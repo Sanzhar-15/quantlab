@@ -1,0 +1,250 @@
+name: Quantlab CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke-build:
+    name: Smoke Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Compile
+        run: npm run compile
+
+      - name: Verify build
+        run: ./scripts/verify-build.sh
+
+      - name: Verify identity
+        run: ./scripts/verify-identity.sh
+
+      - name: Verify network surface
+        run: ./scripts/verify-network-surface.sh
+
+      - name: Verify marketplace
+        env:
+          ALLOW_NET_FAIL: 1
+        run: ./scripts/verify-marketplace.sh
+
+  package-linux:
+    name: Package Linux
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libgtk-3-0 \
+            libxkbfile-dev \
+            libkrb5-dev \
+            libgbm1 \
+            fakeroot \
+            dpkg-dev \
+            perl \
+            curl \
+            build-essential \
+            python3
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Build Linux package
+        run: |
+          npm run gulp vscode-linux-x64-min
+
+      - name: Prepare DEB package
+        run: |
+          npm run gulp vscode-linux-x64-prepare-deb
+
+      - name: Build DEB package
+        run: |
+          npm run gulp vscode-linux-x64-build-deb
+
+      - name: Verify artifacts
+        run: ./scripts/verify-artifacts.sh
+
+      - name: Find artifacts
+        id: find-artifacts
+        run: |
+          if [ -d "../VSCode-linux-x64" ]; then
+            echo "tar_dir=../VSCode-linux-x64" >> $GITHUB_OUTPUT
+            echo "tar_name=quantlab-linux-x64.tar.gz" >> $GITHUB_OUTPUT
+          fi
+
+          DEB_FILE=$(find .build/linux/deb -name "*.deb" -type f 2>/dev/null | head -1)
+          if [ -n "$DEB_FILE" ]; then
+            echo "deb_file=$DEB_FILE" >> $GITHUB_OUTPUT
+            echo "deb_name=$(basename $DEB_FILE)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create TAR archive
+        if: steps.find-artifacts.outputs.tar_dir != ''
+        run: |
+          cd ..
+          tar -czf quantlab-linux-x64.tar.gz VSCode-linux-x64
+          mv quantlab-linux-x64.tar.gz ${{ github.workspace }}/
+
+      - name: Upload TAR artifact
+        if: steps.find-artifacts.outputs.tar_dir != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantlab-linux-x64-tar
+          path: quantlab-linux-x64.tar.gz
+
+      - name: Upload DEB artifact
+        if: steps.find-artifacts.outputs.deb_file != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantlab-linux-x64-deb
+          path: ${{ steps.find-artifacts.outputs.deb_file }}
+
+  package-win:
+    name: Package Windows
+    runs-on: windows-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Install dependencies
+        run: |
+          if (Test-Path package-lock.json) {
+            npm ci
+          } else {
+            npm install
+          }
+
+      - name: Build Windows package
+        run: |
+          npm run gulp vscode-win32-x64-min
+
+      - name: Verify product.json identity
+        run: |
+          node -e "const product = require('./VSCode-win32-x64/resources/app/product.json'); const fs = require('fs'); const identity = {}; fs.readFileSync('config/quantlab.identity.env', 'utf8').split('\n').forEach(line => { const match = line.match(/^([^=]+)=(.*)$/); if (match) identity[match[1].trim()] = match[2].trim(); }); const errors = []; if (product.nameShort !== identity.APP_NAME) errors.push('nameShort mismatch: ' + product.nameShort + ' vs ' + identity.APP_NAME); if (product.applicationName !== identity.APPLICATION_NAME) errors.push('applicationName mismatch: ' + product.applicationName + ' vs ' + identity.APPLICATION_NAME); if (errors.length) { console.error('Verification failed:', errors); process.exit(1); } else { console.log('Product.json identity verified'); }"
+
+      - name: Find artifact
+        id: find-artifact
+        run: |
+          $dir = "VSCode-win32-x64"
+          if (Test-Path $dir) {
+            Write-Host "artifact_dir=$dir" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            Write-Host "artifact_name=quantlab-win32-x64" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          }
+
+      - name: Create ZIP archive
+        if: steps.find-artifact.outputs.artifact_dir != ''
+        run: |
+          Compress-Archive -Path ${{ steps.find-artifact.outputs.artifact_dir }} -DestinationPath quantlab-win32-x64.zip -Force
+
+      - name: Upload artifact
+        if: steps.find-artifact.outputs.artifact_dir != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantlab-win32-x64
+          path: quantlab-win32-x64.zip
+
+  package-mac:
+    name: Package macOS
+    runs-on: macos-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Build macOS package
+        run: |
+          npm run gulp vscode-darwin-x64-min
+
+      - name: Verify product.json identity
+        run: |
+          APP_BUNDLE="VSCode-darwin-x64/Quantlab.app"
+          if [ ! -d "$APP_BUNDLE" ]; then
+            APP_BUNDLE=$(find VSCode-darwin-x64 -name "*.app" -type d | head -1)
+            if [ -z "$APP_BUNDLE" ]; then
+              echo "Error: .app bundle not found in VSCode-darwin-x64"
+              exit 1
+            fi
+          fi
+          node -e "const product = require('./$APP_BUNDLE/Contents/Resources/app/product.json'); const fs = require('fs'); const identity = {}; fs.readFileSync('config/quantlab.identity.env', 'utf8').split('\n').forEach(line => { const match = line.match(/^([^=]+)=(.*)$/); if (match) identity[match[1].trim()] = match[2].trim(); }); const errors = []; if (product.nameShort !== identity.APP_NAME) errors.push('nameShort mismatch: ' + product.nameShort + ' vs ' + identity.APP_NAME); if (product.applicationName !== identity.APPLICATION_NAME) errors.push('applicationName mismatch: ' + product.applicationName + ' vs ' + identity.APPLICATION_NAME); if (errors.length) { console.error('Verification failed:', errors); process.exit(1); } else { console.log('Product.json identity verified'); }"
+
+      - name: Find artifact
+        id: find-artifact
+        run: |
+          if [ -d "VSCode-darwin-x64" ]; then
+            echo "artifact_dir=VSCode-darwin-x64" >> $GITHUB_OUTPUT
+            echo "artifact_name=quantlab-darwin-x64" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create ZIP archive
+        if: steps.find-artifact.outputs.artifact_dir != ''
+        run: |
+          cd ..
+          zip -r quantlab-darwin-x64.zip VSCode-darwin-x64
+          mv quantlab-darwin-x64.zip ${{ github.workspace }}/
+
+      - name: Upload artifact
+        if: steps.find-artifact.outputs.artifact_dir != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantlab-darwin-x64
+          path: quantlab-darwin-x64.zip
+
