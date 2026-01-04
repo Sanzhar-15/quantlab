@@ -51,6 +51,7 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
+            # On Windows, check for 7z first, fallback to tar
             if command -v 7z.exe &> /dev/null && [ -f .build/node_modules_cache/cache.7z ]; then
               7z.exe x .build/node_modules_cache/cache.7z -aoa
             else
@@ -98,7 +99,6 @@ jobs:
 
       - name: Create node_modules archive
         if: steps.cache-node-modules.outputs.cache-hit != 'true'
-        shell: bash
         run: |
           set -e
           node build/azure-pipelines/common/listNodeModules.ts .build/node_modules_list.txt
@@ -126,6 +126,7 @@ jobs:
     name: Package Linux
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 120
 
     steps:
       - name: Checkout
@@ -175,6 +176,9 @@ jobs:
         if: steps.cache-node-modules.outputs.cache-hit != 'true'
         run: |
           set -e
+          export VSCODE_ARCH=x64
+          export npm_config_arch=x64
+          source ./build/azure-pipelines/linux/setup-env.sh
 
           for i in {1..5}; do # try 5 times
             npm ci && break
@@ -183,9 +187,10 @@ jobs:
               exit 1
             fi
             echo "Npm install failed $i, trying again..."
-            sleep 2
           done
         env:
+          VSCODE_ARCH: x64
+          npm_config_arch: x64
           ELECTRON_SKIP_BINARY_DOWNLOAD: 1
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
           GITHUB_TOKEN: ${{ github.token }}
@@ -375,7 +380,7 @@ jobs:
 
   package-mac:
     name: Package macOS
-    runs-on: macos-15-intel
+    runs-on: macos-13
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
 
     steps:
@@ -388,6 +393,7 @@ jobs:
           node-version-file: '.nvmrc'
 
       - name: Prepare node_modules cache key
+        shell: bash
         run: mkdir -p .build && node build/azure-pipelines/common/computeNodeModulesCacheKey.ts compile $(node -p process.arch) > .build/packagelockhash
 
       - name: Restore node_modules cache
@@ -413,7 +419,6 @@ jobs:
               exit 1
             fi
             echo "Npm install failed $i, trying again..."
-            sleep 2
           done
         env:
           ELECTRON_SKIP_BINARY_DOWNLOAD: 1
@@ -436,11 +441,20 @@ jobs:
 
       - name: Verify product.json identity
         run: |
-          APP_BUNDLE="VSCode-darwin-x64/Quantlab.app"
+          # Check both possible output locations
+          if [ -d "VSCode-darwin-x64" ]; then
+            BASE_DIR="VSCode-darwin-x64"
+          elif [ -d "../VSCode-darwin-x64" ]; then
+            BASE_DIR="../VSCode-darwin-x64"
+          else
+            echo "Error: VSCode-darwin-x64 not found in current or parent directory"
+            exit 1
+          fi
+          APP_BUNDLE="$BASE_DIR/Quantlab.app"
           if [ ! -d "$APP_BUNDLE" ]; then
-            APP_BUNDLE=$(find VSCode-darwin-x64 -name "*.app" -type d | head -1)
+            APP_BUNDLE=$(find "$BASE_DIR" -name "*.app" -type d | head -1)
             if [ -z "$APP_BUNDLE" ]; then
-              echo "Error: .app bundle not found in VSCode-darwin-x64"
+              echo "Error: .app bundle not found in $BASE_DIR"
               exit 1
             fi
           fi
@@ -451,15 +465,15 @@ jobs:
         run: |
           if [ -d "VSCode-darwin-x64" ]; then
             echo "artifact_dir=VSCode-darwin-x64" >> $GITHUB_OUTPUT
-            echo "artifact_name=quantlab-darwin-x64" >> $GITHUB_OUTPUT
+          elif [ -d "../VSCode-darwin-x64" ]; then
+            echo "artifact_dir=../VSCode-darwin-x64" >> $GITHUB_OUTPUT
           fi
+          echo "artifact_name=quantlab-darwin-x64" >> $GITHUB_OUTPUT
 
       - name: Create ZIP archive
         if: steps.find-artifact.outputs.artifact_dir != ''
         run: |
-          cd ..
-          zip -r quantlab-darwin-x64.zip VSCode-darwin-x64
-          mv quantlab-darwin-x64.zip ${{ github.workspace }}/
+          zip -r quantlab-darwin-x64.zip ${{ steps.find-artifact.outputs.artifact_dir }}
 
       - name: Upload artifact
         if: steps.find-artifact.outputs.artifact_dir != ''
