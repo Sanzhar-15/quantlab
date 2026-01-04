@@ -1,6 +1,4 @@
-Template: @@NAME@@/add-microsoft-repo
-Type: boolean
-Default: true
-Description: Add Microsoft apt repository for Visual Studio Code?
- The installer would like to add the Microsoft repository and signing
- key to update VS Code through apt.
+Template: @@NAME@@/notice
+Type: note
+Description: @@NAME@@ installation
+ @@NAME@@ does not configure any external apt repositories automatically.
