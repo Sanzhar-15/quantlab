@@ -176,9 +176,6 @@ jobs:
         if: steps.cache-node-modules.outputs.cache-hit != 'true'
         run: |
           set -e
-          export VSCODE_ARCH=x64
-          export npm_config_arch=x64
-          source ./build/azure-pipelines/linux/setup-env.sh
 
           for i in {1..5}; do # try 5 times
             npm ci && break
@@ -187,10 +184,9 @@ jobs:
               exit 1
             fi
             echo "Npm install failed $i, trying again..."
+            sleep 2
           done
         env:
-          VSCODE_ARCH: x64
-          npm_config_arch: x64
           ELECTRON_SKIP_BINARY_DOWNLOAD: 1
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
           GITHUB_TOKEN: ${{ github.token }}
