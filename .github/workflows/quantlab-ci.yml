@@ -6,6 +6,14 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+  GH_TOKEN: ${{ github.token }}
+  GITHUB_AUTH_TOKEN: ${{ github.token }}
+
 jobs:
   smoke-build:
     name: Smoke Build (${{ matrix.os }})
@@ -14,6 +22,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout
@@ -25,6 +36,7 @@ jobs:
           node-version-file: '.nvmrc'
 
       - name: Prepare node_modules cache key
+        shell: bash
         run: mkdir -p .build && node build/azure-pipelines/common/computeNodeModulesCacheKey.ts compile $(node -p process.arch) > .build/packagelockhash
 
       - name: Restore node_modules cache
@@ -36,10 +48,35 @@ jobs:
 
       - name: Extract node_modules cache
         if: steps.cache-node-modules.outputs.cache-hit == 'true'
-        run: tar -xzf .build/node_modules_cache/cache.tgz
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            if command -v 7z.exe &> /dev/null && [ -f .build/node_modules_cache/cache.7z ]; then
+              7z.exe x .build/node_modules_cache/cache.7z -aoa
+            else
+              tar -xzf .build/node_modules_cache/cache.tgz
+            fi
+          else
+            tar -xzf .build/node_modules_cache/cache.tgz
+          fi
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxkbfile-dev \
+            libsecret-1-dev \
+            libnotify-bin \
+            libkrb5-dev
 
       - name: Install dependencies
         if: steps.cache-node-modules.outputs.cache-hit != 'true'
+        shell: bash
         run: |
           set -e
 
@@ -50,14 +87,18 @@ jobs:
               exit 1
             fi
             echo "Npm install failed $i, trying again..."
+            sleep 2
           done
         env:
           ELECTRON_SKIP_BINARY_DOWNLOAD: 1
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_AUTH_TOKEN: ${{ github.token }}
 
       - name: Create node_modules archive
         if: steps.cache-node-modules.outputs.cache-hit != 'true'
+        shell: bash
         run: |
           set -e
           node build/azure-pipelines/common/listNodeModules.ts .build/node_modules_list.txt
@@ -99,19 +140,24 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            build-essential \
             pkg-config \
-            libgtk-3-0 \
+            libx11-dev \
+            libx11-xcb-dev \
             libxkbfile-dev \
+            libsecret-1-dev \
+            libnotify-bin \
             libkrb5-dev \
+            libgtk-3-0 \
             libgbm1 \
             fakeroot \
             dpkg-dev \
             perl \
             curl \
-            build-essential \
             python3
 
       - name: Prepare node_modules cache key
+        shell: bash
         run: mkdir -p .build && node build/azure-pipelines/common/computeNodeModulesCacheKey.ts compile $(node -p process.arch) > .build/packagelockhash
 
       - name: Restore node_modules cache
@@ -129,6 +175,9 @@ jobs:
         if: steps.cache-node-modules.outputs.cache-hit != 'true'
         run: |
           set -e
+          export VSCODE_ARCH=x64
+          export npm_config_arch=x64
+          source ./build/azure-pipelines/linux/setup-env.sh
 
           for i in {1..5}; do # try 5 times
             npm ci && break
@@ -137,11 +186,16 @@ jobs:
               exit 1
             fi
             echo "Npm install failed $i, trying again..."
+            sleep 2
           done
         env:
+          VSCODE_ARCH: x64
+          npm_config_arch: x64
           ELECTRON_SKIP_BINARY_DOWNLOAD: 1
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_AUTH_TOKEN: ${{ github.token }}
 
       - name: Create node_modules archive
         if: steps.cache-node-modules.outputs.cache-hit != 'true'
@@ -153,15 +207,33 @@ jobs:
 
       - name: Build Linux package
         run: |
+          export VSCODE_ARCH=x64
+          export npm_config_arch=x64
+          source ./build/azure-pipelines/linux/setup-env.sh
           npm run gulp vscode-linux-x64-min
+        env:
+          VSCODE_ARCH: x64
+          npm_config_arch: x64
 
       - name: Prepare DEB package
         run: |
+          export VSCODE_ARCH=x64
+          export npm_config_arch=x64
+          source ./build/azure-pipelines/linux/setup-env.sh
           npm run gulp vscode-linux-x64-prepare-deb
+        env:
+          VSCODE_ARCH: x64
+          npm_config_arch: x64
 
       - name: Build DEB package
         run: |
+          export VSCODE_ARCH=x64
+          export npm_config_arch=x64
+          source ./build/azure-pipelines/linux/setup-env.sh
           npm run gulp vscode-linux-x64-build-deb
+        env:
+          VSCODE_ARCH: x64
+          npm_config_arch: x64
 
       - name: Verify artifacts
         run: ./scripts/verify-artifacts.sh
@@ -256,7 +328,9 @@ jobs:
         env:
           ELECTRON_SKIP_BINARY_DOWNLOAD: 1
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_AUTH_TOKEN: ${{ github.token }}
 
       - name: Create node_modules archive
         if: steps.cache-node-modules.outputs.cache-hit != 'true'
@@ -272,8 +346,16 @@ jobs:
           npm run gulp vscode-win32-x64-min
 
       - name: Verify product.json identity
+        shell: pwsh
         run: |
-          node -e "const product = require('./VSCode-win32-x64/resources/app/product.json'); const fs = require('fs'); const identity = {}; fs.readFileSync('config/quantlab.identity.env', 'utf8').split('\n').forEach(line => { const match = line.match(/^([^=]+)=(.*)$/); if (match) identity[match[1].trim()] = match[2].trim(); }); const errors = []; if (product.nameShort !== identity.APP_NAME) errors.push('nameShort mismatch: ' + product.nameShort + ' vs ' + identity.APP_NAME); if (product.applicationName !== identity.APPLICATION_NAME) errors.push('applicationName mismatch: ' + product.applicationName + ' vs ' + identity.APPLICATION_NAME); if (errors.length) { console.error('Verification failed:', errors); process.exit(1); } else { console.log('Product.json identity verified'); }"
+          $productPath = if (Test-Path "VSCode-win32-x64\resources\app\product.json") { "VSCode-win32-x64\resources\app\product.json" } elseif (Test-Path "..\VSCode-win32-x64\resources\app\product.json") { "..\VSCode-win32-x64\resources\app\product.json" } else { throw "product.json not found" }
+          $product = Get-Content $productPath | ConvertFrom-Json
+          $identity = @{}
+          Get-Content "config\quantlab.identity.env" | ForEach-Object { if ($_ -match '^([^=]+)=(.*)$') { $identity[$matches[1].Trim()] = $matches[2].Trim() } }
+          $errors = @()
+          if ($product.nameShort -ne $identity.APP_NAME) { $errors += "nameShort mismatch: $($product.nameShort) vs $($identity.APP_NAME)" }
+          if ($product.applicationName -ne $identity.APPLICATION_NAME) { $errors += "applicationName mismatch: $($product.applicationName) vs $($identity.APPLICATION_NAME)" }
+          if ($errors.Count -gt 0) { Write-Error "Verification failed: $($errors -join ', ')"; exit 1 } else { Write-Host "Product.json identity verified" }
 
       - name: Find artifact
         id: find-artifact
@@ -298,7 +380,7 @@ jobs:
 
   package-mac:
     name: Package macOS
-    runs-on: macos-latest
+    runs-on: macos-13
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
 
     steps:
@@ -336,11 +418,14 @@ jobs:
               exit 1
             fi
             echo "Npm install failed $i, trying again..."
+            sleep 2
           done
         env:
           ELECTRON_SKIP_BINARY_DOWNLOAD: 1
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_AUTH_TOKEN: ${{ github.token }}
 
       - name: Create node_modules archive
         if: steps.cache-node-modules.outputs.cache-hit != 'true'
