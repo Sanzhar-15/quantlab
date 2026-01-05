@@ -20,18 +20,18 @@ FAILED=0
 run_verify() {
     local script_name="$1"
     local script_path="${SCRIPT_DIR}/${script_name}"
-    
+
     if [ ! -f "$script_path" ]; then
         echo "ERROR: Verification script not found: $script_path"
         FAILED=1
         return 1
     fi
-    
+
     if [ ! -x "$script_path" ]; then
         echo "WARNING: Making script executable: $script_path"
         chmod +x "$script_path"
     fi
-    
+
     echo "--- Running: ${script_name} ---"
     if "$script_path"; then
         echo "✓ ${script_name} passed"

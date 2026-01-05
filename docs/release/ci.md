@@ -198,3 +198,92 @@ This will run all jobs including packaging, even if not on the `main` branch.
 - **Corrupted artifacts**: Re-run the workflow
 - **Wrong architecture**: Ensure correct platform job ran (x64 vs arm64)
 
+## CI Guarantees
+
+### What CI Guarantees
+
+The CI workflow provides the following guarantees when all jobs pass:
+
+1. **Code Compiles**: The codebase successfully compiles on all platforms (Windows, macOS, Linux)
+2. **Verification Passes**: All verification scripts pass:
+   - Build artifacts are valid
+   - Product identity is correct (Quantlab branding)
+   - Network surface is safe (no Microsoft endpoints)
+   - Marketplace is configured (Open VSX)
+3. **Artifacts Build**: Packaging jobs successfully produce installable artifacts:
+   - Linux TAR and DEB packages
+   - Windows ZIP archive
+   - macOS ZIP archive
+4. **Artifacts Upload**: All artifacts are successfully uploaded and available for download
+5. **Cross-Platform Compatibility**: Code compiles and basic verification works on all three platforms
+
+### What CI Does NOT Guarantee
+
+The CI workflow does **not** guarantee:
+
+1. **Runtime Functionality**: CI does not run Quantlab or test that it actually works when launched
+2. **Extension Compatibility**: CI does not test extension installation or functionality
+3. **Performance**: CI does not measure or verify performance characteristics
+4. **UI/UX**: CI does not verify the user interface works correctly
+5. **Integration Testing**: CI does not run integration tests or end-to-end tests
+6. **Security Audits**: CI does not perform security vulnerability scanning (beyond basic dependency checks)
+7. **Long-Term Stability**: CI does not test long-running sessions or memory leaks
+8. **Platform-Specific Features**: CI does not verify platform-specific features work (e.g., file associations, context menus)
+
+### Interpreting CI Results
+
+#### All Jobs Green (Success)
+
+- ✅ Code compiles on all platforms
+- ✅ Verification scripts pass
+- ✅ Artifacts are built and uploaded
+- ✅ Safe to download and test artifacts
+- ⚠️ Still need to manually test runtime functionality
+
+#### Smoke Tests Pass, Packaging Fails
+
+- ✅ Code compiles and verification passes
+- ❌ Artifacts are not available
+- **Action**: Check packaging job logs for specific errors (often system dependencies or resource limits)
+
+#### Smoke Tests Fail
+
+- ❌ Code does not compile or verification fails
+- ❌ Artifacts will not be built (packaging jobs may be skipped)
+- **Action**: Fix compilation or verification issues before attempting to build artifacts
+
+#### Partial Success (Some Platforms Pass)
+
+- ✅ Some platforms compile successfully
+- ⚠️ Platform-specific issues may exist
+- **Action**: Review platform-specific job logs to identify issues
+
+### Artifact Retention
+
+- **Retention Period**: Artifacts are retained for **90 days** by default
+- **Expiration**: After 90 days, artifacts are automatically deleted and cannot be recovered
+- **Download**: Artifacts can be downloaded from the workflow run page while they're available
+- **Size Limits**: GitHub Actions has artifact size limits (typically 10GB per artifact, 10GB total per workflow run)
+
+**Best Practice**: Download artifacts you need for testing or distribution soon after the workflow completes.
+
+### CI Status Indicators
+
+- **Green Checkmark**: Job completed successfully
+- **Red X**: Job failed (check logs for details)
+- **Yellow Circle**: Job is in progress
+- **Gray Circle**: Job was skipped (e.g., packaging skipped on PRs)
+
+### Workflow Run States
+
+- **Success**: All required jobs passed
+- **Failure**: One or more required jobs failed
+- **Cancelled**: Workflow was manually cancelled or superseded by a newer run
+- **Skipped**: Workflow was skipped (e.g., no changes on a push event)
+
+## Related Documentation
+
+- [Artifacts](artifacts.md) - Detailed artifact download and installation instructions
+- [Linux Development Build](../build/linux-dev.md) - Building Quantlab locally on Linux
+- [Upstream Sync](../upstream-sync.md) - Syncing with upstream VS Code
+

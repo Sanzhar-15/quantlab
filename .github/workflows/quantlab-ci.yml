@@ -126,11 +126,32 @@ jobs:
           ALLOW_NET_FAIL: 1
         run: ./scripts/verify-marketplace.sh
 
+  test-scripts:
+    name: Test Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Run unit tests
+        run: |
+          chmod +x test/scripts/*.sh
+          ./test/scripts/test-identity-application.sh
+          ./test/scripts/test-network-surface.sh
+          ./test/scripts/test-integration.sh
+
   package-linux:
     name: Package Linux
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    continue-on-error: true
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
 
     steps:
@@ -313,7 +334,6 @@ jobs:
   package-win:
     name: Package Windows
     runs-on: windows-latest
-    continue-on-error: true
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
 
     steps:
@@ -420,7 +440,6 @@ jobs:
   package-mac:
     name: Package macOS
     runs-on: macos-15-intel
-    continue-on-error: true
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
 
     steps:

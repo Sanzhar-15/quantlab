@@ -23,3 +23,11 @@ product.overrides.json
 *.tsbuildinfo
 .vscode-test
 vscode-telemetry-docs/
+
+# Backup files from identity/marketplace/network scripts
+*.backup
+*.backup.*
+product.json.backup*
+
+# Test artifacts
+.test-scripts/

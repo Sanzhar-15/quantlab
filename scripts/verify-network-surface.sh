@@ -215,6 +215,14 @@ main() {
     # Discover and check all endpoints
     discover_endpoints || errors=$((errors + 1))
 
+    # Check for defaultChatAgent (should not exist)
+    if jq -e ".defaultChatAgent" "${PRODUCT_JSON}" > /dev/null 2>&1; then
+        error "defaultChatAgent section found in product.json (should be removed for base distribution)"
+        errors=$((errors + 1))
+    else
+        info "✓ No defaultChatAgent section (clean base distribution)"
+    fi
+
     if [[ ${errors} -eq 0 ]]; then
         info "All network surface verifications passed!"
         return 0
