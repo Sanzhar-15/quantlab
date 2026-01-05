@@ -126,11 +126,23 @@ jobs:
           ALLOW_NET_FAIL: 1
         run: ./scripts/verify-marketplace.sh
 
+      - name: Upload compilation artifact (Linux only)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: compilation-linux-x64
+          path: |
+            .build/
+            out-*
+          retention-days: 1
+          if-no-files-found: warn
+
   package-linux:
     name: Package Linux
     runs-on: ubuntu-latest
     timeout-minutes: 120
     continue-on-error: true
+    needs: smoke-build
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
 
     steps:
@@ -141,6 +153,13 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version-file: '.nvmrc'
+
+      - name: Download compilation artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: compilation-linux-x64
+          path: .
+          if-no-files-found: warn
 
       - name: Install system dependencies
         run: |
@@ -211,7 +230,8 @@ jobs:
           export VSCODE_ARCH=x64
           export npm_config_arch=x64
           source ./build/azure-pipelines/linux/setup-env.sh
-          npm run gulp vscode-linux-x64-min
+          # Use -ci task which skips compilation (assumes out-vscode-min/ exists from smoke-build)
+          npm run gulp vscode-linux-x64-min-ci
         env:
           VSCODE_ARCH: x64
           npm_config_arch: x64
