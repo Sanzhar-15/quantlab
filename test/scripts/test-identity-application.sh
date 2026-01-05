@@ -2,7 +2,7 @@
 # Unit tests for identity application scripts
 # Tests apply-identity.sh with various product.json states
 
-set -euo pipefail
+set -eo pipefail  # Removed -u to avoid issues with command substitution in local declarations
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -80,7 +80,8 @@ test_detect_mismatch() {
     cp "${PRODUCT_JSON}" "${backup}"
 
     # Modify product.json to have wrong identity
-    local temp_json=$(mktemp)
+    local temp_json
+    temp_json=$(mktemp)
     jq '.nameShort = "Wrong Name"' "${PRODUCT_JSON}" > "${temp_json}"
     mv "${temp_json}" "${PRODUCT_JSON}"
 
@@ -108,7 +109,8 @@ test_fix_mismatch() {
     cp "${PRODUCT_JSON}" "${backup}"
 
     # Modify product.json to have wrong identity
-    local temp_json=$(mktemp)
+    local temp_json
+    temp_json=$(mktemp)
     jq '.applicationName = "wrong-name"' "${PRODUCT_JSON}" > "${temp_json}"
     mv "${temp_json}" "${PRODUCT_JSON}"
 
