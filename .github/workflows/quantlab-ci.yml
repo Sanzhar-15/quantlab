@@ -220,6 +220,19 @@ jobs:
           VSCODE_ARCH: x64
           npm_config_arch: x64
 
+      - name: Debug: list Linux bin outputs before prepare-deb
+        if: always()
+        run: |
+          set -e
+          echo "=== bin dir ==="
+          ls -la VSCode-linux-x64/bin || true
+          echo "=== tunnel matches ==="
+          ls -la VSCode-linux-x64/bin/*tunnel* 2>/dev/null || true
+          echo "=== file types ==="
+          for f in VSCode-linux-x64/bin/*tunnel*; do
+            [ -e "$f" ] && file "$f" || true
+          done
+
       - name: Prepare DEB package
         run: |
           export VSCODE_ARCH=x64
