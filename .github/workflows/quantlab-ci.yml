@@ -370,8 +370,8 @@ jobs:
         run: |
           $dir = if (Test-Path "VSCode-win32-x64") { "VSCode-win32-x64" } elseif (Test-Path "..\VSCode-win32-x64") { "..\VSCode-win32-x64" } else { $null }
           if ($dir) {
-            Write-Host "artifact_dir=$dir" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-            Write-Host "artifact_name=quantlab-win32-x64" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "artifact_dir=$dir"
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "artifact_name=quantlab-win32-x64"
           }
 
       - name: Create ZIP archive
