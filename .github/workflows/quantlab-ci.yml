@@ -126,6 +126,17 @@ jobs:
           ALLOW_NET_FAIL: 1
         run: ./scripts/verify-marketplace.sh
 
+      - name: Build and minify (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          # Build out-vscode-min which is needed for packaging
+          # This matches what vscode-linux-x64-min does (without the packaging step)
+          npm run gulp compile-build-with-mangling
+          npm run gulp clean-extensions-build
+          npm run gulp compile-non-native-extensions-build
+          npm run gulp compile-extension-media-build
+          npm run gulp minify-vscode
+
       - name: Upload compilation artifact (Linux only)
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
@@ -155,11 +166,12 @@ jobs:
           node-version-file: '.nvmrc'
 
       - name: Download compilation artifact
+        id: download-compilation
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: compilation-linux-x64
           path: .
-          if-no-files-found: warn
 
       - name: Install system dependencies
         run: |
@@ -230,8 +242,14 @@ jobs:
           export VSCODE_ARCH=x64
           export npm_config_arch=x64
           source ./build/azure-pipelines/linux/setup-env.sh
-          # Use -ci task which skips compilation (assumes out-vscode-min/ exists from smoke-build)
-          npm run gulp vscode-linux-x64-min-ci
+          # Check if compilation artifact was downloaded successfully
+          if [ -d "out-vscode-min" ]; then
+            echo "Using compilation artifact from smoke-build"
+            npm run gulp vscode-linux-x64-min-ci
+          else
+            echo "Compilation artifact not found, compiling from scratch"
+            npm run gulp vscode-linux-x64-min
+          fi
         env:
           VSCODE_ARCH: x64
           npm_config_arch: x64
