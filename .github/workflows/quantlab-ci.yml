@@ -220,18 +220,49 @@ jobs:
           VSCODE_ARCH: x64
           npm_config_arch: x64
 
-      - name: Debug: list Linux bin outputs before prepare-deb
-        if: always()
+      - name: Fix tunnel binary name for DEB packaging
+        shell: bash
         run: |
-          set -e
-          echo "=== bin dir ==="
-          ls -la VSCode-linux-x64/bin || true
-          echo "=== tunnel matches ==="
-          ls -la VSCode-linux-x64/bin/*tunnel* 2>/dev/null || true
-          echo "=== file types ==="
-          for f in VSCode-linux-x64/bin/*tunnel*; do
-            [ -e "$f" ] && file "$f" || true
-          done
+          set -euxo pipefail
+
+          BIN="../VSCode-linux-x64/bin"
+          if [ ! -d "$BIN" ]; then
+            echo "ERROR: Expected build output bin dir not found: $BIN"
+            echo "Listing .. for context:"
+            ls -la ..
+            exit 1
+          fi
+
+          TUNNEL="$(node -p "require('./product.json').tunnelApplicationName")"
+          echo "Expected tunnel name from product.json: $TUNNEL"
+
+          echo "Contents of $BIN:"
+          ls -la "$BIN" || true
+          echo "Tunnel-like candidates:"
+          ls -la "$BIN" | grep -Ei "tunnel" || true
+
+          # If expected name missing, alias it from a known candidate
+          if [ ! -e "$BIN/$TUNNEL" ]; then
+            for cand in code-tunnel vscode-tunnel; do
+              if [ -e "$BIN/$cand" ]; then
+                echo "Creating alias: $BIN/$TUNNEL -> $BIN/$cand"
+                ln -sf "$cand" "$BIN/$TUNNEL"
+                break
+              fi
+            done
+          fi
+
+          # Hard fail with clear error if still missing (prevents dpkg-shlibdeps mystery)
+          if [ ! -e "$BIN/$TUNNEL" ]; then
+            echo "ERROR: No tunnel binary found. Expected $BIN/$TUNNEL."
+            echo "Available files in $BIN:"
+            ls -la "$BIN"
+            exit 1
+          fi
+
+          chmod +x "$BIN/$TUNNEL" || true
+          echo "OK: tunnel binary present: $BIN/$TUNNEL"
+          ls -la "$BIN" | grep -Ei "tunnel" || true
 
       - name: Prepare DEB package
         run: |
