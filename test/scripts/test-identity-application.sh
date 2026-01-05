@@ -23,7 +23,7 @@ info() { echo -e "${YELLOW}INFO:${NC} $1"; }
 # Test 1: Verify identity script passes with current product.json
 test_current_identity() {
     info "Test 1: Verify identity in current product.json"
-    
+
     cd "${PROJECT_ROOT}"
     if bash "${VERIFY_SCRIPT}" > /dev/null 2>&1; then
         success "Current identity verification test passed"
@@ -37,27 +37,27 @@ test_current_identity() {
 # Test 2: Apply identity is idempotent
 test_idempotent() {
     info "Test 2: Test identity application is idempotent"
-    
+
     local backup="${PRODUCT_JSON}.test-backup"
     cp "${PRODUCT_JSON}" "${backup}"
-    
+
     cd "${PROJECT_ROOT}"
-    
+
     # Apply identity twice
-    bash "${IDENTITY_SCRIPT}" > /dev/null 2>&1 || {
-        error "First identity application failed"
+    if ! bash "${IDENTITY_SCRIPT}" > /dev/null 2>&1; then
+        error "First identity application failed (exit code: $?)"
         cp "${backup}" "${PRODUCT_JSON}"
         rm -f "${backup}"
         return 1
-    }
-    
-    bash "${IDENTITY_SCRIPT}" > /dev/null 2>&1 || {
-        error "Second identity application failed"
+    fi
+
+    if ! bash "${IDENTITY_SCRIPT}" > /dev/null 2>&1; then
+        error "Second identity application failed (exit code: $?)"
         cp "${backup}" "${PRODUCT_JSON}"
         rm -f "${backup}"
         return 1
-    }
-    
+    fi
+
     # Verify identity is still valid
     if bash "${VERIFY_SCRIPT}" > /dev/null 2>&1; then
         success "Idempotent identity application test passed"
@@ -75,17 +75,17 @@ test_idempotent() {
 # Test 3: Verify identity script detects mismatches
 test_detect_mismatch() {
     info "Test 3: Verify detection of identity mismatches"
-    
+
     local backup="${PRODUCT_JSON}.test-backup"
     cp "${PRODUCT_JSON}" "${backup}"
-    
+
     # Modify product.json to have wrong identity
     local temp_json=$(mktemp)
     jq '.nameShort = "Wrong Name"' "${PRODUCT_JSON}" > "${temp_json}"
     mv "${temp_json}" "${PRODUCT_JSON}"
-    
+
     cd "${PROJECT_ROOT}"
-    
+
     # Verify should fail
     if bash "${VERIFY_SCRIPT}" > /dev/null 2>&1; then
         error "Verify script should have detected mismatch"
@@ -103,25 +103,25 @@ test_detect_mismatch() {
 # Test 4: Identity application fixes mismatches
 test_fix_mismatch() {
     info "Test 4: Test identity application fixes mismatches"
-    
+
     local backup="${PRODUCT_JSON}.test-backup"
     cp "${PRODUCT_JSON}" "${backup}"
-    
+
     # Modify product.json to have wrong identity
     local temp_json=$(mktemp)
     jq '.applicationName = "wrong-name"' "${PRODUCT_JSON}" > "${temp_json}"
     mv "${temp_json}" "${PRODUCT_JSON}"
-    
+
     cd "${PROJECT_ROOT}"
-    
+
     # Apply identity should fix it
-    bash "${IDENTITY_SCRIPT}" > /dev/null 2>&1 || {
-        error "Identity application failed"
+    if ! bash "${IDENTITY_SCRIPT}" > /dev/null 2>&1; then
+        error "Identity application failed (exit code: $?)"
         cp "${backup}" "${PRODUCT_JSON}"
         rm -f "${backup}"
         return 1
-    }
-    
+    fi
+
     # Verify should now pass
     if bash "${VERIFY_SCRIPT}" > /dev/null 2>&1; then
         success "Identity fix test passed"
@@ -140,13 +140,13 @@ test_fix_mismatch() {
 main() {
     echo "=== Identity Application Script Tests ==="
     echo ""
-    
+
     local failed=0
     test_current_identity || failed=$((failed + 1))
     test_idempotent || failed=$((failed + 1))
     test_detect_mismatch || failed=$((failed + 1))
     test_fix_mismatch || failed=$((failed + 1))
-    
+
     echo ""
     if [ $failed -eq 0 ]; then
         success "All tests passed!"

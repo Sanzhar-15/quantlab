@@ -144,9 +144,13 @@ jobs:
       - name: Run unit tests
         run: |
           chmod +x test/scripts/*.sh
-          ./test/scripts/test-identity-application.sh
-          ./test/scripts/test-network-surface.sh
-          ./test/scripts/test-integration.sh
+          set -e
+          echo "Running test-identity-application.sh..."
+          ./test/scripts/test-identity-application.sh || { echo "test-identity-application.sh failed"; exit 1; }
+          echo "Running test-network-surface.sh..."
+          ./test/scripts/test-network-surface.sh || { echo "test-network-surface.sh failed"; exit 1; }
+          echo "Running test-integration.sh..."
+          ./test/scripts/test-integration.sh || { echo "test-integration.sh failed"; exit 1; }
 
   package-linux:
     name: Package Linux
