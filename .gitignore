@@ -23,3 +23,31 @@ product.overrides.json
 *.tsbuildinfo
 .vscode-test
 vscode-telemetry-docs/
+
+# Backup files from identity/marketplace/network scripts
+*.backup
+*.backup.*
+product.json.backup*
+
+# Test artifacts
+.test-scripts/
+
+# Sibling node_modules copies kept across platforms/partial installs
+/node_modules.*/
+
+# Launch / runtime logs
+.quantlab-launch*.log
+
+# Auto-snapshots of disabled extensions made by the editor at runtime
+/.vscode/extensions.disabled*/
+
+# Python virtualenvs and caches (engine/ subproject)
+**/.venv/
+**/__pycache__/
+
+# Vendored TradingView lightweight-charts (re-clonable reference)
+/Charts/tradingview-light-charts/
+
+# Charts/ pnpm monorepo build outputs
+/Charts/**/dist/
+/Charts/**/.turbo/
