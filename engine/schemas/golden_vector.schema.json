@@ -1,0 +1,235 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quantlab.io/schemas/golden_vector.schema.json",
+  "title": "GoldenTestVector",
+  "description": "Golden test vector schema for backtest verification",
+  "type": "object",
+  "required": ["name", "version", "description", "config", "data", "signals", "expected"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Test vector name (e.g., G001_basic_market_buy)",
+      "pattern": "^G[0-9]{3}_[a-z_]+$"
+    },
+    "version": {
+      "type": "string",
+      "description": "Vector version for tracking updates",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable description of what this test verifies"
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "basic_execution",
+        "order_types",
+        "time_in_force",
+        "short_selling",
+        "volume_partial",
+        "slippage",
+        "forward_fill",
+        "edge_cases",
+        "multi_symbol",
+        "exposure"
+      ],
+      "description": "Test category"
+    },
+    "config": {
+      "type": "object",
+      "required": ["initial_capital", "commission"],
+      "properties": {
+        "initial_capital": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "commission": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["none", "per_share", "flat", "percentage"]
+            },
+            "value": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        },
+        "slippage": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["none", "fixed_bps", "volatility", "volume"]
+            },
+            "value": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        },
+        "fill_assumption": {
+          "type": "string",
+          "enum": ["next_open", "same_close", "vwap"],
+          "default": "next_open"
+        },
+        "allow_shorting": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "data": {
+      "type": "object",
+      "required": ["bars"],
+      "properties": {
+        "bars": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["date", "open", "high", "low", "close", "volume"],
+            "properties": {
+              "date": {
+                "type": "string",
+                "format": "date"
+              },
+              "symbol": {
+                "type": "string"
+              },
+              "open": {
+                "type": "number"
+              },
+              "high": {
+                "type": "number"
+              },
+              "low": {
+                "type": "number"
+              },
+              "close": {
+                "type": "number"
+              },
+              "volume": {
+                "type": "integer"
+              }
+            }
+          },
+          "minItems": 1
+        }
+      }
+    },
+    "signals": {
+      "type": "array",
+      "description": "Signals to generate on specific bars",
+      "items": {
+        "type": "object",
+        "required": ["bar_index", "type"],
+        "properties": {
+          "bar_index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "type": {
+            "type": "string",
+            "enum": ["entry_long", "exit_long", "entry_short", "exit_short"]
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "number"
+          },
+          "order_type": {
+            "type": "string",
+            "enum": ["MARKET", "LIMIT", "STOP", "STOP_LIMIT"]
+          },
+          "limit_price": {
+            "type": "number"
+          },
+          "stop_price": {
+            "type": "number"
+          },
+          "time_in_force": {
+            "type": "string",
+            "enum": ["GFD", "GTC", "IOC"]
+          }
+        }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "required": ["final_equity"],
+      "properties": {
+        "final_equity": {
+          "type": "number",
+          "description": "Expected final portfolio equity"
+        },
+        "total_return": {
+          "type": "number",
+          "description": "Expected total return (decimal, e.g., 0.05 for 5%)"
+        },
+        "total_trades": {
+          "type": "integer",
+          "description": "Expected number of round-trip trades",
+          "minimum": 0
+        },
+        "winning_trades": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "losing_trades": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_commission": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max_drawdown": {
+          "type": "number",
+          "description": "Maximum drawdown (decimal)"
+        },
+        "sharpe_ratio": {
+          "type": "number",
+          "description": "Annualized Sharpe ratio"
+        },
+        "final_positions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "symbol": { "type": "string" },
+              "quantity": { "type": "number" },
+              "avg_price": { "type": "number" }
+            }
+          }
+        },
+        "orders": {
+          "type": "array",
+          "description": "Expected order outcomes",
+          "items": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": ["FILLED", "PARTIAL", "CANCELLED", "REJECTED", "EXPIRED"]
+              },
+              "filled_qty": { "type": "number" },
+              "avg_price": { "type": "number" }
+            }
+          }
+        },
+        "tolerance": {
+          "type": "number",
+          "description": "Numerical comparison tolerance",
+          "default": 0.0001
+        }
+      }
+    },
+    "notes": {
+      "type": "string",
+      "description": "Additional notes or edge cases being tested"
+    }
+  }
+}

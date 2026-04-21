@@ -1,0 +1,71 @@
+# G016: Stop-Limit Sell Order
+# Category: order_types
+# Verifies: Stop-limit sell triggers and fills at limit or better
+
+id: G016
+name: "Stop-limit sell order"
+category: order_types
+description: |
+  A stop-limit sell order should trigger when price falls to the stop,
+  then fill at the limit price or better. Tests stop trigger + limit fill logic.
+
+tags:
+  - stop_limit
+  - sell
+  - order_types
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+    - {date: "2026-01-06", open: "102.00", high: "103.00", low: "98.00", close: "99.00", volume: 1500000}
+    - {date: "2026-01-07", open: "98.50", high: "100.00", low: "97.00", close: "98.00", volume: 1800000}
+
+signals:
+  # Buy first to have a position
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+  # Stop-limit sell: stop at 100, limit at 99
+  - bar_index: 1
+    action: sell
+    symbol: AAPL
+    quantity: "100"
+    order_type: stop_limit
+    stop_price: "100.00"
+    limit_price: "99.00"
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "104.50"
+      side: buy
+    # Stop triggers at bar 2 (low 98 < stop 100), fills at 99 (within limit)
+    - bar_index: 2
+      symbol: AAPL
+      quantity: "100"
+      price: "100.00"
+      side: sell
+
+  final_cash: "99550.00"  # 100000 - 10450 + 10000
+  final_positions: {}
+  final_equity: "99550.00"
+
+  metrics:
+    total_return: "-0.0045"
+    total_trades: 2

@@ -1,0 +1,99 @@
+# G073: Three Symbol Portfolio
+# Category: multi_symbol
+# Verifies: Trading three symbols simultaneously
+
+id: G073
+name: "Three symbol portfolio"
+category: multi_symbol
+description: |
+  Tests trading three different symbols simultaneously
+  with proper position and P&L tracking for each.
+
+tags:
+  - multi_symbol
+  - portfolio
+  - three_symbols
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbols:
+    - symbol: AAPL
+      timeframe: 1d
+      bars:
+        - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+        - {date: "2026-01-05", open: "104.00", high: "106.00", low: "102.00", close: "105.00", volume: 1200000}
+        - {date: "2026-01-06", open: "105.50", high: "108.00", low: "104.00", close: "107.00", volume: 900000}
+    - symbol: GOOGL
+      timeframe: 1d
+      bars:
+        - {date: "2026-01-02", open: "150.00", high: "155.00", low: "148.00", close: "153.00", volume: 800000}
+        - {date: "2026-01-05", open: "153.50", high: "158.00", low: "152.00", close: "156.00", volume: 900000}
+        - {date: "2026-01-06", open: "156.50", high: "160.00", low: "155.00", close: "159.00", volume: 850000}
+    - symbol: MSFT
+      timeframe: 1d
+      bars:
+        - {date: "2026-01-02", open: "400.00", high: "410.00", low: "395.00", close: "405.00", volume: 700000}
+        - {date: "2026-01-05", open: "406.00", high: "415.00", low: "400.00", close: "412.00", volume: 750000}
+        - {date: "2026-01-06", open: "413.00", high: "420.00", low: "410.00", close: "418.00", volume: 700000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "50"
+    order_type: market
+  - bar_index: 0
+    action: buy
+    symbol: GOOGL
+    quantity: "30"
+    order_type: market
+  - bar_index: 0
+    action: buy
+    symbol: MSFT
+    quantity: "10"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "50"
+      price: "104.00"
+      side: buy
+    - bar_index: 1
+      symbol: GOOGL
+      quantity: "30"
+      price: "153.50"
+      side: buy
+    - bar_index: 1
+      symbol: MSFT
+      quantity: "10"
+      price: "406.00"
+      side: buy
+
+  # AAPL: 50 * 104 = 5200
+  # GOOGL: 30 * 153.50 = 4605
+  # MSFT: 10 * 406 = 4060
+  # Total: 13865
+  final_cash: "86135.00"
+  final_positions:
+    AAPL: "50"
+    GOOGL: "30"
+    MSFT: "10"
+  # AAPL: 50 * 107 = 5350
+  # GOOGL: 30 * 159 = 4770
+  # MSFT: 10 * 418 = 4180
+  # Total: 86135 + 5350 + 4770 + 4180 = 100435
+  final_equity: "100435.00"
+
+  metrics:
+    total_return: "0.00435"
+    total_trades: 3

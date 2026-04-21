@@ -1,0 +1,59 @@
+# G025: IOC Order Full Fill
+# Category: time_in_force
+# Verifies: IOC order fills completely when liquidity available
+
+id: G025
+name: "IOC order full fill"
+category: time_in_force
+description: |
+  An IOC (Immediate Or Cancel) order should fill completely
+  when sufficient liquidity is available.
+
+tags:
+  - ioc
+  - market
+  - full_fill
+  - tif
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+  max_volume_participation: 0.10  # 10% of volume
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    # High volume bar allows full fill
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 5000000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"  # Way under 10% of 5M volume
+    order_type: market
+    time_in_force: ioc
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "104.50"
+      side: buy
+
+  final_cash: "89550.00"
+  final_positions:
+    AAPL: "100"
+  final_equity: "99850.00"  # 89550 + (100 * 103)
+
+  metrics:
+    total_return: "-0.0015"
+    total_trades: 1

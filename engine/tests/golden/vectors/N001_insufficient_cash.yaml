@@ -1,0 +1,47 @@
+---
+# N001: Order rejected due to insufficient cash
+# Tests that orders exceeding available cash are properly rejected
+# Spec Reference: Technical Spec §4.2 (Order Validation)
+
+name: "Insufficient Cash Rejection"
+description: |
+  Verify that a buy order is rejected when the required cash
+  exceeds the available account balance.
+
+config:
+  initial_cash: "1000.00"
+  commission_model: "per_trade"
+  commission_rate: "5.00"
+  fill_assumption: "next_open"
+  allow_short: false
+
+data:
+  AAPL:
+    - timestamp: "2024-01-02T09:30:00"
+      open: "100.00"
+      high: "105.00"
+      low: "99.00"
+      close: "102.00"
+      volume: 1000000
+    - timestamp: "2024-01-03T09:30:00"
+      open: "102.00"
+      high: "106.00"
+      low: "101.00"
+      close: "104.00"
+      volume: 1200000
+
+signals:
+  - bar_index: 0
+    symbol: "AAPL"
+    side: "buy"
+    order_type: "market"
+    quantity: "100"  # 100 * $102 = $10,200 > $1,000 available
+
+expected:
+  # Order should be rejected
+  final_cash: "1000.00"
+  final_positions:
+    AAPL: "0"
+  trades_count: 0
+  orders_rejected: 1
+  rejection_reason: "insufficient_cash"

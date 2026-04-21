@@ -1,0 +1,61 @@
+# G049: Short Selling Borrow Fee
+# Category: order_types
+# Verifies: Borrow fee accrued on short positions
+
+id: G049
+name: "Borrow fee accrued on short position"
+category: order_types
+description: |
+  Short positions should accrue borrow fees based on
+  the configured annual rate and holding period.
+
+tags:
+  - short
+  - borrow_fee
+  - cost
+
+skip: true
+skip_reason: "Borrow fee calculation not fully implemented"
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+  borrow_fee_rate: "0.05"  # 5% annual
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+    - {date: "2026-01-06", open: "103.00", high: "104.00", low: "101.00", close: "102.00", volume: 1400000}
+
+signals:
+  - bar_index: 0
+    action: sell_short
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "104.50"
+      side: sell_short
+
+  # Position value ~$10,450, 1 day at 5% annual = ~$1.43 fee
+  final_cash: "110448.57"  # 100000 + 10450 - 1.43
+  final_positions:
+    AAPL: "-100"
+  final_equity: "100248.57"
+
+  metrics:
+    total_return: "0.002486"
+    total_trades: 1

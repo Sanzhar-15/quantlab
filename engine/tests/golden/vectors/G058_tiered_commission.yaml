@@ -1,0 +1,63 @@
+# G058: Tiered Commission
+# Category: slippage
+# Verifies: Tiered commission structure works correctly
+
+id: G058
+name: "Tiered commission"
+category: slippage
+description: |
+  Commission calculated using tiered rates based on
+  order size should be applied correctly.
+
+tags:
+  - commission
+  - tiered
+  - cost
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: tiered
+    tiers:
+      - {threshold: 0, rate: 0.015}  # Base tier for small trades
+      - {threshold: 100, rate: 0.01}
+      - {threshold: 500, rate: 0.005}
+      - {threshold: 1000, rate: 0.002}
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "200"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "200"
+      price: "104.50"
+      side: buy
+
+  # notional: 200 * 104.50 = 20,900
+  # tier: 20,900 >= 1000, rate = 0.002
+  # commission: 20,900 * 0.002 = 41.80
+  final_cash: "79058.20"  # 100000 - 20900 - 41.80
+  final_positions:
+    AAPL: "200"
+  final_equity: "99658.20"  # 79058.20 + (200 * 103)
+
+  metrics:
+    total_return: "-0.003418"
+    total_trades: 1

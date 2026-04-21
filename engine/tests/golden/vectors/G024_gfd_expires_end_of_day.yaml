@@ -1,0 +1,56 @@
+# G024: GFD Order Expires End of Day
+# Category: time_in_force
+# Verifies: GFD limit order expires if not filled same day
+
+id: G024
+name: "GFD order expires end of day"
+category: time_in_force
+description: |
+  A GFD (Good For Day) limit order should expire at market close
+  if not filled, and should not fill on subsequent days.
+
+tags:
+  - gfd
+  - limit
+  - expires
+  - tif
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.00", high: "106.00", low: "103.00", close: "105.00", volume: 1200000}
+    # Price would fill if order was still active
+    - {date: "2026-01-06", open: "100.00", high: "101.00", low: "94.00", close: "95.00", volume: 1500000}
+
+signals:
+  # GFD limit buy at 95 - price doesn't reach on execution bar (bar 1)
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: limit
+    limit_price: "95.00"
+    time_in_force: gfd
+
+expected:
+  fills: []
+  # Order expires after bar 1 (GFD), doesn't fill on bar 2 even though price reaches 94
+
+  final_cash: "100000.00"
+  final_positions: {}
+  final_equity: "100000.00"
+
+  metrics:
+    total_return: "0"
+    total_trades: 0

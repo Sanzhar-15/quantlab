@@ -1,0 +1,45 @@
+---
+# N009: Short selling blocked when disabled
+# Tests that SELL_SHORT orders are rejected when allow_short=false
+# Spec Reference: Technical Spec §5 (Short Selling)
+
+name: "Short Selling Disabled"
+description: |
+  Verify that SELL_SHORT orders are rejected when short selling
+  is disabled in the configuration.
+
+config:
+  initial_cash: "100000.00"
+  commission_model: "none"
+  fill_assumption: "next_open"
+  allow_short: false  # Short selling disabled
+
+data:
+  TSLA:
+    - timestamp: "2024-01-02T09:30:00"
+      open: "250.00"
+      high: "260.00"
+      low: "245.00"
+      close: "255.00"
+      volume: 5000000
+    - timestamp: "2024-01-03T09:30:00"
+      open: "255.00"
+      high: "265.00"
+      low: "252.00"
+      close: "260.00"
+      volume: 5500000
+
+signals:
+  - bar_index: 0
+    symbol: "TSLA"
+    side: "sell_short"  # Attempt short when disabled
+    order_type: "market"
+    quantity: "100"
+
+expected:
+  final_cash: "100000.00"
+  final_positions:
+    TSLA: "0"
+  trades_count: 0
+  orders_rejected: 1
+  rejection_reason: "short_selling_disabled"

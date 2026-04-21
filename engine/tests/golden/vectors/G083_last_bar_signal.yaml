@@ -1,0 +1,52 @@
+# G083: Signal on Last Bar
+# Category: edge_cases
+# Verifies: Signal on last bar has no execution bar
+
+id: G083
+name: "Signal on last bar"
+category: edge_cases
+description: |
+  A signal generated on the last bar of data should not fill
+  since there is no t+1 bar for execution.
+
+tags:
+  - edge_case
+  - last_bar
+  - no_fill
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+    - {date: "2026-01-06", open: "103.00", high: "108.00", low: "101.00", close: "107.00", volume: 900000}
+
+signals:
+  # Signal on last bar (index 2) - no bar 3 to execute on
+  - bar_index: 2
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills: []
+  # No fill - no execution bar available
+
+  final_cash: "100000.00"
+  final_positions: {}
+  final_equity: "100000.00"
+
+  metrics:
+    total_return: "0"
+    total_trades: 0

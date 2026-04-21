@@ -1,0 +1,70 @@
+# G103: Exposure Release on Cancel
+# Category: exposure
+# Verifies: Cancelled orders release reserved exposure
+
+id: G103
+name: "Exposure release on cancel"
+category: exposure
+description: |
+  When an order is cancelled, its reserved exposure should be
+  released, allowing new orders to use that exposure.
+
+tags:
+  - exposure
+  - cancel
+  - release
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+  max_exposure: "50000"
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    # Price never reaches limit, order expires
+    - {date: "2026-01-05", open: "104.00", high: "106.00", low: "103.00", close: "105.00", volume: 1200000}
+    - {date: "2026-01-06", open: "105.00", high: "107.00", low: "104.00", close: "106.00", volume: 900000}
+    - {date: "2026-01-07", open: "106.00", high: "108.00", low: "105.00", close: "107.00", volume: 850000}
+
+signals:
+  # Limit order that won't fill (reserves exposure)
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "500"  # 50000 at limit 100
+    order_type: limit
+    limit_price: "95.00"
+    time_in_force: gfd
+  # Market order after GFD expires
+  - bar_index: 2
+    action: buy
+    symbol: AAPL
+    quantity: "400"  # 40000 at ~106
+    order_type: market
+
+expected:
+  fills:
+    # GFD limit doesn't fill, expires after bar 1
+    # Market order at bar 2 fills at bar 3
+    - bar_index: 3
+      symbol: AAPL
+      quantity: "400"
+      price: "106.00"
+      side: buy
+
+  final_cash: "57600.00"  # 100000 - (400 * 106)
+  final_positions:
+    AAPL: "400"
+  final_equity: "100400.00"  # 57600 + (400 * 107)
+
+  metrics:
+    total_return: "0.004"
+    total_trades: 1

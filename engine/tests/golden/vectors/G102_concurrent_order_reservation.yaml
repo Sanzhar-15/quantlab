@@ -1,0 +1,81 @@
+# G102: Concurrent Order Reservation
+# Category: exposure
+# Verifies: Multiple orders reserve exposure correctly
+
+id: G102
+name: "Concurrent order reservation"
+category: exposure
+description: |
+  When multiple orders are pending, exposure should be reserved
+  for all pending orders to prevent over-exposure.
+
+tags:
+  - exposure
+  - concurrent
+  - reservation
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+  max_exposure: "50000"  # Max 50% exposure
+
+data:
+  symbols:
+    - symbol: AAPL
+      timeframe: 1d
+      bars:
+        - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+        - {date: "2026-01-05", open: "100.00", high: "105.00", low: "98.00", close: "103.00", volume: 1200000}
+        - {date: "2026-01-06", open: "103.00", high: "108.00", low: "101.00", close: "107.00", volume: 900000}
+    - symbol: MSFT
+      timeframe: 1d
+      bars:
+        - {date: "2026-01-02", open: "400.00", high: "410.00", low: "395.00", close: "405.00", volume: 800000}
+        - {date: "2026-01-05", open: "400.00", high: "410.00", low: "395.00", close: "408.00", volume: 900000}
+        - {date: "2026-01-06", open: "408.00", high: "415.00", low: "405.00", close: "412.00", volume: 750000}
+
+signals:
+  # Two orders totaling $60K on 100K portfolio - should hit 50K limit
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "300"  # 300 * 100 = 30000
+    order_type: market
+  - bar_index: 0
+    action: buy
+    symbol: MSFT
+    quantity: "75"  # 75 * 400 = 30000
+    order_type: market
+
+expected:
+  fills:
+    # First order fills (30K exposure)
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "300"
+      price: "100.00"
+      side: buy
+    # Second order partially fills or rejected due to exposure limit
+    - bar_index: 1
+      symbol: MSFT
+      quantity: "50"  # Limited to ~20K to stay under 50K total
+      price: "400.00"
+      side: buy
+
+  # 30000 + 20000 = 50000 exposure (at limit)
+  final_cash: "50000.00"  # 100000 - 30000 - 20000
+  final_positions:
+    AAPL: "300"
+    MSFT: "50"
+  # AAPL: 300 * 107 = 32100
+  # MSFT: 50 * 412 = 20600
+  final_equity: "102700.00"
+
+  metrics:
+    total_return: "0.027"
+    total_trades: 2

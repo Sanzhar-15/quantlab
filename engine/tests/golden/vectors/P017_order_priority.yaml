@@ -1,0 +1,71 @@
+---
+# P017: Order priority: exits before entries
+# Tests that exit orders are processed before entry orders
+# Spec Reference: Technical Spec §4.4 (Order Priority)
+
+name: "Order Priority - Exits Before Entries"
+description: |
+  Verify that when multiple orders are pending, exits are
+  processed before entries to maximize capital efficiency.
+
+config:
+  initial_cash: "50000.00"
+  commission_model: "none"
+  fill_assumption: "next_open"
+  allow_short: false
+
+data:
+  PRIORITY_TEST:
+    - timestamp: "2024-01-02T09:30:00"
+      open: "100.00"
+      high: "105.00"
+      low: "98.00"
+      close: "102.00"
+      volume: 1000000
+    - timestamp: "2024-01-03T09:30:00"
+      open: "102.00"  # Entry fill price
+      high: "107.00"
+      low: "100.00"
+      close: "105.00"
+      volume: 1000000
+    - timestamp: "2024-01-04T09:30:00"
+      open: "105.00"  # Exit and new entry fill price
+      high: "110.00"
+      low: "103.00"
+      close: "108.00"
+      volume: 1000000
+    - timestamp: "2024-01-05T09:30:00"
+      open: "108.00"
+      high: "112.00"
+      low: "106.00"
+      close: "110.00"
+      volume: 1000000
+
+signals:
+  # Bar 0: Buy 400 shares @ ~$40,000
+  - bar_index: 0
+    symbol: "PRIORITY_TEST"
+    side: "buy"
+    order_type: "market"
+    quantity: "400"
+  # Bar 2: Sell existing AND buy new
+  # If exits processed first, sell returns cash, then buy can execute
+  # If entries processed first, might not have enough cash
+  - bar_index: 2
+    symbol: "PRIORITY_TEST"
+    side: "sell"
+    order_type: "market"
+    quantity: "400"
+  - bar_index: 2
+    symbol: "PRIORITY_TEST"
+    side: "buy"
+    order_type: "market"
+    quantity: "350"
+
+expected:
+  # Exit should be processed first (priority)
+  # Then entry can use freed capital
+  final_positions:
+    PRIORITY_TEST: "350"
+  exit_processed_first: true
+  both_orders_filled: true

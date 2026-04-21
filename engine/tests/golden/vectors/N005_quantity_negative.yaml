@@ -1,0 +1,45 @@
+---
+# N005: Order with negative quantity is rejected
+# Tests order validation for invalid quantities
+# Spec Reference: Technical Spec §4.1 (Order Validation)
+
+name: "Invalid Quantity (Negative)"
+description: |
+  Verify that an order with a negative quantity is rejected
+  during order validation.
+
+config:
+  initial_cash: "100000.00"
+  commission_model: "none"
+  fill_assumption: "next_open"
+  allow_short: false
+
+data:
+  AMZN:
+    - timestamp: "2024-01-02T09:30:00"
+      open: "150.00"
+      high: "155.00"
+      low: "148.00"
+      close: "152.00"
+      volume: 4000000
+    - timestamp: "2024-01-03T09:30:00"
+      open: "152.00"
+      high: "158.00"
+      low: "150.00"
+      close: "156.00"
+      volume: 4500000
+
+signals:
+  - bar_index: 0
+    symbol: "AMZN"
+    side: "buy"
+    order_type: "market"
+    quantity: "-10"  # Invalid negative quantity
+
+expected:
+  final_cash: "100000.00"
+  final_positions:
+    AMZN: "0"
+  trades_count: 0
+  orders_rejected: 1
+  rejection_reason: "invalid_quantity"

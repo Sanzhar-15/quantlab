@@ -1,0 +1,56 @@
+# G004: Market Buy with Gap Down
+# Category: basic_execution
+# Verifies: Market order fills at gap-down open price (favorable)
+
+id: G004
+name: "Market buy with gap down opening"
+category: basic_execution
+description: |
+  Market buy order fills at next bar open even when there's a gap down.
+  This is favorable for a buy order - tests price improvement scenario.
+
+tags:
+  - market_order
+  - gap
+  - basic
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "102.00", low: "99.00", close: "101.00", volume: 1000000}
+    - {date: "2026-01-05", open: "95.00", high: "98.00", low: "94.00", close: "97.00", volume: 2500000}
+    - {date: "2026-01-06", open: "97.50", high: "100.00", low: "96.00", close: "99.00", volume: 1200000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "95.00"
+      side: buy
+
+  final_cash: "90500.00"  # 100000 - (100 * 95)
+  final_positions:
+    AAPL: "100"
+  final_equity: "100400.00"  # 90500 + (100 * 99)
+
+  metrics:
+    total_return: "0.004"
+    total_trades: 1

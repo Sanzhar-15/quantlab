@@ -1,0 +1,58 @@
+# G011: Limit Buy Order - No Fill
+# Category: order_types
+# Verifies: Limit buy order does not fill when price never reaches limit
+
+id: G011
+name: "Limit buy order does not fill"
+category: order_types
+description: |
+  A limit buy order should NOT fill if the bar's low never reaches the limit price.
+  Order remains pending until it fills, expires, or is cancelled.
+
+tags:
+  - limit_order
+  - order_types
+  - no_fill
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "105.00", high: "108.00", low: "104.00", close: "107.00", volume: 1200000}
+    - {date: "2026-01-06", open: "107.00", high: "110.00", low: "106.00", close: "109.00", volume: 900000}
+
+signals:
+  # Limit buy at 102, but bar 1 low is 104 (never touches limit)
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: limit
+    limit_price: "102.00"
+    time_in_force: gfd  # Good for day - expires at close
+
+expected:
+  fills: []  # No fills
+
+  final_cash: "100000.00"  # Unchanged
+  final_positions: {}  # No positions
+  final_equity: "100000.00"
+
+  pending_orders:
+    - symbol: AAPL
+      order_type: limit
+      status: expired  # GFD expired at bar 1 close
+
+  metrics:
+    total_return: "0"
+    total_trades: 0

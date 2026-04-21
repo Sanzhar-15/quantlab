@@ -1,0 +1,63 @@
+# G051: Volume-Based Slippage
+# Category: slippage
+# Verifies: Slippage increases with order size relative to volume
+
+id: G051
+name: "Volume-based slippage model (square-root)"
+category: slippage
+description: |
+  Tests volume-based slippage using the square-root market impact model
+  (Almgren-Chriss style). Larger orders relative to bar volume experience
+  more slippage proportional to sqrt(participation).
+
+  For participation = quantity/volume = 1000/10000 = 0.1:
+  impact_pct = coefficient * sqrt(participation) = 0.1 * sqrt(0.1) ≈ 3.16%
+
+tags:
+  - slippage
+  - volume
+  - market_impact
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: volume
+    impact_factor: "0.1"  # Impact coefficient for sqrt model
+  commission:
+    model: none
+  max_volume_participation: "0.20"
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "102.00", low: "99.00", close: "101.00", volume: 1000000}
+    - {date: "2026-01-05", open: "100.00", high: "103.00", low: "99.00", close: "102.00", volume: 10000}
+    - {date: "2026-01-06", open: "102.50", high: "105.00", low: "101.00", close: "104.00", volume: 1000000}
+
+signals:
+  # Large order relative to volume causes significant slippage
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "1000"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "1000"
+      price: "103.16"  # sqrt(0.1) * 0.1 = 3.16% slippage on $100 open
+      side: buy
+
+  final_cash: "-3162.28"  # 100000 - (1000 * 103.1622776...)
+  final_positions:
+    AAPL: "1000"
+  final_equity: "100837.72"  # -3162.28 + (1000 * 104)
+
+  metrics:
+    total_return: "0.0084"  # (100837.72 - 100000) / 100000
+    total_trades: 1

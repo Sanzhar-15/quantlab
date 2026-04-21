@@ -1,0 +1,48 @@
+---
+# N007: Good-For-Day order expires unfilled
+# Tests that GFD orders that don't fill are cancelled at end of day
+# Spec Reference: Technical Spec §4.3 (Time-in-Force)
+
+name: "GFD Order Expires Unfilled"
+description: |
+  Verify that a Good-For-Day limit order that doesn't reach
+  its limit price is cancelled at the end of the trading day.
+
+config:
+  initial_cash: "100000.00"
+  commission_model: "none"
+  fill_assumption: "next_open"
+  allow_short: false
+
+data:
+  META:
+    - timestamp: "2024-01-02T09:30:00"
+      open: "350.00"
+      high: "360.00"
+      low: "345.00"
+      close: "355.00"
+      volume: 5000000
+    # End of day - GFD orders should expire
+    - timestamp: "2024-01-02T16:00:00"  # Market close
+      open: "355.00"
+      high: "358.00"
+      low: "352.00"
+      close: "356.00"
+      volume: 3000000
+
+signals:
+  - bar_index: 0
+    symbol: "META"
+    side: "buy"
+    order_type: "limit"
+    quantity: "10"
+    limit_price: "340.00"  # Price never reached (low was 345)
+    time_in_force: "gfd"
+
+expected:
+  final_cash: "100000.00"
+  final_positions:
+    META: "0"
+  trades_count: 0
+  orders_expired: 1
+  expiration_reason: "end_of_day"

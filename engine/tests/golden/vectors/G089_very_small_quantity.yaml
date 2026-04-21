@@ -1,0 +1,55 @@
+# G089: Very Small Quantity Order
+# Category: edge_cases
+# Verifies: Single share order fills correctly
+
+id: G089
+name: "Very small quantity order"
+category: edge_cases
+description: |
+  A single share order should fill correctly with proper
+  P&L calculation for fractional equity changes.
+
+tags:
+  - edge_case
+  - small_order
+  - precision
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "105.00", volume: 1200000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "1"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "1"
+      price: "104.50"
+      side: buy
+
+  final_cash: "99895.50"  # 100000 - 104.50
+  final_positions:
+    AAPL: "1"
+  final_equity: "100000.50"  # 99895.50 + 105
+
+  metrics:
+    total_return: "0.000005"
+    total_trades: 1

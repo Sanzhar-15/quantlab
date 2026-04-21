@@ -1,0 +1,50 @@
+# G082: Insufficient Cash Rejection
+# Category: edge_cases
+# Verifies: Orders that exceed available cash are rejected
+
+id: G082
+name: "Order exceeds available cash"
+category: edge_cases
+description: |
+  An order that would require more cash than available should be rejected.
+  Tests buying power validation.
+
+tags:
+  - edge_case
+  - buying_power
+  - rejection
+
+setup:
+  initial_cash: "10000"  # Limited cash
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "102.00", low: "99.00", close: "101.00", volume: 1000000}
+    - {date: "2026-01-05", open: "101.00", high: "103.00", low: "100.00", close: "102.00", volume: 1200000}
+
+signals:
+  # Trying to buy 1000 shares at ~$100 = $100,000, but only have $10,000
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "1000"
+    order_type: market
+
+expected:
+  fills: []
+
+  final_cash: "10000.00"
+  final_positions: {}
+  final_equity: "10000.00"
+
+  metrics:
+    total_return: "0"
+    total_trades: 0

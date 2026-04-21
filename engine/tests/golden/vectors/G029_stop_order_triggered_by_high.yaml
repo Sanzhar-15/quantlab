@@ -1,0 +1,57 @@
+# G029: Stop Order Triggered by High
+# Category: order_types
+# Verifies: Stop buy order triggered when high exceeds stop price
+
+id: G029
+name: "Stop order triggered by high"
+category: order_types
+description: |
+  A stop buy order should trigger when the bar's high
+  exceeds the stop price, filling at the stop price.
+
+tags:
+  - stop
+  - trigger
+  - order_types
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    # High (108) exceeds stop (106)
+    - {date: "2026-01-05", open: "104.00", high: "108.00", low: "103.00", close: "107.00", volume: 1200000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: stop
+    stop_price: "106.00"
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "106.00"
+      side: buy
+
+  final_cash: "89400.00"  # 100000 - (100 * 106)
+  final_positions:
+    AAPL: "100"
+  final_equity: "100100.00"  # 89400 + (100 * 107)
+
+  metrics:
+    total_return: "0.001"
+    total_trades: 1

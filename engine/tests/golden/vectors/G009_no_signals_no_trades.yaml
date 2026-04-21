@@ -1,0 +1,47 @@
+# G009: No Signals No Trades
+# Category: basic_execution
+# Verifies: Strategy with no signals produces no trades
+
+id: G009
+name: "No signals no trades"
+category: basic_execution
+description: |
+  A backtest with no signals generated should complete successfully
+  with no trades and equity unchanged (except for any market movement
+  on existing positions - here we have none).
+
+tags:
+  - basic
+  - edge_case
+  - no_trades
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+    - {date: "2026-01-06", open: "103.00", high: "107.00", low: "101.00", close: "106.00", volume: 900000}
+    - {date: "2026-01-07", open: "106.50", high: "109.00", low: "105.00", close: "108.00", volume: 800000}
+    - {date: "2026-01-08", open: "108.00", high: "112.00", low: "107.00", close: "111.00", volume: 950000}
+
+signals: []
+
+expected:
+  fills: []
+  final_cash: "100000.00"
+  final_positions: {}
+  final_equity: "100000.00"
+
+  metrics:
+    total_return: "0"
+    total_trades: 0

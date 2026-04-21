@@ -1,0 +1,68 @@
+# G014: Stop Sell Order - Triggered (Stop Loss)
+# Category: order_types
+# Verifies: Stop sell order triggers when price drops to stop level
+
+id: G014
+name: "Stop sell order triggers on breakdown"
+category: order_types
+description: |
+  A stop sell order triggers when the bar's low reaches the stop price.
+  This is a stop-loss order to exit a long position on breakdown.
+
+tags:
+  - stop_order
+  - stop_loss
+  - order_types
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "102.00", low: "99.00", close: "101.00", volume: 1000000}
+    - {date: "2026-01-05", open: "101.50", high: "103.00", low: "100.00", close: "102.00", volume: 1200000}
+    - {date: "2026-01-06", open: "101.00", high: "102.00", low: "96.00", close: "97.00", volume: 2500000}
+    - {date: "2026-01-07", open: "96.50", high: "98.00", low: "95.00", close: "97.50", volume: 1800000}
+
+signals:
+  # Buy at bar 0, then stop sell at 98 triggers on bar 2
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+  - bar_index: 1
+    action: sell
+    symbol: AAPL
+    quantity: "100"
+    order_type: stop
+    stop_price: "98.00"
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "101.50"
+      side: buy
+    - bar_index: 2
+      symbol: AAPL
+      quantity: "100"
+      price: "98.00"
+      side: sell
+
+  final_cash: "99650.00"  # 100000 - 10150 + 9800
+  final_positions: {}
+  final_equity: "99650.00"
+
+  metrics:
+    total_return: "-0.0035"
+    total_trades: 2

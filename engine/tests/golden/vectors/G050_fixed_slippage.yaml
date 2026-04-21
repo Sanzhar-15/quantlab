@@ -1,0 +1,58 @@
+# G050: Fixed Slippage Model
+# Category: slippage
+# Verifies: Fixed basis point slippage applied to fills
+
+id: G050
+name: "Fixed slippage model"
+category: slippage
+description: |
+  Tests fixed slippage model that adds a fixed basis point cost to fills.
+  Buy orders get worse fill prices, sell orders get worse fill prices.
+
+tags:
+  - slippage
+  - fixed
+  - cost_model
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: fixed
+    basis_points: "10"  # 10 bps = 0.1%
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "102.00", low: "99.00", close: "101.00", volume: 1000000}
+    - {date: "2026-01-05", open: "100.00", high: "103.00", low: "99.00", close: "102.00", volume: 1200000}
+    - {date: "2026-01-06", open: "102.50", high: "105.00", low: "101.00", close: "104.00", volume: 1100000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "100.10"  # 100.00 + 0.1% slippage
+      side: buy
+      slippage: "0.10"
+
+  final_cash: "89990.00"  # 100000 - (100 * 100.10)
+  final_positions:
+    AAPL: "100"
+  final_equity: "100390.00"  # 89990 + (100 * 104)
+
+  metrics:
+    total_return: "0.0039"
+    total_trades: 1

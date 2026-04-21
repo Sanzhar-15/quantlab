@@ -1,0 +1,73 @@
+# G044: Short Cover with Loss
+# Category: short_selling
+# Verifies: Short position covered at higher price yields loss
+
+id: G044
+name: "Short cover with loss"
+category: short_selling
+description: |
+  A short position covered at a higher price than entry should
+  result in a loss. Tests proper short P&L calculation for losses.
+
+tags:
+  - short
+  - cover
+  - loss
+  - short_selling
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+  allow_shorting: true
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "105.00", volume: 1200000}
+    - {date: "2026-01-06", open: "106.00", high: "112.00", low: "105.00", close: "111.00", volume: 1500000}
+    - {date: "2026-01-07", open: "112.00", high: "115.00", low: "110.00", close: "114.00", volume: 1800000}
+
+signals:
+  # Short sell at bar 0
+  - bar_index: 0
+    action: sell_short
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+  # Cover at bar 2 (price went up)
+  - bar_index: 2
+    action: buy_to_cover
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "104.50"
+      side: sell_short
+    - bar_index: 3
+      symbol: AAPL
+      quantity: "100"
+      price: "112.00"
+      side: buy_to_cover
+
+  # Short: receive 104.50 * 100 = 10450
+  # Cover: pay 112 * 100 = 11200
+  # Loss: 10450 - 11200 = -750
+  final_cash: "99250.00"
+  final_positions: {}
+  final_equity: "99250.00"
+
+  metrics:
+    total_return: "-0.0075"
+    total_trades: 2

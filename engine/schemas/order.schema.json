@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quantlab.io/schemas/order.schema.json",
+  "title": "Order",
+  "description": "Trading order schema for Quantlab",
+  "type": "object",
+  "required": ["order_id", "symbol", "side", "quantity", "order_type", "time_in_force"],
+  "properties": {
+    "order_id": {
+      "type": "string",
+      "description": "Unique order identifier (UUID)"
+    },
+    "client_order_id": {
+      "type": "string",
+      "description": "Client-provided order ID for idempotency"
+    },
+    "symbol": {
+      "type": "string",
+      "description": "Trading symbol (e.g., AAPL)",
+      "minLength": 1,
+      "maxLength": 10
+    },
+    "side": {
+      "type": "string",
+      "enum": ["BUY", "SELL"],
+      "description": "Order side"
+    },
+    "quantity": {
+      "type": "number",
+      "description": "Order quantity (shares)",
+      "exclusiveMinimum": 0
+    },
+    "order_type": {
+      "type": "string",
+      "enum": ["MARKET", "LIMIT", "STOP", "STOP_LIMIT"],
+      "description": "Order type"
+    },
+    "time_in_force": {
+      "type": "string",
+      "enum": ["GFD", "GTC", "IOC"],
+      "description": "Time in force: GFD (good for day), GTC (good till cancelled), IOC (immediate or cancel)"
+    },
+    "limit_price": {
+      "type": ["number", "null"],
+      "description": "Limit price (required for LIMIT, STOP_LIMIT)",
+      "exclusiveMinimum": 0
+    },
+    "stop_price": {
+      "type": ["number", "null"],
+      "description": "Stop trigger price (required for STOP, STOP_LIMIT)",
+      "exclusiveMinimum": 0
+    },
+    "status": {
+      "type": "string",
+      "enum": ["PENDING", "SUBMITTED", "ACCEPTED", "PARTIAL", "FILLED", "CANCELLED", "REJECTED", "EXPIRED"],
+      "description": "Order status"
+    },
+    "filled_quantity": {
+      "type": "number",
+      "description": "Quantity filled so far",
+      "minimum": 0
+    },
+    "avg_fill_price": {
+      "type": ["number", "null"],
+      "description": "Average fill price",
+      "exclusiveMinimum": 0
+    },
+    "session_id": {
+      "type": "string",
+      "description": "Trading session ID"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Order creation timestamp (ISO 8601)"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Last update timestamp (ISO 8601)"
+    }
+  },
+  "if": {
+    "properties": {
+      "order_type": { "enum": ["LIMIT", "STOP_LIMIT"] }
+    }
+  },
+  "then": {
+    "required": ["limit_price"]
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "order_type": { "enum": ["STOP", "STOP_LIMIT"] }
+        }
+      },
+      "then": {
+        "required": ["stop_price"]
+      }
+    }
+  ]
+}

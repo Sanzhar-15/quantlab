@@ -1,0 +1,59 @@
+# G022: IOC Order Partial Fill
+# Category: time_in_force
+# Verifies: Immediate-or-cancel order with partial fill
+
+id: G022
+name: "IOC order partial fill"
+category: time_in_force
+description: |
+  An IOC (Immediate-Or-Cancel) order fills what it can immediately
+  and cancels the remainder. Tests partial fill handling.
+
+tags:
+  - ioc
+  - time_in_force
+  - partial_fill
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+  max_volume_participation: "0.10"
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "102.00", low: "99.00", close: "101.00", volume: 1000000}
+    - {date: "2026-01-05", open: "101.00", high: "103.00", low: "100.00", close: "102.00", volume: 500}
+    - {date: "2026-01-06", open: "102.00", high: "104.00", low: "101.00", close: "103.00", volume: 1000000}
+
+signals:
+  # IOC buy 100 shares, but bar 1 only has 500 volume (10% = 50 max)
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+    time_in_force: ioc
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "50"
+      price: "101.00"
+      side: buy
+
+  final_cash: "94950.00"  # 100000 - (50 * 101)
+  final_positions:
+    AAPL: "50"
+  final_equity: "100100.00"  # 94950 + (50 * 103)
+
+  metrics:
+    total_return: "0.001"
+    total_trades: 1

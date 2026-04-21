@@ -1,0 +1,57 @@
+# G028: Limit Order Exact Price Match
+# Category: order_types
+# Verifies: Limit order fills at exact limit price
+
+id: G028
+name: "Limit order exact price match"
+category: order_types
+description: |
+  A limit buy order should fill when the low touches exactly
+  the limit price.
+
+tags:
+  - limit
+  - exact_match
+  - order_types
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    # Low exactly matches limit price
+    - {date: "2026-01-05", open: "104.00", high: "106.00", low: "102.00", close: "105.00", volume: 1200000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: limit
+    limit_price: "102.00"
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "102.00"
+      side: buy
+
+  final_cash: "89800.00"  # 100000 - (100 * 102)
+  final_positions:
+    AAPL: "100"
+  final_equity: "100300.00"  # 89800 + (100 * 105)
+
+  metrics:
+    total_return: "0.003"
+    total_trades: 1

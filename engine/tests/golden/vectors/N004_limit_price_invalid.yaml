@@ -1,0 +1,46 @@
+---
+# N004: Limit order with price of zero is rejected
+# Tests order validation for invalid prices
+# Spec Reference: Technical Spec §4.1 (Order Validation)
+
+name: "Invalid Limit Price (Zero)"
+description: |
+  Verify that a limit order with a price of zero is rejected
+  during order validation.
+
+config:
+  initial_cash: "100000.00"
+  commission_model: "none"
+  fill_assumption: "next_open"
+  allow_short: false
+
+data:
+  NVDA:
+    - timestamp: "2024-01-02T09:30:00"
+      open: "500.00"
+      high: "520.00"
+      low: "495.00"
+      close: "510.00"
+      volume: 3000000
+    - timestamp: "2024-01-03T09:30:00"
+      open: "510.00"
+      high: "530.00"
+      low: "505.00"
+      close: "525.00"
+      volume: 3500000
+
+signals:
+  - bar_index: 0
+    symbol: "NVDA"
+    side: "buy"
+    order_type: "limit"
+    quantity: "10"
+    limit_price: "0.00"  # Invalid price
+
+expected:
+  final_cash: "100000.00"
+  final_positions:
+    NVDA: "0"
+  trades_count: 0
+  orders_rejected: 1
+  rejection_reason: "invalid_price"

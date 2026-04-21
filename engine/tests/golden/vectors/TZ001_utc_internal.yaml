@@ -1,0 +1,60 @@
+# TZ001: UTC Internal Storage
+# Category: timezone
+# Verifies: All timestamps stored in UTC internally
+
+id: TZ001
+name: "UTC internal timestamp storage"
+category: timezone
+description: |
+  All timestamps should be stored and processed in UTC internally,
+  only converting to local time for display purposes.
+
+tags:
+  - timezone
+  - utc
+  - storage
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    # Timestamps in UTC
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "104.50"
+      side: buy
+
+  final_cash: "89550.00"
+  final_positions:
+    AAPL: "100"
+  final_equity: "99850.00"
+
+  metrics:
+    total_return: "-0.0015"
+    total_trades: 1
+
+  timezone:
+    internal_utc: true
+    timestamps_consistent: true

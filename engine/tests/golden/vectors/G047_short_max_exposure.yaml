@@ -1,0 +1,62 @@
+# G047: Short Selling Max Exposure
+# Category: order_types
+# Verifies: Short selling respects max exposure limits
+
+id: G047
+name: "Short selling respects max exposure"
+category: order_types
+description: |
+  Short selling should be blocked when it would cause
+  gross exposure to exceed the maximum limit.
+
+tags:
+  - short
+  - exposure
+  - risk
+
+skip: true
+skip_reason: "Exposure limit for short selling not fully implemented"
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+  risk_limits:
+    max_exposure: "50000"
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+
+signals:
+  # Try to short 600 shares at ~100 = $60,000 exposure, exceeds $50,000 limit
+  - bar_index: 0
+    action: sell_short
+    symbol: AAPL
+    quantity: "600"
+    order_type: market
+
+expected:
+  # Order should be limited to max exposure
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "478"  # Limited by $50,000 / $104.50 = ~478
+      price: "104.50"
+      side: sell_short
+
+  final_cash: "149981.00"  # 100000 + (478 * 104.50)
+  final_positions:
+    AAPL: "-478"
+  final_equity: "100707.00"
+
+  metrics:
+    total_return: "0.00707"
+    total_trades: 1

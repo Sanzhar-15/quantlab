@@ -1,0 +1,58 @@
+# G100: Exposure Limit Blocks Order
+# Category: exposure
+# Verifies: Orders that would breach exposure limits are rejected
+
+id: G100
+name: "Exposure limit blocks order"
+category: exposure
+description: |
+  An order that would cause gross exposure to exceed the configured limit
+  should be rejected before submission. This tests the exposure reservation model.
+
+tags:
+  - exposure
+  - risk_limits
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+  risk_limits:
+    max_exposure: "0.50"  # 50% max gross exposure
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "100.00", volume: 1000000}
+    - {date: "2026-01-05", open: "100.00", high: "106.00", low: "99.00", close: "105.00", volume: 1200000}
+
+signals:
+  # Try to buy 600 shares at ~$100 = $60,000 = 60% exposure (exceeds 50% limit)
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "600"
+    order_type: market
+
+expected:
+  fills: []  # No fills - order rejected
+
+  rejected_orders:
+    - symbol: AAPL
+      quantity: "600"
+      reason: EXPOSURE_LIMIT_BREACH
+      projected_exposure: "0.60"
+      max_allowed: "0.50"
+
+  final_cash: "100000.00"
+  final_positions: {}
+  final_equity: "100000.00"
+
+  metrics:
+    total_return: "0"
+    total_trades: 0

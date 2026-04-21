@@ -1,0 +1,49 @@
+---
+# N013: Stop-limit order gaps through limit
+# Tests stop triggers but price gaps past limit (unfilled)
+# Spec Reference: Technical Spec §4.2 (Order Types)
+
+name: "Stop-Limit Gap Through"
+description: |
+  Verify that a stop-limit order is not filled when the stop
+  triggers but the price gaps through the limit price.
+
+config:
+  initial_cash: "100000.00"
+  commission_model: "none"
+  fill_assumption: "next_open"
+  allow_short: true
+
+data:
+  VOLATILE:
+    - timestamp: "2024-01-02T09:30:00"
+      open: "100.00"
+      high: "105.00"
+      low: "98.00"
+      close: "104.00"
+      volume: 5000000
+    # Gap down overnight - stop triggers but gaps through limit
+    - timestamp: "2024-01-03T09:30:00"
+      open: "85.00"   # Opens below stop AND limit (gap through)
+      high: "88.00"
+      low: "82.00"
+      close: "86.00"
+      volume: 10000000
+
+signals:
+  - bar_index: 0
+    symbol: "VOLATILE"
+    side: "sell"
+    order_type: "stop_limit"
+    quantity: "100"
+    stop_price: "95.00"   # Stop triggers (low=82 < 95)
+    limit_price: "93.00"  # But opens at 85, below limit
+
+expected:
+  final_cash: "100000.00"
+  final_positions:
+    VOLATILE: "0"
+  trades_count: 0
+  stop_triggered: true
+  limit_reached: false
+  reason: "gap_through_limit"

@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quantlab.io/schemas/fill.schema.json",
+  "title": "Fill",
+  "description": "Order fill/execution schema for Quantlab",
+  "type": "object",
+  "required": ["fill_id", "order_id", "symbol", "side", "quantity", "price", "timestamp"],
+  "properties": {
+    "fill_id": {
+      "type": "string",
+      "description": "Unique fill identifier"
+    },
+    "order_id": {
+      "type": "string",
+      "description": "Associated order ID"
+    },
+    "symbol": {
+      "type": "string",
+      "description": "Trading symbol"
+    },
+    "side": {
+      "type": "string",
+      "enum": ["BUY", "SELL"],
+      "description": "Fill side"
+    },
+    "quantity": {
+      "type": "number",
+      "description": "Fill quantity",
+      "exclusiveMinimum": 0
+    },
+    "price": {
+      "type": "number",
+      "description": "Fill price",
+      "exclusiveMinimum": 0
+    },
+    "commission": {
+      "type": "number",
+      "description": "Commission charged",
+      "minimum": 0
+    },
+    "is_partial": {
+      "type": "boolean",
+      "description": "Whether this is a partial fill"
+    },
+    "sequence": {
+      "type": "integer",
+      "description": "Fill sequence number for this order",
+      "minimum": 1
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Fill timestamp (ISO 8601)"
+    },
+    "session_id": {
+      "type": "string",
+      "description": "Trading session ID"
+    },
+    "venue": {
+      "type": "string",
+      "description": "Execution venue"
+    }
+  }
+}

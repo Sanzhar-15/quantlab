@@ -1,0 +1,53 @@
+# G021: Day Order Expires Unfilled
+# Category: time_in_force
+# Verifies: Day order expires at end of day if not filled
+
+id: G021
+name: "Day order expires unfilled"
+category: time_in_force
+description: |
+  A DAY order expires at the end of the trading day if not filled.
+  This test verifies the order doesn't carry over to the next bar.
+
+tags:
+  - day_order
+  - time_in_force
+  - expiration
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "102.00", low: "99.00", close: "101.00", volume: 1000000}
+    - {date: "2026-01-05", open: "101.50", high: "103.00", low: "100.50", close: "102.00", volume: 1200000}
+    - {date: "2026-01-06", open: "101.00", high: "102.50", low: "98.00", close: "99.00", volume: 1500000}
+
+signals:
+  # Day limit buy at 95 - never fills, expires after bar 1
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: limit
+    limit_price: "95.00"
+    time_in_force: gfd
+
+expected:
+  fills: []
+
+  final_cash: "100000.00"
+  final_positions: {}
+  final_equity: "100000.00"
+
+  metrics:
+    total_return: "0"
+    total_trades: 0

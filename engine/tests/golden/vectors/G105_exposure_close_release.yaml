@@ -1,0 +1,87 @@
+# G105: Exposure Released on Position Close
+# Category: exposure
+# Verifies: Closing a position releases exposure for new orders
+
+id: G105
+name: "Closing position releases exposure"
+category: exposure
+description: |
+  When a position is closed, the exposure should be released,
+  allowing new orders to use the freed capacity.
+
+tags:
+  - exposure
+  - close
+  - release
+
+skip: true
+skip_reason: "Exposure release on close not fully implemented"
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+  risk_limits:
+    max_exposure: "50000"
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+    - {date: "2026-01-06", open: "103.00", high: "105.00", low: "102.00", close: "104.50", volume: 1100000}
+    - {date: "2026-01-07", open: "104.00", high: "107.00", low: "103.00", close: "106.00", volume: 1300000}
+
+signals:
+  # Buy to max exposure
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "478"  # ~$50,000
+    order_type: market
+  # Sell all
+  - bar_index: 1
+    action: sell
+    symbol: AAPL
+    quantity: "478"
+    order_type: market
+  # Buy again - should work since exposure was released
+  - bar_index: 2
+    action: buy
+    symbol: AAPL
+    quantity: "478"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "478"
+      price: "104.50"
+      side: buy
+    - bar_index: 2
+      symbol: AAPL
+      quantity: "478"
+      price: "103.00"
+      side: sell
+    - bar_index: 3
+      symbol: AAPL
+      quantity: "478"
+      price: "104.00"
+      side: buy
+
+  # Profit from first round trip: (103 - 104.50) * 478 = -$717
+  # New position at $104
+  final_cash: "717.00"
+  final_positions:
+    AAPL: "478"
+  final_equity: "51385.00"
+
+  metrics:
+    total_return: "-0.486150"
+    total_trades: 3

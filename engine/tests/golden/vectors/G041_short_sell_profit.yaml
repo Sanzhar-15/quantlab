@@ -1,0 +1,67 @@
+# G041: Short Sell with Profit
+# Category: short_selling
+# Verifies: Short sell then cover at lower price for profit
+
+id: G041
+name: "Short sell with profit on cover"
+category: short_selling
+description: |
+  Short sell shares, then cover at a lower price to realize profit.
+  Tests short position P&L calculation.
+
+tags:
+  - short_sell
+  - cover
+  - profit
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "102.00", low: "99.00", close: "101.00", volume: 1000000}
+    - {date: "2026-01-05", open: "101.50", high: "103.00", low: "100.00", close: "100.50", volume: 1200000}
+    - {date: "2026-01-06", open: "100.00", high: "101.00", low: "95.00", close: "96.00", volume: 2000000}
+    - {date: "2026-01-07", open: "95.50", high: "97.00", low: "94.00", close: "95.00", volume: 1800000}
+    - {date: "2026-01-08", open: "95.00", high: "96.00", low: "93.00", close: "94.00", volume: 1500000}
+
+signals:
+  - bar_index: 0
+    action: sell
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+  - bar_index: 2
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "101.50"
+      side: sell
+    - bar_index: 3
+      symbol: AAPL
+      quantity: "100"
+      price: "95.50"
+      side: buy
+
+  final_cash: "100600.00"  # 100000 + 10150 - 9550
+  final_positions: {}
+  final_equity: "100600.00"
+
+  metrics:
+    total_return: "0.006"
+    total_trades: 2

@@ -1,0 +1,73 @@
+# G043: Short Cover with Profit
+# Category: short_selling
+# Verifies: Short position closed at lower price yields profit
+
+id: G043
+name: "Short cover with profit"
+category: short_selling
+description: |
+  A short position covered at a lower price than entry should
+  result in a profit. Tests proper short P&L calculation.
+
+tags:
+  - short
+  - cover
+  - profit
+  - short_selling
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+  allow_shorting: true
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+    - {date: "2026-01-06", open: "102.00", high: "103.00", low: "95.00", close: "96.00", volume: 1500000}
+    - {date: "2026-01-07", open: "95.00", high: "97.00", low: "93.00", close: "94.00", volume: 1800000}
+
+signals:
+  # Short sell at bar 0
+  - bar_index: 0
+    action: sell_short
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+  # Cover at bar 2
+  - bar_index: 2
+    action: buy_to_cover
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "104.50"
+      side: sell_short
+    - bar_index: 3
+      symbol: AAPL
+      quantity: "100"
+      price: "95.00"
+      side: buy_to_cover
+
+  # Short: receive 104.50 * 100 = 10450
+  # Cover: pay 95 * 100 = 9500
+  # Profit: 10450 - 9500 = 950
+  final_cash: "100950.00"
+  final_positions: {}
+  final_equity: "100950.00"
+
+  metrics:
+    total_return: "0.0095"
+    total_trades: 2

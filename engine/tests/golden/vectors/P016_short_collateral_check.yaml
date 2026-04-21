@@ -1,0 +1,80 @@
+---
+# P016: Short collateral properly checked for total exposure
+# Tests that short collateral includes existing shorts + new short
+# Spec Reference: Technical Spec §5.1 (Short Selling)
+
+name: "Short Collateral Total Exposure Check"
+description: |
+  Verify that short selling properly calculates total collateral
+  requirement including all existing short positions.
+
+config:
+  initial_cash: "100000.00"
+  commission_model: "none"
+  fill_assumption: "next_open"
+  allow_short: true
+  short_collateral_ratio: "1.5"  # 150% collateral required
+
+data:
+  STOCK_A:
+    - timestamp: "2024-01-02T09:30:00"
+      open: "100.00"
+      high: "105.00"
+      low: "98.00"
+      close: "103.00"
+      volume: 1000000
+    - timestamp: "2024-01-03T09:30:00"
+      open: "103.00"
+      high: "108.00"
+      low: "101.00"
+      close: "106.00"
+      volume: 1000000
+    - timestamp: "2024-01-04T09:30:00"
+      open: "106.00"
+      high: "110.00"
+      low: "104.00"
+      close: "108.00"
+      volume: 1000000
+  STOCK_B:
+    - timestamp: "2024-01-02T09:30:00"
+      open: "200.00"
+      high: "210.00"
+      low: "195.00"
+      close: "205.00"
+      volume: 500000
+    - timestamp: "2024-01-03T09:30:00"
+      open: "205.00"
+      high: "215.00"
+      low: "200.00"
+      close: "210.00"
+      volume: 500000
+    - timestamp: "2024-01-04T09:30:00"
+      open: "210.00"
+      high: "220.00"
+      low: "205.00"
+      close: "215.00"
+      volume: 500000
+
+signals:
+  # First short: $10,300 value, requires $15,450 collateral
+  - bar_index: 0
+    symbol: "STOCK_A"
+    side: "sell_short"
+    order_type: "market"
+    quantity: "100"
+  # Second short: $20,500 value
+  # Total short value = $30,800, requires $46,200 collateral
+  # Available equity should be sufficient
+  - bar_index: 1
+    symbol: "STOCK_B"
+    side: "sell_short"
+    order_type: "market"
+    quantity: "100"
+
+expected:
+  final_positions:
+    STOCK_A: "-100"
+    STOCK_B: "-100"
+  total_short_value: "30800.00"
+  collateral_requirement: "46200.00"
+  all_shorts_filled: true

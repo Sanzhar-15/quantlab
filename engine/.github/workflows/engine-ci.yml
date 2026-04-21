@@ -1,0 +1,238 @@
+name: Engine CI
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'engine/**'
+      - '.github/workflows/engine-ci.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'engine/**'
+      - '.github/workflows/engine-ci.yml'
+
+defaults:
+  run:
+    working-directory: engine
+
+jobs:
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run Ruff linter
+        run: ruff check quantlab tests
+
+      - name: Run Ruff formatter check
+        run: ruff format --check quantlab tests
+
+      - name: Run Pyright type checker
+        run: pyright quantlab
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.11', '3.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/ --cov=quantlab --cov-report=xml --cov-report=html -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        with:
+          files: ./engine/coverage.xml
+          flags: engine
+          name: engine-coverage
+
+  golden:
+    name: Golden Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run golden tests
+        run: pytest tests/golden/ -v -m golden
+
+  benchmark:
+    name: Performance Benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,benchmark]"
+
+      - name: Run benchmarks
+        run: python -m benchmarks.runner --quick -o benchmark-results.json
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: engine/benchmark-results.json
+          retention-days: 30
+
+      - name: Check benchmark thresholds
+        run: python -m benchmarks.check --current benchmark-results.json --threshold 1.5
+        continue-on-error: true  # Don't fail CI on benchmark regression, just warn
+
+  security:
+    name: Security Scanning (FIX-CI002)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install bandit safety pip-audit
+
+      - name: Run Bandit security linter
+        run: bandit -r quantlab -ll -ii --skip B101,B311
+        continue-on-error: true  # Report but don't fail initially
+
+      - name: Check for known vulnerabilities in dependencies
+        run: pip-audit --ignore-vuln PYSEC-2022-43012
+        continue-on-error: true  # Report but don't fail initially
+
+      - name: Upload security report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-report
+          path: |
+            bandit-report.txt
+          retention-days: 30
+
+  memory-profiling:
+    name: Memory Profiling (FIX-CI004)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,benchmark]"
+          pip install memray tracemalloc-utils memory-profiler
+
+      - name: Run memory profiling on benchmarks
+        run: |
+          # Profile memory during benchmark run
+          python -c "
+          import tracemalloc
+          import json
+          from pathlib import Path
+
+          tracemalloc.start()
+
+          # Run a simple backtest to measure memory
+          try:
+              from benchmarks.runner import BenchmarkRunner
+              runner = BenchmarkRunner()
+              # Run just the small benchmark for memory profiling
+              from benchmarks.runner import BENCHMARKS
+              if BENCHMARKS:
+                  config = BENCHMARKS[0]
+                  result = runner.run_benchmark(config)
+                  print(f'Benchmark {config.name}: {result.mean:.3f}s mean')
+          except Exception as e:
+              print(f'Benchmark error (expected if no data): {e}')
+
+          current, peak = tracemalloc.get_traced_memory()
+          tracemalloc.stop()
+
+          # Write memory report
+          report = {
+              'current_mb': current / 1024 / 1024,
+              'peak_mb': peak / 1024 / 1024,
+              'threshold_mb': 500,  # Alert if > 500MB
+              'passed': peak / 1024 / 1024 < 500
+          }
+
+          print(f'Memory: current={report[\"current_mb\"]:.1f}MB, peak={report[\"peak_mb\"]:.1f}MB')
+
+          Path('memory-report.json').write_text(json.dumps(report, indent=2))
+          "
+
+      - name: Check memory thresholds
+        run: |
+          python -c "
+          import json
+          from pathlib import Path
+
+          report_path = Path('memory-report.json')
+          if report_path.exists():
+              report = json.loads(report_path.read_text())
+              if not report.get('passed', True):
+                  print(f'WARNING: Memory usage ({report[\"peak_mb\"]:.1f}MB) exceeds threshold ({report[\"threshold_mb\"]}MB)')
+              else:
+                  print(f'Memory usage OK: {report[\"peak_mb\"]:.1f}MB')
+          "
+
+      - name: Upload memory report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: memory-report
+          path: engine/memory-report.json
+          retention-days: 30

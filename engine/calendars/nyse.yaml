@@ -1,0 +1,58 @@
+# NYSE Market Calendar
+# Source: NYSE official holiday schedule
+# Updated: 2026-01-26
+
+name: "NYSE"
+description: "New York Stock Exchange"
+timezone: "America/New_York"
+
+regular_hours:
+  open: "09:30"
+  close: "16:00"
+
+extended_hours:
+  pre_market_open: "04:00"
+  pre_market_close: "09:30"
+  after_hours_open: "16:00"
+  after_hours_close: "20:00"
+
+# Trading days per year (used for annualization)
+trading_days_per_year: 252
+
+# 2026 Holidays (NYSE closed)
+holidays:
+  - date: "2026-01-01"
+    name: "New Year's Day"
+  - date: "2026-01-19"
+    name: "Martin Luther King Jr. Day"
+  - date: "2026-02-16"
+    name: "Presidents' Day"
+  - date: "2026-04-03"
+    name: "Good Friday"
+  - date: "2026-05-25"
+    name: "Memorial Day"
+  - date: "2026-06-19"
+    name: "Juneteenth National Independence Day"
+  - date: "2026-07-03"
+    name: "Independence Day (observed)"
+  - date: "2026-09-07"
+    name: "Labor Day"
+  - date: "2026-11-26"
+    name: "Thanksgiving Day"
+  - date: "2026-12-25"
+    name: "Christmas Day"
+
+# 2026 Early Closes (1:00 PM ET)
+early_closes:
+  - date: "2026-11-27"
+    close: "13:00"
+    name: "Day after Thanksgiving"
+  - date: "2026-12-24"
+    close: "13:00"
+    name: "Christmas Eve"
+
+# 2027 Holidays (preview)
+# holidays_2027:
+#   - date: "2027-01-01"
+#     name: "New Year's Day"
+#   # ... to be updated annually in December

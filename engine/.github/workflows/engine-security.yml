@@ -1,0 +1,187 @@
+name: Engine Security Scan (FIX-CI003)
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'engine/**'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'engine/**'
+  schedule:
+    # Run weekly on Monday at 6 AM UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: engine
+
+jobs:
+  bandit:
+    name: Bandit Security Linter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Bandit
+        run: pip install bandit[toml]
+
+      - name: Run Bandit scan
+        run: |
+          bandit -r quantlab \
+            -ll -ii \
+            --skip B101,B311 \
+            -f json -o bandit-results.json
+        continue-on-error: true
+
+      - name: Run Bandit (SARIF for GitHub)
+        run: |
+          bandit -r quantlab \
+            -ll -ii \
+            --skip B101,B311 \
+            -f sarif -o bandit-results.sarif
+        continue-on-error: true
+
+      - name: Upload SARIF results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: engine/bandit-results.sarif
+          category: bandit
+
+      - name: Upload JSON results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-results
+          path: engine/bandit-results.json
+          retention-days: 30
+
+  dependency-audit:
+    name: Dependency Vulnerability Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies and audit tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install pip-audit safety
+
+      - name: Run pip-audit
+        run: |
+          pip-audit \
+            --ignore-vuln PYSEC-2022-43012 \
+            -f json -o pip-audit-results.json
+        continue-on-error: true
+
+      - name: Run Safety check
+        run: |
+          safety check --json > safety-results.json
+        continue-on-error: true
+
+      - name: Upload audit results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-audit
+          path: |
+            engine/pip-audit-results.json
+            engine/safety-results.json
+          retention-days: 30
+
+  secrets-scan:
+    name: Secrets Detection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for git-secrets
+
+      - name: Install detect-secrets
+        run: pip install detect-secrets
+
+      - name: Run detect-secrets
+        run: |
+          detect-secrets scan \
+            --baseline .secrets.baseline \
+            --exclude-files '\.git|node_modules|\.pyc|\.pyo' \
+            > secrets-scan.json
+        continue-on-error: true
+
+      - name: Upload secrets scan
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: secrets-scan
+          path: engine/secrets-scan.json
+          retention-days: 7
+
+  license-check:
+    name: License Compliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pip-licenses
+        run: |
+          pip install -e ".[dev]"
+          pip install pip-licenses
+
+      - name: Generate license report
+        run: |
+          pip-licenses \
+            --format=json \
+            --with-urls \
+            --output-file=licenses.json
+
+      - name: Check for problematic licenses
+        run: |
+          pip-licenses \
+            --fail-on="GPL;AGPL;LGPL" \
+            --allow-only="MIT;BSD;Apache;ISC;MPL;PSF;Public Domain;WTFPL"
+        continue-on-error: true
+
+      - name: Upload license report
+        uses: actions/upload-artifact@v4
+        with:
+          name: license-report
+          path: engine/licenses.json
+          retention-days: 30
+
+  security-summary:
+    name: Security Summary
+    runs-on: ubuntu-latest
+    needs: [bandit, dependency-audit, secrets-scan, license-check]
+    if: always()
+    steps:
+      - name: Create security summary
+        run: |
+          echo "## Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Scan | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Bandit (Code) | ${{ needs.bandit.result == 'success' && '✅' || '⚠️' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependencies | ${{ needs.dependency-audit.result == 'success' && '✅' || '⚠️' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Secrets | ${{ needs.secrets-scan.result == 'success' && '✅' || '⚠️' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Licenses | ${{ needs.license-check.result == 'success' && '✅' || '⚠️' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "See artifacts for detailed reports." >> $GITHUB_STEP_SUMMARY

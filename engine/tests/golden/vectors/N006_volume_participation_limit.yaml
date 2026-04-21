@@ -1,0 +1,44 @@
+---
+# N006: Order fill limited by volume participation
+# Tests that fills are capped at max volume participation
+# Spec Reference: Technical Spec §3.3 (Volume Participation)
+
+name: "Volume Participation Limit"
+description: |
+  Verify that orders are partially filled when the requested
+  quantity exceeds the maximum volume participation limit.
+
+config:
+  initial_cash: "1000000.00"
+  commission_model: "none"
+  fill_assumption: "next_open"
+  max_volume_participation: "0.10"  # 10% max participation
+
+data:
+  LOW_VOL:
+    - timestamp: "2024-01-02T09:30:00"
+      open: "50.00"
+      high: "52.00"
+      low: "49.00"
+      close: "51.00"
+      volume: 1000  # Very low volume
+    - timestamp: "2024-01-03T09:30:00"
+      open: "51.00"
+      high: "53.00"
+      low: "50.00"
+      close: "52.00"
+      volume: 1000
+
+signals:
+  - bar_index: 0
+    symbol: "LOW_VOL"
+    side: "buy"
+    order_type: "market"
+    quantity: "500"  # Want 500, but 10% of 1000 = 100 max
+
+expected:
+  final_positions:
+    LOW_VOL: "100"  # Only filled up to volume limit
+  fill_quantity: "100"
+  unfilled_quantity: "400"
+  partial_fill: true

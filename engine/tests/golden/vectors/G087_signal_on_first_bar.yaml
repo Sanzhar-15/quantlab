@@ -1,0 +1,55 @@
+# G087: Signal on First Bar
+# Category: edge_cases
+# Verifies: Signal on first bar fills on second bar
+
+id: G087
+name: "Signal on first bar"
+category: edge_cases
+description: |
+  A signal generated on the very first bar should result
+  in a fill on the second bar at the open price.
+
+tags:
+  - edge_case
+  - first_bar
+  - timing
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "105.00", volume: 1200000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "104.50"
+      side: buy
+
+  final_cash: "89550.00"  # 100000 - (100 * 104.50)
+  final_positions:
+    AAPL: "100"
+  final_equity: "100050.00"  # 89550 + (100 * 105)
+
+  metrics:
+    total_return: "0.0005"
+    total_trades: 1

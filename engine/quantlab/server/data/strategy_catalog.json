@@ -1,0 +1,1994 @@
+[
+  {
+    "id": "backtesting-engines",
+    "label": "Backtesting Engines",
+    "description": "The computational backbone — determines simulation fidelity, speed, and what types of strategies can be tested.",
+    "order": 1,
+    "icon": "play-circle",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "event-driven-backtest",
+        "label": "Event-Driven Backtest",
+        "description": "Bar-by-bar / tick-by-tick with realistic order routing and fill logic",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "vectorised-backtest",
+        "label": "Vectorised Backtest",
+        "description": "NumPy/Pandas array operations for ultra-fast parameter sweeps and prototyping",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "walk-forward-rolling",
+        "label": "Walk-Forward (Rolling Window)",
+        "description": "Rolls fixed-length train window forward, re-fitting and testing OOS",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "walk-forward-expanding",
+        "label": "Walk-Forward (Expanding Window)",
+        "description": "Expands training window cumulatively while testing on next OOS slice",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "out-of-sample-holdout",
+        "label": "Out-of-Sample Holdout",
+        "description": "Reserves final calendar segment never seen during development",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "paper-trading",
+        "label": "Paper Trading / Live Simulation",
+        "description": "Forwards live data through strategy without real capital",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "multi-asset-cross-sectional",
+        "label": "Multi-Asset Cross-Sectional",
+        "description": "Ranks/scores universe each period and allocates across instruments",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "intraday-tick-backtest",
+        "label": "Intraday / Tick Backtest",
+        "description": "Sub-daily resolution with intraday session handling and microstructure",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "monte-carlo-backtest",
+        "label": "Monte Carlo Backtest",
+        "description": "Reshuffles trade returns or blocks to build equity curve confidence intervals",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "synthetic-data-backtest",
+        "label": "Synthetic Data Backtest",
+        "description": "Tests on generated paths (GBM, regime-switching, bootstrap) to stress robustness",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "multi-timeframe-backtest",
+        "label": "Multi-Timeframe Backtest",
+        "description": "Simultaneously consumes multiple bar frequencies (daily signal + hourly execution)",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "regime-conditional-backtest",
+        "label": "Regime-Conditional Backtest",
+        "description": "Segments history by detected regimes and reports per-regime performance",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "performance-analytics",
+    "label": "Performance Analytics",
+    "description": "The metrics defining whether a strategy is worth trading. CAGR, Sharpe, max drawdown, and profit factor are the minimum viable set.",
+    "order": 2,
+    "icon": "dashboard",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "cagr",
+        "label": "CAGR (Compound Annual Growth Rate)",
+        "description": "Annualised geometric return — the first number every investor asks for",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "sharpe-ratio",
+        "label": "Sharpe Ratio",
+        "description": "Annualised excess return / annualised volatility — the universal risk-adjusted metric",
+        "tier": "essential",
+        "implemented": true,
+        "cross_ref": null
+      },
+      {
+        "id": "sortino-ratio",
+        "label": "Sortino Ratio",
+        "description": "Excess return / downside deviation — penalises only harmful volatility",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "calmar-ratio",
+        "label": "Calmar Ratio",
+        "description": "Annualised return / max drawdown — return per unit worst-case pain",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "maximum-drawdown",
+        "label": "Maximum Drawdown",
+        "description": "Largest peak-to-trough decline — the most important risk metric for traders",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "max-drawdown-duration",
+        "label": "Max Drawdown Duration",
+        "description": "Longest time below prior equity peak — measures psychological endurance",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "underwater-equity-curve",
+        "label": "Underwater Equity Curve",
+        "description": "Time series plot of current drawdown depth — the visual risk diagnostic",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "win-rate-profit-factor",
+        "label": "Win Rate / Profit Factor / Payoff Ratio",
+        "description": "Basic trade quality measures (% profitable, gross P / gross L, avg win / avg loss)",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "expectancy",
+        "label": "Expectancy",
+        "description": "Average P&L per trade = WR×AvgWin − LR×AvgLoss — expected value per trade",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "average-holding-period",
+        "label": "Average Holding Period",
+        "description": "Mean duration from entry to exit — classifies strategy timeframe",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "hit-rate-by-period",
+        "label": "Hit Rate by Period",
+        "description": "Monthly / quarterly / yearly win percentage — investors evaluate at these horizons",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "historical-var",
+        "label": "Historical VaR",
+        "description": "Percentile-based Value-at-Risk from empirical return distribution",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "cvar-expected-shortfall",
+        "label": "CVaR / Expected Shortfall",
+        "description": "Expected loss given loss exceeds VaR — coherent tail risk measure",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "rolling-sharpe-vol-beta",
+        "label": "Rolling Sharpe / Vol / Beta",
+        "description": "Trailing-window metrics tracking performance stability over time",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "alpha-beta-jensens",
+        "label": "Alpha / Beta (Jensen's)",
+        "description": "Benchmark-relative decomposition into skill and market exposure",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "information-ratio",
+        "label": "Information Ratio",
+        "description": "Active return / tracking error relative to benchmark",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "portfolio-turnover",
+        "label": "Portfolio Turnover",
+        "description": "Fraction of portfolio traded per period — key cost and capacity driver",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "brinson-fachler",
+        "label": "Brinson-Fachler Attribution",
+        "description": "Decomposes active return into allocation, selection, and interaction effects",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "factor-based-attribution",
+        "label": "Factor-Based Attribution",
+        "description": "Decomposes returns into factor exposures × factor returns + alpha residual",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "omega-ratio",
+        "label": "Omega Ratio",
+        "description": "Probability-weighted gains vs. losses — captures full distribution shape",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "treynor-ratio",
+        "label": "Treynor Ratio",
+        "description": "Excess return per unit of systematic (beta) risk",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "gain-to-pain-ratio",
+        "label": "Gain-to-Pain Ratio",
+        "description": "Sum of all returns / absolute sum of negative returns",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "tail-ratio",
+        "label": "Tail Ratio",
+        "description": "95th percentile / 5th percentile of returns — distribution asymmetry",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "sterling-burke-kappa",
+        "label": "Sterling / Burke / Kappa Ratios",
+        "description": "Alternative risk-adjusted metrics using drawdown or lower partial moments",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "ulcer-pain-index",
+        "label": "Ulcer / Pain Index",
+        "description": "RMS or mean of drawdown values — penalises both depth and duration",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "recovery-factor",
+        "label": "Recovery Factor",
+        "description": "Net profit / max drawdown — measures recoverability",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "conditional-drawdown-at-risk",
+        "label": "Conditional Drawdown at Risk",
+        "description": "Expected drawdown in worst α% of episodes",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "up-capture-down-capture",
+        "label": "Up-Capture / Down-Capture",
+        "description": "Strategy's participation in benchmark up/down markets",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "tracking-error-active-share",
+        "label": "Tracking Error / Active Share",
+        "description": "Deviation from benchmark holdings and returns",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "capacity-estimation",
+        "label": "Capacity Estimation",
+        "description": "Max AUM before market impact erodes alpha",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "jobson-korkie-sharpe-test",
+        "label": "Jobson-Korkie / Ledoit-Wolf Sharpe Test",
+        "description": "Statistical test for equality of Sharpe ratios between two strategies",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "risk-management",
+    "label": "Risk Management",
+    "description": "Position sizing and risk controls separate surviving strategies from blown-up accounts.",
+    "order": 3,
+    "icon": "shield",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "kelly-criterion",
+        "label": "Kelly Criterion",
+        "description": "Optimal bet size maximising log-growth based on win rate and payoff",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "fractional-kelly",
+        "label": "Fractional Kelly (Half-Kelly)",
+        "description": "Scales Kelly by a fraction to reduce variance at modest growth cost",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "fixed-fractional-sizing",
+        "label": "Fixed Fractional Sizing",
+        "description": "Risks a fixed percentage of equity per trade",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "volatility-targeting",
+        "label": "Volatility Targeting",
+        "description": "Scales position inversely to realised vol to target constant portfolio volatility",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "fixed-stop-loss",
+        "label": "Fixed Stop-Loss",
+        "description": "Exits at predetermined price/percentage below entry",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "trailing-stop-loss",
+        "label": "Trailing Stop-Loss",
+        "description": "Ratchets stop upward with price, locking in gains",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "take-profit-target",
+        "label": "Take-Profit Target",
+        "description": "Exits at pre-set profit level",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "drawdown-limit",
+        "label": "Drawdown Limit / Circuit Breaker",
+        "description": "Halts or reduces trading when drawdown hits threshold",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "gross-net-exposure-limits",
+        "label": "Gross / Net Exposure Limits",
+        "description": "Constrains total long+short and long−short as % of NAV",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "sector-factor-exposure-limits",
+        "label": "Sector / Factor Exposure Limits",
+        "description": "Caps allocation to any single sector or factor tilt",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "volume-participation-limit",
+        "label": "Volume Participation Limit",
+        "description": "Ensures trade size stays below % of ADV",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "canonical-scenario-library",
+        "label": "Canonical Scenario Library",
+        "description": "Pre-loaded stress scenarios: Black Monday 1987, LTCM 1998, GFC 2008, COVID 2020, SVB 2023, Yen Carry 2024",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "historical-scenario-replay",
+        "label": "Historical Scenario Replay",
+        "description": "Re-runs strategy through user-selected or canonical crises",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "margin-leverage-monitor",
+        "label": "Margin / Leverage Monitor",
+        "description": "Tracks used vs. available margin and gross leverage over time",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "risk-parity-sizing",
+        "label": "Risk Parity Sizing",
+        "description": "Allocates risk equally across assets using inverse-vol or covariance weights",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "atr-based-sizing",
+        "label": "ATR-Based Sizing",
+        "description": "Uses Average True Range for position size and stop distance",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "volatility-based-stop",
+        "label": "Volatility-Based Stop",
+        "description": "Sets stop distance as multiple of ATR or rolling σ",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "time-stop",
+        "label": "Time Stop",
+        "description": "Exits after maximum holding period regardless of P&L",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "correlation-based-position-limits",
+        "label": "Correlation-Based Position Limits",
+        "description": "Rejects positions highly correlated to existing holdings",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "concentration-limit-hhi",
+        "label": "Concentration Limit (HHI)",
+        "description": "Monitors Herfindahl index to prevent over-concentration",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "hypothetical-shock-test",
+        "label": "Hypothetical Shock Test",
+        "description": "Applies user-defined shocks (−20% equity, +200bp rates) to portfolio",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "reverse-stress-test",
+        "label": "Reverse Stress Test",
+        "description": "Finds the scenario causing a specified loss (e.g., −50% drawdown)",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "factor-stress-test",
+        "label": "Factor Stress Test",
+        "description": "Shocks individual risk factors and measures portfolio P&L impact",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "monte-carlo-forward-risk",
+        "label": "Monte Carlo Forward Risk",
+        "description": "Simulates correlated future paths for prospective portfolio risk assessment",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "margin-call-simulator",
+        "label": "Margin Call Simulator",
+        "description": "Models forced liquidation cascades when margin is breached",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "days-to-liquidate",
+        "label": "Days-to-Liquidate",
+        "description": "Estimates days to unwind position at a given participation rate",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "equity-curve-trading",
+        "label": "Equity Curve Trading",
+        "description": "Toggles strategy on/off based on its own equity curve vs. moving average",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "overfitting-detection",
+    "label": "Overfitting Detection",
+    "description": "The single most important category separating amateur from institutional quant work.",
+    "order": 4,
+    "icon": "search-fuzzy",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "probability-backtest-overfitting",
+        "label": "Probability of Backtest Overfitting (PBO)",
+        "description": "CSCV framework estimating probability the best IS config was found by chance (Bailey et al.)",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "deflated-sharpe-ratio",
+        "label": "Deflated Sharpe Ratio (DSR)",
+        "description": "Adjusts observed Sharpe for number of trials, skewness, and kurtosis (Bailey & De Prado)",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "walk-forward-efficiency",
+        "label": "Walk-Forward Efficiency Ratio",
+        "description": "OOS Sharpe / IS Sharpe across folds — values near 1.0 indicate robustness",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "monte-carlo-permutation-test",
+        "label": "Monte Carlo Permutation Test",
+        "description": "Shuffles returns to build null distribution and compute p-values for performance",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "purged-k-fold-cv",
+        "label": "Purged k-Fold Cross-Validation",
+        "description": "Time-series CV removing leaked info between folds (De Prado)",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "parameter-stability-heatmap",
+        "label": "Parameter Stability Heatmap",
+        "description": "Visualises performance across parameter grid — smooth = robust, spiky = overfit",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "multiple-testing-corrections",
+        "label": "Multiple Testing Corrections",
+        "description": "Bonferroni, Holm, BH-FDR — adjusts p-values when testing many strategies",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "block-bootstrap-equity",
+        "label": "Block Bootstrap of Equity Curves",
+        "description": "Resamples return blocks preserving autocorrelation for stability assessment",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "minimum-backtest-length",
+        "label": "Minimum Backtest Length (MinBTL)",
+        "description": "Minimum sample size for a given Sharpe to be statistically significant",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "whites-reality-check",
+        "label": "White's Reality Check",
+        "description": "Bootstrap: is the best strategy significant after accounting for full search space?",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "hansens-spa",
+        "label": "Hansen's SPA Test",
+        "description": "Improved Reality Check using studentised statistics for sharper power",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "haircut-sharpe-ratio",
+        "label": "Haircut Sharpe Ratio",
+        "description": "Multiplicative haircut based on number of trials and data-mining bias",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "combinatorial-purged-cv",
+        "label": "Combinatorial Purged CV (CPCV)",
+        "description": "All combinatorial train/test splits with purging and embargo",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "regime-conditional-validation",
+        "label": "Regime-Conditional Validation",
+        "description": "Tests whether alpha persists across bull/bear/high-vol/low-vol regimes",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "synthetic-data-validation",
+        "label": "Synthetic Data Validation",
+        "description": "Evaluates on data with known properties to detect curve-fitting",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "optimisation",
+    "label": "Optimisation",
+    "description": "Finding good parameters without finding noise.",
+    "order": 5,
+    "icon": "target",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "grid-search",
+        "label": "Grid Search",
+        "description": "Exhaustive sweep over parameter grid — simple, interpretable baseline",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "random-search",
+        "label": "Random Search",
+        "description": "Random parameter sampling — more efficient than grid in high dimensions",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "walk-forward-optimisation",
+        "label": "Walk-Forward Optimisation",
+        "description": "Optimises on rolling IS windows, tests forward — gold standard approach",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "robust-optimisation",
+        "label": "Robust Optimisation",
+        "description": "Evaluates stability via sensitivity analysis and neighbourhood averaging",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "constraint-handling",
+        "label": "Constraint Handling",
+        "description": "Enforces position limits, turnover, exposure bounds during optimisation",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "bayesian-optimisation",
+        "label": "Bayesian Optimisation (GP / TPE)",
+        "description": "Sequential model-based optimisation minimising function evaluations",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "genetic-algorithm",
+        "label": "Genetic Algorithm / Evolutionary",
+        "description": "Population-based for complex non-convex landscapes",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "cma-es",
+        "label": "CMA-ES",
+        "description": "Covariance Matrix Adaptation — state-of-the-art continuous black-box optimisation",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "differential-evolution",
+        "label": "Differential Evolution",
+        "description": "Robust population-based optimiser for noisy objectives",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "particle-swarm",
+        "label": "Particle Swarm",
+        "description": "Swarm intelligence for continuous parameter spaces",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "simulated-annealing",
+        "label": "Simulated Annealing",
+        "description": "Probabilistic optimiser escaping local optima via temperature schedule",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "multi-objective-pareto",
+        "label": "Multi-Objective Pareto",
+        "description": "Finds Pareto frontier trading off return vs. drawdown vs. other objectives",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "objective-functions",
+    "label": "Objective Functions",
+    "description": "The target metric the optimiser maximises or minimises.",
+    "order": 6,
+    "icon": "compass",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "maximise-sharpe",
+        "label": "Maximise Sharpe Ratio",
+        "description": "Most common — optimises risk-adjusted return; sensitive to return distribution",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "maximise-sortino",
+        "label": "Maximise Sortino Ratio",
+        "description": "Penalises only downside vol — better for asymmetric strategies",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "maximise-calmar",
+        "label": "Maximise Calmar Ratio",
+        "description": "Optimises return per unit drawdown — preferred by CTAs and trend followers",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "minimise-max-drawdown",
+        "label": "Minimise Maximum Drawdown",
+        "description": "Pure risk-reduction objective — conservative, can sacrifice upside",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "minimise-cvar",
+        "label": "Minimise CVaR / Expected Shortfall",
+        "description": "Tail-risk minimisation — penalises worst-case losses",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "target-volatility",
+        "label": "Target Volatility",
+        "description": "Optimises returns subject to constant volatility constraint",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "maximise-omega",
+        "label": "Maximise Omega Ratio",
+        "description": "Threshold-based gain-loss ratio — captures full distribution shape",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "maximise-deflated-sharpe",
+        "label": "Maximise Deflated Sharpe Ratio",
+        "description": "Optimises Sharpe adjusted for multiple testing — overfitting-resistant",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "custom-weighted-composite",
+        "label": "Custom Weighted Composite",
+        "description": "User-defined weighted combination (e.g., 0.5×Sharpe + 0.3×Calmar − 0.2×MaxDD)",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "maximise-profit-factor",
+        "label": "Maximise Profit Factor",
+        "description": "Gross profit / gross loss — simple P&L efficiency objective",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "execution-microstructure",
+    "label": "Execution & Microstructure",
+    "description": "Bridges theoretical backtest and real-world P&L.",
+    "order": 7,
+    "icon": "rocket",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "transaction-cost-analysis",
+        "label": "Transaction Cost Analysis (TCA)",
+        "description": "Decomposes realised costs into spread, impact, timing, and opportunity",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "slippage-model",
+        "label": "Slippage Model (Fixed / % / Vol)",
+        "description": "Simulates price degradation between signal and fill",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "implementation-shortfall",
+        "label": "Implementation Shortfall",
+        "description": "Total cost vs. decision price (Perold) — the true cost of execution",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "twap-vwap-simulator",
+        "label": "TWAP / VWAP Simulator",
+        "description": "Simulates time/volume-weighted execution and their costs",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "bid-ask-spread-analysis",
+        "label": "Bid-Ask Spread Analysis",
+        "description": "Analyses effective, quoted, and realised spreads",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "maker-taker-fee-model",
+        "label": "Maker/Taker Fee Model",
+        "description": "Applies exchange-specific fee schedules to fill simulation",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "square-root-impact",
+        "label": "Square-Root Impact Model",
+        "description": "Impact ∝ √(size/ADV) — widely calibrated empirically",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "almgren-chriss",
+        "label": "Almgren-Chriss Impact Model",
+        "description": "Separates permanent and temporary linear impact for optimal scheduling",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "is-optimal-scheduler",
+        "label": "IS Optimal Scheduler",
+        "description": "Optimises trade schedule to minimise shortfall given risk aversion",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "fill-probability-model",
+        "label": "Fill Probability Model",
+        "description": "Estimates limit order fill likelihood based on queue, spread, vol",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "order-book-simulator",
+        "label": "Order Book Simulator",
+        "description": "Simulates LOB dynamics for microstructure research",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "latency-impact-analysis",
+        "label": "Latency Impact Analysis",
+        "description": "Models how execution delay degrades fills for speed-sensitive strategies",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "funding-rate-carry-cost",
+        "label": "Funding Rate / Carry Cost Model",
+        "description": "Models funding rates (crypto perps), borrow cost, margin interest as P&L drag",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "portfolio-construction",
+    "label": "Portfolio Construction",
+    "description": "Determines how capital is allocated across assets.",
+    "order": 8,
+    "icon": "pie-chart",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "mean-variance",
+        "label": "Mean-Variance (Markowitz)",
+        "description": "Classical efficient frontier via quadratic programming",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "black-litterman",
+        "label": "Black-Litterman",
+        "description": "Bayesian framework blending equilibrium returns with analyst views",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "risk-parity-erc",
+        "label": "Risk Parity / ERC",
+        "description": "Equal Risk Contribution — each asset contributes identical marginal risk",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "hierarchical-risk-parity",
+        "label": "Hierarchical Risk Parity (HRP)",
+        "description": "De Prado's clustering-based allocation avoiding covariance inversion",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "minimum-variance",
+        "label": "Minimum Variance",
+        "description": "Minimises portfolio variance without return estimation",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "maximum-sharpe-tangency",
+        "label": "Maximum Sharpe (Tangency)",
+        "description": "Highest return-per-unit-risk on the efficient frontier",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "equal-weight",
+        "label": "Equal Weight (1/N)",
+        "description": "Baseline allocation — surprisingly robust OOS benchmark",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "inverse-volatility",
+        "label": "Inverse Volatility",
+        "description": "Weights inversely proportional to realised vol",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "rebalancing-frequency-analysis",
+        "label": "Rebalancing Frequency Analysis",
+        "description": "Compares daily/weekly/monthly/quarterly rebalance cadences",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "maximum-diversification",
+        "label": "Maximum Diversification",
+        "description": "Maximises ratio of weighted volatilities to portfolio vol",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "kelly-criterion-portfolio",
+        "label": "Kelly Criterion (Portfolio)",
+        "description": "Log-growth-optimal sizing extended to multi-asset",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "turnover-constrained-optimisation",
+        "label": "Turnover-Constrained Optimisation",
+        "description": "Optimises subject to max turnover per period",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "factor-constrained-optimisation",
+        "label": "Factor-Constrained Optimisation",
+        "description": "Enforces bounds on factor exposures within optimisation",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "robust-resampled-frontier",
+        "label": "Robust (Resampled Frontier)",
+        "description": "Michaud-style resampling to reduce estimation-error sensitivity",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "nested-clusters-optimisation",
+        "label": "Nested Clusters Optimisation (NCO)",
+        "description": "De Prado's clustering + within-cluster optimisation",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "tax-loss-harvesting",
+        "label": "Tax-Loss Harvesting",
+        "description": "Identifies positions for tax-efficient selling while preserving exposure",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "regime-aware",
+    "label": "Regime-Aware Tools",
+    "description": "Adapts strategy behaviour to current market state.",
+    "order": 9,
+    "icon": "eye",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "hmm-regime-detection",
+        "label": "HMM Regime Detection",
+        "description": "Fits Hidden Markov Models to classify current market state",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": "hidden-markov-model"
+      },
+      {
+        "id": "regime-conditional-performance",
+        "label": "Regime-Conditional Performance",
+        "description": "Computes Sharpe, drawdown, etc. segmented by detected regime",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "volatility-regime-overlay",
+        "label": "Volatility Regime Overlay",
+        "description": "Scales positions based on current vol regime (low/med/high)",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "regime-conditional-correlation",
+        "label": "Regime-Conditional Correlation",
+        "description": "Computes correlations per regime — reveals crisis-correlation spikes",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "markov-switching-overlay",
+        "label": "Markov Switching Overlay",
+        "description": "Hamilton-style regime-switching as strategy filter/overlay",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "macro-regime-classification",
+        "label": "Macro Regime Classification",
+        "description": "Maps economic indicators to expansion/contraction/crisis states",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "transition-probabilities",
+        "label": "Transition Probabilities",
+        "description": "Estimates regime-to-regime transition matrix and expected durations",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "dynamic-allocation-by-regime",
+        "label": "Dynamic Allocation by Regime",
+        "description": "Auto-adjusts portfolio weights when regime changes detected",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "machine-learning",
+    "label": "Machine Learning Integration",
+    "description": "De Prado's framework dominates.",
+    "order": 10,
+    "icon": "hubot",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "shap-values",
+        "label": "SHAP Values",
+        "description": "Shapley-based feature attribution — gold standard for explainability",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "permutation-importance",
+        "label": "Permutation Importance",
+        "description": "Model-agnostic importance via feature shuffling",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "mdi",
+        "label": "MDI (Mean Decrease Impurity)",
+        "description": "Tree-based importance from impurity reduction — fast but biased",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "mda",
+        "label": "MDA (Mean Decrease Accuracy)",
+        "description": "OOB accuracy drop per feature — De Prado's preferred metric",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "purged-k-fold-cv-ml",
+        "label": "Purged k-Fold CV",
+        "description": "CV with purging of overlapping labels to prevent leakage",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "cv-with-embargo",
+        "label": "CV with Embargo",
+        "description": "Purged CV plus embargo gap after test fold for residual leakage",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "triple-barrier-labelling",
+        "label": "Triple-Barrier Labelling",
+        "description": "Labels via profit/loss/time barriers — superior to fixed-horizon labels",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "meta-labelling",
+        "label": "Meta-Labelling",
+        "description": "Secondary classifier predicting whether primary signal will be profitable",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "bet-sizing",
+        "label": "Bet Sizing",
+        "description": "Maps prediction confidence to position size using Kelly or sigmoid",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "fractional-differentiation",
+        "label": "Fractional Differentiation",
+        "description": "Makes prices stationary while retaining maximum memory via fractional-d",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "clustered-feature-importance",
+        "label": "Clustered Feature Importance",
+        "description": "Importance computed at cluster level to handle multicollinearity (De Prado)",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "feature-clustering",
+        "label": "Feature Clustering",
+        "description": "Groups correlated features via hierarchical clustering",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "walk-forward-feature-selection",
+        "label": "Walk-Forward Feature Selection",
+        "description": "Re-selects features at each refit to prevent forward-looking feature bias",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "sequential-feature-selection",
+        "label": "Sequential Feature Selection",
+        "description": "Forward/backward stepwise selection with financial-aware CV",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "model-stacking-blending",
+        "label": "Model Stacking / Blending",
+        "description": "Meta-learner combining predictions from multiple base models",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "hyperparameter-tuning-financial",
+        "label": "Hyperparameter Tuning (Financial)",
+        "description": "Optimises hyperparams using Sharpe/Calmar instead of accuracy",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "sample-weighting-uniqueness",
+        "label": "Sample Weighting (Uniqueness)",
+        "description": "Weights observations by information content for overlapping labels",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "learning-curve-diagnostics",
+        "label": "Learning Curve Diagnostics",
+        "description": "Plots train/validation score vs. sample size to diagnose bias vs. variance",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "signal-analysis",
+    "label": "Signal Analysis",
+    "description": "The alpha researcher's toolkit.",
+    "order": 11,
+    "icon": "lightbulb",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "information-coefficient",
+        "label": "Information Coefficient (IC)",
+        "description": "Rank correlation between signal and forward returns — core alpha quality metric",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "icir",
+        "label": "ICIR (IC Information Ratio)",
+        "description": "Mean IC / IC std — measures signal consistency over time",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "signal-decay-analysis",
+        "label": "Signal Decay Analysis",
+        "description": "IC at increasing forward horizons to measure alpha half-life",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "quantile-return-analysis",
+        "label": "Quantile Return Analysis",
+        "description": "Mean forward return per signal quintile/decile — monotonicity check",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "cumulative-ic",
+        "label": "Cumulative IC",
+        "description": "Running sum of daily IC — visualises signal drift or structural breaks",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "signal-autocorrelation",
+        "label": "Signal Autocorrelation",
+        "description": "Factor rank autocorrelation measuring persistence and implied turnover",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "signal-correlation-matrix",
+        "label": "Signal Correlation Matrix",
+        "description": "Cross-correlation heatmap across all alpha signals for redundancy audit",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "factor-tear-sheet",
+        "label": "Factor Tear Sheet",
+        "description": "One-click comprehensive report: returns, IC, turnover, grouped analysis",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "half-life-estimation-ou",
+        "label": "Half-Life Estimation (OU)",
+        "description": "OLS mean-reversion half-life from Ornstein-Uhlenbeck fit",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "rank-transformation",
+        "label": "Rank Transformation",
+        "description": "Converts raw signals to cross-sectional ranks for outlier-resistant scoring",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "turnover-adjusted-ic",
+        "label": "Turnover-Adjusted IC",
+        "description": "IC penalised by turnover to capture net implementable alpha after costs",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "event-study-analysis",
+        "label": "Event Study Analysis",
+        "description": "Average cumulative abnormal return around discrete events",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "signal-capacity-estimation",
+        "label": "Signal Capacity Estimation",
+        "description": "Max AUM a signal supports before alpha erodes from impact",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "signal-combination-blending",
+        "label": "Signal Combination / Blending",
+        "description": "Optimally combines multiple signals into composite alpha",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "signal-neutralisation",
+        "label": "Signal Neutralisation",
+        "description": "Removes sector/market-cap exposures to isolate pure alpha component",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "statistical-arbitrage",
+    "label": "Statistical Arbitrage & Pairs",
+    "description": "End-to-end workflow for mean-reversion strategies.",
+    "order": 12,
+    "icon": "git-compare",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "pair-universe-screening",
+        "label": "Pair Universe Screening",
+        "description": "Ranks all pairs by cointegration p-value, distance, or correlation — finds candidates",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "spread-construction",
+        "label": "Spread Construction",
+        "description": "Builds price spread using static or dynamic hedge ratio",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "kalman-filter-hedge",
+        "label": "Kalman Filter Hedge Ratio",
+        "description": "Dynamic hedge ratio via state-space model — standard for live pairs",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": "kalman-filter"
+      },
+      {
+        "id": "johansen-hedge-ratio",
+        "label": "Johansen Hedge Ratio",
+        "description": "Cointegrating vector from Johansen for multi-leg baskets",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "z-score-signal-generation",
+        "label": "Z-Score Signal Generation",
+        "description": "Normalises spread into z-score for entry/exit signals",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "half-life-mean-reversion",
+        "label": "Half-Life of Mean Reversion",
+        "description": "Ornstein-Uhlenbeck regression to estimate reversion speed",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "hurst-on-spread",
+        "label": "Hurst Exponent on Spread",
+        "description": "Confirms spread is mean-reverting (H < 0.5) before trading",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": "hurst-exponent-rs"
+      },
+      {
+        "id": "rolling-cointegration-monitor",
+        "label": "Rolling Cointegration Monitor",
+        "description": "Tracks cointegration stability over time to detect relationship breakdown",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "copula-based-pairs",
+        "label": "Copula-Based Pairs",
+        "description": "Uses copula mispricing (conditional CDF deviation) as entry signal",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "principal-component-stat-arb",
+        "label": "Principal Component Stat Arb",
+        "description": "Estimates fair value from PCA residuals for basket trading",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "distance-method-pairs",
+        "label": "Distance Method Pairs",
+        "description": "Non-parametric pair selection based on normalised price distance",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "spread-garch-volatility",
+        "label": "Spread GARCH Volatility",
+        "description": "Models time-varying spread volatility for dynamic position sizing",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "options-strategy",
+    "label": "Options Strategy Tools",
+    "description": "Backtesting and analysis tools specific to options and volatility strategies.",
+    "order": 13,
+    "icon": "layers",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "options-payoff-builder",
+        "label": "Options Payoff Builder",
+        "description": "Constructs and visualises multi-leg P&L diagrams at expiry and pre-expiry",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "greeks-dashboard",
+        "label": "Greeks Dashboard",
+        "description": "Real-time portfolio-level Greeks for risk monitoring",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "delta-hedging-backtest",
+        "label": "Delta-Hedging Backtest",
+        "description": "Simulates dynamic delta-hedging of options positions with configurable frequency",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "vol-spread-backtester",
+        "label": "Vol Spread Strategy Backtester",
+        "description": "Tests calendar spreads, butterflies, straddles/strangles, iron condors",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "implied-vs-realised-pnl",
+        "label": "Implied vs. Realised P&L",
+        "description": "Tracks cumulative P&L from vol premium harvesting (selling IV > RV)",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "roll-analysis",
+        "label": "Roll Analysis",
+        "description": "Models impact of rolling expiring positions to next contract",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "tail-risk-hedge-analysis",
+        "label": "Tail Risk Hedge Analysis",
+        "description": "Costs put protection / put spreads over time vs. drawdown reduction achieved",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "pin-risk-analysis",
+        "label": "Pin Risk Analysis",
+        "description": "Estimates exposure from options expiring near the money",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "gamma-scalping-simulator",
+        "label": "Gamma Scalping Simulator",
+        "description": "Backtests long-gamma strategies with delta rebalancing at specified intervals",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "skew-trading-backtest",
+        "label": "Skew Trading Backtest",
+        "description": "Tests strategies exploiting term structure or skew mispricing",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "early-exercise-detection",
+        "label": "Early Exercise Detection",
+        "description": "Flags American options where early exercise is optimal (dividends, deep ITM)",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "margin-buying-power",
+        "label": "Margin / Buying Power Reduction",
+        "description": "Computes options margin requirements using SPAN or reg-T methodology",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "strategy-comparison-same-underlying",
+        "label": "Strategy Comparison (Same Underlying)",
+        "description": "Side-by-side risk/reward comparison of defined-risk strategies",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "vol-surface-arbitrage-check",
+        "label": "Vol Surface Arbitrage Check",
+        "description": "Validates no-butterfly and no-calendar-spread arbitrage constraints",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "strategy-lifecycle",
+    "label": "Strategy Lifecycle",
+    "description": "Production-grade infrastructure for monitoring live strategies.",
+    "order": 14,
+    "icon": "history",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "live-performance-dashboard",
+        "label": "Live Performance Dashboard",
+        "description": "Real-time P&L, exposure, and execution quality monitoring",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "degradation-detection",
+        "label": "Degradation Detection",
+        "description": "Statistical tests (CUSUM, rolling Sharpe z-test) to flag alpha decay",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "strategy-versioning",
+        "label": "Strategy Versioning",
+        "description": "Git-like version control for code, parameters, and universe snapshots",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "alerts-notifications",
+        "label": "Alerts & Notifications",
+        "description": "Configurable alerts for drawdown, Sharpe drops, regime changes, risk limits",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "paper-to-live-checklist",
+        "label": "Paper-to-Live Checklist",
+        "description": "Structured validation gate: OOS pass, slippage budget, risk limits, compliance",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "strategy-correlation-monitoring",
+        "label": "Strategy Correlation Monitoring",
+        "description": "Tracks rolling pairwise correlation to prevent crowding",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "capacity-monitoring",
+        "label": "Capacity Monitoring",
+        "description": "Ongoing tracking of fill rates, impact, and signal decay vs. AUM growth",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "multi-strategy-portfolio",
+    "label": "Multi-Strategy Portfolio",
+    "description": "Manages a book of strategies as a portfolio.",
+    "order": 15,
+    "icon": "library",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "strategy-correlation-matrix",
+        "label": "Strategy Correlation Matrix",
+        "description": "Heatmap of return correlations across all active strategies",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "capital-allocation-optimiser",
+        "label": "Capital Allocation Optimiser",
+        "description": "Allocates capital using risk-budgeting or utility maximisation",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "strategy-level-risk-parity",
+        "label": "Strategy-Level Risk Parity",
+        "description": "Equal-risk-contribution weighting at the strategy level",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "drawdown-contribution-analysis",
+        "label": "Drawdown Contribution Analysis",
+        "description": "Decomposes portfolio-level drawdown into per-strategy attribution",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "diversification-score",
+        "label": "Diversification Score",
+        "description": "Scalar metric quantifying effective number of independent strategy bets",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "dynamic-strategy-weighting",
+        "label": "Dynamic Strategy Weighting",
+        "description": "Time-varying weights based on rolling performance, regime, or momentum",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "strategy-comparison-framework",
+        "label": "Strategy Comparison Framework",
+        "description": "Jobson-Korkie / paired tests for statistically comparing two strategies",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "bias-detection",
+    "label": "Bias Detection & Data Integrity",
+    "description": "Detects the two most common sources of spurious backtest results.",
+    "order": 16,
+    "icon": "inspect",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "survivorship-bias-scanner",
+        "label": "Survivorship Bias Scanner",
+        "description": "Detects if backtest ran on survivor-only universe; flags missing delistings",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "delisted-security-handling",
+        "label": "Delisted Security Handling",
+        "description": "Configures treatment of bankruptcies, acquisitions, delistings in backtest",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "look-ahead-bias-detector",
+        "label": "Look-Ahead Bias Detector",
+        "description": "Static analysis flagging potential future-peeking (full-period stats, unadjusted data)",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "index-reconstitution-replay",
+        "label": "Index Reconstitution Replay",
+        "description": "Uses historical index membership for realistic point-in-time universes",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "point-in-time-data-validation",
+        "label": "Point-in-Time Data Validation",
+        "description": "Verifies that fundamental data uses as-reported (not restated) values",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "time-zone-alignment-check",
+        "label": "Time-Zone Alignment Check",
+        "description": "Detects signals using data from different time zones without proper alignment",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "corporate-action-audit",
+        "label": "Corporate Action Audit",
+        "description": "Validates split/dividend/merger adjustments in price series",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "transaction-log-reconciliation",
+        "label": "Transaction Log Reconciliation",
+        "description": "Cross-checks backtest fills against market data for feasibility",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  }
+]

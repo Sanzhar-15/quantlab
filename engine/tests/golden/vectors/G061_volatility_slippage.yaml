@@ -1,0 +1,59 @@
+# G061: Volatility-Based Slippage
+# Category: slippage
+# Verifies: Slippage based on bar volatility
+
+id: G061
+name: "Volatility-based slippage"
+category: slippage
+description: |
+  Volatility-based slippage model should apply slippage proportional
+  to the bar's high-low range.
+
+tags:
+  - slippage
+  - volatility
+  - cost
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: volatility
+    value: 0.25  # 25% of bar range
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    # High volatility bar: range = 110 - 98 = 12
+    - {date: "2026-01-05", open: "104.00", high: "110.00", low: "98.00", close: "105.00", volume: 1200000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      # Open 104, range 12, slippage = 25% * 12 = 3 for buy
+      price: "107.00"  # 104 + 3
+      side: buy
+      slippage: "3.00"
+
+  final_cash: "89300.00"  # 100000 - (100 * 107)
+  final_positions:
+    AAPL: "100"
+  final_equity: "99800.00"  # 89300 + (100 * 105)
+
+  metrics:
+    total_return: "-0.002"
+    total_trades: 1

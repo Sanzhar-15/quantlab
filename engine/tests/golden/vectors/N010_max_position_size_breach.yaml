@@ -1,0 +1,43 @@
+---
+# N010: Order breaches maximum position size limit
+# Tests that orders exceeding max_position_size are limited
+# Spec Reference: Technical Spec §4.2 (Position Limits)
+
+name: "Max Position Size Breach"
+description: |
+  Verify that a BUY order that would exceed the maximum position
+  size limit is partially filled up to the limit.
+
+config:
+  initial_cash: "500000.00"
+  commission_model: "none"
+  fill_assumption: "next_open"
+  max_position_size: "200"  # Max 200 shares per position
+
+data:
+  GOOGL:
+    - timestamp: "2024-01-02T09:30:00"
+      open: "140.00"
+      high: "145.00"
+      low: "138.00"
+      close: "143.00"
+      volume: 10000000
+    - timestamp: "2024-01-03T09:30:00"
+      open: "143.00"
+      high: "148.00"
+      low: "142.00"
+      close: "146.00"
+      volume: 11000000
+
+signals:
+  - bar_index: 0
+    symbol: "GOOGL"
+    side: "buy"
+    order_type: "market"
+    quantity: "500"  # Wants 500 but max is 200
+
+expected:
+  final_positions:
+    GOOGL: "200"  # Limited to max position size
+  fill_quantity: "200"
+  position_size_limited: true

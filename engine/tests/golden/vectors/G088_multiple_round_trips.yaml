@@ -1,0 +1,93 @@
+# G088: Multiple Round Trips
+# Category: edge_cases
+# Verifies: Multiple buy/sell cycles work correctly
+
+id: G088
+name: "Multiple round trips"
+category: edge_cases
+description: |
+  Multiple buy and sell cycles should all execute correctly
+  with proper P&L calculation for each round trip.
+
+tags:
+  - edge_case
+  - round_trip
+  - multiple
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.00", high: "106.00", low: "102.00", close: "105.00", volume: 1200000}
+    - {date: "2026-01-06", open: "105.50", high: "108.00", low: "104.00", close: "107.00", volume: 900000}
+    - {date: "2026-01-07", open: "107.00", high: "110.00", low: "106.00", close: "109.00", volume: 850000}
+    - {date: "2026-01-08", open: "109.50", high: "112.00", low: "108.00", close: "111.00", volume: 800000}
+    - {date: "2026-01-09", open: "111.00", high: "114.00", low: "110.00", close: "113.00", volume: 750000}
+
+signals:
+  # First round trip
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+  - bar_index: 1
+    action: sell
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+  # Second round trip
+  - bar_index: 2
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+  - bar_index: 3
+    action: sell
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "104.00"
+      side: buy
+    - bar_index: 2
+      symbol: AAPL
+      quantity: "100"
+      price: "105.50"
+      side: sell
+    - bar_index: 3
+      symbol: AAPL
+      quantity: "100"
+      price: "107.00"
+      side: buy
+    - bar_index: 4
+      symbol: AAPL
+      quantity: "100"
+      price: "109.50"
+      side: sell
+
+  # RT1: Buy 104, Sell 105.50 = +150
+  # RT2: Buy 107, Sell 109.50 = +250
+  # Total: +400
+  final_cash: "100400.00"
+  final_positions: {}
+  final_equity: "100400.00"
+
+  metrics:
+    total_return: "0.004"
+    total_trades: 4

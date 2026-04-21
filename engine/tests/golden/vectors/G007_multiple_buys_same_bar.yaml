@@ -1,0 +1,79 @@
+# G007: Multiple Buy Orders Same Bar
+# Category: basic_execution
+# Verifies: Multiple orders from same signal bar are processed correctly
+
+id: G007
+name: "Multiple buy orders same bar"
+category: basic_execution
+description: |
+  Multiple buy orders generated at the same bar should all execute
+  at the next bar's open price, each filling independently.
+
+tags:
+  - market_order
+  - multiple_orders
+  - basic
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbols:
+    - symbol: AAPL
+      timeframe: 1d
+      bars:
+        - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+        - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+        - {date: "2026-01-06", open: "103.00", high: "107.00", low: "101.00", close: "106.00", volume: 900000}
+    - symbol: MSFT
+      timeframe: 1d
+      bars:
+        - {date: "2026-01-02", open: "400.00", high: "410.00", low: "395.00", close: "405.00", volume: 800000}
+        - {date: "2026-01-05", open: "406.00", high: "415.00", low: "400.00", close: "412.00", volume: 900000}
+        - {date: "2026-01-06", open: "413.00", high: "420.00", low: "410.00", close: "418.00", volume: 750000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "50"
+    order_type: market
+  - bar_index: 0
+    action: buy
+    symbol: MSFT
+    quantity: "20"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "50"
+      price: "104.50"
+      side: buy
+    - bar_index: 1
+      symbol: MSFT
+      quantity: "20"
+      price: "406.00"
+      side: buy
+
+  # 50 * 104.50 = 5225
+  # 20 * 406.00 = 8120
+  # Total: 5225 + 8120 = 13345
+  final_cash: "86655.00"  # 100000 - 13345
+  final_positions:
+    AAPL: "50"
+    MSFT: "20"
+  # AAPL: 50 * 106 = 5300
+  # MSFT: 20 * 418 = 8360
+  final_equity: "100315.00"  # 86655 + 5300 + 8360
+
+  metrics:
+    total_return: "0.00315"
+    total_trades: 2

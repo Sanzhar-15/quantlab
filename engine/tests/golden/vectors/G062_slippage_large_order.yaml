@@ -1,0 +1,61 @@
+# G062: Slippage on Large Order
+# Category: slippage
+# Verifies: Larger orders receive more slippage
+
+id: G062
+name: "Large order receives more slippage"
+category: slippage
+description: |
+  Larger orders that represent higher volume participation
+  should receive proportionally more slippage.
+
+tags:
+  - slippage
+  - large_order
+  - volume
+
+skip: true
+skip_reason: "Volume-based slippage model values need calibration"
+
+setup:
+  initial_cash: "1000000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: volume
+    participation_rate: "0.1"  # 10% participation
+    impact_factor: "0.1"
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 100000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 100000}
+
+signals:
+  # Large order: 5000 shares vs 100000 volume = 5% participation
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "5000"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "5000"
+      price: "105.02"  # With slippage
+      side: buy
+
+  final_cash: "474900.00"
+  final_positions:
+    AAPL: "5000"
+  final_equity: "989900.00"
+
+  metrics:
+    total_return: "-0.0101"
+    total_trades: 1

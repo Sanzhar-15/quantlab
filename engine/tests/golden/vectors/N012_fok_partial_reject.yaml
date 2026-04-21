@@ -1,0 +1,46 @@
+---
+# N012: Fill-Or-Kill order cannot fill completely
+# Tests that FOK orders are cancelled if they can't fill entirely
+# Spec Reference: Technical Spec §4.3 (Time-in-Force)
+
+name: "FOK Order Partial Reject"
+description: |
+  Verify that a Fill-Or-Kill order is cancelled when it cannot
+  be completely filled due to volume participation limits.
+
+config:
+  initial_cash: "500000.00"
+  commission_model: "none"
+  fill_assumption: "next_open"
+  max_volume_participation: "0.10"  # 10% max participation
+
+data:
+  LOW_VOLUME_STOCK:
+    - timestamp: "2024-01-02T09:30:00"
+      open: "50.00"
+      high: "52.00"
+      low: "49.00"
+      close: "51.00"
+      volume: 1000  # Very low volume
+    - timestamp: "2024-01-03T09:30:00"
+      open: "51.00"
+      high: "53.00"
+      low: "50.00"
+      close: "52.00"
+      volume: 1000
+
+signals:
+  - bar_index: 0
+    symbol: "LOW_VOLUME_STOCK"
+    side: "buy"
+    order_type: "market"
+    quantity: "500"  # 500 > 10% of 1000 = 100
+    time_in_force: "fok"  # Fill-Or-Kill
+
+expected:
+  final_cash: "500000.00"
+  final_positions:
+    LOW_VOLUME_STOCK: "0"  # Order cancelled, not partially filled
+  trades_count: 0
+  orders_cancelled: 1
+  cancellation_reason: "fok_insufficient_quantity"

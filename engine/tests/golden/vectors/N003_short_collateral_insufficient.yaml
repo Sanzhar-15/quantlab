@@ -1,0 +1,47 @@
+---
+# N003: Short order rejected due to insufficient collateral
+# Tests that short selling respects collateral requirements
+# Spec Reference: Technical Spec §5.2 (Short Selling Collateral)
+
+name: "Short Collateral Insufficient"
+description: |
+  Verify that a short sell order is rejected when the account
+  does not have sufficient collateral to cover the short position.
+
+config:
+  initial_cash: "10000.00"
+  commission_model: "none"
+  fill_assumption: "next_open"
+  allow_short: true
+  short_collateral_ratio: "1.5"  # Require 150% collateral
+
+data:
+  TSLA:
+    - timestamp: "2024-01-02T09:30:00"
+      open: "200.00"
+      high: "210.00"
+      low: "195.00"
+      close: "205.00"
+      volume: 2000000
+    - timestamp: "2024-01-03T09:30:00"
+      open: "205.00"
+      high: "215.00"
+      low: "200.00"
+      close: "210.00"
+      volume: 2200000
+
+signals:
+  - bar_index: 0
+    symbol: "TSLA"
+    side: "sell_short"
+    order_type: "market"
+    quantity: "100"  # 100 * $205 = $20,500 short value
+    # Required collateral: $20,500 * 1.5 = $30,750 > $10,000 available
+
+expected:
+  final_cash: "10000.00"
+  final_positions:
+    TSLA: "0"
+  trades_count: 0
+  orders_rejected: 1
+  rejection_reason: "insufficient_collateral"

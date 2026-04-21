@@ -1,0 +1,54 @@
+# G046: Short Blocked When Shorting Disabled
+# Category: short_selling
+# Verifies: Short orders rejected when allow_shorting=false
+
+id: G046
+name: "Short blocked when shorting disabled"
+category: short_selling
+description: |
+  When allow_shorting is false, short sell orders should be
+  rejected and the position should remain unchanged.
+
+tags:
+  - short
+  - rejected
+  - config
+  - short_selling
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+  allow_shorting: false
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+    - {date: "2026-01-06", open: "103.00", high: "105.00", low: "101.00", close: "102.00", volume: 900000}
+
+signals:
+  # Attempt short sell - should be rejected
+  - bar_index: 0
+    action: sell_short
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills: []
+  # Short order rejected
+
+  final_cash: "100000.00"
+  final_positions: {}
+  final_equity: "100000.00"
+
+  metrics:
+    total_return: "0"
+    total_trades: 0

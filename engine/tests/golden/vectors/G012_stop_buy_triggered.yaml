@@ -1,0 +1,61 @@
+# G012: Stop Buy Order - Triggered
+# Category: order_types
+# Verifies: Stop buy order triggers when price reaches stop level
+
+id: G012
+name: "Stop buy order triggers on breakout"
+category: order_types
+description: |
+  A stop buy order triggers when the bar's high reaches the stop price.
+  Used for breakout strategies - buy when price breaks above resistance.
+
+tags:
+  - stop_order
+  - order_types
+  - breakout
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "102.00", low: "99.00", close: "101.00", volume: 1000000}
+    - {date: "2026-01-05", open: "101.00", high: "103.00", low: "100.00", close: "102.50", volume: 1200000}
+    - {date: "2026-01-06", open: "102.00", high: "106.00", low: "101.50", close: "105.00", volume: 1800000}
+    - {date: "2026-01-07", open: "105.50", high: "108.00", low: "104.00", close: "107.00", volume: 1500000}
+
+signals:
+  # Stop buy at 105 - triggers on bar 2 when high reaches 106
+  # Using GTC so order persists until triggered
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: stop
+    stop_price: "105.00"
+    time_in_force: gtc
+
+expected:
+  fills:
+    - bar_index: 2
+      symbol: AAPL
+      quantity: "100"
+      price: "105.00"
+      side: buy
+
+  final_cash: "89500.00"  # 100000 - (100 * 105)
+  final_positions:
+    AAPL: "100"
+  final_equity: "100200.00"  # 89500 + (100 * 107)
+
+  metrics:
+    total_return: "0.002"
+    total_trades: 1

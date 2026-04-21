@@ -1,0 +1,66 @@
+# G008: Buy Then Immediate Sell
+# Category: basic_execution
+# Verifies: Sequential buy/sell orders with t+1 semantics
+
+id: G008
+name: "Buy then sell next bar"
+category: basic_execution
+description: |
+  A buy order followed by a sell order on the next bar should
+  result in opening then closing the position with proper P&L.
+
+tags:
+  - market_order
+  - round_trip
+  - sequential
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "105.00", volume: 1200000}
+    - {date: "2026-01-06", open: "105.50", high: "108.00", low: "104.00", close: "107.00", volume: 900000}
+    - {date: "2026-01-07", open: "107.00", high: "110.00", low: "106.00", close: "109.00", volume: 850000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+  - bar_index: 1
+    action: sell
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "104.50"
+      side: buy
+    - bar_index: 2
+      symbol: AAPL
+      quantity: "100"
+      price: "105.50"
+      side: sell
+
+  final_cash: "100100.00"  # 100000 - 10450 + 10550
+  final_positions: {}
+  final_equity: "100100.00"
+
+  metrics:
+    total_return: "0.001"
+    total_trades: 2

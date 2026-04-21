@@ -1,0 +1,58 @@
+# G090: Forward Fill Missing Bar Data
+# Category: forward_fill
+# Verifies: Missing bar data is forward-filled from previous bar
+
+id: G090
+name: "Forward fill missing bar data"
+category: forward_fill
+description: |
+  When a bar is missing (e.g., holiday), the previous bar's close is used
+  for position valuation. Orders placed before the gap fill after.
+
+tags:
+  - forward_fill
+  - missing_data
+  - holiday
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    # Note: Jan 3-4 is a weekend, but there could be a holiday gap too
+    - {date: "2026-01-02", open: "100.00", high: "102.00", low: "99.00", close: "101.00", volume: 1000000}
+    # Gap to Jan 5
+    - {date: "2026-01-05", open: "103.00", high: "106.00", low: "102.00", close: "105.00", volume: 1500000}
+    - {date: "2026-01-06", open: "105.50", high: "108.00", low: "104.00", close: "107.00", volume: 1200000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "103.00"
+      side: buy
+
+  final_cash: "89700.00"  # 100000 - (100 * 103)
+  final_positions:
+    AAPL: "100"
+  final_equity: "100400.00"  # 89700 + (100 * 107)
+
+  metrics:
+    total_return: "0.004"
+    total_trades: 1

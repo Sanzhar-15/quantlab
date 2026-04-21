@@ -1,0 +1,50 @@
+# G081: Negative Limit Price Rejected
+# Category: edge_cases
+# Verifies: Limit orders with negative price are rejected
+
+id: G081
+name: "Negative limit price rejected"
+category: edge_cases
+description: |
+  A limit order with a negative limit price should be rejected.
+  Tests price validation.
+
+tags:
+  - edge_case
+  - validation
+  - rejection
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "102.00", low: "99.00", close: "101.00", volume: 1000000}
+    - {date: "2026-01-05", open: "101.00", high: "103.00", low: "100.00", close: "102.00", volume: 1200000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: limit
+    limit_price: "-50.00"
+
+expected:
+  fills: []
+
+  final_cash: "100000.00"
+  final_positions: {}
+  final_equity: "100000.00"
+
+  metrics:
+    total_return: "0"
+    total_trades: 0

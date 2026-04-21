@@ -1,0 +1,62 @@
+# G054: Zero Volume No Fill
+# Category: partial_fills
+# Verifies: No fill when bar has zero volume
+
+id: G054
+name: "Zero volume no fill"
+category: partial_fills
+description: |
+  An order should not fill on a bar with zero volume,
+  regardless of price movement.
+
+tags:
+  - volume
+  - zero_volume
+  - no_fill
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+  max_volume_participation: 0.10
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    # Zero volume bar
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 0}
+    # Normal volume
+    - {date: "2026-01-06", open: "103.00", high: "105.00", low: "101.00", close: "104.00", volume: 500000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+    time_in_force: gtc
+
+expected:
+  fills:
+    # No fill on bar 1 (zero volume)
+    # Fill on bar 2
+    - bar_index: 2
+      symbol: AAPL
+      quantity: "100"
+      price: "103.00"
+      side: buy
+
+  final_cash: "89700.00"  # 100000 - (100 * 103)
+  final_positions:
+    AAPL: "100"
+  final_equity: "100100.00"  # 89700 + (100 * 104)
+
+  metrics:
+    total_return: "0.001"
+    total_trades: 1

@@ -1,0 +1,76 @@
+# G045: Short with Existing Long Position
+# Category: short_selling
+# Verifies: Selling more than long position creates short
+
+id: G045
+name: "Short with existing long position"
+category: short_selling
+description: |
+  Selling more shares than currently held long should close the
+  long position and create a short position for the excess.
+
+tags:
+  - short
+  - flip
+  - position_flip
+  - short_selling
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+  allow_shorting: true
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "105.00", volume: 1200000}
+    - {date: "2026-01-06", open: "105.00", high: "108.00", low: "104.00", close: "107.00", volume: 900000}
+    - {date: "2026-01-07", open: "107.00", high: "109.00", low: "105.00", close: "106.00", volume: 850000}
+
+signals:
+  # Buy 50 shares first
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "50"
+    order_type: market
+  # Sell 100 shares - closes 50 long, creates 50 short
+  - bar_index: 1
+    action: sell
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "50"
+      price: "104.50"
+      side: buy
+    - bar_index: 2
+      symbol: AAPL
+      quantity: "100"
+      price: "105.00"
+      side: sell
+
+  # Buy: -50 * 104.50 = -5225
+  # Sell: +100 * 105 = +10500
+  # Net cash: 100000 - 5225 + 10500 = 105275
+  # Position: -50 AAPL (short)
+  final_cash: "105275.00"
+  final_positions:
+    AAPL: "-50"
+  # Equity: 105275 - (50 * 106) = 99975
+  final_equity: "99975.00"
+
+  metrics:
+    total_return: "-0.00025"
+    total_trades: 2

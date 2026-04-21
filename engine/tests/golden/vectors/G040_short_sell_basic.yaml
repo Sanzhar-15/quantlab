@@ -1,0 +1,68 @@
+# G040: Basic Short Sell
+# Category: short_selling
+# Verifies: Short selling with 100% collateral model
+
+id: G040
+name: "Basic short sell with collateral"
+category: short_selling
+description: |
+  A short sell should:
+  1. Receive proceeds from the sale
+  2. Reserve 100% collateral against the short
+  3. Mark-to-market the short position (negative quantity)
+  4. Maintain equity identity: equity = cash + long_value - short_value
+
+tags:
+  - short_selling
+  - collateral
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+  short_selling:
+    enabled: true
+    borrow_rate: "0"  # No borrow fee for this basic test
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.00", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+    - {date: "2026-01-06", open: "103.00", high: "104.00", low: "100.00", close: "101.00", volume: 900000}
+
+signals:
+  # Short sell at bar 0
+  - bar_index: 0
+    action: sell_short
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "104.00"
+      side: sell_short
+
+  # After short: cash = 100000 + 10400 (proceeds) = 110400
+  # Collateral reserved = 10400 (100% of short value)
+  # Short value at close = 100 * 101 = 10100
+  # Equity = cash + long_value - short_value = 110400 + 0 - 10100 = 100300
+  final_cash: "110400.00"
+  collateral_reserved: "10400.00"
+  final_positions:
+    AAPL: "-100"  # Negative for short
+  final_equity: "100300.00"  # Profit from price drop
+
+  metrics:
+    total_return: "0.003"
+    short_value: "10100.00"
+    gross_exposure: "0.1007"  # 10100 / 100300

@@ -1,0 +1,52 @@
+# G032: IOC Order No Immediate Fill
+# Category: order_types
+# Verifies: IOC order cancelled if cannot fill immediately
+
+id: G032
+name: "IOC order cancelled if no immediate fill"
+category: order_types
+description: |
+  An IOC (Immediate Or Cancel) order should be cancelled
+  if it cannot be filled immediately at the limit price.
+
+tags:
+  - ioc
+  - cancel
+  - order_types
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "102.00", low: "99.00", close: "101.00", volume: 1000000}
+    - {date: "2026-01-05", open: "101.00", high: "103.00", low: "100.00", close: "102.00", volume: 1200000}
+
+signals:
+  # IOC limit buy at 95 - open is 101, cannot fill
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: limit
+    limit_price: "95.00"
+    time_in_force: ioc
+
+expected:
+  fills: []
+
+  final_cash: "100000.00"
+  final_positions: {}
+  final_equity: "100000.00"
+
+  metrics:
+    total_return: "0"
+    total_trades: 0

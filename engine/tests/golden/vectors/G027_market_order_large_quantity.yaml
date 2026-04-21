@@ -1,0 +1,56 @@
+# G027: Market Order Large Quantity
+# Category: order_types
+# Verifies: Large market order fills correctly
+
+id: G027
+name: "Market order large quantity"
+category: order_types
+description: |
+  A large market order should fill completely at the open price
+  when there is sufficient cash available.
+
+tags:
+  - market
+  - large_order
+  - order_types
+
+setup:
+  initial_cash: "1000000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 10000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 12000000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "5000"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "5000"
+      price: "104.50"
+      side: buy
+
+  # 5000 * 104.50 = 522,500
+  final_cash: "477500.00"
+  final_positions:
+    AAPL: "5000"
+  final_equity: "992500.00"  # 477500 + (5000 * 103)
+
+  metrics:
+    total_return: "-0.0075"
+    total_trades: 1

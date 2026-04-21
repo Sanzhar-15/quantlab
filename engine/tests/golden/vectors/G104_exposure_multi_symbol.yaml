@@ -1,0 +1,78 @@
+# G104: Multi-Symbol Exposure Limit
+# Category: exposure
+# Verifies: Exposure limit applies across all symbols
+
+id: G104
+name: "Exposure limit applies across all symbols"
+category: exposure
+description: |
+  Maximum exposure limit should apply to the total gross exposure
+  across all symbols in the portfolio.
+
+tags:
+  - exposure
+  - multi_symbol
+  - risk
+
+skip: true
+skip_reason: "Multi-symbol exposure limits not fully implemented"
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+  risk_limits:
+    max_exposure: "75000"
+
+data:
+  timeframe: 1d
+  symbols:
+    - symbol: AAPL
+      bars:
+        - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+        - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+    - symbol: MSFT
+      bars:
+        - {date: "2026-01-02", open: "200.00", high: "210.00", low: "198.00", close: "205.00", volume: 800000}
+        - {date: "2026-01-05", open: "206.00", high: "210.00", low: "203.00", close: "207.00", volume: 900000}
+
+signals:
+  # Buy $50,000 of AAPL
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "478"  # ~$50,000 at $104.50
+    order_type: market
+  # Try to buy $50,000 of MSFT - should be limited
+  - bar_index: 0
+    action: buy
+    symbol: MSFT
+    quantity: "243"  # ~$50,000 at $206
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "478"
+      price: "104.50"
+      side: buy
+    - bar_index: 1
+      symbol: MSFT
+      quantity: "121"  # Limited to stay under $75,000 total
+      price: "206.00"
+      side: buy
+
+  final_cash: "24983.00"  # 100000 - 49951 - 24926
+  final_positions:
+    AAPL: "478"
+    MSFT: "121"
+  final_equity: "99964.00"
+
+  metrics:
+    total_return: "-0.000360"
+    total_trades: 2

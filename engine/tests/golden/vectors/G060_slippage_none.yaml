@@ -1,0 +1,56 @@
+# G060: No Slippage Model
+# Category: slippage
+# Verifies: Zero slippage when model is none
+
+id: G060
+name: "No slippage model"
+category: slippage
+description: |
+  With slippage model set to none, fills should occur exactly
+  at the theoretical price with no slippage applied.
+
+tags:
+  - slippage
+  - none
+  - baseline
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "104.50"  # Exactly at open, no slippage
+      side: buy
+      slippage: "0"
+
+  final_cash: "89550.00"
+  final_positions:
+    AAPL: "100"
+  final_equity: "99850.00"
+
+  metrics:
+    total_return: "-0.0015"
+    total_trades: 1

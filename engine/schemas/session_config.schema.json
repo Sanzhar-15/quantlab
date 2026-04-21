@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quantlab.io/schemas/session_config.schema.json",
+  "title": "SessionConfig",
+  "description": "Trading session configuration schema",
+  "type": "object",
+  "required": ["session_id", "mode", "strategy_path", "symbols"],
+  "properties": {
+    "session_id": {
+      "type": "string",
+      "description": "Unique session identifier (UUID)"
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["live", "paper", "backtest"],
+      "description": "Trading mode"
+    },
+    "strategy_path": {
+      "type": "string",
+      "description": "Path to strategy file"
+    },
+    "strategy_hash": {
+      "type": "string",
+      "description": "SHA-256 hash of strategy file for trust verification"
+    },
+    "broker": {
+      "type": "string",
+      "enum": ["alpaca", "mock"],
+      "description": "Broker adapter to use"
+    },
+    "symbols": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "description": "List of symbols to trade"
+    },
+    "risk_limits": {
+      "$ref": "#/$defs/RiskLimits"
+    },
+    "initial_capital": {
+      "type": "number",
+      "description": "Initial capital for backtesting",
+      "exclusiveMinimum": 0
+    },
+    "start_date": {
+      "type": "string",
+      "format": "date",
+      "description": "Backtest start date"
+    },
+    "end_date": {
+      "type": "string",
+      "format": "date",
+      "description": "Backtest end date"
+    },
+    "data_source": {
+      "type": "string",
+      "description": "Data source identifier"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Session creation timestamp"
+    }
+  },
+  "$defs": {
+    "RiskLimits": {
+      "type": "object",
+      "description": "Risk limit configuration",
+      "properties": {
+        "daily_loss_limit_pct": {
+          "type": "number",
+          "description": "Maximum daily loss as percentage of equity",
+          "minimum": 0,
+          "maximum": 100,
+          "default": 2
+        },
+        "max_drawdown_pct": {
+          "type": "number",
+          "description": "Maximum drawdown percentage before circuit breaker",
+          "minimum": 0,
+          "maximum": 100,
+          "default": 5
+        },
+        "max_position_size_pct": {
+          "type": "number",
+          "description": "Maximum single position size as percentage of equity",
+          "minimum": 0,
+          "maximum": 100,
+          "default": 25
+        },
+        "max_gross_exposure_pct": {
+          "type": "number",
+          "description": "Maximum gross exposure as percentage of equity",
+          "minimum": 0,
+          "maximum": 200,
+          "default": 100
+        },
+        "max_consecutive_losses": {
+          "type": "integer",
+          "description": "Maximum consecutive losing trades before circuit breaker",
+          "minimum": 1,
+          "default": 3
+        },
+        "max_order_size": {
+          "type": "number",
+          "description": "Maximum single order size in shares",
+          "exclusiveMinimum": 0
+        },
+        "max_order_value": {
+          "type": "number",
+          "description": "Maximum single order value in currency",
+          "exclusiveMinimum": 0
+        }
+      }
+    }
+  }
+}

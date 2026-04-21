@@ -1,0 +1,69 @@
+# G017: Limit Sell Order Fill
+# Category: order_types
+# Verifies: Limit sell fills when price reaches limit or higher
+
+id: G017
+name: "Limit sell order fills"
+category: order_types
+description: |
+  A limit sell order should fill when the high price reaches the limit.
+  The fill should occur at the limit price or better.
+
+tags:
+  - limit
+  - sell
+  - order_types
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+    - {date: "2026-01-06", open: "103.00", high: "110.00", low: "102.00", close: "109.00", volume: 900000}
+
+signals:
+  # Buy first
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+  # Limit sell at 108
+  - bar_index: 1
+    action: sell
+    symbol: AAPL
+    quantity: "100"
+    order_type: limit
+    limit_price: "108.00"
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "104.50"
+      side: buy
+    # High reaches 110 > limit 108, fills at max(open, limit) = 108
+    - bar_index: 2
+      symbol: AAPL
+      quantity: "100"
+      price: "108.00"
+      side: sell
+
+  final_cash: "100350.00"  # 100000 - 10450 + 10800
+  final_positions: {}
+  final_equity: "100350.00"
+
+  metrics:
+    total_return: "0.0035"
+    total_trades: 2

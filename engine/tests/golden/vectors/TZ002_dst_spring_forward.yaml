@@ -1,0 +1,61 @@
+# TZ002: DST Spring Forward
+# Category: timezone
+# Verifies: DST spring forward handled correctly
+
+id: TZ002
+name: "DST spring forward transition"
+category: timezone
+description: |
+  Daylight Saving Time spring forward transition should be
+  handled correctly without missing or duplicate bars.
+
+tags:
+  - timezone
+  - dst
+  - spring
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    # Around DST spring forward (March 8, 2026)
+    - {date: "2026-03-06", open: "100.00", high: "102.00", low: "99.00", close: "101.00", volume: 1000000}
+    - {date: "2026-03-09", open: "101.50", high: "103.00", low: "100.00", close: "102.00", volume: 1100000}
+    - {date: "2026-03-10", open: "102.50", high: "104.00", low: "101.00", close: "103.00", volume: 1200000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "101.50"
+      side: buy
+
+  final_cash: "89850.00"
+  final_positions:
+    AAPL: "100"
+  final_equity: "100150.00"
+
+  metrics:
+    total_return: "0.0015"
+    total_trades: 1
+
+  timezone:
+    no_missing_bars: true
+    no_duplicate_bars: true

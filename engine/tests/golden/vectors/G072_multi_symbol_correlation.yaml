@@ -1,0 +1,83 @@
+# G072: Multi-Symbol Uncorrelated Movement
+# Category: multi_symbol
+# Verifies: Independent P&L tracking for multiple positions
+
+id: G072
+name: "Multi-symbol uncorrelated movement"
+category: multi_symbol
+description: |
+  Multiple positions moving in different directions should have
+  independent P&L calculations that correctly aggregate.
+
+tags:
+  - multi_symbol
+  - independent
+  - pnl
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbols:
+    - symbol: AAPL
+      timeframe: 1d
+      bars:
+        - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+        - {date: "2026-01-05", open: "104.00", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+        # AAPL goes up
+        - {date: "2026-01-06", open: "103.00", high: "115.00", low: "102.00", close: "114.00", volume: 900000}
+    - symbol: MSFT
+      timeframe: 1d
+      bars:
+        - {date: "2026-01-02", open: "400.00", high: "410.00", low: "395.00", close: "405.00", volume: 800000}
+        - {date: "2026-01-05", open: "405.00", high: "410.00", low: "400.00", close: "408.00", volume: 900000}
+        # MSFT goes down
+        - {date: "2026-01-06", open: "408.00", high: "410.00", low: "380.00", close: "385.00", volume: 1500000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "50"
+    order_type: market
+  - bar_index: 0
+    action: buy
+    symbol: MSFT
+    quantity: "20"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "50"
+      price: "104.00"
+      side: buy
+    - bar_index: 1
+      symbol: MSFT
+      quantity: "20"
+      price: "405.00"
+      side: buy
+
+  # Buy AAPL: 50 * 104 = 5200
+  # Buy MSFT: 20 * 405 = 8100
+  # Total spent: 13300
+  # Cash: 100000 - 13300 = 86700
+  final_cash: "86700.00"
+  final_positions:
+    AAPL: "50"
+    MSFT: "20"
+  # AAPL value: 50 * 114 = 5700
+  # MSFT value: 20 * 385 = 7700
+  # Total: 86700 + 5700 + 7700 = 100100
+  final_equity: "100100.00"
+
+  metrics:
+    total_return: "0.001"
+    total_trades: 2

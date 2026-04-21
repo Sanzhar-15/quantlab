@@ -1,0 +1,59 @@
+# G101: Exposure Limit Allows Partial
+# Category: exposure
+# Verifies: Order is partially filled up to exposure limit
+
+id: G101
+name: "Exposure limit allows partial fill"
+category: exposure
+description: |
+  When an order would exceed the exposure limit, it is partially filled
+  up to the maximum allowed exposure.
+
+tags:
+  - exposure
+  - risk_limit
+  - partial_fill
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+  risk_limits:
+    max_exposure: "50000"  # Max $50k exposure
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "102.00", low: "99.00", close: "101.00", volume: 1000000}
+    - {date: "2026-01-05", open: "100.00", high: "103.00", low: "99.00", close: "102.00", volume: 1200000}
+    - {date: "2026-01-06", open: "102.50", high: "105.00", low: "101.00", close: "104.00", volume: 1100000}
+
+signals:
+  # Trying to buy 1000 shares @ $100 = $100k, but max exposure is $50k
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "1000"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "500"  # Limited to 500 shares = $50k
+      price: "100.00"
+      side: buy
+
+  final_cash: "50000.00"  # 100000 - (500 * 100)
+  final_positions:
+    AAPL: "500"
+  final_equity: "102000.00"  # 50000 + (500 * 104)
+
+  metrics:
+    total_return: "0.02"
+    total_trades: 1

@@ -1,0 +1,59 @@
+---
+# P015: Multiple orders respect cumulative volume participation
+# Tests that volume accumulates across orders in same bar
+# Spec Reference: Technical Spec §3.3 (Volume Participation)
+
+name: "Multi-Order Volume Participation"
+description: |
+  Verify that multiple orders in the same bar properly share
+  the volume participation limit (cumulative tracking).
+
+config:
+  initial_cash: "100000.00"
+  commission_model: "none"
+  fill_assumption: "next_open"
+  max_volume_participation: "0.10"  # 10% max participation
+
+data:
+  SHARED_VOL:
+    - timestamp: "2024-01-02T09:30:00"
+      open: "50.00"
+      high: "52.00"
+      low: "49.00"
+      close: "51.00"
+      volume: 1000
+    - timestamp: "2024-01-03T09:30:00"
+      open: "51.00"  # Fills happen here
+      high: "53.00"
+      low: "50.00"
+      close: "52.00"
+      volume: 1000  # Max fill = 100 shares total
+    - timestamp: "2024-01-04T09:30:00"
+      open: "52.00"
+      high: "54.00"
+      low: "51.00"
+      close: "53.00"
+      volume: 1000
+
+signals:
+  # First order: wants 60 shares
+  - bar_index: 0
+    symbol: "SHARED_VOL"
+    side: "buy"
+    order_type: "market"
+    quantity: "60"
+  # Second order: wants 60 shares (same bar)
+  - bar_index: 0
+    symbol: "SHARED_VOL"
+    side: "buy"
+    order_type: "market"
+    quantity: "60"
+
+expected:
+  # Total max = 10% of 1000 = 100 shares
+  # First order gets 60, second order gets 40 (remainder)
+  final_positions:
+    SHARED_VOL: "100"  # Cumulative volume limit
+  order_1_filled: "60"
+  order_2_filled: "40"  # Limited by cumulative volume
+  volume_limit_enforced: true

@@ -1,0 +1,3095 @@
+[
+  {
+    "id": "data-quality",
+    "label": "Data Quality & Missing Data",
+    "description": "Detect gaps, stale prices, outliers, and corporate actions; impute or flag missing observations before downstream analysis.",
+    "order": 1,
+    "icon": "database",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "missing-data-pattern",
+        "label": "Missing Data Pattern Analysis",
+        "description": "Visualises and classifies missingness patterns (monotone, arbitrary, systematic)",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "forward-fill-backward-fill",
+        "label": "Forward-Fill / Backward-Fill",
+        "description": "Propagates last/next known value to fill gaps",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "linear-spline-interpolation",
+        "label": "Linear / Spline Interpolation",
+        "description": "Fills gaps using linear or cubic spline between known points",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "stale-price-detection",
+        "label": "Stale Price Detection",
+        "description": "Flags repeated identical prices/returns suggesting illiquidity or stale quotes",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "data-frequency-detection",
+        "label": "Data Frequency Detection",
+        "description": "Auto-infers and validates time series frequency",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "duplicate-detection",
+        "label": "Duplicate Detection",
+        "description": "Identifies duplicate timestamps or near-duplicate observations",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "timestamp-alignment",
+        "label": "Timestamp Alignment",
+        "description": "Aligns multiple series to common timeline handling TZ and frequency mismatches",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "holiday-trading-calendar-validation",
+        "label": "Holiday / Trading Calendar Validation",
+        "description": "Validates dates against exchange-specific calendars",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "return-outlier-flagging",
+        "label": "Return Outlier Flagging",
+        "description": "Detects abnormal returns suggesting data errors or corporate actions",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "corporate-action-detection",
+        "label": "Corporate Action Detection",
+        "description": "Detects unadjusted splits, dividends, mergers via price/volume discontinuities",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "littles-mcar-test",
+        "label": "Little's MCAR Test",
+        "description": "Tests whether data is Missing Completely At Random vs. non-random",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "em-imputation",
+        "label": "EM Imputation",
+        "description": "Expectation-Maximisation iteratively estimates missing values",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "multiple-imputation-mice",
+        "label": "Multiple Imputation (MICE)",
+        "description": "Chained equations generating multiple plausible datasets",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "stationarity",
+    "label": "Stationarity & Unit Roots",
+    "description": "Test whether a time series has a unit root or is stationary, guiding the choice of differencing, detrending, or direct modelling.",
+    "order": 2,
+    "icon": "pulse",
+    "context_hints": [
+      "single-series"
+    ],
+    "tools": [
+      {
+        "id": "augmented-dickey-fuller",
+        "label": "Augmented Dickey-Fuller (ADF)",
+        "description": "Tests null of unit root vs. stationarity -- the workhorse for checking if differencing is needed",
+        "tier": "essential",
+        "implemented": true,
+        "cross_ref": null
+      },
+      {
+        "id": "kpss",
+        "label": "KPSS",
+        "description": "Tests null of stationarity (reversed null vs. ADF) -- confirmatory cross-check alongside ADF",
+        "tier": "essential",
+        "implemented": true,
+        "cross_ref": null
+      },
+      {
+        "id": "phillips-perron",
+        "label": "Phillips-Perron (PP)",
+        "description": "Non-parametric ADF correction robust to heteroskedasticity and volatility clustering",
+        "tier": "essential",
+        "implemented": true,
+        "cross_ref": null
+      },
+      {
+        "id": "variance-ratio",
+        "label": "Variance Ratio (Lo-MacKinlay)",
+        "description": "Tests random walk hypothesis -- detects mean reversion or momentum in asset prices",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "chow-denning-joint-vr",
+        "label": "Chow-Denning Joint VR",
+        "description": "Joint variance ratio test across multiple horizons simultaneously -- stronger than single-horizon",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "hurst-exponent",
+        "label": "Hurst Exponent",
+        "description": "Estimates long-memory parameter H: >0.5 trending, <0.5 mean-reverting -- critical for strategy selection",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "df-gls",
+        "label": "DF-GLS (Elliott-Rothenberg-Stock)",
+        "description": "GLS-detrended ADF with superior power near the unit-root boundary",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "zivot-andrews",
+        "label": "Zivot-Andrews",
+        "description": "Unit root test allowing a single endogenous structural break in intercept or trend",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "ng-perron",
+        "label": "Ng-Perron (MZa, MZt, MSB, MPT)",
+        "description": "Modified PP tests with best size-power tradeoff among modern unit root tests",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "ers-point-optimal",
+        "label": "ERS Point Optimal",
+        "description": "Highest theoretical power for local-to-unity alternatives",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "wrights-rank-sign-vr",
+        "label": "Wright's Rank/Sign VR",
+        "description": "Non-parametric variance ratio tests robust to non-normality -- better for fat-tailed returns",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "leybourne-mccabe",
+        "label": "Leybourne-McCabe",
+        "description": "Alternative stationarity test with better finite-sample size properties than KPSS",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "autocorrelation",
+    "label": "Autocorrelation & Serial Dependence",
+    "description": "Measure and test for serial dependence in returns and residuals, guiding AR/MA order selection and model diagnostics.",
+    "order": 3,
+    "icon": "history",
+    "context_hints": [
+      "single-series",
+      "multi-series"
+    ],
+    "tools": [
+      {
+        "id": "acf-pacf",
+        "label": "ACF / PACF",
+        "description": "Plots autocorrelation and partial autocorrelation at each lag -- identifies MA and AR orders",
+        "tier": "essential",
+        "implemented": true,
+        "cross_ref": null
+      },
+      {
+        "id": "ljung-box",
+        "label": "Ljung-Box Test",
+        "description": "Portmanteau test for no autocorrelation up to lag k -- primary residual diagnostic",
+        "tier": "essential",
+        "implemented": true,
+        "cross_ref": null
+      },
+      {
+        "id": "durbin-watson",
+        "label": "Durbin-Watson",
+        "description": "Tests for first-order autocorrelation in regression residuals",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "breusch-godfrey-lm",
+        "label": "Breusch-Godfrey LM",
+        "description": "Tests higher-order serial correlation -- more powerful than DW, valid with lagged dep. variables",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "ljung-box-squared",
+        "label": "Ljung-Box on Squared Residuals",
+        "description": "Tests for remaining ARCH effects after GARCH fitting -- variance equation check",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "cross-correlation-function",
+        "label": "Cross-Correlation Function (CCF)",
+        "description": "Measures lead-lag correlation between two series for cross-asset prediction",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "runs-test",
+        "label": "Runs Test (Wald-Wolfowitz)",
+        "description": "Non-parametric randomness test -- detects patterns parametric tests miss",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "durbins-h-test",
+        "label": "Durbin's h-Test",
+        "description": "Modified DW valid for models with lagged dependent variables",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "cumulative-periodogram",
+        "label": "Cumulative Periodogram (Bartlett's)",
+        "description": "Frequency-domain white noise test -- detects periodic structure",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "weighted-ljung-box",
+        "label": "Weighted Ljung-Box (Fisher-Gallagher)",
+        "description": "Declining-weight portmanteau with better finite-sample properties",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "normality",
+    "label": "Normality",
+    "description": "Test whether returns or residuals follow a Gaussian distribution, quantifying skewness and tail behaviour critical for risk models.",
+    "order": 4,
+    "icon": "graph",
+    "context_hints": [
+      "single-series"
+    ],
+    "tools": [
+      {
+        "id": "jarque-bera",
+        "label": "Jarque-Bera",
+        "description": "Joint skewness + kurtosis test -- standard regression residual diagnostic",
+        "tier": "essential",
+        "implemented": true,
+        "cross_ref": null
+      },
+      {
+        "id": "shapiro-wilk",
+        "label": "Shapiro-Wilk",
+        "description": "Most powerful normality test for small-to-moderate samples (n<5000)",
+        "tier": "essential",
+        "implemented": true,
+        "cross_ref": null
+      },
+      {
+        "id": "anderson-darling",
+        "label": "Anderson-Darling",
+        "description": "Tail-weighted KS test -- superior for detecting tail departures critical for risk",
+        "tier": "essential",
+        "implemented": true,
+        "cross_ref": null
+      },
+      {
+        "id": "qq-plot",
+        "label": "QQ-Plot Generation",
+        "description": "Visual diagnostic: sample vs. theoretical quantiles -- reveals what numerical tests summarise",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "dagostino-pearson",
+        "label": "D'Agostino-Pearson",
+        "description": "Combines skewness and kurtosis z-scores into omnibus test -- robust for n>20",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "kolmogorov-smirnov",
+        "label": "Kolmogorov-Smirnov",
+        "description": "Tests goodness-of-fit against any continuous distribution",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "lilliefors",
+        "label": "Lilliefors",
+        "description": "KS test adjusted when mean/variance are estimated from data",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "cramer-von-mises",
+        "label": "Cramer-von Mises",
+        "description": "Integrated squared CDF difference -- more sensitive in distribution centre than KS",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "pp-plot",
+        "label": "PP-Plot",
+        "description": "Empirical vs. theoretical CDF plot -- complements QQ-plot for body-of-distribution fit",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "epps-pulley",
+        "label": "Epps-Pulley",
+        "description": "Characteristic-function-based test -- effective for heavy-tailed financial data",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "distribution-analysis",
+    "label": "Distribution Analysis",
+    "description": "Characterise the full shape of return distributions including moments, density estimation, and parametric fitting for risk and pricing models.",
+    "order": 5,
+    "icon": "graph-scatter",
+    "context_hints": [
+      "single-series"
+    ],
+    "tools": [
+      {
+        "id": "summary-statistics",
+        "label": "Summary Statistics",
+        "description": "First four moments, min/max, percentiles -- comprehensive descriptive overview",
+        "tier": "essential",
+        "implemented": true,
+        "cross_ref": null
+      },
+      {
+        "id": "returns-analysis",
+        "label": "Returns Analysis",
+        "description": "Computes and analyses log/simple returns, cumulative returns, and return statistics",
+        "tier": "essential",
+        "implemented": true,
+        "cross_ref": null
+      },
+      {
+        "id": "rolling-statistics",
+        "label": "Rolling Statistics",
+        "description": "Rolling mean, std, skewness, kurtosis over configurable windows",
+        "tier": "essential",
+        "implemented": true,
+        "cross_ref": null
+      },
+      {
+        "id": "skewness-kurtosis-moments",
+        "label": "Skewness / Kurtosis / Moments",
+        "description": "First four moments -- negative skewness and excess kurtosis are key stylised facts",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "student-t-fit",
+        "label": "Student-t Distribution Fit",
+        "description": "Fits Student-t estimating DoF -- de facto for fat-tailed return modelling",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "kernel-density-estimation",
+        "label": "Kernel Density Estimation (KDE)",
+        "description": "Non-parametric density estimation -- visualises true return shape",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "empirical-cdf",
+        "label": "Empirical CDF",
+        "description": "Step-function CDF estimate -- foundation for KS tests and distribution comparison",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "parametric-distribution-fit",
+        "label": "Parametric Distribution Fit (MLE)",
+        "description": "Fits any scipy distribution via maximum likelihood -- quantifies best-fit parameters",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "ks-two-sample",
+        "label": "KS Two-Sample Test",
+        "description": "Tests if two samples share the same distribution -- compares returns across regimes",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "skewed-student-t-hansen",
+        "label": "Skewed Student-t (Hansen) Fit",
+        "description": "Asymmetric Student-t capturing fat tails and negative skewness",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "generalised-error-distribution",
+        "label": "Generalised Error Distribution",
+        "description": "Flexible sub/super-Gaussian alternative to Student-t",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "stable-levy-distribution",
+        "label": "Stable (Levy) Distribution Fit",
+        "description": "Alpha-stable distributions allowing infinite variance",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "hill-estimator",
+        "label": "Hill Estimator (Tail Index)",
+        "description": "Estimates tail exponent alpha -- determines if variance (alpha<2) or mean (alpha<1) is infinite",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "gpd-fit-pot",
+        "label": "GPD Fit (Peaks Over Threshold)",
+        "description": "Fits Generalised Pareto to threshold exceedances -- foundation of EVT",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "gev-fit-block-maxima",
+        "label": "GEV Fit (Block Maxima)",
+        "description": "Fits GEV to block maxima -- models worst-case portfolio losses",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "mean-excess-function",
+        "label": "Mean Excess Function Plot",
+        "description": "Mean of exceedances over varying thresholds -- guides GPD threshold selection",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "co-skewness-co-kurtosis",
+        "label": "Co-Skewness / Co-Kurtosis",
+        "description": "Higher-order cross-moments capturing asymmetric dependence beyond correlation",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "gaussian-mixture-model",
+        "label": "Gaussian Mixture Model Fit",
+        "description": "Mixture of Gaussians via EM -- models multimodal, regime-dependent distributions",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "bic-aic-distribution-selection",
+        "label": "BIC/AIC Distribution Selection",
+        "description": "Automated best-fitting distribution from a candidate set",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "heteroskedasticity",
+    "label": "Heteroskedasticity",
+    "description": "Detect non-constant variance in returns or regression residuals, a prerequisite for GARCH modelling and robust inference.",
+    "order": 6,
+    "icon": "layers",
+    "context_hints": [
+      "single-series"
+    ],
+    "tools": [
+      {
+        "id": "breusch-pagan",
+        "label": "Breusch-Pagan",
+        "description": "LM test detecting if residual variance depends linearly on regressors",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "whites-test",
+        "label": "White's Test",
+        "description": "General test assuming no specific functional form -- broadly applicable",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "arch-lm",
+        "label": "ARCH-LM (Engle's)",
+        "description": "Tests for conditional heteroskedasticity in residuals -- gateway before any GARCH model",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "goldfeld-quandt",
+        "label": "Goldfeld-Quandt",
+        "description": "F-test comparing variance in two subsamples -- detects monotonic variance changes",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "koenker-bassett",
+        "label": "Koenker-Bassett",
+        "description": "Robust Breusch-Pagan variant not assuming error normality",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "park-test",
+        "label": "Park Test",
+        "description": "Regresses log-squared residuals on suspected variable -- useful when source is hypothesised",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "glejser-test",
+        "label": "Glejser Test",
+        "description": "Regresses absolute residuals on suspected variables -- simpler alternative to BP",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "harrison-mccabe",
+        "label": "Harrison-McCabe",
+        "description": "Tests for variance break at a known or unknown point -- detects volatility regime shifts",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "nonlinearity",
+    "label": "Nonlinearity Tests",
+    "description": "Test for nonlinear dynamics in returns or residuals that linear models cannot capture, guiding threshold and neural-network specifications.",
+    "order": 7,
+    "icon": "debug-alt",
+    "context_hints": [
+      "single-series"
+    ],
+    "tools": [
+      {
+        "id": "bds-test",
+        "label": "BDS Test",
+        "description": "General test for i.i.d. and nonlinear dependence in residuals -- the broadest nonlinearity diagnostic",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "ramsey-reset",
+        "label": "Ramsey RESET",
+        "description": "Tests functional form misspecification via powers of fitted values",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "tsays-f-test",
+        "label": "Tsay's F-Test",
+        "description": "Tests for threshold nonlinearity -- precursor to TAR/SETAR specification",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "terasvirta-neural-network",
+        "label": "Terasvirta Neural Network Test",
+        "description": "Tests linearity against smooth transition neural network alternative",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "mcleod-li",
+        "label": "McLeod-Li Test",
+        "description": "Tests for nonlinear dependence via squared residuals -- related to ARCH-LM",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "white-neural-network",
+        "label": "White Neural Network Test",
+        "description": "Tests against unspecified nonlinear alternative using single hidden layer",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "keenan-test",
+        "label": "Keenan Test",
+        "description": "Tests for one specific type of non-additivity in time series",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "hansen-threshold",
+        "label": "Hansen Threshold Test",
+        "description": "Tests for threshold effect with nuisance parameters under null",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "cointegration",
+    "label": "Cointegration & Long-Run Relationships",
+    "description": "Test and estimate long-run equilibrium relationships between non-stationary series, foundational for pairs trading and basket strategies.",
+    "order": 8,
+    "icon": "link",
+    "context_hints": [
+      "multi-series"
+    ],
+    "tools": [
+      {
+        "id": "engle-granger-two-step",
+        "label": "Engle-Granger Two-Step",
+        "description": "Pairwise cointegration via ADF on regression residuals -- foundation of pairs trading",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "johansen",
+        "label": "Johansen (Trace + Max-Eigen)",
+        "description": "Tests for multiple cointegrating vectors among N>=2 series -- basket trading",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "vecm",
+        "label": "VECM",
+        "description": "Estimates cointegrating vectors + adjustment speeds -- short-run dynamics + long-run equilibrium",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "phillips-ouliaris",
+        "label": "Phillips-Ouliaris",
+        "description": "Residual-based cointegration test robust to serial correlation",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "kalman-filter-hedge-ratio",
+        "label": "Kalman Filter Hedge Ratio",
+        "description": "Dynamic hedge ratio estimation via state-space model -- standard for live pairs trading",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "ardl-bounds",
+        "label": "ARDL Bounds Test",
+        "description": "Tests cointegration regardless of I(0) or I(1) -- robust when integration order uncertain",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "gregory-hansen",
+        "label": "Gregory-Hansen",
+        "description": "Cointegration test allowing a single structural break in the cointegrating vector",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "dynamic-ols",
+        "label": "Dynamic OLS (DOLS)",
+        "description": "Estimates cointegrating vector with leads/lags correcting for endogeneity",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "fully-modified-ols",
+        "label": "Fully Modified OLS (FMOLS)",
+        "description": "Semi-parametric bias correction for efficient long-run coefficient estimation",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "canonical-cointegrating-regression",
+        "label": "Canonical Cointegrating Regression",
+        "description": "Transforms data to remove second-order bias -- alternative to FMOLS",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "hatemi-j",
+        "label": "Hatemi-J Test",
+        "description": "Gregory-Hansen extension allowing two structural breaks",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "maki-test",
+        "label": "Maki Test",
+        "description": "Cointegration with unknown number of breaks up to a maximum",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "causality",
+    "label": "Causality",
+    "description": "Test directional predictive relationships between time series using Granger causality and information-theoretic measures.",
+    "order": 9,
+    "icon": "arrow-right",
+    "context_hints": [
+      "multi-series"
+    ],
+    "tools": [
+      {
+        "id": "granger-causality",
+        "label": "Granger Causality",
+        "description": "Tests whether lagged X improves prediction of Y in a VAR -- foundational lead-lag test",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "toda-yamamoto",
+        "label": "Toda-Yamamoto",
+        "description": "Modified Granger valid for I(1)/cointegrated series without pre-testing for unit roots",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "transfer-entropy",
+        "label": "Transfer Entropy",
+        "description": "Information-theoretic directed flow -- captures nonlinear causal relationships Granger misses",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "instantaneous-causality",
+        "label": "Instantaneous Causality",
+        "description": "Tests whether innovations in X and Y are contemporaneously correlated",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "convergent-cross-mapping",
+        "label": "Convergent Cross Mapping",
+        "description": "Nonlinear causality for coupled dynamical systems -- detects contagion",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "vecm-causality",
+        "label": "VECM Causality (Short/Long-run)",
+        "description": "Decomposes causality into temporary and permanent channels",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "spectral-granger-causality",
+        "label": "Spectral Granger Causality",
+        "description": "Frequency-domain -- reveals causal relationships at different time horizons",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "partial-granger-causality",
+        "label": "Partial Granger Causality",
+        "description": "Controls for confounders when testing X->Y -- essential with multiple macro factors",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "nonlinear-granger-causality",
+        "label": "Nonlinear Granger Causality",
+        "description": "Kernel/NN-based extensions for nonlinear predictive relationships",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "var-multivariate",
+    "label": "VAR & Multivariate Time Series Models",
+    "description": "Estimate vector autoregressions to model dynamic interactions among multiple financial series, with impulse responses and variance decomposition.",
+    "order": 10,
+    "icon": "group-by-ref-type",
+    "context_hints": [
+      "multi-series"
+    ],
+    "tools": [
+      {
+        "id": "var-estimation",
+        "label": "VAR Estimation",
+        "description": "Estimates unrestricted Vector Autoregression with optimal lag selection (AIC/BIC/HQ)",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "impulse-response-functions",
+        "label": "Impulse Response Functions (IRF)",
+        "description": "Traces how a one-unit shock to variable X propagates through the system over time",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "forecast-error-variance-decomposition",
+        "label": "Forecast Error Variance Decomposition",
+        "description": "Quantifies what fraction of Y's forecast variance is explained by shocks to X",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "var-stability",
+        "label": "VAR Stability (Eigenvalue Check)",
+        "description": "Verifies all eigenvalues of companion matrix lie inside the unit circle",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "var-residual-diagnostics",
+        "label": "VAR Residual Diagnostics",
+        "description": "Multivariate portmanteau, normality, and heteroskedasticity tests on VAR residuals",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "structural-var",
+        "label": "Structural VAR (SVAR)",
+        "description": "Imposes identifying restrictions (Cholesky, short/long-run, sign) for causal interpretation",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "historical-decomposition",
+        "label": "Historical Decomposition",
+        "description": "Decomposes each variable's path into contributions from each structural shock over time",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "bayesian-var",
+        "label": "Bayesian VAR (BVAR)",
+        "description": "Minnesota/Litterman prior for regularised estimation in high-dimensional systems",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "var-forecasting",
+        "label": "VAR Forecasting",
+        "description": "Multi-step-ahead conditional forecasts with fan charts",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "global-var",
+        "label": "Global VAR (GVAR)",
+        "description": "Links country/region-specific VARs via trade-weight matrices for cross-border spillovers",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "factor-augmented-var",
+        "label": "Factor-Augmented VAR (FAVAR)",
+        "description": "Augments VAR with latent factors from large datasets (Bernanke-Boivin-Eliasz)",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "threshold-var",
+        "label": "Threshold VAR (TVAR)",
+        "description": "Regime-switching VAR where dynamics change based on an observable threshold variable",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "structural-breaks",
+    "label": "Structural Breaks & Change Points",
+    "description": "Detect and date shifts in mean, variance, or parameters over time, critical for regime-aware modelling and risk management.",
+    "order": 11,
+    "icon": "split-vertical",
+    "context_hints": [
+      "single-series"
+    ],
+    "tools": [
+      {
+        "id": "cusum-test",
+        "label": "CUSUM Test",
+        "description": "Cumulative sum of recursive residuals for gradual parameter instability",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "cusum-of-squares",
+        "label": "CUSUM of Squares",
+        "description": "Variant detecting changes in variance -- volatility regime shifts",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "chow-test",
+        "label": "Chow Test",
+        "description": "F-test for parameter stability at a known breakpoint",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "pelt-algorithm",
+        "label": "PELT Algorithm",
+        "description": "Optimal changepoint detection with penalised cost -- fast exact algorithm for multiple breaks",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "binary-segmentation",
+        "label": "Binary Segmentation",
+        "description": "Greedy recursive algorithm for multiple changepoints -- fast for high-frequency data",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "bai-perron",
+        "label": "Bai-Perron",
+        "description": "Tests and estimates multiple structural breaks at unknown dates -- gold standard",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "quandt-andrews",
+        "label": "Quandt-Andrews (SupF)",
+        "description": "Supremum of Chow F-statistics over all possible breakpoints",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "hansen-stability",
+        "label": "Hansen Stability Test",
+        "description": "LM-type test against random-walk or random-coefficient alternatives",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "bayesian-online-cpd",
+        "label": "Bayesian Online CPD (BOCPD)",
+        "description": "Bayesian recursive detection for streaming data -- real-time regime monitoring",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "e-divisive",
+        "label": "E-Divisive (Energy-Based)",
+        "description": "Non-parametric multivariate changepoint detection via energy statistics",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "bottom-up-segmentation",
+        "label": "Bottom-Up Segmentation",
+        "description": "Merges adjacent segments from maximally fine partition",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "window-sliding-detection",
+        "label": "Window-Sliding Detection",
+        "description": "Sliding window comparison for distributional shifts non-parametrically",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "regime-detection",
+    "label": "Regime Detection & Hidden States",
+    "description": "Identify latent market regimes (bull/bear, high/low volatility) using hidden state models for regime-aware trading and risk.",
+    "order": 12,
+    "icon": "eye",
+    "context_hints": [
+      "single-series"
+    ],
+    "tools": [
+      {
+        "id": "hidden-markov-model",
+        "label": "Hidden Markov Models (HMM)",
+        "description": "Latent discrete-state model with Gaussian emissions for regime classification",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": "hmm-regime-detection"
+      },
+      {
+        "id": "markov-switching",
+        "label": "Markov Switching Models",
+        "description": "Regime-switching regression with endogenous transition probabilities",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "hamilton-filter",
+        "label": "Hamilton Filter",
+        "description": "Forward-pass filter computing regime probabilities at each time step",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "kim-smoother",
+        "label": "Kim Smoother",
+        "description": "Backward-pass smoother refining regime probabilities using full sample",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "regime-probability-extraction",
+        "label": "Regime Probability Extraction",
+        "description": "Extracts filtered/smoothed state probabilities for downstream signals",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "threshold-autoregressive",
+        "label": "Threshold Autoregressive (TAR/SETAR)",
+        "description": "Regime switches triggered by observable variable exceeding a cutoff",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "smooth-transition",
+        "label": "Smooth Transition (STAR/LSTAR)",
+        "description": "Gradual regime transitions via logistic/exponential function",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "regime-duration-analysis",
+        "label": "Regime Duration Analysis",
+        "description": "Expected duration, persistence, and transition statistics per regime",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "volatility-garch",
+    "label": "Volatility & GARCH",
+    "description": "Model and forecast time-varying volatility using GARCH-family models and realised measures, essential for risk management and options pricing.",
+    "order": 13,
+    "icon": "flame",
+    "context_hints": [
+      "single-series",
+      "high-frequency"
+    ],
+    "tools": [
+      {
+        "id": "garch",
+        "label": "GARCH(p,q)",
+        "description": "Standard generalised ARCH -- the baseline for time-varying volatility across the industry",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "egarch",
+        "label": "EGARCH",
+        "description": "Exponential GARCH in log-variance -- ensures positivity and captures asymmetry",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "gjr-garch",
+        "label": "GJR-GARCH",
+        "description": "Threshold GARCH with leverage effect -- negative returns increase vol more than positive",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "ewma-riskmetrics",
+        "label": "EWMA (RiskMetrics)",
+        "description": "Exponentially weighted variance with lambda=0.94 -- industry-standard quick estimate",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "realised-volatility",
+        "label": "Realised Volatility",
+        "description": "Sum of intraday squared returns -- benchmark for high-frequency measurement",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "har-rv",
+        "label": "HAR-RV (Corsi)",
+        "description": "Heterogeneous Autoregressive Realized Vol -- THE standard for forecasting RV from HF data",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "volatility-persistence-half-life",
+        "label": "Volatility Persistence & Half-Life",
+        "description": "Computes alpha+beta and shock half-life -- how fast vol dissipates",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "arch-lm-std-residuals",
+        "label": "ARCH-LM on Std. Residuals",
+        "description": "Confirms no residual conditional heteroskedasticity post-GARCH",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "distribution-diagnostics",
+        "label": "Distribution Diagnostics",
+        "description": "Tests standardised residuals against assumed distribution (Normal, t, Skew-t, GED)",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "dcc-garch",
+        "label": "DCC-GARCH",
+        "description": "Dynamic Conditional Correlation -- time-varying correlations for portfolio risk and hedging",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "ccc-garch",
+        "label": "CCC-GARCH",
+        "description": "Constant Conditional Correlation -- simpler multivariate baseline (null model for DCC)",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "bipower-variation",
+        "label": "Bipower Variation",
+        "description": "Separates continuous volatility from jump component using adjacent-return products",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "jump-detection-bns",
+        "label": "Jump Detection (BNS Test)",
+        "description": "Barndorff-Nielsen-Shephard test for significant jumps in returns",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "lee-mykland-jump",
+        "label": "Lee-Mykland Jump Test",
+        "description": "Identifies individual jump arrivals at tick/minute frequency",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "figarch",
+        "label": "FIGARCH",
+        "description": "Fractionally integrated GARCH -- captures slow decay in squared-return autocorrelation",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "aparch",
+        "label": "APARCH",
+        "description": "Asymmetric Power ARCH nesting GARCH/GJR/TGARCH -- most general specification",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "harch",
+        "label": "HARCH",
+        "description": "Heterogeneous ARCH using multi-period returns -- heterogeneous market hypothesis",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "component-garch",
+        "label": "Component GARCH",
+        "description": "Decomposes volatility into transitory and permanent components",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "realized-garch",
+        "label": "Realized GARCH",
+        "description": "Bridges high-frequency realized measures with GARCH-type dynamics",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "bekk-garch",
+        "label": "BEKK-GARCH",
+        "description": "Full multivariate GARCH with guaranteed positive-definite covariance matrices",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "news-impact-curve",
+        "label": "News Impact Curve",
+        "description": "Plots past shocks vs. current variance -- visualises asymmetric response",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "sign-bias-test",
+        "label": "Sign Bias Test (Engle-Ng)",
+        "description": "Tests whether positive/negative shocks differ in vol impact -- GARCH diagnostic",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "var-backtesting",
+        "label": "VaR Backtesting (Kupiec/Christoffersen)",
+        "description": "Tests VaR exceedance frequency and independence -- regulatory requirement",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "mincer-zarnowitz",
+        "label": "Mincer-Zarnowitz Regression",
+        "description": "Regresses realised vol on forecast -- R-squared measures accuracy, slope tests bias",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "nyblom-parameter-stability",
+        "label": "Nyblom Parameter Stability",
+        "description": "Tests for constancy of GARCH parameters over time",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "correlation-dependence",
+    "label": "Correlation & Dependence",
+    "description": "Measure linear, rank, and nonlinear dependence between series, including dynamic correlations, copulas, and tail dependence for portfolio construction.",
+    "order": 14,
+    "icon": "git-merge",
+    "context_hints": [
+      "multi-series"
+    ],
+    "tools": [
+      {
+        "id": "pearson-correlation",
+        "label": "Pearson Correlation",
+        "description": "Linear correlation coefficient -- fast baseline",
+        "tier": "essential",
+        "implemented": true,
+        "cross_ref": null
+      },
+      {
+        "id": "spearman-rank-correlation",
+        "label": "Spearman Rank Correlation",
+        "description": "Monotonic rank-based correlation robust to non-linearity and outliers",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "kendall-tau",
+        "label": "Kendall Tau",
+        "description": "Rank correlation via concordant/discordant pairs -- most robust to outliers",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "rolling-correlation",
+        "label": "Rolling Correlation",
+        "description": "Time-windowed Pearson to track dynamic co-movement shifts",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "partial-correlation",
+        "label": "Partial Correlation",
+        "description": "Correlation after removing confounding variable effects",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "correlation-shrinkage",
+        "label": "Correlation Shrinkage (Ledoit-Wolf)",
+        "description": "Optimally shrinks sample correlation toward structured target",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "rmt-cleaned-correlation",
+        "label": "RMT-Cleaned Correlation Matrix",
+        "description": "Filters noise eigenvalues using Marchenko-Pastur from Random Matrix Theory",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "distance-correlation",
+        "label": "Distance Correlation (Szekely)",
+        "description": "Measures both linear and nonlinear dependence; zero iff truly independent",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "mutual-information",
+        "label": "Mutual Information",
+        "description": "Information-theoretic measure of arbitrary dependence",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "copula-fitting",
+        "label": "Copula Fitting (Gaussian, t, Clayton, Frank, Gumbel, Joe)",
+        "description": "Models joint dependence structure -- captures tail dependence",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "tail-dependence-coefficient",
+        "label": "Tail Dependence Coefficient",
+        "description": "Probability of joint extreme events -- critical for crisis-period risk",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "spectral-long-memory",
+    "label": "Spectral, Frequency Domain & Long Memory",
+    "description": "Analyse time series in the frequency domain and estimate long-memory parameters for modelling persistent dynamics in volatility and volume.",
+    "order": 15,
+    "icon": "radio-tower",
+    "context_hints": [
+      "single-series"
+    ],
+    "tools": [
+      {
+        "id": "fft",
+        "label": "FFT (Fast Fourier Transform)",
+        "description": "Decomposes series into constituent frequency components",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "power-spectral-density",
+        "label": "Power Spectral Density (Welch)",
+        "description": "Estimates PSD using overlapping averaged periodograms",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "hurst-exponent-rs",
+        "label": "Hurst Exponent (R/S Analysis)",
+        "description": "Detects long-range dependence: H>0.5 trending, H<0.5 mean-reverting",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": "hurst-on-spread"
+      },
+      {
+        "id": "detrended-fluctuation-analysis",
+        "label": "Detrended Fluctuation Analysis",
+        "description": "Robust scaling-exponent estimation for non-stationary series",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "gph-estimator",
+        "label": "GPH Estimator",
+        "description": "Geweke-Porter-Hudak semiparametric estimator for fractional integration parameter d",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "local-whittle",
+        "label": "Local Whittle Estimator",
+        "description": "Semiparametric d estimator with better bias properties than GPH",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "arfima",
+        "label": "ARFIMA(p,d,q) Fitting",
+        "description": "Long-memory ARIMA with fractional d -- for rates, realised vol, and volume",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "wavelet-analysis",
+        "label": "Wavelet Analysis (CWT/DWT/MODWT)",
+        "description": "Multi-scale time-frequency decomposition at different horizons",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "wavelet-coherence",
+        "label": "Wavelet Coherence",
+        "description": "Time-frequency co-movement between two series",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "multifractal-dfa",
+        "label": "Multifractal DFA (MF-DFA)",
+        "description": "Characterises multifractal scaling across moment orders",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "spectral-coherence",
+        "label": "Spectral Coherence",
+        "description": "Squared correlation between signals as a function of frequency",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "cross-spectral-analysis",
+        "label": "Cross-Spectral Analysis",
+        "description": "Cross-power spectral density for frequency-specific lead-lag",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "hilbert-huang-transform",
+        "label": "Hilbert-Huang Transform",
+        "description": "Adaptive decomposition into intrinsic mode functions",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "time-series-decomposition",
+    "label": "Time Series Decomposition",
+    "description": "Separate time series into trend, seasonal, and residual components for cleaner modelling and anomaly detection.",
+    "order": 16,
+    "icon": "ungroup-by-ref-type",
+    "context_hints": [
+      "single-series"
+    ],
+    "tools": [
+      {
+        "id": "stl-decomposition",
+        "label": "STL Decomposition",
+        "description": "Seasonal-Trend via LOESS -- handles varying seasonality robustly",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "classical-decomposition",
+        "label": "Classical Decomposition",
+        "description": "Additive or multiplicative: trend + seasonal + residual",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "hp-filter",
+        "label": "HP Filter (Hodrick-Prescott)",
+        "description": "Separates trend from cyclical component -- standard in macro and finance",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "trend-extraction",
+        "label": "Trend Extraction",
+        "description": "Long-term trend via moving average, polynomial, or HP filter",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "seasonality-detection",
+        "label": "Seasonality Detection",
+        "description": "Auto-detects seasonal patterns and their periods",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "baxter-king",
+        "label": "Baxter-King Filter",
+        "description": "Band-pass filter isolating business-cycle frequencies",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "christiano-fitzgerald",
+        "label": "Christiano-Fitzgerald Filter",
+        "description": "Asymmetric band-pass for random walk and non-stationary series",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "x13-arima-seats",
+        "label": "X-13 ARIMA-SEATS",
+        "description": "US Census production-grade seasonal adjustment",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "emd",
+        "label": "EMD (Empirical Mode Decomposition)",
+        "description": "Adaptive data-driven decomposition into intrinsic mode functions",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "state-space-kalman",
+    "label": "State-Space & Kalman Filter",
+    "description": "Recursive state estimation for linear and nonlinear systems, enabling time-varying parameter models and dynamic factor tracking.",
+    "order": 17,
+    "icon": "settings-gear",
+    "context_hints": [
+      "single-series",
+      "multi-series"
+    ],
+    "tools": [
+      {
+        "id": "kalman-filter",
+        "label": "Kalman Filter (Linear Gaussian)",
+        "description": "Optimal recursive state estimation for linear systems -- the foundational algorithm",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": "kalman-filter-hedge"
+      },
+      {
+        "id": "kalman-smoother",
+        "label": "Kalman Smoother (RTS)",
+        "description": "Rauch-Tung-Striebel backward pass refining estimates using the full sample",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "time-varying-parameter-regression",
+        "label": "Time-Varying Parameter Regression",
+        "description": "Estimates regression coefficients that evolve as random walks via Kalman filter",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "time-varying-beta",
+        "label": "Time-Varying Beta (CAPM/Factor)",
+        "description": "Tracks how asset's factor exposures change over time -- standard for risk monitoring",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "local-level-model",
+        "label": "Local Level Model",
+        "description": "Simplest state-space: random walk + noise -- extracts signal from noisy observations",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "local-linear-trend",
+        "label": "Local Linear Trend Model",
+        "description": "Level + slope both evolving -- captures changing growth rates",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "unobserved-components",
+        "label": "Unobserved Components Model",
+        "description": "Decomposes series into trend + cycle + seasonal + irregular via state-space",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "extended-kalman-filter",
+        "label": "Extended Kalman Filter (EKF)",
+        "description": "Kalman filter for mildly nonlinear systems via first-order Taylor linearisation",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "unscented-kalman-filter",
+        "label": "Unscented Kalman Filter (UKF)",
+        "description": "Sigma-point Kalman for nonlinear dynamics -- more accurate than EKF",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "particle-filter",
+        "label": "Particle Filter (Sequential MC)",
+        "description": "Monte Carlo state estimation for arbitrary nonlinear/non-Gaussian systems",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "em-state-space",
+        "label": "EM for State-Space Parameters",
+        "description": "Expectation-Maximisation for maximum likelihood estimation of system matrices",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "dimensionality-reduction",
+    "label": "Dimensionality Reduction & Factors",
+    "description": "Extract latent factors and reduce dimensionality of large cross-sections for factor models, portfolio construction, and visualisation.",
+    "order": 18,
+    "icon": "fold",
+    "context_hints": [
+      "multi-series",
+      "panel"
+    ],
+    "tools": [
+      {
+        "id": "pca",
+        "label": "PCA",
+        "description": "Extracts orthogonal principal components explaining maximum variance",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "factor-analysis",
+        "label": "Factor Analysis (Statistical)",
+        "description": "Probabilistic latent factor model with noise, supports Varimax rotation",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "rmt-filtering",
+        "label": "Random Matrix Theory Filtering",
+        "description": "Removes noise eigenvalues below Marchenko-Pastur threshold",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "sparse-pca",
+        "label": "Sparse PCA",
+        "description": "PCA with L1 penalty yielding sparse, interpretable factor loadings",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "kernel-pca",
+        "label": "Kernel PCA",
+        "description": "Non-linear PCA using kernel trick for complex factor structure",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "ica",
+        "label": "ICA",
+        "description": "Separates mixed signals into statistically independent sources",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "tsne-umap",
+        "label": "t-SNE / UMAP",
+        "description": "Non-linear embeddings for visualising high-dim relationships in 2D/3D",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "autoencoder-factor",
+        "label": "Autoencoder Factor Extraction",
+        "description": "Neural network encoder-decoder learning non-linear latent factors",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "nmf",
+        "label": "NMF",
+        "description": "Non-Negative Matrix Factorisation for additive parts-based decomposition",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "model-selection",
+    "label": "Model Selection & Goodness of Fit",
+    "description": "Compare and select among competing models using information criteria, cross-validation, and forecast evaluation tests.",
+    "order": 19,
+    "icon": "check-all",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "aic",
+        "label": "AIC (Akaike)",
+        "description": "Penalises complexity by 2k -- balances fit vs. parsimony",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "bic",
+        "label": "BIC (Bayesian / Schwarz)",
+        "description": "Stronger complexity penalty -- consistent model selector",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "adjusted-r-squared",
+        "label": "Adjusted R-squared",
+        "description": "R-squared corrected for predictor count -- penalises overfitting",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "out-of-sample-r-squared",
+        "label": "Out-of-Sample R-squared",
+        "description": "Predictive power on held-out data -- critical for alpha signal evaluation",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "time-series-cross-validation",
+        "label": "Time Series Cross-Validation",
+        "description": "Expanding/sliding window CV respecting temporal ordering",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "likelihood-ratio-test",
+        "label": "Likelihood Ratio Test",
+        "description": "Tests nested models via -2x log-likelihood difference",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "diebold-mariano",
+        "label": "Diebold-Mariano Test",
+        "description": "Compares predictive accuracy of two competing forecast models",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "hannan-quinn",
+        "label": "Hannan-Quinn Criterion",
+        "description": "Intermediate penalty between AIC and BIC",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "vuong-test",
+        "label": "Vuong Test",
+        "description": "Non-nested model comparison based on log-likelihood ratios",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "clark-west",
+        "label": "Clark-West Test",
+        "description": "Tests equal predictive ability adjusting for nested-model estimation noise",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "encompassing-test",
+        "label": "Encompassing Test (HLN)",
+        "description": "Tests whether one forecast encompasses the information of another",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "waic-dic",
+        "label": "WAIC / DIC",
+        "description": "Bayesian model comparison criteria",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "bayes-factor",
+        "label": "Bayes Factor",
+        "description": "Ratio of marginal likelihoods quantifying evidence for one model over another",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "non-parametric",
+    "label": "Non-Parametric Tests",
+    "description": "Distribution-free statistical tests and bootstrap methods for inference without Gaussian assumptions, essential for fat-tailed financial data.",
+    "order": 20,
+    "icon": "whole-word",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "mann-whitney-u",
+        "label": "Mann-Whitney U",
+        "description": "Compares two independent sample distributions without normality assumption",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "wilcoxon-signed-rank",
+        "label": "Wilcoxon Signed-Rank",
+        "description": "Non-parametric paired test for symmetric differences",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "kruskal-wallis",
+        "label": "Kruskal-Wallis",
+        "description": "Non-parametric one-way ANOVA comparing k independent groups",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "permutation-test",
+        "label": "Permutation Test",
+        "description": "Resamples data to build null distribution for any test statistic",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "bootstrap-confidence-intervals",
+        "label": "Bootstrap Confidence Intervals",
+        "description": "Resamples with replacement to estimate CIs for any statistic",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "block-bootstrap",
+        "label": "Block Bootstrap",
+        "description": "Preserves serial dependence by resampling contiguous blocks",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "stationary-bootstrap",
+        "label": "Stationary Bootstrap (Politis-Romano)",
+        "description": "Random block lengths from geometric distribution",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "sign-test",
+        "label": "Sign Test",
+        "description": "Tests median of differences -- simplest paired test",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "friedman-test",
+        "label": "Friedman Test",
+        "description": "Non-parametric repeated-measures for k related samples",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "moods-median-test",
+        "label": "Mood's Median Test",
+        "description": "Tests whether groups share the same population median",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "fligner-killeen",
+        "label": "Fligner-Killeen",
+        "description": "Non-parametric test for equality of variances across k groups",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "outlier-anomaly",
+    "label": "Outlier & Anomaly Detection",
+    "description": "Detect and handle outliers and anomalies in financial data using statistical, distance-based, and machine-learning methods.",
+    "order": 21,
+    "icon": "bug",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "z-score",
+        "label": "Z-Score",
+        "description": "Flags observations beyond k standard deviations from mean",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "modified-z-score",
+        "label": "Modified Z-Score (MAD-Based)",
+        "description": "Robust outlier score using Median Absolute Deviation",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "mahalanobis-distance",
+        "label": "Mahalanobis Distance",
+        "description": "Multivariate outlier detection accounting for correlations",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "isolation-forest",
+        "label": "Isolation Forest",
+        "description": "Tree-based ensemble isolating anomalies via random partitioning",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "local-outlier-factor",
+        "label": "Local Outlier Factor (LOF)",
+        "description": "Density-based detection comparing local density to neighbours",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "winsorisation",
+        "label": "Winsorisation",
+        "description": "Clips extreme values to specified percentiles",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "robust-covariance-mcd",
+        "label": "Robust Covariance (MCD)",
+        "description": "Minimum Covariance Determinant -- outlier-resistant covariance estimation",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "elliptic-envelope",
+        "label": "Elliptic Envelope",
+        "description": "Robust Gaussian covariance ellipse flagging multivariate outliers",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "hampel-filter",
+        "label": "Hampel Filter",
+        "description": "Sliding-window filter using local median and k*MAD",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "grubbs-test",
+        "label": "Grubbs' Test",
+        "description": "Statistical test for a single outlier in a univariate sample",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "dixons-q-test",
+        "label": "Dixon's Q Test",
+        "description": "Quick single-outlier test for small samples (n<=25)",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "one-class-svm",
+        "label": "One-Class SVM",
+        "description": "Novelty detection by learning boundary around normal data",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "dbscan",
+        "label": "DBSCAN",
+        "description": "Density-based clustering labelling low-density points as outliers",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "robust-statistics",
+    "label": "Robust Statistics & Inference",
+    "description": "Robust estimators and standard errors for reliable inference in the presence of heteroskedasticity, autocorrelation, and outliers.",
+    "order": 22,
+    "icon": "shield",
+    "context_hints": [
+      "any"
+    ],
+    "tools": [
+      {
+        "id": "newey-west-hac",
+        "label": "Newey-West HAC Standard Errors",
+        "description": "Heteroskedasticity and autocorrelation consistent SEs -- used in every time-series regression",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "white-hc-ses",
+        "label": "White Heteroskedasticity-Consistent SEs",
+        "description": "HC0/HC1/HC2/HC3 robust standard errors for cross-sectional regressions",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "clustered-standard-errors",
+        "label": "Clustered Standard Errors",
+        "description": "Clustered by time, entity, or two-way -- standard for panel regressions",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "trimmed-mean",
+        "label": "Trimmed Mean",
+        "description": "Mean after discarding a percentage of extreme observations",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "winsorised-mean",
+        "label": "Winsorised Mean",
+        "description": "Mean after capping extremes at specified percentiles",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "mad",
+        "label": "MAD (Median Absolute Deviation)",
+        "description": "Robust scale estimator -- median of absolute deviations from median",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "m-estimator-huber",
+        "label": "M-Estimator (Huber)",
+        "description": "Robust location/regression: quadratic near centre, linear in tails",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "robust-covariance-mcd-inference",
+        "label": "Robust Covariance (MCD)",
+        "description": "Minimum Covariance Determinant resistant to up to 50% outliers",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "quantile-regression",
+        "label": "Quantile Regression",
+        "description": "Estimates conditional quantiles -- reveals how factor effects vary across the return distribution",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "caviar",
+        "label": "CAViaR (Conditional Autoregressive VaR)",
+        "description": "Engle-Manganelli: directly models VaR quantile dynamics without distributional assumption",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "m-estimator-tukey",
+        "label": "M-Estimator (Tukey Bisquare)",
+        "description": "Redescending M-estimator that fully rejects extreme outliers",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "robust-regression",
+        "label": "Robust Regression (MM/LTS/LMS)",
+        "description": "High-breakdown regression alternatives to OLS",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "ogk-covariance",
+        "label": "OGK Covariance",
+        "description": "Orthogonalised Gnanadesikan-Kettenring for fast robust covariance",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "driscoll-kraay",
+        "label": "Driscoll-Kraay SEs",
+        "description": "Robust SEs for panel data with cross-sectional dependence",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "multicollinearity",
+    "label": "Multicollinearity",
+    "description": "Diagnose and quantify collinearity among predictors that inflates standard errors and destabilises regression coefficients.",
+    "order": 23,
+    "icon": "mirror",
+    "context_hints": [
+      "multi-series",
+      "panel"
+    ],
+    "tools": [
+      {
+        "id": "vif",
+        "label": "Variance Inflation Factor (VIF)",
+        "description": "Quantifies coefficient variance inflation; VIF > 10 flags concern",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "condition-number",
+        "label": "Condition Number",
+        "description": "Ratio of largest to smallest singular value; > 30 indicates problems",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "eigenvalue-analysis",
+        "label": "Eigenvalue Analysis",
+        "description": "Near-zero eigenvalues of X'X indicate collinear dimensions",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "correlation-heatmap",
+        "label": "Correlation Matrix Heatmap",
+        "description": "Visual inspection for highly correlated predictor groups",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "tolerance",
+        "label": "Tolerance (1/VIF)",
+        "description": "Values < 0.1 indicate severe collinearity",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "belsley-kuh-welsch",
+        "label": "Belsley-Kuh-Welsch",
+        "description": "Comprehensive diagnostics using condition indices and variance decomposition",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "determinant-correlation-matrix",
+        "label": "Determinant of Correlation Matrix",
+        "description": "Near-zero means near-singular (highly collinear) structure",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "panel-data",
+    "label": "Panel Data & Cross-Sectional",
+    "description": "Estimation and testing for panel datasets combining cross-sectional and time-series dimensions, standard in empirical asset pricing.",
+    "order": 24,
+    "icon": "table",
+    "context_hints": [
+      "panel"
+    ],
+    "tools": [
+      {
+        "id": "hausman-test",
+        "label": "Hausman Test",
+        "description": "Random vs. fixed effects -- chooses correct panel specification",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "breusch-pagan-lm-re",
+        "label": "Breusch-Pagan LM for Random Effects",
+        "description": "Tests for individual-specific random effects vs. pooled OLS",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "f-test-fixed-effects",
+        "label": "F-Test for Fixed Effects",
+        "description": "Joint significance of all individual fixed effects",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "fama-macbeth",
+        "label": "Fama-MacBeth Regression",
+        "description": "Two-pass cross-sectional regression -- THE standard in empirical asset pricing",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "newey-west-fama-macbeth",
+        "label": "Newey-West Corrected Fama-MacBeth",
+        "description": "FM with HAC adjustment for time-series autocorrelation in second-pass SEs",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "pesaran-cd",
+        "label": "Pesaran CD Test",
+        "description": "Cross-sectional dependence in panel residuals -- critical for asset panels",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "wooldridge-serial",
+        "label": "Wooldridge Serial Correlation",
+        "description": "First-order autocorrelation in fixed effects panel residuals",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "im-pesaran-shin",
+        "label": "Im-Pesaran-Shin Panel Unit Root",
+        "description": "Heterogeneous panel unit root allowing different AR coefficients",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "levin-lin-chu",
+        "label": "Levin-Lin-Chu Test",
+        "description": "Homogeneous panel unit root assuming common AR coefficient",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "shanken-correction",
+        "label": "Shanken Correction",
+        "description": "Corrects Fama-MacBeth SEs for errors-in-variables bias from estimated betas",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "pedroni-panel-cointegration",
+        "label": "Pedroni Panel Cointegration",
+        "description": "Tests for panel cointegration allowing heterogeneous dynamics across entities",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "westerlund-panel-cointegration",
+        "label": "Westerlund Panel Cointegration",
+        "description": "Error-correction-based panel cointegration with better size properties",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "kao-test",
+        "label": "Kao Test",
+        "description": "Homogeneous panel cointegration test -- panel extension of Engle-Granger",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "extreme-value-theory",
+    "label": "Extreme Value Theory",
+    "description": "Model the tails of return distributions for extreme risk quantification, including Value-at-Risk and Expected Shortfall from EVT-calibrated models.",
+    "order": 25,
+    "icon": "warning",
+    "context_hints": [
+      "single-series"
+    ],
+    "tools": [
+      {
+        "id": "block-maxima-gev",
+        "label": "Block Maxima (GEV Fit)",
+        "description": "Fits GEV to block maxima (e.g., monthly worst losses)",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "peaks-over-threshold",
+        "label": "Peaks Over Threshold (GPD Fit)",
+        "description": "Fits GPD to exceedances above a high threshold",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "return-level-estimation",
+        "label": "Return Level Estimation",
+        "description": "Loss levels expected once per N years from EVT model",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "value-at-risk",
+        "label": "Value-at-Risk",
+        "description": "Value-at-Risk from EVT-calibrated tail distributions",
+        "tier": "essential",
+        "implemented": true,
+        "cross_ref": null
+      },
+      {
+        "id": "expected-shortfall",
+        "label": "Expected Shortfall (CVaR)",
+        "description": "Expected loss beyond VaR threshold -- coherent risk measure",
+        "tier": "essential",
+        "implemented": true,
+        "cross_ref": null
+      },
+      {
+        "id": "mean-residual-life-plot",
+        "label": "Mean Residual Life Plot",
+        "description": "Diagnostic guiding GPD threshold selection",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "threshold-selection-methods",
+        "label": "Threshold Selection Methods",
+        "description": "Automated or visual methods for choosing POT threshold",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "extremal-index",
+        "label": "Extremal Index Estimation",
+        "description": "Measures clustering tendency of extremes; theta<1 implies crash clustering",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "market-microstructure",
+    "label": "Market Microstructure Statistics",
+    "description": "Measure liquidity, bid-ask spreads, price impact, and order flow toxicity from trade and quote data.",
+    "order": 26,
+    "icon": "zap",
+    "context_hints": [
+      "high-frequency"
+    ],
+    "tools": [
+      {
+        "id": "amihud-illiquidity",
+        "label": "Amihud Illiquidity Ratio",
+        "description": "Absolute return per unit volume -- the most widely used daily liquidity proxy",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "rolls-implied-spread",
+        "label": "Roll's Implied Spread",
+        "description": "Estimates effective spread from serial covariance of returns",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "corwin-schultz",
+        "label": "Corwin-Schultz High-Low Spread",
+        "description": "Estimates bid-ask spread from daily high-low prices",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "kyles-lambda",
+        "label": "Kyle's Lambda",
+        "description": "Estimates market depth from price-volume regression -- price impact per unit flow",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "vpin",
+        "label": "VPIN",
+        "description": "Volume-Synchronised PIN -- real-time toxicity metric predicting flash crashes",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "realised-kernel",
+        "label": "Realised Kernel Estimator",
+        "description": "Noise-robust volatility estimator for tick data with microstructure noise",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "pin-model",
+        "label": "PIN Model",
+        "description": "Probability of Informed Trading from order flow classification",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "order-flow-imbalance",
+        "label": "Order Flow Imbalance",
+        "description": "Net buying pressure normalised by total volume -- intraday signal",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "trade-classification",
+        "label": "Trade Classification (Lee-Ready)",
+        "description": "Classifies trades as buyer/seller-initiated from tick data",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "hasbroucks-information-share",
+        "label": "Hasbrouck's Information Share",
+        "description": "Decomposes price discovery across multiple venues",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "volatility-surface-options",
+    "label": "Volatility Surface & Options",
+    "description": "Construct and analyse implied volatility surfaces, compute Greeks, and calibrate stochastic volatility models for options trading.",
+    "order": 27,
+    "icon": "graph-line",
+    "context_hints": [
+      "options"
+    ],
+    "tools": [
+      {
+        "id": "iv-calculation",
+        "label": "IV Calculation (BS / Bjerksund-Stensland)",
+        "description": "Extracts implied vol from option prices for European and American options",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "volatility-smile-skew",
+        "label": "Volatility Smile / Skew Visualisation",
+        "description": "Plots IV across strikes at fixed expiry -- reveals market's risk perception",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "volatility-term-structure",
+        "label": "Volatility Term Structure",
+        "description": "IV across expiries at fixed delta -- contango/backwardation in vol",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "vol-surface-svi",
+        "label": "Vol Surface Construction (SVI)",
+        "description": "Stochastic Volatility Inspired parameterisation by Gatheral",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "greeks-computation",
+        "label": "Greeks Computation (Delta, Gamma, Theta, Vega, Rho)",
+        "description": "Full analytical and numerical sensitivities for position risk",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "put-call-parity",
+        "label": "Put-Call Parity Check",
+        "description": "Detects arbitrage opportunities and data errors from parity violations",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "sabr-calibration",
+        "label": "SABR Model Calibration",
+        "description": "Stochastic Alpha Beta Rho -- standard for interest rate and FX options vol",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "local-volatility-dupire",
+        "label": "Local Volatility Surface (Dupire)",
+        "description": "Non-parametric local vol extraction consistent with market prices",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "realised-vs-implied-vol",
+        "label": "Realised vs. Implied Vol Spread",
+        "description": "Tracks vol risk premium over time -- foundation of vol selling strategies",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "vol-of-vol",
+        "label": "Vol-of-Vol Estimation",
+        "description": "Second-order volatility dynamics -- important for vega hedging",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "volatility-cone",
+        "label": "Volatility Cone",
+        "description": "Min/max/percentile realised vol by horizon -- contextualises current IV level",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "skew-dynamics",
+        "label": "Skew Dynamics (Sticky Strike vs. Delta)",
+        "description": "Tests which vol regime applies for delta-hedging",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "variance-swap-fair-value",
+        "label": "Variance Swap Fair Value",
+        "description": "Calculates theoretical variance swap strike from option strip",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "no-arbitrage-surface-checks",
+        "label": "No-Arbitrage Surface Checks",
+        "description": "Validates butterfly and calendar spread constraints on fitted surface",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "fixed-income",
+    "label": "Fixed Income & Yield Curve",
+    "description": "Fit yield curves, compute duration and convexity, and analyse term structure dynamics for fixed income portfolio management.",
+    "order": 28,
+    "icon": "graph-left",
+    "context_hints": [
+      "fixed-income"
+    ],
+    "tools": [
+      {
+        "id": "nelson-siegel",
+        "label": "Nelson-Siegel Fitting",
+        "description": "3-factor parsimonious yield curve model (level, slope, curvature)",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "svensson",
+        "label": "Svensson Extension",
+        "description": "4-factor extended Nelson-Siegel adding a second curvature hump",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "yield-curve-bootstrapping",
+        "label": "Yield Curve Bootstrapping",
+        "description": "Strips spot rates from coupon bonds / swap rates",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "duration-modified-duration",
+        "label": "Duration / Modified Duration",
+        "description": "Price sensitivity to parallel yield shifts -- the primary IR risk metric",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "convexity",
+        "label": "Convexity",
+        "description": "Second-order price sensitivity -- corrects duration for large yield moves",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "dv01-bpv",
+        "label": "DV01 / BPV",
+        "description": "Dollar value of a basis point -- absolute risk per bond or portfolio",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "key-rate-duration",
+        "label": "Key Rate Duration (KRD)",
+        "description": "Sensitivity to non-parallel shifts at specific maturities",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "carry-roll-down",
+        "label": "Carry and Roll-Down Analysis",
+        "description": "Decomposes expected return into yield carry and roll-down the curve",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "swap-curve-construction",
+        "label": "Swap Curve Construction",
+        "description": "Builds OIS/SOFR discount curves from market instruments",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "term-premium-estimation",
+        "label": "Term Premium Estimation (ACM/KW)",
+        "description": "Decomposes yields into expected rates + term premium components",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "pca-yield-changes",
+        "label": "PCA of Yield Changes",
+        "description": "First 3 PCs (level, slope, curvature) explain ~98% of yield curve variation",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "spread-analysis",
+        "label": "Spread Analysis (OAS, Z-Spread, ASW)",
+        "description": "Option-adjusted and static spread decomposition for credit bonds",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "calendar-seasonality",
+    "label": "Calendar & Seasonality Anomalies",
+    "description": "Test for calendar-based return anomalies including day-of-week, month-of-year, and options expiration effects.",
+    "order": 29,
+    "icon": "calendar",
+    "context_hints": [
+      "single-series"
+    ],
+    "tools": [
+      {
+        "id": "day-of-week-effect",
+        "label": "Day-of-Week Effect Test",
+        "description": "Tests whether mean returns differ significantly by weekday",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "month-of-year-effect",
+        "label": "Month-of-Year Effect (January)",
+        "description": "Tests for monthly return patterns including the January effect",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "turn-of-month-effect",
+        "label": "Turn-of-Month Effect",
+        "description": "Tests for elevated returns around month boundaries",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "holiday-effect",
+        "label": "Holiday Effect",
+        "description": "Tests for abnormal returns around exchange holidays",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "options-expiration-effect",
+        "label": "Options Expiration Effect",
+        "description": "Tests for return/vol anomalies around expiry dates",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "quarter-end-window-dressing",
+        "label": "Quarter-End Window Dressing",
+        "description": "Tests for price pressure from institutional portfolio rebalancing",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "intraday-seasonality",
+        "label": "Intraday Seasonality",
+        "description": "Decomposes intraday vol/return patterns (U-shape, lunch effect)",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "lunar-weather-anomalies",
+        "label": "Lunar / Weather Anomalies",
+        "description": "Tests fringe behavioural anomalies -- included for completeness",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  },
+  {
+    "id": "entropy-complexity",
+    "label": "Entropy & Complexity",
+    "description": "Measure information content, regularity, and algorithmic complexity of time series for market efficiency and predictability assessment.",
+    "order": 30,
+    "icon": "circuit-board",
+    "context_hints": [
+      "single-series"
+    ],
+    "tools": [
+      {
+        "id": "shannon-entropy",
+        "label": "Shannon Entropy",
+        "description": "Measures uncertainty / information content of return distribution",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "approximate-entropy",
+        "label": "Approximate Entropy (ApEn)",
+        "description": "Quantifies regularity/predictability of a time series",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "sample-entropy",
+        "label": "Sample Entropy (SampEn)",
+        "description": "Improved ApEn without self-matching bias -- more consistent",
+        "tier": "essential",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "multiscale-entropy",
+        "label": "Multiscale Entropy (MSE)",
+        "description": "SampEn at multiple coarse-graining scales -- reveals complexity structure",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "renyi-entropy",
+        "label": "Renyi Entropy",
+        "description": "Generalised entropy with order parameter tuning tail sensitivity",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "permutation-entropy",
+        "label": "Permutation Entropy",
+        "description": "Maps time series to ordinal patterns -- fast complexity measure",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      },
+      {
+        "id": "lempel-ziv-complexity",
+        "label": "Lempel-Ziv Complexity",
+        "description": "Algorithmic complexity proxy -- counts distinct patterns in binary sequence",
+        "tier": "advanced",
+        "implemented": false,
+        "cross_ref": null
+      }
+    ]
+  }
+]

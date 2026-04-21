@@ -1,0 +1,45 @@
+---
+# N002: Sell order rejected when no position and short selling disabled
+# Tests that sells are blocked when shorting is disabled
+# Spec Reference: Technical Spec §5.1 (Short Selling Controls)
+
+name: "Sell Without Position (Short Disabled)"
+description: |
+  Verify that a sell order is rejected when there is no existing
+  long position and short selling is disabled.
+
+config:
+  initial_cash: "100000.00"
+  commission_model: "none"
+  fill_assumption: "next_open"
+  allow_short: false  # Short selling disabled
+
+data:
+  MSFT:
+    - timestamp: "2024-01-02T09:30:00"
+      open: "350.00"
+      high: "360.00"
+      low: "345.00"
+      close: "355.00"
+      volume: 500000
+    - timestamp: "2024-01-03T09:30:00"
+      open: "355.00"
+      high: "365.00"
+      low: "350.00"
+      close: "360.00"
+      volume: 600000
+
+signals:
+  - bar_index: 0
+    symbol: "MSFT"
+    side: "sell"  # Attempting to sell without a position
+    order_type: "market"
+    quantity: "10"
+
+expected:
+  final_cash: "100000.00"
+  final_positions:
+    MSFT: "0"
+  trades_count: 0
+  orders_rejected: 1
+  rejection_reason: "no_position_to_sell"

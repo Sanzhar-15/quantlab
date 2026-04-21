@@ -1,0 +1,28 @@
+# Crypto 24/7 Market Calendar
+# Cryptocurrency markets trade 24/7/365
+# Updated: 2026-01-26
+
+name: "crypto_24_7"
+description: "Cryptocurrency markets (24/7)"
+timezone: "UTC"
+
+regular_hours:
+  open: "00:00"
+  close: "23:59"
+
+# Trading days per year (365 for crypto)
+trading_days_per_year: 365
+
+# No holidays - crypto trades every day
+holidays: []
+
+# No early closes
+early_closes: []
+
+# Special note: Some exchanges may have maintenance windows
+# but these are not standard market closures
+maintenance_notes: |
+  Major exchanges occasionally have maintenance windows:
+  - Typically announced 24-48 hours in advance
+  - Usually 1-4 hours duration
+  - Should be handled at broker adapter level

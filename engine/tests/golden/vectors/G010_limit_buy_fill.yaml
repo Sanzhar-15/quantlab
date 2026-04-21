@@ -1,0 +1,56 @@
+# G010: Limit Buy Order - Fills
+# Category: order_types
+# Verifies: Limit buy order fills when price touches limit
+
+id: G010
+name: "Limit buy order fills at limit price"
+category: order_types
+description: |
+  A limit buy order should fill when the bar's low is at or below the limit price.
+  Fill price should be the better of open price or limit price (price improvement).
+
+tags:
+  - limit_order
+  - order_types
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "103.00", high: "106.00", low: "101.00", close: "105.00", volume: 1200000}
+    - {date: "2026-01-06", open: "105.00", high: "108.00", low: "104.00", close: "107.00", volume: 900000}
+
+signals:
+  # Limit buy at 102, bar 1 low is 101 so it fills
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: limit
+    limit_price: "102.00"
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "102.00"  # Fills at limit price (open 103 > limit 102, low 101 <= limit)
+      side: buy
+
+  final_cash: "89800.00"  # 100000 - (100 * 102)
+  final_positions:
+    AAPL: "100"
+  final_equity: "100500.00"  # 89800 + (100 * 107)
+
+  metrics:
+    total_return: "0.005"

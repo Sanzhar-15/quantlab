@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quantlab.io/schemas/position.schema.json",
+  "title": "Position",
+  "description": "Trading position schema for Quantlab",
+  "type": "object",
+  "required": ["symbol", "quantity", "avg_entry_price"],
+  "properties": {
+    "symbol": {
+      "type": "string",
+      "description": "Trading symbol",
+      "minLength": 1,
+      "maxLength": 10
+    },
+    "quantity": {
+      "type": "number",
+      "description": "Position quantity (positive = long, negative = short)"
+    },
+    "avg_entry_price": {
+      "type": "number",
+      "description": "Average entry price",
+      "exclusiveMinimum": 0
+    },
+    "market_value": {
+      "type": "number",
+      "description": "Current market value"
+    },
+    "cost_basis": {
+      "type": "number",
+      "description": "Total cost basis"
+    },
+    "unrealized_pnl": {
+      "type": "number",
+      "description": "Unrealized profit/loss"
+    },
+    "unrealized_pnl_pct": {
+      "type": "number",
+      "description": "Unrealized P&L percentage"
+    },
+    "realized_pnl": {
+      "type": "number",
+      "description": "Realized profit/loss for this position"
+    },
+    "side": {
+      "type": "string",
+      "enum": ["LONG", "SHORT", "FLAT"],
+      "description": "Position side"
+    },
+    "session_id": {
+      "type": "string",
+      "description": "Trading session ID"
+    },
+    "opened_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Position open timestamp"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Last update timestamp"
+    }
+  }
+}

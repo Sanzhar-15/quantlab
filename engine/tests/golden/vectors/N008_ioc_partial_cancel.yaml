@@ -1,0 +1,45 @@
+---
+# N008: IOC order partially fills then cancels remainder
+# Tests Immediate-Or-Cancel order behavior
+# Spec Reference: Technical Spec §4.3 (Time-in-Force)
+
+name: "IOC Partial Fill and Cancel"
+description: |
+  Verify that an Immediate-Or-Cancel order fills what it can
+  immediately and cancels any unfilled remainder.
+
+config:
+  initial_cash: "100000.00"
+  commission_model: "none"
+  fill_assumption: "next_open"
+  max_volume_participation: "0.20"  # 20% max participation
+
+data:
+  IOC_TEST:
+    - timestamp: "2024-01-02T09:30:00"
+      open: "100.00"
+      high: "105.00"
+      low: "98.00"
+      close: "103.00"
+      volume: 500  # Low volume
+    - timestamp: "2024-01-03T09:30:00"
+      open: "103.00"
+      high: "107.00"
+      low: "101.00"
+      close: "105.00"
+      volume: 600
+
+signals:
+  - bar_index: 0
+    symbol: "IOC_TEST"
+    side: "buy"
+    order_type: "market"
+    quantity: "200"  # Want 200, but max fill is 500 * 0.20 = 100
+    time_in_force: "ioc"  # Immediate-Or-Cancel
+
+expected:
+  final_positions:
+    IOC_TEST: "100"  # Filled up to volume limit
+  fill_quantity: "100"
+  cancelled_quantity: "100"  # Remainder cancelled
+  order_status: "cancelled"  # Partially filled, remainder cancelled

@@ -1,0 +1,61 @@
+# G020: GTC Order Fills on Later Bar
+# Category: time_in_force
+# Verifies: Good-til-cancelled order remains active across bars
+
+id: G020
+name: "GTC limit order fills on later bar"
+category: time_in_force
+description: |
+  A GTC (Good-Til-Cancelled) limit order remains active across multiple bars
+  and fills when price eventually reaches the limit.
+
+tags:
+  - gtc
+  - time_in_force
+  - limit_order
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "102.00", low: "99.00", close: "101.00", volume: 1000000}
+    - {date: "2026-01-05", open: "101.50", high: "103.00", low: "100.50", close: "102.00", volume: 1200000}
+    - {date: "2026-01-06", open: "102.00", high: "104.00", low: "101.00", close: "103.00", volume: 1100000}
+    - {date: "2026-01-07", open: "102.50", high: "103.50", low: "97.00", close: "98.00", volume: 2000000}
+    - {date: "2026-01-08", open: "98.50", high: "101.00", low: "97.00", close: "100.00", volume: 1800000}
+
+signals:
+  # GTC limit buy at 98 - doesn't fill until bar 3
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: limit
+    limit_price: "98.00"
+    time_in_force: gtc
+
+expected:
+  fills:
+    - bar_index: 3
+      symbol: AAPL
+      quantity: "100"
+      price: "98.00"
+      side: buy
+
+  final_cash: "90200.00"
+  final_positions:
+    AAPL: "100"
+  final_equity: "100200.00"  # 90200 + (100 * 100)
+
+  metrics:
+    total_return: "0.002"
+    total_trades: 1

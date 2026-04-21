@@ -1,0 +1,69 @@
+# G048: Short Selling Collateral Release
+# Category: order_types
+# Verifies: Collateral released when short position covered
+
+id: G048
+name: "Collateral released on short cover"
+category: order_types
+description: |
+  When a short position is covered, the reserved collateral
+  should be released back to buying power.
+
+tags:
+  - short
+  - collateral
+  - cover
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+    - {date: "2026-01-06", open: "98.00", high: "100.00", low: "97.00", close: "99.00", volume: 1400000}
+    - {date: "2026-01-07", open: "99.50", high: "101.00", low: "98.00", close: "100.00", volume: 1100000}
+
+signals:
+  # Short 100 shares
+  - bar_index: 0
+    action: sell_short
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+  # Cover on bar 2
+  - bar_index: 2
+    action: buy_to_cover
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "104.50"
+      side: sell_short
+    - bar_index: 3
+      symbol: AAPL
+      quantity: "100"
+      price: "99.50"
+      side: buy_to_cover
+
+  # Short at 104.50, cover at 99.50, profit = $500
+  final_cash: "100500.00"
+  final_positions: {}
+  final_equity: "100500.00"
+
+  metrics:
+    total_return: "0.005"
+    total_trades: 2

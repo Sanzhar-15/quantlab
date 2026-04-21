@@ -1,0 +1,58 @@
+---
+# N014: BUY_TO_COVER exceeds short position
+# Tests that covering more than short position is limited
+# Spec Reference: Technical Spec §5.2 (Short Position Management)
+
+name: "Buy To Cover Exceeds Short Position"
+description: |
+  Verify that a BUY_TO_COVER order larger than the short position
+  is limited to only cover the short, not create a long position.
+
+config:
+  initial_cash: "100000.00"
+  commission_model: "none"
+  fill_assumption: "next_open"
+  allow_short: true
+  short_collateral_ratio: "1.5"
+
+data:
+  NFLX:
+    - timestamp: "2024-01-02T09:30:00"
+      open: "500.00"
+      high: "510.00"
+      low: "495.00"
+      close: "505.00"
+      volume: 5000000
+    - timestamp: "2024-01-03T09:30:00"
+      open: "505.00"
+      high: "515.00"
+      low: "500.00"
+      close: "510.00"
+      volume: 5500000
+    - timestamp: "2024-01-04T09:30:00"
+      open: "510.00"
+      high: "520.00"
+      low: "505.00"
+      close: "515.00"
+      volume: 5500000
+
+signals:
+  # First: short 50 shares
+  - bar_index: 0
+    symbol: "NFLX"
+    side: "sell_short"
+    order_type: "market"
+    quantity: "50"
+  # Then: try to cover 100 (more than short position)
+  - bar_index: 1
+    symbol: "NFLX"
+    side: "buy_to_cover"
+    order_type: "market"
+    quantity: "100"  # Only 50 are short, should be limited
+
+expected:
+  final_positions:
+    NFLX: "0"  # Position should be flat, not +50 long
+  short_filled: "50"
+  cover_filled: "50"  # Limited to short position size
+  cover_quantity_limited: true

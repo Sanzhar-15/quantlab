@@ -1,0 +1,71 @@
+# G057: Percentage Commission
+# Category: slippage
+# Verifies: Percentage-based commission calculated correctly
+
+id: G057
+name: "Percentage commission"
+category: slippage
+description: |
+  Commission calculated as a percentage of trade value
+  should be applied correctly to P&L.
+
+tags:
+  - commission
+  - percentage
+  - cost
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: percentage
+    value: 0.001  # 0.1% = 10 bps
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+    - {date: "2026-01-06", open: "103.00", high: "108.00", low: "102.00", close: "107.00", volume: 900000}
+
+signals:
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+  - bar_index: 1
+    action: sell
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "104.50"
+      side: buy
+      commission: "10.45"  # 0.1% of 10450
+    - bar_index: 2
+      symbol: AAPL
+      quantity: "100"
+      price: "103.00"
+      side: sell
+      commission: "10.30"  # 0.1% of 10300
+
+  # Buy: 10450 + 10.45 = 10460.45
+  # Sell: 10300 - 10.30 = 10289.70
+  # Net: 100000 - 10460.45 + 10289.70 = 99829.25
+  final_cash: "99829.25"
+  final_positions: {}
+  final_equity: "99829.25"
+
+  metrics:
+    total_return: "-0.0017075"
+    total_trades: 2

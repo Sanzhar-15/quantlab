@@ -1,0 +1,51 @@
+# G084: Order Larger Than Available Cash
+# Category: edge_cases
+# Verifies: Buy order rejected when insufficient cash
+
+id: G084
+name: "Order larger than available cash"
+category: edge_cases
+description: |
+  A buy order for more value than available cash should be
+  rejected entirely (not partially filled).
+
+tags:
+  - edge_case
+  - insufficient_cash
+  - rejected
+
+setup:
+  initial_cash: "10000"  # Small cash amount
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+
+signals:
+  # Try to buy 100 shares at ~104.50 = $10,450 > $10,000 cash
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills: []
+  # Order rejected - insufficient cash
+
+  final_cash: "10000.00"
+  final_positions: {}
+  final_equity: "10000.00"
+
+  metrics:
+    total_return: "0"
+    total_trades: 0

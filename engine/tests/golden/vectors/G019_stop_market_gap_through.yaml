@@ -1,0 +1,70 @@
+# G019: Stop Order Gap Through
+# Category: order_types
+# Verifies: Stop order fills at open when market gaps through stop
+
+id: G019
+name: "Stop order gap through"
+category: order_types
+description: |
+  When the market gaps through a stop price (opens beyond the stop),
+  the order should fill at the open price, not the stop price.
+
+tags:
+  - stop
+  - gap
+  - order_types
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "105.00", volume: 1200000}
+    # Gap down open - opens at 95, well below stop of 100
+    - {date: "2026-01-06", open: "95.00", high: "97.00", low: "93.00", close: "94.00", volume: 2000000}
+
+signals:
+  # Buy first
+  - bar_index: 0
+    action: buy
+    symbol: AAPL
+    quantity: "100"
+    order_type: market
+  # Stop sell at 100
+  - bar_index: 1
+    action: sell
+    symbol: AAPL
+    quantity: "100"
+    order_type: stop
+    stop_price: "100.00"
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "104.50"
+      side: buy
+    # Gap through - fills at open 95, not stop 100
+    - bar_index: 2
+      symbol: AAPL
+      quantity: "100"
+      price: "95.00"
+      side: sell
+
+  final_cash: "99050.00"  # 100000 - 10450 + 9500
+  final_positions: {}
+  final_equity: "99050.00"
+
+  metrics:
+    total_return: "-0.0095"
+    total_trades: 2

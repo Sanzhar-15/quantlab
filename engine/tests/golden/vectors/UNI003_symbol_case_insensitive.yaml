@@ -1,0 +1,63 @@
+# UNI003: Symbol Case Insensitive Lookup
+# Category: unicode
+# Verifies: Symbol lookup is case-insensitive after normalization
+
+id: UNI003
+name: "Symbol lookup case-insensitive after normalization"
+category: unicode
+description: |
+  Symbol lookups should be case-insensitive after NFC normalization
+  and uppercasing.
+
+tags:
+  - unicode
+  - symbol
+  - case
+
+skip: true
+skip_reason: "Case-insensitive symbol matching not fully implemented"
+
+setup:
+  initial_cash: "100000"
+  calendar: nyse
+  fill_assumption: next_open
+  slippage:
+    model: none
+  commission:
+    model: none
+
+data:
+  symbol: AAPL
+  timeframe: 1d
+  bars:
+    - {date: "2026-01-02", open: "100.00", high: "105.00", low: "99.00", close: "104.00", volume: 1000000}
+    - {date: "2026-01-05", open: "104.50", high: "106.00", low: "102.00", close: "103.00", volume: 1200000}
+
+signals:
+  # Using lowercase symbol - should still match
+  - bar_index: 0
+    action: buy
+    symbol: aapl
+    quantity: "100"
+    order_type: market
+
+expected:
+  fills:
+    - bar_index: 1
+      symbol: AAPL
+      quantity: "100"
+      price: "104.50"
+      side: buy
+
+  final_cash: "89550.00"
+  final_positions:
+    AAPL: "100"
+  final_equity: "99850.00"
+
+  metrics:
+    total_return: "-0.0015"
+    total_trades: 1
+
+  unicode:
+    case_insensitive: true
+    normalized_to_upper: true
