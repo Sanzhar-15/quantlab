@@ -1,0 +1,1039 @@
+{
+  "name": "quantlab",
+  "publisher": "quantlab",
+  "displayName": "%displayName%",
+  "description": "%description%",
+  "version": "0.0.1",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.108.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension",
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "test": "npm run compile && mocha ./out/test/**/*.test.js --ui tdd --require source-map-support/register"
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "quantlab.signIn",
+        "title": "%command.signIn.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.signOut",
+        "title": "%command.signOut.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.switchToChart",
+        "title": "%command.switchToChart.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.switchToAction",
+        "title": "%command.switchToAction.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.switchToStats",
+        "title": "%command.switchToStats.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.switchToTrade",
+        "title": "%command.switchToTrade.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.switchToEditor",
+        "title": "%command.switchToEditor.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.switchToVisualise",
+        "title": "%command.switchToVisualise.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.switchToDataEditor",
+        "title": "%command.switchToDataEditor.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openDataAction",
+        "title": "%command.openDataAction.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openStatsTest",
+        "title": "%command.openStatsTest.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openAsChart",
+        "title": "%command.openAsChart.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openAsAction",
+        "title": "%command.openAsAction.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openAsTrade",
+        "title": "%command.openAsTrade.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.action.open",
+        "title": "%command.action.open.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.action.openRun",
+        "title": "%command.action.openRun.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.action.openResource",
+        "title": "%command.action.openResource.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.action.viewInChart",
+        "title": "%command.action.viewInChart.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.action.exportResults",
+        "title": "%command.action.exportResults.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.action.pinRun",
+        "title": "%command.action.pinRun.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.action.addToCompare",
+        "title": "%command.action.addToCompare.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.startPaperSession",
+        "title": "%command.startPaperSession.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.startLiveSession",
+        "title": "%command.startLiveSession.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.pauseSession",
+        "title": "%command.pauseSession.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.resumeSession",
+        "title": "%command.resumeSession.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.stopSession",
+        "title": "%command.stopSession.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.viewSession",
+        "title": "%command.viewSession.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.trade.viewInChart",
+        "title": "%command.trade.viewInChart.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.killSwitch",
+        "title": "%command.killSwitch.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openRiskSettings",
+        "title": "%command.openRiskSettings.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openBrokerSettings",
+        "title": "%command.openBrokerSettings.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.selectDataSource",
+        "title": "%command.selectDataSource.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.setGlobalDataSource",
+        "title": "%command.setGlobalDataSource.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.searchSymbol",
+        "title": "%command.searchSymbol.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.toggleHistoryDropdown",
+        "title": "%command.toggleHistoryDropdown.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openHistoryEntry",
+        "title": "%command.openHistoryEntry.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.cancelHistoryRun",
+        "title": "%command.cancelHistoryRun.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.prioritizeHistoryRun",
+        "title": "%command.prioritizeHistoryRun.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.searchHistory",
+        "title": "%command.searchHistory.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.focusDataPanel",
+        "title": "%command.focusDataPanel.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.focusResourcesPanel",
+        "title": "%command.focusResourcesPanel.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.focusHistoryPanel",
+        "title": "%command.focusHistoryPanel.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.focusTradePanel",
+        "title": "%command.focusTradePanel.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.focusSettingsPanel",
+        "title": "%command.focusSettingsPanel.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openGuide",
+        "title": "%command.openGuide.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.newFromTemplate",
+        "title": "%command.newFromTemplate.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.chart.refresh",
+        "title": "%command.chart.refresh.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.chart.screenshot",
+        "title": "%command.chart.screenshot.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.chart.applyParameters",
+        "title": "%command.chart.applyParameters.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.chart.resetParameters",
+        "title": "%command.chart.resetParameters.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.chart.toggleParameters",
+        "title": "%command.chart.toggleParameters.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.chart.openSettings",
+        "title": "%command.chart.openSettings.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.chart.addVisualizationTemplate",
+        "title": "%command.chart.addVisualizationTemplate.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.chart.generateVisualization",
+        "title": "%command.chart.generateVisualization.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openMarketOverview",
+        "title": "%command.openMarketOverview.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openCryptoOverview",
+        "title": "%command.openCryptoOverview.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openYieldCurve",
+        "title": "%command.openYieldCurve.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openEconomicCalendar",
+        "title": "%command.openEconomicCalendar.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openEarningsCalendar",
+        "title": "%command.openEarningsCalendar.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openDividendsCalendar",
+        "title": "%command.openDividendsCalendar.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openIPOCalendar",
+        "title": "%command.openIPOCalendar.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openSplitsCalendar",
+        "title": "%command.openSplitsCalendar.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openCentralBankCalendar",
+        "title": "%command.openCentralBankCalendar.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openSentimentDashboard",
+        "title": "%command.openSentimentDashboard.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openNewsFlow",
+        "title": "%command.openNewsFlow.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openFundamentals",
+        "title": "%command.openFundamentals.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.openInstitutional",
+        "title": "%command.openInstitutional.title%",
+        "category": "%command.category%"
+      }
+    ],
+    "colors": [
+      {
+        "id": "quantlabAccent",
+        "description": "Quantlab primary accent color for interactive elements.",
+        "defaults": {
+          "light": "#fc7432",
+          "dark": "#fc7432",
+          "highContrast": "#fc7432",
+          "highContrastLight": "#fc7432"
+        }
+      },
+      {
+        "id": "quantlabAccentHover",
+        "description": "Quantlab accent color for hover states.",
+        "defaults": {
+          "light": "#e5681f",
+          "dark": "#e5681f",
+          "highContrast": "#e5681f",
+          "highContrastLight": "#e5681f"
+        }
+      },
+      {
+        "id": "quantlabAccentActive",
+        "description": "Quantlab accent color for active/pressed states.",
+        "defaults": {
+          "light": "#d35a1a",
+          "dark": "#d35a1a",
+          "highContrast": "#d35a1a",
+          "highContrastLight": "#d35a1a"
+        }
+      },
+      {
+        "id": "quantlabViewChart",
+        "description": "Quantlab Chart view stripe color.",
+        "defaults": {
+          "light": "#059669",
+          "dark": "#059669",
+          "highContrast": "#059669",
+          "highContrastLight": "#059669"
+        }
+      },
+      {
+        "id": "quantlabViewAction",
+        "description": "Quantlab Action view stripe color.",
+        "defaults": {
+          "light": "#d97706",
+          "dark": "#d97706",
+          "highContrast": "#d97706",
+          "highContrastLight": "#d97706"
+        }
+      },
+      {
+        "id": "quantlabViewTrade",
+        "description": "Quantlab Trade view stripe color.",
+        "defaults": {
+          "light": "#dc2626",
+          "dark": "#dc2626",
+          "highContrast": "#dc2626",
+          "highContrastLight": "#dc2626"
+        }
+      },
+      {
+        "id": "quantlabStatusPositive",
+        "description": "Quantlab positive status color.",
+        "defaults": {
+          "light": "#059669",
+          "dark": "#059669",
+          "highContrast": "#059669",
+          "highContrastLight": "#059669"
+        }
+      },
+      {
+        "id": "quantlabStatusWarning",
+        "description": "Quantlab warning status color.",
+        "defaults": {
+          "light": "#d97706",
+          "dark": "#d97706",
+          "highContrast": "#d97706",
+          "highContrastLight": "#d97706"
+        }
+      },
+      {
+        "id": "quantlabStatusNegative",
+        "description": "Quantlab negative status color.",
+        "defaults": {
+          "light": "#dc2626",
+          "dark": "#dc2626",
+          "highContrast": "#dc2626",
+          "highContrastLight": "#dc2626"
+        }
+      },
+      {
+        "id": "quantlabStatusInfo",
+        "description": "Quantlab info status color.",
+        "defaults": {
+          "light": "#2563eb",
+          "dark": "#2563eb",
+          "highContrast": "#2563eb",
+          "highContrastLight": "#2563eb"
+        }
+      },
+      {
+        "id": "quantlabStatusNeutral",
+        "description": "Quantlab neutral status color.",
+        "defaults": {
+          "light": "#6b7280",
+          "dark": "#6b7280",
+          "highContrast": "#6b7280",
+          "highContrastLight": "#6b7280"
+        }
+      }
+    ],
+    "customEditors": [
+      {
+        "viewType": "quantlab.chartView",
+        "displayName": "%view.chartEditor.title%",
+        "selector": [
+          {
+            "filenamePattern": "*.py"
+          }
+        ],
+        "priority": "option"
+      },
+      {
+        "viewType": "quantlab.actionView",
+        "displayName": "%view.actionEditor.title%",
+        "selector": [
+          {
+            "filenamePattern": "*.py"
+          },
+          {
+            "filenamePattern": "*.csv"
+          },
+          {
+            "filenamePattern": "*.parquet"
+          },
+          {
+            "filenamePattern": "*.xlsx"
+          }
+        ],
+        "priority": "option"
+      },
+      {
+        "viewType": "quantlab.tradeView",
+        "displayName": "%view.tradeEditor.title%",
+        "selector": [
+          {
+            "filenamePattern": "*.py"
+          }
+        ],
+        "priority": "option"
+      },
+      {
+        "viewType": "quantlab.statsView",
+        "displayName": "Stats",
+        "selector": [
+          {
+            "filenamePattern": "*.csv"
+          },
+          {
+            "filenamePattern": "*.parquet"
+          },
+          {
+            "filenamePattern": "*.xlsx"
+          }
+        ],
+        "priority": "option"
+      },
+      {
+        "viewType": "quantlab.visualiseView",
+        "displayName": "Visualise",
+        "selector": [
+          {
+            "filenamePattern": "*.csv"
+          },
+          {
+            "filenamePattern": "*.parquet"
+          },
+          {
+            "filenamePattern": "*.xlsx"
+          }
+        ],
+        "priority": "option"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "quantlab-data",
+          "title": "%viewContainer.data.title%",
+          "icon": "media/icons/data.svg"
+        },
+        {
+          "id": "quantlab-resources",
+          "title": "%viewContainer.resources.title%",
+          "icon": "media/icons/resources.svg"
+        },
+        {
+          "id": "quantlab-history",
+          "title": "%viewContainer.history.title%",
+          "icon": "media/icons/history.svg"
+        },
+        {
+          "id": "quantlab-trade",
+          "title": "%viewContainer.trade.title%",
+          "icon": "media/icons/trade.svg"
+        },
+        {
+          "id": "quantlab-settings",
+          "title": "%viewContainer.settings.title%",
+          "icon": "media/icons/settings.svg"
+        }
+      ]
+    },
+    "views": {
+      "quantlab-data": [
+        {
+          "id": "quantlab.dataView",
+          "name": "%view.data.title%"
+        }
+      ],
+      "quantlab-resources": [
+        {
+          "id": "quantlab.resourcesPanel",
+          "type": "webview",
+          "name": "%view.resources.title%"
+        }
+      ],
+      "quantlab-history": [
+        {
+          "id": "quantlab.historyView",
+          "name": "%view.history.title%"
+        }
+      ],
+      "quantlab-trade": [
+        {
+          "id": "quantlab.tradeView",
+          "name": "%view.trade.title%"
+        }
+      ],
+      "quantlab-settings": [
+        {
+          "id": "quantlab.settingsView",
+          "name": "%view.settings.title%"
+        }
+      ]
+    },
+    "menus": {
+      "accountsMenu": [
+        {
+          "command": "quantlab.signIn",
+          "when": "!deltaplus.authenticated",
+          "group": "navigation"
+        },
+        {
+          "command": "quantlab.signOut",
+          "when": "deltaplus.authenticated",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "quantlab.switchToChart",
+          "when": "view == quantlab.dataView && viewItem == quantlab.data.serverSymbol",
+          "group": "navigation@1"
+        },
+        {
+          "command": "quantlab.switchToAction",
+          "when": "view == quantlab.dataView && viewItem == quantlab.data.serverSymbol",
+          "group": "navigation@2"
+        },
+        {
+          "command": "quantlab.switchToStats",
+          "when": "view == quantlab.dataView && viewItem == quantlab.data.serverSymbol",
+          "group": "navigation@3"
+        },
+        {
+          "command": "quantlab.switchToChart",
+          "when": "view == quantlab.dataView && viewItem == quantlab.data.symbol",
+          "group": "navigation@1"
+        },
+        {
+          "command": "quantlab.switchToAction",
+          "when": "view == quantlab.dataView && viewItem == quantlab.data.symbol",
+          "group": "navigation@2"
+        },
+        {
+          "command": "quantlab.switchToStats",
+          "when": "view == quantlab.dataView && viewItem == quantlab.data.symbol",
+          "group": "navigation@3"
+        },
+        {
+          "command": "quantlab.viewSession",
+          "when": "view == quantlab.tradeView && viewItem == activeSession",
+          "group": "inline@1"
+        },
+        {
+          "command": "quantlab.viewSession",
+          "when": "view == quantlab.tradeView && viewItem == activeSessionPaused",
+          "group": "inline@1"
+        },
+        {
+          "command": "quantlab.pauseSession",
+          "when": "view == quantlab.tradeView && viewItem == activeSession",
+          "group": "inline@2"
+        },
+        {
+          "command": "quantlab.resumeSession",
+          "when": "view == quantlab.tradeView && viewItem == activeSessionPaused",
+          "group": "inline@2"
+        },
+        {
+          "command": "quantlab.stopSession",
+          "when": "view == quantlab.tradeView && viewItem == activeSession",
+          "group": "inline@3"
+        },
+        {
+          "command": "quantlab.stopSession",
+          "when": "view == quantlab.tradeView && viewItem == activeSessionPaused",
+          "group": "inline@3"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "quantlab.openAsChart",
+          "when": "resourceLangId == python",
+          "group": "1_open@10"
+        },
+        {
+          "command": "quantlab.openAsAction",
+          "when": "resourceLangId == python",
+          "group": "1_open@11"
+        },
+        {
+          "command": "quantlab.openAsTrade",
+          "when": "resourceLangId == python",
+          "group": "1_open@12"
+        },
+        {
+          "command": "quantlab.switchToVisualise",
+          "when": "resourceExtname =~ /\\.(csv|parquet|xlsx)$/i",
+          "group": "1_open@10"
+        },
+        {
+          "command": "quantlab.openDataAction",
+          "when": "resourceExtname =~ /\\.(csv|parquet|xlsx)$/i",
+          "group": "1_open@11"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "quantlab.switchToVisualise",
+          "when": "resourceExtname =~ /\\.(csv|parquet|xlsx)$/i",
+          "group": "navigation@10"
+        },
+        {
+          "command": "quantlab.openDataAction",
+          "when": "resourceExtname =~ /\\.(csv|parquet|xlsx)$/i",
+          "group": "navigation@11"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "quantlab.switchToChart",
+        "key": "ctrl+q c",
+        "mac": "ctrl+q c",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "quantlab.switchToAction",
+        "key": "ctrl+q a",
+        "mac": "ctrl+q a",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "quantlab.switchToTrade",
+        "key": "ctrl+q t",
+        "mac": "ctrl+q t",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "quantlab.switchToEditor",
+        "key": "ctrl+q e",
+        "mac": "ctrl+q e",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "quantlab.switchToEditor",
+        "key": "escape",
+        "when": "editorTextFocus && quantlab.currentView != editor"
+      },
+      {
+        "command": "quantlab.openAsChart",
+        "key": "ctrl+q shift+c",
+        "mac": "ctrl+q shift+c",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "quantlab.openAsAction",
+        "key": "ctrl+q shift+a",
+        "mac": "ctrl+q shift+a",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "quantlab.openAsTrade",
+        "key": "ctrl+q shift+t",
+        "mac": "ctrl+q shift+t",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "quantlab.switchToVisualise",
+        "key": "ctrl+q v",
+        "mac": "ctrl+q v",
+        "when": "quantlab.isDataFile"
+      },
+      {
+        "command": "quantlab.openDataAction",
+        "key": "ctrl+q s",
+        "mac": "ctrl+q s",
+        "when": "quantlab.isDataFile"
+      },
+      {
+        "command": "quantlab.switchToDataEditor",
+        "key": "ctrl+q e",
+        "mac": "ctrl+q e",
+        "when": "quantlab.isDataFile"
+      },
+      {
+        "command": "quantlab.toggleHistoryDropdown",
+        "key": "ctrl+q h",
+        "mac": "ctrl+q h"
+      },
+      {
+        "command": "quantlab.focusDataPanel",
+        "key": "ctrl+q 1",
+        "mac": "ctrl+q 1"
+      },
+      {
+        "command": "quantlab.focusResourcesPanel",
+        "key": "ctrl+q 2",
+        "mac": "ctrl+q 2"
+      },
+      {
+        "command": "quantlab.focusHistoryPanel",
+        "key": "ctrl+q 3",
+        "mac": "ctrl+q 3"
+      },
+      {
+        "command": "quantlab.focusTradePanel",
+        "key": "ctrl+q 4",
+        "mac": "ctrl+q 4"
+      },
+      {
+        "command": "quantlab.killSwitch",
+        "key": "ctrl+q k",
+        "mac": "ctrl+q k",
+        "when": "quantlab.currentView == trade"
+      }
+    ],
+    "configuration": {
+      "title": "Quantlab Trading",
+      "properties": {
+        "quantlab.trading.accounts": {
+          "type": "array",
+          "default": [],
+          "description": "Broker account configurations for trading sessions.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "broker": {
+                "type": "string",
+                "enum": [
+                  "alpaca",
+                  "mock"
+                ],
+                "default": "mock"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "paper",
+                  "live"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "broker",
+              "type"
+            ]
+          }
+        },
+        "quantlab.trading.killSwitchPolicy": {
+          "type": "string",
+          "enum": [
+            "flatten",
+            "cancelOnly",
+            "custom"
+          ],
+          "default": "flatten",
+          "description": "Kill Switch policy to execute in Trade view."
+        },
+        "quantlab.trading.killSwitchCustomActions": {
+          "type": "array",
+          "default": [],
+          "description": "Custom Kill Switch actions to execute when policy is custom."
+        },
+        "quantlab.trading.requireBacktest": {
+          "type": "boolean",
+          "default": false,
+          "description": "Require a completed backtest before live trading."
+        },
+        "quantlab.trading.requirePaperTrading": {
+          "type": "boolean",
+          "default": false,
+          "description": "Require a completed paper trading session before live trading."
+        },
+        "quantlab.trading.requireRiskReview": {
+          "type": "boolean",
+          "default": false,
+          "description": "Require risk review confirmation before live trading."
+        },
+        "quantlab.trading.dailyLossLimit": {
+          "type": "number",
+          "default": 1000,
+          "description": "Daily loss limit in USD (Decision L74). Set 0 to disable."
+        },
+        "quantlab.trading.dailyLossLimitPercent": {
+          "type": "number",
+          "default": 0.02,
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Daily loss limit as fraction of equity (Decision L74: 2%). Takes precedence over USD limit when set."
+        },
+        "quantlab.trading.maxDrawdownPercent": {
+          "type": "number",
+          "default": 0.05,
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Maximum drawdown as fraction of equity (Decision L74: 5%)."
+        },
+        "quantlab.trading.consecutiveLossLimit": {
+          "type": "integer",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 50,
+          "description": "Maximum consecutive losing trades before automatic halt (Decision L74: 3)."
+        },
+        "quantlab.trading.maxExposure": {
+          "type": "number",
+          "default": 100000,
+          "description": "Maximum total exposure in USD. Set 0 to disable."
+        },
+        "quantlab.trading.maxPositionSize": {
+          "type": "number",
+          "default": 0,
+          "description": "Maximum position size (shares). Set 0 to disable."
+        },
+        "quantlab.trading.maxOpenOrders": {
+          "type": "number",
+          "default": 10,
+          "description": "Maximum open orders across sessions. Set 0 to disable."
+        },
+        "quantlab.notifications.showJobComplete": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show notifications when backtests complete."
+        },
+        "quantlab.notifications.showJobFailed": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show notifications when backtests fail."
+        },
+        "quantlab.notifications.showTradeExecuted": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show notifications when trades are executed."
+        },
+        "quantlab.notifications.showRiskAlerts": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show notifications for risk alerts."
+        },
+        "quantlab.notifications.showSessionStatus": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show notifications when sessions start, pause, or stop."
+        },
+        "quantlab.notifications.soundEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable notification sounds."
+        },
+        "quantlab.notifications.soundVolume": {
+          "type": "number",
+          "default": 0.5,
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Notification sound volume (0-1)."
+        },
+        "quantlab.notifications.playFillSound": {
+          "type": "boolean",
+          "default": false,
+          "description": "Play a sound when trades are executed."
+        },
+        "quantlab.notifications.playAlertSound": {
+          "type": "boolean",
+          "default": false,
+          "description": "Play a sound for risk alerts."
+        },
+        "quantlab.notifications.playCompleteSound": {
+          "type": "boolean",
+          "default": false,
+          "description": "Play a sound when backtests complete."
+        },
+        "quantlab.accessibility.reducedMotion": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "always",
+            "never"
+          ],
+          "default": "auto",
+          "description": "Reduce motion in Quantlab views."
+        }
+      }
+    },
+    "authentication": [
+      {
+        "id": "deltaplus",
+        "label": "Delta Plus"
+      }
+    ]
+  },
+  "configurationDefaults": {
+    "workbench.colorCustomizations": {
+      "focusBorder": "#fc7432",
+      "button.background": "#fc7432",
+      "button.foreground": "#ffffff",
+      "button.hoverBackground": "#e5681f",
+      "progressBar.background": "#fc7432",
+      "textLink.foreground": "#fc7432",
+      "textLink.activeForeground": "#e5681f",
+      "list.highlightForeground": "#fc7432",
+      "list.focusHighlightForeground": "#fc7432",
+      "editorLink.activeForeground": "#fc7432",
+      "activityBarBadge.background": "#fc7432",
+      "activityBarBadge.foreground": "#ffffff",
+      "tab.activeBorderTop": "#fc7432",
+      "panelTitle.activeBorder": "#fc7432",
+      "settings.modifiedItemIndicator": "#fc7432",
+      "inputOption.activeBorder": "#fc7432",
+      "inputOption.activeBackground": "#fc743233",
+      "checkbox.background": "#fc7432",
+      "checkbox.foreground": "#ffffff",
+      "dropdown.border": "#fc7432"
+    }
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/ws": "^8.5.10",
+    "mocha": "^11.7.5",
+    "source-map-support": "^0.5.21"
+  },
+  "dependencies": {
+    "typed-emitter": "^2.1.0",
+    "ws": "^8.19.0"
+  }
+}

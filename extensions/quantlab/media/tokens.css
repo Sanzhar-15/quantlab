@@ -1,0 +1,90 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+:root {
+	color-scheme: light dark;
+
+	/* QuantLab Brand Accent - Primary interactive color */
+	--ql-accent: var(--vscode-quantlabAccent, #FF7331);
+	--ql-accent-hover: var(--vscode-quantlabAccentHover, #E5672C);
+	--ql-accent-active: var(--vscode-quantlabAccentActive, #CC5C22);
+	--ql-accent-muted: color-mix(in srgb, var(--ql-accent) 15%, transparent);
+	--ql-accent-foreground: #1A0A00;
+
+	--ql-view-chart: var(--vscode-quantlabViewChart, #059669);
+	--ql-view-action: var(--vscode-quantlabViewAction, #d97706);
+	--ql-view-trade: var(--vscode-quantlabViewTrade, #dc2626);
+	--ql-view-stripe-width: 3px;
+
+	--ql-status-positive: var(--vscode-quantlabStatusPositive, #44BF6E);
+	--ql-status-warning: var(--vscode-quantlabStatusWarning, #F5A623);
+	--ql-status-negative: var(--vscode-quantlabStatusNegative, #FF6B6B);
+	--ql-status-info: var(--vscode-quantlabStatusInfo, #2563eb);
+	--ql-status-neutral: var(--vscode-quantlabStatusNeutral, #767679);
+
+	--ql-status-running: var(--ql-status-info);
+	--ql-status-queued: var(--ql-status-neutral);
+	--ql-status-completed: var(--ql-status-positive);
+	--ql-status-failed: var(--ql-status-negative);
+	--ql-status-cancelled: var(--ql-status-warning);
+
+	--ql-pnl-positive: var(--ql-status-positive);
+	--ql-pnl-negative: var(--ql-status-negative);
+	--ql-pnl-neutral: var(--ql-status-neutral);
+
+	--ql-complexity-safe: var(--ql-status-positive);
+	--ql-complexity-partial: var(--ql-status-warning);
+	--ql-complexity-view-only: var(--ql-status-negative);
+
+	--ql-font-family: var(--vscode-font-family);
+	--ql-font-mono: var(--vscode-editor-font-family, var(--ql-font-family));
+	--ql-font-size-small: 11px;
+	--ql-font-size-base: 12px;
+	--ql-font-size-large: 14px;
+	--ql-font-weight-metric: 600;
+
+	--ql-space-xs: 4px;
+	--ql-space-sm: 8px;
+	--ql-space-md: 12px;
+	--ql-space-lg: 16px;
+	--ql-space-xl: 24px;
+
+	--ql-radius-sm: 4px;
+	--ql-radius-md: 6px;
+	--ql-radius-lg: 8px;
+
+	--ql-shadow-toast: 0 6px 20px rgba(0, 0, 0, 0.2);
+	--ql-shadow-modal: 0 12px 32px rgba(0, 0, 0, 0.32);
+
+	--ql-transition-fast: 150ms ease;
+	--ql-transition-normal: 250ms ease;
+
+	--ql-toast-width: 360px;
+	--ql-toast-offset: 16px;
+
+	--ql-drop-highlight: var(--ql-accent-muted);
+	--ql-drop-border: 2px dashed var(--ql-accent);
+
+	--ql-bg: var(--vscode-editor-background);
+	--ql-fg: var(--vscode-editor-foreground);
+	--ql-muted: var(--vscode-descriptionForeground);
+	--ql-border: var(--vscode-editorWidget-border);
+	--ql-card-bg: var(--vscode-editorWidget-background);
+	--ql-text-inverse: #fff;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	:root {
+		--ql-transition-fast: 0ms;
+		--ql-transition-normal: 0ms;
+	}
+}
+
+.ql-reduced-motion * {
+	animation-duration: 0ms !important;
+	animation-iteration-count: 1 !important;
+	transition-duration: 0ms !important;
+	scroll-behavior: auto !important;
+}

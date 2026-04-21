@@ -1,0 +1,354 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+:root {
+	color-scheme: light dark;
+
+	/* QuantLab Accent Color Overrides */
+	--ql-accent: #FF7331;
+	--ql-accent-hover: #E5672C;
+	--ql-accent-active: #CC5C22;
+	--ql-accent-muted: rgba(255, 115, 49, 0.15);
+	--ql-accent-fg: #1A0A00;
+}
+
+body {
+	margin: 0;
+	padding: 0;
+	font-family: var(--ql-font-family);
+	font-size: 12px;
+	color: var(--ql-fg);
+	background: var(--ql-bg);
+}
+
+#trade-root {
+	height: 100vh;
+	overflow: hidden;
+}
+
+.trade-shell {
+	height: 100%;
+	overflow-y: auto;
+	padding: 18px 22px 36px 28px;
+	box-sizing: border-box;
+	position: relative;
+}
+
+.trade-shell::before {
+	content: '';
+	position: fixed;
+	left: 0;
+	top: 0;
+	bottom: 0;
+	width: var(--ql-view-stripe-width);
+	background: var(--ql-view-trade);
+}
+
+.trade-page {
+	display: flex;
+	flex-direction: column;
+	gap: 16px;
+}
+
+.page-header {
+	display: flex;
+	justify-content: space-between;
+	align-items: flex-start;
+	gap: 16px;
+}
+
+.page-header h1 {
+	margin: 0 0 6px;
+	font-size: 18px;
+}
+
+.page-subtitle {
+	margin: 0;
+	color: var(--vscode-descriptionForeground);
+}
+
+.header-actions {
+	display: flex;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+
+.section-header {
+	display: flex;
+	justify-content: space-between;
+	align-items: baseline;
+	gap: 12px;
+}
+
+.section-header h2 {
+	margin: 0;
+	font-size: 13px;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+}
+
+.section-hint {
+	color: var(--vscode-descriptionForeground);
+	font-size: 11px;
+}
+
+.card {
+	background: var(--vscode-editorWidget-background);
+	border: 1px solid var(--vscode-editorWidget-border);
+	border-radius: 10px;
+	padding: 12px 14px;
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+}
+
+.callout {
+	padding: 10px 12px;
+	border-radius: 6px;
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 6px;
+	background: color-mix(in srgb, var(--ql-status-warning) 15%, transparent);
+	border: 1px solid color-mix(in srgb, var(--ql-status-warning) 40%, transparent);
+	color: var(--ql-status-warning);
+}
+
+.callout.error {
+	color: var(--ql-status-negative);
+	background: color-mix(in srgb, var(--ql-status-negative) 15%, transparent);
+	border-color: color-mix(in srgb, var(--ql-status-negative) 40%, transparent);
+}
+
+.callout-detail {
+	color: var(--vscode-descriptionForeground);
+	font-size: 11px;
+}
+
+.callout-actions {
+	display: flex;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+
+.alert-stack {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.btn {
+	border-radius: 6px;
+	border: 1px solid transparent;
+	padding: 6px 12px;
+	font-size: 12px;
+	cursor: pointer;
+	background: var(--vscode-button-secondaryBackground);
+	color: var(--vscode-button-secondaryForeground);
+}
+
+.btn:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
+.btn-primary {
+	background: var(--ql-accent);
+	color: var(--ql-accent-fg);
+}
+
+.btn-primary:hover:not(:disabled) {
+	background: var(--ql-accent-hover);
+}
+
+.btn-secondary {
+	background: var(--vscode-button-secondaryBackground);
+	color: var(--vscode-button-secondaryForeground);
+	border-color: var(--vscode-button-secondaryBorder);
+}
+
+.btn-ghost {
+	background: transparent;
+	color: var(--ql-accent);
+	border-color: var(--ql-accent);
+}
+
+.btn-ghost:hover:not(:disabled) {
+	background: var(--ql-accent-muted);
+}
+
+.btn-danger {
+	background: var(--ql-status-negative);
+	color: var(--ql-text-inverse);
+}
+
+.requirements-list {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.requirement-row {
+	display: grid;
+	grid-template-columns: 24px 1fr auto;
+	align-items: center;
+	gap: 10px;
+	padding: 8px 10px;
+	border-radius: 6px;
+	background: var(--vscode-editor-background);
+	border: 1px solid var(--vscode-editorWidget-border);
+}
+
+.requirement-row.ok {
+	border-color: color-mix(in srgb, var(--ql-status-positive) 40%, transparent);
+}
+
+.requirement-row.warn {
+	border-color: color-mix(in srgb, var(--ql-status-warning) 40%, transparent);
+}
+
+.requirement-row.blocked {
+	border-color: color-mix(in srgb, var(--ql-status-negative) 50%, transparent);
+}
+
+.req-status {
+	font-weight: 600;
+}
+
+.req-meta {
+	color: var(--vscode-descriptionForeground);
+	font-size: 11px;
+}
+
+.info-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+	gap: 10px;
+}
+
+.info-item {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+}
+
+.info-label {
+	color: var(--vscode-descriptionForeground);
+	font-size: 11px;
+}
+
+.info-value {
+	font-weight: 600;
+}
+
+.session-actions {
+	display: flex;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+
+.perf-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+	gap: 12px;
+}
+
+.metric-item {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	background: var(--vscode-editor-background);
+	border-radius: 6px;
+	padding: 8px 10px;
+	border: 1px solid var(--vscode-editorWidget-border);
+}
+
+.metric-label {
+	color: var(--vscode-descriptionForeground);
+	font-size: 11px;
+}
+
+.metric-value {
+	font-weight: 600;
+}
+
+.metric-value.pos {
+	color: var(--ql-pnl-positive);
+}
+
+.metric-value.neg {
+	color: var(--ql-pnl-negative);
+}
+
+.data-table {
+	width: 100%;
+	border-collapse: collapse;
+	font-size: 12px;
+}
+
+.data-table th,
+.data-table td {
+	text-align: left;
+	padding: 6px 8px;
+	border-bottom: 1px solid var(--vscode-editorGroup-border);
+}
+
+.data-table th {
+	color: var(--vscode-descriptionForeground);
+	font-size: 11px;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+}
+
+.data-table td.pos {
+	color: var(--ql-pnl-positive);
+}
+
+.data-table td.neg {
+	color: var(--ql-pnl-negative);
+}
+
+.row-note td {
+	color: var(--vscode-descriptionForeground);
+	font-size: 11px;
+	padding: 4px 8px 8px;
+}
+
+.activity-list {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.activity-item {
+	display: flex;
+	gap: 10px;
+	padding: 6px 8px;
+	border-radius: 6px;
+	background: var(--vscode-editor-background);
+	border: 1px solid var(--vscode-editorWidget-border);
+}
+
+.activity-time {
+	color: var(--vscode-descriptionForeground);
+	font-size: 11px;
+	min-width: 64px;
+}
+
+.empty-row {
+	color: var(--vscode-descriptionForeground);
+	padding: 8px 0;
+}
+
+@media (max-width: 720px) {
+	.page-header {
+		flex-direction: column;
+		align-items: flex-start;
+	}
+
+	.trade-shell {
+		padding-left: 18px;
+	}
+}

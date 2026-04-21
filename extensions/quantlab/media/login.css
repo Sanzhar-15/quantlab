@@ -1,0 +1,203 @@
+/*---------------------------------------------------------------------------------------------
+ *  QuantLab — Delta Plus Login Panel Styles
+ *--------------------------------------------------------------------------------------------*/
+
+* {
+	box-sizing: border-box;
+}
+
+body {
+	margin: 0;
+	padding: 0;
+	font-family: var(--ql-font-family);
+	background: var(--ql-bg);
+	color: var(--ql-fg);
+	height: 100vh;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.login-shell {
+	width: min(400px, 90vw);
+	background: var(--ql-card-bg);
+	border: 1px solid var(--ql-border);
+	border-radius: var(--ql-radius-lg);
+	padding: 28px 28px 24px;
+	box-shadow: var(--ql-shadow-modal);
+}
+
+/* ── Header ── */
+.login-header {
+	margin-bottom: 20px;
+	text-align: center;
+}
+
+.brand-logo {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 8px;
+	margin-bottom: 6px;
+}
+
+.brand-icon {
+	font-size: 22px;
+	color: var(--ql-accent);
+	line-height: 1;
+}
+
+.brand-name {
+	font-size: 18px;
+	font-weight: 600;
+	letter-spacing: 0.02em;
+}
+
+.login-subtitle {
+	margin: 0;
+	font-size: var(--ql-font-size-base);
+	color: var(--ql-muted);
+}
+
+/* ── Tabs ── */
+.tab-bar {
+	display: flex;
+	border-bottom: 1px solid var(--ql-border);
+	margin-bottom: 20px;
+	gap: 0;
+}
+
+.tab {
+	flex: 1;
+	background: none;
+	border: none;
+	border-bottom: 2px solid transparent;
+	padding: 8px 12px;
+	font-size: var(--ql-font-size-base);
+	color: var(--ql-muted);
+	cursor: pointer;
+	transition: color var(--ql-transition-fast), border-color var(--ql-transition-fast);
+	margin-bottom: -1px;
+}
+
+.tab:hover {
+	color: var(--ql-fg);
+}
+
+.tab.active {
+	color: var(--ql-accent);
+	border-bottom-color: var(--ql-accent);
+	font-weight: 600;
+}
+
+/* ── Form ── */
+.login-form {
+	display: flex;
+	flex-direction: column;
+	gap: 14px;
+}
+
+.field-group {
+	display: flex;
+	flex-direction: column;
+	gap: 5px;
+}
+
+.field-label {
+	font-size: var(--ql-font-size-small);
+	color: var(--ql-muted);
+	font-weight: 500;
+	letter-spacing: 0.03em;
+	text-transform: uppercase;
+}
+
+.field-input {
+	background: var(--vscode-input-background);
+	color: var(--vscode-input-foreground);
+	border: 1px solid var(--vscode-input-border, var(--ql-border));
+	border-radius: var(--ql-radius-md);
+	padding: 7px 10px;
+	font-size: var(--ql-font-size-base);
+	font-family: inherit;
+	outline: none;
+	transition: border-color var(--ql-transition-fast);
+}
+
+.field-input:focus {
+	border-color: var(--ql-accent);
+}
+
+.field-input::placeholder {
+	color: var(--vscode-input-placeholderForeground, var(--ql-muted));
+	opacity: 0.7;
+}
+
+/* ── Error ── */
+.error-msg {
+	font-size: var(--ql-font-size-small);
+	color: var(--ql-status-negative);
+	padding: 6px 10px;
+	background: color-mix(in srgb, var(--ql-status-negative) 10%, transparent);
+	border-radius: var(--ql-radius-sm);
+	border: 1px solid color-mix(in srgb, var(--ql-status-negative) 30%, transparent);
+}
+
+/* ── Buttons ── */
+.btn {
+	border-radius: var(--ql-radius-md);
+	border: 1px solid transparent;
+	padding: 8px 14px;
+	font-size: var(--ql-font-size-base);
+	font-family: inherit;
+	cursor: pointer;
+	transition: background var(--ql-transition-fast), opacity var(--ql-transition-fast);
+}
+
+.btn:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
+.btn-primary {
+	background: var(--ql-accent);
+	color: #000;
+	font-weight: 600;
+	width: 100%;
+	margin-top: 4px;
+}
+
+.btn-primary:hover:not(:disabled) {
+	background: var(--ql-accent-hover);
+}
+
+/* ── Divider ── */
+.divider {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	margin: 16px 0 12px;
+	color: var(--ql-muted);
+	font-size: var(--ql-font-size-small);
+}
+
+.divider::before,
+.divider::after {
+	content: '';
+	flex: 1;
+	height: 1px;
+	background: var(--ql-border);
+}
+
+/* ── Demo button ── */
+.btn-demo {
+	width: 100%;
+	background: transparent;
+	border-color: var(--ql-border);
+	color: var(--ql-muted);
+	font-size: var(--ql-font-size-small);
+}
+
+.btn-demo:hover:not(:disabled) {
+	border-color: var(--ql-accent);
+	color: var(--ql-accent);
+}

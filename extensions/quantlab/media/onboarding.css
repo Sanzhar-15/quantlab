@@ -1,0 +1,78 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+body {
+	margin: 0;
+	padding: 0;
+	font-family: var(--ql-font-family);
+	background: var(--ql-bg);
+	color: var(--ql-fg);
+	height: 100vh;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.welcome-shell {
+	width: min(520px, 90vw);
+	background: var(--ql-card-bg);
+	border: 1px solid var(--ql-border);
+	border-radius: var(--ql-radius-lg);
+	padding: 28px;
+	box-shadow: var(--ql-shadow-modal);
+	text-align: left;
+}
+
+.welcome-shell h1 {
+	margin: 0 0 8px;
+	font-size: 20px;
+}
+
+.welcome-subtitle {
+	margin: 0 0 24px;
+	color: var(--ql-muted);
+}
+
+.welcome-actions {
+	display: flex;
+	gap: 12px;
+	flex-wrap: wrap;
+}
+
+.btn {
+	border-radius: var(--ql-radius-md);
+	border: 1px solid transparent;
+	padding: 8px 14px;
+	font-size: 12px;
+	cursor: pointer;
+	background: var(--vscode-button-secondaryBackground);
+	color: var(--vscode-button-secondaryForeground);
+	transition: background var(--ql-transition-fast);
+}
+
+.btn-primary {
+	background: var(--ql-accent, #FF7331);
+	color: var(--ql-accent-fg, #1A0A00);
+}
+
+.btn-primary:hover {
+	background: var(--ql-accent-hover, #E5672C);
+}
+
+.btn-secondary {
+	background: var(--vscode-button-secondaryBackground);
+	color: var(--vscode-button-secondaryForeground);
+	border-color: var(--vscode-button-secondaryBorder);
+}
+
+.btn-ghost {
+	background: transparent;
+	color: var(--ql-accent, #FF7331);
+	border-color: var(--ql-accent, #FF7331);
+}
+
+.btn-ghost:hover {
+	background: rgba(255, 115, 49, 0.15);
+}

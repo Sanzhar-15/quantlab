@@ -1,0 +1,287 @@
+/*---------------------------------------------------------------------------------------------
+ *  Visualise View Styles
+ *--------------------------------------------------------------------------------------------*/
+
+/* QuantLab Accent Color Overrides */
+:root {
+	--ql-accent: #FF7331;
+	--ql-accent-hover: #E5672C;
+	--ql-accent-active: #CC5C22;
+	--ql-accent-muted: rgba(255, 115, 49, 0.15);
+	--ql-accent-fg: #1A0A00;
+}
+
+body {
+	margin: 0;
+	padding: 0;
+	color: var(--vscode-foreground);
+	background: var(--vscode-editor-background);
+	font-family: var(--vscode-font-family);
+	overflow: hidden;
+}
+
+/* Loading State */
+.visualise-loading {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	height: 100vh;
+	color: var(--vscode-descriptionForeground);
+}
+
+.visualise-loading .codicon {
+	font-size: 32px;
+	margin-bottom: 16px;
+}
+
+/* Main Container */
+.visualise-container {
+	display: flex;
+	height: 100vh;
+}
+
+/* Sidebar */
+.visualise-sidebar {
+	width: 240px;
+	min-width: 200px;
+	border-right: 1px solid var(--vscode-panel-border);
+	background: var(--vscode-sideBar-background);
+	overflow-y: auto;
+	padding: 12px;
+}
+
+.sidebar-section {
+	margin-bottom: 20px;
+}
+
+.sidebar-section h3 {
+	font-size: 11px;
+	font-weight: 600;
+	text-transform: uppercase;
+	color: var(--vscode-sideBarSectionHeader-foreground);
+	margin: 0 0 10px 0;
+	padding-bottom: 6px;
+	border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+/* Chart Type List */
+.chart-type-list {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+}
+
+.chart-type-btn {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 8px 12px;
+	border: none;
+	border-radius: 4px;
+	background: transparent;
+	color: var(--vscode-foreground);
+	cursor: pointer;
+	text-align: left;
+	font-size: 13px;
+}
+
+.chart-type-btn:hover {
+	background: var(--vscode-list-hoverBackground);
+}
+
+.chart-type-btn.active {
+	background: var(--ql-accent);
+	color: var(--ql-accent-fg);
+}
+
+.chart-type-btn .codicon {
+	font-size: 16px;
+	opacity: 0.8;
+}
+
+/* Column List */
+.column-list {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	max-height: 250px;
+	overflow-y: auto;
+}
+
+.column-item {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 6px 8px;
+	border-radius: 4px;
+	cursor: pointer;
+	font-size: 12px;
+}
+
+.column-item:hover {
+	background: var(--vscode-list-hoverBackground);
+}
+
+.column-item input[type="checkbox"] {
+	margin: 0;
+}
+
+.column-name {
+	flex: 1;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.column-type {
+	font-size: 10px;
+	color: var(--vscode-descriptionForeground);
+	font-family: monospace;
+}
+
+/* Data Info */
+.data-info {
+	font-size: 12px;
+}
+
+.info-row {
+	display: flex;
+	justify-content: space-between;
+	padding: 4px 0;
+}
+
+.info-row .label {
+	color: var(--vscode-descriptionForeground);
+}
+
+.info-row .value {
+	font-family: monospace;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	max-width: 120px;
+}
+
+/* Main Chart Area */
+.visualise-main {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+	padding: 16px;
+}
+
+/* Chart Placeholder */
+.chart-placeholder {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	height: 100%;
+	color: var(--vscode-descriptionForeground);
+	text-align: center;
+}
+
+.chart-placeholder .codicon {
+	font-size: 64px;
+	margin-bottom: 16px;
+	opacity: 0.3;
+}
+
+/* Chart Area */
+.chart-area {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+}
+
+.chart-header {
+	margin-bottom: 16px;
+}
+
+.chart-header h3 {
+	margin: 0 0 4px 0;
+	font-size: 14px;
+	font-weight: 500;
+}
+
+.chart-subtitle {
+	font-size: 12px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.chart-canvas {
+	flex: 1;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	background: var(--vscode-editor-inactiveSelectionBackground);
+	border-radius: 8px;
+	padding: 20px;
+	overflow: hidden;
+}
+
+.chart-svg {
+	width: 100%;
+	height: 100%;
+	max-height: 400px;
+}
+
+.chart-legend {
+	display: flex;
+	gap: 16px;
+	padding: 12px 0;
+	flex-wrap: wrap;
+}
+
+.legend-item {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	font-size: 12px;
+}
+
+.legend-color {
+	width: 12px;
+	height: 12px;
+	border-radius: 2px;
+}
+
+.legend-label {
+	color: var(--vscode-descriptionForeground);
+}
+
+/* Heatmap Placeholder */
+.heatmap-placeholder {
+	text-align: center;
+	color: var(--vscode-descriptionForeground);
+}
+
+.heatmap-placeholder p {
+	margin: 8px 0;
+}
+
+/* No Data */
+.no-data {
+	color: var(--vscode-descriptionForeground);
+	font-style: italic;
+}
+
+/* Scrollbar Styling */
+::-webkit-scrollbar {
+	width: 8px;
+	height: 8px;
+}
+
+::-webkit-scrollbar-track {
+	background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+	background: var(--vscode-scrollbarSlider-background);
+	border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+	background: var(--vscode-scrollbarSlider-hoverBackground);
+}
