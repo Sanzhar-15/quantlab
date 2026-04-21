@@ -1,0 +1,14 @@
+V4 PR5 - Incremental LOD updates (append/update/patch).
+
+Goal:
+- Eliminate LOD rebuild spikes and stabilize line quality during streaming and pan.
+
+Tasks:
+- Extend LodPyramid to update only affected buckets on append, updateLast, appendBatch, and patchExisting.
+- Add a batched update path to avoid per-point overhead in appendBatch.
+- For chunked data, update only the touched chunk LODs and clear cache selectively.
+- Add instrumentation for LOD work per frame.
+
+Acceptance:
+- Scenario E shows no LOD rebuild spikes.
+- Scenario D panning has stable LOD timing with minimal variance.

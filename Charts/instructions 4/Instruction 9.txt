@@ -1,0 +1,13 @@
+V4 PR9 - Crisp rendering and Path2D reuse.
+
+Goal:
+- Maintain 4k-like crispness while lowering CPU cost.
+
+Tasks:
+- Enforce device-pixel aligned line widths and consistent lineCap/lineJoin.
+- Add optional Path2D caching keyed by series + range + LOD + scale.
+- Invalidate path cache on data/scale/range changes and on gaps.
+
+Acceptance:
+- Lines remain sharp at all zoom levels.
+- CPU cost drops for small pans without visual artifacts.

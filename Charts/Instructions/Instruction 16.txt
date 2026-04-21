@@ -1,0 +1,12 @@
+Implement ThemeTokens system:
+- Single theme object compiled into PaintStyles used by renderer (no CSS parsing in hot loops)
+- Runtime theme switching (dark/light) without chart re-init
+- Signature design touches (cheap):
+  - subtle grid hierarchy (major/minor)
+  - focus band under crosshair
+  - last-value marker pill rendered in overlay
+  - typography-first axis spacing
+
+Acceptance:
+- Demo: theme toggle is instant and does not rebuild data/decimation caches unnecessarily.
+

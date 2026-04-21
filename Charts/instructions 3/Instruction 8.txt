@@ -1,0 +1,12 @@
+V3 PR8 — Multi-pane interactions + crosshair semantics.
+
+Goal:
+- Clear crosshair behavior across panes.
+
+Tasks:
+- Vertical line spans all panes; horizontal line only in active pane.
+- Add optional paneId in crosshair event payload (additive).
+
+Acceptance:
+- Overlay-only invariant remains true.
+- Tests cover active-pane selection and event payload.

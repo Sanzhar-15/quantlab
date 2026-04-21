@@ -1,0 +1,11 @@
+Enforce bundle size and tree-shaking budgets.
+
+- Add budgets for core+canvas2d and optional Worker/WebGL modules.
+- Ensure optional modules are tree-shakable and off by default.
+- Update size reporting/CI to enforce soft and hard caps.
+- Document how to verify tree-shaking for optional backends.
+
+Acceptance:
+- Size report includes optional variants.
+- CI fails when budgets are exceeded.
+- Production bundle stays within targets.

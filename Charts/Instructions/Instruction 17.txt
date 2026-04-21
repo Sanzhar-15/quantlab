@@ -1,0 +1,15 @@
+Implement a minimal plugin API (guardrails):
+- chart.addPlugin(plugin)
+- plugin hooks limited to:
+  - onInit(chart)
+  - onRenderUnderlay(ctx, layout)   // before series
+  - onRenderOverlay(ctx, layout)    // after series
+  - onPointer(event, state)
+- Provide two example plugins:
+  1) threshold band (y-range shading)
+  2) vertical event markers (time-based lines + labels)
+
+Acceptance:
+- Plugins render without forcing series redraw on pointermove.
+- Plugin rendering respects clipping and theme tokens.
+

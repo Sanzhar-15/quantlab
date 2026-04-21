@@ -1,0 +1,28 @@
+{
+  "name": "@charts-plus/chart-render-webgpu",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "@charts-plus/chart-core": "0.0.0",
+    "@charts-plus/chart-text": "0.0.0",
+    "@charts-plus/chart-interaction": "0.0.0",
+    "@charts-plus/chart-indicators": "0.0.0",
+    "@charts-plus/chart-drawings": "0.0.0"
+  },
+  "scripts": {
+    "build": "npx tsc --build tsconfig.json && tsup src/index.ts --format esm --sourcemap --minify --tsconfig tsconfig.json --external '@charts-plus/*'"
+  }
+}
+

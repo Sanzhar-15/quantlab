@@ -1,0 +1,17 @@
+Set up a workspace repo with TypeScript strict, lint/format, and build outputs (ESM + types). Include:
+- packages/chart-core
+- packages/chart-render-canvas2d
+- apps/demo (Vite)
+- apps/perf-harness (Playwright runner)
+
+CI must run:
+- unit tests
+- Playwright smoke
+- bundle size report (gzipped) for chart-core + chart-render-canvas2d
+
+Add a failing budget placeholder (e.g., 80kb gzipped for combined core+canvas renderer) and ensure CI enforces it.
+
+Acceptance:
+- Demo boots and renders a placeholder canvas.
+- CI shows bundle size numbers and fails if budget exceeded.
+

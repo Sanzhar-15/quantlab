@@ -1,0 +1,12 @@
+Lock the V2 API/UX contract before heavy implementation.
+
+- Decide timezone handling (UTC vs local) and expose a clear option in the API.
+- Define formatting hooks for axis labels and crosshair values.
+- Specify streaming semantics: append/updateLast/out-of-order policy and gap handling.
+- Define crosshair behavior on gaps (null/NaN) and interpolation mode options.
+- Define multi-axis mapping contract (per-series axis id + axis options).
+- Update the API docs to reflect these decisions.
+
+Acceptance:
+- API contract is documented and referenced by demos/tests.
+- Tests cover gap semantics and formatting hooks.

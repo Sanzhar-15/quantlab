@@ -1,0 +1,15 @@
+V4 PR2 - Input pipeline and scheduler coalescing.
+
+Goal:
+- Reduce drag/zoom jitter and input latency without breaking API.
+
+Tasks:
+- Use event.timeStamp (fall back to performance.now) for pan velocity and inertia timing.
+- Coalesce pointer events into a single per-frame intent while preserving total delta.
+- Ensure pointerrawupdate only feeds the FrameScheduler (no direct rendering).
+- Avoid overlay invalidations when pointer is outside the plot and crosshair is inactive.
+- Keep pointermove overlay-only invariant intact.
+
+Acceptance:
+- Drag input latency improves in perf scenario A/B.
+- No regressions in crosshair behavior or inertia feel.

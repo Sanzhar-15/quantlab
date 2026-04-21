@@ -1,0 +1,13 @@
+Implement PriceScale in chart-core:
+- autoscale from visible data only (ignore gaps)
+- yToValue/valueToY
+- scale type: linear (default), log (optional flag; handle <=0 safely by fallback)
+- tick generator:
+  - produce stable tick steps as zoom changes (no jitter)
+- formatting hooks:
+  - default format for macro (%/bps/decimal) and allow custom formatter per series/axis
+
+Acceptance:
+- Unit tests for autoscale bounds and tick stability.
+- Demo: toggle linear/log on a synthetic exponential series.
+

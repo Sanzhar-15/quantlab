@@ -1,0 +1,13 @@
+V3 PR3 — Batch API + streaming coalescing.
+
+Goal:
+- Prevent render storms during streaming ingestion.
+
+Tasks:
+- Add chart.batch(fn) to coalesce invalidations.
+- Add series.appendBatch(points) for bulk ingestion.
+- Allow DataProvider to emit batches without breaking existing updates.
+
+Acceptance:
+- Scenario E maintains <=1 render/frame per chart.
+- Unit tests cover batch invalidation + appendBatch semantics.

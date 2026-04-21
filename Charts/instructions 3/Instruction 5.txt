@@ -1,0 +1,12 @@
+V3 PR5 — Incremental LOD updates.
+
+Goal:
+- Make LOD streaming-friendly and bounded in work per update.
+
+Tasks:
+- Update LodPyramid to update only affected buckets on append/update/patch.
+- Add LOD work counters to debug stats.
+
+Acceptance:
+- Scenario E shows no LOD rebuild spikes.
+- Unit tests cover incremental updates across bucket boundaries.

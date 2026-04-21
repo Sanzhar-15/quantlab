@@ -1,0 +1,10 @@
+Add optional Web Worker pipeline:
+- Build LOD pyramid off-main-thread for large datasets (Scenario_B/C)
+- Transfer typed arrays efficiently (Transferable)
+- Main thread remains responsive; progressive readiness:
+  - render coarse LOD first, refine when worker completes
+
+Acceptance:
+- Loading Scenario_C does not block UI thread for long tasks.
+- Fallback: if Worker unavailable, build on main thread with chunking (idle callbacks / time slicing).
+

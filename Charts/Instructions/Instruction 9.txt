@@ -1,0 +1,11 @@
+Implement LayoutEngine in chart-core + canvas renderer:
+- Single plot pane rectangle + optional left/right axis rectangles
+- Grid renderer (vertical + horizontal lines)
+- Axis renderer:
+  - label measurement cache keyed by (font, text)
+  - avoid measureText in hot loop; only on layout invalidation
+
+Acceptance:
+- Perf harness shows no spikes on pointermove.
+- Grid/axis only rerender when LAYOUT invalidated.
+

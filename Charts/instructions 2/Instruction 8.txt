@@ -1,0 +1,10 @@
+Add multi-axis support with per-series mapping.
+
+- Layout engine supports left and right axes with independent scales.
+- Series can bind to a specific axis; allow combined or per-axis autoscale.
+- Axis renderer handles multiple scales and tick formatting cleanly.
+
+Acceptance:
+- Demo shows left/right axes with distinct scales.
+- Tests cover autoscale per axis and label layout stability.
+- No axis overlap or clipping issues.

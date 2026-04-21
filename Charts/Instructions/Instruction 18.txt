@@ -1,0 +1,10 @@
+Create packages/chart-transforms (separate bundle from rendering core):
+- normalizeToBase100
+- percentChange
+- zScore (rolling optional, but keep O(N) and typed-array friendly)
+- indexRebase (align multiple series to common start)
+
+Acceptance:
+- Demo shows raw vs normalized series overlay.
+- Rendering core does NOT import transforms (no bundle bloat).
+

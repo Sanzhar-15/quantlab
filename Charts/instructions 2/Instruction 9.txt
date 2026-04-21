@@ -1,0 +1,11 @@
+Upgrade interactions for PC-first UX.
+
+- Inertial pan with configurable friction.
+- Precise zoom anchoring at cursor time; clamp to data extents.
+- Improve crosshair snapping (nearest vs interpolate).
+- Touch parity remains consistent with mouse behavior.
+
+Acceptance:
+- Interaction latency targets met without jitter.
+- Playwright interaction tests cover pan/zoom/crosshair.
+- No visual drift at zoom boundaries.

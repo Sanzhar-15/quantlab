@@ -1,0 +1,12 @@
+Implement memory policy and eviction for data + caches.
+
+- Add cache budgets in bytes for data, LOD, and decimator outputs.
+- Implement eviction policy (LRU or visibility-first) for old chunks and LOD levels.
+- Provide hooks or events for eviction visibility (optional).
+- Ensure visible window is always retained with a small padding margin.
+- Add quality degradation strategy under memory pressure (reduce LOD depth, shrink caches).
+
+Acceptance:
+- Scenario C stays interactive while evicting old chunks.
+- Working set stays <= 2x visible window.
+- Tests cover eviction ordering, bounds behavior, and pressure degradation.

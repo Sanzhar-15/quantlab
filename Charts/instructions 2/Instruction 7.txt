@@ -1,0 +1,11 @@
+Optimize rendering with caching and buffer reuse.
+
+- Add buffer pooling for decimation and draw buffers.
+- Reuse raster output on small pans via translation where safe.
+- Avoid Path2D if slower; benchmark in dev builds and choose the faster path.
+- Track per-frame allocations and keep them flat in hot paths.
+
+Acceptance:
+- Pan/zoom stays smooth with no GC churn.
+- Allocation counters remain flat during interaction.
+- No visible artifacts from reuse or translation.

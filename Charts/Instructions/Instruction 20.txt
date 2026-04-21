@@ -1,0 +1,9 @@
+Implement an optional multi-resolution LOD pyramid per series:
+- Levels aggregate min/max (and optionally first/last) over fixed bucket sizes (e.g., 2^k)
+- At render time, choose level based on pixels-per-sample so decimation stays ~O(plotWidth)
+- Streaming updates update pyramid incrementally (append/updateLast)
+
+Acceptance:
+- Scenario_C becomes usable (even if not perfect) without freezing.
+- Perf harness shows stable frame times across wide zoom ranges.
+

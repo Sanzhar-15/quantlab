@@ -1,0 +1,42 @@
+{
+  "name": "charts-plus",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build:packages && npm run build:apps",
+    "build:apps": "npm run build -w @charts-plus/demo && npm run build -w @charts-plus/perf-harness",
+    "build:packages": "npm run build -w @charts-plus/chart-core && npm run build -w @charts-plus/chart-text && npm run build -w @charts-plus/chart-interaction && npm run build -w @charts-plus/chart-indicators && npm run build -w @charts-plus/chart-drawings && npm run build -w @charts-plus/chart-render-webgpu && npm run build -w @charts-plus/chart-render-canvas2d && npm run build -w @charts-plus/chart-transforms && npm run build -w @charts-plus/chart",
+    "format": "prettier . --write",
+    "format:check": "prettier . --check",
+    "lint": "eslint .",
+    "size": "node scripts/bundle-size.mjs --strict",
+    "test": "vitest run",
+    "test:playwright": "npm run test:playwright -w @charts-plus/perf-harness",
+    "test:playwright:smoke": "npm run test:playwright -w @charts-plus/perf-harness -- tests/smoke.spec.ts tests/perf-invariants.spec.ts tests/visual.spec.ts tests/leak.spec.ts",
+    "perf:check": "npm run test:playwright -w @charts-plus/perf-harness -- tests/perf.spec.ts",
+    "perf:record": "PERF_RECORD=1 npm run test:playwright -w @charts-plus/perf-harness -- tests/perf.spec.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.51.1",
+    "@types/node": "^22.10.5",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "@typescript-eslint/eslint-plugin": "^8.18.2",
+    "@typescript-eslint/parser": "^8.18.2",
+    "@vitejs/plugin-react": "^4.2.0",
+    "@webgpu/types": "^0.1.68",
+    "eslint": "^8.57.1",
+    "eslint-config-prettier": "^9.1.0",
+    "jsdom": "^24.1.3",
+    "prettier": "^3.4.2",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "vitest": "^2.1.8"
+  }
+}

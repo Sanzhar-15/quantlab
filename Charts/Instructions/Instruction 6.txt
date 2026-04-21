@@ -1,0 +1,11 @@
+Implement a columnar DataStore in chart-core:
+- time: Float64Array or number[]
+- value: Float64Array or number[] with NaN for gaps OR separate validity bitmap
+- Support setData(points), append(point), updateLast(point)
+- Maintain monotonic time invariant; reject or handle out-of-order data (documented behavior)
+- Provide fast binary search helpers: lowerBound(time), upperBound(time)
+
+Acceptance:
+- Unit tests for streaming behavior and gaps.
+- No object-per-point retained in hot paths (use arrays/typed arrays).
+

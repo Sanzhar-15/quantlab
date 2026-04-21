@@ -1,0 +1,11 @@
+Implement multi-resolution LOD + decimation improvements.
+
+- Build LOD pyramids per chunk (min/max + first/last + gap markers).
+- Select LOD level based on pixels-per-sample and zoom.
+- Bound decimation output; cache results per visible range + scale.
+- Reuse typed arrays and avoid per-frame allocations.
+
+Acceptance:
+- Output size stays within k * plotWidth.
+- Spikes and gaps are preserved at all zoom levels.
+- Unit tests cover envelope correctness and chunk boundary handling.

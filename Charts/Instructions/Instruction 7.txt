@@ -1,0 +1,17 @@
+Implement TimeScale in chart-core:
+- Visible range expressed in time units {from,to} (ms since epoch)
+- Mapping:
+  - timeToX(t) and xToTime(x)
+  - Use a linear transform based on visible range and plot width.
+- Visible index range calculation using DataStore binary search.
+- Pan/zoom model:
+  - pan by deltaX translates visible time range
+  - wheel zoom anchored at cursor time
+
+Add unit tests:
+- round-trips for timeToX/xToTime
+- visible range updates are stable and clamped
+
+Acceptance:
+- Demo: irregular series shows real gaps (time-proportional spacing).
+

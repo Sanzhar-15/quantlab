@@ -1,0 +1,14 @@
+V3 PR12 — Hardening + release readiness.
+
+Goal:
+- Lock in V3 wins and prevent regressions.
+
+Tasks:
+- Add visual regression scenes for pan cache, live mode, multi-pane, revisions.
+- Add fuzz/property tests for patchExisting, gaps, and sampling modes.
+- Add dashboard correctness test (offscreen charts stay idle).
+- Update release checklist for V3 gates.
+
+Acceptance:
+- All CI gates pass including scenarios D/E/F on pinned hardware.
+- Visual diffs are stable and meaningful.

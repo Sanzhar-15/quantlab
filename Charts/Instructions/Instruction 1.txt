@@ -1,0 +1,34 @@
+Create docs/00_north_star.md and docs/01_api_spec.md (TypeScript-first). This is a clean-room project: do NOT copy code from third-party chart libraries; implement original code.
+
+docs/00_north_star.md must include:
+- Target use-case: website-embedded financial/macro line charts, often normalized, irregular timestamps, multiple series.
+- Rendering: Canvas2D core (optional WebGL later), crisp line priority.
+- Absolute goals (qualitative) + measurable gates (quantitative):
+  - No per-frame allocations proportional to data size.
+  - Pointermove should redraw overlay only.
+  - Rendering cost must scale ~O(viewport pixels), not O(N points).
+- Benchmark scenarios:
+  - SCENARIO_A: 3 series × 10k points irregular time
+  - SCENARIO_B: 2 series × 200k points irregular time
+  - SCENARIO_C: 1 series × 2M points irregular time (stress)
+- CI gates:
+  - Bundle-size budget enforced (fail if exceeded).
+  - Perf regression gate: compare against stored baseline JSON; fail if > +15% median frame time on any scenario.
+  - Memory leak smoke test: mount/unmount 50× without heap growth trend.
+- Non-goals for v1: candlesticks, TA tools, drawing tools, complex annotations.
+
+docs/01_api_spec.md must define the frozen v1 API (TS signatures + brief behavior notes):
+- createChart(container, options)
+- chart.addLineSeries(options) returning series handle
+- series.setData({t:number, v:number|null}[]) where null breaks the line
+- series.append(point) and series.updateLast(point)
+- chart.setVisibleTimeRange({from:number,to:number}) and chart.getVisibleTimeRange()
+- chart.onCrosshairMove(cb) emitting {time, x, y, seriesValues: Map<seriesId, {value, formatted}>}
+- chart.setTheme(themeTokens)
+- chart.destroy()
+
+Also create a docs/02_architecture.md with:
+- module boundaries (core vs renderer vs demo)
+- frame pipeline: input coalescing → state update → layout (if dirty) → LOD → render layers
+- time scale: linear-time spacing (actual time gaps shown), visible range in time units, binary search to find visible indices.
+

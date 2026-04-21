@@ -1,0 +1,13 @@
+Refine visuals and theme polish without extra weight.
+
+- Subtle grid hierarchy and axis spacing improvements.
+- Crosshair focus band + last-value marker polish.
+- Tooltip alignment improvements to avoid overflow and jitter.
+- Theme switching stays instant with no cache rebuilds.
+- Define a lightweight visual identity (typography, palette, grid rhythm) and update demo accordingly.
+
+Acceptance:
+- Demo shows refined visual polish in light/dark.
+- Demo reflects the signature look (non-generic).
+- Visual regression snapshots updated.
+- Theme toggle does not invalidate LOD caches unnecessarily.

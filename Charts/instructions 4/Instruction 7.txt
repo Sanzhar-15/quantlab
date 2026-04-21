@@ -1,0 +1,14 @@
+V4 PR7 - Pan/zoom cache v4 (overscan + shift + settle).
+
+Goal:
+- Make drag and live auto-scroll feel elite without blur or residue.
+
+Tasks:
+- Render overscanned buffers and shift by integer device pixels during drag.
+- Rebase cache only when visible range exits overscan; keep drift-free shifts.
+- Add settle pass after interaction to restore full fidelity.
+- Ensure behavior matches both main-thread and worker rendering.
+
+Acceptance:
+- Drag is smooth and crisp with no residue or blur.
+- Auto-scroll uses the same cache and remains stable under streaming.

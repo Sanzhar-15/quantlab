@@ -1,0 +1,12 @@
+Move series rendering to a Worker with OffscreenCanvas.
+
+- Render the series layer in a Worker via OffscreenCanvas.
+- Main thread keeps layout, axes, and overlay rendering.
+- Define a minimal message protocol (visible range, plot rect, theme hash, data handles).
+- Add an A/B toggle to compare OffscreenCanvas vs main-thread series rendering and keep a fallback path.
+- Ensure pointermove only rerenders overlay.
+
+Acceptance:
+- Pointermove p95 < 12 ms.
+- Scenario B/C meet frame-time targets.
+- Perf invariant tests pass (overlay-only on pointermove) with both paths.

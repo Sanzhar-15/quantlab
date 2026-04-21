@@ -1,0 +1,22 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "composite": true,
+    "declaration": true,
+    "declarationMap": true,
+    "lib": ["ES2022", "DOM"],
+    "types": ["@webgpu/types"]
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"],
+  "references": [
+    { "path": "../chart-core" },
+    { "path": "../chart-text" },
+    { "path": "../chart-interaction" },
+    { "path": "../chart-indicators" },
+    { "path": "../chart-drawings" }
+  ]
+}
+

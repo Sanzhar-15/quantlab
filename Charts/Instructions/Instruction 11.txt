@@ -1,0 +1,11 @@
+Implement LineSeries renderer in chart-render-canvas2d:
+- Use decimated buffers
+- Handle gaps (null/NaN) by breaking path segments
+- Clip to plot rect
+- Crisp stroke rules (use snapX/snapY consistently)
+- Avoid Path2D if it’s slower; benchmark quickly in dev and pick the faster approach.
+
+Acceptance:
+- Visual: crisp line, no “hairy” blur.
+- Perf: Scenario_B pan/zoom smooth; no GC churn during interaction.
+

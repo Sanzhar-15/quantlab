@@ -1,0 +1,14 @@
+In chart-render-canvas2d implement CanvasSurface:
+- ResizeObserver support
+- devicePixelRatio scaling (correct backing-store size)
+- Pixel snapping helpers:
+  - snapX(x), snapY(y) with rules that produce crisp 1px strokes at any DPR.
+  - Provide a consistent policy: stroke centered on pixel grid (0.5/dpr offsets where needed).
+
+Add visual demo page "Crispness":
+- horizontal/vertical/diagonal 1px lines at multiple DPRs (simulate by scaling canvas).
+
+Acceptance:
+- Lines appear crisp (no blur) at DPR 1, 1.25, 1.5, 2.
+- No resize feedback loops.
+

@@ -1,0 +1,9 @@
+Expand hardening and regression coverage.
+
+- Fuzz/property tests: time scale, gaps, binary search, LOD boundaries.
+- Visual regression for multi-axis, themes, gaps, overlays.
+- Perf invariants: overlay-only pointermove, decimator output bound, input-to-paint.
+
+Acceptance:
+- CI runs fuzz + visual + perf invariants with clear diffs/logs.
+- Regression failures are actionable.

@@ -1,0 +1,11 @@
+Implement a LineDecimator:
+- Input: visible index range, time/value arrays, plot width in pixels
+- Output: draw buffers sized ~O(plotWidth):
+  - For each pixel column, compute min/max (and optionally first/last) in that column
+  - Preserve spikes (min/max envelope)
+- Cache keyed by (seriesId, visibleTimeRange, plotWidth, scale type) with bounded size.
+
+Acceptance:
+- Scenario_B stays interactive; rendering work scales with plotWidth.
+- Unit tests: envelope preserves true min/max in each bucket.
+

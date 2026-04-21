@@ -1,0 +1,14 @@
+V4 PR6 - Axis range acceleration.
+
+Goal:
+- Remove axis lag during drag by avoiding full data scans.
+
+Tasks:
+- Add min/max bucket stats per series (or reuse LOD buckets) for axis range computation.
+- Use bucket stats for interior ranges and precise scans only on edge buckets.
+- Keep log scale correctness (minPositive handling) and gap behavior intact.
+- Update bucket stats on setData, appendBatch, updateLast, and patchExisting.
+
+Acceptance:
+- Axis updates remain correct under gaps and log scale.
+- Dragging shows no axis lag in scenario C/D.

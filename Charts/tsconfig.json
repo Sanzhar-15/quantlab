@@ -1,0 +1,14 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/chart-core" },
+    { "path": "./packages/chart-text" },
+    { "path": "./packages/chart-interaction" },
+    { "path": "./packages/chart-indicators" },
+    { "path": "./packages/chart-drawings" },
+    { "path": "./packages/chart-render-webgpu" },
+    { "path": "./packages/chart-render-canvas2d" },
+    { "path": "./packages/chart-transforms" },
+    { "path": "./packages/chart" }
+  ]
+}

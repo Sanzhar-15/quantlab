@@ -1,0 +1,14 @@
+V4 PR10 - Crosshair semantics and sampling optimizations.
+
+Goal:
+- Keep tooltip values correct and crosshair updates fast.
+
+Tasks:
+- Cache last indices per series and reuse when time is unchanged.
+- Ensure deterministic tie-breaks for nearest sampling.
+- Respect sampleMode (nearest, linear, hold) and gapThresholdMs.
+- Keep pointermove overlay-only invariant.
+
+Acceptance:
+- Crosshair feels instant even with many series.
+- No correctness regressions in gap or hold sampling.

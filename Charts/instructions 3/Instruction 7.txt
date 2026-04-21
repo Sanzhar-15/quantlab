@@ -1,0 +1,13 @@
+V3 PR7 — Multi-pane layout.
+
+Goal:
+- Stacked panes with shared time scale and per-pane axes.
+
+Tasks:
+- Extend layout engine for stacked panes.
+- Add chart.addPane() and allow series to target a pane.
+- Keep single-pane path unchanged by default.
+
+Acceptance:
+- Demo shows 3 panes with independent y-scales.
+- Scenario D passes without regressions in A/B.

@@ -1,0 +1,14 @@
+V3 PR2 — ChartRuntime v3 (single RAF + visibility culling).
+
+Goal:
+- Dashboard scalability without N schedulers.
+
+Tasks:
+- Introduce a shared ChartRuntime (singleton by default).
+- Use IntersectionObserver to pause offscreen charts.
+- Add priority queue (interacting > visible > idle).
+- Keep worker opt-in-by-import; runtime must not spawn workers unless enabled.
+
+Acceptance:
+- Scenario F shows single RAF driver and offscreen charts idle.
+- No regression in overlay-only pointermove.

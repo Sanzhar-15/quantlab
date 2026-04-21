@@ -1,0 +1,23 @@
+{
+  "name": "@charts-plus/chart-trading",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "npx tsc --build tsconfig.json && tsup src/index.ts --format esm --sourcemap --minify --tsconfig tsconfig.json"
+  },
+  "dependencies": {
+    "@charts-plus/chart-core": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "tsup": "^8.5.1"
+  }
+}

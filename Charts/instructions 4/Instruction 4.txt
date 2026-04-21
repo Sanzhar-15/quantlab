@@ -1,0 +1,14 @@
+V4 PR4 - Streaming pipeline and backpressure hardening.
+
+Goal:
+- Ensure bulk ingestion and live updates do not cause render storms or GC spikes.
+
+Tasks:
+- Audit existing chart.batch, series.appendBatch, and series.patchExisting.
+- Ensure appendBatch/backpressure result in at most one invalidation per frame.
+- Coalesce provider updates during bursts (drop or coalesce per policy) without breaking ordering rules.
+- Ensure dirty-range tracking is used for patchExisting so only affected caches/LOD are recomputed.
+
+Acceptance:
+- Scenario E ingests with stable frame times and no GC spikes.
+- No more than one series redraw per frame during burst updates.

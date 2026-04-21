@@ -1,0 +1,11 @@
+Implement layered rendering:
+- Offscreen canvases (or equivalent) for:
+  - static-ish layer: grid + axes
+  - series layer
+  - overlay layer (crosshair, hover effects)
+- Composite onto main canvas each frame, but only rerender dirty layers.
+
+Acceptance:
+- Pointermove only rerenders overlay layer.
+- Pan/zoom rerenders series + overlay; grid/axes only when ticks/layout change.
+

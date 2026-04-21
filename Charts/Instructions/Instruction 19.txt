@@ -1,0 +1,9 @@
+Add practical website features:
+- chart.exportPng({pixelRatio?:number}) returning Blob or dataURL
+- SSR-safe entry (no window usage at import time)
+- Robust destroy() (removes listeners, disconnects observers)
+
+Acceptance:
+- Demo: “Download PNG” works.
+- Leak smoke test: mount/unmount 50× shows stable memory trend.
+

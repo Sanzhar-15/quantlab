@@ -1,0 +1,15 @@
+V3 PR6 — PanCache overscan + live auto-scroll.
+
+Goal:
+- Smoother pan/live without edge-strip repaint complexity.
+
+Tasks:
+- Implement PanCache for series layer with overscan buffer.
+- Shift cached bitmap by integer device pixels (DPR-aware).
+- Add auto-scroll option that reuses PanCache for streaming.
+- Freeze autoscale during drag; optional tick freeze for stability.
+
+Acceptance:
+- Scenario D/E shows lower pan and live p95.
+- No blur or seams in visual regression.
+- Works in both main-thread and worker series modes.

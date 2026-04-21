@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Charts+ Advanced</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      /* Updated: Darker, desaturated "Charcoal/Midnight" palette */
+      --page-bg: #0b0e11;
+      /* Very dark, almost black blue-grey */
+      --sidebar-bg: #14161a;
+      /* Slightly lighter, separation without strong blue tint */
+      --border-color: #23262b;
+      /* Subtle dark grey border */
+
+      --text-primary: #e6e8eb;
+      --text-secondary: #8b919e;
+      /* Neutral grey, less blue */
+      --text-disabled: #4e535e;
+
+      --accent: #FF802B;
+      /* Brand Orange (Highlight) */
+      --accent-hover: #FF9953;
+      --accent-text: #0b0e11;
+
+      --focus-blue: #2962ff;
+      /* Functional blue, kept distinct */
+      --hover-bg: #1e2126;
+      /* Dark hover state */
+
+      /* Charts+ specific overrides */
+      --chart-bg: #0b0e11;
+      --chart-grid: #1a1d21;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      padding: 0;
+      height: 100vh;
+      width: 100vw;
+      background: var(--page-bg);
+      color: var(--text-primary);
+      font-family: -apple-system, BlinkMacSystemFont, 'Trebuchet MS', Roboto, Ubuntu, sans-serif;
+      overflow: hidden;
+      display: grid;
+      grid-template-rows: 44px 1fr;
+      grid-template-columns: 1fr;
+      grid-template-areas:
+        "top"
+        "main";
+    }
+
+    /* Layout Areas */
+    #top-bar {
+      grid-area: top;
+      background: var(--sidebar-bg);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      padding: 0 10px;
+      gap: 16px;
+      z-index: 30;
+      /* Ensure top bar stays on top */
+    }
+
+    #side-bar {
+      /* Floating Centered Toolbar - OPTIMIZED */
+      position: absolute;
+      /* Center relative to the CHART AREA (offset by top-bar height) */
+      /* Viewport height - 44px top bar. Center is 44 + (H-44)/2 = 22 + H/2 */
+      top: calc(50% + 22px);
+      left: 16px;
+      transform: translateY(-50%);
+      z-index: 20;
+
+      /* Glassmorphism Effect */
+      background: rgba(20, 22, 26, 0.85);
+      /* Semi-transparent charcoal */
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      /* Subtle glass border */
+
+      border-radius: 12px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 8px 6px;
+      gap: 8px;
+
+      /* Layout Safety */
+      width: auto;
+      height: auto;
+      /* Remove overflow to allow dropdowns to pop out */
+      /* max-height: calc(100vh - 64px); */
+      /* overflow-y: auto; */
+    }
+
+    /* Hide scrollbar for Chrome/Safari/Edge */
+    #side-bar::-webkit-scrollbar {
+      display: none;
+    }
+
+    #main-content {
+      grid-area: main;
+      position: relative;
+      overflow: hidden;
+      background: var(--chart-bg);
+    }
+
+    /* Top Bar Components */
+    .top-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-secondary);
+      cursor: pointer;
+      padding: 6px 10px;
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 14px;
+      transition: background 0.1s, color 0.1s;
+    }
+
+    .top-btn:hover {
+      background: var(--hover-bg);
+      color: var(--text-primary);
+    }
+
+    .top-btn.active {
+      color: var(--accent);
+    }
+
+    .top-separator {
+      width: 1px;
+      height: 20px;
+      background: var(--border-color);
+    }
+
+    .dropdown-group {
+      display: flex;
+      gap: 8px;
+    }
+
+    .dropdown-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-primary);
+      font-weight: 500;
+      font-size: 14px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 8px;
+      border-radius: 4px;
+    }
+
+    .dropdown-btn:hover {
+      background: var(--hover-bg);
+    }
+
+    .dropdown-btn::after {
+      content: '';
+      border-left: 4px solid transparent;
+      border-right: 4px solid transparent;
+      border-top: 4px solid var(--text-secondary);
+      margin-left: 4px;
+    }
+
+    /* Side Bar Tools */
+    .tool-group {
+      position: relative;
+      display: flex;
+      align-items: stretch;
+    }
+
+    .tool-btn {
+      width: 34px;
+      height: 34px;
+      border-radius: 4px 0 0 4px;
+      border: none;
+      background: transparent;
+      color: var(--text-secondary);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: color 0.15s;
+    }
+
+    /* Buttons without dropdown */
+    .tool-btn.solo {
+      border-radius: 4px;
+    }
+
+    .tool-btn:hover {
+      background: rgba(255, 255, 255, 0.05);
+      /* Subtle hover inside glass */
+      color: var(--focus-blue);
+    }
+
+    .tool-btn.active {
+      color: var(--focus-blue);
+      background: rgba(41, 98, 255, 0.15);
+      /* Tinted active state */
+    }
+
+    .tool-btn svg {
+      width: 20px;
+      height: 20px;
+      fill: currentColor;
+    }
+
+    /* Dropdown trigger button */
+    .tool-dropdown-btn {
+      width: 12px;
+      height: 34px;
+      border: none;
+      background: transparent;
+      color: var(--text-disabled);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 0 4px 4px 0;
+      padding: 0;
+      transition: color 0.15s;
+    }
+
+    .tool-dropdown-btn:hover {
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--focus-blue);
+    }
+
+    .tool-dropdown-btn svg {
+      width: 8px;
+      height: 8px;
+      fill: currentColor;
+    }
+
+    /* Dropdown panel */
+    .tool-dropdown-panel {
+      position: absolute;
+      left: 100%;
+      top: 0;
+      margin-left: 8px;
+      /* Slight gap */
+
+      /* Glassmorphism Match */
+      background: rgba(20, 22, 26, 0.95);
+      /* Slightly more opaque for readability */
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+
+      border-radius: 8px;
+      min-width: 140px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+      z-index: 1000;
+      display: none;
+      padding: 4px;
+    }
+
+    .tool-dropdown-panel.open {
+      display: block;
+    }
+
+    .tool-dropdown-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      color: var(--text-secondary);
+      cursor: pointer;
+      font-size: 12px;
+      white-space: nowrap;
+      background: transparent;
+      border: none;
+      width: 100%;
+      text-align: left;
+    }
+
+    .tool-dropdown-item:hover {
+      background: var(--hover-bg);
+      color: var(--text-primary);
+    }
+
+    .tool-dropdown-item svg {
+      width: 16px;
+      height: 16px;
+      fill: currentColor;
+    }
+
+    /* Contextual Tools (Right Side of Top Bar) */
+    .context-tools {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    /* Chart Container Override */
+    #chart {
+      width: 100% !important;
+      height: 100% !important;
+      border: none !important;
+      border-radius: 0 !important;
+    }
+
+    /* OHLC Legend Position Fix */
+    .ohlc-legend {
+      top: 10px;
+      left: 10px;
+      font-family: 'Monaco', 'Consolas', monospace;
+    }
+
+    .ohlc-value {
+      color: var(--text-primary);
+    }
+
+    .ohlc-value.up {
+      color: #089981;
+    }
+
+    .ohlc-value.down {
+      color: #f23645;
+    }
+
+    /* V5.2 Performance Metrics Display */
+    #perf-metrics {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      background: rgba(11, 14, 17, 0.92);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-family: 'Monaco', 'Consolas', monospace;
+      font-size: 11px;
+      color: var(--text-secondary);
+      pointer-events: none;
+      z-index: 100;
+      display: none;
+      backdrop-filter: blur(8px);
+    }
+
+    #perf-metrics.visible {
+      display: block;
+    }
+
+    #perf-metrics .metric-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 2px 0;
+    }
+
+    #perf-metrics .metric-label {
+      color: var(--text-disabled);
+    }
+
+    #perf-metrics .metric-value {
+      color: #089981;
+      font-weight: 500;
+    }
+
+    #perf-metrics .metric-value.warn {
+      color: #f3b366;
+    }
+
+    #perf-metrics .metric-value.bad {
+      color: #f23645;
+    }
+
+    #perf-metrics .v52-badge {
+      display: inline-block;
+      background: linear-gradient(135deg, #2962ff 0%, #00bcd4 100%);
+      color: white;
+      font-size: 9px;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 4px;
+      margin-bottom: 8px;
+      letter-spacing: 0.5px;
+    }
+  </style>
+</head>
+
+<body>
+  <!-- Top Bar -->
+  <div id="top-bar">
+    <!-- Return to Terminal -->
+    <button class="top-btn" id="btn-return" title="Return to Terminal">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M19 12H5M12 19l-7-7 7-7" />
+      </svg>
+    </button>
+
+    <div class="top-separator"></div>
+
+    <!-- Primary Navigation Dropdowns -->
+    <div class="dropdown-group">
+      <button class="dropdown-btn">Time Series</button>
+      <button class="dropdown-btn">Candles</button>
+      <button class="dropdown-btn">BTCUSD</button>
+    </div>
+
+    <div class="top-separator"></div>
+
+    <!-- Contextual Tools (Time Series specific) -->
+    <div class="context-tools">
+      <button class="top-btn">1H</button>
+      <button class="top-btn" title="Indicators">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M3 3v18h18" />
+          <path d="M18.7 8l-5.1 5.2-2.8-2.7L7 14.3" />
+        </svg>
+      </button>
+      <button class="top-btn" title="Settings">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="3" />
+          <path
+            d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+        </svg>
+      </button>
+      <button class="top-btn" title="Fullscreen" id="toggle-fullscreen">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" />
+        </svg>
+      </button>
+      <button class="top-btn active" title="Snapshot" id="download-png">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
+          <circle cx="12" cy="13" r="4" />
+        </svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- Side Bar (Now using React LHSToolbar - mounted programmatically) -->
+
+  <!-- Main Content -->
+  <div id="main-content">
+    <div id="chart" data-debug-rps="true">
+      <div id="ohlc-legend" class="ohlc-legend">
+        <div class="ohlc-item"><span class="ohlc-label">O</span><span id="ohlc-o" class="ohlc-value">---</span></div>
+        <div class="ohlc-item"><span class="ohlc-label">H</span><span id="ohlc-h" class="ohlc-value">---</span></div>
+        <div class="ohlc-item"><span class="ohlc-label">L</span><span id="ohlc-l" class="ohlc-value">---</span></div>
+        <div class="ohlc-item"><span class="ohlc-label">C</span><span id="ohlc-c" class="ohlc-value">---</span></div>
+        <div class="ohlc-item"><span id="ohlc-change" class="ohlc-value">---</span></div>
+      </div>
+      <div id="tooltip" data-visible="false"></div>
+      <!-- V5.2 Performance Metrics -->
+      <div id="perf-metrics">
+        <span class="v52-badge">V5.2 DELTA</span>
+        <div class="metric-row">
+          <span class="metric-label">FPS</span>
+          <span class="metric-value" id="perf-fps">--</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">Frame P95</span>
+          <span class="metric-value" id="perf-frame">--ms</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">DPR</span>
+          <span class="metric-value" id="perf-dpr">--</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">Layers</span>
+          <span class="metric-value" id="perf-layers">3</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">Momentum</span>
+          <span class="metric-value" id="perf-momentum">0.95</span>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script type="module" src="/src/main.tsx"></script>
+</body>
+
+</html>

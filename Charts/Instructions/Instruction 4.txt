@@ -1,0 +1,13 @@
+In chart-core implement:
+- FrameScheduler with a single RAF loop.
+- Invalidation flags: LAYOUT, SERIES, OVERLAY.
+- Coalesce wheel/pointer/touch events into a single per-frame intent.
+- Guarantee: pointermove only invalidates OVERLAY (unless tooltip/layout options change).
+
+Add unit tests:
+- invalidation merges correctly
+- multiple events in one frame produce one render
+
+Acceptance:
+- Demo logs renders per second; pointermove does not trigger series redraw.
+

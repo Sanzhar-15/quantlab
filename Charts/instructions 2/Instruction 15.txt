@@ -1,0 +1,10 @@
+DevEx and release readiness.
+
+- Add a minimal Getting Started doc with a copy-paste example.
+- Add migration notes from V1 to V2 (breaking changes, replacements).
+- Add a release checklist that includes perf/bundle gating and baseline rules.
+- Provide example integrations: basic, streaming, multi-axis.
+
+Acceptance:
+- Docs provide a stable onboarding path.
+- Release checklist is reproducible and enforced.

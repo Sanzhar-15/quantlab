@@ -1,0 +1,15 @@
+Add hardening:
+- Property/fuzz tests:
+  - time scale conversions
+  - binary search edge cases
+  - gaps handling
+- Visual regression:
+  - screenshot key scenes (themes, gaps, multi-series, annotations)
+- Perf invariants:
+  - ensure pointermove triggers overlay-only renders (assert via counters)
+  - ensure decimator output size bounded by ~k*plotWidth
+
+Acceptance:
+- CI runs fuzz + visual regression + perf invariants.
+- Regression failures are actionable (clear diff output + logs).
+

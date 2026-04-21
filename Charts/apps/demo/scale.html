@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Charts+ Price Scale</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #070a12;
+        color: #e6e8ec;
+        font-family: 'Space Grotesk', 'IBM Plex Sans', 'Segoe UI', sans-serif;
+      }
+      header {
+        padding: 24px 24px 0;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      h1 {
+        margin: 0;
+        font-size: 22px;
+        letter-spacing: 0.02em;
+      }
+      button {
+        background: #1b2234;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 10px;
+        color: #e6e8ec;
+        padding: 8px 14px;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        cursor: pointer;
+      }
+      button:hover {
+        border-color: rgba(255, 255, 255, 0.3);
+      }
+      #chart {
+        height: calc(100% - 84px);
+        margin: 24px;
+        border-radius: 16px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: #0b0f19;
+      }
+      p {
+        margin: 6px 0 0;
+        color: #9aa3b2;
+        font-size: 13px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div>
+        <h1>Price Scale</h1>
+        <p>Toggle linear/log on an exponential series.</p>
+      </div>
+      <button id="toggle">Switch to Log</button>
+    </header>
+    <div id="chart"></div>
+    <script type="module" src="/src/scale.ts"></script>
+  </body>
+</html>

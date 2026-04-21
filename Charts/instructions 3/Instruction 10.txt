@@ -1,0 +1,14 @@
+V3 PR10 — Macro time ticks + series semantics.
+
+Goal:
+- Macro-grade axis credibility and correct discrete behavior.
+
+Tasks:
+- Calendar-aligned time ticks with stable selection under small pan/zoom.
+- Add per-series renderMode: linear | step.
+- Add per-series sampleMode: nearest | linear | hold.
+- Add chart-level gapThresholdMs to break lines on large gaps.
+
+Acceptance:
+- Time ticks stable for 30Y and 2Y views.
+- Tests cover step/hold sampling and gap threshold behavior.

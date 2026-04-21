@@ -1,0 +1,14 @@
+V4 PR3 - ChartRuntime fairness and frame budget.
+
+Goal:
+- Prevent N charts from causing N frame costs on dashboard pages.
+
+Tasks:
+- Add a per-frame time budget in packages/chart-render-canvas2d/src/chart-runtime.ts.
+- Use priority tiers (interacting > visible > idle) and rotate handles to avoid starvation.
+- Carry over remaining charts to the next frame when budget is exceeded.
+- Keep visibility pausing intact (IntersectionObserver).
+
+Acceptance:
+- Scenario F shows stable frame times with 12 charts, only visible charts render.
+- No chart is starved for more than one frame under load.

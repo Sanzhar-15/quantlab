@@ -1,0 +1,12 @@
+V3 PR11 — Long-history compaction (LOD-only retention).
+
+Goal:
+- Bounded memory with accurate overview for infinite history.
+
+Tasks:
+- Add rawRetentionMs policy: keep raw data near visible window.
+- Keep LOD-only outside retention; optional rehydrate via DataProvider.
+
+Acceptance:
+- Scenario D/E memory trend remains bounded.
+- Zoom-in rehydrates when provider is available; otherwise degrades gracefully.

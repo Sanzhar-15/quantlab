@@ -1,0 +1,11 @@
+Add a Worker pipeline for LOD building.
+
+- Build LOD levels off-main-thread using Transferable arrays.
+- Progressive updates: coarse LOD first, refined levels later.
+- Optional SharedArrayBuffer path when COOP/COEP is available.
+- Fallback to main-thread chunking with idle callbacks/time slicing.
+
+Acceptance:
+- Scenario C loads without long UI thread stalls.
+- Worker builds can be canceled safely.
+- Tests cover progressive readiness and fallback path.

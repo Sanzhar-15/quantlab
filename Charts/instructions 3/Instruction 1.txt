@@ -1,0 +1,21 @@
+V3 PR1 — V3 contract + perf gates D/E/F + instrumentation.
+
+Goal:
+- Lock V3 contract and make new improvements measurable.
+
+Tasks:
+- Create docs/12_v3_contract.md and docs/13_v3_perf_gates.md.
+- Extend perf harness with scenarios D/E/F:
+  - D: 10 series x 2M points, mixed axes, irregular timestamps.
+  - E: streaming ingest 10k pts/sec for 60s, live auto-scroll.
+  - F: dashboard with 12 charts, only 4 visible.
+- Add instrumentation:
+  - per-layer rerender counts (underlay/series/overlay)
+  - per-chart RAF participation
+  - worker queue depth + time spent
+  - input latency (RAF-based) + optional EventTiming column if available.
+
+Acceptance:
+- Perf JSON includes new scenarios and counters.
+- Overlay-only invariant is asserted on pointermove.
+- Baselines can be recorded on pinned hardware.

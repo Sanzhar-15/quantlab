@@ -1,0 +1,13 @@
+Implement crosshair:
+- Overlay-only render: vertical + horizontal lines + optional focus band (cheap fillRect)
+- Emit onCrosshairMove payload:
+  - time under cursor (xToTime)
+  - nearest data sample per series AND optional linear interpolation mode:
+    - mode: 'nearest' (default for discrete macro points)
+    - mode: 'interpolate' (optional for continuous series)
+- Provide seriesValues map with raw + formatted values.
+
+Acceptance:
+- Demo renders external HTML tooltip from emitted events.
+- Pointermove does not rerender series/grid layers.
+

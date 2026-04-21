@@ -1,0 +1,20 @@
+V4 PR1 - V4 contract + perf gates + instrumentation.
+
+Goal:
+- Lock V4 scope and make every change measurable.
+
+Tasks:
+- Create docs/14_v4_contract.md and docs/15_v4_perf_gates.md.
+- Confirm perf harness includes scenarios D/E/F and that they are exercised in tests/perf.spec.ts for charts-plus.
+- Add instrumentation to charts-plus debug:
+  - per-layer render counts (underlay/layout/series/overlay)
+  - per-chart RAF participation
+  - worker queue depth + total time (LOD + chunk LOD)
+  - allocation stats per frame for decimators
+- Wire perf harness to record the new counters in payloads.
+- Assert pointermove overlay-only invariant in perf-invariants (no series/layout invalidation).
+
+Acceptance:
+- Perf JSON includes new counters and D/E/F results.
+- Overlay-only pointermove invariant is enforced.
+- Baselines can be recorded and compared without regressions.

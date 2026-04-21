@@ -1,0 +1,13 @@
+Implement DataProvider and chunked storage in chart-core.
+
+- Define a DataProvider interface: range fetch + streaming append.
+- Add a chunked columnar store (time/value typed arrays) with fixed chunk sizes.
+- Support ring-buffer mode for real-time feeds; define monotonic time policy for out-of-order data.
+- Provide fast binary search across chunks.
+- Track per-chunk stats (min/max/variance, gap count) incrementally.
+- Define prefetch window behavior and backpressure rules for streaming feeds.
+
+Acceptance:
+- Unit tests for append/updateLast/out-of-order handling and binary search across chunks.
+- No object-per-point allocations in hot paths.
+- Chunk stats used without rescanning visible data.

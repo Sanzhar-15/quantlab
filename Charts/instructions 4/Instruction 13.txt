@@ -1,0 +1,17 @@
+V4 PR13 - Hardening and regression suite.
+
+Goal:
+- Lock in V4 gains and prevent backsliding.
+
+Tasks:
+- Add visual regression scenes for:
+  - pan cache shifting (no seams or blur)
+  - streaming + auto-scroll
+  - multi-pane crosshair
+- Add fuzz/property tests for patchExisting, gaps, and sampling modes.
+- Add dashboard correctness test: offscreen charts should not render.
+- Update perf baselines for scenarios D/E/F.
+
+Acceptance:
+- CI prevents regressions in V4 defining features.
+- Visual and perf suites pass.

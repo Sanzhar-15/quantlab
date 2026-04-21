@@ -1,0 +1,13 @@
+Expand the perf harness to capture V2 metrics.
+
+- Add input-to-paint measurement for pointermove, wheel zoom, and drag pan.
+- Add memory sampling (heap + working set) per scenario; keep sample intervals in JSON.
+- Record long task counts.
+- Store metadata (browser version, OS, CPU class, DPR, seed, duration, sample window).
+- Add a warm-up pass; collect >= 5s of samples per scenario per library.
+- Add baseline update rules and a CI policy (scheduled heavy perf, PR smoke + invariants).
+
+Acceptance:
+- Perf results JSON includes input-to-paint, memory samples, and metadata.
+- Baseline comparison gates on median/p95 and input-to-paint.
+- Docs note how to record baselines for a machine class and how CI gates apply.

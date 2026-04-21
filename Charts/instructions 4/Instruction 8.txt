@@ -1,0 +1,14 @@
+V4 PR8 - Tick/label stability and grid caching.
+
+Goal:
+- Stop tick/label jitter and reduce unnecessary grid work during interaction.
+
+Tasks:
+- Add hysteresis to PriceScale tick selection (mirror TimeScale behavior).
+- Compute x tick count from plot width and label widths to avoid collisions.
+- Cache grid and axis layers; redraw only on range/scale/theme/size changes.
+- Ensure label cache invalidation on theme/resize.
+
+Acceptance:
+- Tick labels remain stable under small pan/zoom.
+- Grid and axis redraw counts drop during drag.

@@ -1,0 +1,13 @@
+V4 PR11 - Memory and GC discipline.
+
+Goal:
+- Remove GC spikes that show up as drag stutter.
+
+Tasks:
+- Add pooled buffers to ChunkedLineDecimator (mirror LineDecimator pool behavior).
+- Add LRU bounds to LabelMeasureCache to cap growth.
+- Audit and remove allocations in hot paths where possible.
+
+Acceptance:
+- Allocation stats per frame drop measurably.
+- Memory remains stable in scenario D/E.

@@ -1,0 +1,12 @@
+V3 PR9 — SyncGroup for multi-chart dashboards.
+
+Goal:
+- Sync time range + crosshair across charts without render storms.
+
+Tasks:
+- Add createSyncGroup() with origin-tagging to prevent loops.
+- Batch sync updates through ChartRuntime.
+
+Acceptance:
+- Demo: 4 charts sync pan/zoom/crosshair.
+- Scenario F stays within render budget.

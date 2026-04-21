@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Charts+ Crispness</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #070a12;
+        color: #e6e8ec;
+        font-family: 'Space Grotesk', 'IBM Plex Sans', 'Segoe UI', sans-serif;
+      }
+      header {
+        padding: 24px 24px 0;
+      }
+      h1 {
+        margin: 0;
+        font-size: 22px;
+        letter-spacing: 0.02em;
+      }
+      p {
+        margin: 8px 0 0;
+        color: #9aa3b2;
+        font-size: 13px;
+      }
+      #grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+        gap: 16px;
+        padding: 24px;
+      }
+      .card {
+        background: #0b0f19;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 12px;
+        padding: 12px;
+        display: grid;
+        gap: 10px;
+      }
+      .label {
+        font-size: 12px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: #7f8896;
+      }
+      .canvas-host {
+        width: 100%;
+        height: 160px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Canvas Crispness</h1>
+      <p>1px strokes snapped for DPR 1, 1.25, 1.5, and 2 (simulated).</p>
+    </header>
+    <div id="grid"></div>
+    <script type="module" src="/src/crispness.ts"></script>
+  </body>
+</html>

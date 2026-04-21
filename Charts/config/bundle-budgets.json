@@ -1,0 +1,14 @@
+{
+  "corePlusCanvas2d": {
+    "softGzipBytes": 62464,
+    "hardGzipBytes": 65536
+  },
+  "optionalWorkers": {
+    "softGzipBytes": 8192,
+    "hardGzipBytes": 10240
+  },
+  "optionalWebgl": {
+    "softGzipBytes": 8192,
+    "hardGzipBytes": 10240
+  }
+}

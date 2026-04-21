@@ -1,0 +1,24 @@
+{
+  "name": "@charts-plus/chart-indicators",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "@charts-plus/chart-core": "0.0.0"
+  },
+  "scripts": {
+    "build": "npx tsc --build tsconfig.json && tsup src/index.ts --format esm --sourcemap --minify --tsconfig tsconfig.json"
+  }
+}
+

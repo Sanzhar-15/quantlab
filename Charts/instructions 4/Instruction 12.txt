@@ -1,0 +1,14 @@
+V4 PR12 - Multi-pane and SyncGroup hardening.
+
+Goal:
+- Deliver institutional multi-pane and cross-chart sync behavior.
+
+Tasks:
+- Ensure stacked panes share a time scale with independent y scales.
+- Crosshair rules: vertical line across panes, horizontal in active pane only.
+- SyncGroup should batch updates via runtime and prevent feedback loops.
+- Add a demo scene with 3 panes and 4 synced charts.
+
+Acceptance:
+- Multi-pane behavior is correct and responsive.
+- SyncGroup does not create update loops or perf regressions.

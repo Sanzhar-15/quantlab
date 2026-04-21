@@ -1,0 +1,13 @@
+V3 PR4 — Revisions/backfills (patchExisting + dirty ranges).
+
+Goal:
+- Efficient macro revisions without full LOD rebuilds.
+
+Tasks:
+- Add series.patchExisting(points) for replacing existing timestamps only.
+- Track dirty ranges to limit LOD/decimator recomputation.
+- For DataProvider, refetch ranges if configured; do not add new update types.
+
+Acceptance:
+- Patching a small window does not rebuild full LOD.
+- Tests cover gaps, formatting, and crosshair correctness.

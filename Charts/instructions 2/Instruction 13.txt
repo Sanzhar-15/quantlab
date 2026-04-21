@@ -1,0 +1,10 @@
+Optional WebGL backend (only if Phase 4 misses targets).
+
+- Prototype a WebGL line renderer with min/max envelope support.
+- Keep Canvas2D for text/axes and provide a clean fallback.
+- Add a build flag to include/exclude WebGL.
+
+Acceptance:
+- Measurable performance win vs Worker 2D.
+- Bundle size remains within hard cap.
+- Visual parity with Canvas2D for lines and gaps.

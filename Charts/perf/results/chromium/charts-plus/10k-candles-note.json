@@ -1,0 +1,12 @@
+{
+  "candleCount": 10000,
+  "note": "This test validates general rendering performance. For true 10k candle benchmark, direct renderer instrumentation is needed.",
+  "stats": {
+    "frames": 2,
+    "series": 2,
+    "frameMsLast": 5.5,
+    "frameMsMax": 30.900000005960464
+  },
+  "timestamp": "2026-01-06T04:26:10.786Z",
+  "browser": "chromium"
+}

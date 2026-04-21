@@ -1,0 +1,12 @@
+Implement interactions:
+- Pointer drag pan (capture)
+- Wheel zoom anchored to cursor time
+- Touch pinch zoom + pan (two-finger)
+- Constraints:
+  - min/max zoom (time range bounds)
+  - clamp to data extents (with configurable padding)
+
+Acceptance:
+- Playwright interaction tests pass across scenarios.
+- No scroll-jank (passive listeners where appropriate).
+

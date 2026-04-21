@@ -1,0 +1,16 @@
+Implement a deterministic perf harness:
+- Dataset generators for irregular timestamps (random jitter around base cadence) and optional missing values.
+- Playwright script that:
+  1) loads a page that renders each scenario (A/B/C),
+  2) performs scripted interactions: wheel zoom in/out, drag pan, pointermove crosshair sweep,
+  3) measures: frame times (requestAnimationFrame deltas), long tasks, and total renders,
+  4) writes JSON results.
+
+Implement baseline storage:
+- Store baseline JSON under perf/baselines/<browser>/<scenario>.json
+- CI compares current results vs baseline: fail if median frame time regresses > 15% for any scenario.
+
+Acceptance:
+- One command runs harness locally and produces JSON.
+- CI performs comparison and can fail on forced regression.
+

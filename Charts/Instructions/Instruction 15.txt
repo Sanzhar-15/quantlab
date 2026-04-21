@@ -1,0 +1,11 @@
+Add multi-series support:
+- chart.addLineSeries(options) returns handle with id
+- per-series styles: stroke width, dash, opacity, color token key
+- legend aggregation API:
+  - chart.getSeriesList()
+  - crosshair event includes all visible series values
+
+Acceptance:
+- Demo: 5 series overlayed, toggles on/off without reinitializing chart.
+- Autoscale: either combined scale or per-axis scale option (documented).
+
