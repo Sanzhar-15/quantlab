@@ -1,0 +1,67 @@
+[
+  {
+    "id": "stationarity-suite",
+    "label": "Stationarity Suite",
+    "description": "ADF + KPSS + PP + Hurst with synthesised conclusion. Runs the core battery of stationarity and long-memory tests and produces a unified verdict on whether the series is stationary, trend-stationary, or unit-root.",
+    "section": "statistics",
+    "steps": [
+      "augmented-dickey-fuller",
+      "kpss",
+      "phillips-perron",
+      "hurst-exponent-rs",
+      "variance-ratio"
+    ]
+  },
+  {
+    "id": "pairs-trading-pipeline",
+    "label": "Pairs Trading Pipeline",
+    "description": "Pair screening, cointegration testing, Kalman hedge ratio estimation, spread z-score generation, and half-life calculation. End-to-end pipeline that takes a universe of instruments and produces a trade-ready mean-reversion signal for the best cointegrated pair.",
+    "section": "strategy",
+    "steps": [
+      "pair-universe-screening",
+      "engle-granger-two-step",
+      "kalman-filter-hedge",
+      "z-score-signal-generation",
+      "half-life-mean-reversion"
+    ]
+  },
+  {
+    "id": "garch-diagnostic-suite",
+    "label": "GARCH Diagnostic Suite",
+    "description": "ARCH-LM pre-test, GARCH model fitting, standardised-residual ARCH-LM check, distribution diagnostics, and VaR backtesting. Validates the presence of conditional heteroskedasticity, fits a volatility model, and stress-tests the resulting Value-at-Risk estimates.",
+    "section": "statistics",
+    "steps": [
+      "arch-lm",
+      "garch",
+      "arch-lm-std-residuals",
+      "distribution-diagnostics",
+      "var-backtesting"
+    ]
+  },
+  {
+    "id": "strategy-validation-pipeline",
+    "label": "Strategy Validation Pipeline",
+    "description": "Walk-forward optimisation, Probability of Backtest Overfitting, Deflated Sharpe Ratio, Monte Carlo permutation testing, and regime-conditional validation. A rigorous multi-stage pipeline that guards against overfitting and confirms strategy robustness across market regimes.",
+    "section": "strategy",
+    "steps": [
+      "walk-forward-optimisation",
+      "probability-backtest-overfitting",
+      "deflated-sharpe-ratio",
+      "monte-carlo-permutation-test",
+      "regime-conditional-validation"
+    ]
+  },
+  {
+    "id": "fixed-income-suite",
+    "label": "Fixed Income Suite",
+    "description": "Nelson-Siegel yield curve fitting, duration and modified duration, convexity, carry and roll-down analysis, and PCA on yield changes. Provides a complete fixed-income analytics stack from curve construction through risk decomposition.",
+    "section": "statistics",
+    "steps": [
+      "nelson-siegel",
+      "duration-modified-duration",
+      "convexity",
+      "carry-roll-down",
+      "pca-yield-changes"
+    ]
+  }
+]
