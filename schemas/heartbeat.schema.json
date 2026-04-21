@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quantlab.io/schemas/heartbeat.schema.json",
+  "title": "Daemon Heartbeat",
+  "description": "Heartbeat message from daemon to UI",
+  "type": "object",
+  "required": ["sessionId", "status", "timestamp"],
+  "properties": {
+    "sessionId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["active", "paused", "market_closed", "error"],
+      "description": "Daemon state"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "uptime": {
+      "type": "integer",
+      "description": "Seconds since daemon start"
+    },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "ordersSubmitted": {
+          "type": "integer"
+        },
+        "ordersFilled": {
+          "type": "integer"
+        },
+        "positionCount": {
+          "type": "integer"
+        },
+        "equity": {
+          "type": "string"
+        },
+        "dayPnl": {
+          "type": "string"
+        },
+        "memoryUsageMb": {
+          "type": "number"
+        }
+      }
+    },
+    "brokerConnection": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["connected", "disconnected", "reconnecting"]
+        },
+        "lastPing": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "nextMarketOpen": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Next market open time (if market_closed)"
+    }
+  }
+}

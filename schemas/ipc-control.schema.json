@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quantlab.io/schemas/ipc-control.schema.json",
+  "title": "Quantlab IPC Control Messages",
+  "description": "Control message types for session and order management",
+  "$defs": {
+    "sessionStart": {
+      "type": "object",
+      "required": ["sessionId", "strategyPath", "broker", "riskLimits"],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "strategyPath": {
+          "type": "string",
+          "description": "Path to strategy file"
+        },
+        "broker": {
+          "type": "string",
+          "enum": ["alpaca", "mock"]
+        },
+        "riskLimits": {
+          "$ref": "#/$defs/riskLimits"
+        },
+        "paperTrading": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "sessionStop": {
+      "type": "object",
+      "required": ["sessionId"],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "reason": {
+          "type": "string",
+          "enum": ["user_requested", "risk_limit", "error", "market_close"]
+        }
+      }
+    },
+    "sessionPause": {
+      "type": "object",
+      "required": ["sessionId"],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "format": "uuid"
+        }
+      }
+    },
+    "sessionResume": {
+      "type": "object",
+      "required": ["sessionId"],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "format": "uuid"
+        }
+      }
+    },
+    "orderSubmit": {
+      "type": "object",
+      "required": ["orderId", "symbol", "side", "quantity", "orderType"],
+      "properties": {
+        "orderId": {
+          "type": "string",
+          "pattern": "^ord-[a-f0-9-]{36}$"
+        },
+        "symbol": {
+          "type": "string"
+        },
+        "side": {
+          "type": "string",
+          "enum": ["buy", "sell"]
+        },
+        "quantity": {
+          "type": "string",
+          "description": "Decimal as string for precision"
+        },
+        "orderType": {
+          "type": "string",
+          "enum": ["market", "limit", "stop", "stop_limit"]
+        },
+        "limitPrice": {
+          "type": "string",
+          "description": "Required for limit and stop_limit orders"
+        },
+        "stopPrice": {
+          "type": "string",
+          "description": "Required for stop and stop_limit orders"
+        },
+        "timeInForce": {
+          "type": "string",
+          "enum": ["gfd", "gtc", "ioc"],
+          "default": "gfd"
+        }
+      }
+    },
+    "orderCancel": {
+      "type": "object",
+      "required": ["orderId"],
+      "properties": {
+        "orderId": {
+          "type": "string",
+          "pattern": "^ord-[a-f0-9-]{36}$"
+        }
+      }
+    },
+    "orderModify": {
+      "type": "object",
+      "required": ["orderId"],
+      "properties": {
+        "orderId": {
+          "type": "string",
+          "pattern": "^ord-[a-f0-9-]{36}$"
+        },
+        "quantity": {
+          "type": "string"
+        },
+        "limitPrice": {
+          "type": "string"
+        },
+        "stopPrice": {
+          "type": "string"
+        }
+      }
+    },
+    "flattenRequest": {
+      "type": "object",
+      "required": ["sessionId"],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "symbol": {
+          "type": "string",
+          "description": "Optional: flatten specific symbol only"
+        },
+        "reason": {
+          "type": "string",
+          "enum": ["user_requested", "risk_limit", "emergency"]
+        }
+      }
+    },
+    "riskLimits": {
+      "type": "object",
+      "properties": {
+        "maxPositionSize": {
+          "type": "string",
+          "description": "Max position size as fraction of equity"
+        },
+        "maxExposure": {
+          "type": "string",
+          "description": "Max gross exposure as fraction of equity"
+        },
+        "maxDrawdown": {
+          "type": "string",
+          "description": "Max drawdown before circuit breaker"
+        },
+        "consecutiveLossLimit": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "dailyLossLimit": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

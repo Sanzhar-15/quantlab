@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quantlab.io/schemas/error.schema.json",
+  "title": "Quantlab Error",
+  "description": "Structured error format for consistent error reporting",
+  "type": "object",
+  "required": ["code", "message", "category", "severity", "timestamp"],
+  "properties": {
+    "code": {
+      "type": "string",
+      "pattern": "^[A-Z_]+$",
+      "description": "Error code (e.g., BROKER_ORDER_REJECTED)"
+    },
+    "message": {
+      "type": "string",
+      "description": "Human-readable error message"
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "validation",
+        "broker",
+        "data",
+        "engine",
+        "network",
+        "permission",
+        "configuration",
+        "resource",
+        "internal"
+      ],
+      "description": "Error category"
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["error", "warning", "info"],
+      "description": "Error severity level"
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Additional context (order_id, symbol, etc.)"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the error occurred (UTC)"
+    },
+    "recoverable": {
+      "type": "boolean",
+      "default": false,
+      "description": "Whether the operation can be retried"
+    },
+    "userAction": {
+      "type": "string",
+      "description": "Suggested action for the user"
+    },
+    "stackTrace": {
+      "type": "string",
+      "description": "Stack trace (dev mode only)"
+    },
+    "correlationId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "ID to correlate related errors"
+    }
+  }
+}

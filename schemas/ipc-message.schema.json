@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quantlab.io/schemas/ipc-message.schema.json",
+  "title": "Quantlab IPC Message",
+  "description": "JSON-RPC 2.0 message format for IPC communication between UI and daemon",
+  "oneOf": [
+    { "$ref": "#/$defs/request" },
+    { "$ref": "#/$defs/response" },
+    { "$ref": "#/$defs/notification" }
+  ],
+  "$defs": {
+    "request": {
+      "type": "object",
+      "required": ["jsonrpc", "method", "id"],
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "type": "string",
+          "description": "Method name to invoke"
+        },
+        "params": {
+          "description": "Method parameters"
+        },
+        "id": {
+          "type": "string",
+          "description": "Request identifier for correlation"
+        }
+      },
+      "additionalProperties": false
+    },
+    "response": {
+      "type": "object",
+      "required": ["jsonrpc", "id"],
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "result": {
+          "description": "Successful result"
+        },
+        "error": {
+          "$ref": "#/$defs/error"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "notification": {
+      "type": "object",
+      "required": ["jsonrpc", "method"],
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Notification parameters"
+        }
+      },
+      "additionalProperties": false
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "type": "integer",
+          "description": "Error code"
+        },
+        "message": {
+          "type": "string",
+          "description": "Error message"
+        },
+        "data": {
+          "description": "Additional error data"
+        }
+      }
+    }
+  }
+}

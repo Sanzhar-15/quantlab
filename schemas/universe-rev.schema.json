@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quantlab.io/schemas/universe-rev.schema.json",
+  "title": "UniverseRev",
+  "description": "Universe revision tracking for backtest reproducibility",
+  "type": "object",
+  "required": ["id", "name", "type", "dateRange", "hash"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique identifier for this universe revision"
+    },
+    "name": {
+      "type": "string",
+      "description": "Universe name"
+    },
+    "type": {
+      "type": "string",
+      "enum": ["static", "point_in_time"],
+      "description": "static: fixed list, point_in_time: historically accurate"
+    },
+    "members": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "List of symbols (for static universe)"
+    },
+    "source": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["file", "api", "custom"]
+        },
+        "path": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        }
+      },
+      "description": "Data source for point-in-time universe"
+    },
+    "dateRange": {
+      "type": "object",
+      "required": ["start", "end"],
+      "properties": {
+        "start": {
+          "type": "string",
+          "format": "date"
+        },
+        "end": {
+          "type": "string",
+          "format": "date"
+        }
+      }
+    },
+    "hash": {
+      "type": "string",
+      "description": "SHA-256 hash of universe definition"
+    },
+    "survivorshipBiasWarning": {
+      "type": "boolean",
+      "default": false,
+      "description": "True if static universe may have survivorship bias"
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

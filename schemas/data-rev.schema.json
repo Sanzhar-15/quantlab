@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quantlab.io/schemas/data-rev.schema.json",
+  "title": "DataRev",
+  "description": "Data revision tracking for reproducibility and provenance",
+  "type": "object",
+  "required": ["id", "hash", "hashMethod", "symbol", "timeframe", "dateRange", "source", "rowCount", "schema"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique identifier for this data revision"
+    },
+    "hash": {
+      "type": "string",
+      "description": "SHA-256 hash of data content"
+    },
+    "hashMethod": {
+      "type": "string",
+      "enum": ["full", "sampled"],
+      "description": "full: entire file, sampled: first/last 10MB + every 100th row"
+    },
+    "symbol": {
+      "type": "string",
+      "description": "Symbol identifier (NFC normalized, uppercase)"
+    },
+    "timeframe": {
+      "type": "string",
+      "enum": ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w", "1M"],
+      "description": "Data timeframe"
+    },
+    "dateRange": {
+      "type": "object",
+      "required": ["start", "end"],
+      "properties": {
+        "start": {
+          "type": "string",
+          "format": "date",
+          "description": "Start date (inclusive)"
+        },
+        "end": {
+          "type": "string",
+          "format": "date",
+          "description": "End date (inclusive)"
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["file", "api", "synthetic"],
+          "description": "Data source type"
+        },
+        "path": {
+          "type": "string",
+          "description": "File path (for file source)"
+        },
+        "provider": {
+          "type": "string",
+          "description": "API provider name (for api source)"
+        },
+        "fetchedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When data was fetched"
+        }
+      }
+    },
+    "rowCount": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of rows in dataset"
+    },
+    "schema": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "type"],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["timestamp", "decimal", "integer", "string"]
+          },
+          "nullable": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      },
+      "description": "Column schema"
+    },
+    "adjusted": {
+      "type": "boolean",
+      "default": true,
+      "description": "Whether data is adjusted for corporate actions"
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

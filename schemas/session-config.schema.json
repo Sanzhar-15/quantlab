@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quantlab.io/schemas/session-config.schema.json",
+  "title": "Session Configuration",
+  "description": "Configuration for backtest or live trading session",
+  "type": "object",
+  "required": ["id", "type", "strategyPath"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Session identifier"
+    },
+    "type": {
+      "type": "string",
+      "enum": ["backtest", "paper", "live"],
+      "description": "Session type"
+    },
+    "strategyPath": {
+      "type": "string",
+      "description": "Path to strategy file"
+    },
+    "initialCash": {
+      "type": "string",
+      "default": "100000",
+      "description": "Initial cash as decimal string"
+    },
+    "dateRange": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "type": "string",
+          "format": "date"
+        },
+        "end": {
+          "type": "string",
+          "format": "date"
+        }
+      },
+      "description": "Date range for backtest"
+    },
+    "universe": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["static", "point_in_time"]
+        },
+        "symbols": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "source": {
+          "type": "string"
+        }
+      }
+    },
+    "dataProvider": {
+      "type": "string",
+      "enum": ["alpaca", "file", "mock"],
+      "default": "alpaca"
+    },
+    "broker": {
+      "type": "string",
+      "enum": ["alpaca", "mock"],
+      "description": "Broker for live/paper trading"
+    },
+    "calendar": {
+      "type": "string",
+      "default": "nyse",
+      "description": "Market calendar name"
+    },
+    "fillAssumption": {
+      "type": "string",
+      "enum": ["next_open", "next_close", "typical_price"],
+      "default": "next_open"
+    },
+    "slippage": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string",
+          "enum": ["none", "fixed_bps", "volatility"],
+          "default": "none"
+        },
+        "value": {
+          "type": "string",
+          "description": "Slippage value (bps for fixed_bps)"
+        }
+      }
+    },
+    "commission": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string",
+          "enum": ["none", "per_share", "per_trade"],
+          "default": "none"
+        },
+        "value": {
+          "type": "string"
+        }
+      }
+    },
+    "riskLimits": {
+      "type": "object",
+      "properties": {
+        "maxPositionSize": {
+          "type": "string",
+          "default": "0.10"
+        },
+        "maxExposure": {
+          "type": "string",
+          "default": "1.0"
+        },
+        "maxDrawdown": {
+          "type": "string",
+          "default": "0.20"
+        },
+        "consecutiveLossLimit": {
+          "type": "integer",
+          "default": 3
+        }
+      }
+    },
+    "shortSelling": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "borrowRate": {
+          "type": "string",
+          "default": "0.02",
+          "description": "Annual borrow rate"
+        }
+      }
+    },
+    "debug": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "captureConditions": {
+          "type": "boolean",
+          "default": true
+        },
+        "maxFileSize": {
+          "type": "string",
+          "default": "1GB"
+        }
+      }
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}
