@@ -1,0 +1,141 @@
+name: Performance Benchmark
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'engine/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'engine/**'
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  benchmark:
+    name: Run Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        working-directory: engine
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,benchmark]"
+
+      - name: Run benchmarks
+        working-directory: engine
+        run: |
+          pytest -m benchmark --benchmark-json=benchmark-results.json -v
+        continue-on-error: true
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: engine/benchmark-results.json
+          retention-days: 90
+
+      - name: Download baseline from main
+        if: github.event_name == 'pull_request'
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          name: benchmark-results
+          branch: main
+          workflow: engine-benchmark.yml
+          path: engine/baseline/
+        continue-on-error: true
+
+      - name: Check regression (vs main)
+        if: github.event_name == 'pull_request'
+        working-directory: engine
+        run: |
+          if [ -f baseline/benchmark-results.json ]; then
+            python -m benchmarks.check \
+              --baseline baseline/benchmark-results.json \
+              --current benchmark-results.json \
+              --threshold 1.5
+          else
+            echo "No baseline found on main branch, skipping regression check"
+          fi
+
+  memory-profile:
+    name: Memory Profile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        working-directory: engine
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,benchmark]"
+
+      - name: Run memory profiling
+        working-directory: engine
+        run: |
+          python -c "
+          import tracemalloc
+          import json
+          from decimal import Decimal
+          from pathlib import Path
+
+          tracemalloc.start()
+
+          # Profile backtest engine memory usage
+          from quantlab.backtest.config import BacktestConfig
+          from quantlab.backtest.core import BacktestEngine
+
+          config = BacktestConfig(
+              start_date=None,
+              end_date=None,
+              initial_capital=Decimal('100000'),
+              symbols=['BENCH'],
+          )
+          engine = BacktestEngine(config)
+
+          snapshot = tracemalloc.take_snapshot()
+          top_stats = snapshot.statistics('lineno')
+
+          results = {
+              'peak_mb': tracemalloc.get_traced_memory()[1] / (1024 * 1024),
+              'current_mb': tracemalloc.get_traced_memory()[0] / (1024 * 1024),
+              'top_allocations': [
+                  {'file': str(s.traceback), 'size_kb': s.size / 1024}
+                  for s in top_stats[:20]
+              ],
+          }
+
+          tracemalloc.stop()
+
+          with open('memory-profile.json', 'w') as f:
+              json.dump(results, f, indent=2)
+
+          print(f'Peak memory: {results[\"peak_mb\"]:.2f} MB')
+          print(f'Current memory: {results[\"current_mb\"]:.2f} MB')
+          for alloc in results['top_allocations'][:10]:
+              print(f'  {alloc[\"size_kb\"]:.1f} KB - {alloc[\"file\"]}')
+          "
+
+      - name: Upload memory profile
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-profile
+          path: engine/memory-profile.json
+          retention-days: 90

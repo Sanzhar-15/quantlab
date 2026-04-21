@@ -1,0 +1,135 @@
+name: Engine Security Scan
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'engine/**'
+      - '.github/workflows/engine-security.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'engine/**'
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly Monday 6am UTC
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  dependency-scan:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install scanning tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install safety pip-audit
+
+      - name: Check dependencies for vulnerabilities (pip-audit)
+        working-directory: engine
+        run: |
+          pip install -e "."
+          pip-audit --format json --output pip-audit-report.json || true
+          pip-audit --format columns || true
+
+      - name: Upload pip-audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-report
+          path: engine/pip-audit-report.json
+          retention-days: 30
+
+  static-analysis:
+    name: Static Security Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Bandit
+        run: pip install bandit[toml]
+
+      - name: Run Bandit static analysis
+        working-directory: engine
+        run: |
+          bandit -r quantlab/ \
+            -f json -o bandit-report.json \
+            --severity-level medium \
+            --confidence-level medium \
+            -x "quantlab/tests/*" || true
+
+      - name: Display Bandit summary
+        working-directory: engine
+        run: |
+          bandit -r quantlab/ \
+            -f screen \
+            --severity-level medium \
+            --confidence-level medium \
+            -x "quantlab/tests/*" || true
+
+      - name: Upload Bandit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: engine/bandit-report.json
+          retention-days: 30
+
+  secret-scan:
+    name: Hardcoded Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check for hardcoded credentials
+        working-directory: engine
+        run: |
+          echo "Scanning for hardcoded secrets in engine/quantlab/..."
+          FOUND=0
+
+          # Check for hardcoded API keys
+          if grep -rn 'api_key\s*=\s*["\x27][A-Za-z0-9]' quantlab/ --include="*.py" | grep -v 'test' | grep -v '# ' | grep -v 'get(' | grep -v 'environ'; then
+            echo "WARNING: Possible hardcoded API key found"
+            FOUND=1
+          fi
+
+          # Check for hardcoded secrets
+          if grep -rn 'api_secret\s*=\s*["\x27][A-Za-z0-9]' quantlab/ --include="*.py" | grep -v 'test' | grep -v '# ' | grep -v 'get(' | grep -v 'environ'; then
+            echo "WARNING: Possible hardcoded API secret found"
+            FOUND=1
+          fi
+
+          # Check for hardcoded passwords
+          if grep -rn 'password\s*=\s*["\x27][A-Za-z0-9]' quantlab/ --include="*.py" | grep -v 'test' | grep -v '# ' | grep -v 'get(' | grep -v 'environ' | grep -v 'argparse'; then
+            echo "WARNING: Possible hardcoded password found"
+            FOUND=1
+          fi
+
+          # Check for os.environ direct access in credential paths
+          if grep -rn 'os\.environ\[.*KEY\|os\.environ\[.*SECRET\|os\.environ\[.*PASSWORD' quantlab/ --include="*.py" | grep -v 'test' | grep -v '# '; then
+            echo "WARNING: Direct os.environ access for credentials (should use secrets manager)"
+            FOUND=1
+          fi
+
+          if [ "$FOUND" -eq 0 ]; then
+            echo "No hardcoded secrets found"
+          else
+            echo "Review findings above"
+            exit 1
+          fi
