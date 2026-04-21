@@ -266,8 +266,11 @@ export class ApplyCodeBlockOperation {
 		const codeBlock = { code, resource: uri, markdownBeforeBlock: undefined };
 		const codeMapper = this.codeMapperService.providers[0]?.displayName;
 		if (!codeMapper) {
-			this.notify(localize('applyCodeBlock.noCodeMapper', "No code mapper available."));
-			return undefined;
+			// Fallback: insert at cursor position instead of failing
+			this.notify(localize('applyCodeBlock.noCodeMapperFallback', "No AI code mapper available. Inserting at cursor position instead."));
+			const insertOperation = this.instantiationService.createInstance(InsertCodeBlockOperation);
+			await insertOperation.run({ code, languageId: '', codeBlockIndex: 0, element: undefined as any, chatSessionResource: chatSessionResource });
+			return { editsProposed: true, codeMapper: 'insertAtCursor' };
 		}
 		let editsProposed = false;
 		const cancellationTokenSource = new CancellationTokenSource();
@@ -307,8 +310,11 @@ export class ApplyCodeBlockOperation {
 
 		const codeMapper = this.codeMapperService.providers[0]?.displayName;
 		if (!codeMapper) {
-			this.notify(localize('applyCodeBlock.noCodeMapper', "No code mapper available."));
-			return undefined;
+			// Fallback: insert at cursor position instead of failing
+			this.notify(localize('applyCodeBlock.noCodeMapperFallback', "No AI code mapper available. Inserting at cursor position instead."));
+			const insertOperation = this.instantiationService.createInstance(InsertCodeBlockOperation);
+			await insertOperation.run({ code, languageId: '', codeBlockIndex: 0, element: undefined as any, chatSessionResource: chatSessionResource });
+			return { editsProposed: true, codeMapper: 'insertAtCursor' };
 		}
 		let editsProposed = false;
 		const cancellationTokenSource = new CancellationTokenSource();

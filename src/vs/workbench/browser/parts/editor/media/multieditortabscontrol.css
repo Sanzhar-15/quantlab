@@ -107,6 +107,29 @@
 	outline-offset: -2px;
 }
 
+.monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container > .tab[data-ql-view="chart"]::before,
+.monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container > .tab[data-ql-view="action"]::before,
+.monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container > .tab[data-ql-view="trade"]::before {
+	content: '';
+	position: absolute;
+	top: 0;
+	left: 0;
+	bottom: 0;
+	width: var(--ql-view-stripe-width);
+}
+
+.monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container > .tab[data-ql-view="chart"]::before {
+	background-color: var(--ql-view-chart);
+}
+
+.monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container > .tab[data-ql-view="action"]::before {
+	background-color: var(--ql-view-action);
+}
+
+.monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container > .tab[data-ql-view="trade"]::before {
+	background-color: var(--ql-view-trade);
+}
+
 /* Tab Background Color in/active group/tab */
 .monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container > .tab {
 	background-color: var(--vscode-tab-unfocusedInactiveBackground);
@@ -493,6 +516,61 @@
 	pointer-events: none; /* don't allow tab actions to be clicked when running without tab actions */
 }
 
+/* Quantlab View Buttons */
+
+.monaco-workbench .part.editor > .content .editor-group-container > .title .quantlab-actions {
+	cursor: default;
+	flex: initial;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 0 8px 0 4px;
+	height: var(--editor-group-tab-height);
+}
+
+.monaco-workbench .part.editor > .content .editor-group-container > .title .quantlab-actions .quantlab-view-button {
+	background: transparent;
+	border: 1px solid var(--vscode-tab-border);
+	border-radius: 4px;
+	color: var(--vscode-tab-inactiveForeground);
+	cursor: pointer;
+	font-size: 11px;
+	line-height: 1;
+	padding: 4px 8px;
+}
+
+.monaco-workbench .part.editor > .content .editor-group-container.active > .title .quantlab-actions .quantlab-view-button {
+	color: var(--vscode-tab-activeForeground);
+}
+
+.monaco-workbench .part.editor > .content .editor-group-container > .title .quantlab-actions .quantlab-view-button:hover {
+	background-color: var(--vscode-tab-hoverBackground);
+	color: var(--vscode-tab-hoverForeground);
+}
+
+.monaco-workbench .part.editor > .content .editor-group-container > .title .quantlab-actions .quantlab-view-button.is-disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
+/* Data file button variant */
+.monaco-workbench .part.editor > .content .editor-group-container > .title .quantlab-actions .quantlab-data-button {
+	/* Same styling as strategy buttons */
+}
+
+/* Action button - slightly different styling to indicate it's not a view */
+.monaco-workbench .part.editor > .content .editor-group-container > .title .quantlab-actions .quantlab-action-button {
+	border-left: 1px solid var(--vscode-panel-border);
+	margin-left: 4px;
+	padding-left: 8px;
+}
+
+/* Current view indicator */
+.monaco-workbench .part.editor > .content .editor-group-container > .title .quantlab-actions .quantlab-view-button.is-current {
+	background: var(--vscode-button-secondaryBackground);
+	border-color: var(--vscode-button-secondaryBackground);
+}
+
 /* Editor Actions Toolbar */
 
 .monaco-workbench .part.editor > .content .editor-group-container > .title .editor-actions {
@@ -515,12 +593,22 @@
 	/* When tabs are wrapped, position the editor actions at the end of the very last row */
 	position: absolute;
 	bottom: 0;
+	right: var(--quantlab-actions-width, 0);
+}
+
+.monaco-workbench .part.editor > .content .editor-group-container > .title > .tabs-and-actions-container.wrapping .quantlab-actions {
+	position: absolute;
+	bottom: 0;
 	right: 0;
 }
 
 .monaco-workbench .part.editor > .content .editor-group-container > .title.two-tab-bars > .tabs-and-actions-container:first-child .editor-actions {
 
 	/* When multiple tab bars are visible, only show editor actions for the last tab bar */
+	display: none;
+}
+
+.monaco-workbench .part.editor > .content .editor-group-container > .title.two-tab-bars > .tabs-and-actions-container:first-child .quantlab-actions {
 	display: none;
 }
 

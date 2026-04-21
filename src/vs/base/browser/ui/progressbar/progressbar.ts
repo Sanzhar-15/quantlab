@@ -72,7 +72,7 @@ export class ProgressBar extends Disposable {
 
 		this.bit = document.createElement('div');
 		this.bit.classList.add('progress-bit');
-		this.bit.style.backgroundColor = options?.progressBarBackground || '#0E70C0';
+		this.bit.style.backgroundColor = options?.progressBarBackground || '#fc7432';
 		this.element.appendChild(this.bit);
 	}
 

@@ -52,6 +52,19 @@
 	margin-bottom: auto;
 }
 
+/* Quantlab activity bar separator */
+.monaco-workbench .activitybar > .content .monaco-action-bar .action-item[data-view-container-id^="quantlab-"] {
+	margin-top: 8px;
+	padding-top: 8px;
+	border-top: 1px solid var(--vscode-activityBar-border);
+}
+
+.monaco-workbench .activitybar > .content .monaco-action-bar .action-item[data-view-container-id^="quantlab-"] + .action-item[data-view-container-id^="quantlab-"] {
+	margin-top: 0;
+	padding-top: 0;
+	border-top: none;
+}
+
 /** Menu Bar */
 
 .monaco-workbench .activitybar .menubar {

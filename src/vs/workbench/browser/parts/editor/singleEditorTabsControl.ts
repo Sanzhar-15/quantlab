@@ -4,21 +4,36 @@
  *--------------------------------------------------------------------------------------------*/
 
 import './media/singleeditortabscontrol.css';
-import { EditorResourceAccessor, Verbosity, IEditorPartOptions, SideBySideEditor, preventEditorClose, EditorCloseMethod, IToolbarActions } from '../../../common/editor.js';
+import { EditorResourceAccessor, EditorsOrder, Verbosity, IEditorPartOptions, SideBySideEditor, preventEditorClose, EditorCloseMethod, IToolbarActions } from '../../../common/editor.js';
 import { EditorInput } from '../../../common/editor/editorInput.js';
 import { EditorTabsControl } from './editorTabsControl.js';
 import { ResourceLabel, IResourceLabel } from '../../labels.js';
 import { TAB_ACTIVE_FOREGROUND, TAB_UNFOCUSED_ACTIVE_FOREGROUND } from '../../../common/theme.js';
 import { EventType as TouchEventType, GestureEvent, Gesture } from '../../../../base/browser/touch.js';
-import { addDisposableListener, EventType, EventHelper, Dimension, isAncestor, DragAndDropObserver, isHTMLElement, $ } from '../../../../base/browser/dom.js';
+import { addDisposableListener, EventType, EventHelper, Dimension, isAncestor, DragAndDropObserver, isHTMLElement, clearNode, $ } from '../../../../base/browser/dom.js';
 import { CLOSE_EDITOR_COMMAND_ID, UNLOCK_GROUP_COMMAND_ID } from './editorCommands.js';
 import { Color } from '../../../../base/common/color.js';
 import { assertReturnsDefined, assertReturnsAllDefined } from '../../../../base/common/types.js';
 import { equals } from '../../../../base/common/objects.js';
-import { toDisposable } from '../../../../base/common/lifecycle.js';
+import { DisposableStore, toDisposable } from '../../../../base/common/lifecycle.js';
 import { defaultBreadcrumbsWidgetStyles } from '../../../../platform/theme/browser/defaultStyles.js';
 import { IEditorTitleControlDimensions } from './editorTitleControl.js';
 import { BreadcrumbsControlFactory } from './breadcrumbsControl.js';
+import { ICommandService } from '../../../../platform/commands/common/commands.js';
+import { computeEditorAriaLabel } from '../../editor.js';
+import { customEditorViewTypeToQuantlabView, formatQuantlabViewLabel, IQuantlabTabViewService, QuantlabTabViewStateChange, QuantlabViewType } from './quantlabViewStateService.js';
+import { CustomEditorInput } from '../../../contrib/customEditor/browser/customEditorInput.js';
+import { IContextMenuService } from '../../../../platform/contextview/browser/contextView.js';
+import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
+import { IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
+import { IKeybindingService } from '../../../../platform/keybinding/common/keybinding.js';
+import { INotificationService } from '../../../../platform/notification/common/notification.js';
+import { IQuickInputService } from '../../../../platform/quickinput/common/quickInput.js';
+import { IThemeService } from '../../../../platform/theme/common/themeService.js';
+import { IEditorResolverService } from '../../../services/editor/common/editorResolverService.js';
+import { IHostService } from '../../../services/host/browser/host.js';
+import { IEditorGroupView, IEditorGroupsView, IEditorPartsView } from './editor.js';
+import { IReadonlyEditorGroupModel } from '../../../common/editor/editorGroupModel.js';
 
 interface IRenderedEditorLabel {
 	readonly editor?: EditorInput;
@@ -27,12 +42,44 @@ interface IRenderedEditorLabel {
 
 export class SingleEditorTabsControl extends EditorTabsControl {
 
+	private static readonly QUANTLAB_CONTEXT_KEYS = new Set(['quantlab.currentView', 'quantlab.isStrategy', 'quantlab.isDataFile']);
+
 	private titleContainer: HTMLElement | undefined;
 	private editorLabel: IResourceLabel | undefined;
 	private activeLabel: IRenderedEditorLabel = Object.create(null);
+	private quantlabActionsContainer: HTMLElement | undefined;
+	private quantlabActionsDisposables: DisposableStore | undefined;
 
 	private breadcrumbsControlFactory: BreadcrumbsControlFactory | undefined;
 	private get breadcrumbsControl() { return this.breadcrumbsControlFactory?.control; }
+
+	constructor(
+		parent: HTMLElement,
+		editorPartsView: IEditorPartsView,
+		groupsView: IEditorGroupsView,
+		groupView: IEditorGroupView,
+		tabsModel: IReadonlyEditorGroupModel,
+		@IContextMenuService contextMenuService: IContextMenuService,
+		@IInstantiationService instantiationService: IInstantiationService,
+		@IContextKeyService contextKeyService: IContextKeyService,
+		@ICommandService private readonly commandService: ICommandService,
+		@IKeybindingService keybindingService: IKeybindingService,
+		@INotificationService notificationService: INotificationService,
+		@IQuickInputService quickInputService: IQuickInputService,
+		@IThemeService themeService: IThemeService,
+		@IQuantlabTabViewService private readonly quantlabTabViewService: IQuantlabTabViewService,
+		@IEditorResolverService editorResolverService: IEditorResolverService,
+		@IHostService hostService: IHostService,
+	) {
+		super(parent, editorPartsView, groupsView, groupView, tabsModel, contextMenuService, instantiationService, contextKeyService, keybindingService, notificationService, quickInputService, themeService, editorResolverService, hostService);
+
+		this._register(this.quantlabTabViewService.onDidChangeTabViewState(change => this.onQuantlabTabViewStateChanged(change)));
+		this._register(this.contextKeyService.onDidChangeContext(e => {
+			if (e.affectsSome(SingleEditorTabsControl.QUANTLAB_CONTEXT_KEYS)) {
+				this.updateQuantlabActions();
+			}
+		}));
+	}
 
 	protected override create(parent: HTMLElement): HTMLElement {
 		super.create(parent);
@@ -68,6 +115,7 @@ export class SingleEditorTabsControl extends EditorTabsControl {
 
 		// Create editor actions toolbar
 		this.createEditorActionsToolBar(titleContainer, ['title-actions']);
+		this.createQuantlabActions(titleContainer);
 
 		return titleContainer;
 	}
@@ -100,6 +148,209 @@ export class SingleEditorTabsControl extends EditorTabsControl {
 				}
 			}));
 		}
+	}
+
+	private createQuantlabActions(parent: HTMLElement): void {
+		this.quantlabActionsContainer = $('.quantlab-actions');
+		parent.appendChild(this.quantlabActionsContainer);
+
+		this.updateQuantlabActions();
+	}
+
+	private updateQuantlabActions(): void {
+		if (!this.quantlabActionsContainer) {
+			return;
+		}
+
+		const disposables = this.ensureQuantlabActionsDisposables();
+		disposables.clear();
+		clearNode(this.quantlabActionsContainer);
+
+		const currentView = this.getQuantlabCurrentView();
+		const isStrategy = this.isQuantlabStrategy();
+		const isDataFile = this.isQuantlabDataFile();
+
+		if (isStrategy) {
+			for (const view of this.getQuantlabButtonOrder(currentView)) {
+				this.renderStrategyButton(view, isStrategy, disposables);
+			}
+		} else if (isDataFile) {
+			this.renderDataFileButtons(currentView as 'editor' | 'visualise' | 'stats', disposables);
+		}
+	}
+
+	private renderStrategyButton(view: QuantlabViewType, isStrategy: boolean, disposables: DisposableStore): void {
+		const button = document.createElement('button');
+		button.className = 'quantlab-view-button';
+		button.type = 'button';
+		button.textContent = formatQuantlabViewLabel(view);
+		button.setAttribute('aria-label', `${formatQuantlabViewLabel(view)} view button`);
+		button.setAttribute('data-ql-anchor', `quantlab-view-${view}`);
+
+		if (view !== 'editor' && !isStrategy) {
+			button.classList.add('is-disabled');
+			button.setAttribute('aria-disabled', 'true');
+		}
+
+		disposables.add(addDisposableListener(button, EventType.CLICK, e => {
+			EventHelper.stop(e, true);
+			void this.commandService.executeCommand(this.getQuantlabCommandId(view));
+		}));
+
+		this.quantlabActionsContainer!.appendChild(button);
+	}
+
+	private renderDataFileButtons(currentView: 'editor' | 'visualise' | 'stats', disposables: DisposableStore): void {
+		const viewButtons = this.getDataFileViewButtons(currentView);
+		for (const view of viewButtons) {
+			const button = document.createElement('button');
+			button.className = 'quantlab-view-button quantlab-data-button';
+			button.type = 'button';
+			const label = view === 'visualise' ? 'Visualise' : view === 'stats' ? 'Stats' : 'Editor';
+			button.textContent = label;
+			button.setAttribute('aria-label', `${label} view button`);
+			button.setAttribute('data-ql-anchor', `quantlab-data-${view}`);
+
+			disposables.add(addDisposableListener(button, EventType.CLICK, e => {
+				EventHelper.stop(e, true);
+				const commandId = view === 'visualise' ? 'quantlab.switchToVisualise' : view === 'stats' ? 'quantlab.switchToStats' : 'quantlab.switchToDataEditor';
+				void this.commandService.executeCommand(commandId);
+			}));
+
+			this.quantlabActionsContainer!.appendChild(button);
+		}
+
+		// Always render the Action button
+		const actionButton = document.createElement('button');
+		actionButton.className = 'quantlab-view-button quantlab-data-button quantlab-action-button';
+		actionButton.type = 'button';
+		actionButton.textContent = 'Action';
+		actionButton.setAttribute('aria-label', 'Open Resources panel with statistics tests');
+		actionButton.setAttribute('data-ql-anchor', 'quantlab-data-action');
+
+		disposables.add(addDisposableListener(actionButton, EventType.CLICK, e => {
+			EventHelper.stop(e, true);
+			void this.commandService.executeCommand('quantlab.openDataAction');
+		}));
+
+		this.quantlabActionsContainer!.appendChild(actionButton);
+	}
+
+	private getDataFileViewButtons(currentView: 'editor' | 'visualise' | 'stats'): ('editor' | 'visualise' | 'stats')[] {
+		switch (currentView) {
+			case 'editor':
+				return ['visualise'];
+			case 'visualise':
+				return ['editor'];
+			case 'stats':
+				return ['visualise', 'editor'];
+			default:
+				return ['visualise'];
+		}
+	}
+
+	private getQuantlabButtonOrder(currentView: QuantlabViewType): QuantlabViewType[] {
+		switch (currentView) {
+			case 'chart':
+				return ['editor', 'action', 'trade'];
+			case 'action':
+				return ['chart', 'editor', 'trade'];
+			case 'trade':
+				return ['chart', 'action', 'editor'];
+			default:
+				return ['chart', 'action', 'trade'];
+		}
+	}
+
+	private getQuantlabCommandId(view: QuantlabViewType): string {
+		switch (view) {
+			case 'chart':
+				return 'quantlab.switchToChart';
+			case 'action':
+				return 'quantlab.switchToAction';
+			case 'trade':
+				return 'quantlab.switchToTrade';
+			default:
+				return 'quantlab.switchToEditor';
+		}
+	}
+
+	private getQuantlabCurrentView(): QuantlabViewType {
+		return this.contextKeyService.getContextKeyValue<QuantlabViewType>('quantlab.currentView') ?? 'editor';
+	}
+
+	private isQuantlabStrategy(): boolean {
+		return this.contextKeyService.getContextKeyValue<boolean>('quantlab.isStrategy') === true;
+	}
+
+	private isQuantlabDataFile(): boolean {
+		return this.contextKeyService.getContextKeyValue<boolean>('quantlab.isDataFile') === true;
+	}
+
+	private ensureQuantlabActionsDisposables(): DisposableStore {
+		if (!this.quantlabActionsDisposables) {
+			this.quantlabActionsDisposables = this._register(new DisposableStore());
+		}
+
+		return this.quantlabActionsDisposables;
+	}
+
+	private onQuantlabTabViewStateChanged(change: QuantlabTabViewStateChange): void {
+		const editor = this.tabsModel.activeEditor ?? undefined;
+		const titleContainer = this.titleContainer;
+		if (!editor || !titleContainer) {
+			return;
+		}
+
+		const tabIndex = this.getTabIndex(editor);
+		const tabInstanceId = this.getQuantlabTabInstanceId(editor, tabIndex);
+		if (tabInstanceId !== change.tabInstanceId) {
+			return;
+		}
+
+		const ariaLabel = computeEditorAriaLabel(editor, tabIndex, this.groupView, this.editorPartsView.count);
+		this.applyQuantlabTabViewAttributes(editor, tabIndex, titleContainer, ariaLabel);
+	}
+
+	private applyQuantlabTabViewAttributes(editor: EditorInput, tabIndex: number, titleContainer: HTMLElement, baseAriaLabel: string | undefined): void {
+		const view = this.getQuantlabViewForTab(editor, tabIndex);
+		if (view !== 'editor') {
+			titleContainer.setAttribute('data-ql-view', view);
+		} else {
+			titleContainer.removeAttribute('data-ql-view');
+		}
+
+		const ariaLabel = baseAriaLabel ?? computeEditorAriaLabel(editor, tabIndex, this.groupView, this.editorPartsView.count);
+		const fullAriaLabel = view !== 'editor' ? `${ariaLabel}, ${formatQuantlabViewLabel(view)} view` : ariaLabel;
+		titleContainer.setAttribute('aria-label', fullAriaLabel);
+		titleContainer.setAttribute('aria-description', '');
+	}
+
+	private getQuantlabViewForTab(editor: EditorInput, tabIndex: number): QuantlabViewType {
+		// Direct detection from editor type - CustomEditorInput for Chart/Action/Trade views
+		if (editor instanceof CustomEditorInput) {
+			return customEditorViewTypeToQuantlabView(editor.viewType);
+		}
+
+		return 'editor';
+	}
+
+	private getQuantlabTabInstanceId(editor: EditorInput, tabIndex: number): string | undefined {
+		const resource = EditorResourceAccessor.getOriginalUri(editor, { supportSideBySide: SideBySideEditor.PRIMARY });
+		if (!resource) {
+			return undefined;
+		}
+
+		const groupIndex = this.groupsView.groups.indexOf(this.groupView);
+		if (groupIndex < 0) {
+			return undefined;
+		}
+
+		return `${resource.toString()}::${groupIndex}::${tabIndex}`;
+	}
+
+	private getTabIndex(editor: EditorInput): number {
+		return this.tabsModel.getEditors(EditorsOrder.SEQUENTIAL).indexOf(editor);
 	}
 
 	private onTitleLabelClick(e: MouseEvent): void {
@@ -283,6 +534,9 @@ export class SingleEditorTabsControl extends EditorTabsControl {
 		const [titleContainer, editorLabel] = assertReturnsAllDefined(this.titleContainer, this.editorLabel);
 		if (!editor) {
 			titleContainer.classList.remove('dirty');
+			titleContainer.removeAttribute('data-ql-view');
+			titleContainer.removeAttribute('aria-label');
+			titleContainer.removeAttribute('aria-description');
 			editorLabel.clear();
 			this.clearEditorActionsToolbar();
 		}
@@ -322,6 +576,10 @@ export class SingleEditorTabsControl extends EditorTabsControl {
 					hideIcon: options.showIcons === false,
 				}
 			);
+
+			const tabIndex = this.getTabIndex(editor);
+			const ariaLabel = computeEditorAriaLabel(editor, tabIndex, this.groupView, this.editorPartsView.count);
+			this.applyQuantlabTabViewAttributes(editor, tabIndex, titleContainer, ariaLabel);
 
 			if (isGroupActive) {
 				titleContainer.style.color = this.getColor(TAB_ACTIVE_FOREGROUND) || '';

@@ -233,6 +233,7 @@ export class CompositeBarActionViewItem extends BaseActionViewItem {
 		super.render(container);
 
 		this.container = container;
+		this.container.setAttribute('data-view-container-id', this.compositeBarActionItem.id);
 		if (this.options.icon) {
 			this.container.classList.add('icon');
 		}

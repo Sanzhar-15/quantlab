@@ -42,6 +42,13 @@ function code() {
 	export ELECTRON_ENABLE_STACK_DUMPING=1
 	export ELECTRON_ENABLE_LOGGING=1
 
+	# Delta Plus Server demo credentials
+	export QUANTLAB_DEMO_EMAIL="demo@deltaplus.io"
+	export QUANTLAB_DEMO_PASSWORD="DeltaPlus-Demo-2026!"
+	if [[ "$OSTYPE" != "darwin"* && -z "${CHROME_DESKTOP}" ]]; then
+		export CHROME_DESKTOP=quantlab-dev.desktop
+	fi
+
 	DISABLE_TEST_EXTENSION="--disable-extension=vscode.vscode-api-tests"
 	if [[ "$@" == *"--extensionTestsPath"* ]]; then
 		DISABLE_TEST_EXTENSION=""

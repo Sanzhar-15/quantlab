@@ -1102,12 +1102,12 @@ export interface IListStyles {
 }
 
 export const unthemedListStyles: IListStyles = {
-	listFocusBackground: '#7FB0D0',
-	listActiveSelectionBackground: '#0E639C',
-	listActiveSelectionForeground: '#FFFFFF',
-	listActiveSelectionIconForeground: '#FFFFFF',
-	listFocusAndSelectionOutline: '#90C2F9',
-	listFocusAndSelectionBackground: '#094771',
+	listFocusBackground: '#0B2E4A',
+	listActiveSelectionBackground: '#0E3A5C',
+	listActiveSelectionForeground: '#EAF2F9',
+	listActiveSelectionIconForeground: '#EAF2F9',
+	listFocusAndSelectionOutline: '#0D85D6',
+	listFocusAndSelectionBackground: '#0A2236',
 	listFocusAndSelectionForeground: '#FFFFFF',
 	listInactiveSelectionBackground: '#3F3F46',
 	listInactiveSelectionIconForeground: '#FFFFFF',

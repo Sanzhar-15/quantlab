@@ -102,6 +102,7 @@ class CodeMain {
 
 		// Create services
 		const [instantiationService, instanceEnvironment, environmentMainService, configurationService, stateMainService, bufferLogger, productService, userDataProfilesMainService] = this.createServices();
+		this.configureLinuxAppIdentity(productService);
 
 		try {
 
@@ -156,6 +157,21 @@ class CodeMain {
 			});
 		} catch (error) {
 			instantiationService.invokeFunction(this.quit, error);
+		}
+	}
+
+	private configureLinuxAppIdentity(productService: IProductService): void {
+		if (!isLinux) {
+			return;
+		}
+
+		app.setName(productService.nameShort);
+		app.commandLine.appendSwitch('class', productService.nameShort);
+
+		const desktopName = productService.applicationName;
+		const setDesktopName = (app as unknown as { setDesktopName?: (name: string) => void }).setDesktopName;
+		if (desktopName && typeof setDesktopName === 'function') {
+			setDesktopName.call(app, desktopName);
 		}
 	}
 

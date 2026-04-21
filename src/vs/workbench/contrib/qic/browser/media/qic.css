@@ -1,0 +1,47 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Quantlab. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/* === Main Container (imported by qicPanel.ts for the host-side container) === */
+
+.qic-chat-container {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	padding: 0;
+}
+
+.qic-messages-area {
+	flex: 1;
+	overflow-y: auto;
+}
+
+.qic-input-area {
+	display: flex;
+	gap: 4px;
+	padding: 8px;
+	border-top: 1px solid var(--vscode-panel-border);
+}
+
+.qic-input-area input,
+.qic-input-area textarea {
+	flex: 1;
+	background: var(--vscode-input-background);
+	color: var(--vscode-input-foreground);
+	border: 1px solid var(--vscode-input-border);
+	padding: 6px 8px;
+	border-radius: 4px;
+	font-family: var(--vscode-font-family);
+	font-size: var(--vscode-font-size);
+	resize: none;
+}
+
+.qic-placeholder {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	height: 100%;
+	color: var(--vscode-descriptionForeground);
+	font-style: italic;
+}

@@ -84,7 +84,7 @@ import { MAX_ZOOM_LEVEL, MIN_ZOOM_LEVEL } from '../../platform/window/electron-b
 			nativeHostService.quit();
 		},
 		when: undefined,
-		mac: { primary: KeyMod.CtrlCmd | KeyCode.KeyQ },
+		mac: { primary: KeyMod.CtrlCmd | KeyMod.Shift | KeyCode.KeyQ },
 		linux: { primary: KeyMod.CtrlCmd | KeyCode.KeyQ }
 	});
 

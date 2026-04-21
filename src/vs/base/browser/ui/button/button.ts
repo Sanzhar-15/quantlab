@@ -51,10 +51,10 @@ export interface IButtonStyles {
 }
 
 export const unthemedButtonStyles: IButtonStyles = {
-	buttonBackground: '#0E639C',
-	buttonHoverBackground: '#006BB3',
+	buttonBackground: '#fc7432',
+	buttonHoverBackground: '#e55a1c',
 	buttonSeparator: Color.white.toString(),
-	buttonForeground: Color.white.toString(),
+	buttonForeground: '#061827',
 	buttonBorder: undefined,
 	buttonSecondaryBackground: undefined,
 	buttonSecondaryForeground: undefined,

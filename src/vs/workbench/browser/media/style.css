@@ -53,6 +53,15 @@ body {
 	z-index: 1;
 	overflow: hidden;
 	color: var(--vscode-foreground);
+	--ql-view-chart: var(--vscode-quantlabViewChart, #059669);
+	--ql-view-action: var(--vscode-quantlabViewAction, #d97706);
+	--ql-view-trade: var(--vscode-quantlabViewTrade, #dc2626);
+	--ql-view-stripe-width: 3px;
+	--ql-status-positive: var(--vscode-quantlabStatusPositive, #059669);
+	--ql-status-warning: var(--vscode-quantlabStatusWarning, #d97706);
+	--ql-status-negative: var(--vscode-quantlabStatusNegative, #dc2626);
+	--ql-status-info: var(--vscode-quantlabStatusInfo, #2563eb);
+	--ql-status-neutral: var(--vscode-quantlabStatusNeutral, #6b7280);
 }
 
 .monaco-workbench.web {
@@ -162,6 +171,107 @@ body {
 
 .monaco-workbench .context-view {
 	-webkit-app-region: no-drag;
+}
+
+@keyframes quantlabToastIn {
+	from { opacity: 0; transform: translateY(8px); }
+	to { opacity: 1; transform: translateY(0); }
+}
+
+.monaco-workbench .part.editor > .content {
+	position: relative;
+}
+
+.monaco-workbench .quantlab-toast-container {
+	position: absolute;
+	right: 16px;
+	bottom: 16px;
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	z-index: 40;
+	pointer-events: none;
+}
+
+.monaco-workbench .quantlab-toast {
+	pointer-events: auto;
+	background: var(--vscode-editorWidget-background);
+	color: var(--vscode-editor-foreground);
+	border: 1px solid var(--vscode-editorWidget-border);
+	border-left: 3px solid var(--ql-status-info);
+	border-radius: 6px;
+	box-shadow: 0 6px 20px rgba(0, 0, 0, 0.2);
+	padding: 10px 12px;
+	min-width: 260px;
+	max-width: 360px;
+	animation: quantlabToastIn 150ms ease;
+}
+
+.monaco-workbench .quantlab-toast[data-kind="success"] {
+	border-left-color: var(--ql-status-positive);
+}
+
+.monaco-workbench .quantlab-toast[data-kind="warning"] {
+	border-left-color: var(--ql-status-warning);
+}
+
+.monaco-workbench .quantlab-toast[data-kind="error"] {
+	border-left-color: var(--ql-status-negative);
+}
+
+.monaco-workbench .quantlab-toast-header {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 8px;
+	margin-bottom: 6px;
+}
+
+.monaco-workbench .quantlab-toast-title {
+	font-weight: 600;
+}
+
+.monaco-workbench .quantlab-toast-message {
+	color: var(--vscode-descriptionForeground);
+	font-size: 12px;
+}
+
+.monaco-workbench .quantlab-toast-actions {
+	margin-top: 10px;
+	display: flex;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+
+.monaco-workbench .quantlab-toast-action {
+	border-radius: 4px;
+	border: 1px solid transparent;
+	padding: 4px 8px;
+	font-size: 11px;
+	cursor: pointer;
+	background: var(--vscode-button-secondaryBackground);
+	color: var(--vscode-button-secondaryForeground);
+}
+
+.monaco-workbench .quantlab-toast-action.primary {
+	background: var(--vscode-button-background);
+	color: var(--vscode-button-foreground);
+}
+
+.monaco-workbench .quantlab-toast-close {
+	border: none;
+	background: transparent;
+	color: var(--vscode-descriptionForeground);
+	cursor: pointer;
+	font-size: 12px;
+	line-height: 1;
+	padding: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.monaco-workbench .quantlab-toast {
+		animation: none;
+	}
 }
 
 .monaco-workbench .codicon {

@@ -14,6 +14,18 @@
   "contributes": {
     "themes": [
       {
+        "id": "Quantlab Dark",
+        "label": "%quantlabDarkThemeLabel%",
+        "uiTheme": "vs-dark",
+        "path": "./themes/quantlab_dark.json"
+      },
+      {
+        "id": "Quantlab Light",
+        "label": "%quantlabLightThemeLabel%",
+        "uiTheme": "vs",
+        "path": "./themes/quantlab_light.json"
+      },
+      {
         "id": "Default Dark+",
         "label": "%darkPlusColorThemeLabel%",
         "uiTheme": "vs-dark",

@@ -18,6 +18,7 @@ import { IContextMenuService } from '../../../../platform/contextview/browser/co
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
 import { IKeybindingService } from '../../../../platform/keybinding/common/keybinding.js';
 import { IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
+import { ICommandService } from '../../../../platform/commands/common/commands.js';
 import { MenuId } from '../../../../platform/actions/common/actions.js';
 import { EditorCommandsContextActionRunner, EditorTabsControl } from './editorTabsControl.js';
 import { IQuickInputService } from '../../../../platform/quickinput/common/quickInput.js';
@@ -58,6 +59,20 @@ import { IReadonlyEditorGroupModel } from '../../../common/editor/editorGroupMod
 import { IHostService } from '../../../services/host/browser/host.js';
 import { BugIndicatingError } from '../../../../base/common/errors.js';
 import { applyDragImage } from '../../../../base/browser/ui/dnd/dnd.js';
+import { customEditorViewTypeToQuantlabView, formatQuantlabViewLabel, IQuantlabTabViewService, QuantlabTabViewStateChange, QuantlabViewType } from './quantlabViewStateService.js';
+import { CustomEditorInput } from '../../../contrib/customEditor/browser/customEditorInput.js';
+
+// Data file view types - 'action' is a button/command, not a view
+type DataViewType = 'editor' | 'visualise' | 'stats';
+
+function formatDataViewLabel(view: DataViewType | 'action'): string {
+	switch (view) {
+		case 'visualise': return 'Visualise';
+		case 'action': return 'Action';
+		case 'stats': return 'Stats';
+		default: return 'Editor';
+	}
+}
 
 interface IEditorInputLabel {
 	readonly editor: EditorInput;
@@ -104,12 +119,15 @@ export class MultiEditorTabsControl extends EditorTabsControl {
 
 	private static readonly MOUSE_WHEEL_EVENT_THRESHOLD = 150;
 	private static readonly MOUSE_WHEEL_DISTANCE_THRESHOLD = 1.5;
+	private static readonly QUANTLAB_CONTEXT_KEYS = new Set(['quantlab.currentView', 'quantlab.isStrategy', 'quantlab.isDataFile']);
 
 	private titleContainer: HTMLElement | undefined;
 	private tabsAndActionsContainer: HTMLElement | undefined;
 	private tabsContainer: HTMLElement | undefined;
 	private tabsScrollbar: ScrollableElement | undefined;
 	private tabSizingFixedDisposables: DisposableStore | undefined;
+	private quantlabActionsContainer: HTMLElement | undefined;
+	private quantlabActionsDisposables: DisposableStore | undefined;
 
 	private readonly closeEditorAction = this._register(this.instantiationService.createInstance(CloseEditorTabAction, CloseEditorTabAction.ID, CloseEditorTabAction.LABEL));
 	private readonly unpinEditorAction = this._register(this.instantiationService.createInstance(UnpinEditorAction, UnpinEditorAction.ID, UnpinEditorAction.LABEL));
@@ -143,10 +161,12 @@ export class MultiEditorTabsControl extends EditorTabsControl {
 		@IContextMenuService contextMenuService: IContextMenuService,
 		@IInstantiationService instantiationService: IInstantiationService,
 		@IContextKeyService contextKeyService: IContextKeyService,
+		@ICommandService private readonly commandService: ICommandService,
 		@IKeybindingService keybindingService: IKeybindingService,
 		@INotificationService notificationService: INotificationService,
 		@IQuickInputService quickInputService: IQuickInputService,
 		@IThemeService themeService: IThemeService,
+		@IQuantlabTabViewService private readonly quantlabTabViewService: IQuantlabTabViewService,
 		@IEditorService private readonly editorService: EditorServiceImpl,
 		@IPathService private readonly pathService: IPathService,
 		@ITreeViewsDnDService private readonly treeViewsDragAndDropService: ITreeViewsDnDService,
@@ -162,6 +182,13 @@ export class MultiEditorTabsControl extends EditorTabsControl {
 
 		// React to decorations changing for our resource labels
 		this._register(this.tabResourceLabels.onDidChangeDecorations(() => this.doHandleDecorationsChange()));
+
+		this._register(this.quantlabTabViewService.onDidChangeTabViewState(change => this.onQuantlabTabViewStateChanged(change)));
+		this._register(this.contextKeyService.onDidChangeContext(e => {
+			if (e.affectsSome(MultiEditorTabsControl.QUANTLAB_CONTEXT_KEYS)) {
+				this.updateQuantlabActions();
+			}
+		}));
 	}
 
 	protected override create(parent: HTMLElement): HTMLElement {
@@ -192,6 +219,7 @@ export class MultiEditorTabsControl extends EditorTabsControl {
 
 		// Create Editor Toolbar
 		this.createEditorActionsToolBar(this.tabsAndActionsContainer, ['editor-actions']);
+		this.createQuantlabActions(this.tabsAndActionsContainer);
 
 		// Set tabs control visibility
 		this.updateTabsControlVisibility();
@@ -215,6 +243,259 @@ export class MultiEditorTabsControl extends EditorTabsControl {
 		}));
 
 		return tabsScrollbar;
+	}
+
+	private createQuantlabActions(parent: HTMLElement): void {
+		this.quantlabActionsContainer = $('.quantlab-actions');
+		parent.appendChild(this.quantlabActionsContainer);
+
+		this.updateQuantlabActions();
+	}
+
+	private updateQuantlabActions(): void {
+		if (!this.quantlabActionsContainer) {
+			return;
+		}
+
+		const disposables = this.ensureQuantlabActionsDisposables();
+		disposables.clear();
+		clearNode(this.quantlabActionsContainer);
+
+		const currentView = this.getQuantlabCurrentView();
+		const isStrategy = this.isQuantlabStrategy();
+		const isDataFile = this.isQuantlabDataFile();
+
+		if (isStrategy) {
+			// Strategy files: Chart, Action, Trade (existing behavior)
+			for (const view of this.getQuantlabButtonOrder(currentView)) {
+				this.renderStrategyButton(view, currentView, isStrategy, disposables);
+			}
+		} else if (isDataFile) {
+			// Data files: render view buttons + Action button
+			this.renderDataFileButtons(currentView as DataViewType, disposables);
+		}
+		// Other files: no buttons rendered
+	}
+
+	private renderStrategyButton(
+		view: QuantlabViewType,
+		currentView: QuantlabViewType,
+		isStrategy: boolean,
+		disposables: DisposableStore
+	): void {
+		const button = document.createElement('button');
+		button.className = 'quantlab-view-button';
+		button.type = 'button';
+		button.textContent = formatQuantlabViewLabel(view);
+		button.setAttribute('aria-label', `${formatQuantlabViewLabel(view)} view button`);
+		button.setAttribute('data-ql-anchor', `quantlab-view-${view}`);
+
+		if (view !== 'editor' && !isStrategy) {
+			button.classList.add('is-disabled');
+			button.setAttribute('aria-disabled', 'true');
+		}
+
+		if (view === currentView) {
+			button.classList.add('is-current');
+		}
+
+		disposables.add(addDisposableListener(button, EventType.CLICK, e => {
+			EventHelper.stop(e, true);
+			void this.commandService.executeCommand(this.getQuantlabCommandId(view));
+		}));
+
+		this.quantlabActionsContainer!.appendChild(button);
+	}
+
+	private getQuantlabButtonOrder(currentView: QuantlabViewType): QuantlabViewType[] {
+		switch (currentView) {
+			case 'chart':
+				return ['editor', 'action', 'trade'];
+			case 'action':
+				return ['chart', 'editor', 'trade'];
+			case 'trade':
+				return ['chart', 'action', 'editor'];
+			default:
+				return ['chart', 'action', 'trade'];
+		}
+	}
+
+	private getQuantlabCommandId(view: QuantlabViewType): string {
+		switch (view) {
+			case 'chart':
+				return 'quantlab.switchToChart';
+			case 'action':
+				return 'quantlab.switchToAction';
+			case 'trade':
+				return 'quantlab.switchToTrade';
+			default:
+				return 'quantlab.switchToEditor';
+		}
+	}
+
+	private getQuantlabCurrentView(): QuantlabViewType {
+		return this.contextKeyService.getContextKeyValue<QuantlabViewType>('quantlab.currentView') ?? 'editor';
+	}
+
+	private isQuantlabStrategy(): boolean {
+		return this.contextKeyService.getContextKeyValue<boolean>('quantlab.isStrategy') === true;
+	}
+
+	private isQuantlabDataFile(): boolean {
+		return this.contextKeyService.getContextKeyValue<boolean>('quantlab.isDataFile') === true;
+	}
+
+	/**
+	 * Render buttons for data files.
+	 * Shows view switcher buttons based on current view, plus the Action button.
+	 */
+	private renderDataFileButtons(
+		currentView: DataViewType,
+		disposables: DisposableStore
+	): void {
+		// Render view switcher buttons
+		const viewButtons = this.getDataFileViewButtons(currentView);
+		for (const view of viewButtons) {
+			this.renderDataFileViewButton(view, currentView, disposables);
+		}
+
+		// Always render the Action button (opens Resources panel)
+		this.renderDataFileActionButton(disposables);
+	}
+
+	/**
+	 * Get which view buttons to show based on current view.
+	 * Always shows buttons to switch to OTHER views (not current).
+	 */
+	private getDataFileViewButtons(currentView: DataViewType): DataViewType[] {
+		switch (currentView) {
+			case 'editor':
+				return ['visualise'];  // Can switch to visualise
+			case 'visualise':
+				return ['editor'];     // Can switch back to editor
+			case 'stats':
+				return ['visualise', 'editor'];  // Can switch to either
+			default:
+				return ['visualise'];
+		}
+	}
+
+	/**
+	 * Render a view switcher button for data files
+	 */
+	private renderDataFileViewButton(
+		view: DataViewType,
+		currentView: DataViewType,
+		disposables: DisposableStore
+	): void {
+		const button = document.createElement('button');
+		button.className = 'quantlab-view-button quantlab-data-button';
+		button.type = 'button';
+		button.textContent = formatDataViewLabel(view);
+		button.setAttribute('aria-label', `${formatDataViewLabel(view)} view button`);
+		button.setAttribute('data-ql-anchor', `quantlab-data-${view}`);
+
+		// View buttons are never "current" since we only show buttons to OTHER views
+		// But mark as current if somehow we're showing the current view
+		if (view === currentView) {
+			button.classList.add('is-current');
+		}
+
+		disposables.add(addDisposableListener(button, EventType.CLICK, e => {
+			EventHelper.stop(e, true);
+			void this.commandService.executeCommand(this.getDataFileViewCommandId(view));
+		}));
+
+		this.quantlabActionsContainer!.appendChild(button);
+	}
+
+	/**
+	 * Render the Action button (opens Resources panel with Pure Stats)
+	 */
+	private renderDataFileActionButton(disposables: DisposableStore): void {
+		const button = document.createElement('button');
+		button.className = 'quantlab-view-button quantlab-data-button quantlab-action-button';
+		button.type = 'button';
+		button.textContent = 'Action';
+		button.setAttribute('aria-label', 'Open Resources panel with statistics tests');
+		button.setAttribute('data-ql-anchor', 'quantlab-data-action');
+
+		disposables.add(addDisposableListener(button, EventType.CLICK, e => {
+			EventHelper.stop(e, true);
+			void this.commandService.executeCommand('quantlab.openDataAction');
+		}));
+
+		this.quantlabActionsContainer!.appendChild(button);
+	}
+
+	/**
+	 * Get command ID for data file view switching
+	 */
+	private getDataFileViewCommandId(view: DataViewType): string {
+		switch (view) {
+			case 'visualise':
+				return 'quantlab.switchToVisualise';
+			case 'stats':
+				return 'quantlab.switchToStats';  // Rarely used - usually via Resources
+			default:
+				return 'quantlab.switchToDataEditor';
+		}
+	}
+
+	private ensureQuantlabActionsDisposables(): DisposableStore {
+		if (!this.quantlabActionsDisposables) {
+			this.quantlabActionsDisposables = this._register(new DisposableStore());
+		}
+
+		return this.quantlabActionsDisposables;
+	}
+
+	private onQuantlabTabViewStateChanged(change: QuantlabTabViewStateChange): void {
+		this.forEachTab((editor, tabIndex, tabContainer, tabLabelWidget, tabLabel) => {
+			const tabInstanceId = this.getQuantlabTabInstanceId(editor, tabIndex);
+			if (!tabInstanceId || tabInstanceId !== change.tabInstanceId) {
+				return;
+			}
+
+			this.applyQuantlabTabViewAttributes(editor, tabIndex, tabContainer, tabLabel.ariaLabel);
+		});
+	}
+
+	private applyQuantlabTabViewAttributes(editor: EditorInput, tabIndex: number, tabContainer: HTMLElement, baseAriaLabel: string | undefined): void {
+		const view = this.getQuantlabViewForTab(editor, tabIndex);
+		if (view !== 'editor') {
+			tabContainer.setAttribute('data-ql-view', view);
+		} else {
+			tabContainer.removeAttribute('data-ql-view');
+		}
+
+		const ariaLabel = baseAriaLabel ?? computeEditorAriaLabel(editor, tabIndex, this.groupView, this.editorPartsView.count);
+		const fullAriaLabel = view !== 'editor' ? `${ariaLabel}, ${formatQuantlabViewLabel(view)} view` : ariaLabel;
+		tabContainer.setAttribute('aria-label', fullAriaLabel);
+		tabContainer.setAttribute('aria-description', '');
+	}
+
+	private getQuantlabViewForTab(editor: EditorInput, tabIndex: number): QuantlabViewType {
+		// Direct detection from editor type - CustomEditorInput for Chart/Action/Trade views
+		if (editor instanceof CustomEditorInput) {
+			return customEditorViewTypeToQuantlabView(editor.viewType);
+		}
+
+		return 'editor';
+	}
+
+	private getQuantlabTabInstanceId(editor: EditorInput, tabIndex: number): string | undefined {
+		const resource = EditorResourceAccessor.getOriginalUri(editor, { supportSideBySide: SideBySideEditor.PRIMARY });
+		if (!resource) {
+			return undefined;
+		}
+
+		const groupIndex = this.groupsView.groups.indexOf(this.groupView);
+		if (groupIndex < 0) {
+			return undefined;
+		}
+
+		return `${resource.toString()}::${groupIndex}::${tabIndex}`;
 	}
 
 	private updateTabsScrollbarSizing(): void {
@@ -1622,12 +1903,7 @@ export class MultiEditorTabsControl extends EditorTabsControl {
 			description = tabLabel.description || '';
 		}
 
-		if (tabLabel.ariaLabel) {
-			tabContainer.setAttribute('aria-label', tabLabel.ariaLabel);
-			// Set aria-description to empty string so that screen readers would not read the title as well
-			// More details https://github.com/microsoft/vscode/issues/95378
-			tabContainer.setAttribute('aria-description', '');
-		}
+		this.applyQuantlabTabViewAttributes(editor, tabIndex, tabContainer, tabLabel.ariaLabel);
 
 		// Label
 		tabLabelWidget.setResource(
@@ -1869,6 +2145,7 @@ export class MultiEditorTabsControl extends EditorTabsControl {
 
 	private doLayoutTabsWrapping(dimensions: IEditorTitleControlDimensions): boolean {
 		const [tabsAndActionsContainer, tabsContainer, editorToolbarContainer, tabsScrollbar] = assertReturnsAllDefined(this.tabsAndActionsContainer, this.tabsContainer, this.editorActionsToolbarContainer, this.tabsScrollbar);
+		const quantlabActionsContainer = this.quantlabActionsContainer;
 
 		// Handle wrapping tabs according to setting:
 		// - enabled: only add class if tabs wrap and don't exceed available dimensions
@@ -1883,10 +2160,15 @@ export class MultiEditorTabsControl extends EditorTabsControl {
 			// Toggle the `wrapped` class to enable wrapping
 			tabsAndActionsContainer.classList.toggle('wrapping', tabsWrapMultiLine);
 
+			const quantlabActionsWidth = quantlabActionsContainer?.offsetWidth ?? 0;
+			const actionsWidth = editorToolbarContainer.offsetWidth + quantlabActionsWidth;
+
+			tabsAndActionsContainer.style.setProperty('--quantlab-actions-width', `${quantlabActionsWidth}px`);
+
 			// Update `last-tab-margin-right` CSS variable to account for the absolute
 			// positioned editor actions container when tabs wrap. The margin needs to
 			// be the width of the editor actions container to avoid screen cheese.
-			tabsContainer.style.setProperty('--last-tab-margin-right', tabsWrapMultiLine ? `${editorToolbarContainer.offsetWidth}px` : '0');
+			tabsContainer.style.setProperty('--last-tab-margin-right', tabsWrapMultiLine ? `${actionsWidth}px` : '0');
 
 			// Remove old css classes that are not needed anymore
 			for (const tab of tabsContainer.children) {
@@ -1904,7 +2186,9 @@ export class MultiEditorTabsControl extends EditorTabsControl {
 					return true; // no tab always fits
 				}
 
-				const lastTabOverlapWithToolbarWidth = lastTab.offsetWidth + editorToolbarContainer.offsetWidth - dimensions.available.width;
+				const quantlabActionsWidth = quantlabActionsContainer?.offsetWidth ?? 0;
+				const actionsWidth = editorToolbarContainer.offsetWidth + quantlabActionsWidth;
+				const lastTabOverlapWithToolbarWidth = lastTab.offsetWidth + actionsWidth - dimensions.available.width;
 				if (lastTabOverlapWithToolbarWidth > 1) {
 					// Allow for slight rounding errors related to zooming here
 					// https://github.com/microsoft/vscode/issues/116385

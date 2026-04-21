@@ -52,7 +52,7 @@ import { IView } from '../../../../base/browser/ui/grid/grid.js';
 import { createInstantHoverDelegate } from '../../../../base/browser/ui/hover/hoverDelegateFactory.js';
 import { IBaseActionViewItemOptions } from '../../../../base/browser/ui/actionbar/actionViewItems.js';
 import { IHoverDelegate } from '../../../../base/browser/ui/hover/hoverDelegate.js';
-import { CommandsRegistry } from '../../../../platform/commands/common/commands.js';
+import { CommandsRegistry, ICommandService } from '../../../../platform/commands/common/commands.js';
 import { safeIntl } from '../../../../base/common/date.js';
 import { IsCompactTitleBarContext, TitleBarVisibleContext } from '../../../common/contextkeys.js';
 
@@ -65,6 +65,10 @@ export interface ITitleProperties {
 	isPure?: boolean;
 	isAdmin?: boolean;
 	prefix?: string;
+}
+
+interface IQuantlabTitlebarState {
+	readonly historyCount?: number;
 }
 
 export interface ITitlebarPart extends IDisposable {
@@ -144,6 +148,12 @@ export class BrowserTitleService extends MultiWindowParts<BrowserTitlebarPart> i
 					{ name: 'name', schema: { type: 'string' }, description: 'The name of the variable to register' },
 					{ name: 'contextKey', schema: { type: 'string' }, description: 'The context key to use for the value of the variable' }
 				]
+			}
+		}));
+
+		this._register(CommandsRegistry.registerCommand('quantlab.updateTitlebarState', (accessor, state?: IQuantlabTitlebarState) => {
+			for (const part of this.parts) {
+				part.updateQuantlabTitlebarState(state);
 			}
 		}));
 	}
@@ -257,6 +267,12 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
 	private leftContent!: HTMLElement;
 	private centerContent!: HTMLElement;
 	private rightContent!: HTMLElement;
+	private quantlabHistoryContainer: HTMLElement | undefined;
+	private quantlabHistoryButton: HTMLButtonElement | undefined;
+	private quantlabHistoryBadge: HTMLElement | undefined;
+	private quantlabTitlebarState: Required<IQuantlabTitlebarState> = {
+		historyCount: 0
+	};
 
 	protected readonly customMenubar = this._register(new MutableDisposable<CustomMenubarControl>());
 	protected appIcon: HTMLElement | undefined;
@@ -306,7 +322,8 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
 		@IHostService private readonly hostService: IHostService,
 		@IEditorService private readonly editorService: IEditorService,
 		@IMenuService private readonly menuService: IMenuService,
-		@IKeybindingService private readonly keybindingService: IKeybindingService
+		@IKeybindingService private readonly keybindingService: IKeybindingService,
+		@ICommandService private readonly commandService: ICommandService
 	) {
 		super(id, { hasTitle: false }, themeService, storageService, layoutService);
 
@@ -483,6 +500,8 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
 			this.createActionToolBarMenus();
 		}
 
+		this.createQuantlabControls();
+
 		// Window Controls Container
 		if (!hasNativeTitlebar(this.configurationService, this.titleBarStyle)) {
 			let primaryWindowControlsLocation = isMacintosh ? 'left' : 'right';
@@ -552,6 +571,61 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
 		this.updateStyles();
 
 		return this.element;
+	}
+
+	updateQuantlabTitlebarState(state?: IQuantlabTitlebarState): void {
+		if (!state || !this.quantlabHistoryContainer) {
+			return;
+		}
+
+		const nextState: Required<IQuantlabTitlebarState> = {
+			historyCount: typeof state.historyCount === 'number' ? Math.max(0, state.historyCount) : this.quantlabTitlebarState.historyCount
+		};
+
+		if (nextState.historyCount !== this.quantlabTitlebarState.historyCount && this.quantlabHistoryBadge) {
+			this.quantlabHistoryBadge.textContent = nextState.historyCount > 0 ? String(nextState.historyCount) : '';
+			this.quantlabHistoryBadge.classList.toggle('hidden', nextState.historyCount <= 0);
+			if (this.quantlabHistoryButton) {
+				const historyLabel = nextState.historyCount > 0
+					? localize('quantlabHistoryCount', "History, {0} unviewed", nextState.historyCount)
+					: localize('quantlabHistory', "History");
+				this.quantlabHistoryButton.setAttribute('aria-label', historyLabel);
+			}
+		}
+
+		this.quantlabTitlebarState = nextState;
+	}
+
+	private createQuantlabControls(): void {
+		if (!hasCustomTitlebar(this.configurationService, this.titleBarStyle)) {
+			return;
+		}
+
+		this.quantlabHistoryContainer = append(this.rightContent, $('.quantlab-history'));
+		this.quantlabHistoryButton = this.createQuantlabButton(localize('quantlabHistory', "History"), localize('quantlabHistory', "History"), () => {
+			void this.commandService.executeCommand('quantlab.toggleHistoryDropdown');
+		});
+		this.quantlabHistoryButton.setAttribute('data-ql-anchor', 'quantlab-history');
+		this.quantlabHistoryBadge = append(this.quantlabHistoryButton, $('span.quantlab-history-badge'));
+		this.quantlabHistoryBadge.classList.add('hidden');
+		this.quantlabHistoryContainer.appendChild(this.quantlabHistoryButton);
+
+		this.updateQuantlabTitlebarState(this.quantlabTitlebarState);
+	}
+
+	private createQuantlabButton(label: string, ariaLabel: string, onClick: () => void): HTMLButtonElement {
+		const button = document.createElement('button');
+		button.className = 'quantlab-titlebar-button';
+		button.type = 'button';
+		button.textContent = label;
+		button.setAttribute('aria-label', ariaLabel);
+
+		this._register(addDisposableListener(button, EventType.CLICK, e => {
+			EventHelper.stop(e, true);
+			onClick();
+		}));
+
+		return button;
 	}
 
 	private createTitle(): void {
@@ -908,8 +982,9 @@ export class MainBrowserTitlebarPart extends BrowserTitlebarPart {
 		@IEditorService editorService: IEditorService,
 		@IMenuService menuService: IMenuService,
 		@IKeybindingService keybindingService: IKeybindingService,
+		@ICommandService commandService: ICommandService,
 	) {
-		super(Parts.TITLEBAR_PART, mainWindow, editorGroupService.mainPart, contextMenuService, configurationService, environmentService, instantiationService, themeService, storageService, layoutService, contextKeyService, hostService, editorService, menuService, keybindingService);
+		super(Parts.TITLEBAR_PART, mainWindow, editorGroupService.mainPart, contextMenuService, configurationService, environmentService, instantiationService, themeService, storageService, layoutService, contextKeyService, hostService, editorService, menuService, keybindingService, commandService);
 	}
 }
 
@@ -943,9 +1018,10 @@ export class AuxiliaryBrowserTitlebarPart extends BrowserTitlebarPart implements
 		@IEditorService editorService: IEditorService,
 		@IMenuService menuService: IMenuService,
 		@IKeybindingService keybindingService: IKeybindingService,
+		@ICommandService commandService: ICommandService,
 	) {
 		const id = AuxiliaryBrowserTitlebarPart.COUNTER++;
-		super(`workbench.parts.auxiliaryTitle.${id}`, getWindow(container), editorGroupsContainer, contextMenuService, configurationService, environmentService, instantiationService, themeService, storageService, layoutService, contextKeyService, hostService, editorService, menuService, keybindingService);
+		super(`workbench.parts.auxiliaryTitle.${id}`, getWindow(container), editorGroupsContainer, contextMenuService, configurationService, environmentService, instantiationService, themeService, storageService, layoutService, contextKeyService, hostService, editorService, menuService, keybindingService, commandService);
 	}
 
 	override get preventZoom(): boolean {

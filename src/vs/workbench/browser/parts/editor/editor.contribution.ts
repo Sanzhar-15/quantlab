@@ -24,7 +24,9 @@ import { BinaryResourceDiffEditor } from './binaryDiffEditor.js';
 import { ChangeEncodingAction, ChangeEOLAction, ChangeLanguageAction, EditorStatusContribution } from './editorStatus.js';
 import { Categories } from '../../../../platform/action/common/actionCommonCategories.js';
 import { MenuRegistry, MenuId, IMenuItem, registerAction2 } from '../../../../platform/actions/common/actions.js';
+import { CommandsRegistry } from '../../../../platform/commands/common/commands.js';
 import { SyncDescriptor } from '../../../../platform/instantiation/common/descriptors.js';
+import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
 import { KeyMod, KeyCode } from '../../../../base/common/keyCodes.js';
 import {
 	CloseEditorsInOtherGroupsAction, CloseAllEditorsAction, MoveGroupLeftAction, MoveGroupRightAction, SplitEditorAction, JoinTwoGroupsAction, RevertAndCloseEditorAction,
@@ -73,8 +75,20 @@ import { ICommandAction } from '../../../../platform/action/common/action.js';
 import { EditorContextKeys } from '../../../../editor/common/editorContextKeys.js';
 import { getFontSnippets } from '../../../../base/browser/fonts.js';
 import { registerEditorFontConfigurations } from '../../../../editor/common/config/editorConfigurationSchema.js';
+import { URI } from '../../../../base/common/uri.js';
+import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
+import { IEditorGroupsService } from '../../../services/editor/common/editorGroupsService.js';
+import { IEditorService } from '../../../services/editor/common/editorService.js';
+import { columnToEditorGroup } from '../../../services/editor/common/editorGroupColumn.js';
+import { QuantlabContextKeyController } from './quantlabContextKeys.js';
+import { QuantlabViewEditorInput, QuantlabViewEditorInputSerializer } from './quantlabViewEditorInput.js';
+import { IQuantlabTabViewService, normalizeQuantlabViewType, quantlabViewToCustomEditorViewType, QuantlabTabViewService } from './quantlabViewStateService.js';
+import { EditorPart } from './editorPart.js';
+import { QuantlabToastPayload } from './quantlabToast.js';
 
 //#region Editor Registrations
+
+registerSingleton(IQuantlabTabViewService, QuantlabTabViewService, InstantiationType.Delayed);
 
 Registry.as<IEditorPaneRegistry>(EditorExtensions.EditorPane).registerEditorPane(
 	EditorPaneDescriptor.create(
@@ -84,7 +98,8 @@ Registry.as<IEditorPaneRegistry>(EditorExtensions.EditorPane).registerEditorPane
 	),
 	[
 		new SyncDescriptor(UntitledTextEditorInput),
-		new SyncDescriptor(TextResourceEditorInput)
+		new SyncDescriptor(TextResourceEditorInput),
+		new SyncDescriptor(QuantlabViewEditorInput)
 	]
 );
 
@@ -124,6 +139,7 @@ Registry.as<IEditorPaneRegistry>(EditorExtensions.EditorPane).registerEditorPane
 Registry.as<IEditorFactoryRegistry>(EditorExtensions.EditorFactory).registerEditorSerializer(UntitledTextEditorInput.ID, UntitledTextEditorInputSerializer);
 Registry.as<IEditorFactoryRegistry>(EditorExtensions.EditorFactory).registerEditorSerializer(SideBySideEditorInput.ID, SideBySideEditorInputSerializer);
 Registry.as<IEditorFactoryRegistry>(EditorExtensions.EditorFactory).registerEditorSerializer(DiffEditorInput.ID, DiffEditorInputSerializer);
+Registry.as<IEditorFactoryRegistry>(EditorExtensions.EditorFactory).registerEditorSerializer(QuantlabViewEditorInput.ID, QuantlabViewEditorInputSerializer);
 
 //#endregion
 
@@ -133,6 +149,7 @@ registerWorkbenchContribution2(EditorAutoSave.ID, EditorAutoSave, WorkbenchPhase
 registerWorkbenchContribution2(EditorStatusContribution.ID, EditorStatusContribution, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2(UntitledTextEditorWorkingCopyEditorHandler.ID, UntitledTextEditorWorkingCopyEditorHandler, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2(DynamicEditorConfigurations.ID, DynamicEditorConfigurations, WorkbenchPhase.BlockRestore);
+registerWorkbenchContribution2(QuantlabContextKeyController.ID, QuantlabContextKeyController, WorkbenchPhase.BlockRestore);
 
 //#endregion
 
@@ -169,6 +186,91 @@ quickAccessRegistry.registerQuickAccessProvider({
 //#endregion
 
 //#region Actions & Commands
+
+interface IQuantlabOpenAsViewArgs {
+	resource: URI | string;
+	view: string;
+	viewColumn?: number;
+	preserveFocus?: boolean;
+}
+
+interface IQuantlabSetTabViewStateArgs {
+	tabInstanceId: string;
+	view: string;
+	resource?: URI | string;
+}
+
+CommandsRegistry.registerCommand('quantlab.openAsView', async (accessor, args?: IQuantlabOpenAsViewArgs) => {
+	if (!args?.resource) {
+		return;
+	}
+
+	const resource = URI.isUri(args.resource) ? args.resource : URI.parse(args.resource);
+	const viewType = normalizeQuantlabViewType(args.view);
+	const customEditorViewType = quantlabViewToCustomEditorViewType(viewType);
+
+	const editorService = accessor.get(IEditorService);
+	const editorGroupsService = accessor.get(IEditorGroupsService);
+	const configurationService = accessor.get(IConfigurationService);
+
+	const group = typeof args.viewColumn === 'number' ? columnToEditorGroup(editorGroupsService, configurationService, args.viewColumn) : undefined;
+	// Use override option to open with the custom editor (Chart/Action/Trade views)
+	await editorService.openEditor({ resource, options: { pinned: true, preserveFocus: Boolean(args.preserveFocus), override: customEditorViewType } }, group);
+});
+
+CommandsRegistry.registerCommand('quantlab.setTabViewState', (accessor, args?: IQuantlabSetTabViewStateArgs) => {
+	if (!args?.tabInstanceId) {
+		return;
+	}
+
+	const quantlabTabViewService = accessor.get(IQuantlabTabViewService);
+	const resource = typeof args.resource === 'string' ? URI.parse(args.resource) : args.resource;
+	quantlabTabViewService.setTabViewState(args.tabInstanceId, normalizeQuantlabViewType(args.view), resource);
+});
+
+CommandsRegistry.registerCommand('quantlab.clearTabViewState', (accessor, tabInstanceId?: string) => {
+	if (!tabInstanceId) {
+		return;
+	}
+
+	const quantlabTabViewService = accessor.get(IQuantlabTabViewService);
+	quantlabTabViewService.clearTabViewState(tabInstanceId);
+});
+
+CommandsRegistry.registerCommand('quantlab.getTabViewState', (accessor, tabInstanceId?: string) => {
+	const quantlabTabViewService = accessor.get(IQuantlabTabViewService);
+	if (tabInstanceId) {
+		const state = quantlabTabViewService.getTabViewState(tabInstanceId);
+		if (!state) {
+			return undefined;
+		}
+		return {
+			tabInstanceId: state.tabInstanceId,
+			view: state.view,
+			resource: state.resource?.toString()
+		};
+	}
+
+	return quantlabTabViewService.getAllTabViewStates();
+});
+
+CommandsRegistry.registerCommand('quantlab.showToast', (accessor, args?: QuantlabToastPayload) => {
+	if (!args) {
+		return;
+	}
+	const editorGroupsService = accessor.get(IEditorGroupsService);
+	const part = editorGroupsService.mainPart as EditorPart;
+	part.showQuantlabToast(args);
+});
+
+CommandsRegistry.registerCommand('quantlab.dismissToast', (accessor, id?: string) => {
+	if (!id) {
+		return;
+	}
+	const editorGroupsService = accessor.get(IEditorGroupsService);
+	const part = editorGroupsService.mainPart as EditorPart;
+	part.dismissQuantlabToast(id);
+});
 
 registerAction2(ChangeLanguageAction);
 registerAction2(ChangeEOLAction);

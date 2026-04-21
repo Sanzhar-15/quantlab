@@ -121,6 +121,60 @@
 	margin-right: auto;
 }
 
+/* Quantlab Titlebar Controls */
+
+.monaco-workbench .part.titlebar > .titlebar-container .quantlab-history {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	-webkit-app-region: no-drag;
+}
+
+.monaco-workbench .part.titlebar > .titlebar-container .quantlab-history {
+	margin-left: 8px;
+}
+
+.monaco-workbench .part.titlebar > .titlebar-container .quantlab-titlebar-button {
+	background: transparent;
+	border: 1px solid var(--vscode-titleBar-border);
+	border-radius: 4px;
+	color: var(--vscode-titleBar-activeForeground);
+	cursor: pointer;
+	font-size: 11px;
+	line-height: 1;
+	padding: 4px 8px;
+}
+
+.monaco-workbench .part.titlebar.inactive > .titlebar-container .quantlab-titlebar-button {
+	color: var(--vscode-titleBar-inactiveForeground);
+}
+
+.monaco-workbench .part.titlebar > .titlebar-container .quantlab-titlebar-button:hover {
+	background-color: var(--vscode-toolbar-hoverBackground);
+}
+
+.monaco-workbench .part.titlebar > .titlebar-container .quantlab-titlebar-button:active {
+	background-color: var(--vscode-toolbar-activeBackground);
+}
+
+.monaco-workbench .part.titlebar > .titlebar-container .quantlab-history-badge {
+	align-items: center;
+	background-color: var(--vscode-badge-background);
+	border-radius: 9px;
+	color: var(--vscode-badge-foreground);
+	display: inline-flex;
+	font-size: 10px;
+	height: 16px;
+	justify-content: center;
+	margin-left: 6px;
+	min-width: 16px;
+	padding: 0 4px;
+}
+
+.monaco-workbench .part.titlebar > .titlebar-container .quantlab-history-badge.hidden {
+	display: none;
+}
+
 .monaco-workbench.web .part.titlebar > .titlebar-container > .titlebar-center > .window-title,
 .monaco-workbench.windows .part.titlebar > .titlebar-container > .titlebar-center > .window-title,
 .monaco-workbench.linux .part.titlebar > .titlebar-container > .titlebar-center > .window-title {

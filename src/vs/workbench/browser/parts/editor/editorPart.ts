@@ -36,6 +36,7 @@ import { IContextKeyService } from '../../../../platform/contextkey/common/conte
 import { ServiceCollection } from '../../../../platform/instantiation/common/serviceCollection.js';
 import { EditorPartMaximizedEditorGroupContext, EditorPartMultipleEditorGroupsContext, IsAuxiliaryWindowContext } from '../../../common/contextkeys.js';
 import { mainWindow } from '../../../../base/browser/window.js';
+import { QuantlabToastController, QuantlabToastPayload } from './quantlabToast.js';
 
 export interface IEditorPartUIState {
 	readonly serializedGrid: ISerializedGrid;
@@ -156,6 +157,7 @@ export class EditorPart extends Part<IEditorPartMemento> implements IEditorPart,
 	private readonly scopedContextKeyService: IContextKeyService;
 
 	private centeredLayoutWidget!: CenteredViewLayout;
+	private quantlabToastController: QuantlabToastController | undefined;
 
 	private gridWidget!: SerializableGrid<IEditorGroupView>;
 	private readonly gridWidgetDisposables = this._register(new DisposableStore());
@@ -1018,6 +1020,9 @@ export class EditorPart extends Part<IEditorPartMemento> implements IEditorPart,
 		this.centeredLayoutWidget = this._register(new CenteredViewLayout(this.container, this.gridWidgetView, this.profileMemento[EditorPart.EDITOR_PART_CENTERED_VIEW_STORAGE_KEY], this._partOptions.centeredLayoutFixedWidth));
 		this._register(this.onDidChangeEditorPartOptions(e => this.centeredLayoutWidget.setFixedWidth(e.newPartOptions.centeredLayoutFixedWidth ?? false)));
 
+		// Quantlab toast host
+		this.quantlabToastController = this._register(this.scopedInstantiationService.createInstance(QuantlabToastController, this.container));
+
 		// Drag & Drop support
 		this.setupDragAndDropSupport(parent, this.container);
 
@@ -1034,6 +1039,17 @@ export class EditorPart extends Part<IEditorPartMemento> implements IEditorPart,
 		});
 
 		return this.container;
+	}
+
+	showQuantlabToast(payload?: QuantlabToastPayload): void {
+		this.quantlabToastController?.showToast(payload);
+	}
+
+	dismissQuantlabToast(id?: string): void {
+		if (!id) {
+			return;
+		}
+		this.quantlabToastController?.dismissToast(id);
 	}
 
 	private handleContextKeys(): void {

@@ -45,9 +45,9 @@ export interface ICheckboxStyles {
 }
 
 export const unthemedToggleStyles = {
-	inputActiveOptionBorder: '#007ACC00',
+	inputActiveOptionBorder: '#0D85D600',
 	inputActiveOptionForeground: '#FFFFFF',
-	inputActiveOptionBackground: '#0E639C50'
+	inputActiveOptionBackground: '#0D85D650'
 };
 
 export class ToggleActionViewItem extends BaseActionViewItem {

@@ -205,12 +205,18 @@ import './contrib/notebook/browser/notebook.contribution.js';
 // Speech
 import './contrib/speech/browser/speech.contribution.js';
 
-// Chat
+// Chat (services kept for VS Code compatibility; view container disabled in chatParticipant.contribution.ts)
 import './contrib/chat/browser/chat.contribution.js';
 import './contrib/inlineChat/browser/inlineChat.contribution.js';
 import './contrib/mcp/browser/mcp.contribution.js';
 import './contrib/chat/browser/chatSessions/chatSessions.contribution.js';
 import './contrib/chat/browser/contextContrib/chatContext.contribution.js';
+
+// QIC - Quantlab Intelligence Console
+import './contrib/qic/browser/qic.contribution.js';
+
+// QuantLab Auth Gate — full-screen login overlay shown before the workbench when unauthenticated
+import './contrib/qic/browser/authGate.js';
 
 // Interactive
 import './contrib/interactive/browser/interactive.contribution.js';

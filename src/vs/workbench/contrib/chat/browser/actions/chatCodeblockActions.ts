@@ -363,7 +363,7 @@ export function registerChatCodeBlockActions() {
 				menu: {
 					id: MenuId.ChatCodeBlock,
 					group: 'navigation',
-					isHiddenByDefault: true,
+					isHiddenByDefault: false,  // Show by default for easier code insertion
 					order: 40,
 				}
 			});
