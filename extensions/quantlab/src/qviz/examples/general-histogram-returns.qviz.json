@@ -1,0 +1,80 @@
+{
+	"$schema": "https://quantlab/schemas/qviz/v1.json",
+	"qviz_version": 1,
+	"title": "Distribution of 1-second returns",
+	"description": "50-bin histogram over the full sample.",
+	"dataset": {
+		"uri": "data/btc_1s_2026.parquet",
+		"schema_hash": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+		"mtime_ns": 1735689600000000000,
+		"row_count": 1000000
+	},
+	"transforms": [
+		{
+			"kind": "filter",
+			"column": "returns",
+			"op": "not_null"
+		},
+		{
+			"kind": "bin",
+			"column": "returns",
+			"n_bins": 50,
+			"strategy": "equal_width",
+			"as": "ret_bin"
+		},
+		{
+			"kind": "groupby",
+			"columns": [
+				"ret_bin"
+			]
+		},
+		{
+			"kind": "aggregate",
+			"aggs": [
+				{
+					"column": "returns",
+					"fn": "count",
+					"as": "cnt"
+				}
+			]
+		},
+		{
+			"kind": "sort",
+			"columns": [
+				{
+					"column": "ret_bin"
+				}
+			]
+		}
+	],
+	"chart": {
+		"family": "general",
+		"type": "histogram",
+		"encodings": {
+			"x": {
+				"field": "ret_bin",
+				"type": "ordinal",
+				"title": "Return bucket"
+			},
+			"y": {
+				"field": "cnt",
+				"type": "quantitative",
+				"title": "Count"
+			}
+		},
+		"options": {
+			"y_axis_zero": true,
+			"show_grid": true
+		}
+	},
+	"provenance": {
+		"generated_at": "2026-04-29T16:50:00Z",
+		"generator": "quantlab-extension/0.1.0",
+		"query_hash": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+		"tool_versions": {
+			"qviz_schema": 1,
+			"extension": "0.1.0"
+		},
+		"source": "user-built"
+	}
+}

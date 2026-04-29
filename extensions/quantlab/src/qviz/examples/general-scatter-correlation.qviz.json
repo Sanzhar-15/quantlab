@@ -1,0 +1,72 @@
+{
+	"$schema": "https://quantlab/schemas/qviz/v1.json",
+	"qviz_version": 1,
+	"title": "Returns vs volume scatter",
+	"description": "Each point is one second. Color encodes hour-of-day.",
+	"dataset": {
+		"uri": "data/btc_1s_2026.parquet",
+		"schema_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+		"mtime_ns": 1735689600000000000,
+		"row_count": 1000000
+	},
+	"transforms": [
+		{
+			"kind": "math",
+			"column": "returns",
+			"fn": "abs",
+			"as": "abs_ret"
+		},
+		{
+			"kind": "filter",
+			"column": "abs_ret",
+			"op": ">",
+			"value": 0.0001
+		},
+		{
+			"kind": "date_trunc",
+			"column": "timestamp",
+			"unit": "hour",
+			"as": "hour"
+		},
+		{
+			"kind": "limit",
+			"n": 50000
+		}
+	],
+	"chart": {
+		"family": "general",
+		"type": "scatter",
+		"encodings": {
+			"x": {
+				"field": "volume",
+				"type": "quantitative",
+				"title": "Volume",
+				"scale": "log"
+			},
+			"y": {
+				"field": "abs_ret",
+				"type": "quantitative",
+				"title": "|Return|"
+			},
+			"color": {
+				"field": "hour",
+				"type": "temporal",
+				"title": "Hour"
+			}
+		},
+		"options": {
+			"show_legend": true,
+			"show_grid": true
+		}
+	},
+	"provenance": {
+		"generated_at": "2026-04-29T16:50:00Z",
+		"generator": "quantlab-extension/0.1.0",
+		"query_hash": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+		"tool_versions": {
+			"qviz_schema": 1,
+			"extension": "0.1.0"
+		},
+		"source": "user-built"
+	}
+}

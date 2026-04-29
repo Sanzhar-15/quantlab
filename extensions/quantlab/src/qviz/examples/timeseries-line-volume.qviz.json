@@ -1,0 +1,93 @@
+{
+	"$schema": "https://quantlab/schemas/qviz/v1.json",
+	"qviz_version": 1,
+	"title": "Daily total volume",
+	"description": "1-second OHLCV bars aggregated to daily totals.",
+	"dataset": {
+		"uri": "data/btc_1s_2026.parquet",
+		"schema_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+		"mtime_ns": 1735689600000000000,
+		"row_count": 1000000
+	},
+	"transforms": [
+		{
+			"kind": "filter",
+			"column": "volume",
+			"op": ">",
+			"value": 0
+		},
+		{
+			"kind": "date_trunc",
+			"column": "timestamp",
+			"unit": "day",
+			"as": "day"
+		},
+		{
+			"kind": "groupby",
+			"columns": [
+				"day"
+			]
+		},
+		{
+			"kind": "aggregate",
+			"aggs": [
+				{
+					"column": "volume",
+					"fn": "sum",
+					"as": "vol_sum"
+				},
+				{
+					"column": "close",
+					"fn": "mean",
+					"as": "close_avg"
+				}
+			]
+		},
+		{
+			"kind": "sort",
+			"columns": [
+				{
+					"column": "day"
+				}
+			]
+		}
+	],
+	"chart": {
+		"family": "timeseries",
+		"type": "line",
+		"encodings": {
+			"x": {
+				"field": "day",
+				"type": "temporal",
+				"title": "Day"
+			},
+			"y": {
+				"field": "vol_sum",
+				"type": "quantitative",
+				"title": "Total volume"
+			}
+		},
+		"options": {
+			"decimation": "auto",
+			"show_legend": true,
+			"show_grid": true,
+			"color_palette": "atlas-default"
+		}
+	},
+	"trading_options": {
+		"timezone": "America/New_York",
+		"session": "regular",
+		"currency": "USD"
+	},
+	"provenance": {
+		"generated_at": "2026-04-29T16:50:00Z",
+		"generator": "quantlab-extension/0.1.0",
+		"query_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+		"tool_versions": {
+			"qviz_schema": 1,
+			"extension": "0.1.0",
+			"engine": "1.0.0a1"
+		},
+		"source": "user-built"
+	}
+}

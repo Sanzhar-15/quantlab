@@ -1,0 +1,57 @@
+{
+	"$schema": "https://quantlab/schemas/qviz/v1.json",
+	"qviz_version": 1,
+	"title": "BTC OHLCV candlestick",
+	"description": "Raw 1-second bars with OHLCV encoding.",
+	"dataset": {
+		"uri": "data/btc_1s_2026.parquet",
+		"schema_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+		"mtime_ns": 1735689600000000000,
+		"row_count": 1000000
+	},
+	"transforms": [
+		{
+			"kind": "limit",
+			"n": 100000
+		}
+	],
+	"chart": {
+		"family": "timeseries",
+		"type": "candlestick",
+		"encodings": {
+			"ohlcv": {
+				"time": "timestamp",
+				"open": "open",
+				"high": "high",
+				"low": "low",
+				"close": "close",
+				"volume": "volume"
+			}
+		},
+		"options": {
+			"decimation": "lttb",
+			"show_grid": true,
+			"color_palette": "atlas-dark"
+		}
+	},
+	"trading_options": {
+		"timezone": "UTC",
+		"session": "full24",
+		"adjustment": "none",
+		"currency": "USD",
+		"precision": {
+			"price": 2,
+			"quantity": 4
+		}
+	},
+	"provenance": {
+		"generated_at": "2026-04-29T16:50:00Z",
+		"generator": "quantlab-engine/1.0.0a1 via qviz.candlestick",
+		"query_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+		"tool_versions": {
+			"qviz_schema": 1,
+			"engine": "1.0.0a1"
+		},
+		"source": "engine-emitted"
+	}
+}
