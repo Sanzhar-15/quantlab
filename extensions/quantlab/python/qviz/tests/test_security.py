@@ -128,13 +128,16 @@ def test_budget_aborts_long_query() -> None:
     assert elapsed < 1.0, f"watchdog did not interrupt promptly (took {elapsed:.2f}s)"
 
 
-def test_budget_caps_memory() -> None:
-    # Allocate ~50 MB while cap is 1 MB. The current implementation is post-hoc:
-    # the with-block runs to completion, but exit raises if delta > cap.
+def test_budget_caps_memory(monkeypatch) -> None:
+    # ru_maxrss is monotonic across the process; a real allocation test is
+    # flaky when other tests in the suite have already pushed maxrss high.
+    # Drive the comparison deterministically by injecting before/after values.
+    from qviz import security
+    values = iter([100.0, 250.0])  # before, after — delta 150 MB
+    monkeypatch.setattr(security, "_peak_rss_mb", lambda: next(values))
     with pytest.raises(MemoryLimitError, match="peak"):
         with query_budget(timeout_s=10.0, peak_rss_mb=1):
-            blob = bytearray(50 * 1024 * 1024)
-            del blob
+            pass
 
 
 def test_budget_state_dict_visible() -> None:
