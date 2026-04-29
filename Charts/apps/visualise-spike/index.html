@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Visualise Spike — @charts-plus 1M-point line</title>
+  <style>
+    body { margin: 0; font-family: -apple-system, system-ui, sans-serif; background: #0a0f18; color: #e7e9ee; }
+    #stats { position: fixed; top: 8px; right: 8px; background: rgba(0,0,0,0.7); padding: 12px 16px; border-radius: 6px; font-size: 12px; line-height: 1.6; z-index: 10; min-width: 280px; }
+    #stats .v { color: #4fc3f7; font-weight: 600; }
+    #stats .ok { color: #81c784; }
+    #stats .warn { color: #ffb74d; }
+    #stats .err { color: #f06292; }
+    #chart { width: 100vw; height: 100vh; }
+    button { background: #1e293b; color: #e7e9ee; border: 1px solid #334155; padding: 6px 10px; border-radius: 4px; cursor: pointer; margin-top: 8px; }
+    button:hover { background: #334155; }
+  </style>
+</head>
+<body>
+  <div id="stats">Initializing…</div>
+  <div id="chart"></div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

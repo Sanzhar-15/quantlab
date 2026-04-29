@@ -51,3 +51,4 @@ product.json.backup*
 # Charts/ pnpm monorepo build outputs
 /Charts/**/dist/
 /Charts/**/.turbo/
+/.plans/

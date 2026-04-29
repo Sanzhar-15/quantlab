@@ -28,6 +28,8 @@ export const all = Object.freeze<string[]>([
 	'!test/**/out/**',
 	'!**/node_modules/**',
 	'!**/*.js.map',
+	'!extensions/quantlab/python/**',
+	'!extensions/quantlab/dist/**',
 ]);
 
 export const unicodeFilter = Object.freeze<string[]>([
