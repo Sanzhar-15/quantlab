@@ -188,6 +188,21 @@ class Daemon:
         x_col = req["x_col"]; y_col = req["y_col"]
         n_visible = int(req.get("n_visible", 3000))
         path = resolve_workspace_path(self.workspace_root, path_str)
+        # Validate column names against the file schema BEFORE handing them
+        # to pyarrow. Without this, an attacker can send arbitrary column
+        # references and trigger uncontrolled errors. (Audit finding #3)
+        schema = reader.read_schema(path)
+        schema_names = set(schema.names)
+        if x_col not in schema_names:
+            raise SecurityError(
+                f"decimate: x_col {x_col!r} not in file schema "
+                f"(available: {sorted(schema_names)})"
+            )
+        if y_col not in schema_names:
+            raise SecurityError(
+                f"decimate: y_col {y_col!r} not in file schema "
+                f"(available: {sorted(schema_names)})"
+            )
         mtime = reader.file_mtime_ns(path)
         cache_key = make_cache_key(
             file_path=str(path), mtime_ns=mtime,
@@ -206,6 +221,15 @@ class Daemon:
             ys = t.column(y_col).to_numpy(zero_copy_only=False)
             if np.issubdtype(xs.dtype, np.datetime64):
                 xs = xs.astype("datetime64[ms]").astype(np.int64)
+            # Pre-filter NaN/null rows before LTTB. LTTB can pick a NaN point
+            # from an all-NaN bucket, which then renders as a gap; filtering
+            # upstream gives the renderer a clean, contiguous series.
+            # (Audit finding #8.)
+            if ys.dtype.kind == "f":
+                mask = ~np.isnan(ys)
+                if mask.sum() < ys.shape[0]:
+                    xs = xs[mask]
+                    ys = ys[mask]
             out_xs, out_ys = lttb(xs, ys, n_visible)
 
         arrow_table = pa.table({"t": out_xs, "v": out_ys})

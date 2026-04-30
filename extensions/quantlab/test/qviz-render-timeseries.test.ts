@@ -224,6 +224,30 @@ suite('compileTimeseriesPlan — candlestick', () => {
 		assert.deepStrictEqual(s.data[0], { t: 1000, o: 10, h: 12, l: 9, c: 11 });
 	});
 
+	test('drops candles violating OHLC invariants (h<l, o/c outside [l,h])', () => {
+		const spec = makeSpec({
+			chart: {
+				family: 'timeseries',
+				type: 'candlestick',
+				encodings: {
+					ohlcv: { time: 'ts', open: 'o', high: 'h', low: 'l', close: 'c' },
+				},
+			},
+		});
+		const columns: ColumnData = {
+			ts: [1000, 2000, 3000, 4000, 5000],
+			//      OK   h<l  o>h  c<l  OK
+			o: [10, 11, 50, 12, 13],
+			h: [12, 5, 20, 14, 15],
+			l: [9, 8, 5, 11, 10],
+			c: [11, 9, 19, 8, 14],
+		};
+		const plan = compileTimeseriesPlan(spec, columns, TEST_THEME);
+		const s = plan.series[0] as CandlestickPlan;
+		assert.strictEqual(s.data.length, 2, 'only 2 of 5 candles satisfy OHLC invariants');
+		assert.ok(plan.diagnostics.some(d => /OHLC invariants/.test(d)));
+	});
+
 	test('drops candles with NaN or null OHLC', () => {
 		const spec = makeSpec({
 			chart: {
@@ -258,6 +282,28 @@ suite('compileTimeseriesPlan — candlestick', () => {
 		assert.throws(
 			() => compileTimeseriesPlan(spec, {}, TEST_THEME),
 			(e: Error) => e instanceof CompilePlanError && /requires encodings\.ohlcv/.test(e.message)
+		);
+	});
+
+	test('emits LOUD diagnostic when ALL y values are null (audit #11)', () => {
+		const spec = makeSpec({
+			chart: {
+				family: 'timeseries',
+				type: 'line',
+				encodings: {
+					x: { field: 't', type: 'temporal' },
+					y: { field: 'v', type: 'quantitative' },
+				},
+			},
+		});
+		const plan = compileTimeseriesPlan(
+			spec,
+			{ t: [1, 2, 3], v: [null, null, null] },
+			TEST_THEME
+		);
+		assert.ok(
+			plan.diagnostics.some(d => /ALL 3 rows are null/.test(d)),
+			`expected loud all-null diagnostic, got: ${JSON.stringify(plan.diagnostics)}`
 		);
 	});
 

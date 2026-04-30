@@ -259,6 +259,19 @@ def test_compile_error_returned_as_response(daemon: _DaemonClient) -> None:
     assert "ghost_column" in resp["error"]
 
 
+def test_decimate_rejects_unknown_column(daemon: _DaemonClient) -> None:
+    """Audit finding #3: x_col / y_col must be validated against schema before
+    pyarrow gets them. Without this, an attacker can send any string and trigger
+    uncontrolled errors (KeyError) rather than a controlled SecurityError."""
+    resp, _ = daemon.request(
+        "decimate", path="data/ohlcv.parquet",
+        x_col="__not_a_column__", y_col="close", n_visible=100,
+    )
+    assert resp["ok"] is False
+    assert "SecurityError" in resp["error"]
+    assert "__not_a_column__" in resp["error"]
+
+
 def test_decimate_returns_arrow(daemon: _DaemonClient) -> None:
     resp, binary = daemon.request(
         "decimate", path="data/ohlcv.parquet",

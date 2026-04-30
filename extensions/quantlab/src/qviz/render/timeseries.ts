@@ -129,6 +129,7 @@ function compileCandlestick(
 
 	const data: OhlcDataPointMs[] = new Array(n);
 	let droppedNanRows = 0;
+	let droppedInvalidRows = 0;
 	let outIdx = 0;
 	for (let i = 0; i < n; i++) {
 		const t = tCol[i];
@@ -144,12 +145,22 @@ function compileCandlestick(
 			droppedNanRows++;
 			continue;
 		}
+		// Audit finding #9: validate OHLC structural invariants. h must be the
+		// max and l the min; o/c must lie between l and h. Bad data here
+		// renders as a glitched candle and pollutes downstream analysis.
+		if (h < l || o > h || o < l || c > h || c < l) {
+			droppedInvalidRows++;
+			continue;
+		}
 		data[outIdx++] = { t, o, h, l, c };
 	}
 	data.length = outIdx;
 
 	if (droppedNanRows > 0) {
 		diagnostics.push(`candlestick: dropped ${droppedNanRows} rows with null/NaN OHLCV`);
+	}
+	if (droppedInvalidRows > 0) {
+		diagnostics.push(`candlestick: dropped ${droppedInvalidRows} rows violating OHLC invariants (h<l or o/c outside [l,h])`);
 	}
 
 	return {
@@ -211,6 +222,12 @@ function compileScalarSeries(
 
 	if (nullCount > 0) {
 		diagnostics.push(`${chartType}: ${nullCount} of ${n} rows have null/invalid values`);
+	}
+	if (n > 0 && nullCount === n) {
+		// Audit finding #11: silent empty chart confuses the user. Surface a
+		// loud diagnostic so the renderer / UI can show "no data" copy
+		// instead of an unexplained blank canvas.
+		diagnostics.push(`${chartType}: ALL ${n} rows are null/invalid -- chart will render empty`);
 	}
 
 	const id = chartType;

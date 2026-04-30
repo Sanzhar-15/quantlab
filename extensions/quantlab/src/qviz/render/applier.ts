@@ -36,14 +36,36 @@ import type {
  * Returns the Chart so callers can keep a handle for later updates
  * (re-applying a plan, disposing on unmount, etc.).
  *
- * NOTE: this creates a NEW chart on every call. Callers wanting to update
- * an existing chart should add an updateTimeseriesPlan helper later. For v1,
- * tear down + re-create is fine -- the spike showed setData(1M) at 27ms.
+ * IMPORTANT (audit finding #10): callers who plan to re-render must pass
+ * the previous Chart via `existing` so it is disposed before a new one is
+ * created. Without this, a builder UI that reapplies on every encoding
+ * change leaks one Chart + its workers per call.
+ *
+ *   let chart: Chart | undefined;
+ *   onPlanChange(plan => {
+ *     chart = applyTimeseriesPlan(container, plan, chart);
+ *   });
+ *
+ * setData(1M) is ~27ms (spike), so tear down + re-create is fine for v1.
+ * A patch-in-place updater (changing only encodings, not chart type) is
+ * a Phase 8 polish item.
  */
 export function applyTimeseriesPlan(
 	container: HTMLElement,
-	plan: TimeseriesPlan
+	plan: TimeseriesPlan,
+	existing?: Chart
 ): Chart {
+	if (existing) {
+		try {
+			disposeChart(existing, container);
+		} catch (e) {
+			// Disposal failure should not block re-render. Log via diagnostics
+			// channel in production wiring; here we swallow to keep the new
+			// chart-creation path on the happy path.
+			void e;
+		}
+	}
+
 	const chartOptions: CreateChartOptions = buildCreateChartOptions(plan);
 	const chart = createChart(container, chartOptions);
 
@@ -52,6 +74,30 @@ export function applyTimeseriesPlan(
 	}
 
 	return chart;
+}
+
+/**
+ * Tear down a Chart instance and clear the container.
+ *
+ * @charts-plus has a moving disposal API across versions; this helper
+ * tries the common shapes (`chart.remove()`, `chart.destroy()`,
+ * `chart.dispose()`) and finally falls back to clearing the container's
+ * children. Call this before discarding a Chart reference.
+ */
+export function disposeChart(chart: Chart, container?: HTMLElement): void {
+	const c = chart as unknown as Record<string, unknown>;
+	for (const methodName of ['remove', 'destroy', 'dispose'] as const) {
+		const fn = c[methodName];
+		if (typeof fn === 'function') {
+			(fn as () => void).call(chart);
+			break;
+		}
+	}
+	if (container) {
+		while (container.firstChild) {
+			container.removeChild(container.firstChild);
+		}
+	}
 }
 
 /** Build CreateChartOptions from the plan + (optional) theme tokens. */
@@ -124,14 +170,19 @@ function toDataPoints(plan: readonly { t: number; v: number | null }[]): DataPoi
 }
 
 function toHistogramPoints(plan: readonly { t: number; v: number | null }[]): { t: number; v: number; color?: string }[] {
-	const out: { t: number; v: number; color?: string }[] = new Array(plan.length);
-	let outIdx = 0;
+	// Audit finding #4: histogram silently truncates null y rows. Diagnostic
+	// is surfaced via the plan layer (TimeseriesPlan.diagnostics) for null
+	// counts; this function is the rendering coercion only and intentionally
+	// drops nulls because chart-core's HistogramSeries does not have a
+	// null-bucket concept. Callers wanting null-bucket semantics should
+	// pre-aggregate (count rows per bin in the daemon) instead of relying
+	// on this implicit drop.
+	const out: { t: number; v: number; color?: string }[] = [];
 	for (let i = 0; i < plan.length; i++) {
 		const v = plan[i].v;
 		if (v === null) { continue; }
-		out[outIdx++] = { t: plan[i].t, v };
+		out.push({ t: plan[i].t, v });
 	}
-	out.length = outIdx;
 	return out;
 }
 

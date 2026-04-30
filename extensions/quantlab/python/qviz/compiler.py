@@ -151,12 +151,44 @@ def compile_spec(spec: dict, schema: pa.Schema, file_path: str) -> CompiledQuery
     chart_options = chart.get("options") or {}
     final_limit = ctx.cap
 
-    final_columns = sorted(available)
-    final_sql = f"SELECT * FROM {cte_name} LIMIT {final_limit}"
+    final_columns = _final_columns_for(spec, available)
+    select_clause = ", ".join(quote_ident(c) for c in final_columns) if final_columns else "*"
+    final_sql = f"SELECT {select_clause} FROM {cte_name} LIMIT {final_limit}"
 
     sql = "WITH " + ",\n     ".join(ctx.ctes) + "\n" + final_sql
 
     return CompiledQuery(sql=sql, params=ctx.params, final_columns=final_columns)
+
+
+def _final_columns_for(spec: dict, available: set[str]) -> list[str]:
+    """Project only columns the chart actually consumes (audit finding #6).
+
+    Avoids leaking intermediate columns (e.g. a 'day' alias from date_trunc
+    plus the original 'timestamp') to the renderer, which would change the
+    response shape and confuse encoding lookup.
+
+    Falls back to all available columns when no encodings are present (rare,
+    only happens in tests or pure-data export use cases).
+    """
+    chart = spec.get("chart") or {}
+    encodings = chart.get("encodings") or {}
+    referenced: set[str] = set()
+    for enc_name, enc in encodings.items():
+        if not enc:
+            continue
+        if enc_name == "ohlcv":
+            for f in ("time", "open", "high", "low", "close", "volume"):
+                v = enc.get(f)
+                if isinstance(v, str) and v in available:
+                    referenced.add(v)
+        else:
+            f = enc.get("field") if isinstance(enc, dict) else None
+            if isinstance(f, str) and f in available:
+                referenced.add(f)
+    if not referenced:
+        return sorted(available)
+    # Stable order: encoding-referenced columns first, alphabetised.
+    return sorted(referenced)
 
 
 # ---------------------------------------------------------------------------
