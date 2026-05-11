@@ -48,8 +48,12 @@ tokio = { version = "=1.50.0", default-features = false, features = ["rt-multi-t
 # Bench
 criterion = { version = "=0.8.2", default-features = false, features = ["html_reports"] }
 
-# SIMD (runtime dispatch per Phase 0 Decision F)
-pulp = "=0.22.2"
+# SIMD (runtime dispatch per Phase 0 Decision F).
+# pulp's default features include `x86-v3` (= AVX2 baseline at compile time), which would
+# defeat A3 by baking AVX2 into distributable binaries. We disable defaults and opt back in
+# to `std` only; runtime dispatch comes from pulp's per-function `Arch::detect()` and
+# `multiversion`. Do NOT add `x86-v3`/`x86-v4` to features here.
+pulp = { version = "=0.22.2", default-features = false, features = ["std"] }
 multiversion = "=0.8.0"
 bytemuck = "=1.25.0"
 

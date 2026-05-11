@@ -24,7 +24,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Toolchain version is pinned by quantbook-engine/rust-toolchain.toml; the action tag is
+      # @master per dtolnay/rust-toolchain docs (use a versioned tag OR @master + toolchain:).
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.83.0
           components: rustfmt, clippy
@@ -35,10 +37,10 @@ jobs:
         run: bash scripts/check-build-flags.sh
       - name: cargo fmt
         run: cargo fmt --all -- --check
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: cargo test
-        run: cargo test --workspace
+      - name: cargo clippy (--locked)
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: cargo test (--locked)
+        run: cargo test --locked --workspace
 
   bench-compile:
     name: bench compile (no run)
@@ -46,11 +48,11 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.83.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: quantbook-engine -> target
-      - name: cargo bench --no-run
-        run: cargo bench --workspace --no-run
+      - name: cargo bench --no-run (--locked)
+        run: cargo bench --locked --workspace --no-run

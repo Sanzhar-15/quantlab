@@ -21,12 +21,27 @@ ENGINE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$ENGINE_ROOT/.." && pwd)"
 
 err=0
-banned='target-cpu[[:space:]]*=[[:space:]]*"\?native'
+# Match all real-world poisoning forms:
+#   target-cpu=native            (no spaces, common in TOML/RUSTFLAGS strings)
+#   target-cpu = native          (TOML-y with spaces)
+#   target-cpu="native"          (quoted)
+#   target-cpu = "native"        (quoted with spaces)
+# Note: '"?' is "optional double quote"; do NOT use '"\?' — in grep -E that means literal '?'.
+banned='target-cpu[[:space:]]*=[[:space:]]*"?native'
+
+# Strip comment-only lines (TOML/YAML/shell all use leading '#') before matching, so the rule
+# itself can be documented in comments without self-triggering.
+strip_comments() {
+  # Print non-comment, non-blank lines from $1 prefixed with "$1:<lineno>:" for diagnostics.
+  awk 'NF && $0 !~ /^[[:space:]]*#/ { printf "%s:%d:%s\n", FILENAME, NR, $0 }' "$1"
+}
 
 # 1. .cargo/config.toml
 if [[ -f "$ENGINE_ROOT/.cargo/config.toml" ]]; then
-  if grep -E "$banned" "$ENGINE_ROOT/.cargo/config.toml" > /dev/null 2>&1; then
-    echo "ERROR: $ENGINE_ROOT/.cargo/config.toml contains 'target-cpu=native'." >&2
+  hit=$(strip_comments "$ENGINE_ROOT/.cargo/config.toml" | grep -E "$banned" || true)
+  if [[ -n "$hit" ]]; then
+    echo "ERROR: $ENGINE_ROOT/.cargo/config.toml contains 'target-cpu=native':" >&2
+    echo "$hit" >&2
     err=1
   fi
 fi
@@ -37,11 +52,18 @@ if [[ "${RUSTFLAGS:-}" =~ target-cpu[[:space:]]*=[[:space:]]*\"?native ]]; then
   err=1
 fi
 
-# 3. GitHub workflows (look only at quantbook-engine-related workflows)
+# 3. GitHub workflows
 if [[ -d "$REPO_ROOT/.github/workflows" ]]; then
-  if grep -rE "$banned" "$REPO_ROOT/.github/workflows" > /dev/null 2>&1; then
-    echo "ERROR: a workflow file under .github/workflows/ contains 'target-cpu=native'." >&2
-    grep -nE "$banned" "$REPO_ROOT/.github/workflows" >&2 || true
+  workflow_hits=""
+  while IFS= read -r -d '' wf; do
+    h=$(strip_comments "$wf" | grep -E "$banned" || true)
+    if [[ -n "$h" ]]; then
+      workflow_hits+="$h"$'\n'
+    fi
+  done < <(find "$REPO_ROOT/.github/workflows" -type f \( -name '*.yml' -o -name '*.yaml' \) -print0)
+  if [[ -n "$workflow_hits" ]]; then
+    echo "ERROR: a workflow file under .github/workflows/ contains 'target-cpu=native':" >&2
+    printf '%s' "$workflow_hits" >&2
     err=1
   fi
 fi
