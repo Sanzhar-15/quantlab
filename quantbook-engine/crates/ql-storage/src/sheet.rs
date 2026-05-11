@@ -106,12 +106,27 @@ impl Sheet {
 
     /// Append a fully-constructed column at the next column index. Used by xlsx import or
     /// bench-fixture loading.
+    ///
+    /// Per opus consistency N-3: the prior `column.row_count() as RowId` silently truncated
+    /// u64 → u32. Excel rows fit u32 4000× over, but the cast was a latent fallback. Now uses
+    /// `try_into` with `expect` so any malformed fixture (e.g. > 4.3B rows) fails visibly.
     pub fn append_column(&mut self, column: ColumnStore) {
-        let col_idx = self.columns.len() as ColId;
-        let row_extent = column.row_count() as RowId;
+        let col_idx: ColId = self
+            .columns
+            .len()
+            .try_into()
+            .expect("Sheet::append_column: column count exceeds ColId range");
+        let row_extent: RowId = column
+            .row_count()
+            .try_into()
+            .expect("Sheet::append_column: column row_count exceeds RowId range");
         self.columns.push(column);
-        if col_idx + 1 > self.bounds.col_extent {
-            self.bounds.col_extent = col_idx + 1;
+        if let Some(new_col_extent) = col_idx.checked_add(1) {
+            if new_col_extent > self.bounds.col_extent {
+                self.bounds.col_extent = new_col_extent;
+            }
+        } else {
+            panic!("Sheet::append_column: col_idx + 1 overflows ColId");
         }
         if row_extent > self.bounds.row_extent {
             self.bounds.row_extent = row_extent;

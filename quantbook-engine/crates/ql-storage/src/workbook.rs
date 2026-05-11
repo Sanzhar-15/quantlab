@@ -72,11 +72,17 @@ impl Workbook {
         &self.names
     }
 
-    /// Append a new sheet; returns its `SheetId`. Panics if sheet count would exceed
-    /// `SheetId::MAX` (65,535) — a real workbook would be malformed long before that.
+    /// Append a new sheet; returns its `SheetId`. Panics if the next ID would exceed
+    /// `SheetId::MAX` (65,535). Excel allows ≤255 sheets in practice; we cap at the type
+    /// limit so the ID always fits the field.
     pub fn add_sheet(&mut self, name: impl Into<String>) -> SheetId {
         let id = self.sheets.len();
-        assert!(id <= SheetId::MAX as usize, "too many sheets (limit 65535)");
+        assert!(
+            id < SheetId::MAX as usize,
+            "too many sheets (max {}, current {})",
+            SheetId::MAX as usize,
+            id
+        );
         self.sheets.push(Sheet::new(name));
         id as SheetId
     }
@@ -88,7 +94,11 @@ impl Workbook {
         chunk_rows: u32,
     ) -> SheetId {
         let id = self.sheets.len();
-        assert!(id <= SheetId::MAX as usize, "too many sheets");
+        assert!(
+            id < SheetId::MAX as usize,
+            "too many sheets (max {})",
+            SheetId::MAX as usize
+        );
         self.sheets.push(Sheet::with_chunk_rows(name, chunk_rows));
         id as SheetId
     }

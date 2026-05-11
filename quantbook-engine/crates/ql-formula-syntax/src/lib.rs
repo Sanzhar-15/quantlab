@@ -39,12 +39,14 @@ mod tests {
         let _: Result<Vec<Token>, LexError> = lex("=A1");
         let _: Expr = Expr::Number(1.5);
         let _: CellAddr = CellAddr {
+            sheet: None,
             col: 0,
             row: 0,
             abs_col: false,
             abs_row: false,
         };
         let _: RangeRef = RangeRef::Cells {
+            sheet: None,
             start_col: 0,
             start_row: 0,
             end_col: 0,

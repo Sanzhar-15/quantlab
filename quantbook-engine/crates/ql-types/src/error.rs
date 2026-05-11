@@ -107,7 +107,7 @@ impl fmt::Display for ErrorValue {
 impl FromStr for ErrorValue {
     type Err = ParseErrorValueError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Search ALL — cheap (13 entries) and avoids hand-mapping mistakes.
+        // Search ALL — cheap (14 entries) and avoids hand-mapping mistakes.
         for e in ErrorValue::ALL {
             if s.eq_ignore_ascii_case(e.sigil()) {
                 return Ok(e);

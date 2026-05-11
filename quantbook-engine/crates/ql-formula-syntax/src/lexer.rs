@@ -51,8 +51,11 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
     let mut chars = input.chars().peekable();
 
     while let Some(&c) = chars.peek() {
-        // Skip whitespace — Excel ignores it between tokens.
-        if c.is_whitespace() {
+        // Skip whitespace — Excel only treats ASCII space/tab/LF/CR as whitespace between
+        // tokens (NBSP, vertical-tab, BOM, etc. are NOT whitespace in Excel formulas).
+        // Per opus arch F14: `char::is_whitespace` is Unicode-defined and would silently
+        // accept clipboard-paste NBSP; we lex strictly per Excel canon.
+        if matches!(c, ' ' | '\t' | '\n' | '\r') {
             chars.next();
             continue;
         }
@@ -394,6 +397,31 @@ mod tests {
                 Token::Number(2.0)
             ]
         );
+    }
+
+    #[test]
+    fn ascii_whitespace_only_no_nbsp() {
+        // Per opus arch F14: Excel only accepts ASCII whitespace. NBSP / vertical tab / BOM
+        // are NOT whitespace in Excel formulas — should error out instead of being silently
+        // dropped. \r\n line endings ARE accepted (the four ASCII forms).
+        assert_eq!(
+            lex_ok("1\r\n+\r\n2"),
+            vec![
+                Token::Number(1.0),
+                Token::Op(Operator::Plus),
+                Token::Number(2.0)
+            ]
+        );
+        // NBSP between tokens should NOT be treated as whitespace.
+        assert!(matches!(
+            lex("1\u{00A0}+\u{00A0}2"),
+            Err(LexError::UnexpectedChar('\u{00A0}'))
+        ));
+        // BOM at start should error.
+        assert!(matches!(
+            lex("\u{FEFF}1"),
+            Err(LexError::UnexpectedChar('\u{FEFF}'))
+        ));
     }
 
     // -- numbers ---------------------------------------------------------------

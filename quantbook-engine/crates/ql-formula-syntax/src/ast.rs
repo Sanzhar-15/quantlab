@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use ql_types::{ColId, RowId};
+use ql_types::{ColId, RowId, SheetId};
 
 use crate::token::Operator;
 
@@ -62,10 +62,13 @@ pub enum Expr {
     Spill(Box<Expr>),
 }
 
-/// Address inside an `Expr` — sheet-qualification deferred to Phase 3+; `sheet: None` means
-/// "the formula's containing sheet" (resolved during binding).
+/// Address inside an `Expr`. `sheet: None` means "the formula's containing sheet" (resolved
+/// during binding). The field is Phase-0-tracked but the Phase 0 lexer never populates it —
+/// shipped now (opus arch F13) so Phase 3+ sheet-qualified refs add behavior without a
+/// breaking shape change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CellAddr {
+    pub sheet: Option<SheetId>,
     pub col: ColId,
     pub row: RowId,
     pub abs_col: bool,
@@ -88,7 +91,9 @@ pub struct CellAddr {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RangeRef {
     /// Bounded rectangular cell range. Start ≤ end on each axis (parser-normalized).
+    /// `sheet: None` = the formula's containing sheet (Phase 0 default; Phase 3+ populates).
     Cells {
+        sheet: Option<SheetId>,
         start_col: ColId,
         start_row: RowId,
         end_col: ColId,
@@ -100,6 +105,7 @@ pub enum RangeRef {
     },
     /// Whole-column range (e.g. `A:A`, `B:D`). Rows span the full sheet.
     WholeColumn {
+        sheet: Option<SheetId>,
         start_col: ColId,
         end_col: ColId,
         abs_start: bool,
@@ -107,6 +113,7 @@ pub enum RangeRef {
     },
     /// Whole-row range (e.g. `1:1`, `2:5`). Cols span the full sheet.
     WholeRow {
+        sheet: Option<SheetId>,
         start_row: RowId,
         end_row: RowId,
         abs_start: bool,
@@ -124,6 +131,7 @@ mod tests {
         let _ = Expr::String(Arc::from("hi"));
         let _ = Expr::Bool(true);
         let _ = Expr::CellRef(CellAddr {
+            sheet: None,
             col: 0,
             row: 0,
             abs_col: false,
@@ -152,12 +160,14 @@ mod tests {
             name: Arc::from("SUM"),
             args: vec![
                 Expr::CellRef(CellAddr {
+                    sheet: None,
                     col: 0,
                     row: 0,
                     abs_col: false,
                     abs_row: false,
                 }),
                 Expr::CellRef(CellAddr {
+                    sheet: None,
                     col: 0,
                     row: 1,
                     abs_col: false,
@@ -176,6 +186,7 @@ mod tests {
     fn rangeref_whole_column_shape() {
         // A:A — explicit WholeColumn variant.
         let r = RangeRef::WholeColumn {
+            sheet: None,
             start_col: 0,
             end_col: 0,
             abs_start: false,
@@ -194,6 +205,7 @@ mod tests {
     #[test]
     fn rangeref_whole_row_shape() {
         let r = RangeRef::WholeRow {
+            sheet: None,
             start_row: 0,
             end_row: 0,
             abs_start: false,
@@ -212,6 +224,7 @@ mod tests {
     #[test]
     fn rangeref_cells_bounded_shape() {
         let r = RangeRef::Cells {
+            sheet: None,
             start_col: 0,
             start_row: 0,
             end_col: 1,
@@ -234,6 +247,7 @@ mod tests {
     #[test]
     fn rangeref_variants_distinct() {
         let cells = RangeRef::Cells {
+            sheet: None,
             start_col: 0,
             start_row: 0,
             end_col: 0,
@@ -244,12 +258,14 @@ mod tests {
             abs_end_row: false,
         };
         let col = RangeRef::WholeColumn {
+            sheet: None,
             start_col: 0,
             end_col: 0,
             abs_start: false,
             abs_end: false,
         };
         let row = RangeRef::WholeRow {
+            sheet: None,
             start_row: 0,
             end_row: 0,
             abs_start: false,
