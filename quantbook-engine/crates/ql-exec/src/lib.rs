@@ -20,11 +20,13 @@
 //! - W4-7 Phase 0 exit packet + GO/NO-GO.
 
 pub mod env;
+pub mod lower;
 pub mod plan;
 pub mod scalar;
 pub mod simd;
 
 pub use env::{CellEnv, MapEnv, WorkbookEnv};
+pub use lower::{classify, dispatch, SimdShape};
 pub use plan::{bind, BindError, ExprPlan};
 pub use scalar::eval_scalar;
 pub use simd::{
