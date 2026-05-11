@@ -1,11 +1,32 @@
-//! `ql-functions` — Phase 0 stub. See ../../../.plans/_QUANTBOOK-v1-SPECIFICATION.md Part V.
+//! `ql-functions` — Quantbook built-in function library.
+//!
+//! Phase 0 W4-4 scope: 22 distinct functions (25 registry entries with aliases) covering
+//! the most common Excel formula primitives:
+//!
+//! - **Aggregates**: SUM, AVERAGE/AVG, COUNT, COUNTA, MIN, MAX, PRODUCT.
+//! - **Variance / stdev (Welford-backed for A6)**: VAR, VAR.S, VAR.P, STDEV, STDEV.S, STDEV.P.
+//! - **Logical**: IF, AND, OR, NOT, IFERROR.
+//! - **Math**: ABS, SQRT, ROUND, INT, MOD, POWER.
+//!
+//! All functions are `fn(&[Value]) -> Value` — pre-evaluated args, Excel-compatible
+//! coercion + error propagation. Range references get expanded to per-cell Values
+//! at the binder layer before reaching this module.
+//!
+//! ## A6 acceptance (NIST StRD numacc verification)
+//!
+//! VAR / VAR.S / STDEV / STDEV.S use Welford's online algorithm via
+//! `welford::WelfordState`. Verified against an analytic large-offset + small-variance
+//! dataset (`welford::tests::a6_acceptance_shape_lock_large_offset_small_variance`):
+//! mean accurate to ≥12 significant digits, variance to ≥8 — meets the A6 spec.
+//!
+//! Literal NIST numacc dataset import (W4-5 follow-up) will add data fixtures via a
+//! `Cargo`-tracked test asset; the Welford shape is locked here.
 
-#![allow(dead_code)]
+pub mod registry;
+pub mod scalar_fns;
+pub mod welford;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn smoke() {
-        // crate compiles; replace as Phase 0 work lands.
-    }
-}
+pub use registry::{default_registry, FunctionRegistry, ScalarFn};
+pub use welford::{
+    mean, population_stdev, population_variance, sample_stdev, sample_variance, WelfordState,
+};

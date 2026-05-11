@@ -10,3 +10,7 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+ql-types = { path = "../ql-types" }
+
+[dev-dependencies]
+proptest = { workspace = true }
