@@ -33,6 +33,7 @@ use ql_types::{ColId, RowId, SheetId};
 
 use crate::edges::AdjacencyVectors;
 use crate::node::{CellNode, FormulaRegionNode, Node, NodeId, RangeNode};
+use crate::stats::GraphStats;
 use crate::stripes::{range_contains_rowcol, StripeIndex};
 
 /// The calc-graph container.
@@ -61,6 +62,7 @@ pub struct Graph {
     revision: u64,
     stripes: StripeIndex,
     formula_to_range_deps: HashMap<NodeId, Vec<RangeRef>>,
+    stats: GraphStats,
 }
 
 impl Graph {
@@ -169,7 +171,18 @@ impl Graph {
             "Graph::register_range_dependency: formula_node {} out of bounds",
             formula_node.index()
         );
+        let inserts_before = self.stripes.total_insertions();
         self.stripes.register(formula_node, &range, sheet_id);
+        let inserts_after = self.stripes.total_insertions();
+        // `stripe_inserts` counts the NEW insertions this call produced. HashSet dedup
+        // means a re-registration of the same (formula_node, range) might be a no-op,
+        // in which case the delta is zero — matches Formualizer's instrumentation
+        // semantics (`engine/graph/range_deps.rs:78-86`).
+        self.stats.stripe_inserts = self
+            .stats
+            .stripe_inserts
+            .checked_add((inserts_after - inserts_before) as u64)
+            .expect("Graph::register_range_dependency: stripe_inserts overflowed u64");
         self.formula_to_range_deps
             .entry(formula_node)
             .or_default()
@@ -178,6 +191,24 @@ impl Graph {
             .revision
             .checked_add(1)
             .expect("Graph::register_range_dependency: revision counter overflowed u64");
+    }
+
+    /// Borrow the instrumentation counters. Used by tests + the W3-7 graph-profile.json
+    /// export (OG-06 acceptance).
+    pub fn stats(&self) -> GraphStats {
+        self.stats
+    }
+
+    /// Bump `chunked_reduce_chunks_processed` by `n`. Phase 0 doesn't increment this
+    /// from inside ql-calcgraph; Week 4 ql-exec calls this on each chunk it processes
+    /// during a `SUM`/`COUNT`/etc. reduction. Locking the API in W3-6 means Week 4 just
+    /// wires the increments without a graph-shape change.
+    pub fn record_chunked_reduce(&mut self, chunks_processed: u64) {
+        self.stats.chunked_reduce_chunks_processed = self
+            .stats
+            .chunked_reduce_chunks_processed
+            .checked_add(chunks_processed)
+            .expect("Graph::record_chunked_reduce: counter overflowed u64");
     }
 
     /// True dependents of a cell write at `(sheet, row, col)`. Two-pass:
