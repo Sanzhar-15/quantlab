@@ -20,10 +20,12 @@
 
 pub mod ast;
 pub mod lexer;
+pub mod parser;
 pub mod token;
 
 pub use ast::{CellAddr, Expr, RangeRef};
 pub use lexer::{column_letters_to_index, lex, LexError, MAX_COLUMN, MAX_ROW};
+pub use parser::{parse, ParseError};
 pub use token::{Operator, Token};
 
 #[cfg(test)]
