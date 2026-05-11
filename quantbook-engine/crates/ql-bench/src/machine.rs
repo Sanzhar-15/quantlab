@@ -122,16 +122,19 @@ impl MachineReport {
 }
 
 fn detect_cpu_brand() -> Option<String> {
+    // Each cfg block is the trailing expression of the function on its target — using `return`
+    // instead would make the other cfg blocks' code unreachable on platforms where the first
+    // block always exits (clippy `-D unreachable-code` flagged this on Linux).
     #[cfg(target_os = "linux")]
     {
         let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").ok()?;
-        return cpuinfo
+        cpuinfo
             .lines()
             .find_map(|l| {
                 l.strip_prefix("model name")
                     .and_then(|r| r.split(':').nth(1))
             })
-            .map(|s| s.trim().to_string());
+            .map(|s| s.trim().to_string())
     }
     #[cfg(target_os = "macos")]
     {
@@ -140,27 +143,28 @@ fn detect_cpu_brand() -> Option<String> {
             .output()
             .ok()?;
         if out.status.success() {
-            return String::from_utf8(out.stdout)
+            String::from_utf8(out.stdout)
                 .ok()
-                .map(|s| s.trim().to_string());
+                .map(|s| s.trim().to_string())
+        } else {
+            None
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (); // keep the path compilable on Windows / other targets
+        None
     }
-    None
 }
 
 fn detect_ram_total() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        return meminfo.lines().find_map(|l| {
+        meminfo.lines().find_map(|l| {
             let rest = l.strip_prefix("MemTotal:")?.trim();
             let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
             Some(kib * 1024)
-        });
+        })
     }
     #[cfg(target_os = "macos")]
     {
@@ -169,16 +173,17 @@ fn detect_ram_total() -> Option<u64> {
             .output()
             .ok()?;
         if out.status.success() {
-            return String::from_utf8(out.stdout)
+            String::from_utf8(out.stdout)
                 .ok()
-                .and_then(|s| s.trim().parse().ok());
+                .and_then(|s| s.trim().parse().ok())
+        } else {
+            None
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = ();
+        None
     }
-    None
 }
 
 #[cfg(test)]
