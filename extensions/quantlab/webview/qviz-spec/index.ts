@@ -392,6 +392,32 @@ function init(): void {
 			}
 			return;
 		}
+		// Phase 8 Step B: Ctrl+Z / Cmd+Z undoes UI changes (inspector
+		// toggle, selection). When the UI history is empty we let the
+		// keystroke bubble to VS Code, whose CustomDocument undo stack
+		// handles spec edits via the EditEvent → onDidChangeCustomDocument
+		// machinery wired in VisualiseSpecProvider.
+		// Ctrl+Y or Ctrl+Shift+Z does the redo.
+		if (!inEditable && (e.ctrlKey || e.metaKey)) {
+			const isZ = e.key === 'z' || e.key === 'Z';
+			const isY = e.key === 'y' || e.key === 'Y';
+			if (isZ && !e.shiftKey) {
+				if (store.getState().history.past.length > 0) {
+					e.preventDefault();
+					store.dispatch({ type: 'undoUiHistory' });
+				}
+				// else: let VS Code handle Ctrl+Z for spec undo.
+				return;
+			}
+			if (isY || (isZ && e.shiftKey)) {
+				if (store.getState().history.future.length > 0) {
+					e.preventDefault();
+					store.dispatch({ type: 'redoUiHistory' });
+				}
+				// else: let VS Code handle Ctrl+Y for spec redo.
+				return;
+			}
+		}
 		// Ctrl+I on Linux/Windows, Cmd+I on macOS. Reject when focus is
 		// inside a text input so we don't hijack italicize-style
 		// shortcuts in form fields. The encoded-italic mapping (Ctrl+I

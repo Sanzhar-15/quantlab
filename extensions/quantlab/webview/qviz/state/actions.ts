@@ -298,6 +298,18 @@ export interface ActionColumnStatsError {
 	readonly error: string;
 }
 
+/** Phase 8 Step B: undo / redo for UI-state changes (inspector toggle,
+ *  selection). Spec edits remain on VS Code's native CustomDocument
+ *  undo stack and are reached by Ctrl+Z falling through to VS Code
+ *  whenever the webview's UI history is empty.
+ */
+export interface ActionUndoUiHistory {
+	readonly type: 'undoUiHistory';
+}
+export interface ActionRedoUiHistory {
+	readonly type: 'redoUiHistory';
+}
+
 export type Action =
 	| ActionInit
 	| ActionDataReceived
@@ -332,4 +344,6 @@ export type Action =
 	| ActionInspectorError
 	| ActionColumnStatsRequested
 	| ActionColumnStatsReceived
-	| ActionColumnStatsError;
+	| ActionColumnStatsError
+	| ActionUndoUiHistory
+	| ActionRedoUiHistory;

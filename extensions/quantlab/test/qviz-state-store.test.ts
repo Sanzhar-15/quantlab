@@ -1788,3 +1788,113 @@ suite('qviz state -- megaudit cures (Phase 6)', () => {
 	});
 
 });
+
+// ---------------------------------------------------------------------------
+// Phase 8 Step B — UI undo / redo via the history slice
+// ---------------------------------------------------------------------------
+
+suite('qviz state -- history slice (Phase 8 Step B)', () => {
+
+	test('toggleInspector pushes pre-state to past; undoUiHistory restores it', () => {
+		let s = INITIAL_ROOT_STATE;
+		assert.strictEqual(s.inspector.visible, false);
+		assert.strictEqual(s.history.past.length, 0);
+
+		s = rootReduce(s, { type: 'toggleInspector' });
+		assert.strictEqual(s.inspector.visible, true);
+		assert.strictEqual(s.history.past.length, 1);
+		assert.strictEqual(s.history.past[0].inspectorVisible, false);
+		assert.strictEqual(s.history.future.length, 0);
+
+		s = rootReduce(s, { type: 'undoUiHistory' });
+		assert.strictEqual(s.inspector.visible, false);
+		assert.strictEqual(s.history.past.length, 0);
+		assert.strictEqual(s.history.future.length, 1);
+		assert.strictEqual(s.history.future[0].inspectorVisible, true);
+	});
+
+	test('redoUiHistory replays the undone change', () => {
+		let s = INITIAL_ROOT_STATE;
+		s = rootReduce(s, { type: 'toggleInspector' });
+		s = rootReduce(s, { type: 'undoUiHistory' });
+		assert.strictEqual(s.inspector.visible, false);
+		s = rootReduce(s, { type: 'redoUiHistory' });
+		assert.strictEqual(s.inspector.visible, true);
+		assert.strictEqual(s.history.past.length, 1);
+		assert.strictEqual(s.history.future.length, 0);
+	});
+
+	test('setSelection then clearSelection are both undoable', () => {
+		let s = INITIAL_ROOT_STATE;
+		s = rootReduce(s, { type: 'setSelection', x: 123 });
+		s = rootReduce(s, { type: 'clearSelection' });
+		assert.strictEqual(s.history.past.length, 2);
+		assert.strictEqual(s.inspector.selection, null);
+
+		// Undo the clearSelection: selection comes back.
+		s = rootReduce(s, { type: 'undoUiHistory' });
+		assert.notStrictEqual(s.inspector.selection, null);
+		assert.strictEqual(s.history.past.length, 1);
+
+		// Undo the setSelection: selection cleared again.
+		s = rootReduce(s, { type: 'undoUiHistory' });
+		assert.strictEqual(s.inspector.selection, null);
+		assert.strictEqual(s.history.past.length, 0);
+	});
+
+	test('undoUiHistory is a no-op when past stack is empty', () => {
+		let s = INITIAL_ROOT_STATE;
+		const before = s;
+		s = rootReduce(s, { type: 'undoUiHistory' });
+		assert.strictEqual(s, before, 'no-op must return identical state ref');
+	});
+
+	test('redoUiHistory is a no-op when future stack is empty', () => {
+		let s = INITIAL_ROOT_STATE;
+		const before = s;
+		s = rootReduce(s, { type: 'redoUiHistory' });
+		assert.strictEqual(s, before);
+	});
+
+	test('fresh undoable action clears the redo stack', () => {
+		let s = INITIAL_ROOT_STATE;
+		s = rootReduce(s, { type: 'toggleInspector' });
+		s = rootReduce(s, { type: 'undoUiHistory' });
+		assert.strictEqual(s.history.future.length, 1);
+		s = rootReduce(s, { type: 'toggleInspector' });
+		// New edit invalidates the redo stack — standard undo semantics.
+		assert.strictEqual(s.history.future.length, 0);
+	});
+
+	test('idempotent toggle (no state change) does NOT push to history', () => {
+		let s = INITIAL_ROOT_STATE;
+		s = rootReduce(s, { type: 'toggleInspector', visible: false });
+		// Inspector was already false; no change, no history push.
+		assert.strictEqual(s.inspector.visible, false);
+		assert.strictEqual(s.history.past.length, 0);
+	});
+
+	test('non-UI actions do not pollute the UI history stack', () => {
+		let s = INITIAL_ROOT_STATE;
+		// setColumnFilter is a non-UI inspector action; should NOT be in
+		// the UI undo stack (filters are ephemeral, never persisted, and
+		// have their own clear-all action).
+		s = rootReduce(s, {
+			type: 'setColumnFilter', column: 'a',
+			filter: { kind: 'range', column: 'a', min: 0, max: 10 },
+		});
+		assert.strictEqual(s.history.past.length, 0);
+	});
+
+	test('past stack caps at HISTORY_CAP (100) — oldest entries drop', async () => {
+		const { HISTORY_CAP } = await import('../webview/qviz/state/history');
+		let s = INITIAL_ROOT_STATE;
+		// HISTORY_CAP+5 toggles, alternating visible/hidden so each
+		// dispatch is a real state change.
+		for (let i = 0; i < HISTORY_CAP + 5; i++) {
+			s = rootReduce(s, { type: 'toggleInspector' });
+		}
+		assert.strictEqual(s.history.past.length, HISTORY_CAP);
+	});
+
+});

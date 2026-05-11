@@ -54,6 +54,11 @@ import {
 import {
 	type InspectorState, INITIAL_INSPECTOR_STATE, reduceInspector,
 } from './inspectorState';
+import {
+	type HistoryState, INITIAL_HISTORY_STATE,
+	applyInspectorSnapshot, isUndoableUiAction, popRedo, popUndo,
+	pushHistoryEntry, snapshotInspector,
+} from './history';
 
 export interface RootState {
 	readonly source: SourceState;
@@ -65,6 +70,7 @@ export interface RootState {
 	readonly renderer: RendererState;
 	readonly runtime: RuntimeState;
 	readonly inspector: InspectorState;
+	readonly history: HistoryState;
 }
 
 export const INITIAL_ROOT_STATE: RootState = {
@@ -77,12 +83,41 @@ export const INITIAL_ROOT_STATE: RootState = {
 	renderer: INITIAL_RENDERER_STATE,
 	runtime: INITIAL_RUNTIME_STATE,
 	inspector: INITIAL_INSPECTOR_STATE,
+	history: INITIAL_HISTORY_STATE,
 };
 
 /** Pure root reducer. Each slice sees every action; most return state
  *  unchanged. The result is a fresh top-level object only if at least
- *  one slice changed (cheap dirty-check upstream). */
+ *  one slice changed (cheap dirty-check upstream).
+ *
+ *  Phase 8 Step B: history slice records PRE-action snapshots of
+ *  inspector state on undoable actions (toggleInspector, setSelection,
+ *  clearSelection) and handles undoUiHistory / redoUiHistory by
+ *  applying recorded snapshots back onto the inspector slice.
+ */
 export function rootReduce(state: RootState, action: Action): RootState {
+	// Phase 8 Step B: handle UI undo/redo by short-circuiting before the
+	// per-slice reducers run. The applied snapshot only touches inspector
+	// state; other slices stay unchanged.
+	if (action.type === 'undoUiHistory') {
+		const popped = popUndo(state.history, snapshotInspector(state.inspector));
+		if (popped === null) { return state; }
+		const inspector = applyInspectorSnapshot(state.inspector, popped.entry);
+		if (inspector === state.inspector) {
+			return { ...state, history: popped.next };
+		}
+		return { ...state, inspector, history: popped.next };
+	}
+	if (action.type === 'redoUiHistory') {
+		const popped = popRedo(state.history, snapshotInspector(state.inspector));
+		if (popped === null) { return state; }
+		const inspector = applyInspectorSnapshot(state.inspector, popped.entry);
+		if (inspector === state.inspector) {
+			return { ...state, history: popped.next };
+		}
+		return { ...state, inspector, history: popped.next };
+	}
+
 	const source = reduceSource(state.source, action);
 	const schema = reduceSchema(state.schema, action);
 	const spec = reduceSpec(state.spec, action);
@@ -93,15 +128,27 @@ export function rootReduce(state: RootState, action: Action): RootState {
 	const runtime = reduceRuntime(state.runtime, action);
 	const inspector = reduceInspector(state.inspector, action);
 
+	// Push a history entry if the action was an undoable UI action AND it
+	// actually changed inspector state. Idempotent toggles don't pollute
+	// the history stack.
+	let history = state.history;
+	if (isUndoableUiAction(action.type) && inspector !== state.inspector) {
+		history = pushHistoryEntry(state.history, snapshotInspector(state.inspector));
+	}
+
 	if (
 		source === state.source && schema === state.schema && spec === state.spec
 		&& ui === state.ui && query === state.query
 		&& persistence === state.persistence && renderer === state.renderer
 		&& runtime === state.runtime && inspector === state.inspector
+		&& history === state.history
 	) {
 		return state;
 	}
-	return { source, schema, spec, ui, query, persistence, renderer, runtime, inspector };
+	return {
+		source, schema, spec, ui, query, persistence, renderer, runtime,
+		inspector, history,
+	};
 }
 
 export type Listener = (state: RootState) => void;

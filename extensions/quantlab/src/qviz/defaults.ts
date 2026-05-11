@@ -83,13 +83,35 @@ export function deriveDefaultSpec(args: DeriveDefaultSpecArgs): DeriveDefaultSpe
 	let chartType: ChartType;
 	let encodings: Encodings;
 
+	// Phase 8 Step A: OHLCV smart-default. If the schema contains
+	// `open + high + low + close` (case-insensitive, all numeric) AND a
+	// temporal column, default to candlestick — that's almost always what
+	// a quant wants on first open of an OHLCV parquet. `volume` is
+	// optional. Requires ALL FOUR OHLC names to be present to avoid
+	// false-positive matches on a stray `close` column (e.g., a survey's
+	// "close_date" or a window's "close_time").
+	const ohlcv = detectOhlcvColumns(classified, temporal);
+	if (ohlcv) {
+		family = 'timeseries';
+		chartType = 'candlestick';
+		encodings = {
+			ohlcv: {
+				time: ohlcv.time,
+				open: ohlcv.open,
+				high: ohlcv.high,
+				low: ohlcv.low,
+				close: ohlcv.close,
+				...(ohlcv.volume !== undefined ? { volume: ohlcv.volume } : {}),
+			},
+		};
+	}
 	// Per the plan: line if temporal-x else scatter, empty transforms.
 	// Step C megaudit D1: the prior "1 numeric + nominal → bar" branch
 	// was beyond the documented scope and produced specs without an
 	// aggregation pipeline (raw bars over potentially thousands of
 	// duplicate categories). Revert to two cases only — caller picks
 	// chart type manually if neither applies.
-	if (temporal && numerics.length >= 1) {
+	else if (temporal && numerics.length >= 1) {
 		family = 'timeseries';
 		chartType = 'line';
 		encodings = {
@@ -163,6 +185,59 @@ export function classifyColumn(col: SchemaColumn): ClassifiedColumnType {
 		return 'nominal';
 	}
 	return 'nominal';
+}
+
+interface OhlcvColumns {
+	readonly time: string;
+	readonly open: string;
+	readonly high: string;
+	readonly low: string;
+	readonly close: string;
+	readonly volume?: string;
+}
+
+/**
+ * Phase 8 Step A — OHLCV smart-default detector.
+ *
+ * Returns the column names for a candlestick spec when:
+ *   - all four of open/high/low/close (case-insensitive) are present
+ *   - each of the four classifies as 'quantitative' (numeric)
+ *   - a temporal column is present (any name)
+ *   - volume is optional; included if present and numeric
+ *
+ * Returns null when ANY of the requirements fails so deriveDefaultSpec
+ * falls through to the line/scatter heuristics.
+ */
+function detectOhlcvColumns(
+	classified: ReadonlyArray<{ col: SchemaColumn; type: ClassifiedColumnType }>,
+	temporal: { col: SchemaColumn; type: ClassifiedColumnType } | undefined,
+): OhlcvColumns | null {
+	if (!temporal) { return null; }
+	const byLower = new Map<string, { col: SchemaColumn; type: ClassifiedColumnType }>();
+	for (const c of classified) {
+		// Last wins for case collisions; the validator already rejects
+		// duplicate column names on the parquet side so this is theoretical.
+		byLower.set(c.col.name.toLowerCase(), c);
+	}
+	const o = byLower.get('open');
+	const h = byLower.get('high');
+	const l = byLower.get('low');
+	const c = byLower.get('close');
+	if (!o || !h || !l || !c) { return null; }
+	if (o.type !== 'quantitative' || h.type !== 'quantitative'
+		|| l.type !== 'quantitative' || c.type !== 'quantitative') {
+		return null;
+	}
+	const v = byLower.get('volume');
+	const volume = v && v.type === 'quantitative' ? v.col.name : undefined;
+	return {
+		time: temporal.col.name,
+		open: o.col.name,
+		high: h.col.name,
+		low: l.col.name,
+		close: c.col.name,
+		...(volume !== undefined ? { volume } : {}),
+	};
 }
 
 function makeEncoding(col: SchemaColumn, type: ClassifiedColumnType): Encoding {

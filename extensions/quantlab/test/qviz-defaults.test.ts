@@ -136,6 +136,144 @@ suite('defaults -- happy paths', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Phase 8 Step A — OHLCV smart-default
+// ---------------------------------------------------------------------------
+
+suite('defaults -- OHLCV smart-default (Phase 8 Step A)', () => {
+
+	test('temporal + open/high/low/close → timeseries.candlestick', () => {
+		const r = deriveDefaultSpec({
+			datasetUri: 'data/ohlcv.parquet',
+			schema: schema([
+				{ name: 'time', dtype: 'timestamp[ns]' },
+				{ name: 'open', dtype: 'float64' },
+				{ name: 'high', dtype: 'float64' },
+				{ name: 'low', dtype: 'float64' },
+				{ name: 'close', dtype: 'float64' },
+			]),
+			nowIso: NOW,
+		});
+		assert.ok(r.ok, `expected ok; got ${r.ok ? '' : r.error}`);
+		if (!r.ok) { return; }
+		assert.strictEqual(r.spec.chart.family, 'timeseries');
+		assert.strictEqual(r.spec.chart.type, 'candlestick');
+		const ohlcv = r.spec.chart.encodings.ohlcv;
+		assert.ok(ohlcv, 'encodings.ohlcv must be present');
+		assert.deepStrictEqual({ ...ohlcv }, {
+			time: 'time', open: 'open', high: 'high', low: 'low', close: 'close',
+		});
+		// Validator round-trip — spec must load cleanly in the editor.
+		const v = validate(r.spec);
+		assert.ok(v.ok, `validator should accept candlestick default; got ${v.ok ? '' : JSON.stringify(v.issues)}`);
+	});
+
+	test('volume column included in ohlcv encoding when present and numeric', () => {
+		const r = deriveDefaultSpec({
+			datasetUri: 'data/ohlcv.parquet',
+			schema: schema([
+				{ name: 'time', dtype: 'timestamp[ns]' },
+				{ name: 'open', dtype: 'float64' },
+				{ name: 'high', dtype: 'float64' },
+				{ name: 'low', dtype: 'float64' },
+				{ name: 'close', dtype: 'float64' },
+				{ name: 'volume', dtype: 'int64' },
+			]),
+			nowIso: NOW,
+		});
+		assert.ok(r.ok);
+		if (!r.ok) { return; }
+		assert.strictEqual(r.spec.chart.type, 'candlestick');
+		assert.strictEqual(r.spec.chart.encodings.ohlcv?.volume, 'volume');
+	});
+
+	test('case-insensitive OHLCV names are detected (Open/HIGH/Low/Close)', () => {
+		const r = deriveDefaultSpec({
+			datasetUri: 'data/ohlcv.parquet',
+			schema: schema([
+				{ name: 'Timestamp', dtype: 'timestamp[ns]' },
+				{ name: 'Open', dtype: 'float64' },
+				{ name: 'HIGH', dtype: 'float64' },
+				{ name: 'Low', dtype: 'float64' },
+				{ name: 'Close', dtype: 'float64' },
+			]),
+			nowIso: NOW,
+		});
+		assert.ok(r.ok);
+		if (!r.ok) { return; }
+		assert.strictEqual(r.spec.chart.type, 'candlestick');
+		// The original column names (preserved case) are what gets wired
+		// into the encoding — DuckDB / the daemon won't lowercase them.
+		assert.strictEqual(r.spec.chart.encodings.ohlcv?.open, 'Open');
+		assert.strictEqual(r.spec.chart.encodings.ohlcv?.high, 'HIGH');
+		assert.strictEqual(r.spec.chart.encodings.ohlcv?.low, 'Low');
+		assert.strictEqual(r.spec.chart.encodings.ohlcv?.close, 'Close');
+	});
+
+	test('missing one OHLC column falls through to line (no false-positive candlestick)', () => {
+		// Only open/high/low (no close) + temporal → MUST NOT trigger
+		// candlestick. Falls back to temporal+numeric line.
+		const r = deriveDefaultSpec({
+			datasetUri: 'data/x.parquet',
+			schema: schema([
+				{ name: 'time', dtype: 'timestamp[ns]' },
+				{ name: 'open', dtype: 'float64' },
+				{ name: 'high', dtype: 'float64' },
+				{ name: 'low', dtype: 'float64' },
+				// no 'close'
+			]),
+			nowIso: NOW,
+		});
+		assert.ok(r.ok);
+		if (!r.ok) { return; }
+		assert.strictEqual(r.spec.chart.type, 'line');
+		// Encoding uses first numeric (open) as y.
+		assert.strictEqual(r.spec.chart.encodings.y?.field, 'open');
+	});
+
+	test('OHLC names present but no temporal column → falls through to scatter', () => {
+		const r = deriveDefaultSpec({
+			datasetUri: 'data/x.parquet',
+			schema: schema([
+				{ name: 'open', dtype: 'float64' },
+				{ name: 'high', dtype: 'float64' },
+				{ name: 'low', dtype: 'float64' },
+				{ name: 'close', dtype: 'float64' },
+			]),
+			nowIso: NOW,
+		});
+		assert.ok(r.ok);
+		if (!r.ok) { return; }
+		// No temporal column → can't elect candlestick; ≥2 numerics → scatter.
+		assert.strictEqual(r.spec.chart.type, 'scatter');
+	});
+
+	test('R-3 mitigation: a non-financial schema with a `close` column does NOT trigger candlestick', () => {
+		// Survey data with a `close_date` column. The user's `close` column
+		// is a string date, not numeric. detectOhlcvColumns requires
+		// quantitative dtype on all four OHLC cols, so this case falls
+		// through to line.
+		const r = deriveDefaultSpec({
+			datasetUri: 'data/survey.parquet',
+			schema: schema([
+				{ name: 'time', dtype: 'timestamp[ns]' },
+				{ name: 'open', dtype: 'float64' },   // numeric so far
+				{ name: 'high', dtype: 'float64' },
+				{ name: 'low', dtype: 'float64' },
+				{ name: 'close', dtype: 'utf8' },     // string — NOT numeric
+				{ name: 'responses', dtype: 'int64' },
+			]),
+			nowIso: NOW,
+		});
+		assert.ok(r.ok);
+		if (!r.ok) { return; }
+		// Must not be candlestick (close column failed the numeric check).
+		assert.notStrictEqual(r.spec.chart.type, 'candlestick');
+		assert.strictEqual(r.spec.chart.type, 'line');
+	});
+
+});
+
+// ---------------------------------------------------------------------------
 // failure paths
 // ---------------------------------------------------------------------------
 
