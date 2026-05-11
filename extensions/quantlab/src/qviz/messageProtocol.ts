@@ -373,7 +373,9 @@ export type WebviewMessage =
 	| OpenSpecMessage
 	| DiscardChangesMessage
 	| RequestInspectorDataMessage
-	| RequestColumnStatsMessage;
+	| RequestColumnStatsMessage
+	| RetryDaemonMessage
+	| RecheckDatasetMessage;
 
 export type WebviewMessageType = WebviewMessage['type'];
 
@@ -404,6 +406,22 @@ export interface RequestInspectorDataMessage extends MessageEnvelope {
 export interface RequestColumnStatsMessage extends MessageEnvelope {
 	readonly type: 'requestColumnStats';
 	readonly column: string;
+}
+
+/** Phase 8 Step D: user clicked the "Retry connection" button on the
+ *  daemon-status banner. Provider responds by tearing down + relaunching
+ *  the lifecycle for the document's workspace.
+ */
+export interface RetryDaemonMessage extends MessageEnvelope {
+	readonly type: 'retryDaemon';
+}
+
+/** Phase 8 Step D: user clicked "Re-check file" on the dataset-status
+ *  banner. Provider re-resolves the dataset uri and broadcasts a fresh
+ *  datasetStatus.
+ */
+export interface RecheckDatasetMessage extends MessageEnvelope {
+	readonly type: 'recheckDataset';
 }
 
 export interface EditMessage extends SpecAttributedEnvelope {
@@ -519,6 +537,8 @@ export function validateWebviewMessage(value: unknown): ValidationResult<Webview
 		case 'discardChanges': result = validateDiscardChanges(obj); break;
 		case 'requestInspectorData': result = validateRequestInspectorData(obj); break;
 		case 'requestColumnStats': result = validateRequestColumnStats(obj); break;
+		case 'retryDaemon': result = ok(obj as unknown as RetryDaemonMessage); break;
+		case 'recheckDataset': result = ok(obj as unknown as RecheckDatasetMessage); break;
 		default:
 			return fail(`unknown webview message type: ${JSON.stringify((obj as { type: unknown }).type)}`);
 	}

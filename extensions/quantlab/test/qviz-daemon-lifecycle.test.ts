@@ -304,3 +304,87 @@ suite('DaemonLifecycle -- dispose', () => {
 	});
 
 });
+
+// ---------------------------------------------------------------------------
+// Phase 8 Step D — requestImmediateRetry
+// ---------------------------------------------------------------------------
+
+suite('DaemonLifecycle -- requestImmediateRetry (Phase 8 Step D)', () => {
+
+	const skip = !pythonAvailable();
+
+	test('returns false when status is idle (nothing to retry)', () => {
+		const lifecycle = new DaemonLifecycle({
+			...DEFAULT_DAEMON_LIFECYCLE_OPTIONS,
+			workspaceRoot: '/tmp',
+			pythonPath: PYTHON_PATH,
+			pythonPathPrefix: [FIXTURES_DIR],
+			module: 'dummy_daemon_long_lived',
+		});
+		try {
+			// No spawn started yet — status is 'idle'.
+			assert.strictEqual(lifecycle.requestImmediateRetry(), false);
+		} finally {
+			void lifecycle.dispose();
+		}
+	});
+
+	test('throws DaemonUnavailableError after dispose', async () => {
+		const lifecycle = new DaemonLifecycle({
+			...DEFAULT_DAEMON_LIFECYCLE_OPTIONS,
+			workspaceRoot: '/tmp',
+			pythonPath: PYTHON_PATH,
+			pythonPathPrefix: [FIXTURES_DIR],
+			module: 'dummy_daemon_long_lived',
+		});
+		await lifecycle.dispose();
+		assert.throws(() => lifecycle.requestImmediateRetry(), DaemonUnavailableError);
+	});
+
+	test('crashed -> retry skips backoff and starts spawning', async function () {
+		if (skip) { this.skip(); }
+		this.timeout(8000);
+		// Crash-after-banner with a long initial backoff means the auto-retry
+		// would take a while. requestImmediateRetry should cut through.
+		const lifecycle = new DaemonLifecycle({
+			...DEFAULT_DAEMON_LIFECYCLE_OPTIONS,
+			workspaceRoot: '/tmp',
+			pythonPath: PYTHON_PATH,
+			pythonPathPrefix: [FIXTURES_DIR],
+			module: 'dummy_daemon_no_banner',
+			bannerTimeoutMs: 150,
+			initialBackoffMs: 60_000,   // huge backoff
+			maxBackoffMs: 60_000,
+			maxAttempts: 5,
+		});
+		try {
+			const log = recordStatus(lifecycle);
+			// Kick a spawn; the no-banner fixture will crash quickly.
+			void lifecycle.getClient().catch(() => undefined);
+			// Wait until we see 'crashed'.
+			const deadline = Date.now() + 3000;
+			while (Date.now() < deadline) {
+				if (log.some(s => s.kind === 'crashed')) { break; }
+				await new Promise(r => setTimeout(r, 20));
+			}
+			const sawCrashed = log.some(s => s.kind === 'crashed');
+			assert.ok(sawCrashed, `expected to observe crashed, got ${log.map(s => s.kind).join(',')}`);
+			// Snapshot the 'starting' count BEFORE the retry. startSpawn
+			// fires the transition synchronously inside requestImmediateRetry.
+			const startsBefore = log.filter(s => s.kind === 'starting').length;
+			// Now force a retry — should skip the 60-second backoff and
+			// start spawning immediately.
+			const result = lifecycle.requestImmediateRetry();
+			assert.strictEqual(result, true);
+			const startsAfter = log.filter(s => s.kind === 'starting').length;
+			assert.ok(
+				startsAfter > startsBefore,
+				`requestImmediateRetry should have triggered another 'starting' transition `
+				+ `(before=${startsBefore}, after=${startsAfter}, log=${log.map(s => s.kind).join(',')})`,
+			);
+		} finally {
+			await lifecycle.dispose();
+		}
+	});
+
+});

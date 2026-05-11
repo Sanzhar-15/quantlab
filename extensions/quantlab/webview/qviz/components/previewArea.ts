@@ -29,16 +29,57 @@ export interface PreviewAreaHandle {
 	dispose(): void;
 }
 
-export function mountPreviewArea(root: HTMLElement, store: QvizStore): PreviewAreaHandle {
+export interface PreviewAreaCallbacks {
+	/** Phase 8 Step D: "Retry connection" button on the daemon-status
+	 *  banner. Host wires this to a `retryDaemon` postMessage. */
+	readonly onRetryDaemon?: () => void;
+	/** Phase 8 Step D: "Re-check file" button on the dataset-status
+	 *  banner. Host wires this to a `recheckDataset` postMessage. */
+	readonly onRecheckDataset?: () => void;
+}
+
+export function mountPreviewArea(
+	root: HTMLElement, store: QvizStore, cbs: PreviewAreaCallbacks = {},
+): PreviewAreaHandle {
 	root.classList.add('qviz-preview-area');
+	// Phase 8 Step C: chart-area loading skeleton is a sibling element
+	// of the chart container, positioned absolutely over it via CSS so
+	// the chart canvas underneath isn't disrupted on inflight transitions.
+	// Hidden by default; toggled via [hidden] when state.query.inflight
+	// transitions to non-null.
 	root.innerHTML = `
-		<div class="qviz-preview-stripe" role="status" aria-live="polite"></div>
-		<div class="qviz-preview-chart"></div>
+		<div class="qviz-preview-stripe" role="status" aria-live="polite">
+			<span class="qviz-preview-stripe-message"></span>
+			<button class="qviz-preview-retry-daemon" type="button" hidden>Retry connection</button>
+			<button class="qviz-preview-recheck-dataset" type="button" hidden>Re-check file</button>
+		</div>
+		<div class="qviz-preview-chart-wrap">
+			<div class="qviz-preview-chart"></div>
+			<div class="qviz-preview-skeleton" hidden aria-hidden="true">
+				<div class="qviz-skel-bar qviz-skel-bar-1"></div>
+				<div class="qviz-skel-bar qviz-skel-bar-2"></div>
+				<div class="qviz-skel-bar qviz-skel-bar-3"></div>
+				<div class="qviz-skel-bar qviz-skel-bar-4"></div>
+				<div class="qviz-skel-axis"></div>
+			</div>
+		</div>
 		<div class="qviz-preview-diagnostics" role="log" aria-live="polite"></div>
 	`;
 	const stripe = root.querySelector<HTMLElement>('.qviz-preview-stripe')!;
+	const stripeMessage = root.querySelector<HTMLElement>('.qviz-preview-stripe-message')!;
+	const retryDaemonBtn = root.querySelector<HTMLButtonElement>('.qviz-preview-retry-daemon')!;
+	const recheckDatasetBtn = root.querySelector<HTMLButtonElement>('.qviz-preview-recheck-dataset')!;
 	const chartContainer = root.querySelector<HTMLElement>('.qviz-preview-chart')!;
+	const skeleton = root.querySelector<HTMLElement>('.qviz-preview-skeleton')!;
 	const diagnostics = root.querySelector<HTMLElement>('.qviz-preview-diagnostics')!;
+
+	// Phase 8 Step D: retry-button click wiring. Each button hidden by
+	// default; renderStripe toggles visibility based on the current
+	// daemonStatus / datasetStatus.
+	const onRetryClick = (): void => { cbs.onRetryDaemon?.(); };
+	const onRecheckClick = (): void => { cbs.onRecheckDataset?.(); };
+	retryDaemonBtn.addEventListener('click', onRetryClick);
+	recheckDatasetBtn.addEventListener('click', onRecheckClick);
 
 	const renderStripe = (): void => {
 		const state = store.getState();
@@ -103,8 +144,17 @@ export function mountPreviewArea(root: HTMLElement, store: QvizStore): PreviewAr
 					break;
 			}
 		}
-		stripe.textContent = messages.join(' · ');
+		stripeMessage.textContent = messages.join(' · ');
 		stripe.style.display = messages.length === 0 ? 'none' : '';
+		// Phase 8 Step D: surface retry actions for the recoverable
+		// daemon / dataset failure modes. Buttons are inside the stripe
+		// so they sit next to the relevant error text.
+		const ds = store.getState().runtime.daemonStatus;
+		const showRetryDaemon = ds === 'crashed' || ds === 'respawning' || ds === 'unavailable';
+		const tds = store.getState().runtime.datasetStatus;
+		const showRecheckDataset = tds !== 'ok' && tds !== null;
+		retryDaemonBtn.hidden = !showRetryDaemon;
+		recheckDatasetBtn.hidden = !showRecheckDataset;
 	};
 
 	const renderDiagnostics = (): void => {
@@ -126,8 +176,19 @@ export function mountPreviewArea(root: HTMLElement, store: QvizStore): PreviewAr
 		diagnostics.textContent = lines.join('\n');
 	};
 
+	const renderSkeleton = (): void => {
+		// Phase 8 Step C: show the skeleton overlay while the daemon is
+		// computing the next aggregate. Cleared the instant
+		// state.query.inflight returns to null (same reducer tick that
+		// receives `dataReceived` / `error`), so the skeleton never
+		// outlives the actual chart paint.
+		const inflight = store.getState().query.inflight !== null;
+		skeleton.hidden = !inflight;
+	};
+
 	const onStateChange = (): void => {
 		renderStripe();
+		renderSkeleton();
 		renderDiagnostics();
 	};
 
@@ -138,6 +199,8 @@ export function mountPreviewArea(root: HTMLElement, store: QvizStore): PreviewAr
 	return {
 		chartContainer,
 		dispose: () => {
+			retryDaemonBtn.removeEventListener('click', onRetryClick);
+			recheckDatasetBtn.removeEventListener('click', onRecheckClick);
 			unsubscribe();
 			root.innerHTML = '';
 			root.classList.remove('qviz-preview-area');

@@ -240,6 +240,36 @@ export class DaemonLifecycle {
 	}
 
 	/**
+	 * Phase 8 Step D: skip the backoff window and start spawning now.
+	 *
+	 * Called when the user clicks "Retry connection" on the daemon-status
+	 * banner. Behavior by current status:
+	 *   - `ready`            → no-op; already up.
+	 *   - `crashed` / `respawning` → cancel the pending retry timer and
+	 *     start spawning immediately.
+	 *   - `unavailable`      → reset to idle and start spawning. The
+	 *     `unavailable` status normally means a non-recoverable error;
+	 *     the user is explicitly overriding that judgment.
+	 *   - `idle` / `starting` → no-op; nothing to retry.
+	 *
+	 * Returns `true` when an immediate spawn was initiated, `false`
+	 * otherwise. Throws if the lifecycle has been disposed.
+	 */
+	requestImmediateRetry(): boolean {
+		if (this.disposed) {
+			throw new DaemonUnavailableError('lifecycle disposed');
+		}
+		const k = this.status.kind;
+		if (k === 'ready' || k === 'idle' || k === 'starting') { return false; }
+		this.cancelRetry();
+		// Reset the failure counter so backoff starts fresh next crash;
+		// the user has signaled they expect this attempt to succeed.
+		this.failuresSinceSuccess = 0;
+		this.startSpawn();
+		return true;
+	}
+
+	/**
 	 * Tear down. Cancels any pending respawn timer, disposes the live
 	 * client (if any), rejects all queued `getClient()` waiters, and
 	 * transitions to `unavailable`.

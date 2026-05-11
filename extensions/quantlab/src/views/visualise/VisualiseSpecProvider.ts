@@ -1057,6 +1057,14 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 				void this.handleRequestColumnStats(document, panel, msg);
 				return;
 			}
+			case 'retryDaemon': {
+				void this.handleRetryDaemon(document, panel);
+				return;
+			}
+			case 'recheckDataset': {
+				void this.handleRecheckDataset(document, panel);
+				return;
+			}
 			case 'openSpec':
 			case 'discardChanges':
 				// Reserved protocol slots. v1 doesn't surface UI for
@@ -1473,6 +1481,62 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 		} catch (e) {
 			postErr((e as Error).message);
 		}
+	}
+
+	/**
+	 * Phase 8 Step D: handle the `retryDaemon` webview message. The user
+	 * clicked the "Retry connection" button on the daemon-status banner.
+	 * Cancel the current backoff timer and start spawning immediately.
+	 */
+	private async handleRetryDaemon(
+		document: QvizSpecDocument, _panel: vscode.WebviewPanel,
+	): Promise<void> {
+		const source = this.options.lifecycleSource;
+		if (source === null) { return; }
+		const lifecycle = source.getLifecycleForDocument(document.uri);
+		if (lifecycle === null) { return; }
+		try {
+			// Skip backoff, force spawn. The lifecycle's status-change
+			// subscription already broadcasts the transition through to
+			// the webview, so the banner updates automatically.
+			lifecycle.requestImmediateRetry();
+		} catch {
+			// requestImmediateRetry throws only when the lifecycle is
+			// already disposed. In that case, the source will report no
+			// lifecycle next time, and the banner already reflects
+			// 'unavailable'. Nothing else to do.
+		}
+	}
+
+	/**
+	 * Phase 8 Step D: handle the `recheckDataset` webview message. The
+	 * user clicked the "Re-check file" button on the dataset-status
+	 * banner. Re-resolve the dataset path and broadcast a fresh
+	 * datasetStatus message (which clears the banner when the file is
+	 * now present, or refreshes the kind if the failure mode shifted).
+	 */
+	private async handleRecheckDataset(
+		document: QvizSpecDocument, panel: vscode.WebviewPanel,
+	): Promise<void> {
+		const spec = document.spec;
+		const workspaceRoot = workspaceRootForUri(document.uri);
+		if (workspaceRoot === null) { return; }
+		const resolved = resolveDatasetPath(spec.dataset.uri, workspaceRoot);
+		if (resolved.kind === 'ok') {
+			// Dataset is now resolvable — post an OK status to clear the
+			// banner. The chart will re-query on the next requestData tick.
+			this.postOrLog(panel, {
+				type: 'datasetStatus',
+				protocolVersion: PROTOCOL_VERSION,
+				requestId: this.nextRequestId(document.uri.toString()),
+				status: 'ok',
+				datasetUri: spec.dataset.uri,
+			});
+			return;
+		}
+		// Still failing — broadcast the (possibly updated) failure kind
+		// so the user sees the same/changed error.
+		this.broadcastDatasetStatusToPanel(document, spec.dataset.uri, resolved);
 	}
 
 	/**

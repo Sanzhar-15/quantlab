@@ -33,6 +33,7 @@ import type { QvizTheme } from '../../src/qviz/render/types';
 import type { ColumnData } from '../../src/qviz/render/types';
 import { extractColumnsFromArrowIpc } from '../../src/qviz/render/extract-arrow';
 import { createStore } from '../qviz/state/store';
+import { isDirty } from '../qviz/state/specState';
 import { mountColumnPanel } from '../qviz/components/columnPanel';
 import { mountInspectorPanel } from '../qviz/components/inspectorPanel';
 import { DEFAULT_INSPECTOR_WINDOW_N } from '../qviz/components/inspectorTable';
@@ -69,7 +70,11 @@ function init(): void {
 	root.innerHTML = `
 		<div class="qviz-app">
 			<header class="qviz-app-header">
-				<h1 class="qviz-app-title">Visualise spec</h1>
+				<h1 class="qviz-app-title">
+					Visualise spec
+					<span id="qviz-unsaved-badge" class="qviz-unsaved-badge"
+						aria-label="Unsaved changes" title="Unsaved changes" hidden>●</span>
+				</h1>
 				<div class="qviz-app-header-controls">
 					<button id="qviz-inspector-toggle" type="button"
 						class="qviz-inspector-toggle" aria-pressed="false"
@@ -96,6 +101,7 @@ function init(): void {
 	const previewRoot = document.getElementById('qviz-preview-root')!;
 	const inspectorRoot = document.getElementById('qviz-inspector-root')!;
 	const inspectorToggleBtn = document.getElementById('qviz-inspector-toggle') as HTMLButtonElement;
+	const unsavedBadge = document.getElementById('qviz-unsaved-badge') as HTMLElement;
 
 	const store = createStore();
 	const announcer = mountAnnouncer(root, store);
@@ -103,7 +109,26 @@ function init(): void {
 	const chartType = mountChartTypePicker(chartTypeRoot, store);
 	const encoding = mountEncodingShelves(encodingRoot, store);
 	const transformList = mountTransformList(transformListRoot, store);
-	const preview = mountPreviewArea(previewRoot, store);
+	const preview = mountPreviewArea(previewRoot, store, {
+		// Phase 8 Step D: retry-button wiring. Each click posts a
+		// host-side message; the provider tears down the lifecycle
+		// (retryDaemon) or re-resolves the dataset path (recheckDataset)
+		// and broadcasts the resulting status back to the webview.
+		onRetryDaemon: () => {
+			vscode.postMessage({
+				type: 'retryDaemon',
+				protocolVersion: PROTOCOL_VERSION,
+				requestId: nextRequestId(),
+			});
+		},
+		onRecheckDataset: () => {
+			vscode.postMessage({
+				type: 'recheckDataset',
+				protocolVersion: PROTOCOL_VERSION,
+				requestId: nextRequestId(),
+			});
+		},
+	});
 	const inspectorPanel = mountInspectorPanel(inspectorRoot, store, {
 		vscode,
 		registerColumnStatsRequest: (column, requestId) => {
@@ -486,6 +511,14 @@ function init(): void {
 			...(filters.length > 0 ? { inspectorFilters: filters } : {}),
 		});
 	};
+	// Phase 8 Step F: in-webview unsaved indicator. Subscribes to the
+	// spec slice's isDirty() selector and toggles a small dot in the app
+	// header. VS Code's tab dot covers the same signal at the editor
+	// level; this one sits inside the webview so users editing the chart
+	// have an at-a-glance unsaved cue without looking up at the tab.
+	const unsavedSub = store.subscribe(() => {
+		unsavedBadge.hidden = !isDirty(store.getState().spec);
+	});
 	const inspectorViewSub = store.subscribe(() => {
 		const state = store.getState();
 		const insp = state.inspector;
@@ -560,6 +593,7 @@ function init(): void {
 		disposed = true;
 		liveSubscription();
 		inspectorViewSub();
+		unsavedSub();
 		themeObserver.disconnect();
 		resizeObserver.disconnect();
 		if (resizeTimer !== null) { clearTimeout(resizeTimer); }

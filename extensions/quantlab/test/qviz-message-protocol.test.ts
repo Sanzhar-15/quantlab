@@ -975,6 +975,14 @@ suite('messageProtocol -- webview messages', () => {
 		assert.strictEqual(validateWebviewMessage(env({ type: 'discardChanges' })).ok, true);
 	});
 
+	test('retryDaemon / recheckDataset: bare envelope validates (Phase 8 Step D)', () => {
+		// New webview-to-host messages introduced for retry buttons on
+		// the daemon-status / dataset-status banners. Bare envelopes —
+		// no payload beyond protocolVersion + requestId.
+		assert.strictEqual(validateWebviewMessage(env({ type: 'retryDaemon' })).ok, true);
+		assert.strictEqual(validateWebviewMessage(env({ type: 'recheckDataset' })).ok, true);
+	});
+
 });
 
 // ---------------------------------------------------------------------------

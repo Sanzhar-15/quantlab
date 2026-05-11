@@ -36,6 +36,21 @@ body {
 	font-size: 14px;
 	font-weight: 600;
 	margin: 0;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+
+/* Phase 8 Step F: unsaved-changes dot in the app header. Hidden by
+   default; shown when state.spec.currentHash !== state.spec.lastSavedHash. */
+.qviz-unsaved-badge {
+	color: var(--vscode-charts-orange, #f48771);
+	font-size: 16px;
+	line-height: 1;
+	pointer-events: none;
+}
+.qviz-unsaved-badge[hidden] {
+	display: none;
 }
 
 .qviz-app-hint {
@@ -464,11 +479,89 @@ body.qviz-inspector-open .qviz-app-main {
 	background: var(--vscode-statusBarItem-warningBackground, #cc6633);
 	color: var(--vscode-statusBarItem-warningForeground, #fff);
 	font-size: 11px;
+	display: flex;
+	align-items: center;
+	gap: 8px;
 }
-.qviz-preview-chart {
+.qviz-preview-stripe-message {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.qviz-preview-retry-daemon,
+.qviz-preview-recheck-dataset {
+	background: var(--vscode-button-background, #0e639c);
+	color: var(--vscode-button-foreground, #fff);
+	border: 1px solid var(--vscode-button-border, transparent);
+	padding: 2px 8px;
+	font-size: 11px;
+	cursor: pointer;
+	border-radius: 2px;
+}
+.qviz-preview-retry-daemon:hover,
+.qviz-preview-recheck-dataset:hover {
+	background: var(--vscode-button-hoverBackground, #1177bb);
+}
+.qviz-preview-retry-daemon[hidden],
+.qviz-preview-recheck-dataset[hidden] {
+	display: none;
+}
+.qviz-preview-chart-wrap {
 	flex: 1;
 	min-height: 0;
 	position: relative;
+}
+.qviz-preview-chart {
+	width: 100%;
+	height: 100%;
+	min-height: 0;
+	position: relative;
+}
+/* Phase 8 Step C: chart-area loading skeleton. Positioned absolutely
+   over the chart container so it overlays any in-progress paint. Pure
+   CSS — three pulsing bars suggesting a chart, plus a baseline axis. */
+.qviz-preview-skeleton {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	align-items: flex-end;
+	justify-content: space-around;
+	padding: 12% 8% 14%;
+	pointer-events: none;
+	background: linear-gradient(
+		180deg,
+		var(--vscode-editor-background, #1e1e1e) 0%,
+		var(--vscode-editor-background, #1e1e1e) 100%);
+	opacity: 0.85;
+}
+.qviz-preview-skeleton[hidden] {
+	display: none;
+}
+.qviz-skel-bar {
+	background: var(--vscode-descriptionForeground, #8888aa);
+	width: 14%;
+	opacity: 0.35;
+	border-radius: 2px 2px 0 0;
+	animation: qviz-skel-pulse 1.4s ease-in-out infinite;
+}
+.qviz-skel-bar-1 { height: 45%; animation-delay: 0s; }
+.qviz-skel-bar-2 { height: 72%; animation-delay: 0.2s; }
+.qviz-skel-bar-3 { height: 38%; animation-delay: 0.4s; }
+.qviz-skel-bar-4 { height: 60%; animation-delay: 0.6s; }
+.qviz-skel-axis {
+	position: absolute;
+	left: 8%;
+	right: 8%;
+	bottom: 14%;
+	height: 1px;
+	background: var(--vscode-descriptionForeground, #8888aa);
+	opacity: 0.4;
+}
+@keyframes qviz-skel-pulse {
+	0%, 100% { opacity: 0.25; }
+	50% { opacity: 0.55; }
 }
 .qviz-preview-diagnostics {
 	border-top: 1px solid var(--vscode-panel-border);
