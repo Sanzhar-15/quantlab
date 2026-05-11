@@ -64,14 +64,43 @@ pub fn to_logical(v: &Value) -> Result<bool, ErrorValue> {
     }
 }
 
-/// Invariant text representation — identical to `Value::Display`. Locale-agnostic.
-/// Used by string concatenation (`&`) and by criteria strings (`">="&A1`).
-pub fn to_text(v: &Value) -> String {
+/// Invariant text representation for **display** contexts — UI rendering, debug, criteria-key
+/// formation. Infallible; `Value::Error(e)` is rendered as its sigil (`"#REF!"`, `"#NUM!"`, ...).
+/// Locale-agnostic.
+///
+/// **Do NOT use for the formula `&` operator** — see [`to_text_for_formula`]. Excel propagates
+/// errors through concatenation: `=#REF! & "x"` evaluates to `#REF!`, not the string `"#REF!x"`.
+pub fn to_text_for_display(v: &Value) -> String {
     format!("{v}")
 }
 
-/// Clamp finite. NaN or ±∞ become `#NUM!`. Use in kernels right before wrapping into
-/// `Value::Number`.
+/// Invariant text representation for **formula** contexts — the `&` operator and any builtin
+/// that takes a text argument and would otherwise short-circuit on an error.
+/// Returns `Err(e)` when the input is `Value::Error(e)`, matching Excel's error-propagation rule.
+pub fn to_text_for_formula(v: &Value) -> Result<String, ErrorValue> {
+    match v {
+        Value::Error(e) => Err(*e),
+        _ => Ok(format!("{v}")),
+    }
+}
+
+/// Clamp finite. NaN or ±∞ become `#NUM!`. Use at the leaf of a kernel right before wrapping
+/// into `Value::Number`.
+///
+/// **Contract for arithmetic kernels** (Week 4 ql-exec / ql-functions): `sanitize_f64` maps
+/// every non-finite `f64` to `#NUM!` uniformly. Excel distinguishes a structural zero-divisor
+/// (`=A/0` → `#DIV/0!`) from an overflow-to-infinity (`=1e308 * 10` → `#NUM!`). Both are `Inf`
+/// at the f64 level, so kernels MUST check divisor-zero BEFORE the division and emit
+/// `Err(ErrorValue::DivZero)` directly. Only call `sanitize_f64` on the result when the
+/// operation is non-division (and even then, only for overflow / NaN propagation).
+///
+/// Pseudo-code for a div kernel:
+/// ```text
+/// fn div(a: f64, b: f64) -> Result<f64, ErrorValue> {
+///     if b == 0.0 { return Err(ErrorValue::DivZero); }   // CHECK FIRST
+///     sanitize_f64(a / b)                                 // then map overflow → #NUM!
+/// }
+/// ```
 pub fn sanitize_f64(n: f64) -> Result<f64, ErrorValue> {
     if n.is_nan() || n.is_infinite() {
         Err(ErrorValue::Num)
@@ -326,39 +355,107 @@ mod tests {
         }
     }
 
-    // -- to_text ---------------------------------------------------------------
+    // -- to_text_for_display ---------------------------------------------------
 
     #[test]
-    fn text_invariant_forms() {
-        assert_eq!(to_text(&Value::Blank), "");
-        assert_eq!(to_text(&Value::Number(1.5)), "1.5");
-        assert_eq!(to_text(&Value::Number(0.0)), "0");
-        assert_eq!(to_text(&Value::Number(-2.5)), "-2.5");
-        assert_eq!(to_text(&Value::Boolean(true)), "TRUE");
-        assert_eq!(to_text(&Value::Boolean(false)), "FALSE");
-        assert_eq!(to_text(&Value::text("hi")), "hi");
-        assert_eq!(to_text(&Value::Error(ErrorValue::Ref)), "#REF!");
+    fn display_text_invariant_forms() {
+        assert_eq!(to_text_for_display(&Value::Blank), "");
+        assert_eq!(to_text_for_display(&Value::Number(1.5)), "1.5");
+        assert_eq!(to_text_for_display(&Value::Number(0.0)), "0");
+        assert_eq!(to_text_for_display(&Value::Number(-2.5)), "-2.5");
+        assert_eq!(to_text_for_display(&Value::Boolean(true)), "TRUE");
+        assert_eq!(to_text_for_display(&Value::Boolean(false)), "FALSE");
+        assert_eq!(to_text_for_display(&Value::text("hi")), "hi");
+        // display path: errors render as sigil (for UI / debug / criteria-key formation)
+        assert_eq!(to_text_for_display(&Value::Error(ErrorValue::Ref)), "#REF!");
         assert_eq!(
-            to_text(&Value::Error(ErrorValue::Disconnected)),
+            to_text_for_display(&Value::Error(ErrorValue::Disconnected)),
             "#DISCONNECTED!"
+        );
+        assert_eq!(
+            to_text_for_display(&Value::Error(ErrorValue::AINotAvailable)),
+            "#AI_NOT_AVAILABLE_V1"
         );
     }
 
     #[test]
-    fn text_preserves_arc_str_content() {
+    fn display_text_preserves_arc_str_content() {
         let s: Arc<str> = "anything-here".into();
-        assert_eq!(to_text(&Value::Text(s)), "anything-here");
+        assert_eq!(to_text_for_display(&Value::Text(s)), "anything-here");
+    }
+
+    // -- to_text_for_formula ---------------------------------------------------
+
+    #[test]
+    fn formula_text_non_errors_match_display() {
+        // For non-Error inputs, formula text matches display text.
+        for v in [
+            Value::Blank,
+            Value::Number(1.5),
+            Value::Number(0.0),
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::text("hello"),
+        ] {
+            assert_eq!(
+                to_text_for_formula(&v).unwrap(),
+                to_text_for_display(&v),
+                "mismatch for {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn formula_text_propagates_every_error_variant() {
+        // Excel: `=#REF! & "x"` → #REF!, not "#REF!x".
+        // Every ErrorValue variant must propagate through to_text_for_formula.
+        for e in ErrorValue::ALL {
+            assert_eq!(
+                to_text_for_formula(&Value::Error(e)).unwrap_err(),
+                e,
+                "expected propagation of {e:?}"
+            );
+        }
     }
 
     // -- error short-circuit precedence ---------------------------------------
 
     #[test]
     fn error_short_circuits_in_all_coercions() {
-        // Same input, same error out — across strict / lenient / logical.
+        // Same input, same error out — across strict / lenient / logical / formula-text.
         let inp = Value::Error(ErrorValue::Calc);
         assert_eq!(to_number_strict(&inp).unwrap_err(), ErrorValue::Calc);
         assert_eq!(to_number_lenient(&inp).unwrap_err(), ErrorValue::Calc);
         assert_eq!(to_logical(&inp).unwrap_err(), ErrorValue::Calc);
+        assert_eq!(to_text_for_formula(&inp).unwrap_err(), ErrorValue::Calc);
+        // Display path is the deliberate exception — it renders the sigil for UI:
+        assert_eq!(to_text_for_display(&inp), "#CALC!");
+    }
+
+    // -- division-zero seam contract (sanitize_f64 doc) -------------------------
+
+    /// This test fixes the contract that future ql-functions / ql-exec kernels MUST honor:
+    /// `sanitize_f64` is for overflow/underflow/NaN translation only. Division by zero must be
+    /// surfaced as `#DIV/0!` BEFORE the f64 division; otherwise the kernel would emit
+    /// `#NUM!` for the resulting `Inf`, which is Excel-wrong.
+    #[test]
+    fn sanitize_treats_infinity_as_num_so_div_kernels_must_check_zero_first() {
+        // Bare `1.0 / 0.0` produces +Inf; sanitize_f64 maps that to #NUM!.
+        // If a kernel skipped its divisor-zero check and relied on this fallback, =A/0 would
+        // incorrectly become #NUM! instead of #DIV/0!.
+        assert_eq!(sanitize_f64(1.0_f64 / 0.0).unwrap_err(), ErrorValue::Num);
+        assert_eq!(sanitize_f64(-1.0_f64 / 0.0).unwrap_err(), ErrorValue::Num);
+        // The right pattern (replicated here to lock the contract):
+        fn div(a: f64, b: f64) -> Result<f64, ErrorValue> {
+            if b == 0.0 {
+                return Err(ErrorValue::DivZero); // check first
+            }
+            sanitize_f64(a / b)
+        }
+        assert_eq!(div(1.0, 0.0).unwrap_err(), ErrorValue::DivZero);
+        assert_eq!(div(1.0, 2.0).unwrap(), 0.5);
+        // Overflow still maps to #NUM! through sanitize_f64:
+        assert_eq!(div(f64::MAX, 1e-308).unwrap_err(), ErrorValue::Num);
     }
 
     // -- parse_number_invariant (private but worth direct coverage) ------------

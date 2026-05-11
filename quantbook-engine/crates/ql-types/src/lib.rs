@@ -4,7 +4,7 @@
 //! - [`error`] — the 14-variant `ErrorValue` (Excel sigils + Quantbook-specific surfaces + AI reservation).
 //! - [`value`] — the 5-variant `Value` (`Blank | Number | Boolean | Text | Error`).
 //! - [`coercion`] — Excel-compatible boundary functions: `to_number_{strict,lenient}`,
-//!   `to_logical`, `to_text`, `sanitize_f64`.
+//!   `to_logical`, `to_text_for_{display,formula}`, `sanitize_f64`.
 //!
 //! Spec: `.plans/_QUANTBOOK-v1-SPECIFICATION.md` Part V §2 Week 2 Day 1-2.
 //!
@@ -17,7 +17,10 @@ pub mod coercion;
 pub mod error;
 pub mod value;
 
-pub use coercion::{sanitize_f64, to_logical, to_number_lenient, to_number_strict, to_text};
+pub use coercion::{
+    sanitize_f64, to_logical, to_number_lenient, to_number_strict, to_text_for_display,
+    to_text_for_formula,
+};
 pub use error::{ErrorValue, ParseErrorValueError};
 pub use value::Value;
 
