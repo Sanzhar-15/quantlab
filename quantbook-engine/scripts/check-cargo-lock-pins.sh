@@ -43,6 +43,8 @@ PINNED_PKGS=(
   pyo3
   wasm-bindgen
   proptest
+  serde
+  serde_json
 )
 
 err=0

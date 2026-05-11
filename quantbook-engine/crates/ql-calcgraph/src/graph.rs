@@ -65,6 +65,23 @@ pub struct Graph {
     stats: GraphStats,
 }
 
+/// Count of nodes by `Node` variant. Used by `graph-profile.json` export so a reader can
+/// see at a glance how the graph mass distributes across leaf cells, compressed ranges,
+/// dense formula regions, and (Phase 3+) spill anchors.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NodeCountsByVariant {
+    pub cell: u64,
+    pub range: u64,
+    pub formula_region: u64,
+    pub spill: u64,
+}
+
+impl NodeCountsByVariant {
+    pub fn total(&self) -> u64 {
+        self.cell + self.range + self.formula_region + self.spill
+    }
+}
+
 impl Graph {
     pub fn new() -> Self {
         Self::default()
@@ -234,6 +251,28 @@ impl Graph {
     /// `register_range_dependency` call. Used by tests + W3-7 graph-profile export.
     pub fn range_dependency_count(&self) -> usize {
         self.formula_to_range_deps.values().map(Vec::len).sum()
+    }
+
+    /// Count nodes by variant. Used by W3-7 graph-profile.json export (OG-06) so a
+    /// reader can quickly attribute total graph mass to the right node kind. O(n) over
+    /// the node array; not on any hot path.
+    pub fn node_counts_by_variant(&self) -> NodeCountsByVariant {
+        let mut counts = NodeCountsByVariant::default();
+        for n in &self.nodes {
+            match n {
+                Node::Cell(_) => counts.cell += 1,
+                Node::Range(_) => counts.range += 1,
+                Node::FormulaRegion(_) => counts.formula_region += 1,
+                Node::Spill(_) => counts.spill += 1,
+            }
+        }
+        counts
+    }
+
+    /// Borrow the stripe index — used by ql-profile to dump stripe-key cardinality.
+    /// Read-only public access; mutation goes through `register_range_dependency`.
+    pub fn stripe_index(&self) -> &StripeIndex {
+        &self.stripes
     }
 
     /// Test-only typed accessor for A4 assertions (CORR-24).

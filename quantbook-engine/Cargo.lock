@@ -709,6 +709,7 @@ version = "0.1.0"
 name = "ql-calcgraph"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "proptest",
  "ql-formula-syntax",
  "ql-types",
@@ -760,6 +761,12 @@ version = "0.1.0"
 [[package]]
 name = "ql-profile"
 version = "0.1.0"
+dependencies = [
+ "ql-calcgraph",
+ "ql-types",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "ql-service"

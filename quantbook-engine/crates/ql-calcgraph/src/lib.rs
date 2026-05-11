@@ -42,11 +42,15 @@ pub mod topo;
 pub use dirty::{propagate_from_cells, ChunkDirtySet, ChunkKey};
 pub use edges::AdjacencyVectors;
 pub use fingerprint::fingerprint;
-pub use graph::Graph;
+pub use graph::{Graph, NodeCountsByVariant};
 pub use node::{CellNode, FormulaRegionNode, Node, NodeId, RangeNode, SpillNode};
 pub use stats::GraphStats;
 pub use stripes::{StripeIndex, StripeKey, StripeType};
 pub use topo::{schedule, Schedule};
+
+// Re-exports — downstream crates that depend on ql-calcgraph can use the dependent AST
+// types via this crate without needing a direct ql-formula-syntax dep.
+pub use ql_formula_syntax::RangeRef;
 
 #[cfg(test)]
 mod integration_tests {
