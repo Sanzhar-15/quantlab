@@ -91,6 +91,14 @@ impl StripeIndex {
     /// Register `formula_node`'s dependency on `range`. Picks the cheaper-to-index axis
     /// via the shape heuristic; inserts one entry per touched stripe index along that
     /// axis. Resolves the `RangeRef`'s optional sheet to `sheet_id` if `None`.
+    ///
+    /// **Panics** if the `range` has reversed bounds (start > end on any axis). Per the
+    /// no-fallbacks rule (audit finding H1, 2026-05-12): malformed ranges previously
+    /// silently no-op'd the stripe insert because `for c in start..=end` is an empty
+    /// range when `start > end`. The formula would have appeared registered (entry in
+    /// `formula_to_range_deps`) but be unreachable via writes — silent dependency loss.
+    /// Now: loud panic at the boundary. Caller is responsible for normalizing before
+    /// calling.
     pub fn register(&mut self, formula_node: NodeId, range: &RangeRef, sheet_id: SheetId) {
         match range {
             RangeRef::Cells {
@@ -101,9 +109,17 @@ impl StripeIndex {
                 end_row,
                 ..
             } => {
+                assert!(
+                    start_col <= end_col,
+                    "StripeIndex::register: Cells range has reversed cols (start_col={start_col} > end_col={end_col})"
+                );
+                assert!(
+                    start_row <= end_row,
+                    "StripeIndex::register: Cells range has reversed rows (start_row={start_row} > end_row={end_row})"
+                );
                 let s = sheet.unwrap_or(sheet_id);
-                let height = end_row.saturating_sub(*start_row) + 1;
-                let width = end_col.saturating_sub(*start_col) + 1;
+                let height = end_row - start_row + 1;
+                let width = end_col - start_col + 1;
                 if height > width {
                     for c in *start_col..=*end_col {
                         self.insert(
@@ -134,6 +150,10 @@ impl StripeIndex {
                 end_col,
                 ..
             } => {
+                assert!(
+                    start_col <= end_col,
+                    "StripeIndex::register: WholeColumn has reversed cols (start_col={start_col} > end_col={end_col})"
+                );
                 let s = sheet.unwrap_or(sheet_id);
                 for c in *start_col..=*end_col {
                     self.insert(
@@ -152,6 +172,10 @@ impl StripeIndex {
                 end_row,
                 ..
             } => {
+                assert!(
+                    start_row <= end_row,
+                    "StripeIndex::register: WholeRow has reversed rows (start_row={start_row} > end_row={end_row})"
+                );
                 let s = sheet.unwrap_or(sheet_id);
                 for r in *start_row..=*end_row {
                     self.insert(
@@ -447,6 +471,72 @@ mod tests {
         assert_eq!(idx.stripe_count(), 1);
         // HashSet dedupes; total_insertions counts distinct formulas per stripe.
         assert_eq!(idx.total_insertions(), 1);
+    }
+
+    // ===== Audit H1 fix (2026-05-12): malformed ranges panic instead of silently no-op =====
+
+    #[test]
+    #[should_panic(expected = "reversed cols")]
+    fn register_panics_on_cells_reversed_cols() {
+        let mut idx = StripeIndex::new();
+        let bad = RangeRef::Cells {
+            sheet: None,
+            start_col: 5,
+            start_row: 0,
+            end_col: 2,
+            end_row: 9,
+            abs_start_col: false,
+            abs_start_row: false,
+            abs_end_col: false,
+            abs_end_row: false,
+        };
+        idx.register(NodeId(1), &bad, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "reversed rows")]
+    fn register_panics_on_cells_reversed_rows() {
+        let mut idx = StripeIndex::new();
+        let bad = RangeRef::Cells {
+            sheet: None,
+            start_col: 0,
+            start_row: 9,
+            end_col: 1,
+            end_row: 2,
+            abs_start_col: false,
+            abs_start_row: false,
+            abs_end_col: false,
+            abs_end_row: false,
+        };
+        idx.register(NodeId(1), &bad, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "WholeColumn has reversed cols")]
+    fn register_panics_on_whole_column_reversed() {
+        let mut idx = StripeIndex::new();
+        let bad = RangeRef::WholeColumn {
+            sheet: None,
+            start_col: 5,
+            end_col: 2,
+            abs_start: false,
+            abs_end: false,
+        };
+        idx.register(NodeId(1), &bad, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "WholeRow has reversed rows")]
+    fn register_panics_on_whole_row_reversed() {
+        let mut idx = StripeIndex::new();
+        let bad = RangeRef::WholeRow {
+            sheet: None,
+            start_row: 9,
+            end_row: 2,
+            abs_start: false,
+            abs_end: false,
+        };
+        idx.register(NodeId(1), &bad, 0);
     }
 
     #[test]

@@ -38,7 +38,7 @@
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
-use ql_types::{ColId, RowId, SheetId};
+use ql_types::{ColId, RowId, SheetId, MAX_ROW};
 
 use crate::graph::Graph;
 use crate::node::{Node, NodeId};
@@ -123,7 +123,16 @@ impl ChunkDirtySet {
     }
 
     /// Mark a single cell dirty. O(log n) for the BTreeMap entry + O(1) for the bit set.
+    ///
+    /// Audit M3 (2026-05-12): asserts `row <= MAX_ROW` so downstream chunk-arithmetic
+    /// `chunk_idx * chunk_rows` can't overflow u32. Phase 0 Excel cap is 1,048,575
+    /// (well under u32::MAX); a malformed caller passing u32::MAX would silently wrap
+    /// in release builds without this check.
     pub fn mark_cell(&mut self, sheet: SheetId, row: RowId, col: ColId) {
+        assert!(
+            row <= MAX_ROW,
+            "ChunkDirtySet::mark_cell: row {row} exceeds Excel MAX_ROW {MAX_ROW}"
+        );
         let chunk_idx = row / self.chunk_rows;
         let in_chunk_row = (row % self.chunk_rows) as usize;
         let key = ChunkKey {
@@ -153,6 +162,11 @@ impl ChunkDirtySet {
         assert!(
             start_row <= end_row,
             "ChunkDirtySet::mark_range_in_column: start_row {start_row} > end_row {end_row}"
+        );
+        // Audit M3 (2026-05-12): bound rows under MAX_ROW so chunk-arithmetic stays in u32.
+        assert!(
+            end_row <= MAX_ROW,
+            "ChunkDirtySet::mark_range_in_column: end_row {end_row} exceeds Excel MAX_ROW {MAX_ROW}"
         );
         let start_chunk = start_row / self.chunk_rows;
         let end_chunk = end_row / self.chunk_rows;
@@ -198,11 +212,19 @@ impl ChunkDirtySet {
 
 /// Walk the reverse adjacency from each seed, marking dependents' chunks dirty. Each node
 /// is visited at most once even in the presence of cycles (a defensive precaution; W3-3
-/// will surface true cycle DETECTION as `CycleError`).
+/// `topo::schedule` partitions cycled nodes into `Schedule::cycled` for the evaluator to
+/// surface as `CellError(Cycle)`).
 ///
-/// Seeds are the nodes that just changed (typically `CellNode`s that received a write).
-/// Their own chunks are marked dirty BEFORE the walk starts; then the walk visits
-/// `incoming(seed)` and recurses.
+/// Seeds are the nodes that just changed. Semantics by seed type:
+/// - `Node::Cell` — marks exactly the cell's chunk bit dirty.
+/// - `Node::FormulaRegion` — marks every cell in the region's `target_rect` dirty.
+/// - `Node::Range` — no-op for chunk marking (range nodes don't own chunks); the BFS
+///   still walks through them to find downstream formula dependents.
+/// - `Node::Spill` — panics; Phase 3+ feature, must not appear in Phase 0.
+///
+/// In practice callers seed with `CellNode`s (the binder feeds cell writes). The
+/// FormulaRegion/Range/Spill behavior is documented for completeness; no Phase 0 code
+/// path uses non-Cell seeds.
 pub fn propagate_from_cells(graph: &Graph, dirty: &mut ChunkDirtySet, seeds: &[NodeId]) {
     let mut visited: HashSet<NodeId> = HashSet::new();
     let mut queue: VecDeque<NodeId> = VecDeque::new();
@@ -363,6 +385,30 @@ mod tests {
     fn mark_range_with_reversed_bounds_panics() {
         let mut d = ChunkDirtySet::new(CHUNK_ROWS);
         d.mark_range_in_column(0, 10, 5, 0);
+    }
+
+    // Audit M3 (2026-05-12): row bounds enforced under MAX_ROW so chunk arithmetic
+    // can't overflow u32 in release builds.
+
+    #[test]
+    #[should_panic(expected = "exceeds Excel MAX_ROW")]
+    fn mark_cell_panics_on_row_over_max() {
+        let mut d = ChunkDirtySet::new(CHUNK_ROWS);
+        d.mark_cell(0, u32::MAX, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds Excel MAX_ROW")]
+    fn mark_range_panics_on_end_row_over_max() {
+        let mut d = ChunkDirtySet::new(CHUNK_ROWS);
+        d.mark_range_in_column(0, 0, u32::MAX, 0);
+    }
+
+    #[test]
+    fn mark_cell_at_max_row_does_not_panic() {
+        let mut d = ChunkDirtySet::new(CHUNK_ROWS);
+        d.mark_cell(0, MAX_ROW, 0);
+        assert!(d.is_cell_dirty(0, MAX_ROW, 0));
     }
 
     // ===== propagation tests =====

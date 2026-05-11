@@ -140,7 +140,7 @@ pub fn export_graph_profile(graph: &Graph, dirty: Option<&ChunkDirtySet>) -> ser
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ql_calcgraph::{FormulaRegionNode, Graph as GraphAlias, NodeId, RangeNode, RangeRef};
+    use ql_calcgraph::{FormulaRegionNode, Graph as GraphAlias, RangeNode, RangeRef};
 
     fn make_sample_graph() -> GraphAlias {
         let mut g = Graph::new();
@@ -182,7 +182,7 @@ mod tests {
         );
         // Simulate a Week 4 chunk-reduce.
         g.record_chunked_reduce(3);
-        let _ = NodeId(a1.0); // suppress unused-import worry in tests
+        let _ = a1; // ID used in setup above; bind to suppress unused-var warning.
         g
     }
 
@@ -261,20 +261,42 @@ mod tests {
         assert_eq!(v["stats"]["chunked_reduce_chunks_processed"], 3);
     }
 
+    /// Audit M4 (2026-05-12): the previous version of this test only asserted the
+    /// pretty-printed JSON contained the field-name strings — trivially true by construction
+    /// since `serde::Serialize` derives them from the struct field names. Now: assert each
+    /// nested numeric value parses, the total node count matches, and counter sums are
+    /// internally consistent. Without these checks, a regression that broke the Serialize
+    /// derives or shuffled field meanings would pass the test silently.
     #[test]
-    fn pretty_printed_json_is_readable() {
-        // OG-06 acceptance is semi-formal: a senior engineer reads the JSON + identifies
-        // the hot path within 10 min. This test prints a sample so a reviewer can eyeball.
+    fn pretty_printed_json_is_structurally_consistent() {
         let g = make_sample_graph();
         let mut dirty = ChunkDirtySet::new(16384);
         dirty.mark_cell(0, 5, 0);
         let v = export_graph_profile(&g, Some(&dirty));
         let pretty = serde_json::to_string_pretty(&v).expect("pretty-print works");
-        // Sanity: contains all top-level sections.
-        assert!(pretty.contains("\"schema_version\""));
-        assert!(pretty.contains("\"graph\""));
-        assert!(pretty.contains("\"stats\""));
-        assert!(pretty.contains("\"dirty\""));
+
+        // Round-trip the pretty form back through serde to a Value to verify it parses
+        // cleanly (catches encoding glitches).
+        let round_tripped: serde_json::Value =
+            serde_json::from_str(&pretty).expect("round-trip parse");
+        assert_eq!(round_tripped, v);
+
+        // Internal consistency: node_count == sum of node_counts by variant.
+        let nc = &v["graph"]["node_counts"];
+        let total_by_variant = nc["cell"].as_u64().unwrap()
+            + nc["range"].as_u64().unwrap()
+            + nc["formula_region"].as_u64().unwrap()
+            + nc["spill"].as_u64().unwrap();
+        assert_eq!(
+            v["graph"]["node_count"].as_u64().unwrap(),
+            total_by_variant,
+            "graph.node_count must equal sum of node_counts"
+        );
+
+        // dirty.present <=> chunk_count > 0 (chunk_count should be >0 since we marked a cell).
+        assert_eq!(v["dirty"]["present"], serde_json::Value::Bool(true));
+        assert!(v["dirty"]["chunk_count"].as_u64().unwrap() > 0);
+
         // The output is a stable shape; print for posterity (cargo test --nocapture).
         println!("---\ngraph-profile.json sample:\n{pretty}\n---");
     }

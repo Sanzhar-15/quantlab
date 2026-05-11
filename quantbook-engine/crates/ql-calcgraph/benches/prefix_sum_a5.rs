@@ -11,7 +11,7 @@
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use ql_calcgraph::{Graph, NodeId, RangeRef};
+use ql_calcgraph::{Graph, RangeRef};
 
 fn build_n_sum_a1_to_an_formulas(n: u32) -> Graph {
     let mut g = Graph::new();
@@ -69,13 +69,6 @@ fn bench_a5_invariant_at_scale(c: &mut Criterion) {
             black_box(total);
         });
     });
-}
-
-// NodeId import is unused in the helpers above but kept here for any future bench that
-// wants to thread IDs across — explicit lint suppression in case it'd flag.
-#[allow(dead_code)]
-fn _silence_unused() -> NodeId {
-    NodeId(0)
 }
 
 criterion_group!(

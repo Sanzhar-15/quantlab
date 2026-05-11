@@ -1,22 +1,30 @@
 //! `ql-calcgraph` — Quantbook calculation dependency graph.
 //!
 //! Phase 0 scope per spec Part V §4 Week 3 + the Week 3 Day 0 reference deep-read
-//! (`docs/phase0/references-reading-log.md`):
+//! (`docs/phase0/references-reading-log.md`). All of W3-1..W3-9 are implemented in the
+//! modules below.
 //!
-//! - **W3-1 (THIS COMMIT)**: Node + edges + Graph container. Append-only nodes, directed
-//!   edges with reverse adjacency, revision counter. ~600 LOC + 24 tests across the three
-//!   modules.
-//! - **W3-2** (next): `dirty.rs` — per-chunk dirty bitmap (`ChunkDirtySet`) + propagation.
-//!   OG-05 acceptance ("single-cell write marks only one chunk") locked here.
-//! - **W3-3**: `topo.rs` — iterative Tarjan SCC scheduler returning `(sorted, cycled)`.
-//!   CORR-23 applied (Tarjan, not Kahn).
-//! - **W3-4**: `fingerprint.rs` — `fn fingerprint(&Expr) -> u64` for formula-region
-//!   memoization. ahash via the workspace.
-//! - **W3-5**: `stripes.rs` — Formualizer-style stripe map per CORR-21. The A5
-//!   acceptance piece.
-//! - **W3-6**: typed `#[cfg(test)]` accessors on `Graph` per CORR-24. The 3 A4
-//!   acceptance assertions.
-//! - **W3-7..9**: ql-profile `graph-profile.json` export (OG-06); A1 + A5 bench scaffolds.
+//! - `node.rs` — Node enum (Cell, Range, FormulaRegion, Spill) + payload structs.
+//! - `edges.rs` — append-only adjacency vectors with reverse-lookup.
+//! - `graph.rs` — top-level Graph with register_range_dependency, dependents_for_cell,
+//!   record_chunked_reduce, node_counts_by_variant, stripe_index accessor, and
+//!   `#[cfg(test)]` typed accessors for A4 assertions (CORR-24).
+//! - `dirty.rs` — ChunkDirtySet (sparse per-chunk bitmap) and propagate_from_cells.
+//!   Locks OG-05 acceptance ("single-cell write marks only the affected chunk").
+//! - `topo.rs` — iterative Tarjan SCC over the dirty subset returning
+//!   Schedule { sorted, cycled }. Applies CORR-23 (Tarjan, not Kahn).
+//! - `fingerprint.rs` — fingerprint(&Expr) -> u64 for FormulaRegionNode memoization.
+//! - `stripes.rs` — Formualizer-style StripeKey { Row|Column, index } map per CORR-21.
+//!   Locks A5 acceptance (range-node prefix-SUM near-linear edge growth).
+//! - `stats.rs` — GraphStats instrumentation counters (stripe_inserts,
+//!   dependents_scan_fallback, chunked_reduce_chunks_processed).
+//!
+//! Benches under `benches/` cover A1 (region split/merge falsifier scaffold), A5
+//! (prefix-SUM near-linear), and OG-05 (per-chunk dirty propagation).
+//!
+//! Audit hardening (2026-05-12): post-W3 audit applied H1 (malformed-range panic), H2
+//! (deterministic Vec ordering on `dependents_for_cell`), and M3 (MAX_ROW bound on
+//! chunk arithmetic). See commit message + the audit findings.
 //!
 //! ## Design intent (recap)
 //!

@@ -8,4 +8,4 @@
 
 pub mod graph_profile;
 
-pub use graph_profile::{export_graph_profile, GraphProfile};
+pub use graph_profile::{build_profile, export_graph_profile, GraphProfile};

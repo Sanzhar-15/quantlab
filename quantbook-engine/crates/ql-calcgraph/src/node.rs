@@ -113,7 +113,6 @@ pub struct SpillNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ql_formula_syntax::RangeRef;
 
     #[test]
     fn node_id_index_is_u32_cast() {

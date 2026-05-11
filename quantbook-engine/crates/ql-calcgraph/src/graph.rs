@@ -233,18 +233,23 @@ impl Graph {
     /// 2. Precision filter against each candidate's `formula_to_range_deps` — drops
     ///    candidates whose actual range doesn't contain the cell.
     ///
-    /// Returns the precise dependent set. Used by Week 4 `ql-exec` during dirty
-    /// propagation to find which formulas a cell write affects.
+    /// Returns the precise dependent set, **sorted ascending by `NodeId`** so callers
+    /// receive deterministic ordering across runs. Audit H2 (2026-05-12): the previous
+    /// implementation collected from a `HashSet` which leaked Rust's randomized hash
+    /// state — two identical edits on the same workbook would produce different
+    /// downstream scheduling order, silently breaking replay determinism.
     pub fn dependents_for_cell(&self, sheet: SheetId, row: RowId, col: ColId) -> Vec<NodeId> {
         let candidates = self.stripes.candidates_for_cell(sheet, row, col);
-        candidates
+        let mut out: Vec<NodeId> = candidates
             .into_iter()
             .filter(|formula_id| {
                 self.formula_to_range_deps
                     .get(formula_id)
                     .is_some_and(|ranges| ranges.iter().any(|r| range_contains_rowcol(r, row, col)))
             })
-            .collect()
+            .collect();
+        out.sort();
+        out
     }
 
     /// Total registered range-dependencies across all formula nodes. Counts each
@@ -510,15 +515,48 @@ mod tests {
         assert_eq!(g.stripes().stripe_count(), 1);
         assert_eq!(g.stripes().total_insertions(), 2);
 
-        // Write to A5 (in B1's range): both match.
-        let mut deps_at_5 = g.dependents_for_cell(0, 5, 0);
-        deps_at_5.sort();
+        // Write to A5 (in B1's range): both match. Output is sorted (audit H2 fix).
+        let deps_at_5 = g.dependents_for_cell(0, 5, 0);
         let mut expected: Vec<NodeId> = [b1, c1].to_vec();
         expected.sort();
         assert_eq!(deps_at_5, expected);
+        // Verify the returned Vec is sorted (H2 contract).
+        assert!(deps_at_5.windows(2).all(|w| w[0] <= w[1]));
 
         // Write to A500 (outside B1's range, inside C1's): only C1 matches.
         assert_eq!(g.dependents_for_cell(0, 500, 0), vec![c1]);
+    }
+
+    /// Audit H2 (2026-05-12): `dependents_for_cell` must return a Vec sorted by NodeId
+    /// for determinism. Previously the function collected from a HashSet which leaked
+    /// Rust's randomized hash state to callers, silently breaking replay determinism.
+    #[test]
+    fn dependents_for_cell_returns_sorted_vec() {
+        let mut g = Graph::new();
+        // 50 formulas in random column order — internal HashSet iteration would yield
+        // them in an arbitrary order. dependents_for_cell must sort before returning.
+        let mut ids = Vec::with_capacity(50);
+        for col in 0..50 {
+            let id = g.add_cell_node(0, 0, col + 1);
+            ids.push(id);
+            g.register_range_dependency(
+                id,
+                RangeRef::WholeColumn {
+                    sheet: None,
+                    start_col: 0,
+                    end_col: 0,
+                    abs_start: false,
+                    abs_end: false,
+                },
+                0,
+            );
+        }
+        let deps = g.dependents_for_cell(0, 5, 0);
+        assert_eq!(deps.len(), 50);
+        // Strictly increasing by NodeId.
+        assert!(deps.windows(2).all(|w| w[0] < w[1]));
+        // And: same result on the second call (deterministic).
+        assert_eq!(deps, g.dependents_for_cell(0, 5, 0));
     }
 
     #[test]
