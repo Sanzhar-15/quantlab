@@ -273,14 +273,21 @@ export class StatsViewProvider implements vscode.CustomTextEditorProvider {
     }
 
     private async loadColumnInfo(uri: vscode.Uri): Promise<Array<{ name: string; dtype: ColumnDType }>> {
+        // Audit-fix C3+M1: the underlying command now THROWS on inspection
+        // failure (was: silently returned null/[] which produced empty pickers
+        // with no UI surface). Surface the error to the user, then return
+        // an empty list so the panel shape stays renderable.
         try {
             const result = await vscode.commands.executeCommand<ColumnInfo[]>(
                 'quantlab.getDataFileColumns',
                 uri.fsPath
             );
-            return result?.map(c => ({ name: c.name, dtype: c.dtype })) ?? [];
-        } catch {
-            // Fallback: return empty array
+            return (result ?? []).map(c => ({ name: c.name, dtype: c.dtype }));
+        } catch (err) {
+            const message = (err as Error)?.message ?? String(err);
+            void vscode.window.showErrorMessage(
+                `Failed to inspect ${uri.fsPath}: ${message}`,
+            );
             return [];
         }
     }

@@ -4,6 +4,8 @@
  *--------------------------------------------------------------------------------------------*/
 
 import 'mocha';
+
+import { isTestFlagEnabled } from '../helpers/envFlag';
 import * as assert from 'assert';
 import * as net from 'net';
 import * as path from 'path';
@@ -22,7 +24,13 @@ suite('SocketTransport', () => {
 	let mockServer: net.Server | null = null;
 	let transport: SocketTransport | null = null;
 
-	suiteSetup(async () => {
+	suiteSetup(async function () {
+		// Megaudit Final.2: gated behind RUN_TRADING_INTEGRATION (see
+		// daemon.integration.test.ts for rationale).
+		if (!isTestFlagEnabled(process.env.RUN_TRADING_INTEGRATION)) {  // Megaudit-2 A6-MAJOR-3
+			this.skip();
+			return;
+		}
 		// Ensure test directory exists
 		await fs.mkdir(testDir, { recursive: true });
 	});
@@ -219,7 +227,7 @@ suite('SocketTransport', () => {
 
 			mockServer = net.createServer((socket) => {
 				socket.on('data', (data) => {
-					receivedData.push(data);
+					receivedData.push(data as Buffer);
 				});
 			});
 			await new Promise<void>((resolve) => {
@@ -253,7 +261,7 @@ suite('SocketTransport', () => {
 
 			mockServer = net.createServer((socket) => {
 				socket.on('data', (data) => {
-					receivedData.push(data);
+					receivedData.push(data as Buffer);
 				});
 			});
 			await new Promise<void>((resolve) => {

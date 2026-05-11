@@ -8,6 +8,12 @@ import { DataFileType } from '../types/data';
 import { DataViewType } from '../types/views';
 import { DataSourceDescriptor } from '../types/market';
 import { GlobalState } from '../core/state/GlobalState';
+import {
+	buildDraftSpecForDataset,
+	companionSpecPath,
+	workspaceRelativeDatasetUri,
+} from '../qviz/draftFromDataset';
+import { serializeSpec } from '../qviz/specCore';
 
 export class DataViewManager {
     private static instance: DataViewManager;
@@ -40,8 +46,95 @@ export class DataViewManager {
             return;
         }
 
-        await vscode.commands.executeCommand('vscode.openWith', resource, 'quantlab.visualiseView');
+        // Step D (Phase 5 bridge, 2026-05-11): "Visualise" on a CSV/parquet/xlsx
+        // now routes to the NEW qviz-spec builder (Phase 5) rather than the legacy
+        // `quantlab.visualiseView` data stub. We do that by ensuring a companion
+        // `.qviz.json` exists next to the data file and opening THAT with the spec
+        // editor's viewType. Pattern mirrors how Tableau "Save Workbook" produces
+        // a `.twb` next to the source data -- except we create the spec on the
+        // first Visualise click rather than on first save, so the file is visible
+        // in the explorer immediately and the user can rename / delete it like
+        // any other artifact in the workspace.
+        const specUri = await this.ensureCompanionSpec(resource);
+        if (specUri === null) {
+            // ensureCompanionSpec already surfaced a user-facing error notification.
+            return;
+        }
+        await vscode.commands.executeCommand('vscode.openWith', specUri, 'quantlab.visualiseSpecView');
         this.updateContextKeys('visualise', this.getDataFileType(resource));
+    }
+
+    /**
+     * Step D helper: returns the URI of the companion `.qviz.json` for a
+     * given data file, creating it on disk with a valid draft spec if it
+     * doesn't exist yet. Returns null on failure (and surfaces the error
+     * to the user via `showErrorMessage`).
+     *
+     * Idempotent: if the companion already exists (e.g. the user clicked
+     * "Visualise" before, edited the chart, saved), this returns that
+     * existing URI WITHOUT touching the file -- the prior edits are
+     * preserved and the builder re-opens with the saved state.
+     */
+    private async ensureCompanionSpec(dataUri: vscode.Uri): Promise<vscode.Uri | null> {
+        const dataFsPath = dataUri.fsPath;
+        const specFsPath = companionSpecPath(dataFsPath);
+        const specUri = vscode.Uri.file(specFsPath);
+
+        // If a companion exists already, just open it. The spec's own
+        // validator catches malformed prior content; we don't validate
+        // here so an existing-but-invalid file surfaces its error
+        // through the normal `VisualiseSpecProvider.openCustomDocument`
+        // path (which the user already knows how to debug).
+        try {
+            await vscode.workspace.fs.stat(specUri);
+            return specUri;
+        } catch (e) {
+            const code = (e as { code?: string })?.code;
+            if (code !== 'FileNotFound' && code !== 'ENOENT') {
+                // Some other stat failure (permission, transient FS issue).
+                // Surface and refuse so the user knows the open didn't land.
+                void vscode.window.showErrorMessage(
+                    `Quantlab: cannot inspect ${specFsPath}: ${(e as Error)?.message ?? String(e)}`,
+                );
+                return null;
+            }
+            // Fall through to create.
+        }
+
+        // Compute the dataset URI as workspace-relative. Walk every
+        // workspace folder and pick the first one that contains the data
+        // file. Refusing to fall through to absolute paths matches the
+        // qviz daemon's own contract.
+        const folders = vscode.workspace.workspaceFolders;
+        if (!folders || folders.length === 0) {
+            void vscode.window.showErrorMessage(
+                'Quantlab: cannot create a Visualise spec without an open workspace folder.',
+            );
+            return null;
+        }
+        let datasetRelUri: string | null = null;
+        for (const f of folders) {
+            datasetRelUri = workspaceRelativeDatasetUri(dataFsPath, f.uri.fsPath);
+            if (datasetRelUri !== null) { break; }
+        }
+        if (datasetRelUri === null) {
+            void vscode.window.showErrorMessage(
+                `Quantlab: cannot Visualise ${dataFsPath} -- it lives outside every open workspace folder.`,
+            );
+            return null;
+        }
+
+        const draft = buildDraftSpecForDataset(datasetRelUri);
+        const bytes = serializeSpec(draft);
+        try {
+            await vscode.workspace.fs.writeFile(specUri, bytes);
+        } catch (e) {
+            void vscode.window.showErrorMessage(
+                `Quantlab: failed to create ${specFsPath}: ${(e as Error)?.message ?? String(e)}`,
+            );
+            return null;
+        }
+        return specUri;
     }
 
     /**

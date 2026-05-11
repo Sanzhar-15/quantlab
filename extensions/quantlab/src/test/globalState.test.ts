@@ -5,6 +5,10 @@
 
 import 'mocha';
 import * as assert from 'assert';
+// Megaudit Final.2: install vscode-shim BEFORE importing 'vscode'.
+// Plain mocha doesn't have access to the real VS Code runtime.
+import { installVscodeShim } from '../../test/helpers/vscode-shim';
+installVscodeShim();
 import * as vscode from 'vscode';
 import { GlobalState } from '../core/state/GlobalState';
 import { DataSourceDescriptor, Timeframe, isLocalFileSource } from '../types/market';

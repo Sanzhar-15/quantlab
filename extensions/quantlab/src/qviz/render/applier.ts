@@ -56,14 +56,13 @@ export function applyTimeseriesPlan(
 	existing?: Chart
 ): Chart {
 	if (existing) {
-		try {
-			disposeChart(existing, container);
-		} catch (e) {
-			// Disposal failure should not block re-render. Log via diagnostics
-			// channel in production wiring; here we swallow to keep the new
-			// chart-creation path on the happy path.
-			void e;
-		}
+		// Megaudit M-4: prior implementation explicitly swallowed
+		// dispose errors with `void e;` and a comment justifying the
+		// swallow. CLAUDE.md prohibits this; the matching change to
+		// `general-applier.ts` was AF20. Let dispose errors propagate
+		// — RendererHost wraps applier calls and surfaces the error
+		// as a structured RenderResult.
+		disposeChart(existing, container);
 	}
 
 	const chartOptions: CreateChartOptions = buildCreateChartOptions(plan);

@@ -94,34 +94,126 @@ def test_invalid_max_bytes() -> None:
         LRUCache(max_bytes=10)
 
 
+# Megaudit-2 A4-M3: bytes_estimate validation. The cache refuses
+# negatives, non-int (incl. float), and -- per CPython's quirk that
+# bool is a subclass of int -- the test for bool too, because passing
+# `True` as bytes_estimate is a caller bug that previously crept past
+# the `isinstance(x, int)` check (True is int(1)). The defense
+# tightened in cache.py rejects `bool` explicitly.
+
+
+def test_put_rejects_negative_bytes_estimate() -> None:
+    c: LRUCache[str] = LRUCache()
+    with pytest.raises(ValueError, match="non-negative"):
+        c.put("k", "v", bytes_estimate=-1)
+
+
+def test_put_rejects_float_bytes_estimate() -> None:
+    c: LRUCache[str] = LRUCache()
+    with pytest.raises(ValueError, match="non-negative int"):
+        c.put("k", "v", bytes_estimate=1.5)  # type: ignore[arg-type]
+
+
+def test_put_rejects_bool_bytes_estimate() -> None:
+    # bool is technically int in Python; the cache should still refuse
+    # it because `True`/`False` as a size estimate is always a bug.
+    c: LRUCache[str] = LRUCache()
+    with pytest.raises(ValueError, match="non-negative int"):
+        c.put("k", "v", bytes_estimate=True)  # type: ignore[arg-type]
+
+
+def test_put_rejects_none_bytes_estimate() -> None:
+    c: LRUCache[str] = LRUCache()
+    with pytest.raises(ValueError, match="non-negative int"):
+        c.put("k", "v", bytes_estimate=None)  # type: ignore[arg-type]
+
+
+def test_put_accepts_zero_bytes_estimate() -> None:
+    # Zero is the documented default and must remain accepted -- a
+    # legitimate use for cheap entries where the byte cap isn't the
+    # limiting factor.
+    c: LRUCache[str] = LRUCache()
+    c.put("k", "v", bytes_estimate=0)
+    assert c.get("k") == "v"
+
+
 # ---------- make_cache_key ----------
 
 
+def _fp(mtime_ns: int = 1, size: int = 100, ctime_ns: int = 1, schema_hash: str | None = None) -> dict:
+    fp: dict = {"mtime_ns": mtime_ns, "size": size, "ctime_ns": ctime_ns}
+    if schema_hash is not None:
+        fp["schema_hash"] = schema_hash
+    return fp
+
+
 def test_cache_key_stable_for_same_inputs() -> None:
-    k1 = make_cache_key(file_path="/data/x.parquet", mtime_ns=1, plan={"a": 1, "b": 2})
-    k2 = make_cache_key(file_path="/data/x.parquet", mtime_ns=1, plan={"b": 2, "a": 1})
-    assert k1 == k2  # dict ordering doesn't matter
+    k1 = make_cache_key(file_path="/data/x.parquet", fingerprint=_fp(), plan={"a": 1, "b": 2})
+    k2 = make_cache_key(file_path="/data/x.parquet", fingerprint=_fp(), plan={"b": 2, "a": 1})
+    assert k1 == k2  # plan dict ordering doesn't matter
 
 
 def test_cache_key_changes_on_path() -> None:
-    k1 = make_cache_key(file_path="/a.parquet", mtime_ns=1, plan={"x": 1})
-    k2 = make_cache_key(file_path="/b.parquet", mtime_ns=1, plan={"x": 1})
+    k1 = make_cache_key(file_path="/a.parquet", fingerprint=_fp(), plan={"x": 1})
+    k2 = make_cache_key(file_path="/b.parquet", fingerprint=_fp(), plan={"x": 1})
     assert k1 != k2
 
 
 def test_cache_key_changes_on_mtime() -> None:
-    k1 = make_cache_key(file_path="/x.parquet", mtime_ns=1, plan={"x": 1})
-    k2 = make_cache_key(file_path="/x.parquet", mtime_ns=2, plan={"x": 1})
+    k1 = make_cache_key(file_path="/x.parquet", fingerprint=_fp(mtime_ns=1), plan={"x": 1})
+    k2 = make_cache_key(file_path="/x.parquet", fingerprint=_fp(mtime_ns=2), plan={"x": 1})
     assert k1 != k2
 
 
 def test_cache_key_changes_on_plan() -> None:
-    k1 = make_cache_key(file_path="/x.parquet", mtime_ns=1, plan={"x": 1})
-    k2 = make_cache_key(file_path="/x.parquet", mtime_ns=1, plan={"x": 2})
+    k1 = make_cache_key(file_path="/x.parquet", fingerprint=_fp(), plan={"x": 1})
+    k2 = make_cache_key(file_path="/x.parquet", fingerprint=_fp(), plan={"x": 2})
     assert k1 != k2
 
 
 def test_cache_key_string_plan() -> None:
-    k = make_cache_key(file_path="/x.parquet", mtime_ns=1, plan="SELECT 1")
+    k = make_cache_key(file_path="/x.parquet", fingerprint=_fp(), plan="SELECT 1")
     assert isinstance(k, str)
     assert len(k) == 64  # sha256 hex
+
+
+def test_cache_key_changes_on_schema_hash() -> None:
+    # Audit finding #5: TOCTOU. Same path/mtime/plan/size/ctime but different
+    # schemas MUST produce different cache keys.
+    base = dict(file_path="/x.parquet", plan={"sql": "SELECT * FROM t"})
+    k0 = make_cache_key(**base, fingerprint=_fp())  # no schema_hash
+    k1 = make_cache_key(**base, fingerprint=_fp(schema_hash="sha256:" + "a" * 64))
+    k2 = make_cache_key(**base, fingerprint=_fp(schema_hash="sha256:" + "b" * 64))
+    assert k0 != k1, "key without schema_hash differs from one with"
+    assert k1 != k2, "different schemas yield different cache keys"
+
+
+def test_cache_key_stable_with_same_schema_hash() -> None:
+    base = dict(file_path="/x.parquet", plan={"sql": "SELECT 1"})
+    sh = "sha256:" + "a" * 64
+    fp = _fp(schema_hash=sh)
+    assert make_cache_key(**base, fingerprint=fp) == make_cache_key(**base, fingerprint=fp)
+
+
+def test_cache_key_changes_on_size() -> None:
+    # Audit finding (Codex): same mtime + same schema + DIFFERENT size
+    # (file overwrite preserves mtime via touch -t but contents differ
+    # in length) MUST invalidate the cache.
+    base = dict(file_path="/x.parquet", plan={"sql": "SELECT 1"})
+    k_a = make_cache_key(**base, fingerprint=_fp(size=100))
+    k_b = make_cache_key(**base, fingerprint=_fp(size=200))
+    assert k_a != k_b, "different file sizes yield different cache keys"
+
+
+def test_cache_key_changes_on_ctime() -> None:
+    # Audit finding (Codex): rename-replace updates ctime even if mtime
+    # is preserved (mv/install/atomic-replace patterns). MUST invalidate.
+    base = dict(file_path="/x.parquet", plan={"sql": "SELECT 1"})
+    k_a = make_cache_key(**base, fingerprint=_fp(ctime_ns=1000))
+    k_b = make_cache_key(**base, fingerprint=_fp(ctime_ns=2000))
+    assert k_a != k_b, "different ctimes yield different cache keys"
+
+
+def test_cache_key_rejects_empty_fingerprint() -> None:
+    with pytest.raises(ValueError):
+        make_cache_key(file_path="/x.parquet", fingerprint={}, plan={"x": 1})

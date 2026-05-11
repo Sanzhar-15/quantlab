@@ -76,7 +76,16 @@ export function extractColumnsFromJsonRows(
 
 	for (const spec of specs) {
 		if (spec.kind === 'temporal') {
-			out[spec.name] = extractTemporalColumn(rows, spec.name, spec.temporalUnit ?? 'iso');
+			// Megaudit CRITICAL-12: the module docstring explicitly
+			// forbids unit-guessing; the `?? 'iso'` fallback was
+			// contradicting that contract. If the caller didn't
+			// supply a temporalUnit, refuse to extract.
+			if (spec.temporalUnit === undefined) {
+				throw new ExtractError(
+					`temporal column '${spec.name}' has no temporalUnit; unit guessing is forbidden`,
+				);
+			}
+			out[spec.name] = extractTemporalColumn(rows, spec.name, spec.temporalUnit);
 		} else if (spec.kind === 'numeric') {
 			out[spec.name] = extractNumericColumn(rows, spec.name);
 		} else if (spec.kind === 'string') {
@@ -110,36 +119,77 @@ function extractNumericColumn(
 	rows: ReadonlyArray<Readonly<Record<string, unknown>>>,
 	name: string
 ): (number | null)[] {
+	// Megaudit CRITICAL-12: refuse to guess. The previous behavior
+	// silently mapped NaN/Infinity, unparseable strings, bigints
+	// outside safe-integer range, and any-other-type to `null`. Bad
+	// data showed as missing points in the chart with no signal. New
+	// contract: throw `ExtractError` with column/index/value context
+	// so the user sees the upstream data-quality issue.
 	const out = new Array<number | null>(rows.length);
 	for (let i = 0; i < rows.length; i++) {
 		const v = rows[i][name];
 		if (v === null || v === undefined) { out[i] = null; continue; }
 		if (typeof v === 'number') {
-			out[i] = Number.isFinite(v) ? v : null;
+			if (!Number.isFinite(v)) {
+				throw new ExtractError(
+					`numeric column '${name}' row ${i}: non-finite value ${v}; refusing to coerce to null`,
+				);
+			}
+			out[i] = v;
 			continue;
 		}
 		if (typeof v === 'string') {
 			const parsed = Number(v);
-			out[i] = Number.isFinite(parsed) ? parsed : null;
+			if (!Number.isFinite(parsed)) {
+				throw new ExtractError(
+					`numeric column '${name}' row ${i}: unparseable string ${JSON.stringify(v)}`,
+				);
+			}
+			out[i] = parsed;
 			continue;
 		}
 		if (typeof v === 'bigint') {
+			// Safe-integer check — silent truncation hid data quality
+			// issues for values beyond 2^53.
+			if (v > BigInt(Number.MAX_SAFE_INTEGER) || v < BigInt(Number.MIN_SAFE_INTEGER)) {
+				throw new ExtractError(
+					`numeric column '${name}' row ${i}: bigint ${v} exceeds safe-integer range`,
+				);
+			}
 			out[i] = Number(v);
 			continue;
 		}
-		out[i] = null;
+		throw new ExtractError(
+			`numeric column '${name}' row ${i}: unsupported value type ${typeof v}`,
+		);
 	}
 	return out;
 }
+
 
 function extractStringColumn(
 	rows: ReadonlyArray<Readonly<Record<string, unknown>>>,
 	name: string
 ): string[] {
+	// Megaudit-2 A5-MAJOR-2.1: refuse to silently `String(v)` arbitrary
+	// types. The numeric extractor (CRITICAL-12) throws ExtractError
+	// for unsupported values; the string extractor was inconsistent —
+	// `{ nested: 'x' }` would render as `[object Object]` with no
+	// diagnostic. Now: accept string/number/bigint/boolean (with an
+	// explicit String() coercion documented), but throw on objects
+	// and arrays.
 	const out = new Array<string>(rows.length);
 	for (let i = 0; i < rows.length; i++) {
 		const v = rows[i][name];
-		out[i] = v === null || v === undefined ? '' : String(v);
+		if (v === null || v === undefined) { out[i] = ''; continue; }
+		if (typeof v === 'string') { out[i] = v; continue; }
+		if (typeof v === 'number' || typeof v === 'bigint' || typeof v === 'boolean') {
+			out[i] = String(v);
+			continue;
+		}
+		throw new ExtractError(
+			`string column '${name}' row ${i}: unsupported value type ${typeof v} (must be string/number/bigint/boolean/null)`,
+		);
 	}
 	return out;
 }

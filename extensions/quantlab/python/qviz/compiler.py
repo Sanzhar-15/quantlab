@@ -289,16 +289,41 @@ def _compile_filter(
         sql_op = "IS NULL" if op == "is_null" else "IS NOT NULL"
         where = f"{quote_ident(col)} {sql_op}"
     elif op in ("in", "not_in"):
-        if not isinstance(value, list) or len(value) == 0:
-            raise CompileError(f"filter op {op!r} requires non-empty value list")
-        placeholders = ", ".join("?" for _ in value)
-        ctx.params.extend(value)
-        sql_op = "IN" if op == "in" else "NOT IN"
-        where = f"{quote_ident(col)} {sql_op} ({placeholders})"
+        if not isinstance(value, list):
+            raise CompileError(f"filter op {op!r} requires a list value")
+        if len(value) == 0:
+            # Audit M-G (2026-05-11): empty `in` is a legitimate empty-set
+            # filter coming from the inspector's "uncheck-all" widget.
+            # Match daemon.py:_compile_inspector_filters_to_sql semantics
+            # so the chart-aggregate path agrees with the table-preview
+            # path. Emit a constant FALSE/TRUE predicate via the WHERE
+            # clause; no params are bound.
+            where = "FALSE" if op == "in" else "TRUE"
+        else:
+            placeholders = ", ".join("?" for _ in value)
+            ctx.params.extend(value)
+            sql_op = "IN" if op == "in" else "NOT IN"
+            where = f"{quote_ident(col)} {sql_op} ({placeholders})"
     elif op in ("==", "!=", "<", "<=", ">", ">="):
         sql_op = {"==": "=", "!=": "<>"}.get(op, op)
         ctx.params.append(value)
         where = f"{quote_ident(col)} {sql_op} ?"
+    elif op == "contains":
+        # Phase 6: case-insensitive substring match for the inspector's
+        # text filter widget. Compiles to:
+        #   lower(CAST(col AS VARCHAR)) LIKE lower(?) ESCAPE '\'
+        # so DuckDB's ICU `lower()` runs on BOTH the column value AND
+        # the bound parameter, avoiding the Python-vs-DuckDB case-fold
+        # divergence (audit M-16: Python's `"İ".lower()` = `"i̇"` but
+        # DuckDB's `lower("İ")` = `"i"` under ICU; pre-lowering in
+        # Python silently misses Turkish, German `ß`, etc.). Also
+        # escapes `%`/`_`/`\` (audit M-H) so user input is treated as
+        # literal text, not SQL wildcards.
+        if not isinstance(value, str):
+            raise CompileError(f"filter op 'contains' requires a string value")
+        escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        ctx.params.append(f"%{escaped}%")
+        where = f"lower(CAST({quote_ident(col)} AS VARCHAR)) LIKE lower(?) ESCAPE '\\'"
     else:
         raise CompileError(f"unknown filter op: {op!r}")
 
@@ -366,7 +391,18 @@ def _compile_aggregate(
         if fn not in _AGG_FN_MAP:
             raise CompileError(f"unknown agg fn: {fn!r}")
         sql_fn = _AGG_FN_MAP[fn]
-        agg_parts.append(f"{sql_fn}({quote_ident(col)}) AS {quote_ident(alias)}")
+        # Audit-fix slate: DuckDB returns HUGEINT for SUM(BIGINT) and Decimal
+        # for SUM(DECIMAL). pyarrow then serializes those as Arrow Decimal,
+        # which the TS extractor (extract-arrow.ts) rejects loudly because
+        # Arrow Decimal needs scale-aware extraction. To keep the wire
+        # format renderer-friendly, cast the aggregate result to DOUBLE for
+        # numeric-summable functions. `count` returns BIGINT and stays
+        # exact; `first`/`last` preserve the source dtype (no cast needed).
+        if fn in ("sum", "mean", "median", "min", "max", "std"):
+            expr = f"CAST({sql_fn}({quote_ident(col)}) AS DOUBLE)"
+        else:
+            expr = f"{sql_fn}({quote_ident(col)})"
+        agg_parts.append(f"{expr} AS {quote_ident(alias)}")
         out_cols.add(alias)
 
     select_clause = ", ".join(filter(None, [gb_select, ", ".join(agg_parts)]))

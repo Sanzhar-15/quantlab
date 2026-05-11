@@ -5,6 +5,8 @@
 
 import 'mocha';
 import * as assert from 'assert';
+import { installVscodeShim } from '../../test/helpers/vscode-shim';
+installVscodeShim();
 import * as vscode from 'vscode';
 import { HistoryState } from '../core/state/HistoryState';
 

@@ -141,6 +141,26 @@ def test_ping(daemon: _DaemonClient) -> None:
     assert resp["data"]["pong"] is True
 
 
+def test_capabilities(daemon: _DaemonClient) -> None:
+    """Step 5.G.1: op_capabilities returns the supported transform kinds
+    so the webview's transform menu can be generated from it."""
+    resp, _ = daemon.request("capabilities")
+    assert resp["ok"] is True
+    data = resp["data"]
+    assert data["daemon_version"] == 1
+    # Every kind the compiler accepts must be listed.
+    kinds = set(data["transform_kinds"])
+    assert {"filter", "date_trunc", "bin", "groupby", "aggregate",
+            "window", "math", "tz_convert", "sort", "limit"} <= kinds
+    # Variants the TS validator gates are explicitly listed as unsupported.
+    unsupported = set(data["unsupported"])
+    assert "window.fn=ema" in unsupported
+    assert "bin.strategy=equal_freq" in unsupported
+    assert "resample" in unsupported
+    # Both chart families documented.
+    assert set(data["chart_families"]) == {"timeseries", "general"}
+
+
 def test_schema(daemon: _DaemonClient) -> None:
     resp, _ = daemon.request("schema", path="data/ohlcv.parquet")
     assert resp["ok"], resp
@@ -289,3 +309,420 @@ def test_stats(daemon: _DaemonClient) -> None:
     daemon.request("schema", path="data/ohlcv.parquet")
     resp, _ = daemon.request("stats")
     assert resp["data"]["schema_cache"]["hits"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 (Inspector): preview offset, column_stats, aggregate inspector_filters
+# ---------------------------------------------------------------------------
+
+
+def test_capabilities_advertises_inspector_flags(daemon: _DaemonClient) -> None:
+    """6.A.4: pre-Phase-6 daemons won't have these flags; the inspector
+    toggle stays disabled until they're advertised. Pin the flag names so
+    the TS-side feature-detection contract doesn't drift."""
+    resp, _ = daemon.request("capabilities")
+    inspector = resp["data"]["inspector"]
+    assert inspector["preview_offset"] is True
+    assert inspector["column_stats"] is True
+    assert inspector["aggregate_filters"] is True
+
+
+def test_preview_offset_returns_correct_window(daemon: _DaemonClient) -> None:
+    """6.A.1: preview accepts an offset and returns rows [offset, offset+n)."""
+    resp_head, _ = daemon.request("preview", path="data/ohlcv.parquet", n=200)
+    resp_skip, _ = daemon.request(
+        "preview", path="data/ohlcv.parquet", n=100, offset=100,
+    )
+    # The fixture's synthetic generator increments timestamp by 1s per row,
+    # so the second window's timestamps must equal the back half of the
+    # contiguous first window. Inline-JSON path for both since n<=200.
+    head_ts = [row["timestamp"] for row in resp_head["data"]["rows"]]
+    skip_ts = [row["timestamp"] for row in resp_skip["data"]["rows"]]
+    assert skip_ts == head_ts[100:200]
+
+
+def test_preview_offset_past_end_returns_empty(daemon: _DaemonClient) -> None:
+    """6.A.1: offset > total returns zero rows; doesn't error. The
+    inspector relies on this to detect end-of-table on scroll."""
+    resp, _ = daemon.request(
+        "preview", path="data/ohlcv.parquet", n=10, offset=2_000_000,
+    )
+    assert resp["ok"] is True
+    assert resp["data"]["n"] == 0
+
+
+def test_column_stats_numeric_returns_min_max_and_cardinality(daemon: _DaemonClient) -> None:
+    """6.A.2: numeric column gets min/max + a cardinality cap. Volume in
+    the spike fixture has 1k unique values; we expect cardinality_is_exact
+    to be False with cardinality capped at 21."""
+    resp, _ = daemon.request(
+        "column_stats", path="data/ohlcv.parquet", column="volume",
+    )
+    assert resp["ok"], resp
+    data = resp["data"]
+    assert data["kind"] == "numeric"
+    assert "min" in data and "max" in data
+    assert data["min"] <= data["max"]
+    assert data["total"] == 1_000_000
+    assert data["null_count"] == 0
+    assert data["cardinality_is_exact"] is False
+    assert data["cardinality"] == 21  # CAP + 1
+
+
+def test_column_stats_temporal_returns_min_max(daemon: _DaemonClient) -> None:
+    """6.A.2: temporal column gets ISO-format min/max strings."""
+    resp, _ = daemon.request(
+        "column_stats", path="data/ohlcv.parquet", column="timestamp",
+    )
+    assert resp["ok"], resp
+    data = resp["data"]
+    assert data["kind"] == "temporal"
+    # ISO timestamp strings — TS side parses with Date.parse.
+    assert isinstance(data["min"], str) and isinstance(data["max"], str)
+    assert data["min"] <= data["max"]
+
+
+def test_column_stats_low_cardinality_returns_distinct_list(
+    workspace: Path, daemon: _DaemonClient,
+) -> None:
+    """6.A.2: a column with <= 20 distinct values returns the `distinct`
+    array so the UI can render a checkbox dropdown."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    target = workspace / "data" / "lowcard.parquet"
+    # 6 distinct categories repeated 100 times = 600 rows, 6 distinct.
+    cats = ["AAPL", "MSFT", "GOOG", "AMZN", "META", "TSLA"]
+    rows = cats * 100
+    table = pa.table({"ticker": rows, "px": list(range(600))})
+    pq.write_table(table, str(target))
+
+    resp, _ = daemon.request(
+        "column_stats", path="data/lowcard.parquet", column="ticker",
+    )
+    assert resp["ok"], resp
+    data = resp["data"]
+    assert data["cardinality"] == 6
+    assert data["cardinality_is_exact"] is True
+    assert set(data["distinct"]) == set(cats)
+
+
+def test_column_stats_caches_on_second_call(daemon: _DaemonClient) -> None:
+    """6.A.2: same column on same file should hit the schema cache."""
+    daemon.request("column_stats", path="data/ohlcv.parquet", column="close")
+    resp, _ = daemon.request(
+        "column_stats", path="data/ohlcv.parquet", column="close",
+    )
+    assert resp["data"]["cached"] is True
+
+
+def test_column_stats_unknown_column_rejected(daemon: _DaemonClient) -> None:
+    """6.A.2: asking for a non-existent column surfaces a clear error
+    rather than executing SQL with an injected name."""
+    resp, _ = daemon.request(
+        "column_stats", path="data/ohlcv.parquet", column="not_a_column",
+    )
+    assert resp["ok"] is False
+    assert "not in schema" in resp["error"]
+
+
+def test_aggregate_with_inspector_filters_prepends_filter(daemon: _DaemonClient) -> None:
+    """6.A.3: inspector_filters list is prepended to spec.transforms at
+    compile time and changes the result; the saved spec is NOT mutated."""
+    base_spec = {
+        "qviz_version": 1,
+        "dataset": {
+            "uri": "data/ohlcv.parquet", "schema_hash": "sha256:" + "0" * 64,
+            "mtime_ns": 1,
+        },
+        "transforms": [
+            {"kind": "date_trunc", "column": "timestamp", "unit": "day", "as": "day"},
+            {"kind": "groupby", "columns": ["day"]},
+            {"kind": "aggregate", "aggs": [
+                {"column": "close", "fn": "count", "as": "n"},
+            ]},
+            {"kind": "sort", "columns": [{"column": "day"}]},
+        ],
+        "chart": {"family": "timeseries", "type": "line", "encodings": {}},
+    }
+    # Bound everything to a tiny window so the filter actually drops rows.
+    inspector_filters = [{
+        "kind": "filter", "column": "close", "op": "<", "value": 0.5,
+    }]
+
+    resp_unfiltered, bin_unfiltered = daemon.request("aggregate", spec=base_spec)
+    resp_filtered, bin_filtered = daemon.request(
+        "aggregate", spec=base_spec, inspector_filters=inspector_filters,
+    )
+
+    assert resp_unfiltered["ok"] and resp_filtered["ok"]
+    table_u = arrow_ipc_to_table(bin_unfiltered)
+    table_f = arrow_ipc_to_table(bin_filtered)
+
+    # The filtered aggregate sees fewer rows on EVERY day (some days might
+    # even drop out entirely). We assert the total `n` collapses.
+    sum_u = sum(table_u.column("n").to_pylist())
+    sum_f = sum(table_f.column("n").to_pylist())
+    assert sum_f < sum_u
+
+
+def test_aggregate_inspector_filters_cache_distinct(daemon: _DaemonClient) -> None:
+    """6.A.3: cache keying must include inspector_filters so a filtered
+    query doesn't return a cached unfiltered result."""
+    spec = {
+        "qviz_version": 1,
+        "dataset": {
+            "uri": "data/ohlcv.parquet", "schema_hash": "sha256:" + "0" * 64,
+            "mtime_ns": 1,
+        },
+        "transforms": [
+            {"kind": "date_trunc", "column": "timestamp", "unit": "day", "as": "day"},
+            {"kind": "groupby", "columns": ["day"]},
+            {"kind": "aggregate", "aggs": [
+                {"column": "close", "fn": "count", "as": "n"},
+            ]},
+            {"kind": "sort", "columns": [{"column": "day"}]},
+        ],
+        "chart": {"family": "timeseries", "type": "line", "encodings": {}},
+    }
+    # First call: no filters → fills the cache under key K(unfiltered).
+    daemon.request("aggregate", spec=spec)
+    # Second call: with filters → must NOT hit the K(unfiltered) cached value.
+    resp, _ = daemon.request(
+        "aggregate", spec=spec,
+        inspector_filters=[{"kind": "filter", "column": "close", "op": "<", "value": 0.5}],
+    )
+    assert resp["data"]["cached"] is False
+
+
+def test_preview_with_inspector_filters_returns_filtered_rows_and_total(
+    daemon: _DaemonClient,
+) -> None:
+    """6.D extension: preview accepts inspector_filters and returns
+    a `total` (post-filter count) alongside the rows so the inspector's
+    virtualized scrollbar matches the filtered dataset."""
+    resp, binary = daemon.request(
+        "preview", path="data/ohlcv.parquet", n=100, offset=0,
+        inspector_filters=[
+            {"kind": "filter", "column": "close", "op": "<", "value": 0.5},
+        ],
+    )
+    assert resp["ok"], resp
+    data = resp["data"]
+    # `total` must be present and reflect the FILTERED row count.
+    assert "total" in data
+    assert data["total"] < 1_000_000, "filter should reduce the row count"
+    assert data.get("filtered") is True
+
+
+def test_preview_filters_empty_set_short_circuits(daemon: _DaemonClient) -> None:
+    """6.D extension: an empty `in` set must short-circuit to FALSE rather
+    than crashing on `IN ()` (which DuckDB rejects). The provider lifts
+    empty sets to this shape so the inspector "uncheck-all" UI doesn't
+    blow up."""
+    resp, _ = daemon.request(
+        "preview", path="data/ohlcv.parquet", n=50, offset=0,
+        inspector_filters=[
+            {"kind": "filter", "column": "close", "op": "in", "value": []},
+        ],
+    )
+    assert resp["ok"], resp
+    assert resp["data"]["total"] == 0
+
+
+def test_preview_filters_unknown_column_rejected(daemon: _DaemonClient) -> None:
+    """6.D extension: a filter referencing a column not in the schema
+    must surface a clear error rather than executing arbitrary SQL."""
+    resp, _ = daemon.request(
+        "preview", path="data/ohlcv.parquet", n=10, offset=0,
+        inspector_filters=[
+            {"kind": "filter", "column": "__not_a_column__", "op": ">", "value": 0},
+        ],
+    )
+    assert resp["ok"] is False
+    assert "__not_a_column__" in resp["error"]
+
+
+def test_preview_filters_caches_on_second_call(daemon: _DaemonClient) -> None:
+    """Audit M-32 (2026-05-11): a second filtered preview with identical
+    (offset, filters) MUST hit the cache rather than re-running the
+    DuckDB CTE. Without the cache, heavy scrolling under filters spammed
+    DuckDB linearly."""
+    filters = [
+        {"kind": "filter", "column": "close", "op": "<", "value": 0.5},
+    ]
+    # First call: cache miss, populates.
+    first, _ = daemon.request(
+        "preview", path="data/ohlcv.parquet", n=50, offset=0,
+        inspector_filters=filters,
+    )
+    assert first["ok"]
+    assert first["data"].get("cached", False) is False, "first call must be a cache MISS"
+    # Second call with identical filters/offset/n: cache HIT.
+    second, _ = daemon.request(
+        "preview", path="data/ohlcv.parquet", n=50, offset=0,
+        inspector_filters=filters,
+    )
+    assert second["ok"]
+    assert second["data"].get("cached") is True, "second call must be a cache HIT"
+    # Total must round-trip through cache so the scrollbar stays accurate.
+    assert second["data"]["total"] == first["data"]["total"]
+
+
+def test_preview_filters_contains_escapes_like_metacharacters(
+    workspace: Path, daemon: _DaemonClient,
+) -> None:
+    """Audit M-H + M-16 (2026-05-11): LIKE metachars must be escaped so
+    the user-supplied substring is matched literally, not as wildcards."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    target = workspace / "data" / "wild.parquet"
+    table = pa.table({
+        "name": ["100% sure", "absolutely", "hello_world", "literal-text", "plain"],
+        "val": [1, 2, 3, 4, 5],
+    })
+    pq.write_table(table, str(target))
+
+    # `%` literal must match ONLY rows containing a percent sign.
+    resp, _ = daemon.request(
+        "preview", path="data/wild.parquet", n=10, offset=0,
+        inspector_filters=[
+            {"kind": "filter", "column": "name", "op": "contains", "value": "%"},
+        ],
+    )
+    assert resp["ok"], resp
+    assert resp["data"]["total"] == 1, "only `100% sure` should match"
+
+    # `_` literal must match ONLY rows containing an underscore.
+    resp, _ = daemon.request(
+        "preview", path="data/wild.parquet", n=10, offset=0,
+        inspector_filters=[
+            {"kind": "filter", "column": "name", "op": "contains", "value": "_"},
+        ],
+    )
+    assert resp["ok"], resp
+    assert resp["data"]["total"] == 1, "only `hello_world` should match"
+
+
+def test_preview_filters_contains_case_insensitive_via_duckdb_lower(
+    workspace: Path, daemon: _DaemonClient,
+) -> None:
+    """Audit M-16 (2026-05-11): case-insensitive matching uses DuckDB's
+    `lower()` on BOTH sides so non-ASCII case-folding stays consistent
+    (Python's `str.lower` diverged from DuckDB ICU on Turkish I etc.)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    target = workspace / "data" / "case.parquet"
+    table = pa.table({"name": ["AAPL", "msft", "GooG"], "v": [1, 2, 3]})
+    pq.write_table(table, str(target))
+
+    # Uppercase needle should match lowercase rows and vice-versa.
+    resp, _ = daemon.request(
+        "preview", path="data/case.parquet", n=10, offset=0,
+        inspector_filters=[
+            {"kind": "filter", "column": "name", "op": "contains", "value": "aapl"},
+        ],
+    )
+    assert resp["ok"], resp
+    assert resp["data"]["total"] == 1
+
+
+def test_preview_filters_unknown_op_rejected(daemon: _DaemonClient) -> None:
+    """6.D extension: only known filter operators are accepted by the
+    daemon's compiler; the inspector filters all map to known ops, but
+    a hand-crafted message with a malformed op must fail loudly."""
+    resp, _ = daemon.request(
+        "preview", path="data/ohlcv.parquet", n=10, offset=0,
+        inspector_filters=[
+            {"kind": "filter", "column": "close", "op": "BANANA", "value": 0},
+        ],
+    )
+    assert resp["ok"] is False
+
+
+def test_aggregate_inspector_filters_must_be_filter_kind(daemon: _DaemonClient) -> None:
+    """6.A.3: only FilterTransform dicts are accepted in inspector_filters.
+    Other transform kinds would let the UI silently rewrite the user's
+    pipeline, which is the failure mode we're explicitly preventing by
+    keeping inspector filters ephemeral and filter-only."""
+    spec = {
+        "qviz_version": 1,
+        "dataset": {
+            "uri": "data/ohlcv.parquet", "schema_hash": "sha256:" + "0" * 64,
+            "mtime_ns": 1,
+        },
+        "transforms": [],
+        "chart": {"family": "timeseries", "type": "line", "encodings": {}},
+    }
+    resp, _ = daemon.request(
+        "aggregate", spec=spec,
+        inspector_filters=[{"kind": "sort", "columns": [{"column": "close"}]}],
+    )
+    assert resp["ok"] is False
+    assert "FilterTransform" in resp["error"]
+
+
+def test_toctou_size_change_invalidates_cache(workspace: Path, daemon: _DaemonClient) -> None:
+    """Audit-fix slate AF1 regression: a file replaced with content of a
+    DIFFERENT size MUST invalidate the cached aggregate, even if mtime is
+    forced back to the original.
+
+    Setup:
+      - Build dataset A (1k rows), query, populate cache.
+      - Replace with dataset B (different size, different content) but
+        force the same mtime.
+      - Re-query: must miss cache (size differs).
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    data_dir = workspace / "data"
+    target = data_dir / "tinya.parquet"
+
+    table_a = pa.table({"t": list(range(1000)), "v": [float(i) for i in range(1000)]})
+    pq.write_table(table_a, str(target), compression="snappy")
+    mtime_a = os.stat(target).st_mtime_ns
+    size_a = os.stat(target).st_size
+
+    spec = {
+        "qviz_version": 1,
+        "dataset": {
+            "uri": "data/tinya.parquet",
+            "schema_hash": "sha256:" + "0" * 64,
+            "mtime_ns": 1,
+        },
+        "transforms": [],
+        "chart": {
+            "family": "timeseries", "type": "line",
+            "encodings": {
+                "x": {"field": "t", "type": "temporal"},
+                "y": {"field": "v", "type": "quantitative"},
+            },
+        },
+    }
+    resp_a, binary_a = daemon.request("aggregate", spec=spec)
+    assert resp_a["ok"], resp_a
+    assert resp_a["data"]["cached"] is False
+
+    # Same plan, immediate re-query: cache hit.
+    resp_a2, _ = daemon.request("aggregate", spec=spec)
+    assert resp_a2["data"]["cached"] is True
+
+    # Replace with a SMALLER dataset and force same mtime.
+    table_b = pa.table({"t": list(range(100)), "v": [float(i) * 2 for i in range(100)]})
+    pq.write_table(table_b, str(target), compression="snappy")
+    size_b = os.stat(target).st_size
+    assert size_b != size_a, "test setup should produce different file sizes"
+    os.utime(target, ns=(mtime_a, mtime_a))
+    mtime_b = os.stat(target).st_mtime_ns
+    assert mtime_b == mtime_a, "mtime preservation should have worked"
+
+    # Same spec; expected miss because size (and ctime) differ.
+    resp_b, _ = daemon.request("aggregate", spec=spec)
+    assert resp_b["ok"], resp_b
+    assert resp_b["data"]["cached"] is False, (
+        "TOCTOU: same mtime + different size MUST invalidate cache"
+    )
+    assert resp_b["data"]["n"] == 100, "result must reflect the rewritten file's content"

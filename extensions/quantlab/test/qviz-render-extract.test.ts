@@ -90,9 +90,19 @@ suite('qviz column extraction -- extractColumnsFromJsonRows', () => {
 	});
 
 	test('parses numeric strings (DuckDB sometimes emits them)', () => {
-		const rows = [{ v: '1.5' }, { v: '2' }, { v: 'not-a-number' }];
+		const rows = [{ v: '1.5' }, { v: '2' }];
 		const cols = extractColumnsFromJsonRows(rows, [{ name: 'v', kind: 'numeric' }]);
-		assert.deepStrictEqual(cols.v, [1.5, 2, null]);
+		assert.deepStrictEqual(cols.v, [1.5, 2]);
+	});
+
+	test('Megaudit CRITICAL-12: unparseable numeric strings throw ExtractError (no longer silently nulled)', () => {
+		const rows = [{ v: '1.5' }, { v: 'not-a-number' }];
+		assert.throws(
+			() => extractColumnsFromJsonRows(rows, [{ name: 'v', kind: 'numeric' }]),
+			(e: Error) => /unparseable string/.test(e.message)
+				&& e.name === 'ExtractError',
+			'unparseable string must surface as ExtractError, not silently null',
+		);
 	});
 
 	test('preserves nulls in temporal extraction', () => {

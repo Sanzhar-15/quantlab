@@ -11,6 +11,8 @@
  */
 
 import 'mocha';
+
+import { isTestFlagEnabled } from '../helpers/envFlag';
 import * as assert from 'assert';
 import * as net from 'net';
 import * as path from 'path';
@@ -66,7 +68,7 @@ class SessionMockDaemon {
 		let buffer: Buffer = Buffer.alloc(0) as Buffer;
 
 		socket.on('data', (data) => {
-			buffer = Buffer.concat([buffer, data]) as Buffer;
+			buffer = Buffer.concat([buffer, data as Buffer]) as Buffer;
 
 			try {
 				const { messages, remainder } = this.parser.unframeMessages(buffer);
@@ -172,6 +174,12 @@ suite('Session Lifecycle Integration', function () {
 
 	suiteSetup(async function () {
 		if (process.platform === 'win32') {
+			this.skip();
+			return;
+		}
+		// Megaudit Final.2: gated behind RUN_TRADING_INTEGRATION (see
+		// daemon.integration.test.ts for rationale).
+		if (!isTestFlagEnabled(process.env.RUN_TRADING_INTEGRATION)) {  // Megaudit-2 A6-MAJOR-3
 			this.skip();
 			return;
 		}
@@ -373,6 +381,10 @@ suite('IPC Protocol Compliance', function () {
 			this.skip();
 			return;
 		}
+		if (!isTestFlagEnabled(process.env.RUN_TRADING_INTEGRATION)) {  // Megaudit-2 A6-MAJOR-3
+			this.skip();
+			return;
+		}
 
 		await fs.mkdir(path.dirname(socketPath), { recursive: true });
 		await writeTokenFile(testSessionId, testToken);
@@ -381,7 +393,7 @@ suite('IPC Protocol Compliance', function () {
 			let buffer: Buffer = Buffer.alloc(0);
 
 			socket.on('data', (data) => {
-				buffer = Buffer.concat([buffer, data]) as Buffer;
+				buffer = Buffer.concat([buffer, data as Buffer]) as Buffer;
 
 				const { messages, remainder } = parser.unframeMessages(buffer);
 				buffer = remainder as Buffer;

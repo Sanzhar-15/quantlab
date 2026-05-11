@@ -7,11 +7,22 @@
 			"../../node_modules/@types"
 		],
 		"types": [
-			"node"
-		]
+			"node",
+			"mocha"
+		],
+		"skipLibCheck": true,
+		"paths": {
+			"@charts-plus/chart-core": ["./test/helpers/applier-stub"],
+			"@charts-plus/chart-render-canvas2d": ["./test/helpers/applier-stub"],
+			"@charts-plus/chart-render-canvas2d/worker": ["./test/helpers/applier-stub"]
+		}
 	},
 	"include": [
 		"src/**/*",
+		"test/**/*.ts",
+		"webview/qviz/**/*.ts",
+		"webview/qviz-spec/**/*.ts",
 		"../../src/vscode-dts/vscode.d.ts"
-	]
+	],
+	"exclude": []
 }

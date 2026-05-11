@@ -2,6 +2,26 @@
  *  Data file type definitions for QuantLab statistics feature
  *--------------------------------------------------------------------------------------------*/
 
+/*
+ * Megaudit-2 A4-M6: this allowlist (csv/parquet/xlsx) intentionally
+ * DIFFERS from the qviz daemon's allowlist (parquet/csv/tsv) in
+ *   - src/qviz/persist.ts (`ALLOWED_EXTENSIONS`)
+ *   - python/qviz/security.py (`ALLOWED_EXTENSIONS`)
+ *
+ * The two cover different surfaces:
+ *   - This file: the DataView Manager + stats UI, which renders xlsx
+ *     using a JS xlsx library inside the extension host.
+ *   - qviz allowlist: the Python daemon's pyarrow reader, which has
+ *     NO xlsx support. tsv is supported here only via the pyarrow CSV
+ *     reader with a tab delimiter.
+ *
+ * If you're adding a new format, update BOTH places where applicable
+ * and the daemon's `reader.py`. Do NOT silently add xlsx to qviz
+ * without daemon support: the qviz UI will accept the spec, then the
+ * first schema() RPC will reject it with `extension-not-allowed` and
+ * the user will see a confusing error.
+ */
+
 export type DataFileType = 'csv' | 'parquet' | 'xlsx';
 
 export interface DataFileInfo {

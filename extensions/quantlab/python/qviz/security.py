@@ -33,10 +33,16 @@ class SecurityError(Exception):
     """
 
 
-# Allowlisted file extensions. CSV/XLSX/parquet are the data formats Visualise
-# accepts. Adding others requires a deliberate change here AND an entry in the
-# reader dispatch.
-ALLOWED_EXTENSIONS = frozenset({".parquet", ".csv", ".tsv", ".xlsx", ".xls"})
+# Allowlisted file extensions. MUST match the reader's actual dispatch
+# in `python/qviz/reader.py` — the reader supports parquet/csv/tsv only;
+# xlsx/xls raise NotImplementedError. Megaudit CRITICAL-3: the prior
+# list included xlsx/xls (mismatching the reader AND the TS-side
+# `src/qviz/persist.ts` allowlist). A spec referencing xlsx would pass
+# this gate and fail confusingly inside the reader. One source of truth:
+# extension/daemon must agree, AND only formats the reader actually
+# implements. Adding a new format requires a deliberate change here
+# AND a reader implementation AND an entry in the TS allowlist.
+ALLOWED_EXTENSIONS = frozenset({".parquet", ".csv", ".tsv"})
 
 
 def resolve_workspace_path(workspace_root: str | Path, requested: str) -> Path:

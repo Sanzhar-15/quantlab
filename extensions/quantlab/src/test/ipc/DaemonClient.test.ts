@@ -4,6 +4,8 @@
  *--------------------------------------------------------------------------------------------*/
 
 import 'mocha';
+
+import { isTestFlagEnabled } from '../helpers/envFlag';
 import * as assert from 'assert';
 import * as net from 'net';
 import * as path from 'path';
@@ -26,7 +28,13 @@ suite('DaemonClient', () => {
 	let serverSocket: net.Socket | null = null;
 	const parser = new JsonRpcParser();
 
-	suiteSetup(async () => {
+	suiteSetup(async function () {
+		// Megaudit Final.2: gated behind RUN_TRADING_INTEGRATION (see
+		// daemon.integration.test.ts for rationale).
+		if (!isTestFlagEnabled(process.env.RUN_TRADING_INTEGRATION)) {  // Megaudit-2 A6-MAJOR-3
+			this.skip();
+			return;
+		}
 		// Setup test directory and token
 		await fs.mkdir(testDir, { recursive: true });
 		await writeTokenFile(testSessionId, testToken);
@@ -176,7 +184,7 @@ suite('DaemonClient', () => {
 			// Handle requests on server side
 			let receiveBuffer: Buffer = Buffer.alloc(0) as Buffer;
 			serverSocket!.on('data', (data) => {
-				receiveBuffer = Buffer.concat([receiveBuffer, data]) as Buffer;
+				receiveBuffer = Buffer.concat([receiveBuffer, data as Buffer]) as Buffer;
 
 				const { messages, remainder } = parser.unframeMessages(receiveBuffer);
 				receiveBuffer = remainder as Buffer;
@@ -214,7 +222,7 @@ suite('DaemonClient', () => {
 
 			let receiveBuffer: Buffer = Buffer.alloc(0) as Buffer;
 			serverSocket!.on('data', (data) => {
-				receiveBuffer = Buffer.concat([receiveBuffer, data]) as Buffer;
+				receiveBuffer = Buffer.concat([receiveBuffer, data as Buffer]) as Buffer;
 
 				const { messages, remainder } = parser.unframeMessages(receiveBuffer);
 				receiveBuffer = remainder as Buffer;
@@ -411,7 +419,7 @@ suite('DaemonClient', () => {
 
 			let receiveBuffer: Buffer = Buffer.alloc(0) as Buffer;
 			serverSocket!.on('data', (data) => {
-				receiveBuffer = Buffer.concat([receiveBuffer, data]) as Buffer;
+				receiveBuffer = Buffer.concat([receiveBuffer, data as Buffer]) as Buffer;
 
 				const { messages, remainder } = parser.unframeMessages(receiveBuffer);
 				receiveBuffer = remainder as Buffer;
@@ -451,7 +459,7 @@ suite('DaemonClient', () => {
 
 			let receiveBuffer: Buffer = Buffer.alloc(0) as Buffer;
 			serverSocket!.on('data', (data) => {
-				receiveBuffer = Buffer.concat([receiveBuffer, data]) as Buffer;
+				receiveBuffer = Buffer.concat([receiveBuffer, data as Buffer]) as Buffer;
 
 				const { messages, remainder } = parser.unframeMessages(receiveBuffer);
 				receiveBuffer = remainder as Buffer;
@@ -495,7 +503,7 @@ suite('DaemonClient', () => {
 
 			let receiveBuffer: Buffer = Buffer.alloc(0) as Buffer;
 			serverSocket!.on('data', (data) => {
-				receiveBuffer = Buffer.concat([receiveBuffer, data]) as Buffer;
+				receiveBuffer = Buffer.concat([receiveBuffer, data as Buffer]) as Buffer;
 
 				const { messages, remainder } = parser.unframeMessages(receiveBuffer);
 				receiveBuffer = remainder as Buffer;
@@ -531,7 +539,7 @@ suite('DaemonClient', () => {
 			let flattenCalled = false;
 			let receiveBuffer: Buffer = Buffer.alloc(0) as Buffer;
 			serverSocket!.on('data', (data) => {
-				receiveBuffer = Buffer.concat([receiveBuffer, data]) as Buffer;
+				receiveBuffer = Buffer.concat([receiveBuffer, data as Buffer]) as Buffer;
 
 				const { messages, remainder } = parser.unframeMessages(receiveBuffer);
 				receiveBuffer = remainder as Buffer;

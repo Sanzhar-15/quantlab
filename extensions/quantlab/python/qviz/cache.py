@@ -9,10 +9,17 @@ Invalidation:
   - File path changes (URI) -> different key.
   - File mtime changes -> different key (file was rewritten).
   - Plan changes (any byte of compiled SQL or params) -> different key.
+  - Schema changes -> different key (audit finding #5: TOCTOU race).
 
-We deliberately key on (path, mtime, plan_hash) NOT schema_hash. Schema is
-stable across mtime changes for an unchanged-format file; mtime captures
-content changes more cheaply than re-hashing the schema.
+The TOCTOU concern: a file can be rewritten with the SAME mtime (mtime
+truncation, restore-from-backup, race in nanosecond resolution on slow FS,
+or a malicious actor replacing the file). Keying only on mtime leaves a
+window where a cached aggregate built against the old schema is returned
+for the new file. Including schema_hash closes that window: any structural
+change to the file invalidates the cache regardless of mtime.
+
+For the schema cache itself the schema_hash IS the value, so we don't pass
+it -- the key stays (path, mtime, "schema").
 
 Eviction:
   - LRU on count (max_entries).
@@ -67,6 +74,21 @@ class LRUCache(Generic[T]):
         return entry.value
 
     def put(self, key: str, value: T, bytes_estimate: int = 0) -> None:
+        # Megaudit M-8 defense-in-depth: bytes_estimate must be a sane
+        # non-negative integer. A caller passing 0 (or a misreported
+        # negative) for a 100MB blob would defeat the byte cap. Refuse
+        # loudly so the caller's bug surfaces rather than silently
+        # corrupting the cache accounting.
+        # Megaudit-2 A4-M3: also reject `bool` explicitly. CPython
+        # makes `bool` a subclass of `int`, so `isinstance(True, int)`
+        # is True; passing `True`/`False` here is a caller bug (they
+        # meant to compute a real byte count, never literally "is this
+        # cacheable") and should fail loudly per CLAUDE.md "errors
+        # must be visible".
+        if isinstance(bytes_estimate, bool) or not isinstance(bytes_estimate, int) or bytes_estimate < 0:
+            raise ValueError(
+                f"bytes_estimate must be a non-negative int, got {bytes_estimate!r}",
+            )
         if key in self._store:
             old = self._store.pop(key)
             self._total_bytes -= old.bytes_estimate
@@ -112,20 +134,37 @@ class LRUCache(Generic[T]):
 # ---------------------------------------------------------------------------
 
 
-def make_cache_key(*, file_path: str, mtime_ns: int, plan: dict | str) -> str:
+def make_cache_key(
+    *,
+    file_path: str,
+    fingerprint: dict,
+    plan: dict | str,
+) -> str:
     """Build a stable cache key for a (file, plan) pair.
+
+    `fingerprint` is a dict produced by `reader.file_fingerprint(...)`. It
+    is hashed in canonical (sorted-keys) JSON form so any change to its
+    contents -- mtime, size, ctime, schema -- invalidates the cache. This
+    closes the TOCTOU race far more thoroughly than mtime alone.
 
     `plan` can be a dict (we'll JSON-serialize with sorted keys) or a string
     (already-canonical SQL or compiled-form).
+
+    Both inputs are required. There is no "legacy mtime-only" path; the
+    only callers in this codebase pass a fingerprint, so the API forces
+    correctness.
     """
+    if not isinstance(fingerprint, dict) or not fingerprint:
+        raise ValueError("fingerprint must be a non-empty dict")
     if isinstance(plan, dict):
         plan_repr = json.dumps(plan, sort_keys=True, separators=(",", ":"))
     else:
         plan_repr = str(plan)
+    fp_repr = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"))
     h = hashlib.sha256()
     h.update(file_path.encode("utf-8"))
-    h.update(b"|")
-    h.update(str(mtime_ns).encode("utf-8"))
-    h.update(b"|")
+    h.update(b"|fp=")
+    h.update(fp_repr.encode("utf-8"))
+    h.update(b"|plan=")
     h.update(plan_repr.encode("utf-8"))
     return h.hexdigest()

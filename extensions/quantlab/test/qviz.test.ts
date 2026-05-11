@@ -9,7 +9,9 @@ import * as path from 'path';
 import type { QvizSpec } from '../src/qviz/spec';
 import { validate, validateOrThrow } from '../src/qviz/validate';
 
-const EXAMPLES_DIR = path.join(__dirname, '..', 'src', 'qviz', 'examples');
+// At runtime, __dirname is out/test, so two `..` segments are needed
+// to climb back to the package root before descending into src/.
+const EXAMPLES_DIR = path.join(__dirname, '..', '..', 'src', 'qviz', 'examples');
 
 function readExample(name: string): unknown {
 	return JSON.parse(fs.readFileSync(path.join(EXAMPLES_DIR, name), 'utf8'));
@@ -97,7 +99,14 @@ suite('qviz validation', () => {
 		);
 	});
 
-	test('rejects candlestick chart without ohlcv encoding', () => {
+	test('candlestick without ohlcv encoding still validates (compile-time check)', () => {
+		// Smoke-test fix (2026-05-11): the validator no longer enforces
+		// per-chart-type encoding completeness -- that check moved to the
+		// compiler (CompilePlanError in `applyTimeseriesPlan`). Validator
+		// only enforces structural invariants; an incomplete-encoding spec
+		// passes validation but fails at render time. This test pins the
+		// new "passes validation" half of the contract; the compile-time
+		// rejection is covered by `qviz-render-timeseries.test.ts`.
 		const raw = readExample('timeseries-candlestick.qviz.json') as Record<string, unknown>;
 		const chart = raw.chart as Record<string, unknown>;
 		const tampered = {
@@ -105,11 +114,8 @@ suite('qviz validation', () => {
 			chart: { ...chart, encodings: {} }
 		};
 		const result = validate(tampered);
-		assert.strictEqual(result.ok, false);
-		assert.ok(
-			result.ok === false && result.issues.some(i => i.path.endsWith('encodings.ohlcv') || i.message.includes('ohlcv')),
-			'expected ohlcv-required rejection'
-		);
+		assert.strictEqual(result.ok, true,
+			'spec with empty encodings is now STRUCTURALLY valid; compiler enforces completeness at render');
 	});
 
 	test('rejects chart type not allowed in family', () => {
@@ -122,6 +128,80 @@ suite('qviz validation', () => {
 			result.ok === false && result.issues.some(i => i.path === '$.chart.type'),
 			'expected family/type mismatch rejection'
 		);
+	});
+
+	test('validator-compiler coordination: rejects ema window fn', () => {
+		// The daemon's compiler does not implement ema (needs recursive
+		// CTE). The validator must reject so users don't save a spec
+		// the daemon will reject at first aggregate.
+		const raw = readExample('timeseries-line-volume.qviz.json') as Record<string, unknown>;
+		const transforms = (raw.transforms as readonly unknown[]).slice();
+		transforms[transforms.length - 1] = {
+			kind: 'window', column: 'close', fn: 'ema', window: 14, as: 'ema14',
+		};
+		const tampered = { ...raw, transforms };
+		const result = validate(tampered);
+		assert.strictEqual(result.ok, false);
+		if (result.ok) { return; }
+		assert.ok(
+			result.issues.some(i => /ema/i.test(i.message) && /not yet implemented/i.test(i.message)),
+			`expected ema-not-implemented rejection; got ${JSON.stringify(result.issues)}`,
+		);
+	});
+
+	test('validator-compiler coordination: rejects bin.strategy=equal_freq', () => {
+		const raw = readExample('timeseries-line-volume.qviz.json') as Record<string, unknown>;
+		const transforms = (raw.transforms as readonly unknown[]).slice();
+		transforms[transforms.length - 1] = {
+			kind: 'bin', column: 'close', n_bins: 10, strategy: 'equal_freq', as: 'price_bin',
+		};
+		const tampered = { ...raw, transforms };
+		const result = validate(tampered);
+		assert.strictEqual(result.ok, false);
+		if (result.ok) { return; }
+		assert.ok(
+			result.issues.some(i => /equal_freq/.test(i.message) && /not yet implemented/i.test(i.message)),
+			`expected equal_freq-not-implemented rejection; got ${JSON.stringify(result.issues)}`,
+		);
+	});
+
+	test('validator-compiler coordination: rejects resample transform', () => {
+		const raw = readExample('timeseries-line-volume.qviz.json') as Record<string, unknown>;
+		const transforms = (raw.transforms as readonly unknown[]).slice();
+		transforms[transforms.length - 1] = {
+			kind: 'resample', time_column: 'timestamp', freq: '1h', fill: 'forward',
+		};
+		const tampered = { ...raw, transforms };
+		const result = validate(tampered);
+		assert.strictEqual(result.ok, false);
+		if (result.ok) { return; }
+		assert.ok(
+			result.issues.some(i => /resample/.test(i.message) && /not yet implemented/i.test(i.message)),
+			`expected resample-not-implemented rejection; got ${JSON.stringify(result.issues)}`,
+		);
+	});
+
+	test('validator-compiler coordination: rolling_mean STILL accepted (gate is fn-specific)', () => {
+		// Ensure the ema gate doesn't accidentally reject other window fns.
+		const raw = readExample('timeseries-line-volume.qviz.json') as Record<string, unknown>;
+		const transforms = (raw.transforms as readonly unknown[]).slice();
+		transforms[transforms.length - 1] = {
+			kind: 'window', column: 'close', fn: 'rolling_mean', window: 5, as: 'sma5',
+		};
+		const tampered = { ...raw, transforms };
+		const result = validate(tampered);
+		assert.strictEqual(result.ok, true, `rolling_mean should validate; got ${JSON.stringify(result.ok === false ? result.issues : 'ok')}`);
+	});
+
+	test('validator-compiler coordination: bin without strategy STILL accepted (gate is strategy-specific)', () => {
+		const raw = readExample('timeseries-line-volume.qviz.json') as Record<string, unknown>;
+		const transforms = (raw.transforms as readonly unknown[]).slice();
+		transforms[transforms.length - 1] = {
+			kind: 'bin', column: 'close', n_bins: 10, as: 'price_bin',
+		};
+		const tampered = { ...raw, transforms };
+		const result = validate(tampered);
+		assert.strictEqual(result.ok, true);
 	});
 
 	test('rejects empty groupby columns', () => {

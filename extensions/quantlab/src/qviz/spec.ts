@@ -69,7 +69,9 @@ export type TransformKind = Transform['kind'];
 export interface FilterTransform {
 	readonly kind: 'filter';
 	readonly column: string;
-	readonly op: '==' | '!=' | '<' | '<=' | '>' | '>=' | 'in' | 'not_in' | 'is_null' | 'not_null';
+	/** Phase 6 added `contains` for the inspector's text-filter widget;
+	 *  it compiles to a case-insensitive LIKE on `lower(CAST(col AS VARCHAR))`. */
+	readonly op: '==' | '!=' | '<' | '<=' | '>' | '>=' | 'in' | 'not_in' | 'is_null' | 'not_null' | 'contains';
 	readonly value?: string | number | boolean | readonly (string | number)[] | null;
 }
 

@@ -1,0 +1,799 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/* Phase 5 step D — builder UI styles. Replaces the Step A placeholder. */
+
+body {
+	margin: 0;
+	padding: 0;
+	font-family: var(--vscode-font-family, system-ui, sans-serif);
+	font-size: 13px;
+	color: var(--vscode-foreground);
+	background: var(--vscode-editor-background);
+}
+
+#qviz-spec-root {
+	height: 100vh;
+}
+
+.qviz-app {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+}
+
+.qviz-app-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 8px 16px;
+	border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.qviz-app-title {
+	font-size: 14px;
+	font-weight: 600;
+	margin: 0;
+}
+
+.qviz-app-hint {
+	font-size: 12px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.qviz-app-main {
+	display: grid;
+	grid-template-columns: 220px 280px 1fr;
+	flex: 1;
+	min-height: 0;
+}
+
+/* Phase 6 (6.C.4): when the inspector is open the grid grows a 4th
+ * track for it. The track size is set on the inspector aside itself
+ * via inline width so the user-drag-resize state lives on the element
+ * and persists across re-renders. */
+body.qviz-inspector-open .qviz-app-main {
+	grid-template-columns: 220px 280px 1fr var(--qviz-inspector-width, 33vw);
+}
+
+.qviz-app-aside {
+	border-right: 1px solid var(--vscode-panel-border);
+	overflow-y: auto;
+	padding: 12px;
+}
+
+.qviz-app-builder {
+	border-right: 1px solid var(--vscode-panel-border);
+	padding: 12px;
+	display: flex;
+	flex-direction: column;
+	gap: 16px;
+}
+
+.qviz-app-preview {
+	display: flex;
+	flex-direction: column;
+	min-height: 0;
+}
+
+/* ---------- column panel ---------- */
+
+.qviz-column-panel-title {
+	font-size: 12px;
+	text-transform: uppercase;
+	letter-spacing: 0.5px;
+	color: var(--vscode-descriptionForeground);
+	margin: 0 0 8px;
+}
+
+.qviz-column-list {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+
+.qviz-column-row {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	width: 100%;
+	padding: 4px 8px;
+	background: transparent;
+	border: 1px solid transparent;
+	border-radius: 3px;
+	text-align: left;
+	color: var(--vscode-foreground);
+	cursor: pointer;
+}
+.qviz-column-row:hover {
+	background: var(--vscode-list-hoverBackground);
+}
+.qviz-column-row--focused {
+	background: var(--vscode-list-activeSelectionBackground);
+	color: var(--vscode-list-activeSelectionForeground);
+}
+.qviz-column-row--missing {
+	color: var(--vscode-errorForeground, #e57373);
+	text-decoration: line-through;
+}
+
+.qviz-col-icon {
+	width: 12px;
+	height: 12px;
+	color: currentColor;
+	flex-shrink: 0;
+}
+
+.qviz-column-name {
+	flex: 1;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.qviz-column-dtype {
+	font-size: 10px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.qviz-column-badge {
+	font-size: 9px;
+	padding: 1px 4px;
+	border-radius: 2px;
+	background: var(--vscode-errorBackground, rgba(229,115,115,0.2));
+	color: var(--vscode-errorForeground, #e57373);
+	text-transform: uppercase;
+}
+
+.qviz-column-empty {
+	color: var(--vscode-descriptionForeground);
+	font-style: italic;
+	padding: 8px;
+}
+
+/* ---------- assign menu ---------- */
+
+.qviz-assign-menu {
+	background: var(--vscode-menu-background);
+	color: var(--vscode-menu-foreground);
+	border: 1px solid var(--vscode-menu-border);
+	border-radius: 4px;
+	box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+	padding: 4px;
+	min-width: 160px;
+	z-index: 1000;
+}
+.qviz-assign-menu-header {
+	font-size: 11px;
+	color: var(--vscode-descriptionForeground);
+	padding: 4px 8px;
+}
+.qviz-assign-menu-item {
+	display: block;
+	width: 100%;
+	padding: 4px 8px;
+	background: transparent;
+	border: 0;
+	color: inherit;
+	text-align: left;
+	cursor: pointer;
+	border-radius: 2px;
+}
+.qviz-assign-menu-item:hover, .qviz-assign-menu-item:focus {
+	background: var(--vscode-menu-selectionBackground);
+	color: var(--vscode-menu-selectionForeground);
+	outline: 0;
+}
+
+/* ---------- chart type picker ---------- */
+
+.qviz-chart-type-picker {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px;
+}
+.qviz-chart-type-button {
+	padding: 4px 10px;
+	background: var(--vscode-button-secondaryBackground);
+	color: var(--vscode-button-secondaryForeground);
+	border: 1px solid var(--vscode-button-border, transparent);
+	border-radius: 3px;
+	font-size: 12px;
+	cursor: pointer;
+}
+.qviz-chart-type-button:hover {
+	background: var(--vscode-button-secondaryHoverBackground);
+}
+.qviz-chart-type-button--active {
+	background: var(--vscode-button-background);
+	color: var(--vscode-button-foreground);
+}
+
+/* ---------- encoding shelves ---------- */
+
+.qviz-encoding-shelves {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+.qviz-shelf {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 6px 10px;
+	background: var(--vscode-input-background);
+	border: 1px solid var(--vscode-input-border, transparent);
+	border-radius: 3px;
+	cursor: pointer;
+}
+.qviz-shelf--active {
+	border-color: var(--vscode-focusBorder);
+}
+.qviz-shelf--assigned {
+	background: var(--vscode-editor-selectionBackground, rgba(100,150,255,0.2));
+}
+.qviz-shelf-label {
+	font-weight: 600;
+	color: var(--vscode-descriptionForeground);
+	min-width: 16px;
+}
+.qviz-shelf-field {
+	flex: 1;
+	color: var(--vscode-foreground);
+}
+.qviz-shelf-field[data-encoding-type="temporal"]::after { content: ' · temporal'; color: var(--vscode-descriptionForeground); font-size: 10px; }
+.qviz-shelf-field[data-encoding-type="quantitative"]::after { content: ' · num'; color: var(--vscode-descriptionForeground); font-size: 10px; }
+.qviz-shelf-field[data-encoding-type="nominal"]::after { content: ' · nominal'; color: var(--vscode-descriptionForeground); font-size: 10px; }
+.qviz-shelf-clear {
+	background: transparent;
+	border: 0;
+	color: var(--vscode-descriptionForeground);
+	cursor: pointer;
+	font-size: 16px;
+	padding: 0 4px;
+}
+.qviz-shelf-clear:hover {
+	color: var(--vscode-errorForeground);
+}
+.qviz-shelf--required-empty {
+	border-color: var(--vscode-editorError-foreground, #e57373);
+}
+.qviz-shelf--drop-target {
+	border-color: var(--vscode-focusBorder);
+	background: var(--vscode-list-dropBackground, rgba(100,150,255,0.25));
+}
+.qviz-shelf-required {
+	color: var(--vscode-errorForeground, #e57373);
+	margin-left: 2px;
+}
+.qviz-shelves-empty {
+	color: var(--vscode-descriptionForeground);
+	font-style: italic;
+	padding: 8px;
+}
+
+/* ---------- OHLCV cluster ---------- */
+
+.qviz-shelf--ohlcv {
+	flex-direction: column;
+	align-items: stretch;
+	gap: 4px;
+	padding: 8px 10px;
+}
+.qviz-shelf-ohlcv-header {
+	font-weight: 600;
+	color: var(--vscode-descriptionForeground);
+	font-size: 11px;
+	text-transform: uppercase;
+	letter-spacing: 0.5px;
+	padding-bottom: 4px;
+	border-bottom: 1px solid var(--vscode-panel-border);
+}
+.qviz-shelf-ohlcv-row {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 3px 4px;
+	border-radius: 2px;
+}
+.qviz-shelf-ohlcv-row--assigned {
+	background: var(--vscode-editor-selectionBackground, rgba(100,150,255,0.15));
+}
+.qviz-shelf-ohlcv-row--required-empty {
+	color: var(--vscode-errorForeground, #e57373);
+}
+.qviz-shelf-ohlcv-row.qviz-shelf--drop-target {
+	background: var(--vscode-list-dropBackground, rgba(100,150,255,0.3));
+}
+.qviz-shelf-ohlcv-label {
+	min-width: 64px;
+	font-weight: 500;
+}
+
+/* ---------- column drag state ---------- */
+
+.qviz-column-row--dragging {
+	opacity: 0.4;
+}
+.qviz-assign-menu-empty {
+	padding: 8px;
+	color: var(--vscode-descriptionForeground);
+	font-style: italic;
+}
+
+/* ---------- transform list (5.G) ---------- */
+
+.qviz-transform-list { display: flex; flex-direction: column; gap: 6px; }
+.qviz-transform-header { display: flex; align-items: center; justify-content: space-between; }
+.qviz-transform-title {
+	font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;
+	color: var(--vscode-descriptionForeground); margin: 0;
+}
+.qviz-transform-add-btn {
+	padding: 3px 8px; background: var(--vscode-button-secondaryBackground);
+	color: var(--vscode-button-secondaryForeground); border: 0;
+	border-radius: 3px; font-size: 11px; cursor: pointer;
+}
+.qviz-transform-add-btn:hover { background: var(--vscode-button-secondaryHoverBackground); }
+
+.qviz-add-menu {
+	background: var(--vscode-menu-background); color: var(--vscode-menu-foreground);
+	border: 1px solid var(--vscode-menu-border); border-radius: 4px;
+	padding: 4px; min-width: 140px; z-index: 1000;
+	box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+.qviz-add-menu-item {
+	display: block; width: 100%; padding: 4px 8px; background: transparent;
+	border: 0; color: inherit; text-align: left; cursor: pointer; border-radius: 2px;
+}
+.qviz-add-menu-item:hover:not(:disabled), .qviz-add-menu-item:focus:not(:disabled) {
+	background: var(--vscode-menu-selectionBackground);
+	color: var(--vscode-menu-selectionForeground);
+	outline: 0;
+}
+.qviz-add-menu-item:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.qviz-transform-cards { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.qviz-transform-card {
+	border: 1px solid var(--vscode-input-border, transparent);
+	background: var(--vscode-input-background);
+	border-radius: 3px;
+}
+.qviz-transform-card--error { border-color: var(--vscode-editorError-foreground, #e57373); }
+.qviz-transform-card-header {
+	display: flex; align-items: center; gap: 6px; padding: 4px 6px;
+}
+.qviz-transform-kind {
+	font-weight: 600; font-size: 11px; text-transform: uppercase;
+	color: var(--vscode-descriptionForeground); min-width: 76px;
+}
+.qviz-transform-summary {
+	flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+	font-family: var(--vscode-editor-font-family, monospace); font-size: 11px;
+}
+.qviz-transform-icon-btn {
+	width: 22px; height: 22px; padding: 0; background: transparent;
+	border: 0; color: var(--vscode-descriptionForeground); cursor: pointer;
+	border-radius: 2px; font-size: 12px;
+}
+.qviz-transform-icon-btn:hover:not(:disabled) {
+	background: var(--vscode-toolbar-hoverBackground);
+	color: var(--vscode-foreground);
+}
+.qviz-transform-icon-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.qviz-transform-delete:hover { color: var(--vscode-errorForeground); }
+.qviz-transform-card-error {
+	color: var(--vscode-errorForeground, #e57373);
+	font-size: 11px; padding: 2px 8px;
+}
+.qviz-transform-card-form { padding: 6px 8px; border-top: 1px solid var(--vscode-panel-border); }
+.qviz-transform-empty {
+	color: var(--vscode-descriptionForeground); font-style: italic; padding: 8px;
+}
+
+.qviz-histogram-preset { padding: 4px 0; }
+.qviz-histogram-preset-btn {
+	width: 100%; padding: 6px 8px;
+	background: var(--vscode-button-background); color: var(--vscode-button-foreground);
+	border: 0; border-radius: 3px; font-size: 12px; cursor: pointer;
+}
+.qviz-histogram-preset-btn:hover { background: var(--vscode-button-hoverBackground); }
+
+/* ---------- transform form internals ---------- */
+
+.qviz-form { display: flex; flex-direction: column; gap: 4px; }
+.qviz-form-row { display: flex; align-items: center; gap: 6px; }
+.qviz-form-label {
+	min-width: 64px; font-size: 11px;
+	color: var(--vscode-descriptionForeground);
+}
+.qviz-form-input, .qviz-form-select {
+	flex: 1; padding: 2px 6px;
+	background: var(--vscode-input-background);
+	color: var(--vscode-input-foreground);
+	border: 1px solid var(--vscode-input-border, transparent);
+	border-radius: 2px; font-size: 12px;
+}
+.qviz-form-textarea {
+	width: 100%; padding: 4px 6px; resize: vertical;
+	background: var(--vscode-input-background);
+	color: var(--vscode-input-foreground);
+	border: 1px solid var(--vscode-input-border, transparent);
+	border-radius: 2px; font-size: 12px;
+	font-family: var(--vscode-editor-font-family, monospace);
+}
+.qviz-form-note {
+	font-size: 10px; color: var(--vscode-descriptionForeground);
+	font-style: italic; padding: 2px 0;
+}
+.qviz-form-chips { display: flex; flex-wrap: wrap; gap: 2px; }
+.qviz-form-chip {
+	font-size: 10px; padding: 1px 6px;
+	background: var(--vscode-button-secondaryBackground);
+	color: var(--vscode-button-secondaryForeground);
+	border: 0; border-radius: 10px; cursor: pointer;
+}
+.qviz-form-aggs, .qviz-form-sort-cols { display: flex; flex-direction: column; gap: 3px; }
+.qviz-form-agg-row, .qviz-form-sort-row { display: flex; gap: 4px; }
+.qviz-form-add {
+	padding: 2px 8px; font-size: 11px;
+	background: var(--vscode-button-secondaryBackground);
+	color: var(--vscode-button-secondaryForeground);
+	border: 0; border-radius: 2px; cursor: pointer; align-self: flex-start;
+}
+.qviz-form-remove {
+	width: 22px; padding: 0; background: transparent; border: 0;
+	color: var(--vscode-descriptionForeground); cursor: pointer;
+}
+.qviz-form-remove:hover { color: var(--vscode-errorForeground); }
+
+/* ---------- preview area ---------- */
+
+.qviz-preview-area {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+}
+.qviz-preview-stripe {
+	padding: 4px 12px;
+	background: var(--vscode-statusBarItem-warningBackground, #cc6633);
+	color: var(--vscode-statusBarItem-warningForeground, #fff);
+	font-size: 11px;
+}
+.qviz-preview-chart {
+	flex: 1;
+	min-height: 0;
+	position: relative;
+}
+.qviz-preview-diagnostics {
+	border-top: 1px solid var(--vscode-panel-border);
+	padding: 6px 12px;
+	font-family: var(--vscode-editor-font-family, monospace);
+	font-size: 11px;
+	color: var(--vscode-descriptionForeground);
+	white-space: pre-wrap;
+	max-height: 100px;
+	overflow-y: auto;
+}
+
+/* ---------- Phase 6: app header inspector toggle ---------- */
+
+.qviz-app-header-controls {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+}
+
+.qviz-inspector-toggle {
+	padding: 3px 10px;
+	background: var(--vscode-button-secondaryBackground);
+	color: var(--vscode-button-secondaryForeground);
+	border: 1px solid var(--vscode-button-border, transparent);
+	border-radius: 3px;
+	font-size: 12px;
+	cursor: pointer;
+}
+.qviz-inspector-toggle:hover:not(:disabled) {
+	background: var(--vscode-button-secondaryHoverBackground);
+}
+.qviz-inspector-toggle:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: 1px;
+}
+.qviz-inspector-toggle--active {
+	background: var(--vscode-button-background);
+	color: var(--vscode-button-foreground);
+}
+/* Audit M-38 (2026-05-11): explicit disabled style so capability-gated
+ * users see a real visual cue (not just lighter button-default opacity). */
+.qviz-inspector-toggle:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
+/* ---------- Phase 6: inspector panel ---------- */
+
+.qviz-app-inspector {
+	border-left: 1px solid var(--vscode-panel-border);
+	display: flex;
+	flex-direction: column;
+	min-width: 240px;
+	min-height: 0;
+	background: var(--vscode-editor-background);
+	overflow: hidden;
+}
+/* hidden attribute keeps the aside out of flow when the inspector is
+ * closed (the grid column is also collapsed via the body class). */
+.qviz-app-inspector[hidden] {
+	display: none;
+}
+
+.qviz-inspector-panel {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	min-height: 0;
+	position: relative;
+}
+
+.qviz-inspector-resize-handle {
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	left: -4px;
+	width: 8px;
+	cursor: col-resize;
+	z-index: 10;
+	background: transparent;
+}
+.qviz-inspector-resize-handle:hover {
+	background: var(--vscode-sash-hoverBorder, var(--vscode-focusBorder));
+	opacity: 0.5;
+}
+
+.qviz-inspector-header {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 6px 10px;
+	border-bottom: 1px solid var(--vscode-panel-border);
+}
+.qviz-inspector-title {
+	flex: 1;
+	font-size: 12px;
+	font-weight: 600;
+	color: var(--vscode-foreground);
+}
+.qviz-inspector-clear {
+	padding: 2px 8px;
+	font-size: 11px;
+	background: var(--vscode-button-secondaryBackground);
+	color: var(--vscode-button-secondaryForeground);
+	border: 0;
+	border-radius: 2px;
+	cursor: pointer;
+}
+.qviz-inspector-clear:hover {
+	background: var(--vscode-button-secondaryHoverBackground);
+}
+.qviz-inspector-close {
+	width: 22px;
+	height: 22px;
+	padding: 0;
+	background: transparent;
+	border: 0;
+	color: var(--vscode-descriptionForeground);
+	cursor: pointer;
+	font-size: 16px;
+	line-height: 1;
+}
+.qviz-inspector-close:hover {
+	color: var(--vscode-foreground);
+}
+
+.qviz-inspector-body-wrap {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+}
+
+/* ---------- Phase 6: virtualized table ---------- */
+
+.qviz-inspector-table {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	min-height: 0;
+}
+
+.qviz-inspector-header-row {
+	display: flex;
+	border-bottom: 1px solid var(--vscode-panel-border);
+	background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+	flex-shrink: 0;
+}
+
+.qviz-inspector-cell {
+	flex: 1 1 0;
+	min-width: 80px;
+	padding: 4px 8px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-family: var(--vscode-editor-font-family, monospace);
+	font-size: 11px;
+	box-sizing: border-box;
+}
+.qviz-inspector-cell--header {
+	font-weight: 600;
+	color: var(--vscode-descriptionForeground);
+	font-size: 11px;
+	text-transform: none;
+	letter-spacing: 0;
+	border-right: 1px solid var(--vscode-panel-border);
+}
+.qviz-inspector-cell--header:last-child {
+	border-right: 0;
+}
+
+.qviz-inspector-body {
+	flex: 1;
+	min-height: 0;
+	overflow-y: auto;
+	overflow-x: auto;
+	position: relative;
+}
+
+/* Native scrollbar height drives `total * ROW_HEIGHT`. */
+.qviz-inspector-scroller {
+	position: relative;
+	width: 100%;
+}
+.qviz-inspector-spacer {
+	width: 1px; /* doesn't matter; height is what holds the scrollbar */
+}
+.qviz-inspector-rows {
+	position: absolute;
+	top: 0; left: 0; right: 0;
+}
+
+.qviz-inspector-row {
+	position: absolute;
+	left: 0; right: 0;
+	height: 24px;
+	display: flex;
+	border-bottom: 1px solid var(--vscode-panel-border);
+	cursor: pointer;
+	color: var(--vscode-foreground);
+}
+.qviz-inspector-row:hover {
+	background: var(--vscode-list-hoverBackground);
+}
+.qviz-inspector-row--selected {
+	background: var(--vscode-list-activeSelectionBackground);
+	color: var(--vscode-list-activeSelectionForeground);
+	/* Audit M-44 (2026-05-11): also a non-color indicator (left-edge
+	 * border) so colorblind users + high-contrast themes get a signal. */
+	border-left: 2px solid var(--vscode-focusBorder);
+}
+
+.qviz-inspector-placeholder {
+	flex: 1;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 12px;
+	color: var(--vscode-descriptionForeground);
+	font-style: italic;
+	padding: 16px;
+	font-size: 12px;
+	flex-wrap: wrap;
+}
+/* Audit M-45 (2026-05-11): error variant gets a more attention-getting
+ * color so users distinguish "loading" from "failed". */
+.qviz-inspector-placeholder--error {
+	color: var(--vscode-errorForeground, #e57373);
+	font-style: normal;
+}
+/* Audit M-48: retry button next to the error message. */
+.qviz-inspector-retry {
+	padding: 2px 10px;
+	background: var(--vscode-button-background);
+	color: var(--vscode-button-foreground);
+	border: 0;
+	border-radius: 2px;
+	cursor: pointer;
+	font-style: normal;
+	font-size: 11px;
+}
+.qviz-inspector-retry:hover {
+	background: var(--vscode-button-hoverBackground);
+}
+
+/* ---------- Phase 6: column filter chip + popup ---------- */
+
+.qviz-inspector-cell--header {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+}
+.qviz-inspector-cell-name {
+	flex: 1;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.qviz-col-filter-btn {
+	flex: 0 0 auto;
+	width: 16px;
+	height: 16px;
+	padding: 0;
+	background: transparent;
+	border: 0;
+	color: var(--vscode-descriptionForeground);
+	cursor: pointer;
+	font-size: 9px;
+	border-radius: 2px;
+	line-height: 1;
+}
+.qviz-col-filter-btn:hover {
+	background: var(--vscode-toolbar-hoverBackground);
+	color: var(--vscode-foreground);
+}
+.qviz-col-filter-btn--active {
+	color: var(--vscode-button-foreground);
+	background: var(--vscode-button-background);
+}
+
+.qviz-col-filter-popup {
+	background: var(--vscode-menu-background);
+	color: var(--vscode-menu-foreground);
+	border: 1px solid var(--vscode-menu-border);
+	border-radius: 4px;
+	box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+	padding: 8px;
+	min-width: 200px;
+	max-width: 320px;
+	z-index: 1100;
+}
+.qviz-col-filter-loading,
+.qviz-col-filter-error {
+	color: var(--vscode-descriptionForeground);
+	font-style: italic;
+	font-size: 11px;
+}
+.qviz-col-filter-error {
+	color: var(--vscode-errorForeground, #e57373);
+}
+.qviz-col-filter-range {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+.qviz-col-filter-text {
+	display: flex;
+}
+.qviz-col-filter-set {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	max-height: 240px;
+	overflow-y: auto;
+}
+.qviz-col-filter-set-row {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	cursor: pointer;
+	font-size: 12px;
+	padding: 1px 0;
+}
+.qviz-col-filter-set-row:hover {
+	background: var(--vscode-list-hoverBackground);
+}

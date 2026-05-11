@@ -18,9 +18,9 @@
  * plus a container element and creates an actual @charts-plus Chart.
  */
 
-import type { ChartType, Encoding, OhlcvEncoding, QvizSpec } from '../spec';
+import type { ChartType, QvizSpec } from '../spec';
 import type {
-	BarPlan, BaselinePlan, CandlestickPlan, ColumnData, DataPointMs, HistogramPlan,
+	AreaPlan, BarPlan, BaselinePlan, CandlestickPlan, ColumnData, DataPointMs, HistogramPlan,
 	LinePlan, OhlcDataPointMs, QvizTheme, TimeseriesChartOptions, TimeseriesPlan,
 	TimeseriesSeriesPlan
 } from './types';

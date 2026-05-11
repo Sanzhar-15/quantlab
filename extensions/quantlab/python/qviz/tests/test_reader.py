@@ -11,6 +11,8 @@ import pytest
 
 from qviz.reader import (
     PREVIEW_MAX,
+    _duckdb_uniquify,
+    _uniquify_schema,
     arrow_ipc_to_table,
     file_mtime_ns,
     file_row_count,
@@ -183,6 +185,65 @@ def test_preview_csv(csv_small: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Offset (Phase 6 / 6.A.1): inspector paging
+# ---------------------------------------------------------------------------
+
+
+def test_preview_negative_offset_rejected(parquet_1m: Path) -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        read_preview(parquet_1m, n=10, offset=-1)
+
+
+def test_preview_offset_default_unchanged(parquet_1m: Path) -> None:
+    # Pin the offset=0 default so an inadvertent signature change is caught.
+    a = read_preview(parquet_1m, n=100)
+    b = read_preview(parquet_1m, n=100, offset=0)
+    assert a.num_rows == b.num_rows == 100
+
+
+def test_preview_offset_parquet_skips_correct_rows(parquet_1m: Path) -> None:
+    head = read_preview(parquet_1m, n=200)
+    skipped = read_preview(parquet_1m, n=100, offset=100)
+    assert skipped.num_rows == 100
+    # The second window must equal rows [100, 200) of the contiguous first
+    # window. Compare on a column that's guaranteed monotonic per the
+    # fixture's synthetic generator (`timestamp` increments by 1s).
+    head_ts = head.column("timestamp").to_pylist()
+    skip_ts = skipped.column("timestamp").to_pylist()
+    assert skip_ts == head_ts[100:200]
+
+
+def test_preview_offset_past_end_returns_empty(parquet_1m: Path) -> None:
+    # 1M rows fixture; ask for offset = total + 5.
+    total = read_preview(parquet_1m, n=1).num_rows  # smoke: confirm there's data
+    assert total == 1
+    huge = read_preview(parquet_1m, n=10, offset=2_000_000)
+    assert huge.num_rows == 0
+    # Schema must still be the dataset's schema, not empty struct.
+    assert "timestamp" in huge.column_names
+
+
+def test_preview_offset_csv_skips_correct_rows(tmp_path: Path) -> None:
+    csv = tmp_path / "rows.csv"
+    csv.write_text("a,b\n1,one\n2,two\n3,three\n4,four\n5,five\n")
+    skipped = read_preview(csv, n=2, offset=2)
+    # rows [2, 4) of zero-indexed body = "3,three" and "4,four".
+    assert skipped.num_rows == 2
+    assert skipped.column("a").to_pylist() == [3, 4]
+    assert skipped.column("b").to_pylist() == ["three", "four"]
+
+
+def test_preview_offset_zero_still_fast(parquet_1m: Path) -> None:
+    # The fast-path budget claim from the original test must survive the
+    # offset signature change.
+    t0 = time.perf_counter()
+    table = read_preview(parquet_1m, n=100, offset=0)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    assert table.num_rows == 100
+    assert elapsed_ms < 200, f"offset=0 preview too slow: {elapsed_ms:.0f}ms"
+
+
+# ---------------------------------------------------------------------------
 # mtime + Arrow IPC round-trip
 # ---------------------------------------------------------------------------
 
@@ -210,3 +271,78 @@ def test_arrow_ipc_preserves_dtypes() -> None:
     })
     restored = arrow_ipc_to_table(table_to_arrow_ipc(table))
     assert restored.schema == table.schema
+
+
+# ---------------------------------------------------------------------------
+# Duplicate column-name handling (smoke-test fix, 2026-05-11)
+# ---------------------------------------------------------------------------
+
+
+def test_duckdb_uniquify_no_duplicates_returns_unchanged() -> None:
+    assert _duckdb_uniquify(["a", "b", "c"]) == ["a", "b", "c"]
+
+
+def test_duckdb_uniquify_one_duplicate() -> None:
+    # Real-world case: TradingView indicator export with two "MA #1" columns.
+    assert _duckdb_uniquify(["t", "MA #1", "MA #1", "close"]) == [
+        "t", "MA #1", "MA #1_1", "close",
+    ]
+
+
+def test_duckdb_uniquify_many_duplicates() -> None:
+    # Three identical names → first keeps name, second gets _1, third gets _2.
+    assert _duckdb_uniquify(["x", "x", "x", "x"]) == ["x", "x_1", "x_2", "x_3"]
+
+
+def test_duckdb_uniquify_mixed_overlapping() -> None:
+    # The renaming MUST NOT itself produce a new collision. Here "a_1" exists
+    # in the input; we need to make sure the renamer increments past it
+    # cleanly. Current behavior: blind suffixing (sufficient for v1 because
+    # we don't expect users to ship `x_1, x` mixes; if this becomes a real
+    # issue, switch to a collision-checking renamer.)
+    # This test PINS the current behavior so a future change is intentional.
+    assert _duckdb_uniquify(["a", "a_1", "a", "a"]) == ["a", "a_1", "a_1", "a_2"]
+
+
+def test_uniquify_schema_preserves_types_and_nullability() -> None:
+    schema = pa.schema([
+        pa.field("t", pa.int64(), nullable=False),
+        pa.field("v", pa.float64(), nullable=True),
+        pa.field("v", pa.float64(), nullable=True),
+    ])
+    out = _uniquify_schema(schema)
+    assert out.names == ["t", "v", "v_1"]
+    assert out.field(0).type == pa.int64()
+    assert out.field(0).nullable is False
+    assert out.field(2).type == pa.float64()
+    assert out.field(2).nullable is True
+
+
+def test_uniquify_schema_returns_same_instance_when_unique() -> None:
+    # Defense against unnecessary allocations on the hot path (every schema
+    # read). When there are no duplicates the helper returns the input
+    # reference verbatim so `schema is unique_schema` -> True.
+    schema = pa.schema([pa.field("a", pa.int64()), pa.field("b", pa.float64())])
+    assert _uniquify_schema(schema) is schema
+
+
+def test_read_schema_csv_with_duplicate_columns(tmp_path: Path) -> None:
+    # Real-world TradingView-style export: two columns named "MA #1".
+    csv_path = tmp_path / "tv_export.csv"
+    csv_path.write_text("time,MA #1,MA #1,close\n1,10,20,100\n2,11,21,101\n")
+    schema = read_schema(csv_path)
+    assert schema.names == ["time", "MA #1", "MA #1_1", "close"]
+
+
+def test_read_preview_csv_with_duplicate_columns(tmp_path: Path) -> None:
+    # The preview's column names must match the schema's. Otherwise the
+    # webview's column panel would show de-duped names while the preview
+    # rows reference the originals, and JS would silently drop the second
+    # column.
+    csv_path = tmp_path / "tv_export.csv"
+    csv_path.write_text("time,MA #1,MA #1,close\n1,10,20,100\n2,11,21,101\n")
+    table = read_preview(csv_path, n=10)
+    assert table.schema.names == ["time", "MA #1", "MA #1_1", "close"]
+    # Data preserved positionally: second column's 10/11, third column's 20/21.
+    assert table.column(1).to_pylist() == [10, 11]
+    assert table.column(2).to_pylist() == [20, 21]

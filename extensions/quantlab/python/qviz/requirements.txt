@@ -1,0 +1,13 @@
+# Megaudit-2 A4-C2: pinned minimum runtime dependencies for the qviz
+# daemon. The extension host spawns this package as a long-lived Python
+# subprocess; if the user's venv is missing these or has them at versions
+# the daemon can't use, the startup probe (`_check_duckdb_version`) and
+# pyarrow imports will fail LOUDLY with stderr that the extension
+# surfaces as `daemonStatus: unavailable`.
+#
+# Upper bounds are intentionally open: we want bug fixes in patch
+# releases to land without a coordinated requirements bump. If a future
+# release breaks compatibility, add an upper-bound constraint here
+# along with a release-note pointer.
+duckdb>=0.9.0
+pyarrow>=10.0.0

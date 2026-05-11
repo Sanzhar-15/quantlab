@@ -90,10 +90,18 @@ def test_rejects_disallowed_extension(tmp_path: Path) -> None:
         resolve_workspace_path(tmp_path, "secrets.env")
 
 
-def test_allowlist_includes_expected_extensions() -> None:
+def test_allowlist_matches_reader_dispatch() -> None:
+    """Megaudit CRITICAL-3: extension allowlist MUST match the reader's
+    actual dispatch (parquet/csv/tsv). xlsx/xls were previously
+    accepted by the security gate and rejected by the reader, causing
+    confusing errors AND a threat-model gap (the gate said "OK" for
+    files the reader couldn't actually read)."""
     assert ".parquet" in ALLOWED_EXTENSIONS
     assert ".csv" in ALLOWED_EXTENSIONS
-    assert ".xlsx" in ALLOWED_EXTENSIONS
+    assert ".tsv" in ALLOWED_EXTENSIONS
+    # Excluded: xlsx/xls (reader raises NotImplementedError for them).
+    assert ".xlsx" not in ALLOWED_EXTENSIONS
+    assert ".xls" not in ALLOWED_EXTENSIONS
     assert ".env" not in ALLOWED_EXTENSIONS
     assert ".py" not in ALLOWED_EXTENSIONS
 

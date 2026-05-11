@@ -143,3 +143,86 @@ export interface TimeseriesPlan {
 	/** Diagnostics for the caller to inspect / log. Not consumed by Chart. */
 	readonly diagnostics: readonly string[];
 }
+
+// ---------------------------------------------------------------------------
+// general family (Vega-Lite render target)
+// ---------------------------------------------------------------------------
+
+/**
+ * Hand-rolled subset of the Vega-Lite top-level-spec shape we emit. We do NOT
+ * import vega-lite's types directly so that:
+ *
+ *   1. compileGeneralPlan is pure and has zero npm deps -- testable without
+ *      vega-lite installed
+ *   2. the spec layer is renderer-agnostic: a future Plotly / observable-plot
+ *      adaptor could consume the same plan
+ *
+ * This is a deliberately narrow shape -- only the fields we actually emit.
+ * Vega-Lite ignores unknown top-level fields, and our config block uses
+ * Record<string, unknown> for the rich theme/title/legend/axis sub-trees.
+ */
+export type VegaLiteMarkType =
+	| 'line' | 'bar' | 'circle' | 'point' | 'rect' | 'arc' | 'area' | 'square';
+
+export interface VegaLiteMarkObject {
+	readonly type: VegaLiteMarkType;
+	readonly tooltip?: boolean;
+	readonly opacity?: number;
+	readonly binSpacing?: number;
+}
+
+export type VegaLiteMark = VegaLiteMarkType | VegaLiteMarkObject;
+
+export type VegaLiteEncodingType = 'quantitative' | 'temporal' | 'nominal' | 'ordinal';
+
+export interface VegaLiteFieldDef {
+	readonly field: string;
+	readonly type: VegaLiteEncodingType;
+	readonly title?: string;
+	readonly bin?: boolean | { readonly maxbins: number };
+	readonly aggregate?: 'count' | 'sum' | 'mean' | 'min' | 'max';
+	readonly axis?: { readonly format?: string; readonly title?: string | null } | null;
+	readonly scale?: {
+		readonly type?: 'linear' | 'log' | 'pow';
+		readonly zero?: boolean;
+		readonly scheme?: string;
+	};
+	readonly sort?: 'ascending' | 'descending';
+	readonly legend?: null | { readonly title?: string };
+	readonly format?: string;
+}
+
+export interface VegaLiteEncoding {
+	readonly x?: VegaLiteFieldDef;
+	readonly y?: VegaLiteFieldDef;
+	readonly color?: VegaLiteFieldDef;
+	readonly size?: VegaLiteFieldDef;
+	readonly shape?: VegaLiteFieldDef;
+	readonly row?: VegaLiteFieldDef;
+	readonly column?: VegaLiteFieldDef;
+	readonly theta?: VegaLiteFieldDef;
+	readonly tooltip?: readonly VegaLiteFieldDef[];
+}
+
+export interface VegaLiteSpec {
+	readonly $schema: string;
+	readonly title?: string;
+	readonly description?: string;
+	readonly width: number | 'container';
+	readonly height: number | 'container';
+	readonly background?: string;
+	readonly autosize?: 'fit' | 'pad' | 'none';
+	readonly data: { readonly values: readonly Record<string, unknown>[] };
+	readonly mark: VegaLiteMark;
+	readonly encoding: VegaLiteEncoding;
+	readonly config?: Record<string, unknown>;
+}
+
+/** Subset of qviz ChartType valid for the general family. */
+export type GeneralChartType = 'line' | 'bar' | 'scatter' | 'heatmap' | 'pie' | 'histogram';
+
+export interface GeneralPlan {
+	readonly spec: VegaLiteSpec;
+	/** Diagnostics for the caller to inspect / log. Not consumed by Vega. */
+	readonly diagnostics: readonly string[];
+}

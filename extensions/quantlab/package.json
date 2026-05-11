@@ -12,12 +12,13 @@
   "categories": [
     "Other"
   ],
-  "main": "./out/extension",
+  "main": "./out/src/extension",
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts",
-    "test": "npm run compile && mocha ./out/test/**/*.test.js --ui tdd --require source-map-support/register"
+    "test": "npm run compile && node node_modules/mocha/bin/mocha.js 'out/test/qviz*.test.js' --ui tdd --require source-map-support/register",
+    "test:all": "npm run compile && node node_modules/mocha/bin/mocha.js 'out/test/**/*.test.js' 'out/src/test/**/*.test.js' --ui tdd --require source-map-support/register"
   },
   "activationEvents": [
     "onStartupFinished"
@@ -543,6 +544,16 @@
           }
         ],
         "priority": "option"
+      },
+      {
+        "viewType": "quantlab.visualiseSpecView",
+        "displayName": "Visualise Spec",
+        "selector": [
+          {
+            "filenamePattern": "*.qviz.json"
+          }
+        ],
+        "priority": "default"
       }
     ],
     "viewsContainers": {
@@ -823,6 +834,12 @@
     "configuration": {
       "title": "Quantlab Trading",
       "properties": {
+        "quantlab.pythonPath": {
+          "type": "string",
+          "scope": "machine-overridable",
+          "default": "",
+          "description": "Path to the Python interpreter for the qviz daemon (visualisation). When empty, Quantlab falls through to python.defaultInterpreterPath, then to ~/.quantlab/venv/bin/python. Setting an explicit path that does not resolve to an executable file fails loudly (does not silently fall through)."
+        },
         "quantlab.trading.accounts": {
           "type": "array",
           "default": [],
@@ -1033,7 +1050,11 @@
     "source-map-support": "^0.5.21"
   },
   "dependencies": {
+    "@vscode/codicons": "^0.0.36",
+    "apache-arrow": "^21.1.0",
     "typed-emitter": "^2.1.0",
+    "vega-embed": "^7.1.0",
+    "vega-interpreter": "^2.2.1",
     "ws": "^8.19.0"
   }
 }

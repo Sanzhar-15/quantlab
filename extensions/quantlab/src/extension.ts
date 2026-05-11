@@ -30,7 +30,14 @@ import { ChartViewProvider } from './views/chart/ChartViewProvider';
 import { ActionViewProvider } from './views/action/ActionViewProvider';
 import { TradeViewProvider } from './views/trade/TradeViewProvider';
 import { StatsViewProvider } from './views/stats/StatsViewProvider';
-import { VisualiseViewProvider } from './views/visualise/VisualiseViewProvider';
+import { VisualiseDataProvider } from './views/visualise/VisualiseDataProvider';
+import { VisualiseSpecProvider } from './views/visualise/VisualiseSpecProvider';
+import {
+	DaemonLifecycle,
+	DEFAULT_DAEMON_LIFECYCLE_OPTIONS,
+} from './qviz/daemon-lifecycle';
+import { resolveQuantlabPython, verifyPythonVersion } from './qviz/pythonPath';
+import { LifecycleManager } from './qviz/lifecycleManager';
 import { SecureStorage } from './utils/secureStorage';
 import { ThemeProvider } from './ui/tokens/ThemeProvider';
 import { ReducedMotion } from './ui/accessibility/ReducedMotion';
@@ -217,7 +224,36 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	new ActionViewProvider(context, globalState, historyState, stateManager).register(context);
 	new TradeViewProvider(context).register(context);
 	context.subscriptions.push(StatsViewProvider.register(context));
-	context.subscriptions.push(VisualiseViewProvider.register(context));
+	context.subscriptions.push(VisualiseDataProvider.register(context));
+	qvizLifecycleManager = createQvizLifecycleManager(context);
+	context.subscriptions.push(VisualiseSpecProvider.register(context, {
+		lifecycleSource: qvizLifecycleManager,
+	}));
+
+	// Megaudit-2 A4-M5: when the user edits `quantlab.pythonPath` or
+	// `python.defaultInterpreterPath`, drop the per-folder
+	// `DaemonLifecycle` cache so the next document access re-runs the
+	// factory (which re-reads config and re-validates the binary via
+	// `verifyPythonVersion`). Without this, a respawn after crash --
+	// or a future doc open in the same workspace folder -- would use
+	// the previously-validated python path even though the user just
+	// changed it to a different interpreter (possibly Python 2.x).
+	context.subscriptions.push(
+		vscode.workspace.onDidChangeConfiguration((evt) => {
+			const affected = (
+				evt.affectsConfiguration('quantlab.pythonPath')
+				|| evt.affectsConfiguration('python.defaultInterpreterPath')
+			);
+			if (!affected) { return; }
+			const mgr = qvizLifecycleManager;
+			if (mgr === null) { return; }
+			// Fire-and-forget: child SIGTERM grace is async, but the
+			// cache clear is synchronous so a follow-up open will
+			// rebuild lifecycles immediately. Errors propagate to
+			// the unhandledRejection logger; we do NOT swallow.
+			void mgr.invalidate();
+		}),
+	);
 
 	registerDataCommands(context);
 	registerGlobalStateCommands(context);
@@ -548,9 +584,104 @@ async function initializeServerConnection(
 }
 
 /**
+ * Module-level reference so `deactivate()` can await final disposal.
+ * `context.subscriptions.push` would call `dispose()` synchronously
+ * and not wait for the daemon child processes to exit (Step B AF6 + Step
+ * C megaudit C1 regression — fixed by awaiting in deactivate).
+ */
+let qvizLifecycleManager: LifecycleManager | null = null;
+
+/**
+ * Wire the qviz daemon lifecycle MANAGER. The manager creates one
+ * `DaemonLifecycle` per workspace folder lazily on first use, so a
+ * multi-folder workspace gets per-folder daemons (Step C megaudit C12).
+ *
+ * Returns a manager whose `getLifecycleForDocument` may itself return
+ * null if Python isn't available — the spec editor still opens in that
+ * case but save will REFUSE (Step C megaudit C5 enforcement).
+ */
+function createQvizLifecycleManager(
+	context: vscode.ExtensionContext,
+): LifecycleManager {
+	const pythonPathPrefix = [
+		vscode.Uri.joinPath(context.extensionUri, 'python').fsPath,
+	];
+
+	return new LifecycleManager({
+		create(workspaceRoot: string): DaemonLifecycle | null {
+			// Megaudit-2 A4-M5: read the configs FRESH inside `create()`
+			// (not at activation time). The manager's `invalidate()` is
+			// wired to `onDidChangeConfiguration`, which drops all
+			// cached lifecycles and forces this factory to re-run --
+			// at which point we MUST re-read the user's possibly-new
+			// `quantlab.pythonPath` / `python.defaultInterpreterPath`
+			// and re-validate via `verifyPythonVersion` below.
+			const quantlabConfig = vscode.workspace.getConfiguration('quantlab');
+			const pythonExtConfig = vscode.workspace.getConfiguration('python');
+			const resolved = resolveQuantlabPython({
+				quantlabConfigPath: quantlabConfig.get<string>('pythonPath'),
+				pythonExtConfigPath: pythonExtConfig.get<string>('defaultInterpreterPath'),
+			});
+			if (!resolved) {
+				console.warn(
+					'Quantlab: no Python interpreter found for qviz daemon '
+					+ '(checked QUANTLAB_PYTHON, quantlab.pythonPath, '
+					+ 'python.defaultInterpreterPath, ~/.quantlab/venv/bin/python). '
+					+ 'Save will refuse for files in this workspace.',
+				);
+				return null;
+			}
+			// Megaudit MAJOR-42: verify the resolved binary is actually
+			// Python ≥ 3.10 BEFORE spawning the daemon. The previous
+			// code spawned blindly; if the user's
+			// `python.defaultInterpreterPath` pointed at a non-Python
+			// binary or Python 2.7, the daemon would crash at first
+			// import with confusing error. Now we fail loudly with a
+			// clear message identifying the configured path.
+			const versionCheck = verifyPythonVersion(resolved.pythonPath, 3, 10);
+			if (!versionCheck.ok) {
+				console.warn(
+					`Quantlab: Python at ${resolved.pythonPath} (source: ${resolved.source}) `
+					+ `failed version check: ${versionCheck.error}. `
+					+ 'Save will refuse for files in this workspace until a Python ≥3.10 is configured.',
+				);
+				void vscode.window.showErrorMessage(
+					`Quantlab: configured Python (${resolved.pythonPath}) is not usable: ${versionCheck.error}`,
+				);
+				return null;
+			}
+			console.info(
+				`Quantlab: qviz daemon lifecycle for ${workspaceRoot} `
+				+ `(source: ${resolved.source}, version ${versionCheck.version})`,
+			);
+			return new DaemonLifecycle({
+				...DEFAULT_DAEMON_LIFECYCLE_OPTIONS,
+				workspaceRoot,
+				pythonPath: resolved.pythonPath,
+				pythonPathPrefix,
+			});
+		},
+	});
+}
+
+/**
  * Deactivates the Quantlab extension.
  */
 export async function deactivate(): Promise<void> {
+	// Step C megaudit C1: await qviz daemon lifecycle disposal explicitly.
+	// `context.subscriptions.push({ dispose: () => lifecycle.dispose() })`
+	// would not await the returned Promise (VS Code's contract for
+	// synchronous disposables), leaving Python child processes running
+	// past extension shutdown. Awaiting here guarantees clean teardown.
+	if (qvizLifecycleManager !== null) {
+		try {
+			await qvizLifecycleManager.disposeAll();
+		} catch (e) {
+			console.warn('Quantlab: qviz lifecycle dispose threw during deactivate:', e);
+		}
+		qvizLifecycleManager = null;
+	}
+
 	// Cleanup server connection with proper disposal
 	try {
 		const client = ServerApiClient.getInstance();
