@@ -32,3 +32,8 @@ harness = false
 [[bench]]
 name = "og04_scalar_1m"
 harness = false
+
+# Phase 0 A7 chunk-size sweep over the OG-02 mul2 hot path.
+[[bench]]
+name = "og02_chunk_sweep"
+harness = false
