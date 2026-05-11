@@ -30,10 +30,12 @@
 //! See `_QUANTBOOK-v1-SPECIFICATION.md` Part V §1 OG-02/OG-05/A1/A4/A5 for the
 //! acceptance criteria.
 
+pub mod dirty;
 pub mod edges;
 pub mod graph;
 pub mod node;
 
+pub use dirty::{propagate_from_cells, ChunkDirtySet, ChunkKey};
 pub use edges::AdjacencyVectors;
 pub use graph::Graph;
 pub use node::{CellNode, FormulaRegionNode, Node, NodeId, RangeNode, SpillNode};
