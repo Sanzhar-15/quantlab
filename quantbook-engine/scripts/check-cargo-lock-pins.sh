@@ -42,6 +42,7 @@ PINNED_PKGS=(
   multiversion
   pyo3
   wasm-bindgen
+  proptest
 )
 
 err=0

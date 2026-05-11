@@ -24,9 +24,9 @@ quantbook-engine/
 │   ├── phase0/                     # acceptance results, exit packet, decisions
 │   └── legal/                      # NOTICE.md tracked; *-provenance.md gitignored until ship-prep (CORR-10)
 └── crates/
-    ├── ql-types/               # Value, ErrorValue, coercion (Phase 0)
+    ├── ql-types/               # Value, ErrorValue (14 variants), coercion, Address, Range (Phase 0)
     ├── ql-storage/             # Workbook, Sheet, ColumnStore, SparseOverlay (Phase 0)
-    ├── ql-formula-syntax/      # Lexer, Pratt Parser, AST (Phase 0)
+    ├── ql-formula-syntax/      # Lexer + AST types (Phase 0 partial; Pratt parser deferred per CORR-20)
     ├── ql-formula-semantics/   # Binding, resolution, dep extraction (Phase 3+)
     ├── ql-functions/           # Function registry; ~38 Phase 0 fns incl. Welford VAR/STDEV
     ├── ql-calcgraph/           # CellNode/RangeNode/FormulaRegionNode, dirty, topo, stripe (Phase 0)
