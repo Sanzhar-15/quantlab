@@ -5,9 +5,9 @@
 //! per the opus-architecture audit finding #9 ("the parser is the 2-3 day item; ship in a
 //! focused block with reference reading done first").
 //!
-//! The shape locks here are deliberately complete (matches spec line 643: "Number, String,
-//! Bool, Ref, Range, BinaryOp, UnaryOp, Function, Array, Spill") so future commits add
-//! parser logic without re-shaping the AST.
+//! The shape locks here are deliberately complete (matches `_QUANTBOOK-MASTER-PLAN.md` §6.3
+//! AST list: "Number, String, Bool, Ref, Range, BinaryOp, UnaryOp, Function, Array, Spill")
+//! so future commits add parser logic without re-shaping the AST.
 
 use std::sync::Arc;
 
@@ -47,8 +47,10 @@ pub enum Expr {
     Unary { op: Operator, operand: Box<Expr> },
 
     /// Function call. `name` is the function identifier (e.g. `"SUM"`); the parser uppercases
-    /// it for canonical comparison. `AI` is intercepted here (CORR-06): the parser emits a
-    /// special `FunctionCall` and the binder/evaluator turns it into `Error(AINotAvailable)`.
+    /// it for canonical comparison. Per CORR-06 / T4-D05: the parser builds `Function { name:
+    /// "AI", args: ... }` for any `AI(...)` source; the binder/evaluator then maps the call to
+    /// `Error(ErrorValue::AINotAvailable)`. AI is NOT a lexer-level keyword — see token.rs
+    /// module doc for the source-text propagation contract.
     Function { name: Arc<str>, args: Vec<Expr> },
 
     /// Array literal `{1,2;3,4}`. Phase 0 lexer doesn't recognize `{` — this variant is

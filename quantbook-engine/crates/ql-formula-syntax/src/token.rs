@@ -17,8 +17,14 @@
 //! - Array literal syntax `{1,2;3,4}`
 //!
 //! The `Token` enum is intentionally narrow — adding deferred surface later is non-breaking.
-//! AI() reservation lives at the parser level (CORR-06 / T4-D05): the lexer emits `Ident("AI")`
-//! like any other function name; the parser intercepts and emits `Error(AINotAvailable)`.
+//!
+//! **AI() reservation (CORR-06 / T4-D05) lives entirely at the parser level.** The lexer
+//! treats `AI` as a regular 2-letter column-letter identifier and emits `BareColumn { col,
+//! abs, text }` with `text = "AI"`. When the parser encounters `BareColumn`-or-`CellRef`
+//! immediately followed by `LParen`, it looks up the `text` field as a function name; if it
+//! matches `AI` (case-insensitive), the parser emits `Expr::Function { name: "AI", ... }`
+//! which the binder/evaluator then maps to `Error(ErrorValue::AINotAvailable)`. No special
+//! lexer-level reservation; the `text` field IS the disambiguation handle.
 
 use std::sync::Arc;
 
@@ -36,25 +42,31 @@ pub enum Token {
     /// disambiguates based on the following token (`(` → function, otherwise → named ref).
     Ident(Arc<str>),
 
-    /// A1-style cell reference. Stores zero-indexed `(col, row)` plus absolute-marker flags.
-    /// Column letters → `col` per Excel rules: A=0, B=1, ..., Z=25, AA=26, ..., XFD=16383.
-    /// Row digits in source are 1-indexed; we store 0-indexed internally.
+    /// A1-style cell reference. Stores zero-indexed `(col, row)` plus absolute-marker flags
+    /// AND the raw source text. The raw text is preserved so the parser can disambiguate
+    /// function calls: Excel-canonical, `LOG10(2)` lexes as `CellRef{col=8508, row=9,
+    /// text="LOG10"}` followed by `LParen` — the parser sees LParen and looks up `text` as
+    /// a function name. (Per codex r13 N6 + opus arch F6 audit; the lexer can't disambiguate
+    /// without lookahead beyond `(`, so the parser owns the dispatch.)
     CellRef {
         col: u32,
         row: u32,
         abs_col: bool,
         abs_row: bool,
+        text: Arc<str>,
     },
 
-    /// Open-axis cell reference for whole-column / whole-row forms within a `Range` (e.g.
-    /// `A:A` lexes as two `BareColumn` joined by `Colon`). Stores zero-indexed col with
-    /// abs marker.
+    /// Open-axis cell reference for whole-column forms within a `Range` (e.g.  `A:A` lexes
+    /// as two `BareColumn` joined by `Colon`). Stores zero-indexed col, abs marker, and the
+    /// raw source text (for parser-level function-name disambiguation when followed by `(`).
     BareColumn {
         col: u32,
         abs: bool,
+        text: Arc<str>,
     },
 
-    /// Open-axis bare row for `1:1` forms. 0-indexed row + abs marker.
+    /// Open-axis bare row for `1:1` forms — only meaningful inside a range. 0-indexed row
+    /// + abs marker (the `$` BEFORE the digits, e.g. `$5`).
     BareRow {
         row: u32,
         abs: bool,
@@ -146,18 +158,21 @@ mod tests {
             row: 0,
             abs_col: false,
             abs_row: false,
+            text: Arc::from("A1"),
         };
         let b = Token::CellRef {
             col: 0,
             row: 0,
             abs_col: true,
             abs_row: false,
+            text: Arc::from("$A1"),
         };
         let c = Token::CellRef {
             col: 0,
             row: 1,
             abs_col: false,
             abs_row: false,
+            text: Arc::from("A2"),
         };
         assert_ne!(a, b);
         assert_ne!(a, c);

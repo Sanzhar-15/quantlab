@@ -63,7 +63,14 @@ mod tests {
     fn og02_formula_body_lexes_to_expected_stream() {
         let toks = lex("A * 2").unwrap();
         assert_eq!(toks.len(), 3);
-        assert!(matches!(toks[0], Token::BareColumn { col: 0, abs: false }));
+        assert!(matches!(
+            toks[0],
+            Token::BareColumn {
+                col: 0,
+                abs: false,
+                ..
+            }
+        ));
         assert_eq!(toks[1], Token::Op(Operator::Mul));
         assert_eq!(toks[2], Token::Number(2.0));
     }

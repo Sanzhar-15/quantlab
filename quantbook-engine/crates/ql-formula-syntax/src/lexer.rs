@@ -196,162 +196,150 @@ fn lex_number(chars: &mut Peekable<Chars>) -> Result<Token, LexError> {
     Ok(Token::Number(n))
 }
 
-/// Lex either an identifier (function name / named ref) OR an A1 cell reference / bare
-/// column reference. We peek the structure: `[$]LETTERS[$]DIGITS` → CellRef;
-/// `[$]LETTERS` (no digits) → BareColumn; otherwise Identifier.
+/// Lex either an identifier (function name / named ref) OR an A1 cell reference / bare-axis
+/// reference. Source-shape grammar:
+///   `[$]LETTERS[$]DIGITS` → CellRef
+///   `[$]LETTERS`           → BareColumn (column letters with no row)
+///   `[$]DIGITS`            → BareRow (row digits alone; only meaningful inside a range)
+///   `_letters_digits…`     → Identifier (Ident / Word, parser disambiguates against `(`)
+///
+/// Tracks `leading_dollar` (the `$` before letters/digits) and `mid_dollar` (the `$` between
+/// letters and digits) SEPARATELY so each propagates correctly to the abs markers.
+/// Prior bug (codex r13 N5 / opus arch F1 / opus consistency B-2): pushing the leading `$`
+/// into the letter buffer caused `$5` to lex as `BareRow { abs: false }` — silently wrong.
 fn lex_ident_or_ref(chars: &mut Peekable<Chars>) -> Result<Token, LexError> {
-    // Phase 1: scan optional `$` then letters/underscore/digits as an identifier-ish prefix.
-    let mut buf = String::new();
+    // Track the leading `$` separately — NEVER push into the letter buffer.
+    let mut leading_dollar = false;
     if chars.peek() == Some(&'$') {
-        buf.push('$');
+        leading_dollar = true;
         chars.next();
     }
-    // Letter prefix.
+
+    // Letter prefix: ASCII letters and underscore.
+    let mut letters = String::new();
     while let Some(&c) = chars.peek() {
         if c.is_ascii_alphabetic() || c == '_' {
-            buf.push(c);
+            letters.push(c);
             chars.next();
         } else {
             break;
         }
     }
 
-    // Decide if this is a cell-ref candidate: starts with `[$]` + letters and the next char
-    // is either `$` then digits, or directly digits. The row-side `$` is tracked separately
-    // via `saw_row_dollar`; it must NOT be pushed into `buf` (which holds the LETTER prefix
-    // for `classify_letter_prefix`).
-    let mut saw_row_dollar = false;
+    // Optional `$` between letters and digits (row-absolute marker).
+    let mut mid_dollar = false;
     if chars.peek() == Some(&'$') {
-        saw_row_dollar = true;
+        mid_dollar = true;
         chars.next();
     }
 
-    // If we now see digits, this is a CellRef or BareRow. Identifiers with embedded digits
-    // are NOT supported (Excel named refs allow trailing digits — that's a Phase 3+ feature
-    // to track in the lexer; for Phase 0 minimum, an identifier with trailing digits would
-    // be parsed as `Ident("..." ) + Number` and the parser would reject).
-    if let Some(&c) = chars.peek() {
-        if c.is_ascii_digit() {
-            // We're committed: parse the row digits.
-            let mut row_digits = String::new();
-            while let Some(&d) = chars.peek() {
-                if d.is_ascii_digit() {
-                    row_digits.push(d);
-                    chars.next();
-                } else {
-                    break;
-                }
+    // If digits follow, we're committed to a CellRef / BareRow form.
+    if chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+        let mut row_digits = String::new();
+        while let Some(&d) = chars.peek() {
+            if d.is_ascii_digit() {
+                row_digits.push(d);
+                chars.next();
+            } else {
+                break;
             }
-
-            // Parse the letter part from `buf` to extract col + abs_col, then assemble.
-            let parts = classify_letter_prefix(&buf)?;
-            let row_1based: u32 = row_digits
-                .parse()
-                .map_err(|_| LexError::RowTooLarge(row_digits.clone()))?;
-            if row_1based == 0 {
-                return Err(LexError::InvalidNumber(format!(
-                    "row 0 not allowed: {row_digits}"
-                )));
-            }
-            let row = row_1based - 1;
-            if row > MAX_ROW {
-                return Err(LexError::RowTooLarge(row_digits));
-            }
-
-            match parts {
-                LetterClass::Identifier(text) => {
-                    // We had an identifier but then saw digits — Phase 0 doesn't support
-                    // identifier-with-trailing-digits. Re-emit the identifier and the number
-                    // separately? Simpler: error out for now.
-                    Err(LexError::UnexpectedChar(text.chars().next().unwrap_or('?')))
-                }
-                LetterClass::CellLetters { col, abs_col } => Ok(Token::CellRef {
-                    col,
-                    row,
-                    abs_col,
-                    abs_row: saw_row_dollar,
-                }),
-                LetterClass::None => {
-                    // Pure `[$]<digits>` form → BareRow.
-                    Ok(Token::BareRow {
-                        row,
-                        abs: saw_row_dollar,
-                    })
-                }
-            }
-        } else {
-            // No digits — classify the letter prefix.
-            classify_to_token(&buf, saw_row_dollar)
         }
-    } else {
-        // EOF after the letter run.
-        classify_to_token(&buf, saw_row_dollar)
-    }
-}
 
-enum LetterClass {
-    /// Looks like a cell column (`A`, `AA`, `$XFD`). Includes the abs marker.
-    CellLetters { col: u32, abs_col: bool },
-    /// Looks like an identifier (longer than column-letter cap, contains underscore, etc.).
-    Identifier(String),
-    /// No letters at all (the `$<digits>` form). Used to disambiguate `$1` as BareRow.
-    None,
-}
+        let row_1based: u32 = row_digits
+            .parse()
+            .map_err(|_| LexError::RowTooLarge(row_digits.clone()))?;
+        if row_1based == 0 {
+            return Err(LexError::InvalidNumber(format!(
+                "row 0 not allowed: {row_digits}"
+            )));
+        }
+        let row = row_1based - 1;
+        if row > MAX_ROW {
+            return Err(LexError::RowTooLarge(row_digits));
+        }
 
-fn classify_letter_prefix(buf: &str) -> Result<LetterClass, LexError> {
-    if buf.is_empty() {
-        return Ok(LetterClass::None);
-    }
-    // Strip leading `$` for abs marker; check if any underscore + handle.
-    let (abs_col, rest) = if let Some(rest) = buf.strip_prefix('$') {
-        (true, rest)
-    } else {
-        (false, buf)
-    };
-    // If rest is empty (meaning `$` alone, then digits coming) → no letters.
-    if rest.is_empty() {
-        return Ok(LetterClass::None);
-    }
-    // Trailing `$` (the row-abs marker) must NOT be in `rest`; caller strips it before.
-    // If any underscore — it's an identifier.
-    if rest.contains('_') {
-        return Ok(LetterClass::Identifier(rest.to_string()));
-    }
-    // Pure ASCII letters → try as column letters. Length must be ≤ 3 (Excel max XFD).
-    if rest.chars().all(|c| c.is_ascii_alphabetic()) && rest.len() <= 3 {
-        // Convert column letters to 0-indexed column. A=0, Z=25, AA=26, AAA=702, XFD=16383.
-        let col = column_letters_to_index(rest)?;
-        Ok(LetterClass::CellLetters { col, abs_col })
-    } else {
-        Ok(LetterClass::Identifier(rest.to_string()))
-    }
-}
+        if letters.is_empty() {
+            // Pure `[$]<digits>` → BareRow. Excel allows this only inside a range. The
+            // absolute marker is the `leading_dollar` (the `$` that came BEFORE the digits).
+            // A `mid_dollar` here would mean the source was `$$5` which is invalid in Excel.
+            if mid_dollar {
+                return Err(LexError::UnexpectedChar('$'));
+            }
+            return Ok(Token::BareRow {
+                row,
+                abs: leading_dollar,
+            });
+        }
 
-fn classify_to_token(buf: &str, trailing_dollar: bool) -> Result<Token, LexError> {
-    // `trailing_dollar` only applies when the buf is actually a column-letter prefix and the
-    // next char wasn't a digit. Excel doesn't normally produce that — but defensively handle.
-    let (abs_col, rest) = if let Some(r) = buf.strip_prefix('$') {
-        (true, r)
+        // letters + digits → CellRef. The raw `text` field is preserved so the parser can
+        // disambiguate function calls (`LOG10(2)` → CellRef + LParen; parser looks up text
+        // as a function name on encountering LParen). Excel-canonical: lexer emits CellRef
+        // for `[col-letters][row-digits]`; parser overrides when `(` follows.
+        let raw_text = format!(
+            "{}{}{}{}",
+            if leading_dollar { "$" } else { "" },
+            letters,
+            if mid_dollar { "$" } else { "" },
+            row_digits
+        );
+        let parts = classify_letter_prefix_simple(&letters)?;
+        Ok(Token::CellRef {
+            col: parts.col,
+            row,
+            abs_col: leading_dollar,
+            abs_row: mid_dollar,
+            text: Arc::from(raw_text),
+        })
     } else {
-        (false, buf)
-    };
-    if rest.is_empty() {
-        return Err(LexError::UnexpectedChar('$'));
-    }
-    // Identifier path: anything with underscore OR length > 3.
-    if rest.contains('_') || rest.len() > 3 || rest.chars().any(|c| !c.is_ascii_alphabetic()) {
-        if trailing_dollar {
+        // No trailing digits — either an identifier or a bare column.
+        // `mid_dollar = true` here means we saw `<letters>$<non-digit>` — invalid in Excel.
+        if mid_dollar {
             return Err(LexError::UnexpectedChar('$'));
         }
-        return Ok(Token::Ident(Arc::from(rest)));
+        if letters.is_empty() {
+            // `$` alone with nothing after.
+            return Err(LexError::UnexpectedChar('$'));
+        }
+        // Try column-letter interpretation (length 1-3, all ASCII alpha, value ≤ XFD).
+        let raw_text = if leading_dollar {
+            format!("${letters}")
+        } else {
+            letters.clone()
+        };
+        if letters.chars().all(|c| c.is_ascii_alphabetic()) && letters.len() <= 3 {
+            // Try as column letters. If it fits, emit BareColumn; otherwise treat as Ident.
+            if let Ok(col) = column_letters_to_index(&letters) {
+                return Ok(Token::BareColumn {
+                    col,
+                    abs: leading_dollar,
+                    text: Arc::from(raw_text),
+                });
+            }
+        }
+        // Identifier path. Identifiers cannot carry a `$` prefix in Excel.
+        if leading_dollar {
+            return Err(LexError::UnexpectedChar('$'));
+        }
+        Ok(Token::Ident(Arc::from(letters)))
     }
-    // 1-3 ASCII letters: try column letters.
-    let col = column_letters_to_index(rest)?;
-    // No digits seen — this is a BareColumn (e.g. `A:A` left half).
-    Ok(Token::BareColumn {
-        col,
-        abs: abs_col || trailing_dollar,
-    })
+}
+
+/// Simple classifier — letters-only (no `$` prefix; that's tracked separately by the caller).
+/// Returns the column index for valid 1-3 letter column-letter sequences; errors for too-long
+/// or non-alpha. The caller has already filtered out the `$` prefix.
+struct LetterColumn {
+    col: u32,
+}
+
+fn classify_letter_prefix_simple(letters: &str) -> Result<LetterColumn, LexError> {
+    if letters.is_empty() || letters.len() > 3 {
+        return Err(LexError::ColumnTooLarge(letters.to_string()));
+    }
+    if !letters.chars().all(|c| c.is_ascii_alphabetic()) {
+        return Err(LexError::ColumnTooLarge(letters.to_string()));
+    }
+    let col = column_letters_to_index(letters)?;
+    Ok(LetterColumn { col })
 }
 
 /// Convert Excel column letters (case-insensitive, 1-3 letters) into 0-indexed column.
@@ -569,85 +557,169 @@ mod tests {
 
     // -- cell refs -------------------------------------------------------------
 
+    fn assert_cellref(
+        toks: &[Token],
+        col: u32,
+        row: u32,
+        abs_col: bool,
+        abs_row: bool,
+        text: &str,
+    ) {
+        assert_eq!(toks.len(), 1, "expected single token, got {toks:?}");
+        match &toks[0] {
+            Token::CellRef {
+                col: c,
+                row: r,
+                abs_col: ac,
+                abs_row: ar,
+                text: t,
+            } => {
+                assert_eq!(
+                    (*c, *r, *ac, *ar, t.as_ref()),
+                    (col, row, abs_col, abs_row, text),
+                    "CellRef mismatch"
+                );
+            }
+            other => panic!("expected CellRef, got {other:?}"),
+        }
+    }
+
     #[test]
     fn cellref_basic() {
-        assert_eq!(
-            lex_ok("A1"),
-            vec![Token::CellRef {
-                col: 0,
-                row: 0,
-                abs_col: false,
-                abs_row: false
-            }]
-        );
-        assert_eq!(
-            lex_ok("B2"),
-            vec![Token::CellRef {
-                col: 1,
-                row: 1,
-                abs_col: false,
-                abs_row: false
-            }]
-        );
-        assert_eq!(
-            lex_ok("XFD1048576"),
-            vec![Token::CellRef {
-                col: MAX_COLUMN,
-                row: MAX_ROW,
-                abs_col: false,
-                abs_row: false
-            }]
+        assert_cellref(&lex_ok("A1"), 0, 0, false, false, "A1");
+        assert_cellref(&lex_ok("B2"), 1, 1, false, false, "B2");
+        assert_cellref(
+            &lex_ok("XFD1048576"),
+            MAX_COLUMN,
+            MAX_ROW,
+            false,
+            false,
+            "XFD1048576",
         );
     }
 
     #[test]
     fn cellref_absolute_markers() {
-        assert_eq!(
-            lex_ok("$A1"),
-            vec![Token::CellRef {
-                col: 0,
-                row: 0,
-                abs_col: true,
-                abs_row: false
-            }]
-        );
-        assert_eq!(
-            lex_ok("A$1"),
-            vec![Token::CellRef {
-                col: 0,
-                row: 0,
-                abs_col: false,
-                abs_row: true
-            }]
-        );
-        assert_eq!(
-            lex_ok("$A$1"),
-            vec![Token::CellRef {
-                col: 0,
-                row: 0,
-                abs_col: true,
-                abs_row: true
-            }]
-        );
+        assert_cellref(&lex_ok("$A1"), 0, 0, true, false, "$A1");
+        assert_cellref(&lex_ok("A$1"), 0, 0, false, true, "A$1");
+        assert_cellref(&lex_ok("$A$1"), 0, 0, true, true, "$A$1");
     }
 
     #[test]
     fn cellref_case_insensitive_column() {
-        assert_eq!(
-            lex_ok("a1"),
-            vec![Token::CellRef {
-                col: 0,
-                row: 0,
-                abs_col: false,
-                abs_row: false
-            }]
-        );
+        assert_cellref(&lex_ok("a1"), 0, 0, false, false, "a1");
     }
 
     #[test]
     fn cellref_row_zero_rejected() {
         // Excel rows are 1-indexed; "A0" is invalid.
         assert!(lex("A0").is_err());
+    }
+
+    // -- F1/B-2 regression: $<digits> bare-row absolute marker -----------------
+    // Prior bug (codex r13 / opus arch F1 / opus consistency B-2): leading $ before
+    // digits was silently dropped from BareRow.abs. Lock the correct behavior.
+
+    #[test]
+    fn bare_row_absolute_marker_preserved() {
+        // `$5` (absolute row 5, only meaningful inside a range): abs MUST be true.
+        let toks = lex_ok("$5");
+        assert_eq!(toks, vec![Token::BareRow { row: 4, abs: true }]);
+    }
+
+    #[test]
+    fn bare_row_relative_marker_when_no_dollar() {
+        // No $ at all: shouldn't reach BareRow at all — bare digits route through the
+        // number lexer. Verify.
+        assert_eq!(lex_ok("5"), vec![Token::Number(5.0)]);
+    }
+
+    #[test]
+    fn whole_row_range_absolute_pattern() {
+        // `$1:$1` = absolute whole-row range. Both ends MUST carry abs:true.
+        let toks = lex_ok("$1:$1");
+        assert_eq!(
+            toks,
+            vec![
+                Token::BareRow { row: 0, abs: true },
+                Token::Colon,
+                Token::BareRow { row: 0, abs: true },
+            ]
+        );
+    }
+
+    #[test]
+    fn double_dollar_rejected() {
+        // `$$5` is not valid Excel syntax — reject at lex time.
+        assert!(matches!(lex("$$5"), Err(LexError::UnexpectedChar('$'))));
+    }
+
+    // -- N5: AI() reservation layering -----------------------------------------
+    // CORR-06 / T4-D05: parser intercepts `AI(...)` and emits Error(AINotAvailable).
+    // Lexer-level: `AI` is a regular 2-letter token (BareColumn), `AI(1)` is
+    // `[BareColumn(34), LParen, Number(1), RParen]`. Parser dispatches.
+
+    #[test]
+    fn ai_lexes_with_text_preserved() {
+        // The `text` field on BareColumn lets the parser detect "AI" + LParen and apply
+        // CORR-06 reservation without re-deriving the letters from `col`.
+        let toks = lex_ok("AI(1)");
+        assert_eq!(toks.len(), 4);
+        match &toks[0] {
+            Token::BareColumn {
+                col,
+                abs: false,
+                text,
+            } => {
+                assert_eq!(*col, 34); // A=1, I=9 → 1*26+9 = 35 → 0-indexed 34
+                assert_eq!(text.as_ref(), "AI");
+            }
+            other => panic!("expected BareColumn('AI'), got {other:?}"),
+        }
+        assert_eq!(toks[1], Token::LParen);
+        assert_eq!(toks[2], Token::Number(1.0));
+        assert_eq!(toks[3], Token::RParen);
+    }
+
+    // -- N6: function-name vs CellRef ambiguity (LOG10) ------------------------
+    // Excel-canonical: `LOG10` is BOTH a valid cell ref (col=8508, row=10) AND a function
+    // name. The lexer emits CellRef; the parser uses the `text` field to look up the
+    // function name when `LParen` follows.
+
+    #[test]
+    fn log10_lexes_as_cellref_with_text_for_parser() {
+        let toks = lex_ok("LOG10");
+        assert_eq!(toks.len(), 1);
+        match &toks[0] {
+            Token::CellRef {
+                col,
+                row,
+                abs_col: false,
+                abs_row: false,
+                text,
+            } => {
+                assert_eq!(*col, 8508);
+                assert_eq!(*row, 9); // row 10 in source = 0-indexed 9
+                assert_eq!(text.as_ref(), "LOG10");
+            }
+            other => panic!("expected CellRef('LOG10'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn log10_followed_by_lparen_preserves_text_for_function_dispatch() {
+        // LOG10(2) → [CellRef('LOG10'), LParen, Number(2), RParen]. Parser sees CellRef +
+        // LParen, checks `text` against a function table, builds Expr::Function {name: "LOG10",
+        // args: [Number(2)]}.
+        let toks = lex_ok("LOG10(2)");
+        assert_eq!(toks.len(), 4);
+        match &toks[0] {
+            Token::CellRef { text, .. } => assert_eq!(text.as_ref(), "LOG10"),
+            other => panic!("expected CellRef, got {other:?}"),
+        }
+        assert_eq!(toks[1], Token::LParen);
+        assert_eq!(toks[2], Token::Number(2.0));
+        assert_eq!(toks[3], Token::RParen);
     }
 
     #[test]
@@ -661,37 +733,53 @@ mod tests {
     #[test]
     fn range_two_cells() {
         // A1:B2 → CellRef, Colon, CellRef. The parser combines into RangeRef.
-        assert_eq!(
-            lex_ok("A1:B2"),
-            vec![
-                Token::CellRef {
-                    col: 0,
-                    row: 0,
-                    abs_col: false,
-                    abs_row: false
-                },
-                Token::Colon,
-                Token::CellRef {
-                    col: 1,
-                    row: 1,
-                    abs_col: false,
-                    abs_row: false
-                }
-            ]
-        );
+        let toks = lex_ok("A1:B2");
+        assert_eq!(toks.len(), 3);
+        assert!(matches!(
+            toks[0],
+            Token::CellRef {
+                col: 0,
+                row: 0,
+                abs_col: false,
+                abs_row: false,
+                ..
+            }
+        ));
+        assert_eq!(toks[1], Token::Colon);
+        assert!(matches!(
+            toks[2],
+            Token::CellRef {
+                col: 1,
+                row: 1,
+                abs_col: false,
+                abs_row: false,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn range_whole_column() {
         // A:A → BareColumn, Colon, BareColumn.
-        assert_eq!(
-            lex_ok("A:A"),
-            vec![
-                Token::BareColumn { col: 0, abs: false },
-                Token::Colon,
-                Token::BareColumn { col: 0, abs: false }
-            ]
-        );
+        let toks = lex_ok("A:A");
+        assert_eq!(toks.len(), 3);
+        assert!(matches!(
+            toks[0],
+            Token::BareColumn {
+                col: 0,
+                abs: false,
+                ..
+            }
+        ));
+        assert_eq!(toks[1], Token::Colon);
+        assert!(matches!(
+            toks[2],
+            Token::BareColumn {
+                col: 0,
+                abs: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -755,31 +843,36 @@ mod tests {
     fn formula_a_times_2() {
         // The Phase 0 OG-02 acceptance formula body: `A * 2` (caller strips the leading `=`).
         // Note: A standalone lexes as BareColumn since there's no row digit.
-        assert_eq!(
-            lex_ok("A * 2"),
-            vec![
-                Token::BareColumn { col: 0, abs: false },
-                Token::Op(Operator::Mul),
-                Token::Number(2.0)
-            ]
-        );
+        let toks = lex_ok("A * 2");
+        assert_eq!(toks.len(), 3);
+        assert!(matches!(
+            toks[0],
+            Token::BareColumn {
+                col: 0,
+                abs: false,
+                ..
+            }
+        ));
+        assert_eq!(toks[1], Token::Op(Operator::Mul));
+        assert_eq!(toks[2], Token::Number(2.0));
     }
 
     #[test]
     fn formula_a1_times_2() {
-        assert_eq!(
-            lex_ok("A1 * 2"),
-            vec![
-                Token::CellRef {
-                    col: 0,
-                    row: 0,
-                    abs_col: false,
-                    abs_row: false
-                },
-                Token::Op(Operator::Mul),
-                Token::Number(2.0)
-            ]
-        );
+        let toks = lex_ok("A1 * 2");
+        assert_eq!(toks.len(), 3);
+        assert!(matches!(
+            toks[0],
+            Token::CellRef {
+                col: 0,
+                row: 0,
+                abs_col: false,
+                abs_row: false,
+                ..
+            }
+        ));
+        assert_eq!(toks[1], Token::Op(Operator::Mul));
+        assert_eq!(toks[2], Token::Number(2.0));
     }
 
     #[test]
