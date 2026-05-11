@@ -1,0 +1,403 @@
+//! `ColumnStore` — chunked Arrow base + per-chunk sparse overlay.
+//!
+//! Per spec Part V §4 Week 2 Days 3-4:
+//! - Each column is `Vec<Arc<dyn arrow_array::Array>>` (one chunk per `chunk_rows` rows).
+//! - Each chunk has a parallel `SparseOverlay` for cell edits.
+//! - Default chunk size: 16,384 rows. Override via `QBOOK_CHUNK_ROWS` env var read once at
+//!   construction time. (Constant per ColumnStore — switching mid-life isn't supported.)
+//! - Read merge: overlay-first, base-fallback. Out-of-bounds reads return `Value::Blank`.
+//! - Chunk-replace, not cell-mutate: `replace_chunk(idx, new_array)` swaps a whole chunk's
+//!   base and clears its overlay. Used by recompute. Cell-level writes go through `put`.
+//! - Phase 0 base type: Float64Array. Boolean/Text base chunks come in Week 4+; for now the
+//!   `read_base` helper just handles the Float64 case and `Value::Blank` otherwise.
+
+use std::sync::Arc;
+
+use arrow_array::{Array, ArrayRef, Float64Array};
+use ql_types::{RowId, Value};
+
+use crate::overlay::SparseOverlay;
+
+/// Default chunk size in rows. Override via `QBOOK_CHUNK_ROWS` env var.
+pub const DEFAULT_CHUNK_ROWS: u32 = 16_384;
+
+/// Read `QBOOK_CHUNK_ROWS` from env once, with the default fallback.
+pub fn chunk_rows_from_env() -> u32 {
+    std::env::var("QBOOK_CHUNK_ROWS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_CHUNK_ROWS)
+}
+
+/// Chunked column with overlay. Invariants:
+/// - `base_chunks.len() == overlays.len()`.
+/// - Every chunk except possibly the last is exactly `chunk_rows` long.
+/// - Last chunk MAY be shorter (open-ended column; rows beyond it read as `Blank`).
+#[derive(Clone, Debug)]
+pub struct ColumnStore {
+    chunk_rows: u32,
+    base_chunks: Vec<ArrayRef>,
+    overlays: Vec<SparseOverlay>,
+}
+
+impl ColumnStore {
+    /// New empty column. Chunk size taken from `QBOOK_CHUNK_ROWS` env, default 16384.
+    pub fn new() -> Self {
+        Self::with_chunk_rows(chunk_rows_from_env())
+    }
+
+    /// New empty column with an explicit chunk size. Tests use this to exercise boundaries
+    /// with small chunks.
+    pub fn with_chunk_rows(chunk_rows: u32) -> Self {
+        assert!(chunk_rows > 0, "chunk_rows must be > 0");
+        Self {
+            chunk_rows,
+            base_chunks: Vec::new(),
+            overlays: Vec::new(),
+        }
+    }
+
+    /// Construct from a vector of base chunks (typically the import path).
+    /// Each chunk gets an empty overlay; chunk-rows is taken from the first chunk's length
+    /// (or the explicit param if no chunks yet).
+    pub fn from_chunks(chunk_rows: u32, base_chunks: Vec<ArrayRef>) -> Self {
+        let overlays = base_chunks.iter().map(|_| SparseOverlay::new()).collect();
+        Self {
+            chunk_rows,
+            base_chunks,
+            overlays,
+        }
+    }
+
+    /// Effective chunk size for this column.
+    pub fn chunk_rows(&self) -> u32 {
+        self.chunk_rows
+    }
+
+    /// Number of chunks.
+    pub fn chunk_count(&self) -> usize {
+        self.base_chunks.len()
+    }
+
+    /// Total addressable row count = sum of base chunk lengths. Out-of-bounds reads beyond
+    /// this still return `Value::Blank` (the column is logically open-ended at the top).
+    pub fn row_count(&self) -> u64 {
+        self.base_chunks.iter().map(|c| c.len() as u64).sum()
+    }
+
+    /// Read a single cell. Out-of-bounds returns `Value::Blank`.
+    pub fn read(&self, row: RowId) -> Value {
+        let (chunk_idx, rel_row) = self.locate(row);
+        if chunk_idx >= self.base_chunks.len() {
+            return Value::Blank;
+        }
+        // Overlay first.
+        if let Some(v) = self.overlays[chunk_idx].get(rel_row) {
+            return v.clone();
+        }
+        // Base second.
+        let base = &self.base_chunks[chunk_idx];
+        if (rel_row as usize) >= base.len() {
+            // Within an under-sized last chunk's tail: read as Blank.
+            return Value::Blank;
+        }
+        read_base(base.as_ref(), rel_row)
+    }
+
+    /// Write a cell via the overlay. Chunk autogrowth: if `row` is beyond all current chunks,
+    /// allocate enough empty chunks to cover it (each new chunk is a `Float64Array` of NaN-bit
+    /// pattern; the overlay carries the real value). This matches the spreadsheet "open
+    /// column" model: writing into A1000 of an empty column creates the chunks containing it.
+    pub fn put(&mut self, row: RowId, value: Value) {
+        let (chunk_idx, rel_row) = self.locate(row);
+        // Allocate empty chunks up to chunk_idx if needed.
+        while chunk_idx >= self.base_chunks.len() {
+            self.base_chunks.push(empty_chunk(self.chunk_rows));
+            self.overlays.push(SparseOverlay::new());
+        }
+        self.overlays[chunk_idx].put(rel_row, value);
+    }
+
+    /// Replace an entire chunk's base with a new Arrow array, clearing the overlay for that
+    /// chunk. Used by the recompute path: the new base is the materialized result column.
+    /// Panics if `chunk_idx` is out of bounds. Does NOT check that the new array's len matches
+    /// `chunk_rows` — the last chunk MAY be shorter.
+    pub fn replace_chunk(&mut self, chunk_idx: usize, new_base: ArrayRef) {
+        self.base_chunks[chunk_idx] = new_base;
+        self.overlays[chunk_idx].clear();
+    }
+
+    /// Append a new base chunk (with an empty overlay). Used during initial column build.
+    pub fn append_chunk(&mut self, base: ArrayRef) {
+        self.base_chunks.push(base);
+        self.overlays.push(SparseOverlay::new());
+    }
+
+    /// Borrow a chunk's base array. Useful for direct kernel access on the hot path.
+    pub fn base_chunk(&self, chunk_idx: usize) -> Option<&ArrayRef> {
+        self.base_chunks.get(chunk_idx)
+    }
+
+    /// Borrow a chunk's overlay. Useful for compaction passes that re-materialize base+overlay.
+    pub fn overlay(&self, chunk_idx: usize) -> Option<&SparseOverlay> {
+        self.overlays.get(chunk_idx)
+    }
+
+    /// Locate `(chunk_idx, rel_row)` for an absolute `row`.
+    fn locate(&self, row: RowId) -> (usize, RowId) {
+        let chunk_idx = (row / self.chunk_rows) as usize;
+        let rel_row = row % self.chunk_rows;
+        (chunk_idx, rel_row)
+    }
+}
+
+impl Default for ColumnStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Read a single value from a base Arrow array at chunk-relative `rel_row`. Phase 0 only
+/// handles `Float64Array` (matches the acceptance bench); other base types read as `Blank`
+/// until ql-storage supports them in later phases.
+fn read_base(base: &dyn Array, rel_row: RowId) -> Value {
+    if let Some(arr) = base.as_any().downcast_ref::<Float64Array>() {
+        let idx = rel_row as usize;
+        if idx >= arr.len() {
+            return Value::Blank;
+        }
+        if arr.is_null(idx) {
+            return Value::Blank;
+        }
+        // Use the safe Value::number constructor — sanitizes NaN/Inf into #NUM!.
+        return Value::number(arr.value(idx));
+    }
+    Value::Blank
+}
+
+/// Construct an empty chunk of `chunk_rows` length, filled with nulls. Used by `put`'s
+/// autogrowth path. Stored as a nullable Float64Array (Phase 0 base type); the overlay
+/// carries the real value where one was written.
+fn empty_chunk(chunk_rows: u32) -> ArrayRef {
+    let null_iter = (0..chunk_rows).map(|_| None::<f64>);
+    Arc::new(Float64Array::from_iter(null_iter)) as ArrayRef
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ql_types::ErrorValue;
+
+    fn float64_chunk(values: &[f64]) -> ArrayRef {
+        Arc::new(Float64Array::from(values.to_vec())) as ArrayRef
+    }
+
+    // -- chunk_rows_from_env ---------------------------------------------------
+
+    #[test]
+    fn chunk_rows_default_when_env_unset() {
+        std::env::remove_var("QBOOK_CHUNK_ROWS");
+        assert_eq!(chunk_rows_from_env(), DEFAULT_CHUNK_ROWS);
+    }
+
+    // -- ColumnStore construction ----------------------------------------------
+
+    #[test]
+    fn new_is_empty() {
+        let c = ColumnStore::with_chunk_rows(16);
+        assert_eq!(c.chunk_count(), 0);
+        assert_eq!(c.row_count(), 0);
+        assert_eq!(c.read(0), Value::Blank);
+        assert_eq!(c.read(999_999), Value::Blank);
+    }
+
+    #[test]
+    fn from_chunks_initializes_overlays() {
+        let c = ColumnStore::from_chunks(4, vec![float64_chunk(&[1.0, 2.0, 3.0, 4.0])]);
+        assert_eq!(c.chunk_count(), 1);
+        assert_eq!(c.row_count(), 4);
+        assert_eq!(c.overlay(0).unwrap().len(), 0);
+    }
+
+    // -- read base path --------------------------------------------------------
+
+    #[test]
+    fn read_first_chunk_base() {
+        let c = ColumnStore::from_chunks(4, vec![float64_chunk(&[10.0, 20.0, 30.0, 40.0])]);
+        assert_eq!(c.read(0), Value::Number(10.0));
+        assert_eq!(c.read(1), Value::Number(20.0));
+        assert_eq!(c.read(3), Value::Number(40.0));
+    }
+
+    #[test]
+    fn read_crosses_chunks() {
+        let c = ColumnStore::from_chunks(
+            4,
+            vec![
+                float64_chunk(&[1.0, 2.0, 3.0, 4.0]),
+                float64_chunk(&[5.0, 6.0, 7.0, 8.0]),
+            ],
+        );
+        assert_eq!(c.read(3), Value::Number(4.0)); // last of chunk 0
+        assert_eq!(c.read(4), Value::Number(5.0)); // first of chunk 1
+        assert_eq!(c.read(7), Value::Number(8.0));
+        assert_eq!(c.read(8), Value::Blank); // beyond
+    }
+
+    #[test]
+    fn read_short_last_chunk_tail_is_blank() {
+        // Last chunk has 2 values; capacity 4. Rows 2, 3 read as Blank.
+        let c = ColumnStore::from_chunks(4, vec![float64_chunk(&[1.0, 2.0])]);
+        assert_eq!(c.read(0), Value::Number(1.0));
+        assert_eq!(c.read(1), Value::Number(2.0));
+        assert_eq!(c.read(2), Value::Blank);
+        assert_eq!(c.read(3), Value::Blank);
+    }
+
+    #[test]
+    fn read_base_nan_returns_num_error() {
+        // Bare NaN in the base array → Value::number sanitizes to #NUM!.
+        let c = ColumnStore::from_chunks(4, vec![float64_chunk(&[f64::NAN, 1.0, 2.0, 3.0])]);
+        assert_eq!(c.read(0), Value::Error(ErrorValue::Num));
+        assert_eq!(c.read(1), Value::Number(1.0));
+    }
+
+    // -- overlay precedence ----------------------------------------------------
+
+    #[test]
+    fn overlay_takes_precedence_over_base() {
+        let mut c = ColumnStore::from_chunks(4, vec![float64_chunk(&[1.0, 2.0, 3.0, 4.0])]);
+        c.put(1, Value::Number(99.0));
+        assert_eq!(c.read(1), Value::Number(99.0));
+        assert_eq!(c.read(0), Value::Number(1.0)); // others untouched
+        assert_eq!(c.read(2), Value::Number(3.0));
+    }
+
+    #[test]
+    fn overlay_supports_heterogeneous_value() {
+        let mut c = ColumnStore::from_chunks(4, vec![float64_chunk(&[1.0, 2.0, 3.0, 4.0])]);
+        c.put(0, Value::text("oops"));
+        c.put(1, Value::Boolean(true));
+        c.put(2, Value::Error(ErrorValue::Ref));
+        c.put(3, Value::Blank);
+        assert_eq!(c.read(0), Value::text("oops"));
+        assert_eq!(c.read(1), Value::Boolean(true));
+        assert_eq!(c.read(2), Value::Error(ErrorValue::Ref));
+        assert_eq!(c.read(3), Value::Blank);
+    }
+
+    // -- put autogrowth --------------------------------------------------------
+
+    #[test]
+    fn put_into_empty_column_autogrows_chunks() {
+        let mut c = ColumnStore::with_chunk_rows(4);
+        // Writing to row 10 → needs chunks 0, 1, 2 (chunk_idx 2 covers rows 8..12).
+        c.put(10, Value::Number(123.0));
+        assert_eq!(c.chunk_count(), 3);
+        assert_eq!(c.read(10), Value::Number(123.0));
+        // Surrounding rows in those chunks: base is null → Blank.
+        assert_eq!(c.read(0), Value::Blank);
+        assert_eq!(c.read(9), Value::Blank);
+        assert_eq!(c.read(11), Value::Blank);
+    }
+
+    // -- replace_chunk ---------------------------------------------------------
+
+    #[test]
+    fn replace_chunk_swaps_base_clears_overlay() {
+        let mut c = ColumnStore::from_chunks(4, vec![float64_chunk(&[1.0, 2.0, 3.0, 4.0])]);
+        c.put(2, Value::Number(99.0));
+        assert_eq!(c.read(2), Value::Number(99.0));
+        c.replace_chunk(0, float64_chunk(&[100.0, 200.0, 300.0, 400.0]));
+        // Overlay is cleared; new base shows through.
+        assert_eq!(c.read(2), Value::Number(300.0));
+        assert_eq!(c.read(0), Value::Number(100.0));
+        assert_eq!(c.overlay(0).unwrap().len(), 0);
+    }
+
+    // -- locate ----------------------------------------------------------------
+
+    #[test]
+    fn locate_at_chunk_boundary() {
+        // Boundary math via behavior: reads at boundary multiples must dispatch correctly.
+        // Construct 3 chunks of 16 each (=48 rows), populate at boundary cells.
+        let mut c = ColumnStore::from_chunks(
+            16,
+            vec![
+                float64_chunk(&[0.0; 16]),
+                float64_chunk(&[0.0; 16]),
+                float64_chunk(&[0.0; 16]),
+            ],
+        );
+        c.put(0, Value::Number(1.0));
+        c.put(15, Value::Number(2.0));
+        c.put(16, Value::Number(3.0));
+        c.put(31, Value::Number(4.0));
+        c.put(32, Value::Number(5.0));
+        c.put(47, Value::Number(6.0));
+        assert_eq!(c.read(0), Value::Number(1.0));
+        assert_eq!(c.read(15), Value::Number(2.0));
+        assert_eq!(c.read(16), Value::Number(3.0));
+        assert_eq!(c.read(31), Value::Number(4.0));
+        assert_eq!(c.read(32), Value::Number(5.0));
+        assert_eq!(c.read(47), Value::Number(6.0));
+        // sanity: locate via behavior — 47 is in chunk 2 with rel_row 15
+    }
+
+    #[test]
+    fn append_chunk_grows_correctly() {
+        let mut c = ColumnStore::with_chunk_rows(4);
+        c.append_chunk(float64_chunk(&[1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(c.chunk_count(), 1);
+        c.append_chunk(float64_chunk(&[5.0, 6.0, 7.0, 8.0]));
+        assert_eq!(c.chunk_count(), 2);
+        assert_eq!(c.read(7), Value::Number(8.0));
+    }
+
+    // -- proptest --------------------------------------------------------------
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Invariant: read(row) after put(row, v) returns v, regardless of:
+        ///   - chunk size (1..1024)
+        ///   - row offset (0..100_000)
+        ///   - intermediate edits to other rows
+        ///   - heterogeneous value variants
+        #[test]
+        fn put_then_read_round_trips(
+            chunk_rows in 1u32..1024,
+            row in 0u32..100_000,
+            other_rows in proptest::collection::vec(0u32..100_000, 0..16),
+            // Heterogeneous Value (no NaN/Inf — Value::number sanitizes those).
+            n in proptest::num::f64::POSITIVE | proptest::num::f64::NEGATIVE | proptest::num::f64::ZERO,
+            b in any::<bool>(),
+        ) {
+            let mut c = ColumnStore::with_chunk_rows(chunk_rows);
+            // Apply other writes first.
+            for r in other_rows {
+                c.put(r, Value::Number(b as i32 as f64));
+            }
+            let v = if b { Value::Number(n) } else { Value::Boolean(false) };
+            c.put(row, v.clone());
+            // After v's put, read(row) must equal v EVEN IF a later other-row write
+            // was at `row` (proptest doesn't guarantee uniqueness). We re-put just before
+            // the read to lock the value.
+            c.put(row, v.clone());
+            // Sanitize NaN/Inf to match Value::number's semantics.
+            let expected = match &v {
+                Value::Number(x) if x.is_nan() || x.is_infinite() => Value::Error(ErrorValue::Num),
+                _ => v.clone(),
+            };
+            let got = c.read(row);
+            prop_assert!(got == expected || got == v, "got {got:?}, expected {expected:?} or {v:?}");
+        }
+
+        /// Invariant: read(row) for a never-written row is Value::Blank when the column has
+        /// no chunks, regardless of row.
+        #[test]
+        fn read_empty_column_is_blank(row in 0u32..1_000_000) {
+            let c = ColumnStore::with_chunk_rows(16);
+            prop_assert_eq!(c.read(row), Value::Blank);
+        }
+    }
+}

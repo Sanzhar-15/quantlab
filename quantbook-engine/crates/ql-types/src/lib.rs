@@ -1,20 +1,23 @@
 //! `ql-types` — Phase 0 minimum cell-value types for the Quantbook engine.
 //!
-//! Three modules, one shape:
+//! Four modules, one shape:
 //! - [`error`] — the 14-variant `ErrorValue` (Excel sigils + Quantbook-specific surfaces + AI reservation).
 //! - [`value`] — the 5-variant `Value` (`Blank | Number | Boolean | Text | Error`).
 //! - [`coercion`] — Excel-compatible boundary functions: `to_number_{strict,lenient}`,
 //!   `to_logical`, `to_text_for_{display,formula}`, `sanitize_f64`.
+//! - [`address`] — cell coordinate types: `SheetId`, `RowId`, `ColId`, `Address`, `Range`.
 //!
 //! Spec: `.plans/_QUANTBOOK-v1-SPECIFICATION.md` Part V §2 Week 2 Day 1-2.
 //!
 //! Phase 0 does NOT model `Int`, `Date`, `Time`, `Array`, `Pending` — those come later as
 //! `ql-functions` and `ql-formula-semantics` need them. Stick to the five variants until then.
 
+pub mod address;
 pub mod coercion;
 pub mod error;
 pub mod value;
 
+pub use address::{Address, ColId, Range, RowId, SheetId};
 pub use coercion::{
     sanitize_f64, to_logical, to_number_lenient, to_number_strict, to_text_for_display,
     to_text_for_formula,

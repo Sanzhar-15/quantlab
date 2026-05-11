@@ -1,0 +1,206 @@
+//! `Sheet` — a 2D collection of columns + dimension tracking.
+//!
+//! Per spec Part V §4 Week 2 Days 3-4:
+//! - `columns: Vec<ColumnStore>`.
+//! - `dimensions: Bounds` tracking the largest (row, col) ever written, conservative.
+//! - Open-ended: reading a cell beyond `dimensions` returns `Value::Blank` (matches Excel).
+
+use ql_types::{ColId, RowId, Value};
+
+use crate::column::ColumnStore;
+
+/// Conservative dimension tracking: max row and max col ever touched. Reads beyond return
+/// `Blank` either way; `Bounds` exists for serialization + UI viewport sizing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Bounds {
+    /// One past the largest row ever written. Zero on an empty sheet.
+    pub row_extent: RowId,
+    /// One past the largest column ever touched.
+    pub col_extent: ColId,
+}
+
+/// A single sheet. Columns are independent `ColumnStore`s; the sheet owns them.
+#[derive(Clone, Debug, Default)]
+pub struct Sheet {
+    name: String,
+    columns: Vec<ColumnStore>,
+    bounds: Bounds,
+    chunk_rows: u32,
+}
+
+impl Sheet {
+    /// New empty sheet with the given name. Chunk size from env (or default).
+    pub fn new(name: impl Into<String>) -> Self {
+        Self::with_chunk_rows(name, crate::column::chunk_rows_from_env())
+    }
+
+    /// New empty sheet with an explicit chunk size — useful for tests.
+    pub fn with_chunk_rows(name: impl Into<String>, chunk_rows: u32) -> Self {
+        Self {
+            name: name.into(),
+            columns: Vec::new(),
+            bounds: Bounds::default(),
+            chunk_rows,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn bounds(&self) -> Bounds {
+        self.bounds
+    }
+
+    pub fn column_count(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// Borrow a column. None if `col` ≥ existing column count.
+    pub fn column(&self, col: ColId) -> Option<&ColumnStore> {
+        self.columns.get(col as usize)
+    }
+
+    /// Read a single cell. Out-of-bounds row/col reads as `Value::Blank`.
+    pub fn read(&self, row: RowId, col: ColId) -> Value {
+        match self.columns.get(col as usize) {
+            Some(c) => c.read(row),
+            None => Value::Blank,
+        }
+    }
+
+    /// Write a cell. Autogrows columns as needed; updates bounds.
+    pub fn put(&mut self, row: RowId, col: ColId, value: Value) {
+        let col_idx = col as usize;
+        while self.columns.len() <= col_idx {
+            self.columns
+                .push(ColumnStore::with_chunk_rows(self.chunk_rows));
+        }
+        self.columns[col_idx].put(row, value);
+        // Update bounds (one past max).
+        if row + 1 > self.bounds.row_extent {
+            self.bounds.row_extent = row + 1;
+        }
+        if col + 1 > self.bounds.col_extent {
+            self.bounds.col_extent = col + 1;
+        }
+    }
+
+    /// Append a fully-constructed column at the next column index. Used by xlsx import or
+    /// bench-fixture loading.
+    pub fn append_column(&mut self, column: ColumnStore) {
+        let col_idx = self.columns.len() as ColId;
+        let row_extent = column.row_count() as RowId;
+        self.columns.push(column);
+        if col_idx + 1 > self.bounds.col_extent {
+            self.bounds.col_extent = col_idx + 1;
+        }
+        if row_extent > self.bounds.row_extent {
+            self.bounds.row_extent = row_extent;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::column::ColumnStore;
+    use ql_types::ErrorValue;
+    use std::sync::Arc;
+
+    fn col_with(values: &[f64]) -> ColumnStore {
+        let arr: Arc<dyn arrow_array::Array> =
+            Arc::new(arrow_array::Float64Array::from(values.to_vec()));
+        ColumnStore::from_chunks(values.len() as u32, vec![arr])
+    }
+
+    #[test]
+    fn empty_sheet_reads_blank_everywhere() {
+        let s = Sheet::new("Sheet1");
+        assert_eq!(s.name(), "Sheet1");
+        assert_eq!(s.column_count(), 0);
+        assert_eq!(s.bounds(), Bounds::default());
+        assert_eq!(s.read(0, 0), Value::Blank);
+        assert_eq!(s.read(999, 999), Value::Blank);
+    }
+
+    #[test]
+    fn put_grows_columns_and_bounds() {
+        let mut s = Sheet::with_chunk_rows("S", 4);
+        s.put(5, 2, Value::Number(42.0));
+        assert_eq!(s.column_count(), 3); // columns 0, 1, 2 allocated
+        assert_eq!(
+            s.bounds(),
+            Bounds {
+                row_extent: 6,
+                col_extent: 3
+            }
+        );
+        assert_eq!(s.read(5, 2), Value::Number(42.0));
+        // Empty cells in the new columns:
+        assert_eq!(s.read(0, 0), Value::Blank);
+        assert_eq!(s.read(5, 0), Value::Blank);
+    }
+
+    #[test]
+    fn append_column_updates_bounds() {
+        let mut s = Sheet::with_chunk_rows("S", 4);
+        s.append_column(col_with(&[1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(s.column_count(), 1);
+        assert_eq!(
+            s.bounds(),
+            Bounds {
+                row_extent: 4,
+                col_extent: 1
+            }
+        );
+        s.append_column(col_with(&[10.0, 20.0]));
+        assert_eq!(s.column_count(), 2);
+        // row_extent grows to max
+        assert_eq!(
+            s.bounds(),
+            Bounds {
+                row_extent: 4,
+                col_extent: 2
+            }
+        );
+        assert_eq!(s.read(0, 0), Value::Number(1.0));
+        assert_eq!(s.read(1, 1), Value::Number(20.0));
+        assert_eq!(s.read(2, 1), Value::Blank); // beyond short column
+    }
+
+    #[test]
+    fn bounds_never_shrinks() {
+        let mut s = Sheet::with_chunk_rows("S", 4);
+        s.put(10, 5, Value::Number(1.0));
+        assert_eq!(
+            s.bounds(),
+            Bounds {
+                row_extent: 11,
+                col_extent: 6
+            }
+        );
+        // Writing a lower-row value doesn't shrink bounds.
+        s.put(0, 0, Value::Number(2.0));
+        assert_eq!(
+            s.bounds(),
+            Bounds {
+                row_extent: 11,
+                col_extent: 6
+            }
+        );
+    }
+
+    #[test]
+    fn heterogeneous_writes_per_column() {
+        let mut s = Sheet::with_chunk_rows("S", 4);
+        s.put(0, 0, Value::Number(1.0));
+        s.put(0, 1, Value::Boolean(true));
+        s.put(0, 2, Value::text("hi"));
+        s.put(0, 3, Value::Error(ErrorValue::Ref));
+        assert_eq!(s.read(0, 0), Value::Number(1.0));
+        assert_eq!(s.read(0, 1), Value::Boolean(true));
+        assert_eq!(s.read(0, 2), Value::text("hi"));
+        assert_eq!(s.read(0, 3), Value::Error(ErrorValue::Ref));
+    }
+}

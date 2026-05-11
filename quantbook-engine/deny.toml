@@ -17,6 +17,9 @@ ignore = []
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace-internal `path = "../foo"` deps appear to cargo-deny as wildcards because they
+# have no version specifier. They're not actually a supply-chain wildcard. Allow them.
+allow-wildcard-paths = true
 highlight = "all"
 # Allow specific multiple-versions where the resolver insists; track and reduce.
 allow = []
