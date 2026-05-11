@@ -5,12 +5,34 @@
 //! - `names: NameTable` — workbook-level defined names. Phase 0 ships an empty stub; full
 //!   resolution + scoping lands with `ql-formula-semantics` in Week 2 Day 6+.
 
-use ql_types::{Address, ColId, RowId, SheetId, Value};
+use ql_types::{Address, ColId, Range, RowId, SheetId, Value};
 
 use crate::sheet::Sheet;
 
-/// Defined-names table. Phase 0 stub — entries are workbook-scope only; sheet-scope arrives
-/// with `ql-formula-semantics`.
+/// What a defined name resolves to.
+///
+/// Per codex r13 N9 + opus arch F5: the prior `lookup -> Option<Address>` couldn't represent
+/// the common Excel defined-name targets (range, constant, formula). The shape was a wrong
+/// stub that would force a breaking change in Week 3 ql-calcgraph binding. Widening to the
+/// enum NOW is non-breaking later — calcgraph callers pattern-match on the variant they need.
+///
+/// Phase 0 ships ALL variants for forward compatibility but the table is empty (NameTable
+/// always returns `None`); Week 3 ql-calcgraph + Phase 3 ql-formula-semantics will populate.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NamedTarget {
+    /// Named single cell (`SalesRow1 = $A$1`).
+    Cell(Address),
+    /// Named range (`Sales = $A$2:$A$1000`).
+    Range(Range),
+    /// Named constant (`TaxRate = 0.21`).
+    Constant(Value),
+    /// Named formula (`Profit = Revenue - Costs`). Stored as the raw formula source; the
+    /// binder re-parses + evaluates in the use-site context. Phase 3+ feature.
+    Formula(std::sync::Arc<str>),
+}
+
+/// Defined-names table. Phase 0 stub — `lookup` always returns `None`. Sheet-scope vs
+/// workbook-scope names arrive with `ql-formula-semantics` in Week 2 Days 6+.
 #[derive(Clone, Debug, Default)]
 pub struct NameTable {
     // Reserved; entries Vec or HashMap will land when Phase 3+ binding work needs it.
@@ -22,9 +44,10 @@ impl NameTable {
         Self::default()
     }
 
-    /// Phase 0 never resolves names — every lookup returns `None`. The signature is locked so
-    /// future expansion is non-breaking.
-    pub fn lookup(&self, _name: &str) -> Option<Address> {
+    /// Phase 0 never resolves names — every lookup returns `None`. The signature is locked
+    /// so future expansion is non-breaking (calcgraph callers can pattern-match on
+    /// `NamedTarget` variants now).
+    pub fn lookup(&self, _name: &str) -> Option<NamedTarget> {
         None
     }
 }
@@ -160,6 +183,21 @@ mod tests {
     fn names_lookup_is_phase0_stub() {
         let wb = Workbook::new();
         assert!(wb.names().lookup("MyName").is_none());
+    }
+
+    #[test]
+    fn named_target_variants_distinct() {
+        // Lock the enum shape for forward compatibility (codex r13 N9 / opus arch F5).
+        let cell = NamedTarget::Cell(Address::new(0, 0, 0));
+        let rng = NamedTarget::Range(ql_types::Range::new(0, 0, 0, 9, 0));
+        let con = NamedTarget::Constant(Value::Number(0.21));
+        let frm = NamedTarget::Formula(std::sync::Arc::from("=A1+B1"));
+        assert_ne!(cell, rng);
+        assert_ne!(cell, con);
+        assert_ne!(cell, frm);
+        assert_ne!(rng, con);
+        assert_ne!(rng, frm);
+        assert_ne!(con, frm);
     }
 
     #[test]

@@ -72,18 +72,46 @@ pub struct CellAddr {
     pub abs_row: bool,
 }
 
-/// Range reference inside an `Expr`. `None` on the row axis means whole-column (`A:A`); on
-/// the col axis, whole-row (`1:1`). Same-sheet only in Phase 0.
+/// Range reference inside an `Expr` — validated enum shape.
+///
+/// Per codex r13 N3: the prior `RangeRef` was an option-field bag where all-`None` and
+/// other ill-formed combinations were constructible. Amendment A4's structural graph-dump
+/// assertions explicitly need `SUM(A:A)` to compress to ONE whole-column variant. The
+/// option-bag couldn't pattern-match on "is this a whole-column range?" cleanly.
+///
+/// Three valid forms (matches Excel-canonical range types; sheet-qualification deferred):
+///   - `Cells { ... }` — bounded rectangular range `A1:B10`
+///   - `WholeColumn { ... }` — `A:A`, `A:C`, `$A:$D` (cols specified; rows are the full sheet)
+///   - `WholeRow { ... }` — `1:1`, `2:5`, `$3:$3` (rows specified; cols are the full sheet)
+///
+/// Same-sheet only in Phase 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct RangeRef {
-    pub start_col: Option<ColId>,
-    pub start_row: Option<RowId>,
-    pub end_col: Option<ColId>,
-    pub end_row: Option<RowId>,
-    pub abs_start_col: bool,
-    pub abs_start_row: bool,
-    pub abs_end_col: bool,
-    pub abs_end_row: bool,
+pub enum RangeRef {
+    /// Bounded rectangular cell range. Start ≤ end on each axis (parser-normalized).
+    Cells {
+        start_col: ColId,
+        start_row: RowId,
+        end_col: ColId,
+        end_row: RowId,
+        abs_start_col: bool,
+        abs_start_row: bool,
+        abs_end_col: bool,
+        abs_end_row: bool,
+    },
+    /// Whole-column range (e.g. `A:A`, `B:D`). Rows span the full sheet.
+    WholeColumn {
+        start_col: ColId,
+        end_col: ColId,
+        abs_start: bool,
+        abs_end: bool,
+    },
+    /// Whole-row range (e.g. `1:1`, `2:5`). Cols span the full sheet.
+    WholeRow {
+        start_row: RowId,
+        end_row: RowId,
+        abs_start: bool,
+        abs_end: bool,
+    },
 }
 
 #[cfg(test)]
@@ -146,18 +174,90 @@ mod tests {
 
     #[test]
     fn rangeref_whole_column_shape() {
-        // A:A — start_row + end_row both None
-        let r = RangeRef {
-            start_col: Some(0),
-            start_row: None,
-            end_col: Some(0),
-            end_row: None,
+        // A:A — explicit WholeColumn variant.
+        let r = RangeRef::WholeColumn {
+            start_col: 0,
+            end_col: 0,
+            abs_start: false,
+            abs_end: false,
+        };
+        assert!(matches!(
+            r,
+            RangeRef::WholeColumn {
+                start_col: 0,
+                end_col: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rangeref_whole_row_shape() {
+        let r = RangeRef::WholeRow {
+            start_row: 0,
+            end_row: 0,
+            abs_start: false,
+            abs_end: false,
+        };
+        assert!(matches!(
+            r,
+            RangeRef::WholeRow {
+                start_row: 0,
+                end_row: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rangeref_cells_bounded_shape() {
+        let r = RangeRef::Cells {
+            start_col: 0,
+            start_row: 0,
+            end_col: 1,
+            end_row: 9,
             abs_start_col: false,
             abs_start_row: false,
             abs_end_col: false,
             abs_end_row: false,
         };
-        assert!(r.start_row.is_none() && r.end_row.is_none());
+        assert!(matches!(
+            r,
+            RangeRef::Cells {
+                end_row: 9,
+                end_col: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rangeref_variants_distinct() {
+        let cells = RangeRef::Cells {
+            start_col: 0,
+            start_row: 0,
+            end_col: 0,
+            end_row: 0,
+            abs_start_col: false,
+            abs_start_row: false,
+            abs_end_col: false,
+            abs_end_row: false,
+        };
+        let col = RangeRef::WholeColumn {
+            start_col: 0,
+            end_col: 0,
+            abs_start: false,
+            abs_end: false,
+        };
+        let row = RangeRef::WholeRow {
+            start_row: 0,
+            end_row: 0,
+            abs_start: false,
+            abs_end: false,
+        };
+        assert_ne!(cells, col);
+        assert_ne!(cells, row);
+        assert_ne!(col, row);
     }
 
     #[test]

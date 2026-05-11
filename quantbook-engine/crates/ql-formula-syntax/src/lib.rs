@@ -44,11 +44,11 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        let _: RangeRef = RangeRef {
-            start_col: Some(0),
-            start_row: Some(0),
-            end_col: Some(0),
-            end_row: Some(0),
+        let _: RangeRef = RangeRef::Cells {
+            start_col: 0,
+            start_row: 0,
+            end_col: 0,
+            end_row: 0,
             abs_start_col: false,
             abs_start_row: false,
             abs_end_col: false,

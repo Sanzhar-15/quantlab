@@ -239,6 +239,10 @@ impl ColumnStore {
     }
 
     /// Borrow a chunk's base array. Useful for direct kernel access on the hot path.
+    ///
+    /// **Important:** callers using this for COMPUTE must merge the corresponding overlay
+    /// (`self.overlay(chunk_idx)`) — `base_chunk` alone returns stale data when the overlay
+    /// has edits. Prefer [`Self::iter_chunks`] which returns both together.
     pub fn base_chunk(&self, chunk_idx: usize) -> Option<&ArrayRef> {
         self.base_chunks.get(chunk_idx)
     }
@@ -246,6 +250,32 @@ impl ColumnStore {
     /// Borrow a chunk's overlay. Useful for compaction passes that re-materialize base+overlay.
     pub fn overlay(&self, chunk_idx: usize) -> Option<&SparseOverlay> {
         self.overlays.get(chunk_idx)
+    }
+
+    /// Iterate `(chunk_idx, &base_array, &overlay)` for every chunk.
+    ///
+    /// **The calcgraph + executor hot path uses this.** Per codex r13 N1 + opus arch F8:
+    /// reading `base_chunk(idx)` alone bypasses overlay edits silently. This iterator hands
+    /// both to the caller as a tuple so chunk-level kernels can merge them correctly.
+    ///
+    /// Example pattern (Week 3 ql-calcgraph + Week 4 ql-exec):
+    /// ```text
+    /// for (chunk_idx, base, overlay) in column.iter_chunks() {
+    ///     for rel_row in 0..base.len() as RowId {
+    ///         let value = match overlay.get(rel_row) {
+    ///             Some(v) => v.clone(),
+    ///             None => read_base_cell(base, rel_row),  // your own kernel
+    ///         };
+    ///         // ... compute on value
+    ///     }
+    /// }
+    /// ```
+    pub fn iter_chunks(&self) -> impl Iterator<Item = (usize, &ArrayRef, &SparseOverlay)> + '_ {
+        self.base_chunks
+            .iter()
+            .zip(self.overlays.iter())
+            .enumerate()
+            .map(|(idx, (base, overlay))| (idx, base, overlay))
     }
 
     /// Locate `(chunk_idx, rel_row)` for an absolute `row`.
@@ -405,6 +435,32 @@ mod tests {
     fn replace_chunk_panics_on_length_mismatch() {
         let mut c = ColumnStore::from_chunks(4, vec![float64_chunk(&[1.0, 2.0, 3.0, 4.0])]);
         c.replace_chunk(0, float64_chunk(&[1.0, 2.0])); // shorter — panic
+    }
+
+    // -- FIX-3: N1/F8 — iter_chunks API ---
+
+    #[test]
+    fn iter_chunks_walks_all_chunks_with_overlay() {
+        let mut c = ColumnStore::from_chunks(
+            4,
+            vec![
+                float64_chunk(&[1.0, 2.0, 3.0, 4.0]),
+                float64_chunk(&[5.0, 6.0, 7.0, 8.0]),
+            ],
+        );
+        // Edit row 2 (chunk 0, rel_row 2) via overlay.
+        c.put(2, Value::Number(99.0));
+        // Walk via iter_chunks.
+        let chunks: Vec<_> = c.iter_chunks().collect();
+        assert_eq!(chunks.len(), 2);
+        let (idx0, _base0, overlay0) = chunks[0];
+        let (idx1, _base1, overlay1) = chunks[1];
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        // Overlay 0 has the edit; overlay 1 doesn't.
+        assert_eq!(overlay0.len(), 1);
+        assert_eq!(overlay0.get(2), Some(&Value::Number(99.0)));
+        assert_eq!(overlay1.len(), 0);
     }
 
     // -- ColumnStore construction ----------------------------------------------
