@@ -28,7 +28,7 @@ pub mod simd;
 pub use env::{CellEnv, MapEnv, WorkbookEnv};
 pub use lower::{classify, dispatch, SimdShape};
 pub use plan::{bind, BindError, ExprPlan};
-pub use scalar::eval_scalar;
+pub use scalar::{eval_scalar, eval_scalar_with_registry};
 pub use simd::{
     add_array, add_scalar, div_array, mul_array, mul_scalar, scalar_sub, sub_array, sub_scalar,
 };

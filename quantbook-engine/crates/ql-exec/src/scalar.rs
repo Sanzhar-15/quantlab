@@ -30,6 +30,7 @@
 //! Unary `-x` negates; `+x` no-ops; `x%` divides by 100.
 
 use ql_formula_syntax::Operator;
+use ql_functions::FunctionRegistry;
 use ql_types::{coercion, ErrorValue, Value};
 
 use crate::env::CellEnv;
@@ -38,6 +39,9 @@ use crate::plan::ExprPlan;
 /// Evaluate an `ExprPlan` against `env` to produce a `Value`. Total function — never
 /// panics on Excel semantics (NaN, div-by-zero, etc.). Panics only on internal
 /// programmer errors (e.g. malformed ExprPlan that bind() couldn't produce).
+///
+/// `Function` variants return `#NAME?` (`ErrorValue::Name`). To dispatch through a
+/// registry, use `eval_scalar_with_registry` instead.
 pub fn eval_scalar<E: CellEnv>(plan: &ExprPlan, env: &E) -> Value {
     match plan {
         ExprPlan::Number(n) => Value::number(*n),
@@ -55,6 +59,45 @@ pub fn eval_scalar<E: CellEnv>(plan: &ExprPlan, env: &E) -> Value {
             let v = eval_scalar(operand, env);
             eval_unary(*op, v)
         }
+        ExprPlan::Function { .. } => Value::Error(ErrorValue::Name),
+    }
+}
+
+/// Like `eval_scalar` but dispatches `Function` variants through a `FunctionRegistry`.
+/// Unknown function names return `#NAME?`. Args are evaluated left-to-right with this
+/// same function (recursive); error-args propagate naturally through the registered
+/// function's logic.
+pub fn eval_scalar_with_registry<E: CellEnv>(
+    plan: &ExprPlan,
+    env: &E,
+    registry: &FunctionRegistry,
+) -> Value {
+    match plan {
+        ExprPlan::Number(n) => Value::number(*n),
+        ExprPlan::Bool(b) => Value::Boolean(*b),
+        ExprPlan::String(s) => Value::Text(s.clone()),
+        ExprPlan::CellRef {
+            sheet, row, col, ..
+        } => env.read_cell(*sheet, *row, *col),
+        ExprPlan::Binary { op, lhs, rhs } => {
+            let l = eval_scalar_with_registry(lhs, env, registry);
+            let r = eval_scalar_with_registry(rhs, env, registry);
+            eval_binary(*op, l, r)
+        }
+        ExprPlan::Unary { op, operand } => {
+            let v = eval_scalar_with_registry(operand, env, registry);
+            eval_unary(*op, v)
+        }
+        ExprPlan::Function { name, args } => match registry.lookup(name) {
+            Some(f) => {
+                let evaluated: Vec<Value> = args
+                    .iter()
+                    .map(|a| eval_scalar_with_registry(a, env, registry))
+                    .collect();
+                f(&evaluated)
+            }
+            None => Value::Error(ErrorValue::Name),
+        },
     }
 }
 
@@ -517,5 +560,112 @@ mod tests {
         // f64::MAX * 2.0 = Inf → sanitize_f64 returns #NUM!
         let expr = bin(Operator::Mul, n(f64::MAX), n(2.0));
         assert_eq!(eval(&expr, &env), Value::Error(ErrorValue::Num));
+    }
+
+    // ===== W4-5: function dispatch via registry =====
+
+    fn eval_reg(expr: &Expr, env: &MapEnv, reg: &FunctionRegistry) -> Value {
+        let plan = bind(expr, 0).expect("bind");
+        eval_scalar_with_registry(&plan, env, reg)
+    }
+
+    #[test]
+    fn function_without_registry_yields_name_error() {
+        // Plain eval_scalar (no registry) returns #NAME? for any Function variant.
+        let env = MapEnv::new();
+        let expr = Expr::Function {
+            name: Arc::from("SUM"),
+            args: vec![n(1.0), n(2.0)],
+        };
+        let plan = bind(&expr, 0).unwrap();
+        assert_eq!(eval_scalar(&plan, &env), Value::Error(ErrorValue::Name));
+    }
+
+    #[test]
+    fn function_unknown_name_via_registry_yields_name_error() {
+        let env = MapEnv::new();
+        let reg = ql_functions::default_registry();
+        let expr = Expr::Function {
+            name: Arc::from("DOES_NOT_EXIST"),
+            args: vec![n(1.0)],
+        };
+        assert_eq!(eval_reg(&expr, &env, &reg), Value::Error(ErrorValue::Name));
+    }
+
+    #[test]
+    fn function_sum_via_registry() {
+        let env = MapEnv::new();
+        let reg = ql_functions::default_registry();
+        // =SUM(1, 2, 3) → 6
+        let expr = Expr::Function {
+            name: Arc::from("SUM"),
+            args: vec![n(1.0), n(2.0), n(3.0)],
+        };
+        assert_eq!(eval_reg(&expr, &env, &reg), Value::Number(6.0));
+    }
+
+    #[test]
+    fn function_sum_with_cellrefs_via_registry() {
+        let mut env = MapEnv::new();
+        env.put(0, 0, 0, Value::Number(10.0));
+        env.put(0, 1, 0, Value::Number(20.0));
+        env.put(0, 2, 0, Value::Number(30.0));
+        let reg = ql_functions::default_registry();
+        // =SUM(A1, A2, A3)
+        let expr = Expr::Function {
+            name: Arc::from("SUM"),
+            args: vec![cell_ref(0, 0), cell_ref(0, 1), cell_ref(0, 2)],
+        };
+        assert_eq!(eval_reg(&expr, &env, &reg), Value::Number(60.0));
+    }
+
+    #[test]
+    fn function_if_via_registry() {
+        let env = MapEnv::new();
+        let reg = ql_functions::default_registry();
+        // =IF(TRUE, 1, 2) → 1
+        let expr = Expr::Function {
+            name: Arc::from("IF"),
+            args: vec![Expr::Bool(true), n(1.0), n(2.0)],
+        };
+        assert_eq!(eval_reg(&expr, &env, &reg), Value::Number(1.0));
+    }
+
+    #[test]
+    fn function_nested_in_binary() {
+        // =SUM(1, 2) * 3 = 9
+        let env = MapEnv::new();
+        let reg = ql_functions::default_registry();
+        let inner = Expr::Function {
+            name: Arc::from("SUM"),
+            args: vec![n(1.0), n(2.0)],
+        };
+        let outer = bin(Operator::Mul, inner, n(3.0));
+        assert_eq!(eval_reg(&outer, &env, &reg), Value::Number(9.0));
+    }
+
+    #[test]
+    fn function_var_uses_two_pass_via_registry() {
+        // =VAR.S(1, 3) → 2 (per Welford two-pass)
+        let env = MapEnv::new();
+        let reg = ql_functions::default_registry();
+        let expr = Expr::Function {
+            name: Arc::from("VAR.S"),
+            args: vec![n(1.0), n(3.0)],
+        };
+        assert_eq!(eval_reg(&expr, &env, &reg), Value::Number(2.0));
+    }
+
+    #[test]
+    fn function_error_in_arg_propagates_via_excel_semantics() {
+        let mut env = MapEnv::new();
+        env.put(0, 0, 0, Value::Error(ErrorValue::Ref));
+        let reg = ql_functions::default_registry();
+        let expr = Expr::Function {
+            name: Arc::from("SUM"),
+            args: vec![cell_ref(0, 0), n(5.0)],
+        };
+        // SUM propagates the first error encountered.
+        assert_eq!(eval_reg(&expr, &env, &reg), Value::Error(ErrorValue::Ref));
     }
 }

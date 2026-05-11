@@ -792,6 +792,7 @@ dependencies = [
  "pulp",
  "ql-calcgraph",
  "ql-formula-syntax",
+ "ql-functions",
  "ql-storage",
  "ql-types",
 ]

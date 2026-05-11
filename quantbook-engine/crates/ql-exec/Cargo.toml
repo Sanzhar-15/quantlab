@@ -14,6 +14,7 @@ ql-types          = { path = "../ql-types" }
 ql-formula-syntax = { path = "../ql-formula-syntax" }
 ql-calcgraph      = { path = "../ql-calcgraph" }
 ql-storage        = { path = "../ql-storage" }
+ql-functions      = { path = "../ql-functions" }
 arrow-array       = { workspace = true }
 pulp              = { workspace = true }
 multiversion      = { workspace = true }
@@ -25,4 +26,9 @@ criterion = { workspace = true }
 # Phase 0 OG-02 hot path bench (Week 4 acceptance run).
 [[bench]]
 name = "og02_mul2"
+harness = false
+
+# Phase 0 OG-04 1M scalar baseline bench.
+[[bench]]
+name = "og04_scalar_1m"
 harness = false

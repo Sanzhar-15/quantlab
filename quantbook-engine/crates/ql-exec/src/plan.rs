@@ -52,6 +52,14 @@ pub enum ExprPlan {
         op: Operator,
         operand: Box<ExprPlan>,
     },
+    /// Function call. Args are bound recursively. Phase 0 W4-5: name is preserved
+    /// verbatim from the AST (Excel-canonical uppercase normalization happens at the
+    /// parser level — W4-5 expects already-uppercased names from the binder). The
+    /// scalar evaluator looks up the name in a `FunctionRegistry` at evaluation time.
+    Function {
+        name: Arc<str>,
+        args: Vec<ExprPlan>,
+    },
 }
 
 /// Error during binding. Phase 0 has only one variant; future bind work (sheet-qualified
@@ -92,9 +100,16 @@ pub fn bind(expr: &Expr, owning_sheet: SheetId) -> Result<ExprPlan, BindError> {
         Expr::RangeRef(_) => Err(BindError::UnsupportedVariant(
             "RangeRef requires a Function context; Phase 0 W4-1 has no function dispatch yet",
         )),
-        Expr::Function { .. } => Err(BindError::UnsupportedVariant(
-            "Function dispatch lands in Phase 0 W4-4",
-        )),
+        Expr::Function { name, args } => {
+            let mut bound_args = Vec::with_capacity(args.len());
+            for a in args {
+                bound_args.push(bind(a, owning_sheet)?);
+            }
+            Ok(ExprPlan::Function {
+                name: name.clone(),
+                args: bound_args,
+            })
+        }
         Expr::Array(_) => Err(BindError::UnsupportedVariant("Array literals are Phase 3+")),
         Expr::Spill(_) => Err(BindError::UnsupportedVariant("Spill anchors are Phase 3+")),
     }
@@ -213,14 +228,69 @@ mod tests {
     }
 
     #[test]
-    fn bind_function_unsupported_w4_1() {
+    fn bind_function_lands_in_w4_5() {
+        // Per W4-5: Function variant binds successfully; name + args preserved verbatim.
         let expr = Expr::Function {
             name: Arc::from("SUM"),
-            args: vec![],
+            args: vec![Expr::Number(1.0), Expr::Number(2.0)],
         };
-        assert!(matches!(
-            bind(&expr, 0),
-            Err(BindError::UnsupportedVariant(_))
-        ));
+        let p = bind(&expr, 0).unwrap();
+        match p {
+            ExprPlan::Function { name, args } => {
+                assert_eq!(name.as_ref(), "SUM");
+                assert_eq!(args.len(), 2);
+                assert_eq!(args[0], ExprPlan::Number(1.0));
+                assert_eq!(args[1], ExprPlan::Number(2.0));
+            }
+            _ => panic!("expected Function"),
+        }
+    }
+
+    #[test]
+    fn bind_function_with_nested_cellref() {
+        // =SUM(A1, A2) — both args resolve to CellRefs on the owning sheet.
+        let expr = Expr::Function {
+            name: Arc::from("SUM"),
+            args: vec![
+                Expr::CellRef(CellAddr {
+                    sheet: None,
+                    col: 0,
+                    row: 0,
+                    abs_col: false,
+                    abs_row: false,
+                }),
+                Expr::CellRef(CellAddr {
+                    sheet: None,
+                    col: 0,
+                    row: 1,
+                    abs_col: false,
+                    abs_row: false,
+                }),
+            ],
+        };
+        let p = bind(&expr, 7).unwrap();
+        match p {
+            ExprPlan::Function { args, .. } => {
+                assert!(matches!(
+                    args[0],
+                    ExprPlan::CellRef {
+                        sheet: 7,
+                        row: 0,
+                        col: 0,
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    args[1],
+                    ExprPlan::CellRef {
+                        sheet: 7,
+                        row: 1,
+                        col: 0,
+                        ..
+                    }
+                ));
+            }
+            _ => panic!(),
+        }
     }
 }
