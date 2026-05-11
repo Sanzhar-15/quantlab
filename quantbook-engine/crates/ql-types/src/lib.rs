@@ -17,7 +17,7 @@ pub mod coercion;
 pub mod error;
 pub mod value;
 
-pub use address::{Address, ColId, Range, RowId, SheetId};
+pub use address::{Address, ColId, Range, RowId, SheetId, MAX_COLUMN, MAX_ROW};
 pub use coercion::{
     sanitize_f64, to_logical, to_number_lenient, to_number_strict, to_text_for_display,
     to_text_for_formula,

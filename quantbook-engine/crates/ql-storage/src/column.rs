@@ -14,19 +14,46 @@
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, Float64Array};
-use ql_types::{RowId, Value};
+use ql_types::{RowId, Value, MAX_ROW};
 
 use crate::overlay::SparseOverlay;
 
 /// Default chunk size in rows. Override via `QBOOK_CHUNK_ROWS` env var.
 pub const DEFAULT_CHUNK_ROWS: u32 = 16_384;
 
-/// Read `QBOOK_CHUNK_ROWS` from env once, with the default fallback.
+/// Resolve a chunk-rows value from an optional env-var string.
+///
+/// `None` (var unset) → `DEFAULT_CHUNK_ROWS`.
+/// `Some(non-u32)` → panic with a clear message.
+/// `Some("0")` → panic (zero chunks are nonsense).
+/// `Some(valid)` → that u32.
+///
+/// Per codex r13 N8: prior behavior silently defaulted on any parse failure, which would let
+/// a misconfigured A7 chunk-size sweep benchmark the wrong chunk size while pretending to
+/// test another. This is the pure-function form; `chunk_rows_from_env()` is a thin wrapper
+/// that reads `QBOOK_CHUNK_ROWS` and calls this.
+pub fn resolve_chunk_rows(env_value: Option<&str>) -> u32 {
+    match env_value {
+        None => DEFAULT_CHUNK_ROWS,
+        Some(s) => {
+            let n: u32 = s.parse().unwrap_or_else(|_| {
+                panic!(
+                    "QBOOK_CHUNK_ROWS is set to {s:?} which is not a u32; \
+                     fix the env var or unset to use default {DEFAULT_CHUNK_ROWS}"
+                )
+            });
+            assert!(
+                n > 0,
+                "QBOOK_CHUNK_ROWS must be > 0 (got {n}); fix the env var or unset"
+            );
+            n
+        }
+    }
+}
+
+/// Read `QBOOK_CHUNK_ROWS` from env. Thin wrapper around [`resolve_chunk_rows`].
 pub fn chunk_rows_from_env() -> u32 {
-    std::env::var("QBOOK_CHUNK_ROWS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_CHUNK_ROWS)
+    resolve_chunk_rows(std::env::var("QBOOK_CHUNK_ROWS").ok().as_deref())
 }
 
 /// Chunked column with overlay. Invariants:
@@ -58,9 +85,37 @@ impl ColumnStore {
     }
 
     /// Construct from a vector of base chunks (typically the import path).
-    /// Each chunk gets an empty overlay; chunk-rows is taken from the first chunk's length
-    /// (or the explicit param if no chunks yet).
+    ///
+    /// Enforces invariants (per codex r13 N2):
+    /// - `chunk_rows > 0`
+    /// - Every non-last chunk is exactly `chunk_rows` long.
+    /// - The last chunk may be shorter but must not exceed `chunk_rows`.
+    /// - Every chunk must be `Float64Array` (Phase 0 limit — see `read_base` doc).
+    ///
+    /// Panics on violation. Prior behavior accepted invalid layouts and silently misrouted
+    /// reads via `locate()`.
     pub fn from_chunks(chunk_rows: u32, base_chunks: Vec<ArrayRef>) -> Self {
+        assert!(chunk_rows > 0, "chunk_rows must be > 0");
+        let last_idx = base_chunks.len().saturating_sub(1);
+        for (idx, arr) in base_chunks.iter().enumerate() {
+            let len = arr.len();
+            assert!(
+                arr.as_any().downcast_ref::<Float64Array>().is_some(),
+                "ColumnStore::from_chunks: chunk {idx} has type {:?}; Phase 0 requires Float64Array",
+                arr.data_type()
+            );
+            if idx < last_idx {
+                assert!(
+                    len == chunk_rows as usize,
+                    "ColumnStore::from_chunks: non-last chunk {idx} has len {len}, expected exactly {chunk_rows}"
+                );
+            } else {
+                assert!(
+                    len <= chunk_rows as usize,
+                    "ColumnStore::from_chunks: last chunk {idx} has len {len}, exceeds chunk_rows {chunk_rows}"
+                );
+            }
+        }
         let overlays = base_chunks.iter().map(|_| SparseOverlay::new()).collect();
         Self {
             chunk_rows,
@@ -105,10 +160,18 @@ impl ColumnStore {
     }
 
     /// Write a cell via the overlay. Chunk autogrowth: if `row` is beyond all current chunks,
-    /// allocate enough empty chunks to cover it (each new chunk is a `Float64Array` of NaN-bit
-    /// pattern; the overlay carries the real value). This matches the spreadsheet "open
-    /// column" model: writing into A1000 of an empty column creates the chunks containing it.
+    /// allocate enough empty chunks to cover it (each new chunk is a `Float64Array` of null
+    /// values; the overlay carries the real value). Matches the spreadsheet "open column"
+    /// model: writing to A1000 of an empty column creates the chunks containing it.
+    ///
+    /// **Bound** (per opus arch F3): `row <= MAX_ROW` (Excel's 1,048,575). Beyond that, the
+    /// autogrowth would allocate unbounded null chunks (up to 32 GB at u32::MAX). Panics
+    /// rather than silently allocating.
     pub fn put(&mut self, row: RowId, value: Value) {
+        assert!(
+            row <= MAX_ROW,
+            "ColumnStore::put: row {row} exceeds Excel max row {MAX_ROW}"
+        );
         let (chunk_idx, rel_row) = self.locate(row);
         // Allocate empty chunks up to chunk_idx if needed.
         while chunk_idx >= self.base_chunks.len() {
@@ -120,15 +183,57 @@ impl ColumnStore {
 
     /// Replace an entire chunk's base with a new Arrow array, clearing the overlay for that
     /// chunk. Used by the recompute path: the new base is the materialized result column.
-    /// Panics if `chunk_idx` is out of bounds. Does NOT check that the new array's len matches
-    /// `chunk_rows` — the last chunk MAY be shorter.
+    ///
+    /// Validates (per codex r13 N2):
+    /// - `chunk_idx` is in bounds.
+    /// - New array is `Float64Array` (Phase 0 limit).
+    /// - New array length matches the existing chunk's length exactly (no resize via replace).
     pub fn replace_chunk(&mut self, chunk_idx: usize, new_base: ArrayRef) {
+        assert!(
+            chunk_idx < self.base_chunks.len(),
+            "replace_chunk: chunk_idx {chunk_idx} out of bounds (have {} chunks)",
+            self.base_chunks.len()
+        );
+        assert!(
+            new_base.as_any().downcast_ref::<Float64Array>().is_some(),
+            "replace_chunk: new base has type {:?}; Phase 0 requires Float64Array",
+            new_base.data_type()
+        );
+        let old_len = self.base_chunks[chunk_idx].len();
+        assert!(
+            new_base.len() == old_len,
+            "replace_chunk: new len {} != existing chunk len {old_len}",
+            new_base.len()
+        );
         self.base_chunks[chunk_idx] = new_base;
         self.overlays[chunk_idx].clear();
     }
 
     /// Append a new base chunk (with an empty overlay). Used during initial column build.
+    ///
+    /// Validates: new chunk is `Float64Array`; existing last chunk (if any) was exactly
+    /// `chunk_rows` long (no appending after a short tail); new chunk length is
+    /// `<= chunk_rows`.
     pub fn append_chunk(&mut self, base: ArrayRef) {
+        assert!(
+            base.as_any().downcast_ref::<Float64Array>().is_some(),
+            "append_chunk: new chunk has type {:?}; Phase 0 requires Float64Array",
+            base.data_type()
+        );
+        assert!(
+            base.len() <= self.chunk_rows as usize,
+            "append_chunk: new chunk len {} exceeds chunk_rows {}",
+            base.len(),
+            self.chunk_rows
+        );
+        if let Some(last) = self.base_chunks.last() {
+            assert!(
+                last.len() == self.chunk_rows as usize,
+                "append_chunk: cannot append after a short tail chunk (last len {}, expected exactly {})",
+                last.len(),
+                self.chunk_rows
+            );
+        }
         self.base_chunks.push(base);
         self.overlays.push(SparseOverlay::new());
     }
@@ -157,22 +262,33 @@ impl Default for ColumnStore {
     }
 }
 
-/// Read a single value from a base Arrow array at chunk-relative `rel_row`. Phase 0 only
-/// handles `Float64Array` (matches the acceptance bench); other base types read as `Blank`
-/// until ql-storage supports them in later phases.
+/// Read a single value from a base Arrow array at chunk-relative `rel_row`.
+///
+/// **Phase 0 only handles `Float64Array`.** Per codex r13 N7 + opus arch F4 + founder's
+/// "No Fallbacks" rule (CLAUDE.md): unsupported array types MUST fail visibly, not return
+/// `Value::Blank`. Phase 1+ will add Boolean/String/integer-typed base chunks; until then,
+/// any non-Float64 base is a construction-time bug and panics on read.
 fn read_base(base: &dyn Array, rel_row: RowId) -> Value {
-    if let Some(arr) = base.as_any().downcast_ref::<Float64Array>() {
-        let idx = rel_row as usize;
-        if idx >= arr.len() {
-            return Value::Blank;
-        }
-        if arr.is_null(idx) {
-            return Value::Blank;
-        }
-        // Use the safe Value::number constructor — sanitizes NaN/Inf into #NUM!.
-        return Value::number(arr.value(idx));
+    let arr = base
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap_or_else(|| {
+            panic!(
+                "ColumnStore::read_base: Phase 0 only supports Float64Array bases; got {:?}. \
+                 Construct columns with `from_chunks(_, vec![Arc::new(Float64Array::from(...))])` \
+                 or wait for Phase 1+ to add other types.",
+                base.data_type()
+            )
+        });
+    let idx = rel_row as usize;
+    if idx >= arr.len() {
+        return Value::Blank;
     }
-    Value::Blank
+    if arr.is_null(idx) {
+        return Value::Blank;
+    }
+    // Use the safe Value::number constructor — sanitizes NaN/Inf into #NUM!.
+    Value::number(arr.value(idx))
 }
 
 /// Construct an empty chunk of `chunk_rows` length, filled with nulls. Used by `put`'s
@@ -194,10 +310,101 @@ mod tests {
 
     // -- chunk_rows_from_env ---------------------------------------------------
 
+    // -- chunk_rows resolution (env-pure tests; never mutates process env) ---
+
     #[test]
-    fn chunk_rows_default_when_env_unset() {
-        std::env::remove_var("QBOOK_CHUNK_ROWS");
-        assert_eq!(chunk_rows_from_env(), DEFAULT_CHUNK_ROWS);
+    fn resolve_chunk_rows_unset_returns_default() {
+        assert_eq!(resolve_chunk_rows(None), DEFAULT_CHUNK_ROWS);
+    }
+
+    #[test]
+    fn resolve_chunk_rows_valid_value() {
+        assert_eq!(resolve_chunk_rows(Some("2048")), 2048);
+        assert_eq!(resolve_chunk_rows(Some("16384")), 16384);
+    }
+
+    // -- FIX-2: N8 — invalid QBOOK_CHUNK_ROWS must fail loudly, not silently default ---
+
+    #[test]
+    #[should_panic(expected = "not a u32")]
+    fn resolve_chunk_rows_non_numeric_panics() {
+        let _ = resolve_chunk_rows(Some("abc")); // expected panic
+    }
+
+    #[test]
+    #[should_panic(expected = "must be > 0")]
+    fn resolve_chunk_rows_zero_panics() {
+        let _ = resolve_chunk_rows(Some("0")); // expected panic
+    }
+
+    #[test]
+    #[should_panic(expected = "not a u32")]
+    fn resolve_chunk_rows_empty_panics() {
+        let _ = resolve_chunk_rows(Some("")); // empty string isn't a valid u32
+    }
+
+    // -- FIX-2: N7 + F4 — non-Float64 base panics, not silent Blank --------
+
+    #[test]
+    #[should_panic(expected = "Phase 0 requires Float64Array")]
+    fn from_chunks_panics_on_non_float64() {
+        let s: Arc<dyn arrow_array::Array> =
+            Arc::new(arrow_array::StringArray::from(vec!["a", "b"]));
+        let _ = ColumnStore::from_chunks(2, vec![s]);
+    }
+
+    // -- FIX-2: N2 — chunk invariants enforced (non-last must be exactly chunk_rows) ---
+
+    #[test]
+    #[should_panic(expected = "non-last chunk")]
+    fn from_chunks_panics_on_undersized_non_last_chunk() {
+        // 2-chunk column with chunk_rows=4 — first chunk SHORT (len=3) — should panic.
+        let short = float64_chunk(&[1.0, 2.0, 3.0]); // len 3
+        let normal = float64_chunk(&[4.0, 5.0, 6.0, 7.0]); // len 4
+        let _ = ColumnStore::from_chunks(4, vec![short, normal]);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds chunk_rows")]
+    fn from_chunks_panics_on_oversized_chunk() {
+        let too_big = float64_chunk(&[1.0, 2.0, 3.0, 4.0, 5.0]); // len 5, max 4
+        let _ = ColumnStore::from_chunks(4, vec![too_big]);
+    }
+
+    // -- FIX-2: F3 — ColumnStore::put rejects row > MAX_ROW ---
+
+    #[test]
+    #[should_panic(expected = "exceeds Excel max row")]
+    fn put_panics_on_row_beyond_max_excel() {
+        use ql_types::MAX_ROW;
+        let mut c = ColumnStore::with_chunk_rows(16);
+        c.put(MAX_ROW + 1, Value::Number(1.0));
+    }
+
+    #[test]
+    fn put_at_excel_max_row_is_accepted() {
+        use ql_types::MAX_ROW;
+        let mut c = ColumnStore::with_chunk_rows(16);
+        c.put(MAX_ROW, Value::Number(42.0));
+        assert_eq!(c.read(MAX_ROW), Value::Number(42.0));
+    }
+
+    // -- FIX-2: N2 — replace_chunk validates new base ---
+
+    #[test]
+    #[should_panic(expected = "Phase 0 requires Float64Array")]
+    fn replace_chunk_panics_on_non_float64() {
+        let mut c = ColumnStore::from_chunks(4, vec![float64_chunk(&[1.0, 2.0, 3.0, 4.0])]);
+        let bad: Arc<dyn arrow_array::Array> =
+            Arc::new(arrow_array::StringArray::from(vec!["a"; 4]));
+        c.replace_chunk(0, bad);
+    }
+
+    #[test]
+    #[should_panic(expected = "new len")]
+    fn replace_chunk_panics_on_length_mismatch() {
+        let mut c = ColumnStore::from_chunks(4, vec![float64_chunk(&[1.0, 2.0, 3.0, 4.0])]);
+        c.replace_chunk(0, float64_chunk(&[1.0, 2.0])); // shorter — panic
     }
 
     // -- ColumnStore construction ----------------------------------------------

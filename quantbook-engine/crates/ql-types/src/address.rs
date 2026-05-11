@@ -23,6 +23,13 @@ pub type RowId = u32;
 /// 32-bit column index within a sheet. 0-indexed (column "A" = `ColId(0)`).
 pub type ColId = u32;
 
+/// Excel's row max — 1,048,576 rows means max 0-indexed row is 1,048,575. Used as the
+/// upper bound for ColumnStore writes, Sheet::put, and any other grid-write op.
+pub const MAX_ROW: RowId = 1_048_575;
+
+/// Excel's column max — XFD = 16,383 (0-indexed). Used as the upper bound for grid writes.
+pub const MAX_COLUMN: ColId = 16_383;
+
 /// A sheet-qualified cell address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct Address {
@@ -74,10 +81,16 @@ impl Range {
     }
 
     /// Total number of cells in the range (inclusive on both ends).
+    ///
+    /// Uses widening then checked arithmetic. With u32 row/col bounds, the theoretical max
+    /// is 2^32 × 2^32 = 2^64 = u64::MAX EXACTLY (1 too many for u64::MAX). For Excel-canonical
+    /// bounds (1M rows × 16K cols = ~17B cells) this is comfortably under u64::MAX, but the
+    /// arithmetic is bound-checked anyway (per opus arch F2 + founder "No Fallbacks" rule).
     pub fn cell_count(&self) -> u64 {
-        let rows = (self.end_row - self.start_row + 1) as u64;
-        let cols = (self.end_col - self.start_col + 1) as u64;
-        rows * cols
+        let rows: u64 = u64::from(self.end_row - self.start_row) + 1;
+        let cols: u64 = u64::from(self.end_col - self.start_col) + 1;
+        rows.checked_mul(cols)
+            .expect("Range::cell_count: overflow — range too large to count in u64")
     }
 
     /// True iff `addr` lies within this range (same sheet, inclusive bounds).

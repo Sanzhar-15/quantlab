@@ -70,19 +70,37 @@ impl Sheet {
     }
 
     /// Write a cell. Autogrows columns as needed; updates bounds.
+    ///
+    /// Bound checks (opus arch F2): row/col within Excel limits; `row+1`/`col+1` use
+    /// checked arithmetic to avoid u32 overflow at the boundary.
     pub fn put(&mut self, row: RowId, col: ColId, value: Value) {
+        use ql_types::address::{MAX_COLUMN, MAX_ROW};
+        assert!(
+            row <= MAX_ROW,
+            "Sheet::put: row {row} exceeds Excel max row {MAX_ROW}"
+        );
+        assert!(
+            col <= MAX_COLUMN,
+            "Sheet::put: col {col} exceeds Excel max column {MAX_COLUMN}"
+        );
         let col_idx = col as usize;
         while self.columns.len() <= col_idx {
             self.columns
                 .push(ColumnStore::with_chunk_rows(self.chunk_rows));
         }
         self.columns[col_idx].put(row, value);
-        // Update bounds (one past max).
-        if row + 1 > self.bounds.row_extent {
-            self.bounds.row_extent = row + 1;
+        // Update bounds (one past max). Use checked_add to surface any boundary surprise.
+        let row_extent_candidate = row
+            .checked_add(1)
+            .expect("Sheet::put: row+1 overflow (row == u32::MAX)");
+        let col_extent_candidate = col
+            .checked_add(1)
+            .expect("Sheet::put: col+1 overflow (col == u32::MAX)");
+        if row_extent_candidate > self.bounds.row_extent {
+            self.bounds.row_extent = row_extent_candidate;
         }
-        if col + 1 > self.bounds.col_extent {
-            self.bounds.col_extent = col + 1;
+        if col_extent_candidate > self.bounds.col_extent {
+            self.bounds.col_extent = col_extent_candidate;
         }
     }
 
