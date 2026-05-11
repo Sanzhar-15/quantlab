@@ -10,3 +10,8 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+ql-types          = { path = "../ql-types" }
+ql-formula-syntax = { path = "../ql-formula-syntax" }
+
+[dev-dependencies]
+proptest = { workspace = true }

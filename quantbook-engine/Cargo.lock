@@ -708,6 +708,11 @@ version = "0.1.0"
 [[package]]
 name = "ql-calcgraph"
 version = "0.1.0"
+dependencies = [
+ "proptest",
+ "ql-formula-syntax",
+ "ql-types",
+]
 
 [[package]]
 name = "ql-collab"
