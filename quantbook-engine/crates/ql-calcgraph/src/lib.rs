@@ -34,11 +34,13 @@ pub mod dirty;
 pub mod edges;
 pub mod graph;
 pub mod node;
+pub mod topo;
 
 pub use dirty::{propagate_from_cells, ChunkDirtySet, ChunkKey};
 pub use edges::AdjacencyVectors;
 pub use graph::Graph;
 pub use node::{CellNode, FormulaRegionNode, Node, NodeId, RangeNode, SpillNode};
+pub use topo::{schedule, Schedule};
 
 #[cfg(test)]
 mod integration_tests {
