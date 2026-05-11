@@ -14,4 +14,20 @@ ql-types          = { path = "../ql-types" }
 ql-formula-syntax = { path = "../ql-formula-syntax" }
 
 [dev-dependencies]
-proptest = { workspace = true }
+proptest  = { workspace = true }
+criterion = { workspace = true }
+
+# Phase 0 acceptance bench scaffolds (Week 4 runs them; Week 3 W3-8/9 ensures they compile).
+# Each `harness = false` lets Criterion's own main run; the bench file must call
+# `criterion_main!`.
+[[bench]]
+name = "region_split_merge"
+harness = false
+
+[[bench]]
+name = "prefix_sum_a5"
+harness = false
+
+[[bench]]
+name = "dirty_og05"
+harness = false
