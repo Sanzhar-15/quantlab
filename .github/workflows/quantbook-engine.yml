@@ -20,7 +20,7 @@ env:
 
 jobs:
   check:
-    name: lint + test (stable 1.83)
+    name: lint + test (stable 1.95)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,7 +28,7 @@ jobs:
       # @master per dtolnay/rust-toolchain docs (use a versioned tag OR @master + toolchain:).
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.83.0
+          toolchain: 1.95.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
@@ -50,7 +50,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.83.0
+          toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: quantbook-engine -> target

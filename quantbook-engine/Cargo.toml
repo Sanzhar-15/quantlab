@@ -27,7 +27,9 @@ default-members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.83"
+# MSRV floor 1.85: required for edition2024 (clap_lex 1.1.0 transitively via criterion). Day 2
+# bump from 1.83. Build is pinned to 1.95.0 in rust-toolchain.toml.
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 publish = false
 

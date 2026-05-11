@@ -12,7 +12,7 @@ to Phases 1-10 (9-12 months to v1 ship-candidate).
 quantbook-engine/
 ├── Cargo.toml                  # workspace root (24 member crates)
 ├── Cargo.lock                  # pinned; committed
-├── rust-toolchain.toml         # stable 1.83.0
+├── rust-toolchain.toml         # stable 1.95.0 (MSRV floor 1.85 for edition2024)
 ├── .cargo/config.toml          # per-target SIMD floors; NEVER target-cpu=native
 ├── scripts/
 │   ├── check-build-flags.sh    # Amendment A3 — CI gate for target-cpu=native
@@ -51,7 +51,7 @@ quantbook-engine/
 ## Build
 
 ```bash
-# Rust toolchain pinned via rust-toolchain.toml (1.83.0).
+# Rust toolchain pinned via rust-toolchain.toml (1.95.0; MSRV floor 1.85).
 cargo metadata                                  # workspace must validate
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings

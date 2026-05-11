@@ -10,3 +10,7 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+arrow-array  = { workspace = true }
+arrow-schema = { workspace = true }
+criterion    = { workspace = true }
+num_cpus     = { workspace = true }

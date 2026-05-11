@@ -1,4 +1,8 @@
 [toolchain]
-channel = "1.83.0"
+# Bumped from 1.83.0 → 1.95.0 on Day 2 (2026-05-11). Reason: `criterion` pulls in `clap_lex
+# 1.1.0` which declares `edition = "2024"` in its manifest. The edition2024 Cargo feature
+# stabilized in Rust 1.85, so 1.83 errors with "feature `edition2024` is required, but that
+# feature is not stabilized in this version of Cargo". 1.95.0 is the latest stable.
+channel = "1.95.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
