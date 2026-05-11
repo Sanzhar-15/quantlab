@@ -1,0 +1,94 @@
+# Quantbook Engine — Cargo workspace
+# Phase 0 viability spike. See ../.plans/_QUANTBOOK-v1-SPECIFICATION.md Part V.
+#
+# IMPORTANT: per Cargo's rules (https://doc.rust-lang.org/cargo/reference/workspaces.html),
+# [workspace.dependencies] entries CANNOT carry `optional = true`. Optionality lives on the
+# consuming crate's Cargo.toml. There is no `[workspace.features]` table — features belong on
+# member crates. This file is the result of codex r9 audit corrections.
+
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+# Phase 0 active set (other crates are stubs reserving the workspace tree):
+default-members = [
+    "crates/ql-types",
+    "crates/ql-storage",
+    "crates/ql-formula-syntax",
+    "crates/ql-formula-semantics",
+    "crates/ql-functions",
+    "crates/ql-calcgraph",
+    "crates/ql-exec",
+    "crates/ql-bench",
+    "crates/ql-profile",
+    "crates/ql-oplog",
+    "crates/ql-terminal",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# Apache Arrow — exact pins for Phase 0
+arrow = "=58.1.0"
+arrow-array = "=58.1.0"
+arrow-buffer = "=58.1.0"
+arrow-schema = "=58.1.0"
+arrow-select = "=58.1.0"
+arrow-arith = "=58.1.0"
+arrow-cast = "=58.1.0"
+
+# Concurrency
+rayon = "=1.12.0"
+tokio = { version = "=1.50.0", default-features = false, features = ["rt-multi-thread", "macros", "fs", "net", "time", "sync"] }
+
+# Bench
+criterion = { version = "=0.8.2", default-features = false, features = ["html_reports"] }
+
+# SIMD (runtime dispatch per Phase 0 Decision F)
+pulp = "=0.22.2"
+multiversion = "=0.8.0"
+bytemuck = "=1.25.0"
+
+# Python interop (Phase 5; reserved in workspace pins for consistency)
+pyo3 = { version = "=0.28.3", default-features = false, features = ["extension-module", "abi3-py310"] }
+
+# WASM (later phases)
+wasm-bindgen = "=0.2.118"
+
+# Storage / formats (later phases)
+polars = { version = "=0.53.0", default-features = false, features = ["lazy", "fmt", "parquet"] }
+datafusion = { version = "=53.1.0", default-features = false }
+duckdb = { version = "=1.10502.0", default-features = false, features = ["bundled", "appender-arrow"] }
+calamine = "=0.34.0"
+
+# Reactive (salsa = experiments only per Decision A) / collab
+salsa = "=0.26.2"
+loro = "=1.12.0"
+
+# Utility
+thiserror = "=2.0.18"
+tracing = "=0.1.44"
+dashmap = "=6.1.0"
+petgraph = { version = "=0.8.3", default-features = false, features = ["std"] }
+tempfile = "=3.27.0"
+mimalloc = { version = "=0.1.48", default-features = false }
+num_cpus = "=1.17.0"
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

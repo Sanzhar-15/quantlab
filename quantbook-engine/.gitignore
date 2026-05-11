@@ -1,0 +1,7 @@
+target/
+.references/
+bench-results/
+docs/legal/*-provenance.md
+**/*.rs.bk
+.DS_Store
+*.swp

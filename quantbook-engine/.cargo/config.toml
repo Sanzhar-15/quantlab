@@ -1,0 +1,18 @@
+# Per-target SIMD floors. Distributable builds use runtime dispatch via pulp + multiversion
+# (Phase 0 Decision F). The CI guard at scripts/check-build-flags.sh fails any build that
+# carries `-C target-cpu=native` (Phase 0 Amendment A3 — prevents customer-machine SIGILL).
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-feature=+sse4.2"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+sse4.2"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+sse4.2"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-feature=+neon"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+neon"]

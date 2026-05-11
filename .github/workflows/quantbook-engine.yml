@@ -1,0 +1,56 @@
+name: quantbook-engine
+
+on:
+  push:
+    paths:
+      - 'quantbook-engine/**'
+      - '.github/workflows/quantbook-engine.yml'
+  pull_request:
+    paths:
+      - 'quantbook-engine/**'
+      - '.github/workflows/quantbook-engine.yml'
+
+defaults:
+  run:
+    working-directory: quantbook-engine
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: lint + test (stable 1.83)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.83.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: quantbook-engine -> target
+      - name: Phase 0 Amendment A3 — check build flags
+        run: bash scripts/check-build-flags.sh
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace
+
+  bench-compile:
+    name: bench compile (no run)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.83.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: quantbook-engine -> target
+      - name: cargo bench --no-run
+        run: cargo bench --workspace --no-run
