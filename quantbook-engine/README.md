@@ -15,12 +15,14 @@ quantbook-engine/
 ├── rust-toolchain.toml         # stable 1.95.0 (MSRV floor 1.85 for edition2024)
 ├── .cargo/config.toml          # per-target SIMD floors; NEVER target-cpu=native
 ├── scripts/
-│   ├── check-build-flags.sh    # Amendment A3 — CI gate for target-cpu=native
-│   ├── bench_phase0.sh         # acceptance run wrapper (Phase 0 Week 4)
-│   └── profile_phase0.sh       # perf collection
+│   ├── check-build-flags.sh        # Amendment A3 — CI gate for target-cpu=native (with --self-test)
+│   ├── check-cargo-lock-pins.sh    # workspace pin ↔ Cargo.lock drift guard (codex r11 #9)
+│   ├── bench_phase0.sh             # (Week 4 deliverable) acceptance run wrapper
+│   └── profile_phase0.sh           # (Week 4 deliverable) perf collection
+├── deny.toml                       # cargo-deny policy (advisories+sources+bans; licenses → ship-prep)
 ├── docs/
-│   ├── phase0/                 # acceptance results, exit packet, decisions
-│   └── legal/                  # provenance log (gitignored until ship-prep per CORR-10)
+│   ├── phase0/                     # acceptance results, exit packet, decisions
+│   └── legal/                      # NOTICE.md tracked; *-provenance.md gitignored until ship-prep (CORR-10)
 └── crates/
     ├── ql-types/               # Value, ErrorValue, coercion (Phase 0)
     ├── ql-storage/             # Workbook, Sheet, ColumnStore, SparseOverlay (Phase 0)
@@ -52,11 +54,17 @@ quantbook-engine/
 
 ```bash
 # Rust toolchain pinned via rust-toolchain.toml (1.95.0; MSRV floor 1.85).
-cargo metadata                                  # workspace must validate
+cargo metadata --locked                                    # workspace must validate
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo bench -p ql-bench --bench phase0_vector_25m -- --profile-time 1
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+bash scripts/check-build-flags.sh                          # Amendment A3
+bash scripts/check-build-flags.sh --self-test              # A3 self-test (10 poisoning forms)
+bash scripts/check-cargo-lock-pins.sh                      # workspace pin drift guard
+cargo audit --deny warnings                                # RustSec; requires `cargo install cargo-audit`
+cargo deny --locked check advisories sources bans          # requires `cargo install cargo-deny`
+# Week 4+ (benches not yet implemented):
+# cargo bench -p ql-bench --bench phase0_vector_25m -- --profile-time 1
 ```
 
 ## Phase 0 acceptance

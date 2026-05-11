@@ -5,8 +5,6 @@
 //! `crates/ql-calcgraph/benches/`; this crate provides their shared building blocks so the
 //! exit-packet numbers are comparable across runs and across amendments.
 
-#![allow(dead_code)]
-
 pub mod machine;
 pub mod report;
 pub mod synthetic;

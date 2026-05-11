@@ -11,8 +11,6 @@
 //! Phase 0 does NOT model `Int`, `Date`, `Time`, `Array`, `Pending` — those come later as
 //! `ql-functions` and `ql-formula-semantics` need them. Stick to the five variants until then.
 
-#![allow(dead_code)]
-
 pub mod coercion;
 pub mod error;
 pub mod value;

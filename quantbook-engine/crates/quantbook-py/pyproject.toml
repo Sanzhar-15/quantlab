@@ -1,0 +1,24 @@
+# Maturin build backend for the Quantbook PyO3 binding crate.
+# Phase 0 skeleton only — actual PyO3 wiring lands in Phase 5 (spec Decision C).
+# Round 7 + opus-consistency M-7: spec Decision C requires this file alongside
+# `python/quantbook/__init__.py` so the crate layout matches the documented shape.
+
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "quantbook"
+description = "PyO3 bindings for the Quantbook engine (Phase 5+ — not yet implemented)"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Development Status :: 1 - Planning",
+]
+dynamic = ["version"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "quantbook._quantbook"
