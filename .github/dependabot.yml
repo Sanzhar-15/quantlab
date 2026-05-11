@@ -4,3 +4,14 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+  # Quantbook engine — Rust workspace under /quantbook-engine. Codex r11 audit MAJOR #7
+  # flagged the absence of supply-chain monitoring; cargo-audit gates the CI side, this
+  # opens scheduled PRs for upgrades.
+  - package-ecosystem: "cargo"
+    directory: "/quantbook-engine"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "quantbook-engine"
+      - "deps"

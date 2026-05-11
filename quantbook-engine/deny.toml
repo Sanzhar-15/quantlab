@@ -1,0 +1,36 @@
+# Quantbook engine — cargo-deny policy
+#
+# Scope: advisories + sources + bans. License policy is INTENTIONALLY DEFERRED until
+# ship-readiness per CORR-10 (founder direction: "no legal yet"). When ship-prep starts,
+# uncomment the `[licenses]` table and pick the allow set.
+#
+# Run locally: `cargo deny check advisories sources bans` (from this directory).
+# CI runs the same in `.github/workflows/quantbook-engine.yml` audit job.
+
+[advisories]
+# Use the RustSec advisory DB. Fail on every advisory severity by default.
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/RustSec/advisory-db"]
+yanked = "deny"
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+# Allow specific multiple-versions where the resolver insists; track and reduce.
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+# Vendored / git deps are not allowed for Phase 0 (workspace is purely crates.io).
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+# [licenses]
+# DEFERRED to ship-readiness (CORR-10). Will allow MIT, Apache-2.0, BSD-3-Clause, ISC, etc.,
+# and require provenance for anything else.

@@ -34,14 +34,16 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.dependencies]
-# Apache Arrow — exact pins for Phase 0
-arrow = "=58.1.0"
-arrow-array = "=58.1.0"
-arrow-buffer = "=58.1.0"
-arrow-schema = "=58.1.0"
-arrow-select = "=58.1.0"
-arrow-arith = "=58.1.0"
-arrow-cast = "=58.1.0"
+# Apache Arrow — exact pins for Phase 0. All 7 crates kept in lock-step at the same patch
+# (58.3.0 is the latest 58.x patch as of 2026-05-11; arrow-array 58.1.0's `^58` transitive
+# would otherwise drift arrow-buffer to 58.3 and break the pin guard).
+arrow = "=58.3.0"
+arrow-array = "=58.3.0"
+arrow-buffer = "=58.3.0"
+arrow-schema = "=58.3.0"
+arrow-select = "=58.3.0"
+arrow-arith = "=58.3.0"
+arrow-cast = "=58.3.0"
 
 # Concurrency
 rayon = "=1.12.0"
@@ -62,8 +64,9 @@ bytemuck = "=1.25.0"
 # Python interop (Phase 5; reserved in workspace pins for consistency)
 pyo3 = { version = "=0.28.3", default-features = false, features = ["extension-module", "abi3-py310"] }
 
-# WASM (later phases)
-wasm-bindgen = "=0.2.118"
+# WASM (later phases). Pinned to 0.2.121 (latest 2026-05-11; the older 0.2.118 drifted via
+# transitive resolution after toolchain bump 1.83→1.95 — see scripts/check-cargo-lock-pins.sh).
+wasm-bindgen = "=0.2.121"
 
 # Storage / formats (later phases)
 polars = { version = "=0.53.0", default-features = false, features = ["lazy", "fmt", "parquet"] }

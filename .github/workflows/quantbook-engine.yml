@@ -58,3 +58,25 @@ jobs:
           workspaces: quantbook-engine -> target
       - name: cargo bench --no-run (--locked)
         run: cargo bench --locked --workspace --no-run
+
+  # Codex r11 MAJOR #7: no security gate. This job runs in parallel with `check` and gates
+  # the supply chain on every push/PR. Failures must be loud — `continue-on-error` is NOT set.
+  audit:
+    name: cargo-audit + cargo-deny + lock-pin guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: quantbook-engine -> target
+      - name: install cargo-audit + cargo-deny
+        run: cargo install --locked cargo-audit cargo-deny
+      - name: cargo audit (RustSec)
+        run: cargo audit --deny warnings
+      - name: cargo deny (advisories + sources + bans; licenses deferred per CORR-10)
+        run: cargo deny --locked check advisories sources bans
+      - name: Cargo.lock pin guard (codex r11 #9)
+        run: bash scripts/check-cargo-lock-pins.sh
