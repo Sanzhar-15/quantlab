@@ -5,7 +5,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * Tests for inspectorPanel — Phase 9 step B.
+ * Tests for inspectorPanel -- Phase 9 step B.
  *
  * The inspector panel is the right-side toggleable data-table host
  * (Phase 6 / Phase 8 polish). Until Phase 9 it had no jsdom coverage;
@@ -25,8 +25,8 @@
  *   - Dispose teardown: class removed, content empty, no leaks.
  */
 
-import { installDom, resetDom } from './helpers/jsdom-shim';
-installDom();
+// DOM globals installed by `out/test/helpers/mocha-setup.js` via mocha --require.
+import { resetDom } from './helpers/jsdom-shim';
 
 import * as assert from 'assert';
 
@@ -39,7 +39,7 @@ function mkRoot(): HTMLElement {
 	return root;
 }
 
-suite('inspectorPanel — Phase 9 jsdom coverage', () => {
+suite('inspectorPanel -- Phase 9 jsdom coverage', () => {
 	setup(() => { resetDom(); });
 
 	test('mount installs class, aria-label, and required sub-elements', () => {
@@ -142,7 +142,7 @@ suite('inspectorPanel — Phase 9 jsdom coverage', () => {
 			column: 'sym',
 			filter: { kind: 'set', column: 'sym', includes: ['A', 'B'] },
 		});
-		// setColumnFilter resets the window — re-emit a count to render.
+		// setColumnFilter resets the window -- re-emit a count to render.
 		store.dispatch({
 			type: 'inspectorDataReceived',
 			arrow: new Uint8Array(0),
@@ -212,6 +212,84 @@ suite('inspectorPanel — Phase 9 jsdom coverage', () => {
 		const width = document.documentElement.style.getPropertyValue('--qviz-inspector-width');
 		assert.strictEqual(width, '360px',
 			'mount should fall back to legacy sessionStorage key when v1 absent');
+		handle.dispose();
+	});
+
+	// Megaudit N-2 cure: both keys set, v1 must win (priority assertion).
+	test('when both v1 and legacy sessionStorage keys are set, v1 wins', () => {
+		window.sessionStorage.setItem('qviz.inspectorWidth.v1', '500px');
+		window.sessionStorage.setItem('qviz.inspectorWidth', '300px');
+		const root = mkRoot();
+		const store = createStore();
+		const handle = mountInspectorPanel(root, store);
+
+		const width = document.documentElement.style.getPropertyValue('--qviz-inspector-width');
+		assert.strictEqual(width, '500px',
+			'v1 sessionStorage key takes priority over legacy key');
+		handle.dispose();
+	});
+
+	// Megaudit B-6 cure: drag-to-resize is the most complex part of
+	// inspectorPanel (clamp, capture, sessionStorage write, cancel-on-hide).
+	// Tests below pin the contract.
+	test('pointerdown + pointermove + pointerup writes clamped width to sessionStorage', () => {
+		const root = mkRoot();
+		const store = createStore();
+		store.dispatch({ type: 'toggleInspector', visible: true });
+		const handle = mountInspectorPanel(root, store);
+
+		const handleEl = root.querySelector<HTMLElement>('.qviz-inspector-resize-handle');
+		assert.ok(handleEl, 'resize handle must exist');
+
+		// Start drag at clientX=800, then drag LEFT 200px (widens the
+		// inspector since handle is on the LEFT edge of the right-side panel).
+		const pointerdown = new (window as unknown as { PointerEvent: typeof PointerEvent }).PointerEvent('pointerdown', {
+			pointerId: 1, clientX: 800, clientY: 100, button: 0, bubbles: true,
+		});
+		handleEl!.dispatchEvent(pointerdown);
+
+		const pointermove = new (window as unknown as { PointerEvent: typeof PointerEvent }).PointerEvent('pointermove', {
+			pointerId: 1, clientX: 600, clientY: 100, bubbles: true,
+		});
+		window.dispatchEvent(pointermove);
+
+		const pointerup = new (window as unknown as { PointerEvent: typeof PointerEvent }).PointerEvent('pointerup', {
+			pointerId: 1, clientX: 600, clientY: 100, bubbles: true,
+		});
+		window.dispatchEvent(pointerup);
+
+		// After drag, sessionStorage v1 key should be written with the new px width.
+		const persisted = window.sessionStorage.getItem('qviz.inspectorWidth.v1');
+		assert.ok(persisted !== null, 'drag must persist width to sessionStorage v1 key');
+		assert.ok(/^\d+px$/.test(persisted!),
+			`persisted width must be Npx format, got ${persisted}`);
+
+		handle.dispose();
+	});
+
+	test('hide-during-drag cancels the drag (cancelDragIfActive cure)', () => {
+		const root = mkRoot();
+		const store = createStore();
+		store.dispatch({ type: 'toggleInspector', visible: true });
+		const handle = mountInspectorPanel(root, store);
+		const handleEl = root.querySelector<HTMLElement>('.qviz-inspector-resize-handle');
+		assert.ok(handleEl);
+
+		// Start a drag.
+		handleEl!.dispatchEvent(new (window as unknown as { PointerEvent: typeof PointerEvent }).PointerEvent('pointerdown', {
+			pointerId: 1, clientX: 800, clientY: 100, button: 0, bubbles: true,
+		}));
+		// Hide the inspector mid-drag.
+		store.dispatch({ type: 'toggleInspector', visible: false });
+		// Subsequent pointermove must NOT update --qviz-inspector-width.
+		const widthBefore = document.documentElement.style.getPropertyValue('--qviz-inspector-width');
+		window.dispatchEvent(new (window as unknown as { PointerEvent: typeof PointerEvent }).PointerEvent('pointermove', {
+			pointerId: 1, clientX: 200, clientY: 100, bubbles: true,
+		}));
+		const widthAfter = document.documentElement.style.getPropertyValue('--qviz-inspector-width');
+		assert.strictEqual(widthAfter, widthBefore,
+			'pointermove after hide-during-drag must NOT update width (cancelDragIfActive)');
+
 		handle.dispose();
 	});
 });

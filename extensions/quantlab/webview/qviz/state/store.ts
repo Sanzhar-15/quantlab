@@ -6,10 +6,11 @@
 /**
  * Root store for the qviz webview.
  *
- * Combines the eight slice reducers and exposes a tiny `getState /
- * dispatch / subscribe` API. Listeners are notified on every dispatch
- * when at least one slice changed (referential inequality on any
- * top-level slice triggers notify).
+ * Combines the ten slice reducers (source, schema, spec, ui, query,
+ * persistence, renderer, runtime, inspector, history) and exposes a
+ * tiny `getState / dispatch / subscribe` API. Listeners are notified
+ * on every dispatch when at least one slice changed (referential
+ * inequality on any top-level slice triggers notify).
  *
  * Phase 5 step B.2 (audit-merged plan, post-megaudit-cycle-2).
  *

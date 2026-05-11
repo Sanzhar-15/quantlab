@@ -5,7 +5,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * Tests for columnFilters — Phase 9 step B.
+ * Tests for columnFilters -- Phase 9 step B.
  *
  * Phase 6 added popup filter widgets to the inspector header cells (range
  * slider for numeric/temporal, contains text for high-cardinality strings,
@@ -26,8 +26,8 @@
  *   - dispose() tears everything down and removes the chip.
  */
 
-import { installDom, resetDom } from './helpers/jsdom-shim';
-installDom();
+// DOM globals installed by `out/test/helpers/mocha-setup.js` via mocha --require.
+import { resetDom } from './helpers/jsdom-shim';
 
 import * as assert from 'assert';
 
@@ -73,7 +73,7 @@ const SET_STATS: ColumnStats = {
 	distinct: ['A', 'B', 'C'],
 };
 
-suite('columnFilters — Phase 9 jsdom coverage', () => {
+suite('columnFilters -- Phase 9 jsdom coverage', () => {
 	setup(() => { resetDom(); });
 
 	test('chip button installed with default glyph + aria-pressed=false', () => {
@@ -134,7 +134,7 @@ suite('columnFilters — Phase 9 jsdom coverage', () => {
 
 		// Megaudit Codex MINOR cure: role is "group" not "dialog".
 		assert.strictEqual(popup.getAttribute('role'), 'group',
-			'popup should use role=group (not dialog) — megaudit MINOR cure');
+			'popup should use role=group (not dialog) -- megaudit MINOR cure');
 		assert.strictEqual(popup.getAttribute('aria-label'), 'Filter price');
 		assert.strictEqual(btn.getAttribute('aria-expanded'), 'true');
 
@@ -160,7 +160,7 @@ suite('columnFilters — Phase 9 jsdom coverage', () => {
 		assert.strictEqual(posted[0].type, 'requestColumnStats');
 		assert.strictEqual(posted[0].column, 'price');
 
-		// Close and reopen — should NOT refetch (entry is pending).
+		// Close and reopen -- should NOT refetch (entry is pending).
 		btn.click(); // close
 		btn.click(); // reopen
 		assert.strictEqual(posted.length, 1,
@@ -251,5 +251,79 @@ suite('columnFilters — Phase 9 jsdom coverage', () => {
 
 		assert.strictEqual(document.querySelector('.qviz-col-filter-popup'), null,
 			'mousedown outside should close the popup');
+	});
+
+	// Megaudit B-6 cure: Esc handler + focus restore on popup close.
+	test('Esc inside the popup closes it and restores focus to the chip', () => {
+		const root = mkRoot();
+		const store = createStore();
+		const bridge = { postMessage: () => undefined };
+		const handle = mountColumnFilter(root, 'close', store, { vscode: bridge });
+		const chip = root.querySelector<HTMLButtonElement>('.qviz-col-filter-btn')!;
+		chip.click();
+		// Stub stats so the popup body renders.
+		store.dispatch({
+			type: 'columnStatsReceived', column: 'close',
+			stats: NUMERIC_STATS,
+		});
+
+		const popup = document.querySelector<HTMLElement>('.qviz-col-filter-popup');
+		assert.ok(popup, 'popup is open');
+
+		// Dispatch Esc on the popup.
+		popup!.dispatchEvent(new (window as unknown as { KeyboardEvent: typeof KeyboardEvent }).KeyboardEvent('keydown', {
+			key: 'Escape', bubbles: true,
+		}));
+
+		assert.strictEqual(document.querySelector('.qviz-col-filter-popup'), null,
+			'Esc inside the popup must close it');
+		// Focus restored to the chip.
+		assert.strictEqual(document.activeElement, chip,
+			'closing the popup must restore focus to the chip button');
+
+		handle.dispose();
+	});
+
+	// Megaudit B-6 cure: range slider min/max inputs dispatch
+	// setColumnFilter with the typed values.
+	test('range widget min/max change dispatches setColumnFilter with typed values', () => {
+		const root = mkRoot();
+		const store = createStore();
+		const bridge = { postMessage: () => undefined };
+		const handle = mountColumnFilter(root, 'close', store, { vscode: bridge });
+		const chip = root.querySelector<HTMLButtonElement>('.qviz-col-filter-btn')!;
+		chip.click();
+		store.dispatch({
+			type: 'columnStatsReceived', column: 'close',
+			stats: NUMERIC_STATS,
+		});
+
+		// Find the range widget. Both min and max use the same
+		// `qviz-form-input` class on numeric inputs, ordered min-then-max
+		// in the DOM (per columnFilters.ts:147-157).
+		const popup = document.querySelector<HTMLElement>('.qviz-col-filter-popup');
+		assert.ok(popup);
+		const rangeWrap = popup!.querySelector<HTMLElement>('.qviz-col-filter-range');
+		assert.ok(rangeWrap, 'numeric column must render the range widget');
+		const inputs = Array.from(
+			rangeWrap!.querySelectorAll<HTMLInputElement>('input.qviz-form-input'),
+		);
+		assert.strictEqual(inputs.length, 2,
+			'numeric range widget must render exactly 2 inputs (min, max)');
+		const minInput = inputs[0];
+
+		// Set min to 25 and dispatch change.
+		minInput.value = '25';
+		minInput.dispatchEvent(new (window as unknown as { Event: typeof Event }).Event('change', { bubbles: true }));
+
+		// The store's filter for 'close' must be updated.
+		const filter = store.getState().inspector.filters.close;
+		assert.ok(filter, 'setColumnFilter must have populated the filter slot');
+		assert.strictEqual(filter!.kind, 'range');
+		if (filter!.kind === 'range') {
+			assert.strictEqual(filter!.min, 25);
+		}
+
+		handle.dispose();
 	});
 });

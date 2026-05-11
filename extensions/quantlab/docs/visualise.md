@@ -1,10 +1,10 @@
-# Quantlab Visualise — user guide
+# Quantlab Visualise -- user guide
 
 > Status: **v1** (shipped through Phase 9). Stable API; subject to additive
 > changes in v2 (see "Out of scope" at the end).
 
 Visualise is Quantlab's interactive chart builder. It opens any CSV /
-Parquet / XLSX file, infers a sensible default chart from the schema,
+TSV / Parquet file, infers a sensible default chart from the schema,
 and lets you refine it through a GUI without leaving VS Code. The
 result is a `.qviz.json` file that pairs with the data; opening that
 JSON re-renders the same chart.
@@ -23,14 +23,19 @@ The Quantlab extension registers two custom editors:
 
 | View type                       | File pattern              | What it does                              |
 | ------------------------------- | ------------------------- | ----------------------------------------- |
-| `quantlab.visualiseView`        | `*.csv`, `*.parquet`, `*.xlsx` | Read-only data preview (priority `option`) |
+| `quantlab.visualiseView`        | `*.csv`, `*.tsv`, `*.parquet` | Read-only data file (builder bootstraps from it; saving emits a `.qviz.json` next to the data) |
 | `quantlab.visualiseSpecView`    | `*.qviz.json`             | The chart builder (priority `default`)    |
 
-Right-click a CSV / Parquet / XLSX in the explorer and pick
+Right-click a CSV / TSV / Parquet file in the explorer and pick
 **Quantlab: Visualise** (or use `Ctrl+Q V`) to open the data view.
 Saving a chart from the builder produces a `<name>.qviz.json` next to
-the data file — double-clicking that file from then on reopens the
+the data file -- double-clicking that file from then on reopens the
 chart.
+
+> **XLSX is NOT supported in v1.** The daemon's security gate
+> (`python/qviz/security.py:45`) accepts only `.parquet`, `.csv`, and
+> `.tsv`. Convert xlsx to one of these (e.g., via pandas) before
+> opening with Visualise.
 
 ### What a `.qviz.json` file is
 
@@ -66,7 +71,7 @@ to redraw a chart from its source data:
 ```
 
 The validator at `src/qviz/validate.ts` is the authoritative gate
-between disk and the application — every `.qviz.json` is parsed +
+between disk and the application -- every `.qviz.json` is parsed +
 validated before it reaches the renderer. Workspace-relative dataset
 URIs are required; `..` escapes are rejected; unknown transform kinds
 are rejected (defense against forward-rolled specs an older Quantlab
@@ -76,7 +81,7 @@ can't run).
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  VS Code custom editor (webview iframe — CSP-locked, vega-interpreter)│
+│  VS Code custom editor (webview iframe -- CSP-locked, vega-interpreter)│
 │  ┌────────────────────┐  ┌────────────────────┐  ┌─────────────────┐ │
 │  │ Builder UI (left)  │  │ Chart preview      │  │ Inspector (opt.)│ │
 │  │ - column panel     │  │ - charts-plus or   │  │ - virtualized   │ │
@@ -104,14 +109,15 @@ can't run).
 
 ---
 
-## 2. Getting started — open a data file
+## 2. Getting started -- open a data file
 
-1. Right-click a CSV / Parquet / XLSX in the explorer.
+1. Right-click a CSV / TSV / Parquet file in the explorer.
 2. Pick **Quantlab: Visualise** (or use `Ctrl+Q V` with the file open).
-3. Quantlab spawns the qviz daemon (Python, from
-   `quantlab.pythonPath` or `~/.quantlab/venv/bin/python`), reads the
-   file's schema, and shows a default chart.
-4. To customize, save once — the editor switches to the spec view
+3. Quantlab spawns the qviz daemon (Python interpreter resolved in
+   this order: explicit `quantlab.pythonPath` setting →
+   `python.defaultInterpreterPath` setting → `~/.quantlab/venv/bin/python`
+   fallback), reads the file's schema, and shows a default chart.
+4. To customize, save once -- the editor switches to the spec view
    (`.qviz.json`) with the full builder UI.
 
 ### Default-chart picks (Phase 8 Step A)
@@ -128,7 +134,7 @@ The default chart is derived from the schema:
 The OHLCV detector requires **all four** of open/high/low/close to be
 present and numeric, plus a temporal column. `volume` is optional. The
 match is case-insensitive (`Open`, `OPEN`, `open` all work), but the
-column names must be the literals — `open_price` won't match.
+column names must be the literals -- `open_price` won't match.
 
 If none of the heuristics fits the schema, the builder opens with no
 preselected chart and you pick types + encodings manually.
@@ -153,7 +159,7 @@ Nine buttons:
 | `general`    | line, bar, histogram, scatter, heatmap, pie        |
 
 Shared types (line, bar, histogram) stay in the current family when
-clicked — switching scatter → line keeps you in `general`; switching
+clicked -- switching scatter → line keeps you in `general`; switching
 candlestick → line keeps you in `timeseries`. Family-only types
 (candlestick, baseline → timeseries; scatter, heatmap, pie → general)
 switch family on click.
@@ -163,21 +169,25 @@ Space/Enter selects. The picker uses a WAI-ARIA radiogroup pattern with
 a roving tabindex (exactly one button is in the tab order).
 
 ### Encoding shelves
-The shelf list changes with the chart type:
+The shelf list changes with the chart type (authoritative source:
+`src/qviz/chartChannels.ts:CHART_CHANNELS`):
 
-| Type        | Shelves                                                 |
-| ----------- | ------------------------------------------------------- |
-| line / area | `x`, `y`, `color`, `y2` (for second axis)               |
-| scatter     | `x`, `y`, `color`, `size`, `shape`                      |
-| bar / hist  | `x`, `y`, `color`, `facet_row`, `facet_col`             |
-| heatmap     | `x`, `y`, `color`                                       |
-| pie         | `color` (categorical), `size` (quantitative)            |
-| candlestick | OHLCV cluster (`time`/`open`/`high`/`low`/`close`/`volume`) |
-| baseline    | `x`, `y` + a baseline reference value                   |
+| Type        | Required          | Optional                                       |
+| ----------- | ----------------- | ---------------------------------------------- |
+| line / area | `x`, `y`          | `color`, `y2`, `facet_row`, `facet_col`        |
+| scatter     | `x`, `y`          | `color`, `size`, `shape`, `facet_row`, `facet_col` |
+| bar         | `x`, `y`          | `color`, `facet_row`, `facet_col`              |
+| histogram   | `x`               | `y` (count if omitted), `color`, `facet_row`, `facet_col` |
+| heatmap     | `x`, `y`, `color` | `facet_row`, `facet_col`                       |
+| pie         | `color`, `y`      | (no facets)                                    |
+| candlestick | `ohlcv` cluster (`time`/`open`/`high`/`low`/`close`/`volume`) | -- |
+| baseline    | `x`, `y`          | `color` (baseline value is hardcoded to 0 in v1) |
 
 Each shelf accepts one encoding. Drag a column onto a shelf or use the
-shelf's dropdown. Empty required shelves block save (the diagnostics
-readout names the missing fields).
+shelf's dropdown. Missing required shelves produce a compile-time
+diagnostic in the preview area (NOT a save block -- the validator
+intentionally allows structurally-valid-but-incomplete specs so the
+user can save a half-built spec and resume later).
 
 ### OHLCV cluster (candlestick only)
 A compound shelf that takes 4–5 column names at once. The smart default
@@ -186,20 +196,35 @@ manually.
 
 ### Transform pipeline
 A list of data transforms applied in order before the chart sees the
-data. Supported kinds:
+data. Supported kinds (authoritative enum: `src/qviz/spec.ts:Transform`):
 
-- `filter` — predicate over a column (`>`, `<`, `>=`, `<=`, `=`, `!=`, `in`, `contains`).
-- `groupby` + `aggregate` — must appear as a pair, in order.
-- `sort` — column + asc/desc.
-- `limit` — cap rows after sort (range [1, 10,000,000]).
-- `bin` — bucket a continuous column.
-- `date_trunc` — truncate timestamps to a calendar boundary.
-- `resample` — temporal resample with an aggregation.
-- `tz_convert` — convert a temporal column to a timezone.
-- `math` — derived expression (e.g., `log_return`, `running_max`, `drawdown`).
-- `window` — rolling/expanding window.
+- `filter` -- predicate over a column. Ops: `==`, `!=`, `<`, `<=`, `>`,
+  `>=`, `in`, `not_in`, `is_null`, `not_null`, `contains`.
+- `groupby` + `aggregate` -- must appear as a pair, in order.
+  Aggregate fns: `sum`, `mean`, `median`, `min`, `max`, `count`, `std`,
+  `first`, `last`.
+- `sort` -- one or more (column, desc?) entries.
+- `limit` -- cap rows after sort (range [1, 10,000,000]).
+- `bin` -- bucket a continuous column. Strategies: `equal_width`
+  (`equal_freq` is documented but rejected by the validator -- not yet
+  implemented).
+- `date_trunc` -- truncate timestamps to a calendar boundary
+  (`second`/`minute`/`hour`/`day`/`week`/`month`/`quarter`/`year`).
+- `tz_convert` -- convert a temporal column to a timezone.
+- `math` -- derived scalar fns: `log`, `log10`, `exp`, `abs`, `sqrt`,
+  `log_returns` (plural), `pct_change`, `drawdown`. The `math` fns are
+  scalar-per-row; running aggregates like running-max belong in the
+  `window` transform, not here.
+- `window` -- rolling/expanding window. Fns: `rolling_mean`,
+  `rolling_std`, `rolling_max`, `rolling_min`, `cumsum`, `cumprod`,
+  `cummax`, `cummin`. (`ema` is documented in the spec type but rejected
+  by the daemon compiler in v1.)
 
-Pipeline validation runs at every save and at every spec parse — orphan
+Not implemented in v1 (rejected by validator or compiler):
+`resample` (use `date_trunc` + `groupby` + `aggregate`), `window fn=ema`,
+`bin strategy=equal_freq`.
+
+Pipeline validation runs at every save and at every spec parse -- orphan
 `groupby` (no `aggregate` following) is rejected, and unknown kinds are
 rejected for forward-roll safety.
 
@@ -220,9 +245,13 @@ transformation pipeline ("are my rows being filtered correctly?",
 ### Toggle
 - Keyboard: **`Ctrl+I`** (Mac: **`Cmd+I`**).
 - Mouse: click the "Inspector" toggle button in the editor header.
-- The toggle is disabled when the daemon doesn't advertise the
-  `inspector` capability (graceful degradation against pre-Phase-6
-  daemons).
+- The toggle is disabled when the daemon doesn't advertise **all three**
+  inspector capability flags: `inspector.previewOffset`,
+  `inspector.columnStats`, and `inspector.aggregateFilters`. Any one
+  flag missing disables the toggle (graceful degradation against
+  pre-Phase-6 / pre-Phase-7 daemons; the cure in Phase 7 added
+  per-respawn re-broadcast so the toggle re-enables when a respawned
+  daemon advertises the full bag).
 
 ### Three filter widgets
 Each column header gets a small `⏷` filter chip. Clicking it opens a
@@ -238,7 +267,7 @@ popup whose widget kind depends on the column's stats:
   panel's lifetime.
 - Active filters show a `⏷•` glyph + `aria-pressed=true` (megaudit
   Tier-6: non-color cue + screen-reader signal).
-- Popups use `role="group"` (not `role="dialog"` — the popup isn't
+- Popups use `role="group"` (not `role="dialog"` -- the popup isn't
   modal, it's a labelled container).
 - Popups auto-clamp + flip above the cell if the viewport doesn't have
   room below.
@@ -248,7 +277,7 @@ popup whose widget kind depends on the column's stats:
 ### Aggregated charts (Phase 7 B-10 cure)
 For specs with `groupby` + `aggregate` (e.g., `pnl_by_strategy`,
 `factor_exposure`), the inspector view matches the chart's aggregated
-shape — clicking a row in the table highlights the corresponding chart
+shape -- clicking a row in the table highlights the corresponding chart
 point, and vice versa. The cure threaded the spec's transform pipeline
 through the daemon's `op_preview` so the inspector window pages the
 *aggregated* result, not the raw rows.
@@ -258,7 +287,7 @@ through the daemon's `op_preview` so the inspector window pages the
 - Row click → chart-side selection (when the chart's x-field exists in the preview schema).
 - `Esc` clears selection.
 - Selection routes through whichever channel the chart actually keys on
-  — `ohlcv.time` for candlestick, `color.field` for pie, `x.field` for
+  -- `ohlcv.time` for candlestick, `color.field` for pie, `x.field` for
   everything else (megaudit B-2 / B-3 cure).
 
 ### Performance notes
@@ -300,14 +329,15 @@ qviz.equity_curve(
 qviz.pnl_by_strategy(
     df=trades_df,                 # columns: strategy, pnl
     output="figures/pnl_by_strat",
-    aggregate=True,               # default; aggregates sum(pnl) by strategy
+    aggregate=True,               # default; aggregates sum(pnl) by strategy, sorted desc
 )
 
 # 4. Drawdown
 qviz.drawdown(
     df=equity_df,                 # columns: time, equity
     output="figures/drawdown",
-    # daemon-side spec sets y_axis_zero=false so the area renders below zero
+    # drawdown is pre-computed in Python (running_max guard handles
+    # negative / zero peaks); area renders naturally below zero.
 )
 
 # 5. Factor exposure
@@ -324,16 +354,20 @@ qviz.factor_exposure(
   `.` in basename), interpreted as a path **relative to CWD** (the
   workspace root). Absolute paths outside CWD are rejected.
 - **Output**: two files, written atomically (`tempfile.mkstemp + os.replace`):
-  - `<stem>.parquet` — the source data (or pre-computed shape, for `drawdown`).
-  - `<stem>.qviz.json` — the spec.
+  - `<stem>.parquet` -- the source data (or pre-computed shape, for `drawdown`).
+  - `<stem>.qviz.json` -- the spec.
   - Return value: `Path` to the spec.
 - **Provenance**:
-  - `generator = "quantlab-viz-preset-<name>/v<PRESET_API_VERSION>"`.
+  - `generator = "qviz.<preset_name>/<PRESET_API_VERSION>"` (e.g.,
+    `"qviz.candlestick/0.1.0"`). Built by
+    `python/qviz/presets/_common.py:make_generator_string`.
   - `source = "engine-emitted"`.
   - `query_hash` is the all-zeros sentinel (the preset writes the
     parquet itself; no SQL hash to compute).
   - `schema_hash` + `mtime_ns` computed through the same authoritative
     `reader.hash_schema` / `reader.file_mtime_ns` the daemon uses.
+  - `tool_versions` includes both `qviz_schema: 1` and
+    `python_qviz: "0.1.0"` (the preset API's own version).
 - **Safety**:
   - Output paths reject NUL bytes, C0 control chars, `..` segments,
     paths escaping CWD, empty stems.
@@ -347,24 +381,27 @@ qviz.factor_exposure(
 
 ### Required vs. configurable columns
 
-| Preset            | Required (default names)              | Configurable        |
-| ----------------- | ------------------------------------- | ------------------- |
-| `candlestick`     | `time, open, high, low, close` (+ optional `volume`) | — fixed for now     |
-| `equity_curve`    | `time, equity`                        | `time_col=, equity_col=` |
-| `pnl_by_strategy` | `strategy, pnl`                       | `strategy_col=, pnl_col=` |
-| `drawdown`        | `time, equity`                        | `time_col=, equity_col=` |
-| `factor_exposure` | `factor, exposure`                    | `factor_col=, exposure_col=` |
+| Preset            | Required columns                                     | Configurable kwargs |
+| ----------------- | ---------------------------------------------------- | -------------------- |
+| `candlestick`     | `time, open, high, low, close` (+ optional `volume`; column names hard-coded) | `title=, description=, timezone=, decimation= (auto / lttb / minmax / none), limit= ([1, 10_000_000]), overwrite=` |
+| `equity_curve`    | `time, equity`                                       | `time_col=, equity_col=, title=, description=, timezone=, decimation=, overwrite=` |
+| `pnl_by_strategy` | `strategy, pnl`                                      | `strategy_col=, pnl_col=, title=, description=, aggregate=, overwrite=` |
+| `drawdown`        | `time, equity`                                       | `time_col=, equity_col=, title=, description=, timezone=, decimation=, overwrite=` |
+| `factor_exposure` | `factor, exposure`                                   | `factor_col=, exposure_col=, title=, description=, aggregate=, overwrite=` |
 
-`drawdown` is pre-computed in Python (`running_max → equity/max - 1`,
+`drawdown` is pre-computed in Python (`running_max -> equity/max - 1`,
 inf normalized to NaN, `running_max > 0` guard for negative-equity
 prefixes). The on-disk parquet stores only `time` + `drawdown`; the
-spec sets `chart.options.y_axis_zero=false` so the area renders below
-the baseline. If you need to keep raw equity, call `equity_curve(df)`
-and `drawdown(df)` separately.
+emitted spec leaves `chart.options.y_axis_zero` unset because the
+timeseries renderer doesn't honor it yet -- drawdown values are
+naturally ≤ 0, so the area renders below the baseline regardless. If
+you need to keep raw equity, call `equity_curve(df)` and `drawdown(df)`
+separately.
 
 `pnl_by_strategy` and `factor_exposure` aggregate by default with a
-tie-break sort key on the group column ascending — set
-`aggregate=False` if your DataFrame is already pre-aggregated.
+tie-break sort key on the group column ascending and the aggregate
+alias descending -- set `aggregate=False` if your DataFrame is already
+pre-aggregated.
 
 ### Smoke checklist for the preset API
 `.plans/_phase7-smoke-checklist.md` walks the end-to-end use of each
@@ -381,9 +418,9 @@ See "Default-chart picks" above. Detector lives at
 ### Ctrl+Z / Ctrl+Y undo + redo (Step B)
 Two-layer history:
 
-- **UI history** (inspector toggle, selection) — handled in the webview
+- **UI history** (inspector toggle, selection) -- handled in the webview
   store's `history` slice (cap 100 entries).
-- **Spec edits** — ride VS Code's native `CustomDocument` undo stack
+- **Spec edits** -- ride VS Code's native `CustomDocument` undo stack
   via the existing `onDidChangeCustomDocument` wiring.
 
 When `Ctrl+Z` fires, the webview first checks `state.history.past`. If
@@ -401,7 +438,7 @@ actual paint.
 ### Retry buttons on error banners (Step D)
 - **"Retry connection"** appears next to the daemon-status banner
   whenever the daemon is `crashed | respawning | unavailable`. Clicking
-  it forces an immediate respawn attempt — no editor reload required.
+  it forces an immediate respawn attempt -- no editor reload required.
 - **"Re-check file"** appears when the dataset is `missing |
   dangling-symlink | access-denied | path-escape |
   extension-not-allowed | no-workspace`. Clicking it re-statting the
@@ -427,15 +464,17 @@ each appears as a separate clause separated by ` · `:
 | -------------------------------------------------------------------------- | ------------------------------------------ | ------------------------------------------------------- |
 | `computing…`                                                                | A daemon request is inflight              | Wait; or change inputs to cancel-and-replace.           |
 | `Last successful render from previous spec`                                | Inflight request whose specHash differs   | Wait; once it lands, the old chart is replaced.         |
-| `Data file changed — schema preserved; save to refresh provenance`         | File rewritten, columns unchanged          | Save once; the new mtime + hash get written to the spec.|
-| `Data file changed — N field(s) missing: a, b`                             | Schema drift; spec references columns no longer in the data | Pick replacement columns on the affected encoding shelves; or revert the data file. Save is **blocked** until the spec is consistent. |
+| `Data file changed -- schema preserved; save to refresh provenance`         | File rewritten, columns unchanged          | Save once; the new mtime + hash get written to the spec.|
+| `Data file changed -- N field(s) missing: a, b`                            | Schema drift; spec references columns no longer in the data | Pick replacement columns on the affected encoding shelves; or revert the data file. Save is **blocked** in this drift state until the spec is consistent. |
 | `Daemon crashed; retrying in Nms`                                          | Daemon died; auto-retry scheduled         | Wait; or click **Retry connection** to skip the wait.  |
 | `Daemon respawning…`                                                       | Auto-retry in progress                    | Wait.                                                  |
 | `Daemon unavailable: <msg>`                                                | Daemon failed to spawn / banner timed out | Check `quantlab.pythonPath`; click **Retry connection**.|
 | `Dataset file not found: <uri>`                                            | File deleted between open and now         | Click **Re-check file** after restoring the file.       |
 | `Dataset symlink target gone: <uri>`                                       | Symlink target removed                    | Fix symlink; click **Re-check file**.                  |
-| `Dataset access denied: <uri> — <msg>`                                     | Permissions changed                       | Fix perms; click **Re-check file**.                    |
+| `Dataset access denied: <uri> -- <msg>`                                     | Permissions changed                       | Fix perms; click **Re-check file**.                    |
 | `Dataset path is not workspace-relative: <uri>`                            | Spec's dataset URI escapes the workspace  | Move data into workspace; edit spec dataset URI; or open a different workspace folder. |
+| `Dataset extension not supported: <uri>`                                   | File extension is not in `.parquet/.csv/.tsv` | Convert the file (xlsx → parquet via pandas, etc.); update the spec's `dataset.uri`. |
+| `No workspace folder is open; cannot resolve dataset.`                     | The editor opened the spec without a workspace context | Open the folder that contains the data file as a workspace, or use **File > Open Folder**. |
 
 The diagnostics readout under the stripe shows the last daemon error
 (compile / apply / daemon) with its transform index if applicable:
@@ -460,7 +499,7 @@ a tooltip explaining the capability gap. If the toggle IS enabled but
 the table shows no rows, check the diagnostics readout for an
 `inspectorError` message.
 
-**Q: Save says "cannot save — fields missing".**
+**Q: Save says "cannot save -- fields missing".**
 A: Schema drift. Your spec references columns that don't exist in the
 current data file. The stripe shows the missing column list. Either:
 1. Replace the missing columns on the encoding shelves (the column
@@ -483,7 +522,7 @@ A: Schema drift is auto-detected (mtime / schema-hash compare), but
 any encoding to force a re-query.
 
 **Q: Inspector filters disappear when I close the panel.**
-A: That's intentional. Filters are session-only by design — they never
+A: That's intentional. Filters are session-only by design -- they never
 persist to `.qviz.json`. Reopening the panel starts with a clean filter
 state. (To make a filter permanent, add a corresponding `filter`
 transform to the spec's transform pipeline.)
@@ -560,7 +599,7 @@ reload required"`.
   post-resolve symlink swaps can't redirect (Phase 7 megaudit M-1
   cure).
 - Inspector filters' set sentinels: empty `{op:'in', value:[]}` is
-  short-circuited daemon-side (megaudit M-G cure) — no rows match.
+  short-circuited daemon-side (megaudit M-G cure) -- no rows match.
 
 ### Phase boundaries (for future readers)
 
@@ -574,7 +613,7 @@ reload required"`.
 | 5     | Custom editors + builder UI + drift-aware save                           |
 | 6     | Data inspector panel (virtualized table, column filters, selection sync) |
 | 7     | Python preset API (`qviz.candlestick`, `equity_curve`, …)               |
-| 8     | Polish — OHLCV smart-default, Ctrl+Z, skeleton overlay, retry buttons   |
+| 8     | Polish -- OHLCV smart-default, Ctrl+Z, skeleton overlay, retry buttons   |
 | 9     | Tests + docs (jsdom UI tests, E2E smoke, this guide)                    |
 
 ---
@@ -583,7 +622,7 @@ reload required"`.
 
 The following are NOT in v1, by design:
 
-- Remote VS Code (SSH / Codespaces / dev-container) — the daemon
+- Remote VS Code (SSH / Codespaces / dev-container) -- the daemon
   expects a local filesystem and a local Python interpreter.
 - User-authored expression language for calculated fields. (Use the
   pipeline's `math` transform with a curated function whitelist.)
@@ -595,7 +634,7 @@ The following are NOT in v1, by design:
 - Chart-side visual selection overlay (deferred from Phase 6 polish).
 - Time-series `factor_exposure` (rolling correlation against factor
   returns); v1 ships the long-format snapshot only.
-- Auto-open the produced `.qviz.json` after preset writes — would need
+- Auto-open the produced `.qviz.json` after preset writes -- would need
   a brittle `code` CLI shellout from Python.
 
 ---
