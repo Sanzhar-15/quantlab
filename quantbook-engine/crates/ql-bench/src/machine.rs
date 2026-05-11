@@ -18,9 +18,18 @@ pub struct MachineReport {
     pub logical_cores: usize,
     pub physical_cores: Option<usize>,
     pub ram_total_bytes: Option<u64>,
-    pub rust_version: &'static str,
+    /// Actual rustc that built this binary — captured by `build.rs` from `rustc -vV`.
+    /// Example: `"1.95.0 (59807616e 2026-04-14)"`. Codex r11 MAJOR #6.
+    pub rustc_version: &'static str,
+    /// Declared MSRV floor from `[workspace.package].rust-version`. Different from the
+    /// build-time rustc. Example: `"1.85"`.
+    pub msrv_floor: &'static str,
+    /// Full `rustc -vV` output with newlines replaced by ` | ` (host triple, release date, LLVM, etc.).
+    pub rustc_verbose: &'static str,
     pub build_profile: &'static str,
     pub rustflags_env: Option<String>,
+    pub cargo_build_rustflags_env: Option<String>,
+    pub cargo_encoded_rustflags_env: Option<String>,
     pub chunk_rows: usize,
     pub rayon_num_threads: Option<String>,
     pub simd: SimdDispatch,
@@ -61,13 +70,17 @@ impl MachineReport {
             logical_cores: num_cpus::get(),
             physical_cores: Some(num_cpus::get_physical()),
             ram_total_bytes: detect_ram_total(),
-            rust_version: env!("CARGO_PKG_RUST_VERSION"),
+            rustc_version: env!("QL_RUSTC_VERSION"),
+            msrv_floor: env!("CARGO_PKG_RUST_VERSION"),
+            rustc_verbose: env!("QL_RUSTC_VERBOSE"),
             build_profile: if cfg!(debug_assertions) {
                 "debug"
             } else {
                 "release"
             },
             rustflags_env: env::var("RUSTFLAGS").ok(),
+            cargo_build_rustflags_env: env::var("CARGO_BUILD_RUSTFLAGS").ok(),
+            cargo_encoded_rustflags_env: env::var("CARGO_ENCODED_RUSTFLAGS").ok(),
             chunk_rows: env::var("QBOOK_CHUNK_ROWS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -98,13 +111,27 @@ impl MachineReport {
         }
         writeln!(
             out,
-            "| Rust toolchain | {} ({}) |",
-            self.rust_version, self.build_profile
+            "| Rust toolchain | rustc {} ({}, MSRV floor {}) |",
+            self.rustc_version, self.build_profile, self.msrv_floor
         )?;
         writeln!(
             out,
             "| RUSTFLAGS | `{}` |",
             self.rustflags_env.as_deref().unwrap_or("_(unset)_")
+        )?;
+        writeln!(
+            out,
+            "| CARGO_BUILD_RUSTFLAGS | `{}` |",
+            self.cargo_build_rustflags_env
+                .as_deref()
+                .unwrap_or("_(unset)_")
+        )?;
+        writeln!(
+            out,
+            "| CARGO_ENCODED_RUSTFLAGS | `{}` |",
+            self.cargo_encoded_rustflags_env
+                .as_deref()
+                .unwrap_or("_(unset)_")
         )?;
         writeln!(out, "| Chunk rows | {} |", self.chunk_rows)?;
         writeln!(
@@ -196,6 +223,37 @@ mod tests {
         assert!(r.logical_cores >= 1);
         assert!(!r.os.is_empty());
         assert!(!r.arch.is_empty());
+        // Both rustc version (actual build-time) and MSRV floor (package metadata) must be set.
+        assert!(!r.rustc_version.is_empty());
+        assert!(!r.msrv_floor.is_empty());
+        // The two should differ in practice: rustc_version is "X.Y.Z (hash date)", MSRV is "X.Y".
+        assert!(
+            r.rustc_version.starts_with(char::is_numeric),
+            "rustc_version should start with a digit, got {:?}",
+            r.rustc_version
+        );
+        assert!(
+            r.msrv_floor.starts_with(char::is_numeric),
+            "msrv_floor should start with a digit, got {:?}",
+            r.msrv_floor
+        );
+    }
+
+    #[test]
+    fn rustc_version_is_actual_not_msrv() {
+        // Codex r11 MAJOR #6 lock: ensure we capture the BUILD-time rustc, not the package
+        // MSRV. The captured version contains a git hash + date, never plain "1.85".
+        let r = MachineReport::collect();
+        assert_ne!(
+            r.rustc_version, r.msrv_floor,
+            "rustc_version must NOT equal MSRV floor"
+        );
+        // build-time rustc includes a parenthesized "(hash date)" detail; MSRV does not.
+        assert!(
+            r.rustc_version.contains('('),
+            "rustc_version should embed the (hash date) detail; got {:?}",
+            r.rustc_version
+        );
     }
 
     #[test]
@@ -207,6 +265,12 @@ mod tests {
         assert!(s.contains("| OS |"));
         assert!(s.contains("| Logical cores |"));
         assert!(s.contains("| SIMD detected |"));
+        // Toolchain row carries BOTH actual rustc and MSRV floor.
+        assert!(s.contains("MSRV floor"));
+        // All three Cargo rustflag env channels surface in the report (codex r11 #6 follow-up).
+        assert!(s.contains("RUSTFLAGS"));
+        assert!(s.contains("CARGO_BUILD_RUSTFLAGS"));
+        assert!(s.contains("CARGO_ENCODED_RUSTFLAGS"));
     }
 
     #[test]
