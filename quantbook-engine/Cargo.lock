@@ -728,6 +728,9 @@ version = "0.1.0"
 [[package]]
 name = "ql-formula-syntax"
 version = "0.1.0"
+dependencies = [
+ "ql-types",
+]
 
 [[package]]
 name = "ql-functions"
