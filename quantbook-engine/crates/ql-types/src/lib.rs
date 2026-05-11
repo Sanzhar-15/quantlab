@@ -1,7 +1,7 @@
 //! `ql-types` — Phase 0 minimum cell-value types for the Quantbook engine.
 //!
 //! Three modules, one shape:
-//! - [`error`] — the 13-variant `ErrorValue` (Excel sigils + Quantbook-specific surfaces).
+//! - [`error`] — the 14-variant `ErrorValue` (Excel sigils + Quantbook-specific surfaces + AI reservation).
 //! - [`value`] — the 5-variant `Value` (`Blank | Number | Boolean | Text | Error`).
 //! - [`coercion`] — Excel-compatible boundary functions: `to_number_{strict,lenient}`,
 //!   `to_logical`, `to_text`, `sanitize_f64`.

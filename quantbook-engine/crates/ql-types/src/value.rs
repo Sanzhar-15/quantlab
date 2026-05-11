@@ -38,7 +38,7 @@ pub enum Value {
     Boolean(bool),
     /// String value. `Arc<str>` for cheap clones across formula evaluations.
     Text(Arc<str>),
-    /// One of the 13 error sigils — `#REF!`, `#VALUE!`, … See `ErrorValue`.
+    /// One of the 14 error sigils — `#REF!`, `#VALUE!`, … `#AI_NOT_AVAILABLE_V1`. See `ErrorValue`.
     Error(ErrorValue),
 }
 

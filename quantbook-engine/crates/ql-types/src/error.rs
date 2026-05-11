@@ -1,12 +1,14 @@
-//! `ErrorValue` — the 13 error kinds the Quantbook engine surfaces, per spec Part V §2.
+//! `ErrorValue` — the 14 error kinds the Quantbook engine surfaces, per spec Part V §2.
 //!
-//! Eight are Excel-equivalents (`#REF!`, `#VALUE!`, `#N/A`, `#DIV/0!`, `#NULL!`, `#NUM!`,
-//! `#NAME?`, `#SPILL!`, `#CALC!`). Five are Quantbook-specific surfaces for kernel/connector
-//! failures:
-//!   * `Disconnected` — terminal:// or external data source went away
-//!   * `Binding`      — `qb.show(df)` BoundFrame coercion failed
-//!   * `Timeout`      — UDF / connector exceeded its budget
-//!   * `Permission`   — Workspace-Trust gate denied (kernel spawn / file read)
+//! Nine are Excel-equivalents (`#REF!`, `#VALUE!`, `#N/A`, `#DIV/0!`, `#NULL!`, `#NUM!`,
+//! `#NAME?`, `#SPILL!`, `#CALC!`). Four are Quantbook-specific surfaces for kernel/connector
+//! failures, and one is reserved for the AI cell function:
+//! - `Disconnected` — terminal:// or external data source went away
+//! - `Binding` — `qb.show(df)` BoundFrame coercion failed
+//! - `Timeout` — UDF / connector exceeded its budget
+//! - `Permission` — Workspace-Trust gate denied (kernel spawn / file read)
+//! - `AINotAvailable` — parser-reserved error for `=AI(...)` until the v2 AI cell function ships
+//!   (Round 7 CORR-06 / T4-D05; sigil `#AI_NOT_AVAILABLE_V1`)
 //!
 //! Phase 0 does NOT model `#NIMPL!`, `#CIRC!`, `#CANCEL!` — those come later (interpreter for
 //! the first two; collab for the third).
@@ -43,6 +45,12 @@ pub enum ErrorValue {
     Timeout,
     /// `#PERMISSION!` — Workspace-Trust gate denied an operation. Quantbook-specific.
     Permission,
+    /// `#AI_NOT_AVAILABLE_V1` — `=AI(...)` is reserved keyword in Phase 0; the actual AI cell
+    /// function ships in v2. Parser emits `Error(AINotAvailable)` on any `=AI(...)` formula
+    /// entry. The `_V1` suffix marks this as a temporary error class — when v2 lands, callers
+    /// can match-distinguish v1-era pre-AI formulas from real AI invocations.
+    /// Round 7 CORR-06 / T4-D05.
+    AINotAvailable,
 }
 
 impl ErrorValue {
@@ -63,12 +71,13 @@ impl ErrorValue {
             ErrorValue::Binding => "#BINDING!",
             ErrorValue::Timeout => "#TIMEOUT!",
             ErrorValue::Permission => "#PERMISSION!",
+            ErrorValue::AINotAvailable => "#AI_NOT_AVAILABLE_V1",
         }
     }
 
-    /// All 13 variants in declaration order. Stable; used by exhaustiveness tests and the
+    /// All 14 variants in declaration order. Stable; used by exhaustiveness tests and the
     /// future error-surface UI.
-    pub const ALL: [ErrorValue; 13] = [
+    pub const ALL: [ErrorValue; 14] = [
         ErrorValue::Ref,
         ErrorValue::Value,
         ErrorValue::NA,
@@ -82,6 +91,7 @@ impl ErrorValue {
         ErrorValue::Binding,
         ErrorValue::Timeout,
         ErrorValue::Permission,
+        ErrorValue::AINotAvailable,
     ];
 }
 
@@ -128,13 +138,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_contains_thirteen_distinct_variants() {
-        assert_eq!(ErrorValue::ALL.len(), 13);
+    fn all_contains_fourteen_distinct_variants() {
+        assert_eq!(ErrorValue::ALL.len(), 14);
         // Distinctness: convert to a set-shaped Vec of sigils and check.
         let mut sigils: Vec<&str> = ErrorValue::ALL.iter().map(|e| e.sigil()).collect();
         sigils.sort();
         sigils.dedup();
-        assert_eq!(sigils.len(), 13);
+        assert_eq!(sigils.len(), 14);
     }
 
     #[test]
@@ -156,6 +166,21 @@ mod tests {
         assert_eq!(ErrorValue::Binding.sigil(), "#BINDING!");
         assert_eq!(ErrorValue::Timeout.sigil(), "#TIMEOUT!");
         assert_eq!(ErrorValue::Permission.sigil(), "#PERMISSION!");
+        assert_eq!(ErrorValue::AINotAvailable.sigil(), "#AI_NOT_AVAILABLE_V1");
+    }
+
+    #[test]
+    fn ai_not_available_parses_with_v1_suffix() {
+        // CORR-06 / T4-D05: the parser-emitted sigil must round-trip identically.
+        assert_eq!(
+            "#AI_NOT_AVAILABLE_V1".parse::<ErrorValue>().unwrap(),
+            ErrorValue::AINotAvailable
+        );
+        // ASCII case-insensitive (consistent with the other variants).
+        assert_eq!(
+            "#ai_not_available_v1".parse::<ErrorValue>().unwrap(),
+            ErrorValue::AINotAvailable
+        );
     }
 
     #[test]
