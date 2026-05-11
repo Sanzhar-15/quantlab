@@ -32,12 +32,14 @@
 
 pub mod dirty;
 pub mod edges;
+pub mod fingerprint;
 pub mod graph;
 pub mod node;
 pub mod topo;
 
 pub use dirty::{propagate_from_cells, ChunkDirtySet, ChunkKey};
 pub use edges::AdjacencyVectors;
+pub use fingerprint::fingerprint;
 pub use graph::Graph;
 pub use node::{CellNode, FormulaRegionNode, Node, NodeId, RangeNode, SpillNode};
 pub use topo::{schedule, Schedule};
