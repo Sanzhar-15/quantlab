@@ -241,6 +241,22 @@ class Daemon:
         inspector_filters = req.get("inspector_filters") or []
         if inspector_filters and not isinstance(inspector_filters, list):
             raise ValueError("inspector_filters must be a list")
+        # Megaudit B-10 cure: when the spec has aggregate / groupby
+        # transforms, the inspector's RAW preview shows pre-aggregate rows
+        # while the chart shows post-aggregate bars — confusing and breaks
+        # op_column_stats on derived columns. Setting `apply_spec_transforms=spec`
+        # routes the preview through compile_spec → DuckDB, paging the
+        # AGGREGATED result. The inspector now matches the chart.
+        apply_spec = req.get("apply_spec_transforms")
+        if apply_spec is not None:
+            if not isinstance(apply_spec, dict):
+                raise ValueError("apply_spec_transforms must be a spec dict or null")
+            return self._preview_via_compile(
+                apply_spec, n, offset,
+                inspector_filters=inspector_filters,
+                timeout_s=float(req.get("timeout_s", DEFAULT_TIMEOUT_S)),
+                peak_rss_mb=int(req.get("peak_rss_mb", DEFAULT_PEAK_RSS_MB)),
+            )
         path = resolve_workspace_path(self.workspace_root, path_str)
         with query_budget(
             timeout_s=float(req.get("timeout_s", DEFAULT_TIMEOUT_S)),
@@ -451,13 +467,21 @@ class Daemon:
         }
 
     def op_decimate(self, req: dict) -> dict:
-        from .decimate import lttb
+        from .decimate import lttb_indices
         import pyarrow.parquet as pq
         import numpy as np
 
         path_str = req["path"]
         x_col = req["x_col"]; y_col = req["y_col"]
         n_visible = int(req.get("n_visible", 3000))
+        # M-18 cure: `carry_cols` lets a candlestick (or any multi-column
+        # chart) sample its non-primary columns at the LTTB-picked indices.
+        # Without this, decimation collapsed a 5-column OHLC table to a
+        # 2-column (t, v) line. The primary column (y_col) drives the
+        # LTTB selection; carry_cols ride along.
+        carry_cols = list(req.get("carry_cols") or [])
+        if not isinstance(carry_cols, list) or any(not isinstance(c, str) for c in carry_cols):
+            raise ValueError("carry_cols must be a list of strings")
         path = resolve_workspace_path(self.workspace_root, path_str)
         # Validate column names against the file schema BEFORE handing them
         # to pyarrow. Without this, an attacker can send arbitrary column
@@ -474,21 +498,38 @@ class Daemon:
                 f"decimate: y_col {y_col!r} not in file schema "
                 f"(available: {sorted(schema_names)})"
             )
+        for c in carry_cols:
+            if c not in schema_names:
+                raise SecurityError(
+                    f"decimate: carry_col {c!r} not in file schema "
+                    f"(available: {sorted(schema_names)})"
+                )
+        if x_col in carry_cols or y_col in carry_cols:
+            raise ValueError(
+                f"decimate: carry_cols must not include x_col / y_col "
+                f"(x_col={x_col!r}, y_col={y_col!r}, carry_cols={carry_cols})"
+            )
         # Audit finding #5 (TOCTOU): cache key uses the full fingerprint
         # (mtime + size + ctime + schema_hash). See op_aggregate for rationale.
+        # carry_cols are part of the key so a candlestick (with OHLC carry)
+        # doesn't collide with a line (without carry) on the same file.
+        plan_str = f"decimate:{x_col},{y_col},{n_visible}"
+        if carry_cols:
+            plan_str += "|carry:" + ",".join(sorted(carry_cols))
         cache_key = make_cache_key(
             file_path=str(path), fingerprint=full_fp,
-            plan=f"decimate:{x_col},{y_col},{n_visible}",
+            plan=plan_str,
         )
         cached = self.cache.get(cache_key)
         if cached is not None:
             return {"binary": cached, "data": {"cached": True}, "encoding": "arrow"}
 
+        read_cols = [x_col, y_col] + carry_cols
         with query_budget(
             timeout_s=float(req.get("timeout_s", DEFAULT_TIMEOUT_S)),
             peak_rss_mb=int(req.get("peak_rss_mb", DEFAULT_PEAK_RSS_MB)),
         ):
-            t = pq.read_table(str(path), columns=[x_col, y_col])
+            t = pq.read_table(str(path), columns=read_cols)
             xs = t.column(x_col).to_numpy(zero_copy_only=False)
             ys = t.column(y_col).to_numpy(zero_copy_only=False)
             if np.issubdtype(xs.dtype, np.datetime64):
@@ -496,21 +537,36 @@ class Daemon:
             # Pre-filter NaN/null rows before LTTB. LTTB can pick a NaN point
             # from an all-NaN bucket, which then renders as a gap; filtering
             # upstream gives the renderer a clean, contiguous series.
-            # (Audit finding #8.)
+            # (Audit finding #8.) When carrying columns we must apply the
+            # same mask to every carry column.
+            mask = None
             if ys.dtype.kind == "f":
-                mask = ~np.isnan(ys)
-                if mask.sum() < ys.shape[0]:
-                    xs = xs[mask]
-                    ys = ys[mask]
-            out_xs, out_ys = lttb(xs, ys, n_visible)
+                m = ~np.isnan(ys)
+                if m.sum() < ys.shape[0]:
+                    mask = m
+            if mask is not None:
+                xs = xs[mask]
+                ys = ys[mask]
+            picked = lttb_indices(xs, ys, n_visible)
+            out_xs = xs[picked]
+            out_ys = ys[picked]
+            out_cols: dict[str, "np.ndarray"] = {"t": out_xs, "v": out_ys}
+            for c in carry_cols:
+                arr = t.column(c).to_numpy(zero_copy_only=False)
+                if mask is not None:
+                    arr = arr[mask]
+                out_cols[c] = arr[picked]
 
-        arrow_table = pa.table({"t": out_xs, "v": out_ys})
+        arrow_table = pa.table(out_cols)
         arrow_bytes = reader.table_to_arrow_ipc(arrow_table)
         self.cache.put(cache_key, arrow_bytes, bytes_estimate=len(arrow_bytes))
         return {
             "binary": arrow_bytes,
-            "data": {"cached": False, "n_input": int(t.num_rows), "n_output": len(out_xs),
-                     "bytes": len(arrow_bytes)},
+            "data": {
+                "cached": False, "n_input": int(t.num_rows), "n_output": len(out_xs),
+                "bytes": len(arrow_bytes),
+                "carry_cols": list(carry_cols),
+            },
             "encoding": "arrow",
         }
 
@@ -844,6 +900,88 @@ class Daemon:
     # -----------------------------------------------------------------------
     # Helpers
     # -----------------------------------------------------------------------
+
+    def _preview_via_compile(
+        self,
+        spec: dict,
+        n: int,
+        offset: int,
+        *,
+        inspector_filters: list[dict],
+        timeout_s: float,
+        peak_rss_mb: int,
+    ) -> dict:
+        """Page through `compile_spec(spec)`'s output so the inspector
+        sees the same shape the chart does (B-10 cure).
+
+        Validates the spec's dataset.uri the same way op_aggregate does,
+        prepends inspector_filters (validated against schema) like op_aggregate,
+        compiles to SQL, then wraps the SQL in an outer SELECT with
+        LIMIT/OFFSET so we only ship the page the inspector wants. Total
+        row count comes from a sibling COUNT(*) over the same CTE.
+        """
+        dataset = spec.get("dataset", {})
+        path_str = dataset.get("uri")
+        if not path_str:
+            raise ValueError("apply_spec_transforms: spec.dataset.uri is required")
+        path = resolve_workspace_path(self.workspace_root, path_str)
+        schema, _schema_hash, _full_fp = self._resolve_schema_with_hash(path)
+
+        # Validate inspector_filters against the source schema, the same
+        # way op_aggregate does — keeps error messages consistent.
+        if inspector_filters:
+            known_cols = set(schema.names)
+            for f in inspector_filters:
+                if not isinstance(f, dict) or f.get("kind") != "filter":
+                    raise ValueError(
+                        "inspector_filters entries must be FilterTransform dicts"
+                    )
+                col = f.get("column")
+                if not isinstance(col, str) or col not in known_cols:
+                    raise ValueError(
+                        f"inspector_filters column={col!r} not in dataset schema"
+                    )
+            effective_spec = {
+                **spec,
+                "transforms": [*inspector_filters, *spec.get("transforms", [])],
+            }
+        else:
+            effective_spec = spec
+
+        compiled = compile_spec(effective_spec, schema, str(path))
+        # Wrap the compiled SQL so the inspector pages the AGGREGATE result:
+        #   WITH inner AS (<compiled.sql>)
+        #   SELECT (SELECT COUNT(*) FROM inner) AS __total, * FROM inner
+        #   LIMIT n OFFSET offset
+        # The COUNT(*) gives the inspector a scrollbar total without a
+        # second round-trip. DuckDB inlines the CTE so the inner aggregate
+        # runs once.
+        wrapped_sql = (
+            f"WITH __wrapped_inner AS ({compiled.sql}) "
+            f"SELECT (SELECT COUNT(*) FROM __wrapped_inner) AS __total, * "
+            f"FROM __wrapped_inner LIMIT {int(n)} OFFSET {int(offset)}"
+        )
+        with query_budget(timeout_s=timeout_s, peak_rss_mb=peak_rss_mb):
+            arrow_table = self.conn.execute(wrapped_sql, compiled.params).to_arrow_table()
+        if arrow_table.num_rows > 0:
+            total = int(arrow_table.column("__total")[0].as_py())
+            table = arrow_table.drop_columns(["__total"])
+        else:
+            count_only = self.conn.execute(
+                f"SELECT COUNT(*) FROM ({compiled.sql}) AS _cnt", compiled.params,
+            ).fetchone()
+            total = int(count_only[0]) if count_only else 0
+            # Empty page: re-execute the compiled SQL with LIMIT 0 to get
+            # the right column shape for an empty table.
+            empty_arrow = self.conn.execute(
+                f"SELECT * FROM ({compiled.sql}) AS _e LIMIT 0", compiled.params,
+            ).to_arrow_table()
+            table = empty_arrow
+        resp = self._wrap_arrow_or_json(table)
+        resp.setdefault("data", {})["total"] = total
+        resp["data"]["filtered"] = True
+        resp["data"]["applied_spec_transforms"] = True
+        return resp
 
     @staticmethod
     def _wrap_arrow_or_json(table: pa.Table) -> dict:

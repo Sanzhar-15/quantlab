@@ -110,6 +110,16 @@ function buildCreateChartOptions(plan: TimeseriesPlan): CreateChartOptions {
 	if (plan.chart.timezone !== undefined) {
 		(opts as { timeZone?: string }).timeZone = plan.chart.timezone;
 	}
+	if (plan.chart.yAxisZero === true) {
+		// M-19 cure: when the spec requests `y_axis_zero=true`, ask the
+		// right-axis price scale to include zero by setting a top scale
+		// margin of 0. The default scaleMargins (top=0.1, bottom=0.1)
+		// already covers `y_axis_zero=false`, which is why omitting the
+		// option does the natural thing for drawdown / equity-curve.
+		const margins = { top: 0, bottom: 0.1 };
+		(opts as { axis?: { right?: { scaleMargins?: { top: number; bottom: number } } } }).axis =
+			{ right: { scaleMargins: margins } };
+	}
 	return opts;
 }
 

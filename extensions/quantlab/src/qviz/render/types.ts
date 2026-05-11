@@ -134,6 +134,13 @@ export interface TimeseriesChartOptions {
 	readonly width?: number;
 	readonly height?: number;
 	readonly showGrid?: boolean;
+	/**
+	 * When true, the price-scale range is extended to include zero so the
+	 * baseline reads naturally on metrics that should anchor to zero
+	 * (volumes, PnL, etc). When false (default), the scale auto-fits to
+	 * the data range. Mirrors `spec.chart.options.y_axis_zero`.
+	 */
+	readonly yAxisZero?: boolean;
 	readonly theme?: QvizTheme;
 }
 

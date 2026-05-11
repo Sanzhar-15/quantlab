@@ -62,6 +62,7 @@ export function compileTimeseriesPlan(
 		timezone: spec.trading_options?.timezone,
 		autoSize: true,
 		showGrid: spec.chart.options?.show_grid ?? true,
+		yAxisZero: spec.chart.options?.y_axis_zero,
 		theme,
 	};
 

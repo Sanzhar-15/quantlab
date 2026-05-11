@@ -222,6 +222,89 @@ def test_aggregate(daemon: _DaemonClient) -> None:
     assert "vol_sum" in table.column_names
 
 
+def test_preview_apply_spec_transforms_aggregated(daemon: _DaemonClient) -> None:
+    """Megaudit B-10 cure: when the spec has aggregate transforms, the
+    inspector can opt into post-aggregate rows via
+    `apply_spec_transforms=<spec>`. Result columns match the chart's
+    aggregated shape, not the raw parquet."""
+    spec = {
+        "qviz_version": 1,
+        "dataset": {"uri": "data/ohlcv.parquet", "schema_hash": "sha256:" + "0" * 64,
+                    "mtime_ns": 1},
+        "transforms": [
+            {"kind": "date_trunc", "column": "timestamp", "unit": "day", "as": "day"},
+            {"kind": "groupby", "columns": ["day"]},
+            {"kind": "aggregate", "aggs": [
+                {"column": "volume", "fn": "sum", "as": "vol_sum"},
+            ]},
+            {"kind": "sort", "columns": [{"column": "day"}]},
+        ],
+        "chart": {"family": "timeseries", "type": "line", "encodings": {}},
+    }
+    resp, _ = daemon.request(
+        "preview", path="data/ohlcv.parquet", n=10, offset=0,
+        apply_spec_transforms=spec,
+    )
+    assert resp["ok"], resp
+    data = resp["data"]
+    assert data.get("applied_spec_transforms") is True
+    assert data.get("total", 0) > 0
+    # JSON path for a small (<256 KiB) aggregated result.
+    if resp["encoding"] == "json":
+        rows = data["rows"]
+        assert len(rows) <= 10
+        if rows:
+            # Columns match the AGGREGATED shape, not the raw parquet.
+            assert set(rows[0].keys()) == {"day", "vol_sum"}
+
+
+def test_preview_apply_spec_transforms_with_offset_pages_total(
+    daemon: _DaemonClient,
+) -> None:
+    """B-10 cure: the wrapped SELECT must page through the aggregate
+    output (LIMIT/OFFSET) and report the correct total row count from
+    the underlying compiled SQL."""
+    spec = {
+        "qviz_version": 1,
+        "dataset": {"uri": "data/ohlcv.parquet", "schema_hash": "sha256:" + "0" * 64,
+                    "mtime_ns": 1},
+        "transforms": [
+            {"kind": "date_trunc", "column": "timestamp", "unit": "day", "as": "day"},
+            {"kind": "groupby", "columns": ["day"]},
+            {"kind": "aggregate", "aggs": [
+                {"column": "volume", "fn": "sum", "as": "vol_sum"},
+            ]},
+            {"kind": "sort", "columns": [{"column": "day"}]},
+        ],
+        "chart": {"family": "timeseries", "type": "line", "encodings": {}},
+    }
+    first, _ = daemon.request(
+        "preview", path="data/ohlcv.parquet", n=3, offset=0,
+        apply_spec_transforms=spec,
+    )
+    total = first["data"]["total"]
+    second, _ = daemon.request(
+        "preview", path="data/ohlcv.parquet", n=3, offset=3,
+        apply_spec_transforms=spec,
+    )
+    # Same total, different rows.
+    assert second["data"]["total"] == total
+    if first["encoding"] == "json" and second["encoding"] == "json":
+        if first["data"]["rows"] and second["data"]["rows"]:
+            assert first["data"]["rows"][0] != second["data"]["rows"][0]
+
+
+def test_preview_apply_spec_transforms_rejects_non_dict(daemon: _DaemonClient) -> None:
+    """B-10 cure: apply_spec_transforms must be a spec dict, not a
+    truthy string or other type."""
+    resp, _ = daemon.request(
+        "preview", path="data/ohlcv.parquet", n=10,
+        apply_spec_transforms="not-a-spec",
+    )
+    assert resp["ok"] is False
+    assert "apply_spec_transforms" in resp["error"]
+
+
 def test_aggregate_cache_hit(daemon: _DaemonClient) -> None:
     spec = {
         "qviz_version": 1,
@@ -302,6 +385,61 @@ def test_decimate_returns_arrow(daemon: _DaemonClient) -> None:
     table = arrow_ipc_to_table(binary)
     assert table.num_rows == 3000
     assert set(table.column_names) == {"t", "v"}
+
+
+def test_decimate_carry_cols_candlestick(daemon: _DaemonClient) -> None:
+    """Megaudit M-18 cure: candlestick decimation must carry OHLC columns
+    at LTTB-picked indices, not collapse the 5-column table to (t, v)."""
+    resp, binary = daemon.request(
+        "decimate", path="data/ohlcv.parquet",
+        x_col="timestamp", y_col="close", n_visible=2000,
+        carry_cols=["open", "high", "low", "volume"],
+    )
+    assert resp["ok"], resp
+    assert resp["encoding"] == "arrow"
+    table = arrow_ipc_to_table(binary)
+    assert table.num_rows == 2000
+    # t + v + 4 carry cols
+    assert set(table.column_names) == {"t", "v", "open", "high", "low", "volume"}
+    assert resp["data"]["carry_cols"] == ["open", "high", "low", "volume"]
+    # Sanity check OHLC invariants on the carried sample: high >= max(open, close)
+    # and low <= min(open, close) for every row (or NaN).
+    import math as _math
+    opens = table.column("open").to_pylist()
+    highs = table.column("high").to_pylist()
+    lows = table.column("low").to_pylist()
+    closes = table.column("v").to_pylist()
+    for i in range(len(opens)):
+        o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+        if None in (o, h, l, c) or any(_math.isnan(x) for x in (o, h, l, c)):
+            continue
+        assert h >= max(o, c) - 1e-6, f"row {i}: high {h} < max(open={o}, close={c})"
+        assert l <= min(o, c) + 1e-6, f"row {i}: low {l} > min(open={o}, close={c})"
+
+
+def test_decimate_carry_col_must_be_in_schema(daemon: _DaemonClient) -> None:
+    """M-18 cure: carry_cols are validated against the file schema like
+    x_col / y_col are."""
+    resp, _ = daemon.request(
+        "decimate", path="data/ohlcv.parquet",
+        x_col="timestamp", y_col="close", n_visible=100,
+        carry_cols=["__not_a_column__"],
+    )
+    assert resp["ok"] is False
+    assert "SecurityError" in resp["error"]
+    assert "__not_a_column__" in resp["error"]
+
+
+def test_decimate_carry_col_cannot_be_x_or_y(daemon: _DaemonClient) -> None:
+    """M-18 cure: x_col / y_col cannot appear in carry_cols (would collide
+    with the canonical `t` / `v` output column names)."""
+    resp, _ = daemon.request(
+        "decimate", path="data/ohlcv.parquet",
+        x_col="timestamp", y_col="close", n_visible=100,
+        carry_cols=["close"],
+    )
+    assert resp["ok"] is False
+    assert "carry_cols" in resp["error"]
 
 
 def test_stats(daemon: _DaemonClient) -> None:

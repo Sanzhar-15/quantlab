@@ -154,6 +154,7 @@ export interface DecimateMeta {
 	readonly n_input?: number;
 	readonly n_output?: number;
 	readonly bytes?: number;
+	readonly carry_cols?: readonly string[];
 }
 
 /** Daemon capability descriptor returned by `op_capabilities`. The
@@ -556,7 +557,10 @@ export class QvizDaemonClient {
 
 	async preview(
 		path: string, n?: number, offset?: number,
-		opts: { inspectorFilters?: readonly InspectorFilterDTO[] } = {},
+		opts: {
+			inspectorFilters?: readonly InspectorFilterDTO[];
+			applySpecTransforms?: QvizSpec;
+		} = {},
 	): Promise<JsonResponse<{ rows: readonly Record<string, unknown>[]; n: number }>
 		| ArrowResponse<PreviewMeta>> {
 		const payload: Record<string, unknown> = { path };
@@ -570,6 +574,14 @@ export class QvizDaemonClient {
 		// and the cache key matches pre-Phase-6 unfiltered previews.
 		if (opts.inspectorFilters && opts.inspectorFilters.length > 0) {
 			payload.inspector_filters = opts.inspectorFilters;
+		}
+		// Megaudit B-10 cure: when the spec has aggregate/groupby transforms
+		// AND the inspector is open, pass the full spec via
+		// `applySpecTransforms`. The daemon then routes the preview through
+		// compile_spec so the inspector sees the aggregated shape (matches
+		// the chart) instead of raw pre-aggregate rows.
+		if (opts.applySpecTransforms) {
+			payload.apply_spec_transforms = opts.applySpecTransforms;
 		}
 		const r = await this.callJsonOrArrow('preview', payload);
 		// callJsonOrArrow returns the union typed as `unknown` payload; the
@@ -607,11 +619,16 @@ export class QvizDaemonClient {
 	}
 
 	async decimate(
-		path: string, x_col: string, y_col: string, n_visible?: number
+		path: string, x_col: string, y_col: string, n_visible?: number,
+		carry_cols?: readonly string[],
 	): Promise<ArrowResponse<DecimateMeta>> {
+		// M-18 cure: when decimating a candlestick (or any multi-column
+		// chart), pass the non-primary OHLC/V columns as carry_cols so
+		// the daemon samples them at LTTB-picked indices alongside y_col.
 		const r = await this.callJsonOrArrow('decimate', {
 			path, x_col, y_col,
 			...(n_visible !== undefined ? { n_visible } : {}),
+			...(carry_cols && carry_cols.length > 0 ? { carry_cols: [...carry_cols] } : {}),
 		});
 		if (!('arrow' in r)) {
 			throw new DaemonProtocolError(`decimate returned non-arrow encoding`);
