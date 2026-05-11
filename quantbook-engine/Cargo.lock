@@ -726,6 +726,13 @@ version = "0.1.0"
 [[package]]
 name = "ql-exec"
 version = "0.1.0"
+dependencies = [
+ "proptest",
+ "ql-calcgraph",
+ "ql-formula-syntax",
+ "ql-storage",
+ "ql-types",
+]
 
 [[package]]
 name = "ql-formula-semantics"
