@@ -16,8 +16,12 @@ ql-calcgraph      = { path = "../ql-calcgraph" }
 ql-storage        = { path = "../ql-storage" }
 ql-functions      = { path = "../ql-functions" }
 arrow-array       = { workspace = true }
-pulp              = { workspace = true }
 multiversion      = { workspace = true }
+# `pulp` is in workspace.dependencies for Phase 4+ kernels that need explicit lane ops
+# (Welford reduction with custom lanes, SUMIF masking). W4 SIMD relies on multiversion
+# attributes + LLVM auto-vectorization — pulp not yet needed. Adding pulp would pull in
+# the unmaintained `paste` transitive (RUSTSEC-2024-0436) which fails cargo-audit.
+# Re-add when actually used.
 
 [dev-dependencies]
 proptest  = { workspace = true }
