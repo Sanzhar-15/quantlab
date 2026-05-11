@@ -614,8 +614,20 @@ export class QvizDaemonClient {
 
 	/** Phase 6 (6.A.2): summary stats for one column, used by the
 	 *  inspector's filter widgets. */
-	async columnStats(path: string, column: string): Promise<JsonResponse<ColumnStatsData>> {
-		return this.callJson<ColumnStatsData>('column_stats', { path, column });
+	async columnStats(
+		path: string, column: string,
+		opts: { applySpecTransforms?: QvizSpec } = {},
+	): Promise<JsonResponse<ColumnStatsData>> {
+		// Megaudit B-10 cure: when the column being queried is a derived
+		// alias from the spec's aggregate pipeline (e.g. `pnl_sum`,
+		// `exposure_mean`), pass `applySpecTransforms` so the daemon
+		// compiles the spec and queries the aggregated output instead of
+		// the raw parquet (which doesn't know about derived columns).
+		const payload: Record<string, unknown> = { path, column };
+		if (opts.applySpecTransforms) {
+			payload.apply_spec_transforms = opts.applySpecTransforms;
+		}
+		return this.callJson<ColumnStatsData>('column_stats', payload);
 	}
 
 	async decimate(

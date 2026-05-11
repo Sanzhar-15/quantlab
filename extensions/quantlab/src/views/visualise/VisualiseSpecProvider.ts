@@ -1341,12 +1341,24 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 		const inspectorFilters = msg.inspectorFilters
 			? inspectorFiltersToFilterTransforms(msg.inspectorFilters)
 			: undefined;
+		// Megaudit B-10 webview wireup (2026-05-11): when the spec has
+		// aggregate / groupby transforms (e.g., pnl_by_strategy, factor_exposure
+		// presets, or any user-built spec with an aggregation), the inspector's
+		// raw preview shows pre-aggregate rows while the chart shows
+		// post-aggregate bars — confusing and breaks column-stats on derived
+		// columns. Passing `applySpecTransforms` routes the preview through
+		// `compile_spec` on the daemon side so the inspector matches the chart.
+		const applySpecTransforms = specHasAggregateTransforms(document.spec)
+			? document.spec
+			: undefined;
 		try {
 			// `previewWithFilters` calls the same `client.preview` wrapper
 			// added in Step 6.A.5 (TS daemon-client); when filters are
 			// present they're appended to the request payload as
 			// `inspector_filters`, matching the daemon's contract.
-			const r = await previewWithFilters(client, datasetUri, msg.n, msg.offset, inspectorFilters);
+			const r = await previewWithFilters(
+				client, datasetUri, msg.n, msg.offset, inspectorFilters, applySpecTransforms,
+			);
 			this.postOrLog(panel, {
 				type: 'inspectorData',
 				protocolVersion: PROTOCOL_VERSION,
@@ -1430,8 +1442,17 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 			return;
 		}
 		const datasetUri = document.spec.dataset.uri;
+		// Megaudit B-10 webview wireup: when the spec aggregates, column-stats
+		// against a derived alias (`pnl_sum`, `exposure_mean`) would fail on
+		// the raw parquet. Pass `applySpecTransforms` so the daemon compiles
+		// the spec and queries the aggregate output.
+		const applySpecTransforms = specHasAggregateTransforms(document.spec)
+			? document.spec
+			: undefined;
 		try {
-			const r = await client.columnStats(datasetUri, msg.column);
+			const r = await client.columnStats(datasetUri, msg.column, {
+				...(applySpecTransforms ? { applySpecTransforms } : {}),
+			});
 			const d = r.data;
 			this.postOrLog(panel, {
 				type: 'columnStats',
@@ -1803,17 +1824,43 @@ export function inspectorFiltersToFilterTransforms(
 	return out;
 }
 
+/** Detect whether a spec's transform pipeline produces an aggregate
+ *  output (groupby followed by aggregate). When true, the inspector
+ *  preview should pass `applySpecTransforms` so the table window
+ *  matches the chart's aggregated shape rather than showing raw rows.
+ *
+ *  Megaudit B-10 cure helper. Exported for unit testing.
+ */
+export function specHasAggregateTransforms(spec: QvizSpec): boolean {
+	const transforms = spec.transforms ?? [];
+	for (const t of transforms) {
+		if (t.kind === 'aggregate' || t.kind === 'groupby') {
+			return true;
+		}
+	}
+	return false;
+}
+
 /** Tiny shim around `client.preview` that lifts the response shape so
  *  the provider doesn't care whether the daemon returned the JSON or
- *  Arrow envelope. Inspector consumers always want Arrow + total. */
+ *  Arrow envelope. Inspector consumers always want Arrow + total.
+ *
+ *  `applySpecTransforms` (when set) makes the daemon route the preview
+ *  through `compile_spec(spec)` so the inspector matches an aggregate
+ *  chart's shape rather than showing raw pre-aggregate rows.
+ */
 async function previewWithFilters(
 	client: import('../../qviz/daemon-lifecycle').LifecycleClient,
 	path: string,
 	n: number,
 	offset: number,
 	inspectorFilters: import('../../qviz/daemon-client').InspectorFilterDTO[] | undefined,
+	applySpecTransforms?: QvizSpec,
 ): Promise<{ arrow: Uint8Array; n: number; total?: number; elapsedMs: number }> {
-	const raw = await client.preview(path, n, offset, { inspectorFilters });
+	const raw = await client.preview(path, n, offset, {
+		inspectorFilters,
+		...(applySpecTransforms ? { applySpecTransforms } : {}),
+	});
 	if ('arrow' in raw) {
 		const data = raw.meta as { n?: number; total?: number };
 		return {

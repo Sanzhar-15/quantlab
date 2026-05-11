@@ -294,6 +294,79 @@ def test_preview_apply_spec_transforms_with_offset_pages_total(
             assert first["data"]["rows"][0] != second["data"]["rows"][0]
 
 
+def test_column_stats_apply_spec_transforms_derived_column(daemon: _DaemonClient) -> None:
+    """Megaudit B-10 cure (column_stats half): with apply_spec_transforms,
+    column_stats works on a derived alias from the spec's aggregate pipeline."""
+    spec = {
+        "qviz_version": 1,
+        "dataset": {"uri": "data/ohlcv.parquet", "schema_hash": "sha256:" + "0" * 64,
+                    "mtime_ns": 1},
+        "transforms": [
+            {"kind": "date_trunc", "column": "timestamp", "unit": "day", "as": "day"},
+            {"kind": "groupby", "columns": ["day"]},
+            {"kind": "aggregate", "aggs": [
+                {"column": "volume", "fn": "sum", "as": "vol_sum"},
+            ]},
+            {"kind": "sort", "columns": [{"column": "day"}]},
+        ],
+        "chart": {"family": "timeseries", "type": "line", "encodings": {}},
+    }
+    # Without apply_spec_transforms, vol_sum doesn't exist → error.
+    bad, _ = daemon.request(
+        "column_stats", path="data/ohlcv.parquet", column="vol_sum",
+    )
+    assert bad["ok"] is False
+    assert "vol_sum" in bad["error"]
+    # With apply_spec_transforms, vol_sum exists in the aggregate output.
+    good, _ = daemon.request(
+        "column_stats", path="data/ohlcv.parquet", column="vol_sum",
+        apply_spec_transforms=spec,
+    )
+    assert good["ok"], good
+    stats = good["data"]
+    assert stats["kind"] == "numeric"
+    assert stats["total"] > 0
+    assert "min" in stats and "max" in stats
+    assert stats["min"] >= 0  # volumes are non-negative
+
+
+def test_column_stats_apply_spec_transforms_rejects_unknown_derived_column(
+    daemon: _DaemonClient,
+) -> None:
+    """B-10 cure: unknown column in the aggregate output is rejected with
+    an actionable message that lists available columns."""
+    spec = {
+        "qviz_version": 1,
+        "dataset": {"uri": "data/ohlcv.parquet", "schema_hash": "sha256:" + "0" * 64,
+                    "mtime_ns": 1},
+        "transforms": [
+            {"kind": "date_trunc", "column": "timestamp", "unit": "day", "as": "day"},
+            {"kind": "groupby", "columns": ["day"]},
+            {"kind": "aggregate", "aggs": [
+                {"column": "volume", "fn": "sum", "as": "vol_sum"},
+            ]},
+        ],
+        "chart": {"family": "timeseries", "type": "line", "encodings": {}},
+    }
+    resp, _ = daemon.request(
+        "column_stats", path="data/ohlcv.parquet", column="__nonexistent__",
+        apply_spec_transforms=spec,
+    )
+    assert resp["ok"] is False
+    assert "__nonexistent__" in resp["error"]
+    # The error lists the actual aggregate-output columns to help the user.
+    assert "vol_sum" in resp["error"] or "day" in resp["error"]
+
+
+def test_column_stats_apply_spec_transforms_rejects_non_dict(daemon: _DaemonClient) -> None:
+    resp, _ = daemon.request(
+        "column_stats", path="data/ohlcv.parquet", column="volume",
+        apply_spec_transforms="bogus",
+    )
+    assert resp["ok"] is False
+    assert "apply_spec_transforms" in resp["error"]
+
+
 def test_preview_apply_spec_transforms_rejects_non_dict(daemon: _DaemonClient) -> None:
     """B-10 cure: apply_spec_transforms must be a spec dict, not a
     truthy string or other type."""

@@ -607,33 +607,69 @@ class Daemon:
             raise ValueError("column must be a non-empty string")
         path = resolve_workspace_path(self.workspace_root, path_str)
         schema, schema_hash, full_fp = self._resolve_schema_with_hash(path)
-        if column not in schema.names:
-            # Use a structured kind so the TS side can surface a typed error.
-            raise ValueError(f"column '{column}' not in schema for {path.name}")
 
-        cache_key = make_cache_key(
-            file_path=str(path),
-            fingerprint=full_fp,
-            plan={"op": "column_stats", "column": column},
-        )
+        # Megaudit B-10 cure: when a derived column (e.g. `pnl_sum` from a
+        # groupby+aggregate) is queried, the raw parquet schema doesn't
+        # know about it. `apply_spec_transforms=<spec>` compiles the spec
+        # and queries the aggregated result instead.
+        apply_spec = req.get("apply_spec_transforms")
+        if apply_spec is not None and not isinstance(apply_spec, dict):
+            raise ValueError("apply_spec_transforms must be a spec dict or null")
+
+        if apply_spec is not None:
+            compiled = compile_spec(apply_spec, schema, str(path))
+            # Peek at the aggregate result's schema via LIMIT 0 so we can
+            # classify the column and reject unknown names BEFORE running
+            # the full stats queries.
+            peek = self.conn.execute(
+                f"SELECT * FROM ({compiled.sql}) AS _peek LIMIT 0", compiled.params,
+            ).to_arrow_table()
+            agg_schema = peek.schema
+            if column not in agg_schema.names:
+                raise ValueError(
+                    f"column '{column}' not in aggregate output for {path.name} "
+                    f"(available: {list(agg_schema.names)})"
+                )
+            field = agg_schema.field(column)
+            from_clause_sql = f"({compiled.sql})"
+            from_params = list(compiled.params)
+            # Cache key includes the spec so different aggregates over the
+            # same parquet don't collide. Re-uses the existing make_cache_key
+            # plan structure.
+            cache_key = make_cache_key(
+                file_path=str(path),
+                fingerprint=full_fp,
+                plan={"op": "column_stats", "column": column,
+                      "apply_spec_transforms": apply_spec},
+            )
+        else:
+            if column not in schema.names:
+                # Use a structured kind so the TS side can surface a typed error.
+                raise ValueError(f"column '{column}' not in schema for {path.name}")
+            field = schema.field(column)
+            ddb_path = str(path).replace("'", "''")
+            if path.suffix.lower() == ".parquet":
+                from_clause_sql = f"parquet_scan('{ddb_path}')"
+            elif path.suffix.lower() in (".csv", ".tsv"):
+                from_clause_sql = f"read_csv_auto('{ddb_path}')"
+            else:
+                raise ValueError(f"unsupported file extension: {path.suffix}")
+            from_params = []
+            cache_key = make_cache_key(
+                file_path=str(path),
+                fingerprint=full_fp,
+                plan={"op": "column_stats", "column": column},
+            )
+
         cached = self.schema_cache.get(cache_key)
         if cached is not None:
             return {"data": {**cached, "cached": True}, "encoding": "json"}
 
-        field = schema.field(column)
         kind = _classify_arrow_type(field.type)
         DISTINCT_CAP = 20
 
-        # DuckDB reads parquet/csv directly; quote the column to handle
-        # spaces / special chars / duplicate-suffix names.
-        ddb_path = str(path).replace("'", "''")
+        # Quote the column to handle spaces / special chars / duplicate-suffix names.
         col_q = '"' + column.replace('"', '""') + '"'
-        if path.suffix.lower() == ".parquet":
-            from_clause = f"parquet_scan('{ddb_path}')"
-        elif path.suffix.lower() in (".csv", ".tsv"):
-            from_clause = f"read_csv_auto('{ddb_path}')"
-        else:
-            raise ValueError(f"unsupported file extension: {path.suffix}")
 
         with query_budget(
             timeout_s=float(req.get("timeout_s", DEFAULT_TIMEOUT_S)),
@@ -643,15 +679,17 @@ class Daemon:
             row = self.conn.execute(
                 f"SELECT COUNT(*) AS total, "
                 f"SUM(CASE WHEN {col_q} IS NULL THEN 1 ELSE 0 END) AS nulls "
-                f"FROM {from_clause}"
+                f"FROM {from_clause_sql}",
+                from_params,
             ).fetchone()
             total = int(row[0])
             null_count = int(row[1] or 0)
 
             distinct_rows = self.conn.execute(
-                f"SELECT {col_q} FROM {from_clause} "
+                f"SELECT {col_q} FROM {from_clause_sql} "
                 f"WHERE {col_q} IS NOT NULL "
-                f"GROUP BY {col_q} ORDER BY {col_q} LIMIT {DISTINCT_CAP + 1}"
+                f"GROUP BY {col_q} ORDER BY {col_q} LIMIT {DISTINCT_CAP + 1}",
+                from_params,
             ).fetchall()
             distinct_values = [r[0] for r in distinct_rows]
             cardinality_capped = len(distinct_values)
@@ -670,8 +708,9 @@ class Daemon:
 
             if kind in ("numeric", "temporal") and total - null_count > 0:
                 mn, mx = self.conn.execute(
-                    f"SELECT MIN({col_q}), MAX({col_q}) FROM {from_clause} "
-                    f"WHERE {col_q} IS NOT NULL"
+                    f"SELECT MIN({col_q}), MAX({col_q}) FROM {from_clause_sql} "
+                    f"WHERE {col_q} IS NOT NULL",
+                    from_params,
                 ).fetchone()
                 stats["min"] = _jsonify_scalar(mn)
                 stats["max"] = _jsonify_scalar(mx)

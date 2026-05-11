@@ -922,7 +922,10 @@ suite('VisualiseSpecProvider -- lifecycle (dispose, panel teardown)', () => {
 // Phase 6 (6.G.2/6.G.3): inspector-filter translation
 // ---------------------------------------------------------------------------
 
-import { inspectorFiltersToFilterTransforms } from '../src/views/visualise/VisualiseSpecProvider';
+import {
+	inspectorFiltersToFilterTransforms,
+	specHasAggregateTransforms,
+} from '../src/views/visualise/VisualiseSpecProvider';
 import type { InspectorFilter } from '../src/qviz/messageProtocol';
 
 suite('VisualiseSpecProvider -- inspectorFiltersToFilterTransforms (Phase 6)', () => {
@@ -1112,3 +1115,52 @@ function readDriftStatus(
 	if (!ctx) { throw new Error('no document context for this document'); }
 	return ctx.driftStatus;
 }
+
+// ---------------------------------------------------------------------------
+// Megaudit B-10 webview wireup — specHasAggregateTransforms
+// ---------------------------------------------------------------------------
+
+suite('VisualiseSpecProvider -- specHasAggregateTransforms (B-10 cure)', () => {
+
+	test('empty transforms returns false', () => {
+		assert.strictEqual(specHasAggregateTransforms(makeSpec({ transforms: [] })), false);
+	});
+
+	test('transforms without groupby/aggregate returns false', () => {
+		const spec = makeSpec({
+			transforms: [
+				{ kind: 'filter', column: 'close', op: '>', value: 0 },
+				{ kind: 'sort', columns: [{ column: 'close', desc: false }] },
+				{ kind: 'limit', n: 100 },
+			],
+		});
+		assert.strictEqual(specHasAggregateTransforms(spec), false);
+	});
+
+	test('groupby alone returns true (aggregate may follow)', () => {
+		const spec = makeSpec({
+			transforms: [{ kind: 'groupby', columns: ['strategy'] }],
+		});
+		assert.strictEqual(specHasAggregateTransforms(spec), true);
+	});
+
+	test('aggregate alone returns true', () => {
+		const spec = makeSpec({
+			transforms: [
+				{ kind: 'aggregate', aggs: [{ column: 'pnl', fn: 'sum', as: 'pnl_sum' }] },
+			],
+		});
+		assert.strictEqual(specHasAggregateTransforms(spec), true);
+	});
+
+	test('pnl_by_strategy-style pipeline returns true', () => {
+		const spec = makeSpec({
+			transforms: [
+				{ kind: 'groupby', columns: ['strategy'] },
+				{ kind: 'aggregate', aggs: [{ column: 'pnl', fn: 'sum', as: 'pnl_sum' }] },
+				{ kind: 'sort', columns: [{ column: 'pnl_sum', desc: true }] },
+			],
+		});
+		assert.strictEqual(specHasAggregateTransforms(spec), true);
+	});
+});
