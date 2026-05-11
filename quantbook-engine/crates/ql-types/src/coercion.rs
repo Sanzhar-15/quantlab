@@ -473,4 +473,282 @@ mod tests {
         assert_eq!(parse_number_invariant("%"), None);
         assert_eq!(parse_number_invariant("abc"), None);
     }
+
+    // -- audit-flagged edge cases (opus-arch + codex r11) ----------------------
+
+    #[test]
+    fn negative_zero_equality_with_positive_zero() {
+        // Excel + IEEE 754: -0.0 == 0.0 in numerical comparison. Test lock.
+        assert_eq!(Value::Number(0.0), Value::Number(-0.0));
+        // Through to_number_strict both flatten to 0.0.
+        assert_eq!(to_number_strict(&Value::Number(0.0)).unwrap(), 0.0);
+        assert_eq!(to_number_strict(&Value::Number(-0.0)).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn subnormal_numbers_pass_through_strict_and_lenient() {
+        // Excel divergence intentionally documented: Excel may round subnormals to zero in
+        // some contexts; we don't. The values below `f64::MIN_POSITIVE` are subnormals.
+        let sub = f64::MIN_POSITIVE / 2.0;
+        assert!(sub > 0.0); // sanity
+        assert!(sub < f64::MIN_POSITIVE);
+        assert_eq!(to_number_strict(&Value::Number(sub)).unwrap(), sub);
+        assert_eq!(sanitize_f64(sub).unwrap(), sub);
+    }
+
+    #[test]
+    fn integer_2_pow_53_boundary_collapses_per_f64_mantissa() {
+        // f64 has a 52-bit mantissa + implicit 1; integers up to 2^53 are exactly representable.
+        // 2^53 and 2^53 + 1 collapse to the same f64 value — same as Excel's number type.
+        let a: f64 = 9007199254740992.0; // 2^53
+        let b: f64 = 9007199254740993.0; // 2^53 + 1 (not representable; rounds to 2^53)
+        assert_eq!(a, b);
+        assert_eq!(Value::Number(a), Value::Number(b));
+    }
+
+    #[test]
+    fn empty_string_vs_blank_logical_distinction() {
+        // Distinct variants...
+        assert_ne!(Value::Blank, Value::text(""));
+        // ...with distinct logical-coercion behavior.
+        assert!(!to_logical(&Value::Blank).unwrap()); // Blank → false
+        assert_eq!(
+            to_logical(&Value::text("")).unwrap_err(),
+            ErrorValue::Value // "" → #VALUE! (not parseable as TRUE/FALSE)
+        );
+    }
+
+    #[test]
+    fn locale_currency_explicitly_rejected_v1_boundary() {
+        // Locks the Phase 0 locale-agnostic rule. WHEN locale parsing lands in Phase 3, these
+        // assertions need to be inverted; until then they're the v1.5 boundary marker.
+        assert_eq!(
+            to_number_lenient(&Value::text("$1000.50")).unwrap_err(),
+            ErrorValue::Value
+        );
+        assert_eq!(
+            to_number_lenient(&Value::text("$1,000.50")).unwrap_err(),
+            ErrorValue::Value
+        );
+        assert_eq!(
+            to_number_lenient(&Value::text("€500")).unwrap_err(),
+            ErrorValue::Value
+        );
+        assert_eq!(
+            to_number_lenient(&Value::text("£99.99")).unwrap_err(),
+            ErrorValue::Value
+        );
+    }
+
+    // -- systematic edge-case coverage (whitespace) ---------------------------
+
+    #[test]
+    fn whitespace_combinations() {
+        assert_eq!(to_number_lenient(&Value::text("\t42")).unwrap(), 42.0);
+        assert_eq!(to_number_lenient(&Value::text("42\n")).unwrap(), 42.0);
+        assert_eq!(to_number_lenient(&Value::text("\r\n42\r\n")).unwrap(), 42.0);
+        // Interior whitespace: rejected (matches f64::from_str rules).
+        assert!(to_number_lenient(&Value::text("1 0")).is_err());
+        assert!(to_number_lenient(&Value::text("1\t0")).is_err());
+    }
+
+    #[test]
+    fn nbsp_and_bom_boundary_behavior() {
+        // `str::trim` uses `char::is_whitespace` which classifies U+00A0 NBSP as whitespace
+        // but does NOT include U+FEFF BOM (per Unicode `White_Space` property). Lock the
+        // observed behavior:
+        // - Edge NBSP: stripped by trim → f64 parses → Ok.
+        // - Edge BOM: NOT stripped → f64::parse rejects (BOM char isn't a digit) → Err.
+        // - Embedded NBSP: not stripped (only leading/trailing) → f64::parse rejects → Err.
+        assert_eq!(
+            to_number_lenient(&Value::text("\u{00A0}42\u{00A0}")).unwrap(),
+            42.0
+        );
+        assert_eq!(
+            to_number_lenient(&Value::text("\u{FEFF}42")).unwrap_err(),
+            ErrorValue::Value
+        );
+        assert_eq!(
+            to_number_lenient(&Value::text("4\u{00A0}2")).unwrap_err(),
+            ErrorValue::Value
+        );
+    }
+
+    // -- systematic edge-case coverage (number formats) -----------------------
+
+    #[test]
+    fn hex_octal_binary_prefixes_rejected() {
+        // Excel doesn't accept 0x/0o/0b prefixes in normal numeric context (HEX2DEC etc.
+        // require explicit conversion functions). f64::from_str rejects them anyway.
+        assert!(to_number_lenient(&Value::text("0x1F")).is_err());
+        assert!(to_number_lenient(&Value::text("0o17")).is_err());
+        assert!(to_number_lenient(&Value::text("0b101")).is_err());
+        assert!(to_number_lenient(&Value::text("0xFF")).is_err());
+    }
+
+    #[test]
+    fn leading_zeros_accepted_as_decimal() {
+        // Excel accepts "007" as 7 (decimal). Our f64::parse path agrees.
+        assert_eq!(to_number_lenient(&Value::text("007")).unwrap(), 7.0);
+        assert_eq!(to_number_lenient(&Value::text("00.5")).unwrap(), 0.5);
+        assert_eq!(to_number_lenient(&Value::text("-007")).unwrap(), -7.0);
+    }
+
+    #[test]
+    fn comma_decimal_separator_rejected_locale_v1() {
+        // German/French "1,5" notation. Phase 0 locks invariant ASCII parse; locale comes in Phase 3.
+        assert!(to_number_lenient(&Value::text("1,5")).is_err());
+        assert!(to_number_lenient(&Value::text("1.000,5")).is_err());
+    }
+
+    // -- systematic edge-case coverage (exponent edges) -----------------------
+
+    #[test]
+    fn exponent_zero_forms_resolve_to_zero() {
+        // 0e... is always zero regardless of exponent.
+        assert_eq!(to_number_lenient(&Value::text("0e0")).unwrap(), 0.0);
+        assert_eq!(to_number_lenient(&Value::text("0e+10")).unwrap(), 0.0);
+        assert_eq!(to_number_lenient(&Value::text("0e-10")).unwrap(), 0.0);
+        assert_eq!(to_number_lenient(&Value::text("-0e5")).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn exponent_overflow_to_infinity_is_rejected() {
+        // 1e500 overflows to +Inf. Our parser rejects (returns #VALUE! via None).
+        assert!(to_number_lenient(&Value::text("1e500")).is_err());
+        assert!(to_number_lenient(&Value::text("-1e500")).is_err());
+    }
+
+    #[test]
+    fn exponent_underflow_to_subnormal_or_zero() {
+        // 1e-323 is still representable (smallest subnormal positive ~5e-324).
+        let near_zero = to_number_lenient(&Value::text("1e-323")).unwrap();
+        assert!(near_zero >= 0.0);
+        // 1e-324 underflows to 0.0 (which is finite, so accepted).
+        let result = to_number_lenient(&Value::text("1e-324"));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0.0);
+    }
+
+    #[test]
+    fn exponent_malformed_rejected() {
+        // "1e" no exponent digits.
+        assert!(to_number_lenient(&Value::text("1e")).is_err());
+        // "1e+" no exponent digits after sign.
+        assert!(to_number_lenient(&Value::text("1e+")).is_err());
+        // "e5" no mantissa.
+        assert!(to_number_lenient(&Value::text("e5")).is_err());
+        // Multiple exponents.
+        assert!(to_number_lenient(&Value::text("1e2e3")).is_err());
+    }
+
+    // -- percent edge cases ----------------------------------------------------
+
+    #[test]
+    fn percent_with_decimal_and_exponent() {
+        assert_eq!(to_number_lenient(&Value::text("12.5%")).unwrap(), 0.125);
+        assert_eq!(to_number_lenient(&Value::text("1e2%")).unwrap(), 1.0); // 100% = 1.0
+        assert_eq!(to_number_lenient(&Value::text("-50%")).unwrap(), -0.5);
+    }
+
+    #[test]
+    fn percent_chaining_rejected() {
+        // "50%%" — double percent isn't a thing in Excel; reject.
+        assert!(to_number_lenient(&Value::text("50%%")).is_err());
+        // Internal percent.
+        assert!(to_number_lenient(&Value::text("5%0")).is_err());
+    }
+
+    #[test]
+    fn percent_alone_rejected() {
+        // Bare "%" or whitespace-only with trailing %.
+        assert!(to_number_lenient(&Value::text("%")).is_err());
+        assert!(to_number_lenient(&Value::text(" %")).is_err());
+    }
+
+    // -- sign edge cases -------------------------------------------------------
+
+    #[test]
+    fn sign_only_rejected() {
+        assert!(to_number_lenient(&Value::text("+")).is_err());
+        assert!(to_number_lenient(&Value::text("-")).is_err());
+        assert!(to_number_lenient(&Value::text("+-5")).is_err());
+        assert!(to_number_lenient(&Value::text("--5")).is_err());
+    }
+
+    #[test]
+    fn space_between_sign_and_digits_rejected() {
+        assert!(to_number_lenient(&Value::text("- 5")).is_err());
+        assert!(to_number_lenient(&Value::text("+ 5")).is_err());
+    }
+
+    // -- decimal-point edge cases ---------------------------------------------
+
+    #[test]
+    fn dot_only_and_dotted_edges() {
+        assert!(to_number_lenient(&Value::text(".")).is_err());
+        assert_eq!(to_number_lenient(&Value::text("1.")).unwrap(), 1.0);
+        assert_eq!(to_number_lenient(&Value::text(".5")).unwrap(), 0.5);
+        assert_eq!(to_number_lenient(&Value::text("-0.5")).unwrap(), -0.5);
+        // Multiple decimals.
+        assert!(to_number_lenient(&Value::text("1.2.3")).is_err());
+    }
+
+    // -- NaN / inf textual rejected -------------------------------------------
+
+    #[test]
+    fn nan_inf_text_unparseable() {
+        // f64::parse accepts "NaN" and "inf", but we want spreadsheet-strict — reject.
+        // CURRENT BEHAVIOR: our parser DOES filter via the NaN/Inf check after parse,
+        // returning None. Lock this contract.
+        assert!(to_number_lenient(&Value::text("NaN")).is_err());
+        assert!(to_number_lenient(&Value::text("inf")).is_err());
+        assert!(to_number_lenient(&Value::text("Infinity")).is_err());
+        assert!(to_number_lenient(&Value::text("-inf")).is_err());
+        assert!(to_number_lenient(&Value::text("+Inf")).is_err());
+    }
+
+    // -- to_logical edge: whitespace + literal forms --------------------------
+
+    #[test]
+    fn logical_text_only_true_false_recognized() {
+        // Only TRUE / FALSE in any ASCII case are accepted. "T", "F", "yes", "no", "1", "0" → #VALUE!.
+        assert_eq!(
+            to_logical(&Value::text("T")).unwrap_err(),
+            ErrorValue::Value
+        );
+        assert_eq!(
+            to_logical(&Value::text("F")).unwrap_err(),
+            ErrorValue::Value
+        );
+        assert_eq!(
+            to_logical(&Value::text("yes")).unwrap_err(),
+            ErrorValue::Value
+        );
+        assert_eq!(
+            to_logical(&Value::text("no")).unwrap_err(),
+            ErrorValue::Value
+        );
+        assert_eq!(
+            to_logical(&Value::text("1")).unwrap_err(),
+            ErrorValue::Value
+        );
+        assert_eq!(
+            to_logical(&Value::text("0")).unwrap_err(),
+            ErrorValue::Value
+        );
+    }
+
+    // -- size + max-precision boundary ----------------------------------------
+
+    #[test]
+    fn very_large_number_passes_strict() {
+        assert_eq!(
+            to_number_strict(&Value::Number(f64::MAX)).unwrap(),
+            f64::MAX
+        );
+        // Just below positive infinity stays finite.
+        let close = f64::MAX / 1.0001;
+        assert_eq!(to_number_strict(&Value::Number(close)).unwrap(), close);
+    }
 }
