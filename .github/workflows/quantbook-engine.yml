@@ -4,11 +4,11 @@ on:
   push:
     paths:
       - 'quantbook-engine/**'
-      - '.github/workflows/quantbook-engine.yml'
+      - '.github/workflows/**'
   pull_request:
     paths:
       - 'quantbook-engine/**'
-      - '.github/workflows/quantbook-engine.yml'
+      - '.github/workflows/**'
 
 defaults:
   run:
@@ -35,6 +35,8 @@ jobs:
           workspaces: quantbook-engine -> target
       - name: Phase 0 Amendment A3 — check build flags
         run: bash scripts/check-build-flags.sh
+      - name: Phase 0 Amendment A3 — self-test (10 poisoning forms)
+        run: bash scripts/check-build-flags.sh --self-test
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: cargo clippy (--locked)
