@@ -12,8 +12,17 @@ path = "src/lib.rs"
 [dependencies]
 ql-types          = { path = "../ql-types" }
 ql-formula-syntax = { path = "../ql-formula-syntax" }
-ql-calcgraph     = { path = "../ql-calcgraph" }
+ql-calcgraph      = { path = "../ql-calcgraph" }
 ql-storage        = { path = "../ql-storage" }
+arrow-array       = { workspace = true }
+pulp              = { workspace = true }
+multiversion      = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
+proptest  = { workspace = true }
+criterion = { workspace = true }
+
+# Phase 0 OG-02 hot path bench (Week 4 acceptance run).
+[[bench]]
+name = "og02_mul2"
+harness = false

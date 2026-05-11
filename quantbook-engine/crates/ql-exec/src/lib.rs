@@ -22,7 +22,11 @@
 pub mod env;
 pub mod plan;
 pub mod scalar;
+pub mod simd;
 
 pub use env::{CellEnv, MapEnv, WorkbookEnv};
 pub use plan::{bind, BindError, ExprPlan};
 pub use scalar::eval_scalar;
+pub use simd::{
+    add_array, add_scalar, div_array, mul_array, mul_scalar, scalar_sub, sub_array, sub_scalar,
+};
