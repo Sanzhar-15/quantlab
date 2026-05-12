@@ -191,6 +191,10 @@ mod tests {
         assert_eq!(loaded.read(Address::new(s, 3, 0)), Value::Number(-95.0));
     }
 
+    /// Phase 2A.8 audit M12 closure (was: pinned the persistence gap): named
+    /// ranges now round-trip through save/load via the schema-v2 `names`
+    /// section. A formula referencing a registered name resolves cleanly on
+    /// reload.
     #[test]
     fn named_range_formula_round_trips_through_load_and_recompute() {
         use ql_storage::NamedTarget;
@@ -203,66 +207,74 @@ mod tests {
             let mut rt = WorkbookRuntime::new(&mut wb, &reg);
             rt.set_formula(s, 0, 0, "1000 * TaxRate").unwrap();
         }
-        // NOTE: named-ranges aren't persisted to .qbook yet (deferred to Phase
-        // 2B+ — see ql-io::qbook_format). So after load, the NameTable is empty
-        // and the formula =1000*TaxRate would fail to bind. This test pins the
-        // current limitation: we expect a Recompute error from the loader.
         save_workbook(&wb, "named", &path).unwrap();
-        let result = load_workbook_and_recompute(&path, &reg);
-        match result {
-            Err(LoadAndRecomputeError::Recompute { workbook: _, error }) => {
-                // Underlying error should be a bind-time UnresolvedName for TAXRATE.
-                use crate::plan::BindError;
-                use crate::workbook_runtime::RuntimeError;
-                assert!(
-                    matches!(error, RuntimeError::Bind(BindError::UnresolvedName(_))),
-                    "expected Bind(UnresolvedName), got {error:?}"
-                );
-            }
-            other => panic!("expected Recompute err, got {other:?}"),
-        }
+
+        let loaded = load_workbook_and_recompute(&path, &reg).unwrap();
+        // Name survived the round-trip + the formula recomputed against it.
+        assert_eq!(loaded.read(Address::new(s, 0, 0)), Value::Number(210.0));
+        // Formula text also preserved.
+        assert_eq!(
+            loaded.formula_at(s, 0, 0).map(|t| t.as_ref()),
+            Some("1000 * TaxRate")
+        );
+        // Name is still in the loaded workbook's NameTable.
+        assert!(matches!(
+            loaded.names().lookup("TAXRATE"),
+            Some(NamedTarget::Constant(Value::Number(n))) if n == 0.21
+        ));
     }
 
     /// Phase 2A.6 audit M5 (2026-05-12): on recompute failure, the loader must
     /// preserve the partially-recomputed workbook in the error variant so the
     /// caller can inspect / display the partial state. Previously the workbook
     /// was dropped on the early-return path.
+    ///
+    /// Phase 2A.8 update: named-ranges now persist (audit M12 closed), so the
+    /// prior failure trigger (an unresolved named reference after reload) no
+    /// longer fails. We force a recompute failure by hand-corrupting the
+    /// formula text on-disk to invalid syntax — exercising the same
+    /// partial-state preservation path.
     #[test]
     fn recompute_failure_preserves_partial_workbook_in_error() {
-        use ql_storage::NamedTarget;
         let (_dir, path) = temp_path("partial.qbook");
 
-        // Build a workbook with TWO formulas: one that recomputes cleanly,
-        // and one that depends on a named range. After save+load, the named
-        // range is gone (Phase 2B+ persistence gap), so the second formula
-        // fails to bind during recompute. The error should carry the
-        // partial workbook with the literal A1 value intact (and at least
-        // the formula text for both cells preserved).
+        // Build a workbook with two formulas, save it, then corrupt one
+        // formula's text on-disk so the load → recompute path fails on it.
         let mut wb = Workbook::new();
         let s = wb.add_sheet("S");
         wb.put_at(s, 0, 0, Value::Number(42.0));
-        wb.set_name("MyName", NamedTarget::Constant(Value::Number(7.0)));
         let reg = default_registry();
         {
             let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-            rt.set_formula(s, 1, 0, "A1 + 1").unwrap(); // resolves fine on reload
-            rt.set_formula(s, 2, 0, "MyName + 1").unwrap(); // breaks on reload
+            rt.set_formula(s, 1, 0, "A1 + 1").unwrap();
+            rt.set_formula(s, 2, 0, "A1 * 10").unwrap();
         }
         save_workbook(&wb, "partial", &path).unwrap();
 
+        // Corrupt the JSONL for sheet 0 to introduce a parse-broken formula.
+        // The JSONL line for (s=0, row=2, col=0) has formula "A1 * 10". We
+        // rewrite the file so that line becomes "(((" — guaranteed parse error.
+        let jsonl_path = path.join("sheets").join("0.jsonl");
+        let original = std::fs::read_to_string(&jsonl_path).unwrap();
+        let corrupted = original.replace("A1 * 10", "(((");
+        assert_ne!(
+            corrupted, original,
+            "test setup: expected to corrupt one line"
+        );
+        std::fs::write(&jsonl_path, corrupted).unwrap();
+
         match load_workbook_and_recompute(&path, &reg) {
             Err(LoadAndRecomputeError::Recompute { workbook, error: _ }) => {
-                // The partial workbook is returned. Literal A1 is intact.
+                // Partial workbook is returned. Literal A1 intact.
                 assert_eq!(workbook.read(Address::new(s, 0, 0)), Value::Number(42.0));
-                // Both formula texts are preserved on disk and survive load,
-                // regardless of recompute success.
+                // Both formula texts survive the load.
                 assert_eq!(
                     workbook.formula_at(s, 1, 0).map(|t| t.as_ref()),
                     Some("A1 + 1")
                 );
                 assert_eq!(
                     workbook.formula_at(s, 2, 0).map(|t| t.as_ref()),
-                    Some("MyName + 1")
+                    Some("(((")
                 );
             }
             other => panic!("expected Recompute err with partial workbook, got {other:?}"),
