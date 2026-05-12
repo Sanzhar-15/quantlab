@@ -12,6 +12,10 @@ path = "src/lib.rs"
 [dependencies]
 ql-types          = { path = "../ql-types" }
 ql-formula-syntax = { path = "../ql-formula-syntax" }
+# Phase 2A.10 audit H3: stable formula fingerprint via SipHash24 with a
+# fixed seed. Replaces `std::collections::hash_map::DefaultHasher` whose
+# algorithm contract is "not specified" per the Rust API.
+siphasher         = { workspace = true }
 
 [dev-dependencies]
 proptest  = { workspace = true }

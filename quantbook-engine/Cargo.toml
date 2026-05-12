@@ -88,6 +88,12 @@ petgraph = { version = "=0.8.3", default-features = false, features = ["std"] }
 tempfile = "=3.27.0"
 mimalloc = { version = "=0.1.48", default-features = false }
 num_cpus = "=1.17.0"
+# Phase 2A.10 audit H3/M14: SipHash24 with a fixed seed for stable formula
+# fingerprints. `siphasher` pins the algorithm contract (unlike stdlib
+# `DefaultHasher` whose internal algorithm is not specified). 800 MB/s
+# throughput is plenty for fingerprint use; we don't need BLAKE3's
+# cryptographic strength.
+siphasher = "=1.0.1"
 
 # Serialization (graph-profile.json export — OG-06; `.qbook/workbook.toml` envelope per
 # the Phase 1 workbook format).
