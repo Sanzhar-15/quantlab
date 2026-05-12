@@ -104,9 +104,10 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 
 | ID | Gap | Reproduce | Owner | Target phase |
 |---|---|---|---|---|
-| GAP-I-01 | `extensions/quantlab/` has never been exercised against the engine | No vertical-slice test exists | Engine + IDE | Engine Phase 2B.6 (first slice) |
-| GAP-I-02 | No engine-side test harness simulating IDE consumption (paste-of-1000, edit-cancel, error display) | Absence | Engine | Engine Phase 2B.6 |
-| GAP-I-03 | Diagnostic shape not designed for IDE consumption (lex/parse/bind/recompute errors are typed but not formatted for end-user display) | `RuntimeError::Display` outputs are dev-facing | Engine | Engine Phase 2B.6 + Phase 7.4 (IDE polish) |
+| GAP-I-01 | TypeScript-side `extensions/quantlab/` has never been exercised against the engine — separate worktree work. Engine side: contract + simulation **CLOSED** in Engine Phase 2B.6 (commit-after-66bbbddc3d9); see `docs/architecture/ide-consumer-contract.md` and `crates/ql-exec/tests/ide_simulation.rs`. TypeScript-side work belongs in the `quantlab/` main checkout. | `extensions/quantlab/` empty re: engine bindings | IDE worktree | Phase 2B.6 IDE side (separate session) |
+| ~~GAP-I-02~~ | ~~No engine-side IDE-consumption test harness~~ — **CLOSED** in Engine Phase 2B.6: `crates/ql-exec/tests/ide_simulation.rs` (~270 lines, 7 tests) exercises the engine through the exact call pattern an IDE would use. Each test pins one IDE-2B-0N acceptance item. |
+| GAP-I-03 | Diagnostic shape adequate but not exhaustive — error `Display` strings are user-facing per Phase 2A.11 audit M16 but lack span info (parser error doesn't say WHERE in the formula). | `RuntimeError::Display` outputs lack source position | Engine | Phase 2B.6 follow-up + Phase 7.4 (IDE polish) |
+| GAP-I-04 | No "dry-run" formula validation API. IDE wants on-keystroke validation; currently has to call `set_formula` which commits. Add `WorkbookRuntime::validate_formula(sheet, row, col, text) -> Result<Value, RuntimeError>` that runs lex+parse+bind+eval without persisting. | Absence | Engine | Phase 2B.6 follow-up (cheap) or Engine Phase 6.1 (Session API) |
 
 ### Documentation
 
@@ -122,6 +123,7 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 
 - **GAP-R-03** (bind-plan re-derivation) — closed in Engine Phase 2B.3. See struck-through entry above for the closing summary.
 - **GAP-O-01 / GAP-O-02 / GAP-O-03** (op-log producer bypasses for set_name / add_sheet / put_at + clear_formula) — closed in Engine Phase 2B.5. Runtime wrappers route through the op log; direct Workbook methods doc-marked as low-level. Producer-replay equivalence covers the full Op vocabulary (PutValue, PutFormula, ClearFormula, SetName, AddSheet, BatchCommit).
+- **GAP-I-02** (engine-side IDE-consumption test harness) — closed in Engine Phase 2B.6 (engine side). See struck-through entry above.
 
 ---
 

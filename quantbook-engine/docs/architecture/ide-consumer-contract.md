@@ -1,0 +1,208 @@
+# IDE consumer contract
+
+**Status:** Engine Phase 2B.6 — first vertical-slice surface  
+**Date:** 2026-05-12  
+**Stability:** **DRAFT** — names + shapes will change as Engine Phase 6.1 (Stable Engine Session API) formalizes them. This document is the SPEC that 6.1 will harden.
+
+This document describes how the Quantlab IDE (`extensions/quantlab/`, a separate worktree) consumes the Quantbook engine. It is informed by the IDE-2B-01..05 acceptance criteria in `docs/MASTER-PLAN.md` Phase 2B.6 and exercised in `crates/ql-exec/tests/ide_simulation.rs`.
+
+## 1. Lifecycle (one workbook session)
+
+```text
+                                         ┌────────────────────────────┐
+   IDE opens .qbook                      │ engine state:              │
+   ────────────►  load_workbook_with_oplog─►  Workbook + OpLog        │
+                                         └────────────┬───────────────┘
+                                                      │
+                                                      ▼
+   user types in formula bar / pastes   ┌────────────────────────────┐
+   ──────────────────────────────────►  │ per-edit:                  │
+                                         │   WorkbookRuntime::with_oplog
+                                         │   .set_value / .set_formula│
+                                         │   .transaction().commit()  │
+                                         └────────────┬───────────────┘
+                                                      │ (mutates wb, appends ops)
+                                                      ▼
+   user saves                            ┌────────────────────────────┐
+   ──────────────────────────────────►  │ save_workbook_with_oplog   │
+                                         └────────────┬───────────────┘
+                                                      │
+   user reopens                                       ▼
+   ──────────────────────────────────►  load_workbook_with_oplog → restored
+```
+
+The IDE holds three pieces of state per open workbook:
+
+| State | Type | Lifetime |
+|---|---|---|
+| `wb` | `ql_storage::Workbook` | Open until save / close |
+| `oplog` | `ql_oplog::OpLog` | Open until save / close. Carries mutation history. |
+| `registry` | `ql_functions::FunctionRegistry` | Process-wide singleton (`default_registry()`) |
+
+`WorkbookRuntime` is **per-edit**, not per-session. It borrows `&mut wb` + `&reg` + `&mut oplog` for the duration of one user action (one set_formula call, one paste transaction, one recompute). Borrowing `&mut wb` for the runtime's lifetime prevents the IDE from reading the workbook through other paths while an edit is in flight — that's intentional. The IDE typically constructs a runtime, performs ONE operation, drops the runtime, then re-reads cells for grid rendering.
+
+Engine Phase 6.1 will formalize this as a `WorkbookSession` struct that owns wb + oplog + registry, exposing edit methods directly without the borrow dance. 2B.6 doesn't ship that — the test scaffolding in `ide_simulation.rs` documents the pattern.
+
+## 2. Operations the IDE invokes
+
+### 2.1 Open / load
+
+```rust
+let (wb, oplog) = ql_oplog::load_workbook_with_oplog(path)?;
+```
+
+- Loads the `.qbook/` directory.
+- `oplog.bin` MUST be present (Phase 2A.3.c contract; load fails with `MissingFile` otherwise).
+- The IDE then renders the grid by walking cells via `wb.sheet(id)?.read(row, col)` for each visible cell, and `wb.formula_at(sheet, row, col)` for the formula bar.
+
+If the workbook has no op log (legacy save or external tool), use the bare `ql_io::load_workbook(path)` and construct a fresh empty `OpLog::new()` — but note that subsequent saves via `save_workbook_with_oplog` will write the new (empty-then-growing) log over the absent one.
+
+### 2.2 Edit a single cell
+
+User types `=A1 * 2` and hits Enter:
+
+```rust
+let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+let value = rt.set_formula(sheet, row, col, "A1 * 2")?;
+// value is Value::Number(20.0) given A1=10
+// rt drops; wb + oplog observable again
+```
+
+The IDE renders `value` in the cell. If `set_formula` returns `Err(RuntimeError::...)`:
+- The Display string is user-facing — render it in a diagnostic panel / hover tooltip.
+- The workbook is unchanged (no partial write, per the no-fallbacks rule).
+- The op log is unchanged (append-before-mutate ordering).
+
+Common error variants the IDE renders:
+- `RuntimeError::Lex(...)` — syntax / tokenization error (e.g., unexpected `@`).
+- `RuntimeError::Parse(...)` — parse error (e.g., unclosed paren).
+- `RuntimeError::Bind(BindError::UnresolvedName(...))` — `#NAME?` analogue.
+- `RuntimeError::Bind(BindError::NamedRangeInScalarContext(...))` — use SUM/AVERAGE/COUNT etc.
+- `RuntimeError::Bind(BindError::NamedFormulaUnsupported(...))` — named formulas are Engine Phase 4.
+- `RuntimeError::InvalidSheet { ... }` / `InvalidCell { ... }` — coordinate out of range.
+
+### 2.3 Edit a single cell to a literal
+
+User types `42` (no leading `=`):
+
+```rust
+let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+rt.set_value(sheet, row, col, Value::Number(42.0))?;
+```
+
+Sets a literal; clears any prior formula. Emits `Op::PutValue` (+ `Op::ClearFormula` if cell had a formula).
+
+### 2.4 Cancel an edit
+
+User starts typing, presses Esc. **The IDE simply does not call `set_formula` / `set_value`.** No engine state changes. No op log entry. The runtime is never constructed.
+
+This is the canonical "no-op cancel" path. The engine offers no explicit cancel API because none is needed — borrow-checked mutation requires explicit `&mut` access, and the IDE never grants it for cancelled edits.
+
+### 2.5 Paste a block
+
+User pastes 10 cells (literals + formulas):
+
+```rust
+let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+{
+    let mut tx = rt.transaction();
+    for (row, col, value) in pasted_literals {
+        tx.put_value(sheet, row, col, value)?;
+    }
+    for (row, col, formula) in pasted_formulas {
+        tx.put_formula(sheet, row, col, formula)?;
+    }
+    tx.commit()?;
+}
+```
+
+The transaction:
+- Buffers all writes; eager bind validation surfaces formula errors BEFORE the commit (so the paste atomically succeeds or rejects).
+- Drop without commit = no-op (canonical "ESC cancels paste" path).
+- Emits exactly one `Op::BatchCommit { ops: [...] }` per commit.
+
+### 2.6 Set / remove a defined name
+
+User adds a named range in the Name Manager:
+
+```rust
+let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+rt.set_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)))?;
+```
+
+Emits `Op::SetName`. Returns `RuntimeError::Name(NameTableError::Reserved(...))` for reserved names (currently just `AI` per CORR-06).
+
+### 2.7 Add a sheet
+
+```rust
+let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+let new_sheet_id = rt.add_sheet("Sheet2", 16_384)?;
+```
+
+`16_384` is the engine default chunk size; pass the same unless deliberately tuning.
+
+### 2.8 Clear a formula (keep value)
+
+User edits the formula bar to remove the leading `=` (Excel-canon: strips formula, leaves last-evaluated value as a literal):
+
+```rust
+let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+rt.clear_formula(sheet, row, col)?;
+```
+
+Emits `Op::PutValue(current) + Op::ClearFormula` (preserves the "strip formula, keep value" semantic across replay). No-op if cell had no formula.
+
+### 2.9 Recompute on demand
+
+After an out-of-band mutation (e.g., a UDF refresh, a future connector update) the IDE forces a full recompute:
+
+```rust
+let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+let result = rt.recompute_all();
+if !result.is_complete() {
+    for failure in &result.failures {
+        // display per-cell diagnostic
+    }
+}
+```
+
+Hit/miss counters in the bind-plan cache visible via `rt.cache_stats()` — IDE can surface these in a status bar / debug pane (Engine Phase 6.2 wires them into the ql-profile JSON for the IDE to render).
+
+### 2.10 Save
+
+```rust
+ql_oplog::save_workbook_with_oplog(&wb, &oplog, "name", path)?;
+```
+
+Atomic save (`.qbook/` + `oplog.bin` ride the same temp-then-rename protocol). The op log persists in full — any future session reloading this `.qbook` sees the same history.
+
+## 3. What the IDE does NOT do
+
+- **The IDE does NOT call `Workbook::set_name`, `Workbook::add_sheet`, `Workbook::put_at`, or `Workbook::clear_formula` directly.** Those are LOW-LEVEL methods (doc-marked Phase 2B.5) used by the qbook loader, the op-log replay path, runtime-internal recompute pass 2, and tests. Direct calls bypass the op log silently — a correctness hole for product code.
+- **The IDE does NOT manage the op log directly.** No `oplog.append(...)` calls. The runtime emits ops; the IDE just hands the runtime an `&mut OpLog` and the runtime handles the rest.
+- **The IDE does NOT evaluate formulas itself.** All evaluation goes through the runtime. The IDE consumes results, never produces them.
+- **The IDE does NOT cache parsed/bound plans.** That's the runtime's `PlanCache`. The IDE consumes hit/miss stats for observability but never inserts directly.
+
+## 4. Engine surfaces NOT yet shipped (filed in `docs/known-gaps.md`)
+
+The IDE will need these eventually; they're not blocking the Phase 2B.6 vertical slice:
+
+- **On-keystroke validation.** Today, the IDE has to call `set_formula` to know whether a formula is valid; that COMMITS the formula. A dry-run `WorkbookRuntime::validate_formula(sheet, row, col, text) -> Result<Value, RuntimeError>` is missing. Filed as GAP-I-04 (Phase 2B.6 follow-up if scope allows).
+- **Undo / redo.** The op log captures history; an inverse-op replay would let the IDE undo. GAP-C-04 (Engine Phase 5.4).
+- **Incremental dependency-aware recompute.** `recompute_all` re-walks every formula. The IDE wants "this cell changed → recompute its dependents only." GAP-R-01 (Engine Phase 3 — calcgraph integration).
+- **Cross-sheet diagnostics on rename.** Renaming sheet 0 would invalidate every `Sheet0!A1` reference; today nothing detects this. GAP-B-04 / Phase 4.6.
+- **Long-running cancellation.** No `Cancel-token` on long operations. Engine Phase 6.1 work.
+
+## 5. Acceptance pattern (`crates/ql-exec/tests/ide_simulation.rs`)
+
+The simulation test exercises this contract end-to-end without an actual IDE. Each `#[test]` corresponds to one of IDE-2B-01..05:
+
+| Test | Acceptance | What it proves |
+|---|---|---|
+| `ide_01_formula_edit_returns_value` | IDE-2B-01 | `set_formula` returns the evaluated Value; IDE can render it |
+| `ide_02_bind_errors_carry_user_facing_display` | IDE-2B-02 | Errors round-trip with non-empty Display strings; no fallback values |
+| `ide_03_cancel_pattern_no_state_change` | IDE-2B-03 | The borrow-check-enforced "no call = no mutation" pattern works |
+| `ide_04_paste_block_via_transaction` | IDE-2B-04 | Transaction commit emits exactly one BatchCommit; partial drop = no state |
+| `ide_05_save_reload_preserves_state_and_oplog` | IDE-2B-05 | Round-trip preserves workbook + oplog length + visible cell values |
+
+The test file is the spec for what the actual TypeScript binding (Engine Phase 6.3) will call.
