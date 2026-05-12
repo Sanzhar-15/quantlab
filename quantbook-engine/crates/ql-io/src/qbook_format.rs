@@ -94,6 +94,19 @@ pub const WORKBOOK_SCHEMA_VERSION: u32 = 2;
 /// continue to load on v2 binaries; older versions would need explicit handling.
 const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
+/// Phase 2A.13 audit cycle-3 H1: sentinel filename written inside every
+/// engine-saved workbook directory. Recovery scanning uses this to
+/// distinguish engine-owned `.bak-<random>` siblings (which it may delete
+/// or restore) from user-created sibling directories that happen to match
+/// the `.bak-*` pattern (e.g., `book.qbook.bak-2025-review`).
+///
+/// The marker is written LAST in `write_workbook_to_dir` (after envelope +
+/// all sheet JSONLs), so a partial write doesn't leave a misleading marker
+/// in an incomplete directory. A v1 workbook re-saved on a v2 binary gains
+/// the marker after one successful save; until then, recovery will refuse
+/// to touch marker-less `.bak-*` siblings.
+const ATOMIC_SAVE_MARKER_FILENAME: &str = ".atomic-save-marker-v1";
+
 /// Errors that can occur during save / load.
 #[derive(Debug, Error)]
 pub enum QbookError {
@@ -126,6 +139,23 @@ pub enum QbookError {
     /// fallback.
     #[error("invalid workbook path {path:?}: {reason}")]
     InvalidPath { path: PathBuf, reason: &'static str },
+
+    /// Phase 2A.13 audit cycle-3 M5: step 3 of the atomic-save protocol
+    /// (rename temp → target) failed AND the rollback (rename backup → target)
+    /// also failed. The user-visible state is "workbook may now be unavailable
+    /// at `path`; backup data may still be at `backup_path`." Surfaces this
+    /// fact directly instead of just bubbling up the original temp-rename
+    /// error and burying the rollback failure in stderr.
+    #[error(
+        "atomic save rollback failed at {backup_path:?}: install error ({install}); \
+         backup restore error ({restore}). Workbook may be unavailable at the target; \
+         the backup directory still holds the prior state."
+    )]
+    AtomicSaveRollbackFailed {
+        backup_path: PathBuf,
+        install: String,
+        restore: String,
+    },
 
     #[error("malformed cell record in {file:?} at line {line}: {detail}")]
     MalformedCell {
@@ -466,6 +496,21 @@ fn parse_canonical_error_text(s: &str) -> Option<ErrorValue> {
 pub fn save_workbook(wb: &Workbook, name: &str, path: &Path) -> Result<(), QbookError> {
     let paths = make_save_paths(path)?;
 
+    // Phase 2A.13 audit cycle-3 H5: refuse to save into a path that exists
+    // but is NOT a directory. `path.exists() && !path.is_dir()` means a
+    // regular file (or symlink, FIFO, etc.) is sitting where the workbook
+    // directory should be. The previous code would have happily renamed
+    // that file to `<base>.bak-<suffix>`, then installed our directory in
+    // its place — the user's original file becomes an orphan no one will
+    // ever find (recovery would try `remove_dir_all` on it and fail with
+    // `NotADirectory`). Loud refusal is the right answer.
+    if path.exists() && !path.is_dir() {
+        return Err(QbookError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "target exists but is not a directory",
+        });
+    }
+
     // Step 1: write everything to the temp dir. If this fails, the original
     // target (if any) is untouched and we clean up the partial temp.
     if let Err(e) = write_workbook_to_dir(wb, name, &paths.temp) {
@@ -491,17 +536,15 @@ pub fn save_workbook(wb: &Workbook, name: &str, path: &Path) -> Result<(), Qbook
     // we have `.bak-<random>` only and no target — recovery on next load will
     // roll back. To avoid leaving the temp dir orphaned in that case, attempt
     // a rollback ourselves before returning.
-    if let Err(e) = fs::rename(&paths.temp, path) {
-        if had_existing {
-            // Restore the old state from backup so the user's file isn't lost.
-            if let Err(restore_err) = fs::rename(&paths.backup, path) {
-                eprintln!(
-                    "warning: save failed AND backup restore failed; \
-                     backup remains at {:?}: {restore_err}",
-                    paths.backup
-                );
-            }
-        }
+    if let Err(install_err) = fs::rename(&paths.temp, path) {
+        // Phase 2A.13 audit cycle-3 M5: when install fails AND restore also
+        // fails, surface a compound error (was: silently `eprintln!`ed the
+        // restore failure and returned only the install error).
+        let restore_err: Option<std::io::Error> = if had_existing {
+            fs::rename(&paths.backup, path).err()
+        } else {
+            None
+        };
         // The temp dir didn't move into place; try to clean it up.
         if let Err(cleanup_err) = fs::remove_dir_all(&paths.temp) {
             eprintln!(
@@ -509,7 +552,18 @@ pub fn save_workbook(wb: &Workbook, name: &str, path: &Path) -> Result<(), Qbook
                 paths.temp
             );
         }
-        return Err(QbookError::Io(e));
+        if let Some(restore_err) = restore_err {
+            // Both failed → compound user-visible error.
+            return Err(QbookError::AtomicSaveRollbackFailed {
+                backup_path: paths.backup.clone(),
+                install: install_err.to_string(),
+                restore: restore_err.to_string(),
+            });
+        }
+        // Restore succeeded (or no prior target existed): the user's prior
+        // workbook is intact at `path`. Return the install error so the
+        // caller knows the save itself failed.
+        return Err(QbookError::Io(install_err));
     }
 
     // Step 4: best-effort backup cleanup. On failure, log loudly — but the
@@ -610,6 +664,10 @@ fn recover_from_crashed_save(target: &Path) -> Result<(), QbookError> {
     let bak_prefix = format!("{basename}.bak-");
 
     // Scan the parent dir for orphan .bak-* siblings.
+    // Phase 2A.13 audit cycle-3 H1: ONLY consider directories that carry our
+    // atomic-save marker file (`is_engine_owned_backup`). A user-created
+    // sibling like `book.qbook.bak-2025-review` shares the filename prefix
+    // but lacks the marker — recovery leaves it alone.
     let mut orphans: Vec<PathBuf> = Vec::new();
     let read_dir = match fs::read_dir(parent) {
         Ok(it) => it,
@@ -618,7 +676,12 @@ fn recover_from_crashed_save(target: &Path) -> Result<(), QbookError> {
     for entry in read_dir.flatten() {
         if let Some(name) = entry.file_name().to_str() {
             if name.starts_with(&bak_prefix) {
-                orphans.push(entry.path());
+                let p = entry.path();
+                if is_engine_owned_backup(&p) {
+                    orphans.push(p);
+                }
+                // Else: user-created sibling that just happens to match the
+                // `.bak-*` prefix. Not ours, don't touch.
             }
         }
     }
@@ -626,33 +689,57 @@ fn recover_from_crashed_save(target: &Path) -> Result<(), QbookError> {
     if orphans.is_empty() {
         return Ok(());
     }
+
+    // Phase 2A.13 audit cycle-3 M6: when the target is valid AND we have
+    // multiple orphans, they're ALL stale (a valid target can only result
+    // from a single most-recent successful save; any older `.bak-*` is from
+    // a prior save whose step-4 cleanup never completed). Clean them all up
+    // instead of refusing to load — accumulated `eprintln!` warnings from
+    // repeated step-4 failures would otherwise create a permanent deadlock.
+    if target_envelope_is_valid(target) {
+        for bak in &orphans {
+            if let Err(e) = fs::remove_dir_all(bak) {
+                eprintln!(
+                    "warning: load detected orphan backup {bak:?} but cleanup failed: {e}; \
+                     target is valid, so load proceeds"
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    // Target is missing or invalid. We need to restore from a backup.
+    // Multi-orphan case here IS ambiguous (we don't know which backup
+    // matches the missing target); refuse and ask the user.
     if orphans.len() > 1 {
-        // Multiple orphans = ambiguous recovery. Refuse rather than guess.
         return Err(QbookError::InvalidPath {
             path: target.to_path_buf(),
-            reason: "multiple .bak-* siblings present; ambiguous crash recovery — \
-                     resolve manually before loading",
+            reason: "target is missing/invalid AND multiple .bak-* siblings present; \
+                     ambiguous crash recovery — resolve manually before loading",
         });
     }
     let bak = orphans.into_iter().next().expect("len == 1");
 
-    if target_envelope_is_valid(target) {
-        // Step 3 of save completed; step 4 was interrupted. Roll forward.
-        if let Err(e) = fs::remove_dir_all(&bak) {
-            eprintln!(
-                "warning: load detected orphan backup {bak:?} but cleanup failed: {e}; \
-                 target is valid, so load proceeds"
-            );
+    // Step 2 completed but step 3 didn't (or step 3 partially completed
+    // and left an invalid target). Roll back: restore the old state.
+    if target.exists() {
+        if let Err(e) = fs::remove_dir_all(target) {
+            return Err(QbookError::Io(e));
         }
-    } else {
-        // Step 2 completed but step 3 didn't (or step 3 partially completed
-        // and left an invalid target). Roll back: restore the old state.
-        if target.exists() {
-            if let Err(e) = fs::remove_dir_all(target) {
-                return Err(QbookError::Io(e));
-            }
+    }
+    // Phase 2A.13 audit cycle-3 M4: concurrent loader race. Two loaders
+    // seeing the same orphan can race here — one wins, the other sees
+    // `NotFound` because the bak is already consumed. If we lose the
+    // rename race, re-check whether the target is NOW valid (the other
+    // loader's rename succeeded and installed it). Only return the I/O
+    // error if the rollback genuinely failed.
+    if let Err(rename_err) = fs::rename(&bak, target) {
+        if target_envelope_is_valid(target) {
+            // Another loader won the race and the rollback is already done.
+            // We're good — proceed with load.
+            return Ok(());
         }
-        fs::rename(&bak, target)?;
+        return Err(QbookError::Io(rename_err));
     }
     Ok(())
 }
@@ -824,7 +911,32 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
         writer.flush()?;
     }
 
+    // Phase 2A.13 audit cycle-3 H1: write the atomic-save marker LAST, after
+    // envelope + all sheet JSONLs. A partial write that fails before this
+    // point leaves a directory WITHOUT the marker, so recovery won't
+    // mistake the partial result for an engine-owned backup. Marker
+    // content is the schema version + a human-readable note (no parsing —
+    // the filename's presence is the only signal recovery consults).
+    fs::write(
+        dir.join(ATOMIC_SAVE_MARKER_FILENAME),
+        format!(
+            "Quantbook atomic-save marker v1 (schema_version={WORKBOOK_SCHEMA_VERSION}).\n\
+             Presence of this file proves the directory was written by the\n\
+             engine's atomic-save protocol. Used by recover_from_crashed_save\n\
+             to distinguish engine-owned `.bak-<random>` siblings from\n\
+             user-created sibling directories. Safe to ignore.\n"
+        ),
+    )?;
+
     Ok(())
+}
+
+/// Phase 2A.13 audit cycle-3 H1: a directory is "engine-owned" iff it contains
+/// our marker file. Used by recovery to filter `.bak-<random>` siblings —
+/// user-created directories that match the prefix but lack the marker are
+/// left alone.
+fn is_engine_owned_backup(dir: &Path) -> bool {
+    dir.join(ATOMIC_SAVE_MARKER_FILENAME).is_file()
 }
 
 /// Load a `Workbook` from a `.qbook/` directory.
@@ -864,6 +976,11 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
         });
     }
     let is_v1 = envelope.schema_version == 1;
+
+    // Phase 2A.13 audit cycle-3 H4: counter for legacy-pending migrations so we
+    // can warn the user once per load (rather than silently corrupting any
+    // legitimate `#NULL!` formula results from v1 workbooks).
+    let mut legacy_pending_migrations: usize = 0;
 
     // Construct the Workbook + sheets in id order. Sheet ids in the envelope must be
     // sequential 0..N — Workbook::add_sheet allocates ids in that order.
@@ -926,9 +1043,20 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
             // formula-bearing Blank cell (`Error("#NULL!")` + formula) and
             // rewrite it to the v2 Pending semantic during the v1 load path.
             // v2 files emit `Pending` directly and skip this branch.
+            //
+            // Phase 2A.13 audit cycle-3 H4: this rule cannot distinguish
+            // "engine wrote #NULL! as Pending stand-in" from "user's formula
+            // legitimately evaluated to #NULL!" (Excel's intersection-of-
+            // disjoint-ranges error, e.g. `=SUM(A1 B1)` with a space). Both
+            // encode identically in v1. We count migrations and warn ONCE
+            // per load at the end so the user can audit suspect formulas
+            // rather than silently corrupting real #NULL! results.
             let is_legacy_pending = is_v1
                 && rec.formula.is_some()
                 && matches!(&rec.value, CellWireValue::Error(s) if s == "#NULL!");
+            if is_legacy_pending {
+                legacy_pending_migrations += 1;
+            }
 
             let value = if rec.value.is_pending() || is_legacy_pending {
                 // Pending cells contribute no Value to the cell — leave it
@@ -968,6 +1096,22 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                     reason: format!("rejected by NameTable: {e}"),
                 })?;
         }
+    }
+
+    // Phase 2A.13 audit cycle-3 H4: warn once per load if we rewrote any v1
+    // `Error("#NULL!") + formula` cells to Pending. The rewrite is correct
+    // for engine-produced files (where #NULL! was a stand-in for "not yet
+    // evaluated") but COULD silently corrupt legitimate Excel #NULL! results
+    // — the v1 wire format conflated both cases. The user should re-check
+    // any formulas that legitimately produce #NULL! after this load.
+    if legacy_pending_migrations > 0 {
+        eprintln!(
+            "warning: load_workbook {path:?} migrated {legacy_pending_migrations} v1 \
+             `Error(#NULL!) + formula` cells to the v2 Pending semantic. \
+             If any of those formulas were authored to produce #NULL! intentionally \
+             (e.g. `=SUM(A1 B1)` with a space), their evaluated values will be lost \
+             until recompute. Re-save the workbook in v2 format to remove this ambiguity."
+        );
     }
 
     Ok(wb)
@@ -1644,6 +1788,10 @@ col_extent = 1
     /// (backup cleanup): an orphan `.bak-*` sibling exists, AND the target is
     /// a valid workbook. Recovery should clean up the orphan and load the
     /// target normally.
+    ///
+    /// Phase 2A.13 audit cycle-3 H1 update: the orphan also needs the
+    /// `.atomic-save-marker-v1` file inside it; otherwise recovery treats it
+    /// as a user-created sibling and leaves it alone.
     #[test]
     fn load_recovers_orphan_backup_when_target_valid_roll_forward() {
         let dir = TempDir::new().unwrap();
@@ -1659,12 +1807,49 @@ col_extent = 1
         ));
         fs::create_dir_all(&bak).unwrap();
         fs::write(bak.join("workbook.toml"), "garbage that won't parse").unwrap();
+        // H1: mark this orphan as engine-owned so recovery acts on it.
+        fs::write(bak.join(ATOMIC_SAVE_MARKER_FILENAME), "engine-owned").unwrap();
         assert!(bak.exists());
 
         // Load: should succeed AND clean up the orphan.
         let loaded = load_workbook(&path).unwrap();
         assert_eq!(loaded.sheet(0).unwrap().read(0, 0), Value::Number(7.0));
         assert!(!bak.exists(), "load should have cleaned up the orphan .bak");
+    }
+
+    /// Phase 2A.13 audit cycle-3 H1: a user-created sibling directory whose
+    /// name happens to match the `.bak-*` prefix is NOT engine-owned and
+    /// recovery must leave it alone. Closes the megaudit's `book.qbook.bak-
+    /// 2025-review` data-loss vector.
+    #[test]
+    fn load_does_not_touch_user_created_sibling_lacking_marker() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("user-sibling.qbook");
+        let wb = wb_with("S", &[cell(0, 0, Value::Number(42.0))]);
+        save_workbook(&wb, "user-sibling", &path).unwrap();
+
+        // Plant a user-created sibling matching the .bak-* prefix but
+        // lacking the engine marker. Could be a manual backup the user
+        // made, e.g. `mybook.qbook.bak-2025-review/`.
+        let user_sibling = path.parent().unwrap().join(format!(
+            "{}.bak-2025-review",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        fs::create_dir_all(&user_sibling).unwrap();
+        fs::write(user_sibling.join("notes.md"), "my own backup, don't touch").unwrap();
+        assert!(!is_engine_owned_backup(&user_sibling));
+
+        // Load: succeeds, leaves the user's sibling intact.
+        let loaded = load_workbook(&path).unwrap();
+        assert_eq!(loaded.sheet(0).unwrap().read(0, 0), Value::Number(42.0));
+        assert!(
+            user_sibling.exists(),
+            "recovery must NOT touch user-created marker-less siblings"
+        );
+        assert_eq!(
+            fs::read_to_string(user_sibling.join("notes.md")).unwrap(),
+            "my own backup, don't touch"
+        );
     }
 
     /// Phase 2A.8 audit H2 recovery test — rollback case. Simulate a crash
@@ -1694,22 +1879,55 @@ col_extent = 1
         assert!(!bak.exists(), "backup should be consumed by rollback");
     }
 
-    /// Phase 2A.8 audit H2: multiple orphan `.bak-*` siblings → ambiguous
-    /// recovery, refuse to load. Surfaces as `QbookError::InvalidPath` so the
-    /// caller knows manual intervention is needed.
+    /// Phase 2A.13 audit cycle-3 M6: multiple orphan `.bak-*` siblings WITH a
+    /// valid target are all stale (the most-recent successful save left a
+    /// valid target; any older backups failed step-4 cleanup). Clean them
+    /// all up; the load succeeds. Previously refused with InvalidPath,
+    /// creating a permanent deadlock under repeated step-4 failures.
     #[test]
-    fn load_refuses_when_multiple_orphan_backups() {
+    fn load_cleans_all_orphans_when_target_valid_post_2a13() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("ambiguous.qbook");
+        let path = dir.path().join("multi-stale.qbook");
         let wb = wb_with("S", &[cell(0, 0, Value::Number(1.0))]);
-        save_workbook(&wb, "ambig", &path).unwrap();
+        save_workbook(&wb, "multi-stale", &path).unwrap();
 
-        // Plant TWO orphan .bak-* siblings.
+        // Plant TWO engine-owned orphan .bak-* siblings.
+        let parent = path.parent().unwrap();
+        let basename = path.file_name().unwrap().to_string_lossy().into_owned();
+        let baks: Vec<_> = ["aaa", "bbb"]
+            .iter()
+            .map(|tag| {
+                let bak = parent.join(format!("{basename}.bak-{tag}"));
+                fs::create_dir_all(&bak).unwrap();
+                fs::write(bak.join(ATOMIC_SAVE_MARKER_FILENAME), "engine-owned").unwrap();
+                bak
+            })
+            .collect();
+
+        // Load: target is valid → both orphans get cleaned, load succeeds.
+        let loaded = load_workbook(&path).unwrap();
+        assert_eq!(loaded.sheet(0).unwrap().read(0, 0), Value::Number(1.0));
+        for bak in &baks {
+            assert!(!bak.exists(), "orphan {bak:?} should have been cleaned up");
+        }
+    }
+
+    /// Phase 2A.13 audit cycle-3 M6: multi-orphan case WITH a missing/invalid
+    /// target remains genuinely ambiguous (which backup matches the missing
+    /// target?). Refuse to load with InvalidPath so the user resolves
+    /// manually. Verifies the narrowed refusal condition.
+    #[test]
+    fn load_refuses_when_multiple_orphans_and_target_missing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ambiguous-missing.qbook");
+
+        // Plant two engine-owned orphans BUT no target.
         let parent = path.parent().unwrap();
         let basename = path.file_name().unwrap().to_string_lossy().into_owned();
         for tag in ["aaa", "bbb"] {
             let bak = parent.join(format!("{basename}.bak-{tag}"));
             fs::create_dir_all(&bak).unwrap();
+            fs::write(bak.join(ATOMIC_SAVE_MARKER_FILENAME), "engine-owned").unwrap();
         }
 
         let result = load_workbook(&path);
@@ -1731,6 +1949,36 @@ col_extent = 1
         std::thread::sleep(std::time::Duration::from_nanos(1));
         let s2 = save_session_suffix();
         assert_ne!(s1, s2, "save_session_suffix must produce unique values");
+    }
+
+    /// Phase 2A.13 audit cycle-3 H5: save refuses if the target path exists
+    /// but is a regular file (not a directory). Prior behavior would have
+    /// silently renamed the user's file to `.bak-<suffix>` and installed
+    /// the workbook directory in its place, orphaning the user's file.
+    #[test]
+    fn save_refuses_when_target_is_a_regular_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("conflict.qbook");
+        // Plant a regular file at the target path. (The user's mistake;
+        // the engine doesn't enforce that `.qbook` paths are directories.)
+        fs::write(&path, b"this is a regular file, not a workbook").unwrap();
+        assert!(path.is_file());
+
+        let wb = wb_with("S", &[cell(0, 0, Value::Number(1.0))]);
+        let result = save_workbook(&wb, "conflict", &path);
+        match result {
+            Err(QbookError::InvalidPath { path: p, reason }) => {
+                assert_eq!(p, path);
+                assert!(reason.contains("not a directory"));
+            }
+            other => panic!("expected InvalidPath, got {other:?}"),
+        }
+        // The user's file is intact.
+        assert!(path.is_file());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "this is a regular file, not a workbook"
+        );
     }
 
     /// Phase 2A.8 audit M9 (deny_unknown_fields): a workbook.toml with an

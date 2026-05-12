@@ -89,7 +89,14 @@ pub enum BindError {
     /// audit M3: previously silently mapped to `UnresolvedName` (wrong error class —
     /// the name IS resolved, just to an error value). Carries the underlying
     /// `ErrorValue` so the IDE can echo `#DIV/0!` / `#REF!` etc. accurately.
-    #[error("named constant {0:?} holds an error value: {1:?}")]
+    // Phase 2A.13 audit cycle-3 M1: `{1}` (Display) instead of `{1:?}` (Debug).
+    // `ErrorValue` has a `Display` impl that renders the canonical Excel sigil
+    // (`#DIV/0!` etc.); the prior debug formatter leaked Rust enum identifiers
+    // ("DivZero") into IDE diagnostics — the same mistake WS-4 was supposed to
+    // close everywhere. Note `{0:?}` is kept deliberately on the name field
+    // so the Arc<str> is rendered with surrounding quotes for visual clarity
+    // ("named constant \"X\" ..." vs the bare-string ambiguous "named constant X").
+    #[error("named constant {0:?} holds an error value: {1}")]
     NamedTargetIsError(Arc<str>, ErrorValue),
 }
 

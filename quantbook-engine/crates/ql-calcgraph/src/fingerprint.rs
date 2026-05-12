@@ -399,6 +399,143 @@ mod tests {
                 Expr::NameRef(Arc::from("TAXRATE")),
                 0x5D19_7ECD_43FB_F118,
             ),
+            // Phase 2A.13 audit cycle-3 H3: extended coverage. One golden per
+            // Operator variant (we already had Plus, Mul, Minus above), plus
+            // RangeRef::Cells, CellAddr-with-Some(sheet), Expr::Array, and
+            // Expr::Spill. Catches any reorder of `Operator`'s declaration or
+            // `RangeRef`'s variant assignment.
+            (
+                "Binary(Div, 1, 2)",
+                Expr::Binary {
+                    op: Operator::Div,
+                    lhs: Box::new(Expr::Number(1.0)),
+                    rhs: Box::new(Expr::Number(2.0)),
+                },
+                0xA4E3_0E3D_4072_B97A,
+            ),
+            (
+                "Binary(Pow, 1, 2)",
+                Expr::Binary {
+                    op: Operator::Pow,
+                    lhs: Box::new(Expr::Number(1.0)),
+                    rhs: Box::new(Expr::Number(2.0)),
+                },
+                0xBCF4_42FD_C0F8_3B93,
+            ),
+            (
+                "Binary(Concat, 1, 2)",
+                Expr::Binary {
+                    op: Operator::Concat,
+                    lhs: Box::new(Expr::Number(1.0)),
+                    rhs: Box::new(Expr::Number(2.0)),
+                },
+                0x457E_1335_9D76_C677,
+            ),
+            (
+                "Binary(Eq, 1, 2)",
+                Expr::Binary {
+                    op: Operator::Eq,
+                    lhs: Box::new(Expr::Number(1.0)),
+                    rhs: Box::new(Expr::Number(2.0)),
+                },
+                0x2F34_C190_6455_A592,
+            ),
+            (
+                "Binary(Neq, 1, 2)",
+                Expr::Binary {
+                    op: Operator::Neq,
+                    lhs: Box::new(Expr::Number(1.0)),
+                    rhs: Box::new(Expr::Number(2.0)),
+                },
+                0x0696_AFF0_30C2_B195,
+            ),
+            (
+                "Binary(Lt, 1, 2)",
+                Expr::Binary {
+                    op: Operator::Lt,
+                    lhs: Box::new(Expr::Number(1.0)),
+                    rhs: Box::new(Expr::Number(2.0)),
+                },
+                0x8CA4_6FCE_5CD0_A40E,
+            ),
+            (
+                "Binary(Le, 1, 2)",
+                Expr::Binary {
+                    op: Operator::Le,
+                    lhs: Box::new(Expr::Number(1.0)),
+                    rhs: Box::new(Expr::Number(2.0)),
+                },
+                0x3734_2851_52CA_2B34,
+            ),
+            (
+                "Binary(Gt, 1, 2)",
+                Expr::Binary {
+                    op: Operator::Gt,
+                    lhs: Box::new(Expr::Number(1.0)),
+                    rhs: Box::new(Expr::Number(2.0)),
+                },
+                0x7355_6CFF_FDC4_6019,
+            ),
+            (
+                "Binary(Ge, 1, 2)",
+                Expr::Binary {
+                    op: Operator::Ge,
+                    lhs: Box::new(Expr::Number(1.0)),
+                    rhs: Box::new(Expr::Number(2.0)),
+                },
+                0x00B4_53DE_645B_86D8,
+            ),
+            (
+                "Unary(Percent, 50)",
+                Expr::Unary {
+                    op: Operator::Percent,
+                    operand: Box::new(Expr::Number(50.0)),
+                },
+                0x4D0D_2F0D_928D_0468,
+            ),
+            (
+                "RangeRef::Cells A1:B10",
+                Expr::RangeRef(RangeRef::Cells {
+                    sheet: None,
+                    start_col: 0,
+                    start_row: 0,
+                    end_col: 1,
+                    end_row: 9,
+                    abs_start_col: false,
+                    abs_start_row: false,
+                    abs_end_col: false,
+                    abs_end_row: false,
+                }),
+                0xCB13_4EA9_54B9_6057,
+            ),
+            (
+                "CellRef sheet=Some(2)",
+                Expr::CellRef(CellAddr {
+                    sheet: Some(2),
+                    col: 0,
+                    row: 0,
+                    abs_col: false,
+                    abs_row: false,
+                }),
+                0x6E19_E429_4F2F_388E,
+            ),
+            (
+                "Array [[1, 2], [3, 4]]",
+                Expr::Array(vec![
+                    vec![Expr::Number(1.0), Expr::Number(2.0)],
+                    vec![Expr::Number(3.0), Expr::Number(4.0)],
+                ]),
+                0x03DC_67E4_D861_2386,
+            ),
+            (
+                "Spill(1+2)",
+                Expr::Spill(Box::new(Expr::Binary {
+                    op: Operator::Plus,
+                    lhs: Box::new(Expr::Number(1.0)),
+                    rhs: Box::new(Expr::Number(2.0)),
+                })),
+                0x8D37_9920_D9A5_B01C,
+            ),
         ];
         let mut mismatches = Vec::new();
         for (label, expr, expected) in goldens {

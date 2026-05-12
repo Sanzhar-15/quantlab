@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ql_types::{Address, ColId, Range, RowId, SheetId, Value};
+use ql_types::{Address, ColId, ErrorValue, Range, RowId, SheetId, Value};
 
 use crate::sheet::Sheet;
 
@@ -256,11 +256,24 @@ impl Workbook {
         self.sheets.get_mut(id as usize)
     }
 
-    /// Read by `Address`. Out-of-bounds sheet/row/col reads as `Value::Blank`.
+    /// Read by `Address`.
+    ///
+    /// - **Missing sheet** (sheet id ≥ `sheet_count()`) → `Value::Error(Ref)`
+    ///   (Excel canon: `#REF!`).
+    /// - **Within-sheet missing row/col** → `Value::Blank` (Excel canon: empty
+    ///   cell coerces to 0 / "" / FALSE in arithmetic / text / logical
+    ///   contexts).
+    ///
+    /// Phase 2A.13 audit cycle-3 M2: the prior implementation returned `Blank`
+    /// for missing-sheet too, conflating "sheet deleted" with "empty cell."
+    /// The Phase 2A.7 H6 fix corrected this at the evaluator layer
+    /// (`ql-exec::WorkbookEnv::read_cell`); this commit aligns the storage
+    /// layer's public read API. Any host code that bypasses `WorkbookEnv`
+    /// (CLI tools, IDE inspectors, tests) now sees the same `#REF!` semantic.
     pub fn read(&self, addr: Address) -> Value {
         match self.sheet(addr.sheet) {
             Some(s) => s.read(addr.row, addr.col),
-            None => Value::Blank,
+            None => Value::Error(ErrorValue::Ref),
         }
     }
 
@@ -290,6 +303,16 @@ impl Workbook {
     ///
     /// `formula` is the formula body WITHOUT the leading `=` (matching Excel's
     /// canonical AST representation).
+    ///
+    /// Phase 2A.13 audit cycle-3 H2: panics if `sheet >= sheet_count()`, `row >
+    /// MAX_ROW`, or `col > MAX_COLUMN`. The prior implementation accepted any
+    /// (sheet, row, col), making `validate_cell` at the runtime/transaction layer
+    /// bypassable: a `formula_cells` entry with an out-of-bounds coord would
+    /// later panic deep inside `Sheet::put` during `recompute_all`'s
+    /// `put_at`. Matching the storage-layer convention from `Sheet::put` and
+    /// `Workbook::put_at` (which also panic on invariant violation), the
+    /// in-process programmer-error path stays loud. Trust-boundary callers
+    /// (ql-io loader, IDE host) MUST validate before reaching here.
     pub fn put_formula(
         &mut self,
         sheet: SheetId,
@@ -297,6 +320,21 @@ impl Workbook {
         col: ColId,
         formula: impl Into<Arc<str>>,
     ) {
+        assert!(
+            (sheet as usize) < self.sheets.len(),
+            "Workbook::put_formula: sheet {sheet} does not exist (have {})",
+            self.sheets.len()
+        );
+        assert!(
+            row <= ql_types::MAX_ROW,
+            "Workbook::put_formula: row {row} exceeds MAX_ROW {}",
+            ql_types::MAX_ROW
+        );
+        assert!(
+            col <= ql_types::MAX_COLUMN,
+            "Workbook::put_formula: col {col} exceeds MAX_COLUMN {}",
+            ql_types::MAX_COLUMN
+        );
         self.formula_cells.insert((sheet, row, col), formula.into());
     }
 
@@ -336,8 +374,13 @@ mod tests {
         let wb = Workbook::new();
         assert_eq!(wb.sheet_count(), 0);
         assert!(wb.sheet(0).is_none());
-        // Read out-of-bounds sheet → Blank.
-        assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Blank);
+        // Phase 2A.13 audit cycle-3 M2: read out-of-bounds sheet → #REF!
+        // (was: Blank). Aligns the storage-layer public read API with
+        // `WorkbookEnv::read_cell` per Excel canon.
+        assert_eq!(
+            wb.read(Address::new(0, 0, 0)),
+            Value::Error(ErrorValue::Ref)
+        );
     }
 
     #[test]
@@ -436,6 +479,43 @@ mod tests {
         let mut wb = Workbook::new();
         wb.add_sheet("only-sheet");
         wb.put_at(5, 0, 0, Value::Number(1.0));
+    }
+
+    // ===== Phase 2A.13 audit cycle-3 H2: put_formula bounds checks =====
+
+    #[test]
+    #[should_panic(expected = "Workbook::put_formula: sheet 5 does not exist")]
+    fn put_formula_to_missing_sheet_panics() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        wb.put_formula(5, 0, 0, "A1 + 1");
+    }
+
+    #[test]
+    #[should_panic(expected = "Workbook::put_formula: row 1048576 exceeds MAX_ROW")]
+    fn put_formula_above_max_row_panics() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        wb.put_formula(0, 1_048_576, 0, "A1 + 1");
+    }
+
+    #[test]
+    #[should_panic(expected = "Workbook::put_formula: col 16384 exceeds MAX_COLUMN")]
+    fn put_formula_above_max_col_panics() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        wb.put_formula(0, 0, 16_384, "A1 + 1");
+    }
+
+    #[test]
+    fn put_formula_at_max_row_max_col_ok() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        wb.put_formula(0, 1_048_575, 16_383, "boundary");
+        assert_eq!(
+            wb.formula_at(0, 1_048_575, 16_383).map(|s| s.as_ref()),
+            Some("boundary")
+        );
     }
 
     #[test]

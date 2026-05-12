@@ -1,24 +1,28 @@
 # Phase 2 Entry Plan — Quantbook Engine
 
-**Date written:** 2026-05-12 (end of Phase 1 engine-side work)
-**Branch:** `feat/quantbook-engine` (HEAD `3717bc6b167`)
+**Date last touched:** 2026-05-12 (Phase 2A.13 / megaudit cycle-3 closure)
+**Branch:** `feat/quantbook-engine` (HEAD is the 2A.13 commit — current as of session end; check `git log -1` for the exact SHA)
 **Audience:** the next session (and you, if you come back to this cold)
 
 ---
 
 ## Read this first (60 seconds)
 
-You're picking up after **Phase 1 engine-side complete-plus**. The Quantbook engine can:
+**Phase 2A is complete.** The engine has shipped Phase 0 + Phase 1 + all of Phase 2A.1-.13. Two megaudit cycles ran (cycle 1: 2A.6 + closure 2A.7-.12; cycle 3: verification + 2A.13 fixes). The full audit findings are documented and almost entirely closed.
+
+The Quantbook engine can:
 
 1. Lex/parse/print Excel-canonical formula source (round-trip property tested).
-2. Bind + evaluate scalar formulas with Excel coercion + error propagation.
-3. SIMD-bulk-evaluate region-style operations (OG-02 hot path: 3.4 ms for 25M `=A*2`).
-4. Persist multi-sheet workbooks to `.qbook/` directories (atomic save; NaN/Inf validated; backwards-compat with W5-6 schema).
-5. Live-formula loop: `WorkbookRuntime::set_formula(sheet, row, col, text)` does lex→parse→bind→eval→persist in one call.
+2. Bind + evaluate scalar formulas with **Excel-canon coercion** (lenient text-to-number per 2A.9 M1) and **Excel-canon cross-type comparison** (Number < Text < Bool, 2A.9 M2).
+3. SIMD-bulk-evaluate region-style operations (OG-02 hot path: 3.4 ms for 25M `=A*2`). **Division NOT lowered to SIMD** per 2A.9 H5 — goes scalar to emit Excel-canon `#DIV/0!`.
+4. Persist multi-sheet workbooks to `.qbook/` directories with **schema v2**: NameTable persistence (2A.8 M12), Pending CellWireValue (2A.8 M11), `deny_unknown_fields` strictness, crash-safe atomic save via target↔backup-rename protocol (2A.8 H2 + 2A.13 H1 marker file). v1 fixtures still load with a one-line `eprintln!` warning on legacy `#NULL!+formula` migration.
+5. Live-formula loop: `WorkbookRuntime::set_formula(sheet, row, col, text)` does lex→parse→bind→eval→persist in one call. Cell bounds validated at entry per 2A.7 H1 + 2A.13 H2.
+6. Defined names round-trip through save/load. AI() reserved name refused at registration per 2A.9 M6.
+7. Formula fingerprints are SipHash-2-4 keyed `(0, 0)` — stable across Rust toolchain bumps, locked by 29 golden tuples per 2A.10 + 2A.13 H3.
 
-**659 tests, all 5 gates green, 13/13 Phase 0 acceptance LOCKED.**
+**~480 tests, all 7 gates green** (fmt / clippy / workspace tests / pin guard / build flags / multiversion clones / cargo audit).
 
-The Phase 1 exit packet (`docs/phase1/exit-packet.md`) has the full story. This document is your **action-oriented entry point** — what to do first, what's blocked on what, where the most valuable next chunks live.
+The Phase 2 exit packet (`docs/phase2/exit-packet.md`) has the full story. This document is your **action-oriented entry point** — what to do first.
 
 ---
 
@@ -27,27 +31,29 @@ The Phase 1 exit packet (`docs/phase1/exit-packet.md`) has the full story. This 
 ```bash
 cd /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook
 git rev-parse --abbrev-ref HEAD                # expect: feat/quantbook-engine
-git rev-parse HEAD                              # expect: 3717bc6b167 OR newer
-git log --oneline -5                            # recent Phase 1 commits visible
+git log --oneline -1                            # latest 2A.13 commit
+git log --oneline -15                           # last ~13 commits = the 2A.7-.13 closure cycle
 test -L node_modules || ln -s /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab/node_modules node_modules
 
 mac zsh -lc 'source "$HOME/.cargo/env" && \
   cd /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine && \
   cargo fmt --all -- --check && \
-  cargo clippy --locked --workspace --all-targets -- -D warnings && \
-  cargo test --locked --workspace 2>&1 | grep "^test result" | awk -F"[ .;]+" "{ p += \$4; f += \$6 } END { print \"passed=\" p \" failed=\" f }" && \
+  cargo clippy --workspace --all-targets --offline -- -D warnings && \
+  cargo test --workspace --offline 2>&1 | grep "^test result" | awk -F"[ .;]+" "{ p += \$4; f += \$6 } END { print \"passed=\" p \" failed=\" f }" && \
   bash scripts/check-cargo-lock-pins.sh && \
   bash scripts/check-build-flags.sh && \
-  bash scripts/check-build-flags.sh --self-test && \
-  bash scripts/check-multiversion-clones.sh'
+  bash scripts/check-multiversion-clones.sh && \
+  cargo audit'
 ```
 
 Expected:
 - fmt clean
 - clippy clean
-- 659 tests passed, 0 failed
+- ~480 tests passed, 0 failed
 - pin guard: 18 watched packages aligned
-- A3 + 10/10 self-test
+- A3 build flags clean
+- A2 NEON `fmul.2d` multiversion clones present
+- cargo audit clean (178 crates)
 - A2 disassembly: 20 NEON `fmul.2d` (or equivalent x86_64 AVX2 instructions on Linux CI)
 
 If any of these diverge, **STOP and investigate** before any new work. The engine should be in a clean state.

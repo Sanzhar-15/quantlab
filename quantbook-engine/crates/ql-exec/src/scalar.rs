@@ -3,29 +3,37 @@
 //! Per-cell evaluation path. Used for:
 //! - Single-cell formulas (`=A1+B1` in cell C1).
 //! - Per-cell fallback inside a FormulaRegion when SIMD isn't applicable (text, error,
-//!   mixed types, non-arithmetic ops).
+//!   mixed types, non-arithmetic ops, division — see lower.rs H5 routing).
 //! - Tests, which is most of the W4-1 coverage.
 //!
-//! The SIMD hot path for OG-02 lives in `simd.rs` (W4-2) and bypasses this entirely —
-//! it consumes Arrow Float64Array slices directly via `multiversion`-dispatched kernels.
+//! The SIMD hot path for OG-02 lives in `simd.rs` and bypasses this entirely —
+//! it consumes Arrow Float64Array slices directly via `multiversion`-dispatched
+//! kernels.
 //!
-//! ## Excel binary arithmetic semantics (Phase 0)
+//! ## Excel binary arithmetic semantics (Phase 2A.9 audit M1 — lenient coercion)
 //!
 //! For binary operators `+ - * / ^`:
 //! - If either operand is an `Error`, propagate that error (left operand wins).
-//! - Coerce both operands to f64 via `to_number_strict` (Number → self; Bool → 0/1;
-//!   Blank → 0; Text → `#VALUE!`; Error → propagate).
+//! - Coerce both operands to f64 via `to_number_lenient` (Number → self;
+//!   Bool → 0/1; Blank → 0; Text that parses as a number → that number; Text
+//!   that doesn't parse → `#VALUE!`; Error → propagate). Phase 2A.9 audit M1
+//!   replaced the prior strict path that rejected ALL text.
 //! - Apply the f64 op. Sanitize result via `sanitize_f64` (NaN/Inf → `#NUM!`).
-//! - Special cases: division by zero → `#DIV/0!`; negative base ** non-integer exponent
-//!   → `#NUM!`.
+//! - Special cases (Phase 2A.9 audit M3 / 2A.13 audit M3 companion):
+//!   - Division by zero → `#DIV/0!`.
+//!   - Negative base ^ non-integer exponent → `#NUM!`.
+//!   - `0^0` → `#NUM!`.
+//!   - `0^-n` (n > 0) → `#DIV/0!` (mathematically `1/0^n`).
 //!
 //! For `&` (concat): coerce both to text via `to_text_for_formula`; concat. Errors
 //! propagate.
 //!
-//! Comparison operators (`=`, `<>`, `<`, `>`, `<=`, `>=`) are partially supported: same-
-//! type comparisons return Bool; cross-type comparisons use Excel's type ordering
-//! (Number < Text < Bool — yes really, see Microsoft docs). Phase 0 just handles
-//! same-type Number comparisons; mixed-type lands in W4-4.
+//! Comparison operators (`=`, `<>`, `<`, `>`, `<=`, `>=`) follow Excel-canon
+//! cross-type ordering (Phase 2A.9 audit M2): same-type pairs compare per
+//! their natural ordering; mixed-type pairs use type rank
+//! (`Number < Text < Boolean`). `Blank` coerces to `0` vs Number and `""`
+//! vs Text; for `Blank vs Boolean` the type-rank fallthrough applies (Blank
+//! ranks as Number, so `Blank < TRUE`). See `compare_values_excel`.
 //!
 //! Unary `-x` negates; `+x` no-ops; `x%` divides by 100.
 
@@ -157,6 +165,13 @@ fn eval_arithmetic(op: Operator, lhs: &Value, rhs: &Value) -> Value {
             // explicitly so the error type is clear.
             if lhs_num < 0.0 && rhs_num.fract() != 0.0 {
                 return Value::Error(ErrorValue::Num);
+            }
+            // Phase 2A.13 audit cycle-3 M3 companion: `0^-n` is `#DIV/0!` per
+            // Excel canon (mathematically `0^-n = 1/0^n`). Rust/IEEE produces
+            // `+Inf`, which `sanitize_f64` would map to `#NUM!` — wrong error
+            // class. Guard before the `0^0` check (different precondition).
+            if lhs_num == 0.0 && rhs_num < 0.0 {
+                return Value::Error(ErrorValue::DivZero);
             }
             // Phase 2A.9 audit M3: Excel canon — `0^0` is `#NUM!`. Rust/IEEE
             // produces 1.0, which would be a silent deviation. Guard explicitly.
@@ -837,6 +852,26 @@ mod tests {
         };
         // Excel: #NUM!
         assert_eq!(eval(&expr, &env), Value::Error(ErrorValue::Num));
+    }
+
+    /// Phase 2A.13 audit cycle-3 M3 companion: `=0^-1` is `#DIV/0!`, not
+    /// `#NUM!`. Mathematically `0^-n = 1/0^n`; Excel canon agrees.
+    /// Rust/IEEE `f64::powf(0, -1)` produces `+Inf` — wrong error class.
+    #[test]
+    fn pow_zero_negative_exp_is_div_zero_excel_canon() {
+        let env = MapEnv::new();
+        for &exp in &[-1.0, -2.0, -0.5, -100.0] {
+            let expr = Expr::Binary {
+                op: Operator::Pow,
+                lhs: Box::new(Expr::Number(0.0)),
+                rhs: Box::new(Expr::Number(exp)),
+            };
+            assert_eq!(
+                eval(&expr, &env),
+                Value::Error(ErrorValue::DivZero),
+                "0^{exp} should be #DIV/0! per Excel canon"
+            );
+        }
     }
 
     /// Regression guard: `=2^10` still works.

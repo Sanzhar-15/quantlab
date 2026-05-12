@@ -57,17 +57,17 @@ pub enum SimdShape {
     SubScalar { input_col: ColId, scalar: f64 },
     /// `out[i] = scalar - input_col[i]`. Non-commutative inverse of `SubScalar`.
     ScalarSub { scalar: f64, input_col: ColId },
-    /// `out[i] = input_col[i] / scalar`. **Caution**: branch-free; scalar==0 produces
-    /// f64::INFINITY which the caller must sanitize.
-    DivScalar { input_col: ColId, scalar: f64 },
+    // Phase 2A.13 audit cycle-3 M9: `DivScalar` removed. Phase 2A.9 H5 rerouted
+    // Operator::Div through the scalar evaluator (Excel-canon `#DIV/0!`); the
+    // shape was retained briefly for symmetry but never reached from
+    // `classify`. Deleted here along with the kernel itself.
     /// `out[i] = lhs_col[i] * rhs_col[i]`.
     MulArray { lhs_col: ColId, rhs_col: ColId },
     /// `out[i] = lhs_col[i] + rhs_col[i]`.
     AddArray { lhs_col: ColId, rhs_col: ColId },
     /// `out[i] = lhs_col[i] - rhs_col[i]`.
     SubArray { lhs_col: ColId, rhs_col: ColId },
-    /// `out[i] = lhs_col[i] / rhs_col[i]`. Same caveat as `DivScalar`.
-    DivArray { lhs_col: ColId, rhs_col: ColId },
+    // Phase 2A.13 audit cycle-3 M9: `DivArray` removed alongside `DivScalar`.
     /// Pattern not recognized — caller falls back to scalar evaluator per-cell.
     NotApplicable,
 }
@@ -173,30 +173,25 @@ pub fn classify(plan: &ExprPlan) -> SimdShape {
 /// Returns `true` if a SIMD kernel was invoked, `false` if the shape was `NotApplicable`
 /// (in which case caller must fall back to scalar evaluation per cell).
 ///
-/// For 1-column shapes (MulScalar, AddScalar, SubScalar, ScalarSub, DivScalar):
+/// For 1-column shapes (MulScalar, AddScalar, SubScalar, ScalarSub):
 /// `lhs_chunk` is the input column data; `rhs_chunk` is ignored (pass `&[]` if you have
 /// nothing).
 ///
-/// For 2-column shapes (MulArray, AddArray, SubArray, DivArray):
+/// For 2-column shapes (MulArray, AddArray, SubArray):
 /// both `lhs_chunk` and `rhs_chunk` are read; they must be equal length and equal to
 /// `out.len()`.
+///
+/// Phase 2A.13 audit cycle-3 M9: `Div*` shapes removed — division goes through
+/// the scalar evaluator (Excel-canon `#DIV/0!`).
 pub fn dispatch(shape: &SimdShape, lhs_chunk: &[f64], rhs_chunk: &[f64], out: &mut [f64]) -> bool {
     match shape {
         SimdShape::MulScalar { scalar, .. } => simd::mul_scalar(lhs_chunk, *scalar, out),
         SimdShape::AddScalar { scalar, .. } => simd::add_scalar(lhs_chunk, *scalar, out),
         SimdShape::SubScalar { scalar, .. } => simd::sub_scalar(lhs_chunk, *scalar, out),
         SimdShape::ScalarSub { scalar, .. } => simd::scalar_sub(*scalar, lhs_chunk, out),
-        SimdShape::DivScalar { scalar, .. } => {
-            // Divide each element by the scalar — express as multiplication by reciprocal
-            // for SIMD-friendliness AND consistent NaN/Inf semantics on scalar==0.
-            // Note: 1.0 / 0.0 = Inf in IEEE-754, then x * Inf = ±Inf or NaN. Caller
-            // post-sanitizes via coercion::sanitize_f64 to surface #DIV/0!.
-            simd::mul_scalar(lhs_chunk, 1.0 / *scalar, out)
-        }
         SimdShape::MulArray { .. } => simd::mul_array(lhs_chunk, rhs_chunk, out),
         SimdShape::AddArray { .. } => simd::add_array(lhs_chunk, rhs_chunk, out),
         SimdShape::SubArray { .. } => simd::sub_array(lhs_chunk, rhs_chunk, out),
-        SimdShape::DivArray { .. } => simd::div_array(lhs_chunk, rhs_chunk, out),
         SimdShape::NotApplicable => return false,
     }
     true
@@ -421,24 +416,10 @@ mod tests {
         assert_eq!(out, [90.0, 80.0, 70.0]);
     }
 
-    /// Phase 2A.9 audit H5: the `DivScalar` shape's kernel implementation
-    /// (mul-by-reciprocal) still exists for symmetry, but `classify` no longer
-    /// emits this shape. This test exercises the kernel via direct dispatch to
-    /// confirm the documented `Inf-on-zero-scalar` behavior — useful only as a
-    /// low-level kernel correctness check; the production path no longer
-    /// reaches here for `=A/B` formulas.
-    #[test]
-    fn dispatch_div_scalar_kernel_unreached_from_classify_but_still_correct() {
-        // =A / 2 via direct shape construction (skipping classify).
-        let shape = SimdShape::DivScalar {
-            input_col: 0,
-            scalar: 2.0,
-        };
-        let lhs = [10.0, 20.0, 30.0];
-        let mut out = [0.0; 3];
-        assert!(dispatch(&shape, &lhs, &[], &mut out));
-        assert_eq!(out, [5.0, 10.0, 15.0]);
-    }
+    // Phase 2A.13 audit cycle-3 M9: dispatch_div_scalar_kernel_unreached_from_
+    // classify_but_still_correct removed alongside the DivScalar shape +
+    // div_array kernel. Division correctness is exercised at the scalar
+    // level (`scalar::tests::div_by_zero_scalar_returns_div_zero_error`).
 
     #[test]
     fn dispatch_mul_array() {

@@ -111,19 +111,14 @@ pub fn mul_array(lhs: &[f64], rhs: &[f64], out: &mut [f64]) {
     }
 }
 
-/// `out[i] = lhs[i] / rhs[i]` elementwise. **Does NOT check for division by zero** —
-/// callers are responsible for handling `f64::INFINITY` / `f64::NAN` results. Phase 0
-/// `scalar::eval_arithmetic` checks `rhs == 0.0` explicitly to produce `#DIV/0!`; the
-/// SIMD path passes through and a post-pass sanitizes via `sanitize_f64`. The bulk
-/// kernel stays branch-free for maximum SIMD throughput.
-#[multiversion(targets("x86_64+avx2", "x86_64+sse4.2", "aarch64+neon"))]
-pub fn div_array(lhs: &[f64], rhs: &[f64], out: &mut [f64]) {
-    assert_eq!(lhs.len(), rhs.len(), "div_array: length mismatch");
-    assert_eq!(lhs.len(), out.len(), "div_array: lhs/out length mismatch");
-    for i in 0..lhs.len() {
-        out[i] = lhs[i] / rhs[i];
-    }
-}
+// Phase 2A.13 audit cycle-3 M9: `div_array` kernel deleted. Phase 2A.9 audit
+// H5 rerouted Operator::Div through the scalar evaluator (where Excel-canon
+// `#DIV/0!` is emitted correctly) because the SIMD reciprocal-mul approach
+// produces Inf for zero divisors → `sanitize_f64` → `#NUM!` (wrong error
+// class). The kernel was retained briefly for symmetry but never reached
+// from `classify`; this commit removes the dead code. When the Phase 4+
+// error-bitmap channel ships, a new `div_array_with_error_bitmap` kernel
+// will land alongside the channel — not as a retrofit of this one.
 
 #[cfg(test)]
 mod tests {
@@ -219,17 +214,10 @@ mod tests {
         assert_eq!(out, [10.0, 18.0, 28.0]);
     }
 
-    #[test]
-    fn div_array_passes_through_inf_for_div_by_zero() {
-        // Per the kernel docstring: no branch for rhs==0. Result is INFINITY, caller
-        // post-sanitizes via sanitize_f64 → #DIV/0! upstream of the kernel boundary.
-        let lhs = [10.0, 20.0];
-        let rhs = [2.0, 0.0];
-        let mut out = [0.0; 2];
-        div_array(&lhs, &rhs, &mut out);
-        assert_eq!(out[0], 5.0);
-        assert!(out[1].is_infinite());
-    }
+    // Phase 2A.13 audit cycle-3 M9: div_array kernel deleted; the test that
+    // pinned its Inf-on-zero-divisor behavior is also removed. Division
+    // correctness is now exercised at the scalar level
+    // (`scalar::tests::div_by_zero_scalar_returns_div_zero_error`).
 
     #[test]
     fn og02_correctness_consistency_with_scalar_path() {
