@@ -34,12 +34,19 @@ pub enum NamedTarget {
     Formula(std::sync::Arc<str>),
 }
 
-/// Defined-names table. Phase 0 stub — `lookup` always returns `None`. Sheet-scope vs
-/// workbook-scope names arrive with `ql-formula-semantics` in Week 2 Days 6+.
+/// Defined-names table.
+///
+/// Phase 2A.1 (2026-05-12): real workbook-scope storage. `set` registers a named
+/// target; `lookup` returns it. Sheet-scope names (Excel's `Sheet1!Local`) are
+/// deferred to Phase 3+ ql-formula-semantics.
+///
+/// Names are stored in **canonical case** as the parser emitted them (uppercased
+/// per `parser::canonicalize_function_name`). Callers passing user input should
+/// uppercase before calling `lookup` — or use the convenience method
+/// `lookup_ci` for case-insensitive lookup (does the uppercase internally).
 #[derive(Clone, Debug, Default)]
 pub struct NameTable {
-    // Reserved; entries Vec or HashMap will land when Phase 3+ binding work needs it.
-    _phantom: (),
+    entries: HashMap<Arc<str>, NamedTarget>,
 }
 
 impl NameTable {
@@ -47,11 +54,43 @@ impl NameTable {
         Self::default()
     }
 
-    /// Phase 0 never resolves names — every lookup returns `None`. The signature is locked
-    /// so future expansion is non-breaking (calcgraph callers can pattern-match on
-    /// `NamedTarget` variants now).
-    pub fn lookup(&self, _name: &str) -> Option<NamedTarget> {
-        None
+    /// Register a name → target binding. Replaces any existing entry under the same
+    /// canonical name. `name` is stored as-is; callers wanting case-insensitive
+    /// behavior should uppercase before calling (matching the parser's
+    /// `canonicalize_function_name`).
+    pub fn set(&mut self, name: impl Into<Arc<str>>, target: NamedTarget) {
+        self.entries.insert(name.into(), target);
+    }
+
+    /// Remove a name binding. Idempotent.
+    pub fn clear(&mut self, name: &str) {
+        self.entries.remove(name);
+    }
+
+    /// Look up a name. Case-sensitive on the canonical-uppercase form. Returns
+    /// `None` if not registered.
+    pub fn lookup(&self, name: &str) -> Option<NamedTarget> {
+        self.entries.get(name).cloned()
+    }
+
+    /// Case-insensitive lookup: uppercases the query before searching. Useful for
+    /// user-input names typed in any case.
+    pub fn lookup_ci(&self, name: &str) -> Option<NamedTarget> {
+        let upper = name.to_ascii_uppercase();
+        self.entries.get(upper.as_str()).cloned()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Iterate all `(name, target)` bindings. Order is HashMap-arbitrary.
+    pub fn iter(&self) -> impl Iterator<Item = (&Arc<str>, &NamedTarget)> + '_ {
+        self.entries.iter()
     }
 }
 
@@ -85,6 +124,20 @@ impl Workbook {
 
     pub fn names(&self) -> &NameTable {
         &self.names
+    }
+
+    /// Mutable access to the name table. Phase 2A.1 (2026-05-12) addition for
+    /// runtime registration of defined names.
+    pub fn names_mut(&mut self) -> &mut NameTable {
+        &mut self.names
+    }
+
+    /// Phase 2A.1 convenience: register a name → target binding on the workbook's
+    /// name table. The `name` is uppercased before storage to match the parser's
+    /// canonical form (so `=MyName` in source resolves the same as `=MYNAME`).
+    pub fn set_name(&mut self, name: &str, target: NamedTarget) {
+        let canonical: Arc<str> = Arc::from(name.to_ascii_uppercase().as_str());
+        self.names.set(canonical, target);
     }
 
     /// Append a new sheet; returns its `SheetId`. Panics if the next ID would exceed

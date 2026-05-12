@@ -60,6 +60,19 @@ pub enum Expr {
     /// Spill anchor — Phase 3+ dynamic-array result anchor. Shape-locked, not constructed
     /// in Phase 0.
     Spill(Box<Expr>),
+
+    /// Defined-name reference (Phase 2A.1). Parser emits this for any bare identifier
+    /// (4+ letter) that isn't `TRUE`/`FALSE` or followed by `LParen`. The binder
+    /// resolves the name against the `NameTable` at bind time:
+    /// - `NamedTarget::Cell(addr)` → `ExprPlan::CellRef`
+    /// - `NamedTarget::Constant(value)` → matching literal `ExprPlan` variant
+    /// - `NamedTarget::Range(range)` → unsupported in Phase 2 (Phase 4+ region binder)
+    /// - `NamedTarget::Formula(text)` → unsupported in Phase 2 (Phase 3+ semantic layer)
+    /// - Not found → `BindError::UnresolvedName`
+    ///
+    /// `name` is the canonical (uppercased) form as the parser stored it. NameTable
+    /// lookup is case-sensitive on this canonical form; the parser owns case-folding.
+    NameRef(Arc<str>),
 }
 
 /// Address inside an `Expr`. `sheet: None` means "the formula's containing sheet" (resolved

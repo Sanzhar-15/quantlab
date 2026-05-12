@@ -122,6 +122,12 @@ fn hash_expr(expr: &Expr, h: &mut impl Hasher) {
             9u8.hash(h);
             hash_expr(inner, h);
         }
+        Expr::NameRef(name) => {
+            // Phase 2A.1: defined-name reference. Hash by content (Arc-identity
+            // independence) so two cells with the same name fingerprint identically.
+            10u8.hash(h);
+            name.as_ref().hash(h);
+        }
     }
 }
 

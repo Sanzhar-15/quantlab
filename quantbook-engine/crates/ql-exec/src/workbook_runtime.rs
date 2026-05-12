@@ -26,7 +26,7 @@ use ql_storage::Workbook;
 use ql_types::{ColId, RowId, SheetId, Value};
 
 use crate::env::WorkbookEnv;
-use crate::plan::{bind, BindError};
+use crate::plan::{bind_with_names, BindError};
 use crate::scalar::eval_scalar_with_registry;
 
 /// Errors from the runtime pipeline. Each upstream stage's error wraps cleanly.
@@ -86,7 +86,10 @@ impl<'a> WorkbookRuntime<'a> {
         let formula_text = formula_text.into();
         let tokens = lex(formula_text.as_ref())?;
         let expr = parse(tokens)?;
-        let plan = bind(&expr, sheet)?;
+        // Phase 2A.1 (2026-05-12): bind against the workbook's NameTable so
+        // `Expr::NameRef` resolves against defined names. Phase 1 used the
+        // legacy `bind(...)` (empty name lookup); now name resolution is wired.
+        let plan = bind_with_names(&expr, sheet, self.workbook.names())?;
 
         // Evaluate against the current workbook state. The env borrows immutably; we
         // drop it before taking the mutable borrow for the write.
@@ -137,7 +140,8 @@ impl<'a> WorkbookRuntime<'a> {
         for (sheet, row, col, formula_text) in entries {
             let tokens = lex(formula_text.as_ref())?;
             let expr = parse(tokens)?;
-            let plan = bind(&expr, sheet)?;
+            // Phase 2A.1 — bind against the workbook's NameTable.
+            let plan = bind_with_names(&expr, sheet, self.workbook.names())?;
             let value = {
                 let env = WorkbookEnv::new(self.workbook);
                 eval_scalar_with_registry(&plan, &env, self.registry)
@@ -415,5 +419,145 @@ mod tests {
             loaded.read(ql_types::Address::new(s, 1, 0)),
             Value::Number(300.0)
         );
+    }
+
+    // ===== Phase 2A.1 — named-range resolution =====
+
+    #[test]
+    fn set_formula_resolves_named_cell_target() {
+        use ql_storage::NamedTarget;
+        use ql_types::Address;
+
+        let mut wb = make_runtime_workbook();
+        // A1 = 42; register MYREF → $A$1.
+        wb.put_at(0, 0, 0, Value::Number(42.0));
+        wb.set_name("MyRef", NamedTarget::Cell(Address::new(0, 0, 0)));
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // =MyRef + 1 → 43. The bare ident parses as NameRef, the binder resolves
+        // it to a CellRef via the workbook's name table.
+        let v = rt.set_formula(0, 1, 0, "MyRef + 1").unwrap();
+        assert_eq!(v, Value::Number(43.0));
+    }
+
+    #[test]
+    fn set_formula_resolves_named_number_constant() {
+        use ql_storage::NamedTarget;
+
+        let mut wb = make_runtime_workbook();
+        // TaxRate = 0.21 as a named constant.
+        wb.set_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)));
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        let v = rt.set_formula(0, 0, 0, "100 * TaxRate").unwrap();
+        assert_eq!(v, Value::Number(21.0));
+    }
+
+    #[test]
+    fn set_formula_resolves_named_boolean_constant() {
+        use ql_storage::NamedTarget;
+
+        let mut wb = make_runtime_workbook();
+        wb.set_name("UseFancy", NamedTarget::Constant(Value::Boolean(true)));
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // Phase 0 binder accepts Boolean as ExprPlan::Bool literal. Evaluating
+        // a bare NameRef should return the boolean.
+        let v = rt.set_formula(0, 0, 0, "UseFancy").unwrap();
+        assert_eq!(v, Value::Boolean(true));
+    }
+
+    #[test]
+    fn set_formula_resolves_named_text_constant() {
+        use ql_storage::NamedTarget;
+
+        let mut wb = make_runtime_workbook();
+        wb.set_name("Greeting", NamedTarget::Constant(Value::text("hello")));
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        let v = rt.set_formula(0, 0, 0, "Greeting").unwrap();
+        assert_eq!(v, Value::text("hello"));
+    }
+
+    #[test]
+    fn set_formula_unresolved_name_errors() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // No name registered → bind-time UnresolvedName, surfaced as RuntimeError::Bind.
+        let result = rt.set_formula(0, 0, 0, "UnknownName + 1");
+        match result {
+            Err(RuntimeError::Bind(BindError::UnresolvedName(name))) => {
+                assert_eq!(name.as_ref(), "UNKNOWNNAME");
+            }
+            other => panic!("expected Bind(UnresolvedName), got {other:?}"),
+        }
+        // No partial write on bind failure.
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Blank);
+        assert!(wb.formula_at(0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn set_formula_named_range_target_unsupported() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+
+        let mut wb = make_runtime_workbook();
+        // Range targets aren't usable as scalar operands in Phase 2A.1 — they
+        // surface as UnsupportedVariant (analogous to a bare A1:A10 in a scalar
+        // context). Aggregate-context usage lands Phase 2B+.
+        wb.set_name("Sales", NamedTarget::Range(Range::new(0, 1, 0, 10, 0)));
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        let result = rt.set_formula(0, 0, 0, "Sales");
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::Bind(BindError::UnsupportedVariant(_)))
+            ),
+            "expected Bind(UnsupportedVariant), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn recompute_all_resolves_named_constant() {
+        use ql_storage::NamedTarget;
+
+        let mut wb = make_runtime_workbook();
+        wb.set_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)));
+        // Seed a formula manually (skipping set_formula) so recompute_all does the work.
+        wb.put_at(0, 0, 0, Value::Number(0.0));
+        wb.put_formula(0, 0, 0, "1000 * TaxRate");
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let count = rt.recompute_all().unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Number(210.0)
+        );
+    }
+
+    #[test]
+    fn set_name_uppercases_for_canonical_lookup() {
+        use ql_storage::NamedTarget;
+
+        let mut wb = make_runtime_workbook();
+        // Register with mixed case — the parser will uppercase NameRef tokens, so
+        // lookup must succeed regardless of how the source wrote the name.
+        wb.set_name("MixedCaseName", NamedTarget::Constant(Value::Number(5.0)));
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // Lowercased reference still resolves.
+        let v = rt.set_formula(0, 0, 0, "mixedcasename + 1").unwrap();
+        assert_eq!(v, Value::Number(6.0));
     }
 }

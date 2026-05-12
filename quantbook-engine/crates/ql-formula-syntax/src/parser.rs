@@ -215,24 +215,20 @@ impl Parser {
                     if upper == "FALSE" {
                         return Ok(Expr::Bool(false));
                     }
-                    // Audit H2 fix (2026-05-12): bare identifier (no LParen) used to
-                    // silently emit `Function { name, args: vec![] }`, which dispatched
-                    // to the function with no arguments and produced nonsense errors
-                    // (e.g. `=AVERAGE` → #DIV/0! instead of #NAME?). Phase 0/1 has no
-                    // named-range resolution, so any bare identifier other than
-                    // TRUE/FALSE is a parse error. Phase 2+ will add an
-                    // `Expr::NameRef` variant when named ranges ship; the binder
-                    // resolves it against the NameTable.
-                    Err(ParseError::Unexpected {
-                        context: "prefix",
-                        got: format!(
-                            "bare identifier {:?} (use {}() for a function call, or define \
-                             {} as a named range — Phase 2+)",
-                            name.as_ref(),
-                            name.as_ref(),
-                            name.as_ref()
-                        ),
-                    })
+                    // Phase 2A.1 (2026-05-12): bare identifier (no LParen) emits
+                    // `Expr::NameRef(name)` — a defined-name reference resolved at
+                    // bind time against the workbook's NameTable. If the name isn't
+                    // registered, the binder returns `BindError::UnresolvedName`.
+                    //
+                    // This supersedes audit H2's parse-time rejection: the parse
+                    // succeeds; the rejection moves to bind time with richer info
+                    // (the actual unresolved name in the error variant).
+                    //
+                    // Built-in function names without parens (e.g. `=AVERAGE`) are
+                    // unresolved names too, since there's no NameTable entry for
+                    // them. Users get a clear "unresolved name AVERAGE" error
+                    // pointing them to `=AVERAGE()`.
+                    Ok(Expr::NameRef(canonicalize_function_name(&name)))
                 }
             }
 
@@ -1106,38 +1102,53 @@ mod tests {
         assert!(matches!(perr("A1:B"), ParseError::InvalidRange { .. }));
     }
 
-    /// Audit H2 regression (2026-05-12): bare identifier (no LParen following) used to
-    /// silently emit `Function { name, args: vec![] }`, which dispatched to the function
-    /// at eval time and returned nonsense errors (`=AVERAGE` → #DIV/0!). Now: parse error.
-    /// TRUE / FALSE are explicit exceptions (boolean literals).
+    /// Phase 2A.1 (2026-05-12): bare identifier (no LParen following) now emits
+    /// `Expr::NameRef(name)` — a defined-name reference to be resolved at bind time
+    /// against the workbook's `NameTable`. Unresolved names surface as
+    /// `BindError::UnresolvedName` (the binder's responsibility, not the parser's).
+    ///
+    /// Supersedes audit H2 (W5-7), which made these a parse error. The H2 bug was that
+    /// bare identifiers silently emitted `Function { args: vec![] }`; the W5-7 fix made
+    /// them a hard parse error pending Phase 2's NameRef design. Phase 2A.1 completes
+    /// the original intent: parse → NameRef → binder resolves or errors.
+    ///
+    /// TRUE / FALSE remain explicit exceptions (boolean literals).
     ///
     /// Only tested on 4+ letter names — 1-3 letter names lex as `BareColumn` (since
-    /// they're valid Excel column references), which has its own path: standalone
-    /// BareColumn produces RangeRef::WholeColumn which the ql-exec binder rejects with
-    /// `BindError::UnsupportedVariant`. So 1-3 letter names ARE caught, just by a
-    /// different mechanism (binder, not parser). The Ident asymmetry was the H2 bug.
+    /// they're valid Excel column references) and follow a different parser path.
     #[test]
-    fn parse_bare_identifier_function_name_errors() {
-        // 4+ letter built-in function names without parens are parse errors.
-        assert!(matches!(perr("AVERAGE"), ParseError::Unexpected { .. }));
-        assert!(matches!(perr("IFERROR"), ParseError::Unexpected { .. }));
-        assert!(matches!(perr("POWER"), ParseError::Unexpected { .. }));
-        assert!(matches!(perr("SQRT"), ParseError::Unexpected { .. }));
+    fn parse_bare_identifier_function_name_to_name_ref() {
+        // 4+ letter built-in function names without parens parse as NameRef. The
+        // binder will (correctly) refuse to resolve these because no name has been
+        // defined for them — but that's a bind-time concern, not a parse-time one.
+        // Names are canonicalized to upper-case at parse time.
+        for src in ["AVERAGE", "IFERROR", "POWER", "SQRT"] {
+            match p(src) {
+                Expr::NameRef(name) => assert_eq!(
+                    name.as_ref(),
+                    src.to_ascii_uppercase().as_str(),
+                    "expected NameRef({src:?}) canonicalized to upper-case, got {name:?}"
+                ),
+                other => panic!("expected Expr::NameRef for {src:?}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
-    fn parse_bare_identifier_unknown_name_errors() {
-        // 4+ letter unknown names (potential future defined-name references) also error
-        // in Phase 0/1 since no NameTable resolution exists yet. Phase 2+ will accept
-        // these as Expr::NameRef.
-        assert!(matches!(
-            perr("MyDefinedName"),
-            ParseError::Unexpected { .. }
-        ));
-        assert!(matches!(
-            perr("UnknownThing"),
-            ParseError::Unexpected { .. }
-        ));
+    fn parse_bare_identifier_unknown_name_to_name_ref() {
+        // 4+ letter user-defined names parse as NameRef. Resolution happens at bind
+        // time against the workbook's NameTable; unresolved names surface as
+        // `BindError::UnresolvedName` in ql-exec (not tested here — see ql-exec tests).
+        for src in ["MyDefinedName", "UnknownThing"] {
+            match p(src) {
+                Expr::NameRef(name) => assert_eq!(
+                    name.as_ref(),
+                    src.to_ascii_uppercase().as_str(),
+                    "expected NameRef({src:?}) canonicalized to upper-case, got {name:?}"
+                ),
+                other => panic!("expected Expr::NameRef for {src:?}, got {other:?}"),
+            }
+        }
     }
 
     /// Audit H3 regression (2026-05-12): `A:B:C` used to silently merge into A:C via

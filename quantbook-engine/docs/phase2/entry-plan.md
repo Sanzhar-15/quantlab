@@ -94,21 +94,23 @@ If the user asks "what's next?", default to Track A. If they specify "IDE" or "w
 
 ## Track A: engine-side Phase 2 — suggested sequence
 
-### Phase 2A.1 — Named ranges + `Expr::NameRef` (1–2 days)
+### Phase 2A.1 — Named ranges + `Expr::NameRef` ✅ DONE (2026-05-12)
 
-**Why first:** closes audit H2's deferred path. Currently `=MyDefinedName` is a parse error; should be a NameRef that the binder resolves via NameTable.
+**Closed audit H2's deferred path.** Bare identifiers (4+ letter) now parse to `Expr::NameRef(name)` and resolve through the workbook's `NameTable` at bind time. Unresolved names surface as `BindError::UnresolvedName`. See commit message for Phase 2A.1 / W5-11.
 
-**Steps:**
-1. Add `Expr::NameRef(Arc<str>)` variant to `ql-formula-syntax::ast`. Update `fingerprint`, `printer`, `parser`.
-2. Parser bare-identifier branch: emit `Expr::NameRef(name)` instead of `ParseError::Unexpected`.
-3. Add `BindError::UnresolvedName(Arc<str>)` variant.
-4. Wire `NameTable` resolution in `ql-exec::plan::bind`. Phase 2 minimum: read from `Workbook::names()` (currently empty; the `lookup` method exists per Round 7 forward-compat lock).
-5. Add `Workbook::set_name(name, NamedTarget)` API.
-6. Tests: round-trip a named-range formula, error on unresolved names, defined-name to constant/range/formula targets.
+**What shipped:**
+1. `Expr::NameRef(Arc<str>)` variant in `ql-formula-syntax::ast` — updated `parser`, `printer` (round-trips as bare name), `fingerprint` (discriminant `10u8`).
+2. Parser bare-identifier branch now emits `NameRef` (canonicalized upper-case) instead of `ParseError::Unexpected`. `TRUE`/`FALSE` remain explicit boolean exceptions.
+3. `BindError::UnresolvedName(Arc<str>)` variant added.
+4. New `pub trait NameLookup` + `pub enum ResolvedName` in `ql-exec::plan`; new `pub fn bind_with_names<L: NameLookup>(...)` — original `bind(...)` delegates to it with an empty lookup for back-compat.
+5. `impl NameLookup for NameTable` lives in `ql-exec::env` (bridges ql-storage's `NameTable` to ql-exec's `NameLookup` trait without coupling the crates). Named-range cell targets resolve with `abs=(true,true)` per Excel canon.
+6. `ql-storage::NameTable` replaced its Phase 0 stub with real HashMap-backed storage. New `Workbook::set_name(name, target)` uppercases names for canonical lookup.
+7. `WorkbookRuntime::set_formula` + `recompute_all` both call `bind_with_names(&expr, sheet, self.workbook.names())`.
+8. Tests added: 7 runtime tests (Cell / Number / Boolean / Text / unresolved → `UnresolvedName` / Range → `UnsupportedVariant` / mixed-case canonicalization), 2 parser tests (`parse_bare_identifier_*_to_name_ref`).
+
+**Deferred to Phase 2B+:** named-range targets in aggregate context (`SUM(Sales)`), named-formula targets (`Profit = Revenue - Costs`), sheet-scoped names (`Sheet1!Local`).
 
 **Spec reference:** `_QUANTBOOK-v1-SPECIFICATION.md` Part V §3 + Round 7 T2-D02 (defined names).
-
-**Tracked audit finding:** H2 — currently bare identifiers parse-error; Phase 2A.1 makes them NameRef.
 
 ### Phase 2A.2 — Multi-cell transaction API (1 day)
 

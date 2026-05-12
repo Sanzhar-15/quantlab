@@ -228,6 +228,10 @@ fn print_expr(expr: &Expr, out: &mut String, parent_min_bp: u8) {
             }
             out.push(')');
         }
+        Expr::NameRef(name) => {
+            // Phase 2A.1: defined-name reference round-trips as the bare name.
+            out.push_str(name);
+        }
         Expr::Array(_) | Expr::Spill(_) => {
             // Audit M1 fix (2026-05-12): Phase 0/1 doesn't construct these; if one
             // somehow appears in the AST it's a programmer bug, not a print-time
