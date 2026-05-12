@@ -1,7 +1,7 @@
 # Known engine gaps — checklist with target phases
 
 **Status:** Living document, updated at each phase boundary  
-**Date last touched:** 2026-05-12 (Engine Phase 3.2 close-out — W5-35)  
+**Date last touched:** 2026-05-12 (Engine Phase 3.3 close-out — W5-36)  
 **Companion:** `docs/MASTER-PLAN.md`
 
 Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a gap is closed, move its row to the "Closed" section at the bottom and reference the closing commit.
@@ -18,7 +18,7 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 | GAP-R-04 | Volatile functions (`NOW`, `RAND`, `TODAY`, `RANDBETWEEN`, `RANDARRAY`, `INDIRECT`, `OFFSET`, `INFO`, `CELL`) have no invalidation model. Phase 3.2 (2026-05-12) introduced the `is_volatile_function` set + populates `CalcgraphSession::volatile_formulas`; the actual dirty-on-recompute-tick logic lands in 3.7. | `ql-functions/src/registry.rs` registers volatile fns; `ql-exec/src/calcgraph_session.rs::is_volatile_function` set populated but unused by `recompute_all` | Engine | Engine Phase 3.7 (volatile invalidation) |
 | GAP-R-05 | Value-equality short-circuit not implemented; unchanged upstream still dirties downstream | None — pure missing optimization | Engine | Engine Phase 3.8 |
 | GAP-R-06 | `PlanCache` lives on `WorkbookRuntime`, which is per-edit. The documented IDE pattern drops the runtime after each edit → drops the cache. Phase 2B.3 cache observability is real only across one long-lived runtime/recompute block. | `ql-exec/src/workbook_runtime.rs::WorkbookRuntime` + `docs/architecture/ide-consumer-contract.md` §1 | Engine | Engine Phase 6.1 (`WorkbookSession`) moves cache ownership to the session. |
-| GAP-R-07 | Phase 3.2 dep extraction loses the name when a `NameRef` resolves to `NamedTarget::Constant` or `NamedTarget::Cell` — the binder substitutes the value/CellRef and the source name does not appear in `ExprPlan` (so `CalcgraphSession::name_to_formulas` does not see it). Today the `PlanCache.name_gen` counter (Phase 2B.3) invalidates ALL formulas on any name mutation, so correctness is preserved; only the per-name precision is missing. Phase 3.3 may add an explicit `Expr::NameRef`-preserving plan variant or carry a per-formula name-set on the side. | `ql-exec/src/calcgraph_session.rs` module docs (§ "Still deferred"); `ql-exec/src/plan.rs::bind_with_names` scalar-NameRef branches | Engine | Engine Phase 3.3 (precise name dirty propagation) |
+| GAP-R-07 | Phase 3.2 dep extraction loses the name when a `NameRef` resolves to `NamedTarget::Constant` or `NamedTarget::Cell` — the binder substitutes the value/CellRef and the source name does not appear in `ExprPlan` (so `CalcgraphSession::name_to_formulas` does not see it). Today the `PlanCache.name_gen` counter (Phase 2B.3) invalidates ALL formulas on any name mutation, so correctness is preserved; only the per-name precision is missing. Phase 3.3 wired `on_set_name` → `name_to_formulas`, which works for AggregateNameRef; this gap covers the scalar-NameRef precision miss that Phase 3.3 explicitly did NOT address. | `ql-exec/src/calcgraph_session.rs` module docs (§ "Still deferred"); `ql-exec/src/plan.rs::bind_with_names` scalar-NameRef branches | Engine | Engine Phase 4 (NameRef preservation in ExprPlan + binder revision) |
 
 ### Bind / semantics
 
@@ -79,6 +79,12 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 | GAP-X-04 | R1C1 mode not supported | No mode flag in parser | Engine | Engine Phase 4.9 |
 | GAP-X-05 | Localization (separators, function names) not supported | Hardcoded `,` / English fn names | Engine | Engine Phase 4.9 |
 | GAP-X-06 | Implicit intersection not implemented | Excel-canon feature absent | Engine | Engine Phase 4.9 |
+
+### Calcgraph
+
+| ID | Gap | Reproduce | Owner | Target phase |
+|---|---|---|---|---|
+| GAP-G-01 | Phase 0 `Graph` edges and stripe entries are append-only. When `CalcgraphSession` re-binds a formula whose ranges changed (`=SUM(A:A)` → `=SUM(B:B)`), the OLD stripe entries + `formula_to_range_deps` ranges remain in the graph. A subsequent write to the old range hits the stripe + passes the precision check (the stale range still contains the cell), producing a false-positive dirty mark. Phase 3.3 (session-side `cell_to_formulas` reverse index) handles direct cell deps cleanly; the range path is the residue. Cost is **performance, not correctness**: a false-positive dirty just means a recompute does extra work. | `ql-exec/src/calcgraph_session.rs::extract_and_register_deps` re-bind path; `ql-calcgraph/src/graph.rs::register_range_dependency` has no remove counterpart | Engine | Engine Phase 3.10 megaudit decision: delta-edge graph OR per-formula stripe revocation API |
 
 ### Collaboration
 

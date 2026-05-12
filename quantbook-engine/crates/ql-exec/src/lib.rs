@@ -41,14 +41,17 @@
 //!   `LoadAndRecomputeError` wrapper enum; recompute failures are now
 //!   aggregated into the returned `RecomputeResult` instead.
 //! - `calcgraph_session.rs` (Phase 3.1 W5-34; extended Phase 3.2
-//!   W5-35) — `CalcgraphSession` owning a `ql_calcgraph::Graph` plus an
-//!   O(1) `cell_index` and (Phase 3.2) per-formula `FormulaDeps`
-//!   (cells, named ranges, names, volatile bit). `rebuild_from_workbook`
-//!   returns `RebuildResult` (parallel to `RecomputeResult`) with
-//!   `RebuildFailure` aggregation. 5 mutation hooks
-//!   (`on_set_{value,formula,name}`, `on_clear_formula`, `on_add_sheet`)
-//!   are fired by `WorkbookRuntime`. Phase 3.3 will wire dirty
-//!   propagation; today the hooks bump counters + maintain dep state.
+//!   W5-35; extended Phase 3.3 W5-36) — `CalcgraphSession` owning a
+//!   `ql_calcgraph::Graph` plus an O(1) `cell_index`, per-formula
+//!   `FormulaDeps` (cells, named ranges, names, volatile bit), the
+//!   `cell_to_formulas` reverse index (Phase 3.3) for direct cell
+//!   deps, and a `dirty: HashSet<NodeId>` (Phase 3.3) that the 5
+//!   mutation hooks fan out into via `Graph::dependents_for_cell`
+//!   (stripe + precision) for range deps and `cell_to_formulas` for
+//!   direct cell deps. `rebuild_from_workbook` returns `RebuildResult`
+//!   (parallel to `RecomputeResult`) with `RebuildFailure`
+//!   aggregation. `dirty_formulas()` / `take_dirty()` are the
+//!   scheduler hooks for the future Phase 3.4 Tarjan SCC pass.
 
 pub mod calcgraph_session;
 pub mod env;

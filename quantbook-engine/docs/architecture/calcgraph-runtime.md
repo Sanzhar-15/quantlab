@@ -1,8 +1,8 @@
 # Calcgraph ↔ runtime integration
 
-**Status:** Engine Phase 3.1 — ownership + API shape established  
-**Date:** 2026-05-12  
-**Stability:** **DRAFT** — Phase 3.2–3.10 will fill in the algorithms. Today's commit is the SHELL; the surface is stable from here, the internals get richer.
+**Status:** Engine Phase 3.3 SHIPPED (W5-36, 2026-05-12) — dirty propagation live  
+**Date:** 2026-05-12 (last touched for 3.3 close-out)  
+**Stability:** **STABLE** API surface; **3.4–3.10 will fill in the recompute scheduler / overlay / aggregate cache / etc.** but the 5-hook signature + `dirty_formulas` view + `take_dirty` claim-and-clear is the contract.
 
 This document describes how `ql-calcgraph::Graph` integrates with `ql_exec::WorkbookRuntime`. Engine Phase 3 (the "One Engine" integration phase) closes the gap between the Phase 0 calcgraph (`ql-calcgraph`, built for the bench / A4/A5 acceptance) and the runtime that's been used since Phase 1 W5-10 (`WorkbookRuntime`, currently HashMap-order recompute with no graph awareness).
 
@@ -65,12 +65,41 @@ The 5-hook surface covers every public producer mutation in `WorkbookRuntime`:
 | `set_name(name, target)` | `on_set_name(name)` | Mark all formulas with `NameRef(name)` dirty |
 | `add_sheet(name, chunk_rows)` | `on_add_sheet(new_id)` | Track per-sheet structure generation (Phase 4.6 cross-sheet refs) |
 
-## 3. What Phase 3.1 deliberately doesn't ship
+## 2.3 Dirty propagation (Phase 3.3, shipped W5-36)
+
+Each hook now drives the session's `dirty: HashSet<NodeId>`:
+
+| Hook | Dirty fanout |
+|---|---|
+| `on_set_value(s,r,c)` | Union of `Graph::dependents_for_cell(s,r,c)` (stripe-precision-filtered range deps) and `cell_to_formulas[(s,r,c)]` (session-side reverse index for direct `ExprPlan::CellRef` deps). |
+| `on_set_formula(s,r,c,plan)` | Extract + register deps (cell reverse index + stripe), then propagate dirty downstream via `mark_dirty_from_cell_write(s,r,c)`. The formula itself is NOT marked dirty — the runtime wrote a fresh value before the hook fired. |
+| `on_clear_formula(s,r,c)` | Evict session-side deps + drop the cleared formula from the dirty set, then propagate dirty downstream (dependents need to recompute because the cleared formula no longer produces its prior value). |
+| `on_set_name(name)` | Look up `name_to_formulas[name]` (case-insensitive); mark all referencing formulas dirty. Today only `AggregateNameRef` populates this index — scalar `NameRef` precision is GAP-R-07, deferred to Phase 4. |
+| `on_add_sheet(_)` | No-op (no formulas exist on the new sheet yet). |
+
+The public API for the scheduler:
+
+```rust
+session.dirty_formulas() -> &HashSet<NodeId>   // read-only view
+session.is_dirty(node)   -> bool
+session.take_dirty()     -> HashSet<NodeId>    // atomic claim + clear
+session.cell_dep_count() -> usize              // observability
+```
+
+Phase 3.4 plugs Tarjan SCC over the `take_dirty()` set to recompute in topological order (cycles surface as `#CIRC!`).
+
+### Stale stripes on re-bind (GAP-G-01)
+
+The Phase 0 `Graph` is append-only — no API to remove edges or revoke a `register_range_dependency`. When a formula's text changes from `=SUM(A:A)` to `=SUM(B:B)`, the OLD Column A stripe entry persists, and `formula_to_range_deps[formula_node]` keeps both ranges. A subsequent write to A5 hits the Column A stripe AND passes the precision check (the stale `A:A` range still contains A5) — false-positive dirty.
+
+**Cost: performance, not correctness.** A false-positive dirty just means a recompute does extra work; the value is unchanged so downstream sees no propagation. Phase 3.10 megaudit decides between delta-edge graph storage vs a per-formula `Graph::clear_range_deps_for_formula(node)` API; Phase 3.3 ships with the residue documented.
+
+## 3. What Phase 3.3 deliberately doesn't ship
 
 These are tracked in `docs/known-gaps.md` and pinned to specific Phase 3 sub-items:
 
-- **Dependency extraction (Phase 3.2):** the graph has nodes but no edges. Lex+parse+bind happens during rebuild and `on_set_formula` only via the bind-plan cache; the resulting `ExprPlan` isn't walked for `CellRef` / `RangeRef` / `NameRef` extraction.
-- **Dirty propagation (Phase 3.3):** the hooks bump counters but don't fan out via `Graph::dependents_for_cell`. The stripe index that 2A's W3-5 built (`StripeIndex`, per CORR-21) is wired into the graph but unused by the runtime.
+- ✅ **Dependency extraction (Phase 3.2 / W5-35):** the dep walker + `FormulaDeps` collection + `cell_to_formulas` / `name_to_formulas` / `volatile_formulas` side-tables are all live.
+- ✅ **Dirty propagation (Phase 3.3 / W5-36):** the 5 hooks fan out via stripe + reverse index. `dirty_formulas()` / `take_dirty()` are the scheduler hooks.
 - **Topological recompute (Phase 3.4):** `recompute_all` still walks formulas in HashMap order (GAP-R-01). Phase 3.4 replaces it with Tarjan SCC over the dirty subset (per CORR-23).
 - **Computed-overlay separation (Phase 3.5):** user edits and formula outputs share the same storage overlay today. Phase 3.5 splits them per CORR-25.
 - **Range aggregate cache (Phase 3.6):** `ExprPlan::AggregateNameRef` currently evaluates to `#CALC!`. Phase 3.6 implements actual range aggregate evaluation with HyperFormula-style per-function-name caching on RangeNodes.

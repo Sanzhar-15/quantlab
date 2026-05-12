@@ -240,11 +240,12 @@ The full v1 means all of these crates either ship real behavior or have a docume
    Shipped: `CalcgraphSession::{formula_deps, volatile_formulas, name_to_formulas}` side-tables; `walk_plan_for_deps` recursive walker; `RebuildResult` aggregates per-formula bind failures (parallel to `RecomputeResult`); `on_set_formula` takes `&ExprPlan` (no re-binding in the hook); `on_clear_formula` evicts dep state. 9 new tests; full ql-exec suite at 268 tests. Open follow-ups: GAP-R-07 (scalar `NameRef` name-tracking) and the 3.3 dirty-propagation wire-up that consumes this substrate.  
    Effort: 3-5 days (actual: ~1 day from 3.1 substrate; clean handoff to 3.3).
 
-3. **3.3 Dirty Propagation And Stripe Range Index**  
+3. **3.3 Dirty Propagation And Stripe Range Index** ✅ SHIPPED 2026-05-12 (W5-36)  
    Wire writes to dirty direct dependents and range dependents through Formualizer-style stripe maps. Add precision re-check to remove false positives.  
    References: `.references/formualizer/crates/formualizer-eval/src/engine/graph/range_deps.rs`; `.references/formualizer/crates/formualizer-eval/src/engine/graph/mod.rs`; `.references/formualizer/crates/formualizer-eval/src/engine/sheet_index.rs`.  
-   Acceptance: DIR-3-01 write to `A500` dirties `SUM(A:A)`; DIR-3-02 write outside range does not dirty after precision check; DIR-3-03 whole-row, whole-column, and bounded ranges covered; DIR-3-04 no per-cell edge explosion for full columns.  
-   Effort: 4-6 days.
+   Acceptance: DIR-3-01 ✅ write inside range dirties dependent (`dir_3_01_write_inside_range_dirties_dependent`); DIR-3-02 ✅ write outside range does not dirty after precision check (`dir_3_02_write_outside_range_filtered_by_precision_check`); DIR-3-03 ✅ whole-row, whole-column, and bounded ranges covered (`dir_3_03_whole_col_whole_row_bounded_all_supported`); DIR-3-04 ✅ no per-cell edge explosion for full columns (`dir_3_04_no_per_cell_edge_explosion_for_full_columns`).  
+   Shipped: session-side `dirty: HashSet<NodeId>` plus the 5 hooks fanning out via `Graph::dependents_for_cell` (stripe + precision) for range deps and a new session-side `cell_to_formulas` reverse index for direct cell deps; `on_set_name` fans out via `name_to_formulas`; `take_dirty()` claims + clears for the future 3.4 SCC scheduler; `range_to_rangeref` converter promotes `Range { start_row: 0, end_row: MAX }` to `RangeRef::WholeColumn` (and symmetric for whole-row) to keep the stripe index O(width) instead of O(height). 10 new tests; full ql-exec suite at 278 tests, workspace at 892. Known limitation: stale Phase 0 stripe entries on re-bind (append-only `Graph`) — filed as GAP-G-01 (performance, not correctness; precision check filters at the read side).  
+   Effort: 4-6 days (actual: ~1 day; substrate already existed in `ql-calcgraph` from Phase 0 W3-5).
 
 4. **3.4 Tarjan SCC Scheduler And Full Topological Recompute**  
    Replace map-order recompute with dirty-subset Tarjan SCC plus deterministic layers. Cycles surface as Excel errors and diagnostics, not panics.  
