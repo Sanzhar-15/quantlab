@@ -1,7 +1,7 @@
 # Known engine gaps — checklist with target phases
 
 **Status:** Living document, updated at each phase boundary  
-**Date last touched:** 2026-05-12 (Engine Phase 3.4 close-out — W5-37)  
+**Date last touched:** 2026-05-12 (Engine Phase 3.5 close-out — W5-38)  
 **Companion:** `docs/MASTER-PLAN.md`
 
 Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a gap is closed, move its row to the "Closed" section at the bottom and reference the closing commit.
@@ -45,7 +45,7 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 
 | ID | Gap | Reproduce | Owner | Target phase |
 |---|---|---|---|---|
-| GAP-S-01 | Single overlay per chunk (user + formula outputs share state) | `ql-storage/src/column.rs::SparseOverlay` is a single map | Engine | Engine Phase 3.5 (computed-overlay separation, CORR-25) |
+| ~~GAP-S-01~~ | ~~Single overlay per chunk (user + formula outputs share state)~~ — **CLOSED** in Engine Phase 3.5 (commit-after-645c7baf3bf, W5-38). `ColumnStore` now carries parallel `user_overlays` + `computed_overlays` per chunk; read cascade is user → computed → base; `put` (user) clears computed at the row, `put_computed` clears user. Runtime + qbook loader updated to route writes correctly. |
 | GAP-S-02 | Float64-only base lane; no Boolean/Text/Error/DateTime column types | `ql-storage/src/column.rs::ColumnStore` holds `Vec<ArrayRef>` typed Float64 | Engine | Engine Phase 4.5 (date/time + format) onward, finalized in Phase 4 |
 | GAP-S-03 | No type-tag byte per row; cell type comes from `Value` overlay only | Same — base array is Float64, overlay is `Value` | Engine | Engine Phase 4 (mixed types) |
 | GAP-S-04 | No table metadata in storage; `Table[Column]` parse → bind path absent | `ql-storage` has no `Table` type | Engine | Engine Phase 4.8 (tables + structured refs) |
@@ -137,6 +137,7 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 - **GAP-O-01 / GAP-O-02 / GAP-O-03** (op-log producer bypasses for set_name / add_sheet / put_at + clear_formula) — closed in Engine Phase 2B.5.
 - **GAP-I-02** (engine-side IDE-consumption test harness) — closed in Engine Phase 2B.6.
 - **GAP-I-04** (no dry-run formula validation API) — closed in Engine Phase 2B.7 audit closure: `WorkbookRuntime::validate_formula`.
+- **GAP-S-01** (single overlay per chunk, user + formula outputs conflated) — closed in Engine Phase 3.5: parallel `user_overlays` + `computed_overlays` with read cascade user → computed → base.
 - **Phase 2B.7 audit-closure fixes** (correctness): orphan op-log entries on `add_sheet`(chunk_rows=0 / SheetId::MAX), `set_name` mutate-first divergence, `set_value` / `clear_formula` partial-pair non-atomicity, `transaction::commit` post-mutation log append. All fixed. `Workbook` and `OpLog` proven `Send + Sync` at compile time. See `docs/audits/2026-05-12-phase-2B.md`.
 
 ---

@@ -264,11 +264,23 @@ The full v1 means all of these crates either ship real behavior or have a docume
    16 new tests (10 session unit + 5 runtime integration + 1 wire roundtrip). ql-exec at 295, workspace at 905.  
    Effort: 5-7 days (actual: ~1 day; substrate was already there from Phase 0 W3-3).
 
-5. **3.5 Computed-Overlay Separation**  
+5. **3.5 Computed-Overlay Separation** ✅ SHIPPED 2026-05-12 (W5-38)  
    Split user edits from computed formula/spill outputs in storage. Reads cascade user -> computed -> base. User write clears stale computed value at that cell.  
    References: `.references/formualizer/crates/formualizer-eval/src/arrow_store/mod.rs`; `.references/formualizer/crates/formualizer-eval/src/engine/range_view.rs`; `docs/phase0/references-reading-log.md` CORR-25.  
-   Acceptance: OVR-3-01 formula output no longer mutates user overlay; OVR-3-02 typing over formula clears formula/computed state; OVR-3-03 save/load preserves correct semantic layer; OVR-3-04 range reads see cascade consistently.  
-   Effort: 4-7 days.
+   Acceptance: OVR-3-01 ✅ formula output writes to computed overlay, not user (`ovr_3_01_set_formula_writes_to_computed_overlay_not_user`); OVR-3-02 ✅ typing over formula clears formula text + computed (`ovr_3_02_typing_over_formula_clears_formula_and_computed`); OVR-3-03 ✅ save/load preserves layer (`ovr_3_03_save_load_preserves_layer`); OVR-3-04 ✅ read cascade consistent (`ovr_3_04_read_cascade_consistent_across_lane_types`).  
+   Shipped:  
+   - `ColumnStore` now carries `user_overlays: Vec<SparseOverlay>` AND `computed_overlays: Vec<SparseOverlay>` (parallel per-chunk). Read cascade: user → computed → base.  
+   - `ColumnStore::put` (user edit) auto-clears computed at the row; symmetric `put_computed` clears user. The two lanes maintain the invariant "a row has at most one of {user, computed} entry."  
+   - `ColumnStore::{clear_computed, clear_user}` for explicit lane drops.  
+   - `Sheet::{put_computed, clear_computed, clear_user}` mirror the column API.  
+   - `Workbook::{put_computed_at, clear_computed_at, clear_user_at}`. `Workbook::clear_formula` ALSO drops the cell's computed entry (no formula → no formula output).  
+   - `WorkbookRuntime::{set_formula, recompute_all, recompute_dirty}` route formula outputs through `put_computed_at` (was `put_at`); `clear_formula` runtime path promotes the final formula value into the user lane before clearing (Excel "strip formula, keep value" canonicalized to "value becomes literal"). Transaction commit pass 2 routes formula results through `put_computed_at`.  
+   - `WorkbookRuntime::recompute_dirty` writes `#CIRC!` to the computed overlay (not user) for cycle members.  
+   - qbook loader (`ql_io::load_workbook`) routes cells with formula text to `put_computed_at`; cells without formulas go to `put_at` (user). Save path needs no change — `sheet.read` already goes through the cascade and surfaces the right value per cell.  
+   - `iter_chunks` signature changed: `(idx, &base, &user_overlay, &computed_overlay)` tuple. `overlay(idx)` deprecated; new code uses `user_overlay` / `computed_overlay` explicitly.  
+   - One additional Phase 3.5 acceptance test `ovr_3_02b_clear_formula_promotes_value_to_user_lane` pins the explicit-clear behavior.  
+   10 new tests (5 in ColumnStore + 5 OVR-* at runtime). ql-exec at 305 (was 295), ql-storage at 70 (was 65), workspace at 915 (was 905).  
+   Effort: 4-7 days (actual: ~1 day; the overlay primitive was already per-chunk, so the split was straightforward).
 
 6. **3.6 Range Aggregate Cache V1**  
    Add aggregate cache nodes for SUM/COUNT/MIN/MAX/AVERAGE/PRODUCT over range plans, invalidated by dirty stripes. Start simple: clear relevant aggregate cache on intersecting writes; optimize later.  

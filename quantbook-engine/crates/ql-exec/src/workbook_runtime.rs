@@ -423,13 +423,16 @@ impl<'a> WorkbookRuntime<'a> {
             })?;
         }
 
-        // Persist formula text + evaluated value. Both writes succeed or neither —
-        // put_at can't fail because `validate_cell` at the top of this method
-        // already rejected out-of-range (sheet, row, col). The prior comment
-        // claimed the binder did the validation; that was wrong — validation
-        // is at the runtime entry, the binder just stamps `owning_sheet`
-        // onto unresolved CellRefs. (Phase 2B.7 audit doc D6 fix.)
-        self.workbook.put_at(sheet, row, col, value.clone());
+        // Persist formula text + evaluated value. Phase 3.5 (CORR-25):
+        // a formula's output goes to the COMPUTED overlay, not the user
+        // overlay; if the cell previously held a user-typed value, we
+        // clear that lane first so the user-first read cascade doesn't
+        // mask the new formula output. `put_at` can't fail because
+        // `validate_cell` at the top of this method already rejected
+        // out-of-range (sheet, row, col).
+        self.workbook.clear_user_at(sheet, row, col);
+        self.workbook
+            .put_computed_at(sheet, row, col, value.clone());
         self.workbook.put_formula(sheet, row, col, formula_text);
 
         // Phase 3.1: notify calcgraph after the workbook mutation
@@ -637,19 +640,26 @@ impl<'a> WorkbookRuntime<'a> {
             return Ok(());
         }
         // Producer-replay equivalence: `Workbook::clear_formula` only strips
-        // the formula text; the cell's value (from the formula's most-recent
-        // evaluation) persists. Replay against a fresh workbook has no such
-        // value to preserve, so we record the current value via Op::PutValue
-        // BEFORE the Op::ClearFormula. Skip the PutValue when the current
-        // value is Blank (CellWireValue can't represent Blank in V0 —
-        // documented in `set_value`).
+        // the formula text. Phase 3.5 (CORR-25) made it also drop the
+        // computed-overlay entry (so the cell's prior formula output
+        // doesn't linger uncoupled from a formula). To preserve the
+        // "strip formula, keep value" semantic, we explicitly move the
+        // current value into the user-overlay BEFORE clearing — Excel's
+        // canonical interpretation is "convert formula to literal," and
+        // a literal value lives on the user lane. The op-log path records
+        // PutValue + ClearFormula so replay performs the same
+        // user-overlay write + clear pair.
+        //
+        // Order matters: write user BEFORE clear_formula. Otherwise the
+        // computed entry vanishes first and `current_value` would already
+        // be Blank.
         //
         // Phase 2B.7 audit H2 (2026-05-12): wrap the pair in a single
         // `Op::BatchCommit` for atomicity. The prior two-append sequence
         // could partially succeed (PutValue lands, ClearFormula append
         // fails) and leave the op log without a recoverable replay state.
+        let current_value = self.workbook.read(ql_types::Address::new(sheet, row, col));
         if let Some(oplog) = self.oplog.as_deref_mut() {
-            let current_value = self.workbook.read(ql_types::Address::new(sheet, row, col));
             let mut log_ops: Vec<Op> = Vec::with_capacity(2);
             if let Some(wire) = CellWireValue::from_value(&current_value) {
                 log_ops.push(Op::PutValue {
@@ -664,6 +674,12 @@ impl<'a> WorkbookRuntime<'a> {
                 1 => oplog.append(log_ops.into_iter().next().unwrap())?,
                 _ => oplog.append(Op::BatchCommit { ops: log_ops })?,
             }
+        }
+        // Phase 3.5: preserve the formula's most-recent value as a USER
+        // value before clearing. Blank values are skipped — they're the
+        // storage default; writing Blank explicitly is a no-op.
+        if !matches!(current_value, Value::Blank) {
+            self.workbook.put_at(sheet, row, col, current_value);
         }
         self.workbook.clear_formula(sheet, row, col);
 
@@ -764,7 +780,9 @@ impl<'a> WorkbookRuntime<'a> {
         for (sheet, row, col, formula_text) in entries {
             match self.try_recompute_one_cached(sheet, &formula_text) {
                 Ok(value) => {
-                    self.workbook.put_at(sheet, row, col, value);
+                    // Phase 3.5 (CORR-25): formula outputs route to the
+                    // COMPUTED overlay, never the user lane.
+                    self.workbook.put_computed_at(sheet, row, col, value);
                     succeeded += 1;
                 }
                 Err(error) => {
@@ -824,13 +842,15 @@ impl<'a> WorkbookRuntime<'a> {
         let mut failures: Vec<RecomputeFailure> = Vec::new();
 
         // Cycled nodes get `#CIRC!` regardless of whether the formula
-        // still binds. Spec: cycles are terminal Phase 0 errors.
+        // still binds. Spec: cycles are terminal Phase 0 errors. Phase
+        // 3.5: `#CIRC!` is a FORMULA-output value (the formula's
+        // resolution), so it routes to the computed overlay.
         for node in &sched.cycled {
             let Some((sheet, row, col)) = session.cell_address_for(*node) else {
                 continue; // non-Cell variant; nothing to write
             };
             self.workbook
-                .put_at(sheet, row, col, Value::Error(ErrorValue::Circ));
+                .put_computed_at(sheet, row, col, Value::Error(ErrorValue::Circ));
         }
 
         // Sorted nodes evaluate in dependency-first order.
@@ -847,7 +867,8 @@ impl<'a> WorkbookRuntime<'a> {
             };
             match self.try_recompute_one_cached(sheet, &text) {
                 Ok(value) => {
-                    self.workbook.put_at(sheet, row, col, value);
+                    // Phase 3.5: formula outputs to computed overlay.
+                    self.workbook.put_computed_at(sheet, row, col, value);
                     succeeded += 1;
                 }
                 Err(error) => failures.push(RecomputeFailure {
@@ -2914,6 +2935,182 @@ mod tests {
             wb.read(ql_types::Address::new(0, 0, 4)),
             Value::Number(101.0),
             "E1 must not have been recomputed"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 3.5 (W5-38) — OVR-3-01..04 computed-overlay separation
+    // acceptance tests. CORR-25.
+    // ----------------------------------------------------------------
+
+    /// OVR-3-01: `set_formula` writes the evaluated value to the COMPUTED
+    /// overlay, not the user lane. Inspect each overlay directly via the
+    /// column store to verify lane-routing.
+    #[test]
+    fn ovr_3_01_set_formula_writes_to_computed_overlay_not_user() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.set_value(0, 0, 0, Value::Number(5.0)).unwrap(); // A1 user-value
+            rt.set_formula(0, 0, 1, "A1 * 2").unwrap(); // B1 = formula
+        }
+        // A1: user lane has the value; computed lane is empty.
+        let col_a = wb.sheet(0).unwrap().column(0).unwrap();
+        assert_eq!(
+            col_a.user_overlay(0).unwrap().get(0),
+            Some(&Value::Number(5.0))
+        );
+        assert_eq!(col_a.computed_overlay(0).unwrap().get(0), None);
+        // B1: computed has the formula's evaluated value (10.0); user is empty.
+        let col_b = wb.sheet(0).unwrap().column(1).unwrap();
+        assert_eq!(
+            col_b.computed_overlay(0).unwrap().get(0),
+            Some(&Value::Number(10.0))
+        );
+        assert_eq!(
+            col_b.user_overlay(0).unwrap().get(0),
+            None,
+            "OVR-3-01: formula must NOT mutate user overlay"
+        );
+    }
+
+    /// OVR-3-02: typing a literal value over a formula cell clears both
+    /// the formula text AND the computed-overlay entry. Excel canon:
+    /// "user types over a formula → formula gone, cell becomes literal."
+    #[test]
+    fn ovr_3_02_typing_over_formula_clears_formula_and_computed() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.set_value(0, 0, 0, Value::Number(5.0)).unwrap();
+            rt.set_formula(0, 0, 1, "A1 * 2").unwrap();
+            // Now type a literal over B1.
+            rt.set_value(0, 0, 1, Value::Number(99.0)).unwrap();
+        }
+        // Formula text is gone.
+        assert!(wb.formula_at(0, 0, 1).is_none());
+        // Computed overlay at B1 is gone.
+        let col_b = wb.sheet(0).unwrap().column(1).unwrap();
+        assert_eq!(col_b.computed_overlay(0).unwrap().get(0), None);
+        // User overlay has the new literal.
+        assert_eq!(
+            col_b.user_overlay(0).unwrap().get(0),
+            Some(&Value::Number(99.0))
+        );
+        // Public read returns the user value.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Number(99.0)
+        );
+    }
+
+    /// OVR-3-02 sister: explicit `clear_formula` (Excel "strip formula,
+    /// keep value") MOVES the formula's last evaluated value into the
+    /// user lane so the visible value persists. The op log records the
+    /// PutValue + ClearFormula pair so replay produces the same state.
+    #[test]
+    fn ovr_3_02b_clear_formula_promotes_value_to_user_lane() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.set_formula(0, 0, 0, "3 + 4").unwrap(); // A1 = formula, value 7
+            rt.clear_formula(0, 0, 0).unwrap();
+        }
+        assert!(wb.formula_at(0, 0, 0).is_none());
+        let col = wb.sheet(0).unwrap().column(0).unwrap();
+        // Value moved to user lane.
+        assert_eq!(
+            col.user_overlay(0).unwrap().get(0),
+            Some(&Value::Number(7.0))
+        );
+        // Computed lane empty.
+        assert_eq!(col.computed_overlay(0).unwrap().get(0), None);
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Number(7.0));
+    }
+
+    /// OVR-3-03: save+load round-trip preserves lane assignment. A
+    /// workbook with a user-typed cell + a formula cell with computed
+    /// output, after `save_workbook` + `load_workbook`, has the same
+    /// lane layout (verified by inspecting overlays after load).
+    #[test]
+    fn ovr_3_03_save_load_preserves_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ovr_3_03.qbook");
+        // Build a workbook through the runtime so layers are correct.
+        {
+            let mut wb = make_runtime_workbook();
+            let reg = default_registry();
+            {
+                let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+                rt.set_value(0, 0, 0, Value::Number(5.0)).unwrap();
+                rt.set_formula(0, 0, 1, "A1 * 2").unwrap();
+            }
+            ql_io::save_workbook(&wb, "OVR-3-03", &path).unwrap();
+        }
+        // Load and inspect.
+        let wb_loaded = ql_io::load_workbook(&path).unwrap();
+        // A1: user lane.
+        let col_a = wb_loaded.sheet(0).unwrap().column(0).unwrap();
+        assert_eq!(
+            col_a.user_overlay(0).unwrap().get(0),
+            Some(&Value::Number(5.0))
+        );
+        assert_eq!(col_a.computed_overlay(0).unwrap().get(0), None);
+        // B1: computed lane with the saved formula output. Formula text preserved.
+        assert_eq!(
+            wb_loaded.formula_at(0, 0, 1).map(|s| s.as_ref()),
+            Some("A1 * 2")
+        );
+        let col_b = wb_loaded.sheet(0).unwrap().column(1).unwrap();
+        assert_eq!(
+            col_b.computed_overlay(0).unwrap().get(0),
+            Some(&Value::Number(10.0)),
+            "OVR-3-03: formula output must land in computed on load"
+        );
+        assert_eq!(
+            col_b.user_overlay(0).unwrap().get(0),
+            None,
+            "OVR-3-03: load must NOT route formula values to user overlay"
+        );
+    }
+
+    /// OVR-3-04: reads through the cascade see the right value in every
+    /// scenario — user-only cell, formula-only cell, base-only cell.
+    /// The runtime's public `Workbook::read` is the cascade entry point.
+    #[test]
+    fn ovr_3_04_read_cascade_consistent_across_lane_types() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            // A1: pure user value.
+            rt.set_value(0, 0, 0, Value::Number(1.0)).unwrap();
+            // B1: formula → computed lane.
+            rt.set_formula(0, 0, 1, "A1 * 10").unwrap();
+            // C1: user, then formula on top (formula must shadow user).
+            rt.set_value(0, 0, 2, Value::Number(999.0)).unwrap();
+            rt.set_formula(0, 0, 2, "A1 + 100").unwrap();
+            // D1: formula, then literal on top (literal must shadow formula's computed).
+            rt.set_formula(0, 0, 3, "A1 * 5").unwrap();
+            rt.set_value(0, 0, 3, Value::Number(7777.0)).unwrap();
+        }
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Number(1.0));
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Number(10.0)
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 2)),
+            Value::Number(101.0),
+            "C1: formula replaced user; read sees computed 101"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 3)),
+            Value::Number(7777.0),
+            "D1: literal replaced formula; read sees user 7777"
         );
     }
 

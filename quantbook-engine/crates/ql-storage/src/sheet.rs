@@ -110,6 +110,60 @@ impl Sheet {
         }
     }
 
+    /// **Phase 3.5 (2026-05-12).** Write a FORMULA-OUTPUT value to the cell's computed
+    /// overlay. Mirrors `put` but routes to the computed-overlay lane; used by
+    /// `WorkbookRuntime::set_formula` + `recompute_*` paths. Same bounds checks as `put`.
+    pub fn put_computed(&mut self, row: RowId, col: ColId, value: Value) {
+        use ql_types::address::{MAX_COLUMN, MAX_ROW};
+        assert!(
+            row <= MAX_ROW,
+            "Sheet::put_computed: row {row} exceeds Excel max row {MAX_ROW}"
+        );
+        assert!(
+            col <= MAX_COLUMN,
+            "Sheet::put_computed: col {col} exceeds Excel max column {MAX_COLUMN}"
+        );
+        let col_idx = col as usize;
+        while self.columns.len() <= col_idx {
+            self.columns
+                .push(ColumnStore::with_chunk_rows(self.chunk_rows));
+        }
+        self.columns[col_idx].put_computed(row, value);
+        // Phase 3.5: bounds still grow on computed writes — the cell is now
+        // observable through `read` even if no user-typed value lives at it.
+        let row_extent_candidate = row
+            .checked_add(1)
+            .expect("Sheet::put_computed: row+1 overflow");
+        let col_extent_candidate = col
+            .checked_add(1)
+            .expect("Sheet::put_computed: col+1 overflow");
+        if row_extent_candidate > self.bounds.row_extent {
+            self.bounds.row_extent = row_extent_candidate;
+        }
+        if col_extent_candidate > self.bounds.col_extent {
+            self.bounds.col_extent = col_extent_candidate;
+        }
+    }
+
+    /// **Phase 3.5.** Drop the cell's computed-overlay entry. Called by
+    /// `Workbook::clear_formula` so a cell loses its stale formula output the moment
+    /// the formula text is removed. No-op for out-of-bounds cells.
+    pub fn clear_computed(&mut self, row: RowId, col: ColId) {
+        if let Some(c) = self.columns.get_mut(col as usize) {
+            c.clear_computed(row);
+        }
+    }
+
+    /// **Phase 3.5.** Drop the cell's user-overlay entry. Called by
+    /// `WorkbookRuntime::set_formula` before writing the new computed value, so a cell
+    /// that's transitioning from "user-typed value" to "formula" doesn't keep its
+    /// stale user value masking the new computed output via the read cascade.
+    pub fn clear_user(&mut self, row: RowId, col: ColId) {
+        if let Some(c) = self.columns.get_mut(col as usize) {
+            c.clear_user(row);
+        }
+    }
+
     /// Append a fully-constructed column at the next column index. Used by xlsx import or
     /// bench-fixture loading.
     ///

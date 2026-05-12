@@ -351,7 +351,11 @@ impl<'a> WorkbookTransaction<'a> {
                     ..
                 } => {
                     workbook.put_formula(*sheet, *row, *col, Arc::clone(text));
-                    // Cell's current value stays as-is until pass 2 overwrites it.
+                    // Phase 3.5 (CORR-25): the cell is becoming a formula
+                    // cell. Drop any prior user-typed value so pass 2's
+                    // computed write isn't masked by the read cascade
+                    // (user → computed → base).
+                    workbook.clear_user_at(*sheet, *row, *col);
                 }
             }
         }
@@ -372,7 +376,9 @@ impl<'a> WorkbookTransaction<'a> {
                     let env = WorkbookEnv::new(workbook);
                     eval_scalar_with_registry(plan, &env, registry)
                 };
-                workbook.put_at(*sheet, *row, *col, value);
+                // Phase 3.5 (CORR-25): formula outputs go to the computed
+                // overlay, not the user lane.
+                workbook.put_computed_at(*sheet, *row, *col, value);
             }
         }
 

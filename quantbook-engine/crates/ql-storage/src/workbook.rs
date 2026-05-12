@@ -356,6 +356,9 @@ impl Workbook {
     }
 
     /// Convenience: write a literal row,col,value tuple without constructing an Address.
+    /// Phase 3.5: this is the USER-edit path — routes to `Sheet::put` →
+    /// `ColumnStore::put` which writes the user overlay AND clears any stale computed
+    /// entry at the same cell.
     ///
     /// **Phase 2B.5 (2026-05-12) — LOW-LEVEL.** Bypasses the op log AND the
     /// runtime's bind-plan cache; does NOT clear any pre-existing formula
@@ -366,6 +369,45 @@ impl Workbook {
     /// internal pass 2 of formula recompute, and tests. GAP-O-03.
     pub fn put_at(&mut self, sheet: SheetId, row: RowId, col: ColId, value: Value) {
         self.put(Address::new(sheet, row, col), value);
+    }
+
+    /// **Phase 3.5 (2026-05-12) — CORR-25.** Write a FORMULA-OUTPUT value at
+    /// `(sheet, row, col)`. Routes to the computed-overlay lane (NOT the user lane).
+    /// Used by `WorkbookRuntime::set_formula` (with the freshly-evaluated result of
+    /// the formula text) and by `recompute_all` / `recompute_dirty` for every
+    /// formula cell in their pass.
+    ///
+    /// Panics if `sheet` is out of bounds — same contract as `put_at`. Does NOT touch
+    /// the user overlay; if a cell is transitioning from "user-typed value" to
+    /// "formula", the caller (the runtime) MUST first call `clear_user_at` so the
+    /// stale user value doesn't mask the new computed value via the read cascade.
+    pub fn put_computed_at(&mut self, sheet: SheetId, row: RowId, col: ColId, value: Value) {
+        let total = self.sheet_count();
+        match self.sheet_mut(sheet) {
+            Some(s) => s.put_computed(row, col, value),
+            None => {
+                panic!("Workbook::put_computed_at: sheet {sheet} does not exist (have {total})")
+            }
+        }
+    }
+
+    /// **Phase 3.5.** Drop the computed-overlay entry at `(sheet, row, col)`. No-op if
+    /// the cell has no computed entry or the sheet is out of bounds. Called by
+    /// `clear_formula` (the formula text is gone → its output is stale).
+    pub fn clear_computed_at(&mut self, sheet: SheetId, row: RowId, col: ColId) {
+        if let Some(s) = self.sheet_mut(sheet) {
+            s.clear_computed(row, col);
+        }
+    }
+
+    /// **Phase 3.5.** Drop the user-overlay entry at `(sheet, row, col)`. No-op if
+    /// the cell has no user entry or the sheet is out of bounds. Called by the runtime's
+    /// `set_formula` to clear a stale user value before writing the new computed
+    /// formula output.
+    pub fn clear_user_at(&mut self, sheet: SheetId, row: RowId, col: ColId) {
+        if let Some(s) = self.sheet_mut(sheet) {
+            s.clear_user(row, col);
+        }
     }
 
     /// Phase 1 W5-9: record formula source text for a cell. The caller is responsible
@@ -414,11 +456,18 @@ impl Workbook {
     /// literal (e.g. user types over the formula with a value). Idempotent: removing
     /// a non-existent entry is a no-op.
     ///
+    /// Phase 3.5 (CORR-25): ALSO drops any computed-overlay entry at this cell. A
+    /// cell without a formula text has no business carrying a formula output; the
+    /// invariant the rest of the engine relies on is "computed overlay populated ⇒
+    /// formula text present", and `clear_formula` is the only path that breaks the
+    /// formula→computed pair, so the storage layer enforces both sides here.
+    ///
     /// **Phase 2B.5 (2026-05-12) — LOW-LEVEL.** Bypasses the op log. Use
     /// `ql_exec::WorkbookRuntime::clear_formula` to record `Op::ClearFormula`
     /// in an attached log. GAP-O-03.
     pub fn clear_formula(&mut self, sheet: SheetId, row: RowId, col: ColId) {
         self.formula_cells.remove(&(sheet, row, col));
+        self.clear_computed_at(sheet, row, col);
     }
 
     /// Borrow the formula source for a cell, if it has one.

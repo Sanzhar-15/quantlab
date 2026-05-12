@@ -1122,9 +1122,23 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                     other => other,
                 })?
             };
-            wb.put_at(sheet_id, rec.row as RowId, rec.col as ColId, value);
+            // Phase 3.5 (CORR-25, 2026-05-12) — OVR-3-03: load routes
+            // cells with formulas to the COMPUTED overlay; cells without
+            // formulas go to the USER overlay. This preserves the
+            // engine's semantic invariant ("formula-owned cell has no
+            // user-overlay entry"). Pending/Blank values are skipped on
+            // the formula path because there's nothing to display until
+            // recompute runs; the formula text alone is enough to drive
+            // the recompute pass.
+            let row = rec.row as RowId;
+            let col = rec.col as ColId;
             if let Some(formula_text) = rec.formula {
-                wb.put_formula(sheet_id, rec.row as RowId, rec.col as ColId, formula_text);
+                wb.put_formula(sheet_id, row, col, formula_text);
+                if !matches!(value, Value::Blank) {
+                    wb.put_computed_at(sheet_id, row, col, value);
+                }
+            } else {
+                wb.put_at(sheet_id, row, col, value);
             }
         }
     }

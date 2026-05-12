@@ -1,15 +1,33 @@
-//! `ColumnStore` — chunked Arrow base + per-chunk sparse overlay.
+//! `ColumnStore` — chunked Arrow base + per-chunk DUAL sparse overlays.
 //!
-//! Per spec Part V §4 Week 2 Days 3-4:
+//! Per spec Part V §4 Week 2 Days 3-4 + Engine Phase 3.5 (CORR-25, 2026-05-12):
 //! - Each column is `Vec<Arc<dyn arrow_array::Array>>` (one chunk per `chunk_rows` rows).
-//! - Each chunk has a parallel `SparseOverlay` for cell edits.
+//! - Each chunk has TWO parallel `SparseOverlay`s:
+//!   * `user_overlays[chunk_idx]` — values the user typed directly.
+//!   * `computed_overlays[chunk_idx]` — values produced by formula recompute.
 //! - Default chunk size: 16,384 rows. Override via `QBOOK_CHUNK_ROWS` env var read once at
 //!   construction time. (Constant per ColumnStore — switching mid-life isn't supported.)
-//! - Read merge: overlay-first, base-fallback. Out-of-bounds reads return `Value::Blank`.
+//! - Read merge cascade: user-overlay → computed-overlay → base. Out-of-bounds reads
+//!   return `Value::Blank`.
 //! - Chunk-replace, not cell-mutate: `replace_chunk(idx, new_array)` swaps a whole chunk's
-//!   base and clears its overlay. Used by recompute. Cell-level writes go through `put`.
+//!   base and clears BOTH overlays at that chunk.
 //! - Phase 0 base type: Float64Array. Boolean/Text base chunks come in Week 4+; for now the
 //!   `read_base` helper just handles the Float64 case and `Value::Blank` otherwise.
+//!
+//! ## Layer routing (Phase 3.5)
+//!
+//! - `put(row, value)` — USER edit. Writes to `user_overlays`. Also clears any prior
+//!   `computed_overlays` entry at that row, because a fresh user write makes any prior
+//!   formula output at that cell stale.
+//! - `put_computed(row, value)` — FORMULA OUTPUT. Writes to `computed_overlays`.
+//!   Used by `WorkbookRuntime::recompute_*` and `set_formula`.
+//! - `clear_computed(row)` — drop the computed entry. Called by `clear_formula` (the
+//!   formula text is gone → its output is meaningless).
+//!
+//! On read, `user_overlays.get(row)` wins if present, else `computed_overlays.get(row)`,
+//! else `read_base`. The invariant the runtime maintains: a cell with formula text ALWAYS
+//! has its value in `computed_overlays`, never `user_overlays`. Conversely, a cell without
+//! formula text has its value in `user_overlays` (or `base`).
 
 use std::sync::Arc;
 
@@ -56,15 +74,19 @@ pub fn chunk_rows_from_env() -> u32 {
     resolve_chunk_rows(std::env::var("QBOOK_CHUNK_ROWS").ok().as_deref())
 }
 
-/// Chunked column with overlay. Invariants:
-/// - `base_chunks.len() == overlays.len()`.
+/// Chunked column with dual overlays. Invariants:
+/// - `base_chunks.len() == user_overlays.len() == computed_overlays.len()`.
 /// - Every chunk except possibly the last is exactly `chunk_rows` long.
 /// - Last chunk MAY be shorter (open-ended column; rows beyond it read as `Blank`).
+/// - Phase 3.5: at any row, AT MOST ONE of `user_overlays[chunk]` and
+///   `computed_overlays[chunk]` carries an entry — `put` clears the other side, and
+///   `put_computed` is only called for formula cells (which have no user-overlay entry).
 #[derive(Clone, Debug)]
 pub struct ColumnStore {
     chunk_rows: u32,
     base_chunks: Vec<ArrayRef>,
-    overlays: Vec<SparseOverlay>,
+    user_overlays: Vec<SparseOverlay>,
+    computed_overlays: Vec<SparseOverlay>,
 }
 
 impl ColumnStore {
@@ -80,7 +102,8 @@ impl ColumnStore {
         Self {
             chunk_rows,
             base_chunks: Vec::new(),
-            overlays: Vec::new(),
+            user_overlays: Vec::new(),
+            computed_overlays: Vec::new(),
         }
     }
 
@@ -116,11 +139,13 @@ impl ColumnStore {
                 );
             }
         }
-        let overlays = base_chunks.iter().map(|_| SparseOverlay::new()).collect();
+        let user_overlays = base_chunks.iter().map(|_| SparseOverlay::new()).collect();
+        let computed_overlays = base_chunks.iter().map(|_| SparseOverlay::new()).collect();
         Self {
             chunk_rows,
             base_chunks,
-            overlays,
+            user_overlays,
+            computed_overlays,
         }
     }
 
@@ -141,16 +166,21 @@ impl ColumnStore {
     }
 
     /// Read a single cell. Out-of-bounds returns `Value::Blank`.
+    /// Cascade (Phase 3.5): `user_overlay` → `computed_overlay` → `base`.
     pub fn read(&self, row: RowId) -> Value {
         let (chunk_idx, rel_row) = self.locate(row);
         if chunk_idx >= self.base_chunks.len() {
             return Value::Blank;
         }
-        // Overlay first.
-        if let Some(v) = self.overlays[chunk_idx].get(rel_row) {
+        // 1. User overlay.
+        if let Some(v) = self.user_overlays[chunk_idx].get(rel_row) {
             return v.clone();
         }
-        // Base second.
+        // 2. Computed overlay (formula outputs).
+        if let Some(v) = self.computed_overlays[chunk_idx].get(rel_row) {
+            return v.clone();
+        }
+        // 3. Base.
         let base = &self.base_chunks[chunk_idx];
         if (rel_row as usize) >= base.len() {
             // Within an under-sized last chunk's tail: read as Blank.
@@ -159,10 +189,15 @@ impl ColumnStore {
         read_base(base.as_ref(), rel_row)
     }
 
-    /// Write a cell via the overlay. Chunk autogrowth: if `row` is beyond all current chunks,
+    /// Write a USER-edit cell. Chunk autogrowth: if `row` is beyond all current chunks,
     /// allocate enough empty chunks to cover it (each new chunk is a `Float64Array` of null
     /// values; the overlay carries the real value). Matches the spreadsheet "open column"
     /// model: writing to A1000 of an empty column creates the chunks containing it.
+    ///
+    /// Phase 3.5: ALSO clears any prior `computed_overlay` entry at `row` — a fresh user
+    /// edit invalidates the prior formula output that may have lived at this cell. The
+    /// runtime is responsible for clearing the formula text via `Workbook::clear_formula`
+    /// in parallel; the column only handles the value lane.
     ///
     /// **Bound** (per opus arch F3): `row <= MAX_ROW` (Excel's 1,048,575). Beyond that, the
     /// autogrowth would allocate unbounded null chunks (up to 32 GB at u32::MAX). Panics
@@ -176,13 +211,66 @@ impl ColumnStore {
         // Allocate empty chunks up to chunk_idx if needed.
         while chunk_idx >= self.base_chunks.len() {
             self.base_chunks.push(empty_chunk(self.chunk_rows));
-            self.overlays.push(SparseOverlay::new());
+            self.user_overlays.push(SparseOverlay::new());
+            self.computed_overlays.push(SparseOverlay::new());
         }
-        self.overlays[chunk_idx].put(rel_row, value);
+        self.user_overlays[chunk_idx].put(rel_row, value);
+        // Phase 3.5: user edit clears any stale computed entry at this cell.
+        self.computed_overlays[chunk_idx].remove(rel_row);
     }
 
-    /// Replace an entire chunk's base with a new Arrow array, clearing the overlay for that
-    /// chunk. Used by the recompute path: the new base is the materialized result column.
+    /// **Phase 3.5 (2026-05-12) — CORR-25.** Write a FORMULA-OUTPUT value to the
+    /// computed overlay. ALSO clears any prior user-overlay entry at `row` — the
+    /// invariant is "a cell with a computed value is owned by its formula, so it
+    /// must not also carry a user-typed value." Without this, callers that
+    /// pre-populate a formula cell's prior value via `put` (e.g. tests setting
+    /// up a stale formula result, or low-level loaders) would mask the new
+    /// computed value via the read cascade (user → computed → base).
+    ///
+    /// Used by `WorkbookRuntime::set_formula` (to write the freshly-evaluated value),
+    /// `recompute_all`, and `recompute_dirty`. Same autogrowth + MAX_ROW bound as `put`.
+    pub fn put_computed(&mut self, row: RowId, value: Value) {
+        assert!(
+            row <= MAX_ROW,
+            "ColumnStore::put_computed: row {row} exceeds Excel max row {MAX_ROW}"
+        );
+        let (chunk_idx, rel_row) = self.locate(row);
+        while chunk_idx >= self.base_chunks.len() {
+            self.base_chunks.push(empty_chunk(self.chunk_rows));
+            self.user_overlays.push(SparseOverlay::new());
+            self.computed_overlays.push(SparseOverlay::new());
+        }
+        // Invariant: formula-owned cell has no user-overlay entry.
+        self.user_overlays[chunk_idx].remove(rel_row);
+        self.computed_overlays[chunk_idx].put(rel_row, value);
+    }
+
+    /// **Phase 3.5.** Drop any computed-overlay entry at `row`. Called by
+    /// `Workbook::clear_formula` so the cell's stale formula output disappears the
+    /// moment the formula text is removed. No-op if no entry exists or if the row's
+    /// chunk hasn't been allocated.
+    pub fn clear_computed(&mut self, row: RowId) {
+        let (chunk_idx, rel_row) = self.locate(row);
+        if chunk_idx < self.computed_overlays.len() {
+            self.computed_overlays[chunk_idx].remove(rel_row);
+        }
+    }
+
+    /// **Phase 3.5.** Drop any user-overlay entry at `row`. Called by
+    /// `WorkbookRuntime::set_formula` before writing the new computed value, so a cell
+    /// that was previously user-typed and is now becoming a formula loses its stale
+    /// user value (otherwise the user-first cascade would mask the new formula output).
+    pub fn clear_user(&mut self, row: RowId) {
+        let (chunk_idx, rel_row) = self.locate(row);
+        if chunk_idx < self.user_overlays.len() {
+            self.user_overlays[chunk_idx].remove(rel_row);
+        }
+    }
+
+    /// Replace an entire chunk's base with a new Arrow array, clearing BOTH overlays for
+    /// that chunk. Used by the recompute path: the new base is the materialized result
+    /// column. Phase 3.5: both `user_overlays[chunk_idx]` and `computed_overlays[chunk_idx]`
+    /// are cleared since the new base subsumes prior overlay state.
     ///
     /// Validates (per codex r13 N2):
     /// - `chunk_idx` is in bounds.
@@ -206,10 +294,11 @@ impl ColumnStore {
             new_base.len()
         );
         self.base_chunks[chunk_idx] = new_base;
-        self.overlays[chunk_idx].clear();
+        self.user_overlays[chunk_idx].clear();
+        self.computed_overlays[chunk_idx].clear();
     }
 
-    /// Append a new base chunk (with an empty overlay). Used during initial column build.
+    /// Append a new base chunk (with empty overlays). Used during initial column build.
     ///
     /// Validates: new chunk is `Float64Array`; existing last chunk (if any) was exactly
     /// `chunk_rows` long (no appending after a short tail); new chunk length is
@@ -235,47 +324,69 @@ impl ColumnStore {
             );
         }
         self.base_chunks.push(base);
-        self.overlays.push(SparseOverlay::new());
+        self.user_overlays.push(SparseOverlay::new());
+        self.computed_overlays.push(SparseOverlay::new());
     }
 
     /// Borrow a chunk's base array. Useful for direct kernel access on the hot path.
     ///
-    /// **Important:** callers using this for COMPUTE must merge the corresponding overlay
-    /// (`self.overlay(chunk_idx)`) — `base_chunk` alone returns stale data when the overlay
-    /// has edits. Prefer [`Self::iter_chunks`] which returns both together.
+    /// **Important:** callers using this for COMPUTE must merge BOTH overlays via the
+    /// public read cascade (`Self::read`) — `base_chunk` alone returns stale data when the
+    /// overlays have edits. Prefer [`Self::iter_chunks`] which returns the tuple of
+    /// `(base, user_overlay, computed_overlay)`.
     pub fn base_chunk(&self, chunk_idx: usize) -> Option<&ArrayRef> {
         self.base_chunks.get(chunk_idx)
     }
 
-    /// Borrow a chunk's overlay. Useful for compaction passes that re-materialize base+overlay.
-    pub fn overlay(&self, chunk_idx: usize) -> Option<&SparseOverlay> {
-        self.overlays.get(chunk_idx)
+    /// Borrow a chunk's USER overlay. Useful for compaction passes that re-materialize
+    /// base+overlay. Phase 3.5: this is the user-typed-values lane only; computed-overlay
+    /// access is `computed_overlay(chunk_idx)`.
+    pub fn user_overlay(&self, chunk_idx: usize) -> Option<&SparseOverlay> {
+        self.user_overlays.get(chunk_idx)
     }
 
-    /// Iterate `(chunk_idx, &base_array, &overlay)` for every chunk.
+    /// Borrow a chunk's COMPUTED overlay (formula outputs). Phase 3.5 addition.
+    pub fn computed_overlay(&self, chunk_idx: usize) -> Option<&SparseOverlay> {
+        self.computed_overlays.get(chunk_idx)
+    }
+
+    /// Compat alias for `user_overlay` — pre-Phase 3.5 callers asked for "the overlay";
+    /// post-3.5 there are two, and the user lane is what most callers want (compaction
+    /// of authored values). Kept to ease the migration. New code should call
+    /// `user_overlay` or `computed_overlay` explicitly.
+    #[deprecated(note = "Phase 3.5 split the overlay; use `user_overlay` or `computed_overlay`")]
+    pub fn overlay(&self, chunk_idx: usize) -> Option<&SparseOverlay> {
+        self.user_overlay(chunk_idx)
+    }
+
+    /// Iterate `(chunk_idx, &base_array, &user_overlay, &computed_overlay)` for every
+    /// chunk. Phase 3.5 added the computed-overlay element.
     ///
     /// **The calcgraph + executor hot path uses this.** Per codex r13 N1 + opus arch F8:
-    /// reading `base_chunk(idx)` alone bypasses overlay edits silently. This iterator hands
-    /// both to the caller as a tuple so chunk-level kernels can merge them correctly.
+    /// reading `base_chunk(idx)` alone bypasses overlay edits silently. This iterator
+    /// hands all three to the caller so chunk-level kernels can merge them correctly.
     ///
     /// Example pattern (Week 3 ql-calcgraph + Week 4 ql-exec):
     /// ```text
-    /// for (chunk_idx, base, overlay) in column.iter_chunks() {
+    /// for (chunk_idx, base, user, computed) in column.iter_chunks() {
     ///     for rel_row in 0..base.len() as RowId {
-    ///         let value = match overlay.get(rel_row) {
-    ///             Some(v) => v.clone(),
-    ///             None => read_base_cell(base, rel_row),  // your own kernel
-    ///         };
+    ///         let value = user.get(rel_row)
+    ///             .or_else(|| computed.get(rel_row))
+    ///             .cloned()
+    ///             .unwrap_or_else(|| read_base_cell(base, rel_row));
     ///         // ... compute on value
     ///     }
     /// }
     /// ```
-    pub fn iter_chunks(&self) -> impl Iterator<Item = (usize, &ArrayRef, &SparseOverlay)> + '_ {
+    pub fn iter_chunks(
+        &self,
+    ) -> impl Iterator<Item = (usize, &ArrayRef, &SparseOverlay, &SparseOverlay)> + '_ {
         self.base_chunks
             .iter()
-            .zip(self.overlays.iter())
+            .zip(self.user_overlays.iter())
+            .zip(self.computed_overlays.iter())
             .enumerate()
-            .map(|(idx, (base, overlay))| (idx, base, overlay))
+            .map(|(idx, ((base, user), computed))| (idx, base, user, computed))
     }
 
     /// Locate `(chunk_idx, rel_row)` for an absolute `row`.
@@ -440,7 +551,7 @@ mod tests {
     // -- FIX-3: N1/F8 — iter_chunks API ---
 
     #[test]
-    fn iter_chunks_walks_all_chunks_with_overlay() {
+    fn iter_chunks_walks_all_chunks_with_overlays() {
         let mut c = ColumnStore::from_chunks(
             4,
             vec![
@@ -448,19 +559,23 @@ mod tests {
                 float64_chunk(&[5.0, 6.0, 7.0, 8.0]),
             ],
         );
-        // Edit row 2 (chunk 0, rel_row 2) via overlay.
+        // User edit at row 2; computed write at row 6.
         c.put(2, Value::Number(99.0));
-        // Walk via iter_chunks.
+        c.put_computed(6, Value::Number(77.0));
         let chunks: Vec<_> = c.iter_chunks().collect();
         assert_eq!(chunks.len(), 2);
-        let (idx0, _base0, overlay0) = chunks[0];
-        let (idx1, _base1, overlay1) = chunks[1];
+        let (idx0, _base0, user0, comp0) = chunks[0];
+        let (idx1, _base1, user1, comp1) = chunks[1];
         assert_eq!(idx0, 0);
         assert_eq!(idx1, 1);
-        // Overlay 0 has the edit; overlay 1 doesn't.
-        assert_eq!(overlay0.len(), 1);
-        assert_eq!(overlay0.get(2), Some(&Value::Number(99.0)));
-        assert_eq!(overlay1.len(), 0);
+        // Chunk 0: user has the edit; computed empty.
+        assert_eq!(user0.len(), 1);
+        assert_eq!(user0.get(2), Some(&Value::Number(99.0)));
+        assert_eq!(comp0.len(), 0);
+        // Chunk 1: computed has the formula output; user empty.
+        assert_eq!(user1.len(), 0);
+        assert_eq!(comp1.len(), 1);
+        assert_eq!(comp1.get(2), Some(&Value::Number(77.0)));
     }
 
     // -- ColumnStore construction ----------------------------------------------
@@ -479,7 +594,8 @@ mod tests {
         let c = ColumnStore::from_chunks(4, vec![float64_chunk(&[1.0, 2.0, 3.0, 4.0])]);
         assert_eq!(c.chunk_count(), 1);
         assert_eq!(c.row_count(), 4);
-        assert_eq!(c.overlay(0).unwrap().len(), 0);
+        assert_eq!(c.user_overlay(0).unwrap().len(), 0);
+        assert_eq!(c.computed_overlay(0).unwrap().len(), 0);
     }
 
     // -- read base path --------------------------------------------------------
@@ -575,7 +691,8 @@ mod tests {
         // Overlay is cleared; new base shows through.
         assert_eq!(c.read(2), Value::Number(300.0));
         assert_eq!(c.read(0), Value::Number(100.0));
-        assert_eq!(c.overlay(0).unwrap().len(), 0);
+        assert_eq!(c.user_overlay(0).unwrap().len(), 0);
+        assert_eq!(c.computed_overlay(0).unwrap().len(), 0);
     }
 
     // -- locate ----------------------------------------------------------------
@@ -662,5 +779,91 @@ mod tests {
             let c = ColumnStore::with_chunk_rows(16);
             prop_assert_eq!(c.read(row), Value::Blank);
         }
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 3.5 (W5-38) — overlay separation invariants (CORR-25).
+    // ----------------------------------------------------------------
+
+    /// Phase 3.5 cascade order: user-overlay wins over computed-overlay
+    /// which wins over base.
+    #[test]
+    fn read_cascade_user_then_computed_then_base() {
+        let mut c = ColumnStore::from_chunks(8, vec![float64_chunk(&[1.0; 8])]);
+        // Base only: read returns base.
+        assert_eq!(c.read(0), Value::Number(1.0));
+        // Computed wins over base.
+        c.put_computed(0, Value::Number(7.0));
+        assert_eq!(c.read(0), Value::Number(7.0));
+        // User wins over computed.
+        c.put(0, Value::Number(42.0));
+        assert_eq!(c.read(0), Value::Number(42.0));
+    }
+
+    /// `put` (user edit) clears any prior computed entry at the row so a
+    /// fresh user edit isn't shadowed by stale formula output. Phase 3.5.
+    #[test]
+    fn put_user_clears_computed_at_same_row() {
+        let mut c = ColumnStore::from_chunks(4, vec![float64_chunk(&[0.0; 4])]);
+        c.put_computed(2, Value::Number(99.0));
+        assert_eq!(
+            c.computed_overlay(0).unwrap().get(2),
+            Some(&Value::Number(99.0))
+        );
+        c.put(2, Value::Number(7.0));
+        // Computed at row 2 wiped; user has 7.
+        assert_eq!(c.computed_overlay(0).unwrap().get(2), None);
+        assert_eq!(c.user_overlay(0).unwrap().get(2), Some(&Value::Number(7.0)));
+        // Other computed entries are untouched.
+        c.put_computed(3, Value::Number(11.0));
+        c.put(2, Value::Number(8.0));
+        assert_eq!(
+            c.computed_overlay(0).unwrap().get(3),
+            Some(&Value::Number(11.0))
+        );
+    }
+
+    /// `put_computed` enforces the inverse invariant — writing a formula
+    /// output clears any stale user entry at the same row (which would
+    /// otherwise mask the new computed via the read cascade). Phase 3.5.
+    #[test]
+    fn put_computed_clears_user_at_same_row() {
+        let mut c = ColumnStore::from_chunks(4, vec![float64_chunk(&[0.0; 4])]);
+        c.put(1, Value::Number(50.0));
+        c.put_computed(1, Value::Number(99.0));
+        assert_eq!(c.user_overlay(0).unwrap().get(1), None);
+        assert_eq!(
+            c.computed_overlay(0).unwrap().get(1),
+            Some(&Value::Number(99.0))
+        );
+        assert_eq!(c.read(1), Value::Number(99.0));
+    }
+
+    /// `clear_computed` removes the computed entry without touching user.
+    #[test]
+    fn clear_computed_drops_only_computed_lane() {
+        let mut c = ColumnStore::from_chunks(4, vec![float64_chunk(&[0.0; 4])]);
+        c.put(1, Value::Number(50.0));
+        c.put_computed(2, Value::Number(99.0));
+        c.clear_computed(2);
+        assert_eq!(c.computed_overlay(0).unwrap().get(2), None);
+        assert_eq!(
+            c.user_overlay(0).unwrap().get(1),
+            Some(&Value::Number(50.0))
+        );
+    }
+
+    /// `replace_chunk` clears BOTH overlays (the new base subsumes
+    /// everything that lived in either lane). Phase 3.5 extension.
+    #[test]
+    fn replace_chunk_clears_both_overlays() {
+        let mut c = ColumnStore::from_chunks(4, vec![float64_chunk(&[1.0, 2.0, 3.0, 4.0])]);
+        c.put(0, Value::Number(100.0));
+        c.put_computed(1, Value::Number(200.0));
+        c.replace_chunk(0, float64_chunk(&[10.0, 20.0, 30.0, 40.0]));
+        assert_eq!(c.user_overlay(0).unwrap().len(), 0);
+        assert_eq!(c.computed_overlay(0).unwrap().len(), 0);
+        assert_eq!(c.read(0), Value::Number(10.0));
+        assert_eq!(c.read(1), Value::Number(20.0));
     }
 }
