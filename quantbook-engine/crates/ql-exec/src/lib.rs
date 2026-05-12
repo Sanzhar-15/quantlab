@@ -29,6 +29,7 @@ pub mod env;
 pub mod loader;
 pub mod lower;
 pub mod plan;
+pub mod plan_cache;
 pub mod scalar;
 pub mod simd;
 pub mod transaction;
@@ -38,6 +39,7 @@ pub use env::{CellEnv, MapEnv, WorkbookEnv};
 pub use loader::load_workbook_and_recompute;
 pub use lower::{classify, dispatch, SimdShape};
 pub use plan::{bind, bind_with_names, BindError, ExprPlan, NameLookup, ResolvedName};
+pub use plan_cache::{PlanCache, PlanCacheKey, PlanCacheStats};
 pub use scalar::{eval_scalar, eval_scalar_with_registry};
 pub use simd::{
     // Phase 2A.13 audit cycle-3 M9: `div_array` removed (was dead code after

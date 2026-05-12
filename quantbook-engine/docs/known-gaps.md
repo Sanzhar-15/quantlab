@@ -14,7 +14,7 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 |---|---|---|---|---|
 | GAP-R-01 | `recompute_all` walks formulas in `HashMap`-arbitrary order; dependency chains may compute stale values mid-recompute | `ql-exec/src/workbook_runtime.rs:316-345` — see comment "Iteration order is HashMap-arbitrary" | Engine | Engine Phase 3 (graph-driven recompute) |
 | GAP-R-02 | `recompute_all` short-circuits on first failure (no partial-state visibility, no per-cell error tracking) | `ql-exec/src/workbook_runtime.rs::recompute_all` returns `Result<usize, RuntimeError>` | Engine | Engine Phase 2B.2 (`RecomputeResult` contract) |
-| GAP-R-03 | Bind-plan re-derived from formula text on every recompute (lex + parse + bind cost paid N times) | `ql-exec/src/workbook_runtime.rs::recompute_all` calls `lex` → `parse` → `bind_with_names` per formula | Engine | Engine Phase 2B.3 (bind-plan cache V0) |
+| ~~GAP-R-03~~ | ~~Bind-plan re-derived from formula text on every recompute~~ — **CLOSED** in commit-after-393ce2f765f (Engine Phase 2B.3): `PlanCache` keyed by `(formula_text, sheet, name_gen)` on the runtime; `recompute_all` second-pass is all hits; name mutations bump generation and invalidate; counters exposed via `runtime.cache_stats()` + `Timings::bind_plan_cache_hits/misses`. |
 | GAP-R-04 | Volatile functions (`NOW`, `RAND`, `TODAY`) parse but have no invalidation model | `ql-functions/src/registry.rs` registers volatile fns; no dirty propagation on recompute cycle | Engine | Engine Phase 3.7 (volatile invalidation) |
 | GAP-R-05 | Value-equality short-circuit not implemented; unchanged upstream still dirties downstream | None — pure missing optimization | Engine | Engine Phase 3.8 |
 
@@ -120,7 +120,7 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 
 ## Closed gaps
 
-(none yet — populate as gaps are closed and reference the closing commit.)
+- **GAP-R-03** (bind-plan re-derivation) — closed in Engine Phase 2B.3. See struck-through entry above for the closing summary.
 
 ---
 

@@ -37,6 +37,9 @@ thiserror         = { workspace = true }
 proptest  = { workspace = true }
 criterion = { workspace = true }
 tempfile  = { workspace = true }
+# Phase 2B.3: BPC-04 test wires bind-plan-cache stats into Timings to prove
+# the visibility contract.
+ql-profile = { path = "../ql-profile" }
 
 # Phase 0 OG-02 hot path bench (Week 4 acceptance run).
 [[bench]]

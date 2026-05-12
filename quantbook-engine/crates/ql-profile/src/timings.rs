@@ -28,6 +28,13 @@
 use serde::Serialize;
 
 /// Timing snapshot for a single evaluation pass. Default = all-zero (no eval run yet).
+///
+/// Phase 2B.3 (2026-05-12) added `bind_plan_cache_hits` /
+/// `bind_plan_cache_misses` for the runtime's bind-plan cache (see
+/// `ql_exec::PlanCache`). These are DISTINCT from
+/// `fingerprint_cache_hits/misses` which track the future Engine Phase 3
+/// formula-region fingerprint cache; both fields coexist so JSON consumers
+/// can compare cache effectiveness across layers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Timings {
     /// Total wall-clock for the last `recompute()` call, microseconds.
@@ -35,9 +42,19 @@ pub struct Timings {
     /// Time attributed per node variant during the last eval.
     pub recompute_us_by_node_type: NodeTypeTimings,
     /// Count of formula-region fingerprint cache hits during the last eval.
+    /// Surfaces the Engine Phase 3 calcgraph cache (not yet wired).
     pub fingerprint_cache_hits: u64,
     /// Count of formula-region fingerprint cache misses during the last eval.
     pub fingerprint_cache_misses: u64,
+    /// Phase 2B.3: cumulative bind-plan cache hits since the
+    /// `WorkbookRuntime` was constructed. Skips lex/parse/bind on
+    /// formula text that was bound earlier under the same NameTable
+    /// generation. See `ql_exec::PlanCache` and `WorkbookRuntime::cache_stats`.
+    pub bind_plan_cache_hits: u64,
+    /// Phase 2B.3: cumulative bind-plan cache misses. Each miss corresponds
+    /// to a lex+parse+bind that DID run (because no entry existed yet, or
+    /// the NameTable generation changed since the prior bind).
+    pub bind_plan_cache_misses: u64,
     /// Count of SIMD kernel dispatches during the last eval.
     pub simd_dispatch_count: u64,
     /// Count of scalar evaluator calls during the last eval.
@@ -56,6 +73,18 @@ impl Timings {
             None
         } else {
             Some((self.fingerprint_cache_hits as f64) / (total as f64))
+        }
+    }
+
+    /// Phase 2B.3: bind-plan cache hit rate. `None` when no bind-plan
+    /// lookups have happened (typically: an empty workbook never invoked
+    /// recompute / set_formula). Otherwise a fraction in `[0.0, 1.0]`.
+    pub fn bind_plan_cache_hit_rate(&self) -> Option<f64> {
+        let total = self.bind_plan_cache_hits + self.bind_plan_cache_misses;
+        if total == 0 {
+            None
+        } else {
+            Some((self.bind_plan_cache_hits as f64) / (total as f64))
         }
     }
 
@@ -163,5 +192,16 @@ mod tests {
         t.fingerprint_cache_hits = 0;
         t.fingerprint_cache_misses = 10;
         assert_eq!(t.fingerprint_cache_hit_rate(), Some(0.0));
+    }
+
+    #[test]
+    fn bind_plan_cache_hit_rate_independent_of_fingerprint_cache() {
+        let mut t = Timings::new();
+        assert_eq!(t.bind_plan_cache_hit_rate(), None);
+        t.bind_plan_cache_hits = 9;
+        t.bind_plan_cache_misses = 1;
+        assert_eq!(t.bind_plan_cache_hit_rate(), Some(0.9));
+        // Fingerprint cache rate stays None since those counters are 0.
+        assert_eq!(t.fingerprint_cache_hit_rate(), None);
     }
 }

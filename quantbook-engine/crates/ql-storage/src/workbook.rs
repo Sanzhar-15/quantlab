@@ -49,9 +49,20 @@ pub enum NamedTarget {
 /// belt-and-suspenders entry point for callers that bypass the parser
 /// canonicalization. Sheet-scope names (Excel's `Sheet1!Local`) are deferred to
 /// Phase 3+ ql-formula-semantics.
+///
+/// ## Generation counter (Phase 2B.3)
+///
+/// `generation` is bumped on every successful `set` / `clear`. Bind-plan
+/// caches in `ql-exec` key cached plans by `(formula_text, sheet,
+/// generation)` so a name registration / rename invalidates affected plans
+/// without an explicit cache-flush call — the next lookup just misses.
 #[derive(Clone, Debug, Default)]
 pub struct NameTable {
     entries: HashMap<Arc<str>, NamedTarget>,
+    /// Monotonic counter bumped on every successful mutation. See struct
+    /// docs for the cache-invalidation contract. Wraps at u64::MAX (4×10^18
+    /// mutations — not a realistic concern).
+    generation: u64,
 }
 
 /// Errors emitted by `NameTable::set` when a registration is refused.
@@ -109,6 +120,10 @@ impl NameTable {
             return Err(NameTableError::Reserved(upper));
         }
         self.entries.insert(upper, target);
+        // Phase 2B.3: bump generation so bind-plan caches keyed by the prior
+        // generation miss on next lookup. wrapping_add so we never panic on
+        // u64::MAX (practically unreachable but defensive).
+        self.generation = self.generation.wrapping_add(1);
         Ok(())
     }
 
@@ -116,7 +131,19 @@ impl NameTable {
     /// match the on-write canonicalization. Idempotent.
     pub fn clear(&mut self, name: &str) {
         let upper = name.to_ascii_uppercase();
-        self.entries.remove(upper.as_str());
+        // Only bump generation if a binding was actually removed — idempotent
+        // no-op clears don't invalidate any cache.
+        if self.entries.remove(upper.as_str()).is_some() {
+            self.generation = self.generation.wrapping_add(1);
+        }
+    }
+
+    /// Phase 2B.3 (2026-05-12): monotonic generation counter, bumped on every
+    /// successful `set` / `clear`. Bind-plan caches in `ql-exec` key cached
+    /// plans by `(formula_text, sheet, generation)` so a name mutation
+    /// invalidates affected plans on next lookup without an explicit flush.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Look up a name. Case-sensitive on the canonical-uppercase form — used
