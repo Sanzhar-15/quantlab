@@ -12,11 +12,12 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 
 | ID | Gap | Reproduce | Owner | Target phase |
 |---|---|---|---|---|
-| GAP-R-01 | `recompute_all` walks formulas in `HashMap`-arbitrary order; dependency chains may compute stale values mid-recompute | `ql-exec/src/workbook_runtime.rs:316-345` — see comment "Iteration order is HashMap-arbitrary" | Engine | Engine Phase 3 (graph-driven recompute) |
-| GAP-R-02 | `recompute_all` short-circuits on first failure (no partial-state visibility, no per-cell error tracking) | `ql-exec/src/workbook_runtime.rs::recompute_all` returns `Result<usize, RuntimeError>` | Engine | Engine Phase 2B.2 (`RecomputeResult` contract) |
-| ~~GAP-R-03~~ | ~~Bind-plan re-derived from formula text on every recompute~~ — **CLOSED** in commit-after-393ce2f765f (Engine Phase 2B.3): `PlanCache` keyed by `(formula_text, sheet, name_gen)` on the runtime; `recompute_all` second-pass is all hits; name mutations bump generation and invalidate; counters exposed via `runtime.cache_stats()` + `Timings::bind_plan_cache_hits/misses`. |
+| GAP-R-01 | `recompute_all` walks formulas in `HashMap`-arbitrary order; dependency chains may compute stale values mid-recompute | `ql-exec/src/workbook_runtime.rs::recompute_all` (see "Iteration order is HashMap-arbitrary" comment) | Engine | Engine Phase 3 (graph-driven recompute) |
+| ~~GAP-R-02~~ | ~~`recompute_all` short-circuits on first failure~~ — **CLOSED** in Engine Phase 2B.2 (commit `393ce2f765f`): replaced with `RecomputeResult` aggregating per-cell failures. |
+| ~~GAP-R-03~~ | ~~Bind-plan re-derived from formula text on every recompute~~ — **CLOSED** in Engine Phase 2B.3 (commit `bd3147a1045`): `PlanCache` keyed by `(formula_text, sheet, name_gen)` on the runtime; `recompute_all` second-pass is all hits; name mutations bump generation and invalidate; counters exposed via `runtime.cache_stats()` + `Timings::bind_plan_cache_hits/misses`. |
 | GAP-R-04 | Volatile functions (`NOW`, `RAND`, `TODAY`) parse but have no invalidation model | `ql-functions/src/registry.rs` registers volatile fns; no dirty propagation on recompute cycle | Engine | Engine Phase 3.7 (volatile invalidation) |
 | GAP-R-05 | Value-equality short-circuit not implemented; unchanged upstream still dirties downstream | None — pure missing optimization | Engine | Engine Phase 3.8 |
+| GAP-R-06 | `PlanCache` lives on `WorkbookRuntime`, which is per-edit. The documented IDE pattern drops the runtime after each edit → drops the cache. Phase 2B.3 cache observability is real only across one long-lived runtime/recompute block. | `ql-exec/src/workbook_runtime.rs::WorkbookRuntime` + `docs/architecture/ide-consumer-contract.md` §1 | Engine | Engine Phase 6.1 (`WorkbookSession`) moves cache ownership to the session. |
 
 ### Bind / semantics
 
@@ -35,8 +36,9 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 | ~~GAP-O-01~~ | ~~`Workbook::set_name` bypass~~ — **CLOSED** in commit-after-f64ff00dcb1 (Engine Phase 2B.5): `WorkbookRuntime::set_name` wrapper emits `Op::SetName`; `Workbook::set_name` doc-marked as low-level. Mutate-first ordering guards against ghost-op-on-reserved-name. |
 | ~~GAP-O-02~~ | ~~`Workbook::add_sheet` bypass~~ — **CLOSED** in commit-after-f64ff00dcb1: `WorkbookRuntime::add_sheet(name, chunk_rows)` wrapper emits `Op::AddSheet`. Direct `Workbook::add_sheet` / `add_sheet_with_chunk_rows` doc-marked as low-level (used by qbook loader). |
 | ~~GAP-O-03~~ | ~~Direct `put_at` / `clear_formula` bypass~~ — **CLOSED** in commit-after-f64ff00dcb1: `WorkbookRuntime::clear_formula` wrapper emits `Op::PutValue(current) + Op::ClearFormula` (preserves "strip formula, keep value" semantic across replay). Direct `Workbook::put_at` / `clear_formula` doc-marked as low-level. `Workbook::put_at` remains pub for the qbook loader + runtime-internal recompute pass 2 + tests; product code routes through `WorkbookRuntime::set_value`. |
-| GAP-O-04 | `set_value(Value::Blank)` emits no `PutValue` (CellWireValue lacks Blank variant) — documented limitation | `ql-exec/src/workbook_runtime.rs::set_value` comment cites this | Engine | Engine Phase 5 (CRDT model) or earlier if forced |
+| GAP-O-04 | `set_value(Value::Blank)` emits no `PutValue` (CellWireValue lacks Blank variant). `clear_formula` has the same Blank-skip behavior on the preserved-value op. Documented limitation. | `ql-exec/src/workbook_runtime.rs::set_value` + `::clear_formula` comments | Engine | Engine Phase 5 (CRDT model) or earlier if forced |
 | GAP-O-05 | NaN / Inf in `PutValue` — `serde_json` refuses; surfaces as `RuntimeError::OpLog` | `ql-oplog/src/log.rs::append` serialization path | Engine | Engine Phase 5 or earlier |
+| GAP-O-06 | Op log has no compaction/truncation strategy — unbounded growth on edit-heavy workbooks. Loro snapshot export compresses but retains full history. | `ql-oplog/src/log.rs` (no compaction API); no compaction in any MASTER-PLAN phase | Engine | Engine Phase 5 (CRDT collab re-examines op-log model) |
 
 ### Storage
 
@@ -99,6 +101,7 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 | GAP-PS-06 | `ql-ai` (real AI() provider) stub; `AI()` returns AINotAvailable sentinel | `ql-ai/src/lib.rs:15`; `ql-functions::registry::AI` returns `Value::Error(ErrorValue::AINotAvailable)` | Engine | Engine Phase 6.6 |
 | GAP-PS-07 | `ql-service` (engine-as-service transport) stub | `ql-service/src/lib.rs` | Engine | Engine Phase 6.2 |
 | GAP-PS-08 | `ql-terminal` crate exists; product fit unclear (terminal-side surface for Delta Plus?) | `ql-terminal/src/lib.rs` | Product | Decide by Phase 6 entry |
+| GAP-PS-09 | `WorkbookRuntime<'a>` carries lifetime parameters; Node-API / WASM bindings can't safely wrap it in a long-lived JS object. Need a `WorkbookSession` owning wb + oplog + registry + plan_cache without lifetimes. | `ql-exec/src/workbook_runtime.rs::WorkbookRuntime` (`<'a>` parameter) | Engine | Engine Phase 6.1 (Stable Engine Session API). Subsumes GAP-R-06. |
 
 ### IDE integration
 
@@ -107,7 +110,8 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 | GAP-I-01 | TypeScript-side `extensions/quantlab/` has never been exercised against the engine — separate worktree work. Engine side: contract + simulation **CLOSED** in Engine Phase 2B.6 (commit-after-66bbbddc3d9); see `docs/architecture/ide-consumer-contract.md` and `crates/ql-exec/tests/ide_simulation.rs`. TypeScript-side work belongs in the `quantlab/` main checkout. | `extensions/quantlab/` empty re: engine bindings | IDE worktree | Phase 2B.6 IDE side (separate session) |
 | ~~GAP-I-02~~ | ~~No engine-side IDE-consumption test harness~~ — **CLOSED** in Engine Phase 2B.6: `crates/ql-exec/tests/ide_simulation.rs` (~270 lines, 7 tests) exercises the engine through the exact call pattern an IDE would use. Each test pins one IDE-2B-0N acceptance item. |
 | GAP-I-03 | Diagnostic shape adequate but not exhaustive — error `Display` strings are user-facing per Phase 2A.11 audit M16 but lack span info (parser error doesn't say WHERE in the formula). | `RuntimeError::Display` outputs lack source position | Engine | Phase 2B.6 follow-up + Phase 7.4 (IDE polish) |
-| GAP-I-04 | No "dry-run" formula validation API. IDE wants on-keystroke validation; currently has to call `set_formula` which commits. Add `WorkbookRuntime::validate_formula(sheet, row, col, text) -> Result<Value, RuntimeError>` that runs lex+parse+bind+eval without persisting. | Absence | Engine | Phase 2B.6 follow-up (cheap) or Engine Phase 6.1 (Session API) |
+| ~~GAP-I-04~~ | ~~No dry-run formula validation API~~ — **CLOSED** in Engine Phase 2B.7 audit closure: `WorkbookRuntime::validate_formula(sheet, row, col, text) -> Result<Value, RuntimeError>` runs the full lex/parse/bind/eval pipeline without mutating workbook, op log, or plan cache. IDE can call per-keystroke. |
+| GAP-I-05 | No cancellation API on long-running engine operations (`recompute_all`, `transaction::commit`, future `replay_into`). For 1k-formula workbooks instant; for 100k+ blocks the binding thread. | `ql-exec/src/workbook_runtime.rs::recompute_all` (no `CancelToken` parameter) | Engine | Engine Phase 6.1 (Session API + cancellation) |
 
 ### Documentation
 
@@ -121,9 +125,12 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 
 ## Closed gaps
 
-- **GAP-R-03** (bind-plan re-derivation) — closed in Engine Phase 2B.3. See struck-through entry above for the closing summary.
-- **GAP-O-01 / GAP-O-02 / GAP-O-03** (op-log producer bypasses for set_name / add_sheet / put_at + clear_formula) — closed in Engine Phase 2B.5. Runtime wrappers route through the op log; direct Workbook methods doc-marked as low-level. Producer-replay equivalence covers the full Op vocabulary (PutValue, PutFormula, ClearFormula, SetName, AddSheet, BatchCommit).
-- **GAP-I-02** (engine-side IDE-consumption test harness) — closed in Engine Phase 2B.6 (engine side). See struck-through entry above.
+- **GAP-R-02** (recompute_all short-circuit) — closed in Engine Phase 2B.2.
+- **GAP-R-03** (bind-plan re-derivation) — closed in Engine Phase 2B.3.
+- **GAP-O-01 / GAP-O-02 / GAP-O-03** (op-log producer bypasses for set_name / add_sheet / put_at + clear_formula) — closed in Engine Phase 2B.5.
+- **GAP-I-02** (engine-side IDE-consumption test harness) — closed in Engine Phase 2B.6.
+- **GAP-I-04** (no dry-run formula validation API) — closed in Engine Phase 2B.7 audit closure: `WorkbookRuntime::validate_formula`.
+- **Phase 2B.7 audit-closure fixes** (correctness): orphan op-log entries on `add_sheet`(chunk_rows=0 / SheetId::MAX), `set_name` mutate-first divergence, `set_value` / `clear_formula` partial-pair non-atomicity, `transaction::commit` post-mutation log append. All fixed. `Workbook` and `OpLog` proven `Send + Sync` at compile time. See `docs/audits/2026-05-12-phase-2B.md`.
 
 ---
 

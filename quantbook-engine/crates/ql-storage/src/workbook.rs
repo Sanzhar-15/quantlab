@@ -146,6 +146,24 @@ impl NameTable {
         self.generation
     }
 
+    /// Phase 2B.7 audit H3 (2026-05-12): pre-check whether `set(name, _)`
+    /// would succeed without doing the mutation. Lets the `ql-exec`
+    /// `WorkbookRuntime::set_name` wrapper run validate-then-append-then-
+    /// mutate so a reserved-name rejection doesn't leave the workbook
+    /// either (a) modified with no op log entry, or (b) un-modified but
+    /// with an orphan op log entry.
+    ///
+    /// Returns `Ok(())` if a future `set(name, _)` will succeed,
+    /// `Err(NameTableError::Reserved(...))` otherwise. Pure: no
+    /// mutation, no generation bump.
+    pub fn would_accept(&self, name: &str) -> Result<(), NameTableError> {
+        let upper: Arc<str> = Arc::from(name.to_ascii_uppercase().as_str());
+        if is_reserved_name(&upper) {
+            return Err(NameTableError::Reserved(upper));
+        }
+        Ok(())
+    }
+
     /// Look up a name. Case-sensitive on the canonical-uppercase form — used
     /// by the parser-internal path where the query is already canonicalized.
     /// External callers should prefer `lookup_ci` unless they've already

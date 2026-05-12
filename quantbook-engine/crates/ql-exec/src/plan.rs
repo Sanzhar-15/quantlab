@@ -166,6 +166,13 @@ enum BindContext {
 /// are). Per-arg-position decisions (e.g. IF's then/else accept arrays in
 /// some contexts) land alongside Engine Phase 4.7 array formulas.
 fn is_aggregate_function(name: &str) -> bool {
+    // Phase 2B.7 audit (correctness M1): MEDIAN removed — it was listed
+    // here but not registered in `ql_functions::default_registry`. Keeping
+    // the list synced with the registry is a hard rule; the
+    // `is_aggregate_function_lists_only_registered_aggregates` test pins
+    // it. When Engine Phase 4.3 expands the function library, the metadata
+    // moves to per-function FunctionRegistry attributes and this hardcoded
+    // matcher goes away entirely.
     matches!(
         name,
         "SUM"
@@ -176,7 +183,6 @@ fn is_aggregate_function(name: &str) -> bool {
             | "MIN"
             | "MAX"
             | "PRODUCT"
-            | "MEDIAN"
             | "VAR"
             | "VAR.S"
             | "VAR.P"

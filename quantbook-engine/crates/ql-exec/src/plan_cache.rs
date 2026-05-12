@@ -130,9 +130,14 @@ impl PlanCache {
     }
 
     /// Insert a plan unconditionally (overwriting any existing entry for
-    /// the same key). Used by `WorkbookRuntime::set_formula` which has
-    /// already done the bind work — pre-warming the cache so a subsequent
-    /// `recompute_all` hits.
+    /// the same key). Available for callers that already bound the plan
+    /// out-of-band and want to pre-warm the cache.
+    ///
+    /// Phase 2B.7 audit (correctness L1 / D4): the prior doc-comment
+    /// claimed `WorkbookRuntime::set_formula` uses this method — it
+    /// doesn't (set_formula uses `get_or_insert`). No production caller
+    /// uses `insert` today; the method stays for tests and future pre-
+    /// warming callers (Phase 3 calcgraph integration may need it).
     pub fn insert(&mut self, key: PlanCacheKey, plan: Arc<ExprPlan>) {
         self.entries.insert(key, plan);
     }

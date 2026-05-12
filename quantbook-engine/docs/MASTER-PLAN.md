@@ -160,11 +160,11 @@ The full v1 means all of these crates either ship real behavior or have a docume
    Acceptance: BPC-01 repeated `recompute_all` does not re-lex/re-parse unchanged formulas; BPC-02 name changes invalidate affected plans; BPC-03 fingerprints remain stable; BPC-04 cache miss/hit counters visible in `ql-profile`.  
    Effort: 3-5 days.
 
-4. **2B.4 Named-Range Aggregate Context Prep**  
-   Move binder responsibilities that understand "scalar context" versus "aggregate context" into `ql-formula-semantics`. `SUM(Sales)` should bind to a typed unresolved aggregate-range plan shape instead of generic `UnsupportedVariant`; evaluation may still reject if not implemented.  
-   References: `.references/formualizer/crates/formualizer-workbook/tests/named_range_engine.rs`; `.references/formualizer/crates/formualizer-sheetport/src/resolver.rs`; `.references/hyperformula/src/NamedExpressions.ts`; `.references/hyperformula/src/parser/collectDependencies.ts`.  
-   Acceptance: NAG-01 named constants still work; NAG-02 named cell references still work; NAG-03 named ranges inside aggregate functions bind to an explicit plan variant; NAG-04 named ranges in scalar-only position produce a precise error.  
-   Effort: 3-4 days.
+4. **2B.4 Named-Range Aggregate Context Prep** ✅ SHIPPED (`f64ff00dcb1`)  
+   Bind `SUM(Sales)` to a typed `ExprPlan::AggregateNameRef { name, range }` instead of generic `UnsupportedVariant`; scalar-context misuse surfaces precise `BindError::NamedRangeInScalarContext`. Evaluation returns `#CALC!` for AggregateNameRef pending Phase 3.6. **Deviation from original plan:** the work stays in `ql-exec/src/plan.rs` rather than moving to `ql-formula-semantics`. The move was deferred because `ExprPlan` lives in `ql-exec`; relocating it cleanly requires Phase 3 calcgraph integration to land first (so the eventual home is `ql-formula-semantics` once ownership questions resolve). Tracked as a follow-up; not a 2B.4 blocker.  
+   References used: same as planned (formualizer + hyperformula).  
+   Acceptance shipped: NAG-01..04 + `nag_05_nested_aggregates_with_named_range_bind_cleanly` + `nag_06_round_with_nested_sum_of_named_range_binds_cleanly`.  
+   Effort actual: ~1 day (binder context threading + new variants + tests).
 
 5. **2B.5 Op-Log Producer Coverage Audit**  
    Close silent bypasses: `Workbook::set_name`, `Workbook::add_sheet`, and direct `put_at` paths either emit ops through a runtime/transaction facade or are marked low-level with tests proving callers cannot accidentally use them from product surfaces.  

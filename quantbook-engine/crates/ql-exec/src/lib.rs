@@ -1,29 +1,45 @@
 //! `ql-exec` — Quantbook expression executor.
 //!
-//! Module map (Phase 0 → Phase 2A):
+//! Module map (Phase 0 → Phase 2B):
 //!
-//! - `plan.rs` (Phase 0 W4-1; extended Phase 2A.1, .6) — `ExprPlan` IR;
-//!   `bind` / `bind_with_names` resolvers; `NameLookup` trait;
-//!   `BindError` variants including `UnresolvedName`, `NamedTargetIsBlank`,
-//!   `NamedTargetIsError`, `UnsupportedVariant`.
+//! - `plan.rs` (Phase 0 W4-1; extended Phase 2A.1, 2A.6, 2B.4) — `ExprPlan` IR
+//!   including the Phase 2B.4 `AggregateNameRef` variant; `bind` /
+//!   `bind_with_names` resolvers with Phase 2B.4 context-aware binding
+//!   (`BindContext` + `is_aggregate_function`); `NameLookup` trait;
+//!   `BindError` variants including `UnresolvedName`,
+//!   `NamedTargetIs{Blank,Error}`, `NamedRangeInScalarContext`,
+//!   `NamedFormulaUnsupported`, `UnsupportedVariant`.
+//! - `plan_cache.rs` (Phase 2B.3) — bind-plan cache V0 keyed by
+//!   (formula text, sheet, NameTable generation); `PlanCache` lives on
+//!   `WorkbookRuntime`; `PlanCacheStats` for ql-profile observability.
 //! - `env.rs` (Phase 0) — `CellEnv` trait + `WorkbookEnv` / `MapEnv` impls;
-//!   `NameLookup for NameTable` bridge (Phase 2A.1; case-insensitive lookup
-//!   per Phase 2A.6 audit H2).
-//! - `scalar.rs` (Phase 0 W4-1) — `eval_scalar` per-cell evaluator with
-//!   Excel-compatible arithmetic, error propagation, coercion.
+//!   `NameLookup for NameTable` bridge.
+//! - `scalar.rs` (Phase 0 W4-1; extended Phase 2A.9, 2B.4) — `eval_scalar`
+//!   per-cell evaluator with Excel-canon arithmetic, error propagation,
+//!   coercion. `AggregateNameRef` evaluates to `#CALC!` pending Phase 3.6.
 //! - `simd.rs` (Phase 0 W4-2/W4-3) — `multiversion`-dispatched SIMD kernels;
 //!   OG-02 25M-cell hot path.
 //! - `lower.rs` (Phase 0) — `classify` + `dispatch` for the SIMD shape
 //!   heuristic.
-//! - `workbook_runtime.rs` (Phase 1 W5-10; extended Phase 2A.1, .6) —
-//!   `WorkbookRuntime` live-formula facade (lex → parse → bind → eval →
-//!   persist + recompute_all); `RuntimeError` family including
-//!   `InvalidSheet` and `ConflictingOps`.
-//! - `transaction.rs` (Phase 2A.2; hardened Phase 2A.6) —
-//!   `WorkbookTransaction` multi-cell batch API with two-pass commit,
-//!   eager validation, conflict detection.
-//! - `loader.rs` (Phase 2A.4) — `load_workbook_and_recompute` convenience
-//!   wrapping `ql_io::load_workbook` + `recompute_all`.
+//! - `workbook_runtime.rs` (Phase 1 W5-10; extended Phase 2A.1, 2A.3.b,
+//!   2A.6, 2B.2, 2B.3, 2B.5, 2B.7) — `WorkbookRuntime` live-formula facade
+//!   wrapping lex → parse → bind → eval → persist + recompute_all.
+//!   `RecomputeResult` aggregation (no more short-circuit). Op-log producer
+//!   wrappers (`set_name` / `add_sheet` / `clear_formula`) emit ops when
+//!   an `OpLog` is attached. Phase 2B.7 added `validate_formula` for IDE
+//!   on-keystroke validation and pre-validation guards on `add_sheet`.
+//!   `RuntimeError` family includes `InvalidSheet`, `InvalidCell`,
+//!   `ConflictingOps`, `OpLog`, `Name`, `InvalidChunkRows`, `TooManySheets`.
+//! - `transaction.rs` (Phase 2A.2; hardened Phase 2A.6, 2A.3.b, 2B.7) —
+//!   `WorkbookTransaction` multi-cell batch API with eager validation,
+//!   conflict detection. Phase 2B.7 reordered commit to append-first
+//!   (BatchCommit appended BEFORE workbook mutations) so a serialization
+//!   failure can't leave the workbook divergent from the log.
+//! - `loader.rs` (Phase 2A.4; reshaped Phase 2B.2) —
+//!   `load_workbook_and_recompute(path, &reg) -> Result<(Workbook,
+//!   RecomputeResult), QbookError>` convenience. Phase 2B.2 removed the
+//!   `LoadAndRecomputeError` wrapper enum; recompute failures are now
+//!   aggregated into the returned `RecomputeResult` instead.
 
 pub mod env;
 pub mod loader;
@@ -54,3 +70,15 @@ pub use simd::{
 };
 pub use transaction::WorkbookTransaction;
 pub use workbook_runtime::{RecomputeFailure, RecomputeResult, RuntimeError, WorkbookRuntime};
+
+/// Phase 2B.7 audit H3 (2026-05-12): compile-time proof that the two
+/// engine state types the IDE binding will own are `Send + Sync`. If Loro
+/// 1.x's `LoroDoc` (inside `OpLog`) loses `Sync` in a future version, or
+/// if a Workbook field gains an `Rc`, this fails at build — at the right
+/// time to fix it, not three days into Phase 6.3 binding work.
+#[allow(dead_code)]
+fn _assert_engine_state_is_send_sync() {
+    fn check<T: Send + Sync>() {}
+    check::<ql_storage::Workbook>();
+    check::<ql_oplog::OpLog>();
+}

@@ -269,28 +269,69 @@ impl<'a> WorkbookTransaction<'a> {
             oplog,
         } = self;
 
-        // Phase 2A.3.b: snapshot pre-existing formula presence for each
-        // PendingOp::Value BEFORE pass 1 overwrites it. The snapshot drives
-        // whether a `ClearFormula` op needs to land in the BatchCommit
-        // alongside the `PutValue` (so producer-replay equivalence holds
-        // even when a literal overwrites a formula cell). Computed here so
-        // pass 1 can still do the actual clearing without us losing the
-        // pre-write state.
-        let pre_commit_had_formula: Vec<bool> = if oplog.is_some() {
-            ops.iter()
-                .map(|op| match op {
+        // Phase 2B.7 audit H2/H4 (2026-05-12): build the log_ops list AND
+        // append the BatchCommit BEFORE the workbook mutation passes. The
+        // prior ordering (passes → append) left a divergence window where
+        // a serialization failure mid-append would leave the workbook
+        // fully mutated but the log without the BatchCommit. The new
+        // ordering: any failure aborts before workbook state changes.
+        //
+        // Snapshot `pre_commit_had_formula` for each Value op — needed to
+        // decide whether the BatchCommit's inner ops include a
+        // `ClearFormula` after the `PutValue`. Read from the current
+        // (pre-mutation) workbook state.
+        if let Some(oplog) = oplog {
+            let mut log_ops: Vec<Op> = Vec::with_capacity(ops.len() * 2);
+            for op in &ops {
+                match op {
                     PendingOp::Value {
-                        sheet, row, col, ..
-                    } => workbook.formula_at(*sheet, *row, *col).is_some(),
-                    _ => false,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+                        sheet,
+                        row,
+                        col,
+                        value,
+                    } => {
+                        if let Some(wire) = CellWireValue::from_value(value) {
+                            log_ops.push(Op::PutValue {
+                                sheet: *sheet,
+                                row: *row,
+                                col: *col,
+                                value: wire,
+                            });
+                        }
+                        let had_formula = workbook.formula_at(*sheet, *row, *col).is_some();
+                        if had_formula {
+                            log_ops.push(Op::ClearFormula {
+                                sheet: *sheet,
+                                row: *row,
+                                col: *col,
+                            });
+                        }
+                    }
+                    PendingOp::Formula {
+                        sheet,
+                        row,
+                        col,
+                        text,
+                        ..
+                    } => {
+                        log_ops.push(Op::PutFormula {
+                            sheet: *sheet,
+                            row: *row,
+                            col: *col,
+                            text: text.as_ref().to_owned(),
+                        });
+                    }
+                }
+            }
+            if !log_ops.is_empty() {
+                // Append BEFORE the passes. If this fails, no workbook
+                // mutation has happened.
+                oplog.append(Op::BatchCommit { ops: log_ops })?;
+            }
+        }
 
+        // Now safe to mutate: log has been durably appended (if attached).
         // Pass 1: apply literals + persist formula text. No formula eval yet.
-        // Iterating by reference so we can move ops into pass 2.
         for op in &ops {
             match op {
                 PendingOp::Value {
@@ -332,60 +373,6 @@ impl<'a> WorkbookTransaction<'a> {
                     eval_scalar_with_registry(plan, &env, registry)
                 };
                 workbook.put_at(*sheet, *row, *col, value);
-            }
-        }
-
-        // Phase 2A.3.b: emit a single `BatchCommit` capturing the transaction.
-        // Each `PendingOp::Value` becomes a `PutValue` (skipped if the wire
-        // value is None — Value::Blank case, see workbook_runtime docs) plus
-        // an optional `ClearFormula` when the cell had a formula before pass
-        // 1 ran. Each `PendingOp::Formula` becomes a `PutFormula` (text
-        // only; replay drives recompute_all to materialize values). An empty
-        // `log_ops` short-circuits — no point appending an empty BatchCommit.
-        if let Some(oplog) = oplog {
-            let mut log_ops: Vec<Op> = Vec::with_capacity(ops.len() * 2);
-            for (i, op) in ops.iter().enumerate() {
-                match op {
-                    PendingOp::Value {
-                        sheet,
-                        row,
-                        col,
-                        value,
-                    } => {
-                        if let Some(wire) = CellWireValue::from_value(value) {
-                            log_ops.push(Op::PutValue {
-                                sheet: *sheet,
-                                row: *row,
-                                col: *col,
-                                value: wire,
-                            });
-                        }
-                        if pre_commit_had_formula[i] {
-                            log_ops.push(Op::ClearFormula {
-                                sheet: *sheet,
-                                row: *row,
-                                col: *col,
-                            });
-                        }
-                    }
-                    PendingOp::Formula {
-                        sheet,
-                        row,
-                        col,
-                        text,
-                        ..
-                    } => {
-                        log_ops.push(Op::PutFormula {
-                            sheet: *sheet,
-                            row: *row,
-                            col: *col,
-                            text: text.as_ref().to_owned(),
-                        });
-                    }
-                }
-            }
-            if !log_ops.is_empty() {
-                oplog.append(Op::BatchCommit { ops: log_ops })?;
             }
         }
 

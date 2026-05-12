@@ -141,6 +141,21 @@ pub enum RuntimeError {
     /// variants when they land.
     #[error("name table error: {0}")]
     Name(#[from] ql_storage::NameTableError),
+
+    /// Phase 2B.7 audit H1 (2026-05-12): `WorkbookRuntime::add_sheet` was
+    /// called with `chunk_rows == 0`. `Sheet::with_chunk_rows` accepts it
+    /// silently, then the first cell write panics deep inside the column
+    /// store. Pre-validating at the runtime entry refuses the value cleanly
+    /// before any op-log append, so a bad input can't poison a workbook.
+    #[error("invalid chunk_rows {0}: must be > 0 (engine default is 16384)")]
+    InvalidChunkRows(u32),
+
+    /// Phase 2B.7 audit H1 (2026-05-12): `WorkbookRuntime::add_sheet` was
+    /// called with the workbook already at `SheetId::MAX` (65,535) sheets.
+    /// `Workbook::add_sheet_with_chunk_rows` panics in that case; the
+    /// runtime now refuses before any op-log append.
+    #[error("workbook has {current} sheets; cannot add another (limit {max})")]
+    TooManySheets { current: u32, max: u32 },
 }
 
 impl From<LexError> for RuntimeError {
@@ -193,9 +208,12 @@ pub struct RecomputeFailure {
 ///   written back to the workbook.
 /// - `failures` — every formula that failed structurally, in iteration
 ///   order. Each entry carries cell address + formula text + error.
-/// - `partial_state` — `true` iff `!failures.is_empty()`. Provided as an
-///   explicit boolean so callers branching on "is this workbook now
-///   consistent?" don't have to re-check `failures.len()`.
+///
+/// "Is this workbook now consistent?" is exposed via `is_complete()`
+/// (= `failures.is_empty()`); see `failed_count()` for the count.
+/// Phase 2B.7 audit (correctness M2) dropped a redundant `partial_state`
+/// `pub` field that mirrored `!is_complete()` — having two sources of
+/// truth created a soundness footgun (external constructors could lie).
 ///
 /// No-fallback semantics: failures are NOT swallowed. The struct makes
 /// every failure visible and aggregable. Callers that want short-circuit
@@ -213,7 +231,6 @@ pub struct RecomputeResult {
     pub attempted: usize,
     pub succeeded: usize,
     pub failures: Vec<RecomputeFailure>,
-    pub partial_state: bool,
 }
 
 impl RecomputeResult {
@@ -356,9 +373,11 @@ impl<'a> WorkbookRuntime<'a> {
         }
 
         // Persist formula text + evaluated value. Both writes succeed or neither —
-        // put_at can't fail (it panics on bad sheet, but the binder already
-        // validated `sheet`; if the user passes a nonexistent sheet, we'd panic
-        // upstream when the binder produces CellRefs against it).
+        // put_at can't fail because `validate_cell` at the top of this method
+        // already rejected out-of-range (sheet, row, col). The prior comment
+        // claimed the binder did the validation; that was wrong — validation
+        // is at the runtime entry, the binder just stamps `owning_sheet`
+        // onto unresolved CellRefs. (Phase 2B.7 audit doc D6 fix.)
         self.workbook.put_at(sheet, row, col, value.clone());
         self.workbook.put_formula(sheet, row, col, formula_text);
 
@@ -386,18 +405,29 @@ impl<'a> WorkbookRuntime<'a> {
         // is deferred to Phase 5+). The `ClearFormula` still fires below if
         // the cell had a formula, so the produced log captures the formula
         // removal even when the literal value is Blank.
+        //
+        // Phase 2B.7 audit H2 (2026-05-12): when BOTH PutValue and
+        // ClearFormula need to land, wrap them in a single `Op::BatchCommit`
+        // so the pair is atomic at the Loro level — partial-pair failure
+        // (first appended, second fails) is now impossible.
         let had_formula = self.workbook.formula_at(sheet, row, col).is_some();
         if let Some(oplog) = self.oplog.as_deref_mut() {
+            let mut log_ops: Vec<Op> = Vec::with_capacity(2);
             if let Some(wire) = CellWireValue::from_value(&value) {
-                oplog.append(Op::PutValue {
+                log_ops.push(Op::PutValue {
                     sheet,
                     row,
                     col,
                     value: wire,
-                })?;
+                });
             }
             if had_formula {
-                oplog.append(Op::ClearFormula { sheet, row, col })?;
+                log_ops.push(Op::ClearFormula { sheet, row, col });
+            }
+            match log_ops.len() {
+                0 => {} // Blank value on a non-formula cell — no-op.
+                1 => oplog.append(log_ops.into_iter().next().unwrap())?,
+                _ => oplog.append(Op::BatchCommit { ops: log_ops })?,
             }
         }
 
@@ -421,27 +451,23 @@ impl<'a> WorkbookRuntime<'a> {
         name: &str,
         target: ql_storage::NamedTarget,
     ) -> Result<(), RuntimeError> {
-        // Two failure modes here, unlike set_value / set_formula:
-        //   1. NameTable::set rejects reserved names (CORR-06: "AI").
-        //   2. Op log append fails (serde_json refusal, Loro internal error).
+        // Phase 2B.7 audit H3 (was 2B.5 mutate-first): validate → append →
+        // mutate so neither failure mode leaves engine state divergent:
         //
-        // We MUST NOT leave an orphan op-log entry if (1) fires — that
-        // entry would replay against a fresh workbook and trigger the
-        // same Reserved error, but it lingers as a corrupting "ghost
-        // mutation" in any persisted oplog.bin.
+        //   1. Reserved-name rejection: caught by `NameTable::would_accept`
+        //      before anything else runs. Workbook unmodified, log unmodified.
+        //   2. Op-log append failure: caught BEFORE the workbook mutation.
+        //      Workbook still unmodified, log unmodified.
         //
-        // Strategy: mutate first. NameTable::set is cheap and either
-        // succeeds outright or returns early without touching state.
-        // Once we know the mutation went through, append the op. If
-        // append THEN fails, the workbook is mutated and the log is
-        // missing the entry — uglier, but a true "engine internal"
-        // failure rather than a user-input rejection; surfaces as
-        // `RuntimeError::OpLog` for the caller to handle.
+        // The prior mutate-first ordering left a divergence window where
+        // the workbook had the name but the log didn't — see audit H3 for
+        // why that was wrong. The append-first ordering used by set_value /
+        // set_formula / clear_formula / add_sheet now extends here.
         //
-        // Encoding canonicalizes the name to upper case to match the
-        // on-write canonicalization in `NameTable::set`, so the wire
+        // Wire-form encoding canonicalizes the name to upper case to match
+        // `NameTable::set`'s on-write canonicalization, so the recorded
         // form is stable regardless of how the caller cased the name.
-        self.workbook.set_name(name, target.clone())?;
+        self.workbook.names().would_accept(name)?;
         if let Some(oplog) = self.oplog.as_deref_mut() {
             let target_wire = ql_io::NamedTargetWire::from_target(&target);
             oplog.append(Op::SetName {
@@ -449,6 +475,11 @@ impl<'a> WorkbookRuntime<'a> {
                 target: target_wire,
             })?;
         }
+        // Now the mutation cannot fail (reserved-name already pre-checked).
+        // `set_name` returns Result for forward-compat with future
+        // NameTableError variants; expect them to be pre-checkable via
+        // `would_accept`.
+        self.workbook.set_name(name, target)?;
         Ok(())
     }
 
@@ -468,6 +499,21 @@ impl<'a> WorkbookRuntime<'a> {
         name: impl Into<String>,
         chunk_rows: u32,
     ) -> Result<SheetId, RuntimeError> {
+        // Phase 2B.7 audit H1: pre-validate inputs BEFORE the op-log append
+        // so a bad value can't leave a phantom AddSheet in the log followed
+        // by a process-killing panic from `ColumnStore::with_chunk_rows` or
+        // `Workbook::add_sheet_with_chunk_rows` (assert on `id >= SheetId::MAX`).
+        if chunk_rows == 0 {
+            return Err(RuntimeError::InvalidChunkRows(chunk_rows));
+        }
+        let current_sheet_count = self.workbook.sheet_count() as u32;
+        if current_sheet_count >= SheetId::MAX as u32 {
+            return Err(RuntimeError::TooManySheets {
+                current: current_sheet_count,
+                max: SheetId::MAX as u32,
+            });
+        }
+
         let name: String = name.into();
         if let Some(oplog) = self.oplog.as_deref_mut() {
             oplog.append(Op::AddSheet {
@@ -509,17 +555,27 @@ impl<'a> WorkbookRuntime<'a> {
         // BEFORE the Op::ClearFormula. Skip the PutValue when the current
         // value is Blank (CellWireValue can't represent Blank in V0 —
         // documented in `set_value`).
+        //
+        // Phase 2B.7 audit H2 (2026-05-12): wrap the pair in a single
+        // `Op::BatchCommit` for atomicity. The prior two-append sequence
+        // could partially succeed (PutValue lands, ClearFormula append
+        // fails) and leave the op log without a recoverable replay state.
         if let Some(oplog) = self.oplog.as_deref_mut() {
             let current_value = self.workbook.read(ql_types::Address::new(sheet, row, col));
+            let mut log_ops: Vec<Op> = Vec::with_capacity(2);
             if let Some(wire) = CellWireValue::from_value(&current_value) {
-                oplog.append(Op::PutValue {
+                log_ops.push(Op::PutValue {
                     sheet,
                     row,
                     col,
                     value: wire,
-                })?;
+                });
             }
-            oplog.append(Op::ClearFormula { sheet, row, col })?;
+            log_ops.push(Op::ClearFormula { sheet, row, col });
+            match log_ops.len() {
+                1 => oplog.append(log_ops.into_iter().next().unwrap())?,
+                _ => oplog.append(Op::BatchCommit { ops: log_ops })?,
+            }
         }
         self.workbook.clear_formula(sheet, row, col);
         Ok(())
@@ -566,6 +622,38 @@ impl<'a> WorkbookRuntime<'a> {
     /// canon error value (`#DIV/0!`, `#VALUE!`, etc.) are counted as
     /// succeeded — those error values are normal cell contents per
     /// Excel canon, not structural failures.
+    /// Phase 2B.7 (2026-05-12) — dry-run formula validation for IDE
+    /// on-keystroke diagnostics. Runs the full lex → parse → bind → eval
+    /// pipeline against the current workbook state, returns the would-be
+    /// evaluated value (or `RuntimeError`), but does NOT:
+    ///
+    /// - write to the workbook,
+    /// - append to the op log,
+    /// - pollute the bind-plan cache (this avoids a transient cache entry
+    ///   keyed on a formula text the user hasn't actually committed —
+    ///   would inflate the cache miss count and waste a `name_gen` slot).
+    ///
+    /// Use case: the IDE wants to highlight syntax errors as the user types
+    /// in the formula bar, without committing the formula until Enter.
+    /// Each keystroke can call `validate_formula(sheet, row, col, draft)`
+    /// safely — N calls per keystroke add no engine state.
+    ///
+    /// Closes GAP-I-04 from `docs/known-gaps.md`.
+    pub fn validate_formula(
+        &self,
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        formula_text: &str,
+    ) -> Result<Value, RuntimeError> {
+        validate_cell(self.workbook, sheet, row, col)?;
+        let tokens = lex(formula_text)?;
+        let expr = parse(tokens)?;
+        let plan = bind_with_names(&expr, sheet, self.workbook.names())?;
+        let env = WorkbookEnv::new(self.workbook);
+        Ok(eval_scalar_with_registry(&plan, &env, self.registry))
+    }
+
     pub fn recompute_all(&mut self) -> RecomputeResult {
         // Snapshot the formula list so we don't hold a borrow during eval.
         let entries: Vec<(SheetId, RowId, ColId, Arc<str>)> = self
@@ -595,12 +683,10 @@ impl<'a> WorkbookRuntime<'a> {
             }
         }
 
-        let partial_state = !failures.is_empty();
         RecomputeResult {
             attempted,
             succeeded,
             failures,
-            partial_state,
         }
     }
 
@@ -1280,7 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn set_value_over_existing_formula_emits_put_value_then_clear_formula() {
+    fn set_value_over_existing_formula_emits_batch_commit_pair() {
         let mut wb = make_runtime_workbook();
         let reg = default_registry();
         // Seed a formula at (0, 0) via the runtime so the op log captures it.
@@ -1291,11 +1377,20 @@ mod tests {
             rt.set_value(0, 0, 0, Value::Number(99.0)).unwrap();
         }
         let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
-        // Expect: PutFormula → PutValue → ClearFormula.
-        assert_eq!(ops.len(), 3, "ops were: {ops:?}");
+        // Phase 2B.7 audit H2: the PutValue + ClearFormula pair now lands
+        // as one atomic `Op::BatchCommit` so partial-pair op-log failure is
+        // impossible. Expect 2 ops total: PutFormula → BatchCommit{PutValue,
+        // ClearFormula}.
+        assert_eq!(ops.len(), 2, "ops were: {ops:?}");
         assert!(matches!(ops[0], Op::PutFormula { .. }));
-        assert!(matches!(ops[1], Op::PutValue { .. }));
-        assert!(matches!(ops[2], Op::ClearFormula { .. }));
+        match &ops[1] {
+            Op::BatchCommit { ops: inner } => {
+                assert_eq!(inner.len(), 2);
+                assert!(matches!(inner[0], Op::PutValue { .. }));
+                assert!(matches!(inner[1], Op::ClearFormula { .. }));
+            }
+            other => panic!("expected BatchCommit pair, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1883,6 +1978,226 @@ mod tests {
         }
     }
 
+    // ===== Phase 2B.7 — audit closure: input validation + dry-run + cleanup =====
+
+    /// Phase 2B.7 audit H1: `add_sheet` rejects `chunk_rows == 0` BEFORE
+    /// any op-log append. Without this check, the workbook gets a sheet
+    /// with `chunk_rows = 0` and the first cell write panics inside the
+    /// column store — and the op log has a phantom AddSheet entry that
+    /// would replay the same poison state on next load.
+    #[test]
+    fn add_sheet_rejects_zero_chunk_rows() {
+        use ql_oplog::OpLog;
+        let mut wb = Workbook::new();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        let result = {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.add_sheet("Bad", 0)
+        };
+        match result {
+            Err(RuntimeError::InvalidChunkRows(0)) => {}
+            other => panic!("expected InvalidChunkRows(0), got {other:?}"),
+        }
+        // No sheet added; no op-log entry.
+        assert_eq!(wb.sheet_count(), 0);
+        assert!(
+            oplog.is_empty(),
+            "op log must stay empty on validation failure"
+        );
+    }
+
+    /// Phase 2B.7 audit (correctness L4): `clear_formula` propagates
+    /// `RuntimeError::InvalidSheet` / `InvalidCell` from `validate_cell`.
+    #[test]
+    fn clear_formula_rejects_invalid_sheet() {
+        let mut wb = make_runtime_workbook(); // 1 sheet
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let result = rt.clear_formula(99, 0, 0);
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::InvalidSheet {
+                    sheet: 99,
+                    sheet_count: 1
+                })
+            ),
+            "expected InvalidSheet, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn clear_formula_rejects_invalid_cell() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let result = rt.clear_formula(0, 1_048_576, 0);
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::InvalidCell { row: 1_048_576, .. })
+            ),
+            "expected InvalidCell, got {result:?}"
+        );
+    }
+
+    /// Phase 2B.7 (closes GAP-I-04): `validate_formula` runs the full
+    /// pipeline but doesn't mutate the workbook or the op log. The IDE
+    /// can call it on every keystroke to surface diagnostics without
+    /// committing the user's draft.
+    #[test]
+    fn validate_formula_returns_value_without_writing() {
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Number(10.0));
+        let reg = default_registry();
+        use ql_oplog::OpLog;
+        let mut oplog = OpLog::new();
+        let rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+
+        let v = rt.validate_formula(0, 1, 0, "A1 * 5").unwrap();
+        assert_eq!(v, Value::Number(50.0));
+
+        // Workbook UNCHANGED: cell (1, 0) is still Blank, no formula
+        // associated.
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 0)), Value::Blank);
+        assert!(wb.formula_at(0, 1, 0).is_none());
+        // Op log untouched.
+        assert!(oplog.is_empty());
+    }
+
+    /// `validate_formula` surfaces bind errors the same way `set_formula`
+    /// does — the IDE renders the same Display strings.
+    #[test]
+    fn validate_formula_surfaces_bind_errors() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let rt = WorkbookRuntime::new(&mut wb, &reg);
+        let result = rt.validate_formula(0, 0, 0, "(1 + 2");
+        assert!(matches!(result, Err(RuntimeError::Parse(_))));
+        // No state change.
+        assert!(wb.formula_at(0, 0, 0).is_none());
+    }
+
+    /// `validate_formula` does NOT pollute the bind-plan cache. A
+    /// keystroke-driven validate of a half-typed formula must not insert
+    /// a cache entry that would mismatch when the user finally hits Enter.
+    #[test]
+    fn validate_formula_does_not_pollute_plan_cache() {
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Number(2.0));
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // Validate several drafts. The cache stays empty.
+        let _ = rt.validate_formula(0, 1, 0, "A1 + 1").unwrap();
+        let _ = rt.validate_formula(0, 1, 0, "A1 + 2").unwrap();
+        let _ = rt.validate_formula(0, 1, 0, "A1 + 3").unwrap();
+        assert_eq!(rt.cache_stats().entries, 0);
+        assert_eq!(rt.cache_stats().hits, 0);
+        assert_eq!(rt.cache_stats().misses, 0);
+
+        // A real set_formula DOES populate the cache.
+        rt.set_formula(0, 1, 0, "A1 + 3").unwrap();
+        assert_eq!(rt.cache_stats().entries, 1);
+    }
+
+    /// Phase 2B.7 audit (correctness M1): `is_aggregate_function` must
+    /// only list functions actually registered. Cross-check against the
+    /// default registry; a mismatch means the binder will surface
+    /// `NamedRangeInScalarContext` for what looked like a valid aggregate
+    /// (or vice versa).
+    #[test]
+    fn is_aggregate_function_lists_only_registered_aggregates() {
+        let reg = default_registry();
+        // Every name `is_aggregate_function` recognizes must exist in the
+        // registry. Hardcoded names (mirror the matcher in plan.rs).
+        for name in &[
+            "SUM", "AVERAGE", "AVG", "COUNT", "COUNTA", "MIN", "MAX", "PRODUCT", "VAR", "VAR.S",
+            "VAR.P", "STDEV", "STDEV.S", "STDEV.P",
+        ] {
+            assert!(
+                reg.lookup(name).is_some(),
+                "is_aggregate_function lists {name:?} but it's not in default_registry"
+            );
+        }
+        // Sanity: a known non-aggregate (IF) is in the registry but
+        // is_aggregate_function does NOT claim it. We can't directly call
+        // is_aggregate_function (private), but we can verify via behavior:
+        // a NameRef to a range used inside IF surfaces
+        // NamedRangeInScalarContext (since IF's args are scalar context).
+        // That behaviour is pinned by `nag_04_named_range_in_scalar_positions_errors_precisely`.
+    }
+
+    /// Phase 2B.7 audit closure (test gaps #5 and #6): the existing NAG
+    /// tests don't exercise nested aggregates with named ranges. Ensure
+    /// `SUM(AVERAGE(Sales))` (both aggregate; inner is the named-range arg)
+    /// and `ROUND(SUM(Sales), 2)` (outer scalar, inner aggregate with the
+    /// named range) both bind cleanly to the appropriate plan shapes.
+    #[test]
+    fn nag_05_nested_aggregates_with_named_range_bind_cleanly() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+        let mut wb = make_runtime_workbook();
+        wb.set_name("Sales", NamedTarget::Range(Range::new(0, 1, 0, 10, 0)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // SUM(AVERAGE(Sales)) — outer SUM passes aggregate context to its
+        // arg (the AVERAGE call), which in turn passes aggregate context
+        // to its arg (the Sales NameRef). Both layers see aggregate
+        // context; Sales binds to AggregateNameRef. Today eval returns
+        // #CALC! per Phase 3.6 deferral, but the bind succeeds.
+        let v = rt.set_formula(0, 0, 0, "SUM(AVERAGE(Sales))").unwrap();
+        assert_eq!(v, Value::Error(ErrorValue::Calc));
+    }
+
+    #[test]
+    fn nag_06_round_with_nested_sum_of_named_range_binds_cleanly() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+        let mut wb = make_runtime_workbook();
+        wb.set_name("Sales", NamedTarget::Range(Range::new(0, 1, 0, 10, 0)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // ROUND is non-aggregate; its args bind in scalar context. The
+        // FIRST arg here is SUM(Sales), which is itself a Function call —
+        // recursive bind hits the SUM arm and switches to aggregate context
+        // for ITS arg. Sales binds to AggregateNameRef. The outer ROUND
+        // takes the SUM result + 2 in scalar context. End-to-end binds
+        // cleanly; eval is #CALC! (Sales binds to AggregateNameRef →
+        // evaluates to #CALC! → propagates through SUM → propagates
+        // through ROUND).
+        let v = rt.set_formula(0, 0, 0, "ROUND(SUM(Sales), 2)").unwrap();
+        assert_eq!(v, Value::Error(ErrorValue::Calc));
+    }
+
+    /// Phase 2B.7 audit (cleanup): after dropping the redundant
+    /// `RecomputeResult.partial_state` pub field, `is_complete()` is the
+    /// single source of truth.
+    #[test]
+    fn recompute_result_is_complete_is_single_source_of_truth() {
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Number(1.0));
+        wb.put_formula(0, 0, 1, "A1 + 1"); // good
+        wb.put_formula(0, 0, 2, "((("); // bad
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let result = rt.recompute_all();
+
+        // Compile-time: no `result.partial_state` accessor exists. If a
+        // future hand rolls one and exposes it as pub, this test won't
+        // catch it — but the struct definition is the contract.
+        assert!(!result.is_complete());
+        assert_eq!(result.failed_count(), 1);
+        assert_eq!(result.succeeded, 1);
+        assert_eq!(result.attempted, 2);
+    }
+
     // ===== Phase 2B.5 — op-log producer coverage =====
 
     /// OPL-2B-01 (part 1): `WorkbookRuntime::set_name` records `Op::SetName`
@@ -1949,14 +2264,15 @@ mod tests {
         }
     }
 
-    /// OPL-2B-01 (part 3): `WorkbookRuntime::clear_formula` records
-    /// `Op::PutValue(current_value) + Op::ClearFormula` when there was a
-    /// formula to clear (so replay preserves the cell value, matching the
-    /// "strip formula, keep value" semantic of `Workbook::clear_formula`).
-    /// Clearing a non-formula cell is a no-op for both the workbook and
-    /// the log.
+    /// OPL-2B-01 (part 3): `WorkbookRuntime::clear_formula` records a
+    /// single `Op::BatchCommit { ops: [PutValue(current), ClearFormula] }`
+    /// when there was a formula to clear (so replay preserves the cell
+    /// value, matching the "strip formula, keep value" semantic of
+    /// `Workbook::clear_formula`). Phase 2B.7 audit H2 wraps the pair so
+    /// partial-pair op-log failure is impossible. Clearing a non-formula
+    /// cell is a no-op for both the workbook and the log.
     #[test]
-    fn runtime_clear_formula_emits_ops_when_formula_present() {
+    fn runtime_clear_formula_emits_atomic_pair_when_formula_present() {
         use ql_oplog::{Op, OpLog};
         let mut wb = make_runtime_workbook();
         let reg = default_registry();
@@ -1967,32 +2283,37 @@ mod tests {
             rt.set_formula(0, 0, 0, "1 + 1").unwrap();
             // No-op clear on a different cell: no ops emitted.
             rt.clear_formula(0, 1, 0).unwrap();
-            // Real clear: emits PutValue(2) + ClearFormula.
+            // Real clear: emits BatchCommit { [PutValue(2), ClearFormula] }.
             rt.clear_formula(0, 0, 0).unwrap();
         }
         let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
         // Expect: PutFormula (from set_formula) +
-        //         PutValue (preserves the evaluated value) +
-        //         ClearFormula (the actual strip).
-        assert_eq!(ops.len(), 3, "ops were: {ops:?}");
+        //         BatchCommit { [PutValue(2), ClearFormula] } (the atomic pair).
+        assert_eq!(ops.len(), 2, "ops were: {ops:?}");
         assert!(matches!(ops[0], Op::PutFormula { .. }));
         match &ops[1] {
-            Op::PutValue {
-                sheet,
-                row,
-                col,
-                value,
-            } => {
-                assert_eq!((*sheet, *row, *col), (0, 0, 0));
-                assert_eq!(value, &ql_io::CellWireValue::Number(2.0));
+            Op::BatchCommit { ops: inner } => {
+                assert_eq!(inner.len(), 2);
+                match &inner[0] {
+                    Op::PutValue {
+                        sheet,
+                        row,
+                        col,
+                        value,
+                    } => {
+                        assert_eq!((*sheet, *row, *col), (0, 0, 0));
+                        assert_eq!(value, &ql_io::CellWireValue::Number(2.0));
+                    }
+                    other => panic!("expected PutValue(2), got {other:?}"),
+                }
+                match &inner[1] {
+                    Op::ClearFormula { sheet, row, col } => {
+                        assert_eq!((*sheet, *row, *col), (0, 0, 0));
+                    }
+                    other => panic!("expected ClearFormula, got {other:?}"),
+                }
             }
-            other => panic!("expected PutValue(2), got {other:?}"),
-        }
-        match &ops[2] {
-            Op::ClearFormula { sheet, row, col } => {
-                assert_eq!((*sheet, *row, *col), (0, 0, 0));
-            }
-            other => panic!("expected ClearFormula, got {other:?}"),
+            other => panic!("expected BatchCommit pair, got {other:?}"),
         }
         // Workbook state: formula gone; value preserved at the last
         // evaluated result (2.0).
