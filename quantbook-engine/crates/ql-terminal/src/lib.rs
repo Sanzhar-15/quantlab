@@ -1,4 +1,10 @@
-//! `ql-terminal` — Phase 0 stub. See ../../../.plans/_QUANTBOOK-v1-SPECIFICATION.md Part V.
+//! `ql-terminal` — Phase 2A.12 audit M16/DOC: rewrote stale "Phase 0 stub" doc.
+//!
+//! Reserved for Phase 5+ — terminal/REPL frontend (per spec Part V Phase 5).
+//!
+//! Currently empty (no public surface). The crate exists in the workspace
+//! so the dependency graph is fixed from Phase 0 — adding it later would
+//! be a breaking change for any consumer pinning the workspace shape.
 
 #![allow(dead_code)]
 
@@ -6,6 +12,6 @@
 mod tests {
     #[test]
     fn smoke() {
-        // crate compiles; replace as Phase 0 work lands.
+        // Phase 5+ work lands here.
     }
 }

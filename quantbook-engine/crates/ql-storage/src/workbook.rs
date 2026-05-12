@@ -161,6 +161,24 @@ impl NameTable {
 /// - Calcgraph dependency tracking (computed-overlay separation per CORR-25).
 /// - Automatic recompute on dependency change.
 /// - Cross-sheet formula references.
+///
+/// ## Clone semantics
+///
+/// `Clone` is **shallow with respect to Arrow chunk buffers**: each
+/// `ColumnStore` holds `Vec<Arc<dyn arrow_array::Array>>`, and cloning the
+/// Workbook clones the Arc handles (cheap refcount bump), NOT the underlying
+/// Arrow buffers. This is safe today because the only mutating APIs
+/// (`Workbook::put`, `Sheet::put`, `ColumnStore::put`, `replace_chunk`,
+/// `append_chunk`) operate at the chunk granularity — they install whole new
+/// `ArrayRef` values, never mutate an existing Arrow buffer in place. So a
+/// clone and the original never see each other's writes through their shared
+/// chunk Arcs.
+///
+/// Phase 2A.12 audit H4 (persistence-agent finding): if a future API ever
+/// mutates a chunk's bytes in place (e.g. `Float64Array::values_mut` via
+/// `Arc::make_mut`), it MUST also break the Arc-sharing contract — either
+/// clone the buffer first or document the in-place mutation. The
+/// chunk-replace-only invariant is what makes shallow Clone correct.
 #[derive(Clone, Debug, Default)]
 pub struct Workbook {
     sheets: Vec<Sheet>,

@@ -1,35 +1,45 @@
 //! ExprPlan → SIMD kernel dispatch lowering.
 //!
-//! The W4-2 SIMD kernels in `simd.rs` operate on `&[f64]` slices. The W4-1 scalar
-//! evaluator at `scalar::eval_scalar` works per-cell from an ExprPlan. This module
-//! bridges them: classify an ExprPlan into a `SimdShape`, then `dispatch` the shape
-//! against caller-supplied input chunks + output buffer.
+//! The SIMD kernels in `simd.rs` operate on `&[f64]` slices. The scalar
+//! evaluator at `scalar::eval_scalar` works per-cell from an ExprPlan. This
+//! module bridges them: classify an ExprPlan into a `SimdShape`, then
+//! `dispatch` the shape against caller-supplied input chunks + output buffer.
 //!
-//! ## Phase 0 W4-3 scope
+//! ## Current scope (Phase 2A)
 //!
-//! Recognized shapes are the patterns FormulaRegionNode binding produces for the OG-02
-//! hot path:
+//! Recognized shapes (matched on the patterns FormulaRegionNode binding
+//! produces for the OG-02 hot path):
 //!
-//! - `Binary { op: Mul/Plus/Minus/Div, CellRef, Number }` → `*Scalar` kernels.
-//! - `Binary { op: Mul/Plus/Minus/Div, Number, CellRef }` → commutative ops fold to
-//!   `*Scalar`; `Minus` becomes the non-commutative `ScalarSub`.
-//! - `Binary { op: Mul/Plus/Minus/Div, CellRef, CellRef }` → `*Array` kernels.
-//! - Anything else (nested binaries, unary, function calls, comparisons, concat,
-//!   string literals, etc.) → `NotApplicable`. The runtime evaluator falls back to
-//!   `scalar::eval_scalar` per cell for these.
+//! - `Binary { op: Mul/Plus/Minus, CellRef, Number }` → `*Scalar` kernels.
+//! - `Binary { op: Mul/Plus/Minus, Number, CellRef }` → commutative ops fold
+//!   to `*Scalar`; `Minus` becomes the non-commutative `ScalarSub`.
+//! - `Binary { op: Mul/Plus/Minus, CellRef, CellRef }` → `*Array` kernels.
+//! - **`Operator::Div` is intentionally NOT lowered** (Phase 2A.9 audit H5):
+//!   the SIMD reciprocal-mul approach produces `Inf` for divide-by-zero,
+//!   which `sanitize_f64` maps to `#NUM!` instead of Excel's `#DIV/0!`.
+//!   Division routes through the scalar evaluator which emits the right
+//!   error class. Until a Phase 4+ error-bitmap channel exists, this gap
+//!   stays.
+//! - Anything else (nested binaries, unary, function calls, comparisons,
+//!   concat, string literals, etc.) → `NotApplicable`. The runtime evaluator
+//!   falls back to `scalar::eval_scalar` per cell for these.
 //!
-//! Future shapes (W4-4+):
+//! ## Phase 4+ deferred
+//!
 //! - `Binary { op, CellRef(col_a) * CellRef(col_b), Number(c) }` (FMA-friendly).
 //! - `Function { name: "SUM" | "AVERAGE", args: [RangeRef(...)] }` → reduction kernel.
 //! - `Binary { op: Eq/Lt/etc., CellRef, Number }` → comparison-bitmap kernel for SUMIF.
+//! - Division kernel correctness via an error-bitmap channel that surfaces
+//!   per-element `#DIV/0!` without going scalar.
 //!
 //! ## Row-alignment trust
 //!
-//! The classifier does NOT verify that CellRef rows match the output row. The binder
-//! (Week 4 W4-4 FormulaRegion lowering) is responsible for producing row-aligned plans.
-//! A cross-row reference like `=A1 + B2` evaluated at row N would silently use chunk N
-//! of column A and chunk N of column B, NOT row 1 / row 2. Caller's responsibility for
-//! Phase 0; W4-4 will gate via a row-alignment assertion in the FormulaRegion binder.
+//! The classifier does NOT verify that CellRef rows match the output row.
+//! The binder (Phase 4+ FormulaRegion lowering) is responsible for producing
+//! row-aligned plans. A cross-row reference like `=A1 + B2` evaluated at row
+//! N would silently use chunk N of column A and chunk N of column B, NOT row
+//! 1 / row 2. Caller's responsibility for now; Phase 4+ will gate via a
+//! row-alignment assertion in the FormulaRegion binder.
 
 use crate::plan::ExprPlan;
 use crate::simd;

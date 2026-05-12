@@ -707,4 +707,37 @@ mod tests {
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(7.0));
         assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(14.0));
     }
+
+    /// Phase 2A.12 audit L6: 10k-op stress test for the paste-block use case.
+    /// Asserts the buffer + commit can absorb a 10000-cell transaction in
+    /// under 5 seconds on debug builds (release is much faster). Memory
+    /// footprint isn't measured here (would need a custom allocator hook);
+    /// the perf floor is the practical user-experience bound.
+    #[test]
+    fn stress_10k_op_paste_block_completes_under_5s_debug() {
+        let mut wb = make_wb();
+        let reg = default_registry();
+        let mut tx = WorkbookTransaction::new(&mut wb, &reg);
+
+        let start = std::time::Instant::now();
+        // 100 × 100 grid = 10_000 literal writes.
+        for r in 0..100u32 {
+            for c in 0..100u32 {
+                tx.put_value(0, r, c, Value::Number((r * 100 + c) as f64))
+                    .unwrap();
+            }
+        }
+        assert_eq!(tx.op_count(), 10_000);
+        tx.commit();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_secs_f64() < 5.0,
+            "10k-op stress took {elapsed:?}; perf-floor is 5s on debug"
+        );
+
+        // Spot-check a few cells to confirm the data landed.
+        assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(0.0));
+        assert_eq!(wb.read(Address::new(0, 50, 50)), Value::Number(5050.0));
+        assert_eq!(wb.read(Address::new(0, 99, 99)), Value::Number(9999.0));
+    }
 }
