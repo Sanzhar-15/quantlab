@@ -58,7 +58,8 @@
 //! If a future audit discovers a collision pattern that warrants algorithm
 //! rotation, change `FINGERPRINT_SEED` and regenerate the golden test
 //! fixtures via a one-shot helper documented in the test file. Persisted
-//! caches (Phase 4+ calcgraph) MUST then bump their own schema version.
+//! caches (Engine Phase 3+ calcgraph integration) MUST then bump their own
+//! schema version.
 
 use std::hash::{Hash, Hasher};
 
@@ -301,8 +302,8 @@ mod tests {
     ///    the test will fail and print the actual fingerprints via the
     ///    helper `print_golden_for_regeneration`.
     /// 3. Paste the printed values back into the array.
-    /// 4. Bump any persisted-fingerprint schema version (Phase 4+ calcgraph
-    ///    cache layer).
+    /// 4. Bump any persisted-fingerprint schema version (Engine Phase 3+
+    ///    calcgraph cache layer; see `docs/MASTER-PLAN.md` Phase 3.6).
     #[test]
     fn golden_fingerprints_locked() {
         let goldens: &[(&str, Expr, u64)] = &[

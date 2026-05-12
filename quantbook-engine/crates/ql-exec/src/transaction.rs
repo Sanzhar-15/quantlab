@@ -20,8 +20,9 @@
 //!   IN THE SAME TRANSACTION sees the new value (paste-block semantics).
 //! - **Intra-batch formula→formula dependencies**: formulas evaluate in op-insert
 //!   order. A formula referencing another formula in the same batch may see a
-//!   stale value (whichever was computed last wins). Phase 4 calcgraph
-//!   integration adds topological scheduling.
+//!   stale value (whichever was computed last wins). Engine Phase 3 calcgraph
+//!   integration adds topological scheduling (see `docs/MASTER-PLAN.md`
+//!   Phase 3.4).
 //! - **Drop without commit** = no-op. Buffered ops are discarded; workbook is
 //!   unchanged. Useful for the IDE's "ESC cancels paste" path.
 //! - **Last-write-wins**: writing the same cell twice in one transaction keeps

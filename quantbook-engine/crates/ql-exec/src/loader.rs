@@ -55,7 +55,8 @@ pub enum LoadAndRecomputeError {
 /// formula. Iteration order is HashMap-arbitrary (same caveat as
 /// `WorkbookRuntime::recompute_all`); intra-workbook formula→formula
 /// dependencies may evaluate in an order that produces stale intermediate
-/// values. Phase 4 calcgraph integration fixes that.
+/// values. Engine Phase 3 calcgraph integration fixes that (see
+/// `docs/MASTER-PLAN.md` Phase 3.4; tracked as GAP-R-01).
 ///
 /// Errors from either stage surface as `LoadAndRecomputeError`:
 /// - Load errors short-circuit before any recompute work.

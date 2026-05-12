@@ -319,8 +319,10 @@ impl<'a> WorkbookRuntime<'a> {
     /// value; this method computes the real value).
     ///
     /// Iteration order is HashMap-arbitrary, so cross-cell dependencies may
-    /// evaluate in a non-deterministic order. Phase 4+ calcgraph integration will
-    /// add topological scheduling for deterministic + correct dependency resolution.
+    /// evaluate in a non-deterministic order. Engine Phase 3 calcgraph
+    /// integration will add topological scheduling for deterministic + correct
+    /// dependency resolution (see `docs/MASTER-PLAN.md` Phase 3.4; tracked as
+    /// GAP-R-01 in `docs/known-gaps.md`).
     ///
     /// Returns the count of formula cells re-evaluated. If any single formula
     /// fails to re-evaluate (lex/parse/bind error), that error short-circuits the

@@ -1,6 +1,9 @@
-//! `quantbook-py` — Phase 2A.12 audit M16/DOC: rewrote stale "Phase 0 stub" doc.
+//! `quantbook-py` — Python bindings via PyO3 (the `quantbook` Python
+//! package: `qb.show()`, `qb.publish()`, `qb.bind()`, etc.).
 //!
-//! Reserved for Phase 4+ — Python bindings via PyO3.
+//! Reserved for **Engine Phase 6.3** per `docs/MASTER-PLAN.md` — built over
+//! the stable session API delivered in 6.1. Maturin wheel target. Tracked as
+//! GAP-PS-01 in `docs/known-gaps.md`.
 //!
 //! Currently empty (no public surface). The crate exists in the workspace
 //! so the dependency graph is fixed from Phase 0 — adding it later would
@@ -12,6 +15,6 @@
 mod tests {
     #[test]
     fn smoke() {
-        // Phase 4+ work lands here.
+        // Engine Phase 6.3 work lands here.
     }
 }

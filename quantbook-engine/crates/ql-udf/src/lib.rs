@@ -1,6 +1,9 @@
-//! `ql-udf` — Phase 2A.12 audit M16/DOC: rewrote stale "Phase 0 stub" doc.
+//! `ql-udf` — Python UDF execution surface.
 //!
-//! Reserved for Phase 4+ — user-defined functions registered via the FunctionRegistry surface.
+//! Reserved for **Engine Phase 6.4** per `docs/MASTER-PLAN.md` — registers
+//! Python UDFs through PyO3 with sandbox boundaries, timeouts, cancellation,
+//! type conversion, and deterministic error mapping. Tracked as GAP-PS-03 in
+//! `docs/known-gaps.md`.
 //!
 //! Currently empty (no public surface). The crate exists in the workspace
 //! so the dependency graph is fixed from Phase 0 — adding it later would
@@ -12,6 +15,6 @@
 mod tests {
     #[test]
     fn smoke() {
-        // Phase 4+ work lands here.
+        // Engine Phase 6.4 work lands here.
     }
 }

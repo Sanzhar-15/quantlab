@@ -1,6 +1,10 @@
-//! `ql-io-xlsx` — Phase 2A.12 audit M16/DOC: rewrote stale "Phase 0 stub" doc.
+//! `ql-io-xlsx` — Excel .xlsx import/export surface.
 //!
-//! Reserved for Phase 4+ — .xlsx import/export. Distinct from ql-io which owns the native .qbook/ format.
+//! Reserved for **Engine Phase 4.11** per `docs/MASTER-PLAN.md` — calamine
+//! for read, deliberate writer choice for export, OOXML semantic preservation
+//! for formulas/styles/names/tables/CF/DV/comments/images. Distinct from
+//! `ql-io` which owns the native `.qbook/` format. Tracked as GAP-P-02 in
+//! `docs/known-gaps.md`.
 //!
 //! Currently empty (no public surface). The crate exists in the workspace
 //! so the dependency graph is fixed from Phase 0 — adding it later would
@@ -12,6 +16,6 @@
 mod tests {
     #[test]
     fn smoke() {
-        // Phase 4+ work lands here.
+        // Engine Phase 4.11 work lands here.
     }
 }

@@ -1,6 +1,9 @@
-//! `ql-connectors` — Phase 2A.12 audit M16/DOC: rewrote stale "Phase 0 stub" doc.
+//! `ql-connectors` — external dataset connector surface.
 //!
-//! Reserved for Phase 4+ — external dataset connectors (Postgres, Parquet, etc.).
+//! Reserved for **Engine Phase 6.5** per `docs/MASTER-PLAN.md` — Postgres,
+//! Parquet, CSV, Terminal, and other external data sources behind a uniform
+//! `DataSource` trait with credentials boundary and refresh semantics.
+//! Tracked as GAP-PS-05 in `docs/known-gaps.md`.
 //!
 //! Currently empty (no public surface). The crate exists in the workspace
 //! so the dependency graph is fixed from Phase 0 — adding it later would
@@ -12,6 +15,6 @@
 mod tests {
     #[test]
     fn smoke() {
-        // Phase 4+ work lands here.
+        // Engine Phase 6.5 work lands here.
     }
 }

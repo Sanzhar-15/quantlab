@@ -70,7 +70,7 @@ pub enum ExprPlan {
 pub enum BindError {
     /// The Expr contains a variant not supported in this build (e.g. RangeRef
     /// outside a Function context, Array literal, Spill anchor, NamedTarget::Range
-    /// — all Phase 4+ work).
+    /// — all Engine Phase 4 work per `docs/MASTER-PLAN.md`).
     #[error("unsupported expression variant: {0}")]
     UnsupportedVariant(&'static str),
     /// A `NameRef` was used but the name isn't registered in the active `NameTable`.
