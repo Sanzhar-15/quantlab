@@ -387,11 +387,18 @@ The full v1 means all of these crates either ship real behavior or have a docume
 
 **Sub-items**
 
-1. **4.1 IronCalc Parser Deep-Read And Parser Gap Matrix**  
+1. **4.1 IronCalc Parser Deep-Read And Parser Gap Matrix** ✅ SHIPPED 2026-05-12 (W5-44)  
    Read IronCalc parser and lexer in the deferred order, then write a Quantbook parser gap matrix.  
    References: `.references/ironcalc/base/src/expressions/parser/mod.rs`; `.references/ironcalc/base/src/expressions/lexer/mod.rs`; `.references/ironcalc/base/src/expressions/parser/static_analysis.rs`; `.references/ironcalc/base/src/expressions/parser/stringify.rs`; `.references/ironcalc/base/src/expressions/parser/move_formula.rs`.  
-   Acceptance: PAR-4-01 gap matrix checked in; PAR-4-02 no parser expansion begins before this document exists; PAR-4-03 legal/provenance notes updated.  
-   Effort: 2-4 days.
+   Acceptance: PAR-4-01 ✅ gap matrix checked in at `docs/parser/ironcalc-deep-read.md`; PAR-4-02 ✅ parser expansion (4.6/4.7/4.8/4.9 lexer + AST work) is now formally unlocked; PAR-4-03 ✅ license + provenance documented (IronCalc MIT + Apache-2.0; reference-only policy).  
+   Shipped:  
+   - Full token-kind gap analysis (IronCalc has 11 tokens we don't; we have a few simplifications IronCalc lacks).  
+   - Full AST-node gap analysis (IronCalc has 10 node variants we don't, mapped to Phase 4.6/4.7/4.8/4.9 / post-v1 buckets).  
+   - Feature parity table covering A1/R1C1/cross-sheet/array/structured/LAMBDA/implicit-intersection/spill/localization/move-formula.  
+   - Architectural recommendations: adopt IronCalc's precedence tower for Phase 4.7; locale threading pattern for 4.9; recoverable parse errors via AST `ParseError` nodes for 4.4 error matrix; move-formula as separate tree-walk pass for Phase 5+ copy/paste.  
+   - Sequencing recommendation: collapse 4.6+4.7+4.8 lexer work into one token-set expansion sprint to avoid three back-to-back lexer churns.  
+   - Surfaced GAP-G-01 + GAP-G-03 (Phase 3.10 megaudit carryovers) as Phase 4 entry decisions — array formulas + function library expansion both rebind formulas at scale; the append-only graph fix needs to happen before 4.3 or be a known limitation gated by 4.12 megaudit.  
+   Effort: 2-4 days (actual: ~0.5 day; Explore subagent did the IronCalc survey).
 
 2. **4.2 Excel Compatibility Matrix Harness**  
    Create a checked-in matrix for functions, operators, coercions, errors, arrays, tables, date systems, localization, and xlsx import/export.  
