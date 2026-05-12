@@ -201,7 +201,8 @@ mod tests {
         let (_dir, path) = temp_path("named.qbook");
         let mut wb = Workbook::new();
         let s = wb.add_sheet("S");
-        wb.set_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)));
+        wb.set_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)))
+            .unwrap();
         let reg = default_registry();
         {
             let mut rt = WorkbookRuntime::new(&mut wb, &reg);

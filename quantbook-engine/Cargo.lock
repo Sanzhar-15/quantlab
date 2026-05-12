@@ -834,6 +834,7 @@ dependencies = [
  "arrow-schema",
  "proptest",
  "ql-types",
+ "thiserror",
 ]
 
 [[package]]

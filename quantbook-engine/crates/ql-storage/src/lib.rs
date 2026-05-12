@@ -21,7 +21,7 @@ pub mod workbook;
 pub use column::{chunk_rows_from_env, ColumnStore, DEFAULT_CHUNK_ROWS};
 pub use overlay::SparseOverlay;
 pub use sheet::{Bounds, Sheet};
-pub use workbook::{NameTable, NamedTarget, Workbook};
+pub use workbook::{NameTable, NameTableError, NamedTarget, Workbook};
 
 #[cfg(test)]
 mod tests {

@@ -487,7 +487,8 @@ mod tests {
     #[test]
     fn named_constant_resolves_inside_transaction() {
         let mut wb = make_wb();
-        wb.set_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)));
+        wb.set_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)))
+            .unwrap();
         let reg = default_registry();
         let mut tx = WorkbookTransaction::new(&mut wb, &reg);
         tx.put_formula(0, 0, 0, "1000 * TaxRate").unwrap();
@@ -652,7 +653,8 @@ mod tests {
     fn named_blank_constant_surfaces_as_distinct_bind_error() {
         use crate::plan::BindError;
         let mut wb = make_wb();
-        wb.set_name("MyBlank", NamedTarget::Constant(Value::Blank));
+        wb.set_name("MyBlank", NamedTarget::Constant(Value::Blank))
+            .unwrap();
         let reg = default_registry();
         let mut tx = WorkbookTransaction::new(&mut wb, &reg);
 
@@ -673,7 +675,8 @@ mod tests {
         wb.set_name(
             "MyErr",
             NamedTarget::Constant(Value::Error(ErrorValue::DivZero)),
-        );
+        )
+        .unwrap();
         let reg = default_registry();
         let mut tx = WorkbookTransaction::new(&mut wb, &reg);
 

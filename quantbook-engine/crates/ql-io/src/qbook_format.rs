@@ -955,10 +955,18 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
     // Phase 2A.8: hydrate the workbook's NameTable from the envelope's
     // `names` section. v1 envelopes lack the section (envelope.names is None);
     // those workbooks load with an empty NameTable, matching prior behavior.
+    //
+    // Phase 2A.9 audit M6: `Workbook::set_name` may now refuse reserved names
+    // (currently `AI` per CORR-06). A v2 file that somehow contains a reserved
+    // name (e.g., hand-edited TOML) surfaces as `QbookError::MalformedName`.
     if let Some(names_section) = envelope.names {
         for entry in names_section.entries {
             let target = entry.target.to_target(&entry.name)?;
-            wb.set_name(&entry.name, target);
+            wb.set_name(&entry.name, target)
+                .map_err(|e| QbookError::MalformedName {
+                    name: entry.name.clone(),
+                    reason: format!("rejected by NameTable: {e}"),
+                })?;
         }
     }
 
@@ -1757,13 +1765,17 @@ col_extent = 1
         let mut wb = Workbook::new();
         let s = wb.add_sheet("S");
         wb.put_at(s, 0, 0, Value::Number(7.0));
-        wb.set_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)));
-        wb.set_name("AnchorA1", NamedTarget::Cell(Address::new(s, 0, 0)));
+        wb.set_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)))
+            .unwrap();
+        wb.set_name("AnchorA1", NamedTarget::Cell(Address::new(s, 0, 0)))
+            .unwrap();
         wb.set_name(
             "SalesRange",
             NamedTarget::Range(Range::new(s, 1, 0, 100, 3)),
-        );
-        wb.set_name("Profit", NamedTarget::Formula(Arc::from("Revenue - Costs")));
+        )
+        .unwrap();
+        wb.set_name("Profit", NamedTarget::Formula(Arc::from("Revenue - Costs")))
+            .unwrap();
 
         save_workbook(&wb, "names", &path).unwrap();
         let loaded = load_workbook(&path).unwrap();

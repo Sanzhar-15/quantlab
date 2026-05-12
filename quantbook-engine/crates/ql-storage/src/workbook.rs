@@ -54,20 +54,62 @@ pub struct NameTable {
     entries: HashMap<Arc<str>, NamedTarget>,
 }
 
+/// Errors emitted by `NameTable::set` when a registration is refused.
+///
+/// Phase 2A.9 audit M6 (2026-05-12): closes the AI() reservation hole. The
+/// previous `NameTable::set` returned `()` and silently accepted any name,
+/// including ones reserved by the engine. A user calling
+/// `wb.set_name("AI", NamedTarget::Constant(...))` then writing `=AI` bypassed
+/// the CORR-06 AI sentinel because `=AI` (no parens) goes through the binder's
+/// NameRef path instead of the function-call path. Now the registration
+/// itself is refused.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum NameTableError {
+    /// The name is reserved by the engine. Per CORR-06: `AI`. Future
+    /// reservations belong in `is_reserved_name` below.
+    #[error("name {0:?} is reserved by the engine and cannot be registered")]
+    Reserved(Arc<str>),
+}
+
+/// Phase 2A.9 audit M6: the canonical-uppercase reserved-name list. Names
+/// here cannot be registered via `NameTable::set` or `Workbook::set_name`.
+/// Keep small; document each entry.
+fn is_reserved_name(canonical: &str) -> bool {
+    matches!(
+        canonical,
+        // CORR-06 / T4-D05: AI is the reserved sentinel that dispatches to
+        // `Error(AINotAvailable)` until the Phase 4+ AI() function ships.
+        "AI"
+    )
+}
+
 impl NameTable {
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Register a name → target binding. The key is uppercased before insertion
-    /// so the table always stores entries in canonical Excel case. Replaces any
-    /// existing entry at the same canonical key. Phase 2A.6 audit M6/D5: prior
-    /// behavior stored the key as-is, which created a silent disagreement
-    /// between `Workbook::set_name` (uppercased) and a raw `NameTable::set`
-    /// (verbatim). Now both paths produce the same canonical key.
-    pub fn set(&mut self, name: impl AsRef<str>, target: NamedTarget) {
+    /// so the table always stores entries in canonical Excel case.
+    ///
+    /// Phase 2A.6 audit M6/D5 added the on-write canonicalization (was: stored
+    /// as-is, creating a disagreement with `lookup` that uppercased queries).
+    ///
+    /// Phase 2A.9 audit M6 added the reserved-name guard. Names returned `true`
+    /// from `is_reserved_name` (currently just `AI` per CORR-06) are refused
+    /// with `NameTableError::Reserved`. The return type is now `Result` —
+    /// callers that previously expected `()` need to handle the error or
+    /// `.expect(...)` it.
+    pub fn set(
+        &mut self,
+        name: impl AsRef<str>,
+        target: NamedTarget,
+    ) -> Result<(), NameTableError> {
         let upper: Arc<str> = Arc::from(name.as_ref().to_ascii_uppercase().as_str());
+        if is_reserved_name(&upper) {
+            return Err(NameTableError::Reserved(upper));
+        }
         self.entries.insert(upper, target);
+        Ok(())
     }
 
     /// Remove a name binding. Uppercases the query so callers don't have to
@@ -146,11 +188,12 @@ impl Workbook {
     }
 
     /// Phase 2A.1 convenience: register a name → target binding on the workbook's
-    /// name table. Phase 2A.6 audit M6: canonicalization now lives on
-    /// `NameTable::set` itself, so this is a thin pass-through. Kept for ergonomic
-    /// reasons (callers don't need to reach through `names_mut`).
-    pub fn set_name(&mut self, name: &str, target: NamedTarget) {
-        self.names.set(name, target);
+    /// name table. Phase 2A.6 audit M6: canonicalization lives on
+    /// `NameTable::set` (this is a thin pass-through). Phase 2A.9 audit M6:
+    /// reserved-name registration (currently `AI` per CORR-06) is refused —
+    /// callers must handle or `.expect(...)` the `Result`.
+    pub fn set_name(&mut self, name: &str, target: NamedTarget) -> Result<(), NameTableError> {
+        self.names.set(name, target)
     }
 
     /// Append a new sheet; returns its `SheetId`. Panics if the next ID would exceed
@@ -333,7 +376,7 @@ mod tests {
         let target = NamedTarget::Constant(Value::Number(0.21));
 
         // Path A: raw NameTable::set with mixed case.
-        wb.names_mut().set("MixedCase", target.clone());
+        wb.names_mut().set("MixedCase", target.clone()).unwrap();
         // Case-sensitive lookup on the canonical (upper) form succeeds.
         assert!(wb.names().lookup("MIXEDCASE").is_some());
         // The mixed-case query does NOT find it via plain lookup …
@@ -344,7 +387,7 @@ mod tests {
 
         // Path B: convenience set_name accepts any case and produces the same
         // canonical entry.
-        wb.set_name("anothername", target.clone());
+        wb.set_name("anothername", target.clone()).unwrap();
         assert!(wb.names().lookup("ANOTHERNAME").is_some());
 
         // Path C: clear removes via case-insensitive query.
@@ -489,5 +532,41 @@ mod tests {
         // Both visible.
         assert_eq!(wb.read(Address::new(s, 0, 0)), Value::Number(42.0));
         assert_eq!(wb.formula_at(s, 0, 0).map(|s| s.as_ref()), Some("A1 + 1"));
+    }
+
+    // ===== Phase 2A.9 audit M6: reserved-name rejection =====
+
+    /// `Workbook::set_name("AI", ...)` is refused — the AI sentinel per
+    /// CORR-06 can't be overridden by a user-defined name.
+    #[test]
+    fn set_name_rejects_reserved_ai_canonical_upper() {
+        let mut wb = Workbook::new();
+        let result = wb.set_name("AI", NamedTarget::Constant(Value::Number(42.0)));
+        match result {
+            Err(NameTableError::Reserved(name)) => assert_eq!(name.as_ref(), "AI"),
+            other => panic!("expected Reserved(AI), got {other:?}"),
+        }
+        // NameTable remains empty.
+        assert!(wb.names().is_empty());
+    }
+
+    /// Case-insensitive: `Workbook::set_name("ai", ...)` also refused (the
+    /// uppercase-on-insert step canonicalizes before checking reservation).
+    #[test]
+    fn set_name_rejects_reserved_ai_case_insensitive() {
+        let mut wb = Workbook::new();
+        let result = wb.set_name("ai", NamedTarget::Constant(Value::Number(42.0)));
+        assert!(matches!(result, Err(NameTableError::Reserved(_))));
+        let result_mixed = wb.set_name("Ai", NamedTarget::Constant(Value::Number(42.0)));
+        assert!(matches!(result_mixed, Err(NameTableError::Reserved(_))));
+    }
+
+    /// Non-reserved names succeed as before.
+    #[test]
+    fn set_name_accepts_non_reserved() {
+        let mut wb = Workbook::new();
+        wb.set_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)))
+            .unwrap();
+        assert!(wb.names().lookup("TAXRATE").is_some());
     }
 }

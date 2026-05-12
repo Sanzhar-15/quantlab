@@ -668,7 +668,8 @@ mod tests {
         let mut wb = make_runtime_workbook();
         // A1 = 42; register MYREF → $A$1.
         wb.put_at(0, 0, 0, Value::Number(42.0));
-        wb.set_name("MyRef", NamedTarget::Cell(Address::new(0, 0, 0)));
+        wb.set_name("MyRef", NamedTarget::Cell(Address::new(0, 0, 0)))
+            .unwrap();
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
 
@@ -684,7 +685,8 @@ mod tests {
 
         let mut wb = make_runtime_workbook();
         // TaxRate = 0.21 as a named constant.
-        wb.set_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)));
+        wb.set_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)))
+            .unwrap();
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
 
@@ -697,7 +699,8 @@ mod tests {
         use ql_storage::NamedTarget;
 
         let mut wb = make_runtime_workbook();
-        wb.set_name("UseFancy", NamedTarget::Constant(Value::Boolean(true)));
+        wb.set_name("UseFancy", NamedTarget::Constant(Value::Boolean(true)))
+            .unwrap();
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
 
@@ -712,7 +715,8 @@ mod tests {
         use ql_storage::NamedTarget;
 
         let mut wb = make_runtime_workbook();
-        wb.set_name("Greeting", NamedTarget::Constant(Value::text("hello")));
+        wb.set_name("Greeting", NamedTarget::Constant(Value::text("hello")))
+            .unwrap();
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
 
@@ -748,7 +752,8 @@ mod tests {
         // Range targets aren't usable as scalar operands in Phase 2A.1 — they
         // surface as UnsupportedVariant (analogous to a bare A1:A10 in a scalar
         // context). Aggregate-context usage lands Phase 2B+.
-        wb.set_name("Sales", NamedTarget::Range(Range::new(0, 1, 0, 10, 0)));
+        wb.set_name("Sales", NamedTarget::Range(Range::new(0, 1, 0, 10, 0)))
+            .unwrap();
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
 
@@ -767,7 +772,8 @@ mod tests {
         use ql_storage::NamedTarget;
 
         let mut wb = make_runtime_workbook();
-        wb.set_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)));
+        wb.set_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)))
+            .unwrap();
         // Seed a formula manually (skipping set_formula) so recompute_all does the work.
         wb.put_at(0, 0, 0, Value::Number(0.0));
         wb.put_formula(0, 0, 0, "1000 * TaxRate");
@@ -789,7 +795,8 @@ mod tests {
         let mut wb = make_runtime_workbook();
         // Register with mixed case — the parser will uppercase NameRef tokens, so
         // lookup must succeed regardless of how the source wrote the name.
-        wb.set_name("MixedCaseName", NamedTarget::Constant(Value::Number(5.0)));
+        wb.set_name("MixedCaseName", NamedTarget::Constant(Value::Number(5.0)))
+            .unwrap();
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
 

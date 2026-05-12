@@ -96,12 +96,14 @@ pub fn classify(plan: &ExprPlan) -> SimdShape {
                 scalar: *n,
             }
         }
-        (Operator::Div, ExprPlan::CellRef { col, .. }, ExprPlan::Number(n)) => {
-            SimdShape::DivScalar {
-                input_col: *col,
-                scalar: *n,
-            }
-        }
+        // Phase 2A.9 audit H5: Operator::Div NEVER lowers to SIMD. The
+        // existing kernel pattern `mul by 1.0/scalar` produces `Inf` for
+        // `1/0`, which sanitize_f64 maps to `#NUM!` — but Excel canon is
+        // `#DIV/0!`. Until a Phase 4+ error-bitmap channel can carry the
+        // correct error class through the SIMD path, division goes to the
+        // scalar evaluator where `eval_arithmetic` already emits the right
+        // #DIV/0! variant.
+        (Operator::Div, ExprPlan::CellRef { .. }, ExprPlan::Number(_)) => SimdShape::NotApplicable,
 
         // Number <op> CellRef — commutative folds to the same kernel; non-commutative
         // (Sub) becomes ScalarSub. Div lacks a SIMD inverse kernel (would need
@@ -144,11 +146,12 @@ pub fn classify(plan: &ExprPlan) -> SimdShape {
                 rhs_col: *r,
             }
         }
-        (Operator::Div, ExprPlan::CellRef { col: l, .. }, ExprPlan::CellRef { col: r, .. }) => {
-            SimdShape::DivArray {
-                lhs_col: *l,
-                rhs_col: *r,
-            }
+        // Phase 2A.9 audit H5: same as DivScalar — array-array division also
+        // goes scalar until error-bitmap channel exists. `DivArray` kernel
+        // pattern produces `Inf` for any rhs[i] == 0; scalar evaluator emits
+        // the correct `#DIV/0!`.
+        (Operator::Div, ExprPlan::CellRef { .. }, ExprPlan::CellRef { .. }) => {
+            SimdShape::NotApplicable
         }
 
         // Anything else (nested binaries, comparisons, concat, etc.) — scalar fallback.
@@ -273,17 +276,15 @@ mod tests {
         );
     }
 
+    /// Phase 2A.9 audit H5 (2026-05-12): `=A / scalar` does NOT lower to SIMD.
+    /// The prior `DivScalar` shape produced `Inf` for `x/0` which sanitized to
+    /// `#NUM!`; Excel canon is `#DIV/0!`. Until a Phase 4+ error-bitmap channel
+    /// exists, division goes through the scalar evaluator which emits the
+    /// correct error class.
     #[test]
-    fn classify_div_scalar() {
-        // =A / 2 → DivScalar (lowers to mul by reciprocal at dispatch).
+    fn classify_div_scalar_routes_to_scalar_evaluator() {
         let p = binary(Operator::Div, cellref(0), ExprPlan::Number(2.0));
-        assert_eq!(
-            classify(&p),
-            SimdShape::DivScalar {
-                input_col: 0,
-                scalar: 2.0
-            }
-        );
+        assert_eq!(classify(&p), SimdShape::NotApplicable);
     }
 
     #[test]
@@ -297,6 +298,9 @@ mod tests {
 
     #[test]
     fn classify_array_kernels() {
+        // Phase 2A.9 audit H5: Operator::Div omitted — array-array division
+        // also routes to scalar (NotApplicable) until error-bitmap channel
+        // exists; see `classify_div_array_routes_to_scalar_evaluator`.
         let cases = [
             (
                 Operator::Mul,
@@ -319,18 +323,19 @@ mod tests {
                     rhs_col: 1,
                 },
             ),
-            (
-                Operator::Div,
-                SimdShape::DivArray {
-                    lhs_col: 0,
-                    rhs_col: 1,
-                },
-            ),
         ];
         for (op, expected) in cases {
             let p = binary(op, cellref(0), cellref(1));
             assert_eq!(classify(&p), expected, "op={op:?}");
         }
+    }
+
+    #[test]
+    fn classify_div_array_routes_to_scalar_evaluator() {
+        // =A / B does NOT lower to SIMD; would emit Inf for any rhs[i]==0,
+        // which sanitizes to #NUM! when Excel canon is #DIV/0!.
+        let p = binary(Operator::Div, cellref(0), cellref(1));
+        assert_eq!(classify(&p), SimdShape::NotApplicable);
     }
 
     // ===== classify — non-applicable cases =====
@@ -406,9 +411,15 @@ mod tests {
         assert_eq!(out, [90.0, 80.0, 70.0]);
     }
 
+    /// Phase 2A.9 audit H5: the `DivScalar` shape's kernel implementation
+    /// (mul-by-reciprocal) still exists for symmetry, but `classify` no longer
+    /// emits this shape. This test exercises the kernel via direct dispatch to
+    /// confirm the documented `Inf-on-zero-scalar` behavior — useful only as a
+    /// low-level kernel correctness check; the production path no longer
+    /// reaches here for `=A/B` formulas.
     #[test]
-    fn dispatch_div_scalar_via_reciprocal_mul() {
-        // =A / 2 should produce A * 0.5 results.
+    fn dispatch_div_scalar_kernel_unreached_from_classify_but_still_correct() {
+        // =A / 2 via direct shape construction (skipping classify).
         let shape = SimdShape::DivScalar {
             input_col: 0,
             scalar: 2.0,
@@ -417,21 +428,6 @@ mod tests {
         let mut out = [0.0; 3];
         assert!(dispatch(&shape, &lhs, &[], &mut out));
         assert_eq!(out, [5.0, 10.0, 15.0]);
-    }
-
-    #[test]
-    fn dispatch_div_scalar_by_zero_produces_inf() {
-        // =A / 0 → caller responsibility to sanitize. Reciprocal-mul produces ±Inf.
-        let shape = SimdShape::DivScalar {
-            input_col: 0,
-            scalar: 0.0,
-        };
-        let lhs = [10.0, 20.0, 30.0];
-        let mut out = [0.0; 3];
-        dispatch(&shape, &lhs, &[], &mut out);
-        for &v in &out {
-            assert!(v.is_infinite() || v.is_nan());
-        }
     }
 
     #[test]

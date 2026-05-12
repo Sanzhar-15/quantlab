@@ -13,6 +13,10 @@ path = "src/lib.rs"
 ql-types     = { path = "../ql-types" }
 arrow-array  = { workspace = true }
 arrow-schema = { workspace = true }
+# Phase 2A.9 audit M6: `NameTableError` uses thiserror::Error for ergonomic
+# Display + std::error::Error. Consistent with QbookError / RuntimeError /
+# LoadAndRecomputeError which already use thiserror.
+thiserror    = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

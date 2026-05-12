@@ -127,11 +127,16 @@ fn eval_binary(op: Operator, lhs: Value, rhs: Value) -> Value {
 }
 
 fn eval_arithmetic(op: Operator, lhs: &Value, rhs: &Value) -> Value {
-    let lhs_num = match coercion::to_number_strict(lhs) {
+    // Phase 2A.9 audit M1: arithmetic uses Excel-canonical *lenient* coercion.
+    // `"5" + 1` evaluates to `6` (text-that-parses-as-number coerces); only
+    // unparseable text returns `#VALUE!`. Phase 1 used the strict path which
+    // rejected ALL text — that was a documented Phase 0 deviation from Excel
+    // canon, with the lenient impl sitting unused in `ql-types::coercion`.
+    let lhs_num = match coercion::to_number_lenient(lhs) {
         Ok(n) => n,
         Err(e) => return Value::Error(e),
     };
-    let rhs_num = match coercion::to_number_strict(rhs) {
+    let rhs_num = match coercion::to_number_lenient(rhs) {
         Ok(n) => n,
         Err(e) => return Value::Error(e),
     };
@@ -151,6 +156,11 @@ fn eval_arithmetic(op: Operator, lhs: &Value, rhs: &Value) -> Value {
             // would produce NaN which sanitize_f64 would map to #NUM!, but check
             // explicitly so the error type is clear.
             if lhs_num < 0.0 && rhs_num.fract() != 0.0 {
+                return Value::Error(ErrorValue::Num);
+            }
+            // Phase 2A.9 audit M3: Excel canon — `0^0` is `#NUM!`. Rust/IEEE
+            // produces 1.0, which would be a silent deviation. Guard explicitly.
+            if lhs_num == 0.0 && rhs_num == 0.0 {
                 return Value::Error(ErrorValue::Num);
             }
             lhs_num.powf(rhs_num)
@@ -177,41 +187,75 @@ fn eval_concat(lhs: &Value, rhs: &Value) -> Value {
 }
 
 fn eval_compare(op: Operator, lhs: &Value, rhs: &Value) -> Value {
-    // Phase 0 W4-1: Number-vs-Number comparisons only. Mixed-type comparison + Bool
-    // ordering rules land in W4-4 with full Excel semantics. Other type pairs fall back
-    // to "equal iff both are the same variant + value."
-    let cmp = compare_values_phase0(lhs, rhs);
+    // Phase 2A.9 audit M2: implement Excel-canonical cross-type comparison.
+    // Same-type pairs compare per their natural ordering; mixed-type pairs
+    // order by type rank: Number < Text < Boolean. Blank coerces to 0 for
+    // Number comparisons and "" for Text. Errors propagate.
+    if let Value::Error(e) = lhs {
+        return Value::Error(*e);
+    }
+    if let Value::Error(e) = rhs {
+        return Value::Error(*e);
+    }
+    let cmp = compare_values_excel(lhs, rhs);
     let result_bool = match op {
-        Operator::Eq => cmp == Some(std::cmp::Ordering::Equal),
-        Operator::Neq => cmp != Some(std::cmp::Ordering::Equal),
-        Operator::Lt => cmp == Some(std::cmp::Ordering::Less),
-        Operator::Le => matches!(
-            cmp,
-            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
-        ),
-        Operator::Gt => cmp == Some(std::cmp::Ordering::Greater),
+        Operator::Eq => cmp == std::cmp::Ordering::Equal,
+        Operator::Neq => cmp != std::cmp::Ordering::Equal,
+        Operator::Lt => cmp == std::cmp::Ordering::Less,
+        Operator::Le => matches!(cmp, std::cmp::Ordering::Less | std::cmp::Ordering::Equal),
+        Operator::Gt => cmp == std::cmp::Ordering::Greater,
         Operator::Ge => {
-            matches!(
-                cmp,
-                Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
-            )
+            matches!(cmp, std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
         }
         _ => unreachable!(),
     };
     Value::Boolean(result_bool)
 }
 
-fn compare_values_phase0(lhs: &Value, rhs: &Value) -> Option<std::cmp::Ordering> {
+/// Phase 2A.9 audit M2: Excel-canonical comparison ordering. When operands
+/// have different types, they're ordered by type rank: Number/Blank < Text <
+/// Boolean. Within a type, natural ordering applies. Blank coerces to 0 (for
+/// Number comparisons) or "" (for Text); we represent Blank as having the
+/// Number rank so `=0=B1` is TRUE for blank B1.
+///
+/// This replaces `compare_values_phase0`, which returned `None` for mixed
+/// types and let downstream code silently degrade to `false` for ordering
+/// comparisons — a documented Phase 0 deviation from Excel canon.
+fn compare_values_excel(lhs: &Value, rhs: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
+    // Same-type comparisons go through the natural ordering.
     match (lhs, rhs) {
-        (Value::Number(a), Value::Number(b)) => a.partial_cmp(b),
-        (Value::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
-        (Value::Text(a), Value::Text(b)) => Some(a.as_ref().cmp(b.as_ref())),
-        (Value::Blank, Value::Blank) => Some(Ordering::Equal),
-        // Same-variant fallback: missing pairs return None (Phase 0 doesn't implement
-        // Excel's mixed-type ordering yet). Eq/Neq still produce a Bool via `None != Equal`.
-        _ => None,
+        (Value::Number(a), Value::Number(b)) => return a.partial_cmp(b).unwrap_or(Ordering::Equal),
+        (Value::Boolean(a), Value::Boolean(b)) => return a.cmp(b),
+        (Value::Text(a), Value::Text(b)) => return a.as_ref().cmp(b.as_ref()),
+        (Value::Blank, Value::Blank) => return Ordering::Equal,
+        _ => {}
     }
+    // Blank coerces per the other operand: Blank vs Number → compare as 0;
+    // Blank vs Text → compare as "". This matches Excel's behavior for the
+    // common `=A1=0` and `=A1=""` idioms.
+    match (lhs, rhs) {
+        (Value::Blank, Value::Number(b)) => {
+            return 0.0_f64.partial_cmp(b).unwrap_or(Ordering::Equal)
+        }
+        (Value::Number(a), Value::Blank) => return a.partial_cmp(&0.0).unwrap_or(Ordering::Equal),
+        (Value::Blank, Value::Text(b)) => return "".cmp(b.as_ref()),
+        (Value::Text(a), Value::Blank) => return a.as_ref().cmp(""),
+        _ => {}
+    }
+    // True cross-type: rank by type. Excel canon: Number < Text < Boolean.
+    // Blank carries the Number rank (it coerces above before reaching here for
+    // Number/Text peers, so this only matters for Blank-vs-Bool).
+    fn type_rank(v: &Value) -> u8 {
+        match v {
+            Value::Number(_) | Value::Blank => 0,
+            Value::Text(_) => 1,
+            Value::Boolean(_) => 2,
+            // Error already short-circuited in eval_compare.
+            Value::Error(_) => unreachable!("Error short-circuits in eval_compare"),
+        }
+    }
+    type_rank(lhs).cmp(&type_rank(rhs))
 }
 
 fn eval_unary(op: Operator, operand: Value) -> Value {
@@ -667,5 +711,174 @@ mod tests {
         };
         // SUM propagates the first error encountered.
         assert_eq!(eval_reg(&expr, &env, &reg), Value::Error(ErrorValue::Ref));
+    }
+
+    // ===== Phase 2A.9 audit M1: lenient arithmetic coercion =====
+
+    /// Excel: `="5" + 1` evaluates to `6`. Text-that-parses-as-number coerces.
+    /// Phase 2A.9: switched `eval_arithmetic` from `to_number_strict` to
+    /// `to_number_lenient`. Previously returned `#VALUE!`.
+    #[test]
+    fn arithmetic_lenient_coerces_numeric_text() {
+        let env = MapEnv::new();
+        let expr = Expr::Binary {
+            op: Operator::Plus,
+            lhs: Box::new(Expr::String(Arc::from("5"))),
+            rhs: Box::new(Expr::Number(1.0)),
+        };
+        // Excel: 6
+        assert_eq!(eval(&expr, &env), Value::Number(6.0));
+    }
+
+    /// Excel: `="50%" + 0` evaluates to `0.5`. Trailing-`%` text coerces with
+    /// `/100` scaling per the lenient path.
+    #[test]
+    fn arithmetic_lenient_handles_percent_text() {
+        let env = MapEnv::new();
+        let expr = Expr::Binary {
+            op: Operator::Mul,
+            lhs: Box::new(Expr::String(Arc::from("50%"))),
+            rhs: Box::new(Expr::Number(2.0)),
+        };
+        // Excel: 1.0 (50% × 2)
+        assert_eq!(eval(&expr, &env), Value::Number(1.0));
+    }
+
+    /// Excel: `="abc" + 1` evaluates to `#VALUE!` (unparseable text).
+    #[test]
+    fn arithmetic_lenient_unparseable_text_is_value_error() {
+        let env = MapEnv::new();
+        let expr = Expr::Binary {
+            op: Operator::Plus,
+            lhs: Box::new(Expr::String(Arc::from("abc"))),
+            rhs: Box::new(Expr::Number(1.0)),
+        };
+        assert_eq!(eval(&expr, &env), Value::Error(ErrorValue::Value));
+    }
+
+    // ===== Phase 2A.9 audit M2: Excel cross-type comparison =====
+
+    /// Excel canon: when comparing across types, Number < Text < Boolean.
+    /// `=5 < "x"` is TRUE because Number ranks below Text.
+    #[test]
+    fn compare_number_less_than_text_excel_canon() {
+        let env = MapEnv::new();
+        let expr = Expr::Binary {
+            op: Operator::Lt,
+            lhs: Box::new(Expr::Number(5.0)),
+            rhs: Box::new(Expr::String(Arc::from("x"))),
+        };
+        // Excel: TRUE
+        assert_eq!(eval(&expr, &env), Value::Boolean(true));
+    }
+
+    /// Excel: `="x" < TRUE` is TRUE (Text < Boolean).
+    #[test]
+    fn compare_text_less_than_boolean_excel_canon() {
+        let env = MapEnv::new();
+        let expr = Expr::Binary {
+            op: Operator::Lt,
+            lhs: Box::new(Expr::String(Arc::from("x"))),
+            rhs: Box::new(Expr::Bool(true)),
+        };
+        // Excel: TRUE
+        assert_eq!(eval(&expr, &env), Value::Boolean(true));
+    }
+
+    /// Excel: `=5 >= "0"` is FALSE because Number < Text (5 ranks below "0"
+    /// not by numeric coercion but by type rank).
+    #[test]
+    fn compare_number_not_greater_or_equal_text_excel_canon() {
+        let env = MapEnv::new();
+        let expr = Expr::Binary {
+            op: Operator::Ge,
+            lhs: Box::new(Expr::Number(5.0)),
+            rhs: Box::new(Expr::String(Arc::from("0"))),
+        };
+        // Excel: FALSE (Number ranks below Text)
+        assert_eq!(eval(&expr, &env), Value::Boolean(false));
+    }
+
+    /// Excel: `=A1=0` where A1 is Blank → TRUE (Blank coerces to 0).
+    #[test]
+    fn compare_blank_equals_zero() {
+        let mut env = MapEnv::new();
+        env.put(0, 0, 0, Value::Blank);
+        let expr = Expr::Binary {
+            op: Operator::Eq,
+            lhs: Box::new(cell_ref(0, 0)),
+            rhs: Box::new(Expr::Number(0.0)),
+        };
+        assert_eq!(eval(&expr, &env), Value::Boolean(true));
+    }
+
+    /// Same-type comparisons unchanged: `=5 < 10` is TRUE.
+    #[test]
+    fn compare_same_type_numbers_unchanged() {
+        let env = MapEnv::new();
+        let expr = Expr::Binary {
+            op: Operator::Lt,
+            lhs: Box::new(Expr::Number(5.0)),
+            rhs: Box::new(Expr::Number(10.0)),
+        };
+        assert_eq!(eval(&expr, &env), Value::Boolean(true));
+    }
+
+    // ===== Phase 2A.9 audit M3: 0^0 = #NUM! =====
+
+    /// Excel: `=0^0` is `#NUM!`. Rust/IEEE produces 1.0.
+    #[test]
+    fn pow_zero_zero_is_num_error_excel_canon() {
+        let env = MapEnv::new();
+        let expr = Expr::Binary {
+            op: Operator::Pow,
+            lhs: Box::new(Expr::Number(0.0)),
+            rhs: Box::new(Expr::Number(0.0)),
+        };
+        // Excel: #NUM!
+        assert_eq!(eval(&expr, &env), Value::Error(ErrorValue::Num));
+    }
+
+    /// Regression guard: `=2^10` still works.
+    #[test]
+    fn pow_normal_unchanged() {
+        let env = MapEnv::new();
+        let expr = Expr::Binary {
+            op: Operator::Pow,
+            lhs: Box::new(Expr::Number(2.0)),
+            rhs: Box::new(Expr::Number(10.0)),
+        };
+        assert_eq!(eval(&expr, &env), Value::Number(1024.0));
+    }
+
+    // ===== Phase 2A.9 audit H5: division produces #DIV/0! =====
+
+    /// Excel: `=A1 / 0` where A1=10 → `#DIV/0!`. Phase 2A.9 routes division
+    /// through scalar evaluator (was: SIMD reciprocal-mul produced Inf →
+    /// sanitize_f64 → #NUM!, wrong error class).
+    #[test]
+    fn div_by_zero_scalar_returns_div_zero_error() {
+        let mut env = MapEnv::new();
+        env.put(0, 0, 0, Value::Number(10.0));
+        let expr = Expr::Binary {
+            op: Operator::Div,
+            lhs: Box::new(cell_ref(0, 0)),
+            rhs: Box::new(Expr::Number(0.0)),
+        };
+        assert_eq!(eval(&expr, &env), Value::Error(ErrorValue::DivZero));
+    }
+
+    /// `=A1 / B1` with B1=0 → #DIV/0!.
+    #[test]
+    fn div_cellref_by_zero_cellref_returns_div_zero_error() {
+        let mut env = MapEnv::new();
+        env.put(0, 0, 0, Value::Number(10.0));
+        env.put(0, 0, 1, Value::Number(0.0));
+        let expr = Expr::Binary {
+            op: Operator::Div,
+            lhs: Box::new(cell_ref(0, 0)),
+            rhs: Box::new(cell_ref(0, 1)),
+        };
+        assert_eq!(eval(&expr, &env), Value::Error(ErrorValue::DivZero));
     }
 }
