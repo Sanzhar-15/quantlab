@@ -52,6 +52,12 @@ impl Sheet {
         self.bounds
     }
 
+    /// Row count per chunk for this sheet. Used by ql-io (W5-6) to record the actual
+    /// chunk layout for round-trip. Audit H5 fix (2026-05-12).
+    pub fn chunk_rows(&self) -> u32 {
+        self.chunk_rows
+    }
+
     pub fn column_count(&self) -> usize {
         self.columns.len()
     }

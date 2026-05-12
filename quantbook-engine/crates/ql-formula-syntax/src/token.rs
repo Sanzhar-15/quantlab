@@ -31,8 +31,14 @@ use std::sync::Arc;
 /// A single lexed token. `Copy` for primitives; `Arc<str>` for the text-bearing variants.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Token {
-    /// Numeric literal (integer, decimal, exponent — already coerced to `f64`). Trailing `%`
-    /// is stripped and the value divided by 100 at lex time (Excel-canonical).
+    /// Numeric literal (integer, decimal, exponent — already coerced to `f64`).
+    /// Audit L1 fix (2026-05-12): a trailing `%` is NOT folded into the literal at
+    /// lex time; the lexer emits a separate `Op(Percent)` token. The parser applies
+    /// percent semantics via `Unary { op: Percent, operand }` (postfix unary). To
+    /// match Excel canon more strictly, future Phase 2+ may fold `%` into the
+    /// literal at lex time; until then `50%` produces two tokens (Number(50.0),
+    /// Op(Percent)) and the parser produces Unary { Percent, Number(50.0) } which
+    /// evaluates to 0.5.
     Number(f64),
 
     /// String literal between `"..."` with `""` escape collapsed. The interior content only.

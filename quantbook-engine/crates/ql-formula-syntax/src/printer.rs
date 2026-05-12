@@ -179,7 +179,16 @@ fn print_expr(expr: &Expr, out: &mut String, parent_min_bp: u8) {
             if needs_parens {
                 out.push('(');
             }
-            print_expr(lhs, out, lbp);
+            // Audit H1 fix (2026-05-12): for right-associative ops (Pow has lbp > rbp
+            // in Pratt convention), the LHS of the same op MUST be parenthesized so
+            // `(a^b)^c` round-trips correctly. Previously the LHS got `lbp` which
+            // matched the child's lbp and produced no parens, silently re-parsing
+            // as `a^(b^c)`. For left-associative ops, lbp = rbp - 1, so passing lbp
+            // continues to allow `(a+b)+c` chains to print as `a + b + c` (correct
+            // left-assoc).
+            let is_right_assoc = lbp > rbp;
+            let lhs_min_bp = if is_right_assoc { lbp + 1 } else { lbp };
+            print_expr(lhs, out, lhs_min_bp);
             out.push(' ');
             out.push_str(op.as_str());
             out.push(' ');
@@ -220,9 +229,13 @@ fn print_expr(expr: &Expr, out: &mut String, parent_min_bp: u8) {
             out.push(')');
         }
         Expr::Array(_) | Expr::Spill(_) => {
-            // Phase 0 doesn't construct these; emit a placeholder if reached so we don't
-            // silently lose info. Acceptable since Phase 0 callers never produce them.
-            out.push_str("<unsupported>");
+            // Audit M1 fix (2026-05-12): Phase 0/1 doesn't construct these; if one
+            // somehow appears in the AST it's a programmer bug, not a print-time
+            // fallback. Loud panic per the no-fallbacks rule.
+            unreachable!(
+                "print_expr: Array/Spill variants are Phase 3+ and not constructed in \
+                 Phase 0/1 ASTs — reaching here means the AST was malformed"
+            );
         }
     }
 }
@@ -240,7 +253,11 @@ fn binary_bp(op: Operator) -> (u8, u8) {
         Operator::Plus | Operator::Minus => (30, 31),
         Operator::Mul | Operator::Div => (40, 41),
         Operator::Pow => (51, 50),
-        Operator::Percent => (60, 60), // postfix, but printed as binary would be a bug
+        // Audit L4 fix (2026-05-12): Percent is postfix-only; `binary_bp(Percent)`
+        // never occurs in correct code. Loud panic per the no-fallbacks rule.
+        Operator::Percent => {
+            unreachable!("binary_bp called with Operator::Percent (postfix-only); programmer bug")
+        }
     }
 }
 
@@ -505,6 +522,28 @@ mod tests {
         rt_roundtrip("10 - 3 - 2");
         rt_roundtrip("2 ^ 3 ^ 2");
         rt_roundtrip("A1 + B1 * 2 - 5");
+    }
+
+    /// Audit H1 regression test (2026-05-12). `(a^b)^c` is left-grouped (Pow's LHS is
+    /// itself a Pow). Previously the printer emitted `a ^ b ^ c` because both child
+    /// and parent had lbp=51 and the `lbp < parent_min_bp` check was false. The
+    /// resulting string re-parses as right-grouped `a^(b^c)`, breaking the AST. Fix:
+    /// pass `lbp + 1` to the LHS for right-associative ops so the LHS-as-same-op gets
+    /// parens.
+    #[test]
+    fn roundtrip_left_grouped_power() {
+        // Direct round-trip: parse `(2^3)^4` should equal parse(print(parse(input))).
+        rt_roundtrip("(2 ^ 3) ^ 4");
+        // Adversarial deep left-grouping.
+        rt_roundtrip("((2 ^ 3) ^ 4) ^ 5");
+        // Confirm the surface form makes parens explicit. The parser of `2 ^ 3 ^ 4`
+        // produces Pow(2, Pow(3, 4)) (right-assoc); printing must NOT add parens.
+        // The parser of `(2 ^ 3) ^ 4` produces Pow(Pow(2, 3), 4); printing MUST add
+        // parens around the LHS to preserve the AST.
+        let right_grouped = parse(lex("2 ^ 3 ^ 4").unwrap()).unwrap();
+        assert_eq!(print(&right_grouped), "2 ^ 3 ^ 4");
+        let left_grouped = parse(lex("(2 ^ 3) ^ 4").unwrap()).unwrap();
+        assert_eq!(print(&left_grouped), "(2 ^ 3) ^ 4");
     }
 
     #[test]

@@ -39,8 +39,8 @@ use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use ql_storage::{column::ColumnStore, Sheet, Workbook};
-use ql_types::{ColId, ErrorValue, RowId, SheetId, Value};
+use ql_storage::{Sheet, Workbook};
+use ql_types::{ColId, ErrorValue, RowId, SheetId, Value, MAX_COLUMN, MAX_ROW};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -77,6 +77,10 @@ pub enum QbookError {
 
     #[error("missing required file {file:?}")]
     MissingFile { file: PathBuf },
+
+    /// Sheet ids in the envelope must be sequential 0..N. Audit M3 fix (2026-05-12).
+    #[error("non-sequential sheet ids in envelope: expected id {expected}, found {found}")]
+    NonSequentialSheetIds { expected: u16, found: u16 },
 }
 
 /// TOML envelope for the workbook. Top-level metadata.
@@ -273,25 +277,31 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
     }
 
     // Construct the Workbook + sheets in id order. Sheet ids in the envelope must be
-    // sequential 0..N for Phase 1 W5-6 — Workbook::add_sheet allocates ids in that
-    // order. If the envelope is out-of-order, this will silently mis-map; we assert.
+    // sequential 0..N — Workbook::add_sheet allocates ids in that order.
+    // Audit M3 fix (2026-05-12): previously this panicked; now returns Result error.
     let mut wb = Workbook::new();
     let sheets_dir = path.join("sheets");
     for (expected_id, sheet_env) in envelope.sheets.iter().enumerate() {
-        assert_eq!(
-            sheet_env.id as usize, expected_id,
-            "sheet envelope id {} does not match sequential expected id {expected_id} \
-             (Phase 1 W5-6 requires sequential ids; rewrite the envelope to repair)",
-            sheet_env.id
-        );
+        if sheet_env.id as usize != expected_id {
+            return Err(QbookError::NonSequentialSheetIds {
+                expected: expected_id as u16,
+                found: sheet_env.id,
+            });
+        }
         let sheet_id = wb.add_sheet_with_chunk_rows(sheet_env.name.clone(), sheet_env.chunk_rows);
-        assert_eq!(sheet_id as usize, expected_id);
+        assert_eq!(
+            sheet_id as usize, expected_id,
+            "Workbook::add_sheet_with_chunk_rows returned non-sequential id — programmer error in ql-storage"
+        );
 
-        // Read the sheet JSONL.
+        // Audit M2 fix (2026-05-12): a missing sheet JSONL is now an explicit
+        // MissingFile error rather than silently treating the sheet as empty
+        // (which would mask corruption / partial saves). The on-disk format
+        // emits an empty file for an empty sheet, so file-presence is the
+        // correctness oracle.
         let sheet_path = sheets_dir.join(format!("{sheet_id}.jsonl"));
         if !sheet_path.is_file() {
-            // An empty sheet is allowed; skip if the JSONL doesn't exist.
-            continue;
+            return Err(QbookError::MissingFile { file: sheet_path });
         }
         let f = fs::File::open(&sheet_path)?;
         let reader = BufReader::new(f);
@@ -306,6 +316,23 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                     line: line_no + 1,
                     detail: format!("JSON parse: {e}"),
                 })?;
+            // Audit H4 fix (2026-05-12): validate row/col bounds at the loader so
+            // hand-crafted JSONL with out-of-bounds coordinates produces a clean
+            // MalformedCell error instead of panicking inside Sheet::put.
+            if rec.row > MAX_ROW {
+                return Err(QbookError::MalformedCell {
+                    file: sheet_path.clone(),
+                    line: line_no + 1,
+                    detail: format!("row {} exceeds MAX_ROW {MAX_ROW}", rec.row),
+                });
+            }
+            if rec.col > MAX_COLUMN {
+                return Err(QbookError::MalformedCell {
+                    file: sheet_path.clone(),
+                    line: line_no + 1,
+                    detail: format!("col {} exceeds MAX_COLUMN {MAX_COLUMN}", rec.col),
+                });
+            }
             let value = rec.value.to_value().map_err(|e| match e {
                 QbookError::MalformedCell { detail, .. } => QbookError::MalformedCell {
                     file: sheet_path.clone(),
@@ -321,26 +348,11 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
     Ok(wb)
 }
 
-/// Extract `chunk_rows` from a sheet. Phase 1 W5-6 reads the first column's chunk_rows
-/// if a column exists; otherwise falls back to ColumnStore's default. This is a Phase
-/// 2+ inefficiency (the Sheet should expose chunk_rows directly) but works correctly.
+/// Read the actual `chunk_rows` from a sheet. Audit H5 fix (2026-05-12): uses the
+/// `Sheet::chunk_rows()` accessor (added in W5-7) so the envelope reflects the
+/// real layout instead of the env default.
 fn sheet_chunk_rows(sheet: &Sheet) -> u32 {
-    // Sheets default to env-or-16384; we can recover the value from any existing column
-    // or use the default. For W5-6 simplicity, use the default if no column exists.
-    if sheet.column_count() > 0 {
-        if let Some(col) = sheet.column(0) {
-            return col_chunk_rows(col);
-        }
-    }
-    ql_storage::column::chunk_rows_from_env()
-}
-
-fn col_chunk_rows(_col: &ColumnStore) -> u32 {
-    // ColumnStore stores chunk_rows internally but doesn't expose it publicly.
-    // Phase 1 W5-6 workaround: use the env default. A Phase 2 follow-up adds a public
-    // accessor. The chunk_rows roundtrip is observable but not correctness-critical —
-    // chunks reflow on first write at the new size.
-    ql_storage::column::chunk_rows_from_env()
+    sheet.chunk_rows()
 }
 
 #[cfg(test)]
@@ -542,6 +554,148 @@ mod tests {
             Err(QbookError::MalformedCell { line: 1, .. }) => {}
             other => panic!("expected MalformedCell at line 1, got {other:?}"),
         }
+    }
+
+    /// Audit H4 regression (2026-05-12): out-of-bounds row in a JSONL cell record
+    /// used to panic inside Sheet::put. Now: clean MalformedCell error with the
+    /// line number and a row-bound message.
+    #[test]
+    fn row_over_max_row_errors_not_panics() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("oob.qbook");
+
+        // Set up a valid workbook then overwrite the JSONL with an out-of-bounds row.
+        let wb = wb_with("S", &[cell(0, 0, Value::Number(1.0))]);
+        save_workbook(&wb, "x", &path).unwrap();
+        // u32::MAX is well over Excel's MAX_ROW = 1_048_575.
+        fs::write(
+            path.join("sheets/0.jsonl"),
+            "{\"row\":4294967295,\"col\":0,\"value\":{\"Number\":1.0}}\n",
+        )
+        .unwrap();
+
+        match load_workbook(&path) {
+            Err(QbookError::MalformedCell { detail, .. }) => {
+                assert!(
+                    detail.contains("MAX_ROW"),
+                    "detail should mention MAX_ROW: {detail:?}"
+                );
+            }
+            other => panic!("expected MalformedCell mentioning MAX_ROW, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn col_over_max_col_errors_not_panics() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("oob_col.qbook");
+        let wb = wb_with("S", &[cell(0, 0, Value::Number(1.0))]);
+        save_workbook(&wb, "x", &path).unwrap();
+        // u32::MAX > MAX_COLUMN = 16_383.
+        fs::write(
+            path.join("sheets/0.jsonl"),
+            "{\"row\":0,\"col\":4294967295,\"value\":{\"Number\":1.0}}\n",
+        )
+        .unwrap();
+
+        match load_workbook(&path) {
+            Err(QbookError::MalformedCell { detail, .. }) => {
+                assert!(
+                    detail.contains("MAX_COLUMN"),
+                    "detail should mention MAX_COLUMN: {detail:?}"
+                );
+            }
+            other => panic!("expected MalformedCell mentioning MAX_COLUMN, got {other:?}"),
+        }
+    }
+
+    /// Audit M2 regression (2026-05-12): missing sheet JSONL used to silently treat
+    /// the sheet as empty. Now: MissingFile error.
+    #[test]
+    fn missing_sheet_jsonl_errors() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("partial.qbook");
+        let wb = wb_with("S", &[cell(0, 0, Value::Number(1.0))]);
+        save_workbook(&wb, "x", &path).unwrap();
+
+        // Delete the sheet's JSONL while keeping the envelope intact.
+        fs::remove_file(path.join("sheets/0.jsonl")).unwrap();
+
+        match load_workbook(&path) {
+            Err(QbookError::MissingFile { file }) => {
+                assert!(file.to_string_lossy().contains("0.jsonl"));
+            }
+            other => panic!("expected MissingFile for sheets/0.jsonl, got {other:?}"),
+        }
+    }
+
+    /// Audit M3 regression (2026-05-12): sheet IDs in envelope must be sequential 0..N.
+    /// Previously a panic; now a Result error.
+    #[test]
+    fn non_sequential_sheet_ids_errors_not_panics() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad_ids.qbook");
+        fs::create_dir_all(&path).unwrap();
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        // Hand-write an envelope with non-sequential IDs ([0, 2] — skips 1).
+        fs::write(
+            path.join("workbook.toml"),
+            r#"schema_version = 1
+name = "x"
+
+[[sheets]]
+id = 0
+name = "S0"
+chunk_rows = 16384
+row_extent = 0
+col_extent = 0
+
+[[sheets]]
+id = 2
+name = "S2"
+chunk_rows = 16384
+row_extent = 0
+col_extent = 0
+"#,
+        )
+        .unwrap();
+        fs::write(path.join("sheets/0.jsonl"), "").unwrap();
+        fs::write(path.join("sheets/2.jsonl"), "").unwrap();
+
+        match load_workbook(&path) {
+            Err(QbookError::NonSequentialSheetIds {
+                expected: 1,
+                found: 2,
+            }) => {}
+            other => panic!("expected NonSequentialSheetIds {{1,2}}, got {other:?}"),
+        }
+    }
+
+    /// Audit H5 regression (2026-05-12): chunk_rows used to be a known lie in the
+    /// envelope because no public accessor existed on Sheet. Now Sheet::chunk_rows()
+    /// is the source of truth, and the envelope reflects the actual layout.
+    #[test]
+    fn chunk_rows_envelope_reflects_actual_sheet_value() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("chunks.qbook");
+
+        // Construct a workbook where the sheet has chunk_rows = 64 (not the default
+        // 16384 or env value).
+        let mut wb = Workbook::new();
+        let sheet_id = wb.add_sheet_with_chunk_rows("Tiny", 64);
+        wb.put_at(sheet_id, 0, 0, Value::Number(1.0));
+        save_workbook(&wb, "x", &path).unwrap();
+
+        let toml_str = fs::read_to_string(path.join("workbook.toml")).unwrap();
+        let env: WorkbookEnvelope = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            env.sheets[0].chunk_rows, 64,
+            "envelope must report actual chunk_rows"
+        );
+
+        // Round-trip: the loaded sheet must report the same chunk_rows.
+        let loaded = load_workbook(&path).unwrap();
+        assert_eq!(loaded.sheet(sheet_id).unwrap().chunk_rows(), 64);
     }
 
     // ===== envelope content =====

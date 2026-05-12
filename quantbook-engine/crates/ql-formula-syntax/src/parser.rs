@@ -110,6 +110,12 @@ impl Parser {
                                      // (postfix/range/binary/terminator); clearer as `loop`.
     fn parse_expr(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_prefix()?;
+        // Audit H3 fix (2026-05-12): track whether we already consumed a `:` so
+        // `A:B:C` produces a parse error rather than silently merging spans via
+        // build_range's WholeColumn:WholeColumn arm. Excel rejects nested ranges
+        // outright. Reset is implicit: each recursive parse_expr call starts fresh,
+        // so `(A:B) + (C:D)` (two parenthesized ranges) parses cleanly.
+        let mut already_consumed_colon = false;
 
         loop {
             // Peek the next token; decide whether it's an infix/postfix operator we should
@@ -137,9 +143,16 @@ impl Parser {
                 if min_bp > 80 {
                     break;
                 }
+                if already_consumed_colon {
+                    return Err(ParseError::InvalidRange {
+                        detail: "nested range (e.g. A:B:C) — only one ':' per range; \
+                                 parenthesize sub-ranges if needed",
+                    });
+                }
                 self.advance();
                 let rhs = self.parse_prefix()?;
                 lhs = self.build_range(lhs, rhs)?;
+                already_consumed_colon = true;
                 continue;
             }
 
@@ -202,11 +215,23 @@ impl Parser {
                     if upper == "FALSE" {
                         return Ok(Expr::Bool(false));
                     }
-                    // Phase 0: bare identifier = named ref. The binder will fail at
-                    // resolution time if unknown (Phase 1 work).
-                    Ok(Expr::Function {
-                        name: canonicalize_function_name(&name),
-                        args: vec![],
+                    // Audit H2 fix (2026-05-12): bare identifier (no LParen) used to
+                    // silently emit `Function { name, args: vec![] }`, which dispatched
+                    // to the function with no arguments and produced nonsense errors
+                    // (e.g. `=AVERAGE` → #DIV/0! instead of #NAME?). Phase 0/1 has no
+                    // named-range resolution, so any bare identifier other than
+                    // TRUE/FALSE is a parse error. Phase 2+ will add an
+                    // `Expr::NameRef` variant when named ranges ship; the binder
+                    // resolves it against the NameTable.
+                    Err(ParseError::Unexpected {
+                        context: "prefix",
+                        got: format!(
+                            "bare identifier {:?} (use {}() for a function call, or define \
+                             {} as a named range — Phase 2+)",
+                            name.as_ref(),
+                            name.as_ref(),
+                            name.as_ref()
+                        ),
                     })
                 }
             }
@@ -240,9 +265,12 @@ impl Parser {
 
             // BareColumn — `A`, `$AI` etc. Function call if followed by `(`; range
             // anchor if followed by `:` (handled by the infix loop). Otherwise it's a
-            // standalone bare-column reference (e.g. inside `=A` — Excel parses this as
-            // a 1×N range; Phase 0 W5-1 falls through to scalar evaluator which will
-            // produce a Value::Blank or similar via the binder).
+            // standalone bare-column reference (e.g. inside `=A` — Excel parses this
+            // as a 1×N range). Audit L2 fix (2026-05-12): the ql-exec binder REJECTS
+            // standalone RangeRef::WholeColumn outside a Function context with
+            // BindError::UnsupportedVariant; previous doc claimed scalar evaluator
+            // fallback, which is wrong. Phase 4+ FormulaRegion binder handles this
+            // by lowering to row-aligned CellRefs.
             Token::BareColumn { col, abs, text } => {
                 if matches!(self.peek(), Some(Token::LParen)) {
                     self.advance();
@@ -1076,6 +1104,69 @@ mod tests {
     fn parse_mismatched_range_types_errors() {
         // A1:B (CellRef:BareColumn) is invalid Phase 0.
         assert!(matches!(perr("A1:B"), ParseError::InvalidRange { .. }));
+    }
+
+    /// Audit H2 regression (2026-05-12): bare identifier (no LParen following) used to
+    /// silently emit `Function { name, args: vec![] }`, which dispatched to the function
+    /// at eval time and returned nonsense errors (`=AVERAGE` → #DIV/0!). Now: parse error.
+    /// TRUE / FALSE are explicit exceptions (boolean literals).
+    ///
+    /// Only tested on 4+ letter names — 1-3 letter names lex as `BareColumn` (since
+    /// they're valid Excel column references), which has its own path: standalone
+    /// BareColumn produces RangeRef::WholeColumn which the ql-exec binder rejects with
+    /// `BindError::UnsupportedVariant`. So 1-3 letter names ARE caught, just by a
+    /// different mechanism (binder, not parser). The Ident asymmetry was the H2 bug.
+    #[test]
+    fn parse_bare_identifier_function_name_errors() {
+        // 4+ letter built-in function names without parens are parse errors.
+        assert!(matches!(perr("AVERAGE"), ParseError::Unexpected { .. }));
+        assert!(matches!(perr("IFERROR"), ParseError::Unexpected { .. }));
+        assert!(matches!(perr("POWER"), ParseError::Unexpected { .. }));
+        assert!(matches!(perr("SQRT"), ParseError::Unexpected { .. }));
+    }
+
+    #[test]
+    fn parse_bare_identifier_unknown_name_errors() {
+        // 4+ letter unknown names (potential future defined-name references) also error
+        // in Phase 0/1 since no NameTable resolution exists yet. Phase 2+ will accept
+        // these as Expr::NameRef.
+        assert!(matches!(
+            perr("MyDefinedName"),
+            ParseError::Unexpected { .. }
+        ));
+        assert!(matches!(
+            perr("UnknownThing"),
+            ParseError::Unexpected { .. }
+        ));
+    }
+
+    /// Audit H3 regression (2026-05-12): `A:B:C` used to silently merge into A:C via
+    /// the WholeColumn:WholeColumn arm of build_range, dropping B. Excel rejects
+    /// nested ranges. Now: parse error.
+    #[test]
+    fn parse_nested_range_errors() {
+        // Three bare columns chained.
+        assert!(matches!(perr("A:B:C"), ParseError::InvalidRange { .. }));
+        // Three cell refs chained.
+        assert!(matches!(perr("A1:B1:C1"), ParseError::InvalidRange { .. }));
+        // Three rows chained.
+        assert!(matches!(perr("1:2:3"), ParseError::InvalidRange { .. }));
+    }
+
+    #[test]
+    fn parse_parenthesized_range_pair_ok() {
+        // Two separate ranges joined by an operator MUST still parse (each :
+        // appears in its own parse_expr recursion level). The `already_consumed_colon`
+        // tracking resets on recursion.
+        let e = p("(A:A) + (B:B)");
+        // Top is binary plus; both operands are ranges.
+        assert!(matches!(
+            e,
+            Expr::Binary {
+                op: Operator::Plus,
+                ..
+            }
+        ));
     }
 
     // ===== full OG-02 + SUM patterns =====

@@ -379,8 +379,11 @@ pub fn sqrt(args: &[Value]) -> Value {
     }
 }
 
-/// `ROUND(x, n)` — round to n decimal places (banker's rounding via f64::round, which
-/// rounds half away from zero; Excel's ROUND is also away-from-zero, so this matches).
+/// `ROUND(x, n)` — round to n decimal places using "round half away from zero" (the
+/// Excel ROUND semantic). Implementation: `f64::round`. Audit D2 fix (2026-05-12):
+/// previous doc called this "banker's rounding," which is the round-half-to-EVEN
+/// rule — a different convention. Excel ROUND is away-from-zero, NOT banker's.
+/// The implementation was correct all along; only the doc was wrong.
 pub fn round(args: &[Value]) -> Value {
     if args.len() != 2 {
         return Value::Error(ErrorValue::Value);

@@ -87,7 +87,10 @@ impl Workbook {
         id as SheetId
     }
 
-    /// Add a sheet with an explicit chunk size — test-only convenience.
+    /// Add a sheet with an explicit chunk size. Used by tests AND by ql-io
+    /// (W5-6 `load_workbook`) to reconstruct sheets at the saved chunk layout.
+    /// Audit L7 fix (2026-05-12): doc previously said "test-only" but production
+    /// code calls this.
     pub fn add_sheet_with_chunk_rows(
         &mut self,
         name: impl Into<String>,
