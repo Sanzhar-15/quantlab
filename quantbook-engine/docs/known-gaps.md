@@ -1,7 +1,7 @@
 # Known engine gaps — checklist with target phases
 
 **Status:** Living document, updated at each phase boundary  
-**Date last touched:** 2026-05-12 (Engine Phase 3.8 close-out — W5-41)  
+**Date last touched:** 2026-05-12 (Engine Phase 3.9 close-out — W5-42, V1)  
 **Companion:** `docs/MASTER-PLAN.md`
 
 Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a gap is closed, move its row to the "Closed" section at the bottom and reference the closing commit.
@@ -84,6 +84,7 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 
 | ID | Gap | Reproduce | Owner | Target phase |
 |---|---|---|---|---|
+| GAP-G-02 | Phase 3.9 V1 ships SIMD-eligibility OBSERVABILITY (`RecomputeResult.simd_classified` counts dirty formulas matching a recognized `SimdShape`) but NOT actual bulk SIMD dispatch from the graph scheduler. Per-formula scalar eval still runs even for SIMD-eligible plans; the bench / FormulaRegion path is the only one that drives multiversion kernels at bulk. Real region-style batched dispatch needs FormulaRegion-binder + region detection at write time — Phase 4.7+ array-formula work. | `ql-exec/src/workbook_runtime.rs::try_recompute_with_simd_profile` — classify returns shape but eval still routes through `eval_scalar_with_cache` | Engine | Engine Phase 4.7 (array formulas + FormulaRegion binder) or earlier follow-up under 3.10 megaudit |
 | GAP-G-01 | Phase 0 `Graph` edges and stripe entries are append-only. When `CalcgraphSession` re-binds a formula whose deps changed (`=SUM(A:A)` → `=SUM(B:B)`, or `=A1+B1` → `=C1+D1`), the OLD entries remain in the graph: stripe stays registered, `formula_to_range_deps` keeps the old range, AND (Phase 3.4) the old forward `add_edge(formula, dep)` edges stay too. Subsequent writes hit the stale entries + pass the precision check, producing false-positive dirty marks. Tarjan ordering inflates with extra constraints (still correct, just bigger). Cost is **performance, not correctness** — same root cause across stripes / formula_to_range_deps / direct edges. Phase 3.3 (session-side `cell_to_formulas` reverse index) handles direct deps cleanly on the REVERSE side; this gap is the FORWARD side. | `ql-exec/src/calcgraph_session.rs::extract_and_register_deps` re-bind path; `ql-calcgraph/src/graph.rs::register_range_dependency` + `add_edge` have no remove counterparts | Engine | Engine Phase 3.10 megaudit decision: delta-edge graph storage OR per-formula edge / stripe revocation API |
 
 ### Collaboration

@@ -233,6 +233,14 @@ pub struct RecomputeFailure {
 /// which has no range deps or volatile flag, is skipped entirely during
 /// `recompute_dirty`. The counter is `0` for `recompute_all` (which
 /// always processes every formula in HashMap order — no VEQ logic).
+///
+/// Phase 3.9 (W5-42, 2026-05-12) adds `simd_classified` — SIMD-3-03's
+/// "graph profile shows region execution." Counts how many of the dirty
+/// formulas had plans that `lower::classify` says are SIMD-eligible
+/// (`SimdShape != NotApplicable`). V1 of Phase 3.9 doesn't yet batch
+/// these into bulk Arrow kernel calls (that's the Phase 4.7+ array-
+/// formula / FormulaRegion binder work); the count is the observability
+/// surface that proves the graph scheduler SEES region-eligible cells.
 #[derive(Debug)]
 pub struct RecomputeResult {
     pub attempted: usize,
@@ -242,6 +250,13 @@ pub struct RecomputeResult {
     /// set but skipped because no upstream value actually changed.
     /// Always `0` for the legacy `recompute_all` path.
     pub skipped_value_equality: usize,
+    /// Phase 3.9 (SIMD-3-03): count of dirty formulas whose plan
+    /// `lower::classify` recognized as SIMD-eligible (a recognized
+    /// `SimdShape`). V1 ships observability only — the bulk SIMD
+    /// dispatch via `simd::*` lives on the bench / FormulaRegion path
+    /// (Phase 4.7+); this counter proves the graph scheduler is aware
+    /// of region-eligible formulas. Always `0` for `recompute_all`.
+    pub simd_classified: usize,
 }
 
 impl RecomputeResult {
@@ -829,6 +844,9 @@ impl<'a> WorkbookRuntime<'a> {
             // re-evaluates everything. `recompute_dirty` is the path
             // that benefits from value-equality short-circuit.
             skipped_value_equality: 0,
+            // Phase 3.9: SIMD-eligibility profile is recompute_dirty-
+            // only. `recompute_all` is the legacy full-pass path.
+            simd_classified: 0,
         }
     }
 
@@ -869,6 +887,15 @@ impl<'a> WorkbookRuntime<'a> {
         let mut succeeded = 0;
         let mut failures: Vec<RecomputeFailure> = Vec::new();
         let mut skipped_value_equality: usize = 0;
+        // Phase 3.9 (W5-42): SIMD-eligibility profile. Incremented
+        // each time a re-evaluated formula's plan classifies into a
+        // recognized `SimdShape` (i.e. not `NotApplicable`). V1
+        // observability only — actual bulk SIMD dispatch via
+        // `simd::*` happens on the bench / FormulaRegion path
+        // (Phase 4.7+). The fact that the graph scheduler counts
+        // these tells the IDE / profile reader where region
+        // optimization would pay off.
+        let mut simd_classified: usize = 0;
 
         // Phase 3.8 (W5-41, VEQ-3-01..03) — value-equality short-
         // circuit. State for the pass:
@@ -979,9 +1006,16 @@ impl<'a> WorkbookRuntime<'a> {
             // Phase 3.6 (W5-39): route through the session's aggregate
             // cache so `SUM(Sales)`-style formulas hit the cache when
             // no cell inside `Sales` changed (AGG-3-01).
+            // Phase 3.9 (W5-42): also classify the plan for SIMD
+            // eligibility (SIMD-3-03 profile). We need the plan
+            // post-bind — call a slightly-expanded helper that
+            // returns the value AND the SimdShape classification.
             let agg_cache = session.aggregate_cache();
-            match self.try_recompute_with_aggregate_cache(sheet, &text, agg_cache) {
-                Ok(value) => {
+            match self.try_recompute_with_simd_profile(sheet, &text, agg_cache) {
+                Ok((value, simd_eligible)) => {
+                    if simd_eligible {
+                        simd_classified += 1;
+                    }
                     // Phase 3.8: value-equality check. If the freshly-
                     // computed value matches the snapshot, suppress
                     // the write entirely and don't record this cell
@@ -1012,6 +1046,7 @@ impl<'a> WorkbookRuntime<'a> {
             succeeded,
             failures,
             skipped_value_equality,
+            simd_classified,
         })
     }
 
@@ -1049,6 +1084,23 @@ impl<'a> WorkbookRuntime<'a> {
         formula_text: &Arc<str>,
         agg_cache: &dyn crate::aggregate_cache::AggregateCache,
     ) -> Result<Value, RuntimeError> {
+        self.try_recompute_with_simd_profile(sheet, formula_text, agg_cache)
+            .map(|(v, _)| v)
+    }
+
+    /// Phase 3.9 (W5-42): like `try_recompute_with_aggregate_cache`
+    /// but ALSO returns a `bool` for whether the formula's bound plan
+    /// was SIMD-eligible per `crate::lower::classify`. The bool is
+    /// pure observability — the actual SIMD dispatch via `simd::*`
+    /// happens at the bench / FormulaRegion path. `recompute_dirty`
+    /// uses this to populate `RecomputeResult.simd_classified` so the
+    /// IDE profile can show where region optimization would help.
+    fn try_recompute_with_simd_profile(
+        &mut self,
+        sheet: SheetId,
+        formula_text: &Arc<str>,
+        agg_cache: &dyn crate::aggregate_cache::AggregateCache,
+    ) -> Result<(Value, bool), RuntimeError> {
         let name_gen = self.workbook.names().generation();
         let cache_key = PlanCacheKey {
             text: Arc::clone(formula_text),
@@ -1069,13 +1121,14 @@ impl<'a> WorkbookRuntime<'a> {
                     Ok(bind_with_names(&expr, sheet, workbook.names())?)
                 })?;
 
+        // Phase 3.9: classify the plan against the SIMD kernel set.
+        // Pure function over the plan tree; no allocation.
+        let simd_eligible = crate::lower::classify(plan.as_ref()).is_applicable();
+
         let env = WorkbookEnv::new(self.workbook);
-        Ok(crate::scalar::eval_scalar_with_cache(
-            plan.as_ref(),
-            &env,
-            self.registry,
-            agg_cache,
-        ))
+        let value =
+            crate::scalar::eval_scalar_with_cache(plan.as_ref(), &env, self.registry, agg_cache);
+        Ok((value, simd_eligible))
     }
 }
 
@@ -3730,6 +3783,119 @@ mod tests {
         // value-equality skips.
         assert_eq!(result.skipped_value_equality, 0);
         ql_functions::clear_test_overrides();
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 3.9 (W5-42) — SIMD-3-01..03 acceptance tests.
+    // ----------------------------------------------------------------
+
+    /// SIMD-3-01: the bench-side multiversion-clone path (the OG-02
+    /// `=A*2` 25M-cell kernel) still binds to a recognized
+    /// `SimdShape::MulScalar`. The `bash scripts/check-multiversion-
+    /// clones.sh` gate verifies the binary disassembly; this unit
+    /// test verifies the upstream `lower::classify` still produces
+    /// the expected shape, so the graph scheduler and the bench
+    /// agree on which plans are SIMD-eligible.
+    #[test]
+    fn simd_3_01_og02_pattern_classifies_to_mul_scalar() {
+        use crate::plan::{bind, ExprPlan};
+        use ql_formula_syntax::{lex, parse};
+        // Parse `=A1 * 2` (Excel canon: 1-based row in source).
+        let tokens = lex("A1 * 2").unwrap();
+        let expr = parse(tokens).unwrap();
+        let plan = bind(&expr, 0).unwrap();
+        let shape = crate::lower::classify(&plan);
+        assert!(matches!(shape, crate::SimdShape::MulScalar { .. }));
+        // And the converse: a non-arithmetic expression doesn't
+        // accidentally claim eligibility.
+        assert!(matches!(plan, ExprPlan::Binary { .. }));
+        let str_plan = ExprPlan::String("hello".into());
+        assert!(matches!(
+            crate::lower::classify(&str_plan),
+            crate::SimdShape::NotApplicable
+        ));
+    }
+
+    /// SIMD-3-02: scalar fallback for division. `lower::classify`
+    /// MUST return `NotApplicable` for `=A1 / 2` so the Excel-canon
+    /// `#DIV/0!` error class is preserved (a SIMD reciprocal-mul
+    /// path would produce `+Inf` and surface as `#NUM!` — wrong).
+    /// This is the Phase 2A.9 H5 fix; Phase 3.9 re-affirms.
+    #[test]
+    fn simd_3_02_division_falls_back_to_scalar() {
+        use crate::plan::bind;
+        use ql_formula_syntax::{lex, parse};
+        // A1 / 2 — SIMD-recognized op shape but div semantics
+        // force scalar fallback.
+        let tokens = lex("A1 / 2").unwrap();
+        let expr = parse(tokens).unwrap();
+        let plan = bind(&expr, 0).unwrap();
+        assert_eq!(
+            crate::lower::classify(&plan),
+            crate::SimdShape::NotApplicable,
+            "Operator::Div MUST NOT be SIMD-lowered (Phase 2A.9 H5)"
+        );
+
+        // End-to-end: `=10/0` produces `#DIV/0!` through the runtime,
+        // not `#NUM!` (which would happen if reciprocal-mul SIMD
+        // were used).
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 0, "10 / 0").unwrap();
+        assert_eq!(v, Value::Error(ErrorValue::DivZero));
+    }
+
+    /// SIMD-3-03: graph profile shows region execution.
+    /// `RecomputeResult.simd_classified` counts how many dirty
+    /// formulas had plans that `classify()` recognized as SIMD-
+    /// eligible. A workbook with a mix of `=A*2` (SIMD-eligible)
+    /// and `=SUM(Sales)` (not SIMD-eligible aggregate) edits then
+    /// recomputes; the counter reflects the eligibility split.
+    #[test]
+    fn simd_3_03_profile_records_simd_eligible_formulas() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+        let mut wb = make_runtime_workbook();
+        for r in 0..5 {
+            wb.put_at(0, r, 0, Value::Number(r as f64 + 1.0));
+        }
+        wb.set_name("Sales", NamedTarget::Range(Range::new(0, 0, 0, 4, 0)))
+            .unwrap();
+        let reg = default_registry();
+        let mut graph = crate::CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 1, "A1 * 2").unwrap(); // SIMD-eligible
+            rt.set_formula(0, 1, 1, "A2 + 5").unwrap(); // SIMD-eligible
+            rt.set_formula(0, 2, 1, "SUM(Sales)").unwrap(); // NotApplicable
+            rt.set_formula(0, 3, 1, "A1 / 2").unwrap(); // NotApplicable (div)
+        }
+
+        // Trigger recompute by editing a cell inside Sales — that
+        // dirties at least the SUM formula and any direct-cell-dep
+        // formulas via the BFS.
+        let result = {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(100.0)).unwrap();
+            rt.recompute_dirty().expect("graph attached")
+        };
+        // We don't pin the exact count because it depends on which
+        // formulas the BFS reaches; we DO pin that the field is
+        // exposed and non-zero (at least `A1 * 2` reaches recompute
+        // since A1 is its direct cell dep).
+        assert!(
+            result.simd_classified >= 1,
+            "SIMD-3-03: at least one SIMD-eligible formula reaches recompute_dirty (count={})",
+            result.simd_classified
+        );
+        // Sanity: the legacy `recompute_all` path is always 0.
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let r_all = rt.recompute_all();
+        assert_eq!(
+            r_all.simd_classified, 0,
+            "recompute_all is the legacy path; simd_classified is always 0"
+        );
     }
 
     /// Phase 3.7 extra: `mark_volatile_dirty` on a workbook with zero

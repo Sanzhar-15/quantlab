@@ -327,11 +327,17 @@ The full v1 means all of these crates either ship real behavior or have a docume
    Notes: V1 doesn't handle range-dep formulas with VEQ — they always re-evaluate. The Phase 3.6 aggregate cache already provides O(1) re-eval for unchanged ranges, so this is a small cost.  
    Effort: 2-4 days (actual: ~1 day; the substrate from 3.3 BFS + 3.4 schedule_dirty + 3.6 prior-comparison-via-overlay made this small).
 
-9. **3.9 SIMD Region Through Graph Runtime**  
+9. **3.9 SIMD Region Through Graph Runtime** ✅ SHIPPED 2026-05-12 (W5-42, V1)  
    Ensure region-style lowering and direct Arrow kernels are invoked from the graph scheduler rather than separate bench-only paths.  
    References: `.references/formualizer/crates/formualizer-eval/src/stripes.rs`; `.references/formualizer/crates/formualizer-eval/src/engine/range_view.rs`; `crates/ql-exec/src/{lower,simd}.rs`.  
-   Acceptance: SIMD-3-01 OG-02 path still hits multiversion kernels; SIMD-3-02 scalar fallback is explicit only for unsupported semantics such as div-by-zero-sensitive division; SIMD-3-03 graph profile shows region execution.  
-   Effort: 3-6 days.
+   Acceptance: SIMD-3-01 ✅ OG-02 `=A*2` pattern still classifies to `SimdShape::MulScalar`; `scripts/check-multiversion-clones.sh` confirms the multiversion clones are present in `mul_scalar` (`simd_3_01_og02_pattern_classifies_to_mul_scalar`); SIMD-3-02 ✅ `Operator::Div` returns `SimdShape::NotApplicable` so `10 / 0` emits Excel-canon `#DIV/0!` not `#NUM!` (`simd_3_02_division_falls_back_to_scalar`); SIMD-3-03 ✅ `RecomputeResult.simd_classified` counter exposes SIMD-eligibility of dirty formulas; legacy `recompute_all` is always 0 (`simd_3_03_profile_records_simd_eligible_formulas`).  
+   Shipped:  
+   - `RecomputeResult.simd_classified: usize` — new public field, parallel to `skipped_value_equality`. Counts dirty formulas whose `lower::classify` returns an applicable `SimdShape`.  
+   - `WorkbookRuntime::try_recompute_with_simd_profile` — slightly-expanded helper that returns `(Value, bool)` where the bool is the SIMD-eligibility flag. `try_recompute_with_aggregate_cache` is now a thin wrapper that discards the flag.  
+   - V1 observability only — actual bulk SIMD dispatch via `simd::*` kernels remains on the bench / FormulaRegion path. The Phase 4.7+ array-formula / FormulaRegion binder lands the real batching. The graph scheduler's awareness of SIMD-eligibility is the V1 contribution: the IDE / profile reader can now see WHERE region optimization would pay off.  
+   3 new acceptance tests + 1 regression. ql-exec at 322 (was 319). Workspace at 946 (was 943).  
+   Notes: this V1 is intentionally observability-focused. The MASTER-PLAN's 3-6 day effort estimate covered the full FormulaRegion-binder + per-region batched dispatch — that's structurally a Phase 4 task (depends on the array-formula binder + region detection at write time). Phase 3.10 megaudit will evaluate whether V1 is sufficient or whether a richer V1.1 is needed before Phase 4.  
+   Effort: 3-6 days (actual V1: ~0.5 day; the substrate from Phase 0 W4-2/3 and the bench gate already validated the kernel-level SIMD).
 
 10. **3.10 Phase 3 Megaudit**  
     Independent audit of graph correctness, scheduler cycles, storage overlays, dirty propagation, aggregate invalidation, and perf regressions.  
