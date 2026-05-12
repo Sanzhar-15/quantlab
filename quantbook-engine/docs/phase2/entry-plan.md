@@ -4,11 +4,13 @@
 **Branch:** `feat/quantbook-engine` (HEAD is the 2A.13 commit — current as of session end; check `git log -1` for the exact SHA)
 **Audience:** the next session (and you, if you come back to this cold)
 
+> **STALE BANNER (added 2026-05-12 end-of-day):** This document was written when Phase 2A.3 (op log) was still deferred. Since then, 2A.3 has shipped in three commits: `dfc2a9900ef` (scaffolding) + `a6de4b4a50b` (runtime/transaction wiring) + `fc977815cd2` (`oplog.bin` persistence). The canonical engine plan is now `docs/MASTER-PLAN.md`. New sessions: read MASTER-PLAN.md first. This file remains for historical context of the Phase 2A roadmap.
+
 ---
 
 ## Read this first (60 seconds)
 
-**Phase 2A is complete.** The engine has shipped Phase 0 + Phase 1 + all of Phase 2A.1-.13. Two megaudit cycles ran (cycle 1: 2A.6 + closure 2A.7-.12; cycle 3: verification + 2A.13 fixes). The full audit findings are documented and almost entirely closed.
+**Phase 2A is complete (including 2A.3 — see banner above).** The engine has shipped Phase 0 + Phase 1 + all of Phase 2A.1-.13 + Phase 2A.3. Two megaudit cycles ran (cycle 1: 2A.6 + closure 2A.7-.12; cycle 3: verification + 2A.13 fixes). The full audit findings are documented and almost entirely closed.
 
 The Quantbook engine can:
 

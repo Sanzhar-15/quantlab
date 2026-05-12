@@ -1,14 +1,17 @@
 ---
 title: Phase 2 exit packet (Phase 2A.1-.13 close-out)
-status: Phase 2A complete + megaudit fully closed. GO for Phase 2A.3 (Loro op log) or Phase 2B.
+status: HISTORICAL — superseded by docs/MASTER-PLAN.md (2026-05-12). Phase 2A.3 has SHIPPED (commits dfc2a9900ef + a6de4b4a50b + fc977815cd2). The "GO for Phase 2A.3" recommendation below is STALE.
 date: 2026-05-12
+supersedes_pointer: docs/MASTER-PLAN.md
 ---
+
+> **STALE BANNER (added 2026-05-12 end-of-day):** This document captured the state at end of 2A.13 (HEAD `9d8bd03dc97`). Since then, Phase 2A.3 has fully shipped (op log scaffolding + runtime/transaction wiring + `.qbook/oplog.bin` persistence). The canonical engine plan is now `docs/MASTER-PLAN.md`. Read that first; this packet remains for historical record of the 2A.1-.13 close-out.
 
 # Phase 2 exit packet — Phase 2A complete
 
 This packet closes Phase 2A of the Quantbook engine. Phase 2A shipped five feature items (2A.1, 2A.2, 2A.4, 2A.5, and the deferred-from-Phase-1 H6 work in 2A.7) plus a complete megaudit cycle (2A.6 + 2A.7-.13) — the audit's findings drove most of the substantive correctness work.
 
-Phase 2A.3 (Loro op log scaffolding) remains deferred to Phase 2B+ — its consumer (the IDE / op-replay test harness) doesn't exist yet and the work benefits from a dedicated session.
+~~Phase 2A.3 (Loro op log scaffolding) remains deferred to Phase 2B+~~ — **UPDATE 2026-05-12 end-of-day: Phase 2A.3 has shipped.** See `docs/MASTER-PLAN.md` for the post-2A.3 plan.
 
 ## Shipped this phase
 
