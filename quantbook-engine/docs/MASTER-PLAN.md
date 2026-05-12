@@ -233,11 +233,12 @@ The full v1 means all of these crates either ship real behavior or have a docume
    Acceptance: G3-01 graph can rebuild from workbook deterministically; G3-02 graph mutation API covers set value, set formula, clear formula, set name, add sheet; G3-03 no petgraph hot-path dependency.  
    Effort: 3-4 days.
 
-2. **3.2 Dependency Extraction From Bound Plans**  
+2. **3.2 Dependency Extraction From Bound Plans** ✅ SHIPPED 2026-05-12 (W5-35)  
    Extract cell, range, name, volatile, and future table dependencies from `ExprPlan`. Preserve compressed range dependencies for whole-column/whole-row ranges.  
    References: `.references/formualizer/crates/formualizer-eval/src/engine/graph/formula_analysis.rs`; `.references/hyperformula/src/parser/collectDependencies.ts`; `.references/hyperformula/src/parser/RelativeDependency.ts`.  
-   Acceptance: DEP-3-01 direct cell deps captured; DEP-3-02 range deps remain compressed; DEP-3-03 named deps captured; DEP-3-04 volatile functions marked.  
-   Effort: 3-5 days.
+   Acceptance: DEP-3-01 ✅ direct cell deps captured (`dep_3_01_direct_cell_refs_captured`); DEP-3-02 ✅ range deps remain compressed (`dep_3_02_range_deps_remain_compressed`); DEP-3-03 ✅ named deps captured (`dep_3_03_named_deps_captured`); DEP-3-04 ✅ volatile functions marked (`dep_3_04_volatile_functions_marked`).  
+   Shipped: `CalcgraphSession::{formula_deps, volatile_formulas, name_to_formulas}` side-tables; `walk_plan_for_deps` recursive walker; `RebuildResult` aggregates per-formula bind failures (parallel to `RecomputeResult`); `on_set_formula` takes `&ExprPlan` (no re-binding in the hook); `on_clear_formula` evicts dep state. 9 new tests; full ql-exec suite at 268 tests. Open follow-ups: GAP-R-07 (scalar `NameRef` name-tracking) and the 3.3 dirty-propagation wire-up that consumes this substrate.  
+   Effort: 3-5 days (actual: ~1 day from 3.1 substrate; clean handoff to 3.3).
 
 3. **3.3 Dirty Propagation And Stripe Range Index**  
    Wire writes to dirty direct dependents and range dependents through Formualizer-style stripe maps. Add precision re-check to remove false positives.  

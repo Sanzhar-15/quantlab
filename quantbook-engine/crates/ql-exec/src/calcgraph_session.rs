@@ -1,34 +1,57 @@
-//! Engine Phase 3.1 (2026-05-12) — runtime ↔ calcgraph integration shell.
+//! Engine Phase 3.1+3.2 (2026-05-12) — runtime ↔ calcgraph integration.
 //!
-//! `CalcgraphSession` owns the `ql_calcgraph::Graph` plus a cell-index
-//! `HashMap<(sheet, row, col), NodeId>` for O(1) "which node represents
-//! this cell?" lookups. It lives at the engine level (in `ql-exec`) so
-//! it can reach `ql-storage::Workbook` for rebuild + `ql-formula-syntax`
-//! for lex/parse without dragging those deps into `ql-calcgraph`.
+//! `CalcgraphSession` owns the `ql_calcgraph::Graph` plus per-formula
+//! dependency tracking (cells / ranges / volatile / names). It lives
+//! at the engine level (in `ql-exec`) so it can reach
+//! `ql-storage::Workbook` for rebuild + `ql-formula-syntax` for
+//! lex/parse without dragging those deps into `ql-calcgraph`.
 //!
-//! ## Phase 3.1 scope (ownership + API shape only)
+//! ## Phase 3.1 (ownership shell, shipped W5-34)
 //!
-//! 3.1 lays the FOUNDATION for the calcgraph-runtime integration but
-//! does NOT yet do the load-bearing work:
+//! - Single-writer ownership: runtime borrows `&mut CalcgraphSession`
+//!   per edit (parallel to `&mut OpLog`).
+//! - O(1) `cell_index: HashMap<(SheetId, RowId, ColId), NodeId>` for
+//!   "which node represents this cell?" lookups.
+//! - 5 hooks (`on_set_{value,formula,name}`, `on_clear_formula`,
+//!   `on_add_sheet`) wired through `WorkbookRuntime`.
+//! - `rebuild_from_workbook` adds a `CellNode` per formula cell in
+//!   deterministic `(sheet, row, col)` sort order.
 //!
-//! - `rebuild_from_workbook` walks every formula and adds a `CellNode`
-//!   per formula cell. **Dependencies are NOT extracted yet** — that's
-//!   Phase 3.2 (`Dependency Extraction From Bound Plans`). The graph
-//!   has nodes but no edges.
-//! - The five mutation hooks (`on_set_value`, `on_set_formula`,
-//!   `on_clear_formula`, `on_set_name`, `on_add_sheet`) all exist and
-//!   are wired through the runtime, but they're STUBS — they update
-//!   the cell index where applicable and increment counters for
-//!   observability, but they don't propagate dirty bits or update
-//!   edges. Phase 3.3 (`Dirty Propagation And Stripe Range Index`)
-//!   makes them load-bearing.
-//! - `recompute_all` still walks formulas in HashMap order (GAP-R-01).
-//!   Phase 3.4 replaces it with a Tarjan-SCC-scheduled walk over the
-//!   graph.
+//! ## Phase 3.2 (this commit) — dependency extraction
 //!
-//! 3.1's contract is: the IDE / runtime CAN attach a graph session
-//! today. The session tracks state. When 3.2+ fills in the algorithms,
-//! the API surface doesn't change — only the internals get richer.
+//! - `walk_plan_for_deps` recursively walks a bound `ExprPlan`,
+//!   producing a `FormulaDeps` collection of (a) direct cell refs,
+//!   (b) named-range refs (from `AggregateNameRef`), (c) names
+//!   referenced (currently only via `AggregateNameRef`; see below),
+//!   (d) volatile-function presence.
+//! - `on_set_formula` now takes `&ExprPlan` and runs the extraction.
+//!   The session updates per-formula `formula_deps`, the volatile
+//!   set, and a name→formulas reverse index.
+//! - `rebuild_from_workbook` lex+parse+binds every formula and runs
+//!   the same extraction. Failures aggregate into
+//!   `RebuildResult { attempted, succeeded, failures }` — parallel
+//!   to `RecomputeResult` (Phase 2B.2). The session is still returned
+//!   on partial failure so the caller can inspect.
+//! - Dependency storage is **session-side**, not in the `Graph`. The
+//!   Phase 0 `Graph` edges are append-only; tracking the live deps on
+//!   the session lets Phase 3.3 implement re-registration cleanly
+//!   without needing edge removal (Phase 3.3 may swap in
+//!   Formualizer-style delta-edges for the graph too).
+//!
+//! ## Still deferred to Phase 3.3+
+//!
+//! - **Dirty propagation.** The 5 mutation hooks bump counters and
+//!   maintain dep state but don't yet fan out via
+//!   `Graph::dependents_for_cell`. Phase 3.3 wires that.
+//! - **Topological recompute.** `recompute_all` still HashMap-order
+//!   (GAP-R-01). Phase 3.4 replaces with Tarjan SCC.
+//! - **Name-dep tracking from non-AggregateNameRef paths.** When a
+//!   `NameRef` resolves to a Cell/Number/Bool/Text target, the binder
+//!   substitutes the underlying value and the name is lost. Today
+//!   such names invalidate via the PlanCache's `name_gen` counter
+//!   (Phase 2B.3) — a workbook-wide invalidation, not per-name.
+//!   Phase 3.3 may switch to per-name dirty propagation; until then
+//!   the PlanCache covers correctness.
 //!
 //! ## Ownership model
 //!
@@ -48,14 +71,116 @@
 //! struct that the binding crate can wrap cleanly (per GAP-PS-09).
 //! Today they're separate to keep refactor scope bounded.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ql_calcgraph::{Graph, NodeId};
+use ql_formula_syntax::{lex, parse};
 use ql_storage::Workbook;
-use ql_types::{ColId, RowId, SheetId};
+use ql_types::{ColId, Range, RowId, SheetId};
 
+use crate::plan::{bind_with_names, ExprPlan};
 use crate::workbook_runtime::RuntimeError;
+
+/// Phase 3.2 (2026-05-12) — hardcoded list of functions whose RESULT
+/// depends on something other than their arguments (NOW changes every
+/// recompute even with no inputs; INDIRECT reads a cell named by a
+/// string at runtime). The Phase 3.7 volatile-invalidation pass will
+/// use this set to schedule volatile re-evaluation. Tracked here as
+/// V0; Engine Phase 4.3 (function library expansion) replaces with
+/// per-function metadata on `FunctionRegistry`.
+///
+/// Names MUST be canonical upper-case (matches the parser's
+/// canonicalization for `Expr::Function::name`).
+pub(crate) fn is_volatile_function(name: &str) -> bool {
+    matches!(
+        name,
+        // Time / date — value changes every recompute.
+        "NOW" | "TODAY"
+        // Pseudo-random — value changes every recompute.
+        | "RAND" | "RANDBETWEEN" | "RANDARRAY"
+        // Address-by-string — result depends on workbook structure;
+        // a cell rename anywhere can affect the result.
+        | "INDIRECT"
+        // Structural offset — result depends on the current grid.
+        | "OFFSET"
+        // Environment introspection.
+        | "INFO" | "CELL"
+    )
+}
+
+/// Phase 3.2 — direct-dep collection extracted from walking a bound
+/// `ExprPlan`. Fields are owned (no borrows) so the caller can pass
+/// the collection around or store it without lifetime ceremony.
+///
+/// `cells`, `named_ranges`, and `names` are deduplicated by the
+/// `extract_and_register_deps` orchestrator (the walker emits
+/// duplicates; the orchestrator collapses).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FormulaDeps {
+    /// Direct cell references (`ExprPlan::CellRef`). Resolved sheet
+    /// is included.
+    pub cells: Vec<(SheetId, RowId, ColId)>,
+    /// Named-range references (`ExprPlan::AggregateNameRef`). Each
+    /// entry pairs the canonical (uppercase) name with the resolved
+    /// `Range` payload.
+    pub named_ranges: Vec<(Arc<str>, Range)>,
+    /// Names referenced by the formula. Currently only names that
+    /// resolve to ranges populate this (via `AggregateNameRef`); see
+    /// module docs for the limitation around scalar-resolved names.
+    pub names: Vec<Arc<str>>,
+    /// `true` iff any volatile function appears anywhere in the
+    /// plan tree.
+    pub is_volatile: bool,
+}
+
+impl FormulaDeps {
+    /// Total dependency count (cells + named ranges). Useful for
+    /// summary metrics; Phase 3.10 megaudit / ql-profile will surface
+    /// per-formula dep counts in the graph-profile JSON.
+    pub fn len(&self) -> usize {
+        self.cells.len() + self.named_ranges.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cells.is_empty() && self.named_ranges.is_empty()
+    }
+}
+
+/// Phase 3.2 — recursive walker. Accumulates dependencies + volatile-
+/// function presence by descending the `ExprPlan` tree. Does not
+/// allocate any nodes or touch any graph state; pure read.
+pub(crate) fn walk_plan_for_deps(plan: &ExprPlan, deps: &mut FormulaDeps) {
+    match plan {
+        ExprPlan::Number(_) | ExprPlan::Bool(_) | ExprPlan::String(_) => {
+            // Leaf literals carry no dependencies.
+        }
+        ExprPlan::CellRef {
+            sheet, row, col, ..
+        } => {
+            deps.cells.push((*sheet, *row, *col));
+        }
+        ExprPlan::Binary { lhs, rhs, .. } => {
+            walk_plan_for_deps(lhs, deps);
+            walk_plan_for_deps(rhs, deps);
+        }
+        ExprPlan::Unary { operand, .. } => {
+            walk_plan_for_deps(operand, deps);
+        }
+        ExprPlan::Function { name, args } => {
+            if is_volatile_function(name) {
+                deps.is_volatile = true;
+            }
+            for arg in args {
+                walk_plan_for_deps(arg, deps);
+            }
+        }
+        ExprPlan::AggregateNameRef { name, range } => {
+            deps.named_ranges.push((Arc::clone(name), *range));
+            deps.names.push(Arc::clone(name));
+        }
+    }
+}
 
 /// Phase 3.1 runtime ↔ calcgraph integration container. Owns the
 /// `Graph` plus an O(1) cell index. Construct via `new()` for empty,
@@ -73,6 +198,23 @@ pub struct CalcgraphSession {
     /// it here so the runtime hooks can answer "do I already have a
     /// node for this cell?" without scanning.
     cell_index: HashMap<(SheetId, RowId, ColId), NodeId>,
+    /// Phase 3.2: per-formula live dependency view. Keyed by the
+    /// formula cell's `NodeId`; replaced wholesale on re-bind so
+    /// stale entries can't leak (the Phase 0 graph's edges are
+    /// append-only; this side-table sidesteps that until Phase 3.3
+    /// brings delta-edge storage in).
+    formula_deps: HashMap<NodeId, FormulaDeps>,
+    /// Phase 3.2: formulas marked volatile by `walk_plan_for_deps`.
+    /// Phase 3.7 (volatile invalidation) will read this set every
+    /// recompute cycle to schedule re-evaluation regardless of
+    /// upstream dependency state.
+    volatile_formulas: HashSet<NodeId>,
+    /// Phase 3.2: reverse index from canonical name → formulas that
+    /// reference it. Today populated only by `AggregateNameRef` (the
+    /// only plan variant that preserves the name after binding). Used
+    /// in Phase 3.3 to mark formulas dirty when a named range
+    /// changes.
+    name_to_formulas: HashMap<Arc<str>, HashSet<NodeId>>,
     /// Cumulative observability counters. Phase 3.1 records hook
     /// invocations for verification and future ql-profile integration.
     hook_counts: HookCounts,
@@ -91,20 +233,44 @@ pub struct HookCounts {
     pub add_sheet: u64,
 }
 
-/// Errors emitted by `rebuild_from_workbook`. Engine Phase 3.1 only
-/// surfaces formula-text parse failures — when 3.2 adds dependency
-/// extraction, this gains variants for binder errors. Note that today,
-/// `rebuild` is lenient: a malformed persisted formula doesn't fail the
-/// whole rebuild (similar to `recompute_all`'s `RecomputeResult`); we
-/// just skip nodes for cells that can't lex/parse. 3.2 changes this to
-/// strict-error-aggregation parallel to `RecomputeResult`.
-#[derive(Debug, thiserror::Error)]
-pub enum RebuildError {
-    // Reserved for Phase 3.2 use: structural bind errors during rebuild
-    // will become variants here. For now `rebuild_from_workbook` returns
-    // `Ok(Self)` and skips problem cells.
-    #[error("rebuild error (reserved for Phase 3.2)")]
-    Reserved,
+/// Phase 3.2: aggregate outcome of `rebuild_from_workbook`. Parallel
+/// to `RecomputeResult` from Phase 2B.2 — failures are aggregated
+/// per-cell rather than short-circuiting, so the caller gets a
+/// session containing as much as could be built plus a list of
+/// formulas that couldn't be processed.
+///
+/// `attempted` and `succeeded` are workbook-formula counts; `failures`
+/// lists each formula that couldn't lex/parse/bind, carrying its
+/// position and the underlying `RuntimeError`. The returned
+/// `CalcgraphSession` is usable; cells whose formulas failed simply
+/// have a CellNode but no extracted dependencies.
+#[derive(Debug)]
+pub struct RebuildResult {
+    pub session: CalcgraphSession,
+    pub attempted: usize,
+    pub succeeded: usize,
+    pub failures: Vec<RebuildFailure>,
+}
+
+/// Single-formula failure during rebuild. Captures everything the
+/// IDE needs to display a per-cell diagnostic without re-walking the
+/// workbook.
+#[derive(Debug)]
+pub struct RebuildFailure {
+    pub sheet: SheetId,
+    pub row: RowId,
+    pub col: ColId,
+    pub formula_text: Arc<str>,
+    pub error: RuntimeError,
+}
+
+impl RebuildResult {
+    pub fn is_complete(&self) -> bool {
+        self.failures.is_empty()
+    }
+    pub fn failed_count(&self) -> usize {
+        self.failures.len()
+    }
 }
 
 impl CalcgraphSession {
@@ -146,20 +312,111 @@ impl CalcgraphSession {
         self.hook_counts
     }
 
+    /// Phase 3.2: live dependency view for a formula cell. `None` if
+    /// the cell has no formula or hasn't been bound yet (rebuild
+    /// failed to lex/parse, or the cell isn't a formula at all).
+    pub fn formula_deps(&self, node: NodeId) -> Option<&FormulaDeps> {
+        self.formula_deps.get(&node)
+    }
+
+    /// Phase 3.2: is this formula's plan marked volatile? Volatile
+    /// formulas are scheduled for re-evaluation on every recompute
+    /// cycle in Phase 3.7.
+    pub fn is_volatile(&self, node: NodeId) -> bool {
+        self.volatile_formulas.contains(&node)
+    }
+
+    /// Phase 3.2: read-only view of the volatile-formula set. Phase
+    /// 3.7 reads this every recompute cycle.
+    pub fn volatile_formulas(&self) -> &HashSet<NodeId> {
+        &self.volatile_formulas
+    }
+
+    /// Phase 3.2: formulas that reference `name` (canonical
+    /// uppercase). Today populated only from `AggregateNameRef`
+    /// occurrences. Phase 3.3 reads this from `on_set_name` to mark
+    /// dependents dirty.
+    pub fn formulas_referencing_name(&self, name: &str) -> Option<&HashSet<NodeId>> {
+        let upper = name.to_ascii_uppercase();
+        self.name_to_formulas.get(upper.as_str())
+    }
+
+    /// Phase 3.2 orchestrator: walk a bound `ExprPlan`, populate the
+    /// session's per-formula dep view + volatile set + name→formulas
+    /// reverse index. Replaces any prior entry for the same formula
+    /// node wholesale, so re-bind cleanly drops stale deps even
+    /// though the Phase 0 graph's edges are append-only.
+    ///
+    /// Internal — public callers go through `on_set_formula` or
+    /// rebuild. `formula_node` MUST already exist in the graph (call
+    /// `or_insert_cell_node` first if necessary).
+    fn extract_and_register_deps(&mut self, formula_node: NodeId, plan: &ExprPlan) {
+        // First, evict any prior deps for this formula. Required so
+        // re-binding a formula whose text changed (e.g. `=A1` → `=B1`)
+        // doesn't leave the old cell-dep stamped on the session.
+        self.remove_formula_deps(formula_node);
+
+        // Walk and collect.
+        let mut deps = FormulaDeps::default();
+        walk_plan_for_deps(plan, &mut deps);
+
+        // Register: deduplicate (the walker emits duplicates if the
+        // formula references the same cell twice; the session stores
+        // each cell once).
+        let mut seen_cells: HashSet<(SheetId, RowId, ColId)> = HashSet::new();
+        deps.cells.retain(|c| seen_cells.insert(*c));
+        let mut seen_names: HashSet<Arc<str>> = HashSet::new();
+        deps.names.retain(|n| seen_names.insert(Arc::clone(n)));
+        // named_ranges may contain the same name twice — that's
+        // legitimate (`SUM(Sales) + AVERAGE(Sales)` references the
+        // same range from two arg positions) — leave as-is.
+
+        if deps.is_volatile {
+            self.volatile_formulas.insert(formula_node);
+        }
+        for name in &deps.names {
+            self.name_to_formulas
+                .entry(Arc::clone(name))
+                .or_default()
+                .insert(formula_node);
+        }
+        if !deps.is_empty() || deps.is_volatile {
+            self.formula_deps.insert(formula_node, deps);
+        }
+    }
+
+    /// Internal: remove all dep state for `formula_node`. Used when
+    /// a formula is re-bound (different text → different deps) or
+    /// cleared.
+    fn remove_formula_deps(&mut self, formula_node: NodeId) {
+        if let Some(prior) = self.formula_deps.remove(&formula_node) {
+            for name in &prior.names {
+                if let Some(set) = self.name_to_formulas.get_mut(name) {
+                    set.remove(&formula_node);
+                    if set.is_empty() {
+                        self.name_to_formulas.remove(name);
+                    }
+                }
+            }
+        }
+        self.volatile_formulas.remove(&formula_node);
+    }
+
     /// **G3-01 acceptance.** Deterministic rebuild from an existing
-    /// `Workbook`: walks every formula cell in sorted `(sheet, row, col)`
-    /// order, adds a `CellNode` per cell, populates the cell index.
-    /// Returns a fresh `CalcgraphSession` ready for the runtime to
-    /// attach.
+    /// `Workbook`. Walks every formula cell in sorted `(sheet, row, col)`
+    /// order, adds a `CellNode` per cell, populates the cell index,
+    /// and (Phase 3.2) lex+parse+binds each formula to extract
+    /// dependencies.
     ///
-    /// "Deterministic" here means: same workbook → same node IDs in the
-    /// same order. Workbook's underlying `formula_cells` is a `HashMap`
-    /// (iteration order arbitrary), so we sort before adding nodes.
+    /// Determinism: same workbook → same node IDs in the same order.
+    /// Workbook's underlying `formula_cells` is a `HashMap` (arbitrary
+    /// iteration order), so we sort before adding nodes.
     ///
-    /// Phase 3.1 does NOT extract dependencies during rebuild — the
-    /// graph has nodes but no edges. Phase 3.2's `Dependency Extraction
-    /// From Bound Plans` pass adds edges.
-    pub fn rebuild_from_workbook(wb: &Workbook) -> Result<Self, RebuildError> {
+    /// Failures aggregate into [`RebuildResult::failures`] rather than
+    /// short-circuiting — the returned session is usable, just with
+    /// some formulas missing dep info. Matches Phase 2B.2's
+    /// `RecomputeResult` shape.
+    pub fn rebuild_from_workbook(wb: &Workbook) -> RebuildResult {
         let mut session = Self::new();
 
         // Snapshot + sort the formula list for determinism.
@@ -167,19 +424,55 @@ impl CalcgraphSession {
             .iter_formulas()
             .map(|(s, r, c, f)| (s, r, c, Arc::clone(f)))
             .collect();
-        formulas.sort_by(|a, b| {
-            // Lexicographic (sheet, row, col).
-            (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2))
-        });
+        formulas.sort_by_key(|a| (a.0, a.1, a.2));
 
-        for (sheet, row, col, _text) in formulas {
-            // Phase 3.1: add a CellNode; index it. No dependency
-            // extraction yet. Phase 3.2 will lex+parse+bind the text
-            // and walk for cell/range deps here.
-            session.or_insert_cell_node(sheet, row, col);
+        let attempted = formulas.len();
+        let mut succeeded = 0;
+        let mut failures: Vec<RebuildFailure> = Vec::new();
+
+        for (sheet, row, col, text) in formulas {
+            // Always create the CellNode + index, even if bind fails.
+            // The graph still represents the formula cell; only the
+            // dep view is empty for that cell.
+            let node = session.or_insert_cell_node(sheet, row, col);
+
+            // Phase 3.2: lex + parse + bind + extract deps. Failure
+            // accumulates; we keep going.
+            match Self::bind_text(&text, sheet, wb) {
+                Ok(plan) => {
+                    session.extract_and_register_deps(node, &plan);
+                    succeeded += 1;
+                }
+                Err(error) => failures.push(RebuildFailure {
+                    sheet,
+                    row,
+                    col,
+                    formula_text: text,
+                    error,
+                }),
+            }
         }
 
-        Ok(session)
+        RebuildResult {
+            session,
+            attempted,
+            succeeded,
+            failures,
+        }
+    }
+
+    /// Internal: lex + parse + bind a formula text against the
+    /// workbook's NameTable. Used by `rebuild_from_workbook` and by
+    /// `on_set_formula`'s text-only fallback. Phase 3.3 may add a
+    /// cached version that integrates with `PlanCache`.
+    fn bind_text(
+        text: &str,
+        owning_sheet: SheetId,
+        wb: &Workbook,
+    ) -> Result<ExprPlan, RuntimeError> {
+        let tokens = lex(text)?;
+        let expr = parse(tokens)?;
+        Ok(bind_with_names(&expr, owning_sheet, wb.names())?)
     }
 
     /// **G3-02 acceptance (hook 1/5).** Mutation hook fired by
@@ -200,24 +493,33 @@ impl CalcgraphSession {
     }
 
     /// **G3-02 acceptance (hook 2/5).** Mutation hook fired by
-    /// `WorkbookRuntime::set_formula`. Phase 3.1 stub: ensures the cell
-    /// has a node (creating one if first encounter) so Phase 3.2 can
-    /// later attach the formula's dependencies.
+    /// `WorkbookRuntime::set_formula`. Ensures the cell has a node,
+    /// then (Phase 3.2) walks the bound plan to register cell + range
+    /// + name + volatile dependencies on the session.
     ///
-    /// `formula_text` is currently unused — Phase 3.2 will lex+parse+
-    /// bind it here to extract cell/range/name dependencies.
-    pub fn on_set_formula(&mut self, sheet: SheetId, row: RowId, col: ColId, _formula_text: &str) {
+    /// The runtime passes the already-bound `ExprPlan` it just
+    /// evaluated; this hook does NOT re-bind. Re-binding here would
+    /// either duplicate work (the runtime just did it) or pessimize
+    /// the cache (the runtime's `PlanCache` would miss). The plan
+    /// shape is stable since 2B.4 (Phase 3.2 doesn't add new
+    /// variants).
+    pub fn on_set_formula(&mut self, sheet: SheetId, row: RowId, col: ColId, plan: &ExprPlan) {
         self.hook_counts.set_formula = self.hook_counts.set_formula.saturating_add(1);
-        let _ = self.or_insert_cell_node(sheet, row, col);
+        let node = self.or_insert_cell_node(sheet, row, col);
+        self.extract_and_register_deps(node, plan);
     }
 
     /// **G3-02 acceptance (hook 3/5).** Mutation hook fired by
-    /// `WorkbookRuntime::clear_formula`. Phase 3.1 stub: bumps counter.
-    /// Phase 3.3 will remove outgoing edges for the cleared cell's
-    /// node (since its dependencies no longer apply).
+    /// `WorkbookRuntime::clear_formula`. Phase 3.2: drop the cell's
+    /// dep entry from `formula_deps`, the volatile set, and the
+    /// name→formulas index. The graph's outgoing edges stay (Phase 0
+    /// append-only contract); Phase 3.3 may swap in delta-edges for
+    /// proper removal.
     pub fn on_clear_formula(&mut self, sheet: SheetId, row: RowId, col: ColId) {
         self.hook_counts.clear_formula = self.hook_counts.clear_formula.saturating_add(1);
-        let _ = (sheet, row, col);
+        if let Some(node) = self.cell_index.get(&(sheet, row, col)).copied() {
+            self.remove_formula_deps(node);
+        }
     }
 
     /// **G3-02 acceptance (hook 4/5).** Mutation hook fired by
@@ -235,32 +537,16 @@ impl CalcgraphSession {
         self.hook_counts.add_sheet = self.hook_counts.add_sheet.saturating_add(1);
     }
 
-    // Phase 3.2 plans to add `extract_dependencies(...)` here:
-    // lex+parse+bind the formula text against the workbook+NameTable,
-    // walk the bound ExprPlan, and call
-    //   self.graph.add_edge(formula_node, dep_cell_node)
-    //   self.graph.register_range_dependency(formula_node, range, sheet)
-    // for each direct/range dependency. Phase 3.1 intentionally omits
-    // this — the API surface (rebuild + hooks) is stable here; the
-    // algorithms land later without breaking callers.
-}
-
-/// Forward-compat error mapping for Phase 3.2: a future bind error
-/// during a runtime hook would propagate as `RuntimeError`. Today's
-/// hooks don't fail; this `From` is staged so Phase 3.2 doesn't churn
-/// the runtime signatures.
-impl From<RebuildError> for RuntimeError {
-    fn from(_e: RebuildError) -> Self {
-        // Phase 3.1: no current code path produces a RebuildError. The
-        // From is here to lock the variant when 3.2 adds binding-time
-        // failures during rebuild.
-        unreachable!("RebuildError variants are reserved for Phase 3.2 — none constructible today")
-    }
+    // Phase 3.3 lands the next layer here: dirty propagation. The 5
+    // hooks above currently update dep state but don't fan out via
+    // `Graph::dependents_for_cell`; 3.3 wires that, and 3.4 plugs
+    // Tarjan SCC into `recompute_all`.
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::BindError;
     use ql_types::Value;
 
     fn workbook_with_formulas(formulas: &[(SheetId, RowId, ColId, &str)]) -> Workbook {
@@ -288,8 +574,10 @@ mod tests {
     #[test]
     fn rebuild_from_empty_workbook_is_empty() {
         let wb = Workbook::new();
-        let s = CalcgraphSession::rebuild_from_workbook(&wb).unwrap();
-        assert_eq!(s.graph().node_count(), 0);
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(r.is_complete());
+        assert_eq!(r.attempted, 0);
+        assert_eq!(r.session.graph().node_count(), 0);
     }
 
     /// G3-01: rebuild from a workbook with N formulas → N CellNodes.
@@ -297,7 +585,10 @@ mod tests {
     fn rebuild_creates_one_cell_node_per_formula() {
         let wb =
             workbook_with_formulas(&[(0, 0, 0, "1 + 1"), (0, 0, 1, "2 + 2"), (0, 1, 0, "A1 + B1")]);
-        let s = CalcgraphSession::rebuild_from_workbook(&wb).unwrap();
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(r.is_complete(), "all three formulas should bind");
+        assert_eq!(r.succeeded, 3);
+        let s = r.session;
         assert_eq!(s.graph().node_count(), 3);
         // Every formula cell has an indexed node.
         assert!(s.cell_node_for(0, 0, 0).is_some());
@@ -321,7 +612,9 @@ mod tests {
         ]);
         let mut prior_ids: Option<Vec<NodeId>> = None;
         for _ in 0..10 {
-            let s = CalcgraphSession::rebuild_from_workbook(&wb).unwrap();
+            let r = CalcgraphSession::rebuild_from_workbook(&wb);
+            assert!(r.is_complete());
+            let s = r.session;
             // Collect node ids in sheet/row/col-sorted order.
             let mut ids: Vec<((SheetId, RowId, ColId), NodeId)> =
                 s.cell_index.iter().map(|(k, v)| (*k, *v)).collect();
@@ -334,13 +627,17 @@ mod tests {
         }
     }
 
-    /// G3-02: each of the five mutation hooks bumps its counter.
+    /// G3-02: each of the five mutation hooks bumps its counter. Phase
+    /// 3.2 changed `on_set_formula` to take `&ExprPlan`; this test
+    /// passes a trivial literal plan since it only cares about counter
+    /// increments.
     #[test]
     fn mutation_hooks_each_bump_their_counter() {
         let mut s = CalcgraphSession::new();
+        let plan = ExprPlan::Number(1.0);
         s.on_set_value(0, 0, 0);
-        s.on_set_formula(0, 0, 1, "A1 + 1");
-        s.on_set_formula(0, 0, 2, "A1 * 2");
+        s.on_set_formula(0, 0, 1, &plan);
+        s.on_set_formula(0, 0, 2, &plan);
         s.on_clear_formula(0, 0, 1);
         s.on_set_name("Tax");
         s.on_set_name("Discount");
@@ -359,9 +656,10 @@ mod tests {
     #[test]
     fn on_set_formula_is_idempotent_for_cell_node_creation() {
         let mut s = CalcgraphSession::new();
-        s.on_set_formula(0, 3, 7, "1 + 1");
+        let plan = ExprPlan::Number(0.0);
+        s.on_set_formula(0, 3, 7, &plan);
         let first_node = s.cell_node_for(0, 3, 7).unwrap();
-        s.on_set_formula(0, 3, 7, "2 + 2");
+        s.on_set_formula(0, 3, 7, &plan);
         let second_node = s.cell_node_for(0, 3, 7).unwrap();
         assert_eq!(
             first_node, second_node,
@@ -391,5 +689,357 @@ mod tests {
         // the dep change. Treat this as documentation more than
         // enforcement.
         assert_eq!(s.graph().node_count(), 1);
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 3.2 acceptance gates (DEP-3-01..04).
+    //
+    // These exercise the new `walk_plan_for_deps` + dep registration
+    // machinery via the public `rebuild_from_workbook` /
+    // `formula_deps` / `is_volatile` / `formulas_referencing_name` API.
+    // The Phase 3.7 dirty-propagation work will lean on every field
+    // populated here.
+    // ----------------------------------------------------------------
+
+    /// DEP-3-01: direct cell references in a formula land in
+    /// `FormulaDeps::cells` exactly once each, even when the formula
+    /// references the same cell twice.
+    #[test]
+    fn dep_3_01_direct_cell_refs_captured() {
+        // `A1 + B1 + A1` references A1 twice and B1 once. The walker
+        // emits A1 twice; the orchestrator dedupes to one entry.
+        let wb = workbook_with_formulas(&[(0, 1, 0, "A1 + B1 + A1")]);
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(r.is_complete(), "formula should bind cleanly");
+        let s = r.session;
+        let node = s.cell_node_for(0, 1, 0).unwrap();
+        let deps = s.formula_deps(node).expect("dep view present");
+        assert_eq!(deps.cells.len(), 2, "A1 and B1 — deduped, A1 appears once");
+        assert!(deps.cells.contains(&(0, 0, 0)), "A1 captured");
+        assert!(deps.cells.contains(&(0, 0, 1)), "B1 captured");
+        assert!(deps.named_ranges.is_empty());
+        assert!(!deps.is_volatile);
+    }
+
+    /// DEP-3-02: a SUM-over-named-range stays as one `named_range`
+    /// entry — it does NOT explode into N cell deps. This is the
+    /// HyperFormula-style range-as-single-edge optimization that lets
+    /// the calcgraph stay tractable on big sheets.
+    #[test]
+    fn dep_3_02_range_deps_remain_compressed() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S0");
+        // Seed a contiguous numeric block.
+        for r in 0..10u32 {
+            wb.put_at(0, r, 0, Value::Number(r as f64));
+        }
+        // Define a name pointing at that block.
+        wb.set_name(
+            "Block",
+            ql_storage::NamedTarget::Range(Range {
+                sheet: 0,
+                start_row: 0,
+                end_row: 9,
+                start_col: 0,
+                end_col: 0,
+            }),
+        )
+        .unwrap();
+        // Formula that uses the name in aggregate context.
+        wb.put_at(0, 0, 5, Value::Blank);
+        wb.put_formula(0, 0, 5, "SUM(Block)");
+
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(r.is_complete(), "SUM(Block) must bind");
+        let s = r.session;
+        let node = s.cell_node_for(0, 0, 5).unwrap();
+        let deps = s.formula_deps(node).expect("dep view present");
+        assert!(
+            deps.cells.is_empty(),
+            "named range must not expand to per-cell deps"
+        );
+        assert_eq!(
+            deps.named_ranges.len(),
+            1,
+            "one entry per named range reference"
+        );
+        let (name, range) = &deps.named_ranges[0];
+        assert_eq!(name.as_ref(), "BLOCK", "name canonicalized to uppercase");
+        assert_eq!(range.end_row, 9, "range payload preserved");
+    }
+
+    /// DEP-3-03: the name→formulas reverse index is populated whenever
+    /// a formula references a name (today: only via AggregateNameRef).
+    /// Phase 3.3 reads this to mark dependents dirty when the name's
+    /// target changes.
+    #[test]
+    fn dep_3_03_named_deps_captured() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S0");
+        for r in 0..5u32 {
+            wb.put_at(0, r, 0, Value::Number(r as f64));
+        }
+        wb.set_name(
+            "Sales",
+            ql_storage::NamedTarget::Range(Range {
+                sheet: 0,
+                start_row: 0,
+                end_row: 4,
+                start_col: 0,
+                end_col: 0,
+            }),
+        )
+        .unwrap();
+        wb.put_at(0, 0, 5, Value::Blank);
+        wb.put_at(0, 1, 5, Value::Blank);
+        wb.put_formula(0, 0, 5, "SUM(Sales)");
+        wb.put_formula(0, 1, 5, "AVERAGE(Sales) + SUM(Sales)");
+
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(r.is_complete());
+        let s = r.session;
+
+        let n_sum = s.cell_node_for(0, 0, 5).unwrap();
+        let n_avg = s.cell_node_for(0, 1, 5).unwrap();
+
+        let referencing = s
+            .formulas_referencing_name("Sales")
+            .expect("reverse index populated");
+        assert_eq!(referencing.len(), 2, "both formulas reverse-indexed");
+        assert!(referencing.contains(&n_sum));
+        assert!(referencing.contains(&n_avg));
+
+        // Lookup is case-insensitive (matches NameTable canonicalization).
+        assert!(s.formulas_referencing_name("SALES").is_some());
+        assert!(s.formulas_referencing_name("sales").is_some());
+        assert!(
+            s.formulas_referencing_name("Unknown").is_none(),
+            "unknown name returns None"
+        );
+    }
+
+    /// DEP-3-04: volatile functions land in the volatile set + bump
+    /// `FormulaDeps::is_volatile`. Phase 3.7 reads this set every
+    /// recompute cycle.
+    #[test]
+    fn dep_3_04_volatile_functions_marked() {
+        let wb = workbook_with_formulas(&[
+            (0, 0, 0, "NOW() + 1"),
+            (0, 0, 1, "RAND() * 100"),
+            (0, 0, 2, "A1 + B1"), // not volatile
+        ]);
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(r.is_complete(), "all formulas should bind");
+        let s = r.session;
+
+        let n_now = s.cell_node_for(0, 0, 0).unwrap();
+        let n_rand = s.cell_node_for(0, 0, 1).unwrap();
+        let n_plain = s.cell_node_for(0, 0, 2).unwrap();
+
+        assert!(s.is_volatile(n_now), "NOW() marks formula volatile");
+        assert!(s.is_volatile(n_rand), "RAND() marks formula volatile");
+        assert!(!s.is_volatile(n_plain), "plain arithmetic is not volatile");
+
+        let vol = s.volatile_formulas();
+        assert_eq!(vol.len(), 2);
+        assert!(vol.contains(&n_now));
+        assert!(vol.contains(&n_rand));
+
+        // The per-formula dep view also carries the bit.
+        assert!(s.formula_deps(n_now).unwrap().is_volatile);
+        assert!(s.formula_deps(n_rand).unwrap().is_volatile);
+    }
+
+    /// Phase 3.2 invariant: re-binding a formula REPLACES its dep set
+    /// wholesale — stale cell deps from the prior text don't linger.
+    #[test]
+    fn rebind_replaces_prior_deps() {
+        use ql_formula_syntax::Operator;
+        let mut s = CalcgraphSession::new();
+        // First plan: =A1+B1 — two cells.
+        let plan_v1 = ExprPlan::Binary {
+            op: Operator::Plus,
+            lhs: Box::new(ExprPlan::CellRef {
+                sheet: 0,
+                row: 0,
+                col: 0,
+                abs_col: false,
+                abs_row: false,
+            }),
+            rhs: Box::new(ExprPlan::CellRef {
+                sheet: 0,
+                row: 0,
+                col: 1,
+                abs_col: false,
+                abs_row: false,
+            }),
+        };
+        s.on_set_formula(0, 5, 5, &plan_v1);
+        let node = s.cell_node_for(0, 5, 5).unwrap();
+        assert_eq!(s.formula_deps(node).unwrap().cells.len(), 2);
+
+        // Second plan: =C1 — one cell. Prior A1/B1 must be evicted.
+        let plan_v2 = ExprPlan::CellRef {
+            sheet: 0,
+            row: 0,
+            col: 2,
+            abs_col: false,
+            abs_row: false,
+        };
+        s.on_set_formula(0, 5, 5, &plan_v2);
+        let deps = s.formula_deps(node).unwrap();
+        assert_eq!(deps.cells, vec![(0, 0, 2)]);
+    }
+
+    /// Phase 3.2: clearing a formula evicts its dep entry from
+    /// `formula_deps`, the volatile set, and the name→formulas reverse
+    /// index.
+    #[test]
+    fn clear_formula_evicts_dep_state() {
+        // Note (Phase 3.2): names like `Foo`/`Pi` collide with the
+        // parser's column-letter heuristic. Use a longer name.
+        let mut wb = Workbook::new();
+        wb.add_sheet("S0");
+        wb.put_at(0, 0, 0, Value::Number(1.0));
+        wb.set_name(
+            "MyRange",
+            ql_storage::NamedTarget::Range(Range {
+                sheet: 0,
+                start_row: 0,
+                end_row: 0,
+                start_col: 0,
+                end_col: 0,
+            }),
+        )
+        .unwrap();
+        wb.put_at(0, 0, 5, Value::Blank);
+        wb.put_formula(0, 0, 5, "SUM(MyRange) + NOW()");
+
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(r.is_complete(), "{:?}", r.failures);
+        let mut s = r.session;
+
+        let node = s.cell_node_for(0, 0, 5).unwrap();
+        assert!(s.formula_deps(node).is_some());
+        assert!(s.is_volatile(node));
+        assert!(s.formulas_referencing_name("MyRange").is_some());
+
+        s.on_clear_formula(0, 0, 5);
+
+        assert!(s.formula_deps(node).is_none(), "dep entry evicted");
+        assert!(
+            !s.is_volatile(node),
+            "volatile bit dropped on clear_formula"
+        );
+        assert!(
+            s.formulas_referencing_name("MyRange").is_none(),
+            "name reverse-index dropped — last referencing formula gone"
+        );
+    }
+
+    /// Phase 3.2: rebuild aggregates per-formula bind failures rather
+    /// than short-circuiting. The session returned still has CellNodes
+    /// for every formula cell (so the graph topology is complete),
+    /// just no dep info for the failed ones.
+    #[test]
+    fn rebuild_aggregates_per_formula_failures() {
+        let wb = workbook_with_formulas(&[
+            (0, 0, 0, "1 + 1"),               // ok
+            (0, 0, 1, "1 +"),                 // parse fail (trailing operator)
+            (0, 0, 2, "SUM(MyUnknownName1)"), // bind fail (UnresolvedName)
+        ]);
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert_eq!(r.attempted, 3);
+        assert_eq!(r.succeeded, 1);
+        assert_eq!(r.failed_count(), 2, "{:?}", r.failures);
+        // Every formula cell still has a node (graph topology intact).
+        assert_eq!(r.session.graph().node_count(), 3);
+        // The good one has dep info; the failures do not.
+        let n_ok = r.session.cell_node_for(0, 0, 0).unwrap();
+        let n_bad1 = r.session.cell_node_for(0, 0, 1).unwrap();
+        let n_bad2 = r.session.cell_node_for(0, 0, 2).unwrap();
+        // `1 + 1` has no cell deps but the entry isn't allocated since
+        // there's nothing to track — that's by design (we only allocate
+        // FormulaDeps when there's at least one dep or a volatile bit).
+        assert!(r.session.formula_deps(n_ok).is_none());
+        assert!(r.session.formula_deps(n_bad1).is_none());
+        assert!(r.session.formula_deps(n_bad2).is_none());
+
+        // Failures carry full position + text + error class.
+        let by_addr: HashMap<(SheetId, RowId, ColId), &RebuildFailure> = r
+            .failures
+            .iter()
+            .map(|f| ((f.sheet, f.row, f.col), f))
+            .collect();
+        assert!(matches!(by_addr[&(0, 0, 1)].error, RuntimeError::Parse(_)));
+        // (0, 0, 2) is either a Parse or Bind error depending on how the
+        // parser tokenizes the trailing-digit identifier — assert it's
+        // any structural failure (which is what `rebuild` aggregates).
+        let bad2 = &by_addr[&(0, 0, 2)].error;
+        assert!(
+            matches!(
+                bad2,
+                RuntimeError::Bind(BindError::UnresolvedName(_))
+                    | RuntimeError::Parse(_)
+                    | RuntimeError::Lex(_)
+            ),
+            "unexpected error class for (0,0,2): {bad2:?}"
+        );
+    }
+
+    /// `walk_plan_for_deps` is pure — calling it twice on the same
+    /// plan with two fresh `FormulaDeps` produces equal collections.
+    #[test]
+    fn walk_plan_for_deps_is_pure() {
+        use ql_formula_syntax::Operator;
+        let plan = ExprPlan::Binary {
+            op: Operator::Plus,
+            lhs: Box::new(ExprPlan::CellRef {
+                sheet: 0,
+                row: 0,
+                col: 0,
+                abs_col: false,
+                abs_row: false,
+            }),
+            rhs: Box::new(ExprPlan::Function {
+                name: "NOW".into(),
+                args: Vec::new(),
+            }),
+        };
+        let mut a = FormulaDeps::default();
+        let mut b = FormulaDeps::default();
+        walk_plan_for_deps(&plan, &mut a);
+        walk_plan_for_deps(&plan, &mut b);
+        assert_eq!(a, b);
+        assert!(a.is_volatile);
+        assert_eq!(a.cells.len(), 1);
+    }
+
+    /// The hardcoded volatile set covers Excel-canon volatile
+    /// functions and is upper-case canonical.
+    #[test]
+    fn volatile_function_set_is_canonical() {
+        for f in [
+            "NOW",
+            "TODAY",
+            "RAND",
+            "RANDBETWEEN",
+            "RANDARRAY",
+            "INDIRECT",
+            "OFFSET",
+            "INFO",
+            "CELL",
+        ] {
+            assert!(is_volatile_function(f), "{f} must be volatile");
+        }
+        // Lowercase / mixed are NOT recognized — the parser
+        // canonicalizes function names to uppercase before binding, so
+        // the set only ever sees uppercase.
+        assert!(!is_volatile_function("now"));
+        assert!(!is_volatile_function("Sum"));
+        // Sanity: non-volatile arithmetic functions are not in the set.
+        assert!(!is_volatile_function("SUM"));
+        assert!(!is_volatile_function("AVERAGE"));
+        assert!(!is_volatile_function("IF"));
     }
 }

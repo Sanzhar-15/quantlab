@@ -1,7 +1,7 @@
 # Known engine gaps — checklist with target phases
 
 **Status:** Living document, updated at each phase boundary  
-**Date last touched:** 2026-05-12 (Engine Phase 2B.1 close-out)  
+**Date last touched:** 2026-05-12 (Engine Phase 3.2 close-out — W5-35)  
 **Companion:** `docs/MASTER-PLAN.md`
 
 Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a gap is closed, move its row to the "Closed" section at the bottom and reference the closing commit.
@@ -12,12 +12,13 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 
 | ID | Gap | Reproduce | Owner | Target phase |
 |---|---|---|---|---|
-| GAP-R-01 | `recompute_all` walks formulas in `HashMap`-arbitrary order; dependency chains may compute stale values mid-recompute | `ql-exec/src/workbook_runtime.rs::recompute_all` (see "Iteration order is HashMap-arbitrary" comment) | Engine | Engine Phase 3 (graph-driven recompute) |
+| GAP-R-01 | `recompute_all` walks formulas in `HashMap`-arbitrary order; dependency chains may compute stale values mid-recompute. Phase 3.2 (2026-05-12) builds the dep-graph substrate (`CalcgraphSession::formula_deps` + `volatile_formulas`); Phase 3.4 plugs Tarjan SCC over the dirty subset. | `ql-exec/src/workbook_runtime.rs::recompute_all` (see "Iteration order is HashMap-arbitrary" comment) | Engine | Engine Phase 3.4 (Tarjan SCC scheduler) |
 | ~~GAP-R-02~~ | ~~`recompute_all` short-circuits on first failure~~ — **CLOSED** in Engine Phase 2B.2 (commit `393ce2f765f`): replaced with `RecomputeResult` aggregating per-cell failures. |
 | ~~GAP-R-03~~ | ~~Bind-plan re-derived from formula text on every recompute~~ — **CLOSED** in Engine Phase 2B.3 (commit `bd3147a1045`): `PlanCache` keyed by `(formula_text, sheet, name_gen)` on the runtime; `recompute_all` second-pass is all hits; name mutations bump generation and invalidate; counters exposed via `runtime.cache_stats()` + `Timings::bind_plan_cache_hits/misses`. |
-| GAP-R-04 | Volatile functions (`NOW`, `RAND`, `TODAY`) parse but have no invalidation model | `ql-functions/src/registry.rs` registers volatile fns; no dirty propagation on recompute cycle | Engine | Engine Phase 3.7 (volatile invalidation) |
+| GAP-R-04 | Volatile functions (`NOW`, `RAND`, `TODAY`, `RANDBETWEEN`, `RANDARRAY`, `INDIRECT`, `OFFSET`, `INFO`, `CELL`) have no invalidation model. Phase 3.2 (2026-05-12) introduced the `is_volatile_function` set + populates `CalcgraphSession::volatile_formulas`; the actual dirty-on-recompute-tick logic lands in 3.7. | `ql-functions/src/registry.rs` registers volatile fns; `ql-exec/src/calcgraph_session.rs::is_volatile_function` set populated but unused by `recompute_all` | Engine | Engine Phase 3.7 (volatile invalidation) |
 | GAP-R-05 | Value-equality short-circuit not implemented; unchanged upstream still dirties downstream | None — pure missing optimization | Engine | Engine Phase 3.8 |
 | GAP-R-06 | `PlanCache` lives on `WorkbookRuntime`, which is per-edit. The documented IDE pattern drops the runtime after each edit → drops the cache. Phase 2B.3 cache observability is real only across one long-lived runtime/recompute block. | `ql-exec/src/workbook_runtime.rs::WorkbookRuntime` + `docs/architecture/ide-consumer-contract.md` §1 | Engine | Engine Phase 6.1 (`WorkbookSession`) moves cache ownership to the session. |
+| GAP-R-07 | Phase 3.2 dep extraction loses the name when a `NameRef` resolves to `NamedTarget::Constant` or `NamedTarget::Cell` — the binder substitutes the value/CellRef and the source name does not appear in `ExprPlan` (so `CalcgraphSession::name_to_formulas` does not see it). Today the `PlanCache.name_gen` counter (Phase 2B.3) invalidates ALL formulas on any name mutation, so correctness is preserved; only the per-name precision is missing. Phase 3.3 may add an explicit `Expr::NameRef`-preserving plan variant or carry a per-formula name-set on the side. | `ql-exec/src/calcgraph_session.rs` module docs (§ "Still deferred"); `ql-exec/src/plan.rs::bind_with_names` scalar-NameRef branches | Engine | Engine Phase 3.3 (precise name dirty propagation) |
 
 ### Bind / semantics
 

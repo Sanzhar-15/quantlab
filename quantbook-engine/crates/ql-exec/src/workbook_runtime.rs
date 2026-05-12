@@ -430,15 +430,15 @@ impl<'a> WorkbookRuntime<'a> {
         // is at the runtime entry, the binder just stamps `owning_sheet`
         // onto unresolved CellRefs. (Phase 2B.7 audit doc D6 fix.)
         self.workbook.put_at(sheet, row, col, value.clone());
-        let text_for_hook = Arc::clone(&formula_text);
         self.workbook.put_formula(sheet, row, col, formula_text);
 
         // Phase 3.1: notify calcgraph after the workbook mutation
-        // succeeds. Hook is a counter-bump + cell-index update today
-        // (Phase 3.2 extracts dependencies; Phase 3.3 wires dirty
-        // propagation).
+        // succeeds. Phase 3.2 (2026-05-12): pass the already-bound
+        // `ExprPlan` straight from the PlanCache so the hook walks it
+        // for cell/range/name + volatile deps without re-binding. The
+        // plan is shared by Arc; the hook only needs `&ExprPlan`.
         if let Some(g) = self.graph.as_deref_mut() {
-            g.on_set_formula(sheet, row, col, text_for_hook.as_ref());
+            g.on_set_formula(sheet, row, col, plan.as_ref());
         }
 
         Ok(value)
@@ -2618,8 +2618,13 @@ mod tests {
             rt.set_formula(0, 2, 0, "A1 * 2").unwrap();
         }
 
-        // Now rebuild a session from the workbook.
-        let mut graph = CalcgraphSession::rebuild_from_workbook(&wb).unwrap();
+        // Now rebuild a session from the workbook. Phase 3.2 — rebuild
+        // now returns `RebuildResult` with per-formula failure aggregation.
+        let rebuild = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(rebuild.is_complete(), "no formula should fail to bind");
+        assert_eq!(rebuild.attempted, 2);
+        assert_eq!(rebuild.succeeded, 2);
+        let mut graph = rebuild.session;
         assert_eq!(
             graph.graph().node_count(),
             2,
