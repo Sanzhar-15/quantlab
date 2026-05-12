@@ -23,7 +23,7 @@ use std::sync::Arc;
 use ql_formula_syntax::{lex, parse, LexError, ParseError};
 use ql_functions::FunctionRegistry;
 use ql_storage::Workbook;
-use ql_types::{ColId, RowId, SheetId, Value};
+use ql_types::{ColId, RowId, SheetId, Value, MAX_COLUMN, MAX_ROW};
 
 use crate::env::WorkbookEnv;
 use crate::plan::{bind_with_names, BindError};
@@ -40,6 +40,39 @@ pub(crate) fn validate_sheet(workbook: &Workbook, sheet: SheetId) -> Result<(), 
         return Err(RuntimeError::InvalidSheet {
             sheet,
             sheet_count: count,
+        });
+    }
+    Ok(())
+}
+
+/// Phase 2A.7 audit H1 (2026-05-12) helper. Combines sheet validation with
+/// row/col bounds checks so the runtime entry points refuse out-of-grid
+/// coordinates before any work that would otherwise panic inside
+/// `Sheet::put` (which asserts `row <= MAX_ROW && col <= MAX_COLUMN`). The
+/// Phase 2A.6 audit closed sheet-id panics but missed row/col — three
+/// independent megaudit agents flagged the gap. `pub(crate)` so
+/// `WorkbookTransaction` can call the same validator at buffer time.
+pub(crate) fn validate_cell(
+    workbook: &Workbook,
+    sheet: SheetId,
+    row: RowId,
+    col: ColId,
+) -> Result<(), RuntimeError> {
+    validate_sheet(workbook, sheet)?;
+    if row > MAX_ROW {
+        return Err(RuntimeError::InvalidCell {
+            sheet,
+            row,
+            col,
+            why: "row exceeds MAX_ROW (1,048,575)",
+        });
+    }
+    if col > MAX_COLUMN {
+        return Err(RuntimeError::InvalidCell {
+            sheet,
+            row,
+            col,
+            why: "col exceeds MAX_COLUMN (16,383)",
         });
     }
     Ok(())
@@ -63,6 +96,17 @@ pub enum RuntimeError {
 
     #[error("invalid sheet {sheet}: workbook has {sheet_count} sheets")]
     InvalidSheet { sheet: SheetId, sheet_count: usize },
+
+    /// Phase 2A.7 audit H1: row/col outside the Excel grid (MAX_ROW = 1,048,575;
+    /// MAX_COLUMN = 16,383). Surfaces at buffer time so `Sheet::put` doesn't
+    /// panic mid-commit. `why` describes which bound was exceeded.
+    #[error("invalid cell (sheet={sheet}, row={row}, col={col}): {why}")]
+    InvalidCell {
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        why: &'static str,
+    },
 
     #[error(
         "conflicting transaction ops on cell (sheet={sheet}, row={row}, col={col}): \
@@ -116,11 +160,11 @@ impl<'a> WorkbookRuntime<'a> {
         col: ColId,
         formula_text: impl Into<Arc<str>>,
     ) -> Result<Value, RuntimeError> {
-        // Phase 2A.6 audit L4: validate sheet up front. Without this check, an
-        // invalid sheet id sneaks past lex/parse/bind (the binder doesn't see
-        // the destination sheet) and panics inside `Workbook::put_at` — and the
-        // formula text is already lexed/parsed/bound by then, wasted work.
-        validate_sheet(self.workbook, sheet)?;
+        // Phase 2A.7 audit H1 (was 2A.6 L4 sheet-only): validate sheet AND
+        // row/col bounds up front. Without these checks, out-of-grid cells
+        // sneak past lex/parse/bind and panic inside `Sheet::put` (which
+        // asserts `row <= MAX_ROW && col <= MAX_COLUMN`).
+        validate_cell(self.workbook, sheet, row, col)?;
 
         let formula_text = formula_text.into();
         let tokens = lex(formula_text.as_ref())?;
@@ -149,8 +193,8 @@ impl<'a> WorkbookRuntime<'a> {
 
     /// Set a cell to a literal value (no formula). Clears any existing formula
     /// association at the cell — typing a value over a formula cell deletes the
-    /// formula per Excel canon. Phase 2A.6 audit L4: returns `RuntimeError`
-    /// instead of panicking on an invalid sheet.
+    /// formula per Excel canon. Phase 2A.7 audit H1: validates sheet + row/col
+    /// bounds; returns `RuntimeError` instead of panicking on out-of-grid input.
     pub fn set_value(
         &mut self,
         sheet: SheetId,
@@ -158,7 +202,7 @@ impl<'a> WorkbookRuntime<'a> {
         col: ColId,
         value: Value,
     ) -> Result<(), RuntimeError> {
-        validate_sheet(self.workbook, sheet)?;
+        validate_cell(self.workbook, sheet, row, col)?;
         self.workbook.put_at(sheet, row, col, value);
         self.workbook.clear_formula(sheet, row, col);
         Ok(())
@@ -381,6 +425,79 @@ mod tests {
             }
             other => panic!("expected InvalidSheet, got {other:?}"),
         }
+    }
+
+    /// Phase 2A.7 audit H1 (2026-05-12): out-of-grid row or col now surfaces as
+    /// `RuntimeError::InvalidCell` instead of panicking inside `Sheet::put`.
+    #[test]
+    fn set_formula_rejects_row_above_max() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // MAX_ROW = 1,048,575 — anything above is invalid.
+        let result = rt.set_formula(0, 1_048_576, 0, "1 + 1");
+        match result {
+            Err(RuntimeError::InvalidCell {
+                sheet,
+                row,
+                col,
+                why,
+            }) => {
+                assert_eq!((sheet, row, col), (0, 1_048_576, 0));
+                assert!(why.contains("row"));
+            }
+            other => panic!("expected InvalidCell with row > MAX_ROW, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_formula_rejects_col_above_max() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // MAX_COLUMN = 16,383 — anything above is invalid.
+        let result = rt.set_formula(0, 0, 16_384, "1 + 1");
+        match result {
+            Err(RuntimeError::InvalidCell {
+                sheet,
+                row,
+                col,
+                why,
+            }) => {
+                assert_eq!((sheet, row, col), (0, 0, 16_384));
+                assert!(why.contains("col"));
+            }
+            other => panic!("expected InvalidCell with col > MAX_COLUMN, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_value_rejects_invalid_cell() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        let result = rt.set_value(0, 9_999_999, 0, Value::Number(1.0));
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::InvalidCell { row: 9_999_999, .. })
+            ),
+            "expected InvalidCell, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn set_formula_at_max_row_max_col_ok() {
+        // Boundary case: exactly MAX_ROW and MAX_COLUMN are accepted.
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        let v = rt.set_formula(0, 1_048_575, 16_383, "1 + 1").unwrap();
+        assert_eq!(v, Value::Number(2.0));
     }
 
     #[test]

@@ -1,13 +1,18 @@
 //! Abstract Syntax Tree node definitions.
 //!
-//! Per spec Part V §4 Week 2 Days 5-6. **THIS COMMIT SHIPS TYPE DEFINITIONS ONLY** — the
-//! Pratt parser that constructs these nodes is intentionally deferred to a fresh session
-//! per the opus-architecture audit finding #9 ("the parser is the 2-3 day item; ship in a
-//! focused block with reference reading done first").
+//! Per spec Part V §4 Week 2 Days 5-6. The AST shapes lock the parser's output
+//! vocabulary and the binder's input vocabulary; the Phase 1 W5-1 Pratt parser
+//! builds these trees, the Phase 1 W5-2 printer round-trips them, and the
+//! Phase 0 W4-1 binder in `ql-exec::plan` lowers them to `ExprPlan`.
 //!
-//! The shape locks here are deliberately complete (matches `_QUANTBOOK-MASTER-PLAN.md` §6.3
-//! AST list: "Number, String, Bool, Ref, Range, BinaryOp, UnaryOp, Function, Array, Spill")
-//! so future commits add parser logic without re-shaping the AST.
+//! Phase 2A.1 (2026-05-12) added the `NameRef(Arc<str>)` variant for
+//! defined-name references; the binder resolves it via the workbook's
+//! `NameTable` at bind time.
+//!
+//! AST list aligned with `_QUANTBOOK-MASTER-PLAN.md` §6.3: Number, String,
+//! Bool, CellRef, RangeRef, Binary, Unary, Function, Array, Spill, NameRef.
+//! `Array` and `Spill` are reserved for Phase 3+ dynamic-array work; the
+//! binder rejects them with `BindError::UnsupportedVariant`.
 
 use std::sync::Arc;
 

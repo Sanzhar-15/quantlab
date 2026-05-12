@@ -37,7 +37,7 @@ pub mod workbook_runtime;
 pub use env::{CellEnv, MapEnv, WorkbookEnv};
 pub use loader::{load_workbook_and_recompute, LoadAndRecomputeError};
 pub use lower::{classify, dispatch, SimdShape};
-pub use plan::{bind, BindError, ExprPlan};
+pub use plan::{bind, bind_with_names, BindError, ExprPlan, NameLookup, ResolvedName};
 pub use scalar::{eval_scalar, eval_scalar_with_registry};
 pub use simd::{
     add_array, add_scalar, div_array, mul_array, mul_scalar, scalar_sub, sub_array, sub_scalar,

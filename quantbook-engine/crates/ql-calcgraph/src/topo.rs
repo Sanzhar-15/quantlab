@@ -171,7 +171,16 @@ fn tarjan_dfs(
                 // Unvisited dirty child — recurse.
                 visit_first(w, next_index, indices, lowlinks, on_scc_stack, scc_stack);
                 dfs_stack.push((w, 0));
-            } else if *on_scc_stack.get(&w).unwrap_or(&false) {
+            } else if *on_scc_stack
+                .get(&w)
+                .expect("topo invariant: every key in `indices` must also be in `on_scc_stack` — visit_first populates both atomically")
+            {
+                // Phase 2A.7 audit M13: switched from `unwrap_or(&false)` to `.expect(...)`.
+                // The prior fallback silently treated "missing key" as "not on stack",
+                // conflating "not yet visited" with "explicitly off-stack" — masking a
+                // Tarjan invariant violation. Per no-fallbacks rule, an invariant
+                // violation must panic loudly, not produce subtly-wrong SCC results.
+                //
                 // Back-edge or cross-edge to a node currently on the SCC stack — update
                 // v's lowlink with w's index.
                 let w_idx = indices[&w];

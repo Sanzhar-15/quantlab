@@ -713,6 +713,7 @@ dependencies = [
  "arrow-schema",
  "criterion",
  "num_cpus",
+ "ql-storage",
 ]
 
 [[package]]

@@ -33,10 +33,31 @@ impl FunctionRegistry {
         }
     }
 
-    /// Register a function under `name`. `name` is the canonical uppercase form; lookup
-    /// is case-insensitive at `lookup` time.
+    /// Register a function under `name`.
+    ///
+    /// Phase 2A.7 audit M5: `name` MUST already be canonical upper-case. This is
+    /// asserted at registration time so a stray `register("sum", ...)` doesn't
+    /// silently create an unreachable entry (lookups uppercase the query, so a
+    /// lower-case key would never be found). Duplicate registrations also
+    /// panic — silent override would let a typo replace a built-in with a buggy
+    /// shim. Phase 2 has a closed default function set; if dynamic registration
+    /// ever becomes a real use case, swap this for `Result<(), RegisterError>`.
     pub fn register(&mut self, name: &'static str, f: ScalarFn) {
-        self.fns.insert(name, f);
+        assert!(
+            !name.is_empty(),
+            "FunctionRegistry::register: name must not be empty"
+        );
+        assert!(
+            name.bytes().all(|b| !b.is_ascii_lowercase()),
+            "FunctionRegistry::register: name {name:?} must be canonical upper-case; \
+             lookups uppercase the query, so a lower-case key is unreachable"
+        );
+        let prior = self.fns.insert(name, f);
+        assert!(
+            prior.is_none(),
+            "FunctionRegistry::register: duplicate registration for {name:?} — \
+             silent override would let a typo replace a built-in"
+        );
     }
 
     /// Case-insensitive lookup. Returns `None` if not registered.
@@ -168,6 +189,47 @@ mod tests {
         let var_s = r.lookup("VAR.S").unwrap();
         let result = var_s(&[Value::Number(1.0), Value::Number(3.0)]);
         assert_eq!(result, Value::Number(2.0));
+    }
+
+    // ===== Phase 2A.7 audit M5: register contract =====
+
+    #[test]
+    #[should_panic(expected = "canonical upper-case")]
+    fn register_lowercase_name_panics() {
+        let mut r = FunctionRegistry::new();
+        r.register("sum", scalar_fns::sum);
+    }
+
+    #[test]
+    #[should_panic(expected = "canonical upper-case")]
+    fn register_mixed_case_name_panics() {
+        let mut r = FunctionRegistry::new();
+        r.register("Sum", scalar_fns::sum);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate registration")]
+    fn register_duplicate_name_panics() {
+        let mut r = FunctionRegistry::new();
+        r.register("SUM", scalar_fns::sum);
+        r.register("SUM", scalar_fns::sum);
+    }
+
+    #[test]
+    #[should_panic(expected = "name must not be empty")]
+    fn register_empty_name_panics() {
+        let mut r = FunctionRegistry::new();
+        r.register("", scalar_fns::sum);
+    }
+
+    #[test]
+    fn register_dotted_uppercase_name_ok() {
+        // Dotted Excel-canonical names (VAR.S, STDEV.P) are upper-case.
+        let mut r = FunctionRegistry::new();
+        r.register("CUSTOM.FN", scalar_fns::sum);
+        assert!(r.lookup("CUSTOM.FN").is_some());
+        // Case-insensitive lookup still works.
+        assert!(r.lookup("custom.fn").is_some());
     }
 
     #[test]

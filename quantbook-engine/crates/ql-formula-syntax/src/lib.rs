@@ -1,22 +1,30 @@
-//! `ql-formula-syntax` — Token, Lexer, AST type definitions.
+//! `ql-formula-syntax` — Excel-canonical formula lex + parse + print pipeline.
 //!
-//! **PHASE 0 PARTIAL** — Week 2 Days 5-6 scope ships in two parts:
-//! 1. (THIS COMMIT) Token, Lexer, AST types. Bounded; ~45 tokenizer tests + AST shape tests.
-//! 2. (FUTURE) Pratt parser, AST printer, 100 parser tests. Deferred to a fresh session
-//!    after the reference reading sprint (`docs/phase0/references-reading-log.md` Section 5).
+//! Module map (Phase 0 → Phase 2A):
 //!
-//! Rationale (codex-r11 audit + opus-arch #9): the Pratt parser is the 2-3 day item that
-//! benefits from clear-headed implementation with Formualizer + IronCalc parser internals
-//! freshly read. Shipping the lexer + AST shapes now unblocks Week 2 Day 7 fixture writing,
-//! Week 3 calcgraph (which consumes `Expr`), and Week 4 ql-exec — none of which need the
-//! parser to exist yet (the test fixtures construct `Expr` trees directly).
+//! - [`token`] (Phase 0 W2-5) — `Token`, `Operator` enums; the lexer's output
+//!   vocabulary.
+//! - [`ast`] (Phase 0 W2-6; extended Phase 2A.1) — `Expr` tree with variants
+//!   for Number, String, Bool, CellRef, RangeRef, Binary, Unary, Function,
+//!   Array, Spill, and (Phase 2A.1) `NameRef(Arc<str>)` for defined-name
+//!   references.
+//! - [`lexer`] (Phase 0 W2-5; extended Phase 2A.5) — `lex()`: source → tokens.
+//!   Covers numbers, strings, identifiers (including Phase 2A.5 dotted names
+//!   like `VAR.S`, `STDEV.P`), A1 cell refs, ranges via Colon, whole-column /
+//!   whole-row sentinels, operators, punctuation. ASCII-whitespace strict.
+//!   Phase 3+ deferred: R1C1, sheet-qualified refs, structured table refs,
+//!   cross-workbook, array literals.
+//! - [`parser`] (Phase 1 W5-1) — `parse()`: tokens → `Expr`. Pratt-style with
+//!   Excel-canonical precedence (unary > ^ > * / > + - > & > comparison).
+//!   Function-call disambiguation across Ident / CellRef / BareColumn (e.g.
+//!   `LOG10(2)` lexes as CellRef but parses as a function call when `(`
+//!   follows). TRUE / FALSE recognized as booleans.
+//! - [`printer`] (Phase 1 W5-2) — `print()`: `Expr` → source. Round-trip
+//!   property `parse(print(parse(s))) == parse(s)` locked by tests.
 //!
-//! Phase 0 lexer covers: numbers, strings, identifiers, A1 cell refs, ranges via Colon,
-//! whole-column / whole-row sentinels, operators, punctuation. Deferred to Phase 3+:
-//! R1C1, sheet-qualified, structured table refs, cross-workbook, array literals.
-//!
-//! The `AI()` reservation per CORR-06 / T4-D05 is intercepted at parser level (not yet
-//! built here) and emits `Error(AINotAvailable)` from `ql-types`.
+//! The `AI()` reservation per CORR-06 / T4-D05 is canonicalized at parser
+//! level and dispatches through `ql_functions::default_registry` to a
+//! sentinel that returns `Error(AINotAvailable)`.
 
 pub mod ast;
 pub mod lexer;

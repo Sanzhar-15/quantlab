@@ -13,7 +13,7 @@
 //! it reads Arrow chunks via `ColumnStore::iter_chunks` for batch processing.
 
 use ql_storage::{NameTable, NamedTarget};
-use ql_types::{ColId, RowId, SheetId, Value};
+use ql_types::{ColId, ErrorValue, RowId, SheetId, Value};
 
 use crate::plan::{NameLookup, ResolvedName};
 
@@ -36,13 +36,17 @@ impl<'w> WorkbookEnv<'w> {
 
 impl<'w> CellEnv for WorkbookEnv<'w> {
     fn read_cell(&self, sheet: SheetId, row: RowId, col: ColId) -> Value {
+        // Phase 2A.7 audit H6 (2026-05-12): out-of-bounds sheet now surfaces
+        // `Value::Error(ErrorValue::Ref)` — Excel's canonical `#REF!`. Prior
+        // behavior silently mapped missing-sheet to `Value::Blank`, which
+        // hid stale-sheet refs in saved formulas (e.g., a formula authored
+        // against Sheet3 in a workbook later truncated to 2 sheets). Two
+        // megaudit agents flagged the silent fallback. Within an existing
+        // sheet, missing cells still return `Blank` — that's correct Excel
+        // canon for "empty cell."
         match self.workbook.sheet(sheet) {
             Some(s) => s.read(row, col),
-            // Out-of-bounds sheet — Excel returns #REF!. Per no-fallbacks rule, this is
-            // a SEMANTIC choice (not a fallback): Phase 0 evaluator deliberately maps
-            // missing-sheet to Blank for now, matching the Excel "removed sheet" behavior.
-            // When sheet-deletion lands Phase 3+, this maps to ErrorValue::Ref.
-            None => Value::Blank,
+            None => Value::Error(ErrorValue::Ref),
         }
     }
 }
@@ -130,11 +134,13 @@ mod tests {
         assert_eq!(e.read_cell(0, 5, 2), Value::Blank);
     }
 
+    /// Phase 2A.7 audit H6 (2026-05-12): missing-sheet reads return `#REF!`,
+    /// not `Blank`. (Was previously a silent Phase-3-deferred fallback.)
     #[test]
-    fn workbook_env_blank_for_missing_sheet() {
+    fn workbook_env_ref_error_for_missing_sheet() {
         let wb = ql_storage::Workbook::new();
         let e = WorkbookEnv::new(&wb);
-        assert_eq!(e.read_cell(99, 0, 0), Value::Blank);
+        assert_eq!(e.read_cell(99, 0, 0), Value::Error(ErrorValue::Ref));
     }
 
     #[test]

@@ -81,10 +81,12 @@ impl MachineReport {
             rustflags_env: env::var("RUSTFLAGS").ok(),
             cargo_build_rustflags_env: env::var("CARGO_BUILD_RUSTFLAGS").ok(),
             cargo_encoded_rustflags_env: env::var("CARGO_ENCODED_RUSTFLAGS").ok(),
-            chunk_rows: env::var("QBOOK_CHUNK_ROWS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(16_384),
+            // Phase 2A.7 audit H10: route through ql-storage's loud-on-parse-failure
+            // helper. The previous inline `.unwrap_or(16_384)` re-introduced the exact
+            // silent-fallback bug that the storage layer was hardened against in
+            // Phase 0 — a misconfigured `QBOOK_CHUNK_ROWS=abc` would have the storage
+            // layer panic correctly while the bench report substituted a lie.
+            chunk_rows: ql_storage::chunk_rows_from_env() as usize,
             rayon_num_threads: env::var("RAYON_NUM_THREADS").ok(),
             simd: SimdDispatch::detect(),
         }

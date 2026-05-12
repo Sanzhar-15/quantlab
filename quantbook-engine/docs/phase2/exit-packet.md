@@ -68,8 +68,8 @@ This packet closes Phase 2A of the Quantbook engine. Phase 2A shipped four featu
 Deferred from 2A.6 audit (all LOW or non-blocking MEDIUM):
 
 - **`.qbook` NameTable persistence**: the schema doesn't serialize defined names. Pinned by `loader.rs::named_range_formula_round_trips_through_load_and_recompute`. Fix lives in `ql-io::qbook_format` with a schema-version bump.
-- **`recompute_all` partial-state on Err** (audit M4): short-circuits on the first failing formula; caller has no way to know how far it got. Add `RecomputeResult` carrying succeeded-count + failed cell.
-- **`load_workbook_and_recompute` partial workbook drop** (audit M5): on `Err`, the partially recomputed workbook is dropped. Consider `LoadAndRecomputeError::Recompute { workbook, error }`.
+- **`recompute_all` partial-state on Err** (audit M4): the runtime-direct entry point still short-circuits on the first failing formula and has no way to surface succeeded-count to the caller. The loader path is now closed (see below). Open: add `RecomputeResult` carrying succeeded-count + failed cell to `WorkbookRuntime::recompute_all` itself.
+- ~~`load_workbook_and_recompute` partial workbook drop (audit M5)~~ — **closed** by commit `5ebd8707c41` (W5-16 / 2A.6 M5 follow-up). `LoadAndRecomputeError::Recompute` is now a struct variant carrying the partial workbook + the underlying `RuntimeError`. The IDE can recover and render overlays from the partial state.
 - **Bind-plan cache** (audit L3): `recompute_all` re-lexes/parses/binds every formula on every call. Cache `ExprPlan` next to formula text in `Workbook::formula_cells` so recompute is bind-cache hit + eval.
 - **AVERAGE-without-parens UX** (audit L10): `BindError::UnresolvedName` doesn't hint when the name matches a registered function. IDE polish.
 - **10k-op transaction stress test** (audit L6): no perf floor established.

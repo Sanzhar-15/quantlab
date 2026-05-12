@@ -39,7 +39,7 @@ use ql_types::{ColId, RowId, SheetId, Value};
 use crate::env::WorkbookEnv;
 use crate::plan::{bind_with_names, ExprPlan};
 use crate::scalar::eval_scalar_with_registry;
-use crate::workbook_runtime::{validate_sheet, RuntimeError};
+use crate::workbook_runtime::{validate_cell, RuntimeError};
 
 /// Phase 2A.6 audit H4: track the *kind* of op last buffered for each cell so
 /// `put_value` after `put_formula` (or vice versa) on the same cell can be
@@ -112,7 +112,7 @@ impl<'a> WorkbookTransaction<'a> {
         col: ColId,
         value: Value,
     ) -> Result<(), RuntimeError> {
-        validate_sheet(self.workbook, sheet)?;
+        validate_cell(self.workbook, sheet, row, col)?;
         self.check_op_kind(sheet, row, col, OpKind::Value)?;
         self.ops.push(PendingOp::Value {
             sheet,
@@ -150,7 +150,7 @@ impl<'a> WorkbookTransaction<'a> {
         col: ColId,
         formula_text: impl Into<Arc<str>>,
     ) -> Result<(), RuntimeError> {
-        validate_sheet(self.workbook, sheet)?;
+        validate_cell(self.workbook, sheet, row, col)?;
         self.check_op_kind(sheet, row, col, OpKind::Formula)?;
 
         let text = formula_text.into();
@@ -596,6 +596,53 @@ mod tests {
                 })
             ),
             "expected InvalidSheet, got {result:?}"
+        );
+    }
+
+    // ===== Phase 2A.7 audit H1: row/col validation =====
+
+    #[test]
+    fn put_value_rejects_row_above_max() {
+        let mut wb = make_wb();
+        let reg = default_registry();
+        let mut tx = WorkbookTransaction::new(&mut wb, &reg);
+
+        let result = tx.put_value(0, 1_048_576, 0, Value::Number(1.0));
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::InvalidCell { row: 1_048_576, .. })
+            ),
+            "expected InvalidCell, got {result:?}"
+        );
+        assert_eq!(tx.op_count(), 0);
+    }
+
+    #[test]
+    fn put_formula_rejects_col_above_max() {
+        let mut wb = make_wb();
+        let reg = default_registry();
+        let mut tx = WorkbookTransaction::new(&mut wb, &reg);
+
+        let result = tx.put_formula(0, 0, 16_384, "1 + 1");
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidCell { col: 16_384, .. })),
+            "expected InvalidCell, got {result:?}"
+        );
+        assert_eq!(tx.op_count(), 0);
+    }
+
+    #[test]
+    fn put_value_at_max_row_max_col_ok() {
+        let mut wb = make_wb();
+        let reg = default_registry();
+        let mut tx = WorkbookTransaction::new(&mut wb, &reg);
+        tx.put_value(0, 1_048_575, 16_383, Value::Number(42.0))
+            .unwrap();
+        tx.commit();
+        assert_eq!(
+            wb.read(Address::new(0, 1_048_575, 16_383)),
+            Value::Number(42.0)
         );
     }
 

@@ -14,3 +14,8 @@ arrow-array  = { workspace = true }
 arrow-schema = { workspace = true }
 criterion    = { workspace = true }
 num_cpus     = { workspace = true }
+# Phase 2A.7 audit H10: defer QBOOK_CHUNK_ROWS parsing to ql-storage's
+# `chunk_rows_from_env`, which panics loudly on parse failure. Prior bench
+# behavior silently defaulted, which would let a misconfigured A7 sweep
+# benchmark the wrong chunk size while reporting another.
+ql-storage   = { path = "../ql-storage" }
