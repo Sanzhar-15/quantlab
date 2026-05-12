@@ -983,6 +983,14 @@ suite('messageProtocol -- webview messages', () => {
 		assert.strictEqual(validateWebviewMessage(env({ type: 'recheckDataset' })).ok, true);
 	});
 
+	test('promoteToChart: bare envelope validates (Visualise v2)', () => {
+		// Visualise v2 introduces a webview -> host message that asks the
+		// provider to scaffold a .py and open it in the Chart view.
+		// Bare envelope -- the provider derives document context from
+		// the panel that posted the message.
+		assert.strictEqual(validateWebviewMessage(env({ type: 'promoteToChart' })).ok, true);
+	});
+
 });
 
 // ---------------------------------------------------------------------------

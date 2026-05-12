@@ -375,7 +375,8 @@ export type WebviewMessage =
 	| RequestInspectorDataMessage
 	| RequestColumnStatsMessage
 	| RetryDaemonMessage
-	| RecheckDatasetMessage;
+	| RecheckDatasetMessage
+	| PromoteToChartMessage;
 
 export type WebviewMessageType = WebviewMessage['type'];
 
@@ -422,6 +423,16 @@ export interface RetryDaemonMessage extends MessageEnvelope {
  */
 export interface RecheckDatasetMessage extends MessageEnvelope {
 	readonly type: 'recheckDataset';
+}
+
+/** Visualise v2: user clicked the "Promote to Chart" button. The
+ *  provider generates a minimal .py scaffold under
+ *  .quantlab/visualise-promoted/ and opens it in the Chart custom
+ *  editor. Bare envelope; the document context comes from the panel
+ *  that posted the message.
+ */
+export interface PromoteToChartMessage extends MessageEnvelope {
+	readonly type: 'promoteToChart';
 }
 
 export interface EditMessage extends SpecAttributedEnvelope {
@@ -539,6 +550,7 @@ export function validateWebviewMessage(value: unknown): ValidationResult<Webview
 		case 'requestColumnStats': result = validateRequestColumnStats(obj); break;
 		case 'retryDaemon': result = ok(obj as unknown as RetryDaemonMessage); break;
 		case 'recheckDataset': result = ok(obj as unknown as RecheckDatasetMessage); break;
+		case 'promoteToChart': result = ok(obj as unknown as PromoteToChartMessage); break;
 		default:
 			return fail(`unknown webview message type: ${JSON.stringify((obj as { type: unknown }).type)}`);
 	}

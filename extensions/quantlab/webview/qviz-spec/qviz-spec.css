@@ -609,6 +609,28 @@ body.qviz-inspector-open .qviz-app-main {
 	cursor: not-allowed;
 }
 
+/* Visualise v2: Promote to Chart button -- same shape as inspector toggle. */
+.qviz-promote-to-chart {
+	padding: 3px 10px;
+	background: var(--vscode-button-secondaryBackground);
+	color: var(--vscode-button-secondaryForeground);
+	border: 1px solid var(--vscode-button-border, transparent);
+	border-radius: 3px;
+	font-size: 12px;
+	cursor: pointer;
+}
+.qviz-promote-to-chart:hover:not(:disabled) {
+	background: var(--vscode-button-secondaryHoverBackground);
+}
+.qviz-promote-to-chart:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: 1px;
+}
+.qviz-promote-to-chart:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
 /* ---------- Phase 6: inspector panel ---------- */
 
 .qviz-app-inspector {

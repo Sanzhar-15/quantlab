@@ -261,6 +261,11 @@
         "category": "%command.category%"
       },
       {
+        "command": "quantlab.visualise.promoteToChart",
+        "title": "Visualise: Promote to Chart",
+        "category": "%command.category%"
+      },
+      {
         "command": "quantlab.chart.screenshot",
         "title": "%command.chart.screenshot.title%",
         "category": "%command.category%"

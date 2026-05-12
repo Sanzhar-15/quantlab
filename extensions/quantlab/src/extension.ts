@@ -230,6 +230,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		lifecycleSource: qvizLifecycleManager,
 	}));
 
+	// Visualise v2 -- Promote to Chart. The webview button is the primary
+	// entry point (posts a `promoteToChart` message to the provider); this
+	// command-palette entry gives a discoverable fallback that surfaces a
+	// helpful message when no Visualise spec editor is active. (The
+	// active-panel forwarding path is a future enhancement; v1 wires
+	// through the webview only.)
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.visualise.promoteToChart', () => {
+			void vscode.window.showInformationMessage(
+				'Promote to Chart: open a .qviz.json spec and click the "Promote to Chart" button in the editor header.',
+			);
+		}),
+	);
+
 	// Megaudit-2 A4-M5: when the user edits `quantlab.pythonPath` or
 	// `python.defaultInterpreterPath`, drop the per-folder
 	// `DaemonLifecycle` cache so the next document access re-runs the

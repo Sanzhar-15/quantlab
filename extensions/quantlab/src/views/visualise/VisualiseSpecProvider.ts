@@ -46,8 +46,11 @@
  */
 
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
 
 import { getNonce, getWebviewUri } from '../../utils/webview';
+import { generatePromoteScaffold, readExistingScaffold } from '../../qviz/promoteToChart';
 import {
 	type DaemonCapabilities,
 	type DaemonStatusKind,
@@ -1065,6 +1068,10 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 				void this.handleRecheckDataset(document, panel);
 				return;
 			}
+			case 'promoteToChart': {
+				void this.handlePromoteToChart(document);
+				return;
+			}
 			case 'openSpec':
 			case 'discardChanges':
 				// Reserved protocol slots. v1 doesn't surface UI for
@@ -1537,6 +1544,62 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 		// Still failing -- broadcast the (possibly updated) failure kind
 		// so the user sees the same/changed error.
 		this.broadcastDatasetStatusToPanel(document, spec.dataset.uri, resolved);
+	}
+
+	/**
+	 * Visualise v2: handle the `promoteToChart` webview message. Generate
+	 * a minimal .py scaffold under .quantlab/visualise-promoted/ and
+	 * open it in Quantlab's Chart view. The scaffold references the same
+	 * dataset; the user adds indicators / wires live sessions in the
+	 * Chart UI.
+	 */
+	private async handlePromoteToChart(document: QvizSpecDocument): Promise<void> {
+		const workspaceRoot = workspaceRootForUri(document.uri);
+		if (workspaceRoot === null) {
+			void vscode.window.showWarningMessage(
+				'Promote to Chart: no workspace folder is open. Open a folder first.',
+			);
+			return;
+		}
+		const result = generatePromoteScaffold(
+			document.spec, document.uri.fsPath, workspaceRoot,
+			{ readExistingFile: readExistingScaffold },
+		);
+		if (result.kind === 'error') {
+			void vscode.window.showWarningMessage(`Promote to Chart: ${result.message}`);
+			return;
+		}
+		// Write the scaffold. Ensure parent dir exists. Atomic-write via
+		// tempfile + rename so a crash mid-write doesn't leave a partial
+		// scaffold the Chart view would try to parse.
+		const dir = path.dirname(result.scaffoldPath);
+		try {
+			await fs.promises.mkdir(dir, { recursive: true });
+			const tmp = result.scaffoldPath + `.tmp.${process.pid}.${Date.now()}`;
+			await fs.promises.writeFile(tmp, result.scaffoldBody, 'utf8');
+			await fs.promises.rename(tmp, result.scaffoldPath);
+		} catch (e) {
+			void vscode.window.showWarningMessage(
+				`Promote to Chart: failed to write scaffold: ${(e as Error).message}`,
+			);
+			return;
+		}
+		const scaffoldUri = vscode.Uri.file(result.scaffoldPath);
+		try {
+			await vscode.commands.executeCommand(
+				'vscode.openWith', scaffoldUri, 'quantlab.chartView',
+			);
+		} catch (e) {
+			// If the Chart view registration is missing or unavailable,
+			// fall back to opening the .py file in the default editor so
+			// the user still sees the scaffold + can copy/paste into
+			// Chart manually.
+			void vscode.window.showWarningMessage(
+				`Promote to Chart: Chart view unavailable (${(e as Error).message}). `
+				+ `Scaffold written to ${result.scaffoldPath}; open it manually.`,
+			);
+			await vscode.commands.executeCommand('vscode.open', scaffoldUri);
+		}
 	}
 
 	/**

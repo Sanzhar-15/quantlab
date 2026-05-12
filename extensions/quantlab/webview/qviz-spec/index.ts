@@ -75,6 +75,9 @@ function init(): void {
 						aria-label="Unsaved changes" title="Unsaved changes" hidden>●</span>
 				</h1>
 				<div class="qviz-app-header-controls">
+					<button id="qviz-promote-to-chart" type="button"
+						class="qviz-promote-to-chart" disabled
+						title="Open this dataset in the Chart view (requires a timeseries chart and a resolvable dataset)">Promote to Chart</button>
 					<button id="qviz-inspector-toggle" type="button"
 						class="qviz-inspector-toggle" aria-pressed="false"
 						title="Toggle data inspector (Ctrl+I)">Inspector</button>
@@ -100,6 +103,7 @@ function init(): void {
 	const previewRoot = document.getElementById('qviz-preview-root')!;
 	const inspectorRoot = document.getElementById('qviz-inspector-root')!;
 	const inspectorToggleBtn = document.getElementById('qviz-inspector-toggle') as HTMLButtonElement;
+	const promoteToChartBtn = document.getElementById('qviz-promote-to-chart') as HTMLButtonElement;
 	const unsavedBadge = document.getElementById('qviz-unsaved-badge') as HTMLElement;
 
 	const store = createStore();
@@ -518,6 +522,33 @@ function init(): void {
 	const unsavedSub = store.subscribe(() => {
 		unsavedBadge.hidden = !isDirty(store.getState().spec);
 	});
+	// Visualise v2: Promote to Chart button. Enabled only when the
+	// current spec is timeseries AND the dataset resolves (datasetStatus
+	// === 'ok'). Tooltip explains the gate state.
+	const promoteSub = store.subscribe(() => {
+		const s = store.getState();
+		const spec = s.spec.current;
+		const isTimeseries = spec?.chart.family === 'timeseries';
+		const datasetOk = s.runtime.datasetStatus === 'ok'
+			|| s.runtime.datasetStatus === null;
+		const enabled = !!spec && isTimeseries && datasetOk;
+		promoteToChartBtn.disabled = !enabled;
+		promoteToChartBtn.title = enabled
+			? 'Open this dataset in the Chart view (writes a .py scaffold to .quantlab/visualise-promoted/).'
+			: !spec
+				? 'No spec loaded yet.'
+				: !isTimeseries
+					? `Promote to Chart only supports timeseries specs (current: ${spec.chart.family}/${spec.chart.type}).`
+					: `Dataset is not resolvable (${s.runtime.datasetStatus}). Fix the dataset path first.`;
+	});
+	const onPromoteClick = (): void => {
+		vscode.postMessage({
+			type: 'promoteToChart',
+			protocolVersion: PROTOCOL_VERSION,
+			requestId: nextRequestId(),
+		});
+	};
+	promoteToChartBtn.addEventListener('click', onPromoteClick);
 	const inspectorViewSub = store.subscribe(() => {
 		const state = store.getState();
 		const insp = state.inspector;
@@ -593,6 +624,8 @@ function init(): void {
 		liveSubscription();
 		inspectorViewSub();
 		unsavedSub();
+		promoteSub();
+		promoteToChartBtn.removeEventListener('click', onPromoteClick);
 		themeObserver.disconnect();
 		resizeObserver.disconnect();
 		if (resizeTimer !== null) { clearTimeout(resizeTimer); }
