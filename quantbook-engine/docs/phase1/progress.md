@@ -3,25 +3,36 @@
 **Date:** 2026-05-12
 **Branch:** `feat/quantbook-engine`
 **Phase 0 exit:** `2df2e96293b` (GO; 13/13 acceptance after W5-5 closed OG-06)
-**Phase 1 status:** Engine-side substantially complete; awaiting Phase 1 audit + IDE integration.
+**Phase 1 status:** **Engine-side COMPLETE-PLUS.** Exit packet at `docs/phase1/exit-packet.md`; next-session entry point at `docs/phase2/entry-plan.md`.
+
+> **2026-05-12 close:** Phase 1 is done engine-side. This document is the
+> mid-Phase-1 snapshot; the full close-out is the exit packet. The two read
+> together — this one for the "we got here by..." narrative, the exit packet
+> for the formal hand-off + Phase 2 sequence.
 
 ---
 
-## TL;DR
+## TL;DR (updated at close)
 
-Engine-side Phase 1 work — Pratt parser, AST printer, first E2E, AI() runtime
-honoring, Timings struct closing OG-06, and `.qbook/` workbook serialization — is
-shipped across 6 W5 commits. **619 workspace tests** (started Phase 1 at 487 →
-+132). All gates green.
+Engine-side Phase 1 work shipped in **10 W5 commits + 1 audit-fix + 1 doc** (+1
+this progress doc). **659 workspace tests** (started Phase 1 at 487 → **+172
+net**). All gates green; cargo audit clean.
+
+The W5 sequence delivered the original Phase 1 plan AND substantial Phase 2 prep
+work along the way (atomic save, formula storage, WorkbookRuntime live-formula
+facade). The engine can now consume a user-typed `=A1*2` end-to-end and persist
+the result.
 
 Remaining Phase 1 items per the Phase 0 exit packet:
-- IDE workbench integration (~5 days) — **lives in a different repo/tree**, not the
-  engine.
-- Phase 1 audit + acceptance (~1 day) — in progress.
+- IDE workbench integration (~5 days) — **lives in a different repo/tree**, not
+  the engine repo.
+- Phase 1 audit + acceptance (~1 day) — **closed** in W5-7 audit fix + W5-8
+  follow-up.
 
 The engine can now: lex any Excel-canonical formula source, build an AST,
-canonically print it back, evaluate it through scalar/SIMD paths, and persist/load
-multi-sheet workbooks.
+canonically print it back, evaluate it through scalar/SIMD paths, persist/load
+multi-sheet workbooks with formulas, and live-evaluate user-typed formulas via
+`WorkbookRuntime::set_formula`.
 
 ---
 
@@ -35,8 +46,19 @@ multi-sheet workbooks.
 | `74a523384dc` | W5-4 AI() registration honoring CORR-06 | +5 |
 | `d4d04e089b1` | W5-5 Timings struct + OG-06 fully LOCKED | +7 |
 | `0ca0c309d91` | W5-6 `.qbook/` workbook save+load | +15 |
+| `71ece0e4fe8` | docs/phase1: progress snapshot (this doc) | 0 |
+| `9fa3843f81f` | W5-7 Phase 1 audit fixes (H1–H5 + M1–M3 + L1/L2/L4/L7 + D2) | +10 |
+| `f71cbf3fdd5` | W5-8 atomic save (M4) + NaN/Inf save-side validation (M6) | +6 |
+| `5d6332b71d6` | W5-9 Workbook formula storage + qbook formula persistence | +11 |
+| `3717bc6b167` | W5-10 WorkbookRuntime live-formula facade | +13 |
 
-**Total Phase 1: +136 tests, 619 workspace total, 0 failed.**
+**Total Phase 1: +176 tests, 659 workspace total, 0 failed.**
+
+> **2026-05-12 close:** the row count above totals to 176, not 136 as the
+> mid-Phase-1 snapshot read. The original TL;DR was written between W5-6 and
+> W5-7, before the audit-fix sprint added ~40 tests across H/M/L verification.
+> The exit packet (`docs/phase1/exit-packet.md`) has the final count
+> reconciliation.
 
 ---
 

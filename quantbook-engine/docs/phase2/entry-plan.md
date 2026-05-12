@@ -1,0 +1,281 @@
+# Phase 2 Entry Plan — Quantbook Engine
+
+**Date written:** 2026-05-12 (end of Phase 1 engine-side work)
+**Branch:** `feat/quantbook-engine` (HEAD `3717bc6b167`)
+**Audience:** the next session (and you, if you come back to this cold)
+
+---
+
+## Read this first (60 seconds)
+
+You're picking up after **Phase 1 engine-side complete-plus**. The Quantbook engine can:
+
+1. Lex/parse/print Excel-canonical formula source (round-trip property tested).
+2. Bind + evaluate scalar formulas with Excel coercion + error propagation.
+3. SIMD-bulk-evaluate region-style operations (OG-02 hot path: 3.4 ms for 25M `=A*2`).
+4. Persist multi-sheet workbooks to `.qbook/` directories (atomic save; NaN/Inf validated; backwards-compat with W5-6 schema).
+5. Live-formula loop: `WorkbookRuntime::set_formula(sheet, row, col, text)` does lex→parse→bind→eval→persist in one call.
+
+**659 tests, all 5 gates green, 13/13 Phase 0 acceptance LOCKED.**
+
+The Phase 1 exit packet (`docs/phase1/exit-packet.md`) has the full story. This document is your **action-oriented entry point** — what to do first, what's blocked on what, where the most valuable next chunks live.
+
+---
+
+## Verify your starting state (5 minutes)
+
+```bash
+cd /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook
+git rev-parse --abbrev-ref HEAD                # expect: feat/quantbook-engine
+git rev-parse HEAD                              # expect: 3717bc6b167 OR newer
+git log --oneline -5                            # recent Phase 1 commits visible
+test -L node_modules || ln -s /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab/node_modules node_modules
+
+mac zsh -lc 'source "$HOME/.cargo/env" && \
+  cd /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine && \
+  cargo fmt --all -- --check && \
+  cargo clippy --locked --workspace --all-targets -- -D warnings && \
+  cargo test --locked --workspace 2>&1 | grep "^test result" | awk -F"[ .;]+" "{ p += \$4; f += \$6 } END { print \"passed=\" p \" failed=\" f }" && \
+  bash scripts/check-cargo-lock-pins.sh && \
+  bash scripts/check-build-flags.sh && \
+  bash scripts/check-build-flags.sh --self-test && \
+  bash scripts/check-multiversion-clones.sh'
+```
+
+Expected:
+- fmt clean
+- clippy clean
+- 659 tests passed, 0 failed
+- pin guard: 18 watched packages aligned
+- A3 + 10/10 self-test
+- A2 disassembly: 20 NEON `fmul.2d` (or equivalent x86_64 AVX2 instructions on Linux CI)
+
+If any of these diverge, **STOP and investigate** before any new work. The engine should be in a clean state.
+
+---
+
+## What's done (don't redo)
+
+Phase 0 (13/13 acceptance gates LOCKED):
+- OG-01 / OG-02 / OG-03 / OG-04 / OG-05 / OG-06 / A1 / A2 / A3 / A4 / A5 / A6 / A7
+
+Phase 1 engine-side (10 commits W5-1..W5-10 + 1 audit fix W5-7 + 1 doc):
+- Pratt parser + AST printer + round-trip property
+- First E2E integration test
+- AI() runtime sentinel
+- Timings struct + OG-06 fully closed (schema v2)
+- `.qbook/` directory format (TOML envelope + JSONL per sheet)
+- Atomic save with temp-dir + rename
+- NaN/Inf save-side validation
+- Workbook formula storage (formula_cells map)
+- WorkbookRuntime live-formula facade
+
+See `docs/phase1/exit-packet.md` for the full close-out.
+
+---
+
+## Two parallel tracks for Phase 2
+
+The Phase 0 exit packet's "Phase 1" sequence had IDE integration as the gating real-world ship. That's still pending — it lives in `extensions/quantlab/` (TypeScript work, **different working tree**), not the engine repo.
+
+Engine-side, Phase 2 splits into independent tracks:
+
+### Track A — Engine collaboration foundation (~10 days)
+
+Loro CRDT integration, op log scaffolding, multi-cell transaction API. This is engine work; you can do it here.
+
+### Track B — IDE integration (~5 days)
+
+Wires the engine's `WorkbookRuntime::set_formula` to the VS Code formula bar. **Not engine work — different repo.**
+
+If the user asks "what's next?", default to Track A. If they specify "IDE" or "workbench", they want Track B (which is a different session entirely).
+
+---
+
+## Track A: engine-side Phase 2 — suggested sequence
+
+### Phase 2A.1 — Named ranges + `Expr::NameRef` (1–2 days)
+
+**Why first:** closes audit H2's deferred path. Currently `=MyDefinedName` is a parse error; should be a NameRef that the binder resolves via NameTable.
+
+**Steps:**
+1. Add `Expr::NameRef(Arc<str>)` variant to `ql-formula-syntax::ast`. Update `fingerprint`, `printer`, `parser`.
+2. Parser bare-identifier branch: emit `Expr::NameRef(name)` instead of `ParseError::Unexpected`.
+3. Add `BindError::UnresolvedName(Arc<str>)` variant.
+4. Wire `NameTable` resolution in `ql-exec::plan::bind`. Phase 2 minimum: read from `Workbook::names()` (currently empty; the `lookup` method exists per Round 7 forward-compat lock).
+5. Add `Workbook::set_name(name, NamedTarget)` API.
+6. Tests: round-trip a named-range formula, error on unresolved names, defined-name to constant/range/formula targets.
+
+**Spec reference:** `_QUANTBOOK-v1-SPECIFICATION.md` Part V §3 + Round 7 T2-D02 (defined names).
+
+**Tracked audit finding:** H2 — currently bare identifiers parse-error; Phase 2A.1 makes them NameRef.
+
+### Phase 2A.2 — Multi-cell transaction API (1 day)
+
+**Why:** the IDE's "paste a 10×10 block" operation should batch through one transaction, not 100 individual `set_value` calls. Each transaction is one save-state change; the op log (Phase 2A.3) records one op per transaction.
+
+**API design (sketch):**
+```rust
+pub struct WorkbookTransaction<'a> { ... }
+
+impl<'a> WorkbookTransaction<'a> {
+    pub fn put_value(&mut self, sheet, row, col, value);
+    pub fn put_formula(&mut self, sheet, row, col, text) -> Result<Value, RuntimeError>;
+    pub fn commit(self) -> Result<(), RuntimeError>;  // applies all writes atomically
+}
+```
+
+Implementation: collect writes in memory, commit applies them all at once. Useful for the IDE + for the op log (Phase 2A.3) which records one entry per transaction commit.
+
+**Tracked from Phase 1 exit packet:** "Phase 2 prep work".
+
+### Phase 2A.3 — Loro op log scaffolding (2–3 days)
+
+**Why:** Phase 5 ships full multi-user collaboration. Phase 2 scaffolds the API surface so Phase 5's wiring is incremental.
+
+**Architectural locks (Round 7 T1-D05):**
+- Loro CRDT for **op log only** (full collab in Phase 5+).
+- `loro = "=1.12.0"` already pinned in workspace deps.
+
+**Steps:**
+1. New `ql-oplog` crate (already stubbed). Define `Op` enum: `PutValue`, `PutFormula`, `ClearFormula`, `AddSheet`, etc.
+2. `OpLog` API: `append(op)`, `iter()`, `len()`, replay-against-Workbook.
+3. Wire `WorkbookTransaction::commit` to append a single op per commit.
+4. Wire `WorkbookRuntime::set_formula` (single-cell case) to append one op.
+5. Serialize op log into `.qbook/oplog.bin` (Loro's binary format) on save.
+6. Load + replay on load (or `recompute_all` after load).
+
+**This is a deep dive.** Phase 5 will lift it to multi-user. Phase 2A.3 establishes the op grammar.
+
+### Phase 2A.4 — Convenience: `load_workbook_and_recompute` (~0.5 day)
+
+**Why:** the current load path leaves formula cells with sentinel values. Callers must call `recompute_all` to refresh. The convenience wraps both:
+
+```rust
+pub fn load_workbook_and_recompute(
+    path: &Path,
+    registry: &FunctionRegistry,
+) -> Result<Workbook, LoadOrRuntimeError>;
+```
+
+Plus a unified error type. Small but eliminates a footgun.
+
+### Phase 2A.5 — Lexer dotted identifiers (`VAR.S`, `STDEV.P`) (~0.5 day)
+
+**Why:** the function registry has `VAR.S` as a key but the lexer rejects `.` outside numeric context. The Phase 1 workaround uses the `VAR` alias. Phase 2 lexer enhancement removes the workaround.
+
+**Implementation:** in `lex_ident_or_ref`, allow `.` followed by uppercase letters as a continuation of the identifier (only when the LHS is already an Ident, not a CellRef). Excel canon: `VAR.S` is a single identifier.
+
+**Test:** parser + WorkbookRuntime evaluate `=VAR.S(1, 2, 3)`.
+
+### Phase 2A.6 — Phase 2 audit + acceptance (~1 day)
+
+Same pattern as Phase 0 W3 audit + Phase 1 W5-7 audit: dispatch an independent agent, fix HIGH findings, ship audit-fix commit. Defer cosmetic items.
+
+---
+
+## Things to NOT do in the next session
+
+- **Don't ship workbench integration** in the engine repo. That's TypeScript work in `extensions/quantlab/`. Engine APIs are stable; IDE work is a separate session.
+
+- **Don't add dependency-graph wiring** to `WorkbookRuntime::recompute_all`. That's Phase 4+ work; needs calcgraph integration. Phase 2's recompute-all-everything is sufficient.
+
+- **Don't change the `.qbook/` schema_version** unless a hard incompatibility forces it. The Phase 2 work (formulas, op log) is additive via new optional fields per the existing serde-skip pattern.
+
+- **Don't pull `pulp` back into ql-exec**. We removed it in `820b857d027` due to RUSTSEC-2024-0436 (unmaintained `paste` transitive). Phase 4+ Welford SIMD will revisit when paste's situation changes.
+
+---
+
+## Quick-reference paths
+
+**Live engine sources** (the things you'll modify most):
+- `crates/ql-formula-syntax/src/{lexer,parser,printer,ast,token}.rs`
+- `crates/ql-storage/src/{workbook,sheet,column,overlay}.rs`
+- `crates/ql-calcgraph/src/{graph,node,edges,dirty,topo,fingerprint,stripes,stats}.rs`
+- `crates/ql-functions/src/{registry,scalar_fns,welford}.rs`
+- `crates/ql-exec/src/{plan,env,scalar,simd,lower,workbook_runtime}.rs`
+- `crates/ql-profile/src/{graph_profile,timings}.rs`
+- `crates/ql-io/src/qbook_format.rs`
+
+**Phase 2 stub crates to populate**:
+- `crates/ql-oplog/` — Track A.3 (Loro op log)
+- `crates/ql-formula-semantics/` — defined-name + named-range resolution (Track A.1)
+
+**Docs**:
+- `docs/phase0/exit-packet.md` — Phase 0 viability close
+- `docs/phase0/references-reading-log.md` — deep-read findings (CORR-21..25)
+- `docs/phase1/progress.md` — Phase 1 progress snapshot (mid-Phase-1, slightly stale)
+- `docs/phase1/exit-packet.md` — Phase 1 close (this commit)
+- `docs/phase2/entry-plan.md` — THIS FILE
+
+**Plan + decisions** (gitignored, in main checkout):
+- `.plans/_active.md` — live plan file per the global plan protocol
+- `.plans/_round-7-decisions-log.md` — CORR-01..25 corrections log
+
+**Scripts** (`scripts/`):
+- `check-build-flags.sh` — A3 target-cpu=native CI guard + --self-test
+- `check-cargo-lock-pins.sh` — pin-guard (18 watched packages)
+- `check-multiversion-clones.sh` — A2 disassembly verification
+
+---
+
+## Test commands cheat-sheet
+
+```bash
+# Full workspace test
+mac zsh -lc 'source "$HOME/.cargo/env" && cd quantbook-engine && cargo test --locked --workspace'
+
+# Single crate
+cargo test --locked -p ql-exec
+
+# A single test
+cargo test --locked -p ql-exec workbook_runtime::tests::set_formula_literal_arithmetic
+
+# Bench
+cargo bench -p ql-exec --bench og02_mul2
+
+# A2 disassembly check (multiversion clone verification)
+bash scripts/check-multiversion-clones.sh
+
+# All 5 local gates in one shot (used in this session repeatedly)
+mac zsh -lc 'source "$HOME/.cargo/env" && cd quantbook-engine && \
+  cargo fmt --all -- --check && \
+  cargo clippy --locked --workspace --all-targets -- -D warnings && \
+  cargo test --locked --workspace 2>&1 | grep "^test result" | awk -F"[ .;]+" "{ p += \$4; f += \$6 } END { print \"passed=\" p \" failed=\" f }" && \
+  bash scripts/check-cargo-lock-pins.sh && \
+  bash scripts/check-build-flags.sh && bash scripts/check-build-flags.sh --self-test'
+```
+
+---
+
+## Audit posture
+
+If you make non-trivial changes, **dispatch an independent audit agent** before declaring done. The pattern that's worked for both Phase 0 W3 and Phase 1 has been:
+
+1. Make changes + add tests.
+2. Run gates, verify green.
+3. Push.
+4. Dispatch a background audit agent (use the general-purpose agent type with a thorough prompt naming the files + findings categories: HIGH/MEDIUM/LOW + doc-rot).
+5. While the agent runs, work on lower-priority things or write docs.
+6. On agent return: fix HIGH findings in one focused commit, defer MEDIUM/LOW where appropriate.
+
+Both audits surfaced real bugs (Phase 0 H1/H2/H3 in calcgraph; Phase 1 H1 printer + H2 parser + H4 qbook). The pattern pays back.
+
+---
+
+## Memory + plan-protocol pointers
+
+Per the user's global instructions:
+- Memory lives at `~/.claude/projects/-Users-sanzhar-Documents-Sanzhar-Sanzhar-quantlab/memory/`.
+- Update `current_work.md` at session end with a handoff snapshot.
+- `.plans/_active.md` is the plan-protocol entry point.
+
+This session's `current_work.md` should reflect:
+- HEAD at `3717bc6b167` (or whatever HEAD is after this commit lands).
+- Phase 1 engine-side complete-plus.
+- Phase 2 entry-plan is THIS file.
+- 659 tests, all gates green.
+
+---
+
+**TL;DR for the impatient**: read `docs/phase1/exit-packet.md` for what shipped, then come back here for what to do next. The 5-minute verification commands above are your first checklist.
