@@ -1061,28 +1061,30 @@ mod tests {
         );
     }
 
+    /// Phase 2B.4 (2026-05-12): named range in a bare scalar position now
+    /// surfaces the precise `NamedRangeInScalarContext` instead of the
+    /// generic `UnsupportedVariant`. Aggregate-context usage (e.g.
+    /// `=SUM(Sales)`) is now accepted and binds to `ExprPlan::AggregateNameRef`.
+    /// NAG-04 acceptance.
     #[test]
-    fn set_formula_named_range_target_unsupported() {
+    fn set_formula_named_range_in_scalar_context_errors() {
         use ql_storage::NamedTarget;
         use ql_types::Range;
 
         let mut wb = make_runtime_workbook();
-        // Range targets aren't usable as scalar operands in Phase 2A.1 — they
-        // surface as UnsupportedVariant (analogous to a bare A1:A10 in a scalar
-        // context). Aggregate-context usage lands Phase 2B+.
         wb.set_name("Sales", NamedTarget::Range(Range::new(0, 1, 0, 10, 0)))
             .unwrap();
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
 
         let result = rt.set_formula(0, 0, 0, "Sales");
-        assert!(
-            matches!(
-                result,
-                Err(RuntimeError::Bind(BindError::UnsupportedVariant(_)))
-            ),
-            "expected Bind(UnsupportedVariant), got {result:?}"
-        );
+        match result {
+            Err(RuntimeError::Bind(BindError::NamedRangeInScalarContext(name))) => {
+                // Parser canonicalizes to upper case.
+                assert_eq!(name.as_ref(), "SALES");
+            }
+            other => panic!("expected Bind(NamedRangeInScalarContext), got {other:?}"),
+        }
     }
 
     #[test]
@@ -1610,5 +1612,147 @@ mod tests {
         let after_recompute = rt.cache_stats();
         assert_eq!(after_recompute.misses, 1, "no new misses");
         assert_eq!(after_recompute.hits, 1, "recompute hit the cache");
+    }
+
+    // ===== Phase 2B.4 — named-range aggregate context prep =====
+
+    /// NAG-01: named CONSTANTS continue to work after the binder grows
+    /// context-awareness. Regression guard against accidentally breaking
+    /// the existing Constant resolution path. Uses a long unambiguous name
+    /// to avoid the parser's column-letter heuristic (short names like
+    /// `Pi` collide with column-pair syntax).
+    #[test]
+    fn nag_01_named_constants_still_work_in_scalar_and_aggregate_contexts() {
+        use ql_storage::NamedTarget;
+        let mut wb = make_runtime_workbook();
+        // Pick 0.42 (not an approximation of any math constant, so
+        // clippy's `approx_constant` lint stays quiet — earlier the test
+        // used 3.14 / 6.28 which clippy flagged as ≈ π / τ).
+        wb.set_name("MyConstant", NamedTarget::Constant(Value::Number(0.42)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // Scalar position.
+        let v_scalar = rt.set_formula(0, 0, 0, "MyConstant * 2").unwrap();
+        assert_eq!(v_scalar, Value::Number(0.84));
+
+        // Aggregate position.
+        let v_aggregate = rt
+            .set_formula(0, 0, 1, "SUM(MyConstant, MyConstant, MyConstant)")
+            .unwrap();
+        assert!(matches!(v_aggregate, Value::Number(n) if (n - 1.26).abs() < 1e-9));
+    }
+
+    /// NAG-02: named CELL REFERENCES continue to work after the binder
+    /// grows context-awareness.
+    #[test]
+    fn nag_02_named_cell_references_still_work() {
+        use ql_storage::NamedTarget;
+        use ql_types::Address;
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Number(42.0));
+        wb.set_name("MyRef", NamedTarget::Cell(Address::new(0, 0, 0)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // Scalar position.
+        let v_scalar = rt.set_formula(0, 1, 0, "MyRef + 8").unwrap();
+        assert_eq!(v_scalar, Value::Number(50.0));
+
+        // Aggregate position — a named cell ref inside SUM is fine; it
+        // resolves as a single cell, not as a range.
+        let v_aggregate = rt.set_formula(0, 1, 1, "SUM(MyRef, MyRef)").unwrap();
+        assert_eq!(v_aggregate, Value::Number(84.0));
+    }
+
+    /// NAG-03: a named RANGE inside an aggregate function binds to the
+    /// explicit `ExprPlan::AggregateNameRef` variant (rather than producing
+    /// a bind error). Until Engine Phase 3.6 wires aggregate-range eval,
+    /// the cell value is `#CALC!` — but the bind shape is in place and
+    /// the IDE can see the formula text + recognize the construct.
+    #[test]
+    fn nag_03_named_range_in_aggregate_function_binds_to_explicit_variant() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+        let mut wb = make_runtime_workbook();
+        wb.set_name("Sales", NamedTarget::Range(Range::new(0, 1, 0, 10, 0)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // SUM(Sales) — the bind succeeds (no UnsupportedVariant); the
+        // evaluated value is #CALC! per Phase 2B.4's deferred-eval contract.
+        let v = rt.set_formula(0, 0, 0, "SUM(Sales)").unwrap();
+        assert_eq!(v, Value::Error(ErrorValue::Calc));
+        // Formula text was written (no partial-failure short-circuit).
+        assert_eq!(
+            wb.formula_at(0, 0, 0).map(|s| s.as_ref()),
+            Some("SUM(Sales)")
+        );
+    }
+
+    /// NAG-04: a named RANGE in scalar context produces the precise
+    /// `NamedRangeInScalarContext` error, not the generic `UnsupportedVariant`.
+    /// (The pre-existing `set_formula_named_range_in_scalar_context_errors`
+    /// test covers a single shape; this one exercises a few more positions.)
+    #[test]
+    fn nag_04_named_range_in_scalar_positions_errors_precisely() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+        let mut wb = make_runtime_workbook();
+        wb.set_name("Block", NamedTarget::Range(Range::new(0, 0, 0, 5, 5)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // Bare reference.
+        match rt.set_formula(0, 0, 0, "Block") {
+            Err(RuntimeError::Bind(BindError::NamedRangeInScalarContext(n))) => {
+                assert_eq!(n.as_ref(), "BLOCK");
+            }
+            other => panic!("expected NamedRangeInScalarContext, got {other:?}"),
+        }
+
+        // Inside arithmetic.
+        match rt.set_formula(0, 0, 1, "Block + 1") {
+            Err(RuntimeError::Bind(BindError::NamedRangeInScalarContext(n))) => {
+                assert_eq!(n.as_ref(), "BLOCK");
+            }
+            other => panic!("expected NamedRangeInScalarContext, got {other:?}"),
+        }
+
+        // Inside a NON-aggregate function (IF) — args are scalar context.
+        match rt.set_formula(0, 0, 2, "IF(TRUE, Block, 0)") {
+            Err(RuntimeError::Bind(BindError::NamedRangeInScalarContext(n))) => {
+                assert_eq!(n.as_ref(), "BLOCK");
+            }
+            other => panic!("expected NamedRangeInScalarContext inside IF, got {other:?}"),
+        }
+    }
+
+    /// Named formulas (NamedTarget::Formula) surface a distinct
+    /// `NamedFormulaUnsupported` error rather than the generic
+    /// `UnsupportedVariant`. Engine Phase 4 will implement them.
+    #[test]
+    fn named_formula_surfaces_distinct_bind_error() {
+        use ql_storage::NamedTarget;
+        let mut wb = make_runtime_workbook();
+        wb.names_mut()
+            .set(
+                "Profit",
+                NamedTarget::Formula(std::sync::Arc::from("Revenue - Costs")),
+            )
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        match rt.set_formula(0, 0, 0, "Profit") {
+            Err(RuntimeError::Bind(BindError::NamedFormulaUnsupported(n))) => {
+                assert_eq!(n.as_ref(), "PROFIT");
+            }
+            other => panic!("expected NamedFormulaUnsupported, got {other:?}"),
+        }
     }
 }

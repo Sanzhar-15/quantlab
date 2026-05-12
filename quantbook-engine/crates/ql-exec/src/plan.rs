@@ -28,7 +28,7 @@
 use std::sync::Arc;
 
 use ql_formula_syntax::{Expr, Operator};
-use ql_types::{ColId, ErrorValue, RowId, SheetId};
+use ql_types::{ColId, ErrorValue, Range, RowId, SheetId};
 
 /// Bound, execution-ready expression. Sheet refs are concrete.
 #[derive(Clone, Debug, PartialEq)]
@@ -59,6 +59,24 @@ pub enum ExprPlan {
     Function {
         name: Arc<str>,
         args: Vec<ExprPlan>,
+    },
+    /// Phase 2B.4 (2026-05-12): a `NameRef` resolving to a `NamedTarget::Range`
+    /// in an aggregate-argument position (e.g. the arg of `SUM`, `AVERAGE`,
+    /// `COUNT`). Carries the canonical name + the resolved Range. The scalar
+    /// evaluator currently rejects this with `Value::Error(ErrorValue::Calc)`
+    /// because aggregate-range evaluation is Engine Phase 3.6 work; the bind
+    /// shape lands now so the IDE / op-log surfaces are stable when Phase 3.6
+    /// flips the eval on.
+    ///
+    /// In scalar (non-aggregate) positions, the same `NameRef` produces
+    /// [`BindError::NamedRangeInScalarContext`] instead of binding to this
+    /// variant.
+    AggregateNameRef {
+        /// Canonical (uppercase) name as it appears in the NameTable.
+        name: Arc<str>,
+        /// Pre-resolved range payload. Phase 3.6 evaluator reads from this
+        /// directly rather than re-looking-up the name.
+        range: Range,
     },
 }
 
@@ -98,6 +116,74 @@ pub enum BindError {
     // ("named constant \"X\" ..." vs the bare-string ambiguous "named constant X").
     #[error("named constant {0:?} holds an error value: {1}")]
     NamedTargetIsError(Arc<str>, ErrorValue),
+    /// Phase 2B.4 (2026-05-12): a `NameRef` resolving to a `NamedTarget::Range`
+    /// appeared in a scalar-context position (e.g. `=Sales + 1` instead of
+    /// `=SUM(Sales)`). Excel returns `#VALUE!` at evaluation; we surface it at
+    /// bind so the IDE highlights the offending token before any state writes.
+    /// Distinct from the generic `UnsupportedVariant` so callers can render a
+    /// specific "this name is a range; use it inside an aggregate function"
+    /// hint.
+    #[error(
+        "named range {0:?} cannot be used in this scalar position; \
+         wrap it in an aggregate function such as SUM, AVERAGE, COUNT, MIN, MAX"
+    )]
+    NamedRangeInScalarContext(Arc<str>),
+    /// Phase 2B.4 (2026-05-12): a `NameRef` resolving to a
+    /// `NamedTarget::Formula` in a scalar-context position. Named formulas
+    /// (`Profit = Revenue - Costs`) are Engine Phase 4 work; this distinct
+    /// variant tells the IDE / caller that the name is recognized but the
+    /// named-formula feature itself is not yet shipped.
+    #[error(
+        "named formula {0:?} cannot be used in this position; \
+         named-formula resolution is Engine Phase 4 work"
+    )]
+    NamedFormulaUnsupported(Arc<str>),
+}
+
+/// Phase 2B.4 (2026-05-12): bind-time context for a sub-expression. Drives
+/// per-name-ref decisions about whether a `NamedTarget::Range` is acceptable
+/// (aggregate-arg) or surfaces as `BindError::NamedRangeInScalarContext`
+/// (scalar). Internal to the binder; not exposed in the public API yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BindContext {
+    /// Default. NameRefs resolving to ranges or formulas are rejected with
+    /// precise errors.
+    Scalar,
+    /// Inside the argument list of an aggregate function (SUM, AVERAGE,
+    /// MIN, MAX, COUNT, etc. — see `is_aggregate_function`). NameRefs
+    /// resolving to ranges bind to `ExprPlan::AggregateNameRef`; named
+    /// formulas still error (Engine Phase 4 work).
+    AggregateArg,
+}
+
+/// Phase 2B.4 (2026-05-12): hardcoded list of functions whose arguments
+/// accept aggregate-range inputs. Tracked here as a V0 stub; Engine Phase
+/// 4.3 (function library expansion) replaces this with per-function
+/// metadata on `FunctionRegistry`. The names below MUST match the
+/// canonical uppercase form the parser emits.
+///
+/// Aggregate detection is binary in V0 (all args are aggregate or no args
+/// are). Per-arg-position decisions (e.g. IF's then/else accept arrays in
+/// some contexts) land alongside Engine Phase 4.7 array formulas.
+fn is_aggregate_function(name: &str) -> bool {
+    matches!(
+        name,
+        "SUM"
+            | "AVERAGE"
+            | "AVG"
+            | "COUNT"
+            | "COUNTA"
+            | "MIN"
+            | "MAX"
+            | "PRODUCT"
+            | "MEDIAN"
+            | "VAR"
+            | "VAR.S"
+            | "VAR.P"
+            | "STDEV"
+            | "STDEV.S"
+            | "STDEV.P"
+    )
 }
 
 /// Resolve an Expr against an owning sheet, producing an ExprPlan. **No name
@@ -116,10 +202,23 @@ pub fn bind(expr: &Expr, owning_sheet: SheetId) -> Result<ExprPlan, BindError> {
 /// `NameLookup`; the production caller passes a `ql_storage::NameTable` reference
 /// (via the `NameLookup` blanket impl in `ql-exec::env`), but tests can supply
 /// a custom HashMap-backed mock.
+///
+/// Phase 2B.4 (2026-05-12): the top-level entry point binds in
+/// [`BindContext::Scalar`]. Recursion into aggregate-function arg lists
+/// switches to [`BindContext::AggregateArg`].
 pub fn bind_with_names<L: NameLookup>(
     expr: &Expr,
     owning_sheet: SheetId,
     names: &L,
+) -> Result<ExprPlan, BindError> {
+    bind_with_context(expr, owning_sheet, names, BindContext::Scalar)
+}
+
+fn bind_with_context<L: NameLookup>(
+    expr: &Expr,
+    owning_sheet: SheetId,
+    names: &L,
+    ctx: BindContext,
 ) -> Result<ExprPlan, BindError> {
     match expr {
         Expr::Number(n) => Ok(ExprPlan::Number(*n)),
@@ -134,20 +233,44 @@ pub fn bind_with_names<L: NameLookup>(
         }),
         Expr::Binary { op, lhs, rhs } => Ok(ExprPlan::Binary {
             op: *op,
-            lhs: Box::new(bind_with_names(lhs, owning_sheet, names)?),
-            rhs: Box::new(bind_with_names(rhs, owning_sheet, names)?),
+            // Binary operands are always scalar context regardless of the
+            // outer context (Excel doesn't accept `=SUM(A1 + B1:B10)` —
+            // each operand to + is scalar).
+            lhs: Box::new(bind_with_context(
+                lhs,
+                owning_sheet,
+                names,
+                BindContext::Scalar,
+            )?),
+            rhs: Box::new(bind_with_context(
+                rhs,
+                owning_sheet,
+                names,
+                BindContext::Scalar,
+            )?),
         }),
         Expr::Unary { op, operand } => Ok(ExprPlan::Unary {
             op: *op,
-            operand: Box::new(bind_with_names(operand, owning_sheet, names)?),
+            operand: Box::new(bind_with_context(
+                operand,
+                owning_sheet,
+                names,
+                BindContext::Scalar,
+            )?),
         }),
         Expr::RangeRef(_) => Err(BindError::UnsupportedVariant(
             "RangeRef requires a Function context; Phase 0 W4-1 has no function dispatch yet",
         )),
         Expr::Function { name, args } => {
+            // Phase 2B.4: switch context for aggregate-function arg lists.
+            let arg_ctx = if is_aggregate_function(name) {
+                BindContext::AggregateArg
+            } else {
+                BindContext::Scalar
+            };
             let mut bound_args = Vec::with_capacity(args.len());
             for a in args {
-                bound_args.push(bind_with_names(a, owning_sheet, names)?);
+                bound_args.push(bind_with_context(a, owning_sheet, names, arg_ctx)?);
             }
             Ok(ExprPlan::Function {
                 name: name.clone(),
@@ -162,7 +285,7 @@ pub fn bind_with_names<L: NameLookup>(
             // broken; panic to surface the upstream bug per the no-fallbacks rule.
             assert!(
                 !name.is_empty(),
-                "bind_with_names: Expr::NameRef carries an empty string — parser invariant violated"
+                "bind_with_context: Expr::NameRef carries an empty string — parser invariant violated"
             );
             // Phase 2A.1: resolve the name via the active NameTable; Phase 2A.6
             // audit H2 uses case-insensitive lookup in the `NameTable` impl so
@@ -180,12 +303,20 @@ pub fn bind_with_names<L: NameLookup>(
                 Some(ResolvedName::Number(n)) => Ok(ExprPlan::Number(n)),
                 Some(ResolvedName::Bool(b)) => Ok(ExprPlan::Bool(b)),
                 Some(ResolvedName::Text(s)) => Ok(ExprPlan::String(s)),
-                Some(ResolvedName::Range) => Err(BindError::UnsupportedVariant(
-                    "NamedTarget::Range resolution requires the Phase 4+ FormulaRegion binder",
-                )),
-                Some(ResolvedName::Formula) => Err(BindError::UnsupportedVariant(
-                    "NamedTarget::Formula resolution requires the Phase 3+ ql-formula-semantics layer",
-                )),
+                // Phase 2B.4: context-aware Range handling.
+                Some(ResolvedName::Range(range)) => match ctx {
+                    BindContext::AggregateArg => Ok(ExprPlan::AggregateNameRef {
+                        name: name.clone(),
+                        range,
+                    }),
+                    BindContext::Scalar => Err(BindError::NamedRangeInScalarContext(name.clone())),
+                },
+                // Phase 2B.4: named formulas still unsupported (Engine Phase 4).
+                // We surface a distinct error rather than the generic
+                // UnsupportedVariant so the IDE can render a specific hint.
+                Some(ResolvedName::Formula(_)) => {
+                    Err(BindError::NamedFormulaUnsupported(name.clone()))
+                }
                 // Phase 2A.6 audit M2/M3: surface Blank- and Error-targets loudly.
                 Some(ResolvedName::Blank) => Err(BindError::NamedTargetIsBlank(name.clone())),
                 Some(ResolvedName::ErrorValue(e)) => {
@@ -212,8 +343,15 @@ pub enum ResolvedName {
     Number(f64),
     Bool(bool),
     Text(Arc<str>),
-    Range,
-    Formula,
+    /// `NamedTarget::Range(_)` resolved with payload. Phase 2B.4 (2026-05-12):
+    /// previously carried no data; now threads the underlying `Range` so the
+    /// binder can pre-resolve into `ExprPlan::AggregateNameRef` without
+    /// asking the name table again at eval time.
+    Range(Range),
+    /// `NamedTarget::Formula(_)` resolved with payload. Phase 2B.4 added the
+    /// formula text payload; the binder rejects this for now (named-formula
+    /// resolution is Engine Phase 4) but the shape is in place.
+    Formula(Arc<str>),
     /// `NamedTarget::Constant(Value::Blank)`. The binder rejects this loudly so
     /// the caller can fix the data binding.
     Blank,

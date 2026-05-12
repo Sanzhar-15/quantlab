@@ -111,8 +111,11 @@ fn named_target_to_resolved(target: NamedTarget) -> Option<ResolvedName> {
         NamedTarget::Constant(Value::Text(s)) => Some(ResolvedName::Text(s)),
         NamedTarget::Constant(Value::Blank) => Some(ResolvedName::Blank),
         NamedTarget::Constant(Value::Error(e)) => Some(ResolvedName::ErrorValue(e)),
-        NamedTarget::Range(_) => Some(ResolvedName::Range),
-        NamedTarget::Formula(_) => Some(ResolvedName::Formula),
+        // Phase 2B.4 (2026-05-12): carry Range / formula-text payload so the
+        // context-aware binder doesn't have to re-look-up the name to
+        // produce `ExprPlan::AggregateNameRef`.
+        NamedTarget::Range(range) => Some(ResolvedName::Range(range)),
+        NamedTarget::Formula(text) => Some(ResolvedName::Formula(text)),
     }
 }
 

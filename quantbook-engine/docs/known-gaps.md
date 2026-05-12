@@ -22,7 +22,7 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 
 | ID | Gap | Reproduce | Owner | Target phase |
 |---|---|---|---|---|
-| GAP-B-01 | Named-range targets in aggregate context (`SUM(Sales)`) surface as `BindError::UnsupportedVariant` | `ql-exec/src/workbook_runtime.rs::tests::set_formula_named_range_target_unsupported` | Engine | Engine Phase 2B.4 (aggregate context prep) → Phase 3.6 (aggregate cache) |
+| GAP-B-01 | Named-range BIND surface for aggregate context — **partially closed** in Engine Phase 2B.4 (commit-after-bd3147a1045). `SUM(Sales)` now binds to `ExprPlan::AggregateNameRef { name, range }` (the explicit variant) instead of `UnsupportedVariant`; the bind shape carries the resolved `Range`. Scalar-context misuse surfaces precise `BindError::NamedRangeInScalarContext`. **REMAINING:** the scalar evaluator returns `Value::Error(ErrorValue::Calc)` for AggregateNameRef — actual aggregate-range evaluation lands in Engine Phase 3.6. | `ql-exec/src/workbook_runtime.rs::tests::nag_03_named_range_in_aggregate_function_binds_to_explicit_variant` | Engine | Engine Phase 3.6 (range aggregate cache + eval) |
 | GAP-B-02 | Named-formula targets (`Profit = Revenue - Costs`) — same `UnsupportedVariant` | None tested yet; parser doesn't even encounter | Engine | Engine Phase 4 |
 | GAP-B-03 | Sheet-scoped names (`Sheet1!Local`) — NameTable has no per-sheet scope | `ql-storage/src/workbook.rs::NameTable` is workbook-flat | Engine | Engine Phase 4.6 |
 | GAP-B-04 | Cross-sheet cell references (`Sheet2!A1`) — parser supports, binder does not resolve | `ql-formula-syntax::Expr::CellRef` carries sheet id but binder ignores cross-sheet at eval | Engine | Engine Phase 4.6 |
