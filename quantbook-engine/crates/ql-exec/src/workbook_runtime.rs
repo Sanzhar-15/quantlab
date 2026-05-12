@@ -405,9 +405,21 @@ impl<'a> WorkbookRuntime<'a> {
 
         // Evaluate against the current workbook state. The env borrows immutably; we
         // drop it before taking the mutable borrow for the write.
+        // Phase 3.6 (W5-39): if a calcgraph session is attached, route
+        // the eval through `eval_scalar_with_cache` so aggregate-range
+        // results land in the session's cache (next recompute on an
+        // unchanged range hits without re-scanning).
         let value = {
             let env = WorkbookEnv::new(self.workbook);
-            eval_scalar_with_registry(plan.as_ref(), &env, self.registry)
+            match self.graph.as_deref() {
+                Some(session) => crate::scalar::eval_scalar_with_cache(
+                    plan.as_ref(),
+                    &env,
+                    self.registry,
+                    session.aggregate_cache(),
+                ),
+                None => eval_scalar_with_registry(plan.as_ref(), &env, self.registry),
+            }
         };
 
         // Phase 2A.3.b op-log emission, BEFORE mutation. If append fails, no
@@ -865,7 +877,14 @@ impl<'a> WorkbookRuntime<'a> {
             let Some(text) = self.workbook.formula_at(sheet, row, col).cloned() else {
                 continue;
             };
-            match self.try_recompute_one_cached(sheet, &text) {
+            // Phase 3.6 (W5-39): route through the session's aggregate
+            // cache so `SUM(Sales)`-style formulas hit the cache when
+            // no cell inside `Sales` changed (AGG-3-01). The cache lives
+            // inside `session`, which we borrowed mutably above; the
+            // cache itself uses interior mutability (RefCell) so an
+            // immutable borrow is enough.
+            let agg_cache = session.aggregate_cache();
+            match self.try_recompute_with_aggregate_cache(sheet, &text, agg_cache) {
                 Ok(value) => {
                     // Phase 3.5: formula outputs to computed overlay.
                     self.workbook.put_computed_at(sheet, row, col, value);
@@ -895,10 +914,33 @@ impl<'a> WorkbookRuntime<'a> {
     /// into a `RecomputeFailure`. Successful binds are cached so a
     /// subsequent recompute (or a `set_formula` editing a nearby cell
     /// with the same text) hits.
+    ///
+    /// Phase 3.6 (W5-39): this is the no-aggregate-cache wrapper. The
+    /// `recompute_dirty` path uses
+    /// [`Self::try_recompute_with_aggregate_cache`] which threads the
+    /// session's aggregate cache through the evaluator.
     fn try_recompute_one_cached(
         &mut self,
         sheet: SheetId,
         formula_text: &Arc<str>,
+    ) -> Result<Value, RuntimeError> {
+        self.try_recompute_with_aggregate_cache(
+            sheet,
+            formula_text,
+            &crate::aggregate_cache::NoAggregateCache,
+        )
+    }
+
+    /// Phase 3.6 (W5-39): variant of `try_recompute_one_cached` that
+    /// threads an `AggregateCache` through the scalar evaluator so
+    /// `SUM(Sales)` / `AVERAGE(Sales)` calls consult + populate the
+    /// cache. Used by `recompute_dirty` which owns a session-side
+    /// `InMemAggregateCache`.
+    fn try_recompute_with_aggregate_cache(
+        &mut self,
+        sheet: SheetId,
+        formula_text: &Arc<str>,
+        agg_cache: &dyn crate::aggregate_cache::AggregateCache,
     ) -> Result<Value, RuntimeError> {
         let name_gen = self.workbook.names().generation();
         let cache_key = PlanCacheKey {
@@ -921,10 +963,11 @@ impl<'a> WorkbookRuntime<'a> {
                 })?;
 
         let env = WorkbookEnv::new(self.workbook);
-        Ok(eval_scalar_with_registry(
+        Ok(crate::scalar::eval_scalar_with_cache(
             plan.as_ref(),
             &env,
             self.registry,
+            agg_cache,
         ))
     }
 }
@@ -2090,9 +2133,9 @@ mod tests {
 
     /// NAG-03: a named RANGE inside an aggregate function binds to the
     /// explicit `ExprPlan::AggregateNameRef` variant (rather than producing
-    /// a bind error). Until Engine Phase 3.6 wires aggregate-range eval,
-    /// the cell value is `#CALC!` — but the bind shape is in place and
-    /// the IDE can see the formula text + recognize the construct.
+    /// a bind error). Phase 3.6 (W5-39, 2026-05-12) wired aggregate-range
+    /// eval, so the cell value is now the actual SUM (not `#CALC!`). The
+    /// range here covers A2:A11 (no values populated) → SUM = 0.
     #[test]
     fn nag_03_named_range_in_aggregate_function_binds_to_explicit_variant() {
         use ql_storage::NamedTarget;
@@ -2103,10 +2146,9 @@ mod tests {
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
 
-        // SUM(Sales) — the bind succeeds (no UnsupportedVariant); the
-        // evaluated value is #CALC! per Phase 2B.4's deferred-eval contract.
+        // SUM(Sales) — Phase 3.6: actual evaluation. Empty range sums to 0.
         let v = rt.set_formula(0, 0, 0, "SUM(Sales)").unwrap();
-        assert_eq!(v, Value::Error(ErrorValue::Calc));
+        assert_eq!(v, Value::Number(0.0));
         // Formula text was written (no partial-failure short-circuit).
         assert_eq!(
             wb.formula_at(0, 0, 0).map(|s| s.as_ref()),
@@ -2346,10 +2388,12 @@ mod tests {
         // SUM(AVERAGE(Sales)) — outer SUM passes aggregate context to its
         // arg (the AVERAGE call), which in turn passes aggregate context
         // to its arg (the Sales NameRef). Both layers see aggregate
-        // context; Sales binds to AggregateNameRef. Today eval returns
-        // #CALC! per Phase 3.6 deferral, but the bind succeeds.
+        // context; Sales binds to AggregateNameRef.
+        // Phase 3.6 (W5-39): empty range. AVERAGE over empty = #DIV/0!
+        // (per ql-functions::scalar_fns::average). Outer SUM propagates
+        // the error.
         let v = rt.set_formula(0, 0, 0, "SUM(AVERAGE(Sales))").unwrap();
-        assert_eq!(v, Value::Error(ErrorValue::Calc));
+        assert_eq!(v, Value::Error(ErrorValue::DivZero));
     }
 
     #[test]
@@ -2366,12 +2410,11 @@ mod tests {
         // FIRST arg here is SUM(Sales), which is itself a Function call —
         // recursive bind hits the SUM arm and switches to aggregate context
         // for ITS arg. Sales binds to AggregateNameRef. The outer ROUND
-        // takes the SUM result + 2 in scalar context. End-to-end binds
-        // cleanly; eval is #CALC! (Sales binds to AggregateNameRef →
-        // evaluates to #CALC! → propagates through SUM → propagates
-        // through ROUND).
+        // takes the SUM result + 2 in scalar context.
+        // Phase 3.6 (W5-39): SUM(Sales) = 0 over empty range; ROUND(0, 2)
+        // = 0.
         let v = rt.set_formula(0, 0, 0, "ROUND(SUM(Sales), 2)").unwrap();
-        assert_eq!(v, Value::Error(ErrorValue::Calc));
+        assert_eq!(v, Value::Number(0.0));
     }
 
     /// Phase 2B.7 audit (cleanup): after dropping the redundant
@@ -3111,6 +3154,198 @@ mod tests {
             wb.read(ql_types::Address::new(0, 0, 3)),
             Value::Number(7777.0),
             "D1: literal replaced formula; read sees user 7777"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 3.6 (W5-39) — AGG-3-01..04 acceptance tests (CORR-25 follow-up).
+    // ----------------------------------------------------------------
+
+    /// Helper: build a workbook with a named range `BigRange` over A1:A`size`
+    /// pre-populated with values 1..=size, and a SUM(BigRange) formula at B1.
+    /// Returns (wb, session) after rebuild — session has 0 cached aggregates.
+    fn build_aggregate_workbook(size: u32) -> (Workbook, crate::CalcgraphSession) {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+        let mut wb = make_runtime_workbook();
+        for r in 0..size {
+            wb.put_at(0, r, 0, Value::Number((r + 1) as f64));
+        }
+        wb.set_name(
+            "BigRange",
+            NamedTarget::Range(Range::new(0, 0, 0, size - 1, 0)),
+        )
+        .unwrap();
+        wb.put_at(0, 0, 1, Value::Blank);
+        wb.put_formula(0, 0, 1, "SUM(BigRange)");
+        let rebuild = crate::CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(rebuild.is_complete());
+        (wb, rebuild.session)
+    }
+
+    /// AGG-3-04 (correctness baseline): SUM/AVERAGE/MIN/MAX/COUNT/PRODUCT
+    /// over a named range produce the same result as the scalar baseline.
+    /// Sales = A1:A5 = [1, 2, 3, 4, 5]: SUM = 15, AVERAGE = 3, MIN = 1,
+    /// MAX = 5, COUNT = 5, PRODUCT = 120.
+    #[test]
+    fn agg_3_04_results_match_scalar_baseline() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+        let mut wb = make_runtime_workbook();
+        for r in 0..5 {
+            wb.put_at(0, r, 0, Value::Number((r + 1) as f64));
+        }
+        wb.set_name("Sales", NamedTarget::Range(Range::new(0, 0, 0, 4, 0)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        assert_eq!(
+            rt.set_formula(0, 0, 1, "SUM(Sales)").unwrap(),
+            Value::Number(15.0)
+        );
+        assert_eq!(
+            rt.set_formula(0, 1, 1, "AVERAGE(Sales)").unwrap(),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            rt.set_formula(0, 2, 1, "MIN(Sales)").unwrap(),
+            Value::Number(1.0)
+        );
+        assert_eq!(
+            rt.set_formula(0, 3, 1, "MAX(Sales)").unwrap(),
+            Value::Number(5.0)
+        );
+        assert_eq!(
+            rt.set_formula(0, 4, 1, "COUNT(Sales)").unwrap(),
+            Value::Number(5.0)
+        );
+        assert_eq!(
+            rt.set_formula(0, 5, 1, "PRODUCT(Sales)").unwrap(),
+            Value::Number(120.0)
+        );
+    }
+
+    /// AGG-3-01: `SUM(BigRange)` does NOT rescan the range on an unrelated
+    /// write. We use a 1000-row range to make the cost asymmetric; a write
+    /// to a cell OUTSIDE the range, followed by `recompute_dirty`, should
+    /// produce a cache HIT (the SUM result is reused).
+    #[test]
+    fn agg_3_01_no_rescan_on_unrelated_writes() {
+        let (mut wb, mut graph) = build_aggregate_workbook(1000);
+        let reg = default_registry();
+        // First eval: populates the cache.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            // Re-set the formula via the runtime so the eval path uses the
+            // session cache. `build_aggregate_workbook` used the low-level
+            // workbook API which doesn't populate the session cache.
+            rt.set_formula(0, 0, 1, "SUM(BigRange)").unwrap();
+        }
+        let s_after_first = graph.aggregate_cache_stats();
+        assert_eq!(s_after_first.misses, 1, "first eval is a cold miss");
+        assert_eq!(s_after_first.hits, 0);
+
+        // Unrelated write at column Z (col 25) — outside BigRange (col 0).
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 25, Value::Number(999.0)).unwrap();
+            // No formula at Z1; recompute_dirty has nothing to do for
+            // the chain. The cache should NOT have been invalidated.
+            rt.recompute_dirty().unwrap();
+        }
+        let s_after_unrelated = graph.aggregate_cache_stats();
+        assert_eq!(
+            s_after_unrelated.invalidations, 0,
+            "unrelated write outside BigRange must not invalidate cache"
+        );
+
+        // Re-evaluate the SUM formula to trigger a lookup → hit.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 1, "SUM(BigRange)").unwrap();
+        }
+        let s_after_second = graph.aggregate_cache_stats();
+        assert!(
+            s_after_second.hits > s_after_first.hits,
+            "AGG-3-01: second eval must hit the cache (hits before={}, after={})",
+            s_after_first.hits,
+            s_after_second.hits
+        );
+    }
+
+    /// AGG-3-02: a write INSIDE BigRange invalidates the cache. After the
+    /// invalidation, the next eval is a miss + fresh computation.
+    #[test]
+    fn agg_3_02_intersecting_write_invalidates_cache() {
+        let (mut wb, mut graph) = build_aggregate_workbook(10);
+        let reg = default_registry();
+        // First eval populates cache.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            let v = rt.set_formula(0, 0, 1, "SUM(BigRange)").unwrap();
+            assert_eq!(v, Value::Number(55.0)); // 1+2+...+10 = 55
+        }
+        assert_eq!(graph.aggregate_cache_stats().invalidations, 0);
+
+        // Write to A5 (inside BigRange) — must invalidate.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 4, 0, Value::Number(100.0)).unwrap();
+        }
+        assert!(
+            graph.aggregate_cache_stats().invalidations >= 1,
+            "AGG-3-02: write inside range must invalidate"
+        );
+
+        // Re-evaluate; the new value (5 → 100) shifts the sum from 55 to 150.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            let v = rt.set_formula(0, 0, 1, "SUM(BigRange)").unwrap();
+            assert_eq!(v, Value::Number(150.0));
+        }
+    }
+
+    /// AGG-3-03: full-column aggregate remains compressed. We register a
+    /// `SUM(WholeCol)` where WholeCol is start_row=0, end_row=RowId::MAX
+    /// — the stripe should still be ONE entry (per DIR-3-04). Phase 3.6
+    /// re-verifies in the aggregate-eval context: the eval doesn't blow
+    /// up trying to iterate 4 billion rows; it clamps via Sheet::bounds.
+    #[test]
+    fn agg_3_03_full_column_aggregate_remains_compressed() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+        let mut wb = make_runtime_workbook();
+        // Populate a few cells; bounds determines the clamp.
+        for r in 0..50 {
+            wb.put_at(0, r, 0, Value::Number(1.0));
+        }
+        wb.set_name(
+            "WholeCol",
+            NamedTarget::Range(Range {
+                sheet: 0,
+                start_row: 0,
+                start_col: 0,
+                end_row: ql_types::RowId::MAX, // whole column
+                end_col: 0,
+            }),
+        )
+        .unwrap();
+        let reg = default_registry();
+        let mut graph = crate::CalcgraphSession::new();
+        let v = {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 1, "SUM(WholeCol)").unwrap()
+        };
+        // 50 ones = 50. The clamp via Sheet::bounds prevents iterating
+        // RowId::MAX cells.
+        assert_eq!(v, Value::Number(50.0));
+        // Stripe still compressed: ONE Column-0 entry (verified at DIR-
+        // 3-04; reaffirm here in the aggregate path).
+        assert_eq!(
+            graph.graph().stripe_index().stripe_count(),
+            1,
+            "AGG-3-03: full-column dep registers a single stripe"
         );
     }
 

@@ -13,13 +13,37 @@
 //! it reads Arrow chunks via `ColumnStore::iter_chunks` for batch processing.
 
 use ql_storage::{NameTable, NamedTarget};
-use ql_types::{ColId, ErrorValue, RowId, SheetId, Value};
+use ql_types::{ColId, ErrorValue, Range, RowId, SheetId, Value};
 
 use crate::plan::{NameLookup, ResolvedName};
 
 /// Read a single cell value. Out-of-bounds reads return `Value::Blank` per Excel semantics.
 pub trait CellEnv {
     fn read_cell(&self, sheet: SheetId, row: RowId, col: ColId) -> Value;
+
+    /// Phase 3.6 (2026-05-12) — AGG-3-04 entry point. Materialize a range
+    /// into a flat `Vec<Value>` for aggregate functions (SUM, AVERAGE,
+    /// MIN, MAX, COUNT, PRODUCT). Default impl iterates the range row by
+    /// row using `read_cell`; impls that have cheaper bounds info (e.g.
+    /// `WorkbookEnv` clamps to `Sheet::bounds`) override.
+    ///
+    /// Returns an empty Vec for a degenerate range (e.g. range entirely
+    /// outside a sheet's populated area). The aggregate function then
+    /// applies its empty-input rule (MIN/MAX → 0; AVERAGE → `#DIV/0!`;
+    /// SUM/COUNT/PRODUCT → 0 or 1; see `ql-functions::scalar_fns`).
+    fn read_range(&self, range: Range) -> Vec<Value> {
+        let mut out = Vec::new();
+        for row in range.start_row..=range.end_row {
+            for col in range.start_col..=range.end_col {
+                out.push(self.read_cell(range.sheet, row, col));
+            }
+            // Safety: end_row could be `RowId::MAX` (whole-column); the
+            // outer range syntax must be bounded by the caller. The
+            // default impl iterates to completion — the WorkbookEnv
+            // override clamps to `Sheet::bounds().row_extent`.
+        }
+        out
+    }
 }
 
 /// `ql-storage::Workbook`-backed implementation. Wraps a Workbook reference; reads dispatch
@@ -48,6 +72,40 @@ impl<'w> CellEnv for WorkbookEnv<'w> {
             Some(s) => s.read(row, col),
             None => Value::Error(ErrorValue::Ref),
         }
+    }
+
+    /// Phase 3.6 override: clamps the iteration to `Sheet::bounds` so a
+    /// `SUM(A:A)` named range with `end_row = RowId::MAX` reads only the
+    /// populated rows (typically a few hundred thousand at most on a
+    /// real sheet), not all 4 billion `RowId` slots. Without this clamp
+    /// AGG-3-04 would correctness-pass but AGG-3-03 (full-column-still-
+    /// usable) would hang at evaluation time.
+    fn read_range(&self, range: Range) -> Vec<Value> {
+        let Some(sheet) = self.workbook.sheet(range.sheet) else {
+            return vec![Value::Error(ErrorValue::Ref)];
+        };
+        let bounds = sheet.bounds();
+        // bounds extents are "one past max"; convert to inclusive bounds.
+        if bounds.row_extent == 0 || bounds.col_extent == 0 {
+            return Vec::new();
+        }
+        let max_row = bounds.row_extent - 1;
+        let max_col = bounds.col_extent - 1;
+        let end_row = range.end_row.min(max_row);
+        let end_col = range.end_col.min(max_col);
+        if range.start_row > end_row || range.start_col > end_col {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(
+            ((end_row - range.start_row + 1) as usize)
+                .saturating_mul((end_col - range.start_col + 1) as usize),
+        );
+        for row in range.start_row..=end_row {
+            for col in range.start_col..=end_col {
+                out.push(sheet.read(row, col));
+            }
+        }
+        out
     }
 }
 

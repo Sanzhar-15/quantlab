@@ -79,6 +79,7 @@ use ql_formula_syntax::{lex, parse, RangeRef};
 use ql_storage::Workbook;
 use ql_types::{ColId, Range, RowId, SheetId};
 
+use crate::aggregate_cache::{AggregateCacheStats, InMemAggregateCache};
 use crate::plan::{bind_with_names, ExprPlan};
 use crate::workbook_runtime::RuntimeError;
 
@@ -281,6 +282,13 @@ pub struct CalcgraphSession {
     /// Per-recompute-cycle scoped — the caller clears the set after
     /// recompute.
     dirty: HashSet<NodeId>,
+    /// Phase 3.6 (W5-39, 2026-05-12) — AGG-3-01..04 cache. Stores
+    /// per-`(range, function_name)` aggregate results so a recompute
+    /// that didn't touch any cell inside the range returns the cached
+    /// value without re-scanning. `mark_dirty_from_cell_write`
+    /// invalidates entries whose range contains the written cell
+    /// (matching the stripe-precision-check pattern at the read side).
+    aggregate_cache: InMemAggregateCache,
     /// Cumulative observability counters. Phase 3.1 records hook
     /// invocations for verification and future ql-profile integration.
     hook_counts: HookCounts,
@@ -602,6 +610,13 @@ impl CalcgraphSession {
         // the workbook (e.g. `load_workbook_and_recompute`), so the
         // session is in a clean state.
         session.dirty.clear();
+        // Phase 3.6: aggregate cache also starts empty. Even if the
+        // caller pre-populated the workbook with computed values, those
+        // values aren't keyed by `(range, function)` and don't unlock
+        // a cache hit on next eval. `clear_all` is a no-op on a fresh
+        // session (the Default impl initializes empty), but keeping
+        // it makes the contract explicit.
+        session.aggregate_cache.clear_all();
 
         RebuildResult {
             session,
@@ -756,6 +771,14 @@ impl CalcgraphSession {
         use std::collections::VecDeque;
         let mut queue: VecDeque<NodeId> = VecDeque::new();
 
+        // Phase 3.6 (AGG-3-02): invalidate any cached aggregate whose
+        // range contains this cell. Done BEFORE the dirty fanout so a
+        // formula whose recompute would otherwise hit a stale cache
+        // sees a fresh miss + recomputation. Precision is exact —
+        // writes outside every cached range are O(cache_size) with no
+        // entry removal.
+        self.aggregate_cache.invalidate_at(sheet, row, col);
+
         // Seed with the direct fanout from the edited cell (which may
         // not itself be a formula).
         for dep in self.graph.dependents_for_cell(sheet, row, col) {
@@ -812,6 +835,22 @@ impl CalcgraphSession {
     /// callers re-sort / topologically order without re-allocating.
     pub fn take_dirty(&mut self) -> HashSet<NodeId> {
         std::mem::take(&mut self.dirty)
+    }
+
+    /// Phase 3.6 — borrow the aggregate cache. The runtime passes this
+    /// to `eval_scalar_with_cache` during `recompute_dirty` /
+    /// `set_formula` so aggregate-over-range evals hit the cache when
+    /// nothing in the range changed since the last computation.
+    pub fn aggregate_cache(&self) -> &InMemAggregateCache {
+        &self.aggregate_cache
+    }
+
+    /// Phase 3.6 — snapshot of `(hits, misses, invalidations)` for
+    /// observability + tests (AGG-3-01 asserts hits > 0 after an
+    /// unrelated edit; AGG-3-02 asserts invalidations > 0 after an
+    /// intersecting edit).
+    pub fn aggregate_cache_stats(&self) -> AggregateCacheStats {
+        self.aggregate_cache.stats()
     }
 
     /// Phase 3.3 introspection: how many cells have at least one

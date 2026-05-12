@@ -282,11 +282,21 @@ The full v1 means all of these crates either ship real behavior or have a docume
    10 new tests (5 in ColumnStore + 5 OVR-* at runtime). ql-exec at 305 (was 295), ql-storage at 70 (was 65), workspace at 915 (was 905).  
    Effort: 4-7 days (actual: ~1 day; the overlay primitive was already per-chunk, so the split was straightforward).
 
-6. **3.6 Range Aggregate Cache V1**  
+6. **3.6 Range Aggregate Cache V1** ✅ SHIPPED 2026-05-12 (W5-39)  
    Add aggregate cache nodes for SUM/COUNT/MIN/MAX/AVERAGE/PRODUCT over range plans, invalidated by dirty stripes. Start simple: clear relevant aggregate cache on intersecting writes; optimize later.  
    References: `.references/hyperformula/src/DependencyGraph/RangeVertex.ts`; `.references/hyperformula/src/DependencyGraph/RangeMapping.ts`; `.references/formualizer/crates/formualizer-eval/src/engine/tests/compressed_range_scheduler.rs`.  
-   Acceptance: AGG-3-01 `SUM(A1:A100000)` does not rescan full range on unrelated writes; AGG-3-02 intersecting write invalidates; AGG-3-03 full-column aggregate remains compressed; AGG-3-04 results match scalar baseline.  
-   Effort: 5-8 days. Uncertain: cache representation may need revision after storage overlay split.
+   Acceptance: AGG-3-01 ✅ unrelated writes don't trigger rescan (`agg_3_01_no_rescan_on_unrelated_writes`); AGG-3-02 ✅ intersecting writes invalidate (`agg_3_02_intersecting_write_invalidates_cache`); AGG-3-03 ✅ full-column aggregate remains compressed (`agg_3_03_full_column_aggregate_remains_compressed`); AGG-3-04 ✅ results match scalar baseline for SUM/AVERAGE/MIN/MAX/COUNT/PRODUCT (`agg_3_04_results_match_scalar_baseline`).  
+   Shipped:  
+   - New module `aggregate_cache.rs`: `AggregateCache` trait, `InMemAggregateCache` (HashMap-backed with `RefCell` interior mutability for `&self` stores), `NoAggregateCache` zero-cost no-op default. Stats: hits / misses / invalidations.  
+   - `CellEnv::read_range(range)` — default impl iterates row-by-row; `WorkbookEnv` overrides to clamp to `Sheet::bounds` so `SUM(WholeCol)` doesn't iterate `RowId::MAX` cells.  
+   - Aggregate evaluator: scalar.rs Function branch detects `(aggregate_fn, [single AggregateNameRef arg])` and routes through cache (hit → return cached; miss → materialize range → call fn → store cached, except for `Value::Error` results). Multi-range aggregates (`SUM(A, B)`) fall back to no-cache materialize-and-call.  
+   - `eval_scalar_with_cache(plan, env, registry, &dyn AggregateCache)` is the new entry point; `eval_scalar_with_registry` wraps with `NoAggregateCache`.  
+   - `CalcgraphSession::aggregate_cache: InMemAggregateCache` field + `aggregate_cache()` / `aggregate_cache_stats()` accessors. `mark_dirty_from_cell_write` calls `invalidate_at(s, r, c)` before fanning out dirty propagation — entries whose range contains the cell are dropped (precision-exact).  
+   - `WorkbookRuntime::set_formula` routes through `eval_scalar_with_cache` (using session cache when attached). `recompute_dirty` uses `try_recompute_with_aggregate_cache`.  
+   - The legacy `eval_scalar_with_registry` + `recompute_all` paths use `NoAggregateCache` (no behavior change without a session).  
+   16 new tests (7 aggregate_cache unit + 4 AGG-3-01..04 acceptance + 3 NAG-* updated for actual eval + 2 read_range correctness). ql-exec at 311 (was 295). Workspace at 926 (was 915).  
+   Notes: V1 caches only single-`AggregateNameRef`-arg calls. Multi-range and mixed-type args (`SUM(A, 5)`, `SUM(A, B)`) fall back to no-cache. Phase 4.7 (array formulas) revisits.  
+   Effort: 5-8 days (actual: ~1 day; substrate from 3.5 overlay split made range reads clean).
 
 7. **3.7 Volatile Function Invalidation**  
    Model NOW/RAND/RANDBETWEEN and later volatile functions as graph roots invalidated by recompute cycle, edit, or explicit recalc mode. Add deterministic test mode.  

@@ -165,7 +165,7 @@ enum BindContext {
 /// Aggregate detection is binary in V0 (all args are aggregate or no args
 /// are). Per-arg-position decisions (e.g. IF's then/else accept arrays in
 /// some contexts) land alongside Engine Phase 4.7 array formulas.
-fn is_aggregate_function(name: &str) -> bool {
+pub(crate) fn is_aggregate_function(name: &str) -> bool {
     // Phase 2B.7 audit (correctness M1): MEDIAN removed — it was listed
     // here but not registered in `ql_functions::default_registry`. Keeping
     // the list synced with the registry is a hard rule; the

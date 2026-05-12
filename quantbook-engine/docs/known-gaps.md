@@ -1,7 +1,7 @@
 # Known engine gaps — checklist with target phases
 
 **Status:** Living document, updated at each phase boundary  
-**Date last touched:** 2026-05-12 (Engine Phase 3.5 close-out — W5-38)  
+**Date last touched:** 2026-05-12 (Engine Phase 3.6 close-out — W5-39)  
 **Companion:** `docs/MASTER-PLAN.md`
 
 Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a gap is closed, move its row to the "Closed" section at the bottom and reference the closing commit.
@@ -24,7 +24,7 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 
 | ID | Gap | Reproduce | Owner | Target phase |
 |---|---|---|---|---|
-| GAP-B-01 | Named-range BIND surface for aggregate context — **partially closed** in Engine Phase 2B.4 (commit-after-bd3147a1045). `SUM(Sales)` now binds to `ExprPlan::AggregateNameRef { name, range }` (the explicit variant) instead of `UnsupportedVariant`; the bind shape carries the resolved `Range`. Scalar-context misuse surfaces precise `BindError::NamedRangeInScalarContext`. **REMAINING:** the scalar evaluator returns `Value::Error(ErrorValue::Calc)` for AggregateNameRef — actual aggregate-range evaluation lands in Engine Phase 3.6. | `ql-exec/src/workbook_runtime.rs::tests::nag_03_named_range_in_aggregate_function_binds_to_explicit_variant` | Engine | Engine Phase 3.6 (range aggregate cache + eval) |
+| ~~GAP-B-01~~ | ~~Named-range BIND surface for aggregate context~~ — **FULLY CLOSED** in Engine Phase 3.6 (W5-39, commit-after-18b19cbc4b5). Phase 2B.4 added the bind shape (`ExprPlan::AggregateNameRef`); Phase 3.6 adds the actual evaluator: SUM/AVERAGE/MIN/MAX/COUNT/PRODUCT over a single named-range arg now compute the real aggregate (via `CellEnv::read_range` clamped to `Sheet::bounds`) instead of `#CALC!`. Cache + invalidation also shipped (AGG-3-01..04). |
 | GAP-B-02 | Named-formula targets (`Profit = Revenue - Costs`) — same `UnsupportedVariant` | None tested yet; parser doesn't even encounter | Engine | Engine Phase 4 |
 | GAP-B-03 | Sheet-scoped names (`Sheet1!Local`) — NameTable has no per-sheet scope | `ql-storage/src/workbook.rs::NameTable` is workbook-flat | Engine | Engine Phase 4.6 |
 | GAP-B-04 | Cross-sheet cell references (`Sheet2!A1`) — parser supports, binder does not resolve | `ql-formula-syntax::Expr::CellRef` carries sheet id but binder ignores cross-sheet at eval | Engine | Engine Phase 4.6 |
@@ -138,6 +138,7 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 - **GAP-I-02** (engine-side IDE-consumption test harness) — closed in Engine Phase 2B.6.
 - **GAP-I-04** (no dry-run formula validation API) — closed in Engine Phase 2B.7 audit closure: `WorkbookRuntime::validate_formula`.
 - **GAP-S-01** (single overlay per chunk, user + formula outputs conflated) — closed in Engine Phase 3.5: parallel `user_overlays` + `computed_overlays` with read cascade user → computed → base.
+- **GAP-B-01** (named-range aggregate eval returned `#CALC!`) — fully closed in Engine Phase 3.6 (W5-39): the scalar evaluator now computes the real aggregate for SUM/AVERAGE/MIN/MAX/COUNT/PRODUCT over a single named-range arg + caches the result on `CalcgraphSession`.
 - **Phase 2B.7 audit-closure fixes** (correctness): orphan op-log entries on `add_sheet`(chunk_rows=0 / SheetId::MAX), `set_name` mutate-first divergence, `set_value` / `clear_formula` partial-pair non-atomicity, `transaction::commit` post-mutation log append. All fixed. `Workbook` and `OpLog` proven `Send + Sync` at compile time. See `docs/audits/2026-05-12-phase-2B.md`.
 
 ---
