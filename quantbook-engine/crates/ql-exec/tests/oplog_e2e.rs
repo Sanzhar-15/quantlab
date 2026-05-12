@@ -123,7 +123,10 @@ fn runtime_produced_oplog_replay_then_recompute_yields_observationally_equivalen
     // recompute_all to materialize.
     {
         let mut rt = WorkbookRuntime::new(&mut replay_wb, &reg);
-        rt.recompute_all().unwrap();
+        assert!(
+            rt.recompute_all().is_complete(),
+            "recompute on replay-side workbook had failures"
+        );
     }
 
     // ===== Equivalence =====
@@ -157,7 +160,10 @@ fn transaction_produced_oplog_replay_then_recompute_yields_observationally_equiv
     replay_into(&oplog, &mut replay_wb, &reg).unwrap();
     {
         let mut rt = WorkbookRuntime::new(&mut replay_wb, &reg);
-        rt.recompute_all().unwrap();
+        assert!(
+            rt.recompute_all().is_complete(),
+            "recompute on replay-side workbook had failures"
+        );
     }
 
     assert_workbooks_observationally_equal(&producer_wb, &replay_wb);
@@ -192,7 +198,10 @@ fn mixed_runtime_and_transaction_producer_replays_equivalently() {
     replay_into(&oplog, &mut replay_wb, &reg).unwrap();
     {
         let mut rt = WorkbookRuntime::new(&mut replay_wb, &reg);
-        rt.recompute_all().unwrap();
+        assert!(
+            rt.recompute_all().is_complete(),
+            "recompute on replay-side workbook had failures"
+        );
     }
 
     assert_workbooks_observationally_equal(&producer_wb, &replay_wb);
@@ -221,7 +230,10 @@ fn runtime_produced_oplog_survives_binary_round_trip() {
     replay_into(&restored, &mut replay_wb, &reg).unwrap();
     {
         let mut rt = WorkbookRuntime::new(&mut replay_wb, &reg);
-        rt.recompute_all().unwrap();
+        assert!(
+            rt.recompute_all().is_complete(),
+            "recompute on replay-side workbook had failures"
+        );
     }
 
     assert_workbooks_observationally_equal(&producer_wb, &replay_wb);
@@ -268,7 +280,10 @@ fn replayed_workbook_supports_load_recompute_convenience() {
     replay_into(&oplog, &mut replay_wb, &reg).unwrap();
     {
         let mut rt = WorkbookRuntime::new(&mut replay_wb, &reg);
-        rt.recompute_all().unwrap();
+        assert!(
+            rt.recompute_all().is_complete(),
+            "recompute on replay-side workbook had failures"
+        );
     }
 
     // Save + reload through the convenience function. The replayed workbook
@@ -276,7 +291,8 @@ fn replayed_workbook_supports_load_recompute_convenience() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("replayed.qbook");
     ql_io::save_workbook(&replay_wb, "replayed-e2e", &path).unwrap();
-    let reloaded = load_workbook_and_recompute(&path, &reg).unwrap();
+    let (reloaded, recompute) = load_workbook_and_recompute(&path, &reg).unwrap();
+    assert!(recompute.is_complete());
     assert_eq!(reloaded.read(Address::new(0, 0, 1)), Value::Number(111.0));
 }
 
@@ -320,7 +336,10 @@ fn producer_save_load_replay_recompute_round_trip_yields_equivalent_workbook() {
     replay_into(&loaded_oplog, &mut replay_wb, &reg).unwrap();
     {
         let mut rt = WorkbookRuntime::new(&mut replay_wb, &reg);
-        rt.recompute_all().unwrap();
+        assert!(
+            rt.recompute_all().is_complete(),
+            "recompute on replay-side workbook had failures"
+        );
     }
 
     // ===== Equivalence =====

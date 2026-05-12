@@ -7,12 +7,24 @@
 //!
 //! 1. `let mut wb = ql_io::load_workbook(path)?;`
 //! 2. `let mut rt = WorkbookRuntime::new(&mut wb, &registry);`
-//! 3. `rt.recompute_all()?;`
+//! 3. `let _ = rt.recompute_all();`
 //!
-//! Phase 2A.4 collapses that to one call. The IDE's "Open file…" path uses it.
+//! Phase 2A.4 collapses that to one call. The IDE's "Open file…" path uses
+//! it.
 //!
-//! Returns the recomputed `Workbook` on success. The error type covers both
-//! load failures (`QbookError`) and recompute failures (`RuntimeError`).
+//! ## Phase 2B.2 (2026-05-12)
+//!
+//! Signature simplified from `Result<Workbook, LoadAndRecomputeError>` to
+//! `Result<(Workbook, RecomputeResult), QbookError>`. The prior shape had
+//! two failure modes (load error vs recompute error) and stuffed the
+//! partially-recomputed workbook into the error variant per Phase 2A.6
+//! audit M5. With the new [`RecomputeResult`] aggregating per-cell
+//! failures instead of short-circuiting, recompute is no longer fallible
+//! at the API level — it always returns a result. Load is the only
+//! remaining short-circuit, so the outer `Result` only handles that.
+//! Callers inspect `RecomputeResult::is_complete()` / `.failures` to see
+//! whether the workbook came back fully consistent. Tracked as GAP-R-02
+//! in `docs/known-gaps.md`.
 
 use std::path::Path;
 
@@ -20,36 +32,16 @@ use ql_functions::FunctionRegistry;
 use ql_io::QbookError;
 use ql_storage::Workbook;
 
-use crate::workbook_runtime::{RuntimeError, WorkbookRuntime};
+use crate::workbook_runtime::{RecomputeResult, WorkbookRuntime};
 
-/// Combined error for the load + recompute pipeline.
+/// Load a `.qbook/` directory and immediately recompute every formula cell.
 ///
-/// Phase 2A.6 audit M5 (2026-05-12): `Recompute` is now a struct variant that
-/// carries the partially-recomputed `Workbook` alongside the underlying
-/// `RuntimeError`. Previously, a recompute failure dropped the partial
-/// workbook on the early-return path, denying the caller any recovery — the
-/// IDE couldn't show overlays or let the user inspect the partial state.
-/// Callers that don't need the partial workbook can simply ignore the field.
-#[derive(Debug, thiserror::Error)]
-pub enum LoadAndRecomputeError {
-    #[error("qbook load error: {0}")]
-    Load(#[from] QbookError),
-
-    #[error("recompute error: {error}")]
-    Recompute {
-        /// The partially-recomputed workbook at the point of failure. Formula
-        /// cells already evaluated before the failure have their refreshed
-        /// values; cells past the failure point hold their pre-recompute
-        /// (potentially stale) saved values. Iteration order is HashMap-
-        /// arbitrary, so the partition between "refreshed" and "stale" is
-        /// non-deterministic per call.
-        workbook: Workbook,
-        error: RuntimeError,
-    },
-}
-
-/// Load a `.qbook/` directory and immediately recompute every formula cell so
-/// the returned workbook's values reflect the current state of dependencies.
+/// Returns `(Workbook, RecomputeResult)` on a successful load. The workbook
+/// has every formula re-evaluated where possible; cells whose formulas failed
+/// structurally keep their pre-load values, and the failure detail is in
+/// `RecomputeResult::failures`. Callers wanting "all-or-nothing" semantics
+/// can check `recompute.is_complete()` and discard the workbook on
+/// partial-state.
 ///
 /// The recompute does the full lex → parse → bind → eval pipeline for each
 /// formula. Iteration order is HashMap-arbitrary (same caveat as
@@ -58,31 +50,19 @@ pub enum LoadAndRecomputeError {
 /// values. Engine Phase 3 calcgraph integration fixes that (see
 /// `docs/MASTER-PLAN.md` Phase 3.4; tracked as GAP-R-01).
 ///
-/// Errors from either stage surface as `LoadAndRecomputeError`:
-/// - Load errors short-circuit before any recompute work.
-/// - Recompute errors return the partially-recomputed workbook (Phase 2A.6
-///   audit M5) so the caller can show the partial state with error overlays.
-///
-/// The `clippy::result_large_err` lint is suppressed here: the `Recompute`
-/// variant deliberately carries a full `Workbook` so callers can recover from
-/// partial-state failures. Boxing it would defeat the purpose of audit M5
-/// (forcing every caller through an extra allocation just to access the
-/// payload they specifically asked for). This function is not in a hot path —
-/// it's the "Open file…" entry point.
-#[allow(clippy::result_large_err)]
+/// Only `QbookError` short-circuits (file missing, schema mismatch, malformed
+/// cell, etc.). Recompute failures are aggregated into `RecomputeResult`
+/// without losing the workbook.
 pub fn load_workbook_and_recompute(
     path: &Path,
     registry: &FunctionRegistry,
-) -> Result<Workbook, LoadAndRecomputeError> {
+) -> Result<(Workbook, RecomputeResult), QbookError> {
     let mut workbook = ql_io::load_workbook(path)?;
-    let recompute_result = {
+    let recompute = {
         let mut runtime = WorkbookRuntime::new(&mut workbook, registry);
         runtime.recompute_all()
     };
-    match recompute_result {
-        Ok(_) => Ok(workbook),
-        Err(error) => Err(LoadAndRecomputeError::Recompute { workbook, error }),
-    }
+    Ok((workbook, recompute))
 }
 
 #[cfg(test)]
@@ -121,7 +101,8 @@ mod tests {
         save_workbook(&wb, "refresh", &path).unwrap();
 
         // Load via the convenience — it should recompute B1 against A1=100.
-        let loaded = load_workbook_and_recompute(&path, &reg).unwrap();
+        let (loaded, result) = load_workbook_and_recompute(&path, &reg).unwrap();
+        assert!(result.is_complete());
         assert_eq!(loaded.read(Address::new(s, 0, 0)), Value::Number(100.0));
         assert_eq!(loaded.read(Address::new(s, 1, 0)), Value::Number(200.0));
         // Formula text preserved.
@@ -141,19 +122,21 @@ mod tests {
         save_workbook(&wb, "noformula", &path).unwrap();
 
         let reg = default_registry();
-        let loaded = load_workbook_and_recompute(&path, &reg).unwrap();
+        let (loaded, result) = load_workbook_and_recompute(&path, &reg).unwrap();
+        assert_eq!(result.attempted, 0);
+        assert!(result.is_complete());
         assert_eq!(loaded.read(Address::new(s, 0, 0)), Value::Number(42.0));
         assert_eq!(loaded.read(Address::new(s, 0, 1)), Value::text("hello"));
     }
 
     #[test]
-    fn load_failure_surfaces_as_load_error() {
+    fn load_failure_surfaces_as_qbook_error() {
         let reg = default_registry();
         let missing = std::path::Path::new("/tmp/does-not-exist-2026.qbook");
         let result = load_workbook_and_recompute(missing, &reg);
         assert!(
-            matches!(result, Err(LoadAndRecomputeError::Load(_))),
-            "expected Load error for missing path, got {result:?}"
+            result.is_err(),
+            "expected QbookError for missing path, got {result:?}"
         );
     }
 
@@ -164,8 +147,10 @@ mod tests {
         save_workbook(&wb, "empty", &path).unwrap();
 
         let reg = default_registry();
-        let loaded = load_workbook_and_recompute(&path, &reg).unwrap();
+        let (loaded, result) = load_workbook_and_recompute(&path, &reg).unwrap();
         assert_eq!(loaded.sheet_count(), 0);
+        assert_eq!(result.attempted, 0);
+        assert!(result.is_complete());
     }
 
     #[test]
@@ -185,7 +170,9 @@ mod tests {
         wb.put_at(s, 0, 0, Value::Number(5.0));
         save_workbook(&wb, "multi", &path).unwrap();
 
-        let loaded = load_workbook_and_recompute(&path, &reg).unwrap();
+        let (loaded, result) = load_workbook_and_recompute(&path, &reg).unwrap();
+        assert_eq!(result.succeeded, 3);
+        assert!(result.is_complete());
         // Recomputed against A1=5:
         assert_eq!(loaded.read(Address::new(s, 1, 0)), Value::Number(6.0));
         assert_eq!(loaded.read(Address::new(s, 2, 0)), Value::Number(50.0));
@@ -211,7 +198,8 @@ mod tests {
         }
         save_workbook(&wb, "named", &path).unwrap();
 
-        let loaded = load_workbook_and_recompute(&path, &reg).unwrap();
+        let (loaded, result) = load_workbook_and_recompute(&path, &reg).unwrap();
+        assert!(result.is_complete());
         // Name survived the round-trip + the formula recomputed against it.
         assert_eq!(loaded.read(Address::new(s, 0, 0)), Value::Number(210.0));
         // Formula text also preserved.
@@ -226,10 +214,13 @@ mod tests {
         ));
     }
 
-    /// Phase 2A.6 audit M5 (2026-05-12): on recompute failure, the loader must
-    /// preserve the partially-recomputed workbook in the error variant so the
-    /// caller can inspect / display the partial state. Previously the workbook
-    /// was dropped on the early-return path.
+    /// Phase 2A.6 audit M5 / Phase 2B.2 (2026-05-12): on recompute failure,
+    /// the loader must preserve the partially-recomputed workbook so the
+    /// caller can inspect / display the partial state. Phase 2B.2 reshapes
+    /// this from `LoadAndRecomputeError::Recompute { workbook, error }` to
+    /// `Ok((workbook, RecomputeResult { failures, .. }))` — the failure
+    /// information moved INTO the RecomputeResult, the workbook always
+    /// comes back. Acceptance R2B-04.
     ///
     /// Phase 2A.8 update: named-ranges now persist (audit M12 closed), so the
     /// prior failure trigger (an unresolved named reference after reload) no
@@ -237,7 +228,7 @@ mod tests {
     /// formula text on-disk to invalid syntax — exercising the same
     /// partial-state preservation path.
     #[test]
-    fn recompute_failure_preserves_partial_workbook_in_error() {
+    fn recompute_failure_preserves_partial_workbook_in_result() {
         let (_dir, path) = temp_path("partial.qbook");
 
         // Build a workbook with two formulas, save it, then corrupt one
@@ -265,21 +256,28 @@ mod tests {
         );
         std::fs::write(&jsonl_path, corrupted).unwrap();
 
-        match load_workbook_and_recompute(&path, &reg) {
-            Err(LoadAndRecomputeError::Recompute { workbook, error: _ }) => {
-                // Partial workbook is returned. Literal A1 intact.
-                assert_eq!(workbook.read(Address::new(s, 0, 0)), Value::Number(42.0));
-                // Both formula texts survive the load.
-                assert_eq!(
-                    workbook.formula_at(s, 1, 0).map(|t| t.as_ref()),
-                    Some("A1 + 1")
-                );
-                assert_eq!(
-                    workbook.formula_at(s, 2, 0).map(|t| t.as_ref()),
-                    Some("(((")
-                );
-            }
-            other => panic!("expected Recompute err with partial workbook, got {other:?}"),
-        }
+        let (workbook, result) = load_workbook_and_recompute(&path, &reg).unwrap();
+        // Partial workbook is returned; literal A1 intact.
+        assert_eq!(workbook.read(Address::new(s, 0, 0)), Value::Number(42.0));
+        // Both formula texts survive the load.
+        assert_eq!(
+            workbook.formula_at(s, 1, 0).map(|t| t.as_ref()),
+            Some("A1 + 1")
+        );
+        assert_eq!(
+            workbook.formula_at(s, 2, 0).map(|t| t.as_ref()),
+            Some("(((")
+        );
+        // Recompute aggregate reports the partial state.
+        assert!(!result.is_complete());
+        assert_eq!(result.attempted, 2);
+        assert_eq!(result.succeeded, 1);
+        assert_eq!(result.failed_count(), 1);
+        // The failure carries the exact corrupted formula text + cell coords.
+        let failure = &result.failures[0];
+        assert_eq!(failure.sheet, s);
+        assert_eq!(failure.row, 2);
+        assert_eq!(failure.col, 0);
+        assert_eq!(failure.formula_text.as_ref(), "(((");
     }
 }

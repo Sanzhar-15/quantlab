@@ -35,7 +35,7 @@ pub mod transaction;
 pub mod workbook_runtime;
 
 pub use env::{CellEnv, MapEnv, WorkbookEnv};
-pub use loader::{load_workbook_and_recompute, LoadAndRecomputeError};
+pub use loader::load_workbook_and_recompute;
 pub use lower::{classify, dispatch, SimdShape};
 pub use plan::{bind, bind_with_names, BindError, ExprPlan, NameLookup, ResolvedName};
 pub use scalar::{eval_scalar, eval_scalar_with_registry};
@@ -51,4 +51,4 @@ pub use simd::{
     sub_scalar,
 };
 pub use transaction::WorkbookTransaction;
-pub use workbook_runtime::{RuntimeError, WorkbookRuntime};
+pub use workbook_runtime::{RecomputeFailure, RecomputeResult, RuntimeError, WorkbookRuntime};

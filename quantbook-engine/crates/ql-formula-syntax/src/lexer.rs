@@ -17,9 +17,10 @@ use crate::token::{Operator, Token};
 ///
 /// Phase 2A.11 audit M16 (2026-05-12): switched from hand-rolled Display +
 /// std::error::Error to `thiserror::Error` for consistency with QbookError,
-/// RuntimeError, LoadAndRecomputeError, NameTableError (all already use
-/// thiserror). Display strings are user-facing and identical to the prior
-/// hand-rolled formatters.
+/// RuntimeError, NameTableError (all already use thiserror). Display strings
+/// are user-facing and identical to the prior hand-rolled formatters.
+/// (Phase 2B.2 removed `LoadAndRecomputeError`; recompute failures are now
+/// aggregated in `RecomputeResult` rather than surfaced as a wrapping enum.)
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum LexError {
     #[error("unterminated string literal")]

@@ -146,6 +146,80 @@ impl From<BindError> for RuntimeError {
     }
 }
 
+/// Outcome of a single failed cell during `WorkbookRuntime::recompute_all`.
+///
+/// Phase 2B.2 (2026-05-12): part of the [`RecomputeResult`] aggregation
+/// replacing the prior short-circuit `Result<usize, RuntimeError>` return
+/// shape. Captures everything a caller needs to display the failure
+/// without re-walking the workbook: the cell address, the formula text
+/// that was tried, and the structural error from lex/parse/bind.
+///
+/// Evaluation-time errors that surface as `Value::Error(...)` (e.g. `=10/0`
+/// → `#DIV/0!`) do NOT appear here — those are normal cell values per
+/// Excel canon and get written to the workbook like any other recompute
+/// success. `RecomputeFailure` is reserved for STRUCTURAL failures where
+/// the formula cannot be evaluated at all.
+///
+/// Not `Clone` — `RuntimeError` contains `loro::LoroError` (via the
+/// Phase 2A.3.b `OpLog` variant) which is not Clone. Pass by ownership
+/// or borrow.
+#[derive(Debug)]
+pub struct RecomputeFailure {
+    pub sheet: SheetId,
+    pub row: RowId,
+    pub col: ColId,
+    pub formula_text: Arc<str>,
+    pub error: RuntimeError,
+}
+
+/// Aggregate outcome of `WorkbookRuntime::recompute_all`.
+///
+/// Phase 2B.2 (2026-05-12): replaces the prior `Result<usize, RuntimeError>`
+/// return shape. The previous signature short-circuited on first failure,
+/// dropping per-cell context and forcing callers to re-walk the workbook
+/// to find what went wrong. The new shape:
+///
+/// - `attempted` — total formula cells in the workbook snapshot at start.
+/// - `succeeded` — formulas that lex/parse/bind/eval'd cleanly and were
+///   written back to the workbook.
+/// - `failures` — every formula that failed structurally, in iteration
+///   order. Each entry carries cell address + formula text + error.
+/// - `partial_state` — `true` iff `!failures.is_empty()`. Provided as an
+///   explicit boolean so callers branching on "is this workbook now
+///   consistent?" don't have to re-check `failures.len()`.
+///
+/// No-fallback semantics: failures are NOT swallowed. The struct makes
+/// every failure visible and aggregable. Callers that want short-circuit
+/// semantics can check `is_complete()` and bail.
+///
+/// Cells past a failure point keep their pre-recompute (potentially stale)
+/// values; their formula text is preserved either way (recompute never
+/// clears formula on failure). Iteration order is `HashMap`-arbitrary
+/// today (GAP-R-01); Engine Phase 3 calcgraph integration makes it
+/// topological.
+///
+/// Not `Clone` for the same reason as `RecomputeFailure`.
+#[derive(Debug)]
+pub struct RecomputeResult {
+    pub attempted: usize,
+    pub succeeded: usize,
+    pub failures: Vec<RecomputeFailure>,
+    pub partial_state: bool,
+}
+
+impl RecomputeResult {
+    /// True iff every formula recomputed without a structural failure.
+    pub fn is_complete(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    /// Number of structural failures (lex/parse/bind). Excludes evaluation
+    /// errors like `#DIV/0!` which are normal cell values.
+    pub fn failed_count(&self) -> usize {
+        self.failures.len()
+    }
+}
+
 /// Live-formula facade. Wraps a `&mut Workbook` + `&FunctionRegistry`.
 ///
 /// Construct one per session of cell edits. Re-creating per call is cheap (the
@@ -324,32 +398,67 @@ impl<'a> WorkbookRuntime<'a> {
     /// dependency resolution (see `docs/MASTER-PLAN.md` Phase 3.4; tracked as
     /// GAP-R-01 in `docs/known-gaps.md`).
     ///
-    /// Returns the count of formula cells re-evaluated. If any single formula
-    /// fails to re-evaluate (lex/parse/bind error), that error short-circuits the
-    /// whole recompute — the workbook is left in a partial state. Phase 2+: track
-    /// per-cell errors and continue.
-    pub fn recompute_all(&mut self) -> Result<usize, RuntimeError> {
+    /// Phase 2B.2 (2026-05-12): signature changed from `Result<usize,
+    /// RuntimeError>` to `RecomputeResult` (always returns; no Result
+    /// wrapper). The prior shape short-circuited on first failure and
+    /// dropped per-cell context; the new shape continues past failures
+    /// and aggregates them. See [`RecomputeResult`] for the contract.
+    ///
+    /// Cells that fail structurally (lex/parse/bind) keep their
+    /// pre-recompute values and formula text. Cells that succeed have
+    /// their value replaced. Cells whose evaluation produces an Excel-
+    /// canon error value (`#DIV/0!`, `#VALUE!`, etc.) are counted as
+    /// succeeded — those error values are normal cell contents per
+    /// Excel canon, not structural failures.
+    pub fn recompute_all(&mut self) -> RecomputeResult {
         // Snapshot the formula list so we don't hold a borrow during eval.
         let entries: Vec<(SheetId, RowId, ColId, Arc<str>)> = self
             .workbook
             .iter_formulas()
             .map(|(s, r, c, f)| (s, r, c, Arc::clone(f)))
             .collect();
-        let count = entries.len();
+        let attempted = entries.len();
+        let mut succeeded = 0;
+        let mut failures: Vec<RecomputeFailure> = Vec::new();
 
         for (sheet, row, col, formula_text) in entries {
-            let tokens = lex(formula_text.as_ref())?;
-            let expr = parse(tokens)?;
-            // Phase 2A.1 — bind against the workbook's NameTable.
-            let plan = bind_with_names(&expr, sheet, self.workbook.names())?;
-            let value = {
-                let env = WorkbookEnv::new(self.workbook);
-                eval_scalar_with_registry(&plan, &env, self.registry)
-            };
-            self.workbook.put_at(sheet, row, col, value);
+            match self.try_recompute_one(sheet, &formula_text) {
+                Ok(value) => {
+                    self.workbook.put_at(sheet, row, col, value);
+                    succeeded += 1;
+                }
+                Err(error) => {
+                    failures.push(RecomputeFailure {
+                        sheet,
+                        row,
+                        col,
+                        formula_text,
+                        error,
+                    });
+                }
+            }
         }
 
-        Ok(count)
+        let partial_state = !failures.is_empty();
+        RecomputeResult {
+            attempted,
+            succeeded,
+            failures,
+            partial_state,
+        }
+    }
+
+    /// Helper for `recompute_all`: lex/parse/bind/eval a single formula
+    /// without writing it back. Failures here become `RecomputeFailure`
+    /// entries; successes return the evaluated `Value` for the caller to
+    /// `put_at` into the workbook.
+    fn try_recompute_one(&self, sheet: SheetId, formula_text: &str) -> Result<Value, RuntimeError> {
+        let tokens = lex(formula_text)?;
+        let expr = parse(tokens)?;
+        // Phase 2A.1 — bind against the workbook's NameTable.
+        let plan = bind_with_names(&expr, sheet, self.workbook.names())?;
+        let env = WorkbookEnv::new(self.workbook);
+        Ok(eval_scalar_with_registry(&plan, &env, self.registry))
     }
 }
 
@@ -641,8 +750,10 @@ mod tests {
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
 
-        let count = rt.recompute_all().unwrap();
-        assert_eq!(count, 0);
+        let result = rt.recompute_all();
+        assert_eq!(result.attempted, 0);
+        assert_eq!(result.succeeded, 0);
+        assert!(result.is_complete());
     }
 
     #[test]
@@ -664,8 +775,10 @@ mod tests {
 
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-        let count = rt.recompute_all().unwrap();
-        assert_eq!(count, 1);
+        let result = rt.recompute_all();
+        assert_eq!(result.attempted, 1);
+        assert_eq!(result.succeeded, 1);
+        assert!(result.is_complete());
 
         // B1 now shows 200 (refreshed).
         assert_eq!(
@@ -689,7 +802,9 @@ mod tests {
 
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-        rt.recompute_all().unwrap();
+        let result = rt.recompute_all();
+        assert_eq!(result.succeeded, 3);
+        assert!(result.is_complete());
 
         assert_eq!(wb.read(ql_types::Address::new(0, 1, 0)), Value::Number(3.0));
         assert_eq!(
@@ -751,7 +866,8 @@ mod tests {
 
         // Recompute refreshes everything.
         let mut rt = WorkbookRuntime::new(&mut loaded, &reg);
-        rt.recompute_all().unwrap();
+        let result = rt.recompute_all();
+        assert!(result.is_complete());
         assert_eq!(
             loaded.read(ql_types::Address::new(s, 1, 0)),
             Value::Number(300.0)
@@ -927,8 +1043,9 @@ mod tests {
 
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-        let count = rt.recompute_all().unwrap();
-        assert_eq!(count, 1);
+        let result = rt.recompute_all();
+        assert_eq!(result.succeeded, 1);
+        assert!(result.is_complete());
         assert_eq!(
             wb.read(ql_types::Address::new(0, 0, 0)),
             Value::Number(210.0)
@@ -1123,7 +1240,8 @@ mod tests {
         let len_before_recompute = oplog.len();
         {
             let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
-            rt.recompute_all().unwrap();
+            let result = rt.recompute_all();
+            assert!(result.is_complete());
         }
         assert_eq!(
             oplog.len(),
@@ -1143,5 +1261,137 @@ mod tests {
         rt.set_value(0, 0, 0, Value::Number(5.0)).unwrap();
         let v = rt.set_formula(0, 1, 0, "A1 + 10").unwrap();
         assert_eq!(v, Value::Number(15.0));
+    }
+
+    // ===== Phase 2B.2 — RecomputeResult contract =====
+
+    /// R2B-01: a structural failure surfaces with the exact cell address +
+    /// formula text + underlying RuntimeError. No information is lost going
+    /// from "failed cell" to "RecomputeFailure entry".
+    #[test]
+    fn recompute_all_failure_carries_exact_cell_and_formula_text() {
+        let mut wb = make_runtime_workbook();
+        // Seed an unparseable formula by hand-writing it into the workbook
+        // (bypassing the runtime's set_formula which would reject it
+        // up-front). This simulates the on-disk-corruption scenario the
+        // loader handles.
+        wb.put_formula(0, 3, 5, "(((");
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let result = rt.recompute_all();
+        assert!(!result.is_complete());
+        assert_eq!(result.failed_count(), 1);
+        let failure = &result.failures[0];
+        assert_eq!(failure.sheet, 0);
+        assert_eq!(failure.row, 3);
+        assert_eq!(failure.col, 5);
+        assert_eq!(failure.formula_text.as_ref(), "(((");
+        // Underlying error is a parse error (unclosed paren).
+        assert!(
+            matches!(failure.error, RuntimeError::Parse(_)),
+            "expected Parse error, got {:?}",
+            failure.error
+        );
+    }
+
+    /// R2B-02: a failure does not short-circuit. Cells whose formulas DO
+    /// parse cleanly get re-evaluated and counted as succeeded, regardless
+    /// of iteration order.
+    #[test]
+    fn recompute_all_does_not_short_circuit_on_first_failure() {
+        let mut wb = make_runtime_workbook();
+        // 3 good formulas + 2 bad ones. We don't know iteration order, but
+        // we know exactly 3 should succeed and exactly 2 should fail.
+        wb.put_at(0, 0, 0, Value::Number(10.0));
+        wb.put_formula(0, 1, 0, "A1 + 1"); // good
+        wb.put_formula(0, 2, 0, "A1 * 2"); // good
+        wb.put_formula(0, 3, 0, "A1 - 5"); // good
+        wb.put_formula(0, 4, 0, "((("); // parse error
+        wb.put_formula(0, 5, 0, "@bogus"); // lex error
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let result = rt.recompute_all();
+        assert_eq!(result.attempted, 5);
+        assert_eq!(result.succeeded, 3);
+        assert_eq!(result.failed_count(), 2);
+        assert!(!result.is_complete());
+
+        // Good cells were updated regardless of order.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 1, 0)),
+            Value::Number(11.0)
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 2, 0)),
+            Value::Number(20.0)
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 3, 0)), Value::Number(5.0));
+    }
+
+    /// R2B-03: invalid persisted formulas do NOT panic the runtime. Every
+    /// kind of structural failure (lex / parse / bind) surfaces as a
+    /// `RecomputeFailure` entry; the runtime stays alive.
+    #[test]
+    fn recompute_all_does_not_panic_on_invalid_persisted_formulas() {
+        let mut wb = make_runtime_workbook();
+        wb.put_formula(0, 0, 0, "@@@"); // lex error
+        wb.put_formula(0, 0, 1, "1 +"); // parse error (trailing operator)
+        wb.put_formula(0, 0, 2, "UnknownName + 1"); // bind error (UnresolvedName)
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // Just calling this must not panic — the assertion is the absence
+        // of a panic, plus the structural-failure invariant.
+        let result = rt.recompute_all();
+        assert_eq!(result.attempted, 3);
+        assert_eq!(result.succeeded, 0);
+        assert_eq!(result.failed_count(), 3);
+        assert!(!result.is_complete());
+    }
+
+    /// Evaluation-time errors (Value::Error variants like #DIV/0!) count as
+    /// SUCCEEDED, not failed. Recompute writes the error value to the cell
+    /// per Excel canon. Only structural failures (lex/parse/bind) populate
+    /// `RecomputeResult::failures`.
+    #[test]
+    fn recompute_all_eval_time_error_values_count_as_succeeded() {
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Number(10.0));
+        wb.put_formula(0, 1, 0, "A1 / 0"); // evaluates to #DIV/0!
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let result = rt.recompute_all();
+        assert_eq!(result.succeeded, 1);
+        assert_eq!(result.failed_count(), 0);
+        assert!(result.is_complete());
+        // The cell value is the error sentinel, written by put_at.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 1, 0)),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    /// Failed cells keep their pre-recompute values; their formula text is
+    /// preserved (recompute never clears formula on failure).
+    #[test]
+    fn recompute_all_failed_cells_preserve_prior_state() {
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Number(999.0)); // pre-recompute value
+        wb.put_formula(0, 0, 0, "(((");
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let result = rt.recompute_all();
+        assert_eq!(result.failed_count(), 1);
+        // Cell value untouched by failed recompute.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Number(999.0)
+        );
+        // Formula text still on disk.
+        assert_eq!(wb.formula_at(0, 0, 0).map(|s| s.as_ref()), Some("((("));
     }
 }
