@@ -7,5 +7,7 @@
 //! See `_QUANTBOOK-v1-SPECIFICATION.md` Part V §1 OG-06.
 
 pub mod graph_profile;
+pub mod timings;
 
 pub use graph_profile::{build_profile, export_graph_profile, GraphProfile};
+pub use timings::{NodeKind, NodeTypeTimings, Timings};

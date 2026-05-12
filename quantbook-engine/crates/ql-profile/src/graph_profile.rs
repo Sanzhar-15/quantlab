@@ -4,11 +4,11 @@
 //! within 10 min"). The shape is locked in W3-7; Week 4 ql-exec adds recompute-time
 //! fields as it lands. No new fields land in Phase 0 beyond the structural ones.
 //!
-//! ## Output shape
+//! ## Output shape (schema v2 — W5-5)
 //!
 //! ```json
 //! {
-//!   "schema_version": 1,
+//!   "schema_version": 2,
 //!   "graph": {
 //!     "revision": 7,
 //!     "node_count": 6,
@@ -28,29 +28,51 @@
 //!     "present": true,
 //!     "chunk_count": 2,
 //!     "chunk_rows": 16384
+//!   },
+//!   "timings": {                           // Optional — present only when supplied
+//!     "last_eval_duration_us": 3400,
+//!     "recompute_us_by_node_type": {
+//!       "cell_us": 600, "range_us": 0,
+//!       "formula_region_us": 2800, "spill_us": 0
+//!     },
+//!     "fingerprint_cache_hits": 10,
+//!     "fingerprint_cache_misses": 2,
+//!     "simd_dispatch_count": 1,
+//!     "scalar_dispatch_count": 0
 //!   }
 //! }
 //! ```
 //!
-//! ## What's missing (Week 4)
-//!
-//! `recompute_time_ms_by_node_type`, `fingerprint_cache_hit_rate`, `last_eval_duration_ms`.
-//! These need a `Timings` struct that lives in ql-exec.
+//! OG-06 acceptance fully closed in W5-5 with the `timings` section. Earlier W3-7
+//! shipped graph/stats/dirty (shape-only); W5-5 adds time-spent attribution so a
+//! senior engineer reads the JSON + identifies the hot path within 10 min per the
+//! spec criterion.
 
 use ql_calcgraph::{ChunkDirtySet, Graph, NodeCountsByVariant};
 use serde::Serialize;
 
+use crate::timings::Timings;
+
 /// Stable schema version for the profile output. Bump on incompatible changes.
-const SCHEMA_VERSION: u32 = 1;
+/// - v1: W3-7 initial shape (graph + stats + dirty).
+/// - v2: W5-5 added `timings` section (OG-06 acceptance fully closed).
+const SCHEMA_VERSION: u32 = 2;
 
 /// Top-level profile envelope. Serializable; `export_graph_profile` returns this as a
 /// `serde_json::Value` for callers that want to merge it into a larger envelope.
+///
+/// `timings` is `None` (omitted from JSON via serde skip) when no eval has run; once
+/// the runtime layer (Week 4+ `ql-exec` integration) wires it, the field will be
+/// populated with the most recent eval's data.
 #[derive(Clone, Debug, Serialize)]
 pub struct GraphProfile {
     pub schema_version: u32,
     pub graph: GraphSection,
     pub stats: StatsSection,
     pub dirty: DirtySection,
+    /// Timing snapshot from the most recent eval. `None` if no eval has run yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<Timings>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -96,10 +118,14 @@ pub struct DirtySection {
     pub chunk_rows: u32,
 }
 
-/// Build the `GraphProfile` struct from a graph + optional dirty set. Pass `None` for
-/// the dirty set when profiling a graph mid-construction (before any dirty propagation
-/// has happened).
-pub fn build_profile(graph: &Graph, dirty: Option<&ChunkDirtySet>) -> GraphProfile {
+/// Build the `GraphProfile` struct from a graph + optional dirty set + optional
+/// timing snapshot. `None` for `dirty` means "no dirty propagation has happened yet";
+/// `None` for `timings` means "no evaluation has run yet."
+pub fn build_profile(
+    graph: &Graph,
+    dirty: Option<&ChunkDirtySet>,
+    timings: Option<Timings>,
+) -> GraphProfile {
     let node_counts: NodeCountsSection = graph.node_counts_by_variant().into();
     let stats = graph.stats();
     GraphProfile {
@@ -125,6 +151,7 @@ pub fn build_profile(graph: &Graph, dirty: Option<&ChunkDirtySet>) -> GraphProfi
             },
             None => DirtySection::default(),
         },
+        timings,
     }
 }
 
@@ -132,8 +159,12 @@ pub fn build_profile(graph: &Graph, dirty: Option<&ChunkDirtySet>) -> GraphProfi
 /// + by integration tests that want to assert against the JSON shape directly.
 ///
 /// For a pretty-printed JSON string, call `serde_json::to_string_pretty(&value)`.
-pub fn export_graph_profile(graph: &Graph, dirty: Option<&ChunkDirtySet>) -> serde_json::Value {
-    let profile = build_profile(graph, dirty);
+pub fn export_graph_profile(
+    graph: &Graph,
+    dirty: Option<&ChunkDirtySet>,
+    timings: Option<Timings>,
+) -> serde_json::Value {
+    let profile = build_profile(graph, dirty, timings);
     serde_json::to_value(&profile).expect("GraphProfile must serialize cleanly")
 }
 
@@ -189,14 +220,14 @@ mod tests {
     #[test]
     fn schema_version_locked() {
         let g = Graph::new();
-        let p = build_profile(&g, None);
-        assert_eq!(p.schema_version, 1);
+        let p = build_profile(&g, None, None);
+        assert_eq!(p.schema_version, 2);
     }
 
     #[test]
     fn empty_graph_profile_zero_everything() {
         let g = Graph::new();
-        let p = build_profile(&g, None);
+        let p = build_profile(&g, None, None);
         assert_eq!(p.graph.node_count, 0);
         assert_eq!(p.graph.edge_count, 0);
         assert_eq!(p.graph.stripe_count, 0);
@@ -210,12 +241,13 @@ mod tests {
         assert_eq!(p.stats.chunked_reduce_chunks_processed, 0);
         assert!(!p.dirty.present);
         assert_eq!(p.dirty.chunk_count, 0);
+        assert_eq!(p.timings, None);
     }
 
     #[test]
     fn sample_graph_profile_node_counts() {
         let g = make_sample_graph();
-        let p = build_profile(&g, None);
+        let p = build_profile(&g, None, None);
         assert_eq!(p.graph.node_counts.cell, 3);
         assert_eq!(p.graph.node_counts.range, 1);
         assert_eq!(p.graph.node_counts.formula_region, 1);
@@ -226,7 +258,7 @@ mod tests {
     #[test]
     fn sample_graph_profile_stats() {
         let g = make_sample_graph();
-        let p = build_profile(&g, None);
+        let p = build_profile(&g, None, None);
         assert_eq!(p.stats.stripe_inserts, 1);
         assert_eq!(p.stats.chunked_reduce_chunks_processed, 3);
         assert_eq!(p.stats.dependents_scan_fallback, 0);
@@ -238,7 +270,7 @@ mod tests {
         let mut dirty = ChunkDirtySet::new(16384);
         dirty.mark_cell(0, 0, 0);
         dirty.mark_cell(0, 16384, 0); // different chunk in same column
-        let p = build_profile(&g, Some(&dirty));
+        let p = build_profile(&g, Some(&dirty), None);
         assert!(p.dirty.present);
         assert_eq!(p.dirty.chunk_count, 2);
         assert_eq!(p.dirty.chunk_rows, 16384);
@@ -247,18 +279,73 @@ mod tests {
     #[test]
     fn export_graph_profile_yields_valid_json() {
         let g = make_sample_graph();
-        let v = export_graph_profile(&g, None);
+        let v = export_graph_profile(&g, None, None);
         assert!(v.is_object());
-        // Schema version present and correct.
-        assert_eq!(v["schema_version"], 1);
+        // Schema version present and correct (v2 since W5-5).
+        assert_eq!(v["schema_version"], 2);
         // Top-level keys.
         for k in &["graph", "stats", "dirty"] {
             assert!(v.get(*k).is_some(), "missing top-level key: {k}");
         }
+        // Timings absent when None (serde skip_serializing_if).
+        assert!(v.get("timings").is_none());
         // Spot-check nested fields.
         assert_eq!(v["graph"]["node_counts"]["cell"], 3);
         assert_eq!(v["graph"]["stripe_count"], 1);
         assert_eq!(v["stats"]["chunked_reduce_chunks_processed"], 3);
+    }
+
+    // ===== W5-5: timings section (OG-06 fully closed) =====
+
+    #[test]
+    fn timings_section_present_when_supplied() {
+        use crate::timings::{NodeKind, Timings};
+        let g = make_sample_graph();
+        let mut t = Timings::new();
+        t.last_eval_duration_us = 3_400; // 3.4 ms — OG-02 baseline
+        t.record_simd_dispatch();
+        t.record_node_eval(NodeKind::FormulaRegion, 2_800);
+        t.record_node_eval(NodeKind::Cell, 600);
+        t.fingerprint_cache_hits = 10;
+        t.fingerprint_cache_misses = 2;
+
+        let p = build_profile(&g, None, Some(t));
+        let timings = p.timings.expect("timings should be present");
+        assert_eq!(timings.last_eval_duration_us, 3_400);
+        assert_eq!(timings.simd_dispatch_count, 1);
+        assert_eq!(timings.recompute_us_by_node_type.cell_us, 600);
+        assert_eq!(timings.recompute_us_by_node_type.formula_region_us, 2_800);
+        assert_eq!(timings.fingerprint_cache_hit_rate(), Some(10.0 / 12.0));
+    }
+
+    #[test]
+    fn timings_section_in_json_output() {
+        use crate::timings::{NodeKind, Timings};
+        let g = make_sample_graph();
+        let mut t = Timings::new();
+        t.last_eval_duration_us = 3_400;
+        t.record_simd_dispatch();
+        t.record_simd_dispatch();
+        t.record_node_eval(NodeKind::FormulaRegion, 2_800);
+
+        let v = export_graph_profile(&g, None, Some(t));
+        assert!(v.get("timings").is_some(), "timings key present in JSON");
+        assert_eq!(v["timings"]["last_eval_duration_us"], 3_400);
+        assert_eq!(v["timings"]["simd_dispatch_count"], 2);
+        assert_eq!(
+            v["timings"]["recompute_us_by_node_type"]["formula_region_us"],
+            2_800
+        );
+    }
+
+    #[test]
+    fn timings_section_skipped_when_none() {
+        let g = make_sample_graph();
+        let v = export_graph_profile(&g, None, None);
+        assert!(v.get("timings").is_none(), "no timings key when None");
+        // Pretty-printed JSON also shouldn't contain "timings".
+        let pretty = serde_json::to_string_pretty(&v).expect("pretty-print");
+        assert!(!pretty.contains("\"timings\""));
     }
 
     /// Audit M4 (2026-05-12): the previous version of this test only asserted the
@@ -272,7 +359,7 @@ mod tests {
         let g = make_sample_graph();
         let mut dirty = ChunkDirtySet::new(16384);
         dirty.mark_cell(0, 5, 0);
-        let v = export_graph_profile(&g, Some(&dirty));
+        let v = export_graph_profile(&g, Some(&dirty), None);
         let pretty = serde_json::to_string_pretty(&v).expect("pretty-print works");
 
         // Round-trip the pretty form back through serde to a Value to verify it parses
