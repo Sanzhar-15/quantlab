@@ -45,6 +45,7 @@ PINNED_PKGS=(
   proptest
   serde
   serde_json
+  toml
 )
 
 err=0

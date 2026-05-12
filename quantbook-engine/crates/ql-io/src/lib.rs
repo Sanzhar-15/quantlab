@@ -1,11 +1,13 @@
-//! `ql-io` — Phase 0 stub. See ../../../.plans/_QUANTBOOK-v1-SPECIFICATION.md Part V.
+//! `ql-io` — Quantbook native `.qbook/` workbook directory format.
+//!
+//! Phase 1 W5-6 scope: load + save round-trip for the `.qbook/` directory layout.
+//! See `qbook_format.rs` for the format spec + implementation.
+//!
+//! Foreign-format support (xlsx, ods) lives in `ql-io-xlsx` / `ql-io-ods` crates.
 
-#![allow(dead_code)]
+pub mod qbook_format;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn smoke() {
-        // crate compiles; replace as Phase 0 work lands.
-    }
-}
+pub use qbook_format::{
+    error_to_canonical_text, load_workbook, save_workbook, CellRecord, CellWireValue, QbookError,
+    SheetEnvelope, WorkbookEnvelope, WORKBOOK_SCHEMA_VERSION,
+};

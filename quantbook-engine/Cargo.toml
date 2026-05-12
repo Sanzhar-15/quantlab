@@ -89,9 +89,11 @@ tempfile = "=3.27.0"
 mimalloc = { version = "=0.1.48", default-features = false }
 num_cpus = "=1.17.0"
 
-# Serialization (graph-profile.json export — OG-06; future workbook envelope serialization)
+# Serialization (graph-profile.json export — OG-06; `.qbook/workbook.toml` envelope per
+# the Phase 1 workbook format).
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.149"
+toml = "=0.9.7"
 
 [profile.dev]
 opt-level = 0
