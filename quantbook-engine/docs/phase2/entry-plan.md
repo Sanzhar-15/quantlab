@@ -182,13 +182,15 @@ Promoted ql-io from dev-dependency to regular dependency of ql-exec (loader.rs u
 
 **Surfaced gap (not fixed here):** named-range definitions don't persist through `save_workbook` / `load_workbook` — the on-disk schema has no NameTable section. Test `named_range_formula_round_trips_through_load_and_recompute` pins this; fix lives in `ql-io::qbook_format` (Phase 2B+).
 
-### Phase 2A.5 — Lexer dotted identifiers (`VAR.S`, `STDEV.P`) (~0.5 day)
+### Phase 2A.5 — Lexer dotted identifiers (`VAR.S`, `STDEV.P`) ✅ DONE (2026-05-12)
 
-**Why:** the function registry has `VAR.S` as a key but the lexer rejects `.` outside numeric context. The Phase 1 workaround uses the `VAR` alias. Phase 2 lexer enhancement removes the workaround.
+**Shipped** in `ql-formula-syntax::lexer::lex_ident_or_ref`. After the initial letter run, a `while` loop allows `.LETTERS` continuation; once any dot is consumed, the token is committed to the `Ident` path (CellRef-style `$`/digit suffixes become errors). Orphan dots (no letter after) become a `LexError::UnexpectedChar('.')`.
 
-**Implementation:** in `lex_ident_or_ref`, allow `.` followed by uppercase letters as a continuation of the identifier (only when the LHS is already an Ident, not a CellRef). Excel canon: `VAR.S` is a single identifier.
+**End-to-end verified:** `=VAR.S(1, 2, 3)` evaluates to 1.0; `=STDEV.P(2, 4, 4, 4, 5, 5, 7, 9)` evaluates to 2.0. The function registry already had `VAR.S` / `VAR.P` / `STDEV.S` / `STDEV.P` from Phase 0 — only the lexer needed the change.
 
-**Test:** parser + WorkbookRuntime evaluate `=VAR.S(1, 2, 3)`.
+**Tests:** 10 lexer tests (single-dot, multi-dot, lowercase preservation, function-call form, orphan-dot error, leading-/trailing-dollar rejection, trailing-digit rejection, `A1+.5` regression guard for CellRef-then-Number) + 1 parser test (`VAR.S(...)` → `Expr::Function`) + 2 runtime tests (`VAR.S` and `STDEV.P` end-to-end through `set_formula`).
+
+**Multi-dot policy:** the `while` loop accepts patterns like `A.B.C` lexing as `Ident("A.B.C")`. Excel doesn't use these, but the binder rejects unknown function names downstream, so no extra restriction was warranted. Pinned by `dotted_ident_multi_dot` test.
 
 ### Phase 2A.6 — Phase 2 audit + acceptance (~1 day)
 

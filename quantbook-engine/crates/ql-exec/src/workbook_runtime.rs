@@ -259,6 +259,33 @@ mod tests {
         assert!(wb.formula_at(0, 0, 0).is_none());
     }
 
+    /// Phase 2A.5 (2026-05-12): `=VAR.S(1, 2, 3)` end-to-end — lexer accepts the
+    /// dotted identifier, parser builds Expr::Function { name: "VAR.S" }, binder
+    /// produces ExprPlan::Function, scalar evaluator dispatches via the registry
+    /// to the variance kernel. Sample variance of {1,2,3} is 1.0.
+    #[test]
+    fn set_formula_var_s_dotted_function_dispatches() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        let v = rt.set_formula(0, 0, 0, "VAR.S(1, 2, 3)").unwrap();
+        assert_eq!(v, Value::Number(1.0));
+    }
+
+    #[test]
+    fn set_formula_stdev_p_dotted_function_dispatches() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // Population stdev of {2, 4, 4, 4, 5, 5, 7, 9} is exactly 2.0 (textbook).
+        let v = rt
+            .set_formula(0, 0, 0, "STDEV.P(2, 4, 4, 4, 5, 5, 7, 9)")
+            .unwrap();
+        assert_eq!(v, Value::Number(2.0));
+    }
+
     #[test]
     fn set_formula_ai_returns_ai_not_available() {
         let mut wb = make_runtime_workbook();

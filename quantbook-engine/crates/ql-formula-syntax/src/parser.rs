@@ -930,6 +930,25 @@ mod tests {
         }
     }
 
+    /// Phase 2A.5 (2026-05-12): dotted identifiers like `VAR.S` lex as a single
+    /// `Token::Ident("VAR.S")` and parse as a function call when followed by `(`.
+    /// Pin the parser end of the pipeline so the lexer change can't quietly
+    /// regress into a CellRef + Number pattern downstream.
+    #[test]
+    fn parse_dotted_function_name() {
+        match p("VAR.S(1, 2, 3)") {
+            Expr::Function { name, args } => {
+                assert_eq!(name.as_ref(), "VAR.S");
+                assert_eq!(args.len(), 3);
+            }
+            other => panic!("VAR.S(...) should parse as a function call, got {other:?}"),
+        }
+        match p("var.s(1, 2)") {
+            Expr::Function { name, .. } => assert_eq!(name.as_ref(), "VAR.S"),
+            other => panic!("var.s lowercase canonicalizes to VAR.S, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_log10_disambiguation() {
         // LOG10 lexes as a CellRef (col=L+O+G+1+0... ridiculous column index, text="LOG10").

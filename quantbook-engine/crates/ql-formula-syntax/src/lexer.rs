@@ -229,6 +229,59 @@ fn lex_ident_or_ref(chars: &mut Peekable<Chars>) -> Result<Token, LexError> {
         }
     }
 
+    // Phase 2A.5 (2026-05-12): dotted identifiers like `VAR.S`, `STDEV.P`. If we
+    // see `.LETTERS`, treat as a continuation of the identifier — this commits
+    // the token to the Ident path (no CellRef / BareColumn / BareRow
+    // interpretation after a dot, since Excel doesn't have dotted cell refs).
+    // An orphan dot (not followed by an ASCII letter) is a lex error here, not
+    // a separate token: we've already entered identifier-lex mode, and Excel
+    // canon doesn't put bare dots in identifier position.
+    //
+    // The `while` loop allows multi-dot patterns (e.g. `A.B.C`) for forward
+    // compatibility — Excel only uses single-dot today, but the parser/binder
+    // will reject unknown function names regardless of dot count.
+    let mut has_dot = false;
+    while chars.peek() == Some(&'.') {
+        // Commit to consuming the `.` only when a letter follows. We peek twice
+        // by cloning the iterator (cheap — Chars holds a single &str slice).
+        let mut lookahead = chars.clone();
+        lookahead.next(); // skip the `.` in the cloned view
+        let next_is_letter = lookahead.peek().is_some_and(|c| c.is_ascii_alphabetic());
+        if !next_is_letter {
+            // Bare dot in identifier position (or end-of-input). Reject loudly.
+            return Err(LexError::UnexpectedChar('.'));
+        }
+        chars.next(); // consume the `.` for real now
+        letters.push('.');
+        has_dot = true;
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_alphabetic() || c == '_' {
+                letters.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Phase 2A.5: once we've absorbed a dot, the token is unambiguously an
+    // Ident. Cell-ref syntax (digits / extra `$`) isn't legal after a dot, and
+    // leading `$` on an identifier isn't either. Reject these up front so the
+    // error points at the offending character, not at downstream parse mismatch.
+    if has_dot {
+        if leading_dollar {
+            return Err(LexError::UnexpectedChar('$'));
+        }
+        if chars.peek() == Some(&'$') {
+            return Err(LexError::UnexpectedChar('$'));
+        }
+        if chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+            let bad = chars.peek().copied().unwrap();
+            return Err(LexError::UnexpectedChar(bad));
+        }
+        return Ok(Token::Ident(Arc::from(letters)));
+    }
+
     // Optional `$` between letters and digits (row-absolute marker).
     let mut mid_dollar = false;
     if chars.peek() == Some(&'$') {
@@ -981,5 +1034,118 @@ mod tests {
     fn invalid_number_errors() {
         // "1.2.3" — f64::parse rejects.
         assert!(matches!(lex("1.2.3"), Err(LexError::InvalidNumber(_))));
+    }
+
+    // -- Phase 2A.5: dotted identifiers ----------------------------------------
+
+    #[test]
+    fn dotted_ident_var_s() {
+        let toks = lex_ok("VAR.S");
+        assert_eq!(toks.len(), 1);
+        match &toks[0] {
+            Token::Ident(s) => assert_eq!(s.as_ref(), "VAR.S"),
+            other => panic!("expected Ident(VAR.S), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dotted_ident_stdev_p() {
+        let toks = lex_ok("STDEV.P");
+        assert_eq!(toks.len(), 1);
+        match &toks[0] {
+            Token::Ident(s) => assert_eq!(s.as_ref(), "STDEV.P"),
+            other => panic!("expected Ident(STDEV.P), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dotted_ident_lowercase_preserved_at_lex_time() {
+        // The lexer preserves case; the parser uppercases at canonicalization.
+        let toks = lex_ok("var.s");
+        assert_eq!(toks.len(), 1);
+        match &toks[0] {
+            Token::Ident(s) => assert_eq!(s.as_ref(), "var.s"),
+            other => panic!("expected Ident(var.s), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dotted_ident_function_call() {
+        let toks = lex_ok("VAR.S(1, 2, 3)");
+        assert!(matches!(toks[0], Token::Ident(_)));
+        assert_eq!(toks[1], Token::LParen);
+        assert_eq!(toks[2], Token::Number(1.0));
+        assert_eq!(toks[3], Token::Comma);
+        // Last token must be RParen.
+        assert_eq!(toks.last().unwrap(), &Token::RParen);
+    }
+
+    #[test]
+    fn dotted_ident_multi_dot() {
+        // Multi-dot names aren't Excel-standard, but the lexer accepts them
+        // (the parser/binder rejects unknown function names downstream). This
+        // pins the behavior so we don't regress without thinking about it.
+        let toks = lex_ok("A.B.C");
+        assert_eq!(toks.len(), 1);
+        match &toks[0] {
+            Token::Ident(s) => assert_eq!(s.as_ref(), "A.B.C"),
+            other => panic!("expected Ident(A.B.C), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn orphan_dot_in_ident_position_errors() {
+        // `VAR.` with nothing after the dot — Excel doesn't allow trailing dots
+        // in identifier position, and we can't undo the consumed letters.
+        assert!(matches!(lex("VAR."), Err(LexError::UnexpectedChar('.'))));
+        // `VAR.+` — dot followed by non-letter operator.
+        assert!(matches!(lex("VAR.+1"), Err(LexError::UnexpectedChar('.'))));
+        // `VAR.1` — dot followed by digit. Excel canon: dotted identifiers
+        // can't have digits in the suffix.
+        assert!(matches!(lex("VAR.1"), Err(LexError::UnexpectedChar('.'))));
+    }
+
+    #[test]
+    fn dotted_ident_rejects_leading_dollar() {
+        // `$VAR.S` — identifiers can't carry the column-absolute marker.
+        assert!(matches!(lex("$VAR.S"), Err(LexError::UnexpectedChar('$'))));
+    }
+
+    #[test]
+    fn dotted_ident_rejects_trailing_dollar() {
+        // `VAR.S$` — no row-absolute marker after a dotted ident either.
+        assert!(matches!(lex("VAR.S$"), Err(LexError::UnexpectedChar('$'))));
+    }
+
+    #[test]
+    fn dotted_ident_rejects_trailing_digit() {
+        // `VAR.S1` — once we've consumed a dot, the token is locked into the
+        // Ident path; digits would imply CellRef semantics, which dotted names
+        // don't support.
+        assert!(matches!(lex("VAR.S1"), Err(LexError::UnexpectedChar('1'))));
+    }
+
+    #[test]
+    fn cellref_followed_by_dot_still_works_as_separate_tokens() {
+        // `A1.5` is `A1` (CellRef) followed by `.5` (Number) — the lexer
+        // commits to the CellRef path when digits follow letters, and `.5`
+        // re-enters lex_number. Pin this behavior so the dotted-ident path
+        // doesn't accidentally steal CellRef syntax.
+        let toks = lex_ok("A1+.5");
+        assert!(matches!(toks[0], Token::CellRef { .. }));
+        assert_eq!(toks[1], Token::Op(Operator::Plus));
+        assert_eq!(toks[2], Token::Number(0.5));
+    }
+
+    #[test]
+    fn plain_ident_still_works_after_dot_extension() {
+        // Regression guard: tokens with no dot in them must still lex the way
+        // they did pre-2A.5 (Ident for 4+ letters / non-column-letter, BareColumn
+        // for 1-3 valid column letters).
+        let toks = lex_ok("AVERAGE");
+        assert_eq!(toks.len(), 1);
+        assert!(matches!(toks[0], Token::Ident(_)));
+        let toks = lex_ok("A");
+        assert!(matches!(toks[0], Token::BareColumn { .. }));
     }
 }
