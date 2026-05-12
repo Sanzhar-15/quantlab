@@ -112,24 +112,35 @@ If the user asks "what's next?", default to Track A. If they specify "IDE" or "w
 
 **Spec reference:** `_QUANTBOOK-v1-SPECIFICATION.md` Part V §3 + Round 7 T2-D02 (defined names).
 
-### Phase 2A.2 — Multi-cell transaction API (1 day)
+### Phase 2A.2 — Multi-cell transaction API ✅ DONE (2026-05-12)
 
-**Why:** the IDE's "paste a 10×10 block" operation should batch through one transaction, not 100 individual `set_value` calls. Each transaction is one save-state change; the op log (Phase 2A.3) records one op per transaction.
+**Shipped** in `quantbook-engine/crates/ql-exec/src/transaction.rs`. The IDE's "paste a block" path goes through one `WorkbookTransaction` instead of N individual `set_value` calls; the eventual op log (2A.3) gets one entry per transaction commit.
 
-**API design (sketch):**
+**API (final):**
 ```rust
-pub struct WorkbookTransaction<'a> { ... }
+pub struct WorkbookTransaction<'a> { /* &mut Workbook + &FunctionRegistry */ }
 
 impl<'a> WorkbookTransaction<'a> {
-    pub fn put_value(&mut self, sheet, row, col, value);
-    pub fn put_formula(&mut self, sheet, row, col, text) -> Result<Value, RuntimeError>;
-    pub fn commit(self) -> Result<(), RuntimeError>;  // applies all writes atomically
+    pub fn new(workbook: &'a mut Workbook, registry: &'a FunctionRegistry) -> Self;
+    pub fn put_value(&mut self, sheet, row, col, value: Value);
+    pub fn put_formula(&mut self, sheet, row, col, text) -> Result<(), RuntimeError>;
+    pub fn op_count(&self) -> usize;
+    pub fn commit(self);
 }
+// Plus: WorkbookRuntime::transaction() -> WorkbookTransaction<'_>
 ```
 
-Implementation: collect writes in memory, commit applies them all at once. Useful for the IDE + for the op log (Phase 2A.3) which records one entry per transaction commit.
+**Semantics shipped:**
+- **Eager validation**: `put_formula` runs lex + parse + bind at call time. Errors (syntax, `UnresolvedName`, `UnsupportedVariant`) surface BEFORE any state change.
+- **Two-pass commit**: pass 1 applies all literal writes + persists all formula text; pass 2 evaluates each buffered formula against the post-pass-1 workbook and writes the result. Means a formula referencing a literal-value cell written EARLIER in the same transaction sees the new value (paste-block semantics).
+- **Drop without commit = no-op**: the borrow checker enforces one active transaction per workbook, and dropping without `commit` discards the buffered ops cleanly. (IDE's "ESC cancels paste".)
+- **Last-write-wins** within a transaction. Order in `ops` Vec dictates which write lands last.
 
-**Tracked from Phase 1 exit packet:** "Phase 2 prep work".
+**Known surprise (pinned by test, not yet fixed):** if a transaction does `put_formula(C)` then `put_value(C)` on the same cell, the literal's formula-clear happens in pass 1, but pass 2 still evaluates the buffered formula and overwrites the literal value — final state is the formula's value with no formula text. Documented in `value_after_formula_on_same_cell_clears_formula`. The IDE should not interleave value/formula on the same cell in one batch; if it ever does, revisit. (Phase 4 calcgraph integration with proper dependency-driven recompute supersedes this corner.)
+
+**Deferred to Phase 2B+:** transaction-aware op log integration (2A.3 task), formula→formula intra-batch topological ordering (Phase 4 calcgraph).
+
+**Tests:** 15 in `transaction::tests` (literal-only commit, formula commit, formula sees in-batch value, parse-error rejection, unresolved-name rejection, drop-no-commit, no-op commit, value clears existing formula, last-write-wins on dup, formula-overwrites-value, value-after-formula corner pin, named-constant resolution, error-value propagation, 5×2 paste block, runtime.transaction() integration).
 
 ### Phase 2A.3 — Loro op log scaffolding (2–3 days)
 

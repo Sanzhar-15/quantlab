@@ -28,6 +28,7 @@ use ql_types::{ColId, RowId, SheetId, Value};
 use crate::env::WorkbookEnv;
 use crate::plan::{bind_with_names, BindError};
 use crate::scalar::eval_scalar_with_registry;
+use crate::transaction::WorkbookTransaction;
 
 /// Errors from the runtime pipeline. Each upstream stage's error wraps cleanly.
 #[derive(Debug, thiserror::Error)]
@@ -114,6 +115,14 @@ impl<'a> WorkbookRuntime<'a> {
     pub fn set_value(&mut self, sheet: SheetId, row: RowId, col: ColId, value: Value) {
         self.workbook.put_at(sheet, row, col, value);
         self.workbook.clear_formula(sheet, row, col);
+    }
+
+    /// Begin a multi-cell transaction. The returned `WorkbookTransaction`
+    /// borrows the runtime's workbook + registry for its lifetime. Buffer
+    /// writes via `put_value`/`put_formula` then call `commit` to apply them
+    /// atomically. See `transaction::WorkbookTransaction` for full semantics.
+    pub fn transaction(&mut self) -> WorkbookTransaction<'_> {
+        WorkbookTransaction::new(self.workbook, self.registry)
     }
 
     /// Re-evaluate every formula in the workbook. Used after `load_workbook` to

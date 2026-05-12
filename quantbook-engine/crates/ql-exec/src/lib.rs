@@ -24,6 +24,7 @@ pub mod lower;
 pub mod plan;
 pub mod scalar;
 pub mod simd;
+pub mod transaction;
 pub mod workbook_runtime;
 
 pub use env::{CellEnv, MapEnv, WorkbookEnv};
@@ -33,4 +34,5 @@ pub use scalar::{eval_scalar, eval_scalar_with_registry};
 pub use simd::{
     add_array, add_scalar, div_array, mul_array, mul_scalar, scalar_sub, sub_array, sub_scalar,
 };
+pub use transaction::WorkbookTransaction;
 pub use workbook_runtime::{RuntimeError, WorkbookRuntime};
