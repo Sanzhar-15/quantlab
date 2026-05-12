@@ -226,11 +226,22 @@ pub struct RecomputeFailure {
 /// topological.
 ///
 /// Not `Clone` for the same reason as `RecomputeFailure`.
+///
+/// Phase 3.8 (W5-41, 2026-05-12) adds the `skipped_value_equality` field
+/// — VEQ-3-03's "profile records skipped downstream vertices." A dirty
+/// formula whose direct cell deps all stayed at their prior values, and
+/// which has no range deps or volatile flag, is skipped entirely during
+/// `recompute_dirty`. The counter is `0` for `recompute_all` (which
+/// always processes every formula in HashMap order — no VEQ logic).
 #[derive(Debug)]
 pub struct RecomputeResult {
     pub attempted: usize,
     pub succeeded: usize,
     pub failures: Vec<RecomputeFailure>,
+    /// Phase 3.8 (VEQ-3-03): count of formulas that were in the dirty
+    /// set but skipped because no upstream value actually changed.
+    /// Always `0` for the legacy `recompute_all` path.
+    pub skipped_value_equality: usize,
 }
 
 impl RecomputeResult {
@@ -813,6 +824,11 @@ impl<'a> WorkbookRuntime<'a> {
             attempted,
             succeeded,
             failures,
+            // Phase 3.8: `recompute_all` doesn't run the VEQ check —
+            // it's the HashMap-order legacy path that always
+            // re-evaluates everything. `recompute_dirty` is the path
+            // that benefits from value-equality short-circuit.
+            skipped_value_equality: 0,
         }
     }
 
@@ -852,17 +868,54 @@ impl<'a> WorkbookRuntime<'a> {
         let attempted = sched.total_count();
         let mut succeeded = 0;
         let mut failures: Vec<RecomputeFailure> = Vec::new();
+        let mut skipped_value_equality: usize = 0;
+
+        // Phase 3.8 (W5-41, VEQ-3-01..03) — value-equality short-
+        // circuit. State for the pass:
+        //   - `prior`: workbook value at each sched node BEFORE we
+        //     touch anything. Snapshotted once, used as the equality
+        //     baseline.
+        //   - `originally_dirty`: NodeIds that were in the dirty set
+        //     coming in to this call. Used to distinguish "top-level
+        //     dirty" (came from an external edit; must re-eval) from
+        //     "downstream dirty" (only here because an upstream
+        //     formula was dirty; check if upstream actually changed).
+        //   - `changed`: addresses whose value differs from `prior`
+        //     after this pass. Built as we go; downstream formulas
+        //     check membership to decide whether to re-eval.
+        use std::collections::{HashMap, HashSet};
+        let mut prior: HashMap<(SheetId, RowId, ColId), Value> = HashMap::new();
+        let mut originally_dirty: HashSet<ql_calcgraph::NodeId> = HashSet::new();
+        for n in sched.sorted.iter().chain(sched.cycled.iter()) {
+            originally_dirty.insert(*n);
+            if let Some(addr) = session.cell_address_for(*n) {
+                prior.insert(
+                    addr,
+                    self.workbook
+                        .read(ql_types::Address::new(addr.0, addr.1, addr.2)),
+                );
+            }
+        }
+        let mut changed: HashSet<(SheetId, RowId, ColId)> = HashSet::new();
 
         // Cycled nodes get `#CIRC!` regardless of whether the formula
         // still binds. Spec: cycles are terminal Phase 0 errors. Phase
         // 3.5: `#CIRC!` is a FORMULA-output value (the formula's
-        // resolution), so it routes to the computed overlay.
+        // resolution), so it routes to the computed overlay. Phase
+        // 3.8: still apply value-equality (the cycle might have been
+        // pre-existing → `#CIRC!` matches prior `#CIRC!`; skip write).
+        let circ = Value::Error(ErrorValue::Circ);
         for node in &sched.cycled {
             let Some((sheet, row, col)) = session.cell_address_for(*node) else {
-                continue; // non-Cell variant; nothing to write
+                continue;
             };
-            self.workbook
-                .put_computed_at(sheet, row, col, Value::Error(ErrorValue::Circ));
+            let prior_val = prior.get(&(sheet, row, col));
+            if prior_val == Some(&circ) {
+                skipped_value_equality += 1;
+            } else {
+                self.workbook.put_computed_at(sheet, row, col, circ.clone());
+                changed.insert((sheet, row, col));
+            }
         }
 
         // Sorted nodes evaluate in dependency-first order.
@@ -870,24 +923,77 @@ impl<'a> WorkbookRuntime<'a> {
             let Some((sheet, row, col)) = session.cell_address_for(*node) else {
                 continue;
             };
-            // Fetch the formula text from the workbook. A node may
-            // be in the schedule but lack a current formula if it
-            // was cleared between dirty-marking and recompute — in
-            // that case there's nothing to recompute.
             let Some(text) = self.workbook.formula_at(sheet, row, col).cloned() else {
                 continue;
             };
+
+            // Phase 3.8: VEQ decision — does any upstream of `node`
+            // have a reason to recompute? Cases:
+            //   a) Volatile (NOW/RAND/etc.) — always re-eval (its
+            //      value can change without any cell edit).
+            //   b) Has named-range deps — V1 conservatively re-evals
+            //      (we don't track per-cell-in-range changes yet).
+            //   c) Has at least one direct-cell dep that's a
+            //      formula in the original dirty set AND that
+            //      formula's value changed → re-eval.
+            //   d) Has NO direct-cell dep that's in the original
+            //      dirty set (top-level dirty; came from an external
+            //      edit) → re-eval.
+            //   e) All direct-cell deps are in the dirty set but
+            //      none ended up in `changed` → SKIP.
+            let is_volatile = session.is_volatile(*node);
+            let needs_eval = if is_volatile {
+                true
+            } else if let Some(deps) = session.formula_deps(*node) {
+                if !deps.named_ranges.is_empty() {
+                    true
+                } else {
+                    let mut had_dirty_dep = false;
+                    let mut had_changed_dep = false;
+                    for &(ds, dr, dc) in &deps.cells {
+                        if let Some(dep_node) = session.cell_node_for(ds, dr, dc) {
+                            if originally_dirty.contains(&dep_node) {
+                                had_dirty_dep = true;
+                                if changed.contains(&(ds, dr, dc)) {
+                                    had_changed_dep = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // Top-level dirty (no dep in dirty set) OR a
+                    // changed dirty-dep → re-eval. Pure-downstream
+                    // with no changed dep → skip.
+                    !had_dirty_dep || had_changed_dep
+                }
+            } else {
+                // No tracked deps (e.g., `=1+1`). Treat as top-level.
+                true
+            };
+
+            if !needs_eval {
+                skipped_value_equality += 1;
+                continue;
+            }
+
             // Phase 3.6 (W5-39): route through the session's aggregate
             // cache so `SUM(Sales)`-style formulas hit the cache when
-            // no cell inside `Sales` changed (AGG-3-01). The cache lives
-            // inside `session`, which we borrowed mutably above; the
-            // cache itself uses interior mutability (RefCell) so an
-            // immutable borrow is enough.
+            // no cell inside `Sales` changed (AGG-3-01).
             let agg_cache = session.aggregate_cache();
             match self.try_recompute_with_aggregate_cache(sheet, &text, agg_cache) {
                 Ok(value) => {
-                    // Phase 3.5: formula outputs to computed overlay.
-                    self.workbook.put_computed_at(sheet, row, col, value);
+                    // Phase 3.8: value-equality check. If the freshly-
+                    // computed value matches the snapshot, suppress
+                    // the write entirely and don't record this cell
+                    // as `changed` — downstream formulas that depend
+                    // only on this one will skip too.
+                    let prior_val = prior.get(&(sheet, row, col));
+                    if prior_val == Some(&value) {
+                        skipped_value_equality += 1;
+                    } else {
+                        self.workbook.put_computed_at(sheet, row, col, value);
+                        changed.insert((sheet, row, col));
+                    }
                     succeeded += 1;
                 }
                 Err(error) => failures.push(RecomputeFailure {
@@ -905,6 +1011,7 @@ impl<'a> WorkbookRuntime<'a> {
             attempted,
             succeeded,
             failures,
+            skipped_value_equality,
         })
     }
 
@@ -3446,6 +3553,182 @@ mod tests {
             ),
             _ => panic!("expected Number values"),
         }
+        ql_functions::clear_test_overrides();
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 3.8 (W5-41) — VEQ-3-01..03 acceptance tests.
+    // ----------------------------------------------------------------
+
+    /// VEQ-3-01: when an upstream's recomputed value equals its prior
+    /// value, downstream formulas that depend only on it are SKIPPED.
+    /// Setup: A1 = 1 literal; B1 = A1 + 1 (= 2); C1 = B1 + 1 (= 3).
+    /// Trigger: edit A1 to 1 (same value). Both B1 and C1 are marked
+    /// dirty via the Phase 3.3 BFS. After recompute_dirty:
+    ///
+    /// - B1 re-evaluates (top-level dirty); value unchanged → suppress.
+    /// - C1 skipped entirely (its only changed-upstream candidate, B1,
+    ///   stayed unchanged).
+    ///
+    /// Observable: `skipped_value_equality` ≥ 1, and no extra writes
+    /// to B1/C1.
+    #[test]
+    fn veq_3_01_unchanged_upstream_suppresses_downstream_recompute() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = crate::CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(1.0)).unwrap();
+            rt.set_formula(0, 0, 1, "A1 + 1").unwrap();
+            rt.set_formula(0, 0, 2, "B1 + 1").unwrap();
+        }
+        // Sanity baseline.
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(2.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Number(3.0));
+
+        // Edit A1 to the SAME value — triggers dirty propagation but
+        // no actual change.
+        let result = {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(1.0)).unwrap();
+            rt.recompute_dirty().expect("graph attached")
+        };
+        // VEQ-3-03: profile records skipped vertices.
+        assert!(
+            result.skipped_value_equality >= 1,
+            "VEQ-3-01: at least one of B1/C1 must be skipped (skipped={})",
+            result.skipped_value_equality
+        );
+        // C1 specifically is the downstream-of-downstream — it should
+        // be skipped because B1's value didn't change.
+        assert_eq!(
+            result.skipped_value_equality, 2,
+            "Both B1 (value-equality on output) and C1 (skip because B1 unchanged) should be skipped"
+        );
+        // Values still correct.
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(2.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Number(3.0));
+    }
+
+    /// VEQ-3-02: error equality is correct. A formula that re-evaluates
+    /// to the same `#DIV/0!` error should be treated as equal — no
+    /// write, downstream skipped. Setup: A1 = 10 / 0 (→ #DIV/0!);
+    /// B1 = A1 + 1 (→ #DIV/0!, error propagation).
+    /// Edit A1's formula to the same text → still #DIV/0!. B1 skipped.
+    #[test]
+    fn veq_3_02_error_equality_suppresses_downstream() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = crate::CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 5, Value::Number(0.0)).unwrap(); // F1 = 0
+            rt.set_formula(0, 0, 0, "10 / F1").unwrap(); // A1 = #DIV/0!
+            rt.set_formula(0, 0, 1, "A1 + 1").unwrap(); // B1 = #DIV/0!
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Error(ErrorValue::DivZero)
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Error(ErrorValue::DivZero)
+        );
+
+        // Edit F1 to 0 (same value) — triggers dirty cascade.
+        let result = {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 5, Value::Number(0.0)).unwrap();
+            rt.recompute_dirty().expect("graph attached")
+        };
+        // Both A1 and B1 stayed at #DIV/0!. Skip count covers both.
+        assert!(
+            result.skipped_value_equality >= 1,
+            "VEQ-3-02: error-valued cells with unchanged errors must skip"
+        );
+        // Re-confirm values.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Error(ErrorValue::DivZero)
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    /// VEQ-3-03: the `skipped_value_equality` counter on
+    /// `RecomputeResult` is the public profile surface for value-
+    /// equality short-circuit. This test asserts the field exists,
+    /// is non-zero when skips occur, and stays 0 when every dirty
+    /// formula actually changed.
+    #[test]
+    fn veq_3_03_profile_records_skipped_vertices() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = crate::CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(1.0)).unwrap();
+            rt.set_formula(0, 0, 1, "A1 + 1").unwrap();
+        }
+
+        // Case 1: no-change edit → skip > 0.
+        let r1 = {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(1.0)).unwrap();
+            rt.recompute_dirty().expect("graph attached")
+        };
+        assert!(r1.skipped_value_equality > 0);
+
+        // Case 2: real change → skip = 0.
+        let r2 = {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(100.0)).unwrap();
+            rt.recompute_dirty().expect("graph attached")
+        };
+        assert_eq!(
+            r2.skipped_value_equality, 0,
+            "VEQ-3-03: value DID change; no skips expected"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Number(101.0)
+        );
+
+        // Case 3: `recompute_all` legacy path — skipped is always 0.
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let r3 = rt.recompute_all();
+        assert_eq!(
+            r3.skipped_value_equality, 0,
+            "recompute_all doesn't run VEQ — field is always 0"
+        );
+    }
+
+    /// VEQ regression: a volatile formula (RAND) is NEVER skipped on
+    /// value-equality — its value can change between calls without
+    /// any cell edit. The Phase 3.7 mark_volatile_dirty path triggers
+    /// the recompute; even if the seeded RAND happened to produce the
+    /// same value twice in a row, the formula must still re-evaluate.
+    #[test]
+    fn veq_does_not_skip_volatile_formulas() {
+        ql_functions::set_test_rng_seed(0x4242_4242_4242_4242);
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = crate::CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 0, "RAND()").unwrap();
+        }
+        graph.mark_volatile_dirty();
+        let result = {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.recompute_dirty().expect("graph attached")
+        };
+        // Volatile formulas always re-evaluate; never counted as
+        // value-equality skips.
+        assert_eq!(result.skipped_value_equality, 0);
         ql_functions::clear_test_overrides();
     }
 

@@ -313,11 +313,19 @@ The full v1 means all of these crates either ship real behavior or have a docume
    Notes: RANDARRAY / INDIRECT / OFFSET / INFO / CELL still deferred to Phase 4.3 (function library expansion). NOW/TODAY date arithmetic is approximate (Excel 1900 leap-year quirk not modeled); Phase 4.5 (date/time + format) pins exact semantics.  
    Effort: 2-4 days (actual: ~1 day; substrate from 3.2 made this small).
 
-8. **3.8 Value-Equality Short-Circuit**  
+8. **3.8 Value-Equality Short-Circuit** ✅ SHIPPED 2026-05-12 (W5-41)  
    If a recomputed value is equal to the previous visible value, do not dirty downstream dependents beyond what is already required. Equality must respect Excel errors, blanks, numbers, text, bools, and dates.  
    References: `.references/hyperformula/src/DependencyGraph/TopSort.ts`; `.references/hyperformula/src/interpreter/InterpreterValue.ts`; `crates/ql-types/src/value.rs`.  
-   Acceptance: VEQ-3-01 unchanged upstream suppresses downstream recompute; VEQ-3-02 error equality is correct; VEQ-3-03 profile records skipped downstream vertices.  
-   Effort: 2-4 days.
+   Acceptance: VEQ-3-01 ✅ unchanged upstream suppresses downstream recompute (`veq_3_01_unchanged_upstream_suppresses_downstream_recompute`); VEQ-3-02 ✅ error equality is correct (`veq_3_02_error_equality_suppresses_downstream`); VEQ-3-03 ✅ profile records skipped vertices via `RecomputeResult.skipped_value_equality` (`veq_3_03_profile_records_skipped_vertices`).  
+   Shipped:  
+   - `RecomputeResult.skipped_value_equality: usize` — new public field counting how many dirty formulas were skipped via VEQ. Always 0 on `recompute_all` (legacy path).  
+   - `recompute_dirty` rewrite: snapshot prior values for all sched nodes; process in topo order; for each node, decide if it needs eval (volatile → yes, range deps → yes, top-level dirty → yes, has-changed-upstream → yes, otherwise → SKIP). After eval, compare new vs prior. If equal, suppress the computed-overlay write and don't mark as changed; downstream formulas observe "no changed deps" and skip too.  
+   - Cycled nodes apply VEQ: a pre-existing `#CIRC!` stays `#CIRC!`; skip the write but count.  
+   - Volatile formulas (NOW, RAND, etc.) bypass VEQ — they always re-evaluate (Phase 3.7 invariant preserved via `session.is_volatile(node)` check).  
+   - Aggregate-cache hits (Phase 3.6) interact correctly: a cached aggregate result that matches prior still counts as a VEQ skip when the formula's eval returns it.  
+   4 new tests (VEQ-3-01..03 + volatile-bypass regression). ql-exec at 319 (was 315). Workspace at 943 (was 939).  
+   Notes: V1 doesn't handle range-dep formulas with VEQ — they always re-evaluate. The Phase 3.6 aggregate cache already provides O(1) re-eval for unchanged ranges, so this is a small cost.  
+   Effort: 2-4 days (actual: ~1 day; the substrate from 3.3 BFS + 3.4 schedule_dirty + 3.6 prior-comparison-via-overlay made this small).
 
 9. **3.9 SIMD Region Through Graph Runtime**  
    Ensure region-style lowering and direct Arrow kernels are invoked from the graph scheduler rather than separate bench-only paths.  

@@ -1,7 +1,7 @@
 # Known engine gaps — checklist with target phases
 
 **Status:** Living document, updated at each phase boundary  
-**Date last touched:** 2026-05-12 (Engine Phase 3.7 close-out — W5-40)  
+**Date last touched:** 2026-05-12 (Engine Phase 3.8 close-out — W5-41)  
 **Companion:** `docs/MASTER-PLAN.md`
 
 Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a gap is closed, move its row to the "Closed" section at the bottom and reference the closing commit.
@@ -16,7 +16,7 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 | ~~GAP-R-02~~ | ~~`recompute_all` short-circuits on first failure~~ — **CLOSED** in Engine Phase 2B.2 (commit `393ce2f765f`): replaced with `RecomputeResult` aggregating per-cell failures. |
 | ~~GAP-R-03~~ | ~~Bind-plan re-derived from formula text on every recompute~~ — **CLOSED** in Engine Phase 2B.3 (commit `bd3147a1045`): `PlanCache` keyed by `(formula_text, sheet, name_gen)` on the runtime; `recompute_all` second-pass is all hits; name mutations bump generation and invalidate; counters exposed via `runtime.cache_stats()` + `Timings::bind_plan_cache_hits/misses`. |
 | ~~GAP-R-04~~ | ~~Volatile functions have no invalidation model~~ — **CLOSED** in Engine Phase 3.7 (W5-40, commit-after-c4ecf389898). `CalcgraphSession::mark_volatile_dirty()` adds every volatile formula to the dirty set + fans out the reverse-dep BFS so downstream formulas recompute too. NOW/TODAY/RAND/RANDBETWEEN registered in `default_registry`; deterministic test mode via `ql_functions::set_test_rng_seed` + `set_test_now_secs`. RANDARRAY/INDIRECT/OFFSET/INFO/CELL deferred to Phase 4.3. |
-| GAP-R-05 | Value-equality short-circuit not implemented; unchanged upstream still dirties downstream | None — pure missing optimization | Engine | Engine Phase 3.8 |
+| ~~GAP-R-05~~ | ~~Value-equality short-circuit not implemented~~ — **CLOSED** in Engine Phase 3.8 (W5-41, commit-after-83cb3d3c5de). `recompute_dirty` now snapshots prior values, evaluates in topo order, and skips formulas whose direct cell deps all stayed unchanged. `RecomputeResult.skipped_value_equality` exposes the count. Volatile + range-dep formulas bypass the skip (always re-eval). |
 | GAP-R-06 | `PlanCache` lives on `WorkbookRuntime`, which is per-edit. The documented IDE pattern drops the runtime after each edit → drops the cache. Phase 2B.3 cache observability is real only across one long-lived runtime/recompute block. | `ql-exec/src/workbook_runtime.rs::WorkbookRuntime` + `docs/architecture/ide-consumer-contract.md` §1 | Engine | Engine Phase 6.1 (`WorkbookSession`) moves cache ownership to the session. |
 | GAP-R-07 | Phase 3.2 dep extraction loses the name when a `NameRef` resolves to `NamedTarget::Constant` or `NamedTarget::Cell` — the binder substitutes the value/CellRef and the source name does not appear in `ExprPlan` (so `CalcgraphSession::name_to_formulas` does not see it). Today the `PlanCache.name_gen` counter (Phase 2B.3) invalidates ALL formulas on any name mutation, so correctness is preserved; only the per-name precision is missing. Phase 3.3 wired `on_set_name` → `name_to_formulas`, which works for AggregateNameRef; this gap covers the scalar-NameRef precision miss that Phase 3.3 explicitly did NOT address. | `ql-exec/src/calcgraph_session.rs` module docs (§ "Still deferred"); `ql-exec/src/plan.rs::bind_with_names` scalar-NameRef branches | Engine | Engine Phase 4 (NameRef preservation in ExprPlan + binder revision) |
 
@@ -140,6 +140,7 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 - **GAP-S-01** (single overlay per chunk, user + formula outputs conflated) — closed in Engine Phase 3.5: parallel `user_overlays` + `computed_overlays` with read cascade user → computed → base.
 - **GAP-B-01** (named-range aggregate eval returned `#CALC!`) — fully closed in Engine Phase 3.6 (W5-39): the scalar evaluator now computes the real aggregate for SUM/AVERAGE/MIN/MAX/COUNT/PRODUCT over a single named-range arg + caches the result on `CalcgraphSession`.
 - **GAP-R-04** (volatile function invalidation) — closed in Engine Phase 3.7 (W5-40): `mark_volatile_dirty` fans out volatile cells + downstream chain; NOW/TODAY/RAND/RANDBETWEEN registered; deterministic test RNG via `set_test_rng_seed`.
+- **GAP-R-05** (value-equality short-circuit) — closed in Engine Phase 3.8 (W5-41): `recompute_dirty` skips formulas whose direct cell deps stayed at their prior values. `RecomputeResult.skipped_value_equality` exposes the count.
 - **Phase 2B.7 audit-closure fixes** (correctness): orphan op-log entries on `add_sheet`(chunk_rows=0 / SheetId::MAX), `set_name` mutate-first divergence, `set_value` / `clear_formula` partial-pair non-atomicity, `transaction::commit` post-mutation log append. All fixed. `Workbook` and `OpLog` proven `Send + Sync` at compile time. See `docs/audits/2026-05-12-phase-2B.md`.
 
 ---
