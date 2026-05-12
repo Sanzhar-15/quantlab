@@ -30,7 +30,26 @@ use crate::plan::{bind_with_names, BindError};
 use crate::scalar::eval_scalar_with_registry;
 use crate::transaction::WorkbookTransaction;
 
+/// Phase 2A.6 audit H1/L4 (2026-05-12) helper. Confirms `sheet` is in range
+/// before any work that would otherwise panic inside `Workbook::put_at`.
+/// `pub(crate)` so `WorkbookTransaction` can call the same validator at
+/// `put_value` / `put_formula` buffering time.
+pub(crate) fn validate_sheet(workbook: &Workbook, sheet: SheetId) -> Result<(), RuntimeError> {
+    let count = workbook.sheet_count();
+    if (sheet as usize) >= count {
+        return Err(RuntimeError::InvalidSheet {
+            sheet,
+            sheet_count: count,
+        });
+    }
+    Ok(())
+}
+
 /// Errors from the runtime pipeline. Each upstream stage's error wraps cleanly.
+/// Phase 2A.6 audit H1/L4 (2026-05-12) added `InvalidSheet` so callers that pass
+/// a sheet id outside the workbook's range get a clean error instead of a panic
+/// from `Workbook::put_at`. Phase 2A.6 audit H4 added `ConflictingOps` for
+/// the `WorkbookTransaction` mixed-kind-on-same-cell case.
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
     #[error("lex error: {0:?}")]
@@ -41,6 +60,19 @@ pub enum RuntimeError {
 
     #[error("bind error: {0:?}")]
     Bind(BindError),
+
+    #[error("invalid sheet {sheet}: workbook has {sheet_count} sheets")]
+    InvalidSheet { sheet: SheetId, sheet_count: usize },
+
+    #[error(
+        "conflicting transaction ops on cell (sheet={sheet}, row={row}, col={col}): \
+         a value and a formula were both buffered for this cell in the same transaction"
+    )]
+    ConflictingOps {
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+    },
 }
 
 impl From<LexError> for RuntimeError {
@@ -84,6 +116,12 @@ impl<'a> WorkbookRuntime<'a> {
         col: ColId,
         formula_text: impl Into<Arc<str>>,
     ) -> Result<Value, RuntimeError> {
+        // Phase 2A.6 audit L4: validate sheet up front. Without this check, an
+        // invalid sheet id sneaks past lex/parse/bind (the binder doesn't see
+        // the destination sheet) and panics inside `Workbook::put_at` — and the
+        // formula text is already lexed/parsed/bound by then, wasted work.
+        validate_sheet(self.workbook, sheet)?;
+
         let formula_text = formula_text.into();
         let tokens = lex(formula_text.as_ref())?;
         let expr = parse(tokens)?;
@@ -111,10 +149,19 @@ impl<'a> WorkbookRuntime<'a> {
 
     /// Set a cell to a literal value (no formula). Clears any existing formula
     /// association at the cell — typing a value over a formula cell deletes the
-    /// formula per Excel canon.
-    pub fn set_value(&mut self, sheet: SheetId, row: RowId, col: ColId, value: Value) {
+    /// formula per Excel canon. Phase 2A.6 audit L4: returns `RuntimeError`
+    /// instead of panicking on an invalid sheet.
+    pub fn set_value(
+        &mut self,
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        value: Value,
+    ) -> Result<(), RuntimeError> {
+        validate_sheet(self.workbook, sheet)?;
         self.workbook.put_at(sheet, row, col, value);
         self.workbook.clear_formula(sheet, row, col);
+        Ok(())
     }
 
     /// Begin a multi-cell transaction. The returned `WorkbookTransaction`
@@ -310,12 +357,49 @@ mod tests {
 
         // Now set a literal — should clear the formula.
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-        rt.set_value(0, 0, 0, Value::Number(42.0));
+        rt.set_value(0, 0, 0, Value::Number(42.0)).unwrap();
         assert_eq!(
             wb.read(ql_types::Address::new(0, 0, 0)),
             Value::Number(42.0)
         );
         assert!(wb.formula_at(0, 0, 0).is_none());
+    }
+
+    /// Phase 2A.6 audit H1/L4 (2026-05-12): invalid sheet ids surface as
+    /// `RuntimeError::InvalidSheet` instead of panicking inside `Workbook::put_at`.
+    #[test]
+    fn set_formula_rejects_invalid_sheet() {
+        let mut wb = make_runtime_workbook(); // 1 sheet
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        let result = rt.set_formula(99, 0, 0, "1 + 1");
+        match result {
+            Err(RuntimeError::InvalidSheet { sheet, sheet_count }) => {
+                assert_eq!(sheet, 99);
+                assert_eq!(sheet_count, 1);
+            }
+            other => panic!("expected InvalidSheet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_value_rejects_invalid_sheet() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        let result = rt.set_value(5, 0, 0, Value::Number(1.0));
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::InvalidSheet {
+                    sheet: 5,
+                    sheet_count: 1
+                })
+            ),
+            "expected InvalidSheet, got {result:?}"
+        );
     }
 
     #[test]
@@ -324,7 +408,7 @@ mod tests {
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
 
-        rt.set_value(0, 0, 0, Value::text("hello"));
+        rt.set_value(0, 0, 0, Value::text("hello")).unwrap();
         assert_eq!(
             wb.read(ql_types::Address::new(0, 0, 0)),
             Value::text("hello")

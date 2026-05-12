@@ -1137,6 +1137,17 @@ mod tests {
         assert_eq!(toks[2], Token::Number(0.5));
     }
 
+    /// Phase 2A.6 audit M8 (2026-05-12): leading-dot input like `.S` (no letters
+    /// before the dot) routes through `lex_number`, not `lex_ident_or_ref`, and
+    /// fails as `InvalidNumber` since `.S` isn't parseable as f64. Pin this so a
+    /// future change to either lexer path can't silently steal the leading-dot
+    /// syntax for a dotted identifier.
+    #[test]
+    fn leading_dot_routes_through_number_lexer_and_rejects() {
+        assert!(matches!(lex(".S"), Err(LexError::InvalidNumber(_))));
+        assert!(matches!(lex("."), Err(LexError::InvalidNumber(_))));
+    }
+
     #[test]
     fn plain_ident_still_works_after_dot_extension() {
         // Regression guard: tokens with no dot in them must still lex the way

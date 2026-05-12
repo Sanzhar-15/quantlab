@@ -28,7 +28,7 @@
 use std::sync::Arc;
 
 use ql_formula_syntax::{Expr, Operator};
-use ql_types::{ColId, RowId, SheetId};
+use ql_types::{ColId, ErrorValue, RowId, SheetId};
 
 /// Bound, execution-ready expression. Sheet refs are concrete.
 #[derive(Clone, Debug, PartialEq)]
@@ -63,7 +63,9 @@ pub enum ExprPlan {
 }
 
 /// Error during binding. Phase 2A.1 (2026-05-12) added `UnresolvedName` for the
-/// new `Expr::NameRef` path.
+/// new `Expr::NameRef` path. Phase 2A.6 audit M2/M3 added the
+/// `NamedTargetIs{Blank,Error}` variants so previously-silent fallbacks become
+/// loud, distinct errors that the IDE can present accurately.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BindError {
     /// The Expr contains a variant not supported in this build (e.g. RangeRef
@@ -75,6 +77,16 @@ pub enum BindError {
     /// than as a runtime Error value, so the IDE can highlight the offending token
     /// before evaluation.
     UnresolvedName(Arc<str>),
+    /// A `NameRef` resolved to a `NamedTarget::Constant(Value::Blank)`. Phase 2A.6
+    /// audit M2: previously this was silently coerced to `Text("")`, producing
+    /// nonsense in arithmetic contexts. Now surfaced loudly so callers fix the
+    /// data binding.
+    NamedTargetIsBlank(Arc<str>),
+    /// A `NameRef` resolved to a `NamedTarget::Constant(Value::Error(_))`. Phase 2A.6
+    /// audit M3: previously silently mapped to `UnresolvedName` (wrong error class —
+    /// the name IS resolved, just to an error value). Carries the underlying
+    /// `ErrorValue` so the IDE can echo `#DIV/0!` / `#REF!` etc. accurately.
+    NamedTargetIsError(Arc<str>, ErrorValue),
 }
 
 /// Resolve an Expr against an owning sheet, producing an ExprPlan. **No name
@@ -134,8 +146,16 @@ pub fn bind_with_names<L: NameLookup>(
         Expr::Array(_) => Err(BindError::UnsupportedVariant("Array literals are Phase 3+")),
         Expr::Spill(_) => Err(BindError::UnsupportedVariant("Spill anchors are Phase 3+")),
         Expr::NameRef(name) => {
-            // Phase 2A.1: resolve the name via the active NameTable. The parser
-            // canonicalized the name to uppercase; lookup is case-sensitive on that.
+            // Phase 2A.6 audit M1: parser-emitted `NameRef` must always carry a
+            // non-empty canonical name. An empty name here means the parser is
+            // broken; panic to surface the upstream bug per the no-fallbacks rule.
+            assert!(
+                !name.is_empty(),
+                "bind_with_names: Expr::NameRef carries an empty string — parser invariant violated"
+            );
+            // Phase 2A.1: resolve the name via the active NameTable; Phase 2A.6
+            // audit H2 uses case-insensitive lookup in the `NameTable` impl so
+            // every entry point canonicalizes uniformly.
             match names.lookup_named_target(name) {
                 Some(ResolvedName::Cell(sheet, row, col, abs_col, abs_row)) => {
                     Ok(ExprPlan::CellRef {
@@ -155,6 +175,11 @@ pub fn bind_with_names<L: NameLookup>(
                 Some(ResolvedName::Formula) => Err(BindError::UnsupportedVariant(
                     "NamedTarget::Formula resolution requires the Phase 3+ ql-formula-semantics layer",
                 )),
+                // Phase 2A.6 audit M2/M3: surface Blank- and Error-targets loudly.
+                Some(ResolvedName::Blank) => Err(BindError::NamedTargetIsBlank(name.clone())),
+                Some(ResolvedName::ErrorValue(e)) => {
+                    Err(BindError::NamedTargetIsError(name.clone(), e))
+                }
                 None => Err(BindError::UnresolvedName(name.clone())),
             }
         }
@@ -166,6 +191,10 @@ pub fn bind_with_names<L: NameLookup>(
 /// import ql-storage directly, so the lookup trait projects NamedTarget into this
 /// enum first. Phase 2 supports Cell + Constant; Range and Formula return
 /// unsupported errors.
+///
+/// Phase 2A.6 audit M2/M3: added `Blank` and `ErrorValue` so the binder can
+/// surface them as distinct `BindError` variants instead of either coercing
+/// silently or returning the wrong error class.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResolvedName {
     Cell(SheetId, RowId, ColId, bool, bool),
@@ -174,6 +203,12 @@ pub enum ResolvedName {
     Text(Arc<str>),
     Range,
     Formula,
+    /// `NamedTarget::Constant(Value::Blank)`. The binder rejects this loudly so
+    /// the caller can fix the data binding.
+    Blank,
+    /// `NamedTarget::Constant(Value::Error(...))`. The binder rejects with a
+    /// distinct error carrying the underlying `ErrorValue`.
+    ErrorValue(ErrorValue),
 }
 
 /// Name-resolution interface. ql-exec stays decoupled from ql-storage; the

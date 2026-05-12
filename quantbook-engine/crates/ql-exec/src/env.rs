@@ -12,8 +12,6 @@
 //! `ql-storage` directly and the SIMD path (W4-2) doesn't go through this trait at all —
 //! it reads Arrow chunks via `ColumnStore::iter_chunks` for batch processing.
 
-use std::sync::Arc;
-
 use ql_storage::{NameTable, NamedTarget};
 use ql_types::{ColId, RowId, SheetId, Value};
 
@@ -79,12 +77,22 @@ impl CellEnv for MapEnv {
 // `Expr::NameRef` against the workbook's name table. Keeps ql-exec's `plan` module
 // agnostic to ql-storage (the trait lives there); this impl bridges them in env.rs
 // where ql-storage is already imported.
+//
+// Phase 2A.6 audit H2: use `lookup_ci` so the binder is robust against callers
+// who bypass parser-side canonicalization. The parser already uppercases names in
+// `Expr::NameRef`, so this is a safety net for hand-constructed ASTs / tests; it
+// removes a case-sensitivity footgun without breaking any happy path.
 impl NameLookup for NameTable {
     fn lookup_named_target(&self, name: &str) -> Option<ResolvedName> {
-        named_target_to_resolved(self.lookup(name)?)
+        named_target_to_resolved(self.lookup_ci(name)?)
     }
 }
 
+/// Project a `NamedTarget` into the binder-side `ResolvedName` vocabulary. Phase
+/// 2A.6 audit M2/M3: `Constant(Blank)` and `Constant(Error)` now map to distinct
+/// `ResolvedName` variants (the binder converts them to specific `BindError`
+/// kinds) — previously they were silently coerced to `Text("")` and `None`
+/// respectively, both of which violate the no-fallbacks rule.
 fn named_target_to_resolved(target: NamedTarget) -> Option<ResolvedName> {
     match target {
         NamedTarget::Cell(addr) => Some(ResolvedName::Cell(
@@ -97,16 +105,8 @@ fn named_target_to_resolved(target: NamedTarget) -> Option<ResolvedName> {
         NamedTarget::Constant(Value::Number(n)) => Some(ResolvedName::Number(n)),
         NamedTarget::Constant(Value::Boolean(b)) => Some(ResolvedName::Bool(b)),
         NamedTarget::Constant(Value::Text(s)) => Some(ResolvedName::Text(s)),
-        NamedTarget::Constant(Value::Blank) => {
-            // A name targeting Blank is unusual but well-defined: treat as a literal
-            // empty string. Phase 2 ships this conservatively; revisit if it's a
-            // real user pattern.
-            Some(ResolvedName::Text(Arc::from("")))
-        }
-        NamedTarget::Constant(Value::Error(_)) => {
-            // Named errors aren't a normal Excel pattern; refuse to resolve.
-            None
-        }
+        NamedTarget::Constant(Value::Blank) => Some(ResolvedName::Blank),
+        NamedTarget::Constant(Value::Error(e)) => Some(ResolvedName::ErrorValue(e)),
         NamedTarget::Range(_) => Some(ResolvedName::Range),
         NamedTarget::Formula(_) => Some(ResolvedName::Formula),
     }

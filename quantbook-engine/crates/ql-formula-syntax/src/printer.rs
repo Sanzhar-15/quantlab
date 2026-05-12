@@ -631,9 +631,22 @@ mod tests {
         rt_roundtrip("SUM(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)");
     }
 
-    // Note: `VAR.S(...)`-style dotted function names are NOT yet supported by the
-    // lexer (it doesn't allow `.` inside identifiers; bare `.` triggers `InvalidNumber`).
-    // The function registry handles `VAR.S` as a key but the parser can't produce
-    // that name from source. Workaround in Phase 1: use the `VAR` alias. Phase 2+
-    // lexer extension to allow dotted identifiers.
+    /// Phase 2A.5 (2026-05-12): the lexer now accepts dotted identifiers, so
+    /// `VAR.S(...)` round-trips through lex → parse → print. Replaces the prior
+    /// "VAR alias workaround" path.
+    #[test]
+    fn roundtrip_dotted_function_name() {
+        rt_roundtrip("VAR.S(1, 2, 3)");
+        rt_roundtrip("STDEV.P(1, 2, 3, 4)");
+    }
+
+    /// Multi-dot identifiers (lexer-accepted, binder-rejected for unknown
+    /// names) still round-trip through the printer cleanly. Pin per audit L9
+    /// (2026-05-12) so a future printer change can't break dotted-name output.
+    #[test]
+    fn print_multi_dot_name_ref() {
+        let e = parse(lex("A.B.C").expect("lex")).expect("parse");
+        let printed = print(&e);
+        assert_eq!(printed, "A.B.C");
+    }
 }

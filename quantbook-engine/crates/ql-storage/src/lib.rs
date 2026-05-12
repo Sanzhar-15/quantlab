@@ -1,7 +1,9 @@
 //! `ql-storage` — Workbook, Sheet, ColumnStore, SparseOverlay.
 //!
-//! Per spec Part V §4 Week 2 Days 3-4. Phase 0 minimum:
-//! - [`workbook`] — top-level `Workbook` + `NameTable` stub.
+//! Per spec Part V §4 Week 2 Days 3-4. Phase 0 minimum, with Phase 2A
+//! extensions to `Workbook`:
+//! - [`workbook`] — top-level `Workbook` + `NameTable` (real HashMap-backed
+//!   storage since Phase 2A.1; canonicalizing-on-write since Phase 2A.6).
 //! - [`sheet`] — per-sheet `Sheet` + conservative `Bounds` tracking.
 //! - [`column`] — `ColumnStore`: chunked Arrow base + per-chunk sparse overlay; default
 //!   chunk size 16,384 rows (`QBOOK_CHUNK_ROWS` env override).

@@ -28,6 +28,7 @@
 //!   both ops in the list, and pass 2 applies them in order — so the final value
 //!   matches the last `put_*` for that cell.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use ql_formula_syntax::{lex, parse};
@@ -38,7 +39,18 @@ use ql_types::{ColId, RowId, SheetId, Value};
 use crate::env::WorkbookEnv;
 use crate::plan::{bind_with_names, ExprPlan};
 use crate::scalar::eval_scalar_with_registry;
-use crate::workbook_runtime::RuntimeError;
+use crate::workbook_runtime::{validate_sheet, RuntimeError};
+
+/// Phase 2A.6 audit H4: track the *kind* of op last buffered for each cell so
+/// `put_value` after `put_formula` (or vice versa) on the same cell can be
+/// rejected loudly at buffer time. Same-kind multi-writes (two `put_value`s,
+/// two `put_formula`s) are still allowed — the existing last-write-wins
+/// semantics handle them cleanly.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum OpKind {
+    Value,
+    Formula,
+}
 
 /// One pending operation in a transaction. Internal — the public API is the
 /// `put_value` / `put_formula` methods.
@@ -68,6 +80,10 @@ pub struct WorkbookTransaction<'a> {
     workbook: &'a mut Workbook,
     registry: &'a FunctionRegistry,
     ops: Vec<PendingOp>,
+    /// Phase 2A.6 audit H4: per-cell last-buffered op kind. Used to reject
+    /// mixed-kind writes (value+formula on the same cell within one tx) at
+    /// buffer time so the resulting workbook state is unambiguous.
+    cell_kinds: HashMap<(SheetId, RowId, ColId), OpKind>,
 }
 
 impl<'a> WorkbookTransaction<'a> {
@@ -76,6 +92,7 @@ impl<'a> WorkbookTransaction<'a> {
             workbook,
             registry,
             ops: Vec::new(),
+            cell_kinds: HashMap::new(),
         }
     }
 
@@ -83,13 +100,27 @@ impl<'a> WorkbookTransaction<'a> {
     /// (or to other transactions) until `commit`. Any existing formula at the
     /// cell is cleared at commit (typing a value over a formula deletes it,
     /// per Excel canon).
-    pub fn put_value(&mut self, sheet: SheetId, row: RowId, col: ColId, value: Value) {
+    ///
+    /// Phase 2A.6 audit H1: the destination `sheet` is validated up front so
+    /// commit can't panic from `Workbook::put_at` mid-flight, leaving partial
+    /// writes. Audit H4: rejects with `RuntimeError::ConflictingOps` if a
+    /// formula was already buffered for the same cell in this transaction.
+    pub fn put_value(
+        &mut self,
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        value: Value,
+    ) -> Result<(), RuntimeError> {
+        validate_sheet(self.workbook, sheet)?;
+        self.check_op_kind(sheet, row, col, OpKind::Value)?;
         self.ops.push(PendingOp::Value {
             sheet,
             row,
             col,
             value,
         });
+        Ok(())
     }
 
     /// Buffer a formula write. The formula text is lexed + parsed + bound NOW
@@ -98,6 +129,20 @@ impl<'a> WorkbookTransaction<'a> {
     /// from earlier ops in the same transaction.
     ///
     /// `formula_text` is the formula body without the leading `=`.
+    ///
+    /// Phase 2A.6 audit H1: validates `sheet` up front. Audit H4: rejects with
+    /// `RuntimeError::ConflictingOps` if a value op was already buffered for
+    /// the same cell in this transaction (mixing value+formula on one cell
+    /// within a single batch was previously possible but produced surprising
+    /// final state — see audit doc for the formula-text-cleared-but-formula-
+    /// value-applied corner).
+    ///
+    /// Note on bound-plan staleness: bound plans capture the workbook's
+    /// NameTable state at buffer time. Names registered between two
+    /// transactions take effect for the next transaction's `put_formula` calls,
+    /// but cannot be retroactively rebound (the transaction holds `&mut
+    /// Workbook` for its lifetime, so the user can't mutate names mid-tx
+    /// anyway).
     pub fn put_formula(
         &mut self,
         sheet: SheetId,
@@ -105,13 +150,18 @@ impl<'a> WorkbookTransaction<'a> {
         col: ColId,
         formula_text: impl Into<Arc<str>>,
     ) -> Result<(), RuntimeError> {
+        validate_sheet(self.workbook, sheet)?;
+        self.check_op_kind(sheet, row, col, OpKind::Formula)?;
+
         let text = formula_text.into();
         let tokens = lex(text.as_ref())?;
         let expr = parse(tokens)?;
         // Bind eagerly against the current workbook NameTable. The transaction
-        // doesn't allow registering names mid-batch, so the table is stable for
-        // the transaction's lifetime — eager binding is safe and surfaces
-        // UnresolvedName / UnsupportedVariant before any writes land.
+        // doesn't allow registering names mid-batch (the &mut Workbook borrow
+        // prevents the user from mutating names while the tx is alive), so the
+        // table is stable for the transaction's lifetime — eager binding is
+        // safe and surfaces UnresolvedName / UnsupportedVariant before any
+        // writes land.
         let plan = bind_with_names(&expr, sheet, self.workbook.names())?;
         self.ops.push(PendingOp::Formula {
             sheet,
@@ -121,6 +171,25 @@ impl<'a> WorkbookTransaction<'a> {
             plan,
         });
         Ok(())
+    }
+
+    /// Phase 2A.6 audit H4 helper. Returns Err if a different op kind was
+    /// already buffered for `(sheet,row,col)`; otherwise records `kind` and
+    /// returns Ok. Same-kind multi-writes are allowed (last-write-wins).
+    fn check_op_kind(
+        &mut self,
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        kind: OpKind,
+    ) -> Result<(), RuntimeError> {
+        match self.cell_kinds.get(&(sheet, row, col)) {
+            Some(prior) if *prior != kind => Err(RuntimeError::ConflictingOps { sheet, row, col }),
+            _ => {
+                self.cell_kinds.insert((sheet, row, col), kind);
+                Ok(())
+            }
+        }
     }
 
     /// Number of buffered ops. Useful for the IDE to display "5 writes pending".
@@ -135,6 +204,7 @@ impl<'a> WorkbookTransaction<'a> {
             workbook,
             registry,
             ops,
+            cell_kinds: _,
         } = self;
 
         // Pass 1: apply literals + persist formula text. No formula eval yet.
@@ -205,9 +275,9 @@ mod tests {
         let mut wb = make_wb();
         let reg = default_registry();
         let mut tx = WorkbookTransaction::new(&mut wb, &reg);
-        tx.put_value(0, 0, 0, Value::Number(1.0));
-        tx.put_value(0, 0, 1, Value::Number(2.0));
-        tx.put_value(0, 0, 2, Value::Number(3.0));
+        tx.put_value(0, 0, 0, Value::Number(1.0)).unwrap();
+        tx.put_value(0, 0, 1, Value::Number(2.0)).unwrap();
+        tx.put_value(0, 0, 2, Value::Number(3.0)).unwrap();
         assert_eq!(tx.op_count(), 3);
         // Not yet visible.
         // (Can't read wb here — tx holds &mut. Drop tx first.)
@@ -224,7 +294,7 @@ mod tests {
         let reg = default_registry();
         {
             let mut tx = WorkbookTransaction::new(&mut wb, &reg);
-            tx.put_value(0, 0, 0, Value::Number(42.0));
+            tx.put_value(0, 0, 0, Value::Number(42.0)).unwrap();
             // Drop without commit.
         }
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Blank);
@@ -266,7 +336,7 @@ mod tests {
         // The classic paste-block scenario: A1 is a literal, B1 references A1.
         // At commit time, pass 1 writes A1=10; pass 2 evaluates B1=A1*2 against
         // the post-pass-1 workbook, seeing A1=10 → B1=20.
-        tx.put_value(0, 0, 0, Value::Number(10.0));
+        tx.put_value(0, 0, 0, Value::Number(10.0)).unwrap();
         tx.put_formula(0, 0, 1, "A1 * 2").unwrap();
         tx.commit();
 
@@ -280,7 +350,7 @@ mod tests {
         let reg = default_registry();
         let mut tx = WorkbookTransaction::new(&mut wb, &reg);
         // Buffer a good op first.
-        tx.put_value(0, 0, 0, Value::Number(99.0));
+        tx.put_value(0, 0, 0, Value::Number(99.0)).unwrap();
 
         // Now a parse error.
         let result = tx.put_formula(0, 0, 1, "(1 + 2");
@@ -289,7 +359,7 @@ mod tests {
         assert_eq!(tx.op_count(), 1);
 
         // Subsequent good ops still work.
-        tx.put_value(0, 0, 2, Value::Number(77.0));
+        tx.put_value(0, 0, 2, Value::Number(77.0)).unwrap();
         tx.commit();
 
         // Good ops applied; failed op had no effect.
@@ -328,7 +398,7 @@ mod tests {
 
         // Transaction overwrites with a literal.
         let mut tx = WorkbookTransaction::new(&mut wb, &reg);
-        tx.put_value(0, 0, 0, Value::Number(100.0));
+        tx.put_value(0, 0, 0, Value::Number(100.0)).unwrap();
         tx.commit();
 
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(100.0));
@@ -340,62 +410,78 @@ mod tests {
         let mut wb = make_wb();
         let reg = default_registry();
         let mut tx = WorkbookTransaction::new(&mut wb, &reg);
-        tx.put_value(0, 0, 0, Value::Number(1.0));
-        tx.put_value(0, 0, 0, Value::Number(2.0));
-        tx.put_value(0, 0, 0, Value::Number(3.0));
+        tx.put_value(0, 0, 0, Value::Number(1.0)).unwrap();
+        tx.put_value(0, 0, 0, Value::Number(2.0)).unwrap();
+        tx.put_value(0, 0, 0, Value::Number(3.0)).unwrap();
         tx.commit();
 
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(3.0));
     }
 
+    /// Phase 2A.6 audit H4 (2026-05-12): mixing value + formula on the SAME cell
+    /// within a single transaction was previously allowed and produced surprising
+    /// final state (literal-then-formula left both consistent, but formula-then-
+    /// literal left formula-value-with-cleared-formula-text). The fix rejects
+    /// both orderings loudly with `ConflictingOps`.
     #[test]
-    fn formula_overwrites_earlier_value_in_same_transaction() {
+    fn value_then_formula_on_same_cell_rejected_as_conflict() {
         let mut wb = make_wb();
         let reg = default_registry();
         let mut tx = WorkbookTransaction::new(&mut wb, &reg);
-        // First a literal, then a formula on the same cell. The formula must
-        // win, with its text persisted.
-        tx.put_value(0, 0, 0, Value::Number(99.0));
-        tx.put_formula(0, 0, 0, "10 + 5").unwrap();
-        tx.commit();
 
+        tx.put_value(0, 0, 0, Value::Number(99.0)).unwrap();
+        let result = tx.put_formula(0, 0, 0, "10 + 5");
+        match result {
+            Err(RuntimeError::ConflictingOps { sheet, row, col }) => {
+                assert_eq!((sheet, row, col), (0, 0, 0));
+            }
+            other => panic!("expected ConflictingOps, got {other:?}"),
+        }
+        // The first op stays buffered; the rejected op didn't.
+        assert_eq!(tx.op_count(), 1);
+        tx.commit();
+        // Final state reflects only the literal.
+        assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(99.0));
+        assert!(wb.formula_at(0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn formula_then_value_on_same_cell_rejected_as_conflict() {
+        let mut wb = make_wb();
+        let reg = default_registry();
+        let mut tx = WorkbookTransaction::new(&mut wb, &reg);
+
+        tx.put_formula(0, 0, 0, "10 + 5").unwrap();
+        let result = tx.put_value(0, 0, 0, Value::Number(99.0));
+        match result {
+            Err(RuntimeError::ConflictingOps { sheet, row, col }) => {
+                assert_eq!((sheet, row, col), (0, 0, 0));
+            }
+            other => panic!("expected ConflictingOps, got {other:?}"),
+        }
+        assert_eq!(tx.op_count(), 1);
+        tx.commit();
+        // Final state reflects only the formula.
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(15.0));
         assert_eq!(wb.formula_at(0, 0, 0).map(|s| s.as_ref()), Some("10 + 5"));
     }
 
     #[test]
-    fn value_after_formula_on_same_cell_clears_formula() {
+    fn multiple_value_writes_on_same_cell_still_allowed_after_conflict_fix() {
+        // Audit H4 introduces ConflictingOps for mixed-kind writes only. Same-kind
+        // multi-writes (last-write-wins) must continue to work — pin it.
         let mut wb = make_wb();
         let reg = default_registry();
         let mut tx = WorkbookTransaction::new(&mut wb, &reg);
-        // Formula first, then value: value-write clears the formula at pass 1,
-        // then pass 2 re-writes the formula's value... wait, that's a subtle
-        // ordering issue. Pass 1 applies in op order: put_formula persists text,
-        // then put_value clears formula + writes literal. So final state has
-        // no formula. Pass 2 then evaluates the formula and writes its value,
-        // overwriting the literal. THAT'S A BUG — but it's the documented
-        // last-write-wins-in-pass-2 behavior.
-        //
-        // The IDE shouldn't put_value AFTER put_formula on the same cell within
-        // one batch; if it does, formula wins (because pass 2 evaluates AFTER
-        // pass 1's literal write). This test pins the behavior so we don't
-        // regress without thinking about it.
-        tx.put_formula(0, 0, 0, "10 + 5").unwrap();
-        tx.put_value(0, 0, 0, Value::Number(99.0));
+        tx.put_value(0, 0, 0, Value::Number(1.0)).unwrap();
+        tx.put_value(0, 0, 0, Value::Number(2.0)).unwrap();
+        tx.put_formula(0, 1, 0, "A1 + 100").unwrap();
+        tx.put_formula(0, 1, 0, "A1 + 200").unwrap(); // last-write-wins for formulas
         tx.commit();
 
-        // Pass 1: put_formula persists text "10 + 5" → clears formula (no-op since
-        //   none) + put_at left for pass 2. Then put_value writes 99 and clears
-        //   the formula text.
-        // Pass 2: re-evaluates formula → writes 15 over the 99.
-        //
-        // So the final value is 15 but the formula text is None (cleared).
-        // This is the surprising case; flag it in docs if it bites.
-        assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(15.0));
-        assert!(
-            wb.formula_at(0, 0, 0).is_none(),
-            "literal-after-formula in same tx clears formula text"
-        );
+        assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(2.0));
+        assert_eq!(wb.read(Address::new(0, 1, 0)), Value::Number(202.0));
+        assert_eq!(wb.formula_at(0, 1, 0).map(|s| s.as_ref()), Some("A1 + 200"));
     }
 
     #[test]
@@ -440,8 +526,10 @@ mod tests {
         let reg = default_registry();
         let mut tx = WorkbookTransaction::new(&mut wb, &reg);
         for r in 0..5u32 {
-            tx.put_value(0, r, 0, Value::Number((r + 1) as f64));
-            tx.put_value(0, r, 1, Value::Number(((r + 1) * 10) as f64));
+            tx.put_value(0, r, 0, Value::Number((r + 1) as f64))
+                .unwrap();
+            tx.put_value(0, r, 1, Value::Number(((r + 1) * 10) as f64))
+                .unwrap();
         }
         tx.put_formula(0, 5, 0, "SUM(A1, B1, A2, B2, A3, B3, A4, B4, A5, B5)")
             .unwrap();
@@ -450,6 +538,106 @@ mod tests {
 
         // Sum of 1,10, 2,20, 3,30, 4,40, 5,50 = 165.
         assert_eq!(wb.read(Address::new(0, 5, 0)), Value::Number(165.0));
+    }
+
+    // ===== Phase 2A.6 audit H1: sheet validation =====
+
+    #[test]
+    fn put_value_rejects_invalid_sheet() {
+        let mut wb = make_wb(); // has one sheet (id 0)
+        let reg = default_registry();
+        let mut tx = WorkbookTransaction::new(&mut wb, &reg);
+
+        let result = tx.put_value(99, 0, 0, Value::Number(1.0));
+        match result {
+            Err(RuntimeError::InvalidSheet { sheet, sheet_count }) => {
+                assert_eq!(sheet, 99);
+                assert_eq!(sheet_count, 1);
+            }
+            other => panic!("expected InvalidSheet, got {other:?}"),
+        }
+        assert_eq!(tx.op_count(), 0);
+    }
+
+    #[test]
+    fn put_formula_rejects_invalid_sheet() {
+        let mut wb = make_wb();
+        let reg = default_registry();
+        let mut tx = WorkbookTransaction::new(&mut wb, &reg);
+
+        let result = tx.put_formula(5, 0, 0, "1 + 1");
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::InvalidSheet {
+                    sheet: 5,
+                    sheet_count: 1
+                })
+            ),
+            "expected InvalidSheet, got {result:?}"
+        );
+        assert_eq!(tx.op_count(), 0);
+    }
+
+    #[test]
+    fn transaction_on_workbook_with_no_sheets_errors_at_buffer_time() {
+        // Audit L5 regression guard: empty workbook (no sheets) used to panic at
+        // commit time. Now: clean InvalidSheet error at buffer time.
+        let mut wb = Workbook::new();
+        let reg = default_registry();
+        let mut tx = WorkbookTransaction::new(&mut wb, &reg);
+        let result = tx.put_value(0, 0, 0, Value::Number(1.0));
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::InvalidSheet {
+                    sheet: 0,
+                    sheet_count: 0
+                })
+            ),
+            "expected InvalidSheet, got {result:?}"
+        );
+    }
+
+    // ===== Phase 2A.6 audit M2/M3: Blank/Error named-target rejection =====
+
+    #[test]
+    fn named_blank_constant_surfaces_as_distinct_bind_error() {
+        use crate::plan::BindError;
+        let mut wb = make_wb();
+        wb.set_name("MyBlank", NamedTarget::Constant(Value::Blank));
+        let reg = default_registry();
+        let mut tx = WorkbookTransaction::new(&mut wb, &reg);
+
+        let result = tx.put_formula(0, 0, 0, "MyBlank + 1");
+        match result {
+            Err(RuntimeError::Bind(BindError::NamedTargetIsBlank(name))) => {
+                // Parser canonicalizes to upper case.
+                assert_eq!(name.as_ref(), "MYBLANK");
+            }
+            other => panic!("expected Bind(NamedTargetIsBlank), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_error_constant_surfaces_as_distinct_bind_error() {
+        use crate::plan::BindError;
+        let mut wb = make_wb();
+        wb.set_name(
+            "MyErr",
+            NamedTarget::Constant(Value::Error(ErrorValue::DivZero)),
+        );
+        let reg = default_registry();
+        let mut tx = WorkbookTransaction::new(&mut wb, &reg);
+
+        let result = tx.put_formula(0, 0, 0, "MyErr + 1");
+        match result {
+            Err(RuntimeError::Bind(BindError::NamedTargetIsError(name, err))) => {
+                assert_eq!(name.as_ref(), "MYERR");
+                assert_eq!(err, ErrorValue::DivZero);
+            }
+            other => panic!("expected Bind(NamedTargetIsError), got {other:?}"),
+        }
     }
 
     // ===== runtime → transaction integration =====
@@ -462,7 +650,7 @@ mod tests {
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
 
         let mut tx = rt.transaction();
-        tx.put_value(0, 0, 0, Value::Number(7.0));
+        tx.put_value(0, 0, 0, Value::Number(7.0)).unwrap();
         tx.put_formula(0, 0, 1, "A1 * 2").unwrap();
         tx.commit();
 

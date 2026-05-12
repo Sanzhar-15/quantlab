@@ -192,10 +192,10 @@ impl Parser {
             Token::String(s) => Ok(Expr::String(s)),
 
             // Identifier — either a function call (if next is `(`) or a name-ref.
-            // Phase 0 W5-1: bare identifier outside function context is treated as a
-            // named-range reference. Named ranges aren't resolved in Phase 0 (no name
-            // table integration with the parser yet); future Phase 1 binding will
-            // resolve them.
+            // Phase 2A.1 (2026-05-12): a bare identifier outside a function context
+            // emits `Expr::NameRef(name)`. The binder resolves the name against the
+            // workbook's `NameTable` at bind time and surfaces `UnresolvedName` if
+            // the name isn't registered.
             Token::Ident(name) => {
                 if matches!(self.peek(), Some(Token::LParen)) {
                     self.advance(); // consume `(`
