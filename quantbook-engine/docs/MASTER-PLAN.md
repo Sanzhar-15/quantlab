@@ -400,11 +400,12 @@ The full v1 means all of these crates either ship real behavior or have a docume
    - Surfaced GAP-G-01 + GAP-G-03 (Phase 3.10 megaudit carryovers) as Phase 4 entry decisions — array formulas + function library expansion both rebind formulas at scale; the append-only graph fix needs to happen before 4.3 or be a known limitation gated by 4.12 megaudit.  
    Effort: 2-4 days (actual: ~0.5 day; Explore subagent did the IronCalc survey).
 
-2. **4.2 Excel Compatibility Matrix Harness**  
+2. **4.2 Excel Compatibility Matrix Harness** ✅ SHIPPED 2026-05-12 (W5-45)  
    Create a checked-in matrix for functions, operators, coercions, errors, arrays, tables, date systems, localization, and xlsx import/export.  
-   References: `.references/formualizer/benchmarks/function_matrix.yaml`; `.references/formualizer/benchmarks/harness/runner/schema.py`; `.references/ironcalc/base/src/test/`.  
-   Acceptance: ECM-4-01 matrix exists; ECM-4-02 each function has status, tests, category, and Excel parity notes; ECM-4-03 CI can report coverage percentage.  
-   Effort: 2-3 days.
+   References: `.references/formualizer/benchmarks/function_matrix.yaml` (taxonomy ref only — not directly applicable; formualizer's matrix is benchmark-scenario claim-safety, not per-function compat); `.references/ironcalc/base/src/test/` (used implicitly via Phase 4.1 gap matrix).  
+   Acceptance: ECM-4-01 ✅ matrix exists at `docs/compat/excel-matrix.md` (~180 function rows across 11 categories + operators + coercion + errors + arrays + tables + dates + localization + xlsx); ECM-4-02 ✅ each function row carries Status emoji (✅/⚠️/🔄/❌) + Tests count + Phase ref + Notes column; ECM-4-03 ✅ `scripts/report-compat-coverage.sh` parses the matrix and emits human-readable + JSON output with per-category breakdown and headline `coverage=NN%`.  
+   Shipped baseline: 202 rows (51 ✅ implemented, 13 ⚠️ partial, 1 🔄 reserved, 137 ❌ missing) = **32% coverage**. Phase 4.3 (function library wave 1) will close ~100 more `❌` rows.  
+   Effort: 2-3 days (actual: ~0.5 day).
 
 3. **4.3 Function Library Expansion Wave 1 - Core 100**  
    Implement high-use math, logical, text, lookup, statistical, date/time, and information functions. Include metadata for volatility, laziness, array behavior, and argument coercion.  
