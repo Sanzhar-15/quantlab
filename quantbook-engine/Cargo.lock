@@ -1445,6 +1445,7 @@ dependencies = [
  "ql-formula-syntax",
  "ql-functions",
  "ql-io",
+ "ql-oplog",
  "ql-storage",
  "ql-types",
  "tempfile",

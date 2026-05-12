@@ -20,6 +20,10 @@ ql-functions      = { path = "../ql-functions" }
 # convenience. No new transitive risk — ql-io was already linked through
 # dev-deps in the same crate.
 ql-io             = { path = "../ql-io" }
+# Phase 2A.3.b (2026-05-12): opt-in op-log attachment for WorkbookRuntime +
+# WorkbookTransaction. CellWireValue conversion happens via ql-io (already
+# present); Op + OpLog types come from ql-oplog.
+ql-oplog          = { path = "../ql-oplog" }
 arrow-array       = { workspace = true }
 multiversion      = { workspace = true }
 thiserror         = { workspace = true }

@@ -22,6 +22,8 @@ use std::sync::Arc;
 
 use ql_formula_syntax::{lex, parse, LexError, ParseError};
 use ql_functions::FunctionRegistry;
+use ql_io::CellWireValue;
+use ql_oplog::{Op, OpLog};
 use ql_storage::Workbook;
 use ql_types::{ColId, RowId, SheetId, Value, MAX_COLUMN, MAX_ROW};
 
@@ -121,6 +123,15 @@ pub enum RuntimeError {
         row: RowId,
         col: ColId,
     },
+
+    /// Phase 2A.3.b (2026-05-12): the producer-side append into an attached
+    /// op log failed (serde_json refused the wire value — e.g. NaN/Inf — or
+    /// Loro surfaced an internal error). Producer order is append-then-mutate:
+    /// when this fires, the workbook is unchanged. Callers attaching an op
+    /// log handle the error; callers that don't attach one never see this
+    /// variant.
+    #[error("op log error: {0}")]
+    OpLog(#[from] ql_oplog::OpLogError),
 }
 
 impl From<LexError> for RuntimeError {
@@ -139,14 +150,49 @@ impl From<BindError> for RuntimeError {
 ///
 /// Construct one per session of cell edits. Re-creating per call is cheap (the
 /// struct holds borrows, no heap state of its own).
+///
+/// Phase 2A.3.b (2026-05-12): optionally attach an `OpLog` via
+/// `WorkbookRuntime::with_oplog`. When attached, `set_value` and `set_formula`
+/// emit ops into the log in append-before-mutate order. `transaction()`
+/// re-borrows the op-log handle into the returned transaction so a single op
+/// log records both individual edits and batched commits cohesively.
 pub struct WorkbookRuntime<'a> {
     workbook: &'a mut Workbook,
     registry: &'a FunctionRegistry,
+    /// Optional op-log sink. When `Some`, all producer methods append before
+    /// mutating the workbook so a failing append leaves the workbook
+    /// unchanged. When `None`, the runtime behaves exactly as Phase 1 W5-10.
+    oplog: Option<&'a mut OpLog>,
 }
 
 impl<'a> WorkbookRuntime<'a> {
     pub fn new(workbook: &'a mut Workbook, registry: &'a FunctionRegistry) -> Self {
-        Self { workbook, registry }
+        Self {
+            workbook,
+            registry,
+            oplog: None,
+        }
+    }
+
+    /// Phase 2A.3.b: construct a runtime that records every mutation to the
+    /// supplied `OpLog`. Producer-replay equivalence: replaying the resulting
+    /// log against a fresh workbook (then calling `recompute_all` to
+    /// materialize formula values) reproduces the same observable state.
+    ///
+    /// See module docs for the documented limitations: `set_value(Value::Blank)`
+    /// emits no `PutValue` (CellWireValue lacks a Blank variant in 2A.3.b);
+    /// NaN/Inf in number values fail serde_json serialization and surface as
+    /// `RuntimeError::OpLog`.
+    pub fn with_oplog(
+        workbook: &'a mut Workbook,
+        registry: &'a FunctionRegistry,
+        oplog: &'a mut OpLog,
+    ) -> Self {
+        Self {
+            workbook,
+            registry,
+            oplog: Some(oplog),
+        }
     }
 
     /// Set a cell to a formula. Pipeline: lex → parse → bind (against `sheet`) →
@@ -185,6 +231,19 @@ impl<'a> WorkbookRuntime<'a> {
             eval_scalar_with_registry(&plan, &env, self.registry)
         };
 
+        // Phase 2A.3.b op-log emission, BEFORE mutation. If append fails, no
+        // mutation; workbook stays consistent. We emit `PutFormula` only — the
+        // evaluated value isn't recorded because replay re-derives it via
+        // `WorkbookRuntime::recompute_all` (see replay.rs module docs).
+        if let Some(oplog) = self.oplog.as_deref_mut() {
+            oplog.append(Op::PutFormula {
+                sheet,
+                row,
+                col,
+                text: formula_text.as_ref().to_owned(),
+            })?;
+        }
+
         // Persist formula text + evaluated value. Both writes succeed or neither —
         // put_at can't fail (it panics on bad sheet, but the binder already
         // validated `sheet`; if the user passes a nonexistent sheet, we'd panic
@@ -207,6 +266,30 @@ impl<'a> WorkbookRuntime<'a> {
         value: Value,
     ) -> Result<(), RuntimeError> {
         validate_cell(self.workbook, sheet, row, col)?;
+
+        // Phase 2A.3.b: emit ops BEFORE mutating, so a serialization failure
+        // (NaN/Inf) leaves the workbook unchanged. `CellWireValue::from_value`
+        // returns None for `Value::Blank`; we skip the `PutValue` in that case
+        // (documented limitation — replaying a Blank write won't reset a
+        // prior non-Blank value; rare enough that the wire-format expansion
+        // is deferred to Phase 5+). The `ClearFormula` still fires below if
+        // the cell had a formula, so the produced log captures the formula
+        // removal even when the literal value is Blank.
+        let had_formula = self.workbook.formula_at(sheet, row, col).is_some();
+        if let Some(oplog) = self.oplog.as_deref_mut() {
+            if let Some(wire) = CellWireValue::from_value(&value) {
+                oplog.append(Op::PutValue {
+                    sheet,
+                    row,
+                    col,
+                    value: wire,
+                })?;
+            }
+            if had_formula {
+                oplog.append(Op::ClearFormula { sheet, row, col })?;
+            }
+        }
+
         self.workbook.put_at(sheet, row, col, value);
         self.workbook.clear_formula(sheet, row, col);
         Ok(())
@@ -216,8 +299,19 @@ impl<'a> WorkbookRuntime<'a> {
     /// borrows the runtime's workbook + registry for its lifetime. Buffer
     /// writes via `put_value`/`put_formula` then call `commit` to apply them
     /// atomically. See `transaction::WorkbookTransaction` for full semantics.
+    ///
+    /// Phase 2A.3.b (2026-05-12): if the runtime was constructed with
+    /// `with_oplog`, the transaction inherits the op-log handle via
+    /// `Option::as_deref_mut` (re-borrowed for the transaction's shorter
+    /// lifetime). The runtime is borrow-frozen while the transaction is
+    /// alive, so a single op log records both individual edits and batched
+    /// commits without aliasing.
     pub fn transaction(&mut self) -> WorkbookTransaction<'_> {
-        WorkbookTransaction::new(self.workbook, self.registry)
+        WorkbookTransaction::with_optional_oplog(
+            self.workbook,
+            self.registry,
+            self.oplog.as_deref_mut(),
+        )
     }
 
     /// Re-evaluate every formula in the workbook. Used after `load_workbook` to
@@ -854,5 +948,198 @@ mod tests {
         // Lowercased reference still resolves.
         let v = rt.set_formula(0, 0, 0, "mixedcasename + 1").unwrap();
         assert_eq!(v, Value::Number(6.0));
+    }
+
+    // ===== Phase 2A.3.b — op-log producer wiring =====
+
+    #[test]
+    fn set_value_with_oplog_emits_put_value() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+
+        rt.set_value(0, 2, 3, Value::Number(42.0)).unwrap();
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            Op::PutValue {
+                sheet,
+                row,
+                col,
+                value,
+            } => {
+                assert_eq!((*sheet, *row, *col), (0, 2, 3));
+                assert_eq!(value, &CellWireValue::Number(42.0));
+            }
+            other => panic!("expected PutValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_value_over_existing_formula_emits_put_value_then_clear_formula() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        // Seed a formula at (0, 0) via the runtime so the op log captures it.
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.set_formula(0, 0, 0, "1 + 1").unwrap();
+            rt.set_value(0, 0, 0, Value::Number(99.0)).unwrap();
+        }
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        // Expect: PutFormula → PutValue → ClearFormula.
+        assert_eq!(ops.len(), 3, "ops were: {ops:?}");
+        assert!(matches!(ops[0], Op::PutFormula { .. }));
+        assert!(matches!(ops[1], Op::PutValue { .. }));
+        assert!(matches!(ops[2], Op::ClearFormula { .. }));
+    }
+
+    #[test]
+    fn set_value_blank_emits_nothing_when_cell_is_already_blank() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            // Blank-write on a blank cell with no formula — emits no op
+            // (PutValue is skipped because CellWireValue::from_value(Blank) =
+            // None; ClearFormula is skipped because had_formula = false).
+            rt.set_value(0, 0, 0, Value::Blank).unwrap();
+        }
+        assert!(
+            oplog.is_empty(),
+            "expected empty log, got {} ops",
+            oplog.len()
+        );
+    }
+
+    #[test]
+    fn set_value_blank_over_formula_emits_clear_formula_only() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        // Seed a formula directly on the workbook (skip the op log so we
+        // isolate the Blank-over-formula behaviour).
+        wb.put_at(0, 0, 0, Value::Number(5.0));
+        wb.put_formula(0, 0, 0, "1 + 4");
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.set_value(0, 0, 0, Value::Blank).unwrap();
+        }
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], Op::ClearFormula { .. }));
+    }
+
+    #[test]
+    fn set_formula_with_oplog_emits_put_formula_text_only() {
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Number(10.0));
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            let v = rt.set_formula(0, 1, 0, "A1 * 2").unwrap();
+            assert_eq!(v, Value::Number(20.0));
+        }
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            Op::PutFormula {
+                sheet,
+                row,
+                col,
+                text,
+            } => {
+                assert_eq!((*sheet, *row, *col), (0, 1, 0));
+                assert_eq!(text.as_str(), "A1 * 2");
+            }
+            other => panic!("expected PutFormula, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_formula_lex_error_does_not_emit_op() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            // `@` is rejected by the lexer.
+            let result = rt.set_formula(0, 0, 0, "@foo");
+            assert!(matches!(result, Err(RuntimeError::Lex(_))));
+        }
+        assert!(
+            oplog.is_empty(),
+            "lex error must not append; got {} ops",
+            oplog.len()
+        );
+    }
+
+    #[test]
+    fn set_formula_parse_error_does_not_emit_op() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            let result = rt.set_formula(0, 0, 0, "(1 + 2");
+            assert!(matches!(result, Err(RuntimeError::Parse(_))));
+        }
+        assert!(oplog.is_empty());
+    }
+
+    #[test]
+    fn set_formula_invalid_cell_does_not_emit_op() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            let result = rt.set_formula(99, 0, 0, "1 + 1");
+            assert!(matches!(result, Err(RuntimeError::InvalidSheet { .. })));
+        }
+        assert!(oplog.is_empty());
+    }
+
+    #[test]
+    fn recompute_all_does_not_emit_ops() {
+        // recompute_all is idempotent re-evaluation; it shouldn't show up in
+        // the op log as a producer mutation. (The op log records user-intent
+        // edits, not derived recomputes.)
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        // Seed via the runtime so 2 ops land (1 PutValue + 1 PutFormula);
+        // then recompute_all must not add more.
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.set_value(0, 0, 0, Value::Number(2.0)).unwrap();
+            rt.set_formula(0, 1, 0, "A1 * 3").unwrap();
+        }
+        let len_before_recompute = oplog.len();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.recompute_all().unwrap();
+        }
+        assert_eq!(
+            oplog.len(),
+            len_before_recompute,
+            "recompute_all must not append ops"
+        );
+        assert_eq!(len_before_recompute, 2);
+    }
+
+    #[test]
+    fn runtime_without_oplog_set_value_and_set_formula_still_work() {
+        // Regression guard for the existing public API.
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        rt.set_value(0, 0, 0, Value::Number(5.0)).unwrap();
+        let v = rt.set_formula(0, 1, 0, "A1 + 10").unwrap();
+        assert_eq!(v, Value::Number(15.0));
     }
 }

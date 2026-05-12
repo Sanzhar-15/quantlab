@@ -33,6 +33,8 @@ use std::sync::Arc;
 
 use ql_formula_syntax::{lex, parse};
 use ql_functions::FunctionRegistry;
+use ql_io::CellWireValue;
+use ql_oplog::{Op, OpLog};
 use ql_storage::Workbook;
 use ql_types::{ColId, RowId, SheetId, Value};
 
@@ -76,6 +78,12 @@ enum PendingOp {
 ///
 /// The transaction holds a `&mut Workbook` for its entire lifetime — only one
 /// transaction can exist per workbook at a time (enforced by the borrow checker).
+///
+/// Phase 2A.3.b (2026-05-12): optional op-log attachment via
+/// `WorkbookTransaction::with_oplog` (or inherited from a runtime constructed
+/// via `WorkbookRuntime::with_oplog`). When attached, `commit` produces a
+/// single `Op::BatchCommit` containing one inner op per buffered write. Empty
+/// transactions (no buffered ops) emit nothing.
 pub struct WorkbookTransaction<'a> {
     workbook: &'a mut Workbook,
     registry: &'a FunctionRegistry,
@@ -84,6 +92,10 @@ pub struct WorkbookTransaction<'a> {
     /// mixed-kind writes (value+formula on the same cell within one tx) at
     /// buffer time so the resulting workbook state is unambiguous.
     cell_kinds: HashMap<(SheetId, RowId, ColId), OpKind>,
+    /// Phase 2A.3.b: optional op-log sink. `commit` emits a single
+    /// `BatchCommit` at the end of pass 2 when this is `Some` and there is
+    /// at least one buffered op.
+    oplog: Option<&'a mut OpLog>,
 }
 
 impl<'a> WorkbookTransaction<'a> {
@@ -93,6 +105,43 @@ impl<'a> WorkbookTransaction<'a> {
             registry,
             ops: Vec::new(),
             cell_kinds: HashMap::new(),
+            oplog: None,
+        }
+    }
+
+    /// Phase 2A.3.b: construct a transaction that records its commit as a
+    /// single `Op::BatchCommit` in the supplied op log. Useful when the
+    /// caller wants ad-hoc transactions outside an enclosing
+    /// `WorkbookRuntime::with_oplog`.
+    pub fn with_oplog(
+        workbook: &'a mut Workbook,
+        registry: &'a FunctionRegistry,
+        oplog: &'a mut OpLog,
+    ) -> Self {
+        Self {
+            workbook,
+            registry,
+            ops: Vec::new(),
+            cell_kinds: HashMap::new(),
+            oplog: Some(oplog),
+        }
+    }
+
+    /// Phase 2A.3.b: internal forwarding constructor used by
+    /// `WorkbookRuntime::transaction` to pass through the runtime's
+    /// (possibly absent) op-log handle via `Option::as_deref_mut`. Public
+    /// callers should prefer `new` or `with_oplog`.
+    pub fn with_optional_oplog(
+        workbook: &'a mut Workbook,
+        registry: &'a FunctionRegistry,
+        oplog: Option<&'a mut OpLog>,
+    ) -> Self {
+        Self {
+            workbook,
+            registry,
+            ops: Vec::new(),
+            cell_kinds: HashMap::new(),
+            oplog,
         }
     }
 
@@ -199,13 +248,45 @@ impl<'a> WorkbookTransaction<'a> {
 
     /// Apply all buffered ops to the workbook. See module docs for the two-pass
     /// semantics. Consumes the transaction.
-    pub fn commit(self) {
+    ///
+    /// Phase 2A.3.b (2026-05-12): signature changed from `fn commit(self)` to
+    /// `fn commit(self) -> Result<(), RuntimeError>` so a failing op-log
+    /// append (Loro internal error, serde_json NaN/Inf refusal) surfaces to
+    /// the caller. Callers without an attached op log never see an error
+    /// from this path — `Ok(())` is the only outcome. Op-log append happens
+    /// AFTER both workbook passes succeed, so a log-append failure leaves the
+    /// workbook fully updated but the log without a corresponding
+    /// `BatchCommit` entry. Callers attaching an op log are expected to
+    /// treat this as an error condition (engine state has diverged from log
+    /// state) and abort recording — analogous to the "no fallbacks" rule.
+    pub fn commit(self) -> Result<(), RuntimeError> {
         let Self {
             workbook,
             registry,
             ops,
             cell_kinds: _,
+            oplog,
         } = self;
+
+        // Phase 2A.3.b: snapshot pre-existing formula presence for each
+        // PendingOp::Value BEFORE pass 1 overwrites it. The snapshot drives
+        // whether a `ClearFormula` op needs to land in the BatchCommit
+        // alongside the `PutValue` (so producer-replay equivalence holds
+        // even when a literal overwrites a formula cell). Computed here so
+        // pass 1 can still do the actual clearing without us losing the
+        // pre-write state.
+        let pre_commit_had_formula: Vec<bool> = if oplog.is_some() {
+            ops.iter()
+                .map(|op| match op {
+                    PendingOp::Value {
+                        sheet, row, col, ..
+                    } => workbook.formula_at(*sheet, *row, *col).is_some(),
+                    _ => false,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Pass 1: apply literals + persist formula text. No formula eval yet.
         // Iterating by reference so we can move ops into pass 2.
@@ -236,7 +317,7 @@ impl<'a> WorkbookTransaction<'a> {
         // Pass 2: evaluate each buffered formula against the post-write workbook
         // and write the result. The env borrow is scoped to drop before the
         // mutable put_at — same pattern as workbook_runtime.rs.
-        for op in ops {
+        for op in &ops {
             if let PendingOp::Formula {
                 sheet,
                 row,
@@ -247,11 +328,67 @@ impl<'a> WorkbookTransaction<'a> {
             {
                 let value = {
                     let env = WorkbookEnv::new(workbook);
-                    eval_scalar_with_registry(&plan, &env, registry)
+                    eval_scalar_with_registry(plan, &env, registry)
                 };
-                workbook.put_at(sheet, row, col, value);
+                workbook.put_at(*sheet, *row, *col, value);
             }
         }
+
+        // Phase 2A.3.b: emit a single `BatchCommit` capturing the transaction.
+        // Each `PendingOp::Value` becomes a `PutValue` (skipped if the wire
+        // value is None — Value::Blank case, see workbook_runtime docs) plus
+        // an optional `ClearFormula` when the cell had a formula before pass
+        // 1 ran. Each `PendingOp::Formula` becomes a `PutFormula` (text
+        // only; replay drives recompute_all to materialize values). An empty
+        // `log_ops` short-circuits — no point appending an empty BatchCommit.
+        if let Some(oplog) = oplog {
+            let mut log_ops: Vec<Op> = Vec::with_capacity(ops.len() * 2);
+            for (i, op) in ops.iter().enumerate() {
+                match op {
+                    PendingOp::Value {
+                        sheet,
+                        row,
+                        col,
+                        value,
+                    } => {
+                        if let Some(wire) = CellWireValue::from_value(value) {
+                            log_ops.push(Op::PutValue {
+                                sheet: *sheet,
+                                row: *row,
+                                col: *col,
+                                value: wire,
+                            });
+                        }
+                        if pre_commit_had_formula[i] {
+                            log_ops.push(Op::ClearFormula {
+                                sheet: *sheet,
+                                row: *row,
+                                col: *col,
+                            });
+                        }
+                    }
+                    PendingOp::Formula {
+                        sheet,
+                        row,
+                        col,
+                        text,
+                        ..
+                    } => {
+                        log_ops.push(Op::PutFormula {
+                            sheet: *sheet,
+                            row: *row,
+                            col: *col,
+                            text: text.as_ref().to_owned(),
+                        });
+                    }
+                }
+            }
+            if !log_ops.is_empty() {
+                oplog.append(Op::BatchCommit { ops: log_ops })?;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -281,7 +418,7 @@ mod tests {
         assert_eq!(tx.op_count(), 3);
         // Not yet visible.
         // (Can't read wb here — tx holds &mut. Drop tx first.)
-        tx.commit();
+        tx.commit().unwrap();
 
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(1.0));
         assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(2.0));
@@ -306,7 +443,7 @@ mod tests {
         let reg = default_registry();
         let tx = WorkbookTransaction::new(&mut wb, &reg);
         assert_eq!(tx.op_count(), 0);
-        tx.commit();
+        tx.commit().unwrap();
         // Workbook still empty.
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Blank);
     }
@@ -319,7 +456,7 @@ mod tests {
         let reg = default_registry();
         let mut tx = WorkbookTransaction::new(&mut wb, &reg);
         tx.put_formula(0, 0, 0, "1 + 2 * 3").unwrap();
-        tx.commit();
+        tx.commit().unwrap();
 
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(7.0));
         assert_eq!(
@@ -338,7 +475,7 @@ mod tests {
         // the post-pass-1 workbook, seeing A1=10 → B1=20.
         tx.put_value(0, 0, 0, Value::Number(10.0)).unwrap();
         tx.put_formula(0, 0, 1, "A1 * 2").unwrap();
-        tx.commit();
+        tx.commit().unwrap();
 
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(10.0));
         assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(20.0));
@@ -360,7 +497,7 @@ mod tests {
 
         // Subsequent good ops still work.
         tx.put_value(0, 0, 2, Value::Number(77.0)).unwrap();
-        tx.commit();
+        tx.commit().unwrap();
 
         // Good ops applied; failed op had no effect.
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(99.0));
@@ -399,7 +536,7 @@ mod tests {
         // Transaction overwrites with a literal.
         let mut tx = WorkbookTransaction::new(&mut wb, &reg);
         tx.put_value(0, 0, 0, Value::Number(100.0)).unwrap();
-        tx.commit();
+        tx.commit().unwrap();
 
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(100.0));
         assert!(wb.formula_at(0, 0, 0).is_none());
@@ -413,7 +550,7 @@ mod tests {
         tx.put_value(0, 0, 0, Value::Number(1.0)).unwrap();
         tx.put_value(0, 0, 0, Value::Number(2.0)).unwrap();
         tx.put_value(0, 0, 0, Value::Number(3.0)).unwrap();
-        tx.commit();
+        tx.commit().unwrap();
 
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(3.0));
     }
@@ -439,7 +576,7 @@ mod tests {
         }
         // The first op stays buffered; the rejected op didn't.
         assert_eq!(tx.op_count(), 1);
-        tx.commit();
+        tx.commit().unwrap();
         // Final state reflects only the literal.
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(99.0));
         assert!(wb.formula_at(0, 0, 0).is_none());
@@ -460,7 +597,7 @@ mod tests {
             other => panic!("expected ConflictingOps, got {other:?}"),
         }
         assert_eq!(tx.op_count(), 1);
-        tx.commit();
+        tx.commit().unwrap();
         // Final state reflects only the formula.
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(15.0));
         assert_eq!(wb.formula_at(0, 0, 0).map(|s| s.as_ref()), Some("10 + 5"));
@@ -477,7 +614,7 @@ mod tests {
         tx.put_value(0, 0, 0, Value::Number(2.0)).unwrap();
         tx.put_formula(0, 1, 0, "A1 + 100").unwrap();
         tx.put_formula(0, 1, 0, "A1 + 200").unwrap(); // last-write-wins for formulas
-        tx.commit();
+        tx.commit().unwrap();
 
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(2.0));
         assert_eq!(wb.read(Address::new(0, 1, 0)), Value::Number(202.0));
@@ -492,7 +629,7 @@ mod tests {
         let reg = default_registry();
         let mut tx = WorkbookTransaction::new(&mut wb, &reg);
         tx.put_formula(0, 0, 0, "1000 * TaxRate").unwrap();
-        tx.commit();
+        tx.commit().unwrap();
 
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(210.0));
     }
@@ -506,7 +643,7 @@ mod tests {
         // without error — the error lives in the cell as a Value, not in the
         // commit return.
         tx.put_formula(0, 0, 0, "10 / 0").unwrap();
-        tx.commit();
+        tx.commit().unwrap();
 
         assert_eq!(
             wb.read(Address::new(0, 0, 0)),
@@ -535,7 +672,7 @@ mod tests {
         tx.put_formula(0, 5, 0, "SUM(A1, B1, A2, B2, A3, B3, A4, B4, A5, B5)")
             .unwrap();
         assert_eq!(tx.op_count(), 11);
-        tx.commit();
+        tx.commit().unwrap();
 
         // Sum of 1,10, 2,20, 3,30, 4,40, 5,50 = 165.
         assert_eq!(wb.read(Address::new(0, 5, 0)), Value::Number(165.0));
@@ -640,7 +777,7 @@ mod tests {
         let mut tx = WorkbookTransaction::new(&mut wb, &reg);
         tx.put_value(0, 1_048_575, 16_383, Value::Number(42.0))
             .unwrap();
-        tx.commit();
+        tx.commit().unwrap();
         assert_eq!(
             wb.read(Address::new(0, 1_048_575, 16_383)),
             Value::Number(42.0)
@@ -702,7 +839,7 @@ mod tests {
         let mut tx = rt.transaction();
         tx.put_value(0, 0, 0, Value::Number(7.0)).unwrap();
         tx.put_formula(0, 0, 1, "A1 * 2").unwrap();
-        tx.commit();
+        tx.commit().unwrap();
 
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(7.0));
         assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(14.0));
@@ -728,7 +865,7 @@ mod tests {
             }
         }
         assert_eq!(tx.op_count(), 10_000);
-        tx.commit();
+        tx.commit().unwrap();
         let elapsed = start.elapsed();
         assert!(
             elapsed.as_secs_f64() < 5.0,
@@ -739,5 +876,155 @@ mod tests {
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(0.0));
         assert_eq!(wb.read(Address::new(0, 50, 50)), Value::Number(5050.0));
         assert_eq!(wb.read(Address::new(0, 99, 99)), Value::Number(9999.0));
+    }
+
+    // ===== Phase 2A.3.b — op log producer wiring =====
+
+    #[test]
+    fn commit_empty_transaction_emits_no_batch_commit() {
+        let mut wb = make_wb();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let tx = WorkbookTransaction::with_oplog(&mut wb, &reg, &mut oplog);
+            assert_eq!(tx.op_count(), 0);
+            tx.commit().unwrap();
+        }
+        assert!(
+            oplog.is_empty(),
+            "empty commit must not append; got {} ops",
+            oplog.len()
+        );
+    }
+
+    #[test]
+    fn commit_value_then_formula_emits_one_batch_commit_with_two_ops() {
+        let mut wb = make_wb();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut tx = WorkbookTransaction::with_oplog(&mut wb, &reg, &mut oplog);
+            tx.put_value(0, 0, 0, Value::Number(10.0)).unwrap();
+            tx.put_formula(0, 0, 1, "A1 * 2").unwrap();
+            tx.commit().unwrap();
+        }
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ops.len(), 1, "expected one BatchCommit, got {ops:?}");
+        match &ops[0] {
+            Op::BatchCommit { ops: inner } => {
+                assert_eq!(inner.len(), 2);
+                assert!(matches!(inner[0], Op::PutValue { .. }));
+                assert!(matches!(inner[1], Op::PutFormula { .. }));
+            }
+            other => panic!("expected BatchCommit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commit_value_over_existing_formula_emits_clear_formula_inside_batch() {
+        let mut wb = make_wb();
+        // Pre-existing formula at (0, 0); transaction writes a literal.
+        wb.put_at(0, 0, 0, Value::Number(5.0));
+        wb.put_formula(0, 0, 0, "1 + 4");
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut tx = WorkbookTransaction::with_oplog(&mut wb, &reg, &mut oplog);
+            tx.put_value(0, 0, 0, Value::Number(99.0)).unwrap();
+            tx.commit().unwrap();
+        }
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        match &ops[0] {
+            Op::BatchCommit { ops: inner } => {
+                // PutValue + ClearFormula because cell had a pre-existing
+                // formula before the transaction.
+                assert_eq!(inner.len(), 2);
+                assert!(matches!(inner[0], Op::PutValue { .. }));
+                assert!(matches!(inner[1], Op::ClearFormula { .. }));
+            }
+            other => panic!("expected BatchCommit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dropping_transaction_without_commit_emits_nothing() {
+        let mut wb = make_wb();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut tx = WorkbookTransaction::with_oplog(&mut wb, &reg, &mut oplog);
+            tx.put_value(0, 0, 0, Value::Number(7.0)).unwrap();
+            // Drop without commit.
+        }
+        assert!(oplog.is_empty());
+    }
+
+    #[test]
+    fn transaction_via_runtime_inherits_oplog_handle() {
+        use crate::WorkbookRuntime;
+        let mut wb = make_wb();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            // Direct edit via the runtime → one PutValue op.
+            rt.set_value(0, 0, 0, Value::Number(1.0)).unwrap();
+            // Now run a transaction; its commit should emit one BatchCommit.
+            let mut tx = rt.transaction();
+            tx.put_value(0, 0, 1, Value::Number(2.0)).unwrap();
+            tx.put_formula(0, 0, 2, "A1 + B1").unwrap();
+            tx.commit().unwrap();
+            // After the transaction, the runtime can still emit more direct
+            // edits.
+            rt.set_value(0, 0, 3, Value::Number(99.0)).unwrap();
+        }
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        // 1 direct PutValue + 1 BatchCommit (2 inner) + 1 direct PutValue = 3
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(ops[0], Op::PutValue { .. }));
+        assert!(matches!(ops[1], Op::BatchCommit { .. }));
+        assert!(matches!(ops[2], Op::PutValue { .. }));
+    }
+
+    #[test]
+    fn transaction_without_oplog_still_works() {
+        let mut wb = make_wb();
+        let reg = default_registry();
+        let mut tx = WorkbookTransaction::new(&mut wb, &reg);
+        tx.put_value(0, 0, 0, Value::Number(7.0)).unwrap();
+        tx.put_formula(0, 0, 1, "A1 + 3").unwrap();
+        tx.commit().unwrap();
+        assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(7.0));
+        assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(10.0));
+    }
+
+    #[test]
+    fn commit_emits_clear_formula_only_for_pre_existing_formula_cells() {
+        // Mixed-batch test: one Value op on a previously-formula cell (should
+        // emit PutValue + ClearFormula); one Value op on a blank cell (should
+        // emit just PutValue); one Formula op (should emit PutFormula).
+        let mut wb = make_wb();
+        wb.put_at(0, 0, 0, Value::Number(50.0));
+        wb.put_formula(0, 0, 0, "10 * 5"); // pre-existing formula
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut tx = WorkbookTransaction::with_oplog(&mut wb, &reg, &mut oplog);
+            tx.put_value(0, 0, 0, Value::Number(100.0)).unwrap(); // over formula
+            tx.put_value(0, 0, 1, Value::Number(200.0)).unwrap(); // blank cell
+            tx.put_formula(0, 0, 2, "A1 + B1").unwrap();
+            tx.commit().unwrap();
+        }
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        match &ops[0] {
+            Op::BatchCommit { ops: inner } => {
+                // First op: PutValue(0,0,0) + ClearFormula(0,0,0) = 2
+                // Second op: PutValue(0,0,1) = 1
+                // Third op: PutFormula(0,0,2) = 1
+                // Total inner: 4
+                assert_eq!(inner.len(), 4, "inner ops were: {inner:?}");
+            }
+            other => panic!("expected BatchCommit, got {other:?}"),
+        }
     }
 }
