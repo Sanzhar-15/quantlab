@@ -684,22 +684,32 @@ pub fn pi(args: &[Value]) -> Value {
     Value::Number(std::f64::consts::PI)
 }
 
-/// `DEGREES(radians)` — radians → degrees.
+/// `DEGREES(radians)` — radians → degrees. Phase 3.10 audit M7
+/// (2026-05-13): sanitize the output via `sanitize_f64` so an Inf
+/// produced by `f64::to_degrees` on extreme inputs surfaces as
+/// `#NUM!` rather than a silent non-finite Value::Number.
 pub fn degrees(args: &[Value]) -> Value {
     let n = match one_number(args, 1, 1) {
         Ok(n) => n,
         Err(e) => return Value::Error(e),
     };
-    Value::Number(n.to_degrees())
+    match coercion::sanitize_f64(n.to_degrees()) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
 }
 
-/// `RADIANS(degrees)` — degrees → radians.
+/// `RADIANS(degrees)` — degrees → radians. Same sanitization
+/// contract as DEGREES (Phase 3.10 audit M7).
 pub fn radians(args: &[Value]) -> Value {
     let n = match one_number(args, 1, 1) {
         Ok(n) => n,
         Err(e) => return Value::Error(e),
     };
-    Value::Number(n.to_radians())
+    match coercion::sanitize_f64(n.to_radians()) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
 }
 
 // ===== Text (Phase 4.3 V1) =====
@@ -1393,6 +1403,132 @@ mod tests {
         assert_eq!(iserr(&[div]), Value::Boolean(true));
         assert_eq!(iserr(&[na]), Value::Boolean(false));
         assert_eq!(iserr(&[n(1.0)]), Value::Boolean(false));
+    }
+
+    // ===== Phase 3.10 audit closure (W5-48) — H5 (FN4-02 backfill) =====
+    //
+    // The original Phase 4.3 V1 batch tests had positive coverage but
+    // were thin on arity / error / coercion per FN4-02. Codex deep-
+    // audit flagged ROUNDDOWN/TRUNC/SIGN/EXP/LOG10/DEGREES/RADIANS/
+    // UPPER/LOWER/TRIM. This block backfills those gates.
+
+    #[test]
+    fn h5_rounddown_arity_error_coercion() {
+        assert_eq!(rounddown(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(rounddown(&[n(1.0)]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            rounddown(&[Value::Error(ErrorValue::Ref), n(0.0)]),
+            Value::Error(ErrorValue::Ref)
+        );
+        // Lenient text→number coercion via to_number_strict for now —
+        // text that parses works, text that doesn't surfaces #VALUE!.
+        assert_eq!(
+            rounddown(&[Value::text("not-a-number"), n(0.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn h5_trunc_arity_error_coercion() {
+        assert_eq!(trunc(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            trunc(&[n(1.0), n(2.0), n(3.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            trunc(&[Value::Error(ErrorValue::NA)]),
+            Value::Error(ErrorValue::NA)
+        );
+        // Blank → 0 (Excel canon for numeric contexts).
+        assert_eq!(trunc(&[Value::Blank]), n(0.0));
+    }
+
+    #[test]
+    fn h5_sign_arity_error_coercion() {
+        assert_eq!(sign(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(sign(&[n(1.0), n(2.0)]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            sign(&[Value::Error(ErrorValue::Num)]),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(sign(&[Value::Blank]), n(0.0));
+    }
+
+    #[test]
+    fn h5_exp_arity_error_overflow() {
+        assert_eq!(exp(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(exp(&[n(1.0), n(2.0)]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            exp(&[Value::Error(ErrorValue::Ref)]),
+            Value::Error(ErrorValue::Ref)
+        );
+        // Overflow path: EXP(1000) ≈ Inf → sanitize → #NUM!.
+        assert_eq!(exp(&[n(1000.0)]), Value::Error(ErrorValue::Num));
+        // Underflow: EXP(-1000) ≈ 0 (finite). Return Number(0.0).
+        assert_eq!(exp(&[n(-1000.0)]), n(0.0));
+    }
+
+    #[test]
+    fn h5_log10_arity_error_coercion() {
+        assert_eq!(log10(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(log10(&[n(1.0), n(2.0)]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            log10(&[Value::Error(ErrorValue::Calc)]),
+            Value::Error(ErrorValue::Calc)
+        );
+        // log10(1) = 0 — round-trip with our impl.
+        assert_eq!(log10(&[n(1.0)]), n(0.0));
+    }
+
+    #[test]
+    fn h5_degrees_radians_arity_error_overflow() {
+        // Arity.
+        assert_eq!(degrees(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(degrees(&[n(1.0), n(2.0)]), Value::Error(ErrorValue::Value));
+        assert_eq!(radians(&[]), Value::Error(ErrorValue::Value));
+        // Error propagation.
+        assert_eq!(
+            degrees(&[Value::Error(ErrorValue::Ref)]),
+            Value::Error(ErrorValue::Ref)
+        );
+        // M7 fix verification: extreme input → Inf → #NUM! (was a
+        // silent non-finite Value::Number pre-W5-48).
+        assert_eq!(degrees(&[n(f64::MAX)]), Value::Error(ErrorValue::Num));
+        // Coercion: Blank → 0 → 0 degrees.
+        assert_eq!(degrees(&[Value::Blank]), n(0.0));
+    }
+
+    #[test]
+    fn h5_upper_lower_arity() {
+        assert_eq!(upper(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(upper(&[t("a"), t("b")]), Value::Error(ErrorValue::Value));
+        assert_eq!(lower(&[]), Value::Error(ErrorValue::Value));
+        // German sharp-s known divergence: Rust to_uppercase("ß") =
+        // "SS"; Excel UPPER("ß") = "ß". Phase 4.9 (localization)
+        // closes; matrix already notes the divergence.
+        assert_eq!(upper(&[t("ß")]), t("SS"));
+    }
+
+    #[test]
+    fn h5_trim_arity_nbsp_preserved() {
+        assert_eq!(trim(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(trim(&[t("a"), t("b")]), Value::Error(ErrorValue::Value));
+        // Non-breaking space (U+00A0) is NOT collapsed by Excel TRIM;
+        // only regular spaces (0x20). Our impl matches this contract.
+        let nbsp = "\u{00A0}";
+        let input = format!("{nbsp}hello{nbsp}");
+        assert_eq!(trim(&[Value::text(input.clone())]), Value::text(input));
+    }
+
+    #[test]
+    fn h5_len_known_unicode_divergence() {
+        // LEN counts Unicode scalar values (`char`s), NOT UTF-16
+        // code units like Excel. For a ZWJ emoji sequence (👨‍👩‍👧),
+        // Rust scalars = 5 but Excel UTF-16 = 8. Matrix documents
+        // this as a known divergence; this test pins our actual
+        // behavior so a future change can't drift silently.
+        let zwj_family = "👨\u{200D}👩\u{200D}👧";
+        assert_eq!(len(&[Value::text(zwj_family)]), n(5.0));
     }
 
     #[test]

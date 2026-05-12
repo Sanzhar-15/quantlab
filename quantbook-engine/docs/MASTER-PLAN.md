@@ -401,20 +401,31 @@ The full v1 means all of these crates either ship real behavior or have a docume
    - Surfaced GAP-G-01 + GAP-G-03 (Phase 3.10 megaudit carryovers) as Phase 4 entry decisions — array formulas + function library expansion both rebind formulas at scale; the append-only graph fix needs to happen before 4.3 or be a known limitation gated by 4.12 megaudit.  
    Effort: 2-4 days (actual: ~0.5 day; Explore subagent did the IronCalc survey).
 
-2. **4.2 Excel Compatibility Matrix Harness** ✅ SHIPPED 2026-05-12 (W5-45)  
+2. **4.2 Excel Compatibility Matrix Harness** ✅ SHIPPED 2026-05-12 (W5-45); doc honesty patched W5-48  
    Create a checked-in matrix for functions, operators, coercions, errors, arrays, tables, date systems, localization, and xlsx import/export.  
    References: `.references/formualizer/benchmarks/function_matrix.yaml` (taxonomy ref only — not directly applicable; formualizer's matrix is benchmark-scenario claim-safety, not per-function compat); `.references/ironcalc/base/src/test/` (used implicitly via Phase 4.1 gap matrix).  
-   Acceptance: ECM-4-01 ✅ matrix exists at `docs/compat/excel-matrix.md` (~180 function rows across 11 categories + operators + coercion + errors + arrays + tables + dates + localization + xlsx); ECM-4-02 ✅ each function row carries Status emoji (✅/⚠️/🔄/❌) + Tests count + Phase ref + Notes column; ECM-4-03 ✅ `scripts/report-compat-coverage.sh` parses the matrix and emits human-readable + JSON output with per-category breakdown and headline `coverage=NN%`.  
-   Shipped baseline: 202 rows (51 ✅ implemented, 13 ⚠️ partial, 1 🔄 reserved, 137 ❌ missing) = **32% coverage**. Phase 4.3 (function library wave 1) will close ~100 more `❌` rows.  
-   Effort: 2-3 days (actual: ~0.5 day).
+   Acceptance:  
+   - ECM-4-01 ✅ matrix exists at `docs/compat/excel-matrix.md`.  
+   - ECM-4-02 ⚠️ **PARTIAL** (revised W5-48 per Codex deep-audit): each function row carries Status + Tests + Phase + Notes; the CATEGORY for each function is the `###` section header it lives under (Aggregates/Statistical, Logical, Math&Trig, Text, Date&Time, Lookup&Reference, Information, Financial, Engineering, Database, Reserved) rather than a per-row column. ~52 rows have empty/short Notes — full per-row parity-note expansion is the documented Phase 4.3+ follow-up. The original ECM-4-02 prose was rewritten to match the actual schema.  
+   - ECM-4-03 ✅ `scripts/report-compat-coverage.sh` parses the matrix and emits human-readable + JSON output with per-category breakdown and headline `coverage=NN%`.  
+   Shipped baseline: 217 rows (post-W5-46 + W5-48 status revisions: 70 ✅ + 16 ⚠️ + 1 🔄 + 130 ❌) ≈ **40% coverage**.  
+   Effort: 2-3 days (actual: ~0.5 day for V1 + 0.1 day for audit closure).
 
-3. **4.3 Function Library Expansion Wave 1 - Core 100** 🔄 IN PROGRESS (V1 batch shipped 2026-05-13, W5-46)  
+3. **4.3 Function Library Expansion Wave 1 - Core 100** 🔄 IN PROGRESS (V1 batch shipped 2026-05-13, W5-46; FN4-02 backfill W5-48)  
    Implement high-use math, logical, text, lookup, statistical, date/time, and information functions. Include metadata for volatility, laziness, array behavior, and argument coercion.  
    References: `.references/ironcalc/base/src/functions/mod.rs`; `.references/ironcalc/base/src/functions/math_and_trigonometry/`; `.references/ironcalc/base/src/functions/statistical/`; `.references/formualizer/crates/formualizer-eval/src/function_registry.rs`.  
-   Acceptance: FN4-01 ⚠️ partial — registry at 52 entries (was 30) after V1 batch; 100 target requires further batches; FN4-02 ✅ V1 batch each has positive + error + coercion + arity tests (~25 new tests); FN4-03 ❌ IF/IFERROR lazy eval still deferred (would need scalar evaluator changes to skip unselected branch); FN4-04 ✅ matrix updated — coverage 32% → 40%.  
-   V1 batch shipped (22 functions): ROUNDUP, ROUNDDOWN, TRUNC, SIGN, EXP, LN, LOG, LOG10, PI, DEGREES, RADIANS, LEN, UPPER, LOWER, TRIM, ISNUMBER, ISTEXT, ISBLANK, ISLOGICAL, ISERROR, ISNA, ISERR. All scalar (per-cell, no range deps beyond what 3.6 already provides). Excel-canon error propagation and coercion.  
-   Remaining to close FN4-01: ~48 more functions across SUMIF/COUNTIF/AVERAGEIF family, LARGE/SMALL/RANK, LEFT/RIGHT/MID/FIND/SEARCH/SUBSTITUTE/REPLACE, ROUND/CEILING/FLOOR family completion, trig (SIN/COS/TAN/ASIN/ACOS/ATAN/ATAN2), CHOOSE/INDEX/MATCH/VLOOKUP/HLOOKUP. FN4-03 (lazy IF/IFERROR) is separable; needs scalar.rs Function-branch refactor to defer arg eval.  
-   Effort: 2-3 weeks (V1 batch: ~0.5 day; remaining: 1-2 weeks).
+   Acceptance:  
+   - FN4-01 ⚠️ partial — registry at 52 entries (was 30) after V1 batch; 100 target requires further batches.  
+   - FN4-02 ✅ (after W5-48 backfill) each V1-batch function now has positive + error + coercion + arity tests. Initial V1 commit (W5-46) had only positive tests for most fns; Codex deep-audit H5 flagged the gap; W5-48 closure adds 9 dedicated H5 backfill tests (ROUNDDOWN/TRUNC/SIGN/EXP/LOG10/DEGREES+RADIANS/UPPER+LOWER/TRIM/LEN-unicode).  
+   - FN4-03 ❌ IF/IFERROR lazy eval still deferred.  
+   - FN4-04 ✅ matrix updated; coverage 32% → 40%; UPPER/LOWER reclassified ⚠️ partial (Unicode-default mapping diverges from Excel for ß and other locale-sensitive chars); ROUNDUP/ROUNDDOWN reclassified ⚠️ partial (binary-float edge cases vs Excel's 15-digit display rounding); LEN annotated as known scalar-vs-UTF-16 divergence.  
+   V1 batch shipped (22 functions): ROUNDUP, ROUNDDOWN, TRUNC, SIGN, EXP, LN, LOG, LOG10, PI, DEGREES, RADIANS, LEN, UPPER, LOWER, TRIM, ISNUMBER, ISTEXT, ISBLANK, ISLOGICAL, ISERROR, ISNA, ISERR. All scalar (per-cell, no range deps beyond what 3.6 already provides). Excel-canon error propagation; W5-48 fixed M7 (DEGREES/RADIANS now sanitize output via `sanitize_f64` so Inf surfaces as `#NUM!`).  
+   Remaining to close FN4-01: ~48 more functions across SUMIF/COUNTIF/AVERAGEIF family, LARGE/SMALL/RANK, LEFT/RIGHT/MID/FIND/SEARCH/SUBSTITUTE/REPLACE, ROUND/CEILING/FLOOR family completion, trig (SIN/COS/TAN/ASIN/ACOS/ATAN/ATAN2), CHOOSE/INDEX/MATCH/VLOOKUP/HLOOKUP.  
+   Known divergences from Excel canon (documented in matrix, Phase 4.9/4.5 closures):  
+   - UPPER/LOWER: Rust's `to_uppercase`/`to_lowercase` use Unicode default mapping (ß → SS); Excel preserves case-sensitive locale rules. Phase 4.9.  
+   - LEN: Rust scalar count (`.chars().count()`); Excel UTF-16 code unit count. Matches for ASCII/BMP; diverges for emoji ZWJ sequences. Phase 4.9.  
+   - ROUNDUP/ROUNDDOWN: binary-float edges (`0.1 + 0.2` rounds up to `0.4` not `0.3`); Phase 4.5 number formats + decimal-aware rounding revisits.  
+   Effort: 2-3 weeks (V1 batch + audit closure: ~0.6 day; remaining: 1-2 weeks).
 
 4. **4.4 Coercion And Error Semantics Matrix**  
    Centralize coercion rules and error precedence. Lock binary op behavior, function argument coercion, blank handling, text-to-number, and date serial behavior.  

@@ -10,14 +10,31 @@ implemented / total count by category.
 This document is the canonical machine-parseable reference for what
 Excel features Quantbook implements. Categories: operators, coercion,
 errors, functions, arrays/spills, tables, date systems, localization,
-xlsx round-trip. Each row carries:
+xlsx round-trip.
+
+**Phase 3.10/Codex audit closure (W5-48, 2026-05-13):** ECM-4-02
+was originally written as "each function has status + tests +
+category + Excel parity notes." After the audit caught the schema
+mismatch (function tables have no `Category` column; categories
+are encoded as `###` SECTION HEADERS under `## 1. Functions`), the
+ECM-4-02 acceptance is now: each function row carries Status +
+Tests + Phase + Notes; the function's CATEGORY is determined by
+the `###` section it lives under (Aggregates/Statistical, Logical,
+Math&Trig, Text, Date&Time, Lookup&Reference, Information,
+Financial, Engineering, Database, Reserved). Many rows still have
+empty/short Notes; per-row parity-note expansion is the
+documented Phase 4.3+ follow-up (also captured in §"Open
+follow-ups" below).
+
+Each function row carries:
 
 - **Status:** ✅ implemented · ⚠️ partial · 🔄 reserved · ❌ not-yet
 - **Tests:** existing test count (`-` for non-function rows)
-- **Category:** Math / Statistical / Logical / Text / Date&Time /
-  Lookup / Information / Database / Financial / Engineering / Volatile
-  / Reserved
-- **Notes:** Excel parity notes, Phase to close, known limitations.
+- **Phase:** Phase that closes / closed this row.
+- **Notes:** Excel parity notes, known limitations, divergences.
+
+The category for each row comes from the `###` section header it's
+listed under (not a per-row column).
 
 The `Status` column is the format `scripts/report-compat-coverage.sh`
 counts: rows with `✅` count as implemented, rows with `⚠️` count
@@ -86,8 +103,8 @@ as partial, rows with `❌` are missing.
 | ABS | ✅ | 3+ | 0 | |
 | SQRT | ✅ | 3+ | 0 | Negative → #NUM! |
 | ROUND | ✅ | 5+ | 0 | |
-| ROUNDUP | ✅ | 4 | 4.3 V1 | Round away from zero; sign-preserving |
-| ROUNDDOWN | ✅ | 1 | 4.3 V1 | Truncate toward zero |
+| ROUNDUP | ⚠️ | 4 | 4.3 V1 | Round away from zero; sign-preserving. **Binary-float gotcha:** `ROUNDUP(0.1 + 0.2, 1)` rounds `0.30000000000000004` to `0.4`, while Excel's 15-digit display-aware rounding usually yields `0.3`. Decimal-aware rounding lands Phase 4.5 (number formats). |
+| ROUNDDOWN | ⚠️ | 2 | 4.3 V1 | Truncate toward zero. Same binary-float gotcha as ROUNDUP. **Negative-zero leak:** very-small negative inputs produce `Value::Number(-0.0)` (PartialEq says `0.0 == -0.0`; cosmetic only — display may show `-0`). |
 | MROUND / CEILING / CEILING.MATH / CEILING.PRECISE | ❌ | 0 | 4.3 | |
 | FLOOR / FLOOR.MATH / FLOOR.PRECISE | ❌ | 0 | 4.3 | |
 | INT | ✅ | 3+ | 0 | Truncation toward -∞ |
@@ -118,10 +135,10 @@ as partial, rows with `❌` are missing.
 
 | Function | Status | Tests | Phase | Notes |
 |---|---|---|---|---|
-| LEN | ✅ | 2 | 4.3 V1 | Char count (UTF-8 chars, not bytes) |
+| LEN | ✅ | 3 | 4.3 V1 | **DIVERGES from Excel for emoji ZWJ sequences.** Rust counts Unicode scalar values (`.chars().count()`); Excel counts UTF-16 code units (`LENB`-like for non-BMP). For ASCII / BMP-plane text, both match. ZWJ family emoji like `👨‍👩‍👧`: Quantbook = 5, Excel = 8. Pin Phase 4.9. |
 | LEFT / RIGHT / MID | ❌ | 0 | 4.3 | |
-| UPPER | ✅ | 1 | 4.3 V1 | Unicode uppercase (Turkish I edge case → 4.9) |
-| LOWER | ✅ | 1 | 4.3 V1 | Unicode lowercase |
+| UPPER | ⚠️ | 2 | 4.3 V1 | Rust's Unicode-default mapping. **DIVERGES from Excel for German ß** (Quantbook = `SS`, Excel = `ß`) and any other locale-sensitive mapping (Turkish I, Greek final sigma). For ASCII-only text both match. Pin Phase 4.9 (locale-aware case). |
+| LOWER | ⚠️ | 1 | 4.3 V1 | Rust Unicode-default. Same divergence class as UPPER. Pin Phase 4.9. |
 | PROPER | ❌ | 0 | 4.3 | Title-case |
 | TRIM | ✅ | 1 | 4.3 V1 | Strip + collapse internal space runs |
 | CLEAN | ❌ | 0 | 4.3 | Strip non-printable ASCII |

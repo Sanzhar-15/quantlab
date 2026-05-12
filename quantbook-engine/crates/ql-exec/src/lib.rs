@@ -1,6 +1,6 @@
 //! `ql-exec` — Quantbook expression executor.
 //!
-//! Module map (Phase 0 → Phase 2B):
+//! Module map (Phase 0 → Phase 3.10 + Phase 4.3 V1):
 //!
 //! - `plan.rs` (Phase 0 W4-1; extended Phase 2A.1, 2A.6, 2B.4) — `ExprPlan` IR
 //!   including the Phase 2B.4 `AggregateNameRef` variant; `bind` /
@@ -12,11 +12,22 @@
 //! - `plan_cache.rs` (Phase 2B.3) — bind-plan cache V0 keyed by
 //!   (formula text, sheet, NameTable generation); `PlanCache` lives on
 //!   `WorkbookRuntime`; `PlanCacheStats` for ql-profile observability.
-//! - `env.rs` (Phase 0) — `CellEnv` trait + `WorkbookEnv` / `MapEnv` impls;
-//!   `NameLookup for NameTable` bridge.
-//! - `scalar.rs` (Phase 0 W4-1; extended Phase 2A.9, 2B.4) — `eval_scalar`
-//!   per-cell evaluator with Excel-canon arithmetic, error propagation,
-//!   coercion. `AggregateNameRef` evaluates to `#CALC!` pending Phase 3.6.
+//! - `env.rs` (Phase 0; extended Phase 3.6 for `read_range`) —
+//!   `CellEnv` trait + `WorkbookEnv` / `MapEnv` impls. Phase 3.6
+//!   added `read_range(Range) -> Vec<Value>` with WorkbookEnv
+//!   override that clamps to `Sheet::bounds` for whole-column
+//!   safety. `NameLookup for NameTable` bridge.
+//! - `scalar.rs` (Phase 0 W4-1; extended Phase 2A.9, 2B.4, 3.6) —
+//!   `eval_scalar` per-cell evaluator with Excel-canon arithmetic,
+//!   error propagation, coercion. Phase 3.6 added
+//!   `eval_scalar_with_cache` entry point that routes aggregate-
+//!   over-named-range calls through an `AggregateCache` for cache-
+//!   hit short-circuit. `AggregateNameRef` outside a Function
+//!   context returns `#CALC!` defensively (binder normally rejects).
+//! - `aggregate_cache.rs` (Phase 3.6 W5-39) — `AggregateCache`
+//!   trait + `InMemAggregateCache` (RefCell-backed for `&self`
+//!   stores) + `NoAggregateCache` no-op default. Stats counters
+//!   (hits, misses, invalidations). Used by `CalcgraphSession`.
 //! - `simd.rs` (Phase 0 W4-2/W4-3) — `multiversion`-dispatched SIMD kernels;
 //!   OG-02 25M-cell hot path.
 //! - `lower.rs` (Phase 0) — `classify` + `dispatch` for the SIMD shape

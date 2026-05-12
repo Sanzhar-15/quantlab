@@ -15,8 +15,12 @@ file is the unlock.
 
 ## Provenance + license (PAR-4-03)
 
-- **Source repo (read-only):** `.references/ironcalc/` (vendored at
-  `/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/.references/ironcalc/`).
+- **Source repo (read-only):** `.references/ironcalc/` — the path is
+  RELATIVE TO THE PARENT REPO ROOT
+  `/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/`,
+  NOT the engine crate. Inside the engine crate (`quantbook-engine/`)
+  the path resolves to `../.references/ironcalc/`. The vendored
+  source mirror is read-only; do not edit.
 - **License:** IronCalc is dual-licensed **MIT** + **Apache-2.0** (see
   `LICENSE-MIT`, `LICENSE-APACHE` in the IronCalc root). Copyright 2023
   EqualTo GmbH, Nicolás Hatcher.
@@ -55,7 +59,7 @@ ironcalc/base/src/expressions/
 
 ## 2. Token-kind gap
 
-### IronCalc tokens (27 variants)
+### IronCalc tokens (29 variants)
 
 ```text
 Illegal, EOF, Ident, String, Number, Boolean, Error,
@@ -107,7 +111,7 @@ Operator: Plus, Minus, Mul, Div, Percent, Pow, Concat,
 
 ## 3. AST-node gap
 
-### IronCalc `Node` (26 variants, `parser/mod.rs` lines ~120-233)
+### IronCalc `Node` (27 variants, `parser/mod.rs` lines ~120-233)
 
 ```text
 Boolean, Number, String, Reference, Range, WrongReference, WrongRange,
@@ -143,6 +147,7 @@ Function{name, args}, Array, Spill, NameRef
 | Range as first-class operator | `OpRange` (`:` as binary operator node) | Phase 4.6/4.7 |
 | Parse errors as tree nodes | `ParseError{formula, msg, pos}` | Phase 4.4 (recoverable parse) |
 | Empty positional arg | `EmptyArg` for `SUM(, A2)` | Phase 4.3 (function library — IF/IFS/CHOOSE expect this shape) |
+| User-named / registered functions | `NamedFunctionKind{id, name, args}` (distinct from built-in `Function`) | Phase 4.3 (registration) + 6.4 (Python UDFs) |
 
 ### AST shapes we have, IronCalc doesn't (or differs)
 

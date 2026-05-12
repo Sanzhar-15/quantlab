@@ -8,15 +8,28 @@
 //!
 //! Phase 1 W5-10 scope:
 //! - `set_formula(sheet, row, col, text)` — parse + eval + persist formula text +
-//!   evaluated value to the workbook.
+//!   evaluated value. Phase 3.5: routes the evaluated value to the COMPUTED
+//!   overlay; clears any stale user-overlay entry at the cell first.
 //! - `set_value(sheet, row, col, value)` — literal-only write; clears any existing
-//!   formula association.
-//! - `recompute_all()` — re-evaluate every formula in the workbook.
+//!   formula association. Phase 3.5: `clear_formula` cascades to drop the
+//!   computed-overlay entry too.
+//! - `recompute_all()` — legacy HashMap-order full pass; no graph awareness.
+//! - `recompute_dirty()` (Phase 3.4 W5-37) — incremental graph-driven recompute.
+//!   Runs Tarjan SCC over the attached `CalcgraphSession`'s dirty set; cycled
+//!   members get `Value::Error(ErrorValue::Circ)`. Phase 3.6 routes aggregates
+//!   through the session's `InMemAggregateCache`; Phase 3.8 applies value-
+//!   equality short-circuit; Phase 3.9 V1 tallies SIMD-eligible formulas in
+//!   `RecomputeResult.simd_classified`.
+//! - `validate_formula(sheet, row, col, text)` (Phase 2B.7) — full pipeline
+//!   without mutation; IDE on-keystroke validation entry.
 //!
-//! Phase 4+ deferred:
-//! - Dependency-tracking incremental recompute (calcgraph integration).
-//! - Computed-overlay separation (CORR-25): user-input vs formula-output layered.
-//! - Cross-sheet formula references via NameTable resolution.
+//! Phase 4+ deferred (per Phase 3.10 megaudit + W5-48 Codex deep-audit):
+//! - GAP-G-01 / GAP-G-03 — append-only graph rebind staleness + range-deps-
+//!   not-scheduler-edges. Architectural decision needed before Phase 4.3 V2.
+//! - GAP-G-02 — bulk SIMD region dispatch from graph scheduler (V1 is
+//!   observability only).
+//! - FN4-03 — lazy IF/IFERROR (needs scalar.rs Function-branch refactor).
+//! - Cross-sheet formula references via NameTable resolution (Phase 4.6).
 
 use std::sync::Arc;
 
