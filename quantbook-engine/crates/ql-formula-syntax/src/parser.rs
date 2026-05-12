@@ -42,33 +42,28 @@ use crate::ast::{CellAddr, Expr, RangeRef};
 use crate::token::{Operator, Token};
 
 /// Parse error variants.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// Phase 2A.11 audit M16 (2026-05-12): switched to `thiserror::Error` from
+/// hand-rolled Display + std::error::Error. Strings identical to prior
+/// hand-rolled formatters; consistency with the other error types.
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum ParseError {
     /// Reached end of token stream while expecting more input.
+    #[error("unexpected end of input in {context}")]
     UnexpectedEnd { context: &'static str },
     /// A specific token type was expected but a different one was found.
+    #[error("unexpected token in {context}: {got}")]
     Unexpected { context: &'static str, got: String },
     /// Range bounds malformed (e.g. `A1:B10:C100` or unmatched range types like `A1:B`).
+    #[error("invalid range: {detail}")]
     InvalidRange { detail: &'static str },
     /// Trailing tokens after a complete expression.
+    #[error("trailing {count} token(s) after expression")]
     Trailing { count: usize },
     /// Unclosed function call or grouping.
+    #[error("unclosed {what}")]
     UnclosedDelimiter { what: &'static str },
 }
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnexpectedEnd { context } => write!(f, "unexpected end of input in {context}"),
-            Self::Unexpected { context, got } => write!(f, "unexpected token in {context}: {got}"),
-            Self::InvalidRange { detail } => write!(f, "invalid range: {detail}"),
-            Self::Trailing { count } => write!(f, "trailing {count} token(s) after expression"),
-            Self::UnclosedDelimiter { what } => write!(f, "unclosed {what}"),
-        }
-    }
-}
-
-impl std::error::Error for ParseError {}
 
 /// Parse a complete formula from `tokens` (lexer output) to an AST.
 pub fn parse(tokens: Vec<Token>) -> Result<Expr, ParseError> {

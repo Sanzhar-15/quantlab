@@ -774,6 +774,7 @@ name = "ql-formula-syntax"
 version = "0.1.0"
 dependencies = [
  "ql-types",
+ "thiserror",
 ]
 
 [[package]]

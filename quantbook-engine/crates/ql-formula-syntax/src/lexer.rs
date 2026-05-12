@@ -14,31 +14,32 @@ use std::sync::Arc;
 use crate::token::{Operator, Token};
 
 /// Lex error — narrow, structured.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// Phase 2A.11 audit M16 (2026-05-12): switched from hand-rolled Display +
+/// std::error::Error to `thiserror::Error` for consistency with QbookError,
+/// RuntimeError, LoadAndRecomputeError, NameTableError (all already use
+/// thiserror). Display strings are user-facing and identical to the prior
+/// hand-rolled formatters.
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum LexError {
+    #[error("unterminated string literal")]
     UnterminatedString,
+
+    #[error("invalid number: {0:?}")]
     InvalidNumber(String),
+
+    #[error("unexpected character: {0:?}")]
     UnexpectedChar(char),
+
     /// Cell-ref or column letters exceed the Excel column-letter max (XFD = 16383). The
     /// constructor enforces this even though our `ColId = u32` could technically hold more.
+    #[error("column letters out of range: {0:?}")]
     ColumnTooLarge(String),
+
     /// Row digits exceed the Excel row max (1048576). Same enforcement reason.
+    #[error("row digits out of range: {0:?}")]
     RowTooLarge(String),
 }
-
-impl std::fmt::Display for LexError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LexError::UnterminatedString => write!(f, "unterminated string literal"),
-            LexError::InvalidNumber(s) => write!(f, "invalid number: {s:?}"),
-            LexError::UnexpectedChar(c) => write!(f, "unexpected character: {c:?}"),
-            LexError::ColumnTooLarge(s) => write!(f, "column letters out of range: {s:?}"),
-            LexError::RowTooLarge(s) => write!(f, "row digits out of range: {s:?}"),
-        }
-    }
-}
-
-impl std::error::Error for LexError {}
 
 /// Excel's column-letter upper bound (XFD = 16383, zero-indexed).
 pub const MAX_COLUMN: u32 = 16_383;

@@ -85,13 +85,17 @@ pub(crate) fn validate_cell(
 /// the `WorkbookTransaction` mixed-kind-on-same-cell case.
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
-    #[error("lex error: {0:?}")]
+    // Phase 2A.11 audit M16: switched from `{0:?}` debug formatters to `{0}`
+    // Display now that LexError + BindError implement thiserror::Error with
+    // user-facing strings. IDE error display reads cleanly: "lex error:
+    // unexpected character: '@'" instead of "lex error: UnexpectedChar('@')".
+    #[error("lex error: {0}")]
     Lex(LexError),
 
     #[error("parse error: {0}")]
     Parse(#[from] ParseError),
 
-    #[error("bind error: {0:?}")]
+    #[error("bind error: {0}")]
     Bind(BindError),
 
     #[error("invalid sheet {sheet}: workbook has {sheet_count} sheets")]
@@ -741,6 +745,53 @@ mod tests {
         // No partial write on bind failure.
         assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Blank);
         assert!(wb.formula_at(0, 0, 0).is_none());
+    }
+
+    /// Phase 2A.11 audit M16: error Display strings are human-readable, not
+    /// Rust-debug syntax. Previously `RuntimeError::Bind(BindError::Unresolved
+    /// Name("X"))` rendered via `{0:?}` and surfaced "bind error:
+    /// UnresolvedName(\"X\")" — Rust debug format with an awkward bracket+
+    /// quote spelling. Now reads "bind error: unresolved name \"X\"".
+    #[test]
+    fn runtime_error_bind_display_is_human_readable() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt
+            .set_formula(0, 0, 0, "UnknownName + 1")
+            .expect_err("expected an error");
+        let display = err.to_string();
+        // The display contains the user-facing canonical name; no Rust
+        // debug-syntax markers like `UnresolvedName(...)`.
+        assert!(
+            display.contains("UNKNOWNNAME"),
+            "Display lost the name: {display:?}"
+        );
+        assert!(
+            !display.contains("UnresolvedName"),
+            "Display still leaks Rust variant syntax: {display:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_error_lex_display_is_human_readable() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // `@` is not in the Phase 0 alphabet — lex error.
+        let err = rt
+            .set_formula(0, 0, 0, "@foo")
+            .expect_err("expected an error");
+        let display = err.to_string();
+        assert!(
+            display.contains("unexpected character"),
+            "Display lost the message: {display:?}"
+        );
+        // No debug-syntax leak like `UnexpectedChar('@')`.
+        assert!(
+            !display.contains("UnexpectedChar"),
+            "Display still leaks Rust variant syntax: {display:?}"
+        );
     }
 
     #[test]

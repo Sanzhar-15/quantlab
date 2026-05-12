@@ -10,4 +10,8 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-ql-types = { path = "../ql-types" }
+ql-types  = { path = "../ql-types" }
+# Phase 2A.11 audit M16: LexError + ParseError use thiserror::Error
+# (consistent with QbookError / RuntimeError / LoadAndRecomputeError /
+# NameTableError which already do).
+thiserror = { workspace = true }

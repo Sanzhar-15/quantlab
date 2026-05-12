@@ -62,30 +62,34 @@ pub enum ExprPlan {
     },
 }
 
-/// Error during binding. Phase 2A.1 (2026-05-12) added `UnresolvedName` for the
-/// new `Expr::NameRef` path. Phase 2A.6 audit M2/M3 added the
-/// `NamedTargetIs{Blank,Error}` variants so previously-silent fallbacks become
-/// loud, distinct errors that the IDE can present accurately.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Error during binding. Phase 2A.1 added `UnresolvedName`; Phase 2A.6 added
+/// `NamedTargetIs{Blank,Error}`; Phase 2A.11 audit M16 switched to
+/// `thiserror::Error` for consistency with the rest of the error surface.
+/// Display strings are now user-facing (suitable for IDE diagnostics).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BindError {
     /// The Expr contains a variant not supported in this build (e.g. RangeRef
     /// outside a Function context, Array literal, Spill anchor, NamedTarget::Range
     /// — all Phase 4+ work).
+    #[error("unsupported expression variant: {0}")]
     UnsupportedVariant(&'static str),
     /// A `NameRef` was used but the name isn't registered in the active `NameTable`.
     /// Phase 2A.1: equivalent to Excel's `#NAME?` but surfaced at bind time rather
     /// than as a runtime Error value, so the IDE can highlight the offending token
     /// before evaluation.
+    #[error("unresolved name {0:?}")]
     UnresolvedName(Arc<str>),
     /// A `NameRef` resolved to a `NamedTarget::Constant(Value::Blank)`. Phase 2A.6
     /// audit M2: previously this was silently coerced to `Text("")`, producing
     /// nonsense in arithmetic contexts. Now surfaced loudly so callers fix the
     /// data binding.
+    #[error("named constant {0:?} is blank; cannot be used in this context")]
     NamedTargetIsBlank(Arc<str>),
     /// A `NameRef` resolved to a `NamedTarget::Constant(Value::Error(_))`. Phase 2A.6
     /// audit M3: previously silently mapped to `UnresolvedName` (wrong error class —
     /// the name IS resolved, just to an error value). Carries the underlying
     /// `ErrorValue` so the IDE can echo `#DIV/0!` / `#REF!` etc. accurately.
+    #[error("named constant {0:?} holds an error value: {1:?}")]
     NamedTargetIsError(Arc<str>, ErrorValue),
 }
 
