@@ -756,8 +756,11 @@ dependencies = [
  "ql-calcgraph",
  "ql-formula-syntax",
  "ql-functions",
+ "ql-io",
  "ql-storage",
  "ql-types",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

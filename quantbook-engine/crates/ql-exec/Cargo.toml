@@ -17,6 +17,7 @@ ql-storage        = { path = "../ql-storage" }
 ql-functions      = { path = "../ql-functions" }
 arrow-array       = { workspace = true }
 multiversion      = { workspace = true }
+thiserror         = { workspace = true }
 # `pulp` is in workspace.dependencies for Phase 4+ kernels that need explicit lane ops
 # (Welford reduction with custom lanes, SUMIF masking). W4 SIMD relies on multiversion
 # attributes + LLVM auto-vectorization — pulp not yet needed. Adding pulp would pull in
@@ -26,6 +27,9 @@ multiversion      = { workspace = true }
 [dev-dependencies]
 proptest  = { workspace = true }
 criterion = { workspace = true }
+tempfile  = { workspace = true }
+# ql-io used by the WorkbookRuntime save-load-recompute E2E test (W5-10).
+ql-io     = { path = "../ql-io" }
 
 # Phase 0 OG-02 hot path bench (Week 4 acceptance run).
 [[bench]]
