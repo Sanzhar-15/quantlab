@@ -1,0 +1,89 @@
+//! The `Op` enum — the engine's mutation vocabulary for the op log.
+//!
+//! Phase 2A.3.a (2026-05-12): minimum producer set covering everything
+//! `WorkbookRuntime` and `WorkbookTransaction` can mutate through their
+//! public API. Future variants (sheet renames, sheet deletes, formatting
+//! changes) land alongside the API additions that produce them.
+//!
+//! Each variant mirrors a `Workbook` mutation method one-to-one:
+//!
+//! | `Op` variant       | Replays to                                       |
+//! |--------------------|--------------------------------------------------|
+//! | `PutValue`         | `Workbook::put_at`                               |
+//! | `PutFormula`       | `Workbook::put_formula`                          |
+//! | `ClearFormula`     | `Workbook::clear_formula`                        |
+//! | `SetName`          | `Workbook::set_name`                             |
+//! | `AddSheet`         | `Workbook::add_sheet_with_chunk_rows`            |
+//! | `BatchCommit`      | (recursive — applies each inner op in order)     |
+//!
+//! ## Wire format choices
+//!
+//! - `Arc<str>` is NOT used in wire fields. `serde` without the `rc`
+//!   feature can't deserialize `Arc<str>` directly. We store `String` on
+//!   the wire and convert at the replay boundary. Cleaner separation: the
+//!   wire format owns its strings; the runtime types share via Arc once
+//!   inside the workbook.
+//! - `ValueWire` and `NamedTargetWire` are reused from
+//!   `ql_io::qbook_format` (Phase 2A.8 shipped them). Sharing the
+//!   serialization vocabulary across the engine's three persistence
+//!   surfaces (qbook envelope, qbook JSONL, op log) prevents wire-format
+//!   drift.
+
+use serde::{Deserialize, Serialize};
+
+use ql_io::{CellWireValue, NamedTargetWire};
+use ql_types::{ColId, RowId, SheetId};
+
+/// A mutation operation recordable in the op log.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "kind")]
+pub enum Op {
+    /// Single literal cell write. Mirrors `WorkbookRuntime::set_value`.
+    PutValue {
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        value: CellWireValue,
+    },
+
+    /// Single formula write (text only — replay re-evaluates via the
+    /// caller's `WorkbookRuntime::recompute_all`, not via replay itself).
+    /// Mirrors `WorkbookRuntime::set_formula` for the persistence side.
+    PutFormula {
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        text: String,
+    },
+
+    /// Remove formula association at a cell (cell becomes literal-only).
+    /// Mirrors `Workbook::clear_formula`.
+    ClearFormula {
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+    },
+
+    /// Register a defined name. Mirrors `Workbook::set_name`. Reserved-name
+    /// refusal propagates at replay time as `ReplayError::NameRejected`.
+    SetName {
+        name: String,
+        target: NamedTargetWire,
+    },
+
+    /// Create a new sheet. Mirrors `Workbook::add_sheet_with_chunk_rows`.
+    /// Sheet IDs are deterministic (the workbook assigns them in append
+    /// order); the producer doesn't pin the ID in the op, since replay
+    /// against an empty workbook produces the same sequence.
+    AddSheet { name: String, chunk_rows: u32 },
+
+    /// One transaction's ops applied atomically at replay time. Produced
+    /// by `WorkbookTransaction::commit` in 2A.3.b. Replay applies each
+    /// inner op in order; on failure, replay reports the inner op's
+    /// index relative to the BatchCommit's parent index. No implicit
+    /// rollback at replay (commits are committed).
+    ///
+    /// Nested BatchCommits are permitted by the schema but produced
+    /// nowhere in production; replay handles them via recursion.
+    BatchCommit { ops: Vec<Op> },
+}

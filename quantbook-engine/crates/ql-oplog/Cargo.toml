@@ -10,3 +10,15 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+# Phase 2A.3.a (2026-05-12): Loro op log scaffolding. Per Round 7 architectural
+# lock T1-D05, Loro is reserved for the op log layer only — no other crate
+# depends on it. CRDT semantics are reserved for Phase 5+ multi-user work;
+# Phase 2A.3 uses Loro as the persistence + future-CRDT-merge substrate.
+ql-types     = { path = "../ql-types" }
+ql-storage   = { path = "../ql-storage" }
+ql-functions = { path = "../ql-functions" }
+ql-io        = { path = "../ql-io" }
+loro         = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }

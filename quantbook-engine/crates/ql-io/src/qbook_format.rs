@@ -92,7 +92,11 @@ pub const WORKBOOK_SCHEMA_VERSION: u32 = 2;
 
 /// The earliest schema version this reader still accepts. v1 fixtures (Phase 1)
 /// continue to load on v2 binaries; older versions would need explicit handling.
-const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
+///
+/// Phase 2A.13 audit cycle-3 LOW-9: now `pub` so external callers (e.g.
+/// `ql-oplog`) can inspect the accepted version range without reaching into
+/// qbook_format internals.
+pub const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
 /// Phase 2A.13 audit cycle-3 H1: sentinel filename written inside every
 /// engine-saved workbook directory. Recovery scanning uses this to
