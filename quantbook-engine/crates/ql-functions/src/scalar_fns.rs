@@ -492,6 +492,371 @@ pub fn ai(_args: &[Value]) -> Value {
     Value::Error(ErrorValue::AINotAvailable)
 }
 
+// ===== Math (Phase 4.3 V1, W5-46, 2026-05-13) =====
+
+/// Helper: read a single numeric arg or short-circuit with an error.
+/// Used by single-arg math functions (EXP, LN, etc.). Blank coerces to 0
+/// per Excel canon for numeric contexts (consistent with binary arithmetic).
+fn one_number(args: &[Value], min_arity: usize, max_arity: usize) -> Result<f64, ErrorValue> {
+    if args.len() < min_arity || args.len() > max_arity {
+        return Err(ErrorValue::Value);
+    }
+    match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => Ok(n),
+        NumericArg::Skip => Ok(0.0),
+        NumericArg::Error(e) => Err(e),
+    }
+}
+
+/// `ROUNDUP(number, digits)` — round AWAY from zero. Excel canon: a value
+/// with absolute value less than `10^-digits` rounds up to the next multiple,
+/// regardless of sign. `ROUNDUP(2.1, 0) = 3`; `ROUNDUP(-2.1, 0) = -3`.
+pub fn roundup(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let value = match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => n,
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    let digits = match coerce_numeric(&args[1]) {
+        NumericArg::Number(n) => n.trunc() as i32,
+        NumericArg::Skip => 0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    let factor = 10f64.powi(digits);
+    let result = (value * factor).abs().ceil() * value.signum() / factor;
+    match coercion::sanitize_f64(result) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `ROUNDDOWN(number, digits)` — round TOWARD zero. Excel canon truncation
+/// at the `digits` decimal place. `ROUNDDOWN(2.9, 0) = 2`;
+/// `ROUNDDOWN(-2.9, 0) = -2`.
+pub fn rounddown(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let value = match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => n,
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    let digits = match coerce_numeric(&args[1]) {
+        NumericArg::Number(n) => n.trunc() as i32,
+        NumericArg::Skip => 0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    let factor = 10f64.powi(digits);
+    let result = (value * factor).abs().floor() * value.signum() / factor;
+    match coercion::sanitize_f64(result) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `TRUNC(number, [digits])` — truncate toward zero. Equivalent to
+/// `ROUNDDOWN`, but the `digits` argument is optional (defaults to 0).
+pub fn trunc(args: &[Value]) -> Value {
+    if args.is_empty() || args.len() > 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let value = match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => n,
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    let digits = if args.len() == 2 {
+        match coerce_numeric(&args[1]) {
+            NumericArg::Number(n) => n.trunc() as i32,
+            NumericArg::Skip => 0,
+            NumericArg::Error(e) => return Value::Error(e),
+        }
+    } else {
+        0
+    };
+    let factor = 10f64.powi(digits);
+    let result = (value * factor).trunc() / factor;
+    match coercion::sanitize_f64(result) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `SIGN(number)` — returns `1` for positive, `-1` for negative, `0` for zero.
+pub fn sign(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let result = if n > 0.0 {
+        1.0
+    } else if n < 0.0 {
+        -1.0
+    } else {
+        0.0
+    };
+    Value::Number(result)
+}
+
+/// `EXP(number)` — `e^number`. `#NUM!` on overflow.
+pub fn exp(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    match coercion::sanitize_f64(n.exp()) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `LN(number)` — natural log. Non-positive argument → `#NUM!`.
+pub fn ln(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    if n <= 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    match coercion::sanitize_f64(n.ln()) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `LOG(number, [base])` — logarithm with optional base (default 10).
+/// Non-positive number or non-positive base or base == 1 → `#NUM!`.
+pub fn log(args: &[Value]) -> Value {
+    if args.is_empty() || args.len() > 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let value = match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => n,
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    if value <= 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let base = if args.len() == 2 {
+        match coerce_numeric(&args[1]) {
+            NumericArg::Number(n) => n,
+            NumericArg::Skip => 0.0,
+            NumericArg::Error(e) => return Value::Error(e),
+        }
+    } else {
+        10.0
+    };
+    if base <= 0.0 || base == 1.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    match coercion::sanitize_f64(value.log(base)) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `LOG10(number)` — base-10 logarithm.
+pub fn log10(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    if n <= 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    match coercion::sanitize_f64(n.log10()) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `PI()` — π constant. No arguments.
+pub fn pi(args: &[Value]) -> Value {
+    if !args.is_empty() {
+        return Value::Error(ErrorValue::Value);
+    }
+    Value::Number(std::f64::consts::PI)
+}
+
+/// `DEGREES(radians)` — radians → degrees.
+pub fn degrees(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    Value::Number(n.to_degrees())
+}
+
+/// `RADIANS(degrees)` — degrees → radians.
+pub fn radians(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    Value::Number(n.to_radians())
+}
+
+// ===== Text (Phase 4.3 V1) =====
+
+/// Helper: coerce a Value to its display string per Excel canon.
+/// Numbers print as their f64 representation; Bool as TRUE/FALSE;
+/// Text passes through; Blank as "" (empty string). Errors propagate.
+fn coerce_text(v: &Value) -> Result<String, ErrorValue> {
+    match v {
+        Value::Error(e) => Err(*e),
+        Value::Text(s) => Ok(s.as_ref().to_owned()),
+        Value::Number(n) => Ok(format_number_for_text(*n)),
+        Value::Boolean(b) => Ok(if *b { "TRUE" } else { "FALSE" }.to_owned()),
+        Value::Blank => Ok(String::new()),
+    }
+}
+
+/// Excel-canon number → text. Integers render without a trailing `.0`;
+/// otherwise the default `f64` Display is good enough for V1. Phase 4.5
+/// (number formats) replaces this with locale-aware formatting.
+fn format_number_for_text(n: f64) -> String {
+    if n == n.trunc() && n.abs() < 1e15 {
+        format!("{}", n as i64)
+    } else {
+        format!("{n}")
+    }
+}
+
+/// `LEN(text)` — character count of the text representation (UTF-8 chars).
+/// Excel treats it as character count, not byte count.
+pub fn len(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let text = match coerce_text(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    Value::Number(text.chars().count() as f64)
+}
+
+/// `UPPER(text)` — ASCII + Unicode uppercase. Excel's localization
+/// (Turkish dotted/dotless I) lands Phase 4.9.
+pub fn upper(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let text = match coerce_text(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    Value::text(text.to_uppercase())
+}
+
+/// `LOWER(text)` — ASCII + Unicode lowercase.
+pub fn lower(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let text = match coerce_text(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    Value::text(text.to_lowercase())
+}
+
+/// `TRIM(text)` — strip leading/trailing whitespace AND collapse internal
+/// runs of multiple spaces to a single space. Excel's canon collapses
+/// only standard space (0x20) runs; we follow that.
+pub fn trim(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let text = match coerce_text(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut prev_space = false;
+    let trimmed = text.trim_matches(' ');
+    for c in trimmed.chars() {
+        if c == ' ' {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    Value::text(out)
+}
+
+// ===== Information (Phase 4.3 V1) =====
+
+/// `ISNUMBER(value)` — TRUE iff value is a Number (not error, not text, etc.).
+pub fn isnumber(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    Value::Boolean(matches!(args[0], Value::Number(_)))
+}
+
+/// `ISTEXT(value)` — TRUE iff value is Text. Blank → FALSE.
+pub fn istext(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    Value::Boolean(matches!(args[0], Value::Text(_)))
+}
+
+/// `ISBLANK(value)` — TRUE iff value is Blank.
+pub fn isblank(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    Value::Boolean(matches!(args[0], Value::Blank))
+}
+
+/// `ISLOGICAL(value)` — TRUE iff value is Bool.
+pub fn islogical(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    Value::Boolean(matches!(args[0], Value::Boolean(_)))
+}
+
+/// `ISERROR(value)` — TRUE iff value is any error. Unlike Excel's ISERR
+/// (which excludes #N/A), ISERROR catches all error variants.
+pub fn iserror(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    Value::Boolean(matches!(args[0], Value::Error(_)))
+}
+
+/// `ISNA(value)` — TRUE iff value is specifically `#N/A`.
+pub fn isna(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    Value::Boolean(matches!(args[0], Value::Error(ErrorValue::NA)))
+}
+
+/// `ISERR(value)` — TRUE iff value is any error EXCEPT `#N/A`.
+pub fn iserr(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    Value::Boolean(match &args[0] {
+        Value::Error(ErrorValue::NA) => false,
+        Value::Error(_) => true,
+        _ => false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,5 +1178,240 @@ mod tests {
         // Args ignored — even arguments with errors don't propagate.
         let args = [Value::text("prompt"), Value::Error(ErrorValue::Ref)];
         assert_eq!(ai(&args), Value::Error(ErrorValue::AINotAvailable));
+    }
+
+    // ===== Phase 4.3 V1 (W5-46) — math + text + info =====
+
+    fn t(s: &str) -> Value {
+        Value::text(s)
+    }
+
+    // ROUNDUP
+
+    #[test]
+    fn roundup_positive_and_negative_round_away_from_zero() {
+        assert_eq!(roundup(&[n(2.1), n(0.0)]), n(3.0));
+        assert_eq!(roundup(&[n(-2.1), n(0.0)]), n(-3.0));
+        assert_eq!(roundup(&[n(1.234), n(2.0)]), n(1.24));
+        assert_eq!(roundup(&[n(1.5), n(-1.0)]), n(10.0));
+    }
+
+    #[test]
+    fn roundup_zero_input_zero_output() {
+        assert_eq!(roundup(&[n(0.0), n(2.0)]), n(0.0));
+    }
+
+    #[test]
+    fn roundup_error_arg_propagates() {
+        assert_eq!(
+            roundup(&[Value::Error(ErrorValue::DivZero), n(0.0)]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn roundup_wrong_arity_is_value_error() {
+        assert_eq!(roundup(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(roundup(&[n(1.0)]), Value::Error(ErrorValue::Value));
+    }
+
+    // ROUNDDOWN
+
+    #[test]
+    fn rounddown_truncates_toward_zero() {
+        assert_eq!(rounddown(&[n(2.9), n(0.0)]), n(2.0));
+        assert_eq!(rounddown(&[n(-2.9), n(0.0)]), n(-2.0));
+        assert_eq!(rounddown(&[n(1.999), n(2.0)]), n(1.99));
+    }
+
+    // TRUNC
+
+    #[test]
+    fn trunc_with_and_without_digits() {
+        assert_eq!(trunc(&[n(2.9)]), n(2.0));
+        assert_eq!(trunc(&[n(-2.9)]), n(-2.0));
+        assert_eq!(trunc(&[n(1.999), n(2.0)]), n(1.99));
+    }
+
+    // SIGN
+
+    #[test]
+    fn sign_basic() {
+        assert_eq!(sign(&[n(5.0)]), n(1.0));
+        assert_eq!(sign(&[n(-5.0)]), n(-1.0));
+        assert_eq!(sign(&[n(0.0)]), n(0.0));
+    }
+
+    // EXP / LN / LOG / LOG10
+
+    #[test]
+    fn exp_and_ln_round_trip() {
+        // exp(ln(x)) ≈ x for positive x.
+        match (ln(&[n(5.0)]), exp(&[n(1.6094379124341003)])) {
+            (Value::Number(a), Value::Number(b)) => {
+                assert!((b - 5.0).abs() < 1e-9);
+                assert!((a - 1.6094379124341003).abs() < 1e-9);
+            }
+            _ => panic!("expected Number"),
+        }
+    }
+
+    #[test]
+    fn ln_non_positive_is_num_error() {
+        assert_eq!(ln(&[n(0.0)]), Value::Error(ErrorValue::Num));
+        assert_eq!(ln(&[n(-1.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn log_default_base_is_ten() {
+        match log(&[n(100.0)]) {
+            Value::Number(n) => assert!((n - 2.0).abs() < 1e-9),
+            _ => panic!("expected Number"),
+        }
+    }
+
+    #[test]
+    fn log_explicit_base() {
+        match log(&[n(8.0), n(2.0)]) {
+            Value::Number(n) => assert!((n - 3.0).abs() < 1e-9),
+            _ => panic!("expected Number"),
+        }
+    }
+
+    #[test]
+    fn log_invalid_inputs() {
+        assert_eq!(log(&[n(-1.0)]), Value::Error(ErrorValue::Num));
+        assert_eq!(log(&[n(10.0), n(1.0)]), Value::Error(ErrorValue::Num));
+        assert_eq!(log(&[n(10.0), n(0.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn log10_basic() {
+        match log10(&[n(1000.0)]) {
+            Value::Number(n) => assert!((n - 3.0).abs() < 1e-9),
+            _ => panic!("expected Number"),
+        }
+    }
+
+    // PI / DEGREES / RADIANS
+
+    #[test]
+    fn pi_constant() {
+        assert_eq!(pi(&[]), Value::Number(std::f64::consts::PI));
+    }
+
+    #[test]
+    fn pi_with_args_is_value_error() {
+        assert_eq!(pi(&[n(1.0)]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn degrees_and_radians_round_trip() {
+        match degrees(&[Value::Number(std::f64::consts::PI)]) {
+            Value::Number(n) => assert!((n - 180.0).abs() < 1e-9),
+            _ => panic!("expected Number"),
+        }
+        match radians(&[n(180.0)]) {
+            Value::Number(n) => assert!((n - std::f64::consts::PI).abs() < 1e-9),
+            _ => panic!("expected Number"),
+        }
+    }
+
+    // LEN / UPPER / LOWER / TRIM
+
+    #[test]
+    fn len_counts_chars_not_bytes() {
+        assert_eq!(len(&[t("hello")]), n(5.0));
+        assert_eq!(len(&[t("")]), n(0.0));
+        // Multi-byte char: é is 1 char, 2 bytes in UTF-8.
+        assert_eq!(len(&[t("café")]), n(4.0));
+    }
+
+    #[test]
+    fn len_coerces_non_text_args() {
+        assert_eq!(len(&[Value::Number(42.0)]), n(2.0));
+        assert_eq!(len(&[Value::Boolean(true)]), n(4.0)); // "TRUE"
+        assert_eq!(len(&[Value::Blank]), n(0.0));
+    }
+
+    #[test]
+    fn upper_lower_basic() {
+        assert_eq!(upper(&[t("Hello")]), t("HELLO"));
+        assert_eq!(lower(&[t("Hello")]), t("hello"));
+        assert_eq!(upper(&[t("café")]), t("CAFÉ"));
+    }
+
+    #[test]
+    fn trim_collapses_internal_space_runs() {
+        assert_eq!(trim(&[t("  hello   world  ")]), t("hello world"));
+        assert_eq!(trim(&[t("abc")]), t("abc"));
+        assert_eq!(trim(&[t("")]), t(""));
+    }
+
+    #[test]
+    fn text_fns_propagate_errors() {
+        for f in [&upper as &dyn Fn(&[Value]) -> Value, &lower, &trim, &len] {
+            assert_eq!(
+                f(&[Value::Error(ErrorValue::Ref)]),
+                Value::Error(ErrorValue::Ref)
+            );
+        }
+    }
+
+    // Information
+
+    #[test]
+    fn isnumber_recognizes_numbers_only() {
+        assert_eq!(isnumber(&[n(1.0)]), Value::Boolean(true));
+        assert_eq!(isnumber(&[t("1")]), Value::Boolean(false));
+        assert_eq!(isnumber(&[Value::Boolean(true)]), Value::Boolean(false));
+        assert_eq!(isnumber(&[Value::Blank]), Value::Boolean(false));
+        assert_eq!(
+            isnumber(&[Value::Error(ErrorValue::Ref)]),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn istext_isblank_islogical() {
+        assert_eq!(istext(&[t("x")]), Value::Boolean(true));
+        assert_eq!(istext(&[n(1.0)]), Value::Boolean(false));
+        assert_eq!(isblank(&[Value::Blank]), Value::Boolean(true));
+        assert_eq!(isblank(&[t("")]), Value::Boolean(false));
+        assert_eq!(islogical(&[Value::Boolean(false)]), Value::Boolean(true));
+        assert_eq!(islogical(&[n(0.0)]), Value::Boolean(false));
+    }
+
+    #[test]
+    fn iserror_catches_all_iserr_excludes_na() {
+        let na = Value::Error(ErrorValue::NA);
+        let div = Value::Error(ErrorValue::DivZero);
+        assert_eq!(iserror(std::slice::from_ref(&na)), Value::Boolean(true));
+        assert_eq!(iserror(std::slice::from_ref(&div)), Value::Boolean(true));
+        assert_eq!(isna(std::slice::from_ref(&na)), Value::Boolean(true));
+        assert_eq!(isna(std::slice::from_ref(&div)), Value::Boolean(false));
+        assert_eq!(iserr(&[div]), Value::Boolean(true));
+        assert_eq!(iserr(&[na]), Value::Boolean(false));
+        assert_eq!(iserr(&[n(1.0)]), Value::Boolean(false));
+    }
+
+    #[test]
+    fn is_fns_arity_check() {
+        // Every IS* function rejects wrong arity with #VALUE!.
+        for f in [
+            &isnumber as &dyn Fn(&[Value]) -> Value,
+            &istext,
+            &isblank,
+            &islogical,
+            &iserror,
+            &isna,
+            &iserr,
+        ] {
+            assert_eq!(f(&[]), Value::Error(ErrorValue::Value));
+            assert_eq!(
+                f(&[Value::Number(1.0), Value::Number(2.0)]),
+                Value::Error(ErrorValue::Value)
+            );
+        }
     }
 }

@@ -124,6 +124,33 @@ pub fn default_registry() -> FunctionRegistry {
     // `scalar_fns::ai` doc.
     r.register("AI", scalar_fns::ai);
 
+    // Engine Phase 4.3 V1 (W5-46, 2026-05-13): function library wave 1
+    // batch — math + text + information. All scalar (per-cell, no
+    // range-arg machinery beyond what 3.6 already provides). Excel-
+    // canon error propagation and coercion.
+    r.register("ROUNDUP", scalar_fns::roundup);
+    r.register("ROUNDDOWN", scalar_fns::rounddown);
+    r.register("TRUNC", scalar_fns::trunc);
+    r.register("SIGN", scalar_fns::sign);
+    r.register("EXP", scalar_fns::exp);
+    r.register("LN", scalar_fns::ln);
+    r.register("LOG", scalar_fns::log);
+    r.register("LOG10", scalar_fns::log10);
+    r.register("PI", scalar_fns::pi);
+    r.register("DEGREES", scalar_fns::degrees);
+    r.register("RADIANS", scalar_fns::radians);
+    r.register("LEN", scalar_fns::len);
+    r.register("UPPER", scalar_fns::upper);
+    r.register("LOWER", scalar_fns::lower);
+    r.register("TRIM", scalar_fns::trim);
+    r.register("ISNUMBER", scalar_fns::isnumber);
+    r.register("ISTEXT", scalar_fns::istext);
+    r.register("ISBLANK", scalar_fns::isblank);
+    r.register("ISLOGICAL", scalar_fns::islogical);
+    r.register("ISERROR", scalar_fns::iserror);
+    r.register("ISNA", scalar_fns::isna);
+    r.register("ISERR", scalar_fns::iserr);
+
     // Engine Phase 3.7 (W5-40, 2026-05-12): volatile functions. The
     // `is_volatile_function` whitelist in `ql-exec::calcgraph_session`
     // already covers these names; this registration is the executable
@@ -151,10 +178,13 @@ mod tests {
     #[test]
     fn default_registry_has_expected_count() {
         let r = default_registry();
-        // 30 entries — 27 distinct functions (22 W4-4 + AI sentinel per
-        // CORR-06 + 4 volatile from Phase 3.7: NOW, TODAY, RAND,
-        // RANDBETWEEN) + 3 aliases (AVG, VAR, STDEV).
-        assert_eq!(r.len(), 30);
+        // 52 entries — Phase 0 W4-4 (22 functions + 3 aliases = 25) +
+        // AI sentinel (1) + Phase 3.7 volatiles (NOW/TODAY/RAND/
+        // RANDBETWEEN = 4) + Phase 4.3 V1 wave 1 (ROUNDUP, ROUNDDOWN,
+        // TRUNC, SIGN, EXP, LN, LOG, LOG10, PI, DEGREES, RADIANS, LEN,
+        // UPPER, LOWER, TRIM, ISNUMBER, ISTEXT, ISBLANK, ISLOGICAL,
+        // ISERROR, ISNA, ISERR = 22).
+        assert_eq!(r.len(), 52);
     }
 
     #[test]

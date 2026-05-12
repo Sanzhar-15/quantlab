@@ -407,11 +407,13 @@ The full v1 means all of these crates either ship real behavior or have a docume
    Shipped baseline: 202 rows (51 ✅ implemented, 13 ⚠️ partial, 1 🔄 reserved, 137 ❌ missing) = **32% coverage**. Phase 4.3 (function library wave 1) will close ~100 more `❌` rows.  
    Effort: 2-3 days (actual: ~0.5 day).
 
-3. **4.3 Function Library Expansion Wave 1 - Core 100**  
+3. **4.3 Function Library Expansion Wave 1 - Core 100** 🔄 IN PROGRESS (V1 batch shipped 2026-05-13, W5-46)  
    Implement high-use math, logical, text, lookup, statistical, date/time, and information functions. Include metadata for volatility, laziness, array behavior, and argument coercion.  
    References: `.references/ironcalc/base/src/functions/mod.rs`; `.references/ironcalc/base/src/functions/math_and_trigonometry/`; `.references/ironcalc/base/src/functions/statistical/`; `.references/formualizer/crates/formualizer-eval/src/function_registry.rs`.  
-   Acceptance: FN4-01 at least 100 total functions implemented; FN4-02 every function has positive, error, coercion, and arity tests; FN4-03 IF/IFERROR lazy eval fixed; FN4-04 matrix updated.  
-   Effort: 2-3 weeks.
+   Acceptance: FN4-01 ⚠️ partial — registry at 52 entries (was 30) after V1 batch; 100 target requires further batches; FN4-02 ✅ V1 batch each has positive + error + coercion + arity tests (~25 new tests); FN4-03 ❌ IF/IFERROR lazy eval still deferred (would need scalar evaluator changes to skip unselected branch); FN4-04 ✅ matrix updated — coverage 32% → 40%.  
+   V1 batch shipped (22 functions): ROUNDUP, ROUNDDOWN, TRUNC, SIGN, EXP, LN, LOG, LOG10, PI, DEGREES, RADIANS, LEN, UPPER, LOWER, TRIM, ISNUMBER, ISTEXT, ISBLANK, ISLOGICAL, ISERROR, ISNA, ISERR. All scalar (per-cell, no range deps beyond what 3.6 already provides). Excel-canon error propagation and coercion.  
+   Remaining to close FN4-01: ~48 more functions across SUMIF/COUNTIF/AVERAGEIF family, LARGE/SMALL/RANK, LEFT/RIGHT/MID/FIND/SEARCH/SUBSTITUTE/REPLACE, ROUND/CEILING/FLOOR family completion, trig (SIN/COS/TAN/ASIN/ACOS/ATAN/ATAN2), CHOOSE/INDEX/MATCH/VLOOKUP/HLOOKUP. FN4-03 (lazy IF/IFERROR) is separable; needs scalar.rs Function-branch refactor to defer arg eval.  
+   Effort: 2-3 weeks (V1 batch: ~0.5 day; remaining: 1-2 weeks).
 
 4. **4.4 Coercion And Error Semantics Matrix**  
    Centralize coercion rules and error precedence. Lock binary op behavior, function argument coercion, blank handling, text-to-number, and date serial behavior.  

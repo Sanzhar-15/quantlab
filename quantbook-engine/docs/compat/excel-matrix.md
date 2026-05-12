@@ -86,19 +86,25 @@ as partial, rows with `❌` are missing.
 | ABS | ✅ | 3+ | 0 | |
 | SQRT | ✅ | 3+ | 0 | Negative → #NUM! |
 | ROUND | ✅ | 5+ | 0 | |
-| ROUNDUP / ROUNDDOWN | ❌ | 0 | 4.3 | |
+| ROUNDUP | ✅ | 4 | 4.3 V1 | Round away from zero; sign-preserving |
+| ROUNDDOWN | ✅ | 1 | 4.3 V1 | Truncate toward zero |
 | MROUND / CEILING / CEILING.MATH / CEILING.PRECISE | ❌ | 0 | 4.3 | |
 | FLOOR / FLOOR.MATH / FLOOR.PRECISE | ❌ | 0 | 4.3 | |
 | INT | ✅ | 3+ | 0 | Truncation toward -∞ |
-| TRUNC | ❌ | 0 | 4.3 | Truncation toward 0 |
+| TRUNC | ✅ | 1 | 4.3 V1 | Truncation toward 0; optional `digits` arg |
 | MOD | ✅ | 3+ | 0 | Excel mod semantics, sign-of-divisor |
 | QUOTIENT | ❌ | 0 | 4.3 | |
 | POWER | ✅ | 5+ | 0 | Same special cases as `^` operator |
-| EXP / LN / LOG / LOG10 | ❌ | 0 | 4.3 | |
+| EXP | ✅ | 1 | 4.3 V1 | `#NUM!` on overflow |
+| LN | ✅ | 2 | 4.3 V1 | Natural log; non-positive → `#NUM!` |
+| LOG | ✅ | 3 | 4.3 V1 | Optional base; base=1 or non-positive → `#NUM!` |
+| LOG10 | ✅ | 1 | 4.3 V1 | Base-10 log; non-positive → `#NUM!` |
 | SIN / COS / TAN / ASIN / ACOS / ATAN / ATAN2 | ❌ | 0 | 4.3 | |
 | SINH / COSH / TANH / ASINH / ACOSH / ATANH | ❌ | 0 | 4.10 | |
-| PI / DEGREES / RADIANS | ❌ | 0 | 4.3 | |
-| SIGN | ❌ | 0 | 4.3 | |
+| PI | ✅ | 2 | 4.3 V1 | Constant; arity check |
+| DEGREES | ✅ | 1 | 4.3 V1 | Radians → degrees |
+| RADIANS | ✅ | 1 | 4.3 V1 | Degrees → radians |
+| SIGN | ✅ | 1 | 4.3 V1 | -1/0/1 |
 | FACT / FACTDOUBLE / COMBIN / COMBINA / PERMUT / PERMUTATIONA | ❌ | 0 | 4.10 | |
 | GCD / LCM | ❌ | 0 | 4.10 | |
 | RAND / RANDBETWEEN | ✅ | 3+ | 3.7 | xorshift64, seeded test fixture |
@@ -112,10 +118,13 @@ as partial, rows with `❌` are missing.
 
 | Function | Status | Tests | Phase | Notes |
 |---|---|---|---|---|
-| LEN | ❌ | 0 | 4.3 | |
+| LEN | ✅ | 2 | 4.3 V1 | Char count (UTF-8 chars, not bytes) |
 | LEFT / RIGHT / MID | ❌ | 0 | 4.3 | |
-| UPPER / LOWER / PROPER | ❌ | 0 | 4.3 | |
-| TRIM / CLEAN | ❌ | 0 | 4.3 | |
+| UPPER | ✅ | 1 | 4.3 V1 | Unicode uppercase (Turkish I edge case → 4.9) |
+| LOWER | ✅ | 1 | 4.3 V1 | Unicode lowercase |
+| PROPER | ❌ | 0 | 4.3 | Title-case |
+| TRIM | ✅ | 1 | 4.3 V1 | Strip + collapse internal space runs |
+| CLEAN | ❌ | 0 | 4.3 | Strip non-printable ASCII |
 | CONCAT / CONCATENATE | ❌ | 0 | 4.3 | The `&` operator works; functions defer |
 | TEXTJOIN | ❌ | 0 | 4.3 | |
 | FIND / SEARCH | ❌ | 0 | 4.3 | Case-sensitive vs not |
@@ -166,8 +175,14 @@ as partial, rows with `❌` are missing.
 
 | Function | Status | Tests | Phase | Notes |
 |---|---|---|---|---|
-| ISNUMBER / ISTEXT / ISBLANK / ISLOGICAL / ISERROR / ISNA | ❌ | 0 | 4.3 | |
-| ISERR / ISFORMULA / ISEVEN / ISODD / ISREF | ❌ | 0 | 4.3 | |
+| ISNUMBER | ✅ | 1 | 4.3 V1 | TRUE iff Value::Number |
+| ISTEXT | ✅ | 1 | 4.3 V1 | TRUE iff Value::Text |
+| ISBLANK | ✅ | 1 | 4.3 V1 | TRUE iff Value::Blank |
+| ISLOGICAL | ✅ | 1 | 4.3 V1 | TRUE iff Value::Boolean |
+| ISERROR | ✅ | 2 | 4.3 V1 | TRUE for ANY error |
+| ISNA | ✅ | 1 | 4.3 V1 | TRUE only for `#N/A` |
+| ISERR | ✅ | 1 | 4.3 V1 | TRUE for errors EXCEPT `#N/A` |
+| ISFORMULA / ISEVEN / ISODD / ISREF | ❌ | 0 | 4.3 | |
 | ISNONTEXT | ❌ | 0 | 4.3 | |
 | TYPE / N | ❌ | 0 | 4.3 | |
 | NA / ERROR.TYPE | ❌ | 0 | 4.3 | |
