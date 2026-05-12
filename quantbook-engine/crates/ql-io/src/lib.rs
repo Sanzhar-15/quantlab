@@ -8,7 +8,7 @@
 pub mod qbook_format;
 
 pub use qbook_format::{
-    error_to_canonical_text, load_workbook, save_workbook, CellRecord, CellWireValue, NamedEntry,
-    NamedTargetWire, NamesSection, QbookError, SheetEnvelope, WorkbookEnvelope,
-    MIN_SUPPORTED_SCHEMA_VERSION, WORKBOOK_SCHEMA_VERSION,
+    error_to_canonical_text, load_workbook, save_workbook, save_workbook_extending, CellRecord,
+    CellWireValue, NamedEntry, NamedTargetWire, NamesSection, QbookError, SheetEnvelope,
+    WorkbookEnvelope, MIN_SUPPORTED_SCHEMA_VERSION, WORKBOOK_SCHEMA_VERSION,
 };

@@ -17,16 +17,22 @@
 //!
 //! ## Scope
 //!
-//! 2A.3.a covers the crate itself + tests. Integration into
-//! `WorkbookRuntime` / `WorkbookTransaction` lands in 2A.3.b; persistence
-//! alongside the `.qbook/` envelope lands in 2A.3.c.
+//! 2A.3.a (2026-05-12) shipped the crate itself + tests. 2A.3.b wired
+//! `WorkbookRuntime` / `WorkbookTransaction` to emit ops. 2A.3.c (this
+//! commit) adds `oplog.bin` persistence alongside the `.qbook/` envelope
+//! via [`persistence::save_workbook_with_oplog`] /
+//! [`persistence::load_workbook_with_oplog`].
 
 pub mod error;
 pub mod log;
 pub mod op;
+pub mod persistence;
 pub mod replay;
 
 pub use error::OpLogError;
 pub use log::OpLog;
 pub use op::Op;
+pub use persistence::{
+    load_workbook_with_oplog, save_workbook_with_oplog, PersistenceError, OPLOG_FILENAME,
+};
 pub use replay::{replay_into, ReplayError};

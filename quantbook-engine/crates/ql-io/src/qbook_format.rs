@@ -498,6 +498,35 @@ fn parse_canonical_error_text(s: &str) -> Option<ErrorValue> {
 /// target, sharing its parent directory. POSIX `rename(2)` is atomic within a
 /// single filesystem; the sibling-only design preserves that property.
 pub fn save_workbook(wb: &Workbook, name: &str, path: &Path) -> Result<(), QbookError> {
+    save_workbook_extending(wb, name, path, |_| Ok(()))
+}
+
+/// Phase 2A.3.c (2026-05-12): closure-based extension primitive. Same atomic-save
+/// protocol as `save_workbook`, with an additional hook (`extend`) that fires
+/// AFTER `write_workbook_to_dir` populates the temp directory but BEFORE the
+/// atomic `rename(temp → target)`. Used by `ql_oplog::save_workbook_with_oplog`
+/// to write `oplog.bin` as a sidecar — it rides the same atomic rename and
+/// recovers via the same crash-rollback path.
+///
+/// The closure receives the temp directory path. It can `fs::write` arbitrary
+/// files into it. The atomic-save invariant still holds: at every step
+/// boundary, at least one of {target, `<target>.bak-<random>`} contains a
+/// complete valid workbook + any sidecars the closure wrote.
+///
+/// Closure failure cleans up the temp directory and propagates the error —
+/// same semantics as a `write_workbook_to_dir` failure.
+///
+/// Public `save_workbook` is a thin wrapper that calls this with a no-op
+/// closure; callers without sidecars should keep using `save_workbook`.
+pub fn save_workbook_extending<F>(
+    wb: &Workbook,
+    name: &str,
+    path: &Path,
+    extend: F,
+) -> Result<(), QbookError>
+where
+    F: FnOnce(&Path) -> Result<(), QbookError>,
+{
     let paths = make_save_paths(path)?;
 
     // Phase 2A.13 audit cycle-3 H5: refuse to save into a path that exists
@@ -523,6 +552,20 @@ pub fn save_workbook(wb: &Workbook, name: &str, path: &Path) -> Result<(), Qbook
             // failure goes to stderr per the M8 audit (don't silence).
             eprintln!(
                 "warning: failed to clean partial temp directory {:?} after save error: {cleanup_err}",
+                paths.temp
+            );
+        }
+        return Err(e);
+    }
+
+    // Phase 2A.3.c: extension hook fires after the engine has finished
+    // populating the temp dir (envelope + sheets + marker), but before the
+    // atomic rename. Sidecars written here become part of the all-or-nothing
+    // visibility guarantee.
+    if let Err(e) = extend(&paths.temp) {
+        if let Err(cleanup_err) = fs::remove_dir_all(&paths.temp) {
+            eprintln!(
+                "warning: failed to clean partial temp directory {:?} after extend error: {cleanup_err}",
                 paths.temp
             );
         }
@@ -2217,5 +2260,72 @@ col_extent = 0
             assert_eq!(loaded.read(Address::new(0, 0, 0)), Value::Number(200.0));
             assert!(!paths.backup.exists(), "orphan .bak should be removed");
         }
+    }
+
+    // ===== Phase 2A.3.c — save_workbook_extending =====
+
+    #[test]
+    fn save_workbook_extending_writes_sidecar_into_target() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sidecar.qbook");
+        let wb = wb_with("S", &[cell(0, 0, Value::Number(7.0))]);
+
+        save_workbook_extending(&wb, "sidecar", &path, |temp_dir| {
+            fs::write(temp_dir.join("custom.bin"), b"hello").map_err(QbookError::Io)
+        })
+        .unwrap();
+
+        // The workbook persisted normally.
+        let loaded = load_workbook(&path).unwrap();
+        assert_eq!(loaded.read(Address::new(0, 0, 0)), Value::Number(7.0));
+        // And the sidecar moved with the atomic rename.
+        assert!(path.join("custom.bin").is_file());
+        assert_eq!(fs::read(path.join("custom.bin")).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn save_workbook_extending_closure_failure_cleans_temp_and_preserves_target() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("closure-fail.qbook");
+        // Seed with an initial workbook so we can verify the failed save
+        // doesn't perturb it.
+        let original = wb_with("S", &[cell(0, 0, Value::Number(100.0))]);
+        save_workbook(&original, "v1", &path).unwrap();
+
+        // Attempt a save_workbook_extending where the closure fails. The
+        // protocol should clean up the temp dir and leave the target
+        // unchanged.
+        let new_wb = wb_with("S", &[cell(0, 0, Value::Number(200.0))]);
+        let result = save_workbook_extending(&new_wb, "v2", &path, |_| {
+            Err(QbookError::InvalidPath {
+                path: PathBuf::from("/synthetic"),
+                reason: "synthetic-closure-failure",
+            })
+        });
+        assert!(
+            matches!(
+                result,
+                Err(QbookError::InvalidPath {
+                    reason: "synthetic-closure-failure",
+                    ..
+                })
+            ),
+            "expected synthetic closure-failure error, got {result:?}"
+        );
+
+        // Original target still has v1 values.
+        let loaded = load_workbook(&path).unwrap();
+        assert_eq!(loaded.read(Address::new(0, 0, 0)), Value::Number(100.0));
+        // No orphan temp dir lingering. The temp suffix is random per call,
+        // so glob the parent for .tmp-save-* directories — none should match.
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-save-"))
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "expected no .tmp-save-* orphans, got {entries:?}"
+        );
     }
 }

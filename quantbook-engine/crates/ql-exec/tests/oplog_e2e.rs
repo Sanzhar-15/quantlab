@@ -280,6 +280,68 @@ fn replayed_workbook_supports_load_recompute_convenience() {
     assert_eq!(reloaded.read(Address::new(0, 0, 1)), Value::Number(111.0));
 }
 
+/// Phase 2A.3.c full-stack persistence round-trip: producer (real runtime)
+/// → save_workbook_with_oplog → load_workbook_with_oplog → replay → recompute
+/// yields a workbook observationally equal to the producer's final state.
+#[test]
+fn producer_save_load_replay_recompute_round_trip_yields_equivalent_workbook() {
+    use ql_oplog::{load_workbook_with_oplog, save_workbook_with_oplog};
+    use tempfile::TempDir;
+
+    // ===== Produce =====
+    let mut producer_wb = fresh_wb();
+    let reg = default_registry();
+    let mut producer_oplog = OpLog::new();
+    {
+        let mut rt = WorkbookRuntime::with_oplog(&mut producer_wb, &reg, &mut producer_oplog);
+        rt.set_value(0, 0, 0, Value::Number(3.0)).unwrap();
+        rt.set_value(0, 0, 1, Value::Number(4.0)).unwrap();
+        rt.set_formula(0, 0, 2, "A1 + B1").unwrap();
+        rt.set_formula(0, 0, 3, "A1 * B1").unwrap();
+        // Overwrite to exercise PutValue + ClearFormula.
+        rt.set_value(0, 0, 3, Value::Number(99.0)).unwrap();
+    }
+
+    // ===== Save both =====
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("e2e.qbook");
+    save_workbook_with_oplog(&producer_wb, &producer_oplog, "e2e", &path).unwrap();
+
+    // ===== Load both =====
+    let (_loaded_wb, loaded_oplog) = load_workbook_with_oplog(&path).unwrap();
+    assert_eq!(
+        loaded_oplog.len(),
+        producer_oplog.len(),
+        "oplog op count mismatch after save/load"
+    );
+
+    // ===== Replay against fresh workbook + recompute =====
+    let mut replay_wb = fresh_wb();
+    replay_into(&loaded_oplog, &mut replay_wb, &reg).unwrap();
+    {
+        let mut rt = WorkbookRuntime::new(&mut replay_wb, &reg);
+        rt.recompute_all().unwrap();
+    }
+
+    // ===== Equivalence =====
+    assert_workbooks_observationally_equal(&producer_wb, &replay_wb);
+
+    // And the loaded workbook ALONE (without replay) matches the producer —
+    // it was saved with the materialized values intact.
+    let (loaded_wb_alone, _) = load_workbook_with_oplog(&path).unwrap();
+    // After load_workbook, formula values are Pending (Blank) — the
+    // loaded workbook has the formula TEXT and the SAVED value. The saved
+    // value was the producer's evaluated result, so it should still match.
+    assert_eq!(
+        loaded_wb_alone.read(Address::new(0, 0, 2)),
+        Value::Number(7.0)
+    );
+    assert_eq!(
+        loaded_wb_alone.read(Address::new(0, 0, 3)),
+        Value::Number(99.0)
+    );
+}
+
 /// Sanity check: ensure `WorkbookTransaction::with_oplog` standalone (no
 /// enclosing runtime) also produces valid ops.
 #[test]

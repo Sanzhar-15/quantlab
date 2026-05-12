@@ -22,3 +22,7 @@ loro         = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 thiserror    = { workspace = true }
+
+[dev-dependencies]
+# Phase 2A.3.c: persistence round-trip tests need temp dirs.
+tempfile = { workspace = true }
