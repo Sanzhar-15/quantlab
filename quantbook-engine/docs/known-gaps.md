@@ -130,8 +130,8 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 |---|---|---|---|---|
 | GAP-D-01 | Phase 2 docs had STALE wording about 2A.3 being deferred — banner-patched but not rewritten | `docs/phase2/{entry-plan,exit-packet}.md` banners | Engine | Closed as banner; full rewrite if needed in Engine Phase 2B exit |
 | GAP-D-02 | Phase 3 / 4 / 5 / 6 / 7 `entry-plan.md` and `exit-packet.md` don't exist yet | Files absent under `docs/phase{3,4,5,6,7}/` | Engine | Created per phase as work begins |
-| GAP-D-03 | No `docs/architecture/` directory; calcgraph-runtime, parser-and-semantics, collaboration-crdt all referenced in MASTER-PLAN.md but don't exist | Files absent | Engine | Each created when its phase begins |
-| GAP-D-04 | Excel compatibility matrix (`docs/compat/excel-matrix.md`) doesn't exist | File absent | Engine | Engine Phase 4.2 |
+| ~~GAP-D-03~~ | ~~No `docs/architecture/` directory~~ — **CLOSED** in Engine Phase 3.1+3.10. `docs/architecture/calcgraph-runtime.md` exists; parser-and-semantics and collaboration-crdt docs deferred to Phase 5 entry (their phases haven't started). |
+| ~~GAP-D-04~~ | ~~Excel compatibility matrix (`docs/compat/excel-matrix.md`) doesn't exist~~ — **CLOSED** in Engine Phase 4.2 (W5-45). 217-row matrix + `scripts/report-compat-coverage.sh` CI reporter. |
 | GAP-D-05 | Legal / provenance notes for adopted reference patterns not collected | `docs/legal/` absent | Engine | Engine Phase 7 ship prep |
 
 ## Closed gaps
@@ -145,6 +145,9 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 - **GAP-B-01** (named-range aggregate eval returned `#CALC!`) — fully closed in Engine Phase 3.6 (W5-39): the scalar evaluator now computes the real aggregate for SUM/AVERAGE/MIN/MAX/COUNT/PRODUCT over a single named-range arg + caches the result on `CalcgraphSession`.
 - **GAP-R-04** (volatile function invalidation) — closed in Engine Phase 3.7 (W5-40): `mark_volatile_dirty` fans out volatile cells + downstream chain; NOW/TODAY/RAND/RANDBETWEEN registered; deterministic test RNG via `set_test_rng_seed`.
 - **GAP-R-05** (value-equality short-circuit) — closed in Engine Phase 3.8 (W5-41): `recompute_dirty` skips formulas whose direct cell deps stayed at their prior values. `RecomputeResult.skipped_value_equality` exposes the count.
+- **GAP-D-03** (no `docs/architecture/` directory) — closed in Engine Phase 3.1 + 3.10 (W5-34, W5-43): `docs/architecture/calcgraph-runtime.md` exists with full Phase 3.x rewrite.
+- **GAP-D-04** (Excel compatibility matrix file absent) — closed in Engine Phase 4.2 (W5-45): `docs/compat/excel-matrix.md` ships with 217 rows + `scripts/report-compat-coverage.sh` CI reporter.
+- **Phase 3 megaudit H2** (`on_set_name` not transitive) — closed in 3.10 audit-closure commit (W5-43): BFS-fanout fix + regression test `h2_set_name_propagates_dirty_transitively`.
 - **Phase 2B.7 audit-closure fixes** (correctness): orphan op-log entries on `add_sheet`(chunk_rows=0 / SheetId::MAX), `set_name` mutate-first divergence, `set_value` / `clear_formula` partial-pair non-atomicity, `transaction::commit` post-mutation log append. All fixed. `Workbook` and `OpLog` proven `Send + Sync` at compile time. See `docs/audits/2026-05-12-phase-2B.md`.
 
 ---

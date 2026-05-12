@@ -227,10 +227,11 @@ The full v1 means all of these crates either ship real behavior or have a docume
 
 **Sub-items**
 
-1. **3.1 Calcgraph Runtime Ownership Model**  
+1. **3.1 Calcgraph Runtime Ownership Model** ✅ SHIPPED 2026-05-12 (W5-34)  
    Decide where graph state lives: likely inside `WorkbookRuntime` session state with persistable rebuild from workbook formulas, not inside `Workbook` storage alone. Define rebuild, mutation, and snapshot APIs.  
    References: `.references/formualizer/crates/formualizer-eval/src/engine/graph/mod.rs`; `.references/formualizer/crates/formualizer-eval/src/engine/vertex_store.rs`; `.references/hyperformula/src/DependencyGraph/DependencyGraph.ts`.  
-   Acceptance: G3-01 graph can rebuild from workbook deterministically; G3-02 graph mutation API covers set value, set formula, clear formula, set name, add sheet; G3-03 no petgraph hot-path dependency.  
+   Acceptance: G3-01 ✅ graph rebuilds deterministically (`rebuild_is_deterministic_across_runs`); G3-02 ✅ 5-hook mutation API (`on_set_value`, `on_set_formula`, `on_clear_formula`, `on_set_name`, `on_add_sheet`); G3-03 ✅ no petgraph hot-path dep — Phase 0 W3-1 hand-rolled `Graph` per Round 7 T1-D02 lock.  
+   Shipped: `CalcgraphSession` ownership shell at `crates/ql-exec/src/calcgraph_session.rs`; constructor variants (`new`, `with_oplog`, `with_graph`, `with_oplog_and_graph`); 11 unit tests + 4 wiring tests in `workbook_runtime.rs`. Future Phase 6.1 `WorkbookSession` will absorb Workbook + OpLog + CalcgraphSession + PlanCache + FunctionRegistry into one owning struct (GAP-PS-09).  
    Effort: 3-4 days.
 
 2. **3.2 Dependency Extraction From Bound Plans** ✅ SHIPPED 2026-05-12 (W5-35)  
