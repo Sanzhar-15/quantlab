@@ -41,6 +41,7 @@
 //!   `LoadAndRecomputeError` wrapper enum; recompute failures are now
 //!   aggregated into the returned `RecomputeResult` instead.
 
+pub mod calcgraph_session;
 pub mod env;
 pub mod loader;
 pub mod lower;
@@ -51,6 +52,7 @@ pub mod simd;
 pub mod transaction;
 pub mod workbook_runtime;
 
+pub use calcgraph_session::{CalcgraphSession, HookCounts, RebuildError};
 pub use env::{CellEnv, MapEnv, WorkbookEnv};
 pub use loader::load_workbook_and_recompute;
 pub use lower::{classify, dispatch, SimdShape};

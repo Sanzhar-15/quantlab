@@ -268,6 +268,13 @@ pub struct WorkbookRuntime<'a> {
     /// for unchanged formula text under the same NameTable generation.
     /// See `crate::plan_cache` module docs for the invalidation contract.
     plan_cache: PlanCache,
+    /// Phase 3.1 (2026-05-12) optional calcgraph session. When `Some`,
+    /// every mutation method calls the corresponding hook on the
+    /// session AFTER the workbook mutation succeeds. Phase 3.1 hooks
+    /// are stubs (counter bumps + cell-index updates); Phase 3.3 wires
+    /// dirty propagation through the same surface. See
+    /// `crate::calcgraph_session` module docs for the ownership model.
+    graph: Option<&'a mut crate::CalcgraphSession>,
 }
 
 impl<'a> WorkbookRuntime<'a> {
@@ -277,6 +284,7 @@ impl<'a> WorkbookRuntime<'a> {
             registry,
             oplog: None,
             plan_cache: PlanCache::new(),
+            graph: None,
         }
     }
 
@@ -299,6 +307,49 @@ impl<'a> WorkbookRuntime<'a> {
             registry,
             oplog: Some(oplog),
             plan_cache: PlanCache::new(),
+            graph: None,
+        }
+    }
+
+    /// Phase 3.1 (2026-05-12): construct a runtime that fires calcgraph
+    /// mutation hooks on every producer method. Phase 3.1 hooks are
+    /// stubs (counter bumps + cell-index updates) — they accumulate
+    /// state that Phase 3.3 will turn into real dirty propagation and
+    /// edge updates. Today's recompute_all still walks formulas in
+    /// HashMap order; Phase 3.4 replaces it with a Tarjan-SCC-scheduled
+    /// graph walk.
+    pub fn with_graph(
+        workbook: &'a mut Workbook,
+        registry: &'a FunctionRegistry,
+        graph: &'a mut crate::CalcgraphSession,
+    ) -> Self {
+        Self {
+            workbook,
+            registry,
+            oplog: None,
+            plan_cache: PlanCache::new(),
+            graph: Some(graph),
+        }
+    }
+
+    /// Phase 3.1 (2026-05-12): construct a runtime with BOTH an attached
+    /// op log and an attached calcgraph session. The combined-attachment
+    /// constructor mirrors the IDE pattern (open file → load oplog +
+    /// rebuild graph → hand both to the runtime per edit). Order of
+    /// operations per mutation: lex+parse+bind → op-log append → workbook
+    /// mutation → graph hook.
+    pub fn with_oplog_and_graph(
+        workbook: &'a mut Workbook,
+        registry: &'a FunctionRegistry,
+        oplog: &'a mut OpLog,
+        graph: &'a mut crate::CalcgraphSession,
+    ) -> Self {
+        Self {
+            workbook,
+            registry,
+            oplog: Some(oplog),
+            plan_cache: PlanCache::new(),
+            graph: Some(graph),
         }
     }
 
@@ -379,7 +430,16 @@ impl<'a> WorkbookRuntime<'a> {
         // is at the runtime entry, the binder just stamps `owning_sheet`
         // onto unresolved CellRefs. (Phase 2B.7 audit doc D6 fix.)
         self.workbook.put_at(sheet, row, col, value.clone());
+        let text_for_hook = Arc::clone(&formula_text);
         self.workbook.put_formula(sheet, row, col, formula_text);
+
+        // Phase 3.1: notify calcgraph after the workbook mutation
+        // succeeds. Hook is a counter-bump + cell-index update today
+        // (Phase 3.2 extracts dependencies; Phase 3.3 wires dirty
+        // propagation).
+        if let Some(g) = self.graph.as_deref_mut() {
+            g.on_set_formula(sheet, row, col, text_for_hook.as_ref());
+        }
 
         Ok(value)
     }
@@ -433,6 +493,18 @@ impl<'a> WorkbookRuntime<'a> {
 
         self.workbook.put_at(sheet, row, col, value);
         self.workbook.clear_formula(sheet, row, col);
+
+        // Phase 3.1: notify calcgraph. `set_value` always fires
+        // `on_set_value`; if the cell had a formula that we just cleared,
+        // also fires `on_clear_formula` so the graph can detach old deps
+        // when Phase 3.3 wires that path.
+        if let Some(g) = self.graph.as_deref_mut() {
+            g.on_set_value(sheet, row, col);
+            if had_formula {
+                g.on_clear_formula(sheet, row, col);
+            }
+        }
+
         Ok(())
     }
 
@@ -480,6 +552,13 @@ impl<'a> WorkbookRuntime<'a> {
         // NameTableError variants; expect them to be pre-checkable via
         // `would_accept`.
         self.workbook.set_name(name, target)?;
+
+        // Phase 3.1: notify calcgraph. Today a counter-bump; Phase 3.3
+        // will mark all formulas containing this name dirty.
+        if let Some(g) = self.graph.as_deref_mut() {
+            g.on_set_name(name);
+        }
+
         Ok(())
     }
 
@@ -521,7 +600,16 @@ impl<'a> WorkbookRuntime<'a> {
                 chunk_rows,
             })?;
         }
-        Ok(self.workbook.add_sheet_with_chunk_rows(name, chunk_rows))
+        let new_id = self.workbook.add_sheet_with_chunk_rows(name, chunk_rows);
+
+        // Phase 3.1: notify calcgraph. Today a counter-bump; Phase 4.6
+        // will use this to track per-sheet structure generations for
+        // cross-sheet reference invalidation.
+        if let Some(g) = self.graph.as_deref_mut() {
+            g.on_add_sheet(new_id);
+        }
+
+        Ok(new_id)
     }
 
     /// Phase 2B.5 (2026-05-12): clear a cell's formula association through
@@ -578,6 +666,14 @@ impl<'a> WorkbookRuntime<'a> {
             }
         }
         self.workbook.clear_formula(sheet, row, col);
+
+        // Phase 3.1: notify calcgraph. Phase 3.3 will detach the
+        // cleared cell's outgoing edges (its old dependencies no
+        // longer apply).
+        if let Some(g) = self.graph.as_deref_mut() {
+            g.on_clear_formula(sheet, row, col);
+        }
+
         Ok(())
     }
 
@@ -2458,5 +2554,127 @@ mod tests {
             replay_wb.read(ql_types::Address::new(0, 0, 2)),
             Value::Number(999.0)
         );
+    }
+
+    // ===== Phase 3.1 — calcgraph runtime integration =====
+
+    /// G3-02 / hook-coverage test: each runtime mutation calls the
+    /// corresponding calcgraph hook. Attach a `CalcgraphSession`, drive
+    /// the runtime through all 5 mutation kinds, verify counters.
+    #[test]
+    fn runtime_mutations_fire_calcgraph_hooks() {
+        use crate::CalcgraphSession;
+        use ql_storage::NamedTarget;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            // set_value on a blank cell → on_set_value, NOT on_clear_formula
+            rt.set_value(0, 0, 0, Value::Number(10.0)).unwrap();
+            // set_formula → on_set_formula
+            rt.set_formula(0, 1, 0, "A1 + 1").unwrap();
+            // set_value over the formula → on_set_value + on_clear_formula
+            rt.set_value(0, 1, 0, Value::Number(99.0)).unwrap();
+            // clear_formula on a non-formula cell → on_clear_formula is
+            // NOT called (no-op exit). Verified by counter staying flat.
+            rt.clear_formula(0, 5, 5).unwrap();
+            // set_formula + clear_formula → on_set_formula + on_clear_formula
+            rt.set_formula(0, 2, 0, "A1 * 3").unwrap();
+            rt.clear_formula(0, 2, 0).unwrap();
+            // set_name → on_set_name
+            rt.set_name("Rate", NamedTarget::Constant(Value::Number(0.5)))
+                .unwrap();
+            // add_sheet → on_add_sheet
+            let _new_id = rt.add_sheet("S2", 16_384).unwrap();
+        }
+        let counts = graph.hook_counts();
+        assert_eq!(counts.set_value, 2, "set_value fired twice");
+        assert_eq!(counts.set_formula, 2, "set_formula fired twice");
+        // clear_formula fires: once from set_value-over-formula, once
+        // from explicit clear_formula on the formula at (2, 0). The
+        // no-op clear at (5, 5) does NOT increment because
+        // `clear_formula` short-circuits on `!had_formula` before
+        // calling the hook.
+        assert_eq!(counts.clear_formula, 2);
+        assert_eq!(counts.set_name, 1);
+        assert_eq!(counts.add_sheet, 1);
+    }
+
+    /// G3-01 + integration: rebuild a graph from an existing workbook,
+    /// then continue editing through the runtime — new mutations
+    /// register on the same graph, and the cell index reflects every
+    /// formula cell.
+    #[test]
+    fn rebuild_then_edit_keeps_cell_index_in_sync() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        // Seed with two formulas BEFORE attaching the graph.
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.set_value(0, 0, 0, Value::Number(10.0)).unwrap();
+            rt.set_formula(0, 1, 0, "A1 + 1").unwrap();
+            rt.set_formula(0, 2, 0, "A1 * 2").unwrap();
+        }
+
+        // Now rebuild a session from the workbook.
+        let mut graph = CalcgraphSession::rebuild_from_workbook(&wb).unwrap();
+        assert_eq!(
+            graph.graph().node_count(),
+            2,
+            "rebuild creates one node per existing formula"
+        );
+        assert!(graph.cell_node_for(0, 1, 0).is_some());
+        assert!(graph.cell_node_for(0, 2, 0).is_some());
+
+        // Attach to the runtime and add a third formula. The graph
+        // sees the new node.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 3, 0, "A1 - 5").unwrap();
+        }
+        assert_eq!(graph.graph().node_count(), 3);
+        assert!(graph.cell_node_for(0, 3, 0).is_some());
+    }
+
+    /// Without an attached graph, the runtime behaves identically to
+    /// pre-3.1. Regression guard.
+    #[test]
+    fn runtime_without_graph_works_as_before() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_value(0, 0, 0, Value::Number(7.0)).unwrap();
+        let v = rt.set_formula(0, 1, 0, "A1 * 2").unwrap();
+        assert_eq!(v, Value::Number(14.0));
+        rt.clear_formula(0, 1, 0).unwrap();
+    }
+
+    /// Combined `with_oplog_and_graph` constructor: both op log AND
+    /// graph receive their respective updates.
+    #[test]
+    fn runtime_with_oplog_and_graph_drives_both() {
+        use crate::CalcgraphSession;
+        use ql_oplog::{Op, OpLog};
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt =
+                WorkbookRuntime::with_oplog_and_graph(&mut wb, &reg, &mut oplog, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(5.0)).unwrap();
+            rt.set_formula(0, 1, 0, "A1 + 1").unwrap();
+        }
+        // Op log captured both ops.
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0], Op::PutValue { .. }));
+        assert!(matches!(ops[1], Op::PutFormula { .. }));
+        // Graph saw both hooks.
+        let counts = graph.hook_counts();
+        assert_eq!(counts.set_value, 1);
+        assert_eq!(counts.set_formula, 1);
     }
 }
