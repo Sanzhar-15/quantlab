@@ -15,6 +15,11 @@ ql-formula-syntax = { path = "../ql-formula-syntax" }
 ql-calcgraph      = { path = "../ql-calcgraph" }
 ql-storage        = { path = "../ql-storage" }
 ql-functions      = { path = "../ql-functions" }
+# Phase 2A.4 (2026-05-12): promoted from dev-dependency. `loader.rs` needs
+# `ql_io::load_workbook` at runtime for the `load_workbook_and_recompute`
+# convenience. No new transitive risk — ql-io was already linked through
+# dev-deps in the same crate.
+ql-io             = { path = "../ql-io" }
 arrow-array       = { workspace = true }
 multiversion      = { workspace = true }
 thiserror         = { workspace = true }
@@ -28,8 +33,6 @@ thiserror         = { workspace = true }
 proptest  = { workspace = true }
 criterion = { workspace = true }
 tempfile  = { workspace = true }
-# ql-io used by the WorkbookRuntime save-load-recompute E2E test (W5-10).
-ql-io     = { path = "../ql-io" }
 
 # Phase 0 OG-02 hot path bench (Week 4 acceptance run).
 [[bench]]

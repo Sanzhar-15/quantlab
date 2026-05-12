@@ -160,18 +160,27 @@ impl<'a> WorkbookTransaction<'a> {
 
 **This is a deep dive.** Phase 5 will lift it to multi-user. Phase 2A.3 establishes the op grammar.
 
-### Phase 2A.4 — Convenience: `load_workbook_and_recompute` (~0.5 day)
+### Phase 2A.4 — Convenience: `load_workbook_and_recompute` ✅ DONE (2026-05-12)
 
-**Why:** the current load path leaves formula cells with sentinel values. Callers must call `recompute_all` to refresh. The convenience wraps both:
+**Shipped** in `quantbook-engine/crates/ql-exec/src/loader.rs`. New module + free function:
 
 ```rust
 pub fn load_workbook_and_recompute(
     path: &Path,
     registry: &FunctionRegistry,
-) -> Result<Workbook, LoadOrRuntimeError>;
+) -> Result<Workbook, LoadAndRecomputeError>;
+
+pub enum LoadAndRecomputeError {
+    Load(QbookError),
+    Recompute(RuntimeError),
+}
 ```
 
-Plus a unified error type. Small but eliminates a footgun.
+Promoted ql-io from dev-dependency to regular dependency of ql-exec (loader.rs uses `ql_io::load_workbook` at runtime). Re-exported from `ql-exec::lib`.
+
+**Tests** (6 in `loader::tests`): formula refresh against stale-on-disk values, formula-free workbook, missing-path load error, empty workbook, multiple formulas all recomputed, named-range round-trip pins the persistence gap (`.qbook` doesn't yet serialize `NameTable`; load surfaces `Recompute(UnresolvedName)` — flagged for Phase 2B+).
+
+**Surfaced gap (not fixed here):** named-range definitions don't persist through `save_workbook` / `load_workbook` — the on-disk schema has no NameTable section. Test `named_range_formula_round_trips_through_load_and_recompute` pins this; fix lives in `ql-io::qbook_format` (Phase 2B+).
 
 ### Phase 2A.5 — Lexer dotted identifiers (`VAR.S`, `STDEV.P`) (~0.5 day)
 
