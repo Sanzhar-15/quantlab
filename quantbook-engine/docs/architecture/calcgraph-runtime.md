@@ -1,8 +1,8 @@
 # Calcgraph ↔ runtime integration
 
-**Status:** Engine Phase 3.4 SHIPPED (W5-37, 2026-05-12) — Tarjan SCC scheduler + `recompute_dirty` live  
-**Date:** 2026-05-12 (last touched for 3.4 close-out)  
-**Stability:** **STABLE** API surface; **3.5–3.10 will fill in the overlay / aggregate cache / volatile invalidation / etc.** but the 5-hook signature + `dirty_formulas` / `take_dirty` view + `schedule_dirty()` / `recompute_dirty()` entry points are the contract.
+**Status:** Engine Phase 3 SHIPPED (megaudit-closed W5-43, 2026-05-12). All 10 sub-items (3.1–3.10) landed in 10 commits. Phase 3 megaudit findings + closure decisions live at `docs/audits/2026-05-12-phase-3-megaudit.md`.  
+**Date:** 2026-05-12 (last touched for 3.10 megaudit close).  
+**Stability:** **STABLE** for the documented surface. The 5-hook signature, `dirty_formulas` / `take_dirty` view, `schedule_dirty()` / `recompute_dirty()` entry points, computed-overlay routing, aggregate cache, volatile invalidation tick, and value-equality short-circuit are all contract. Known gaps (range-as-scheduler-edge, append-only-graph rebind staleness) are filed as GAP-G-01 / GAP-G-03 and deferred to Phase 4 — they need delta-edge graph storage or per-formula revocation API, not safe to half-bake at Phase 3 close.
 
 This document describes how `ql-calcgraph::Graph` integrates with `ql_exec::WorkbookRuntime`. Engine Phase 3 (the "One Engine" integration phase) closes the gap between the Phase 0 calcgraph (`ql-calcgraph`, built for the bench / A4/A5 acceptance) and the runtime that's been used since Phase 1 W5-10 (`WorkbookRuntime`, currently HashMap-order recompute with no graph awareness).
 

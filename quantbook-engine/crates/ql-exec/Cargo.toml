@@ -55,3 +55,11 @@ harness = false
 [[bench]]
 name = "og02_chunk_sweep"
 harness = false
+
+# Phase 3.10 megaudit A3-03: 10k-formula dirty recompute benchmark.
+# Cold edit + idempotent edit (the latter measures the Phase 3.8 VEQ
+# short-circuit gain). Regression detection — guards against future
+# changes that re-introduce O(n) eval on idempotent edits.
+[[bench]]
+name = "a3_10k_dirty_recompute"
+harness = false

@@ -725,12 +725,14 @@ impl CalcgraphSession {
     /// `ExprPlan::AggregateNameRef` — see GAP-R-07 for the scalar-
     /// NameRef precision gap (PlanCache `name_gen` still covers
     /// correctness; per-name precision is the open follow-up).
+    ///
+    /// Phase 3.10 megaudit H2 (2026-05-12): the prior implementation
+    /// only marked DIRECT name-referencing formulas dirty, leaving
+    /// downstream-of-downstream stale. Fixed: each directly-affected
+    /// formula now seeds a `mark_dirty_from_cell_write` BFS at its
+    /// own cell address, fanning out the same way cell writes do.
     pub fn on_set_name(&mut self, name: &str) {
         self.hook_counts.set_name = self.hook_counts.set_name.saturating_add(1);
-        // Case-insensitive lookup matches `formulas_referencing_name`
-        // canonicalization (NameTable + the dep walker both store
-        // uppercase). Snapshot the set into a local Vec to avoid a
-        // double-mut borrow on `self`.
         let upper = name.to_ascii_uppercase();
         let dependents: Vec<NodeId> = self
             .name_to_formulas
@@ -739,6 +741,15 @@ impl CalcgraphSession {
             .unwrap_or_default();
         for n in dependents {
             self.dirty.insert(n);
+            // Phase 3.10 H2 fix: transitive fanout. Whatever depends on
+            // this name-referencing formula must also recompute when
+            // the name's target changes, just like for a direct cell
+            // edit. mark_dirty_from_cell_write does the BFS via the
+            // reverse-dep + stripe path so any chain or range dep is
+            // reached.
+            if let Some((s, r, c)) = self.cell_address_for(n) {
+                self.mark_dirty_from_cell_write(s, r, c);
+            }
         }
     }
 
@@ -1373,6 +1384,51 @@ mod tests {
                     | RuntimeError::Lex(_)
             ),
             "unexpected error class for (0,0,2): {bad2:?}"
+        );
+    }
+
+    /// Phase 3.10 megaudit H2 regression: `on_set_name` must propagate
+    /// dirty TRANSITIVELY. A chain `Sales → B1 = SUM(Sales) → C1 = B1+1`:
+    /// editing Sales must dirty BOTH B1 and C1, so a subsequent
+    /// `recompute_dirty` updates C1's value too.
+    #[test]
+    fn h2_set_name_propagates_dirty_transitively() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        for r in 0..3u32 {
+            wb.put_at(0, r, 0, Value::Number((r + 1) as f64));
+        }
+        wb.set_name(
+            "Sales",
+            ql_storage::NamedTarget::Range(Range {
+                sheet: 0,
+                start_row: 0,
+                end_row: 2,
+                start_col: 0,
+                end_col: 0,
+            }),
+        )
+        .unwrap();
+        wb.put_at(0, 0, 1, Value::Blank);
+        wb.put_at(0, 0, 2, Value::Blank);
+        wb.put_formula(0, 0, 1, "SUM(Sales)");
+        wb.put_formula(0, 0, 2, "B1 + 1");
+
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(r.is_complete());
+        let mut s = r.session;
+        let b1 = s.cell_node_for(0, 0, 1).unwrap();
+        let c1 = s.cell_node_for(0, 0, 2).unwrap();
+        assert!(s.dirty_formulas().is_empty());
+
+        s.on_set_name("Sales");
+
+        // H2: BOTH B1 (direct name ref) AND C1 (transitive via B1) must
+        // be dirty. Pre-3.10 the dirty set only contained B1.
+        assert!(s.is_dirty(b1), "B1 references Sales directly");
+        assert!(
+            s.is_dirty(c1),
+            "Phase 3.10 H2 fix: C1 = B1 + 1 must also dirty when Sales changes"
         );
     }
 
