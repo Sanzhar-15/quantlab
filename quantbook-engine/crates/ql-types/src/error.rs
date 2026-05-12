@@ -10,8 +10,9 @@
 //! - `AINotAvailable` — parser-reserved error for `=AI(...)` until the v2 AI cell function ships
 //!   (Round 7 CORR-06 / T4-D05; sigil `#AI_NOT_AVAILABLE_V1`)
 //!
-//! Phase 0 does NOT model `#NIMPL!`, `#CIRC!`, `#CANCEL!` — those come later (interpreter for
-//! the first two; collab for the third).
+//! `#CIRC!` was added in Engine Phase 3.4 (W5-37, 2026-05-12) — the Tarjan SCC scheduler
+//! emits it for cells in non-trivial strongly connected components or with a self-loop.
+//! `#NIMPL!` and `#CANCEL!` remain deferred (interpreter / collab phases).
 
 use std::fmt;
 use std::str::FromStr;
@@ -51,6 +52,10 @@ pub enum ErrorValue {
     /// can match-distinguish v1-era pre-AI formulas from real AI invocations.
     /// Round 7 CORR-06 / T4-D05.
     AINotAvailable,
+    /// `#CIRC!` — circular reference. Emitted by the Engine Phase 3.4 Tarjan SCC
+    /// scheduler for every cell in a non-trivial strongly connected component or with
+    /// a self-loop in the dependency graph. Excel's canonical surface for cycles.
+    Circ,
 }
 
 impl ErrorValue {
@@ -72,12 +77,13 @@ impl ErrorValue {
             ErrorValue::Timeout => "#TIMEOUT!",
             ErrorValue::Permission => "#PERMISSION!",
             ErrorValue::AINotAvailable => "#AI_NOT_AVAILABLE_V1",
+            ErrorValue::Circ => "#CIRC!",
         }
     }
 
-    /// All 14 variants in declaration order. Stable; used by exhaustiveness tests and the
+    /// All 15 variants in declaration order. Stable; used by exhaustiveness tests and the
     /// future error-surface UI.
-    pub const ALL: [ErrorValue; 14] = [
+    pub const ALL: [ErrorValue; 15] = [
         ErrorValue::Ref,
         ErrorValue::Value,
         ErrorValue::NA,
@@ -92,6 +98,7 @@ impl ErrorValue {
         ErrorValue::Timeout,
         ErrorValue::Permission,
         ErrorValue::AINotAvailable,
+        ErrorValue::Circ,
     ];
 }
 
@@ -138,13 +145,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_contains_fourteen_distinct_variants() {
-        assert_eq!(ErrorValue::ALL.len(), 14);
+    fn all_contains_fifteen_distinct_variants() {
+        assert_eq!(ErrorValue::ALL.len(), 15);
         // Distinctness: convert to a set-shaped Vec of sigils and check.
         let mut sigils: Vec<&str> = ErrorValue::ALL.iter().map(|e| e.sigil()).collect();
         sigils.sort();
         sigils.dedup();
-        assert_eq!(sigils.len(), 14);
+        assert_eq!(sigils.len(), 15);
+    }
+
+    /// Engine Phase 3.4 (2026-05-12): `#CIRC!` is the canonical Excel sigil for
+    /// circular references. The Tarjan SCC scheduler emits it for every cell in
+    /// a non-trivial SCC or with a self-loop.
+    #[test]
+    fn sigil_circ_matches_excel_canonical_form() {
+        assert_eq!(ErrorValue::Circ.sigil(), "#CIRC!");
+        // Round-trip.
+        assert_eq!("#CIRC!".parse::<ErrorValue>().unwrap(), ErrorValue::Circ);
+        // Case-insensitive.
+        assert_eq!("#circ!".parse::<ErrorValue>().unwrap(), ErrorValue::Circ);
     }
 
     #[test]

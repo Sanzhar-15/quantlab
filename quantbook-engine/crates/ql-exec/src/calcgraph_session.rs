@@ -74,7 +74,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use ql_calcgraph::{Graph, NodeId};
+use ql_calcgraph::{schedule, CellNode, Graph, Node, NodeId, Schedule};
 use ql_formula_syntax::{lex, parse, RangeRef};
 use ql_storage::Workbook;
 use ql_types::{ColId, Range, RowId, SheetId};
@@ -459,11 +459,28 @@ impl CalcgraphSession {
         // reverse index. We do NOT create CellNodes for dep cells (no
         // need — the lookup at `on_set_value` is by (sheet, row, col)
         // tuple, not by NodeId).
+        //
+        // Phase 3.4: ALSO add a forward `graph.add_edge(formula_node,
+        // dep_node)` when the dep cell is ITSELF a formula cell. The
+        // Tarjan scheduler walks `graph.outgoing(formula_node)` to
+        // discover the dep set; without this edge it can't order a
+        // chain like `=A1`, `=B1=A1+1`, `=C1=B1+1` correctly. The
+        // edge is append-only per Phase 0 contract (re-bind leaves
+        // stale edges — filed as GAP-G-01; impact is performance,
+        // not correctness, because stale edges only add constraints).
         for &(s, r, c) in &deps.cells {
             self.cell_to_formulas
                 .entry((s, r, c))
                 .or_default()
                 .insert(formula_node);
+            if let Some(&dep_node) = self.cell_index.get(&(s, r, c)) {
+                // Note: self-edges (formula_node == dep_node) are
+                // ALLOWED here — they're the canonical way to model
+                // `=A1` at A1 (self-cycle), and the Phase 0 W3-3
+                // Tarjan scheduler treats a self-looped single-node
+                // SCC as `cycled`.
+                self.graph.add_edge(formula_node, dep_node);
+            }
         }
         // Phase 3.3: register named-range deps with the Graph's stripe
         // index. The Graph's `register_range_dependency` populates BOTH
@@ -547,11 +564,20 @@ impl CalcgraphSession {
         let mut succeeded = 0;
         let mut failures: Vec<RebuildFailure> = Vec::new();
 
+        // Phase 3.4: pre-pass — insert a CellNode for every formula
+        // before any extract runs. The Tarjan-side forward edges
+        // require `cell_index` to be COMPLETE at extract time so
+        // formula `=A1` at C1 can see A1's node and add the edge
+        // (otherwise late-arriving deps would be missed). Done in
+        // sorted order so node IDs stay deterministic.
+        for (sheet, row, col, _) in &formulas {
+            session.or_insert_cell_node(*sheet, *row, *col);
+        }
+
         for (sheet, row, col, text) in formulas {
-            // Always create the CellNode + index, even if bind fails.
-            // The graph still represents the formula cell; only the
-            // dep view is empty for that cell.
-            let node = session.or_insert_cell_node(sheet, row, col);
+            let node = session
+                .cell_node_for(sheet, row, col)
+                .expect("pre-pass inserted every formula's node");
 
             // Phase 3.2: lex + parse + bind + extract deps. Failure
             // accumulates; we keep going. Phase 3.3 passes the
@@ -631,7 +657,25 @@ impl CalcgraphSession {
     /// since 2B.4 (Phase 3.2 doesn't add new variants).
     pub fn on_set_formula(&mut self, sheet: SheetId, row: RowId, col: ColId, plan: &ExprPlan) {
         self.hook_counts.set_formula = self.hook_counts.set_formula.saturating_add(1);
+        // Phase 3.4: distinguish first-time-formula at this cell vs
+        // re-bind. The first case needs RETROACTIVE forward edges
+        // from previously-existing formulas that already reference
+        // this cell (those formulas' extract didn't see a NodeId for
+        // this cell at the time, so no edge was added).
+        let is_new_formula = self.cell_node_for(sheet, row, col).is_none();
         let node = self.or_insert_cell_node(sheet, row, col);
+        if is_new_formula {
+            let referencing: Vec<NodeId> = self
+                .cell_to_formulas
+                .get(&(sheet, row, col))
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default();
+            for prev in referencing {
+                if prev != node {
+                    self.graph.add_edge(prev, node);
+                }
+            }
+        }
         self.extract_and_register_deps(node, sheet, plan);
         // Phase 3.3: dirty downstream — formulas referencing the cell
         // whose formula text just changed see a (potentially) new
@@ -692,24 +736,60 @@ impl CalcgraphSession {
         self.hook_counts.add_sheet = self.hook_counts.add_sheet.saturating_add(1);
     }
 
-    /// Phase 3.3: internal fanout — for a write at `(sheet, row, col)`,
-    /// mark every formula node that depends on this cell (directly
-    /// or via a range) dirty. Two lookups:
+    /// Phase 3.3 (single-hop) + Phase 3.4 (BFS): internal fanout —
+    /// for a write at `(sheet, row, col)`, mark every formula node
+    /// that TRANSITIVELY depends on this cell dirty. Two reverse-
+    /// direction lookups per visited node:
     ///
     /// 1. `Graph::dependents_for_cell` returns range-dep candidates,
     ///    already filtered by the precision check (DIR-3-02).
     /// 2. `cell_to_formulas[(s,r,c)]` returns direct-cell-dep
     ///    formulas.
     ///
-    /// Union goes into `self.dirty`. Idempotent — a cell with no
-    /// dependents is a no-op (no graph nodes touched).
+    /// Phase 3.4 added the BFS pass: for each newly-marked formula
+    /// `F`, look up `F`'s cell address and recurse. A chain
+    /// `=A1 → =B1=A1+1 → =C1=B1+1` thus marks both B1 AND C1 dirty
+    /// from a single edit at A1. The `dirty.insert(node)` check
+    /// returns false on duplicate insert → BFS visits each node at
+    /// most once → cycles in the dep graph are safe.
     fn mark_dirty_from_cell_write(&mut self, sheet: SheetId, row: RowId, col: ColId) {
+        use std::collections::VecDeque;
+        let mut queue: VecDeque<NodeId> = VecDeque::new();
+
+        // Seed with the direct fanout from the edited cell (which may
+        // not itself be a formula).
         for dep in self.graph.dependents_for_cell(sheet, row, col) {
-            self.dirty.insert(dep);
+            if self.dirty.insert(dep) {
+                queue.push_back(dep);
+            }
         }
         if let Some(set) = self.cell_to_formulas.get(&(sheet, row, col)) {
-            for dep in set {
-                self.dirty.insert(*dep);
+            for &dep in set {
+                if self.dirty.insert(dep) {
+                    queue.push_back(dep);
+                }
+            }
+        }
+
+        // BFS: for every newly-marked formula, find what depends on
+        // ITS cell and propagate. This is the transitive closure of
+        // the reverse-dep relation, scoped to formula nodes.
+        while let Some(node) = queue.pop_front() {
+            let Some((ns, nr, nc)) = self.cell_address_for(node) else {
+                continue;
+            };
+            for dep in self.graph.dependents_for_cell(ns, nr, nc) {
+                if self.dirty.insert(dep) {
+                    queue.push_back(dep);
+                }
+            }
+            if let Some(set) = self.cell_to_formulas.get(&(ns, nr, nc)) {
+                let snapshot: Vec<NodeId> = set.iter().copied().collect();
+                for dep in snapshot {
+                    if self.dirty.insert(dep) {
+                        queue.push_back(dep);
+                    }
+                }
             }
         }
     }
@@ -743,10 +823,40 @@ impl CalcgraphSession {
         self.cell_to_formulas.len()
     }
 
-    // Phase 3.4 lands the next layer here: Tarjan SCC scheduling over
-    // the dirty subset. Today `take_dirty` returns an unsorted set;
-    // 3.4 sorts by topological layer (acyclic) and groups SCC members
-    // (cycles surface as `#CIRC!` errors).
+    /// Phase 3.4: address lookup for a formula node. The graph's
+    /// `Node::Cell` payload carries `(sheet, row, col)` — this is the
+    /// inverse of `cell_node_for`. Returns `None` if the node is not
+    /// a Cell variant (today every NodeId in `cell_index` is a Cell;
+    /// Phase 4 may add Range/Region nodes that aren't formula cells).
+    pub fn cell_address_for(&self, node: NodeId) -> Option<(SheetId, RowId, ColId)> {
+        match self.graph.node(node) {
+            Node::Cell(CellNode { sheet, row, col }) => Some((*sheet, *row, *col)),
+            _ => None,
+        }
+    }
+
+    /// **Phase 3.4 acceptance (SCH-3-01..04 entry point).** Atomically
+    /// claim the dirty set and run the Phase 0 W3-3 iterative Tarjan
+    /// scheduler over it. The returned [`Schedule`] partitions nodes:
+    ///
+    /// - `sorted`: dependency-first topological order. Evaluate
+    ///   `sorted[0]` before `sorted[1]`, etc.
+    /// - `cycled`: nodes in a non-trivial strongly connected component
+    ///   (size > 1) or with a self-loop. Per Phase 0 spec these get
+    ///   `Value::Error(ErrorValue::Circ)`.
+    ///
+    /// The dirty set is cleared by this call. Edges to non-dirty
+    /// nodes are not traversed (those nodes aren't being recomputed;
+    /// their current values are read as-is). Input ordering is
+    /// sorted-by-NodeId before the scheduler runs so SCH-3-03
+    /// determinism holds: same workbook + same edits → same schedule
+    /// across runs (the underlying scheduler is already deterministic
+    /// in its input slice order; we just normalize HashSet iteration).
+    pub fn schedule_dirty(&mut self) -> Schedule {
+        let mut dirty_vec: Vec<NodeId> = self.dirty.drain().collect();
+        dirty_vec.sort();
+        schedule(&self.graph, &dirty_vec)
+    }
 }
 
 #[cfg(test)]
@@ -1670,5 +1780,248 @@ mod tests {
         let deps1 = s.graph().dependents_for_cell(0, 5, 0);
         let deps2 = s.graph().dependents_for_cell(0, 5, 0);
         assert_eq!(deps1, deps2);
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 3.4 acceptance gates (SCH-3-01..04).
+    //
+    // The Phase 0 W3-3 iterative Tarjan scheduler already exists in
+    // ql-calcgraph::topo. Phase 3.4 wires it: extract_and_register_deps
+    // adds forward edges for direct cell→cell deps so Tarjan can
+    // discover the dep graph; schedule_dirty consumes the session's
+    // dirty set and returns (sorted, cycled).
+    //
+    // These tests live at the session level — they verify the
+    // schedule's shape directly. The matching end-to-end recompute
+    // tests live in `workbook_runtime.rs` (where the runtime evaluates
+    // the schedule's `sorted` order and writes `#CIRC!` for the
+    // `cycled` set).
+    // ----------------------------------------------------------------
+
+    /// Helper: workbook for the canonical dependency-chain test.
+    /// A1 = 1 (literal); B1 = A1 + 1; C1 = B1 + 1.
+    fn chain_workbook() -> Workbook {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S0");
+        wb.put_at(0, 0, 0, Value::Number(1.0));
+        wb.put_at(0, 0, 1, Value::Blank);
+        wb.put_at(0, 0, 2, Value::Blank);
+        wb.put_formula(0, 0, 1, "A1 + 1");
+        wb.put_formula(0, 0, 2, "B1 + 1");
+        wb
+    }
+
+    /// SCH-3-01: dependency chains schedule in correct order. With
+    /// A1=literal, B1=A1+1, C1=B1+1, marking A1 dirty propagates to
+    /// B1 + C1 (via cell_to_formulas) and the schedule orders
+    /// B1 BEFORE C1 (because C1 depends on B1).
+    #[test]
+    fn sch_3_01_dependency_chains_schedule_in_dependency_first_order() {
+        let wb = chain_workbook();
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(r.is_complete());
+        let mut s = r.session;
+        let b1 = s.cell_node_for(0, 0, 1).unwrap();
+        let c1 = s.cell_node_for(0, 0, 2).unwrap();
+
+        // Phase 3.4 invariant: the forward edge from C1 to B1 exists
+        // in the graph (extract_and_register_deps added it on the
+        // rebuild pre-pass + extract).
+        assert!(
+            s.graph().outgoing(c1).contains(&b1),
+            "C1 must have an outgoing edge to B1 (the dep)"
+        );
+
+        // Edit A1 — both B1 and C1 dirty.
+        s.on_set_value(0, 0, 0);
+        assert!(s.is_dirty(b1));
+        assert!(s.is_dirty(c1));
+
+        let sched = s.schedule_dirty();
+        assert!(sched.cycled.is_empty(), "no cycles in a linear chain");
+        // B1 must come before C1 in sorted order.
+        let pos_b1 = sched.sorted.iter().position(|n| *n == b1).unwrap();
+        let pos_c1 = sched.sorted.iter().position(|n| *n == c1).unwrap();
+        assert!(
+            pos_b1 < pos_c1,
+            "B1 must schedule before C1 (B1 is C1's dep)"
+        );
+
+        // dirty set is cleared after schedule_dirty.
+        assert!(s.dirty_formulas().is_empty());
+    }
+
+    /// SCH-3-02: cycles surface in `Schedule::cycled` carrying every
+    /// SCC member. Build a 2-cycle (A1 = B1 + 1; B1 = A1 + 1) and a
+    /// self-loop (D1 = D1 + 1) and verify the cycle reporter sees
+    /// every involved node.
+    #[test]
+    fn sch_3_02_cycles_report_all_scc_members() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S0");
+        wb.put_at(0, 0, 0, Value::Blank);
+        wb.put_at(0, 0, 1, Value::Blank);
+        wb.put_at(0, 0, 3, Value::Blank);
+        wb.put_formula(0, 0, 0, "B1 + 1");
+        wb.put_formula(0, 0, 1, "A1 + 1");
+        // Self-cycle at D1.
+        wb.put_formula(0, 0, 3, "D1 + 1");
+
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(r.is_complete());
+        let mut s = r.session;
+        let a1 = s.cell_node_for(0, 0, 0).unwrap();
+        let b1 = s.cell_node_for(0, 0, 1).unwrap();
+        let d1 = s.cell_node_for(0, 0, 3).unwrap();
+
+        // Force the cycle into dirty: edit any of A1/B1, the dirty
+        // walk picks up the cycle members via direct-cell-dep reverse
+        // index. We seed both formulas + the self-loop directly.
+        s.dirty.insert(a1);
+        s.dirty.insert(b1);
+        s.dirty.insert(d1);
+
+        let sched = s.schedule_dirty();
+        assert!(
+            sched.cycled.contains(&a1),
+            "A1 must surface in cycled — part of the 2-cycle"
+        );
+        assert!(
+            sched.cycled.contains(&b1),
+            "B1 must surface in cycled — part of the 2-cycle"
+        );
+        assert!(
+            sched.cycled.contains(&d1),
+            "D1 must surface in cycled — self-loop"
+        );
+        // Sorted should be empty in this case (every dirty node is in
+        // a cycle).
+        assert!(sched.sorted.is_empty());
+    }
+
+    /// SCH-3-03: schedule is deterministic across runs. Two
+    /// independent rebuilds of the same workbook + same edit sequence
+    /// produce the same Schedule.
+    #[test]
+    fn sch_3_03_schedule_is_deterministic_across_runs() {
+        fn run() -> (Vec<NodeId>, Vec<NodeId>) {
+            let wb = chain_workbook();
+            let r = CalcgraphSession::rebuild_from_workbook(&wb);
+            let mut s = r.session;
+            s.on_set_value(0, 0, 0); // edit A1
+            let sched = s.schedule_dirty();
+            (sched.sorted, sched.cycled)
+        }
+        let r1 = run();
+        let r2 = run();
+        assert_eq!(r1, r2, "schedule must be byte-identical across runs");
+    }
+
+    /// SCH-3-04: schedule operates ONLY on the dirty subset. An
+    /// edit to A1 dirties B1 + C1 but does NOT include unrelated
+    /// formula E1 (which references some other cell).
+    #[test]
+    fn sch_3_04_dirty_subset_avoids_unrelated_formulas() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S0");
+        // A1=lit, B1=A1+1, C1=B1+1 — the chain.
+        wb.put_at(0, 0, 0, Value::Number(1.0));
+        wb.put_at(0, 0, 1, Value::Blank);
+        wb.put_at(0, 0, 2, Value::Blank);
+        wb.put_formula(0, 0, 1, "A1 + 1");
+        wb.put_formula(0, 0, 2, "B1 + 1");
+        // E1 = Z1 + 1 — unrelated to A1/B1/C1.
+        wb.put_at(0, 0, 4, Value::Blank);
+        wb.put_at(0, 0, 25, Value::Number(7.0));
+        wb.put_formula(0, 0, 4, "Z1 + 1");
+
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(r.is_complete());
+        let mut s = r.session;
+        let b1 = s.cell_node_for(0, 0, 1).unwrap();
+        let c1 = s.cell_node_for(0, 0, 2).unwrap();
+        let e1 = s.cell_node_for(0, 0, 4).unwrap();
+
+        // Edit A1 only.
+        s.on_set_value(0, 0, 0);
+        let sched = s.schedule_dirty();
+        let all: HashSet<NodeId> = sched
+            .sorted
+            .iter()
+            .chain(sched.cycled.iter())
+            .copied()
+            .collect();
+        assert!(all.contains(&b1));
+        assert!(all.contains(&c1));
+        assert!(
+            !all.contains(&e1),
+            "E1 must NOT appear in the schedule — it doesn't depend on A1"
+        );
+    }
+
+    /// Phase 3.4 edge case: empty dirty set produces empty Schedule.
+    #[test]
+    fn schedule_dirty_with_empty_dirty_is_empty_schedule() {
+        let mut s = CalcgraphSession::new();
+        let sched = s.schedule_dirty();
+        assert!(sched.is_empty());
+        assert_eq!(sched.total_count(), 0);
+    }
+
+    /// Phase 3.4 invariant: `cell_address_for` is the inverse of
+    /// `cell_node_for`. Round-trip every formula cell in a workbook
+    /// and verify equality.
+    #[test]
+    fn cell_address_for_inverts_cell_node_for() {
+        let wb = chain_workbook();
+        let r = CalcgraphSession::rebuild_from_workbook(&wb);
+        let s = r.session;
+        for (sheet, row, col) in [(0u16, 0u32, 1u32), (0, 0, 2)] {
+            let node = s.cell_node_for(sheet, row, col).unwrap();
+            let addr = s.cell_address_for(node).unwrap();
+            assert_eq!(addr, (sheet, row, col));
+        }
+    }
+
+    /// Phase 3.4 retroactive-edge guarantee: setting a formula AT a
+    /// cell that older formulas already reference must wire the
+    /// forward edges so Tarjan can order them. Edit sequence:
+    ///   1. B1 = A1 + 1   (added first; A1 not a formula yet → no
+    ///      F'→F edge possible)
+    ///   2. A1 = 99       (now A1 becomes a formula; the retroactive
+    ///      path must add the B1→A1 edge)
+    #[test]
+    fn retroactive_edge_when_dep_becomes_formula() {
+        use ql_formula_syntax::Operator;
+        let mut s = CalcgraphSession::new();
+        // B1 = A1 + 1.
+        let plan_b1 = ExprPlan::Binary {
+            op: Operator::Plus,
+            lhs: Box::new(ExprPlan::CellRef {
+                sheet: 0,
+                row: 0,
+                col: 0,
+                abs_col: false,
+                abs_row: false,
+            }),
+            rhs: Box::new(ExprPlan::Number(1.0)),
+        };
+        s.on_set_formula(0, 0, 1, &plan_b1);
+        let b1 = s.cell_node_for(0, 0, 1).unwrap();
+        // A1 isn't a formula yet.
+        assert!(s.cell_node_for(0, 0, 0).is_none());
+        // So B1's outgoing is empty — no edge to a non-existent A1
+        // node.
+        assert!(s.graph().outgoing(b1).is_empty());
+
+        // Now set A1 = 99 — turns A1 into a formula. Retroactive
+        // edge B1 → A1 must materialize.
+        let plan_a1 = ExprPlan::Number(99.0);
+        s.on_set_formula(0, 0, 0, &plan_a1);
+        let a1 = s.cell_node_for(0, 0, 0).unwrap();
+        assert!(
+            s.graph().outgoing(b1).contains(&a1),
+            "retroactive edge B1 → A1 must exist after A1 becomes a formula"
+        );
     }
 }

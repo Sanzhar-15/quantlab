@@ -457,6 +457,7 @@ pub fn error_to_canonical_text(e: ErrorValue) -> String {
         ErrorValue::Timeout => "#TIMEOUT!".to_string(),
         ErrorValue::Permission => "#PERMISSION!".to_string(),
         ErrorValue::AINotAvailable => "#AI_NOT_AVAILABLE_V1".to_string(),
+        ErrorValue::Circ => "#CIRC!".to_string(),
     }
 }
 
@@ -476,6 +477,7 @@ fn parse_canonical_error_text(s: &str) -> Option<ErrorValue> {
         "#TIMEOUT!" => ErrorValue::Timeout,
         "#PERMISSION!" => ErrorValue::Permission,
         "#AI_NOT_AVAILABLE_V1" => ErrorValue::AINotAvailable,
+        "#CIRC!" => ErrorValue::Circ,
         _ => return None,
     })
 }

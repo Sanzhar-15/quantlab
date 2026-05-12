@@ -25,7 +25,7 @@ use ql_functions::FunctionRegistry;
 use ql_io::CellWireValue;
 use ql_oplog::{Op, OpLog};
 use ql_storage::Workbook;
-use ql_types::{ColId, RowId, SheetId, Value, MAX_COLUMN, MAX_ROW};
+use ql_types::{ColId, ErrorValue, RowId, SheetId, Value, MAX_COLUMN, MAX_ROW};
 
 use crate::env::WorkbookEnv;
 use crate::plan::{bind_with_names, BindError};
@@ -784,6 +784,88 @@ impl<'a> WorkbookRuntime<'a> {
             succeeded,
             failures,
         }
+    }
+
+    /// **Engine Phase 3.4 (2026-05-12) — W5-37 SCH-3-01..04 entry
+    /// point.** Recompute only the formulas the attached
+    /// [`CalcgraphSession`] has marked dirty since the last call.
+    /// The scheduler runs iterative Tarjan SCC over the dirty
+    /// subset; nodes in non-trivial SCCs (or with self-loops) are
+    /// written as `Value::Error(ErrorValue::Circ)`. Everything else
+    /// is evaluated in topological order via the existing PlanCache
+    /// pipeline.
+    ///
+    /// Returns `None` when no `CalcgraphSession` is attached (the
+    /// runtime was constructed via `new` or `with_oplog`); the
+    /// dirty-set lives on the session, so we can't do incremental
+    /// recompute without it. Callers in that mode should use
+    /// `recompute_all` for a full HashMap-order pass instead.
+    ///
+    /// Returns `Some(RecomputeResult)` otherwise, matching the
+    /// aggregation shape of `recompute_all`: per-cell failures
+    /// (parse / bind issues that have somehow surfaced post-bind,
+    /// e.g. a name was deleted between extract and recompute) are
+    /// collected, the rest succeed.
+    pub fn recompute_dirty(&mut self) -> Option<RecomputeResult> {
+        // The session lives behind an `Option<&'a mut CalcgraphSession>`
+        // — take it out for the duration of this call so we can borrow
+        // both the workbook and the session simultaneously. Reattach
+        // before returning.
+        let mut session_slot = self.graph.take();
+        let session = session_slot.as_deref_mut()?;
+
+        // Phase 3.4: claim dirty + topo-sort. Edges in the graph
+        // model the dep direction (`outgoing(F) = what F depends on`).
+        // Tarjan emits SCCs in reverse-topo of the condensation
+        // which, for our edge orientation, is dependency-first order.
+        let sched = session.schedule_dirty();
+        let attempted = sched.total_count();
+        let mut succeeded = 0;
+        let mut failures: Vec<RecomputeFailure> = Vec::new();
+
+        // Cycled nodes get `#CIRC!` regardless of whether the formula
+        // still binds. Spec: cycles are terminal Phase 0 errors.
+        for node in &sched.cycled {
+            let Some((sheet, row, col)) = session.cell_address_for(*node) else {
+                continue; // non-Cell variant; nothing to write
+            };
+            self.workbook
+                .put_at(sheet, row, col, Value::Error(ErrorValue::Circ));
+        }
+
+        // Sorted nodes evaluate in dependency-first order.
+        for node in &sched.sorted {
+            let Some((sheet, row, col)) = session.cell_address_for(*node) else {
+                continue;
+            };
+            // Fetch the formula text from the workbook. A node may
+            // be in the schedule but lack a current formula if it
+            // was cleared between dirty-marking and recompute — in
+            // that case there's nothing to recompute.
+            let Some(text) = self.workbook.formula_at(sheet, row, col).cloned() else {
+                continue;
+            };
+            match self.try_recompute_one_cached(sheet, &text) {
+                Ok(value) => {
+                    self.workbook.put_at(sheet, row, col, value);
+                    succeeded += 1;
+                }
+                Err(error) => failures.push(RecomputeFailure {
+                    sheet,
+                    row,
+                    col,
+                    formula_text: text,
+                    error,
+                }),
+            }
+        }
+
+        self.graph = session_slot;
+        Some(RecomputeResult {
+            attempted,
+            succeeded,
+            failures,
+        })
     }
 
     /// Phase 2B.3 helper for `recompute_all`: consult the bind-plan cache
@@ -2681,5 +2763,179 @@ mod tests {
         let counts = graph.hook_counts();
         assert_eq!(counts.set_value, 1);
         assert_eq!(counts.set_formula, 1);
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 3.4 integration: WorkbookRuntime::recompute_dirty drives
+    // the calcgraph schedule + writes results to the workbook.
+    // ----------------------------------------------------------------
+
+    /// Phase 3.4: with no graph attached, `recompute_dirty` returns
+    /// None — the dirty set lives on the session, so without one
+    /// there's nothing to drive.
+    #[test]
+    fn recompute_dirty_returns_none_when_no_graph_attached() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        assert!(rt.recompute_dirty().is_none());
+    }
+
+    /// SCH-3-01 end-to-end: edit a chain head, recompute_dirty
+    /// cascades through the chain. A1=1; B1=A1+1; C1=B1+1. After
+    /// set_value(A1, 10), B1 and C1 should both update to 11 and 12.
+    #[test]
+    fn recompute_dirty_cascades_dependency_chain() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        // Seed via the runtime so the graph gets the hooks.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(1.0)).unwrap();
+            rt.set_formula(0, 0, 1, "A1 + 1").unwrap();
+            rt.set_formula(0, 0, 2, "B1 + 1").unwrap();
+        }
+        // After the initial sets, B1 = 2, C1 = 3.
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(2.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Number(3.0));
+
+        // Edit A1 → 10 — the chain must propagate.
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(10.0)).unwrap();
+        let result = rt.recompute_dirty().expect("graph attached");
+        // Both B1 and C1 were dirty; both recomputed cleanly.
+        assert_eq!(result.attempted, 2);
+        assert_eq!(result.succeeded, 2);
+        assert!(result.failures.is_empty());
+
+        // Verify: B1 = 11, C1 = 12.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Number(11.0),
+            "B1 = A1 + 1 = 11"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 2)),
+            Value::Number(12.0),
+            "C1 = B1 + 1 = 12"
+        );
+    }
+
+    /// SCH-3-02 end-to-end: cycles get `#CIRC!`. Build A1 = B1 + 1
+    /// and B1 = A1 + 1 (a 2-cycle), then trigger a recompute. Every
+    /// cell in the SCC must be `Value::Error(ErrorValue::Circ)`.
+    ///
+    /// Note: we build the cycle directly via the workbook's low-level
+    /// `put_formula` API and rebuild the session. Going through
+    /// `WorkbookRuntime::set_formula` for the second cycle member
+    /// would re-evaluate A1 mid-cycle and write a non-cycle value,
+    /// which is fine — but it complicates the test setup. The
+    /// rebuild path is the canonical "load existing workbook" entry
+    /// the IDE uses and is the cleanest way to set up the test.
+    #[test]
+    fn recompute_dirty_writes_circ_error_for_cycle_members() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        wb.put_at(0, 0, 0, Value::Blank);
+        wb.put_at(0, 0, 1, Value::Blank);
+        wb.put_formula(0, 0, 0, "B1 + 1");
+        wb.put_formula(0, 0, 1, "A1 + 1");
+        let rebuild = CalcgraphSession::rebuild_from_workbook(&wb);
+        assert!(rebuild.is_complete());
+        let mut graph = rebuild.session;
+        assert!(graph.dirty_formulas().is_empty(), "rebuild starts clean");
+
+        // Mark the cycle dirty. on_set_value(A1) → cell_to_formulas[A1]
+        // = {B1} → mark B1 dirty. BFS from B1 → cell_to_formulas[B1]
+        // = {A1} → mark A1 dirty. The Tarjan SCC scheduler discovers
+        // the cycle.
+        graph.on_set_value(0, 0, 0);
+        assert_eq!(graph.dirty_formulas().len(), 2);
+
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        let result = rt.recompute_dirty().expect("graph attached");
+        // Both members are in cycled (not sorted); attempted == 2.
+        assert_eq!(result.attempted, 2);
+        // `succeeded` counts only sorted-path evaluations.
+        assert_eq!(result.succeeded, 0);
+        assert!(result.failures.is_empty());
+
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Error(ErrorValue::Circ),
+            "A1 in cycle → #CIRC!"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Error(ErrorValue::Circ),
+            "B1 in cycle → #CIRC!"
+        );
+    }
+
+    /// SCH-3-04 end-to-end: an edit to A1 cascades through its
+    /// chain, but an UNRELATED formula `=Z1+1` at E1 stays untouched.
+    #[test]
+    fn recompute_dirty_skips_unrelated_formulas() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(1.0)).unwrap(); // A1
+            rt.set_value(0, 0, 25, Value::Number(100.0)).unwrap(); // Z1
+            rt.set_formula(0, 0, 1, "A1 + 1").unwrap(); // B1
+            rt.set_formula(0, 0, 4, "Z1 + 1").unwrap(); // E1
+        }
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(2.0));
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 4)),
+            Value::Number(101.0)
+        );
+
+        // Edit A1; E1 should NOT recompute.
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(50.0)).unwrap();
+        let result = rt.recompute_dirty().expect("graph attached");
+        // Only B1 was dirty.
+        assert_eq!(result.attempted, 1);
+        assert_eq!(result.succeeded, 1);
+
+        // B1 updated to 51.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Number(51.0)
+        );
+        // E1 untouched (its value would still be the prior 101).
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 4)),
+            Value::Number(101.0),
+            "E1 must not have been recomputed"
+        );
+    }
+
+    /// Phase 3.4: empty dirty (e.g. recompute_dirty called twice in a
+    /// row with no edits between) returns an empty result.
+    #[test]
+    fn recompute_dirty_twice_in_a_row_is_idempotent() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(1.0)).unwrap();
+            rt.set_formula(0, 0, 1, "A1 + 1").unwrap();
+        }
+        let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+        rt.set_value(0, 0, 0, Value::Number(2.0)).unwrap();
+        let r1 = rt.recompute_dirty().unwrap();
+        assert_eq!(r1.attempted, 1);
+        let r2 = rt.recompute_dirty().unwrap();
+        assert_eq!(r2.attempted, 0, "second call: nothing dirty");
+        assert_eq!(r2.succeeded, 0);
     }
 }

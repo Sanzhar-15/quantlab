@@ -247,11 +247,22 @@ The full v1 means all of these crates either ship real behavior or have a docume
    Shipped: session-side `dirty: HashSet<NodeId>` plus the 5 hooks fanning out via `Graph::dependents_for_cell` (stripe + precision) for range deps and a new session-side `cell_to_formulas` reverse index for direct cell deps; `on_set_name` fans out via `name_to_formulas`; `take_dirty()` claims + clears for the future 3.4 SCC scheduler; `range_to_rangeref` converter promotes `Range { start_row: 0, end_row: MAX }` to `RangeRef::WholeColumn` (and symmetric for whole-row) to keep the stripe index O(width) instead of O(height). 10 new tests; full ql-exec suite at 278 tests, workspace at 892. Known limitation: stale Phase 0 stripe entries on re-bind (append-only `Graph`) — filed as GAP-G-01 (performance, not correctness; precision check filters at the read side).  
    Effort: 4-6 days (actual: ~1 day; substrate already existed in `ql-calcgraph` from Phase 0 W3-5).
 
-4. **3.4 Tarjan SCC Scheduler And Full Topological Recompute**  
+4. **3.4 Tarjan SCC Scheduler And Full Topological Recompute** ✅ SHIPPED 2026-05-12 (W5-37)  
    Replace map-order recompute with dirty-subset Tarjan SCC plus deterministic layers. Cycles surface as Excel errors and diagnostics, not panics.  
    References: `.references/formualizer/crates/formualizer-eval/src/engine/scheduler.rs`; `.references/hyperformula/src/DependencyGraph/TopSort.ts`; `docs/phase0/references-reading-log.md` CORR-23.  
-   Acceptance: SCH-3-01 dependency chains recompute correctly; SCH-3-02 cycle reports include SCC members; SCH-3-03 acyclic layers deterministic across runs; SCH-3-04 dirty subset recompute avoids unrelated formulas.  
-   Effort: 5-7 days.
+   Acceptance: SCH-3-01 ✅ dependency chains schedule in dependency-first order (`sch_3_01_dependency_chains_schedule_in_dependency_first_order` + `recompute_dirty_cascades_dependency_chain`); SCH-3-02 ✅ cycles surface in `Schedule::cycled` (`sch_3_02_cycles_report_all_scc_members` + `recompute_dirty_writes_circ_error_for_cycle_members`); SCH-3-03 ✅ deterministic across runs (`sch_3_03_schedule_is_deterministic_across_runs`); SCH-3-04 ✅ dirty subset avoids unrelated formulas (`sch_3_04_dirty_subset_avoids_unrelated_formulas` + `recompute_dirty_skips_unrelated_formulas`).  
+   Shipped:  
+   - Phase 0 W3-3 iterative Tarjan in `ql_calcgraph::topo::schedule` was already built (no recursion limit on deep chains). 3.4 wires it.  
+   - `extract_and_register_deps` adds forward `graph.add_edge(formula, dep_formula)` for direct cell→cell deps (self-edges allowed for `=A1` at A1 → Tarjan reports as cycled).  
+   - `on_set_formula` does retroactive-edge wiring: when a new formula appears at a cell that older formulas already reference, the F'→F forward edges are materialized so Tarjan can order them.  
+   - `rebuild_from_workbook` pre-inserts all formula nodes before any extract pass so the forward-edge wiring at extract time sees a complete `cell_index`.  
+   - `mark_dirty_from_cell_write` upgraded from single-hop (Phase 3.3) to BFS — a chain edit cascades through the reverse-dep graph until fixpoint.  
+   - `CalcgraphSession::schedule_dirty() -> Schedule` drains the dirty set and runs Tarjan.  
+   - `CalcgraphSession::cell_address_for(NodeId)` — inverse of `cell_node_for`, needed by the runtime to look up addresses from schedule output.  
+   - `WorkbookRuntime::recompute_dirty()` evaluates the `sorted` partition in dependency-first order via the existing PlanCache pipeline; writes `Value::Error(ErrorValue::Circ)` for every `cycled` member.  
+   - New `ErrorValue::Circ` variant (15th, was reserved at Phase 0; Phase 0 doc updated). Handled in `ql-io::qbook_format` wire roundtrip.  
+   16 new tests (10 session unit + 5 runtime integration + 1 wire roundtrip). ql-exec at 295, workspace at 905.  
+   Effort: 5-7 days (actual: ~1 day; substrate was already there from Phase 0 W3-3).
 
 5. **3.5 Computed-Overlay Separation**  
    Split user edits from computed formula/spill outputs in storage. Reads cascade user -> computed -> base. User write clears stale computed value at that cell.  

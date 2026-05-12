@@ -1,7 +1,7 @@
 # Known engine gaps — checklist with target phases
 
 **Status:** Living document, updated at each phase boundary  
-**Date last touched:** 2026-05-12 (Engine Phase 3.3 close-out — W5-36)  
+**Date last touched:** 2026-05-12 (Engine Phase 3.4 close-out — W5-37)  
 **Companion:** `docs/MASTER-PLAN.md`
 
 Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a gap is closed, move its row to the "Closed" section at the bottom and reference the closing commit.
@@ -12,7 +12,7 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 
 | ID | Gap | Reproduce | Owner | Target phase |
 |---|---|---|---|---|
-| GAP-R-01 | `recompute_all` walks formulas in `HashMap`-arbitrary order; dependency chains may compute stale values mid-recompute. Phase 3.2 (2026-05-12) builds the dep-graph substrate (`CalcgraphSession::formula_deps` + `volatile_formulas`); Phase 3.4 plugs Tarjan SCC over the dirty subset. | `ql-exec/src/workbook_runtime.rs::recompute_all` (see "Iteration order is HashMap-arbitrary" comment) | Engine | Engine Phase 3.4 (Tarjan SCC scheduler) |
+| GAP-R-01 | `recompute_all` STILL walks formulas in `HashMap`-arbitrary order — it's the full-pass legacy path. Phase 3.4 (2026-05-12) added `WorkbookRuntime::recompute_dirty()` which uses Tarjan SCC over the dirty subset (correct order for chains, `#CIRC!` for cycles). The IDE / consumer should migrate from `recompute_all` to `recompute_dirty` for incremental editing. `recompute_all` remains useful for fresh-load full passes. | `ql-exec/src/workbook_runtime.rs::recompute_all` vs `recompute_dirty` | Engine | Engine Phase 6.1 (`WorkbookSession`) decides if `recompute_all` is renamed / deprecated when the session contract lands. |
 | ~~GAP-R-02~~ | ~~`recompute_all` short-circuits on first failure~~ — **CLOSED** in Engine Phase 2B.2 (commit `393ce2f765f`): replaced with `RecomputeResult` aggregating per-cell failures. |
 | ~~GAP-R-03~~ | ~~Bind-plan re-derived from formula text on every recompute~~ — **CLOSED** in Engine Phase 2B.3 (commit `bd3147a1045`): `PlanCache` keyed by `(formula_text, sheet, name_gen)` on the runtime; `recompute_all` second-pass is all hits; name mutations bump generation and invalidate; counters exposed via `runtime.cache_stats()` + `Timings::bind_plan_cache_hits/misses`. |
 | GAP-R-04 | Volatile functions (`NOW`, `RAND`, `TODAY`, `RANDBETWEEN`, `RANDARRAY`, `INDIRECT`, `OFFSET`, `INFO`, `CELL`) have no invalidation model. Phase 3.2 (2026-05-12) introduced the `is_volatile_function` set + populates `CalcgraphSession::volatile_formulas`; the actual dirty-on-recompute-tick logic lands in 3.7. | `ql-functions/src/registry.rs` registers volatile fns; `ql-exec/src/calcgraph_session.rs::is_volatile_function` set populated but unused by `recompute_all` | Engine | Engine Phase 3.7 (volatile invalidation) |
@@ -84,7 +84,7 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 
 | ID | Gap | Reproduce | Owner | Target phase |
 |---|---|---|---|---|
-| GAP-G-01 | Phase 0 `Graph` edges and stripe entries are append-only. When `CalcgraphSession` re-binds a formula whose ranges changed (`=SUM(A:A)` → `=SUM(B:B)`), the OLD stripe entries + `formula_to_range_deps` ranges remain in the graph. A subsequent write to the old range hits the stripe + passes the precision check (the stale range still contains the cell), producing a false-positive dirty mark. Phase 3.3 (session-side `cell_to_formulas` reverse index) handles direct cell deps cleanly; the range path is the residue. Cost is **performance, not correctness**: a false-positive dirty just means a recompute does extra work. | `ql-exec/src/calcgraph_session.rs::extract_and_register_deps` re-bind path; `ql-calcgraph/src/graph.rs::register_range_dependency` has no remove counterpart | Engine | Engine Phase 3.10 megaudit decision: delta-edge graph OR per-formula stripe revocation API |
+| GAP-G-01 | Phase 0 `Graph` edges and stripe entries are append-only. When `CalcgraphSession` re-binds a formula whose deps changed (`=SUM(A:A)` → `=SUM(B:B)`, or `=A1+B1` → `=C1+D1`), the OLD entries remain in the graph: stripe stays registered, `formula_to_range_deps` keeps the old range, AND (Phase 3.4) the old forward `add_edge(formula, dep)` edges stay too. Subsequent writes hit the stale entries + pass the precision check, producing false-positive dirty marks. Tarjan ordering inflates with extra constraints (still correct, just bigger). Cost is **performance, not correctness** — same root cause across stripes / formula_to_range_deps / direct edges. Phase 3.3 (session-side `cell_to_formulas` reverse index) handles direct deps cleanly on the REVERSE side; this gap is the FORWARD side. | `ql-exec/src/calcgraph_session.rs::extract_and_register_deps` re-bind path; `ql-calcgraph/src/graph.rs::register_range_dependency` + `add_edge` have no remove counterparts | Engine | Engine Phase 3.10 megaudit decision: delta-edge graph storage OR per-formula edge / stripe revocation API |
 
 ### Collaboration
 

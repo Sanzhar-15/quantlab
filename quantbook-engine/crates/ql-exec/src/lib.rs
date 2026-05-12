@@ -22,14 +22,19 @@
 //! - `lower.rs` (Phase 0) — `classify` + `dispatch` for the SIMD shape
 //!   heuristic.
 //! - `workbook_runtime.rs` (Phase 1 W5-10; extended Phase 2A.1, 2A.3.b,
-//!   2A.6, 2B.2, 2B.3, 2B.5, 2B.7) — `WorkbookRuntime` live-formula facade
+//!   2A.6, 2B.2, 2B.3, 2B.5, 2B.7; Phase 3.4 W5-37 adds
+//!   `recompute_dirty`) — `WorkbookRuntime` live-formula facade
 //!   wrapping lex → parse → bind → eval → persist + recompute_all.
-//!   `RecomputeResult` aggregation (no more short-circuit). Op-log producer
-//!   wrappers (`set_name` / `add_sheet` / `clear_formula`) emit ops when
-//!   an `OpLog` is attached. Phase 2B.7 added `validate_formula` for IDE
-//!   on-keystroke validation and pre-validation guards on `add_sheet`.
-//!   `RuntimeError` family includes `InvalidSheet`, `InvalidCell`,
-//!   `ConflictingOps`, `OpLog`, `Name`, `InvalidChunkRows`, `TooManySheets`.
+//!   `RecomputeResult` aggregation (no more short-circuit). Op-log
+//!   producer wrappers (`set_name` / `add_sheet` / `clear_formula`)
+//!   emit ops when an `OpLog` is attached. Phase 2B.7 added
+//!   `validate_formula` for IDE on-keystroke validation and
+//!   pre-validation guards on `add_sheet`. Phase 3.4 added
+//!   `recompute_dirty()` — runs Tarjan SCC over the attached
+//!   session's dirty set; cycled members get
+//!   `Value::Error(ErrorValue::Circ)`. `RuntimeError` family includes
+//!   `InvalidSheet`, `InvalidCell`, `ConflictingOps`, `OpLog`,
+//!   `Name`, `InvalidChunkRows`, `TooManySheets`.
 //! - `transaction.rs` (Phase 2A.2; hardened Phase 2A.6, 2A.3.b, 2B.7) —
 //!   `WorkbookTransaction` multi-cell batch API with eager validation,
 //!   conflict detection. Phase 2B.7 reordered commit to append-first
@@ -40,18 +45,20 @@
 //!   RecomputeResult), QbookError>` convenience. Phase 2B.2 removed the
 //!   `LoadAndRecomputeError` wrapper enum; recompute failures are now
 //!   aggregated into the returned `RecomputeResult` instead.
-//! - `calcgraph_session.rs` (Phase 3.1 W5-34; extended Phase 3.2
-//!   W5-35; extended Phase 3.3 W5-36) — `CalcgraphSession` owning a
-//!   `ql_calcgraph::Graph` plus an O(1) `cell_index`, per-formula
-//!   `FormulaDeps` (cells, named ranges, names, volatile bit), the
-//!   `cell_to_formulas` reverse index (Phase 3.3) for direct cell
-//!   deps, and a `dirty: HashSet<NodeId>` (Phase 3.3) that the 5
-//!   mutation hooks fan out into via `Graph::dependents_for_cell`
-//!   (stripe + precision) for range deps and `cell_to_formulas` for
-//!   direct cell deps. `rebuild_from_workbook` returns `RebuildResult`
-//!   (parallel to `RecomputeResult`) with `RebuildFailure`
-//!   aggregation. `dirty_formulas()` / `take_dirty()` are the
-//!   scheduler hooks for the future Phase 3.4 Tarjan SCC pass.
+//! - `calcgraph_session.rs` (Phase 3.1 W5-34 → 3.2 W5-35 → 3.3 W5-36
+//!   → 3.4 W5-37) — `CalcgraphSession` owns the `ql_calcgraph::Graph`
+//!   plus per-formula `FormulaDeps`, `cell_to_formulas` reverse
+//!   index, `name_to_formulas` reverse index, `volatile_formulas`,
+//!   and a `dirty: HashSet<NodeId>`. The 5 mutation hooks fan out
+//!   via `Graph::dependents_for_cell` (stripe + precision for range
+//!   deps) and `cell_to_formulas` (direct deps), with BFS for
+//!   transitive cascading (Phase 3.4). Forward `add_edge`s for
+//!   direct cell→cell deps are added at extract time (Phase 3.4) so
+//!   the Phase 0 W3-3 iterative Tarjan in `topo::schedule` can order
+//!   chain dependents correctly. `schedule_dirty()` + `take_dirty()`
+//!   are the scheduler entry points; `cell_address_for(NodeId)` is
+//!   the inverse of `cell_node_for` for the runtime's evaluation
+//!   loop.
 
 pub mod calcgraph_session;
 pub mod env;

@@ -1,8 +1,8 @@
 # Calcgraph ↔ runtime integration
 
-**Status:** Engine Phase 3.3 SHIPPED (W5-36, 2026-05-12) — dirty propagation live  
-**Date:** 2026-05-12 (last touched for 3.3 close-out)  
-**Stability:** **STABLE** API surface; **3.4–3.10 will fill in the recompute scheduler / overlay / aggregate cache / etc.** but the 5-hook signature + `dirty_formulas` view + `take_dirty` claim-and-clear is the contract.
+**Status:** Engine Phase 3.4 SHIPPED (W5-37, 2026-05-12) — Tarjan SCC scheduler + `recompute_dirty` live  
+**Date:** 2026-05-12 (last touched for 3.4 close-out)  
+**Stability:** **STABLE** API surface; **3.5–3.10 will fill in the overlay / aggregate cache / volatile invalidation / etc.** but the 5-hook signature + `dirty_formulas` / `take_dirty` view + `schedule_dirty()` / `recompute_dirty()` entry points are the contract.
 
 This document describes how `ql-calcgraph::Graph` integrates with `ql_exec::WorkbookRuntime`. Engine Phase 3 (the "One Engine" integration phase) closes the gap between the Phase 0 calcgraph (`ql-calcgraph`, built for the bench / A4/A5 acceptance) and the runtime that's been used since Phase 1 W5-10 (`WorkbookRuntime`, currently HashMap-order recompute with no graph awareness).
 
@@ -99,8 +99,8 @@ The Phase 0 `Graph` is append-only — no API to remove edges or revoke a `regis
 These are tracked in `docs/known-gaps.md` and pinned to specific Phase 3 sub-items:
 
 - ✅ **Dependency extraction (Phase 3.2 / W5-35):** the dep walker + `FormulaDeps` collection + `cell_to_formulas` / `name_to_formulas` / `volatile_formulas` side-tables are all live.
-- ✅ **Dirty propagation (Phase 3.3 / W5-36):** the 5 hooks fan out via stripe + reverse index. `dirty_formulas()` / `take_dirty()` are the scheduler hooks.
-- **Topological recompute (Phase 3.4):** `recompute_all` still walks formulas in HashMap order (GAP-R-01). Phase 3.4 replaces it with Tarjan SCC over the dirty subset (per CORR-23).
+- ✅ **Dirty propagation (Phase 3.3 + 3.4 / W5-36, W5-37):** the 5 hooks fan out via stripe + reverse index. Phase 3.4 added BFS for transitive propagation so chain edits cascade. `dirty_formulas()` / `take_dirty()` / `schedule_dirty()` are the scheduler hooks.
+- ✅ **Topological recompute (Phase 3.4 / W5-37):** `WorkbookRuntime::recompute_dirty()` runs the Phase 0 W3-3 iterative Tarjan over the dirty set. `sorted` goes through the PlanCache evaluator; `cycled` gets `Value::Error(ErrorValue::Circ)`. `recompute_all` stays as the full-pass legacy entry point (`GAP-R-01` retargeted to Phase 6.1 for the API rename decision).
 - **Computed-overlay separation (Phase 3.5):** user edits and formula outputs share the same storage overlay today. Phase 3.5 splits them per CORR-25.
 - **Range aggregate cache (Phase 3.6):** `ExprPlan::AggregateNameRef` currently evaluates to `#CALC!`. Phase 3.6 implements actual range aggregate evaluation with HyperFormula-style per-function-name caching on RangeNodes.
 - **Volatile function invalidation (Phase 3.7):** `NOW()`, `RAND()`, `TODAY()` parse and evaluate today but have no dirty-propagation hook.
