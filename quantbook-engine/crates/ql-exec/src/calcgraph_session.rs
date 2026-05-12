@@ -837,6 +837,40 @@ impl CalcgraphSession {
         std::mem::take(&mut self.dirty)
     }
 
+    /// **Phase 3.7 (2026-05-12) — VOL-3-01/02 entry point.** Mark every
+    /// volatile formula (NOW / RAND / TODAY / RANDBETWEEN / RANDARRAY
+    /// / INDIRECT / OFFSET / INFO / CELL, per `is_volatile_function`)
+    /// dirty AND fan out the transitive reverse-dep graph from each
+    /// volatile cell so downstream formulas recompute too. This is
+    /// the "F9 / explicit recalc" trigger.
+    ///
+    /// Returns the number of volatile formulas marked. Zero means no
+    /// volatile formulas exist in the workbook — `recompute_dirty`
+    /// after this call will be a no-op.
+    pub fn mark_volatile_dirty(&mut self) -> usize {
+        let volatile: Vec<NodeId> = self.volatile_formulas.iter().copied().collect();
+        let count = volatile.len();
+        for v in volatile {
+            self.dirty.insert(v);
+            // Fan out from the volatile cell's address so downstream
+            // formulas reading its value also recompute (VOL-3-02).
+            // `mark_dirty_from_cell_write` does BFS via the reverse-
+            // dep + stripe path, so any chain or range dep is reached.
+            if let Some((s, r, c)) = self.cell_address_for(v) {
+                self.mark_dirty_from_cell_write(s, r, c);
+            }
+        }
+        count
+    }
+
+    /// Phase 3.7: count of formulas currently marked volatile (Phase
+    /// 3.2 populates via `is_volatile_function`). Test-only
+    /// observability; product code consumes `volatile_formulas()` or
+    /// calls `mark_volatile_dirty()` directly.
+    pub fn volatile_count(&self) -> usize {
+        self.volatile_formulas.len()
+    }
+
     /// Phase 3.6 — borrow the aggregate cache. The runtime passes this
     /// to `eval_scalar_with_cache` during `recompute_dirty` /
     /// `set_formula` so aggregate-over-range evals hit the cache when

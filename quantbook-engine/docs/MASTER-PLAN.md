@@ -298,11 +298,20 @@ The full v1 means all of these crates either ship real behavior or have a docume
    Notes: V1 caches only single-`AggregateNameRef`-arg calls. Multi-range and mixed-type args (`SUM(A, 5)`, `SUM(A, B)`) fall back to no-cache. Phase 4.7 (array formulas) revisits.  
    Effort: 5-8 days (actual: ~1 day; substrate from 3.5 overlay split made range reads clean).
 
-7. **3.7 Volatile Function Invalidation**  
+7. **3.7 Volatile Function Invalidation** ✅ SHIPPED 2026-05-12 (W5-40)  
    Model NOW/RAND/RANDBETWEEN and later volatile functions as graph roots invalidated by recompute cycle, edit, or explicit recalc mode. Add deterministic test mode.  
    References: `.references/formualizer/crates/formualizer-eval/src/rng.rs`; `.references/formualizer/crates/formualizer-eval/src/engine/tests/volatile_rng.rs`; `.references/ironcalc/base/src/functions/math_and_trigonometry/random.rs`.  
-   Acceptance: VOL-3-01 volatile formulas recompute when requested; VOL-3-02 nonvolatile dependents update if volatile value changes; VOL-3-03 deterministic RNG test fixture exists.  
-   Effort: 2-4 days.
+   Acceptance: VOL-3-01 ✅ `mark_volatile_dirty` + `recompute_dirty` produces a new RAND() value (`vol_3_01_volatile_formulas_recompute_when_requested`); VOL-3-02 ✅ non-volatile dependents update when volatile changes (`vol_3_02_nonvolatile_dependents_update_when_volatile_changes`); VOL-3-03 ✅ seeded RNG produces deterministic RAND() sequence (`vol_3_03_seeded_rng_produces_deterministic_rand_sequence`).  
+   Shipped:  
+   - New `ql-functions::volatile` module: NOW, TODAY, RAND, RANDBETWEEN. xorshift64 PRNG with thread-local state — no `rand` crate dep (Phase 0 pin-guard rule). Default seeds from SystemTime nanos; tests override via `set_test_rng_seed`. Excel epoch (1899-12-30) used for NOW/TODAY serial dates; `set_test_now_secs` pins for tests.  
+   - All 4 registered in `default_registry`. Registry count now 30 (was 26).  
+   - `CalcgraphSession::mark_volatile_dirty()` — adds all volatile formulas to the dirty set AND calls `mark_dirty_from_cell_write` for each to fan out the reverse-dep BFS (VOL-3-02 wiring; downstream chains pick up the new value). Returns count of marked formulas.  
+   - `CalcgraphSession::volatile_count()` for observability.  
+   - The Phase 3.2 substrate (`is_volatile_function` whitelist + `volatile_formulas` set populated during dep extraction) was already in place; 3.7 just wires the tick.  
+   - Public `ql_functions::{set_test_rng_seed, set_test_now_secs, clear_test_overrides}` for engine + IDE test fixtures.  
+   13 new tests (9 volatile unit + 3 VOL-3-01..03 acceptance + 1 zero-volatile-noop). ql-exec at 315, ql-functions at 72, workspace at 939.  
+   Notes: RANDARRAY / INDIRECT / OFFSET / INFO / CELL still deferred to Phase 4.3 (function library expansion). NOW/TODAY date arithmetic is approximate (Excel 1900 leap-year quirk not modeled); Phase 4.5 (date/time + format) pins exact semantics.  
+   Effort: 2-4 days (actual: ~1 day; substrate from 3.2 made this small).
 
 8. **3.8 Value-Equality Short-Circuit**  
    If a recomputed value is equal to the previous visible value, do not dirty downstream dependents beyond what is already required. Equality must respect Excel errors, blanks, numbers, text, bools, and dates.  

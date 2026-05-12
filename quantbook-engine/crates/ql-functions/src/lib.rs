@@ -24,9 +24,11 @@
 
 pub mod registry;
 pub mod scalar_fns;
+pub mod volatile;
 pub mod welford;
 
 pub use registry::{default_registry, FunctionRegistry, ScalarFn};
+pub use volatile::{clear_test_overrides, set_test_now_secs, set_test_rng_seed};
 pub use welford::{
     mean, population_stdev, population_variance, sample_stdev, sample_variance, WelfordState,
 };

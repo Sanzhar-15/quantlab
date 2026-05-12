@@ -3349,6 +3349,123 @@ mod tests {
         );
     }
 
+    // ----------------------------------------------------------------
+    // Phase 3.7 (W5-40) — VOL-3-01..03 acceptance tests.
+    // ----------------------------------------------------------------
+
+    /// VOL-3-03: deterministic RNG test fixture exists. The
+    /// `ql_functions::set_test_rng_seed` helper produces a fixed RAND()
+    /// sequence; re-seeding reproduces the same first value.
+    #[test]
+    fn vol_3_03_seeded_rng_produces_deterministic_rand_sequence() {
+        ql_functions::set_test_rng_seed(0xCAFE_F00D_DEAD_BEEF);
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v1 = rt.set_formula(0, 0, 0, "RAND()").unwrap();
+
+        // Re-seed and run again; same first value.
+        ql_functions::set_test_rng_seed(0xCAFE_F00D_DEAD_BEEF);
+        let mut wb2 = make_runtime_workbook();
+        let mut rt2 = WorkbookRuntime::new(&mut wb2, &reg);
+        let v2 = rt2.set_formula(0, 0, 0, "RAND()").unwrap();
+
+        assert_eq!(v1, v2, "VOL-3-03: same seed → same RAND() value");
+        match v1 {
+            Value::Number(n) => assert!((0.0..1.0).contains(&n)),
+            _ => panic!("RAND should return a Number"),
+        }
+        ql_functions::clear_test_overrides();
+    }
+
+    /// VOL-3-01: marking volatile dirty + recompute_dirty re-evaluates
+    /// the volatile formula. With the seeded RNG, the value advances
+    /// to the next position in the deterministic sequence.
+    #[test]
+    fn vol_3_01_volatile_formulas_recompute_when_requested() {
+        ql_functions::set_test_rng_seed(0x1234_5678_9ABC_DEF0);
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = crate::CalcgraphSession::new();
+        let initial = {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 0, "RAND()").unwrap()
+        };
+        assert_eq!(graph.volatile_count(), 1, "RAND() is volatile");
+
+        let marked = graph.mark_volatile_dirty();
+        assert_eq!(marked, 1);
+        let updated = {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            let _ = rt.recompute_dirty().expect("graph attached");
+            wb.read(ql_types::Address::new(0, 0, 0))
+        };
+        assert_ne!(
+            initial, updated,
+            "VOL-3-01: volatile formula must produce a new value after the tick"
+        );
+        ql_functions::clear_test_overrides();
+    }
+
+    /// VOL-3-02: a non-volatile formula `=A1 + 1` (where A1 = RAND())
+    /// recomputes when A1's volatile tick fires.
+    #[test]
+    fn vol_3_02_nonvolatile_dependents_update_when_volatile_changes() {
+        ql_functions::set_test_rng_seed(0xAAAA_BBBB_CCCC_DDDD);
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = crate::CalcgraphSession::new();
+        let (initial_a1, initial_b1) = {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            let a1 = rt.set_formula(0, 0, 0, "RAND()").unwrap();
+            let b1 = rt.set_formula(0, 0, 1, "A1 + 1").unwrap();
+            (a1, b1)
+        };
+        match (initial_a1.clone(), initial_b1.clone()) {
+            (Value::Number(a), Value::Number(b)) => {
+                assert!((a + 1.0 - b).abs() < 1e-12);
+            }
+            _ => panic!("expected Number values"),
+        }
+
+        graph.mark_volatile_dirty();
+        let (new_a1, new_b1) = {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            let _ = rt.recompute_dirty().expect("graph attached");
+            (
+                wb.read(ql_types::Address::new(0, 0, 0)),
+                wb.read(ql_types::Address::new(0, 0, 1)),
+            )
+        };
+        assert_ne!(initial_a1, new_a1, "RAND() advanced");
+        assert_ne!(initial_b1, new_b1, "B1 = A1 + 1 reflects new A1");
+        match (new_a1, new_b1) {
+            (Value::Number(a), Value::Number(b)) => assert!(
+                (a + 1.0 - b).abs() < 1e-12,
+                "VOL-3-02: B1 must still equal A1 + 1 after recompute"
+            ),
+            _ => panic!("expected Number values"),
+        }
+        ql_functions::clear_test_overrides();
+    }
+
+    /// Phase 3.7 extra: `mark_volatile_dirty` on a workbook with zero
+    /// volatile formulas returns 0 and leaves the dirty set empty.
+    #[test]
+    fn mark_volatile_dirty_zero_when_no_volatile_formulas() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = crate::CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 0, "1 + 1").unwrap();
+            rt.set_formula(0, 0, 1, "A1 * 2").unwrap();
+        }
+        let count = graph.mark_volatile_dirty();
+        assert_eq!(count, 0);
+        assert!(graph.dirty_formulas().is_empty());
+    }
+
     /// Phase 3.4: empty dirty (e.g. recompute_dirty called twice in a
     /// row with no edits between) returns an empty result.
     #[test]

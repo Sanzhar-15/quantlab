@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use ql_types::Value;
 
-use crate::scalar_fns;
+use crate::{scalar_fns, volatile};
 
 /// Function signature: pre-evaluated args → result Value.
 pub type ScalarFn = fn(&[Value]) -> Value;
@@ -124,6 +124,16 @@ pub fn default_registry() -> FunctionRegistry {
     // `scalar_fns::ai` doc.
     r.register("AI", scalar_fns::ai);
 
+    // Engine Phase 3.7 (W5-40, 2026-05-12): volatile functions. The
+    // `is_volatile_function` whitelist in `ql-exec::calcgraph_session`
+    // already covers these names; this registration is the executable
+    // half. RANDARRAY / INDIRECT / OFFSET / INFO / CELL stay deferred
+    // to the Phase 4.3 function library expansion.
+    r.register("NOW", volatile::now);
+    r.register("TODAY", volatile::today);
+    r.register("RAND", volatile::rand);
+    r.register("RANDBETWEEN", volatile::randbetween);
+
     r
 }
 
@@ -141,9 +151,10 @@ mod tests {
     #[test]
     fn default_registry_has_expected_count() {
         let r = default_registry();
-        // 26 entries — 23 distinct functions (22 W4-4 + AI sentinel per CORR-06)
-        // + 3 aliases (AVG, VAR, STDEV).
-        assert_eq!(r.len(), 26);
+        // 30 entries — 27 distinct functions (22 W4-4 + AI sentinel per
+        // CORR-06 + 4 volatile from Phase 3.7: NOW, TODAY, RAND,
+        // RANDBETWEEN) + 3 aliases (AVG, VAR, STDEV).
+        assert_eq!(r.len(), 30);
     }
 
     #[test]
