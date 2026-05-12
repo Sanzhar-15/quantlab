@@ -23,13 +23,29 @@ use ql_storage::Workbook;
 use crate::workbook_runtime::{RuntimeError, WorkbookRuntime};
 
 /// Combined error for the load + recompute pipeline.
+///
+/// Phase 2A.6 audit M5 (2026-05-12): `Recompute` is now a struct variant that
+/// carries the partially-recomputed `Workbook` alongside the underlying
+/// `RuntimeError`. Previously, a recompute failure dropped the partial
+/// workbook on the early-return path, denying the caller any recovery — the
+/// IDE couldn't show overlays or let the user inspect the partial state.
+/// Callers that don't need the partial workbook can simply ignore the field.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadAndRecomputeError {
     #[error("qbook load error: {0}")]
     Load(#[from] QbookError),
 
-    #[error("recompute error: {0}")]
-    Recompute(#[from] RuntimeError),
+    #[error("recompute error: {error}")]
+    Recompute {
+        /// The partially-recomputed workbook at the point of failure. Formula
+        /// cells already evaluated before the failure have their refreshed
+        /// values; cells past the failure point hold their pre-recompute
+        /// (potentially stale) saved values. Iteration order is HashMap-
+        /// arbitrary, so the partition between "refreshed" and "stale" is
+        /// non-deterministic per call.
+        workbook: Workbook,
+        error: RuntimeError,
+    },
 }
 
 /// Load a `.qbook/` directory and immediately recompute every formula cell so
@@ -41,19 +57,31 @@ pub enum LoadAndRecomputeError {
 /// dependencies may evaluate in an order that produces stale intermediate
 /// values. Phase 4 calcgraph integration fixes that.
 ///
-/// Errors from either stage surface as `LoadAndRecomputeError` — load errors
-/// short-circuit before any recompute work; recompute errors leave the
-/// workbook in a partial state (matching `WorkbookRuntime::recompute_all`).
+/// Errors from either stage surface as `LoadAndRecomputeError`:
+/// - Load errors short-circuit before any recompute work.
+/// - Recompute errors return the partially-recomputed workbook (Phase 2A.6
+///   audit M5) so the caller can show the partial state with error overlays.
+///
+/// The `clippy::result_large_err` lint is suppressed here: the `Recompute`
+/// variant deliberately carries a full `Workbook` so callers can recover from
+/// partial-state failures. Boxing it would defeat the purpose of audit M5
+/// (forcing every caller through an extra allocation just to access the
+/// payload they specifically asked for). This function is not in a hot path —
+/// it's the "Open file…" entry point.
+#[allow(clippy::result_large_err)]
 pub fn load_workbook_and_recompute(
     path: &Path,
     registry: &FunctionRegistry,
 ) -> Result<Workbook, LoadAndRecomputeError> {
     let mut workbook = ql_io::load_workbook(path)?;
-    {
+    let recompute_result = {
         let mut runtime = WorkbookRuntime::new(&mut workbook, registry);
-        runtime.recompute_all()?;
+        runtime.recompute_all()
+    };
+    match recompute_result {
+        Ok(_) => Ok(workbook),
+        Err(error) => Err(LoadAndRecomputeError::Recompute { workbook, error }),
     }
-    Ok(workbook)
 }
 
 #[cfg(test)]
@@ -181,9 +209,63 @@ mod tests {
         // current limitation: we expect a Recompute error from the loader.
         save_workbook(&wb, "named", &path).unwrap();
         let result = load_workbook_and_recompute(&path, &reg);
-        assert!(
-            matches!(result, Err(LoadAndRecomputeError::Recompute(_))),
-            "expected Recompute(UnresolvedName) since .qbook NameTable persistence is Phase 2B+, got {result:?}"
-        );
+        match result {
+            Err(LoadAndRecomputeError::Recompute { workbook: _, error }) => {
+                // Underlying error should be a bind-time UnresolvedName for TAXRATE.
+                use crate::plan::BindError;
+                use crate::workbook_runtime::RuntimeError;
+                assert!(
+                    matches!(error, RuntimeError::Bind(BindError::UnresolvedName(_))),
+                    "expected Bind(UnresolvedName), got {error:?}"
+                );
+            }
+            other => panic!("expected Recompute err, got {other:?}"),
+        }
+    }
+
+    /// Phase 2A.6 audit M5 (2026-05-12): on recompute failure, the loader must
+    /// preserve the partially-recomputed workbook in the error variant so the
+    /// caller can inspect / display the partial state. Previously the workbook
+    /// was dropped on the early-return path.
+    #[test]
+    fn recompute_failure_preserves_partial_workbook_in_error() {
+        use ql_storage::NamedTarget;
+        let (_dir, path) = temp_path("partial.qbook");
+
+        // Build a workbook with TWO formulas: one that recomputes cleanly,
+        // and one that depends on a named range. After save+load, the named
+        // range is gone (Phase 2B+ persistence gap), so the second formula
+        // fails to bind during recompute. The error should carry the
+        // partial workbook with the literal A1 value intact (and at least
+        // the formula text for both cells preserved).
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        wb.put_at(s, 0, 0, Value::Number(42.0));
+        wb.set_name("MyName", NamedTarget::Constant(Value::Number(7.0)));
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.set_formula(s, 1, 0, "A1 + 1").unwrap(); // resolves fine on reload
+            rt.set_formula(s, 2, 0, "MyName + 1").unwrap(); // breaks on reload
+        }
+        save_workbook(&wb, "partial", &path).unwrap();
+
+        match load_workbook_and_recompute(&path, &reg) {
+            Err(LoadAndRecomputeError::Recompute { workbook, error: _ }) => {
+                // The partial workbook is returned. Literal A1 is intact.
+                assert_eq!(workbook.read(Address::new(s, 0, 0)), Value::Number(42.0));
+                // Both formula texts are preserved on disk and survive load,
+                // regardless of recompute success.
+                assert_eq!(
+                    workbook.formula_at(s, 1, 0).map(|t| t.as_ref()),
+                    Some("A1 + 1")
+                );
+                assert_eq!(
+                    workbook.formula_at(s, 2, 0).map(|t| t.as_ref()),
+                    Some("MyName + 1")
+                );
+            }
+            other => panic!("expected Recompute err with partial workbook, got {other:?}"),
+        }
     }
 }
