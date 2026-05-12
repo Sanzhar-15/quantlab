@@ -133,6 +133,14 @@ pub enum RuntimeError {
     /// variant.
     #[error("op log error: {0}")]
     OpLog(#[from] ql_oplog::OpLogError),
+
+    /// Phase 2B.5 (2026-05-12): `WorkbookRuntime::set_name` couldn't register
+    /// the name in the workbook's `NameTable`. Currently the only
+    /// `NameTableError` variant is `Reserved` (per CORR-06 the `AI` name is
+    /// engine-reserved); see `ql_storage::NameTableError` for additional
+    /// variants when they land.
+    #[error("name table error: {0}")]
+    Name(#[from] ql_storage::NameTableError),
 }
 
 impl From<LexError> for RuntimeError {
@@ -394,6 +402,125 @@ impl<'a> WorkbookRuntime<'a> {
         }
 
         self.workbook.put_at(sheet, row, col, value);
+        self.workbook.clear_formula(sheet, row, col);
+        Ok(())
+    }
+
+    /// Phase 2B.5 (2026-05-12): register a defined name through the runtime,
+    /// emitting `Op::SetName` into the attached op log (if any). This is the
+    /// op-log-recording wrapper for `Workbook::set_name`; product code SHOULD
+    /// route through here so the mutation lands in the op log.
+    ///
+    /// Direct callers of `Workbook::set_name` bypass the op log silently —
+    /// that path is documented as low-level and intended only for tests, the
+    /// qbook loader (where the workbook is being constructed from disk and
+    /// op-log history is loaded separately), and other engine-internal
+    /// reconstruction code. See GAP-O-01 in `docs/known-gaps.md`.
+    pub fn set_name(
+        &mut self,
+        name: &str,
+        target: ql_storage::NamedTarget,
+    ) -> Result<(), RuntimeError> {
+        // Two failure modes here, unlike set_value / set_formula:
+        //   1. NameTable::set rejects reserved names (CORR-06: "AI").
+        //   2. Op log append fails (serde_json refusal, Loro internal error).
+        //
+        // We MUST NOT leave an orphan op-log entry if (1) fires — that
+        // entry would replay against a fresh workbook and trigger the
+        // same Reserved error, but it lingers as a corrupting "ghost
+        // mutation" in any persisted oplog.bin.
+        //
+        // Strategy: mutate first. NameTable::set is cheap and either
+        // succeeds outright or returns early without touching state.
+        // Once we know the mutation went through, append the op. If
+        // append THEN fails, the workbook is mutated and the log is
+        // missing the entry — uglier, but a true "engine internal"
+        // failure rather than a user-input rejection; surfaces as
+        // `RuntimeError::OpLog` for the caller to handle.
+        //
+        // Encoding canonicalizes the name to upper case to match the
+        // on-write canonicalization in `NameTable::set`, so the wire
+        // form is stable regardless of how the caller cased the name.
+        self.workbook.set_name(name, target.clone())?;
+        if let Some(oplog) = self.oplog.as_deref_mut() {
+            let target_wire = ql_io::NamedTargetWire::from_target(&target);
+            oplog.append(Op::SetName {
+                name: name.to_ascii_uppercase(),
+                target: target_wire,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Phase 2B.5 (2026-05-12): append a new sheet through the runtime,
+    /// emitting `Op::AddSheet` into the attached op log (if any). Returns
+    /// the new sheet's `SheetId`. Wraps `Workbook::add_sheet_with_chunk_rows`.
+    ///
+    /// `chunk_rows` is the per-sheet chunk size. Pass `16_384` (the engine
+    /// default) unless you have a specific reason — the qbook loader uses
+    /// the saved chunk_rows so layouts round-trip.
+    ///
+    /// Direct callers of `Workbook::add_sheet` / `add_sheet_with_chunk_rows`
+    /// bypass the op log silently — that path is documented as low-level.
+    /// See GAP-O-02 in `docs/known-gaps.md`.
+    pub fn add_sheet(
+        &mut self,
+        name: impl Into<String>,
+        chunk_rows: u32,
+    ) -> Result<SheetId, RuntimeError> {
+        let name: String = name.into();
+        if let Some(oplog) = self.oplog.as_deref_mut() {
+            oplog.append(Op::AddSheet {
+                name: name.clone(),
+                chunk_rows,
+            })?;
+        }
+        Ok(self.workbook.add_sheet_with_chunk_rows(name, chunk_rows))
+    }
+
+    /// Phase 2B.5 (2026-05-12): clear a cell's formula association through
+    /// the runtime, emitting `Op::ClearFormula` into the attached op log (if
+    /// any). Idempotent: clearing a cell with no formula is a no-op for the
+    /// workbook AND for the op log (no entry emitted) — avoiding spurious
+    /// "removed nothing" entries.
+    ///
+    /// Note: `set_value` already emits `ClearFormula` automatically when it
+    /// overwrites a formula cell. This method is for callers that want to
+    /// explicitly strip a formula without changing the cell's value.
+    ///
+    /// Direct callers of `Workbook::clear_formula` bypass the op log
+    /// silently. See GAP-O-03 in `docs/known-gaps.md`.
+    pub fn clear_formula(
+        &mut self,
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+    ) -> Result<(), RuntimeError> {
+        validate_cell(self.workbook, sheet, row, col)?;
+        let had_formula = self.workbook.formula_at(sheet, row, col).is_some();
+        if !had_formula {
+            // No-op: nothing to record, nothing to mutate.
+            return Ok(());
+        }
+        // Producer-replay equivalence: `Workbook::clear_formula` only strips
+        // the formula text; the cell's value (from the formula's most-recent
+        // evaluation) persists. Replay against a fresh workbook has no such
+        // value to preserve, so we record the current value via Op::PutValue
+        // BEFORE the Op::ClearFormula. Skip the PutValue when the current
+        // value is Blank (CellWireValue can't represent Blank in V0 —
+        // documented in `set_value`).
+        if let Some(oplog) = self.oplog.as_deref_mut() {
+            let current_value = self.workbook.read(ql_types::Address::new(sheet, row, col));
+            if let Some(wire) = CellWireValue::from_value(&current_value) {
+                oplog.append(Op::PutValue {
+                    sheet,
+                    row,
+                    col,
+                    value: wire,
+                })?;
+            }
+            oplog.append(Op::ClearFormula { sheet, row, col })?;
+        }
         self.workbook.clear_formula(sheet, row, col);
         Ok(())
     }
@@ -1754,5 +1881,261 @@ mod tests {
             }
             other => panic!("expected NamedFormulaUnsupported, got {other:?}"),
         }
+    }
+
+    // ===== Phase 2B.5 — op-log producer coverage =====
+
+    /// OPL-2B-01 (part 1): `WorkbookRuntime::set_name` records `Op::SetName`
+    /// in the attached op log AND registers the name in the workbook's
+    /// NameTable. Without an op log, behavior is identical to
+    /// `Workbook::set_name` (no recording).
+    #[test]
+    fn runtime_set_name_emits_op_into_attached_oplog() {
+        use ql_oplog::{Op, OpLog};
+        use ql_storage::NamedTarget;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.set_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)))
+                .unwrap();
+        }
+        // NameTable has the new binding.
+        assert!(matches!(
+            wb.names().lookup_ci("TaxRate"),
+            Some(NamedTarget::Constant(Value::Number(n))) if n == 0.21
+        ));
+        // Op log has the matching Op::SetName.
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            Op::SetName { name, target } => {
+                // Op log records the canonicalized (uppercase) name.
+                assert_eq!(name, "TAXRATE");
+                // Wire form is NamedTargetWire::Constant for a constant target.
+                assert!(matches!(target, ql_io::NamedTargetWire::Constant { .. }));
+            }
+            other => panic!("expected SetName, got {other:?}"),
+        }
+    }
+
+    /// OPL-2B-01 (part 2): `WorkbookRuntime::add_sheet` records `Op::AddSheet`
+    /// in the attached op log AND adds the sheet to the workbook. Returns
+    /// the new SheetId.
+    #[test]
+    fn runtime_add_sheet_emits_op_into_attached_oplog() {
+        use ql_oplog::{Op, OpLog};
+        let mut wb = Workbook::new();
+        // Pre-existing sheet 0.
+        wb.add_sheet("Existing");
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        let new_id = {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.add_sheet("NewSheet", 16_384).unwrap()
+        };
+        assert_eq!(new_id, 1);
+        assert_eq!(wb.sheet_count(), 2);
+
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            Op::AddSheet { name, chunk_rows } => {
+                assert_eq!(name, "NewSheet");
+                assert_eq!(*chunk_rows, 16_384);
+            }
+            other => panic!("expected AddSheet, got {other:?}"),
+        }
+    }
+
+    /// OPL-2B-01 (part 3): `WorkbookRuntime::clear_formula` records
+    /// `Op::PutValue(current_value) + Op::ClearFormula` when there was a
+    /// formula to clear (so replay preserves the cell value, matching the
+    /// "strip formula, keep value" semantic of `Workbook::clear_formula`).
+    /// Clearing a non-formula cell is a no-op for both the workbook and
+    /// the log.
+    #[test]
+    fn runtime_clear_formula_emits_ops_when_formula_present() {
+        use ql_oplog::{Op, OpLog};
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            // Seed a formula at (0, 0, 0). It evaluates to 2.
+            rt.set_formula(0, 0, 0, "1 + 1").unwrap();
+            // No-op clear on a different cell: no ops emitted.
+            rt.clear_formula(0, 1, 0).unwrap();
+            // Real clear: emits PutValue(2) + ClearFormula.
+            rt.clear_formula(0, 0, 0).unwrap();
+        }
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        // Expect: PutFormula (from set_formula) +
+        //         PutValue (preserves the evaluated value) +
+        //         ClearFormula (the actual strip).
+        assert_eq!(ops.len(), 3, "ops were: {ops:?}");
+        assert!(matches!(ops[0], Op::PutFormula { .. }));
+        match &ops[1] {
+            Op::PutValue {
+                sheet,
+                row,
+                col,
+                value,
+            } => {
+                assert_eq!((*sheet, *row, *col), (0, 0, 0));
+                assert_eq!(value, &ql_io::CellWireValue::Number(2.0));
+            }
+            other => panic!("expected PutValue(2), got {other:?}"),
+        }
+        match &ops[2] {
+            Op::ClearFormula { sheet, row, col } => {
+                assert_eq!((*sheet, *row, *col), (0, 0, 0));
+            }
+            other => panic!("expected ClearFormula, got {other:?}"),
+        }
+        // Workbook state: formula gone; value preserved at the last
+        // evaluated result (2.0).
+        assert!(wb.formula_at(0, 0, 0).is_none());
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Number(2.0));
+    }
+
+    /// OPL-2B-01 (regression): without an attached op log, the new
+    /// runtime methods behave identically to the underlying Workbook
+    /// methods (no panics, no errors, no recording).
+    #[test]
+    fn runtime_set_name_add_sheet_clear_formula_work_without_oplog() {
+        use ql_storage::NamedTarget;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // Long unambiguous name — short identifiers like `Foo` can collide
+        // with the parser's bare-column-pair heuristic.
+        rt.set_name("MyValue", NamedTarget::Constant(Value::Number(7.0)))
+            .unwrap();
+        let id = rt.add_sheet("AnotherSheet", 16_384).unwrap();
+        assert_eq!(id, 1);
+
+        // Set + clear a formula on the new sheet.
+        rt.set_formula(id, 0, 0, "MyValue * 2").unwrap();
+        rt.clear_formula(id, 0, 0).unwrap();
+        // Cell value untouched by clear_formula (only the formula
+        // association was removed).
+        assert_eq!(
+            wb.read(ql_types::Address::new(id, 0, 0)),
+            Value::Number(14.0)
+        );
+        assert!(wb.formula_at(id, 0, 0).is_none());
+    }
+
+    /// OPL-2B-01 (reserved name): `WorkbookRuntime::set_name` propagates
+    /// `NameTableError::Reserved` (per CORR-06, "AI" is reserved) AND
+    /// leaves the op log untouched. The runtime uses mutate-first ordering
+    /// for set_name specifically because NameTable::set has its own failure
+    /// mode beyond op-log append.
+    #[test]
+    fn runtime_set_name_reserved_name_does_not_append_op() {
+        use ql_oplog::OpLog;
+        use ql_storage::NamedTarget;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        let result = {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.set_name("AI", NamedTarget::Constant(Value::Number(0.0)))
+        };
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Name(ql_storage::NameTableError::Reserved(_)))
+        ));
+        // Op log must be empty — no ghost entry for a rejected mutation.
+        assert!(
+            oplog.is_empty(),
+            "rejected set_name must not leave a ghost op in the log; got {} ops",
+            oplog.len()
+        );
+    }
+
+    /// OPL-2B-02: producer/replay equivalence across the full op vocabulary
+    /// (PutValue, PutFormula, ClearFormula, SetName, AddSheet, BatchCommit).
+    /// Producer uses the runtime; replay against fresh workbook + recompute
+    /// yields the same observable state, including names + extra sheet.
+    #[test]
+    fn opl_2b_02_full_op_vocabulary_producer_replay_equivalence() {
+        use ql_oplog::{replay_into, OpLog};
+        use ql_storage::NamedTarget;
+        let mut producer_wb = Workbook::new();
+        producer_wb.add_sheet("S0");
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut producer_wb, &reg, &mut oplog);
+            // SetName.
+            rt.set_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)))
+                .unwrap();
+            // AddSheet.
+            let sheet_id = rt.add_sheet("S1", 16_384).unwrap();
+            // PutValue on sheet 0.
+            rt.set_value(0, 0, 0, Value::Number(100.0)).unwrap();
+            // PutFormula on sheet 0.
+            rt.set_formula(0, 0, 1, "A1 * TaxRate").unwrap();
+            // PutValue + ClearFormula (set_value over a formula cell).
+            rt.set_formula(0, 0, 2, "A1 + 1").unwrap();
+            rt.set_value(0, 0, 2, Value::Number(999.0)).unwrap();
+            // Explicit ClearFormula on a fresh formula cell.
+            rt.set_formula(0, 0, 3, "A1 - 1").unwrap();
+            rt.clear_formula(0, 0, 3).unwrap();
+            // Transaction → BatchCommit on sheet 1.
+            {
+                let mut tx = rt.transaction();
+                tx.put_value(sheet_id, 0, 0, Value::Number(7.0)).unwrap();
+                tx.put_formula(sheet_id, 0, 1, "A1 * 2").unwrap();
+                tx.commit().unwrap();
+            }
+        }
+
+        // Replay against a fresh workbook.
+        let mut replay_wb = Workbook::new();
+        replay_wb.add_sheet("S0");
+        replay_into(&oplog, &mut replay_wb, &reg).unwrap();
+        // Recompute_all to materialize formula values from replayed text.
+        {
+            let mut rt = WorkbookRuntime::new(&mut replay_wb, &reg);
+            assert!(rt.recompute_all().is_complete());
+        }
+
+        // Equivalence: sheet count, name table, every cell + formula text.
+        assert_eq!(replay_wb.sheet_count(), producer_wb.sheet_count());
+        assert_eq!(replay_wb.sheet_count(), 2);
+        // Name persisted.
+        assert!(matches!(
+            replay_wb.names().lookup_ci("TaxRate"),
+            Some(NamedTarget::Constant(Value::Number(n))) if n == 0.21
+        ));
+        // Cell values match on sheet 0.
+        for col in 0..4 {
+            assert_eq!(
+                replay_wb.read(ql_types::Address::new(0, 0, col)),
+                producer_wb.read(ql_types::Address::new(0, 0, col)),
+                "cell (0, 0, {col}) differs"
+            );
+        }
+        // Cell values match on sheet 1.
+        for col in 0..2 {
+            assert_eq!(
+                replay_wb.read(ql_types::Address::new(1, 0, col)),
+                producer_wb.read(ql_types::Address::new(1, 0, col)),
+                "cell (1, 0, {col}) differs"
+            );
+        }
+        // Formula at (0, 0, 3) was cleared in both.
+        assert!(replay_wb.formula_at(0, 0, 3).is_none());
+        // Cell (0, 0, 2) was overwritten by set_value — formula text gone in both.
+        assert!(replay_wb.formula_at(0, 0, 2).is_none());
+        assert_eq!(
+            replay_wb.read(ql_types::Address::new(0, 0, 2)),
+            Value::Number(999.0)
+        );
     }
 }

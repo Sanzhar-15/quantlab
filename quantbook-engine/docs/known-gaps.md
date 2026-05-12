@@ -32,9 +32,9 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 
 | ID | Gap | Reproduce | Owner | Target phase |
 |---|---|---|---|---|
-| GAP-O-01 | `Workbook::set_name` mutation bypasses op log | `ql-storage/src/workbook.rs::set_name`; runtime has no wrapper | Engine | Engine Phase 2B.5 (op-log producer coverage audit) |
-| GAP-O-02 | `Workbook::add_sheet` mutation bypasses op log | `ql-storage/src/workbook.rs::add_sheet`; runtime has no wrapper | Engine | Engine Phase 2B.5 |
-| GAP-O-03 | Direct `Workbook::put_at` callable from product code; bypasses op log | All product paths SHOULD go through `WorkbookRuntime::set_value`, but `put_at` is `pub` | Engine | Engine Phase 2B.5 |
+| ~~GAP-O-01~~ | ~~`Workbook::set_name` bypass~~ — **CLOSED** in commit-after-f64ff00dcb1 (Engine Phase 2B.5): `WorkbookRuntime::set_name` wrapper emits `Op::SetName`; `Workbook::set_name` doc-marked as low-level. Mutate-first ordering guards against ghost-op-on-reserved-name. |
+| ~~GAP-O-02~~ | ~~`Workbook::add_sheet` bypass~~ — **CLOSED** in commit-after-f64ff00dcb1: `WorkbookRuntime::add_sheet(name, chunk_rows)` wrapper emits `Op::AddSheet`. Direct `Workbook::add_sheet` / `add_sheet_with_chunk_rows` doc-marked as low-level (used by qbook loader). |
+| ~~GAP-O-03~~ | ~~Direct `put_at` / `clear_formula` bypass~~ — **CLOSED** in commit-after-f64ff00dcb1: `WorkbookRuntime::clear_formula` wrapper emits `Op::PutValue(current) + Op::ClearFormula` (preserves "strip formula, keep value" semantic across replay). Direct `Workbook::put_at` / `clear_formula` doc-marked as low-level. `Workbook::put_at` remains pub for the qbook loader + runtime-internal recompute pass 2 + tests; product code routes through `WorkbookRuntime::set_value`. |
 | GAP-O-04 | `set_value(Value::Blank)` emits no `PutValue` (CellWireValue lacks Blank variant) — documented limitation | `ql-exec/src/workbook_runtime.rs::set_value` comment cites this | Engine | Engine Phase 5 (CRDT model) or earlier if forced |
 | GAP-O-05 | NaN / Inf in `PutValue` — `serde_json` refuses; surfaces as `RuntimeError::OpLog` | `ql-oplog/src/log.rs::append` serialization path | Engine | Engine Phase 5 or earlier |
 
@@ -121,6 +121,7 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 ## Closed gaps
 
 - **GAP-R-03** (bind-plan re-derivation) — closed in Engine Phase 2B.3. See struck-through entry above for the closing summary.
+- **GAP-O-01 / GAP-O-02 / GAP-O-03** (op-log producer bypasses for set_name / add_sheet / put_at + clear_formula) — closed in Engine Phase 2B.5. Runtime wrappers route through the op log; direct Workbook methods doc-marked as low-level. Producer-replay equivalence covers the full Op vocabulary (PutValue, PutFormula, ClearFormula, SetName, AddSheet, BatchCommit).
 
 ---
 

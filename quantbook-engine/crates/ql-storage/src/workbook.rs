@@ -237,6 +237,14 @@ impl Workbook {
     /// `NameTable::set` (this is a thin pass-through). Phase 2A.9 audit M6:
     /// reserved-name registration (currently `AI` per CORR-06) is refused —
     /// callers must handle or `.expect(...)` the `Result`.
+    ///
+    /// **Phase 2B.5 (2026-05-12) — LOW-LEVEL.** This method bypasses the op
+    /// log silently: callers that want their name registration to land in an
+    /// attached `OpLog` must go through `ql_exec::WorkbookRuntime::set_name`
+    /// instead. Direct `Workbook::set_name` callers are: (a) the qbook
+    /// loader (reconstructing from disk; op-log is loaded separately), and
+    /// (b) tests / engine-internal reconstruction code. Tracked as
+    /// GAP-O-01 in `docs/known-gaps.md`.
     pub fn set_name(&mut self, name: &str, target: NamedTarget) -> Result<(), NameTableError> {
         self.names.set(name, target)
     }
@@ -244,6 +252,11 @@ impl Workbook {
     /// Append a new sheet; returns its `SheetId`. Panics if the next ID would exceed
     /// `SheetId::MAX` (65,535). Excel allows ≤255 sheets in practice; we cap at the type
     /// limit so the ID always fits the field.
+    ///
+    /// **Phase 2B.5 (2026-05-12) — LOW-LEVEL.** Bypasses the op log
+    /// silently — use `ql_exec::WorkbookRuntime::add_sheet` to record the
+    /// sheet creation in an attached `OpLog`. Tracked as GAP-O-02 in
+    /// `docs/known-gaps.md`.
     pub fn add_sheet(&mut self, name: impl Into<String>) -> SheetId {
         let id = self.sheets.len();
         assert!(
@@ -260,6 +273,12 @@ impl Workbook {
     /// (W5-6 `load_workbook`) to reconstruct sheets at the saved chunk layout.
     /// Audit L7 fix (2026-05-12): doc previously said "test-only" but production
     /// code calls this.
+    ///
+    /// **Phase 2B.5 (2026-05-12) — LOW-LEVEL.** Bypasses the op log. Use
+    /// `ql_exec::WorkbookRuntime::add_sheet` for op-log-recording sheet
+    /// creation. The qbook loader calls this directly because op-log
+    /// reconstruction is the loader's job (it replays the saved
+    /// `oplog.bin`), not this method's. GAP-O-02.
     pub fn add_sheet_with_chunk_rows(
         &mut self,
         name: impl Into<String>,
@@ -319,6 +338,14 @@ impl Workbook {
     }
 
     /// Convenience: write a literal row,col,value tuple without constructing an Address.
+    ///
+    /// **Phase 2B.5 (2026-05-12) — LOW-LEVEL.** Bypasses the op log AND the
+    /// runtime's bind-plan cache; does NOT clear any pre-existing formula
+    /// at the cell (use `clear_formula` separately if needed). Product code
+    /// should route through `ql_exec::WorkbookRuntime::set_value`, which
+    /// records `Op::PutValue` + an optional `Op::ClearFormula`. Direct
+    /// `put_at` is for the qbook loader, the op-log replay path, runtime-
+    /// internal pass 2 of formula recompute, and tests. GAP-O-03.
     pub fn put_at(&mut self, sheet: SheetId, row: RowId, col: ColId, value: Value) {
         self.put(Address::new(sheet, row, col), value);
     }
@@ -368,6 +395,10 @@ impl Workbook {
     /// Remove any formula association for a cell. Used when a formula cell becomes a
     /// literal (e.g. user types over the formula with a value). Idempotent: removing
     /// a non-existent entry is a no-op.
+    ///
+    /// **Phase 2B.5 (2026-05-12) — LOW-LEVEL.** Bypasses the op log. Use
+    /// `ql_exec::WorkbookRuntime::clear_formula` to record `Op::ClearFormula`
+    /// in an attached log. GAP-O-03.
     pub fn clear_formula(&mut self, sheet: SheetId, row: RowId, col: ColId) {
         self.formula_cells.remove(&(sheet, row, col));
     }
