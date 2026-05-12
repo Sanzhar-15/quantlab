@@ -176,19 +176,34 @@ fn e2e_var_s_via_alias() {
 
 #[test]
 fn e2e_ai_function_returns_ai_not_available() {
-    // =AI("prompt") per CORR-06: parser emits Function { name: "AI", ... }; the binder/
-    // evaluator should map to ErrorValue::AINotAvailable.
-    //
-    // The current ql-functions registry doesn't have AI registered (it's not a real
-    // function — the Phase 0 intent was for the binder/evaluator to return the error).
-    // Without registry entry, eval_scalar_with_registry returns Name error.
-    //
-    // For Phase 0 W5-3 acceptance, verify the parser + bind chain WORKS (no panic, no
-    // bind error). The actual AINotAvailable mapping is a Phase 1 follow-up that
-    // hooks at the runtime layer.
+    // =AI("prompt") per CORR-06 / T4-D05: parser emits Function { name: "AI", ... };
+    // the AI sentinel function in the registry returns Error(AINotAvailable).
+    // W5-4: previously this returned Name error (no AI registered); now properly
+    // honors the spec sigil.
     use ql_types::ErrorValue;
     let result = eval_source_with_registry(r#"AI("prompt")"#, &[]);
-    assert_eq!(result, Value::Error(ErrorValue::Name));
+    assert_eq!(result, Value::Error(ErrorValue::AINotAvailable));
+}
+
+#[test]
+fn e2e_ai_with_no_args_also_returns_ai_not_available() {
+    // =AI() bare — same sentinel.
+    use ql_types::ErrorValue;
+    let result = eval_source_with_registry("AI()", &[]);
+    assert_eq!(result, Value::Error(ErrorValue::AINotAvailable));
+}
+
+#[test]
+fn e2e_ai_case_insensitive_dispatch() {
+    use ql_types::ErrorValue;
+    for src in [r#"AI("x")"#, r#"ai("x")"#, r#"Ai("x")"#] {
+        let result = eval_source_with_registry(src, &[]);
+        assert_eq!(
+            result,
+            Value::Error(ErrorValue::AINotAvailable),
+            "src={src}"
+        );
+    }
 }
 
 #[test]

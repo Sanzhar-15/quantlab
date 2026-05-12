@@ -99,6 +99,10 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("MOD", scalar_fns::r#mod);
     r.register("POWER", scalar_fns::power);
 
+    // AI reservation per CORR-06 / T4-D05 — returns Error(AINotAvailable). See
+    // `scalar_fns::ai` doc.
+    r.register("AI", scalar_fns::ai);
+
     r
 }
 
@@ -116,8 +120,25 @@ mod tests {
     #[test]
     fn default_registry_has_expected_count() {
         let r = default_registry();
-        // 25 entries — 22 distinct functions + 3 aliases (AVG, VAR, STDEV).
-        assert_eq!(r.len(), 25);
+        // 26 entries — 23 distinct functions (22 W4-4 + AI sentinel per CORR-06)
+        // + 3 aliases (AVG, VAR, STDEV).
+        assert_eq!(r.len(), 26);
+    }
+
+    #[test]
+    fn ai_dispatches_to_not_available_sentinel() {
+        use ql_types::ErrorValue;
+        let r = default_registry();
+        let ai = r.lookup("AI").expect("AI is registered");
+        // AI ignores its args and returns the AINotAvailable error.
+        assert_eq!(ai(&[]), Value::Error(ErrorValue::AINotAvailable));
+        assert_eq!(
+            ai(&[Value::Number(1.0), Value::text("prompt")]),
+            Value::Error(ErrorValue::AINotAvailable)
+        );
+        // Case-insensitive lookup works.
+        let ai_lower = r.lookup("ai").expect("ai (lowercase) resolves");
+        assert_eq!(ai_lower(&[]), Value::Error(ErrorValue::AINotAvailable));
     }
 
     #[test]

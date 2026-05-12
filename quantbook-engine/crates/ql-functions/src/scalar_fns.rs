@@ -464,6 +464,21 @@ pub fn power(args: &[Value]) -> Value {
     }
 }
 
+// ===== AI reservation (CORR-06 / T4-D05) =====
+
+/// `AI(...)` — reserved Excel function name per CORR-06. Until Quantbook ships the AI
+/// integration (v2 conditional), invocation returns `Error(ErrorValue::AINotAvailable)`
+/// with the sigil `#AI_NOT_AVAILABLE_V1`. Args are ignored (Error propagation skipped on
+/// purpose — even `=AI(BADREF)` returns AINotAvailable, not Ref, because the function
+/// is not actually called).
+///
+/// Per the no-fallbacks rule's exception clause (CLAUDE.md "explicit, user-requested
+/// error handling at system boundaries"): this is the canonical Quantbook sigil for
+/// "AI feature not available," not a silent error swallow.
+pub fn ai(_args: &[Value]) -> Value {
+    Value::Error(ErrorValue::AINotAvailable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,5 +768,19 @@ mod tests {
     fn arc_str_value_preserved_through_iferror() {
         let s = Value::Text(Arc::from("hello"));
         assert_eq!(iferror(&[s.clone(), n(0.0)]), s);
+    }
+
+    // ===== AI reservation (CORR-06) =====
+
+    #[test]
+    fn ai_no_args_returns_not_available() {
+        assert_eq!(ai(&[]), Value::Error(ErrorValue::AINotAvailable));
+    }
+
+    #[test]
+    fn ai_with_args_still_returns_not_available() {
+        // Args ignored — even arguments with errors don't propagate.
+        let args = [Value::text("prompt"), Value::Error(ErrorValue::Ref)];
+        assert_eq!(ai(&args), Value::Error(ErrorValue::AINotAvailable));
     }
 }
