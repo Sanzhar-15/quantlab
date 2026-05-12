@@ -5,6 +5,9 @@
 //! - `names: NameTable` — workbook-level defined names. Phase 0 ships an empty stub; full
 //!   resolution + scoping lands with `ql-formula-semantics` in Week 2 Day 6+.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use ql_types::{Address, ColId, Range, RowId, SheetId, Value};
 
 use crate::sheet::Sheet;
@@ -53,10 +56,22 @@ impl NameTable {
 }
 
 /// Top-level Quantbook container.
+///
+/// Phase 1 W5-9 adds `formula_cells`: a HashMap keyed by `(sheet, row, col)` mapping
+/// formula-bearing cells to their formula source text (e.g. `"A1 + B1"`). The cell's
+/// EVALUATED result still lives in the Sheet's columnar storage as a Value; this map
+/// records that the value was *produced by a formula* (so it can be recomputed and so
+/// the save path persists the formula). Cells without an entry here are literals.
+///
+/// This is the minimum Phase 1 formula-persistence model. Phase 4+ adds:
+/// - Calcgraph dependency tracking (computed-overlay separation per CORR-25).
+/// - Automatic recompute on dependency change.
+/// - Cross-sheet formula references.
 #[derive(Clone, Debug, Default)]
 pub struct Workbook {
     sheets: Vec<Sheet>,
     names: NameTable,
+    formula_cells: HashMap<(SheetId, RowId, ColId), Arc<str>>,
 }
 
 impl Workbook {
@@ -139,6 +154,48 @@ impl Workbook {
     /// Convenience: write a literal row,col,value tuple without constructing an Address.
     pub fn put_at(&mut self, sheet: SheetId, row: RowId, col: ColId, value: Value) {
         self.put(Address::new(sheet, row, col), value);
+    }
+
+    /// Phase 1 W5-9: record formula source text for a cell. The caller is responsible
+    /// for evaluating the formula and storing the result via `put`/`put_at` — this
+    /// method just persists the formula association. Pass an empty string or omit the
+    /// call to mark a cell as literal-only.
+    ///
+    /// `formula` is the formula body WITHOUT the leading `=` (matching Excel's
+    /// canonical AST representation).
+    pub fn put_formula(
+        &mut self,
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        formula: impl Into<Arc<str>>,
+    ) {
+        self.formula_cells.insert((sheet, row, col), formula.into());
+    }
+
+    /// Remove any formula association for a cell. Used when a formula cell becomes a
+    /// literal (e.g. user types over the formula with a value). Idempotent: removing
+    /// a non-existent entry is a no-op.
+    pub fn clear_formula(&mut self, sheet: SheetId, row: RowId, col: ColId) {
+        self.formula_cells.remove(&(sheet, row, col));
+    }
+
+    /// Borrow the formula source for a cell, if it has one.
+    pub fn formula_at(&self, sheet: SheetId, row: RowId, col: ColId) -> Option<&Arc<str>> {
+        self.formula_cells.get(&(sheet, row, col))
+    }
+
+    /// Count of formula cells across the workbook.
+    pub fn formula_count(&self) -> usize {
+        self.formula_cells.len()
+    }
+
+    /// Iterate every formula cell as `(sheet, row, col, formula)`. Iteration order is
+    /// HashMap-arbitrary; callers that need determinism (qbook save) should sort first.
+    pub fn iter_formulas(&self) -> impl Iterator<Item = (SheetId, RowId, ColId, &Arc<str>)> + '_ {
+        self.formula_cells
+            .iter()
+            .map(|((s, r, c), f)| (*s, *r, *c, f))
     }
 }
 
@@ -250,5 +307,88 @@ mod tests {
             Value::Error(ErrorValue::AINotAvailable)
         );
         assert_eq!(wb.read(Address::new(s, 5, 0)), Value::Blank);
+    }
+
+    // ===== W5-9: formula_cells =====
+
+    #[test]
+    fn formula_cells_default_empty() {
+        let wb = Workbook::new();
+        assert_eq!(wb.formula_count(), 0);
+        assert!(wb.formula_at(0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn put_and_get_formula() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        wb.put_formula(s, 0, 0, "A1 + B1");
+        assert_eq!(wb.formula_count(), 1);
+        assert_eq!(wb.formula_at(s, 0, 0).map(|s| s.as_ref()), Some("A1 + B1"));
+        assert!(wb.formula_at(s, 0, 1).is_none());
+    }
+
+    #[test]
+    fn clear_formula_removes_entry() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        wb.put_formula(s, 0, 0, "A1 + 1");
+        wb.clear_formula(s, 0, 0);
+        assert_eq!(wb.formula_count(), 0);
+        assert!(wb.formula_at(s, 0, 0).is_none());
+    }
+
+    #[test]
+    fn clear_nonexistent_formula_is_noop() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        // No panic; idempotent.
+        wb.clear_formula(0, 5, 5);
+        assert_eq!(wb.formula_count(), 0);
+    }
+
+    #[test]
+    fn put_formula_replaces_existing() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        wb.put_formula(s, 0, 0, "A1 + 1");
+        wb.put_formula(s, 0, 0, "B1 * 2");
+        assert_eq!(wb.formula_count(), 1);
+        assert_eq!(wb.formula_at(s, 0, 0).map(|s| s.as_ref()), Some("B1 * 2"));
+    }
+
+    #[test]
+    fn iter_formulas_yields_all() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        wb.put_formula(s, 0, 0, "f1");
+        wb.put_formula(s, 1, 0, "f2");
+        wb.put_formula(s, 5, 3, "f3");
+        let mut items: Vec<_> = wb
+            .iter_formulas()
+            .map(|(sh, r, c, f)| (sh, r, c, f.as_ref().to_owned()))
+            .collect();
+        items.sort();
+        assert_eq!(
+            items,
+            vec![
+                (s, 0, 0, "f1".to_owned()),
+                (s, 1, 0, "f2".to_owned()),
+                (s, 5, 3, "f3".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn formula_and_value_coexist_on_same_cell() {
+        // A formula cell ALSO holds an evaluated value in the Sheet's columnar storage.
+        // The caller (or future runtime) is responsible for keeping them consistent.
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        wb.put_at(s, 0, 0, Value::Number(42.0));
+        wb.put_formula(s, 0, 0, "A1 + 1");
+        // Both visible.
+        assert_eq!(wb.read(Address::new(s, 0, 0)), Value::Number(42.0));
+        assert_eq!(wb.formula_at(s, 0, 0).map(|s| s.as_ref()), Some("A1 + 1"));
     }
 }

@@ -123,11 +123,19 @@ pub struct SheetEnvelope {
 ///
 /// Tagged enum representation keeps the wire format compact + self-describing:
 /// `{"row":5,"col":3,"value":{"Number":42.0}}`.
+///
+/// W5-9 added the optional `formula` field. If `Some`, the cell carries a formula
+/// whose evaluated result is `value`. If `None` (or absent in the JSON), the cell is
+/// a literal value. Old W5-6 schema-v1 files without a `formula` field load as
+/// literal-only cells (the absent field defaults to `None` via serde).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CellRecord {
     pub row: u32,
     pub col: u32,
     pub value: CellWireValue,
+    /// Formula source (without leading `=`). Phase 1 W5-9. Omitted from JSON when None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formula: Option<String>,
 }
 
 /// Wire-format mirror of `ql_types::Value`. Phase 1 W5-6 doesn't add Serialize to
@@ -303,14 +311,29 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
         let f = fs::File::create(&sheet_path)?;
         let mut writer = BufWriter::new(f);
         let bounds = sheet.bounds();
-        // Naive iteration: walk every (row, col) within bounds. Sparse cells (Blank)
+
+        // Collect formula cells for this sheet so we can emit them even when their
+        // row/col falls outside the value-bounds rectangle (e.g. a formula cell
+        // with no evaluated value yet, or a formula at an extreme position).
+        // Sort by (row, col) for deterministic output.
+        let mut formula_positions: Vec<(RowId, ColId)> = wb
+            .iter_formulas()
+            .filter(|(s, _, _, _)| *s == sheet_id)
+            .map(|(_, r, c, _)| (r, c))
+            .collect();
+        formula_positions.sort();
+
+        // Track which (row, col) pairs we've already written from the value-bounds
+        // sweep, so the formula-only pass doesn't double-emit.
+        let mut written: std::collections::HashSet<(RowId, ColId)> =
+            std::collections::HashSet::new();
+
+        // Naive iteration over value bounds. Sparse cells (Blank without a formula)
         // are skipped. Phase 2 may optimize via direct chunk-walking; not on hot path.
         for row in 0..bounds.row_extent {
             for col in 0..bounds.col_extent {
                 let v = sheet.read(row, col);
                 // Audit M6 fix (2026-05-12): reject NaN/Inf at the save boundary.
-                // serde_json silently encodes NaN as `null`, producing files that
-                // fail to load — silent corruption. Validate explicitly.
                 if let Value::Number(n) = v {
                     if !n.is_finite() {
                         return Err(QbookError::NonFiniteNumber {
@@ -321,16 +344,54 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
                         });
                     }
                 }
-                if let Some(wire) = CellWireValue::from_value(&v) {
+                let wire = CellWireValue::from_value(&v);
+                let formula = wb
+                    .formula_at(sheet_id, row, col)
+                    .map(|s| s.as_ref().to_owned());
+                // Emit if there's a non-blank value OR a formula.
+                if wire.is_some() || formula.is_some() {
                     let rec = CellRecord {
                         row,
                         col,
-                        value: wire,
+                        // For formula cells with Blank evaluated value (e.g. not yet
+                        // evaluated), emit a Number(0.0) placeholder — but Phase 1
+                        // semantics call for the formula to ALWAYS have an evaluated
+                        // value once committed. We accept Blank-with-formula as a
+                        // valid transient state (Phase 2+ runtime will compute on save).
+                        // To represent Blank-with-formula on disk, we emit
+                        // CellWireValue::Error(#NULL!) as the placeholder. Loading
+                        // produces the formula entry plus a placeholder value the
+                        // runtime can re-evaluate.
+                        value: wire.unwrap_or_else(|| {
+                            CellWireValue::Error(error_to_canonical_text(ErrorValue::Null))
+                        }),
+                        formula,
                     };
                     let line = serde_json::to_string(&rec)?;
                     writeln!(writer, "{line}")?;
+                    written.insert((row, col));
                 }
             }
+        }
+
+        // Emit formula cells whose (row, col) fell outside the value-bounds rectangle.
+        // These are formula-only cells with Blank values: we represent them with a
+        // #NULL! placeholder so the formula text survives the round-trip.
+        for (row, col) in formula_positions {
+            if written.contains(&(row, col)) {
+                continue;
+            }
+            let formula = wb
+                .formula_at(sheet_id, row, col)
+                .map(|s| s.as_ref().to_owned());
+            let rec = CellRecord {
+                row,
+                col,
+                value: CellWireValue::Error(error_to_canonical_text(ErrorValue::Null)),
+                formula,
+            };
+            let line = serde_json::to_string(&rec)?;
+            writeln!(writer, "{line}")?;
         }
         writer.flush()?;
     }
@@ -425,7 +486,15 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                 },
                 other => other,
             })?;
+            // For Phase 1 W5-9 formula cells with Blank placeholder values: skip the
+            // put_at if the value is the #NULL! sentinel we emit. Phase 2+ runtime
+            // would re-evaluate the formula to recover the true value.
+            // For now, just persist the formula association — the value stays whatever
+            // the placeholder decodes to. Callers that re-evaluate will overwrite it.
             wb.put_at(sheet_id, rec.row as RowId, rec.col as ColId, value);
+            if let Some(formula_text) = rec.formula {
+                wb.put_formula(sheet_id, rec.row as RowId, rec.col as ColId, formula_text);
+            }
         }
     }
 
@@ -916,6 +985,122 @@ col_extent = 0
     }
 
     // ===== atomic save (audit M4 fix) =====
+
+    // ===== W5-9: formula round-trip =====
+
+    /// W5-9: formula cells survive save → load round-trip with both the formula text
+    /// AND the evaluated value preserved.
+    #[test]
+    fn roundtrip_formula_with_value() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.qbook");
+
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        // Cell (0, 0) has a literal value.
+        wb.put_at(s, 0, 0, Value::Number(5.0));
+        // Cell (1, 0) has BOTH a value and a formula.
+        wb.put_at(s, 1, 0, Value::Number(15.0));
+        wb.put_formula(s, 1, 0, "A1 * 3");
+
+        save_workbook(&wb, "formulas", &path).unwrap();
+        let loaded = load_workbook(&path).unwrap();
+
+        // Literal cell.
+        assert_eq!(loaded.sheet(s).unwrap().read(0, 0), Value::Number(5.0));
+        assert!(loaded.formula_at(s, 0, 0).is_none());
+        // Formula cell.
+        assert_eq!(loaded.sheet(s).unwrap().read(1, 0), Value::Number(15.0));
+        assert_eq!(
+            loaded.formula_at(s, 1, 0).map(|s| s.as_ref()),
+            Some("A1 * 3")
+        );
+    }
+
+    #[test]
+    fn roundtrip_formula_only_cell_outside_bounds() {
+        // A formula cell at (100, 100) where the sheet's value-bounds extent is (0, 0)
+        // — pure formula-only state. Should survive round-trip via the formula-positions
+        // emit path.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fonly.qbook");
+
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        wb.put_formula(s, 100, 100, "SUM(A:A)");
+        // Note: NO put_at for (100, 100). bounds stays at (0, 0).
+
+        save_workbook(&wb, "fonly", &path).unwrap();
+        let loaded = load_workbook(&path).unwrap();
+
+        assert_eq!(
+            loaded.formula_at(s, 100, 100).map(|s| s.as_ref()),
+            Some("SUM(A:A)")
+        );
+        // Value is the #NULL! placeholder.
+        assert_eq!(
+            loaded.sheet(s).unwrap().read(100, 100),
+            Value::Error(ErrorValue::Null)
+        );
+    }
+
+    #[test]
+    fn roundtrip_multiple_formulas_across_sheets() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("multi-f.qbook");
+
+        let mut wb = Workbook::new();
+        let s1 = wb.add_sheet("Sheet1");
+        let s2 = wb.add_sheet("Sheet2");
+        wb.put_at(s1, 0, 0, Value::Number(1.0));
+        wb.put_formula(s1, 0, 0, "1");
+        wb.put_at(s2, 5, 5, Value::Number(99.0));
+        wb.put_formula(s2, 5, 5, "B5 + 1");
+
+        save_workbook(&wb, "multi", &path).unwrap();
+        let loaded = load_workbook(&path).unwrap();
+
+        assert_eq!(loaded.formula_count(), 2);
+        assert_eq!(loaded.formula_at(s1, 0, 0).map(|s| s.as_ref()), Some("1"));
+        assert_eq!(
+            loaded.formula_at(s2, 5, 5).map(|s| s.as_ref()),
+            Some("B5 + 1")
+        );
+    }
+
+    #[test]
+    fn old_schema_v1_files_without_formula_field_load_as_literal_only() {
+        // Backwards-compat: a CellRecord JSON missing the `formula` field (old W5-6
+        // schema-v1-format files) deserializes with formula = None via serde default.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        fs::write(
+            path.join("workbook.toml"),
+            r#"schema_version = 1
+name = "legacy"
+
+[[sheets]]
+id = 0
+name = "S"
+chunk_rows = 16384
+row_extent = 1
+col_extent = 1
+"#,
+        )
+        .unwrap();
+        // No `formula` field — emulates the W5-6 format.
+        fs::write(
+            path.join("sheets/0.jsonl"),
+            "{\"row\":0,\"col\":0,\"value\":{\"Number\":7.0}}\n",
+        )
+        .unwrap();
+
+        let loaded = load_workbook(&path).unwrap();
+        assert_eq!(loaded.sheet(0).unwrap().read(0, 0), Value::Number(7.0));
+        assert!(loaded.formula_at(0, 0, 0).is_none());
+        assert_eq!(loaded.formula_count(), 0);
+    }
 
     /// Audit M4 acceptance (2026-05-12): a successful save replaces the target
     /// atomically via a sibling temp dir + rename. No temp leftover after success.
