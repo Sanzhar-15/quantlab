@@ -75,6 +75,19 @@ pub enum QbookError {
     #[error("workbook directory {path:?} does not exist or is not a directory")]
     NotADirectory { path: PathBuf },
 
+    /// A cell value that doesn't survive JSON round-trip cleanly. serde_json
+    /// silently encodes NaN/Inf as `null`, which then fails to load as a Number.
+    /// Save-side validation rejects them with this error. Audit M6 fix (2026-05-12).
+    #[error(
+        "non-finite f64 cell at sheet {sheet} row {row} col {col}: {value} cannot be serialized"
+    )]
+    NonFiniteNumber {
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        value: f64,
+    },
+
     #[error("missing required file {file:?}")]
     MissingFile { file: PathBuf },
 
@@ -196,12 +209,70 @@ fn parse_canonical_error_text(s: &str) -> Option<ErrorValue> {
     })
 }
 
-/// Save a `Workbook` to `path` (a `.qbook/` directory). Creates the directory and
-/// `sheets/` subdirectory if missing. **Overwrites existing files** without prompting
-/// — caller's responsibility to backup if needed.
+/// Save a `Workbook` to `path` (a `.qbook/` directory). **Atomic**: writes the whole
+/// workbook to a sibling temp directory, then renames it into place. If the save fails
+/// partway through (disk full, OOM, JSON encode error, panic), the original target —
+/// if any — is untouched. Audit M4 fix (2026-05-12).
+///
+/// Atomicity guarantees:
+/// - **Per-file write failure**: original target intact; temp dir gets cleaned up on
+///   next save attempt.
+/// - **Pre-rename crash**: target intact (we haven't touched it yet).
+/// - **Rename window**: when target exists, we remove it then rename the temp dir.
+///   There's a microsecond window where neither path exists. POSIX `rename(2)` is
+///   atomic on the same filesystem, but Rust's `fs::rename` for directories requires
+///   the target to be empty or absent. Phase 2's simpler approach: remove + rename.
+///   A future Phase 4+ atomic-replace with `.bak` rotation would close that window.
 pub fn save_workbook(wb: &Workbook, name: &str, path: &Path) -> Result<(), QbookError> {
-    fs::create_dir_all(path)?;
-    let sheets_dir = path.join("sheets");
+    // Compute the temp-dir path next to the target. Using PID + a fixed suffix gives
+    // a stable name per process so concurrent saves from the same process collide loudly
+    // (the first save's leftover temp gets cleaned up). Across processes, PID
+    // disambiguates.
+    let temp_path = sibling_temp_path(path);
+
+    // Pre-clean any leftover from a prior interrupted save with the same temp name.
+    // This is best-effort: if it fails, the create_dir_all below will surface a clear
+    // error (e.g. "file exists"). We don't error here — leftover cleanup is a
+    // recovery courtesy, not a correctness gate.
+    if temp_path.exists() {
+        let _ = fs::remove_dir_all(&temp_path);
+    }
+
+    // Write everything to the temp dir.
+    let write_result = write_workbook_to_dir(wb, name, &temp_path);
+    if let Err(e) = write_result {
+        // Save failed mid-write. Clean up the partial temp dir so the next save starts
+        // fresh, then propagate the error. The original target — if any — is intact.
+        let _ = fs::remove_dir_all(&temp_path);
+        return Err(e);
+    }
+
+    // Commit: replace target with the freshly-written temp dir.
+    if path.exists() {
+        fs::remove_dir_all(path)?;
+    }
+    fs::rename(&temp_path, path)?;
+    Ok(())
+}
+
+/// Generate a sibling temp-dir path for atomic save. Uses the target's basename +
+/// `.tmp-save-PID` suffix in the same parent directory so the rename stays on the
+/// same filesystem (a precondition for atomicity on POSIX).
+fn sibling_temp_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let basename = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "workbook".to_string());
+    parent.join(format!("{basename}.tmp-save-{}", std::process::id()))
+}
+
+/// Inner write that populates `dir` with `workbook.toml` + `sheets/*.jsonl`. Used by
+/// `save_workbook` against a temp dir; not a public surface (the atomic-save wrapper
+/// is what callers want).
+fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), QbookError> {
+    fs::create_dir_all(dir)?;
+    let sheets_dir = dir.join("sheets");
     fs::create_dir_all(&sheets_dir)?;
 
     // Build the envelope.
@@ -223,7 +294,7 @@ pub fn save_workbook(wb: &Workbook, name: &str, path: &Path) -> Result<(), Qbook
         sheets: sheet_envelopes,
     };
     let toml_str = toml::to_string_pretty(&envelope)?;
-    fs::write(path.join("workbook.toml"), toml_str)?;
+    fs::write(dir.join("workbook.toml"), toml_str)?;
 
     // Per-sheet JSONL.
     for sheet_id in 0..(wb.sheet_count() as SheetId) {
@@ -237,6 +308,19 @@ pub fn save_workbook(wb: &Workbook, name: &str, path: &Path) -> Result<(), Qbook
         for row in 0..bounds.row_extent {
             for col in 0..bounds.col_extent {
                 let v = sheet.read(row, col);
+                // Audit M6 fix (2026-05-12): reject NaN/Inf at the save boundary.
+                // serde_json silently encodes NaN as `null`, producing files that
+                // fail to load — silent corruption. Validate explicitly.
+                if let Value::Number(n) = v {
+                    if !n.is_finite() {
+                        return Err(QbookError::NonFiniteNumber {
+                            sheet: sheet_id,
+                            row,
+                            col,
+                            value: n,
+                        });
+                    }
+                }
                 if let Some(wire) = CellWireValue::from_value(&v) {
                     let rec = CellRecord {
                         row,
@@ -756,17 +840,158 @@ col_extent = 0
 
     #[test]
     fn nan_inf_become_num_error_via_value_constructor() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("nan.qbook");
         // Even if a Number(NaN) somehow got serialized (it can't from Value::number,
         // but a buggy external writer could try), to_value sanitizes via Value::number.
         let wire = CellWireValue::Number(f64::NAN);
         let v = wire.to_value().unwrap();
         assert_eq!(v, Value::Error(ErrorValue::Num));
+    }
 
-        // Same for the file path: emit a NaN-bearing JSONL by hand, ensure it loads as
-        // #NUM!. JSON doesn't actually let us write NaN; this test is for the wire
-        // converter's robustness, not the file format.
-        let _ = path;
+    /// Audit M6 fix (2026-05-12): file-level NaN handling. serde_json silently
+    /// encodes NaN as `null`, producing files that fail to load — a silent
+    /// corruption. Save-side validation rejects NaN/Inf explicitly with a
+    /// NonFiniteNumber error carrying the cell coordinates.
+    #[test]
+    fn save_with_nan_value_errors_cleanly() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nan-save.qbook");
+
+        let mut wb = Workbook::new();
+        let sheet_id = wb.add_sheet("S");
+        // Bypass Value::number sanitizer by using the pub enum variant directly.
+        wb.put_at(sheet_id, 5, 3, Value::Number(f64::NAN));
+
+        match save_workbook(&wb, "nan-test", &path) {
+            Err(QbookError::NonFiniteNumber {
+                sheet,
+                row,
+                col,
+                value,
+            }) => {
+                assert_eq!(sheet, sheet_id);
+                assert_eq!(row, 5);
+                assert_eq!(col, 3);
+                assert!(value.is_nan());
+            }
+            other => panic!("expected NonFiniteNumber error, got {other:?}"),
+        }
+        // After a failed save, the target should NOT exist (atomic-save guarantee).
+        assert!(
+            !path.exists(),
+            "atomic-save invariant violated: target exists after failed save at {path:?}"
+        );
+    }
+
+    #[test]
+    fn save_with_inf_value_errors_cleanly() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("inf-save.qbook");
+
+        let mut wb = Workbook::new();
+        let sheet_id = wb.add_sheet("S");
+        wb.put_at(sheet_id, 0, 0, Value::Number(f64::INFINITY));
+
+        match save_workbook(&wb, "inf-test", &path) {
+            Err(QbookError::NonFiniteNumber { value, .. }) => {
+                assert!(value.is_infinite());
+            }
+            other => panic!("expected NonFiniteNumber error, got {other:?}"),
+        }
+        // Atomic-save invariant: target absent after failed save.
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn save_with_neg_inf_value_errors_cleanly() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("neg-inf-save.qbook");
+
+        let mut wb = Workbook::new();
+        let sheet_id = wb.add_sheet("S");
+        wb.put_at(sheet_id, 0, 0, Value::Number(f64::NEG_INFINITY));
+
+        let result = save_workbook(&wb, "neg-inf-test", &path);
+        assert!(matches!(result, Err(QbookError::NonFiniteNumber { .. })));
+        assert!(!path.exists());
+    }
+
+    // ===== atomic save (audit M4 fix) =====
+
+    /// Audit M4 acceptance (2026-05-12): a successful save replaces the target
+    /// atomically via a sibling temp dir + rename. No temp leftover after success.
+    #[test]
+    fn atomic_save_leaves_no_temp_dir_after_success() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("atomic.qbook");
+        let wb = wb_with("S", &[cell(0, 0, Value::Number(1.0))]);
+        save_workbook(&wb, "atomic-test", &path).unwrap();
+        assert!(path.exists(), "target should exist after save");
+
+        // The temp-dir name follows `<basename>.tmp-save-<pid>`. After a successful
+        // save, NO such directory should remain.
+        let temp_path = sibling_temp_path(&path);
+        assert!(
+            !temp_path.exists(),
+            "temp dir {temp_path:?} should be cleaned up after successful save"
+        );
+    }
+
+    /// Audit M4 acceptance: a failed save does NOT clobber the existing target. Pre-
+    /// populate target with one workbook, then attempt to save a NaN-bearing
+    /// workbook (which serde_json will reject). The pre-existing target must
+    /// remain readable and unchanged.
+    #[test]
+    fn atomic_save_failed_save_does_not_clobber_target() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("preserved.qbook");
+
+        // First, write a valid workbook with known content.
+        let original = wb_with("S", &[cell(0, 0, Value::Number(42.0))]);
+        save_workbook(&original, "first", &path).unwrap();
+        assert!(path.exists());
+
+        // Attempt a save that will fail (NaN-bearing).
+        let mut bad_wb = Workbook::new();
+        let sheet_id = bad_wb.add_sheet("S");
+        bad_wb.put_at(sheet_id, 0, 0, Value::Number(f64::NAN));
+        let result = save_workbook(&bad_wb, "bad", &path);
+        assert!(result.is_err(), "expected save to fail");
+
+        // Target must still exist with the original content.
+        assert!(path.exists(), "target was clobbered by failed save");
+        let reloaded = load_workbook(&path).unwrap();
+        assert_eq!(reloaded.sheet(0).unwrap().read(0, 0), Value::Number(42.0));
+
+        // Temp dir from the failed save was cleaned up.
+        let temp_path = sibling_temp_path(&path);
+        assert!(
+            !temp_path.exists(),
+            "temp dir from failed save should be cleaned up"
+        );
+    }
+
+    /// Audit M4 acceptance: leftover temp dir from a prior crashed save is cleaned
+    /// up before the next save starts. Simulates a crash by manually creating a
+    /// temp dir with the expected name.
+    #[test]
+    fn atomic_save_cleans_up_leftover_temp_from_prior_crash() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("leftover.qbook");
+
+        // Simulate a crashed prior save: create the temp dir with some garbage.
+        let temp_path = sibling_temp_path(&path);
+        fs::create_dir_all(&temp_path).unwrap();
+        fs::write(temp_path.join("garbage"), "not a real workbook").unwrap();
+        assert!(temp_path.exists());
+
+        // Now do a real save. Should succeed despite the leftover temp.
+        let wb = wb_with("S", &[cell(0, 0, Value::Number(1.0))]);
+        save_workbook(&wb, "recover", &path).unwrap();
+
+        // Temp dir gone, target exists.
+        assert!(!temp_path.exists());
+        assert!(path.exists());
+        let reloaded = load_workbook(&path).unwrap();
+        assert_eq!(reloaded.sheet(0).unwrap().read(0, 0), Value::Number(1.0));
     }
 }
