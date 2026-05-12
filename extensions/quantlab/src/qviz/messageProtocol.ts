@@ -39,7 +39,7 @@
  *     requestData, edit, save, saveAs), the receiver RECOMPUTES
  *     `computeSpecHash(spec)` and rejects the message if it doesn't
  *     match envelope.specHash. The envelope's specHash is therefore a
- *     trust boundary on these messages — a hostile sender cannot fake
+ *     trust boundary on these messages -- a hostile sender cannot fake
  *     attribution.
  *   - For messages that carry ONLY a specHash and no spec (data, error,
  *     saveResult), the receiver MUST trust the envelope's specHash
@@ -264,7 +264,7 @@ export interface InspectorCapabilities {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 6 — Inspector types
+// Phase 6 -- Inspector types
 // ---------------------------------------------------------------------------
 
 /** A column filter as understood by the inspector UI. Lives in webview
@@ -899,7 +899,7 @@ function validateDaemonCapabilities(
 	}
 	// Audit M-F + M-49 (2026-05-11): the optional `inspector` capability
 	// bag arrived in Phase 6. The validator originally required ALL
-	// three flags as booleans — that rejected partial-rollout daemons
+	// three flags as booleans -- that rejected partial-rollout daemons
 	// (one or two flags only) by dropping the WHOLE capabilities
 	// message, leaving the webview with no caps at all (worse than
 	// degraded). Updated semantics: the bag itself is optional; when
@@ -1187,7 +1187,7 @@ function validateInspectorData(
 	if (n === 0 && arrowLen > 0) {
 		// Arrow IPC with zero rows still ships ~80 bytes of schema; we
 		// accept that. Only the "0 rows but megabytes of bytes" case
-		// would be suspicious — out of scope for v1.
+		// would be suspicious -- out of scope for v1.
 	} else if (n > 0 && arrowLen === 0) {
 		return fail(`inspectorData reports n=${n} but arrow byteLength=0`);
 	}
@@ -1372,7 +1372,7 @@ function typeofVal(v: unknown): string {
 }
 
 /** Deep-freeze a successful validator result so consumers can't mutate
- *  the validated message — neither the top-level envelope nor any
+ *  the validated message -- neither the top-level envelope nor any
  *  nested object/array (columns, capabilities, transforms, etc.).
  *  The `arrow` Uint8Array is left mutable -- freezing a typed-array
  *  view with Object.freeze does not freeze the underlying bytes; the

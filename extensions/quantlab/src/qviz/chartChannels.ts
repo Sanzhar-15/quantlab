@@ -22,7 +22,7 @@
  *     x AND y AND color.
  *
  * Drift between this table and the compilers means the UI lets the user
- * build a spec that compiles to nothing — exactly the worst-case failure
+ * build a spec that compiles to nothing -- exactly the worst-case failure
  * the Phase 5 plan calls out.
  *
  * Note (2026-05-11): the validator USED to enforce these completeness
@@ -74,7 +74,7 @@ export const CHART_CHANNELS: Record<Exclude<ChartType, 'candlestick'>, ChartChan
 		// Smoke-test fix (2026-05-11): histogram MUST list `y` in required.
 		// The compiler (src/qviz/render/timeseries.ts:compileScalarSeries)
 		// rejects any spec without both x and y, so leaving `y` off the
-		// channel table made the UI hide the y shelf — users dropped a
+		// channel table made the UI hide the y shelf -- users dropped a
 		// column on x, switched chart-type to histogram, then got
 		// "histogram chart requires encodings.x and encodings.y" with no
 		// way to fix it from the builder. The renderer side treats
@@ -101,7 +101,7 @@ export const CHART_CHANNELS: Record<Exclude<ChartType, 'candlestick'>, ChartChan
 		// The compiler (src/qviz/render/general.ts:buildPieEncoding, ~L259)
 		// hard-rejects any spec without both `color` (slice category) AND
 		// `y` (slice angle / theta). Listing `y` as optional made the UI
-		// hide its mandatory state — users assigned color, watched the
+		// hide its mandatory state -- users assigned color, watched the
 		// preview throw "pie chart requires encodings.y for slice angle"
 		// and had no shelf-state signal pointing them at y.
 		// Same root cause as the histogram fix above.

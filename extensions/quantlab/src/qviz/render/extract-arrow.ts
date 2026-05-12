@@ -149,7 +149,7 @@ export function extractColumnsFromArrowIpcSafe(
 		const name = field.name;
 		const vec = table.getChild(name);
 		if (vec === null || vec === undefined) {
-			// Skip rather than throw — the inspector keeps rendering other
+			// Skip rather than throw -- the inspector keeps rendering other
 			// columns. The skipped column won't appear in the output map.
 			continue;
 		}
@@ -417,7 +417,7 @@ function extractNumeric(name: string, vec: Vector): (number | null)[] {
  *
  *  Megaudit-2 A5-MAJOR-3.1: throw on anything that isn't strictly
  *  `true | false | null | undefined`. The previous `v === true ? 1 : 0`
- *  silently mapped unexpected types (number, string) to 0 — defeating
+ *  silently mapped unexpected types (number, string) to 0 -- defeating
  *  CRITICAL-12's refuse-to-coerce principle for the Bool extractor. */
 function extractBool(vec: Vector): (number | null)[] {
 	const n = vec.length;

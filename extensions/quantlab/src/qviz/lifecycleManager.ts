@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * LifecycleManager — per-workspace-folder daemon lifecycle registry.
+ * LifecycleManager -- per-workspace-folder daemon lifecycle registry.
  *
  * Phase 5 step C megaudit fix C12: prior `extension.ts` used
  * `folders[0]` only, so specs from folder[1+] resolved against the
@@ -20,7 +20,7 @@
  *
  * Disposal: `disposeAll()` returns a Promise that awaits every
  * underlying lifecycle's dispose. Extension `deactivate()` MUST await
- * this — the per-lifecycle Python child kill is async.
+ * this -- the per-lifecycle Python child kill is async.
  */
 
 import * as vscode from 'vscode';
@@ -50,7 +50,7 @@ export class LifecycleManager implements LifecycleSource {
 	private readonly lifecycles = new Map<string, ManagedLifecycle | null>();
 	private disposed = false;
 
-	constructor(private readonly factory: LifecycleFactory) {}
+	constructor(private readonly factory: LifecycleFactory) { }
 
 	getLifecycleForDocument(documentUri: vscode.Uri): DaemonLifecycle | null {
 		if (this.disposed) { return null; }
@@ -134,7 +134,7 @@ export class LifecycleManager implements LifecycleSource {
 	 * `null` cache entries) so the next `getLifecycleForDocument` call
 	 * re-invokes the factory. Used by the extension's
 	 * `onDidChangeConfiguration` listener when the user's Python path
-	 * setting changes — the previously-validated interpreter may now
+	 * setting changes -- the previously-validated interpreter may now
 	 * point at a different binary that hasn't been version-checked.
 	 *
 	 * Disposing the per-folder `DaemonLifecycle` instances is async

@@ -4,21 +4,21 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * Schema-drift detector — Phase 5 step 5.C.2.
+ * Schema-drift detector -- Phase 5 step 5.C.2.
  *
  * Pure module. No vscode imports. No I/O. Given a `QvizSpec` and the
  * currently-live `SchemaInfo` for its dataset, report which of the
  * three drift branches applies:
  *
- *   - `same-hash`       — `spec.dataset.schema_hash` matches the live
+ *   - `same-hash`       -- `spec.dataset.schema_hash` matches the live
  *                          schema's hash. The spec is consistent with
  *                          the file; webview opens normally.
- *   - `fields-preserved` — schema_hash changed (columns added / removed
+ *   - `fields-preserved` -- schema_hash changed (columns added / removed
  *                          / dtype-changed) but every column the spec
  *                          REFERENCES still exists in the new schema.
  *                          UI should warn ("data file changed since
  *                          spec was saved; save to update provenance").
- *   - `fields-missing`   — at least one column referenced by the spec
+ *   - `fields-missing`   -- at least one column referenced by the spec
  *                          (encoding `field`, ohlcv member, transform
  *                          `column`, aggregate `column`, etc.) no
  *                          longer exists in the new schema. UI
@@ -31,13 +31,14 @@
  * can't silently slip through and produce a false `fields-preserved`.
  */
 
-import type {
-	AggregateTransform, BinTransform, DateTruncTransform, FilterTransform,
-	GroupByTransform, MathTransform, QvizSpec, ResampleTransform,
-	SortTransform, Transform, TzConvertTransform, WindowTransform,
+import {
+	type AggregateTransform, type BinTransform, type DateTruncTransform,
+	type FilterTransform, type GroupByTransform, type MathTransform,
+	type QvizSpec, type ResampleTransform, type SortTransform,
+	type Transform, type TzConvertTransform, type WindowTransform,
+	assertNeverTransform,
 } from './spec';
 import type { SchemaInfo } from './messageProtocol';
-import { assertNeverTransform } from './spec';
 
 export type SchemaDriftKind = 'same-hash' | 'fields-preserved' | 'fields-missing';
 
@@ -76,7 +77,7 @@ export function detectDrift(spec: QvizSpec, currentSchema: SchemaInfo): DriftRes
 	if (missing.length === 0) {
 		return { drift: 'fields-preserved', oldHash, newHash, missingFields: [] };
 	}
-	// Stable order: first encountered wins. Dedupe though — a field
+	// Stable order: first encountered wins. Dedupe though -- a field
 	// referenced multiple times only appears once.
 	const dedup: string[] = [];
 	const seen = new Set<string>();
@@ -101,7 +102,7 @@ export function detectDrift(spec: QvizSpec, currentSchema: SchemaInfo): DriftRes
  *
  * Does NOT include transform OUTPUT names (`as`) because those are
  * synthesized by the transform itself and only become live after the
- * pipeline runs. The drift detector cares about INPUTS — fields the
+ * pipeline runs. The drift detector cares about INPUTS -- fields the
  * spec assumes exist in the source file.
  *
  * Note: a transform's output name CAN be referenced by a downstream

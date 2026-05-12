@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * Pipeline-level validation — Phase 5 step 5.G.4.
+ * Pipeline-level validation -- Phase 5 step 5.G.4.
  *
  * The QvizSpec validator (`validate.ts`) checks each transform's own
  * shape but NOT cross-transform constraints. The daemon's compiler

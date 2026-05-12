@@ -1,11 +1,11 @@
-/// <reference lib="dom" />
 /*---------------------------------------------------------------------------------------------
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+/// <reference lib="dom" />
 
 /**
- * RendererHost — Phase 5 step 5.D.5.
+ * RendererHost -- Phase 5 step 5.D.5.
  *
  * Cross-renderer orchestrator. Hides the choice between the timeseries
  * applier (`@charts-plus`) and the general applier (Vega-Lite) behind
@@ -281,7 +281,7 @@ export class RendererHost {
 				if (dx > DRAG_THRESHOLD_PX || dy > DRAG_THRESHOLD_PX) { return; }
 			}
 			// Audit M-15: a true click outside any data point leaves
-			// lastCrosshairTime === null. Skip dispatch — the user
+			// lastCrosshairTime === null. Skip dispatch -- the user
 			// clicked empty space.
 			if (lastCrosshairTime === null) { return; }
 			// Audit M-33 (Tier 5): read this.hooks at FIRE time so a
@@ -308,7 +308,7 @@ export class RendererHost {
 			return () => { /* nothing to detach */ };
 		}
 		// Defensive: tests substitute a stub handle that doesn't have a
-		// real Vega `view`. Skip the install rather than throw — the
+		// real Vega `view`. Skip the install rather than throw -- the
 		// caller has no way to wire selection without a real view, but
 		// the lifecycle / family-swap tests that don't exercise
 		// selection shouldn't fall over here.
@@ -318,7 +318,7 @@ export class RendererHost {
 		}
 		// Audit M-6 (2026-05-11): only data marks should fire selection.
 		// Without this filter, clicks on legend swatches, axis labels,
-		// gridlines, and group/facet headers also dispatch — sometimes
+		// gridlines, and group/facet headers also dispatch -- sometimes
 		// with a `datum` that carries the field but with the WRONG
 		// value (e.g., a facet header's row-key vs the actual click
 		// target). Whitelist the marks that carry true row data.
@@ -355,7 +355,7 @@ export class RendererHost {
 		this.disposed = true;
 		// Megaudit M-8: dispose() is on the public API; if the applier's
 		// dispose throws, the caller (webview teardown, panel close)
-		// needs to know. Don't swallow here — propagate so any failure
+		// needs to know. Don't swallow here -- propagate so any failure
 		// is visible in the developer console / error reporting.
 		this.disposeActive();
 	}
@@ -370,7 +370,7 @@ export class RendererHost {
 		try { a.detachSelectionListener(); } catch { /* nothing useful to do */ }
 		// Megaudit M-8: prior code wrapped applier dispose in catch +
 		// "best-effort" container.removeChild fallback. CLAUDE.md
-		// prohibits "graceful degradation" — applier disposal errors
+		// prohibits "graceful degradation" -- applier disposal errors
 		// MUST surface. Let them propagate; the caller's render()
 		// boundary catches them and surfaces a structured RenderResult
 		// with stage='dispose'. The container is the applier's

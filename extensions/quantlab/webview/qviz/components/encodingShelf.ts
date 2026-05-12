@@ -1,11 +1,11 @@
-/// <reference lib="dom" />
 /*---------------------------------------------------------------------------------------------
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+/// <reference lib="dom" />
 
 /**
- * encodingShelf — Phase 5 steps 5.D.3 + 5.F.1 + 5.F.2 + 5.F.3.
+ * encodingShelf -- Phase 5 steps 5.D.3 + 5.F.1 + 5.F.2 + 5.F.3.
  *
  * Renders the encoding-assignment shelves for the current chart type.
  * Drives off `chartChannels.ts` so the UI's available channels always
@@ -39,7 +39,7 @@ import {
 	isChannelRequired,
 } from '../../../src/qviz/chartChannels';
 
-/** Drag payload contract — must match what columnPanel writes. */
+/** Drag payload contract -- must match what columnPanel writes. */
 const DRAG_MIME_COLUMN = 'application/qviz-column';
 
 interface DragPayload {
@@ -192,7 +192,7 @@ function mountRegularShelves(
 }
 
 // ---------------------------------------------------------------------------
-// OHLCV cluster (candlestick) — Step 5.F.2
+// OHLCV cluster (candlestick) -- Step 5.F.2
 // ---------------------------------------------------------------------------
 
 interface OhlcvSlot {
@@ -361,7 +361,7 @@ function attachDropTarget(
  *  payload. Single source of truth for the mime type and shape. */
 export const DRAG_COLUMN_MIME = DRAG_MIME_COLUMN;
 
-/** Encode a drag payload — column panel calls this to populate
+/** Encode a drag payload -- column panel calls this to populate
  *  dataTransfer. The type alias here keeps the call site symmetric. */
 export function encodeDragPayload(column: string, encodingType: EncodingType): string {
 	const payload: DragPayload = { column, encodingType };

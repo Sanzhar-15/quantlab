@@ -19,7 +19,7 @@
  * a follow-up `schemaChanged` once detection completes).
  *
  * `schemaChanged` ALWAYS updates `info` from the message's `newSchema`.
- * This is the canonical "deliver the live schema" event — the webview
+ * This is the canonical "deliver the live schema" event -- the webview
  * keeps the user's in-memory spec edits while reflecting the on-disk
  * columns. The protocol validator's cross-field invariant guarantees
  * `newSchema.schema_hash === newHash`, so `info` is consistent with

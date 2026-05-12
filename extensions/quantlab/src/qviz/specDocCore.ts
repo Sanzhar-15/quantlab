@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * SpecDocumentCore — vscode-free state machine for the .qviz.json document.
+ * SpecDocumentCore -- vscode-free state machine for the .qviz.json document.
  *
  * QvizSpecDocument (the vscode-side `CustomDocument` adapter) wraps an
  * instance of this class. The split exists so the lifecycle of the
@@ -136,7 +136,7 @@ export class SpecDocumentCore {
 		const previous = this._spec;
 		const accepted = r.spec;
 		// Megaudit CRITICAL-10 (final): the audit raised a real concern
-		// — a content-handler that throws WITHOUT being caught upstream
+		// -- a content-handler that throws WITHOUT being caught upstream
 		// would short-circuit fireEdit, leaving `_spec` mutated but
 		// the undo entry never registered (silently corrupting the
 		// undo stack). Naively moving events outside the guard caused
@@ -146,7 +146,7 @@ export class SpecDocumentCore {
 		// try/catch so a thrown subscriber error doesn't skip
 		// fireEdit, then re-throw the captured error AFTER fireEdit
 		// has registered the undo entry. Net: state mutation, undo
-		// entry, and error propagation all happen — no path leaves
+		// entry, and error propagation all happen -- no path leaves
 		// the doc in an inconsistent state.
 		this._applyingEdit = true;
 		let contentError: unknown = undefined;
@@ -286,7 +286,7 @@ export class SpecDocumentCore {
 				this.fireEdit({
 					label,
 					// Megaudit-2 A1-M5: same guard as applyEdit's undo/redo
-					// — reentrant applyEdit/applyReload from a content
+					// -- reentrant applyEdit/applyReload from a content
 					// subscriber must throw rather than corrupt state.
 					undo: async () => {
 						if (this._disposed) { return; }

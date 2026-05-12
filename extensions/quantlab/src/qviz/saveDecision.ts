@@ -4,16 +4,16 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * Pure save-decision function — extracted from VisualiseSpecProvider's
+ * Pure save-decision function -- extracted from VisualiseSpecProvider's
  * `driftAwareSaveAs` so it can be unit-tested without a vscode shim
  * (Step C megaudit C14: provider had zero tests because everything
  * was tangled with vscode runtime).
  *
  * Given a drift detection status, the function returns one of:
- *   - `refuse`          — save MUST be refused, with a structured
+ *   - `refuse`          -- save MUST be refused, with a structured
  *                          message naming the underlying reason.
- *   - `verbatim`        — drift is `same-hash`; save the spec as-is.
- *   - `with-refresh`    — drift is `fields-preserved`; save a spec
+ *   - `verbatim`        -- drift is `same-hash`; save the spec as-is.
+ *   - `with-refresh`    -- drift is `fields-preserved`; save a spec
  *                          with refreshed `dataset.schema_hash` +
  *                          `provenance.generated_at` + reset
  *                          `query_hash`. The decision payload carries

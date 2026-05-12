@@ -89,7 +89,7 @@ export async function applyGeneralPlan(
 	// expressions via `new Function(...)`) crashes every render with
 	// "Evaluating a string as JavaScript violates the following CSP".
 	// `ast: true` makes Vega parse expressions to an AST and `expr:`
-	// hands the AST to the interpreter — no runtime code generation.
+	// hands the AST to the interpreter -- no runtime code generation.
 	const options: EmbedOptions = {
 		actions: false,
 		renderer: 'canvas',

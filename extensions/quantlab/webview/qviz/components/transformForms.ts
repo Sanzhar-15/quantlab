@@ -1,11 +1,11 @@
-/// <reference lib="dom" />
 /*---------------------------------------------------------------------------------------------
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+/// <reference lib="dom" />
 
 /**
- * Per-transform form factories — Phase 5 step 5.G.3.
+ * Per-transform form factories -- Phase 5 step 5.G.3.
  *
  * Each factory builds a small DOM island that:
  *   - Renders inputs reflecting the current `Transform` value.
@@ -84,7 +84,7 @@ function makeColumnSelect(
 	options?: { allowProduced?: readonly string[] },
 ): HTMLSelectElement {
 	const opts = [
-		// Empty option so the user can clear the selection — the form
+		// Empty option so the user can clear the selection -- the form
 		// re-renders empty fields red via CSS.
 		{ value: '', label: '(select a column)' },
 		...columns.map(c => ({ value: c.name, label: `${c.name} · ${c.dtype}` })),
@@ -365,7 +365,7 @@ const aggregateForm: TransformFormFactory<AggregateTransform> = (t, ctx, onUpdat
 };
 
 // ---------------------------------------------------------------------------
-// window (without ema — gated by validator at Step C cleanup)
+// window (without ema -- gated by validator at Step C cleanup)
 // ---------------------------------------------------------------------------
 
 const WINDOW_FNS: readonly { value: WindowTransform['fn']; label: string }[] = [
@@ -599,7 +599,6 @@ export const FORM_BY_KIND: { [K in TransformKind]: TransformFormFactory<Extract<
 	// `resample` is in the Transform union but rejected by the
 	// validator (Step C cleanup). No form factory; the menu doesn't
 	// offer it. Listed here so TS knows the registry is exhaustive.
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	resample: (() => {
 		throw new Error("'resample' is not yet implemented; menu must not offer it.");
 	}) as unknown as TransformFormFactory<Extract<Transform, { kind: 'resample' }>>,

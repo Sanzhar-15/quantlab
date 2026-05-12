@@ -9,10 +9,10 @@
  * file OR generate a draft one and open that. This module owns the
  * pure logic for both halves:
  *
- *   - `companionSpecPath` — given the data file's absolute fs path,
+ *   - `companionSpecPath` -- given the data file's absolute fs path,
  *     return the absolute fs path of the companion spec (same dir,
  *     same basename, `.qviz.json` extension).
- *   - `buildDraftSpecForDataset` — given a workspace-relative dataset
+ *   - `buildDraftSpecForDataset` -- given a workspace-relative dataset
  *     URI, produce a valid `QvizSpec` skeleton that:
  *       1. references the real CSV via `dataset.uri`
  *       2. carries a syntactically-valid placeholder `schema_hash`

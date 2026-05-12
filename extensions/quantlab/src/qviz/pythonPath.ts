@@ -12,10 +12,10 @@
  *
  * Lookup order (matches the implementation):
  *
- *   1. `process.env.QUANTLAB_PYTHON` — highest priority. Test / CI
+ *   1. `process.env.QUANTLAB_PYTHON` -- highest priority. Test / CI
  *      override; explicit user intent. If this points at a path that
  *      doesn't exist or isn't executable, the resolver FAILS LOUDLY
- *      (returns null without falling through) — an explicit override
+ *      (returns null without falling through) -- an explicit override
  *      should not be silently demoted (Step C megaudit PP1 fix).
  *   2. `quantlab.pythonPath` setting (Quantlab-specific override).
  *   3. `python.defaultInterpreterPath` setting (VS Code Python extension).
@@ -73,7 +73,7 @@ export function resolveQuantlabPython(
 	const platform = opts.platform ?? process.platform;
 
 	// 1. QUANTLAB_PYTHON env override. If the user explicitly set this,
-	//    fall-through is wrong — return null on misconfiguration.
+	//    fall-through is wrong -- return null on misconfiguration.
 	const envPath = env.QUANTLAB_PYTHON;
 	if (envPath && envPath.length > 0) {
 		if (existsAndExecutableFile(envPath)) {
@@ -85,7 +85,7 @@ export function resolveQuantlabPython(
 
 	// 2. quantlab.pythonPath. Same explicit-fail-loud policy: if the
 	//    user configured a path and it's bad, that's a configuration
-	//    bug — don't paper over.
+	//    bug -- don't paper over.
 	if (opts.quantlabConfigPath && opts.quantlabConfigPath.length > 0) {
 		if (existsAndExecutableFile(opts.quantlabConfigPath)) {
 			return { pythonPath: opts.quantlabConfigPath, source: 'config-quantlab' };
@@ -122,7 +122,7 @@ function existsAndExecutableFile(p: string): boolean {
 	// Megaudit MAJOR-14: this helper intentionally returns boolean
 	// because the resolver wants a fast yes/no and falls through to
 	// the next candidate on no. The previous silent catches were the
-	// right shape — but we now log the underlying error code so a
+	// right shape -- but we now log the underlying error code so a
 	// misconfigured path (typo'd, permission-denied) is diagnosable
 	// in the developer console instead of looking identical to
 	// "not found".
@@ -159,7 +159,7 @@ export type PythonVersionResult =
 /**
  * Verify a Python interpreter is at least the given minimum version.
  * Used by the lifecycle creator to fail loudly if the configured
- * Python is e.g. Python 2.7 — that path resolves successfully but the
+ * Python is e.g. Python 2.7 -- that path resolves successfully but the
  * daemon would crash at first import (Step C megaudit PP3).
  *
  * Calls `python -c "import sys; print(sys.version_info[:2])"` (~50ms

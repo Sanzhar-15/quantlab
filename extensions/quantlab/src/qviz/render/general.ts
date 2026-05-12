@@ -359,7 +359,7 @@ function buildConfig(
 	const showGrid = chartOptions?.show_grid ?? true;
 	const showLegend = chartOptions?.show_legend ?? true;
 	// Megaudit M-21: an empty palette is a theme-config bug. Don't
-	// silently substitute the hardcoded default — that would mask the
+	// silently substitute the hardcoded default -- that would mask the
 	// theme issue and the user sees foreign colors with no signal.
 	if (theme.seriesPalette.length === 0) {
 		throw new Error(

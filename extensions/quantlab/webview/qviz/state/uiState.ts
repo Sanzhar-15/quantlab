@@ -27,8 +27,8 @@ import type { Action } from './actions';
 export interface UiState {
 	readonly focusedColumn: string | null;
 	readonly activeShelf:
-		| 'x' | 'y' | 'y2' | 'color' | 'size' | 'shape'
-		| 'facet_row' | 'facet_col' | null;
+	| 'x' | 'y' | 'y2' | 'color' | 'size' | 'shape'
+	| 'facet_row' | 'facet_col' | null;
 	readonly editingTransformIndex: number | null;
 	readonly themeTokensVersion: number;
 }

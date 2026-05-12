@@ -1,11 +1,11 @@
-/// <reference lib="dom" />
 /*---------------------------------------------------------------------------------------------
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+/// <reference lib="dom" />
 
 /**
- * previewArea — Phase 5 step 5.D.4.
+ * previewArea -- Phase 5 step 5.D.4.
  *
  * Renders the chart preview pane: a chart container (handed to
  * `RendererHost`), a stripe row for stale-chart / drift indicators,
@@ -92,11 +92,11 @@ export function mountPreviewArea(
 		}
 		switch (state.schema.drift) {
 			case 'fields-preserved':
-				messages.push('Data file changed — schema preserved; save to refresh provenance');
+				messages.push('Data file changed -- schema preserved; save to refresh provenance');
 				break;
 			case 'fields-missing':
 				messages.push(
-					`Data file changed — ${state.schema.missingFields.length} field(s) missing: `
+					`Data file changed -- ${state.schema.missingFields.length} field(s) missing: `
 					+ state.schema.missingFields.join(', '),
 				);
 				break;
@@ -131,7 +131,7 @@ export function mountPreviewArea(
 					messages.push(`Dataset symlink target gone: ${uri}`);
 					break;
 				case 'access-denied':
-					messages.push(`Dataset access denied: ${uri}${err ? ' — ' + err : ''}`);
+					messages.push(`Dataset access denied: ${uri}${err ? ' -- ' + err : ''}`);
 					break;
 				case 'path-escape':
 					messages.push(`Dataset path is not workspace-relative: ${uri}`);
@@ -168,7 +168,7 @@ export function mountPreviewArea(
 		} else if (state.query.lastData !== null) {
 			const ms = state.query.lastData.elapsedMs;
 			const cached = state.query.lastData.cached ? ' (cached)' : '';
-			lines.push(`Render OK — daemon elapsed ${ms.toFixed(1)}ms${cached}`);
+			lines.push(`Render OK -- daemon elapsed ${ms.toFixed(1)}ms${cached}`);
 			for (const d of state.query.lastData.diagnostics) {
 				lines.push(`  • ${d}`);
 			}

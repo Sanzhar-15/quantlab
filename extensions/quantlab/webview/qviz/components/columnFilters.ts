@@ -1,11 +1,11 @@
-/// <reference lib="dom" />
 /*---------------------------------------------------------------------------------------------
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+/// <reference lib="dom" />
 
 /**
- * columnFilters — Phase 6 step 6.D.
+ * columnFilters -- Phase 6 step 6.D.
  *
  * Renders a per-column filter widget for the inspector table's header
  * cells. Picks the widget kind based on the daemon-reported column
@@ -32,10 +32,10 @@
  */
 
 import type { QvizStore } from '../state/store';
-import type {
-	ColumnStats, InspectorFilter,
+import {
+	type ColumnStats, type InspectorFilter,
+	PROTOCOL_VERSION,
 } from '../../../src/qviz/messageProtocol';
-import { PROTOCOL_VERSION } from '../../../src/qviz/messageProtocol';
 
 /** Acquire-once handle for posting messages back to the provider. */
 interface VsCodeBridge {
@@ -279,7 +279,7 @@ export function mountColumnFilter(
 		requestStatsIfNeeded();
 		const popupEl = document.createElement('div');
 		popupEl.className = 'qviz-col-filter-popup';
-		// Audit Codex MINOR (2026-05-11): the popup isn't modal —
+		// Audit Codex MINOR (2026-05-11): the popup isn't modal --
 		// background interaction stays live, no focus trap. `role="dialog"
 		// aria-modal=false` is misleading (SR announces "dialog" but the
 		// dialog contract is broken). `role="group"` accurately describes

@@ -1,11 +1,11 @@
-/// <reference lib="dom" />
 /*---------------------------------------------------------------------------------------------
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+/// <reference lib="dom" />
 
 /**
- * inspectorTable — Phase 6 step 6.C.2.
+ * inspectorTable -- Phase 6 step 6.C.2.
  *
  * Virtualized data table for the inspector panel.
  *
@@ -24,7 +24,7 @@
  *   - When the visible window leaves the loaded data window, the
  *     dispatch layer (in qviz-spec/index.ts) issues a fresh
  *     `requestInspectorData` for the new offset. We just dispatch the
- *     intent — the dispatch layer handles request lifecycle.
+ *     intent -- the dispatch layer handles request lifecycle.
  *
  * State binding:
  *
@@ -43,7 +43,7 @@ import { extractColumnsFromArrowIpcSafe } from '../../../src/qviz/render/extract
 import { canonicalizeSelectionX, selectionFieldForSpec } from '../state/inspectorState';
 import { mountColumnFilter, type ColumnFiltersHandle } from './columnFilters';
 
-interface VsCodeBridge { postMessage(value: unknown): void; }
+interface VsCodeBridge { postMessage(value: unknown): void }
 
 /** Fixed pixel height of one row. Matches the CSS rule in qviz-spec.css. */
 const ROW_HEIGHT = 24;
@@ -308,7 +308,7 @@ export function mountInspectorTable(
 				newColumnNames = schema.columns.map(c => c.name);
 				cachedRowCount = 0;
 			} else {
-				// Audit M-34 (2026-05-11): inspector-safe extractor —
+				// Audit M-34 (2026-05-11): inspector-safe extractor --
 				// per-column failures fall back to stringified cells
 				// instead of failing the whole table.
 				cachedColumns = extractColumnsFromArrowIpcSafe(insp.window.arrow);
@@ -371,7 +371,7 @@ export function mountInspectorTable(
 		if (offset !== currentOffset) {
 			store.dispatch({ type: 'setScrollOffset', offset });
 		}
-		// Re-render visible rows even if offset didn't change — the
+		// Re-render visible rows even if offset didn't change -- the
 		// scrollbar can move within the same row index when rounding.
 		update();
 	};

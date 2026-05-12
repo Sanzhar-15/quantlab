@@ -1,11 +1,11 @@
-/// <reference lib="dom" />
 /*---------------------------------------------------------------------------------------------
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+/// <reference lib="dom" />
 
 /**
- * chartTypePicker — Phase 5 step 5.D.2.
+ * chartTypePicker -- Phase 5 step 5.D.2.
  *
  * Renders 9 buttons (line, area, bar, histogram, candlestick,
  * baseline, scatter, heatmap, pie). For shared types (line, bar,
@@ -41,7 +41,7 @@ const CHART_TYPES_IN_ORDER: readonly { type: ChartType; label: string }[] = [
  *   - If the current family supports the target type, keep it (no
  *     spurious family swap on a shared-type click like `line`).
  *   - Otherwise prefer `timeseries` when it supports the type
- *     (line/area/bar/histogram/candlestick/baseline) — those are the
+ *     (line/area/bar/histogram/candlestick/baseline) -- those are the
  *     more common picks in trading workflows.
  *   - Fall back to `general` (scatter/heatmap/pie + the shared types).
  */

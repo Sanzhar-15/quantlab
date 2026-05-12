@@ -257,7 +257,7 @@ function parseBin(ctx: Ctx, path: string, obj: Record<string, unknown>): BinTran
 	// Validator-compiler coordination (Step C megaudit follow-up): the
 	// daemon's compiler only implements equal_width. A spec with
 	// strategy='equal_freq' would validate here but the daemon would
-	// silently apply equal_width — a "save a spec the daemon will
+	// silently apply equal_width -- a "save a spec the daemon will
 	// quietly miscompile" pattern. Reject until the compiler catches up.
 	// When equal_freq lands in `python/qviz/compiler.py`, remove this gate.
 	if (strategy === 'equal_freq') {
@@ -320,7 +320,7 @@ function parseWindow(ctx: Ctx, path: string, obj: Record<string, unknown>): Wind
 	//
 	// Ordering: this gate runs BEFORE the `window` field check so the
 	// actionable "ema is not implemented" message always wins (even if
-	// the user forgot `window` too — they'd still need to pick a
+	// the user forgot `window` too -- they'd still need to pick a
 	// different fn first).
 	if (fn === 'ema') {
 		ctx.error(
@@ -675,7 +675,7 @@ function expectObject(ctx: Ctx, path: string, x: unknown): Record<string, unknow
 	// at the validator boundary. Modern JSON.parse treats these as
 	// plain own keys (no setter triggered), but downstream code that
 	// iterates via `for...in` or `Object.assign` could surface them.
-	// Refuse loudly rather than silently strip — the caller learns
+	// Refuse loudly rather than silently strip -- the caller learns
 	// their input is malformed.
 	for (const k of ['__proto__', 'constructor', 'prototype']) {
 		if (Object.prototype.hasOwnProperty.call(x, k)) {
@@ -690,14 +690,14 @@ function expectObject(ctx: Ctx, path: string, x: unknown): Record<string, unknow
  *  control chars at the validator boundary. NUL bytes in identifiers
  *  break SQL identifier quoting; unbounded lengths cause O(n^2)
  *  serialization later in the pipeline. The cap is intentionally
- *  generous (4 KiB) — column names that long are themselves a smell. */
+ *  generous (4 KiB) -- column names that long are themselves a smell. */
 const MAX_STRING_LENGTH = 4 * 1024;
 function isAcceptableString(s: string): boolean {
 	if (s.length > MAX_STRING_LENGTH) { return false; }
 	for (let i = 0; i < s.length; i++) {
 		const code = s.charCodeAt(i);
 		// Disallow NUL (0x00) and most C0 control chars.
-		// Permit \t (0x09), \n (0x0A), \r (0x0D) — common in titles.
+		// Permit \t (0x09), \n (0x0A), \r (0x0D) -- common in titles.
 		if (code === 0x00) { return false; }
 		if (code < 0x20 && code !== 0x09 && code !== 0x0A && code !== 0x0D) {
 			return false;
@@ -761,7 +761,7 @@ function expectStringArray(ctx: Ctx, path: string, x: unknown): readonly string[
 /** Megaudit M-19 + Megaudit-2 A3-MAJOR-6: optional fields are silently
  *  dropped when absent, but a present-but-wrong-type value records a
  *  ctx.error AND returns undefined. Previously the helpers silently
- *  swallowed wrong types — e.g. `title: 123` validated as `undefined`
+ *  swallowed wrong types -- e.g. `title: 123` validated as `undefined`
  *  with no diagnostic and the user's intent was lost on round-trip. */
 function optString(ctx: Ctx, path: string, x: unknown): string | undefined {
 	if (x === undefined) { return undefined; }
@@ -803,7 +803,7 @@ function validateFilterValue(
 	const isPrimitive = (v: unknown): boolean => {
 		if (v === null) { return true; }
 		if (typeof v === 'string' || typeof v === 'boolean') { return true; }
-		// Megaudit-2 A3-MINOR/CODEX-9: require finite numbers — NaN
+		// Megaudit-2 A3-MINOR/CODEX-9: require finite numbers -- NaN
 		// and Infinity break DuckDB parameter binding semantics and
 		// should never appear in a stored spec.
 		if (typeof v === 'number') { return Number.isFinite(v); }

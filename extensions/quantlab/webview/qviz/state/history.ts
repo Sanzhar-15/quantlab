@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * History slice — Phase 8 Step B.
+ * History slice -- Phase 8 Step B.
  *
  * Records snapshots of UI-state (inspector toggle, selection) so Ctrl+Z
  * / Ctrl+Y can reverse those changes. The slice is updated by

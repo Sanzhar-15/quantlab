@@ -1,11 +1,11 @@
-/// <reference lib="dom" />
 /*---------------------------------------------------------------------------------------------
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+/// <reference lib="dom" />
 
 /**
- * columnPanel — Phase 5 step 5.D.1.
+ * columnPanel -- Phase 5 step 5.D.1.
  *
  * Renders the data file's column list with a type icon per column.
  * Keyboard-driven for Step D (drag-and-drop arrives in Step F):
@@ -14,7 +14,7 @@
  * current chart type. Selecting a channel dispatches `setEncoding`.
  *
  * Display:
- *   - Type icon (temporal / quantitative / nominal) — uses small SVG.
+ *   - Type icon (temporal / quantitative / nominal) -- uses small SVG.
  *   - Column name.
  *   - "missing" badge when the field is in `schema.missingFields`.
  *

@@ -407,7 +407,7 @@ export class QvizDaemonClient {
 		// PYTHONHOME, etc. can cause the child to load attacker-controlled
 		// code on launch.
 		//
-		// Megaudit-2 C2: scrub MUST happen AFTER opts.env merge — the
+		// Megaudit-2 C2: scrub MUST happen AFTER opts.env merge -- the
 		// previous order let a misbehaving caller reintroduce the
 		// scrubbed vars via opts.env. Now: merge first, scrub last,
 		// then set the daemon-required vars (which overrides any
@@ -878,7 +878,7 @@ export class QvizDaemonClient {
 
 	private onStdoutChunk(chunk: Buffer): void {
 		// Megaudit-2 m6: short-circuit when the client is already
-		// closed — otherwise late stdout chunks accumulate in
+		// closed -- otherwise late stdout chunks accumulate in
 		// `this.buffer` and re-trigger failPending paths via
 		// tryEmitFrame.
 		if (this.closed || this.fatal !== null) { return; }
@@ -986,7 +986,7 @@ export class QvizDaemonClient {
 
 		// Audit-fix AF4 + Megaudit-2 CODEX-3: id mismatch is a fatal
 		// desync. The previous check was `typeof r.id === 'number' &&
-		// r.id !== head.id` — which silently ACCEPTED missing/string/
+		// r.id !== head.id` -- which silently ACCEPTED missing/string/
 		// null ids by attributing them to the queue head. Now: require
 		// id to be a number that exactly matches head.id.
 		if (typeof r.id !== 'number' || r.id !== head.id) {
@@ -1072,7 +1072,7 @@ export class QvizDaemonClient {
 		if (!this.intendedClose && this.child.exitCode === null && this.child.signalCode === null) {
 			try { this.child.kill('SIGKILL'); } catch (e) {
 				// Megaudit MAJOR-18: only swallow ESRCH ("no such
-				// process" — child already gone). Any other kill error
+				// process" -- child already gone). Any other kill error
 				// (EPERM, EINVAL) is a real condition that MUST surface
 				// rather than silently disappear.
 				const code = (e as NodeJS.ErrnoException).code;

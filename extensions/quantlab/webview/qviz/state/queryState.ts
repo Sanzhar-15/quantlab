@@ -39,7 +39,7 @@ export interface QueryState {
 	readonly lastErrorRequestId: number | null;
 	readonly lastErrorMessage: string | null;
 	readonly lastErrorKind:
-		| 'compile' | 'security' | 'timeout' | 'memory' | 'internal' | 'protocol' | null;
+	| 'compile' | 'security' | 'timeout' | 'memory' | 'internal' | 'protocol' | null;
 	readonly lastErrorTransformIndex: number | null;
 	/** The most recent successful payload; the renderer reads this. */
 	readonly lastData: {
@@ -135,7 +135,7 @@ export function reduceQuery(state: QueryState, action: Action): QueryState {
 			// Megaudit residual: webview-local errors (extract / render
 			// failure that fired AFTER `dataReceived` cleared inflight)
 			// don't have an in-flight slot to attribute against. The
-			// specHash gate still applies — only attribute when the
+			// specHash gate still applies -- only attribute when the
 			// error matches the LAST SUCCESSFUL render's spec, so a
 			// stale post-render error from a superseded spec doesn't
 			// clobber diagnostics for the current spec.

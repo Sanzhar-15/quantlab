@@ -98,7 +98,7 @@ interface ChartBounds {
 	end: number;
 }
 
-const ORD_STEP_MS = 86_400_000; // 1 day — universal step for ordinal spacing
+const ORD_STEP_MS = 86_400_000; // 1 day -- universal step for ordinal spacing
 
 class OrdinalTimeMap {
 	readonly realTimes: number[];
@@ -555,7 +555,7 @@ export class ChartClient {
 		while (this.visualizationSeries.length >= ChartClient.MAX_VIZ_SERIES) {
 			const inactiveIdx = this.visualizationSeries.findIndex(h => !h.active);
 			if (inactiveIdx === -1) {
-				break; // All active — allow temporary overflow
+				break; // All active -- allow temporary overflow
 			}
 			const evicted = this.visualizationSeries.splice(inactiveIdx, 1)[0];
 			this.chart?.removeSeries(evicted.series);

@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * Default-spec derivation — Phase 5 step 5.C.3.
+ * Default-spec derivation -- Phase 5 step 5.C.3.
  *
  * Pure module. No vscode imports. No I/O. Given a `SchemaInfo` and a
  * dataset URI, produce a fully-valid `QvizSpec` with reasonable
@@ -38,7 +38,7 @@
  *   - `ordinal`      → never auto-detected; Y2 / future use.
  *
  * The classification is resilient to unknown dtypes (treated as
- * nominal — they won't be picked as x or y by the defaults but they
+ * nominal -- they won't be picked as x or y by the defaults but they
  * remain visible in the column panel).
  */
 
@@ -66,7 +66,7 @@ export interface DeriveDefaultSpecArgs {
  *
  * Returns `{ ok: false, error }` when the schema can't drive a sensible
  * default (no usable columns). The caller should surface the error
- * verbatim — it names the actionable shortfall ("no columns",
+ * verbatim -- it names the actionable shortfall ("no columns",
  * "no numeric column", etc.).
  */
 export function deriveDefaultSpec(args: DeriveDefaultSpecArgs): DeriveDefaultSpecResult {
@@ -85,7 +85,7 @@ export function deriveDefaultSpec(args: DeriveDefaultSpecArgs): DeriveDefaultSpe
 
 	// Phase 8 Step A: OHLCV smart-default. If the schema contains
 	// `open + high + low + close` (case-insensitive, all numeric) AND a
-	// temporal column, default to candlestick — that's almost always what
+	// temporal column, default to candlestick -- that's almost always what
 	// a quant wants on first open of an OHLCV parquet. `volume` is
 	// optional. Requires ALL FOUR OHLC names to be present to avoid
 	// false-positive matches on a stray `close` column (e.g., a survey's
@@ -109,7 +109,7 @@ export function deriveDefaultSpec(args: DeriveDefaultSpecArgs): DeriveDefaultSpe
 	// Step C megaudit D1: the prior "1 numeric + nominal → bar" branch
 	// was beyond the documented scope and produced specs without an
 	// aggregation pipeline (raw bars over potentially thousands of
-	// duplicate categories). Revert to two cases only — caller picks
+	// duplicate categories). Revert to two cases only -- caller picks
 	// chart type manually if neither applies.
 	else if (temporal && numerics.length >= 1) {
 		family = 'timeseries';
@@ -197,7 +197,7 @@ interface OhlcvColumns {
 }
 
 /**
- * Phase 8 Step A — OHLCV smart-default detector.
+ * Phase 8 Step A -- OHLCV smart-default detector.
  *
  * Returns the column names for a candlestick spec when:
  *   - all four of open/high/low/close (case-insensitive) are present

@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * Persist module — Phase 5 step 5.C.1.
+ * Persist module -- Phase 5 step 5.C.1.
  *
  * Pure module. No vscode imports. No I/O against the workspace beyond
  * `fs.realpathSync` / `fs.statSync` for symlink + extension validation.
@@ -161,7 +161,7 @@ export function resolveDatasetPath(
 			// that returned `false` for ANY error. Permission-denied
 			// on the parent dir would mask a legitimate symlink as
 			// "not a symlink." Now distinguish ENOENT (the lstat
-			// itself says "not present" — consistent with the outer
+			// itself says "not present" -- consistent with the outer
 			// realpath ENOENT we're already handling) from other
 			// errors which surface a system-error result instead.
 			let isDanglingSymlink = false;
@@ -250,7 +250,7 @@ export function resolveDatasetPath(
 		const err = e as NodeJS.ErrnoException;
 		const code = err.code ?? 'UNKNOWN';
 		// statSync after a successful realpathSync is rare to fail, but
-		// it CAN happen — file deleted between the two calls (TOCTOU
+		// it CAN happen -- file deleted between the two calls (TOCTOU
 		// window). Map to the closest existing error kind.
 		if (code === 'ENOENT') {
 			return {

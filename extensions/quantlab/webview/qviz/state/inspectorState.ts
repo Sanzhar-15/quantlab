@@ -8,28 +8,28 @@
  *
  * Holds the side-panel data-inspector's transient state:
  *
- *   - `visible`             — panel open/closed; toggle action flips it.
- *   - `filters`             — per-column ephemeral filter (range / text /
+ *   - `visible`             -- panel open/closed; toggle action flips it.
+ *   - `filters`             -- per-column ephemeral filter (range / text /
  *                             set). NEVER serialized into `.qviz.json`;
  *                             closing the editor clears them.
- *   - `selection`           — x-value currently highlighted. Both the
+ *   - `selection`           -- x-value currently highlighted. Both the
  *                             chart and the table read from this; both
  *                             can dispatch `setSelection` to update it.
- *   - `scrollOffset`        — first visible row index, used by the
+ *   - `scrollOffset`        -- first visible row index, used by the
  *                             virtualized table to decide when to ask
  *                             the daemon for a new window.
- *   - `window`              — the most-recently-received Arrow IPC bytes
+ *   - `window`              -- the most-recently-received Arrow IPC bytes
  *                             of preview rows for the current `(offset,
  *                             filters)` tuple. `null` until the first
  *                             inspectorDataReceived lands or after
  *                             filters/visibility change invalidates it.
- *   - `statsCache`          — per-column stats memoized by name, with a
+ *   - `statsCache`          -- per-column stats memoized by name, with a
  *                             pending flag so the widget can render a
  *                             spinner without dispatching a second
  *                             fetch on rapid re-opens.
  *
  * The slice is RESET on `init` because each document gets its own
- * inspector state — switching between editors must not carry filters or
+ * inspector state -- switching between editors must not carry filters or
  * selection across.
  *
  * Persistence contract (Phase 6 / 6.F):
@@ -40,7 +40,7 @@
  *   could carry inspector keys. Three invariants enforce the boundary:
  *
  *     1. `QvizSpec` (in `src/qviz/spec.ts`) has no `filters`/`selection`/
- *        `scrollOffset`/`window`/`statsCache`/`visible` field — the
+ *        `scrollOffset`/`window`/`statsCache`/`visible` field -- the
  *        TypeScript type system rejects any leakage at the call site.
  *     2. The `init` action RESETS this slice to defaults; closing and
  *        reopening a document drops every filter and selection.
@@ -183,7 +183,7 @@ export function selectionFieldForSpec(spec: {
  *  values through this so a chart click and a row click on the same
  *  point end up with selections that compare equal.
  *
- *  Heuristics intentionally conservative — only well-known temporal
+ *  Heuristics intentionally conservative -- only well-known temporal
  *  shapes get coerced. Strings that aren't ISO-parsable stay as-is. */
 export function canonicalizeSelectionX(x: unknown): unknown {
 	if (x instanceof Date) {
@@ -208,7 +208,7 @@ export function canonicalizeSelectionX(x: unknown): unknown {
 	}
 	if (typeof x === 'string') {
 		// ISO-8601 detection: starts with 4-digit year + dash + month.
-		// We don't try to parse every string — only the timestamp-shaped
+		// We don't try to parse every string -- only the timestamp-shaped
 		// ones. Parse-failure leaves the string untouched.
 		if (/^\d{4}-\d{2}/.test(x)) {
 			const ms = Date.parse(x);
@@ -256,7 +256,7 @@ export function reduceInspector(state: InspectorState, action: Action): Inspecto
 		case 'setChartType': {
 			// Audit M-9 (2026-05-11): chart-type swaps that drop the
 			// selection field (e.g., line → pie, scatter → candlestick)
-			// leave a ghost selection — its x-value no longer maps to
+			// leave a ghost selection -- its x-value no longer maps to
 			// any row in the new chart's coordinate space. Clear
 			// selection on any chart-type transition; the user can
 			// re-click as needed. This is more aggressive than strictly
@@ -287,7 +287,7 @@ export function reduceInspector(state: InspectorState, action: Action): Inspecto
 		case 'schemaChanged': {
 			// Audit B-4 (2026-05-11): when the dataset's schema changes
 			// mid-session, the inspector's per-column state (filters,
-			// statsCache) MUST be reconciled — otherwise the user keeps
+			// statsCache) MUST be reconciled -- otherwise the user keeps
 			// filters on columns that no longer exist (the daemon
 			// rejects those requests with cryptic errors) and stats are
 			// stale for columns whose dtype changed. We don't fully
@@ -319,7 +319,7 @@ export function reduceInspector(state: InspectorState, action: Action): Inspecto
 				// Drop the loaded window; it was fetched under old
 				// schema and the column-set may not match.
 				window: null,
-				// Drop selection if its column was removed — we don't
+				// Drop selection if its column was removed -- we don't
 				// have selection.column, only selection.x; conservative
 				// choice: clear selection on any field drop. Keep when
 				// nothing was filtered out (drop-by-default is too
@@ -347,7 +347,7 @@ export function reduceInspector(state: InspectorState, action: Action): Inspecto
 					// Filter change invalidates any pending window.
 					window: null,
 					scrollOffset: 0,
-					// Filter edit is a fresh start — drop any prior error
+					// Filter edit is a fresh start -- drop any prior error
 					// so the next fetch can repopulate cleanly.
 					lastError: null,
 					// Audit M-10 (2026-05-11): a filter change can drop
@@ -445,7 +445,7 @@ export function reduceInspector(state: InspectorState, action: Action): Inspecto
 			// We now stash the error string so the table can render an
 			// explicit failure placeholder, AND the dispatcher in
 			// qviz-spec/index.ts watches this field to clear its
-			// duplicate-request cursor — without that clear, the same
+			// duplicate-request cursor -- without that clear, the same
 			// (offset, filters) retry was suppressed forever.
 			return {
 				...state,

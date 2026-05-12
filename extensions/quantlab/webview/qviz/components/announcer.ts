@@ -1,11 +1,11 @@
-/// <reference lib="dom" />
 /*---------------------------------------------------------------------------------------------
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+/// <reference lib="dom" />
 
 /**
- * Accessibility announcer — Phase 5 step 5.H.1.
+ * Accessibility announcer -- Phase 5 step 5.H.1.
  *
  * A hidden `aria-live` region that emits speech-friendly status
  * messages for state transitions a screen-reader user would otherwise
@@ -19,11 +19,11 @@
  * called twice via DnD+click) doesn't double-announce.
  *
  * Subscribes to the store and watches:
- *   - encoding assignments (setEncoding, setOhlcv) — polite
- *   - query lifecycle (requestStarted, dataReceived, errorReceived) — polite
- *   - save lifecycle (saveStarted, saveResult) — polite (ok) / assertive (failed)
- *   - drift detection (schemaChanged) — polite
- *   - daemon status transitions to crashed/unavailable — assertive
+ *   - encoding assignments (setEncoding, setOhlcv) -- polite
+ *   - query lifecycle (requestStarted, dataReceived, errorReceived) -- polite
+ *   - save lifecycle (saveStarted, saveResult) -- polite (ok) / assertive (failed)
+ *   - drift detection (schemaChanged) -- polite
+ *   - daemon status transitions to crashed/unavailable -- assertive
  */
 
 import type { QvizStore, RootState } from '../state/store';
@@ -188,7 +188,7 @@ function diffAndAnnounce(
 				);
 				break;
 			case 'same-hash':
-				// Don't announce returning to clean — the user just
+				// Don't announce returning to clean -- the user just
 				// saved or the drift was resolved silently.
 				break;
 		}

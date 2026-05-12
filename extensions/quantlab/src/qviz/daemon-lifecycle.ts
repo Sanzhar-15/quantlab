@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * DaemonLifecycle — workspace-keyed lifecycle manager for QvizDaemonClient.
+ * DaemonLifecycle -- workspace-keyed lifecycle manager for QvizDaemonClient.
  *
  * Phase 5 step B.3 (audit-merged plan, post-megaudit-cycle-2). Wraps a
  * `QvizDaemonClient` with:
@@ -286,7 +286,7 @@ export class DaemonLifecycle {
 			// transitioning to `unavailable`. The prior order
 			// (transition → dispose) left a brief window where status
 			// subscribers were told "gone" but the child process was
-			// still alive for up to `disposeGraceMs` — risking
+			// still alive for up to `disposeGraceMs` -- risking
 			// port/socket conflicts if a downstream consumer reacted
 			// by spawning a fresh lifecycle.
 			if (this.client) {

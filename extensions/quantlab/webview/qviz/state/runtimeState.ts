@@ -51,7 +51,7 @@ export function reduceRuntime(state: RuntimeState, action: Action): RuntimeState
 			// Megaudit MAJOR-25: the store is per-webview (per panel),
 			// not global. On `init` for a new document, daemon and
 			// dataset status from the previous document MUST reset to
-			// defaults — the provider re-emits the current values
+			// defaults -- the provider re-emits the current values
 			// immediately via the post-init message stream.
 			//
 			// Audit M-25 (2026-05-11): capabilities ALSO reset to the

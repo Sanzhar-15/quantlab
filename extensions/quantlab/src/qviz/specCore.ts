@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * specCore — vscode-free core for the .qviz.json document model.
+ * specCore -- vscode-free core for the .qviz.json document model.
  *
  * The QvizSpecDocument class (in src/views/visualise/QvizSpecDocument.ts)
  * is a thin VS Code adapter around this module. The split keeps the

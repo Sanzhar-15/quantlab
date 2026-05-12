@@ -1,11 +1,11 @@
-/// <reference lib="dom" />
 /*---------------------------------------------------------------------------------------------
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+/// <reference lib="dom" />
 
 /**
- * TransformList — Phase 5 steps 5.G.2 + 5.G.4 + 5.G.5.
+ * TransformList -- Phase 5 steps 5.G.2 + 5.G.4 + 5.G.5.
  *
  * Renders the ordered transform pipeline as a list of cards. Each card
  * has a header (kind + summary + move/edit/delete buttons) and an
@@ -41,7 +41,7 @@ import {
 /** All transform kinds known to the spec format. The Add menu is
  *  filtered against `runtime.capabilities.transformKinds`; this list
  *  is the upper bound.
- *  `resample` excluded — Step C cleanup gates it in the validator. */
+ *  `resample` excluded -- Step C cleanup gates it in the validator. */
 const ALL_KINDS: readonly TransformKind[] = [
 	'filter', 'date_trunc', 'bin', 'groupby', 'aggregate',
 	'window', 'math', 'tz_convert', 'sort', 'limit',
@@ -243,8 +243,10 @@ export function mountTransformList(root: HTMLElement, store: QvizStore): { dispo
 				// per-kind); the card's `t` matches the registry.
 				const factory = FORM_BY_KIND[t.kind] as (
 					t: Transform,
-					ctx: { columns: ReadonlyArray<{ name: string; dtype: string; nullable: boolean }>;
-						availableProducedNames: readonly string[]; },
+					ctx: {
+						columns: ReadonlyArray<{ name: string; dtype: string; nullable: boolean }>;
+						availableProducedNames: readonly string[];
+					},
 					on: (n: Transform) => void,
 				) => TransformFormHandle;
 				const handle = factory(t, formCtx, (next) => {
@@ -292,7 +294,7 @@ export function mountTransformList(root: HTMLElement, store: QvizStore): { dispo
 
 function pipelineHasHistogramShape(transforms: readonly Transform[]): boolean {
 	// Heuristic: the pipeline contains at least one bin + groupby +
-	// aggregate(count). We don't enforce strict ordering — the user
+	// aggregate(count). We don't enforce strict ordering -- the user
 	// may have other transforms interleaved; the preset only fires if
 	// none of these are present.
 	const hasBin = transforms.some(t => t.kind === 'bin');
@@ -309,7 +311,7 @@ function applyHistogramPreset(store: QvizStore): void {
 	if (spec === null) { return; }
 	// Megaudit M-21: use the x encoding's column as bin source; if no
 	// x set, pick the first quantitative schema column. REFUSE to
-	// build the preset when neither is available — substituting
+	// build the preset when neither is available -- substituting
 	// literal `'value'` / `'*'` produces an invalid spec the daemon
 	// rejects with a confusing error. Tell the user to pick a column
 	// first via an alert (we don't have a notification UI in the
@@ -323,7 +325,6 @@ function applyHistogramPreset(store: QvizStore): void {
 		binColumn = numCol?.name ?? '';
 	}
 	if (binColumn.length === 0) {
-		// eslint-disable-next-line no-alert
 		alert('Histogram preset needs a column. Assign a numeric column to X first, '
 			+ 'or open a dataset that has numeric columns.');
 		return;
@@ -336,7 +337,6 @@ function applyHistogramPreset(store: QvizStore): void {
 		const required = ['bin', 'groupby', 'aggregate'];
 		const missing = required.filter(k => !caps.transformKinds.includes(k));
 		if (missing.length > 0) {
-			// eslint-disable-next-line no-alert
 			alert(`Histogram preset needs daemon support for: ${missing.join(', ')}.`);
 			return;
 		}

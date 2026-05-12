@@ -149,7 +149,7 @@ function extractNumericColumn(
 			continue;
 		}
 		if (typeof v === 'bigint') {
-			// Safe-integer check — silent truncation hid data quality
+			// Safe-integer check -- silent truncation hid data quality
 			// issues for values beyond 2^53.
 			if (v > BigInt(Number.MAX_SAFE_INTEGER) || v < BigInt(Number.MIN_SAFE_INTEGER)) {
 				throw new ExtractError(
@@ -173,7 +173,7 @@ function extractStringColumn(
 ): string[] {
 	// Megaudit-2 A5-MAJOR-2.1: refuse to silently `String(v)` arbitrary
 	// types. The numeric extractor (CRITICAL-12) throws ExtractError
-	// for unsupported values; the string extractor was inconsistent —
+	// for unsupported values; the string extractor was inconsistent --
 	// `{ nested: 'x' }` would render as `[object Object]` with no
 	// diagnostic. Now: accept string/number/bigint/boolean (with an
 	// explicit String() coercion documented), but throw on objects

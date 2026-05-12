@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * VisualiseDataProvider — VS Code CustomReadonlyEditorProvider for
+ * VisualiseDataProvider -- VS Code CustomReadonlyEditorProvider for
  * `*.csv | *.parquet | *.xlsx`.
  *
  * Phase 5 step A.3 (audit-merged plan). This is the data-file entry point
@@ -88,7 +88,7 @@ class DataDocument implements vscode.CustomDocument {
 	private readonly _onDidDispose = new vscode.EventEmitter<void>();
 	readonly onDidDispose = this._onDidDispose.event;
 
-	constructor(readonly uri: vscode.Uri) {}
+	constructor(readonly uri: vscode.Uri) { }
 
 	dispose(): void {
 		this._onDidDispose.fire();
@@ -115,7 +115,7 @@ export class VisualiseDataProvider implements vscode.CustomReadonlyEditorProvide
 	private readonly stateByUri = new Map<string, LegacyVisualiseState>();
 	private readonly panelByUri = new Map<string, vscode.WebviewPanel>();
 
-	constructor(private readonly context: vscode.ExtensionContext) {}
+	constructor(private readonly context: vscode.ExtensionContext) { }
 
 	async openCustomDocument(
 		uri: vscode.Uri,

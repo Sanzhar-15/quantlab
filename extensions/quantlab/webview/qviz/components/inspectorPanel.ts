@@ -1,11 +1,11 @@
-/// <reference lib="dom" />
 /*---------------------------------------------------------------------------------------------
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+/// <reference lib="dom" />
 
 /**
- * inspectorPanel — Phase 6 step 6.C.1.
+ * inspectorPanel -- Phase 6 step 6.C.1.
  *
  * Outer shell for the data inspector. Mounts/unmounts the body
  * (header + virtualized table) based on `state.inspector.visible`.
@@ -14,7 +14,7 @@
  *
  * UI surface:
  *   - Header row:
- *       title ("Inspector — N rows[, filtered]")
+ *       title ("Inspector -- N rows[, filtered]")
  *       "Clear filters" button (shown only when any filter is active)
  *       close (×) button (dispatches toggleInspector with visible:false)
  *   - Body: virtualized table (see inspectorTable.ts).
@@ -29,7 +29,7 @@ import type { QvizStore } from '../state/store';
 import { selectionFieldForSpec } from '../state/inspectorState';
 import { mountInspectorTable, type InspectorTableHandle } from './inspectorTable';
 
-interface VsCodeBridge { postMessage(value: unknown): void; }
+interface VsCodeBridge { postMessage(value: unknown): void }
 
 export interface InspectorPanelHandle {
 	dispose(): void;
@@ -97,7 +97,7 @@ export function mountInspectorPanel(
 				//
 				// Audit B-1 (2026-05-11): when xField is a transform-
 				// derived alias (not in the raw preview's schema), the
-				// preview row doesn't have that key — `row[xField]`
+				// preview row doesn't have that key -- `row[xField]`
 				// would be undefined and chart→row sync is broken
 				// anyway. No-op the dispatch in that case so we don't
 				// set a phantom undefined selection.
@@ -143,7 +143,7 @@ export function mountInspectorPanel(
 			} else {
 				unmountTable();
 				// Audit M-30 (2026-05-11): hiding mid-drag (e.g., Ctrl+I)
-				// must cancel the drag — otherwise dragActive stays true,
+				// must cancel the drag -- otherwise dragActive stays true,
 				// every subsequent mouse-move keeps writing CSS width
 				// while the panel is hidden, and the next reopen sees
 				// the stale dragStartWidth.
@@ -158,8 +158,8 @@ export function mountInspectorPanel(
 			title.textContent = 'Inspector';
 		} else {
 			title.textContent = filterCount > 0
-				? `Inspector — ${total.toLocaleString()} rows (filtered)`
-				: `Inspector — ${total.toLocaleString()} rows`;
+				? `Inspector -- ${total.toLocaleString()} rows (filtered)`
+				: `Inspector -- ${total.toLocaleString()} rows`;
 		}
 		clearBtn.hidden = filterCount === 0;
 	};
@@ -181,7 +181,7 @@ export function mountInspectorPanel(
 	// session. (Audit NIT 2026-05-11: comment previously said
 	// `webview.setState`; the implementation uses sessionStorage.
 	// sessionStorage scopes to the panel's iframe and outlives the
-	// reload, which is the UX we want — no need to plumb width through
+	// reload, which is the UX we want -- no need to plumb width through
 	// VS Code's persistent webview state.)
 	const MIN_WIDTH_PX = 240;
 	const MAX_WIDTH_FRAC = 0.6;

@@ -60,7 +60,7 @@ export function applyTimeseriesPlan(
 		// dispose errors with `void e;` and a comment justifying the
 		// swallow. CLAUDE.md prohibits this; the matching change to
 		// `general-applier.ts` was AF20. Let dispose errors propagate
-		// — RendererHost wraps applier calls and surfaces the error
+		// -- RendererHost wraps applier calls and surfaces the error
 		// as a structured RenderResult.
 		disposeChart(existing, container);
 	}

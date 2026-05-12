@@ -1,11 +1,11 @@
-/// <reference lib="dom" />
 /*---------------------------------------------------------------------------------------------
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+/// <reference lib="dom" />
 
 /**
- * Builder webview entry — Phase 5 step D (replacing the Step A
+ * Builder webview entry -- Phase 5 step D (replacing the Step A
  * placeholder). Wires:
  *   - Inbound messages from the provider via `validateExtensionMessage`
  *     → dispatched into the qviz state store as actions.
@@ -29,8 +29,7 @@ import {
 	validateExtensionMessage,
 } from '../../src/qviz/messageProtocol';
 import type { QvizSpec } from '../../src/qviz/spec';
-import type { QvizTheme } from '../../src/qviz/render/types';
-import type { ColumnData } from '../../src/qviz/render/types';
+import type { ColumnData, QvizTheme } from '../../src/qviz/render/types';
 import { extractColumnsFromArrowIpc } from '../../src/qviz/render/extract-arrow';
 import { createStore } from '../qviz/state/store';
 import { isDirty } from '../qviz/state/specState';
@@ -144,7 +143,7 @@ function init(): void {
 		},
 	});
 
-	// Step 5.E.2 — ResizeObserver on the chart container. Re-apply the
+	// Step 5.E.2 -- ResizeObserver on the chart container. Re-apply the
 	// last render with the same data so the chart fills the resized
 	// container. Debounced so a drag doesn't trigger 60 re-applies per
 	// second. We don't re-fetch data on resize.
@@ -247,7 +246,7 @@ function init(): void {
 	// renderer drive on dataReceived. The `lastDispatchedHash` guard
 	// prevents firing requestData for the same spec twice (e.g., when
 	// init lands and we already match).
-	let lastDispatchedHash: string | null = null;
+	const lastDispatchedHash: string | null = null;
 	let lastDispatchedEditHash: string | null = null;
 	let lastRenderedDataHash: string | null = null;
 	let debounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -259,7 +258,7 @@ function init(): void {
 			// undo stack gets the new spec recorded as an edit step.
 			// Provider's handleEdit suppresses the contentChange echo
 			// so this doesn't bounce back as an init. Skip if the hash
-			// matches what we last edit-dispatched (idempotent — the
+			// matches what we last edit-dispatched (idempotent -- the
 			// document's structurally-equal short-circuit also catches
 			// duplicates, but the network round-trip is wasteful).
 			if (lastDispatchedEditHash !== specHash) {
@@ -307,7 +306,7 @@ function init(): void {
 	const liveSubscription = store.subscribe((state) => {
 		// Live-preview trigger. Megaudit MAJOR-33: the prior gate
 		// (`hash !== lastDispatchedHash`) silently swallowed undo when
-		// the post-undo hash matched a previously-dispatched value —
+		// the post-undo hash matched a previously-dispatched value --
 		// no fresh requestData fired and the chart stayed at the
 		// pre-undo render. New gate: dispatch unless the hash matches
 		// the LAST SUCCESSFULLY RENDERED hash (i.e., the chart on
@@ -365,7 +364,7 @@ function init(): void {
 	void liveSubscription;
 	void lastDispatchedHash;
 
-	// Step 5.E.1 — theme refresh via MutationObserver on body.className.
+	// Step 5.E.1 -- theme refresh via MutationObserver on body.className.
 	// VS Code signals theme changes by toggling body classes
 	// (`vscode-dark`, `vscode-light`, `vscode-high-contrast`). The
 	// observer fires `themeUpdated` so the store advances
@@ -408,7 +407,7 @@ function init(): void {
 		);
 		// Phase 6 (6.E.5): Escape clears the inspector selection.
 		// Defer to native handling when focus is in a text input or
-		// a popup is open — Esc has other meanings there (commit input,
+		// a popup is open -- Esc has other meanings there (commit input,
 		// close popup) and the inspector selection isn't the priority.
 		if (e.key === 'Escape' && !inEditable) {
 			if (store.getState().inspector.selection !== null) {
@@ -452,7 +451,7 @@ function init(): void {
 		if (!(e.ctrlKey || e.metaKey)) { return; }
 		if (inEditable) { return; }
 		// Audit M-E (2026-05-11): swallow the shortcut when the daemon
-		// doesn't advertise inspector caps — opening would just produce
+		// doesn't advertise inspector caps -- opening would just produce
 		// cryptic op-unsupported errors. The button is disabled in this
 		// state too; the shortcut bypasses the button so we re-check.
 		const insCaps = store.getState().runtime.capabilities?.inspector;
@@ -564,7 +563,7 @@ function init(): void {
 				lastInspectorFiltersHashReq = '';
 			}
 		}
-		// Audit M-28 (2026-05-11): drop the else — a single tick can
+		// Audit M-28 (2026-05-11): drop the else -- a single tick can
 		// flip visibility AND change scroll/filters (e.g., toggleInspector
 		// + setColumnFilter dispatched together). The prior `if/else if`
 		// short-circuit missed the second update. Now both branches
@@ -792,8 +791,8 @@ async function renderActiveData(
 }
 
 /** Read the VS Code CSS custom properties into a single token bag.
- *  Both `readThemeFromCssVars()` (QvizTheme — what the renderer wants)
- *  and `readThemeTokensFromCssVars()` (ThemeTokens — what the protocol
+ *  Both `readThemeFromCssVars()` (QvizTheme -- what the renderer wants)
+ *  and `readThemeTokensFromCssVars()` (ThemeTokens -- what the protocol
  *  action carries) project from this same bag. */
 function readVscodeCssBag(): {
 	background: string;
@@ -808,7 +807,7 @@ function readVscodeCssBag(): {
 	const styles = getComputedStyle(document.body);
 	// Megaudit M-13: warn (once per session per missing var) when a
 	// VS Code CSS custom property is missing/empty. Hardcoded
-	// fallback colors silently substitute the user's theme — log so
+	// fallback colors silently substitute the user's theme -- log so
 	// theme-integration regressions are diagnosable.
 	const warned = new Set<string>();
 	const get = (name: string, fallback: string): string => {

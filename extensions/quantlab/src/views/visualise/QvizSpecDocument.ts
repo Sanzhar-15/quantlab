@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * QvizSpecDocument — vscode.CustomDocument backing a `.qviz.json` editor.
+ * QvizSpecDocument -- vscode.CustomDocument backing a `.qviz.json` editor.
  *
  * Phase 5 step A.2 (audit-merged plan). Thin vscode adapter around
  * `SpecDocumentCore` (in `src/qviz/specDocCore.ts`) which owns the
@@ -276,7 +276,7 @@ export class QvizSpecDocument implements vscode.CustomDocument {
 		// the disk write (was: AFTER). The previous order let the disk
 		// write commit, then threw MidSaveEditError, leaving disk with
 		// the older transformed spec while memory had the newer edit
-		// AND `lastKnownDiskBytes` un-updated — so the next save would
+		// AND `lastKnownDiskBytes` un-updated -- so the next save would
 		// false-positive a SaveConflictError. The error message said
 		// "rolled back" but no rollback happened. Now the check fires
 		// pre-write, so a thrown MidSaveEditError genuinely leaves disk
@@ -288,7 +288,7 @@ export class QvizSpecDocument implements vscode.CustomDocument {
 		// or core has been mutated yet.
 		await vscode.workspace.fs.writeFile(targetUri, bytes);
 		await this.assertWrittenBytesMatch(targetUri, bytes);
-		// Re-check after the await — a fast user could have edited
+		// Re-check after the await -- a fast user could have edited
 		// during the (potentially slow) writeFile. If they did, the
 		// disk now has the transformed version and memory has newer
 		// content; surface as MidSaveEditError so the user retries.
@@ -314,7 +314,7 @@ export class QvizSpecDocument implements vscode.CustomDocument {
 	 *     file is never a conflict).
 	 *   - `lastKnownDiskBytes` is null (untitled doc, never saved
 	 *     against a baseline).
-	 *   - target doesn't exist (no conflict — caller is creating it).
+	 *   - target doesn't exist (no conflict -- caller is creating it).
 	 */
 	private async assertNoExternalChange(targetUri: vscode.Uri): Promise<void> {
 		if (targetUri.toString() !== this.uri.toString()) { return; }
@@ -323,7 +323,7 @@ export class QvizSpecDocument implements vscode.CustomDocument {
 		try {
 			current = await vscode.workspace.fs.readFile(targetUri);
 		} catch (e) {
-			// Only swallow "file doesn't exist" — that's a legitimate
+			// Only swallow "file doesn't exist" -- that's a legitimate
 			// "no in-place conflict, the write will create it fresh".
 			// Anything else (EACCES, transient I/O, corruption) MUST
 			// propagate so the user sees the real error rather than us
@@ -366,7 +366,7 @@ export class QvizSpecDocument implements vscode.CustomDocument {
 	 * Megaudit CRITICAL-11 (post-write half of TOCTOU defense):
 	 * after `writeFile`, re-read the target and verify the bytes match
 	 * what we intended to write. A mismatch means another process wrote
-	 * to the same path during our write — we MUST surface that rather
+	 * to the same path during our write -- we MUST surface that rather
 	 * than report "save succeeded" when our content is gone.
 	 */
 	private async assertWrittenBytesMatch(
