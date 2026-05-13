@@ -24,24 +24,11 @@ use ql_types::{coercion, ErrorValue, Value};
 use crate::welford;
 use crate::welford::WelfordState;
 
-/// Helper: extract `f64` from a Value, propagating Error. Skip Blank (treats as
-/// "absent" — caller decides whether that's an error or a no-op for the function).
-enum NumericArg {
-    Number(f64),
-    Skip,
-    Error(ErrorValue),
-}
-
-fn coerce_numeric(v: &Value) -> NumericArg {
-    match v {
-        Value::Error(e) => NumericArg::Error(*e),
-        Value::Blank => NumericArg::Skip,
-        other => match coercion::to_number_strict(other) {
-            Ok(n) => NumericArg::Number(n),
-            Err(e) => NumericArg::Error(e),
-        },
-    }
-}
+// W5-64 (Phase 4.4.A): the local `NumericArg` enum + `coerce_numeric` helper
+// were promoted to `crate::range_aware_fns` as cross-module utilities (also
+// used by `range_fns`). The shim there delegates to
+// `ql_types::coercion::to_number_strict_skip_blank` (the central neutral API).
+use crate::range_aware_fns::{coerce_numeric, NumericArg};
 
 /// Helper: feed args through a Welford-style accumulator (streaming variant).
 /// Errors short-circuit. Returns `Ok((state))` if all args usable.
@@ -1346,26 +1333,13 @@ pub fn atan2(args: &[Value]) -> Value {
 /// Helper: coerce a Value to its display string per Excel canon.
 /// Numbers print as their f64 representation; Bool as TRUE/FALSE;
 /// Text passes through; Blank as "" (empty string). Errors propagate.
-fn coerce_text(v: &Value) -> Result<String, ErrorValue> {
-    match v {
-        Value::Error(e) => Err(*e),
-        Value::Text(s) => Ok(s.as_ref().to_owned()),
-        Value::Number(n) => Ok(format_number_for_text(*n)),
-        Value::Boolean(b) => Ok(if *b { "TRUE" } else { "FALSE" }.to_owned()),
-        Value::Blank => Ok(String::new()),
-    }
-}
-
-/// Excel-canon number → text. Integers render without a trailing `.0`;
-/// otherwise the default `f64` Display is good enough for V1. Phase 4.5
-/// (number formats) replaces this with locale-aware formatting.
-fn format_number_for_text(n: f64) -> String {
-    if n == n.trunc() && n.abs() < 1e15 {
-        format!("{}", n as i64)
-    } else {
-        format!("{n}")
-    }
-}
+// W5-64 (Phase 4.4.A): the private `coerce_text` + `format_number_for_text`
+// helpers were promoted to `ql_types::coercion::{to_text_for_arg,
+// format_number_for_arg}`. Local aliases preserved here for callers within
+// this module — keeps the diff readable. `coerce_text` shadows the central
+// `to_text_for_arg` and gets the new NaN/Inf policy "for free" (raw NaN/Inf
+// → #NUM!), which is byte-for-byte the W5-64 design contract.
+use ql_types::coercion::to_text_for_arg as coerce_text;
 
 /// `LEN(text)` — character count of the text representation (UTF-8 chars).
 /// Excel treats it as character count, not byte count.
@@ -1498,18 +1472,10 @@ pub fn trim(args: &[Value]) -> Value {
 /// Helper: coerce a Value to an integer arg for position/length
 /// fields in text functions. Numbers truncate; Bool 1/0; Blank 0;
 /// Text rejected as #VALUE!; Error propagates.
-fn coerce_int_arg(v: &Value) -> Result<i64, ErrorValue> {
-    match v {
-        Value::Number(n) => Ok(n.trunc() as i64),
-        Value::Boolean(b) => Ok(if *b { 1 } else { 0 }),
-        Value::Blank => Ok(0),
-        Value::Text(s) => match coercion::to_number_lenient(&Value::Text(s.clone())) {
-            Ok(n) => Ok(n.trunc() as i64),
-            Err(_) => Err(ErrorValue::Value),
-        },
-        Value::Error(e) => Err(*e),
-    }
-}
+// W5-64 (Phase 4.4.A): private `coerce_int_arg` was promoted to
+// `ql_types::coercion::to_int_arg`. Local alias retained for in-module
+// callers (LEFT, RIGHT, MID, FIND, SEARCH, REPLACE, REPT, SUBSTITUTE).
+use ql_types::coercion::to_int_arg as coerce_int_arg;
 
 /// `LEFT(text, [num_chars])` — leftmost `num_chars` characters of
 /// `text`. Default num_chars=1. Negative → #VALUE!. num_chars

@@ -35,28 +35,11 @@
 
 use ql_types::{coercion, ErrorValue, Value};
 
-use crate::range_aware_fns::FnArg;
+// W5-64 (Phase 4.4.A): the previously-duplicated `NumericArg` + `coerce_numeric`
+// helpers were consolidated into `crate::range_aware_fns` (cross-module home),
+// which delegates to `ql_types::coercion::to_number_strict_skip_blank`.
+use crate::range_aware_fns::{coerce_numeric, FnArg, NumericArg};
 use crate::wildcard::{has_wildcards, WildcardPattern};
-
-/// Helper: coerce a Value to a numeric f64 for sum-style accumulation.
-/// Errors propagate; Blank skips; Bool coerces (TRUE=1.0, FALSE=0.0);
-/// Text → #VALUE! (strict — matches scalar_fns module canon).
-enum NumericArg {
-    Number(f64),
-    Skip,
-    Error(ErrorValue),
-}
-
-fn coerce_numeric(v: &Value) -> NumericArg {
-    match v {
-        Value::Error(e) => NumericArg::Error(*e),
-        Value::Blank => NumericArg::Skip,
-        other => match coercion::to_number_strict(other) {
-            Ok(n) => NumericArg::Number(n),
-            Err(e) => NumericArg::Error(e),
-        },
-    }
-}
 
 /// Comparison operator parsed from a criteria string like `">5"`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1397,7 +1380,14 @@ pub fn concat(args: &[FnArg]) -> Value {
     let mut char_count: usize = 0;
     for arg in args {
         match arg {
-            FnArg::Scalar(v) => match value_to_concat_text(v) {
+            // W5-64 (Phase 4.4.A): the local `value_to_concat_text` helper was
+            // a byte-for-byte duplicate of `coercion::to_text_for_arg`. Switched
+            // to the central path. Behavior preserved: Blank→"", Number→
+            // integer-rendered text (`< 1e15` guard), Bool→TRUE/FALSE, Text→
+            // clone, Error→propagate. The W5-64 NaN/Inf-→#NUM! addition is a
+            // FORWARD-COMPATIBLE behavior change for raw non-finite Numbers,
+            // which the Value invariant says should never reach here anyway.
+            FnArg::Scalar(v) => match coercion::to_text_for_arg(v) {
                 Ok(s) => {
                     char_count = char_count.saturating_add(s.chars().count());
                     if char_count > EXCEL_TEXT_CAP_CHARS {
@@ -1409,7 +1399,7 @@ pub fn concat(args: &[FnArg]) -> Value {
             },
             FnArg::Range { values, .. } => {
                 for v in values {
-                    match value_to_concat_text(v) {
+                    match coercion::to_text_for_arg(v) {
                         Ok(s) => {
                             char_count = char_count.saturating_add(s.chars().count());
                             if char_count > EXCEL_TEXT_CAP_CHARS {
@@ -1426,25 +1416,9 @@ pub fn concat(args: &[FnArg]) -> Value {
     Value::text(out)
 }
 
-/// CONCAT-style text coercion: Blank→"", Number→text, Bool→TRUE/FALSE,
-/// Text→clone, Error→propagate.
-fn value_to_concat_text(v: &Value) -> Result<String, ErrorValue> {
-    match v {
-        Value::Error(e) => Err(*e),
-        Value::Blank => Ok(String::new()),
-        Value::Text(s) => Ok(s.as_ref().to_owned()),
-        Value::Boolean(b) => Ok(if *b { "TRUE" } else { "FALSE" }.to_owned()),
-        Value::Number(n) => {
-            // Match scalar_fns::format_number_for_text: integer
-            // rendering without trailing .0, else default Display.
-            if *n == n.trunc() && n.abs() < 1e15 {
-                Ok(format!("{}", *n as i64))
-            } else {
-                Ok(format!("{n}"))
-            }
-        }
-    }
-}
+// W5-64 (Phase 4.4.A): `value_to_concat_text` was deleted; CONCAT now calls
+// `ql_types::coercion::to_text_for_arg` directly. The two functions had
+// byte-for-byte identical bodies.
 
 #[cfg(test)]
 mod tests {

@@ -29,7 +29,35 @@
 //! — they keep working under `ScalarFn`. Only new functions that
 //! genuinely need per-arg range distinction use the new tier.
 
-use ql_types::Value;
+use ql_types::{coercion, ErrorValue, Value};
+
+/// Cross-module ergonomic enum for "numeric coerce, with Blank-skip and
+/// Error-propagation surfaced as distinct match arms." Wraps the central
+/// `ql_types::coercion::to_number_strict_skip_blank` so callers can use a
+/// match on three variants instead of `Result<Option<f64>, ErrorValue>`.
+///
+/// **W5-64 (Phase 4.4.A consolidation):** Was previously duplicated in
+/// `scalar_fns.rs` and `range_fns.rs`. Codex audit MEDIUM 3: keep the central
+/// API neutral (Result/Option) but the function-aware enum stays in
+/// ql-functions where it belongs.
+#[derive(Debug)]
+pub enum NumericArg {
+    Number(f64),
+    Skip,
+    Error(ErrorValue),
+}
+
+/// W5-64 (Phase 4.4.A): cross-module ergonomic wrapper around
+/// `coercion::to_number_strict_skip_blank`. Both `scalar_fns` and `range_fns`
+/// use this; the duplicate `coerce_numeric` previously in each module was
+/// removed.
+pub fn coerce_numeric(v: &Value) -> NumericArg {
+    match coercion::to_number_strict_skip_blank(v) {
+        Ok(Some(n)) => NumericArg::Number(n),
+        Ok(None) => NumericArg::Skip,
+        Err(e) => NumericArg::Error(e),
+    }
+}
 
 /// A single argument to a range-aware function. `Scalar` carries a
 /// pre-evaluated `Value`; `Range` carries the flat row-major

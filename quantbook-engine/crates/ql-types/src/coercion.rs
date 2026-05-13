@@ -68,19 +68,129 @@ pub fn to_logical(v: &Value) -> Result<bool, ErrorValue> {
 /// formation. Infallible; `Value::Error(e)` is rendered as its sigil (`"#REF!"`, `"#NUM!"`, ...).
 /// Locale-agnostic.
 ///
+/// **W5-64 (Phase 4.4.A; Codex MEDIUM 1 fix):** A raw `Value::Number(NaN)` or
+/// `Value::Number(±Inf)` — which can be constructed by bypassing `Value::number(n)` —
+/// renders as the `"#NUM!"` sigil rather than `"NaN"` / `"inf"`. The Value invariant says
+/// non-finite numbers should never reach this path, but if they do, surface as `#NUM!`.
+///
 /// **Do NOT use for the formula `&` operator** — see [`to_text_for_formula`]. Excel propagates
 /// errors through concatenation: `=#REF! & "x"` evaluates to `#REF!`, not the string `"#REF!x"`.
 pub fn to_text_for_display(v: &Value) -> String {
+    if let Value::Number(n) = v {
+        if n.is_nan() || n.is_infinite() {
+            return ErrorValue::Num.to_string();
+        }
+    }
     format!("{v}")
 }
 
 /// Invariant text representation for **formula** contexts — the `&` operator and any builtin
 /// that takes a text argument and would otherwise short-circuit on an error.
 /// Returns `Err(e)` when the input is `Value::Error(e)`, matching Excel's error-propagation rule.
+///
+/// **W5-64 (Phase 4.4.A; Codex MEDIUM 1 fix):** Raw `Value::Number(NaN/±Inf)` returns
+/// `Err(#NUM!)` — non-finite numbers can't be concatenated into a result.
 pub fn to_text_for_formula(v: &Value) -> Result<String, ErrorValue> {
     match v {
         Value::Error(e) => Err(*e),
+        Value::Number(n) if n.is_nan() || n.is_infinite() => Err(ErrorValue::Num),
         _ => Ok(format!("{v}")),
+    }
+}
+
+/// Function-arg text coercion. Used by builtins that take a text argument and want
+/// Excel's **integer-rendering rule** (no trailing `.0` for whole numbers below 2^53-ish).
+/// Distinct from [`to_text_for_formula`] in that the Number → text path uses
+/// [`format_number_for_arg`] which has a `< 1e15` guard preventing precision loss on the
+/// `i64` cast.
+///
+/// **W5-64 (Phase 4.4.A consolidation):** Replaces the private `coerce_text` helper that
+/// lived in `ql-functions::scalar_fns` and `value_to_concat_text` in `range_fns`. Behavior
+/// is byte-for-byte identical to those two paths.
+///
+/// Rules:
+/// - `Error(e)` → propagate.
+/// - `Number(NaN/±Inf)` → `Err(#NUM!)` (W5-64 NaN/Inf policy).
+/// - `Number(n)` finite → integer rendering via `format_number_for_arg`.
+/// - `Boolean(true)` → `"TRUE"`; `Boolean(false)` → `"FALSE"`.
+/// - `Text(s)` → clone of the body.
+/// - `Blank` → `""` (empty).
+pub fn to_text_for_arg(v: &Value) -> Result<String, ErrorValue> {
+    match v {
+        Value::Error(e) => Err(*e),
+        Value::Text(s) => Ok(s.as_ref().to_owned()),
+        Value::Number(n) => {
+            if n.is_nan() || n.is_infinite() {
+                Err(ErrorValue::Num)
+            } else {
+                Ok(format_number_for_arg(*n))
+            }
+        }
+        Value::Boolean(b) => Ok(if *b { "TRUE" } else { "FALSE" }.to_owned()),
+        Value::Blank => Ok(String::new()),
+    }
+}
+
+/// Excel-canon Number → text for function-arg contexts. Whole numbers below the f64-mantissa
+/// precision boundary (~2^53 / `< 1e15`) render as integers without a trailing `.0`. Anything
+/// outside that window falls back to the default `f64` Display.
+///
+/// **W5-64 (Phase 4.4.A consolidation):** Promoted from the private
+/// `ql-functions::scalar_fns::format_number_for_text`. Phase 4.5 will replace this with a
+/// locale-aware formatter; until then this is the canonical Excel-integer-rendering rule.
+pub fn format_number_for_arg(n: f64) -> String {
+    if n == n.trunc() && n.abs() < 1e15 {
+        format!("{}", n as i64)
+    } else {
+        format!("{n}")
+    }
+}
+
+/// Function-arg integer coercion. Used by builtins for position / length / count fields
+/// (e.g. LEFT, MID, FIND, REPT, RANK k).
+///
+/// **W5-64 (Phase 4.4.A consolidation):** Replaces the private `coerce_int_arg` helper in
+/// `ql-functions::scalar_fns`. Behavior is byte-for-byte identical, including the
+/// lossy-discard of the lenient-parse error for Text args.
+///
+/// Rules:
+/// - `Number(n)` → `n.trunc() as i64` (truncate toward zero).
+/// - `Boolean(true)` → `1`; `Boolean(false)` → `0`.
+/// - `Blank` → `0`.
+/// - `Text(s)` → lenient-parse-then-truncate; parse failure → `Err(#VALUE!)`.
+/// - `Error(e)` → propagate.
+pub fn to_int_arg(v: &Value) -> Result<i64, ErrorValue> {
+    match v {
+        Value::Number(n) => Ok(n.trunc() as i64),
+        Value::Boolean(b) => Ok(if *b { 1 } else { 0 }),
+        Value::Blank => Ok(0),
+        Value::Text(s) => match to_number_lenient(&Value::Text(s.clone())) {
+            Ok(n) => Ok(n.trunc() as i64),
+            Err(_) => Err(ErrorValue::Value),
+        },
+        Value::Error(e) => Err(*e),
+    }
+}
+
+/// Strict numeric coercion that distinguishes Blank-skip from Number / Error. Used by
+/// aggregate functions (SUM / AVERAGE / MIN / MAX / etc.) that need to drop Blank cells
+/// rather than coerce them to 0.0.
+///
+/// **W5-64 (Phase 4.4.A consolidation):** Replaces the private `coerce_numeric` /
+/// `NumericArg` helpers that were duplicated in both `ql-functions::scalar_fns` and
+/// `ql-functions::range_fns`. Codex MEDIUM 3 review recommended a neutral
+/// `Result<Option<f64>, ErrorValue>` shape over the function-aware enum to keep `ql-types`
+/// function-agnostic.
+///
+/// Returns:
+/// - `Ok(Some(n))` — numeric value (Number / Boolean / Text-parseable-strict).
+/// - `Ok(None)` — Blank; caller should skip this cell.
+/// - `Err(e)` — Error cell, or unparseable Text → `#VALUE!`, or NaN/Inf → `#NUM!`.
+pub fn to_number_strict_skip_blank(v: &Value) -> Result<Option<f64>, ErrorValue> {
+    match v {
+        Value::Error(e) => Err(*e),
+        Value::Blank => Ok(None),
+        other => to_number_strict(other).map(Some),
     }
 }
 
@@ -750,5 +860,240 @@ mod tests {
         // Just below positive infinity stays finite.
         let close = f64::MAX / 1.0001;
         assert_eq!(to_number_strict(&Value::Number(close)).unwrap(), close);
+    }
+
+    // ===== W5-64 Phase 4.4.A — central helpers + NaN/Inf policy =====
+
+    // -- to_text_for_display NaN/Inf policy (Codex MEDIUM 1) -------------------
+
+    #[test]
+    fn display_text_raw_nan_renders_as_num_sigil() {
+        assert_eq!(to_text_for_display(&Value::Number(f64::NAN)), "#NUM!");
+    }
+
+    #[test]
+    fn display_text_raw_inf_renders_as_num_sigil() {
+        assert_eq!(to_text_for_display(&Value::Number(f64::INFINITY)), "#NUM!");
+        assert_eq!(
+            to_text_for_display(&Value::Number(f64::NEG_INFINITY)),
+            "#NUM!"
+        );
+    }
+
+    #[test]
+    fn display_text_finite_numbers_unchanged() {
+        // W5-64 NaN/Inf branch must not regress finite-number rendering.
+        assert_eq!(to_text_for_display(&Value::Number(1.5)), "1.5");
+        assert_eq!(to_text_for_display(&Value::Number(0.0)), "0");
+        assert_eq!(to_text_for_display(&Value::Number(-2.5)), "-2.5");
+    }
+
+    // -- to_text_for_formula NaN/Inf policy -----------------------------------
+
+    #[test]
+    fn formula_text_raw_nan_propagates_as_num_error() {
+        assert_eq!(
+            to_text_for_formula(&Value::Number(f64::NAN)).unwrap_err(),
+            ErrorValue::Num
+        );
+    }
+
+    #[test]
+    fn formula_text_raw_inf_propagates_as_num_error() {
+        assert_eq!(
+            to_text_for_formula(&Value::Number(f64::INFINITY)).unwrap_err(),
+            ErrorValue::Num
+        );
+        assert_eq!(
+            to_text_for_formula(&Value::Number(f64::NEG_INFINITY)).unwrap_err(),
+            ErrorValue::Num
+        );
+    }
+
+    // -- to_text_for_arg -------------------------------------------------------
+
+    #[test]
+    fn to_text_for_arg_basic_types() {
+        assert_eq!(to_text_for_arg(&Value::Blank).unwrap(), "");
+        assert_eq!(to_text_for_arg(&Value::Boolean(true)).unwrap(), "TRUE");
+        assert_eq!(to_text_for_arg(&Value::Boolean(false)).unwrap(), "FALSE");
+        assert_eq!(to_text_for_arg(&Value::text("hello")).unwrap(), "hello");
+    }
+
+    #[test]
+    fn to_text_for_arg_integer_rendering_no_trailing_zero() {
+        // Integers render without ".0".
+        assert_eq!(to_text_for_arg(&Value::Number(42.0)).unwrap(), "42");
+        assert_eq!(to_text_for_arg(&Value::Number(-7.0)).unwrap(), "-7");
+        assert_eq!(to_text_for_arg(&Value::Number(0.0)).unwrap(), "0");
+    }
+
+    #[test]
+    fn to_text_for_arg_fractional_uses_display() {
+        assert_eq!(to_text_for_arg(&Value::Number(1.5)).unwrap(), "1.5");
+        assert_eq!(to_text_for_arg(&Value::Number(-0.25)).unwrap(), "-0.25");
+    }
+
+    #[test]
+    fn to_text_for_arg_large_integers_fall_back_to_display() {
+        // `n.abs() < 1e15` guard. 1e15 itself falls to Display path (no precision loss
+        // beyond that boundary).
+        let big = 1.0e15;
+        let big_str = to_text_for_arg(&Value::Number(big)).unwrap();
+        // f64 Display of 1e15 is "1000000000000000". Either way, no precision loss matters.
+        assert!(
+            big_str == "1000000000000000" || big_str.contains("e"),
+            "unexpected rendering: {big_str}"
+        );
+    }
+
+    #[test]
+    fn to_text_for_arg_propagates_errors() {
+        for e in ErrorValue::ALL {
+            assert_eq!(to_text_for_arg(&Value::Error(e)).unwrap_err(), e);
+        }
+    }
+
+    #[test]
+    fn to_text_for_arg_nan_inf_is_num_error() {
+        assert_eq!(
+            to_text_for_arg(&Value::Number(f64::NAN)).unwrap_err(),
+            ErrorValue::Num
+        );
+        assert_eq!(
+            to_text_for_arg(&Value::Number(f64::INFINITY)).unwrap_err(),
+            ErrorValue::Num
+        );
+        assert_eq!(
+            to_text_for_arg(&Value::Number(f64::NEG_INFINITY)).unwrap_err(),
+            ErrorValue::Num
+        );
+    }
+
+    // -- to_int_arg ------------------------------------------------------------
+
+    #[test]
+    fn to_int_arg_number_truncates_toward_zero() {
+        assert_eq!(to_int_arg(&Value::Number(3.7)).unwrap(), 3);
+        assert_eq!(to_int_arg(&Value::Number(-3.7)).unwrap(), -3);
+        assert_eq!(to_int_arg(&Value::Number(0.0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn to_int_arg_bool_to_one_or_zero() {
+        assert_eq!(to_int_arg(&Value::Boolean(true)).unwrap(), 1);
+        assert_eq!(to_int_arg(&Value::Boolean(false)).unwrap(), 0);
+    }
+
+    #[test]
+    fn to_int_arg_blank_is_zero() {
+        assert_eq!(to_int_arg(&Value::Blank).unwrap(), 0);
+    }
+
+    #[test]
+    fn to_int_arg_text_parseable_truncates() {
+        assert_eq!(to_int_arg(&Value::text("5")).unwrap(), 5);
+        assert_eq!(to_int_arg(&Value::text("5.7")).unwrap(), 5);
+        assert_eq!(to_int_arg(&Value::text("-3.9")).unwrap(), -3);
+    }
+
+    #[test]
+    fn to_int_arg_text_unparseable_is_value_error() {
+        assert_eq!(
+            to_int_arg(&Value::text("abc")).unwrap_err(),
+            ErrorValue::Value
+        );
+        assert_eq!(to_int_arg(&Value::text("")).unwrap_err(), ErrorValue::Value);
+    }
+
+    #[test]
+    fn to_int_arg_error_propagates() {
+        for e in ErrorValue::ALL {
+            assert_eq!(to_int_arg(&Value::Error(e)).unwrap_err(), e);
+        }
+    }
+
+    // -- to_number_strict_skip_blank (aggregate-skip API) ---------------------
+
+    #[test]
+    fn skip_blank_number_returns_some() {
+        assert_eq!(
+            to_number_strict_skip_blank(&Value::Number(2.5)).unwrap(),
+            Some(2.5)
+        );
+    }
+
+    #[test]
+    fn skip_blank_blank_returns_none() {
+        assert_eq!(to_number_strict_skip_blank(&Value::Blank).unwrap(), None);
+    }
+
+    #[test]
+    fn skip_blank_boolean_returns_some() {
+        assert_eq!(
+            to_number_strict_skip_blank(&Value::Boolean(true)).unwrap(),
+            Some(1.0)
+        );
+        assert_eq!(
+            to_number_strict_skip_blank(&Value::Boolean(false)).unwrap(),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn skip_blank_text_is_value_error() {
+        assert_eq!(
+            to_number_strict_skip_blank(&Value::text("hello")).unwrap_err(),
+            ErrorValue::Value
+        );
+        // Even text that PARSES as a number is rejected (strict, not lenient).
+        assert_eq!(
+            to_number_strict_skip_blank(&Value::text("5")).unwrap_err(),
+            ErrorValue::Value
+        );
+    }
+
+    #[test]
+    fn skip_blank_error_propagates() {
+        for e in ErrorValue::ALL {
+            assert_eq!(
+                to_number_strict_skip_blank(&Value::Error(e)).unwrap_err(),
+                e
+            );
+        }
+    }
+
+    #[test]
+    fn skip_blank_nan_inf_is_num_error() {
+        assert_eq!(
+            to_number_strict_skip_blank(&Value::Number(f64::NAN)).unwrap_err(),
+            ErrorValue::Num
+        );
+        assert_eq!(
+            to_number_strict_skip_blank(&Value::Number(f64::INFINITY)).unwrap_err(),
+            ErrorValue::Num
+        );
+    }
+
+    // -- format_number_for_arg (public; promoted from scalar_fns) -------------
+
+    #[test]
+    fn format_number_for_arg_integer_rendering() {
+        assert_eq!(format_number_for_arg(0.0), "0");
+        assert_eq!(format_number_for_arg(42.0), "42");
+        assert_eq!(format_number_for_arg(-7.0), "-7");
+    }
+
+    #[test]
+    fn format_number_for_arg_fractional() {
+        assert_eq!(format_number_for_arg(1.5), "1.5");
+        assert_eq!(format_number_for_arg(-2.25), "-2.25");
+    }
+
+    #[test]
+    fn format_number_for_arg_large_falls_back_to_display() {
+        // At 1e15 the guard triggers fallback.
+        let s = format_number_for_arg(1.0e15);
+        assert!(s == "1000000000000000" || s.contains("e"));
     }
 }
