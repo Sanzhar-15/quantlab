@@ -67,43 +67,58 @@ export type SaveDecision =
  *     still satisfy the spec, but the schema_hash has changed; save
  *     a refreshed spec so the on-disk attribution matches.
  */
+function assertNeverDriftStatus(x: never): never {
+	throw new Error(`unhandled DriftStatusForSave: ${JSON.stringify(x)}`);
+}
+function assertNeverDriftKind(x: never): never {
+	throw new Error(`unhandled drift kind: ${JSON.stringify(x)}`);
+}
+
 export function decideSave(status: DriftStatusForSave): SaveDecision {
-	if (status.kind === 'idle') {
-		return {
-			action: 'refuse',
-			reason: 'idle',
-			userMessage: 'Cannot save: schema drift detection has not started yet. Please retry in a moment.',
-		};
+	// Megaudit Theme B (B9, 2026-05-13): exhaustiveness via assertNever
+	// on BOTH the outer status switch AND the inner drift switch. The
+	// previous fall-through-to-same-hash branch silently swallowed any
+	// future SchemaDriftKind addition.
+	switch (status.kind) {
+		case 'idle':
+			return {
+				action: 'refuse',
+				reason: 'idle',
+				userMessage: 'Cannot save: schema drift detection has not started yet. Please retry in a moment.',
+			};
+		case 'in-flight':
+			return {
+				action: 'refuse',
+				reason: 'in-flight',
+				userMessage: 'Cannot save: schema drift detection is still in progress. Please retry in a moment.',
+			};
+		case 'failed':
+			return {
+				action: 'refuse',
+				reason: 'failed',
+				userMessage: `Cannot save: schema drift detection failed (${status.error}). Resolve the underlying issue and retry.`,
+			};
+		case 'detected': {
+			const drift = status.result;
+			switch (drift.drift) {
+				case 'fields-missing':
+					return {
+						action: 'refuse',
+						reason: 'fields-missing',
+						userMessage:
+							`Cannot save: spec references ${drift.missingFields.length} `
+							+ `field(s) missing from data file (${drift.missingFields.join(', ')}). `
+							+ 'Fix the broken encodings/transforms before saving.',
+					};
+				case 'fields-preserved':
+					return { action: 'with-refresh', liveSchema: status.liveSchema };
+				case 'same-hash':
+					return { action: 'verbatim' };
+				default:
+					return assertNeverDriftKind(drift.drift);
+			}
+		}
+		default:
+			return assertNeverDriftStatus(status);
 	}
-	if (status.kind === 'in-flight') {
-		return {
-			action: 'refuse',
-			reason: 'in-flight',
-			userMessage: 'Cannot save: schema drift detection is still in progress. Please retry in a moment.',
-		};
-	}
-	if (status.kind === 'failed') {
-		return {
-			action: 'refuse',
-			reason: 'failed',
-			userMessage: `Cannot save: schema drift detection failed (${status.error}). Resolve the underlying issue and retry.`,
-		};
-	}
-	// status.kind === 'detected'
-	const drift = status.result;
-	if (drift.drift === 'fields-missing') {
-		return {
-			action: 'refuse',
-			reason: 'fields-missing',
-			userMessage:
-				`Cannot save: spec references ${drift.missingFields.length} `
-				+ `field(s) missing from data file (${drift.missingFields.join(', ')}). `
-				+ 'Fix the broken encodings/transforms before saving.',
-		};
-	}
-	if (drift.drift === 'fields-preserved') {
-		return { action: 'with-refresh', liveSchema: status.liveSchema };
-	}
-	// drift.drift === 'same-hash'
-	return { action: 'verbatim' };
 }

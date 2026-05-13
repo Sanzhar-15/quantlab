@@ -467,6 +467,56 @@ body.qviz-inspector-open .qviz-app-main {
 }
 .qviz-form-remove:hover { color: var(--vscode-errorForeground); }
 
+/* ---------- expr transform (Visualise v2 calculated field) ---------- */
+
+.qviz-form-expr-textarea {
+	min-height: 60px;
+	font-family: var(--vscode-editor-font-family, monospace);
+	font-size: 12px;
+	resize: vertical;
+}
+.qviz-form-expr-textarea--invalid {
+	border-color: var(--vscode-inputValidation-errorBorder, #be1100);
+}
+.qviz-form-expr-hints {
+	display: flex; flex-wrap: wrap; gap: 2px;
+	font-size: 10px;
+	padding: 2px 0;
+}
+.qviz-form-expr-hint-label {
+	color: var(--vscode-descriptionForeground);
+	margin-right: 4px;
+}
+.qviz-form-expr-hint-chip {
+	font-size: 10px;
+	padding: 1px 6px;
+	background: var(--vscode-button-secondaryBackground);
+	color: var(--vscode-button-secondaryForeground);
+	border: 0;
+	border-radius: 10px;
+	cursor: pointer;
+	display: inline-flex;
+	gap: 4px;
+	align-items: baseline;
+}
+.qviz-form-expr-hint-chip:hover {
+	background: var(--vscode-button-hoverBackground);
+}
+.qviz-form-expr-hint-chip-dtype {
+	font-size: 9px;
+	opacity: 0.6;
+	font-style: italic;
+}
+.qviz-form-expr-error {
+	font-size: 11px;
+	color: var(--vscode-inputValidation-errorForeground, var(--vscode-errorForeground));
+	background: var(--vscode-inputValidation-errorBackground, transparent);
+	padding: 4px 6px;
+	border-left: 2px solid var(--vscode-inputValidation-errorBorder, #be1100);
+	margin-top: 2px;
+	font-family: var(--vscode-editor-font-family, monospace);
+}
+
 /* ---------- preview area ---------- */
 
 .qviz-preview-area {

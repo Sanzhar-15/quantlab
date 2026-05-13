@@ -23,6 +23,8 @@ from qviz.reader import (
     table_to_arrow_ipc,
 )
 
+from qviz.tests._fixture_helpers import require_fixture
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -30,26 +32,20 @@ from qviz.reader import (
 
 
 @pytest.fixture
-def parquet_1m(tmp_path: Path) -> Path:
-    """Reuse the spike data if available, else generate fresh."""
-    spike_path = Path("/tmp/quantlab-spike-data/synthetic_ohlcv_1m.parquet")
-    if spike_path.exists():
-        return spike_path
-    # Fallback: generate fresh
-    import numpy as np
-    n = 1_000_000
-    rng = np.random.default_rng(42)
-    table = pa.table({
-        "timestamp": pa.array(
-            [pa.scalar(i * 1_000_000_000, type=pa.timestamp("ns")) for i in range(n)],
-            type=pa.timestamp("ns"),
-        ),
-        "close": rng.standard_normal(n).astype("float32"),
-        "volume": rng.integers(0, 1000, n, dtype="int64"),
-    })
-    out = tmp_path / "test.parquet"
-    pq.write_table(table, str(out))
-    return out
+def parquet_1m() -> Path:
+    """The canonical spike data parquet.
+
+    Megaudit F5 (2026-05-13): previously this fixture silently fell
+    through to an ad-hoc generator with a different schema if the spike
+    file was missing, which both violated CLAUDE.md "no fallbacks" and
+    masked CI environments where the autouse generator had failed.
+    `require_fixture` now hard-fails under `QUANTLAB_REQUIRE_FIXTURES=1`
+    and soft-skips otherwise; the session-scoped autouse fixture in
+    `conftest.py` already guarantees presence locally.
+    """
+    p = Path("/tmp/quantlab-spike-data/synthetic_ohlcv_1m.parquet")
+    require_fixture(p, "spike OHLCV parquet")
+    return p
 
 
 @pytest.fixture

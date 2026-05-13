@@ -219,6 +219,70 @@ data. Supported kinds (authoritative enum: `src/qviz/spec.ts:Transform`):
   `rolling_std`, `rolling_max`, `rolling_min`, `cumsum`, `cumprod`,
   `cummax`, `cummin`. (`ema` is documented in the spec type but rejected
   by the daemon compiler in v1.)
+- `expr` -- **Visualise v2 calculated field.** A user-typed expression
+  over one or more columns producing a new column named `as`. The
+  textarea accepts a closed-grammar expression language (see below);
+  the webview parses the text to an AST and the daemon walks the AST to
+  emit parameterized DuckDB SQL.
+
+  **Operators** (Python-style precedence: `||` < `&&` < `!` < comparison
+  < `+`/`-` < `*`/`/`/`%` < unary `-`):
+  - Arithmetic: `+`, `-`, `*`, `/`, `%`
+  - Comparison: `==`, `!=`, `<`, `<=`, `>`, `>=`
+  - Logical: `&&`, `||`, `!`
+
+  **Conditional**: `if (cond) then a else b` (compiles to DuckDB
+  `CASE WHEN cond THEN a ELSE b END`).
+
+  **Whitelisted functions** (no user-defined fns; no SQL aggregates or
+  window fns -- use `aggregate` / `window` for those):
+  - Unary numeric: `abs`, `log` (natural), `ln`, `log10`, `exp`, `sqrt`
+  - 2-arg numeric: `min` (DuckDB `least`), `max` (DuckDB `greatest`)
+  - Null handling: `coalesce(...)` (1..32 args), `nullif(a, b)`
+
+  **Literals**: integer / decimal / exponent numbers (`42`, `1.5`,
+  `1e-3`), single-quoted strings with `\\`, `\'`, `\n`, `\t`, `\r`
+  escapes, `true` / `false` / `null`.
+
+  **Caps**: 1024 chars input / 16 levels deep / 256 nodes. The webview
+  parser rejects oversize input inline; the validator + daemon re-check
+  at the wire boundary.
+
+  **Limits & rules** (megaudit Theme F F6):
+  - `references` must equal the set of column refs in the AST. Webview
+    parser populates this from the parse; validator + daemon re-verify
+    that `set(references) == set(collectColumnRefs(expression))`.
+  - `as` must be a fresh name. The daemon refuses `expr.as=close` (a
+    source column) AND `expr.as=sma20` if a preceding `window` already
+    produced `sma20`.
+  - Identifiers that aren't bare-ASCII (`mid price`, `if`, `價格`) must
+    be wrapped in backticks. Doubled backtick escapes a literal one.
+
+  Common examples:
+  - `pnl_pct = (close - open) / open`
+  - `mid = (high + low) / 2`
+  - `direction = if (close > open) then 1 else -1`
+  - `signed_volume = if (close > open) then volume else -volume`
+  - `vol_filled = coalesce(volume, 0)`
+
+  **NULL semantics.** SQL three-valued logic applies, so any operation
+  with a NULL operand returns NULL — including comparisons. In a
+  conditional like `if (vol > 0.3) then 1 else 0`, a row where `vol` is
+  NULL falls through to the ELSE branch (NULL is neither greater nor
+  not-greater than 0.3). If you want a row with NULL to produce NULL
+  rather than the ELSE value, use `coalesce` or `nullif` to make the
+  null-handling explicit, e.g.:
+  - `regime = if (coalesce(vol, 0) > 0.3) then 1 else 0` (NULL → 0)
+  - `regime = if (vol > 0.3) then 1 else nullif(0, 0)` (NULL → NULL)
+
+  **Integer/float division.** DuckDB's `/` returns DOUBLE for integer
+  inputs (true division), not integer division. So `1 / 2 = 0.5`. Use
+  `floor(a / b)` if you want integer-style truncation. (`floor` is not
+  in the current whitelist — file an issue if you need it.)
+
+  **Numeric precision.** Numeric literals are parsed as IEEE-754
+  doubles. Integer literals outside [-2^53, 2^53] are rejected at
+  parse time to prevent silent rounding.
 
 Not implemented in v1 (rejected by validator or compiler):
 `resample` (use `date_trunc` + `groupby` + `aggregate`), `window fn=ema`,
@@ -230,8 +294,11 @@ rejected for forward-roll safety.
 
 ### Diagnostics
 A small log under the chart preview shows the last successful render's
-elapsed time + any compile/apply diagnostics; on failure it shows the
-error with its kind (compile, apply, daemon).
+elapsed time + any compile-time warnings (e.g. precision-loss warnings
+from aggregating DECIMAL / 64-bit-integer columns — see Operational
+notes §9). On failure it shows the error tagged with its structured
+kind: one of `compile`, `security`, `timeout`, `memory`, `internal`,
+or `protocol`.
 
 ---
 
@@ -273,6 +340,13 @@ popup whose widget kind depends on the column's stats:
   room below.
 - Filters are **session-only by design**. They never persist into
   `.qviz.json`. Closing the panel drops them.
+- **NULL handling** (closure megaudit 2026-05-13): the checkbox-set
+  widget renders a `(null)` row whenever the column has any SQL NULL
+  values. Unchecking only `(null)` keeps non-null rows and drops
+  NULLs; leaving `(null)` checked while unchecking non-null values
+  preserves NULLs in the filtered result. See §9 "Operational notes"
+  for the full SQL/Excel trivalent semantics including `not_in`
+  behavior.
 
 ### Aggregated charts (Phase 7 B-10 cure)
 For specs with `groupby` + `aggregate` (e.g., `pnl_by_strategy`,
@@ -477,7 +551,9 @@ each appears as a separate clause separated by ` · `:
 | `No workspace folder is open; cannot resolve dataset.`                     | The editor opened the spec without a workspace context | Open the folder that contains the data file as a workspace, or use **File > Open Folder**. |
 
 The diagnostics readout under the stripe shows the last daemon error
-(compile / apply / daemon) with its transform index if applicable:
+tagged with its structured kind (one of `compile`, `security`,
+`timeout`, `memory`, `internal`, `protocol`) and its transform index
+if applicable:
 
     [compile] (transform #2) filter column 'volum' not in schema
 
@@ -535,7 +611,88 @@ basename contains a `.`.
 
 ---
 
-## 9. Architecture quickref (for contributors)
+## 9. Operational notes
+
+### Aggregate precision on DECIMAL / 64-bit-integer columns
+
+`sum / mean / median / std / min / max` on a DECIMAL or 64-bit-integer
+column compiles to DuckDB SQL with an explicit `CAST(... AS DOUBLE)`.
+The DuckDB engine itself handles wide integers natively (HUGEINT for
+`sum(BIGINT)`), but the Arrow IPC bridge to the webview's TS-side
+renderer does not yet support Decimal128 extraction — so the
+intermediate `CAST` is what keeps the pipeline working. DOUBLE has
+53 bits of mantissa: values past 2^53 (~9e15) lose ones-place
+precision, and DECIMAL aggregates lose fractional precision at large
+magnitudes.
+
+The compiler emits a `warning` per affected aggregate; the daemon
+surfaces them on `aggregate` response data as `data.warnings: string[]`,
+and the provider relays them to the webview's diagnostics readout so
+the loss is visible. For auditing / accounting outputs that need exact
+arithmetic, pre-aggregate externally and load the result, or wait for
+the planned exact-decimal extractor (tracked as a follow-up to G5 —
+requires DuckDB → Arrow Decimal128 in the extractor + a renderer
+contract for exact-value rendering, both out of scope for v1).
+
+### NULL semantics in inspector set filters
+
+The set-filter widget renders a `(null)` checkbox whenever the column
+has any SQL NULL rows (the `op_column_stats` query surfaces `null` at
+the head of the `distinct` list when `null_count > 0`). Unchecking
+`(null)` filters out NULL rows; leaving it checked while unchecking
+non-null values produces SQL like `col IS NULL OR col IN (...)` so
+NULL rows are correctly preserved.
+
+`not_in` filters follow SQL/Excel trivalent semantics, NOT boolean
+complement: `not_in ["a"]` against a nullable column excludes BOTH
+the "a" rows AND the NULL rows. A NULL row's truth value under
+`col NOT IN ("a")` is UNKNOWN, so it does not pass the WHERE clause.
+If you want NULL rows surfaced, leave `(null)` checked alongside the
+non-null values you keep (which compiles to `col IS NULL OR col IN
+(...)`, not `NOT IN`).
+
+### Running the qviz Python tests
+
+From the extension root (`extensions/quantlab`):
+
+    ~/.quantlab/venv/bin/python -m pytest python/qviz/tests/ -q
+
+Several fixtures depend on a 1M-row OHLCV parquet at
+`/tmp/quantlab-spike-data/synthetic_ohlcv_1m.parquet`. The `conftest`
+auto-generates it on session start, so local runs Just Work. CI and
+strict environments should set `QUANTLAB_REQUIRE_FIXTURES=1`, which
+converts the soft-skip on missing fixtures into a hard failure so a
+silently-skipped suite cannot look green:
+
+    QUANTLAB_REQUIRE_FIXTURES=1 ~/.quantlab/venv/bin/python -m pytest python/qviz/tests/ -q
+
+The `npm run test:py` script invokes this strict variant; the
+`npm run test:py:dev` script keeps the soft-skip default for local
+work. Schema-shape conditional skips (e.g. tests that require a
+`ticker` column the synthetic parquet does not provide) remain soft
+skips even under strict mode — those are capability gates, not
+fixture-presence gates.
+
+### Wire-shape kind unions (closure megaudit 2026-05-13)
+
+For contributors editing the protocol enums: the following unions are
+the source of truth and must stay in lockstep across TS and Python:
+
+| Union | TS source | Python source |
+|---|---|---|
+| `DaemonErrorKind` | `daemon-client.ts:75-89` (set + decoder) | `daemon.py:Daemon` class — every `"error_kind": "<kind>"` literal |
+| `InspectorErrorKind` | `messageProtocol.ts:354-376` | n/a (provider derives; subset of DaemonErrorKind) |
+| `DaemonStatusKind` | `messageProtocol.ts:166-180` + validator set | `daemon-lifecycle.ts:75-110` (TS-only) |
+| `InspectorSetFilter.includes` | `messageProtocol.ts:303-315` (admits null) | n/a (validator accepts) |
+
+The cross-side `test_kind_set_matches_catch_ladder_source` (Python)
+and the daemon.py grep in `qviz-error-kind-contract.test.ts` (TS)
+catch drift between the daemon's emitted kinds and the TS-side
+validator set.
+
+---
+
+## 10. Architecture quickref (for contributors)
 
 ### Top-level layout
 
@@ -543,7 +700,9 @@ basename contains a `.`.
 | ---------------- | ------------------------------------------------------- |
 | Daemon (Python)  | `extensions/quantlab/python/qviz/`                      |
 | TS validator     | `extensions/quantlab/src/qviz/validate.ts`              |
-| Daemon client    | `extensions/quantlab/src/qviz/daemonClient.ts`          |
+| Daemon client    | `extensions/quantlab/src/qviz/daemon-client.ts`         |
+| Expr AST/parser  | `extensions/quantlab/src/qviz/exprAst.ts`, `exprParser.ts` |
+| Pipeline order   | `extensions/quantlab/src/qviz/pipelineValidate.ts`      |
 | Extension host   | `extensions/quantlab/src/views/visualise/VisualiseSpecProvider.ts` |
 | Webview entry    | `extensions/quantlab/webview/qviz-spec/index.ts`        |
 | Webview state    | `extensions/quantlab/webview/qviz/state/`               |
@@ -618,28 +777,30 @@ reload required"`.
 
 ---
 
-## 10. Out of scope (explicitly v2+)
+## 11. Out of scope (explicitly v2+)
 
 The following are NOT in v1, by design:
 
 - Remote VS Code (SSH / Codespaces / dev-container) -- the daemon
   expects a local filesystem and a local Python interpreter.
-- User-authored expression language for calculated fields. (Use the
-  pipeline's `math` transform with a curated function whitelist.)
 - Cross-filter / linked brushing across multiple charts.
 - Full pivot-table family.
 - Real-time / streaming data.
 - Delta Plus cloud sync of saved specs.
-- "Promote to Chart" handoff (timeseries family → Chart view).
 - Chart-side visual selection overlay (deferred from Phase 6 polish).
 - Time-series `factor_exposure` (rolling correlation against factor
   returns); v1 ships the long-format snapshot only.
 - Auto-open the produced `.qviz.json` after preset writes -- would need
   a brittle `code` CLI shellout from Python.
 
+The user-authored expression language (`expr` transform) and the
+"Promote to Chart" timeseries-family handoff are SHIPPED in v1 and
+documented in §3 ("Transform pipeline") and §6 ("Promote to Chart"),
+respectively. They are no longer "v2+".
+
 ---
 
-## 11. Migration
+## 12. Migration
 
 There is no migration guide for v1 because v1 is the first stable
 release. When a v2 schema lands, this section will document the
@@ -649,7 +810,7 @@ them on save.
 
 ---
 
-## 12. Smoke checklists
+## 13. Smoke checklists
 
 If you want to manually walk the user-facing surface, the per-phase
 smoke checklists live at:

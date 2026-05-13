@@ -99,14 +99,16 @@ suite('qviz validation', () => {
 		);
 	});
 
-	test('candlestick without ohlcv encoding still validates (compile-time check)', () => {
-		// Smoke-test fix (2026-05-11): the validator no longer enforces
-		// per-chart-type encoding completeness -- that check moved to the
-		// compiler (CompilePlanError in `applyTimeseriesPlan`). Validator
-		// only enforces structural invariants; an incomplete-encoding spec
-		// passes validation but fails at render time. This test pins the
-		// new "passes validation" half of the contract; the compile-time
-		// rejection is covered by `qviz-render-timeseries.test.ts`.
+	test('candlestick without ohlcv encoding is rejected (B3 megaudit)', () => {
+		// Megaudit Theme B (B3, 2026-05-13): the validator now enforces
+		// the candlestick ↔ ohlcv cross-validation rule. Previously per-
+		// encoding completeness was deferred to compile time to avoid
+		// builder-time error noise; the OHLCV CLUSTER specifically is a
+		// structural invariant of candlestick charts and is checked at
+		// the validator boundary.
+		//
+		// The wider "x must be present, y must be present, etc." checks
+		// remain at compile time per the 2026-05-11 cure.
 		const raw = readExample('timeseries-candlestick.qviz.json') as Record<string, unknown>;
 		const chart = raw.chart as Record<string, unknown>;
 		const tampered = {
@@ -114,8 +116,28 @@ suite('qviz validation', () => {
 			chart: { ...chart, encodings: {} }
 		};
 		const result = validate(tampered);
-		assert.strictEqual(result.ok, true,
-			'spec with empty encodings is now STRUCTURALLY valid; compiler enforces completeness at render');
+		assert.strictEqual(result.ok, false,
+			'candlestick without ohlcv is structurally invalid');
+		if (!result.ok) {
+			assert.ok(result.issues.some(i => /ohlcv/.test(i.path)),
+				`expected ohlcv-missing issue, got ${JSON.stringify(result.issues)}`);
+		}
+	});
+
+	test('B3: non-candlestick chart with stray ohlcv encoding is rejected', () => {
+		const raw = readExample('timeseries-line-volume.qviz.json') as Record<string, unknown>;
+		const chart = raw.chart as Record<string, unknown>;
+		const encodings = chart.encodings as Record<string, unknown>;
+		const tampered = {
+			...raw,
+			chart: { ...chart, encodings: { ...encodings,
+				ohlcv: { time: 't', open: 'o', high: 'h', low: 'l', close: 'c' } } },
+		};
+		const result = validate(tampered);
+		assert.strictEqual(result.ok, false);
+		if (!result.ok) {
+			assert.ok(result.issues.some(i => /ohlcv/.test(i.path)));
+		}
 	});
 
 	test('rejects chart type not allowed in family', () => {
@@ -137,7 +159,7 @@ suite('qviz validation', () => {
 		const raw = readExample('timeseries-line-volume.qviz.json') as Record<string, unknown>;
 		const transforms = (raw.transforms as readonly unknown[]).slice();
 		transforms[transforms.length - 1] = {
-			kind: 'window', column: 'close', fn: 'ema', window: 14, as: 'ema14',
+			kind: 'window', column: 'close', fn: 'ema', window: 14, order_by: 'timestamp', as: 'ema14',
 		};
 		const tampered = { ...raw, transforms };
 		const result = validate(tampered);
@@ -186,7 +208,7 @@ suite('qviz validation', () => {
 		const raw = readExample('timeseries-line-volume.qviz.json') as Record<string, unknown>;
 		const transforms = (raw.transforms as readonly unknown[]).slice();
 		transforms[transforms.length - 1] = {
-			kind: 'window', column: 'close', fn: 'rolling_mean', window: 5, as: 'sma5',
+			kind: 'window', column: 'close', fn: 'rolling_mean', window: 5, order_by: 'timestamp', as: 'sma5',
 		};
 		const tampered = { ...raw, transforms };
 		const result = validate(tampered);

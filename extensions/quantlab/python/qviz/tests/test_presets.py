@@ -94,9 +94,13 @@ _ALLOWED_FAMILY_TYPES = {
     "general":    {"scatter", "heatmap", "bar", "pie", "histogram", "line"},
 }
 _ALLOWED_DECIMATION = {"auto", "lttb", "minmax", "none"}
+# Megaudit Theme B (B2, 2026-05-13): set must match daemon's
+# op_capabilities.transform_kinds exactly. `resample` was here but the
+# daemon rejects it as unsupported; `expr` was missing despite being
+# fully shipped. The regression test below now pins the lockstep.
 _ALLOWED_TRANSFORM_KINDS = {
     "filter", "date_trunc", "bin", "groupby", "aggregate",
-    "window", "math", "resample", "tz_convert", "sort", "limit",
+    "window", "math", "expr", "tz_convert", "sort", "limit",
 }
 _REQUIRED_TOP_KEYS = {"qviz_version", "dataset", "transforms", "chart", "provenance"}
 _ALLOWED_TOP_KEYS = _REQUIRED_TOP_KEYS | {"$schema", "title", "description", "trading_options"}
@@ -839,3 +843,23 @@ def test_all_presets_emit_validator_parity_compliant_specs(
     ]
     for p in paths:
         _load_compile_and_resolve(p, workspace)
+
+
+def test_allowed_transform_kinds_matches_daemon_capabilities() -> None:
+    """Megaudit Theme B (B2, 2026-05-13): lock the preset-parity set to
+    the daemon's op_capabilities.transform_kinds. Either side drifting
+    (rename, add, remove) fails this test loudly."""
+    from qviz.daemon import Daemon
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        daemon = Daemon(td)
+        caps = daemon.op_capabilities({})["data"]
+        assert set(caps["transform_kinds"]) == _ALLOWED_TRANSFORM_KINDS, (
+            "Drift between _ALLOWED_TRANSFORM_KINDS and daemon "
+            f"capabilities: caps={set(caps['transform_kinds'])} "
+            f"helper={_ALLOWED_TRANSFORM_KINDS}"
+        )
+        # `resample` must remain explicitly unsupported (daemon rejects it).
+        assert "resample" in set(caps.get("unsupported", [])), (
+            "resample must remain in op_capabilities.unsupported"
+        )

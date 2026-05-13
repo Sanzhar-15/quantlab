@@ -54,6 +54,7 @@ from .security import (
     MemoryLimitError,
     SecurityError,
     TimeoutError_,
+    enforce_spec_caps,
     query_budget,
     resolve_workspace_path,
 )
@@ -63,6 +64,31 @@ from .security import (
 # Arrow IPC frame. 256 KB is roughly where JSON serialization starts to cost
 # more than the framing overhead.
 INLINE_JSON_THRESHOLD_BYTES = 256 * 1024
+
+# Megaudit Theme A (A11, 2026-05-13): per-request preview pagination
+# caps. The filtered/apply_spec_transforms preview branches were
+# previously unbounded — a hostile request could ask for an enormous
+# page or offset, forcing large scans before the IPC layer caught it.
+# Normal inspector requests are well under these.
+PREVIEW_MAX = 50_000
+PREVIEW_OFFSET_MAX = 10_000_000
+
+
+def _parse_preview_window(req: dict) -> tuple[int, int]:
+    """Theme A A11: validate `n` and `offset` once, before any path
+    branches. Rejects negative values, booleans-as-ints, and any value
+    outside the pagination caps."""
+    n_raw = req.get("n", 100)
+    offset_raw = req.get("offset", 0)
+    if isinstance(n_raw, bool) or not isinstance(n_raw, int) or not (1 <= n_raw <= PREVIEW_MAX):
+        raise ValueError(
+            f"preview n must be integer in [1, {PREVIEW_MAX}], got {n_raw!r}"
+        )
+    if isinstance(offset_raw, bool) or not isinstance(offset_raw, int) or not (0 <= offset_raw <= PREVIEW_OFFSET_MAX):
+        raise ValueError(
+            f"preview offset must be integer in [0, {PREVIEW_OFFSET_MAX}], got {offset_raw!r}"
+        )
+    return n_raw, offset_raw
 
 # Megaudit-2 A4-C2: pin a minimum DuckDB version. The qviz daemon relies on
 # `connection.execute(...).arrow()` and the Arrow integration shape that has
@@ -138,7 +164,26 @@ class Daemon:
         self.conn = duckdb.connect(":memory:")
         # Reduce DuckDB's thread footprint inside an extension host that is
         # already running multiple workers.
-        self.conn.execute("SET threads = 4")
+        # Megaudit Theme G (G8, 2026-05-13): env override for hosts where
+        # the default oversubscribes (2-core CI) or undersubscribes
+        # (32-core workstations).
+        import os
+        _threads_env = os.environ.get("QUANTLAB_QVIZ_DUCKDB_THREADS")
+        if _threads_env is not None:
+            try:
+                _t = int(_threads_env)
+                if _t < 1 or _t > 64:
+                    raise ValueError(f"out of range [1, 64]: {_t}")
+                self.conn.execute(f"SET threads = {_t}")
+            except ValueError as e:
+                import sys
+                print(
+                    f"[qviz] QUANTLAB_QVIZ_DUCKDB_THREADS={_threads_env!r} invalid ({e}); using default 4",
+                    file=sys.stderr,
+                )
+                self.conn.execute("SET threads = 4")
+        else:
+            self.conn.execute("SET threads = 4")
         # Cache aggregate results keyed by (path, mtime, plan_hash).
         # Stores Arrow IPC bytes for aggregates / decimates AND, for
         # filtered previews under the inline-JSON threshold, the JSON
@@ -197,17 +242,34 @@ class Daemon:
         the schema cache (which is already keyed on the size+ctime+mtime
         fingerprint), repeat calls against the same file are sub-millisecond.
         """
-        fp_no_schema = reader.file_fingerprint(path)
+        # Megaudit Theme C (C7, 2026-05-13): stat the file BEFORE and
+        # AFTER read_schema. A file replaced mid-read produces a
+        # mismatched (fp_before, schema, fp_after) triple, which the
+        # cache would otherwise store with the OLD hash but the NEW
+        # schema. Reject the read in that case so the next request
+        # retries against a stable file.
+        fp_before = reader.file_fingerprint(path)
         sch_key = make_cache_key(
-            file_path=str(path), fingerprint=fp_no_schema, plan="schema",
+            file_path=str(path), fingerprint=fp_before, plan="schema",
         )
         cached = self.schema_cache.get(sch_key)
         if cached is not None:
             schema_hash = cached["schema_hash"]
             schema = reader.read_schema(path)  # cheap: pq metadata read
-            full_fp = {**fp_no_schema, "schema_hash": schema_hash}
+            fp_after = reader.file_fingerprint(path)
+            if fp_after != fp_before:
+                raise SecurityError(
+                    "file changed during cached-schema read (TOCTOU)"
+                )
+            full_fp = {**fp_before, "schema_hash": schema_hash}
             return schema, schema_hash, full_fp
         schema = reader.read_schema(path)
+        fp_after = reader.file_fingerprint(path)
+        if fp_after != fp_before:
+            raise SecurityError(
+                "file changed during schema read (TOCTOU)"
+            )
+        fp_no_schema = fp_before
         schema_hash = reader.hash_schema(schema)
         # Pre-warm the schema cache so the next op_aggregate/decimate hits.
         row_count = reader.file_row_count(path) if path.suffix.lower() == ".parquet" else None
@@ -228,11 +290,11 @@ class Daemon:
 
     def op_preview(self, req: dict) -> dict:
         path_str = req["path"]
-        n = int(req.get("n", 100))
-        # Phase 6 (6.A.1): optional offset lets the inspector page rows
-        # by re-asking with offset advanced past the loaded window. Default
-        # 0 preserves the original "first n rows" contract.
-        offset = int(req.get("offset", 0))
+        # Megaudit Theme A (A11): validate pagination bounds ONCE here
+        # so every branch (raw, filtered, apply_spec_transforms) shares
+        # the same caps. Was previously per-branch via int() coercion
+        # which silently accepted negative and huge values.
+        n, offset = _parse_preview_window(req)
         # Phase 6 (6.D extension): optional inspector_filters thread the
         # webview's ephemeral filter set through to the daemon. When
         # present, the preview goes through DuckDB so the table window
@@ -261,6 +323,7 @@ class Daemon:
         with query_budget(
             timeout_s=float(req.get("timeout_s", DEFAULT_TIMEOUT_S)),
             peak_rss_mb=int(req.get("peak_rss_mb", DEFAULT_PEAK_RSS_MB)),
+            conn=self.conn,
         ):
             if inspector_filters:
                 # Compile each filter into a SQL WHERE fragment using the
@@ -316,11 +379,17 @@ class Daemon:
                         },
                         "encoding": "json",
                     }
-                ddb_path = str(path).replace("'", "''")
+                # Megaudit Theme C (C8, 2026-05-13): bind the file path as
+                # a positional parameter rather than string-interpolating.
+                # The path is workspace-validated upstream, but the
+                # interpolation pattern violates the daemon's stated
+                # "everything-bound" invariant and gives security audits
+                # a false-positive injection signature.
+                source_params: list = [str(path)]
                 if path.suffix.lower() == ".parquet":
-                    from_clause = f"parquet_scan('{ddb_path}')"
+                    from_clause = "parquet_scan(?)"
                 elif path.suffix.lower() in (".csv", ".tsv"):
-                    from_clause = f"read_csv_auto('{ddb_path}')"
+                    from_clause = "read_csv_auto(?)"
                 else:
                     raise ValueError(f"unsupported file extension: {path.suffix}")
                 where_sql, where_params = _compile_inspector_filters_to_sql(
@@ -333,7 +402,7 @@ class Daemon:
                     f"SELECT (SELECT COUNT(*) FROM filtered) AS total, * "
                     f"FROM filtered LIMIT {int(n)} OFFSET {int(offset)}"
                 )
-                cursor = self.conn.execute(total_sql, where_params)
+                cursor = self.conn.execute(total_sql, [*source_params, *where_params])
                 arrow_table = cursor.to_arrow_table()
                 if arrow_table.num_rows > 0:
                     total = int(arrow_table.column("total")[0].as_py())
@@ -342,7 +411,7 @@ class Daemon:
                     # Past-EOF: total is still needed for the scrollbar.
                     count_only = self.conn.execute(
                         f"SELECT COUNT(*) FROM {from_clause}{where_sql}",
-                        where_params,
+                        [*source_params, *where_params],
                     ).fetchone()
                     total = int(count_only[0]) if count_only else 0
                     # Need schema columns for an empty table — pull from
@@ -381,6 +450,12 @@ class Daemon:
         if not path_str:
             raise ValueError("spec.dataset.uri is required")
         path = resolve_workspace_path(self.workspace_root, path_str)
+
+        # Megaudit Theme C (C2, 2026-05-13): enforce spec-level caps
+        # BEFORE compile so a hostile spec with 1000 transforms or a
+        # 100k-element IN list can't generate a multi-MB SQL string
+        # outside the query_budget timeout/memory accounting.
+        enforce_spec_caps(spec)
 
         # Phase 6 (6.A.3): inspector-side ephemeral filters arrive in
         # `inspector_filters` and are prepended to `spec.transforms` at
@@ -432,9 +507,26 @@ class Daemon:
         )
         cached = self.cache.get(cache_key)
         if cached is not None:
+            # Megaudit G5 (2026-05-13) -- opus audit: precision-loss
+            # warnings are compile-time metadata, not cache content.
+            # Re-run `compile_spec` on the cache-hit path so the
+            # warnings survive across repeat aggregate calls (the
+            # common case: same chart re-rendered on tab switch /
+            # undo / inspector toggle). `compile_spec` is pure CPU
+            # against the resolved schema — no DuckDB, no I/O — so
+            # the overhead is negligible compared to the avoided
+            # DuckDB cycle.
+            cached_compiled = compile_spec(effective_spec, schema, str(path))
+            data: dict = {
+                "cached": True,
+                "n": _arrow_row_count(cached),
+                "bytes": len(cached),
+            }
+            if cached_compiled.warnings:
+                data["warnings"] = list(cached_compiled.warnings)
             return {
                 "binary": cached,
-                "data": {"cached": True, "n": _arrow_row_count(cached), "bytes": len(cached)},
+                "data": data,
                 "encoding": "arrow",
             }
 
@@ -443,6 +535,7 @@ class Daemon:
         with query_budget(
             timeout_s=float(req.get("timeout_s", DEFAULT_TIMEOUT_S)),
             peak_rss_mb=int(req.get("peak_rss_mb", DEFAULT_PEAK_RSS_MB)),
+            conn=self.conn,
         ):
             # Megaudit MAJOR-11: drop the silent `hasattr` fallback to
             # the deprecated `fetch_arrow_table`. We pin DuckDB to a
@@ -455,14 +548,21 @@ class Daemon:
 
         arrow_bytes = reader.table_to_arrow_ipc(arrow_table)
         self.cache.put(cache_key, arrow_bytes, bytes_estimate=len(arrow_bytes))
+        data: dict = {
+            "cached": False,
+            "n": arrow_table.num_rows,
+            "bytes": len(arrow_bytes),
+            "columns": arrow_table.column_names,
+        }
+        # Megaudit G5 (2026-05-13): surface compile-time precision-loss
+        # warnings (DOUBLE cast on DECIMAL / 64-bit-integer aggregates).
+        # The webview's diagnostics readout reads `data.warnings` so the
+        # user sees the loss instead of silently mis-trusting the chart.
+        if compiled.warnings:
+            data["warnings"] = list(compiled.warnings)
         return {
             "binary": arrow_bytes,
-            "data": {
-                "cached": False,
-                "n": arrow_table.num_rows,
-                "bytes": len(arrow_bytes),
-                "columns": arrow_table.column_names,
-            },
+            "data": data,
             "encoding": "arrow",
         }
 
@@ -473,7 +573,17 @@ class Daemon:
 
         path_str = req["path"]
         x_col = req["x_col"]; y_col = req["y_col"]
+        # Megaudit Theme C (C4, 2026-05-13): cap n_visible AND carry_cols
+        # before the pq.read_table that materializes columns. A hostile
+        # request with n_visible=10M and 100 carry_cols can OOM the
+        # daemon before any later check fires.
+        DECIMATE_MAX_N_VISIBLE = 100_000
+        DECIMATE_MAX_CARRY_COLS = 16
         n_visible = int(req.get("n_visible", 3000))
+        if n_visible < 3 or n_visible > DECIMATE_MAX_N_VISIBLE:
+            raise SecurityError(
+                f"decimate: n_visible {n_visible} outside [3, {DECIMATE_MAX_N_VISIBLE}]"
+            )
         # M-18 cure: `carry_cols` lets a candlestick (or any multi-column
         # chart) sample its non-primary columns at the LTTB-picked indices.
         # Without this, decimation collapsed a 5-column OHLC table to a
@@ -482,6 +592,11 @@ class Daemon:
         carry_cols = list(req.get("carry_cols") or [])
         if not isinstance(carry_cols, list) or any(not isinstance(c, str) for c in carry_cols):
             raise ValueError("carry_cols must be a list of strings")
+        if len(carry_cols) > DECIMATE_MAX_CARRY_COLS:
+            raise SecurityError(
+                f"decimate: carry_cols length {len(carry_cols)} "
+                f"exceeds cap {DECIMATE_MAX_CARRY_COLS}"
+            )
         path = resolve_workspace_path(self.workspace_root, path_str)
         # Validate column names against the file schema BEFORE handing them
         # to pyarrow. Without this, an attacker can send arbitrary column
@@ -528,6 +643,7 @@ class Daemon:
         with query_budget(
             timeout_s=float(req.get("timeout_s", DEFAULT_TIMEOUT_S)),
             peak_rss_mb=int(req.get("peak_rss_mb", DEFAULT_PEAK_RSS_MB)),
+            conn=self.conn,
         ):
             t = pq.read_table(str(path), columns=read_cols)
             xs = t.column(x_col).to_numpy(zero_copy_only=False)
@@ -633,28 +749,34 @@ class Daemon:
             field = agg_schema.field(column)
             from_clause_sql = f"({compiled.sql})"
             from_params = list(compiled.params)
-            # Cache key includes the spec so different aggregates over the
-            # same parquet don't collide. Re-uses the existing make_cache_key
-            # plan structure.
+            # Megaudit Theme A (A9, 2026-05-13): cache key keyed on the
+            # COMPILED SQL + params instead of the whole spec dict. The
+            # spec dict carries `provenance.generated_at` which changes
+            # on every regeneration, so the previous "stuff the spec in
+            # the key" approach effectively never hit on the path it was
+            # built to accelerate. Compiled SQL is the canonical input
+            # to DuckDB — same query = same key by construction.
             cache_key = make_cache_key(
                 file_path=str(path),
                 fingerprint=full_fp,
                 plan={"op": "column_stats", "column": column,
-                      "apply_spec_transforms": apply_spec},
+                      "sql": compiled.sql, "params": list(compiled.params)},
             )
         else:
             if column not in schema.names:
                 # Use a structured kind so the TS side can surface a typed error.
                 raise ValueError(f"column '{column}' not in schema for {path.name}")
             field = schema.field(column)
-            ddb_path = str(path).replace("'", "''")
+            # C8 (megaudit): bind path as positional parameter instead
+            # of interpolating with quote-escape. The path is
+            # workspace-validated; binding is for invariant consistency.
             if path.suffix.lower() == ".parquet":
-                from_clause_sql = f"parquet_scan('{ddb_path}')"
+                from_clause_sql = "parquet_scan(?)"
             elif path.suffix.lower() in (".csv", ".tsv"):
-                from_clause_sql = f"read_csv_auto('{ddb_path}')"
+                from_clause_sql = "read_csv_auto(?)"
             else:
                 raise ValueError(f"unsupported file extension: {path.suffix}")
-            from_params = []
+            from_params = [str(path)]
             cache_key = make_cache_key(
                 file_path=str(path),
                 fingerprint=full_fp,
@@ -674,6 +796,7 @@ class Daemon:
         with query_budget(
             timeout_s=float(req.get("timeout_s", DEFAULT_TIMEOUT_S)),
             peak_rss_mb=int(req.get("peak_rss_mb", DEFAULT_PEAK_RSS_MB)),
+            conn=self.conn,
         ):
             # Null count + distinct cardinality (capped) in one round-trip.
             row = self.conn.execute(
@@ -692,9 +815,17 @@ class Daemon:
                 from_params,
             ).fetchall()
             distinct_values = [r[0] for r in distinct_rows]
-            cardinality_capped = len(distinct_values)
-            # If we got CAP+1 back, the true cardinality is just "> CAP".
-            cardinality_is_exact = cardinality_capped <= DISTINCT_CAP
+            non_null_distinct = len(distinct_values)
+            # Megaudit D8 (2026-05-13) -- opus audit: NULL is a
+            # distinct value from the user's perspective. Counting it
+            # alongside non-null distinct values keeps `cardinality`
+            # semantically honest and aligns with the `distinct` list
+            # (which now also surfaces `null` when null_count > 0).
+            cardinality_capped = non_null_distinct + (1 if null_count > 0 else 0)
+            # If we got CAP+1 back on the non-null query, the true
+            # cardinality is just "> CAP". (Null adds at most 1; safe
+            # to fold into the same threshold.)
+            cardinality_is_exact = non_null_distinct <= DISTINCT_CAP
 
             stats: dict = {
                 "kind": kind,
@@ -704,7 +835,15 @@ class Daemon:
                 "total": total,
             }
             if cardinality_is_exact:
-                stats["distinct"] = [_jsonify_scalar(v) for v in distinct_values]
+                # When the column has NULL rows, surface `null` at the
+                # head of the distinct list so the set-filter widget
+                # renders a `(null)` checkbox alongside the non-null
+                # values. Without this the D8 SQL-NULL handling is
+                # forward-compatible plumbing the UI never reaches.
+                distinct_jsonified = [_jsonify_scalar(v) for v in distinct_values]
+                if null_count > 0:
+                    distinct_jsonified.insert(0, None)
+                stats["distinct"] = distinct_jsonified
 
             if kind in ("numeric", "temporal") and total - null_count > 0:
                 mn, mx = self.conn.execute(
@@ -751,6 +890,7 @@ class Daemon:
                     "tz_convert",
                     "sort",
                     "limit",
+                    "expr",
                 ],
                 "unsupported": [
                     # Variants the TS validator rejects; listed for
@@ -791,13 +931,28 @@ class Daemon:
         "column_stats": "op_column_stats",
     }
 
-    def handle(self, req: dict) -> tuple[dict, bytes | None]:
+    def handle(self, req: object) -> tuple[dict, bytes | None]:
         """Dispatch one request. Returns (json_response, optional_arrow_payload)."""
+        # Megaudit Theme C (C5, 2026-05-13): a malformed JSON frame that
+        # decodes to a list/string/number used to crash here via
+        # `req.get(...)`. Guard at the entry so any non-object frame
+        # produces a structured protocol error instead of an unhandled
+        # exception that the IPC loop would treat as a daemon crash.
+        if not isinstance(req, dict):
+            return ({
+                "id": None,
+                "ok": False,
+                "error": f"protocol: request must be a JSON object, got {type(req).__name__}",
+                "error_kind": "protocol",
+                "elapsed_ms": 0.0,
+            }, None)
         op_name = req.get("op")
         method_name = self.OPS.get(op_name) if isinstance(op_name, str) else None
         if not method_name:
             return ({"id": req.get("id"), "ok": False,
-                     "error": f"unknown op: {op_name!r}", "elapsed_ms": 0.0}, None)
+                     "error": f"unknown op: {op_name!r}",
+                     "error_kind": "protocol",
+                     "elapsed_ms": 0.0}, None)
         handler = getattr(self, method_name)
 
         t0 = time.perf_counter()
@@ -920,10 +1075,20 @@ class Daemon:
                 out.flush()
             except IPCError as e:
                 # Build an error-shaped JSON response that fits.
+                # Megaudit F3 (2026-05-13) — opus audit: this branch
+                # MUST include `error_kind` because the TS-side decoder
+                # now refuses unknown/missing kinds with
+                # DaemonProtocolError (which fatalises the client).
+                # Oversized outbound frames are an internal capacity
+                # event, not a user-fixable spec error -- classify as
+                # `internal` so the user sees "InternalError: IPC
+                # frame too large" and the lifecycle doesn't tear down
+                # every other in-flight request.
                 err_resp = {
                     "id": response.get("id"),
                     "ok": False,
                     "error": f"IPCError: outbound frame failed: {e}",
+                    "error_kind": "internal",
                     "elapsed_ms": response.get("elapsed_ms", 0.0),
                 }
                 try:
@@ -964,6 +1129,8 @@ class Daemon:
         if not path_str:
             raise ValueError("apply_spec_transforms: spec.dataset.uri is required")
         path = resolve_workspace_path(self.workspace_root, path_str)
+        # C2 (megaudit): enforce spec-level caps here too.
+        enforce_spec_caps(spec)
         schema, _schema_hash, _full_fp = self._resolve_schema_with_hash(path)
 
         # Validate inspector_filters against the source schema, the same
@@ -987,7 +1154,14 @@ class Daemon:
         else:
             effective_spec = spec
 
-        compiled = compile_spec(effective_spec, schema, str(path))
+        # Megaudit Theme A (A10, 2026-05-13): suppress the compiler's
+        # implicit final LIMIT here. The outer wrap below adds its own
+        # LIMIT n OFFSET offset (bounded by PREVIEW_MAX). Without this,
+        # COUNT(*) over the inner would top out at ctx.cap = 1_000_000,
+        # reporting a wrong `total` for large aggregates AND breaking
+        # offset paging when the user's spec carries its own smaller
+        # `limit`.
+        compiled = compile_spec(effective_spec, schema, str(path), implicit_final_limit=False)
         # Wrap the compiled SQL so the inspector pages the AGGREGATE result:
         #   WITH inner AS (<compiled.sql>)
         #   SELECT (SELECT COUNT(*) FROM inner) AS __total, * FROM inner
@@ -1000,7 +1174,7 @@ class Daemon:
             f"SELECT (SELECT COUNT(*) FROM __wrapped_inner) AS __total, * "
             f"FROM __wrapped_inner LIMIT {int(n)} OFFSET {int(offset)}"
         )
-        with query_budget(timeout_s=timeout_s, peak_rss_mb=peak_rss_mb):
+        with query_budget(timeout_s=timeout_s, peak_rss_mb=peak_rss_mb, conn=self.conn):
             arrow_table = self.conn.execute(wrapped_sql, compiled.params).to_arrow_table()
         if arrow_table.num_rows > 0:
             total = int(arrow_table.column("__total")[0].as_py())
@@ -1026,15 +1200,34 @@ class Daemon:
     def _wrap_arrow_or_json(table: pa.Table) -> dict:
         """Decide whether to send a small table inline as JSON or as Arrow IPC.
 
-        Threshold: ~256 KB of estimated Arrow size. Below that, JSON is fine
-        and avoids the Arrow IPC overhead. Above, Arrow IPC saves bandwidth
-        and parse time.
+        Threshold: ~256 KB. Below that, JSON is fine and avoids the Arrow
+        IPC overhead. Above, Arrow IPC saves bandwidth and parse time.
+
+        Megaudit Theme G (G4, 2026-05-13): `table.nbytes` is the
+        IN-MEMORY size, which can vastly differ from JSON-serialized
+        size (string columns with dictionary encoding have small nbytes
+        but huge JSON). The previous code occasionally produced multi-MB
+        JSON responses that bloated past the 64 MB IPC frame cap. Now:
+        cap by row count AND nbytes AND verify the JSON size with a
+        cheap dumps() — fall back to Arrow if any check fails.
         """
-        if table.nbytes < INLINE_JSON_THRESHOLD_BYTES:
+        INLINE_JSON_MAX_ROWS = 1000
+        if table.num_rows <= INLINE_JSON_MAX_ROWS and table.nbytes < INLINE_JSON_THRESHOLD_BYTES:
             rows: list[dict] = []
             for batch in table.to_batches():
                 rows.extend(batch.to_pylist())
-            return {"data": {"rows": rows, "n": len(rows)}, "encoding": "json"}
+            # G4: measure the actual JSON serialization size before
+            # committing to the JSON path. Use `default=str` so
+            # datetime/Decimal types are rendered the same way
+            # write_json would; we discard the produced string (just
+            # need its length).
+            import json as _json
+            serialized_len = len(_json.dumps(rows, default=str))
+            if serialized_len < INLINE_JSON_THRESHOLD_BYTES:
+                return {
+                    "data": {"rows": rows, "n": len(rows), "json_bytes": serialized_len},
+                    "encoding": "json",
+                }
         arrow_bytes = reader.table_to_arrow_ipc(table)
         return {
             "binary": arrow_bytes,
@@ -1138,10 +1331,48 @@ def _compile_inspector_filters_to_sql(
                 # the provider, but defensively handle it here too.
                 parts.append("FALSE" if op == "in" else "TRUE")
                 continue
-            placeholders = ",".join(["?"] * len(value))
-            sql_op = "IN" if op == "in" else "NOT IN"
-            parts.append(f"{col_q} {sql_op} ({placeholders})")
-            params.extend(value)
+            # Megaudit D8 (2026-05-13): split SQL NULL out of the
+            # value array. The webview's set-filter widget admits
+            # literal None for nullable columns; passing None straight
+            # into an IN clause is a SQL-semantic trap (Postgres / DuckDB
+            # both evaluate `col IN (NULL, 'a')` per the trivalent
+            # logic where a NULL col is UNKNOWN rather than TRUE, so a
+            # row whose col is NULL is excluded). Lift None into an
+            # explicit `IS NULL` (or `IS NOT NULL` for not_in) and run
+            # the remaining non-null values through the parameterized
+            # IN clause.
+            has_null = any(v is None for v in value)
+            non_null = [v for v in value if v is not None]
+            if op == "in":
+                clauses: list[str] = []
+                if has_null:
+                    clauses.append(f"{col_q} IS NULL")
+                if non_null:
+                    placeholders = ",".join(["?"] * len(non_null))
+                    clauses.append(f"{col_q} IN ({placeholders})")
+                    params.extend(non_null)
+                parts.append(" OR ".join(clauses) if clauses else "FALSE")
+            else:
+                # not_in: SQL/Excel-style TRIVALENT semantics, NOT
+                # boolean complement of `in`. A NULL row is UNKNOWN
+                # under both `col IN (...)` and `col NOT IN (...)` —
+                # so NULL rows are EXCLUDED from `not_in`'s result.
+                # When the user explicitly unchecks the (null)
+                # checkbox alongside other values, we honor that with
+                # `IS NOT NULL`. When they leave (null) checked and
+                # uncheck only non-null values, NULL rows are still
+                # excluded — which mirrors Excel's filter semantics
+                # (uncheck-all-but-x does not surface UNKNOWN rows).
+                # This is intentional; see test_d8_trivalent_*
+                # pinning tests.
+                clauses_n: list[str] = []
+                if has_null:
+                    clauses_n.append(f"{col_q} IS NOT NULL")
+                if non_null:
+                    placeholders = ",".join(["?"] * len(non_null))
+                    clauses_n.append(f"{col_q} NOT IN ({placeholders})")
+                    params.extend(non_null)
+                parts.append(" AND ".join(clauses_n) if clauses_n else "TRUE")
         elif op in ("==", "!=", "<", "<=", ">", ">="):
             sql_op = {"==": "=", "!=": "<>"}.get(op, op)
             parts.append(f"{col_q} {sql_op} ?")
@@ -1185,6 +1416,11 @@ def _jsonify_scalar(v: Any) -> Any:
     JavaScript's `JSON.parse`) reject. Coerce non-finite floats to None
     before they reach the wire; the column-stats consumer treats null
     min/max as "no usable bound" and degrades the widget gracefully.
+
+    Megaudit Theme G (G3, 2026-05-13): explicit branches for
+    `datetime.timedelta` (→ ms, parseable by JS) and `bytearray` /
+    `memoryview` (→ hex). The previous bare `str(v)` fallback emitted
+    strings the webview couldn't parse for these types.
     """
     import datetime as _dt
     import math
@@ -1200,8 +1436,16 @@ def _jsonify_scalar(v: Any) -> Any:
         return v
     if isinstance(v, (_dt.datetime, _dt.date, _dt.time)):
         return v.isoformat()
+    if isinstance(v, _dt.timedelta):
+        # G3: emit milliseconds (Date-compatible) for parity with the
+        # datetime path.
+        return v.total_seconds() * 1000.0
     if isinstance(v, bytes):
         return v.hex()
+    if isinstance(v, bytearray):
+        return bytes(v).hex()
+    if isinstance(v, memoryview):
+        return v.tobytes().hex()
     # Decimal etc. — DuckDB hands these back; str() preserves precision.
     return str(v)
 

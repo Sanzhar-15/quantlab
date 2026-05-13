@@ -24,10 +24,12 @@
 
 import type {
 	AggregateTransform, AggregationOp, BinTransform, DateTruncTransform,
-	FilterTransform, GroupByTransform, LimitTransform, MathTransform,
-	SortTransform, Transform, TzConvertTransform, WindowTransform,
+	ExprTransform, FilterTransform, GroupByTransform, LimitTransform,
+	MathTransform, SortTransform, Transform, TzConvertTransform, WindowTransform,
 } from '../../../src/qviz/spec';
 import type { SchemaColumn } from '../../../src/qviz/messageProtocol';
+import { printColName, printExpr } from '../../../src/qviz/exprAst';
+import { parseExpression } from '../../../src/qviz/exprParser';
 
 export type TransformKind = Transform['kind'];
 
@@ -39,6 +41,12 @@ export interface TransformFormContext {
 export interface TransformFormHandle {
 	readonly root: HTMLElement;
 	dispose(): void;
+	/** Optional in-place state refresh. When the spec changes due to
+	 *  this card's own dispatch (or an upstream transform changing the
+	 *  available-columns set), the host calls `update(t, ctx)` instead
+	 *  of disposing + re-mounting. Forms that don't implement this fall
+	 *  back to the dispose-and-remount path. (M7 megaudit fix.) */
+	update?(t: Transform, ctx: TransformFormContext): void;
 }
 
 /** Build a form for `transform`. Calls `onUpdate(next)` on every
@@ -385,6 +393,9 @@ const windowForm: TransformFormFactory<WindowTransform> = (t, ctx, onUpdate) => 
 	const colSel = makeColumnSelect(ctx.columns, t.column);
 	const fnSel = makeSelect(WINDOW_FNS, t.fn);
 	const winInp = makeNumberInput(t.window, 'rolling window');
+	// Megaudit Theme A (A1, 2026-05-13): order_by required for all
+	// window fns. Column picker mirrors `column` selector.
+	const orderSel = makeColumnSelect(ctx.columns, t.order_by, { allowProduced: ctx.availableProducedNames });
 	const asInp = makeTextInput(t.as, 'output column');
 	const emit = (): void => {
 		const fn = fnSel.value as WindowTransform['fn'];
@@ -395,6 +406,7 @@ const windowForm: TransformFormFactory<WindowTransform> = (t, ctx, onUpdate) => 
 			column: colSel.value,
 			fn,
 			...(winVal !== undefined ? { window: winVal } : {}),
+			order_by: orderSel.value,
 			as: asInp.value,
 		});
 		winInp.style.display = requiresWindow ? '' : 'none';
@@ -402,11 +414,13 @@ const windowForm: TransformFormFactory<WindowTransform> = (t, ctx, onUpdate) => 
 	colSel.addEventListener('change', emit);
 	fnSel.addEventListener('change', emit);
 	winInp.addEventListener('change', emit);
+	orderSel.addEventListener('change', emit);
 	asInp.addEventListener('blur', emit);
 	asInp.addEventListener('change', emit);
 	root.appendChild(row('Column', colSel));
 	root.appendChild(row('Fn', fnSel));
 	root.appendChild(row('Window', winInp));
+	root.appendChild(row('Order by', orderSel));
 	root.appendChild(row('As', asInp));
 	if (!t.fn.startsWith('rolling_')) {
 		winInp.style.display = 'none';
@@ -422,37 +436,51 @@ const MATH_FNS: readonly { value: MathTransform['fn']; label: string }[] = [
 	'log', 'log10', 'exp', 'abs', 'sqrt', 'log_returns', 'pct_change', 'drawdown',
 ].map(f => ({ value: f as MathTransform['fn'], label: f }));
 
+// Megaudit Theme A (A2, 2026-05-13): these three math fns emit window
+// SQL and require `order_by`. Others are row-local.
+const MATH_FNS_ORDER_REQUIRED = new Set(['log_returns', 'pct_change', 'drawdown']);
+
 const mathForm: TransformFormFactory<MathTransform> = (t, ctx, onUpdate) => {
 	const root = document.createElement('div');
 	root.className = 'qviz-form qviz-form--math';
 	const colSel = makeColumnSelect(ctx.columns, t.column);
 	const fnSel = makeSelect(MATH_FNS, t.fn);
 	const periodsInp = makeNumberInput(t.periods, 'periods (log_returns/pct_change)');
+	const orderSel = makeColumnSelect(ctx.columns, t.order_by ?? '',
+		{ allowProduced: ctx.availableProducedNames });
 	const asInp = makeTextInput(t.as, 'output column');
 	const emit = (): void => {
 		const fn = fnSel.value as MathTransform['fn'];
 		const usesPeriods = fn === 'log_returns' || fn === 'pct_change';
+		const usesOrderBy = MATH_FNS_ORDER_REQUIRED.has(fn);
 		const periods = usesPeriods ? parseInt(periodsInp.value, 10) || undefined : undefined;
 		onUpdate({
 			kind: 'math',
 			column: colSel.value,
 			fn,
 			...(periods !== undefined ? { periods } : {}),
+			...(usesOrderBy ? { order_by: orderSel.value } : {}),
 			as: asInp.value,
 		});
 		periodsInp.style.display = usesPeriods ? '' : 'none';
+		orderSel.style.display = usesOrderBy ? '' : 'none';
 	};
 	colSel.addEventListener('change', emit);
 	fnSel.addEventListener('change', emit);
 	periodsInp.addEventListener('change', emit);
+	orderSel.addEventListener('change', emit);
 	asInp.addEventListener('blur', emit);
 	asInp.addEventListener('change', emit);
 	root.appendChild(row('Column', colSel));
 	root.appendChild(row('Fn', fnSel));
 	root.appendChild(row('Periods', periodsInp));
+	root.appendChild(row('Order by', orderSel));
 	root.appendChild(row('As', asInp));
 	if (t.fn !== 'log_returns' && t.fn !== 'pct_change') {
 		periodsInp.style.display = 'none';
+	}
+	if (!MATH_FNS_ORDER_REQUIRED.has(t.fn)) {
+		orderSel.style.display = 'none';
 	}
 	return { root, dispose: () => { /* */ } };
 };
@@ -582,6 +610,270 @@ const limitForm: TransformFormFactory<LimitTransform> = (t, _ctx, onUpdate) => {
 };
 
 // ---------------------------------------------------------------------------
+// expr (Visualise v2 calculated field)
+// ---------------------------------------------------------------------------
+
+const exprForm: TransformFormFactory<ExprTransform> = (t, ctx, onUpdate) => {
+	const root = document.createElement('div');
+	root.className = 'qviz-form qviz-form--expr';
+
+	const textarea = document.createElement('textarea');
+	textarea.className = 'qviz-form-input qviz-form-expr-textarea';
+	textarea.rows = 4;
+	textarea.spellcheck = false;
+	textarea.value = printExpr(t.expression);
+	textarea.placeholder = "e.g. (close - open) / open  --  or  if (vol > 0.3) then 1 else 0";
+
+	const asInp = makeTextInput(t.as, 'output column');
+
+	// Hint chip row: available column names so the user can see what to
+	// type. Each chip shows the column's dtype so the user can pick
+	// numeric vs. string targets at a glance.
+	const hintRow = document.createElement('div');
+	hintRow.className = 'qviz-form-expr-hints';
+	const hintLabel = document.createElement('span');
+	hintLabel.className = 'qviz-form-expr-hint-label';
+	hintLabel.textContent = 'Columns: ';
+	hintRow.appendChild(hintLabel);
+	const sourceChips = ctx.columns.map(c => ({ name: c.name, dtype: c.dtype }));
+	const producedChips = ctx.availableProducedNames.map(n => ({ name: n, dtype: 'produced' }));
+	for (const { name, dtype } of [...sourceChips, ...producedChips]) {
+		const chip = document.createElement('button');
+		chip.type = 'button';
+		chip.className = 'qviz-form-expr-hint-chip';
+		chip.textContent = name;
+		chip.title = `${name}: ${dtype} -- click to insert at the cursor`;
+		const tag = document.createElement('span');
+		tag.className = 'qviz-form-expr-hint-chip-dtype';
+		tag.textContent = dtype;
+		chip.appendChild(tag);
+		chip.addEventListener('click', () => {
+			// Codex audit LOW (2026-05-12): route the column name
+			// through `printColName` so names that aren't bare
+			// identifiers (`mid price`, `if`, `null`, `weird``name`)
+			// emit as the backtick-quoted form that actually parses.
+			// Naive `before + name + after` would insert raw text that
+			// the parser rejects.
+			const inserted = printColName(name);
+			const before = textarea.value.slice(0, textarea.selectionStart);
+			const after = textarea.value.slice(textarea.selectionEnd);
+			textarea.value = before + inserted + after;
+			const caret = before.length + inserted.length;
+			textarea.selectionStart = textarea.selectionEnd = caret;
+			textarea.focus();
+			schedulePreview();
+			// Manual chip-insert is a "commit" action: dispatch so the
+			// chart re-renders with the new column reference. We can do
+			// this because the chip-insert doesn't disrupt the user's
+			// in-flight typing -- they explicitly clicked.
+			commitExpr();
+		});
+		hintRow.appendChild(chip);
+	}
+
+	const errBox = document.createElement('div');
+	errBox.className = 'qviz-form-expr-error';
+	errBox.hidden = true;
+
+	// M8: surface `as` collision against schema + upstream-produced
+	// columns inline, BEFORE the user hits compile and gets a daemon
+	// error. The pool is computed once at mount; chips/columns are a
+	// snapshot — same lifecycle pattern as the rest of the form.
+	const reservedNames = new Set<string>([
+		...ctx.columns.map(c => c.name),
+		...ctx.availableProducedNames,
+	]);
+	const asErr = document.createElement('div');
+	asErr.className = 'qviz-form-expr-error';
+	asErr.hidden = true;
+	const validateAs = (): boolean => {
+		const name = asInp.value;
+		if (name.length === 0) {
+			asInp.classList.add('qviz-form-expr-textarea--invalid');
+			asErr.hidden = false;
+			asErr.textContent = 'Output column name is required.';
+			return false;
+		}
+		if (reservedNames.has(name)) {
+			asInp.classList.add('qviz-form-expr-textarea--invalid');
+			asErr.hidden = false;
+			asErr.textContent = `'${name}' is already a column in the pipeline -- pick a different name.`;
+			return false;
+		}
+		asInp.classList.remove('qviz-form-expr-textarea--invalid');
+		asErr.hidden = true;
+		asErr.textContent = '';
+		return true;
+	};
+
+	// Two-phase update model:
+	//
+	//   - `previewParse` runs on every `input` event (debounced). Updates
+	//     the inline error UI ONLY. Does NOT dispatch.
+	//   - `dispatchIfValid` runs on `change` (textarea blur) or Ctrl+Enter.
+	//     Re-parses the current text and dispatches if valid.
+	//
+	// Why split: dispatching on every keystroke causes `renderCards` to
+	// rebuild the form (since the spec hash changed), which destroys the
+	// textarea + cursor + any in-flight unparseable text. By holding
+	// dispatch until the user is "done" (blur or explicit commit), the
+	// in-flight typing experience is preserved.
+	let previewTimer: ReturnType<typeof setTimeout> | null = null;
+	const schedulePreview = (): void => {
+		if (previewTimer !== null) { clearTimeout(previewTimer); }
+		previewTimer = setTimeout(previewParse, 120);
+	};
+	const previewParse = (): void => {
+		previewTimer = null;
+		const r = parseExpression(textarea.value);
+		if (!r.ok) {
+			textarea.classList.add('qviz-form-expr-textarea--invalid');
+			errBox.hidden = false;
+			errBox.textContent = `Parse error at position ${r.position}: ${r.error}`;
+			return;
+		}
+		textarea.classList.remove('qviz-form-expr-textarea--invalid');
+		errBox.hidden = true;
+		errBox.textContent = '';
+	};
+	// Last-valid AST tracked in the form's own closure: when the user
+	// edits the `as` field with an in-flight unparseable expression, we
+	// still commit the `as` change by carrying the previous AST forward.
+	// `t.expression` is the spec's source of truth; we shadow it so we
+	// can ALSO commit through unparseable interludes.
+	let lastValidAst: ExprTransform['expression'] = t.expression;
+	let lastValidRefs: readonly string[] = t.references;
+
+	// `commitExpr`: invoked from textarea events. Dispatches ONLY when
+	// the textarea parses successfully — otherwise we'd reset the
+	// textarea to a canonical form on the next renderCards() pass and
+	// destroy the user's in-flight typing.
+	const commitExpr = (): void => {
+		if (previewTimer !== null) { clearTimeout(previewTimer); previewTimer = null; }
+		const r = parseExpression(textarea.value);
+		if (!r.ok) {
+			textarea.classList.add('qviz-form-expr-textarea--invalid');
+			errBox.hidden = false;
+			errBox.textContent = `Parse error at position ${r.position}: ${r.error}`;
+			return;
+		}
+		textarea.classList.remove('qviz-form-expr-textarea--invalid');
+		errBox.hidden = true;
+		errBox.textContent = '';
+		lastValidAst = r.ast;
+		lastValidRefs = r.references;
+		if (!validateAs()) { return; }
+		onUpdate({
+			kind: 'expr',
+			as: asInp.value,
+			expression: lastValidAst,
+			references: lastValidRefs,
+		});
+	};
+
+	// `commitAs`: invoked from `as` input events. Always dispatches with
+	// the LAST-VALID AST so the user's `as` edit isn't lost when the
+	// expression textarea happens to be mid-edit (M2 megaudit fix).
+	const commitAs = (): void => {
+		if (!validateAs()) { return; }
+		onUpdate({
+			kind: 'expr',
+			as: asInp.value,
+			expression: lastValidAst,
+			references: lastValidRefs,
+		});
+	};
+
+	textarea.addEventListener('input', schedulePreview);
+	textarea.addEventListener('change', commitExpr);
+	textarea.addEventListener('keydown', (e: KeyboardEvent) => {
+		// Cmd+Enter / Ctrl+Enter commits without leaving the field --
+		// matches the convention in chat boxes, editor command palettes,
+		// etc. for "send/apply now".
+		if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+			e.preventDefault();
+			commitExpr();
+		}
+	});
+	asInp.addEventListener('input', validateAs);
+	asInp.addEventListener('change', commitAs);
+	asInp.addEventListener('blur', commitAs);
+
+	root.appendChild(row('Expression', textarea));
+	root.appendChild(hintRow);
+	root.appendChild(errBox);
+	root.appendChild(row('As', asInp));
+	root.appendChild(asErr);
+
+	return {
+		root,
+		dispose: () => {
+			if (previewTimer !== null) {
+				clearTimeout(previewTimer);
+				previewTimer = null;
+			}
+		},
+		// M7 (megaudit): in-place refresh. When the spec or upstream
+		// produced-names change, the host calls update() rather than
+		// disposing + re-mounting. This preserves:
+		//   - the textarea's text + caret position (in-flight typing)
+		//   - which element has focus
+		//   - the user's selection
+		// We only mutate what's diverged from the previous render: the
+		// `as` input value if the spec carries a new `as`, and the chip
+		// row if upstream columns changed.
+		update: (nextT: Transform, nextCtx: TransformFormContext) => {
+			if (nextT.kind !== 'expr') { return; }  // type guard for the union
+			lastValidAst = nextT.expression;
+			lastValidRefs = nextT.references;
+			// Only overwrite the `as` input if (a) the user isn't
+			// currently editing it AND (b) the spec's `as` differs from
+			// what's shown. Without the focus check, an in-flight
+			// `as` edit would be clobbered by our own dispatch.
+			if (document.activeElement !== asInp && asInp.value !== nextT.as) {
+				asInp.value = nextT.as;
+			}
+			// Refresh the reserved-names set for collision detection.
+			reservedNames.clear();
+			for (const c of nextCtx.columns) { reservedNames.add(c.name); }
+			for (const n of nextCtx.availableProducedNames) { reservedNames.add(n); }
+			// Rebuild the hint chip row in-place. The textarea is NOT
+			// touched.
+			while (hintRow.childNodes.length > 1) {
+				hintRow.removeChild(hintRow.lastChild!);
+			}
+			for (const { name, dtype } of [
+				...nextCtx.columns.map(c => ({ name: c.name, dtype: c.dtype })),
+				...nextCtx.availableProducedNames.map(n => ({ name: n, dtype: 'produced' })),
+			]) {
+				const chip = document.createElement('button');
+				chip.type = 'button';
+				chip.className = 'qviz-form-expr-hint-chip';
+				chip.textContent = name;
+				chip.title = `${name}: ${dtype} -- click to insert at the cursor`;
+				const tag = document.createElement('span');
+				tag.className = 'qviz-form-expr-hint-chip-dtype';
+				tag.textContent = dtype;
+				chip.appendChild(tag);
+				chip.addEventListener('click', () => {
+					// Same printColName routing as the mount path.
+					const inserted = printColName(name);
+					const before = textarea.value.slice(0, textarea.selectionStart);
+					const after = textarea.value.slice(textarea.selectionEnd);
+					textarea.value = before + inserted + after;
+					const caret = before.length + inserted.length;
+					textarea.selectionStart = textarea.selectionEnd = caret;
+					textarea.focus();
+					schedulePreview();
+					commitExpr();
+				});
+				hintRow.appendChild(chip);
+			}
+		},
+	};
+};
+
+// ---------------------------------------------------------------------------
 // registry
 // ---------------------------------------------------------------------------
 
@@ -602,23 +894,53 @@ export const FORM_BY_KIND: { [K in TransformKind]: TransformFormFactory<Extract<
 	resample: (() => {
 		throw new Error("'resample' is not yet implemented; menu must not offer it.");
 	}) as unknown as TransformFormFactory<Extract<Transform, { kind: 'resample' }>>,
+	expr: exprForm,
 };
 
-/** Build a default (empty) transform of the given kind for "Add" menu. */
-export function defaultTransformOfKind(kind: TransformKind): Transform {
+/** Build a default (empty) transform of the given kind for "Add" menu.
+ *
+ *  `reservedNames` is the set of column names already in use (source
+ *  schema + already-produced names). For kinds that produce a new
+ *  column, the default `as` is uniquified against this set so two quick
+ *  "+ Add transform → expr" clicks don't both default to `'new_col'`.
+ *  Pass an empty set if you don't have it; callers in the transformList
+ *  always pass the live snapshot. (L4 megaudit fix.) */
+export function defaultTransformOfKind(
+	kind: TransformKind,
+	reservedNames: ReadonlySet<string> = new Set(),
+): Transform {
+	const uniqueName = (base: string): string => {
+		if (!reservedNames.has(base)) { return base; }
+		for (let i = 2; i < 1000; i += 1) {
+			const candidate = `${base}${i}`;
+			if (!reservedNames.has(candidate)) { return candidate; }
+		}
+		return `${base}_${Date.now()}`;
+	};
 	switch (kind) {
 		case 'filter': return { kind: 'filter', column: '', op: '==', value: '' };
-		case 'date_trunc': return { kind: 'date_trunc', column: '', unit: 'day', as: 'day' };
-		case 'bin': return { kind: 'bin', column: '', n_bins: 10, as: 'bin', strategy: 'equal_width' };
+		case 'date_trunc': return { kind: 'date_trunc', column: '', unit: 'day', as: uniqueName('day') };
+		case 'bin': return { kind: 'bin', column: '', n_bins: 10, as: uniqueName('bin'), strategy: 'equal_width' };
 		case 'groupby': return { kind: 'groupby', columns: [] };
-		case 'aggregate': return { kind: 'aggregate', aggs: [{ column: '', fn: 'count', as: 'count' }] };
-		case 'window': return { kind: 'window', column: '', fn: 'rolling_mean', window: 5, as: 'roll' };
-		case 'math': return { kind: 'math', column: '', fn: 'log_returns', as: 'r' };
+		case 'aggregate': return { kind: 'aggregate', aggs: [{ column: '', fn: 'count', as: uniqueName('count') }] };
+		case 'window': return { kind: 'window', column: '', fn: 'rolling_mean', window: 5, order_by: '', as: uniqueName('roll') };
+		case 'math': return { kind: 'math', column: '', fn: 'log_returns', order_by: '', as: uniqueName('r') };
 		case 'tz_convert': return { kind: 'tz_convert', column: '', to_tz: 'UTC' };
 		case 'sort': return { kind: 'sort', columns: [{ column: '' }] };
 		case 'limit': return { kind: 'limit', n: 100 };
 		case 'resample':
 			throw new Error("'resample' is not yet implemented (validator rejects).");
+		case 'expr':
+			// Default: a constant `0` so the form parses immediately. The
+			// user replaces the textarea contents with their expression
+			// and fills in `as`. L4: `new_col` is uniquified so back-to-
+			// back "+ Add transform → expr" doesn't collide.
+			return {
+				kind: 'expr',
+				as: uniqueName('new_col'),
+				expression: { kind: 'num', value: 0 },
+				references: [],
+			};
 	}
 }
 
@@ -643,5 +965,10 @@ export function summarizeTransform(t: Transform): string {
 		case 'sort': return t.columns.map(c => `${c.column}${c.desc ? ' ↓' : ' ↑'}`).join(', ');
 		case 'limit': return `n=${t.n}${t.offset ? `, offset=${t.offset}` : ''}`;
 		case 'resample': return '(unsupported)';
+		case 'expr': {
+			const printed = printExpr(t.expression);
+			const truncated = printed.length > 48 ? printed.slice(0, 45) + '…' : printed;
+			return `${truncated} as ${t.as}`;
+		}
 	}
 }

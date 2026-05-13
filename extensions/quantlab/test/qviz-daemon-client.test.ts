@@ -529,6 +529,37 @@ suite('QvizDaemonClient -- protocol + lifecycle (audit fixes)', () => {
 		}
 	});
 
+	test('F3: unknown error_kind rejects with DaemonProtocolError and drains queue', async function () {
+		if (skip) { this.skip(); }
+		const ws = makeWorkspace();
+		const c = new QvizDaemonClient({
+			...DEFAULT_DAEMON_CLIENT_OPTIONS,
+			workspaceRoot: ws,
+			pythonPath: PYTHON_PATH,
+			pythonPathPrefix: [FIXTURES_DIR],
+			module: 'dummy_daemon_bad_error_kind',
+		});
+		try {
+			await c.ready();
+			// First ping receives the bad-error_kind frame. Decoder
+			// throws DaemonProtocolError → fatal → failPending drains.
+			const p1 = c.ping();
+			// Second ping enqueues after the first; should also reject
+			// because failPending drains the whole queue.
+			const p2 = c.ping();
+			await assert.rejects(p1, (e: Error) =>
+				e instanceof DaemonProtocolError
+				&& /invalid error_kind/i.test(e.message),
+				'p1 must reject with DaemonProtocolError on invalid error_kind',
+			);
+			await assert.rejects(p2, (e: Error) => e instanceof Error,
+				'p2 must reject when fatal protocol error drains queue');
+		} finally {
+			await c.dispose();
+			rmrfSync(ws);
+		}
+	});
+
 	test('AF9: ready() rejects on banner timeout', async function () {
 		if (skip) { this.skip(); }
 		const c = new QvizDaemonClient({

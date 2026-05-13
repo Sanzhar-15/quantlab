@@ -201,11 +201,13 @@ suite('chartTypePicker -- Phase 9 jsdom coverage', () => {
 		});
 	});
 
-	// Megaudit B-6 cure: keyboard navigation contract for the
-	// chartTypePicker. WAI-ARIA radiogroup pattern: ArrowRight/Down
-	// moves to next, ArrowLeft/Up moves to previous, Home/End jump
-	// to first/last, selection follows focus.
-	test('ArrowRight on the active button moves focus to the next button and selects it', () => {
+	// Megaudit Theme D (D1, 2026-05-13): keyboard contract CHANGED.
+	// ArrowRight/Down/Left/Up/Home/End MOVE FOCUS only — they no longer
+	// commit selection. The old "selection-follows-focus" pattern
+	// silently destroyed encodings (the reducer filters encodings to
+	// allowed channels for the new chart type). Selection is now
+	// Space/Enter only.
+	test('D1: ArrowRight moves focus only — does not commit selection', () => {
 		const root = mkRoot();
 		const store = createStore();
 		store.dispatch({ type: 'init', fsPath: '/x.qviz.json', spec: specWith('timeseries', 'line') });
@@ -213,81 +215,88 @@ suite('chartTypePicker -- Phase 9 jsdom coverage', () => {
 
 		const buttons = Array.from(root.querySelectorAll<HTMLButtonElement>('button[role="radio"]'));
 		const initialActive = buttons.findIndex(b => b.getAttribute('aria-checked') === 'true');
-		assert.ok(initialActive >= 0, 'one button should be aria-checked initially');
+		const initialType = store.getState().spec.current!.chart.type;
 
-		// Focus the active button (jsdom focus is partial but supported).
 		buttons[initialActive].focus();
 		buttons[initialActive].dispatchEvent(new (window as unknown as { KeyboardEvent: typeof KeyboardEvent }).KeyboardEvent('keydown', {
 			key: 'ArrowRight', bubbles: true,
 		}));
 
-		const newActive = buttons.findIndex(b => b.getAttribute('aria-checked') === 'true');
-		assert.notStrictEqual(newActive, initialActive,
-			'ArrowRight must shift the aria-checked state to the next radio');
-		assert.strictEqual(newActive, (initialActive + 1) % buttons.length,
-			'next index must wrap modulo total');
-
-		// Selection-follows-focus: store's chart.type must reflect the new button.
-		const newType = buttons[newActive].dataset.chartType;
-		assert.ok(newType, 'each button must carry data-chart-type');
-		assert.strictEqual(store.getState().spec.current!.chart.type, newType,
-			'selection follows focus: dispatching setChartType per arrow-nav move');
+		// Selection MUST NOT change.
+		assert.strictEqual(store.getState().spec.current!.chart.type, initialType,
+			'arrow nav must NOT dispatch setChartType');
 
 		handle.dispose();
 	});
 
-	test('ArrowLeft on the first button wraps to the last', () => {
+	test('D1: Space on a focused button commits selection', () => {
+		const root = mkRoot();
+		const store = createStore();
+		store.dispatch({ type: 'init', fsPath: '/x.qviz.json', spec: specWith('timeseries', 'line') });
+		const handle = mountChartTypePicker(root, store);
+
+		const buttons = Array.from(root.querySelectorAll<HTMLButtonElement>('button[role="radio"]'));
+		// Pick a different button than the currently-active one.
+		const initialActive = buttons.findIndex(b => b.getAttribute('aria-checked') === 'true');
+		const targetIdx = (initialActive + 1) % buttons.length;
+		const target = buttons[targetIdx];
+		target.focus();
+		target.dispatchEvent(new (window as unknown as { KeyboardEvent: typeof KeyboardEvent }).KeyboardEvent('keydown', {
+			key: ' ', bubbles: true,
+		}));
+		assert.strictEqual(store.getState().spec.current!.chart.type, target.dataset.chartType,
+			'Space commits selection on the focused button');
+
+		handle.dispose();
+	});
+
+	test('D1: ArrowLeft on first button wraps focus to last (without commit)', () => {
 		const root = mkRoot();
 		const store = createStore();
 		store.dispatch({ type: 'init', fsPath: '/x.qviz.json', spec: specWith('timeseries', 'line') });
 		const handle = mountChartTypePicker(root, store);
 		const buttons = Array.from(root.querySelectorAll<HTMLButtonElement>('button[role="radio"]'));
+		const initialType = store.getState().spec.current!.chart.type;
 
-		// Find current active, navigate left until index 0 (line is buttons[0]
-		// in the canonical order from chartTypePicker.ts).
-		let active = buttons.findIndex(b => b.getAttribute('aria-checked') === 'true');
-		// Push left until we hit 0.
-		while (active > 0) {
-			buttons[active].focus();
-			buttons[active].dispatchEvent(new (window as unknown as { KeyboardEvent: typeof KeyboardEvent }).KeyboardEvent('keydown', {
-				key: 'ArrowLeft', bubbles: true,
-			}));
-			active = buttons.findIndex(b => b.getAttribute('aria-checked') === 'true');
-		}
-		// Now press ArrowLeft on index 0 -> should wrap to last (index N-1).
 		buttons[0].focus();
 		buttons[0].dispatchEvent(new (window as unknown as { KeyboardEvent: typeof KeyboardEvent }).KeyboardEvent('keydown', {
 			key: 'ArrowLeft', bubbles: true,
 		}));
-		const wrapped = buttons.findIndex(b => b.getAttribute('aria-checked') === 'true');
-		assert.strictEqual(wrapped, buttons.length - 1,
-			'ArrowLeft on first button must wrap to last (modulo wraparound)');
+		assert.strictEqual(document.activeElement, buttons[buttons.length - 1],
+			'ArrowLeft from first wraps focus to last');
+		assert.strictEqual(store.getState().spec.current!.chart.type, initialType,
+			'wrap does not commit');
 
 		handle.dispose();
 	});
 
-	test('Home jumps to first, End jumps to last', () => {
+	test('Home/End move focus without committing', () => {
 		const root = mkRoot();
 		const store = createStore();
 		store.dispatch({ type: 'init', fsPath: '/x.qviz.json', spec: specWith('timeseries', 'line') });
 		const handle = mountChartTypePicker(root, store);
 		const buttons = Array.from(root.querySelectorAll<HTMLButtonElement>('button[role="radio"]'));
 
-		// Press End from any focused button.
+		const initialType = store.getState().spec.current!.chart.type;
+
+		// Press End from focused button.
 		buttons[0].focus();
 		buttons[0].dispatchEvent(new (window as unknown as { KeyboardEvent: typeof KeyboardEvent }).KeyboardEvent('keydown', {
 			key: 'End', bubbles: true,
 		}));
-		const afterEnd = buttons.findIndex(b => b.getAttribute('aria-checked') === 'true');
-		assert.strictEqual(afterEnd, buttons.length - 1, 'End must jump to last button');
+		assert.strictEqual(document.activeElement, buttons[buttons.length - 1],
+			'End moves focus to last button');
 
 		// Press Home.
-		buttons[afterEnd].focus();
-		buttons[afterEnd].dispatchEvent(new (window as unknown as { KeyboardEvent: typeof KeyboardEvent }).KeyboardEvent('keydown', {
+		(document.activeElement as HTMLElement).dispatchEvent(new (window as unknown as { KeyboardEvent: typeof KeyboardEvent }).KeyboardEvent('keydown', {
 			key: 'Home', bubbles: true,
 		}));
-		const afterHome = buttons.findIndex(b => b.getAttribute('aria-checked') === 'true');
-		assert.strictEqual(afterHome, 0, 'Home must jump to first button');
+		assert.strictEqual(document.activeElement, buttons[0],
+			'Home moves focus to first button');
+
+		// D1: neither Home nor End committed selection.
+		assert.strictEqual(store.getState().spec.current!.chart.type, initialType,
+			'Home/End do not commit selection');
 
 		handle.dispose();
 	});

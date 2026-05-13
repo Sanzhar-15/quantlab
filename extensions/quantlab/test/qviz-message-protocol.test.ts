@@ -481,7 +481,13 @@ suite('messageProtocol -- extension messages', () => {
 	});
 
 	test('daemonStatus: every documented status validates', () => {
-		for (const status of ['idle', 'starting', 'ready', 'crashed', 'respawning', 'unavailable']) {
+		// Megaudit E8 (2026-05-13): include `disposing` so the loop
+		// pins the full set; without this a regression that removes
+		// 'disposing' from the validator would not be caught.
+		for (const status of [
+			'idle', 'starting', 'ready', 'crashed', 'respawning',
+			'disposing', 'unavailable',
+		]) {
 			const extra: Record<string, unknown> = { type: 'daemonStatus', status };
 			if (status === 'crashed' || status === 'respawning') {
 				extra.retryInMs = 100;
@@ -489,6 +495,17 @@ suite('messageProtocol -- extension messages', () => {
 			const r = validateExtensionMessage(env(extra));
 			assert.strictEqual(r.ok, true, `status=${status} must validate`);
 		}
+	});
+
+	test('E8: daemonStatus rejects retryInMs on disposing (terminal-direction state)', () => {
+		// `disposing` is a transient terminal-direction status; a
+		// retryInMs field would be semantically meaningless (no
+		// respawn after dispose). The existing validator rejects
+		// `retryInMs` on non-crashed/respawning states.
+		const r = validateExtensionMessage(env({
+			type: 'daemonStatus', status: 'disposing', retryInMs: 100,
+		}));
+		assert.strictEqual(r.ok, false);
 	});
 
 	test('daemonStatus: rejects retryInMs < 0 or non-finite', () => {
@@ -862,6 +879,88 @@ suite('messageProtocol -- extension messages', () => {
 			datasetUri: 'data/file.parquet', error: 42,
 		}));
 		assert.strictEqual(r.ok, false);
+	});
+
+	// -----------------------------------------------------------------
+	// Megaudit F1 (2026-05-13): anti-regression for the snake↔camel
+	// capabilities transform. If a future provider refactor stops
+	// calling `mapDaemonCapsForInit` and forwards the raw daemon
+	// payload, snake_case keys reach `validateDaemonCapabilities` which
+	// must refuse them with a targeted error message — NOT silently
+	// pass them through as unknown extras.
+	// -----------------------------------------------------------------
+	test('F1: rejects init.capabilities with snake_case transform_kinds (second branch)', () => {
+		// Cover the second alias in the loop — a regression that
+		// short-circuits on the first match alone wouldn't catch this.
+		const spec = validSpec();
+		const r = validateExtensionMessage(initEnv({
+			type: 'init', specHash: computeSpecHash(spec),
+			fsPath: '/x', spec,
+			capabilities: {
+				daemonVersion: 7,
+				transform_kinds: [], chartFamilies: [],
+			},
+		}));
+		assert.strictEqual(r.ok, false);
+		if (!r.ok) {
+			assert.match(r.error, /snake_case key 'transform_kinds'/);
+		}
+	});
+
+	test('F1: rejects init.capabilities with snake_case daemon_version', () => {
+		const spec = validSpec();
+		const r = validateExtensionMessage(initEnv({
+			type: 'init', specHash: computeSpecHash(spec),
+			fsPath: '/x', spec,
+			capabilities: {
+				daemon_version: 7,
+				transform_kinds: [], chart_families: [],
+			},
+		}));
+		assert.strictEqual(r.ok, false);
+		if (!r.ok) {
+			assert.match(r.error, /snake_case key 'daemon_version'/);
+		}
+	});
+
+	test('F1: rejects init.capabilities.inspector with snake_case preview_offset', () => {
+		const spec = validSpec();
+		const r = validateExtensionMessage(initEnv({
+			type: 'init', specHash: computeSpecHash(spec),
+			fsPath: '/x', spec,
+			capabilities: {
+				daemonVersion: 7,
+				transformKinds: [], chartFamilies: [],
+				inspector: {
+					preview_offset: true,
+					column_stats: false,
+					aggregate_filters: false,
+				},
+			},
+		}));
+		assert.strictEqual(r.ok, false);
+		if (!r.ok) {
+			assert.match(r.error, /inspector.*snake_case key 'preview_offset'/);
+		}
+	});
+
+	test('F1: accepts init.capabilities with proper camelCase shape', () => {
+		const spec = validSpec();
+		const r = validateExtensionMessage(initEnv({
+			type: 'init', specHash: computeSpecHash(spec),
+			fsPath: '/x', spec,
+			capabilities: {
+				daemonVersion: 7,
+				transformKinds: ['filter'], chartFamilies: ['timeseries'],
+				inspector: {
+					previewOffset: true,
+					columnStats: false,
+					aggregateFilters: false,
+				},
+			},
+		}));
+		assert.strictEqual(r.ok, true,
+			r.ok ? '' : `expected ok but failed: ${r.error}`);
 	});
 
 });
@@ -1265,6 +1364,29 @@ suite('messageProtocol -- Phase 6 inspector messages', () => {
 			inspectorFilters: [{ kind: 'set', column: 'a', includes: [{ nested: 1 }] }],
 		}));
 		assert.strictEqual(r.ok, false);
+	});
+
+	// Megaudit D8 (2026-05-13): null is a legitimate set member for
+	// nullable columns; the validator must let it through. The daemon
+	// translates null in the IN-list into `col IS NULL` so SQL NULL
+	// rows match without colliding with the literal string `"null"`.
+	test('D8: requestInspectorData accepts null in set.includes', () => {
+		const r = validateWebviewMessage(env({
+			type: 'requestInspectorData', offset: 0, n: 50,
+			inspectorFilters: [{
+				kind: 'set', column: 'a', includes: [null, 'x', 1, true],
+			}],
+		}));
+		assert.strictEqual(r.ok, true,
+			r.ok ? '' : `expected ok; got ${r.error}`);
+	});
+
+	test('D8: requestInspectorData accepts set with only null', () => {
+		const r = validateWebviewMessage(env({
+			type: 'requestInspectorData', offset: 0, n: 50,
+			inspectorFilters: [{ kind: 'set', column: 'a', includes: [null] }],
+		}));
+		assert.strictEqual(r.ok, true);
 	});
 
 	// --- webview → ext: requestColumnStats ---

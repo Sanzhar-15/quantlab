@@ -27,6 +27,13 @@ SPIKE_DIR = Path("/tmp/quantlab-spike-data")
 SPIKE_DATA = SPIKE_DIR / "synthetic_ohlcv_1m.parquet"
 SPIKE_ROWS = 1_000_000
 
+# Strict-mode fixture-presence helper lives in `_fixture_helpers.py`
+# (sibling module — pytest will not let test files `import conftest`,
+# so test modules import directly from `_fixture_helpers`). The
+# constant is hard-coded here too rather than imported so conftest stays
+# importable in environments where `qviz.tests` isn't yet on sys.path.
+QUANTLAB_REQUIRE_FIXTURES = "QUANTLAB_REQUIRE_FIXTURES"
+
 
 def _generate_spike_data(out: Path, n: int = SPIKE_ROWS) -> None:
     """Write a deterministic OHLCV+returns parquet to `out`.
@@ -79,7 +86,17 @@ def ensure_spike_data() -> Path:
     ``Path("/tmp/quantlab-spike-data/...")``; this autouse fixture just
     guarantees the file is there. autouse=True means it runs even for
     tests that don't request it explicitly.
+
+    Megaudit F5 (2026-05-13): under ``QUANTLAB_REQUIRE_FIXTURES=1`` we
+    must NOT silently regenerate. Strict mode means "this fixture must
+    already exist as provisioned by CI/ops"; auto-regenerating would
+    repair the very condition strict mode exists to surface. In strict
+    mode we leave the file alone and let `require_fixture` hard-fail
+    at the per-test fixture layer.
     """
-    if not SPIKE_DATA.exists() or os.path.getsize(SPIKE_DATA) < 1024:
+    needs_regen = (
+        not SPIKE_DATA.exists() or os.path.getsize(SPIKE_DATA) < 1024
+    )
+    if needs_regen and os.environ.get(QUANTLAB_REQUIRE_FIXTURES) != "1":
         _generate_spike_data(SPIKE_DATA)
     return SPIKE_DATA

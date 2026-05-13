@@ -41,6 +41,7 @@ import { mountEncodingShelves } from '../qviz/components/encodingShelf';
 import { mountPreviewArea } from '../qviz/components/previewArea';
 import { mountTransformList } from '../qviz/components/transformList';
 import { mountAnnouncer } from '../qviz/components/announcer';
+import { handleInvalidExtensionMessage } from './invalidMessage';
 import { RendererHost } from '../qviz/render/RendererHost';
 
 interface VSCodeApi {
@@ -207,7 +208,7 @@ function init(): void {
 	window.addEventListener('message', (event: MessageEvent) => {
 		const result = validateExtensionMessage(event.data);
 		if (!result.ok) {
-			console.error('qviz-spec: invalid extension message:', result.error);
+			handleInvalidExtensionMessage(result.error, announcer);
 			return;
 		}
 		const msg = result.value;
@@ -247,10 +248,11 @@ function init(): void {
 	});
 
 	// Live-preview wiring: debounced requestData on spec change, and
-	// renderer drive on dataReceived. The `lastDispatchedHash` guard
-	// prevents firing requestData for the same spec twice (e.g., when
-	// init lands and we already match).
-	const lastDispatchedHash: string | null = null;
+	// renderer drive on dataReceived. The actual de-dup guard is
+	// `lastSuccessfullyRenderedHash` (a few lines down); the previous
+	// `lastDispatchedHash` was dead code retained for a comment that
+	// no longer matched the implementation. (Megaudit Theme D D14,
+	// 2026-05-13.)
 	let lastDispatchedEditHash: string | null = null;
 	let lastRenderedDataHash: string | null = null;
 	let debounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -366,7 +368,6 @@ function init(): void {
 		}
 	});
 	void liveSubscription;
-	void lastDispatchedHash;
 
 	// Step 5.E.1 -- theme refresh via MutationObserver on body.className.
 	// VS Code signals theme changes by toggling body classes
@@ -765,9 +766,15 @@ function dispatchExtensionMessage(
 			});
 			return;
 		case 'inspectorError':
+			// Megaudit D3 (2026-05-13): forward `errorKind` -- the
+			// previous dispatch dropped it, so the state slice's
+			// lastErrorKind never got set and the Retry button was
+			// rendered uniformly even for terminal kinds like
+			// `security` or `protocol`.
 			store.dispatch({
 				type: 'inspectorError',
 				error: msg.error,
+				errorKind: msg.errorKind,
 			});
 			return;
 		case 'columnStats':

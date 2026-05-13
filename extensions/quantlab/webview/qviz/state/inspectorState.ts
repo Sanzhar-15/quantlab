@@ -54,7 +54,7 @@
  */
 
 import type {
-	ColumnStats, InspectorFilter,
+	ColumnStats, InspectorFilter, InspectorErrorKind,
 } from '../../../src/qviz/messageProtocol';
 import type { Action } from './actions';
 
@@ -94,6 +94,12 @@ export interface InspectorState {
 	 *  dispatcher in qviz-spec/index.ts ALSO clears the duplicate-request
 	 *  cursor when this field is non-null so retries can fire. */
 	readonly lastError: string | null;
+	/** Megaudit D3 (2026-05-13): structured kind of the most recent
+	 *  inspector error. Invariant: `lastError === null` iff
+	 *  `lastErrorKind === null`. Drives Retry-button gating (security
+	 *  and protocol are terminal; timeout/memory/internal are
+	 *  retryable) and screen-reader phrasing in `announcer.ts`. */
+	readonly lastErrorKind: InspectorErrorKind | null;
 }
 
 export const INITIAL_INSPECTOR_STATE: InspectorState = {
@@ -104,6 +110,7 @@ export const INITIAL_INSPECTOR_STATE: InspectorState = {
 	window: null,
 	statsCache: {},
 	lastError: null,
+	lastErrorKind: null,
 };
 
 /** Stable string fingerprint of the active filters, used to detect stale
@@ -234,12 +241,40 @@ function sameSelection(
 	return a.x === b.x;
 }
 
+/** Megaudit D3 audit (2026-05-13): the invariant
+ *  `lastError === null iff lastErrorKind === null` is reducer-only.
+ *  Wrap the inner reducer so every transition is checked once. If
+ *  it ever fails, throw — this is a programmer error and silently
+ *  papering over it would let the inspector UI desync (per the
+ *  audit's analysis of the previous "kind === null retryable"
+ *  fallback). */
+function assertInspectorErrorInvariant(s: InspectorState, label: string): void {
+	if ((s.lastError === null) !== (s.lastErrorKind === null)) {
+		throw new Error(
+			`inspector invariant broken at ${label}: lastError=`
+			+ `${JSON.stringify(s.lastError)} but lastErrorKind=`
+			+ `${JSON.stringify(s.lastErrorKind)}`,
+		);
+	}
+}
+
 export function reduceInspector(state: InspectorState, action: Action): InspectorState {
+	const next = reduceInspectorInner(state, action);
+	if (next !== state) {
+		assertInspectorErrorInvariant(next, action.type);
+	}
+	return next;
+}
+
+function reduceInspectorInner(state: InspectorState, action: Action): InspectorState {
 	switch (action.type) {
 		case 'init':
 			// Reset per-document. Identity-preserve when already at the
 			// default state to avoid spurious top-level RootState change
 			// when nothing actually shifted.
+			// D3 audit: also check lastErrorKind so a state with
+			// {lastError:null, lastErrorKind:'security'} (invariant
+			// violation) is not silently identity-preserved.
 			if (
 				state.visible === INITIAL_INSPECTOR_STATE.visible
 				&& Object.keys(state.filters).length === 0
@@ -248,6 +283,7 @@ export function reduceInspector(state: InspectorState, action: Action): Inspecto
 				&& state.window === null
 				&& Object.keys(state.statsCache).length === 0
 				&& state.lastError === null
+				&& state.lastErrorKind === null
 			) {
 				return state;
 			}
@@ -312,6 +348,13 @@ export function reduceInspector(state: InspectorState, action: Action): Inspecto
 			if (!filtersChanged && !statsChanged && state.window === null) {
 				return state;
 			}
+			// Megaudit Theme D (D5, 2026-05-13): preserve scrollOffset on
+			// fields-preserved drifts (no column removed). The window is
+			// invalidated regardless (because the LOADED rows may carry
+			// stale dtypes), but the user's scroll position is not
+			// invalidated by a benign schema-hash change. The "no
+			// columns removed" check is the same condition that
+			// preserves filters.
 			return {
 				...state,
 				filters: filtersChanged ? filters : state.filters,
@@ -325,8 +368,12 @@ export function reduceInspector(state: InspectorState, action: Action): Inspecto
 				// nothing was filtered out (drop-by-default is too
 				// aggressive for fields-preserved drifts).
 				selection: filtersChanged ? null : state.selection,
-				scrollOffset: 0,
+				// D5: only reset scrollOffset when columns actually
+				// changed. Otherwise the user's scroll position is
+				// preserved across same-hash drifts.
+				scrollOffset: filtersChanged ? 0 : state.scrollOffset,
 				lastError: null,
+				lastErrorKind: null,
 			};
 		}
 
@@ -350,6 +397,7 @@ export function reduceInspector(state: InspectorState, action: Action): Inspecto
 					// Filter edit is a fresh start -- drop any prior error
 					// so the next fetch can repopulate cleanly.
 					lastError: null,
+					lastErrorKind: null,
 					// Audit M-10 (2026-05-11): a filter change can drop
 					// the row whose x-value is the current selection; the
 					// ghost highlight after refetch is confusing. Clear.
@@ -366,6 +414,7 @@ export function reduceInspector(state: InspectorState, action: Action): Inspecto
 				window: null,
 				scrollOffset: 0,
 				lastError: null,
+				lastErrorKind: null,
 				selection: null,
 			};
 		}
@@ -382,9 +431,28 @@ export function reduceInspector(state: InspectorState, action: Action): Inspecto
 				window: null,
 				scrollOffset: 0,
 				lastError: null,
+				lastErrorKind: null,
 				// Same rationale as setColumnFilter: filter removal
 				// invalidates the current selection's row context.
 				selection: null,
+			};
+		}
+
+		case 'retryInspectorFetch': {
+			// Megaudit Theme D (D4, 2026-05-13): null lastError and
+			// reset window so the next fetch cycle re-fires from the
+			// current cursor. Filters are PRESERVED (the bug that
+			// motivated this action: the prior "Retry" path dispatched
+			// clearAllFilters as a side effect, wiping user state).
+			if (state.lastError === null && state.window === null) {
+				return state;
+			}
+			return {
+				...state,
+				lastError: null,
+				lastErrorKind: null,
+				window: null,
+				// Keep scrollOffset, filters, selection.
 			};
 		}
 
@@ -435,6 +503,7 @@ export function reduceInspector(state: InspectorState, action: Action): Inspecto
 				// Successful data fetch clears any prior error so the
 				// table's placeholder slot stops showing the stale error.
 				lastError: null,
+				lastErrorKind: null,
 			};
 		}
 
@@ -447,10 +516,15 @@ export function reduceInspector(state: InspectorState, action: Action): Inspecto
 			// qviz-spec/index.ts watches this field to clear its
 			// duplicate-request cursor -- without that clear, the same
 			// (offset, filters) retry was suppressed forever.
+			// Megaudit D3 (2026-05-13): also stash the structured kind
+			// so the table can gate Retry button visibility (security
+			// and protocol are terminal; the others are retryable) and
+			// the announcer can vary phrasing by kind.
 			return {
 				...state,
 				window: null,
 				lastError: action.error,
+				lastErrorKind: action.errorKind,
 			};
 		}
 

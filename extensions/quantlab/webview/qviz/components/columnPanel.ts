@@ -167,6 +167,18 @@ export function mountColumnPanel(root: HTMLElement, store: QvizStore): { dispose
 	const renderColumns = (): void => {
 		const state = store.getState();
 		const info = state.schema.info;
+		// Megaudit Theme D (D10, 2026-05-13): snapshot the
+		// currently-focused column name BEFORE the innerHTML wipe so we
+		// can restore focus after rebuild. Without this, schema-hash-
+		// triggered re-renders drop the user's focus to <body>, jarring
+		// keyboard / SR users.
+		const focusedColumn = (() => {
+			const a = document.activeElement;
+			if (a instanceof HTMLElement && a.classList.contains('qviz-column-row')) {
+				return a.dataset.column ?? null;
+			}
+			return null;
+		})();
 		list.innerHTML = '';
 		rows = [];
 		if (info === null) {
@@ -221,6 +233,12 @@ export function mountColumnPanel(root: HTMLElement, store: QvizStore): { dispose
 			li.appendChild(button);
 			list.appendChild(li);
 			rows.push(row);
+		}
+		// D10: restore focus to the snapshotted column if it still
+		// exists in the rebuilt list.
+		if (focusedColumn !== null) {
+			const restore = rows.find(r => r.column.name === focusedColumn);
+			if (restore) { restore.button.focus(); }
 		}
 	};
 

@@ -14,7 +14,8 @@
 import * as assert from 'assert';
 
 import { collectReferencedFields, detectDrift } from '../src/qviz/schemaDrift';
-import type { QvizSpec } from '../src/qviz/spec';
+import type { QvizSpec, Transform } from '../src/qviz/spec';
+import type { ExprAst } from '../src/qviz/exprAst';
 import type { SchemaInfo } from '../src/qviz/messageProtocol';
 
 const HASH_A = 'sha256:' + 'a'.repeat(64);
@@ -233,12 +234,53 @@ suite('schemaDrift -- fields-missing branch', () => {
 		assert.strictEqual(result.drift, 'fields-preserved');
 	});
 
+	test('expr produced name recognized, references flagged when missing', () => {
+		// expr references = ['high', 'low']; output = 'mid'.
+		const exprSpec = spec({
+			transforms: [
+				{
+					kind: 'expr',
+					as: 'mid',
+					expression: {
+						kind: 'binary', op: '+',
+						left: { kind: 'col', name: 'high' },
+						right: { kind: 'col', name: 'low' },
+					},
+					references: ['high', 'low'],
+				},
+			],
+			chart: {
+				family: 'general', type: 'scatter',
+				encodings: {
+					x: { field: 'mid', type: 'quantitative' },
+					y: { field: 'high', type: 'quantitative' },
+				},
+			},
+		});
+
+		// All source columns present → preserved.
+		assert.strictEqual(
+			detectDrift(exprSpec, schemaInfo({
+				hash: HASH_B, columns: [{ name: 'high' }, { name: 'low' }],
+			})).drift,
+			'fields-preserved',
+		);
+
+		// Drop `low` → missing-field drift on the expr's references.
+		const missing = detectDrift(exprSpec, schemaInfo({
+			hash: HASH_B, columns: [{ name: 'high' }],
+		}));
+		assert.strictEqual(missing.drift, 'fields-missing');
+		assert.ok(missing.missingFields.includes('low'),
+			`'low' should be in missingFields, got: ${[...missing.missingFields]}`);
+	});
+
 	test('window/math/date_trunc produced names recognized', () => {
 		const transformSpec = spec({
 			transforms: [
 				{ kind: 'date_trunc', column: 'ts', unit: 'day', as: 'day' },
-				{ kind: 'window', column: 'price', fn: 'rolling_mean', window: 5, as: 'sma5' },
-				{ kind: 'math', column: 'price', fn: 'log_returns', as: 'log_r' },
+				{ kind: 'window', column: 'price', fn: 'rolling_mean', window: 5, order_by: 'ts', as: 'sma5' },
+				{ kind: 'math', column: 'price', fn: 'log_returns', order_by: 'ts', as: 'log_r' },
 			],
 			chart: {
 				family: 'general', type: 'scatter',
@@ -329,6 +371,201 @@ suite('schemaDrift -- collectReferencedFields', () => {
 		}));
 		// Only the encoding refs (a, b) make it through.
 		assert.deepStrictEqual([...fields].sort(), ['a', 'b']);
+	});
+
+	// Megaudit F4 (2026-05-13): one case per transform kind so the
+	// walker can't lose a case in a future refactor without a failing
+	// test. Cases use default chart encodings (x:a, y:b) so each
+	// `expected` is unioned with ['a','b'].
+	test('walkTransformReferences pins one case per transform kind', () => {
+		const exprAst: ExprAst = {
+			kind: 'binary', op: '+',
+			left: { kind: 'col', name: 'a' },
+			right: { kind: 'col', name: 'b' },
+		};
+		const cases: Array<[string, Transform[], string[]]> = [
+			['filter',
+				[{ kind: 'filter', column: 'p', op: '>', value: 0 }],
+				['p']],
+			['date_trunc',
+				[{ kind: 'date_trunc', column: 'ts', unit: 'day', as: 'day' }],
+				['ts']],
+			['bin',
+				[{ kind: 'bin', column: 'v', n_bins: 10, as: 'vb' }],
+				['v']],
+			['groupby',
+				[{ kind: 'groupby', columns: ['c1', 'c2'] }],
+				['c1', 'c2']],
+			['aggregate',
+				[{
+					kind: 'aggregate', aggs: [
+						{ column: 'x', fn: 'sum', as: 'xs' },
+						{ column: 'y', fn: 'mean', as: 'ym' },
+					],
+				}],
+				['x', 'y']],
+			['window+order_by',
+				[{
+					kind: 'window', column: 'price', fn: 'rolling_mean',
+					window: 20, order_by: 'ts', as: 'sma20',
+				}],
+				['price', 'ts']],
+			['math+order_by (log_returns)',
+				[{
+					kind: 'math', column: 'close', fn: 'log_returns',
+					order_by: 'ts', as: 'r',
+				}],
+				['close', 'ts']],
+			['math no order_by (log)',
+				[{ kind: 'math', column: 'close', fn: 'log', as: 'lc' }],
+				['close']],
+			['resample',
+				[{ kind: 'resample', time_column: 'ts', freq: '1m', fill: 'forward' }],
+				['ts']],
+			['tz_convert',
+				[{ kind: 'tz_convert', column: 'ts', to_tz: 'UTC' }],
+				['ts']],
+			['sort',
+				[{ kind: 'sort', columns: [{ column: 'a' }, { column: 'b', desc: true }] }],
+				['a', 'b']],
+			['limit',
+				[{ kind: 'limit', n: 100 }],
+				[]],
+			['expr (uses references field verbatim)',
+				[{
+					kind: 'expr', as: 'sum_ab',
+					expression: exprAst,
+					references: ['a', 'b'],
+				}],
+				['a', 'b']],
+		];
+		for (const [name, transforms, expectedTransformRefs] of cases) {
+			const fields = collectReferencedFields(spec({ transforms }));
+			// `collectReferencedFields` returns a list without dedup
+			// (drift detection AND-s against schema name set, so
+			// multiplicities are irrelevant). Dedup before asserting.
+			// Default spec encodings always inject 'a','b' from x,y.
+			const got = [...new Set(fields)].sort();
+			const want = [...new Set([...expectedTransformRefs, 'a', 'b'])].sort();
+			assert.deepStrictEqual(got, want, `case: ${name}`);
+		}
+	});
+
+	test('produced-name reference from downstream expr is filtered out', () => {
+		// A window produces 'sma20'; an expr that references it via
+		// the AST + references list must NOT surface 'sma20' as a
+		// source-column reference (the walker filters produced names).
+		const ast: ExprAst = {
+			kind: 'binary', op: '*',
+			left: { kind: 'col', name: 'sma20' },
+			right: { kind: 'num', value: 2 },
+		};
+		const fields = collectReferencedFields(spec({
+			transforms: [
+				{
+					kind: 'window', column: 'price', fn: 'rolling_mean',
+					window: 20, order_by: 'ts', as: 'sma20',
+				},
+				{
+					kind: 'expr', as: 'doubled',
+					expression: ast, references: ['sma20'],
+				},
+			],
+		}));
+		// Source refs: price, ts (from window) + a, b (encodings).
+		// 'sma20' produced; expr's reference filtered.
+		assert.deepStrictEqual([...new Set(fields)].sort(),
+			['a', 'b', 'price', 'ts']);
+	});
+
+	test('expr collector reads .references verbatim, not the AST', () => {
+		// Deliberately skew: AST says 'ast_only' but references says 'ref_only'.
+		// Use encodings that mention NEITHER — otherwise the encoding's
+		// own 'a'/'b' would mask whether the walker incorrectly re-derived
+		// from the AST.
+		// (Validator would reject this skewed spec at parseExpr; we're
+		// testing the collector's contract in isolation.)
+		const ast: ExprAst = { kind: 'col', name: 'ast_only' };
+		const fields = collectReferencedFields(spec({
+			transforms: [{
+				kind: 'expr', as: 'derived',
+				expression: ast, references: ['ref_only'],
+			}],
+			chart: {
+				family: 'general', type: 'scatter',
+				encodings: {
+					x: { field: 'enc_x', type: 'quantitative' },
+					y: { field: 'enc_y', type: 'quantitative' },
+				},
+			},
+		}));
+		// 'ref_only' surfaces (verbatim use); 'ast_only' is NOT independently
+		// re-collected. The encoding refs 'enc_x' and 'enc_y' also come through.
+		const deduped = [...new Set(fields)].sort();
+		assert.deepStrictEqual(deduped, ['enc_x', 'enc_y', 'ref_only'],
+			`walker must read references field verbatim, not the AST; got ${JSON.stringify(fields)}`);
+		assert.ok(!deduped.includes('ast_only'),
+			'ast_only must NOT surface — walker reads .references, not the AST');
+	});
+
+	test('window order_by missing in schema is flagged as fields-missing', () => {
+		// Codex F4 audit (2026-05-13): pin the actual user-visible
+		// regression path that motivated the walker fix. A spec where
+		// the window column exists but order_by doesn't would previously
+		// have classified as fields-preserved (silent drift); now it
+		// must classify as fields-missing.
+		const spec1 = spec({
+			transforms: [{
+				kind: 'window', column: 'price', fn: 'rolling_mean',
+				window: 20, order_by: 'ts', as: 'sma20',
+			}],
+			chart: {
+				family: 'general', type: 'line',
+				encodings: {
+					x: { field: 'sma20', type: 'quantitative' },
+					y: { field: 'price', type: 'quantitative' },
+				},
+			},
+		});
+		const result = detectDrift(spec1, schemaInfo({
+			hash: HASH_B,
+			// Schema includes price but NOT ts (order_by source).
+			columns: [{ name: 'price' }],
+		}));
+		assert.strictEqual(result.drift, 'fields-missing',
+			'window.order_by missing must be flagged');
+		assert.ok([...result.missingFields].includes('ts'),
+			`missingFields must include 'ts'; got ${JSON.stringify(result.missingFields)}`);
+	});
+
+	test('window order_by referencing produced name is correctly filtered', () => {
+		// Realistic post-Theme-A pattern: date_trunc produces 'day',
+		// then window orders by 'day'. The walker pushes 'day' for
+		// window, but it's already in `produced` by then (date_trunc
+		// runs first), so the per-step filter at schemaDrift.ts:134
+		// strips it. No 'day' source-reference should appear.
+		const spec1 = spec({
+			transforms: [
+				{ kind: 'date_trunc', column: 'ts', unit: 'day', as: 'day' },
+				{
+					kind: 'window', column: 'price', fn: 'rolling_mean',
+					window: 5, order_by: 'day', as: 'sma5',
+				},
+			],
+			chart: {
+				family: 'general', type: 'line',
+				encodings: {
+					x: { field: 'day', type: 'temporal' },
+					y: { field: 'sma5', type: 'quantitative' },
+				},
+			},
+		});
+		const fields = collectReferencedFields(spec1);
+		// Source refs: ts (from date_trunc), price (from window).
+		// 'day' is produced — must NOT surface.
+		const deduped = [...new Set(fields)].sort();
+		assert.deepStrictEqual(deduped, ['price', 'ts'],
+			`order_by referencing produced name must be filtered; got ${JSON.stringify(fields)}`);
 	});
 
 	test('SD2 shadow-alias: later alias must NOT hide earlier source-column reference', () => {

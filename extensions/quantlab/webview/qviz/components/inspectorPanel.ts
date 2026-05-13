@@ -222,11 +222,20 @@ export function mountInspectorPanel(
 			const api = (window as { acquireVsCodeApi?: () => unknown }).acquireVsCodeApi;
 			void api; // already acquired upstream, nothing to do here.
 			const w = document.documentElement.style.getPropertyValue('--qviz-inspector-width');
-			// Audit Tier-9 (2026-05-11): namespace per-document so two
+			// Megaudit Theme D (D11, 2026-05-13): per-doc key so two
 			// split-view editors don't fight over a single shared width.
-			// `viewType` is stable across the panel lifetime.
-			window.sessionStorage.setItem('qviz.inspectorWidth.v1', w);
-		} catch { /* sessionStorage may be unavailable in test envs */ }
+			// The old single-key code shared state across all open
+			// Visualise panels — last-write-wins. The legacy key remains
+			// readable below for one-shot migration on first hydrate.
+			const docPath = store.getState().source?.documentFsPath ?? null;
+			const key = docPath !== null
+				? `qviz.inspectorWidth.v1::${docPath}`
+				: 'qviz.inspectorWidth.v1';
+			window.sessionStorage.setItem(key, w);
+		} catch (e) {
+			// Per "no fallbacks": surface the persistence failure.
+			console.warn('[qviz inspectorPanel] inspector width persist failed:', e);
+		}
 	};
 	const onPointerDown = (e: PointerEvent): void => {
 		if (e.button !== 0) { return; }
@@ -242,12 +251,20 @@ export function mountInspectorPanel(
 	resizeHandle.addEventListener('pointerdown', onPointerDown);
 	// Restore persisted width if present.
 	try {
-		const saved = window.sessionStorage.getItem('qviz.inspectorWidth.v1')
+		// D11 (megaudit): try per-doc key first, then global, then legacy.
+		const docPath = store.getState().source?.documentFsPath ?? null;
+		const perDocKey = docPath !== null
+			? `qviz.inspectorWidth.v1::${docPath}`
+			: 'qviz.inspectorWidth.v1';
+		const saved = window.sessionStorage.getItem(perDocKey)
+			?? window.sessionStorage.getItem('qviz.inspectorWidth.v1')
 			?? window.sessionStorage.getItem('qviz.inspectorWidth'); // legacy key
 		if (saved && /^[\d.]+px$/.test(saved)) {
 			document.documentElement.style.setProperty('--qviz-inspector-width', saved);
 		}
-	} catch { /* sessionStorage may be unavailable */ }
+	} catch (e) {
+		console.warn('[qviz inspectorPanel] inspector width restore failed:', e);
+	}
 
 	const unsubscribe = store.subscribe(update);
 	update();

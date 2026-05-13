@@ -374,11 +374,17 @@ function removeOnce<T>(arr: T[], item: T): void {
 	if (idx >= 0) { arr.splice(idx, 1); }
 }
 
-/** Deep-frozen clone of a spec. JSON-serialize + parse is the simplest
- *  correct deep-copy in this codebase (the spec is JSON-serializable by
- *  construction). */
+/** Deep-frozen clone of a spec.
+ *
+ *  Megaudit Theme G (G12, 2026-05-13): switched from
+ *  `JSON.parse(TextDecoder.decode(serializeSpec(spec)))` (round-trips
+ *  through bytes + JSON parse) to `structuredClone(spec)`. Same
+ *  correctness for the JSON-serializable spec shape we accept (no
+ *  Functions/Dates/Maps/Sets at the boundary — validator rejects),
+ *  ~10× faster. Every `get spec` / `get savedSpec` access pays this,
+ *  so the perf wins compound under a busy `onContentChange` subscriber. */
 function frozenClone(spec: QvizSpec): QvizSpec {
-	const decoded = JSON.parse(new TextDecoder().decode(serializeSpec(spec))) as QvizSpec;
+	const decoded = structuredClone(spec) as QvizSpec;
 	deepFreeze(decoded);
 	return decoded;
 }

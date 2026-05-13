@@ -66,14 +66,51 @@ export class DaemonProtocolError extends Error {
 
 /** Megaudit MAJOR-34: structured kind from the daemon's `error_kind`
  *  response field. Used by the provider to map to the protocol's
- *  typed `errorKind` (compile / security / timeout / memory / internal)
- *  without parsing the message string. */
-export type DaemonErrorKind = 'compile' | 'security' | 'timeout' | 'memory' | 'internal';
+ *  typed `errorKind` without parsing the message string.
+ *
+ *  Megaudit F3 (2026-05-13): `'protocol'` added so daemon-side protocol
+ *  violations (non-dict frames, unknown op, etc. -- see
+ *  `python/qviz/daemon.py:906,914`) round-trip with the correct kind
+ *  instead of silently downgrading to `'compile'`. */
+export type DaemonErrorKind =
+	| 'compile'
+	| 'security'
+	| 'timeout'
+	| 'memory'
+	| 'internal'
+	| 'protocol';
+
+/** Source of truth for the kind set; exported for the cross-side
+ *  contract test that greps daemon.py to confirm the Python side hasn't
+ *  drifted. */
+export const DAEMON_ERROR_KINDS: ReadonlySet<DaemonErrorKind> = new Set([
+	'compile', 'security', 'timeout', 'memory', 'internal', 'protocol',
+]);
+
+/** Megaudit F3 (2026-05-13): strict decoder. Per CLAUDE.md "no
+ *  fallbacks" the previous default-to-`'compile'` silently masked
+ *  classification bugs; we now refuse unknown/missing kinds with
+ *  `DaemonProtocolError`. Callers MUST catch in the same pattern they
+ *  catch `requireFiniteElapsed` (push head back, failPending). */
+export function decodeDaemonErrorKind(raw: unknown, op: string): DaemonErrorKind {
+	if (typeof raw === 'string' && DAEMON_ERROR_KINDS.has(raw as DaemonErrorKind)) {
+		return raw as DaemonErrorKind;
+	}
+	throw new DaemonProtocolError(
+		`response for op '${op}' has invalid error_kind=${JSON.stringify(raw)}; `
+		+ `expected one of ${[...DAEMON_ERROR_KINDS].sort().join(', ')}`,
+	);
+}
 
 export class DaemonOpError extends Error {
 	readonly elapsedMs: number;
 	readonly errorKind: DaemonErrorKind;
-	constructor(message: string, elapsedMs: number, errorKind: DaemonErrorKind = 'compile') {
+	// Megaudit F3 (2026-05-13): the `errorKind` parameter was previously
+	// defaulted to `'compile'`. That default was the same shape of
+	// silent classification fallback `decodeDaemonErrorKind` now refuses
+	// at the wire; the constructor must match. Callers MUST pass the
+	// kind explicitly.
+	constructor(message: string, elapsedMs: number, errorKind: DaemonErrorKind) {
 		super(message);
 		this.name = 'DaemonOpError';
 		this.elapsedMs = elapsedMs;
@@ -148,6 +185,13 @@ export interface AggregateMeta {
 	readonly n: number;
 	readonly bytes: number;
 	readonly columns: readonly string[];
+	/** Megaudit G5 (2026-05-13): compile-time precision-loss warnings
+	 *  (e.g. `sum(BIGINT)` cast to DOUBLE losing ones-place past
+	 *  2^53). Present only when non-empty; consumers must treat
+	 *  `undefined` and `[]` equivalently. The provider relays this
+	 *  to the webview's diagnostics readout so users see the loss
+	 *  rather than silently mis-trusting the chart values. */
+	readonly warnings?: readonly string[];
 }
 
 export interface DecimateMeta {
@@ -1010,13 +1054,20 @@ export class QvizDaemonClient {
 			// Megaudit MAJOR-34: propagate structured error_kind from
 			// the daemon response so the provider can map to the
 			// protocol's typed errorKind without parsing message strings.
-			const validKinds: ReadonlySet<DaemonErrorKind> = new Set([
-				'compile', 'security', 'timeout', 'memory', 'internal',
-			]);
-			const errorKind: DaemonErrorKind = typeof r.error_kind === 'string'
-				&& validKinds.has(r.error_kind as DaemonErrorKind)
-				? r.error_kind as DaemonErrorKind
-				: 'compile';  // legacy default for daemons that don't emit error_kind
+			// Megaudit F3 (2026-05-13): strict decode — unknown/missing
+			// error_kind now surfaces as DaemonProtocolError instead of
+			// silently classifying as 'compile'. Callers expecting
+			// `errorKind === 'compile'` for legacy daemons must update;
+			// the Python side has emitted error_kind on every response
+			// since the protocol layer was introduced.
+			let errorKind: DaemonErrorKind;
+			try {
+				errorKind = decodeDaemonErrorKind(r.error_kind, head.op);
+			} catch (e) {
+				this.orderedQueue.unshift(head);
+				this.failPending(e as DaemonProtocolError);
+				return;
+			}
 			head.reject(new DaemonOpError(
 				r.error, requireFiniteElapsed(r.elapsed_ms, head.op), errorKind,
 			));

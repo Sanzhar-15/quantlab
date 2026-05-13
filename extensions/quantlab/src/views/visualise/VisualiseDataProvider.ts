@@ -225,8 +225,15 @@ export class VisualiseDataProvider implements vscode.CustomReadonlyEditorProvide
 				return;
 			}
 			default: {
+				// Megaudit Theme E (E15, 2026-05-13): the compile-time
+				// `exhaustive: never` already enforces enumeration at
+				// build time. Throwing at runtime here would surface as
+				// an unhandled promise rejection (handleMessage is
+				// invoked via `void`), potentially crashing the
+				// extension host. Log + return instead.
 				const exhaustive: never = message;
-				throw new Error(`unknown DataWebviewMessage: ${JSON.stringify(exhaustive)}`);
+				console.error(`VisualiseDataProvider: unknown DataWebviewMessage at runtime: ${JSON.stringify(exhaustive)}`);
+				return;
 			}
 		}
 	}

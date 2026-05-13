@@ -24,7 +24,7 @@
 import type {
 	DaemonStatusKind, DatasetStatusKind,
 	SchemaDriftKind, SchemaInfo, ThemeTokens, DaemonCapabilities,
-	InspectorFilter, ColumnStats,
+	InspectorFilter, ColumnStats, InspectorErrorKind,
 } from '../../../src/qviz/messageProtocol';
 import type { ChartFamily, ChartType, Encoding, QvizSpec, Transform } from '../../../src/qviz/spec';
 
@@ -251,6 +251,17 @@ export interface ActionClearAllFilters {
 	readonly type: 'clearAllFilters';
 }
 
+/** Megaudit Theme D (D4, 2026-05-13): the inspector "Retry" button
+ *  used to dispatch `clearAllFilters` to force a cache-reset of the
+ *  fetch cursor. That side effect destroyed every column filter the
+ *  user had built up — a frustrating UX trap on any transient daemon
+ *  failure. This dedicated action nulls `lastError` and resets the
+ *  fetch cursor (window=null + scrollOffset preserved) WITHOUT
+ *  touching `filters`. */
+export interface ActionRetryInspectorFetch {
+	readonly type: 'retryInspectorFetch';
+}
+
 export interface ActionSetSelection {
 	readonly type: 'setSelection';
 	/** `null` clears the selection. Must always carry the actual value,
@@ -279,6 +290,10 @@ export interface ActionInspectorDataReceived {
 export interface ActionInspectorError {
 	readonly type: 'inspectorError';
 	readonly error: string;
+	// Megaudit D3 (2026-05-13): required — the wire message already
+	// carries `errorKind`, the dispatcher previously dropped it, the
+	// state slice now mirrors it for Retry-gating and SR phrasing.
+	readonly errorKind: InspectorErrorKind;
 }
 
 export interface ActionColumnStatsRequested {
@@ -337,6 +352,7 @@ export type Action =
 	| ActionInspectorToggle
 	| ActionSetColumnFilter
 	| ActionClearAllFilters
+	| ActionRetryInspectorFetch
 	| ActionSetSelection
 	| ActionClearSelection
 	| ActionSetScrollOffset

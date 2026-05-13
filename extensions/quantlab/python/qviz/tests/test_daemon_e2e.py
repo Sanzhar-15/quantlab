@@ -23,6 +23,8 @@ import pytest
 from qviz.ipc import FRAME_ARROW_IPC, FRAME_JSON, HEADER_FMT, HEADER_SIZE
 from qviz.reader import arrow_ipc_to_table
 
+from qviz.tests._fixture_helpers import require_fixture
+
 
 PYTHON = sys.executable
 DAEMON_MAIN = "qviz.daemon"
@@ -33,8 +35,7 @@ PYTHON_DIR = Path(__file__).resolve().parents[2]  # extensions/quantlab/python
 @pytest.fixture
 def workspace(tmp_path: Path) -> Path:
     """A workspace containing a copy/symlink of the spike parquet under data/."""
-    if not SPIKE_DATA.exists():
-        pytest.skip("spike data not present")
+    require_fixture(SPIKE_DATA, "spike OHLCV parquet")
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     target = data_dir / "ohlcv.parquet"
@@ -151,7 +152,7 @@ def test_capabilities(daemon: _DaemonClient) -> None:
     # Every kind the compiler accepts must be listed.
     kinds = set(data["transform_kinds"])
     assert {"filter", "date_trunc", "bin", "groupby", "aggregate",
-            "window", "math", "tz_convert", "sort", "limit"} <= kinds
+            "window", "math", "tz_convert", "sort", "limit", "expr"} <= kinds
     # Variants the TS validator gates are explicitly listed as unsupported.
     unsupported = set(data["unsupported"])
     assert "window.fn=ema" in unsupported
@@ -220,6 +221,47 @@ def test_aggregate(daemon: _DaemonClient) -> None:
     table = arrow_ipc_to_table(binary)
     assert "day" in table.column_names
     assert "vol_sum" in table.column_names
+
+
+def test_expr_calculated_field_end_to_end(daemon: _DaemonClient) -> None:
+    """Visualise v2: an `expr` transform compiles to DuckDB SQL and the
+    daemon ships an Arrow result with the calculated column present."""
+    spec = {
+        "qviz_version": 1,
+        "dataset": {"uri": "data/ohlcv.parquet", "schema_hash": "sha256:" + "0" * 64,
+                    "mtime_ns": 1},
+        "transforms": [
+            {
+                "kind": "expr",
+                "as": "mid",
+                "expression": {
+                    "kind": "binary", "op": "/",
+                    "left": {
+                        "kind": "binary", "op": "+",
+                        "left": {"kind": "col", "name": "high"},
+                        "right": {"kind": "col", "name": "low"},
+                    },
+                    "right": {"kind": "num", "value": 2},
+                },
+                "references": ["high", "low"],
+            },
+            {"kind": "limit", "n": 100},
+        ],
+        "chart": {
+            "family": "timeseries", "type": "line",
+            "encodings": {
+                "x": {"field": "timestamp", "type": "temporal"},
+                "y": {"field": "mid", "type": "quantitative"},
+            },
+        },
+    }
+    resp, binary = daemon.request("aggregate", spec=spec)
+    assert resp["ok"], resp
+    assert resp["encoding"] == "arrow"
+    assert binary is not None
+    table = arrow_ipc_to_table(binary)
+    assert "mid" in table.column_names
+    assert table.num_rows == 100
 
 
 def test_preview_apply_spec_transforms_aggregated(daemon: _DaemonClient) -> None:
@@ -398,6 +440,29 @@ def test_path_traversal_rejected(daemon: _DaemonClient) -> None:
     resp, _ = daemon.request("schema", path="../etc/passwd")
     assert resp["ok"] is False
     assert "SecurityError" in resp["error"]
+    # Megaudit F3 (2026-05-13): pin error_kind round-trip on the e2e path.
+    assert resp["error_kind"] == "security"
+
+
+def test_unknown_op_error_kind_protocol(daemon: _DaemonClient) -> None:
+    # Megaudit F3 (2026-05-13): unknown op is the canonical 'protocol' kind.
+    resp, _ = daemon.request("nope")
+    assert resp["ok"] is False
+    assert resp["error_kind"] == "protocol"
+
+
+def test_aggregate_compile_error_kind(daemon: _DaemonClient) -> None:
+    # Megaudit F3 (2026-05-13): pin compile kind on the aggregate path.
+    spec = {
+        "qviz_version": 1,
+        "dataset": {"uri": "data/ohlcv.parquet",
+                    "schema_hash": "sha256:" + "0" * 64, "mtime_ns": 1},
+        "transforms": [{"kind": "filter", "column": "ghost", "op": ">", "value": 0}],
+        "chart": {"family": "timeseries", "type": "line", "encodings": {}},
+    }
+    resp, _ = daemon.request("aggregate", spec=spec)
+    assert resp["ok"] is False
+    assert resp["error_kind"] == "compile"
 
 
 def test_absolute_path_rejected(daemon: _DaemonClient) -> None:

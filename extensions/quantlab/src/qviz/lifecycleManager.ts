@@ -115,9 +115,25 @@ export class LifecycleManager implements LifecycleSource {
 	async disposeAll(): Promise<void> {
 		if (this.disposed) { return; }
 		this.disposed = true;
+		// Megaudit Theme E (E9, 2026-05-13): fire each handler with a
+		// terminal `{kind:'unavailable', error:'manager disposed'}`
+		// BEFORE clearing them. Without this, subscribers (provider's
+		// per-document banners) sit at their last-known status until
+		// their panel disposes — the user sees "ready" on a manager
+		// that's gone.
+		const terminal: import('./daemon-lifecycle').LifecycleStatus = {
+			kind: 'unavailable',
+			error: 'lifecycle manager disposed',
+		};
 		const all: Promise<void>[] = [];
 		for (const managed of this.lifecycles.values()) {
 			if (managed === null) { continue; }
+			for (const h of [...managed.statusHandlers]) {
+				try { h(terminal); } catch (e) {
+					// CLAUDE.md system-boundary cleanup exception.
+					console.warn('lifecycleManager.disposeAll: handler threw', e);
+				}
+			}
 			if (managed.statusUnsubscribe) {
 				managed.statusUnsubscribe();
 				managed.statusUnsubscribe = null;

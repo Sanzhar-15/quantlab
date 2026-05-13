@@ -79,7 +79,13 @@ export function mountChartTypePicker(root: HTMLElement, store: QvizStore): { dis
 		const btn = buttons.get(orderedTypes[clamped]);
 		if (btn) {
 			btn.focus();
-			selectType(orderedTypes[clamped]);
+			// Megaudit Theme D (D1, 2026-05-13): do NOT call selectType
+			// here. Arrow-key navigation must MOVE FOCUS only — Space/
+			// Enter commit selection via the keydown handler below.
+			// Previously, every arrow tap dispatched setChartType, and
+			// the reducer's encoding-filter cascade silently destroyed
+			// the user's encoding work on each keystroke. Loosely
+			// modeled after WAI-ARIA listbox-with-explicit-selection.
 		}
 	};
 	for (const { type, label } of CHART_TYPES_IN_ORDER) {

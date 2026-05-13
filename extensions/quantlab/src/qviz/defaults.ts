@@ -214,10 +214,18 @@ function detectOhlcvColumns(
 ): OhlcvColumns | null {
 	if (!temporal) { return null; }
 	const byLower = new Map<string, { col: SchemaColumn; type: ClassifiedColumnType }>();
+	// Megaudit Theme G (G13, 2026-05-13): refuse auto-detect when the
+	// parquet has case-ambiguous OHLCV-like column names (e.g., both
+	// `Close` and `close`). Previously "last wins" silently picked an
+	// arbitrary physical column and produced a candlestick spec that
+	// referenced the wrong actual column. Refusing falls through to
+	// scatter, which is correct.
 	for (const c of classified) {
-		// Last wins for case collisions; the validator already rejects
-		// duplicate column names on the parquet side so this is theoretical.
-		byLower.set(c.col.name.toLowerCase(), c);
+		const key = c.col.name.toLowerCase();
+		if (byLower.has(key)) {
+			return null;
+		}
+		byLower.set(key, c);
 	}
 	const o = byLower.get('open');
 	const h = byLower.get('high');

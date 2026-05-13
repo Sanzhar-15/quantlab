@@ -203,12 +203,13 @@ export function mountInspectorTable(
 			const row = document.createElement('div');
 			row.className = 'qviz-inspector-row';
 			row.setAttribute('role', 'row');
-			// Audit M-41 (2026-05-11): tabindex + aria-selected so
-			// keyboard users can tab into a row and Enter to select.
-			// Roving tabindex would be nicer but tabindex=0 on every
-			// row is the minimum that lets SR + keyboard users reach
-			// the data at all.
-			row.tabIndex = 0;
+			// Megaudit Theme D (D12, 2026-05-13): roving tabindex.
+			// Only the FIRST visible row carries tabIndex=0; all others
+			// are -1. This collapses 200+ rendered rows into a single
+			// tab stop while still letting SR users enter the grid via
+			// keyboard. Once inside, ArrowUp/Down navigates between
+			// rows (handled by the existing keydown listener on `body`).
+			row.tabIndex = (i === renderFrom) ? 0 : -1;
 			row.style.top = `${i * ROW_HEIGHT}px`;
 			row.dataset.localIdx = String(localIdx);
 
@@ -270,7 +271,14 @@ export function mountInspectorTable(
 			return;
 		}
 		const daemon = state.runtime.daemonStatus;
-		if (daemon === 'crashed' || daemon === 'respawning' || daemon === 'unavailable') {
+		// Megaudit E8 audit (2026-05-13): include `disposing` so the
+		// inspector table doesn't render stale rows during the brief
+		// teardown window between dispose() and the terminal
+		// `unavailable` transition. In-flight fetches will be
+		// cancelled by `client.dispose()` anyway, so showing the
+		// placeholder is honest.
+		if (daemon === 'crashed' || daemon === 'respawning'
+			|| daemon === 'disposing' || daemon === 'unavailable') {
 			const why = state.runtime.daemonLastError ?? daemon;
 			setPlaceholder(`Daemon ${daemon}: ${why}`);
 			return;
@@ -279,18 +287,56 @@ export function mountInspectorTable(
 		// instead of hiding them behind a generic "Loading…" placeholder
 		// that misleads the user into waiting forever.
 		if (insp.lastError !== null) {
-			// Audit M-48: clearing the error (via clearAllFilters or
-			// a new filter dispatch) is the retry pathway. Dispatch a
-			// scroll-offset noop that re-runs the request flow.
-			setPlaceholder(`Could not load rows: ${insp.lastError}`, {
+			// Megaudit Theme D (D4, 2026-05-13): use the dedicated
+			// retryInspectorFetch action so the user's filters survive
+			// the click. The prior clearAllFilters path nuked every
+			// filter as a side effect, a frustrating UX trap on any
+			// transient daemon failure.
+			// Megaudit D3 (2026-05-13) + audit revision: gate the Retry
+			// button via an exhaustive switch on the error kind so a
+			// future addition to `InspectorErrorKind` fails the TS
+			// compile rather than silently falling through to a
+			// default branch. `security`, `protocol`, and `compile`
+			// are deterministic denials (same request fails the same
+			// way); `timeout`, `memory`, `internal` can be transient.
+			//
+			// `lastErrorKind === null` while `lastError !== null` is
+			// an invariant violation (enforced in `reduceInspector`).
+			// Per CLAUDE.md "no fallbacks" the prior "treat null kind
+			// as retryable" branch was a fallback masking exactly the
+			// regression this slice was added to expose. Now: log
+			// loudly and render a non-retryable placeholder so the
+			// bug is visible.
+			const kind = insp.lastErrorKind;
+			if (kind === null) {
+				console.error(
+					'[qviz inspector] invariant violation: lastError set but '
+					+ 'lastErrorKind=null; suppressing Retry. Fix the dispatcher.',
+				);
+				setPlaceholder(`Could not load rows: ${insp.lastError}`,
+					{ kind: 'error' });
+				return;
+			}
+			let retryable: boolean;
+			switch (kind) {
+				case 'timeout':
+				case 'memory':
+				case 'internal':
+					retryable = true; break;
+				case 'security':
+				case 'protocol':
+				case 'compile':
+					retryable = false; break;
+				default: {
+					const _exhaustive: never = kind;
+					throw new Error(`unhandled inspector kind: ${String(_exhaustive)}`);
+				}
+			}
+			setPlaceholder(`Could not load rows (${kind}): ${insp.lastError}`, {
 				kind: 'error',
-				retry: () => {
-					// Setting scroll offset to the SAME value won't
-					// re-fire (reducer identity-preserves); instead we
-					// clear the error and reset the cursor so the
-					// dispatch layer treats this as a fresh request.
-					store.dispatch({ type: 'clearAllFilters' });
-				},
+				retry: retryable
+					? () => { store.dispatch({ type: 'retryInspectorFetch' }); }
+					: undefined,
 			});
 			return;
 		}

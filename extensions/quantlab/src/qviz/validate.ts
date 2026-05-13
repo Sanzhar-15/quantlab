@@ -23,12 +23,17 @@
 import {
 	type AggregateTransform, type AggregationOp, type BinTransform, type ChartConfig,
 	type ChartFamily, type ChartOptions, type ChartType, type DatasetRef, type DateTruncTransform,
-	type Encoding, type EncodingType, type Encodings, type FilterTransform,
+	type Encoding, type EncodingType, type Encodings, type ExprTransform, type FilterTransform,
 	type GroupByTransform, type LimitTransform, type MathTransform, type OhlcvEncoding,
 	type Provenance, type QvizSpec, type ResampleTransform, type SortTransform,
 	type TradingOptions, type Transform, type TzConvertTransform, type WindowTransform,
 	QVIZ_SCHEMA_VERSION
 } from './spec';
+import {
+	type BinaryOp, type ExprAst, type WhitelistedFn,
+	BINARY_OPS, EXPR_AST_KINDS, EXPR_LIMITS, FN_ARITY, UNARY_OPS, WHITELISTED_FNS,
+	astDepth, astNodeCount, collectColumnRefs,
+} from './exprAst';
 import { validatePipeline } from './pipelineValidate';
 
 export interface ValidationOk {
@@ -207,6 +212,7 @@ function parseTransform(ctx: Ctx, path: string, x: unknown): Transform | null {
 		case 'tz_convert': return parseTzConvert(ctx, path, obj);
 		case 'sort': return parseSort(ctx, path, obj);
 		case 'limit': return parseLimit(ctx, path, obj);
+		case 'expr': return parseExpr(ctx, path, obj);
 		default:
 			ctx.error(`${path}.kind`, `unknown transform kind: ${JSON.stringify(kind)}`);
 			return null;
@@ -346,7 +352,13 @@ function parseWindow(ctx: Ctx, path: string, obj: Record<string, unknown>): Wind
 		ctx.error(`${path}.window`, `must be a safe integer 1..1000000, got ${windowVal}`);
 		return null;
 	}
-	return { kind: 'window', column, fn, window: windowVal ?? undefined, as };
+	// Megaudit Theme A (A1, 2026-05-13): window functions are order-
+	// dependent. Without an explicit ORDER BY in the compiled SQL, the
+	// daemon used parquet scan order, silently producing wrong rolling
+	// means / cumulative sums on unsorted data. order_by is now required.
+	const orderBy = expectString(ctx, `${path}.order_by`, obj.order_by);
+	if (orderBy === null) { return null; }
+	return { kind: 'window', column, fn, window: windowVal ?? undefined, order_by: orderBy, as };
 }
 
 const MATH_FNS = ['log', 'log10', 'exp', 'abs', 'sqrt', 'log_returns', 'pct_change', 'drawdown'] as const;
@@ -363,7 +375,23 @@ function parseMath(ctx: Ctx, path: string, obj: Record<string, unknown>): MathTr
 		ctx.error(`${path}.periods`, `must be a safe integer 1..1000000, got ${periods}`);
 		return null;
 	}
-	return { kind: 'math', column, fn, periods, as };
+	// Megaudit Theme A (A2, 2026-05-13): the three lag/cummax-using math
+	// fns (log_returns, pct_change, drawdown) emit window SQL and need
+	// an explicit ORDER BY. Pure scalar fns (log, log10, exp, abs, sqrt)
+	// are row-local and don't take order_by.
+	const ORDER_REQUIRED = new Set(['log_returns', 'pct_change', 'drawdown']);
+	let orderBy: string | undefined = undefined;
+	if (ORDER_REQUIRED.has(fn)) {
+		const ob = expectString(ctx, `${path}.order_by`, obj.order_by);
+		if (ob === null) { return null; }
+		orderBy = ob;
+	} else if (obj.order_by !== undefined) {
+		// Document but reject: order_by on row-local fns is a user error
+		// (suggests they don't realize it's row-local).
+		ctx.error(`${path}.order_by`, `math fn "${fn}" is row-local and does not take order_by`);
+		return null;
+	}
+	return { kind: 'math', column, fn, periods, ...(orderBy !== undefined ? { order_by: orderBy } : {}), as };
 }
 
 function parseResample(ctx: Ctx, path: string, obj: Record<string, unknown>): ResampleTransform | null {
@@ -404,7 +432,20 @@ function parseSort(ctx: Ctx, path: string, obj: Record<string, unknown>): SortTr
 		if (!c) { continue; }
 		const column = expectString(ctx, `${path}.columns[${i}].column`, c.column);
 		if (column === null) { continue; }
-		const desc = c.desc !== undefined ? c.desc === true : undefined;
+		// Megaudit Theme B (B7, 2026-05-13): desc must be a real
+		// boolean when present. Was: `c.desc === true` silently
+		// coerced any non-true value (e.g. "yes") to false without
+		// validator error. Use optBool to mirror the rest of the file.
+		let desc: boolean | undefined = undefined;
+		if (c.desc !== undefined) {
+			const b = optBool(ctx, `${path}.columns[${i}].desc`, c.desc);
+			if (b === undefined && c.desc !== undefined) {
+				// optBool already pushed the error; continue collecting
+				// other column errors but treat this one as unset.
+				continue;
+			}
+			desc = b;
+		}
 		cols.push({ column, desc });
 	}
 	if (cols.length === 0) {
@@ -432,6 +473,261 @@ function parseLimit(ctx: Ctx, path: string, obj: Record<string, unknown>): Limit
 	return { kind: 'limit', n, offset };
 }
 
+// Visualise v2 -- `expr` transform validator. Walks the AST received
+// over the wire, defending in depth against tampered specs: every node
+// kind must be in EXPR_AST_KINDS; every binary op in BINARY_OPS; every
+// unary op in UNARY_OPS; every call.fn in WHITELISTED_FNS with arity
+// inside FN_ARITY; every numeric literal must be finite; every string
+// literal must pass isAcceptableString; depth/node-count must be inside
+// EXPR_LIMITS; and the spec's `references` field must exactly equal
+// `collectColumnRefs(ast)` so the daemon-side compiler can trust it.
+/** Megaudit Theme C (C1, 2026-05-13): iterative pre-flight that bounds
+ *  raw-AST depth and node count BEFORE recursive validateExprAst is
+ *  called. A hand-crafted JSON spec with 50k nested binary nodes would
+ *  otherwise blow V8's recursion stack inside validateExprAst before
+ *  the post-validation cap checks could fire. The work-stack walk is
+ *  O(nodes) and bounded by EXPR_LIMITS.maxAstNodes. */
+function preflightExprAstCaps(ctx: Ctx, rootPath: string, root: unknown): boolean {
+	const stack: { node: unknown; path: string; depth: number }[] = [
+		{ node: root, path: rootPath, depth: 1 },
+	];
+	let nodes = 0;
+	while (stack.length > 0) {
+		const { node, path, depth } = stack.pop()!;
+		if (depth > EXPR_LIMITS.maxAstDepth) {
+			ctx.error(path, `AST depth exceeds cap ${EXPR_LIMITS.maxAstDepth}`);
+			return false;
+		}
+		nodes += 1;
+		if (nodes > EXPR_LIMITS.maxAstNodes) {
+			ctx.error(rootPath, `AST node count exceeds cap ${EXPR_LIMITS.maxAstNodes}`);
+			return false;
+		}
+		if (node === null || typeof node !== 'object' || Array.isArray(node)) { continue; }
+		const n = node as Record<string, unknown>;
+		const childDepth = depth + 1;
+		// Push every value that COULD be an AST sub-node. Unknown keys
+		// are ignored at this layer; validateExprAst will reject any
+		// node whose `kind` is not in EXPR_AST_KINDS.
+		if (n.operand !== undefined) {
+			stack.push({ node: n.operand, path: `${path}.operand`, depth: childDepth });
+		}
+		if (n.left !== undefined) {
+			stack.push({ node: n.left, path: `${path}.left`, depth: childDepth });
+		}
+		if (n.right !== undefined) {
+			stack.push({ node: n.right, path: `${path}.right`, depth: childDepth });
+		}
+		if (Array.isArray(n.args)) {
+			for (let i = 0; i < n.args.length; i += 1) {
+				stack.push({ node: n.args[i], path: `${path}.args[${i}]`, depth: childDepth });
+			}
+		}
+		if (n.cond !== undefined) {
+			stack.push({ node: n.cond, path: `${path}.cond`, depth: childDepth });
+		}
+		if (n.then_ !== undefined) {
+			stack.push({ node: n.then_, path: `${path}.then_`, depth: childDepth });
+		}
+		if (n.else_ !== undefined) {
+			stack.push({ node: n.else_, path: `${path}.else_`, depth: childDepth });
+		}
+	}
+	return true;
+}
+
+function parseExpr(ctx: Ctx, path: string, obj: Record<string, unknown>): ExprTransform | null {
+	const as = expectString(ctx, `${path}.as`, obj.as);
+	if (as === null) { return null; }
+
+	const exprRaw = obj.expression;
+	if (exprRaw === null || typeof exprRaw !== 'object' || Array.isArray(exprRaw)) {
+		ctx.error(`${path}.expression`, `expected object, got ${typeofValue(exprRaw)}`);
+		return null;
+	}
+
+	// C1 (megaudit): bound depth + node count via iterative walk BEFORE
+	// the recursive validateExprAst can stack-blow.
+	if (!preflightExprAstCaps(ctx, `${path}.expression`, exprRaw)) {
+		return null;
+	}
+
+	const ast = validateExprAst(ctx, `${path}.expression`, exprRaw);
+	if (ast === null) { return null; }
+
+	// Defense in depth: parser enforces caps too, but a hand-crafted spec
+	// could ship an AST that bypasses the parser entirely. After
+	// preflight we re-check the post-validation tree because the AST
+	// builder may normalize some shapes.
+	if (astDepth(ast) > EXPR_LIMITS.maxAstDepth) {
+		ctx.error(`${path}.expression`, `AST depth exceeds cap ${EXPR_LIMITS.maxAstDepth}`);
+		return null;
+	}
+	if (astNodeCount(ast) > EXPR_LIMITS.maxAstNodes) {
+		ctx.error(`${path}.expression`, `AST node count exceeds cap ${EXPR_LIMITS.maxAstNodes}`);
+		return null;
+	}
+
+	const references = expectStringArray(ctx, `${path}.references`, obj.references);
+	if (references === null) { return null; }
+	const computed = collectColumnRefs(ast);
+	// Megaudit Theme B (B5, 2026-05-13): compare as sets (with
+	// duplicate guard) rather than ordered list. Non-Quantlab spec
+	// emitters (Python presets, AI codegen, hand-edits) emit
+	// references in alphabetic or insertion order, NOT pre-order. The
+	// daemon recomputes from the AST anyway — order isn't a security
+	// property.
+	const refSet = new Set(references);
+	if (references.length !== refSet.size) {
+		ctx.error(
+			`${path}.references`,
+			`duplicate references not allowed: ${JSON.stringify(references)}`,
+		);
+		return null;
+	}
+	const computedSet = new Set(computed);
+	if (refSet.size !== computedSet.size
+		|| [...refSet].some(r => !computedSet.has(r))) {
+		ctx.error(
+			`${path}.references`,
+			`references ${JSON.stringify([...refSet].sort())} != AST refs ${JSON.stringify([...computedSet].sort())}`,
+		);
+		return null;
+	}
+
+	return { kind: 'expr', as, expression: ast, references };
+}
+
+function validateExprAst(ctx: Ctx, path: string, x: unknown): ExprAst | null {
+	// M3 (megaudit): route through expectObject so the AST node walker
+	// runs the same prototype-pollution own-key guard (`__proto__`,
+	// `constructor`, `prototype`) as the rest of the validator. The
+	// open-coded check this replaces silently allowed those keys.
+	const node = expectObject(ctx, path, x);
+	if (node === null) { return null; }
+	const kind = node.kind;
+	if (typeof kind !== 'string' || !EXPR_AST_KINDS.has(kind as ExprAst['kind'])) {
+		ctx.error(`${path}.kind`, `unknown ExprAst kind: ${JSON.stringify(kind)}`);
+		return null;
+	}
+	switch (kind as ExprAst['kind']) {
+		case 'col': {
+			const name = expectString(ctx, `${path}.name`, node.name);
+			if (name === null) { return null; }
+			return { kind: 'col', name };
+		}
+		case 'num': {
+			const value = expectNumber(ctx, `${path}.value`, node.value);
+			if (value === null) { return null; }
+			// L5: optional source-form preservation.
+			if (node.source === undefined) {
+				return { kind: 'num', value };
+			}
+			const source = expectString(ctx, `${path}.source`, node.source);
+			if (source === null) { return null; }
+			// Codex audit HIGH (2026-05-12): the printer trusts `source`
+			// and the daemon binds `value`. If they diverge — for
+			// example a crafted `{ value: 1, source: 'close' }` — the
+			// form would render "close" while DuckDB would receive `1`,
+			// silently rewriting the user's spec on the next blur.
+			// Defend at the wire boundary: `source` must match the
+			// parser's numeric grammar AND round-trip to the same value.
+			//
+			// Codex second pass MEDIUM (2026-05-13): regex must mirror
+			// the parser's numeric grammar, which accepts leading-dot
+			// decimals (`.5`) via parsePrimary's lookahead. The
+			// previous `^\d+(\.\d+)?(...)$` rejected legitimate
+			// parser output. Allow either `digits.digits?` or `.digits`.
+			if (!/^(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(source)) {
+				ctx.error(`${path}.source`, `numeric source form ${JSON.stringify(source)} is not a numeric literal`);
+				return null;
+			}
+			if (Number(source) !== value) {
+				ctx.error(
+					`${path}.source`,
+					`numeric source form ${JSON.stringify(source)} parses to ${Number(source)}, not ${value}`,
+				);
+				return null;
+			}
+			// Cap the source-form length AFTER format check so a
+			// rejected source is reported with the better diagnostic.
+			if (source.length > 64) {
+				ctx.error(`${path}.source`, `numeric source form exceeds 64 chars: ${source.length}`);
+				return null;
+			}
+			return { kind: 'num', value, source };
+		}
+		case 'str': {
+			const value = expectString(ctx, `${path}.value`, node.value);
+			if (value === null) { return null; }
+			return { kind: 'str', value };
+		}
+		case 'bool': {
+			if (typeof node.value !== 'boolean') {
+				ctx.error(`${path}.value`, `expected boolean, got ${typeofValue(node.value)}`);
+				return null;
+			}
+			return { kind: 'bool', value: node.value };
+		}
+		case 'null':
+			return { kind: 'null' };
+		case 'unary': {
+			const op = node.op;
+			if (typeof op !== 'string' || !UNARY_OPS.has(op as '-' | '!')) {
+				ctx.error(`${path}.op`, `unknown unary op: ${JSON.stringify(op)}`);
+				return null;
+			}
+			const operand = validateExprAst(ctx, `${path}.operand`, node.operand);
+			if (operand === null) { return null; }
+			return { kind: 'unary', op: op as '-' | '!', operand };
+		}
+		case 'binary': {
+			const op = node.op;
+			if (typeof op !== 'string' || !BINARY_OPS.has(op as BinaryOp)) {
+				ctx.error(`${path}.op`, `unknown binary op: ${JSON.stringify(op)}`);
+				return null;
+			}
+			const left = validateExprAst(ctx, `${path}.left`, node.left);
+			const right = validateExprAst(ctx, `${path}.right`, node.right);
+			if (left === null || right === null) { return null; }
+			return { kind: 'binary', op: op as BinaryOp, left, right };
+		}
+		case 'call': {
+			const fn = node.fn;
+			if (typeof fn !== 'string' || !WHITELISTED_FNS.has(fn as WhitelistedFn)) {
+				ctx.error(`${path}.fn`, `unknown function: ${JSON.stringify(fn)}`);
+				return null;
+			}
+			if (!Array.isArray(node.args)) {
+				ctx.error(`${path}.args`, `expected array, got ${typeofValue(node.args)}`);
+				return null;
+			}
+			const arity = FN_ARITY[fn as WhitelistedFn];
+			if (node.args.length < arity.min || node.args.length > arity.max) {
+				ctx.error(
+					`${path}.args`,
+					`function '${fn}' expects ${arity.min === arity.max ? arity.min : `${arity.min}..${arity.max}`} arg(s), got ${node.args.length}`,
+				);
+				return null;
+			}
+			const args: ExprAst[] = [];
+			for (let i = 0; i < node.args.length; i++) {
+				const a = validateExprAst(ctx, `${path}.args[${i}]`, node.args[i]);
+				if (a === null) { return null; }
+				args.push(a);
+			}
+			return { kind: 'call', fn: fn as WhitelistedFn, args };
+		}
+		case 'if': {
+			const cond = validateExprAst(ctx, `${path}.cond`, node.cond);
+			const then_ = validateExprAst(ctx, `${path}.then_`, node.then_);
+			const else_ = validateExprAst(ctx, `${path}.else_`, node.else_);
+			if (cond === null || then_ === null || else_ === null) { return null; }
+			return { kind: 'if', cond, then_, else_ };
+		}
+	}
+}
+
 // --- chart config -------------------------------------------------------------
 
 const CHART_FAMILIES: readonly ChartFamily[] = ['timeseries', 'general'];
@@ -455,6 +751,22 @@ function parseChartConfig(ctx: Ctx, path: string, x: unknown): ChartConfig | nul
 	const encodings = parseEncodings(ctx, `${path}.encodings`, obj.encodings);
 	const options = obj.options !== undefined ? parseChartOptions(ctx, `${path}.options`, obj.options) ?? undefined : undefined;
 	if (encodings === null) { return null; }
+	// Megaudit Theme B (B3, 2026-05-13): the `ohlcv` encoding cluster is
+	// only meaningful for candlestick charts. The validator previously
+	// accepted (a) a `line` chart with stray `ohlcv` encoding (confuses
+	// compiler) and (b) a `candlestick` chart MISSING `ohlcv` (which the
+	// compiler would reject downstream with a less specific message).
+	// Reject both structural mistakes at the wire boundary.
+	if (type === 'candlestick' && encodings.ohlcv === undefined) {
+		ctx.error(`${path}.encodings.ohlcv`,
+			'candlestick chart requires ohlcv encoding cluster');
+		return null;
+	}
+	if (type !== 'candlestick' && encodings.ohlcv !== undefined) {
+		ctx.error(`${path}.encodings.ohlcv`,
+			`ohlcv encoding is only valid for candlestick (got ${type})`);
+		return null;
+	}
 	return { family, type, encodings, options };
 }
 
@@ -534,7 +846,18 @@ function parseOhlcvEncoding(ctx: Ctx, path: string, x: unknown): OhlcvEncoding |
 	const low = expectString(ctx, `${path}.low`, obj.low);
 	const close = expectString(ctx, `${path}.close`, obj.close);
 	if (time === null || open === null || high === null || low === null || close === null) { return null; }
-	return { time, open, high, low, close, volume: optString(ctx, `${path}.volume`, obj.volume) };
+	// Megaudit Theme B (B6, 2026-05-13): optional `volume` was routed
+	// through `optString` which silently returned undefined on a
+	// present-but-wrong-type value (after recording the error). Mirror
+	// the explicit pattern used by other transforms so a wrong type
+	// hard-fails the parse.
+	let volume: string | undefined = undefined;
+	if (obj.volume !== undefined) {
+		const v = expectString(ctx, `${path}.volume`, obj.volume);
+		if (v === null) { return null; }
+		volume = v;
+	}
+	return { time, open, high, low, close, ...(volume !== undefined ? { volume } : {}) };
 }
 
 function parseChartOptions(ctx: Ctx, path: string, x: unknown): ChartOptions | null {
@@ -560,7 +883,30 @@ function parseChartOptions(ctx: Ctx, path: string, x: unknown): ChartOptions | n
 }
 
 const MAX_MARKERS = 256;
-const MARKER_SHAPES = ['arrowUp', 'arrowDown', 'circle', 'square', 'diamond', 'triangle'] as const;
+// Megaudit Theme A (A8, 2026-05-13): tightened to match Marker.shape type
+// in spec.ts. The validator previously accepted 'diamond' and 'triangle'
+// which the type and renderer do not support.
+const MARKER_SHAPES = ['arrowUp', 'arrowDown', 'circle', 'square'] as const;
+
+/** A7 (megaudit): Marker.time is typed `string | number` and the renderer
+ *  needs numeric epoch markers (the obvious case for timeseries). The
+ *  previous validator went through expectString which rejected all
+ *  numeric inputs. */
+function parseMarkerTime(ctx: Ctx, path: string, x: unknown): string | number | null {
+	if (typeof x === 'number') {
+		if (!Number.isFinite(x)) {
+			ctx.error(path, `expected finite number, got ${x}`);
+			return null;
+		}
+		return x;
+	}
+	if (typeof x === 'string') {
+		return expectString(ctx, path, x);
+	}
+	ctx.error(path, `expected string or finite number, got ${typeofValue(x)}`);
+	return null;
+}
+
 function parseMarkers(ctx: Ctx, path: string, x: unknown): ChartOptions['markers'] | null {
 	if (!Array.isArray(x)) {
 		ctx.error(path, `expected array, got ${typeofValue(x)}`);
@@ -574,21 +920,25 @@ function parseMarkers(ctx: Ctx, path: string, x: unknown): ChartOptions['markers
 	for (let i = 0; i < x.length; i++) {
 		const m = expectObject(ctx, `${path}[${i}]`, x[i]);
 		if (!m) { return null; }
-		// Each field optional but type-validated when present.
-		const time = m.time !== undefined ? expectString(ctx, `${path}[${i}].time`, m.time) : undefined;
+		// A6 (megaudit): `time` is REQUIRED. The previous code padded
+		// missing `time` to empty string, which silently placed markers
+		// at empty-string coordinate — a real bug in the renderer.
+		if (m.time === undefined || m.time === null) {
+			ctx.error(`${path}[${i}].time`, 'required');
+			return null;
+		}
+		const time = parseMarkerTime(ctx, `${path}[${i}].time`, m.time);
+		if (time === null) { return null; }
 		const label = m.label !== undefined ? expectString(ctx, `${path}[${i}].label`, m.label) : undefined;
 		const color = m.color !== undefined ? expectString(ctx, `${path}[${i}].color`, m.color) : undefined;
 		const shape = m.shape !== undefined
 			? expectEnum(ctx, `${path}[${i}].shape`, m.shape, MARKER_SHAPES)
 			: undefined;
-		// time has runtime null if expectString failed; we already
-		// emitted ctx.error in that case, so bail.
-		if (m.time !== undefined && time === null) { return null; }
 		if (m.label !== undefined && label === null) { return null; }
 		if (m.color !== undefined && color === null) { return null; }
 		if (m.shape !== undefined && shape === null) { return null; }
 		out.push({
-			time: time ?? '',
+			time,
 			label: label ?? undefined,
 			color: color ?? undefined,
 			shape: (shape ?? undefined) as NonNullable<ChartOptions['markers']>[number]['shape'],
@@ -614,9 +964,23 @@ function parseTradingOptions(ctx: Ctx, path: string, x: unknown): TradingOptions
 function parsePrecision(ctx: Ctx, path: string, x: unknown): { price?: number; quantity?: number } | null {
 	const obj = expectObject(ctx, path, x);
 	if (!obj) { return null; }
+	// Megaudit Theme B (B8, 2026-05-13): precision means a count of
+	// decimal places — must be a non-negative integer in a sane range.
+	// Was: bare expectNumber accepted -1.5, 1e9, etc.
+	const checkPrecision = (label: 'price' | 'quantity'): number | undefined => {
+		const v = obj[label];
+		if (v === undefined) { return undefined; }
+		const n = expectNumber(ctx, `${path}.${label}`, v);
+		if (n === null) { return undefined; }
+		if (!Number.isSafeInteger(n) || n < 0 || n > 18) {
+			ctx.error(`${path}.${label}`, `must be integer in [0, 18], got ${n}`);
+			return undefined;
+		}
+		return n;
+	};
 	return {
-		price: obj.price !== undefined ? expectNumber(ctx, `${path}.price`, obj.price) ?? undefined : undefined,
-		quantity: obj.quantity !== undefined ? expectNumber(ctx, `${path}.quantity`, obj.quantity) ?? undefined : undefined,
+		price: checkPrecision('price'),
+		quantity: checkPrecision('quantity'),
 	};
 }
 
@@ -630,6 +994,15 @@ function parseProvenance(ctx: Ctx, path: string, x: unknown): Provenance | null 
 	if (generatedAt === null || generator === null || queryHash === null || !tv) { return null; }
 	if (typeof tv.qviz_schema !== 'number') {
 		ctx.error(`${path}.tool_versions.qviz_schema`, `expected number, got ${typeofValue(tv.qviz_schema)}`);
+		return null;
+	}
+	// Megaudit Theme B (B4, 2026-05-13): tool_versions.qviz_schema must
+	// MATCH the top-level qviz_version. The top-level was already gated
+	// but its duplicate in tool_versions wasn't, so a spec could
+	// silently round-trip with mismatched attribution.
+	if (tv.qviz_schema !== QVIZ_SCHEMA_VERSION) {
+		ctx.error(`${path}.tool_versions.qviz_schema`,
+			`expected ${QVIZ_SCHEMA_VERSION}, got ${JSON.stringify(tv.qviz_schema)}`);
 		return null;
 	}
 	// Megaudit-2 A3-MINOR-10: tool_versions extra keys must be

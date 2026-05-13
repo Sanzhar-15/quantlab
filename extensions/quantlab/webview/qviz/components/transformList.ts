@@ -44,7 +44,7 @@ import {
  *  `resample` excluded -- Step C cleanup gates it in the validator. */
 const ALL_KINDS: readonly TransformKind[] = [
 	'filter', 'date_trunc', 'bin', 'groupby', 'aggregate',
-	'window', 'math', 'tz_convert', 'sort', 'limit',
+	'window', 'math', 'tz_convert', 'sort', 'limit', 'expr',
 ];
 
 export function mountTransformList(root: HTMLElement, store: QvizStore): { dispose(): void } {
@@ -85,7 +85,19 @@ export function mountTransformList(root: HTMLElement, store: QvizStore): { dispo
 			}
 			btn.addEventListener('click', () => {
 				closeMenu();
-				const newT = defaultTransformOfKind(kind);
+				// L4 (megaudit): the default `as` for kinds that produce
+				// a column is uniquified against the names already in
+				// use, so back-to-back `+ Add` for the same kind doesn't
+				// collide.
+				const reserved = new Set<string>([
+					...(state.schema.info?.columns ?? []).map(c => c.name),
+				]);
+				const producedSoFar: string[] = [];
+				for (const t of (state.spec.current?.transforms ?? [])) {
+					collectProducedNames(t, producedSoFar);
+				}
+				for (const n of producedSoFar) { reserved.add(n); }
+				const newT = defaultTransformOfKind(kind, reserved);
 				const next = state.spec.current?.transforms.length ?? 0;
 				store.dispatch({ type: 'upsertTransform', index: next, transform: newT });
 				// Auto-open the editor on the new transform.
@@ -124,12 +136,15 @@ export function mountTransformList(root: HTMLElement, store: QvizStore): { dispo
 
 	// Per-card form handles, keyed by index. Forms are leaked between
 	// renders if not disposed; the card-list rebuild below disposes
-	// them all and remounts.
-	const formHandles = new Map<number, TransformFormHandle>();
+	// them all and remounts. We also track the transform kind the
+	// handle was built for, so M7's preserve-across-render path can
+	// detect when the kind changed and force a remount.
+	type HandleEntry = { handle: TransformFormHandle; kind: TransformKind };
+	const formHandles = new Map<number, HandleEntry>();
 
 	const disposeForms = (): void => {
-		for (const h of formHandles.values()) {
-			try { h.dispose(); } catch (e) {
+		for (const entry of formHandles.values()) {
+			try { entry.handle.dispose(); } catch (e) {
 				// Megaudit M-13: don't silently swallow. CLAUDE.md
 				// system-boundary exception: cleanup-loop errors log
 				// individually but must NOT abort the loop.
@@ -173,7 +188,29 @@ export function mountTransformList(root: HTMLElement, store: QvizStore): { dispo
 		lastChartType = chartType;
 		lastCapabilitiesHash = capHash;
 
-		disposeForms();
+		// M7 (megaudit): preserve the editing card's form handle across
+		// renders when it supports in-place update() AND the kind hasn't
+		// changed. This keeps the textarea / focus / cursor stable when
+		// the user is mid-typing in (e.g.) an expr form. Forms without
+		// update() get the legacy dispose-and-remount path.
+		const preserveIdx = editingIndex;
+		const preservedEntry = preserveIdx !== null
+			? formHandles.get(preserveIdx) ?? null
+			: null;
+		const newKindAtPreserveIdx = preserveIdx !== null && transforms[preserveIdx]
+			? transforms[preserveIdx].kind : null;
+		const canPreserve = preservedEntry !== null
+			&& typeof preservedEntry.handle.update === 'function'
+			&& preservedEntry.kind === newKindAtPreserveIdx;
+
+		// Dispose every handle EXCEPT the preserved one.
+		for (const [idx, entry] of formHandles.entries()) {
+			if (canPreserve && idx === preserveIdx) { continue; }
+			try { entry.handle.dispose(); } catch (e) {
+				console.warn('qviz transformList: form dispose threw:', e);
+			}
+			formHandles.delete(idx);
+		}
 		cardsList.innerHTML = '';
 
 		const pipelineErrors = validatePipeline(transforms);
@@ -239,22 +276,31 @@ export function mountTransformList(root: HTMLElement, store: QvizStore): { dispo
 					columns: state.schema.info?.columns ?? [],
 					availableProducedNames: [...producedNames],
 				};
-				// Type erasure here is unavoidable (factories are
-				// per-kind); the card's `t` matches the registry.
-				const factory = FORM_BY_KIND[t.kind] as (
-					t: Transform,
-					ctx: {
-						columns: ReadonlyArray<{ name: string; dtype: string; nullable: boolean }>;
-						availableProducedNames: readonly string[];
-					},
-					on: (n: Transform) => void,
-				) => TransformFormHandle;
-				const handle = factory(t, formCtx, (next) => {
-					store.dispatch({ type: 'upsertTransform', index: i, transform: next });
-				});
-				formContainer.appendChild(handle.root);
-				card.appendChild(formContainer);
-				formHandles.set(i, handle);
+				// M7: reuse the preserved handle if it's still valid.
+				if (canPreserve && preservedEntry !== null && preserveIdx === i) {
+					formContainer.appendChild(preservedEntry.handle.root);
+					card.appendChild(formContainer);
+					formHandles.set(i, preservedEntry);
+					// In-place state refresh: textarea, focus, cursor preserved.
+					preservedEntry.handle.update?.(t, formCtx);
+				} else {
+					// Type erasure here is unavoidable (factories are
+					// per-kind); the card's `t` matches the registry.
+					const factory = FORM_BY_KIND[t.kind] as (
+						t: Transform,
+						ctx: {
+							columns: ReadonlyArray<{ name: string; dtype: string; nullable: boolean }>;
+							availableProducedNames: readonly string[];
+						},
+						on: (n: Transform) => void,
+					) => TransformFormHandle;
+					const handle = factory(t, formCtx, (next) => {
+						store.dispatch({ type: 'upsertTransform', index: i, transform: next });
+					});
+					formContainer.appendChild(handle.root);
+					card.appendChild(formContainer);
+					formHandles.set(i, { handle, kind: t.kind });
+				}
 			}
 
 			cardsList.appendChild(card);
@@ -325,8 +371,17 @@ function applyHistogramPreset(store: QvizStore): void {
 		binColumn = numCol?.name ?? '';
 	}
 	if (binColumn.length === 0) {
-		alert('Histogram preset needs a column. Assign a numeric column to X first, '
-			+ 'or open a dataset that has numeric columns.');
+		// Megaudit Theme D (D15, 2026-05-13): console + announcer
+		// instead of alert(). alert() is a blocking modal that doesn't
+		// theme with VS Code and breaks SR users.
+		const msg = 'Histogram preset needs a column. Assign a numeric column to X first, '
+			+ 'or open a dataset that has numeric columns.';
+		console.warn('[qviz histogram preset] ' + msg);
+		// Megaudit D3 (2026-05-13): a local preset failure is a UI-side
+		// protocol error from the inspector's perspective (not a daemon
+		// response). Tag as 'protocol' so it's classified as terminal
+		// (no Retry button) and surfaced consistently in the placeholder.
+		store.dispatch({ type: 'inspectorError', error: msg, errorKind: 'protocol' });
 		return;
 	}
 	// Megaudit M-8: gate on capabilities. If the daemon doesn't
@@ -337,7 +392,9 @@ function applyHistogramPreset(store: QvizStore): void {
 		const required = ['bin', 'groupby', 'aggregate'];
 		const missing = required.filter(k => !caps.transformKinds.includes(k));
 		if (missing.length > 0) {
-			alert(`Histogram preset needs daemon support for: ${missing.join(', ')}.`);
+			const msg = `Histogram preset needs daemon support for: ${missing.join(', ')}.`;
+			console.warn('[qviz histogram preset] ' + msg);
+			store.dispatch({ type: 'inspectorError', error: msg, errorKind: 'protocol' });
 			return;
 		}
 	}
@@ -387,6 +444,7 @@ function collectProducedNames(t: Transform, out: string[]): void {
 		case 'bin':
 		case 'window':
 		case 'math':
+		case 'expr':
 			out.push(t.as);
 			return;
 		case 'aggregate':

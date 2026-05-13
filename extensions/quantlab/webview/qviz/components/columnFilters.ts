@@ -120,6 +120,13 @@ export function mountColumnFilter(
 		button.setAttribute('aria-expanded', 'false');
 	};
 
+	// Megaudit Theme D (D7, 2026-05-13): track any debounce timers
+	// scheduled inside this popup so the cleanup hook can cancel them.
+	// Without this, typing in the text-filter input + closing the popup
+	// within 300ms would still fire a dispatch the user thought they
+	// cancelled.
+	const pendingDebounces: Array<ReturnType<typeof setTimeout>> = [];
+
 	const renderPopupBody = (
 		popupEl: HTMLElement, stats: ColumnStats, current: InspectorFilter | undefined,
 	): void => {
@@ -215,6 +222,9 @@ export function mountColumnFilter(
 			input.addEventListener('input', () => {
 				if (debounce !== null) { clearTimeout(debounce); }
 				debounce = setTimeout(() => {
+					// D7: pop from pendingDebounces once fired.
+					const idx = pendingDebounces.indexOf(debounce!);
+					if (idx >= 0) { pendingDebounces.splice(idx, 1); }
 					const v = input.value;
 					if (v.length === 0) {
 						dispatchFilter(null);
@@ -222,6 +232,7 @@ export function mountColumnFilter(
 						dispatchFilter({ kind: 'text', column, contains: v });
 					}
 				}, 300);
+				pendingDebounces.push(debounce);
 			});
 			wrap.appendChild(input);
 			popupEl.appendChild(wrap);
@@ -232,38 +243,48 @@ export function mountColumnFilter(
 		const wrap = document.createElement('div');
 		wrap.className = 'qviz-col-filter-set';
 		const distinct = stats.distinct ?? [];
-		const currentSet = new Set<string | number | boolean>(
-			current?.kind === 'set' ? current.includes : distinct as (string | number | boolean)[],
+		// Megaudit D8 (2026-05-13): the set carries `null` directly
+		// (not the literal string `"null"`) so unchecking everything
+		// except `(null)` correctly filters to SQL-NULL rows. The
+		// previous `String(v)` coercion turned `null` into the string
+		// `"null"`, which the daemon then matched against literal
+		// string columns — silently wrong.
+		type SetValue = string | number | boolean | null;
+		const isSetValue = (v: unknown): v is SetValue =>
+			v === null
+			|| typeof v === 'string'
+			|| typeof v === 'number'
+			|| typeof v === 'boolean';
+		const distinctValues: SetValue[] = distinct.filter(isSetValue);
+		const currentSet = new Set<SetValue>(
+			current?.kind === 'set'
+				? (current.includes as readonly SetValue[])
+				: distinctValues,
 		);
-		const startWithAllChecked = current?.kind !== 'set';
-		if (startWithAllChecked) {
-			currentSet.clear();
-			for (const v of distinct) {
-				if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
-					currentSet.add(v);
-				}
-			}
-		}
 		const updateFilter = (): void => {
-			const arr = Array.from(currentSet);
-			if (arr.length === distinct.length) {
+			const arr: SetValue[] = Array.from(currentSet);
+			if (arr.length === distinctValues.length) {
 				// All checked == no filter; clear.
 				dispatchFilter(null);
 			} else {
 				dispatchFilter({ kind: 'set', column, includes: arr });
 			}
 		};
-		for (const v of distinct) {
-			const id = `qviz-filter-${column}-${String(v)}`;
+		// Megaudit D8 (2026-05-13): DOM ids use the row index to avoid
+		// the `null` / `"null"` collision the previous `String(v)`
+		// scheme would produce when a column had both real-NULL rows
+		// and literal-string `"null"` rows.
+		for (let idx = 0; idx < distinctValues.length; idx++) {
+			const v = distinctValues[idx];
+			const id = `qviz-filter-${column}-${idx}`;
 			const row = document.createElement('label');
 			row.className = 'qviz-col-filter-set-row';
 			const cb = document.createElement('input');
 			cb.type = 'checkbox';
 			cb.id = id;
-			const scalar = (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') ? v : String(v);
-			cb.checked = currentSet.has(scalar);
+			cb.checked = currentSet.has(v);
 			cb.addEventListener('change', () => {
-				if (cb.checked) { currentSet.add(scalar); } else { currentSet.delete(scalar); }
+				if (cb.checked) { currentSet.add(v); } else { currentSet.delete(v); }
 				updateFilter();
 			});
 			const labelText = document.createElement('span');
@@ -368,6 +389,10 @@ export function mountColumnFilter(
 			off();
 			document.removeEventListener('mousedown', onDocClick, true);
 			popupEl.removeEventListener('keydown', onPopupKey);
+			// D7 (megaudit): clear any pending debounce so a cancelled
+			// popup doesn't fire a dispatch after teardown.
+			for (const t of pendingDebounces) { clearTimeout(t); }
+			pendingDebounces.length = 0;
 		};
 	};
 

@@ -57,9 +57,24 @@ def resolve_workspace_path(workspace_root: str | Path, requested: str) -> Path:
       5. Confirm the file exists and has an allowlisted extension.
 
     Raises SecurityError on any violation.
+
+    Megaudit Theme C (C6, 2026-05-13): caller MUST treat this as a
+    POINT-IN-TIME check. Path can change between this resolution and a
+    later open (TOCTOU). Where security matters (read_parquet, schema
+    fetch), call `verify_path_identity(path)` immediately before each
+    open to confirm the path's inode/dev hasn't been swapped under us.
     """
     if not requested:
         raise SecurityError("path: must not be empty")
+
+    # C6 (megaudit): hard byte caps on the requested path and its
+    # segments. The realpath call below tolerates long inputs but
+    # downstream filesystem APIs differ by OS.
+    MAX_PATH_BYTES = 4096
+    MAX_SEGMENT_BYTES = 255
+    encoded = requested.encode("utf-8", errors="strict")
+    if len(encoded) > MAX_PATH_BYTES:
+        raise SecurityError(f"path: byte length {len(encoded)} exceeds cap {MAX_PATH_BYTES}")
 
     if requested.startswith("/") or requested.startswith("\\") or (len(requested) >= 2 and requested[1] == ":"):
         raise SecurityError(f"path: must be workspace-relative, not absolute: {requested!r}")
@@ -67,6 +82,11 @@ def resolve_workspace_path(workspace_root: str | Path, requested: str) -> Path:
     parts = requested.replace("\\", "/").split("/")
     if ".." in parts:
         raise SecurityError(f"path: must not contain '..' segments: {requested!r}")
+    for seg in parts:
+        if len(seg.encode("utf-8", errors="strict")) > MAX_SEGMENT_BYTES:
+            raise SecurityError(
+                f"path: segment {seg!r} byte length exceeds cap {MAX_SEGMENT_BYTES}"
+            )
 
     root_resolved = Path(workspace_root).resolve(strict=True)
     candidate = (root_resolved / requested).resolve(strict=False)
@@ -118,6 +138,8 @@ class MemoryLimitError(Exception):
 def query_budget(
     timeout_s: float = DEFAULT_TIMEOUT_S,
     peak_rss_mb: int = DEFAULT_PEAK_RSS_MB,
+    *,
+    conn: object | None = None,
 ) -> Iterator[dict]:
     """Bound a query's wallclock and peak RSS.
 
@@ -133,6 +155,15 @@ def query_budget(
     Note: macOS getrusage returns ru_maxrss in BYTES; Linux returns KILOBYTES.
     We normalize to MB.
 
+    Megaudit Theme C (C3, 2026-05-13): the optional `conn` parameter is
+    the active DuckDB connection for this request. When supplied, the
+    watchdog ALSO calls `conn.interrupt()` on timeout, which terminates
+    DuckDB queries that are blocked inside C-level code where Python's
+    KeyboardInterrupt-via-SIGINT can't reach. We do NOT use
+    `SET memory_limit` because that's connection-global, and the
+    daemon's `self.conn` is shared across all requests; mid-query
+    interrupt is the correct lever.
+
     Yields a dict where the executor can place metadata (e.g., 'cancelled': True
     if a cancel was received via another channel).
     """
@@ -144,7 +175,21 @@ def query_budget(
     rss_before = _peak_rss_mb()
     state = {"cancelled": False}
 
-    timer = threading.Timer(timeout_s, _interrupt_main_thread)
+    def _on_timeout() -> None:
+        # C3 (megaudit): DuckDB-level cancel runs FIRST so blocked
+        # C-level queries get cut; SIGINT runs second to interrupt the
+        # Python main thread at the next bytecode boundary.
+        if conn is not None:
+            try:
+                conn.interrupt()  # type: ignore[attr-defined]
+            except Exception as e:
+                # The conn may not support interrupt() (test stubs, etc.)
+                # — surface the failure but proceed to SIGINT path.
+                import sys
+                print(f"[qviz security] conn.interrupt() raised: {e!r}", file=sys.stderr)
+        _interrupt_main_thread()
+
+    timer = threading.Timer(timeout_s, _on_timeout)
     timer.daemon = True
     timer.start()
     started_at = time.perf_counter()
@@ -194,3 +239,69 @@ def _interrupt_main_thread() -> None:
     else:
         import _thread
         _thread.interrupt_main()
+
+
+# ---------------------------------------------------------------------------
+# Spec-level caps (Megaudit Theme C C2, 2026-05-13)
+# ---------------------------------------------------------------------------
+#
+# Enforced BEFORE `compile_spec` so a hostile spec with an enormous IN
+# list / 1000 transforms can't generate huge SQL strings + param arrays
+# outside the query_budget timeout/memory accounting.
+
+SPEC_CAPS = {
+    "max_transforms": 64,           # 5-10 is typical; 64 is generous
+    "max_aggregates_per_transform": 32,
+    "max_sort_columns": 8,
+    "max_filter_in_values": 1024,   # matches FilterTransform IN-list bound
+    "max_groupby_columns": 16,
+}
+
+
+def enforce_spec_caps(spec: dict) -> None:
+    """Reject specs that would generate huge SQL/params before any
+    compile work runs. Raises SecurityError with a structured message
+    naming the offending field.
+    """
+    if not isinstance(spec, dict):
+        raise SecurityError(f"spec must be dict, got {type(spec).__name__}")
+    transforms = spec.get("transforms", []) or []
+    if not isinstance(transforms, list):
+        raise SecurityError("spec.transforms must be a list")
+    if len(transforms) > SPEC_CAPS["max_transforms"]:
+        raise SecurityError(
+            f"spec.transforms length {len(transforms)} exceeds cap "
+            f"{SPEC_CAPS['max_transforms']}"
+        )
+    for i, t in enumerate(transforms):
+        if not isinstance(t, dict):
+            continue  # validator + compiler will reject
+        kind = t.get("kind")
+        if kind == "filter" and t.get("op") in ("in", "not_in"):
+            value = t.get("value")
+            if isinstance(value, list) and len(value) > SPEC_CAPS["max_filter_in_values"]:
+                raise SecurityError(
+                    f"transforms[{i}].value IN-list length {len(value)} "
+                    f"exceeds cap {SPEC_CAPS['max_filter_in_values']}"
+                )
+        elif kind == "aggregate":
+            aggs = t.get("aggs", [])
+            if isinstance(aggs, list) and len(aggs) > SPEC_CAPS["max_aggregates_per_transform"]:
+                raise SecurityError(
+                    f"transforms[{i}].aggs length {len(aggs)} "
+                    f"exceeds cap {SPEC_CAPS['max_aggregates_per_transform']}"
+                )
+        elif kind == "sort":
+            cols = t.get("columns", [])
+            if isinstance(cols, list) and len(cols) > SPEC_CAPS["max_sort_columns"]:
+                raise SecurityError(
+                    f"transforms[{i}].columns length {len(cols)} "
+                    f"exceeds cap {SPEC_CAPS['max_sort_columns']}"
+                )
+        elif kind == "groupby":
+            cols = t.get("columns", [])
+            if isinstance(cols, list) and len(cols) > SPEC_CAPS["max_groupby_columns"]:
+                raise SecurityError(
+                    f"transforms[{i}].columns length {len(cols)} "
+                    f"exceeds cap {SPEC_CAPS['max_groupby_columns']}"
+                )

@@ -112,6 +112,68 @@ suite('DaemonLifecycle -- option validation', () => {
 		assert.strictEqual(a, b, 'concurrent dispose must share the same promise');
 	});
 
+	// Megaudit E8 (2026-05-13): `disposing` transient between
+	// dispose() invocation and the terminal `unavailable` transition.
+	// Per opus audit (2026-05-13) the transition lives inside the
+	// IIFE (microtask-fast, not strictly synchronous) so a throwing
+	// status handler cannot strand teardown by leaving disposePromise
+	// null. The full ordering is asserted via `await p` then log.
+	test('E8: dispose() emits disposing before unavailable', async () => {
+		const lc = new DaemonLifecycle({
+			...DEFAULT_DAEMON_LIFECYCLE_OPTIONS,
+			workspaceRoot: '/tmp', pythonPath: '/usr/bin/python3',
+		});
+		const log = recordStatus(lc);
+		await lc.dispose();
+		const kinds = log.map(s => s.kind);
+		const iDisposing = kinds.indexOf('disposing');
+		const iUnavailable = kinds.indexOf('unavailable');
+		assert.ok(iDisposing >= 0,
+			`expected 'disposing' in status log; got ${kinds.join(',')}`);
+		assert.ok(iUnavailable >= 0,
+			`expected 'unavailable' in status log; got ${kinds.join(',')}`);
+		assert.ok(iDisposing < iUnavailable,
+			`'disposing' must precede 'unavailable'; got ${kinds.join(',')}`);
+	});
+
+	test('E8: getStatus() returns disposing synchronously during the grace window', async () => {
+		const lc = new DaemonLifecycle({
+			...DEFAULT_DAEMON_LIFECYCLE_OPTIONS,
+			workspaceRoot: '/tmp', pythonPath: '/usr/bin/python3',
+		});
+		const p = lc.dispose();
+		// The `disposing` transition is SYNC (right after disposePromise
+		// is assigned), so getStatus() reports it without any await.
+		assert.strictEqual(lc.getStatus().kind, 'disposing');
+		await p;
+		// After teardown, status is `unavailable`.
+		assert.strictEqual(lc.getStatus().kind, 'unavailable');
+	});
+
+	test('E8 opus audit: throwing status handler does not strand teardown', async () => {
+		// If a status handler throws on the `disposing` transition,
+		// the disposePromise must still resolve teardown (cancelRetry,
+		// transition to unavailable, reject waiters). Without this
+		// invariant the lifecycle wedges, leaking the child process.
+		const lc = new DaemonLifecycle({
+			...DEFAULT_DAEMON_LIFECYCLE_OPTIONS,
+			workspaceRoot: '/tmp', pythonPath: '/usr/bin/python3',
+		});
+		const seen: string[] = [];
+		lc.onStatusChange(s => {
+			seen.push(s.kind);
+			if (s.kind === 'disposing') {
+				throw new Error('handler synthetic');
+			}
+		});
+		await assert.rejects(lc.dispose(), /synthetic/);
+		// Even though the handler threw on `disposing`, the unavailable
+		// transition fired (visible to subsequent subscribers via
+		// getStatus). The lifecycle is fully torn down, not stranded.
+		assert.strictEqual(lc.getStatus().kind, 'unavailable',
+			`teardown must complete despite handler throw; got ${seen.join(',')}`);
+	});
+
 });
 
 suite('DaemonLifecycle -- happy path', () => {

@@ -98,6 +98,14 @@ export type LifecycleStatus =
 		readonly attemptNumber: number;
 		readonly lastError: string;
 	}
+	/** Megaudit E8 (2026-05-13): a synchronous transient state emitted
+	 *  the moment `dispose()` is called, BEFORE awaiting
+	 *  `client.dispose()`. Subscribers (banner + provider replay) see
+	 *  this immediately and stop showing the stale `ready` state. The
+	 *  terminal transition to `unavailable` still happens AFTER the
+	 *  client teardown resolves so MAJOR-29's port-conflict guard
+	 *  (respawn handlers wait for `unavailable`) is preserved. */
+	| { readonly kind: 'disposing'; readonly reason: string }
 	/** maxAttempts exhausted, OR an explicit dispose ran. Subsequent
 	 *  `getClient()` calls reject with DaemonUnavailableError. */
 	| { readonly kind: 'unavailable'; readonly error: string };
@@ -279,9 +287,31 @@ export class DaemonLifecycle {
 	dispose(): Promise<void> {
 		if (this.disposePromise !== null) { return this.disposePromise; }
 		this.disposed = true;
+		// Megaudit E8 (2026-05-13): emit `disposing` SYNCHRONOUSLY
+		// before awaiting client teardown so subscribers stop seeing
+		// `ready` immediately. The terminal `unavailable` transition
+		// still happens AFTER `await client.dispose()` so MAJOR-29
+		// (port-conflict on premature respawn) is preserved.
+		//
+		// E8 opus audit (2026-05-13): assign `disposePromise` BEFORE
+		// the sync `disposing` transition. If a status handler throws
+		// during `transition('disposing')`, the throw propagates out
+		// of `dispose()` to the caller — but the IIFE has already
+		// been scheduled, so cancelRetry / client.dispose() /
+		// transition('unavailable') / waiter rejection still run.
+		// Without this ordering a throwing handler would leave
+		// `disposePromise === null` and strand the lifecycle (child
+		// process leaked, subsequent `dispose()` re-enters and
+		// re-throws). A caller's sync throw is acceptable; a leaked
+		// child is not.
+		const reason = 'lifecycle disposed';
 		this.disposePromise = (async () => {
+			// Microtask boundary first so the no-client case (no
+			// `await client.dispose()` to suspend on) doesn't run
+			// `transition('unavailable')` synchronously inside the
+			// IIFE, collapsing the disposing→unavailable distinction.
+			await Promise.resolve();
 			this.cancelRetry();
-			const reason = 'lifecycle disposed';
 			// Megaudit MAJOR-29: dispose the live client BEFORE
 			// transitioning to `unavailable`. The prior order
 			// (transition → dispose) left a brief window where status
@@ -301,6 +331,18 @@ export class DaemonLifecycle {
 				w.reject(err);
 			}
 		})();
+		// Sync `disposing` transition — wrapped so a throwing status
+		// handler propagates via the returned promise (callers can
+		// `await dispose()` and observe it) WITHOUT skipping the
+		// teardown the IIFE above is about to run. Without the
+		// try/catch the sync throw would propagate from `dispose()`
+		// itself, leaving the caller's `await lc.dispose()` to never
+		// see the rejection.
+		try {
+			this.transition({ kind: 'disposing', reason });
+		} catch (e) {
+			this.disposePromise = this.disposePromise.then(() => { throw e; });
+		}
 		return this.disposePromise;
 	}
 

@@ -97,8 +97,9 @@ export function detectDrift(spec: QvizSpec, currentSchema: SchemaInfo): DriftRes
  *   - OhlcvEncoding members (time, open, high, low, close, volume).
  *   - Transform inputs: filter.column, date_trunc.column, bin.column,
  *     groupby.columns, aggregate.aggs[*].column, window.column,
- *     math.column, resample.time_column, tz_convert.column,
- *     sort.columns[*].column.
+ *     window.order_by, math.column, math.order_by (when defined),
+ *     resample.time_column, tz_convert.column, sort.columns[*].column,
+ *     expr.references[*].
  *
  * Does NOT include transform OUTPUT names (`as`) because those are
  * synthesized by the transform itself and only become live after the
@@ -195,13 +196,22 @@ function walkTransformReferences(
 			return;
 		}
 		case 'window': {
+			// Megaudit F4 (2026-05-13): post-Theme-A `order_by` is
+			// now required on WindowTransform; drift analysis must
+			// flag specs that lose the order column upstream, not
+			// just the data column.
 			const f: WindowTransform = t;
 			referenced.push(f.column);
+			referenced.push(f.order_by);
 			return;
 		}
 		case 'math': {
+			// MathTransform.order_by is required for `log_returns`,
+			// `pct_change`, `drawdown`; optional for row-local fns
+			// (`log`, `exp`, etc.). Push only when present.
 			const f: MathTransform = t;
 			referenced.push(f.column);
+			if (f.order_by !== undefined) { referenced.push(f.order_by); }
 			return;
 		}
 		case 'resample': {
@@ -223,6 +233,11 @@ function walkTransformReferences(
 			// limit references no fields.
 			return;
 		}
+		case 'expr': {
+			// Visualise v2 expr: references the column set captured during parse.
+			for (const c of t.references) { referenced.push(c); }
+			return;
+		}
 		default:
 			assertNeverTransform(t);
 	}
@@ -234,6 +249,7 @@ function registerProducedNames(t: Transform, produced: Set<string>): void {
 		case 'bin':
 		case 'window':
 		case 'math':
+		case 'expr':
 			produced.add(t.as);
 			return;
 		case 'aggregate':

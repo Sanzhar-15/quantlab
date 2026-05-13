@@ -52,3 +52,10 @@ product.json.backup*
 /Charts/**/dist/
 /Charts/**/.turbo/
 /.plans/
+
+# Megaudit audit transcripts — ephemeral, large, regenerated per session
+/.audits/
+extensions/quantlab/.audits/
+
+# Auto-saved session transcripts dropped at repo / extension root
+2026-*-*-*-*-*.txt

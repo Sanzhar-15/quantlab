@@ -1163,4 +1163,69 @@ suite('VisualiseSpecProvider -- specHasAggregateTransforms (B-10 cure)', () => {
 		});
 		assert.strictEqual(specHasAggregateTransforms(spec), true);
 	});
+
+	// H3 (megaudit, 2026-05-12): non-aggregate transforms that produce
+	// new columns also require applySpecTransforms — otherwise the
+	// inspector queries raw parquet and can't see/filter the calculated
+	// column.
+
+	test('H3: expr-only pipeline returns true (calculated column case)', () => {
+		const spec = makeSpec({
+			transforms: [
+				{
+					kind: 'expr',
+					as: 'mid',
+					expression: {
+						kind: 'binary', op: '+',
+						left: { kind: 'col', name: 'high' },
+						right: { kind: 'col', name: 'low' },
+					},
+					references: ['high', 'low'],
+				},
+			],
+		});
+		assert.strictEqual(specHasAggregateTransforms(spec), true);
+	});
+
+	test('H3: window-only pipeline returns true', () => {
+		const spec = makeSpec({
+			transforms: [
+				{ kind: 'window', column: 'close', fn: 'rolling_mean', window: 20, order_by: 'timestamp', as: 'sma20' },
+			],
+		});
+		assert.strictEqual(specHasAggregateTransforms(spec), true);
+	});
+
+	test('H3: math-only pipeline returns true', () => {
+		const spec = makeSpec({
+			transforms: [
+				{ kind: 'math', column: 'close', fn: 'log_returns', order_by: 'timestamp', as: 'r' },
+			],
+		});
+		assert.strictEqual(specHasAggregateTransforms(spec), true);
+	});
+
+	test('H3: date_trunc, bin, tz_convert-with-as all return true', () => {
+		for (const t of [
+			{ kind: 'date_trunc', column: 'ts', unit: 'day', as: 'day' } as const,
+			{ kind: 'bin', column: 'close', n_bins: 20, as: 'bin' } as const,
+			{ kind: 'tz_convert', column: 'ts', to_tz: 'UTC', as: 'ts_utc' } as const,
+		]) {
+			assert.strictEqual(
+				specHasAggregateTransforms(makeSpec({ transforms: [t] })),
+				true,
+				`${t.kind} must trigger applySpecTransforms`,
+			);
+		}
+	});
+
+	test('H3: tz_convert WITHOUT `as` (in-place replacement) does NOT add a column → still false alone', () => {
+		const spec = makeSpec({
+			transforms: [
+				{ kind: 'tz_convert', column: 'ts', to_tz: 'UTC' },
+				{ kind: 'sort', columns: [{ column: 'ts', desc: false }] },
+			],
+		});
+		assert.strictEqual(specHasAggregateTransforms(spec), false);
+	});
 });

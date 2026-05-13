@@ -116,7 +116,12 @@ export function buildDraftSpecForDataset(
 		provenance: {
 			generator: 'manual',
 			generated_at: new Date().toISOString(),
-			query_hash: '',
+			// Megaudit Theme G (G14, 2026-05-13): use the canonical zero
+			// sentinel (matches defaults.ts / persist.ts emitters). The
+			// previous '' was asymmetric with every other emitter and a
+			// future regex tightening on query_hash would silently break
+			// drafts.
+			query_hash: 'sha256:' + '0'.repeat(64),
 			tool_versions: { qviz_schema: QVIZ_SCHEMA_VERSION },
 			source: 'user-built',
 		},

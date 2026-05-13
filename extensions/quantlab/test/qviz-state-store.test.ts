@@ -1085,7 +1085,10 @@ void _USES_ACTION_TYPE;
 // Phase 6 — inspector slice
 // ---------------------------------------------------------------------------
 
-import { hashFilters, INITIAL_INSPECTOR_STATE } from '../webview/qviz/state/inspectorState';
+import {
+	hashFilters, INITIAL_INSPECTOR_STATE,
+	reduceInspector, type InspectorState,
+} from '../webview/qviz/state/inspectorState';
 import type { ColumnStats, InspectorFilter } from '../src/qviz/messageProtocol';
 
 function inspectorOf(state: RootState) {
@@ -1215,8 +1218,107 @@ suite('qviz state -- inspector slice (Phase 6)', () => {
 			type: 'inspectorDataReceived',
 			arrow: new Uint8Array([1]), offset: 0, n: 1, elapsedMs: 1,
 		});
-		const erred = rootReduce(seeded, { type: 'inspectorError', error: 'daemon timeout' });
+		const erred = rootReduce(seeded, {
+			type: 'inspectorError',
+			error: 'daemon timeout',
+			errorKind: 'timeout',
+		});
 		assert.strictEqual(inspectorOf(erred).window, null);
+		assert.strictEqual(inspectorOf(erred).lastError, 'daemon timeout');
+		assert.strictEqual(inspectorOf(erred).lastErrorKind, 'timeout');
+	});
+
+	// Megaudit D3 (2026-05-13): each inspector kind round-trips through
+	// the reducer so a future refactor that drops one arm fails here.
+	// Audit revision: 'compile' is now in the union (op_preview path
+	// compile errors) — covered too.
+	test('inspectorError persists every InspectorErrorKind value', () => {
+		const kinds = [
+			'security', 'timeout', 'memory', 'internal', 'protocol', 'compile',
+		] as const;
+		for (const k of kinds) {
+			const s = rootReduce(withInitialSpec(), {
+				type: 'inspectorError', error: 'x', errorKind: k,
+			});
+			assert.strictEqual(inspectorOf(s).lastErrorKind, k,
+				`kind ${k} must survive the reducer`);
+		}
+	});
+
+	test('retryInspectorFetch clears both lastError and lastErrorKind, preserves filters', () => {
+		const s0 = withInitialSpec();
+		const filtered = rootReduce(s0, {
+			type: 'setColumnFilter',
+			column: 'volume',
+			filter: { kind: 'range', column: 'volume', min: 0, max: 100 },
+		});
+		const erred = rootReduce(filtered, {
+			type: 'inspectorError', error: 'oom', errorKind: 'memory',
+		});
+		const retried = rootReduce(erred, { type: 'retryInspectorFetch' });
+		assert.strictEqual(inspectorOf(retried).lastError, null);
+		assert.strictEqual(inspectorOf(retried).lastErrorKind, null);
+		assert.ok(inspectorOf(retried).filters.volume !== undefined,
+			'filters must survive retry — that was the D4 bug');
+	});
+
+	// Megaudit D3 audit (2026-05-13): every action that nulls lastError
+	// must also null lastErrorKind. Each test seeds an error then
+	// dispatches the resetting action; if a future refactor drops
+	// one of the kind-resets, the corresponding test fails.
+	test('setColumnFilter (add) clears lastErrorKind', () => {
+		const seeded = rootReduce(withInitialSpec(), {
+			type: 'inspectorError', error: 'x', errorKind: 'timeout',
+		});
+		const next = rootReduce(seeded, {
+			type: 'setColumnFilter', column: 'a',
+			filter: { kind: 'range', column: 'a', min: 0, max: 1 },
+		});
+		assert.strictEqual(inspectorOf(next).lastErrorKind, null);
+	});
+
+	test('setColumnFilter (remove) clears lastErrorKind', () => {
+		let s = rootReduce(withInitialSpec(), {
+			type: 'setColumnFilter', column: 'a',
+			filter: { kind: 'range', column: 'a', min: 0, max: 1 },
+		});
+		s = rootReduce(s, {
+			type: 'inspectorError', error: 'x', errorKind: 'memory',
+		});
+		s = rootReduce(s, {
+			type: 'setColumnFilter', column: 'a', filter: null,
+		});
+		assert.strictEqual(inspectorOf(s).lastErrorKind, null);
+	});
+
+	test('inspectorDataReceived clears lastErrorKind', () => {
+		const erred = rootReduce(withInitialSpec(), {
+			type: 'inspectorError', error: 'x', errorKind: 'internal',
+		});
+		const recovered = rootReduce(erred, {
+			type: 'inspectorDataReceived',
+			arrow: new Uint8Array([1]), offset: 0, n: 1, elapsedMs: 1,
+		});
+		assert.strictEqual(inspectorOf(recovered).lastErrorKind, null);
+	});
+
+	test('reduceInspector throws on invariant violation', () => {
+		// Bypass the dispatcher and construct an inconsistent state
+		// directly, then drive an action that DOES NOT touch the
+		// lastError fields (so the invariant survives into the next
+		// state and the wrapped assertion catches it). `clearAllFilters`
+		// and the other reset paths would normalize the violation away;
+		// `toggleInspector` simply flips `visible` and spreads the rest.
+		const bad: InspectorState = {
+			...INITIAL_INSPECTOR_STATE,
+			lastError: 'x',
+			lastErrorKind: null,
+			visible: true,
+		};
+		assert.throws(
+			() => reduceInspector(bad, { type: 'toggleInspector', visible: false }),
+			/inspector invariant broken/,
+		);
 	});
 
 	test('columnStatsReceived caches by column, idempotent on identical payload', () => {
@@ -1781,10 +1883,15 @@ suite('qviz state -- megaudit cures (Phase 6)', () => {
 			type: 'setColumnFilter', column: 'a',
 			filter: { kind: 'range', column: 'a', min: 0, max: 10 },
 		});
-		s = rootReduce(s, { type: 'inspectorError', error: 'daemon down' });
+		s = rootReduce(s, {
+			type: 'inspectorError',
+			error: 'daemon down',
+			errorKind: 'internal',
+		});
 		assert.ok(s.inspector.lastError !== null);
 		s = rootReduce(s, { type: 'clearAllFilters' });
 		assert.strictEqual(s.inspector.lastError, null);
+		assert.strictEqual(s.inspector.lastErrorKind, null);
 	});
 
 });

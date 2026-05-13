@@ -169,6 +169,12 @@ export type DaemonStatusKind =
 	| 'ready'
 	| 'crashed'
 	| 'respawning'
+	/** Megaudit E8 (2026-05-13): synchronous transient between
+	 *  `dispose()` invocation and the terminal `unavailable`
+	 *  transition. The banner stops showing `ready` immediately;
+	 *  respawn handlers still gate on `unavailable` so MAJOR-29
+	 *  (premature port-conflict respawn) is preserved. */
+	| 'disposing'
 	| 'unavailable';
 
 export interface SchemaChangedMessage extends MessageEnvelope {
@@ -303,8 +309,14 @@ export interface InspectorTextFilter {
 export interface InspectorSetFilter {
 	readonly kind: 'set';
 	readonly column: string;
-	/** Allowed values; empty array means "no rows match". */
-	readonly includes: readonly (string | number | boolean)[];
+	/** Allowed values; empty array means "no rows match". Megaudit
+	 *  D8 (2026-05-13): widened to admit literal `null` so nullable
+	 *  columns can filter to "include SQL-NULL rows" without
+	 *  colliding with the literal string `"null"`. JSON-native; the
+	 *  daemon translates `null` in this array into `col IS NULL`
+	 *  alongside any non-null IN-clause members. The validator at
+	 *  `validateInspectorFilters` accepts the wider type. */
+	readonly includes: readonly (string | number | boolean | null)[];
 }
 
 /** Column stats payload returned from the daemon, normalized to the shape
@@ -344,8 +356,25 @@ export interface InspectorDataMessage extends MessageEnvelope {
 export interface InspectorErrorMessage extends MessageEnvelope {
 	readonly type: 'inspectorError';
 	readonly error: string;
-	readonly errorKind: 'security' | 'timeout' | 'memory' | 'internal' | 'protocol';
+	readonly errorKind: InspectorErrorKind;
 }
+
+/** Megaudit D3 (2026-05-13): exported so the webview state slice can
+ *  type its `lastErrorKind` field against the same union, and so
+ *  inspector UI gating (Retry button visibility, SR phrasing) reads
+ *  from one source of truth.
+ *
+ *  D3 audit (opus + codex, 2026-05-13): `'compile'` IS reachable on
+ *  the inspector path. `op_preview` routes through `_preview_via_compile`
+ *  when `apply_spec_transforms` is set (the spec has groupby/aggregate),
+ *  which can raise CompileError. The earlier doc claim that the
+ *  inspector path never compiles was wrong and silently downgraded
+ *  every aggregate-preset compile error to `internal`. The union now
+ *  includes `'compile'`; it is gated as TERMINAL (no Retry) because
+ *  compile errors are deterministic — the same spec compiles the
+ *  same way on retry. */
+export type InspectorErrorKind =
+	| 'security' | 'timeout' | 'memory' | 'internal' | 'protocol' | 'compile';
 
 /** Phase 6 (6.B.1): column stats response, used to drive filter widgets. */
 export interface ColumnStatsMessage extends MessageEnvelope {
@@ -548,9 +577,35 @@ export function validateWebviewMessage(value: unknown): ValidationResult<Webview
 		case 'discardChanges': result = validateDiscardChanges(obj); break;
 		case 'requestInspectorData': result = validateRequestInspectorData(obj); break;
 		case 'requestColumnStats': result = validateRequestColumnStats(obj); break;
-		case 'retryDaemon': result = ok(obj as unknown as RetryDaemonMessage); break;
-		case 'recheckDataset': result = ok(obj as unknown as RecheckDatasetMessage); break;
-		case 'promoteToChart': result = ok(obj as unknown as PromoteToChartMessage); break;
+		// Megaudit Theme E (E13, 2026-05-13): rebuild as a literal so
+		// extra junk fields on the inbound object are stripped. Previously
+		// `obj as unknown as ...` passed every field through, which made
+		// the protocol forgiving of malformed senders and meant that adding
+		// a field to one of these messages later wouldn't be enforced.
+		case 'retryDaemon': {
+			result = ok({
+				type: 'retryDaemon' as const,
+				protocolVersion: (obj as { protocolVersion: number }).protocolVersion,
+				requestId: (obj as { requestId: number }).requestId,
+			} satisfies RetryDaemonMessage);
+			break;
+		}
+		case 'recheckDataset': {
+			result = ok({
+				type: 'recheckDataset' as const,
+				protocolVersion: (obj as { protocolVersion: number }).protocolVersion,
+				requestId: (obj as { requestId: number }).requestId,
+			} satisfies RecheckDatasetMessage);
+			break;
+		}
+		case 'promoteToChart': {
+			result = ok({
+				type: 'promoteToChart' as const,
+				protocolVersion: (obj as { protocolVersion: number }).protocolVersion,
+				requestId: (obj as { requestId: number }).requestId,
+			} satisfies PromoteToChartMessage);
+			break;
+		}
 		default:
 			return fail(`unknown webview message type: ${JSON.stringify((obj as { type: unknown }).type)}`);
 	}
@@ -734,7 +789,10 @@ function validateTheme(obj: Record<string, unknown>): ValidationResult<ThemeMess
 	return ok(obj as unknown as ThemeMessage);
 }
 
-const DAEMON_STATUS_KINDS = new Set(['idle', 'starting', 'ready', 'crashed', 'respawning', 'unavailable']);
+const DAEMON_STATUS_KINDS = new Set([
+	'idle', 'starting', 'ready', 'crashed', 'respawning',
+	'disposing', 'unavailable',  // E8 (2026-05-13)
+]);
 
 function validateDaemonStatus(obj: Record<string, unknown>): ValidationResult<DaemonStatusMessage> {
 	if (typeof obj.status !== 'string' || !DAEMON_STATUS_KINDS.has(obj.status)) {
@@ -896,6 +954,26 @@ function validateDaemonCapabilities(
 ): ValidationResult<DaemonCapabilities> {
 	if (!isObject(value)) { return fail(`${label} must be an object`); }
 	const c = value;
+	// Megaudit F1 (2026-05-13): the daemon-side payload uses snake_case
+	// (`daemon_version`, `transform_kinds`, `chart_families`); the
+	// protocol-side payload uses camelCase. `mapDaemonCapsForInit` is
+	// the only legal bridge. If a snake_case key reaches this validator
+	// it means a regression bypassed the transform — refuse rather than
+	// silently passing through with an unknown extra. The anti-regression
+	// test in `qviz-message-protocol.test.ts` pins this behavior.
+	const SNAKE_ALIASES: ReadonlyArray<readonly [string, string]> = [
+		['daemon_version', 'daemonVersion'],
+		['transform_kinds', 'transformKinds'],
+		['chart_families', 'chartFamilies'],
+	];
+	for (const [snake, camel] of SNAKE_ALIASES) {
+		if (snake in c) {
+			return fail(
+				`${label}: snake_case key '${snake}' rejected; use '${camel}' `
+				+ `(extension must transform daemon payload via mapDaemonCapsForInit)`,
+			);
+		}
+	}
 	if (
 		typeof c.daemonVersion !== 'number'
 		|| !Number.isSafeInteger(c.daemonVersion)
@@ -926,6 +1004,22 @@ function validateDaemonCapabilities(
 			return fail(`${label}.inspector must be an object when present`);
 		}
 		const i = c.inspector as Record<string, unknown>;
+		// Megaudit F1 (2026-05-13): same snake-alias rejection on the
+		// inspector sub-bag — the three daemon-side flags must never
+		// reach this validator un-transformed.
+		const INSPECTOR_SNAKE: ReadonlyArray<readonly [string, string]> = [
+			['preview_offset', 'previewOffset'],
+			['column_stats', 'columnStats'],
+			['aggregate_filters', 'aggregateFilters'],
+		];
+		for (const [snake, camel] of INSPECTOR_SNAKE) {
+			if (snake in i) {
+				return fail(
+					`${label}.inspector: snake_case key '${snake}' rejected; `
+					+ `use '${camel}' (transform via mapDaemonCapsForInit)`,
+				);
+			}
+		}
 		for (const k of ['previewOffset', 'columnStats', 'aggregateFilters'] as const) {
 			if (i[k] !== undefined && typeof i[k] !== 'boolean') {
 				return fail(`${label}.inspector.${k} must be a boolean when present`);
@@ -1143,9 +1237,18 @@ function validateInspectorFilters(
 			if (f.includes.length > MAX_INSPECTOR_SET_INCLUDES) {
 				return fail(`${path}.includes length ${f.includes.length} exceeds cap ${MAX_INSPECTOR_SET_INCLUDES}`);
 			}
-			const cleanIncludes: (string | number | boolean)[] = [];
+			// Megaudit D8 (2026-05-13): allow `null` so set filters
+			// over nullable columns can include SQL NULL rows without
+			// colliding with the literal string `"null"`. The daemon
+			// splits null out of the IN clause and emits `IS NULL OR
+			// IN (...)`.
+			const cleanIncludes: (string | number | boolean | null)[] = [];
 			for (let j = 0; j < f.includes.length; j++) {
 				const v = f.includes[j];
+				if (v === null) {
+					cleanIncludes.push(null);
+					continue;
+				}
 				if (typeof v === 'string' || typeof v === 'boolean') {
 					if (typeof v === 'string' && v.length > MAX_INSPECTOR_TEXT_FILTER_LEN) {
 						return fail(`${path}.includes[${j}] string exceeds cap ${MAX_INSPECTOR_TEXT_FILTER_LEN}`);
@@ -1161,7 +1264,7 @@ function validateInspectorFilters(
 					cleanIncludes.push(v);
 					continue;
 				}
-				return fail(`${path}.includes[${j}] must be a string, finite number, or boolean`);
+				return fail(`${path}.includes[${j}] must be a string, finite number, boolean, or null`);
 			}
 			out.push({ kind: 'set', column, includes: cleanIncludes });
 		} else {
@@ -1219,8 +1322,19 @@ function validateInspectorError(
 		return fail('inspectorError.error must be a non-empty string');
 	}
 	const k = obj.errorKind;
-	if (k !== 'security' && k !== 'timeout' && k !== 'memory' && k !== 'internal' && k !== 'protocol') {
-		return fail(`inspectorError.errorKind must be one of 'security'|'timeout'|'memory'|'internal'|'protocol' (got ${JSON.stringify(k)})`);
+	// Megaudit D3 audit (2026-05-13): `'compile'` added — op_preview's
+	// apply_spec_transforms path can raise CompileError. The previous
+	// validator rejected `'compile'`, but the producer (provider's
+	// inspector mapping) was silently downgrading to `'internal'`, so
+	// the rejection branch was never exercised in practice. With the
+	// downgrade gone, `'compile'` must now round-trip.
+	if (k !== 'security' && k !== 'timeout' && k !== 'memory'
+		&& k !== 'internal' && k !== 'protocol' && k !== 'compile') {
+		return fail(
+			`inspectorError.errorKind must be one of `
+			+ `'security'|'timeout'|'memory'|'internal'|'protocol'|'compile' `
+			+ `(got ${JSON.stringify(k)})`,
+		);
 	}
 	return ok(obj as unknown as InspectorErrorMessage);
 }

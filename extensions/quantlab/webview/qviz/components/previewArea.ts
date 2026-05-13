@@ -111,6 +111,15 @@ export function mountPreviewArea(
 			case 'respawning':
 				messages.push('Daemon respawning…');
 				break;
+			case 'disposing':
+				// Megaudit E8 (2026-05-13): transient state between
+				// dispose() invocation and the terminal `unavailable`
+				// transition. The banner stops showing `ready` here
+				// so the user sees the shutdown immediately rather
+				// than mid-flight requests "succeeding" against a
+				// daemon that's tearing down.
+				messages.push('Daemon shutting down…');
+				break;
 			case 'unavailable':
 				messages.push(
 					`Daemon unavailable${state.runtime.daemonLastError ? `: ${state.runtime.daemonLastError}` : ''}`,

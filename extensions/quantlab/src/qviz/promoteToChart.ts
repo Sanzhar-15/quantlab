@@ -107,9 +107,16 @@ export function generatePromoteScaffold(
 	// scaffold lives flat in `.quantlab/visualise-promoted/`.
 	const specAbs = path.resolve(specUri);
 	const relSpec = path.relative(workspaceRoot, specAbs);
+	// Megaudit Theme G (G15, 2026-05-13): widen the regex to catch
+	// Unicode line/paragraph separators (U+2028, U+2029) and the C0/C1
+	// control range. Without this, an exotic basename could produce a
+	// scaffold filename that downstream tools interpret as containing a
+	// newline. The path containment check at write time blocks the
+	// directory-escape vector; this closes the cosmetic/filename-shape
+	// gap.
 	const sanitized = relSpec
 		.replace(/\.qviz\.json$/i, '')
-		.replace(/[/\\]/g, '__');
+		.replace(/[/\\\x00-\x1f\u2028\u2029]/g, '__');
 	const scaffoldRel = path.join(SCAFFOLD_SUBDIR, sanitized + '.py');
 	const scaffoldPath = path.resolve(workspaceRoot, scaffoldRel);
 

@@ -288,11 +288,27 @@ export class RendererHost {
 			// late `setHooks` call takes effect for the next click.
 			this.hooks.onSelection?.(lastCrosshairTime);
 		};
+		// Megaudit Theme D (D9, 2026-05-13): also attach mouseup on
+		// `window` and mouseleave on the container. If the user starts
+		// a drag inside the chart but releases OUTSIDE, the container-
+		// scoped mouseup never fires, leaving `mouseDownAt` set. The
+		// NEXT mouseup-on-container (potentially from a different
+		// interaction) would then dispatch a stale selection. By
+		// attaching mouseup to window AND clearing mouseDownAt on
+		// mouseleave, the drag-past-edge case is handled.
+		const onWindowMouseUp = (e: MouseEvent): void => {
+			if (mouseDownAt !== null) { onMouseUp(e); }
+		};
+		const onMouseLeave = (): void => { mouseDownAt = null; };
 		this.container.addEventListener('mousedown', onMouseDown);
 		this.container.addEventListener('mouseup', onMouseUp);
+		this.container.addEventListener('mouseleave', onMouseLeave);
+		window.addEventListener('mouseup', onWindowMouseUp);
 		return () => {
 			this.container.removeEventListener('mousedown', onMouseDown);
 			this.container.removeEventListener('mouseup', onMouseUp);
+			this.container.removeEventListener('mouseleave', onMouseLeave);
+			window.removeEventListener('mouseup', onWindowMouseUp);
 			offCrosshair?.();
 		};
 	}

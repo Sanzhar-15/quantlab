@@ -264,11 +264,27 @@ suite('specCore.serializeSpec', () => {
 				{ kind: 'groupby', columns: ['day'] },
 				{ kind: 'aggregate', aggs: [{ column: 'x', fn: 'mean', as: 'x_avg' }] },
 			],
-			[{ kind: 'window', column: 'x', fn: 'rolling_mean', window: 5, as: 'roll' }],
-			[{ kind: 'math', column: 'x', fn: 'log_returns', as: 'r' }],
+			[{ kind: 'window', column: 'x', fn: 'rolling_mean', window: 5, order_by: 't', as: 'roll' }],
+			[{ kind: 'math', column: 'x', fn: 'log_returns', order_by: 't', as: 'r' }],
 			[{ kind: 'tz_convert', column: 't', to_tz: 'America/New_York' }],
 			[{ kind: 'sort', columns: [{ column: 't' }] }],
 			[{ kind: 'limit', n: 1000, offset: 0 }],
+			[{
+				kind: 'expr',
+				as: 'mid',
+				expression: {
+					kind: 'binary',
+					op: '/',
+					left: {
+						kind: 'binary',
+						op: '+',
+						left: { kind: 'col', name: 'high' },
+						right: { kind: 'col', name: 'low' },
+					},
+					right: { kind: 'num', value: 2 },
+				},
+				references: ['high', 'low'],
+			}],
 		];
 		for (const ts of transforms) {
 			const label = ts.map(t => t.kind).join('+');

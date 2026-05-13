@@ -105,6 +105,26 @@ export function mountAnnouncer(root: HTMLElement, store: QvizStore): AnnouncerHa
 	};
 }
 
+/** Megaudit Theme G (G10, 2026-05-13): format a chart's x-axis
+ *  selection value for SR users. If x looks like an epoch timestamp
+ *  (plausible ms or s range), emit as ISO; otherwise stringify as-is.
+ *  Heuristic: ms epoch 1e12..4e13 (2001..3266) or s epoch 1e9..4e10. */
+function formatSelectionX(x: unknown): string {
+	if (typeof x === 'number' && Number.isFinite(x)) {
+		// ms epoch: 1e12 = 2001-09; 4e13 = 3236-10.
+		// s epoch: 1e9 = 2001-09; 4e10 = 3236-10.
+		const looksMs = x >= 1e12 && x <= 4e13;
+		const looksSec = x >= 1e9 && x < 1e12;
+		if (looksMs) {
+			return new Date(x).toISOString();
+		}
+		if (looksSec) {
+			return new Date(x * 1000).toISOString();
+		}
+	}
+	return String(x);
+}
+
 /**
  * Compare two states and emit announcements for meaningful transitions.
  * Each branch is intentionally narrow (announces the SPECIFIC thing
@@ -221,18 +241,29 @@ function diffAndAnnounce(
 		if (curFilterKeys.length === 0 && prevFilterKeys.length > 0) {
 			emit('All inspector filters cleared.');
 		} else {
-			// Find first-added / first-changed for the announcement.
-			for (const k of curFilterKeys) {
-				if (state.inspector.filters[k] !== prev.inspector.filters[k]) {
+			// Megaudit Theme D (D2, 2026-05-13): rewrite the diff to use
+			// the union of prev+cur keys and compare against PREV for
+			// "cleared" vs CUR for "applied/updated". The prior loops
+			// had two bugs:
+			//   (a) a stray `state.inspector.filters[k] !== state.inspector.filters[k]`
+			//       check (always false except NaN) flagged as unreachable
+			//       but indicates the diff was hand-typed against the
+			//       wrong reference.
+			//   (b) partial-clear (clearing 1 of 3 filters) would also
+			//       enter the "applied" loop and announce "filter
+			//       applied to <surviving-key>" — false positive.
+			const allKeys = new Set([...prevFilterKeys, ...curFilterKeys]);
+			for (const k of allKeys) {
+				const had = prev.inspector.filters[k] !== undefined;
+				const has = state.inspector.filters[k] !== undefined;
+				if (had && !has) {
+					emit(`Inspector filter cleared on ${k}.`);
+					break;
+				} else if (!had && has) {
 					emit(`Inspector filter applied to ${k}.`);
 					break;
-				}
-			}
-			for (const k of prevFilterKeys) {
-				if (state.inspector.filters[k] !== undefined
-					&& state.inspector.filters[k] !== state.inspector.filters[k]) { /* unreachable */ }
-				if (state.inspector.filters[k] === undefined) {
-					emit(`Inspector filter cleared on ${k}.`);
+				} else if (had && has && state.inspector.filters[k] !== prev.inspector.filters[k]) {
+					emit(`Inspector filter updated on ${k}.`);
 					break;
 				}
 			}
@@ -242,11 +273,49 @@ function diffAndAnnounce(
 		if (state.inspector.selection === null && prev.inspector.selection !== null) {
 			emit('Inspector selection cleared.');
 		} else if (state.inspector.selection !== null) {
-			emit(`Inspector selection: ${String(state.inspector.selection.x)}.`);
+			// Megaudit Theme G (G10, 2026-05-13): when x is a plausible
+			// epoch timestamp (large finite number in ms or s range),
+			// announce it as an ISO string instead of raw ms — SR users
+			// won't parse "1715638800000" but "2024-05-13T..." is
+			// readable.
+			emit(`Inspector selection: ${formatSelectionX(state.inspector.selection.x)}.`);
 		}
 	}
 	if (prev.inspector.lastError !== state.inspector.lastError
 		&& state.inspector.lastError !== null) {
-		emit(`Inspector error: ${state.inspector.lastError}.`, 'assertive');
+		// Megaudit D3 (2026-05-13) + audit revision: vary the verb by
+		// kind so SR users hear a meaningful action signal. Use an
+		// exhaustive switch so a future kind added to
+		// `InspectorErrorKind` fails the TS compile rather than
+		// silently falling into a default. `kind === null` while
+		// `lastError !== null` is an invariant violation (enforced
+		// in the reducer); we log and treat it as 'internal' for
+		// announcement purposes — better to surface a generic
+		// message than to omit the announcement entirely.
+		const kind = state.inspector.lastErrorKind;
+		if (kind === null) {
+			console.error(
+				'[qviz announcer] invariant violation: lastError set but '
+				+ 'lastErrorKind=null. Announcing as generic error.',
+			);
+			emit(`Inspector error: ${state.inspector.lastError}.`, 'assertive');
+		} else {
+			let verb: string;
+			switch (kind) {
+				case 'security':
+				case 'protocol':
+				case 'compile':
+					verb = 'Inspector denied'; break;
+				case 'timeout':
+				case 'memory':
+				case 'internal':
+					verb = 'Inspector error'; break;
+				default: {
+					const _exhaustive: never = kind;
+					throw new Error(`unhandled inspector kind: ${String(_exhaustive)}`);
+				}
+			}
+			emit(`${verb} (${kind}): ${state.inspector.lastError}.`, 'assertive');
+		}
 	}
 }

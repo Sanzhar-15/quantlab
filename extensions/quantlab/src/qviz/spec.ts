@@ -19,6 +19,8 @@
  * See `examples/` for concrete specs and `validate.ts` for runtime validation.
  */
 
+import type { ExprAst } from './exprAst';
+
 // --- top-level ----------------------------------------------------------------
 
 export const QVIZ_SCHEMA_VERSION = 1 as const;
@@ -62,7 +64,8 @@ export type Transform =
 	| ResampleTransform
 	| TzConvertTransform
 	| SortTransform
-	| LimitTransform;
+	| LimitTransform
+	| ExprTransform;
 
 export type TransformKind = Transform['kind'];
 
@@ -72,7 +75,16 @@ export interface FilterTransform {
 	/** Phase 6 added `contains` for the inspector's text-filter widget;
 	 *  it compiles to a case-insensitive LIKE on `lower(CAST(col AS VARCHAR))`. */
 	readonly op: '==' | '!=' | '<' | '<=' | '>' | '>=' | 'in' | 'not_in' | 'is_null' | 'not_null' | 'contains';
-	readonly value?: string | number | boolean | readonly (string | number)[] | null;
+	/** Megaudit D8 (2026-05-13): the IN/NOT_IN value array can now
+	 *  carry `null` so set filters over nullable columns correctly
+	 *  include SQL NULL rows. Daemon splits null out of the array
+	 *  and emits `IS NULL OR col IN (...)`. Strings widened to
+	 *  include null too (boolean already implied by other filter
+	 *  kinds; here we keep them aligned). */
+	readonly value?:
+		| string | number | boolean
+		| readonly (string | number | boolean | null)[]
+		| null;
 }
 
 export interface DateTruncTransform {
@@ -111,6 +123,11 @@ export interface WindowTransform {
 	readonly column: string;
 	readonly fn: 'rolling_mean' | 'rolling_std' | 'rolling_max' | 'rolling_min' | 'ema' | 'cumsum' | 'cumprod' | 'cummax' | 'cummin';
 	readonly window?: number;
+	/** Column to ORDER BY in the window frame. REQUIRED — every window
+	 *  function is order-dependent, and the previous "no ORDER BY"
+	 *  compilation silently mixed rows in parquet scan order. (Megaudit
+	 *  Theme A A1, 2026-05-13.) */
+	readonly order_by: string;
 	readonly as: string;
 }
 
@@ -119,6 +136,11 @@ export interface MathTransform {
 	readonly column: string;
 	readonly fn: 'log' | 'log10' | 'exp' | 'abs' | 'sqrt' | 'log_returns' | 'pct_change' | 'drawdown';
 	readonly periods?: number;
+	/** Required when `fn` ∈ {log_returns, pct_change, drawdown} — those
+	 *  three emit window/lag SQL and need an explicit ordering column.
+	 *  Other fns are row-local and ignore this field. (Megaudit Theme A
+	 *  A2, 2026-05-13.) */
+	readonly order_by?: string;
 	readonly as: string;
 }
 
@@ -146,6 +168,26 @@ export interface LimitTransform {
 	readonly kind: 'limit';
 	readonly n: number;
 	readonly offset?: number;
+}
+
+/**
+ * Visualise v2 -- calculated field via a closed-grammar expression.
+ *
+ * The `expression` field is a structured AST (see `exprAst.ts`), NOT
+ * raw SQL or a string. The webview parses user-typed text in the
+ * transform editor and emits the AST; the daemon walks it to produce
+ * parameterized DuckDB SQL.
+ *
+ * The `references` field lists every column the AST reads. It's a
+ * defense-in-depth duplicate of what `collectColumnRefs(expression)`
+ * would compute, so the validator can refuse a spec whose `references`
+ * disagrees with its AST.
+ */
+export interface ExprTransform {
+	readonly kind: 'expr';
+	readonly as: string;
+	readonly expression: ExprAst;
+	readonly references: readonly string[];
 }
 
 // --- chart configuration ------------------------------------------------------
