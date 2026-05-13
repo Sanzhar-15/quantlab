@@ -1229,15 +1229,20 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
 
         // **W5-81 (Phase 4.5.D part 5):** apply the per-sheet cell-format
         // overlay. v4 envelopes carry `format_overlay`; v1-v3 don't.
-        // We DO NOT validate that each id resolves in the FormatTable
-        // here — a corrupted .qbook that binds cells to a phantom id
-        // would still load with the overlay intact; `format::render`
-        // falls back to General on a missing-id lookup. Stricter
-        // validation can be added when the runtime's display path
-        // wires through (W5-82). For now: trust the on-disk format,
-        // surface mismatches via render diagnostics rather than load
-        // refusal.
+        //
+        // **W5-84 closure (Codex MEDIUM-3):** the loader now VALIDATES
+        // that each overlay id resolves in the workbook's `FormatTable`,
+        // matching the runtime + replay contract (which both surface
+        // `UnknownFormatId` / `FormatNotRegistered` on bad ids). A
+        // corrupted `.qbook` binding a cell to an unregistered id no
+        // longer falls through to silent General fallback at render
+        // time — it now surfaces `MalformedFormatOverlay` at load.
         if let Some(ref overlay_entries) = sheet_env.format_overlay {
+            // Snapshot the set of registered ids BEFORE the overlay
+            // mutation so we don't borrow `wb` twice (mutable on the
+            // sheet + immutable on `wb.formats()`).
+            let known_ids: std::collections::HashSet<u32> =
+                wb.formats().iter().map(|(id, _)| id.0).collect();
             let sheet_mut = wb.sheet_mut(sheet_id).expect("just-added sheet must exist");
             for entry in overlay_entries {
                 // Bounds-check to mirror the cell-record validation
@@ -1250,6 +1255,14 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                         row: entry.row,
                         col: entry.col,
                         why: "out-of-range row/col",
+                    });
+                }
+                if !known_ids.contains(&entry.id) {
+                    return Err(QbookError::MalformedFormatOverlay {
+                        sheet: sheet_id,
+                        row: entry.row,
+                        col: entry.col,
+                        why: "format id not registered in FormatTable",
                     });
                 }
                 sheet_mut.format_overlay_mut().set(
@@ -2606,6 +2619,54 @@ id = 0
                 Err(QbookError::MalformedFormatOverlay { sheet: 0, .. })
             ),
             "expected MalformedFormatOverlay, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_format_overlay_unregistered_id_surfaces_as_error() {
+        // **W5-84 closure (Codex MEDIUM-3):** an overlay entry pointing
+        // at an unregistered FormatId must surface as
+        // `MalformedFormatOverlay` at load — not silently bind through
+        // to a render-time General fallback.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("phantom_id_overlay.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        // id 999 is NOT pre-populated as a built-in and not in any
+        // `[[formats.entries]]` section, so it should never be bindable
+        // by the loader. Mirrors runtime / replay's contract.
+        let bad_toml = r#"
+schema_version = 4
+name = "phantom_id"
+date_system = "1900"
+
+[[sheets]]
+id = 0
+name = "S"
+chunk_rows = 16384
+row_extent = 0
+col_extent = 0
+
+[[sheets.format_overlay]]
+row = 0
+col = 0
+id = 999
+"#;
+        fs::write(path.join("workbook.toml"), bad_toml).unwrap();
+        fs::write(path.join("sheets/0.jsonl"), "").unwrap();
+        fs::write(path.join(ATOMIC_SAVE_MARKER_FILENAME), "").unwrap();
+
+        let result = load_workbook(&path);
+        assert!(
+            matches!(
+                result,
+                Err(QbookError::MalformedFormatOverlay {
+                    sheet: 0,
+                    row: 0,
+                    col: 0,
+                    why: "format id not registered in FormatTable",
+                })
+            ),
+            "expected MalformedFormatOverlay(unregistered id), got {result:?}"
         );
     }
 

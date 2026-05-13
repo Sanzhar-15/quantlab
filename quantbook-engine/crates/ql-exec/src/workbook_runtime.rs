@@ -869,6 +869,21 @@ impl<'a> WorkbookRuntime<'a> {
     /// because `set_cell_format` refuses unknown ids), falls back to
     /// `General` rendering. If the format string fails to parse,
     /// falls back to `General` and the renderer never errors.
+    ///
+    /// **W5-84 closure (Codex MEDIUM-2) cache-staleness caveat:** the
+    /// `format_cache` is keyed by `FormatId` and populated on first
+    /// `read_display` for that id. `FormatTable::register_at` rejects
+    /// id→string mutations, so cached entries stay correct for the
+    /// runtime's lifetime under the runtime's own append-only
+    /// `intern_format` path. HOWEVER, the low-level
+    /// `Workbook::formats_mut()` accessor (loader-only by convention but
+    /// `pub` for the qbook loader + tests) can register a new id AFTER
+    /// `read_display` has cached the General fallback for that id. In
+    /// that pathological sequence the cache will continue rendering
+    /// General until the runtime is rebuilt. Analogous to the
+    /// `WorkbookEnv` date-system caveat documented on
+    /// `Workbook::set_date_system`. Tracked as GAP-F-12 in
+    /// `docs/known-gaps.md`.
     pub fn read_display(&mut self, sheet: SheetId, row: RowId, col: ColId) -> String {
         let value = self.workbook.read(ql_types::Address::new(sheet, row, col));
         let format_id = self

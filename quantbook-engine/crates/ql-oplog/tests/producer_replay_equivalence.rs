@@ -70,6 +70,39 @@ fn realistic_op_sequence() -> Vec<Op> {
         col: 0,
         value: CellWireValue::Text("widget".to_owned()),
     });
+    // **W5-84 closure (Sonnet MEDIUM D.3):** include format ops in the
+    // realistic sequence so the equivalence comparator exercises the
+    // FormatTable + CellFormatOverlay paths.
+    //
+    // Register a custom format id (164 = first custom).
+    ops.push(Op::RegisterFormat {
+        id: 164,
+        string: "\"€\" #,##0.00".to_owned(),
+    });
+    // Bind a cell on sheet 0 to a built-in id 14 (m/d/yyyy) — no
+    // RegisterFormat needed; the built-in is pre-seeded by
+    // `FormatTable::default()`.
+    ops.push(Op::SetCellFormat {
+        sheet: 0,
+        row: 0,
+        col: 0,
+        id: Some(14),
+    });
+    // Bind another cell to the custom id.
+    ops.push(Op::SetCellFormat {
+        sheet: 0,
+        row: 1,
+        col: 0,
+        id: Some(164),
+    });
+    // And clear a binding (Op::SetCellFormat with None on a previously-
+    // bound cell). Tests the clear path.
+    ops.push(Op::SetCellFormat {
+        sheet: 0,
+        row: 0,
+        col: 0,
+        id: None,
+    });
     ops
 }
 
@@ -182,6 +215,47 @@ fn assert_workbooks_observationally_equal(a: &Workbook, b: &Workbook) {
             .lookup_ci(name)
             .unwrap_or_else(|| panic!("name {name:?} present in a but not in b"));
         assert_eq!(target_a, target_b, "name {name:?} target differs");
+    }
+
+    // **W5-84 closure (Sonnet MEDIUM D.3):** FormatTable + per-sheet
+    // CellFormatOverlay must also be compared so a producer/replay
+    // divergence in format ops surfaces here (rather than letting a
+    // bug in `RegisterFormat` / `SetCellFormat` ordering or id-
+    // prediction slip through with matching cell values but mismatched
+    // formats).
+    let formats_a: std::collections::HashMap<u32, String> = a
+        .formats()
+        .iter()
+        .map(|(id, s)| (id.0, s.to_owned()))
+        .collect();
+    let formats_b: std::collections::HashMap<u32, String> = b
+        .formats()
+        .iter()
+        .map(|(id, s)| (id.0, s.to_owned()))
+        .collect();
+    assert_eq!(
+        formats_a, formats_b,
+        "FormatTable contents differ between producer and replay"
+    );
+    for sheet_id in 0..(a.sheet_count() as u16) {
+        let overlay_a: std::collections::HashMap<(u32, u32), u32> = a
+            .sheet(sheet_id)
+            .unwrap()
+            .format_overlay()
+            .iter()
+            .map(|((r, c), fid)| ((r, c), fid.0))
+            .collect();
+        let overlay_b: std::collections::HashMap<(u32, u32), u32> = b
+            .sheet(sheet_id)
+            .unwrap()
+            .format_overlay()
+            .iter()
+            .map(|((r, c), fid)| ((r, c), fid.0))
+            .collect();
+        assert_eq!(
+            overlay_a, overlay_b,
+            "CellFormatOverlay differs on sheet {sheet_id}"
+        );
     }
 }
 

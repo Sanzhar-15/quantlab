@@ -1,0 +1,306 @@
+Phase 4.5 closing mega-audit (Codex) - W5-77..W5-83
+Date: 2026-05-13
+Audited HEAD: 7a85ccdf996
+
+Verification note: targeted `cargo test` commands could not be run because `cargo`
+is not on PATH in this environment (`zsh: command not found: cargo`). Verdicts
+below are from source inspection plus in-repo test citations.
+
+Summary
+=======
+
+Overall verdict: MIXED.
+
+The W5-77..W5-83 arc is structurally sound: parser/renderer/runtime/storage/
+op-log/qbook integration mostly follows the mini-spec, and the core runtime paths
+have focused tests. However, I found one HIGH correctness/spec breach and several
+MEDIUM closure gaps:
+
+- HIGH: V2 fraction formats (`# ?/?`) are not rejected as
+  `UnsupportedV2(Fraction)`; they are parsed as normal number formats and will
+  render garbage-like output.
+- MEDIUM: `m/mm` disambiguation looks past a prior `m/mm` token and therefore
+  classifies `h:mm m` as hour-minute-minute, contrary to the mini-spec's
+  acceptance corpus.
+- MEDIUM: compatibility docs still mark `TEXT` / display formatting as unshipped,
+  and the parent design doc still contains pre-implementation shapes and unchecked
+  boxes.
+- MEDIUM: `WorkbookRuntime::format_cache` is stable for runtime-owned mutations
+  but can become stale after low-level `formats_mut().register_at()` mutation on
+  the same live runtime; this is the same class as the already-documented
+  `WorkbookEnv` date-system caveat, but it is not documented as a known gap.
+
+A. Parser (W5-77b): MIXED
+=========================
+
+Most parser mechanics match the mini-spec: section splitting caps at 4
+(`crates/ql-functions/src/format/parser.rs:37`), comma role resolution handles
+between-digits vs trailing scale (`parser.rs:98` and `parser.rs:223`), bracket
+currency parses LCIDs with a clean error on invalid hex (`lexer.rs:402`), and
+length limits are rejected with `Other` (`lexer.rs:252`, `lexer.rs:261`,
+`lexer.rs:270`, `lexer.rs:279`, `lexer.rs:288`).
+
+HIGH - Fraction formats are accepted instead of rejected as V2.
+Spec proof: the mini-spec requires `# ?/?` to emit `UnsupportedV2(Fraction)`
+(`docs/architecture/2026-05-13-format-string-grammar.md:164`,
+`docs/architecture/2026-05-13-format-string-grammar.md:267`, and
+`docs/architecture/2026-05-13-format-string-grammar.md:345`). Code proof:
+the lexer has V2 dispatch only for colors, elapsed time, and conditionals
+(`crates/ql-functions/src/format/lexer.rs:434`); `?` is accepted as a digit
+placeholder (`lexer.rs:156`) and `/` is accepted as a literal (`lexer.rs:334`).
+The parser tests cover color/conditional/elapsed only (`parser.rs:720`) and do
+not cover fraction rejection.
+Reproduction by inspection: `parse("# ?/?")` tokenizes as `Sharp, Literal(' '),
+Question, Literal('/'), Question`, classifies as `SectionKind::Number`, and
+reaches the renderer instead of returning `UnsupportedV2(Fraction)`.
+
+MEDIUM - `m/mm` disambiguation over-classifies `h:mm m`.
+Spec proof: the mini-spec test corpus says `"h:mm m" -> minute, month`
+(`docs/architecture/2026-05-13-format-string-grammar.md:333`). Code proof:
+`walk_for_anchor` ignores earlier `DateM` tokens and keeps walking back to `h`
+(`crates/ql-functions/src/format/parser.rs:287`), so the second `m` in
+`h:mm m` sees the earlier hour anchor and becomes `Minute` (`parser.rs:260`).
+Reproduction by inspection: raw tokens are `h`, `:`, `mm`, space, `m`; for the
+last `m`, backward walk skips `mm` and returns `Hour`, causing `MonthRole::Minute`.
+
+LOW - Position fidelity exists but tests are weaker than the spec asks.
+The lexer returns the offending start index for unterminated quotes, trailing
+backslash, and trailing `_`/`*` (`lexer.rs:197`, `lexer.rs:207`, `lexer.rs:216`,
+`lexer.rs:226`). Tests assert exact position only for unterminated quotes
+(`lexer.rs:623`); trailing backslash/ghost tests only match the variant
+(`lexer.rs:637`, `lexer.rs:686`).
+
+B. Renderer (W5-78): PASS
+=========================
+
+The renderer follows the section routing and sign rules: one-section formats
+auto-prepend `-`, while 2/3/4-section formats pass `auto_minus = false`
+(`crates/ql-functions/src/format/render.rs:38`, `render.rs:84`,
+`render.rs:197`, `render.rs:397`). Tests pin `0`, `0;(0)`, zero-section, and
+four-section text routing (`render.rs:896`, `render.rs:901`, `render.rs:907`,
+`render.rs:912`).
+
+Time-only formats skip `serial_to_ymd` unless date tokens are present
+(`render.rs:531`), AM/PM conversion handles 0/1-11/12/13-23 (`render.rs:561`),
+and tests cover midnight/noon/1 PM (`render.rs:1006`, `render.rs:1012`,
+`render.rs:1018`). Built-in representative render tests cover the parser-
+relevant number/date/time/text subset (`render.rs:1082`). `YEARFRAC` quirks do
+not affect `format::render`; the renderer consumes serial numbers and date
+system context only (`render.rs:519`, `render.rs:546`).
+
+C. Storage layer (W5-79): PASS
+==============================
+
+`FormatTable` pre-seeds the V1 built-in subset (`crates/ql-storage/src/format.rs:35`),
+allocates custom ids monotonically (`format.rs:112`), and rejects id/string
+collisions while allowing same-id same-string idempotency (`format.rs:129`).
+Tests cover built-ins, monotonic allocation, idempotency, and both collision
+types (`format.rs:204`, `format.rs:228`, `format.rs:238`, `format.rs:264`,
+`format.rs:271`, `format.rs:278`).
+
+`CellFormatOverlay` exposes get/set/clear/clear_all/iter/count_refs
+(`crates/ql-storage/src/format_overlay.rs:39`, `format_overlay.rs:47`,
+`format_overlay.rs:53`, `format_overlay.rs:67`, `format_overlay.rs:72`,
+`format_overlay.rs:78`), documents the flat-map V1 simplification
+(`format_overlay.rs:12`), and tests isolation/counting/clearing (`format_overlay.rs:90`).
+Workbook and Sheet accessors are reachable for loader and runtime paths
+(`crates/ql-storage/src/workbook.rs:275`, `workbook.rs:281`,
+`crates/ql-storage/src/sheet.rs:54`, `sheet.rs:60`).
+
+D. Op-log (W5-80): PASS
+=======================
+
+Replay routes `RegisterFormat` through `register_at` and reports collisions as
+`FormatRejected` (`crates/ql-oplog/src/replay.rs:246`). Tests cover idempotent
+id 0 = General, id collision, set/clear, unknown id rejection, and built-in id
+14 without registration (`replay.rs:604`, `replay.rs:624`, `replay.rs:649`,
+`replay.rs:674`, `replay.rs:704`, `replay.rs:746`).
+
+`SetCellFormat` validates the id before binding (`replay.rs:267`), and
+`BatchCommit` replays inner ops in order by direct iteration (`replay.rs:290`).
+Producer/replay equivalence has the new variants in its realistic op path
+(`crates/ql-oplog/tests/producer_replay_equivalence.rs:110`).
+
+E. .qbook schema v3 -> v4 (W5-81): MIXED
+========================================
+
+Save/load is mostly correct: schema v4 and the v3 compatibility contract are
+documented (`crates/ql-io/src/qbook_format.rs:98`), custom formats are persisted
+sorted by id while built-ins are omitted (`qbook_format.rs:997`,
+`qbook_format.rs:1014`), format overlays are sorted by `(row, col)`
+(`qbook_format.rs:950`, `qbook_format.rs:965`), and load registers custom
+formats via `register_at` with `MalformedFormat` on collision (`qbook_format.rs:1201`).
+Tests cover no-builtins-on-disk, custom format round-trip, overlay round-trip,
+legacy v3 defaults, malformed format, malformed overlay, and future schema
+rejection (`qbook_format.rs:2393`, `qbook_format.rs:2417`, `qbook_format.rs:2441`,
+`qbook_format.rs:2503`, `qbook_format.rs:2539`, `qbook_format.rs:2570`,
+`qbook_format.rs:2689`). Atomic save uses the existing marker/rename protocol
+(`qbook_format.rs:1119`).
+
+MEDIUM - Overlay ids are not validated on load.
+The loader explicitly says it does not validate that each overlay id resolves
+in the `FormatTable` (`qbook_format.rs:1230`) and then stores any id
+(`qbook_format.rs:1255`). Runtime `set_cell_format` and replay both reject
+unknown ids (`crates/ql-exec/src/workbook_runtime.rs:825`,
+`crates/ql-oplog/src/replay.rs:271`), so qbook load is the outlier. A corrupted
+`.qbook` can bind a cell to a missing custom id and `read_display` silently
+falls back to General (`workbook_runtime.rs:867`). This should either become a
+`MalformedFormatOverlay` validation or be filed as a persistence gap.
+
+F. Runtime wrappers + read_display (W5-82): MIXED
+=================================================
+
+Runtime append-before-mutate and idempotency are correct: `intern_format`
+predicts the id and appends `RegisterFormat` before mutating (`workbook_runtime.rs:787`),
+built-ins/repeats avoid duplicate ops (`workbook_runtime.rs:781`), and
+`set_cell_format` validates unknown ids before appending (`workbook_runtime.rs:821`).
+Tests cover built-in no-op, new custom op, duplicate no-op, unknown id rejection,
+General fallback, date display, custom display, cache stability, error sigils,
+and replay round-trip (`workbook_runtime.rs:4616` through `workbook_runtime.rs:4846`).
+
+MEDIUM - `format_cache` staleness is not documented for low-level mutation.
+The cache is keyed only by `FormatId` and inserts on first `read_display`
+(`workbook_runtime.rs:879`); the doc assumes `register_at` rejects id->string
+mutations (`workbook_runtime.rs:327`). That is true for runtime-owned append-only
+use, but low-level `Workbook::formats_mut()` remains public for loader/tests
+(`crates/ql-storage/src/workbook.rs:281`). If a caller constructs a runtime,
+calls `read_display` for an unknown id (caching General fallback), then registers
+that id through low-level access on the same workbook/runtime lifetime, the
+cache will continue rendering General. This mirrors the already-documented
+`WorkbookEnv` date-system staleness caveat (`workbook.rs:263`) and needs a
+doc/gap note or an invalidation API.
+
+G. TEXT() function (W5-83): PASS
+================================
+
+`TEXT` is a context-aware function, propagates value and format-arg errors,
+requires a text/blank format argument, maps parse failure to `#VALUE!`, and uses
+the workbook `EvalContext` for date-system-sensitive rendering
+(`crates/ql-functions/src/format/text_fn.rs:21`, `text_fn.rs:25`,
+`text_fn.rs:29`, `text_fn.rs:36`, `text_fn.rs:41`, `text_fn.rs:45`).
+Unit tests cover arity, coercion, blank/empty format, error propagation,
+invalid format, numeric/date/time/text rendering, and Excel1904 context
+(`text_fn.rs:71` through `text_fn.rs:247`). Runtime e2e tests cover formula
+integration and invalid format through recompute (`crates/ql-exec/src/workbook_runtime.rs:4850`,
+`workbook_runtime.rs:4867`, `workbook_runtime.rs:4882`).
+
+H. Cross-cutting / architecture: MIXED
+======================================
+
+PASS - V2 color/conditional/elapsed errors align with `TEXT` and renderer
+expectations: parser refuses these before render (`crates/ql-functions/src/format/lexer.rs:434`),
+and `TEXT` converts parse failures to `#VALUE!` (`text_fn.rs:45`).
+
+HIGH - Fraction V2 refusal is missing; see A. This is the one V2 token family
+where parser refusal is inconsistent with the renderer's "V2 unreachable"
+assumption (`crates/ql-functions/src/format/render.rs:11`).
+
+MEDIUM - Built-in format table scope is inconsistent with the mini-spec and
+xlsx-readiness story. The mini-spec says V1 ships the full built-in table
+verbatim and specifically calls custom built-in ids 5-8 and 41-44 part of that
+table (`docs/architecture/2026-05-13-format-string-grammar.md:269`,
+`format-string-grammar.md:273`). `FormatTable` only pre-seeds a subset
+(`crates/ql-storage/src/format.rs:31`). This is probably acceptable for Phase
+4.5 runtime use, but xlsx import will commonly surface currency/accounting ids;
+track this as a Phase 4.11 or Phase 4.10 gap before import lands.
+
+MEDIUM - Compatibility coverage docs are stale. `coverage.rs` lists `TEXT` as
+covered (`crates/ql-functions/tests/coverage.rs:224`), but the matrix still
+marks `TEXT` as [no] with 0 tests and "Needs format parser"
+(`docs/compat/excel-matrix.md:171`), and display format parsing remains [no]
+(`docs/compat/excel-matrix.md:368`).
+
+PASS - GAP-F-07 is documented in `known-gaps.md` with Phase 4.10 target
+(`docs/known-gaps.md:78`), and `count_refs` cites that future compaction hook
+(`crates/ql-storage/src/format_overlay.rs:78`).
+
+MEDIUM - New gaps should be filed for (1) fraction-format V2 refusal, (2)
+format-cache staleness under low-level mutation, (3) qbook overlay unknown-id
+validation/fallback policy, and (4) full built-in table/xlsx import readiness.
+
+I. Test corpus completeness: MIXED
+==================================
+
+The direct corpus is substantial: parser/lexer/render/TEXT/runtime/qbook/oplog
+tests cover the common path and many edge cases. However, closure still needs
+the following gaps addressed.
+
+HIGH - Add regression tests for fraction V2 rejection (`parse("# ?/?")` and
+`TEXT(1, "# ?/?") -> #VALUE!`) because this would currently let a real
+incorrect render path ship. Spec and code citations are in A.
+
+MEDIUM - Add parser tests for `h:mm m` and exact error positions for trailing
+backslash/ghost. The mini-spec names `h:mm m` in its corpus
+(`docs/architecture/2026-05-13-format-string-grammar.md:333`), but parser tests
+currently stop at `h:mm:ss`, `mm:ss`, reverse `ss:mm`, and `h:mmm:s`
+(`crates/ql-functions/src/format/parser.rs:496`).
+
+MEDIUM - There is no parse -> re-string round-trip API/test despite the
+mini-spec saying every [yes] built-in should round-trip parse -> re-string
+(`docs/architecture/2026-05-13-format-string-grammar.md:301`). If no stringifier
+is intended for V1, the mini-spec should be amended.
+
+MEDIUM - Add an e2e save-with-formats -> load -> recompute -> read_display test.
+Current tests cover qbook format round-trip (`crates/ql-io/src/qbook_format.rs:2480`)
+and runtime replay/display separately (`crates/ql-exec/src/workbook_runtime.rs:4820`),
+but not the combined persistence/display path.
+
+MEDIUM - Renderer property/fuzz tests for digit padding/thousands/exponent
+invariants would be useful before xlsx import begins, but this is not a W5-84
+blocker if the concrete HIGH/MEDIUM cases above are fixed.
+
+J. Decision-doc fidelity: MIXED
+===============================
+
+MEDIUM - The mini-spec is not fully aligned with implementation:
+fraction refusal is missing (A), `h:mm m` disambiguation differs (A), and the
+parse -> re-string requirement has no implementation surface (I).
+
+MEDIUM - The parent design doc still contains pre-implementation drift:
+it sketches `FormatString { positive, negative, zero, text }` rather than the
+implemented `Vec<Section>` (`docs/architecture/2026-05-13-dates-times-formats.md:291`),
+says the parser carries `LocaleHints` (`dates-times-formats.md:284`) while
+`parse` is `parse(input: &str)` (`crates/ql-functions/src/format/parser.rs:25`),
+and leaves Phase 4.5 acceptance checkboxes unchecked/stale
+(`dates-times-formats.md:446`). Update it to mark 4.5.D/E shipped and explicitly
+defer locale hints/full built-ins where that is now the chosen implementation.
+
+What's needed for W5-84 closure
+===============================
+
+1. Fix HIGH fraction refusal:
+   - Detect `# ?/?` / fraction patterns and return
+     `FormatParseError::UnsupportedV2 { kind: V2Token::Fraction, position }`.
+   - Add parser and TEXT regression tests.
+
+2. Fix or explicitly defer `h:mm m`:
+   - Update `walk_for_anchor` so a prior `m/mm` stops the backward search, or
+     amend the mini-spec if the implementation behavior is intentional.
+   - Add tests for `h:mm m`, `mmm m`, `h:m`, `mm:ss`, and lone `mm`.
+
+3. Decide qbook unknown overlay-id policy:
+   - Prefer load-time `MalformedFormatOverlay` when an overlay id is absent from
+     `FormatTable`; otherwise file a known gap documenting General fallback on
+     corrupted files.
+
+4. Document `format_cache` staleness:
+   - Add a docstring/known-gap note analogous to `Workbook::set_date_system` for
+     low-level `formats_mut()` changes during a live `WorkbookRuntime`.
+
+5. Update docs/matrix:
+   - Mark `TEXT` and display format parsing as shipped/partial in
+     `docs/compat/excel-matrix.md`.
+   - Update `docs/architecture/2026-05-13-dates-times-formats.md` for shipped
+     4.5.D/E, actual AST/API shape, qbook schema v4, locale-hints deferral, and
+     built-in-table subset vs full-table/xlsx plan.
+
+6. Add combined e2e coverage:
+   - save workbook with custom formats + overlay -> load -> recompute formula
+     using `TEXT` -> `read_display`.
+
+7. Re-run targeted tests once `cargo` is available:
+   - `cargo test -p ql-functions format::`
+   - `cargo test -p ql-storage format`
+   - `cargo test -p ql-oplog format`
+   - `cargo test -p ql-io format`
+   - `cargo test -p ql-exec read_display text_formula intern_format set_cell_format`

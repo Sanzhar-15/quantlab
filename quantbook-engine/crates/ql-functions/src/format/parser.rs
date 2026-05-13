@@ -50,8 +50,43 @@ fn split_sections(tokens: &[Token]) -> Result<Vec<&[Token]>, FormatParseError> {
     Ok(sections)
 }
 
+/// **W5-84 closure (Codex HIGH-1):** detect the Excel fraction-format
+/// pattern `?/?` and reject it as V2-deferred. The lexer emits `?`/`/`
+/// as separate tokens (digit placeholder + literal slash), so the
+/// fraction pattern only surfaces here at the section level. Per
+/// mini-spec § 6 / § 10 / § 12.3, fraction formats must surface as
+/// `UnsupportedV2 { kind: Fraction }` — not silently render as digits +
+/// literal slash + digits.
+///
+/// Detection is intentionally minimal: any three-token run
+/// `Question, Literal('/'), Question` (possibly with intervening
+/// whitespace literals) anywhere in a section triggers the rejection.
+/// This catches `?/?`, `# ?/?`, `?/?? `, and the like.
+fn check_fraction_pattern(raw: &[Token]) -> Result<(), FormatParseError> {
+    // Scan for `?, (literal '/'), ?` triple. We don't allow other
+    // intervening tokens because fraction format's denominator placeholders
+    // must immediately follow the slash.
+    let mut i = 0;
+    while i + 2 < raw.len() {
+        let is_q1 = matches!(raw[i], Token::Question { .. });
+        let is_slash = matches!(raw[i + 1], Token::Literal { ch: '/', .. });
+        let is_q2 = matches!(raw[i + 2], Token::Question { .. });
+        if is_q1 && is_slash && is_q2 {
+            return Err(FormatParseError::UnsupportedV2 {
+                kind: crate::format::V2Token::Fraction,
+                position: raw[i].position(),
+            });
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 /// Build a `Section` from its raw token slice.
 fn build_section(raw: &[Token]) -> Result<Section, FormatParseError> {
+    // **W5-84 closure (Codex HIGH-1):** reject `?/?` fraction patterns
+    // before any section-assembly work happens. See `check_fraction_pattern`.
+    check_fraction_pattern(raw)?;
     if raw.is_empty() {
         return Ok(Section {
             kind: SectionKind::Empty,
@@ -294,7 +329,17 @@ fn walk_for_anchor(raw: &[Token], from: usize, forward: bool) -> Option<AnchorKi
         match &raw[i] {
             Token::TimeH { .. } => return Some(AnchorKind::Hour),
             Token::TimeS { .. } => return Some(AnchorKind::Second),
-            Token::DateY { .. } | Token::DateD { .. } => return Some(AnchorKind::DateYDM),
+            // **W5-84 closure (Codex MEDIUM + Sonnet MEDIUM A.1):** a
+            // prior `DateM` is itself a date/time anchor for the
+            // disambiguation rule (mini-spec § 4.1: "the most recent
+            // date/time token"). Treating it as a date-anchor means
+            // the new `m`/`mm` falls through to Month, NOT Minute.
+            // Without this stop, `h:mm m` walked past the leading `mm`
+            // back to the `h` and classified the trailing `m` as
+            // Minute — a user-visible rendering bug.
+            Token::DateY { .. } | Token::DateD { .. } | Token::DateM { .. } => {
+                return Some(AnchorKind::DateYDM);
+            }
             // Continue past spacer / ghost / literal / quoted / currency.
             _ => continue,
         }
@@ -733,6 +778,86 @@ mod tests {
     fn elapsed_time_error_is_uncovered_v2() {
         let err = parse("[h]:mm:ss").unwrap_err();
         assert!(matches!(err, FormatParseError::UnsupportedV2 { .. }));
+    }
+
+    // ===== W5-84 closure (Codex HIGH-1): fraction `?/?` rejection =====
+
+    #[test]
+    fn fraction_format_is_uncovered_v2() {
+        // Bare `?/?` is the Excel fraction format for proper fractions.
+        // Per mini-spec § 6 / § 12.3, must surface as UnsupportedV2(Fraction).
+        let err = parse("?/?").unwrap_err();
+        assert!(matches!(
+            err,
+            FormatParseError::UnsupportedV2 {
+                kind: crate::format::V2Token::Fraction,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn fraction_format_with_integer_part_is_uncovered_v2() {
+        // The `# ?/?` form mixes a whole-number placeholder with a
+        // fraction part. Must still surface as Fraction.
+        let err = parse("# ?/?").unwrap_err();
+        assert!(matches!(
+            err,
+            FormatParseError::UnsupportedV2 {
+                kind: crate::format::V2Token::Fraction,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn fraction_format_inside_section_is_uncovered_v2() {
+        // Fraction pattern in any section triggers — even if other
+        // sections are valid.
+        let err = parse("0;?/?").unwrap_err();
+        assert!(matches!(
+            err,
+            FormatParseError::UnsupportedV2 {
+                kind: crate::format::V2Token::Fraction,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn slash_between_non_question_tokens_is_not_fraction() {
+        // `d/m/yyyy` (date with slash separators) and `0/0` (literal
+        // slash between digits) MUST NOT be flagged as fraction.
+        let fs = parse_ok("m/d/yyyy");
+        assert_eq!(fs.sections[0].kind, SectionKind::Date);
+        let fs = parse_ok("0/0");
+        // No fraction error; section parses as Number with literal '/'.
+        assert_eq!(fs.sections[0].kind, SectionKind::Number);
+    }
+
+    // ===== W5-84 closure (Codex MEDIUM + Sonnet MEDIUM A.1):
+    //       `h:mm m` disambiguation =====
+
+    #[test]
+    fn mm_after_time_then_m_in_date_context_classifies_correctly() {
+        // **W5-84 fix:** the trailing `m` should be Month, not Minute.
+        // Mini-spec § 12.2 explicitly lists `"h:mm m"` → [minute, month].
+        // Before the fix, walk_for_anchor walked past the leading `mm`
+        // back to `h` and classified the trailing `m` as Minute too.
+        let fs = parse_ok("h:mm m");
+        // tokens: Hour, ':', Minute(mm,padded), ' ', Month(m, not padded)
+        assert!(matches!(
+            fs.sections[0].tokens[2],
+            SectionToken::Minute { padded: true }
+        ));
+        // The trailing m at index 4 (after ' ' Literal at 3).
+        assert!(matches!(
+            fs.sections[0].tokens[4],
+            SectionToken::Month {
+                padded: false,
+                role: MonthRole::Month,
+            }
+        ));
     }
 
     // ===== Error propagation from lexer =====

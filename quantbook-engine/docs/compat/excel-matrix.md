@@ -168,7 +168,7 @@ as partial, rows with `❌` are missing.
 | REPLACE | ⚠️ | 3 | 4.3 V2 | W5-56: position-based replace. 1-based start_num; num_chars 0 = pure insert; start past end appends. Out-of-bounds args clamp gracefully. |
 | REPT | ⚠️ | 3 | 4.3 V2 | W5-56: text repeat. Excel canonical 32,767-character cap enforced (returns #VALUE! when exceeded). Negative num_times → #VALUE!. |
 | EXACT | ✅ | 2 | 4.3 V2 | W5-56: case-sensitive equality. Numbers coerce to text before compare. |
-| TEXT | ❌ | 0 | 4.5 | Needs format parser |
+| TEXT | ✅ | 28 | 4.5.E | W5-83: render Value via parsed Excel format string. Built on the W5-77→W5-82 format module (parser+renderer+FormatTable+overlay+runtime). Parse failures (incl. V2-deferred [Red]/conditionals/elapsed/fraction) surface as #VALUE!. Tests in `format::text_fn::tests` + `workbook_runtime::tests::text_formula_*` + e2e `format_persistence_round_trip_through_qbook`. |
 | VALUE / NUMBERVALUE | ❌ | 0 | 4.3 | Text → number coercion as function |
 | FIXED / DOLLAR | ❌ | 0 | 4.5 | |
 | CHAR / CODE / UNICODE / UNICHAR | ❌ | 0 | 4.3 | |
@@ -362,11 +362,11 @@ as partial, rows with `❌` are missing.
 | Feature | Status | Phase | Notes |
 |---|---|---|---|
 | Excel 1900 epoch (Windows default) | ⚠️ | 4.5 | NOW/TODAY use approximate 1899-12-30 epoch; 1900 leap-year quirk NOT modeled |
-| Excel 1904 epoch (Mac legacy) | ❌ | 4.5 | DTF-4-01 policy decision |
-| Date serial arithmetic | ⚠️ | 4.5 | Number arithmetic works; date-aware fns absent |
-| Time serial arithmetic | ❌ | 4.5 | |
-| Display format parsing | ❌ | 4.5 | Storage value vs display split — DTF-4-04 |
-| Locale-sensitive date formats | ❌ | 4.5 | en-US / en-GB / de / fr |
+| Excel 1904 epoch (Mac legacy) | ✅ | 4.5.A | DTF-4-01 shipped W5-71; Workbook::date_system + .qbook v3 migration |
+| Date serial arithmetic | ✅ | 4.5.B/C | 22 date/time fns shipped W5-72→W5-75 (V1 18/18 + V2 4/6) |
+| Time serial arithmetic | ✅ | 4.5.B | HOUR/MINUTE/SECOND/TIME shipped W5-72 |
+| Display format parsing | ✅ | 4.5.D | DTF-4-04 shipped W5-77→W5-82: parser + renderer + FormatTable + sparse overlay + .qbook v4 + WorkbookRuntime::read_display |
+| Locale-sensitive date formats | ⚠️ | 4.9 | en-US only in V1 (Phase 4.5 ships); de/fr fixtures land Phase 4.9 per Codex HIGH 3 re-scope |
 
 ---
 

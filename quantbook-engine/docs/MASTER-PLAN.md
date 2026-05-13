@@ -445,10 +445,19 @@ The full v1 means all of these crates either ship real behavior or have a docume
    Acceptance: COER-4-01 matrix checked in ✅; COER-4-02 arithmetic, comparison, aggregate, logical, and text coercion cases covered ✅ (W5-65 tests); COER-4-03 no silent fallback for unsupported variants ✅ (W5-64 NaN/Inf policy + matrix-tests).  
    Effort spent: ~3 sessions implementation. Mega-audit cycle pending.
 
-5. **4.5 Dates, Times, Number Formats**  
+5. **4.5 Dates, Times, Number Formats — ✅ FULLY SHIPPED 2026-05-13 (W5-69 → W5-84)**  
    Implement serial date systems, time arithmetic, display formatting, parse formatted numbers, and locale-sensitive format tokens.  
    **Design doc (Codex-reviewed W5-68):** `docs/architecture/2026-05-13-dates-times-formats.md` — 6 sub-phases (4.5.A.0 EvalContext tier, 4.5.A epoch+serial, 4.5.B 18-fn V1 wave, 4.5.C 7-fn V2 wave, 4.5.D format parser + sparse overlay + op-log, 4.5.E TEXT() + locale stubs). 4 HIGH + 8 MEDIUM + 5 LOW Codex findings synthesized into the design.  
    **4.5.D companion mini-spec (W5-77):** `docs/architecture/2026-05-13-format-string-grammar.md` — EBNF + token table + section semantics + V1/V2 split + IronCalc-divergence catalog + error categories. Lands BEFORE parser implementation per design doc § 13 (W5-49 pattern).  
+   **Sub-phase status:**
+   - **4.5.A.0** ✅ SHIPPED W5-69 — `EvalContext` + `ContextAwareFn` registry tier.
+   - **4.5.A** ✅ SHIPPED W5-70/W5-71 — `ql-types::date` module + `Workbook::date_system` + `.qbook` schema v3 migration.
+   - **4.5.B** ✅ SHIPPED W5-72/W5-73/W5-74 — V1 date/time function wave (18/18: DATE/YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/TIME/DATEVALUE/TIMEVALUE/NOW/TODAY/WEEKDAY/EOMONTH/EDATE/DAYS/NETWORKDAYS/WORKDAY/YEARFRAC).
+   - **4.5.C** ✅ SHIPPED W5-75 — V2 wave 4/6 (DATEDIF/DAYS360/WEEKNUM/ISOWEEKNUM; NETWORKDAYS.INTL + WORKDAY.INTL deferred to tier-4 build).
+   - **4.5.D** ✅ SHIPPED W5-77a → W5-82 — format parser + renderer + FormatTable + sparse overlay + op-log + `.qbook` schema v4 + WorkbookRuntime wrappers + `read_display`.
+   - **4.5.E** ✅ SHIPPED W5-83 — `TEXT(value, format_string)` formula function.
+   - **Mid-arc mega-audit** ✅ W5-76 — closed 3 HIGH + 5 MEDIUM on the V1+V2 date wave.
+   - **Closing mega-audit** ✅ W5-84 — closed 1 HIGH (fraction `?/?` V2 rejection missing) + 3 MEDIUM (`walk_for_anchor` DateM stop, `.qbook` overlay-id validation, producer-replay equivalence format coverage) + filed GAP-F-12 (format_cache staleness) + GAP-F-13 (built-in table subset for xlsx).  
    References: `.references/ironcalc/base/src/formatter/`; `.references/ironcalc/base/src/functions/date_and_time.rs`; `.references/formualizer/crates/formualizer-workbook/tests/calamine/dates.rs`.  
    Acceptance: DTF-4-01 1900/1904 policy explicit; DTF-4-02 date/time functions match matrix; **DTF-4-03 re-scoped to "format parser has en-US fully populated + extension point for locale; en/de/fr behavior tests move to Phase 4.9"** (Codex HIGH 3); DTF-4-04 storage distinguishes value from display format via sparse format overlay + workbook FormatTable.  
    Effort: ~6-8 sessions implementation + 1 mega-audit per the design doc § 8 (Codex MEDIUM 3 re-estimate; Phase 4.4 reference: estimated 2.5 sessions, took 5).

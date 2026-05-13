@@ -382,3 +382,99 @@ fn standalone_transaction_with_oplog_produces_batch_commit() {
     assert_eq!(replay_wb.read(Address::new(0, 0, 0)), Value::Number(42.0));
     assert_eq!(replay_wb.read(Address::new(0, 0, 1)), Value::Number(43.0));
 }
+
+// ===== W5-84 closure (Codex MEDIUM + Sonnet MEDIUM I.2):
+//       E2E format persistence round-trip =====
+
+/// Real producer → save to `.qbook` → load → recompute → `read_display`.
+/// This is the full end-to-end persistence + display path for the
+/// Phase 4.5.D + 4.5.E arc. Prior tests covered the layers in
+/// isolation but never the combined flow.
+#[test]
+fn format_persistence_round_trip_through_qbook() {
+    use ql_storage::FormatId;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("formats_e2e.qbook");
+    let reg = default_registry();
+
+    // ===== Producer side =====
+    let mut producer_wb = fresh_wb();
+    let custom_id;
+    {
+        let mut rt = WorkbookRuntime::new(&mut producer_wb, &reg);
+        // Number value with built-in date format.
+        rt.set_value(0, 0, 0, Value::Number(45477.0)).unwrap(); // 2024-07-04
+        rt.set_cell_format(0, 0, 0, Some(FormatId(14))).unwrap();
+        // Number value with custom format.
+        rt.set_value(0, 1, 0, Value::Number(1234.5)).unwrap();
+        custom_id = rt.intern_format("#,##0.00").unwrap();
+        rt.set_cell_format(0, 1, 0, Some(custom_id)).unwrap();
+        // Formula that uses TEXT() — value should be the rendered string.
+        rt.set_formula(0, 2, 0, "TEXT(A1, \"yyyy-mm-dd\")").unwrap();
+        let _ = rt.recompute_all();
+    }
+    // Snapshot expected display values on the producer side.
+    let producer_display_a1 = {
+        let mut rt = WorkbookRuntime::new(&mut producer_wb, &reg);
+        rt.read_display(0, 0, 0)
+    };
+    let producer_display_a2 = {
+        let mut rt = WorkbookRuntime::new(&mut producer_wb, &reg);
+        rt.read_display(0, 1, 0)
+    };
+    assert_eq!(producer_display_a1, "7/4/2024");
+    assert_eq!(producer_display_a2, "1,234.50");
+
+    // ===== Save =====
+    ql_io::save_workbook(&producer_wb, "formats_e2e", &path).unwrap();
+
+    // ===== Load + recompute =====
+    let (loaded_wb, _result) = load_workbook_and_recompute(&path, &reg).unwrap();
+
+    // FormatTable: the custom entry survived.
+    assert_eq!(
+        loaded_wb.formats().lookup(custom_id),
+        Some("#,##0.00"),
+        "custom format string must survive .qbook round-trip"
+    );
+    // Per-sheet overlay: bindings survived.
+    assert_eq!(
+        loaded_wb.sheet(0).unwrap().format_overlay().get(0, 0),
+        Some(FormatId(14)),
+        "built-in id 14 binding must survive round-trip"
+    );
+    assert_eq!(
+        loaded_wb.sheet(0).unwrap().format_overlay().get(1, 0),
+        Some(custom_id),
+        "custom id binding must survive round-trip"
+    );
+    // Cell values survive too.
+    assert_eq!(
+        loaded_wb.read(Address::new(0, 0, 0)),
+        Value::Number(45477.0)
+    );
+    assert_eq!(loaded_wb.read(Address::new(0, 1, 0)), Value::Number(1234.5));
+    // TEXT formula's value (post-recompute) — should be the rendered string.
+    assert_eq!(
+        loaded_wb.read(Address::new(0, 2, 0)),
+        Value::text("2024-07-04"),
+        "TEXT(A1, \"yyyy-mm-dd\") must round-trip + recompute to the rendered string"
+    );
+
+    // ===== read_display on the reloaded workbook =====
+    let mut loaded_wb_mut = loaded_wb;
+    let mut rt = WorkbookRuntime::new(&mut loaded_wb_mut, &reg);
+    assert_eq!(
+        rt.read_display(0, 0, 0),
+        "7/4/2024",
+        "read_display through reloaded FormatTable + overlay must match producer"
+    );
+    assert_eq!(
+        rt.read_display(0, 1, 0),
+        "1,234.50",
+        "custom-format read_display must match producer"
+    );
+    // Unbound cell (the TEXT formula's output) renders via General path.
+    assert_eq!(rt.read_display(0, 2, 0), "2024-07-04");
+}
