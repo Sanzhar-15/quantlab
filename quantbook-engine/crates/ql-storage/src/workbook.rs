@@ -252,6 +252,15 @@ impl Workbook {
     /// when missing from the envelope) and by xlsx import in Phase 4.11.
     /// Switching post-load shifts every serial by 1462 days — not
     /// recommended as a runtime operation.
+    ///
+    /// **W5-76 mega-audit caveat:** `WorkbookEnv` (`ql-exec`) caches the
+    /// `EvalContext` (and therefore the `DateSystem`) at construction.
+    /// Mutating the workbook's date system AFTER a `WorkbookEnv` has been
+    /// constructed will produce a stale eval context until a fresh
+    /// `WorkbookEnv` is created. Today every recompute path constructs
+    /// a fresh `WorkbookEnv`, so normal evaluation is safe; callers that
+    /// hold a long-lived `WorkbookEnv` across `set_date_system` must
+    /// rebuild it. Treat this method as loader-only.
     pub fn set_date_system(&mut self, system: ql_types::DateSystem) {
         self.date_system = system;
     }

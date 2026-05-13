@@ -1,0 +1,75 @@
+I could not save a report file because this session’s filesystem sandbox is read-only and no dispatch output path/tool was available. Audit result follows.
+
+# Phase 4.5 Mega-Audit Verdict
+
+Phase 4.5 is not clean. The core 1900/1904 conversion module is mostly solid, and the context-aware registry tier is wired correctly, but the date-function layer has two real correctness problems: `ISOWEEKNUM` fails valid lower-bound dates whose ISO-week anchor falls before the workbook epoch, and `YEARFRAC(..., 0)` now contradicts the newly shipped `DAYS360(..., FALSE)` implementation even though both are supposed to represent US/NASD 30/360 semantics. There are also several medium-risk scope and consistency gaps: serial `0` is invalid for `serial_to_ymd(0, Excel1900)` but some higher-level date functions accept it silently; `WorkbookEnv` snapshots `date_system`; `GAP-T-01` is still open despite being targeted at Phase 4.5.A; and the coverage waiver list got worse.
+
+## NEW HIGH
+
+1. **`ISOWEEKNUM` returns `#NUM!` for valid epoch-edge dates.**  
+   `isoweeknum_ctx` computes the Thursday anchor by serial arithmetic, then calls `serial_to_ymd(thursday_serial, ctx.date_system)` without handling anchors before the workbook epoch. For `Excel1900`, `ISOWEEKNUM(1)` is valid input: serial 1 is 1900-01-01. The code computes Sunday, then `thursday_int = -2`, and `serial_to_ymd(-2, Excel1900)` returns `#NUM!`. Same class for `Excel1904` serial 0, a legitimate 1904-system epoch date. See `crates/ql-functions/src/date_fns.rs:1069-1093`; `serial_to_ymd` rejects negatives at `crates/ql-types/src/date.rs:171-176`. This is not a documented divergence and the W5-75 tests only cover modern dates.
+
+2. **`YEARFRAC(..., 0)` is internally inconsistent with `DAYS360(..., FALSE) / 360`.**  
+   `YEARFRAC` basis 0 falls through to European 30/360 at `crates/ql-functions/src/date_fns.rs:801-807`, while `DAYS360` implements a US/NASD-style day-31 adjustment at `crates/ql-functions/src/date_fns.rs:974-984`. Example: Jan 31 to Feb 29, 2024. `DAYS360(FALSE)` returns 29 days per the W5-75 code/tests, while `YEARFRAC(..., 0)` returns 28/360 because it does not adjust the start day 31 to 30. GAP-F-11 documents `YEARFRAC` basis 0 as simplified, but after W5-75 the proper-ish US helper exists and is not reused. This is false confidence: both functions are registered, both expose the same convention family, and they disagree.
+
+## NEW MEDIUM
+
+1. **Serial-0 policy is inconsistent above the conversion layer.**  
+   The core contract says `serial_to_ymd(0, Excel1900)` is `#NUM!` (`crates/ql-types/src/date.rs:178-188`). `YEAR/MONTH/DAY`, `EOMONTH`, `EDATE`, `DAYS360`, and `WEEKNUM` mostly inherit that. But `WEEKDAY(0, Excel1900)` returns a weekday via direct serial math (`crates/ql-functions/src/date_fns.rs:469-515`), `WORKDAY(0, 0)` returns 0 before validating (`crates/ql-functions/src/date_fns.rs:704-706`), `NETWORKDAYS(0,0)` iterates and returns 0 (`crates/ql-functions/src/date_fns.rs:670-683`), and `YEARFRAC(0,0)` returns 0 before validating (`crates/ql-functions/src/date_fns.rs:764-767`). Either serial 0 is a valid Excel oddity for these functions, or it is not. Today the behavior is accidental and untested.
+
+2. **`WorkbookEnv` caches `date_system`; mutable workbook APIs can stale it.**  
+   `WorkbookEnv::new` snapshots `workbook.date_system()` into `eval_ctx` at construction (`crates/ql-exec/src/env.rs:92-99`), and `eval_context()` returns that cached value (`crates/ql-exec/src/env.rs:213-219`). `Workbook::set_date_system` is public and can mutate after env construction (`crates/ql-storage/src/workbook.rs:250-256`). Current runtime paths create fresh envs around eval, so normal formula evaluation is probably safe, but the API shape is footgun-prone. If `set_date_system` is intended loader-only, make that impossible or document the invalidation requirement.
+
+3. **`GAP-T-01` is stale and under-closed.**  
+   `NowProvider::System` still returns UTC offset 0 by design (`crates/ql-types/src/eval_context.rs:92-108`), and the known gap still targets “Engine Phase 4.5.A (immediate)” (`docs/known-gaps.md:79`) even though W5-75 is past 4.5.A. Production `NOW/TODAY` remain regression-neutral versus the old UTC path, but the docs overstate schedule closure.
+
+4. **WASM clock panic remains reachable through default context.**  
+   The code explicitly says `NowProvider::System` can panic on `wasm32-unknown-unknown` and callers must guard or inject `Test` (`crates/ql-types/src/eval_context.rs:62-66`). `DEFAULT_EVAL_CONTEXT` uses `System` (`crates/ql-types/src/eval_context.rs:130-134`), and `CellEnv::eval_context()` defaults to it (`crates/ql-exec/src/env.rs:69-77`). No cfg guard is present.
+
+5. **Coverage guardrail weakened further.**  
+   `coverage.rs::EXPLICITLY_DEFERRED` now waives all date functions with “covered by date_fns tests” reasons (`crates/ql-functions/tests/coverage.rs:189-223`). Those module tests are useful, but they do not follow the matrix convention for canon vs V1 divergence. The W5-62 concern that this file is becoming a waiver list is valid.
+
+6. **DATEVALUE parser doc is self-contradictory.**  
+   The parser comment says 2-digit years use `50-99 -> 1950-1999; 00-49 -> 2000-2049` (`crates/ql-functions/src/date_fns.rs:292-293`), while the implementation and tests correctly use Excel’s 00-29 / 30-99 split (`crates/ql-functions/src/date_fns.rs:318-324`, `:1597-1608`). Code is right; local docs are wrong.
+
+## NEW LOW
+
+1. `docs/known-gaps.md` header still says last touched W5-58 even though W5-74 added GAP-F-08 through GAP-F-11 and GAP-T-01 remains active (`docs/known-gaps.md:3-5`, `:74-79`).
+
+2. `YEARFRAC` basis 1 is documented as a V1 approximation in comments but not filed as its own known gap; only basis 0 has GAP-F-11 (`crates/ql-functions/src/date_fns.rs:787-799`, `docs/known-gaps.md:77`).
+
+3. W5-74 commit subject says “wave 3 (4 of 18)” while the body correctly says it closes 18/18. Minor trace sloppiness, but this arc relies heavily on commit-message protocol claims.
+
+## Per-Concern Verdict
+
+A: **Mostly pass.** Core 1900/1904 conversion is correct: serial 60 and serial 0 behave as intended in `serial_to_ymd` / `ymd_to_serial` (`crates/ql-types/src/date.rs:167-276`). `YEAR(0)` in 1904 works through `serial_to_ymd`; `DATEVALUE("1904-01-01")` returns 0; `EOMONTH(0,0)` in 1904 should return Jan 31. The unresolved issue is 1900-system serial 0 consistency in higher-level functions.
+
+B: **Pass with caveat.** Dispatch order is range-aware, then context-aware, then scalar (`crates/ql-exec/src/scalar.rs:138-182`). Registry cross-table collisions panic (`crates/ql-functions/src/registry.rs:59-152`). `MapEnv` gets default Excel1900 (`crates/ql-exec/src/env.rs:69-77`, `:239-246`). Transaction path uses `WorkbookEnv` (`crates/ql-exec/src/transaction.rs:375-378`). Caveat: cached `WorkbookEnv` context can stale if reused across `set_date_system`.
+
+C: **Pass.** Schema v3 saves `date_system` (`crates/ql-io/src/qbook_format.rs:904-910`), missing field defaults to Excel1900 on load (`:1077-1083`), round-trip tests exist (`:2162-2210`), and future v4 is rejected (`:2296-2323`). No `Op::SetWorkbookDateSystem` shipped; that is acceptable only because date system is workbook-envelope state, not an edit operation today.
+
+D: **Mostly pass, with open target drift.** `now_ctx` and `today_ctx` are date-system-aware (`crates/ql-functions/src/volatile.rs:143-190`), test override still works (`:415-424`), and Unix epoch in 1904 returns 24107 (`:379-390`). Production offset is still 0 by `NowProvider::System`, matching pre-W5-71 behavior. WASM remains unguarded.
+
+E: **Pass.** DATE cascade uses serial arithmetic (`crates/ql-functions/src/date_fns.rs:120-141`) and tests cover phantom, overflow, underflow, two-digit year, and 1899+1900 behavior (`:1853-1948`). `DATE(1900,1,0)` correctly falls below min serial and returns `#NUM!`.
+
+F: **Mostly pass.** WEEKDAY direct serial math is implemented as intended (`crates/ql-functions/src/date_fns.rs:481-515`) and covers return types 1/2/3 and 1904 serial 0 in tests (`:1695-1738`). Missing: explicit test for `WEEKDAY(60,1)` and 11-17 concrete examples. Also decide serial 0 in 1900.
+
+G: **Pass as scoped, with doc nit.** V1 en-US parsing is narrow and documented (`crates/ql-functions/src/date_fns.rs:286-331`). It rejects dots/month names, trims whitespace, and pins phantom date. Two-digit code is correct, comment is wrong.
+
+H: **Pass but under-specified for users.** GAP-F-09/F-10 document holiday deferral (`docs/known-gaps.md:75-76`), and functions reject 3 args (`crates/ql-functions/src/date_fns.rs:657-660`, `:692-695`). Tier-4 signature is named clearly enough, but there is no practical workaround beyond manual subtraction.
+
+I: **Fail.** DAYS360 has partial US/NASD logic; YEARFRAC basis 0 does not reuse it. This is a real internal inconsistency.
+
+J: **Mostly pass.** 2024 fixtures are realistic: Jan 1, 2024 Monday; `NETWORKDAYS` Jan 1 to Jan 5 = 5; ISO week 1 is correct. Tests are weak around edge years and sometimes assert ranges instead of exact values (`crates/ql-functions/src/date_fns.rs:1271-1299`).
+
+K: **Fail as a guardrail.** The coverage list now waives all date functions into module tests. That may be acceptable temporarily, but it is not equivalent to matrix-backed canon/divergence coverage.
+
+L: **Mixed.** Commit messages claim 7 gates green for W5-72 through W5-75 and include test counts. I did not rerun gates because the sandbox is read-only. MASTER-PLAN is broadly in sync for Phase 4.5, but known-gaps metadata is stale and GAP-T-01 target drift is unresolved.
+
+## What’s Needed For W5-76 Closure
+
+- Fix `ISOWEEKNUM` lower-bound handling for `Excel1900` serial 1 and `Excel1904` serial 0; add regression tests.
+- Refactor `YEARFRAC` basis 0 to share the `DAYS360(FALSE)` US/NASD adjustment helper, or explicitly mark `YEARFRAC` as intentionally divergent despite `DAYS360` support.
+- Decide and test serial 0 policy for `WEEKDAY`, `WORKDAY`, `NETWORKDAYS`, and `YEARFRAC` in Excel1900.
+- Update GAP-T-01 target/status and known-gaps header metadata.
+- Move at least date canon/divergence cases out of `EXPLICITLY_DEFERRED` waiver territory into matrix-style tests.

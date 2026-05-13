@@ -100,11 +100,27 @@ impl NowProvider {
                 // with the actual local-offset lookup. Until then, NOW()
                 // is UTC-equivalent — preserves the current pre-W5-69
                 // behavior for compatibility.
-                let secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|_| ErrorValue::Num)?
-                    .as_secs();
-                Ok((secs, 0))
+                //
+                // **W5-76 mega-audit fix (WASM clock guard):** on
+                // `wasm32-unknown-unknown`, `std::time::SystemTime::now()`
+                // panics ("time not implemented on this platform").
+                // Surface that as `#NUM!` instead of bringing the
+                // workbook down — callers (Phase 6.3 WASM bindings)
+                // SHOULD inject `Test { unix_secs: <host-clock>, ... }`
+                // for real time on WASM; this fallback exists to keep a
+                // mis-configured WASM build computable.
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                {
+                    return Err(ErrorValue::Num);
+                }
+                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+                {
+                    let secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|_| ErrorValue::Num)?
+                        .as_secs();
+                    Ok((secs, 0))
+                }
             }
         }
     }

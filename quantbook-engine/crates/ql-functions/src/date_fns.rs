@@ -9,8 +9,8 @@
 //! DAYS, NETWORKDAYS, WORKDAY, YEARFRAC) land in W5-73/W5-74.
 
 use ql_types::{
-    coercion, days_in_month, hms_to_fraction, is_leap_year, serial_to_ymd, ymd_to_serial,
-    DateSystem, ErrorValue, EvalContext, Value,
+    coercion, days_in_month, hms_to_fraction, is_leap_year, serial_to_ymd, unix_days_to_ymd,
+    ymd_to_serial, ymd_to_unix_days, DateSystem, ErrorValue, EvalContext, Value,
 };
 
 // ============================================================================
@@ -289,8 +289,8 @@ pub fn time(args: &[Value]) -> Value {
 /// Accepted forms:
 /// - ISO 8601: `YYYY-MM-DD`
 /// - US slash: `M/D/YYYY`, `MM/DD/YYYY`
-/// - US slash, 2-digit year: `M/D/YY` (50-99 → 1950-1999;
-///   00-49 → 2000-2049 per Excel canon for `DATEVALUE`).
+/// - US slash, 2-digit year: `M/D/YY` (00-29 → 2000-2029;
+///   30-99 → 1930-1999 per Excel canon for `DATEVALUE`).
 /// - ISO with leading zeros (`2024-01-05`) or without (`2024-1-5`).
 ///
 /// Returns `Err(#VALUE!)` on any unrecognized format. Month / day range
@@ -315,9 +315,8 @@ fn parse_date_text(text: &str) -> Result<(i32, u32, u32), ErrorValue> {
             let mi: u32 = m.parse().map_err(|_| ErrorValue::Value)?;
             let di: u32 = d.parse().map_err(|_| ErrorValue::Value)?;
             let yi_raw: i32 = y.parse().map_err(|_| ErrorValue::Value)?;
-            // 2-digit year convention (Excel DATEVALUE):
-            // 0-29 → 2000-2029; 30-99 → 1930-1999.
-            // (We pin a slightly more conservative split at 50.)
+            // 2-digit year convention (Excel DATEVALUE canon):
+            // 00-29 → 2000-2029; 30-99 → 1930-1999.
             let yi = if (0..=29).contains(&yi_raw) {
                 yi_raw + 2000
             } else if (30..=99).contains(&yi_raw) {
@@ -470,6 +469,16 @@ pub fn weekday_ctx(args: &[Value], ctx: &EvalContext) -> Value {
         return Value::Error(ErrorValue::Num);
     }
     let serial_int = serial.trunc() as i64;
+    // **W5-76 (Phase 4.5 mega-audit MEDIUM, serial-0 policy):** in
+    // Excel1900, serial 0 is the "1/0/1900" formatter oddity, NOT a
+    // real date. Reject for parity with `serial_to_ymd` and the rest
+    // of the date-function family (YEAR/MONTH/DAY/EOMONTH/EDATE/
+    // DAYS360/WEEKNUM/ISOWEEKNUM already reject via `serial_to_ymd`).
+    // Excel1904 serial 0 IS the legitimate epoch (1904, 1, 1) and is
+    // still accepted.
+    if matches!(ctx.date_system, DateSystem::Excel1900) && serial_int == 0 {
+        return Value::Error(ErrorValue::Num);
+    }
     let return_type: i64 = if args.len() == 2 {
         match to_int_date_arg(&args[1]) {
             Ok(n) => n,
@@ -504,10 +513,17 @@ pub fn weekday_ctx(args: &[Value], ctx: &EvalContext) -> Value {
             }
         }
         n @ 12..=16 => {
-            // n=12: 1=Tue..7=Mon. n=13: 1=Wed..7=Tue. ... n=16: 1=Sat..7=Fri.
-            // Anchor: n=12 maps Tuesday (dow_sun_zero=2) to 1.
-            // Anchor offset = n - 11 (1..=5).
-            let anchor = n - 11;
+            // **W5-76 (Phase 4.5 mega-audit HIGH-2 fix):** anchor was
+            // `n - 11` which gave the wrong day-of-week start. Correct
+            // formula: `anchor = n - 10`. Mapping:
+            //   n=12 → anchor=2 (Tuesday is day 1 — verified: dow=Tue=2,
+            //          `(2 - 2) % 7 + 1 = 1`)
+            //   n=13 → anchor=3 (Wednesday is day 1)
+            //   n=14 → anchor=4 (Thursday is day 1)
+            //   n=15 → anchor=5 (Friday is day 1)
+            //   n=16 → anchor=6 (Saturday is day 1)
+            // Pinned by `weekday_return_type_12_through_16_exhaustive`.
+            let anchor = n - 10;
             (dow_sun_zero - anchor).rem_euclid(7) + 1
         }
         _ => return Value::Error(ErrorValue::Num),
@@ -594,10 +610,12 @@ pub fn edate_ctx(args: &[Value], ctx: &EvalContext) -> Value {
         return Value::Error(ErrorValue::Num);
     }
     let clamped_d = d.min(max_day);
-    // **W5-68 § 3.2 / serial-60 contract:** in Excel1900, if EDATE
-    // lands on (1900, 2, 29) (e.g., EDATE(1900-03-29, -1)), return the
-    // phantom serial 60. Otherwise route through ymd_to_serial which
-    // handles the phantom on its own.
+    // **W5-68 § 3.2 / serial-60 contract:** `ymd_to_serial` handles the
+    // Excel1900 phantom day on its own — if EDATE clamps to (1900, 2, 29)
+    // (e.g., `EDATE(1900-03-29, -1)`), the inner call returns serial 60
+    // without any extra branching here. **W5-76 (Phase 4.5 mega-audit
+    // HIGH-S2 fix):** comment was misleading — it implied a special-case
+    // branch existed in EDATE itself.
     match ymd_to_serial(norm_y, norm_m, clamped_d, ctx.date_system) {
         Ok(s) => Value::Number(s),
         Err(e) => Value::Error(e),
@@ -669,6 +687,12 @@ pub fn networkdays_ctx(args: &[Value], ctx: &EvalContext) -> Value {
     };
     let start_int = start.trunc() as i64;
     let end_int = end.trunc() as i64;
+    // **W5-76 (Phase 4.5 mega-audit MEDIUM, serial-0 policy):** reject
+    // Excel1900 serial 0 (the "1/0/1900" formatter oddity) at the
+    // endpoints. Mirrors WEEKDAY / YEAR / MONTH / DAY contract.
+    if matches!(ctx.date_system, DateSystem::Excel1900) && (start_int == 0 || end_int == 0) {
+        return Value::Error(ErrorValue::Num);
+    }
     let (lo, hi, sign) = if start_int <= end_int {
         (start_int, end_int, 1i64)
     } else {
@@ -702,6 +726,11 @@ pub fn workday_ctx(args: &[Value], ctx: &EvalContext) -> Value {
         Err(e) => return Value::Error(e),
     };
     let mut cur = start.trunc() as i64;
+    // **W5-76 (Phase 4.5 mega-audit MEDIUM, serial-0 policy):** reject
+    // Excel1900 serial 0 at start. Mirrors WEEKDAY / NETWORKDAYS.
+    if matches!(ctx.date_system, DateSystem::Excel1900) && cur == 0 {
+        return Value::Error(ErrorValue::Num);
+    }
     if days == 0 {
         return Value::Number(cur as f64);
     }
@@ -761,6 +790,15 @@ pub fn yearfrac_ctx(args: &[Value], ctx: &EvalContext) -> Value {
     if !(0..=4).contains(&basis) {
         return Value::Error(ErrorValue::Num);
     }
+    // **W5-76 (Phase 4.5 mega-audit MEDIUM, serial-0 policy):** reject
+    // Excel1900 serial 0 BEFORE the same-date short-circuit, so
+    // `YEARFRAC(0, 0)` returns `#NUM!` (consistent with `serial_to_ymd`)
+    // rather than silently 0.0. Mirrors WEEKDAY / WORKDAY / NETWORKDAYS.
+    if matches!(ctx.date_system, DateSystem::Excel1900)
+        && (s_start.trunc() as i64 == 0 || s_end.trunc() as i64 == 0)
+    {
+        return Value::Error(ErrorValue::Num);
+    }
     // Reject identical dates with positive denominator (Excel canon
     // returns 0.0).
     if s_start.trunc() == s_end.trunc() {
@@ -798,11 +836,29 @@ pub fn yearfrac_ctx(args: &[Value], ctx: &EvalContext) -> Value {
                 actual_days / 365.25
             }
         }
-        0 | 4 => {
-            // European 30/360 (V1 also serves basis 0; see GAP-F-11).
-            let days_360 = 360.0 * (hy as f64 - ly as f64)
-                + 30.0 * (hm as f64 - lm as f64)
-                + (hd as f64 - ld as f64);
+        0 => {
+            // **W5-76 (Phase 4.5 mega-audit HIGH-1 fix):** basis 0 is
+            // US NASD 30/360 — share the DAYS360(FALSE) algorithm so
+            // `YEARFRAC(s, e, 0)` and `DAYS360(s, e, FALSE)/360` agree.
+            // Previously basis 0 fell through to European 30/360
+            // (basis 4), causing internal-inconsistency on day-31
+            // dates. GAP-F-11 still applies for the Feb-29 NASD edges.
+            let days = days360_count(ly, lm, ld, hy, hm, hd, false);
+            days as f64 / 360.0
+        }
+        4 => {
+            // **YEARFRAC basis 4 (European 30/360):** intentionally
+            // does NOT day-31 adjust — matches real-Excel's quirk that
+            // `YEARFRAC(2024-01-01, 2024-12-31, 4) == 1.0` rather than
+            // the strict 30E/360 value 359/360. Note this means
+            // `YEARFRAC(..., 4) != DAYS360(..., TRUE) / 360` for inputs
+            // where start_day or end_day == 31; the two conventions
+            // diverge in Excel as well. **W5-76 mega-audit MEDIUM:**
+            // documented as intentional, not a bug — the OLD-Excel
+            // behavior is what users on Excel-parity spreadsheets
+            // expect.
+            let days_360 =
+                360.0 * (hy - ly) as f64 + 30.0 * (hm as f64 - lm as f64) + (hd as f64 - ld as f64);
             days_360 / 360.0
         }
         _ => unreachable!("basis range checked above"),
@@ -955,35 +1011,51 @@ pub fn days360_ctx(args: &[Value], ctx: &EvalContext) -> Value {
     } else {
         false
     };
-    let (sy, sm, mut sd) = match serial_to_ymd(start, ctx.date_system) {
+    let (sy, sm, sd) = match serial_to_ymd(start, ctx.date_system) {
         Ok(v) => v,
         Err(e) => return Value::Error(e),
     };
-    let (ey, em, mut ed) = match serial_to_ymd(end, ctx.date_system) {
+    let (ey, em, ed) = match serial_to_ymd(end, ctx.date_system) {
         Ok(v) => v,
         Err(e) => return Value::Error(e),
     };
-    // Apply day-31 adjustment.
+    let days = days360_count(sy, sm, sd, ey, em, ed, european);
+    Value::Number(days as f64)
+}
+
+/// Shared US/European 30/360 day-count helper used by `DAYS360` and
+/// `YEARFRAC(basis ∈ {0, 4})`.
+///
+/// **W5-76 (Phase 4.5 mega-audit HIGH-1 fix):** centralized so the two
+/// functions can't disagree on the day-31 → day-30 adjustment. Before
+/// W5-76, `YEARFRAC(s, e, 0)` used European 30/360 while `DAYS360(s, e,
+/// FALSE)` used the US NASD adjustment, producing different answers on
+/// day-31 dates. Codex + Sonnet mega-audit both flagged.
+///
+/// Returns the signed day count: positive when (sy, sm, sd) <= (ey, em,
+/// ed), negative otherwise.
+fn days360_count(sy: i32, sm: u32, sd: u32, ey: i32, em: u32, ed: u32, european: bool) -> i32 {
+    let mut sd_adj = sd;
+    let mut ed_adj = ed;
     if european {
-        if sd == 31 {
-            sd = 30;
+        if sd_adj == 31 {
+            sd_adj = 30;
         }
-        if ed == 31 {
-            ed = 30;
+        if ed_adj == 31 {
+            ed_adj = 30;
         }
     } else {
-        // US NASD (simplified):
+        // US NASD (simplified — full Feb-29 logic per GAP-F-11):
         //   if sd == 31, set sd = 30
-        //   if ed == 31 AND sd in {30, 31} (after sd's own adjustment), set ed = 30
-        if sd == 31 {
-            sd = 30;
+        //   if ed == 31 AND sd (post-adj) == 30, set ed = 30
+        if sd_adj == 31 {
+            sd_adj = 30;
         }
-        if ed == 31 && sd == 30 {
-            ed = 30;
+        if ed_adj == 31 && sd_adj == 30 {
+            ed_adj = 30;
         }
     }
-    let days = 360 * (ey - sy) + 30 * (em as i32 - sm as i32) + (ed as i32 - sd as i32);
-    Value::Number(days as f64)
+    360 * (ey - sy) + 30 * (em as i32 - sm as i32) + (ed_adj as i32 - sd_adj as i32)
 }
 
 /// **`WEEKNUM(serial, [return_type])`** — week number of the year.
@@ -1074,38 +1146,43 @@ pub fn isoweeknum_ctx(args: &[Value], ctx: &EvalContext) -> Value {
         Ok(s) => s,
         Err(e) => return Value::Error(e),
     };
-    if serial < 0.0 {
-        return Value::Error(ErrorValue::Num);
-    }
-    let serial_int = serial.trunc() as i64;
-    // Day-of-week, Mon-indexed (0=Mon..6=Sun).
-    let dow_sun_zero: i64 = match ctx.date_system {
-        DateSystem::Excel1900 => (serial_int - 1).rem_euclid(7),
-        DateSystem::Excel1904 => (serial_int + 5).rem_euclid(7),
-    };
-    let dow_mon_zero = (dow_sun_zero + 6).rem_euclid(7); // 0=Mon..6=Sun
-                                                         // Anchor: this week's Thursday (3 in Mon-indexed).
-    let thursday_int = serial_int + (3 - dow_mon_zero);
-    let thursday_serial = thursday_int as f64;
-    let (iso_y, _, _) = match serial_to_ymd(thursday_serial, ctx.date_system) {
+    // Domain check via `serial_to_ymd`: rejects negative serials,
+    // out-of-range, and (for Excel1900) serial 0. This also extracts the
+    // (y, m, d) tuple we need to drive Gregorian arithmetic.
+    let (y, m, d) = match serial_to_ymd(serial, ctx.date_system) {
         Ok(v) => v,
         Err(e) => return Value::Error(e),
     };
-    // Jan 4 of iso_y is always in week 1. Find its Monday (week-1 anchor).
-    let jan4_serial = match ymd_to_serial(iso_y, 1, 4, ctx.date_system) {
-        Ok(s) => s,
-        Err(e) => return Value::Error(e),
-    };
-    let jan4_int = jan4_serial.trunc() as i64;
-    let jan4_dow_sun_zero: i64 = match ctx.date_system {
-        DateSystem::Excel1900 => (jan4_int - 1).rem_euclid(7),
-        DateSystem::Excel1904 => (jan4_int + 5).rem_euclid(7),
-    };
-    let jan4_dow_mon_zero = (jan4_dow_sun_zero + 6).rem_euclid(7);
-    let week1_monday_int = jan4_int - jan4_dow_mon_zero;
-    // Find this week's Monday.
-    let this_monday_int = serial_int - dow_mon_zero;
-    let week_num = (this_monday_int - week1_monday_int) / 7 + 1;
+    // **W5-76 (Phase 4.5 mega-audit HIGH-3 fix):** previously this
+    // function computed the Thursday anchor in serial-space and then
+    // called `serial_to_ymd` on it. For the Excel1900 lower bound
+    // (serial 1 = (1900, 1, 1)) the Thursday anchor falls at serial -2,
+    // which `serial_to_ymd` rejects → `#NUM!`. Same class for Excel1904
+    // serial 0. Fix: do the ISO-week math in unix_days (real Gregorian)
+    // space, which has no epoch lower bound and treats arithmetic
+    // uniformly. This makes ISOWEEKNUM follow the real-Gregorian
+    // calendar rather than Excel's broken pre-1900-03-01 day-of-week
+    // labeling — a documented divergence from `WEEKDAY` for Excel1900
+    // serials 1..=60 only.
+    //
+    // Phantom note: `ymd_to_unix_days(1900, 2, 29)` extrapolates via the
+    // pure Howard Hinnant arithmetic, landing on Gregorian 1900-03-01
+    // (Thursday). ISOWEEKNUM(60) therefore reports the ISO week of real
+    // 1900-03-01 (week 9), not the phantom day.
+    let unix_days_now = ymd_to_unix_days(y, m, d);
+    // Real-Gregorian day-of-week. unix_days 0 = Thu Jan 1, 1970, so
+    // in Mon-zero indexing (0=Mon..6=Sun): Thu = 3.
+    let dow_mon_zero = (unix_days_now + 3).rem_euclid(7);
+    let thursday_unix = unix_days_now + (3 - dow_mon_zero);
+    let (iso_y, _, _) = unix_days_to_ymd(thursday_unix);
+    // Jan 4 of iso_y is always in week 1. Find its Monday (week-1 anchor)
+    // in unix_days space — works even when iso_y < 1900 (Excel1900) or
+    // iso_y < 1904 (Excel1904).
+    let jan4_unix = ymd_to_unix_days(iso_y, 1, 4);
+    let jan4_dow_mon_zero = (jan4_unix + 3).rem_euclid(7);
+    let week1_monday_unix = jan4_unix - jan4_dow_mon_zero;
+    let this_monday_unix = thursday_unix - 3;
+    let week_num = (this_monday_unix - week1_monday_unix) / 7 + 1;
     Value::Number(week_num as f64)
 }
 
@@ -1327,6 +1404,120 @@ mod tests_wave_c {
         let weeknum = weeknum_ctx(&[serial.clone(), n(21.0)], &ctx_1900());
         let iso = isoweeknum_ctx(&[serial], &ctx_1900());
         assert_eq!(weeknum, iso);
+    }
+
+    // ===== W5-76 Phase 4.5 mega-audit closures =====
+
+    #[test]
+    fn isoweeknum_excel1900_serial_1_no_panic_returns_week_1() {
+        // **W5-76 HIGH-3:** `ISOWEEKNUM(1)` in Excel1900 used to compute
+        // the Thursday anchor at serial -2 → `serial_to_ymd` rejected →
+        // `#NUM!`. After the unix_days fix, this honors the real
+        // Gregorian calendar: Jan 1, 1900 was Monday → ISO week 1.
+        assert_eq!(isoweeknum_ctx(&[n(1.0)], &ctx_1900()), n(1.0));
+    }
+
+    #[test]
+    fn isoweeknum_excel1904_serial_0_no_panic_returns_week_53() {
+        // **W5-76 HIGH-3 (1904 variant):** serial 0 in Excel1904 is the
+        // legitimate epoch date (1904, 1, 1) = Friday. ISO week of a
+        // Friday Jan 1 belongs to the prior ISO year. 1903 was a long
+        // ISO year (53 weeks) — Fri Jan 1, 1904 is week 53 of 1903.
+        let ctx_1904 = EvalContext {
+            date_system: DateSystem::Excel1904,
+            ..EvalContext::default()
+        };
+        assert_eq!(isoweeknum_ctx(&[n(0.0)], &ctx_1904), n(53.0));
+    }
+
+    #[test]
+    fn isoweeknum_excel1900_serial_0_is_num_error() {
+        // Serial 0 in Excel1900 is the "1/0/1900" formatter oddity, not
+        // a real date — `serial_to_ymd` rejects, and so must ISOWEEKNUM.
+        assert_eq!(
+            isoweeknum_ctx(&[n(0.0)], &ctx_1900()),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn yearfrac_basis_0_matches_days360_us_nasd() {
+        // **W5-76 HIGH-1 pinning test:** `YEARFRAC(s, e, 0)` and
+        // `DAYS360(s, e, FALSE) / 360` MUST agree (both are US/NASD
+        // 30/360). Day-31 adjustment makes this non-trivial.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(31.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(3.0), n(31.0)], &ctx_1900());
+        let yf = yearfrac_ctx(&[start.clone(), end.clone(), n(0.0)], &ctx_1900());
+        let d360 = days360_ctx(&[start, end], &ctx_1900());
+        let (Value::Number(yf_n), Value::Number(d360_n)) = (yf, d360) else {
+            panic!("expected Number results");
+        };
+        // Jan 31 → 30, Mar 31 → 30 (since sd_adj = 30). 360*0 + 30*2 + 0 = 60.
+        assert_eq!(d360_n, 60.0);
+        assert!(
+            (yf_n - 60.0 / 360.0).abs() < 1e-12,
+            "yf={yf_n}, expected 60/360"
+        );
+    }
+
+    #[test]
+    fn excel1900_serial_0_uniformly_rejected_by_date_functions() {
+        // **W5-76 mega-audit MEDIUM (serial-0 policy):** Excel1900
+        // serial 0 is the "1/0/1900" formatter oddity, not a real date.
+        // ALL date functions must surface `#NUM!` for it, matching
+        // `serial_to_ymd`'s contract.
+        let zero = n(0.0);
+        let one = n(1.0);
+        let num = Value::Error(ErrorValue::Num);
+        assert_eq!(weekday_ctx(std::slice::from_ref(&zero), &ctx_1900()), num);
+        assert_eq!(
+            networkdays_ctx(&[zero.clone(), one.clone()], &ctx_1900()),
+            num
+        );
+        assert_eq!(
+            networkdays_ctx(&[one.clone(), zero.clone()], &ctx_1900()),
+            num
+        );
+        assert_eq!(workday_ctx(&[zero.clone(), n(5.0)], &ctx_1900()), num);
+        assert_eq!(
+            yearfrac_ctx(&[zero.clone(), zero.clone()], &ctx_1900()),
+            num
+        );
+        assert_eq!(yearfrac_ctx(&[zero, one, n(0.0)], &ctx_1900()), num);
+    }
+
+    #[test]
+    fn excel1904_serial_0_accepted_as_epoch() {
+        // **W5-76 mega-audit MEDIUM (serial-0 policy):** in Excel1904
+        // serial 0 IS the legitimate epoch (1904-01-01 = Friday). Must
+        // NOT be rejected.
+        let ctx_1904 = EvalContext {
+            date_system: DateSystem::Excel1904,
+            ..EvalContext::default()
+        };
+        // WEEKDAY(0, Excel1904) = 6 (Friday) with default return_type 1.
+        assert_eq!(weekday_ctx(&[n(0.0)], &ctx_1904), n(6.0));
+        // WORKDAY(0, 1) in Excel1904 → next working day from Friday =
+        // Monday = serial 3.
+        assert_eq!(workday_ctx(&[n(0.0), n(1.0)], &ctx_1904), n(3.0));
+    }
+
+    #[test]
+    fn yearfrac_basis_0_matches_days360_at_february_end() {
+        // Jan 30 → Feb 28: US/NASD says ed_adj stays at 28 (since
+        // sd_adj != 30 doesn't trigger the second branch; sd_adj = 30
+        // does so ed_adj=28 stays). Days = 360*0 + 30*1 + (28 - 30) = 28.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(30.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(2.0), n(28.0)], &ctx_1900());
+        let yf = yearfrac_ctx(&[start.clone(), end.clone(), n(0.0)], &ctx_1900());
+        let d360 = days360_ctx(&[start, end], &ctx_1900());
+        let (Value::Number(yf_n), Value::Number(d360_n)) = (yf, d360) else {
+            panic!("expected Number results");
+        };
+        assert!(
+            (yf_n - d360_n / 360.0).abs() < 1e-12,
+            "yf={yf_n}, d360={d360_n}"
+        );
     }
 }
 
@@ -1742,6 +1933,50 @@ mod tests_wave2 {
         assert_eq!(
             weekday_ctx(&[n(-1.0)], &ctx_1900()),
             Value::Error(ErrorValue::Num)
+        );
+    }
+
+    // W5-76 (Phase 4.5 mega-audit HIGH-2): exhaustively pin WEEKDAY for
+    // return types 11-17. The original W5-73 ship had `anchor = n - 11`
+    // which was off-by-one for the 12-16 family — and no test covered
+    // any of those return types. Sonnet mega-audit caught it.
+    //
+    // Pick 2024-01-01 (Monday). Expected outputs per return type:
+    //   RT=1  Sun=1..Sat=7  → Mon=2
+    //   RT=2  Mon=1..Sun=7  → Mon=1
+    //   RT=3  Mon=0..Sun=6  → Mon=0
+    //   RT=11 Mon=1..Sun=7  → Mon=1
+    //   RT=12 Tue=1..Mon=7  → Mon=7
+    //   RT=13 Wed=1..Tue=7  → Mon=6
+    //   RT=14 Thu=1..Wed=7  → Mon=5
+    //   RT=15 Fri=1..Thu=7  → Mon=4
+    //   RT=16 Sat=1..Fri=7  → Mon=3
+    //   RT=17 Sun=1..Sat=7  → Mon=2 (same as RT=1)
+    #[test]
+    fn weekday_return_type_12_through_16_exhaustive() {
+        let monday_2024_01_01 = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let cases = [(12, 7), (13, 6), (14, 5), (15, 4), (16, 3)];
+        for (rt, expected) in cases {
+            let got = weekday_ctx(&[monday_2024_01_01.clone(), n(rt as f64)], &ctx_1900());
+            assert_eq!(
+                got,
+                n(expected as f64),
+                "WEEKDAY(2024-01-01=Mon, return_type={rt}) expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn weekday_return_type_11_and_17_match_2_and_1() {
+        // RT 11 ≡ RT 2 (Mon=1..Sun=7); RT 17 ≡ RT 1 (Sun=1..Sat=7).
+        let day = date_ctx(&[n(2024.0), n(7.0), n(4.0)], &ctx_1900()); // Thursday
+        assert_eq!(
+            weekday_ctx(&[day.clone(), n(11.0)], &ctx_1900()),
+            weekday_ctx(&[day.clone(), n(2.0)], &ctx_1900())
+        );
+        assert_eq!(
+            weekday_ctx(&[day.clone(), n(17.0)], &ctx_1900()),
+            weekday_ctx(&[day, n(1.0)], &ctx_1900())
         );
     }
 
