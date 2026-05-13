@@ -116,6 +116,22 @@ impl FunctionRegistry {
         self.fns.keys()
     }
 
+    /// W5-65 (Phase 4.4.B; Codex MEDIUM 4 fix): names registered in the
+    /// range-aware table. The original `names()` only exposes scalar names;
+    /// any coverage report or registry-walk that wants to enumerate ALL
+    /// registered functions (e.g. for matrix-test completeness) must call
+    /// both `names()` and `range_aware_names()`.
+    pub fn range_aware_names(&self) -> impl Iterator<Item = &&'static str> {
+        self.range_aware_fns.keys()
+    }
+
+    /// W5-65 (Phase 4.4.B): convenience iterator over ALL registered function
+    /// names (both scalar and range-aware tables, no de-duplication since the
+    /// two tables are disjoint by registration invariant).
+    pub fn names_all(&self) -> impl Iterator<Item = &&'static str> {
+        self.fns.keys().chain(self.range_aware_fns.keys())
+    }
+
     pub fn len(&self) -> usize {
         self.fns.len() + self.range_aware_fns.len()
     }
