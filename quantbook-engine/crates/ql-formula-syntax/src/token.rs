@@ -86,6 +86,26 @@ pub enum Token {
     Comma,
     Colon,
     Semicolon,
+
+    /// **W5-88 (Phase 4.6.A part 2):** `!` separator between a sheet
+    /// name and a cell/range reference. Only meaningful immediately
+    /// after a `SheetName` / `QuotedSheetName` token; appearing
+    /// elsewhere is a parser error.
+    Bang,
+
+    /// **W5-88 (Phase 4.6.A part 2):** unquoted sheet name preceding `!`.
+    /// `[A-Za-z_][A-Za-z0-9_.]*` per design doc § 4.1. The lexer uses
+    /// one-token lookahead to disambiguate from `Ident`: only when the
+    /// next non-whitespace char is `!` does the run emit as
+    /// `SheetName + Bang` instead of an `Ident`. Stored as `Arc<str>`
+    /// for cheap clone-through-bind.
+    SheetName(Arc<str>),
+
+    /// **W5-88 (Phase 4.6.A part 2):** quoted sheet name `'...'` with
+    /// `''` → `'` escape decoded. Like `SheetName`, only emitted when
+    /// the closing quote is followed by `!` (skipping intervening
+    /// whitespace). The body is the decoded form (no surrounding quotes).
+    QuotedSheetName(Arc<str>),
 }
 
 /// Operator subtype carried by `Token::Op`.

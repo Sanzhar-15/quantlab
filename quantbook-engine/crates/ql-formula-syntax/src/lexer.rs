@@ -40,6 +40,17 @@ pub enum LexError {
     /// Row digits exceed the Excel row max (1048576). Same enforcement reason.
     #[error("row digits out of range: {0:?}")]
     RowTooLarge(String),
+
+    /// **W5-88 (Phase 4.6.A part 2):** a `'...'`-style quoted sheet name
+    /// was opened but never closed before end-of-input.
+    #[error("unterminated quoted sheet name")]
+    UnterminatedQuotedSheetName,
+
+    /// **W5-88 (Phase 4.6.A part 2):** a `'...'` block was closed but not
+    /// followed by `!`. Bare quoted strings have no other lexical role
+    /// in Excel formulas — this is a clean syntax error.
+    #[error("quoted string not followed by '!' — only valid as a sheet-name prefix")]
+    DanglingQuotedString,
 }
 
 /// Excel's column-letter upper bound (XFD = 16383, zero-indexed).
@@ -141,6 +152,23 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             }
             '"' => out.push(lex_string(&mut chars)?),
             '0'..='9' | '.' => out.push(lex_number(&mut chars)?),
+            // **W5-88 (Phase 4.6.A part 2):** quoted sheet name `'...'`.
+            // Single-quote has no other lexical role in Excel formulas;
+            // bare/unclosed/non-prefix `'...'` surfaces as a clean lex
+            // error.
+            '\'' => {
+                lex_quoted_sheet_name(&mut chars, &mut out)?;
+            }
+            // **W5-88 (Phase 4.6.A part 2):** unquoted sheet-name prefix
+            // must be detected BEFORE the A1/function/cell-ref classifier
+            // per Codex MEDIUM-1: `A!B1` lexes sheet `A`, not bare column
+            // `A`; `A1!B1` lexes sheet `A1`, not cell `A1`. The check
+            // uses a cheap multi-char peek (Chars::clone) to avoid
+            // committing unless a real `!` follows.
+            'A'..='Z' | 'a'..='z' | '_' if try_lex_sheet_name_prefix(&mut chars, &mut out)? => {
+                // Token(s) emitted by try_lex_sheet_name_prefix when it
+                // returns true. Fall through to next loop iteration.
+            }
             '$' | 'A'..='Z' | 'a'..='z' | '_' => out.push(lex_ident_or_ref(&mut chars)?),
             other => return Err(LexError::UnexpectedChar(other)),
         }
@@ -424,6 +452,129 @@ pub fn column_letters_to_index(letters: &str) -> Result<u32, LexError> {
         return Err(LexError::ColumnTooLarge(letters.to_string()));
     }
     Ok(zero_based)
+}
+
+// ===== W5-88 (Phase 4.6.A part 2) — sheet-prefix lexing =====
+
+/// Scan an unquoted sheet-name candidate at `chars` and peek ahead for
+/// `!`. If a `Sheet!` prefix is recognized, emit `SheetName + Bang` and
+/// return `Ok(true)`. If not (the leading run is actually an Ident /
+/// CellRef / etc.), leave `chars` untouched and return `Ok(false)` —
+/// the caller falls through to the existing dispatch.
+///
+/// Multi-char lookahead via `Chars::clone()`: cheap (just a `&str` +
+/// cursor) and doesn't disturb the real iterator.
+///
+/// Per design doc § 4.1: name shape `[A-Za-z_][A-Za-z0-9_.]*`. Per
+/// § 4.3 / Codex MEDIUM-1: this routine MUST run before the A1/
+/// function/name classifier so `A1!B1` lexes sheet `A1`, not cell
+/// `A1`. Edge cases (whitespace around `!`, dotted names, etc.) are
+/// pinned in the test corpus.
+fn try_lex_sheet_name_prefix(
+    chars: &mut Peekable<Chars>,
+    out: &mut Vec<Token>,
+) -> Result<bool, LexError> {
+    // Peek into a clone to scan the candidate name + lookahead.
+    let mut peek = chars.clone();
+    let mut name = String::new();
+
+    // First char: `[A-Za-z_]` (caller's match arm already verified).
+    let first = peek.next().expect("caller guaranteed at least one char");
+    debug_assert!(first.is_ascii_alphabetic() || first == '_');
+    name.push(first);
+
+    // Trailing chars: `[A-Za-z0-9_.]`.
+    while let Some(&c) = peek.peek() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+            name.push(c);
+            peek.next();
+        } else {
+            break;
+        }
+    }
+
+    // Skip whitespace between name and `!` per design § 4.3.
+    while let Some(&c) = peek.peek() {
+        if matches!(c, ' ' | '\t' | '\n' | '\r') {
+            peek.next();
+        } else {
+            break;
+        }
+    }
+
+    // Decision: is the next char `!`?
+    let is_sheet_prefix = peek.peek() == Some(&'!');
+    if !is_sheet_prefix {
+        // Not a sheet prefix — leave `chars` untouched; caller falls
+        // through to the existing identifier dispatch.
+        return Ok(false);
+    }
+
+    // Commit: consume from the real `chars` iterator to match what we
+    // scanned in the clone, then emit SheetName + Bang.
+    for _ in 0..name.chars().count() {
+        chars.next();
+    }
+    // Skip whitespace between name and `!`.
+    while let Some(&c) = chars.peek() {
+        if matches!(c, ' ' | '\t' | '\n' | '\r') {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    // Consume the `!`.
+    chars.next();
+
+    out.push(Token::SheetName(Arc::from(name)));
+    out.push(Token::Bang);
+    Ok(true)
+}
+
+/// Lex a quoted-sheet-name prefix `'...'!`. The caller has just peeked
+/// the opening `'`. The body allows any char except `'`; `''` decodes
+/// to a single `'`. After the closing `'`, whitespace is skipped and
+/// `!` is required — bare `'...'` without `!` produces
+/// `LexError::DanglingQuotedString`.
+fn lex_quoted_sheet_name(
+    chars: &mut Peekable<Chars>,
+    out: &mut Vec<Token>,
+) -> Result<(), LexError> {
+    // Consume opening quote.
+    chars.next();
+    let mut name = String::new();
+    loop {
+        match chars.next() {
+            None => return Err(LexError::UnterminatedQuotedSheetName),
+            Some('\'') => {
+                // `''` is the embedded-quote escape; otherwise this is
+                // the closing quote.
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                    name.push('\'');
+                } else {
+                    break;
+                }
+            }
+            Some(c) => name.push(c),
+        }
+    }
+    // Skip whitespace before required `!`.
+    while let Some(&c) = chars.peek() {
+        if matches!(c, ' ' | '\t' | '\n' | '\r') {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if chars.peek() != Some(&'!') {
+        return Err(LexError::DanglingQuotedString);
+    }
+    chars.next();
+
+    out.push(Token::QuotedSheetName(Arc::from(name)));
+    out.push(Token::Bang);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1160,5 +1311,187 @@ mod tests {
         assert!(matches!(toks[0], Token::Ident(_)));
         let toks = lex_ok("A");
         assert!(matches!(toks[0], Token::BareColumn { .. }));
+    }
+
+    // ===== W5-88 / Phase 4.6.A part 2 — sheet-prefix tokens =====
+
+    #[test]
+    fn unquoted_sheet_prefix_emits_sheet_name_bang_then_cellref() {
+        let toks = lex_ok("Sheet1!A1");
+        assert_eq!(toks.len(), 3);
+        match &toks[0] {
+            Token::SheetName(n) => assert_eq!(n.as_ref(), "Sheet1"),
+            other => panic!("expected SheetName, got {other:?}"),
+        }
+        assert_eq!(toks[1], Token::Bang);
+        assert!(matches!(toks[2], Token::CellRef { .. }));
+    }
+
+    #[test]
+    fn unquoted_sheet_prefix_with_range() {
+        let toks = lex_ok("Sheet1!A1:B2");
+        // SheetName, Bang, CellRef(A1), Colon, CellRef(B2)
+        assert_eq!(toks.len(), 5);
+        assert!(matches!(toks[0], Token::SheetName(_)));
+        assert_eq!(toks[1], Token::Bang);
+    }
+
+    #[test]
+    fn sheet_prefix_takes_priority_over_a1_classification() {
+        // Per Codex MEDIUM-1: `A!B1` must lex sheet `A`, not bare column `A`.
+        let toks = lex_ok("A!B1");
+        assert_eq!(toks.len(), 3);
+        match &toks[0] {
+            Token::SheetName(n) => assert_eq!(n.as_ref(), "A"),
+            other => panic!("expected SheetName, got {other:?}"),
+        }
+        assert_eq!(toks[1], Token::Bang);
+        assert!(matches!(toks[2], Token::CellRef { .. }));
+    }
+
+    #[test]
+    fn cell_ref_shaped_name_classifies_as_sheet_when_followed_by_bang() {
+        // Per Codex MEDIUM-1: `A1!B1` lexes sheet `A1`, not cell `A1`.
+        let toks = lex_ok("A1!B1");
+        assert_eq!(toks.len(), 3);
+        match &toks[0] {
+            Token::SheetName(n) => assert_eq!(n.as_ref(), "A1"),
+            other => panic!("expected SheetName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_name_shaped_sheet_works_without_paren() {
+        // `SUM!A1` is a sheet reference, NOT a function call. The lexer's
+        // sheet-prefix recognizer wins over the function/Ident dispatch
+        // because of one-token lookahead.
+        let toks = lex_ok("SUM!A1");
+        assert_eq!(toks.len(), 3);
+        match &toks[0] {
+            Token::SheetName(n) => assert_eq!(n.as_ref(), "SUM"),
+            other => panic!("expected SheetName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_call_still_works_after_sheet_prefix_check() {
+        // `SUM(A1)` — no `!` so the sheet-prefix detection fails and
+        // we fall through to the existing dispatch. Per the pre-W5-88
+        // lexer behavior: 3-letter `SUM` resolves as `BareColumn`
+        // (because `SUM` is a valid column-letter trio); the parser
+        // sees `LParen` next and routes to a function call.
+        let toks = lex_ok("SUM(A1)");
+        assert_eq!(toks.len(), 4);
+        assert!(matches!(toks[0], Token::BareColumn { .. }));
+        assert_eq!(toks[1], Token::LParen);
+        assert!(matches!(toks[2], Token::CellRef { .. }));
+        assert_eq!(toks[3], Token::RParen);
+    }
+
+    #[test]
+    fn dotted_sheet_name_supported() {
+        let toks = lex_ok("Data.2024!A1");
+        assert_eq!(toks.len(), 3);
+        match &toks[0] {
+            Token::SheetName(n) => assert_eq!(n.as_ref(), "Data.2024"),
+            other => panic!("expected SheetName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whitespace_around_bang_accepted() {
+        // Excel accepts whitespace around `!` per design § 4.3.
+        let toks = lex_ok("Sheet1 ! A1");
+        // Whitespace between Sheet1 and ! is consumed by the recognizer.
+        // Whitespace between ! and A1 is consumed by the main loop.
+        assert!(matches!(toks[0], Token::SheetName(_)));
+        assert_eq!(toks[1], Token::Bang);
+        assert!(matches!(toks[2], Token::CellRef { .. }));
+    }
+
+    #[test]
+    fn quoted_sheet_name_with_space() {
+        let toks = lex_ok("'Q3 2025'!A1");
+        assert_eq!(toks.len(), 3);
+        match &toks[0] {
+            Token::QuotedSheetName(n) => assert_eq!(n.as_ref(), "Q3 2025"),
+            other => panic!("expected QuotedSheetName, got {other:?}"),
+        }
+        assert_eq!(toks[1], Token::Bang);
+    }
+
+    #[test]
+    fn quoted_sheet_name_with_escaped_quote() {
+        // Excel canon: `''` inside a quoted sheet name decodes to a single `'`.
+        let toks = lex_ok("'Ben''s Sheet'!A1");
+        match &toks[0] {
+            Token::QuotedSheetName(n) => assert_eq!(n.as_ref(), "Ben's Sheet"),
+            other => panic!("expected QuotedSheetName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unterminated_quoted_sheet_name_errors() {
+        match lex("'unterminated") {
+            Err(LexError::UnterminatedQuotedSheetName) => {}
+            other => panic!("expected UnterminatedQuotedSheetName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dangling_quoted_string_without_bang_errors() {
+        // A `'...'` block without a trailing `!` has no other role in
+        // Excel formulas — distinct error from a quoted sheet name.
+        match lex("'no bang'") {
+            Err(LexError::DanglingQuotedString) => {}
+            other => panic!("expected DanglingQuotedString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quoted_sheet_with_whitespace_before_bang() {
+        let toks = lex_ok("'Sheet One'  !  A1");
+        assert!(matches!(toks[0], Token::QuotedSheetName(_)));
+        assert_eq!(toks[1], Token::Bang);
+        assert!(matches!(toks[2], Token::CellRef { .. }));
+    }
+
+    #[test]
+    fn double_sheet_qualifier_lexes_but_parser_will_reject() {
+        // `Sheet1!Sheet2!A1` lexes as three tokens of the sheet-pattern
+        // shape (SheetName, Bang, SheetName, Bang, CellRef). The parser
+        // owns the "double sheet qualifier" rejection (W5-89).
+        let toks = lex_ok("Sheet1!Sheet2!A1");
+        assert_eq!(toks.len(), 5);
+        assert!(matches!(toks[0], Token::SheetName(_)));
+        assert_eq!(toks[1], Token::Bang);
+        assert!(matches!(toks[2], Token::SheetName(_)));
+        assert_eq!(toks[3], Token::Bang);
+    }
+
+    #[test]
+    fn ident_inside_function_args_still_works() {
+        // Defined-name reference inside a function. Should NOT be
+        // classified as a sheet prefix because there's no `!` after.
+        // SUM is 3-letter BareColumn; TaxRate is 7-letter Ident.
+        let toks = lex_ok("SUM(TaxRate)");
+        assert!(matches!(toks[0], Token::BareColumn { .. }));
+        assert_eq!(toks[1], Token::LParen);
+        match &toks[2] {
+            Token::Ident(n) => assert_eq!(n.as_ref(), "TaxRate"),
+            other => panic!("expected Ident, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quoted_string_after_quote_uses_quoted_sheet_name_path() {
+        // Lexer's `'` arm is dedicated to quoted sheet names. A bare
+        // `'...'` is always treated as a candidate sheet prefix; only
+        // the `!`-or-no-`!` check disambiguates.
+        let toks = lex_ok("'A'!B1");
+        match &toks[0] {
+            Token::QuotedSheetName(n) => assert_eq!(n.as_ref(), "A"),
+            other => panic!("expected QuotedSheetName, got {other:?}"),
+        }
     }
 }
