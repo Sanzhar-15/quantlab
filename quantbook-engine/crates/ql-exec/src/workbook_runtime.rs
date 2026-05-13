@@ -4844,4 +4844,53 @@ mod tests {
             Some(custom_id)
         );
     }
+
+    // ===== W5-83 / Phase 4.5.E — TEXT() formula integration =====
+
+    #[test]
+    fn text_formula_renders_through_recompute() {
+        // End-to-end: a `TEXT(serial, "yyyy-mm-dd")` formula evaluates
+        // to a Text value with the rendered string.
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        wb.put_at(s, 0, 0, Value::Number(45477.0)); // 2024-07-04
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(s, 1, 0, "TEXT(A1, \"yyyy-mm-dd\")").unwrap();
+        let _ = rt.recompute_all();
+        assert_eq!(
+            wb.read(ql_types::Address::new(s, 1, 0)),
+            Value::text("2024-07-04")
+        );
+    }
+
+    #[test]
+    fn text_formula_with_number_format_returns_formatted_text() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        wb.put_at(s, 0, 0, Value::Number(1234.5));
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(s, 1, 0, "TEXT(A1, \"#,##0.00\")").unwrap();
+        let _ = rt.recompute_all();
+        assert_eq!(
+            wb.read(ql_types::Address::new(s, 1, 0)),
+            Value::text("1,234.50")
+        );
+    }
+
+    #[test]
+    fn text_formula_invalid_format_returns_value_error() {
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // `[Red]0` is V2-deferred → parser refuses → TEXT returns #VALUE!
+        rt.set_formula(s, 0, 0, "TEXT(1, \"[Red]0\")").unwrap();
+        let _ = rt.recompute_all();
+        assert_eq!(
+            wb.read(ql_types::Address::new(s, 0, 0)),
+            Value::Error(ErrorValue::Value)
+        );
+    }
 }

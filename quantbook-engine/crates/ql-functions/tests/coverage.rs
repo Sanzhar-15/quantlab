@@ -221,6 +221,11 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
     ("DAYS360", "W5-75 V2; covered by date_fns::tests_wave_c"),
     ("WEEKNUM", "W5-75 V2; covered by date_fns::tests_wave_c"),
     ("ISOWEEKNUM", "W5-75 V2; covered by date_fns::tests_wave_c"),
+    // Phase 4.5.E — TEXT() formatter
+    (
+        "TEXT",
+        "W5-83 Phase 4.5.E; covered by format::text_fn::tests + workbook_runtime end-to-end tests",
+    ),
     // Range-aware
     ("SUMIF", "wildcards + V1 anchoring divergence in matrix"),
     ("COUNTIF", "wildcards covered in matrix"),

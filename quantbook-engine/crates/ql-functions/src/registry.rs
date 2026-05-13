@@ -9,7 +9,7 @@ use ql_types::Value;
 
 use crate::context_aware_fns::ContextAwareFn;
 use crate::range_aware_fns::RangeAwareFn;
-use crate::{date_fns, range_fns, scalar_fns, volatile};
+use crate::{date_fns, format, range_fns, scalar_fns, volatile};
 
 /// Function signature: pre-evaluated args → result Value.
 pub type ScalarFn = fn(&[Value]) -> Value;
@@ -390,6 +390,13 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_context_aware("WEEKNUM", date_fns::weeknum_ctx);
     r.register_context_aware("ISOWEEKNUM", date_fns::isoweeknum_ctx);
 
+    // **W5-83 (Phase 4.5.E):** `TEXT(value, format_string)` — format a
+    // value into a text string per the workbook's number-format grammar.
+    // ContextAwareFn because the renderer needs `DateSystem` for the
+    // serial→date conversion path. Parser failures + V2-deferred tokens
+    // surface as `#VALUE!`. Companion `format::render` shipped W5-78.
+    r.register_context_aware("TEXT", format::text_ctx);
+
     // Engine Phase 4.3 V2 batch — range-aware (W5-53, GAP-F-05
     // closure). These use the new `RangeAwareFn` table because the
     // existing `ScalarFn = fn(&[Value]) -> Value` contract can't
@@ -477,8 +484,9 @@ mod tests {
         // EDATE = 5) + Phase 4.5.B wave 3 (W5-74: DAYS, NETWORKDAYS,
         // WORKDAY, YEARFRAC = 4 — CLOSES V1 wave 18/18) + Phase 4.5.C
         // V2 wave (W5-75: DATEDIF, DAYS360, WEEKNUM, ISOWEEKNUM = 4
-        // of 6; NETWORKDAYS.INTL + WORKDAY.INTL deferred to tier-4).
-        assert_eq!(r.len(), 129);
+        // of 6; NETWORKDAYS.INTL + WORKDAY.INTL deferred to tier-4) +
+        // Phase 4.5.E (W5-83: TEXT = 1).
+        assert_eq!(r.len(), 130);
     }
 
     #[test]
