@@ -315,6 +315,16 @@ The split fixes Codex HIGH H1 (bounded ranges silently shrunk under clamp, break
 
 `parse_ifs_pairs` and SUMPRODUCT now track 2D `(rows, cols)` shape, not flat length. A `2×2` range and a `1×4` range have the same flat length (4) but different shapes — Excel returns `#VALUE!`. Pre-W5-60 they would silently zip. If you add a new IFS-family function, use `parse_ifs_pairs`. If you write a new array-consensus function, follow SUMPRODUCT's pattern of tracking `Vec<(&[Value], usize, usize)>` with `(rows, cols)` consensus.
 
+### 19. Wildcards in criteria are TEXT-CELL only (W5-61)
+
+The W5-61 wildcard support (`?`, `*`, `~` escape) in SUMIF/COUNTIF/SUMIFS/AVERAGEIF/etc. matches Excel's canon: wildcards target **text cells only**. A `Value::Number(5.0)` cell does NOT match the criteria `"5*"` even though its text representation is `"5"`. If you write a future range-aware function that needs wildcards, route through `Predicate::TextWildcard` (which calls `WildcardPattern::matches`) — do not invent a new path that matches against coerced text representations of numeric cells.
+
+`build_predicate` routes to `TextWildcard` for ANY criteria text containing `~`, `?`, or `*` (even if all wildcards are escaped, like `~?`). The pattern compiler handles escapes correctly; a `Predicate::Text` would see the raw `~?` string and never match a cell containing literal `?`.
+
+### 20. SEARCH unconditionally routes through `WildcardPattern` (W5-61)
+
+`SEARCH` always uses `WildcardPattern::search_in`, even when the needle has no wildcard chars. This is safe because a pattern with only literal chars compiles to a single `Literal` part and behaves identically to a substring search. The pre-W5-61 hand-rolled substring loop was deleted — do not resurrect it. Any future SEARCH change must preserve the wildcard contract (escapes, case-insensitive matching, start_num).
+
 ---
 
 ## Self-check + recovery (MANDATORY before declaring a session complete)

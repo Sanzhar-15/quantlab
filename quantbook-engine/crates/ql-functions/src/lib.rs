@@ -28,6 +28,7 @@ pub mod registry;
 pub mod scalar_fns;
 pub mod volatile;
 pub mod welford;
+pub mod wildcard;
 
 pub use range_aware_fns::{FnArg, RangeAwareFn};
 pub use registry::{default_registry, FunctionRegistry, ScalarFn};

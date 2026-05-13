@@ -59,14 +59,14 @@ as partial, rows with `❌` are missing.
 | VAR.P | ✅ | A6 | 0 | Welford-backed |
 | STDEV (alias: STDEV.S) | ✅ | A6 | 0 | Welford-backed |
 | STDEV.P | ✅ | A6 | 0 | Welford-backed |
-| SUMIF | ⚠️ | 16 | 4.3 V2 | W5-53 (GAP-F-05 closure): supports number/text/bool/blank criteria + comparators `> < >= <= <> =`. Wildcards (`?` `*`) deferred. 2-arg + 3-arg forms; sum_range default to range. Error in sum_range cell propagates (Excel canon). **W5-60 KNOWN DIVERGENCE**: when `sum_range` size differs from `range`, Quantbook does a flat-index zip; Excel anchors the top-left of `sum_range` and uses `range`'s shape, ignoring `sum_range`'s declared extent. Behavior matches only when `sum_range.len() == range.len()`. Pin Phase 4.3 polish or 4.10. |
+| SUMIF | ⚠️ | 17 | 4.3 V2 | W5-53 + W5-61: supports number/text/bool/blank criteria + comparators `> < >= <= <> =`. **Wildcards `?` / `*` shipped W5-61** (escape with `~`); apply only to Eq/Ne text criteria, only against text cells (not coerced numbers). 2-arg + 3-arg forms; sum_range default to range. Error in sum_range cell propagates (Excel canon). **W5-60 KNOWN DIVERGENCE**: when `sum_range` size differs from `range`, Quantbook does a flat-index zip; Excel anchors the top-left of `sum_range` and uses `range`'s shape, ignoring `sum_range`'s declared extent. Behavior matches only when `sum_range.len() == range.len()`. Pin Phase 4.3 polish or 4.10. |
 | VLOOKUP | ⚠️ | 8 | 4.3 V2 | W5-54: exact match (range_lookup=FALSE/0) and approximate match (default, sorted ascending). col_index_num<1 → #VALUE!; col_index_num>cols → #REF!; not-found → #N/A. Case-insensitive text equality. Wildcards deferred. |
 | HLOOKUP | ⚠️ | 2 | 4.3 V2 | W5-54: row-direction mirror of VLOOKUP. Same caveats. |
 | MATCH | ⚠️ | 7 | 4.3 V2 | W5-54: match_type 0/1/-1 (exact / largest-≤ / smallest-≥). 1-based result. Not-found → #N/A. Linear scan (V1 — no binary-search optimization yet). |
 | INDEX | ⚠️ | 5 | 4.3 V2 | W5-54: scalar result only. 1D and 2D variants. row_num=0 / col_num=0 (array spill) → #REF! pending Phase 4.7 array formulas. Out-of-bounds → #REF!. |
 | CHOOSE | ✅ | 5 | 4.3 V2 | W5-54: scalar args only, 1-based index. Out-of-bounds → #VALUE!. Fractional indexes truncated per Excel canon. |
-| SUMIFS | ⚠️ | 6 | 4.3 V2 | W5-55: multi-condition AND. Excel arg order: `sum_range FIRST`, then (criteria_range, criteria) pairs. All ranges must have identical length. Same predicate suite as SUMIF (comparators + text/number/bool/blank; wildcards deferred). |
-| COUNTIF | ⚠️ | 13 | 4.3 V2 | W5-53 (GAP-F-05 closure): same predicate suite as SUMIF. Error cells in the range are NOT propagated (Excel canon — COUNTIF ignores errors, unlike SUMIF). Wildcards deferred. |
+| SUMIFS | ⚠️ | 6 | 4.3 V2 | W5-55 + W5-61: multi-condition AND. Excel arg order: `sum_range FIRST`, then (criteria_range, criteria) pairs. All criteria ranges + sum range must share the same `(rows, cols)` shape (W5-60 strict 2D-shape validation). Same predicate suite as SUMIF, **including W5-61 wildcards** (`?` `*` with `~` escape). |
+| COUNTIF | ✅ | 21 | 4.3 polish | W5-53 + W5-61: same predicate suite as SUMIF, including W5-61 wildcards `?` / `*` (escape with `~`). Error cells in the range are NOT propagated (Excel canon — COUNTIF ignores errors, unlike SUMIF). |
 | COUNTIFS | ⚠️ | 3 | 4.3 V2 | W5-55: multi-condition AND count. Errors in range cells don't propagate (Excel canon). |
 | AVERAGEIF | ⚠️ | 6 | 4.3 V2 | W5-55: same predicate suite as SUMIF; #DIV/0! on no matches; optional separate average_range. **W5-60 KNOWN DIVERGENCE**: same as SUMIF — when `average_range` size differs from `range`, Quantbook does a flat-index zip; Excel anchors the top-left of `average_range` and uses `range`'s shape. Behavior matches only when sizes are equal. Pin Phase 4.3 polish or 4.10. |
 | AVERAGEIFS | ⚠️ | 2 | 4.3 V2 | W5-55: multi-condition AND average; #DIV/0! on no matches. |
@@ -76,7 +76,7 @@ as partial, rows with `❌` are missing.
 | MODE.MULT | ❌ | 0 | 4.7 | Returns array of multiple modes — needs dynamic-array spill. |
 | LARGE / SMALL | ✅ | 5 | 4.3 V2 | W5-58: 1-based k-th order statistic; k out of [1, count] → #NUM!; empty → #NUM!. |
 | RANK / RANK.EQ | ✅ | 5 | 4.3 V2 | W5-58: 1-based rank in `ref`. order = 0/omitted = descending (largest = 1); != 0 = ascending. Ties get same rank (Excel RANK.EQ semantics). Value not in `ref` → #N/A. RANK.EQ is a registry alias of RANK. |
-| RANK.AVG | ❌ | 0 | 4.10 | Average rank for ties (different from RANK.EQ). |
+| RANK.AVG | ✅ | 7 | 4.3 polish | W5-61: average rank for tied values. Tie of size k starting at base rank r returns r + (k-1)/2. Otherwise identical semantics to RANK / RANK.EQ. |
 | PERCENTILE / PERCENTILE.INC / PERCENTILE.EXC | ❌ | 0 | 4.10 | |
 | QUARTILE / QUARTILE.INC / QUARTILE.EXC | ❌ | 0 | 4.10 | |
 | CORREL / COVARIANCE.P / COVARIANCE.S | ❌ | 0 | 4.10 | |
@@ -115,8 +115,8 @@ as partial, rows with `❌` are missing.
 | MROUND | ✅ | 4 | 4.3 V2 | W5-57 + W5-60 fix: round-half-away-from-zero; sign-mismatch number/multiple → #NUM!. **W5-60**: `MROUND(0, 0)` → `0` (matches Excel); `MROUND(nonzero, 0)` → `#NUM!` (was incorrectly returning `0` per Sonnet HIGH H1). |
 | CEILING | ✅ | 4 | 4.3 V2 | W5-57: round away from zero to nearest multiple of significance. Default significance=1. Excel sign rule: number > 0 with significance < 0 → #NUM!. CEILING.MATH (mode flag) deferred. |
 | FLOOR | ✅ | 3 | 4.3 V2 | W5-57: round toward zero to nearest multiple. Same sign rule as CEILING. significance=0 with non-zero number → #DIV/0! (Excel canon — diverges from CEILING which returns 0). FLOOR.MATH deferred. |
-| CEILING.MATH / CEILING.PRECISE | ❌ | 0 | 4.10 | Modern variants with explicit mode flag. |
-| FLOOR.MATH / FLOOR.PRECISE | ❌ | 0 | 4.10 | Same family. |
+| CEILING.MATH | ✅ | 7 | 4.3 polish | W5-61: signature `(number, [significance], [mode])`. Significance is `abs(significance)` — sign ignored (unlike CEILING). Default significance=1, mode=0. Positive number always rounds toward +∞; negative number with mode=0 rounds toward +∞ (toward zero), with mode≠0 rounds toward -∞ (away from zero). significance=0 returns 0. CEILING.PRECISE deferred to 4.10. |
+| FLOOR.MATH | ✅ | 8 | 4.3 polish | W5-61: signature `(number, [significance], [mode])`. Mirror of CEILING.MATH. Positive number rounds toward -∞; negative+mode=0 toward -∞ (away from zero); negative+mode≠0 toward +∞ (toward zero). significance=0 + nonzero number → #DIV/0! (mirrors FLOOR canon, diverges from CEILING.MATH). FLOOR.PRECISE deferred to 4.10. |
 | INT | ✅ | 3+ | 0 | Truncation toward -∞ |
 | TRUNC | ✅ | 1 | 4.3 V1 | Truncation toward 0; optional `digits` arg |
 | MOD | ✅ | 3+ | 0 | Excel mod semantics, sign-of-divisor |
@@ -151,14 +151,14 @@ as partial, rows with `❌` are missing.
 | LEFT / RIGHT / MID | ⚠️ | 9 | 4.3 V2 | W5-56: 1-based positions; UTF-8 char-count (UTF-16 canon deferred to 4.9, same divergence class as LEN). Negative num_chars → #VALUE!; MID start < 1 → #VALUE!. |
 | UPPER | ⚠️ | 2 | 4.3 V1 | Rust's Unicode-default mapping. **DIVERGES from Excel for German ß** (Quantbook = `SS`, Excel = `ß`) and any other locale-sensitive mapping (Turkish I, Greek final sigma). For ASCII-only text both match. Pin Phase 4.9 (locale-aware case). |
 | LOWER | ⚠️ | 1 | 4.3 V1 | Rust Unicode-default. Same divergence class as UPPER. Pin Phase 4.9. |
-| PROPER | ❌ | 0 | 4.3 | Title-case |
+| PROPER | ✅ | 6 | 4.3 polish | W5-61: title-case each "word". A word starts after any non-letter character (Unicode). Digits and punctuation break words (Excel canon — `"123abc"` → `"123Abc"`, `"o'neill"` → `"O'Neill"`). |
 | TRIM | ✅ | 1 | 4.3 V1 | Strip + collapse internal space runs |
-| CLEAN | ❌ | 0 | 4.3 | Strip non-printable ASCII |
+| CLEAN | ✅ | 4 | 4.3 polish | W5-61: strip ASCII control chars 0x00–0x1F (tab, LF, CR, and the rest). Chars ≥ 0x20 and all Unicode pass through. |
 | CONCATENATE | ⚠️ | 4 | 4.3 V2 | W5-56: variadic scalar args, no range support (Excel CONCATENATE is the legacy non-range version). Errors propagate. CONCAT (range-aware variant) deferred to next batch. |
-| CONCAT | ❌ | 0 | 4.10 | Range-aware variant of CONCATENATE — deferred to wave 2 (needs RangeAwareFn flatten). |
+| CONCAT | ✅ | 7 | 4.3 polish | W5-61: range-aware variant of CONCATENATE. Accepts ranges (flattens row-major) and scalars. Blanks become empty strings (no skip). Numbers / bools coerce to text representation. Errors propagate (first one returned). Variadic; ≥1 arg required. |
 | TEXTJOIN | ❌ | 0 | 4.3 | |
 | FIND | ⚠️ | 5 | 4.3 V2 | W5-56: case-SENSITIVE substring search; 1-based result; not found → #VALUE!. Optional start_num. Empty needle returns start_num. No wildcards (FIND never supports wildcards in Excel anyway). |
-| SEARCH | ⚠️ | 2 | 4.3 V2 | W5-56: case-INSENSITIVE substring search. **Wildcards `?` / `*` deferred** (treated as literal characters in V1; documented). Same start_num + not-found semantics as FIND. |
+| SEARCH | ✅ | 7 | 4.3 polish | W5-56 + W5-61: case-INSENSITIVE substring search. **Wildcards `?` (single char) and `*` (any chars) supported W5-61.** Escape with `~` (`~?`, `~*`, `~~`). Same start_num + not-found semantics as FIND. Empty needle returns start_num. |
 | SUBSTITUTE | ⚠️ | 4 | 4.3 V2 | W5-56: case-sensitive find-and-replace. Optional instance_num replaces only the Nth occurrence (1-based). Empty old_text is a no-op (Excel canon). |
 | REPLACE | ⚠️ | 3 | 4.3 V2 | W5-56: position-based replace. 1-based start_num; num_chars 0 = pure insert; start past end appends. Out-of-bounds args clamp gracefully. |
 | REPT | ⚠️ | 3 | 4.3 V2 | W5-56: text repeat. Excel canonical 32,767-character cap enforced (returns #VALUE! when exceeded). Negative num_times → #VALUE!. |

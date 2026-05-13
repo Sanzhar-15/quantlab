@@ -231,9 +231,12 @@ pub(crate) fn is_aggregate_function(name: &str) -> bool {
             | "SMALL"
             | "RANK"
             | "RANK.EQ"
+            | "RANK.AVG"
             | "MEDIAN"
             | "MODE"
             | "MODE.SNGL"
+            // Range-aware text completion (W5-61 polish).
+            | "CONCAT"
     )
 }
 

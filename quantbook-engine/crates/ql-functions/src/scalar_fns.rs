@@ -904,6 +904,128 @@ pub fn floor(args: &[Value]) -> Value {
     }
 }
 
+/// `CEILING.MATH(number, [significance], [mode])` — round `number` UP
+/// (toward +∞) to the nearest multiple of `significance`. Unlike
+/// CEILING, uses **absolute** significance and has a `mode` flag for
+/// negative numbers.
+///
+/// Excel canon:
+/// - Default `significance` = 1; default `mode` = 0.
+/// - `significance` is taken as `abs(significance)` — sign is ignored
+///   (unlike CEILING which errors on number > 0 + significance < 0).
+/// - Positive `number`: round toward +∞ (away from zero).
+/// - Negative `number`:
+///   - `mode = 0` (default): round toward +∞ (i.e. toward zero).
+///   - `mode ≠ 0`: round toward -∞ (i.e. away from zero).
+/// - `significance = 0` returns 0.
+pub fn ceiling_math(args: &[Value]) -> Value {
+    if args.is_empty() || args.len() > 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let number = match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => n,
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    let significance = if args.len() >= 2 {
+        match coerce_numeric(&args[1]) {
+            NumericArg::Number(n) => n,
+            NumericArg::Skip => 0.0,
+            NumericArg::Error(e) => return Value::Error(e),
+        }
+    } else {
+        1.0
+    };
+    let mode = if args.len() == 3 {
+        match coerce_numeric(&args[2]) {
+            NumericArg::Number(n) => n,
+            NumericArg::Skip => 0.0,
+            NumericArg::Error(e) => return Value::Error(e),
+        }
+    } else {
+        0.0
+    };
+    if significance == 0.0 {
+        return Value::Number(0.0);
+    }
+    let abs_sig = significance.abs();
+    // Direction:
+    //   - Positive number: always toward +∞ (.ceil()).
+    //   - Negative + mode=0: toward +∞ (toward zero) — .ceil().
+    //   - Negative + mode≠0: toward -∞ (away from zero) — .floor().
+    let result = if number >= 0.0 || mode == 0.0 {
+        (number / abs_sig).ceil() * abs_sig
+    } else {
+        (number / abs_sig).floor() * abs_sig
+    };
+    match coercion::sanitize_f64(result) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `FLOOR.MATH(number, [significance], [mode])` — round `number` DOWN
+/// (toward -∞) to the nearest multiple of `significance`. Mirror of
+/// CEILING.MATH with the opposite default direction.
+///
+/// Excel canon:
+/// - Default `significance` = 1; default `mode` = 0.
+/// - `significance` = `abs(significance)`.
+/// - Positive `number`: round toward -∞ (toward zero).
+/// - Negative `number`:
+///   - `mode = 0` (default): round toward -∞ (away from zero).
+///   - `mode ≠ 0`: round toward +∞ (toward zero).
+/// - `significance = 0` returns `#DIV/0!` per Excel canon (FLOOR.MATH
+///   diverges from CEILING.MATH here; matches Excel).
+pub fn floor_math(args: &[Value]) -> Value {
+    if args.is_empty() || args.len() > 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let number = match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => n,
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    let significance = if args.len() >= 2 {
+        match coerce_numeric(&args[1]) {
+            NumericArg::Number(n) => n,
+            NumericArg::Skip => 0.0,
+            NumericArg::Error(e) => return Value::Error(e),
+        }
+    } else {
+        1.0
+    };
+    let mode = if args.len() == 3 {
+        match coerce_numeric(&args[2]) {
+            NumericArg::Number(n) => n,
+            NumericArg::Skip => 0.0,
+            NumericArg::Error(e) => return Value::Error(e),
+        }
+    } else {
+        0.0
+    };
+    if significance == 0.0 {
+        if number == 0.0 {
+            return Value::Number(0.0);
+        }
+        return Value::Error(ErrorValue::DivZero);
+    }
+    let abs_sig = significance.abs();
+    // Direction (mirror of CEILING.MATH):
+    //   - Positive number: always toward -∞ (.floor()).
+    //   - Negative + mode=0: toward -∞ (away from zero) — .floor().
+    //   - Negative + mode≠0: toward +∞ (toward zero) — .ceil().
+    let result = if number >= 0.0 || mode == 0.0 {
+        (number / abs_sig).floor() * abs_sig
+    } else {
+        (number / abs_sig).ceil() * abs_sig
+    };
+    match coercion::sanitize_f64(result) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
 /// `MROUND(number, multiple)` — round `number` to the nearest
 /// multiple of `multiple`. .5 rounds away from zero (Excel canon).
 /// Sign rule: number and multiple must have the same sign; mixed →
@@ -1283,6 +1405,56 @@ pub fn lower(args: &[Value]) -> Value {
     Value::text(text.to_lowercase())
 }
 
+/// `PROPER(text)` — title-case each "word". A word starts after any
+/// non-letter character (Unicode). First letter of each word is
+/// uppercased; all other letters lowercased. Digits and punctuation
+/// pass through unchanged.
+///
+/// Excel canon: `PROPER("o'neill 123abc")` → `"O'Neill 123Abc"` (the
+/// digit ends the word, so `a` becomes uppercase).
+pub fn proper(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let text = match coerce_text(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut prev_is_letter = false;
+    for c in text.chars() {
+        if c.is_alphabetic() {
+            if !prev_is_letter {
+                out.extend(c.to_uppercase());
+            } else {
+                out.extend(c.to_lowercase());
+            }
+            prev_is_letter = true;
+        } else {
+            out.push(c);
+            prev_is_letter = false;
+        }
+    }
+    Value::text(out)
+}
+
+/// `CLEAN(text)` — strip all non-printable ASCII control characters
+/// (code points 0x00–0x1F, inclusive) from `text`. Excel canon: removes
+/// the "low" control range only; tab (0x09), LF (0x0A), CR (0x0D) etc.
+/// are ALL stripped. Higher code points (≥ 0x20) and Unicode characters
+/// pass through unchanged.
+pub fn clean(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let text = match coerce_text(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let out: String = text.chars().filter(|c| (*c as u32) >= 0x20).collect();
+    Value::text(out)
+}
+
 /// `TRIM(text)` — strip leading/trailing whitespace AND collapse internal
 /// runs of multiple spaces to a single space. Excel's canon collapses
 /// only standard space (0x20) runs; we follow that.
@@ -1471,10 +1643,16 @@ pub fn find(args: &[Value]) -> Value {
 }
 
 /// `SEARCH(find_text, within_text, [start_num])` — like FIND but
-/// **case-insensitive**. Excel also supports `?` (single char) and
-/// `*` (any chars) wildcards — V1 does NOT implement wildcards;
-/// they're documented as deferred in the matrix and treated as
-/// literal characters here.
+/// **case-insensitive**. **W5-61**: now honors Excel's `?` (single
+/// char) and `*` (zero or more chars) wildcards. Escape with `~`
+/// (`~?`, `~*`, `~~`).
+///
+/// When the find_text contains an unescaped wildcard, search uses
+/// the `wildcard::WildcardPattern` matcher (whole-pattern anchored
+/// search; returns the START position of the first match). Without
+/// wildcards, falls back to the original case-insensitive substring
+/// search (preserves the exact byte-for-byte behavior of pre-W5-61
+/// callers that don't use wildcard chars).
 pub fn search(args: &[Value]) -> Value {
     if args.len() < 2 || args.len() > 3 {
         return Value::Error(ErrorValue::Value);
@@ -1500,22 +1678,23 @@ pub fn search(args: &[Value]) -> Value {
         return Value::Error(ErrorValue::Value);
     }
     let start_idx = (start - 1) as usize;
-    let needle_u: Vec<char> = needle.to_uppercase().chars().collect();
-    let hay_u: Vec<char> = hay.to_uppercase().chars().collect();
-    if needle_u.is_empty() {
+    // Empty-needle edge case: Excel returns `start` directly.
+    if needle.is_empty() {
         return Value::Number(start as f64);
     }
-    let n_len = needle_u.len();
-    let h_len = hay_u.len();
-    if start_idx + n_len > h_len {
-        return Value::Error(ErrorValue::Value);
+    // W5-61: SEARCH always routes through WildcardPattern. The
+    // pattern compiler correctly handles escaped wildcards (`~?`,
+    // `~*`, `~~`) AND no-wildcard inputs (which compile to a single
+    // Literal part and behave identically to the pre-W5-61
+    // case-insensitive substring search). Routing unconditionally
+    // through this path also avoids the bug where `has_wildcards`
+    // returned false for `~?` but the substring path would have
+    // searched for the literal "~?" instead of the literal "?".
+    let pat = crate::wildcard::WildcardPattern::compile(&needle);
+    match pat.search_in(&hay, start_idx) {
+        Some(i) => Value::Number((i + 1) as f64),
+        None => Value::Error(ErrorValue::Value),
     }
-    for i in start_idx..=(h_len - n_len) {
-        if hay_u[i..i + n_len] == needle_u[..] {
-            return Value::Number((i + 1) as f64);
-        }
-    }
-    Value::Error(ErrorValue::Value)
 }
 
 /// `SUBSTITUTE(text, old_text, new_text, [instance_num])` —
@@ -2815,6 +2994,42 @@ mod tests {
         );
     }
 
+    // ===== W5-61 SEARCH wildcards =====
+
+    #[test]
+    fn search_wildcard_star_finds_substring() {
+        // "foo*" matches anything starting with "foo".
+        // In "abcfoobar", the match starts at position 4 (1-based).
+        assert_eq!(search(&[vt("foo*"), vt("abcfoobar")]), n(4.0));
+    }
+
+    #[test]
+    fn search_wildcard_question_matches_single() {
+        // "?o" matches one char + "o". In "fool", matches at 1.
+        assert_eq!(search(&[vt("?o"), vt("fool")]), n(1.0));
+    }
+
+    #[test]
+    fn search_wildcard_escape_literal() {
+        // "~?" — literal `?`. In "what?", matches at 5 (1-based).
+        assert_eq!(search(&[vt("~?"), vt("what?")]), n(5.0));
+    }
+
+    #[test]
+    fn search_wildcard_no_match() {
+        assert_eq!(
+            search(&[vt("z*"), vt("apple")]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn search_wildcard_with_start_skips_earlier_match() {
+        // "?o" — without start, matches at 1 (fo). With start=2,
+        // skips first match → finds next 'o' at position 3 (oo).
+        assert_eq!(search(&[vt("?o"), vt("foozoo"), n(2.0)]), n(2.0));
+    }
+
     #[test]
     fn substitute_replace_all() {
         // Default: replace all "o" with "0".
@@ -3009,6 +3224,187 @@ mod tests {
         assert_eq!(odd(&[n(2.0)]), n(3.0));
         assert_eq!(odd(&[n(-1.5)]), n(-3.0));
         assert_eq!(odd(&[n(0.0)]), n(1.0)); // Excel canon
+    }
+
+    // ===== W5-61 Phase 4.3 polish: PROPER / CLEAN / CEILING.MATH / FLOOR.MATH =====
+    // Uses the `t(&str)` helper defined earlier in this test module
+    // (line ~2246, Phase 4.3 V1 helper).
+
+    #[test]
+    fn proper_simple_words() {
+        assert_eq!(proper(&[t("hello world")]), t("Hello World"));
+        assert_eq!(proper(&[t("HELLO WORLD")]), t("Hello World"));
+        assert_eq!(proper(&[t("hELLO wORLD")]), t("Hello World"));
+    }
+
+    #[test]
+    fn proper_digits_break_words() {
+        // Excel canon: a digit ends the word, so the letter after it
+        // becomes uppercase.
+        assert_eq!(proper(&[t("123abc")]), t("123Abc"));
+        assert_eq!(proper(&[t("abc123def")]), t("Abc123Def"));
+    }
+
+    #[test]
+    fn proper_punctuation_breaks_words() {
+        assert_eq!(proper(&[t("o'neill")]), t("O'Neill"));
+        assert_eq!(proper(&[t("mary-jane")]), t("Mary-Jane"));
+    }
+
+    #[test]
+    fn proper_empty_and_blank() {
+        assert_eq!(proper(&[t("")]), t(""));
+        assert_eq!(proper(&[Value::Blank]), t(""));
+    }
+
+    #[test]
+    fn proper_propagates_errors() {
+        assert_eq!(
+            proper(&[Value::Error(ErrorValue::DivZero)]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn proper_arity_error() {
+        assert_eq!(proper(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(proper(&[t("a"), t("b")]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn clean_strips_low_control_chars() {
+        // Tab, LF, CR, all 0x00-0x1F.
+        let input: String = "ab\tcd\nef\r".to_string();
+        assert_eq!(clean(&[t(&input)]), t("abcdef"));
+    }
+
+    #[test]
+    fn clean_preserves_high_chars() {
+        // Space (0x20) and above are preserved.
+        assert_eq!(clean(&[t("hello world")]), t("hello world"));
+        assert_eq!(clean(&[t("café")]), t("café")); // Unicode preserved
+    }
+
+    #[test]
+    fn clean_empty_input() {
+        assert_eq!(clean(&[t("")]), t(""));
+    }
+
+    #[test]
+    fn clean_propagates_errors() {
+        assert_eq!(
+            clean(&[Value::Error(ErrorValue::Num)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn ceiling_math_positive_default() {
+        // Default significance = 1, mode = 0.
+        assert_eq!(ceiling_math(&[n(4.3)]), n(5.0));
+        assert_eq!(ceiling_math(&[n(4.0)]), n(4.0));
+    }
+
+    #[test]
+    fn ceiling_math_with_significance() {
+        // Round 7.3 up to nearest 0.5 → 7.5.
+        assert_eq!(ceiling_math(&[n(7.3), n(0.5)]), n(7.5));
+        // Round 11 up to nearest 3 → 12.
+        assert_eq!(ceiling_math(&[n(11.0), n(3.0)]), n(12.0));
+    }
+
+    #[test]
+    fn ceiling_math_uses_abs_significance() {
+        // Unlike CEILING, CEILING.MATH ignores significance sign.
+        // CEILING(4.3, -1) is #NUM!; CEILING.MATH(4.3, -1) is 5.
+        assert_eq!(ceiling_math(&[n(4.3), n(-1.0)]), n(5.0));
+        assert_eq!(ceiling_math(&[n(11.0), n(-3.0)]), n(12.0));
+    }
+
+    #[test]
+    fn ceiling_math_negative_default_mode_zero() {
+        // Negative number, mode=0 → round toward +∞ (toward zero).
+        // -4.3 → -4.
+        assert_eq!(ceiling_math(&[n(-4.3)]), n(-4.0));
+        assert_eq!(ceiling_math(&[n(-4.3), n(0.5)]), n(-4.0));
+    }
+
+    #[test]
+    fn ceiling_math_negative_mode_one() {
+        // Negative number, mode=1 → round toward -∞ (away from zero).
+        // -4.3 → -5.
+        assert_eq!(ceiling_math(&[n(-4.3), n(1.0), n(1.0)]), n(-5.0));
+        assert_eq!(ceiling_math(&[n(-4.3), n(0.5), n(1.0)]), n(-4.5));
+    }
+
+    #[test]
+    fn ceiling_math_zero_significance_returns_zero() {
+        // Matches CEILING canon (unlike FLOOR.MATH).
+        assert_eq!(ceiling_math(&[n(4.3), n(0.0)]), n(0.0));
+        assert_eq!(ceiling_math(&[n(-4.3), n(0.0)]), n(0.0));
+    }
+
+    #[test]
+    fn ceiling_math_arity_error() {
+        assert_eq!(ceiling_math(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            ceiling_math(&[n(1.0), n(2.0), n(3.0), n(4.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn floor_math_positive_default() {
+        assert_eq!(floor_math(&[n(4.7)]), n(4.0));
+        assert_eq!(floor_math(&[n(4.0)]), n(4.0));
+    }
+
+    #[test]
+    fn floor_math_with_significance() {
+        // Round 7.7 down to nearest 0.5 → 7.5.
+        assert_eq!(floor_math(&[n(7.7), n(0.5)]), n(7.5));
+    }
+
+    #[test]
+    fn floor_math_uses_abs_significance() {
+        assert_eq!(floor_math(&[n(4.7), n(-1.0)]), n(4.0));
+    }
+
+    #[test]
+    fn floor_math_negative_default_mode_zero() {
+        // Negative + mode=0 → round toward -∞ (away from zero).
+        // -4.3 → -5.
+        assert_eq!(floor_math(&[n(-4.3)]), n(-5.0));
+    }
+
+    #[test]
+    fn floor_math_negative_mode_one() {
+        // Negative + mode≠0 → round toward +∞ (toward zero).
+        // -4.3 → -4.
+        assert_eq!(floor_math(&[n(-4.3), n(1.0), n(1.0)]), n(-4.0));
+    }
+
+    #[test]
+    fn floor_math_zero_significance_nonzero_number_is_div_zero() {
+        // Matches FLOOR canon (NOT CEILING.MATH which returns 0).
+        assert_eq!(
+            floor_math(&[n(4.3), n(0.0)]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn floor_math_zero_significance_zero_number_is_zero() {
+        assert_eq!(floor_math(&[n(0.0), n(0.0)]), n(0.0));
+    }
+
+    #[test]
+    fn floor_math_arity_error() {
+        assert_eq!(floor_math(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            floor_math(&[n(1.0), n(2.0), n(3.0), n(4.0)]),
+            Value::Error(ErrorValue::Value)
+        );
     }
 
     #[test]

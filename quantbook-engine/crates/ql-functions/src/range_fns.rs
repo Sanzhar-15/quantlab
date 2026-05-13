@@ -36,6 +36,7 @@
 use ql_types::{coercion, ErrorValue, Value};
 
 use crate::range_aware_fns::FnArg;
+use crate::wildcard::{has_wildcards, WildcardPattern};
 
 /// Helper: coerce a Value to a numeric f64 for sum-style accumulation.
 /// Errors propagate; Blank skips; Bool coerces (TRUE=1.0, FALSE=0.0);
@@ -84,6 +85,12 @@ enum Predicate {
     /// Blank-criteria match: criteria is `""` (empty text) → matches
     /// Value::Blank AND Value::Text("").
     Blank(CmpOp),
+    /// Text-with-wildcards (W5-61). Only Eq / Ne. Excel canon: the
+    /// pattern is matched against the cell's text representation
+    /// (case-insensitive). Non-Text cells (Number, Bool) never match
+    /// a wildcard criteria — matches Excel canon where wildcard
+    /// criteria target text cells specifically.
+    TextWildcard(CmpOp, WildcardPattern),
 }
 
 impl Predicate {
@@ -143,6 +150,23 @@ impl Predicate {
                 match op {
                     CmpOp::Eq => is_blank,
                     CmpOp::Ne => !is_blank,
+                    _ => false,
+                }
+            }
+            Predicate::TextWildcard(op, pattern) => {
+                // Excel canon: wildcards target text cells. Blanks
+                // are matched against the empty string.
+                let is_match = match v {
+                    Value::Text(s) => pattern.matches(s.as_ref()),
+                    Value::Blank => pattern.matches(""),
+                    // Non-text cells never match wildcard criteria.
+                    _ => false,
+                };
+                match op {
+                    CmpOp::Eq => is_match,
+                    CmpOp::Ne => !is_match,
+                    // Wildcards only support Eq/Ne (build_predicate
+                    // never constructs this with ordered ops).
                     _ => false,
                 }
             }
@@ -219,7 +243,21 @@ fn build_predicate(criteria: &Value) -> Result<Predicate, ErrorValue> {
             if upper == "FALSE" {
                 return Ok(Predicate::Boolean(op, false));
             }
-            // Default: text comparison.
+            // Wildcard detection (W5-61). Excel canon: wildcards
+            // only apply to Eq / Ne. For ordered comparisons
+            // (Lt/Le/Gt/Ge) wildcards are treated as literal chars.
+            // Route to wildcard path if the criteria contains ANY of
+            // `?`, `*`, OR `~` (the escape char) — even purely
+            // escaped criteria like `~?` need the WildcardPattern
+            // compiler to correctly strip the escape and produce a
+            // literal-`?` match. `Predicate::Text` would compare the
+            // raw string `~?` against cells and miss.
+            let has_wildcard_syntax =
+                matches!(op, CmpOp::Eq | CmpOp::Ne) && (has_wildcards(rest) || rest.contains('~'));
+            if has_wildcard_syntax {
+                return Ok(Predicate::TextWildcard(op, WildcardPattern::compile(rest)));
+            }
+            // Default: plain text comparison.
             Ok(Predicate::Text(op, rest.to_string()))
         }
     }
@@ -1191,6 +1229,64 @@ pub fn rank(args: &[FnArg]) -> Value {
     Value::Number((better + 1) as f64)
 }
 
+/// `RANK.AVG(value, ref, [order])` — like RANK / RANK.EQ but returns
+/// the AVERAGE of the ranks for tied values, not the smallest. If the
+/// value ties with `k` other values, the rank returned is
+/// `base + (k - 1) / 2` where `base` is what RANK would have returned.
+///
+/// Example: `[10, 20, 20, 30]` descending — value 20 has rank 2 in
+/// RANK (two values tied at the second rank). RANK.AVG returns
+/// `2 + (2-1)/2 = 2.5`.
+pub fn rank_avg(args: &[FnArg]) -> Value {
+    if args.len() < 2 || args.len() > 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let target = match &args[0] {
+        FnArg::Scalar(Value::Number(n)) => *n,
+        FnArg::Scalar(Value::Boolean(b)) => {
+            if *b {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        FnArg::Scalar(Value::Blank) => 0.0,
+        FnArg::Scalar(Value::Error(e)) => return Value::Error(*e),
+        _ => return Value::Error(ErrorValue::Value),
+    };
+    let arr = match collect_numbers_strict(&args[1..2]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if arr.is_empty() {
+        return Value::Error(ErrorValue::NA);
+    }
+    let order = if args.len() == 3 {
+        match &args[2] {
+            FnArg::Scalar(Value::Number(n)) => *n != 0.0,
+            FnArg::Scalar(Value::Boolean(b)) => *b,
+            FnArg::Scalar(Value::Blank) => false,
+            FnArg::Scalar(Value::Error(e)) => return Value::Error(*e),
+            _ => return Value::Error(ErrorValue::Value),
+        }
+    } else {
+        false
+    };
+    // Count tied values (bit-pattern equality, matching MODE).
+    let ties = arr.iter().filter(|x| **x == target).count();
+    if ties == 0 {
+        return Value::Error(ErrorValue::NA);
+    }
+    let better = if order {
+        arr.iter().filter(|x| **x < target).count()
+    } else {
+        arr.iter().filter(|x| **x > target).count()
+    };
+    // Base rank = better + 1; tie offset = (ties - 1) / 2.
+    let rank = better as f64 + 1.0 + (ties as f64 - 1.0) / 2.0;
+    Value::Number(rank)
+}
+
 /// `MEDIAN(num1, num2, ...)` — median of the flattened numeric
 /// values. Even count → average of the two middle. Empty → `#NUM!`.
 pub fn median(args: &[FnArg]) -> Value {
@@ -1261,6 +1357,62 @@ pub fn mode(args: &[FnArg]) -> Value {
     match best {
         Some((bits, _, _)) => Value::Number(f64::from_bits(bits)),
         None => Value::Error(ErrorValue::NA),
+    }
+}
+
+/// `CONCAT(text1, [text2], ...)` — concatenate scalar values AND
+/// flattened range cells into one string. Differs from CONCATENATE in
+/// that it accepts range arguments (CONCATENATE only accepts scalars).
+///
+/// Excel canon:
+/// - Variadic; at least 1 arg.
+/// - Blanks become empty strings (no skip; matches Excel canon).
+/// - Numbers / bools coerce to text representation (TRUE/FALSE for
+///   bools; integer-without-trailing-zero rendering for numbers via
+///   the same path as CONCATENATE).
+/// - Errors propagate (the first error encountered is returned).
+/// - Ranges are flattened in row-major order.
+pub fn concat(args: &[FnArg]) -> Value {
+    if args.is_empty() {
+        return Value::Error(ErrorValue::Value);
+    }
+    let mut out = String::new();
+    for arg in args {
+        match arg {
+            FnArg::Scalar(v) => match value_to_concat_text(v) {
+                Ok(s) => out.push_str(&s),
+                Err(e) => return Value::Error(e),
+            },
+            FnArg::Range { values, .. } => {
+                for v in values {
+                    match value_to_concat_text(v) {
+                        Ok(s) => out.push_str(&s),
+                        Err(e) => return Value::Error(e),
+                    }
+                }
+            }
+        }
+    }
+    Value::text(out)
+}
+
+/// CONCAT-style text coercion: Blank→"", Number→text, Bool→TRUE/FALSE,
+/// Text→clone, Error→propagate.
+fn value_to_concat_text(v: &Value) -> Result<String, ErrorValue> {
+    match v {
+        Value::Error(e) => Err(*e),
+        Value::Blank => Ok(String::new()),
+        Value::Text(s) => Ok(s.as_ref().to_owned()),
+        Value::Boolean(b) => Ok(if *b { "TRUE" } else { "FALSE" }.to_owned()),
+        Value::Number(n) => {
+            // Match scalar_fns::format_number_for_text: integer
+            // rendering without trailing .0, else default Display.
+            if *n == n.trunc() && n.abs() < 1e15 {
+                Ok(format!("{}", *n as i64))
+            } else {
+                Ok(format!("{n}"))
+            }
+        }
     }
 }
 
@@ -1505,6 +1657,83 @@ mod tests {
         let range = r(vec![n(1.0)]);
         let v = countif(&[range, s(Value::Error(ErrorValue::Num))]);
         assert_eq!(v, Value::Error(ErrorValue::Num));
+    }
+
+    // ===== W5-61 wildcards in criteria =====
+
+    #[test]
+    fn countif_wildcard_star_matches_prefix() {
+        // Criteria "ap*" matches "apple", "apricot"; not "banana".
+        let range = r(vec![t("apple"), t("apricot"), t("banana"), t("cherry")]);
+        assert_eq!(countif(&[range, s(t("ap*"))]), n(2.0));
+    }
+
+    #[test]
+    fn countif_wildcard_star_matches_suffix() {
+        // "*ple" matches "apple", "pineapple".
+        let range = r(vec![t("apple"), t("pineapple"), t("banana")]);
+        assert_eq!(countif(&[range, s(t("*ple"))]), n(2.0));
+    }
+
+    #[test]
+    fn countif_wildcard_question_matches_single_char() {
+        // "a?c" matches "abc", "axc"; not "ac" (no middle char) and
+        // not "abbc" (2 middle chars).
+        let range = r(vec![t("abc"), t("axc"), t("ac"), t("abbc")]);
+        assert_eq!(countif(&[range, s(t("a?c"))]), n(2.0));
+    }
+
+    #[test]
+    fn countif_wildcard_combined_star_and_question() {
+        // "?o*" — any single char, then "o", then anything.
+        let range = r(vec![t("foo"), t("bog"), t("blog"), t("oh")]);
+        // "foo" → f + o + o ✓; "bog" → b + o + g ✓; "blog" → b + l (≠ o) ✗;
+        // "oh" → o + h (no 'o' after) ✗.
+        assert_eq!(countif(&[range, s(t("?o*"))]), n(2.0));
+    }
+
+    #[test]
+    fn countif_wildcard_escape_treats_as_literal() {
+        // Criteria "~?" — literal `?`, no wildcard.
+        let range = r(vec![t("?"), t("a"), t("?"), t("??")]);
+        // Matches only the cells equal to literal "?".
+        assert_eq!(countif(&[range, s(t("~?"))]), n(2.0));
+    }
+
+    #[test]
+    fn countif_wildcard_case_insensitive() {
+        let range = r(vec![t("Apple"), t("APPLE"), t("apple")]);
+        assert_eq!(countif(&[range, s(t("ap*"))]), n(3.0));
+    }
+
+    #[test]
+    fn countif_wildcard_does_not_match_numbers() {
+        // Excel canon: wildcards target text cells only. Numbers
+        // (even those rendering as "5" textually) do not match
+        // wildcard patterns.
+        let range = r(vec![n(5.0), n(50.0), t("5"), t("50")]);
+        // "5*" — text "5" matches (no chars after), "50" matches.
+        // Numbers do not match.
+        assert_eq!(countif(&[range, s(t("5*"))]), n(2.0));
+    }
+
+    #[test]
+    fn countif_wildcard_not_equal_inverts() {
+        // "<>ap*" — NOT starting with "ap".
+        let range = r(vec![t("apple"), t("apricot"), t("banana"), t("cherry")]);
+        assert_eq!(countif(&[range, s(t("<>ap*"))]), n(2.0));
+    }
+
+    #[test]
+    fn sumif_wildcard_sums_matching_indices() {
+        let crit_range = r(vec![t("apple"), t("apricot"), t("banana"), t("cherry")]);
+        let sum_range = FnArg::Range {
+            values: vec![n(10.0), n(20.0), n(30.0), n(40.0)],
+            rows: 1,
+            cols: 4,
+        };
+        // "ap*" matches indices 0 and 1 → 10 + 20 = 30.
+        assert_eq!(sumif(&[crit_range, s(t("ap*")), sum_range]), n(30.0));
     }
 
     // ===== W5-54 Lookup family =====
@@ -2240,6 +2469,64 @@ mod tests {
         assert_eq!(rank(&[s(n(1.0)), r(vec![])]), Value::Error(ErrorValue::NA));
     }
 
+    // --- RANK.AVG (W5-61) ---
+
+    #[test]
+    fn rank_avg_descending_with_ties_averages() {
+        // [10, 20, 20, 30] descending — 30=1, 20+20=avg(2,3)=2.5, 10=4.
+        let arr = r(vec![n(10.0), n(20.0), n(20.0), n(30.0)]);
+        assert_eq!(rank_avg(&[s(n(30.0)), arr.clone()]), n(1.0));
+        assert_eq!(rank_avg(&[s(n(20.0)), arr.clone()]), n(2.5));
+        assert_eq!(rank_avg(&[s(n(10.0)), arr]), n(4.0));
+    }
+
+    #[test]
+    fn rank_avg_three_way_tie() {
+        // [10, 20, 20, 20, 30] descending — 20 ties with 2 others.
+        // RANK would give 20 rank 2; RANK.AVG = 2 + (3-1)/2 = 3.
+        let arr = r(vec![n(10.0), n(20.0), n(20.0), n(20.0), n(30.0)]);
+        assert_eq!(rank_avg(&[s(n(20.0)), arr]), n(3.0));
+    }
+
+    #[test]
+    fn rank_avg_no_ties_matches_rank() {
+        let arr = r(vec![n(10.0), n(20.0), n(30.0), n(40.0)]);
+        assert_eq!(rank_avg(&[s(n(30.0)), arr.clone()]), n(2.0));
+        assert_eq!(rank_avg(&[s(n(10.0)), arr]), n(4.0));
+    }
+
+    #[test]
+    fn rank_avg_ascending() {
+        // [10, 20, 20, 30] ascending — 10=1, 20+20=avg(2,3)=2.5, 30=4.
+        let arr = r(vec![n(10.0), n(20.0), n(20.0), n(30.0)]);
+        assert_eq!(rank_avg(&[s(n(20.0)), arr.clone(), s(n(1.0))]), n(2.5));
+        assert_eq!(rank_avg(&[s(n(10.0)), arr.clone(), s(n(1.0))]), n(1.0));
+        assert_eq!(rank_avg(&[s(n(30.0)), arr, s(n(1.0))]), n(4.0));
+    }
+
+    #[test]
+    fn rank_avg_value_not_in_ref_is_na() {
+        let arr = r(vec![n(10.0), n(20.0), n(30.0)]);
+        assert_eq!(rank_avg(&[s(n(99.0)), arr]), Value::Error(ErrorValue::NA));
+    }
+
+    #[test]
+    fn rank_avg_empty_ref_is_na() {
+        assert_eq!(
+            rank_avg(&[s(n(1.0)), r(vec![])]),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn rank_avg_arity_error() {
+        assert_eq!(rank_avg(&[s(n(1.0))]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            rank_avg(&[s(n(1.0)), r(vec![n(1.0)]), s(n(0.0)), s(n(0.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
     // --- MEDIAN ---
 
     #[test]
@@ -2339,5 +2626,64 @@ mod tests {
             mode(&[r(vec![n(1.0), n(near_one)])]),
             Value::Error(ErrorValue::NA)
         );
+    }
+
+    // --- CONCAT (W5-61, range-aware variant of CONCATENATE) ---
+    // Uses the `t` helper defined at the top of this test module
+    // (line ~1419).
+
+    #[test]
+    fn concat_scalars_only() {
+        assert_eq!(
+            concat(&[s(t("hello")), s(t(" ")), s(t("world"))]),
+            t("hello world")
+        );
+    }
+
+    #[test]
+    fn concat_flattens_range() {
+        // CONCAT accepts ranges; CONCATENATE doesn't.
+        assert_eq!(concat(&[r(vec![t("a"), t("b"), t("c")])]), t("abc"));
+    }
+
+    #[test]
+    fn concat_mixed_scalar_and_range() {
+        assert_eq!(
+            concat(&[s(t("start-")), r(vec![t("a"), t("b")]), s(t("-end"))]),
+            t("start-ab-end")
+        );
+    }
+
+    #[test]
+    fn concat_blanks_become_empty_string() {
+        // Excel canon: blanks contribute empty string (no skip).
+        assert_eq!(concat(&[s(t("a")), s(Value::Blank), s(t("b"))]), t("ab"));
+        assert_eq!(concat(&[r(vec![t("x"), Value::Blank, t("y")])]), t("xy"));
+    }
+
+    #[test]
+    fn concat_coerces_numbers_and_bools() {
+        assert_eq!(
+            concat(&[s(n(1.0)), s(t("-")), s(Value::Boolean(true))]),
+            t("1-TRUE")
+        );
+    }
+
+    #[test]
+    fn concat_propagates_errors() {
+        assert_eq!(
+            concat(&[s(t("a")), s(Value::Error(ErrorValue::DivZero)), s(t("b"))]),
+            Value::Error(ErrorValue::DivZero)
+        );
+        // Error in a range cell also propagates.
+        assert_eq!(
+            concat(&[r(vec![t("x"), Value::Error(ErrorValue::Num)])]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn concat_empty_args_is_value_error() {
+        assert_eq!(concat(&[]), Value::Error(ErrorValue::Value));
     }
 }

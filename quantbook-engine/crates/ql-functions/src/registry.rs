@@ -186,6 +186,8 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("LEN", scalar_fns::len);
     r.register("UPPER", scalar_fns::upper);
     r.register("LOWER", scalar_fns::lower);
+    r.register("PROPER", scalar_fns::proper);
+    r.register("CLEAN", scalar_fns::clean);
     r.register("TRIM", scalar_fns::trim);
     r.register("ISNUMBER", scalar_fns::isnumber);
     r.register("ISTEXT", scalar_fns::istext);
@@ -215,6 +217,8 @@ pub fn default_registry() -> FunctionRegistry {
     // FLOOR / MROUND; integer-domain for GCD / LCM / QUOTIENT.
     r.register("CEILING", scalar_fns::ceiling);
     r.register("FLOOR", scalar_fns::floor);
+    r.register("CEILING.MATH", scalar_fns::ceiling_math);
+    r.register("FLOOR.MATH", scalar_fns::floor_math);
     r.register("MROUND", scalar_fns::mround);
     r.register("ODD", scalar_fns::odd);
     r.register("EVEN", scalar_fns::even);
@@ -287,6 +291,8 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_range_aware("SMALL", range_fns::small);
     r.register_range_aware("RANK", range_fns::rank);
     r.register_range_aware("RANK.EQ", range_fns::rank); // Modern Excel alias
+    r.register_range_aware("RANK.AVG", range_fns::rank_avg);
+    r.register_range_aware("CONCAT", range_fns::concat);
     r.register_range_aware("MEDIAN", range_fns::median);
     r.register_range_aware("MODE", range_fns::mode);
     r.register_range_aware("MODE.SNGL", range_fns::mode); // Modern Excel alias
@@ -326,8 +332,10 @@ mod tests {
         // EVEN, QUOTIENT, GCD, LCM, SINH, COSH, TANH, ASINH,
         // ACOSH, ATANH = 14) + Phase 4.3 V2 stats family (W5-58:
         // LARGE, SMALL, RANK, RANK.EQ alias, MEDIAN, MODE,
-        // MODE.SNGL alias = 7).
-        assert_eq!(r.len(), 102);
+        // MODE.SNGL alias = 7) + Phase 4.3 polish wave 1 (W5-61:
+        // PROPER, CLEAN, CEILING.MATH, FLOOR.MATH, RANK.AVG,
+        // CONCAT = 6).
+        assert_eq!(r.len(), 108);
     }
 
     #[test]
