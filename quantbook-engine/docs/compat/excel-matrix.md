@@ -110,25 +110,30 @@ as partial, rows with `❌` are missing.
 | ROUND | ✅ | 5+ | 0 | |
 | ROUNDUP | ⚠️ | 4 | 4.3 V1 | Round away from zero; sign-preserving. **Binary-float gotcha:** `ROUNDUP(0.1 + 0.2, 1)` rounds `0.30000000000000004` to `0.4`, while Excel's 15-digit display-aware rounding usually yields `0.3`. Decimal-aware rounding lands Phase 4.5 (number formats). |
 | ROUNDDOWN | ⚠️ | 2 | 4.3 V1 | Truncate toward zero. Same binary-float gotcha as ROUNDUP. **Negative-zero leak:** very-small negative inputs produce `Value::Number(-0.0)` (PartialEq says `0.0 == -0.0`; cosmetic only — display may show `-0`). |
-| MROUND / CEILING / CEILING.MATH / CEILING.PRECISE | ❌ | 0 | 4.3 | |
-| FLOOR / FLOOR.MATH / FLOOR.PRECISE | ❌ | 0 | 4.3 | |
+| MROUND | ✅ | 3 | 4.3 V2 | W5-57: round-half-away-from-zero; sign-mismatch number/multiple → #NUM!; multiple=0 returns 0. |
+| CEILING | ✅ | 4 | 4.3 V2 | W5-57: round away from zero to nearest multiple of significance. Default significance=1. Excel sign rule: number > 0 with significance < 0 → #NUM!. CEILING.MATH (mode flag) deferred. |
+| FLOOR | ✅ | 3 | 4.3 V2 | W5-57: round toward zero to nearest multiple. Same sign rule as CEILING. significance=0 with non-zero number → #DIV/0! (Excel canon — diverges from CEILING which returns 0). FLOOR.MATH deferred. |
+| CEILING.MATH / CEILING.PRECISE | ❌ | 0 | 4.10 | Modern variants with explicit mode flag. |
+| FLOOR.MATH / FLOOR.PRECISE | ❌ | 0 | 4.10 | Same family. |
 | INT | ✅ | 3+ | 0 | Truncation toward -∞ |
 | TRUNC | ✅ | 1 | 4.3 V1 | Truncation toward 0; optional `digits` arg |
 | MOD | ✅ | 3+ | 0 | Excel mod semantics, sign-of-divisor |
-| QUOTIENT | ❌ | 0 | 4.3 | |
+| QUOTIENT | ✅ | 2 | 4.3 V2 | W5-57: integer truncation TOWARD ZERO (not floor). 0 denominator → #DIV/0!. |
+| ODD | ✅ | 1 | 4.3 V2 | W5-57: round away from zero to nearest odd integer. ODD(0) = 1 (Excel canon). |
+| EVEN | ✅ | 1 | 4.3 V2 | W5-57: round away from zero to nearest even integer. EVEN(0) = 0. |
 | POWER | ✅ | 5+ | 0 | Same special cases as `^` operator |
 | EXP | ✅ | 1 | 4.3 V1 | `#NUM!` on overflow |
 | LN | ✅ | 2 | 4.3 V1 | Natural log; non-positive → `#NUM!` |
 | LOG | ✅ | 3 | 4.3 V1 | Optional base; base=1 or non-positive → `#NUM!` |
 | LOG10 | ✅ | 1 | 4.3 V1 | Base-10 log; non-positive → `#NUM!` |
 | SIN / COS / TAN / ASIN / ACOS / ATAN / ATAN2 | ✅ | 13 | 4.3 V2 | W5-51; ATAN2 uses Excel `(x, y)` arg order (not Rust's `(y, x)`); ATAN2(0,0)→#DIV/0!; ASIN/ACOS domain `|x|>1`→#NUM!; TAN(π/2) returns huge-finite (Excel canon, not error) |
-| SINH / COSH / TANH / ASINH / ACOSH / ATANH | ❌ | 0 | 4.10 | |
+| SINH / COSH / TANH / ASINH / ACOSH / ATANH | ✅ | 8 | 4.3 V2 | W5-57: hyperbolic + inverse hyperbolic. ACOSH domain x≥1 → #NUM! otherwise. ATANH domain \|x\|<1 (Excel canon: ATANH(±1) → #NUM!, not ±∞). SINH/COSH overflow → #NUM! via sanitize_f64. |
 | PI | ✅ | 2 | 4.3 V1 | Constant; arity check |
 | DEGREES | ✅ | 1 | 4.3 V1 | Radians → degrees |
 | RADIANS | ✅ | 1 | 4.3 V1 | Degrees → radians |
 | SIGN | ✅ | 1 | 4.3 V1 | -1/0/1 |
 | FACT / FACTDOUBLE / COMBIN / COMBINA / PERMUT / PERMUTATIONA | ❌ | 0 | 4.10 | |
-| GCD / LCM | ❌ | 0 | 4.10 | |
+| GCD / LCM | ✅ | 6 | 4.3 V2 | W5-57: variadic non-negative integers. Negative arg → #NUM!. Non-integer truncated toward zero (Excel canon). LCM with any 0 returns 0; GCD with all-0 returns 0. Range args not supported (V1 scalar-only). |
 | RAND / RANDBETWEEN | ✅ | 3+ | 3.7 | xorshift64, seeded test fixture |
 | RANDARRAY | ❌ | 0 | 4.7 | Array-result; needs 4.7 |
 | SUMPRODUCT | ✅ | 7 | 4.3 V2 | W5-55: element-wise multiply arrays then sum. All arrays must have same length. Non-numeric cells treated as 0 (lenient — Excel canon for SUMPRODUCT). Error cells propagate. Scalar args act as constant multipliers. |

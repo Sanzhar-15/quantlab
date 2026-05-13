@@ -816,6 +816,370 @@ pub fn atan(args: &[Value]) -> Value {
     }
 }
 
+// ===== Math completion (W5-57, Phase 4.3 V2) =====
+//
+// CEILING / FLOOR / MROUND / ODD / EVEN / QUOTIENT / GCD / LCM.
+// All scalar. Excel rounding-canon sign rules:
+// - CEILING / FLOOR / MROUND: if number > 0 and significance < 0,
+//   return #NUM!. Same for the reverse (number < 0 with significance
+//   > 0 is allowed but rounds TOWARD zero).
+// - QUOTIENT: integer truncation toward zero (NOT floor); 0
+//   denominator → #DIV/0!.
+// - GCD / LCM: all args must be non-negative integers; mixed-sign or
+//   non-integer → #NUM!.
+
+/// `CEILING(number, [significance])` — round `number` UP (away from
+/// zero) to the nearest multiple of `significance`. Default
+/// significance = 1.
+///
+/// Sign rule (Excel canon): if `number > 0` and `significance < 0`,
+/// returns `#NUM!`. `significance = 0` returns 0.
+pub fn ceiling(args: &[Value]) -> Value {
+    if args.is_empty() || args.len() > 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let number = match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => n,
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    let significance = if args.len() == 2 {
+        match coerce_numeric(&args[1]) {
+            NumericArg::Number(n) => n,
+            NumericArg::Skip => 0.0,
+            NumericArg::Error(e) => return Value::Error(e),
+        }
+    } else {
+        1.0
+    };
+    if significance == 0.0 {
+        return Value::Number(0.0);
+    }
+    if number > 0.0 && significance < 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    match coercion::sanitize_f64((number / significance).ceil() * significance) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `FLOOR(number, [significance])` — round `number` DOWN (toward
+/// zero) to the nearest multiple of `significance`. Default
+/// significance = 1.
+///
+/// Same sign rule as CEILING.
+pub fn floor(args: &[Value]) -> Value {
+    if args.is_empty() || args.len() > 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let number = match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => n,
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    let significance = if args.len() == 2 {
+        match coerce_numeric(&args[1]) {
+            NumericArg::Number(n) => n,
+            NumericArg::Skip => 0.0,
+            NumericArg::Error(e) => return Value::Error(e),
+        }
+    } else {
+        1.0
+    };
+    if significance == 0.0 {
+        if number == 0.0 {
+            return Value::Number(0.0);
+        }
+        // Non-zero / 0 → #DIV/0! per Excel FLOOR canon (vs CEILING
+        // which returns 0 — yes, the two differ in this edge).
+        return Value::Error(ErrorValue::DivZero);
+    }
+    if number > 0.0 && significance < 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    match coercion::sanitize_f64((number / significance).floor() * significance) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `MROUND(number, multiple)` — round `number` to the nearest
+/// multiple of `multiple`. .5 rounds away from zero (Excel canon).
+/// Sign rule: number and multiple must have the same sign; mixed →
+/// `#NUM!`. multiple = 0 returns 0.
+pub fn mround(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let number = match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => n,
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    let multiple = match coerce_numeric(&args[1]) {
+        NumericArg::Number(n) => n,
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    if multiple == 0.0 {
+        return Value::Number(0.0);
+    }
+    if (number > 0.0 && multiple < 0.0) || (number < 0.0 && multiple > 0.0) {
+        return Value::Error(ErrorValue::Num);
+    }
+    // Round-half-away-from-zero. `(x).round()` already does that
+    // in Rust for non-negative; for negative the rounding goes the
+    // other way. We use the formula `((x / m + 0.5*sign(x)).trunc()) * m`.
+    let q = number / multiple;
+    let rounded = if q >= 0.0 {
+        (q + 0.5).floor()
+    } else {
+        (q - 0.5).ceil()
+    };
+    match coercion::sanitize_f64(rounded * multiple) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `ODD(number)` — round AWAY from zero to the nearest odd integer.
+/// ODD(0) = 1 per Excel canon.
+pub fn odd(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    if n == 0.0 {
+        return Value::Number(1.0);
+    }
+    // Round away from zero to the next integer of the right parity.
+    let away = if n > 0.0 { n.ceil() } else { n.floor() };
+    let away_i = away as i64;
+    // If even, bump by ±1 to get to odd.
+    let adjusted = if away_i % 2 == 0 {
+        if n > 0.0 {
+            away_i + 1
+        } else {
+            away_i - 1
+        }
+    } else {
+        away_i
+    };
+    Value::Number(adjusted as f64)
+}
+
+/// `EVEN(number)` — round AWAY from zero to the nearest even
+/// integer. EVEN(0) = 0.
+pub fn even(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    if n == 0.0 {
+        return Value::Number(0.0);
+    }
+    let away = if n > 0.0 { n.ceil() } else { n.floor() };
+    let away_i = away as i64;
+    let adjusted = if away_i % 2 != 0 {
+        if n > 0.0 {
+            away_i + 1
+        } else {
+            away_i - 1
+        }
+    } else {
+        away_i
+    };
+    Value::Number(adjusted as f64)
+}
+
+/// `QUOTIENT(numerator, denominator)` — integer quotient, truncated
+/// TOWARD ZERO (not floored). `denominator = 0` → `#DIV/0!`.
+pub fn quotient(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let num = match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => n,
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    let den = match coerce_numeric(&args[1]) {
+        NumericArg::Number(n) => n,
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    if den == 0.0 {
+        return Value::Error(ErrorValue::DivZero);
+    }
+    Value::Number((num / den).trunc())
+}
+
+/// Helper for GCD / LCM: collect args as non-negative integers.
+/// Variadic; rejects mixed signs, non-integers, errors.
+fn collect_nonneg_integers(args: &[Value]) -> Result<Vec<u64>, ErrorValue> {
+    if args.is_empty() {
+        return Err(ErrorValue::Value);
+    }
+    let mut out = Vec::with_capacity(args.len());
+    for a in args {
+        let n = match coerce_numeric(a) {
+            NumericArg::Number(n) => n,
+            NumericArg::Skip => 0.0,
+            NumericArg::Error(e) => return Err(e),
+        };
+        if n < 0.0 {
+            return Err(ErrorValue::Num);
+        }
+        let truncated = n.trunc();
+        // Excel: GCD/LCM truncate to integer per docs (not error).
+        // Bound for safety.
+        if !truncated.is_finite() || truncated > (u64::MAX as f64) {
+            return Err(ErrorValue::Num);
+        }
+        out.push(truncated as u64);
+    }
+    Ok(out)
+}
+
+fn gcd2(a: u64, b: u64) -> u64 {
+    let (mut a, mut b) = (a, b);
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+/// `GCD(num1, num2, ...)` — greatest common divisor. Variadic.
+/// All args must be non-negative; mixed sign / negative → `#NUM!`.
+/// Excel: `GCD(0, 0, ..., 0) = 0`.
+pub fn gcd(args: &[Value]) -> Value {
+    let nums = match collect_nonneg_integers(args) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let mut g: u64 = 0;
+    for n in nums {
+        g = gcd2(g, n);
+    }
+    Value::Number(g as f64)
+}
+
+/// `LCM(num1, num2, ...)` — least common multiple. Variadic.
+/// All args must be non-negative integers; mixed sign / negative →
+/// `#NUM!`. LCM with any 0 returns 0.
+pub fn lcm(args: &[Value]) -> Value {
+    let nums = match collect_nonneg_integers(args) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    // LCM identity is 1; but if any arg is 0, result is 0.
+    if nums.contains(&0) {
+        return Value::Number(0.0);
+    }
+    let mut result: u128 = 1;
+    for n in nums {
+        let n_u128 = n as u128;
+        let g = gcd2(result as u64, n) as u128;
+        // result = (result * n) / gcd. Use u128 to defer overflow.
+        match result.checked_mul(n_u128 / g) {
+            Some(v) => result = v,
+            None => return Value::Error(ErrorValue::Num),
+        }
+    }
+    if result > (u64::MAX as u128) || (result as f64) > f64::MAX {
+        return Value::Error(ErrorValue::Num);
+    }
+    Value::Number(result as f64)
+}
+
+// ===== Hyperbolic trig (W5-57, Phase 4.3 V2) =====
+
+/// `SINH(number)` — hyperbolic sine. Overflow → #NUM! via
+/// `sanitize_f64`.
+pub fn sinh(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    match coercion::sanitize_f64(n.sinh()) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `COSH(number)` — hyperbolic cosine. Overflow → #NUM!.
+pub fn cosh(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    match coercion::sanitize_f64(n.cosh()) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `TANH(number)` — hyperbolic tangent. Saturates to ±1 for large
+/// |n| (no overflow). Total domain.
+pub fn tanh(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    match coercion::sanitize_f64(n.tanh()) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `ASINH(number)` — inverse hyperbolic sine. Total real domain.
+pub fn asinh(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    match coercion::sanitize_f64(n.asinh()) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `ACOSH(number)` — inverse hyperbolic cosine. Domain `n >= 1`;
+/// out-of-domain → `#NUM!`.
+pub fn acosh(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    if n < 1.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    match coercion::sanitize_f64(n.acosh()) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `ATANH(number)` — inverse hyperbolic tangent. Domain `|n| < 1`;
+/// out-of-domain → `#NUM!`. (Excel canon: ATANH(±1) is undefined and
+/// returns #NUM! rather than ±∞.)
+pub fn atanh(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    if !(n > -1.0 && n < 1.0) {
+        return Value::Error(ErrorValue::Num);
+    }
+    match coercion::sanitize_f64(n.atanh()) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
 /// `ATAN2(x_num, y_num)` — two-argument arc tangent. Returns
 /// radians in `(-π, π]`. Excel takes the angle's x-coordinate FIRST,
 /// then y — the inverse of Rust's `f64::atan2(y, x)`. Per IronCalc +
@@ -2558,5 +2922,245 @@ mod tests {
     fn exact_number_coercion() {
         // Numbers coerce to text first, then case-sensitive compare.
         assert_eq!(exact(&[n(5.0), vt("5")]), Value::Boolean(true));
+    }
+
+    // ===== W5-57: math completion + hyperbolic trig =====
+
+    #[test]
+    fn ceiling_default_significance_is_one() {
+        assert_eq!(ceiling(&[n(2.5)]), n(3.0));
+        assert_eq!(ceiling(&[n(-2.5)]), n(-2.0));
+        assert_eq!(ceiling(&[n(7.0)]), n(7.0));
+    }
+
+    #[test]
+    fn ceiling_explicit_significance() {
+        assert_eq!(ceiling(&[n(7.0), n(5.0)]), n(10.0));
+        assert_eq!(ceiling(&[n(-2.5), n(-2.0)]), n(-4.0));
+        assert_eq!(ceiling(&[n(-2.5), n(2.0)]), n(-2.0));
+    }
+
+    #[test]
+    fn ceiling_positive_with_negative_significance_is_num() {
+        assert_eq!(ceiling(&[n(2.5), n(-1.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn ceiling_zero_significance_returns_zero() {
+        assert_eq!(ceiling(&[n(7.0), n(0.0)]), n(0.0));
+    }
+
+    #[test]
+    fn floor_basic() {
+        assert_eq!(floor(&[n(2.7)]), n(2.0));
+        assert_eq!(floor(&[n(-2.7)]), n(-3.0));
+        assert_eq!(floor(&[n(7.0), n(5.0)]), n(5.0));
+    }
+
+    #[test]
+    fn floor_zero_significance_nonzero_number_is_div_zero() {
+        assert_eq!(floor(&[n(7.0), n(0.0)]), Value::Error(ErrorValue::DivZero));
+        assert_eq!(floor(&[n(0.0), n(0.0)]), n(0.0));
+    }
+
+    #[test]
+    fn floor_positive_with_negative_significance_is_num() {
+        assert_eq!(floor(&[n(2.5), n(-1.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn mround_basic() {
+        assert_eq!(mround(&[n(7.0), n(5.0)]), n(5.0));
+        assert_eq!(mround(&[n(8.0), n(5.0)]), n(10.0));
+        assert_eq!(mround(&[n(2.5), n(1.0)]), n(3.0)); // .5 rounds away
+        assert_eq!(mround(&[n(-2.5), n(-1.0)]), n(-3.0));
+    }
+
+    #[test]
+    fn mround_sign_mismatch_is_num() {
+        assert_eq!(mround(&[n(7.0), n(-5.0)]), Value::Error(ErrorValue::Num));
+        assert_eq!(mround(&[n(-7.0), n(5.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn mround_zero_multiple_returns_zero() {
+        assert_eq!(mround(&[n(7.0), n(0.0)]), n(0.0));
+    }
+
+    #[test]
+    fn odd_basic() {
+        assert_eq!(odd(&[n(1.5)]), n(3.0));
+        assert_eq!(odd(&[n(3.0)]), n(3.0)); // already odd
+        assert_eq!(odd(&[n(2.0)]), n(3.0));
+        assert_eq!(odd(&[n(-1.5)]), n(-3.0));
+        assert_eq!(odd(&[n(0.0)]), n(1.0)); // Excel canon
+    }
+
+    #[test]
+    fn even_basic() {
+        assert_eq!(even(&[n(1.5)]), n(2.0));
+        assert_eq!(even(&[n(2.0)]), n(2.0)); // already even
+        assert_eq!(even(&[n(3.0)]), n(4.0));
+        assert_eq!(even(&[n(-1.5)]), n(-2.0));
+        assert_eq!(even(&[n(0.0)]), n(0.0)); // even(0) = 0
+    }
+
+    #[test]
+    fn quotient_basic() {
+        assert_eq!(quotient(&[n(7.0), n(3.0)]), n(2.0));
+        assert_eq!(quotient(&[n(8.0), n(3.0)]), n(2.0));
+        // Negative truncates toward zero (NOT floor).
+        assert_eq!(quotient(&[n(-7.0), n(3.0)]), n(-2.0));
+        assert_eq!(quotient(&[n(7.0), n(-3.0)]), n(-2.0));
+    }
+
+    #[test]
+    fn quotient_zero_denominator_is_div_zero() {
+        assert_eq!(
+            quotient(&[n(7.0), n(0.0)]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn gcd_basic() {
+        assert_eq!(gcd(&[n(8.0), n(12.0)]), n(4.0));
+        assert_eq!(gcd(&[n(8.0), n(12.0), n(16.0)]), n(4.0));
+        assert_eq!(gcd(&[n(8.0), n(0.0)]), n(8.0));
+        assert_eq!(gcd(&[n(0.0), n(0.0)]), n(0.0));
+        assert_eq!(gcd(&[n(7.0)]), n(7.0));
+    }
+
+    #[test]
+    fn gcd_negative_arg_is_num() {
+        assert_eq!(gcd(&[n(8.0), n(-4.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn gcd_truncates_to_integer() {
+        // Excel: GCD truncates non-integer args toward zero.
+        assert_eq!(gcd(&[n(8.5), n(12.0)]), n(4.0));
+    }
+
+    #[test]
+    fn gcd_arity() {
+        assert_eq!(gcd(&[]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn lcm_basic() {
+        assert_eq!(lcm(&[n(4.0), n(6.0)]), n(12.0));
+        assert_eq!(lcm(&[n(4.0), n(6.0), n(8.0)]), n(24.0));
+        // Any zero → 0.
+        assert_eq!(lcm(&[n(4.0), n(0.0)]), n(0.0));
+        assert_eq!(lcm(&[n(7.0)]), n(7.0));
+    }
+
+    #[test]
+    fn lcm_negative_arg_is_num() {
+        assert_eq!(lcm(&[n(4.0), n(-6.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    // --- Hyperbolic trig ---
+
+    #[test]
+    fn sinh_basic() {
+        match sinh(&[n(0.0)]) {
+            Value::Number(v) => assert!(v.abs() < 1e-9),
+            _ => panic!(),
+        }
+        match sinh(&[n(1.0)]) {
+            Value::Number(v) => assert!((v - 1.175_201_193_643_801_4).abs() < 1e-12),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cosh_basic() {
+        assert_eq!(cosh(&[n(0.0)]), n(1.0));
+        match cosh(&[n(1.0)]) {
+            Value::Number(v) => assert!((v - 1.543_080_634_815_243_7).abs() < 1e-12),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn tanh_basic_and_saturation() {
+        match tanh(&[n(0.0)]) {
+            Value::Number(v) => assert!(v.abs() < 1e-9),
+            _ => panic!(),
+        }
+        // tanh(±large) saturates to ±1.
+        match tanh(&[n(100.0)]) {
+            Value::Number(v) => assert!((v - 1.0).abs() < 1e-12),
+            _ => panic!(),
+        }
+        match tanh(&[n(-100.0)]) {
+            Value::Number(v) => assert!((v + 1.0).abs() < 1e-12),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn sinh_overflow_is_num() {
+        // SINH(1000) overflows.
+        assert_eq!(sinh(&[n(1000.0)]), Value::Error(ErrorValue::Num));
+        assert_eq!(cosh(&[n(1000.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn asinh_basic() {
+        match asinh(&[n(0.0)]) {
+            Value::Number(v) => assert!(v.abs() < 1e-9),
+            _ => panic!(),
+        }
+        // asinh(1) = ln(1 + sqrt(2)) ≈ 0.881_373_587_019_543
+        match asinh(&[n(1.0)]) {
+            Value::Number(v) => assert!((v - 0.881_373_587_019_543).abs() < 1e-12),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn acosh_domain_and_basic() {
+        // acosh(1) = 0.
+        match acosh(&[n(1.0)]) {
+            Value::Number(v) => assert!(v.abs() < 1e-9),
+            _ => panic!(),
+        }
+        // acosh(2) = ln(2 + sqrt(3)) ≈ 1.316_957_896_924_816_7
+        match acosh(&[n(2.0)]) {
+            Value::Number(v) => assert!((v - 1.316_957_896_924_816_7).abs() < 1e-12),
+            _ => panic!(),
+        }
+        // Domain: x < 1 → #NUM!.
+        assert_eq!(acosh(&[n(0.5)]), Value::Error(ErrorValue::Num));
+        assert_eq!(acosh(&[n(-1.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn atanh_domain_and_basic() {
+        match atanh(&[n(0.0)]) {
+            Value::Number(v) => assert!(v.abs() < 1e-9),
+            _ => panic!(),
+        }
+        // |x| ≥ 1 → #NUM! (Excel canon, not ±∞).
+        assert_eq!(atanh(&[n(1.0)]), Value::Error(ErrorValue::Num));
+        assert_eq!(atanh(&[n(-1.0)]), Value::Error(ErrorValue::Num));
+        assert_eq!(atanh(&[n(1.5)]), Value::Error(ErrorValue::Num));
+        // |x| < 1 ok.
+        match atanh(&[n(0.5)]) {
+            Value::Number(v) => assert!((v - 0.549_306_144_334_054_8).abs() < 1e-12),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn hyperbolic_arity_errors() {
+        let fns: [fn(&[Value]) -> Value; 6] = [sinh, cosh, tanh, asinh, acosh, atanh];
+        for f in fns.iter() {
+            assert_eq!(f(&[]), Value::Error(ErrorValue::Value));
+            assert_eq!(f(&[n(0.0), n(0.0)]), Value::Error(ErrorValue::Value));
+        }
     }
 }

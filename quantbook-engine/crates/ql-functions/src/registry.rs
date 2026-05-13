@@ -210,6 +210,24 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("REPT", scalar_fns::rept);
     r.register("EXACT", scalar_fns::exact);
 
+    // Engine Phase 4.3 V2 batch #6 — math completion + hyperbolic
+    // trig (W5-57). All scalar. Math sign-rule canon for CEILING /
+    // FLOOR / MROUND; integer-domain for GCD / LCM / QUOTIENT.
+    r.register("CEILING", scalar_fns::ceiling);
+    r.register("FLOOR", scalar_fns::floor);
+    r.register("MROUND", scalar_fns::mround);
+    r.register("ODD", scalar_fns::odd);
+    r.register("EVEN", scalar_fns::even);
+    r.register("QUOTIENT", scalar_fns::quotient);
+    r.register("GCD", scalar_fns::gcd);
+    r.register("LCM", scalar_fns::lcm);
+    r.register("SINH", scalar_fns::sinh);
+    r.register("COSH", scalar_fns::cosh);
+    r.register("TANH", scalar_fns::tanh);
+    r.register("ASINH", scalar_fns::asinh);
+    r.register("ACOSH", scalar_fns::acosh);
+    r.register("ATANH", scalar_fns::atanh);
+
     // Engine Phase 4.3 V2 batch #1 (W5-51, 2026-05-13): trigonometry.
     // All scalar, single-arg except ATAN2 (two args). Inputs/outputs
     // in radians; pair with DEGREES/RADIANS for degree-mode math.
@@ -291,8 +309,11 @@ mod tests {
         // completion (W5-55: AVERAGEIF, SUMIFS, COUNTIFS, AVERAGEIFS,
         // SUMPRODUCT = 5) + Phase 4.3 V2 text wave 2 (W5-56: LEFT,
         // RIGHT, MID, FIND, SEARCH, SUBSTITUTE, REPLACE, CONCATENATE,
-        // REPT, EXACT = 10).
-        assert_eq!(r.len(), 81);
+        // REPT, EXACT = 10) + Phase 4.3 V2 math completion +
+        // hyperbolic trig (W5-57: CEILING, FLOOR, MROUND, ODD,
+        // EVEN, QUOTIENT, GCD, LCM, SINH, COSH, TANH, ASINH,
+        // ACOSH, ATANH = 14).
+        assert_eq!(r.len(), 95);
     }
 
     #[test]
