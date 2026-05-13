@@ -299,6 +299,98 @@ The workspace root has `node_modules/`, session-export `.txt` files, etc. Broad 
 
 `git commit` triggers `npm run -s precommit` (a husky hook). It's automatic; no special action needed unless it fails. Per CLAUDE.md, DO NOT bypass with `--no-verify` — fix the underlying issue.
 
+### 16. CHOOSE with a Range argument silently returns `#VALUE!` (Sonnet MEDIUM 2, W5-60)
+
+`CHOOSE(index, value1, value2, ...)` expects SCALAR `value*` args, NOT ranges. Calling `CHOOSE(2, A1:A5, B1:B5)` does NOT pick column B — it returns `#VALUE!` because the implementation builds `FnArg::Scalar(Value::Error(#VALUE!))` from a Range arg. Excel ALSO returns an error here in scalar context, BUT a user may expect range selection. This is V1 scope; range-returning CHOOSE waits for Phase 4.7 (array formulas + spill).
+
+### 17. `read_range_with_shape` open-ended vs bounded branch (W5-60)
+
+`CellEnv::read_range_with_shape` has TWO paths since W5-60:
+- **Open-ended** (`end_row == RowId::MAX || end_col == ColId::MAX`, i.e. whole-row/column refs like `A:A`): clamp to populated bounds, scan in bounded order. Pre-W5-60 behavior.
+- **Bounded** (explicit ranges like `A1:C10`): preserve REQUESTED shape, pad out-of-bounds cells with `Value::Blank`. NOT clamped.
+
+The split fixes Codex HIGH H1 (bounded ranges silently shrunk under clamp, breaking trailing-blank semantics in lookups). Any future change to `read_range_with_shape` must preserve this branch.
+
+### 18. IFS family + SUMPRODUCT must check `(rows, cols)`, NOT flat length (W5-60)
+
+`parse_ifs_pairs` and SUMPRODUCT now track 2D `(rows, cols)` shape, not flat length. A `2×2` range and a `1×4` range have the same flat length (4) but different shapes — Excel returns `#VALUE!`. Pre-W5-60 they would silently zip. If you add a new IFS-family function, use `parse_ifs_pairs`. If you write a new array-consensus function, follow SUMPRODUCT's pattern of tracking `Vec<(&[Value], usize, usize)>` with `(rows, cols)` consensus.
+
+---
+
+## Self-check + recovery (MANDATORY before declaring a session complete)
+
+This section exists because "MANDATORY" with no auditable trace is hope, not enforcement. Run these checks before claiming you followed the protocol.
+
+### Self-check command sequence
+
+```bash
+# 1. Reading-check — did you actually open the handoff?
+ls -la /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/audits/2026-05-13-engine-session-final-handoff.md
+ls -la /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/process/audit-protocol.md
+
+# 2. Branch + state check
+cd /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook
+git rev-parse --abbrev-ref HEAD   # expect: feat/quantbook-engine
+git log --oneline -5
+git status --short
+
+# 3. Test count check
+mac zsh -lc 'export PATH="$HOME/.cargo/bin:$PATH"; \
+  cd /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine && \
+  cargo test --workspace 2>&1 | grep "test result:" | \
+  python3 -c "
+import sys, re
+passed = failed = 0
+for line in sys.stdin:
+    m = re.search(r'(\d+) passed.*?(\d+) failed', line)
+    if m: passed += int(m.group(1)); failed += int(m.group(2))
+print(f'PASSED: {passed}, FAILED: {failed}')"'
+
+# 4. Has any code been changed without a 7-gate pass? Look at staged + unstaged diff.
+git diff --stat
+git diff --cached --stat
+
+# 5. Cycle-discipline self-check
+# Count plan-implement-audit cycles in this session. If > 2, you should be writing a handoff for a fresh session, NOT continuing.
+```
+
+### Recovery — "what to do if you violated the protocol"
+
+**If you skipped a per-commit gate and already committed:**
+1. Run the missed gate now.
+2. If it passes — note the gap in the next commit message (NOT silently); add a `Gate skipped in <prior_commit>; re-run clean here` line.
+3. If it fails — IMMEDIATELY write the fix. Do NOT push. The commit must NOT be the user's first encounter with the failure.
+
+**If you skipped a per-phase mega-audit and the work is shippable-state:**
+1. Run the audit retroactively before declaring the phase closed.
+2. If findings emerge, file them with the original phase's number (e.g. `W5-NN audit closure addresses W5-MM phase audit findings`).
+3. If the phase is already labeled "closed" in docs, mark it `⚠️ AUDIT-RETRO-PENDING` until the audit runs.
+
+**If you ran > 2 plan-implement-audit cycles in one session without user override:**
+1. STOP. Don't start cycle 4.
+2. Write a handoff covering everything done in cycles 1-3.
+3. Commit the work-in-progress (or stash with notes) and explicitly tell the user the session is over.
+
+**If you discovered the previous session left stale docs (date, HEAD, test count drift):**
+1. DON'T trust the docs over the code. Run the actual command (`git rev-parse HEAD`, `cargo test --workspace`) and pin reality.
+2. Add a doc-drift fix to the next commit; reference the prior session.
+3. Update `MEMORY.md` / `current_work.md` only AFTER verifying the new state.
+
+**If Codex disagrees with you and you don't understand why:**
+1. Re-read Codex's full output, including the parts after "summary".
+2. If still unclear, ask the user. Don't silently overrule Codex.
+3. NEVER claim "Codex-verified" without actually running `codex exec ...`.
+
+### Auditable trace requirement
+
+Every commit message body must include a 1-line "Protocol trace" entry if any optional step was skipped, e.g.:
+
+```
+Protocol trace: 7 gates run; per-phase mega-audit deferred to next commit (cycle 2 budget).
+```
+
+Absence of the line implies "all MANDATORY items completed for this commit."
+
 ---
 
 ## Audit-closure expectations

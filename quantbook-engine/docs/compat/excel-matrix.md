@@ -59,7 +59,7 @@ as partial, rows with `❌` are missing.
 | VAR.P | ✅ | A6 | 0 | Welford-backed |
 | STDEV (alias: STDEV.S) | ✅ | A6 | 0 | Welford-backed |
 | STDEV.P | ✅ | A6 | 0 | Welford-backed |
-| SUMIF | ⚠️ | 16 | 4.3 V2 | W5-53 (GAP-F-05 closure): supports number/text/bool/blank criteria + comparators `> < >= <= <> =`. Wildcards (`?` `*`) deferred. 2-arg + 3-arg forms; sum_range default to range. Error in sum_range cell propagates (Excel canon). |
+| SUMIF | ⚠️ | 16 | 4.3 V2 | W5-53 (GAP-F-05 closure): supports number/text/bool/blank criteria + comparators `> < >= <= <> =`. Wildcards (`?` `*`) deferred. 2-arg + 3-arg forms; sum_range default to range. Error in sum_range cell propagates (Excel canon). **W5-60 KNOWN DIVERGENCE**: when `sum_range` size differs from `range`, Quantbook does a flat-index zip; Excel anchors the top-left of `sum_range` and uses `range`'s shape, ignoring `sum_range`'s declared extent. Behavior matches only when `sum_range.len() == range.len()`. Pin Phase 4.3 polish or 4.10. |
 | VLOOKUP | ⚠️ | 8 | 4.3 V2 | W5-54: exact match (range_lookup=FALSE/0) and approximate match (default, sorted ascending). col_index_num<1 → #VALUE!; col_index_num>cols → #REF!; not-found → #N/A. Case-insensitive text equality. Wildcards deferred. |
 | HLOOKUP | ⚠️ | 2 | 4.3 V2 | W5-54: row-direction mirror of VLOOKUP. Same caveats. |
 | MATCH | ⚠️ | 7 | 4.3 V2 | W5-54: match_type 0/1/-1 (exact / largest-≤ / smallest-≥). 1-based result. Not-found → #N/A. Linear scan (V1 — no binary-search optimization yet). |
@@ -68,7 +68,7 @@ as partial, rows with `❌` are missing.
 | SUMIFS | ⚠️ | 6 | 4.3 V2 | W5-55: multi-condition AND. Excel arg order: `sum_range FIRST`, then (criteria_range, criteria) pairs. All ranges must have identical length. Same predicate suite as SUMIF (comparators + text/number/bool/blank; wildcards deferred). |
 | COUNTIF | ⚠️ | 13 | 4.3 V2 | W5-53 (GAP-F-05 closure): same predicate suite as SUMIF. Error cells in the range are NOT propagated (Excel canon — COUNTIF ignores errors, unlike SUMIF). Wildcards deferred. |
 | COUNTIFS | ⚠️ | 3 | 4.3 V2 | W5-55: multi-condition AND count. Errors in range cells don't propagate (Excel canon). |
-| AVERAGEIF | ⚠️ | 6 | 4.3 V2 | W5-55: same predicate suite as SUMIF; #DIV/0! on no matches; optional separate average_range. |
+| AVERAGEIF | ⚠️ | 6 | 4.3 V2 | W5-55: same predicate suite as SUMIF; #DIV/0! on no matches; optional separate average_range. **W5-60 KNOWN DIVERGENCE**: same as SUMIF — when `average_range` size differs from `range`, Quantbook does a flat-index zip; Excel anchors the top-left of `average_range` and uses `range`'s shape. Behavior matches only when sizes are equal. Pin Phase 4.3 polish or 4.10. |
 | AVERAGEIFS | ⚠️ | 2 | 4.3 V2 | W5-55: multi-condition AND average; #DIV/0! on no matches. |
 | MINIFS / MAXIFS | ❌ | 0 | 4.3 | Multi-condition min/max |
 | MEDIAN | ✅ | 6 | 4.3 V2 | W5-58: even-count averages two middles; mixed scalar/range args supported; empty → #NUM!; text in range → #VALUE! (strict, matches SUM/AVERAGE). |
@@ -112,7 +112,7 @@ as partial, rows with `❌` are missing.
 | ROUND | ✅ | 5+ | 0 | |
 | ROUNDUP | ⚠️ | 4 | 4.3 V1 | Round away from zero; sign-preserving. **Binary-float gotcha:** `ROUNDUP(0.1 + 0.2, 1)` rounds `0.30000000000000004` to `0.4`, while Excel's 15-digit display-aware rounding usually yields `0.3`. Decimal-aware rounding lands Phase 4.5 (number formats). |
 | ROUNDDOWN | ⚠️ | 2 | 4.3 V1 | Truncate toward zero. Same binary-float gotcha as ROUNDUP. **Negative-zero leak:** very-small negative inputs produce `Value::Number(-0.0)` (PartialEq says `0.0 == -0.0`; cosmetic only — display may show `-0`). |
-| MROUND | ✅ | 3 | 4.3 V2 | W5-57: round-half-away-from-zero; sign-mismatch number/multiple → #NUM!; multiple=0 returns 0. |
+| MROUND | ✅ | 4 | 4.3 V2 | W5-57 + W5-60 fix: round-half-away-from-zero; sign-mismatch number/multiple → #NUM!. **W5-60**: `MROUND(0, 0)` → `0` (matches Excel); `MROUND(nonzero, 0)` → `#NUM!` (was incorrectly returning `0` per Sonnet HIGH H1). |
 | CEILING | ✅ | 4 | 4.3 V2 | W5-57: round away from zero to nearest multiple of significance. Default significance=1. Excel sign rule: number > 0 with significance < 0 → #NUM!. CEILING.MATH (mode flag) deferred. |
 | FLOOR | ✅ | 3 | 4.3 V2 | W5-57: round toward zero to nearest multiple. Same sign rule as CEILING. significance=0 with non-zero number → #DIV/0! (Excel canon — diverges from CEILING which returns 0). FLOOR.MATH deferred. |
 | CEILING.MATH / CEILING.PRECISE | ❌ | 0 | 4.10 | Modern variants with explicit mode flag. |

@@ -1,4 +1,4 @@
-# Engine session final handoff — 2026-05-13 (W5-49 → W5-58, plus finalization W5-59+)
+# Engine session final handoff — 2026-05-13 (W5-49 → W5-58, plus W5-59 finalization, plus W5-60 closure)
 
 **This document is the single canonical handoff for the next Claude Code window.** Read it cover-to-cover BEFORE doing anything else. Then read `docs/process/audit-protocol.md`. Then verify state and proceed.
 
@@ -6,7 +6,7 @@
 
 ## TL;DR (60 seconds)
 
-Branch `feat/quantbook-engine` ← 24 commits unpushed. HEAD `d6a6bcdcfc5` (W5-58) plus the finalization commits this doc lives in. 1212 workspace tests, all 7 gates green at every shippable point. **FN4-01 (function library wave 1) ✅ CLOSED** at 102 registry entries. Phase 4.3 is functionally complete; polish items deferred to a Phase 4.3 polish micro-batch. Phase 4.4 (Coercion + Error Matrix) is the recommended next architectural beat.
+Branch `feat/quantbook-engine` ← 26 commits unpushed at W5-60 close. HEAD `51fedf11c68` (W5-59) plus W5-60 closure commit (this doc lives in W5-60). 1219 workspace tests at W5-60 close (1212 at W5-58, +1 from W5-59 MROUND test split, +6 from W5-60 2D-shape regression tests). All 7 gates green at every shippable point. **FN4-01 (function library wave 1) ✅ CLOSED** at 102 registry entries. Phase 4.3 is functionally complete; polish items deferred to a Phase 4.3 polish micro-batch. Phase 4.4 (Coercion + Error Matrix) is the recommended next architectural beat.
 
 **Three correctness gaps from prior phases closed this session:** GAP-G-01 (rebind staleness, including W5-52 clear-formula path closure), GAP-G-03 (range deps not scheduler edges), GAP-F-05 (function-signature can't carry range-vs-scalar metadata).
 
@@ -29,7 +29,7 @@ If any of those don't match, STOP and investigate before doing other work. Stale
 
 ---
 
-## Session ledger (10 commits W5-49 → W5-58, plus finalization)
+## Session ledger (10 commits W5-49 → W5-58, plus W5-59 finalization + W5-60 closure)
 
 | Commit | Subject | Tests delta | Registry delta |
 |---|---|---|---|
@@ -42,11 +42,12 @@ If any of those don't match, STOP and investigate before doing other work. Stale
 | `234d8db429c` | W5-55 IFS family + SUMPRODUCT (AVERAGEIF/SUMIFS/COUNTIFS/AVERAGEIFS/SUMPRODUCT) | +31 → 1132 | +5 → 49 (71 entries) |
 | `6c65fea5037` | W5-56 Text wave 2 (LEFT/RIGHT/MID/FIND/SEARCH/SUBSTITUTE/REPLACE/CONCATENATE/REPT/EXACT) | +29 → 1161 | +10 → 59 (81 entries) |
 | `7a80eaf4412` | W5-57 Math completion + hyperbolic trig (CEILING/FLOOR/MROUND/ODD/EVEN/QUOTIENT/GCD/LCM + SINH/COSH/TANH/ASINH/ACOSH/ATANH) | +28 → 1189 | +14 → 73 (95 entries) |
-| `d6a6bcdcfc5` | **W5-58 Stats family (LARGE/SMALL/RANK/MEDIAN/MODE) — FN4-01 CLOSED** | +23 → 1212 | +5 → 78 unique + 2 aliases = 102 registry entries |
-| W5-59 (this commit) | Session finalization — handoff doc + audit protocol + doc-drift fixes (Codex-flagged) | 0 (no code) | — |
+| `d6a6bcdcfc5` | **W5-58 Stats family (LARGE/SMALL/RANK/MEDIAN/MODE) — FN4-01 CLOSED** | +23 → 1212 | +5 unique → 78 unique fns; registry total at 102 entries (78 unique + ~24 aliases accumulated across the wave) |
+| `51fedf11c68` | W5-59 Session finalization — handoff doc + audit protocol + doc-drift fixes (Codex-flagged) | +1 → 1213 (MROUND zero-multiple test split) | — |
+| W5-60 (this commit) | Mega-audit closure — `read_range_with_shape` bounded-range fix (Codex H1), IFS/SUMPRODUCT 2D shape validation (Codex H2), MROUND(x, 0) → `#NUM!` (Sonnet H1), SUMIF/AVERAGEIF flat-zip downgrade (Codex H3 deferred), doc-drift cleanup, audit-protocol self-check section | +6 → 1219 | — |
 
 Tests grew **+231 from session start at 981 → 1212**.
-Function library grew **+48 (30 → 78 unique fns; 102 registry entries with aliases)**.
+Function library grew **+48 unique fns this session (30 → 78 unique)**. Total registry entries grew to **102** (unique fns + aliases accumulated through W5-51..W5-58). Verify with `cargo test -p ql-functions --test registry_invariants -- --nocapture` if a precise count matters.
 
 ---
 
@@ -255,7 +256,7 @@ Then Phase 4.7 (Array formulas + FormulaRegion binder, the Option B from W5-49),
 7. `docs/architecture/calcgraph-runtime.md` (calcgraph integration overview)
 8. `docs/audits/2026-05-13-w5-49-50-51-megaudit-*.{md,txt}` (the W5-52 mega-audit — Codex+Sonnet parallel)
 9. `docs/audits/2026-05-13-finalization-planning-*.{md,txt}` (Claude + Codex finalization planning)
-10. `docs/audits/2026-05-13-phase-4.3-v2-session-audit-*.{md,txt}` (W5-53..W5-58 mega-audit — will land in finalization commit chain)
+10. `docs/audits/2026-05-13-session-final-megaudit-*.{md,txt}` (W5-49..W5-59 final mega-audit — Codex + Sonnet parallel, landed W5-60)
 
 ---
 
@@ -270,7 +271,7 @@ Then Phase 4.7 (Array formulas + FormulaRegion binder, the Option B from W5-49),
 [ ] git branch --show-current — feat/quantbook-engine
 [ ] mac zsh -lc 'export PATH="$HOME/.cargo/bin:$PATH"; cd quantbook-engine && cargo test --workspace 2>&1 | grep -E "^test result:" | awk "/ok\. [0-9]+ passed/ {sum+=\$4} END {print sum}"' — 1212+
 [ ] Run the 7 gates per audit-protocol § Per-commit gates
-[ ] Confirm the W5-53..W5-58 mega-audit has landed (look for docs/audits/2026-05-13-phase-4.3-v2-session-audit-*); if not, that's the FIRST work item
+[ ] Confirm the final mega-audit has landed (`docs/audits/2026-05-13-session-final-megaudit-*`); W5-60 closure addressed Codex HIGH H1+H2 and Sonnet HIGH H1; Codex HIGH H3 (SUMIF/AVERAGEIF flat-zip vs Excel anchoring) downgraded to ⚠️ in matrix
 [ ] Once verified clean state + mega-audit done, decide work: Phase 4.3 polish OR Phase 4.4 architectural decision OR specific user-requested work
 [ ] If non-trivial (architectural): enter Plan mode + dispatch Codex per audit-protocol § Architectural decisions
 [ ] If implementation: stay strict on the 7-gates-per-commit cadence

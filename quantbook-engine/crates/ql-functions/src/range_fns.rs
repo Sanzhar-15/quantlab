@@ -786,15 +786,19 @@ pub fn averageif(args: &[FnArg]) -> Value {
 }
 
 /// Helper: parse `[crit_range1, crit1, crit_range2, crit2, ...]`
-/// pairs after a starting index. Returns (paired_ranges_and_preds,
-/// expected_len_in_cells) or an Error to propagate.
+/// pairs after a starting index. Returns
+/// `(paired_ranges_and_preds, (expected_rows, expected_cols))`
+/// or an Error to propagate.
 ///
 /// For SUMIFS / AVERAGEIFS the start_index is 1 (arg[0] is the
 /// sum/average range). For COUNTIFS it's 0 (no leading range).
 ///
-/// All ranges must have identical `.len()`. Excel canon: mismatched
-/// shapes → `#VALUE!`.
-type IfsPairs<'a> = (Vec<(&'a [Value], Predicate)>, usize);
+/// **W5-60 fix (Codex mega-audit HIGH H2):** all ranges must have
+/// identical 2D shape `(rows, cols)`, NOT just identical flat
+/// length. The pre-W5-60 check only compared `.len()` which silently
+/// accepted `2x2` vs `1x4` (both length 4) and produced wrong row-
+/// major matched answers. Excel canon: mismatched shapes → `#VALUE!`.
+type IfsPairs<'a> = (Vec<(&'a [Value], Predicate)>, (usize, usize));
 
 fn parse_ifs_pairs<'a>(args: &'a [FnArg], start_index: usize) -> Result<IfsPairs<'a>, ErrorValue> {
     let pair_args = &args[start_index..];
@@ -802,11 +806,11 @@ fn parse_ifs_pairs<'a>(args: &'a [FnArg], start_index: usize) -> Result<IfsPairs
         return Err(ErrorValue::Value);
     }
     let mut pairs: Vec<(&'a [Value], Predicate)> = Vec::with_capacity(pair_args.len() / 2);
-    let mut expected: Option<usize> = None;
+    let mut expected_shape: Option<(usize, usize)> = None;
     let mut chunks = pair_args.chunks_exact(2);
     for pair in chunks.by_ref() {
-        let range = match &pair[0] {
-            FnArg::Range { values, .. } => values.as_slice(),
+        let (range, rrows, rcols) = match &pair[0] {
+            FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
             FnArg::Scalar(_) => return Err(ErrorValue::Value),
         };
         let pred_arg = match &pair[1] {
@@ -814,15 +818,15 @@ fn parse_ifs_pairs<'a>(args: &'a [FnArg], start_index: usize) -> Result<IfsPairs
             FnArg::Range { .. } => return Err(ErrorValue::Value),
         };
         let pred = build_predicate(pred_arg)?;
-        // Shape check.
-        match expected {
-            None => expected = Some(range.len()),
-            Some(n) if n != range.len() => return Err(ErrorValue::Value),
+        // 2D shape check.
+        match expected_shape {
+            None => expected_shape = Some((rrows, rcols)),
+            Some((er, ec)) if er != rrows || ec != rcols => return Err(ErrorValue::Value),
             Some(_) => {}
         }
         pairs.push((range, pred));
     }
-    Ok((pairs, expected.unwrap_or(0)))
+    Ok((pairs, expected_shape.unwrap_or((0, 0))))
 }
 
 /// `SUMIFS(sum_range, criteria_range1, criteria1, [crit_range2,
@@ -835,19 +839,21 @@ pub fn sumifs(args: &[FnArg]) -> Value {
     if args.len() < 3 {
         return Value::Error(ErrorValue::Value);
     }
-    let sum_range = match &args[0] {
-        FnArg::Range { values, .. } => values.as_slice(),
+    let (sum_range, sr_rows, sr_cols) = match &args[0] {
+        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
         FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
     };
-    let (pairs, expected_len) = match parse_ifs_pairs(args, 1) {
+    let (pairs, (exp_rows, exp_cols)) = match parse_ifs_pairs(args, 1) {
         Ok(x) => x,
         Err(e) => return Value::Error(e),
     };
-    if sum_range.len() != expected_len {
+    // W5-60: 2D shape check (rows + cols must both match).
+    if sr_rows != exp_rows || sr_cols != exp_cols {
         return Value::Error(ErrorValue::Value);
     }
+    let total_cells = exp_rows * exp_cols;
     let mut total = 0.0_f64;
-    for i in 0..expected_len {
+    for i in 0..total_cells {
         let mut all_match = true;
         for (range, pred) in &pairs {
             if !pred.matches(&range[i]) {
@@ -878,12 +884,13 @@ pub fn countifs(args: &[FnArg]) -> Value {
     if args.is_empty() {
         return Value::Error(ErrorValue::Value);
     }
-    let (pairs, expected_len) = match parse_ifs_pairs(args, 0) {
+    let (pairs, (exp_rows, exp_cols)) = match parse_ifs_pairs(args, 0) {
         Ok(x) => x,
         Err(e) => return Value::Error(e),
     };
+    let total_cells = exp_rows * exp_cols;
     let mut count: usize = 0;
-    for i in 0..expected_len {
+    for i in 0..total_cells {
         let mut all_match = true;
         for (range, pred) in &pairs {
             if !pred.matches(&range[i]) {
@@ -904,20 +911,21 @@ pub fn averageifs(args: &[FnArg]) -> Value {
     if args.len() < 3 {
         return Value::Error(ErrorValue::Value);
     }
-    let avg_range = match &args[0] {
-        FnArg::Range { values, .. } => values.as_slice(),
+    let (avg_range, ar_rows, ar_cols) = match &args[0] {
+        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
         FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
     };
-    let (pairs, expected_len) = match parse_ifs_pairs(args, 1) {
+    let (pairs, (exp_rows, exp_cols)) = match parse_ifs_pairs(args, 1) {
         Ok(x) => x,
         Err(e) => return Value::Error(e),
     };
-    if avg_range.len() != expected_len {
+    if ar_rows != exp_rows || ar_cols != exp_cols {
         return Value::Error(ErrorValue::Value);
     }
+    let total_cells = exp_rows * exp_cols;
     let mut total = 0.0_f64;
     let mut count: usize = 0;
-    for i in 0..expected_len {
+    for i in 0..total_cells {
         let mut all_match = true;
         for (range, pred) in &pairs {
             if !pred.matches(&range[i]) {
@@ -947,24 +955,35 @@ pub fn averageifs(args: &[FnArg]) -> Value {
 }
 
 /// `SUMPRODUCT(array1, [array2], ...)` — element-wise multiply all
-/// arrays and sum the products. All arrays must have the same total
-/// length; mismatched → `#VALUE!`. Non-numeric cell values
-/// contribute as 0 (Excel canon: SUMPRODUCT is lenient, unlike
-/// SUMIF/SUM which propagate text → #VALUE!). Error cells propagate.
+/// arrays and sum the products.
+///
+/// **W5-60 fix (Codex mega-audit HIGH H2):** all range arrays must
+/// have identical 2D shape `(rows, cols)`, NOT just identical flat
+/// length. The pre-W5-60 ship checked only `.len()` which silently
+/// accepted `2x2` vs `1x4` (both length 4) and multiplied row-major
+/// to produce wrong answers. Excel canon: mismatched dimensions →
+/// `#VALUE!`. (Microsoft SUMPRODUCT docs:
+/// https://support.microsoft.com/en-us/office/sumproduct-function-16753e75-9f68-4874-94ac-4d2145a2fd2e.)
+///
+/// Scalar args still act as constant multipliers (Excel canon:
+/// `SUMPRODUCT(5, A1:A3) = 5 * SUM(A1:A3)`). Non-numeric cells are
+/// treated as 0 (SUMPRODUCT-specific leniency, unlike SUM/SUMIF
+/// which propagate `#VALUE!` for text). Error cells propagate.
 pub fn sumproduct(args: &[FnArg]) -> Value {
     if args.is_empty() {
         return Value::Error(ErrorValue::Value);
     }
-    // Collect range slices; scalars in V1 are accepted as 1-element
-    // arrays — Excel canon: SUMPRODUCT(5) = 5, SUMPRODUCT(5, range)
-    // multiplies every element by 5.
-    let mut arrays: Vec<&[Value]> = Vec::with_capacity(args.len());
+    // Collect range slices + their 2D shape; scalars contribute as
+    // 1×1 (constant multiplier).
+    let mut arrays: Vec<(&[Value], usize, usize)> = Vec::with_capacity(args.len());
     let scalar_single: Vec<[Value; 1]>;
     {
         let mut tmp: Vec<[Value; 1]> = Vec::new();
         for a in args {
             match a {
-                FnArg::Range { values, .. } => arrays.push(values.as_slice()),
+                FnArg::Range { values, rows, cols } => {
+                    arrays.push((values.as_slice(), *rows, *cols));
+                }
                 FnArg::Scalar(v) => {
                     tmp.push([v.clone()]);
                 }
@@ -972,24 +991,25 @@ pub fn sumproduct(args: &[FnArg]) -> Value {
         }
         scalar_single = tmp;
     }
-    // Push slices for scalar args after collecting (borrow-safe).
+    // Push scalar args as 1x1 arrays.
     for arr in &scalar_single {
-        arrays.push(arr.as_slice());
+        arrays.push((arr.as_slice(), 1, 1));
     }
-    // Determine common length: the longest non-singleton array; all
-    // non-singletons must agree.
-    let mut common_len: Option<usize> = None;
-    for arr in &arrays {
-        if arr.len() == 1 {
+    // W5-60: shape consensus among non-1x1 arrays. All must agree
+    // on (rows, cols), not just on flat length.
+    let mut common_shape: Option<(usize, usize)> = None;
+    for (_, r, c) in &arrays {
+        if *r == 1 && *c == 1 {
             continue;
         }
-        match common_len {
-            None => common_len = Some(arr.len()),
-            Some(n) if n != arr.len() => return Value::Error(ErrorValue::Value),
+        match common_shape {
+            None => common_shape = Some((*r, *c)),
+            Some((er, ec)) if er != *r || ec != *c => return Value::Error(ErrorValue::Value),
             Some(_) => {}
         }
     }
-    let total_len = common_len.unwrap_or(1);
+    let (total_rows, total_cols) = common_shape.unwrap_or((1, 1));
+    let total_len = total_rows * total_cols;
     // Coerce a Value to f64 lenient-for-SUMPRODUCT: Number → n; Bool
     // → 1.0/0.0; Blank → 0; Text → 0 (lenient); Error → propagate.
     let to_num = |v: &Value| -> Result<f64, ErrorValue> {
@@ -1004,9 +1024,11 @@ pub fn sumproduct(args: &[FnArg]) -> Value {
     let mut sum = 0.0_f64;
     for i in 0..total_len {
         let mut prod = 1.0_f64;
-        for arr in &arrays {
-            let idx = if arr.len() == 1 { 0 } else { i };
-            match to_num(&arr[idx]) {
+        for (slice, r, c) in &arrays {
+            // 1x1 scalar broadcasts to every position; non-1x1
+            // arrays index by the common-shape position.
+            let idx = if *r == 1 && *c == 1 { 0 } else { i };
+            match to_num(&slice[idx]) {
                 Ok(n) => prod *= n,
                 Err(e) => return Value::Error(e),
             }
@@ -2023,6 +2045,116 @@ mod tests {
     #[test]
     fn sumproduct_empty_args_is_value_error() {
         assert_eq!(sumproduct(&[]), Value::Error(ErrorValue::Value));
+    }
+
+    // ===== W5-60: 2D shape validation regression tests =====
+    // Codex mega-audit HIGH H2: IFS family + SUMPRODUCT must reject
+    // same-flat-length-but-different-shape arrays.
+
+    #[test]
+    fn sumproduct_2x2_vs_1x4_same_length_different_shape_is_value_error() {
+        let a2x2 = FnArg::Range {
+            values: vec![n(1.0), n(2.0), n(3.0), n(4.0)],
+            rows: 2,
+            cols: 2,
+        };
+        let a1x4 = FnArg::Range {
+            values: vec![n(1.0), n(2.0), n(3.0), n(4.0)],
+            rows: 1,
+            cols: 4,
+        };
+        // Same flat length (4) but different shape — Excel #VALUE!.
+        // Pre-W5-60 this silently accepted and produced 1+4+9+16 = 30.
+        assert_eq!(sumproduct(&[a2x2, a1x4]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn sumproduct_1x3_vs_3x1_same_length_different_shape_is_value_error() {
+        let a1x3 = FnArg::Range {
+            values: vec![n(1.0), n(2.0), n(3.0)],
+            rows: 1,
+            cols: 3,
+        };
+        let a3x1 = FnArg::Range {
+            values: vec![n(1.0), n(2.0), n(3.0)],
+            rows: 3,
+            cols: 1,
+        };
+        assert_eq!(sumproduct(&[a1x3, a3x1]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn sumifs_1x3_vs_3x1_criteria_range_shape_mismatch_is_value_error() {
+        let sum_range = FnArg::Range {
+            values: vec![n(10.0), n(20.0), n(30.0)],
+            rows: 1,
+            cols: 3,
+        };
+        let crit_range = FnArg::Range {
+            values: vec![n(1.0), n(2.0), n(3.0)],
+            rows: 3,
+            cols: 1,
+        };
+        // Same flat length (3) but different shape — must reject.
+        assert_eq!(
+            sumifs(&[sum_range, crit_range, s(n(1.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn countifs_shape_mismatch_between_two_criteria_ranges_is_value_error() {
+        let r1 = FnArg::Range {
+            values: vec![n(1.0), n(1.0)],
+            rows: 1,
+            cols: 2,
+        };
+        let r2 = FnArg::Range {
+            values: vec![n(1.0), n(1.0)],
+            rows: 2,
+            cols: 1,
+        };
+        // Same flat length (2), different shape.
+        assert_eq!(
+            countifs(&[r1, s(n(1.0)), r2, s(n(1.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn averageifs_avg_range_shape_mismatch_is_value_error() {
+        let avg_range = FnArg::Range {
+            values: vec![n(10.0), n(20.0)],
+            rows: 1,
+            cols: 2,
+        };
+        let crit_range = FnArg::Range {
+            values: vec![n(1.0), n(1.0)],
+            rows: 2,
+            cols: 1,
+        };
+        assert_eq!(
+            averageifs(&[avg_range, crit_range, s(n(1.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn sumproduct_2x2_matching_arrays_works() {
+        // Same shape — must work. Verifies the 2D-shape fix didn't
+        // break the happy path.
+        let a = FnArg::Range {
+            values: vec![n(1.0), n(2.0), n(3.0), n(4.0)],
+            rows: 2,
+            cols: 2,
+        };
+        let b = FnArg::Range {
+            values: vec![n(10.0), n(20.0), n(30.0), n(40.0)],
+            rows: 2,
+            cols: 2,
+        };
+        // 1*10 + 2*20 + 3*30 + 4*40 = 10 + 40 + 90 + 160 = 300.
+        assert_eq!(sumproduct(&[a, b]), n(300.0));
     }
 
     // ===== W5-58: Stats family =====

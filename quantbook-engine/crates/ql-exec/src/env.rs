@@ -127,33 +127,65 @@ impl<'w> CellEnv for WorkbookEnv<'w> {
         out
     }
 
-    /// W5-54: clamp-aware shape. Returns the (rows, cols) actually
-    /// materialized into the values Vec, NOT the requested-but-
-    /// unclamped range dimensions.
+    /// W5-54 / W5-60: shape handling for explicit vs open-ended ranges.
+    ///
+    /// Two cases:
+    /// - **Open-ended** (whole-column / whole-row, end_row or end_col at
+    ///   `RowId::MAX` / `ColId::MAX`): clamp to sheet bounds. Shape and
+    ///   values reflect the populated subset. This is the W5-54 behavior
+    ///   for aggregate scans like `SUM(A:A)` over a sparse column.
+    /// - **Bounded explicit** (every coordinate < MAX): preserve the
+    ///   REQUESTED shape; pad out-of-bounds cells with `Value::Blank`.
+    ///   W5-60 fix per the W5-49→W5-58 mega-audit: shape-aware functions
+    ///   (INDEX / VLOOKUP / HLOOKUP / SUMIFS / SUMPRODUCT) rely on the
+    ///   shape matching the user's explicit range bounds. The W5-54
+    ///   clamp behavior produced `#REF!` for `INDEX(A1:B10, 10, 2)` when
+    ///   row 10 was blank because shape shrank to the populated subset.
     fn read_range_with_shape(&self, range: Range) -> (Vec<Value>, usize, usize) {
         let Some(sheet) = self.workbook.sheet(range.sheet) else {
             return (vec![Value::Error(ErrorValue::Ref)], 1, 1);
         };
-        let bounds = sheet.bounds();
-        if bounds.row_extent == 0 || bounds.col_extent == 0 {
-            return (Vec::new(), 0, 0);
-        }
-        let max_row = bounds.row_extent - 1;
-        let max_col = bounds.col_extent - 1;
-        let end_row = range.end_row.min(max_row);
-        let end_col = range.end_col.min(max_col);
-        if range.start_row > end_row || range.start_col > end_col {
-            return (Vec::new(), 0, 0);
-        }
-        let rows = (end_row - range.start_row + 1) as usize;
-        let cols = (end_col - range.start_col + 1) as usize;
-        let mut out = Vec::with_capacity(rows.saturating_mul(cols));
-        for row in range.start_row..=end_row {
-            for col in range.start_col..=end_col {
-                out.push(sheet.read(row, col));
+        let is_open_ended =
+            range.end_row == ql_types::RowId::MAX || range.end_col == ql_types::ColId::MAX;
+        if is_open_ended {
+            // Clamp to bounds (existing W5-54 behavior for SUM(A:A)
+            // and similar whole-column / whole-row aggregate scans).
+            let bounds = sheet.bounds();
+            if bounds.row_extent == 0 || bounds.col_extent == 0 {
+                return (Vec::new(), 0, 0);
             }
+            let max_row = bounds.row_extent - 1;
+            let max_col = bounds.col_extent - 1;
+            let end_row = range.end_row.min(max_row);
+            let end_col = range.end_col.min(max_col);
+            if range.start_row > end_row || range.start_col > end_col {
+                return (Vec::new(), 0, 0);
+            }
+            let rows = (end_row - range.start_row + 1) as usize;
+            let cols = (end_col - range.start_col + 1) as usize;
+            let mut out = Vec::with_capacity(rows.saturating_mul(cols));
+            for row in range.start_row..=end_row {
+                for col in range.start_col..=end_col {
+                    out.push(sheet.read(row, col));
+                }
+            }
+            (out, rows, cols)
+        } else {
+            // Bounded explicit range: preserve requested shape; pad
+            // out-of-bounds cells with Blank. The user asked for
+            // exactly A1:B10; even if only A1:A5 is populated, the
+            // shape must remain 10×2 so INDEX / VLOOKUP /
+            // SUMIFS / SUMPRODUCT see the layout the user authored.
+            let rows = (range.end_row - range.start_row + 1) as usize;
+            let cols = (range.end_col - range.start_col + 1) as usize;
+            let mut out = Vec::with_capacity(rows.saturating_mul(cols));
+            for row in range.start_row..=range.end_row {
+                for col in range.start_col..=range.end_col {
+                    out.push(sheet.read(row, col));
+                }
+            }
+            (out, rows, cols)
         }
-        (out, rows, cols)
     }
 }
 

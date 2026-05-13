@@ -907,7 +907,9 @@ pub fn floor(args: &[Value]) -> Value {
 /// `MROUND(number, multiple)` — round `number` to the nearest
 /// multiple of `multiple`. .5 rounds away from zero (Excel canon).
 /// Sign rule: number and multiple must have the same sign; mixed →
-/// `#NUM!`. multiple = 0 returns 0.
+/// `#NUM!`. **W5-60 fix:** `MROUND(0, 0) = 0`, but `MROUND(non-zero, 0) = #NUM!`
+/// per Excel canon. The W5-57 ship returned 0 unconditionally for
+/// `multiple = 0`, which is wrong; Sonnet mega-audit caught it.
 pub fn mround(args: &[Value]) -> Value {
     if args.len() != 2 {
         return Value::Error(ErrorValue::Value);
@@ -923,7 +925,11 @@ pub fn mround(args: &[Value]) -> Value {
         NumericArg::Error(e) => return Value::Error(e),
     };
     if multiple == 0.0 {
-        return Value::Number(0.0);
+        // MROUND(0, 0) = 0 per Excel; MROUND(n, 0) for non-zero n = #NUM!.
+        if number == 0.0 {
+            return Value::Number(0.0);
+        }
+        return Value::Error(ErrorValue::Num);
     }
     if (number > 0.0 && multiple < 0.0) || (number < 0.0 && multiple > 0.0) {
         return Value::Error(ErrorValue::Num);
@@ -2983,8 +2989,17 @@ mod tests {
     }
 
     #[test]
-    fn mround_zero_multiple_returns_zero() {
-        assert_eq!(mround(&[n(7.0), n(0.0)]), n(0.0));
+    fn mround_zero_multiple_with_zero_number_returns_zero() {
+        assert_eq!(mround(&[n(0.0), n(0.0)]), n(0.0));
+    }
+
+    #[test]
+    fn mround_zero_multiple_with_nonzero_number_is_num() {
+        // W5-60 (Sonnet mega-audit HIGH H1): Excel canon — MROUND(n, 0)
+        // for non-zero n returns #NUM!, NOT 0. The W5-57 ship returned
+        // 0 unconditionally; corrected.
+        assert_eq!(mround(&[n(7.0), n(0.0)]), Value::Error(ErrorValue::Num));
+        assert_eq!(mround(&[n(-3.0), n(0.0)]), Value::Error(ErrorValue::Num));
     }
 
     #[test]
