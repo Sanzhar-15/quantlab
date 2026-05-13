@@ -25,7 +25,7 @@ pub use format::{FormatId, FormatTable, FormatTableError, FIRST_CUSTOM_FORMAT_ID
 pub use format_overlay::CellFormatOverlay;
 pub use overlay::SparseOverlay;
 pub use sheet::{Bounds, Sheet};
-pub use workbook::{NameTable, NameTableError, NamedTarget, Workbook};
+pub use workbook::{NameTable, NameTableError, NamedTarget, SheetNameError, Workbook};
 
 #[cfg(test)]
 mod tests {

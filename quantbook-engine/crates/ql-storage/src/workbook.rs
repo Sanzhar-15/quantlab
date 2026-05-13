@@ -82,6 +82,28 @@ pub enum NameTableError {
     Reserved(Arc<str>),
 }
 
+/// **Phase 4.6.AA (W5-86):** errors from `Workbook::validate_sheet_name`,
+/// used by `add_sheet` / `rename_sheet` (Phase 4.6.C). Distinct from
+/// `NameTableError` because the validation rules differ (sheet names
+/// allow reserved-name-table entries like `AI`; sheet names reject
+/// Excel-reserved characters; etc.).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SheetNameError {
+    /// Empty string — Excel canon rejects.
+    #[error("sheet name cannot be empty")]
+    Empty,
+
+    /// Excel-reserved character in the proposed name. Set: `:`, `\`,
+    /// `/`, `?`, `*`, `[`, `]`. xlsx round-trip prerequisite (Phase 4.11).
+    #[error("sheet name contains Excel-reserved character {0:?}")]
+    ReservedCharacter(char),
+
+    /// Canonical duplicate of an existing sheet name (case-insensitive
+    /// comparison per `Workbook::canonical_sheet_name`).
+    #[error("sheet name {name:?} is already in use (case-insensitive)")]
+    Duplicate { name: String },
+}
+
 /// Phase 2A.9 audit M6: the canonical-uppercase reserved-name list. Names
 /// here cannot be registered via `NameTable::set` or `Workbook::set_name`.
 /// Keep small; document each entry.
@@ -288,6 +310,73 @@ impl Workbook {
 
     pub fn sheet_count(&self) -> usize {
         self.sheets.len()
+    }
+
+    // ===== Phase 4.6.AA (W5-86): sheet registry + canonicalizer =====
+
+    /// **Phase 4.6.AA (W5-86):** canonicalize a sheet name for
+    /// case-insensitive comparison. ASCII uppercase per the parent
+    /// design doc § 7.3 (consistency with `NameTable::set`'s rule;
+    /// Unicode casefolding deferred to a follow-up gap).
+    ///
+    /// Excel canonical: sheet names compare case-insensitively (so
+    /// `"Sheet1"` and `"SHEET1"` are the same sheet) but the DISPLAY
+    /// form preserves user-supplied case. This function returns the
+    /// canonical form used for lookup / duplicate-detection ONLY;
+    /// display goes through `Sheet::name()`.
+    ///
+    /// V1 simplification: ASCII-only uppercase. `"Café"` and `"café"`
+    /// canonicalize to different forms (the non-ASCII `é` is not
+    /// folded). Excel itself uses Unicode casefolding here; if a real
+    /// workbook with non-ASCII sheet names surfaces a collision, this
+    /// gets revisited.
+    pub fn canonical_sheet_name(name: &str) -> String {
+        name.to_ascii_uppercase()
+    }
+
+    /// **Phase 4.6.AA (W5-86):** find a sheet by name (case-insensitive
+    /// per `canonical_sheet_name`). Returns the first match in id order.
+    ///
+    /// Lookup cost: O(sheet_count). Acceptable for typical workbooks
+    /// (low double-digits of sheets). If profiling shows pain, a
+    /// canonical-name → id index can be added without changing this
+    /// API surface.
+    pub fn sheet_id_by_name(&self, name: &str) -> Option<SheetId> {
+        let canonical = Self::canonical_sheet_name(name);
+        for (idx, sheet) in self.sheets.iter().enumerate() {
+            if Self::canonical_sheet_name(sheet.name()) == canonical {
+                return Some(idx as SheetId);
+            }
+        }
+        None
+    }
+
+    /// **Phase 4.6.AA (W5-86):** validate a sheet name for use with
+    /// `add_sheet` / `rename_sheet`. Rejects:
+    /// - empty string (Excel canon)
+    /// - canonical duplicate of an existing sheet name
+    /// - Excel-reserved characters `:`, `\`, `/`, `?`, `*`, `[`, `]`
+    ///   (also xlsx round-trip prerequisite for Phase 4.11)
+    ///
+    /// Per the parent design's named-divergence catalog: V1 matches
+    /// Excel's rejection set exactly. Length limit (Excel's 31-char
+    /// max) is NOT enforced in V1 — that's a UX hint, not a correctness
+    /// boundary; tracked for follow-up if xlsx import surfaces it.
+    pub fn validate_sheet_name(&self, name: &str) -> Result<(), SheetNameError> {
+        if name.is_empty() {
+            return Err(SheetNameError::Empty);
+        }
+        for c in name.chars() {
+            if matches!(c, ':' | '\\' | '/' | '?' | '*' | '[' | ']') {
+                return Err(SheetNameError::ReservedCharacter(c));
+            }
+        }
+        if self.sheet_id_by_name(name).is_some() {
+            return Err(SheetNameError::Duplicate {
+                name: name.to_owned(),
+            });
+        }
+        Ok(())
     }
 
     pub fn names(&self) -> &NameTable {
@@ -841,5 +930,135 @@ mod tests {
         wb.set_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)))
             .unwrap();
         assert!(wb.names().lookup("TAXRATE").is_some());
+    }
+
+    // ===== W5-86 / Phase 4.6.AA — sheet registry + canonicalizer =====
+
+    #[test]
+    fn canonical_sheet_name_uppercases_ascii() {
+        assert_eq!(Workbook::canonical_sheet_name("Sheet1"), "SHEET1");
+        assert_eq!(Workbook::canonical_sheet_name("sheet1"), "SHEET1");
+        assert_eq!(Workbook::canonical_sheet_name("SHEET1"), "SHEET1");
+    }
+
+    #[test]
+    fn canonical_sheet_name_passes_non_ascii_through() {
+        // V1 simplification: ASCII-only uppercasing; non-ASCII letters
+        // stay as-is. `Café` and `café` canonicalize to different forms.
+        // Documented as a known V1 simplification.
+        assert_eq!(Workbook::canonical_sheet_name("Café"), "CAFé");
+    }
+
+    #[test]
+    fn sheet_id_by_name_finds_case_insensitive() {
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("Inventory");
+        let s1 = wb.add_sheet("Q3 2025");
+        assert_eq!(wb.sheet_id_by_name("Inventory"), Some(s0));
+        assert_eq!(wb.sheet_id_by_name("inventory"), Some(s0));
+        assert_eq!(wb.sheet_id_by_name("INVENTORY"), Some(s0));
+        assert_eq!(wb.sheet_id_by_name("Q3 2025"), Some(s1));
+        assert_eq!(wb.sheet_id_by_name("q3 2025"), Some(s1));
+    }
+
+    #[test]
+    fn sheet_id_by_name_returns_none_on_miss() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S1");
+        assert_eq!(wb.sheet_id_by_name("S2"), None);
+        assert_eq!(wb.sheet_id_by_name(""), None);
+    }
+
+    #[test]
+    fn sheet_id_by_name_first_match_in_id_order() {
+        // Duplicates are caught at add time via `validate_sheet_name`, but
+        // if a workbook somehow has two sheets with the same canonical
+        // name (e.g. loaded from a corrupted .qbook), `sheet_id_by_name`
+        // returns the FIRST in id order.
+        let mut wb = Workbook::new();
+        // Bypass validation to construct the test fixture.
+        let s0 = wb.add_sheet("Test");
+        wb.sheets.push(Sheet::new("test")); // Same canonical form.
+        let s1: SheetId = (wb.sheet_count() - 1) as SheetId;
+        assert_eq!(wb.sheet_id_by_name("test"), Some(s0));
+        // Confirm both exist.
+        assert!(wb.sheet(s0).is_some());
+        assert!(wb.sheet(s1).is_some());
+    }
+
+    #[test]
+    fn validate_sheet_name_rejects_empty() {
+        let wb = Workbook::new();
+        assert_eq!(wb.validate_sheet_name(""), Err(SheetNameError::Empty));
+    }
+
+    #[test]
+    fn validate_sheet_name_rejects_excel_reserved_characters() {
+        let wb = Workbook::new();
+        for c in [':', '\\', '/', '?', '*', '[', ']'] {
+            let name = format!("S{c}1");
+            let result = wb.validate_sheet_name(&name);
+            assert_eq!(
+                result,
+                Err(SheetNameError::ReservedCharacter(c)),
+                "expected ReservedCharacter({c:?}) for {name:?}, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_sheet_name_rejects_canonical_duplicate() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("Inventory");
+        assert_eq!(
+            wb.validate_sheet_name("Inventory"),
+            Err(SheetNameError::Duplicate {
+                name: "Inventory".to_owned()
+            })
+        );
+        // Case-insensitive duplicate also rejected.
+        assert_eq!(
+            wb.validate_sheet_name("inventory"),
+            Err(SheetNameError::Duplicate {
+                name: "inventory".to_owned()
+            })
+        );
+        assert_eq!(
+            wb.validate_sheet_name("INVENTORY"),
+            Err(SheetNameError::Duplicate {
+                name: "INVENTORY".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn validate_sheet_name_accepts_valid_names() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("Already_Exists");
+        // Various non-conflicting valid names.
+        assert!(wb.validate_sheet_name("Sheet1").is_ok());
+        assert!(wb.validate_sheet_name("Q3 2025").is_ok());
+        assert!(wb.validate_sheet_name("Data.csv").is_ok()); // dot is OK
+        assert!(wb.validate_sheet_name("a").is_ok());
+        assert!(wb.validate_sheet_name("Café").is_ok()); // Unicode OK
+                                                         // Reserved-char rejection takes precedence over duplicate check.
+                                                         // (Order is: empty → reserved-char → duplicate.)
+    }
+
+    #[test]
+    fn validate_sheet_name_reserved_chars_anywhere_in_name_rejected() {
+        let wb = Workbook::new();
+        assert!(matches!(
+            wb.validate_sheet_name("S1:Sheet"),
+            Err(SheetNameError::ReservedCharacter(':'))
+        ));
+        assert!(matches!(
+            wb.validate_sheet_name("ends_with*"),
+            Err(SheetNameError::ReservedCharacter('*'))
+        ));
+        assert!(matches!(
+            wb.validate_sheet_name("?starts_with"),
+            Err(SheetNameError::ReservedCharacter('?'))
+        ));
     }
 }
