@@ -550,6 +550,14 @@ function init(): void {
 		});
 	};
 	promoteToChartBtn.addEventListener('click', onPromoteClick);
+	// **Subscriber invariant** (Front 7 fix, 2026-05-13 post-smoke):
+	// `store.subscribe` callbacks MUST be pure read-and-render. They
+	// MUST NOT call `store.dispatch(...)` synchronously — the store's
+	// re-entrancy guard at `store.ts:172-180` throws on nested
+	// dispatch. Force-close logic that previously lived here on
+	// capabilities loss now lives in `reduceInspectorInner`'s
+	// `capabilitiesUpdated` arm. Apply the same invariant to every
+	// other subscriber added below.
 	const inspectorViewSub = store.subscribe(() => {
 		const state = store.getState();
 		const insp = state.inspector;
@@ -565,13 +573,6 @@ function init(): void {
 		inspectorToggleBtn.title = inspectorSupported
 			? 'Toggle data inspector (Ctrl+I)'
 			: 'Data inspector requires a newer Python daemon. Reinstall the venv via the "Quantlab: Reinstall Python environment" command, or update the bundled qviz package and reload the window.';
-		// If the inspector is currently visible but the daemon doesn't
-		// support it (e.g., a respawn dropped the capability), force-
-		// close so the user doesn't sit on an inert panel.
-		if (insp.visible && !inspectorSupported) {
-			store.dispatch({ type: 'toggleInspector', visible: false });
-			return;
-		}
 		// Toggle parent grid class so the inspector column gets a track.
 		document.body.classList.toggle('qviz-inspector-open', insp.visible);
 		inspectorRoot.hidden = !insp.visible;

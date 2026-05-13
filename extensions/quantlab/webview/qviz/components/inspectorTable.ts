@@ -309,12 +309,24 @@ export function mountInspectorTable(
 			// bug is visible.
 			const kind = insp.lastErrorKind;
 			if (kind === null) {
+				// Closure (a) (2026-05-13 post-smoke): surface the
+				// invariant violation VISIBLY, not only on
+				// console.error which is invisible in packaged
+				// extension (no Devtools by default). The user-facing
+				// placeholder now distinguishes "internal invariant"
+				// from regular kind-tagged errors and asks for a reload
+				// + report — so the bug class doesn't hide.
 				console.error(
 					'[qviz inspector] invariant violation: lastError set but '
 					+ 'lastErrorKind=null; suppressing Retry. Fix the dispatcher.',
 				);
-				setPlaceholder(`Could not load rows: ${insp.lastError}`,
-					{ kind: 'error' });
+				setPlaceholder(
+					`Internal error (inspector invariant violation): `
+					+ `${insp.lastError}. Reload the window `
+					+ `(Developer: Reload Window) and report this — the `
+					+ `dispatcher dropped the error kind.`,
+					{ kind: 'error' },
+				);
 				return;
 			}
 			let retryable: boolean;

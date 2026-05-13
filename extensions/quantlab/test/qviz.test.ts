@@ -99,16 +99,19 @@ suite('qviz validation', () => {
 		);
 	});
 
-	test('candlestick without ohlcv encoding is rejected (B3 megaudit)', () => {
-		// Megaudit Theme B (B3, 2026-05-13): the validator now enforces
-		// the candlestick ↔ ohlcv cross-validation rule. Previously per-
-		// encoding completeness was deferred to compile time to avoid
-		// builder-time error noise; the OHLCV CLUSTER specifically is a
-		// structural invariant of candlestick charts and is checked at
-		// the validator boundary.
-		//
-		// The wider "x must be present, y must be present, etc." checks
-		// remain at compile time per the 2026-05-11 cure.
+	test('candlestick without ohlcv encoding is ACCEPTED at validator level', () => {
+		// Megaudit Theme B (B3, 2026-05-13) — REVERTED post-UI-smoke
+		// 2026-05-13: the validator previously rejected candlestick
+		// without ohlcv (and non-candlestick with ohlcv) as structural
+		// errors. That broke transitional `edit.spec` messages the
+		// webview sends after each chart-type-picker click — the user
+		// gets stuck on the previous chart type because the edit never
+		// applies. The compiler at `render/timeseries.ts:107` already
+		// throws `CompilePlanError('candlestick chart requires
+		// encodings.ohlcv')` at render time, which surfaces in the
+		// preview diagnostics readout — the correct place for
+		// "incomplete combination" signals. The wire validator accepts
+		// the structurally-incomplete state so live editing flows.
 		const raw = readExample('timeseries-candlestick.qviz.json') as Record<string, unknown>;
 		const chart = raw.chart as Record<string, unknown>;
 		const tampered = {
@@ -116,15 +119,17 @@ suite('qviz validation', () => {
 			chart: { ...chart, encodings: {} }
 		};
 		const result = validate(tampered);
-		assert.strictEqual(result.ok, false,
-			'candlestick without ohlcv is structurally invalid');
-		if (!result.ok) {
-			assert.ok(result.issues.some(i => /ohlcv/.test(i.path)),
-				`expected ohlcv-missing issue, got ${JSON.stringify(result.issues)}`);
-		}
+		assert.strictEqual(result.ok, true,
+			'wire validator must accept candlestick-without-ohlcv; '
+			+ 'the renderer enforces the structural invariant');
 	});
 
-	test('B3: non-candlestick chart with stray ohlcv encoding is rejected', () => {
+	test('non-candlestick chart WITH stray ohlcv encoding is ACCEPTED at validator level', () => {
+		// Same reasoning as the candlestick-without-ohlcv revert: the
+		// wire validator must accept this transitional state so the
+		// webview can move BETWEEN chart types without getting wedged.
+		// Non-candlestick renderers ignore the stray ohlcv cluster;
+		// no compile-time error.
 		const raw = readExample('timeseries-line-volume.qviz.json') as Record<string, unknown>;
 		const chart = raw.chart as Record<string, unknown>;
 		const encodings = chart.encodings as Record<string, unknown>;
@@ -134,10 +139,7 @@ suite('qviz validation', () => {
 				ohlcv: { time: 't', open: 'o', high: 'h', low: 'l', close: 'c' } } },
 		};
 		const result = validate(tampered);
-		assert.strictEqual(result.ok, false);
-		if (!result.ok) {
-			assert.ok(result.issues.some(i => /ohlcv/.test(i.path)));
-		}
+		assert.strictEqual(result.ok, true);
 	});
 
 	test('rejects chart type not allowed in family', () => {

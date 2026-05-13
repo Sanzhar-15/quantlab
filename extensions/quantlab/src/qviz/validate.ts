@@ -751,22 +751,23 @@ function parseChartConfig(ctx: Ctx, path: string, x: unknown): ChartConfig | nul
 	const encodings = parseEncodings(ctx, `${path}.encodings`, obj.encodings);
 	const options = obj.options !== undefined ? parseChartOptions(ctx, `${path}.options`, obj.options) ?? undefined : undefined;
 	if (encodings === null) { return null; }
-	// Megaudit Theme B (B3, 2026-05-13): the `ohlcv` encoding cluster is
-	// only meaningful for candlestick charts. The validator previously
-	// accepted (a) a `line` chart with stray `ohlcv` encoding (confuses
-	// compiler) and (b) a `candlestick` chart MISSING `ohlcv` (which the
-	// compiler would reject downstream with a less specific message).
-	// Reject both structural mistakes at the wire boundary.
-	if (type === 'candlestick' && encodings.ohlcv === undefined) {
-		ctx.error(`${path}.encodings.ohlcv`,
-			'candlestick chart requires ohlcv encoding cluster');
-		return null;
-	}
-	if (type !== 'candlestick' && encodings.ohlcv !== undefined) {
-		ctx.error(`${path}.encodings.ohlcv`,
-			`ohlcv encoding is only valid for candlestick (got ${type})`);
-		return null;
-	}
+	// Megaudit Theme B (B3, 2026-05-13) reverted 2026-05-13 post-smoke:
+	// the cross-validation between `chart.type === 'candlestick'` and the
+	// `encodings.ohlcv` cluster ran at every wire-boundary call, including
+	// `edit.spec` messages the webview sends after each user keystroke /
+	// chart-type-picker click. That correctly enforced the SAVED contract
+	// but broke transitional edits: clicking the candlestick chip in the
+	// picker BEFORE ohlcv columns were filled in (or vice-versa: changing
+	// AWAY from candlestick before clearing the ohlcv cluster) was
+	// rejected, the edit never applied, and the user was stuck on the
+	// previous chart type. The compiler at `render/timeseries.ts:107`
+	// already throws `CompilePlanError('candlestick chart requires
+	// encodings.ohlcv')` at render time, which surfaces in the preview
+	// diagnostics readout — the correct place for a "this combination is
+	// incomplete" signal. The reverse case (non-candlestick chart with a
+	// stray ohlcv cluster) is harmless: non-candlestick renderers ignore
+	// it and the compiler doesn't error. Net: structural validation
+	// belongs at the compile-plan boundary, not the wire boundary.
 	return { family, type, encodings, options };
 }
 

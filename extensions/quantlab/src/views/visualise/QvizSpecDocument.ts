@@ -56,6 +56,21 @@ import { PLACEHOLDER_SCHEMA_HASH } from '../../qviz/draftFromDataset';
  * stay structurally aligned by construction.
  */
 function defaultDraftSpec(): QvizSpec {
+	// Front 3 (2026-05-13 post-smoke): no schema is known when an
+	// empty `.qviz.json` is opened, so we seed with NO encodings
+	// rather than literal placeholder field names `x` / `y`.
+	// Placeholder fields produced "field 'x' not in column data"
+	// rejections from the renderer the moment a real dataset got
+	// associated, and made the local renderer compile fail
+	// repeatedly during builder edits. With empty encodings the
+	// renderer cleanly reports "line chart requires encodings.x and
+	// encodings.y" until the user assigns columns via the column-
+	// panel or drag-drop — at which point `inferEncodingTypeForChannel`
+	// (Pattern B) sets the correct schema-derived encoding type.
+	//
+	// `deriveDefaultSpec(...)` in `src/qviz/defaults.ts` (called via
+	// `draftFromDataset.ts`) remains the schema-aware seeder for the
+	// "Open as Visualise" path where the dataset is known up front.
 	return {
 		qviz_version: QVIZ_SCHEMA_VERSION,
 		title: '',
@@ -69,10 +84,7 @@ function defaultDraftSpec(): QvizSpec {
 		chart: {
 			family: 'timeseries',
 			type: 'line',
-			encodings: {
-				x: { field: 'x', type: 'temporal' },
-				y: { field: 'y', type: 'quantitative' },
-			},
+			encodings: {},
 		},
 		provenance: {
 			generator: 'manual',

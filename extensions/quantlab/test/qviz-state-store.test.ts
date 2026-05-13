@@ -677,6 +677,139 @@ suite('qviz state -- runtime slice', () => {
 		assert.deepStrictEqual(s.runtime.capabilities, caps);
 	});
 
+	test('Front 7: capabilitiesUpdated dropping inspector support auto-closes visible inspector (no nested dispatch)', () => {
+		// Reproduce the exact wedge: inspector visible, daemon
+		// respawns with a capability bag that doesn't support
+		// inspector. The previous code did a synchronous
+		// `store.dispatch({type:'toggleInspector', visible:false})`
+		// from inside the subscriber, which the store's
+		// re-entrancy guard rejected ("QvizStore: nested dispatch
+		// is not allowed"). The fix moves the auto-close into
+		// `reduceInspector`'s `capabilitiesUpdated` arm so the
+		// transition is atomic in a single root reduction.
+		const fullCaps = {
+			daemonVersion: 3, transformKinds: [], chartFamilies: [] as const,
+			inspector: { previewOffset: true, columnStats: true, aggregateFilters: true },
+		};
+		const visible = rootReduce(INITIAL_ROOT_STATE, {
+			type: 'capabilitiesUpdated', capabilities: fullCaps,
+		});
+		const opened = rootReduce(visible, { type: 'toggleInspector', visible: true });
+		assert.strictEqual(opened.inspector.visible, true, 'inspector opened');
+
+		const downgrade = {
+			daemonVersion: 3, transformKinds: [], chartFamilies: [] as const,
+			// `inspector` bag absent → unsupported.
+		};
+		const closed = rootReduce(opened, {
+			type: 'capabilitiesUpdated', capabilities: downgrade,
+		});
+		assert.strictEqual(closed.inspector.visible, false,
+			'inspector must auto-close when capabilities drop support');
+	});
+
+	test('Front 7: capabilitiesUpdated with same support is a no-op for inspector', () => {
+		// Regression pin: if caps are upgraded but inspector
+		// support stays the same, inspector visibility doesn't
+		// flicker. This is the identity-preserve check.
+		const fullCaps = {
+			daemonVersion: 3, transformKinds: [], chartFamilies: [] as const,
+			inspector: { previewOffset: true, columnStats: true, aggregateFilters: true },
+		};
+		const opened = rootReduce(
+			rootReduce(INITIAL_ROOT_STATE, {
+				type: 'capabilitiesUpdated', capabilities: fullCaps,
+			}),
+			{ type: 'toggleInspector', visible: true },
+		);
+		const caps2 = { ...fullCaps, daemonVersion: 4 };
+		const next = rootReduce(opened, {
+			type: 'capabilitiesUpdated', capabilities: caps2,
+		});
+		assert.strictEqual(next.inspector.visible, true,
+			'inspector visibility must not flicker on upgrade');
+	});
+
+	test('Front 7: init with unsupported caps resets inspector to closed (regression pin)', () => {
+		// Codex audit cycle1: `init` always returns
+		// INITIAL_INSPECTOR_STATE which has visible=false, so a fresh
+		// document with unsupported caps defaults correctly closed.
+		// Pin this so a future change to the `init` arm doesn't
+		// silently re-introduce the "visible from prior document
+		// survives an init" wedge.
+		const fullCaps = {
+			daemonVersion: 3, transformKinds: [], chartFamilies: [] as const,
+			inspector: { previewOffset: true, columnStats: true, aggregateFilters: true },
+		};
+		const opened = rootReduce(
+			rootReduce(INITIAL_ROOT_STATE, {
+				type: 'capabilitiesUpdated', capabilities: fullCaps,
+			}),
+			{ type: 'toggleInspector', visible: true },
+		);
+		assert.strictEqual(opened.inspector.visible, true);
+		// Now init a fresh document with unsupported caps.
+		const next = rootReduce(opened, {
+			type: 'init',
+			fsPath: '/y',
+			spec: spec(),
+			capabilities: {
+				daemonVersion: 4, transformKinds: [], chartFamilies: [] as const,
+				// no `inspector` bag → unsupported
+			},
+		});
+		assert.strictEqual(next.inspector.visible, false,
+			'init must reset inspector to closed regardless of caps');
+	});
+
+	test('Front 7: partial-capability downgrade (one flag false) auto-closes inspector', () => {
+		// Cycle 1 audit M3: the reducer requires ALL three inspector
+		// flags (previewOffset, columnStats, aggregateFilters) to be
+		// true for the panel to remain visible. A daemon that
+		// advertises 2-of-3 is "partial support" and must close the
+		// panel. The original subscriber bug fired for the all-false
+		// case AND the partial cases — pin the partial path too.
+		const fullCaps = {
+			daemonVersion: 3, transformKinds: [], chartFamilies: [] as const,
+			inspector: { previewOffset: true, columnStats: true, aggregateFilters: true },
+		};
+		const opened = rootReduce(
+			rootReduce(INITIAL_ROOT_STATE, {
+				type: 'capabilitiesUpdated', capabilities: fullCaps,
+			}),
+			{ type: 'toggleInspector', visible: true },
+		);
+		const partial = {
+			...fullCaps,
+			// columnStats dropped — partial support, panel must close.
+			inspector: { previewOffset: true, columnStats: false, aggregateFilters: true },
+		};
+		const next = rootReduce(opened, {
+			type: 'capabilitiesUpdated', capabilities: partial,
+		});
+		assert.strictEqual(next.inspector.visible, false,
+			'partial capability downgrade must close visible inspector');
+	});
+
+	test('Front 7: capabilitiesUpdated dropping support on already-hidden inspector is a no-op', () => {
+		// Identity-preserve when visible=false. The reducer
+		// returns the unchanged state object, so reference
+		// equality holds upstream.
+		const fullCaps = {
+			daemonVersion: 3, transformKinds: [], chartFamilies: [] as const,
+			inspector: { previewOffset: true, columnStats: true, aggregateFilters: true },
+		};
+		const closed = rootReduce(INITIAL_ROOT_STATE, {
+			type: 'capabilitiesUpdated', capabilities: fullCaps,
+		});
+		const downgrade = { ...fullCaps, inspector: undefined };
+		const next = rootReduce(closed, {
+			type: 'capabilitiesUpdated', capabilities: downgrade,
+		});
+		assert.strictEqual(next.inspector, closed.inspector,
+			'reducer must identity-preserve when inspector was already closed');
+	});
+
 	test('init.capabilities populates runtime slice', () => {
 		const caps = { daemonVersion: 2, transformKinds: ['filter'], chartFamilies: ['timeseries'] as const };
 		const s = rootReduce(INITIAL_ROOT_STATE, {

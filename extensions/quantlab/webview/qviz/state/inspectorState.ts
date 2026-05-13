@@ -383,6 +383,25 @@ function reduceInspectorInner(state: InspectorState, action: Action): InspectorS
 			return { ...state, visible: next };
 		}
 
+		case 'capabilitiesUpdated': {
+			// Front 7 (2026-05-13 post-smoke): when the daemon
+			// respawns / downgrades, the new capabilities may no
+			// longer support the inspector. Auto-close inline in
+			// the reducer to avoid the previous subscriber-side
+			// `store.dispatch({type:'toggleInspector'})` which
+			// triggered the store re-entrancy guard
+			// ("QvizStore: nested dispatch is not allowed"). This
+			// is the correctness-spine fix — the subscriber at
+			// `webview/qviz-spec/index.ts:553` now reads UI state
+			// only and never dispatches.
+			if (!state.visible) { return state; }
+			const i = action.capabilities.inspector;
+			const supported = i !== undefined
+				&& i.previewOffset && i.columnStats && i.aggregateFilters;
+			if (supported) { return state; }
+			return { ...state, visible: false };
+		}
+
 		case 'setColumnFilter': {
 			const current = state.filters[action.column];
 			if (action.filter === null) {

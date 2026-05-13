@@ -159,33 +159,21 @@ export function deriveDefaultSpec(args: DeriveDefaultSpecArgs): DeriveDefaultSpe
 }
 
 // ---------------------------------------------------------------------------
-// dtype classification
+// dtype classification — moved to `schemaEncoding.ts` in the post-smoke
+// builder-coherence pass (Pattern B, 2026-05-13). `defaults.ts` re-
+// exports for backward-compatibility with existing import sites.
 // ---------------------------------------------------------------------------
 
-export type ClassifiedColumnType = 'temporal' | 'quantitative' | 'nominal' | 'ordinal';
-
-/** Map a pyarrow dtype string to the qviz EncodingType vocabulary.
- *  Unknown / unsupported dtypes fall through to 'nominal'. */
-export function classifyColumn(col: SchemaColumn): ClassifiedColumnType {
-	const dt = col.dtype.toLowerCase();
-	if (dt.startsWith('timestamp') || dt === 'date32[day]' || dt === 'date64[ms]') {
-		return 'temporal';
-	}
-	if (
-		dt.startsWith('int') || dt.startsWith('uint')
-		|| dt.startsWith('float') || dt === 'double' || dt === 'half_float'
-		|| dt.startsWith('decimal')
-	) {
-		return 'quantitative';
-	}
-	if (dt === 'utf8' || dt === 'large_utf8' || dt === 'string'
-		|| dt.startsWith('dictionary')
-		|| dt === 'bool' || dt === 'boolean'
-	) {
-		return 'nominal';
-	}
-	return 'nominal';
-}
+import {
+	classifyColumn,
+	inferEncodingTypeForChannel,
+	type ClassifiedColumnType,
+} from './schemaEncoding';
+export {
+	classifyColumn,
+	inferEncodingTypeForChannel,
+	type ClassifiedColumnType,
+};
 
 interface OhlcvColumns {
 	readonly time: string;

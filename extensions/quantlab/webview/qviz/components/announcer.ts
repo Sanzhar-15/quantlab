@@ -294,11 +294,19 @@ function diffAndAnnounce(
 		// message than to omit the announcement entirely.
 		const kind = state.inspector.lastErrorKind;
 		if (kind === null) {
+			// Closure (a) (2026-05-13 post-smoke): announce the
+			// invariant violation explicitly to SR users (not only
+			// console.error). The placeholder in inspectorTable.ts
+			// matches.
 			console.error(
 				'[qviz announcer] invariant violation: lastError set but '
 				+ 'lastErrorKind=null. Announcing as generic error.',
 			);
-			emit(`Inspector error: ${state.inspector.lastError}.`, 'assertive');
+			emit(
+				`Internal error in inspector: ${state.inspector.lastError}. `
+				+ `Please reload the window and report this.`,
+				'assertive',
+			);
 		} else {
 			let verb: string;
 			switch (kind) {

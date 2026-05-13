@@ -377,6 +377,12 @@ type PanCacheState = {
   firstSeriesOrder: number;
 };
 
+// PATCH(quantlab) Front 6 (2026-05-13 post-smoke): gate the verbose
+// `[PAN]` debug `console.log` calls behind a default-false flag. At
+// ~60Hz drag rate these flooded the production console thousands of
+// lines per pan gesture. Set to `true` for local debugging only.
+const DEBUG_PAN = false;
+
 const LOD_MAX_LEVELS = 8;
 const LOD_MIN_POINTS = 2048;
 const LOD_RETENTION_MIN_POINTS = 2;
@@ -4336,13 +4342,15 @@ export function createChart(
     const { clamped } = resolveElasticRange(beforeRange);
     panBaseRange = clamped;
 
-    // DEBUG: Log pan start state
-    console.log('[PAN] beginPan:', {
-      beforeRange: { from: beforeRange.from, to: beforeRange.to, span: beforeRange.to - beforeRange.from },
-      panBaseRange: { from: panBaseRange.from, to: panBaseRange.to, span: panBaseRange.to - panBaseRange.from },
-      panOverscrollPx,
-      panOverscrollRaw,
-    });
+    // DEBUG: Log pan start state (PATCH(quantlab) Front 6: gated)
+    if (DEBUG_PAN) {
+      console.log('[PAN] beginPan:', {
+        beforeRange: { from: beforeRange.from, to: beforeRange.to, span: beforeRange.to - beforeRange.from },
+        panBaseRange: { from: panBaseRange.from, to: panBaseRange.to, span: panBaseRange.to - panBaseRange.from },
+        panOverscrollPx,
+        panOverscrollRaw,
+      });
+    }
 
     // Freeze Y-axis ticks for stability during horizontal pan
     freezeYAxisTicks();
@@ -4538,15 +4546,17 @@ export function createChart(
     deltaX: number,
     plotWidth: number,
   ): { rangeChanged: boolean; overscrollChanged: boolean } => {
-    // DEBUG: Log pan delta application
-    const debugBefore = xScale.getVisibleRange();
-    console.log('[PAN] applyPanDelta START:', {
-      deltaX,
-      plotWidth,
-      elasticClampEnabled,
-      panOverscrollRaw,
-      beforeRange: { from: debugBefore.from, to: debugBefore.to, span: debugBefore.to - debugBefore.from },
-    });
+    // DEBUG: Log pan delta application (PATCH(quantlab) Front 6: gated)
+    if (DEBUG_PAN) {
+      const debugBefore = xScale.getVisibleRange();
+      console.log('[PAN] applyPanDelta START:', {
+        deltaX,
+        plotWidth,
+        elasticClampEnabled,
+        panOverscrollRaw,
+        beforeRange: { from: debugBefore.from, to: debugBefore.to, span: debugBefore.to - debugBefore.from },
+      });
+    }
 
     if (!elasticClampEnabled) {
       const before = xScale.getVisibleRange();
@@ -4557,10 +4567,12 @@ export function createChart(
         Number.isFinite(span) && span > 0
           ? -((after.from - before.from) / span) * plotWidth
           : 0;
-      console.log('[PAN] applyPanDelta (non-elastic):', {
-        rangeChanged: Math.abs(actualDeltaX) > 1e-6,
-        afterRange: { from: after.from, to: after.to, span: after.to - after.from },
-      });
+      if (DEBUG_PAN) {
+        console.log('[PAN] applyPanDelta (non-elastic):', {
+          rangeChanged: Math.abs(actualDeltaX) > 1e-6,
+          afterRange: { from: after.from, to: after.to, span: after.to - after.from },
+        });
+      }
       return { rangeChanged: Math.abs(actualDeltaX) > 1e-6, overscrollChanged: false };
     }
 
@@ -4599,14 +4611,16 @@ export function createChart(
       }
     }
 
-    // DEBUG: Log elastic pan result
-    const debugAfter = xScale.getVisibleRange();
-    console.log('[PAN] applyPanDelta (elastic) END:', {
-      rangeChanged,
-      overscrollChanged,
-      panOverscrollRaw,
-      afterRange: { from: debugAfter.from, to: debugAfter.to, span: debugAfter.to - debugAfter.from },
-    });
+    // DEBUG: Log elastic pan result (PATCH(quantlab) Front 6: gated)
+    if (DEBUG_PAN) {
+      const debugAfter = xScale.getVisibleRange();
+      console.log('[PAN] applyPanDelta (elastic) END:', {
+        rangeChanged,
+        overscrollChanged,
+        panOverscrollRaw,
+        afterRange: { from: debugAfter.from, to: debugAfter.to, span: debugAfter.to - debugAfter.from },
+      });
+    }
 
     return { rangeChanged, overscrollChanged };
   };
@@ -8127,7 +8141,7 @@ export function createChart(
     const range = xScale.getVisibleRange();
     // DIAGNOSTIC: Trace range during pan
     const rangeSpan = range.to - range.from;
-    if (panActive) {
+    if (DEBUG_PAN && panActive) {
       console.log('[PAN] renderSeries:', {
         range: { from: range.from, to: range.to, span: rangeSpan },
         panBaseRange: panBaseRange ? { from: panBaseRange.from, to: panBaseRange.to, span: panBaseRange.to - panBaseRange.from } : null,
@@ -8301,8 +8315,8 @@ export function createChart(
       if (!seriesCtx) return;
       const size = seriesLayer.getSize();
 
-      // DEBUG: Log direct rendering
-      if (panActive) {
+      // DEBUG: Log direct rendering (PATCH(quantlab) Front 6: gated)
+      if (DEBUG_PAN && panActive) {
         console.log('[PAN] Direct rendering (no worker):', {
           range: { from: range.from, to: range.to, span: range.to - range.from },
           panOffsetPx,

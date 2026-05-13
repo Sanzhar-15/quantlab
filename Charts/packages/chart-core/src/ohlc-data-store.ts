@@ -23,6 +23,39 @@ const sanitizeValue = (value: number, nonFinite: NonFinitePolicy): number => {
   return value;
 };
 
+// PATCH(quantlab) Front 5 (2026-05-13 post-smoke): when monotonicity
+// fails, the user benefits enormously from row indices + a unit hint.
+// TradingView daily CSVs occasionally export duplicate rows around
+// feed adjustments OR Unix-seconds timestamps when the chart expects
+// milliseconds — both produce "strictly increasing" failures with
+// indistinguishable error messages today.
+const formatTimeHint = (t: number, prev: number): string => {
+  // Unix-seconds detector: timestamps in [1e9, 1e10] are seconds
+  // since ~2001-2286. The chart pipeline expects MILLISECONDS
+  // (~1e12). If we see a "seconds-shaped" timestamp, hint loudly.
+  if (t > 1e9 && t < 1e10 && prev > 1e9 && prev < 1e10) {
+    return ' (timestamps look like Unix SECONDS; the chart expects MILLISECONDS — multiply by 1000)';
+  }
+  return '';
+};
+const formatMonotonicityError = (
+  scope: 'setData' | 'append' | 'appendBatch',
+  index: number,
+  prevIndex: number,
+  t: number,
+  prevTime: number,
+  relation: 'duplicate' | 'out-of-order',
+): string => {
+  const indexHint = relation === 'duplicate'
+    ? `rows ${prevIndex} and ${index} share timestamp ${t}`
+    : `row ${index} has timestamp ${t} < row ${prevIndex} timestamp ${prevTime}`;
+  return `OhlcDataStore.${scope} requires strictly increasing time values; `
+    + `${indexHint}.${formatTimeHint(t, prevTime)} `
+    + `Add a \`sort\` transform on the time column or deduplicate `
+    + `upstream (groupby+aggregate(last) for dup days, sort+limit for `
+    + `out-of-order).`;
+};
+
 const sanitizePoint = (
   point: OhlcDataPoint,
   nonFinite: NonFinitePolicy,
@@ -92,7 +125,9 @@ export class OhlcDataStore {
       const t = point.t;
       if (t < prevTime) {
         if (this._outOfOrder === 'drop') continue;
-        throw new Error('OhlcDataStore.setData requires strictly increasing time values.');
+        throw new Error(formatMonotonicityError(
+          'setData', i, i - 1, t, prevTime, 'out-of-order',
+        ));
       }
       if (t === prevTime) {
         if (this._duplicates === 'ignore') continue;
@@ -106,7 +141,9 @@ export class OhlcDataStore {
           }
           continue;
         }
-        throw new Error('OhlcDataStore.setData requires strictly increasing time values.');
+        throw new Error(formatMonotonicityError(
+          'setData', i, i - 1, t, prevTime, 'duplicate',
+        ));
       }
       const sanitized = sanitizePoint(point, this._nonFinite);
       time[length] = t;
@@ -131,7 +168,9 @@ export class OhlcDataStore {
       const last = this._time[this._length - 1]!;
       if (point.t < last) {
         if (this._outOfOrder === 'drop') return;
-        throw new Error('OhlcDataStore.append requires time greater than the last value.');
+        throw new Error(formatMonotonicityError(
+          'append', this._length, this._length - 1, point.t, last, 'out-of-order',
+        ));
       }
       if (point.t === last) {
         if (this._duplicates === 'ignore') return;
@@ -143,7 +182,9 @@ export class OhlcDataStore {
           this._close[this._length - 1] = sanitized.c;
           return;
         }
-        throw new Error('OhlcDataStore.append requires time greater than the last value.');
+        throw new Error(formatMonotonicityError(
+          'append', this._length, this._length - 1, point.t, last, 'duplicate',
+        ));
       }
     }
 
@@ -161,15 +202,26 @@ export class OhlcDataStore {
     if (points.length === 0) return;
 
     let prevTime = this._length > 0 ? this._time[this._length - 1]! : Number.NEGATIVE_INFINITY;
+    // PATCH(quantlab) Front 5 audit H2 (2026-05-13): track the
+    // prev-index in the COMBINED stream (existing store + batch
+    // appends so far), NOT just the batch's local index. The earlier
+    // version reported `i - 1` which was `-1` when the first row of
+    // the batch failed against an already-populated store — exactly
+    // the confusing message Front 5 was meant to eliminate.
+    let prevIndex = this._length > 0 ? this._length - 1 : -1;
     this._ensureCapacity(this._length + points.length);
 
-    for (const point of points) {
+    for (let i = 0; i < points.length; i++) {
+      const point = points[i]!;
+      const combinedIndex = this._length;
       if (point.t < prevTime) {
-        if (this._outOfOrder === 'drop') continue;
-        throw new Error('OhlcDataStore.appendBatch requires strictly increasing time values.');
+        if (this._outOfOrder === 'drop') { continue; }
+        throw new Error(formatMonotonicityError(
+          'appendBatch', combinedIndex, prevIndex, point.t, prevTime, 'out-of-order',
+        ));
       }
       if (point.t === prevTime) {
-        if (this._duplicates === 'ignore') continue;
+        if (this._duplicates === 'ignore') { continue; }
         if (this._duplicates === 'replace') {
           if (this._length > 0) {
             const sanitized = sanitizePoint(point, this._nonFinite);
@@ -180,7 +232,9 @@ export class OhlcDataStore {
           }
           continue;
         }
-        throw new Error('OhlcDataStore.appendBatch requires strictly increasing time values.');
+        throw new Error(formatMonotonicityError(
+          'appendBatch', combinedIndex, prevIndex, point.t, prevTime, 'duplicate',
+        ));
       }
       const sanitized = sanitizePoint(point, this._nonFinite);
       this._time[this._length] = point.t;
@@ -188,6 +242,7 @@ export class OhlcDataStore {
       this._high[this._length] = sanitized.h;
       this._low[this._length] = sanitized.l;
       this._close[this._length] = sanitized.c;
+      prevIndex = this._length;
       this._length += 1;
       prevTime = point.t;
     }
