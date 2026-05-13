@@ -941,6 +941,379 @@ pub fn trim(args: &[Value]) -> Value {
     Value::text(out)
 }
 
+// ===== Text functions wave 2 (W5-56, Phase 4.3 V2) =====
+//
+// LEFT / RIGHT / MID / FIND / SEARCH / SUBSTITUTE / REPLACE /
+// CONCATENATE / REPT / EXACT. All scalar (`ScalarFn`). Excel uses
+// 1-based character indices for FIND/SEARCH/MID/REPLACE.
+//
+// **Unicode caveat (same as LEN W5-46/48):** indexing/length is
+// done in Unicode scalar values via `.chars()`, NOT in UTF-16 code
+// units as Excel does. Matches for ASCII / BMP; diverges for emoji
+// ZWJ sequences. Documented in `docs/compat/excel-matrix.md`;
+// pinned to Phase 4.9.
+
+/// Helper: coerce a Value to an integer arg for position/length
+/// fields in text functions. Numbers truncate; Bool 1/0; Blank 0;
+/// Text rejected as #VALUE!; Error propagates.
+fn coerce_int_arg(v: &Value) -> Result<i64, ErrorValue> {
+    match v {
+        Value::Number(n) => Ok(n.trunc() as i64),
+        Value::Boolean(b) => Ok(if *b { 1 } else { 0 }),
+        Value::Blank => Ok(0),
+        Value::Text(s) => match coercion::to_number_lenient(&Value::Text(s.clone())) {
+            Ok(n) => Ok(n.trunc() as i64),
+            Err(_) => Err(ErrorValue::Value),
+        },
+        Value::Error(e) => Err(*e),
+    }
+}
+
+/// `LEFT(text, [num_chars])` — leftmost `num_chars` characters of
+/// `text`. Default num_chars=1. Negative → #VALUE!. num_chars
+/// greater than text length returns the whole text. Empty text
+/// returns empty.
+pub fn left(args: &[Value]) -> Value {
+    if args.is_empty() || args.len() > 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let text = match coerce_text(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let n = if args.len() == 2 {
+        match coerce_int_arg(&args[1]) {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        1
+    };
+    if n < 0 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let out: String = text.chars().take(n as usize).collect();
+    Value::text(out)
+}
+
+/// `RIGHT(text, [num_chars])` — rightmost `num_chars` characters.
+/// Same caveats as LEFT.
+pub fn right(args: &[Value]) -> Value {
+    if args.is_empty() || args.len() > 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let text = match coerce_text(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let n = if args.len() == 2 {
+        match coerce_int_arg(&args[1]) {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        1
+    };
+    if n < 0 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let total = text.chars().count();
+    let take_from = total.saturating_sub(n as usize);
+    let out: String = text.chars().skip(take_from).collect();
+    Value::text(out)
+}
+
+/// `MID(text, start_num, num_chars)` — substring starting at
+/// `start_num` (1-based) of length `num_chars`. start_num < 1 →
+/// #VALUE!; num_chars < 0 → #VALUE!. start_num past end → empty.
+pub fn mid(args: &[Value]) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let text = match coerce_text(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let start = match coerce_int_arg(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let len = match coerce_int_arg(&args[2]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    if start < 1 || len < 0 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let skip = (start - 1) as usize;
+    let take = len as usize;
+    let out: String = text.chars().skip(skip).take(take).collect();
+    Value::text(out)
+}
+
+/// `FIND(find_text, within_text, [start_num])` — 1-based position
+/// of `find_text` inside `within_text`, starting search at
+/// `start_num` (default 1). **Case-sensitive.** Not found → #VALUE!.
+/// start_num < 1 or > length → #VALUE!. No wildcard support.
+pub fn find(args: &[Value]) -> Value {
+    if args.len() < 2 || args.len() > 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let needle = match coerce_text(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let hay = match coerce_text(&args[1]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let start = if args.len() == 3 {
+        match coerce_int_arg(&args[2]) {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        1
+    };
+    let total = hay.chars().count();
+    if start < 1 || (start as usize) > total + 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let start_idx = (start - 1) as usize;
+    // Collect chars to allow indexing by char position.
+    let chars: Vec<char> = hay.chars().collect();
+    let needle_chars: Vec<char> = needle.chars().collect();
+    if needle_chars.is_empty() {
+        // Empty needle matches at start_num per Excel canon.
+        return Value::Number(start as f64);
+    }
+    let n_len = needle_chars.len();
+    let h_len = chars.len();
+    if start_idx + n_len > h_len {
+        return Value::Error(ErrorValue::Value);
+    }
+    for i in start_idx..=(h_len - n_len) {
+        if chars[i..i + n_len] == needle_chars[..] {
+            return Value::Number((i + 1) as f64);
+        }
+    }
+    Value::Error(ErrorValue::Value)
+}
+
+/// `SEARCH(find_text, within_text, [start_num])` — like FIND but
+/// **case-insensitive**. Excel also supports `?` (single char) and
+/// `*` (any chars) wildcards — V1 does NOT implement wildcards;
+/// they're documented as deferred in the matrix and treated as
+/// literal characters here.
+pub fn search(args: &[Value]) -> Value {
+    if args.len() < 2 || args.len() > 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let needle = match coerce_text(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let hay = match coerce_text(&args[1]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let start = if args.len() == 3 {
+        match coerce_int_arg(&args[2]) {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        1
+    };
+    let total = hay.chars().count();
+    if start < 1 || (start as usize) > total + 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let start_idx = (start - 1) as usize;
+    let needle_u: Vec<char> = needle.to_uppercase().chars().collect();
+    let hay_u: Vec<char> = hay.to_uppercase().chars().collect();
+    if needle_u.is_empty() {
+        return Value::Number(start as f64);
+    }
+    let n_len = needle_u.len();
+    let h_len = hay_u.len();
+    if start_idx + n_len > h_len {
+        return Value::Error(ErrorValue::Value);
+    }
+    for i in start_idx..=(h_len - n_len) {
+        if hay_u[i..i + n_len] == needle_u[..] {
+            return Value::Number((i + 1) as f64);
+        }
+    }
+    Value::Error(ErrorValue::Value)
+}
+
+/// `SUBSTITUTE(text, old_text, new_text, [instance_num])` —
+/// replace `old_text` with `new_text` inside `text`. If
+/// `instance_num` is omitted, replaces all occurrences; otherwise
+/// replaces only the Nth (1-based) occurrence. Case-sensitive.
+pub fn substitute(args: &[Value]) -> Value {
+    if args.len() < 3 || args.len() > 4 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let text = match coerce_text(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let old = match coerce_text(&args[1]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let new_t = match coerce_text(&args[2]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    // Empty `old` is a no-op (Excel returns the text unchanged).
+    if old.is_empty() {
+        return Value::text(text);
+    }
+    let instance: Option<i64> = if args.len() == 4 {
+        match coerce_int_arg(&args[3]) {
+            Ok(n) if n >= 1 => Some(n),
+            Ok(_) => return Value::Error(ErrorValue::Value),
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        None
+    };
+    match instance {
+        None => {
+            // Replace all.
+            Value::text(text.replace(&old, &new_t))
+        }
+        Some(target) => {
+            // Replace only the Nth occurrence.
+            let mut out = String::with_capacity(text.len());
+            let mut remainder = text.as_str();
+            let mut count: i64 = 0;
+            while let Some(idx) = remainder.find(&old) {
+                count += 1;
+                if count == target {
+                    out.push_str(&remainder[..idx]);
+                    out.push_str(&new_t);
+                    out.push_str(&remainder[idx + old.len()..]);
+                    return Value::text(out);
+                }
+                // Copy past this occurrence unchanged.
+                out.push_str(&remainder[..idx + old.len()]);
+                remainder = &remainder[idx + old.len()..];
+            }
+            // Target instance not found — return original text.
+            out.push_str(remainder);
+            Value::text(out)
+        }
+    }
+}
+
+/// `REPLACE(old_text, start_num, num_chars, new_text)` — replace
+/// the `num_chars` characters starting at 1-based `start_num` in
+/// `old_text` with `new_text`. Excel canon: start_num past end
+/// appends; num_chars > remaining length truncates to end. start_num
+/// < 1 or num_chars < 0 → #VALUE!.
+pub fn replace_fn(args: &[Value]) -> Value {
+    if args.len() != 4 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let text = match coerce_text(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let start = match coerce_int_arg(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let cnt = match coerce_int_arg(&args[2]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let new_t = match coerce_text(&args[3]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    if start < 1 || cnt < 0 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let total = chars.len();
+    let start_idx = (start - 1) as usize;
+    let mut out = String::new();
+    // Prefix: 0..min(start_idx, total).
+    let prefix_end = start_idx.min(total);
+    out.extend(chars[..prefix_end].iter());
+    // Inserted text.
+    out.push_str(&new_t);
+    // Suffix: chars after the removed slice (start_idx + cnt).
+    let suffix_start = (start_idx + cnt as usize).min(total);
+    out.extend(chars[suffix_start..].iter());
+    Value::text(out)
+}
+
+/// `CONCATENATE(text1, text2, ...)` — concatenate scalar text args.
+/// Variadic; needs at least 1 arg. Errors propagate. Numbers coerce
+/// to their text representation.
+pub fn concatenate(args: &[Value]) -> Value {
+    if args.is_empty() {
+        return Value::Error(ErrorValue::Value);
+    }
+    let mut out = String::new();
+    for a in args {
+        match coerce_text(a) {
+            Ok(s) => out.push_str(&s),
+            Err(e) => return Value::Error(e),
+        }
+    }
+    Value::text(out)
+}
+
+/// `REPT(text, num_times)` — repeat `text` `num_times` times.
+/// num_times < 0 → #VALUE!. num_times = 0 → empty.
+pub fn rept(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let text = match coerce_text(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let n = match coerce_int_arg(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    if n < 0 {
+        return Value::Error(ErrorValue::Value);
+    }
+    // Guard against pathological inputs.
+    let target_len = text.len().saturating_mul(n as usize);
+    if target_len > 32_767 {
+        // Excel REPT length cap is 32,767 chars; clamp + return #VALUE!
+        // matching the canonical limit.
+        return Value::Error(ErrorValue::Value);
+    }
+    Value::text(text.repeat(n as usize))
+}
+
+/// `EXACT(text1, text2)` — case-sensitive equality. Returns TRUE/
+/// FALSE. Numbers coerce to text first.
+pub fn exact(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let a = match coerce_text(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let b = match coerce_text(&args[1]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    Value::Boolean(a == b)
+}
+
 // ===== Information (Phase 4.3 V1) =====
 
 /// `ISNUMBER(value)` — TRUE iff value is a Number (not error, not text, etc.).
@@ -1953,5 +2326,237 @@ mod tests {
             atan2(&[Value::Blank, Value::Blank]),
             Value::Error(ErrorValue::DivZero)
         );
+    }
+
+    // ===== W5-56: text functions wave 2 =====
+
+    fn vt(s: &str) -> Value {
+        Value::Text(std::sync::Arc::from(s))
+    }
+
+    #[test]
+    fn left_default_and_explicit_count() {
+        assert_eq!(left(&[vt("hello")]), vt("h"));
+        assert_eq!(left(&[vt("hello"), n(3.0)]), vt("hel"));
+        assert_eq!(left(&[vt("hello"), n(0.0)]), vt(""));
+        // num_chars > len: returns whole string.
+        assert_eq!(left(&[vt("hi"), n(99.0)]), vt("hi"));
+    }
+
+    #[test]
+    fn left_negative_count_is_value_error() {
+        assert_eq!(left(&[vt("hi"), n(-1.0)]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn left_empty_text() {
+        assert_eq!(left(&[vt(""), n(3.0)]), vt(""));
+    }
+
+    #[test]
+    fn left_arity_errors() {
+        assert_eq!(left(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            left(&[vt("a"), n(1.0), n(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn right_default_and_explicit() {
+        assert_eq!(right(&[vt("hello")]), vt("o"));
+        assert_eq!(right(&[vt("hello"), n(3.0)]), vt("llo"));
+        assert_eq!(right(&[vt("hello"), n(0.0)]), vt(""));
+        assert_eq!(right(&[vt("hi"), n(99.0)]), vt("hi"));
+    }
+
+    #[test]
+    fn mid_basic() {
+        // MID("hello", 2, 3) → "ell" (1-based start).
+        assert_eq!(mid(&[vt("hello"), n(2.0), n(3.0)]), vt("ell"));
+        // Start past end → empty.
+        assert_eq!(mid(&[vt("hi"), n(10.0), n(3.0)]), vt(""));
+        // Length 0 → empty.
+        assert_eq!(mid(&[vt("hi"), n(1.0), n(0.0)]), vt(""));
+    }
+
+    #[test]
+    fn mid_start_below_one_is_value_error() {
+        assert_eq!(
+            mid(&[vt("hi"), n(0.0), n(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            mid(&[vt("hi"), n(-1.0), n(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn find_case_sensitive() {
+        // FIND("ll", "hello") → 3.
+        assert_eq!(find(&[vt("ll"), vt("hello")]), n(3.0));
+        // Case sensitive: not found.
+        assert_eq!(
+            find(&[vt("LL"), vt("hello")]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn find_with_start_num() {
+        // "to_loop" positions (1-based): t=1 o=2 _=3 l=4 o=5 o=6 p=7.
+        // FIND("o", "to_loop", 4) — start at position 4 → finds at 5.
+        assert_eq!(find(&[vt("o"), vt("to_loop"), n(4.0)]), n(5.0));
+        // Start at 6 → finds at 6.
+        assert_eq!(find(&[vt("o"), vt("to_loop"), n(6.0)]), n(6.0));
+        // Start at 7 → no more 'o' → #VALUE!.
+        assert_eq!(
+            find(&[vt("o"), vt("to_loop"), n(7.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn find_empty_needle_matches_start() {
+        assert_eq!(find(&[vt(""), vt("hello")]), n(1.0));
+        assert_eq!(find(&[vt(""), vt("hello"), n(3.0)]), n(3.0));
+    }
+
+    #[test]
+    fn find_not_found_is_value_error() {
+        assert_eq!(
+            find(&[vt("x"), vt("hello")]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn search_case_insensitive() {
+        assert_eq!(search(&[vt("LL"), vt("hello")]), n(3.0));
+        assert_eq!(search(&[vt("Hello"), vt("HELLO")]), n(1.0));
+    }
+
+    #[test]
+    fn search_not_found() {
+        assert_eq!(
+            search(&[vt("zzz"), vt("hello")]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn substitute_replace_all() {
+        // Default: replace all "o" with "0".
+        assert_eq!(substitute(&[vt("foo"), vt("o"), vt("0")]), vt("f00"));
+    }
+
+    #[test]
+    fn substitute_nth_only() {
+        // Replace only the 2nd "o".
+        assert_eq!(
+            substitute(&[vt("foo"), vt("o"), vt("0"), n(2.0)]),
+            vt("fo0")
+        );
+    }
+
+    #[test]
+    fn substitute_empty_old_no_op() {
+        assert_eq!(substitute(&[vt("hello"), vt(""), vt("X")]), vt("hello"));
+    }
+
+    #[test]
+    fn substitute_target_instance_not_present_returns_text_unchanged() {
+        // Only 2 "o"s in "foo"; asking for instance 5 → return as-is.
+        assert_eq!(
+            substitute(&[vt("foo"), vt("o"), vt("0"), n(5.0)]),
+            vt("foo")
+        );
+    }
+
+    #[test]
+    fn replace_basic() {
+        // REPLACE("abcdef", 2, 3, "XYZ") → "aXYZef" (replaces 3 chars
+        // starting at position 2: 'bcd' → 'XYZ').
+        assert_eq!(
+            replace_fn(&[vt("abcdef"), n(2.0), n(3.0), vt("XYZ")]),
+            vt("aXYZef")
+        );
+    }
+
+    #[test]
+    fn replace_insert_at_end() {
+        // start past end + num_chars=0 → pure append.
+        assert_eq!(
+            replace_fn(&[vt("abc"), n(4.0), n(0.0), vt("DEF")]),
+            vt("abcDEF")
+        );
+    }
+
+    #[test]
+    fn replace_start_below_one_is_value_error() {
+        assert_eq!(
+            replace_fn(&[vt("abc"), n(0.0), n(1.0), vt("X")]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn concatenate_basic() {
+        assert_eq!(
+            concatenate(&[vt("hello"), vt(" "), vt("world")]),
+            vt("hello world")
+        );
+    }
+
+    #[test]
+    fn concatenate_coerces_numbers() {
+        assert_eq!(concatenate(&[vt("v="), n(42.0)]), vt("v=42"));
+    }
+
+    #[test]
+    fn concatenate_propagates_errors() {
+        assert_eq!(
+            concatenate(&[vt("x"), Value::Error(ErrorValue::Num)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn concatenate_empty_args_is_value_error() {
+        assert_eq!(concatenate(&[]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn rept_basic() {
+        assert_eq!(rept(&[vt("ab"), n(3.0)]), vt("ababab"));
+        assert_eq!(rept(&[vt("x"), n(0.0)]), vt(""));
+    }
+
+    #[test]
+    fn rept_negative_count_is_value_error() {
+        assert_eq!(rept(&[vt("a"), n(-1.0)]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn rept_excessive_length_is_value_error() {
+        // text="x"(1 char), num_times=33000 → 33000 chars > 32767.
+        assert_eq!(
+            rept(&[vt("x"), n(33000.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn exact_case_sensitive() {
+        assert_eq!(exact(&[vt("Hello"), vt("Hello")]), Value::Boolean(true));
+        assert_eq!(exact(&[vt("Hello"), vt("hello")]), Value::Boolean(false));
+        assert_eq!(exact(&[vt(""), vt("")]), Value::Boolean(true));
+    }
+
+    #[test]
+    fn exact_number_coercion() {
+        // Numbers coerce to text first, then case-sensitive compare.
+        assert_eq!(exact(&[n(5.0), vt("5")]), Value::Boolean(true));
     }
 }

@@ -1,7 +1,7 @@
 # Known engine gaps — checklist with target phases
 
 **Status:** Living document, updated at each phase boundary  
-**Date last touched:** 2026-05-13 (Engine Phase 4.3 V2 — W5-55: AVERAGEIF/SUMIFS/COUNTIFS/AVERAGEIFS/SUMPRODUCT shipped)  
+**Date last touched:** 2026-05-13 (Engine Phase 4.3 V2 — W5-56: text wave 2 shipped — LEFT/RIGHT/MID/FIND/SEARCH/SUBSTITUTE/REPLACE/CONCATENATE/REPT/EXACT)  
 **Companion:** `docs/MASTER-PLAN.md`
 
 Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a gap is closed, move its row to the "Closed" section at the bottom and reference the closing commit.

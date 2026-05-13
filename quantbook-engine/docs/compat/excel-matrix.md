@@ -141,18 +141,21 @@ as partial, rows with `❌` are missing.
 | Function | Status | Tests | Phase | Notes |
 |---|---|---|---|---|
 | LEN | ✅ | 3 | 4.3 V1 | **DIVERGES from Excel for emoji ZWJ sequences.** Rust counts Unicode scalar values (`.chars().count()`); Excel counts UTF-16 code units (`LENB`-like for non-BMP). For ASCII / BMP-plane text, both match. ZWJ family emoji like `👨‍👩‍👧`: Quantbook = 5, Excel = 8. Pin Phase 4.9. |
-| LEFT / RIGHT / MID | ❌ | 0 | 4.3 | |
+| LEFT / RIGHT / MID | ⚠️ | 9 | 4.3 V2 | W5-56: 1-based positions; UTF-8 char-count (UTF-16 canon deferred to 4.9, same divergence class as LEN). Negative num_chars → #VALUE!; MID start < 1 → #VALUE!. |
 | UPPER | ⚠️ | 2 | 4.3 V1 | Rust's Unicode-default mapping. **DIVERGES from Excel for German ß** (Quantbook = `SS`, Excel = `ß`) and any other locale-sensitive mapping (Turkish I, Greek final sigma). For ASCII-only text both match. Pin Phase 4.9 (locale-aware case). |
 | LOWER | ⚠️ | 1 | 4.3 V1 | Rust Unicode-default. Same divergence class as UPPER. Pin Phase 4.9. |
 | PROPER | ❌ | 0 | 4.3 | Title-case |
 | TRIM | ✅ | 1 | 4.3 V1 | Strip + collapse internal space runs |
 | CLEAN | ❌ | 0 | 4.3 | Strip non-printable ASCII |
-| CONCAT / CONCATENATE | ❌ | 0 | 4.3 | The `&` operator works; functions defer |
+| CONCATENATE | ⚠️ | 4 | 4.3 V2 | W5-56: variadic scalar args, no range support (Excel CONCATENATE is the legacy non-range version). Errors propagate. CONCAT (range-aware variant) deferred to next batch. |
+| CONCAT | ❌ | 0 | 4.10 | Range-aware variant of CONCATENATE — deferred to wave 2 (needs RangeAwareFn flatten). |
 | TEXTJOIN | ❌ | 0 | 4.3 | |
-| FIND / SEARCH | ❌ | 0 | 4.3 | Case-sensitive vs not |
-| SUBSTITUTE / REPLACE | ❌ | 0 | 4.3 | |
-| REPT | ❌ | 0 | 4.3 | |
-| EXACT | ❌ | 0 | 4.3 | |
+| FIND | ⚠️ | 5 | 4.3 V2 | W5-56: case-SENSITIVE substring search; 1-based result; not found → #VALUE!. Optional start_num. Empty needle returns start_num. No wildcards (FIND never supports wildcards in Excel anyway). |
+| SEARCH | ⚠️ | 2 | 4.3 V2 | W5-56: case-INSENSITIVE substring search. **Wildcards `?` / `*` deferred** (treated as literal characters in V1; documented). Same start_num + not-found semantics as FIND. |
+| SUBSTITUTE | ⚠️ | 4 | 4.3 V2 | W5-56: case-sensitive find-and-replace. Optional instance_num replaces only the Nth occurrence (1-based). Empty old_text is a no-op (Excel canon). |
+| REPLACE | ⚠️ | 3 | 4.3 V2 | W5-56: position-based replace. 1-based start_num; num_chars 0 = pure insert; start past end appends. Out-of-bounds args clamp gracefully. |
+| REPT | ⚠️ | 3 | 4.3 V2 | W5-56: text repeat. Excel canonical 32,767-character cap enforced (returns #VALUE! when exceeded). Negative num_times → #VALUE!. |
+| EXACT | ✅ | 2 | 4.3 V2 | W5-56: case-sensitive equality. Numbers coerce to text before compare. |
 | TEXT | ❌ | 0 | 4.5 | Needs format parser |
 | VALUE / NUMBERVALUE | ❌ | 0 | 4.3 | Text → number coercion as function |
 | FIXED / DOLLAR | ❌ | 0 | 4.5 | |

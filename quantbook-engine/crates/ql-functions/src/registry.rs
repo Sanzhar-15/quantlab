@@ -195,6 +195,21 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("ISNA", scalar_fns::isna);
     r.register("ISERR", scalar_fns::iserr);
 
+    // Engine Phase 4.3 V2 batch #5 — text functions wave 2 (W5-56).
+    // All scalar (existing ScalarFn contract). 1-based indices for
+    // FIND/SEARCH/MID/REPLACE; UTF-8 char-count semantics (UTF-16
+    // canon deferred to Phase 4.9).
+    r.register("LEFT", scalar_fns::left);
+    r.register("RIGHT", scalar_fns::right);
+    r.register("MID", scalar_fns::mid);
+    r.register("FIND", scalar_fns::find);
+    r.register("SEARCH", scalar_fns::search);
+    r.register("SUBSTITUTE", scalar_fns::substitute);
+    r.register("REPLACE", scalar_fns::replace_fn);
+    r.register("CONCATENATE", scalar_fns::concatenate);
+    r.register("REPT", scalar_fns::rept);
+    r.register("EXACT", scalar_fns::exact);
+
     // Engine Phase 4.3 V2 batch #1 (W5-51, 2026-05-13): trigonometry.
     // All scalar, single-arg except ATAN2 (two args). Inputs/outputs
     // in radians; pair with DEGREES/RADIANS for degree-mode math.
@@ -274,8 +289,10 @@ mod tests {
         // lookup family (W5-54: MATCH, INDEX, VLOOKUP, HLOOKUP,
         // CHOOSE = 5) + Phase 4.3 V2 conditional-aggregate
         // completion (W5-55: AVERAGEIF, SUMIFS, COUNTIFS, AVERAGEIFS,
-        // SUMPRODUCT = 5).
-        assert_eq!(r.len(), 71);
+        // SUMPRODUCT = 5) + Phase 4.3 V2 text wave 2 (W5-56: LEFT,
+        // RIGHT, MID, FIND, SEARCH, SUBSTITUTE, REPLACE, CONCATENATE,
+        // REPT, EXACT = 10).
+        assert_eq!(r.len(), 81);
     }
 
     #[test]
