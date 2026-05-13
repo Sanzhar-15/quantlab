@@ -1019,6 +1019,229 @@ pub fn sumproduct(args: &[FnArg]) -> Value {
     }
 }
 
+// ===== W5-58: Stats family (LARGE / SMALL / RANK / MEDIAN / MODE) =====
+//
+// Order-statistic and frequency functions over a range or variadic
+// numeric args. All accept any mix of `Range` and `Scalar` arg
+// shapes — values are flattened via `collect_numbers_strict`.
+//
+// Excel-canon edge cases:
+// - Text/Blank handling: matches the existing scalar-fns SUM /
+//   AVERAGE — Blank is skipped, Text is rejected as #VALUE!.
+//   (Excel's behavior for Text in a range arg differs from a
+//   scalar arg; we use the strict rule throughout for consistency
+//   with the rest of the function library.)
+// - Empty after coercion → #NUM!.
+// - LARGE / SMALL: k < 1 or k > count → #NUM!.
+// - MEDIAN: even count → average of the two middle values.
+// - MODE: returns the most-frequent value; tie-broken by first
+//   appearance. If no value repeats → #N/A.
+
+/// Helper: flatten all numeric values from a list of FnArgs.
+/// Scalar and Range both contribute their values. Blank skipped;
+/// Text → #VALUE!; Error propagates. Booleans coerce 0/1.
+fn collect_numbers_strict(args: &[FnArg]) -> Result<Vec<f64>, ErrorValue> {
+    let mut out = Vec::new();
+    for arg in args {
+        match arg {
+            FnArg::Scalar(v) => match coerce_numeric(v) {
+                NumericArg::Number(n) => out.push(n),
+                NumericArg::Skip => {}
+                NumericArg::Error(e) => return Err(e),
+            },
+            FnArg::Range { values, .. } => {
+                for v in values {
+                    match coerce_numeric(v) {
+                        NumericArg::Number(n) => out.push(n),
+                        NumericArg::Skip => {}
+                        NumericArg::Error(e) => return Err(e),
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `LARGE(array, k)` — k-th largest value in `array`. 1-based k.
+/// k < 1 or k > count → `#NUM!`. Empty array → `#NUM!`.
+pub fn large(args: &[FnArg]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let arr = match collect_numbers_strict(&args[..1]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let k = match &args[1] {
+        FnArg::Scalar(Value::Number(n)) => n.trunc() as i64,
+        FnArg::Scalar(Value::Boolean(b)) => i64::from(*b),
+        FnArg::Scalar(Value::Blank) => 0,
+        FnArg::Scalar(Value::Error(e)) => return Value::Error(*e),
+        _ => return Value::Error(ErrorValue::Value),
+    };
+    if arr.is_empty() || k < 1 || (k as usize) > arr.len() {
+        return Value::Error(ErrorValue::Num);
+    }
+    let mut sorted = arr;
+    // Descending so index k-1 is the k-th largest.
+    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    Value::Number(sorted[(k - 1) as usize])
+}
+
+/// `SMALL(array, k)` — k-th smallest. Same constraints as LARGE.
+pub fn small(args: &[FnArg]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let arr = match collect_numbers_strict(&args[..1]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let k = match &args[1] {
+        FnArg::Scalar(Value::Number(n)) => n.trunc() as i64,
+        FnArg::Scalar(Value::Boolean(b)) => i64::from(*b),
+        FnArg::Scalar(Value::Blank) => 0,
+        FnArg::Scalar(Value::Error(e)) => return Value::Error(*e),
+        _ => return Value::Error(ErrorValue::Value),
+    };
+    if arr.is_empty() || k < 1 || (k as usize) > arr.len() {
+        return Value::Error(ErrorValue::Num);
+    }
+    let mut sorted = arr;
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Value::Number(sorted[(k - 1) as usize])
+}
+
+/// `RANK(value, ref, [order])` — 1-based rank of `value` within
+/// `ref`. order = 0 or omitted = descending (largest = rank 1);
+/// order != 0 = ascending. Ties get the same rank (Excel's RANK.EQ
+/// behavior — the older RANK function is identical in V1 since we
+/// don't ship RANK.AVG separately). value not in ref → `#N/A`.
+pub fn rank(args: &[FnArg]) -> Value {
+    if args.len() < 2 || args.len() > 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let target = match &args[0] {
+        FnArg::Scalar(Value::Number(n)) => *n,
+        FnArg::Scalar(Value::Boolean(b)) => {
+            if *b {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        FnArg::Scalar(Value::Blank) => 0.0,
+        FnArg::Scalar(Value::Error(e)) => return Value::Error(*e),
+        _ => return Value::Error(ErrorValue::Value),
+    };
+    let arr = match collect_numbers_strict(&args[1..2]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if arr.is_empty() {
+        return Value::Error(ErrorValue::NA);
+    }
+    let order = if args.len() == 3 {
+        match &args[2] {
+            FnArg::Scalar(Value::Number(n)) => *n != 0.0,
+            FnArg::Scalar(Value::Boolean(b)) => *b,
+            FnArg::Scalar(Value::Blank) => false,
+            FnArg::Scalar(Value::Error(e)) => return Value::Error(*e),
+            _ => return Value::Error(ErrorValue::Value),
+        }
+    } else {
+        false
+    };
+    // Check `value` is in `ref`.
+    if !arr.contains(&target) {
+        return Value::Error(ErrorValue::NA);
+    }
+    // Rank: count of values strictly better than `value`, then +1.
+    // Ties get the same rank (smallest in the tie group).
+    let better = if order {
+        // Ascending — rank 1 is the SMALLEST. Better = strictly less.
+        arr.iter().filter(|x| **x < target).count()
+    } else {
+        // Descending — rank 1 is the LARGEST. Better = strictly greater.
+        arr.iter().filter(|x| **x > target).count()
+    };
+    Value::Number((better + 1) as f64)
+}
+
+/// `MEDIAN(num1, num2, ...)` — median of the flattened numeric
+/// values. Even count → average of the two middle. Empty → `#NUM!`.
+pub fn median(args: &[FnArg]) -> Value {
+    if args.is_empty() {
+        return Value::Error(ErrorValue::Value);
+    }
+    let mut nums = match collect_numbers_strict(args) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if nums.is_empty() {
+        return Value::Error(ErrorValue::Num);
+    }
+    nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let len = nums.len();
+    let result = if len % 2 == 1 {
+        nums[len / 2]
+    } else {
+        (nums[len / 2 - 1] + nums[len / 2]) / 2.0
+    };
+    match coercion::sanitize_f64(result) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `MODE(num1, num2, ...)` — most frequent value. Tie-broken by
+/// first appearance. Returns `#N/A` if no value repeats. Empty →
+/// `#NUM!`. (Modern Excel name: `MODE.SNGL` — registered as an
+/// alias.)
+pub fn mode(args: &[FnArg]) -> Value {
+    if args.is_empty() {
+        return Value::Error(ErrorValue::Value);
+    }
+    let nums = match collect_numbers_strict(args) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if nums.is_empty() {
+        return Value::Error(ErrorValue::Num);
+    }
+    // Count frequencies. Bit-pattern key — sanitize_f64 already
+    // filtered NaN/Inf from upstream coercion, so this is safe.
+    use std::collections::HashMap;
+    let mut counts: HashMap<u64, (u32, usize)> = HashMap::new();
+    for (i, &v) in nums.iter().enumerate() {
+        let bits = v.to_bits();
+        counts
+            .entry(bits)
+            .and_modify(|(c, _)| *c += 1)
+            .or_insert((1, i));
+    }
+    // Pick max count; tie-break by smallest first_index.
+    let mut best: Option<(u64, u32, usize)> = None;
+    for (bits, (count, first_idx)) in &counts {
+        if *count < 2 {
+            continue;
+        }
+        match best {
+            None => best = Some((*bits, *count, *first_idx)),
+            Some((_, bc, bi)) => {
+                if *count > bc || (*count == bc && *first_idx < bi) {
+                    best = Some((*bits, *count, *first_idx));
+                }
+            }
+        }
+    }
+    match best {
+        Some((bits, _, _)) => Value::Number(f64::from_bits(bits)),
+        None => Value::Error(ErrorValue::NA),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1800,5 +2023,189 @@ mod tests {
     #[test]
     fn sumproduct_empty_args_is_value_error() {
         assert_eq!(sumproduct(&[]), Value::Error(ErrorValue::Value));
+    }
+
+    // ===== W5-58: Stats family =====
+
+    // --- LARGE / SMALL ---
+
+    #[test]
+    fn large_returns_kth_largest() {
+        let arr = r(vec![n(3.0), n(1.0), n(4.0), n(1.0), n(5.0), n(9.0)]);
+        assert_eq!(large(&[arr, s(n(1.0))]), n(9.0));
+        let arr = r(vec![n(3.0), n(1.0), n(4.0), n(1.0), n(5.0), n(9.0)]);
+        assert_eq!(large(&[arr, s(n(2.0))]), n(5.0));
+        let arr = r(vec![n(3.0), n(1.0), n(4.0), n(1.0), n(5.0), n(9.0)]);
+        assert_eq!(large(&[arr, s(n(6.0))]), n(1.0));
+    }
+
+    #[test]
+    fn large_k_out_of_range_is_num() {
+        let arr = r(vec![n(1.0), n(2.0)]);
+        assert_eq!(large(&[arr, s(n(5.0))]), Value::Error(ErrorValue::Num));
+        let arr = r(vec![n(1.0), n(2.0)]);
+        assert_eq!(large(&[arr, s(n(0.0))]), Value::Error(ErrorValue::Num));
+        let arr = r(vec![n(1.0), n(2.0)]);
+        assert_eq!(large(&[arr, s(n(-1.0))]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn large_empty_range_is_num() {
+        assert_eq!(
+            large(&[r(vec![]), s(n(1.0))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn small_returns_kth_smallest() {
+        let arr = r(vec![n(3.0), n(1.0), n(4.0), n(1.0), n(5.0), n(9.0)]);
+        assert_eq!(small(&[arr, s(n(1.0))]), n(1.0));
+        let arr = r(vec![n(3.0), n(1.0), n(4.0), n(1.0), n(5.0), n(9.0)]);
+        assert_eq!(small(&[arr, s(n(3.0))]), n(3.0));
+    }
+
+    #[test]
+    fn small_k_out_of_range_is_num() {
+        let arr = r(vec![n(1.0)]);
+        assert_eq!(small(&[arr, s(n(5.0))]), Value::Error(ErrorValue::Num));
+    }
+
+    // --- RANK ---
+
+    #[test]
+    fn rank_descending_default() {
+        // Default order: largest = rank 1.
+        let arr = r(vec![n(10.0), n(20.0), n(30.0), n(40.0)]);
+        // 30 is the 2nd-largest (after 40) → rank 2.
+        assert_eq!(rank(&[s(n(30.0)), arr]), n(2.0));
+    }
+
+    #[test]
+    fn rank_ascending_with_order() {
+        let arr = r(vec![n(10.0), n(20.0), n(30.0), n(40.0)]);
+        // Ascending: 30 is the 3rd-smallest → rank 3.
+        assert_eq!(rank(&[s(n(30.0)), arr, s(n(1.0))]), n(3.0));
+    }
+
+    #[test]
+    fn rank_ties_get_same_rank() {
+        let arr = r(vec![n(10.0), n(20.0), n(20.0), n(30.0)]);
+        // Descending: 30 = rank 1; both 20s = rank 2; 10 = rank 4.
+        assert_eq!(rank(&[s(n(20.0)), arr]), n(2.0));
+        let arr = r(vec![n(10.0), n(20.0), n(20.0), n(30.0)]);
+        assert_eq!(rank(&[s(n(10.0)), arr]), n(4.0));
+    }
+
+    #[test]
+    fn rank_value_not_in_ref_is_na() {
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(rank(&[s(n(99.0)), arr]), Value::Error(ErrorValue::NA));
+    }
+
+    #[test]
+    fn rank_empty_ref_is_na() {
+        assert_eq!(rank(&[s(n(1.0)), r(vec![])]), Value::Error(ErrorValue::NA));
+    }
+
+    // --- MEDIAN ---
+
+    #[test]
+    fn median_odd_count() {
+        // [1, 2, 3, 4, 5] → 3.
+        assert_eq!(
+            median(&[r(vec![n(1.0), n(2.0), n(3.0), n(4.0), n(5.0)])]),
+            n(3.0)
+        );
+    }
+
+    #[test]
+    fn median_even_count_averages() {
+        // [1, 2, 3, 4] → (2+3)/2 = 2.5.
+        assert_eq!(median(&[r(vec![n(1.0), n(2.0), n(3.0), n(4.0)])]), n(2.5));
+    }
+
+    #[test]
+    fn median_mixed_scalar_and_range() {
+        // SCALARS contribute; RANGE contributes.
+        assert_eq!(
+            median(&[s(n(1.0)), r(vec![n(2.0), n(3.0)]), s(n(4.0)), s(n(5.0))]),
+            n(3.0)
+        );
+    }
+
+    #[test]
+    fn median_unsorted_input() {
+        // Input order shouldn't matter.
+        assert_eq!(
+            median(&[r(vec![n(5.0), n(1.0), n(3.0), n(2.0), n(4.0)])]),
+            n(3.0)
+        );
+    }
+
+    #[test]
+    fn median_empty_is_num() {
+        assert_eq!(median(&[r(vec![])]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn median_arity_zero_is_value_error() {
+        assert_eq!(median(&[]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn median_text_in_range_propagates_value() {
+        // Matches existing SUM/AVERAGE strict-text behavior.
+        let arr = r(vec![n(1.0), t("hello"), n(3.0)]);
+        assert_eq!(median(&[arr]), Value::Error(ErrorValue::Value));
+    }
+
+    // --- MODE ---
+
+    #[test]
+    fn mode_basic() {
+        // [1, 2, 2, 3] → 2 (most frequent).
+        assert_eq!(mode(&[r(vec![n(1.0), n(2.0), n(2.0), n(3.0)])]), n(2.0));
+    }
+
+    #[test]
+    fn mode_tie_picks_first_appearance() {
+        // [5, 3, 5, 3] → both 5 and 3 appear twice; first-appearance
+        // tie-breaks to 5.
+        assert_eq!(mode(&[r(vec![n(5.0), n(3.0), n(5.0), n(3.0)])]), n(5.0));
+    }
+
+    #[test]
+    fn mode_no_repeat_is_na() {
+        // [1, 2, 3] — nothing repeats → #N/A.
+        assert_eq!(
+            mode(&[r(vec![n(1.0), n(2.0), n(3.0)])]),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn mode_empty_is_num() {
+        assert_eq!(mode(&[r(vec![])]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn mode_mixed_scalar_and_range() {
+        // SCALARS count too.
+        assert_eq!(
+            mode(&[s(n(7.0)), r(vec![n(1.0), n(7.0)]), s(n(2.0))]),
+            n(7.0)
+        );
+    }
+
+    #[test]
+    fn mode_floats_exact_equality() {
+        // Float bits used for hashing — 1.0 vs 1.0000000000000002
+        // are distinct → no repeat → #N/A.
+        let near_one = 1.0_f64 + f64::EPSILON;
+        assert_eq!(
+            mode(&[r(vec![n(1.0), n(near_one)])]),
+            Value::Error(ErrorValue::NA)
+        );
     }
 }

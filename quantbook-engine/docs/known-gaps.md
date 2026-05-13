@@ -1,7 +1,7 @@
 # Known engine gaps — checklist with target phases
 
 **Status:** Living document, updated at each phase boundary  
-**Date last touched:** 2026-05-13 (Engine Phase 4.3 V2 — W5-57: math completion + hyperbolic trig — CEILING/FLOOR/MROUND/ODD/EVEN/QUOTIENT/GCD/LCM + SINH/COSH/TANH/ASINH/ACOSH/ATANH)  
+**Date last touched:** 2026-05-13 (Engine Phase 4.3 V2 — W5-58: **FN4-01 CLOSED at 102 registry entries** — stats family shipped (LARGE/SMALL/RANK/MEDIAN/MODE))  
 **Companion:** `docs/MASTER-PLAN.md`
 
 Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a gap is closed, move its row to the "Closed" section at the bottom and reference the closing commit.

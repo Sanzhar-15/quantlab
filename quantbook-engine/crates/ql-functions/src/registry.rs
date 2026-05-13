@@ -279,6 +279,18 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_range_aware("AVERAGEIFS", range_fns::averageifs);
     r.register_range_aware("SUMPRODUCT", range_fns::sumproduct);
 
+    // Engine Phase 4.3 V2 batch #7 — stats family (W5-58).
+    // Closes FN4-01 (100 functions). LARGE/SMALL are k-th order;
+    // RANK is 1-based with tie semantics; MEDIAN handles even-count
+    // averaging; MODE first-appearance tie-break + #N/A if no repeat.
+    r.register_range_aware("LARGE", range_fns::large);
+    r.register_range_aware("SMALL", range_fns::small);
+    r.register_range_aware("RANK", range_fns::rank);
+    r.register_range_aware("RANK.EQ", range_fns::rank); // Modern Excel alias
+    r.register_range_aware("MEDIAN", range_fns::median);
+    r.register_range_aware("MODE", range_fns::mode);
+    r.register_range_aware("MODE.SNGL", range_fns::mode); // Modern Excel alias
+
     r
 }
 
@@ -312,8 +324,10 @@ mod tests {
         // REPT, EXACT = 10) + Phase 4.3 V2 math completion +
         // hyperbolic trig (W5-57: CEILING, FLOOR, MROUND, ODD,
         // EVEN, QUOTIENT, GCD, LCM, SINH, COSH, TANH, ASINH,
-        // ACOSH, ATANH = 14).
-        assert_eq!(r.len(), 95);
+        // ACOSH, ATANH = 14) + Phase 4.3 V2 stats family (W5-58:
+        // LARGE, SMALL, RANK, RANK.EQ alias, MEDIAN, MODE,
+        // MODE.SNGL alias = 7).
+        assert_eq!(r.len(), 102);
     }
 
     #[test]

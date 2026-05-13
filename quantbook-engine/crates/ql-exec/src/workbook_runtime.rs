@@ -2552,6 +2552,13 @@ mod tests {
             "COUNTIFS",
             "AVERAGEIFS",
             "SUMPRODUCT",
+            "LARGE",
+            "SMALL",
+            "RANK",
+            "RANK.EQ",
+            "MEDIAN",
+            "MODE",
+            "MODE.SNGL",
         ] {
             assert!(
                 reg.lookup_range_aware(name).is_some(),

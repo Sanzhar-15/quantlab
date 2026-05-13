@@ -217,6 +217,14 @@ pub(crate) fn is_aggregate_function(name: &str) -> bool {
             | "COUNTIFS"
             | "AVERAGEIFS"
             | "SUMPRODUCT"
+            // Range-aware stats family (W5-58, FN4-01 closure).
+            | "LARGE"
+            | "SMALL"
+            | "RANK"
+            | "RANK.EQ"
+            | "MEDIAN"
+            | "MODE"
+            | "MODE.SNGL"
     )
 }
 

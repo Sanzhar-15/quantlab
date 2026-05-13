@@ -71,10 +71,12 @@ as partial, rows with `❌` are missing.
 | AVERAGEIF | ⚠️ | 6 | 4.3 V2 | W5-55: same predicate suite as SUMIF; #DIV/0! on no matches; optional separate average_range. |
 | AVERAGEIFS | ⚠️ | 2 | 4.3 V2 | W5-55: multi-condition AND average; #DIV/0! on no matches. |
 | MINIFS / MAXIFS | ❌ | 0 | 4.3 | Multi-condition min/max |
-| MEDIAN | ❌ | 0 | 4.3 | Removed from `is_aggregate_function` Phase 2B.7 audit M1 |
-| MODE / MODE.SNGL / MODE.MULT | ❌ | 0 | 4.3 | |
-| LARGE / SMALL | ❌ | 0 | 4.3 | k-th largest/smallest |
-| RANK / RANK.AVG / RANK.EQ | ❌ | 0 | 4.3 | |
+| MEDIAN | ✅ | 6 | 4.3 V2 | W5-58: even-count averages two middles; mixed scalar/range args supported; empty → #NUM!; text in range → #VALUE! (strict, matches SUM/AVERAGE). |
+| MODE / MODE.SNGL | ✅ | 5 | 4.3 V2 | W5-58: most frequent value; first-appearance tie-break; no repeats → #N/A; empty → #NUM!. Float bit-pattern equality (exact, no epsilon). MODE.SNGL is a registry alias of MODE. |
+| MODE.MULT | ❌ | 0 | 4.7 | Returns array of multiple modes — needs dynamic-array spill. |
+| LARGE / SMALL | ✅ | 5 | 4.3 V2 | W5-58: 1-based k-th order statistic; k out of [1, count] → #NUM!; empty → #NUM!. |
+| RANK / RANK.EQ | ✅ | 5 | 4.3 V2 | W5-58: 1-based rank in `ref`. order = 0/omitted = descending (largest = 1); != 0 = ascending. Ties get same rank (Excel RANK.EQ semantics). Value not in `ref` → #N/A. RANK.EQ is a registry alias of RANK. |
+| RANK.AVG | ❌ | 0 | 4.10 | Average rank for ties (different from RANK.EQ). |
 | PERCENTILE / PERCENTILE.INC / PERCENTILE.EXC | ❌ | 0 | 4.10 | |
 | QUARTILE / QUARTILE.INC / QUARTILE.EXC | ❌ | 0 | 4.10 | |
 | CORREL / COVARIANCE.P / COVARIANCE.S | ❌ | 0 | 4.10 | |
