@@ -69,12 +69,15 @@ pub fn eval_scalar<E: CellEnv>(plan: &ExprPlan, env: &E) -> Value {
             eval_unary(*op, v)
         }
         ExprPlan::Function { .. } => Value::Error(ErrorValue::Name),
-        // Phase 2B.4 (2026-05-12): the bind shape exists but aggregate-range
-        // evaluation lands in Engine Phase 3.6. Surface a clean Excel-canon
-        // `#CALC!` so the cell shows a recognizable error sigil rather than
-        // silently producing wrong values. The enclosing aggregate function
-        // (SUM, AVERAGE, ...) sees the error and propagates per
-        // Excel's left-error-wins rule.
+        // **Legacy no-registry path only.** Phase 3.6 / W5-39 added
+        // real aggregate-over-named-range evaluation, but ONLY in
+        // `eval_scalar_with_cache` (the cache-enabled entry point).
+        // This older `eval_scalar` function is kept for tests + the
+        // SIMD per-cell fallback path; it has no registry handle
+        // and intentionally surfaces `#CALC!` for any aggregate-
+        // named-range reference. Callers that want actual aggregate
+        // semantics must go through `eval_scalar_with_registry` or
+        // `eval_scalar_with_cache`.
         ExprPlan::AggregateNameRef { .. } => Value::Error(ErrorValue::Calc),
     }
 }

@@ -157,10 +157,19 @@ enum BindContext {
 }
 
 /// Phase 2B.4 (2026-05-12): hardcoded list of functions whose arguments
-/// accept aggregate-range inputs. Tracked here as a V0 stub; Engine Phase
-/// 4.3 (function library expansion) replaces this with per-function
-/// metadata on `FunctionRegistry`. The names below MUST match the
-/// canonical uppercase form the parser emits.
+/// accept aggregate-range / named-range inputs. The function name is
+/// historical — this list is now better understood as "names for which
+/// the binder allows `AggregateNameRef` in arg positions"; both scalar
+/// aggregates (SUM, AVERAGE) AND range-aware functions (SUMIF, VLOOKUP,
+/// LARGE, ...) live here. The `is_aggregate_function_lists_only_registered_aggregates`
+/// test invariant pins the cross-table sync.
+///
+/// **Re-target:** the planned replacement with per-function metadata
+/// (`FunctionRegistry` attributes) is no longer Phase 4.3 work — Phase
+/// 4.3 wave 1 closed W5-58 with this matcher still in place. The right
+/// time to replace this is **Phase 4.7 (array formulas) or Phase 4.10
+/// (function library wave 2)**, whichever introduces richer per-
+/// function metadata first.
 ///
 /// Aggregate detection is binary in V0 (all args are aggregate or no args
 /// are). Per-arg-position decisions (e.g. IF's then/else accept arrays in

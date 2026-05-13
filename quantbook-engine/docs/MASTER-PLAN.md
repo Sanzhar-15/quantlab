@@ -1,8 +1,8 @@
 # Quantbook Engine Master Plan
 
-**Status:** Canonical engine-side plan, post-Phase 2A.3  
-**Date:** 2026-05-12  
-**Current HEAD:** `fc977815cd2`  
+**Status:** Canonical engine-side plan, Phase 4.3 V2 closure session 2026-05-13  
+**Date:** 2026-05-13 (last touched W5-58 — FN4-01 closure)  
+**Current HEAD:** `d6a6bcdcfc5` (W5-58 stats family, +finalization commits if landed)  
 **Scope:** engine-internal sequencing for all 24 workspace crates  
 **Authored:** Claude Opus 4.7 + Codex (co-thinking session, 2026-05-12)
 

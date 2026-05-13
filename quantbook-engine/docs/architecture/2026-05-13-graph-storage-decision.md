@@ -1,6 +1,6 @@
 # Graph storage architecture decision — GAP-G-01 + GAP-G-03
 
-**Status:** **DECISION MADE 2026-05-13 (W5-49).** Implementation queued for the next session(s). NOT shipped.
+**Status:** **DECISION MADE W5-49 → IMPLEMENTED W5-50 → AUDIT-CLOSED W5-52 → GAP-F-05 (function-dispatch signature) CLOSED W5-53.** Both GAP-G-01 (rebind staleness, including the W5-52 clear-formula path follow-up) and GAP-G-03 (range deps not scheduler edges) shipped. Earlier draft of this doc said "NOT shipped"; that wording was current 2026-05-13 morning and has been amended by the W5-52 closure section below. See `docs/audits/2026-05-13-engine-session-final-handoff.md` for the integrated session view.
 **Author:** Claude Opus 4.7 (W5-49) + Codex (gpt-5.5, independent read-only review).
 **Affects:** `crates/ql-calcgraph/` (Graph, StripeIndex, AdjacencyVectors, Tarjan scheduler) + `crates/ql-exec/src/calcgraph_session.rs` (extract_and_register_deps wiring).
 **Blocks:** Phase 4.3 V2 (SUMIF / COUNTIF / SUMIFS / AVERAGEIF / VLOOKUP / HLOOKUP / INDEX / MATCH / CHOOSE — the range-aware function batch).

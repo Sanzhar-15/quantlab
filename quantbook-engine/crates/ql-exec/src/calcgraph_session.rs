@@ -482,10 +482,15 @@ impl CalcgraphSession {
         // dep_node)` when the dep cell is ITSELF a formula cell. The
         // Tarjan scheduler walks `graph.outgoing(formula_node)` to
         // discover the dep set; without this edge it can't order a
-        // chain like `=A1`, `=B1=A1+1`, `=C1=B1+1` correctly. The
-        // edge is append-only per Phase 0 contract (re-bind leaves
-        // stale edges — filed as GAP-G-01; impact is performance,
-        // not correctness, because stale edges only add constraints).
+        // chain like `=A1`, `=B1=A1+1`, `=C1=B1+1` correctly.
+        //
+        // **W5-50 / W5-52 closure (GAP-G-01):** the original Phase 0
+        // append-only contract HAS been relaxed. Re-bind now revokes
+        // stale edges via `Graph::clear_outgoing` called from
+        // `extract_and_register_deps` entry (line 453) and from
+        // `on_clear_formula` (W5-52 audit closure). Stale-edge false
+        // `#CIRC!` cycles can no longer occur. See
+        // `docs/architecture/2026-05-13-graph-storage-decision.md`.
         for &(s, r, c) in &deps.cells {
             self.cell_to_formulas
                 .entry((s, r, c))

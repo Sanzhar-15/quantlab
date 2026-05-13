@@ -66,7 +66,7 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 
 | ID | Gap | Reproduce | Owner | Target phase |
 |---|---|---|---|---|
-| GAP-F-01 | 22 of ~260 v1 target functions implemented (8.4%) | `ql-functions/src/registry.rs::default_registry` count | Engine | Engine Phase 4.3 (wave 1, 100 fns) + 4.10 (wave 2, 260) |
+| GAP-F-01 | Function library coverage — **Wave 1 (100 target) ✅ CLOSED W5-58** at 102 registry entries (≈80 unique functions + 7 aliases). Full v1 target ~260 still pending Phase 4.10 wave 2. | `ql-functions/src/registry.rs::default_registry` count | Engine | Wave 1: ✅ done. Wave 2 (≈260): Engine Phase 4.10. |
 | GAP-F-02 | `IF` / `IFERROR` evaluate both branches eagerly (no lazy arg semantics) | `ql-functions/src/registry.rs` — no lazy arg support; megaudit M7 deferred | Engine | Engine Phase 4.3 |
 | GAP-F-03 | No Excel compatibility matrix (functions, coercions, errors, dates) | Doc absence | Engine | Engine Phase 4.2 (matrix harness) |
 | GAP-F-04 | No NIST `numacc4` extreme test fixture for Welford stats | `ql-functions/src/welford.rs` covers numacc3 only | Engine | Post-v1 stats hardening |
