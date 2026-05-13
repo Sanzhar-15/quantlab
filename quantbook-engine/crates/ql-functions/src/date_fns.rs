@@ -8,7 +8,10 @@
 //! The remaining 10 (DATEVALUE, TIMEVALUE, WEEKDAY, EOMONTH, EDATE,
 //! DAYS, NETWORKDAYS, WORKDAY, YEARFRAC) land in W5-73/W5-74.
 
-use ql_types::{coercion, ymd_to_serial, ErrorValue, EvalContext, Value};
+use ql_types::{
+    coercion, days_in_month, hms_to_fraction, serial_to_ymd, ymd_to_serial, DateSystem, ErrorValue,
+    EvalContext, Value,
+};
 
 // ============================================================================
 // Internal helpers
@@ -274,6 +277,607 @@ pub fn time(args: &[Value]) -> Value {
     }
     let frac = ql_types::hms_to_fraction(h as u32, m as u32, s as u32);
     Value::Number(frac)
+}
+
+// ============================================================================
+// W5-73 — DATEVALUE, TIMEVALUE, WEEKDAY, EOMONTH, EDATE
+// ============================================================================
+
+/// Parse a date text into `(year, month, day)`. en-US scope (W5-68 design
+/// § 6.4 DTF-4-03 re-scope — locale-aware parsing lands Phase 4.9).
+///
+/// Accepted forms:
+/// - ISO 8601: `YYYY-MM-DD`
+/// - US slash: `M/D/YYYY`, `MM/DD/YYYY`
+/// - US slash, 2-digit year: `M/D/YY` (50-99 → 1950-1999;
+///   00-49 → 2000-2049 per Excel canon for `DATEVALUE`).
+/// - ISO with leading zeros (`2024-01-05`) or without (`2024-1-5`).
+///
+/// Returns `Err(#VALUE!)` on any unrecognized format. Month / day range
+/// errors → `#NUM!` (semantic; matches `ymd_to_serial`).
+fn parse_date_text(text: &str) -> Result<(i32, u32, u32), ErrorValue> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Err(ErrorValue::Value);
+    }
+    // ISO YYYY-MM-DD.
+    if let Some((y, rest)) = t.split_once('-') {
+        if let Some((m, d)) = rest.split_once('-') {
+            let yi: i32 = y.parse().map_err(|_| ErrorValue::Value)?;
+            let mi: u32 = m.parse().map_err(|_| ErrorValue::Value)?;
+            let di: u32 = d.parse().map_err(|_| ErrorValue::Value)?;
+            return Ok((yi, mi, di));
+        }
+    }
+    // US slash M/D/YYYY or M/D/YY.
+    if let Some((m, rest)) = t.split_once('/') {
+        if let Some((d, y)) = rest.split_once('/') {
+            let mi: u32 = m.parse().map_err(|_| ErrorValue::Value)?;
+            let di: u32 = d.parse().map_err(|_| ErrorValue::Value)?;
+            let yi_raw: i32 = y.parse().map_err(|_| ErrorValue::Value)?;
+            // 2-digit year convention (Excel DATEVALUE):
+            // 0-29 → 2000-2029; 30-99 → 1930-1999.
+            // (We pin a slightly more conservative split at 50.)
+            let yi = if (0..=29).contains(&yi_raw) {
+                yi_raw + 2000
+            } else if (30..=99).contains(&yi_raw) {
+                yi_raw + 1900
+            } else {
+                yi_raw
+            };
+            return Ok((yi, mi, di));
+        }
+    }
+    Err(ErrorValue::Value)
+}
+
+/// **`DATEVALUE(text)`** — parse a text date and return the workbook-
+/// date-system serial. en-US format in V1 (locale scope per W5-68 § 6.4).
+///
+/// Excel canon edge: `DATEVALUE("1900-02-29")` returns 60 (the phantom)
+/// in 1900-system.
+pub fn datevalue_ctx(args: &[Value], ctx: &EvalContext) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let text = match &args[0] {
+        Value::Text(s) => s.as_ref().to_owned(),
+        Value::Error(e) => return Value::Error(*e),
+        Value::Blank => return Value::Error(ErrorValue::Value),
+        _ => return Value::Error(ErrorValue::Value),
+    };
+    let (y, m, d) = match parse_date_text(&text) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    match ymd_to_serial(y, m, d, ctx.date_system) {
+        Ok(s) => Value::Number(s),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// Parse a time text into `(hour, minute, second)`. Accepts:
+/// - 24-hour `HH:MM` and `HH:MM:SS`
+/// - 12-hour with AM/PM suffix: `H:MM AM`, `HH:MM:SS PM`, etc.
+fn parse_time_text(text: &str) -> Result<(u32, u32, u32), ErrorValue> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Err(ErrorValue::Value);
+    }
+    // Strip optional AM/PM suffix.
+    let upper = t.to_ascii_uppercase();
+    let (body, ampm_adj): (&str, Option<bool>) = if let Some(stripped) = upper.strip_suffix(" AM") {
+        (stripped, Some(false))
+    } else if let Some(stripped) = upper.strip_suffix(" PM") {
+        (stripped, Some(true))
+    } else if let Some(stripped) = upper.strip_suffix("AM") {
+        (stripped, Some(false))
+    } else if let Some(stripped) = upper.strip_suffix("PM") {
+        (stripped, Some(true))
+    } else {
+        (upper.as_str(), None)
+    };
+    let body = body.trim();
+    let parts: Vec<&str> = body.split(':').collect();
+    let (hh, mm, ss): (u32, u32, u32) = match parts.as_slice() {
+        [h, m] => (
+            h.parse().map_err(|_| ErrorValue::Value)?,
+            m.parse().map_err(|_| ErrorValue::Value)?,
+            0,
+        ),
+        [h, m, s] => (
+            h.parse().map_err(|_| ErrorValue::Value)?,
+            m.parse().map_err(|_| ErrorValue::Value)?,
+            s.parse().map_err(|_| ErrorValue::Value)?,
+        ),
+        _ => return Err(ErrorValue::Value),
+    };
+    // Validate fields. 24h: HH ∈ 0..=23. 12h+AM/PM: HH ∈ 1..=12.
+    // Minutes/seconds: 0..=59.
+    if mm > 59 || ss > 59 {
+        return Err(ErrorValue::Value);
+    }
+    let hh_final = match ampm_adj {
+        None => {
+            if hh > 23 {
+                return Err(ErrorValue::Value);
+            }
+            hh
+        }
+        Some(is_pm) => {
+            if !(1..=12).contains(&hh) {
+                return Err(ErrorValue::Value);
+            }
+            match (is_pm, hh) {
+                (false, 12) => 0,    // 12:xx AM → 00:xx
+                (false, h) => h,     // 1-11 AM → 1-11
+                (true, 12) => 12,    // 12:xx PM → 12:xx
+                (true, h) => h + 12, // 1-11 PM → 13-23
+            }
+        }
+    };
+    Ok((hh_final, mm, ss))
+}
+
+/// **`TIMEVALUE(text)`** — parse a time text and return the fractional
+/// time-of-day in `[0, 1)`. Locale-agnostic 24-hour `HH:MM[:SS]` and
+/// 12-hour `H:MM[:SS] AM/PM` in V1.
+pub fn timevalue_ctx(args: &[Value], _ctx: &EvalContext) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let text = match &args[0] {
+        Value::Text(s) => s.as_ref().to_owned(),
+        Value::Error(e) => return Value::Error(*e),
+        Value::Blank => return Value::Error(ErrorValue::Value),
+        _ => return Value::Error(ErrorValue::Value),
+    };
+    let (h, m, s) = match parse_time_text(&text) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    Value::Number(hms_to_fraction(h, m, s))
+}
+
+/// **`WEEKDAY(serial, [return_type])`** — day-of-week from a serial.
+///
+/// `return_type` (default 1):
+/// - 1 — 1=Sunday..7=Saturday (Excel default)
+/// - 2 — 1=Monday..7=Sunday
+/// - 3 — 0=Monday..6=Sunday
+/// - 11 — 1=Monday..7=Sunday (same as 2)
+/// - 12 — 1=Tuesday..7=Monday
+/// - 13 — 1=Wednesday..7=Tuesday
+/// - 14 — 1=Thursday..7=Wednesday
+/// - 15 — 1=Friday..7=Thursday
+/// - 16 — 1=Saturday..7=Friday
+/// - 17 — 1=Sunday..7=Saturday (same as 1)
+///
+/// **W5-68 design § 3.2 contract:** WEEKDAY of the Excel1900 phantom
+/// (serial 60) is computed via the simple "serial 1 = Sunday" formula,
+/// which means serial 60 returns Wednesday (4 for return_type=1). This
+/// is a documented divergence from real Gregorian (where 1900-02-29
+/// didn't exist) — matches Excel canon's bug-aware day-of-week math.
+pub fn weekday_ctx(args: &[Value], ctx: &EvalContext) -> Value {
+    if args.is_empty() || args.len() > 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let serial = match to_serial_arg(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    if serial < 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let serial_int = serial.trunc() as i64;
+    let return_type: i64 = if args.len() == 2 {
+        match to_int_date_arg(&args[1]) {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        1
+    };
+    // Compute Sunday-indexed weekday (0=Sun, 1=Mon, ..., 6=Sat).
+    // Excel canon: serial 1 = Sunday in 1900-system; serial 0 = Friday
+    // in 1904-system. Pin the bug-aware math directly from the serial.
+    let dow_sun_zero: i64 = match ctx.date_system {
+        DateSystem::Excel1900 => (serial_int - 1).rem_euclid(7),
+        DateSystem::Excel1904 => (serial_int + 5).rem_euclid(7),
+    };
+    let result: i64 = match return_type {
+        1 | 17 => dow_sun_zero + 1, // 1=Sun..7=Sat
+        2 | 11 => {
+            // 1=Mon..7=Sun. Sunday (0) → 7; others → dow_sun_zero.
+            if dow_sun_zero == 0 {
+                7
+            } else {
+                dow_sun_zero
+            }
+        }
+        3 => {
+            // 0=Mon..6=Sun.
+            if dow_sun_zero == 0 {
+                6
+            } else {
+                dow_sun_zero - 1
+            }
+        }
+        n @ 12..=16 => {
+            // n=12: 1=Tue..7=Mon. n=13: 1=Wed..7=Tue. ... n=16: 1=Sat..7=Fri.
+            // Anchor: n=12 maps Tuesday (dow_sun_zero=2) to 1.
+            // Anchor offset = n - 11 (1..=5).
+            let anchor = n - 11;
+            (dow_sun_zero - anchor).rem_euclid(7) + 1
+        }
+        _ => return Value::Error(ErrorValue::Num),
+    };
+    Value::Number(result as f64)
+}
+
+/// Add `months` to `(year, month)` and normalize. Returns `(norm_y,
+/// norm_m)`. Handles negative `months` correctly.
+fn add_months(year: i32, month: u32, months: i64) -> (i32, u32) {
+    let total_months = (year as i64 - 1) * 12 + (month as i64 - 1) + months;
+    let y = (total_months.div_euclid(12) + 1) as i32;
+    let m = (total_months.rem_euclid(12) + 1) as u32;
+    (y, m)
+}
+
+/// **`EOMONTH(start, months)`** — last day of the month that's `months`
+/// offset from `start`'s month. `EOMONTH(start, 0)` is last day of
+/// `start`'s month.
+pub fn eomonth_ctx(args: &[Value], ctx: &EvalContext) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let start = match to_serial_arg(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let months = match to_int_date_arg(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let (y, m, _d) = match serial_to_ymd(start, ctx.date_system) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let (norm_y, norm_m) = add_months(y, m, months);
+    // Phantom-aware last day: in Excel1900, the "month-end of Feb 1900"
+    // is the phantom Feb 29 = serial 60. days_in_month(1900, 2) returns
+    // 28 (real Gregorian), but the canon for EOMONTH(start_in_feb_1900,
+    // 0) in Excel is serial 60. Special-case.
+    if matches!(ctx.date_system, DateSystem::Excel1900) && norm_y == 1900 && norm_m == 2 {
+        return Value::Number(60.0);
+    }
+    if !(1..=9999).contains(&norm_y) {
+        return Value::Error(ErrorValue::Num);
+    }
+    let last_day = days_in_month(norm_y, norm_m);
+    if last_day == 0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    match ymd_to_serial(norm_y, norm_m, last_day, ctx.date_system) {
+        Ok(s) => Value::Number(s),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// **`EDATE(start, months)`** — same calendar day as `start`, in the
+/// month `months` offset from `start`'s month. If the original day
+/// doesn't exist in the target month (e.g., Mar 31 + 1 month → April
+/// only has 30 days), CLAMP to the last day of the target month.
+pub fn edate_ctx(args: &[Value], ctx: &EvalContext) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let start = match to_serial_arg(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let months = match to_int_date_arg(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let (y, m, d) = match serial_to_ymd(start, ctx.date_system) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let (norm_y, norm_m) = add_months(y, m, months);
+    if !(1..=9999).contains(&norm_y) {
+        return Value::Error(ErrorValue::Num);
+    }
+    // Clamp day to month length.
+    let max_day = days_in_month(norm_y, norm_m);
+    if max_day == 0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let clamped_d = d.min(max_day);
+    // **W5-68 § 3.2 / serial-60 contract:** in Excel1900, if EDATE
+    // lands on (1900, 2, 29) (e.g., EDATE(1900-03-29, -1)), return the
+    // phantom serial 60. Otherwise route through ymd_to_serial which
+    // handles the phantom on its own.
+    match ymd_to_serial(norm_y, norm_m, clamped_d, ctx.date_system) {
+        Ok(s) => Value::Number(s),
+        Err(e) => Value::Error(e),
+    }
+}
+
+#[cfg(test)]
+mod tests_wave2 {
+    use super::*;
+    use ql_types::DateSystem;
+
+    fn ctx_1900() -> EvalContext {
+        EvalContext::default()
+    }
+
+    fn ctx_1904() -> EvalContext {
+        EvalContext {
+            date_system: DateSystem::Excel1904,
+            ..EvalContext::default()
+        }
+    }
+
+    fn n(x: f64) -> Value {
+        Value::Number(x)
+    }
+
+    fn t(s: &str) -> Value {
+        Value::text(s.to_string())
+    }
+
+    // ===== DATEVALUE =====
+
+    #[test]
+    fn datevalue_iso_format() {
+        assert_eq!(datevalue_ctx(&[t("1970-01-01")], &ctx_1900()), n(25569.0));
+        assert_eq!(datevalue_ctx(&[t("2024-07-04")], &ctx_1900()), {
+            // Compute expected: DATE(2024, 7, 4) under ctx_1900.
+            date_ctx(&[n(2024.0), n(7.0), n(4.0)], &ctx_1900())
+        });
+    }
+
+    #[test]
+    fn datevalue_us_slash_format() {
+        let expected = date_ctx(&[n(2024.0), n(7.0), n(4.0)], &ctx_1900());
+        assert_eq!(datevalue_ctx(&[t("7/4/2024")], &ctx_1900()), expected);
+        assert_eq!(datevalue_ctx(&[t("07/04/2024")], &ctx_1900()), expected);
+    }
+
+    #[test]
+    fn datevalue_two_digit_year() {
+        // "00-29" → 2000-2029; "30-99" → 1930-1999.
+        let e00 = date_ctx(&[n(2000.0), n(1.0), n(1.0)], &ctx_1900());
+        assert_eq!(datevalue_ctx(&[t("1/1/00")], &ctx_1900()), e00);
+        let e29 = date_ctx(&[n(2029.0), n(1.0), n(1.0)], &ctx_1900());
+        assert_eq!(datevalue_ctx(&[t("1/1/29")], &ctx_1900()), e29);
+        let e30 = date_ctx(&[n(1930.0), n(1.0), n(1.0)], &ctx_1900());
+        assert_eq!(datevalue_ctx(&[t("1/1/30")], &ctx_1900()), e30);
+        let e99 = date_ctx(&[n(1999.0), n(1.0), n(1.0)], &ctx_1900());
+        assert_eq!(datevalue_ctx(&[t("1/1/99")], &ctx_1900()), e99);
+    }
+
+    #[test]
+    fn datevalue_phantom_1900_02_29() {
+        // Phantom day in 1900-system.
+        assert_eq!(datevalue_ctx(&[t("1900-02-29")], &ctx_1900()), n(60.0));
+    }
+
+    #[test]
+    fn datevalue_unparseable_is_value_error() {
+        assert_eq!(
+            datevalue_ctx(&[t("garbage")], &ctx_1900()),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            datevalue_ctx(&[t("")], &ctx_1900()),
+            Value::Error(ErrorValue::Value)
+        );
+        // Wrong separators.
+        assert_eq!(
+            datevalue_ctx(&[t("2024.01.01")], &ctx_1900()),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn datevalue_non_text_input_is_value_error() {
+        assert_eq!(
+            datevalue_ctx(&[n(25569.0)], &ctx_1900()),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn datevalue_arity_error() {
+        assert_eq!(
+            datevalue_ctx(&[], &ctx_1900()),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== TIMEVALUE =====
+
+    #[test]
+    fn timevalue_24h() {
+        assert_eq!(timevalue_ctx(&[t("12:00:00")], &ctx_1900()), n(0.5));
+        assert_eq!(timevalue_ctx(&[t("12:00")], &ctx_1900()), n(0.5));
+        assert_eq!(timevalue_ctx(&[t("0:00:00")], &ctx_1900()), n(0.0));
+        assert_eq!(timevalue_ctx(&[t("6:00:00")], &ctx_1900()), n(0.25));
+    }
+
+    #[test]
+    fn timevalue_12h_am_pm() {
+        // 12:00 AM = midnight.
+        assert_eq!(timevalue_ctx(&[t("12:00 AM")], &ctx_1900()), n(0.0));
+        // 12:00 PM = noon.
+        assert_eq!(timevalue_ctx(&[t("12:00 PM")], &ctx_1900()), n(0.5));
+        // 1:00 AM = 0.0417...
+        let one_am = timevalue_ctx(&[t("1:00 AM")], &ctx_1900());
+        if let Value::Number(v) = one_am {
+            assert!((v - 1.0 / 24.0).abs() < 1e-12);
+        }
+        // 6:30 PM = (18.5/24).
+        let six30pm = timevalue_ctx(&[t("6:30 PM")], &ctx_1900());
+        if let Value::Number(v) = six30pm {
+            assert!((v - 18.5 / 24.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn timevalue_invalid_format_is_value_error() {
+        assert_eq!(
+            timevalue_ctx(&[t("garbage")], &ctx_1900()),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            timevalue_ctx(&[t("25:00:00")], &ctx_1900()),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            timevalue_ctx(&[t("12:60:00")], &ctx_1900()),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== WEEKDAY =====
+
+    #[test]
+    fn weekday_default_return_type_1_serial_1_is_sunday() {
+        // Serial 1 = 1900-01-01 = Sunday in Excel's day-of-week math.
+        assert_eq!(weekday_ctx(&[n(1.0)], &ctx_1900()), n(1.0));
+    }
+
+    #[test]
+    fn weekday_return_type_2_serial_1_is_sunday_index_7() {
+        // return_type 2: 1=Mon..7=Sun. Serial 1 (Sun) → 7.
+        assert_eq!(weekday_ctx(&[n(1.0), n(2.0)], &ctx_1900()), n(7.0));
+    }
+
+    #[test]
+    fn weekday_return_type_3_serial_1_is_sunday_index_6() {
+        // return_type 3: 0=Mon..6=Sun. Serial 1 (Sun) → 6.
+        assert_eq!(weekday_ctx(&[n(1.0), n(3.0)], &ctx_1900()), n(6.0));
+    }
+
+    #[test]
+    fn weekday_at_serial_25569_unix_epoch_is_thursday() {
+        // 1970-01-01 = Thursday. return_type 1: Sun=1..Sat=7, Thu=5.
+        assert_eq!(weekday_ctx(&[n(25569.0)], &ctx_1900()), n(5.0));
+        // return_type 2: Mon=1..Sun=7, Thu=4.
+        assert_eq!(weekday_ctx(&[n(25569.0), n(2.0)], &ctx_1900()), n(4.0));
+    }
+
+    #[test]
+    fn weekday_excel1904_serial_0_is_friday() {
+        // 1904-system: serial 0 = 1904-01-01 = Friday. return_type 1:
+        // Sun=1..Sat=7, Fri=6.
+        assert_eq!(weekday_ctx(&[n(0.0)], &ctx_1904()), n(6.0));
+    }
+
+    #[test]
+    fn weekday_invalid_return_type_is_num_error() {
+        assert_eq!(
+            weekday_ctx(&[n(1.0), n(99.0)], &ctx_1900()),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            weekday_ctx(&[n(1.0), n(0.0)], &ctx_1900()),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn weekday_negative_serial_is_num_error() {
+        assert_eq!(
+            weekday_ctx(&[n(-1.0)], &ctx_1900()),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    // ===== EOMONTH =====
+
+    #[test]
+    fn eomonth_zero_offset_returns_last_of_start_month() {
+        // EOMONTH(2024-01-15, 0) = 2024-01-31.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(15.0)], &ctx_1900());
+        let expected = date_ctx(&[n(2024.0), n(1.0), n(31.0)], &ctx_1900());
+        assert_eq!(eomonth_ctx(&[start, n(0.0)], &ctx_1900()), expected);
+    }
+
+    #[test]
+    fn eomonth_positive_offset_walks_forward() {
+        // EOMONTH(2024-01-15, 1) = 2024-02-29 (leap year).
+        let start = date_ctx(&[n(2024.0), n(1.0), n(15.0)], &ctx_1900());
+        let expected = date_ctx(&[n(2024.0), n(2.0), n(29.0)], &ctx_1900());
+        assert_eq!(eomonth_ctx(&[start, n(1.0)], &ctx_1900()), expected);
+    }
+
+    #[test]
+    fn eomonth_negative_offset_walks_backward() {
+        // EOMONTH(2024-03-15, -1) = 2024-02-29.
+        let start = date_ctx(&[n(2024.0), n(3.0), n(15.0)], &ctx_1900());
+        let expected = date_ctx(&[n(2024.0), n(2.0), n(29.0)], &ctx_1900());
+        assert_eq!(eomonth_ctx(&[start, n(-1.0)], &ctx_1900()), expected);
+    }
+
+    #[test]
+    fn eomonth_feb_1900_returns_phantom_60() {
+        // EOMONTH(any-day-in-feb-1900, 0) = phantom serial 60.
+        let start = date_ctx(&[n(1900.0), n(2.0), n(15.0)], &ctx_1900());
+        assert_eq!(eomonth_ctx(&[start, n(0.0)], &ctx_1900()), n(60.0));
+    }
+
+    // ===== EDATE =====
+
+    #[test]
+    fn edate_same_day_in_next_month() {
+        // EDATE(2024-01-15, 1) = 2024-02-15.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(15.0)], &ctx_1900());
+        let expected = date_ctx(&[n(2024.0), n(2.0), n(15.0)], &ctx_1900());
+        assert_eq!(edate_ctx(&[start, n(1.0)], &ctx_1900()), expected);
+    }
+
+    #[test]
+    fn edate_clamps_day_when_target_month_shorter() {
+        // EDATE(2024-01-31, 1) = 2024-02-29 (Feb 2024 has 29 days; 31
+        // doesn't exist).
+        let start = date_ctx(&[n(2024.0), n(1.0), n(31.0)], &ctx_1900());
+        let expected = date_ctx(&[n(2024.0), n(2.0), n(29.0)], &ctx_1900());
+        assert_eq!(edate_ctx(&[start, n(1.0)], &ctx_1900()), expected);
+
+        // EDATE(2023-01-31, 1) = 2023-02-28 (non-leap).
+        let start = date_ctx(&[n(2023.0), n(1.0), n(31.0)], &ctx_1900());
+        let expected = date_ctx(&[n(2023.0), n(2.0), n(28.0)], &ctx_1900());
+        assert_eq!(edate_ctx(&[start, n(1.0)], &ctx_1900()), expected);
+    }
+
+    #[test]
+    fn edate_negative_months_walks_backward() {
+        // EDATE(2024-03-15, -1) = 2024-02-15.
+        let start = date_ctx(&[n(2024.0), n(3.0), n(15.0)], &ctx_1900());
+        let expected = date_ctx(&[n(2024.0), n(2.0), n(15.0)], &ctx_1900());
+        assert_eq!(edate_ctx(&[start, n(-1.0)], &ctx_1900()), expected);
+    }
+
+    #[test]
+    fn edate_propagates_error() {
+        let err = Value::Error(ErrorValue::Ref);
+        assert_eq!(
+            edate_ctx(&[err, n(1.0)], &ctx_1900()),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn eomonth_arity_error() {
+        assert_eq!(
+            eomonth_ctx(&[n(1.0)], &ctx_1900()),
+            Value::Error(ErrorValue::Value)
+        );
+    }
 }
 
 #[cfg(test)]

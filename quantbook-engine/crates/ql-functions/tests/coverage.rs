@@ -199,6 +199,11 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
     ("MINUTE", "W5-72; covered by date_fns::tests"),
     ("SECOND", "W5-72; covered by date_fns::tests"),
     ("TIME", "W5-72; covered by date_fns::tests"),
+    ("DATEVALUE", "W5-73; covered by date_fns::tests_wave2"),
+    ("TIMEVALUE", "W5-73; covered by date_fns::tests_wave2"),
+    ("WEEKDAY", "W5-73; covered by date_fns::tests_wave2"),
+    ("EOMONTH", "W5-73; covered by date_fns::tests_wave2"),
+    ("EDATE", "W5-73; covered by date_fns::tests_wave2"),
     // Range-aware
     ("SUMIF", "wildcards + V1 anchoring divergence in matrix"),
     ("COUNTIF", "wildcards covered in matrix"),

@@ -250,7 +250,8 @@ Per the merged plan (Claude + Codex), the next 5 sessions:
 7. **Phase 4.5.A.0** ✅ SHIPPED W5-69 — `EvalContext` (DateSystem + Locale + NowProvider) + `ContextAwareFn` third registry tier + dispatch wiring + `CellEnv::eval_context()` default impl. 26 new tests. Codex Phase 4.5 design review HIGH 1 closed.
 8. **Phase 4.5.A part 1** ✅ SHIPPED W5-70 — `ql-types::date` module (serial↔ymd + 1900 leap-year bug; 56 tests). Pure additive; no existing code paths modified.
 9. **Phase 4.5.A part 2** ✅ SHIPPED W5-71 — `Workbook::date_system` field + `.qbook` schema v3 migration + `WorkbookEnv::eval_context()` override + NOW/TODAY upgraded to ContextAwareFn tier. **Phase 4.5.A FULLY CLOSED.**
-10. **(IMMEDIATELY NEXT) — Phase 4.5.B** — V1 wave of 18 date/time functions per design doc § 5.1: DATE, YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, TIME, DATEVALUE, TIMEVALUE, WEEKDAY, EOMONTH, EDATE, DAYS, NETWORKDAYS, WORKDAY, YEARFRAC. Mostly ContextAwareFn tier (date_system aware); YEAR/MONTH/DAY/HOUR/MINUTE/SECOND can stay scalar since they're pure functions of the serial.
+10. **Phase 4.5.B wave 1** ✅ SHIPPED W5-72 — DATE/YEAR/MONTH/DAY (ContextAwareFn) + HOUR/MINUTE/SECOND/TIME (ScalarFn). 8 of 18 V1 fns. New module `date_fns` (~605 LOC, 31 tests). Registry 108 → 116.
+11. **(IMMEDIATELY NEXT) — Phase 4.5.B wave 2** — DATEVALUE, TIMEVALUE, WEEKDAY, EOMONTH, EDATE. Text parsing for VALUE fns (en-US ISO + slash), WEEKDAY return_type 1/2/3/11-17, month-arithmetic for EOMONTH/EDATE.
 3. **Phase 4.4 implementation** — Centralized coercion module. Per-function audit against the matrix.
 4. **Phase 4.5** — Dates / Times / Number Formats. Excel epoch policy + format parser. Substantial; use design-doc pattern.
 5. **Phase 4.6** — Cross-Sheet References + Sheet-Scoped Names. Token + AST + binder + runtime expansion. Re-audit graph supplemental and named-range behavior.

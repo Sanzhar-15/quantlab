@@ -364,6 +364,15 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("SECOND", date_fns::second);
     r.register("TIME", date_fns::time);
 
+    // **W5-73 (Phase 4.5.B wave 2):** date text parsing + month arithmetic +
+    // weekday. All ContextAwareFn (date_system aware; TIMEVALUE is locale-
+    // technically but consistent tier).
+    r.register_context_aware("DATEVALUE", date_fns::datevalue_ctx);
+    r.register_context_aware("TIMEVALUE", date_fns::timevalue_ctx);
+    r.register_context_aware("WEEKDAY", date_fns::weekday_ctx);
+    r.register_context_aware("EOMONTH", date_fns::eomonth_ctx);
+    r.register_context_aware("EDATE", date_fns::edate_ctx);
+
     // Engine Phase 4.3 V2 batch — range-aware (W5-53, GAP-F-05
     // closure). These use the new `RangeAwareFn` table because the
     // existing `ScalarFn = fn(&[Value]) -> Value` contract can't
@@ -446,8 +455,10 @@ mod tests {
         // MODE.SNGL alias = 7) + Phase 4.3 polish wave 1 (W5-61:
         // PROPER, CLEAN, CEILING.MATH, FLOOR.MATH, RANK.AVG,
         // CONCAT = 6) + Phase 4.5.B wave 1 (W5-72: DATE, YEAR,
-        // MONTH, DAY, HOUR, MINUTE, SECOND, TIME = 8).
-        assert_eq!(r.len(), 116);
+        // MONTH, DAY, HOUR, MINUTE, SECOND, TIME = 8) + Phase 4.5.B
+        // wave 2 (W5-73: DATEVALUE, TIMEVALUE, WEEKDAY, EOMONTH,
+        // EDATE = 5).
+        assert_eq!(r.len(), 121);
     }
 
     #[test]
