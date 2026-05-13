@@ -23,6 +23,7 @@
 //! `Cargo`-tracked test asset; the Welford shape is locked here.
 
 pub mod context_aware_fns;
+pub mod date_fns;
 pub mod range_aware_fns;
 pub mod range_fns;
 pub mod registry;

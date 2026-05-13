@@ -186,6 +186,19 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "RANDBETWEEN",
         "non-deterministic; covered by volatile dedicated tests",
     ),
+    // Phase 4.5.B wave 1 date/time fns (W5-72) — covered by
+    // `date_fns::tests` module (31 unit tests pinning Excel-canon
+    // edge cases including 1900-phantom day, month/day cascade,
+    // negative-arg #NUM!, etc). Deferred from per_function_overrides
+    // since the module-internal tests already do the coverage.
+    ("DATE", "W5-72; covered by date_fns::tests"),
+    ("YEAR", "W5-72; covered by date_fns::tests"),
+    ("MONTH", "W5-72; covered by date_fns::tests"),
+    ("DAY", "W5-72; covered by date_fns::tests"),
+    ("HOUR", "W5-72; covered by date_fns::tests"),
+    ("MINUTE", "W5-72; covered by date_fns::tests"),
+    ("SECOND", "W5-72; covered by date_fns::tests"),
+    ("TIME", "W5-72; covered by date_fns::tests"),
     // Range-aware
     ("SUMIF", "wildcards + V1 anchoring divergence in matrix"),
     ("COUNTIF", "wildcards covered in matrix"),

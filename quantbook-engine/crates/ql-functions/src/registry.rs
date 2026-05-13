@@ -9,7 +9,7 @@ use ql_types::Value;
 
 use crate::context_aware_fns::ContextAwareFn;
 use crate::range_aware_fns::RangeAwareFn;
-use crate::{range_fns, scalar_fns, volatile};
+use crate::{date_fns, range_fns, scalar_fns, volatile};
 
 /// Function signature: pre-evaluated args → result Value.
 pub type ScalarFn = fn(&[Value]) -> Value;
@@ -351,6 +351,19 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("RAND", volatile::rand);
     r.register("RANDBETWEEN", volatile::randbetween);
 
+    // **W5-72 (Phase 4.5.B wave 1):** date/time function library —
+    // foundational 8 (per W5-68 design § 5.1). DATE/YEAR/MONTH/DAY are
+    // ContextAwareFn (need workbook.date_system for serial interp).
+    // HOUR/MINUTE/SECOND/TIME are pure scalar (no date_system dep).
+    r.register_context_aware("DATE", date_fns::date_ctx);
+    r.register_context_aware("YEAR", date_fns::year_ctx);
+    r.register_context_aware("MONTH", date_fns::month_ctx);
+    r.register_context_aware("DAY", date_fns::day_ctx);
+    r.register("HOUR", date_fns::hour);
+    r.register("MINUTE", date_fns::minute);
+    r.register("SECOND", date_fns::second);
+    r.register("TIME", date_fns::time);
+
     // Engine Phase 4.3 V2 batch — range-aware (W5-53, GAP-F-05
     // closure). These use the new `RangeAwareFn` table because the
     // existing `ScalarFn = fn(&[Value]) -> Value` contract can't
@@ -432,8 +445,9 @@ mod tests {
         // LARGE, SMALL, RANK, RANK.EQ alias, MEDIAN, MODE,
         // MODE.SNGL alias = 7) + Phase 4.3 polish wave 1 (W5-61:
         // PROPER, CLEAN, CEILING.MATH, FLOOR.MATH, RANK.AVG,
-        // CONCAT = 6).
-        assert_eq!(r.len(), 108);
+        // CONCAT = 6) + Phase 4.5.B wave 1 (W5-72: DATE, YEAR,
+        // MONTH, DAY, HOUR, MINUTE, SECOND, TIME = 8).
+        assert_eq!(r.len(), 116);
     }
 
     #[test]
