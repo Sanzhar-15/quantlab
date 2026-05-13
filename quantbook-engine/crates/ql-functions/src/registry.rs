@@ -236,6 +236,16 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_range_aware("HLOOKUP", range_fns::hlookup);
     r.register_range_aware("CHOOSE", range_fns::choose);
 
+    // Engine Phase 4.3 V2 batch #4 — conditional-aggregate
+    // completion (W5-55). Multi-condition variants of SUMIF/COUNTIF
+    // + AVERAGEIF / AVERAGEIFS + SUMPRODUCT. All consume
+    // RangeAwareFn dispatch.
+    r.register_range_aware("AVERAGEIF", range_fns::averageif);
+    r.register_range_aware("SUMIFS", range_fns::sumifs);
+    r.register_range_aware("COUNTIFS", range_fns::countifs);
+    r.register_range_aware("AVERAGEIFS", range_fns::averageifs);
+    r.register_range_aware("SUMPRODUCT", range_fns::sumproduct);
+
     r
 }
 
@@ -262,8 +272,10 @@ mod tests {
         // SIN, COS, TAN, ASIN, ACOS, ATAN, ATAN2 = 7) + Phase 4.3 V2
         // range-aware (W5-53: SUMIF, COUNTIF = 2) + Phase 4.3 V2
         // lookup family (W5-54: MATCH, INDEX, VLOOKUP, HLOOKUP,
-        // CHOOSE = 5).
-        assert_eq!(r.len(), 66);
+        // CHOOSE = 5) + Phase 4.3 V2 conditional-aggregate
+        // completion (W5-55: AVERAGEIF, SUMIFS, COUNTIFS, AVERAGEIFS,
+        // SUMPRODUCT = 5).
+        assert_eq!(r.len(), 71);
     }
 
     #[test]

@@ -65,11 +65,11 @@ as partial, rows with `❌` are missing.
 | MATCH | ⚠️ | 7 | 4.3 V2 | W5-54: match_type 0/1/-1 (exact / largest-≤ / smallest-≥). 1-based result. Not-found → #N/A. Linear scan (V1 — no binary-search optimization yet). |
 | INDEX | ⚠️ | 5 | 4.3 V2 | W5-54: scalar result only. 1D and 2D variants. row_num=0 / col_num=0 (array spill) → #REF! pending Phase 4.7 array formulas. Out-of-bounds → #REF!. |
 | CHOOSE | ✅ | 5 | 4.3 V2 | W5-54: scalar args only, 1-based index. Out-of-bounds → #VALUE!. Fractional indexes truncated per Excel canon. |
-| SUMIFS | ❌ | 0 | 4.3 V2 (next batch) | Multi-condition; needs the same predicate infra as SUMIF + AND-across-conditions zip. |
+| SUMIFS | ⚠️ | 6 | 4.3 V2 | W5-55: multi-condition AND. Excel arg order: `sum_range FIRST`, then (criteria_range, criteria) pairs. All ranges must have identical length. Same predicate suite as SUMIF (comparators + text/number/bool/blank; wildcards deferred). |
 | COUNTIF | ⚠️ | 13 | 4.3 V2 | W5-53 (GAP-F-05 closure): same predicate suite as SUMIF. Error cells in the range are NOT propagated (Excel canon — COUNTIF ignores errors, unlike SUMIF). Wildcards deferred. |
-| COUNTIFS | ❌ | 0 | 4.3 V2 (next batch) | Multi-condition count. |
-| AVERAGEIF | ❌ | 0 | 4.3 | Conditional average |
-| AVERAGEIFS | ❌ | 0 | 4.3 | Multi-condition average |
+| COUNTIFS | ⚠️ | 3 | 4.3 V2 | W5-55: multi-condition AND count. Errors in range cells don't propagate (Excel canon). |
+| AVERAGEIF | ⚠️ | 6 | 4.3 V2 | W5-55: same predicate suite as SUMIF; #DIV/0! on no matches; optional separate average_range. |
+| AVERAGEIFS | ⚠️ | 2 | 4.3 V2 | W5-55: multi-condition AND average; #DIV/0! on no matches. |
 | MINIFS / MAXIFS | ❌ | 0 | 4.3 | Multi-condition min/max |
 | MEDIAN | ❌ | 0 | 4.3 | Removed from `is_aggregate_function` Phase 2B.7 audit M1 |
 | MODE / MODE.SNGL / MODE.MULT | ❌ | 0 | 4.3 | |
@@ -131,7 +131,7 @@ as partial, rows with `❌` are missing.
 | GCD / LCM | ❌ | 0 | 4.10 | |
 | RAND / RANDBETWEEN | ✅ | 3+ | 3.7 | xorshift64, seeded test fixture |
 | RANDARRAY | ❌ | 0 | 4.7 | Array-result; needs 4.7 |
-| SUMPRODUCT | ❌ | 0 | 4.3 | |
+| SUMPRODUCT | ✅ | 7 | 4.3 V2 | W5-55: element-wise multiply arrays then sum. All arrays must have same length. Non-numeric cells treated as 0 (lenient — Excel canon for SUMPRODUCT). Error cells propagate. Scalar args act as constant multipliers. |
 | SUMSQ / SUMX2MY2 / SUMX2PY2 / SUMXMY2 | ❌ | 0 | 4.10 | |
 | AGGREGATE | ❌ | 0 | 4.10 | Conditional aggregation; depends on 4.7 |
 | SUBTOTAL | ❌ | 0 | 4.10 | |

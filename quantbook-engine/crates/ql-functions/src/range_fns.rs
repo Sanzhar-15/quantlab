@@ -724,6 +724,301 @@ pub fn countif(args: &[FnArg]) -> Value {
     Value::Number(count as f64)
 }
 
+// ===== W5-55: AVERAGEIF / SUMIFS / COUNTIFS / AVERAGEIFS / SUMPRODUCT =====
+//
+// Conditional-aggregate completion batch. Direct extensions of
+// W5-53's `build_predicate` + W5-54's range-shape infra. All ranges
+// in an IFS-family call must have identical row × col dimensions
+// (Excel canon: #VALUE! otherwise).
+
+/// `AVERAGEIF(range, criteria, [average_range])` — average cells in
+/// `average_range` (or `range` if omitted) where the corresponding
+/// cell in `range` matches `criteria`. Returns `#DIV/0!` if no cells
+/// match. Same predicate semantics as SUMIF.
+pub fn averageif(args: &[FnArg]) -> Value {
+    if args.len() < 2 || args.len() > 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let crit_range = match &args[0] {
+        FnArg::Range { values, .. } => values.as_slice(),
+        FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
+    };
+    let crit = match &args[1] {
+        FnArg::Scalar(v) => v,
+        FnArg::Range { .. } => return Value::Error(ErrorValue::Value),
+    };
+    let avg_range: &[Value] = if args.len() == 3 {
+        match &args[2] {
+            FnArg::Range { values, .. } => values.as_slice(),
+            FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
+        }
+    } else {
+        crit_range
+    };
+    let predicate = match build_predicate(crit) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
+    };
+    let mut total = 0.0_f64;
+    let mut count: usize = 0;
+    for (c, v) in crit_range.iter().zip(avg_range.iter()) {
+        if !predicate.matches(c) {
+            continue;
+        }
+        match coerce_numeric(v) {
+            NumericArg::Number(n) => {
+                total += n;
+                count += 1;
+            }
+            // Blank in the average range: skip (don't count). Matches
+            // SUMIF / AVERAGE behavior — Blank ≠ zero in averaging.
+            NumericArg::Skip => {}
+            NumericArg::Error(e) => return Value::Error(e),
+        }
+    }
+    if count == 0 {
+        return Value::Error(ErrorValue::DivZero);
+    }
+    match coercion::sanitize_f64(total / (count as f64)) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// Helper: parse `[crit_range1, crit1, crit_range2, crit2, ...]`
+/// pairs after a starting index. Returns (paired_ranges_and_preds,
+/// expected_len_in_cells) or an Error to propagate.
+///
+/// For SUMIFS / AVERAGEIFS the start_index is 1 (arg[0] is the
+/// sum/average range). For COUNTIFS it's 0 (no leading range).
+///
+/// All ranges must have identical `.len()`. Excel canon: mismatched
+/// shapes → `#VALUE!`.
+type IfsPairs<'a> = (Vec<(&'a [Value], Predicate)>, usize);
+
+fn parse_ifs_pairs<'a>(args: &'a [FnArg], start_index: usize) -> Result<IfsPairs<'a>, ErrorValue> {
+    let pair_args = &args[start_index..];
+    if pair_args.is_empty() || pair_args.len() % 2 != 0 {
+        return Err(ErrorValue::Value);
+    }
+    let mut pairs: Vec<(&'a [Value], Predicate)> = Vec::with_capacity(pair_args.len() / 2);
+    let mut expected: Option<usize> = None;
+    let mut chunks = pair_args.chunks_exact(2);
+    for pair in chunks.by_ref() {
+        let range = match &pair[0] {
+            FnArg::Range { values, .. } => values.as_slice(),
+            FnArg::Scalar(_) => return Err(ErrorValue::Value),
+        };
+        let pred_arg = match &pair[1] {
+            FnArg::Scalar(v) => v,
+            FnArg::Range { .. } => return Err(ErrorValue::Value),
+        };
+        let pred = build_predicate(pred_arg)?;
+        // Shape check.
+        match expected {
+            None => expected = Some(range.len()),
+            Some(n) if n != range.len() => return Err(ErrorValue::Value),
+            Some(_) => {}
+        }
+        pairs.push((range, pred));
+    }
+    Ok((pairs, expected.unwrap_or(0)))
+}
+
+/// `SUMIFS(sum_range, criteria_range1, criteria1, [crit_range2,
+/// crit2, ...])` — sum cells in `sum_range` where ALL
+/// criteria_range/criteria pairs match elementwise.
+///
+/// Excel-canon argument order: sum_range FIRST, then pairs. (SUMIF
+/// has sum_range LAST — confusing but it's the spec.)
+pub fn sumifs(args: &[FnArg]) -> Value {
+    if args.len() < 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let sum_range = match &args[0] {
+        FnArg::Range { values, .. } => values.as_slice(),
+        FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
+    };
+    let (pairs, expected_len) = match parse_ifs_pairs(args, 1) {
+        Ok(x) => x,
+        Err(e) => return Value::Error(e),
+    };
+    if sum_range.len() != expected_len {
+        return Value::Error(ErrorValue::Value);
+    }
+    let mut total = 0.0_f64;
+    for i in 0..expected_len {
+        let mut all_match = true;
+        for (range, pred) in &pairs {
+            if !pred.matches(&range[i]) {
+                all_match = false;
+                break;
+            }
+        }
+        if !all_match {
+            continue;
+        }
+        match coerce_numeric(&sum_range[i]) {
+            NumericArg::Number(n) => total += n,
+            NumericArg::Skip => {}
+            NumericArg::Error(e) => return Value::Error(e),
+        }
+    }
+    match coercion::sanitize_f64(total) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `COUNTIFS(criteria_range1, criteria1, [crit_range2, crit2, ...])`
+/// — count cells where ALL criteria_range/criteria pairs match
+/// elementwise. Errors in range cells don't propagate (Excel canon —
+/// same as COUNTIF).
+pub fn countifs(args: &[FnArg]) -> Value {
+    if args.is_empty() {
+        return Value::Error(ErrorValue::Value);
+    }
+    let (pairs, expected_len) = match parse_ifs_pairs(args, 0) {
+        Ok(x) => x,
+        Err(e) => return Value::Error(e),
+    };
+    let mut count: usize = 0;
+    for i in 0..expected_len {
+        let mut all_match = true;
+        for (range, pred) in &pairs {
+            if !pred.matches(&range[i]) {
+                all_match = false;
+                break;
+            }
+        }
+        if all_match {
+            count += 1;
+        }
+    }
+    Value::Number(count as f64)
+}
+
+/// `AVERAGEIFS(average_range, criteria_range1, criteria1, ...)` —
+/// like SUMIFS but average. Returns `#DIV/0!` if no rows match.
+pub fn averageifs(args: &[FnArg]) -> Value {
+    if args.len() < 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let avg_range = match &args[0] {
+        FnArg::Range { values, .. } => values.as_slice(),
+        FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
+    };
+    let (pairs, expected_len) = match parse_ifs_pairs(args, 1) {
+        Ok(x) => x,
+        Err(e) => return Value::Error(e),
+    };
+    if avg_range.len() != expected_len {
+        return Value::Error(ErrorValue::Value);
+    }
+    let mut total = 0.0_f64;
+    let mut count: usize = 0;
+    for i in 0..expected_len {
+        let mut all_match = true;
+        for (range, pred) in &pairs {
+            if !pred.matches(&range[i]) {
+                all_match = false;
+                break;
+            }
+        }
+        if !all_match {
+            continue;
+        }
+        match coerce_numeric(&avg_range[i]) {
+            NumericArg::Number(n) => {
+                total += n;
+                count += 1;
+            }
+            NumericArg::Skip => {}
+            NumericArg::Error(e) => return Value::Error(e),
+        }
+    }
+    if count == 0 {
+        return Value::Error(ErrorValue::DivZero);
+    }
+    match coercion::sanitize_f64(total / count as f64) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `SUMPRODUCT(array1, [array2], ...)` — element-wise multiply all
+/// arrays and sum the products. All arrays must have the same total
+/// length; mismatched → `#VALUE!`. Non-numeric cell values
+/// contribute as 0 (Excel canon: SUMPRODUCT is lenient, unlike
+/// SUMIF/SUM which propagate text → #VALUE!). Error cells propagate.
+pub fn sumproduct(args: &[FnArg]) -> Value {
+    if args.is_empty() {
+        return Value::Error(ErrorValue::Value);
+    }
+    // Collect range slices; scalars in V1 are accepted as 1-element
+    // arrays — Excel canon: SUMPRODUCT(5) = 5, SUMPRODUCT(5, range)
+    // multiplies every element by 5.
+    let mut arrays: Vec<&[Value]> = Vec::with_capacity(args.len());
+    let scalar_single: Vec<[Value; 1]>;
+    {
+        let mut tmp: Vec<[Value; 1]> = Vec::new();
+        for a in args {
+            match a {
+                FnArg::Range { values, .. } => arrays.push(values.as_slice()),
+                FnArg::Scalar(v) => {
+                    tmp.push([v.clone()]);
+                }
+            }
+        }
+        scalar_single = tmp;
+    }
+    // Push slices for scalar args after collecting (borrow-safe).
+    for arr in &scalar_single {
+        arrays.push(arr.as_slice());
+    }
+    // Determine common length: the longest non-singleton array; all
+    // non-singletons must agree.
+    let mut common_len: Option<usize> = None;
+    for arr in &arrays {
+        if arr.len() == 1 {
+            continue;
+        }
+        match common_len {
+            None => common_len = Some(arr.len()),
+            Some(n) if n != arr.len() => return Value::Error(ErrorValue::Value),
+            Some(_) => {}
+        }
+    }
+    let total_len = common_len.unwrap_or(1);
+    // Coerce a Value to f64 lenient-for-SUMPRODUCT: Number → n; Bool
+    // → 1.0/0.0; Blank → 0; Text → 0 (lenient); Error → propagate.
+    let to_num = |v: &Value| -> Result<f64, ErrorValue> {
+        match v {
+            Value::Number(n) => Ok(*n),
+            Value::Boolean(b) => Ok(if *b { 1.0 } else { 0.0 }),
+            Value::Blank => Ok(0.0),
+            Value::Text(_) => Ok(0.0),
+            Value::Error(e) => Err(*e),
+        }
+    };
+    let mut sum = 0.0_f64;
+    for i in 0..total_len {
+        let mut prod = 1.0_f64;
+        for arr in &arrays {
+            let idx = if arr.len() == 1 { 0 } else { i };
+            match to_num(&arr[idx]) {
+                Ok(n) => prod *= n,
+                Err(e) => return Value::Error(e),
+            }
+        }
+        sum += prod;
+    }
+    match coercion::sanitize_f64(sum) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1246,5 +1541,264 @@ mod tests {
             choose(&[s(n(2.7)), s(t("a")), s(t("b")), s(t("c"))]),
             t("b")
         );
+    }
+
+    // ===== W5-55: AVERAGEIF / SUMIFS / COUNTIFS / AVERAGEIFS / SUMPRODUCT =====
+
+    // --- AVERAGEIF ---
+
+    #[test]
+    fn averageif_basic() {
+        // Range [1, 5, 5, 10]; criteria 5 → matches 2 cells; avg = 5.
+        let range = r(vec![n(1.0), n(5.0), n(5.0), n(10.0)]);
+        assert_eq!(averageif(&[range, s(n(5.0))]), n(5.0));
+    }
+
+    #[test]
+    fn averageif_comparator() {
+        // Range [1, 2, 3, 4, 5]; criteria >2 → matches 3, 4, 5; avg = 4.
+        let range = r(vec![n(1.0), n(2.0), n(3.0), n(4.0), n(5.0)]);
+        assert_eq!(averageif(&[range, s(t(">2"))]), n(4.0));
+    }
+
+    #[test]
+    fn averageif_separate_average_range() {
+        let labels = r(vec![t("a"), t("b"), t("a"), t("c")]);
+        let vals = r(vec![n(10.0), n(20.0), n(30.0), n(40.0)]);
+        // criteria "a" → positions 0, 2 → values 10, 30 → avg 20.
+        assert_eq!(averageif(&[labels, s(t("a")), vals]), n(20.0));
+    }
+
+    #[test]
+    fn averageif_no_match_is_div_zero() {
+        let range = r(vec![n(1.0), n(2.0)]);
+        assert_eq!(
+            averageif(&[range, s(n(99.0))]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn averageif_empty_range_is_div_zero() {
+        let range = r(vec![]);
+        assert_eq!(
+            averageif(&[range, s(n(1.0))]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn averageif_arity_errors() {
+        assert_eq!(averageif(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            averageif(&[r(vec![n(1.0)])]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            averageif(&[r(vec![n(1.0)]), s(n(1.0)), s(n(1.0)), s(n(1.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // --- SUMIFS ---
+
+    /// W5-55: mirrors the e2e shape (rows=4, cols=1) the dispatch
+    /// builds for a single-column named range. Catches any
+    /// hidden shape-sensitivity in `parse_ifs_pairs`.
+    #[test]
+    fn sumifs_two_conditions_2d_column_shape() {
+        let labels1 = FnArg::Range {
+            values: vec![t("a"), t("a"), t("b"), t("b")],
+            rows: 4,
+            cols: 1,
+        };
+        let labels2 = FnArg::Range {
+            values: vec![t("x"), t("y"), t("x"), t("y")],
+            rows: 4,
+            cols: 1,
+        };
+        let vals = FnArg::Range {
+            values: vec![n(1.0), n(2.0), n(3.0), n(4.0)],
+            rows: 4,
+            cols: 1,
+        };
+        assert_eq!(
+            sumifs(&[vals, labels1, s(t("a")), labels2, s(t("y"))]),
+            n(2.0)
+        );
+    }
+
+    #[test]
+    fn sumifs_two_conditions() {
+        // Two label ranges + values.
+        // labels1 [a, a, b, b]; labels2 [x, y, x, y]; vals [1, 2, 3, 4].
+        // Criteria: labels1=a AND labels2=y → only position 1 matches → sum 2.
+        let labels1 = r(vec![t("a"), t("a"), t("b"), t("b")]);
+        let labels2 = r(vec![t("x"), t("y"), t("x"), t("y")]);
+        let vals = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        assert_eq!(
+            sumifs(&[vals, labels1, s(t("a")), labels2, s(t("y"))]),
+            n(2.0)
+        );
+    }
+
+    #[test]
+    fn sumifs_three_conditions_and() {
+        let r1 = r(vec![n(1.0), n(1.0), n(1.0), n(2.0)]);
+        let r2 = r(vec![n(10.0), n(10.0), n(20.0), n(10.0)]);
+        let r3 = r(vec![t("a"), t("b"), t("a"), t("a")]);
+        let vals = r(vec![n(100.0), n(200.0), n(300.0), n(400.0)]);
+        // r1=1 AND r2=10 AND r3=a → only position 0 matches → sum 100.
+        assert_eq!(
+            sumifs(&[vals, r1, s(n(1.0)), r2, s(n(10.0)), r3, s(t("a")),]),
+            n(100.0)
+        );
+    }
+
+    #[test]
+    fn sumifs_shape_mismatch_is_value_error() {
+        let r1 = r(vec![n(1.0), n(2.0)]);
+        let r2 = r(vec![n(1.0), n(2.0), n(3.0)]); // different length
+        let vals = r(vec![n(10.0), n(20.0)]);
+        assert_eq!(
+            sumifs(&[vals, r1, s(n(1.0)), r2, s(n(1.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn sumifs_sum_range_shape_mismatch_is_value_error() {
+        let r1 = r(vec![n(1.0), n(2.0)]);
+        let vals = r(vec![n(10.0), n(20.0), n(30.0)]); // longer than criteria
+        assert_eq!(
+            sumifs(&[vals, r1, s(n(1.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn sumifs_unpaired_extra_arg_is_value_error() {
+        let r1a = r(vec![n(1.0)]);
+        let r1b = r(vec![n(1.0)]);
+        let vals = r(vec![n(10.0)]);
+        // 3 args after sum_range = unpaired (need pairs).
+        assert_eq!(
+            sumifs(&[vals, r1a, s(n(1.0)), r1b]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn sumifs_empty_match_is_zero() {
+        let labels = r(vec![t("a"), t("a")]);
+        let vals = r(vec![n(1.0), n(2.0)]);
+        assert_eq!(sumifs(&[vals, labels, s(t("z"))]), n(0.0));
+    }
+
+    // --- COUNTIFS ---
+
+    #[test]
+    fn countifs_two_conditions() {
+        let r1 = r(vec![t("a"), t("a"), t("b"), t("b")]);
+        let r2 = r(vec![n(1.0), n(2.0), n(1.0), n(2.0)]);
+        // r1=a AND r2>1 → only position 1 matches → 1.
+        assert_eq!(countifs(&[r1, s(t("a")), r2, s(t(">1"))]), n(1.0));
+    }
+
+    #[test]
+    fn countifs_no_matches_is_zero() {
+        let r1 = r(vec![n(1.0), n(2.0)]);
+        assert_eq!(countifs(&[r1, s(n(99.0))]), n(0.0));
+    }
+
+    #[test]
+    fn countifs_arity_must_be_pairs() {
+        let r1 = r(vec![n(1.0)]);
+        assert_eq!(countifs(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(countifs(&[r1]), Value::Error(ErrorValue::Value));
+    }
+
+    // --- AVERAGEIFS ---
+
+    #[test]
+    fn averageifs_two_conditions() {
+        let labels1 = r(vec![t("a"), t("a"), t("b"), t("b")]);
+        let labels2 = r(vec![t("x"), t("y"), t("x"), t("y")]);
+        let vals = r(vec![n(10.0), n(20.0), n(30.0), n(40.0)]);
+        // labels1=a AND labels2=y → position 1 → avg 20.
+        assert_eq!(
+            averageifs(&[vals, labels1, s(t("a")), labels2, s(t("y"))]),
+            n(20.0)
+        );
+    }
+
+    #[test]
+    fn averageifs_no_match_div_zero() {
+        let r1 = r(vec![n(1.0)]);
+        let vals = r(vec![n(10.0)]);
+        assert_eq!(
+            averageifs(&[vals, r1, s(n(99.0))]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    // --- SUMPRODUCT ---
+
+    #[test]
+    fn sumproduct_two_arrays() {
+        let a1 = r(vec![n(1.0), n(2.0), n(3.0)]);
+        let a2 = r(vec![n(10.0), n(20.0), n(30.0)]);
+        // 1*10 + 2*20 + 3*30 = 10 + 40 + 90 = 140.
+        assert_eq!(sumproduct(&[a1, a2]), n(140.0));
+    }
+
+    #[test]
+    fn sumproduct_single_array_is_sum() {
+        let a = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(sumproduct(&[a]), n(6.0));
+    }
+
+    #[test]
+    fn sumproduct_text_treated_as_zero() {
+        // Lenient — text contributes 0, not #VALUE!.
+        let a1 = r(vec![n(1.0), t("hello"), n(3.0)]);
+        let a2 = r(vec![n(10.0), n(20.0), n(30.0)]);
+        // 1*10 + 0*20 + 3*30 = 100.
+        assert_eq!(sumproduct(&[a1, a2]), n(100.0));
+    }
+
+    #[test]
+    fn sumproduct_shape_mismatch_is_value_error() {
+        let a1 = r(vec![n(1.0), n(2.0)]);
+        let a2 = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(sumproduct(&[a1, a2]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn sumproduct_error_in_cell_propagates() {
+        let a1 = r(vec![n(1.0), Value::Error(ErrorValue::Num), n(3.0)]);
+        let a2 = r(vec![n(10.0), n(20.0), n(30.0)]);
+        assert_eq!(sumproduct(&[a1, a2]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn sumproduct_scalar_acts_as_constant_multiplier() {
+        // SUMPRODUCT(2, A) = 2 * SUM(A).
+        let a = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(sumproduct(&[s(n(2.0)), a]), n(12.0));
+    }
+
+    #[test]
+    fn sumproduct_three_arrays() {
+        let a1 = r(vec![n(1.0), n(2.0)]);
+        let a2 = r(vec![n(3.0), n(4.0)]);
+        let a3 = r(vec![n(5.0), n(6.0)]);
+        // 1*3*5 + 2*4*6 = 15 + 48 = 63.
+        assert_eq!(sumproduct(&[a1, a2, a3]), n(63.0));
+    }
+
+    #[test]
+    fn sumproduct_empty_args_is_value_error() {
+        assert_eq!(sumproduct(&[]), Value::Error(ErrorValue::Value));
     }
 }

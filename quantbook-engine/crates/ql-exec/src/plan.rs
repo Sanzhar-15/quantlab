@@ -211,6 +211,12 @@ pub(crate) fn is_aggregate_function(name: &str) -> bool {
             | "VLOOKUP"
             | "HLOOKUP"
             | "CHOOSE"
+            // Range-aware conditional-aggregate completion (W5-55).
+            | "AVERAGEIF"
+            | "SUMIFS"
+            | "COUNTIFS"
+            | "AVERAGEIFS"
+            | "SUMPRODUCT"
     )
 }
 

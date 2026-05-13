@@ -2540,7 +2540,18 @@ mod tests {
         // the parallel range_aware_fns table; check via
         // lookup_range_aware.
         for name in &[
-            "SUMIF", "COUNTIF", "MATCH", "INDEX", "VLOOKUP", "HLOOKUP", "CHOOSE",
+            "SUMIF",
+            "COUNTIF",
+            "MATCH",
+            "INDEX",
+            "VLOOKUP",
+            "HLOOKUP",
+            "CHOOSE",
+            "AVERAGEIF",
+            "SUMIFS",
+            "COUNTIFS",
+            "AVERAGEIFS",
+            "SUMPRODUCT",
         ] {
             assert!(
                 reg.lookup_range_aware(name).is_some(),
@@ -4231,6 +4242,163 @@ mod tests {
             .set_formula(0, 0, 3, "VLOOKUP(\"zzz\", Lookup, 2, FALSE)")
             .unwrap();
         assert_eq!(v, Value::Error(ErrorValue::NA));
+    }
+
+    // ----------------------------------------------------------------
+    // W5-55 — Phase 4.3 V2 conditional-aggregate completion.
+    // AVERAGEIF / SUMIFS / COUNTIFS / AVERAGEIFS / SUMPRODUCT
+    // end-to-end through parse → bind → eval.
+    // ----------------------------------------------------------------
+
+    /// AVERAGEIF: range [1, 2, 3, 4, 5], criteria ">2" → matches 3, 4,
+    /// 5 → avg 4.
+    #[test]
+    fn w5_55_averageif_e2e() {
+        use ql_storage::NamedTarget;
+        let mut wb = make_runtime_workbook();
+        for (i, v) in [1.0, 2.0, 3.0, 4.0, 5.0].iter().enumerate() {
+            wb.put_at(0, i as u32, 0, Value::Number(*v));
+        }
+        wb.set_name(
+            "Vals",
+            NamedTarget::Range(ql_types::Range::new(0, 0, 0, 4, 0)),
+        )
+        .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 1, "AVERAGEIF(Vals, \">2\")").unwrap();
+        assert_eq!(v, Value::Number(4.0));
+    }
+
+    /// SUMIFS: two label columns + value column. Sum of values where
+    /// labels1="a" AND labels2="y".
+    #[test]
+    fn w5_55_sumifs_two_conditions_e2e() {
+        use ql_storage::NamedTarget;
+        use std::sync::Arc;
+        let mut wb = make_runtime_workbook();
+        // Col A: labels1 [a, a, b, b]
+        // Col B: labels2 [x, y, x, y]
+        // Col C: vals    [1, 2, 3, 4]
+        let l1 = ["a", "a", "b", "b"];
+        let l2 = ["x", "y", "x", "y"];
+        let vals = [1.0, 2.0, 3.0, 4.0];
+        for (i, ((a, b), v)) in l1.iter().zip(l2.iter()).zip(vals.iter()).enumerate() {
+            wb.put_at(0, i as u32, 0, Value::Text(Arc::from(*a)));
+            wb.put_at(0, i as u32, 1, Value::Text(Arc::from(*b)));
+            wb.put_at(0, i as u32, 2, Value::Number(*v));
+        }
+        wb.set_name(
+            "LabelsA",
+            NamedTarget::Range(ql_types::Range::new(0, 0, 0, 3, 0)),
+        )
+        .unwrap();
+        wb.set_name(
+            "LabelsB",
+            NamedTarget::Range(ql_types::Range::new(0, 0, 1, 3, 1)),
+        )
+        .unwrap();
+        wb.set_name(
+            "Vals",
+            NamedTarget::Range(ql_types::Range::new(0, 0, 2, 3, 2)),
+        )
+        .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt
+            .set_formula(0, 0, 3, "SUMIFS(Vals, LabelsA, \"a\", LabelsB, \"y\")")
+            .unwrap();
+        // Only row 1 matches (a, y) → value 2.
+        assert_eq!(v, Value::Number(2.0));
+    }
+
+    /// COUNTIFS: same shape, count where labels1="a".
+    #[test]
+    fn w5_55_countifs_single_condition_e2e() {
+        use ql_storage::NamedTarget;
+        use std::sync::Arc;
+        let mut wb = make_runtime_workbook();
+        for (i, label) in ["a", "b", "a", "c", "a"].iter().enumerate() {
+            wb.put_at(0, i as u32, 0, Value::Text(Arc::from(*label)));
+        }
+        wb.set_name(
+            "Labels",
+            NamedTarget::Range(ql_types::Range::new(0, 0, 0, 4, 0)),
+        )
+        .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 1, "COUNTIFS(Labels, \"a\")").unwrap();
+        assert_eq!(v, Value::Number(3.0));
+    }
+
+    /// SUMPRODUCT: dot-product of two columns.
+    #[test]
+    fn w5_55_sumproduct_two_columns_e2e() {
+        use ql_storage::NamedTarget;
+        let mut wb = make_runtime_workbook();
+        for (i, (a, b)) in [(1.0, 10.0), (2.0, 20.0), (3.0, 30.0)].iter().enumerate() {
+            wb.put_at(0, i as u32, 0, Value::Number(*a));
+            wb.put_at(0, i as u32, 1, Value::Number(*b));
+        }
+        wb.set_name(
+            "Prices",
+            NamedTarget::Range(ql_types::Range::new(0, 0, 0, 2, 0)),
+        )
+        .unwrap();
+        wb.set_name(
+            "Quantities",
+            NamedTarget::Range(ql_types::Range::new(0, 0, 1, 2, 1)),
+        )
+        .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // 1*10 + 2*20 + 3*30 = 140.
+        let v = rt
+            .set_formula(0, 0, 2, "SUMPRODUCT(Prices, Quantities)")
+            .unwrap();
+        assert_eq!(v, Value::Number(140.0));
+    }
+
+    /// AVERAGEIFS with two conditions.
+    #[test]
+    fn w5_55_averageifs_e2e() {
+        use ql_storage::NamedTarget;
+        use std::sync::Arc;
+        let mut wb = make_runtime_workbook();
+        // labels1: [a, a, b]
+        // labels2: [x, y, x]
+        // vals:    [10, 20, 30]
+        // AVERAGEIFS(vals, l1, "a", l2, "y") → row 1 only → avg 20.
+        for (i, (a, b, v)) in [("a", "x", 10.0), ("a", "y", 20.0), ("b", "x", 30.0)]
+            .iter()
+            .enumerate()
+        {
+            wb.put_at(0, i as u32, 0, Value::Text(Arc::from(*a)));
+            wb.put_at(0, i as u32, 1, Value::Text(Arc::from(*b)));
+            wb.put_at(0, i as u32, 2, Value::Number(*v));
+        }
+        wb.set_name(
+            "LabelsA",
+            NamedTarget::Range(ql_types::Range::new(0, 0, 0, 2, 0)),
+        )
+        .unwrap();
+        wb.set_name(
+            "LabelsB",
+            NamedTarget::Range(ql_types::Range::new(0, 0, 1, 2, 1)),
+        )
+        .unwrap();
+        wb.set_name(
+            "Vals",
+            NamedTarget::Range(ql_types::Range::new(0, 0, 2, 2, 2)),
+        )
+        .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt
+            .set_formula(0, 0, 3, "AVERAGEIFS(Vals, LabelsA, \"a\", LabelsB, \"y\")")
+            .unwrap();
+        assert_eq!(v, Value::Number(20.0));
     }
 
     /// Phase 3.7 extra: `mark_volatile_dirty` on a workbook with zero
