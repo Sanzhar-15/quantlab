@@ -14,6 +14,8 @@
 //! | `ClearFormula`     | `Workbook::clear_formula`                        |
 //! | `SetName`          | `Workbook::set_name`                             |
 //! | `AddSheet`         | `Workbook::add_sheet_with_chunk_rows`            |
+//! | `RegisterFormat`   | `FormatTable::register_at` (W5-80)               |
+//! | `SetCellFormat`    | `CellFormatOverlay::set` / `::clear` (W5-80)     |
 //! | `BatchCommit`      | (recursive — applies each inner op in order)     |
 //!
 //! ## Wire format choices
@@ -76,6 +78,29 @@ pub enum Op {
     /// order); the producer doesn't pin the ID in the op, since replay
     /// against an empty workbook produces the same sequence.
     AddSheet { name: String, chunk_rows: u32 },
+
+    /// Register a format string at a specific id. Mirrors
+    /// `FormatTable::register_at`. Emitted when
+    /// `WorkbookRuntime::intern_format` allocates a NEW id; idempotent
+    /// on replay (re-registering an existing id with the same string
+    /// is a no-op). Re-registering at the same id with a DIFFERENT
+    /// string fails at `FormatTable::register_at` and surfaces as
+    /// `ReplayError::FormatRejected`. Shipped W5-80 (Phase 4.5.D part 4).
+    RegisterFormat { id: u32, string: String },
+
+    /// Set or clear a cell's format id. Mirrors
+    /// `CellFormatOverlay::set` (when `id` is `Some`) and `::clear`
+    /// (when `id` is `None`). The id MUST resolve in the workbook's
+    /// `FormatTable` at replay time; an unknown id surfaces as
+    /// `ReplayError::FormatNotRegistered`. Shipped W5-80.
+    SetCellFormat {
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        /// `None` ⇒ clear the overlay entry (cell falls back to General).
+        /// `Some(id)` ⇒ bind the cell to that format id.
+        id: Option<u32>,
+    },
 
     /// One transaction's ops applied atomically at replay time. Produced
     /// by `WorkbookTransaction::commit` in 2A.3.b. Replay applies each

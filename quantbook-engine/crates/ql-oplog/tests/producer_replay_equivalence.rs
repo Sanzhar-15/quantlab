@@ -107,6 +107,28 @@ fn apply_producer_side(ops: &[Op], wb: &mut Workbook) {
             Op::AddSheet { name, chunk_rows } => {
                 wb.add_sheet_with_chunk_rows(name.clone(), *chunk_rows);
             }
+            Op::RegisterFormat { id, string } => {
+                wb.formats_mut()
+                    .register_at(ql_storage::FormatId(*id), string.as_str())
+                    .expect("producer-side register_at must succeed");
+            }
+            Op::SetCellFormat {
+                sheet,
+                row,
+                col,
+                id,
+            } => {
+                let s = wb.sheet_mut(*sheet).expect("sheet exists");
+                match id {
+                    Some(raw_id) => {
+                        s.format_overlay_mut()
+                            .set(*row, *col, ql_storage::FormatId(*raw_id));
+                    }
+                    None => {
+                        s.format_overlay_mut().clear(*row, *col);
+                    }
+                }
+            }
             Op::BatchCommit { ops } => {
                 apply_producer_side(ops, wb);
             }
