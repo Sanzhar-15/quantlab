@@ -440,7 +440,7 @@ The full v1 means all of these crates either ship real behavior or have a docume
    - **4.4.A helper migration (W5-64 ✅)** — `ql-types::coercion` gained `to_text_for_arg`, `to_int_arg`, `to_number_strict_skip_blank`, `format_number_for_arg` + NaN/Inf policy on text/display.
    - **4.4.B matrix-as-tests (W5-65 ✅)** — 4 new integration test files (89 tests) pinning the §3.1/§3.3/§3.4 matrices + registry coverage guardrail.
    - **4.4.C error-matrix doc (W5-66 ✅)** — `docs/compat/error-matrix.md` distillation.
-   - **4.4 mega-audit (pending)** — Codex + Sonnet parallel per the protocol.  
+   - **4.4 mega-audit closure (W5-67 ✅)** — Codex + Sonnet parallel mega-audit. 2 HIGH (COUNT canon mismatch → GAP-F-06 + V1 divergence relabel; error-matrix overclaim → honest framing) + 7 MEDIUM + 3 LOW all addressed.  
    References: `.references/ironcalc/base/src/cast.rs`; `.references/ironcalc/base/src/calc_result.rs`; `.references/formualizer/crates/formualizer-eval/src/coercion.rs`; `.references/hyperformula/src/interpreter/InterpreterValue.ts`.  
    Acceptance: COER-4-01 matrix checked in ✅; COER-4-02 arithmetic, comparison, aggregate, logical, and text coercion cases covered ✅ (W5-65 tests); COER-4-03 no silent fallback for unsupported variants ✅ (W5-64 NaN/Inf policy + matrix-tests).  
    Effort spent: ~3 sessions implementation. Mega-audit cycle pending.

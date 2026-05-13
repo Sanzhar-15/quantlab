@@ -1,0 +1,72 @@
+I could not save the audit file because this session is read-only. Full review output is below.
+
+# Phase 4.4 mega-audit verdict
+
+Phase 4.4 is mostly sound at the implementation layer: the W5-64 helper migration preserves the old aggregate/text behavior except for the intentional raw NaN/Inf policy, and the registry enumeration fix does include both scalar and range-aware tables. The weak point is W5-65/W5-66 overclaiming. The matrix tests are useful, but they are not “every real divergence becomes a test failure,” and the compat doc says every row has a matching test while several rows are explicitly untested or only covered by unrelated old unit tests. I found one real canon mismatch around `COUNT` direct arguments, plus multiple false-confidence gaps in doc/test coverage.
+
+## NEW HIGH
+
+1. **`COUNT` is labeled canon while it is wrong for direct logical/text-number arguments.**  
+   `count` only counts `Value::Number` and skips `Value::Boolean(true)` and `Value::Text("1")`: `crates/ql-functions/src/scalar_fns.rs:98`. W5-65 then pins that as canon in `count_skips_text_and_blanks_canon`: `crates/ql-functions/tests/per_function_overrides.rs:62`, and W5-66 documents “skips errors, blanks, text, bools” as 🟢 canon: `docs/compat/error-matrix.md:84`. Microsoft’s COUNT docs say error values are not counted, but **logical values and text representations of numbers typed directly into the argument list are counted**; only arrays/references skip logical/text/error cells. Source: Microsoft COUNT docs, remarks section: https://support.microsoft.com/en-us/office/count-function-a59cd7fc-b623-4d93-87a4-d23bf411294c.  
+   Impact: `COUNT(TRUE, "1")` should be `2` in Excel, but the current function layer cannot distinguish direct literals from referenced cells after pre-eval, so it returns `0`. Either implement argument-provenance-aware COUNT semantics or relabel this as a V1 divergence and add E2E tests for both direct args and cell refs.
+
+2. **The W5-66 doc’s “each row has a matching test” claim is false.**  
+   The doc says each row below has a matching test at `docs/compat/error-matrix.md:10` and says each override row is enforced by tests at `docs/compat/error-matrix.md:69`. But rows have `—` or deferred placeholders: `MIN/MAX` at `docs/compat/error-matrix.md:86`, `PRODUCT` at `:87`, `AND/OR/NOT` at `:113`, `INDEX` at `:122`, `CHOOSE` at `:123`, `AVERAGEIF` at `:142`. Worse, `coverage.rs` says `CHOOSE` has “range-arg gotcha pinned” at `crates/ql-functions/tests/coverage.rs:199`, but W5-65’s `per_function_overrides.rs` has no CHOOSE test; the only range-arg test is an older module unit test in `range_fns.rs`, not the new matrix substrate. This is exactly the kind of false-confidence ship the audit protocol is meant to catch.
+
+## NEW MEDIUM
+
+1. **`coverage.rs` is more waiver list than coverage gate.**  
+   The guard is mechanically correct, but many entries are “default; deferred” with no real matrix assertion: `crates/ql-functions/tests/coverage.rs:101`, `:112`, `:116`, `:130`, `:153`, `:159`, `:166`. That forces a decision, but it does not force coverage. The W5-65 commit’s claim that any real divergence becomes a test failure is not defensible.
+
+2. **New public helper API is not re-exported at the crate root.**  
+   `to_text_for_arg`, `to_int_arg`, `to_number_strict_skip_blank`, and `format_number_for_arg` are `pub` in `crates/ql-types/src/coercion.rs:118`, `:141`, `:162`, `:189`, but `lib.rs` only re-exports the older helpers at `crates/ql-types/src/lib.rs:21`. Callers must use `ql_types::coercion::...`. That is workable, but it contradicts the “promoted public API surface” expectation.
+
+3. **`to_int_arg` still lets raw NaN/Inf cast to integers.**  
+   `to_int_arg` casts `Value::Number(n)` directly via `n.trunc() as i64`: `crates/ql-types/src/coercion.rs:164`. That preserves old behavior, but it is now inside the central coercion module whose top-level contract says non-finite numbers produce `#NUM!`: `crates/ql-types/src/coercion.rs:12`. There is no test for `to_int_arg(Value::Number(f64::NAN))`. If W5-64’s raw non-finite policy is meant to be central, integer args are a hole.
+
+4. **Compat doc mixes “missing” and “intentional divergence.”**  
+   `AI` is tagged 🟡 at `docs/compat/error-matrix.md:174`, but it is not an Excel divergence in the same sense as UTF-16 or anchoring; it is an unimplemented/provider-missing sentinel. A distinct ⚪/reserved tag would be clearer.
+
+5. **No performance evidence for the aggregate-loop migration.**  
+   The shim is total and simple at `crates/ql-functions/src/range_aware_fns.rs:54`, so inlining should erase it, but I found no SUM/aggregate-specific benchmark result in this phase. Concern H remains a risk note, not a demonstrated regression.
+
+## NEW LOW
+
+1. Stale comment: `scalar_fns.rs` says text integer args are rejected at `crates/ql-functions/src/scalar_fns.rs:1474`, but `to_int_arg` parses text leniently at `crates/ql-types/src/coercion.rs:167`.
+
+2. `range_aware_fns::coerce_numeric` is `pub` at `crates/ql-functions/src/range_aware_fns.rs:54`; current use appears internal to the crate, so `pub(crate)` would be cleaner unless external callers need it.
+
+3. Test names are mostly consistent. The one “divergence” word in COUNT/COUNTA comments is function-to-function contrast, not V1 Excel divergence, so it does not need `_v1_divergence_`.
+
+## Per-concern verdict (A-K)
+
+A: Mostly pass. `to_text_for_arg` is identical for finite old cases; NaN/Inf is intentional behavior change and tested at `coercion.rs:958`. `to_int_arg` preserves lossy text parse failure to `#VALUE!` at `coercion.rs:167`. The numeric shim is total at `range_aware_fns.rs:55`. CONCAT’s old helper matches except for NaN/Inf.
+
+B: Pass for display/formula/arg text. Checks happen before formatting at `coercion.rs:79`, `:96`, `:123`. Tests would fail if removed: `coercion_matrix.rs:135`, `:142`, `:182`, `:191`; unit tests at `coercion.rs:869`, `:893`, `:958`. `0.0`/`-0.0` are pinned at `coercion_matrix.rs:90`.
+
+C: Mixed. The 9×5 type matrix is covered. §3.3 rows are covered, including the “lone text failure” control at `error_precedence.rs:289`. §3.4 is only partly covered; later compat §3.7/§3.8 rows are mostly deferred by coverage list entries rather than matrix tests.
+
+D: Fails on accuracy/overclaim. COUNT direct args are mislabeled canon. COUNTA counts errors correctly per Microsoft docs: https://support.microsoft.com/en-gb/office/counta-function-7dc98875-d5c1-46f1-9a82-53f3219e2509. Test cross-references do not all exist as W5-65 tests.
+
+E: Mostly pass. IFERROR eager-vs-introspection is not contradictory: `docs/architecture/...:120` and `docs/compat/error-matrix.md:112` describe different aspects. The drift is mainly coverage status, not semantics.
+
+F: Pass mechanically. `names_all()` chains scalar and range-aware names at `registry.rs:131`; coverage uses it at `coverage.rs:222`. A rename like `SUMIF` → `SUM_IF` would make `SUMIF` stale via `coverage.rs:243`.
+
+G: Partial. Functions are public in the module, but not crate-root re-exported. `coerce_numeric` could likely be `pub(crate)`.
+
+H: No proven regression, no proof either. The added calls should inline, but no benchmark evidence was produced for SUM/AVERAGE hot loops.
+
+I: Low risk. Cross-crate duplicate test names are not currently confusing because names are descriptive and crate paths are shown by Cargo when needed.
+
+J: Pass. `Result<Option<f64>, ErrorValue>` is scalar-cell-shaped but does not block future array/cross-sheet contexts; it can be applied cell-by-cell.
+
+K: Protocol concerns are real. Commit messages claim 7 gates green for W5-64/65/66; W5-63 says gates N/A but tests verified. The cycle count is far beyond discipline, and W5-65’s “any real divergence shows up as a test failure” is overclaiming.
+
+## What's needed for W5-67 closure
+
+- Fix or explicitly document the COUNT direct-argument divergence; add E2E tests for `COUNT(TRUE, "1")` and ref/range cases.
+- Rewrite `docs/compat/error-matrix.md` so “matching test” only appears where a specific test exists.
+- Move untested rows either to real tests or to an honest “deferred coverage” section.
+- Correct `coverage.rs` reasons that claim tests are pinned when they are only documented.
+- Decide whether `to_int_arg` should reject raw NaN/Inf as `#NUM!`, then test it.
+- Re-export the new `ql-types::coercion` helpers or document that module-qualified access is intentional.

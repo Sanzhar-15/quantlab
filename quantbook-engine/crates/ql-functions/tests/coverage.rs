@@ -44,9 +44,18 @@ const EXPECTED_COVERED: &[&str] = &[
     "ISNA",
     "ISNUMBER",
     "ISTEXT",
-    // Lookup family
+    // Lookup family — W5-67 added HLOOKUP + CHOOSE (Sonnet mega-audit S1,
+    // Codex HIGH 2: previously claimed transitively-covered but no real
+    // test existed; now each path is explicitly pinned).
+    "CHOOSE",
+    "HLOOKUP",
     "MATCH",
     "VLOOKUP",
+    // Math divergence — W5-67 added ROUNDUP binary-float divergence test
+    // (Sonnet mega-audit MEDIUM-S5: divergence was doc-only, could regress
+    // silently).
+    "ROUNDUP",
+    "ROUNDDOWN",
 ];
 
 /// Functions that intentionally lack matrix coverage today, with a stated
@@ -101,14 +110,8 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
     ("ABS", "default; deferred"),
     ("SQRT", "domain error #NUM!; deferred"),
     ("ROUND", "default; deferred"),
-    (
-        "ROUNDUP",
-        "binary-float divergence already documented in matrix",
-    ),
-    (
-        "ROUNDDOWN",
-        "binary-float divergence already documented in matrix",
-    ),
+    // (ROUNDUP / ROUNDDOWN moved to EXPECTED_COVERED in W5-67 — now have
+    // explicit binary-float divergence tests.)
     ("INT", "default; deferred"),
     ("TRUNC", "default; deferred"),
     ("MOD", "div-zero handling; deferred"),
@@ -191,12 +194,14 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
     ("AVERAGEIF", "V1 anchoring divergence in matrix"),
     ("AVERAGEIFS", "2D shape validation pinned in W5-60"),
     ("SUMPRODUCT", "2D shape validation pinned in W5-60"),
-    (
-        "HLOOKUP",
-        "mirrors VLOOKUP; covered by per_function_overrides",
-    ),
+    // (HLOOKIP moved to EXPECTED_COVERED in W5-67 — Sonnet mega-audit S1
+    // flagged that the prior "transitively covered by VLOOKUP" reason was
+    // false; HLOOKUP is a separate function body, not an alias.)
     ("INDEX", "documented in matrix; array spill deferred to 4.7"),
-    ("CHOOSE", "documented in matrix; range-arg gotcha pinned"),
+    // (CHOOSE moved to EXPECTED_COVERED in W5-67 — Codex mega-audit HIGH 2
+    // flagged that the "range-arg gotcha pinned" claim was about an older
+    // module unit test, not the W5-65 matrix substrate. Now has explicit
+    // matrix tests for each path.)
     (
         "RANK.EQ",
         "alias of RANK; covered by per_function_overrides via RANK",

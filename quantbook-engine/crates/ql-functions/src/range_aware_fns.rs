@@ -40,8 +40,13 @@ use ql_types::{coercion, ErrorValue, Value};
 /// `scalar_fns.rs` and `range_fns.rs`. Codex audit MEDIUM 3: keep the central
 /// API neutral (Result/Option) but the function-aware enum stays in
 /// ql-functions where it belongs.
+///
+/// **W5-67 closure (Codex mega-audit LOW 2):** scoped to `pub(crate)` —
+/// internal cross-module helper, not part of the public API. External
+/// callers should use `ql_types::coercion::to_number_strict_skip_blank`
+/// directly.
 #[derive(Debug)]
-pub enum NumericArg {
+pub(crate) enum NumericArg {
     Number(f64),
     Skip,
     Error(ErrorValue),
@@ -51,7 +56,9 @@ pub enum NumericArg {
 /// `coercion::to_number_strict_skip_blank`. Both `scalar_fns` and `range_fns`
 /// use this; the duplicate `coerce_numeric` previously in each module was
 /// removed.
-pub fn coerce_numeric(v: &Value) -> NumericArg {
+///
+/// **W5-67 closure (Codex mega-audit LOW 2):** scoped to `pub(crate)`.
+pub(crate) fn coerce_numeric(v: &Value) -> NumericArg {
     match coercion::to_number_strict_skip_blank(v) {
         Ok(Some(n)) => NumericArg::Number(n),
         Ok(None) => NumericArg::Skip,

@@ -7,15 +7,25 @@ reference** distilled from that design — one place to look up "what
 does this function do when it sees an error" / "which error wins when
 multiple sources combine."
 
-**Companion enforceable tests** (W5-65 Phase 4.4.B; each row below has
-a matching test):
+**Companion enforceable tests** (W5-65 Phase 4.4.B):
 - Type-pair matrix: `crates/ql-types/tests/coercion_matrix.rs` (46 tests).
 - Error precedence E2E: `crates/ql-exec/tests/error_precedence.rs` (15 tests).
-- Per-function overrides: `crates/ql-functions/tests/per_function_overrides.rs` (25 tests).
-- Coverage guardrail: `crates/ql-functions/tests/coverage.rs` (3 tests; walks both registries).
+- Per-function overrides: `crates/ql-functions/tests/per_function_overrides.rs` (38 tests at W5-67).
+- Coverage guardrail: `crates/ql-functions/tests/coverage.rs` (3 tests; walks both registries via `names_all()`).
 
-If a row in this document conflicts with the test, **the test wins**.
-File a doc-drift fix.
+**W5-67 closure (mega-audit Codex HIGH 2 + Sonnet S3 fix):** rows below
+have an explicit `Test:` cell that EITHER cites a specific test by name
+OR shows `—` to indicate the row is **doc-only / coverage deferred**.
+The original claim that "each row has a matching test" was overstated;
+several rows describe behavior that no test currently pins (specifically:
+many of the § 3.7 math/text divergence highlights, some § 3.3 logical
+rows like AND/OR/NOT, and § 3.8 volatile). Rows with `—` are tracked by
+`coverage.rs::EXPLICITLY_DEFERRED` — adding a real test there moves the
+function to `EXPECTED_COVERED` and updates the cell.
+
+If a row WITH a cited test conflicts with that test, **the test wins**.
+File a doc-drift fix. If a row without a test is wrong, the doc-drift
+fix is purely textual until a real test lands.
 
 ---
 
@@ -72,7 +82,11 @@ or — where the override is type-pair-coercion-only — by `crates/ql-types/tes
 Tags:
 - 🟢 **canon** — matches Excel.
 - 🟡 **divergence** — intentional Quantbook V1 divergence (documented).
-- ⚪ **deferred / not registered** — function exists in Excel; not in Quantbook V1.
+- ⚪ **not registered / sentinel** — function exists in Excel but not in Quantbook V1's
+  function library (lands a later phase), OR is registered but returns a placeholder
+  sentinel error (e.g. `AI()` → `#AI_NOT_AVAILABLE_V1`). **W5-67 closure (Codex
+  mega-audit MEDIUM 4 fix):** distinct from 🟡 "behavior diverges" vs ⚪ "behavior
+  missing."
 
 ### 3.1 Aggregates
 
@@ -81,7 +95,7 @@ Tags:
 | `SUM` | Default; Error propagates from first errored arg; Blank skipped | 🟢 | (coercion_matrix) |
 | `AVERAGE` | Default + empty range / all-blank → `#DIV/0!` | 🟢 | `average_empty_args_is_div_zero_canon`, `average_all_blank_args_is_div_zero_canon` |
 | `AVG` | Alias of AVERAGE | 🟢 | (covered transitively) |
-| `COUNT` | **Skips errors**, blanks, text, bools; counts only Number cells | 🟢 | `count_skips_errors_canon`, `count_skips_text_and_blanks_canon` |
+| `COUNT` | Skips errors (canon). **V1 divergence**: skips text/bools UNCONDITIONALLY (Excel canon distinguishes direct literal args from range/ref args — direct `COUNT(TRUE, "1")` counts 2 in Excel but 0 in Quantbook). Provenance-aware dispatch is deferred. | 🟢 errors / 🟡 direct-args | `count_skips_errors_canon`, `count_skips_text_and_bools_v1_divergence`, `count_direct_bool_and_numeric_text_v1_divergence` |
 | `COUNTA` | **Counts errors** (diverges from COUNT here); skips only blanks | 🟢 | `counta_counts_errors_canon`, `counta_skips_only_blanks_canon` |
 | `MIN` / `MAX` | Empty range → 0 (Excel canon) | 🟢 | — (deferred to 4.4.C completion) |
 | `PRODUCT` | Default; blanks skipped | 🟢 | — |
@@ -118,9 +132,9 @@ All predicates **introspect** — never propagate errors.
 |---|---|---|---|
 | `MATCH` | Not found → `#N/A` (not propagation of arg error) | 🟢 | `match_not_found_is_na_canon` |
 | `VLOOKUP` | col_index<1 → `#VALUE!`; col_index>cols → `#REF!`; not found → `#N/A` | 🟢 | `vlookup_col_index_less_than_one_is_value_canon`, `vlookup_col_index_greater_than_cols_is_ref_canon`, `vlookup_not_found_is_na_canon` |
-| `HLOOKUP` | Mirror of VLOOKUP | 🟢 | (via VLOOKUP coverage; tests transitively) |
+| `HLOOKUP` | Mirror of VLOOKUP — separate function body (NOT a VLOOKUP alias) | 🟢 | `hlookup_row_index_less_than_one_is_value_canon`, `hlookup_row_index_greater_than_rows_is_ref_canon`, `hlookup_not_found_is_na_canon`, `hlookup_exact_match_returns_lower_row_canon` |
 | `INDEX` | row_num=0 / col_num=0 (array spill) → `#REF!` pending Phase 4.7; out-of-bounds → `#REF!` | 🟡 (V1 array-via-REF) | — |
-| `CHOOSE` | Out-of-bounds index → `#VALUE!`; Range arg returns `#VALUE!` (gotcha 16 in audit-protocol) | 🟢 | — |
+| `CHOOSE` | Out-of-bounds index → `#VALUE!`; Range arg returns `#VALUE!` (gotcha 16 in audit-protocol) | 🟢 canon / 🟡 range-arg | `choose_basic_picks_indexed_arg_canon`, `choose_index_less_than_one_is_value_canon`, `choose_index_greater_than_args_is_value_canon`, `choose_range_arg_returns_value_v1_divergence` |
 
 ### 3.5 Stats family
 
@@ -171,7 +185,7 @@ All predicates **introspect** — never propagate errors.
 |---|---|---|
 | `NOW` / `TODAY` | Non-deterministic; volatile dependency tracking via Phase 3.7 | 🟢 |
 | `RAND` / `RANDBETWEEN` | Non-deterministic; deterministic test-seed API exists (`set_test_rng_seed`) | 🟢 |
-| `AI` | Returns `#AI_NOT_AVAILABLE_V1` sentinel; provider lands Phase 6.6 | 🟡 (V1 sentinel) |
+| `AI` | Returns `#AI_NOT_AVAILABLE_V1` sentinel; provider lands Phase 6.6 | ⚪ (V1 sentinel, not yet implemented) |
 
 ---
 

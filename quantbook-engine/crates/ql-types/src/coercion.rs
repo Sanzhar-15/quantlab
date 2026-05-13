@@ -106,7 +106,10 @@ pub fn to_text_for_formula(v: &Value) -> Result<String, ErrorValue> {
 ///
 /// **W5-64 (Phase 4.4.A consolidation):** Replaces the private `coerce_text` helper that
 /// lived in `ql-functions::scalar_fns` and `value_to_concat_text` in `range_fns`. Behavior
-/// is byte-for-byte identical to those two paths.
+/// is byte-for-byte identical to those two paths for FINITE numeric and non-numeric inputs.
+/// **W5-67 closure (Sonnet mega-audit MEDIUM-S2 clarification):** raw
+/// `Value::Number(NaN/±Inf)` now returns `Err(#NUM!)` instead of rendering as `"NaN"` /
+/// `"inf"` — this is the deliberate Codex MEDIUM 1 policy change, not a regression.
 ///
 /// Rules:
 /// - `Error(e)` → propagate.
@@ -150,18 +153,29 @@ pub fn format_number_for_arg(n: f64) -> String {
 /// (e.g. LEFT, MID, FIND, REPT, RANK k).
 ///
 /// **W5-64 (Phase 4.4.A consolidation):** Replaces the private `coerce_int_arg` helper in
-/// `ql-functions::scalar_fns`. Behavior is byte-for-byte identical, including the
-/// lossy-discard of the lenient-parse error for Text args.
+/// `ql-functions::scalar_fns`. Byte-for-byte identical for finite Number inputs.
+///
+/// **W5-67 closure (Codex mega-audit MEDIUM 3):** NaN/Inf Number inputs now return
+/// `Err(#NUM!)`. Previously `n.trunc() as i64` cast silently — `f64::INFINITY as i64`
+/// gives `i64::MAX` on most targets, which would have leaked into position/length args
+/// as a giant integer. Aligns this helper with the W5-64 central NaN/Inf policy.
 ///
 /// Rules:
-/// - `Number(n)` → `n.trunc() as i64` (truncate toward zero).
+/// - `Number(n)` finite → `n.trunc() as i64` (truncate toward zero).
+/// - `Number(NaN/±Inf)` → `Err(#NUM!)`.
 /// - `Boolean(true)` → `1`; `Boolean(false)` → `0`.
 /// - `Blank` → `0`.
 /// - `Text(s)` → lenient-parse-then-truncate; parse failure → `Err(#VALUE!)`.
 /// - `Error(e)` → propagate.
 pub fn to_int_arg(v: &Value) -> Result<i64, ErrorValue> {
     match v {
-        Value::Number(n) => Ok(n.trunc() as i64),
+        Value::Number(n) => {
+            if n.is_nan() || n.is_infinite() {
+                Err(ErrorValue::Num)
+            } else {
+                Ok(n.trunc() as i64)
+            }
+        }
         Value::Boolean(b) => Ok(if *b { 1 } else { 0 }),
         Value::Blank => Ok(0),
         Value::Text(s) => match to_number_lenient(&Value::Text(s.clone())) {
@@ -1011,6 +1025,23 @@ mod tests {
         for e in ErrorValue::ALL {
             assert_eq!(to_int_arg(&Value::Error(e)).unwrap_err(), e);
         }
+    }
+
+    // W5-67 closure (Codex Phase 4.4 mega-audit MEDIUM 3):
+    #[test]
+    fn to_int_arg_nan_inf_is_num_error() {
+        assert_eq!(
+            to_int_arg(&Value::Number(f64::NAN)).unwrap_err(),
+            ErrorValue::Num
+        );
+        assert_eq!(
+            to_int_arg(&Value::Number(f64::INFINITY)).unwrap_err(),
+            ErrorValue::Num
+        );
+        assert_eq!(
+            to_int_arg(&Value::Number(f64::NEG_INFINITY)).unwrap_err(),
+            ErrorValue::Num
+        );
     }
 
     // -- to_number_strict_skip_blank (aggregate-skip API) ---------------------

@@ -1469,9 +1469,12 @@ pub fn trim(args: &[Value]) -> Value {
 // ZWJ sequences. Documented in `docs/compat/excel-matrix.md`;
 // pinned to Phase 4.9.
 
-/// Helper: coerce a Value to an integer arg for position/length
-/// fields in text functions. Numbers truncate; Bool 1/0; Blank 0;
-/// Text rejected as #VALUE!; Error propagates.
+// Integer-arg coercion for text-function position/length fields.
+// **W5-67 closure (Codex mega-audit LOW 1):** the prior comment said "Text
+// rejected as #VALUE!" — actually `to_int_arg` parses text leniently via
+// `to_number_lenient` and only returns `#VALUE!` on parse FAILURE. See
+// `ql_types::coercion::to_int_arg` for the canonical contract.
+//
 // W5-64 (Phase 4.4.A): private `coerce_int_arg` was promoted to
 // `ql_types::coercion::to_int_arg`. Local alias retained for in-module
 // callers (LEFT, RIGHT, MID, FIND, SEARCH, REPLACE, REPT, SUBSTITUTE).

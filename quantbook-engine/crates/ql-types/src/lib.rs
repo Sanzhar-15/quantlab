@@ -4,7 +4,8 @@
 //! - [`error`] — the 14-variant `ErrorValue` (Excel sigils + Quantbook-specific surfaces + AI reservation).
 //! - [`value`] — the 5-variant `Value` (`Blank | Number | Boolean | Text | Error`).
 //! - [`coercion`] — Excel-compatible boundary functions: `to_number_{strict,lenient}`,
-//!   `to_logical`, `to_text_for_{display,formula}`, `sanitize_f64`.
+//!   `to_logical`, `to_text_for_{display,formula,arg}`, `to_int_arg`,
+//!   `to_number_strict_skip_blank`, `format_number_for_arg`, `sanitize_f64`.
 //! - [`address`] — cell coordinate types: `SheetId`, `RowId`, `ColId`, `Address`, `Range`.
 //!
 //! Spec: `.plans/_QUANTBOOK-v1-SPECIFICATION.md` Part V §2 Week 2 Day 1-2.
@@ -19,7 +20,8 @@ pub mod value;
 
 pub use address::{Address, ColId, Range, RowId, SheetId, MAX_COLUMN, MAX_ROW};
 pub use coercion::{
-    sanitize_f64, to_logical, to_number_lenient, to_number_strict, to_text_for_display,
+    format_number_for_arg, sanitize_f64, to_int_arg, to_logical, to_number_lenient,
+    to_number_strict, to_number_strict_skip_blank, to_text_for_arg, to_text_for_display,
     to_text_for_formula,
 };
 pub use error::{ErrorValue, ParseErrorValueError};

@@ -40,11 +40,14 @@ fn n(x: f64) -> Value {
 }
 
 // ============================================================================
-// COUNT — skips errors, blanks, text, bools; counts only Number cells
+// COUNT — skips errors (canon) + V1 divergence: skips text/bools
+// unconditionally (Excel direct-arg semantics not implemented)
 // ============================================================================
 
 #[test]
 fn count_skips_errors_canon() {
+    // Errors-in-range behavior: Excel COUNT canon skips errors (does NOT
+    // propagate). This part matches.
     let reg = default_registry();
     let count = reg.lookup("COUNT").expect("COUNT is registered");
     let args = [
@@ -59,7 +62,19 @@ fn count_skips_errors_canon() {
 }
 
 #[test]
-fn count_skips_text_and_blanks_canon() {
+fn count_skips_text_and_bools_v1_divergence() {
+    // **W5-67 closure (Codex mega-audit HIGH 1):** Excel COUNT canon
+    // distinguishes DIRECT literal args from RANGE/REF args:
+    //  - Direct args: COUNT(TRUE, "1") → 2 (counts logical + numeric text)
+    //  - Range/ref:   COUNT(A1:A2) where A1=TRUE, A2="1" → 0
+    // Quantbook's eval dispatcher pre-evaluates all args before calling
+    // the function, so the count() function CANNOT distinguish provenance.
+    // Current behavior: ALWAYS skips text/bool (matches the range/ref case
+    // but NOT the direct-arg case).
+    //
+    // This is an intentional V1 divergence — provenance-aware dispatch
+    // would require a much larger arg-shape refactor. Pinned here as
+    // V1-divergence so the matrix doc tag (🟡) is enforced.
     let reg = default_registry();
     let count = reg.lookup("COUNT").expect("COUNT is registered");
     let args = [
@@ -69,8 +84,25 @@ fn count_skips_text_and_blanks_canon() {
         Value::Number(2.0),
         Value::Boolean(true),
     ];
-    // Only the two Number cells count.
+    // Only the two Number cells count. Excel (direct args) would also
+    // count Boolean(true) and text "hello"? No — "hello" doesn't parse
+    // as numeric. So Excel direct-arg would count: 1.0, 2.0, true → 3.
+    // We return 2. This is the divergence; pinned.
     assert_eq!(count(&args), Value::Number(2.0));
+}
+
+#[test]
+fn count_direct_bool_and_numeric_text_v1_divergence() {
+    // Sharper version of the divergence test from the Codex mega-audit:
+    // COUNT(TRUE, "1") — Excel direct-arg returns 2; Quantbook returns 0.
+    let reg = default_registry();
+    let count = reg.lookup("COUNT").expect("COUNT is registered");
+    let args = [Value::Boolean(true), Value::text("1")];
+    assert_eq!(
+        count(&args),
+        Value::Number(0.0),
+        "V1 divergence: Excel direct-arg canon would return 2"
+    );
 }
 
 // ============================================================================
@@ -313,6 +345,151 @@ fn vlookup_not_found_is_na_canon() {
         vlookup(&[s(n(99.0)), table, s(n(2.0)), s(Value::Boolean(false))]),
         Value::Error(ErrorValue::NA)
     );
+}
+
+// W5-67 closure (Sonnet HIGH-S1): HLOOKUP had ZERO test coverage in this
+// matrix file despite the section header naming it. HLOOKUP is a separate
+// function body (range_fns.rs:656), NOT a VLOOKUP alias — each of the
+// three error paths needs explicit pinning.
+
+#[test]
+fn hlookup_row_index_less_than_one_is_value_canon() {
+    let reg = default_registry();
+    let hlookup = reg.lookup_range_aware("HLOOKUP").expect("HLOOKUP");
+    // 2x2 table: first row {1, 2}, second row {10, 20}. HLOOKUP searches
+    // the first row.
+    let table = r2d(vec![n(1.0), n(2.0), n(10.0), n(20.0)], 2, 2);
+    // row_index = 0 → #VALUE!.
+    assert_eq!(
+        hlookup(&[s(n(1.0)), table, s(n(0.0))]),
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+#[test]
+fn hlookup_row_index_greater_than_rows_is_ref_canon() {
+    let reg = default_registry();
+    let hlookup = reg.lookup_range_aware("HLOOKUP").expect("HLOOKUP");
+    let table = r2d(vec![n(1.0), n(2.0), n(10.0), n(20.0)], 2, 2);
+    // row_index = 5 (only 2 rows) → #REF!.
+    assert_eq!(
+        hlookup(&[s(n(1.0)), table, s(n(5.0))]),
+        Value::Error(ErrorValue::Ref)
+    );
+}
+
+#[test]
+fn hlookup_not_found_is_na_canon() {
+    let reg = default_registry();
+    let hlookup = reg.lookup_range_aware("HLOOKUP").expect("HLOOKUP");
+    let table = r2d(vec![n(1.0), n(2.0), n(10.0), n(20.0)], 2, 2);
+    // Looking for 99 with exact-match → #N/A.
+    assert_eq!(
+        hlookup(&[s(n(99.0)), table, s(n(2.0)), s(Value::Boolean(false))]),
+        Value::Error(ErrorValue::NA)
+    );
+}
+
+#[test]
+fn hlookup_exact_match_returns_lower_row_canon() {
+    let reg = default_registry();
+    let hlookup = reg.lookup_range_aware("HLOOKUP").expect("HLOOKUP");
+    let table = r2d(vec![n(1.0), n(2.0), n(10.0), n(20.0)], 2, 2);
+    // HLOOKUP for 2 (second col) in row 2 → 20.
+    assert_eq!(
+        hlookup(&[s(n(2.0)), table, s(n(2.0)), s(Value::Boolean(false))]),
+        n(20.0)
+    );
+}
+
+// ============================================================================
+// CHOOSE — out-of-bounds index, error handling (W5-67 closure Codex HIGH 2)
+// ============================================================================
+
+#[test]
+fn choose_basic_picks_indexed_arg_canon() {
+    let reg = default_registry();
+    let choose = reg.lookup_range_aware("CHOOSE").expect("CHOOSE");
+    // CHOOSE(2, "a", "b", "c") → "b".
+    assert_eq!(
+        choose(&[
+            s(n(2.0)),
+            s(Value::text("a")),
+            s(Value::text("b")),
+            s(Value::text("c"))
+        ]),
+        Value::text("b")
+    );
+}
+
+#[test]
+fn choose_index_less_than_one_is_value_canon() {
+    let reg = default_registry();
+    let choose = reg.lookup_range_aware("CHOOSE").expect("CHOOSE");
+    assert_eq!(
+        choose(&[s(n(0.0)), s(n(10.0)), s(n(20.0))]),
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+#[test]
+fn choose_index_greater_than_args_is_value_canon() {
+    let reg = default_registry();
+    let choose = reg.lookup_range_aware("CHOOSE").expect("CHOOSE");
+    // index 5, only 2 choice args.
+    assert_eq!(
+        choose(&[s(n(5.0)), s(n(10.0)), s(n(20.0))]),
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+// ============================================================================
+// ROUNDUP / ROUNDDOWN — binary-float vs Excel 15-digit display rounding
+// (W5-67 closure: Sonnet mega-audit MEDIUM-S5 — divergence was documented
+// in matrix but had no pinning test, so could silently regress.)
+// ============================================================================
+
+#[test]
+fn roundup_binary_float_divergence_v1_divergence() {
+    // Excel canon: ROUNDUP(0.1 + 0.2, 1) = 0.3 (15-digit display rounding
+    // sees 0.30000000000000004 as 0.3 to 15 sig figs).
+    // Quantbook V1: f64 arithmetic gives 0.30000000000000004, which rounds
+    // UP to 0.4 at 1 decimal place.
+    let reg = default_registry();
+    let roundup = reg.lookup("ROUNDUP").expect("ROUNDUP registered");
+    let result = roundup(&[n(0.1 + 0.2), n(1.0)]);
+    // Pin the V1 divergence — if this assertion changes (e.g. we move to
+    // decimal arithmetic in Phase 4.5), it's a deliberate behavior change
+    // and the matrix doc must update in lockstep.
+    assert_eq!(
+        result,
+        n(0.4),
+        "V1 binary-float divergence from Excel canon (0.3)"
+    );
+}
+
+#[test]
+fn rounddown_binary_float_well_behaved_for_clean_values() {
+    // Control: ROUNDDOWN doesn't have the same divergence for clean inputs.
+    let reg = default_registry();
+    let rounddown = reg.lookup("ROUNDDOWN").expect("ROUNDDOWN registered");
+    assert_eq!(rounddown(&[n(2.7), n(0.0)]), n(2.0));
+    assert_eq!(rounddown(&[n(2.7), n(1.0)]), n(2.7));
+    assert_eq!(rounddown(&[n(-2.7), n(0.0)]), n(-2.0));
+}
+
+#[test]
+fn choose_range_arg_returns_value_v1_divergence() {
+    // V1 gotcha (audit-protocol § 16): CHOOSE expects scalar args. A Range
+    // arg gets eagerly evaluated to FnArg::Scalar(Value::Error(#VALUE!)) by
+    // the dispatcher, OR (depending on dispatch path) reaches the function
+    // as FnArg::Range — which CHOOSE's scalar-only implementation rejects.
+    // Either way, the visible behavior is #VALUE!.
+    let reg = default_registry();
+    let choose = reg.lookup_range_aware("CHOOSE").expect("CHOOSE");
+    let range_arg = r(vec![n(1.0), n(2.0)]);
+    let v = choose(&[s(n(1.0)), range_arg, s(n(99.0))]);
+    assert_eq!(v, Value::Error(ErrorValue::Value));
 }
 
 // ============================================================================
