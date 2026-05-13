@@ -26,6 +26,12 @@ pub struct Sheet {
     columns: Vec<ColumnStore>,
     bounds: Bounds,
     chunk_rows: u32,
+    /// **W5-79 (Phase 4.5.D part 3):** per-sheet sparse cell-format
+    /// overlay. Cells without an entry render via `FormatId::GENERAL`.
+    /// Resolution: lookup the id here, then call
+    /// `workbook.formats().lookup(id)` to get the format-string, parse,
+    /// and render.
+    format_overlay: crate::CellFormatOverlay,
 }
 
 impl Sheet {
@@ -41,7 +47,23 @@ impl Sheet {
             columns: Vec::new(),
             bounds: Bounds::default(),
             chunk_rows,
+            format_overlay: crate::CellFormatOverlay::new(),
         }
+    }
+
+    /// **W5-79 (Phase 4.5.D part 3):** read access to the per-sheet
+    /// cell-format overlay.
+    pub fn format_overlay(&self) -> &crate::CellFormatOverlay {
+        &self.format_overlay
+    }
+
+    /// **W5-79 (Phase 4.5.D part 3):** mutable access for `set` /
+    /// `clear`. Phase 4.5.D part 4 (W5-80) will route mutations through
+    /// `WorkbookRuntime::set_cell_format` so they emit
+    /// `Op::SetCellFormat`; direct access stays available for the
+    /// loader + tests.
+    pub fn format_overlay_mut(&mut self) -> &mut crate::CellFormatOverlay {
+        &mut self.format_overlay
     }
 
     pub fn name(&self) -> &str {

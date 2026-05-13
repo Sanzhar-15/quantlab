@@ -14,11 +14,15 @@
 //! overlay (`ColumnStore::put`) and are never applied to the base array directly.
 
 pub mod column;
+pub mod format;
+pub mod format_overlay;
 pub mod overlay;
 pub mod sheet;
 pub mod workbook;
 
 pub use column::{chunk_rows_from_env, ColumnStore, DEFAULT_CHUNK_ROWS};
+pub use format::{FormatId, FormatTable, FormatTableError, FIRST_CUSTOM_FORMAT_ID};
+pub use format_overlay::CellFormatOverlay;
 pub use overlay::SparseOverlay;
 pub use sheet::{Bounds, Sheet};
 pub use workbook::{NameTable, NameTableError, NamedTarget, Workbook};
@@ -41,5 +45,58 @@ mod tests {
         let _: Sheet = Sheet::new("t");
         let _: NameTable = NameTable::new();
         let _: Bounds = Bounds::default();
+    }
+
+    // ===== W5-79 / Phase 4.5.D part 3 — FormatTable + overlay integration =====
+
+    #[test]
+    fn workbook_default_has_format_table_with_builtins() {
+        let wb = Workbook::new();
+        assert_eq!(wb.formats().lookup(FormatId::GENERAL), Some("General"));
+        assert_eq!(wb.formats().lookup(FormatId(14)), Some("m/d/yyyy"));
+    }
+
+    #[test]
+    fn workbook_intern_returns_existing_builtin_id() {
+        let mut wb = Workbook::new();
+        let id = wb.formats_mut().intern("0.00");
+        assert_eq!(id, FormatId(2));
+    }
+
+    #[test]
+    fn workbook_intern_new_string_allocates_custom_id() {
+        let mut wb = Workbook::new();
+        let id = wb.formats_mut().intern("\"⚓\" #,##0");
+        assert_eq!(id.0, FIRST_CUSTOM_FORMAT_ID);
+    }
+
+    #[test]
+    fn sheet_format_overlay_starts_empty() {
+        let s = Sheet::new("Sheet1");
+        assert!(s.format_overlay().is_empty());
+    }
+
+    #[test]
+    fn sheet_format_overlay_set_and_clear_round_trip() {
+        let mut s = Sheet::new("Sheet1");
+        s.format_overlay_mut().set(3, 5, FormatId(14));
+        assert_eq!(s.format_overlay().get(3, 5), Some(FormatId(14)));
+        s.format_overlay_mut().clear(3, 5);
+        assert!(s.format_overlay().get(3, 5).is_none());
+    }
+
+    #[test]
+    fn workbook_independent_sheets_have_independent_overlays() {
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet_with_chunk_rows("A", 16);
+        let s1 = wb.add_sheet_with_chunk_rows("B", 16);
+        // Compose: set a format on A:(0,0) via the table + overlay APIs.
+        let id = wb.formats_mut().intern("yyyy-mm-dd");
+        wb.sheet_mut(s0).unwrap().format_overlay_mut().set(0, 0, id);
+        // Sheet B should not see the entry.
+        assert_eq!(wb.sheet(s0).unwrap().format_overlay().get(0, 0), Some(id));
+        assert_eq!(wb.sheet(s1).unwrap().format_overlay().get(0, 0), None);
+        // FormatTable lookup resolves back to the source string.
+        assert_eq!(wb.formats().lookup(id), Some("yyyy-mm-dd"));
     }
 }

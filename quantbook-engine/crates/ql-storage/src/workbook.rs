@@ -235,6 +235,13 @@ pub struct Workbook {
     /// `date1904` SST flag. Functions read this via
     /// `WorkbookEnv::eval_context()` to drive serial ↔ date conversion.
     date_system: ql_types::DateSystem,
+    /// **W5-79 (Phase 4.5.D part 3):** workbook-level format-string
+    /// interning table. Cells with non-General formats reference an id
+    /// into this table via per-sheet [`crate::CellFormatOverlay`].
+    /// Default loads the Excel built-ins from
+    /// `docs/architecture/2026-05-13-format-string-grammar.md` § 10
+    /// (parser-relevant subset).
+    formats: crate::FormatTable,
 }
 
 impl Workbook {
@@ -263,6 +270,20 @@ impl Workbook {
     /// rebuild it. Treat this method as loader-only.
     pub fn set_date_system(&mut self, system: ql_types::DateSystem) {
         self.date_system = system;
+    }
+
+    /// **W5-79 (Phase 4.5.D part 3):** read access to the workbook's
+    /// format-string interning table.
+    pub fn formats(&self) -> &crate::FormatTable {
+        &self.formats
+    }
+
+    /// **W5-79 (Phase 4.5.D part 3):** mutable access for `intern` /
+    /// `register_at`. Phase 4.5.D part 4 (W5-80) will route mutations
+    /// through `WorkbookRuntime::register_format` so they land in the
+    /// op log; direct access stays available for the loader + tests.
+    pub fn formats_mut(&mut self) -> &mut crate::FormatTable {
+        &mut self.formats
     }
 
     pub fn sheet_count(&self) -> usize {
