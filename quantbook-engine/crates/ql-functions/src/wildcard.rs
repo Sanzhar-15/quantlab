@@ -13,6 +13,25 @@
 //!
 //! Matching is **case-insensitive** by Excel canon.
 //!
+//! ## Unicode case-expansion divergence (W5-62 Codex audit M1)
+//!
+//! Rust's `to_uppercase()` can expand one Unicode scalar into MULTIPLE
+//! chars (e.g. German `ß` → `SS`). Our matcher uppercases the entire
+//! text and pattern before comparing, which means:
+//!
+//! 1. `?` (AnyOne) no longer maps to "exactly one ORIGINAL Unicode
+//!    scalar" — it maps to "exactly one char of the uppercased
+//!    buffer." A `?` consuming the second char of an expanded `ß → SS`
+//!    leaves the first `S` unmatched, which is semantically odd.
+//! 2. `WildcardPattern::search_in` returns positions in the
+//!    UPPERCASED buffer. For chars that expand on uppercasing, the
+//!    returned 1-based position drifts from the original-string
+//!    position the caller expected.
+//!
+//! These are documented divergences from Excel's canon, pinned at
+//! Phase 4.9 (Unicode/UTF-16 work). Same divergence class as the
+//! existing UPPER/LOWER and LEN char-count notes.
+//!
 //! Used by:
 //! - `range_fns::build_predicate` — when SUMIF/COUNTIF/SUMIFS/AVERAGEIF
 //!   criteria text contains unescaped wildcards.
@@ -112,66 +131,111 @@ impl WildcardPattern {
 }
 
 /// Whole-string match: pattern must consume entire input.
+///
+/// **W5-62 audit closure (Sonnet HIGH H2 / Codex LOW L2):** The
+/// prior recursive implementation backtracked exponentially on
+/// pathological patterns like `a*a*a*a*a*a*a*a*a*a*b` over short
+/// inputs. Sonnet measured 3.61s for a 30-char input. Switched to
+/// the classic iterative two-pointer glob algorithm: track the
+/// last-seen `*` position in pattern and the corresponding position
+/// in text; on mismatch, roll back to (last star + 1, text idx + 1).
+/// Worst case is O(n · m), with O(n + m) on typical inputs.
 fn match_parts(text: &[char], parts: &[Part]) -> bool {
-    match parts.split_first() {
-        None => text.is_empty(),
-        Some((Part::Literal(lit), rest)) => {
-            let lit_chars: Vec<char> = lit.chars().collect();
-            if text.len() < lit_chars.len() {
-                return false;
-            }
-            if text[..lit_chars.len()] != lit_chars[..] {
-                return false;
-            }
-            match_parts(&text[lit_chars.len()..], rest)
-        }
-        Some((Part::AnyOne, rest)) => {
-            if text.is_empty() {
-                return false;
-            }
-            match_parts(&text[1..], rest)
-        }
-        Some((Part::Star, rest)) => {
-            // Try each suffix of `text` against `rest`.
-            for i in 0..=text.len() {
-                if match_parts(&text[i..], rest) {
-                    return true;
-                }
-            }
-            false
-        }
-    }
+    iterative_glob(text, parts, /* prefix_ok = */ false)
 }
 
 /// Prefix match: pattern must match a prefix of the input (rest is
-/// ignored). Used for substring search via SEARCH.
+/// ignored). Used for substring search via SEARCH. Same iterative
+/// algorithm with `prefix_ok = true` so reaching end-of-pattern with
+/// leftover text counts as a match.
 fn match_prefix(text: &[char], parts: &[Part]) -> bool {
-    match parts.split_first() {
-        None => true, // Empty pattern matches the empty prefix.
-        Some((Part::Literal(lit), rest)) => {
-            let lit_chars: Vec<char> = lit.chars().collect();
-            if text.len() < lit_chars.len() {
-                return false;
+    iterative_glob(text, parts, /* prefix_ok = */ true)
+}
+
+/// Iterative glob matcher with O(n·m) worst case (no exponential
+/// backtracking). Handles `Literal`, `AnyOne`, and `Star` parts.
+///
+/// Algorithm: walk text and pattern in lockstep. When we hit a
+/// `Star`, remember the pattern position (`star_pi`) and text
+/// position (`star_ti`). On mismatch later, roll back to the slot
+/// after the star, advancing text by one (i.e., star consumed one
+/// more char). The check for pattern-completion happens at the top
+/// of every loop iteration, so a successful end-match returns true
+/// before any spurious backtrack.
+fn iterative_glob(text: &[char], parts: &[Part], prefix_ok: bool) -> bool {
+    let n = text.len();
+    let m = parts.len();
+    let mut ti = 0usize;
+    let mut pi = 0usize;
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti: usize = 0;
+
+    loop {
+        // Pattern done? Check for completion before doing anything
+        // else. This is the critical fix vs the prior trace bug
+        // where a successful match could fall into a backtrack.
+        if pi == m {
+            if prefix_ok || ti == n {
+                return true;
             }
-            if text[..lit_chars.len()] != lit_chars[..] {
-                return false;
-            }
-            match_prefix(&text[lit_chars.len()..], rest)
-        }
-        Some((Part::AnyOne, rest)) => {
-            if text.is_empty() {
-                return false;
-            }
-            match_prefix(&text[1..], rest)
-        }
-        Some((Part::Star, rest)) => {
-            for i in 0..=text.len() {
-                if match_prefix(&text[i..], rest) {
-                    return true;
+            // Whole-match wants ti == n but we have leftover text.
+            // Try backtracking to last star to consume more.
+            if let Some(sp) = star_pi {
+                if star_ti < n {
+                    pi = sp + 1;
+                    star_ti += 1;
+                    ti = star_ti;
+                    continue;
                 }
             }
-            false
+            return false;
         }
+
+        // Try to advance the current pattern part.
+        let advanced = match &parts[pi] {
+            Part::Literal(lit) => {
+                let lit_chars: Vec<char> = lit.chars().collect();
+                let lit_len = lit_chars.len();
+                if ti + lit_len <= n && text[ti..ti + lit_len] == lit_chars[..] {
+                    ti += lit_len;
+                    pi += 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            Part::AnyOne => {
+                if ti < n {
+                    ti += 1;
+                    pi += 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            Part::Star => {
+                star_pi = Some(pi);
+                star_ti = ti;
+                pi += 1;
+                true
+            }
+        };
+
+        if advanced {
+            continue;
+        }
+
+        // Mismatch — backtrack to last star (have it consume one
+        // more char) and retry.
+        if let Some(sp) = star_pi {
+            if star_ti < n {
+                pi = sp + 1;
+                star_ti += 1;
+                ti = star_ti;
+                continue;
+            }
+        }
+        return false;
     }
 }
 
@@ -341,5 +405,46 @@ mod tests {
         let p = WildcardPattern::compile("?o");
         // "fool" — "fo" matches at index 0.
         assert_eq!(p.search_in("fool", 0), Some(0));
+    }
+
+    // W5-62: pathological-pattern perf regression test (Sonnet HIGH
+    // H2). Pre-W5-62 recursive matcher took ~3.6s for the 30-char
+    // input. The iterative algorithm should complete in <100ms.
+    #[test]
+    fn pathological_star_pattern_completes_quickly() {
+        let pat = "a*a*a*a*a*a*a*a*a*a*b";
+        let text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 30 'a', no 'b'
+        let p = WildcardPattern::compile(pat);
+        let start = std::time::Instant::now();
+        // No match (no 'b' in text).
+        assert!(!p.matches(text));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "pathological pattern took {elapsed:?}, expected <100ms; \
+             check for backtracking regression in iterative_glob"
+        );
+    }
+
+    #[test]
+    fn trailing_star_after_match() {
+        // Regression for the trace bug: "*c" against "abc" should
+        // match (end-of-pattern check must precede backtrack).
+        let p = WildcardPattern::compile("*c");
+        assert!(p.matches("abc"));
+        assert!(p.matches("c"));
+        assert!(!p.matches("ab"));
+    }
+
+    #[test]
+    fn multi_star_with_partial_literal() {
+        // "a*b*c" against various inputs.
+        let p = WildcardPattern::compile("a*b*c");
+        assert!(p.matches("abc"));
+        assert!(p.matches("a_b_c"));
+        assert!(p.matches("aXXXbYYYc"));
+        assert!(p.matches("abbc")); // a, then '' covered by *, then 'b', '', 'c'.
+        assert!(!p.matches("a")); // need 'b' and 'c' after.
+        assert!(!p.matches("ac")); // no 'b'.
     }
 }

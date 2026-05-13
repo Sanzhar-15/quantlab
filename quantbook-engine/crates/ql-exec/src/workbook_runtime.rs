@@ -2556,9 +2556,15 @@ mod tests {
             "SMALL",
             "RANK",
             "RANK.EQ",
+            // W5-62 audit closure (Codex M2 / Sonnet H1): the
+            // invariant test had drifted out of sync with the
+            // is_aggregate_function whitelist. RANK.AVG + CONCAT
+            // landed W5-61 but weren't pinned here.
+            "RANK.AVG",
             "MEDIAN",
             "MODE",
             "MODE.SNGL",
+            "CONCAT",
         ] {
             assert!(
                 reg.lookup_range_aware(name).is_some(),

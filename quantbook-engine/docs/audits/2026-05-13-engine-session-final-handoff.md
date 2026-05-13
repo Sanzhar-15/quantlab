@@ -6,7 +6,7 @@
 
 ## TL;DR (60 seconds)
 
-Branch `feat/quantbook-engine` ← 26 commits unpushed at W5-60 close. HEAD `51fedf11c68` (W5-59) plus W5-60 closure commit (this doc lives in W5-60). 1219 workspace tests at W5-60 close (1212 at W5-58, +1 from W5-59 MROUND test split, +6 from W5-60 2D-shape regression tests). All 7 gates green at every shippable point. **FN4-01 (function library wave 1) ✅ CLOSED** at 102 registry entries. Phase 4.3 is functionally complete; polish items deferred to a Phase 4.3 polish micro-batch. Phase 4.4 (Coercion + Error Matrix) is the recommended next architectural beat.
+Branch `feat/quantbook-engine` ← 28 commits unpushed at W5-62 close. HEAD: W5-62 closure (look up via `git log --oneline -3`). Prior ship points: `f17a460efca` (W5-60), `90aea91f843` (W5-61 polish wave 1), W5-62 closure on top. Tests at W5-62 close: 1290+ workspace tests; growth across the polish + closure batch tracked per-commit. All 7 gates green at every shippable point. **FN4-01 (function library wave 1) ✅ CLOSED** at 102 registry entries. Phase 4.3 is functionally complete; polish items deferred to a Phase 4.3 polish micro-batch. Phase 4.4 (Coercion + Error Matrix) is the recommended next architectural beat.
 
 **Three correctness gaps from prior phases closed this session:** GAP-G-01 (rebind staleness, including W5-52 clear-formula path closure), GAP-G-03 (range deps not scheduler edges), GAP-F-05 (function-signature can't carry range-vs-scalar metadata).
 
@@ -153,8 +153,8 @@ Each of these is in `docs/compat/excel-matrix.md` with the divergence detail. Th
 2. **ROUNDUP / ROUNDDOWN binary-float vs Excel 15-digit display rounding**. `ROUNDUP(0.1 + 0.2, 1)` returns `0.4` (binary), Excel canon `0.3` (decimal-display). Pin Phase 4.5.
 3. **UPPER / LOWER Unicode-default mapping** (Rust `to_uppercase` / `to_lowercase`) vs Excel's locale-sensitive rules. German `ß → SS` (Quantbook) vs `ß` (Excel). Pin Phase 4.9.
 4. **Text in range arg of SUM-family** returns `#VALUE!` (Quantbook strict). Excel typically SKIPS text cells in a range. Documented; matches existing SUM behavior.
-5. **SEARCH wildcards (`?` / `*`)** treated as literal chars in V1. Pin Phase 4.3 polish (next batch).
-6. **SUMIF / COUNTIF criteria wildcards** treated as literal chars in V1. Same deferral.
+5. **SEARCH / SUMIF / COUNTIF wildcards** ✅ SHIPPED W5-61 (`?`, `*`, `~` escape). Wildcards in criteria are TEXT-CELL only (Codex W5-62 audit fix: non-text cells out-of-scope for both Eq and Ne).
+6. **Unicode case-expansion vs wildcards** — Rust's `to_uppercase()` expands `ß → SS`. `?` consumes one uppercased char (not one original scalar); SEARCH returns position in uppercased buffer. Same divergence class as UPPER/LOWER + LEN. Pin Phase 4.9.
 7. **`to_number_strict` rejects Inf/NaN at INPUT** (not at output via sanitize_f64). Affects trig fns: `Value::Number(f64::INFINITY)` returns `#NUM!` even for fns like `atan` whose math is well-defined for ±∞.
 8. **FLOOR(n, 0) vs CEILING(n, 0)** diverge: FLOOR returns `#DIV/0!` (matching `n/0`); CEILING returns `0`. Per Excel canon.
 
@@ -171,15 +171,21 @@ Each of these is in `docs/compat/excel-matrix.md` with the divergence detail. Th
 
 ## Open gaps + carryovers
 
-### Polish items (Phase 4.3 polish — NOT gating wave 1 closure)
+### Polish items
 
+**Phase 4.3 polish wave 1 — SHIPPED W5-61 (mega-audit closure W5-62):**
+- ✅ Wildcards in SUMIF / COUNTIF / SUMIFS / AVERAGEIF / SEARCH (`?`, `*`, `~` escape).
+- ✅ CONCAT (range-aware variant; 32K char cap enforced W5-62).
+- ✅ PROPER (title-case).
+- ✅ CLEAN (strip ASCII 0x00–0x1F).
+- ✅ RANK.AVG (average rank for ties).
+- ✅ CEILING.MATH (abs-significance + mode flag).
+- ✅ FLOOR.MATH (mirror).
+
+**Polish remaining (deferred / future waves):**
 - **FN4-03** — IF / IFERROR lazy eval. Requires `scalar.rs` Function-branch refactor to defer arg eval for selected lazy functions. Documented in known-gaps GAP-F-02.
-- **Wildcards in SUMIF / COUNTIF / SEARCH** (`?` for single char, `*` for any chars). V1 treats them as literal chars. Documented in matrix + commit messages.
-- **CONCAT** (range-aware variant of CONCATENATE). Needs `RangeAwareFn` integration.
-- **PROPER / CLEAN** — small scalar text fns.
-- **RANK.AVG** — different tie semantics from RANK / RANK.EQ. Defer Phase 4.10.
-- **CEILING.MATH / FLOOR.MATH** — mode-flag variants. Defer.
 - **MODE.MULT** — returns array of modes; needs spill support. Phase 4.7.
+- **CEILING.PRECISE / FLOOR.PRECISE** — additional rounding variants. Phase 4.10.
 
 ### Cross-phase carryovers
 
@@ -235,8 +241,8 @@ Full gotchas list: `docs/process/audit-protocol.md` § Critical gotchas.
 
 Per the merged plan (Claude + Codex), the next 5 sessions:
 
-1. **(IMMEDIATELY NEXT, after this finalization)** — Phase 4.3 polish micro-batch: wildcards in SUMIF/COUNTIF/SEARCH, CONCAT (range-aware), PROPER, CLEAN, RANK.AVG, CEILING.MATH/FLOOR.MATH. Keep MODE.MULT deferred (spill = Phase 4.7).
-2. **Phase 4.4 architectural decision** — Coercion + Error Semantics Matrix. Use W5-49-pattern: Plan mode + Codex-reviewed design doc at `docs/architecture/<date>-coercion-matrix.md`. No code in this session.
+1. **(IMMEDIATELY NEXT)** — **Phase 4.4 architectural decision** — Coercion + Error Semantics Matrix. Use W5-49-pattern: Plan mode + Codex-reviewed design doc at `docs/architecture/<date>-coercion-matrix.md`. No code in this session. (Phase 4.3 polish wave 1 SHIPPED W5-61, closed W5-62.)
+2. **Phase 4.4 implementation** — Centralized coercion module. Per-function audit against the matrix.
 3. **Phase 4.4 implementation** — Centralized coercion module. Per-function audit against the matrix.
 4. **Phase 4.5** — Dates / Times / Number Formats. Excel epoch policy + format parser. Substantial; use design-doc pattern.
 5. **Phase 4.6** — Cross-Sheet References + Sheet-Scoped Names. Token + AST + binder + runtime expansion. Re-audit graph supplemental and named-range behavior.

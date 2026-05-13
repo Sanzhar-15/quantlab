@@ -1,0 +1,71 @@
+# W5-61 mega-audit verdict
+
+W5-61 is mostly coherent, but I would not close it as-is. The wildcard engine handles the common `*`, `?`, and `~` cases, and SEARCH’s edge handling looks preserved by inspection. The main correctness problem is in predicate inversion: `<>wildcard` currently matches non-text cells even though the implementation docs and audit protocol claim wildcard criteria are text-cell only. There are also meaningful false-confidence gaps: the aggregate whitelist invariant test was not updated for `RANK.AVG` / `CONCAT`, Unicode case expansion can break wildcard `?` cardinality and SEARCH positions, `CONCAT` is marked ✅ without enforcing the 32,767-character text result cap, and stale handoff/master-plan docs still describe shipped W5-61 items as pending. I could not run Rust tests in this sandbox because `cargo` is unavailable (`zsh: command not found: cargo`).
+
+## NEW HIGH
+
+1. `<>wildcard` matches numbers/bools/errors despite the W5-61 contract saying wildcard criteria are text-cell only.
+
+`Predicate::TextWildcard` computes `is_match = false` for all non-text/non-blank values, then returns `!is_match` for `CmpOp::Ne`, so every number, bool, and error cell matches `<>ap*`, `<>~?`, etc. See [range_fns.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/range_fns.rs:156), especially lines 159-167.
+
+This contradicts the code comment at [range_fns.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/range_fns.rs:88), the audit protocol at [audit-protocol.md](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/process/audit-protocol.md:318), and the matrix wording “only against text cells” at [excel-matrix.md](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/compat/excel-matrix.md:62). Existing tests only cover positive wildcard not matching numbers and `<>ap*` over all-text ranges, so the mixed-type inversion hole is untested at [range_fns.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/range_fns.rs:1710) and [range_fns.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/range_fns.rs:1721).
+
+## NEW MEDIUM
+
+1. Unicode uppercase expansion breaks wildcard “one char” semantics and SEARCH positions.
+
+`WildcardPattern::matches` uppercases the whole text before matching, and `search_in` uppercases the haystack before indexing: [wildcard.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/wildcard.rs:87), [wildcard.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/wildcard.rs:100). Rust uppercasing can expand one scalar into multiple chars, e.g. `ß` -> `SS`. That means `?` no longer consumes exactly one original Unicode scalar, and SEARCH can return positions in the uppercased buffer rather than the original text. This is not covered by the existing Unicode caveat, which talks about UTF-8 char-count vs UTF-16 but not case-fold expansion.
+
+2. The aggregate whitelist invariant test was not updated for the new range-aware entries.
+
+`is_aggregate_function` includes `RANK.AVG` and `CONCAT` at [plan.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/plan.rs:234) and [plan.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/plan.rs:239), and both are registered at [registry.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/registry.rs:294). But the invariant test’s range-aware list stops at `MODE.SNGL`; it does not assert `RANK.AVG` or `CONCAT` are registered: [workbook_runtime.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/workbook_runtime.rs:2542). The current code happens to be synced, but the test no longer pins the invariant it claims to pin.
+
+3. `CONCAT` is marked ✅ without enforcing Excel’s 32,767-character text result cap.
+
+`CONCAT` appends indefinitely and returns `Value::text(out)` with no cap check: [range_fns.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/range_fns.rs:1375). The codebase already enforces the same text-result cap for `REPT`: [scalar_fns.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/scalar_fns.rs:1839). If the project is treating the 32,767 limit as canonical for text functions, `CONCAT` should either enforce it or be downgraded from ✅ in [excel-matrix.md](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/compat/excel-matrix.md:158).
+
+4. Stale canonical docs still list W5-61 work as pending.
+
+The W5-59 handoff still says SEARCH wildcards are deferred at [engine-session-final-handoff.md](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/audits/2026-05-13-engine-session-final-handoff.md:136), still lists `CONCAT` and `RANK.AVG` as polish/deferred at lines 178 and 180, and still says the immediate next item is the Phase 4.3 polish micro-batch at line 238. `MASTER-PLAN.md` also still lists the W5-61 shipped items as “Polish remaining” at [MASTER-PLAN.md](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/MASTER-PLAN.md:429).
+
+## NEW LOW
+
+1. SEARCH’s function comment says it falls back to the original substring path when no wildcards are present, but the code now always uses `WildcardPattern`.
+
+The stale comment is at [scalar_fns.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/scalar_fns.rs:1650). The implementation below it correctly routes unconditionally through `WildcardPattern::compile` and `search_in` at lines 1685-1694.
+
+2. Wildcard matching/search can regress badly on pathological patterns.
+
+`Star` recursively tries every suffix in both whole-match and prefix-match paths: [wildcard.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/wildcard.rs:134), [wildcard.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/wildcard.rs:167). `search_in` also tries the pattern at every start position: [wildcard.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/wildcard.rs:105). Acceptable for now, but worth recording as a perf gap if wildcard criteria become hot.
+
+## Per-concern assessment
+
+A: Common wildcard semantics are mostly correct: `?` rejects empty input at [wildcard.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/wildcard.rs:128), empty pattern matches only empty at line 117, trailing `~` becomes literal at lines 49-59, and `~~?` detection works because `has_wildcards` skips only one char after `~` at lines 181-187. Gap: Unicode uppercase expansion breaks “exactly one original char.”
+
+B: SEARCH boundary logic looks preserved by inspection: `start < 1` and `start > total + 1` return `#VALUE!`, empty needle returns `start`, and non-empty beyond end flows to `None`: [scalar_fns.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/scalar_fns.rs:1676). I could not run tests because `cargo` is unavailable.
+
+C: CEILING/FLOOR.MATH implementation matches the stated W5-61 behavior for ordinary finite numbers: abs significance, mode zero/nonzero branch, and zero significance cases are at [scalar_fns.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/scalar_fns.rs:948) and [scalar_fns.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/scalar_fns.rs:1007). Gaps: no tests for NaN or omitted empty third arg shape.
+
+D: PROPER/CLEAN are straightforward for ASCII and basic Unicode. CLEAN preserves DEL/Unicode by design via `>= 0x20`: [scalar_fns.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/scalar_fns.rs:1446). PROPER is per-scalar, not grapheme-aware: [scalar_fns.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/scalar_fns.rs:1425).
+
+E: RANK.AVG tie arithmetic is correct by inspection: ties counted with `==`, better counted by order, rank = `better + 1 + (ties - 1)/2`: [range_fns.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/range_fns.rs:1275). Empty and missing target return `#N/A`.
+
+F: CONCAT flattening is row-major because env range reads loop rows then cols at [env.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/env.rs:167) and [env.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/env.rs:182). Missing cap test/implementation remains.
+
+G: Over-routing on `~` is intentional and documented in code at [range_fns.rs](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/range_fns.rs:246). But `Ne` inversion over non-text cells is the HIGH.
+
+H: Whitelist implementation is synced, but the invariant test is stale and no longer covers the two W5-61 additions.
+
+I: Predicate compilation is once per formula evaluation, not per cell, which is fine for a single SUMIF pass. No caching across recalcs; record as perf follow-up, not closure-blocking.
+
+J: Coverage gaps: mixed-type `<>wildcard`, Unicode wildcard expansion, wildcard empty/trailing-tilde/`~~?`, SEARCH boundary cases, PROPER Unicode, CLEAN DEL, CONCAT 32K, RANK.AVG signed zero, CEILING/FLOOR NaN/mode blank.
+
+K: Matrix count/status was updated for COUNTIF and registry count is 108. Handoff/master-plan drift remains.
+
+## What's needed for W5-62 closure
+
+- Fix or explicitly re-spec `TextWildcard` `CmpOp::Ne` behavior for non-text cells, then add mixed-type `COUNTIF/SUMIF("<>pattern")` tests.
+- Add `RANK.AVG` and `CONCAT` to `is_aggregate_function_lists_only_registered_aggregates`.
+- Decide and enforce/document the `CONCAT` 32,767-char cap.
+- Add Unicode wildcard tests, especially `?` and SEARCH positions with uppercase-expanding chars.
+- Refresh handoff/master-plan text so W5-61 shipped work is no longer listed as pending.

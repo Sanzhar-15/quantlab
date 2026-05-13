@@ -1643,16 +1643,17 @@ pub fn find(args: &[Value]) -> Value {
 }
 
 /// `SEARCH(find_text, within_text, [start_num])` — like FIND but
-/// **case-insensitive**. **W5-61**: now honors Excel's `?` (single
-/// char) and `*` (zero or more chars) wildcards. Escape with `~`
-/// (`~?`, `~*`, `~~`).
+/// **case-insensitive**. **W5-61**: honors Excel's `?` (single char)
+/// and `*` (zero or more chars) wildcards. Escape with `~` (`~?`,
+/// `~*`, `~~`).
 ///
-/// When the find_text contains an unescaped wildcard, search uses
-/// the `wildcard::WildcardPattern` matcher (whole-pattern anchored
-/// search; returns the START position of the first match). Without
-/// wildcards, falls back to the original case-insensitive substring
-/// search (preserves the exact byte-for-byte behavior of pre-W5-61
-/// callers that don't use wildcard chars).
+/// **W5-62 (Codex audit L1):** SEARCH unconditionally routes through
+/// `WildcardPattern::search_in` regardless of whether the needle
+/// contains wildcards. A wildcard-free needle compiles to a single
+/// Literal part and behaves identically to a plain case-insensitive
+/// substring search (matched byte-for-byte against the pre-W5-61
+/// behavior in tests). Empty needle still short-circuits to
+/// `Number(start)`.
 pub fn search(args: &[Value]) -> Value {
     if args.len() < 2 || args.len() > 3 {
         return Value::Error(ErrorValue::Value);

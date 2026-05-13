@@ -154,13 +154,24 @@ impl Predicate {
                 }
             }
             Predicate::TextWildcard(op, pattern) => {
-                // Excel canon: wildcards target text cells. Blanks
-                // are matched against the empty string.
+                // Excel canon: wildcards target text cells. Numbers,
+                // Bools, and Errors are NEVER candidates for wildcard
+                // matching — for BOTH Eq and Ne.
+                //
+                // W5-62 Codex audit HIGH H1 fix: previously this
+                // computed `is_match=false` for non-text cells and
+                // then `!is_match` for Ne, which incorrectly made
+                // every Number / Bool / Error cell match `<>pattern`.
+                // The contract is "wildcard criteria only see text
+                // cells" — non-text cells are out-of-scope entirely.
+                let is_text_candidate = matches!(v, Value::Text(_) | Value::Blank);
+                if !is_text_candidate {
+                    return false;
+                }
                 let is_match = match v {
                     Value::Text(s) => pattern.matches(s.as_ref()),
                     Value::Blank => pattern.matches(""),
-                    // Non-text cells never match wildcard criteria.
-                    _ => false,
+                    _ => unreachable!("filtered above"),
                 };
                 match op {
                     CmpOp::Eq => is_match,
@@ -1372,21 +1383,40 @@ pub fn mode(args: &[FnArg]) -> Value {
 ///   the same path as CONCATENATE).
 /// - Errors propagate (the first error encountered is returned).
 /// - Ranges are flattened in row-major order.
+/// - **W5-62 (Codex M3 / Sonnet M1):** Excel's 32,767-character text
+///   result cap is enforced. If accumulated length would exceed,
+///   returns `#VALUE!`. Matches REPT's behavior.
 pub fn concat(args: &[FnArg]) -> Value {
     if args.is_empty() {
         return Value::Error(ErrorValue::Value);
     }
+    // Excel's text-result cap (also enforced by REPT). Counted in
+    // Unicode chars, not bytes — matches the existing REPT cap path.
+    const EXCEL_TEXT_CAP_CHARS: usize = 32_767;
     let mut out = String::new();
+    let mut char_count: usize = 0;
     for arg in args {
         match arg {
             FnArg::Scalar(v) => match value_to_concat_text(v) {
-                Ok(s) => out.push_str(&s),
+                Ok(s) => {
+                    char_count = char_count.saturating_add(s.chars().count());
+                    if char_count > EXCEL_TEXT_CAP_CHARS {
+                        return Value::Error(ErrorValue::Value);
+                    }
+                    out.push_str(&s);
+                }
                 Err(e) => return Value::Error(e),
             },
             FnArg::Range { values, .. } => {
                 for v in values {
                     match value_to_concat_text(v) {
-                        Ok(s) => out.push_str(&s),
+                        Ok(s) => {
+                            char_count = char_count.saturating_add(s.chars().count());
+                            if char_count > EXCEL_TEXT_CAP_CHARS {
+                                return Value::Error(ErrorValue::Value);
+                            }
+                            out.push_str(&s);
+                        }
                         Err(e) => return Value::Error(e),
                     }
                 }
@@ -1722,6 +1752,37 @@ mod tests {
         // "<>ap*" — NOT starting with "ap".
         let range = r(vec![t("apple"), t("apricot"), t("banana"), t("cherry")]);
         assert_eq!(countif(&[range, s(t("<>ap*"))]), n(2.0));
+    }
+
+    // W5-62 Codex audit HIGH H1: `<>wildcard` against mixed-type
+    // ranges (numbers + bools + errors + text) must NOT match the
+    // non-text cells. They are out-of-scope for wildcard criteria
+    // entirely — neither positive nor negative match.
+    #[test]
+    fn countif_wildcard_neq_does_not_match_numbers() {
+        // Range has 2 text "ap..." + 2 non-matching text + 2 numbers
+        // + 1 bool + 1 error. "<>ap*" should match only the 2
+        // non-matching TEXT cells. Numbers, bool, error are
+        // out-of-scope.
+        let range = r(vec![
+            t("apple"),
+            t("apricot"),
+            t("banana"),
+            t("cherry"),
+            n(1.0),
+            n(2.0),
+            Value::Boolean(true),
+            Value::Error(ErrorValue::Num),
+        ]);
+        assert_eq!(countif(&[range, s(t("<>ap*"))]), n(2.0));
+    }
+
+    #[test]
+    fn countif_wildcard_eq_does_not_match_numbers() {
+        // Symmetric: positive wildcard "5*" should not match number
+        // cells, even though Value::Number(5.0) renders as text "5".
+        let range = r(vec![n(5.0), n(50.0), t("5"), t("50")]);
+        assert_eq!(countif(&[range, s(t("5*"))]), n(2.0));
     }
 
     #[test]
@@ -2685,5 +2746,24 @@ mod tests {
     #[test]
     fn concat_empty_args_is_value_error() {
         assert_eq!(concat(&[]), Value::Error(ErrorValue::Value));
+    }
+
+    // W5-62 audit closure (Codex M3 / Sonnet M1): Excel's 32K char
+    // text-result cap must be enforced.
+    #[test]
+    fn concat_exceeds_32k_char_cap_is_value_error() {
+        // 33,000 single-char strings → 33,000 chars > 32,767.
+        let scalars: Vec<FnArg> = (0..33_000).map(|_| s(t("a"))).collect();
+        assert_eq!(concat(&scalars), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn concat_just_under_cap_succeeds() {
+        // 32,767 single-char strings → exactly at the cap.
+        let scalars: Vec<FnArg> = (0..32_767).map(|_| s(t("a"))).collect();
+        match concat(&scalars) {
+            Value::Text(s) => assert_eq!(s.chars().count(), 32_767),
+            other => panic!("expected Value::Text(32767 chars), got {other:?}"),
+        }
     }
 }
