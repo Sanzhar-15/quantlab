@@ -1,0 +1,156 @@
+Phase 4.6 cross-sheet references design review
+Date: 2026-05-13
+Scope: docs/architecture/2026-05-13-cross-sheet-references.md only. No shipped code reviewed as an implementation.
+
+Overall verdict: do not start W5-85 implementation from this doc as-is. The high-level "SheetId is canonical below the parser" direction is sound, and matches the sheet-by-id model in HyperFormula, but the doc still has unresolved contradictions around persisted formula text, eager parser resolution, schema compatibility, and range/sheet-prefix grammar. Those need to be closed in the design doc before code lands.
+
+HIGH findings
+
+HIGH-1: Rename survival is not actually specified for the persisted formula source.
+
+The doc says formulas survive rename because AST/plans carry SheetId, while `Op::PutFormula` and `.qbook` formula cells still persist raw formula text containing sheet names. That is a split-brain contract. A workbook can parse `Sheet2!A1`, store an AST/plan with `sheet = 1`, rename sheet 1 to `Data`, and continue evaluating from a cached plan. But the persisted formula text is still `Sheet2!A1` unless rename rewrites formula sources. On reload, replay, cache miss, or recompute after cache invalidation, eager parse will see `Sheet2` as unknown and fail.
+
+This directly conflicts with Decision 3, Decision 5.3, Decision 8.1, Decision 10.3, and XS-4-04. Formualizer handles this by rewriting AST/source references on rename and by tombstoning deleted-sheet references. HyperFormula keeps id/name mapping and has explicit placeholder/rename behavior. The Phase 4.6 doc needs one canonical rule:
+
+- either rename rewrites all stored formula texts and named-formula texts from old display name to new display name, with tests;
+- or `.qbook`/op-log persist a resolved formula representation alongside display text;
+- or parser/binder use a stable sheet-id-bearing token/source format internally and only print names at UI/export boundaries.
+
+Without that, "ids below parser" is true only for warm in-memory plans, not for the actual persisted workbook model.
+
+HIGH-2: Extending v4 in place contradicts the current qbook compatibility policy.
+
+The current qbook format uses `#[serde(deny_unknown_fields)]` and its documented policy says any future additive field requires a schema bump. Adding `scope` to `NamedEntry` or `NamedTargetWire` while keeping schema v4 means older v4 readers will treat the new file as "supported schema 4" and then fail during TOML deserialization with an unknown field, not with `UnsupportedSchema`. That is exactly the forward-compat hygiene the current schema policy was designed to avoid.
+
+The doc should require schema v5 for sheet-scoped names. It can still load v1-v4 by defaulting all existing names to workbook scope. But writing scoped names is a new persisted semantic, so the saved envelope must advertise v5.
+
+HIGH-3: Phase 4.6.A is not "pure syntax" if the parser eagerly resolves sheets to ids.
+
+Decision 5.3 chooses parser-time resolution, while Phase 4.6.A says lexer/parser/AST land with no runtime changes and standalone parse context errors on any sheet name. That is not a pure syntax milestone. It means `parse(lex("Sheet2!A1"))` cannot succeed without workbook state, and current printer round-trip tests, syntax-only IDE paths, and formula tooling must either plumb workbook sheet maps immediately or lose cross-sheet parse support.
+
+This is especially risky because the parser currently owns function/name/cell ambiguity, while name resolution intentionally happens later in the binder. Moving sheet-name resolution into parser creates a different phase boundary for sheets than for defined names. If eager resolution remains the choice, the doc needs an API migration plan: `parse()` legacy behavior, `parse_with_context()`, IDE syntax-highlight behavior when no workbook is available, diagnostic severity for unknown sheets, and how raw formula text is preserved for unresolved/renamed/deleted sheets. Otherwise use a lazy AST locator such as `SheetRef::Name(Arc<str>) | Id(SheetId) | Current` and resolve during bind.
+
+HIGH-4: Cross-sheet range semantics are under-specified and will likely parse incorrectly.
+
+IronCalc's test corpus includes `SUM(Sheet1!3:$3)`, `SUM('Second Sheet'!C:D)`, and `SUM(Sheet2!D4:C20)`. Those are the common forms the doc references, but Decision B only defines `sheet_qualifier? (cell_ref | range_ref)`. The current AST has one `sheet: Option<SheetId>` per `RangeRef`, so the parser must define how `Sheet2!D4:C20` is represented: the qualifier applies to the entire range, including the unqualified right endpoint. Current `build_range` style would otherwise combine `CellRef(Some(sheet))` with `CellRef(None)` and either drop the sheet or reject the range unless changed deliberately.
+
+The doc also needs explicit rejection behavior for mixed-sheet two-endpoint ranges such as `Sheet1!A1:Sheet2!B2` and future 3D ranges such as `Sheet1:Sheet3!A1`. Without this, implementers may accidentally create same-sheet fallbacks or silently normalize invalid cross-sheet ranges.
+
+MEDIUM findings
+
+MEDIUM-1: Lexer design does not fit the current A1/function/name ambiguity.
+
+The proposed `SheetName` token rule says scan `[A-Za-z_][A-Za-z0-9_.]*` and look ahead for `!`. The current lexer first classifies column-like and cell-like text as `BareColumn` or `CellRef`, and only later does the parser reinterpret some of those as functions. `Sheet1!A1` under the current classifier is shaped like a cell ref prefix with a too-long column part, so the sheet-prefix recognizer must run before A1 classification. The doc should say that explicitly.
+
+The same issue applies to `SUM!A1`, `A!A1`, `LOG10!A1`, dotted sheet names, and whitespace around `!`. Add a tokenization table that pins:
+
+- `A!B1` as sheet `A`, not bare column `A`;
+- `A1!B1` as sheet `A1`, not cell `A1`;
+- `SUM(A1)` still as function call;
+- `SUM!A1` as sheet name if a sheet named `SUM` exists;
+- quoted names with doubled single quote escaping.
+
+MEDIUM-2: Sheet-name canonicalization is too vague and conflicts with existing name handling.
+
+The doc says sheet lookup is NFC and case-insensitive. Existing `NameTable` canonicalizes defined names with ASCII uppercase, and HyperFormula canonicalizes sheet names by lowercase display name. The doc should define one engine-level sheet-name canonicalizer, including whether it is ASCII-only, Unicode casefolding, NFC normalization, and collision behavior.
+
+It should also define sheet-name validation before rename/add: empty names, duplicate names by canonical form, quote escaping for printer output, and characters invalid for Excel/xlsx (`:`, `\`, `/`, `?`, `*`, `[`, `]`) if Phase 4.11 xlsx import/export compatibility matters. If Quantbook intentionally allows a wider set than Excel, the divergence should be named.
+
+MEDIUM-3: Sheet-scoped names need a cache-generation and lookup contract.
+
+Option A, per-sheet `NameTable`, is workable, but the doc only discusses workbook `name_gen` for PlanCache invalidation. A sheet-scoped-name mutation can change the meaning of formulas on that sheet while leaving `Workbook::names().generation()` unchanged. That creates stale cached plans unless the cache key includes a combined generation, such as `(workbook_name_gen, sheet_name_gen_for_owning_sheet, sheet_registry_gen)`, or the runtime flushes/increments a global semantic generation on any name/sheet mutation.
+
+The binder trait also needs to preserve the current sheet in lookup for all name contexts, including named formulas and aggregate-name refs. The current `NameLookup` shape has no `owning_sheet` parameter, so this is a real API boundary, not just storage plumbing.
+
+MEDIUM-4: `SetSheetScopedName` as a separate op risks schema drift from `.qbook` names.
+
+The doc proposes `NamedEntry.scope` in `.qbook` but a separate `Op::SetSheetScopedName` in the op log. That can work, but it creates two representations for the same concept. A simpler and less divergent shape is `Op::SetName { scope: Option<SheetId>, name, target }` in a new op-log schema/version, mirroring the v5 qbook `NamedEntry`.
+
+If separate ops remain, the doc should state whether workbook and sheet scoped names share validation/canonicalization, how clear/delete operations work, and whether `BatchCommit` can atomically rename a sheet plus update scoped names if needed.
+
+MEDIUM-5: Replay determinism is underspecified for snapshot plus full op-log workflows.
+
+Current op-log replay assumes `AddSheet` ids are deterministic by append order. The design adds `RenameSheet { id, new_name }`, which is id-specific. That is deterministic when replaying into an empty workbook that consumes the same `AddSheet` sequence. It is not deterministic if a loader replays a full historical op log after loading a final-state snapshot that already contains the renamed sheets.
+
+The doc currently says snapshot is authoritative and op-log replay applies after snapshot load. That needs to be reconciled with the existing persistence contract. Pick one:
+
+- load snapshot as final state and keep op log as history, without replaying it onto the snapshot;
+- or replay op log into an empty baseline and treat the snapshot as a cache/checkpoint with compaction rules.
+
+Then add a rename replay test that covers save after rename, load, and recompute from formula text.
+
+MEDIUM-6: Sheet rename semantics need to cover names, formulas, graph deps, and case-only renames.
+
+The design covers formula plan cache invalidation but not the rest of the workbook semantic state. Rename must specify:
+
+- collision checks under canonical sheet-name comparison;
+- whether case-only rename is allowed and whether it updates display name;
+- formula text and named-formula text rewrite policy, per HIGH-1;
+- printer behavior after rename;
+- scoped names attached to the renamed sheet;
+- named targets that point to the renamed sheet by id;
+- calcgraph dependency invalidation or rebuilding;
+- diagnostics for deleted or missing sheets.
+
+The references show that serious spreadsheet engines treat rename/remove as graph-affecting operations, not just display-name mutation.
+
+MEDIUM-7: PlanCache invalidation via `name_gen` is acceptable as a stopgap but should not be the named design.
+
+Sheet rename changes sheet-name resolution and printer output, not workbook defined-name lookup. Bumping `name_gen` is coarse and semantically misleading. The design should add a `sheet_gen` or global `semantic_gen` and key PlanCache on it. Rename is rare, so coarse invalidation is fine; the issue is correctness clarity and future maintainability, not performance.
+
+MEDIUM-8: AST/printer extension needs an explicit sheet-name rendering contract.
+
+The AST already stores `SheetId`, but the printer currently has no context. The doc says the printer takes an inverse id-to-name map, but the public API impact is not specified. It needs a new context-aware printer API, quote/escape rules, behavior for missing sheet ids, and a rule for same-sheet references: preserve explicit `Sheet1!A1` or omit it when `sheet == owning_sheet`?
+
+That last choice affects round-trip equality. If parse stores only `SheetId`, then `Sheet1!A1` in a formula on `Sheet1` and `A1` have identical ASTs unless explicitness is represented. If the printer omits same-sheet prefixes, text canonicalization is acceptable, but the doc should state that source spelling is not preserved.
+
+MEDIUM-9: IronCalc divergence policy is too thin.
+
+The doc references IronCalc but does not translate the corpus into acceptance cases. At minimum, copy the relevant corpus into the design checklist: quoted whole-column ranges, sheet-qualified whole-row ranges, inverse range order normalization with sheet qualifiers, whitespace around bang, and quote escaping. Also state deliberate non-goals: R1C1 sheet refs, 3D ranges, external workbook refs, deleted-sheet tombstones/placeholders.
+
+LOW findings
+
+LOW-1: `BindError::SheetDeletedAfterParse` is not reachable without a sheet registry contract.
+
+If parser eagerly resolves a `SheetId`, binder can only detect deletion if it receives a workbook/sheet-existence resolver. The current binder only sees AST plus owning sheet plus name lookup. The doc should either extend binder context with `has_sheet(id)` or move the check to runtime reads, which already return `#REF!` for missing sheets.
+
+LOW-2: Reserved sheet names are not a binder concern.
+
+The doc says reserved sheet names are treated as plain sheet names at lex time and binder rejects if needed. Reserved/invalid sheet names should be rejected at add/rename/import time, before formulas reference them. Formula parsing should not be the first line of defense for invalid workbook metadata.
+
+LOW-3: Sub-phase ordering should start with a sheet registry/canonicalizer.
+
+A -> B -> C -> D is close, but the real first deliverable should be "sheet registry API and canonicalizer" before parser work. Parser context, rename collision checks, printer inverse lookup, qbook load validation, and IDE diagnostics all depend on that. Sheet-scoped names can land after rename only if the rename design already accounts for per-sheet name tables and cache generations.
+
+Concern-by-concern verdicts
+
+Parser-workbook coupling: HIGH. Eager parser resolution is possible but not with the "pure syntax" Phase A story and not without an IDE/no-workbook parse contract. Prefer lazy AST sheet names or a parallel `parse_with_context` API with raw-source preservation.
+
+Name canonicalization: MEDIUM. Needs one central sheet-name canonicalizer and validation rules. Existing NameTable ASCII uppercase is not enough for sheet display names.
+
+Op-log shape: MEDIUM. Add `scope` to name ops or prove why a separate scoped-name op is better. Rename ops by id are fine only after replay baseline semantics are clarified.
+
+Schema bump policy: HIGH. New `scope` field requires qbook schema v5 under the current `deny_unknown_fields` policy.
+
+Sub-phase ordering: LOW/MEDIUM. Add sheet registry/canonicalizer before lexer/parser. Rename can precede scoped names only if scoped-name storage and cache invalidation are designed up front.
+
+Sheet rename semantics: HIGH. The current doc's formula-text story is inconsistent. Rename must rewrite persisted formula texts or persist resolved formulas.
+
+Lexer ambiguity: MEDIUM. Sheet-prefix recognition must run before A1/function/name classification and needs a golden ambiguity table.
+
+AST extension: MEDIUM. `SheetId` in AST is usable, but it loses explicit same-sheet qualification and cannot represent unknown/deleted sheets. Printer API must become context-aware.
+
+Replay determinism: MEDIUM. Define whether op log is replayed into empty workbooks or kept beside final snapshots as history. Do not replay a full historical log onto an already-final snapshot.
+
+IronCalc divergence policy: MEDIUM. Convert the referenced IronCalc cases into explicit tests and name unsupported 3D/R1C1/external/deleted-sheet behavior.
+
+Closing recommendations before W5-85 ships
+
+1. Rewrite §3, §5.3, §8, §9, and §10.3 around a single durable formula-reference model. The design must say what happens to stored formula text after sheet rename and after reload.
+2. Change qbook persistence decision from "extend v4 in place" to "schema v5; v1-v4 load as workbook-scoped names."
+3. Add a sheet registry/canonicalizer design: lookup by canonical name, id-to-display-name, add/rename validation, duplicate handling, quote/escape printing.
+4. Replace Phase 4.6.A with two substeps: sheet registry/context API first, then lexer/parser/printer. Include legacy `parse()` and IDE no-workbook behavior.
+5. Add a cross-sheet range grammar section covering `Sheet!A1:B2`, `Sheet!A:A`, `Sheet!1:3`, invalid mixed-sheet endpoint ranges, and deferred 3D ranges.
+6. Add PlanCache key policy for `sheet_gen` or global `semantic_gen`, plus sheet-scoped-name generation.
+7. Align op-log and qbook name scope shapes, preferably with `scope: Option<SheetId>` in both persisted surfaces after explicit version bumps.
+8. Add a test matrix from IronCalc and HyperFormula/Formualizer behavior: quoted names, escaped quotes, whole-row/whole-column ranges, inverse ranges, rename after save/load, rename replay into empty workbook, and duplicate/case-only rename handling.

@@ -1,0 +1,18 @@
+Review the Phase 4.6 cross-sheet references design doc at docs/architecture/2026-05-13-cross-sheet-references.md. Return HIGH/MEDIUM/LOW findings on the design (NOT the code, since none is shipped yet). Specific concerns surfaced for you in section 14 of the doc; investigate those plus any other architectural risks you see (parser-workbook coupling, name canonicalization, op-log shape, schema bump policy, sub-phase ordering, sheet rename semantics, lexer ambiguity, AST extension, replay determinism, IronCalc divergence policy).
+
+Reference materials for cross-checking:
+- .references/ironcalc/base/src/expressions/lexer/ranges.rs (IronCalc cross-sheet lexer)
+- .references/ironcalc/base/src/expressions/parser/tests/test_ranges.rs (test corpus)
+- .references/hyperformula/src/DependencyGraph/SheetMapping.ts (sheet-by-name vs sheet-by-id model)
+- .references/formualizer/crates/formualizer-eval/src/engine/graph/sheets.rs
+
+Current state files (for context):
+- crates/ql-formula-syntax/src/ast.rs (Expr::CellRef + CellAddr already has sheet: Option<SheetId>)
+- crates/ql-formula-syntax/src/lexer.rs (NO bang/sheet handling today)
+- crates/ql-exec/src/plan.rs (bind_with_names; bind output already carries sheet: SheetId)
+- crates/ql-storage/src/workbook.rs (NameTable is workbook-flat)
+- crates/ql-io/src/qbook_format.rs (NamedTargetWire has no scope field)
+
+Working dir: /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/
+
+Output format: write your review to docs/audits/2026-05-13-phase-4.6-design-codex-review.txt with verdicts per concern plus a closing recommendations punch list for the design-doc revisions to land before W5-85 ships.
