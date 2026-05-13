@@ -12,6 +12,11 @@ Excel features Quantbook implements. Categories: operators, coercion,
 errors, functions, arrays/spills, tables, date systems, localization,
 xlsx round-trip.
 
+**Companion: `docs/compat/error-matrix.md`** (W5-66, Phase 4.4.C) —
+distilled per-function error semantics + coercion overrides. When a
+function row in THIS doc says "see error-matrix" in the Notes column,
+that's the place to look up which sigil it returns when.
+
 **Phase 3.10/Codex audit closure (W5-48, 2026-05-13):** ECM-4-02
 was originally written as "each function has status + tests +
 category + Excel parity notes." After the audit caught the schema

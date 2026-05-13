@@ -435,10 +435,15 @@ The full v1 means all of these crates either ship real behavior or have a docume
 
 4. **4.4 Coercion And Error Semantics Matrix**  
    Centralize coercion rules and error precedence. Lock binary op behavior, function argument coercion, blank handling, text-to-number, and date serial behavior.  
-   **Design doc (Codex-reviewed W5-63):** `docs/architecture/2026-05-13-coercion-matrix.md` — 3 sub-phases (4.4.A helper migration, 4.4.B matrix tests, 4.4.C error-matrix doc). 3 HIGH + 4 MEDIUM + 3 LOW Codex findings synthesized into the design.  
+   **Status:**
+   - **4.4 design (W5-63 ✅)** — `docs/architecture/2026-05-13-coercion-matrix.md` (Codex-reviewed, 3 HIGH + 4 MEDIUM + 3 LOW findings synthesized).
+   - **4.4.A helper migration (W5-64 ✅)** — `ql-types::coercion` gained `to_text_for_arg`, `to_int_arg`, `to_number_strict_skip_blank`, `format_number_for_arg` + NaN/Inf policy on text/display.
+   - **4.4.B matrix-as-tests (W5-65 ✅)** — 4 new integration test files (89 tests) pinning the §3.1/§3.3/§3.4 matrices + registry coverage guardrail.
+   - **4.4.C error-matrix doc (W5-66 ✅)** — `docs/compat/error-matrix.md` distillation.
+   - **4.4 mega-audit (pending)** — Codex + Sonnet parallel per the protocol.  
    References: `.references/ironcalc/base/src/cast.rs`; `.references/ironcalc/base/src/calc_result.rs`; `.references/formualizer/crates/formualizer-eval/src/coercion.rs`; `.references/hyperformula/src/interpreter/InterpreterValue.ts`.  
-   Acceptance: COER-4-01 matrix checked in; COER-4-02 arithmetic, comparison, aggregate, logical, and text coercion cases covered; COER-4-03 no silent fallback for unsupported variants.  
-   Effort: ~2.5 sessions implementation + 0.5 session mega-audit per the design doc § 5.
+   Acceptance: COER-4-01 matrix checked in ✅; COER-4-02 arithmetic, comparison, aggregate, logical, and text coercion cases covered ✅ (W5-65 tests); COER-4-03 no silent fallback for unsupported variants ✅ (W5-64 NaN/Inf policy + matrix-tests).  
+   Effort spent: ~3 sessions implementation. Mega-audit cycle pending.
 
 5. **4.5 Dates, Times, Number Formats**  
    Implement serial date systems, time arithmetic, display formatting, parse formatted numbers, and locale-sensitive format tokens.  
