@@ -415,7 +415,10 @@ The full v1 means all of these crates either ship real behavior or have a docume
 
 3. **4.3 Function Library Expansion Wave 1 - Core 100** 🔄 IN PROGRESS (V1 batch shipped 2026-05-13, W5-46; FN4-02 backfill W5-48)  
    Implement high-use math, logical, text, lookup, statistical, date/time, and information functions. Include metadata for volatility, laziness, array behavior, and argument coercion.  
-   **V2 prerequisite (W5-49 decision, SHIPPED W5-50):** SUMIF / COUNTIF / SUMIFS / AVERAGEIF family + lookup family (VLOOKUP/HLOOKUP/MATCH/INDEX/CHOOSE) were GATED on GAP-G-01 + GAP-G-03. Both shipped 2026-05-13 (W5-50): per-formula revocation API on `Graph` + `StripeIndex`, plus `topo::schedule_with_supplemental` for range-induced Tarjan ordering. V2 batch is now unblocked. See `docs/architecture/2026-05-13-graph-storage-decision.md`.  
+   **V2 prerequisites (W5-49 decision; SHIPPED W5-50 + W5-52):**
+   - GAP-G-01 + GAP-G-03 (graph correctness): SHIPPED. W5-50 wired revocation into the rebind path; W5-52 (mega-audit closure) extended it to the clear path that W5-50 missed. See `docs/architecture/2026-05-13-graph-storage-decision.md`.
+   - **GAP-F-05 (function-dispatch signature)**: NOT YET SHIPPED. The current `ScalarFn = fn(&[Value]) -> Value` cannot carry per-argument range-vs-scalar metadata. Range-aware V2 functions — SUMIF / COUNTIF / SUMIFS / AVERAGEIF / SUMPRODUCT / VLOOKUP / HLOOKUP / MATCH / INDEX / CHOOSE — need the signature widened (e.g., `enum FnArg { Scalar(Value), Range(Vec<Value>) }`) before they can ship. Surfaced post-W5-50 by both Codex + Sonnet in the W5-49 mega-audit; filed as GAP-F-05 in `docs/known-gaps.md`.
+   - **Scalar-only V2 batches are NOT blocked** by GAP-F-05. W5-51 (trig: SIN/COS/TAN/ASIN/ACOS/ATAN/ATAN2) shipped as the first V2 batch. Text / further math / hyperbolic trig fit the existing contract too.  
    References: `.references/ironcalc/base/src/functions/mod.rs`; `.references/ironcalc/base/src/functions/math_and_trigonometry/`; `.references/ironcalc/base/src/functions/statistical/`; `.references/formualizer/crates/formualizer-eval/src/function_registry.rs`.  
    Acceptance:  
    - FN4-01 ⚠️ partial — registry at 52 entries (was 30) after V1 batch; 100 target requires further batches.  

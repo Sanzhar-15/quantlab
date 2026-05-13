@@ -533,7 +533,10 @@ impl CalcgraphSession {
     /// index. Does NOT touch the `Graph`'s stripe state or edges —
     /// those are revoked separately by the caller via
     /// `Graph::clear_outgoing` + `Graph::clear_range_deps_for_formula`
-    /// (W5-50). See `extract_and_register_deps` for the wiring.
+    /// (W5-50). **Both callers** (`extract_and_register_deps` for
+    /// the rebind path, `on_clear_formula` for the clear path) MUST
+    /// honor this contract — the clear-path miss was caught by the
+    /// W5-52 mega-audit (see commit history).
     fn remove_formula_deps(&mut self, formula_node: NodeId) {
         if let Some(prior) = self.formula_deps.remove(&formula_node) {
             for name in &prior.names {
@@ -718,10 +721,27 @@ impl CalcgraphSession {
     /// formulas dirty (the cleared formula no longer produces its
     /// prior value; dependents must recompute) and removes the
     /// cleared formula itself from the dirty set.
+    ///
+    /// **W5-52 (audit closure):** also revoke graph-side state —
+    /// `clear_outgoing` (direct cell edges) + `clear_range_deps_for_formula`
+    /// (range deps in stripes + `formula_to_range_deps`). W5-50 wired
+    /// this into `extract_and_register_deps` (the rebind path) but
+    /// missed the clear path; Codex + Sonnet mega-audit independently
+    /// caught it. Without these calls, clearing a formula leaves the
+    /// same stale graph state that W5-50 fixes — reproducing the
+    /// H3/H4 staleness class on the clear path.
     pub fn on_clear_formula(&mut self, sheet: SheetId, row: RowId, col: ColId) {
         self.hook_counts.clear_formula = self.hook_counts.clear_formula.saturating_add(1);
         if let Some(node) = self.cell_index.get(&(sheet, row, col)).copied() {
             self.remove_formula_deps(node);
+            // W5-52: revoke graph-side state for the cleared formula.
+            // Without these, stale outgoing edges + stripe entries
+            // persist and the next schedule_dirty can rediscover the
+            // cleared formula as a dependent of writes to its OLD
+            // deps (or as a Tarjan cycle participant if it pointed
+            // at a cell that later points back).
+            self.graph.clear_outgoing(node);
+            self.graph.clear_range_deps_for_formula(node);
             // The cleared formula doesn't compute anymore. If it was
             // dirty (queued for recompute), drop it from the set.
             self.dirty.remove(&node);
@@ -999,13 +1019,22 @@ impl CalcgraphSession {
             if ranges.is_empty() {
                 continue;
             }
+            // W5-52 (audit closure, Sonnet MEDIUM): deduplicate G across
+            // F's multiple ranges. Without this, a formula with two
+            // overlapping ranges (e.g., SUM(A1:A10) + SUM(A1:A5)) that
+            // both contain the same dirty G would push G twice into
+            // `supplemental[F]`. Tarjan handles duplicate edges
+            // correctly, but the Vec growth is wasted work — and this
+            // gets worse as Phase 4.3 V2 adds multi-range functions.
+            // `added.insert(g)` returns `true` on first add only.
+            let mut added: HashSet<NodeId> = HashSet::new();
             for range in ranges {
                 let resolved_sheet = Graph::range_ref_sheet(range).unwrap_or(fs);
                 for &(g, gs, gr, gc) in &dirty_addrs {
                     if gs != resolved_sheet {
                         continue;
                     }
-                    if range_contains_rowcol(range, gr, gc) {
+                    if range_contains_rowcol(range, gr, gc) && added.insert(g) {
                         supplemental.entry(f).or_default().push(g);
                     }
                 }
@@ -2389,6 +2418,194 @@ mod tests {
             "A1 alone in sorted — no supplemental edge to non-formula B1"
         );
         assert!(sched.cycled.is_empty());
+    }
+
+    // ----------------------------------------------------------------
+    // W5-52 — audit closure: on_clear_formula must revoke graph state.
+    //
+    // Both auditors (Codex + Sonnet) independently flagged that
+    // `on_clear_formula` only called `remove_formula_deps` (session-
+    // side) and never `graph.clear_outgoing` / `graph.clear_range_deps_
+    // for_formula`. This reproduced the H3/H4 staleness class on the
+    // clear path — exactly what W5-50 was written to fix on the rebind
+    // path. The fix wires both Graph revocation calls into
+    // `on_clear_formula` after `remove_formula_deps`.
+    //
+    // These three tests pin the new contract.
+    // ----------------------------------------------------------------
+
+    /// W5-52: clearing a formula must revoke its outgoing graph edges
+    /// (direct cell deps) AND remove its back-pointers from the deps'
+    /// incoming lists.
+    #[test]
+    fn clear_formula_revokes_outgoing_graph_edges() {
+        let mut s = CalcgraphSession::new();
+        s.or_insert_cell_node(0, 0, 0); // A1
+        s.or_insert_cell_node(0, 1, 0); // A2
+
+        // B1 = "=A1+A2" (two cell deps).
+        let plan_b1 = ExprPlan::Binary {
+            op: ql_formula_syntax::Operator::Plus,
+            lhs: Box::new(ExprPlan::CellRef {
+                sheet: 0,
+                row: 0,
+                col: 0,
+                abs_col: false,
+                abs_row: false,
+            }),
+            rhs: Box::new(ExprPlan::CellRef {
+                sheet: 0,
+                row: 1,
+                col: 0,
+                abs_col: false,
+                abs_row: false,
+            }),
+        };
+        s.on_set_formula(0, 0, 1, &plan_b1);
+        let a1 = s.cell_node_for(0, 0, 0).unwrap();
+        let a2 = s.cell_node_for(0, 1, 0).unwrap();
+        let b1 = s.cell_node_for(0, 0, 1).unwrap();
+        assert_eq!(s.graph().outgoing(b1).len(), 2, "B1 has 2 outgoing edges");
+        assert!(
+            s.graph().incoming(a1).contains(&b1),
+            "A1 ← B1 back-pointer set"
+        );
+        assert!(s.graph().incoming(a2).contains(&b1));
+
+        // Clear B1. Both outgoing edges AND back-pointers must be revoked.
+        s.on_clear_formula(0, 0, 1);
+
+        assert!(
+            s.graph().outgoing(b1).is_empty(),
+            "clear must revoke outgoing"
+        );
+        assert!(
+            !s.graph().incoming(a1).contains(&b1),
+            "A1's back-pointer to B1 must be gone"
+        );
+        assert!(
+            !s.graph().incoming(a2).contains(&b1),
+            "A2's back-pointer to B1 must be gone"
+        );
+    }
+
+    /// W5-52: clearing a range-dep formula must revoke its stripe
+    /// registrations + `formula_to_range_deps` entry. Writes to the
+    /// old range must not falsely dirty the cleared formula.
+    #[test]
+    fn clear_formula_revokes_range_stripes() {
+        let mut s = CalcgraphSession::new();
+        s.or_insert_cell_node(0, 0, 1); // B1
+
+        // B1 = SUM(A:A) — Column A whole-col range.
+        let col_a = ql_types::Range {
+            sheet: 0,
+            start_row: 0,
+            start_col: 0,
+            end_row: ql_types::RowId::MAX,
+            end_col: 0,
+        };
+        let plan = ExprPlan::Function {
+            name: Arc::from("SUM"),
+            args: vec![ExprPlan::AggregateNameRef {
+                name: Arc::from("X"),
+                range: col_a,
+            }],
+        };
+        s.on_set_formula(0, 0, 1, &plan);
+        let b1 = s.cell_node_for(0, 0, 1).unwrap();
+        assert_eq!(
+            s.graph().stripe_index().stripe_count(),
+            1,
+            "Column A stripe registered"
+        );
+        assert!(s.graph().dependents_for_cell(0, 5, 0).contains(&b1));
+
+        // Clear B1.
+        s.on_clear_formula(0, 0, 1);
+
+        assert_eq!(
+            s.graph().stripe_index().stripe_count(),
+            0,
+            "stripe pruned to empty after clear"
+        );
+        assert!(
+            s.graph().dependents_for_cell(0, 5, 0).is_empty(),
+            "A5 must NOT find cleared B1"
+        );
+        // Simulate the write to A5; B1 must not dirty.
+        s.take_dirty();
+        s.on_set_value(0, 5, 0);
+        assert!(!s.is_dirty(b1), "stale range stripe must not fire");
+    }
+
+    /// W5-52: the Codex/Sonnet reproduction — A1=SUM(A1:A1) (self-
+    /// range cycle), clear A1, then write A1 as a literal. The stale
+    /// supplemental F→F edge must NOT be rebuilt — A1 has no formula
+    /// anymore. schedule_dirty must NOT emit A1 in `cycled`.
+    #[test]
+    fn clear_formula_then_no_phantom_cycle() {
+        let mut s = CalcgraphSession::new();
+        s.or_insert_cell_node(0, 0, 0); // A1
+
+        // A1 = SUM(A1:A1) — self-range.
+        let a1_range = ql_types::Range {
+            sheet: 0,
+            start_row: 0,
+            start_col: 0,
+            end_row: 0,
+            end_col: 0,
+        };
+        let plan = ExprPlan::Function {
+            name: Arc::from("SUM"),
+            args: vec![ExprPlan::AggregateNameRef {
+                name: Arc::from("X"),
+                range: a1_range,
+            }],
+        };
+        s.on_set_formula(0, 0, 0, &plan);
+        let a1 = s.cell_node_for(0, 0, 0).unwrap();
+        assert!(s.graph().dependents_for_cell(0, 0, 0).contains(&a1));
+
+        // Clear the formula. Pre-W5-52 this left the Column A stripe
+        // + formula_to_range_deps[A1] = [A1:A1] in place; a subsequent
+        // write to A1 would re-dirty A1 via the stale stripe, then
+        // schedule_dirty would build supplemental A1→A1 from the
+        // stale range_deps_for(A1), and Tarjan would emit A1 in
+        // `cycled` — producing a false #CIRC! on a cell that's no
+        // longer a formula.
+        s.on_clear_formula(0, 0, 0);
+
+        assert_eq!(
+            s.graph().stripe_index().stripe_count(),
+            0,
+            "stripe must be revoked"
+        );
+        assert!(
+            s.graph().range_deps_for(a1).is_empty(),
+            "range deps must be revoked"
+        );
+        assert!(
+            s.graph().outgoing(a1).is_empty(),
+            "outgoing edges must be revoked"
+        );
+
+        // Simulate the literal write to A1.
+        s.take_dirty();
+        s.on_set_value(0, 0, 0);
+
+        // A1 must NOT be in the dirty set (no formula references it
+        // anymore and its own range dep was revoked).
+        assert!(
+            !s.is_dirty(a1),
+            "cleared A1 must not re-dirty itself via stale stripe"
+        );
+
+        // schedule_dirty must emit an empty schedule (no dirty
+        // formulas) — definitely no phantom cycle on A1.
+        let sched = s.schedule_dirty();
+        assert!(sched.cycled.is_empty(), "no phantom cycle");
+        assert!(sched.sorted.is_empty(), "no phantom sorted entry");
     }
 
     /// W5-50: re-binding to the SAME plan is a no-op for graph state

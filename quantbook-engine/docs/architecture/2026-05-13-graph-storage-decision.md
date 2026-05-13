@@ -19,7 +19,7 @@
 GAP-G-01 (rebind staleness) and GAP-G-03 (range deps not scheduler edges) are independent correctness failures with independent fixes. They ship as one architectural change because they share the gate that blocks Phase 4.3 V2. Implementation order is **A before C** — Option C reads `formula_to_range_deps`, which Option A makes current.
 
 - **Option A** — Add per-formula revocation API to `Graph` + `StripeIndex`. Reverse-index stripe membership so per-formula clear is `O(stripes-this-formula-is-in)` rather than scanning the whole stripe map. Call the new APIs in `extract_and_register_deps` at the same point as the existing `remove_formula_deps`. Keeps `Vec<Vec<NodeId>>` adjacency, no new graph library, no `IndexSet`/`petgraph` dep, no edge-epoch metadata.
-- **Option C (small variant)** — At recompute time, before invoking Tarjan, build a temporary supplemental adjacency: for each dirty formula `F` with range deps, for each OTHER dirty FORMULA node `G`, if `G`'s cell address is contained in one of `F`'s ranges, push `G` into `supplemental[F]`. Pass the map to a new `topo::schedule_with_supplemental` variant. Discard the map after the scheduler returns.
+- **Option C (small variant)** — At recompute time, before invoking Tarjan, build a temporary supplemental adjacency: for each dirty formula `F` with range deps, for each dirty FORMULA node `G` (including `G == F` for self-range cycles like `A1 = SUM(A1:A1)`), if `G`'s cell address is contained in one of `F`'s ranges, push `G` into `supplemental[F]`. Pass the map to a new `topo::schedule_with_supplemental` variant. Discard the map after the scheduler returns. (W5-52 audit-closure clarification: earlier wording said "OTHER" dirty formula nodes; the implementation intentionally allows the self-edge case.)
 - **Option B (FormulaRegion binder + region detection)** is the right design for Phase 4.7 array formulas + Phase 4.7 SIMD region dispatch (GAP-G-02), but the wrong tool for Phase 4.3 V2: region-detection-at-write is its own correctness surface, and SUMIF/COUNTIF/lookup functions don't need region semantics — just correctly-ordered range-aware recompute. Folding G-01/G-03 fixes into B couples them to a much larger Phase 4.7 redesign that doesn't need to ship first.
 
 ## The two bugs (problem statement)
@@ -140,7 +140,7 @@ Files: `crates/ql-exec/src/calcgraph_session.rs` (`schedule_dirty`) + `crates/ql
 
 - New helper `CalcgraphSession::build_range_supplemental(&self, dirty: &HashSet<NodeId>) -> HashMap<NodeId, Vec<NodeId>>`:
   - For each dirty formula node `F`, look up `formula_to_range_deps[F]`.
-  - For each range `R` in F's range list, for each OTHER dirty formula node `G` in `dirty`, if `G`'s cell address (via `cell_address_for(G)`) satisfies `stripes::range_contains_rowcol(R, row, col)` AND `G.sheet == range.sheet` (resolved), push `G` into `supplemental[F]`.
+  - For each range `R` in F's range list, for each dirty formula node `G` in `dirty` (including `G == F` for self-range cycles), if `G`'s cell address (via `cell_address_for(G)`) satisfies `stripes::range_contains_rowcol(R, row, col)` AND `G.sheet == range.sheet` (resolved), push `G` into `supplemental[F]`. (W5-52 audit closure also added dedup so the same G doesn't appear twice when F has overlapping ranges.)
   - Optimization knob: if profiling shows the O(|dirty_formulas|²) inner loop is hot, switch to per-range bucketing. Not premature for V1.
 - `schedule_dirty` calls the new variant with the supplemental.
 - Update `recompute_dirty` call path to thread the supplemental through.
@@ -173,6 +173,32 @@ Codex (gpt-5.5, read-only sandbox, ~10 min wall, 6083-line output) was dispatche
 4. **Option A shape confirmed.** Back-pointer removal from `incoming[target]` is required for the symmetric invariant; linear scan is acceptable because rebind happens at edit-rate, not recompute-rate. The `formula_to_stripe_keys` reverse index is essential — without it, per-formula stripe clear would be O(total_stripes) and a real scale risk. Bump `revision` once per clear, not per edge.
 5. **Option D variants rejected.** Epoch-marked edges keep stale memory + push correctness filtering into every scheduler traversal. `IndexSet` adds a dep and changes memory profile. Full rebuild from plans pays bind/extract on the hot path. Codex: "Best 'D' is a bounded variant of A+C."
 6. **Effort estimate revised DOWN.** W5-47 said 3-5 days for A. Codex: "The core A change is smaller because the session already has the rebind choke point... Option A: 1 strong session, maybe 2 if graph stats/revision expectations need cleanup. Option C: 0.5-1 session."
+
+## W5-52 audit closure amendments (2026-05-13, post-ship)
+
+After W5-50 + W5-51 shipped, a deep mega-audit ran with both Codex and a Sonnet agent in parallel. They independently flagged one HIGH issue and several MEDIUM/LOW. Documented here for honesty:
+
+### HIGH (fixed in W5-52)
+
+- **`on_clear_formula` was not revoking graph state.** The original W5-50 implementation wired `Graph::clear_outgoing` + `Graph::clear_range_deps_for_formula` into `extract_and_register_deps` (the rebind path) but missed `on_clear_formula` (the clear path). Result: clearing a formula left stale forward edges + stripe registrations — the same H3/H4 staleness class W5-50 was built to fix. Reproducible as `A1 = SUM(A1:A1)` → clear A1 → on_set_value(A1) re-fans-out via stale stripe → false `#CIRC!` cycled. Fixed in W5-52 by adding the same two revocation calls inside `on_clear_formula`'s `if let Some(node)` block. Three new regression tests (`clear_formula_revokes_outgoing_graph_edges`, `clear_formula_revokes_range_stripes`, `clear_formula_then_no_phantom_cycle`).
+
+### MEDIUM — scope gap that ALSO blocks Phase 4.3 V2
+
+- **`ScalarFn = fn(&[Value]) -> Value` signature cannot carry range-vs-scalar metadata.** This doc claimed Phase 4.3 V2 (SUMIF / COUNTIF / VLOOKUP) "is now unblocked" once A+C ship. That's true for the GRAPH substrate, but a second blocker — the function-dispatch signature — was not surfaced in the W5-49 decision and was discovered during W5-51 (trig batch). The conditional-aggregate and lookup families need either a wider signature (e.g., `enum FnArg { Scalar(Value), Range(Vec<Value>) }`) or per-function evaluator special-casing. Filed as a follow-up gap; pure scalar V2 batches (W5-51 trig is the first) work under the existing contract. See `docs/known-gaps.md` for the new entry.
+
+### MEDIUM — supplemental dedup (cleanliness, not correctness)
+
+- **`build_range_supplemental` could push duplicate G entries** when F had overlapping ranges (e.g., `SUM(A1:A10) + SUM(A1:A5)` both contain G at A3). Tarjan handles duplicate edges correctly, so this was a perf/cleanliness issue, not a correctness bug. W5-52 adds a per-F `HashSet<NodeId>` dedup in the inner loop.
+
+### LOW (fixed in W5-52)
+
+- ATAN2 rustdoc title said `(y, x)`; body and tests correctly used Excel's `(x_num, y_num)`. Doc-only inversion.
+- Two places in this doc said "OTHER dirty formula nodes"; the implementation intentionally includes the self-edge for self-range cycles. Wording corrected above.
+
+### LOW (acknowledged, not fixed)
+
+- `Graph::clear_outgoing` / `clear_range_deps_for_formula` bump the revision counter even when called on a node with no edges / no range deps. State-idempotent, revision-not-idempotent. Affects only callers that use revision as a cheapness proxy — none today.
+- W5-50 commit message per-file test count breakdown is off by ±1 in two files (cancels in total +35).
 
 ## Stop conditions
 

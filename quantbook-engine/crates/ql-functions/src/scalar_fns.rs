@@ -816,13 +816,15 @@ pub fn atan(args: &[Value]) -> Value {
     }
 }
 
-/// `ATAN2(y, x)` — two-argument arc tangent. Returns radians in
-/// `(-π, π]`. Excel argument order is `ATAN2(x, y)` historically —
-/// but the W3C / OOXML standard and modern Excel use `ATAN2(x_num,
-/// y_num)`. Per IronCalc + the W3C reference, Quantbook follows
-/// `ATAN2(x, y)` order: first arg is x, second is y. Returns
-/// `#DIV/0!` if both args are zero (Excel canon; Rust's `f64::atan2`
-/// would return 0.0 in that case, which is wrong).
+/// `ATAN2(x_num, y_num)` — two-argument arc tangent. Returns
+/// radians in `(-π, π]`. Excel takes the angle's x-coordinate FIRST,
+/// then y — the inverse of Rust's `f64::atan2(y, x)`. Per IronCalc +
+/// the W3C / OOXML reference, Quantbook takes `args[0]` as `x` and
+/// `args[1]` as `y` and internally calls `y.atan2(x)`. Returns
+/// `#DIV/0!` if both args are zero (Excel canon; Rust's
+/// `f64::atan2(0.0, 0.0)` would silently return 0.0). The W5-52
+/// audit closure fixed this docstring's title — it previously said
+/// `ATAN2(y, x)`, inverting the labels.
 pub fn atan2(args: &[Value]) -> Value {
     if args.len() != 2 {
         return Value::Error(ErrorValue::Value);
