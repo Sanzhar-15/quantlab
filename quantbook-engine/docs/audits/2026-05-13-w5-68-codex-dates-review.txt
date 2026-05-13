@@ -1,0 +1,90 @@
+I couldn’t save `docs/audits/2026-05-13-w5-68-codex-dates-review.txt` because this run’s filesystem sandbox is read-only. Full review follows.
+
+# Phase 4.5 design doc review — verdict
+
+Verdict: **not ready for implementation as written**. The serial-as-`Value::Number(f64)` decision is defensible, but the surrounding architecture has several blocking holes: workbook `DateSystem` cannot reach current function implementations, `NOW`/`TODAY` are UTC while Excel is local-time-facing, the `General` date auto-detect claim is wrong and would corrupt display semantics, and DTF-4-03’s locale acceptance conflicts with the design’s en-US-only parser/rendering story. The doc is also overselling “centralized 1900 bug handling” without pinning the serial-60 contract for `DATE`, `DATEVALUE`, extraction functions, and IronCalc reference divergence.
+
+## NEW HIGH (design flaws blocking implementation)
+
+1. **Date-system state has no path into function evaluation.**  
+   The design adds `Workbook::date_system` at [docs/architecture/2026-05-13-dates-times-formats.md:55](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-dates-times-formats.md:55), but current scalar functions are plain `fn(&[Value]) -> Value` [crates/ql-functions/src/registry.rs:13](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/registry.rs:13), and `eval_scalar_with_cache` dispatches through that registry without workbook context [crates/ql-exec/src/scalar.rs:167](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/scalar.rs:167). Any function needing 1900/1904 behavior, including `DATE`, `YEAR`, `WEEKDAY`, `DATEVALUE`, `NOW`, and `TODAY`, cannot correctly choose a system under the proposed surface. The doc needs an evaluator context plan, not just a pure `ql-types::date` module.
+
+2. **`General` display behavior is wrong and dangerous.**  
+   The design says default `"General"` is “date if the underlying serial looks like a date” [dates-times-formats.md:207](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-dates-times-formats.md:207). Excel does not generally render `45810` as a date just because it is in date range; a date format must be applied. Auto-detecting by serial range would make normal numbers display as dates and makes `Value::Number` untenable. This directly contradicts the otherwise-correct claim that value and display format must be separate [dates-times-formats.md:49](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-dates-times-formats.md:49).
+
+3. **DTF-4-03 locale requirements are internally inconsistent.**  
+   Acceptance requires en/de/fr examples in MASTER-PLAN [docs/MASTER-PLAN.md:451](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/MASTER-PLAN.md:451) and “locale-aware separators in parsing path” [dates-times-formats.md:266](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-dates-times-formats.md:266), but the design says V1 hardcodes en-US separators [dates-times-formats.md:196](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-dates-times-formats.md:196) and defers locale parsing/conversion to Phase 4.9 [dates-times-formats.md:239](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-dates-times-formats.md:239). This cannot pass its stated acceptance without a scope rewrite.
+
+4. **`NOW`/`TODAY` local-time semantics are missing.**  
+   Current `NOW`/`TODAY` use Unix seconds from `SystemTime` [crates/ql-functions/src/volatile.rs:98](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/volatile.rs:98), which is UTC-derived. Excel `NOW()` and `TODAY()` are local-time user-facing functions. IronCalc explicitly routes through a timezone object for current Excel serials [`.references/ironcalc/base/src/functions/date_and_time.rs:977`](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/.references/ironcalc/base/src/functions/date_and_time.rs:977). The doc only says “Excel doesn’t model time zones” [dates-times-formats.md:240](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-dates-times-formats.md:240), which is true for stored serial arithmetic but false for current-clock acquisition.
+
+## NEW MEDIUM (improvements; rework recommended pre-implementation)
+
+1. **The 1900 serial-60 contract is underspecified.**  
+   The doc says `DATEVALUE("1900-02-29")` must work [dates-times-formats.md:62](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-dates-times-formats.md:62), but it does not decide `DATE(1900,2,29)`, `YEAR(60)`, `MONTH(60)`, `DAY(60)`, or `serial_to_ymd(60)`. IronCalc special-cases parsed text `1900-02-29` to serial 60 [date_and_time.rs:469](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/.references/ironcalc/base/src/functions/date_and_time.rs:469), but its `from_excel_date` maps serials through real `chrono::NaiveDate` [formatter/dates.rs:23](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/.references/ironcalc/base/src/formatter/dates.rs:23), so IronCalc is not a clean oracle for serial 60. Pin Quantbook behavior explicitly.
+
+2. **Centralization is asserted, not enforced.**  
+   “All date arithmetic routes through `ymd_to_serial` / `serial_to_ymd`” [dates-times-formats.md:253](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-dates-times-formats.md:253) is a convention. Add guardrails: keep conversion helpers in one module, expose a `DateSerial` newtype internally if needed, add deny-list tests for direct epoch constants, and add per-function edge tests at serial 59/60/61.
+
+3. **Roll-your-own date math estimate is optimistic.**  
+   IronCalc’s date/time function file is 1703 LOC and formatter is 3948 LOC total from the reference read. Even if Quantbook’s scope is smaller, V1 has parsing, permissive `DATE`, `EDATE`/`EOMONTH`, week numbering, business days, and format rendering. The `~500 LOC` date module [dates-times-formats.md:84](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-dates-times-formats.md:84) plus 5-day format parser [dates-times-formats.md:225](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-dates-times-formats.md:225) is likely too low.
+
+4. **Date crate rationale needs correction.**  
+   Rejecting `chrono` is reasonable for dependency and 1900-bug reasons. Rejecting `time` for WASM friction is weaker: current `time` docs show it is mostly `no_std`, has default `std`, and has a `wasm-bindgen` feature. Jiff also does not appear to have Excel serial support; its docs explicitly list Unix time scales and Gregorian calendars, with no Excel epoch support. So “roll our own” remains defensible, but the rationale should say “Excel serial compatibility dominates,” not imply `time` is inherently WASM-hostile. Sources: `time` docs https://docs.rs/time and `jiff` docs https://docs.rs/jiff.
+
+5. **Function wave split underweights business-date functions.**  
+   Deferring all of `NETWORKDAYS`, `WORKDAY`, and `YEARFRAC` to V2 [dates-times-formats.md:137](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-dates-times-formats.md:137) means V1 still fails common project-plan and finance spreadsheets. If V1 is “user-visible usable dates,” simple `NETWORKDAYS` and `WORKDAY` should probably move up; `.INTL` variants can stay V2.
+
+6. **Format parser V1 omits common tokens without declaring fallback.**  
+   `_` and `*` are listed as terminals [dates-times-formats.md:165](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-dates-times-formats.md:165) but not assigned V1/V2 behavior. IronCalc models them as `Ghost` and `Spacer` tokens [formatter/parser.rs:12](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/.references/ironcalc/base/src/formatter/parser.rs:12). `@` is similarly listed but its render path is not specified. This will cause ad hoc behavior in `TEXT()` and cell display.
+
+7. **`FormatId` storage plan does not match existing storage shape.**  
+   The doc says “Each cell can carry” `format_id` [dates-times-formats.md:200](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-dates-times-formats.md:200), but there is no `Cell` struct in the current columnar storage; values live in base Arrow chunks plus overlays [crates/ql-storage/src/column.rs:6](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-storage/src/column.rs:6), and qbook records carry only row/col/value/formula [crates/ql-io/src/qbook_format.rs:281](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-io/src/qbook_format.rs:281). The design needs a concrete sparse style/format overlay, persistence schema, and op-log operation shape.
+
+8. **Op-log and replay determinism risk is real.**  
+   The design says Phase 5 replay is byte-identical [dates-times-formats.md:277](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-dates-times-formats.md:277), but new date-system defaults, format ops, and volatile local-time behavior can affect replay. Current op log has only value/formula/name/sheet ops [crates/ql-oplog/src/op.rs:42](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-oplog/src/op.rs:42). Add `SetWorkbookDateSystem` and `SetCellFormat` decisions or explicitly defer with consequences.
+
+## NEW LOW (doc nits, naming, suggestions)
+
+1. `serial = 0` as “1900-01-00” [dates-times-formats.md:68](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-dates-times-formats.md:68) should be labeled as display oddity, not a real YMD tuple.
+2. `SECOND()` says no fractional seconds [dates-times-formats.md:123](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-dates-times-formats.md:123), but `NOW()` currently only has whole-second input from `as_secs()` [volatile.rs:102](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/volatile.rs:102). Decide whether subsecond `NOW()` is a non-goal or use `subsec_nanos`.
+3. The design says `jiff` is “no_std” [dates-times-formats.md:82](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-dates-times-formats.md:82); current docs describe `std` and `alloc` default features. Reword.
+4. `DTF-4-02` says “match matrix,” but `excel-matrix.md` has grouped date rows, not per-function detailed semantics [docs/compat/excel-matrix.md:183](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/compat/excel-matrix.md:183). Add a date/time submatrix.
+5. The doc is not too long for scope, but the format parser grammar deserves a separate spec table if implementation is expected to pass review.
+
+## Per-concern verdict (A–K)
+
+A: **Mostly sound.** `f64` precision is not the issue; display metadata is. No `Value::Date` needed if the format/style layer is correct. A tag only becomes valuable if arrays or typed import APIs need provenance; the doc’s stop condition is acceptable.
+
+B: **Not pinned enough.** Central helpers are right, but serial 60 behavior must be specified for every public function. IronCalc is inconsistent around `DATEVALUE` vs serial extraction, so don’t blindly mirror it.
+
+C: **Defensible outcome, weak rationale.** Rolling own is reasonable because Excel serials are weird. The crate survey should be corrected, especially around `time` WASM support and Jiff’s actual scope.
+
+D: **Scope needs rebalancing.** `DATEDIF` can remain V2, but simple `NETWORKDAYS`, `WORKDAY`, and maybe `YEARFRAC` deserve reconsideration. `EOMONTH(start,0)` should be explicitly pinned.
+
+E: **Blocking contradiction.** V1/V2 split is plausible, but locale acceptance and `_`/`*`/`@` behavior are underspecified.
+
+F: **Storage concept right, concrete design missing.** No date auto-detect in General. Need sparse format overlay, compaction policy, xlsx built-in/custom ID mapping, and op-log format ops.
+
+G: **Partly correct, misses local time.** `set_test_now_secs(0)` should still be 25569 in 1900 mode. Behavior for 1904 workbooks and local timezone must be specified.
+
+H: **Optimistic.** Phase 4.4 already overran; Phase 4.5 has more surface area. Format parser plus storage/persistence/op-log likely pushes beyond 3 weeks.
+
+I: **Missing real risks.** Add DATEVALUE locale ambiguity, `.qbook` schema migration, op-log replay, xlsx extreme-date import, and serial-60 oracle risk.
+
+J: **Missing coercion edge and text rendering path.** `NOW() - "1:30:00"` should probably require `TIMEVALUE`; document it. Text section formats with `@` need a render contract.
+
+K: **Length acceptable; structure needs split.** Keep the architectural decision doc, but extract a format-string mini-spec and a date-function edge-case matrix.
+
+## Recommended changes to the design doc
+
+1. Add an evaluator-context decision: how `DateSystem`, locale, and clock provider reach date/time functions despite `ScalarFn = fn(&[Value]) -> Value`.
+2. Replace `"General"` auto-date detection with Excel-like behavior: raw numbers display as numbers unless a date/time format is applied.
+3. Add a serial-60 matrix covering `ymd_to_serial`, `serial_to_ymd`, `DATE`, `DATEVALUE`, `YEAR`, `MONTH`, `DAY`, `WEEKDAY`, formatting, and import/export.
+4. Rewrite DTF-4-03 scope so en/de/fr tests either truly land in 4.5 or are moved to 4.9. Do not keep both claims.
+5. Specify local-clock behavior for `NOW`/`TODAY`, including test hooks, WASM host callback, and 1904 workbook behavior.
+6. Define concrete format storage: sparse overlay/table shape, qbook schema bump, op-log ops, dedup compaction, and xlsx built-in ID handling.
+7. Add explicit V1/V2 behavior for `_`, `*`, `@`, empty sections like `0;-0;;@`, colors, and conditionals.
+8. Split format parser details into a companion spec before implementation.
+9. Re-estimate effort with separate buckets for date module, date functions, parser, renderer, persistence, op-log, and audit.
+10. Update risks for DATEVALUE locale parsing, xlsx extreme serials, legacy `.qbook` migration, and IronCalc reference limitations.

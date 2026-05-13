@@ -447,9 +447,10 @@ The full v1 means all of these crates either ship real behavior or have a docume
 
 5. **4.5 Dates, Times, Number Formats**  
    Implement serial date systems, time arithmetic, display formatting, parse formatted numbers, and locale-sensitive format tokens.  
+   **Design doc (Codex-reviewed W5-68):** `docs/architecture/2026-05-13-dates-times-formats.md` — 6 sub-phases (4.5.A.0 EvalContext tier, 4.5.A epoch+serial, 4.5.B 18-fn V1 wave, 4.5.C 7-fn V2 wave, 4.5.D format parser + sparse overlay + op-log, 4.5.E TEXT() + locale stubs). 4 HIGH + 8 MEDIUM + 5 LOW Codex findings synthesized into the design.  
    References: `.references/ironcalc/base/src/formatter/`; `.references/ironcalc/base/src/functions/date_and_time.rs`; `.references/formualizer/crates/formualizer-workbook/tests/calamine/dates.rs`.  
-   Acceptance: DTF-4-01 1900/1904 policy explicit; DTF-4-02 date/time functions match matrix; DTF-4-03 number format parser tests include en/de/fr examples; DTF-4-04 storage distinguishes value from display format.  
-   Effort: 1-2 weeks.
+   Acceptance: DTF-4-01 1900/1904 policy explicit; DTF-4-02 date/time functions match matrix; **DTF-4-03 re-scoped to "format parser has en-US fully populated + extension point for locale; en/de/fr behavior tests move to Phase 4.9"** (Codex HIGH 3); DTF-4-04 storage distinguishes value from display format via sparse format overlay + workbook FormatTable.  
+   Effort: ~6-8 sessions implementation + 1 mega-audit per the design doc § 8 (Codex MEDIUM 3 re-estimate; Phase 4.4 reference: estimated 2.5 sessions, took 5).
 
 6. **4.6 Cross-Sheet References And Sheet-Scoped Names**  
    Extend AST/binder/runtime to support `Sheet1!A1`, quoted sheet names, 3D constraints if chosen, and sheet-scoped names.  
