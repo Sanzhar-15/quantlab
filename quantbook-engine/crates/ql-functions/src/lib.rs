@@ -24,6 +24,7 @@
 
 pub mod context_aware_fns;
 pub mod date_fns;
+pub mod format;
 pub mod range_aware_fns;
 pub mod range_fns;
 pub mod registry;
