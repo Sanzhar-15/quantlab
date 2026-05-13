@@ -13,6 +13,7 @@ pub mod ast;
 pub mod error;
 pub mod lexer;
 pub mod parser;
+pub mod render;
 
 pub use ast::{
     DigitKind, FormatString, MonthNameLen, MonthRole, NumberState, Section, SectionKind,
@@ -21,3 +22,4 @@ pub use ast::{
 pub use error::{FormatParseError, V2Token};
 pub use lexer::{tokenize, Token};
 pub use parser::parse;
+pub use render::render;
