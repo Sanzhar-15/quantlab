@@ -94,7 +94,18 @@ use thiserror::Error;
 /// loaded by a v3 reader gets `Workbook::date_system = Excel1900` (the
 /// default). A v3 envelope's `date_system` is currently always set on
 /// save; old binaries (v2 readers) refuse v3 via `UnsupportedSchema`.
-pub const WORKBOOK_SCHEMA_VERSION: u32 = 3;
+///
+/// **W5-81 (Phase 4.5.D part 5):** bumped to v4. v4 adds:
+///   - top-level `formats: Option<FormatsSection>` — custom format
+///     entries (id >= 164). Excel built-in ids 0-163 are NOT persisted;
+///     `FormatTable::default()` re-seeds them on load.
+///   - per-sheet `format_overlay: Option<Vec<FormatOverlayEntry>>` —
+///     sparse `(row, col, id)` tuples binding cells to format ids.
+///
+/// Loaders accept v1, v2, v3, AND v4 envelopes. A v3 envelope loaded
+/// by a v4 reader gets an empty FormatTable + all-General overlay
+/// (regression-neutral). v3 readers refuse v4 via `UnsupportedSchema`.
+pub const WORKBOOK_SCHEMA_VERSION: u32 = 4;
 
 /// The earliest schema version this reader still accepts. v1 fixtures (Phase 1)
 /// continue to load on v2 binaries; older versions would need explicit handling.
@@ -196,6 +207,24 @@ pub enum QbookError {
     /// Sheet ids in the envelope must be sequential 0..N. Audit M3 fix (2026-05-12).
     #[error("non-sequential sheet ids in envelope: expected id {expected}, found {found}")]
     NonSequentialSheetIds { expected: u16, found: u16 },
+
+    /// **W5-81 (Phase 4.5.D part 5):** envelope's `formats` section
+    /// references an id whose registration collides with the
+    /// pre-populated built-in table OR an internal inconsistency
+    /// (same string at two ids). The `details` field is the
+    /// `FormatTableError`'s `Debug` rendering.
+    #[error("malformed format entry id={id}: {details}")]
+    MalformedFormat { id: u32, details: String },
+
+    /// **W5-81 (Phase 4.5.D part 5):** per-sheet `format_overlay` carries
+    /// coordinates outside the workbook's row/col bounds.
+    #[error("malformed format overlay entry on sheet {sheet}: row={row}, col={col} ({why})")]
+    MalformedFormatOverlay {
+        sheet: u16,
+        row: u32,
+        col: u32,
+        why: &'static str,
+    },
 }
 
 /// TOML envelope for the workbook. Top-level metadata.
@@ -222,6 +251,13 @@ pub struct WorkbookEnvelope {
     /// `DateSystem::Excel1900` — the default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub date_system: Option<DateSystemWire>,
+    /// **W5-81 (Phase 4.5.D part 5):** workbook-level format-string
+    /// interning table. v4 envelopes carry custom format entries (id ≥
+    /// 164) only; built-ins 0-163 are re-seeded by `FormatTable::default()`
+    /// on load. v1-v3 envelopes omit the field; the loader treats `None`
+    /// as "no custom formats registered" and proceeds with defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formats: Option<FormatsSection>,
 }
 
 /// **W5-71 (Phase 4.5.A.2):** wire representation of `ql_types::DateSystem`.
@@ -262,6 +298,43 @@ pub struct SheetEnvelope {
     /// the field exists for save-side allocation hints and observability.
     pub row_extent: u32,
     pub col_extent: u32,
+    /// **W5-81 (Phase 4.5.D part 5):** per-sheet sparse cell-format overlay.
+    /// `Some([])` and `None` are equivalent ("no custom formats on this
+    /// sheet"); save serializes as `None` for v4 sheets with empty
+    /// overlay to keep TOML minimal. Loader maps `None` → empty overlay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_overlay: Option<Vec<FormatOverlayEntry>>,
+}
+
+/// **W5-81 (Phase 4.5.D part 5):** workbook-level format-table wire format.
+///
+/// Persists ONLY custom entries (`id >= FIRST_CUSTOM_FORMAT_ID`). Built-in
+/// ids 0-163 are re-seeded by `FormatTable::default()` at load time, so
+/// putting them on disk would bloat every workbook with the same constants.
+/// Entries are sorted by id for deterministic diffs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormatsSection {
+    pub entries: Vec<FormatEntry>,
+}
+
+/// **W5-81 (Phase 4.5.D part 5):** one row in the workbook FormatTable.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FormatEntry {
+    pub id: u32,
+    pub string: String,
+}
+
+/// **W5-81 (Phase 4.5.D part 5):** one entry in a sheet's cell-format
+/// overlay — `(row, col)` ↦ FormatId. Sorted by `(row, col)` on save
+/// for deterministic diffs.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FormatOverlayEntry {
+    pub row: u32,
+    pub col: u32,
+    pub id: u32,
 }
 
 /// Phase 2A.8: workbook-scope defined names. The on-disk wire format mirrors
@@ -874,12 +947,32 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
     for sheet_id in 0..(wb.sheet_count() as SheetId) {
         let sheet = wb.sheet(sheet_id).expect("sheet_count was wrong");
         let bounds = sheet.bounds();
+        // **W5-81 (Phase 4.5.D part 5):** serialize the per-sheet cell-format
+        // overlay if it has any entries. Sorted by (row, col) for diffability.
+        let format_overlay = {
+            let overlay = sheet.format_overlay();
+            if overlay.is_empty() {
+                None
+            } else {
+                let mut entries: Vec<FormatOverlayEntry> = overlay
+                    .iter()
+                    .map(|((r, c), fid)| FormatOverlayEntry {
+                        row: r,
+                        col: c,
+                        id: fid.0,
+                    })
+                    .collect();
+                entries.sort_by_key(|e| (e.row, e.col));
+                Some(entries)
+            }
+        };
         sheet_envelopes.push(SheetEnvelope {
             id: sheet_id,
             name: sheet.name().to_owned(),
             chunk_rows: sheet_chunk_rows(sheet),
             row_extent: bounds.row_extent,
             col_extent: bounds.col_extent,
+            format_overlay,
         });
     }
 
@@ -901,6 +994,28 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
         Some(NamesSection { entries })
     };
 
+    // **W5-81 (Phase 4.5.D part 5):** serialize custom FormatTable entries
+    // (id ≥ FIRST_CUSTOM_FORMAT_ID). Built-ins are re-seeded from
+    // `FormatTable::default()` on load and aren't persisted. None if the
+    // table has no custom entries (typical for built-in-only workbooks).
+    let formats_section = {
+        let mut entries: Vec<FormatEntry> = wb
+            .formats()
+            .iter()
+            .filter(|(id, _)| id.0 >= ql_storage::FIRST_CUSTOM_FORMAT_ID)
+            .map(|(id, s)| FormatEntry {
+                id: id.0,
+                string: s.to_owned(),
+            })
+            .collect();
+        if entries.is_empty() {
+            None
+        } else {
+            entries.sort_by_key(|e| e.id);
+            Some(FormatsSection { entries })
+        }
+    };
+
     let envelope = WorkbookEnvelope {
         schema_version: WORKBOOK_SCHEMA_VERSION,
         name: name.to_owned(),
@@ -908,6 +1023,8 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
         names: names_section,
         // **W5-71 (Phase 4.5.A.2):** persist the workbook's date system.
         date_system: Some(DateSystemWire::from_runtime(wb.date_system())),
+        // **W5-81 (Phase 4.5.D part 5):** persist custom format entries.
+        formats: formats_section,
     };
     let toml_str = toml::to_string_pretty(&envelope)?;
     fs::write(dir.join("workbook.toml"), toml_str)?;
@@ -1081,6 +1198,21 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
         wb.set_date_system(ds_wire.to_runtime());
     }
     // (Else: leave at Workbook::default(), which is Excel1900.)
+    // **W5-81 (Phase 4.5.D part 5):** apply the envelope's FormatsSection.
+    // v4 envelopes carry custom format entries (id ≥ 164); v1-v3 don't.
+    // Built-ins 0-163 are already in the FormatTable from
+    // `Workbook::default()`. `register_at` is idempotent for the
+    // pre-seeded builtins; mismatches surface as `MalformedFormat`.
+    if let Some(ref fs) = envelope.formats {
+        for entry in &fs.entries {
+            wb.formats_mut()
+                .register_at(ql_storage::FormatId(entry.id), entry.string.as_str())
+                .map_err(|err| QbookError::MalformedFormat {
+                    id: entry.id,
+                    details: format!("{err:?}"),
+                })?;
+        }
+    }
     let sheets_dir = path.join("sheets");
     for (expected_id, sheet_env) in envelope.sheets.iter().enumerate() {
         if sheet_env.id as usize != expected_id {
@@ -1094,6 +1226,39 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
             sheet_id as usize, expected_id,
             "Workbook::add_sheet_with_chunk_rows returned non-sequential id — programmer error in ql-storage"
         );
+
+        // **W5-81 (Phase 4.5.D part 5):** apply the per-sheet cell-format
+        // overlay. v4 envelopes carry `format_overlay`; v1-v3 don't.
+        // We DO NOT validate that each id resolves in the FormatTable
+        // here — a corrupted .qbook that binds cells to a phantom id
+        // would still load with the overlay intact; `format::render`
+        // falls back to General on a missing-id lookup. Stricter
+        // validation can be added when the runtime's display path
+        // wires through (W5-82). For now: trust the on-disk format,
+        // surface mismatches via render diagnostics rather than load
+        // refusal.
+        if let Some(ref overlay_entries) = sheet_env.format_overlay {
+            let sheet_mut = wb.sheet_mut(sheet_id).expect("just-added sheet must exist");
+            for entry in overlay_entries {
+                // Bounds-check to mirror the cell-record validation
+                // below — out-of-range coordinates surface as
+                // `MalformedFormatOverlay` rather than silently binding
+                // a sentinel address.
+                if entry.row > MAX_ROW || entry.col > MAX_COLUMN {
+                    return Err(QbookError::MalformedFormatOverlay {
+                        sheet: sheet_id,
+                        row: entry.row,
+                        col: entry.col,
+                        why: "out-of-range row/col",
+                    });
+                }
+                sheet_mut.format_overlay_mut().set(
+                    entry.row,
+                    entry.col,
+                    ql_storage::FormatId(entry.id),
+                );
+            }
+        }
 
         // Audit M2 fix (2026-05-12): a missing sheet JSONL is now an explicit
         // MissingFile error rather than silently treating the sheet as empty
@@ -2222,6 +2387,228 @@ sheets = [
         }
     }
 
+    // ===== W5-81 Phase 4.5.D part 5 — formats + overlay v3→v4 migration =====
+
+    #[test]
+    fn empty_format_table_round_trips_without_persisting_builtins() {
+        // A fresh workbook has the pre-seeded built-ins in its FormatTable
+        // but no CUSTOM entries. Save should omit the `formats` section
+        // entirely so v3-style envelopes still produce minimal TOML.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("empty_formats.qbook");
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        save_workbook(&wb, "empty_formats", &path).unwrap();
+        // Round-trip: built-ins still present after load.
+        let loaded = load_workbook(&path).unwrap();
+        assert_eq!(
+            loaded.formats().lookup(ql_storage::FormatId(14)),
+            Some("m/d/yyyy")
+        );
+        // The TOML envelope should NOT contain a `[formats]` table (built-
+        // ins aren't persisted; the section is None when empty).
+        let toml_str = std::fs::read_to_string(path.join("workbook.toml")).unwrap();
+        assert!(
+            !toml_str.contains("[formats]") && !toml_str.contains("formats ="),
+            "envelope must omit empty formats section, got:\n{toml_str}"
+        );
+    }
+
+    #[test]
+    fn custom_format_round_trips_through_save_load() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("custom_formats.qbook");
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        // Intern two custom formats.
+        let id_a = wb.formats_mut().intern("\"⚓\" #,##0.00");
+        let id_b = wb.formats_mut().intern("0.0000");
+        assert_eq!(id_a.0, ql_storage::FIRST_CUSTOM_FORMAT_ID);
+        assert_eq!(id_b.0, ql_storage::FIRST_CUSTOM_FORMAT_ID + 1);
+        save_workbook(&wb, "custom_formats", &path).unwrap();
+        let loaded = load_workbook(&path).unwrap();
+        // Both custom entries survive.
+        assert_eq!(loaded.formats().lookup(id_a), Some("\"⚓\" #,##0.00"));
+        assert_eq!(loaded.formats().lookup(id_b), Some("0.0000"));
+        // Built-ins still present too.
+        assert_eq!(
+            loaded.formats().lookup(ql_storage::FormatId(0)),
+            Some("General")
+        );
+    }
+
+    #[test]
+    fn per_sheet_format_overlay_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("overlay.qbook");
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("A");
+        let s1 = wb.add_sheet("B");
+        // Bind cells on both sheets to different built-in ids.
+        wb.sheet_mut(s0)
+            .unwrap()
+            .format_overlay_mut()
+            .set(0, 0, ql_storage::FormatId(14)); // m/d/yyyy
+        wb.sheet_mut(s0)
+            .unwrap()
+            .format_overlay_mut()
+            .set(3, 5, ql_storage::FormatId(4)); // #,##0.00
+        wb.sheet_mut(s1)
+            .unwrap()
+            .format_overlay_mut()
+            .set(10, 20, ql_storage::FormatId(49)); // @
+        save_workbook(&wb, "overlay", &path).unwrap();
+        let loaded = load_workbook(&path).unwrap();
+        // Sheet A overlay round-trips.
+        assert_eq!(
+            loaded.sheet(s0).unwrap().format_overlay().get(0, 0),
+            Some(ql_storage::FormatId(14))
+        );
+        assert_eq!(
+            loaded.sheet(s0).unwrap().format_overlay().get(3, 5),
+            Some(ql_storage::FormatId(4))
+        );
+        // Sheet B overlay round-trips.
+        assert_eq!(
+            loaded.sheet(s1).unwrap().format_overlay().get(10, 20),
+            Some(ql_storage::FormatId(49))
+        );
+        // Sheet A doesn't see Sheet B's binding.
+        assert_eq!(loaded.sheet(s0).unwrap().format_overlay().get(10, 20), None);
+    }
+
+    #[test]
+    fn full_format_round_trip_custom_id_plus_overlay() {
+        // Real-world path: intern a custom format, bind a cell to it,
+        // round-trip, verify everything survives.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("full.qbook");
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("Sheet1");
+        let fmt = "\"$\"#,##0.00;[Red]\"$\"#,##0.00"; // V1 parser doesn't
+                                                      // support [Red] but the parser refuses LATE; the FormatTable doesn't
+                                                      // call the parser at registration — it just interns the string.
+                                                      // Use a parser-friendly format here for symmetry with future tests.
+        let _ = fmt; // silence unused
+        let id = wb.formats_mut().intern("\"€\" #,##0.00");
+        wb.sheet_mut(s).unwrap().format_overlay_mut().set(2, 1, id);
+        save_workbook(&wb, "full", &path).unwrap();
+        let loaded = load_workbook(&path).unwrap();
+        let loaded_id = loaded.sheet(s).unwrap().format_overlay().get(2, 1).unwrap();
+        assert_eq!(loaded_id, id);
+        assert_eq!(loaded.formats().lookup(loaded_id), Some("\"€\" #,##0.00"));
+    }
+
+    #[test]
+    fn v3_envelope_missing_formats_loads_with_defaults() {
+        // Hand-craft a v3-style envelope without `formats` / `format_overlay`.
+        // The v4 reader must default-load it cleanly with the pre-seeded
+        // built-ins + empty overlays (regression-neutral).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy_v3.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let v3_toml = r#"
+schema_version = 3
+name = "legacy_v3"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "S", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+"#;
+        fs::write(path.join("workbook.toml"), v3_toml).unwrap();
+        fs::write(path.join("sheets/0.jsonl"), "").unwrap();
+        fs::write(path.join(ATOMIC_SAVE_MARKER_FILENAME), "").unwrap();
+
+        let loaded = load_workbook(&path).unwrap();
+        // Built-ins were re-seeded by FormatTable::default().
+        assert_eq!(
+            loaded.formats().lookup(ql_storage::FormatId(0)),
+            Some("General")
+        );
+        // No custom entries.
+        for id in ql_storage::FIRST_CUSTOM_FORMAT_ID..(ql_storage::FIRST_CUSTOM_FORMAT_ID + 10) {
+            assert!(
+                loaded.formats().lookup(ql_storage::FormatId(id)).is_none(),
+                "v3 envelope must not produce custom format at id {id}"
+            );
+        }
+        // Empty overlay.
+        assert!(loaded.sheet(0).unwrap().format_overlay().is_empty());
+    }
+
+    #[test]
+    fn malformed_format_id_collision_surfaces_as_error() {
+        // Hand-craft a v4 envelope that tries to re-bind id 0 (General)
+        // to a different string. The loader must surface
+        // `MalformedFormat`.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad_format.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let bad_toml = r#"
+schema_version = 4
+name = "bad"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "S", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+
+[[formats.entries]]
+id = 0
+string = "NOT_GENERAL"
+"#;
+        fs::write(path.join("workbook.toml"), bad_toml).unwrap();
+        fs::write(path.join("sheets/0.jsonl"), "").unwrap();
+        fs::write(path.join(ATOMIC_SAVE_MARKER_FILENAME), "").unwrap();
+
+        let result = load_workbook(&path);
+        assert!(
+            matches!(result, Err(QbookError::MalformedFormat { id: 0, .. })),
+            "expected MalformedFormat(id=0), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_format_overlay_out_of_range_surfaces_as_error() {
+        // Hand-craft a v4 envelope with an out-of-range row in the
+        // overlay. The loader must surface `MalformedFormatOverlay`.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad_overlay.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        // MAX_ROW is u32::MAX in `ql_types`; we use a far-too-large row.
+        let row_too_big = u32::MAX;
+        let bad_toml = format!(
+            r#"
+schema_version = 4
+name = "bad_overlay"
+date_system = "1900"
+
+[[sheets]]
+id = 0
+name = "S"
+chunk_rows = 16384
+row_extent = 0
+col_extent = 0
+
+[[sheets.format_overlay]]
+row = {row_too_big}
+col = 0
+id = 0
+"#
+        );
+        fs::write(path.join("workbook.toml"), &bad_toml).unwrap();
+        fs::write(path.join("sheets/0.jsonl"), "").unwrap();
+        fs::write(path.join(ATOMIC_SAVE_MARKER_FILENAME), "").unwrap();
+
+        let result = load_workbook(&path);
+        assert!(
+            matches!(
+                result,
+                Err(QbookError::MalformedFormatOverlay { sheet: 0, .. })
+            ),
+            "expected MalformedFormatOverlay, got {result:?}"
+        );
+    }
+
     /// Phase 2A.8 audit M11: a formula-bearing cell with Blank value
     /// round-trips through the new `Pending` wire variant. On load, the
     /// formula is preserved and the cell value is Blank (Pending decodes to
@@ -2295,15 +2682,16 @@ col_extent = 1
 
     /// Phase 2A.8 forward-compat: a hand-crafted envelope with an unknown
     /// schema version is rejected via the existing UnsupportedSchema path.
-    /// No silent forward compat. **W5-71 (Phase 4.5.A.2):** updated from
-    /// version 3 to version 4 after v3 became the current ship version.
+    /// No silent forward compat. **W5-81 (Phase 4.5.D part 5):** updated
+    /// from version 4 to version 5 after v4 became the current ship
+    /// version (adding FormatTable + per-sheet format overlay).
     #[test]
     fn future_schema_version_rejected() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("future.qbook");
         fs::create_dir_all(path.join("sheets")).unwrap();
         let toml = r#"
-schema_version = 4
+schema_version = 5
 name = "future"
 
 [[sheets]]
@@ -2318,7 +2706,7 @@ col_extent = 0
 
         let result = load_workbook(&path);
         assert!(
-            matches!(result, Err(QbookError::UnsupportedSchema { found: 4 })),
+            matches!(result, Err(QbookError::UnsupportedSchema { found: 5 })),
             "expected UnsupportedSchema, got {result:?}"
         );
     }
