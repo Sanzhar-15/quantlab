@@ -341,8 +341,13 @@ pub fn default_registry() -> FunctionRegistry {
     // already covers these names; this registration is the executable
     // half. RANDARRAY / INDIRECT / OFFSET / INFO / CELL stay deferred
     // to the Phase 4.3 function library expansion.
-    r.register("NOW", volatile::now);
-    r.register("TODAY", volatile::today);
+    // **W5-71 (Phase 4.5.A.2):** NOW/TODAY moved to the
+    // ContextAwareFn tier so they can read the workbook's date_system
+    // + locale-aware UTC offset from `EvalContext`. The legacy
+    // `volatile::now` / `volatile::today` scalar functions are kept in
+    // the source (deprecated callable API) but no longer registered.
+    r.register_context_aware("NOW", volatile::now_ctx);
+    r.register_context_aware("TODAY", volatile::today_ctx);
     r.register("RAND", volatile::rand);
     r.register("RANDBETWEEN", volatile::randbetween);
 

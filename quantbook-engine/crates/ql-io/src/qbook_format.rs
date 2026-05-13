@@ -88,7 +88,13 @@ use thiserror::Error;
 /// placeholders into `Pending` when the cell carries a formula). v1 readers
 /// (pre-2A.8 binaries, if any exist) refuse v2 via the `UnsupportedSchema`
 /// error path.
-pub const WORKBOOK_SCHEMA_VERSION: u32 = 2;
+/// **W5-71 (Phase 4.5.A.2):** bumped to v3. v3 adds an optional
+/// `date_system` envelope field (`"1900"` or `"1904"`, default `"1900"`
+/// on missing). Loaders accept v1, v2, AND v3 envelopes. A v2 envelope
+/// loaded by a v3 reader gets `Workbook::date_system = Excel1900` (the
+/// default). A v3 envelope's `date_system` is currently always set on
+/// save; old binaries (v2 readers) refuse v3 via `UnsupportedSchema`.
+pub const WORKBOOK_SCHEMA_VERSION: u32 = 3;
 
 /// The earliest schema version this reader still accepts. v1 fixtures (Phase 1)
 /// continue to load on v2 binaries; older versions would need explicit handling.
@@ -211,6 +217,37 @@ pub struct WorkbookEnvelope {
     /// load with `names: None`; the loader treats that as "no names registered."
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub names: Option<NamesSection>,
+    /// **W5-71 (Phase 4.5.A.2):** Excel date system. Present in v3 envelopes
+    /// (always `Some` on save), absent in v1/v2 (loader maps `None` to
+    /// `DateSystem::Excel1900` — the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_system: Option<DateSystemWire>,
+}
+
+/// **W5-71 (Phase 4.5.A.2):** wire representation of `ql_types::DateSystem`.
+/// Serialized as a string `"1900"` or `"1904"` for human-readable TOML.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum DateSystemWire {
+    #[serde(rename = "1900")]
+    Excel1900,
+    #[serde(rename = "1904")]
+    Excel1904,
+}
+
+impl DateSystemWire {
+    pub fn from_runtime(system: ql_types::DateSystem) -> Self {
+        match system {
+            ql_types::DateSystem::Excel1900 => Self::Excel1900,
+            ql_types::DateSystem::Excel1904 => Self::Excel1904,
+        }
+    }
+
+    pub fn to_runtime(self) -> ql_types::DateSystem {
+        match self {
+            Self::Excel1900 => ql_types::DateSystem::Excel1900,
+            Self::Excel1904 => ql_types::DateSystem::Excel1904,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -869,6 +906,8 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
         name: name.to_owned(),
         sheets: sheet_envelopes,
         names: names_section,
+        // **W5-71 (Phase 4.5.A.2):** persist the workbook's date system.
+        date_system: Some(DateSystemWire::from_runtime(wb.date_system())),
     };
     let toml_str = toml::to_string_pretty(&envelope)?;
     fs::write(dir.join("workbook.toml"), toml_str)?;
@@ -1035,6 +1074,13 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
     // sequential 0..N — Workbook::add_sheet allocates ids in that order.
     // Audit M3 fix (2026-05-12): previously this panicked; now returns Result error.
     let mut wb = Workbook::new();
+    // **W5-71 (Phase 4.5.A.2):** apply the envelope's date_system, defaulting
+    // to Excel1900 when absent (v1/v2 envelopes lack the field). v3+
+    // envelopes always carry it.
+    if let Some(ds_wire) = envelope.date_system {
+        wb.set_date_system(ds_wire.to_runtime());
+    }
+    // (Else: leave at Workbook::default(), which is Excel1900.)
     let sheets_dir = path.join("sheets");
     for (expected_id, sheet_env) in envelope.sheets.iter().enumerate() {
         if sheet_env.id as usize != expected_id {
@@ -2111,6 +2157,71 @@ col_extent = 1
         ));
     }
 
+    // ===== W5-71 Phase 4.5.A.2 — date_system v2→v3 migration =====
+
+    #[test]
+    fn date_system_excel1900_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ds_1900.qbook");
+        let mut wb = Workbook::new();
+        // Default is Excel1900; verify it survives save/load.
+        wb.add_sheet("S");
+        assert_eq!(wb.date_system(), ql_types::DateSystem::Excel1900);
+        save_workbook(&wb, "ds_1900", &path).unwrap();
+        let loaded = load_workbook(&path).unwrap();
+        assert_eq!(loaded.date_system(), ql_types::DateSystem::Excel1900);
+    }
+
+    #[test]
+    fn date_system_excel1904_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ds_1904.qbook");
+        let mut wb = Workbook::new();
+        wb.set_date_system(ql_types::DateSystem::Excel1904);
+        wb.add_sheet("S");
+        save_workbook(&wb, "ds_1904", &path).unwrap();
+        let loaded = load_workbook(&path).unwrap();
+        assert_eq!(loaded.date_system(), ql_types::DateSystem::Excel1904);
+    }
+
+    #[test]
+    fn v2_envelope_missing_date_system_loads_as_excel1900() {
+        // Hand-craft a v2 envelope without the new field; expect the v3
+        // reader to default-load as Excel1900.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy_v2.qbook");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::create_dir_all(path.join("sheets")).unwrap();
+        let v2_toml = r#"
+schema_version = 2
+name = "legacy_v2"
+sheets = [
+  { id = 0, name = "S", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+"#;
+        std::fs::write(path.join("workbook.toml"), v2_toml).unwrap();
+        // Empty sheet JSONL.
+        std::fs::write(path.join("sheets/0.jsonl"), "").unwrap();
+        // Engine-owned marker (so recovery passes).
+        std::fs::write(path.join(ATOMIC_SAVE_MARKER_FILENAME), "").unwrap();
+
+        let loaded = load_workbook(&path).unwrap();
+        // Default date_system on missing field is Excel1900.
+        assert_eq!(loaded.date_system(), ql_types::DateSystem::Excel1900);
+    }
+
+    #[test]
+    fn date_system_wire_round_trip() {
+        // Pure type-level test: wire enum round-trips runtime enum.
+        for ds in [
+            ql_types::DateSystem::Excel1900,
+            ql_types::DateSystem::Excel1904,
+        ] {
+            let wire = DateSystemWire::from_runtime(ds);
+            assert_eq!(wire.to_runtime(), ds);
+        }
+    }
+
     /// Phase 2A.8 audit M11: a formula-bearing cell with Blank value
     /// round-trips through the new `Pending` wire variant. On load, the
     /// formula is preserved and the cell value is Blank (Pending decodes to
@@ -2183,15 +2294,16 @@ col_extent = 1
     }
 
     /// Phase 2A.8 forward-compat: a hand-crafted envelope with an unknown
-    /// schema version (e.g. 3) is rejected via the existing UnsupportedSchema
-    /// path. No silent forward compat.
+    /// schema version is rejected via the existing UnsupportedSchema path.
+    /// No silent forward compat. **W5-71 (Phase 4.5.A.2):** updated from
+    /// version 3 to version 4 after v3 became the current ship version.
     #[test]
     fn future_schema_version_rejected() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("future.qbook");
         fs::create_dir_all(path.join("sheets")).unwrap();
         let toml = r#"
-schema_version = 3
+schema_version = 4
 name = "future"
 
 [[sheets]]
@@ -2206,7 +2318,7 @@ col_extent = 0
 
         let result = load_workbook(&path);
         assert!(
-            matches!(result, Err(QbookError::UnsupportedSchema { found: 3 })),
+            matches!(result, Err(QbookError::UnsupportedSchema { found: 4 })),
             "expected UnsupportedSchema, got {result:?}"
         );
     }

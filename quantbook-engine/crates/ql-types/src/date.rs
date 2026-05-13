@@ -124,6 +124,25 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     (final_y, m, d)
 }
 
+/// **W5-71 (Phase 4.5.A.2):** convert days-since-Unix-epoch to `(year,
+/// month, day)`. Public so `volatile::now_ctx` / `today_ctx` can compute
+/// the workbook's date-system-aware current serial. Calls the same
+/// Hinnant algorithm as `serial_to_ymd`; no Excel-bug branch (Unix days
+/// don't carry the phantom).
+pub fn unix_days_to_ymd(unix_days: i64) -> (i32, u32, u32) {
+    civil_from_days(unix_days)
+}
+
+/// **W5-71 (Phase 4.5.A.2):** convert `(year, month, day)` to
+/// days-since-Unix-epoch. Inverse of [`unix_days_to_ymd`].
+///
+/// Validity: caller validates month ∈ 1..=12 and day ∈
+/// 1..=days_in_month(year, month). For an invalid `(y, m, d)`, output
+/// is unspecified (in practice: the algorithm extrapolates).
+pub fn ymd_to_unix_days(year: i32, month: u32, day: u32) -> i64 {
+    days_from_civil(year, month, day)
+}
+
 // ============================================================================
 // serial ↔ ymd
 // ============================================================================

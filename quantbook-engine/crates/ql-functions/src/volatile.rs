@@ -105,22 +105,110 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// **W5-71 (Phase 4.5.A.2):** internal helper. Given a context, return
+/// `(local_unix_days, secs_in_day)` — the local day count since Unix
+/// epoch plus the within-day seconds. Used by both `now_ctx` and
+/// `today_ctx`.
+///
+/// Reads `(unix_secs, utc_offset_seconds)` from `ctx.now_provider`.
+/// Applies the offset to get LOCAL time. `local_secs = unix_secs +
+/// offset`. Day floor + remainder via Euclidean div (handles negative
+/// pre-1970 local times correctly).
+fn local_unix_days_and_secs(ctx: &ql_types::EvalContext) -> Result<(i64, u64), ErrorValue> {
+    let (unix_secs, offset) = ctx.now_provider.read()?;
+    let local_secs = (unix_secs as i64) + (offset as i64);
+    let days = local_secs.div_euclid(86_400);
+    let secs_in_day = local_secs.rem_euclid(86_400) as u64;
+    Ok((days, secs_in_day))
+}
+
+/// **W5-71 (Phase 4.5.A.2):** context-aware `NOW()`. Returns the
+/// workbook-date-system-correct serial for the local current time, via
+/// `EvalContext.now_provider` (System or Test) + `EvalContext.date_system`.
+///
+/// **Behavior change from the pre-W5-71 scalar `now`:**
+/// - Local-time aware: if the `NowProvider` reports a non-zero UTC
+///   offset, the returned serial reflects local wall-clock time. The
+///   pre-W5-71 path used UTC-equivalent seconds.
+/// - 1904-system aware: in an Excel1904 workbook, the serial is
+///   computed from the 1904 epoch.
+/// - Leap-year-bug aware: routes through `ymd_to_serial` which centrally
+///   handles the 1900 phantom day.
+///
+/// For all CURRENT dates (post 1900-03-01, which is everything any user
+/// will ever see), the new path produces an Excel-canon-correct serial.
+/// The scalar `now` is kept for backwards compat with pre-EvalContext
+/// callers; it now reads the same `now_secs()` source but applies the
+/// flat 25569 offset (1900-system + UTC, no leap-year-bug awareness).
+pub fn now_ctx(args: &[Value], ctx: &ql_types::EvalContext) -> Value {
+    if !args.is_empty() {
+        return Value::Error(ErrorValue::Value);
+    }
+    // Override path: respect the test-now-override even when using
+    // `now_provider` so deterministic tests keep working.
+    let (local_days, secs_in_day) = if let Some(override_secs) = TEST_NOW_OVERRIDE.with(|s| s.get())
+    {
+        let local_secs = override_secs as i64;
+        (
+            local_secs.div_euclid(86_400),
+            local_secs.rem_euclid(86_400) as u64,
+        )
+    } else {
+        match local_unix_days_and_secs(ctx) {
+            Ok(v) => v,
+            Err(e) => return Value::Error(e),
+        }
+    };
+    let (y, m, d) = ql_types::unix_days_to_ymd(local_days);
+    let day_serial = match ql_types::ymd_to_serial(y, m, d, ctx.date_system) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let frac = secs_in_day as f64 / 86_400.0;
+    Value::number(day_serial + frac)
+}
+
+/// **W5-71 (Phase 4.5.A.2):** context-aware `TODAY()`. Same as
+/// `now_ctx` but returns the integer-only serial (no time-of-day).
+pub fn today_ctx(args: &[Value], ctx: &ql_types::EvalContext) -> Value {
+    if !args.is_empty() {
+        return Value::Error(ErrorValue::Value);
+    }
+    let local_days = if let Some(override_secs) = TEST_NOW_OVERRIDE.with(|s| s.get()) {
+        (override_secs as i64).div_euclid(86_400)
+    } else {
+        match local_unix_days_and_secs(ctx) {
+            Ok((d, _)) => d,
+            Err(e) => return Value::Error(e),
+        }
+    };
+    let (y, m, d) = ql_types::unix_days_to_ymd(local_days);
+    match ql_types::ymd_to_serial(y, m, d, ctx.date_system) {
+        Ok(s) => Value::number(s),
+        Err(e) => Value::Error(e),
+    }
+}
+
 /// `NOW()` — current date+time as an Excel-style serial number (days
-/// since 1899-12-30). For V1 we approximate with Unix-time-based
-/// arithmetic; the Phase 4.5 date/time + format work pins the exact
-/// epoch + leap-year rules.
+/// since 1899-12-30). **Legacy scalar path retained for backwards
+/// compat.** New callers should use [`now_ctx`] via the
+/// `ContextAwareFn` registry tier. For dates after 1900-03-01 (i.e.
+/// every real date), this path produces the same serial as `now_ctx`
+/// when the workbook uses Excel1900 + UTC offset 0. Diverges on
+/// 1904-system workbooks and on locales with non-zero UTC offset.
 pub fn now(args: &[Value]) -> Value {
     if !args.is_empty() {
         return Value::Error(ErrorValue::Value);
     }
     let secs = now_secs() as f64;
-    // Excel epoch (1899-12-30) is 25569 days before Unix epoch
-    // (1970-01-01). Convert seconds → days.
     let serial = (secs / 86_400.0) + 25_569.0;
     Value::number(serial)
 }
 
 /// `TODAY()` — current date (no time-of-day) as an Excel-style serial.
+/// **Legacy scalar path retained for backwards compat.** See
+/// [`today_ctx`] for the EvalContext-aware version that handles 1904
+/// and local time.
 pub fn today(args: &[Value]) -> Value {
     if !args.is_empty() {
         return Value::Error(ErrorValue::Value);
@@ -272,5 +360,80 @@ mod tests {
             Value::Error(ErrorValue::Value)
         );
         assert_eq!(rand(&[Value::Number(1.0)]), Value::Error(ErrorValue::Value));
+    }
+
+    // ===== W5-71 Phase 4.5.A.2 — context-aware NOW/TODAY =====
+
+    #[test]
+    fn now_ctx_unix_epoch_in_excel1900_is_25569() {
+        let ctx = ql_types::EvalContext::for_test(0, 0);
+        assert_eq!(now_ctx(&[], &ctx), Value::Number(25_569.0));
+    }
+
+    #[test]
+    fn today_ctx_unix_epoch_in_excel1900_is_25569() {
+        let ctx = ql_types::EvalContext::for_test(0, 0);
+        assert_eq!(today_ctx(&[], &ctx), Value::Number(25_569.0));
+    }
+
+    #[test]
+    fn now_ctx_unix_epoch_in_excel1904_is_24107() {
+        // 1900-system serial 25569 - 1462 (= phantom day + epoch diff) = 24107.
+        let ctx = ql_types::EvalContext {
+            date_system: ql_types::DateSystem::Excel1904,
+            now_provider: ql_types::NowProvider::Test {
+                unix_secs: 0,
+                utc_offset_seconds: 0,
+            },
+            ..ql_types::EvalContext::default()
+        };
+        assert_eq!(now_ctx(&[], &ctx), Value::Number(24_107.0));
+    }
+
+    #[test]
+    fn now_ctx_with_utc_offset_shifts_local_time() {
+        // unix_secs = 0 (1970-01-01 00:00 UTC), offset = +1 hour.
+        // Local time = 1970-01-01 01:00 → fractional 1/24.
+        let ctx = ql_types::EvalContext::for_test(0, 3600);
+        let v = now_ctx(&[], &ctx);
+        if let Value::Number(n) = v {
+            let expected = 25_569.0 + (1.0 / 24.0);
+            assert!((n - expected).abs() < 1e-9, "expected {expected}, got {n}");
+        } else {
+            panic!("expected Number, got {v:?}");
+        }
+    }
+
+    #[test]
+    fn today_ctx_with_utc_offset_can_shift_day() {
+        // unix_secs = 0 (1970-01-01 00:00 UTC), offset = -1 hour.
+        // Local time = 1969-12-31 23:00 → day before Unix epoch.
+        let ctx = ql_types::EvalContext::for_test(0, -3600);
+        assert_eq!(today_ctx(&[], &ctx), Value::Number(25_568.0));
+    }
+
+    #[test]
+    fn now_ctx_test_override_via_thread_local_takes_precedence() {
+        // The test-now-override should still work for backwards compat.
+        set_test_now_secs(0);
+        // Construct a ctx that would give a different answer; the
+        // override should win.
+        let ctx = ql_types::EvalContext::for_test(86_400, 0);
+        let v = now_ctx(&[], &ctx);
+        assert_eq!(v, Value::Number(25_569.0)); // override wins.
+        clear_test_overrides();
+    }
+
+    #[test]
+    fn now_ctx_arity_error() {
+        let ctx = ql_types::EvalContext::default();
+        assert_eq!(
+            now_ctx(&[Value::Number(1.0)], &ctx),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            today_ctx(&[Value::Number(1.0)], &ctx),
+            Value::Error(ErrorValue::Value)
+        );
     }
 }

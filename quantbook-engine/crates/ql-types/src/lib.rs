@@ -27,8 +27,9 @@ pub use coercion::{
     to_text_for_formula,
 };
 pub use date::{
-    days_in_month, fraction_to_hms, hms_to_fraction, is_leap_year, serial_to_ymd, ymd_to_serial,
-    MAX_EXCEL_SERIAL_DAY, UNIX_EPOCH_AS_1900_SERIAL, UNIX_EPOCH_AS_1904_SERIAL,
+    days_in_month, fraction_to_hms, hms_to_fraction, is_leap_year, serial_to_ymd, unix_days_to_ymd,
+    ymd_to_serial, ymd_to_unix_days, MAX_EXCEL_SERIAL_DAY, UNIX_EPOCH_AS_1900_SERIAL,
+    UNIX_EPOCH_AS_1904_SERIAL,
 };
 pub use error::{ErrorValue, ParseErrorValueError};
 pub use eval_context::{DateSystem, EvalContext, Locale, NowProvider, DEFAULT_EVAL_CONTEXT};

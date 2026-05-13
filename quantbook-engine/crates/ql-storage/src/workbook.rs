@@ -229,11 +229,31 @@ pub struct Workbook {
     sheets: Vec<Sheet>,
     names: NameTable,
     formula_cells: HashMap<(SheetId, RowId, ColId), Arc<str>>,
+    /// **W5-71 (Phase 4.5.A.2):** Excel date system for this workbook.
+    /// Default `Excel1900` (Windows Excel canon). The `.qbook` envelope
+    /// persists this; xlsx I/O (Phase 4.11) maps it from the workbook's
+    /// `date1904` SST flag. Functions read this via
+    /// `WorkbookEnv::eval_context()` to drive serial ↔ date conversion.
+    date_system: ql_types::DateSystem,
 }
 
 impl Workbook {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// **W5-71 (Phase 4.5.A.2):** the workbook's date system.
+    pub fn date_system(&self) -> ql_types::DateSystem {
+        self.date_system
+    }
+
+    /// **W5-71 (Phase 4.5.A.2):** set the workbook's date system.
+    /// Used by the `.qbook` loader on file load (defaults to `Excel1900`
+    /// when missing from the envelope) and by xlsx import in Phase 4.11.
+    /// Switching post-load shifts every serial by 1462 days — not
+    /// recommended as a runtime operation.
+    pub fn set_date_system(&mut self, system: ql_types::DateSystem) {
+        self.date_system = system;
     }
 
     pub fn sheet_count(&self) -> usize {

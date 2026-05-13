@@ -79,13 +79,23 @@ pub trait CellEnv {
 
 /// `ql-storage::Workbook`-backed implementation. Wraps a Workbook reference; reads dispatch
 /// via the Workbook's sheet lookup + the sheet's `read(row, col)`.
+///
+/// **W5-71 (Phase 4.5.A.2):** caches an `EvalContext` built from the
+/// workbook's `date_system` at construction time. Locale + NowProvider
+/// stay at their defaults (`EnUs` + `System`) — Phase 4.9 + future
+/// Phase-6.3 WASM bindings will plumb those through too.
 pub struct WorkbookEnv<'w> {
     workbook: &'w ql_storage::Workbook,
+    eval_ctx: EvalContext,
 }
 
 impl<'w> WorkbookEnv<'w> {
     pub fn new(workbook: &'w ql_storage::Workbook) -> Self {
-        Self { workbook }
+        let eval_ctx = EvalContext {
+            date_system: workbook.date_system(),
+            ..EvalContext::default()
+        };
+        Self { workbook, eval_ctx }
     }
 }
 
@@ -199,6 +209,14 @@ impl<'w> CellEnv for WorkbookEnv<'w> {
             (out, rows, cols)
         }
     }
+
+    /// **W5-71 (Phase 4.5.A.2):** return the cached `EvalContext` built
+    /// from the workbook's `date_system` at WorkbookEnv construction.
+    /// Overrides the trait default (which returns
+    /// `&DEFAULT_EVAL_CONTEXT`).
+    fn eval_context(&self) -> &EvalContext {
+        &self.eval_ctx
+    }
 }
 
 /// HashMap-backed env for tests + simple harnesses. Stores `((sheet, row, col), Value)`
@@ -306,5 +324,38 @@ mod tests {
         let e = WorkbookEnv::new(&wb);
         assert_eq!(e.read_cell(sheet_id, 5, 3), Value::Number(7.0));
         assert_eq!(e.read_cell(sheet_id, 0, 0), Value::Blank);
+    }
+
+    // ===== W5-71 Phase 4.5.A.2 — WorkbookEnv carries date_system =====
+
+    #[test]
+    fn workbook_env_eval_context_reflects_default_excel1900() {
+        let wb = ql_storage::Workbook::new();
+        let e = WorkbookEnv::new(&wb);
+        assert_eq!(
+            e.eval_context().date_system,
+            ql_types::DateSystem::Excel1900
+        );
+    }
+
+    #[test]
+    fn workbook_env_eval_context_reflects_excel1904_workbook() {
+        let mut wb = ql_storage::Workbook::new();
+        wb.set_date_system(ql_types::DateSystem::Excel1904);
+        let e = WorkbookEnv::new(&wb);
+        assert_eq!(
+            e.eval_context().date_system,
+            ql_types::DateSystem::Excel1904
+        );
+    }
+
+    #[test]
+    fn map_env_eval_context_is_default_excel1900() {
+        // MapEnv (test harness, no workbook backing) uses the trait default.
+        let e = MapEnv::new();
+        assert_eq!(
+            e.eval_context().date_system,
+            ql_types::DateSystem::Excel1900
+        );
     }
 }
