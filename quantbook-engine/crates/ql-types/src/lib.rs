@@ -15,6 +15,7 @@
 
 pub mod address;
 pub mod coercion;
+pub mod date;
 pub mod error;
 pub mod eval_context;
 pub mod value;
@@ -24,6 +25,10 @@ pub use coercion::{
     format_number_for_arg, sanitize_f64, to_int_arg, to_logical, to_number_lenient,
     to_number_strict, to_number_strict_skip_blank, to_text_for_arg, to_text_for_display,
     to_text_for_formula,
+};
+pub use date::{
+    days_in_month, fraction_to_hms, hms_to_fraction, is_leap_year, serial_to_ymd, ymd_to_serial,
+    MAX_EXCEL_SERIAL_DAY, UNIX_EPOCH_AS_1900_SERIAL, UNIX_EPOCH_AS_1904_SERIAL,
 };
 pub use error::{ErrorValue, ParseErrorValueError};
 pub use eval_context::{DateSystem, EvalContext, Locale, NowProvider, DEFAULT_EVAL_CONTEXT};
