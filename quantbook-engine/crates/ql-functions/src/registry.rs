@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use ql_types::Value;
 
+use crate::context_aware_fns::ContextAwareFn;
 use crate::range_aware_fns::RangeAwareFn;
 use crate::{range_fns, scalar_fns, volatile};
 
@@ -17,13 +18,16 @@ pub type ScalarFn = fn(&[Value]) -> Value;
 ///
 /// W5-53 adds a parallel `range_aware_fns` table for functions that
 /// need per-argument range-vs-scalar metadata (SUMIF, COUNTIF, etc.).
-/// Lookup checks the range-aware table first; falls back to the
-/// scalar table. A single name MUST NOT be registered in both
-/// (registration panics if there's a conflict).
+/// W5-69 (Phase 4.5.A.0) adds `context_aware_fns` for date/locale/clock-
+/// aware functions that take an extra `&EvalContext` arg. Dispatch order:
+/// range_aware FIRST → context_aware SECOND → scalar LAST. A single name
+/// MUST NOT be registered in more than one table (registration panics on
+/// any cross-table collision).
 #[derive(Clone, Debug)]
 pub struct FunctionRegistry {
     fns: HashMap<&'static str, ScalarFn>,
     range_aware_fns: HashMap<&'static str, RangeAwareFn>,
+    context_aware_fns: HashMap<&'static str, ContextAwareFn>,
 }
 
 impl Default for FunctionRegistry {
@@ -39,6 +43,7 @@ impl FunctionRegistry {
         Self {
             fns: HashMap::new(),
             range_aware_fns: HashMap::new(),
+            context_aware_fns: HashMap::new(),
         }
     }
 
@@ -60,6 +65,19 @@ impl FunctionRegistry {
             name.bytes().all(|b| !b.is_ascii_lowercase()),
             "FunctionRegistry::register: name {name:?} must be canonical upper-case; \
              lookups uppercase the query, so a lower-case key is unreachable"
+        );
+        // W5-69 (Phase 4.5.A.0): cross-table disjointness — a name
+        // already in range_aware_fns or context_aware_fns cannot also
+        // be registered as scalar.
+        assert!(
+            !self.range_aware_fns.contains_key(name),
+            "FunctionRegistry::register: {name:?} is already registered as a \
+             range-aware function; cannot register in both tables"
+        );
+        assert!(
+            !self.context_aware_fns.contains_key(name),
+            "FunctionRegistry::register: {name:?} is already registered as a \
+             context-aware function; cannot register in both tables"
         );
         let prior = self.fns.insert(name, f);
         assert!(
@@ -88,10 +106,48 @@ impl FunctionRegistry {
             "FunctionRegistry::register_range_aware: {name:?} is already registered \
              as a scalar function; cannot register in both tables"
         );
+        // W5-69 (Phase 4.5.A.0): also disjoint from context_aware_fns.
+        assert!(
+            !self.context_aware_fns.contains_key(name),
+            "FunctionRegistry::register_range_aware: {name:?} is already registered \
+             as a context-aware function; cannot register in both tables"
+        );
         let prior = self.range_aware_fns.insert(name, f);
         assert!(
             prior.is_none(),
             "FunctionRegistry::register_range_aware: duplicate registration for {name:?}"
+        );
+    }
+
+    /// **W5-69 (Phase 4.5.A.0):** register a context-aware function. These
+    /// receive `&EvalContext` (date_system + locale + now_provider) in
+    /// addition to the standard `&[Value]` args. Same canonical-uppercase
+    /// requirement + duplicate panic + cross-table disjointness as the
+    /// other two `register_*` methods.
+    pub fn register_context_aware(&mut self, name: &'static str, f: ContextAwareFn) {
+        assert!(
+            !name.is_empty(),
+            "FunctionRegistry::register_context_aware: name must not be empty"
+        );
+        assert!(
+            name.bytes().all(|b| !b.is_ascii_lowercase()),
+            "FunctionRegistry::register_context_aware: name {name:?} must be canonical \
+             upper-case"
+        );
+        assert!(
+            !self.fns.contains_key(name),
+            "FunctionRegistry::register_context_aware: {name:?} is already registered \
+             as a scalar function; cannot register in both tables"
+        );
+        assert!(
+            !self.range_aware_fns.contains_key(name),
+            "FunctionRegistry::register_context_aware: {name:?} is already registered \
+             as a range-aware function; cannot register in both tables"
+        );
+        let prior = self.context_aware_fns.insert(name, f);
+        assert!(
+            prior.is_none(),
+            "FunctionRegistry::register_context_aware: duplicate registration for {name:?}"
         );
     }
 
@@ -112,6 +168,15 @@ impl FunctionRegistry {
         self.range_aware_fns.get(upper.as_str()).copied()
     }
 
+    /// **W5-69 (Phase 4.5.A.0):** case-insensitive lookup in the
+    /// context-aware table. Callers should check this AFTER
+    /// `lookup_range_aware` but BEFORE `lookup`. Dispatch order:
+    /// `range_aware` → `context_aware` → `scalar`.
+    pub fn lookup_context_aware(&self, name: &str) -> Option<ContextAwareFn> {
+        let upper = name.to_ascii_uppercase();
+        self.context_aware_fns.get(upper.as_str()).copied()
+    }
+
     pub fn names(&self) -> impl Iterator<Item = &&'static str> {
         self.fns.keys()
     }
@@ -125,19 +190,31 @@ impl FunctionRegistry {
         self.range_aware_fns.keys()
     }
 
+    /// **W5-69 (Phase 4.5.A.0):** names registered in the context-aware
+    /// table. Same pattern as `range_aware_names()`; coverage walks must
+    /// include this iterator OR use `names_all()` (which chains all 3).
+    pub fn context_aware_names(&self) -> impl Iterator<Item = &&'static str> {
+        self.context_aware_fns.keys()
+    }
+
     /// W5-65 (Phase 4.4.B): convenience iterator over ALL registered function
-    /// names (both scalar and range-aware tables, no de-duplication since the
-    /// two tables are disjoint by registration invariant).
+    /// names across all tables (scalar + range-aware + context-aware). The
+    /// three tables are disjoint by registration invariant, so no
+    /// deduplication is needed. **W5-69 (Phase 4.5.A.0):** extended to chain
+    /// the context-aware table.
     pub fn names_all(&self) -> impl Iterator<Item = &&'static str> {
-        self.fns.keys().chain(self.range_aware_fns.keys())
+        self.fns
+            .keys()
+            .chain(self.range_aware_fns.keys())
+            .chain(self.context_aware_fns.keys())
     }
 
     pub fn len(&self) -> usize {
-        self.fns.len() + self.range_aware_fns.len()
+        self.fns.len() + self.range_aware_fns.len() + self.context_aware_fns.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.fns.is_empty() && self.range_aware_fns.is_empty()
+        self.fns.is_empty() && self.range_aware_fns.is_empty() && self.context_aware_fns.is_empty()
     }
 }
 
@@ -390,6 +467,151 @@ mod tests {
         let mut r = FunctionRegistry::new();
         r.register_range_aware("SUMIF", range_fns::sumif);
         r.register_range_aware("SUMIF", range_fns::sumif);
+    }
+
+    // ===== W5-69 Phase 4.5.A.0 — context-aware tier =====
+
+    // A trivial test fixture: a context-aware fn that returns the
+    // workbook's date-system as a Number (1900→1900.0, 1904→1904.0).
+    // Lets us verify dispatch + arg-shape without depending on any
+    // not-yet-implemented date function.
+    fn echo_date_system_year(args: &[Value], ctx: &ql_types::EvalContext) -> Value {
+        if !args.is_empty() {
+            return Value::Error(ql_types::ErrorValue::Value);
+        }
+        let n = match ctx.date_system {
+            ql_types::DateSystem::Excel1900 => 1900.0,
+            ql_types::DateSystem::Excel1904 => 1904.0,
+        };
+        Value::Number(n)
+    }
+
+    #[test]
+    fn context_aware_register_and_lookup_works() {
+        let mut r = FunctionRegistry::new();
+        r.register_context_aware("ECHO.DS", echo_date_system_year);
+        assert!(r.lookup_context_aware("ECHO.DS").is_some());
+        assert!(r.lookup_context_aware("echo.ds").is_some()); // case-insensitive
+        assert!(r.lookup("ECHO.DS").is_none()); // NOT in scalar table
+        assert!(r.lookup_range_aware("ECHO.DS").is_none()); // NOT in range-aware table
+    }
+
+    #[test]
+    fn context_aware_fn_receives_eval_context() {
+        let mut r = FunctionRegistry::new();
+        r.register_context_aware("ECHO.DS", echo_date_system_year);
+        let f = r.lookup_context_aware("ECHO.DS").expect("registered");
+        let ctx_1900 = ql_types::EvalContext::default();
+        assert_eq!(f(&[], &ctx_1900), Value::Number(1900.0));
+        let ctx_1904 = ql_types::EvalContext {
+            date_system: ql_types::DateSystem::Excel1904,
+            ..ql_types::EvalContext::default()
+        };
+        assert_eq!(f(&[], &ctx_1904), Value::Number(1904.0));
+    }
+
+    #[test]
+    fn context_aware_table_disjoint_from_scalar() {
+        let r = default_registry();
+        for (name, _) in r.fns.iter() {
+            assert!(
+                !r.context_aware_fns.contains_key(name),
+                "{name:?} appears in both fns and context_aware_fns"
+            );
+        }
+    }
+
+    #[test]
+    fn context_aware_table_disjoint_from_range_aware() {
+        let r = default_registry();
+        for (name, _) in r.range_aware_fns.iter() {
+            assert!(
+                !r.context_aware_fns.contains_key(name),
+                "{name:?} appears in both range_aware_fns and context_aware_fns"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "is already registered as a scalar function")]
+    fn register_context_aware_with_existing_scalar_name_panics() {
+        let mut r = FunctionRegistry::new();
+        r.register("FOO", scalar_fns::sum);
+        r.register_context_aware("FOO", echo_date_system_year);
+    }
+
+    #[test]
+    #[should_panic(expected = "is already registered as a range-aware function")]
+    fn register_context_aware_with_existing_range_aware_name_panics() {
+        let mut r = FunctionRegistry::new();
+        r.register_range_aware("FOO", range_fns::sumif);
+        r.register_context_aware("FOO", echo_date_system_year);
+    }
+
+    #[test]
+    #[should_panic(expected = "is already registered as a context-aware function")]
+    fn register_scalar_with_existing_context_aware_name_panics() {
+        let mut r = FunctionRegistry::new();
+        r.register_context_aware("FOO", echo_date_system_year);
+        r.register("FOO", scalar_fns::sum);
+    }
+
+    #[test]
+    #[should_panic(expected = "is already registered as a context-aware function")]
+    fn register_range_aware_with_existing_context_aware_name_panics() {
+        let mut r = FunctionRegistry::new();
+        r.register_context_aware("FOO", echo_date_system_year);
+        r.register_range_aware("FOO", range_fns::sumif);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate registration")]
+    fn duplicate_context_aware_registration_panics() {
+        let mut r = FunctionRegistry::new();
+        r.register_context_aware("ECHO.DS", echo_date_system_year);
+        r.register_context_aware("ECHO.DS", echo_date_system_year);
+    }
+
+    #[test]
+    fn names_all_chains_all_three_tables() {
+        let mut r = FunctionRegistry::new();
+        r.register("SCALAR_FN", scalar_fns::sum);
+        r.register_range_aware("RANGE_FN", range_fns::sumif);
+        r.register_context_aware("CONTEXT_FN", echo_date_system_year);
+        let all: Vec<&str> = r.names_all().copied().collect();
+        assert!(all.contains(&"SCALAR_FN"));
+        assert!(all.contains(&"RANGE_FN"));
+        assert!(all.contains(&"CONTEXT_FN"));
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn len_includes_context_aware_table() {
+        let mut r = FunctionRegistry::new();
+        r.register("S", scalar_fns::sum);
+        assert_eq!(r.len(), 1);
+        r.register_range_aware("RA", range_fns::sumif);
+        assert_eq!(r.len(), 2);
+        r.register_context_aware("CA", echo_date_system_year);
+        assert_eq!(r.len(), 3);
+    }
+
+    #[test]
+    fn is_empty_checks_all_three_tables() {
+        let mut r = FunctionRegistry::new();
+        assert!(r.is_empty());
+        r.register_context_aware("CA", echo_date_system_year);
+        assert!(!r.is_empty());
+    }
+
+    #[test]
+    fn context_aware_names_returns_only_context_aware() {
+        let mut r = FunctionRegistry::new();
+        r.register("S", scalar_fns::sum);
+        r.register_range_aware("RA", range_fns::sumif);
+        r.register_context_aware("CA", echo_date_system_year);
+        let names: Vec<&str> = r.context_aware_names().copied().collect();
+        assert_eq!(names, vec!["CA"]);
     }
 
     #[test]

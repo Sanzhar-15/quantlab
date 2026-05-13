@@ -13,7 +13,9 @@
 //! it reads Arrow chunks via `ColumnStore::iter_chunks` for batch processing.
 
 use ql_storage::{NameTable, NamedTarget};
-use ql_types::{ColId, ErrorValue, Range, RowId, SheetId, Value};
+use ql_types::{
+    ColId, ErrorValue, EvalContext, Range, RowId, SheetId, Value, DEFAULT_EVAL_CONTEXT,
+};
 
 use crate::plan::{NameLookup, ResolvedName};
 
@@ -62,6 +64,16 @@ pub trait CellEnv {
         let cols = (range.end_col - range.start_col + 1) as usize;
         debug_assert_eq!(rows.saturating_mul(cols), values.len());
         (values, rows, cols)
+    }
+
+    /// **W5-69 (Phase 4.5.A.0):** the evaluator context for date /
+    /// locale / clock-aware function dispatch. Default impl returns
+    /// `&DEFAULT_EVAL_CONTEXT` (Excel1900 + EnUs + System), suitable
+    /// for tests, MapEnv, and benches that don't carry workbook state.
+    /// `WorkbookEnv` overrides this with the workbook's actual
+    /// `date_system` field once Sub-phase 4.5.A adds it.
+    fn eval_context(&self) -> &EvalContext {
+        &DEFAULT_EVAL_CONTEXT
     }
 }
 

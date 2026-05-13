@@ -16,6 +16,7 @@
 pub mod address;
 pub mod coercion;
 pub mod error;
+pub mod eval_context;
 pub mod value;
 
 pub use address::{Address, ColId, Range, RowId, SheetId, MAX_COLUMN, MAX_ROW};
@@ -25,6 +26,7 @@ pub use coercion::{
     to_text_for_formula,
 };
 pub use error::{ErrorValue, ParseErrorValueError};
+pub use eval_context::{DateSystem, EvalContext, Locale, NowProvider, DEFAULT_EVAL_CONTEXT};
 pub use value::Value;
 
 #[cfg(test)]
