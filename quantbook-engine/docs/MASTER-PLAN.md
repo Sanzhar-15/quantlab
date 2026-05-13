@@ -380,13 +380,13 @@ The full v1 means all of these crates either ship real behavior or have a docume
 
 - Phase 3 graph runtime is shipped.
 - Aggregate, dirty, and volatile machinery exist.
-- **GAP-G-01 + GAP-G-03 architectural decision made (W5-49, 2026-05-13).** See `docs/architecture/2026-05-13-graph-storage-decision.md`: Option A (per-formula revocation API for `Graph` + `StripeIndex`) + small Option C (Tarjan supplemental adjacency at recompute time). FormulaRegion binder (Option B) deferred to Phase 4.7. Implementation order: A before C. **Phase 4.3 V2 (SUMIF/COUNTIF/lookup family) is gated on both A and C shipping** — those functions exercise range-dep correctness at scale; without C, V2 ships onto broken substrate, and without A, C amplifies G-01.
+- **GAP-G-01 + GAP-G-03 SHIPPED (W5-50, 2026-05-13).** Decision recorded in `docs/architecture/2026-05-13-graph-storage-decision.md` (W5-49) and implemented W5-50: Option A — `Graph::clear_outgoing` + `Graph::clear_range_deps_for_formula` + `StripeIndex::clear_for_formula` backed by `formula_to_stripe_keys` reverse index, wired into `extract_and_register_deps`. Option C — `topo::schedule_with_supplemental` accepts a HashMap of temp adjacency; `CalcgraphSession::build_range_supplemental` constructs F→G edges for dirty-formula pairs inside ranges. FormulaRegion binder (Option B) still deferred to Phase 4.7. Phase 4.3 V2 (SUMIF/COUNTIF/lookup family) is **now unblocked**. Tests: +35 vs Phase 3 exit (981 → 1016 workspace).
 
 **Dependencies**
 
 - Array formulas, spills, structured references, xlsx formula load, and cross-sheet recalculation depend on Phase 3 graph integration.
 - IronCalc deep-read is mandatory at Phase 4 start.
-- Phase 4.3 V2 is gated on GAP-G-01 (Option A) + GAP-G-03 (small Option C). Phase 4.7 (array formulas) consumes Option A's revocation API as well.
+- ~~Phase 4.3 V2 is gated on GAP-G-01 (Option A) + GAP-G-03 (small Option C).~~ **Gate cleared W5-50.** Phase 4.7 (array formulas) consumes Option A's revocation API as well.
 
 **Sub-items**
 
@@ -415,7 +415,7 @@ The full v1 means all of these crates either ship real behavior or have a docume
 
 3. **4.3 Function Library Expansion Wave 1 - Core 100** 🔄 IN PROGRESS (V1 batch shipped 2026-05-13, W5-46; FN4-02 backfill W5-48)  
    Implement high-use math, logical, text, lookup, statistical, date/time, and information functions. Include metadata for volatility, laziness, array behavior, and argument coercion.  
-   **V2 prerequisite (W5-49 decision):** SUMIF / COUNTIF / SUMIFS / AVERAGEIF family + lookup family (VLOOKUP/HLOOKUP/MATCH/INDEX/CHOOSE) are GATED on GAP-G-01 + GAP-G-03 shipping (Option A + small Option C per `docs/architecture/2026-05-13-graph-storage-decision.md`). V1 batch deliberately stayed in scalar/per-cell function territory (math/text/info) to avoid multiplying the GAP-G surfaces; V2 is range/lookup-heavy and exercises range-dep correctness end-to-end.  
+   **V2 prerequisite (W5-49 decision, SHIPPED W5-50):** SUMIF / COUNTIF / SUMIFS / AVERAGEIF family + lookup family (VLOOKUP/HLOOKUP/MATCH/INDEX/CHOOSE) were GATED on GAP-G-01 + GAP-G-03. Both shipped 2026-05-13 (W5-50): per-formula revocation API on `Graph` + `StripeIndex`, plus `topo::schedule_with_supplemental` for range-induced Tarjan ordering. V2 batch is now unblocked. See `docs/architecture/2026-05-13-graph-storage-decision.md`.  
    References: `.references/ironcalc/base/src/functions/mod.rs`; `.references/ironcalc/base/src/functions/math_and_trigonometry/`; `.references/ironcalc/base/src/functions/statistical/`; `.references/formualizer/crates/formualizer-eval/src/function_registry.rs`.  
    Acceptance:  
    - FN4-01 ⚠️ partial — registry at 52 entries (was 30) after V1 batch; 100 target requires further batches.  

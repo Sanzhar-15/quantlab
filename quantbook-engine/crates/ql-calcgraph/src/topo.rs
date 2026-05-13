@@ -85,6 +85,35 @@ impl Schedule {
 ///
 /// Duplicate entries in `dirty_subset` are tolerated (deduped internally via a HashSet).
 pub fn schedule(graph: &Graph, dirty_subset: &[NodeId]) -> Schedule {
+    let empty: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    schedule_with_supplemental(graph, dirty_subset, &empty)
+}
+
+/// **W5-50 — GAP-G-03 closure (small Option C).** Schedule with caller-
+/// provided supplemental adjacency layered on top of `graph.outgoing(v)`.
+/// Used by `CalcgraphSession::schedule_dirty` to inject range-induced
+/// edges that the Phase 0 graph itself doesn't carry: for each dirty
+/// formula `F` with range deps and a dirty formula `G` inside one of
+/// `F`'s ranges, the caller pushes a temp edge `F → G` into
+/// `supplemental[F]` so Tarjan can see the range-induced ordering /
+/// cycle.
+///
+/// The supplemental map is read-only during the scheduler call.
+/// Entries are appended to the corresponding `graph.outgoing(v)` slice
+/// — they don't replace real edges. Edges to non-dirty nodes are still
+/// filtered out (the existing dirty-subset contract holds).
+///
+/// Self-loops via supplemental ARE recognized as cycles (e.g.
+/// `A1 = SUM(A1:A1)` builds a supplemental `A1 → A1` edge; this single
+/// dirty formula gets emitted into `cycled`).
+///
+/// Backward compatibility: `schedule(graph, subset)` is now a thin
+/// wrapper that passes an empty supplemental map.
+pub fn schedule_with_supplemental(
+    graph: &Graph,
+    dirty_subset: &[NodeId],
+    supplemental: &HashMap<NodeId, Vec<NodeId>>,
+) -> Schedule {
     let dirty: HashSet<NodeId> = dirty_subset.iter().copied().collect();
     if dirty.is_empty() {
         return Schedule::default();
@@ -109,6 +138,7 @@ pub fn schedule(graph: &Graph, dirty_subset: &[NodeId]) -> Schedule {
         tarjan_dfs(
             seed,
             graph,
+            supplemental,
             &dirty,
             &mut indices,
             &mut lowlinks,
@@ -127,6 +157,7 @@ pub fn schedule(graph: &Graph, dirty_subset: &[NodeId]) -> Schedule {
 fn tarjan_dfs(
     seed: NodeId,
     graph: &Graph,
+    supplemental: &HashMap<NodeId, Vec<NodeId>>,
     dirty: &HashSet<NodeId>,
     indices: &mut HashMap<NodeId, u32>,
     lowlinks: &mut HashMap<NodeId, u32>,
@@ -141,6 +172,10 @@ fn tarjan_dfs(
     // frames. Filtering "is this child in dirty?" happens at child-visit time so we don't
     // pre-allocate filtered child vectors per node (the hot path under no-cycles is one
     // outgoing-slice scan per node, period).
+    //
+    // W5-50: the "child slice" is now `graph.outgoing(v)` concatenated with
+    // `supplemental.get(&v)` (if any). Indices < outgoing.len() refer to the real graph;
+    // indices >= outgoing.len() refer to the supplemental list. Constant-time per child.
     let mut dfs_stack: Vec<(NodeId, usize)> = Vec::new();
 
     // First visit of seed.
@@ -148,13 +183,19 @@ fn tarjan_dfs(
     dfs_stack.push((seed, 0));
 
     while let Some(&(v, child_idx)) = dfs_stack.last() {
-        let children = graph.outgoing(v);
+        let outgoing = graph.outgoing(v);
+        let supp: &[NodeId] = supplemental.get(&v).map(|v| v.as_slice()).unwrap_or(&[]);
+        let total_children = outgoing.len() + supp.len();
 
         // Find the next not-yet-considered child that's in the dirty subset.
         let mut next_child: Option<NodeId> = None;
         let mut new_child_idx = child_idx;
-        while new_child_idx < children.len() {
-            let candidate = children[new_child_idx];
+        while new_child_idx < total_children {
+            let candidate = if new_child_idx < outgoing.len() {
+                outgoing[new_child_idx]
+            } else {
+                supp[new_child_idx - outgoing.len()]
+            };
             new_child_idx += 1;
             if dirty.contains(&candidate) {
                 next_child = Some(candidate);
@@ -208,13 +249,21 @@ fn tarjan_dfs(
                     }
                 }
 
-                // Classify the SCC.
+                // Classify the SCC. Self-loops can come from the real graph
+                // OR the supplemental map — both count as cycles.
                 let is_cycle = scc.len() > 1
-                    || (scc.len() == 1
-                        && graph
-                            .outgoing(scc[0])
+                    || (scc.len() == 1 && {
+                        let self_id = scc[0];
+                        let real_self_loop = graph
+                            .outgoing(self_id)
                             .iter()
-                            .any(|&t| t == scc[0] && dirty.contains(&t)));
+                            .any(|&t| t == self_id && dirty.contains(&t));
+                        let supp_self_loop = supplemental
+                            .get(&self_id)
+                            .map(|s| s.iter().any(|&t| t == self_id && dirty.contains(&t)))
+                            .unwrap_or(false);
+                        real_self_loop || supp_self_loop
+                    });
                 if is_cycle {
                     cycled.extend(scc);
                 } else {
@@ -457,5 +506,125 @@ mod tests {
         for node in &s.sorted {
             assert!([a, b].contains(node));
         }
+    }
+
+    // ===== W5-50 (Phase 4 pre-V2): schedule_with_supplemental =====
+
+    #[test]
+    fn schedule_with_empty_supplemental_matches_schedule() {
+        // Empty supplemental must behave identically to schedule().
+        let mut g = Graph::new();
+        let ids = n_cells(&mut g, 3);
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        g.add_edge(a, b);
+        g.add_edge(b, c);
+
+        let supp: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        let s_with = schedule_with_supplemental(&g, &[a, b, c], &supp);
+        let s_plain = schedule(&g, &[a, b, c]);
+        assert_eq!(s_with, s_plain);
+    }
+
+    #[test]
+    fn supplemental_edge_produces_cycle() {
+        // GAP-G-03 / H1 scenario #1 (cycle):
+        //   A1 = SUM(B1:B1)   → supplemental A → B
+        //   B1 = "=A1+1"      → real graph B → A
+        // Both dirty → 2-SCC → cycled.
+        let mut g = Graph::new();
+        let ids = n_cells(&mut g, 2);
+        let (a, b) = (ids[0], ids[1]);
+        g.add_edge(b, a); // real: B depends on A
+        let mut supp: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        supp.insert(a, vec![b]); // supplemental: A depends on B (range)
+
+        let s = schedule_with_supplemental(&g, &[a, b], &supp);
+        assert!(s.sorted.is_empty(), "should be all cycled");
+        let cycled: HashSet<_> = s.cycled.iter().copied().collect();
+        assert_eq!(cycled, [a, b].into_iter().collect());
+    }
+
+    #[test]
+    fn supplemental_edge_produces_correct_ordering() {
+        // GAP-G-03 / H1 scenario #2 (ordering):
+        //   A1 = SUM(B1:B1)   → supplemental A → B
+        //   B1 = "=C1+1"      → real: B → C
+        //   C1 = 10           → leaf
+        // Dep-first: C, B, A.
+        let mut g = Graph::new();
+        let ids = n_cells(&mut g, 3);
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        g.add_edge(b, c);
+        let mut supp: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        supp.insert(a, vec![b]);
+
+        let s = schedule_with_supplemental(&g, &[a, b, c], &supp);
+        assert!(s.cycled.is_empty());
+        assert_eq!(s.sorted, vec![c, b, a]);
+    }
+
+    #[test]
+    fn supplemental_self_loop_is_cycled() {
+        // Self-range cycle: A1 = SUM(A1:A1). Single dirty formula,
+        // supplemental edge A → A. Must be cycled.
+        let mut g = Graph::new();
+        let a = g.add_cell_node(0, 0, 0);
+        let mut supp: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        supp.insert(a, vec![a]);
+
+        let s = schedule_with_supplemental(&g, &[a], &supp);
+        assert!(s.sorted.is_empty());
+        assert_eq!(s.cycled, vec![a]);
+    }
+
+    #[test]
+    fn supplemental_edge_to_non_dirty_node_ignored() {
+        // Supplemental A → B but B not dirty → A emits as sorted alone.
+        // Matches the existing contract that edges to non-dirty nodes
+        // are filtered out (they're read-as-is, not re-evaluated).
+        let mut g = Graph::new();
+        let ids = n_cells(&mut g, 2);
+        let (a, b) = (ids[0], ids[1]);
+        let mut supp: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        supp.insert(a, vec![b]); // B is in graph but not in dirty subset
+
+        let s = schedule_with_supplemental(&g, &[a], &supp);
+        assert_eq!(s.sorted, vec![a]);
+        assert!(s.cycled.is_empty());
+    }
+
+    #[test]
+    fn supplemental_does_not_duplicate_existing_real_edge() {
+        // If a real graph edge already exists from A to B AND supplemental
+        // also has A → B, the duplicate edge causes Tarjan to re-traverse
+        // the same back-edge. The cycle classification still must be
+        // correct (here: no cycle, just a chain).
+        let mut g = Graph::new();
+        let ids = n_cells(&mut g, 2);
+        let (a, b) = (ids[0], ids[1]);
+        g.add_edge(a, b); // real A → B
+        let mut supp: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        supp.insert(a, vec![b]); // supplemental A → B (duplicate)
+
+        let s = schedule_with_supplemental(&g, &[a, b], &supp);
+        // Dep-first: B then A.
+        assert_eq!(s.sorted, vec![b, a]);
+        assert!(s.cycled.is_empty());
+    }
+
+    #[test]
+    fn supplemental_three_node_cycle_via_mixed_edges() {
+        // A → B (real), B → C (real), C → A (supplemental). 3-node SCC.
+        let mut g = Graph::new();
+        let ids = n_cells(&mut g, 3);
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        g.add_edge(a, b);
+        g.add_edge(b, c);
+        let mut supp: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        supp.insert(c, vec![a]);
+
+        let s = schedule_with_supplemental(&g, &[a, b, c], &supp);
+        assert!(s.sorted.is_empty());
+        assert_eq!(s.cycled.len(), 3);
     }
 }

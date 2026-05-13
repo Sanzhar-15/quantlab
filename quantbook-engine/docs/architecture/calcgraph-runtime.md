@@ -2,7 +2,7 @@
 
 **Status:** Engine Phase 3 SHIPPED (megaudit-closed W5-43, 2026-05-12). All 10 sub-items (3.1–3.10) landed in 10 commits. Phase 3 megaudit findings + closure decisions live at `docs/audits/2026-05-12-phase-3-megaudit.md`.  
 **Date:** 2026-05-12 (last touched for 3.10 megaudit close).  
-**Stability:** **STABLE** for the documented surface. The 5-hook signature, `dirty_formulas` / `take_dirty` view, `schedule_dirty()` / `recompute_dirty()` entry points, computed-overlay routing, aggregate cache, volatile invalidation tick, and value-equality short-circuit are all contract. Known gaps (range-as-scheduler-edge, append-only-graph rebind staleness) are filed as GAP-G-01 / GAP-G-03 and deferred to Phase 4 — they need delta-edge graph storage or per-formula revocation API, not safe to half-bake at Phase 3 close.
+**Stability:** **STABLE** for the documented surface. The 5-hook signature, `dirty_formulas` / `take_dirty` view, `schedule_dirty()` / `recompute_dirty()` entry points, computed-overlay routing, aggregate cache, volatile invalidation tick, and value-equality short-circuit are all contract. **W5-50 (Phase 4 pre-V2) closed GAP-G-01 + GAP-G-03** via `Graph::clear_outgoing` / `Graph::clear_range_deps_for_formula` (per-formula revocation) + `topo::schedule_with_supplemental` (range-induced edges injected at recompute time). See `docs/architecture/2026-05-13-graph-storage-decision.md`.
 
 This document describes how `ql-calcgraph::Graph` integrates with `ql_exec::WorkbookRuntime`. Engine Phase 3 (the "One Engine" integration phase) closes the gap between the Phase 0 calcgraph (`ql-calcgraph`, built for the bench / A4/A5 acceptance) and the runtime that's been used since Phase 1 W5-10 (`WorkbookRuntime`, currently HashMap-order recompute with no graph awareness).
 
@@ -88,11 +88,17 @@ session.cell_dep_count() -> usize              // observability
 
 Phase 3.4 plugs Tarjan SCC over the `take_dirty()` set to recompute in topological order (cycles surface as `#CIRC!`).
 
-### Stale stripes on re-bind (GAP-G-01)
+### Re-bind staleness (GAP-G-01, **CLOSED W5-50**)
 
-The Phase 0 `Graph` is append-only — no API to remove edges or revoke a `register_range_dependency`. When a formula's text changes from `=SUM(A:A)` to `=SUM(B:B)`, the OLD Column A stripe entry persists, and `formula_to_range_deps[formula_node]` keeps both ranges. A subsequent write to A5 hits the Column A stripe AND passes the precision check (the stale `A:A` range still contains A5) — false-positive dirty.
+Earlier Phase 3 commits shipped the Phase 0 `Graph` as append-only — no API to remove edges or revoke a `register_range_dependency`. Phase 3.10 megaudit found this was correctness-relevant: stale forward edges after rebind could produce FALSE `#CIRC!` cycles in Tarjan (H3), and stale range-dep stripe entries falsely dirty the formula on writes to OLD ranges (H4).
 
-**Cost: performance, not correctness.** A false-positive dirty just means a recompute does extra work; the value is unchanged so downstream sees no propagation. Phase 3.10 megaudit decides between delta-edge graph storage vs a per-formula `Graph::clear_range_deps_for_formula(node)` API; Phase 3.3 ships with the residue documented.
+**W5-50 closure:** the Graph now exposes per-formula revocation. `extract_and_register_deps` calls `Graph::clear_outgoing(formula_node)` and `Graph::clear_range_deps_for_formula(formula_node)` at the same point as the session-side `remove_formula_deps`, so re-binding cleanly drops stale forward edges, back-pointers, stripe registrations, and `formula_to_range_deps` entries. `StripeIndex::clear_for_formula` is O(stripes-this-formula-is-in) thanks to a reverse `formula_to_stripe_keys` index. See `docs/architecture/2026-05-13-graph-storage-decision.md` for the full decision record.
+
+### Range deps as scheduler edges (GAP-G-03, **CLOSED W5-50**)
+
+Phase 3.4 wired Tarjan over the dirty set but only walked `graph.outgoing(v)` — range deps in stripes + `formula_to_range_deps` were invisible to the scheduler. Megaudit H1 showed this could miss range-induced cycles and order range-dep formulas wrongly.
+
+**W5-50 closure:** `CalcgraphSession::schedule_dirty` now builds a supplemental adjacency `HashMap<NodeId, Vec<NodeId>>` of temp F → G edges (G dirty formula inside one of F's ranges) and passes it to `topo::schedule_with_supplemental`. Temp edges live only for the duration of the scheduler call; the Phase 0 stripe compression (SUM(A:A) → one RangeRef, not 25M edges) is preserved. Scope: dirty FORMULA nodes only — literal cells inside ranges are read as current values during eval, not scheduled.
 
 ## 3. What Phase 3.3 deliberately doesn't ship
 

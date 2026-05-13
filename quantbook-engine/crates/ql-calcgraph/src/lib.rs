@@ -53,8 +53,8 @@ pub use fingerprint::fingerprint;
 pub use graph::{Graph, NodeCountsByVariant};
 pub use node::{CellNode, FormulaRegionNode, Node, NodeId, RangeNode, SpillNode};
 pub use stats::GraphStats;
-pub use stripes::{StripeIndex, StripeKey, StripeType};
-pub use topo::{schedule, Schedule};
+pub use stripes::{range_contains_rowcol, StripeIndex, StripeKey, StripeType};
+pub use topo::{schedule, schedule_with_supplemental, Schedule};
 
 // Re-exports — downstream crates that depend on ql-calcgraph can use the dependent AST
 // types via this crate without needing a direct ql-formula-syntax dep.

@@ -60,9 +60,23 @@ pub struct StripeKey {
 ///
 /// Use via `Graph::register_range_dependency` and `Graph::dependents_for_cell` — those
 /// wrap the stripe insertion and precision-check together.
+///
+/// ## Reverse index (Phase 4 / W5-50)
+///
+/// `formula_to_stripe_keys: HashMap<NodeId, Vec<StripeKey>>` records, per formula
+/// node, every stripe key it has been registered against. Used by
+/// `clear_for_formula` to revoke a formula's stripe membership on re-bind in
+/// O(stripes-this-formula-is-in) instead of scanning the whole stripe map. The
+/// reverse vector is append-on-newly-inserted (matches the forward
+/// `HashSet::insert` returning `true`), so a re-registration of the same
+/// `(formula, range)` does not duplicate the reverse entry.
 #[derive(Clone, Debug, Default)]
 pub struct StripeIndex {
     stripe_to_dependents: HashMap<StripeKey, HashSet<NodeId>>,
+    /// Reverse lookup: which stripes does `formula_node` appear in? Mirror of
+    /// `stripe_to_dependents` keyed by formula. Kept in lock-step with the
+    /// forward map via the `insert` helper.
+    formula_to_stripe_keys: HashMap<NodeId, Vec<StripeKey>>,
 }
 
 impl StripeIndex {
@@ -192,10 +206,58 @@ impl StripeIndex {
     }
 
     fn insert(&mut self, key: StripeKey, formula_node: NodeId) {
-        self.stripe_to_dependents
+        let newly_inserted = self
+            .stripe_to_dependents
             .entry(key)
             .or_default()
             .insert(formula_node);
+        // Mirror into the reverse index ONLY when the forward HashSet
+        // accepted the entry as new. Re-registering the same
+        // `(formula, range)` is a no-op on both sides — the original A5
+        // stripe-inserts counter semantics rely on this.
+        if newly_inserted {
+            self.formula_to_stripe_keys
+                .entry(formula_node)
+                .or_default()
+                .push(key);
+        }
+    }
+
+    /// Revoke every stripe membership held by `formula_node`. Called by
+    /// `Graph::clear_range_deps_for_formula` on re-bind so a formula whose
+    /// range deps changed (`SUM(A:A) → SUM(B:B)`) no longer falsely dirty
+    /// from writes to the OLD range.
+    ///
+    /// O(stripes-this-formula-is-in) thanks to the reverse index. A
+    /// formula with no stripe membership (e.g., one that never called
+    /// `register_range_dependency`) is a no-op.
+    ///
+    /// Empties stripe buckets are pruned: if `formula_node` was the last
+    /// dependent on a stripe, the `StripeKey` entry is removed entirely.
+    /// This keeps `stripe_count()` honest.
+    ///
+    /// Idempotent: calling twice on the same node yields the same final
+    /// state.
+    pub fn clear_for_formula(&mut self, formula_node: NodeId) {
+        let Some(keys) = self.formula_to_stripe_keys.remove(&formula_node) else {
+            return;
+        };
+        for key in keys {
+            if let Some(set) = self.stripe_to_dependents.get_mut(&key) {
+                set.remove(&formula_node);
+                if set.is_empty() {
+                    self.stripe_to_dependents.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Test-only typed accessor for the reverse index (CORR-24 pattern).
+    /// Returns the list of stripe keys the formula appears under, or
+    /// `None` if it's never been registered.
+    #[cfg(test)]
+    pub(crate) fn stripe_keys_for_formula(&self, formula_node: NodeId) -> Option<&Vec<StripeKey>> {
+        self.formula_to_stripe_keys.get(&formula_node)
     }
 
     /// Candidate dependents for a cell write at `(sheet, row, col)`. Returns the union of
@@ -227,7 +289,10 @@ impl StripeIndex {
 /// Test whether `range` (sheet-resolved) contains the cell at `(row, col)`. The sheet
 /// check is implicit (caller already filtered by sheet via the stripe key); this only
 /// validates row/col bounds.
-pub(crate) fn range_contains_rowcol(range: &RangeRef, row: RowId, col: ColId) -> bool {
+///
+/// Public (W5-50) so the Phase 3 runtime can reuse it when building the
+/// supplemental adjacency for `topo::schedule_with_supplemental`.
+pub fn range_contains_rowcol(range: &RangeRef, row: RowId, col: ColId) -> bool {
     match range {
         RangeRef::Cells {
             start_col,
@@ -556,5 +621,123 @@ mod tests {
             map.get(&key).unwrap(),
             &[NodeId(1), NodeId(2)].into_iter().collect::<HashSet<_>>()
         );
+    }
+
+    // ===== W5-50 (Phase 4 pre-V2): reverse index + clear_for_formula =====
+
+    #[test]
+    fn reverse_index_populated_on_register() {
+        let mut idx = StripeIndex::new();
+        idx.register(NodeId(7), &whole_col(0, 0), 0); // Col 0 stripe
+        idx.register(NodeId(7), &whole_row(5, 5), 0); // Row 5 stripe
+        let keys = idx.stripe_keys_for_formula(NodeId(7)).expect("present");
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&StripeKey {
+            sheet_id: 0,
+            stripe_type: StripeType::Column,
+            index: 0,
+        }));
+        assert!(keys.contains(&StripeKey {
+            sheet_id: 0,
+            stripe_type: StripeType::Row,
+            index: 5,
+        }));
+    }
+
+    #[test]
+    fn reverse_index_dedups_same_formula_same_stripe() {
+        // Two ranges that share a stripe (`A:A` and `A1:A10` both hit Col 0)
+        // for the same formula must NOT create two reverse-index entries —
+        // the forward HashSet dedups; the reverse vector mirrors that.
+        let mut idx = StripeIndex::new();
+        idx.register(NodeId(7), &whole_col(0, 0), 0);
+        idx.register(NodeId(7), &cells(0, 0, 0, 9), 0); // A1:A10 → Col 0 (height>width)
+        let keys = idx.stripe_keys_for_formula(NodeId(7)).expect("present");
+        assert_eq!(keys.len(), 1, "two ranges, same stripe → one reverse entry");
+        assert_eq!(idx.total_insertions(), 1);
+    }
+
+    #[test]
+    fn clear_for_formula_removes_from_all_stripes() {
+        // Formula registered on Col 0 and Row 5; clearing must drop both.
+        let mut idx = StripeIndex::new();
+        idx.register(NodeId(7), &whole_col(0, 0), 0);
+        idx.register(NodeId(7), &whole_row(5, 5), 0);
+        assert_eq!(idx.stripe_count(), 2);
+        assert_eq!(idx.total_insertions(), 2);
+
+        idx.clear_for_formula(NodeId(7));
+
+        assert_eq!(idx.stripe_count(), 0, "both stripes were singleton-pruned");
+        assert_eq!(idx.total_insertions(), 0);
+        assert!(idx.stripe_keys_for_formula(NodeId(7)).is_none());
+        // Cell write at A5 finds no candidates.
+        assert!(idx.candidates_for_cell(0, 5, 0).is_empty());
+    }
+
+    #[test]
+    fn clear_for_formula_preserves_other_formulas() {
+        // 100 formulas share Col 0 stripe; clearing one drops only that one.
+        let mut idx = StripeIndex::new();
+        for i in 1..=100u32 {
+            idx.register(NodeId(i), &whole_col(0, 0), 0);
+        }
+        assert_eq!(idx.total_insertions(), 100);
+
+        idx.clear_for_formula(NodeId(42));
+
+        assert_eq!(idx.total_insertions(), 99, "only 1 removed");
+        assert_eq!(idx.stripe_count(), 1, "stripe still has 99 deps");
+        // The cleared formula no longer matches.
+        let candidates = idx.candidates_for_cell(0, 0, 0);
+        assert_eq!(candidates.len(), 99);
+        assert!(!candidates.contains(&NodeId(42)));
+    }
+
+    #[test]
+    fn clear_for_formula_is_idempotent() {
+        let mut idx = StripeIndex::new();
+        idx.register(NodeId(7), &whole_col(0, 0), 0);
+        idx.clear_for_formula(NodeId(7));
+        idx.clear_for_formula(NodeId(7)); // no-op
+        idx.clear_for_formula(NodeId(999)); // never registered, no-op
+        assert_eq!(idx.stripe_count(), 0);
+        assert_eq!(idx.total_insertions(), 0);
+    }
+
+    #[test]
+    fn re_register_after_clear_works() {
+        // The rebind workflow: register A:A, clear, register B:B. The
+        // post-clear state must accept the new registration cleanly.
+        let mut idx = StripeIndex::new();
+        idx.register(NodeId(7), &whole_col(0, 0), 0); // A:A
+        idx.clear_for_formula(NodeId(7));
+        idx.register(NodeId(7), &whole_col(1, 1), 0); // B:B
+
+        assert_eq!(idx.stripe_count(), 1);
+        // A5 no longer dirties; B5 does.
+        assert!(idx.candidates_for_cell(0, 5, 0).is_empty());
+        assert_eq!(
+            idx.candidates_for_cell(0, 5, 1),
+            [NodeId(7)].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn clear_for_formula_handles_stripe_with_multiple_deps_correctly() {
+        // Col 0 has [B1, C1]; clearing B1 leaves [C1] and the stripe stays.
+        let mut idx = StripeIndex::new();
+        let b1 = NodeId(1);
+        let c1 = NodeId(2);
+        idx.register(b1, &whole_col(0, 0), 0);
+        idx.register(c1, &whole_col(0, 0), 0);
+        assert_eq!(idx.total_insertions(), 2);
+
+        idx.clear_for_formula(b1);
+
+        assert_eq!(idx.stripe_count(), 1, "stripe survives (C1 still in it)");
+        assert_eq!(idx.total_insertions(), 1);
+        let candidates = idx.candidates_for_cell(0, 5, 0);
+        assert_eq!(candidates, [c1].into_iter().collect());
     }
 }

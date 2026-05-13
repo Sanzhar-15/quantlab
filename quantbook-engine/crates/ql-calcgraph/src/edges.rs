@@ -100,6 +100,50 @@ impl AdjacencyVectors {
     pub fn edge_count(&self) -> usize {
         self.outgoing.iter().map(Vec::len).sum()
     }
+
+    /// Drain every outgoing edge from `from` and return the prior target list.
+    /// Caller is responsible for removing the back-pointer in each target's
+    /// `incoming` slot (see `Graph::clear_outgoing` for the wrapper that does
+    /// both halves of the symmetric invariant).
+    ///
+    /// Phase 4 / W5-50: introduced for the per-formula edge revocation API
+    /// that fixes GAP-G-01 (rebind staleness). Append-only is no longer the
+    /// global invariant — the revocation path is the documented exception.
+    ///
+    /// Returns the drained `Vec<NodeId>` so the caller can iterate to clean
+    /// up `incoming`. The internal storage is left as an empty `Vec`, which
+    /// matches the layout of a brand-new node and preserves the
+    /// `outgoing.len() == node_count` invariant.
+    pub fn clear_outgoing(&mut self, from: NodeId) -> Vec<NodeId> {
+        let idx = from.index();
+        assert!(
+            idx < self.outgoing.len(),
+            "clear_outgoing: NodeId({idx}) out of bounds (have {} nodes)",
+            self.outgoing.len()
+        );
+        std::mem::take(&mut self.outgoing[idx])
+    }
+
+    /// Remove a single `from -> target` back-pointer from `incoming[target]`.
+    /// Used by `Graph::clear_outgoing` after `clear_outgoing` returns the
+    /// drained outgoing list — for each target, walk `incoming` once and
+    /// retain only entries that are NOT `from`.
+    ///
+    /// Phase 0's append-only contract had no caller-driven dedup, so a
+    /// `(from -> target)` edge added twice has two back-pointers in
+    /// `incoming[target]`. `retain` removes all of them, which is the
+    /// intended behavior for the per-formula revocation path: clearing
+    /// a formula's outgoing list must drop every back-pointer for that
+    /// formula, not just one.
+    pub fn remove_back_pointer(&mut self, target: NodeId, from: NodeId) {
+        let idx = target.index();
+        assert!(
+            idx < self.incoming.len(),
+            "remove_back_pointer: NodeId({idx}) out of bounds (have {} nodes)",
+            self.incoming.len()
+        );
+        self.incoming[idx].retain(|&n| n != from);
+    }
 }
 
 #[cfg(test)]
@@ -183,5 +227,70 @@ mod tests {
         let mut a = AdjacencyVectors::new();
         a.push_node();
         a.add_edge(NodeId(0), NodeId(5));
+    }
+
+    // ===== W5-50 (Phase 4 pre-V2): edge revocation =====
+
+    #[test]
+    fn clear_outgoing_returns_prior_targets_and_empties() {
+        let mut a = AdjacencyVectors::new();
+        for _ in 0..3 {
+            a.push_node();
+        }
+        a.add_edge(NodeId(0), NodeId(1));
+        a.add_edge(NodeId(0), NodeId(2));
+        assert_eq!(a.outgoing(NodeId(0)).len(), 2);
+
+        let drained = a.clear_outgoing(NodeId(0));
+        assert_eq!(drained, vec![NodeId(1), NodeId(2)]);
+        assert!(a.outgoing(NodeId(0)).is_empty());
+        // Back-pointers untouched by clear_outgoing alone (caller's job).
+        assert_eq!(a.incoming(NodeId(1)), &[NodeId(0)]);
+    }
+
+    #[test]
+    fn clear_outgoing_on_node_with_no_edges_is_empty() {
+        let mut a = AdjacencyVectors::new();
+        a.push_node();
+        let drained = a.clear_outgoing(NodeId(0));
+        assert!(drained.is_empty());
+        assert!(a.outgoing(NodeId(0)).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn clear_outgoing_oob_panics() {
+        let mut a = AdjacencyVectors::new();
+        a.push_node();
+        let _ = a.clear_outgoing(NodeId(5));
+    }
+
+    #[test]
+    fn remove_back_pointer_removes_all_matching_entries() {
+        // Two `from -> target` edges → two back-pointers; remove drops both.
+        let mut a = AdjacencyVectors::new();
+        a.push_node();
+        a.push_node();
+        a.add_edge(NodeId(0), NodeId(1));
+        a.add_edge(NodeId(0), NodeId(1));
+        assert_eq!(a.incoming(NodeId(1)), &[NodeId(0), NodeId(0)]);
+
+        a.remove_back_pointer(NodeId(1), NodeId(0));
+        assert!(a.incoming(NodeId(1)).is_empty());
+    }
+
+    #[test]
+    fn remove_back_pointer_preserves_others() {
+        // (0,1) and (2,1); removing (0,1)'s back-pointer leaves (2,1)'s.
+        let mut a = AdjacencyVectors::new();
+        for _ in 0..3 {
+            a.push_node();
+        }
+        a.add_edge(NodeId(0), NodeId(1));
+        a.add_edge(NodeId(2), NodeId(1));
+        assert_eq!(a.incoming(NodeId(1)), &[NodeId(0), NodeId(2)]);
+
+        a.remove_back_pointer(NodeId(1), NodeId(0));
+        assert_eq!(a.incoming(NodeId(1)), &[NodeId(2)]);
     }
 }

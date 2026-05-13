@@ -216,6 +216,61 @@ impl Graph {
         self.stats
     }
 
+    /// **W5-50 — GAP-G-01 closure.** Revoke every outgoing edge from
+    /// `node`, AND the symmetric back-pointer in each former target's
+    /// `incoming` slot. Used by `CalcgraphSession::extract_and_register_deps`
+    /// on re-bind so a formula whose direct cell deps changed
+    /// (e.g. `=A1` → `=1`) doesn't leave stale forward edges that would
+    /// confuse the Tarjan scheduler into seeing a false `#CIRC!` cycle.
+    ///
+    /// Bumps `revision` exactly once per call (not per edge), matching
+    /// the existing semantics of `add_edge` / `register_range_dependency`.
+    /// A node with no outgoing edges is a no-op.
+    ///
+    /// This is the documented exception to Phase 0's append-only invariant.
+    /// See `docs/architecture/2026-05-13-graph-storage-decision.md`.
+    pub fn clear_outgoing(&mut self, node: NodeId) {
+        assert!(
+            node.index() < self.nodes.len(),
+            "Graph::clear_outgoing: node {} out of bounds",
+            node.index()
+        );
+        let drained = self.edges.clear_outgoing(node);
+        for target in drained {
+            self.edges.remove_back_pointer(target, node);
+        }
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("Graph::clear_outgoing: revision counter overflowed u64");
+    }
+
+    /// **W5-50 — GAP-G-01 closure (range side).** Revoke every range-dep
+    /// registration held by `formula_node`. Clears both
+    /// `formula_to_range_deps[formula_node]` and every stripe membership
+    /// in `StripeIndex` (via `StripeIndex::clear_for_formula`). After
+    /// this call, writes to cells in the OLD ranges no longer dirty
+    /// `formula_node` via the precision-check path.
+    ///
+    /// Bumps `revision` once per call. Idempotent — a formula with no
+    /// range deps is a no-op.
+    ///
+    /// Companion to `clear_outgoing`: the session-side `extract_and_register_deps`
+    /// calls both before re-extracting the formula's new dep set.
+    pub fn clear_range_deps_for_formula(&mut self, formula_node: NodeId) {
+        assert!(
+            formula_node.index() < self.nodes.len(),
+            "Graph::clear_range_deps_for_formula: node {} out of bounds",
+            formula_node.index()
+        );
+        self.formula_to_range_deps.remove(&formula_node);
+        self.stripes.clear_for_formula(formula_node);
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("Graph::clear_range_deps_for_formula: revision counter overflowed u64");
+    }
+
     /// Bump `chunked_reduce_chunks_processed` by `n`. Phase 0 doesn't increment this
     /// from inside ql-calcgraph; Week 4 ql-exec calls this on each chunk it processes
     /// during a `SUM`/`COUNT`/etc. reduction. Locking the API in W3-6 means Week 4 just
@@ -256,6 +311,29 @@ impl Graph {
     /// `register_range_dependency` call. Used by tests + W3-7 graph-profile export.
     pub fn range_dependency_count(&self) -> usize {
         self.formula_to_range_deps.values().map(Vec::len).sum()
+    }
+
+    /// W5-50 — public accessor for the per-formula range-dep list. Returns
+    /// an empty slice if the formula has no range deps (or doesn't exist).
+    /// The runtime side uses this to build the supplemental adjacency for
+    /// `topo::schedule_with_supplemental` (GAP-G-03 closure).
+    pub fn range_deps_for(&self, formula_node: NodeId) -> &[RangeRef] {
+        self.formula_to_range_deps
+            .get(&formula_node)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// W5-50 — return the sheet a `RangeRef` resolves against. `None`
+    /// means "use the formula's owning sheet" (the binder convention).
+    /// Helper so runtime code doesn't have to match on `RangeRef`
+    /// variants just to pull the sheet field.
+    pub fn range_ref_sheet(range: &RangeRef) -> Option<SheetId> {
+        match range {
+            RangeRef::Cells { sheet, .. }
+            | RangeRef::WholeColumn { sheet, .. }
+            | RangeRef::WholeRow { sheet, .. } => *sheet,
+        }
     }
 
     /// Count nodes by variant. Used by W3-7 graph-profile.json export (OG-06) so a
@@ -643,5 +721,209 @@ mod tests {
         assert!(matches!(g.node(cell_a), Node::Cell(_)));
         assert!(matches!(g.node(range), Node::Range(_)));
         assert!(matches!(g.node(region), Node::FormulaRegion(_)));
+    }
+
+    // ===== W5-50 (Phase 4 pre-V2): per-formula revocation API =====
+
+    #[test]
+    fn clear_outgoing_drops_edges_and_back_pointers() {
+        // B1 depends on A1 and A2.
+        let mut g = Graph::new();
+        let a1 = g.add_cell_node(0, 0, 0);
+        let a2 = g.add_cell_node(0, 1, 0);
+        let b1 = g.add_cell_node(0, 0, 1);
+        g.add_edge(b1, a1);
+        g.add_edge(b1, a2);
+        assert_eq!(g.outgoing(b1), &[a1, a2]);
+        assert_eq!(g.incoming(a1), &[b1]);
+        assert_eq!(g.incoming(a2), &[b1]);
+        let rev_before = g.revision();
+
+        g.clear_outgoing(b1);
+
+        assert!(g.outgoing(b1).is_empty());
+        assert!(g.incoming(a1).is_empty(), "back-pointer dropped");
+        assert!(g.incoming(a2).is_empty(), "back-pointer dropped");
+        assert_eq!(g.revision(), rev_before + 1, "single revision bump");
+    }
+
+    #[test]
+    fn clear_outgoing_preserves_other_dependents_back_pointers() {
+        // B1 and C1 both depend on A1. Clearing B1 leaves C1's edge intact.
+        let mut g = Graph::new();
+        let a1 = g.add_cell_node(0, 0, 0);
+        let b1 = g.add_cell_node(0, 0, 1);
+        let c1 = g.add_cell_node(0, 0, 2);
+        g.add_edge(b1, a1);
+        g.add_edge(c1, a1);
+
+        g.clear_outgoing(b1);
+
+        assert!(g.outgoing(b1).is_empty());
+        assert_eq!(g.outgoing(c1), &[a1], "C1's edge untouched");
+        assert_eq!(g.incoming(a1), &[c1], "A1's back-pointers now [c1]");
+    }
+
+    #[test]
+    fn clear_outgoing_is_idempotent_and_handles_empty() {
+        let mut g = Graph::new();
+        let a = g.add_cell_node(0, 0, 0);
+        let rev = g.revision();
+        g.clear_outgoing(a); // no edges; just bumps revision
+        g.clear_outgoing(a); // idempotent
+        assert_eq!(g.revision(), rev + 2);
+        assert!(g.outgoing(a).is_empty());
+    }
+
+    #[test]
+    fn clear_range_deps_for_formula_clears_stripes_and_map() {
+        // B1 has SUM(A:A) + SUM(B1:B10): two stripes, two range-dep entries.
+        let mut g = Graph::new();
+        let b1 = g.add_cell_node(0, 0, 1);
+        let col_a = RangeRef::WholeColumn {
+            sheet: None,
+            start_col: 0,
+            end_col: 0,
+            abs_start: false,
+            abs_end: false,
+        };
+        let col_b_part = RangeRef::Cells {
+            sheet: None,
+            start_col: 1,
+            start_row: 0,
+            end_col: 1,
+            end_row: 9,
+            abs_start_col: false,
+            abs_start_row: false,
+            abs_end_col: false,
+            abs_end_row: false,
+        };
+        g.register_range_dependency(b1, col_a, 0);
+        g.register_range_dependency(b1, col_b_part, 0);
+        assert_eq!(g.range_dependency_count(), 2);
+        assert_eq!(g.stripe_index().stripe_count(), 2);
+        let rev_before = g.revision();
+
+        g.clear_range_deps_for_formula(b1);
+
+        assert_eq!(g.range_dependency_count(), 0);
+        assert_eq!(
+            g.stripe_index().stripe_count(),
+            0,
+            "stripes pruned to empty"
+        );
+        // A5 / B5 no longer find B1 as a candidate.
+        assert!(g.dependents_for_cell(0, 5, 0).is_empty());
+        assert!(g.dependents_for_cell(0, 5, 1).is_empty());
+        assert_eq!(g.revision(), rev_before + 1);
+    }
+
+    #[test]
+    fn clear_range_deps_preserves_other_formulas() {
+        // B1 and C1 both register A:A. Clearing B1 leaves C1.
+        let mut g = Graph::new();
+        let b1 = g.add_cell_node(0, 0, 1);
+        let c1 = g.add_cell_node(0, 0, 2);
+        let col_a = RangeRef::WholeColumn {
+            sheet: None,
+            start_col: 0,
+            end_col: 0,
+            abs_start: false,
+            abs_end: false,
+        };
+        g.register_range_dependency(b1, col_a, 0);
+        g.register_range_dependency(c1, col_a, 0);
+        assert_eq!(g.stripe_index().stripe_count(), 1);
+
+        g.clear_range_deps_for_formula(b1);
+
+        // C1 still registered.
+        assert_eq!(g.range_dependency_count(), 1);
+        assert_eq!(g.stripe_index().stripe_count(), 1, "stripe stays");
+        let deps = g.dependents_for_cell(0, 5, 0);
+        assert_eq!(deps, vec![c1]);
+    }
+
+    #[test]
+    fn rebind_workflow_no_stale_false_circ() {
+        // GAP-G-01 / H3 acceptance: clear_outgoing breaks the false-cycle
+        // chain after rebind.
+        //   1. B1 = "=A1"           → add_edge(B1, A1)
+        //   2. B1 = "=1" (rebind)   → clear_outgoing(B1)
+        //   3. A1 = "=B1"           → add_edge(A1, B1)
+        // Tarjan over {A1, B1} must NOT report a cycle.
+        let mut g = Graph::new();
+        let a1 = g.add_cell_node(0, 0, 0);
+        let b1 = g.add_cell_node(0, 0, 1);
+        g.add_edge(b1, a1); // step 1
+        g.clear_outgoing(b1); // step 2 (rebind to constant)
+        g.add_edge(a1, b1); // step 3
+
+        let sched = crate::topo::schedule(&g, &[a1, b1]);
+        assert!(sched.cycled.is_empty(), "no false #CIRC! after revocation");
+        // Dependency-first order: B1 then A1 (A1 depends on B1).
+        assert_eq!(sched.sorted, vec![b1, a1]);
+    }
+
+    #[test]
+    fn rebind_workflow_no_stale_stripe_dirty() {
+        // GAP-G-01 / H4 acceptance: clear_range_deps_for_formula breaks
+        // the stale-dirty chain after range rebind.
+        //   1. B1 = "=SUM(A:A)"    → register_range_dependency(B1, A:A)
+        //   2. B1 = "=SUM(B:B)" (rebind)
+        //        → clear_range_deps_for_formula(B1)
+        //        → register_range_dependency(B1, B:B)
+        //   3. write A5            → dependents_for_cell(A, 5) must NOT contain B1
+        let mut g = Graph::new();
+        let b1 = g.add_cell_node(0, 0, 1);
+        let col_a = RangeRef::WholeColumn {
+            sheet: None,
+            start_col: 0,
+            end_col: 0,
+            abs_start: false,
+            abs_end: false,
+        };
+        let col_b = RangeRef::WholeColumn {
+            sheet: None,
+            start_col: 1,
+            end_col: 1,
+            abs_start: false,
+            abs_end: false,
+        };
+        g.register_range_dependency(b1, col_a, 0); // step 1
+        g.clear_range_deps_for_formula(b1); // step 2a
+        g.register_range_dependency(b1, col_b, 0); // step 2b
+
+        // step 3: A5 no longer dirties B1.
+        assert!(g.dependents_for_cell(0, 5, 0).is_empty());
+        // B5 still dirties B1 (new range).
+        assert_eq!(g.dependents_for_cell(0, 5, 1), vec![b1]);
+    }
+
+    #[test]
+    fn determinism_rebind_same_plan_same_edges() {
+        // Rebinding to the same target list (same plan) must yield the
+        // same outgoing edge order — Tarjan's emission order depends on
+        // adjacency order, so this is observable downstream.
+        let mut g = Graph::new();
+        let a1 = g.add_cell_node(0, 0, 0);
+        let b1 = g.add_cell_node(0, 1, 0);
+        let c1 = g.add_cell_node(0, 2, 0);
+        let f = g.add_cell_node(0, 0, 3);
+
+        // Initial bind.
+        g.add_edge(f, a1);
+        g.add_edge(f, b1);
+        g.add_edge(f, c1);
+        let initial: Vec<_> = g.outgoing(f).to_vec();
+
+        // Rebind to identical targets.
+        g.clear_outgoing(f);
+        g.add_edge(f, a1);
+        g.add_edge(f, b1);
+        g.add_edge(f, c1);
+        let rebound: Vec<_> = g.outgoing(f).to_vec();
+
+        assert_eq!(initial, rebound, "edge order identical post-rebind");
     }
 }

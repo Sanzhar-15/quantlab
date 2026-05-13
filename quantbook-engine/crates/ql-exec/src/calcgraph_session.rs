@@ -74,7 +74,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use ql_calcgraph::{schedule, CellNode, Graph, Node, NodeId, Schedule};
+use ql_calcgraph::{
+    range_contains_rowcol, schedule_with_supplemental, CellNode, Graph, Node, NodeId, Schedule,
+};
 use ql_formula_syntax::{lex, parse, RangeRef};
 use ql_storage::Workbook;
 use ql_types::{ColId, Range, RowId, SheetId};
@@ -423,12 +425,13 @@ impl CalcgraphSession {
     /// node wholesale so re-bind cleanly drops stale session-side
     /// deps even though the Phase 0 graph's edges are append-only.
     ///
-    /// Stripe-side stale entries DO accumulate on re-bind (the Phase 0
-    /// `Graph` is append-only) — `Graph::dependents_for_cell` filters
-    /// these via the formula_to_range_deps precision check, so the
-    /// false-positive cost is read-side, not write-side. Phase 3.3
-    /// accepts this trade-off (the Phase 0 graph contract); a future
-    /// phase may add delta-edges to the graph.
+    /// **W5-50 (GAP-G-01 closure):** graph + stripe state is wholesale
+    /// revoked before re-registration via `Graph::clear_outgoing` +
+    /// `Graph::clear_range_deps_for_formula`. Prior comments here
+    /// claimed stripe-side stale entries accumulated on re-bind; that
+    /// was the Phase 0 append-only trade-off and is now fixed. The
+    /// revocation is the documented exception to the append-only
+    /// invariant — see `docs/architecture/2026-05-13-graph-storage-decision.md`.
     ///
     /// Internal — public callers go through `on_set_formula` or
     /// rebuild. `formula_node` MUST already exist in the graph (call
@@ -447,6 +450,13 @@ impl CalcgraphSession {
         // re-binding a formula whose text changed (e.g. `=A1` → `=B1`)
         // doesn't leave the old cell-dep stamped on the session.
         self.remove_formula_deps(formula_node);
+        // W5-50 (GAP-G-01 closure): also revoke prior graph edges +
+        // stripe registrations. Without this, stale forward edges
+        // create false `#CIRC!` cycles (megaudit H3) and stale stripe
+        // entries falsely dirty the formula on writes to the OLD range
+        // (megaudit H4). Idempotent on first-time bind.
+        self.graph.clear_outgoing(formula_node);
+        self.graph.clear_range_deps_for_formula(formula_node);
 
         // Walk and collect.
         let mut deps = FormulaDeps::default();
@@ -520,8 +530,10 @@ impl CalcgraphSession {
     /// Used when a formula is re-bound (different text → different
     /// deps) or cleared. Cleans `formula_deps`, the volatile set, the
     /// name→formulas reverse index, and the cell→formulas reverse
-    /// index. Does NOT touch the Phase 0 `Graph`'s stripe state or
-    /// edges (append-only contract).
+    /// index. Does NOT touch the `Graph`'s stripe state or edges —
+    /// those are revoked separately by the caller via
+    /// `Graph::clear_outgoing` + `Graph::clear_range_deps_for_formula`
+    /// (W5-50). See `extract_and_register_deps` for the wiring.
     fn remove_formula_deps(&mut self, formula_node: NodeId) {
         if let Some(prior) = self.formula_deps.remove(&formula_node) {
             for name in &prior.names {
@@ -939,7 +951,67 @@ impl CalcgraphSession {
     pub fn schedule_dirty(&mut self) -> Schedule {
         let mut dirty_vec: Vec<NodeId> = self.dirty.drain().collect();
         dirty_vec.sort();
-        schedule(&self.graph, &dirty_vec)
+        // W5-50 (GAP-G-03 closure): inject supplemental adjacency so
+        // Tarjan can see range-induced ordering / cycles. The Phase 0
+        // graph stores range deps in stripes + `formula_to_range_deps`
+        // rather than as `add_edge` edges (the A4 acceptance: SUM(A:A)
+        // must compress to ONE RangeRef, not 25M edges). For Tarjan we
+        // expand range deps lazily into temp edges F → G where G is a
+        // dirty formula inside one of F's ranges.
+        let supplemental = self.build_range_supplemental(&dirty_vec);
+        schedule_with_supplemental(&self.graph, &dirty_vec, &supplemental)
+    }
+
+    /// W5-50 — build the supplemental adjacency for
+    /// `topo::schedule_with_supplemental`. For each dirty formula `F`
+    /// with at least one range dep, and each OTHER (or same — for
+    /// self-range cycles) dirty formula `G` whose cell address falls
+    /// inside one of F's ranges, emit a temp edge `F → G`.
+    ///
+    /// Per Codex (W5-49 review): scope is **dirty formula nodes only**.
+    /// Non-formula cells (literals) inside the range are read as
+    /// current values during recompute, NOT scheduled — adding edges
+    /// to them would just produce no-op Tarjan filtering.
+    ///
+    /// Determinism: `dirty_vec` is sorted by NodeId before this call
+    /// runs, so the supplemental Vec entries land in a deterministic
+    /// order (same dirty set + same graph → same supplemental → same
+    /// Schedule).
+    ///
+    /// Complexity: O(|dirty_vec|² × avg_ranges_per_formula). Typical
+    /// edits have small dirty sets; the inner loop is a tight
+    /// `range_contains_rowcol` check. If profiling later shows pain,
+    /// switching to per-range bucketing (build a per-stripe index of
+    /// dirty formulas, intersect with range bounds) is the path.
+    fn build_range_supplemental(&self, dirty_vec: &[NodeId]) -> HashMap<NodeId, Vec<NodeId>> {
+        // Resolve cell addresses for every dirty FORMULA node. Non-
+        // formula NodeIds (none exist today — the graph only adds Cell
+        // nodes for formula cells) filter out via cell_address_for
+        // returning None.
+        let dirty_addrs: Vec<(NodeId, SheetId, RowId, ColId)> = dirty_vec
+            .iter()
+            .filter_map(|&n| self.cell_address_for(n).map(|(s, r, c)| (n, s, r, c)))
+            .collect();
+
+        let mut supplemental: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for &(f, fs, _, _) in &dirty_addrs {
+            let ranges = self.graph.range_deps_for(f);
+            if ranges.is_empty() {
+                continue;
+            }
+            for range in ranges {
+                let resolved_sheet = Graph::range_ref_sheet(range).unwrap_or(fs);
+                for &(g, gs, gr, gc) in &dirty_addrs {
+                    if gs != resolved_sheet {
+                        continue;
+                    }
+                    if range_contains_rowcol(range, gr, gc) {
+                        supplemental.entry(f).or_default().push(g);
+                    }
+                }
+            }
+        }
+        supplemental
     }
 }
 
@@ -1881,6 +1953,470 @@ mod tests {
         // Write to B1 — fires.
         s.on_set_value(0, 0, 1);
         assert!(s.is_dirty(node));
+    }
+
+    // ----------------------------------------------------------------
+    // W5-50 — GAP-G-01 closure (Phase 4 pre-V2).
+    //
+    // Phase 3.10 megaudit H3 + H4 found that re-binding a formula did
+    // NOT clear the Phase 0 `Graph`'s forward edges or stripe entries
+    // — creating false `#CIRC!` cycles (H3) and false-positive dirty
+    // marks (H4). W5-50 wires `Graph::clear_outgoing` +
+    // `Graph::clear_range_deps_for_formula` into
+    // `extract_and_register_deps` so the graph is wholesale revoked
+    // before re-registration.
+    //
+    // The graph-level revocation API has its own tests in
+    // `ql-calcgraph::graph::tests`. These tests verify the SESSION
+    // wiring: `on_set_formula` → `extract_and_register_deps` actually
+    // invokes the new clears.
+    // ----------------------------------------------------------------
+
+    /// W5-50: on rebind, the graph's `outgoing[formula]` reflects the
+    /// new dep set, not the union of old + new.
+    #[test]
+    fn rebind_clears_graph_outgoing_edges() {
+        let mut s = CalcgraphSession::new();
+        // Add A1 and B1 as formula cells so cell_index has nodes for
+        // them (extract_and_register_deps only adds forward edges to
+        // dep cells that already have nodes).
+        let _a1_node = s.or_insert_cell_node(0, 0, 0);
+        let _b1_node = s.or_insert_cell_node(0, 1, 0);
+        // F at (0,5,5) initially depends on A1.
+        let plan_v1 = ExprPlan::CellRef {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            abs_col: false,
+            abs_row: false,
+        };
+        s.on_set_formula(0, 5, 5, &plan_v1);
+        let f = s.cell_node_for(0, 5, 5).unwrap();
+        let a1 = s.cell_node_for(0, 0, 0).unwrap();
+        let b1 = s.cell_node_for(0, 1, 0).unwrap();
+        assert_eq!(s.graph().outgoing(f), &[a1], "initial bind adds F→A1 edge");
+        assert_eq!(s.graph().incoming(a1), &[f]);
+
+        // Rebind F to depend on B1 instead.
+        let plan_v2 = ExprPlan::CellRef {
+            sheet: 0,
+            row: 1,
+            col: 0,
+            abs_col: false,
+            abs_row: false,
+        };
+        s.on_set_formula(0, 5, 5, &plan_v2);
+
+        // Graph-level outgoing now reflects ONLY the new dep.
+        assert_eq!(
+            s.graph().outgoing(f),
+            &[b1],
+            "rebind clears stale F→A1, adds F→B1"
+        );
+        // Symmetric: A1 no longer has F as a dependent.
+        assert!(
+            s.graph().incoming(a1).is_empty(),
+            "A1's back-pointer to F removed"
+        );
+        assert_eq!(s.graph().incoming(b1), &[f]);
+    }
+
+    /// W5-50 / megaudit H3 — session-level acceptance: rebind a formula
+    /// to a constant clears outgoing edges so when a later edit points
+    /// the old dep at the formula, the graph state does NOT form a
+    /// false `A1 ↔ B1` cycle.
+    ///
+    ///   1. B1 = "=A1"           → graph: B1→A1
+    ///   2. B1 = "=1" (rebind)   → graph: B1's outgoing cleared
+    ///   3. A1 = "=B1"           → graph: A1→B1
+    ///
+    /// Tarjan operating over the dirty set `{A1, B1}` must emit a
+    /// 2-node SORTED schedule (B1 then A1), not a 2-node CYCLED one.
+    /// We drive Tarjan directly here because the runtime's natural
+    /// dirty fanout doesn't queue both nodes — the rebind itself
+    /// doesn't dirty A1, and A1's new formula only dirties downstream
+    /// of A1 (which is empty in this minimal setup). The scheduler
+    /// contract is what matters for the bug: given a hypothetical
+    /// dirty set covering both, it must not fabricate a cycle.
+    #[test]
+    fn h3_no_false_circ_after_rebind_to_constant() {
+        let mut s = CalcgraphSession::new();
+        s.or_insert_cell_node(0, 0, 0); // A1 pre-exists as a node
+        s.or_insert_cell_node(0, 0, 1); // B1 pre-exists as a node
+
+        // Step 1: B1 = "=A1"
+        let plan_b1_v1 = ExprPlan::CellRef {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            abs_col: false,
+            abs_row: false,
+        };
+        s.on_set_formula(0, 0, 1, &plan_b1_v1);
+
+        // Step 2: B1 = "=1" — constant, no deps. clear_outgoing fires.
+        s.on_set_formula(0, 0, 1, &ExprPlan::Number(1.0));
+
+        // Step 3: A1 = "=B1"
+        let plan_a1 = ExprPlan::CellRef {
+            sheet: 0,
+            row: 0,
+            col: 1,
+            abs_col: false,
+            abs_row: false,
+        };
+        s.on_set_formula(0, 0, 0, &plan_a1);
+
+        let a1 = s.cell_node_for(0, 0, 0).unwrap();
+        let b1 = s.cell_node_for(0, 0, 1).unwrap();
+
+        // Graph state sanity: B1 has NO outgoing edges (rebind cleared
+        // the stale B1→A1); A1→B1 was added by step 3.
+        assert!(s.graph().outgoing(b1).is_empty(), "B1's outgoing cleared");
+        assert_eq!(s.graph().outgoing(a1), &[b1]);
+
+        // Tarjan over the hypothetical dirty set {A1, B1}: must emit
+        // SORTED, not CYCLED. Pre-W5-50 this would have been CYCLED
+        // because outgoing[B1] still contained A1.
+        let sched = ql_calcgraph::schedule(s.graph(), &[a1, b1]);
+        assert!(
+            sched.cycled.is_empty(),
+            "H3 closure: no false #CIRC! after rebind. cycled={:?}",
+            sched.cycled
+        );
+        assert_eq!(sched.sorted, vec![b1, a1], "dep-first: B1 then A1");
+    }
+
+    /// W5-50 / megaudit H4 — session-level acceptance: rebinding a
+    /// range-dep formula from SUM(A:A) to SUM(B:B) clears the Column A
+    /// stripe entry, so writes to A5 no longer falsely dirty B1.
+    ///
+    /// The plan-level `AggregateNameRef` carries a `Range` (from
+    /// `ql_types`) which `range_to_rangeref` (line 101) maps to the
+    /// appropriate `RangeRef` variant — `start_row: 0, end_row: MAX`
+    /// becomes `WholeColumn`.
+    #[test]
+    fn h4_rebind_clears_stale_range_stripe_dirty() {
+        let mut s = CalcgraphSession::new();
+        let _b1_node = s.or_insert_cell_node(0, 0, 1);
+
+        // Step 1: B1 = SUM(Sales_A) where Sales_A → A:A.
+        // Construct a whole-column-A range (start_row=0, end_row=MAX).
+        let sales_a = ql_types::Range {
+            sheet: 0,
+            start_row: 0,
+            start_col: 0,
+            end_row: ql_types::RowId::MAX,
+            end_col: 0,
+        };
+        let plan_v1 = ExprPlan::AggregateNameRef {
+            name: Arc::from("SALES_A"),
+            range: sales_a,
+        };
+        let plan_v1_wrapped = ExprPlan::Function {
+            name: Arc::from("SUM"),
+            args: vec![plan_v1],
+        };
+        s.on_set_formula(0, 0, 1, &plan_v1_wrapped);
+        let b1 = s.cell_node_for(0, 0, 1).unwrap();
+        assert_eq!(
+            s.graph().stripe_index().stripe_count(),
+            1,
+            "Column A stripe registered"
+        );
+
+        // Step 2: rebind to SUM(Sales_B) where Sales_B → B:B.
+        let sales_b = ql_types::Range {
+            sheet: 0,
+            start_row: 0,
+            start_col: 1,
+            end_row: ql_types::RowId::MAX,
+            end_col: 1,
+        };
+        let plan_v2 = ExprPlan::AggregateNameRef {
+            name: Arc::from("SALES_B"),
+            range: sales_b,
+        };
+        let plan_v2_wrapped = ExprPlan::Function {
+            name: Arc::from("SUM"),
+            args: vec![plan_v2],
+        };
+        s.on_set_formula(0, 0, 1, &plan_v2_wrapped);
+
+        // Stripe map: ONLY Column B now (Column A was cleared).
+        assert_eq!(s.graph().stripe_index().stripe_count(), 1);
+        assert!(
+            s.graph().dependents_for_cell(0, 5, 0).is_empty(),
+            "A5 write must NOT find B1 — Column A stripe revoked"
+        );
+        assert_eq!(
+            s.graph().dependents_for_cell(0, 5, 1),
+            vec![b1],
+            "B5 write finds B1 via new Column B stripe"
+        );
+
+        // Step 3: simulate write to A5 — B1 must not dirty via the
+        // stale stripe.
+        s.take_dirty(); // clear residue from the on_set_formula calls
+        s.on_set_value(0, 5, 0);
+        assert!(
+            !s.is_dirty(b1),
+            "H4 closure: stale Column A stripe must not fire"
+        );
+
+        // And: B5 still dirties.
+        s.on_set_value(0, 5, 1);
+        assert!(s.is_dirty(b1));
+    }
+
+    // ----------------------------------------------------------------
+    // W5-50 — GAP-G-03 closure (Phase 4 pre-V2).
+    //
+    // Phase 3.10 megaudit H1 found that range-dep formulas don't create
+    // scheduler edges — Tarjan can't see range-induced cycles or
+    // ordering. W5-50 fixes this by computing a supplemental adjacency
+    // at `schedule_dirty` time: for each dirty formula F with range
+    // deps and a dirty formula G inside one of F's ranges, the session
+    // injects a temp edge F → G into the Tarjan input.
+    //
+    // The Tarjan-level supplemental tests live in `topo::tests`. These
+    // tests exercise the SESSION integration end-to-end: build the
+    // formulas via on_set_formula, drive dirtying via on_set_value,
+    // and assert on schedule_dirty's output.
+    // ----------------------------------------------------------------
+
+    /// W5-50 / megaudit H1 example #1 — range-induced cycle:
+    ///   A1 = "=SUM(B1:B1)"   → range dep on B1
+    ///   B1 = "=A1"           → cell ref to A1
+    /// Edits to A1 and B1 make both dirty. The session must emit BOTH
+    /// in `cycled` (the cycle is `A1 → B1 → A1` via supplemental +
+    /// real edge).
+    #[test]
+    fn h1_range_induced_cycle_detected() {
+        let mut s = CalcgraphSession::new();
+        s.or_insert_cell_node(0, 0, 0);
+        s.or_insert_cell_node(0, 0, 1);
+
+        // A1 = SUM(B1:B1)
+        let b1_range = ql_types::Range {
+            sheet: 0,
+            start_row: 0,
+            start_col: 1,
+            end_row: 0,
+            end_col: 1,
+        };
+        let plan_a1 = ExprPlan::Function {
+            name: Arc::from("SUM"),
+            args: vec![ExprPlan::AggregateNameRef {
+                name: Arc::from("X"),
+                range: b1_range,
+            }],
+        };
+        s.on_set_formula(0, 0, 0, &plan_a1);
+
+        // B1 = "=A1"
+        let plan_b1 = ExprPlan::CellRef {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            abs_col: false,
+            abs_row: false,
+        };
+        s.on_set_formula(0, 0, 1, &plan_b1);
+
+        // Drive both into the dirty set.
+        s.take_dirty(); // clear any residue from the on_set_formula calls
+        s.on_set_value(0, 0, 0); // dirties B1 (depends on A1)
+        s.on_set_value(0, 0, 1); // dirties A1 (via Column B stripe)
+
+        let a1 = s.cell_node_for(0, 0, 0).unwrap();
+        let b1 = s.cell_node_for(0, 0, 1).unwrap();
+        assert!(s.is_dirty(a1) && s.is_dirty(b1), "both dirty");
+
+        let sched = s.schedule_dirty();
+        assert!(
+            sched.sorted.is_empty(),
+            "all in cycled, sorted={:?}",
+            sched.sorted
+        );
+        let cycled: HashSet<NodeId> = sched.cycled.iter().copied().collect();
+        assert_eq!(
+            cycled,
+            [a1, b1].into_iter().collect(),
+            "H1: range-induced cycle detected"
+        );
+    }
+
+    /// W5-50 / megaudit H1 example #2 — range-induced ordering (no
+    /// cycle):
+    ///   A1 = "=SUM(B1:B1)"   → range dep on B1
+    ///   B1 = "=C1"           → cell ref to C1
+    /// Edits dirty both A1 and B1. Tarjan must order B1 before A1
+    /// (A1 depends on B1 via the range, so B1 must compute first).
+    #[test]
+    fn h1_range_induced_ordering_via_supplemental() {
+        let mut s = CalcgraphSession::new();
+        s.or_insert_cell_node(0, 0, 0);
+        s.or_insert_cell_node(0, 0, 1);
+        s.or_insert_cell_node(0, 0, 2);
+
+        // A1 = SUM(B1:B1)
+        let b1_range = ql_types::Range {
+            sheet: 0,
+            start_row: 0,
+            start_col: 1,
+            end_row: 0,
+            end_col: 1,
+        };
+        let plan_a1 = ExprPlan::Function {
+            name: Arc::from("SUM"),
+            args: vec![ExprPlan::AggregateNameRef {
+                name: Arc::from("X"),
+                range: b1_range,
+            }],
+        };
+        s.on_set_formula(0, 0, 0, &plan_a1);
+
+        // B1 = "=C1"
+        let plan_b1 = ExprPlan::CellRef {
+            sheet: 0,
+            row: 0,
+            col: 2,
+            abs_col: false,
+            abs_row: false,
+        };
+        s.on_set_formula(0, 0, 1, &plan_b1);
+
+        // Drive both A1 and B1 dirty via a literal write to C1: B1
+        // depends on C1 (direct cell), A1 depends on B1 (via range).
+        // mark_dirty_from_cell_write fans out transitively.
+        s.take_dirty();
+        s.on_set_value(0, 0, 2); // write to C1 → B1 dirty → A1 dirty (Column B stripe + transitive BFS)
+
+        let a1 = s.cell_node_for(0, 0, 0).unwrap();
+        let b1 = s.cell_node_for(0, 0, 1).unwrap();
+        assert!(s.is_dirty(a1) && s.is_dirty(b1), "both dirty");
+
+        let sched = s.schedule_dirty();
+        assert!(
+            sched.cycled.is_empty(),
+            "no cycle, cycled={:?}",
+            sched.cycled
+        );
+        assert_eq!(sched.sorted, vec![b1, a1], "B1 before A1 (dep-first)");
+    }
+
+    /// W5-50 / self-range cycle: `A1 = "=SUM(A1:A1)"`. Single dirty
+    /// formula whose range covers itself. Supplemental injects A1 → A1.
+    /// Tarjan emits A1 in `cycled`.
+    #[test]
+    fn self_range_cycle_via_supplemental() {
+        let mut s = CalcgraphSession::new();
+        s.or_insert_cell_node(0, 0, 0);
+
+        // A1 = SUM(A1:A1)
+        let a1_range = ql_types::Range {
+            sheet: 0,
+            start_row: 0,
+            start_col: 0,
+            end_row: 0,
+            end_col: 0,
+        };
+        let plan_a1 = ExprPlan::Function {
+            name: Arc::from("SUM"),
+            args: vec![ExprPlan::AggregateNameRef {
+                name: Arc::from("X"),
+                range: a1_range,
+            }],
+        };
+        s.on_set_formula(0, 0, 0, &plan_a1);
+
+        // Force A1 dirty: write to A1's cell (self-fanout via stripe).
+        s.take_dirty();
+        s.on_set_value(0, 0, 0);
+
+        let a1 = s.cell_node_for(0, 0, 0).unwrap();
+        assert!(s.is_dirty(a1));
+
+        let sched = s.schedule_dirty();
+        assert!(sched.sorted.is_empty(), "self-cycle, sorted empty");
+        assert_eq!(sched.cycled, vec![a1], "self-range cycle detected");
+    }
+
+    /// W5-50 — partial dirty: B1 in A1's range is a LITERAL (not a
+    /// formula → no NodeId). Supplemental builder must NOT push a
+    /// (non-existent) temp edge. A1 evaluates against current B1 value
+    /// as the existing contract requires.
+    #[test]
+    fn partial_dirty_literal_in_range_no_supplemental() {
+        let mut s = CalcgraphSession::new();
+        s.or_insert_cell_node(0, 0, 0);
+        // B1 is NOT a formula cell — no node added.
+
+        // A1 = SUM(B1:B1) where B1 is a literal.
+        let b1_range = ql_types::Range {
+            sheet: 0,
+            start_row: 0,
+            start_col: 1,
+            end_row: 0,
+            end_col: 1,
+        };
+        let plan_a1 = ExprPlan::Function {
+            name: Arc::from("SUM"),
+            args: vec![ExprPlan::AggregateNameRef {
+                name: Arc::from("X"),
+                range: b1_range,
+            }],
+        };
+        s.on_set_formula(0, 0, 0, &plan_a1);
+
+        // Force A1 into dirty by writing to its own cell (no
+        // dependents exist for A1 since it's the only formula).
+        s.take_dirty();
+        s.on_set_value(0, 0, 1); // write to literal B1 — fanout dirties A1 via stripe
+
+        let a1 = s.cell_node_for(0, 0, 0).unwrap();
+        assert!(s.is_dirty(a1), "A1 dirty via Column B stripe");
+        assert!(
+            s.cell_node_for(0, 0, 1).is_none(),
+            "B1 has no node (literal)"
+        );
+
+        let sched = s.schedule_dirty();
+        assert_eq!(
+            sched.sorted,
+            vec![a1],
+            "A1 alone in sorted — no supplemental edge to non-formula B1"
+        );
+        assert!(sched.cycled.is_empty());
+    }
+
+    /// W5-50: re-binding to the SAME plan is a no-op for graph state
+    /// (same edges, same stripes). Determinism check.
+    #[test]
+    fn rebind_to_same_plan_yields_same_graph_state() {
+        let mut s = CalcgraphSession::new();
+        s.or_insert_cell_node(0, 0, 0); // A1
+
+        let plan = ExprPlan::CellRef {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            abs_col: false,
+            abs_row: false,
+        };
+        s.on_set_formula(0, 0, 1, &plan);
+        let f = s.cell_node_for(0, 0, 1).unwrap();
+        let edges_before: Vec<_> = s.graph().outgoing(f).to_vec();
+        let stripe_count_before = s.graph().stripe_index().stripe_count();
+
+        // Same plan again.
+        s.on_set_formula(0, 0, 1, &plan);
+        let edges_after: Vec<_> = s.graph().outgoing(f).to_vec();
+        let stripe_count_after = s.graph().stripe_index().stripe_count();
+
+        assert_eq!(edges_before, edges_after, "edge list identical");
+        assert_eq!(stripe_count_before, stripe_count_after);
     }
 
     /// Phase 3.3: rebuild leaves a clean dirty set (a fresh load
