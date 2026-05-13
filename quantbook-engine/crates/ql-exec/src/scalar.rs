@@ -146,7 +146,11 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                 for a in args {
                     match a {
                         ExprPlan::AggregateNameRef { range, .. } => {
-                            fn_args.push(FnArg::Range(env.read_range(*range)));
+                            // W5-54: shape-aware Range so VLOOKUP /
+                            // HLOOKUP / INDEX can address by (row,
+                            // col). SUMIF / COUNTIF ignore shape.
+                            let (values, rows, cols) = env.read_range_with_shape(*range);
+                            fn_args.push(FnArg::Range { values, rows, cols });
                         }
                         other => {
                             fn_args.push(FnArg::Scalar(eval_scalar_with_cache(

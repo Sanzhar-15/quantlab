@@ -32,22 +32,54 @@
 use ql_types::Value;
 
 /// A single argument to a range-aware function. `Scalar` carries a
-/// pre-evaluated `Value`; `Range` carries the flat-iteration of a
-/// range reference (row-major by `(row, col)` per `CellEnv::read_range`).
+/// pre-evaluated `Value`; `Range` carries the flat row-major
+/// iteration of a range reference (per `CellEnv::read_range`) PLUS
+/// its 2D shape (rows × cols).
 ///
-/// The `Range` payload is a `Vec<Value>` rather than a slice because
-/// the producer (eval) owns the buffer. For very large ranges
-/// (whole-column refs over millions of cells) this is the same cost
-/// as the existing flattening path; range-aware functions just get
-/// the structure preserved so they can pair `criteria_range[i]` with
-/// `sum_range[i]`.
+/// Shape is required for 2D-addressing functions like VLOOKUP /
+/// HLOOKUP / INDEX, which compute `values[row * cols + col]`. 1D
+/// consumers (SUMIF, COUNTIF) ignore shape and iterate `values`
+/// flat — `rows * cols == values.len()` is the invariant the eval
+/// dispatch maintains.
+///
+/// `values` is a `Vec<Value>` rather than a slice because the
+/// producer (eval) owns the buffer. For very large ranges (whole-
+/// column refs over millions of cells) this is the same cost as the
+/// existing flattening path; range-aware functions get both the
+/// flat data and the structure.
 #[derive(Clone, Debug, PartialEq)]
 pub enum FnArg {
     Scalar(Value),
-    Range(Vec<Value>),
+    Range {
+        values: Vec<Value>,
+        rows: usize,
+        cols: usize,
+    },
 }
 
 impl FnArg {
+    /// Construct a 1D `Range` (1 row × N cols, or N rows × 1 col —
+    /// caller decides which axis). Convenience for tests + 1D
+    /// consumers; uses `rows = 1, cols = values.len()` by default.
+    /// Production callers should construct the variant directly so
+    /// the shape reflects the source range.
+    #[cfg(test)]
+    pub fn range_1d(values: Vec<Value>) -> Self {
+        let cols = values.len();
+        FnArg::Range {
+            values,
+            rows: 1,
+            cols,
+        }
+    }
+
+    /// Construct a 2D `Range` with explicit shape.
+    #[cfg(test)]
+    pub fn range_2d(values: Vec<Value>, rows: usize, cols: usize) -> Self {
+        debug_assert_eq!(rows * cols, values.len(), "shape mismatch");
+        FnArg::Range { values, rows, cols }
+    }
+
     /// Convenience for tests + scalar-only call sites: returns the
     /// inner `Value` if this is a scalar arg, panics otherwise.
     /// Production code should `match` on the variant explicitly.
@@ -55,15 +87,16 @@ impl FnArg {
     pub fn unwrap_scalar(&self) -> &Value {
         match self {
             FnArg::Scalar(v) => v,
-            FnArg::Range(_) => panic!("FnArg::unwrap_scalar called on a Range arg"),
+            FnArg::Range { .. } => panic!("FnArg::unwrap_scalar called on a Range arg"),
         }
     }
 
-    /// Convenience for tests: returns the inner Vec if Range, panics otherwise.
+    /// Convenience for tests: returns the inner values if Range,
+    /// panics otherwise.
     #[cfg(test)]
     pub fn unwrap_range(&self) -> &[Value] {
         match self {
-            FnArg::Range(v) => v.as_slice(),
+            FnArg::Range { values, .. } => values.as_slice(),
             FnArg::Scalar(_) => panic!("FnArg::unwrap_range called on a Scalar arg"),
         }
     }

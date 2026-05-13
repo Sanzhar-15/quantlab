@@ -60,6 +60,11 @@ as partial, rows with `❌` are missing.
 | STDEV (alias: STDEV.S) | ✅ | A6 | 0 | Welford-backed |
 | STDEV.P | ✅ | A6 | 0 | Welford-backed |
 | SUMIF | ⚠️ | 16 | 4.3 V2 | W5-53 (GAP-F-05 closure): supports number/text/bool/blank criteria + comparators `> < >= <= <> =`. Wildcards (`?` `*`) deferred. 2-arg + 3-arg forms; sum_range default to range. Error in sum_range cell propagates (Excel canon). |
+| VLOOKUP | ⚠️ | 8 | 4.3 V2 | W5-54: exact match (range_lookup=FALSE/0) and approximate match (default, sorted ascending). col_index_num<1 → #VALUE!; col_index_num>cols → #REF!; not-found → #N/A. Case-insensitive text equality. Wildcards deferred. |
+| HLOOKUP | ⚠️ | 2 | 4.3 V2 | W5-54: row-direction mirror of VLOOKUP. Same caveats. |
+| MATCH | ⚠️ | 7 | 4.3 V2 | W5-54: match_type 0/1/-1 (exact / largest-≤ / smallest-≥). 1-based result. Not-found → #N/A. Linear scan (V1 — no binary-search optimization yet). |
+| INDEX | ⚠️ | 5 | 4.3 V2 | W5-54: scalar result only. 1D and 2D variants. row_num=0 / col_num=0 (array spill) → #REF! pending Phase 4.7 array formulas. Out-of-bounds → #REF!. |
+| CHOOSE | ✅ | 5 | 4.3 V2 | W5-54: scalar args only, 1-based index. Out-of-bounds → #VALUE!. Fractional indexes truncated per Excel canon. |
 | SUMIFS | ❌ | 0 | 4.3 V2 (next batch) | Multi-condition; needs the same predicate infra as SUMIF + AND-across-conditions zip. |
 | COUNTIF | ⚠️ | 13 | 4.3 V2 | W5-53 (GAP-F-05 closure): same predicate suite as SUMIF. Error cells in the range are NOT propagated (Excel canon — COUNTIF ignores errors, unlike SUMIF). Wildcards deferred. |
 | COUNTIFS | ❌ | 0 | 4.3 V2 (next batch) | Multi-condition count. |
@@ -174,18 +179,21 @@ as partial, rows with `❌` are missing.
 
 | Function | Status | Tests | Phase | Notes |
 |---|---|---|---|---|
-| VLOOKUP / HLOOKUP | ❌ | 0 | 4.3 | Range-arg; needs 4.7 partial |
-| LOOKUP | ❌ | 0 | 4.3 | Vector & array forms |
+| VLOOKUP | ⚠️ | 8 | 4.3 V2 | (see Aggregates/Conditional section for full notes; W5-54 shipped) |
+| HLOOKUP | ⚠️ | 2 | 4.3 V2 | (see W5-54 above) |
+| LOOKUP | ❌ | 0 | 4.10 | Vector & array forms; less common — defer past V1 wave 1 |
 | XLOOKUP | ❌ | 0 | 4.7 | Dynamic-array; modern Excel |
-| MATCH / XMATCH | ❌ | 0 | 4.3 | |
-| INDEX | ❌ | 0 | 4.3 | Range-arg semantics |
+| MATCH | ⚠️ | 7 | 4.3 V2 | W5-54 (see notes above) |
+| XMATCH | ❌ | 0 | 4.10 | Modern Excel; same family as MATCH |
+| INDEX | ⚠️ | 5 | 4.3 V2 | W5-54 (see notes above) |
 | OFFSET | ❌ | 0 | 4.7 | Volatile; whitelisted in 3.2 but not implemented |
 | INDIRECT | ❌ | 0 | 4.7 | Volatile; whitelisted in 3.2 but not implemented |
-| ADDRESS | ❌ | 0 | 4.3 | |
-| ROW / COLUMN / ROWS / COLUMNS | ❌ | 0 | 4.3 | |
+| ADDRESS | ❌ | 0 | 4.10 | |
+| ROW / COLUMN / ROWS / COLUMNS | ❌ | 0 | 4.10 | |
 | TRANSPOSE | ❌ | 0 | 4.7 | Array-result |
 | FILTER / SORT / SORTBY / UNIQUE | ❌ | 0 | 4.7 | Dynamic-array; modern Excel |
-| CHOOSE / CHOOSEROWS / CHOOSECOLS | ❌ | 0 | 4.3 (CHOOSE) / 4.7 (rest) | |
+| CHOOSE | ✅ | 5 | 4.3 V2 | W5-54 (see notes above) |
+| CHOOSEROWS / CHOOSECOLS | ❌ | 0 | 4.7 | Dynamic-array companions |
 | HYPERLINK | ❌ | 0 | post-v1 | Display-side, UI-coupled |
 
 ### Information

@@ -226,6 +226,16 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_range_aware("SUMIF", range_fns::sumif);
     r.register_range_aware("COUNTIF", range_fns::countif);
 
+    // Engine Phase 4.3 V2 batch #3 — lookup family (W5-54). Same
+    // RangeAwareFn dispatch as SUMIF/COUNTIF. MATCH/INDEX/VLOOKUP/
+    // HLOOKUP need 2D shape (rows, cols) on the range arg; CHOOSE
+    // takes only scalar args.
+    r.register_range_aware("MATCH", range_fns::r#match);
+    r.register_range_aware("INDEX", range_fns::index);
+    r.register_range_aware("VLOOKUP", range_fns::vlookup);
+    r.register_range_aware("HLOOKUP", range_fns::hlookup);
+    r.register_range_aware("CHOOSE", range_fns::choose);
+
     r
 }
 
@@ -250,8 +260,10 @@ mod tests {
         // UPPER, LOWER, TRIM, ISNUMBER, ISTEXT, ISBLANK, ISLOGICAL,
         // ISERROR, ISNA, ISERR = 22) + Phase 4.3 V2 trig (W5-51:
         // SIN, COS, TAN, ASIN, ACOS, ATAN, ATAN2 = 7) + Phase 4.3 V2
-        // range-aware (W5-53: SUMIF, COUNTIF = 2).
-        assert_eq!(r.len(), 61);
+        // range-aware (W5-53: SUMIF, COUNTIF = 2) + Phase 4.3 V2
+        // lookup family (W5-54: MATCH, INDEX, VLOOKUP, HLOOKUP,
+        // CHOOSE = 5).
+        assert_eq!(r.len(), 66);
     }
 
     #[test]

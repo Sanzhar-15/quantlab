@@ -202,6 +202,15 @@ pub(crate) fn is_aggregate_function(name: &str) -> bool {
             // range args resolve to `AggregateNameRef`.
             | "SUMIF"
             | "COUNTIF"
+            // Range-aware lookup family (W5-54): same reason — table
+            // args are range references that must bind as
+            // AggregateNameRef so the eval-side dispatch can construct
+            // `FnArg::Range { values, rows, cols }`.
+            | "MATCH"
+            | "INDEX"
+            | "VLOOKUP"
+            | "HLOOKUP"
+            | "CHOOSE"
     )
 }
 

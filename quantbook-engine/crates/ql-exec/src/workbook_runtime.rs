@@ -2535,10 +2535,13 @@ mod tests {
                 "is_aggregate_function lists {name:?} but it's not in default_registry"
             );
         }
-        // W5-53 (GAP-F-05 closure): range-aware names are also in
-        // is_aggregate_function but live in the parallel range_aware_fns
-        // table; check via lookup_range_aware.
-        for name in &["SUMIF", "COUNTIF"] {
+        // W5-53 (GAP-F-05 closure) + W5-54 (lookup family): range-
+        // aware names are also in is_aggregate_function but live in
+        // the parallel range_aware_fns table; check via
+        // lookup_range_aware.
+        for name in &[
+            "SUMIF", "COUNTIF", "MATCH", "INDEX", "VLOOKUP", "HLOOKUP", "CHOOSE",
+        ] {
             assert!(
                 reg.lookup_range_aware(name).is_some(),
                 "is_aggregate_function lists {name:?} (range-aware variant) but \
@@ -4061,6 +4064,173 @@ mod tests {
         // SUMIF formula at B1 should now include 100 → 100+3+4+5 = 112.
         let result = wb.read(ql_types::Address::new(0, 0, 1));
         assert_eq!(result, Value::Number(112.0));
+    }
+
+    // ----------------------------------------------------------------
+    // W5-54 — Phase 4.3 V2 lookup family (VLOOKUP / HLOOKUP / MATCH /
+    // INDEX / CHOOSE). End-to-end via the full parse → bind → eval
+    // pipeline. The 2D shape from `read_range_with_shape` flows
+    // through `FnArg::Range { values, rows, cols }`.
+    // ----------------------------------------------------------------
+
+    /// VLOOKUP with exact match against a 2-column table.
+    #[test]
+    fn w5_54_vlookup_exact_match_e2e() {
+        use ql_storage::NamedTarget;
+        use std::sync::Arc;
+        let mut wb = make_runtime_workbook();
+        // Table at A1:B3:
+        //   apple   1
+        //   banana  2
+        //   cherry  3
+        wb.put_at(0, 0, 0, Value::Text(Arc::from("apple")));
+        wb.put_at(0, 0, 1, Value::Number(1.0));
+        wb.put_at(0, 1, 0, Value::Text(Arc::from("banana")));
+        wb.put_at(0, 1, 1, Value::Number(2.0));
+        wb.put_at(0, 2, 0, Value::Text(Arc::from("cherry")));
+        wb.put_at(0, 2, 1, Value::Number(3.0));
+        wb.set_name(
+            "Table",
+            NamedTarget::Range(ql_types::Range::new(0, 0, 0, 2, 1)),
+        )
+        .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt
+            .set_formula(0, 0, 3, "VLOOKUP(\"banana\", Table, 2, FALSE)")
+            .unwrap();
+        assert_eq!(v, Value::Number(2.0));
+    }
+
+    /// VLOOKUP with approximate match (default range_lookup=TRUE) on
+    /// an ascending-sorted first column.
+    #[test]
+    fn w5_54_vlookup_approximate_match_e2e() {
+        use ql_storage::NamedTarget;
+        use std::sync::Arc;
+        let mut wb = make_runtime_workbook();
+        // Grading table: score thresholds → grade letter.
+        let rows = [
+            (0.0, "F"),
+            (60.0, "D"),
+            (70.0, "C"),
+            (80.0, "B"),
+            (90.0, "A"),
+        ];
+        for (i, (threshold, grade)) in rows.iter().enumerate() {
+            wb.put_at(0, i as u32, 0, Value::Number(*threshold));
+            wb.put_at(0, i as u32, 1, Value::Text(Arc::from(*grade)));
+        }
+        wb.set_name(
+            "Grades",
+            NamedTarget::Range(ql_types::Range::new(0, 0, 0, 4, 1)),
+        )
+        .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // Score 75 → largest ≤ 75 is 70 → grade "C".
+        let v = rt.set_formula(0, 0, 3, "VLOOKUP(75, Grades, 2)").unwrap();
+        assert_eq!(v, Value::Text(Arc::from("C")));
+    }
+
+    /// HLOOKUP with exact match on a 2-row × 3-col table.
+    #[test]
+    fn w5_54_hlookup_exact_match_e2e() {
+        use ql_storage::NamedTarget;
+        use std::sync::Arc;
+        let mut wb = make_runtime_workbook();
+        // Row 0: headers; Row 1: values.
+        for (i, h) in ["a", "b", "c"].iter().enumerate() {
+            wb.put_at(0, 0, i as u32, Value::Text(Arc::from(*h)));
+        }
+        for (i, v) in [10.0, 20.0, 30.0].iter().enumerate() {
+            wb.put_at(0, 1, i as u32, Value::Number(*v));
+        }
+        wb.set_name(
+            "HTable",
+            NamedTarget::Range(ql_types::Range::new(0, 0, 0, 1, 2)),
+        )
+        .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt
+            .set_formula(0, 3, 0, "HLOOKUP(\"b\", HTable, 2, FALSE)")
+            .unwrap();
+        assert_eq!(v, Value::Number(20.0));
+    }
+
+    /// MATCH exact + INDEX combination — the canonical replacement
+    /// for VLOOKUP. Demonstrates both functions plus the
+    /// scalar-argument result feeding into another formula.
+    #[test]
+    fn w5_54_index_match_pattern_e2e() {
+        use ql_storage::NamedTarget;
+        use std::sync::Arc;
+        let mut wb = make_runtime_workbook();
+        // Lookup keys in column A, values in column B.
+        for (i, key) in ["alpha", "beta", "gamma", "delta"].iter().enumerate() {
+            wb.put_at(0, i as u32, 0, Value::Text(Arc::from(*key)));
+            wb.put_at(0, i as u32, 1, Value::Number(((i + 1) * 10) as f64));
+        }
+        wb.set_name(
+            "Keys",
+            NamedTarget::Range(ql_types::Range::new(0, 0, 0, 3, 0)),
+        )
+        .unwrap();
+        wb.set_name(
+            "Vals",
+            NamedTarget::Range(ql_types::Range::new(0, 0, 1, 3, 1)),
+        )
+        .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // MATCH("gamma", Keys, 0) = 3 (1-based position of gamma).
+        let m = rt
+            .set_formula(0, 0, 2, "MATCH(\"gamma\", Keys, 0)")
+            .unwrap();
+        assert_eq!(m, Value::Number(3.0));
+        // INDEX(Vals, MATCH("gamma", Keys, 0)) = 30.
+        let v = rt
+            .set_formula(0, 1, 2, "INDEX(Vals, MATCH(\"gamma\", Keys, 0))")
+            .unwrap();
+        assert_eq!(v, Value::Number(30.0));
+    }
+
+    /// CHOOSE picks from scalar args.
+    #[test]
+    fn w5_54_choose_e2e() {
+        use std::sync::Arc;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt
+            .set_formula(0, 0, 0, "CHOOSE(3, \"a\", \"b\", \"c\", \"d\")")
+            .unwrap();
+        assert_eq!(v, Value::Text(Arc::from("c")));
+    }
+
+    /// VLOOKUP not-found returns #N/A. Verifies the error
+    /// classification is end-to-end correct (not stuck at #VALUE!).
+    #[test]
+    fn w5_54_vlookup_not_found_returns_na_e2e() {
+        use ql_storage::NamedTarget;
+        use std::sync::Arc;
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Text(Arc::from("apple")));
+        wb.put_at(0, 0, 1, Value::Number(1.0));
+        wb.put_at(0, 1, 0, Value::Text(Arc::from("banana")));
+        wb.put_at(0, 1, 1, Value::Number(2.0));
+        wb.set_name(
+            "Lookup",
+            NamedTarget::Range(ql_types::Range::new(0, 0, 0, 1, 1)),
+        )
+        .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt
+            .set_formula(0, 0, 3, "VLOOKUP(\"zzz\", Lookup, 2, FALSE)")
+            .unwrap();
+        assert_eq!(v, Value::Error(ErrorValue::NA));
     }
 
     /// Phase 3.7 extra: `mark_volatile_dirty` on a workbook with zero

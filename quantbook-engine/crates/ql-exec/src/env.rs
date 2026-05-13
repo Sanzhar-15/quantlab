@@ -44,6 +44,25 @@ pub trait CellEnv {
         }
         out
     }
+
+    /// **W5-54 (range-aware functions, GAP-F-05 follow-up):** return
+    /// the flat `Vec<Value>` for the range PLUS its 2D shape (rows,
+    /// cols). For range-aware functions like VLOOKUP/INDEX which
+    /// need to address by `(row, col)`, the dispatcher uses this to
+    /// construct `FnArg::Range { values, rows, cols }`.
+    ///
+    /// `rows * cols == values.len()` is the invariant. If the env
+    /// clamps to sheet bounds (`WorkbookEnv`), the returned shape
+    /// reflects the clamped dimensions. The default impl below
+    /// returns the unclamped shape derived from the range bounds —
+    /// matching the unclamped `read_range` default.
+    fn read_range_with_shape(&self, range: Range) -> (Vec<Value>, usize, usize) {
+        let values = self.read_range(range);
+        let rows = (range.end_row - range.start_row + 1) as usize;
+        let cols = (range.end_col - range.start_col + 1) as usize;
+        debug_assert_eq!(rows.saturating_mul(cols), values.len());
+        (values, rows, cols)
+    }
 }
 
 /// `ql-storage::Workbook`-backed implementation. Wraps a Workbook reference; reads dispatch
@@ -106,6 +125,35 @@ impl<'w> CellEnv for WorkbookEnv<'w> {
             }
         }
         out
+    }
+
+    /// W5-54: clamp-aware shape. Returns the (rows, cols) actually
+    /// materialized into the values Vec, NOT the requested-but-
+    /// unclamped range dimensions.
+    fn read_range_with_shape(&self, range: Range) -> (Vec<Value>, usize, usize) {
+        let Some(sheet) = self.workbook.sheet(range.sheet) else {
+            return (vec![Value::Error(ErrorValue::Ref)], 1, 1);
+        };
+        let bounds = sheet.bounds();
+        if bounds.row_extent == 0 || bounds.col_extent == 0 {
+            return (Vec::new(), 0, 0);
+        }
+        let max_row = bounds.row_extent - 1;
+        let max_col = bounds.col_extent - 1;
+        let end_row = range.end_row.min(max_row);
+        let end_col = range.end_col.min(max_col);
+        if range.start_row > end_row || range.start_col > end_col {
+            return (Vec::new(), 0, 0);
+        }
+        let rows = (end_row - range.start_row + 1) as usize;
+        let cols = (end_col - range.start_col + 1) as usize;
+        let mut out = Vec::with_capacity(rows.saturating_mul(cols));
+        for row in range.start_row..=end_row {
+            for col in range.start_col..=end_col {
+                out.push(sheet.read(row, col));
+            }
+        }
+        (out, rows, cols)
     }
 }
 
