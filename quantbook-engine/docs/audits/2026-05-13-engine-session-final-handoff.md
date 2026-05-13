@@ -241,8 +241,9 @@ Full gotchas list: `docs/process/audit-protocol.md` § Critical gotchas.
 
 Per the merged plan (Claude + Codex), the next 5 sessions:
 
-1. **(IMMEDIATELY NEXT)** — **Phase 4.4 architectural decision** — Coercion + Error Semantics Matrix. Use W5-49-pattern: Plan mode + Codex-reviewed design doc at `docs/architecture/<date>-coercion-matrix.md`. No code in this session. (Phase 4.3 polish wave 1 SHIPPED W5-61, closed W5-62.)
-2. **Phase 4.4 implementation** — Centralized coercion module. Per-function audit against the matrix.
+1. **Phase 4.4 architectural decision** ✅ SHIPPED W5-63 — Coercion + Error Semantics Matrix design doc at `docs/architecture/2026-05-13-coercion-matrix.md` (Codex-reviewed: 3 HIGH + 4 MEDIUM + 3 LOW findings synthesized).
+2. **(IMMEDIATELY NEXT) — Phase 4.4 implementation 4.4.A** — Helper migration: promote `coerce_text`, `coerce_int_arg`, `coerce_numeric` (de-duped from range_fns) to `ql-types::coercion` with neutral API names (`to_text_for_arg`, `to_int_arg`, `to_number_strict_skip_blank`). Per-function audit against the matrix.
+3. **Phase 4.4.B + 4.4.C** — Matrix-as-tests (~80 type-pair assertions, error-precedence end-to-end, per-fn overrides) + `docs/compat/error-matrix.md` + cross-link sweep.
 3. **Phase 4.4 implementation** — Centralized coercion module. Per-function audit against the matrix.
 4. **Phase 4.5** — Dates / Times / Number Formats. Excel epoch policy + format parser. Substantial; use design-doc pattern.
 5. **Phase 4.6** — Cross-Sheet References + Sheet-Scoped Names. Token + AST + binder + runtime expansion. Re-audit graph supplemental and named-range behavior.

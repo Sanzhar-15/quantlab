@@ -435,9 +435,10 @@ The full v1 means all of these crates either ship real behavior or have a docume
 
 4. **4.4 Coercion And Error Semantics Matrix**  
    Centralize coercion rules and error precedence. Lock binary op behavior, function argument coercion, blank handling, text-to-number, and date serial behavior.  
+   **Design doc (Codex-reviewed W5-63):** `docs/architecture/2026-05-13-coercion-matrix.md` — 3 sub-phases (4.4.A helper migration, 4.4.B matrix tests, 4.4.C error-matrix doc). 3 HIGH + 4 MEDIUM + 3 LOW Codex findings synthesized into the design.  
    References: `.references/ironcalc/base/src/cast.rs`; `.references/ironcalc/base/src/calc_result.rs`; `.references/formualizer/crates/formualizer-eval/src/coercion.rs`; `.references/hyperformula/src/interpreter/InterpreterValue.ts`.  
    Acceptance: COER-4-01 matrix checked in; COER-4-02 arithmetic, comparison, aggregate, logical, and text coercion cases covered; COER-4-03 no silent fallback for unsupported variants.  
-   Effort: 1-2 weeks.
+   Effort: ~2.5 sessions implementation + 0.5 session mega-audit per the design doc § 5.
 
 5. **4.5 Dates, Times, Number Formats**  
    Implement serial date systems, time arithmetic, display formatting, parse formatted numbers, and locale-sensitive format tokens.  

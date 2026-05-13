@@ -1,0 +1,80 @@
+I could not save the audit file because the workspace is mounted read-only in this session. Full review output is below.
+
+# Phase 4.4 design doc review — verdict
+
+The design is close, but I would not implement from it unchanged. The largest issue is that the doc mixes three different things without clean labels: Excel canon, current Quantbook behavior, and aspirational behavior after later lazy-dispatch work. That causes at least one wrong error-precedence row, under-specifies major existing overrides like `COUNT`/`COUNTA`/information predicates, and risks pinning Quantbook divergences as if they were canonical Excel behavior. The helper migration is directionally right, but the proposed API names should be made less function-aware before promoting them into `ql-types`.
+
+## NEW HIGH
+
+1. **`="x" + #REF!` row is wrong/ambiguous for current Quantbook behavior.**  
+   The doc says the result may be `#VALUE!` if text coercion happens first or `#REF!` if propagation happens first: [coercion-matrix.md:95](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-coercion-matrix.md:95). Current evaluator always does error propagation before arithmetic coercion inside `eval_binary`, after evaluating both operands: [scalar.rs:240](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/scalar.rs:240) and [scalar.rs:265](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/scalar.rs:265). So `Text("x") + Error(Ref)` returns `#REF!`, not `#VALUE!`. The matrix must not encode this as ambiguous if it is meant to pin implementation.
+
+2. **The non-goal says “ignore errors in range” for `SUM/AVERAGE`, but the actual divergence is text-in-range, not errors.**  
+   The doc says Excel’s “ignore errors in range” canon for `SUM/AVERAGE` is deferred: [coercion-matrix.md:152](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-coercion-matrix.md:152). Current `SUM`/`AVERAGE` propagate errors via `coerce_numeric`: [scalar_fns.rs:35](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/scalar_fns.rs:35), [scalar_fns.rs:80](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/scalar_fns.rs:80), [scalar_fns.rs:95](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/scalar_fns.rs:95). The real documented divergence is that text in aggregate/range contexts becomes `#VALUE!` instead of being skipped: [coercion-matrix.md:80](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-coercion-matrix.md:80), [range_fns.rs:1099](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/range_fns.rs:1099). Fix this wording before tests are written.
+
+3. **The override matrix is not complete enough to drive tests.**  
+   It lists `IF`, `IFERROR`, `ISERROR`/`ISNA`/`ISERR`, `COUNTIF`, `MATCH`, `VLOOKUP/HLOOKUP`: [coercion-matrix.md:108](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-coercion-matrix.md:108). Missing current overrides include `COUNT` skipping errors: [scalar_fns.rs:108](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/scalar_fns.rs:108), `COUNTA` counting errors: [scalar_fns.rs:121](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/scalar_fns.rs:121), `ISNUMBER`/`ISTEXT`/`ISBLANK`/`ISLOGICAL` returning false instead of propagating errors: [scalar_fns.rs:1869](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/scalar_fns.rs:1869), `CHOOSE` returning only the selected value: [range_fns.rs:726](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/range_fns.rs:726), and stats functions’ strict range behavior: [range_fns.rs:1111](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/range_fns.rs:1111).
+
+## NEW MEDIUM
+
+1. **NaN/Inf is a real latent gap, not fully prevented by constructors.**  
+   `Value::number` sanitizes non-finite numbers: [value.rs:47](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-types/src/value.rs:47). But the enum variant is public, so `Value::Number(f64::NAN)` can still be constructed directly; tests already do this: [value.rs:231](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-types/src/value.rs:231). Numeric/logical coercions sanitize: [coercion.rs:29](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-types/src/coercion.rs:29), [coercion.rs:53](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-types/src/coercion.rs:53). Text display/formula paths do not: [coercion.rs:73](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-types/src/coercion.rs:73), [coercion.rs:80](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-types/src/coercion.rs:80). The doc should decide whether text coercion of raw non-finite numbers renders or maps to `#NUM!`.
+
+2. **`IFERROR(#REF!, 0)` is current behavior, not merely aspirational.**  
+   Scalar function args are pre-evaluated left-to-right: [scalar.rs:223](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-exec/src/scalar.rs:223), and `iferror` catches `Value::Error` in arg 0: [scalar_fns.rs:338](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/scalar_fns.rs:338). GAP-F-02 is still real, but it is about lazy evaluation/side-effect/branch-evaluation semantics, not this simple result. The doc should say current result is `0`, while full laziness remains deferred.
+
+3. **Promoting `NumericForAggregate` into `ql-types` with an aggregate-specific name blurs layering.**  
+   `ql-types` currently owns `Value`-level coercions: [coercion.rs:1](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-types/src/coercion.rs:1). A public `NumericForAggregate` makes the leaf crate function-aware. Prefer `to_number_strict_skip_blank(v) -> Result<Option<f64>, ErrorValue>` or a neutral `BlankPolicy` API. That keeps the type crate about value coercion, not Excel aggregate categories.
+
+4. **Coverage-report plan needs registry support for range-aware names.**  
+   Current `FunctionRegistry::names()` exposes only scalar names: [registry.rs:115](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/registry.rs:115), while `len()` includes both tables: [registry.rs:119](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/registry.rs:119). A matrix coverage check must include `range_aware_fns` too, otherwise `MATCH`, `VLOOKUP`, `COUNTIF`, `RANK`, `CONCAT`, etc. can slip.
+
+## NEW LOW
+
+1. §3.1 says “seven Value variants,” but `Value` has five variants; the matrix splits finite/non-finite numbers and text parseability. Reword as “input cases,” not variants. See `Value`: [value.rs:29](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-types/src/value.rs:29).
+
+2. The formula-text row for finite numbers says `"n"` but current `Display` already removes `.0` for `42.0`: [value.rs:80](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-types/src/value.rs:80). The separate `format_number_for_text` rule mainly adds the `< 1e15` guard and explicit integer cast: [scalar_fns.rs:1362](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-functions/src/scalar_fns.rs:1362).
+
+3. Stop condition “500 lines” is arbitrary. Better stop on “test table no longer makes semantic grouping obvious” or “new helper API cannot express a row without per-function special casing.”
+
+## Per-concern verdict
+
+A: Mostly correct, but NaN/Inf is a real latent gap because raw public enum construction bypasses `Value::number`. Text `"TRUE"`/`"FALSE"` should not coerce numerically; `=1+"TRUE"` should be `#VALUE!`, while logical coercion accepts it. `Blank` COUNT/COUNTA behavior belongs in per-function overrides, not the base type-pair matrix.
+
+B: Dispatcher arg evaluation is left-to-right. Binary errors are left-error-first after both sides are evaluated. The `="x"+#REF!` row must be fixed to current `#REF!`. `IFERROR(#REF!,0)` currently returns `0`; GAP-F-02 is not about that simple case. `ISERROR` receives `Value::Error` and introspects correctly.
+
+C: Override matrix is undercomplete. Add `COUNT`, `COUNTA`, all information predicates, `AVERAGE` empty, `MIN/MAX` empty/all-skipped, `CHOOSE`, `INDEX`, `LARGE/SMALL/MEDIAN/MODE/RANK`, and note unimplemented `TYPE`, `NA`, `ERROR.TYPE`.
+
+D: Migration is feasible, but name the promoted APIs neutrally. `to_text_for_arg` is acceptable if documented as invariant text-argument formatting; `NumericForAggregate` is too function-specific for `ql-types`.
+
+E: Three-crate test placement is coherent. Add canon/divergence tags in test names. Add a registry coverage check that sees both scalar and range-aware registries.
+
+F: Locale/date deferrals are fine. The SUM/AVERAGE non-goal must be corrected from “ignore errors” to “skip text/blanks in range/aggregate contexts,” and the divergence should be defended explicitly.
+
+G: Helper migration is more than a tiny refactor. `coerce_numeric` has many scalar call sites and several range call sites. One session is plausible but tight; include time for mechanical fallout and review. Mega-audit is already estimated at line 170, which is good.
+
+H: Stop conditions are directionally useful but need concrete examples. Replace the 500-line ceiling with a maintainability criterion.
+
+I: Add `docs/compat/excel-matrix.md` cross-links for coercion rows, aggregate rows, information rows, and lookup/stat rows. The doc already proposes a new `docs/compat/error-matrix.md`: [coercion-matrix.md:144](/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/docs/architecture/2026-05-13-coercion-matrix.md:144).
+
+J: Keep coercion in `ql-types`, but only for `Value`-level rules. Do not introduce aggregate-branded concepts there. A new `ql-coercion` crate is unnecessary at this size.
+
+K: Add a short “future contexts” paragraph naming arrays, cross-sheet refs, Python/AI boundary values, and CRDT replay determinism. These can be deferred, but they affect whether the matrix is intended to be scalar-only or reusable.
+
+## Recommended changes to the design doc
+
+1. Replace the `="x" + #REF!` row with a deterministic current result: `#REF!`, because binary error propagation precedes arithmetic coercion.
+
+2. Correct the SUM/AVERAGE non-goal wording: the disputed Excel divergence is text/non-numeric range handling, not ignoring error cells.
+
+3. Split every rule into labels: `Excel canon`, `Current Quantbook`, `Intentional V1 divergence`, or `Aspirational after FN4-03`.
+
+4. Expand §3.4 to include `COUNT`, `COUNTA`, information predicates, `CHOOSE`, `INDEX`, `AVERAGE`, `MIN/MAX`, `LARGE/SMALL`, `MEDIAN`, `MODE`, `RANK/RANK.AVG`, and unimplemented `TYPE`/`NA`/`ERROR.TYPE`.
+
+5. Rename the proposed aggregate helper to a neutral API, preferably `to_number_strict_skip_blank -> Result<Option<f64>, ErrorValue>`.
+
+6. Add an explicit NaN/Inf policy for text/display coercion of raw `Value::Number(non_finite)`.
+
+7. Add a registry coverage check that includes both `fns` and `range_aware_fns`.
+
+8. Add future-context notes for arrays, cross-sheet references, Python/AI value ingress, and CRDT replay determinism.
