@@ -9,8 +9,8 @@
 //! DAYS, NETWORKDAYS, WORKDAY, YEARFRAC) land in W5-73/W5-74.
 
 use ql_types::{
-    coercion, days_in_month, hms_to_fraction, serial_to_ymd, ymd_to_serial, DateSystem, ErrorValue,
-    EvalContext, Value,
+    coercion, days_in_month, hms_to_fraction, is_leap_year, serial_to_ymd, ymd_to_serial,
+    DateSystem, ErrorValue, EvalContext, Value,
 };
 
 // ============================================================================
@@ -601,6 +601,435 @@ pub fn edate_ctx(args: &[Value], ctx: &EvalContext) -> Value {
     match ymd_to_serial(norm_y, norm_m, clamped_d, ctx.date_system) {
         Ok(s) => Value::Number(s),
         Err(e) => Value::Error(e),
+    }
+}
+
+// ============================================================================
+// W5-74 — DAYS, NETWORKDAYS, WORKDAY, YEARFRAC (V1 wave 3, closes 18/18)
+// ============================================================================
+
+/// **`DAYS(end_date, start_date)`** — number of days between two serials.
+/// Returns `INT(end) - INT(start)`. Negative result when end < start
+/// (Excel canon).
+///
+/// **V1 divergence (filed as GAP-F-08):** strict numeric only. Text args
+/// (which Excel would DATEVALUE) return `#VALUE!`. Use DATEVALUE
+/// explicitly. Lands proper text support in Phase 4.10 polish.
+///
+/// Pure ScalarFn — doesn't need date_system (serial subtraction is
+/// system-agnostic when both inputs are from the same system).
+pub fn days(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let end = match to_serial_arg(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let start = match to_serial_arg(&args[1]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    Value::Number(end.trunc() - start.trunc())
+}
+
+/// Internal: is the weekday at the given serial a working day (Mon–Fri)?
+/// Bug-aware via the same direct serial formula `WEEKDAY` uses.
+fn is_working_day(serial_int: i64, system: DateSystem) -> bool {
+    let dow_sun_zero: i64 = match system {
+        DateSystem::Excel1900 => (serial_int - 1).rem_euclid(7),
+        DateSystem::Excel1904 => (serial_int + 5).rem_euclid(7),
+    };
+    // dow_sun_zero: 0=Sun, 1=Mon, ..., 6=Sat. Working = Mon..Fri = 1..=5.
+    (1..=5).contains(&dow_sun_zero)
+}
+
+/// **`NETWORKDAYS(start_date, end_date)`** — number of working days
+/// (Mon–Fri) between two serials, inclusive of both endpoints. Negative
+/// count when end < start.
+///
+/// **V1 divergence (GAP-F-09):** the optional 3rd `holidays` arg is NOT
+/// supported in V1 — the function tier (`ContextAwareFn`) can't see
+/// range args. Calling with 3 args returns `#VALUE!`. Holidays-aware
+/// version (and NETWORKDAYS.INTL with weekend mask) lands when the
+/// 4th registry tier `RangeAndContextAwareFn` is built (Phase 4.5.C or
+/// later — see W5-68 design § 4.A trade-off note).
+pub fn networkdays_ctx(args: &[Value], ctx: &EvalContext) -> Value {
+    if args.len() != 2 {
+        // 3-arg form (with holidays) explicitly rejected as V1 divergence.
+        return Value::Error(ErrorValue::Value);
+    }
+    let start = match to_serial_arg(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let end = match to_serial_arg(&args[1]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let start_int = start.trunc() as i64;
+    let end_int = end.trunc() as i64;
+    let (lo, hi, sign) = if start_int <= end_int {
+        (start_int, end_int, 1i64)
+    } else {
+        (end_int, start_int, -1i64)
+    };
+    let mut working = 0i64;
+    for s in lo..=hi {
+        if is_working_day(s, ctx.date_system) {
+            working += 1;
+        }
+    }
+    Value::Number((working * sign) as f64)
+}
+
+/// **`WORKDAY(start_date, days)`** — return the serial that is `days`
+/// working days (Mon–Fri) after `start_date` (or before, if `days < 0`).
+///
+/// **V1 divergence (GAP-F-10):** optional 3rd `holidays` arg not
+/// supported (same reason as NETWORKDAYS). 3-arg call returns
+/// `#VALUE!`. WORKDAY.INTL waits for tier-4 plus weekend-mask support.
+pub fn workday_ctx(args: &[Value], ctx: &EvalContext) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let start = match to_serial_arg(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let days = match to_int_date_arg(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let mut cur = start.trunc() as i64;
+    if days == 0 {
+        return Value::Number(cur as f64);
+    }
+    let step: i64 = if days > 0 { 1 } else { -1 };
+    let mut remaining = days.abs();
+    while remaining > 0 {
+        cur += step;
+        if cur < 0 {
+            return Value::Error(ErrorValue::Num);
+        }
+        if cur > ql_types::MAX_EXCEL_SERIAL_DAY {
+            return Value::Error(ErrorValue::Num);
+        }
+        if is_working_day(cur, ctx.date_system) {
+            remaining -= 1;
+        }
+    }
+    Value::Number(cur as f64)
+}
+
+/// **`YEARFRAC(start, end, [basis])`** — fractional years between two
+/// dates. `basis` selects the day-count convention (default 0):
+///
+/// - `0` US (NASD) 30/360 — implemented as European-30/360 in V1 (see
+///   V1 divergence below).
+/// - `1` Actual/actual — uses real day count; denominator handles
+///   leap-year span via the average-year-length method.
+/// - `2` Actual/360 — actual days / 360.
+/// - `3` Actual/365 — actual days / 365.
+/// - `4` European 30/360 — `(360*(y2-y1) + 30*(m2-m1) + (d2-d1)) / 360`.
+///
+/// **V1 divergence (GAP-F-11):** basis 0 (US NASD 30/360) uses the
+/// European-30/360 algorithm in V1 (basis 4). The US convention's
+/// end-of-month special-casing (Feb 28/29 → Feb 30; if d1=31 → d1=30;
+/// if d2=31 and d1=30/31 → d2=30) lands in Phase 4.10. For most date
+/// ranges the divergence is 0-1 days out of 360.
+pub fn yearfrac_ctx(args: &[Value], ctx: &EvalContext) -> Value {
+    if args.len() < 2 || args.len() > 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let s_start = match to_serial_arg(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let s_end = match to_serial_arg(&args[1]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let basis: i64 = if args.len() == 3 {
+        match to_int_date_arg(&args[2]) {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        0
+    };
+    if !(0..=4).contains(&basis) {
+        return Value::Error(ErrorValue::Num);
+    }
+    // Reject identical dates with positive denominator (Excel canon
+    // returns 0.0).
+    if s_start.trunc() == s_end.trunc() {
+        return Value::Number(0.0);
+    }
+    // Ensure lo <= hi for the day-count.
+    let (lo_serial, hi_serial) = if s_start <= s_end {
+        (s_start, s_end)
+    } else {
+        (s_end, s_start)
+    };
+    let (ly, lm, ld) = match serial_to_ymd(lo_serial, ctx.date_system) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let (hy, hm, hd) = match serial_to_ymd(hi_serial, ctx.date_system) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let actual_days = (hi_serial.trunc() - lo_serial.trunc()).abs();
+    let frac = match basis {
+        2 => actual_days / 360.0,
+        3 => actual_days / 365.0,
+        1 => {
+            // Actual/actual: split by year boundary or use
+            // average-year-length. Use the Excel-canon simple rule:
+            // if start and end are in the same year, use that year's
+            // length. Otherwise, use 365.25 as an approximation. (Excel
+            // uses a more elaborate algorithm; basis 1 is the most
+            // complex basis. V1 approximation; pin Phase 4.10.)
+            if ly == hy {
+                let year_len = if is_leap_year(ly) { 366.0 } else { 365.0 };
+                actual_days / year_len
+            } else {
+                actual_days / 365.25
+            }
+        }
+        0 | 4 => {
+            // European 30/360 (V1 also serves basis 0; see GAP-F-11).
+            let days_360 = 360.0 * (hy as f64 - ly as f64)
+                + 30.0 * (hm as f64 - lm as f64)
+                + (hd as f64 - ld as f64);
+            days_360 / 360.0
+        }
+        _ => unreachable!("basis range checked above"),
+    };
+    // Preserve sign: if user passed end < start, return negative frac.
+    Value::Number(if s_start <= s_end { frac } else { -frac })
+}
+
+#[cfg(test)]
+mod tests_wave3 {
+    use super::*;
+
+    fn ctx_1900() -> EvalContext {
+        EvalContext::default()
+    }
+    fn n(x: f64) -> Value {
+        Value::Number(x)
+    }
+
+    // ===== DAYS =====
+
+    #[test]
+    fn days_basic_subtraction() {
+        assert_eq!(days(&[n(100.0), n(50.0)]), n(50.0));
+        assert_eq!(days(&[n(50.0), n(100.0)]), n(-50.0));
+        assert_eq!(days(&[n(0.0), n(0.0)]), n(0.0));
+    }
+
+    #[test]
+    fn days_truncates_fractional() {
+        assert_eq!(days(&[n(100.9), n(50.1)]), n(50.0));
+    }
+
+    #[test]
+    fn days_text_arg_is_value_error_v1_divergence() {
+        // V1: text args not parsed (GAP-F-08). Use DATEVALUE explicitly.
+        assert_eq!(
+            days(&[Value::text("2024-01-01"), n(50.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn days_arity_error() {
+        assert_eq!(days(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(days(&[n(1.0)]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            days(&[n(1.0), n(2.0), n(3.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== NETWORKDAYS =====
+
+    #[test]
+    fn networkdays_single_week() {
+        // 2024-01-01 (Mon) to 2024-01-05 (Fri) = 5 working days inclusive.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        assert_eq!(networkdays_ctx(&[start, end], &ctx_1900()), n(5.0));
+    }
+
+    #[test]
+    fn networkdays_includes_endpoints_skips_weekend() {
+        // 2024-01-05 (Fri) to 2024-01-08 (Mon) = 2 working days
+        // (Fri + Mon; weekend skipped).
+        let start = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(1.0), n(8.0)], &ctx_1900());
+        assert_eq!(networkdays_ctx(&[start, end], &ctx_1900()), n(2.0));
+    }
+
+    #[test]
+    fn networkdays_full_week_window() {
+        // 2024-01-01 (Mon) to 2024-01-07 (Sun) = 5 working days.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(1.0), n(7.0)], &ctx_1900());
+        assert_eq!(networkdays_ctx(&[start, end], &ctx_1900()), n(5.0));
+    }
+
+    #[test]
+    fn networkdays_negative_when_end_before_start() {
+        // End < start → negative count.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        assert_eq!(networkdays_ctx(&[start, end], &ctx_1900()), n(-5.0));
+    }
+
+    #[test]
+    fn networkdays_with_holidays_arg_is_value_error_v1_divergence() {
+        // GAP-F-09: 3-arg form not supported in V1.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        assert_eq!(
+            networkdays_ctx(&[start, end, n(0.0)], &ctx_1900()),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== WORKDAY =====
+
+    #[test]
+    fn workday_forward_simple() {
+        // 2024-01-01 (Mon) + 4 working days = 2024-01-05 (Fri).
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let expected = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        assert_eq!(workday_ctx(&[start, n(4.0)], &ctx_1900()), expected);
+    }
+
+    #[test]
+    fn workday_crosses_weekend() {
+        // 2024-01-05 (Fri) + 1 working day = 2024-01-08 (Mon).
+        let start = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        let expected = date_ctx(&[n(2024.0), n(1.0), n(8.0)], &ctx_1900());
+        assert_eq!(workday_ctx(&[start, n(1.0)], &ctx_1900()), expected);
+    }
+
+    #[test]
+    fn workday_backward() {
+        // 2024-01-08 (Mon) - 1 working day = 2024-01-05 (Fri).
+        let start = date_ctx(&[n(2024.0), n(1.0), n(8.0)], &ctx_1900());
+        let expected = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        assert_eq!(workday_ctx(&[start, n(-1.0)], &ctx_1900()), expected);
+    }
+
+    #[test]
+    fn workday_zero_days_returns_start() {
+        let start = date_ctx(&[n(2024.0), n(1.0), n(5.0)], &ctx_1900());
+        assert_eq!(workday_ctx(&[start.clone(), n(0.0)], &ctx_1900()), start);
+    }
+
+    #[test]
+    fn workday_with_holidays_arg_is_value_error_v1_divergence() {
+        // GAP-F-10: 3-arg form not supported.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        assert_eq!(
+            workday_ctx(&[start, n(1.0), n(0.0)], &ctx_1900()),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== YEARFRAC =====
+
+    #[test]
+    fn yearfrac_basis_3_actual_365() {
+        // 2024-01-01 to 2025-01-01 = 366 days / 365 = ~1.0027.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2025.0), n(1.0), n(1.0)], &ctx_1900());
+        if let Value::Number(v) = yearfrac_ctx(&[start, end, n(3.0)], &ctx_1900()) {
+            assert!((v - 366.0 / 365.0).abs() < 1e-9);
+        } else {
+            panic!("expected Number");
+        }
+    }
+
+    #[test]
+    fn yearfrac_basis_2_actual_360() {
+        // 2024-01-01 to 2024-12-31 = 365 days / 360 ~ 1.0139.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(12.0), n(31.0)], &ctx_1900());
+        if let Value::Number(v) = yearfrac_ctx(&[start, end, n(2.0)], &ctx_1900()) {
+            assert!((v - 365.0 / 360.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn yearfrac_basis_4_european_30_360() {
+        // 2024-01-01 to 2024-12-31 in European 30/360.
+        // (360*0 + 30*11 + (31-1)) / 360 = (0 + 330 + 30) / 360 = 1.0
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(12.0), n(31.0)], &ctx_1900());
+        if let Value::Number(v) = yearfrac_ctx(&[start, end, n(4.0)], &ctx_1900()) {
+            assert!((v - 1.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn yearfrac_basis_1_same_leap_year() {
+        // 2024-01-01 to 2024-12-31 in actual/actual (leap year = 366).
+        // = 365 / 366 (Jan 1 to Dec 31 is 365 days, not 366).
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(12.0), n(31.0)], &ctx_1900());
+        if let Value::Number(v) = yearfrac_ctx(&[start, end, n(1.0)], &ctx_1900()) {
+            assert!((v - 365.0 / 366.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn yearfrac_default_basis_is_zero() {
+        // No 3rd arg → basis 0.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(12.0), n(31.0)], &ctx_1900());
+        let with_default = yearfrac_ctx(&[start.clone(), end.clone()], &ctx_1900());
+        let with_explicit_0 = yearfrac_ctx(&[start, end, n(0.0)], &ctx_1900());
+        assert_eq!(with_default, with_explicit_0);
+    }
+
+    #[test]
+    fn yearfrac_zero_for_same_date() {
+        let s = date_ctx(&[n(2024.0), n(7.0), n(4.0)], &ctx_1900());
+        assert_eq!(yearfrac_ctx(&[s.clone(), s.clone()], &ctx_1900()), n(0.0));
+    }
+
+    #[test]
+    fn yearfrac_invalid_basis_is_num_error() {
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(12.0), n(31.0)], &ctx_1900());
+        assert_eq!(
+            yearfrac_ctx(&[start.clone(), end.clone(), n(5.0)], &ctx_1900()),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            yearfrac_ctx(&[start, end, n(-1.0)], &ctx_1900()),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn yearfrac_arity_error() {
+        let s = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        assert_eq!(
+            yearfrac_ctx(std::slice::from_ref(&s), &ctx_1900()),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            yearfrac_ctx(&[s.clone(), s.clone(), n(0.0), n(0.0)], &ctx_1900()),
+            Value::Error(ErrorValue::Value)
+        );
     }
 }
 

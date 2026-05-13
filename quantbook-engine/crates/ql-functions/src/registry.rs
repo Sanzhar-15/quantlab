@@ -373,6 +373,15 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_context_aware("EOMONTH", date_fns::eomonth_ctx);
     r.register_context_aware("EDATE", date_fns::edate_ctx);
 
+    // **W5-74 (Phase 4.5.B wave 3, CLOSES V1 wave 18/18):** business-date
+    // + finance basics. DAYS is ScalarFn (pure subtraction); the rest
+    // are ContextAwareFn. Holidays arg unsupported in V1 (see GAP-F-09,
+    // GAP-F-10) — 3-arg NETWORKDAYS/WORKDAY returns #VALUE!.
+    r.register("DAYS", date_fns::days);
+    r.register_context_aware("NETWORKDAYS", date_fns::networkdays_ctx);
+    r.register_context_aware("WORKDAY", date_fns::workday_ctx);
+    r.register_context_aware("YEARFRAC", date_fns::yearfrac_ctx);
+
     // Engine Phase 4.3 V2 batch — range-aware (W5-53, GAP-F-05
     // closure). These use the new `RangeAwareFn` table because the
     // existing `ScalarFn = fn(&[Value]) -> Value` contract can't
@@ -457,8 +466,9 @@ mod tests {
         // CONCAT = 6) + Phase 4.5.B wave 1 (W5-72: DATE, YEAR,
         // MONTH, DAY, HOUR, MINUTE, SECOND, TIME = 8) + Phase 4.5.B
         // wave 2 (W5-73: DATEVALUE, TIMEVALUE, WEEKDAY, EOMONTH,
-        // EDATE = 5).
-        assert_eq!(r.len(), 121);
+        // EDATE = 5) + Phase 4.5.B wave 3 (W5-74: DAYS, NETWORKDAYS,
+        // WORKDAY, YEARFRAC = 4 — CLOSES V1 wave 18/18).
+        assert_eq!(r.len(), 125);
     }
 
     #[test]

@@ -204,6 +204,19 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
     ("WEEKDAY", "W5-73; covered by date_fns::tests_wave2"),
     ("EOMONTH", "W5-73; covered by date_fns::tests_wave2"),
     ("EDATE", "W5-73; covered by date_fns::tests_wave2"),
+    ("DAYS", "W5-74; covered by date_fns::tests_wave3"),
+    (
+        "NETWORKDAYS",
+        "W5-74; V1 no-holidays — GAP-F-09 pinned by tests_wave3",
+    ),
+    (
+        "WORKDAY",
+        "W5-74; V1 no-holidays — GAP-F-10 pinned by tests_wave3",
+    ),
+    (
+        "YEARFRAC",
+        "W5-74; V1 simplified 30/360 — GAP-F-11 pinned by tests_wave3",
+    ),
     // Range-aware
     ("SUMIF", "wildcards + V1 anchoring divergence in matrix"),
     ("COUNTIF", "wildcards covered in matrix"),
