@@ -217,6 +217,10 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "YEARFRAC",
         "W5-74; V1 simplified 30/360 — GAP-F-11 pinned by tests_wave3",
     ),
+    ("DATEDIF", "W5-75 V2; covered by date_fns::tests_wave_c"),
+    ("DAYS360", "W5-75 V2; covered by date_fns::tests_wave_c"),
+    ("WEEKNUM", "W5-75 V2; covered by date_fns::tests_wave_c"),
+    ("ISOWEEKNUM", "W5-75 V2; covered by date_fns::tests_wave_c"),
     // Range-aware
     ("SUMIF", "wildcards + V1 anchoring divergence in matrix"),
     ("COUNTIF", "wildcards covered in matrix"),

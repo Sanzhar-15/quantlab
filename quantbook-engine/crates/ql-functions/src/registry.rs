@@ -382,6 +382,14 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_context_aware("WORKDAY", date_fns::workday_ctx);
     r.register_context_aware("YEARFRAC", date_fns::yearfrac_ctx);
 
+    // **W5-75 (Phase 4.5.C V2 wave, 4 of 6):** date-arithmetic V2 fns.
+    // NETWORKDAYS.INTL + WORKDAY.INTL deferred (carry GAP-F-09/10
+    // tier-4 dependency).
+    r.register_context_aware("DATEDIF", date_fns::datedif_ctx);
+    r.register_context_aware("DAYS360", date_fns::days360_ctx);
+    r.register_context_aware("WEEKNUM", date_fns::weeknum_ctx);
+    r.register_context_aware("ISOWEEKNUM", date_fns::isoweeknum_ctx);
+
     // Engine Phase 4.3 V2 batch — range-aware (W5-53, GAP-F-05
     // closure). These use the new `RangeAwareFn` table because the
     // existing `ScalarFn = fn(&[Value]) -> Value` contract can't
@@ -467,8 +475,10 @@ mod tests {
         // MONTH, DAY, HOUR, MINUTE, SECOND, TIME = 8) + Phase 4.5.B
         // wave 2 (W5-73: DATEVALUE, TIMEVALUE, WEEKDAY, EOMONTH,
         // EDATE = 5) + Phase 4.5.B wave 3 (W5-74: DAYS, NETWORKDAYS,
-        // WORKDAY, YEARFRAC = 4 — CLOSES V1 wave 18/18).
-        assert_eq!(r.len(), 125);
+        // WORKDAY, YEARFRAC = 4 — CLOSES V1 wave 18/18) + Phase 4.5.C
+        // V2 wave (W5-75: DATEDIF, DAYS360, WEEKNUM, ISOWEEKNUM = 4
+        // of 6; NETWORKDAYS.INTL + WORKDAY.INTL deferred to tier-4).
+        assert_eq!(r.len(), 129);
     }
 
     #[test]

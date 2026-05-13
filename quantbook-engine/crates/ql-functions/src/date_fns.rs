@@ -811,6 +811,525 @@ pub fn yearfrac_ctx(args: &[Value], ctx: &EvalContext) -> Value {
     Value::Number(if s_start <= s_end { frac } else { -frac })
 }
 
+// ============================================================================
+// W5-75 — DATEDIF, DAYS360, WEEKNUM, ISOWEEKNUM (Phase 4.5.C V2 wave, 4 of 6)
+// ============================================================================
+
+/// **`DATEDIF(start, end, unit)`** — date-difference with unit modes.
+/// Excel-canon undocumented but widely used.
+///
+/// Units (case-insensitive):
+/// - `"Y"` — complete years between start and end
+/// - `"M"` — complete months
+/// - `"D"` — total days (same as `end - start` truncated)
+/// - `"YM"` — months ignoring years (0..=11)
+/// - `"YD"` — days ignoring years
+/// - `"MD"` — days ignoring months and years (CAUTION: this unit has
+///   historically reported wrong results in real Excel for some dates;
+///   we implement the documented intent, which may diverge from real
+///   Excel's buggy output)
+///
+/// Negative result (start > end) → `#NUM!` per Excel canon.
+pub fn datedif_ctx(args: &[Value], ctx: &EvalContext) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let start = match to_serial_arg(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let end = match to_serial_arg(&args[1]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let unit = match &args[2] {
+        Value::Text(s) => s.as_ref().to_ascii_uppercase(),
+        Value::Error(e) => return Value::Error(*e),
+        _ => return Value::Error(ErrorValue::Value),
+    };
+    if start > end {
+        return Value::Error(ErrorValue::Num);
+    }
+    let (sy, sm, sd) = match serial_to_ymd(start, ctx.date_system) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let (ey, em, ed) = match serial_to_ymd(end, ctx.date_system) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let result: f64 = match unit.as_str() {
+        "Y" => {
+            let mut years = ey - sy;
+            // Subtract 1 if we haven't reached the anniversary yet.
+            if (em, ed) < (sm, sd) {
+                years -= 1;
+            }
+            years as f64
+        }
+        "M" => {
+            let mut months = (ey - sy) * 12 + (em as i32 - sm as i32);
+            if ed < sd {
+                months -= 1;
+            }
+            months as f64
+        }
+        "D" => end.trunc() - start.trunc(),
+        "YM" => {
+            let mut months = (em as i32 - sm as i32).rem_euclid(12);
+            if ed < sd {
+                months -= 1;
+                if months < 0 {
+                    months += 12;
+                }
+            }
+            months as f64
+        }
+        "YD" => {
+            // Days from (sy, sm, sd) to the same date in ey (i.e., the
+            // anniversary), then days from that to (ey, em, ed).
+            // Simpler: compute days from (sy, sm, sd) to (ey, em, ed)
+            // ignoring full-year multiples.
+            let anniversary_year = if (em, ed) >= (sm, sd) { ey } else { ey - 1 };
+            // Phantom-aware year-start: if anniversary date falls into
+            // Excel1900 feb 29 territory, ymd_to_serial handles it.
+            let anniv_serial = match ymd_to_serial(anniversary_year, sm, sd, ctx.date_system) {
+                Ok(s) => s,
+                Err(_) => {
+                    // (sm, sd) might be (2, 29) on a non-leap anniversary year — clamp.
+                    let clamped_d = sd.min(days_in_month(anniversary_year, sm));
+                    match ymd_to_serial(anniversary_year, sm, clamped_d, ctx.date_system) {
+                        Ok(s) => s,
+                        Err(e) => return Value::Error(e),
+                    }
+                }
+            };
+            end.trunc() - anniv_serial.trunc()
+        }
+        "MD" => {
+            // Days ignoring months and years. Excel's documented intent:
+            // (end_day - start_day) if end_day >= start_day, else end_day
+            // + (days in start's month - start_day).
+            if ed >= sd {
+                (ed - sd) as f64
+            } else {
+                let dim = days_in_month(sy, sm);
+                ((ed + dim) - sd) as f64
+            }
+        }
+        _ => return Value::Error(ErrorValue::Num),
+    };
+    Value::Number(result)
+}
+
+/// **`DAYS360(start, end, [method])`** — 360-day year day-count.
+/// `method = FALSE` (default) = US NASD; `method = TRUE` = European.
+/// Returns `(360*Δy + 30*Δm + Δd)` under the chosen day-adjustment.
+///
+/// **V1 simplification (carries GAP-F-11 spirit):** US NASD's
+/// end-of-month special-casing is partially implemented (d=31 → 30
+/// rule). European method (no special-casing beyond day-31 → 30) is
+/// the simpler path; both share most code.
+///
+/// Returns negative when end < start.
+pub fn days360_ctx(args: &[Value], ctx: &EvalContext) -> Value {
+    if args.len() < 2 || args.len() > 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let start = match to_serial_arg(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let end = match to_serial_arg(&args[1]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let european: bool = if args.len() == 3 {
+        match &args[2] {
+            Value::Boolean(b) => *b,
+            Value::Number(n) => *n != 0.0,
+            Value::Blank => false,
+            Value::Error(e) => return Value::Error(*e),
+            _ => return Value::Error(ErrorValue::Value),
+        }
+    } else {
+        false
+    };
+    let (sy, sm, mut sd) = match serial_to_ymd(start, ctx.date_system) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let (ey, em, mut ed) = match serial_to_ymd(end, ctx.date_system) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    // Apply day-31 adjustment.
+    if european {
+        if sd == 31 {
+            sd = 30;
+        }
+        if ed == 31 {
+            ed = 30;
+        }
+    } else {
+        // US NASD (simplified):
+        //   if sd == 31, set sd = 30
+        //   if ed == 31 AND sd in {30, 31} (after sd's own adjustment), set ed = 30
+        if sd == 31 {
+            sd = 30;
+        }
+        if ed == 31 && sd == 30 {
+            ed = 30;
+        }
+    }
+    let days = 360 * (ey - sy) + 30 * (em as i32 - sm as i32) + (ed as i32 - sd as i32);
+    Value::Number(days as f64)
+}
+
+/// **`WEEKNUM(serial, [return_type])`** — week number of the year.
+///
+/// Return types (default 1):
+/// - `1` — week starts Sunday; week containing Jan 1 is week 1.
+/// - `2` — week starts Monday; week containing Jan 1 is week 1.
+/// - `11..=17` — week starts on the named day (11=Mon, 12=Tue, ...,
+///   17=Sun); week containing Jan 1 is week 1.
+/// - `21` — ISO 8601 (same as ISOWEEKNUM).
+///
+/// **Algorithm:** for non-ISO return types, find the first day of the
+/// year, walk backward to the prior week-start, then count weeks.
+/// For ISO (21), defer to [`isoweeknum_ctx`].
+pub fn weeknum_ctx(args: &[Value], ctx: &EvalContext) -> Value {
+    if args.is_empty() || args.len() > 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let serial = match to_serial_arg(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let return_type: i64 = if args.len() == 2 {
+        match to_int_date_arg(&args[1]) {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        1
+    };
+    if return_type == 21 {
+        return isoweeknum_ctx(&[args[0].clone()], ctx);
+    }
+    // Determine week-start day-of-week (0=Sun..6=Sat).
+    let week_start_dow: i64 = match return_type {
+        1 | 17 => 0, // Sunday
+        2 | 11 => 1, // Monday
+        12 => 2,
+        13 => 3,
+        14 => 4,
+        15 => 5,
+        16 => 6,
+        _ => return Value::Error(ErrorValue::Num),
+    };
+    let (y, _, _) = match serial_to_ymd(serial, ctx.date_system) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    // Compute the serial for Jan 1 of `y` under ctx.date_system.
+    let jan1_serial = match ymd_to_serial(y, 1, 1, ctx.date_system) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    // Compute jan1's day-of-week using the bug-aware formula.
+    let jan1_int = jan1_serial.trunc() as i64;
+    let jan1_dow_sun_zero: i64 = match ctx.date_system {
+        DateSystem::Excel1900 => (jan1_int - 1).rem_euclid(7),
+        DateSystem::Excel1904 => (jan1_int + 5).rem_euclid(7),
+    };
+    // Days from jan1 back to the prior week-start.
+    let offset = (jan1_dow_sun_zero - week_start_dow).rem_euclid(7);
+    let week_anchor_int = jan1_int - offset;
+    let serial_int = serial.trunc() as i64;
+    if serial_int < week_anchor_int {
+        return Value::Error(ErrorValue::Num);
+    }
+    let days_since = serial_int - week_anchor_int;
+    let week_num = days_since / 7 + 1;
+    Value::Number(week_num as f64)
+}
+
+/// **`ISOWEEKNUM(serial)`** — ISO 8601 week number.
+///
+/// ISO 8601 rules:
+/// - Week starts on Monday.
+/// - Week 1 is the week containing the year's first Thursday.
+/// - Last few days of December may belong to week 1 of the next year;
+///   first few days of January may belong to week 52/53 of the prior year.
+///
+/// Standard algorithm: take the Thursday of `serial`'s week (anchor),
+/// find which year that Thursday belongs to (the "ISO year"), then count
+/// from Jan 4 of that ISO year (which is always in week 1).
+pub fn isoweeknum_ctx(args: &[Value], ctx: &EvalContext) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let serial = match to_serial_arg(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    if serial < 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let serial_int = serial.trunc() as i64;
+    // Day-of-week, Mon-indexed (0=Mon..6=Sun).
+    let dow_sun_zero: i64 = match ctx.date_system {
+        DateSystem::Excel1900 => (serial_int - 1).rem_euclid(7),
+        DateSystem::Excel1904 => (serial_int + 5).rem_euclid(7),
+    };
+    let dow_mon_zero = (dow_sun_zero + 6).rem_euclid(7); // 0=Mon..6=Sun
+                                                         // Anchor: this week's Thursday (3 in Mon-indexed).
+    let thursday_int = serial_int + (3 - dow_mon_zero);
+    let thursday_serial = thursday_int as f64;
+    let (iso_y, _, _) = match serial_to_ymd(thursday_serial, ctx.date_system) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    // Jan 4 of iso_y is always in week 1. Find its Monday (week-1 anchor).
+    let jan4_serial = match ymd_to_serial(iso_y, 1, 4, ctx.date_system) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let jan4_int = jan4_serial.trunc() as i64;
+    let jan4_dow_sun_zero: i64 = match ctx.date_system {
+        DateSystem::Excel1900 => (jan4_int - 1).rem_euclid(7),
+        DateSystem::Excel1904 => (jan4_int + 5).rem_euclid(7),
+    };
+    let jan4_dow_mon_zero = (jan4_dow_sun_zero + 6).rem_euclid(7);
+    let week1_monday_int = jan4_int - jan4_dow_mon_zero;
+    // Find this week's Monday.
+    let this_monday_int = serial_int - dow_mon_zero;
+    let week_num = (this_monday_int - week1_monday_int) / 7 + 1;
+    Value::Number(week_num as f64)
+}
+
+#[cfg(test)]
+mod tests_wave_c {
+    use super::*;
+
+    fn ctx_1900() -> EvalContext {
+        EvalContext::default()
+    }
+    fn n(x: f64) -> Value {
+        Value::Number(x)
+    }
+    fn t(s: &str) -> Value {
+        Value::text(s.to_string())
+    }
+
+    // ===== DATEDIF =====
+
+    #[test]
+    fn datedif_y_complete_years() {
+        let start = date_ctx(&[n(2020.0), n(1.0), n(15.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(1.0), n(15.0)], &ctx_1900());
+        assert_eq!(datedif_ctx(&[start, end, t("Y")], &ctx_1900()), n(4.0));
+    }
+
+    #[test]
+    fn datedif_y_partial_year_rounds_down() {
+        // 2020-01-15 to 2024-01-14 = 3 complete years (not 4).
+        let start = date_ctx(&[n(2020.0), n(1.0), n(15.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(1.0), n(14.0)], &ctx_1900());
+        assert_eq!(datedif_ctx(&[start, end, t("Y")], &ctx_1900()), n(3.0));
+    }
+
+    #[test]
+    fn datedif_m_complete_months() {
+        let start = date_ctx(&[n(2024.0), n(1.0), n(15.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(7.0), n(15.0)], &ctx_1900());
+        assert_eq!(datedif_ctx(&[start, end, t("M")], &ctx_1900()), n(6.0));
+    }
+
+    #[test]
+    fn datedif_d_total_days() {
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(1.0), n(31.0)], &ctx_1900());
+        assert_eq!(datedif_ctx(&[start, end, t("D")], &ctx_1900()), n(30.0));
+    }
+
+    #[test]
+    fn datedif_ym_months_ignoring_years() {
+        // 2020-01-15 to 2024-07-15 = 4 years + 6 months. YM = 6.
+        let start = date_ctx(&[n(2020.0), n(1.0), n(15.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(7.0), n(15.0)], &ctx_1900());
+        assert_eq!(datedif_ctx(&[start, end, t("YM")], &ctx_1900()), n(6.0));
+    }
+
+    #[test]
+    fn datedif_md_days_ignoring_months_and_years() {
+        // 2020-01-05 to 2024-03-20 = "MD" = 20 - 5 = 15.
+        let start = date_ctx(&[n(2020.0), n(1.0), n(5.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(3.0), n(20.0)], &ctx_1900());
+        assert_eq!(datedif_ctx(&[start, end, t("MD")], &ctx_1900()), n(15.0));
+    }
+
+    #[test]
+    fn datedif_md_end_day_before_start_day_wraps() {
+        // 2020-01-25 to 2024-03-05. MD: start month is Jan (31 days).
+        // ed (5) < sd (25), so result = (5 + 31) - 25 = 11.
+        let start = date_ctx(&[n(2020.0), n(1.0), n(25.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(3.0), n(5.0)], &ctx_1900());
+        assert_eq!(datedif_ctx(&[start, end, t("MD")], &ctx_1900()), n(11.0));
+    }
+
+    #[test]
+    fn datedif_negative_is_num_error() {
+        let start = date_ctx(&[n(2024.0), n(1.0), n(15.0)], &ctx_1900());
+        let end = date_ctx(&[n(2020.0), n(1.0), n(15.0)], &ctx_1900());
+        assert_eq!(
+            datedif_ctx(&[start, end, t("Y")], &ctx_1900()),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn datedif_invalid_unit_is_num_error() {
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(12.0), n(31.0)], &ctx_1900());
+        assert_eq!(
+            datedif_ctx(&[start, end, t("X")], &ctx_1900()),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn datedif_unit_case_insensitive() {
+        let start = date_ctx(&[n(2020.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        assert_eq!(
+            datedif_ctx(&[start.clone(), end.clone(), t("y")], &ctx_1900()),
+            n(4.0)
+        );
+    }
+
+    // ===== DAYS360 =====
+
+    #[test]
+    fn days360_full_year_us() {
+        // 2024-01-01 to 2025-01-01 in US 30/360 = 360.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let end = date_ctx(&[n(2025.0), n(1.0), n(1.0)], &ctx_1900());
+        assert_eq!(days360_ctx(&[start, end], &ctx_1900()), n(360.0));
+    }
+
+    #[test]
+    fn days360_one_month_us() {
+        // 2024-01-15 to 2024-02-15 = 30.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(15.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(2.0), n(15.0)], &ctx_1900());
+        assert_eq!(days360_ctx(&[start, end], &ctx_1900()), n(30.0));
+    }
+
+    #[test]
+    fn days360_day_31_adjustment_us() {
+        // 2024-01-31 to 2024-02-29. US: sd=31→30, ed stays (sd not 31 now? No: post-adj sd=30,
+        // ed=29; ed != 31 so no further adj. Result = 30*(2-1) + (29-30) = 29.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(31.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(2.0), n(29.0)], &ctx_1900());
+        assert_eq!(days360_ctx(&[start, end], &ctx_1900()), n(29.0));
+    }
+
+    #[test]
+    fn days360_european_method() {
+        // 2024-01-31 to 2024-03-31, European: both 31→30. = 360*0 + 30*2 + 0 = 60.
+        let start = date_ctx(&[n(2024.0), n(1.0), n(31.0)], &ctx_1900());
+        let end = date_ctx(&[n(2024.0), n(3.0), n(31.0)], &ctx_1900());
+        assert_eq!(
+            days360_ctx(&[start, end, Value::Boolean(true)], &ctx_1900()),
+            n(60.0)
+        );
+    }
+
+    // ===== WEEKNUM =====
+
+    #[test]
+    fn weeknum_default_return_type_1_jan_1_2024() {
+        // 2024-01-01 = Monday. Default RT=1 (week starts Sunday).
+        // Jan 1 2024 is in the week starting Sunday 2023-12-31, but
+        // since 2023-12-31 is in 2023, the week containing Jan 1 of
+        // 2024 starts at the last Sunday before/on Jan 1 = Dec 31
+        // 2023. So Jan 1 2024 is in "week 1 of 2024" (the week
+        // containing Jan 1). Result = 1.
+        let serial = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        assert_eq!(weeknum_ctx(&[serial], &ctx_1900()), n(1.0));
+    }
+
+    #[test]
+    fn weeknum_return_type_2_mon_start() {
+        // Jan 1 2024 is a Monday; RT=2 (Mon-start) → week 1.
+        let serial = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        assert_eq!(weeknum_ctx(&[serial, n(2.0)], &ctx_1900()), n(1.0));
+    }
+
+    #[test]
+    fn weeknum_mid_year() {
+        // 2024-07-04 (Thursday) — somewhere in mid-year, ~week 27.
+        let serial = date_ctx(&[n(2024.0), n(7.0), n(4.0)], &ctx_1900());
+        if let Value::Number(w) = weeknum_ctx(&[serial], &ctx_1900()) {
+            assert!((27.0..=28.0).contains(&w), "expected ~27, got {w}");
+        } else {
+            panic!("expected Number");
+        }
+    }
+
+    #[test]
+    fn weeknum_invalid_return_type_is_num_error() {
+        let serial = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        assert_eq!(
+            weeknum_ctx(&[serial, n(99.0)], &ctx_1900()),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    // ===== ISOWEEKNUM =====
+
+    #[test]
+    fn isoweeknum_mid_year_thursday() {
+        // 2024-07-04 = Thursday. ISO week ~27.
+        let serial = date_ctx(&[n(2024.0), n(7.0), n(4.0)], &ctx_1900());
+        if let Value::Number(w) = isoweeknum_ctx(&[serial], &ctx_1900()) {
+            assert!((26.0..=28.0).contains(&w), "expected ~27, got {w}");
+        }
+    }
+
+    #[test]
+    fn isoweeknum_jan_1_2024_is_week_1() {
+        // 2024-01-01 is a Monday — definitively ISO week 1.
+        let serial = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        assert_eq!(isoweeknum_ctx(&[serial], &ctx_1900()), n(1.0));
+    }
+
+    #[test]
+    fn isoweeknum_jan_1_2023_is_week_52_of_prior_year() {
+        // 2023-01-01 was a Sunday. ISO week 1 of 2023 starts Mon Jan 2.
+        // So Jan 1 2023 is week 52 of 2022.
+        let serial = date_ctx(&[n(2023.0), n(1.0), n(1.0)], &ctx_1900());
+        assert_eq!(isoweeknum_ctx(&[serial], &ctx_1900()), n(52.0));
+    }
+
+    #[test]
+    fn isoweeknum_dec_31_2018_is_week_1_of_2019() {
+        // 2018-12-31 was a Monday. ISO week 1 of 2019 starts that day.
+        let serial = date_ctx(&[n(2018.0), n(12.0), n(31.0)], &ctx_1900());
+        assert_eq!(isoweeknum_ctx(&[serial], &ctx_1900()), n(1.0));
+    }
+
+    #[test]
+    fn weeknum_return_type_21_delegates_to_isoweeknum() {
+        let serial = date_ctx(&[n(2024.0), n(1.0), n(1.0)], &ctx_1900());
+        let weeknum = weeknum_ctx(&[serial.clone(), n(21.0)], &ctx_1900());
+        let iso = isoweeknum_ctx(&[serial], &ctx_1900());
+        assert_eq!(weeknum, iso);
+    }
+}
+
 #[cfg(test)]
 mod tests_wave3 {
     use super::*;
