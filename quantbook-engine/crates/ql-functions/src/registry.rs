@@ -151,6 +151,17 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("ISNA", scalar_fns::isna);
     r.register("ISERR", scalar_fns::iserr);
 
+    // Engine Phase 4.3 V2 batch #1 (W5-51, 2026-05-13): trigonometry.
+    // All scalar, single-arg except ATAN2 (two args). Inputs/outputs
+    // in radians; pair with DEGREES/RADIANS for degree-mode math.
+    r.register("SIN", scalar_fns::sin);
+    r.register("COS", scalar_fns::cos);
+    r.register("TAN", scalar_fns::tan);
+    r.register("ASIN", scalar_fns::asin);
+    r.register("ACOS", scalar_fns::acos);
+    r.register("ATAN", scalar_fns::atan);
+    r.register("ATAN2", scalar_fns::atan2);
+
     // Engine Phase 3.7 (W5-40, 2026-05-12): volatile functions. The
     // `is_volatile_function` whitelist in `ql-exec::calcgraph_session`
     // already covers these names; this registration is the executable
@@ -178,13 +189,14 @@ mod tests {
     #[test]
     fn default_registry_has_expected_count() {
         let r = default_registry();
-        // 52 entries — Phase 0 W4-4 (22 functions + 3 aliases = 25) +
+        // 59 entries — Phase 0 W4-4 (22 functions + 3 aliases = 25) +
         // AI sentinel (1) + Phase 3.7 volatiles (NOW/TODAY/RAND/
         // RANDBETWEEN = 4) + Phase 4.3 V1 wave 1 (ROUNDUP, ROUNDDOWN,
         // TRUNC, SIGN, EXP, LN, LOG, LOG10, PI, DEGREES, RADIANS, LEN,
         // UPPER, LOWER, TRIM, ISNUMBER, ISTEXT, ISBLANK, ISLOGICAL,
-        // ISERROR, ISNA, ISERR = 22).
-        assert_eq!(r.len(), 52);
+        // ISERROR, ISNA, ISERR = 22) + Phase 4.3 V2 trig (W5-51:
+        // SIN, COS, TAN, ASIN, ACOS, ATAN, ATAN2 = 7).
+        assert_eq!(r.len(), 59);
     }
 
     #[test]

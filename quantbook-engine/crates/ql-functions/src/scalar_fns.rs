@@ -712,6 +712,141 @@ pub fn radians(args: &[Value]) -> Value {
     }
 }
 
+// ===== Trigonometry (Phase 4.3 V2, W5-51) =====
+//
+// Excel canon: SIN / COS / TAN / SINH / COSH / TANH take an angle in
+// RADIANS. Use RADIANS(deg) if input is in degrees. ASIN / ACOS / ATAN /
+// ATAN2 RETURN radians.
+//
+// Domain errors → #NUM!:
+//   - ASIN(x), ACOS(x): |x| > 1
+//   - ATAN2(0, 0): both args zero (per Excel; Rust f64::atan2 returns 0)
+//   - SINH(x), COSH(x): very large |x| may overflow to ±Inf — sanitize
+//     surfaces as #NUM!.
+//
+// TAN(pi/2) does NOT error in Excel — it returns a huge but finite
+// float (≈1.6e16). The IEEE 754 result of `(π/2).tan()` is finite
+// because π/2 cannot be exactly represented; sanitize_f64 lets it
+// through. Matches IronCalc behavior.
+
+/// `SIN(angle_in_radians)` — sine. Standard f64 sin.
+pub fn sin(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    match coercion::sanitize_f64(n.sin()) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `COS(angle_in_radians)` — cosine. Standard f64 cos.
+pub fn cos(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    match coercion::sanitize_f64(n.cos()) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `TAN(angle_in_radians)` — tangent. Excel does NOT error at
+/// asymptotes; the IEEE 754 result of `(π/2).tan()` is finite (the
+/// argument isn't exactly π/2 in floating point). `sanitize_f64`
+/// surfaces a NaN or non-finite result as `#NUM!`.
+pub fn tan(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    match coercion::sanitize_f64(n.tan()) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `ASIN(value)` — arc sine. Returns radians in `[-π/2, π/2]`. Domain
+/// `|value| > 1` → `#NUM!` (matches Excel; Rust returns NaN which
+/// `sanitize_f64` would also surface as `#NUM!`, but we check
+/// up-front for the canonical error message and to avoid relying on
+/// NaN-propagation behavior).
+pub fn asin(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    if !(-1.0..=1.0).contains(&n) {
+        return Value::Error(ErrorValue::Num);
+    }
+    match coercion::sanitize_f64(n.asin()) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `ACOS(value)` — arc cosine. Returns radians in `[0, π]`. Domain
+/// `|value| > 1` → `#NUM!`.
+pub fn acos(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    if !(-1.0..=1.0).contains(&n) {
+        return Value::Error(ErrorValue::Num);
+    }
+    match coercion::sanitize_f64(n.acos()) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `ATAN(value)` — arc tangent. Returns radians in `(-π/2, π/2)`.
+/// Total domain: any real input.
+pub fn atan(args: &[Value]) -> Value {
+    let n = match one_number(args, 1, 1) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    match coercion::sanitize_f64(n.atan()) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `ATAN2(y, x)` — two-argument arc tangent. Returns radians in
+/// `(-π, π]`. Excel argument order is `ATAN2(x, y)` historically —
+/// but the W3C / OOXML standard and modern Excel use `ATAN2(x_num,
+/// y_num)`. Per IronCalc + the W3C reference, Quantbook follows
+/// `ATAN2(x, y)` order: first arg is x, second is y. Returns
+/// `#DIV/0!` if both args are zero (Excel canon; Rust's `f64::atan2`
+/// would return 0.0 in that case, which is wrong).
+pub fn atan2(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let x = match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => n,
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    let y = match coerce_numeric(&args[1]) {
+        NumericArg::Number(n) => n,
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    if x == 0.0 && y == 0.0 {
+        return Value::Error(ErrorValue::DivZero);
+    }
+    // Excel arg order is (x, y); Rust's f64::atan2 is (y, x).
+    match coercion::sanitize_f64(y.atan2(x)) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
 // ===== Text (Phase 4.3 V1) =====
 
 /// Helper: coerce a Value to its display string per Excel canon.
@@ -1548,6 +1683,235 @@ mod tests {
                 f(&[Value::Number(1.0), Value::Number(2.0)]),
                 Value::Error(ErrorValue::Value)
             );
+        }
+    }
+
+    // ===== W5-51 (Phase 4.3 V2): trigonometry tests =====
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn sin_cos_tan_basic_values() {
+        // sin(0) = 0, cos(0) = 1, tan(0) = 0
+        match sin(&[n(0.0)]) {
+            Value::Number(v) => assert!(approx(v, 0.0)),
+            _ => panic!(),
+        }
+        match cos(&[n(0.0)]) {
+            Value::Number(v) => assert!(approx(v, 1.0)),
+            _ => panic!(),
+        }
+        match tan(&[n(0.0)]) {
+            Value::Number(v) => assert!(approx(v, 0.0)),
+            _ => panic!(),
+        }
+
+        // sin(π/2) ≈ 1, cos(π/2) ≈ 0
+        let half_pi = std::f64::consts::FRAC_PI_2;
+        match sin(&[n(half_pi)]) {
+            Value::Number(v) => assert!(approx(v, 1.0)),
+            _ => panic!(),
+        }
+        match cos(&[n(half_pi)]) {
+            Value::Number(v) => assert!(v.abs() < 1e-9),
+            _ => panic!(),
+        }
+
+        // sin(π) ≈ 0, cos(π) ≈ -1
+        match sin(&[n(std::f64::consts::PI)]) {
+            Value::Number(v) => assert!(v.abs() < 1e-9),
+            _ => panic!(),
+        }
+        match cos(&[n(std::f64::consts::PI)]) {
+            Value::Number(v) => assert!(approx(v, -1.0)),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn tan_at_quarter_pi_is_one() {
+        // tan(π/4) = 1.
+        let quarter_pi = std::f64::consts::FRAC_PI_4;
+        match tan(&[n(quarter_pi)]) {
+            Value::Number(v) => assert!(approx(v, 1.0)),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn tan_near_half_pi_is_huge_finite_not_error() {
+        // Excel canon: TAN(PI()/2) returns a huge but finite number,
+        // not an error. The IEEE 754 result of (π/2).tan() is finite
+        // because π/2 cannot be exactly represented in f64.
+        let half_pi = std::f64::consts::FRAC_PI_2;
+        match tan(&[n(half_pi)]) {
+            Value::Number(v) => {
+                assert!(v.is_finite(), "tan(π/2) must be finite, got {v}");
+                assert!(v.abs() > 1e10, "tan(π/2) should be huge, got {v}");
+            }
+            other => panic!("expected huge finite Number, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn asin_acos_atan_basic_inverses() {
+        // asin(0) = 0, asin(1) = π/2
+        match asin(&[n(0.0)]) {
+            Value::Number(v) => assert!(approx(v, 0.0)),
+            _ => panic!(),
+        }
+        match asin(&[n(1.0)]) {
+            Value::Number(v) => assert!(approx(v, std::f64::consts::FRAC_PI_2)),
+            _ => panic!(),
+        }
+        // acos(1) = 0, acos(0) = π/2, acos(-1) = π
+        match acos(&[n(1.0)]) {
+            Value::Number(v) => assert!(approx(v, 0.0)),
+            _ => panic!(),
+        }
+        match acos(&[n(0.0)]) {
+            Value::Number(v) => assert!(approx(v, std::f64::consts::FRAC_PI_2)),
+            _ => panic!(),
+        }
+        match acos(&[n(-1.0)]) {
+            Value::Number(v) => assert!(approx(v, std::f64::consts::PI)),
+            _ => panic!(),
+        }
+        // atan(1) = π/4
+        match atan(&[n(1.0)]) {
+            Value::Number(v) => assert!(approx(v, std::f64::consts::FRAC_PI_4)),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn asin_acos_domain_errors() {
+        // |x| > 1 → #NUM!
+        assert_eq!(asin(&[n(1.5)]), Value::Error(ErrorValue::Num));
+        assert_eq!(asin(&[n(-2.0)]), Value::Error(ErrorValue::Num));
+        assert_eq!(acos(&[n(1.5)]), Value::Error(ErrorValue::Num));
+        assert_eq!(acos(&[n(-2.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn asin_acos_boundary_values_ok() {
+        // |x| == 1 is in domain.
+        assert!(matches!(asin(&[n(1.0)]), Value::Number(_)));
+        assert!(matches!(asin(&[n(-1.0)]), Value::Number(_)));
+        assert!(matches!(acos(&[n(1.0)]), Value::Number(_)));
+        assert!(matches!(acos(&[n(-1.0)]), Value::Number(_)));
+    }
+
+    #[test]
+    fn atan_extreme_inputs_converge() {
+        // atan saturates at ±π/2.
+        match atan(&[n(1e100)]) {
+            Value::Number(v) => assert!(approx(v, std::f64::consts::FRAC_PI_2)),
+            _ => panic!(),
+        }
+        match atan(&[n(-1e100)]) {
+            Value::Number(v) => assert!(approx(v, -std::f64::consts::FRAC_PI_2)),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn atan2_basic_quadrants() {
+        // Excel arg order: ATAN2(x, y). Internally we call y.atan2(x).
+        // atan2(1, 0) → angle pointing along +x → 0
+        match atan2(&[n(1.0), n(0.0)]) {
+            Value::Number(v) => assert!(approx(v, 0.0)),
+            _ => panic!(),
+        }
+        // atan2(0, 1) → angle pointing along +y → π/2
+        match atan2(&[n(0.0), n(1.0)]) {
+            Value::Number(v) => assert!(approx(v, std::f64::consts::FRAC_PI_2)),
+            _ => panic!(),
+        }
+        // atan2(-1, 0) → π (along -x)
+        match atan2(&[n(-1.0), n(0.0)]) {
+            Value::Number(v) => assert!(approx(v, std::f64::consts::PI)),
+            _ => panic!(),
+        }
+        // atan2(1, 1) → π/4
+        match atan2(&[n(1.0), n(1.0)]) {
+            Value::Number(v) => assert!(approx(v, std::f64::consts::FRAC_PI_4)),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn atan2_zero_zero_is_div_zero() {
+        // Excel canon: ATAN2(0, 0) → #DIV/0!. Rust's f64::atan2(0,0)
+        // would return 0.0; we check up-front.
+        assert_eq!(atan2(&[n(0.0), n(0.0)]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn trig_arity_errors() {
+        // 0 args or 2+ args → #VALUE! for the single-arg fns.
+        let single_arg: [fn(&[Value]) -> Value; 6] = [sin, cos, tan, asin, acos, atan];
+        for f in single_arg.iter() {
+            assert_eq!(f(&[]), Value::Error(ErrorValue::Value));
+            assert_eq!(f(&[n(0.0), n(1.0)]), Value::Error(ErrorValue::Value));
+        }
+        // ATAN2: 0, 1, or 3+ args → #VALUE!.
+        assert_eq!(atan2(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(atan2(&[n(1.0)]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            atan2(&[n(1.0), n(1.0), n(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn trig_error_propagation() {
+        // Any Error arg → that error.
+        let err = Value::Error(ErrorValue::DivZero);
+        let single_arg: [fn(&[Value]) -> Value; 6] = [sin, cos, tan, asin, acos, atan];
+        for f in single_arg.iter() {
+            assert_eq!(
+                f(std::slice::from_ref(&err)),
+                Value::Error(ErrorValue::DivZero)
+            );
+        }
+        assert_eq!(
+            atan2(&[err.clone(), n(1.0)]),
+            Value::Error(ErrorValue::DivZero)
+        );
+        assert_eq!(atan2(&[n(1.0), err]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn trig_text_arg_is_value_error() {
+        // Module canon (line 17): Text → #VALUE! for numeric-context
+        // aggregates and math fns. `coerce_numeric` runs Text through
+        // `to_number_strict` which rejects it. Matches SIN/COS/TAN
+        // behavior in Excel for non-numeric text.
+        let bad = Value::Text(std::sync::Arc::from("hello"));
+        assert_eq!(
+            sin(std::slice::from_ref(&bad)),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            cos(std::slice::from_ref(&bad)),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(atan2(&[bad, n(1.0)]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn trig_blank_coerces_to_zero() {
+        // Blank → 0 per the existing one_number / coerce_numeric convention.
+        match sin(&[Value::Blank]) {
+            Value::Number(v) => assert!(approx(v, 0.0)),
+            _ => panic!(),
+        }
+        match cos(&[Value::Blank]) {
+            Value::Number(v) => assert!(approx(v, 1.0)),
+            _ => panic!(),
         }
     }
 }

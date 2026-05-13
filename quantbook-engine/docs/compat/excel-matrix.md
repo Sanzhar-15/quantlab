@@ -116,7 +116,7 @@ as partial, rows with `❌` are missing.
 | LN | ✅ | 2 | 4.3 V1 | Natural log; non-positive → `#NUM!` |
 | LOG | ✅ | 3 | 4.3 V1 | Optional base; base=1 or non-positive → `#NUM!` |
 | LOG10 | ✅ | 1 | 4.3 V1 | Base-10 log; non-positive → `#NUM!` |
-| SIN / COS / TAN / ASIN / ACOS / ATAN / ATAN2 | ❌ | 0 | 4.3 | |
+| SIN / COS / TAN / ASIN / ACOS / ATAN / ATAN2 | ✅ | 13 | 4.3 V2 | W5-51; ATAN2 uses Excel `(x, y)` arg order (not Rust's `(y, x)`); ATAN2(0,0)→#DIV/0!; ASIN/ACOS domain `|x|>1`→#NUM!; TAN(π/2) returns huge-finite (Excel canon, not error) |
 | SINH / COSH / TANH / ASINH / ACOSH / ATANH | ❌ | 0 | 4.10 | |
 | PI | ✅ | 2 | 4.3 V1 | Constant; arity check |
 | DEGREES | ✅ | 1 | 4.3 V1 | Radians → degrees |
