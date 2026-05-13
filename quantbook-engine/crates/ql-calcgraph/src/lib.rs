@@ -58,12 +58,12 @@ pub use topo::{schedule, schedule_with_supplemental, Schedule};
 
 // Re-exports — downstream crates that depend on ql-calcgraph can use the dependent AST
 // types via this crate without needing a direct ql-formula-syntax dep.
-pub use ql_formula_syntax::RangeRef;
+pub use ql_formula_syntax::{RangeRef, SheetRef};
 
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use ql_formula_syntax::RangeRef;
+    use ql_formula_syntax::{RangeRef, SheetRef};
 
     /// Integration: the full W3-1 surface composes — build a 5-node graph with mixed
     /// types and verify reverse-adjacency.
@@ -86,7 +86,7 @@ mod integration_tests {
         let col_a_range = g.add_range_node(RangeNode {
             sheet: 0,
             range: RangeRef::WholeColumn {
-                sheet: None,
+                sheet: SheetRef::Current,
                 start_col: 0,
                 end_col: 0,
                 abs_start: false,
@@ -156,7 +156,7 @@ mod integration_tests {
         g.register_range_dependency(
             formula,
             RangeRef::WholeColumn {
-                sheet: None,
+                sheet: SheetRef::Current,
                 start_col: 0,
                 end_col: 0,
                 abs_start: false,
@@ -198,7 +198,7 @@ mod integration_tests {
             g.register_range_dependency(
                 id,
                 RangeRef::WholeColumn {
-                    sheet: None,
+                    sheet: SheetRef::Current,
                     start_col: 0,
                     end_col: 0,
                     abs_start: false,
@@ -267,7 +267,7 @@ mod integration_tests {
         g.register_range_dependency(
             f1,
             RangeRef::WholeColumn {
-                sheet: None,
+                sheet: SheetRef::Current,
                 start_col: 0,
                 end_col: 0,
                 abs_start: false,
@@ -279,7 +279,7 @@ mod integration_tests {
         g.register_range_dependency(
             f2,
             RangeRef::WholeColumn {
-                sheet: None,
+                sheet: SheetRef::Current,
                 start_col: 0,
                 end_col: 0,
                 abs_start: false,
@@ -293,7 +293,7 @@ mod integration_tests {
         g.register_range_dependency(
             f1,
             RangeRef::WholeColumn {
-                sheet: None,
+                sheet: SheetRef::Current,
                 start_col: 0,
                 end_col: 0,
                 abs_start: false,

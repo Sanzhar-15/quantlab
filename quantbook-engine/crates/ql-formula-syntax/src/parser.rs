@@ -38,7 +38,7 @@
 
 use std::sync::Arc;
 
-use crate::ast::{CellAddr, Expr, RangeRef};
+use crate::ast::{CellAddr, Expr, RangeRef, SheetRef};
 use crate::token::{Operator, Token};
 
 /// Parse error variants.
@@ -245,7 +245,7 @@ impl Parser {
                     })
                 } else {
                     Ok(Expr::CellRef(CellAddr {
-                        sheet: None,
+                        sheet: SheetRef::Current,
                         col,
                         row,
                         abs_col,
@@ -275,7 +275,7 @@ impl Parser {
                     // (it'd evaluate over the entire column as a vector). Keep it as a
                     // RangeRef::WholeColumn for the binder to handle / reject.
                     Ok(Expr::RangeRef(RangeRef::WholeColumn {
-                        sheet: None,
+                        sheet: SheetRef::Current,
                         start_col: col,
                         end_col: col,
                         abs_start: abs,
@@ -287,7 +287,7 @@ impl Parser {
             // BareRow — `1`, `$5`. Same logic but for rows. Cannot be a function call
             // (digits-only identifiers aren't valid function names).
             Token::BareRow { row, abs } => Ok(Expr::RangeRef(RangeRef::WholeRow {
-                sheet: None,
+                sheet: SheetRef::Current,
                 start_row: row,
                 end_row: row,
                 abs_start: abs,
@@ -383,7 +383,7 @@ impl Parser {
                     (b.row, a.row, b.abs_row, a.abs_row)
                 };
                 Ok(Expr::RangeRef(RangeRef::Cells {
-                    sheet: None,
+                    sheet: SheetRef::Current,
                     start_col,
                     start_row,
                     end_col,
@@ -425,7 +425,7 @@ impl Parser {
                     false
                 };
                 Ok(Expr::RangeRef(RangeRef::WholeColumn {
-                    sheet: None,
+                    sheet: SheetRef::Current,
                     start_col: lo,
                     end_col: hi,
                     abs_start,
@@ -462,7 +462,7 @@ impl Parser {
                     false
                 };
                 Ok(Expr::RangeRef(RangeRef::WholeRow {
-                    sheet: None,
+                    sheet: SheetRef::Current,
                     start_row: lo,
                     end_row: hi,
                     abs_start,
@@ -489,7 +489,7 @@ fn number_to_bare_row(e: Expr) -> Result<Expr, ParseError> {
         }
         let row = (n as u32) - 1;
         Ok(Expr::RangeRef(RangeRef::WholeRow {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_row: row,
             end_row: row,
             abs_start: false,

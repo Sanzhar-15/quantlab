@@ -77,7 +77,7 @@ use std::sync::Arc;
 use ql_calcgraph::{
     range_contains_rowcol, schedule_with_supplemental, CellNode, Graph, Node, NodeId, Schedule,
 };
-use ql_formula_syntax::{lex, parse, RangeRef};
+use ql_formula_syntax::{lex, parse, RangeRef, SheetRef};
 use ql_storage::Workbook;
 use ql_types::{ColId, Range, RowId, SheetId};
 
@@ -105,7 +105,7 @@ fn range_to_rangeref(r: Range) -> RangeRef {
     let whole_cols = r.start_col == 0 && r.end_col == ColId::MAX;
     if whole_rows && !whole_cols {
         RangeRef::WholeColumn {
-            sheet: Some(r.sheet),
+            sheet: SheetRef::Id(r.sheet),
             start_col: r.start_col,
             end_col: r.end_col,
             abs_start: false,
@@ -113,7 +113,7 @@ fn range_to_rangeref(r: Range) -> RangeRef {
         }
     } else if whole_cols && !whole_rows {
         RangeRef::WholeRow {
-            sheet: Some(r.sheet),
+            sheet: SheetRef::Id(r.sheet),
             start_row: r.start_row,
             end_row: r.end_row,
             abs_start: false,
@@ -123,7 +123,7 @@ fn range_to_rangeref(r: Range) -> RangeRef {
         // Bounded rectangle (or fully-saturated rectangle, which the
         // stripe index handles by picking the smaller axis).
         RangeRef::Cells {
-            sheet: Some(r.sheet),
+            sheet: SheetRef::Id(r.sheet),
             start_col: r.start_col,
             start_row: r.start_row,
             end_col: r.end_col,

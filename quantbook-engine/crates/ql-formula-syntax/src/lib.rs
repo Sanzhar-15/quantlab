@@ -32,7 +32,7 @@ pub mod parser;
 pub mod printer;
 pub mod token;
 
-pub use ast::{CellAddr, Expr, RangeRef};
+pub use ast::{CellAddr, Expr, RangeRef, SheetRef};
 pub use lexer::{column_letters_to_index, lex, LexError, MAX_COLUMN, MAX_ROW};
 pub use parser::{parse, ParseError};
 pub use printer::print;
@@ -51,14 +51,14 @@ mod tests {
         let _: Result<Vec<Token>, LexError> = lex("=A1");
         let _: Expr = Expr::Number(1.5);
         let _: CellAddr = CellAddr {
-            sheet: None,
+            sheet: SheetRef::Current,
             col: 0,
             row: 0,
             abs_col: false,
             abs_row: false,
         };
         let _: RangeRef = RangeRef::Cells {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 0,
             start_row: 0,
             end_col: 0,

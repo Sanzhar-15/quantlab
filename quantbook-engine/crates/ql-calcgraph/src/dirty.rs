@@ -280,7 +280,7 @@ fn mark_node_chunks(graph: &Graph, dirty: &mut ChunkDirtySet, node_id: NodeId) {
 mod tests {
     use super::*;
     use crate::node::FormulaRegionNode;
-    use ql_formula_syntax::RangeRef;
+    use ql_formula_syntax::{RangeRef, SheetRef};
 
     use crate::node::RangeNode;
 
@@ -452,7 +452,7 @@ mod tests {
         let col_a = g.add_range_node(RangeNode {
             sheet: 0,
             range: RangeRef::WholeColumn {
-                sheet: None,
+                sheet: SheetRef::Current,
                 start_col: 0,
                 end_col: 0,
                 abs_start: false,

@@ -328,11 +328,17 @@ impl Graph {
     /// means "use the formula's owning sheet" (the binder convention).
     /// Helper so runtime code doesn't have to match on `RangeRef`
     /// variants just to pull the sheet field.
+    ///
+    /// **W5-87 (Phase 4.6.A part 1):** returns `None` for both
+    /// `SheetRef::Current` and `SheetRef::Name` (the latter is parser-
+    /// only and shouldn't reach this code path in practice); `Some(id)`
+    /// for `SheetRef::Id`. Callers that need post-resolution access
+    /// should use the resolved `ExprPlan::CellRef.sheet` field instead.
     pub fn range_ref_sheet(range: &RangeRef) -> Option<SheetId> {
         match range {
             RangeRef::Cells { sheet, .. }
             | RangeRef::WholeColumn { sheet, .. }
-            | RangeRef::WholeRow { sheet, .. } => *sheet,
+            | RangeRef::WholeRow { sheet, .. } => sheet.id(),
         }
     }
 
@@ -373,6 +379,7 @@ impl Graph {
 
 #[cfg(test)]
 mod tests {
+    use ql_formula_syntax::SheetRef;
     use super::*;
     use ql_formula_syntax::RangeRef;
 
@@ -404,7 +411,7 @@ mod tests {
         let id = g.add_range_node(RangeNode {
             sheet: 0,
             range: RangeRef::WholeColumn {
-                sheet: None,
+                sheet: SheetRef::Current,
                 start_col: 0,
                 end_col: 0,
                 abs_start: false,
@@ -545,7 +552,7 @@ mod tests {
         let mut g = Graph::new();
         let b1 = g.add_cell_node(0, 0, 1); // formula cell
         let range = RangeRef::WholeColumn {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 0,
             end_col: 0,
             abs_start: false,
@@ -569,7 +576,7 @@ mod tests {
         let b1 = g.add_cell_node(0, 0, 1);
         let c1 = g.add_cell_node(0, 0, 2);
         let bounded = RangeRef::Cells {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 0,
             start_row: 0,
             end_col: 0,
@@ -580,7 +587,7 @@ mod tests {
             abs_end_row: false,
         };
         let whole_col = RangeRef::WholeColumn {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 0,
             end_col: 0,
             abs_start: false,
@@ -620,7 +627,7 @@ mod tests {
             g.register_range_dependency(
                 id,
                 RangeRef::WholeColumn {
-                    sheet: None,
+                    sheet: SheetRef::Current,
                     start_col: 0,
                     end_col: 0,
                     abs_start: false,
@@ -652,7 +659,7 @@ mod tests {
         g.register_range_dependency(
             NodeId(99),
             RangeRef::WholeColumn {
-                sheet: None,
+                sheet: SheetRef::Current,
                 start_col: 0,
                 end_col: 0,
                 abs_start: false,
@@ -668,14 +675,14 @@ mod tests {
         let mut g = Graph::new();
         let c1 = g.add_cell_node(0, 0, 2);
         let col_a = RangeRef::WholeColumn {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 0,
             end_col: 0,
             abs_start: false,
             abs_end: false,
         };
         let col_b = RangeRef::WholeColumn {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 1,
             end_col: 1,
             abs_start: false,
@@ -701,7 +708,7 @@ mod tests {
         let range = g.add_range_node(RangeNode {
             sheet: 0,
             range: RangeRef::WholeColumn {
-                sheet: None,
+                sheet: SheetRef::Current,
                 start_col: 0,
                 end_col: 0,
                 abs_start: false,
@@ -781,14 +788,14 @@ mod tests {
         let mut g = Graph::new();
         let b1 = g.add_cell_node(0, 0, 1);
         let col_a = RangeRef::WholeColumn {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 0,
             end_col: 0,
             abs_start: false,
             abs_end: false,
         };
         let col_b_part = RangeRef::Cells {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 1,
             start_row: 0,
             end_col: 1,
@@ -825,13 +832,13 @@ mod tests {
         let b1 = g.add_cell_node(0, 0, 1);
         let c1 = g.add_cell_node(0, 0, 2);
         let col_a = RangeRef::WholeColumn {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 0,
             end_col: 0,
             abs_start: false,
             abs_end: false,
         };
-        g.register_range_dependency(b1, col_a, 0);
+        g.register_range_dependency(b1, col_a.clone(), 0);
         g.register_range_dependency(c1, col_a, 0);
         assert_eq!(g.stripe_index().stripe_count(), 1);
 
@@ -877,14 +884,14 @@ mod tests {
         let mut g = Graph::new();
         let b1 = g.add_cell_node(0, 0, 1);
         let col_a = RangeRef::WholeColumn {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 0,
             end_col: 0,
             abs_start: false,
             abs_end: false,
         };
         let col_b = RangeRef::WholeColumn {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 1,
             end_col: 1,
             abs_start: false,

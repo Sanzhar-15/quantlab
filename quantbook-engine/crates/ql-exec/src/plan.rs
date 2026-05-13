@@ -279,7 +279,7 @@ fn bind_with_context<L: NameLookup>(
         Expr::Bool(b) => Ok(ExprPlan::Bool(*b)),
         Expr::String(s) => Ok(ExprPlan::String(s.clone())),
         Expr::CellRef(addr) => Ok(ExprPlan::CellRef {
-            sheet: addr.sheet.unwrap_or(owning_sheet),
+            sheet: addr.sheet.resolve_or(owning_sheet),
             row: addr.row,
             col: addr.col,
             abs_col: addr.abs_col,
@@ -433,7 +433,7 @@ impl NameLookup for EmptyNameLookup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ql_formula_syntax::{CellAddr, RangeRef};
+    use ql_formula_syntax::{CellAddr, RangeRef, SheetRef};
 
     #[test]
     fn bind_number() {
@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn bind_cellref_unresolved_sheet_uses_owning() {
         let expr = Expr::CellRef(CellAddr {
-            sheet: None,
+            sheet: SheetRef::Current,
             col: 3,
             row: 5,
             abs_col: false,
@@ -473,7 +473,7 @@ mod tests {
     fn bind_cellref_resolved_sheet_kept() {
         // Phase 3+ scenario: `Sheet2!A1` from a formula on Sheet0 should bind to sheet 2.
         let expr = Expr::CellRef(CellAddr {
-            sheet: Some(2),
+            sheet: SheetRef::Id(2),
             col: 0,
             row: 0,
             abs_col: false,
@@ -489,7 +489,7 @@ mod tests {
         let expr = Expr::Binary {
             op: Operator::Mul,
             lhs: Box::new(Expr::CellRef(CellAddr {
-                sheet: None,
+                sheet: SheetRef::Current,
                 col: 0,
                 row: 0,
                 abs_col: false,
@@ -530,7 +530,7 @@ mod tests {
     #[test]
     fn bind_rangeref_unsupported() {
         let expr = Expr::RangeRef(RangeRef::WholeColumn {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 0,
             end_col: 0,
             abs_start: false,
@@ -568,14 +568,14 @@ mod tests {
             name: Arc::from("SUM"),
             args: vec![
                 Expr::CellRef(CellAddr {
-                    sheet: None,
+                    sheet: SheetRef::Current,
                     col: 0,
                     row: 0,
                     abs_col: false,
                     abs_row: false,
                 }),
                 Expr::CellRef(CellAddr {
-                    sheet: None,
+                    sheet: SheetRef::Current,
                     col: 0,
                     row: 1,
                     abs_col: false,

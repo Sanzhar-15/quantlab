@@ -80,13 +80,83 @@ pub enum Expr {
     NameRef(Arc<str>),
 }
 
-/// Address inside an `Expr`. `sheet: None` means "the formula's containing sheet" (resolved
-/// during binding). The field is Phase-0-tracked but the Phase 0 lexer never populates it —
-/// shipped now (opus arch F13) so Phase 3+ sheet-qualified refs add behavior without a
-/// breaking shape change.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// **W5-87 (Phase 4.6.A part 1):** sheet-qualification for AST references.
+///
+/// - `Current` — formula's owning sheet (no `Sheet!` prefix in source).
+///   The historical `Option::None` value maps here.
+/// - `Name(Arc<str>)` — parser-emitted name for `Sheet!X` and `'Sheet'!X`
+///   syntax. Binder resolves to `Id` via `SheetResolver` (Phase 4.6.B).
+/// - `Id(SheetId)` — already-resolved sheet id (the historical
+///   `Option::Some(id)` value, plus what the binder produces after
+///   resolving `Name`).
+///
+/// Per design doc § 5.2 / Codex HIGH-3 fix: parser stays workbook-free
+/// by emitting `Name`; resolution happens at bind time. Tests + post-
+/// bind code construct `Id` directly.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SheetRef {
+    /// No `Sheet!` prefix in source — defaults to the formula's owning sheet.
+    Current,
+    /// Unresolved sheet name from the lexer. Resolved at bind time.
+    Name(Arc<str>),
+    /// Resolved sheet id. Produced post-bind or by tests bypassing the binder.
+    Id(SheetId),
+}
+
+impl SheetRef {
+    /// Backwards-compat helper for the Phase 4.6.A migration: the
+    /// historical `Option<SheetId>::None` value maps to `Current`,
+    /// `Some(id)` maps to `Id(id)`. Lets call sites that were
+    /// constructing `Option<SheetId>` switch with minimal churn.
+    pub fn from_option(opt: Option<SheetId>) -> Self {
+        match opt {
+            None => Self::Current,
+            Some(id) => Self::Id(id),
+        }
+    }
+
+    /// **W5-87 (Phase 4.6.A part 1):** resolve against a default sheet
+    /// (typically the formula's owning sheet). Mirrors the historical
+    /// `Option<SheetId>::unwrap_or(owning_sheet)` pattern. PANICS on
+    /// `SheetRef::Name`: that variant is parser-only, and any post-
+    /// parse code path should have resolved it through the binder
+    /// before reaching layers that call this method (calcgraph,
+    /// stripes, etc.).
+    pub fn resolve_or(&self, owning_sheet: SheetId) -> SheetId {
+        match self {
+            SheetRef::Current => owning_sheet,
+            SheetRef::Id(s) => *s,
+            SheetRef::Name(name) => panic!(
+                "unresolved SheetRef::Name({name:?}) at a layer that requires \
+                 a resolved sheet id — must go through the binder first"
+            ),
+        }
+    }
+
+    /// **W5-87 (Phase 4.6.A part 1):** if already resolved to an id,
+    /// return it; if `Current`, return None (caller decides what
+    /// default to use). Used by code paths that DON'T have an owning-
+    /// sheet context handy.
+    pub fn id(&self) -> Option<SheetId> {
+        match self {
+            SheetRef::Current => None,
+            SheetRef::Id(s) => Some(*s),
+            SheetRef::Name(_) => None,
+        }
+    }
+}
+
+/// Address inside an `Expr`. `sheet: SheetRef::Current` means "the
+/// formula's containing sheet" (resolved during binding). Sheet-
+/// qualified refs (`Sheet1!A1`, `'Q3 2025'!A1`) populate
+/// `SheetRef::Name(name)` until the binder resolves to `SheetRef::Id`.
+///
+/// **W5-87 (Phase 4.6.A part 1):** `Copy` dropped because `SheetRef`
+/// carries `Arc<str>` in the `Name` variant. Most existing callers
+/// switch to `.clone()` (Arc clone is cheap) or pass by reference.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CellAddr {
-    pub sheet: Option<SheetId>,
+    pub sheet: SheetRef,
     pub col: ColId,
     pub row: RowId,
     pub abs_col: bool,
@@ -106,12 +176,14 @@ pub struct CellAddr {
 ///   - `WholeRow { ... }` — `1:1`, `2:5`, `$3:$3` (rows specified; cols are the full sheet)
 ///
 /// Same-sheet only in Phase 0.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// **W5-87 (Phase 4.6.A part 1):** `Copy` dropped — `SheetRef` carries
+/// `Arc<str>`. Same migration pattern as `CellAddr`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RangeRef {
     /// Bounded rectangular cell range. Start ≤ end on each axis (parser-normalized).
-    /// `sheet: None` = the formula's containing sheet (Phase 0 default; Phase 3+ populates).
+    /// `sheet: SheetRef::Current` = the formula's containing sheet.
     Cells {
-        sheet: Option<SheetId>,
+        sheet: SheetRef,
         start_col: ColId,
         start_row: RowId,
         end_col: ColId,
@@ -123,7 +195,7 @@ pub enum RangeRef {
     },
     /// Whole-column range (e.g. `A:A`, `B:D`). Rows span the full sheet.
     WholeColumn {
-        sheet: Option<SheetId>,
+        sheet: SheetRef,
         start_col: ColId,
         end_col: ColId,
         abs_start: bool,
@@ -131,7 +203,7 @@ pub enum RangeRef {
     },
     /// Whole-row range (e.g. `1:1`, `2:5`). Cols span the full sheet.
     WholeRow {
-        sheet: Option<SheetId>,
+        sheet: SheetRef,
         start_row: RowId,
         end_row: RowId,
         abs_start: bool,
@@ -149,7 +221,7 @@ mod tests {
         let _ = Expr::String(Arc::from("hi"));
         let _ = Expr::Bool(true);
         let _ = Expr::CellRef(CellAddr {
-            sheet: None,
+            sheet: SheetRef::Current,
             col: 0,
             row: 0,
             abs_col: false,
@@ -178,14 +250,14 @@ mod tests {
             name: Arc::from("SUM"),
             args: vec![
                 Expr::CellRef(CellAddr {
-                    sheet: None,
+                    sheet: SheetRef::Current,
                     col: 0,
                     row: 0,
                     abs_col: false,
                     abs_row: false,
                 }),
                 Expr::CellRef(CellAddr {
-                    sheet: None,
+                    sheet: SheetRef::Current,
                     col: 0,
                     row: 1,
                     abs_col: false,
@@ -204,7 +276,7 @@ mod tests {
     fn rangeref_whole_column_shape() {
         // A:A — explicit WholeColumn variant.
         let r = RangeRef::WholeColumn {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 0,
             end_col: 0,
             abs_start: false,
@@ -223,7 +295,7 @@ mod tests {
     #[test]
     fn rangeref_whole_row_shape() {
         let r = RangeRef::WholeRow {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_row: 0,
             end_row: 0,
             abs_start: false,
@@ -242,7 +314,7 @@ mod tests {
     #[test]
     fn rangeref_cells_bounded_shape() {
         let r = RangeRef::Cells {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 0,
             start_row: 0,
             end_col: 1,
@@ -265,7 +337,7 @@ mod tests {
     #[test]
     fn rangeref_variants_distinct() {
         let cells = RangeRef::Cells {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 0,
             start_row: 0,
             end_col: 0,
@@ -276,14 +348,14 @@ mod tests {
             abs_end_row: false,
         };
         let col = RangeRef::WholeColumn {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 0,
             end_col: 0,
             abs_start: false,
             abs_end: false,
         };
         let row = RangeRef::WholeRow {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_row: 0,
             end_row: 0,
             abs_start: false,

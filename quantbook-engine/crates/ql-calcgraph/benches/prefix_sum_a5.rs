@@ -8,6 +8,7 @@
 //! The unit test asserts CORRECTNESS (stripe insertion count); this bench gives PERF
 //! visibility — useful if a future change accidentally moves the path from O(N) to O(N²).
 
+use ql_formula_syntax::SheetRef;
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
@@ -20,7 +21,7 @@ fn build_n_sum_a1_to_an_formulas(n: u32) -> Graph {
         g.register_range_dependency(
             id,
             RangeRef::Cells {
-                sheet: None,
+                sheet: SheetRef::Current,
                 start_col: 0,
                 start_row: 0,
                 end_col: 0,

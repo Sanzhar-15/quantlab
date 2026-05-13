@@ -171,7 +171,7 @@ pub fn export_graph_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ql_calcgraph::{FormulaRegionNode, Graph as GraphAlias, RangeNode, RangeRef};
+    use ql_calcgraph::{FormulaRegionNode, Graph as GraphAlias, RangeNode, RangeRef, SheetRef};
 
     fn make_sample_graph() -> GraphAlias {
         let mut g = Graph::new();
@@ -182,7 +182,7 @@ mod tests {
         let _range = g.add_range_node(RangeNode {
             sheet: 0,
             range: RangeRef::WholeColumn {
-                sheet: None,
+                sheet: SheetRef::Current,
                 start_col: 0,
                 end_col: 0,
                 abs_start: false,
@@ -203,7 +203,7 @@ mod tests {
         g.register_range_dependency(
             b1,
             RangeRef::WholeColumn {
-                sheet: None,
+                sheet: SheetRef::Current,
                 start_col: 0,
                 end_col: 0,
                 abs_start: false,

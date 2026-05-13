@@ -441,12 +441,12 @@ mod tests {
     use super::*;
     use crate::env::MapEnv;
     use crate::plan::bind;
-    use ql_formula_syntax::{CellAddr, Expr};
+    use ql_formula_syntax::{CellAddr, Expr, SheetRef};
     use std::sync::Arc;
 
     fn cell_ref(col: u32, row: u32) -> Expr {
         Expr::CellRef(CellAddr {
-            sheet: None,
+            sheet: SheetRef::Current,
             col,
             row,
             abs_col: false,

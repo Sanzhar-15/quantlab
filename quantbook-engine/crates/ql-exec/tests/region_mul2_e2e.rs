@@ -19,7 +19,7 @@ use ql_calcgraph::RangeRef;
 use ql_exec::{
     bind, classify, dispatch, eval_scalar, eval_scalar_with_registry, MapEnv, SimdShape,
 };
-use ql_formula_syntax::{lex, parse};
+use ql_formula_syntax::{lex, parse, SheetRef};
 use ql_functions::default_registry;
 use ql_types::Value;
 
@@ -303,7 +303,7 @@ fn rangeref_reexport_compiles() {
     // Compile-time check that the ql-calcgraph re-export of RangeRef works for
     // downstream consumers like ql-exec test code.
     let _ = RangeRef::WholeColumn {
-        sheet: None,
+        sheet: SheetRef::Current,
         start_col: 0,
         end_col: 0,
         abs_start: false,

@@ -112,6 +112,7 @@ pub struct SpillNode {
 
 #[cfg(test)]
 mod tests {
+    use ql_formula_syntax::SheetRef;
     use super::*;
 
     #[test]
@@ -147,7 +148,7 @@ mod tests {
         let rn = RangeNode {
             sheet: 0,
             range: RangeRef::WholeColumn {
-                sheet: None,
+                sheet: SheetRef::Current,
                 start_col: 0,
                 end_col: 0,
                 abs_start: false,
@@ -197,7 +198,7 @@ mod tests {
         let r = Node::Range(RangeNode {
             sheet: 0,
             range: RangeRef::WholeColumn {
-                sheet: None,
+                sheet: SheetRef::Current,
                 start_col: 0,
                 end_col: 0,
                 abs_start: false,

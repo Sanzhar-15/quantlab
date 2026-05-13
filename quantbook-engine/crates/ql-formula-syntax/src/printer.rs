@@ -29,7 +29,7 @@
 //! These are intentional canonical-form rewrites, not bugs. The round-trip property
 //! checks that `parse(printed) == parse(original)`, NOT that the strings match.
 
-use crate::ast::{CellAddr, Expr, RangeRef};
+use crate::ast::{CellAddr, Expr, RangeRef, SheetRef};
 use crate::token::Operator;
 
 /// Print an `Expr` to its A1-canonical string form.
@@ -82,7 +82,7 @@ fn print_range(r: &RangeRef, out: &mut String) {
         } => {
             print_cell_addr(
                 &CellAddr {
-                    sheet: None,
+                    sheet: SheetRef::Current,
                     col: *start_col,
                     row: *start_row,
                     abs_col: *abs_start_col,
@@ -93,7 +93,7 @@ fn print_range(r: &RangeRef, out: &mut String) {
             out.push(':');
             print_cell_addr(
                 &CellAddr {
-                    sheet: None,
+                    sheet: SheetRef::Current,
                     col: *end_col,
                     row: *end_row,
                     abs_col: *abs_end_col,

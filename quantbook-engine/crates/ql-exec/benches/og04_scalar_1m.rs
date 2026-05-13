@@ -19,7 +19,7 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use ql_exec::{bind, eval_scalar, eval_scalar_with_registry, ExprPlan, MapEnv};
-use ql_formula_syntax::{CellAddr, Expr, Operator};
+use ql_formula_syntax::{CellAddr, Expr, Operator, SheetRef};
 use ql_functions::default_registry;
 use ql_types::Value;
 
@@ -37,7 +37,7 @@ fn build_mul2_plan_for(row: u32) -> ExprPlan {
     let expr = Expr::Binary {
         op: Operator::Mul,
         lhs: Box::new(Expr::CellRef(CellAddr {
-            sheet: None,
+            sheet: SheetRef::Current,
             col: 0,
             row,
             abs_col: false,

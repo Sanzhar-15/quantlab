@@ -197,16 +197,18 @@ fn hash_operator(op: &ql_formula_syntax::Operator, h: &mut impl Hasher) {
 }
 
 /// Phase 2A.10 audit M14: explicit field-by-field hashing for `CellAddr`,
-/// including an explicit Option-tag for the `sheet` field. Avoids depending
-/// on Option<T>'s derived Hash which writes a None/Some discriminant byte.
+/// including an explicit tag for the `sheet` field. Avoids depending on
+/// derived `Hash` impls.
+///
+/// **W5-87 (Phase 4.6.A part 1):** updated for the `SheetRef::{Current,
+/// Name, Id}` field shape. Tag bytes are chosen so the old `Option`
+/// hashing (`None` = 0, `Some(s)` = 1 + s) maps to the new variants:
+/// `Current` keeps `0`, `Id` keeps `1`. `Name` introduces a new tag
+/// `2` followed by the string bytes. Existing fingerprint suffixes
+/// remain backwards-compatible for `Current` and `Id` cases — only
+/// `Name`-bearing addresses (Phase 4.6.B+ output) get the new tag.
 fn hash_cell_addr(addr: &ql_formula_syntax::CellAddr, h: &mut impl Hasher) {
-    match addr.sheet {
-        None => 0u8.hash(h),
-        Some(s) => {
-            1u8.hash(h);
-            s.hash(h);
-        }
-    }
+    hash_sheet_ref(&addr.sheet, h);
     addr.col.hash(h);
     addr.row.hash(h);
     addr.abs_col.hash(h);
@@ -232,7 +234,7 @@ fn hash_range_ref(r: &ql_formula_syntax::RangeRef, h: &mut impl Hasher) {
             abs_end_row,
         } => {
             0x20u8.hash(h);
-            hash_option_sheet(sheet, h);
+            hash_sheet_ref(sheet, h);
             start_col.hash(h);
             start_row.hash(h);
             end_col.hash(h);
@@ -250,7 +252,7 @@ fn hash_range_ref(r: &ql_formula_syntax::RangeRef, h: &mut impl Hasher) {
             abs_end,
         } => {
             0x21u8.hash(h);
-            hash_option_sheet(sheet, h);
+            hash_sheet_ref(sheet, h);
             start_col.hash(h);
             end_col.hash(h);
             abs_start.hash(h);
@@ -264,7 +266,7 @@ fn hash_range_ref(r: &ql_formula_syntax::RangeRef, h: &mut impl Hasher) {
             abs_end,
         } => {
             0x22u8.hash(h);
-            hash_option_sheet(sheet, h);
+            hash_sheet_ref(sheet, h);
             start_row.hash(h);
             end_row.hash(h);
             abs_start.hash(h);
@@ -273,12 +275,21 @@ fn hash_range_ref(r: &ql_formula_syntax::RangeRef, h: &mut impl Hasher) {
     }
 }
 
-fn hash_option_sheet(s: &Option<ql_types::SheetId>, h: &mut impl Hasher) {
+/// **W5-87 (Phase 4.6.A part 1):** replaces the old `hash_option_sheet`
+/// helper. Tags 0/1 preserve fingerprint stability for `Current`/`Id`
+/// (the historical `None`/`Some` cases); `Name` gets tag 2 and emits
+/// the string bytes.
+fn hash_sheet_ref(s: &ql_formula_syntax::SheetRef, h: &mut impl Hasher) {
+    use ql_formula_syntax::SheetRef;
     match s {
-        None => 0u8.hash(h),
-        Some(sheet) => {
+        SheetRef::Current => 0u8.hash(h),
+        SheetRef::Id(sheet) => {
             1u8.hash(h);
             sheet.hash(h);
+        }
+        SheetRef::Name(name) => {
+            2u8.hash(h);
+            name.as_bytes().hash(h);
         }
     }
 }
@@ -286,7 +297,7 @@ fn hash_option_sheet(s: &Option<ql_types::SheetId>, h: &mut impl Hasher) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ql_formula_syntax::{CellAddr, Expr, Operator, RangeRef};
+    use ql_formula_syntax::{CellAddr, Expr, Operator, RangeRef, SheetRef};
     use std::sync::Arc;
 
     /// Phase 2A.10 audit H3/M14: golden fingerprint values pinned for the
@@ -320,7 +331,7 @@ mod tests {
             (
                 "CellRef(sheet=None, col=0, row=0)",
                 Expr::CellRef(CellAddr {
-                    sheet: None,
+                    sheet: SheetRef::Current,
                     col: 0,
                     row: 0,
                     abs_col: false,
@@ -331,7 +342,7 @@ mod tests {
             (
                 "CellRef abs A$1",
                 Expr::CellRef(CellAddr {
-                    sheet: None,
+                    sheet: SheetRef::Current,
                     col: 0,
                     row: 0,
                     abs_col: false,
@@ -342,7 +353,7 @@ mod tests {
             (
                 "RangeRef::WholeColumn A:A",
                 Expr::RangeRef(RangeRef::WholeColumn {
-                    sheet: None,
+                    sheet: SheetRef::Current,
                     start_col: 0,
                     end_col: 0,
                     abs_start: false,
@@ -353,7 +364,7 @@ mod tests {
             (
                 "RangeRef::WholeRow 1:1",
                 Expr::RangeRef(RangeRef::WholeRow {
-                    sheet: None,
+                    sheet: SheetRef::Current,
                     start_row: 0,
                     end_row: 0,
                     abs_start: false,
@@ -497,7 +508,7 @@ mod tests {
             (
                 "RangeRef::Cells A1:B10",
                 Expr::RangeRef(RangeRef::Cells {
-                    sheet: None,
+                    sheet: SheetRef::Current,
                     start_col: 0,
                     start_row: 0,
                     end_col: 1,
@@ -512,7 +523,7 @@ mod tests {
             (
                 "CellRef sheet=Some(2)",
                 Expr::CellRef(CellAddr {
-                    sheet: Some(2),
+                    sheet: SheetRef::Id(2),
                     col: 0,
                     row: 0,
                     abs_col: false,
@@ -566,7 +577,7 @@ mod tests {
             op: Operator::Plus,
             lhs: Box::new(Expr::Number(1.0)),
             rhs: Box::new(Expr::CellRef(CellAddr {
-                sheet: None,
+                sheet: SheetRef::Current,
                 col: 3,
                 row: 5,
                 abs_col: false,
@@ -585,7 +596,7 @@ mod tests {
 
     fn cell(col: u32, row: u32) -> Expr {
         Expr::CellRef(CellAddr {
-            sheet: None,
+            sheet: SheetRef::Current,
             col,
             row,
             abs_col: false,
@@ -647,14 +658,14 @@ mod tests {
     #[test]
     fn cellref_absolute_flags_matter() {
         let relative = Expr::CellRef(CellAddr {
-            sheet: None,
+            sheet: SheetRef::Current,
             col: 0,
             row: 0,
             abs_col: false,
             abs_row: false,
         });
         let abs_col = Expr::CellRef(CellAddr {
-            sheet: None,
+            sheet: SheetRef::Current,
             col: 0,
             row: 0,
             abs_col: true,
@@ -765,7 +776,7 @@ mod tests {
     #[test]
     fn rangeref_variants_distinguish() {
         let cells = Expr::RangeRef(RangeRef::Cells {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 0,
             start_row: 0,
             end_col: 0,
@@ -776,14 +787,14 @@ mod tests {
             abs_end_row: false,
         });
         let whole_col = Expr::RangeRef(RangeRef::WholeColumn {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 0,
             end_col: 0,
             abs_start: false,
             abs_end: false,
         });
         let whole_row = Expr::RangeRef(RangeRef::WholeRow {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_row: 0,
             end_row: 0,
             abs_start: false,
@@ -823,7 +834,7 @@ mod tests {
         // But: two cells whose binder produced literally the same Expr (e.g. both
         // referencing `$A$1 * 2`) DO share fingerprints:
         let abs = Expr::CellRef(CellAddr {
-            sheet: None,
+            sheet: SheetRef::Current,
             col: 0,
             row: 0,
             abs_col: true,

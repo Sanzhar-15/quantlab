@@ -131,7 +131,7 @@ impl StripeIndex {
                     start_row <= end_row,
                     "StripeIndex::register: Cells range has reversed rows (start_row={start_row} > end_row={end_row})"
                 );
-                let s = sheet.unwrap_or(sheet_id);
+                let s = sheet.resolve_or(sheet_id);
                 let height = end_row - start_row + 1;
                 let width = end_col - start_col + 1;
                 if height > width {
@@ -168,7 +168,7 @@ impl StripeIndex {
                     start_col <= end_col,
                     "StripeIndex::register: WholeColumn has reversed cols (start_col={start_col} > end_col={end_col})"
                 );
-                let s = sheet.unwrap_or(sheet_id);
+                let s = sheet.resolve_or(sheet_id);
                 for c in *start_col..=*end_col {
                     self.insert(
                         StripeKey {
@@ -190,7 +190,7 @@ impl StripeIndex {
                     start_row <= end_row,
                     "StripeIndex::register: WholeRow has reversed rows (start_row={start_row} > end_row={end_row})"
                 );
-                let s = sheet.unwrap_or(sheet_id);
+                let s = sheet.resolve_or(sheet_id);
                 for r in *start_row..=*end_row {
                     self.insert(
                         StripeKey {
@@ -312,11 +312,12 @@ pub fn range_contains_rowcol(range: &RangeRef, row: RowId, col: ColId) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use ql_formula_syntax::SheetRef;
     use super::*;
 
     fn cells(start_col: u32, start_row: u32, end_col: u32, end_row: u32) -> RangeRef {
         RangeRef::Cells {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col,
             start_row,
             end_col,
@@ -330,7 +331,7 @@ mod tests {
 
     fn whole_col(start: u32, end: u32) -> RangeRef {
         RangeRef::WholeColumn {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: start,
             end_col: end,
             abs_start: false,
@@ -340,7 +341,7 @@ mod tests {
 
     fn whole_row(start: u32, end: u32) -> RangeRef {
         RangeRef::WholeRow {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_row: start,
             end_row: end,
             abs_start: false,
@@ -545,7 +546,7 @@ mod tests {
     fn register_panics_on_cells_reversed_cols() {
         let mut idx = StripeIndex::new();
         let bad = RangeRef::Cells {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 5,
             start_row: 0,
             end_col: 2,
@@ -563,7 +564,7 @@ mod tests {
     fn register_panics_on_cells_reversed_rows() {
         let mut idx = StripeIndex::new();
         let bad = RangeRef::Cells {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 0,
             start_row: 9,
             end_col: 1,
@@ -581,7 +582,7 @@ mod tests {
     fn register_panics_on_whole_column_reversed() {
         let mut idx = StripeIndex::new();
         let bad = RangeRef::WholeColumn {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_col: 5,
             end_col: 2,
             abs_start: false,
@@ -595,7 +596,7 @@ mod tests {
     fn register_panics_on_whole_row_reversed() {
         let mut idx = StripeIndex::new();
         let bad = RangeRef::WholeRow {
-            sheet: None,
+            sheet: SheetRef::Current,
             start_row: 9,
             end_row: 2,
             abs_start: false,
