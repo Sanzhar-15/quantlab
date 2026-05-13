@@ -7,15 +7,23 @@ use std::collections::HashMap;
 
 use ql_types::Value;
 
-use crate::{scalar_fns, volatile};
+use crate::range_aware_fns::RangeAwareFn;
+use crate::{range_fns, scalar_fns, volatile};
 
 /// Function signature: pre-evaluated args → result Value.
 pub type ScalarFn = fn(&[Value]) -> Value;
 
 /// Phase 0 function registry. Built by `default_registry()` with the W4-4 function set.
+///
+/// W5-53 adds a parallel `range_aware_fns` table for functions that
+/// need per-argument range-vs-scalar metadata (SUMIF, COUNTIF, etc.).
+/// Lookup checks the range-aware table first; falls back to the
+/// scalar table. A single name MUST NOT be registered in both
+/// (registration panics if there's a conflict).
 #[derive(Clone, Debug)]
 pub struct FunctionRegistry {
     fns: HashMap<&'static str, ScalarFn>,
+    range_aware_fns: HashMap<&'static str, RangeAwareFn>,
 }
 
 impl Default for FunctionRegistry {
@@ -30,6 +38,7 @@ impl FunctionRegistry {
     pub fn new() -> Self {
         Self {
             fns: HashMap::new(),
+            range_aware_fns: HashMap::new(),
         }
     }
 
@@ -60,6 +69,32 @@ impl FunctionRegistry {
         );
     }
 
+    /// W5-53: register a range-aware function under `name`. Same
+    /// canonical-uppercase requirement + duplicate panic as
+    /// `register`. Cross-table name collision also panics — a name
+    /// cannot live in both `fns` and `range_aware_fns`.
+    pub fn register_range_aware(&mut self, name: &'static str, f: RangeAwareFn) {
+        assert!(
+            !name.is_empty(),
+            "FunctionRegistry::register_range_aware: name must not be empty"
+        );
+        assert!(
+            name.bytes().all(|b| !b.is_ascii_lowercase()),
+            "FunctionRegistry::register_range_aware: name {name:?} must be canonical \
+             upper-case"
+        );
+        assert!(
+            !self.fns.contains_key(name),
+            "FunctionRegistry::register_range_aware: {name:?} is already registered \
+             as a scalar function; cannot register in both tables"
+        );
+        let prior = self.range_aware_fns.insert(name, f);
+        assert!(
+            prior.is_none(),
+            "FunctionRegistry::register_range_aware: duplicate registration for {name:?}"
+        );
+    }
+
     /// Case-insensitive lookup. Returns `None` if not registered.
     pub fn lookup(&self, name: &str) -> Option<ScalarFn> {
         // Allocate a single uppercase key for the lookup; the registry holds &'static
@@ -68,16 +103,25 @@ impl FunctionRegistry {
         self.fns.get(upper.as_str()).copied()
     }
 
+    /// W5-53: case-insensitive lookup in the range-aware table.
+    /// Callers should check this BEFORE `lookup` — if a function is
+    /// range-aware, the dispatch must construct `Vec<FnArg>` rather
+    /// than flattening to `Vec<Value>`.
+    pub fn lookup_range_aware(&self, name: &str) -> Option<RangeAwareFn> {
+        let upper = name.to_ascii_uppercase();
+        self.range_aware_fns.get(upper.as_str()).copied()
+    }
+
     pub fn names(&self) -> impl Iterator<Item = &&'static str> {
         self.fns.keys()
     }
 
     pub fn len(&self) -> usize {
-        self.fns.len()
+        self.fns.len() + self.range_aware_fns.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.fns.is_empty()
+        self.fns.is_empty() && self.range_aware_fns.is_empty()
     }
 }
 
@@ -172,6 +216,16 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("RAND", volatile::rand);
     r.register("RANDBETWEEN", volatile::randbetween);
 
+    // Engine Phase 4.3 V2 batch — range-aware (W5-53, GAP-F-05
+    // closure). These use the new `RangeAwareFn` table because the
+    // existing `ScalarFn = fn(&[Value]) -> Value` contract can't
+    // distinguish "this argument is a range" from "this argument is
+    // a scalar criteria". The dispatch in
+    // `ql-exec::scalar::eval_scalar_with_cache` checks the range-
+    // aware table first.
+    r.register_range_aware("SUMIF", range_fns::sumif);
+    r.register_range_aware("COUNTIF", range_fns::countif);
+
     r
 }
 
@@ -189,14 +243,53 @@ mod tests {
     #[test]
     fn default_registry_has_expected_count() {
         let r = default_registry();
-        // 59 entries — Phase 0 W4-4 (22 functions + 3 aliases = 25) +
+        // 61 entries — Phase 0 W4-4 (22 functions + 3 aliases = 25) +
         // AI sentinel (1) + Phase 3.7 volatiles (NOW/TODAY/RAND/
         // RANDBETWEEN = 4) + Phase 4.3 V1 wave 1 (ROUNDUP, ROUNDDOWN,
         // TRUNC, SIGN, EXP, LN, LOG, LOG10, PI, DEGREES, RADIANS, LEN,
         // UPPER, LOWER, TRIM, ISNUMBER, ISTEXT, ISBLANK, ISLOGICAL,
         // ISERROR, ISNA, ISERR = 22) + Phase 4.3 V2 trig (W5-51:
-        // SIN, COS, TAN, ASIN, ACOS, ATAN, ATAN2 = 7).
-        assert_eq!(r.len(), 59);
+        // SIN, COS, TAN, ASIN, ACOS, ATAN, ATAN2 = 7) + Phase 4.3 V2
+        // range-aware (W5-53: SUMIF, COUNTIF = 2).
+        assert_eq!(r.len(), 61);
+    }
+
+    #[test]
+    fn range_aware_lookup_returns_registered_function() {
+        let r = default_registry();
+        assert!(r.lookup_range_aware("SUMIF").is_some());
+        assert!(r.lookup_range_aware("sumif").is_some()); // case-insensitive
+        assert!(r.lookup_range_aware("COUNTIF").is_some());
+        // SUM is NOT range-aware (uses the existing ScalarFn path).
+        assert!(r.lookup_range_aware("SUM").is_none());
+    }
+
+    #[test]
+    fn scalar_and_range_aware_tables_are_disjoint() {
+        let r = default_registry();
+        // No name appears in both tables.
+        for (name, _) in r.fns.iter() {
+            assert!(
+                !r.range_aware_fns.contains_key(name),
+                "name {name:?} is in both fns and range_aware_fns"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "is already registered as a scalar function")]
+    fn register_range_aware_with_existing_scalar_name_panics() {
+        let mut r = FunctionRegistry::new();
+        r.register("FOO", scalar_fns::sum);
+        r.register_range_aware("FOO", range_fns::sumif);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate registration")]
+    fn duplicate_range_aware_registration_panics() {
+        let mut r = FunctionRegistry::new();
+        r.register_range_aware("SUMIF", range_fns::sumif);
+        r.register_range_aware("SUMIF", range_fns::sumif);
     }
 
     #[test]

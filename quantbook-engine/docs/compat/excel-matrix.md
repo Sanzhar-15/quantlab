@@ -59,10 +59,10 @@ as partial, rows with `❌` are missing.
 | VAR.P | ✅ | A6 | 0 | Welford-backed |
 | STDEV (alias: STDEV.S) | ✅ | A6 | 0 | Welford-backed |
 | STDEV.P | ✅ | A6 | 0 | Welford-backed |
-| SUMIF | ❌ | 0 | 4.3 | Conditional sum |
-| SUMIFS | ❌ | 0 | 4.3 | Multi-condition sum |
-| COUNTIF | ❌ | 0 | 4.3 | Conditional count |
-| COUNTIFS | ❌ | 0 | 4.3 | Multi-condition count |
+| SUMIF | ⚠️ | 16 | 4.3 V2 | W5-53 (GAP-F-05 closure): supports number/text/bool/blank criteria + comparators `> < >= <= <> =`. Wildcards (`?` `*`) deferred. 2-arg + 3-arg forms; sum_range default to range. Error in sum_range cell propagates (Excel canon). |
+| SUMIFS | ❌ | 0 | 4.3 V2 (next batch) | Multi-condition; needs the same predicate infra as SUMIF + AND-across-conditions zip. |
+| COUNTIF | ⚠️ | 13 | 4.3 V2 | W5-53 (GAP-F-05 closure): same predicate suite as SUMIF. Error cells in the range are NOT propagated (Excel canon — COUNTIF ignores errors, unlike SUMIF). Wildcards deferred. |
+| COUNTIFS | ❌ | 0 | 4.3 V2 (next batch) | Multi-condition count. |
 | AVERAGEIF | ❌ | 0 | 4.3 | Conditional average |
 | AVERAGEIFS | ❌ | 0 | 4.3 | Multi-condition average |
 | MINIFS / MAXIFS | ❌ | 0 | 4.3 | Multi-condition min/max |

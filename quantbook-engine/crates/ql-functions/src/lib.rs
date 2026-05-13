@@ -22,11 +22,14 @@
 //! Literal NIST numacc dataset import (W4-5 follow-up) will add data fixtures via a
 //! `Cargo`-tracked test asset; the Welford shape is locked here.
 
+pub mod range_aware_fns;
+pub mod range_fns;
 pub mod registry;
 pub mod scalar_fns;
 pub mod volatile;
 pub mod welford;
 
+pub use range_aware_fns::{FnArg, RangeAwareFn};
 pub use registry::{default_registry, FunctionRegistry, ScalarFn};
 pub use volatile::{clear_test_overrides, set_test_now_secs, set_test_rng_seed};
 pub use welford::{

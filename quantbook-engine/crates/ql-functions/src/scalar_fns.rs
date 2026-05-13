@@ -1916,4 +1916,42 @@ mod tests {
             _ => panic!(),
         }
     }
+
+    // ===== W5-53 (audit gap closure): trig edge cases =====
+
+    #[test]
+    fn trig_non_finite_input_is_num_error_at_coercion() {
+        // `to_number_strict` (`ql_types::coercion`) rejects NaN/Inf at
+        // INPUT — Value::Number(±Inf) and Value::Number(NaN) never reach
+        // the trig fn body. So EVERY trig fn returns #NUM! on these
+        // inputs uniformly. Even atan, whose math IS well-defined for
+        // ±Inf (→ ±π/2), can't see the value because coercion gates it.
+        let trig_fns: [fn(&[Value]) -> Value; 6] = [sin, cos, tan, asin, acos, atan];
+        for f in trig_fns.iter() {
+            assert_eq!(f(&[n(f64::INFINITY)]), Value::Error(ErrorValue::Num));
+            assert_eq!(f(&[n(f64::NEG_INFINITY)]), Value::Error(ErrorValue::Num));
+            assert_eq!(f(&[n(f64::NAN)]), Value::Error(ErrorValue::Num));
+        }
+        assert_eq!(
+            atan2(&[n(f64::INFINITY), n(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(atan2(&[n(1.0), n(f64::NAN)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn atan2_blank_args_treated_as_zero() {
+        // Blank coerces to 0 per scalar_fns convention. ATAN2(blank, 1) =
+        // ATAN2(0, 1) = π/2 (along +y axis).
+        match atan2(&[Value::Blank, n(1.0)]) {
+            Value::Number(v) => assert!(approx(v, std::f64::consts::FRAC_PI_2)),
+            other => panic!("expected π/2, got {other:?}"),
+        }
+        // ATAN2(blank, blank) — both coerce to 0 → #DIV/0! per the
+        // explicit (0, 0) check.
+        assert_eq!(
+            atan2(&[Value::Blank, Value::Blank]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
 }

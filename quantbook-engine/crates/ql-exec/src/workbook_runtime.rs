@@ -2535,6 +2535,20 @@ mod tests {
                 "is_aggregate_function lists {name:?} but it's not in default_registry"
             );
         }
+        // W5-53 (GAP-F-05 closure): range-aware names are also in
+        // is_aggregate_function but live in the parallel range_aware_fns
+        // table; check via lookup_range_aware.
+        for name in &["SUMIF", "COUNTIF"] {
+            assert!(
+                reg.lookup_range_aware(name).is_some(),
+                "is_aggregate_function lists {name:?} (range-aware variant) but \
+                 it's not in default_registry's range_aware_fns table"
+            );
+            assert!(
+                reg.lookup(name).is_none(),
+                "{name:?} is range-aware ONLY; must not also appear in the scalar table"
+            );
+        }
         // Sanity: a known non-aggregate (IF) is in the registry but
         // is_aggregate_function does NOT claim it. We can't directly call
         // is_aggregate_function (private), but we can verify via behavior:
@@ -3909,6 +3923,144 @@ mod tests {
             r_all.simd_classified, 0,
             "recompute_all is the legacy path; simd_classified is always 0"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // W5-53 — Phase 4.3 V2 range-aware dispatch (GAP-F-05 closure).
+    //
+    // End-to-end tests that exercise SUMIF + COUNTIF through the full
+    // parse → bind → eval pipeline. The eval-side dispatch at
+    // `scalar.rs::eval_scalar_with_cache` now checks
+    // `registry.lookup_range_aware` first and constructs `Vec<FnArg>`
+    // with per-arg range/scalar variants. These tests verify the
+    // wiring is correct end-to-end (not just via the unit tests in
+    // `range_fns`).
+    // ----------------------------------------------------------------
+
+    /// SUMIF over a named range with numeric criteria.
+    /// `Sales = A1:A5 = [1, 5, 5, 10, 5]`. `=SUMIF(Sales, 5)` should
+    /// match the three 5's → 15.
+    #[test]
+    fn w5_53_sumif_named_range_numeric_criteria() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Number(1.0));
+        wb.put_at(0, 1, 0, Value::Number(5.0));
+        wb.put_at(0, 2, 0, Value::Number(5.0));
+        wb.put_at(0, 3, 0, Value::Number(10.0));
+        wb.put_at(0, 4, 0, Value::Number(5.0));
+        wb.set_name("Sales", NamedTarget::Range(Range::new(0, 0, 0, 4, 0)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 1, "SUMIF(Sales, 5)").unwrap();
+        assert_eq!(v, Value::Number(15.0));
+    }
+
+    /// SUMIF with a comparator criteria string.
+    /// `=SUMIF(Sales, ">5")` → sum of cells > 5 → 10.
+    #[test]
+    fn w5_53_sumif_comparator_criteria() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Number(1.0));
+        wb.put_at(0, 1, 0, Value::Number(5.0));
+        wb.put_at(0, 2, 0, Value::Number(10.0));
+        wb.put_at(0, 3, 0, Value::Number(100.0));
+        wb.set_name("Vals", NamedTarget::Range(Range::new(0, 0, 0, 3, 0)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 1, "SUMIF(Vals, \">5\")").unwrap();
+        assert_eq!(v, Value::Number(110.0));
+    }
+
+    /// COUNTIF over a named range. `=COUNTIF(Sales, ">=5")` → 4 cells.
+    #[test]
+    fn w5_53_countif_named_range() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Number(1.0));
+        wb.put_at(0, 1, 0, Value::Number(5.0));
+        wb.put_at(0, 2, 0, Value::Number(10.0));
+        wb.put_at(0, 3, 0, Value::Number(100.0));
+        wb.put_at(0, 4, 0, Value::Number(5.0));
+        wb.set_name("Vals", NamedTarget::Range(Range::new(0, 0, 0, 4, 0)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 1, "COUNTIF(Vals, \">=5\")").unwrap();
+        assert_eq!(v, Value::Number(4.0));
+    }
+
+    /// SUMIF with a 3-arg call: separate `sum_range`. Criteria range
+    /// holds labels; sum range holds the values. Demonstrates the
+    /// per-arg range distinction the W5-53 infra was built for.
+    #[test]
+    fn w5_53_sumif_with_separate_sum_range() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+        use std::sync::Arc;
+        let mut wb = make_runtime_workbook();
+        // Labels column A: [apple, banana, apple, cherry, apple]
+        wb.put_at(0, 0, 0, Value::Text(Arc::from("apple")));
+        wb.put_at(0, 1, 0, Value::Text(Arc::from("banana")));
+        wb.put_at(0, 2, 0, Value::Text(Arc::from("apple")));
+        wb.put_at(0, 3, 0, Value::Text(Arc::from("cherry")));
+        wb.put_at(0, 4, 0, Value::Text(Arc::from("apple")));
+        // Values column B: [1, 2, 3, 4, 5]
+        wb.put_at(0, 0, 1, Value::Number(1.0));
+        wb.put_at(0, 1, 1, Value::Number(2.0));
+        wb.put_at(0, 2, 1, Value::Number(3.0));
+        wb.put_at(0, 3, 1, Value::Number(4.0));
+        wb.put_at(0, 4, 1, Value::Number(5.0));
+        wb.set_name("Labels", NamedTarget::Range(Range::new(0, 0, 0, 4, 0)))
+            .unwrap();
+        wb.set_name("Vals", NamedTarget::Range(Range::new(0, 0, 1, 4, 1)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // Sum the apple-labeled values: positions 0, 2, 4 → 1+3+5 = 9.
+        let v = rt
+            .set_formula(0, 0, 2, "SUMIF(Labels, \"apple\", Vals)")
+            .unwrap();
+        assert_eq!(v, Value::Number(9.0));
+    }
+
+    /// SUMIF interacts correctly with the recompute path (Phase 3.6
+    /// aggregate cache is BYPASSED for range-aware functions — they
+    /// are NOT in `is_aggregate_function`'s set, so they recompute
+    /// on every edit). When a cell in the criteria range changes,
+    /// the SUMIF formula must re-evaluate.
+    #[test]
+    fn w5_53_sumif_recomputes_on_range_cell_change() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+        let mut wb = make_runtime_workbook();
+        for r in 0..5 {
+            wb.put_at(0, r, 0, Value::Number(r as f64 + 1.0));
+        }
+        wb.set_name("Vals", NamedTarget::Range(Range::new(0, 0, 0, 4, 0)))
+            .unwrap();
+        let reg = default_registry();
+        let mut graph = crate::CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            let v = rt.set_formula(0, 0, 1, "SUMIF(Vals, \">2\")").unwrap();
+            assert_eq!(v, Value::Number(3.0 + 4.0 + 5.0));
+        }
+        // Edit a cell in Vals — bumps A1 from 1.0 to 100.0.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(100.0)).unwrap();
+            let _ = rt.recompute_dirty().expect("graph attached");
+        }
+        // SUMIF formula at B1 should now include 100 → 100+3+4+5 = 112.
+        let result = wb.read(ql_types::Address::new(0, 0, 1));
+        assert_eq!(result, Value::Number(112.0));
     }
 
     /// Phase 3.7 extra: `mark_volatile_dirty` on a workbook with zero

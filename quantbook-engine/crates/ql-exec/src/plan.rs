@@ -173,6 +173,14 @@ pub(crate) fn is_aggregate_function(name: &str) -> bool {
     // it. When Engine Phase 4.3 expands the function library, the metadata
     // moves to per-function FunctionRegistry attributes and this hardcoded
     // matcher goes away entirely.
+    //
+    // W5-53 (GAP-F-05 closure): SUMIF + COUNTIF are NOT scalar aggregates
+    // (they return a scalar but take range + criteria) — they live in the
+    // parallel `range_aware_fns` table. But the binder uses this list to
+    // decide whether `NamedRangeInScalarContext` should fire on
+    // `=SUMIF(NamedRange, 5)`. Since SUMIF NEEDS a range arg, we add it
+    // here so the binder allows the AggregateNameRef in arg position. The
+    // eval-side dispatch routes correctly via `lookup_range_aware` first.
     matches!(
         name,
         "SUM"
@@ -189,6 +197,11 @@ pub(crate) fn is_aggregate_function(name: &str) -> bool {
             | "STDEV"
             | "STDEV.S"
             | "STDEV.P"
+            // Range-aware (W5-53): NOT scalar aggregates, but the binder
+            // treats them as aggregate-context for arg binding so named-
+            // range args resolve to `AggregateNameRef`.
+            | "SUMIF"
+            | "COUNTIF"
     )
 }
 

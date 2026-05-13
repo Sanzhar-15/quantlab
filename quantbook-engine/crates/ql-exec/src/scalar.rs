@@ -132,71 +132,97 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
             let v = eval_scalar_with_cache(operand, env, registry, cache);
             eval_unary(*op, v)
         }
-        ExprPlan::Function { name, args } => match registry.lookup(name) {
-            Some(f) => {
-                // Phase 3.6 (2026-05-12) — AGG-3-04 correctness + AGG-
-                // 3-01 cache hit path. Detect aggregate-over-named-range
-                // and route through the cache. The cache key is `(range,
-                // function_name)` — the EXACT call shape, not just the
-                // range — so `SUM(Sales)` and `AVERAGE(Sales)` are
-                // separate entries.
-                //
-                // Single-AggregateNameRef-arg fast path: most aggregates
-                // are called with a single named range (`=SUM(Sales)`).
-                // We special-case that for cache use. Multi-range
-                // aggregates (`SUM(Sales, Discount)`) fall back to no-
-                // cache (compute on every call) — V1 limitation.
-                let single_range_arg = match args.as_slice() {
-                    [ExprPlan::AggregateNameRef { range, .. }] => Some(*range),
-                    _ => None,
-                };
-                if let Some(range) = single_range_arg {
-                    if crate::plan::is_aggregate_function(name) {
-                        if let Some(cached) = cache.lookup_aggregate(range, name) {
-                            return cached;
+        ExprPlan::Function { name, args } => {
+            // W5-53 (GAP-F-05 closure): check the range-aware table
+            // FIRST. Range-aware functions like SUMIF need per-arg
+            // range-vs-scalar metadata that the scalar `&[Value]`
+            // contract can't carry. If a function is registered as
+            // range-aware, build `Vec<FnArg>` with the correct
+            // variant per arg (`AggregateNameRef` → `Range(read_range)`,
+            // everything else → `Scalar(eval)`).
+            if let Some(raf) = registry.lookup_range_aware(name) {
+                use ql_functions::FnArg;
+                let mut fn_args: Vec<FnArg> = Vec::with_capacity(args.len());
+                for a in args {
+                    match a {
+                        ExprPlan::AggregateNameRef { range, .. } => {
+                            fn_args.push(FnArg::Range(env.read_range(*range)));
                         }
-                        let flat = env.read_range(range);
-                        let v = f(&flat);
-                        // Don't cache `Value::Error(_)` results — they
-                        // often signal env-level issues (missing sheet
-                        // → #REF!, empty range AVERAGE → #DIV/0!) that
-                        // a follow-up edit would resolve; better to
-                        // recompute than serve a stale error.
-                        if !matches!(v, Value::Error(_)) {
-                            cache.store_aggregate(range, name, v.clone());
-                        }
-                        return v;
-                    }
-                }
-                let has_range_arg = args
-                    .iter()
-                    .any(|a| matches!(a, ExprPlan::AggregateNameRef { .. }));
-                if has_range_arg && crate::plan::is_aggregate_function(name) {
-                    // Multi-range or mixed aggregate args: materialize
-                    // every range and call the function. No cache use
-                    // (V2 may add multi-range cache keys).
-                    let mut flat: Vec<Value> = Vec::new();
-                    for a in args {
-                        match a {
-                            ExprPlan::AggregateNameRef { range, .. } => {
-                                flat.extend(env.read_range(*range));
-                            }
-                            other => {
-                                flat.push(eval_scalar_with_cache(other, env, registry, cache));
-                            }
+                        other => {
+                            fn_args.push(FnArg::Scalar(eval_scalar_with_cache(
+                                other, env, registry, cache,
+                            )));
                         }
                     }
-                    f(&flat)
-                } else {
-                    let evaluated: Vec<Value> = args
-                        .iter()
-                        .map(|a| eval_scalar_with_cache(a, env, registry, cache))
-                        .collect();
-                    f(&evaluated)
                 }
+                return raf(&fn_args);
             }
-            None => Value::Error(ErrorValue::Name),
-        },
+            match registry.lookup(name) {
+                Some(f) => {
+                    // Phase 3.6 (2026-05-12) — AGG-3-04 correctness + AGG-
+                    // 3-01 cache hit path. Detect aggregate-over-named-range
+                    // and route through the cache. The cache key is `(range,
+                    // function_name)` — the EXACT call shape, not just the
+                    // range — so `SUM(Sales)` and `AVERAGE(Sales)` are
+                    // separate entries.
+                    //
+                    // Single-AggregateNameRef-arg fast path: most aggregates
+                    // are called with a single named range (`=SUM(Sales)`).
+                    // We special-case that for cache use. Multi-range
+                    // aggregates (`SUM(Sales, Discount)`) fall back to no-
+                    // cache (compute on every call) — V1 limitation.
+                    let single_range_arg = match args.as_slice() {
+                        [ExprPlan::AggregateNameRef { range, .. }] => Some(*range),
+                        _ => None,
+                    };
+                    if let Some(range) = single_range_arg {
+                        if crate::plan::is_aggregate_function(name) {
+                            if let Some(cached) = cache.lookup_aggregate(range, name) {
+                                return cached;
+                            }
+                            let flat = env.read_range(range);
+                            let v = f(&flat);
+                            // Don't cache `Value::Error(_)` results — they
+                            // often signal env-level issues (missing sheet
+                            // → #REF!, empty range AVERAGE → #DIV/0!) that
+                            // a follow-up edit would resolve; better to
+                            // recompute than serve a stale error.
+                            if !matches!(v, Value::Error(_)) {
+                                cache.store_aggregate(range, name, v.clone());
+                            }
+                            return v;
+                        }
+                    }
+                    let has_range_arg = args
+                        .iter()
+                        .any(|a| matches!(a, ExprPlan::AggregateNameRef { .. }));
+                    if has_range_arg && crate::plan::is_aggregate_function(name) {
+                        // Multi-range or mixed aggregate args: materialize
+                        // every range and call the function. No cache use
+                        // (V2 may add multi-range cache keys).
+                        let mut flat: Vec<Value> = Vec::new();
+                        for a in args {
+                            match a {
+                                ExprPlan::AggregateNameRef { range, .. } => {
+                                    flat.extend(env.read_range(*range));
+                                }
+                                other => {
+                                    flat.push(eval_scalar_with_cache(other, env, registry, cache));
+                                }
+                            }
+                        }
+                        f(&flat)
+                    } else {
+                        let evaluated: Vec<Value> = args
+                            .iter()
+                            .map(|a| eval_scalar_with_cache(a, env, registry, cache))
+                            .collect();
+                        f(&evaluated)
+                    }
+                }
+                None => Value::Error(ErrorValue::Name),
+            }
+        }
         // `AggregateNameRef` outside a Function context — the binder is
         // supposed to surface `BindError::NamedRangeInScalarContext`
         // before we ever evaluate. Defensive fallback: `#CALC!`.
