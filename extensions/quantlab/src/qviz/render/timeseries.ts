@@ -58,11 +58,28 @@ export function compileTimeseriesPlan(
 		);
 	}
 
+	// Front 4 + Cycle 2 audit HIGH-3 (Codex, 2026-05-14): when the
+	// user hasn't set `chart.options.y_axis_zero` explicitly, apply
+	// the chart-type's canonical zero-baseline default. Bars and
+	// histograms anchor at zero (Tufte canon for length-from-zero);
+	// line / area / baseline / candlestick auto-fit (Vega-Lite-side
+	// equivalent: scale.zero=false). Without this branch, timeseries
+	// bar/histogram silently inherited Vega-Lite's quantitative
+	// implicit `zero=true` only when the explicit option was set,
+	// while the general-family renderer applied the same canon
+	// automatically — an unintentional divergence between the two
+	// renderer paths.
+	const yAxisZeroDefault = (spec.chart.type === 'bar' || spec.chart.type === 'histogram')
+		? true
+		: false;
+	const yAxisZero = spec.chart.options?.y_axis_zero !== undefined
+		? spec.chart.options.y_axis_zero
+		: yAxisZeroDefault;
 	const chartOptions: TimeseriesChartOptions = {
 		timezone: spec.trading_options?.timezone,
 		autoSize: true,
 		showGrid: spec.chart.options?.show_grid ?? true,
-		yAxisZero: spec.chart.options?.y_axis_zero,
+		yAxisZero,
 		theme,
 	};
 

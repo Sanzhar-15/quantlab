@@ -96,6 +96,42 @@ export function reduceSpec(state: SpecState, action: Action): SpecState {
 				pendingSaveHash: null,
 			};
 		}
+		case 'applyChartTypeWithFit': {
+			// Front 1 (2026-05-14): controller-resolved chart-type
+			// transition. Mirrors `setChartType`'s family-vs-type
+			// validation but applies the controller-computed
+			// encodings atomically as ONE history entry. The
+			// controller (webview/qviz/controllers/chartTypeFit.ts)
+			// is responsible for filter-and-fit semantics; the
+			// reducer trusts the payload and just commits it.
+			if (state.current === null) { return state; }
+			const allowed = CHART_TYPE_BY_FAMILY[action.family];
+			if (!allowed || !allowed.includes(action.chartType)) {
+				throw new Error(
+					`applyChartTypeWithFit: chartType '${action.chartType}' not allowed in family '${action.family}'; `
+					+ `allowed: ${(allowed ?? []).join(', ')}`,
+				);
+			}
+			// Deep-clone + freeze the encodings so the action payload
+			// can't be mutated post-dispatch.
+			const cloned = deepCloneFreeze(action.encodings) as Encodings;
+			if (
+				state.current.chart.family === action.family
+				&& state.current.chart.type === action.chartType
+				&& structurallyEqual(state.current.chart.encodings, cloned)
+			) {
+				return state;
+			}
+			return advance(state, {
+				...state.current,
+				chart: {
+					...state.current.chart,
+					family: action.family,
+					type: action.chartType,
+					encodings: cloned,
+				},
+			});
+		}
 		case 'setChartType': {
 			if (state.current === null) { return state; }
 			// Validate family/type whitelist so the reducer can't produce

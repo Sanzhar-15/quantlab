@@ -255,6 +255,12 @@ export interface ChartOptions {
 	readonly show_grid?: boolean;
 	readonly color_palette?: string;
 	readonly y_axis_zero?: boolean;
+	/** Front 4 (2026-05-14): symmetry with `y_axis_zero`. Force the
+	 *  x-axis quantitative scale to include zero. Almost never wanted
+	 *  for time-series charts; sometimes wanted for histograms with
+	 *  numeric bin edges. Defaults to false at the renderer when
+	 *  absent (per `scaleDefaults.ts`). */
+	readonly x_axis_zero?: boolean;
 	readonly markers?: readonly Marker[];
 }
 

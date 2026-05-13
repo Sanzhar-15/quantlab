@@ -289,7 +289,8 @@ function reduceInspectorInner(state: InspectorState, action: Action): InspectorS
 			}
 			return INITIAL_INSPECTOR_STATE;
 
-		case 'setChartType': {
+		case 'setChartType':
+		case 'applyChartTypeWithFit': {
 			// Audit M-9 (2026-05-11): chart-type swaps that drop the
 			// selection field (e.g., line → pie, scatter → candlestick)
 			// leave a ghost selection -- its x-value no longer maps to
@@ -299,6 +300,11 @@ function reduceInspectorInner(state: InspectorState, action: Action): InspectorS
 			// necessary, but the alternative ("only clear when the
 			// selection-field name changes") requires reading the prior
 			// spec which the reducer doesn't carry.
+			//
+			// Cycle 2 audit HIGH-1 (Opus, 2026-05-14): Front 1's
+			// `applyChartTypeWithFit` action MUST share this arm.
+			// Previously only `setChartType` was here; the new picker
+			// path silently regressed M-9 for every chart-type click.
 			if (state.selection === null) { return state; }
 			return { ...state, selection: null };
 		}

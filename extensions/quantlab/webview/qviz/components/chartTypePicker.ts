@@ -22,6 +22,19 @@
 import type { QvizStore } from '../state/store';
 import type { ChartFamily, ChartType } from '../../../src/qviz/spec';
 import { CHART_TYPE_BY_FAMILY } from '../../../src/qviz/validate';
+import { fitChartTypeTransition } from '../controllers/chartTypeFit';
+
+/** Front 1 (2026-05-14): controller-layer auto-fit kill switch.
+ *  Constant rather than a VS Code config because:
+ *    - The fit is non-destructive (only fills EMPTY required
+ *      channels; never overwrites user-set encodings) so we expect
+ *      to ship it default-on with no toggle.
+ *    - A surface-area config schema entry would have to be
+ *      explained in docs, which is heavier than the value.
+ *  If a regression surfaces, flip this to `false` and ship a
+ *  hotfix. The chart-type picker falls back to the legacy
+ *  `setChartType` action (same behavior as before Front 1). */
+const BUILDER_INTELLIGENCE_ENABLED = true;
 
 /** All chart types the picker offers, in display order. */
 const CHART_TYPES_IN_ORDER: readonly { type: ChartType; label: string }[] = [
@@ -70,9 +83,39 @@ export function mountChartTypePicker(root: HTMLElement, store: QvizStore): { dis
 	const buttons = new Map<ChartType, HTMLButtonElement>();
 	const orderedTypes: ChartType[] = CHART_TYPES_IN_ORDER.map(x => x.type);
 	const selectType = (type: ChartType): void => {
-		const currentFamily = store.getState().spec.current?.chart.family ?? null;
-		const family = familyForType(type, currentFamily);
-		store.dispatch({ type: 'setChartType', family, chartType: type });
+		const state = store.getState();
+		const currentSpec = state.spec.current;
+		if (currentSpec === null) {
+			// Per CLAUDE.md "errors must be visible": the picker mounts
+			// AFTER `init` dispatches (the visualise host wires it
+			// inside the spec subscriber). A null spec at selectType
+			// time means the host wired the picker before init -- an
+			// invariant violation, not a runtime case.
+			throw new Error('chartTypePicker.selectType: picker mounted without a current spec');
+		}
+		const family = familyForType(type, currentSpec.chart.family);
+		// Front 1: invoke the fitter when enabled. The
+		// applyChartTypeWithFit reducer arm short-circuits identity-
+		// preserve when family/type/encodings are all unchanged, so
+		// a no-op click produces no history entry. When the flag is
+		// off, fall through to the legacy reducer (same identity-
+		// preserve semantics on its own arm).
+		if (!BUILDER_INTELLIGENCE_ENABLED) {
+			store.dispatch({ type: 'setChartType', family, chartType: type });
+			return;
+		}
+		const result = fitChartTypeTransition(
+			state.schema.info,
+			currentSpec,
+			type,
+			family,
+		);
+		store.dispatch({
+			type: 'applyChartTypeWithFit',
+			family: result.family,
+			chartType: result.chartType,
+			encodings: result.encodings,
+		});
 	};
 	const focusIndex = (idx: number): void => {
 		const clamped = ((idx % orderedTypes.length) + orderedTypes.length) % orderedTypes.length;

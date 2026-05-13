@@ -30,6 +30,7 @@
 import type {
 	ChartOptions, ChartType, Encoding, Encodings, QvizSpec
 } from '../spec';
+import { getDefaultScaleOptions } from '../scaleDefaults';
 import type {
 	ColumnData, GeneralChartType, GeneralPlan, QvizTheme,
 	VegaLiteEncoding, VegaLiteEncodingType, VegaLiteFieldDef, VegaLiteMark, VegaLiteSpec
@@ -153,7 +154,7 @@ function buildEncoding(
 		case 'pie':
 			return buildPieEncoding(encodings, columns);
 		case 'heatmap':
-			return buildHeatmapEncoding(encodings);
+			return buildHeatmapEncoding(encodings, chartOptions);
 		default: {
 			// Audit fix (2026-05-11): the cartesian path used to emit
 			// whatever encodings were present and let Vega-Lite error at
@@ -169,7 +170,7 @@ function buildEncoding(
 					`${chartType} chart requires encodings.x and encodings.y`
 				);
 			}
-			return buildCartesianEncoding(encodings, chartOptions);
+			return buildCartesianEncoding(encodings, chartOptions, chartType);
 		}
 	}
 }
@@ -187,7 +188,8 @@ function buildEncoding(
  */
 function buildCartesianEncoding(
 	encodings: Encodings,
-	chartOptions: ChartOptions | undefined
+	chartOptions: ChartOptions | undefined,
+	chartType: GeneralChartType,
 ): VegaLiteEncoding {
 	// Build an intermediate that's narrowed to the channels we set, then
 	// cast to VegaLiteEncoding (which has the same channel names by
@@ -201,16 +203,32 @@ function buildCartesianEncoding(
 		row?: VegaLiteFieldDef; column?: VegaLiteFieldDef;
 	} & Record<string, VegaLiteFieldDef> = {};
 
+	// Front 4 (2026-05-14): compute effective scale defaults per
+	// (chartType, channel, encoding.type) when the spec hasn't set
+	// `chart.options.{x,y}_axis_zero` explicitly. Precedence is:
+	//   1. explicit chart.options.{x,y}_axis_zero (user override)
+	//   2. chart-type default from scaleDefaults
+	// …unless encoding.scale is log/pow, in which case the default
+	// `zero` is dropped (Vega-Lite warns + drops it; semantically
+	// incoherent with log/pow). Explicit chart-options.x/y_axis_zero
+	// is still honored — user choice wins. Cycle 2 audit MEDIUM
+	// (Codex, 2026-05-14). Never persisted back into the spec.
 	if (encodings.x) {
-		out.x = mapFieldDef(encodings.x, { yAxisZero: false });
+		out.x = mapFieldDef(encodings.x, {
+			axisZero: resolveAxisZero(chartType, 'x', encodings.x, chartOptions?.x_axis_zero),
+		});
 	}
 	if (encodings.y) {
-		out.y = mapFieldDef(encodings.y, { yAxisZero: chartOptions?.y_axis_zero === true });
+		out.y = mapFieldDef(encodings.y, {
+			axisZero: resolveAxisZero(chartType, 'y', encodings.y, chartOptions?.y_axis_zero),
+		});
 	}
 	// Audit-fix AF24: y2 (previously collected into rows but never emitted).
 	// Vega-Lite uses y2 alongside y for range marks (errorband, area-range).
 	if (encodings.y2) {
-		(out as Record<string, VegaLiteFieldDef>).y2 = mapFieldDef(encodings.y2, {});
+		(out as Record<string, VegaLiteFieldDef>).y2 = mapFieldDef(encodings.y2, {
+			axisZero: resolveAxisZero(chartType, 'y2', encodings.y2, undefined),
+		});
 	}
 	if (encodings.color) {
 		out.color = mapColorFieldDef(encodings.color);
@@ -304,22 +322,68 @@ function buildPieEncoding(
  * encodes the value. All three are required -- the validator already
  * enforces this, but we double-check here so the compiler is defensive
  * against a hand-built spec that bypassed validation.
+ *
+ * Cycle 2 audit HIGH-2 (Codex, 2026-05-14): heatmap quantitative x/y
+ * axes must also receive Front 4's `zero=false` default (auto-fit), or
+ * a quantitative-axis heatmap clusters in a corner the same way the
+ * smoke-session scatter did. Mirror the cartesian path's precedence
+ * (explicit `chart.options.{x,y}_axis_zero` → scaleDefaults default).
  */
-function buildHeatmapEncoding(encodings: Encodings): VegaLiteEncoding {
+function buildHeatmapEncoding(
+	encodings: Encodings, chartOptions: ChartOptions | undefined,
+): VegaLiteEncoding {
 	if (!encodings.x || !encodings.y || !encodings.color) {
 		throw new CompileGeneralPlanError(
 			'heatmap chart requires encodings.x, encodings.y, and encodings.color'
 		);
 	}
 	return {
-		x: mapFieldDef(encodings.x, {}),
-		y: mapFieldDef(encodings.y, {}),
+		x: mapFieldDef(encodings.x, {
+			axisZero: resolveAxisZero('heatmap', 'x', encodings.x, chartOptions?.x_axis_zero),
+		}),
+		y: mapFieldDef(encodings.y, {
+			axisZero: resolveAxisZero('heatmap', 'y', encodings.y, chartOptions?.y_axis_zero),
+		}),
 		color: mapFieldDef(encodings.color, {}),
 	};
 }
 
+/**
+ * Front 4 + Cycle 2 audit MEDIUM (2026-05-14): compute the effective
+ * `scale.zero` for a single channel.
+ *
+ * Precedence:
+ *   1. Explicit `chart.options.{x,y}_axis_zero` (user wins, even when
+ *      combined with `encoding.scale = log/pow` — Vega-Lite warns).
+ *   2. `getDefaultScaleOptions(...)` chart-type default …
+ *   3. …unless `encoding.scale` is `log` or `pow`, in which case the
+ *      default is suppressed (zero on log is incoherent: log(0) = -∞,
+ *      Vega-Lite drops `zero` and warns).
+ *
+ * Returns `undefined` when no zero should be emitted at all (clean
+ * absence in the Vega-Lite spec, matches pre-Front-4 behavior for
+ * channels where defaults don't apply).
+ */
+function resolveAxisZero(
+	chartType: GeneralChartType,
+	channel: 'x' | 'y' | 'y2',
+	enc: Encoding,
+	explicitOption: boolean | undefined,
+): boolean | undefined {
+	if (explicitOption !== undefined) { return explicitOption; }
+	if (enc.scale === 'log' || enc.scale === 'pow') { return undefined; }
+	return getDefaultScaleOptions(chartType, channel, enc.type).zero;
+}
+
 interface MapFieldDefOpts {
-	readonly yAxisZero?: boolean;
+	/** Front 4 (2026-05-14): effective scale.zero for this channel.
+	 *  Pre-computed by buildCartesianEncoding via the precedence
+	 *  (explicit chart.options.{x,y}_axis_zero → scaleDefaults default).
+	 *  When undefined, scale.zero is omitted entirely and Vega-Lite
+	 *  chooses (which historically meant true for quantitative — the
+	 *  exact "scatter clusters top-right" symptom the defaults exist
+	 *  to address). */
+	readonly axisZero?: boolean;
 }
 
 function mapFieldDef(enc: Encoding, opts: MapFieldDefOpts): VegaLiteFieldDef {
@@ -331,9 +395,12 @@ function mapFieldDef(enc: Encoding, opts: MapFieldDefOpts): VegaLiteFieldDef {
 	if (enc.format !== undefined) { out.format = enc.format; }
 	// Audit-fix AF25: build the scale object only with fields that are
 	// actually set, so we never emit `scale: { type: undefined, zero: true }`.
+	// Front 4: axisZero may be false (not just true) to OVERRIDE Vega-Lite's
+	// implicit `zero=true` for quantitative axes — emit it explicitly when
+	// the caller supplied it.
 	const scale: Record<string, unknown> = {};
 	if (enc.scale !== undefined) { scale.type = enc.scale; }
-	if (opts.yAxisZero === true) { scale.zero = true; }
+	if (opts.axisZero !== undefined) { scale.zero = opts.axisZero; }
 	if (Object.keys(scale).length > 0) { out.scale = scale; }
 	if (enc.sort !== undefined) {
 		out.sort = enc.sort === 'asc' ? 'ascending' : 'descending';

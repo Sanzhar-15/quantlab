@@ -26,7 +26,7 @@ import type {
 	SchemaDriftKind, SchemaInfo, ThemeTokens, DaemonCapabilities,
 	InspectorFilter, ColumnStats, InspectorErrorKind,
 } from '../../../src/qviz/messageProtocol';
-import type { ChartFamily, ChartType, Encoding, QvizSpec, Transform } from '../../../src/qviz/spec';
+import type { ChartFamily, ChartType, Encoding, Encodings, QvizSpec, Transform } from '../../../src/qviz/spec';
 
 // ---------------------------------------------------------------------------
 // extension → webview messages, lifted into actions
@@ -157,6 +157,20 @@ export interface ActionSetChartType {
 	readonly type: 'setChartType';
 	readonly family: ChartFamily;
 	readonly chartType: ChartType;
+}
+
+/** Front 1 (2026-05-14): atomic chart-type + encodings transition,
+ *  emitted by the chart-type picker after running
+ *  `fitChartTypeTransition`. One history entry covers both the
+ *  family/type swap AND the auto-fill, so undo restores the
+ *  pre-swap encoding shelves in one Ctrl-Z. */
+export interface ActionApplyChartTypeWithFit {
+	readonly type: 'applyChartTypeWithFit';
+	readonly family: ChartFamily;
+	readonly chartType: ChartType;
+	/** Pre-computed encodings (preserved compatible channels +
+	 *  auto-filled required channels). The reducer applies as-is. */
+	readonly encodings: Encodings;
 }
 
 /** The user assigned a column to an encoding shelf (or cleared it). */
@@ -338,6 +352,7 @@ export type Action =
 	| ActionDatasetStatus
 	| ActionRequestStarted
 	| ActionSetChartType
+	| ActionApplyChartTypeWithFit
 	| ActionSetEncoding
 	| ActionSetOhlcv
 	| ActionUpsertTransform

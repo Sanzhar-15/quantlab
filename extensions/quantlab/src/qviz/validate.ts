@@ -879,6 +879,12 @@ function parseChartOptions(ctx: Ctx, path: string, x: unknown): ChartOptions | n
 		show_grid: optBool(ctx, `${path}.show_grid`, obj.show_grid),
 		color_palette: optString(ctx, `${path}.color_palette`, obj.color_palette),
 		y_axis_zero: optBool(ctx, `${path}.y_axis_zero`, obj.y_axis_zero),
+		// Cycle 2 audit HIGH-1 (Codex, 2026-05-14): without this line,
+		// `chart.options.x_axis_zero` round-trips as undefined and the
+		// user's explicit x-axis-zero override is silently dropped on
+		// save/load. The field was added to spec.ts + general.ts in
+		// Front 4 but the validator was forgotten.
+		x_axis_zero: optBool(ctx, `${path}.x_axis_zero`, obj.x_axis_zero),
 		markers,
 	};
 }
