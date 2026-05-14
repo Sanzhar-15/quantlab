@@ -7971,19 +7971,12 @@ mod tests {
         assert_eq!(wb.read(ql_types::Address::new(0, 1, 1)), Value::Number(4.0));
     }
 
-    /// TRANSPOSE composed with SEQUENCE: `=TRANSPOSE(SEQUENCE(3))`
-    /// produces a 1×3 spill (SEQUENCE(3) is 3×1; transpose to 1×3).
-    /// Tests that the Unified function's Array return flows through
-    /// nested function dispatch via FunctionArg::Scalar(#CALC!) —
-    /// wait, that's scalar context. Let me think.
-    ///
-    /// Actually TRANSPOSE(SEQUENCE(3)) — outer is TRANSPOSE, inner is
-    /// SEQUENCE. The arg materialization for TRANSPOSE sees SEQUENCE
-    /// as an arg position. Args evaluate via `eval_scalar_with_cache`
-    /// which for an Array-returning Unified function in scalar context
-    /// returns #CALC!. So TRANSPOSE receives FunctionArg::Scalar(#CALC!)
-    /// and propagates the error. This pins design § 6.3 (no nested
-    /// array composition in v1).
+    /// TRANSPOSE composed with SEQUENCE: `=TRANSPOSE(SEQUENCE(3))` —
+    /// outer is TRANSPOSE, inner is SEQUENCE. Args evaluate via
+    /// `eval_scalar_with_cache` which for an Array-returning Unified
+    /// function in scalar context returns #CALC!. So TRANSPOSE
+    /// receives FunctionArg::Scalar(#CALC!) and propagates the error.
+    /// Pins design § 6.3 (no nested array composition in v1).
     #[test]
     fn set_formula_transpose_of_sequence_in_arg_position_is_calc_error() {
         let mut wb = make_runtime_workbook();
@@ -7996,6 +7989,84 @@ mod tests {
         // this is a v1 limitation (design § 6.3 implicit-intersection
         // deferral).
         assert_eq!(v, Value::Error(ErrorValue::Calc));
+    }
+
+    // ===== W5-107 (Phase 4.7.N.2) — FILTER end-to-end =====
+
+    /// `=FILTER({1,2,3,4}, {TRUE,FALSE,TRUE,FALSE})` spills 1×2 with
+    /// kept values 1 and 3.
+    #[test]
+    fn set_formula_filter_row_keeps_truthy() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "FILTER({1, 2, 3, 4}, {TRUE, FALSE, TRUE, FALSE})")
+            .unwrap();
+        drop(rt);
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(1, 2))
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Number(1.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(3.0));
+    }
+
+    /// `=FILTER({1;2;3;4}, {TRUE;FALSE;TRUE;FALSE})` spills 2×1
+    /// preserving column orientation.
+    #[test]
+    fn set_formula_filter_column_keeps_truthy() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "FILTER({1; 2; 3; 4}, {TRUE; FALSE; TRUE; FALSE})")
+            .unwrap();
+        drop(rt);
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(2, 1))
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Number(1.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 0)), Value::Number(3.0));
+    }
+
+    /// `=FILTER({1,2,3}, {FALSE,FALSE,FALSE})` with no if_empty →
+    /// degenerate result → #CALC! at anchor, no spill.
+    #[test]
+    fn set_formula_filter_all_false_no_if_empty_produces_calc() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt
+            .set_formula(0, 0, 0, "FILTER({1, 2, 3}, {FALSE, FALSE, FALSE})")
+            .unwrap();
+        drop(rt);
+        assert_eq!(v, Value::Error(ErrorValue::Calc));
+        assert_eq!(wb.spill_anchor_at(0, 0, 0), None);
+    }
+
+    /// `=FILTER({1,2,3}, {FALSE,FALSE,FALSE}, "none")` with if_empty
+    /// → singleton spill of "none".
+    #[test]
+    fn set_formula_filter_all_false_with_if_empty_spills_singleton() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(
+            0,
+            0,
+            0,
+            "FILTER({1, 2, 3}, {FALSE, FALSE, FALSE}, \"none\")",
+        )
+        .unwrap();
+        drop(rt);
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(1, 1))
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Text(std::sync::Arc::from("none"))
+        );
     }
 
     // ===== W5-106 (Phase 4.7.M.2) — input-dependent shape transitions =====

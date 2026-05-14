@@ -264,6 +264,151 @@ pub fn transpose(args: &[FunctionArg], _ctx: &FunctionContext) -> FunctionReturn
     FunctionReturn::Array(arr)
 }
 
+/// Helper: extract the (rows, cols, cells) triple from an Array or
+/// Range arg shape. Scalar args become 1×1. Error args bubble up via
+/// `Err`. Used by FILTER for both its `array` and `include` args.
+fn arg_as_2d(arg: &FunctionArg) -> Result<(u32, u32, Vec<Value>), Value> {
+    match arg {
+        FunctionArg::Scalar(Value::Error(e)) => Err(Value::Error(*e)),
+        FunctionArg::Scalar(v) => Ok((1, 1, vec![v.clone()])),
+        FunctionArg::Array(a) => Ok((a.rows(), a.cols(), a.cells().to_vec())),
+        FunctionArg::Range { values, rows, cols } => {
+            if *rows > u32::MAX as usize || *cols > u32::MAX as usize {
+                return Err(Value::Error(ErrorValue::Num));
+            }
+            Ok((*rows as u32, *cols as u32, values.clone()))
+        }
+    }
+}
+
+/// **W5-107 (Phase 4.7.N.2) — FILTER.** Subset of `array` rows (or
+/// cols) where the corresponding `include` value is truthy.
+///
+/// `FILTER(array, include, [if_empty])`.
+///
+/// v1 contract — 1D only. `array` and `include` must both be:
+/// - row-vector (rows == 1, cols == N), OR
+/// - column-vector (rows == N, cols == 1).
+///
+/// Both must share the same orientation AND length. 2D `array`
+/// filtering (where include is per-row or per-col) is Excel canon but
+/// deferred to v2 (would need an orientation discriminator).
+///
+/// Truthy rules (Excel canon):
+/// - Number != 0 → truthy.
+/// - Boolean(true) → truthy.
+/// - Boolean(false), Number(0), Blank → falsy.
+/// - Text → not allowed; surface `#VALUE!` (Excel actually accepts
+///   text in some locales but our coercion is consistent with how
+///   SUMIF/etc. handle conditions; defer locale-permissive coercion).
+/// - Error in include cell → propagate.
+///
+/// Arity: 2 or 3. Wrong → `#N/A`.
+///
+/// Outcomes:
+/// - At least one include truthy → result vector with matching shape
+///   (row-of-N → row-of-K; column-of-N → column-of-K, where K is the
+///   truthy count).
+/// - All-false + `if_empty` provided → 1×1 ArrayValue of if_empty.
+/// - All-false + no `if_empty` → degenerate ArrayValue
+///   (cell-boundary path surfaces as `#CALC!`).
+/// - Shape mismatch (orientation or length) → `#VALUE!`.
+/// - Error in `array` or `include` cell → first error wins, propagate.
+pub fn filter(args: &[FunctionArg], _ctx: &FunctionContext) -> FunctionReturn {
+    if args.len() < 2 || args.len() > 3 {
+        return FunctionReturn::Scalar(Value::Error(ErrorValue::NA));
+    }
+
+    let (a_rows, a_cols, a_cells) = match arg_as_2d(&args[0]) {
+        Ok(t) => t,
+        Err(e) => return FunctionReturn::Scalar(e),
+    };
+    let (i_rows, i_cols, i_cells) = match arg_as_2d(&args[1]) {
+        Ok(t) => t,
+        Err(e) => return FunctionReturn::Scalar(e),
+    };
+
+    // v1 — 1D shape required. Determine orientation:
+    // row-vector: rows == 1 AND cols >= 1.
+    // column-vector: cols == 1 AND rows >= 1.
+    // Anything else (2D or degenerate) → #VALUE!.
+    let (is_row_vec, length): (bool, u32) = if a_rows == 1 && a_cols >= 1 {
+        (true, a_cols)
+    } else if a_cols == 1 && a_rows >= 1 {
+        (false, a_rows)
+    } else {
+        return FunctionReturn::Scalar(Value::Error(ErrorValue::Value));
+    };
+
+    // include must match orientation + length.
+    let include_matches_shape = if is_row_vec {
+        i_rows == 1 && i_cols == length
+    } else {
+        i_cols == 1 && i_rows == length
+    };
+    if !include_matches_shape {
+        return FunctionReturn::Scalar(Value::Error(ErrorValue::Value));
+    }
+
+    // Walk include cells, building the result. Truthy decision:
+    // - Error → propagate immediately (left-error wins).
+    // - Number != 0 → truthy.
+    // - Boolean(true) → truthy.
+    // - Boolean(false), Number(0), Blank → falsy.
+    // - Text → #VALUE!.
+    let mut kept: Vec<Value> = Vec::with_capacity(length as usize);
+    for (idx, include_v) in i_cells.iter().enumerate() {
+        let truthy = match include_v {
+            Value::Error(e) => return FunctionReturn::Scalar(Value::Error(*e)),
+            Value::Number(n) => *n != 0.0,
+            Value::Boolean(b) => *b,
+            Value::Blank => false,
+            Value::Text(_) => {
+                return FunctionReturn::Scalar(Value::Error(ErrorValue::Value));
+            }
+        };
+        if truthy {
+            // Defensive bound check — index is by construction
+            // < a_cells.len() since length == include length and
+            // we iterate include.
+            if let Some(cell) = a_cells.get(idx) {
+                // Per Excel canon, an Error in the data array
+                // surfaces as a per-cell error in the result
+                // (not propagated as the whole return). FILTER
+                // preserves whatever is in the kept cells.
+                kept.push(cell.clone());
+            }
+        }
+    }
+
+    // All-false case.
+    if kept.is_empty() {
+        if args.len() == 3 {
+            // if_empty provided — 1×1 with that value.
+            let if_empty_v = match &args[2] {
+                FunctionArg::Scalar(v) => v.clone(),
+                // Per Excel canon, if_empty as a non-scalar is
+                // unusual but accepted; we take cell (0, 0).
+                FunctionArg::Array(a) => a.first().clone(),
+                FunctionArg::Range { values, .. } => {
+                    values.first().cloned().unwrap_or(Value::Blank)
+                }
+            };
+            return FunctionReturn::Array(ArrayValue::singleton(if_empty_v));
+        }
+        // No if_empty — degenerate output. Cell-boundary surfaces #CALC!.
+        let degen_shape = if is_row_vec { (1, 0) } else { (0, 1) };
+        return FunctionReturn::Array(ArrayValue::empty(degen_shape.0, degen_shape.1));
+    }
+
+    // Non-empty result. Shape preserves orientation.
+    let k = kept.len() as u32;
+    let (out_rows, out_cols) = if is_row_vec { (1, k) } else { (k, 1) };
+    let arr = ArrayValue::new(out_rows, out_cols, kept)
+        .expect("kept.len() == rows*cols; ArrayValue::new must succeed");
+    FunctionReturn::Array(arr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,5 +768,235 @@ mod tests {
         assert_eq!(twice.rows(), 2);
         assert_eq!(twice.cols(), 3);
         assert_eq!(twice.cells(), original_cells.as_slice());
+    }
+
+    // ===== W5-107 (Phase 4.7.N.2) — FILTER =====
+
+    fn b(v: bool) -> Value {
+        Value::Boolean(v)
+    }
+
+    /// FILTER row vector with mixed mask → row of kept values.
+    /// {1,2,3,4} include {T,F,T,F} → {1,3} (1×2).
+    #[test]
+    fn filter_row_vector_keeps_truthy_only() {
+        let array = arr(
+            1,
+            4,
+            vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+                Value::Number(4.0),
+            ],
+        );
+        let include = arr(1, 4, vec![b(true), b(false), b(true), b(false)]);
+        let result = expect_array(filter(&[array, include], &ctx()));
+        assert_eq!(result.rows(), 1);
+        assert_eq!(result.cols(), 2);
+        assert_eq!(result.at(0, 0), &Value::Number(1.0));
+        assert_eq!(result.at(0, 1), &Value::Number(3.0));
+    }
+
+    /// FILTER column vector with mixed mask → column of kept values.
+    /// {1;2;3;4} include {T;F;T;F} → {1;3} (2×1).
+    #[test]
+    fn filter_column_vector_keeps_truthy_only() {
+        let array = arr(
+            4,
+            1,
+            vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+                Value::Number(4.0),
+            ],
+        );
+        let include = arr(4, 1, vec![b(true), b(false), b(true), b(false)]);
+        let result = expect_array(filter(&[array, include], &ctx()));
+        assert_eq!(result.rows(), 2);
+        assert_eq!(result.cols(), 1);
+        assert_eq!(result.at(0, 0), &Value::Number(1.0));
+        assert_eq!(result.at(1, 0), &Value::Number(3.0));
+    }
+
+    /// FILTER with all-truthy mask preserves full input.
+    #[test]
+    fn filter_all_truthy_returns_full_input() {
+        let array = arr(
+            1,
+            3,
+            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)],
+        );
+        let include = arr(1, 3, vec![b(true), b(true), b(true)]);
+        let result = expect_array(filter(&[array, include], &ctx()));
+        assert_eq!(result.rows(), 1);
+        assert_eq!(result.cols(), 3);
+    }
+
+    /// FILTER with all-false + no if_empty → degenerate ArrayValue.
+    /// Cell-boundary writeback surfaces #CALC!.
+    #[test]
+    fn filter_all_false_no_if_empty_returns_degenerate() {
+        let array = arr(
+            1,
+            3,
+            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)],
+        );
+        let include = arr(1, 3, vec![b(false), b(false), b(false)]);
+        let result = expect_array(filter(&[array, include], &ctx()));
+        assert!(result.is_degenerate());
+    }
+
+    /// FILTER with all-false + if_empty → 1×1 of if_empty.
+    #[test]
+    fn filter_all_false_with_if_empty_returns_singleton() {
+        let array = arr(
+            1,
+            3,
+            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)],
+        );
+        let include = arr(1, 3, vec![b(false), b(false), b(false)]);
+        let if_empty = FunctionArg::Scalar(Value::Text(std::sync::Arc::from("none")));
+        let result = expect_array(filter(&[array, include, if_empty], &ctx()));
+        assert_eq!(result.rows(), 1);
+        assert_eq!(result.cols(), 1);
+        assert_eq!(result.at(0, 0), &Value::Text(std::sync::Arc::from("none")));
+    }
+
+    /// Numeric truthy: non-zero number → keep; zero → drop.
+    #[test]
+    fn filter_numeric_truthy_zero_is_falsy() {
+        let array = arr(
+            1,
+            4,
+            vec![
+                Value::Number(10.0),
+                Value::Number(20.0),
+                Value::Number(30.0),
+                Value::Number(40.0),
+            ],
+        );
+        let include = arr(
+            1,
+            4,
+            vec![
+                Value::Number(1.0),
+                Value::Number(0.0),
+                Value::Number(-1.0),
+                Value::Number(0.0),
+            ],
+        );
+        let result = expect_array(filter(&[array, include], &ctx()));
+        assert_eq!(result.cols(), 2);
+        assert_eq!(result.at(0, 0), &Value::Number(10.0));
+        assert_eq!(result.at(0, 1), &Value::Number(30.0));
+    }
+
+    /// Blank in include → falsy.
+    #[test]
+    fn filter_blank_is_falsy() {
+        let array = arr(1, 2, vec![Value::Number(1.0), Value::Number(2.0)]);
+        let include = arr(1, 2, vec![Value::Blank, b(true)]);
+        let result = expect_array(filter(&[array, include], &ctx()));
+        assert_eq!(result.cols(), 1);
+        assert_eq!(result.at(0, 0), &Value::Number(2.0));
+    }
+
+    /// Text in include → #VALUE! (v1 doesn't coerce text booleans).
+    #[test]
+    fn filter_text_in_include_returns_value_error() {
+        let array = arr(1, 1, vec![Value::Number(1.0)]);
+        let include = FunctionArg::Array(
+            ArrayValue::new(1, 1, vec![Value::Text(std::sync::Arc::from("yes"))]).unwrap(),
+        );
+        let e = expect_scalar_error(filter(&[array, include], &ctx()));
+        assert_eq!(e, ErrorValue::Value);
+    }
+
+    /// Error in include propagates immediately (left-error wins).
+    #[test]
+    fn filter_error_in_include_propagates() {
+        let array = arr(1, 2, vec![Value::Number(1.0), Value::Number(2.0)]);
+        let include = arr(1, 2, vec![b(true), Value::Error(ErrorValue::DivZero)]);
+        let e = expect_scalar_error(filter(&[array, include], &ctx()));
+        assert_eq!(e, ErrorValue::DivZero);
+    }
+
+    /// Shape mismatch — different lengths → #VALUE!.
+    #[test]
+    fn filter_length_mismatch_returns_value_error() {
+        let array = arr(
+            1,
+            3,
+            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)],
+        );
+        let include = arr(1, 2, vec![b(true), b(false)]);
+        let e = expect_scalar_error(filter(&[array, include], &ctx()));
+        assert_eq!(e, ErrorValue::Value);
+    }
+
+    /// Shape mismatch — different orientation (row array, column include).
+    #[test]
+    fn filter_orientation_mismatch_returns_value_error() {
+        let array = arr(
+            1,
+            3,
+            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)],
+        );
+        let include = arr(3, 1, vec![b(true), b(false), b(true)]);
+        let e = expect_scalar_error(filter(&[array, include], &ctx()));
+        assert_eq!(e, ErrorValue::Value);
+    }
+
+    /// 2D array (rows > 1 AND cols > 1) → #VALUE! (v1 1D only).
+    #[test]
+    fn filter_2d_array_returns_value_error() {
+        let array = arr(
+            2,
+            2,
+            vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+                Value::Number(4.0),
+            ],
+        );
+        let include = arr(2, 2, vec![b(true), b(true), b(true), b(true)]);
+        let e = expect_scalar_error(filter(&[array, include], &ctx()));
+        assert_eq!(e, ErrorValue::Value);
+    }
+
+    /// Wrong arity — 0, 1, or 4+ args → #N/A.
+    #[test]
+    fn filter_zero_args_returns_na() {
+        let e = expect_scalar_error(filter(&[], &ctx()));
+        assert_eq!(e, ErrorValue::NA);
+    }
+
+    #[test]
+    fn filter_one_arg_returns_na() {
+        let array = arr(1, 1, vec![Value::Number(1.0)]);
+        let e = expect_scalar_error(filter(&[array], &ctx()));
+        assert_eq!(e, ErrorValue::NA);
+    }
+
+    #[test]
+    fn filter_four_args_returns_na() {
+        let array = arr(1, 1, vec![Value::Number(1.0)]);
+        let include = arr(1, 1, vec![b(true)]);
+        let if_empty = n(0.0);
+        let extra = n(0.0);
+        let e = expect_scalar_error(filter(&[array, include, if_empty, extra], &ctx()));
+        assert_eq!(e, ErrorValue::NA);
+    }
+
+    /// Error in array arg propagates.
+    #[test]
+    fn filter_error_in_array_propagates() {
+        let array = FunctionArg::Scalar(Value::Error(ErrorValue::Ref));
+        let include = arr(1, 1, vec![b(true)]);
+        let e = expect_scalar_error(filter(&[array, include], &ctx()));
+        assert_eq!(e, ErrorValue::Ref);
     }
 }

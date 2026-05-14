@@ -588,6 +588,7 @@ pub fn default_registry() -> FunctionRegistry {
     // functions. TRANSPOSE swaps rows ↔ cols; FILTER returns subset
     // matching a boolean mask.
     r.register_unified("TRANSPOSE", crate::array_returning_fns::transpose);
+    r.register_unified("FILTER", crate::array_returning_fns::filter);
 
     r
 }
@@ -635,8 +636,9 @@ mod tests {
         // of 6; NETWORKDAYS.INTL + WORKDAY.INTL deferred to tier-4) +
         // Phase 4.5.E (W5-83: TEXT = 1) +
         // Phase 4.7.M (W5-106: SEQUENCE = 1, first array-returning fn) +
-        // Phase 4.7.N (W5-107: TRANSPOSE = 1; FILTER lands in 4.7.N.2).
-        assert_eq!(r.len(), 132);
+        // Phase 4.7.N (W5-107: TRANSPOSE + FILTER = 2, second + third
+        // array-returning fns).
+        assert_eq!(r.len(), 133);
     }
 
     #[test]

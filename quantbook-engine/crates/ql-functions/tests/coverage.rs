@@ -268,6 +268,12 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
          array_returning_fns unit tests, not the scalar arg-coverage \
          matrix",
     ),
+    (
+        "FILTER",
+        "array-returning fn (W5-107) — covered by ql-exec spill tests + \
+         array_returning_fns unit tests, not the scalar arg-coverage \
+         matrix",
+    ),
 ];
 
 #[test]
