@@ -1,6 +1,6 @@
 # Engine Phase 4.8 — Structured References and Tables
 
-**Status:** Design doc (sub-phase 4.8.AA / W5-109). Pre-implementation. Codex review pending.
+**Status:** Design doc (sub-phase 4.8.AA / W5-109). Pre-implementation. **Codex review pass 1 closed 2026-05-14 (7 HIGH + 8 MEDIUM + 4 LOW); revisions inline below.**
 **Authored:** Claude Opus 4.7, 2026-05-14
 **Predecessor:** Phase 4.7 (array formulas + dynamic spills) shipped + closure-verified clean at HEAD `f00cb321e33`.
 **References:** `.references/ironcalc/base/src/expressions/lexer/structured_references.rs`; `.references/ironcalc/base/src/expressions/parser/tests/test_tables.rs`; `.references/ironcalc/base/src/types.rs` (Table); `.references/formualizer/crates/formualizer-parse/src/structured_ref.rs`; `.references/formualizer/crates/formualizer-eval/src/engine/graph/tables.rs`; `.references/formualizer/tests/corpus/tables/structured_refs_pending/`.
@@ -79,14 +79,42 @@ pub struct TableMetadata {
     has_header: bool,
     /// Totals row present at `top_row + rows - 1` if true. (Last row.)
     has_totals: bool,
-    /// Ordered list of column names. Length == `cols`. Stable IDs are
-    /// the indices into this Vec. Canonicalized to lowercase for
-    /// case-insensitive lookup; case-preserving display version stored
-    /// alongside (parallel Vec).
-    column_names: Vec<Arc<str>>,         // lowercase canonical
-    column_display: Vec<Arc<str>>,       // original case
+    /// Ordered list of columns. Length == `cols`. Canonical name is
+    /// lowercase; display preserves case; column_id is a stable
+    /// per-column u32 that persists across renames within the table
+    /// (allocated monotonically; never reused). totals_function is
+    /// metadata for Phase 4.10 auto-populate (4.8 stores only).
+    columns: Vec<TableColumn>,
+}
+
+pub struct TableColumn {
+    /// Stable id, monotonically allocated. NOT the index in `columns` —
+    /// removing a column does NOT renumber subsequent ids.
+    id: u32,
+    /// Lowercase canonical name.
+    name: Arc<str>,
+    /// Case-preserving display name.
+    display: Arc<str>,
+    /// Phase 4.10 will auto-populate the totals row when this is Some;
+    /// 4.8 just stores the metadata.
+    totals_function: Option<TotalsFunction>,
+}
+
+pub enum TotalsFunction {
+    None,
+    Average,
+    Count,
+    CountNums,
+    Max,
+    Min,
+    StdDev,
+    Sum,
+    Variance,
+    Custom,  // user-typed formula in the totals row
 }
 ```
+
+**Stable column ID** decision: post-Codex MEDIUM-1. The id field enables future formula-text-rewrite-on-column-rename to disambiguate columns even when names collide ephemerally (e.g., rename A→B while B exists). 4.8 doesn't load-bear on the id beyond serialization; later phases (4.10 calculated columns, Phase 5 column move) consume it.
 
 **Data-range computation** (helper methods):
 - `header_range()` — `(top_row, top_col)..(top_row, top_col+cols-1)` if `has_header` else None.
@@ -127,34 +155,87 @@ pub struct Workbook {
 2. **Column names within a table are unique** (case-insensitive). Excel requires this; if loaded data violates it, columns get auto-disambiguated as `Col1`, `Col2`, ... at load time.
 3. **Table footprint cannot overlap another table's footprint.** Validated at create / resize time.
 4. **Table footprint can overlap user-overlay cells.** Inserting a table over existing data is fine; the user's values remain visible but are now interpreted via table semantics for `Table[Col]` refs.
-5. **Tables cannot anchor spills** (4.7 interaction). If a `SEQUENCE(N)` formula lives inside a table's footprint and the spill would extend beyond the table boundary, the spill is blocked with `#SPILL!`. Within-table spills are allowed if they fit entirely.
+5. **Tables block ALL spill anchors inside their footprint** — REVISED post-Codex (HIGH-3). Original draft allowed within-table spills if they fit; Excel canon DOES NOT allow array formulas inside Tables. `=SEQUENCE(3)` typed into ANY cell inside a table footprint produces `#SPILL!` at the anchor (even if the resulting array would fit). Scalar formulas inside tables remain allowed. Validation: `write_spill` consults `Workbook::table_at(anchor)` before registering; a Some-result blocks.
 
-### 4.4 `TableId` vs `Arc<str>` names
+### 4.4 `TableId` vs `Arc<str>` names — REVISED post-Codex (HIGH-1)
 
-Decision: use `Arc<str>` (uppercase canonical) as the primary key, matching `NameTable`. A separate `TableId(u32)` is tempting for the graph (stable across renames) but adds complexity. The graph indexes tables by name; a rename triggers a re-extract pass on every formula that references the old name. This matches our existing `NameTable::generation` invalidation cadence and is consistent with how Excel itself behaves (renames cascade through formula text).
+Decision: use `Arc<str>` (uppercase canonical) as the primary key, matching `NameTable`. A separate `TableId(u32)` is tempting for the graph (stable across renames) but adds complexity. **Renames REWRITE formula text** (Excel canon, see § 12.2). The plan-cache-invalidation alternative (the original draft's approach) was broken: cached plans rebind against the OLD name and fail `BindError::UnknownTable`, breaking bind/recompute/persistence. Rewrite-on-rename is the simpler correct path.
 
-**Defer numeric IDs to a future polish wave** if the rename overhead proves real.
+**Defer numeric IDs to a future polish wave** if formula-text rewrite ever proves too expensive at scale.
+
+### 4.5 Table-to-formulas dep index — NEW post-Codex (HIGH-2)
+
+Mirrors `name_to_formulas` (existing in `CalcgraphSession`). Every formula's `extract_and_register_deps` pass discovers `StructuredRef` references and registers them in `table_to_formulas: HashMap<Arc<str>, HashSet<NodeId>>`. The runtime fires `on_table_create / on_table_rename / on_column_rename / on_table_resize / on_table_drop` hooks against this index when table metadata mutates. These hooks dirty the indexed formulas + transitively propagate dirty downstream (matching the W5-91 / `on_set_name` BFS fanout pattern). Without this index, `resize_table` growth would NOT dirty formulas reading the new rows.
 
 ## 5. Lexer changes
 
-### 5.1 New token
+### 5.1 New token — REVISED post-Codex (HIGH-5)
 
 ```rust
 Token::StructuredRef {
     table_name: Arc<str>,         // case-preserving
-    bracket_content: Arc<str>,    // verbatim from `[` to matching `]`
+    /// Unescaped bracket content. Lexer applies OOXML structured-
+    /// reference escape rules (see § 5.4) before emitting.
+    bracket_content: Arc<str>,
 }
 ```
 
-`bracket_content` is the unparsed bracket text; the parser runs the spec sub-grammar on it (parallel to how IronCalc separates lexer-stage capture from parser-stage interpretation).
+`bracket_content` is the bracket text with all escapes resolved; the parser runs the spec sub-grammar on the unescaped string.
 
-### 5.2 Recognition rule
+### 5.4 Bracket escape rules — NEW post-Codex (HIGH-5)
 
-After lexing an Ident, peek for `[`. If present AND the Ident is NOT a function name (we know the function name set), consume the bracket-balanced content as `bracket_content`. Emit `Token::StructuredRef`.
+Per OOXML / Excel structured-reference grammar, the bracket content has 5 escape-prefixed characters:
 
-**Function name collision:** `SUM[...]` is NOT a structured ref — it's a syntax error (functions use parens). The Ident-vs-FunctionRef discrimination happens at the lexer level via the function-name table.
+| Source | Resolves to |
+|---|---|
+| `'[` | literal `[` in identifier (e.g., column name with `[`) |
+| `']` | literal `]` |
+| `'#` | literal `#` (so a column literally named `#Foo` stays distinct from `#Foo` specifier) |
+| `'@` | literal `@` |
+| `''` | literal `'` |
+
+A naive bracket balancer would mis-nest on `Table[[Header'[X']]]` (a table whose column is named `Header[X]`). The lexer must consume the escape pair as a single character.
+
+The lexer's bracket-balancer pseudocode:
+```
+content = ""
+depth = 1            // we've consumed the opening [
+while depth > 0:
+    c = next char
+    if c == "'":
+        c2 = next char (must exist or LexError::UnterminatedStructuredRef)
+        content.push(c2)  // unescape: consume the pair as just c2
+    elif c == "[":
+        depth += 1
+        content.push(c)
+    elif c == "]":
+        depth -= 1
+        if depth > 0: content.push(c)
+    else:
+        content.push(c)
+emit Token::StructuredRef { table_name, bracket_content: content }
+```
+
+Test surface: headers containing `[`, `]`, `#`, `@`, and `'`.
+
+### 5.2 Recognition rule — REVISED post-Codex (MEDIUM-2, MEDIUM-3)
+
+After lexing an Ident, peek for `[`. If present, consume the bracket-balanced content (per § 5.4 escape rules) and emit `Token::StructuredRef`. **No function-name exclusion at the lexer level**: `SUM[Qty]` lexes as a structured ref (functions distinguish by `(`, not `[`); table-name validity is enforced by `create_table` (§ 12.1 + § 5.3).
 
 **Bare-column collision (Phase 4.7.N gap #148):** an Ident that matches a column letter pattern (`A`, `XFD`, etc.) lexes as `BareColumn` BEFORE checking for `[`. To resolve `Src[Col]` correctly, Ident classification must check for `[` lookahead FIRST, then fall back to BareColumn. **This is the close-out for #148** — Phase 4.8 lexer changes pre-empt the bare-column shadowing trap.
+
+### 5.3 Table-name validity — NEW post-Codex (MEDIUM-3)
+
+Excel table-name rules (enforced at `create_table` validation, NOT at the lexer):
+
+- Length ≥ 1, ≤ 255 (Excel limit).
+- Starts with letter, `_`, or backslash. Subsequent chars: letters, digits, `_`, `.`, `?`.
+- **NOT a cell reference pattern**: `A1`, `XFD1048576`, `R1C1`, `$A$1`, etc. — would shadow regular refs.
+- **NOT a column-letter pattern**: `A`, `XFD`, `BB`, ... (1–3 letters that lex as `BareColumn`). Excel rejects these for tables.
+- **NOT a reserved word**: `TRUE`, `FALSE`, `Print_Area`, `Print_Titles`, etc.
+- Unique case-insensitively across both `NameTable` AND `TableTable` (shared namespace; § 4.3 invariant #1).
+
+`A[0]` will lex as `Token::StructuredRef { table_name: "A", bracket_content: "0" }`. `create_table("A", ...)` will REJECT the name. So `A[0]` would emit `BindError::UnknownTable("A")` — which is acceptable: no table named `A` can exist. The lexer doesn't reject; the binder surfaces a precise error.
 
 ### 5.3 Tokens NOT introduced
 
@@ -172,26 +253,18 @@ Expr::StructuredRef {
 }
 ```
 
-### 6.2 `TableSpecSubtree`
+### 6.2 `TableSpecSubtree` — REVISED post-Codex (HIGH-4)
+
+Original draft used a fixed enum with `SpecialColumn(item, col)`-style flat variants. Excel allows arbitrary multi-item combinations: `Table[[#Data],[#Totals],[Col]]`, `Table[[#Headers],[Col1],[Col2]]`, etc. Formualizer's `Combination(Vec<...>)` is the right representation; we adopt it.
 
 ```rust
-pub enum TableSpecSubtree {
-    /// `Table[Col]` or `Table[[Col]]` — default data-column.
+pub enum TableSpecItem {
+    /// `#All`, `#Headers`, `#Data`, `#Totals`, `#This Row`.
+    Special(SpecialItem),
+    /// `[Col]` — single column.
     Column(Arc<str>),
-    /// `Table[[Col1]:[Col2]]` — column range, data rows.
+    /// `[Col1]:[Col2]` — column range (order-independent).
     ColumnRange(Arc<str>, Arc<str>),
-    /// `Table[[#Headers]]`, `Table[[#Totals]]`, `Table[[#All]]`,
-    /// `Table[[#Data]]` — whole-row specifier without a column scope.
-    SpecialAll(SpecialItem),
-    /// `Table[[#Headers], [Col]]` or `Table[[#Totals], [Col]]` etc.
-    SpecialColumn(SpecialItem, Arc<str>),
-    /// `Table[[#Headers], [Col1]:[Col2]]`.
-    SpecialColumnRange(SpecialItem, Arc<str>, Arc<str>),
-    /// `[@Col]` shorthand — current row, single column. Resolution
-    /// requires the binder to know the formula's cell address.
-    ThisRowColumn(Arc<str>),
-    /// `[@[Col1]:[Col2]]` shorthand — current row, column range.
-    ThisRowColumnRange(Arc<str>, Arc<str>),
 }
 
 pub enum SpecialItem {
@@ -199,11 +272,30 @@ pub enum SpecialItem {
     Totals,
     Data,
     All,
-    ThisRow,  // for `Table[[#This Row], [Col]]` form
+    ThisRow,
+}
+
+pub enum TableSpecSubtree {
+    /// `Table[Col]` — bare column shorthand. Single-item, no bracket pair.
+    /// Parser normalizes to `Combination(vec![Column(col)])` at bind time;
+    /// kept distinct here for printer round-trip.
+    BareColumn(Arc<str>),
+    /// `Table[[Col]]`, `Table[[#Headers]]`, `Table[[#Data], [Col]:[Col2]]`,
+    /// etc. The vec carries items in source order; the binder normalizes.
+    Combination(Vec<TableSpecItem>),
+    /// `[@Col]` shorthand — current row, single column. Distinct from
+    /// `Combination(vec![Special(ThisRow), Column(col)])` because the
+    /// `@`-form has different printer canon. Resolution requires the
+    /// binder to know the formula's cell address.
+    ThisRowColumn(Arc<str>),
+    /// `[@[Col1]:[Col2]]` shorthand.
+    ThisRowColumnRange(Arc<str>, Arc<str>),
 }
 ```
 
-**Note:** `ThisRow` as a `SpecialItem` (e.g., `Table[[#This Row], [Col]]`) and `ThisRowColumn(col)` (the `[@Col]` shorthand) are TWO distinct paths. The parser normalizes `Table[[#This Row], [Col]]` to `SpecialColumn(ThisRow, col)`; the `@`-prefixed form stays in `ThisRowColumn` until bind time.
+**Normalization at bind time:** the binder collapses `Combination` items to a single `RowSelector` (which rows are addressed) + a `ColumnSelector` (which columns are addressed), then intersects them to produce a `Range`. Multiple `Special` items combine as set-union over rows (e.g., `[#Headers],[#Data]` = headers ∪ data rows). Multiple `Column` items combine as ordered list of columns (which the binder validates as adjacent, since structured refs can't express a "gappy" range — Excel canon).
+
+**`ThisRow` in `Combination` vs `ThisRowColumn`:** `Table[[#This Row], [Col]]` parses to `Combination(vec![Special(ThisRow), Column(col)])`; `[@Col]` parses to `ThisRowColumn(col)`. Both bind to the same resolved single cell, but printer round-trip preserves the source syntax.
 
 ### 6.3 `Expr::StructuredRef` parsing path
 
@@ -272,13 +364,55 @@ For `Expr::StructuredRef { table_name, spec }`:
    - `BindError::ThisRowOutsideTable { table, formula_cell }`
    - `BindError::StructuredRefDegenerateRange(Arc<str>)` (e.g., `#Data` on a header-only table)
 
-### 7.3 Context plumbing
+### 7.3 Context plumbing — REVISED post-Codex (MEDIUM-4)
 
-The binder already takes `owning_sheet: SheetId` for resolving `Expr::CellRef`. Phase 4.8 extends to optionally take `owning_cell: Option<Address>` so the `ThisRowColumn` resolution has the formula's full cell address. Existing call sites that don't have a cell address (e.g., dry-run parse + bind for syntax validation) pass `None`; this causes `ThisRowColumn` binds to error precisely.
+The binder already takes `owning_sheet: SheetId` for resolving `Expr::CellRef`. Phase 4.8 introduces a `BindSite` struct to bundle context:
 
-### 7.4 `TableTable::generation` invalidation
+```rust
+pub struct BindSite {
+    pub sheet: SheetId,
+    /// The full cell address of the formula being bound. Required
+    /// for `ThisRowColumn` resolution. `None` allowed for dry-run
+    /// parse+bind (syntax validation, plan-cache pre-warm, etc.);
+    /// `ThisRowColumn` binds with `cell: None` surface
+    /// `BindError::ThisRowRequiresOwningCell`.
+    pub cell: Option<Address>,
+}
+```
 
-Plan cache key already includes `name_gen`. Add `table_gen`:
+Every call site of `bind_with_names_and_sheets` updates to take `&BindSite`. Call sites and the cell they should supply:
+- `WorkbookRuntime::set_formula(sheet, row, col, text)` → `cell: Some(Address)`.
+- `WorkbookRuntime::recompute_dirty / recompute_all` → reuse the formula's own cell address (always known).
+- `WorkbookRuntime::validate_formula(sheet, row, col, text)` → `cell: Some(Address)`.
+- `CalcgraphSession::bind_text` (used by `rebuild_from_workbook`) → `cell: Some(Address)` from the formula's location.
+- `CalcgraphSession::reextract_deps` → `cell: Some(Address)` from the reader node's location.
+- Pure syntax tests / parse fuzzers → `cell: None`.
+
+This is a multi-call-site change but mechanical. Sub-phase 4.8.E does the plumbing.
+
+### 7.4 Error-to-value mapping — NEW post-Codex (HIGH-7)
+
+Current bind failures surface as `RuntimeError::Bind(BindError)` from `set_formula`, which REJECTS the call. For recompute paths, the formula's cell value is left unchanged (W5-103 contract). This is too strict for table refs: a user typing `=SUM(Sales[Qty])` BEFORE `Sales` exists should land an error cell value, not refuse the formula.
+
+**Decision:** `set_formula` retains its REJECT-on-bind-error contract for SYNTACTIC errors (lex/parse). For SEMANTIC bind errors arising from table refs (unknown table, unknown column, this-row outside table, etc.), the formula text is ACCEPTED, the cell stores `Value::Error(...)`, and a future bind retry can succeed once the table exists.
+
+Mapping table:
+
+| `BindError` variant | Cell value at anchor |
+|---|---|
+| `UnknownTable` | `Value::Error(#NAME?)` |
+| `UnknownTableColumn` | `Value::Error(#REF!)` |
+| `TableHasNoHeader` | `Value::Error(#REF!)` |
+| `TableHasNoTotals` | `Value::Error(#REF!)` |
+| `ThisRowOutsideTable` | `Value::Error(#VALUE!)` |
+| `ThisRowRequiresOwningCell` | (internal — never reaches cell value) |
+| `StructuredRefDegenerateRange` | `Value::Error(#CALC!)` (consistent with 4.7) |
+
+Implementation: introduce a `BindError::is_table_related(&self) -> bool` and route table-related bind errors through a soft-fail path in `set_formula`. Recompute path naturally re-binds via plan cache invalidation when the table appears, so `on_table_create` dirties the formula and the next eval succeeds.
+
+### 7.5 Plan cache invalidation — REVISED post-Codex (HIGH-1 spillover)
+
+The original draft proposed a `table_gen: u64` field in `PlanCacheKey`. Per HIGH-1 closure (§ 12.2 — formula text is rewritten on rename), `table_gen` is no longer needed for renames. It IS needed for non-rename mutations: `resize_table` (range changes; cached plans hold the OLD resolved range), `column_rename` (column index changes), `drop_table` (cached plans hold a now-invalid range). Add `table_gen` for these cases:
 
 ```rust
 struct PlanCacheKey {
@@ -289,7 +423,7 @@ struct PlanCacheKey {
 }
 ```
 
-Any table mutation bumps `table_gen`; the next bind of any formula misses the cache and re-resolves against the new metadata.
+Mutations that bump `table_gen`: resize, column_rename, drop. (Create + rename rewrite formula text → text-keyed cache misses anyway.) `table_gen` bumps PLUS `on_table_*` dirty-propagation hooks together ensure dependent formulas re-evaluate against the new metadata.
 
 ## 8. Calcgraph dep extraction
 
@@ -301,13 +435,36 @@ Any table mutation bumps `table_gen`; the next bind of any formula misses the ca
 
 **Trade-off:** When a table is renamed or columns reshuffled, every formula referencing it must re-extract. With a dedicated vertex, only the vertex's range mapping changes. Our approach uses `table_gen` to invalidate the plan cache and re-bind on next eval — same end-state, simpler graph.
 
-### 8.2 `[@Col]` `ThisRowColumn` deps
+### 8.2 `[@Col]` `ThisRowColumn` deps — REVISED post-Codex (MEDIUM-5)
 
 The `is_this_row: bool` flag in `ExprPlan::StructuredRef` lets the dep extractor register a single CELL dep (not a range stripe), matching the runtime semantic of `@Col` resolving to a specific cell. Different from `Table[Col]` which is a column-wide range dep.
 
+**Walker behavior** (`walk_plan_for_deps` in `calcgraph_session.rs`) — NEW match arm:
+
+```rust
+ExprPlan::StructuredRef { resolved, is_this_row, table_name, .. } => {
+    if is_this_row {
+        // Single cell dep — the resolved Range is 1x1.
+        let (s, r, c) = resolved.top_left();
+        deps.cells.push((s, r, c));
+    } else {
+        // Range dep via stripe index (matches AggregateNameRef).
+        deps.range_refs.push(*resolved);
+    }
+    // Always register the table name dep so on_table_* hooks find us.
+    deps.tables.push(Arc::clone(table_name));
+}
+```
+
+`deps.tables: Vec<Arc<str>>` is NEW; populated alongside `deps.cells` / `deps.range_refs` / `deps.named_ranges`. Registered in `CalcgraphSession::table_to_formulas` (§ 4.5) at dep-extraction time.
+
 ### 8.3 Producer-alias rewrite interaction (4.7.I)
 
+### 8.4 Producer-alias rewrite interaction (4.7.I)
+
 If a `Table[Col]` resolves to a range that overlaps a spill footprint, the producer-alias rewrite (Phase 4.7.I) applies cell-by-cell. The same `spill_target_anchor` lookup runs for each cell in the resolved range. This is automatic — the resolved range goes through `walk_plan_for_deps` like any other range.
+
+In practice this is a narrow case (per § 4.3 invariant #5, tables BLOCK spill anchors inside their footprint, so the overlap scenario is "table data feeds a SUM that gets spilled into ELSEWHERE"). The rewrite stays general.
 
 ## 9. Storage layout
 
@@ -379,7 +536,7 @@ pub enum Op {
 
 Replay validates each op against current state; collisions (e.g., `CreateTable` for a name that already exists) surface as `ReplayError::TableCollision` (no silent overwrite). Op log atomicity per the Phase 4.7.J HIGH-3 pattern: append BEFORE mutation; failed append leaves workbook unchanged.
 
-### 10.3 `.qbook` schema bump v5 → v6
+### 10.3 `.qbook` schema bump v5 → v6 — REVISED post-Codex (MEDIUM-7)
 
 The 4.7 wave kept the schema at v5 (the save-side spill-target skip was behavioral). Adding `TableTable` persistence requires v6.
 
@@ -388,11 +545,14 @@ schema v6:
   + tables: Vec<TableMetadataRecord>
 ```
 
-Backward compat: v5 files load with `TableTable::default()` (empty); the loader records this in the bookkeeping. v6-savers warn on load of a v5 file (the warning surfaces in `LoadResult` per CLAUDE.md "errors must be visible"). v5 files saved by a v6-writer get upgraded silently (no-op for empty TableTable).
+**Backward compat (forward-vs-back, per Codex):**
+- **v6 reader loading v1–v5 file**: tables field absent → `TableTable::default()` (empty). Safe.
+- **v5 reader loading v6 file**: the existing reader bound `v4..=WORKBOOK_SCHEMA_VERSION` REFUSES v6. **This is correct**: silently dropping table metadata would break formulas (a formula referencing `Sales[Qty]` would surface `BindError::UnknownTable` after load → cell renders `#NAME?` when pre-save it was a valid SUM). Loud refusal preserves semantic integrity.
+- **v6 reader writing v5-compat**: not supported in 4.8. If the file is read by a v5-only reader, it fails loud. (Downgrade-on-save would be a Phase 5 export option.)
 
 ### 10.4 `MIN_SUPPORTED_SCHEMA_VERSION`
 
-Stays at 4 (no need to drop v5 support). v6 writer + v4/v5/v6 reader.
+Stays at 4 (v6 writer + v4/v5/v6 reader for read; write always v6).
 
 ## 11. Function library interactions
 
@@ -435,17 +595,36 @@ Validates:
 
 Emits `Op::CreateTable`. Bumps `TableTable::generation`.
 
-### 12.2 `rename_table` / `rename_column`
+### 12.2 `rename_table` / `rename_column` — REVISED post-Codex (HIGH-1)
 
-Both fire the `table_gen` bump → next bind re-resolves formula text against the new name. **Formula text in cells is NOT rewritten** (Excel canon: formula text references resolve at bind time; the printer renders the current name). The Phase 4.6 sheet-rename pattern is the precedent.
+**Formula text IS rewritten on rename** (Excel canon). The original draft proposed plan-cache invalidation + no rewrite — Codex correctly noted that cached plans rebind against the OLD name and fail `BindError::UnknownTable`, breaking bind/recompute/persistence.
 
-**Edge case:** if formula text was authored before the table existed (when `Table[Col]` would have failed to bind as `UnknownTable`), creating the table NOW must dirty those formulas so they re-bind successfully. → `Workbook::tables_mut().create(...)` calls `CalcgraphSession::on_table_create(name)` which dirties every formula text-matching `name` (similar to `on_set_name`).
+**Implementation flow** for `rename_table(old, new)`:
+1. Validate: `new` is a valid table name (§ 5.3), not already taken in NameTable or TableTable.
+2. Op log append `Op::RenameTable { old, new }` (before any mutation; W5-103 atomicity pattern).
+3. Walk every formula in `table_to_formulas[old]` (the dep index from § 4.5):
+   - Rewrite formula text via `ql-formula-syntax::ast::rewrite_table_ref(old, new)` — produces new text.
+   - `Workbook::put_formula(sheet, row, col, new_text)`.
+   - Mark the cell dirty in `CalcgraphSession`.
+4. Update `TableTable`: rekey from `old` to `new`.
+5. Update `table_to_formulas[new] = table_to_formulas.remove(old)`.
 
-### 12.3 `resize_table`
+`rename_column` follows the same pattern but rewrites column references INSIDE bracket content rather than the table name itself.
 
-Two scenarios:
-- **Grow rows:** common case (user added rows below the table). Update `rows`. No graph mutations needed; deps registered against the OLD range still cover the new region only if the binder re-extracted them. → bump `table_gen`, mark all dependents dirty via existing range-stripe machinery, force re-extract on next recompute.
-- **Add column:** append a column name to the roster. Same dirty/re-extract pass. Inserting a column in the MIDDLE is NOT supported in 4.8 (deferred to Phase 5 structural edits).
+**ast::rewrite_table_ref** is a tree-walk pass (mirrors `rewrite_sheet_ref` from Phase 4.6 sheet rename). Phase 4.6 already established this pattern; we extend it for `Expr::StructuredRef`.
+
+**Cells with formula text referencing tables that didn't exist at bind time** are listed in a `pending_table_refs: HashSet<(Arc<str>, NodeId)>` map (populated when bind surfaces `UnknownTable`). `on_table_create` queries this map + dirties the matching formulas so the next eval re-binds with the new table in scope.
+
+### 12.3 `resize_table` — REVISED post-Codex (LOW-3, HIGH-2)
+
+Three scenarios:
+- **Grow rows:** common case (user added rows below the table). Update `rows`. Bump `table_gen`. Walk `table_to_formulas[name]` and mark every dependent dirty so they re-extract against the new range.
+- **Add column at end:** append a column to the roster. Same dirty/re-extract pass. Allocates a new `column_id`.
+- **Remove last column:** truncate the roster. Same dirty/re-extract pass. `ResizeTable { removed_columns: vec![last_col] }`.
+
+Inserting / removing a column in the MIDDLE is NOT supported in 4.8 (deferred to Phase 5 structural edits — requires physical cell move).
+
+Op log encoding: one `Op::ResizeTable { name, new_rows, new_cols, added_columns: Vec<TableColumnRecord>, removed_columns: Vec<String> }`. Single atomic op (Codex open-question 6 closure). Replay sees missing-table → `ReplayError::TableNotFound`.
 
 ### 12.4 `drop_table`
 
@@ -453,45 +632,53 @@ Removes metadata. Formula text referencing the dropped table re-binds to `BindEr
 
 ## 13. Cross-cutting decisions
 
-1. **No fallbacks** — unknown table / column / specifier surfaces a specific bind error (per CLAUDE.md "errors must be visible"). No "graceful fallback to A1 notation."
+1. **No fallbacks** — unknown table / column / specifier surfaces a specific bind error (per CLAUDE.md "errors must be visible"). Table-related bind errors map to cell error values per § 7.4 (so a formula referencing a not-yet-created table is accepted with an error cell value; later `create_table` dirties + re-binds).
 2. **Case-insensitive name lookups** — match Excel canon. Canonical = uppercase for lookups; case-preserving for display.
-3. **Shared name/table namespace** — registration validates against both; collisions reject.
-4. **Plan cache key extension** — `table_gen` joins `name_gen` and `sheet` in `PlanCacheKey`.
-5. **Op log is the source of truth for replay** — `Workbook::tables_mut().create(...)` direct calls bypass the op log (low-level path); runtime calls always emit the op.
-6. **Persistence schema bump** — v5 → v6. Backward-compat with v5 (empty tables on load).
-7. **`[@Col]` requires owning_cell context** — bind without context fails precisely.
+3. **Shared name/table namespace** — registration validates against both; collisions reject. **Sheet-scoped names** (4.6.D existing feature): a sheet-scoped name AND a workbook-scoped table collide on the canonical key — hard collision, both refuse (Codex LOW-1 closure).
+4. **Plan cache key extension** — `table_gen` joins `name_gen` and `sheet` in `PlanCacheKey` (only for resize/column_rename/drop; create+rename rewrite formula text so text-keyed cache misses anyway).
+5. **Op log is the source of truth for replay** — `Workbook::tables_mut().create(...)` direct calls bypass the op log (low-level path); runtime calls always emit the op. Direct calls are reserved for the qbook loader.
+6. **Persistence schema bump** — v5 → v6. v6 reader loads v4–v6; v5 reader REFUSES v6 (loud-fail per § 10.3).
+7. **`[@Col]` requires owning_cell context** — bind without context fails precisely with `BindError::ThisRowRequiresOwningCell`.
 8. **Tables can't overlap** — validated at create + resize.
-9. **No dedicated graph vertex per table** — table refs are range refs; the stripe index already handles invalidation.
-10. **Phase 4.8 closes #148** — bare-column shadowing — by re-ordering the lexer's Ident-with-lookahead check.
+9. **No dedicated graph vertex per table** — table refs are range refs; `table_to_formulas` dep index + `on_table_*` hooks handle metadata-change invalidation directly (§ 4.5).
+10. **Renames rewrite formula text** — `ast::rewrite_table_ref(old, new)` tree-walk per § 12.2; matches Phase 4.6 sheet-rename precedent.
+11. **Spills inside tables blocked** — § 4.3 invariant #5 (Codex HIGH-3 closure).
+12. **Table-related bind errors are soft** — accepted formula text + error cell value (§ 7.4); non-table bind errors stay hard.
+13. **Phase 4.8 closes #148** — bare-column shadowing — by re-ordering the lexer's Ident-with-lookahead check.
 
-## 14. Sub-phase split
+## 14. Sub-phase split — REVISED post-Codex (MEDIUM-8, LOW-4)
 
-Each sub-phase ships independently (1 commit + 7 gates green) with self-audit; Codex pull-up at major milestones; closing megaudit at 4.8.O.
+Each sub-phase ships independently (1 commit + 7 gates green) with self-audit; Codex pull-ups at major milestones; closing megaudit at 4.8.O.
+
+**Codex MEDIUM-8 fix**: first E2E test moves earlier — to 4.8.H (after create + binder + walker land). Codex correctly noted that 4.8.M (the prior position) was too late.
+
+**Estimate revision (Codex LOW-4)**: 1-2 weeks was optimistic. Realistic: 2-3 weeks, matching 4.7 complexity once rename rewriting, dirty hooks, parser combinations, escape rules, and persistence are accounted for.
 
 | # | Sub-phase | Subject | Audit |
 |---|---|---|---|
-| 0 | **4.8.AA** (W5-109) | This design doc + Codex review (doc-only) | Codex review (this commit) |
-| 1 | **4.8.A** (W5-110) | `TableMetadata` + `TableTable` in `ql-storage` + module wiring | Self + Sonnet |
-| 2 | **4.8.B** (W5-111) | Lexer: `Token::StructuredRef`; Ident-with-`[`-lookahead pre-empts BareColumn (closes #148) | Self + Sonnet + Codex pull-up |
-| 3 | **4.8.C** (W5-112) | Parser: `Expr::StructuredRef` + `TableSpecSubtree` sub-grammar | Self + Sonnet |
-| 4 | **4.8.D** (W5-113) | Printer: `Expr::StructuredRef` round-trip + display-name preservation | Self only |
-| 5 | **4.8.E** (W5-114) | Binder: `ExprPlan::StructuredRef` resolution + `BindError::Unknown{Table,TableColumn}` variants | Self + Sonnet |
-| 6 | **4.8.F** (W5-115) | Binder: `[@Col]` `owning_cell` context plumbing + `BindError::ThisRowOutsideTable` | Self + Sonnet |
-| 7 | **4.8.G** (W5-116) | Plan cache extension: `table_gen` in `PlanCacheKey` | Self only |
-| 8 | **4.8.H** (W5-117) | Workbook runtime: `create_table` / `drop_table` + op log emission | Self + Sonnet + Codex pull-up |
-| 9 | **4.8.I** (W5-118) | Workbook runtime: `rename_table` / `rename_column` + calcgraph dirty propagation | Self + Sonnet |
-| 10 | **4.8.J** (W5-119) | Workbook runtime: `resize_table` (grow rows + add column) | Self + Sonnet |
+| 0 | **4.8.AA** (W5-109) | This design doc + Codex review (doc-only) — pass 2 closed below | Codex review (closed) |
+| 1 | **4.8.A** (W5-110) | `TableMetadata` + `TableColumn` + `TableTable` in `ql-storage` + module wiring | Self + Sonnet |
+| 2 | **4.8.B** (W5-111) | Lexer: `Token::StructuredRef` + bracket-escape rules (§ 5.4); Ident-with-`[`-lookahead pre-empts BareColumn (closes #148); table-name validation in `create_table` rejects A[0]-style collisions | Self + Sonnet + Codex pull-up |
+| 3 | **4.8.C** (W5-112) | Parser: `Expr::StructuredRef` + `TableSpecSubtree::Combination` sub-grammar (multi-item support per § 6.2) | Self + Sonnet |
+| 4 | **4.8.D** (W5-113) | Printer: `Expr::StructuredRef` round-trip (syntax-only — no workbook lookup per Codex MEDIUM-6) | Self only |
+| 5 | **4.8.E** (W5-114) | `BindSite` struct + plumb owning_cell through every bind call site (set_formula, recompute, validate_formula, reextract, rebuild) | Self + Sonnet |
+| 6 | **4.8.F** (W5-115) | Binder: `ExprPlan::StructuredRef` resolution + new `BindError` variants + § 7.4 error-to-cell-value mapping | Self + Sonnet |
+| 7 | **4.8.G** (W5-116) | Calcgraph: `walk_plan_for_deps` arm for StructuredRef + `table_to_formulas` dep index + `on_table_*` hooks (§ 4.5, § 8.2); plan cache `table_gen` field | Self + Sonnet + Codex pull-up |
+| 8 | **4.8.H** (W5-117) | Workbook runtime: `create_table` / `drop_table` + op log emission + **first E2E test** (`SUM(Sales[Qty])` round-trip) | Self + Sonnet |
+| 9 | **4.8.I** (W5-118) | Workbook runtime: `rename_table` / `rename_column` + `ast::rewrite_table_ref` tree-walk + formula text rewrite + dirty propagation | Self + Sonnet + Codex pull-up |
+| 10 | **4.8.J** (W5-119) | Workbook runtime: `resize_table` (grow rows + add/remove last column) + spill-anchor block (§ 4.3 invariant #5) | Self + Sonnet |
 | 11 | **4.8.K** (W5-120) | Op log: `CreateTable / RenameTable / RenameColumn / ResizeTable / DropTable` replay | Self + Sonnet |
-| 12 | **4.8.L** (W5-121) | Persistence: schema v5 → v6 + `TableTable` save/load + load-side v5 compat | Self + Sonnet |
-| 13 | **4.8.M** (W5-122) | First end-to-end test: `SUM(Sales[Qty])` round-trip through aggregate cache | Self only |
-| 14 | **4.8.N** (W5-123) | Specifier coverage: `#Headers`, `#Totals`, `#All`, `#Data`, `#This Row` + column ranges | Self only |
+| 12 | **4.8.L** (W5-121) | Persistence: schema v5 → v6 + `TableTable` save/load + v5-reader fails loud on v6 | Self + Sonnet |
+| 13 | **4.8.M** (W5-122) | Specifier coverage tests: `#Headers`, `#Totals`, `#All`, `#Data`, `#This Row` + `[@Col]` + column ranges + combinations | Self only |
+| 14 | **4.8.N** (W5-123) | Edge cases: header-only table (empty-data bind error), `A[0]`-style collisions, escape-prefix headers, dropped-table re-binding | Self only |
 | 15 | **4.8.O** (W5-124) | Closing mega-audit (Codex + Sonnet parallel) | **Codex + Sonnet** |
 
-16 sub-phases (15 implementation + 1 design). Estimated 1-2 weeks at prior pace.
+16 sub-phases (15 implementation + 1 design). **Estimated 2-3 weeks at prior pace (revised post-Codex).**
 
 **Stop conditions** (defer remaining to a Phase 4.8 polish wave):
-- If 4.8.B Ident-with-`[`-lookahead surfaces unforeseen tokenizer regressions, halt and re-design (#148 was assumed cheap).
-- If 4.8.E `[@Col]` resolution proves hard to plumb without major binder refactor, defer the shorthand to 4.9 and ship the explicit form only.
+- If 4.8.B Ident-with-`[`-lookahead surfaces unforeseen tokenizer regressions, halt and re-design.
+- If 4.8.E owning_cell plumbing balloons (Codex MEDIUM-4 flagged 5+ call sites; if more emerge, refactor `bind_with_names_and_sheets` signature first).
+- If 4.8.F error-to-cell-value mapping breaks the existing `set_formula` REJECT contract for non-table errors, halt — backwards compat for existing bind errors is non-negotiable.
 - If schema bump in 4.8.L breaks load-recompute round-trip for v5 files, halt — backward compat is non-negotiable.
 
 ## 15. What's NOT in scope
@@ -505,15 +692,41 @@ Each sub-phase ships independently (1 commit + 7 gates green) with self-audit; C
 - Slicers / filtered views. Phase 5+.
 - Phase 4.10 polish: dynamic column index refs (`Table[INDEX(headers, 2)]`).
 
-## 16. Open questions for Codex review
+## 16. Open questions — CLOSED post-Codex pass 1
 
-1. **Spec sub-grammar normalization** — should `Sales[[Col]]` and `Sales[Col]` be the SAME AST node (normalize at parse time) or remain distinct for printer round-trip? I propose normalize; Codex weigh in.
-2. **`[@Col]` outside a table's owning row** — Excel surfaces `#VALUE!`; I propose `BindError::ThisRowOutsideTable` at bind time (precise) rather than runtime `#VALUE!`. Codex preference?
-3. **Table name as defined-name interaction** — if a user runs `set_name("Sales", Constant(5))` AFTER `create_table("Sales", ...)`, should it (a) fail at set_name with `NameTableError::CollidesWithTable`, (b) succeed and shadow the table for scalar-context references, or (c) something else? I propose (a) — hard collision.
-4. **Header-row-only table** (header but no data rows) — design § 13.2 of 4.7 ships degenerate spills as `#CALC!`; should `Sales[Qty]` on a zero-data-row table surface `#CALC!` or `#REF!`? I propose `#CALC!` (consistent with 4.7).
-5. **Cross-sheet table refs** — Excel supports `Sheet1.Sales[Qty]`. I propose v1 supports it via the existing sheet-qualified-ref machinery, but defer 3D ranges. Codex confirm?
-6. **Op log atomicity for `ResizeTable`** — adding a column changes both `cols` AND `column_names`. Should this be one op or two? I propose one (`ResizeTable` carries both new dims AND column deltas) to avoid mid-replay inconsistent state.
-7. **Per-table graph vertex** — I argue against (§ 8.1); Codex push back if Formualizer's approach has wins I'm missing.
-8. **`#148` closure as part of 4.8.B** — bare-column shadowing fix lands as a side-effect. Codex confirm this is the right sub-phase to fold it in.
+All 8 open questions resolved by Codex's pass-1 review. Decisions adopted into the design:
 
-Codex: review this doc end-to-end. Flag missing acceptance criteria, mis-categorized sub-phases, incorrect Excel-canon claims, missing op-log variants, schema-compat risks. Treat the open questions above as starting points; surface anything else you'd push back on.
+1. **Spec sub-grammar normalization** — semantically normalize at bind time (collapse `Sales[[Col]]` and `Sales[Col]` to the same RowSelector + ColumnSelector); the AST keeps distinct `BareColumn` vs `Combination(vec![Column(c)])` variants for printer round-trip. Codex agreed; documented in § 6.2.
+2. **`[@Col]` outside owning row** — `BindError::ThisRowOutsideTable` at bind time; mapped to `Value::Error(#VALUE!)` cell value per § 7.4 error mapping. Codex agreed.
+3. **Name/table collision** — hard collision (set_name AND create_table both refuse). Sheet-scoped names included. Codex LOW-1 closure.
+4. **Header-only table** — `ql_types::Range` (inclusive) can't represent zero rows. v1 choice: `BindError::StructuredRefDegenerateRange` at bind time → `Value::Error(#CALC!)` cell value. Defer "EmptyRange" type to a future polish wave. Codex HIGH-6 closure.
+5. **Cross-sheet table refs** — Codex pushed back: table names are workbook-scoped; `Sales[Qty]` is reachable from any sheet via the unqualified `Sales` lookup. `Sheet1.Sales[Qty]` requires lexer/parser proof, deferred to Phase 4.9 alongside other sheet-qualified work. The unqualified form works in v1.
+6. **`ResizeTable` op atomicity** — one atomic op carrying both new dims AND column deltas; replay sees missing-table → `ReplayError::TableNotFound` (fail-loud). Codex agreed.
+7. **Per-table graph vertex** — no dedicated vertex; `table_to_formulas` dep index (§ 4.5) + `on_table_*` hooks handle metadata-change invalidation directly. Codex agreed conditionally on the dep index existing (which it now does in § 4.5).
+8. **#148 closure folded into 4.8.B** — yes, with regression tests for `Src[Col]`, `A:A`, `A[0]` (table-name validation rejects), `SUM[X]` (table-name validation rejects). Codex confirmed.
+
+## 17. Codex pass-1 review summary
+
+Codex's pass-1 review (7 HIGH + 8 MEDIUM + 4 LOW) drove the revisions above:
+
+- **HIGH-1 (rename semantics)** → § 4.4 + § 12.2: rewrite formula text on rename.
+- **HIGH-2 (dirty hooks)** → § 4.5: `table_to_formulas` dep index + `on_table_*` hooks.
+- **HIGH-3 (spills inside tables)** → § 4.3 invariant #5: block ALL spill anchors.
+- **HIGH-4 (AST combinations)** → § 6.2: `TableSpecSubtree::Combination(Vec<TableSpecItem>)`.
+- **HIGH-5 (escape rules)** → § 5.4: OOXML escape pseudocode + test surface.
+- **HIGH-6 (empty ranges)** → § 16 q4: header-only is bind error in v1.
+- **HIGH-7 (error rendering)** → § 7.4: error-to-cell-value mapping.
+- **MEDIUM-1 (column IDs + totals function)** → § 4.1 revised.
+- **MEDIUM-2 (function-name exclusion)** → § 5.2 revised: no lexer-side filter.
+- **MEDIUM-3 (table-name validation)** → § 5.3: explicit Excel-ish rules.
+- **MEDIUM-4 (BindSite)** → § 7.3: struct + call-site enumeration.
+- **MEDIUM-5 (walker changes)** → § 8.2: explicit StructuredRef arm.
+- **MEDIUM-6 (printer separation)** → § 14 sub-phase 4.8.D note: syntax-only printer.
+- **MEDIUM-7 (schema compat)** → § 10.3: v5 reader fails loud on v6.
+- **MEDIUM-8 (sub-phase ordering)** → § 14: first E2E at 4.8.H.
+- **LOW-1 (sheet-scoped names)** → § 13 decision #3.
+- **LOW-2 (header/totals row [@Col])** → § 13 decision #7 + § 7.4.
+- **LOW-3 (remove last column)** → § 12.3.
+- **LOW-4 (estimate)** → § 14: 2-3 weeks.
+
+**Ready for implementation pass.** Optional Codex pass-2 verification possible before 4.8.A; not blocking.
