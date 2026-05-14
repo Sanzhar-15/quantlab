@@ -75,6 +75,14 @@ pub trait CellEnv {
     fn eval_context(&self) -> &EvalContext {
         &DEFAULT_EVAL_CONTEXT
     }
+
+    /// **W5-117 (Phase 4.8.G.2):** the formula's own cell address, if
+    /// the env was constructed with one. Used by the structured-ref
+    /// `[@Col]` row-narrowing path in scalar.rs. Default impl returns
+    /// `None` — only `WorkbookEnv::with_formula_cell` overrides.
+    fn formula_cell_for_sref(&self) -> Option<ql_types::Address> {
+        None
+    }
 }
 
 /// `ql-storage::Workbook`-backed implementation. Wraps a Workbook reference; reads dispatch
@@ -87,6 +95,13 @@ pub trait CellEnv {
 pub struct WorkbookEnv<'w> {
     workbook: &'w ql_storage::Workbook,
     eval_ctx: EvalContext,
+    /// **W5-117 (Phase 4.8.G.2):** the formula's own cell address, if
+    /// known. Used by the eval-side `ExprPlan::StructuredRef` arm to
+    /// narrow `[@Col]` forms (resolved is the full column data range;
+    /// eval narrows row to `formula_cell.row` if it falls inside the
+    /// range). `None` for paths without cell context (legacy callers,
+    /// tests).
+    formula_cell: Option<ql_types::Address>,
 }
 
 impl<'w> WorkbookEnv<'w> {
@@ -95,7 +110,31 @@ impl<'w> WorkbookEnv<'w> {
             date_system: workbook.date_system(),
             ..EvalContext::default()
         };
-        Self { workbook, eval_ctx }
+        Self {
+            workbook,
+            eval_ctx,
+            formula_cell: None,
+        }
+    }
+
+    /// **W5-117 (Phase 4.8.G.2):** WorkbookEnv variant that carries the
+    /// formula's own cell. Used at eval time when the caller knows
+    /// the cell (set_formula, recompute_dirty, recompute_all,
+    /// validate_formula).
+    pub fn with_formula_cell(
+        workbook: &'w ql_storage::Workbook,
+        cell: ql_types::Address,
+    ) -> Self {
+        let mut env = Self::new(workbook);
+        env.formula_cell = Some(cell);
+        env
+    }
+
+    /// **W5-117 (Phase 4.8.G.2):** the formula's cell address, if the
+    /// env was constructed with one. Used by the structured-ref `[@Col]`
+    /// narrowing path in scalar.rs.
+    pub fn formula_cell(&self) -> Option<ql_types::Address> {
+        self.formula_cell
     }
 }
 
@@ -216,6 +255,13 @@ impl<'w> CellEnv for WorkbookEnv<'w> {
     /// `&DEFAULT_EVAL_CONTEXT`).
     fn eval_context(&self) -> &EvalContext {
         &self.eval_ctx
+    }
+
+    /// **W5-117 (Phase 4.8.G.2):** the formula's own cell address, if
+    /// constructed via `with_formula_cell`. The scalar.rs StructuredRef
+    /// `[@Col]` arm uses this for row narrowing.
+    fn formula_cell_for_sref(&self) -> Option<ql_types::Address> {
+        self.formula_cell
     }
 }
 

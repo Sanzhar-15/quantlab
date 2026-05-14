@@ -633,7 +633,12 @@ impl<'a> WorkbookRuntime<'a> {
         // `eval_scalar_with_cache` (inside `eval_at_cell_boundary`) so
         // aggregate-range results land in the session's cache.
         let result: EvalResult = {
-            let env = WorkbookEnv::new(self.workbook);
+            // **W5-117 (Phase 4.8.G.2):** carry the formula's cell for
+            // structured-ref `[@Col]` row narrowing at eval time.
+            let env = WorkbookEnv::with_formula_cell(
+                self.workbook,
+                ql_types::Address::new(sheet, row, col),
+            );
             match self.graph.as_deref() {
                 Some(session) => crate::scalar::eval_at_cell_boundary(
                     plan.as_ref(),
@@ -1984,7 +1989,11 @@ impl<'a> WorkbookRuntime<'a> {
             self.workbook,
             self.workbook,
         )?;
-        let env = WorkbookEnv::new(self.workbook);
+        // **W5-117 (Phase 4.8.G.2):** carry cell for `[@Col]` narrowing.
+        let env = WorkbookEnv::with_formula_cell(
+            self.workbook,
+            ql_types::Address::new(sheet, row, col),
+        );
         // **W5-103 megaudit MEDIUM-3 closure (#129):** route through
         // `eval_at_cell_boundary` so a top-level array literal like
         // `{1, 2, 3}` returns the anchor value (array.at(0,0)) instead
@@ -2573,7 +2582,12 @@ impl<'a> WorkbookRuntime<'a> {
         self.workbook.clear_spill_if_present((sheet, row, col));
 
         let result: crate::eval_result::EvalResult = {
-            let env = WorkbookEnv::new(self.workbook);
+            // **W5-117 (Phase 4.8.G.2):** carry recomputed cell for
+            // structured-ref `[@Col]` row narrowing.
+            let env = WorkbookEnv::with_formula_cell(
+                self.workbook,
+                ql_types::Address::new(sheet, row, col),
+            );
             crate::scalar::eval_at_cell_boundary(plan.as_ref(), &env, self.registry, agg_cache)
         };
 
@@ -8731,6 +8745,97 @@ mod tests {
         let v = rt.set_formula(0, 10, 0, "SUM(Sales[Qty])").unwrap();
         drop(rt);
         assert_eq!(v, Value::Number(100.0), "SUM(Sales[Qty]) = 10+20+30+40");
+    }
+
+    /// **Phase 4.8.G.2 e2e:** `[@Qty]` shorthand inside a table data
+    /// cell resolves to the same-row's Qty value. Pins eval-time row
+    /// narrowing via `WorkbookEnv::with_formula_cell`.
+    #[test]
+    fn structured_ref_at_column_narrows_to_current_row() {
+        use ql_storage::{TableColumn, TableMetadata};
+        let mut wb = make_runtime_workbook();
+        let table = TableMetadata {
+            name: Arc::from("SALES"),
+            display_name: Arc::from("Sales"),
+            sheet: 0,
+            top_row: 0,
+            top_col: 0,
+            rows: 4,
+            cols: 2,
+            has_header: true,
+            has_totals: false,
+            columns: vec![
+                TableColumn {
+                    id: 0,
+                    name: Arc::from("qty"),
+                    display: Arc::from("Qty"),
+                    totals_function: None,
+                },
+                TableColumn {
+                    id: 1,
+                    name: Arc::from("doubled"),
+                    display: Arc::from("Doubled"),
+                    totals_function: None,
+                },
+            ],
+        };
+        wb.tables_mut().insert(Arc::clone(&table.name), table);
+        // Header row at 0 (A1, B1). Data rows 1..3.
+        // A2=10, A3=20, A4=30.
+        wb.put(ql_types::Address::new(0, 1, 0), Value::Number(10.0));
+        wb.put(ql_types::Address::new(0, 2, 0), Value::Number(20.0));
+        wb.put(ql_types::Address::new(0, 3, 0), Value::Number(30.0));
+
+        let reg = default_registry();
+        // Write `=Sales[@Qty]*2` into B2 (data row 1, col 1 → "Doubled").
+        // Eval should narrow to A2 → 10 → result 20.
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 1, 1, "Sales[@Qty]*2").unwrap();
+        assert_eq!(v, Value::Number(20.0), "[@Qty] at B2 narrows to A2=10");
+        // Same formula at B3 narrows to A3=20 → result 40.
+        let v3 = rt.set_formula(0, 2, 1, "Sales[@Qty]*2").unwrap();
+        assert_eq!(v3, Value::Number(40.0), "[@Qty] at B3 narrows to A3=20");
+        // Same formula at B4 narrows to A4=30 → result 60.
+        let v4 = rt.set_formula(0, 3, 1, "Sales[@Qty]*2").unwrap();
+        assert_eq!(v4, Value::Number(60.0), "[@Qty] at B4 narrows to A4=30");
+    }
+
+    /// **Phase 4.8.G.2 e2e:** `[@Qty]` typed OUTSIDE the table's data
+    /// rows → `#VALUE!` per Excel canon. Validates the
+    /// `narrow_structured_ref` out-of-range guard.
+    #[test]
+    fn structured_ref_at_column_outside_table_returns_value_error() {
+        use ql_storage::{TableColumn, TableMetadata};
+        let mut wb = make_runtime_workbook();
+        let table = TableMetadata {
+            name: Arc::from("SALES"),
+            display_name: Arc::from("Sales"),
+            sheet: 0,
+            top_row: 0,
+            top_col: 0,
+            rows: 2,
+            cols: 1,
+            has_header: true,
+            has_totals: false,
+            columns: vec![TableColumn {
+                id: 0,
+                name: Arc::from("qty"),
+                display: Arc::from("Qty"),
+                totals_function: None,
+            }],
+        };
+        wb.tables_mut().insert(Arc::clone(&table.name), table);
+        wb.put(ql_types::Address::new(0, 1, 0), Value::Number(10.0));
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // Formula at row 5 — well outside the table (which is rows 0-1).
+        let v = rt.set_formula(0, 5, 5, "Sales[@Qty]").unwrap();
+        assert_eq!(
+            v,
+            Value::Error(ErrorValue::Value),
+            "[@Qty] outside table data rows returns #VALUE!"
+        );
     }
 
     /// AVERAGE through the same path — confirms the cache fast path

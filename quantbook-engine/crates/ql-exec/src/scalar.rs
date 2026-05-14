@@ -94,8 +94,11 @@ pub fn eval_scalar<E: CellEnv>(plan: &ExprPlan, env: &E) -> Value {
         // `eval_scalar_*` and materializing an `ArrayValue` instead.
         ExprPlan::Array(_) => Value::Error(ErrorValue::Calc),
         // **W5-115 (Phase 4.8.F):** structured-ref in scalar context.
-        // 4.8.G adds actual evaluation. For now the no-registry path
-        // surfaces #CALC! (matches AggregateNameRef precedent).
+        // No-registry path: the legacy `eval_scalar` doesn't have access
+        // to a `WorkbookEnv` with the formula cell, so `[@Col]` narrowing
+        // can't fire here. Surface #CALC! (matches AggregateNameRef
+        // precedent — callers needing actual semantics use
+        // `eval_scalar_with_cache` which DOES narrow).
         ExprPlan::StructuredRef { .. } => Value::Error(ErrorValue::Calc),
     }
 }
@@ -190,14 +193,24 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                                 let (values, rows, cols) = env.read_range_with_shape(*range);
                                 fn_args.push(FnArg::Range { values, rows, cols });
                             }
-                            // **W5-116 (Phase 4.8.G):** structured-ref in
-                            // range-aware function arg position — read the
-                            // resolved range as a `FnArg::Range` like an
-                            // `AggregateNameRef`. `is_this_row` narrowing
-                            // is deferred (4.8.G.2 + eval-time cell context).
-                            ExprPlan::StructuredRef { resolved, .. } => {
-                                let (values, rows, cols) = env.read_range_with_shape(*resolved);
-                                fn_args.push(FnArg::Range { values, rows, cols });
+                            // **W5-116/117 (Phase 4.8.G + G.2):** structured-ref
+                            // in range-aware function arg position. `[@Col]`
+                            // narrows the resolved range to a single row at
+                            // the formula's own cell (env.formula_cell()).
+                            ExprPlan::StructuredRef {
+                                resolved,
+                                is_this_row,
+                                ..
+                            } => {
+                                let r = narrow_structured_ref(*resolved, *is_this_row, env);
+                                match r {
+                                    Ok(range) => {
+                                        let (values, rows, cols) =
+                                            env.read_range_with_shape(range);
+                                        fn_args.push(FnArg::Range { values, rows, cols });
+                                    }
+                                    Err(ev) => fn_args.push(FnArg::Scalar(Value::Error(ev))),
+                                }
                             }
                             other => {
                                 fn_args.push(FnArg::Scalar(eval_scalar_with_cache(
@@ -240,10 +253,24 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                             }
                             // **W5-116 (Phase 4.8.G):** structured-ref same
                             // shape as AggregateNameRef in unified-ABI
-                            // function arg position.
-                            ExprPlan::StructuredRef { resolved, .. } => {
-                                let (values, rows, cols) = env.read_range_with_shape(*resolved);
-                                f_args.push(FunctionArg::Range { values, rows, cols });
+                            // function arg position. 4.8.G.2: `[@Col]`
+                            // narrows resolved to single row.
+                            ExprPlan::StructuredRef {
+                                resolved,
+                                is_this_row,
+                                ..
+                            } => {
+                                let r = narrow_structured_ref(*resolved, *is_this_row, env);
+                                match r {
+                                    Ok(range) => {
+                                        let (values, rows, cols) =
+                                            env.read_range_with_shape(range);
+                                        f_args.push(FunctionArg::Range { values, rows, cols });
+                                    }
+                                    Err(ev) => {
+                                        f_args.push(FunctionArg::Scalar(Value::Error(ev)));
+                                    }
+                                }
                             }
                             ExprPlan::Array(rows) => {
                                 // Materialize cells into an `ArrayValue`.
@@ -305,13 +332,17 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                     // cache (compute on every call) — V1 limitation.
                     let single_range_arg = match args.as_slice() {
                         [ExprPlan::AggregateNameRef { range, .. }] => Some(*range),
-                        // **W5-116 (Phase 4.8.G):** single-StructuredRef
+                        // **W5-116/117 (Phase 4.8.G + G.2):** single-StructuredRef
                         // fast path. `SUM(Sales[Qty])` uses the same
                         // (range, function_name) aggregate cache key as
-                        // `SUM(Sales)` — the resolved range is the cache
-                        // key, regardless of whether the source was a
-                        // named range or a structured ref.
-                        [ExprPlan::StructuredRef { resolved, .. }] => Some(*resolved),
+                        // `SUM(Sales)`. For `[@Col]` we narrow first; the
+                        // cache key becomes the narrowed (single-row)
+                        // range, which is still unambiguously cell-keyed.
+                        [ExprPlan::StructuredRef {
+                            resolved,
+                            is_this_row,
+                            ..
+                        }] => narrow_structured_ref(*resolved, *is_this_row, env).ok(),
                         _ => None,
                     };
                     if let Some(range) = single_range_arg {
@@ -360,11 +391,16 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                                 ExprPlan::AggregateNameRef { range, .. } => {
                                     flat.extend(env.read_range(*range));
                                 }
-                                // **W5-116 (Phase 4.8.G):** structured-ref
-                                // in multi-range aggregate.
-                                ExprPlan::StructuredRef { resolved, .. } => {
-                                    flat.extend(env.read_range(*resolved));
-                                }
+                                // **W5-116/117 (Phase 4.8.G + G.2):** structured-ref
+                                // in multi-range aggregate; `[@Col]` narrows.
+                                ExprPlan::StructuredRef {
+                                    resolved,
+                                    is_this_row,
+                                    ..
+                                } => match narrow_structured_ref(*resolved, *is_this_row, env) {
+                                    Ok(r) => flat.extend(env.read_range(r)),
+                                    Err(ev) => flat.push(Value::Error(ev)),
+                                },
                                 ExprPlan::Array(rows) => {
                                     // **W5-100:** array cells are literal-
                                     // only per the W5-99 binder restriction
@@ -412,15 +448,72 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
         // path) lands in W5-102 / Phase 4.7.J; until then, every
         // `ExprPlan::Array` evaluation produces `#CALC!`.
         ExprPlan::Array(_) => Value::Error(ErrorValue::Calc),
-        // **W5-115 (Phase 4.8.F):** structured-ref in scalar context.
-        // 4.8.G adds real evaluation (read range like AggregateNameRef,
-        // narrow row for is_this_row). For now: #CALC! placeholder so
-        // bind-time tests work without eval support.
-        ExprPlan::StructuredRef { .. } => Value::Error(ErrorValue::Calc),
+        // **W5-115/116/117 (Phase 4.8.F/G/G.2):** structured-ref at
+        // top-level scalar context. `[@Col]` (is_this_row=true) narrows
+        // to a single cell via the formula's own cell; reads that cell.
+        // Multi-cell ranges (`Sales[Qty]`) surface as #CALC! per design
+        // § 6.3 (same as AggregateNameRef bare-scalar position).
+        ExprPlan::StructuredRef {
+            resolved,
+            is_this_row,
+            ..
+        } => match narrow_structured_ref(*resolved, *is_this_row, env) {
+            Ok(range) if range.start_row == range.end_row && range.start_col == range.end_col => {
+                env.read_cell(range.sheet, range.start_row, range.start_col)
+            }
+            Ok(_) => Value::Error(ErrorValue::Calc), // multi-cell in scalar context
+            Err(ev) => Value::Error(ev),
+        },
     }
 }
 
-/// **W5-103 (Phase 4.7.J.1) — cell-boundary entry point.** Returns
+/// **W5-117 (Phase 4.8.G.2):** narrow a `StructuredRef::resolved` range
+/// to a single row for `[@Col]` forms. For non-`[@]` forms, returns the
+/// range unchanged. For `[@]` forms, requires the formula's cell to be
+/// inside the range's row span; if outside (e.g., `[@Qty]` typed in a
+/// cell below the table), returns `#VALUE!` per Excel canon.
+///
+/// Cases:
+/// - `is_this_row == false` → return `resolved` as-is.
+/// - `is_this_row == true` + `env.formula_cell()` is `Some(addr)` with
+///   `addr.row` ∈ `[resolved.start_row, resolved.end_row]` → narrow to
+///   `(addr.row, addr.row, resolved.start_col, resolved.end_col)`.
+/// - `is_this_row == true` + cell missing or out of range → `#VALUE!`.
+fn narrow_structured_ref<E: CellEnv + ?Sized>(
+    resolved: ql_types::Range,
+    is_this_row: bool,
+    env: &E,
+) -> Result<ql_types::Range, ErrorValue> {
+    if !is_this_row {
+        return Ok(resolved);
+    }
+    // is_this_row: need cell context for the row.
+    let cell = env_formula_cell(env).ok_or(ErrorValue::Value)?;
+    if cell.row < resolved.start_row || cell.row > resolved.end_row {
+        return Err(ErrorValue::Value);
+    }
+    Ok(ql_types::Range::new(
+        resolved.sheet,
+        cell.row,
+        resolved.start_col,
+        cell.row,
+        resolved.end_col,
+    ))
+}
+
+/// **W5-117 (Phase 4.8.G.2):** access the formula cell from an env if
+/// the env carries one. CellEnv doesn't expose this; we downcast to the
+/// concrete `WorkbookEnv` type. Other CellEnv impls (MapEnv in tests)
+/// always return None.
+fn env_formula_cell<E: CellEnv + ?Sized>(env: &E) -> Option<ql_types::Address> {
+    // Downcast trick — only WorkbookEnv carries a formula_cell. Since
+    // CellEnv is a trait without `Any`-supertrait, we use a separate
+    // accessor: callers wrapping a WorkbookEnv have type info at the
+    // construction site, but inside the generic eval path we don't.
+    // For now expose the cell via a no-op trait method; only WorkbookEnv
+    // overrides it.
+    env.formula_cell_for_sref()
+}
 /// `EvalResult::Scalar` for every plan shape that does NOT produce an
 /// array at the cell root, and `EvalResult::Array` ONLY for top-level
 /// `ExprPlan::Array` (Phase 4.7.J.1) and, in future, array-returning
