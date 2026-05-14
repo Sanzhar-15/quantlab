@@ -38,6 +38,51 @@ import {
 	channelsForChartType,
 	isChannelRequired,
 } from '../../../src/qviz/chartChannels';
+import type { TransformAttribution } from '../../../src/qviz/messageProtocol';
+import { findColumnDrop } from '../util/attribution';
+
+/** Front 2 V2 (2026-05-14): when the shelf badge is clicked, this
+ *  helper dispatches the open-editor action for the responsible
+ *  transform AND scrolls its card into view. The card is located by
+ *  the `data-transform-index="${N}"` attribute added by transformList.
+ *  No-op if the card isn't in the DOM (e.g., transform list hasn't
+ *  rendered yet). */
+function focusTransformCard(store: QvizStore, index: number): void {
+	store.dispatch({ type: 'openTransformEditor', index });
+	// Front 2 V2 audit HIGH (Opus, 2026-05-14): scope the selector to
+	// `.qviz-transform-card`. The badge buttons ALSO carry
+	// `data-transform-index` (so the click handler can read it), so a
+	// bare attribute selector picked up the badge first in document
+	// order (shelves render above the transform list). The selector
+	// was scrolling the badge into view (already visible) instead of
+	// the responsible card.
+	const card = document.querySelector<HTMLElement>(
+		`.qviz-transform-card[data-transform-index="${index}"]`,
+	);
+	// `scrollIntoView` is part of the W3C CSSOM View spec and is
+	// implemented in every real browser + Electron webview. jsdom (used
+	// by the test harness) deliberately omits it because it has no
+	// layout engine. Guarding with the typeof check keeps the test
+	// harness clean without affecting production behavior. NOT a
+	// CLAUDE.md fallback -- the only failure mode is jsdom-specific.
+	if (card && typeof card.scrollIntoView === 'function') {
+		card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+	}
+}
+
+/** Front 2 V2: compute the fresh-attribution payload, gated on
+ *  `lastData.specHash === spec.currentHash`. Same staleness gate the
+ *  Front 2 V1 audit MEDIUM fix established. Returns null when the
+ *  attribution can't be trusted against the current spec. */
+function getFreshAttribution(
+	store: QvizStore,
+): readonly TransformAttribution[] | null {
+	const state = store.getState();
+	const lastData = state.query.lastData;
+	if (lastData === null) { return null; }
+	if (lastData.specHash !== state.spec.currentHash) { return null; }
+	return lastData.attribution;
+}
 
 /** Drag payload contract -- must match what columnPanel writes. */
 const DRAG_MIME_COLUMN = 'application/qviz-column';
@@ -103,6 +148,7 @@ function mountRegularShelves(
 		container: HTMLElement;
 		fieldEl: HTMLElement;
 		clearBtn: HTMLButtonElement;
+		droppedBadge: HTMLButtonElement;
 	}>();
 
 	for (const ch of channels) {
@@ -139,8 +185,25 @@ function mountRegularShelves(
 			store.dispatch({ type: 'setEncoding', channel: ch, encoding: null });
 		});
 
+		// Front 2 V2 (2026-05-14): "dropped by transform #N" badge. Mounted
+		// once, hidden by default. The refresh handler reads the latest
+		// fresh attribution payload and shows/hides + sets the click
+		// handler's target transform index.
+		const droppedBadge = document.createElement('button');
+		droppedBadge.type = 'button';
+		droppedBadge.className = 'qviz-shelf-dropped-badge';
+		droppedBadge.hidden = true;
+		droppedBadge.addEventListener('click', (e) => {
+			e.stopPropagation();
+			const idxStr = droppedBadge.dataset.transformIndex;
+			if (idxStr !== undefined) {
+				focusTransformCard(store, Number(idxStr));
+			}
+		});
+
 		container.appendChild(labelEl);
 		container.appendChild(fieldEl);
+		container.appendChild(droppedBadge);
 		container.appendChild(clearBtn);
 
 		container.addEventListener('click', (e) => {
@@ -159,13 +222,16 @@ function mountRegularShelves(
 		});
 
 		root.appendChild(container);
-		shelves.set(ch, { container, fieldEl, clearBtn });
+		shelves.set(ch, { container, fieldEl, clearBtn, droppedBadge });
 	}
 
 	const refresh = (): void => {
 		const state = store.getState();
 		const encodings = state.spec.current?.chart.encodings;
 		const active = state.ui.activeShelf;
+		// Front 2 V2 (2026-05-14): fetch fresh attribution once per refresh
+		// instead of per-shelf; same staleness gate for all shelves.
+		const freshAttribution = getFreshAttribution(store);
 		for (const [ch, els] of shelves) {
 			const enc = encodings?.[ch] ?? null;
 			if (enc) {
@@ -184,6 +250,26 @@ function mountRegularShelves(
 				'qviz-shelf--required-empty',
 				isChannelRequired(chartType, ch) && enc === null,
 			);
+			// Front 2 V2: badge visibility + content. Only meaningful when
+			// the shelf has an assigned encoding referencing a column some
+			// upstream transform dropped.
+			const drop = enc !== null
+				? findColumnDrop(enc.field, freshAttribution)
+				: null;
+			// Front 2 V2 audit MEDIUM (Opus, 2026-05-14): the badge IS
+			// the signal; no extra shelf-level class toggle. Removed
+			// `qviz-shelf--dropped` -- it had no matching CSS and just
+			// added DOM churn on every refresh.
+			if (drop !== null) {
+				els.droppedBadge.hidden = false;
+				els.droppedBadge.textContent = `dropped by #${drop.index}`;
+				els.droppedBadge.title = `dropped by transform #${drop.index} (${drop.kind}) -- click to open`;
+				els.droppedBadge.dataset.transformIndex = String(drop.index);
+			} else {
+				els.droppedBadge.hidden = true;
+				els.droppedBadge.textContent = '';
+				delete els.droppedBadge.dataset.transformIndex;
+			}
 		}
 	};
 	const off = store.subscribe(refresh);
@@ -225,6 +311,7 @@ function mountOhlcvShelf(root: HTMLElement, store: QvizStore): () => void {
 		fieldEl: HTMLElement;
 		clearBtn: HTMLButtonElement;
 		row: HTMLElement;
+		droppedBadge: HTMLButtonElement;
 	}>();
 
 	for (const slot of OHLCV_SLOTS) {
@@ -254,25 +341,43 @@ function mountOhlcvShelf(root: HTMLElement, store: QvizStore): () => void {
 			applyOhlcvUpdate(store, slot.key, undefined);
 		});
 
+		// Front 2 V2 (2026-05-14): per-slot dropped-by badge. Same shape
+		// + behavior as the regular shelf badge.
+		const droppedBadge = document.createElement('button');
+		droppedBadge.type = 'button';
+		droppedBadge.className = 'qviz-shelf-dropped-badge';
+		droppedBadge.hidden = true;
+		droppedBadge.addEventListener('click', (e) => {
+			e.stopPropagation();
+			const idxStr = droppedBadge.dataset.transformIndex;
+			if (idxStr !== undefined) {
+				focusTransformCard(store, Number(idxStr));
+			}
+		});
+
 		row.appendChild(labelEl);
 		row.appendChild(fieldEl);
+		row.appendChild(droppedBadge);
 		row.appendChild(clearBtn);
 		cluster.appendChild(row);
 
 		attachDropTarget(row, (payload) => {
 			applyOhlcvUpdate(store, slot.key, payload.column);
 		});
-		slotElements.set(slot.key, { fieldEl, clearBtn, row });
+		slotElements.set(slot.key, { fieldEl, clearBtn, row, droppedBadge });
 	}
 
 	root.appendChild(cluster);
 
 	const refresh = (): void => {
 		const ohlcv = store.getState().spec.current?.chart.encodings.ohlcv;
+		// Front 2 V2: fresh attribution gate (same logic as regular shelves).
+		const freshAttribution = getFreshAttribution(store);
 		for (const slot of OHLCV_SLOTS) {
 			const els = slotElements.get(slot.key)!;
 			const value = ohlcv?.[slot.key];
-			if (typeof value === 'string' && value.length > 0) {
+			const hasValue = typeof value === 'string' && value.length > 0;
+			if (hasValue) {
 				els.fieldEl.textContent = value;
 				els.clearBtn.hidden = false;
 				els.row.classList.add('qviz-shelf-ohlcv-row--assigned');
@@ -286,6 +391,23 @@ function mountOhlcvShelf(root: HTMLElement, store: QvizStore): () => void {
 				} else {
 					els.row.classList.remove('qviz-shelf-ohlcv-row--required-empty');
 				}
+			}
+			// Front 2 V2: dropped-by badge per OHLCV slot.
+			const drop = hasValue
+				? findColumnDrop(value as string, freshAttribution)
+				: null;
+			// Front 2 V2 audit MEDIUM (Opus, 2026-05-14): same as above,
+			// no shelf-row-level class toggle. Badge alone is the
+			// signal.
+			if (drop !== null) {
+				els.droppedBadge.hidden = false;
+				els.droppedBadge.textContent = `dropped by #${drop.index}`;
+				els.droppedBadge.title = `dropped by transform #${drop.index} (${drop.kind}) -- click to open`;
+				els.droppedBadge.dataset.transformIndex = String(drop.index);
+			} else {
+				els.droppedBadge.hidden = true;
+				els.droppedBadge.textContent = '';
+				delete els.droppedBadge.dataset.transformIndex;
 			}
 		}
 	};

@@ -176,6 +176,27 @@ export function reduceQuery(state: QueryState, action: Action): QueryState {
 				lastErrorTransformIndex: null,
 			};
 		}
+		case 'schemaChanged': {
+			// Front 2 V2 audit HIGH (Codex, 2026-05-14): schema drift
+			// invalidates attribution semantics even when the spec hash
+			// is unchanged. A `schemaChanged` action updates
+			// `schema.info` but leaves `spec.currentHash` alone, so the
+			// V2 consumers' `lastData.specHash === currentHash` gate
+			// would still consider attribution "fresh" — even though
+			// it was computed against the prior file schema. Clear
+			// attribution defensively on schemaChanged; the next
+			// dataReceived re-populates it.
+			if (state.lastData === null || state.lastData.attribution === null) {
+				return state;
+			}
+			return {
+				...state,
+				lastData: Object.freeze({
+					...state.lastData,
+					attribution: null,
+				}),
+			};
+		}
 		default:
 			return state;
 	}

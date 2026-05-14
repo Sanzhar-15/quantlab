@@ -32,11 +32,38 @@ import type {
 	BinTransform, GroupByTransform, AggregateTransform,
 	Transform, TransformKind,
 } from '../../../src/qviz/spec';
+import type { TransformAttribution } from '../../../src/qviz/messageProtocol';
 import { validatePipeline } from '../../../src/qviz/pipelineValidate';
 import {
 	FORM_BY_KIND, defaultTransformOfKind, summarizeTransform,
 	type TransformFormHandle,
 } from './transformForms';
+
+/** Front 2 V2 (2026-05-14): cap on visible drop-chips per card.
+ *  Aggregate can drop 20+ columns from a wide table; an unconstrained
+ *  chip row would dominate the card. Drops beyond the cap collapse into
+ *  a "+N more" tooltip-bearing chip carrying the full list. */
+const DROPS_VISIBLE_CAP = 5;
+
+/** Front 2 V2: stringify an attribution record's columns into a stable
+ *  digest for the structural-hash early-return guard in renderCards.
+ *  Only the produces/drops content matters for chip rendering; the
+ *  availableAfter list is internal.
+ *
+ *  Front 2 V2 audit MEDIUM (Both, 2026-05-14): JSON-encode the
+ *  arrays so column names containing `,`, `|`, or `:` can't collide
+ *  with each other. `['a,b'].join(',')` === `['a','b'].join(',')`
+ *  pre-fix; `JSON.stringify(['a,b'])` !== `JSON.stringify(['a','b'])`
+ *  post-fix. Real-world Parquet/CSV allows comma-bearing column
+ *  names (e.g., `"bid,ask"`), so the collision is observable. */
+function attributionDigest(
+	attribution: readonly TransformAttribution[] | null,
+): string {
+	if (!attribution) { return ''; }
+	return attribution
+		.map(r => JSON.stringify([r.index, r.kind, r.produces, r.drops]))
+		.join(';');
+}
 
 /** All transform kinds known to the spec format. The Add menu is
  *  filtered against `runtime.capabilities.transformKinds`; this list
@@ -159,6 +186,7 @@ export function mountTransformList(root: HTMLElement, store: QvizStore): { dispo
 	let lastEditingIndex: number | null = null;
 	let lastChartType: string | null = null;
 	let lastCapabilitiesHash: string | null = null;
+	let lastAttributionDigest: string = '';
 	const renderCards = (): void => {
 		const state = store.getState();
 		const transforms = state.spec.current?.transforms ?? [];
@@ -168,6 +196,33 @@ export function mountTransformList(root: HTMLElement, store: QvizStore): { dispo
 		const chartType = state.spec.current?.chart.type ?? null;
 		const showPreset = chartType === 'histogram' && !pipelineHasHistogramShape(transforms);
 		presetSlot.hidden = !showPreset;
+
+		// Front 2 V2 (2026-05-14): the per-transform produces/drops chip
+		// row consumes `state.query.lastData.attribution` gated on the
+		// spec-hash match. When the user has edited the spec but the
+		// new dataReceived hasn't landed, the attribution is for the
+		// OLD spec; passing null hides the chips rather than misattribute.
+		// Same stale-attribution gate the Front 2 V1 audit MEDIUM fix
+		// applied at the render-trigger sites.
+		const lastData = state.query.lastData;
+		const freshAttribution: readonly TransformAttribution[] | null
+			= lastData !== null && lastData.specHash === state.spec.currentHash
+				? lastData.attribution
+				: null;
+		const attrDigest = attributionDigest(freshAttribution);
+		// Front 2 V2 audit MEDIUM (Codex, 2026-05-14): canonical
+		// attribution identity is `record.index`, NOT array position.
+		// The wire validator pins (index, kind, produces[], drops[],
+		// availableAfter[]) per record but doesn't pin
+		// `record.index === array_index`. Build a Map so a malformed-
+		// but-validator-passing payload (sparse / reordered) renders
+		// each card against the correct attribution record.
+		const attrByIndex: Map<number, TransformAttribution> = new Map();
+		if (freshAttribution !== null) {
+			for (const r of freshAttribution) {
+				attrByIndex.set(r.index, r);
+			}
+		}
 
 		// Skip rebuild if nothing structural changed.
 		const specHash = state.spec.currentHash;
@@ -181,12 +236,14 @@ export function mountTransformList(root: HTMLElement, store: QvizStore): { dispo
 			&& editingIndex === lastEditingIndex
 			&& chartType === lastChartType
 			&& capHash === lastCapabilitiesHash
+			&& attrDigest === lastAttributionDigest
 		) { return; }
 		lastSpecHash = specHash;
 		lastSchemaHash = schemaHash;
 		lastEditingIndex = editingIndex;
 		lastChartType = chartType;
 		lastCapabilitiesHash = capHash;
+		lastAttributionDigest = attrDigest;
 
 		// M7 (megaudit): preserve the editing card's form handle across
 		// renders when it supports in-place update() AND the kind hasn't
@@ -219,6 +276,10 @@ export function mountTransformList(root: HTMLElement, store: QvizStore): { dispo
 		transforms.forEach((t, i) => {
 			const card = document.createElement('li');
 			card.className = 'qviz-transform-card';
+			// Front 2 V2 (2026-05-14): per-card transform-index hook so
+			// the encoding-shelf "dropped by #N" badge can scrollIntoView
+			// the responsible card via `document.querySelector`.
+			card.dataset.transformIndex = String(i);
 			if (pipelineErrors[i]) {
 				card.classList.add('qviz-transform-card--error');
 			}
@@ -301,6 +362,20 @@ export function mountTransformList(root: HTMLElement, store: QvizStore): { dispo
 					card.appendChild(formContainer);
 					formHandles.set(i, { handle, kind: t.kind });
 				}
+			}
+
+			// Front 2 V2 (2026-05-14): per-transform produces/drops chip
+			// row. Hidden when attribution is absent OR stale OR when
+			// the transform is a no-op (filter / sort / limit don't
+			// change column shape, so an empty chip row would be visual
+			// noise). The chip row is appended AFTER the form container
+			// so it visually anchors to the bottom of the card.
+			const attrRecord = attrByIndex.get(i) ?? null;
+			if (
+				attrRecord !== null
+				&& (attrRecord.produces.length > 0 || attrRecord.drops.length > 0)
+			) {
+				card.appendChild(buildAttributionRow(attrRecord));
 			}
 
 			cardsList.appendChild(card);
@@ -462,4 +537,61 @@ function collectProducedNames(t: Transform, out: string[]): void {
 		case 'limit':
 			return;
 	}
+}
+
+/** Front 2 V2 (2026-05-14): render the produces/drops chip row for one
+ *  transform card. Caller guarantees at least one of produces/drops is
+ *  non-empty; this helper takes care of the labels + cap-at-N tooltip
+ *  for the drops list.
+ *
+ *  CSS classes:
+ *    .qviz-form-attribution        -- outer flex container
+ *    .qviz-form-attribution-section -- one of "Produces:" / "Drops:"
+ *    .qviz-form-attribution-label   -- the section label text
+ *    .qviz-form-attribution-chip    -- one chip per column
+ *    .qviz-form-attribution-chip--more -- the "+N more" overflow chip
+ */
+function buildAttributionRow(record: TransformAttribution): HTMLElement {
+	const row = document.createElement('div');
+	row.className = 'qviz-form-attribution';
+	if (record.produces.length > 0) {
+		row.appendChild(buildAttributionSection('Produces', record.produces, false));
+	}
+	if (record.drops.length > 0) {
+		row.appendChild(buildAttributionSection('Drops', record.drops, true));
+	}
+	return row;
+}
+
+function buildAttributionSection(
+	labelText: string, columns: readonly string[], capWithMore: boolean,
+): HTMLElement {
+	const section = document.createElement('span');
+	section.className = 'qviz-form-attribution-section';
+	const label = document.createElement('span');
+	label.className = 'qviz-form-attribution-label';
+	label.textContent = `${labelText}: `;
+	section.appendChild(label);
+
+	const visible = capWithMore && columns.length > DROPS_VISIBLE_CAP
+		? columns.slice(0, DROPS_VISIBLE_CAP)
+		: columns;
+	for (const col of visible) {
+		const chip = document.createElement('span');
+		chip.className = 'qviz-form-attribution-chip';
+		chip.textContent = col;
+		section.appendChild(chip);
+	}
+	if (capWithMore && columns.length > DROPS_VISIBLE_CAP) {
+		const more = document.createElement('span');
+		more.className = 'qviz-form-attribution-chip qviz-form-attribution-chip--more';
+		const overflowCount = columns.length - DROPS_VISIBLE_CAP;
+		more.textContent = `+${overflowCount} more`;
+		// Tooltip carries the full list; native title is fine here -- no
+		// screen-reader-only payload, just the same data the user can
+		// see by hovering.
+		more.title = columns.slice(DROPS_VISIBLE_CAP).join(', ');
+		section.appendChild(more);
+	}
+	return section;
 }
