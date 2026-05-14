@@ -7742,4 +7742,134 @@ mod tests {
         assert_eq!(v, Value::Error(ErrorValue::Calc));
         assert_eq!(wb.spill_anchor_at(0, 0, 0), None);
     }
+
+    // ===== W5-106 (Phase 4.7.M.2) — input-dependent shape transitions =====
+
+    /// Shape transition through recompute_dirty: A1 = 3, B1 = SEQUENCE(A1)
+    /// (spills B1..B3). Change A1 to 5; recompute_dirty re-evaluates B1
+    /// → write_spill clears old 3x1 footprint, registers new 5x1, writes
+    /// B1..B5. Pins that the shape transition itself works.
+    #[test]
+    fn recompute_dirty_sequence_grows_footprint() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(3.0)).unwrap(); // A1 = 3
+            rt.set_formula(0, 0, 1, "SEQUENCE(A1)").unwrap(); // B1 = SEQUENCE(A1)
+        }
+        // Pre-state: B1 spills 3x1 (col 1, rows 0..3).
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 1).copied(),
+            Some(ql_storage::SpillShape::new(3, 1))
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 2, 1)), Value::Number(3.0));
+
+        // Change A1 to 5 and recompute_dirty.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(5.0)).unwrap();
+            let result = rt.recompute_dirty().expect("graph attached");
+            assert!(result.is_complete(), "recompute failures: {result:?}");
+        }
+        // Post-state: B1 spills 5x1 (col 1, rows 0..5).
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 1).copied(),
+            Some(ql_storage::SpillShape::new(5, 1)),
+            "shape grew from 3x1 to 5x1"
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(1.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 4, 1)), Value::Number(5.0));
+    }
+
+    /// Shape transition shrinkage: A1 = 5, B1 = SEQUENCE(A1) (5x1).
+    /// Change A1 to 2; expect B1 to spill 2x1, B3..B5 to become Blank.
+    #[test]
+    fn recompute_dirty_sequence_shrinks_footprint() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(5.0)).unwrap();
+            rt.set_formula(0, 0, 1, "SEQUENCE(A1)").unwrap();
+        }
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 1).copied(),
+            Some(ql_storage::SpillShape::new(5, 1))
+        );
+        // Change A1 to 2.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(2.0)).unwrap();
+            let result = rt.recompute_dirty().expect("graph attached");
+            assert!(result.is_complete(), "recompute failures: {result:?}");
+        }
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 1).copied(),
+            Some(ql_storage::SpillShape::new(2, 1))
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(1.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 1)), Value::Number(2.0));
+        // B3, B4, B5 cleared.
+        assert_eq!(wb.read(ql_types::Address::new(0, 2, 1)), Value::Blank);
+        assert_eq!(wb.read(ql_types::Address::new(0, 3, 1)), Value::Blank);
+        assert_eq!(wb.read(ql_types::Address::new(0, 4, 1)), Value::Blank);
+    }
+
+    /// **#136 surface test (CURRENTLY IGNORED — pending #136 closure)**:
+    /// A1 = 3, B1 = SEQUENCE(A1) (spills B1..B3), D1 = B5 (currently
+    /// Blank — references a cell OUTSIDE the spill footprint). Change
+    /// A1 to 5; B1 now spills B1..B5. D1 should see B5 = 5 and update.
+    ///
+    /// Confirmed reproducible 2026-05-14: B1's recompute writes B5
+    /// via write_spill but no on_set_value hook fires. D1's dep at
+    /// (0,4,1) wasn't dirty, so recompute_dirty doesn't re-evaluate
+    /// D1. D1 stays at Blank.
+    ///
+    /// Fix (task #136): recompute_dirty must (a) detect spill-shape
+    /// transitions per formula, (b) fire on_set_value at cells added
+    /// to or removed from the footprint, AND (c) run a fixed-point
+    /// loop so mid-pass dirties (like D1 here) get picked up in a
+    /// follow-up schedule_dirty + eval iteration. Substantial change.
+    ///
+    /// Leaving as #[ignore]'d regression pin until #136 lands.
+    #[test]
+    #[ignore = "task #136: recompute_dirty spill-footprint hooks + fixed-point loop"]
+    fn recompute_dirty_sequence_grows_dirties_new_target_readers() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(3.0)).unwrap();
+            rt.set_formula(0, 0, 1, "SEQUENCE(A1)").unwrap();
+            // D1 = B5 — currently Blank (outside the 3x1 spill).
+            rt.set_formula(0, 0, 3, "B5").unwrap();
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 3)),
+            Value::Blank,
+            "D1 = B5 evaluates to Blank initially (B5 outside footprint)"
+        );
+
+        // Grow the spill.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(5.0)).unwrap();
+            let result = rt.recompute_dirty().expect("graph attached");
+            assert!(result.is_complete(), "recompute failures: {result:?}");
+        }
+
+        // After recompute_dirty: D1 should see B5 = 5.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 3)),
+            Value::Number(5.0),
+            "D1 must update to B5's new value after spill grows"
+        );
+    }
 }
