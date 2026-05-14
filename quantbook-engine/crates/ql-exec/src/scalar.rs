@@ -149,51 +149,127 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
             eval_unary(*op, v)
         }
         ExprPlan::Function { name, args } => {
-            // W5-53 (GAP-F-05 closure): check the range-aware table
-            // FIRST. Range-aware functions like SUMIF need per-arg
-            // range-vs-scalar metadata that the scalar `&[Value]`
-            // contract can't carry. If a function is registered as
-            // range-aware, build `Vec<FnArg>` with the correct
-            // variant per arg (`AggregateNameRef` → `Range(read_range)`,
-            // everything else → `Scalar(eval)`).
-            if let Some(raf) = registry.lookup_range_aware(name) {
-                use ql_functions::FnArg;
-                let mut fn_args: Vec<FnArg> = Vec::with_capacity(args.len());
-                for a in args {
-                    match a {
-                        ExprPlan::AggregateNameRef { range, .. } => {
-                            // W5-54: shape-aware Range so VLOOKUP /
-                            // HLOOKUP / INDEX can address by (row,
-                            // col). SUMIF / COUNTIF ignore shape.
-                            let (values, rows, cols) = env.read_range_with_shape(*range);
-                            fn_args.push(FnArg::Range { values, rows, cols });
-                        }
-                        other => {
-                            fn_args.push(FnArg::Scalar(eval_scalar_with_cache(
-                                other, env, registry, cache,
-                            )));
+            // **W5-100-AUDIT (Phase 4.7.G Sonnet closure):** dispatch
+            // via `lookup_any` and match on `RegisteredFn` — one
+            // HashMap lookup, one match. Pre-W5-100 the dispatcher
+            // called `lookup_range_aware` → `lookup_context_aware` →
+            // `lookup` in sequence (three separate HashMap lookups).
+            // The unified registry storage (W5-96) made the migration
+            // mechanical; doing it here lands the dispatch shape
+            // needed for 4.7.J spill routing.
+            use ql_functions::RegisteredFn;
+            match registry.lookup_any(name) {
+                Some(RegisteredFn::RangeAware(raf)) => {
+                    // W5-53 (GAP-F-05 closure): range-aware functions
+                    // like SUMIF need per-arg range-vs-scalar metadata
+                    // that the scalar `&[Value]` contract can't carry.
+                    // Build `Vec<FnArg>` with the correct variant per
+                    // arg (`AggregateNameRef` → `Range(read_range)`,
+                    // everything else → `Scalar(eval)`).
+                    //
+                    // W5-100 known gap: `ExprPlan::Array` args in
+                    // range-aware functions (SUMIF / VLOOKUP / etc.)
+                    // currently fall into the `Scalar(eval)` branch
+                    // and produce `#CALC!`. Array-as-range-arg for
+                    // range-aware functions is Phase 4.7+ work; for
+                    // v1 only aggregate-context (scalar SUM/AVERAGE)
+                    // arrays are supported per design § 6.3.
+                    use ql_functions::FnArg;
+                    let mut fn_args: Vec<FnArg> = Vec::with_capacity(args.len());
+                    for a in args {
+                        match a {
+                            ExprPlan::AggregateNameRef { range, .. } => {
+                                // W5-54: shape-aware Range so VLOOKUP /
+                                // HLOOKUP / INDEX can address by (row,
+                                // col). SUMIF / COUNTIF ignore shape.
+                                let (values, rows, cols) = env.read_range_with_shape(*range);
+                                fn_args.push(FnArg::Range { values, rows, cols });
+                            }
+                            other => {
+                                fn_args.push(FnArg::Scalar(eval_scalar_with_cache(
+                                    other, env, registry, cache,
+                                )));
+                            }
                         }
                     }
+                    raf(&fn_args)
                 }
-                return raf(&fn_args);
-            }
-            // **W5-69 (Phase 4.5.A.0):** check the context-aware table
-            // SECOND. Date / locale / clock-aware functions (DATE, NOW,
-            // TODAY, WEEKDAY, ...) take an extra `&EvalContext` arg in
-            // addition to pre-evaluated `&[Value]`. Args are evaluated
-            // left-to-right exactly like the scalar path; only the
-            // function signature differs. EvalContext is sourced from
-            // `env.eval_context()` (default is Excel1900 + EnUs +
-            // System).
-            if let Some(caf) = registry.lookup_context_aware(name) {
-                let evaluated: Vec<Value> = args
-                    .iter()
-                    .map(|a| eval_scalar_with_cache(a, env, registry, cache))
-                    .collect();
-                return caf(&evaluated, env.eval_context());
-            }
-            match registry.lookup(name) {
-                Some(f) => {
+                Some(RegisteredFn::ContextAware(caf)) => {
+                    // **W5-69 (Phase 4.5.A.0):** context-aware functions
+                    // (DATE, NOW, TODAY, WEEKDAY, ...) take an extra
+                    // `&EvalContext` arg. Args evaluated left-to-right
+                    // exactly like the scalar path; only the function
+                    // signature differs.
+                    let evaluated: Vec<Value> = args
+                        .iter()
+                        .map(|a| eval_scalar_with_cache(a, env, registry, cache))
+                        .collect();
+                    caf(&evaluated, env.eval_context())
+                }
+                Some(RegisteredFn::Unified(uf)) => {
+                    // **W5-100-AUDIT (Phase 4.7.G):** unified ABI path.
+                    // No production callers from `default_registry`
+                    // today; Phase 4.7.M/N register SEQUENCE / FILTER /
+                    // TRANSPOSE through this tier. The arg materialization
+                    // here is the minimum-viable shape: every plan arg
+                    // becomes a `FunctionArg::Scalar(eval)`, EXCEPT
+                    // `ExprPlan::Array` which becomes a `FunctionArg::Array`
+                    // and `ExprPlan::AggregateNameRef` which becomes a
+                    // `FunctionArg::Range`.
+                    use ql_functions::{FunctionArg, FunctionContext, FunctionReturn};
+                    let mut f_args: Vec<FunctionArg> = Vec::with_capacity(args.len());
+                    for a in args {
+                        match a {
+                            ExprPlan::AggregateNameRef { range, .. } => {
+                                let (values, rows, cols) = env.read_range_with_shape(*range);
+                                f_args.push(FunctionArg::Range { values, rows, cols });
+                            }
+                            ExprPlan::Array(rows) => {
+                                // Materialize cells into an `ArrayValue`.
+                                // Cells are literal-only per the W5-99
+                                // binder restriction, so eval_scalar
+                                // produces a clean `Value` per cell.
+                                let row_count = rows.len() as u32;
+                                let col_count = rows.first().map(|r| r.len()).unwrap_or(0) as u32;
+                                let mut cells: Vec<Value> =
+                                    Vec::with_capacity((row_count * col_count) as usize);
+                                for row in rows {
+                                    for cell in row {
+                                        cells.push(eval_scalar_with_cache(
+                                            cell, env, registry, cache,
+                                        ));
+                                    }
+                                }
+                                let av = ql_types::ArrayValue::new(row_count, col_count, cells)
+                                    .expect(
+                                        "ExprPlan::Array passed binder validation; \
+                                         shape should be intact",
+                                    );
+                                f_args.push(FunctionArg::Array(av));
+                            }
+                            other => {
+                                f_args.push(FunctionArg::Scalar(eval_scalar_with_cache(
+                                    other, env, registry, cache,
+                                )));
+                            }
+                        }
+                    }
+                    let ctx = FunctionContext::new(env.eval_context());
+                    let ret = uf(&f_args, &ctx);
+                    match ret {
+                        FunctionReturn::Scalar(v) => v,
+                        // **W5-100-AUDIT:** unified-ABI array returns in
+                        // SCALAR eval context are `#CALC!` per design
+                        // § 6.3. The cell-boundary spill path (4.7.J)
+                        // will route Unified-Array returns differently
+                        // through a new `eval_at_cell_boundary` entry
+                        // point that returns `EvalResult::Array`. Until
+                        // then, any array-returning function called from
+                        // a sub-expression position produces `#CALC!`.
+                        FunctionReturn::Array(_) => Value::Error(ErrorValue::Calc),
+                    }
+                }
+                Some(RegisteredFn::Scalar(f)) => {
                     // Phase 3.6 (2026-05-12) — AGG-3-04 correctness + AGG-
                     // 3-01 cache hit path. Detect aggregate-over-named-range
                     // and route through the cache. The cache key is `(range,
@@ -1474,5 +1550,104 @@ mod tests {
         };
         let v = eval_scalar_with_cache(&plan, &env, &registry, &cache);
         assert_eq!(v, Value::Number(-1.0));
+    }
+
+    // W5-100-AUDIT (Sonnet closure): additional aggregate coverage.
+
+    #[test]
+    fn array_literal_product_with_only_numbers() {
+        // L2 — `=PRODUCT({2, 3, 4})` → 24. Multiplicative aggregate
+        // path is structurally identical to SUM but worth pinning.
+        let env = crate::env::MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Function {
+            name: std::sync::Arc::from("PRODUCT"),
+            args: vec![ExprPlan::Array(vec![vec![
+                ExprPlan::Number(2.0),
+                ExprPlan::Number(3.0),
+                ExprPlan::Number(4.0),
+            ]])],
+        };
+        let v = eval_scalar_with_cache(&plan, &env, &registry, &cache);
+        assert_eq!(v, Value::Number(24.0));
+    }
+
+    #[test]
+    fn array_literal_counta_with_mixed_types() {
+        // L3 — `=COUNTA({1, "hi", TRUE, #N/A})` — COUNTA counts non-
+        // blank cells. Pins the W5-100 documented assumption that
+        // error cells count as non-blank.
+        let env = crate::env::MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Function {
+            name: std::sync::Arc::from("COUNTA"),
+            args: vec![ExprPlan::Array(vec![vec![
+                ExprPlan::Number(1.0),
+                ExprPlan::String(std::sync::Arc::from("hi")),
+                ExprPlan::Bool(true),
+                ExprPlan::Error(ErrorValue::NA),
+            ]])],
+        };
+        let v = eval_scalar_with_cache(&plan, &env, &registry, &cache);
+        assert_eq!(v, Value::Number(4.0));
+    }
+
+    #[test]
+    fn array_literal_nested_aggregate_sum_of_sum() {
+        // L5 — `=SUM(SUM({5}), {1, 2, 3})` = SUM(5, {1,2,3}) =
+        // 5 + 6 = 11. Nested aggregate calls: outer SUM sees a
+        // mixture of scalar (from inner SUM eval) + array literal.
+        let env = crate::env::MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        let inner_sum = ExprPlan::Function {
+            name: std::sync::Arc::from("SUM"),
+            args: vec![ExprPlan::Array(vec![vec![ExprPlan::Number(5.0)]])],
+        };
+        let plan = ExprPlan::Function {
+            name: std::sync::Arc::from("SUM"),
+            args: vec![
+                inner_sum,
+                ExprPlan::Array(vec![vec![
+                    ExprPlan::Number(1.0),
+                    ExprPlan::Number(2.0),
+                    ExprPlan::Number(3.0),
+                ]]),
+            ],
+        };
+        let v = eval_scalar_with_cache(&plan, &env, &registry, &cache);
+        assert_eq!(v, Value::Number(11.0));
+    }
+
+    #[test]
+    fn array_literal_in_range_aware_function_still_calc_error() {
+        // L4 / W5-100-AUDIT — SUMPRODUCT is range-aware; the W5-100
+        // range-aware dispatch arm DOES NOT yet handle `ExprPlan::Array`
+        // args. Per the new comment in the RangeAware match arm:
+        // array-as-range-arg for range-aware functions is Phase 4.7+
+        // (or later) work; only aggregate-context (scalar SUM /
+        // AVERAGE / etc.) arrays are supported per design § 6.3.
+        //
+        // Pin this interim behavior so a future array-aware range-
+        // aware dispatch lands as a FAILing test that triggers the
+        // assertion update — same migration-trigger pattern as the
+        // W5-99 → W5-100 transition for SUM({1,#N/A,3}).
+        let env = crate::env::MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Function {
+            name: std::sync::Arc::from("SUMPRODUCT"),
+            args: vec![ExprPlan::Array(vec![vec![
+                ExprPlan::Number(1.0),
+                ExprPlan::Number(2.0),
+                ExprPlan::Number(3.0),
+            ]])],
+        };
+        let v = eval_scalar_with_cache(&plan, &env, &registry, &cache);
+        // Interim: SUMPRODUCT sees the array as `FnArg::Scalar(#CALC!)`
+        // and propagates the error.
+        assert_eq!(v, Value::Error(ErrorValue::Calc));
     }
 }

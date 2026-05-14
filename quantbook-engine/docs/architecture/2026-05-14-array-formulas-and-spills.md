@@ -172,7 +172,7 @@ pub enum FunctionReturn {
 pub struct FunctionContext<'a> {
     pub eval_ctx: &'a EvalContext,
     // Additive shape — fields can land later without changing the FunctionFn alias.
-    // Workbook access threads through eval-site env in W5-101 (Phase 4.7.G), not here.
+    // Workbook access threads through eval-site env in W5-100 (Phase 4.7.G), not here.
 }
 
 pub type FunctionFn = fn(&[FunctionArg], &FunctionContext) -> FunctionReturn;
@@ -198,7 +198,7 @@ pub struct FunctionRegistry {
 
 **Why tagged dispatch, not adapter-wrapping:** the alternative ("every register_* shim-wraps the legacy fn into a `FunctionFn`") would require boxing fn pointers (`Box<dyn Fn>`) because a bare `fn` pointer can't capture the wrapped legacy fn pointer. Tagged dispatch keeps fn pointers as plain `fn` values (Copy, no allocation) and pushes the per-tier match into the single eval-site dispatch instead of into per-call adapter calls. Net effect: same single-storage-map win Codex wanted, lower runtime overhead, simpler implementation. Full adapter normalization remains available as a future polish if the eval-site arms grow unwieldy.
 
-**Caller-side dispatch** in `ql-exec::eval` (W5-101 / Phase 4.7.G migration target):
+**Caller-side dispatch** in `ql-exec::eval` (W5-100-AUDIT / Phase 4.7.G migration, shipped post-Sonnet closure):
 
 ```rust
 match registry.lookup_any(name) {
@@ -446,15 +446,15 @@ Codex MEDIUM: settle graph + function ABI BEFORE runtime work. Revised order mov
 | 4 | **4.7.D** (W5-98) | Parser: `Expr::Array` construction with arity check + `ParseError::ArrayRowArityMismatch` | Self + Sonnet |
 | 5 | **4.7.E** (W5-99) | Printer: `Expr::Array` round-trip | Self only |
 | 6 | **4.7.F** (W5-100) | Binder: `Expr::Array` → `ExprPlan::Array` lowering + `BindError::ArrayRowArityMismatch` (NOT panic) | Self + Sonnet |
-| 7 | **4.7.G** (W5-101) | Evaluator: `EvalResult::Array(ArrayValue)`; array-in-scalar-context → `#CALC!`; array-in-aggregate-context feeds cells | Self + Sonnet |
-| 8 | **4.7.H** (W5-102) | `SpillAnchorTable` storage (map-only) + `Workbook::clear_spill_at` (overlay-aware) | Self + Sonnet |
-| 9 | **4.7.I** (W5-103) | Calcgraph: producer-alias dep extraction (lazy, no new nodes) | Self + Sonnet + **Codex pull-up** |
-| 10 | **4.7.J** (W5-104) | Runtime `set_formula` array path: clear-old → eval → bounds → degenerate → block → register-and-write | Self + Sonnet |
-| 11 | **4.7.K** (W5-105) | Runtime `set_value` + `clear_formula` spill invalidation | Self + Sonnet |
-| 12 | **4.7.L** (W5-106) | Persistence save-side: skip cells inside an active spill range; round-trip via recompute | Self + Sonnet |
-| 13 | **4.7.M** (W5-107) | First dynamic-array function: `SEQUENCE` | Self only |
-| 14 | **4.7.N** (W5-108) | Second + third dynamic-array functions: `FILTER`, `TRANSPOSE` | Self only |
-| 15 | **4.7.O** (W5-109) | Closing mega-audit (Codex + Sonnet parallel) | **Codex + Sonnet** |
+| 7 | **4.7.G** (W5-100) | Evaluator: `EvalResult::Array(ArrayValue)`; array-in-scalar-context → `#CALC!`; array-in-aggregate-context feeds cells; eval-site `lookup_any` dispatch migration | Self + Sonnet |
+| 8 | **4.7.H** (W5-101) | `SpillAnchorTable` storage (map-only) + `Workbook::clear_spill_at` (overlay-aware) | Self + Sonnet |
+| 9 | **4.7.I** (W5-102) | Calcgraph: producer-alias dep extraction (lazy, no new nodes) | Self + Sonnet + **Codex pull-up** |
+| 10 | **4.7.J** (W5-103) | Runtime `set_formula` array path: clear-old → eval → bounds → degenerate → block → register-and-write | Self + Sonnet |
+| 11 | **4.7.K** (W5-104) | Runtime `set_value` + `clear_formula` spill invalidation | Self + Sonnet |
+| 12 | **4.7.L** (W5-105) | Persistence save-side: skip cells inside an active spill range; round-trip via recompute | Self + Sonnet |
+| 13 | **4.7.M** (W5-106) | First dynamic-array function: `SEQUENCE` | Self only |
+| 14 | **4.7.N** (W5-107) | Second + third dynamic-array functions: `FILTER`, `TRANSPOSE` | Self only |
+| 15 | **4.7.O** (W5-108) | Closing mega-audit (Codex + Sonnet parallel) | **Codex + Sonnet** |
 
 16 sub-phases (15 implementation + 1 design). Estimated 2-3 weeks at prior pace.
 
@@ -484,7 +484,7 @@ This requires the saver to consult `spill_target_anchor` per cell — cheap (one
 
 `WORKBOOK_SCHEMA_VERSION` stays at 5. The skip is a behavioral fix, not a wire-format change.
 
-**Edge case:** a `.qbook` saved by a pre-W5-107 reader (no skip logic) WOULD include the spill-target cells as user records. On load, recompute_all re-evaluates the formula, sees the user blocker(s), and emits `#SPILL!` at the anchor. This is a regression for "saved-before-fix files loaded after-fix" — documented as a known transitional gap, not a closure-blocker.
+**Edge case:** a `.qbook` saved by a pre-W5-105 reader (no skip logic) WOULD include the spill-target cells as user records. On load, recompute_all re-evaluates the formula, sees the user blocker(s), and emits `#SPILL!` at the anchor. This is a regression for "saved-before-fix files loaded after-fix" — documented as a known transitional gap, not a closure-blocker.
 
 ### 12.3 Round-trip semantics
 
@@ -587,9 +587,9 @@ Excel 365+ dynamic arrays canonicalize "array in non-array context → spill or 
 
 Per § 10.5: invalidate ALL readers transitively when a spill anchor's footprint changes. Big hammer at edit rate; acceptable per the existing W5-91 rename invalidation pattern. Per-spill reverse mapping deferred.
 
-### 14.7 Pre-W5-107 saved files
+### 14.7 Pre-W5-105 (Phase 4.7.L) saved files
 
-A `.qbook` saved by pre-W5-107 code (no skip logic per § 12.2) contains spill-target cells as user-overlay records. Post-W5-107 load → recompute_all sees user blockers → emits `#SPILL!` at the anchor. Documented transitional gap; not a closure-blocker.
+A `.qbook` saved by pre-W5-105 code (no skip logic per § 12.2) contains spill-target cells as user-overlay records. Post-W5-105 load → recompute_all sees user blockers → emits `#SPILL!` at the anchor. Documented transitional gap; not a closure-blocker.
 
 ## 15. What's NOT in scope
 
