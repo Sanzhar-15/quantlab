@@ -2075,4 +2075,96 @@ mod tests {
             other => panic!("expected Function, got {other:?}"),
         }
     }
+
+    // W5-98 closure (Sonnet M1 + M3 + L1 + L2 + L3): supplementary
+    // tests covering edge cases the original commit missed.
+
+    #[test]
+    fn parse_array_literal_singleton_1x1() {
+        // L1 — degenerate 1×1 array `{5}`. Valid; parser must NOT
+        // confuse this with a `{}` empty-literal rejection.
+        let expr = parse_ok("{5}");
+        match expr {
+            Expr::Array(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].len(), 1);
+                assert_eq!(rows[0][0], Expr::Number(5.0));
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_array_literal_3x2_three_rows() {
+        // M3 — three-row arity check. Exercises the loop bound past
+        // the second row (covered by the existing 2x2 test).
+        let expr = parse_ok("{1, 2; 3, 4; 5, 6}");
+        match expr {
+            Expr::Array(rows) => {
+                assert_eq!(rows.len(), 3);
+                for row in &rows {
+                    assert_eq!(row.len(), 2);
+                }
+                assert_eq!(rows[0][0], Expr::Number(1.0));
+                assert_eq!(rows[1][0], Expr::Number(3.0));
+                assert_eq!(rows[2][0], Expr::Number(5.0));
+                assert_eq!(rows[2][1], Expr::Number(6.0));
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_array_literal_arity_mismatch_second_row_longer() {
+        // M1 — `{1; 2, 3}` second row LONGER than first. The original
+        // arity test covered second-row-SHORTER; this covers the
+        // opposite direction to catch any directional bias in the
+        // arity-check logic.
+        let err = parse_err("{1; 2, 3}");
+        match err {
+            ParseError::ArrayRowArityMismatch {
+                expected,
+                found,
+                row,
+            } => {
+                assert_eq!(expected, 1);
+                assert_eq!(found, 2);
+                assert_eq!(row, 1);
+            }
+            other => panic!("expected ArrayRowArityMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_error_literal_as_binary_operand() {
+        // L2 — `=1 + #N/A`. Verify the new `Token::Error` primary arm
+        // integrates with binary-operator precedence (i.e. is_op
+        // dispatch sees the error as a complete primary and applies
+        // the `+` correctly).
+        let expr = parse_ok("1 + #N/A");
+        match expr {
+            Expr::Binary { op, lhs, rhs } => {
+                assert_eq!(op, Operator::Plus);
+                assert_eq!(*lhs, Expr::Number(1.0));
+                assert_eq!(*rhs, Expr::Error(ql_types::ErrorValue::NA));
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_array_literal_double_semicolon_rejects() {
+        // L3 — `{1;;3}` (double semicolon, missing cell). Document the
+        // parser's behavior: after the first `;`, parse_array_cell is
+        // called on the second `;`, which is NOT in the allowed cell
+        // tokens → InvalidArrayCellToken{got: "Semicolon"}. The user
+        // gets a clear "Semicolon not valid as array cell" error.
+        let err = parse_err("{1;;3}");
+        match err {
+            ParseError::InvalidArrayCellToken { got } => {
+                assert!(got.contains("Semicolon"), "got: {got}");
+            }
+            other => panic!("expected InvalidArrayCellToken, got {other:?}"),
+        }
+    }
 }

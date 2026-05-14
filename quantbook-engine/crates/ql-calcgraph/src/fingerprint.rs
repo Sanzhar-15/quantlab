@@ -556,6 +556,20 @@ mod tests {
                 })),
                 0x8D37_9920_D9A5_B01C,
             ),
+            // W5-98 closure (Sonnet M2): pin Expr::Error fingerprint
+            // for two representative variants. Hashing the sigil
+            // string (not the discriminant) means future ErrorValue
+            // reorders won't shift these.
+            (
+                "Error(#REF!)",
+                Expr::Error(ql_types::ErrorValue::Ref),
+                0xED55_03D7_E7B7_0840,
+            ),
+            (
+                "Error(#N/A)",
+                Expr::Error(ql_types::ErrorValue::NA),
+                0xAEB3_8EAB_0E1F_6828,
+            ),
         ];
         let mut mismatches = Vec::new();
         for (label, expr, expected) in goldens {
