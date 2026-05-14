@@ -697,3 +697,63 @@ fn rename_column_op_log_replay_reconstructs_rename() {
         "post-replay SUM(Sales[Quantity]) matches producer"
     );
 }
+
+/// **W5-122 (Phase 4.8.J) e2e:** resize_table emits `Op::ResizeTable`;
+/// replay against a fresh workbook reconstructs the new dimensions +
+/// new column roster; post-replay recompute_all picks up the resized
+/// range and evaluates SUM correctly.
+#[test]
+fn resize_table_op_log_replay_reconstructs_resize() {
+    let mut producer_wb = fresh_wb();
+    let reg = default_registry();
+    let mut producer_oplog = OpLog::new();
+    {
+        let mut rt = WorkbookRuntime::with_oplog(&mut producer_wb, &reg, &mut producer_oplog);
+        rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+            .unwrap();
+        // Seed 4 values via PutValue so replay sees them; the table
+        // initially covers only the first 2 data rows.
+        rt.set_value(0, 1, 0, Value::Number(10.0)).unwrap();
+        rt.set_value(0, 2, 0, Value::Number(20.0)).unwrap();
+        rt.set_value(0, 3, 0, Value::Number(40.0)).unwrap();
+        rt.set_value(0, 4, 0, Value::Number(50.0)).unwrap();
+        // SUM at initial dim: rows 1-2 = 30.
+        let _ = rt.set_formula(0, 10, 0, "SUM(Sales[Qty])").unwrap();
+        // Grow to 5 rows + add "Price" column.
+        rt.resize_table("Sales", 5, 2, vec!["Price".into()], vec![])
+            .unwrap();
+        // Resize bumps TableTable generation + clears plan cache, but
+        // doesn't dirty individual formula cells (targeted dirty-prop
+        // via `table_to_formulas` is 4.8.G.3, deferred). The
+        // legacy-pass `recompute_all` re-evaluates every formula so
+        // the SUM picks up the new range.
+        assert!(rt.recompute_all().is_complete());
+    }
+    assert_eq!(
+        producer_wb.read(Address::new(0, 10, 0)),
+        Value::Number(120.0),
+        "producer SUM after resize+recompute covers rows 1-4 = 120"
+    );
+
+    let mut replay_wb = fresh_wb();
+    replay_into(&producer_oplog, &mut replay_wb, &reg).unwrap();
+    // Table metadata reflects resize.
+    let meta = replay_wb.lookup_table("Sales").expect("table present");
+    assert_eq!(meta.rows, 5);
+    assert_eq!(meta.cols, 2);
+    assert!(meta.lookup_column("Qty").is_some());
+    assert!(
+        meta.lookup_column("Price").is_some(),
+        "new column visible on replay"
+    );
+    // Post-replay recompute confirms SUM picks up the new range.
+    {
+        let mut rt = WorkbookRuntime::new(&mut replay_wb, &reg);
+        assert!(rt.recompute_all().is_complete());
+    }
+    assert_eq!(
+        replay_wb.read(Address::new(0, 10, 0)),
+        Value::Number(120.0),
+        "post-replay SUM matches producer"
+    );
+}

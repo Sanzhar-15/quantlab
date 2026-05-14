@@ -202,6 +202,17 @@ pub enum ReplayError {
         column: String,
         reason: &'static str,
     },
+
+    /// **W5-122 (Phase 4.8.J):** `ResizeTable` op was rejected by a
+    /// validation rule (arithmetic mismatch, trailing-columns
+    /// mismatch, column-name collision, footprint overlap, etc.).
+    /// `reason` is a static string describing which invariant fired.
+    #[error("replay resize-table rejected at op index {index}: table {name:?} ({reason})")]
+    TableResizeRejected {
+        index: usize,
+        name: String,
+        reason: &'static str,
+    },
 }
 
 /// Wrapper around `ql_storage::FormatTableError` that owns its strings,
@@ -509,6 +520,21 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             old_name,
             new_name,
         } => apply_rename_column(workbook, index, table, old_name, new_name),
+        Op::ResizeTable {
+            name,
+            new_rows,
+            new_cols,
+            added_columns,
+            removed_columns,
+        } => apply_resize_table(
+            workbook,
+            index,
+            name,
+            *new_rows,
+            *new_cols,
+            added_columns,
+            removed_columns,
+        ),
     }
 }
 
@@ -620,6 +646,165 @@ fn apply_rename_column(
     }
     meta.columns[col_idx as usize].name = std::sync::Arc::from(new_lower.as_str());
     meta.columns[col_idx as usize].display = std::sync::Arc::from(new_name);
+    workbook.tables_mut().bump_generation();
+    Ok(())
+}
+
+/// **W5-122 (Phase 4.8.J):** replay a `ResizeTable`. Validates the
+/// target table exists, the arithmetic invariant
+/// (`new_cols == old_cols + added.len() - removed.len()`),
+/// `removed_columns` exactly match the current trailing columns
+/// (case-insensitive on display), the final column roster has unique
+/// canonical names, and the new footprint cells outside the old
+/// footprint don't overlap other tables. Mutates the table metadata
+/// in place (rows/cols + columns vec). Bumps `TableTable` generation.
+fn apply_resize_table(
+    workbook: &mut ql_storage::Workbook,
+    index: usize,
+    name: &str,
+    new_rows: u32,
+    new_cols: u32,
+    added_columns: &[String],
+    removed_columns: &[String],
+) -> Result<(), ReplayError> {
+    use ql_storage::TableColumn;
+    let canonical = name.to_ascii_uppercase();
+    // Snapshot the immutable bits we need to validate before mutating.
+    let (sheet, top_row, top_col, old_rows, old_cols, old_displays) = {
+        let meta =
+            workbook
+                .tables()
+                .lookup(&canonical)
+                .ok_or_else(|| ReplayError::TableNotFound {
+                    index,
+                    name: name.to_owned(),
+                })?;
+        (
+            meta.sheet,
+            meta.top_row,
+            meta.top_col,
+            meta.rows,
+            meta.cols,
+            meta.columns
+                .iter()
+                .map(|c| c.display.as_ref().to_owned())
+                .collect::<Vec<_>>(),
+        )
+    };
+    if new_rows == 0 || new_cols == 0 {
+        return Err(ReplayError::TableResizeRejected {
+            index,
+            name: name.to_owned(),
+            reason: "table rows and cols must both be > 0",
+        });
+    }
+    let added_len = added_columns.len() as u32;
+    let removed_len = removed_columns.len() as u32;
+    if removed_len > old_cols {
+        return Err(ReplayError::TableResizeRejected {
+            index,
+            name: name.to_owned(),
+            reason: "removed_columns count exceeds existing column count",
+        });
+    }
+    // Arithmetic invariant.
+    if new_cols != old_cols + added_len - removed_len {
+        return Err(ReplayError::TableResizeRejected {
+            index,
+            name: name.to_owned(),
+            reason: "new_cols does not match old_cols + added - removed",
+        });
+    }
+    // removed_columns must exactly match trailing displays
+    // (case-insensitive).
+    let trailing_start = (old_cols - removed_len) as usize;
+    for (i, expected) in removed_columns.iter().enumerate() {
+        let idx = trailing_start + i;
+        if !old_displays[idx].eq_ignore_ascii_case(expected) {
+            return Err(ReplayError::TableResizeRejected {
+                index,
+                name: name.to_owned(),
+                reason: "removed_columns do not match trailing columns",
+            });
+        }
+    }
+    // added_columns: non-empty + unique vs final roster.
+    if added_columns.iter().any(|s| s.is_empty()) {
+        return Err(ReplayError::TableResizeRejected {
+            index,
+            name: name.to_owned(),
+            reason: "added column names cannot be empty",
+        });
+    }
+    // Build the final canonical (lowercase) roster.
+    let mut final_canon: Vec<String> = old_displays
+        .iter()
+        .take(trailing_start)
+        .map(|d| d.to_ascii_lowercase())
+        .collect();
+    for a in added_columns {
+        final_canon.push(a.to_ascii_lowercase());
+    }
+    {
+        use std::collections::HashSet;
+        let mut seen: HashSet<&str> = HashSet::new();
+        for cn in &final_canon {
+            if !seen.insert(cn.as_str()) {
+                return Err(ReplayError::TableResizeRejected {
+                    index,
+                    name: name.to_owned(),
+                    reason: "final column roster has duplicate canonical names",
+                });
+            }
+        }
+    }
+    // Footprint-overlap check: only cells NEWLY claimed by this resize
+    // need checking. Old-footprint cells already belong to this table.
+    // We test all cells in [top_row..top_row+new_rows] x [top_col..
+    // top_col+new_cols] and skip those inside the OLD footprint.
+    let old_end_row = top_row + old_rows;
+    let old_end_col = top_col + old_cols;
+    let new_end_row = top_row + new_rows;
+    let new_end_col = top_col + new_cols;
+    for r in top_row..new_end_row {
+        for c in top_col..new_end_col {
+            let inside_old = r < old_end_row && c < old_end_col;
+            if inside_old {
+                continue;
+            }
+            if let Some(other) = workbook.table_at(sheet, r, c) {
+                if !other.name.eq_ignore_ascii_case(&canonical) {
+                    return Err(ReplayError::TableResizeRejected {
+                        index,
+                        name: name.to_owned(),
+                        reason: "new footprint overlaps an existing table",
+                    });
+                }
+            }
+        }
+    }
+    // ----- Mutation -----
+    // Allocate new column ids BEFORE taking &mut on the table entry
+    // (allocate_column_id lives on TableTable not TableMetadata).
+    let new_ids: Vec<u32> = (0..added_columns.len())
+        .map(|_| workbook.tables_mut().allocate_column_id())
+        .collect();
+    let meta = workbook
+        .tables_mut()
+        .get_mut(&canonical)
+        .expect("verified at top");
+    meta.rows = new_rows;
+    meta.cols = new_cols;
+    meta.columns
+        .truncate(meta.columns.len() - removed_len as usize);
+    for (cn, id) in added_columns.iter().zip(new_ids) {
+        meta.columns.push(TableColumn {
+            id,
+            name: std::sync::Arc::from(cn.to_ascii_lowercase().as_str()),
+            display: std::sync::Arc::from(cn.as_str()),
+            totals_function: None,
+        });
+    }
     workbook.tables_mut().bump_generation();
     Ok(())
 }

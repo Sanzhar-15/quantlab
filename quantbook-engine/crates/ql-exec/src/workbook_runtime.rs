@@ -260,6 +260,14 @@ pub enum RuntimeError {
         column: String,
         reason: &'static str,
     },
+
+    /// **W5-122 (Phase 4.8.J):** `resize_table` was rejected by a
+    /// validation rule (zero dims, arithmetic mismatch, trailing-
+    /// columns mismatch, column-name collision, footprint overlap,
+    /// etc.). `reason` is a static string describing which invariant
+    /// fired.
+    #[error("table {name:?} resize rejected: {reason}")]
+    TableResizeRejected { name: String, reason: &'static str },
 }
 
 impl From<LexError> for RuntimeError {
@@ -1865,6 +1873,202 @@ impl<'a> WorkbookRuntime<'a> {
         // miss anyway; bare invalidation prevents stale entries.
         self.plan_cache.clear();
         Ok(rewritten)
+    }
+
+    /// **W5-122 (Phase 4.8.J):** resize a table's footprint per
+    /// design § 12.3. Three scenarios are supported by a single op:
+    ///
+    /// - **Grow / shrink rows:** common path. Pass `added_columns =
+    ///   removed_columns = []` and the new row count.
+    /// - **Append column(s) at the END:** list each new display name
+    ///   in `added_columns`; column ids are freshly allocated.
+    /// - **Truncate trailing column(s):** list each in
+    ///   `removed_columns` in their current left-to-right order
+    ///   (case-insensitive on display).
+    ///
+    /// Inserting / removing a column in the MIDDLE is NOT supported in
+    /// 4.8 (Phase 5 structural edits — requires physical cell move).
+    ///
+    /// Validation (all BEFORE op-log append per W5-103 atomicity):
+    /// - Table exists.
+    /// - `new_rows > 0` AND `new_cols > 0`.
+    /// - `removed_columns.len() <= old_cols`.
+    /// - Arithmetic: `new_cols == old_cols + added.len() - removed.len()`.
+    /// - `removed_columns` exactly match trailing columns (case-insensitive).
+    /// - `added_columns`: non-empty entries; final roster has unique
+    ///   canonical (lowercase) names.
+    /// - New footprint cells outside the OLD footprint don't overlap
+    ///   another table.
+    ///
+    /// NOTE: a spill-anchor check inside the new footprint is
+    /// intentionally OMITTED to mirror `create_table`, which doesn't
+    /// check either. The runtime invariant § 4.3 #5 is enforced at
+    /// `write_spill` time today; closing this uniformly across
+    /// create+resize is a separate follow-up.
+    ///
+    /// No formula-text rewriting: resize doesn't change column NAMES
+    /// of surviving columns, so existing references stay valid.
+    /// Re-binding picks up the new range/columns on next eval via the
+    /// cleared plan cache.
+    ///
+    /// **Caller responsibility:** resize bumps `TableTable::generation`
+    /// and clears the plan cache, but does NOT dirty individual
+    /// formula cells. Cached SUM values etc. from BEFORE the resize
+    /// remain materialized in the COMPUTED overlay until the caller
+    /// re-triggers eval (typically via [`Self::recompute_all`]).
+    /// Targeted dirty-propagation via a `table_to_formulas` reverse
+    /// index is design § 4.5 / sub-phase 4.8.G.3 (deferred).
+    pub fn resize_table(
+        &mut self,
+        name: &str,
+        new_rows: u32,
+        new_cols: u32,
+        added_columns: Vec<String>,
+        removed_columns: Vec<String>,
+    ) -> Result<(), RuntimeError> {
+        use ql_storage::TableColumn;
+        let canonical = name.to_ascii_uppercase();
+        // Snapshot the immutable bits we need to validate.
+        let (sheet, top_row, top_col, old_rows, old_cols, old_displays) = {
+            let meta = self
+                .workbook
+                .tables()
+                .lookup(&canonical)
+                .ok_or_else(|| RuntimeError::TableNotFound(name.to_owned()))?;
+            (
+                meta.sheet,
+                meta.top_row,
+                meta.top_col,
+                meta.rows,
+                meta.cols,
+                meta.columns
+                    .iter()
+                    .map(|c| c.display.as_ref().to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        if new_rows == 0 || new_cols == 0 {
+            return Err(RuntimeError::TableResizeRejected {
+                name: name.to_owned(),
+                reason: "table rows and cols must both be > 0",
+            });
+        }
+        let added_len = added_columns.len() as u32;
+        let removed_len = removed_columns.len() as u32;
+        if removed_len > old_cols {
+            return Err(RuntimeError::TableResizeRejected {
+                name: name.to_owned(),
+                reason: "removed_columns count exceeds existing column count",
+            });
+        }
+        if new_cols != old_cols + added_len - removed_len {
+            return Err(RuntimeError::TableResizeRejected {
+                name: name.to_owned(),
+                reason: "new_cols does not match old_cols + added - removed",
+            });
+        }
+        // removed_columns must exactly match trailing displays
+        // (case-insensitive).
+        let trailing_start = (old_cols - removed_len) as usize;
+        for (i, expected) in removed_columns.iter().enumerate() {
+            let idx = trailing_start + i;
+            if !old_displays[idx].eq_ignore_ascii_case(expected) {
+                return Err(RuntimeError::TableResizeRejected {
+                    name: name.to_owned(),
+                    reason: "removed_columns do not match trailing columns",
+                });
+            }
+        }
+        if added_columns.iter().any(|s| s.is_empty()) {
+            return Err(RuntimeError::TableResizeRejected {
+                name: name.to_owned(),
+                reason: "added column names cannot be empty",
+            });
+        }
+        // Build the final canonical (lowercase) roster + check
+        // uniqueness.
+        let mut final_canon: Vec<String> = old_displays
+            .iter()
+            .take(trailing_start)
+            .map(|d| d.to_ascii_lowercase())
+            .collect();
+        for a in &added_columns {
+            final_canon.push(a.to_ascii_lowercase());
+        }
+        {
+            use std::collections::HashSet;
+            let mut seen: HashSet<&str> = HashSet::new();
+            for cn in &final_canon {
+                if !seen.insert(cn.as_str()) {
+                    return Err(RuntimeError::TableResizeRejected {
+                        name: name.to_owned(),
+                        reason: "final column roster has duplicate canonical names",
+                    });
+                }
+            }
+        }
+        // Footprint-overlap check: only cells NEWLY claimed need
+        // checking (cells in the OLD footprint already belong to this
+        // table).
+        let old_end_row = top_row + old_rows;
+        let old_end_col = top_col + old_cols;
+        let new_end_row = top_row + new_rows;
+        let new_end_col = top_col + new_cols;
+        for r in top_row..new_end_row {
+            for c in top_col..new_end_col {
+                let inside_old = r < old_end_row && c < old_end_col;
+                if inside_old {
+                    continue;
+                }
+                if let Some(other) = self.workbook.table_at(sheet, r, c) {
+                    if !other.name.eq_ignore_ascii_case(&canonical) {
+                        return Err(RuntimeError::TableResizeRejected {
+                            name: name.to_owned(),
+                            reason: "new footprint overlaps an existing table",
+                        });
+                    }
+                }
+            }
+        }
+        // ----- Op-log append (BEFORE mutation per W5-103) -----
+        if let Some(oplog) = self.oplog.as_deref_mut() {
+            oplog.append(Op::ResizeTable {
+                name: canonical.clone(),
+                new_rows,
+                new_cols,
+                added_columns: added_columns.clone(),
+                removed_columns: removed_columns.clone(),
+            })?;
+        }
+        // ----- Mutation -----
+        // Allocate new column ids first; mutable borrows on TableTable
+        // versus TableMetadata conflict otherwise.
+        let new_ids: Vec<u32> = (0..added_columns.len())
+            .map(|_| self.workbook.tables_mut().allocate_column_id())
+            .collect();
+        let meta = self
+            .workbook
+            .tables_mut()
+            .get_mut(&canonical)
+            .expect("verified at top");
+        meta.rows = new_rows;
+        meta.cols = new_cols;
+        meta.columns
+            .truncate(meta.columns.len() - removed_len as usize);
+        for (cn, id) in added_columns.iter().zip(new_ids) {
+            meta.columns.push(TableColumn {
+                id,
+                name: Arc::from(cn.to_ascii_lowercase().as_str()),
+                display: Arc::from(cn.as_str()),
+                totals_function: None,
+            });
+        }
+        self.workbook.tables_mut().bump_generation();
+        // Plan cache clear so formulas re-bind against the new range
+        // / column roster on next eval. Targeted invalidation via
+        // `table_to_formulas` is design § 4.5 / 4.8.G.3 (deferred).
+        self.plan_cache.clear();
+        Ok(())
     }
 
     /// **W5-92 (Phase 4.6.D):** create a new sheet,
@@ -9808,6 +10012,321 @@ mod tests {
             }
             other => panic!("expected PutFormula for rewrite, got {other:?}"),
         }
+    }
+
+    // ===== W5-122 (Phase 4.8.J) — resize_table =====
+
+    #[test]
+    fn resize_table_grow_rows_extends_sum_range() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+        }
+        // Initial: header at row 0, data at rows 1-2 = 10, 20 → SUM = 30.
+        wb.put(ql_types::Address::new(0, 1, 0), Value::Number(10.0));
+        wb.put(ql_types::Address::new(0, 2, 0), Value::Number(20.0));
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let v = rt.set_formula(0, 10, 0, "SUM(Sales[Qty])").unwrap();
+            assert_eq!(v, Value::Number(30.0));
+        }
+        // Add data BELOW current footprint, then resize to include it.
+        wb.put(ql_types::Address::new(0, 3, 0), Value::Number(40.0));
+        wb.put(ql_types::Address::new(0, 4, 0), Value::Number(50.0));
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.resize_table("Sales", 5, 1, vec![], vec![]).unwrap();
+            assert!(rt.recompute_all().is_complete());
+        }
+        // SUM now covers rows 1..4 = 10+20+40+50 = 120.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 10, 0)),
+            Value::Number(120.0)
+        );
+        // Metadata reflects new dims.
+        let meta = wb.lookup_table("Sales").unwrap();
+        assert_eq!(meta.rows, 5);
+        assert_eq!(meta.cols, 1);
+    }
+
+    #[test]
+    fn resize_table_shrink_rows_truncates_sum_range() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.create_table("Sales", 0, 0, 0, 5, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+        }
+        // Header at row 0, data at rows 1-4 = 10, 20, 40, 50.
+        wb.put(ql_types::Address::new(0, 1, 0), Value::Number(10.0));
+        wb.put(ql_types::Address::new(0, 2, 0), Value::Number(20.0));
+        wb.put(ql_types::Address::new(0, 3, 0), Value::Number(40.0));
+        wb.put(ql_types::Address::new(0, 4, 0), Value::Number(50.0));
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let v = rt.set_formula(0, 10, 0, "SUM(Sales[Qty])").unwrap();
+            assert_eq!(v, Value::Number(120.0));
+        }
+        // Shrink from 5 rows to 3 (drop bottom 2 data rows).
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.resize_table("Sales", 3, 1, vec![], vec![]).unwrap();
+            assert!(rt.recompute_all().is_complete());
+        }
+        // SUM now covers rows 1..2 = 30.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 10, 0)),
+            Value::Number(30.0)
+        );
+        // Cells at rows 3-4 still hold their values (storage isn't
+        // touched), but they're no longer part of the table.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 3, 0)),
+            Value::Number(40.0)
+        );
+        assert!(wb.table_at(0, 3, 0).is_none(), "row 3 no longer in table");
+    }
+
+    #[test]
+    fn resize_table_add_column_appends_new_column() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+        }
+        // Resize: cols 1 → 2, add "Price".
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.resize_table("Sales", 3, 2, vec!["Price".into()], vec![])
+                .unwrap();
+        }
+        let meta = wb.lookup_table("Sales").unwrap();
+        assert_eq!(meta.cols, 2);
+        assert_eq!(meta.columns.len(), 2);
+        let (idx, col) = meta.lookup_column("Price").unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(col.name.as_ref(), "price");
+        assert_eq!(col.display.as_ref(), "Price");
+        // Pre-existing column intact.
+        assert!(meta.lookup_column("Qty").is_some());
+        // New column has a freshly allocated id distinct from Qty's.
+        let qty_id = meta.lookup_column("Qty").unwrap().1.id;
+        assert_ne!(col.id, qty_id);
+    }
+
+    #[test]
+    fn resize_table_remove_last_column_drops_column() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.create_table(
+                "Sales",
+                0,
+                0,
+                0,
+                3,
+                2,
+                true,
+                false,
+                vec!["Qty".into(), "Price".into()],
+            )
+            .unwrap();
+        }
+        // Resize: drop "Price".
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.resize_table("Sales", 3, 1, vec![], vec!["Price".into()])
+                .unwrap();
+        }
+        let meta = wb.lookup_table("Sales").unwrap();
+        assert_eq!(meta.cols, 1);
+        assert_eq!(meta.columns.len(), 1);
+        assert!(meta.lookup_column("Qty").is_some());
+        assert!(meta.lookup_column("Price").is_none());
+    }
+
+    #[test]
+    fn resize_table_unknown_table_errors() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt.resize_table("Nope", 5, 1, vec![], vec![]).unwrap_err();
+        match err {
+            RuntimeError::TableNotFound(n) => assert_eq!(n, "Nope"),
+            other => panic!("expected TableNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resize_table_zero_dims_rejected() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+            .unwrap();
+        let err = rt.resize_table("Sales", 0, 1, vec![], vec![]).unwrap_err();
+        match err {
+            RuntimeError::TableResizeRejected { reason, .. } => {
+                assert!(reason.contains("> 0"), "reason: {reason}");
+            }
+            other => panic!("expected TableResizeRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resize_table_arithmetic_mismatch_rejected() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+            .unwrap();
+        // old_cols=1, add 1, remove 0 → expect new_cols = 2; pass 3 instead.
+        let err = rt
+            .resize_table("Sales", 3, 3, vec!["Price".into()], vec![])
+            .unwrap_err();
+        match err {
+            RuntimeError::TableResizeRejected { reason, .. } => {
+                assert!(reason.contains("does not match"), "reason: {reason}");
+            }
+            other => panic!("expected TableResizeRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resize_table_removed_columns_not_trailing_rejected() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.create_table(
+            "Sales",
+            0,
+            0,
+            0,
+            3,
+            3,
+            true,
+            false,
+            vec!["A".into(), "B".into(), "C".into()],
+        )
+        .unwrap();
+        // removed_columns = ["A"] — but A is NOT trailing (trailing is C).
+        let err = rt
+            .resize_table("Sales", 3, 2, vec![], vec!["A".into()])
+            .unwrap_err();
+        match err {
+            RuntimeError::TableResizeRejected { reason, .. } => {
+                assert!(reason.contains("do not match trailing"), "reason: {reason}");
+            }
+            other => panic!("expected TableResizeRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resize_table_overlap_with_other_table_rejected() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            // Sales at rows 0-2, cols 0-0.
+            rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+            // Orders at rows 5-7, cols 0-0.
+            rt.create_table("Orders", 0, 5, 0, 3, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+        }
+        // Grow Sales to 10 rows — would overlap Orders at rows 5-7.
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt.resize_table("Sales", 10, 1, vec![], vec![]).unwrap_err();
+        match err {
+            RuntimeError::TableResizeRejected { reason, .. } => {
+                assert!(reason.contains("overlaps"), "reason: {reason}");
+            }
+            other => panic!("expected TableResizeRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resize_table_added_column_duplicate_rejected() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+            .unwrap();
+        // Adding "qty" (lowercase) collides with existing "Qty".
+        let err = rt
+            .resize_table("Sales", 3, 2, vec!["qty".into()], vec![])
+            .unwrap_err();
+        match err {
+            RuntimeError::TableResizeRejected { reason, .. } => {
+                assert!(
+                    reason.contains("duplicate canonical names"),
+                    "reason: {reason}"
+                );
+            }
+            other => panic!("expected TableResizeRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resize_table_removed_columns_excess_count_rejected() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+            .unwrap();
+        // Only 1 column exists; trying to remove 2. Use new_cols=1
+        // so the zero-dims check doesn't fire first (the
+        // excess-count check is what we want to pin here).
+        let err = rt
+            .resize_table("Sales", 3, 1, vec![], vec!["Qty".into(), "Phantom".into()])
+            .unwrap_err();
+        match err {
+            RuntimeError::TableResizeRejected { reason, .. } => {
+                assert!(
+                    reason.contains("exceeds existing column count"),
+                    "reason: {reason}"
+                );
+            }
+            other => panic!("expected TableResizeRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resize_table_emits_ops() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+            rt.resize_table("Sales", 5, 2, vec!["Price".into()], vec![])
+                .unwrap();
+        }
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        // CreateTable + ResizeTable.
+        assert_eq!(ops.len(), 2, "got {ops:?}");
+        assert!(matches!(
+            &ops[1],
+            Op::ResizeTable {
+                name,
+                new_rows,
+                new_cols,
+                added_columns,
+                removed_columns,
+            } if name == "SALES"
+                && *new_rows == 5
+                && *new_cols == 2
+                && added_columns == &vec!["Price".to_owned()]
+                && removed_columns.is_empty()
+        ));
     }
 
     /// **End-to-end with op log**: create_table emits Op::CreateTable;

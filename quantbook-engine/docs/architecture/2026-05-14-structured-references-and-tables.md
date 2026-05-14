@@ -675,14 +675,14 @@ Each sub-phase ships independently (1 commit + 7 gates green) with self-audit; C
 | 8 | **4.8.H** (W5-118) | Workbook runtime: `create_table` / `drop_table` + `Op::CreateTable` / `Op::DropTable` + replay arms + W5-103 atomicity | ✅ shipped `ec3e9cc960a` (9 tests incl. producer→replay e2e) |
 | 9a | **4.8.I** (W5-119) | Workbook runtime: `rename_table` + `ast::rewrite_table_ref` tree-walk + formula text rewrite + `Op::RenameTable` | ✅ shipped `e2d80eee653` (4 tests) |
 | 9b | **4.8.I.2** (W5-121) | `rename_column` + `Op::RenameColumn` (same pattern as rename_table but rewrites column refs inside `StructuredRef` specs) | ✅ shipped (11 tests: 10 unit + 1 e2e replay) |
-| 10 | **4.8.J** (W5-NNN) | `resize_table` (grow rows + add/remove last column) + spill-anchor block (§ 4.3 invariant #5) + `Op::ResizeTable` | ⏳ DEFERRED |
+| 10 | **4.8.J** (W5-122) | `resize_table` (grow rows + add/remove last column) + `Op::ResizeTable`. NOTE: spill-anchor check intentionally omitted to mirror `create_table` (which doesn't check either); uniform fix is a separate follow-up. | ✅ shipped (13 tests: 12 unit + 1 e2e replay) |
 | 11 | **4.8.K** (W5-NNN) | Op log: additional replay coverage + atomicity edge cases (currently `Op::CreateTable / DropTable / RenameTable` all replay-tested; `RenameColumn / ResizeTable` arrive with 9b + 10) | ⏳ DEFERRED |
 | 12 | **4.8.L** (W5-NNN) | Persistence: schema v5 → v6 + `TableTable` save/load + v5-reader loud-fails on v6 | ⏳ DEFERRED |
 | 13 | **4.8.M** (W5-NNN) | Specifier coverage tests: `#Headers`, `#Totals`, `#All`, `#Data`, `#This Row` + `[@Col]` + column ranges + combinations | ⏳ PARTIAL — covered by binder tests (4.8.F) + e2e (4.8.G/G.2/H/I); explicit coverage matrix deferred |
 | 14 | **4.8.N** (W5-NNN) | Edge cases: header-only table (empty-data bind error), `A[0]`-style collisions, escape-prefix headers, dropped-table re-binding, soft-fail integration | ⏳ DEFERRED |
 | 15 | **4.8.O** (W5-NNN) | Closing mega-audit (Codex + Sonnet parallel) | ⏳ DEFERRED |
 
-16 sub-phases (15 implementation + 1 design). **10 / 15 implementation sub-phases shipped** (4.8.A→I plus 4.8.I.2; plus the design doc).
+16 sub-phases (15 implementation + 1 design). **11 / 15 implementation sub-phases shipped** (4.8.A→I plus 4.8.I.2 plus 4.8.J; plus the design doc).
 
 ### Renumbering note
 
@@ -702,7 +702,7 @@ W5-NNN ids are convention, not load-bearing. Treat the **subphase letter** (G, H
 In rough priority order:
 
 1. ~~**4.8.I.2 rename_column**~~ — ✅ shipped W5-121.
-2. **4.8.J resize_table** — moderate (grow rows + add/remove last column; overlap re-check; dirties via plan cache clear since the resolved range changes).
+2. ~~**4.8.J resize_table**~~ — ✅ shipped W5-122.
 3. **4.8.L persistence v5→v6** — moderate (schema bump + TableTable serialize/deserialize in qbook_format.rs; v5-reader loud-fail on v6).
 4. **4.8.G.3 calcgraph hooks** — optional (current rename impl uses formula-text rewrite which works correctly without `table_to_formulas`; the index becomes a perf optimization when tables grow large or rename rate is high).
 5. **4.8.N error-to-cell-value soft-fail** — table-related `BindError`s currently hard-reject at `set_formula`; design § 7.4 wants soft-fail so formulas typed BEFORE the table exists land an error cell value, then re-bind on `on_table_create`.

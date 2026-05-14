@@ -207,4 +207,38 @@ pub enum Op {
         old_name: String,
         new_name: String,
     },
+
+    /// **W5-122 (Phase 4.8.J):** resize a table's footprint.
+    ///
+    /// Three scenarios (per design § 12.3):
+    /// - Grow/shrink rows: change `new_rows`; `added_columns` and
+    ///   `removed_columns` both empty.
+    /// - Append column(s) at the END: list each in `added_columns`.
+    /// - Truncate trailing column(s): list each in `removed_columns`
+    ///   in current left-to-right order.
+    ///
+    /// Inserting / removing a column in the MIDDLE is NOT supported in
+    /// 4.8 (Phase 5 structural edits — requires physical cell move).
+    ///
+    /// **Arithmetic invariant**: `new_cols == old_cols +
+    /// added_columns.len() - removed_columns.len()`. Producer + replay
+    /// both validate.
+    ///
+    /// **Column ids are NOT serialized** (same pattern as `CreateTable`)
+    /// — replay allocates fresh ids from the workbook's
+    /// `next_column_id` counter for each entry in `added_columns`,
+    /// matching producer-side allocation order.
+    ///
+    /// Replay validates: target table exists; arithmetic matches;
+    /// `removed_columns` exactly match trailing columns case-
+    /// insensitively; final column roster has unique canonical names;
+    /// new footprint cells outside the old footprint don't overlap
+    /// other tables.
+    ResizeTable {
+        name: String,
+        new_rows: u32,
+        new_cols: u32,
+        added_columns: Vec<String>,
+        removed_columns: Vec<String>,
+    },
 }
