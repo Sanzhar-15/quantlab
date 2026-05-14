@@ -1158,7 +1158,10 @@ mod tests {
             let once = parse(lex(src).expect("lex")).expect("parse");
             let printed = print(&once);
             let twice = parse(lex(&printed).expect("lex")).expect("parse");
-            assert_eq!(once, twice, "round-trip diverged for {src:?}: printed as {printed:?}");
+            assert_eq!(
+                once, twice,
+                "round-trip diverged for {src:?}: printed as {printed:?}"
+            );
         }
     }
 }

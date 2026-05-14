@@ -660,26 +660,53 @@ Each sub-phase ships independently (1 commit + 7 gates green) with self-audit; C
 
 **Estimate revision (Codex LOW-4)**: 1-2 weeks was optimistic. Realistic: 2-3 weeks, matching 4.7 complexity once rename rewriting, dirty hooks, parser combinations, escape rules, and persistence are accounted for.
 
-| # | Sub-phase | Subject | Audit |
+| # | Sub-phase | Subject | Status |
 |---|---|---|---|
-| 0 | **4.8.AA** (W5-109) | This design doc + Codex review (doc-only) — pass 2 closed below | Codex review (closed) |
-| 1 | **4.8.A** (W5-110) | `TableMetadata` + `TableColumn` + `TableTable` in `ql-storage` + module wiring | Self + Sonnet |
-| 2 | **4.8.B** (W5-111) | Lexer: `Token::StructuredRef` + bracket-escape rules (§ 5.4); Ident-with-`[`-lookahead pre-empts BareColumn (closes #148); table-name validation in `create_table` rejects A[0]-style collisions | Self + Sonnet + Codex pull-up |
-| 3 | **4.8.C** (W5-112) | Parser: `Expr::StructuredRef` + `TableSpecSubtree::Combination` sub-grammar (multi-item support per § 6.2) | Self + Sonnet |
-| 4 | **4.8.D** (W5-113) | Printer: `Expr::StructuredRef` round-trip (syntax-only — no workbook lookup per Codex MEDIUM-6) | Self only |
-| 5 | **4.8.E** (W5-114) | `BindSite` struct + plumb owning_cell through every bind call site (set_formula, recompute, validate_formula, reextract, rebuild) | Self + Sonnet |
-| 6 | **4.8.F** (W5-115) | Binder: `ExprPlan::StructuredRef` resolution + new `BindError` variants + § 7.4 error-to-cell-value mapping | Self + Sonnet |
-| 7 | **4.8.G** (W5-116) | Calcgraph: `walk_plan_for_deps` arm for StructuredRef + `table_to_formulas` dep index + `on_table_*` hooks (§ 4.5, § 8.2); plan cache `table_gen` field | Self + Sonnet + Codex pull-up |
-| 8 | **4.8.H** (W5-117) | Workbook runtime: `create_table` / `drop_table` + op log emission + **first E2E test** (`SUM(Sales[Qty])` round-trip) | Self + Sonnet |
-| 9 | **4.8.I** (W5-118) | Workbook runtime: `rename_table` / `rename_column` + `ast::rewrite_table_ref` tree-walk + formula text rewrite + dirty propagation | Self + Sonnet + Codex pull-up |
-| 10 | **4.8.J** (W5-119) | Workbook runtime: `resize_table` (grow rows + add/remove last column) + spill-anchor block (§ 4.3 invariant #5) | Self + Sonnet |
-| 11 | **4.8.K** (W5-120) | Op log: `CreateTable / RenameTable / RenameColumn / ResizeTable / DropTable` replay | Self + Sonnet |
-| 12 | **4.8.L** (W5-121) | Persistence: schema v5 → v6 + `TableTable` save/load + v5-reader fails loud on v6 | Self + Sonnet |
-| 13 | **4.8.M** (W5-122) | Specifier coverage tests: `#Headers`, `#Totals`, `#All`, `#Data`, `#This Row` + `[@Col]` + column ranges + combinations | Self only |
-| 14 | **4.8.N** (W5-123) | Edge cases: header-only table (empty-data bind error), `A[0]`-style collisions, escape-prefix headers, dropped-table re-binding | Self only |
-| 15 | **4.8.O** (W5-124) | Closing mega-audit (Codex + Sonnet parallel) | **Codex + Sonnet** |
+| 0 | **4.8.AA** (W5-109) | This design doc + Codex review (doc-only) | ✅ shipped `d3db4a65f13` |
+| 1 | **4.8.A** (W5-110) | `TableMetadata` + `TableColumn` + `TableTable` in `ql-storage` + module wiring | ✅ shipped `03b90ec3f13` (14 tests) |
+| 2 | **4.8.B** (W5-111) | Lexer: `Token::StructuredRef` + bracket-escape rules (§ 5.4); Ident-with-`[`-lookahead pre-empts BareColumn (closes #148) | ✅ shipped `f8a7cd8fa14` (12 tests; #148 closed) |
+| 3 | **4.8.C** (W5-112) | Parser: `Expr::StructuredRef` + `TableSpecSubtree::Combination` sub-grammar (multi-item per § 6.2) | ✅ shipped `7080db0b5f1` (13 tests) |
+| 4 | **4.8.D** (W5-113) | Printer: `Expr::StructuredRef` escape-aware round-trip + lexer/parser refactor (preserve `'`-escapes) | ✅ shipped `1c9894e34af` (14 tests; § 5.1 design pivot) |
+| 5 | **4.8.E** (W5-114) | `BindSite` struct + plumb owning_cell through every bind call site | ✅ shipped `f35d9307d9d` (no test delta; infra) |
+| 6 | **4.8.F** (W5-115) | Binder: `ExprPlan::StructuredRef` resolution + new `BindError` variants + `TableLookup` trait + `walk_plan_for_deps` arm | ✅ shipped `54bc253aea8` (9 binder tests) |
+| 7a | **4.8.G** (W5-116) | scalar.rs aggregate dispatch arms for StructuredRef (4 arms mirror AggregateNameRef) | ✅ shipped `4c47595d6bd` (2 e2e tests; `SUM(Sales[Qty])`) |
+| 7b | **4.8.G.2** (W5-117) | `WorkbookEnv::with_formula_cell` + `CellEnv::formula_cell_for_sref` + `narrow_structured_ref` helper for `[@Col]` row narrowing at eval time | ✅ shipped `05f86c56e2c` (2 e2e tests; `[@Qty]*2`) |
+| 7c | **4.8.G.3** (deferred) | `table_to_formulas` reverse dep index + `on_table_create/rename/drop/resize/rename_column` hooks + plan cache `table_gen` field | ⏳ DEFERRED — current impl uses formula-text rewrite (rename) + name_gen + plan_cache.clear() (rename); targeted invalidation deferred until needed |
+| 8 | **4.8.H** (W5-118) | Workbook runtime: `create_table` / `drop_table` + `Op::CreateTable` / `Op::DropTable` + replay arms + W5-103 atomicity | ✅ shipped `ec3e9cc960a` (9 tests incl. producer→replay e2e) |
+| 9a | **4.8.I** (W5-119) | Workbook runtime: `rename_table` + `ast::rewrite_table_ref` tree-walk + formula text rewrite + `Op::RenameTable` | ✅ shipped `e2d80eee653` (4 tests) |
+| 9b | **4.8.I.2** (deferred) | `rename_column` + `Op::RenameColumn` (same pattern as rename_table but rewrites column refs inside `StructuredRef` specs) | ⏳ DEFERRED |
+| 10 | **4.8.J** (W5-NNN) | `resize_table` (grow rows + add/remove last column) + spill-anchor block (§ 4.3 invariant #5) + `Op::ResizeTable` | ⏳ DEFERRED |
+| 11 | **4.8.K** (W5-NNN) | Op log: additional replay coverage + atomicity edge cases (currently `Op::CreateTable / DropTable / RenameTable` all replay-tested; `RenameColumn / ResizeTable` arrive with 9b + 10) | ⏳ DEFERRED |
+| 12 | **4.8.L** (W5-NNN) | Persistence: schema v5 → v6 + `TableTable` save/load + v5-reader loud-fails on v6 | ⏳ DEFERRED |
+| 13 | **4.8.M** (W5-NNN) | Specifier coverage tests: `#Headers`, `#Totals`, `#All`, `#Data`, `#This Row` + `[@Col]` + column ranges + combinations | ⏳ PARTIAL — covered by binder tests (4.8.F) + e2e (4.8.G/G.2/H/I); explicit coverage matrix deferred |
+| 14 | **4.8.N** (W5-NNN) | Edge cases: header-only table (empty-data bind error), `A[0]`-style collisions, escape-prefix headers, dropped-table re-binding, soft-fail integration | ⏳ DEFERRED |
+| 15 | **4.8.O** (W5-NNN) | Closing mega-audit (Codex + Sonnet parallel) | ⏳ DEFERRED |
 
-16 sub-phases (15 implementation + 1 design). **Estimated 2-3 weeks at prior pace (revised post-Codex).**
+16 sub-phases (15 implementation + 1 design). **9 / 15 implementation sub-phases shipped this session** (plus the design doc).
+
+### Renumbering note
+
+The W5-NNN ids in commits diverged from the design's W5-NNN plan starting at 4.8.G (design said W5-116, shipped as W5-116; but 4.8.G.2 introduced a new sub-phase id that shifted everything by 1). Mapping:
+
+| Design said | Shipped as |
+|---|---|
+| 4.8.G = W5-116 | 4.8.G = W5-116 ✓ |
+| 4.8.H = W5-117 | 4.8.G.2 = W5-117 |
+| 4.8.I = W5-118 | 4.8.H = W5-118 |
+| 4.8.J = W5-119 | 4.8.I = W5-119 |
+
+W5-NNN ids are convention, not load-bearing. Treat the **subphase letter** (G, H, I) as the canonical identifier; the W5-NNN is just the SHA-line tag in commit messages.
+
+### Deferred work — what a fresh session should pick up
+
+In rough priority order:
+
+1. **4.8.I.2 rename_column** — small (~similar shape to rename_table; AST walker substitutes column refs inside `StructuredRef::spec` items).
+2. **4.8.J resize_table** — moderate (grow rows + add/remove last column; overlap re-check; dirties via plan cache clear since the resolved range changes).
+3. **4.8.L persistence v5→v6** — moderate (schema bump + TableTable serialize/deserialize in qbook_format.rs; v5-reader loud-fail on v6).
+4. **4.8.G.3 calcgraph hooks** — optional (current rename impl uses formula-text rewrite which works correctly without `table_to_formulas`; the index becomes a perf optimization when tables grow large or rename rate is high).
+5. **4.8.N error-to-cell-value soft-fail** — table-related `BindError`s currently hard-reject at `set_formula`; design § 7.4 wants soft-fail so formulas typed BEFORE the table exists land an error cell value, then re-bind on `on_table_create`.
+6. **4.8.O closing megaudit** — Codex + Sonnet parallel review on the cumulative 4.8 wave.
 
 **Stop conditions** (defer remaining to a Phase 4.8 polish wave):
 - If 4.8.B Ident-with-`[`-lookahead surfaces unforeseen tokenizer regressions, halt and re-design.
