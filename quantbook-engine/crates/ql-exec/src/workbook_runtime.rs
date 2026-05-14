@@ -859,6 +859,22 @@ impl<'a> WorkbookRuntime<'a> {
         array: ArrayValue,
         formula_text: Arc<str>,
     ) -> (Value, Option<SpillShape>) {
+        // **Sheet validation invariant** (megaudit MEDIUM-5 + Codex
+        // verify follow-up). `set_formula` validates `sheet < sheet_count()`
+        // at entry; single-threaded code with no Drop hooks means the
+        // sheet cannot disappear mid-function. Per CLAUDE.md "no
+        // fallbacks — errors must be visible," check the invariant
+        // ONCE at the top of `write_spill` so it fires uniformly even
+        // for 1×1 spills (which skip the per-target blocking loop) or
+        // bounds/degenerate exits (which would otherwise miss the
+        // check). The bound is unused on the degenerate path but
+        // present even there so a future code change can't accidentally
+        // bypass the assertion.
+        let _sheet_invariant = self
+            .workbook
+            .sheet(sheet)
+            .expect("write_spill: sheet validated at set_formula entry");
+
         // Degenerate-array origin is a function-eval contract (e.g.
         // FILTER with all-false mask without if_empty). Surface as
         // #CALC!, NOT #SPILL!. Design § 8.1 step c.
@@ -901,19 +917,13 @@ impl<'a> WorkbookRuntime<'a> {
                 }
                 let r = row + dr;
                 let c = col + dc;
-                // `set_formula` validates `sheet < sheet_count()` at entry
-                // via `validate_cell`; single-threaded code with no Drop
-                // hooks means the sheet cannot disappear mid-function.
-                // Per CLAUDE.md "no fallbacks — errors must be visible"
-                // (megaudit MEDIUM-5 closure), surface this invariant
-                // explicitly via `expect` rather than `unwrap_or(Blank)`.
-                // A `None` here would mean an upstream bug; failing loud
-                // beats silently treating it as "cell empty" and letting
-                // a downstream `register_spill` panic hide the cause.
+                // Sheet existence is asserted at the top of `write_spill`;
+                // re-asserting here would be redundant. The `expect` at
+                // function entry guarantees this lookup succeeds.
                 let sheet_ref = self
                     .workbook
                     .sheet(sheet)
-                    .expect("write_spill: sheet validated at set_formula entry");
+                    .expect("write_spill: sheet asserted at function entry");
                 let occupied = self.workbook.spill_anchor_at(sheet, r, c).is_some()
                     || self.workbook.formula_at(sheet, r, c).is_some()
                     || sheet_ref.read(r, c) != Value::Blank;

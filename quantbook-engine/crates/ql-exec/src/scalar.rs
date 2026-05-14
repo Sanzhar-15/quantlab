@@ -439,9 +439,23 @@ pub fn eval_at_cell_boundary<E: CellEnv>(
                     cells.push(eval_scalar_with_cache(cell_plan, env, registry, cache));
                 }
             }
+            // `ArrayShapeError::CellCountMismatch` is unreachable from this
+            // code path: binder enforces `EmptyArrayLiteral` rejection,
+            // `ArrayRowArityMismatch` rejection, and `ArrayCellNotLiteral`
+            // rejection — so the input `ExprPlan::Array(rows)` satisfies
+            // `rows.len() >= 1`, all rows have equal width `>= 1`, and
+            // every cell-plan is a literal. The flatten above pushes
+            // exactly `rows.len() * rows[0].len()` cells. If this
+            // `expect` ever fires, EITHER the binder validation was
+            // bypassed (e.g. a direct `ExprPlan::Array(...)` constructor
+            // call in tests/host code), OR `ArrayValue::new` gained a
+            // new error variant. Both are upstream bugs — surface
+            // loudly per CLAUDE.md no-fallbacks rule.
             let array = ArrayValue::new(array_rows, array_cols, cells).expect(
-                "binder validation guarantees rows*cols == cell count; \
-                 reaching ArrayShapeError here means the binder is broken",
+                "eval_at_cell_boundary: ArrayValue::new failed — \
+                 binder validation should make CellCountMismatch \
+                 unreachable; ExprPlan::Array constructed directly \
+                 (bypassing binder) is the most likely cause",
             );
             EvalResult::Array(array)
         }

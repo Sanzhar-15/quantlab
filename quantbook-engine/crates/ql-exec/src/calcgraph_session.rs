@@ -490,12 +490,17 @@ impl CalcgraphSession {
         // circuit; W5-102 keeps it unconditional for simplicity. (See
         // W5-102 Codex audit LOW-3.)
         //
-        // **Lifecycle gap (Codex W5-102 HIGH-1, design § 10.5):** this
-        // rewrite only fires for formulas bound AFTER the spill is
+        // **Lifecycle handoff (Codex W5-102 HIGH-1, design § 10.5):**
+        // this rewrite only fires for formulas bound AFTER the spill is
         // registered. If a reader B1=A2 was bound BEFORE A1 spilled to
         // A1:A3, its dep stays on (0,1,0) and won't get a graph edge
-        // to the anchor. The re-extraction trigger at spill registration
-        // is Phase 4.7.J's responsibility (writeback path).
+        // to the anchor — at registration time, only the writeback
+        // caller can trigger re-extraction. This is closed by
+        // Phase 4.7.J.4 (`reextract_spill_footprint_readers` in
+        // `WorkbookRuntime::set_formula`), which calls
+        // `reextract_deps` for every reader indexed under any cell
+        // in the OLD or NEW spill footprint after a spill registers
+        // or dissolves. See `workbook_runtime.rs:reextract_spill_footprint_readers`.
         for cell in deps.cells.iter_mut() {
             if let Some(anchor) = workbook.spill_target_anchor(cell.0, cell.1, cell.2) {
                 *cell = anchor;
@@ -1022,6 +1027,14 @@ impl CalcgraphSession {
     /// Anchor cell itself is INCLUDED in the rectangle. The caller
     /// decides whether to filter it out (the anchor's own deps are
     /// already handled by `on_set_formula`, so excluding makes sense).
+    ///
+    /// **Identity invariant:** each `(sheet, row, col)` maps to at most
+    /// one `NodeId` in the calcgraph (`cell_index` is keyed by tuple
+    /// and `or_insert_cell_node` is the only construction site). So
+    /// a caller filtering by `cell_address_for(node) == anchor` is
+    /// safe: if it matches, it's THE anchor, not a different cell
+    /// that happens to share an address. This invariant is enforced
+    /// at insert time, not by this query's API.
     pub fn readers_in_rect(
         &self,
         anchor_sheet: SheetId,
