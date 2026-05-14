@@ -1629,8 +1629,9 @@ impl<'a> WorkbookRuntime<'a> {
         // commits successfully.
         //
         // Re-extraction of readers indexed under the dissolved
-        // footprint is Phase 4.7.K work. For now, the on_set_value
-        // pass below dirties readers via the existing index.
+        // footprint shipped in W5-108 (Phase 4.7.O) via the
+        // `reextract_spill_footprint_readers` call after the
+        // `on_set_value` pass below.
         //
         // **Value preservation semantic for spill anchors:** for a
         // scalar formula, clear_formula moves the computed value to
@@ -1725,6 +1726,17 @@ impl<'a> WorkbookRuntime<'a> {
                     }
                 }
             }
+            // **W5-108 (Phase 4.7.O) — Codex HIGH BLOCKER closure**:
+            // re-extract readers indexed under the dissolved footprint
+            // so producer-alias deps re-route back to literal cell
+            // addresses. Mirrors `set_value`'s parallel call at the
+            // dissolved-self path. Without this, a reader `D1=B1`
+            // (where B1 was a spill target of cleared anchor A1)
+            // keeps a dep on A1 — a future `set_value(B1, 5)` would
+            // NOT dirty D1, since D1's graph dep no longer matches B1.
+            // The comment at line 1632 marked this as Phase 4.7.K
+            // work; 4.7.O closes it.
+            self.reextract_spill_footprint_readers(sheet, row, col, Some(shape), None);
         }
 
         Ok(())
@@ -7567,6 +7579,55 @@ mod tests {
             after - baseline,
             2,
             "clear_formula at 1x3 anchor must fire on_set_value for B1 and C1"
+        );
+    }
+
+    /// **W5-108 (Phase 4.7.O) — Codex HIGH BLOCKER closure**:
+    /// `clear_formula` at a spill anchor must re-extract producer-
+    /// aliased readers so their deps re-route back to literal cell
+    /// addresses. Mirrors `set_value_at_spill_target_reextracts_aliased_readers`
+    /// but drives via `clear_formula(anchor)` instead.
+    ///
+    /// Pre-fix: clear_formula fired `on_set_value` for old targets but
+    /// skipped `reextract_spill_footprint_readers`. A reader `X1=B1`
+    /// (where B1 was a spill target of A1) kept its dep on A1 — a
+    /// later `set_value(B1, 5)` would NOT dirty X1 because X1's graph
+    /// dep no longer matched B1.
+    #[test]
+    fn clear_formula_at_spill_anchor_reextracts_aliased_readers() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+            // X1 = B1 (literal target ref). Producer-alias rewrites
+            // dep to anchor A1.
+            rt.set_formula(0, 0, 23, "B1").unwrap();
+        }
+        let x1 = graph.cell_node_for(0, 0, 23).unwrap();
+        assert_eq!(
+            graph.formula_deps(x1).unwrap().cells,
+            vec![(0, 0, 0)],
+            "X1 starts aliased to anchor A1 via producer-alias"
+        );
+        let _ = graph.take_dirty();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.clear_formula(0, 0, 0).unwrap();
+        }
+        // After clear, X1's dep must be re-extracted to literal B1
+        // (now Blank). Without the 4.7.O fix, X1's dep would stay on
+        // (0, 0, 0) (anchor A1), which is no longer a valid producer.
+        assert_eq!(
+            graph.formula_deps(x1).unwrap().cells,
+            vec![(0, 0, 1)],
+            "X1's dep re-extracted to literal B1 after anchor cleared"
+        );
+        assert!(
+            graph.is_dirty(x1),
+            "X1 must be dirty: its dep target dissolved"
         );
     }
 
