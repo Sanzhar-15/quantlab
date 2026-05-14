@@ -22,8 +22,8 @@ use ql_types::{Address, ColId, Range, RowId, SheetId};
 /// **W5-110 (Phase 4.8.A):** the per-column metadata inside a [`TableMetadata`].
 ///
 /// The `id` field is a stable per-column identifier monotonically allocated
-/// from the workbook-level counter ([`TableTable::next_column_id`]). Stable
-/// across renames within the table; never reused. Future phases (4.10
+/// from the workbook-level counter (`TableTable::next_column_id`, private).
+/// Stable across renames within the table; never reused. Future phases (4.10
 /// calculated columns, Phase 5 column move) consume `id` to disambiguate
 /// columns even when names collide ephemerally.
 ///
@@ -74,10 +74,10 @@ pub enum TotalsFunction {
 /// rows. `has_header` (true) means row `top_row` is the header row;
 /// `has_totals` (true) means row `top_row + rows - 1` is the totals row.
 ///
-/// **Range helpers** ([`header_range`], [`totals_range`], [`data_range`],
-/// [`all_range`], [`column_data_range`]) compute concrete `Range` values
-/// from the metadata; they are pure functions over `&self` with no
-/// internal caching.
+/// **Range helpers** ([`Self::header_range`], [`Self::totals_range`],
+/// [`Self::data_range`], [`Self::all_range`], [`Self::column_data_range`])
+/// compute concrete `Range` values from the metadata; they are pure
+/// functions over `&self` with no internal caching.
 ///
 /// See the design doc § 4.1 for invariants + § 4.3 for the workbook-level
 /// invariants (overlap rules, namespace sharing with `NameTable`, etc.).
@@ -187,7 +187,13 @@ impl TableMetadata {
         }
         let data = self.data_range()?;
         let col = self.top_col + col_idx;
-        Some(Range::new(self.sheet, data.start_row, col, data.end_row, col))
+        Some(Range::new(
+            self.sheet,
+            data.start_row,
+            col,
+            data.end_row,
+            col,
+        ))
     }
 
     /// Look up a column by case-insensitive name. Returns `(col_idx,
