@@ -3,7 +3,7 @@
 //! Modules:
 //! - [`error`] — the 14-variant `ErrorValue` (Excel sigils + Quantbook-specific surfaces + AI reservation).
 //! - [`value`] — the 5-variant `Value` (`Blank | Number | Boolean | Text | Error`).
-//! - [`array`] — `ArrayValue`: a 2D row-major container of `Value` cells, used at the eval
+//! - [`mod@array`] — `ArrayValue`: a 2D row-major container of `Value` cells, used at the eval
 //!   boundary and in the unified function-dispatch ABI (Phase 4.7, W5-95).
 //! - [`coercion`] — Excel-compatible boundary functions: `to_number_{strict,lenient}`,
 //!   `to_logical`, `to_text_for_{display,formula,arg}`, `to_int_arg`,

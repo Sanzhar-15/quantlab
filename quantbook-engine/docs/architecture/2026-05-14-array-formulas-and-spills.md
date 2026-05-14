@@ -510,7 +510,7 @@ When a spill anchor's footprint CHANGES (shape resize), readers whose extracted 
 - **Option a:** invalidate ALL readers transitively. Big hammer; correct but pessimistic.
 - **Option b:** maintain a reverse map `cell → readers` so we can target invalidation.
 
-**Decision:** Option a for v1 (matches the existing `name_gen` invalidation cadence at edit-rate). Per-spill reverse mapping is a future polish item.
+**Decision (post-W5-108 / Phase 4.7.O closure update):** Option b shipped. `Graph::readers_in_rect` (used by `WorkbookRuntime::reextract_spill_footprint_readers` at `workbook_runtime.rs:842-957`) walks ONLY readers indexed under the OLD or NEW footprint and re-extracts their deps. The original design proposed Option a for v1 ("matches the existing `name_gen` invalidation cadence at edit-rate"); 4.7.J HIGH-1 closure shipped the targeted variant directly. The big-hammer Option a remains a valid simplification if the reverse map proves too clever in practice.
 
 ## 11. Sub-phase split — REORDERED per Codex MEDIUM
 
@@ -599,11 +599,13 @@ Each function specifies argument validation + output shape + error precedence pe
 
 `FILTER(array, include, [if_empty])` — applies a boolean mask along the first axis.
 
+**v1 scope (post-W5-108 / Phase 4.7.O closure update):** 1D inputs only — `array` and `include` must both be row vectors (1×N) or both column vectors (N×1), with matching length. 2D inputs (N×M array + N×1 or 1×M mask) deferred to v2 / Phase 4.10. The shipped implementation at `crates/ql-functions/src/array_returning_fns.rs:335-341` rejects any `array` with `rows > 1 AND cols > 1` with `#VALUE!`. The 2D enumeration below describes the eventual target shape; do NOT take it as the shipped 4.7 scope.
+
 **Arguments:**
-- `array` (required, FunctionArg::Array or ::Range — both 2D shapes).
-- `include` (required, same shape OR 1D matching one axis of `array`):
-  - If `array` is N×M and `include` is N×1: filter rows where include[i]=TRUE.
-  - If `array` is N×M and `include` is 1×M: filter columns where include[j]=TRUE.
+- `array` (required, FunctionArg::Array or ::Range — v1 must be 1D row or column vector).
+- `include` (required, same orientation and length as `array`):
+  - If `array` is N×M and `include` is N×1: filter rows where include[i]=TRUE. **(v2 / Phase 4.10)**
+  - If `array` is N×M and `include` is 1×M: filter columns where include[j]=TRUE. **(v2 / Phase 4.10)**
   - If `include` is N×M (same shape as array): cell-wise filter — Phase 4.10 (out of scope for 4.7).
 - `if_empty` (optional, scalar): returned if no `include` cell is TRUE; default is `#CALC!`.
 
@@ -626,7 +628,7 @@ Each function specifies argument validation + output shape + error precedence pe
 
 **Output shape:** input N×M → output M×N. Cell `(i, j)` in input maps to `(j, i)` in output.
 
-**Argument-error precedence:** `#VALUE!` on non-array input (e.g. a scalar `Number`). No error for degenerate inputs (transpose of 0×N is N×0).
+**Argument-error precedence (post-W5-108 / Phase 4.7.O closure update):** scalar input is implicitly treated as 1×1 and returned unchanged (Excel canon: `TRANSPOSE(5)` → `5`). The shipped impl at `crates/ql-functions/src/array_returning_fns.rs:222-225` returns a 1×1 ArrayValue containing the scalar. (The original design said `#VALUE!` on non-array; that was wrong per Excel canon, fixed in 4.7.O.) Errors in input propagate. No error for degenerate inputs (transpose of 0×N is N×0).
 
 **Examples:**
 - `TRANSPOSE({1,2,3})` (1×3) → 3×1 `[1; 2; 3]`.

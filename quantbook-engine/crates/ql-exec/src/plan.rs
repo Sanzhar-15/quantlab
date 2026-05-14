@@ -419,7 +419,11 @@ fn bind_with_context<L: NameLookup>(
             )?),
         }),
         Expr::RangeRef(_) => Err(BindError::UnsupportedVariant(
-            "RangeRef requires a Function context; Phase 0 W4-1 has no function dispatch yet",
+            "literal RangeRef in non-Function context is unsupported in v1; \
+             use a named range (Phase 2B.4 AggregateNameRef) or wrap in an \
+             aggregate function. (Updated W5-108 / Phase 4.7.O; original \
+             Phase 0 W4-1 message referenced \"no function dispatch yet\" \
+             which has been in place since Phase 2A.)",
         )),
         Expr::Function { name, args } => {
             // Phase 2B.4: switch context for aggregate-function arg lists.

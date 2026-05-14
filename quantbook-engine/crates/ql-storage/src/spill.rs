@@ -261,13 +261,18 @@ impl SpillAnchorTable {
             }
         }
         // **W5-101-AUDIT (Codex LOW-1):** panic-atomicity. Pre-allocate
-        // both maps via `try_reserve` so any allocation failure surfaces
-        // as a clean error rather than a partial-insert state after the
-        // first `anchors.insert`. We don't have a structural error
-        // variant for OOM (HashMap doesn't surface allocation failures
-        // through the public Result API in stable Rust); on `try_reserve`
-        // failure we panic — same effective behavior as the un-guarded
-        // pre-W5-101-AUDIT path, but explicit about the failure mode.
+        // both maps so any allocation failure surfaces BEFORE we insert
+        // — preventing a partial-insert state where `anchors` has the
+        // new entry but `targets` panicked mid-loop. We use
+        // `HashMap::reserve`, which aborts on allocation failure
+        // (stable Rust doesn't expose a `Result`-returning variant for
+        // `HashMap` allocation, and `try_reserve` is unavailable on the
+        // pre-stabilized `HashMap` API). The panic-on-OOM effective
+        // behavior matches the un-guarded pre-W5-101-AUDIT path —
+        // explicit reserve makes the failure point earlier and
+        // unambiguous. (Comment corrected W5-108 / Phase 4.7.O Codex
+        // LOW: prior comment incorrectly attributed the semantics to
+        // `try_reserve`, which is NOT used here.)
         let target_count = (shape.rows as usize) * (shape.cols as usize);
         self.anchors.reserve(1);
         self.targets.reserve(target_count);
