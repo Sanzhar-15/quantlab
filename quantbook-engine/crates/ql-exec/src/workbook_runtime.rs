@@ -42,7 +42,7 @@ use ql_storage::{FormatId, Workbook};
 use ql_types::{ColId, ErrorValue, EvalContext, RowId, SheetId, Value, MAX_COLUMN, MAX_ROW};
 
 use crate::env::WorkbookEnv;
-use crate::plan::{bind_with_names, BindError};
+use crate::plan::{bind_with_names_and_sheets, BindError};
 use crate::plan_cache::{PlanCache, PlanCacheKey, PlanCacheStats};
 use crate::scalar::eval_scalar_with_registry;
 use crate::transaction::WorkbookTransaction;
@@ -460,7 +460,12 @@ impl<'a> WorkbookRuntime<'a> {
                     let expr = parse(tokens)?;
                     // Phase 2A.1 (2026-05-12): bind against the workbook's NameTable
                     // so `Expr::NameRef` resolves against defined names.
-                    Ok(bind_with_names(&expr, sheet, self.workbook.names())?)
+                    Ok(bind_with_names_and_sheets(
+                        &expr,
+                        sheet,
+                        self.workbook.names(),
+                        self.workbook,
+                    )?)
                 })?;
 
         // Evaluate against the current workbook state. The env borrows immutably; we
@@ -985,7 +990,7 @@ impl<'a> WorkbookRuntime<'a> {
         validate_cell(self.workbook, sheet, row, col)?;
         let tokens = lex(formula_text)?;
         let expr = parse(tokens)?;
-        let plan = bind_with_names(&expr, sheet, self.workbook.names())?;
+        let plan = bind_with_names_and_sheets(&expr, sheet, self.workbook.names(), self.workbook)?;
         let env = WorkbookEnv::new(self.workbook);
         Ok(eval_scalar_with_registry(&plan, &env, self.registry))
     }
@@ -1304,7 +1309,12 @@ impl<'a> WorkbookRuntime<'a> {
                 .get_or_insert::<_, RuntimeError>(cache_key, || {
                     let tokens = lex(formula_text.as_ref())?;
                     let expr = parse(tokens)?;
-                    Ok(bind_with_names(&expr, sheet, workbook.names())?)
+                    Ok(bind_with_names_and_sheets(
+                        &expr,
+                        sheet,
+                        workbook.names(),
+                        workbook,
+                    )?)
                 })?;
 
         // Phase 3.9: classify the plan against the SIMD kernel set.
@@ -4908,4 +4918,76 @@ mod tests {
             Value::Error(ErrorValue::Value)
         );
     }
-}
+
+    // ===== W5-90 / Phase 4.6.B — cross-sheet end-to-end evaluation =====
+
+    #[test]
+    fn cross_sheet_cellref_evaluates_after_recompute() {
+        // `Sheet2!A1 + 1` on Sheet1, where Sheet2!A1 = 41 → 42.
+        let mut wb = Workbook::new();
+        let s1 = wb.add_sheet("Sheet1");
+        let s2 = wb.add_sheet("Sheet2");
+        wb.put_at(s2, 0, 0, Value::Number(41.0));
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(s1, 0, 0, "Sheet2!A1 + 1").unwrap();
+        let _ = rt.recompute_all();
+        assert_eq!(
+            wb.read(ql_types::Address::new(s1, 0, 0)),
+            Value::Number(42.0)
+        );
+    }
+
+    // NOTE: `SUM(Sheet2!A1:A3)` (range literal as function arg) is a
+    // Phase 4.7 feature — the binder currently rejects `Expr::RangeRef`
+    // outside a Function context, and only NameRef→Range pairs reach
+    // the AggregateNameRef path. Cross-sheet ranges through named
+    // ranges DO work; verified by the named-target tests below.
+
+    #[test]
+    fn cross_sheet_quoted_name_with_space_evaluates() {
+        // Quoted-sheet-name path: `'Q3 2025'!A1 + 100`.
+        let mut wb = Workbook::new();
+        let s1 = wb.add_sheet("Main");
+        let s2 = wb.add_sheet("Q3 2025");
+        wb.put_at(s2, 0, 0, Value::Number(7.0));
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(s1, 0, 0, "'Q3 2025'!A1 + 100").unwrap();
+        let _ = rt.recompute_all();
+        assert_eq!(
+            wb.read(ql_types::Address::new(s1, 0, 0)),
+            Value::Number(107.0)
+        );
+    }
+
+    #[test]
+    fn cross_sheet_formula_with_unknown_sheet_surfaces_bind_error_at_set_time() {
+        // `set_formula` binds eagerly so the IDE can surface syntax-time
+        // errors. An unknown-sheet ref fails at bind, not at recompute.
+        let mut wb = Workbook::new();
+        let s1 = wb.add_sheet("S");
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt.set_formula(s1, 0, 0, "Phantom!A1 + 1").unwrap_err();
+        match err {
+            RuntimeError::Bind(crate::plan::BindError::UnknownSheet(name)) => {
+                assert_eq!(name.as_ref(), "Phantom");
+            }
+            other => panic!("expected RuntimeError::Bind(UnknownSheet), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cross_sheet_three_sheet_chain_evaluates() {
+        // Sheet3 reads from Sheet2 reads from Sheet1. Tests that
+        // cross-sheet deps work through the calcgraph + recompute path.
+        let mut wb = Workbook::new();
+        let s1 = wb.add_sheet("S1");
+        let s2 = wb.add_sheet("S2");
+        let s3 = wb.add_sheet("S3");
+        wb.put_at(s1, 0, 0, Value::Number(10.0)); // S1!A1 = 10
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(s2, 0, 0, "S1!A1 * 2").unwrap(); // S2!A1 = 20
+        rt.set_formula(s3, 0, 0, "S2!A1 + 5"

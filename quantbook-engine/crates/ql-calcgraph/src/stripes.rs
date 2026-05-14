@@ -312,8 +312,8 @@ pub fn range_contains_rowcol(range: &RangeRef, row: RowId, col: ColId) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use ql_formula_syntax::SheetRef;
     use super::*;
+    use ql_formula_syntax::SheetRef;
 
     fn cells(start_col: u32, start_row: u32, end_col: u32, end_row: u32) -> RangeRef {
         RangeRef::Cells {

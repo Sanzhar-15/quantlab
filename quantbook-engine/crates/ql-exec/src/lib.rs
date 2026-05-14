@@ -92,7 +92,10 @@ pub use calcgraph_session::{
 pub use env::{CellEnv, MapEnv, WorkbookEnv};
 pub use loader::load_workbook_and_recompute;
 pub use lower::{classify, dispatch, SimdShape};
-pub use plan::{bind, bind_with_names, BindError, ExprPlan, NameLookup, ResolvedName};
+pub use plan::{
+    bind, bind_with_names, bind_with_names_and_sheets, BindError, ExprPlan, NameLookup,
+    ResolvedName, SheetResolver,
+};
 pub use plan_cache::{PlanCache, PlanCacheKey, PlanCacheStats};
 pub use scalar::{eval_scalar, eval_scalar_with_cache, eval_scalar_with_registry};
 pub use simd::{

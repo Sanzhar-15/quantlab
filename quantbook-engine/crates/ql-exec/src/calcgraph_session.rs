@@ -82,7 +82,7 @@ use ql_storage::Workbook;
 use ql_types::{ColId, Range, RowId, SheetId};
 
 use crate::aggregate_cache::{AggregateCacheStats, InMemAggregateCache};
-use crate::plan::{bind_with_names, ExprPlan};
+use crate::plan::{bind_with_names_and_sheets, ExprPlan};
 use crate::workbook_runtime::RuntimeError;
 
 /// Phase 3.3 (2026-05-12) — convert a `ql_types::Range` (used in
@@ -657,7 +657,12 @@ impl CalcgraphSession {
     ) -> Result<ExprPlan, RuntimeError> {
         let tokens = lex(text)?;
         let expr = parse(tokens)?;
-        Ok(bind_with_names(&expr, owning_sheet, wb.names())?)
+        Ok(bind_with_names_and_sheets(
+            &expr,
+            owning_sheet,
+            wb.names(),
+            wb,
+        )?)
     }
 
     /// **G3-02 acceptance (hook 1/5).** Mutation hook fired by

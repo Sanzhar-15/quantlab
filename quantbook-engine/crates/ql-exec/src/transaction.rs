@@ -40,7 +40,7 @@ use ql_storage::Workbook;
 use ql_types::{ColId, RowId, SheetId, Value};
 
 use crate::env::WorkbookEnv;
-use crate::plan::{bind_with_names, ExprPlan};
+use crate::plan::{bind_with_names_and_sheets, ExprPlan};
 use crate::scalar::eval_scalar_with_registry;
 use crate::workbook_runtime::{validate_cell, RuntimeError};
 
@@ -212,7 +212,7 @@ impl<'a> WorkbookTransaction<'a> {
         // table is stable for the transaction's lifetime — eager binding is
         // safe and surfaces UnresolvedName / UnsupportedVariant before any
         // writes land.
-        let plan = bind_with_names(&expr, sheet, self.workbook.names())?;
+        let plan = bind_with_names_and_sheets(&expr, sheet, self.workbook.names(), self.workbook)?;
         self.ops.push(PendingOp::Formula {
             sheet,
             row,

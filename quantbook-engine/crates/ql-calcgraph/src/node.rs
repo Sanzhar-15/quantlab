@@ -112,8 +112,8 @@ pub struct SpillNode {
 
 #[cfg(test)]
 mod tests {
-    use ql_formula_syntax::SheetRef;
     use super::*;
+    use ql_formula_syntax::SheetRef;
 
     #[test]
     fn node_id_index_is_u32_cast() {

@@ -379,9 +379,9 @@ impl Graph {
 
 #[cfg(test)]
 mod tests {
-    use ql_formula_syntax::SheetRef;
     use super::*;
     use ql_formula_syntax::RangeRef;
+    use ql_formula_syntax::SheetRef;
 
     #[test]
     fn empty_graph_has_zero_state() {

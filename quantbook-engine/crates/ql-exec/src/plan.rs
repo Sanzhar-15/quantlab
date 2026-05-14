@@ -27,7 +27,7 @@
 
 use std::sync::Arc;
 
-use ql_formula_syntax::{Expr, Operator};
+use ql_formula_syntax::{Expr, Operator, SheetRef};
 use ql_types::{ColId, ErrorValue, Range, RowId, SheetId};
 
 /// Bound, execution-ready expression. Sheet refs are concrete.
@@ -138,6 +138,13 @@ pub enum BindError {
          named-formula resolution is Engine Phase 4 work"
     )]
     NamedFormulaUnsupported(Arc<str>),
+
+    /// **W5-90 (Phase 4.6.B):** `SheetRef::Name(N)` from cross-sheet
+    /// syntax (`Sheet1!A1`) didn't resolve to any sheet in the
+    /// workbook at bind time. Surfaces as a clean bind-time diagnostic
+    /// before any runtime read; closes XS-4-01.
+    #[error("unknown sheet {0:?}")]
+    UnknownSheet(Arc<str>),
 }
 
 /// Phase 2B.4 (2026-05-12): bind-time context for a sub-expression. Drives
@@ -241,37 +248,48 @@ pub(crate) fn is_aggregate_function(name: &str) -> bool {
 }
 
 /// Resolve an Expr against an owning sheet, producing an ExprPlan. **No name
-/// resolution** — any `Expr::NameRef` produces `BindError::UnresolvedName`.
-/// Callers that need named-range support should use `bind_with_names` and pass
-/// a `&NameTable`.
+/// resolution + no sheet resolution** — any `Expr::NameRef` produces
+/// `BindError::UnresolvedName`; any cross-sheet ref (`SheetRef::Name`)
+/// produces `BindError::UnknownSheet`.
 ///
-/// `owning_sheet` is the sheet the formula lives on. AST `CellAddr.sheet` of `None`
-/// means "this sheet"; `Some(s)` means an explicit sheet ref (Phase 3+ shipping the
-/// parser surface; Phase 0/1 always has `None` from the lexer).
+/// `owning_sheet` is the sheet the formula lives on.
 pub fn bind(expr: &Expr, owning_sheet: SheetId) -> Result<ExprPlan, BindError> {
-    bind_with_names(expr, owning_sheet, &EmptyNameLookup)
+    bind_with_names_and_sheets(expr, owning_sheet, &EmptyNameLookup, &EmptySheetResolver)
 }
 
-/// Phase 2A.1 — bind with a name resolver. The resolver is any type implementing
-/// `NameLookup`; the production caller passes a `ql_storage::NameTable` reference
-/// (via the `NameLookup` blanket impl in `ql-exec::env`), but tests can supply
-/// a custom HashMap-backed mock.
-///
-/// Phase 2B.4 (2026-05-12): the top-level entry point binds in
-/// [`BindContext::Scalar`]. Recursion into aggregate-function arg lists
-/// switches to [`BindContext::AggregateArg`].
+/// Phase 2A.1 — bind with a name resolver. **W5-90 update**: this entry
+/// point uses an `EmptySheetResolver`, so cross-sheet refs surface as
+/// `BindError::UnknownSheet`. Callers that need cross-sheet support
+/// should use [`bind_with_names_and_sheets`] and pass a real
+/// [`SheetResolver`] (typically `&Workbook` via the blanket impl).
 pub fn bind_with_names<L: NameLookup>(
     expr: &Expr,
     owning_sheet: SheetId,
     names: &L,
 ) -> Result<ExprPlan, BindError> {
-    bind_with_context(expr, owning_sheet, names, BindContext::Scalar)
+    bind_with_names_and_sheets(expr, owning_sheet, names, &EmptySheetResolver)
+}
+
+/// **W5-90 (Phase 4.6.B):** bind with BOTH name and sheet resolvers.
+/// Production callers (`WorkbookRuntime`, `WorkbookTransaction`,
+/// `CalcgraphSession`) pass `self.workbook.names()` for `names` and
+/// `self.workbook` for `sheets` (the blanket `SheetResolver for
+/// Workbook` impl in `env.rs` does the lookup via
+/// `Workbook::sheet_id_by_name`).
+pub fn bind_with_names_and_sheets<L: NameLookup>(
+    expr: &Expr,
+    owning_sheet: SheetId,
+    names: &L,
+    sheets: &dyn SheetResolver,
+) -> Result<ExprPlan, BindError> {
+    bind_with_context(expr, owning_sheet, names, sheets, BindContext::Scalar)
 }
 
 fn bind_with_context<L: NameLookup>(
     expr: &Expr,
     owning_sheet: SheetId,
     names: &L,
+    sheets: &dyn SheetResolver,
     ctx: BindContext,
 ) -> Result<ExprPlan, BindError> {
     match expr {
@@ -279,7 +297,7 @@ fn bind_with_context<L: NameLookup>(
         Expr::Bool(b) => Ok(ExprPlan::Bool(*b)),
         Expr::String(s) => Ok(ExprPlan::String(s.clone())),
         Expr::CellRef(addr) => Ok(ExprPlan::CellRef {
-            sheet: addr.sheet.resolve_or(owning_sheet),
+            sheet: resolve_sheet_ref(&addr.sheet, owning_sheet, sheets)?,
             row: addr.row,
             col: addr.col,
             abs_col: addr.abs_col,
@@ -294,12 +312,14 @@ fn bind_with_context<L: NameLookup>(
                 lhs,
                 owning_sheet,
                 names,
+                sheets,
                 BindContext::Scalar,
             )?),
             rhs: Box::new(bind_with_context(
                 rhs,
                 owning_sheet,
                 names,
+                sheets,
                 BindContext::Scalar,
             )?),
         }),
@@ -309,6 +329,7 @@ fn bind_with_context<L: NameLookup>(
                 operand,
                 owning_sheet,
                 names,
+                sheets,
                 BindContext::Scalar,
             )?),
         }),
@@ -324,7 +345,7 @@ fn bind_with_context<L: NameLookup>(
             };
             let mut bound_args = Vec::with_capacity(args.len());
             for a in args {
-                bound_args.push(bind_with_context(a, owning_sheet, names, arg_ctx)?);
+                bound_args.push(bind_with_context(a, owning_sheet, names, sheets, arg_ctx)?);
             }
             Ok(ExprPlan::Function {
                 name: name.clone(),
@@ -427,6 +448,46 @@ struct EmptyNameLookup;
 impl NameLookup for EmptyNameLookup {
     fn lookup_named_target(&self, _name: &str) -> Option<ResolvedName> {
         None
+    }
+}
+
+/// **W5-90 (Phase 4.6.B):** sheet-name resolution interface. Mirrors
+/// `NameLookup`: `ql-exec` stays decoupled from `ql-storage`; the
+/// production caller wires a `Workbook` through this trait. Used by
+/// the binder to resolve `SheetRef::Name(N)` → `SheetRef::Id(id)`.
+///
+/// Lookup contract: case-insensitive (per `Workbook::canonical_sheet_name`).
+pub trait SheetResolver {
+    fn resolve_sheet(&self, name: &str) -> Option<SheetId>;
+}
+
+/// Default empty-resolver. Used by the legacy `bind()` / `bind_with_names()`
+/// entry points: any cross-sheet ref surfaces as `BindError::UnknownSheet`.
+pub(crate) struct EmptySheetResolver;
+
+impl SheetResolver for EmptySheetResolver {
+    fn resolve_sheet(&self, _name: &str) -> Option<SheetId> {
+        None
+    }
+}
+
+/// **W5-90 (Phase 4.6.B):** resolve a `SheetRef` for the binder.
+///
+/// - `Current` → `owning_sheet` (the formula's own sheet).
+/// - `Id(s)` → `s` (already resolved; produced post-bind or by tests).
+/// - `Name(n)` → lookup via `sheets.resolve_sheet(n)`; `None` →
+///   `BindError::UnknownSheet`.
+fn resolve_sheet_ref(
+    sheet: &SheetRef,
+    owning_sheet: SheetId,
+    sheets: &dyn SheetResolver,
+) -> Result<SheetId, BindError> {
+    match sheet {
+        SheetRef::Current => Ok(owning_sheet),
+        SheetRef::Id(s) => Ok(*s),
+        SheetRef::Name(n) => sheets
+            .resolve_sheet(n)
+            .ok_or_else(|| BindError::UnknownSheet(n.clone())),
     }
 }
 
@@ -606,6 +667,137 @@ mod tests {
                 ));
             }
             _ => panic!(),
+        }
+    }
+
+    // ===== W5-90 / Phase 4.6.B — cross-sheet binding via SheetResolver =====
+
+    /// Test-only `SheetResolver`: a fixed `name → id` map.
+    struct MockSheetResolver {
+        map: std::collections::HashMap<String, SheetId>,
+    }
+    impl MockSheetResolver {
+        fn new(pairs: &[(&str, SheetId)]) -> Self {
+            Self {
+                map: pairs
+                    .iter()
+                    .map(|(n, s)| (n.to_ascii_uppercase(), *s))
+                    .collect(),
+            }
+        }
+    }
+    impl SheetResolver for MockSheetResolver {
+        fn resolve_sheet(&self, name: &str) -> Option<SheetId> {
+            self.map.get(&name.to_ascii_uppercase()).copied()
+        }
+    }
+
+    #[test]
+    fn bind_resolves_sheet_ref_name_via_resolver() {
+        let expr = Expr::CellRef(CellAddr {
+            sheet: SheetRef::Name(Arc::from("Sheet2")),
+            col: 0,
+            row: 0,
+            abs_col: false,
+            abs_row: false,
+        });
+        let sheets = MockSheetResolver::new(&[("Sheet2", 1)]);
+        let p = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets).expect("bind");
+        match p {
+            ExprPlan::CellRef { sheet, .. } => assert_eq!(sheet, 1),
+            other => panic!("expected CellRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_resolves_sheet_ref_name_case_insensitively() {
+        let expr = Expr::CellRef(CellAddr {
+            sheet: SheetRef::Name(Arc::from("sheet1")),
+            col: 0,
+            row: 0,
+            abs_col: false,
+            abs_row: false,
+        });
+        let sheets = MockSheetResolver::new(&[("Sheet1", 5)]);
+        let p = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets).expect("bind");
+        match p {
+            ExprPlan::CellRef { sheet, .. } => assert_eq!(sheet, 5),
+            other => panic!("expected CellRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_unknown_sheet_name_surfaces_as_error() {
+        let expr = Expr::CellRef(CellAddr {
+            sheet: SheetRef::Name(Arc::from("Nonexistent")),
+            col: 0,
+            row: 0,
+            abs_col: false,
+            abs_row: false,
+        });
+        let sheets = MockSheetResolver::new(&[("Sheet1", 0)]);
+        let err = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets).unwrap_err();
+        match err {
+            BindError::UnknownSheet(name) => assert_eq!(name.as_ref(), "Nonexistent"),
+            other => panic!("expected UnknownSheet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_empty_sheet_resolver_rejects_all_sheet_names() {
+        // The legacy `bind()` / `bind_with_names()` entry points use an
+        // empty resolver, so any cross-sheet ref errors cleanly.
+        let expr = Expr::CellRef(CellAddr {
+            sheet: SheetRef::Name(Arc::from("AnySheet")),
+            col: 0,
+            row: 0,
+            abs_col: false,
+            abs_row: false,
+        });
+        let err = bind(&expr, 0).unwrap_err();
+        assert!(matches!(err, BindError::UnknownSheet(_)));
+    }
+
+    #[test]
+    fn bind_current_sheet_resolves_to_owning_sheet() {
+        let expr = Expr::CellRef(CellAddr {
+            sheet: SheetRef::Current,
+            col: 3,
+            row: 4,
+            abs_col: false,
+            abs_row: false,
+        });
+        let sheets = MockSheetResolver::new(&[]);
+        let p = bind_with_names_and_sheets(&expr, 9, &EmptyNameLookup, &sheets).expect("bind");
+        match p {
+            ExprPlan::CellRef { sheet, .. } => assert_eq!(sheet, 9),
+            other => panic!("expected CellRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_sheet_resolution_propagates_through_binary_op() {
+        // `Sheet2!A1 + 1` — the inner CellRef resolves through the resolver;
+        // the binary wraps both bound sides.
+        let expr = Expr::Binary {
+            op: Operator::Plus,
+            lhs: Box::new(Expr::CellRef(CellAddr {
+                sheet: SheetRef::Name(Arc::from("Sheet2")),
+                col: 0,
+                row: 0,
+                abs_col: false,
+                abs_row: false,
+            })),
+            rhs: Box::new(Expr::Number(1.0)),
+        };
+        let sheets = MockSheetResolver::new(&[("Sheet2", 7)]);
+        let p = bind_with_names_and_sheets(&expr, 0, &EmptyNameLookup, &sheets).expect("bind");
+        match p {
+            ExprPlan::Binary { lhs, .. } => match lhs.as_ref() {
+                ExprPlan::CellRef { sheet, .. } => assert_eq!(*sheet, 7),
+                other => panic!("expected nested CellRef, got {other:?}"),
+            },
+            other => panic!("expected Binary, got {other:?}"),
         }
     }
 }

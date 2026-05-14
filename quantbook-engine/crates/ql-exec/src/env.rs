@@ -260,6 +260,18 @@ impl NameLookup for NameTable {
     }
 }
 
+/// **W5-90 (Phase 4.6.B):** the production `SheetResolver` impl —
+/// `&Workbook` resolves sheet names via `Workbook::sheet_id_by_name`
+/// (the canonicalizing case-insensitive lookup added in W5-86).
+/// Production callers (`WorkbookRuntime`, `WorkbookTransaction`,
+/// `CalcgraphSession`) pass `&self.workbook` as the `&dyn SheetResolver`
+/// argument to `bind_with_names_and_sheets`.
+impl crate::plan::SheetResolver for ql_storage::Workbook {
+    fn resolve_sheet(&self, name: &str) -> Option<ql_types::SheetId> {
+        self.sheet_id_by_name(name)
+    }
+}
+
 /// Project a `NamedTarget` into the binder-side `ResolvedName` vocabulary. Phase
 /// 2A.6 audit M2/M3: `Constant(Blank)` and `Constant(Error)` now map to distinct
 /// `ResolvedName` variants (the binder converts them to specific `BindError`
