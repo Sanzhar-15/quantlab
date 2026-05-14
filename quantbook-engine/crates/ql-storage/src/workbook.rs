@@ -264,6 +264,14 @@ pub struct Workbook {
     /// `docs/architecture/2026-05-13-format-string-grammar.md` § 10
     /// (parser-relevant subset).
     formats: crate::FormatTable,
+    /// **W5-101 (Phase 4.7.H):** spill-anchor table. Workbook-level
+    /// because spills can theoretically span sheets (rare in Excel; v1
+    /// keeps single-sheet but the table doesn't assume). Map-only by
+    /// design; mutation goes through `register_spill` / `clear_spill_at`
+    /// — the latter is the workbook-layer convenience that also clears
+    /// computed overlays at every target cell. See
+    /// `crates/ql-storage/src/spill.rs` module docs.
+    spill_anchors: crate::SpillAnchorTable,
 }
 
 impl Workbook {
@@ -530,6 +538,82 @@ impl Workbook {
 
     pub fn sheet_mut(&mut self, id: SheetId) -> Option<&mut Sheet> {
         self.sheets.get_mut(id as usize)
+    }
+
+    // ===== W5-101 (Phase 4.7.H) spill-anchor API =====
+
+    /// **W5-101 (Phase 4.7.H):** read access to the spill-anchor table.
+    /// Production callers (runtime, calcgraph dep extraction in 4.7.I,
+    /// persistence save-skip in 4.7.L) use this for lookups.
+    pub fn spill_anchors(&self) -> &crate::SpillAnchorTable {
+        &self.spill_anchors
+    }
+
+    /// **W5-101 (Phase 4.7.H):** convenience: is `(sheet, row, col)` an
+    /// active spill anchor? Returns `Some(&shape)` iff yes. Delegates to
+    /// `SpillAnchorTable::anchor_at`.
+    pub fn spill_anchor_at(
+        &self,
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+    ) -> Option<&crate::SpillShape> {
+        self.spill_anchors.anchor_at(sheet, row, col)
+    }
+
+    /// **W5-101 (Phase 4.7.H):** reverse lookup — if `(sheet, row, col)`
+    /// is a spill target (anchor or any non-anchor target cell), return
+    /// the anchor. `O(1)`. Used by the runtime spill-invalidation path
+    /// (4.7.K) on `set_value` to detect user writes into spill ranges.
+    pub fn spill_target_anchor(
+        &self,
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+    ) -> Option<(SheetId, RowId, ColId)> {
+        self.spill_anchors.target_anchor(sheet, row, col)
+    }
+
+    /// **W5-101 (Phase 4.7.H):** register a new spill. Map-only — does
+    /// NOT touch computed overlays. The runtime spill-writeback path
+    /// (4.7.J) couples this with `put_computed_at` calls for each
+    /// target cell value AFTER `register_spill` succeeds.
+    pub fn register_spill(
+        &mut self,
+        anchor: (SheetId, RowId, ColId),
+        shape: crate::SpillShape,
+    ) -> Result<(), crate::SpillBlockError> {
+        self.spill_anchors.register(anchor, shape)
+    }
+
+    /// **W5-101 (Phase 4.7.H):** workbook-layer convenience: unregister
+    /// the anchor + clear the computed overlay at every target cell.
+    /// This is the function the runtime calls during the "clear old
+    /// spill before re-eval" step (design § 8.3) and when clearing a
+    /// formula at an anchor cell (design § 10.3).
+    ///
+    /// Errors:
+    /// - `SpillNotFoundError` — the cell isn't an anchor. Callers that
+    ///   want a no-op-on-miss behavior should pre-check
+    ///   `spill_anchor_at(...).is_some()`.
+    pub fn clear_spill_at(
+        &mut self,
+        anchor: (SheetId, RowId, ColId),
+    ) -> Result<(), crate::SpillNotFoundError> {
+        let shape = self.spill_anchors.unregister(anchor)?;
+        // Iterate the cleared rectangle and clear computed overlays.
+        // This is the coupling reason `clear_spill_at` lives on
+        // `Workbook` (which owns sheet access) rather than on the
+        // map-only `SpillAnchorTable`.
+        let (asheet, arow, acol) = anchor;
+        if let Some(sheet) = self.sheets.get_mut(asheet as usize) {
+            for dr in 0..shape.rows {
+                for dc in 0..shape.cols {
+                    sheet.clear_computed(arow + dr, acol + dc);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Read by `Address`.
@@ -1233,4 +1317,113 @@ mod tests {
         wb.add_sheet("Sheet1");
         wb.add_sheet("Sheet1"); // panics here
     }
-}
+
+    // ===== W5-101 (Phase 4.7.H) Workbook spill-anchor integration =====
+
+    #[test]
+    fn workbook_register_spill_round_trip() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        // Register a 2x3 spill at (0, 1, 1) — covers B2:D3.
+        wb.register_spill((0, 1, 1), crate::SpillShape::new(2, 3))
+            .unwrap();
+        assert_eq!(
+            wb.spill_anchor_at(0, 1, 1),
+            Some(&crate::SpillShape::new(2, 3))
+        );
+        // Reverse lookup at every target cell.
+        for dr in 0..2 {
+            for dc in 0..3 {
+                assert_eq!(
+                    wb.spill_target_anchor(0, 1 + dr, 1 + dc),
+                    Some((0, 1, 1)),
+                    "cell ({},{}) → anchor (0,1,1)",
+                    1 + dr,
+                    1 + dc
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn workbook_clear_spill_at_clears_computed_overlays() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        // Register a 1x3 spill at (0, 0, 0) covering A1:C1.
+        wb.register_spill((0, 0, 0), crate::SpillShape::new(1, 3))
+            .unwrap();
+        // Simulate the runtime writing computed values at each target.
+        wb.put_computed_at(0, 0, 0, Value::Number(10.0));
+        wb.put_computed_at(0, 0, 1, Value::Number(20.0));
+        wb.put_computed_at(0, 0, 2, Value::Number(30.0));
+        // Sanity: reads return the computed values.
+        assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(10.0));
+        assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(20.0));
+        assert_eq!(wb.read(Address::new(0, 0, 2)), Value::Number(30.0));
+        // clear_spill_at: unregisters AND clears overlays at every target.
+        wb.clear_spill_at((0, 0, 0)).unwrap();
+        // Anchor + targets gone from the table.
+        assert!(wb.spill_anchor_at(0, 0, 0).is_none());
+        assert!(wb.spill_target_anchor(0, 0, 1).is_none());
+        // Reads now fall through to Blank (computed overlay cleared).
+        assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Blank);
+        assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Blank);
+        assert_eq!(wb.read(Address::new(0, 0, 2)), Value::Blank);
+    }
+
+    #[test]
+    fn workbook_register_spill_rejects_collision_with_existing() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        wb.register_spill((0, 0, 0), crate::SpillShape::new(3, 1))
+            .unwrap();
+        // Second spill at (0, 1, 0) would overlap A2/A3 of the first.
+        let err = wb
+            .register_spill((0, 1, 0), crate::SpillShape::new(3, 1))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::SpillBlockError::TargetCellOccupied { .. }
+        ));
+    }
+
+    #[test]
+    fn workbook_clear_spill_at_unknown_anchor_errors() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        let err = wb.clear_spill_at((0, 5, 5)).unwrap_err();
+        assert_eq!(err.row, 5);
+        assert_eq!(err.col, 5);
+    }
+
+    #[test]
+    fn workbook_clear_spill_at_preserves_user_overlays_outside_rectangle() {
+        // A user-typed value outside the spill rectangle must survive
+        // clear_spill_at. Verifies the clear loop is bounded to the
+        // shape rectangle.
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        wb.register_spill((0, 0, 0), crate::SpillShape::new(1, 3))
+            .unwrap();
+        wb.put_computed_at(0, 0, 0, Value::Number(1.0));
+        wb.put_computed_at(0, 0, 1, Value::Number(2.0));
+        wb.put_computed_at(0, 0, 2, Value::Number(3.0));
+        // User value at A2 (row 1, col 0) — OUTSIDE the 1x3 spill.
+        wb.put_at(0, 1, 0, Value::Number(99.0));
+        wb.clear_spill_at((0, 0, 0)).unwrap();
+        // Spill range cleared.
+        assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Blank);
+        // User value at A2 untouched.
+        assert_eq!(wb.read(Address::new(0, 1, 0)), Value::Number(99.0));
+    }
+
+    #[test]
+    fn workbook_spill_anchors_accessor_returns_table() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        assert_eq!(wb.spill_anchors().len(), 0);
+        wb.register_spill((0, 0, 0), crate::SpillShape::new(2, 2))
+            .unwrap();
+        wb.register_spill((0, 5, 5), crate::SpillShape::new(1, 1))
+            .unwrap();
+        assert_eq!(wb.s
