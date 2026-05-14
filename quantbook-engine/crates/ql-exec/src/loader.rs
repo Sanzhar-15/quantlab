@@ -280,4 +280,50 @@ mod tests {
         assert_eq!(failure.col, 0);
         assert_eq!(failure.formula_text.as_ref(), "(((");
     }
+
+    /// **W5-105 (Phase 4.7.L)** — full save → load → recompute_all
+    /// round-trip for a spilled formula. Acceptance: design § 12.3.
+    #[test]
+    fn spill_formula_save_load_recompute_round_trip() {
+        let (_dir, path) = temp_path("spill-roundtrip.qbook");
+
+        // Build a workbook with A1 = {1, 2, 3} spilling.
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.set_formula(s, 0, 0, "{1, 2, 3}").unwrap();
+        }
+        // Pre-save: spill should be registered and targets materialized.
+        assert_eq!(
+            wb.spill_anchor_at(s, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(1, 3))
+        );
+        assert_eq!(wb.read(Address::new(s, 0, 1)), Value::Number(2.0));
+        assert_eq!(wb.read(Address::new(s, 0, 2)), Value::Number(3.0));
+
+        save_workbook(&wb, "spill-roundtrip", &path).unwrap();
+
+        // Load + recompute_all. 4.7.J #128 made recompute_all dispatch
+        // top-level arrays through write_spill, so this should re-derive
+        // the spill state.
+        let (loaded, result) = load_workbook_and_recompute(&path, &reg).unwrap();
+        assert!(result.is_complete(), "recompute failures: {result:?}");
+        assert_eq!(result.succeeded, 1, "only A1 has a formula");
+
+        // Post-recompute: spill anchor and targets restored identically.
+        assert_eq!(
+            loaded.spill_anchor_at(s, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(1, 3)),
+            "spill anchor must be re-registered by recompute_all"
+        );
+        assert_eq!(loaded.read(Address::new(s, 0, 0)), Value::Number(1.0));
+        assert_eq!(loaded.read(Address::new(s, 0, 1)), Value::Number(2.0));
+        assert_eq!(loaded.read(Address::new(s, 0, 2)), Value::Number(3.0));
+        assert_eq!(
+            loaded.formula_at(s, 0, 0).map(|s| s.as_ref()),
+            Some("{1, 2, 3}")
+        );
+    }
 }

@@ -1117,6 +1117,25 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
         // are skipped. Phase 2 may optimize via direct chunk-walking; not on hot path.
         for row in 0..bounds.row_extent {
             for col in 0..bounds.col_extent {
+                // **W5-105 (Phase 4.7.L) — design § 12.2 closure**: skip
+                // non-anchor spill TARGET cells. Their computed values are
+                // runtime-derived from the anchor's formula via the
+                // load → recompute_all pipeline (Phase 4.7.J #128 made
+                // recompute_all dispatch top-level arrays through
+                // `write_spill`). Saving target cells would emit
+                // `CellRecord { value: <spilled>, formula: None }` records
+                // that on reload look like user-typed values BLOCKING the
+                // re-spill — the very issue Codex W5-94 design HIGH-5
+                // identified as motivating the schema-skip approach.
+                //
+                // The anchor cell itself still saves (its formula text is
+                // what replay + recompute_all needs).
+                if let Some(anchor) = wb.spill_target_anchor(sheet_id, row, col) {
+                    if anchor != (sheet_id, row, col) {
+                        continue;
+                    }
+                }
+
                 let v = sheet.read(row, col);
                 // Audit M6 fix (2026-05-12): reject NaN/Inf at the save boundary.
                 if let Value::Number(n) = v {
@@ -2789,6 +2808,102 @@ id = 999
         );
         // Pending decodes to Blank — recompute would resolve to 2.0.
         assert_eq!(loaded.read(Address::new(s, 5, 3)), Value::Blank);
+    }
+
+    /// **W5-105 (Phase 4.7.L)**: spill TARGET cells must NOT be saved
+    /// — only the anchor cell (with its formula text) round-trips.
+    /// Verified by reading the saved sheet JSONL directly: target rows
+    /// for B1/C1 are absent; A1's record has the formula text and a
+    /// Pending value placeholder.
+    #[test]
+    fn spill_target_cells_skipped_on_save() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("spill-skip.qbook");
+
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        // Simulate the post-set_formula state for `A1 = {1, 2, 3}`:
+        //   - Formula text at A1.
+        //   - Computed values at A1=1, B1=2, C1=3.
+        //   - Spill anchor registered with shape (1, 3).
+        wb.put_formula(s, 0, 0, "{1, 2, 3}");
+        wb.put_computed_at(s, 0, 0, Value::Number(1.0));
+        wb.put_computed_at(s, 0, 1, Value::Number(2.0));
+        wb.put_computed_at(s, 0, 2, Value::Number(3.0));
+        wb.register_spill((s, 0, 0), ql_storage::SpillShape::new(1, 3))
+            .unwrap();
+
+        save_workbook(&wb, "spill-skip", &path).unwrap();
+
+        // Read the saved sheet JSONL directly to confirm B1/C1 are NOT
+        // recorded.
+        let sheet_path = path.join("sheets").join(format!("{s}.jsonl"));
+        let content = fs::read_to_string(&sheet_path).unwrap();
+        // Anchor A1 record must be present.
+        assert!(
+            content.lines().any(|l| {
+                let r: CellRecord = serde_json::from_str(l).unwrap();
+                r.row == 0 && r.col == 0 && r.formula.is_some()
+            }),
+            "anchor A1 record must be present with formula text. got:\n{content}"
+        );
+        // B1 and C1 records must be ABSENT.
+        for (row, col, name) in [(0, 1, "B1"), (0, 2, "C1")] {
+            assert!(
+                content.lines().all(|l| {
+                    let r: CellRecord = serde_json::from_str(l).unwrap();
+                    !(r.row == row && r.col == col)
+                }),
+                "{name} record must NOT appear in saved JSONL (spill target). got:\n{content}"
+            );
+        }
+    }
+
+    /// **W5-105 (Phase 4.7.L)** load round-trip: save a workbook with a
+    /// spill, load it back, verify:
+    ///   - the anchor's formula text survives.
+    ///   - the anchor's computed value survives (lands in user lane —
+    ///     CellWireValue doesn't differentiate user vs computed; this
+    ///     is fine, the caller's `recompute_all` will write_spill →
+    ///     clear_user_at(anchor) → put_computed_at(anchor) to restore
+    ///     the correct lane).
+    ///   - the SpillAnchorTable + target cells (B1, C1) are EMPTY.
+    ///     `recompute_all` re-derives them per design § 12.3.
+    #[test]
+    fn spill_targets_load_as_blank_pending_recompute() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("spill-load.qbook");
+
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        wb.put_formula(s, 0, 0, "{1, 2, 3}");
+        wb.put_computed_at(s, 0, 0, Value::Number(1.0));
+        wb.put_computed_at(s, 0, 1, Value::Number(2.0));
+        wb.put_computed_at(s, 0, 2, Value::Number(3.0));
+        wb.register_spill((s, 0, 0), ql_storage::SpillShape::new(1, 3))
+            .unwrap();
+
+        save_workbook(&wb, "spill-load", &path).unwrap();
+        let loaded = load_workbook(&path).unwrap();
+
+        // Anchor formula text survives.
+        assert_eq!(
+            loaded.formula_at(s, 0, 0).map(|s| s.as_ref()),
+            Some("{1, 2, 3}")
+        );
+        // Anchor's value at load: Number(1.0) in user lane. (Per design
+        // § 12.2: anchors save normally — formula + value. The
+        // pre-recompute state has the value in user lane; recompute_all
+        // then routes through write_spill → clear_user_at → put_computed_at
+        // to correct the lane.)
+        assert_eq!(loaded.read(Address::new(s, 0, 0)), Value::Number(1.0));
+        // B1 and C1 are Blank — they weren't saved.
+        assert_eq!(loaded.read(Address::new(s, 0, 1)), Value::Blank);
+        assert_eq!(loaded.read(Address::new(s, 0, 2)), Value::Blank);
+        // SpillAnchorTable does NOT round-trip — it's runtime-derived
+        // by recompute_all from the formula text. Loaded workbook has
+        // no spill state until recompute fires.
+        assert_eq!(loaded.spill_anchor_at(s, 0, 0), None);
     }
 
     /// Phase 2A.8 backward-compat test: a hand-crafted v1 envelope (no `names`
