@@ -142,4 +142,33 @@ pub enum Op {
     /// Nested BatchCommits are permitted by the schema but produced
     /// nowhere in production; replay handles them via recursion.
     BatchCommit { ops: Vec<Op> },
+
+    /// **W5-118 (Phase 4.8.H):** create a workbook-scoped table.
+    /// Mirrors `WorkbookRuntime::create_table`. Replay inserts the
+    /// table into `Workbook::tables_mut()` after validating the same
+    /// invariants as the producer-side (non-overlapping footprint,
+    /// non-empty unique column names, table-name uniqueness against
+    /// both `TableTable` and `NameTable`).
+    ///
+    /// Column ids are NOT serialized — replay allocates fresh ids from
+    /// the workbook's `next_column_id` counter, matching producer-side
+    /// allocation order (deterministic if the op log is replayed in
+    /// order).
+    CreateTable {
+        name: String,
+        sheet: SheetId,
+        top_row: RowId,
+        top_col: ColId,
+        rows: u32,
+        cols: u32,
+        has_header: bool,
+        has_totals: bool,
+        column_names: Vec<String>,
+    },
+
+    /// **W5-118 (Phase 4.8.H):** drop a table's metadata. Cells inside
+    /// the table footprint are untouched. Formulas referencing the
+    /// dropped table re-bind to `BindError::UnknownTable` on next
+    /// recompute. Mirrors `WorkbookRuntime::drop_table`.
+    DropTable { name: String },
 }

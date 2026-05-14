@@ -214,6 +214,15 @@ fn apply_producer_side(ops: &[Op], wb: &mut Workbook) {
             Op::BatchCommit { ops } => {
                 apply_producer_side(ops, wb);
             }
+            // **W5-118 (Phase 4.8.H):** producer-side equivalence for
+            // table ops would require mirroring the WorkbookRuntime
+            // validation here. Not exercised by `realistic_op_sequence`
+            // today; assert unreachable so a future addition forces a
+            // test author to mirror the producer logic.
+            Op::CreateTable { .. } | Op::DropTable { .. } => unreachable!(
+                "realistic_op_sequence doesn't emit table ops yet; \
+                 update apply_producer_side when adding table coverage"
+            ),
         }
     }
 }

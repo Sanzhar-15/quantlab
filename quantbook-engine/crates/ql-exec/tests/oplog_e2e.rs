@@ -568,3 +568,77 @@ fn oplog_replay_then_recompute_reconstructs_spill_for_literal_array() {
     assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(20.0));
     assert_eq!(wb.read(Address::new(0, 0, 2)), Value::Number(30.0));
 }
+
+/// **W5-118 (Phase 4.8.H) e2e:** create_table emits Op::CreateTable;
+/// replay against a fresh workbook reconstructs the table; subsequent
+/// formula referencing the table binds + evaluates correctly.
+#[test]
+fn create_table_op_log_replay_reconstructs_table() {
+    let mut producer_wb = fresh_wb();
+    let reg = default_registry();
+    let mut producer_oplog = OpLog::new();
+    {
+        let mut rt = WorkbookRuntime::with_oplog(&mut producer_wb, &reg, &mut producer_oplog);
+        rt.create_table(
+            "Sales",
+            0,
+            0,
+            0,
+            3,
+            1,
+            true,
+            false,
+            vec!["Qty".into()],
+        )
+        .unwrap();
+    }
+    // Producer-side seed values; replay won't re-create cell values
+    // unless they were emitted as Op::PutValue (which we DO here).
+    {
+        let mut rt = WorkbookRuntime::with_oplog(&mut producer_wb, &reg, &mut producer_oplog);
+        rt.set_value(0, 1, 0, Value::Number(50.0)).unwrap();
+        rt.set_value(0, 2, 0, Value::Number(75.0)).unwrap();
+        let _ = rt.set_formula(0, 10, 0, "SUM(Sales[Qty])").unwrap();
+    }
+    assert_eq!(
+        producer_wb.read(Address::new(0, 10, 0)),
+        Value::Number(125.0)
+    );
+
+    // ===== Replay against fresh workbook + recompute. =====
+    let mut replay_wb = fresh_wb();
+    replay_into(&producer_oplog, &mut replay_wb, &reg).unwrap();
+    // After replay, the table exists and cells are set, but the formula
+    // value isn't computed (replay doesn't evaluate).
+    assert!(replay_wb.lookup_table("Sales").is_some(), "table re-registered");
+    {
+        let mut rt = WorkbookRuntime::new(&mut replay_wb, &reg);
+        assert!(rt.recompute_all().is_complete(), "recompute failures");
+    }
+    assert_eq!(
+        replay_wb.read(Address::new(0, 10, 0)),
+        Value::Number(125.0),
+        "post-replay SUM(Sales[Qty]) matches producer"
+    );
+}
+
+/// **W5-118 (Phase 4.8.H) e2e:** drop_table emits Op::DropTable; replay
+/// removes the table; a formula that referenced it would re-bind as
+/// UnknownTable (we verify by checking the table is absent).
+#[test]
+fn drop_table_op_log_replay_removes_table() {
+    let mut producer_wb = fresh_wb();
+    let reg = default_registry();
+    let mut producer_oplog = OpLog::new();
+    {
+        let mut rt = WorkbookRuntime::with_oplog(&mut producer_wb, &reg, &mut producer_oplog);
+        rt.create_table("Sales", 0, 0, 0, 2, 1, true, false, vec!["Qty".into()])
+            .unwrap();
+        rt.drop_table("Sales").unwrap();
+    }
+    assert!(producer_wb.lookup_table("Sales").is_none());
+
+    let mut replay_wb = fresh_wb();
+    replay_into(&producer_oplog, &mut replay_wb, &reg).unwrap();
+    assert!(replay_wb.lookup_table("Sales").is_none(), "table dropped on replay");
+}

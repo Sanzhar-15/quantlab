@@ -160,6 +160,23 @@ pub enum ReplayError {
         #[source]
         source: ql_storage::SheetNameError,
     },
+
+    /// **W5-118 (Phase 4.8.H):** `CreateTable` op references invariants
+    /// the producer should have validated. Catches snapshot-vs-replay
+    /// divergence (e.g. snapshot already has the table; another producer
+    /// raced).
+    #[error("replay create-table rejected at op index {index}: {reason}")]
+    TableCreateRejected {
+        index: usize,
+        name: String,
+        reason: &'static str,
+    },
+
+    /// **W5-118 (Phase 4.8.H):** `DropTable` op references a missing
+    /// table. Surfaces snapshot-vs-replay divergence loudly per
+    /// no-fallbacks doctrine.
+    #[error("replay drop-table at op index {index}: table {name:?} not found")]
+    TableNotFound { index: usize, name: String },
 }
 
 /// Wrapper around `ql_storage::FormatTableError` that owns its strings,
@@ -426,7 +443,158 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             }
             Ok(())
         }
+        Op::CreateTable {
+            name,
+            sheet,
+            top_row,
+            top_col,
+            rows,
+            cols,
+            has_header,
+            has_totals,
+            column_names,
+        } => apply_create_table(
+            workbook,
+            index,
+            name,
+            *sheet,
+            *top_row,
+            *top_col,
+            *rows,
+            *cols,
+            *has_header,
+            *has_totals,
+            column_names,
+        ),
+        Op::DropTable { name } => {
+            let canonical = name.to_ascii_uppercase();
+            if workbook
+                .tables_mut()
+                .remove(canonical.as_str())
+                .is_none()
+            {
+                return Err(ReplayError::TableNotFound {
+                    index,
+                    name: name.clone(),
+                });
+            }
+            Ok(())
+        }
     }
+}
+
+/// **W5-118 (Phase 4.8.H):** apply a `CreateTable` op against the
+/// workbook. Validates the same invariants the producer side checks
+/// (mirror via `WorkbookRuntime::create_table`).
+#[allow(clippy::too_many_arguments)]
+fn apply_create_table(
+    workbook: &mut Workbook,
+    index: usize,
+    name: &str,
+    sheet: SheetId,
+    top_row: RowId,
+    top_col: ColId,
+    rows: u32,
+    cols: u32,
+    has_header: bool,
+    has_totals: bool,
+    column_names: &[String],
+) -> Result<(), ReplayError> {
+    use ql_storage::{TableColumn, TableMetadata};
+    let canonical: std::sync::Arc<str> =
+        std::sync::Arc::from(name.to_ascii_uppercase().as_str());
+    if workbook.tables().lookup(&canonical).is_some() {
+        return Err(ReplayError::TableCreateRejected {
+            index,
+            name: name.to_owned(),
+            reason: "table with this canonical name already exists",
+        });
+    }
+    if workbook.names().lookup_ci(&canonical).is_some() {
+        return Err(ReplayError::TableCreateRejected {
+            index,
+            name: name.to_owned(),
+            reason: "defined-name with this canonical name already exists (shared namespace)",
+        });
+    }
+    if column_names.len() != cols as usize {
+        return Err(ReplayError::TableCreateRejected {
+            index,
+            name: name.to_owned(),
+            reason: "column_names length does not match cols",
+        });
+    }
+    if column_names.iter().any(|s| s.is_empty()) {
+        return Err(ReplayError::TableCreateRejected {
+            index,
+            name: name.to_owned(),
+            reason: "table column names cannot be empty",
+        });
+    }
+    // Column-name uniqueness (case-insensitive).
+    {
+        use std::collections::HashSet;
+        let mut seen: HashSet<String> = HashSet::new();
+        for cn in column_names {
+            if !seen.insert(cn.to_ascii_lowercase()) {
+                return Err(ReplayError::TableCreateRejected {
+                    index,
+                    name: name.to_owned(),
+                    reason: "table column names must be unique (case-insensitive)",
+                });
+            }
+        }
+    }
+    if workbook.sheet(sheet).is_none() {
+        return Err(ReplayError::TableCreateRejected {
+            index,
+            name: name.to_owned(),
+            reason: "table references unknown sheet",
+        });
+    }
+    if rows == 0 || cols == 0 {
+        return Err(ReplayError::TableCreateRejected {
+            index,
+            name: name.to_owned(),
+            reason: "table rows and cols must both be > 0",
+        });
+    }
+    // Non-overlap: check every cell in the footprint.
+    for r in top_row..top_row + rows {
+        for c in top_col..top_col + cols {
+            if workbook.table_at(sheet, r, c).is_some() {
+                return Err(ReplayError::TableCreateRejected {
+                    index,
+                    name: name.to_owned(),
+                    reason: "table footprint overlaps an existing table",
+                });
+            }
+        }
+    }
+    // Build columns with freshly-allocated ids.
+    let columns: Vec<TableColumn> = column_names
+        .iter()
+        .map(|cn| TableColumn {
+            id: workbook.tables_mut().allocate_column_id(),
+            name: std::sync::Arc::from(cn.to_ascii_lowercase().as_str()),
+            display: std::sync::Arc::from(cn.as_str()),
+            totals_function: None,
+        })
+        .collect();
+    let meta = TableMetadata {
+        name: canonical.clone(),
+        display_name: std::sync::Arc::from(name),
+        sheet,
+        top_row,
+        top_col,
+        rows,
+        cols,
+        has_header,
+        has_totals,
+        columns,
+    };
+    workbook.tables_mut().insert(canonical, meta);
+    Ok(())
 }
 
 fn validate_cell(

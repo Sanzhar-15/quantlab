@@ -233,6 +233,17 @@ pub enum RuntimeError {
     /// misconfiguration; the recompute result is partial.
     #[error("recompute_dirty hit iteration cap with cells still dirty")]
     RecomputeIterationCap,
+
+    /// **W5-118 (Phase 4.8.H):** `create_table` was rejected by a
+    /// validation rule. `reason` is a static string describing which
+    /// invariant fired (uniqueness, overlap, empty column name, ...).
+    #[error("table {name:?} create rejected: {reason}")]
+    TableCreateRejected { name: String, reason: &'static str },
+
+    /// **W5-118 (Phase 4.8.H):** `drop_table` was called on a name
+    /// that doesn't exist.
+    #[error("table {0:?} not found")]
+    TableNotFound(String),
 }
 
 impl From<LexError> for RuntimeError {
@@ -1440,7 +1451,165 @@ impl<'a> WorkbookRuntime<'a> {
         Ok(())
     }
 
-    /// Phase 2B.5 (2026-05-12): append a new sheet through the runtime,
+    // ===== W5-118 (Phase 4.8.H) — table mutation API =====
+
+    /// **W5-118 (Phase 4.8.H):** register a new workbook-scoped table,
+    /// emitting `Op::CreateTable` into the attached op log (if any).
+    ///
+    /// Validation (op log append is BEFORE storage mutation per the
+    /// W5-103 atomicity pattern):
+    /// - Sheet exists.
+    /// - Footprint fits in the sheet (rows + cols > 0).
+    /// - No overlap with any existing table footprint.
+    /// - Name is unique against both `TableTable` AND `NameTable`
+    ///   (shared namespace per design § 4.3 / § 13 decision #3).
+    /// - Column count matches `column_names.len()`.
+    /// - Column names are non-empty and unique case-insensitively.
+    ///
+    /// Each column is assigned a stable id from
+    /// `TableTable::allocate_column_id`. Header / totals rows are
+    /// metadata-only — this method does NOT write into the header row;
+    /// callers can pre-populate cells via `set_value`.
+    ///
+    /// Direct callers of `Workbook::tables_mut().insert` bypass the op
+    /// log silently — that path is documented as low-level (qbook
+    /// loader + tests).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_table(
+        &mut self,
+        name: &str,
+        sheet: SheetId,
+        top_row: RowId,
+        top_col: ColId,
+        rows: u32,
+        cols: u32,
+        has_header: bool,
+        has_totals: bool,
+        column_names: Vec<String>,
+    ) -> Result<(), RuntimeError> {
+        let canonical = name.to_ascii_uppercase();
+        // ----- Validation (all checks BEFORE op-log append) -----
+        let sheet_count = self.workbook.sheet_count();
+        if self.workbook.sheet(sheet).is_none() {
+            return Err(RuntimeError::InvalidSheet { sheet, sheet_count });
+        }
+        if rows == 0 || cols == 0 {
+            return Err(RuntimeError::TableCreateRejected {
+                name: name.to_owned(),
+                reason: "table rows and cols must both be > 0",
+            });
+        }
+        if column_names.len() != cols as usize {
+            return Err(RuntimeError::TableCreateRejected {
+                name: name.to_owned(),
+                reason: "column_names length does not match cols",
+            });
+        }
+        if column_names.iter().any(|s| s.is_empty()) {
+            return Err(RuntimeError::TableCreateRejected {
+                name: name.to_owned(),
+                reason: "table column names cannot be empty",
+            });
+        }
+        // Column-name uniqueness (case-insensitive).
+        {
+            use std::collections::HashSet;
+            let mut seen: HashSet<String> = HashSet::new();
+            for cn in &column_names {
+                if !seen.insert(cn.to_ascii_lowercase()) {
+                    return Err(RuntimeError::TableCreateRejected {
+                        name: name.to_owned(),
+                        reason: "table column names must be unique (case-insensitive)",
+                    });
+                }
+            }
+        }
+        // Name uniqueness (shared namespace: TableTable + NameTable).
+        if self.workbook.tables().lookup(&canonical).is_some() {
+            return Err(RuntimeError::TableCreateRejected {
+                name: name.to_owned(),
+                reason: "table with this canonical name already exists",
+            });
+        }
+        if self.workbook.names().lookup_ci(&canonical).is_some() {
+            return Err(RuntimeError::TableCreateRejected {
+                name: name.to_owned(),
+                reason: "defined-name with this canonical name already exists (shared namespace)",
+            });
+        }
+        // Non-overlap: walk the proposed footprint.
+        for r in top_row..top_row + rows {
+            for c in top_col..top_col + cols {
+                if self.workbook.table_at(sheet, r, c).is_some() {
+                    return Err(RuntimeError::TableCreateRejected {
+                        name: name.to_owned(),
+                        reason: "table footprint overlaps an existing table",
+                    });
+                }
+            }
+        }
+        // ----- Op-log append (BEFORE mutation per W5-103 atomicity) -----
+        if let Some(oplog) = self.oplog.as_deref_mut() {
+            oplog.append(Op::CreateTable {
+                name: canonical.clone(),
+                sheet,
+                top_row,
+                top_col,
+                rows,
+                cols,
+                has_header,
+                has_totals,
+                column_names: column_names.clone(),
+            })?;
+        }
+        // ----- Mutation -----
+        use ql_storage::{TableColumn, TableMetadata};
+        let columns: Vec<TableColumn> = column_names
+            .iter()
+            .map(|cn| TableColumn {
+                id: self.workbook.tables_mut().allocate_column_id(),
+                name: Arc::from(cn.to_ascii_lowercase().as_str()),
+                display: Arc::from(cn.as_str()),
+                totals_function: None,
+            })
+            .collect();
+        let meta = TableMetadata {
+            name: Arc::from(canonical.as_str()),
+            display_name: Arc::from(name),
+            sheet,
+            top_row,
+            top_col,
+            rows,
+            cols,
+            has_header,
+            has_totals,
+            columns,
+        };
+        self.workbook
+            .tables_mut()
+            .insert(Arc::from(canonical.as_str()), meta);
+        Ok(())
+    }
+
+    /// **W5-118 (Phase 4.8.H):** drop a table's metadata. Cells inside
+    /// the table footprint are untouched. Formulas referencing the
+    /// dropped table re-bind to `BindError::UnknownTable` on next
+    /// recompute. Emits `Op::DropTable` to the attached op log (if any).
+    pub fn drop_table(&mut self, name: &str) -> Result<(), RuntimeError> {
+        let canonical = name.to_ascii_uppercase();
+        if self.workbook.tables().lookup(&canonical).is_none() {
+            return Err(RuntimeError::TableNotFound(name.to_owned()));
+        }
+        if let Some(oplog) = self.oplog.as_deref_mut() {
+            oplog.append(Op::DropTable {
+                name: canonical.clone(),
+            })?;
+        }
+        let _ = self.workbook.tables_mut().remove(&canonical);
+        Ok(())
+    }
+
+    /// **W5-92 (Phase 4.6.D):** create a new sheet,
     /// emitting `Op::AddSheet` into the attached op log (if any). Returns
     /// the new sheet's `SheetId`. Wraps `Workbook::add_sheet_with_chunk_rows`.
     ///
@@ -8836,6 +9005,161 @@ mod tests {
             Value::Error(ErrorValue::Value),
             "[@Qty] outside table data rows returns #VALUE!"
         );
+    }
+
+    // ===== W5-118 (Phase 4.8.H) — create_table / drop_table + op log =====
+
+    #[test]
+    fn create_table_happy_path_registers_and_emits_op() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.create_table(
+                "Sales",
+                0,
+                0,
+                0,
+                5,
+                3,
+                true,
+                false,
+                vec!["Region".into(), "Qty".into(), "Price".into()],
+            )
+            .unwrap();
+        }
+        let t = wb.lookup_table("Sales").expect("registered");
+        assert_eq!(t.name.as_ref(), "SALES");
+        assert_eq!(t.display_name.as_ref(), "Sales");
+        assert_eq!(t.cols, 3);
+        assert_eq!(t.rows, 5);
+        assert!(t.has_header);
+        assert!(!t.has_totals);
+        // Verify op-log emission.
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(&ops[0], Op::CreateTable { name, .. } if name == "SALES"));
+    }
+
+    #[test]
+    fn create_table_rejects_overlap() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.create_table("A", 0, 0, 0, 5, 2, true, false, vec!["x".into(), "y".into()])
+            .unwrap();
+        // Overlapping footprint should reject.
+        let err = rt
+            .create_table("B", 0, 2, 1, 3, 2, true, false, vec!["p".into(), "q".into()])
+            .unwrap_err();
+        match err {
+            RuntimeError::TableCreateRejected { reason, .. } => {
+                assert!(reason.contains("overlap"), "reason: {reason}");
+            }
+            other => panic!("expected TableCreateRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_table_rejects_duplicate_column_names_case_insensitive() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt
+            .create_table(
+                "T",
+                0,
+                0,
+                0,
+                2,
+                2,
+                true,
+                false,
+                vec!["Qty".into(), "qty".into()],
+            )
+            .unwrap_err();
+        match err {
+            RuntimeError::TableCreateRejected { reason, .. } => {
+                assert!(reason.contains("unique"), "reason: {reason}");
+            }
+            other => panic!("expected TableCreateRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_table_rejects_namespace_collision_with_defined_name() {
+        let mut wb = make_runtime_workbook();
+        wb.set_name("FOO", ql_storage::NamedTarget::Constant(Value::Number(1.0)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt
+            .create_table("Foo", 0, 0, 0, 2, 1, true, false, vec!["x".into()])
+            .unwrap_err();
+        match err {
+            RuntimeError::TableCreateRejected { reason, .. } => {
+                assert!(reason.contains("defined-name"), "reason: {reason}");
+            }
+            other => panic!("expected TableCreateRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_table_removes_metadata_and_emits_op() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.create_table("Sales", 0, 0, 0, 2, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+            rt.drop_table("Sales").unwrap();
+        }
+        assert!(wb.lookup_table("Sales").is_none());
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(&ops[1], Op::DropTable { name } if name == "SALES"));
+    }
+
+    #[test]
+    fn drop_table_missing_errors() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt.drop_table("Nope").unwrap_err();
+        match err {
+            RuntimeError::TableNotFound(n) => assert_eq!(n, "Nope"),
+            other => panic!("expected TableNotFound, got {other:?}"),
+        }
+    }
+
+    /// **End-to-end with op log**: create_table emits Op::CreateTable;
+    /// SUM(Sales[Qty]) using the just-created table works. Validates
+    /// the runtime API end-to-end.
+    #[test]
+    fn create_table_then_sum_column_works() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.create_table(
+            "Sales",
+            0,
+            0,
+            0,
+            3,
+            1,
+            true,
+            false,
+            vec!["Qty".into()],
+        )
+        .unwrap();
+        drop(rt);
+        wb.put(ql_types::Address::new(0, 1, 0), Value::Number(7.0));
+        wb.put(ql_types::Address::new(0, 2, 0), Value::Number(13.0));
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 5, 0, "SUM(Sales[Qty])").unwrap();
+        assert_eq!(v, Value::Number(20.0));
     }
 
     /// AVERAGE through the same path — confirms the cache fast path
