@@ -61,6 +61,19 @@ pub enum LexError {
     /// looking characters starting at the `#`.
     #[error("unrecognized error sigil: {0:?}")]
     InvalidErrorSigil(String),
+
+    /// **W5-111 (Phase 4.8.B):** a structured-reference opened a `[`
+    /// after a table-name identifier but the matching `]` never appeared
+    /// before end-of-input.
+    #[error("unterminated structured reference (missing `]`)")]
+    UnterminatedStructuredRef,
+
+    /// **W5-111 (Phase 4.8.B):** a single-quote escape `'` inside
+    /// structured-ref bracket content was the LAST character before the
+    /// close. Per OOXML escape rules, `'` requires a following character
+    /// to escape. A trailing `'` is a syntax error.
+    #[error("dangling escape `'` at end of structured reference bracket content")]
+    DanglingStructuredRefEscape,
 }
 
 /// Excel's column-letter upper bound (XFD = 16383, zero-indexed).
@@ -476,7 +489,8 @@ fn lex_ident_or_ref(chars: &mut Peekable<Chars>) -> Result<Token, LexError> {
             text: Arc::from(raw_text),
         })
     } else {
-        // No trailing digits — either an identifier or a bare column.
+        // No trailing digits — either an identifier, a bare column, OR a
+        // structured table reference (Phase 4.8.B / #148 closure).
         // `mid_dollar = true` here means we saw `<letters>$<non-digit>` — invalid in Excel.
         if mid_dollar {
             return Err(LexError::UnexpectedChar('$'));
@@ -485,6 +499,25 @@ fn lex_ident_or_ref(chars: &mut Peekable<Chars>) -> Result<Token, LexError> {
             // `$` alone with nothing after.
             return Err(LexError::UnexpectedChar('$'));
         }
+
+        // **W5-111 (Phase 4.8.B / #148 closure):** structured-reference
+        // lookahead. If the next char is `[`, this is `Token::StructuredRef`
+        // REGARDLESS of whether `letters` would otherwise classify as a
+        // column letter (`Src`, `AAA`, `RC`, ...). Pre-4.8.B the lexer
+        // emitted BareColumn for `Src` then choked on the trailing `[`,
+        // surfacing as a misleading bind error. The lookahead pre-empts.
+        //
+        // Table names CAN NOT carry a `$` prefix (Excel canon — `$Sales`
+        // is invalid).
+        if !leading_dollar && chars.peek() == Some(&'[') {
+            chars.next(); // consume the opening `[`
+            let bracket_content = consume_structured_ref_bracket(chars)?;
+            return Ok(Token::StructuredRef {
+                table_name: Arc::from(letters),
+                bracket_content: Arc::from(bracket_content),
+            });
+        }
+
         // Try column-letter interpretation (length 1-3, all ASCII alpha, value ≤ XFD).
         let raw_text = if leading_dollar {
             format!("${letters}")
@@ -507,6 +540,63 @@ fn lex_ident_or_ref(chars: &mut Peekable<Chars>) -> Result<Token, LexError> {
         }
         Ok(Token::Ident(Arc::from(letters)))
     }
+}
+
+/// **W5-111 (Phase 4.8.B):** consume the bracket content of a structured
+/// reference. The caller has already consumed the opening `[`. Returns
+/// the UNESCAPED content (between the outer `[` and matching `]`); the
+/// closing `]` is also consumed.
+///
+/// Per OOXML structured-reference grammar (design doc § 5.4), the
+/// following escape pairs collapse to single characters in the content:
+///
+/// | Source | Resolves to |
+/// |---|---|
+/// | `'[` | literal `[` |
+/// | `']` | literal `]` |
+/// | `'#` | literal `#` |
+/// | `'@` | literal `@` |
+/// | `''` | literal `'` |
+///
+/// Unescaped `[` increments depth; unescaped `]` decrements depth. The
+/// outermost `]` (depth → 0) closes the bracket and is consumed but NOT
+/// pushed to the result.
+///
+/// **Error cases:**
+/// - EOF before matching `]` → `LexError::UnterminatedStructuredRef`.
+/// - Trailing `'` with no following character →
+///   `LexError::DanglingStructuredRefEscape`.
+///
+/// Test surface lives in the lexer test module (Phase 4.8.B), exercising
+/// each escape pair, nested brackets, and the EOF / dangling cases.
+fn consume_structured_ref_bracket(chars: &mut Peekable<Chars>) -> Result<String, LexError> {
+    let mut content = String::new();
+    let mut depth: u32 = 1; // we've already consumed the opening `[`
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                // Escape pair: the NEXT character is taken literally.
+                // Per OOXML, the escape MUST have a following character.
+                match chars.next() {
+                    Some(escaped) => content.push(escaped),
+                    None => return Err(LexError::DanglingStructuredRefEscape),
+                }
+            }
+            '[' => {
+                depth = depth.saturating_add(1);
+                content.push('[');
+            }
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(content);
+                }
+                content.push(']');
+            }
+            other => content.push(other),
+        }
+    }
+    Err(LexError::UnterminatedStructuredRef)
 }
 
 /// Simple classifier — letters-only (no `$` prefix; that's tracked separately by the caller).
@@ -1810,5 +1900,227 @@ mod tests {
         assert_eq!(toks.len(), 2);
         assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::AINotAvailable));
         assert!(matches!(toks[1], Token::Number(n) if n == 5.0));
+    }
+
+    // ===== W5-111 (Phase 4.8.B) — structured references =====
+
+    #[test]
+    fn structured_ref_simple_column() {
+        let toks = lex_ok("Sales[Qty]");
+        assert_eq!(toks.len(), 1);
+        match &toks[0] {
+            Token::StructuredRef {
+                table_name,
+                bracket_content,
+            } => {
+                assert_eq!(table_name.as_ref(), "Sales");
+                assert_eq!(bracket_content.as_ref(), "Qty");
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn structured_ref_with_nested_brackets() {
+        // `Sales[[#Headers], [Qty]]` — outer `[` opens at depth 1; the inner
+        // `[`s increment depth to 2; their `]`s drop back to 1; the final
+        // `]` drops to 0 and closes.
+        let toks = lex_ok("Sales[[#Headers], [Qty]]");
+        assert_eq!(toks.len(), 1);
+        match &toks[0] {
+            Token::StructuredRef {
+                table_name,
+                bracket_content,
+            } => {
+                assert_eq!(table_name.as_ref(), "Sales");
+                assert_eq!(bracket_content.as_ref(), "[#Headers], [Qty]");
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    /// Each of the 5 OOXML escape pairs collapses to a single literal
+    /// character in the bracket content.
+    #[test]
+    fn structured_ref_escape_pairs() {
+        // `'[`, `']`, `'#`, `'@`, `''` escapes.
+        let cases = [
+            ("Tbl['[a]", "[a"),     // escaped opening bracket inside content
+            ("Tbl[a']]", "a]"),     // escaped closing bracket
+            ("Tbl['#Hash]", "#Hash"),
+            ("Tbl['@AtSign]", "@AtSign"),
+            ("Tbl[Bob''s]", "Bob's"),
+        ];
+        for (src, expected_content) in cases {
+            let toks = lex_ok(src);
+            assert_eq!(toks.len(), 1, "case {src:?} produced wrong token count");
+            match &toks[0] {
+                Token::StructuredRef {
+                    bracket_content, ..
+                } => {
+                    assert_eq!(
+                        bracket_content.as_ref(),
+                        expected_content,
+                        "case {src:?}"
+                    );
+                }
+                other => panic!("case {src:?} → expected StructuredRef, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn structured_ref_unterminated_bracket_errors() {
+        let err = lex("Tbl[abc").unwrap_err();
+        assert_eq!(err, LexError::UnterminatedStructuredRef);
+    }
+
+    #[test]
+    fn structured_ref_dangling_escape_errors() {
+        // `'` is the LAST character before EOF inside bracket content.
+        let err = lex("Tbl[abc'").unwrap_err();
+        assert_eq!(err, LexError::DanglingStructuredRefEscape);
+    }
+
+    /// **#148 closure (Phase 4.7.N follow-up):** `Src` is a valid 3-letter
+    /// column letter (S=19, R=18, C=3 → column 12,950) and would lex as
+    /// `BareColumn` PRE-4.8.B. The Ident-with-`[`-lookahead in
+    /// `lex_ident_or_ref` pre-empts: `Src[Col]` lexes as StructuredRef.
+    #[test]
+    fn issue_148_closure_src_lexes_as_structured_ref() {
+        let toks = lex_ok("Src[Col]");
+        assert_eq!(toks.len(), 1);
+        match &toks[0] {
+            Token::StructuredRef {
+                table_name,
+                bracket_content,
+            } => {
+                assert_eq!(table_name.as_ref(), "Src");
+                assert_eq!(bracket_content.as_ref(), "Col");
+            }
+            other => panic!("expected StructuredRef for Src[Col], got {other:?}"),
+        }
+    }
+
+    /// Sibling regression: `AAA[Col]` — `AAA` is column 702. Pre-4.8.B the
+    /// lexer would emit `BareColumn{col=702}` then a `LBrace`? No — `[` is
+    /// not even in the existing token vocabulary outside structured refs.
+    /// Pre-4.8.B `AAA[Col]` would have lexed as `BareColumn + UnexpectedChar('[')`.
+    #[test]
+    fn issue_148_closure_aaa_lexes_as_structured_ref() {
+        let toks = lex_ok("AAA[Col]");
+        assert_eq!(toks.len(), 1);
+        match &toks[0] {
+            Token::StructuredRef {
+                table_name,
+                bracket_content,
+            } => {
+                assert_eq!(table_name.as_ref(), "AAA");
+                assert_eq!(bracket_content.as_ref(), "Col");
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    /// A bare column followed by anything OTHER than `[` still lexes as
+    /// `BareColumn` (no regression). `A:A` test is below; here we just
+    /// check `Src` without a following `[`.
+    #[test]
+    fn bare_column_without_bracket_still_lexes_as_bare_column() {
+        let toks = lex_ok("Src");
+        assert_eq!(toks.len(), 1);
+        match &toks[0] {
+            Token::BareColumn { col, abs, text } => {
+                assert!(!abs);
+                assert_eq!(text.as_ref(), "Src");
+                // S=19, R=18, C=3 — value computed below for spot-check.
+                let expected = (19u32 * 26 + 18) * 26 + 3 - 1;
+                assert_eq!(*col, expected);
+            }
+            other => panic!("expected BareColumn for `Src`, got {other:?}"),
+        }
+    }
+
+    /// `A:A` regression: bare-column followed by `:` followed by bare-
+    /// column. The `[`-lookahead must NOT fire for `A:A`. (Existing
+    /// test `whole_column_range_a_a_lexes_as_two_bare_columns_and_colon`
+    /// at line ~1097 already covers this; restated here for clarity
+    /// since the lookahead change affected the same code path.)
+    #[test]
+    fn issue_148_closure_a_colon_a_still_works() {
+        let toks = lex_ok("A:A");
+        assert_eq!(toks.len(), 3);
+        assert!(matches!(toks[0], Token::BareColumn { col: 0, .. }));
+        assert!(matches!(toks[1], Token::Colon));
+        assert!(matches!(toks[2], Token::BareColumn { col: 0, .. }));
+    }
+
+    /// Function-name-like table refs lex as StructuredRef. Per design
+    /// § 5.2 the lexer no longer excludes function names; table-name
+    /// validation in create_table (4.8.H) rejects illegal names.
+    #[test]
+    fn function_name_table_ref_lexes_as_structured_ref() {
+        let toks = lex_ok("SUM[Qty]");
+        assert_eq!(toks.len(), 1);
+        match &toks[0] {
+            Token::StructuredRef {
+                table_name,
+                bracket_content,
+            } => {
+                assert_eq!(table_name.as_ref(), "SUM");
+                assert_eq!(bracket_content.as_ref(), "Qty");
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    /// `A[0]` — `A` is column 0; without lookahead this would be
+    /// BareColumn + `[` + Number + `]`. With lookahead, the `[` triggers
+    /// StructuredRef capture; `bracket_content` is `"0"`. Table-name
+    /// validation in 4.8.H rejects `A` as a table name (it's a cell-ref
+    /// pattern), so `A[0]` surfaces as `BindError::UnknownTable("A")` —
+    /// behavior change is intentional per design § 5.3.
+    #[test]
+    fn a_bracket_zero_lexes_as_structured_ref() {
+        let toks = lex_ok("A[0]");
+        assert_eq!(toks.len(), 1);
+        match &toks[0] {
+            Token::StructuredRef {
+                table_name,
+                bracket_content,
+            } => {
+                assert_eq!(table_name.as_ref(), "A");
+                assert_eq!(bracket_content.as_ref(), "0");
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    /// `$A` cannot precede `[` — `$` is the absolute-marker, table names
+    /// don't carry `$`. `$A[X]` would be `$A` (BareColumn abs) then `[X]`
+    /// — and since `[X]` outside an Ident-`[` context is a lexer error,
+    /// the test asserts the lookahead skips the `[` for `$`-prefixed
+    /// idents.
+    #[test]
+    fn dollar_prefixed_ident_does_not_match_structured_ref_lookahead() {
+        // `$A[1]` should lex as `BareColumn(A, abs)` + `[1]`-style
+        // unsupported. Actually `[` outside structured-ref is going to
+        // surface SOME error. We just need to confirm the FIRST token is
+        // a `BareColumn` not a `StructuredRef`.
+        let result = lex("$A[1]");
+        // Either errors (the `[` is an unexpected char on its own) or
+        // produces BareColumn-first. Either way the first token is NOT
+        // StructuredRef.
+        match result {
+            Ok(toks) => match &toks[0] {
+                Token::BareColumn { abs: true, .. } => {}
+                other => panic!("expected first token BareColumn(abs), got {other:?}"),
+            },
+            Err(_) => {
+                // Acceptable — `[` may surface as UnexpectedChar; the
+                // invariant is that `$A` was NOT pulled into a
+                // StructuredRef.
+            }
+        }
     }
 }

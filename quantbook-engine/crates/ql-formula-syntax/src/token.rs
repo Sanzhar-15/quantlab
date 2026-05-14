@@ -123,6 +123,29 @@ pub enum Token {
     /// the closing quote is followed by `!` (skipping intervening
     /// whitespace). The body is the decoded form (no surrounding quotes).
     QuotedSheetName(Arc<str>),
+
+    /// **W5-111 (Phase 4.8.B):** structured table reference `Table[Col]`,
+    /// `Table[[#Headers], [Col]]`, etc. `table_name` is the case-preserving
+    /// identifier preceding `[`; `bracket_content` is the UNESCAPED text
+    /// between the outer `[` and matching `]` (per OOXML escape rules
+    /// `'[`, `']`, `'#`, `'@`, `''` consumed at lex time).
+    ///
+    /// The parser runs a structured-ref sub-grammar over `bracket_content`
+    /// to produce `Expr::StructuredRef` (Phase 4.8.C / W5-112).
+    ///
+    /// **#148 closure:** an identifier followed immediately by `[` lexes
+    /// as `StructuredRef` even when the identifier matches a column-letter
+    /// pattern (`Src`, `AAA`). Pre-4.8.B these would have shadowed into
+    /// `BareColumn` and surfaced misleading bind errors. Table-name
+    /// validity (rejecting `A1`/`A:A`/cell-ref-like names) is enforced
+    /// at `create_table` (Phase 4.8.H), NOT here.
+    StructuredRef {
+        /// Table identifier verbatim (case-preserving; canonicalize at
+        /// bind time via `Workbook::lookup_table`).
+        table_name: Arc<str>,
+        /// Bracket content with escapes resolved.
+        bracket_content: Arc<str>,
+    },
 }
 
 /// Operator subtype carried by `Token::Op`.
