@@ -1342,6 +1342,33 @@ impl<'a> WorkbookRuntime<'a> {
             // No-op: nothing to record, nothing to mutate.
             return Ok(());
         }
+
+        // **W5-103 megaudit MEDIUM-4 closure / design § 10.3:** if this
+        // cell anchors a spill, dissolve the spill BEFORE clearing the
+        // formula. Without this, `SpillAnchorTable` keeps dangling
+        // anchor + target entries and the target cells' computed
+        // overlays survive as orphan values that the read cascade
+        // still surfaces — Sonnet megaudit caught this gap.
+        //
+        // Capture the old footprint BEFORE clearing so the calcgraph
+        // hook pass below can fire `on_set_value` for each non-anchor
+        // target. This mirrors `set_formula`'s 4.7.J.3 invalidation
+        // pattern.
+        //
+        // Re-extraction of readers indexed under the dissolved
+        // footprint is Phase 4.7.K work (full set_value + clear_formula
+        // spill-invalidation closure). For now, the on_set_value pass
+        // dirties any readers via the existing index — under-dirty is
+        // possible if a reader was producer-aliased to the anchor
+        // (their dep is at the anchor cell, which gets dirtied by
+        // `on_clear_formula` below).
+        let dissolved_shape = self.workbook.spill_anchor_at(sheet, row, col).copied();
+        if dissolved_shape.is_some() {
+            // Idempotent: clear_spill_at returns SpillNotFoundError
+            // only if the anchor isn't registered, which can't happen
+            // here (spill_anchor_at returned Some).
+            let _ = self.workbook.clear_spill_at((sheet, row, col));
+        }
         // Producer-replay equivalence: `Workbook::clear_formula` only strips
         // the formula text. Phase 3.5 (CORR-25) made it also drop the
         // computed-overlay entry (so the cell's prior formula output
@@ -1391,6 +1418,26 @@ impl<'a> WorkbookRuntime<'a> {
         // longer apply).
         if let Some(g) = self.graph.as_deref_mut() {
             g.on_clear_formula(sheet, row, col);
+        }
+
+        // **W5-103 megaudit MEDIUM-4 closure (continued):** if a spill
+        // was just dissolved, fire `on_set_value` for each non-anchor
+        // cell in the dissolved footprint. Mirrors `set_formula`'s
+        // 4.7.J.3 invalidation pattern: target cells lost their
+        // spilled value (now Blank), so any reader indexed under a
+        // target address must dirty so its next recompute re-reads
+        // from the now-Blank target.
+        if let Some(shape) = dissolved_shape {
+            if let Some(g) = self.graph.as_deref_mut() {
+                for dr in 0..shape.rows {
+                    for dc in 0..shape.cols {
+                        if dr == 0 && dc == 0 {
+                            continue;
+                        }
+                        g.on_set_value(sheet, row + dr, col + dc);
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -6638,6 +6685,131 @@ mod tests {
         assert_eq!(
             wb.read(ql_types::Address::new(0, 0, 3)),
             Value::Number(20.0)
+        );
+    }
+
+    // ===== W5-103 megaudit MEDIUM-4 — clear_formula on spill anchor =====
+    //
+    // Per design § 10.3: clearing the formula at a spill anchor must
+    // dissolve the spill first. Otherwise SpillAnchorTable retains
+    // dangling anchor + target entries and the targets' computed
+    // overlays survive as orphan values.
+
+    /// Closes the design § 10.3 gap: clear_formula at A1 (spill anchor)
+    /// must dissolve A1's 1×3 spill, clearing B1/C1 computed overlays
+    /// and removing the anchor + target entries.
+    #[test]
+    fn clear_formula_at_spill_anchor_dissolves_spill() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // Spill 1x3 from A1.
+        rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+        // Clear the formula at A1.
+        rt.clear_formula(0, 0, 0).unwrap();
+        drop(rt);
+
+        // Anchor table cleaned.
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0),
+            None,
+            "anchor must be removed from SpillAnchorTable"
+        );
+        assert_eq!(
+            wb.spill_target_anchor(0, 0, 1),
+            None,
+            "B1 must no longer map back to A1"
+        );
+        assert_eq!(
+            wb.spill_target_anchor(0, 0, 2),
+            None,
+            "C1 must no longer map back to A1"
+        );
+        // Anchor cell: formula gone, A1 also becomes Blank. Excel
+        // canon: deleting a spill-anchor formula removes the entire
+        // spill, INCLUDING the anchor — the anchor's value came from
+        // the spilled array's (0,0) slot, not from a scalar formula
+        // result. clear_formula's "preserve current value as user
+        // overlay" path skips because current_value is Blank by the
+        // time it's captured (dissolution cleared the anchor's computed
+        // overlay first). This is the correct semantic: spill anchors
+        // don't retain a value after deletion the way scalar formulas
+        // do.
+        assert!(wb.formula_at(0, 0, 0).is_none(), "A1 formula text gone");
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Blank,
+            "A1 must be Blank after spill anchor's formula is cleared (Excel canon)"
+        );
+        // Target cells: computed overlays cleared by clear_spill_at.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Blank,
+            "B1 (spill target) must be Blank after dissolution"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 2)),
+            Value::Blank,
+            "C1 (spill target) must be Blank after dissolution"
+        );
+    }
+
+    /// Clear at a non-anchor cell (no spill anchored there) — original
+    /// clear_formula behavior preserved. Negative control.
+    #[test]
+    fn clear_formula_at_non_anchor_cell_unchanged_behavior() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // Spill at A1, set unrelated formula at D1.
+        rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+        rt.set_formula(0, 0, 3, "10 + 10").unwrap();
+        // Clear D1 — A1's spill must be untouched.
+        rt.clear_formula(0, 0, 3).unwrap();
+        drop(rt);
+
+        // A1's spill still active.
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(1, 3))
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(2.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Number(3.0));
+        // D1: formula gone, value preserved on user lane (existing semantic).
+        assert!(wb.formula_at(0, 0, 3).is_none());
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 3)),
+            Value::Number(20.0)
+        );
+    }
+
+    /// Closes design § 10.3 dirty-propagation: clear_formula at an
+    /// anchor must fire on_set_value for each non-anchor cell in the
+    /// dissolved footprint, so readers indexed under those addresses
+    /// dirty for next recompute.
+    #[test]
+    fn clear_formula_at_spill_anchor_fires_on_set_value_for_targets() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+        }
+        let baseline = graph.hook_counts().set_value;
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.clear_formula(0, 0, 0).unwrap();
+        }
+        let after = graph.hook_counts().set_value;
+        // 2 non-anchor cells in the 1x3 footprint → 2 on_set_value calls.
+        assert_eq!(
+            after - baseline,
+            2,
+            "clear_formula at 1x3 anchor must fire on_set_value for B1 and C1"
         );
     }
 }
