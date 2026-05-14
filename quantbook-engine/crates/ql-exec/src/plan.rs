@@ -20,10 +20,15 @@
 //! - `Binary { op, lhs, rhs }` — arithmetic + concat + comparison
 //! - `Unary { op, operand }` — unary minus / plus / percent
 //!
-//! Deferred (will surface in W4-4 ql-functions integration):
+//! Covered through Phase 4.7:
 //! - `RangeRef` — single range used inside a Function call (e.g. `SUM(A:A)`)
-//! - `Function { name, args }` — registry dispatch
-//! - `Array`, `Spill` — Phase 3+ dynamic arrays
+//!   — bound via the aggregate-context path (Phase 2B.4 / W5-39 evaluator).
+//! - `Function { name, args }` — registry dispatch (Phase 0+).
+//! - `Array(Vec<Vec<ExprPlan>>)` — array literals (W5-99 / Phase 4.7.F).
+//! - `Error(ErrorValue)` — error-sigil literals (W5-99 / Phase 4.7.F).
+//!
+//! Deferred (NOT bound today):
+//! - `Spill(Box<Expr>)` — reserved for Excel's `A1#` spill-range-ref syntax (Phase 4.9).
 
 use std::sync::Arc;
 
@@ -114,9 +119,18 @@ pub enum ExprPlan {
 /// Display strings are now user-facing (suitable for IDE diagnostics).
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BindError {
-    /// The Expr contains a variant not supported in this build (e.g. RangeRef
-    /// outside a Function context, Array literal, Spill anchor, NamedTarget::Range
-    /// — all Engine Phase 4 work per `docs/MASTER-PLAN.md`).
+    /// The Expr contains a variant not supported in this build. Currently
+    /// reachable from:
+    /// - `Expr::RangeRef` outside a Function context (Phase 4+ region binder).
+    /// - `Expr::Spill` — Excel's `A1#` syntax (Phase 4.9).
+    /// - `NamedTarget::Range` in scalar position (lands on the more
+    ///   specific `NamedRangeInScalarContext` variant; this is the
+    ///   catchall for variants the binder doesn't otherwise cover).
+    ///
+    /// Phase 4.7.F: `Expr::Array` and `Expr::Error` are now SUPPORTED;
+    /// degenerate-array shapes surface as `EmptyArrayLiteral`, ragged
+    /// shapes as `ArrayRowArityMismatch`, non-literal cells as
+    /// `ArrayCellNotLiteral`.
     #[error("unsupported expression variant: {0}")]
     UnsupportedVariant(&'static str),
     /// A `NameRef` was used but the name isn't registered in the active `NameTable`.
@@ -195,6 +209,15 @@ pub enum BindError {
         col: u32,
         got: &'static str,
     },
+
+    /// **W5-99 closure (Sonnet L-1 / Codex MEDIUM-7):** `Expr::Array`
+    /// is degenerate — zero rows OR row 0 has zero cells. The parser
+    /// rejects `{}` with `ParseError::EmptyArrayLiteral`, but
+    /// `Expr::Array(vec![])` and `Expr::Array(vec![vec![]])` are
+    /// directly-constructible from Rust code, so the binder is the
+    /// second line of defense.
+    #[error("array literal is degenerate (zero rows or zero cells per row)")]
+    EmptyArrayLiteral,
 }
 
 /// Phase 2B.4 (2026-05-12): bind-time context for a sub-expression. Drives
@@ -408,15 +431,16 @@ fn bind_with_context<L: NameLookup>(
         // (Number / Bool / String / Error). The parser already validates
         // both; this is defense in depth against direct AST construction.
         Expr::Array(rows) => {
-            if rows.is_empty() {
-                // The parser rejects `{}` with EmptyArrayLiteral, but a
-                // direct AST construction with `vec![]` could land here.
-                // No dedicated bind-error variant — surface as a clean
-                // UnsupportedVariant for the degenerate construction.
-                return Err(BindError::UnsupportedVariant(
-                    "Expr::Array with zero rows is not constructible from source; \
-                     direct AST construction with an empty Vec is rejected",
-                ));
+            // **W5-99 closure (Codex MEDIUM-7 / Sonnet L-1):** reject
+            // degenerate shapes — zero rows OR zero cells in row 0.
+            // The parser rejects `{}` via `ParseError::EmptyArrayLiteral`,
+            // but `Expr::Array(vec![])` and `Expr::Array(vec![vec![]])`
+            // are directly-constructible; the latter would otherwise
+            // bind with `expected_arity = 0` and produce a degenerate
+            // ExprPlan::Array(vec![vec![]]) that downstream code would
+            // need a special case for.
+            if rows.is_empty() || rows[0].is_empty() {
+                return Err(BindError::EmptyArrayLiteral);
             }
             let expected_arity = rows[0].len() as u32;
             let mut bound_rows: Vec<Vec<ExprPlan>> = Vec::with_capacity(rows.len());
@@ -1043,11 +1067,63 @@ mod tests {
 
     #[test]
     fn bind_array_literal_zero_rows_rejects() {
-        // Direct construction with no rows. Parser doesn't emit (rejects
-        // `{}` with EmptyArrayLiteral); binder surfaces UnsupportedVariant.
+        // W5-99 closure (Codex MEDIUM-7): now uses the dedicated
+        // EmptyArrayLiteral variant (was UnsupportedVariant pre-closure).
         let expr = Expr::Array(vec![]);
         let err = bind(&expr, 0).unwrap_err();
-        assert!(matches!(err, BindError::UnsupportedVariant(_)));
+        assert!(matches!(err, BindError::EmptyArrayLiteral));
+    }
+
+    #[test]
+    fn bind_array_literal_one_empty_row_rejects() {
+        // W5-99 closure (Codex MEDIUM-7): the degenerate case Codex caught
+        // — `Expr::Array(vec![vec![]])` (one row, zero cells) was
+        // previously accepted because `expected_arity = rows[0].len() = 0`
+        // matched every subsequent row. Now rejected.
+        let expr = Expr::Array(vec![vec![]]);
+        let err = bind(&expr, 0).unwrap_err();
+        assert!(matches!(err, BindError::EmptyArrayLiteral));
+    }
+
+    #[test]
+    fn bind_array_literal_rejects_name_ref_cell() {
+        // W5-99 closure (Sonnet M-1): NameRef as array-cell — parser
+        // rejects via InvalidArrayCellToken; binder mirror for
+        // direct-AST construction.
+        let expr = Expr::Array(vec![vec![
+            Expr::Number(1.0),
+            Expr::NameRef(Arc::from("TAXRATE")),
+        ]]);
+        let err = bind(&expr, 0).unwrap_err();
+        match err {
+            BindError::ArrayCellNotLiteral { row, col, got } => {
+                assert_eq!(row, 0);
+                assert_eq!(col, 1);
+                assert_eq!(got, "NameRef");
+            }
+            other => panic!("expected ArrayCellNotLiteral, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_array_literal_rejects_function_cell() {
+        // W5-99 closure (Sonnet M-1): Function call as array-cell.
+        let expr = Expr::Array(vec![vec![
+            Expr::Number(1.0),
+            Expr::Function {
+                name: Arc::from("SUM"),
+                args: vec![Expr::Number(1.0)],
+            },
+        ]]);
+        let err = bind(&expr, 0).unwrap_err();
+        match err {
+            BindError::ArrayCellNotLiteral { row, col, got } => {
+                assert_eq!(row, 0);
+                assert_eq!(col, 1);
+                assert_eq!(got, "Function");
+            }
+            other => panic!("expected ArrayCellNotLiteral, got {other:?}"),
+        }
     }
 
     #[test]

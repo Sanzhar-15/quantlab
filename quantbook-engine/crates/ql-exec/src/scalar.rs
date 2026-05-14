@@ -1254,4 +1254,41 @@ mod tests {
         };
         assert_eq!(eval_scalar(&plan, &env), Value::Error(ErrorValue::NA));
     }
+
+    #[test]
+    fn array_literal_as_aggregate_arg_returns_calc_interim() {
+        // W5-99 closure (Sonnet M-2): pin the interim `SUM({1, #N/A, 3})`
+        // behavior so a future array-aware aggregate-context path lands
+        // without silently regressing.
+        //
+        // Interim contract (W5-99): `ExprPlan::Array` is an opaque arg
+        // to the registered scalar function; the dispatch path
+        // currently evaluates each arg via `eval_scalar_with_cache`
+        // BEFORE handing values to the function. So `SUM({1,2,3})`
+        // evaluates the inner `ExprPlan::Array` via the scalar arm,
+        // which returns `Value::Error(ErrorValue::Calc)` per the
+        // design-§-6.3 rule. SUM then propagates the error.
+        //
+        // TODO(Phase 4.7.G — W5-100+): once the unified
+        // `FunctionFn` ABI dispatches arrays as `FunctionArg::Array`,
+        // `SUM({1,#N/A,3})` should evaluate to `Value::Error(NA)`
+        // (Excel-canon: errors in an array short-circuit the
+        // aggregate). When that lands, this test will FAIL and serve
+        // as the migration trigger to update the assertion.
+        let env = crate::env::MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Function {
+            name: std::sync::Arc::from("SUM"),
+            args: vec![ExprPlan::Array(vec![vec![
+                ExprPlan::Number(1.0),
+                ExprPlan::Error(ErrorValue::NA),
+                ExprPlan::Number(3.0),
+            ]])],
+        };
+        let v = eval_scalar_with_cache(&plan, &env, &registry, &cache);
+        // Interim: SUM sees a single arg = `#CALC!` (array-in-scalar),
+        // propagates `#CALC!`.
+        assert_eq!(v, Value::Error(ErrorValue::Calc));
+    }
 }
