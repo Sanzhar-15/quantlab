@@ -45,7 +45,7 @@ use ql_types::{
 
 use crate::env::WorkbookEnv;
 use crate::eval_result::EvalResult;
-use crate::plan::{bind_with_names_and_sheets, BindError};
+use crate::plan::{bind_with_site, BindError, BindSite};
 use crate::plan_cache::{PlanCache, PlanCacheKey, PlanCacheStats};
 use crate::transaction::WorkbookTransaction;
 
@@ -516,9 +516,12 @@ impl<'a> WorkbookRuntime<'a> {
                     // NameTable so `Expr::NameRef` resolves against defined
                     // names. W5-92 (Phase 4.6.D): pass `&Workbook` for names
                     // so the two-tier sheet-then-workbook chain fires.
-                    Ok(bind_with_names_and_sheets(
+                    // **W5-114 (Phase 4.8.E):** carry the formula's own cell
+                    // address through BindSite; 4.8.F's structured-ref
+                    // `[@Col]` resolution reads it.
+                    Ok(bind_with_site(
                         &expr,
-                        sheet,
+                        BindSite::at_cell(ql_types::Address::new(sheet, row, col)),
                         self.workbook,
                         self.workbook,
                     )?)
@@ -851,14 +854,15 @@ impl<'a> WorkbookRuntime<'a> {
         // graph. The HashSet dedupes across the old+new union, AND
         // dedupes the anchor cell out (its own deps were handled by
         // on_set_formula above).
-        let reader_info: Vec<(ql_calcgraph::NodeId, SheetId, Arc<str>)> = {
+        let reader_info: Vec<(ql_calcgraph::NodeId, SheetId, RowId, ColId, Arc<str>)> = {
             let g = match self.graph.as_deref() {
                 Some(g) => g,
                 None => return, // No graph attached — nothing to re-extract.
             };
             use std::collections::HashSet;
             let mut seen: HashSet<ql_calcgraph::NodeId> = HashSet::new();
-            let mut result: Vec<(ql_calcgraph::NodeId, SheetId, Arc<str>)> = Vec::new();
+            let mut result: Vec<(ql_calcgraph::NodeId, SheetId, RowId, ColId, Arc<str>)> =
+                Vec::new();
             for shape in [old_shape, new_shape].into_iter().flatten() {
                 for node in
                     g.readers_in_rect(anchor_sheet, anchor_row, anchor_col, shape.rows, shape.cols)
@@ -880,7 +884,7 @@ impl<'a> WorkbookRuntime<'a> {
                     let Some(text) = self.workbook.formula_at(s, r, c).cloned() else {
                         continue;
                     };
-                    result.push((node, s, text));
+                    result.push((node, s, r, c, text));
                 }
             }
             result
@@ -890,7 +894,7 @@ impl<'a> WorkbookRuntime<'a> {
         // `g` from step 1 is released; we now alternate immutable workbook
         // reads (inside the PlanCache miss closure) with mutable graph
         // mutations (reextract_deps).
-        for (node, reader_sheet, text) in reader_info {
+        for (node, reader_sheet, reader_row, reader_col, text) in reader_info {
             let name_gen = self.workbook.names().generation();
             let cache_key = PlanCacheKey {
                 text: Arc::clone(&text),
@@ -902,9 +906,14 @@ impl<'a> WorkbookRuntime<'a> {
                 .get_or_insert::<_, RuntimeError>(cache_key, || {
                     let tokens = lex(text.as_ref())?;
                     let expr = parse(tokens)?;
-                    Ok(bind_with_names_and_sheets(
+                    // **W5-114 (Phase 4.8.E):** carry reader cell address.
+                    Ok(bind_with_site(
                         &expr,
-                        reader_sheet,
+                        BindSite::at_cell(ql_types::Address::new(
+                            reader_sheet,
+                            reader_row,
+                            reader_col,
+                        )),
                         self.workbook,
                         self.workbook,
                     )?)
@@ -1964,7 +1973,14 @@ impl<'a> WorkbookRuntime<'a> {
         let expr = parse(tokens)?;
         // W5-92 (Phase 4.6.D): pass `&Workbook` for names so the
         // two-tier sheet-then-workbook scope chain fires.
-        let plan = bind_with_names_and_sheets(&expr, sheet, self.workbook, self.workbook)?;
+        // **W5-114 (Phase 4.8.E):** carry the (proposed) cell address so
+        // structured-ref `[@Col]` validation works.
+        let plan = bind_with_site(
+            &expr,
+            BindSite::at_cell(ql_types::Address::new(sheet, row, col)),
+            self.workbook,
+            self.workbook,
+        )?;
         let env = WorkbookEnv::new(self.workbook);
         // **W5-103 megaudit MEDIUM-3 closure (#129):** route through
         // `eval_at_cell_boundary` so a top-level array literal like
@@ -2305,8 +2321,13 @@ impl<'a> WorkbookRuntime<'a> {
                             // because it accesses self.graph which is None
                             // during recompute_dirty's session_slot window).
                             let mut seen: HashSet<ql_calcgraph::NodeId> = HashSet::new();
-                            let mut readers: Vec<(ql_calcgraph::NodeId, SheetId, Arc<str>)> =
-                                Vec::new();
+                            let mut readers: Vec<(
+                                ql_calcgraph::NodeId,
+                                SheetId,
+                                RowId,
+                                ColId,
+                                Arc<str>,
+                            )> = Vec::new();
                             for shape in [old_spill_shape, new_spill_shape].into_iter().flatten() {
                                 for n in
                                     session.readers_in_rect(sheet, row, col, shape.rows, shape.cols)
@@ -2324,10 +2345,10 @@ impl<'a> WorkbookRuntime<'a> {
                                     else {
                                         continue;
                                     };
-                                    readers.push((n, s, text));
+                                    readers.push((n, s, r, c, text));
                                 }
                             }
-                            for (rn, reader_sheet, reader_text) in readers {
+                            for (rn, reader_sheet, reader_row, reader_col, reader_text) in readers {
                                 let name_gen = self.workbook.names().generation();
                                 let cache_key = PlanCacheKey {
                                     text: Arc::clone(&reader_text),
@@ -2341,9 +2362,14 @@ impl<'a> WorkbookRuntime<'a> {
                                         || {
                                             let tokens = lex(reader_text.as_ref())?;
                                             let expr = parse(tokens)?;
-                                            Ok(bind_with_names_and_sheets(
+                                            // **W5-114 (Phase 4.8.E):** reader cell addr.
+                                            Ok(bind_with_site(
                                                 &expr,
-                                                reader_sheet,
+                                                BindSite::at_cell(ql_types::Address::new(
+                                                    reader_sheet,
+                                                    reader_row,
+                                                    reader_col,
+                                                )),
                                                 workbook,
                                                 workbook,
                                             )?)
@@ -2489,8 +2515,12 @@ impl<'a> WorkbookRuntime<'a> {
                     let expr = parse(tokens)?;
                     // W5-92 (Phase 4.6.D): pass `workbook` for names so
                     // the two-tier sheet-then-workbook scope chain fires.
-                    Ok(bind_with_names_and_sheets(
-                        &expr, sheet, workbook, workbook,
+                    // **W5-114 (Phase 4.8.E):** carry recomputed cell address.
+                    Ok(bind_with_site(
+                        &expr,
+                        BindSite::at_cell(ql_types::Address::new(sheet, row, col)),
+                        workbook,
+                        workbook,
                     )?)
                 })?;
 

@@ -361,13 +361,71 @@ pub fn bind_with_names<L: NameLookup>(
 /// `self.workbook` for `sheets` (the blanket `SheetResolver for
 /// Workbook` impl in `env.rs` does the lookup via
 /// `Workbook::sheet_id_by_name`).
+///
+/// **Phase 4.8.E note:** prefer [`bind_with_site`] for new code — it
+/// carries the formula's owning cell (needed by 4.8.F's structured-ref
+/// `[@Col]` resolution). This sheet-only entry point remains for
+/// callers that don't have cell context (pure-syntax tests, parse
+/// fuzzers) and constructs a `BindSite` with `cell: None` internally.
 pub fn bind_with_names_and_sheets<L: NameLookup>(
     expr: &Expr,
     owning_sheet: SheetId,
     names: &L,
     sheets: &dyn SheetResolver,
 ) -> Result<ExprPlan, BindError> {
-    bind_with_context(expr, owning_sheet, names, sheets, BindContext::Scalar)
+    bind_with_site(
+        expr,
+        BindSite {
+            sheet: owning_sheet,
+            cell: None,
+        },
+        names,
+        sheets,
+    )
+}
+
+/// **W5-114 (Phase 4.8.E):** the formula's bind context — sheet plus
+/// optionally the cell address. The cell is required for structured-
+/// reference `[@Col]` resolution (4.8.F); other bind paths ignore it.
+///
+/// `cell: None` is allowed for parse-only / syntax-validation paths
+/// where no specific cell is being bound; structured-ref `[@Col]`
+/// surfaces `BindError::ThisRowRequiresOwningCell` in that case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindSite {
+    pub sheet: SheetId,
+    pub cell: Option<ql_types::Address>,
+}
+
+impl BindSite {
+    /// Construct a BindSite with no cell context (for parse-only paths).
+    pub fn sheet_only(sheet: SheetId) -> Self {
+        Self { sheet, cell: None }
+    }
+
+    /// Construct a BindSite with full cell context.
+    pub fn at_cell(addr: ql_types::Address) -> Self {
+        Self {
+            sheet: addr.sheet,
+            cell: Some(addr),
+        }
+    }
+}
+
+/// **W5-114 (Phase 4.8.E):** bind with explicit `BindSite` context.
+/// Used by production call sites that have the owning cell address
+/// available. 4.8.F consumes `site.cell` for `[@Col]` resolution; for
+/// now it's plumbed through and ignored by the existing bind logic.
+pub fn bind_with_site<L: NameLookup>(
+    expr: &Expr,
+    site: BindSite,
+    names: &L,
+    sheets: &dyn SheetResolver,
+) -> Result<ExprPlan, BindError> {
+    // 4.8.E: cell field plumbed but not yet consumed. 4.8.F adds the
+    // structured-ref resolution arm that reads it.
+    let _ = site.cell;
+    bind_with_context(expr, site.sheet, names, sheets, BindContext::Scalar)
 }
 
 fn bind_with_context<L: NameLookup>(

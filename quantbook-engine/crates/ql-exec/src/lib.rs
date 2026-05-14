@@ -95,8 +95,8 @@ pub use eval_result::EvalResult;
 pub use loader::load_workbook_and_recompute;
 pub use lower::{classify, dispatch, SimdShape};
 pub use plan::{
-    bind, bind_with_names, bind_with_names_and_sheets, BindError, ExprPlan, NameLookup,
-    ResolvedName, SheetResolver,
+    bind, bind_with_names, bind_with_names_and_sheets, bind_with_site, BindError, BindSite,
+    ExprPlan, NameLookup, ResolvedName, SheetResolver,
 };
 pub use plan_cache::{PlanCache, PlanCacheKey, PlanCacheStats};
 pub use scalar::{

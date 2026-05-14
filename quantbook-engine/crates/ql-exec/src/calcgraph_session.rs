@@ -82,7 +82,7 @@ use ql_storage::Workbook;
 use ql_types::{ColId, Range, RowId, SheetId};
 
 use crate::aggregate_cache::{AggregateCacheStats, InMemAggregateCache};
-use crate::plan::{bind_with_names_and_sheets, ExprPlan};
+use crate::plan::{bind_with_site, BindSite, ExprPlan};
 use crate::workbook_runtime::RuntimeError;
 
 /// Phase 3.3 (2026-05-12) — convert a `ql_types::Range` (used in
@@ -657,7 +657,7 @@ impl CalcgraphSession {
             // accumulates; we keep going. Phase 3.3 passes the
             // formula's owning sheet so the stripe register can use
             // the correct fallback for any range with `sheet: None`.
-            match Self::bind_text(&text, sheet, wb) {
+            match Self::bind_text(&text, BindSite::at_cell(ql_types::Address::new(sheet, row, col)), wb) {
                 Ok(plan) => {
                     session.extract_and_register_deps(node, sheet, &plan, wb);
                     succeeded += 1;
@@ -696,9 +696,13 @@ impl CalcgraphSession {
     /// workbook's NameTable. Used by `rebuild_from_workbook` and by
     /// `on_set_formula`'s text-only fallback. Phase 3.3 may add a
     /// cached version that integrates with `PlanCache`.
+    ///
+    /// **W5-114 (Phase 4.8.E):** signature now takes `BindSite` so
+    /// the formula's cell address flows through for structured-ref
+    /// `[@Col]` resolution (4.8.F).
     fn bind_text(
         text: &str,
-        owning_sheet: SheetId,
+        site: BindSite,
         wb: &Workbook,
     ) -> Result<ExprPlan, RuntimeError> {
         let tokens = lex(text)?;
@@ -706,7 +710,7 @@ impl CalcgraphSession {
         // W5-92 (Phase 4.6.D): pass `wb` for names so the two-tier
         // sheet-then-workbook scope chain fires; was `wb.names()`
         // (workbook-scoped only).
-        Ok(bind_with_names_and_sheets(&expr, owning_sheet, wb, wb)?)
+        Ok(bind_with_site(&expr, site, wb, wb)?)
     }
 
     /// **G3-02 acceptance (hook 1/5).** Mutation hook fired by

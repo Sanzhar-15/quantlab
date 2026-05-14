@@ -40,7 +40,7 @@ use ql_storage::Workbook;
 use ql_types::{ColId, RowId, SheetId, Value};
 
 use crate::env::WorkbookEnv;
-use crate::plan::{bind_with_names_and_sheets, ExprPlan};
+use crate::plan::{bind_with_site, BindSite, ExprPlan};
 use crate::scalar::eval_scalar_with_registry;
 use crate::workbook_runtime::{validate_cell, RuntimeError};
 
@@ -215,7 +215,13 @@ impl<'a> WorkbookTransaction<'a> {
         // W5-92 (Phase 4.6.D): pass `&Workbook` for names so the two-tier
         // sheet-then-workbook scope chain fires; was `self.workbook.names()`
         // (workbook-scoped only).
-        let plan = bind_with_names_and_sheets(&expr, sheet, self.workbook, self.workbook)?;
+        // **W5-114 (Phase 4.8.E):** carry the formula's cell address.
+        let plan = bind_with_site(
+            &expr,
+            BindSite::at_cell(ql_types::Address::new(sheet, row, col)),
+            self.workbook,
+            self.workbook,
+        )?;
         self.ops.push(PendingOp::Formula {
             sheet,
             row,
