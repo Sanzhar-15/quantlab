@@ -74,6 +74,7 @@
 pub mod aggregate_cache;
 pub mod calcgraph_session;
 pub mod env;
+pub mod eval_result;
 pub mod loader;
 pub mod lower;
 pub mod plan;
@@ -90,6 +91,7 @@ pub use calcgraph_session::{
     CalcgraphSession, FormulaDeps, HookCounts, RebuildFailure, RebuildResult,
 };
 pub use env::{CellEnv, MapEnv, WorkbookEnv};
+pub use eval_result::EvalResult;
 pub use loader::load_workbook_and_recompute;
 pub use lower::{classify, dispatch, SimdShape};
 pub use plan::{

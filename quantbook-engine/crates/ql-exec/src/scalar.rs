@@ -228,18 +228,45 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                             return v;
                         }
                     }
-                    let has_range_arg = args
-                        .iter()
-                        .any(|a| matches!(a, ExprPlan::AggregateNameRef { .. }));
-                    if has_range_arg && crate::plan::is_aggregate_function(name) {
-                        // Multi-range or mixed aggregate args: materialize
-                        // every range and call the function. No cache use
-                        // (V2 may add multi-range cache keys).
+                    // **W5-100 (Phase 4.7.G):** also detect `ExprPlan::Array`
+                    // args as range-like containers. Per design § 6.3, array
+                    // results in aggregate-arg context "feed cells" — i.e.,
+                    // SUM({1,2,3}) iterates the cells the same way it would
+                    // iterate a named-range arg's cells. Without this, the
+                    // pre-W5-100 path evaluated the Array as scalar (→
+                    // #CALC!) and SUM saw a single error value.
+                    let has_range_or_array_arg = args.iter().any(|a| {
+                        matches!(a, ExprPlan::AggregateNameRef { .. } | ExprPlan::Array(_))
+                    });
+                    if has_range_or_array_arg && crate::plan::is_aggregate_function(name) {
+                        // Multi-range / mixed aggregate args: materialize
+                        // every range AND every array literal, then call
+                        // the function. No cache use (V2 may add multi-
+                        // range cache keys; array-literal args are pure
+                        // values without provenance, so caching them is
+                        // a no-op anyway).
                         let mut flat: Vec<Value> = Vec::new();
                         for a in args {
                             match a {
                                 ExprPlan::AggregateNameRef { range, .. } => {
                                     flat.extend(env.read_range(*range));
+                                }
+                                ExprPlan::Array(rows) => {
+                                    // **W5-100:** array cells are literal-
+                                    // only per the W5-99 binder restriction
+                                    // (Number / Bool / String / Error). Eval
+                                    // each cell via the scalar path — the
+                                    // legacy scalar arm already returns the
+                                    // literal value via `eval_scalar_with_cache`.
+                                    // Row-major iteration matches the
+                                    // existing `env.read_range` flat shape.
+                                    for row in rows {
+                                        for cell in row {
+                                            flat.push(eval_scalar_with_cache(
+                                                cell, env, registry, cache,
+                                            ));
+                                        }
+                                    }
                                 }
                                 other => {
                                     flat.push(eval_scalar_with_cache(other, env, registry, cache));
@@ -1256,25 +1283,17 @@ mod tests {
     }
 
     #[test]
-    fn array_literal_as_aggregate_arg_returns_calc_interim() {
-        // W5-99 closure (Sonnet M-2): pin the interim `SUM({1, #N/A, 3})`
-        // behavior so a future array-aware aggregate-context path lands
-        // without silently regressing.
+    fn array_literal_as_aggregate_arg_propagates_error_cell() {
+        // W5-100 (Phase 4.7.G): `SUM({1, #N/A, 3})` now expands the
+        // array's cells into the aggregate's flat-arg list; the #N/A
+        // cell propagates through SUM. Per Excel canon, errors short-
+        // circuit the aggregate.
         //
-        // Interim contract (W5-99): `ExprPlan::Array` is an opaque arg
-        // to the registered scalar function; the dispatch path
-        // currently evaluates each arg via `eval_scalar_with_cache`
-        // BEFORE handing values to the function. So `SUM({1,2,3})`
-        // evaluates the inner `ExprPlan::Array` via the scalar arm,
-        // which returns `Value::Error(ErrorValue::Calc)` per the
-        // design-§-6.3 rule. SUM then propagates the error.
-        //
-        // TODO(Phase 4.7.G — W5-100+): once the unified
-        // `FunctionFn` ABI dispatches arrays as `FunctionArg::Array`,
-        // `SUM({1,#N/A,3})` should evaluate to `Value::Error(NA)`
-        // (Excel-canon: errors in an array short-circuit the
-        // aggregate). When that lands, this test will FAIL and serve
-        // as the migration trigger to update the assertion.
+        // Pre-W5-100 (W5-99 interim): this test asserted the array
+        // produced #CALC! at eval; the closure annotation expected
+        // this to FAIL once 4.7.G landed. W5-100 lands the
+        // array-in-aggregate-context expansion (design § 6.3); the
+        // assertion now expects the error-cell to propagate.
         let env = crate::env::MapEnv::new();
         let registry = ql_functions::default_registry();
         let cache = NoAggregateCache;
@@ -1287,8 +1306,173 @@ mod tests {
             ]])],
         };
         let v = eval_scalar_with_cache(&plan, &env, &registry, &cache);
-        // Interim: SUM sees a single arg = `#CALC!` (array-in-scalar),
-        // propagates `#CALC!`.
+        assert_eq!(v, Value::Error(ErrorValue::NA));
+    }
+
+    #[test]
+    fn array_literal_sum_with_only_numbers() {
+        // W5-100: `=SUM({1, 2, 3})` → 6.
+        let env = crate::env::MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Function {
+            name: std::sync::Arc::from("SUM"),
+            args: vec![ExprPlan::Array(vec![vec![
+                ExprPlan::Number(1.0),
+                ExprPlan::Number(2.0),
+                ExprPlan::Number(3.0),
+            ]])],
+        };
+        let v = eval_scalar_with_cache(&plan, &env, &registry, &cache);
+        assert_eq!(v, Value::Number(6.0));
+    }
+
+    #[test]
+    fn array_literal_average_with_only_numbers() {
+        // W5-100: `=AVERAGE({1, 2, 3, 4})` → 2.5.
+        let env = crate::env::MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Function {
+            name: std::sync::Arc::from("AVERAGE"),
+            args: vec![ExprPlan::Array(vec![vec![
+                ExprPlan::Number(1.0),
+                ExprPlan::Number(2.0),
+                ExprPlan::Number(3.0),
+                ExprPlan::Number(4.0),
+            ]])],
+        };
+        let v = eval_scalar_with_cache(&plan, &env, &registry, &cache);
+        assert_eq!(v, Value::Number(2.5));
+    }
+
+    #[test]
+    fn array_literal_sum_2d_array_row_major() {
+        // W5-100: `=SUM({1, 2; 3, 4})` → 10 (2x2 row-major).
+        let env = crate::env::MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Function {
+            name: std::sync::Arc::from("SUM"),
+            args: vec![ExprPlan::Array(vec![
+                vec![ExprPlan::Number(1.0), ExprPlan::Number(2.0)],
+                vec![ExprPlan::Number(3.0), ExprPlan::Number(4.0)],
+            ])],
+        };
+        let v = eval_scalar_with_cache(&plan, &env, &registry, &cache);
+        assert_eq!(v, Value::Number(10.0));
+    }
+
+    #[test]
+    fn array_literal_sum_mixed_with_scalar_arg() {
+        // W5-100: `=SUM({1, 2}, 3, 4)` → 10. Mixed array + scalar args.
+        let env = crate::env::MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Function {
+            name: std::sync::Arc::from("SUM"),
+            args: vec![
+                ExprPlan::Array(vec![vec![ExprPlan::Number(1.0), ExprPlan::Number(2.0)]]),
+                ExprPlan::Number(3.0),
+                ExprPlan::Number(4.0),
+            ],
+        };
+        let v = eval_scalar_with_cache(&plan, &env, &registry, &cache);
+        assert_eq!(v, Value::Number(10.0));
+    }
+
+    #[test]
+    fn array_literal_count_with_mixed_types() {
+        // W5-100: `=COUNT({1, "hello", TRUE, 4})` → 2 (only Numbers count).
+        // COUNT ignores non-numeric values per Excel canon.
+        let env = crate::env::MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Function {
+            name: std::sync::Arc::from("COUNT"),
+            args: vec![ExprPlan::Array(vec![vec![
+                ExprPlan::Number(1.0),
+                ExprPlan::String(std::sync::Arc::from("hello")),
+                ExprPlan::Bool(true),
+                ExprPlan::Number(4.0),
+            ]])],
+        };
+        let v = eval_scalar_with_cache(&plan, &env, &registry, &cache);
+        assert_eq!(v, Value::Number(2.0));
+    }
+
+    #[test]
+    fn array_literal_in_non_aggregate_function_still_calc_error() {
+        // W5-100: `=ABS({-1, -2})` is NOT an aggregate context. ABS
+        // expects a single scalar arg; the array evaluates as scalar
+        // → #CALC!, ABS propagates per error-arg rule. Excel's
+        // implicit-intersection behavior (which would pick the row
+        // for the calling cell) is Phase 4.9 work; v1 returns #CALC!.
+        let env = crate::env::MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Function {
+            name: std::sync::Arc::from("ABS"),
+            args: vec![ExprPlan::Array(vec![vec![
+                ExprPlan::Number(-1.0),
+                ExprPlan::Number(-2.0),
+            ]])],
+        };
+        let v = eval_scalar_with_cache(&plan, &env, &registry, &cache);
+        // Array → #CALC! at the arg position; ABS sees #CALC! and
+        // propagates.
         assert_eq!(v, Value::Error(ErrorValue::Calc));
+    }
+
+    #[test]
+    fn array_literal_sum_singleton() {
+        // W5-100: `=SUM({42})` → 42. Edge case: 1x1 array.
+        let env = crate::env::MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Function {
+            name: std::sync::Arc::from("SUM"),
+            args: vec![ExprPlan::Array(vec![vec![ExprPlan::Number(42.0)]])],
+        };
+        let v = eval_scalar_with_cache(&plan, &env, &registry, &cache);
+        assert_eq!(v, Value::Number(42.0));
+    }
+
+    #[test]
+    fn array_literal_max_with_negative_and_error() {
+        // W5-100: `=MAX({-5, -3, #N/A, -1})` → #N/A (error short-circuits).
+        let env = crate::env::MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Function {
+            name: std::sync::Arc::from("MAX"),
+            args: vec![ExprPlan::Array(vec![vec![
+                ExprPlan::Number(-5.0),
+                ExprPlan::Number(-3.0),
+                ExprPlan::Error(ErrorValue::NA),
+                ExprPlan::Number(-1.0),
+            ]])],
+        };
+        let v = eval_scalar_with_cache(&plan, &env, &registry, &cache);
+        assert_eq!(v, Value::Error(ErrorValue::NA));
+    }
+
+    #[test]
+    fn array_literal_max_without_error_short_circuit() {
+        // W5-100: `=MAX({-5, -3, -1})` → -1. Sanity check that MAX
+        // works correctly when no error cells are present.
+        let env = crate::env::MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Function {
+            name: std::sync::Arc::from("MAX"),
+            args: vec![ExprPlan::Array(vec![vec![
+                ExprPlan::Number(-5.0),
+                ExprPlan::Number(-3.0),
+                ExprPlan::Number(-1.0),
+            ]])],
+        };
+        let v = eval_scalar_with_cache(&plan, &env, &registry, &cache);
+        assert_eq!(v, Value::Number(-1.0));
     }
 }
