@@ -38,10 +38,13 @@ use ql_functions::format::{self, FormatString};
 use ql_functions::FunctionRegistry;
 use ql_io::CellWireValue;
 use ql_oplog::{Op, OpLog};
-use ql_storage::{FormatId, Workbook};
-use ql_types::{ColId, ErrorValue, EvalContext, RowId, SheetId, Value, MAX_COLUMN, MAX_ROW};
+use ql_storage::{FormatId, SpillShape, Workbook};
+use ql_types::{
+    ArrayValue, ColId, ErrorValue, EvalContext, RowId, SheetId, Value, MAX_COLUMN, MAX_ROW,
+};
 
 use crate::env::WorkbookEnv;
+use crate::eval_result::EvalResult;
 use crate::plan::{bind_with_names_and_sheets, BindError};
 use crate::plan_cache::{PlanCache, PlanCacheKey, PlanCacheStats};
 use crate::scalar::eval_scalar_with_registry;
@@ -515,22 +518,42 @@ impl<'a> WorkbookRuntime<'a> {
                     )?)
                 })?;
 
-        // Evaluate against the current workbook state. The env borrows immutably; we
-        // drop it before taking the mutable borrow for the write.
-        // Phase 3.6 (W5-39): if a calcgraph session is attached, route
-        // the eval through `eval_scalar_with_cache` so aggregate-range
-        // results land in the session's cache (next recompute on an
-        // unchanged range hits without re-scanning).
-        let value = {
+        // **W5-103 (Phase 4.7.J.2 / Codex W5-102 MEDIUM-4):** clear any
+        // PRIOR spill anchored at this cell BEFORE eval. Per design § 8.3:
+        // every re-eval at an anchor cell starts by dissolving the old
+        // footprint, EVEN IF the new result will block. Without this,
+        // a 3-row spill shrinking to 1 row would leave the old A2/A3
+        // computed entries in place; or a re-eval that blocks would
+        // self-block against its own old footprint.
+        //
+        // `clear_spill_if_present` is a no-op when no spill exists.
+        self.workbook.clear_spill_if_present((sheet, row, col));
+
+        // Evaluate at the cell boundary. Returns `EvalResult::Scalar`
+        // for every plan whose outermost node is non-Array; returns
+        // `EvalResult::Array` for top-level `ExprPlan::Array(_)` (and,
+        // later, array-returning functions — Phase 4.7.M/N).
+        //
+        // Phase 3.6 (W5-39): when a session is attached, route through
+        // `eval_scalar_with_cache` (inside `eval_at_cell_boundary`) so
+        // aggregate-range results land in the session's cache.
+        let result: EvalResult = {
             let env = WorkbookEnv::new(self.workbook);
             match self.graph.as_deref() {
-                Some(session) => crate::scalar::eval_scalar_with_cache(
+                Some(session) => crate::scalar::eval_at_cell_boundary(
                     plan.as_ref(),
                     &env,
                     self.registry,
                     session.aggregate_cache(),
                 ),
-                None => eval_scalar_with_registry(plan.as_ref(), &env, self.registry),
+                None => {
+                    // No session attached: synthesize a no-op cache.
+                    // The legacy `eval_scalar_with_registry` did the
+                    // equivalent through `NoAggregateCache`; we do the
+                    // same here for cell-boundary parity.
+                    let nc = crate::aggregate_cache::NoAggregateCache;
+                    crate::scalar::eval_at_cell_boundary(plan.as_ref(), &env, self.registry, &nc)
+                }
             }
         };
 
@@ -547,17 +570,22 @@ impl<'a> WorkbookRuntime<'a> {
             })?;
         }
 
-        // Persist formula text + evaluated value. Phase 3.5 (CORR-25):
-        // a formula's output goes to the COMPUTED overlay, not the user
-        // overlay; if the cell previously held a user-typed value, we
-        // clear that lane first so the user-first read cascade doesn't
-        // mask the new formula output. `put_at` can't fail because
-        // `validate_cell` at the top of this method already rejected
-        // out-of-range (sheet, row, col).
-        self.workbook.clear_user_at(sheet, row, col);
-        self.workbook
-            .put_computed_at(sheet, row, col, value.clone());
-        self.workbook.put_formula(sheet, row, col, formula_text);
+        // **Route by EvalResult variant.** Scalar takes the existing
+        // single-cell write path; Array routes to spill writeback.
+        let anchor_value = match result {
+            EvalResult::Scalar(v) => {
+                // Existing scalar persistence path. Phase 3.5 (CORR-25):
+                // a formula's output goes to the COMPUTED overlay, not
+                // the user overlay; clear any stale user-overlay entry
+                // first so the user-first read cascade doesn't mask
+                // the new output.
+                self.workbook.clear_user_at(sheet, row, col);
+                self.workbook.put_computed_at(sheet, row, col, v.clone());
+                self.workbook.put_formula(sheet, row, col, formula_text);
+                v
+            }
+            EvalResult::Array(array) => self.write_spill(sheet, row, col, array, formula_text),
+        };
 
         // Phase 3.1: notify calcgraph after the workbook mutation
         // succeeds. Phase 3.2 (2026-05-12): pass the already-bound
@@ -571,7 +599,122 @@ impl<'a> WorkbookRuntime<'a> {
             g.on_set_formula(sheet, row, col, plan.as_ref(), self.workbook);
         }
 
-        Ok(value)
+        Ok(anchor_value)
+    }
+
+    /// **W5-103 (Phase 4.7.J.2)** — spill writeback path. Called from
+    /// `set_formula` when `eval_at_cell_boundary` returns
+    /// `EvalResult::Array`. Performs (per design § 8.1):
+    ///
+    /// 1. Degenerate check (`rows == 0 || cols == 0` → `#CALC!`).
+    /// 2. Bounds check (anchor + shape fits within grid → `#SPILL!`).
+    /// 3. Blocking check (any non-anchor target cell occupied → `#SPILL!`).
+    /// 4. Happy path: `register_spill` then `put_computed_at` for every
+    ///    cell in the rectangle.
+    ///
+    /// Anchor cell ALWAYS gets a formula association (`put_formula`).
+    /// Non-anchor targets are formula-less per design § 8.2.
+    ///
+    /// **What about target-cell calcgraph invalidation?** That's Phase
+    /// 4.7.J.3 (Codex W5-102 MEDIUM-1). This sub-phase only handles
+    /// storage-layer writeback.
+    fn write_spill(
+        &mut self,
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        array: ArrayValue,
+        formula_text: Arc<str>,
+    ) -> Value {
+        // Degenerate-array origin is a function-eval contract (e.g.
+        // FILTER with all-false mask without if_empty). Surface as
+        // #CALC!, NOT #SPILL!. Design § 8.1 step c.
+        if array.is_degenerate() {
+            let err = Value::Error(ErrorValue::Calc);
+            self.workbook.clear_user_at(sheet, row, col);
+            self.workbook.put_computed_at(sheet, row, col, err.clone());
+            self.workbook.put_formula(sheet, row, col, formula_text);
+            return err;
+        }
+
+        // Bounds check. `array.rows() / cols()` are `>= 1` (degenerate
+        // path above caught zero). The last cell sits at
+        // `(row + rows - 1, col + cols - 1)` — both must satisfy
+        // `<= MAX_ROW / MAX_COLUMN`.
+        let last_row_offset = array.rows() - 1;
+        let last_col_offset = array.cols() - 1;
+        let end_row = row.checked_add(last_row_offset);
+        let end_col = col.checked_add(last_col_offset);
+        let out_of_bounds =
+            !matches!((end_row, end_col), (Some(r), Some(c)) if r <= MAX_ROW && c <= MAX_COLUMN);
+        if out_of_bounds {
+            let err = Value::Error(ErrorValue::Spill);
+            self.workbook.clear_user_at(sheet, row, col);
+            self.workbook.put_computed_at(sheet, row, col, err.clone());
+            self.workbook.put_formula(sheet, row, col, formula_text);
+            return err;
+        }
+
+        // Blocking check. For every NON-ANCHOR cell in the spill
+        // rectangle, the cell must be "spill-empty": no formula, no
+        // value (user or computed), no other spill anchor. The clear-old
+        // step at the top of `set_formula` already removed THIS anchor's
+        // prior footprint, so any remaining non-blank computed entry
+        // here came from elsewhere.
+        for dr in 0..array.rows() {
+            for dc in 0..array.cols() {
+                if dr == 0 && dc == 0 {
+                    continue;
+                }
+                let r = row + dr;
+                let c = col + dc;
+                let occupied = self.workbook.spill_anchor_at(sheet, r, c).is_some()
+                    || self.workbook.formula_at(sheet, r, c).is_some()
+                    || self
+                        .workbook
+                        .sheet(sheet)
+                        .map(|s| s.read(r, c))
+                        .unwrap_or(Value::Blank)
+                        != Value::Blank;
+                if occupied {
+                    let err = Value::Error(ErrorValue::Spill);
+                    self.workbook.clear_user_at(sheet, row, col);
+                    self.workbook.put_computed_at(sheet, row, col, err.clone());
+                    self.workbook.put_formula(sheet, row, col, formula_text);
+                    return err;
+                }
+            }
+        }
+
+        // Happy path. Register the spill THEN materialize cells.
+        // `register_spill` enforces invariants (no anchor collision,
+        // no target/anchor footprint overlap with OTHER spills, bounds).
+        // The blocking check above proved no value/formula collision.
+        let shape = SpillShape::new(array.rows(), array.cols());
+        match self.workbook.register_spill((sheet, row, col), shape) {
+            Ok(()) => {}
+            Err(e) => panic!(
+                "W5-103: register_spill failed after blocker check passed — \
+                 the blocker check is incomplete or SpillAnchorTable has \
+                 a hidden invariant. error: {:?}",
+                e
+            ),
+        }
+
+        // Write each target cell to computed overlay. Anchor gets the
+        // (0,0) value; the rest follow row-major order.
+        self.workbook.clear_user_at(sheet, row, col);
+        for dr in 0..array.rows() {
+            for dc in 0..array.cols() {
+                let v = array.at(dr, dc).clone();
+                self.workbook.put_computed_at(sheet, row + dr, col + dc, v);
+            }
+        }
+        self.workbook.put_formula(sheet, row, col, formula_text);
+
+        // Excel's anchor return value = the (0,0) cell of the array.
+        // Callers (formula bar UI, op-log replay) see this.
+        array.at(0, 0).clone()
     }
 
     /// Set a cell to a literal value (no formula). Clears any existing formula
@@ -5516,6 +5659,225 @@ mod tests {
             wb.read(ql_types::Address::new(s0, 0, 0)),
             Value::Number(0.21),
             "cache invalidation: sheet-scoped value should win after registration"
+        );
+    }
+
+    // ===== W5-103 (Phase 4.7.J.2) — spill writeback =====
+    //
+    // Tests for array formula writeback. Per design § 8.1:
+    //   1. Scalar path unchanged (regression coverage above).
+    //   2. Array literal at A1 → spills to A1:A1+rows-1 × A1:A1+cols-1.
+    //   3. Clear-old: re-setting an array formula at the same cell
+    //      first dissolves the prior spill.
+    //   4. Blocking: any non-anchor target with a value/formula/anchor
+    //      → anchor gets #SPILL!, no targets written.
+    //   5. Bounds: anchor + shape exceeds MAX_ROW/MAX_COLUMN → anchor
+    //      gets #SPILL!, no registration.
+
+    /// Phase 4.7.J.2 — happy path: `={1,2,3}` at A1 spills 1×3 across
+    /// A1, B1, C1. Return value is array.at(0,0) = 1.
+    #[test]
+    fn set_formula_array_literal_horizontal_spills_1x3() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        let v = rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+        assert_eq!(v, Value::Number(1.0), "anchor return is array (0,0)");
+        // All three cells materialized in the computed overlay.
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Number(1.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(2.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Number(3.0));
+        // Anchor has formula text; non-anchors do not (design § 8.2).
+        assert!(wb.formula_at(0, 0, 0).is_some());
+        assert!(wb.formula_at(0, 0, 1).is_none());
+        assert!(wb.formula_at(0, 0, 2).is_none());
+        // Spill anchor registered.
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(1, 3))
+        );
+        // Reverse lookup: B1 and C1 map back to A1.
+        assert_eq!(wb.spill_target_anchor(0, 0, 1), Some((0, 0, 0)));
+        assert_eq!(wb.spill_target_anchor(0, 0, 2), Some((0, 0, 0)));
+    }
+
+    /// Phase 4.7.J.2 — happy path: `={1;2;3}` at A1 spills 3×1 down
+    /// (vertical: semicolons are row separators per design § 3.1).
+    #[test]
+    fn set_formula_array_literal_vertical_spills_3x1() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        let v = rt.set_formula(0, 0, 0, "{1; 2; 3}").unwrap();
+        assert_eq!(v, Value::Number(1.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Number(1.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 0)), Value::Number(2.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 2, 0)), Value::Number(3.0));
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(3, 1))
+        );
+    }
+
+    /// Phase 4.7.J.2 — happy path: 2×2. `{1,2;3,4}` → A1=1, B1=2, A2=3, B2=4.
+    #[test]
+    fn set_formula_array_literal_2x2_spills() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        rt.set_formula(0, 0, 0, "{1, 2; 3, 4}").unwrap();
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Number(1.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(2.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 0)), Value::Number(3.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 1)), Value::Number(4.0));
+    }
+
+    /// Phase 4.7.J.2 — clear-old: re-setting an array formula at the
+    /// same anchor with a SMALLER shape leaves no orphan cells from
+    /// the prior footprint. Per design § 8.3.
+    #[test]
+    fn set_formula_array_shrinks_clears_old_footprint() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // First: 3-cell horizontal spill.
+        rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+
+        // Then: 1-cell array at the same anchor. The clear-old step
+        // must dissolve the prior 1×3 footprint BEFORE evaluating
+        // the new one, so the new 1×1 doesn't see its own old B1/C1
+        // entries as blockers, AND B1/C1 are blank in the final state.
+        rt.set_formula(0, 0, 0, "{9}").unwrap();
+        drop(rt);
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Number(9.0));
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Blank,
+            "old B1 must be cleared by clear-old"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 2)),
+            Value::Blank,
+            "old C1 must be cleared by clear-old"
+        );
+        // New shape registered; reverse map no longer points B1/C1 → A1.
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(1, 1))
+        );
+        assert_eq!(wb.spill_target_anchor(0, 0, 1), None);
+    }
+
+    /// Phase 4.7.J.2 — scalar-after-array: re-setting an anchor cell
+    /// with a SCALAR formula dissolves the prior spill entirely.
+    #[test]
+    fn set_formula_scalar_after_array_clears_spill_state() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+        rt.set_formula(0, 0, 0, "42").unwrap();
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Number(42.0)
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Blank);
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Blank);
+        assert_eq!(wb.spill_anchor_at(0, 0, 0), None);
+    }
+
+    /// Phase 4.7.J.2 — blocking: B1 has a user value `=5`. Setting
+    /// `={1,2}` at A1 (1×2 spill A1:B1) sees B1 occupied → anchor gets
+    /// #SPILL!, no targets registered, no targets overwritten.
+    #[test]
+    fn set_formula_array_blocked_by_user_value_at_target() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // B1 = literal 5 (user lane).
+        rt.set_value(0, 0, 1, Value::Number(5.0)).unwrap();
+        // Try to spill 1×2 from A1.
+        let v = rt.set_formula(0, 0, 0, "{1, 2}").unwrap();
+        assert_eq!(v, Value::Error(ErrorValue::Spill));
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Error(ErrorValue::Spill)
+        );
+        // B1 untouched (still holds user 5).
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(5.0));
+        // No spill registered.
+        assert_eq!(wb.spill_anchor_at(0, 0, 0), None);
+        // Anchor still has formula text (so re-eval after blocker clears
+        // can spill correctly — design § 9.2).
+        assert_eq!(wb.formula_at(0, 0, 0).map(|s| s.as_ref()), Some("{1, 2}"));
+    }
+
+    /// Phase 4.7.J.2 — blocking: B1 has its own formula (computed
+    /// output `=10+10`). Setting `={1,2}` at A1 sees B1 occupied →
+    /// anchor #SPILL!, B1's formula untouched.
+    #[test]
+    fn set_formula_array_blocked_by_formula_at_target() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        rt.set_formula(0, 0, 1, "10 + 10").unwrap();
+        let v = rt.set_formula(0, 0, 0, "{1, 2}").unwrap();
+        assert_eq!(v, Value::Error(ErrorValue::Spill));
+        // B1 still holds its own formula's output.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Number(20.0)
+        );
+        assert_eq!(
+            wb.formula_at(0, 0, 1).map(|s| s.as_ref()),
+            Some("10 + 10"),
+            "B1's formula must NOT be removed by a blocked spill"
+        );
+        assert_eq!(wb.spill_anchor_at(0, 0, 0), None);
+    }
+
+    /// Phase 4.7.J.2 — out-of-bounds spill: anchor at MAX_ROW with a
+    /// 3-row vertical array → end_row exceeds grid → anchor #SPILL!.
+    #[test]
+    fn set_formula_array_out_of_bounds_returns_spill() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // Anchor at the LAST row in the grid. `{1;2;3}` would need
+        // 3 rows starting from MAX_ROW → out of bounds.
+        let v = rt.set_formula(0, MAX_ROW, 0, "{1; 2; 3}");
+        // Anchor cell validation passes (MAX_ROW is in range). Eval
+        // produces ArrayValue. Bounds check at writeback fails.
+        assert_eq!(v.unwrap(), Value::Error(ErrorValue::Spill));
+        drop(rt);
+        assert_eq!(wb.spill_anchor_at(0, MAX_ROW, 0), None);
+    }
+
+    /// Phase 4.7.J.2 — clear-old idempotency: setting the SAME array
+    /// twice at the same anchor produces stable state (no infinite
+    /// re-spill, no self-blocking).
+    #[test]
+    fn set_formula_array_same_formula_twice_is_stable() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+        let v = rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+        assert_eq!(v, Value::Number(1.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(2.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Number(3.0));
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(1, 3))
         );
     }
 }
