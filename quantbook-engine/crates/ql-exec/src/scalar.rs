@@ -79,6 +79,19 @@ pub fn eval_scalar<E: CellEnv>(plan: &ExprPlan, env: &E) -> Value {
         // semantics must go through `eval_scalar_with_registry` or
         // `eval_scalar_with_cache`.
         ExprPlan::AggregateNameRef { .. } => Value::Error(ErrorValue::Calc),
+        // **W5-99 (Phase 4.7.F):** error literal — return the error
+        // value directly. Used by `=#REF!` formulas and error literals
+        // inside array cells.
+        ExprPlan::Error(ev) => Value::Error(*ev),
+        // **W5-99 (Phase 4.7.F):** array literal in scalar context.
+        // Per design § 6.3 (Codex HIGH-2 fix): array-in-scalar-context
+        // surfaces as `#CALC!`. This applies to the cell-boundary
+        // ALSO until the runtime spill path lands in W5-102 / 4.7.J;
+        // for now, even array literals at the cell root produce
+        // `#CALC!`. The spill path will route around this by detecting
+        // `ExprPlan::Array` at the cell-boundary BEFORE calling
+        // `eval_scalar_*` and materializing an `ArrayValue` instead.
+        ExprPlan::Array(_) => Value::Error(ErrorValue::Calc),
     }
 }
 
@@ -249,6 +262,15 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
         // supposed to surface `BindError::NamedRangeInScalarContext`
         // before we ever evaluate. Defensive fallback: `#CALC!`.
         ExprPlan::AggregateNameRef { .. } => Value::Error(ErrorValue::Calc),
+        // **W5-99 (Phase 4.7.F):** error literal — return the error
+        // value directly. Same shape as the no-registry `eval_scalar`
+        // arm above.
+        ExprPlan::Error(ev) => Value::Error(*ev),
+        // **W5-99 (Phase 4.7.F):** array literal in scalar context →
+        // `#CALC!` per design § 6.3. Cell-boundary detection (the spill
+        // path) lands in W5-102 / Phase 4.7.J; until then, every
+        // `ExprPlan::Array` evaluation produces `#CALC!`.
+        ExprPlan::Array(_) => Value::Error(ErrorValue::Calc),
     }
 }
 
@@ -1173,5 +1195,63 @@ mod tests {
         // called BEFORE `lookup_context_aware`. The earlier
         // `range_aware_lookup_returns_registered_function` test pins
         // that the range_aware table is consulted first via SUMIF.
+    }
+
+    // ===== W5-99 (Phase 4.7.F) — Expr::Error + Expr::Array eval =====
+
+    #[test]
+    fn eval_scalar_expr_plan_error_returns_value_error() {
+        let env = crate::env::MapEnv::new();
+        let plan = ExprPlan::Error(ErrorValue::Ref);
+        assert_eq!(eval_scalar(&plan, &env), Value::Error(ErrorValue::Ref));
+        let plan = ExprPlan::Error(ErrorValue::NA);
+        assert_eq!(eval_scalar(&plan, &env), Value::Error(ErrorValue::NA));
+    }
+
+    #[test]
+    fn eval_scalar_expr_plan_array_in_scalar_context_returns_calc_error() {
+        // Per design § 6.3 (Codex HIGH-2): array-in-scalar-context →
+        // `#CALC!`. The cell-boundary spill path is Phase 4.7.J;
+        // until then, every ExprPlan::Array evaluation through the
+        // scalar evaluator produces #CALC!.
+        let env = crate::env::MapEnv::new();
+        let plan = ExprPlan::Array(vec![vec![ExprPlan::Number(1.0), ExprPlan::Number(2.0)]]);
+        assert_eq!(eval_scalar(&plan, &env), Value::Error(ErrorValue::Calc));
+    }
+
+    #[test]
+    fn eval_scalar_with_cache_expr_plan_error_returns_value_error() {
+        // The cache-aware entry point has its own copy of the variant
+        // arm; verify it behaves identically.
+        let env = crate::env::MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Error(ErrorValue::DivZero);
+        let v = eval_scalar_with_cache(&plan, &env, &registry, &cache);
+        assert_eq!(v, Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn eval_scalar_with_cache_expr_plan_array_returns_calc_error() {
+        let env = crate::env::MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Array(vec![vec![ExprPlan::Number(7.0)]]);
+        let v = eval_scalar_with_cache(&plan, &env, &registry, &cache);
+        assert_eq!(v, Value::Error(ErrorValue::Calc));
+    }
+
+    #[test]
+    fn binary_op_with_error_literal_propagates() {
+        // `=1 + #N/A` → #N/A via Excel's left-error-wins rule applied
+        // after evaluation. The error literal at the RHS propagates
+        // through `eval_binary`.
+        let env = crate::env::MapEnv::new();
+        let plan = ExprPlan::Binary {
+            op: Operator::Plus,
+            lhs: Box::new(ExprPlan::Number(1.0)),
+            rhs: Box::new(ExprPlan::Error(ErrorValue::NA)),
+        };
+        assert_eq!(eval_scalar(&plan, &env), Value::Error(ErrorValue::NA));
     }
 }

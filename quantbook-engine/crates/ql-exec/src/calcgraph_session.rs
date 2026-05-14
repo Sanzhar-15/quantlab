@@ -233,6 +233,13 @@ pub(crate) fn walk_plan_for_deps(plan: &ExprPlan, deps: &mut FormulaDeps) {
             deps.named_ranges.push((Arc::clone(name), *range));
             deps.names.push(Arc::clone(name));
         }
+        // **W5-99 (Phase 4.7.F):** array-literal and error-literal plans
+        // have NO dependencies — they're pure constants. Array cells
+        // are also restricted to literals (Number/Bool/String/Error),
+        // so even walking the inner cells would yield zero deps.
+        ExprPlan::Array(_) | ExprPlan::Error(_) => {
+            // No deps; leaf literals.
+        }
     }
 }
 

@@ -78,6 +78,34 @@ pub enum ExprPlan {
         /// directly rather than re-looking-up the name.
         range: Range,
     },
+
+    /// **W5-99 (Phase 4.7.F):** array literal lowered from `Expr::Array`.
+    /// Row-major; outer `Vec` is rows, inner `Vec` is cells. Element-arity
+    /// is invariant — every row has the same length. The binder enforces
+    /// this (`BindError::ArrayRowArityMismatch`) on every public input AND
+    /// the parser already enforces it (`ParseError::ArrayRowArityMismatch`);
+    /// defense in depth — the binder can't trust the AST because
+    /// `Expr::Array` is a public variant that tests / tools can construct
+    /// directly with ragged shapes.
+    ///
+    /// Inner `ExprPlan`s are restricted to the array-cell subset per
+    /// design § 3.3: `Number` / `Bool` / `String` / `Error`. Cell-refs,
+    /// function calls, and nested arrays are NOT permitted in v1 (already
+    /// rejected at parse time via `ParseError::InvalidArrayCellToken`).
+    /// The binder validates the same subset as defense in depth.
+    ///
+    /// Eval-site dispatch: Phase 4.7.G (W5-101). The runtime materializes
+    /// an `ArrayValue` from this plan and routes to either the cell-
+    /// boundary spill path (cell context) or `#CALC!` (scalar context),
+    /// per design § 6.3.
+    Array(Vec<Vec<ExprPlan>>),
+
+    /// **W5-99 (Phase 4.7.F):** error-sigil literal lowered from
+    /// `Expr::Error(ev)`. The evaluator returns `Value::Error(ev)` directly;
+    /// the lowering is mechanical (no resolution, no context). Used by
+    /// `=#REF!` formulas, `IFERROR(..., #N/A)` fallback args, and error
+    /// literals inside `Expr::Array` cells.
+    Error(ErrorValue),
 }
 
 /// Error during binding. Phase 2A.1 added `UnresolvedName`; Phase 2A.6 added
@@ -145,6 +173,28 @@ pub enum BindError {
     /// before any runtime read; closes XS-4-01.
     #[error("unknown sheet {0:?}")]
     UnknownSheet(Arc<str>),
+
+    /// **W5-99 (Phase 4.7.F):** `Expr::Array` row N has a different
+    /// length than row 0. The parser already enforces uniform arity
+    /// (`ParseError::ArrayRowArityMismatch`), but `Expr::Array` is a
+    /// PUBLIC variant — tests and tools can construct ragged arrays
+    /// directly. Defense-in-depth: the binder rejects ragged shapes
+    /// with this error rather than panicking (Codex MEDIUM-5 in the
+    /// W5-94 design review).
+    #[error("array literal row {row} has {found} cell(s), expected {expected} (matching row 0)")]
+    ArrayRowArityMismatch { expected: u32, found: u32, row: u32 },
+
+    /// **W5-99 (Phase 4.7.F):** `Expr::Array` contains a cell that
+    /// isn't in the bind-allowed subset (Number / Bool / String /
+    /// Error). The parser already restricts cell tokens at parse
+    /// time, but defense-in-depth applies to tests / tools that
+    /// construct `Expr::Array` directly. Lists what was found.
+    #[error("array literal contains a non-literal cell at row {row}, col {col}: {got}")]
+    ArrayCellNotLiteral {
+        row: u32,
+        col: u32,
+        got: &'static str,
+    },
 }
 
 /// Phase 2B.4 (2026-05-12): bind-time context for a sub-expression. Drives
@@ -352,15 +402,70 @@ fn bind_with_context<L: NameLookup>(
                 args: bound_args,
             })
         }
-        Expr::Array(_) => Err(BindError::UnsupportedVariant(
-            "Array literals — binder support lands in Phase 4.7.F (W5-100)",
-        )),
+        // **W5-99 (Phase 4.7.F):** lower `Expr::Array` to
+        // `ExprPlan::Array`. Per design § 5, this is element-wise +
+        // enforces uniform row arity AND the restricted cell-kind subset
+        // (Number / Bool / String / Error). The parser already validates
+        // both; this is defense in depth against direct AST construction.
+        Expr::Array(rows) => {
+            if rows.is_empty() {
+                // The parser rejects `{}` with EmptyArrayLiteral, but a
+                // direct AST construction with `vec![]` could land here.
+                // No dedicated bind-error variant — surface as a clean
+                // UnsupportedVariant for the degenerate construction.
+                return Err(BindError::UnsupportedVariant(
+                    "Expr::Array with zero rows is not constructible from source; \
+                     direct AST construction with an empty Vec is rejected",
+                ));
+            }
+            let expected_arity = rows[0].len() as u32;
+            let mut bound_rows: Vec<Vec<ExprPlan>> = Vec::with_capacity(rows.len());
+            for (row_idx, row) in rows.iter().enumerate() {
+                let found_arity = row.len() as u32;
+                if found_arity != expected_arity {
+                    return Err(BindError::ArrayRowArityMismatch {
+                        expected: expected_arity,
+                        found: found_arity,
+                        row: row_idx as u32,
+                    });
+                }
+                let mut bound_row: Vec<ExprPlan> = Vec::with_capacity(row.len());
+                for (col_idx, cell) in row.iter().enumerate() {
+                    let bound_cell = match cell {
+                        Expr::Number(n) => ExprPlan::Number(*n),
+                        Expr::Bool(b) => ExprPlan::Bool(*b),
+                        Expr::String(s) => ExprPlan::String(s.clone()),
+                        Expr::Error(ev) => ExprPlan::Error(*ev),
+                        // Per design § 3.3 / parser restriction: only the
+                        // four literal kinds are allowed inside an array
+                        // cell. Reject everything else loudly so a future
+                        // test that constructs `Expr::Array(vec![vec![
+                        // Expr::CellRef(_)]])` directly surfaces a clean
+                        // error rather than silently producing a corrupt
+                        // ExprPlan.
+                        other => {
+                            return Err(BindError::ArrayCellNotLiteral {
+                                row: row_idx as u32,
+                                col: col_idx as u32,
+                                got: variant_kind(other),
+                            });
+                        }
+                    };
+                    bound_row.push(bound_cell);
+                }
+                bound_rows.push(bound_row);
+            }
+            Ok(ExprPlan::Array(bound_rows))
+        }
+
         Expr::Spill(_) => Err(BindError::UnsupportedVariant(
             "Spill-range-ref `A1#` syntax is Phase 4.9",
         )),
-        Expr::Error(_) => Err(BindError::UnsupportedVariant(
-            "Error literals — binder support lands in Phase 4.7.F (W5-100)",
-        )),
+
+        // **W5-99 (Phase 4.7.F):** error literal — mechanical lowering.
+        // No resolution, no context. The evaluator returns
+        // `Value::Error(ev)` directly.
+        Expr::Error(ev) => Ok(ExprPlan::Error(*ev)),
         Expr::NameRef(name) => {
             // Phase 2A.6 audit M1: parser-emitted `NameRef` must always carry a
             // non-empty canonical name. An empty name here means the parser is
@@ -481,6 +586,26 @@ pub(crate) struct EmptySheetResolver;
 impl SheetResolver for EmptySheetResolver {
     fn resolve_sheet(&self, _name: &str) -> Option<SheetId> {
         None
+    }
+}
+
+/// **W5-99 (Phase 4.7.F):** human-readable variant tag for the
+/// `ArrayCellNotLiteral` error message. Used only on the error
+/// path so the cost is irrelevant.
+fn variant_kind(e: &Expr) -> &'static str {
+    match e {
+        Expr::Number(_) => "Number",
+        Expr::Bool(_) => "Bool",
+        Expr::String(_) => "String",
+        Expr::Error(_) => "Error",
+        Expr::CellRef(_) => "CellRef",
+        Expr::RangeRef(_) => "RangeRef",
+        Expr::Binary { .. } => "Binary",
+        Expr::Unary { .. } => "Unary",
+        Expr::Function { .. } => "Function",
+        Expr::Array(_) => "Array",
+        Expr::Spill(_) => "Spill",
+        Expr::NameRef(_) => "NameRef",
     }
 }
 
@@ -811,6 +936,152 @@ mod tests {
                 other => panic!("expected nested CellRef, got {other:?}"),
             },
             other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    // ===== W5-99 (Phase 4.7.F) — Expr::Array + Expr::Error lowering =====
+
+    #[test]
+    fn bind_error_literal_lowers_to_expr_plan_error() {
+        let expr = Expr::Error(ErrorValue::Ref);
+        let p = bind(&expr, 0).expect("bind");
+        match p {
+            ExprPlan::Error(ev) => assert_eq!(ev, ErrorValue::Ref),
+            other => panic!("expected ExprPlan::Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_array_literal_lowers_element_wise() {
+        // `{1, "hi"; TRUE, #N/A}` — 2x2 with all four allowed cell kinds.
+        let expr = Expr::Array(vec![
+            vec![Expr::Number(1.0), Expr::String(Arc::from("hi"))],
+            vec![Expr::Bool(true), Expr::Error(ErrorValue::NA)],
+        ]);
+        let p = bind(&expr, 0).expect("bind");
+        match p {
+            ExprPlan::Array(rows) => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0].len(), 2);
+                assert!(matches!(rows[0][0], ExprPlan::Number(n) if n == 1.0));
+                match &rows[0][1] {
+                    ExprPlan::String(s) => assert_eq!(s.as_ref(), "hi"),
+                    other => panic!("expected String, got {other:?}"),
+                }
+                assert!(matches!(rows[1][0], ExprPlan::Bool(true)));
+                assert!(matches!(rows[1][1], ExprPlan::Error(ErrorValue::NA)));
+            }
+            other => panic!("expected ExprPlan::Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_array_literal_rejects_ragged_via_arity_error() {
+        // Direct-AST construction of a ragged array. The PARSER would
+        // reject this via `ParseError::ArrayRowArityMismatch`, but the
+        // binder is defense in depth — `Expr::Array` is a public
+        // variant.
+        let expr = Expr::Array(vec![
+            vec![Expr::Number(1.0), Expr::Number(2.0)],
+            vec![Expr::Number(3.0)],
+        ]);
+        let err = bind(&expr, 0).unwrap_err();
+        match err {
+            BindError::ArrayRowArityMismatch {
+                expected,
+                found,
+                row,
+            } => {
+                assert_eq!(expected, 2);
+                assert_eq!(found, 1);
+                assert_eq!(row, 1);
+            }
+            other => panic!("expected ArrayRowArityMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_array_literal_rejects_non_literal_cell() {
+        // Array cell containing a CellRef — parser wouldn't emit this,
+        // but defense in depth covers direct AST construction.
+        let expr = Expr::Array(vec![vec![
+            Expr::Number(1.0),
+            Expr::CellRef(CellAddr {
+                sheet: SheetRef::Current,
+                col: 0,
+                row: 0,
+                abs_col: false,
+                abs_row: false,
+            }),
+        ]]);
+        let err = bind(&expr, 0).unwrap_err();
+        match err {
+            BindError::ArrayCellNotLiteral { row, col, got } => {
+                assert_eq!(row, 0);
+                assert_eq!(col, 1);
+                assert_eq!(got, "CellRef");
+            }
+            other => panic!("expected ArrayCellNotLiteral, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_array_literal_rejects_nested_array() {
+        // Nested array — `Expr::Array` inside an array cell. Parser
+        // rejects this with InvalidArrayCellToken; binder rejects with
+        // ArrayCellNotLiteral.
+        let expr = Expr::Array(vec![vec![
+            Expr::Number(1.0),
+            Expr::Array(vec![vec![Expr::Number(2.0)]]),
+        ]]);
+        let err = bind(&expr, 0).unwrap_err();
+        match err {
+            BindError::ArrayCellNotLiteral { got, .. } => assert_eq!(got, "Array"),
+            other => panic!("expected ArrayCellNotLiteral, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_array_literal_zero_rows_rejects() {
+        // Direct construction with no rows. Parser doesn't emit (rejects
+        // `{}` with EmptyArrayLiteral); binder surfaces UnsupportedVariant.
+        let expr = Expr::Array(vec![]);
+        let err = bind(&expr, 0).unwrap_err();
+        assert!(matches!(err, BindError::UnsupportedVariant(_)));
+    }
+
+    #[test]
+    fn bind_array_literal_singleton_lowers() {
+        // 1x1 array — degenerate but valid.
+        let expr = Expr::Array(vec![vec![Expr::Number(42.0)]]);
+        let p = bind(&expr, 0).expect("bind");
+        match p {
+            ExprPlan::Array(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].len(), 1);
+                assert!(matches!(rows[0][0], ExprPlan::Number(n) if n == 42.0));
+            }
+            other => panic!("expected ExprPlan::Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_array_literal_3x2_lowers() {
+        // 3x2 — exercises the arity-check loop past the second row.
+        let expr = Expr::Array(vec![
+            vec![Expr::Number(1.0), Expr::Number(2.0)],
+            vec![Expr::Number(3.0), Expr::Number(4.0)],
+            vec![Expr::Number(5.0), Expr::Number(6.0)],
+        ]);
+        let p = bind(&expr, 0).expect("bind");
+        match p {
+            ExprPlan::Array(rows) => {
+                assert_eq!(rows.len(), 3);
+                for row in &rows {
+                    assert_eq!(row.len(), 2);
+                }
+            }
+            other => panic!("expected ExprPlan::Array, got {other:?}"),
         }
     }
 }
