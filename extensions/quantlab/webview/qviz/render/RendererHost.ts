@@ -31,6 +31,7 @@
  */
 
 import type { QvizSpec } from '../../../src/qviz/spec';
+import type { TransformAttribution } from '../../../src/qviz/messageProtocol';
 import type { ColumnData, QvizTheme, TimeseriesPlan, GeneralPlan } from '../../../src/qviz/render/types';
 import {
 	compileTimeseriesPlan, CompilePlanError,
@@ -55,12 +56,18 @@ type ChartFamily = QvizSpec['chart']['family'];
  *  stubs to verify dispose semantics without the heavy dependencies
  *  (Step 5.E.3 leak test). */
 export interface RendererAppliers {
-	readonly compileTimeseries: (spec: QvizSpec, cols: ColumnData, theme: QvizTheme) => TimeseriesPlan;
+	readonly compileTimeseries: (
+		spec: QvizSpec, cols: ColumnData, theme: QvizTheme,
+		attribution?: readonly TransformAttribution[] | null,
+	) => TimeseriesPlan;
 	readonly applyTimeseries: (
 		container: HTMLElement, plan: TimeseriesPlan, existing?: ChartHandle,
 	) => ChartHandle;
 	readonly disposeTimeseries: (chart: ChartHandle, container?: HTMLElement) => void;
-	readonly compileGeneral: (spec: QvizSpec, cols: ColumnData, theme: QvizTheme) => GeneralPlan;
+	readonly compileGeneral: (
+		spec: QvizSpec, cols: ColumnData, theme: QvizTheme,
+		attribution?: readonly TransformAttribution[] | null,
+	) => GeneralPlan;
 	readonly applyGeneral: (
 		container: HTMLElement, plan: GeneralPlan, existing?: VegaEmbedHandle,
 	) => Promise<VegaEmbedHandle>;
@@ -150,6 +157,7 @@ export class RendererHost {
 	 */
 	async render(
 		spec: QvizSpec, columns: ColumnData, theme: QvizTheme,
+		attribution?: readonly TransformAttribution[] | null,
 	): Promise<RenderResult> {
 		if (this.disposed) {
 			return { ok: false, error: 'RendererHost has been disposed', stage: 'apply' };
@@ -172,7 +180,7 @@ export class RendererHost {
 		if (family === 'timeseries') {
 			let plan;
 			try {
-				plan = this.appliers.compileTimeseries(spec, columns, theme);
+				plan = this.appliers.compileTimeseries(spec, columns, theme, attribution);
 			} catch (e) {
 				if (e instanceof CompilePlanError) {
 					return { ok: false, error: e.message, stage: 'compile', errorName: (e as Error).name };
@@ -201,7 +209,7 @@ export class RendererHost {
 		// family === 'general'
 		let plan;
 		try {
-			plan = this.appliers.compileGeneral(spec, columns, theme);
+			plan = this.appliers.compileGeneral(spec, columns, theme, attribution);
 		} catch (e) {
 			if (e instanceof CompileGeneralPlanError) {
 				return { ok: false, error: e.message, stage: 'compile', errorName: (e as Error).name };

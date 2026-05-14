@@ -414,6 +414,107 @@ suite('qviz state -- query slice (stale-result attribution)', () => {
 		assert.deepStrictEqual(next.query.lastData?.arrow, new Uint8Array([1, 2, 3]));
 	});
 
+	test('Front 2: dataReceived without attribution stores null in lastData.attribution', () => {
+		// Pre-Front-2 daemon (or post-Front-2 daemon with no transforms
+		// in spec). The reducer must default the field to null, not
+		// undefined or [] — null carries "no attribution data available"
+		// semantics that the renderer can branch on.
+		const sh = computeSpecHash(spec());
+		const s = setUpRequest(1, sh);
+		const next = rootReduce(s, {
+			type: 'dataReceived', requestId: 1, specHash: sh,
+			arrow: new Uint8Array(), elapsedMs: 0, cached: false, diagnostics: [],
+		});
+		assert.strictEqual(next.query.lastData?.attribution, null);
+	});
+
+	test('Front 2: dataReceived with attribution stores frozen attribution', () => {
+		const sh = computeSpecHash(spec());
+		const s = setUpRequest(1, sh);
+		const next = rootReduce(s, {
+			type: 'dataReceived', requestId: 1, specHash: sh,
+			arrow: new Uint8Array(), elapsedMs: 0, cached: false, diagnostics: [],
+			attribution: [
+				{ index: 0, kind: 'aggregate',
+					produces: ['mean_close'], drops: ['open', 'high', 'low', 'close'],
+					availableAfter: ['date', 'mean_close'] },
+			],
+		});
+		const a = next.query.lastData!.attribution!;
+		assert.strictEqual(a.length, 1);
+		assert.strictEqual(a[0].index, 0);
+		assert.strictEqual(a[0].kind, 'aggregate');
+		assert.deepStrictEqual(a[0].produces, ['mean_close']);
+		// Frozen: a malicious caller cannot mutate the array post-dispatch.
+		assert.ok(Object.isFrozen(a), 'attribution array must be frozen');
+		assert.ok(Object.isFrozen(a[0]), 'attribution records must be frozen');
+		assert.ok(Object.isFrozen(a[0].produces), 'inner arrays must be frozen');
+	});
+
+	test('Front 2 audit MEDIUM: spec-hash gate semantics for renderActiveData', () => {
+		// Documents the contract enforced at the render-trigger call
+		// sites in `webview/qviz-spec/index.ts` (resize observer + live
+		// subscriber). When `state.query.lastData.specHash !==
+		// state.spec.currentHash`, the gate passes `null` attribution
+		// to the renderer so the error message doesn't reference
+		// transform indices from the prior spec. This test exercises
+		// the underlying state — the gate logic itself lives in
+		// index.ts and is too entangled with the renderer to unit-test
+		// in isolation, so we pin the state shape it relies on.
+		const sh1 = computeSpecHash(spec());
+		let s = setUpRequest(1, sh1);
+		s = rootReduce(s, {
+			type: 'dataReceived', requestId: 1, specHash: sh1,
+			arrow: new Uint8Array(), elapsedMs: 0, cached: false, diagnostics: [],
+			attribution: [{ index: 0, kind: 'aggregate',
+				produces: ['mean_close'], drops: ['close'],
+				availableAfter: ['date', 'mean_close'] }],
+		});
+		assert.strictEqual(s.query.lastData?.specHash, sh1);
+		assert.ok(s.query.lastData?.attribution);
+		// Simulate user edit: dispatch a setEncoding to mutate the spec.
+		// The reducer advances state.spec.currentHash to a new value
+		// without rebuilding lastData (the previous-data is still
+		// available for resize/theme renders).
+		const before = s.spec.currentHash;
+		s = rootReduce(s, {
+			type: 'setEncoding', channel: 'y',
+			encoding: { field: 'mean_close', type: 'quantitative' },
+		});
+		assert.notStrictEqual(s.spec.currentHash, before,
+			'spec edit must advance the hash');
+		// At this point lastData.specHash === sh1 (old) but
+		// spec.currentHash !== sh1. The render-trigger sites will
+		// detect this and pass null attribution to the renderer.
+		assert.notStrictEqual(s.query.lastData?.specHash, s.spec.currentHash,
+			'stale data: hashes diverge');
+	});
+
+	test('Front 2: requestStarted clears prior attribution on next dataReceived', () => {
+		// Front 2 plan: attribution is per-request; a new request should
+		// not inherit the previous request's attribution. The reducer
+		// achieves this by rebuilding lastData on every dataReceived,
+		// so we test that a fresh request with no attribution gives
+		// null even after a prior request HAD attribution.
+		const sh = computeSpecHash(spec());
+		let s = setUpRequest(1, sh);
+		s = rootReduce(s, {
+			type: 'dataReceived', requestId: 1, specHash: sh,
+			arrow: new Uint8Array(), elapsedMs: 0, cached: false, diagnostics: [],
+			attribution: [{ index: 0, kind: 'filter',
+				produces: [], drops: [], availableAfter: ['a'] }],
+		});
+		assert.ok(s.query.lastData?.attribution, 'first request set attribution');
+		// New request without attribution.
+		s = setUpRequest(2, sh);
+		s = rootReduce(s, {
+			type: 'dataReceived', requestId: 2, specHash: sh,
+			arrow: new Uint8Array(), elapsedMs: 0, cached: false, diagnostics: [],
+		});
+		assert.strictEqual(s.query.lastData?.attribution, null,
+			'fresh request without attribution must reset to null');
+	});
+
 	test('dataReceived stores a defensive copy of the arrow bytes', () => {
 		const sh = computeSpecHash(spec());
 		const s = setUpRequest(1, sh);

@@ -430,6 +430,71 @@ suite('messageProtocol -- extension messages', () => {
 		assert.strictEqual(r.ok, false);
 	});
 
+	test('data: accepts attribution absent (pre-Front-2 daemon)', () => {
+		// Front 2 (2026-05-14): the optional field stays optional. Old
+		// daemons that don't advertise transformAttributionV1 send
+		// `data` messages without `attribution`; validator must accept.
+		const r = validateExtensionMessage(env({
+			type: 'data', specHash: VALID_SPEC_HASH, arrow: new Uint8Array(),
+			elapsedMs: 0, cached: false, diagnostics: [],
+		}));
+		assert.strictEqual(r.ok, true);
+	});
+
+	test('data: accepts well-formed attribution', () => {
+		const r = validateExtensionMessage(env({
+			type: 'data', specHash: VALID_SPEC_HASH, arrow: new Uint8Array(),
+			elapsedMs: 0, cached: false, diagnostics: [],
+			attribution: [
+				{ index: 0, kind: 'groupby', produces: [], drops: [],
+					availableAfter: ['a', 'b', 'c'] },
+				{ index: 1, kind: 'aggregate', produces: ['mean_close'],
+					drops: ['open', 'high', 'low', 'close'],
+					availableAfter: ['date', 'mean_close'] },
+			],
+		}));
+		assert.strictEqual(r.ok, true);
+	});
+
+	test('data: rejects attribution with non-integer index', () => {
+		const r = validateExtensionMessage(env({
+			type: 'data', specHash: VALID_SPEC_HASH, arrow: new Uint8Array(),
+			elapsedMs: 0, cached: false, diagnostics: [],
+			attribution: [{ index: 1.5, kind: 'filter',
+				produces: [], drops: [], availableAfter: [] }],
+		}));
+		assert.strictEqual(r.ok, false);
+		if (!r.ok) { assert.match(r.error, /index must be a non-negative safe integer/); }
+	});
+
+	test('data: rejects attribution with missing kind', () => {
+		const r = validateExtensionMessage(env({
+			type: 'data', specHash: VALID_SPEC_HASH, arrow: new Uint8Array(),
+			elapsedMs: 0, cached: false, diagnostics: [],
+			attribution: [{ index: 0, produces: [], drops: [], availableAfter: [] }],
+		}));
+		assert.strictEqual(r.ok, false);
+	});
+
+	test('data: rejects attribution with non-string column entries', () => {
+		const r = validateExtensionMessage(env({
+			type: 'data', specHash: VALID_SPEC_HASH, arrow: new Uint8Array(),
+			elapsedMs: 0, cached: false, diagnostics: [],
+			attribution: [{ index: 0, kind: 'aggregate',
+				produces: ['ok', 42], drops: [], availableAfter: [] }],
+		}));
+		assert.strictEqual(r.ok, false);
+	});
+
+	test('data: rejects attribution that is not an array', () => {
+		const r = validateExtensionMessage(env({
+			type: 'data', specHash: VALID_SPEC_HASH, arrow: new Uint8Array(),
+			elapsedMs: 0, cached: false, diagnostics: [],
+			attribution: 'not-an-array',
+		}));
+		assert.strictEqual(r.ok, false);
+	});
+
 	test('error: requires specHash', () => {
 		const r = validateExtensionMessage(env({
 			type: 'error', error: 'boom', errorKind: 'compile',

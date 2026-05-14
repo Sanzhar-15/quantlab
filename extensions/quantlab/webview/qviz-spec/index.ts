@@ -25,6 +25,7 @@
 import {
 	type ExtensionMessage,
 	type ThemeTokens,
+	type TransformAttribution,
 	PROTOCOL_VERSION,
 	validateExtensionMessage,
 } from '../../src/qviz/messageProtocol';
@@ -197,9 +198,23 @@ function init(): void {
 			const spec = state.spec.current;
 			const data = state.query.lastData;
 			if (spec === null || data === null) { return; }
+			// Front 2 audit MEDIUM (Opus + Codex, 2026-05-14): when the
+			// spec has been edited but the new dataReceived has not yet
+			// landed, `spec` is the NEW spec while `data` is the OLD
+			// payload. Pre-Front-2 this could surface a "column not in
+			// data" error against stale columns; Front 2 makes it
+			// worse because the suffix would name a transform from the
+			// OLD spec that does not exist in the NEW spec's
+			// `transforms` array. Drop attribution to null when hashes
+			// diverge so the error message stays accurate (plain,
+			// pre-Front-2 wording).
+			const attrForRender = data.specHash === state.spec.currentHash
+				? data.attribution
+				: null;
 			void renderActiveData(renderer, spec, data.arrow,
 				data.specHash,
-				dispatchExtractError, dispatchRenderError);
+				dispatchExtractError, dispatchRenderError,
+				attrForRender);
 		}, RESIZE_DEBOUNCE_MS);
 	});
 	resizeObserver.observe(preview.chartContainer);
@@ -362,9 +377,17 @@ function init(): void {
 			lastRenderedDataHash = state.query.lastData.specHash;
 			lastRenderedThemeVersion = state.ui.themeTokensVersion;
 			lastSuccessfullyRenderedHash = state.query.lastData.specHash;
+			// Front 2 audit MEDIUM: same stale-attribution gate as the
+			// resize path above. Spec edited but new data not yet
+			// arrived -> drop attribution so the error message doesn't
+			// reference transform indices from the prior spec.
+			const attrForRender = state.query.lastData.specHash === state.spec.currentHash
+				? state.query.lastData.attribution
+				: null;
 			void renderActiveData(renderer, spec, state.query.lastData.arrow,
 				state.query.lastData.specHash,
-				dispatchExtractError, dispatchRenderError);
+				dispatchExtractError, dispatchRenderError,
+				attrForRender);
 		}
 	});
 	void liveSubscription;
@@ -682,6 +705,12 @@ function dispatchExtensionMessage(
 				elapsedMs: msg.elapsedMs,
 				cached: msg.cached,
 				diagnostics: msg.diagnostics,
+				// Front 2 (2026-05-14): pass through the per-transform
+				// schema-snapshot attribution. Absent on pre-Front-2
+				// daemons.
+				...(msg.attribution !== undefined
+					? { attribution: msg.attribution }
+					: {}),
 			});
 			return;
 		case 'error':
@@ -808,6 +837,11 @@ async function renderActiveData(
 	triggerSpecHash: string,
 	dispatchExtractError: (triggerSpecHash: string, message: string) => void,
 	dispatchRenderError: (triggerSpecHash: string, stage: string, message: string) => void,
+	// Front 2 (2026-05-14): per-transform schema-snapshot attribution from
+	// `state.query.lastData.attribution`. Threaded into the renderer so
+	// "column not in data" errors name the responsible transform. `null`
+	// on pre-Front-2 daemons; the renderer falls back to plain messages.
+	attribution: readonly TransformAttribution[] | null,
 ): Promise<void> {
 	let columns: ColumnData;
 	try {
@@ -821,7 +855,7 @@ async function renderActiveData(
 		return;
 	}
 	const theme = readThemeFromCssVars();
-	const result = await renderer.render(spec, columns, theme);
+	const result = await renderer.render(spec, columns, theme, attribution);
 	if (!result.ok) {
 		// Megaudit M-7: surface render failures to the diagnostics
 		// readout too.

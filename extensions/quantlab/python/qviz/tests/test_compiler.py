@@ -15,6 +15,7 @@ import pytest
 
 from qviz.compiler import (
     CompileError,
+    TransformAttribution,
     compile_spec,
     quote_ident,
 )
@@ -1431,3 +1432,267 @@ def test_g5_no_warning_on_mean_of_int32(tmp_path) -> None:
     }
     cq = compile_spec(spec, schema, str(p))
     assert cq.warnings == [], cq.warnings
+
+
+# ---------------------------------------------------------------------------
+# Front 2 (2026-05-14) -- per-transform schema-snapshot attribution
+# ---------------------------------------------------------------------------
+
+
+def _ohlcv_schema(tmp_path) -> tuple[Path, pa.Schema]:
+    """Common helper: emit a BTC-shaped OHLCV parquet + return (path, schema)."""
+    p = tmp_path / "data" / "ohlcv.parquet"
+    p.parent.mkdir(parents=True)
+    table = pa.table({
+        "date": pa.array([1700000000000, 1700086400000, 1700172800000], type=pa.timestamp("ms")),
+        "open": [100.0, 101.0, 102.0],
+        "high": [101.5, 102.5, 103.5],
+        "low": [99.5, 100.5, 101.5],
+        "close": [101.0, 102.0, 103.0],
+        "volume": [1000, 1100, 1200],
+    })
+    pq.write_table(table, str(p))
+    return p, pq.read_schema(str(p))
+
+
+def test_attribution_empty_for_spec_with_no_transforms(tmp_path) -> None:
+    p, schema = _ohlcv_schema(tmp_path)
+    spec = {
+        "chart": {"family": "general", "type": "scatter", "encodings": {
+            "x": {"field": "open", "type": "quantitative"},
+            "y": {"field": "close", "type": "quantitative"},
+        }},
+        "dataset": {"uri": str(p)},
+        "transforms": [],
+    }
+    cq = compile_spec(spec, schema, str(p))
+    assert cq.attribution == []
+
+
+def test_attribution_filter_neither_produces_nor_drops(tmp_path) -> None:
+    p, schema = _ohlcv_schema(tmp_path)
+    spec = {
+        "chart": {"family": "general", "type": "scatter", "encodings": {
+            "x": {"field": "open", "type": "quantitative"},
+            "y": {"field": "close", "type": "quantitative"},
+        }},
+        "dataset": {"uri": str(p)},
+        "transforms": [
+            {"kind": "filter", "column": "close", "op": ">", "value": 100},
+        ],
+    }
+    cq = compile_spec(spec, schema, str(p))
+    assert len(cq.attribution) == 1
+    r = cq.attribution[0]
+    assert r.index == 0
+    assert r.kind == "filter"
+    assert r.produces == []
+    assert r.drops == []
+    # All source columns survive.
+    assert set(r.available_after) == {"date", "open", "high", "low", "close", "volume"}
+
+
+def test_attribution_aggregate_drops_non_grouped_columns(tmp_path) -> None:
+    p, schema = _ohlcv_schema(tmp_path)
+    spec = {
+        "chart": {"family": "general", "type": "bar", "encodings": {
+            "x": {"field": "date", "type": "temporal"},
+            "y": {"field": "mean_close", "type": "quantitative"},
+        }},
+        "dataset": {"uri": str(p)},
+        "transforms": [
+            {"kind": "groupby", "columns": ["date"]},
+            {"kind": "aggregate", "aggs": [
+                {"column": "close", "fn": "mean", "as": "mean_close"},
+            ]},
+        ],
+    }
+    cq = compile_spec(spec, schema, str(p))
+    assert len(cq.attribution) == 2
+    # groupby is pass-through.
+    gb = cq.attribution[0]
+    assert gb.kind == "groupby"
+    assert gb.produces == []
+    assert gb.drops == []
+    # aggregate keeps groupby cols + aggregate aliases; drops everything else.
+    agg = cq.attribution[1]
+    assert agg.kind == "aggregate"
+    assert agg.index == 1
+    assert agg.produces == ["mean_close"]
+    assert set(agg.drops) == {"open", "high", "low", "close", "volume"}
+    assert set(agg.available_after) == {"date", "mean_close"}
+
+
+def test_attribution_window_produces_alias(tmp_path) -> None:
+    p, schema = _ohlcv_schema(tmp_path)
+    spec = {
+        "chart": {"family": "general", "type": "line", "encodings": {
+            "x": {"field": "date", "type": "temporal"},
+            "y": {"field": "sma", "type": "quantitative"},
+        }},
+        "dataset": {"uri": str(p)},
+        "transforms": [
+            {"kind": "window", "column": "close", "fn": "rolling_mean",
+             "window": 3, "order_by": "date", "as": "sma"},
+        ],
+    }
+    cq = compile_spec(spec, schema, str(p))
+    assert len(cq.attribution) == 1
+    r = cq.attribution[0]
+    assert r.kind == "window"
+    assert r.produces == ["sma"]
+    assert r.drops == []
+    assert "sma" in r.available_after
+
+
+def test_attribution_window_then_aggregate_drops_alias(tmp_path) -> None:
+    """First-drop-wins test: window produces 'sma'; aggregate drops it."""
+    p, schema = _ohlcv_schema(tmp_path)
+    spec = {
+        "chart": {"family": "general", "type": "bar", "encodings": {
+            "x": {"field": "date", "type": "temporal"},
+            "y": {"field": "mean_close", "type": "quantitative"},
+        }},
+        "dataset": {"uri": str(p)},
+        "transforms": [
+            {"kind": "window", "column": "close", "fn": "rolling_mean",
+             "window": 3, "order_by": "date", "as": "sma"},
+            {"kind": "groupby", "columns": ["date"]},
+            {"kind": "aggregate", "aggs": [
+                {"column": "close", "fn": "mean", "as": "mean_close"},
+            ]},
+        ],
+    }
+    cq = compile_spec(spec, schema, str(p))
+    assert len(cq.attribution) == 3
+    assert cq.attribution[0].produces == ["sma"]
+    # aggregate at index 2 drops sma + others.
+    agg = cq.attribution[2]
+    assert "sma" in agg.drops
+    # No reintroduction; available_after lacks sma.
+    assert "sma" not in agg.available_after
+
+
+def test_attribution_enriches_encoding_error_message(tmp_path) -> None:
+    """Core Front 2 user-facing fix: when an encoding references a column
+    that an upstream transform dropped, the CompileError message names
+    the responsible transform."""
+    p, schema = _ohlcv_schema(tmp_path)
+    spec = {
+        "chart": {"family": "general", "type": "bar", "encodings": {
+            "x": {"field": "date", "type": "temporal"},
+            # Encoding references 'close' but aggregate at index 1 drops it.
+            "y": {"field": "close", "type": "quantitative"},
+        }},
+        "dataset": {"uri": str(p)},
+        "transforms": [
+            {"kind": "groupby", "columns": ["date"]},
+            {"kind": "aggregate", "aggs": [
+                {"column": "close", "fn": "mean", "as": "mean_close"},
+            ]},
+        ],
+    }
+    with pytest.raises(CompileError) as exc_info:
+        compile_spec(spec, schema, str(p))
+    msg = str(exc_info.value)
+    assert "chart.encodings.y.field='close' not in pipeline columns" in msg
+    assert "dropped by transform #1 (aggregate)" in msg
+
+
+def test_attribution_error_without_attribution_has_no_suffix(tmp_path) -> None:
+    """When a column is referenced that was NEVER in the pipeline (typo
+    case), no `dropped by transform` suffix is added — that suffix is
+    reserved for the specific 'a transform dropped it' diagnosis."""
+    p, schema = _ohlcv_schema(tmp_path)
+    spec = {
+        "chart": {"family": "general", "type": "scatter", "encodings": {
+            "x": {"field": "open", "type": "quantitative"},
+            "y": {"field": "closeprice_typo", "type": "quantitative"},
+        }},
+        "dataset": {"uri": str(p)},
+        "transforms": [],
+    }
+    with pytest.raises(CompileError) as exc_info:
+        compile_spec(spec, schema, str(p))
+    msg = str(exc_info.value)
+    assert "not in pipeline columns" in msg
+    assert "dropped by transform" not in msg
+
+
+def test_attribution_ohlcv_encoding_error_enriched(tmp_path) -> None:
+    """Same enrichment for candlestick OHLCV cluster references."""
+    p, schema = _ohlcv_schema(tmp_path)
+    spec = {
+        "chart": {
+            "family": "timeseries", "type": "candlestick",
+            "encodings": {"ohlcv": {
+                "time": "date", "open": "open", "high": "high",
+                # 'low' was dropped by aggregate below.
+                "low": "low", "close": "close",
+            }},
+        },
+        "dataset": {"uri": str(p)},
+        "transforms": [
+            {"kind": "groupby", "columns": ["date"]},
+            {"kind": "aggregate", "aggs": [
+                {"column": "open", "fn": "first", "as": "open"},
+                {"column": "high", "fn": "max", "as": "high"},
+                {"column": "close", "fn": "last", "as": "close"},
+            ]},
+        ],
+    }
+    with pytest.raises(CompileError) as exc_info:
+        compile_spec(spec, schema, str(p))
+    msg = str(exc_info.value)
+    assert "chart.encodings.ohlcv.low='low' not in pipeline columns" in msg
+    assert "dropped by transform #1 (aggregate)" in msg
+
+
+def test_attribution_bin_then_groupby_aggregate_keeps_bin(tmp_path) -> None:
+    """bin produces the bin column; aggregate over a groupby that includes
+    the bin keeps it; chain attribution is per-transform correct."""
+    p, schema = _ohlcv_schema(tmp_path)
+    spec = {
+        "chart": {"family": "general", "type": "bar", "encodings": {
+            "x": {"field": "close_bin", "type": "ordinal"},
+            "y": {"field": "n", "type": "quantitative"},
+        }},
+        "dataset": {"uri": str(p)},
+        "transforms": [
+            {"kind": "bin", "column": "close", "n_bins": 5, "as": "close_bin"},
+            {"kind": "groupby", "columns": ["close_bin"]},
+            {"kind": "aggregate", "aggs": [
+                {"column": "close", "fn": "count", "as": "n"},
+            ]},
+        ],
+    }
+    cq = compile_spec(spec, schema, str(p))
+    assert len(cq.attribution) == 3
+    assert cq.attribution[0].produces == ["close_bin"]
+    # aggregate keeps the binned grouping column + count alias.
+    agg = cq.attribution[2]
+    assert set(agg.available_after) == {"close_bin", "n"}
+
+
+def test_attribution_dataclass_field_types(tmp_path) -> None:
+    """Defensive shape pin: attribution records are TransformAttribution
+    dataclass instances with the expected fields."""
+    p, schema = _ohlcv_schema(tmp_path)
+    spec = {
+        "chart": {"family": "general", "type": "scatter", "encodings": {
+            "x": {"field": "open", "type": "quantitative"},
+            "y": {"field": "close", "type": "quantitative"},
+        }},
+        "dataset": {"uri": str(p)},
+        "transforms": [
+            {"kind": "filter", "column": "close", "op": ">", "value": 100},
+        ],
+    }
+    cq = compile_spec(spec, schema, str(p))
+    assert isinstance(cq.attribution[0], TransformAttribution)
+    r = cq.attribution[0]
+    assert isinstance(r.index, int)
+    assert isinstance(r.kind, str)
+    assert isinstance(r.produces, list)
+    assert isinstance(r.drops, list)
+    assert isinstance(r.available_after, list)

@@ -30,6 +30,28 @@ import pyarrow as pa
 
 
 @dataclass
+class TransformAttribution:
+    """Front 2 (2026-05-14): per-transform schema snapshot.
+
+    One record per transform in the spec's `transforms` array (same order,
+    same indices). `produces` and `drops` are computed as set differences
+    against the previous step's available set. `available_after` is the
+    full column set after this transform — the renderer uses it to
+    attribute encoding-references-missing-column errors back to the
+    transform responsible for the drop.
+
+    Wire shape (camelCase at egress): `{index, kind, produces[], drops[],
+    availableAfter[]}`. The daemon's `_attribution_to_wire` performs the
+    snake→camel transform; this dataclass stays Pythonic.
+    """
+    index: int
+    kind: str
+    produces: list[str]
+    drops: list[str]
+    available_after: list[str]
+
+
+@dataclass
 class CompiledQuery:
     sql: str
     params: list
@@ -43,6 +65,12 @@ class CompiledQuery:
     loses precision above 2^53. The daemon forwards these to the
     aggregate response's `data.warnings` so the webview can surface
     them in the diagnostics readout. Empty list = no warnings."""
+    attribution: list[TransformAttribution] = field(default_factory=list)
+    """Front 2 (2026-05-14): per-transform produces/drops/available_after
+    snapshots. One record per spec transform, in pipeline order. Used by
+    the daemon's encoding-validator and the renderer's compile-error
+    enricher to report `"column X dropped by transform #N (kind)"`. Empty
+    when the spec has no transforms."""
 
     def __repr__(self) -> str:
         return f"CompiledQuery(sql={self.sql!r}, params={self.params!r})"
@@ -230,10 +258,29 @@ def compile_spec(
     ctx.ctes.append(_make_source_cte(cte_name, file_path, ctx))
     available = set(available_columns.keys())
 
-    for t in transforms:
+    # Front 2 (2026-05-14): capture per-transform schema snapshots. We
+    # already have `available` before and after each step; the only new
+    # work is the set diff.
+    attribution: list[TransformAttribution] = []
+    for idx, t in enumerate(transforms):
         cte_idx += 1
         next_cte_name = f"t{cte_idx}"
+        before = available
         cte_sql, available = _compile_transform(cte_name, next_cte_name, t, available, ctx)
+        produces = sorted(available - before)
+        drops = sorted(before - available)
+        # `_compile_transform` above already raises `CompileError` for
+        # missing/unknown kinds (see compiler.py:_compile_transform
+        # dispatch + final raise), so by the time we get here `t["kind"]`
+        # is guaranteed to be a known string. No fallback per
+        # CLAUDE.md — Front 2 audit LOW (Opus, 2026-05-14).
+        attribution.append(TransformAttribution(
+            index=idx,
+            kind=str(t["kind"]),
+            produces=produces,
+            drops=drops,
+            available_after=sorted(available),
+        ))
         ctx.ctes.append(cte_sql)
         cte_name = next_cte_name
 
@@ -250,7 +297,7 @@ def compile_spec(
 
     # Validate encodings reference real columns in the final state.
     encodings = chart.get("encodings", {})
-    _validate_encodings_reference_columns(encodings, available)
+    _validate_encodings_reference_columns(encodings, available, attribution)
 
     chart_options = chart.get("options") or {}
     final_columns = _final_columns_for(spec, available)
@@ -268,6 +315,7 @@ def compile_spec(
     return CompiledQuery(
         sql=sql, params=ctx.params, final_columns=final_columns,
         warnings=list(ctx.warnings),
+        attribution=attribution,
     )
 
 
@@ -1098,8 +1146,37 @@ def _require_column(col: str, available: set[str]) -> None:
         )
 
 
-def _validate_encodings_reference_columns(encodings: dict, available: set[str]) -> None:
-    """Each encoding's `field` must be in the final pipeline columns."""
+def _describe_column_drop(
+    column: str, attribution: list[TransformAttribution] | None,
+) -> str:
+    """Front 2 (2026-05-14): if `column` was dropped by a transform,
+    return ``" -- dropped by transform #N (kind)"``. Otherwise return ``""``.
+
+    First-drop wins: walks attribution in pipeline order, returns on the
+    first record whose `drops` list contains the column. Re-introduced-
+    and-dropped-again cases attribute to the FIRST drop (rare; documented
+    plan decision so V2 can expand if real cases surface).
+    """
+    if not attribution:
+        return ""
+    for record in attribution:
+        if column in record.drops:
+            return f" -- dropped by transform #{record.index} ({record.kind})"
+    return ""
+
+
+def _validate_encodings_reference_columns(
+    encodings: dict,
+    available: set[str],
+    attribution: list[TransformAttribution] | None = None,
+) -> None:
+    """Each encoding's `field` must be in the final pipeline columns.
+
+    Front 2 (2026-05-14): when `attribution` is provided, missing-column
+    errors are enriched with `"-- dropped by transform #N (kind)"` so the
+    user knows which transform dropped the column rather than chasing a
+    generic message.
+    """
     for enc_name, enc in encodings.items():
         if not enc:
             continue
@@ -1107,14 +1184,18 @@ def _validate_encodings_reference_columns(encodings: dict, available: set[str]) 
             for ohlcv_field in ("time", "open", "high", "low", "close", "volume"):
                 v = enc.get(ohlcv_field)
                 if v is not None and v not in available:
+                    suffix = _describe_column_drop(v, attribution)
                     raise CompileError(
                         f"chart.encodings.ohlcv.{ohlcv_field}={v!r} not in pipeline columns"
+                        f"{suffix}"
                     )
         else:
             f = enc.get("field")
             if f is not None and f not in available:
+                suffix = _describe_column_drop(f, attribution)
                 raise CompileError(
                     f"chart.encodings.{enc_name}.field={f!r} not in pipeline columns"
+                    f"{suffix}"
                 )
 
 

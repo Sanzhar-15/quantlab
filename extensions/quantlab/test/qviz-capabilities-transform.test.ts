@@ -134,4 +134,34 @@ suite('capabilitiesTransform -- mapDaemonCapsForInit', () => {
 		assert.strictEqual(out.inspector, undefined);
 	});
 
+	test('Front 2: transform_attribution_v1=true is translated to transformAttributionV1', () => {
+		const raw: DaemonCapabilitiesData = {
+			...baseRaw(),
+			transform_attribution_v1: true,
+		};
+		const out = mapDaemonCapsForInit(raw);
+		assert.strictEqual(out.transformAttributionV1, true);
+	});
+
+	test('Front 2: transform_attribution_v1 absent leaves transformAttributionV1 absent', () => {
+		// Pre-Front-2 daemon. Field omitted entirely; the camelCase
+		// shape must also omit it (not emit as `false`, since absence
+		// and explicit-false carry the same renderer fallback semantics
+		// but we keep the shape minimal).
+		const out = mapDaemonCapsForInit(baseRaw());
+		assert.ok(!('transformAttributionV1' in out),
+			'transformAttributionV1 must be absent on the camelCase output');
+	});
+
+	test('Front 2: transform_attribution_v1=false also omits the camel field', () => {
+		// Explicit-false from the daemon is rare but possible. We treat
+		// it as "not supported", same as absent.
+		const raw: DaemonCapabilitiesData = {
+			...baseRaw(),
+			transform_attribution_v1: false,
+		};
+		const out = mapDaemonCapsForInit(raw);
+		assert.ok(!('transformAttributionV1' in out));
+	});
+
 });

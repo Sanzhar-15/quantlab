@@ -428,3 +428,116 @@ suite('compileTimeseriesPlan — error gates', () => {
 	});
 
 });
+
+suite('compileTimeseriesPlan -- Front 2 attribution enrichment', () => {
+
+	test('scalar series: aggregate-dropped column produces enriched error', () => {
+		const spec = makeSpec({
+			chart: {
+				family: 'timeseries' as const,
+				type: 'line' as const,
+				encodings: {
+					x: { field: 'date', type: 'temporal' as const },
+					y: { field: 'close', type: 'quantitative' as const },
+				},
+			},
+		});
+		const columns: ColumnData = { date: [1, 2] };
+		const attribution = [
+			{ index: 0, kind: 'aggregate',
+				produces: ['mean_close'], drops: ['close'],
+				availableAfter: ['date', 'mean_close'] },
+		];
+		assert.throws(
+			() => compileTimeseriesPlan(spec, columns, TEST_THEME, attribution),
+			(e: Error) => {
+				assert.match(e.message,
+					/encodings\.y\.field='close' not in column data -- dropped by transform #0 \(aggregate\)/);
+				return true;
+			},
+		);
+	});
+
+	test('candlestick: OHLCV channel-specific message + enriched suffix', () => {
+		const spec = makeSpec({
+			chart: {
+				family: 'timeseries' as const,
+				type: 'candlestick' as const,
+				encodings: {
+					ohlcv: {
+						time: 'date', open: 'open', high: 'high',
+						low: 'low', close: 'close',
+					},
+				},
+			},
+		});
+		const columns: ColumnData = {
+			date: [1, 2], open: [1, 2], high: [1, 2], close: [1, 2],
+		};
+		const attribution = [
+			{ index: 0, kind: 'groupby', produces: [], drops: [],
+				availableAfter: ['date', 'open', 'high', 'low', 'close'] },
+			{ index: 1, kind: 'aggregate',
+				produces: ['mean_close'], drops: ['open', 'high', 'low'],
+				availableAfter: ['date', 'close', 'mean_close'] },
+		];
+		assert.throws(
+			() => compileTimeseriesPlan(spec, columns, TEST_THEME, attribution),
+			(e: Error) => {
+				assert.match(e.message,
+					/encodings\.ohlcv\.low='low' not in column data -- dropped by transform #1 \(aggregate\)/);
+				return true;
+			},
+		);
+	});
+
+	test('back-compat: missing column with no attribution preserves verbatim message', () => {
+		const spec = makeSpec({
+			chart: {
+				family: 'timeseries' as const,
+				type: 'line' as const,
+				encodings: {
+					x: { field: 'date', type: 'temporal' as const },
+					y: { field: 'ghost', type: 'quantitative' as const },
+				},
+			},
+		});
+		const columns: ColumnData = { date: [1, 2] };
+		assert.throws(
+			() => compileTimeseriesPlan(spec, columns, TEST_THEME),
+			(e: Error) => {
+				assert.strictEqual(e.message,
+					"encodings.y.field='ghost' not in column data");
+				return true;
+			},
+		);
+	});
+
+	test('x channel missing column also gets enriched when attribution provided', () => {
+		const spec = makeSpec({
+			chart: {
+				family: 'timeseries' as const,
+				type: 'line' as const,
+				encodings: {
+					x: { field: 'dropped_x', type: 'temporal' as const },
+					y: { field: 'close', type: 'quantitative' as const },
+				},
+			},
+		});
+		const columns: ColumnData = { close: [1, 2] };
+		const attribution = [
+			{ index: 0, kind: 'aggregate',
+				produces: ['close'], drops: ['dropped_x'],
+				availableAfter: ['close'] },
+		];
+		assert.throws(
+			() => compileTimeseriesPlan(spec, columns, TEST_THEME, attribution),
+			(e: Error) => {
+				assert.match(e.message,
+					/encodings\.x\.field='dropped_x' not in column data -- dropped by transform #0 \(aggregate\)/);
+				return true;
+			},
+		);
+	});
+
+});

@@ -32,6 +32,7 @@
  */
 
 import type { Action } from './actions';
+import type { TransformAttribution } from '../../../src/qviz/messageProtocol';
 
 export interface QueryState {
 	readonly inflight: { readonly requestId: number; readonly specHash: string } | null;
@@ -49,6 +50,11 @@ export interface QueryState {
 		readonly elapsedMs: number;
 		readonly cached: boolean;
 		readonly diagnostics: readonly string[];
+		/** Front 2 (2026-05-14): per-transform schema-snapshot attribution
+		 *  for the response. The renderer consumes this to enrich
+		 *  "column not in data" error messages with the responsible
+		 *  transform. `null` when the daemon didn't include it. */
+		readonly attribution: readonly TransformAttribution[] | null;
 	} | null;
 }
 
@@ -94,6 +100,22 @@ export function reduceQuery(state: QueryState, action: Action): QueryState {
 			const arrowCopy = new Uint8Array(action.arrow.length);
 			arrowCopy.set(action.arrow);
 			const diagnostics = Object.freeze(action.diagnostics.slice()) as readonly string[];
+			// Front 2 (2026-05-14): defensively deep-freeze the attribution
+			// array. The action payload is typed `readonly` but a malicious
+			// or buggy caller could pass a mutable array; freezing each
+			// record prevents post-dispatch mutation.
+			let attribution: readonly TransformAttribution[] | null = null;
+			if (action.attribution !== undefined) {
+				attribution = Object.freeze(
+					action.attribution.map(r => Object.freeze({
+						index: r.index,
+						kind: r.kind,
+						produces: Object.freeze(r.produces.slice()) as readonly string[],
+						drops: Object.freeze(r.drops.slice()) as readonly string[],
+						availableAfter: Object.freeze(r.availableAfter.slice()) as readonly string[],
+					})),
+				) as readonly TransformAttribution[];
+			}
 			return {
 				...state,
 				inflight: null,
@@ -105,6 +127,7 @@ export function reduceQuery(state: QueryState, action: Action): QueryState {
 					elapsedMs: action.elapsedMs,
 					cached: action.cached,
 					diagnostics,
+					attribution,
 				}),
 				lastErrorRequestId: null,
 				lastErrorMessage: null,

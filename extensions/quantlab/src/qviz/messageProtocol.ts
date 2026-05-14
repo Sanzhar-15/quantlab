@@ -136,6 +136,27 @@ export interface DataMessage extends SpecAttributedEnvelope {
 	readonly elapsedMs: number;
 	readonly cached: boolean;
 	readonly diagnostics: readonly string[];
+	/** Front 2 (2026-05-14): per-transform schema-snapshot attribution.
+	 *  One record per `spec.transforms[]` entry, in pipeline order. The
+	 *  renderer uses it to enrich "encoding references missing column"
+	 *  errors with the responsible transform. Absent on responses from
+	 *  pre-`transform_attribution_v1` daemons; the renderer falls back
+	 *  to the plain message. */
+	readonly attribution?: readonly TransformAttribution[];
+}
+
+/** Front 2 (2026-05-14): per-transform schema snapshot. Returned by the
+ *  daemon in the `data` envelope. `produces` and `drops` are computed
+ *  as set diffs against the previous step's available columns;
+ *  `availableAfter` is the full column set after this transform.
+ *  See `python/qviz/compiler.py:TransformAttribution` for the
+ *  daemon-side dataclass. */
+export interface TransformAttribution {
+	readonly index: number;
+	readonly kind: string;
+	readonly produces: readonly string[];
+	readonly drops: readonly string[];
+	readonly availableAfter: readonly string[];
 }
 
 export interface ErrorMessage extends SpecAttributedEnvelope {
@@ -261,6 +282,12 @@ export interface DaemonCapabilities {
 	 *  pre-Phase-6 daemons; webview disables the inspector toggle when
 	 *  any of these is missing. */
 	readonly inspector?: InspectorCapabilities;
+	/** Front 2 (2026-05-14): when true, the daemon emits per-transform
+	 *  schema-snapshot attribution in `op_aggregate` responses (see
+	 *  `DataMessage.attribution`). Absent on pre-Front-2 daemons; the
+	 *  renderer falls back to plain "column not in data" error
+	 *  messages when this bit is not set. */
+	readonly transformAttributionV1?: boolean;
 }
 
 export interface InspectorCapabilities {
@@ -748,7 +775,39 @@ function validateData(obj: Record<string, unknown>): ValidationResult<DataMessag
 	if (!Array.isArray(obj.diagnostics) || !obj.diagnostics.every(d => typeof d === 'string')) {
 		return fail('data.diagnostics must be an array of strings');
 	}
+	// Front 2 (2026-05-14): attribution is optional (older daemons omit it),
+	// but when present its shape must be exact.
+	if (obj.attribution !== undefined) {
+		const ar = validateAttribution(obj.attribution, 'data.attribution');
+		if (!ar.ok) { return ar; }
+	}
 	return ok(obj as unknown as DataMessage);
+}
+
+function validateAttribution(
+	value: unknown, label: string,
+): ValidationResult<readonly TransformAttribution[]> {
+	if (!Array.isArray(value)) {
+		return fail(`${label} must be an array`);
+	}
+	for (let i = 0; i < value.length; i++) {
+		const r = value[i];
+		if (!isObject(r)) {
+			return fail(`${label}[${i}] must be an object`);
+		}
+		if (typeof r.index !== 'number' || !Number.isSafeInteger(r.index) || r.index < 0) {
+			return fail(`${label}[${i}].index must be a non-negative safe integer`);
+		}
+		if (typeof r.kind !== 'string' || r.kind.length === 0) {
+			return fail(`${label}[${i}].kind must be a non-empty string`);
+		}
+		for (const f of ['produces', 'drops', 'availableAfter'] as const) {
+			if (!Array.isArray(r[f]) || !(r[f] as unknown[]).every(s => typeof s === 'string')) {
+				return fail(`${label}[${i}].${f} must be an array of strings`);
+			}
+		}
+	}
+	return ok(value as readonly TransformAttribution[]);
 }
 
 const ERROR_KINDS = new Set(['compile', 'security', 'timeout', 'memory', 'internal', 'protocol']);
@@ -1030,6 +1089,18 @@ function validateDaemonCapabilities(
 		(c.inspector as { previewOffset?: unknown }).previewOffset ??= false;
 		(c.inspector as { columnStats?: unknown }).columnStats ??= false;
 		(c.inspector as { aggregateFilters?: unknown }).aggregateFilters ??= false;
+	}
+	// Front 2 (2026-05-14): optional `transformAttributionV1` bit. Same
+	// snake-alias rejection as the others — daemon-side `transform_attribution_v1`
+	// must be transformed via `mapDaemonCapsForInit` first.
+	if ('transform_attribution_v1' in c) {
+		return fail(
+			`${label}: snake_case key 'transform_attribution_v1' rejected; `
+			+ `use 'transformAttributionV1' (transform via mapDaemonCapsForInit)`,
+		);
+	}
+	if (c.transformAttributionV1 !== undefined && typeof c.transformAttributionV1 !== 'boolean') {
+		return fail(`${label}.transformAttributionV1 must be a boolean when present`);
 	}
 	return ok(c as unknown as DaemonCapabilities);
 }

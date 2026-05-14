@@ -192,6 +192,17 @@ export interface AggregateMeta {
 	 *  to the webview's diagnostics readout so users see the loss
 	 *  rather than silently mis-trusting the chart values. */
 	readonly warnings?: readonly string[];
+	/** Front 2 (2026-05-14): per-transform schema-snapshot attribution.
+	 *  Wire shape uses camelCase already (the daemon's
+	 *  `_attribution_to_wire` does the snake→camel transform server-side).
+	 *  Absent on pre-Front-2 daemons. */
+	readonly attribution?: readonly {
+		readonly index: number;
+		readonly kind: string;
+		readonly produces: readonly string[];
+		readonly drops: readonly string[];
+		readonly availableAfter: readonly string[];
+	}[];
 }
 
 export interface DecimateMeta {
@@ -217,6 +228,11 @@ export interface DaemonCapabilitiesData {
 		readonly column_stats: boolean;
 		readonly aggregate_filters: boolean;
 	};
+	/** Front 2 (2026-05-14): when true, the daemon emits per-transform
+	 *  schema-snapshot attribution in `op_aggregate` responses. The
+	 *  capabilitiesTransform translates this to camelCase
+	 *  `transformAttributionV1` for the webview-side capabilities bag. */
+	readonly transform_attribution_v1?: boolean;
 }
 
 /** Phase 6 (6.A.2): the column-stats response shape. The inspector's

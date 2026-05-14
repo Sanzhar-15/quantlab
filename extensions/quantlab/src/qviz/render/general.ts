@@ -31,6 +31,8 @@ import type {
 	ChartOptions, ChartType, Encoding, Encodings, QvizSpec
 } from '../spec';
 import { getDefaultScaleOptions } from '../scaleDefaults';
+import type { TransformAttribution } from '../messageProtocol';
+import { describeColumnDrop } from './attribution';
 import type {
 	ColumnData, GeneralChartType, GeneralPlan, QvizTheme,
 	VegaLiteEncoding, VegaLiteEncodingType, VegaLiteFieldDef, VegaLiteMark, VegaLiteSpec
@@ -62,11 +64,18 @@ const GENERAL_CHART_TYPES: readonly GeneralChartType[] =
 
 /**
  * Compile a spec + columnar data into a GeneralPlan.
+ *
+ * Front 2 (2026-05-14): the optional `attribution` parameter carries
+ * per-transform schema snapshots from the daemon. When present, the
+ * "encoding references missing column" error message is enriched to
+ * name the responsible transform. Pre-Front-2 daemons or test callers
+ * that don't pass it get the unchanged message.
  */
 export function compileGeneralPlan(
 	spec: QvizSpec,
 	columns: ColumnData,
-	theme: QvizTheme = DEFAULT_THEME
+	theme: QvizTheme = DEFAULT_THEME,
+	attribution?: readonly TransformAttribution[] | null,
 ): GeneralPlan {
 	if (spec.chart.family !== 'general') {
 		throw new CompileGeneralPlanError(
@@ -83,9 +92,9 @@ export function compileGeneralPlan(
 	const diagnostics: string[] = [];
 	const chartType = spec.chart.type;
 
-	validateEncodingFields(spec.chart.encodings, columns);
+	validateEncodingFields(spec.chart.encodings, columns, attribution);
 
-	const rows = columnsToRows(columns, spec.chart.encodings);
+	const rows = columnsToRows(columns, spec.chart.encodings, attribution);
 	const mark = buildMark(chartType);
 	const encoding = buildEncoding(chartType, spec.chart.encodings, spec.chart.options, columns);
 	const config = buildConfig(theme, spec.chart.options);
@@ -470,7 +479,8 @@ function buildConfig(
  */
 function columnsToRows(
 	columns: ColumnData,
-	encodings: Encodings
+	encodings: Encodings,
+	attribution?: readonly TransformAttribution[] | null,
 ): Record<string, unknown>[] {
 	const referenced = collectReferencedFields(encodings);
 	if (referenced.length === 0) {
@@ -483,8 +493,13 @@ function columnsToRows(
 	const usable: string[] = [];
 	for (const name of referenced) {
 		if (columns[name] === undefined) {
+			// Front 2 (2026-05-14): same enrichment as validateEncodingFields.
+			// This is the defense-in-depth pass; the channel-named path above
+			// should have caught it, but a y2/ohlcv-cluster reference reaches
+			// here without channel context.
+			const suffix = describeColumnDrop(name, attribution);
 			throw new CompileGeneralPlanError(
-				`encoding references field '${name}' but no such column in data`
+				`encoding references field '${name}' but no such column in data${suffix}`
 			);
 		}
 		usable.push(name);
@@ -540,14 +555,23 @@ function collectReferencedFields(encodings: Encodings): string[] {
  * This runs before columnsToRows so the error message names the channel
  * (more useful than just the field name) when something is off.
  */
-function validateEncodingFields(encodings: Encodings, columns: ColumnData): void {
+function validateEncodingFields(
+	encodings: Encodings,
+	columns: ColumnData,
+	attribution?: readonly TransformAttribution[] | null,
+): void {
 	const channels: readonly (keyof Encodings)[] =
 		['x', 'y', 'color', 'size', 'shape', 'facet_row', 'facet_col'];
 	for (const ch of channels) {
 		const enc = encodings[ch] as Encoding | undefined;
 		if (enc !== undefined && columns[enc.field] === undefined) {
+			// Front 2 (2026-05-14): when attribution is available and
+			// some transform in the pipeline dropped this column, append
+			// "(dropped by transform #N (kind))" so the user knows where
+			// to look. Empty string when the column was never produced.
+			const suffix = describeColumnDrop(enc.field, attribution);
 			throw new CompileGeneralPlanError(
-				`encodings.${String(ch)}.field='${enc.field}' not in column data`
+				`encodings.${String(ch)}.field='${enc.field}' not in column data${suffix}`
 			);
 		}
 	}

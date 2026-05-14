@@ -40,7 +40,7 @@ import pyarrow as pa
 
 from . import reader
 from .cache import LRUCache, make_cache_key
-from .compiler import CompileError, compile_spec
+from .compiler import CompileError, TransformAttribution, compile_spec
 from .ipc import (
     FRAME_JSON,
     IPCError,
@@ -72,6 +72,28 @@ INLINE_JSON_THRESHOLD_BYTES = 256 * 1024
 # Normal inspector requests are well under these.
 PREVIEW_MAX = 50_000
 PREVIEW_OFFSET_MAX = 10_000_000
+
+
+def _attribution_to_wire(
+    attribution: list[TransformAttribution] | None,
+) -> list[dict] | None:
+    """Front 2 (2026-05-14): convert per-transform snapshot dataclasses
+    to the camelCase wire shape that the TS validator expects. Returns
+    `None` when there are no transforms (don't ship an empty list — the
+    optional field stays absent, smaller JSON, no semantic difference).
+    """
+    if not attribution:
+        return None
+    return [
+        {
+            "index": r.index,
+            "kind": r.kind,
+            "produces": list(r.produces),
+            "drops": list(r.drops),
+            "availableAfter": list(r.available_after),
+        }
+        for r in attribution
+    ]
 
 
 def _parse_preview_window(req: dict) -> tuple[int, int]:
@@ -524,6 +546,13 @@ class Daemon:
             }
             if cached_compiled.warnings:
                 data["warnings"] = list(cached_compiled.warnings)
+            # Front 2 (2026-05-14): per-transform schema snapshots. The
+            # webview's `describeColumnDrop` helper uses this to enrich
+            # render-time "column not in data" errors with the transform
+            # responsible for the drop.
+            cached_attr = _attribution_to_wire(cached_compiled.attribution)
+            if cached_attr is not None:
+                data["attribution"] = cached_attr
             return {
                 "binary": cached,
                 "data": data,
@@ -560,6 +589,10 @@ class Daemon:
         # user sees the loss instead of silently mis-trusting the chart.
         if compiled.warnings:
             data["warnings"] = list(compiled.warnings)
+        # Front 2 (2026-05-14): per-transform schema snapshots.
+        attr_wire = _attribution_to_wire(compiled.attribution)
+        if attr_wire is not None:
+            data["attribution"] = attr_wire
         return {
             "binary": arrow_bytes,
             "data": data,
@@ -911,6 +944,11 @@ class Daemon:
                     "column_stats": True,
                     "aggregate_filters": True,
                 },
+                # Front 2 (2026-05-14): per-transform schema-snapshot
+                # attribution in aggregate responses. Webview falls back
+                # to plain "column not in data" error message when this
+                # bit is absent (old daemons).
+                "transform_attribution_v1": True,
             },
             "encoding": "json",
         }

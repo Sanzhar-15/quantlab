@@ -885,3 +885,81 @@ suite('compileGeneralPlan -- error gates', () => {
 	});
 
 });
+
+suite('compileGeneralPlan -- Front 2 attribution enrichment', () => {
+
+	test('attribution-enriched error when aggregate dropped the column', () => {
+		const spec = makeSpec({
+			chart: {
+				family: 'general' as const,
+				type: 'scatter' as const,
+				encodings: {
+					x: { field: 'date', type: 'temporal' as const },
+					// y references 'close' but the aggregate dropped it.
+					y: { field: 'close', type: 'quantitative' as const },
+				},
+			},
+		});
+		const columns: ColumnData = { date: [1, 2], mean_close: [100, 200] };
+		const attribution = [
+			{ index: 0, kind: 'groupby', produces: [], drops: [],
+				availableAfter: ['date', 'close'] },
+			{ index: 1, kind: 'aggregate',
+				produces: ['mean_close'], drops: ['close'],
+				availableAfter: ['date', 'mean_close'] },
+		];
+		assert.throws(
+			() => compileGeneralPlan(spec, columns, TEST_THEME, attribution),
+			(e: Error) => {
+				assert.match(e.message,
+					/encodings\.y\.field='close' not in column data -- dropped by transform #1 \(aggregate\)/);
+				return true;
+			},
+		);
+	});
+
+	test('back-compat: missing column with no attribution preserves the old message', () => {
+		const spec = makeSpec({
+			chart: {
+				family: 'general' as const,
+				type: 'scatter' as const,
+				encodings: {
+					x: { field: 'a', type: 'quantitative' as const },
+					y: { field: 'missing', type: 'quantitative' as const },
+				},
+			},
+		});
+		const columns: ColumnData = { a: [1, 2] };
+		assert.throws(
+			() => compileGeneralPlan(spec, columns, TEST_THEME),
+			(e: Error) => {
+				assert.strictEqual(e.message,
+					"encodings.y.field='missing' not in column data");
+				return true;
+			},
+		);
+	});
+
+	test('null attribution behaves like absent', () => {
+		const spec = makeSpec({
+			chart: {
+				family: 'general' as const,
+				type: 'scatter' as const,
+				encodings: {
+					x: { field: 'a', type: 'quantitative' as const },
+					y: { field: 'missing', type: 'quantitative' as const },
+				},
+			},
+		});
+		const columns: ColumnData = { a: [1, 2] };
+		assert.throws(
+			() => compileGeneralPlan(spec, columns, TEST_THEME, null),
+			(e: Error) => {
+				assert.strictEqual(e.message,
+					"encodings.y.field='missing' not in column data");
+				return true;
+			},
+		);
+	});
+
+});

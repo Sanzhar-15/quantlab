@@ -19,6 +19,8 @@
  */
 
 import type { ChartType, QvizSpec } from '../spec';
+import type { TransformAttribution } from '../messageProtocol';
+import { describeColumnDrop } from './attribution';
 import type {
 	AreaPlan, BarPlan, BaselinePlan, CandlestickPlan, ColumnData, DataPointMs, HistogramPlan,
 	LinePlan, OhlcDataPointMs, QvizTheme, TimeseriesChartOptions, TimeseriesPlan,
@@ -46,11 +48,17 @@ export class CompilePlanError extends Error {
 
 /**
  * Compile a spec + columnar data into a TimeseriesPlan.
+ *
+ * Front 2 (2026-05-14): `attribution` optionally carries per-transform
+ * schema snapshots from the daemon. When present, "encoding references
+ * missing column" errors are enriched to name the responsible
+ * transform.
  */
 export function compileTimeseriesPlan(
 	spec: QvizSpec,
 	columns: ColumnData,
-	theme: QvizTheme = DEFAULT_THEME
+	theme: QvizTheme = DEFAULT_THEME,
+	attribution?: readonly TransformAttribution[] | null,
 ): TimeseriesPlan {
 	if (spec.chart.family !== 'timeseries') {
 		throw new CompilePlanError(
@@ -91,7 +99,7 @@ export function compileTimeseriesPlan(
 
 	switch (chartType) {
 		case 'candlestick': {
-			series.push(compileCandlestick(spec, columns, diagnostics));
+			series.push(compileCandlestick(spec, columns, diagnostics, attribution));
 			break;
 		}
 		case 'line':
@@ -99,7 +107,7 @@ export function compileTimeseriesPlan(
 		case 'bar':
 		case 'histogram':
 		case 'baseline': {
-			series.push(compileScalarSeries(spec, columns, palette[0], chartType, diagnostics));
+			series.push(compileScalarSeries(spec, columns, palette[0], chartType, diagnostics, attribution));
 			break;
 		}
 		default: {
@@ -117,7 +125,10 @@ export function compileTimeseriesPlan(
 // ---------------------------------------------------------------------------
 
 function compileCandlestick(
-	spec: QvizSpec, columns: ColumnData, diagnostics: string[]
+	spec: QvizSpec,
+	columns: ColumnData,
+	diagnostics: string[],
+	attribution?: readonly TransformAttribution[] | null,
 ): CandlestickPlan {
 	const ohlcv = spec.chart.encodings.ohlcv;
 	if (!ohlcv) {
@@ -126,8 +137,10 @@ function compileCandlestick(
 	for (const fieldName of ['time', 'open', 'high', 'low', 'close'] as const) {
 		const colName = ohlcv[fieldName];
 		if (columns[colName] === undefined) {
+			// Front 2 (2026-05-14): enrich with the responsible transform.
+			const suffix = describeColumnDrop(colName, attribution);
 			throw new CompilePlanError(
-				`encodings.ohlcv.${fieldName}='${colName}' not in column data`
+				`encodings.ohlcv.${fieldName}='${colName}' not in column data${suffix}`
 			);
 		}
 	}
@@ -194,7 +207,8 @@ function compileScalarSeries(
 	columns: ColumnData,
 	defaultColor: string,
 	chartType: Exclude<ChartType, 'candlestick' | 'scatter' | 'heatmap' | 'pie'>,
-	diagnostics: string[]
+	diagnostics: string[],
+	attribution?: readonly TransformAttribution[] | null,
 ): LinePlan | AreaPlan | BarPlan | HistogramPlan | BaselinePlan {
 	const xEnc = spec.chart.encodings.x;
 	const yEnc = spec.chart.encodings.y;
@@ -202,10 +216,17 @@ function compileScalarSeries(
 		throw new CompilePlanError(`${chartType} chart requires encodings.x and encodings.y`);
 	}
 	if (columns[xEnc.field] === undefined) {
-		throw new CompilePlanError(`encodings.x.field='${xEnc.field}' not in column data`);
+		// Front 2 (2026-05-14): enrich with the responsible transform.
+		const suffix = describeColumnDrop(xEnc.field, attribution);
+		throw new CompilePlanError(
+			`encodings.x.field='${xEnc.field}' not in column data${suffix}`
+		);
 	}
 	if (columns[yEnc.field] === undefined) {
-		throw new CompilePlanError(`encodings.y.field='${yEnc.field}' not in column data`);
+		const suffix = describeColumnDrop(yEnc.field, attribution);
+		throw new CompilePlanError(
+			`encodings.y.field='${yEnc.field}' not in column data${suffix}`
+		);
 	}
 
 	const xCol = columns[xEnc.field] as ArrayLike<number>;

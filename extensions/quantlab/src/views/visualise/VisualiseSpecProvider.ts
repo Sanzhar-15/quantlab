@@ -1333,6 +1333,18 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 			// we ever need structured levels, that's a separate
 			// wire-shape change.
 			const warnings = r.meta.warnings ?? [];
+			// Front 2 (2026-05-14): relay per-transform schema-snapshot
+			// attribution from the daemon meta to the webview. Wire
+			// shape is already camelCase (daemon-side `_attribution_to_wire`
+			// does the transform), so we pass through verbatim. Absent
+			// on pre-Front-2 daemons; the validator accepts the absence.
+			//
+			// Front 2 audit LOW (Opus, 2026-05-14): empty attribution
+			// arrays (spec has no transforms) are normalized to absent.
+			// The daemon's `_attribution_to_wire` returns `None` for
+			// empty, but a future daemon or middlebox might emit `[]`;
+			// pin the wire-shape promise (absent == no-attribution).
+			const attribution = r.meta.attribution;
 			this.postOrLog(panel, {
 				type: 'data',
 				protocolVersion: PROTOCOL_VERSION,
@@ -1342,6 +1354,9 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 				elapsedMs: r.elapsedMs,
 				cached: r.cached,
 				diagnostics: warnings,
+				...(attribution !== undefined && attribution.length > 0
+					? { attribution }
+					: {}),
 			});
 		} catch (e) {
 			const error = (e as Error).message;

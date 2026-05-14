@@ -25,6 +25,7 @@ import type {
 	DaemonStatusKind, DatasetStatusKind,
 	SchemaDriftKind, SchemaInfo, ThemeTokens, DaemonCapabilities,
 	InspectorFilter, ColumnStats, InspectorErrorKind,
+	TransformAttribution,
 } from '../../../src/qviz/messageProtocol';
 import type { ChartFamily, ChartType, Encoding, Encodings, QvizSpec, Transform } from '../../../src/qviz/spec';
 
@@ -58,6 +59,10 @@ export interface ActionDataReceived {
 	readonly elapsedMs: number;
 	readonly cached: boolean;
 	readonly diagnostics: readonly string[];
+	/** Front 2 (2026-05-14): per-transform schema-snapshot attribution.
+	 *  Absent when the daemon doesn't advertise `transformAttributionV1`.
+	 *  Renderer uses it to enrich "column not in data" error messages. */
+	readonly attribution?: readonly TransformAttribution[];
 }
 
 export interface ActionError {

@@ -50,5 +50,11 @@ export function mapDaemonCapsForInit(
 				aggregateFilters: !!di.aggregate_filters,
 			},
 		} : {}),
+		// Front 2 (2026-05-14): pre-Front-2 daemons omit this flag; the
+		// renderer treats absence as "no enriched attribution available"
+		// and uses the plain error message.
+		...(raw.transform_attribution_v1 === true
+			? { transformAttributionV1: true }
+			: {}),
 	};
 }
