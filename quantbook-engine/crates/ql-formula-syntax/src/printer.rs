@@ -354,6 +354,78 @@ fn print_expr(expr: &Expr, out: &mut String, parent_min_bp: u8) {
                  and not constructed in Phase 4.7 — reaching here means the AST was malformed"
             );
         }
+        Expr::StructuredRef { table_name, spec } => {
+            // **W5-112 (Phase 4.8.C):** structured-ref round-trip.
+            // Phase 4.8.D will add OOXML-escape-aware emission for
+            // column names containing `[`, `]`, `#`, `@`, `'`. v0 of
+            // the printer in 4.8.C just emits the canonical bracket
+            // form — sufficient for the round-trip tests in this
+            // sub-phase since none use escape-requiring names.
+            out.push_str(table_name);
+            out.push('[');
+            print_sref_spec(spec, out);
+            out.push(']');
+        }
+    }
+}
+
+/// **W5-112 (Phase 4.8.C):** print the bracket content of a structured
+/// reference. v0 — no escape handling (4.8.D adds it). The caller
+/// emits the wrapping `[` and `]`.
+fn print_sref_spec(spec: &crate::ast::TableSpecSubtree, out: &mut String) {
+    use crate::ast::{SpecialItem, TableSpecItem, TableSpecSubtree};
+    match spec {
+        TableSpecSubtree::BareColumn(name) => {
+            out.push_str(name);
+        }
+        TableSpecSubtree::ThisRowColumn(name) => {
+            out.push('@');
+            out.push_str(name);
+        }
+        TableSpecSubtree::ThisRowColumnRange(c1, c2) => {
+            out.push('@');
+            out.push('[');
+            out.push_str(c1);
+            out.push(']');
+            out.push(':');
+            out.push('[');
+            out.push_str(c2);
+            out.push(']');
+        }
+        TableSpecSubtree::Combination(items) => {
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                match item {
+                    TableSpecItem::Special(s) => {
+                        out.push('[');
+                        out.push_str(match s {
+                            SpecialItem::Headers => "#Headers",
+                            SpecialItem::Totals => "#Totals",
+                            SpecialItem::Data => "#Data",
+                            SpecialItem::All => "#All",
+                            SpecialItem::ThisRow => "#This Row",
+                        });
+                        out.push(']');
+                    }
+                    TableSpecItem::Column(c) => {
+                        out.push('[');
+                        out.push_str(c);
+                        out.push(']');
+                    }
+                    TableSpecItem::ColumnRange(c1, c2) => {
+                        out.push('[');
+                        out.push_str(c1);
+                        out.push(']');
+                        out.push(':');
+                        out.push('[');
+                        out.push_str(c2);
+                        out.push(']');
+                    }
+                }
+            }
+        }
     }
 }
 

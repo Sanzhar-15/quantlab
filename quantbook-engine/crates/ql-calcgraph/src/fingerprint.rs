@@ -176,6 +176,19 @@ fn hash_expr(expr: &Expr, h: &mut impl Hasher) {
             11u8.hash(h);
             ev.sigil().hash(h);
         }
+        Expr::StructuredRef { table_name, spec } => {
+            // **W5-112 (Phase 4.8.C):** structured table reference.
+            // Hash by table name (canonical-insensitive — uppercase
+            // for stability) + the spec subtree's debug representation
+            // (Debug is derived; stable across versions within a major
+            // release). Two cells with `Sales[Qty]` fingerprint
+            // identically regardless of case in the source text.
+            12u8.hash(h);
+            table_name.to_ascii_uppercase().hash(h);
+            // Hash spec by its Debug form for now — full structural
+            // hashing lands when 4.8.E binder + 4.8.G calcgraph land.
+            format!("{spec:?}").hash(h);
+        }
     }
 }
 

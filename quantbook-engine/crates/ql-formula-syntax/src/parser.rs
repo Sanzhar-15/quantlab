@@ -111,6 +111,20 @@ pub enum ParseError {
     /// allowed in v1 array literals (Phase 4.10 lifts this).
     #[error("invalid array-cell token in array literal: {got}")]
     InvalidArrayCellToken { got: String },
+
+    /// **W5-112 (Phase 4.8.C):** the bracket content of a structured
+    /// reference (e.g. `Sales[...]`) didn't parse against the
+    /// structured-ref sub-grammar. `reason` describes what failed
+    /// (e.g. "unclosed inner `[`", "unknown special item `#Foo`",
+    /// "empty column name").
+    #[error(
+        "malformed structured reference {table_name}[{bracket_content}]: {reason}"
+    )]
+    StructuredRefMalformed {
+        table_name: String,
+        bracket_content: String,
+        reason: &'static str,
+    },
 }
 
 /// Parse a complete formula from `tokens` (lexer output) to an AST.
@@ -359,6 +373,22 @@ impl Parser {
                 abs_start: abs,
                 abs_end: abs,
             })),
+
+            // **W5-112 (Phase 4.8.C):** structured reference. Lexer
+            // emitted `StructuredRef { table_name, bracket_content }`
+            // with the OOXML escapes already resolved. Parse the
+            // bracket content against the structured-ref sub-grammar
+            // (`parse_structured_ref_spec`).
+            Token::StructuredRef {
+                table_name,
+                bracket_content,
+            } => {
+                let spec = parse_structured_ref_spec(&table_name, &bracket_content)?;
+                Ok(Expr::StructuredRef {
+                    table_name: table_name.clone(),
+                    spec,
+                })
+            }
 
             // Unary prefix operators.
             Token::Op(Operator::Minus) => {
@@ -911,6 +941,276 @@ fn infix_bp(op: Operator) -> Option<(u8, u8)> {
 fn canonicalize_function_name(name: &Arc<str>) -> Arc<str> {
     let upper = name.as_ref().to_ascii_uppercase();
     Arc::from(upper.as_str())
+}
+
+// ===== W5-112 (Phase 4.8.C): structured-reference sub-grammar =====
+
+/// Parse the bracket content of a structured reference (e.g. `Sales[...]`)
+/// against the spec sub-grammar (design § 6.3). The content has already
+/// been OOXML-unescaped by the lexer.
+///
+/// Top-level shape decision (in order):
+/// 1. Content starts with `@` → `ThisRowColumn` or `ThisRowColumnRange`.
+/// 2. Content starts with `[` → `Combination` (one or more items separated
+///    by `,`, possibly with whitespace).
+/// 3. Otherwise (bare identifier, no leading `[` or `@`) → `BareColumn`.
+fn parse_structured_ref_spec(
+    table_name: &str,
+    bracket_content: &str,
+) -> Result<crate::ast::TableSpecSubtree, ParseError> {
+    let trimmed = bracket_content.trim();
+    if trimmed.is_empty() {
+        return Err(ParseError::StructuredRefMalformed {
+            table_name: table_name.to_owned(),
+            bracket_content: bracket_content.to_owned(),
+            reason: "empty bracket content",
+        });
+    }
+
+    let mut cursor = SrefCursor::new(trimmed);
+
+    if cursor.peek() == Some('@') {
+        cursor.advance();
+        parse_sref_thisrow(table_name, bracket_content, &mut cursor)
+    } else if cursor.peek() == Some('[') {
+        parse_sref_combination(table_name, bracket_content, &mut cursor)
+    } else {
+        // Bare column shorthand. Whole remaining content is the column name.
+        let name = cursor.remaining_trimmed();
+        if name.is_empty() {
+            return Err(ParseError::StructuredRefMalformed {
+                table_name: table_name.to_owned(),
+                bracket_content: bracket_content.to_owned(),
+                reason: "empty bare column name",
+            });
+        }
+        Ok(crate::ast::TableSpecSubtree::BareColumn(Arc::from(name)))
+    }
+}
+
+/// Lightweight char cursor over a structured-ref bracket content string.
+struct SrefCursor<'a> {
+    rest: &'a str,
+}
+
+impl<'a> SrefCursor<'a> {
+    fn new(s: &'a str) -> Self {
+        Self { rest: s }
+    }
+    fn peek(&self) -> Option<char> {
+        self.rest.chars().next()
+    }
+    fn advance(&mut self) {
+        if let Some(c) = self.rest.chars().next() {
+            self.rest = &self.rest[c.len_utf8()..];
+        }
+    }
+    fn skip_ws(&mut self) {
+        self.rest = self.rest.trim_start();
+    }
+    fn remaining_trimmed(&self) -> &'a str {
+        self.rest.trim()
+    }
+    fn is_empty(&self) -> bool {
+        self.rest.is_empty()
+    }
+
+    /// Consume a `[...]` group (without leading `[`-consumption — caller
+    /// already consumed the `[`). Returns the inner string with leading/
+    /// trailing whitespace trimmed. The inner `]` is consumed.
+    fn consume_bracket_group(&mut self) -> Result<&'a str, &'static str> {
+        // The lexer already ensured bracket balance at the OUTER level
+        // with escape handling. Here we just walk until the next `]` —
+        // any nested `[` inside is itself an inner spec which the lexer
+        // would have already balanced.
+        let mut depth: u32 = 1;
+        let mut end_byte = None;
+        let bytes = self.rest.as_bytes();
+        for (i, b) in bytes.iter().enumerate() {
+            match *b {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_byte = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let i = end_byte.ok_or("unclosed `[` inside structured-ref content")?;
+        let inner = &self.rest[..i];
+        self.rest = &self.rest[i + 1..];
+        Ok(inner.trim())
+    }
+}
+
+/// Parse the `@...` ThisRow shorthand (caller already consumed the `@`).
+fn parse_sref_thisrow(
+    table_name: &str,
+    bracket_content: &str,
+    cursor: &mut SrefCursor<'_>,
+) -> Result<crate::ast::TableSpecSubtree, ParseError> {
+    cursor.skip_ws();
+    let malformed = |reason: &'static str| ParseError::StructuredRefMalformed {
+        table_name: table_name.to_owned(),
+        bracket_content: bracket_content.to_owned(),
+        reason,
+    };
+
+    // `@Col` (no inner brackets) — single column.
+    if cursor.peek() != Some('[') {
+        let name = cursor.remaining_trimmed();
+        if name.is_empty() {
+            return Err(malformed("empty column name after `@`"));
+        }
+        return Ok(crate::ast::TableSpecSubtree::ThisRowColumn(Arc::from(name)));
+    }
+
+    // `@[Col]` or `@[Col1]:[Col2]` — bracketed forms.
+    cursor.advance(); // consume `[`
+    let first = cursor
+        .consume_bracket_group()
+        .map_err(|_| malformed("unclosed `[` after `@`"))?;
+    if first.is_empty() {
+        return Err(malformed("empty column name inside `@[...]`"));
+    }
+    cursor.skip_ws();
+    if cursor.is_empty() {
+        return Ok(crate::ast::TableSpecSubtree::ThisRowColumn(Arc::from(first)));
+    }
+    // Expect `:[Col2]`.
+    if cursor.peek() != Some(':') {
+        return Err(malformed("expected `:` or end after `@[Col]`"));
+    }
+    cursor.advance(); // `:`
+    cursor.skip_ws();
+    if cursor.peek() != Some('[') {
+        return Err(malformed("expected `[Col]` after `@[...]:` "));
+    }
+    cursor.advance(); // `[`
+    let second = cursor
+        .consume_bracket_group()
+        .map_err(|_| malformed("unclosed `[` in `@[Col1]:[Col2]`"))?;
+    if second.is_empty() {
+        return Err(malformed("empty second column in `@[Col1]:[Col2]`"));
+    }
+    cursor.skip_ws();
+    if !cursor.is_empty() {
+        return Err(malformed("trailing content after `@[Col1]:[Col2]`"));
+    }
+    Ok(crate::ast::TableSpecSubtree::ThisRowColumnRange(
+        Arc::from(first),
+        Arc::from(second),
+    ))
+}
+
+/// Parse a `Combination` — one or more `[item]` (or `[Col1]:[Col2]`)
+/// separated by `,`. Caller has NOT yet consumed the first `[`.
+fn parse_sref_combination(
+    table_name: &str,
+    bracket_content: &str,
+    cursor: &mut SrefCursor<'_>,
+) -> Result<crate::ast::TableSpecSubtree, ParseError> {
+    let malformed = |reason: &'static str| ParseError::StructuredRefMalformed {
+        table_name: table_name.to_owned(),
+        bracket_content: bracket_content.to_owned(),
+        reason,
+    };
+
+    let mut items: Vec<crate::ast::TableSpecItem> = Vec::new();
+    loop {
+        cursor.skip_ws();
+        if cursor.peek() != Some('[') {
+            return Err(malformed("expected `[` to open structured-ref item"));
+        }
+        cursor.advance();
+        let inner = cursor
+            .consume_bracket_group()
+            .map_err(|_| malformed("unclosed `[` inside Combination item"))?;
+        let item = classify_sref_item(table_name, bracket_content, inner)?;
+
+        // After this item, peek for `:` (column range) or `,` (next item) or end.
+        cursor.skip_ws();
+        if cursor.peek() == Some(':') {
+            // Column range: only valid if the just-parsed item is a Column.
+            cursor.advance();
+            cursor.skip_ws();
+            if cursor.peek() != Some('[') {
+                return Err(malformed("expected `[Col2]` after `:` in column range"));
+            }
+            cursor.advance();
+            let inner2 = cursor
+                .consume_bracket_group()
+                .map_err(|_| malformed("unclosed `[` in `[Col1]:[Col2]`"))?;
+            let item2 = classify_sref_item(table_name, bracket_content, inner2)?;
+            match (item, item2) {
+                (
+                    crate::ast::TableSpecItem::Column(c1),
+                    crate::ast::TableSpecItem::Column(c2),
+                ) => {
+                    items.push(crate::ast::TableSpecItem::ColumnRange(c1, c2));
+                }
+                _ => {
+                    return Err(malformed(
+                        "`:` between non-column items in structured ref (only `[Col]:[Col]` is valid)",
+                    ));
+                }
+            }
+        } else {
+            items.push(item);
+        }
+
+        cursor.skip_ws();
+        match cursor.peek() {
+            Some(',') => {
+                cursor.advance();
+                continue;
+            }
+            None => break,
+            _ => return Err(malformed("expected `,` or end after structured-ref item")),
+        }
+    }
+
+    Ok(crate::ast::TableSpecSubtree::Combination(items))
+}
+
+/// Classify the inner content of a `[item]` against the 3 item shapes:
+/// `Special(item)`, `Column(name)`, or (caller handles ColumnRange).
+fn classify_sref_item(
+    table_name: &str,
+    bracket_content: &str,
+    inner: &str,
+) -> Result<crate::ast::TableSpecItem, ParseError> {
+    let trimmed = inner.trim();
+    if trimmed.is_empty() {
+        return Err(ParseError::StructuredRefMalformed {
+            table_name: table_name.to_owned(),
+            bracket_content: bracket_content.to_owned(),
+            reason: "empty `[]` item in structured ref",
+        });
+    }
+    if let Some(rest) = trimmed.strip_prefix('#') {
+        // Special item. Match case-insensitively per Excel canon.
+        let special = match rest.trim().to_ascii_uppercase().as_str() {
+            "HEADERS" => crate::ast::SpecialItem::Headers,
+            "TOTALS" => crate::ast::SpecialItem::Totals,
+            "DATA" => crate::ast::SpecialItem::Data,
+            "ALL" => crate::ast::SpecialItem::All,
+            "THIS ROW" => crate::ast::SpecialItem::ThisRow,
+            _ => {
+                return Err(ParseError::StructuredRefMalformed {
+                    table_name: table_name.to_owned(),
+                    bracket_content: bracket_content.to_owned(),
+                    reason: "unknown special item — supported: #Headers, #Totals, #Data, #All, #This Row",
+                });
+            }
+        };
+        Ok(crate::ast::TableSpecItem::Special(special))
+    } else {
+        Ok(crate::ast::TableSpecItem::Column(Arc::from(trimmed)))
+    }
 }
 
 #[cfg(test)]
@@ -2165,6 +2465,222 @@ mod tests {
                 assert!(got.contains("Semicolon"), "got: {got}");
             }
             other => panic!("expected InvalidArrayCellToken, got {other:?}"),
+        }
+    }
+
+    // ===== W5-112 (Phase 4.8.C) — structured references =====
+
+    use crate::ast::{SpecialItem, TableSpecItem, TableSpecSubtree};
+
+    #[test]
+    fn parse_structured_ref_bare_column() {
+        let expr = parse_ok("Sales[Qty]");
+        match expr {
+            Expr::StructuredRef { table_name, spec } => {
+                assert_eq!(table_name.as_ref(), "Sales");
+                assert_eq!(spec, TableSpecSubtree::BareColumn(Arc::from("Qty")));
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_structured_ref_single_column_in_brackets() {
+        // `Sales[[Qty]]` — combination with one column.
+        let expr = parse_ok("Sales[[Qty]]");
+        match expr {
+            Expr::StructuredRef { spec, .. } => match spec {
+                TableSpecSubtree::Combination(items) => {
+                    assert_eq!(items.len(), 1);
+                    assert_eq!(items[0], TableSpecItem::Column(Arc::from("Qty")));
+                }
+                other => panic!("expected Combination, got {other:?}"),
+            },
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_structured_ref_special_headers() {
+        let expr = parse_ok("Sales[[#Headers]]");
+        match expr {
+            Expr::StructuredRef { spec, .. } => {
+                assert_eq!(
+                    spec,
+                    TableSpecSubtree::Combination(vec![TableSpecItem::Special(
+                        SpecialItem::Headers
+                    )])
+                );
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_structured_ref_all_5_specifiers() {
+        let cases = [
+            ("Sales[[#Headers]]", SpecialItem::Headers),
+            ("Sales[[#Totals]]", SpecialItem::Totals),
+            ("Sales[[#Data]]", SpecialItem::Data),
+            ("Sales[[#All]]", SpecialItem::All),
+            ("Sales[[#This Row]]", SpecialItem::ThisRow),
+        ];
+        for (src, expected) in cases {
+            let expr = parse_ok(src);
+            match expr {
+                Expr::StructuredRef { spec, .. } => match spec {
+                    TableSpecSubtree::Combination(items) => {
+                        assert_eq!(items, vec![TableSpecItem::Special(expected)], "case {src:?}");
+                    }
+                    other => panic!("case {src:?}: expected Combination, got {other:?}"),
+                },
+                other => panic!("case {src:?}: expected StructuredRef, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_structured_ref_special_column_combination() {
+        // `Sales[[#Headers], [Qty]]` — 2-item combination.
+        let expr = parse_ok("Sales[[#Headers], [Qty]]");
+        match expr {
+            Expr::StructuredRef { spec, .. } => {
+                assert_eq!(
+                    spec,
+                    TableSpecSubtree::Combination(vec![
+                        TableSpecItem::Special(SpecialItem::Headers),
+                        TableSpecItem::Column(Arc::from("Qty")),
+                    ])
+                );
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_structured_ref_column_range() {
+        // `Sales[[Col1]:[Col2]]` — column range item.
+        let expr = parse_ok("Sales[[Col1]:[Col2]]");
+        match expr {
+            Expr::StructuredRef { spec, .. } => {
+                assert_eq!(
+                    spec,
+                    TableSpecSubtree::Combination(vec![TableSpecItem::ColumnRange(
+                        Arc::from("Col1"),
+                        Arc::from("Col2")
+                    )])
+                );
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_structured_ref_three_item_combination() {
+        // `Sales[[#Data], [#Totals], [Col]]` — multi-item combination
+        // (the design § 6.2 Combination(Vec<...>) case driven by Codex
+        // HIGH-4 closure).
+        let expr = parse_ok("Sales[[#Data], [#Totals], [Col]]");
+        match expr {
+            Expr::StructuredRef { spec, .. } => {
+                assert_eq!(
+                    spec,
+                    TableSpecSubtree::Combination(vec![
+                        TableSpecItem::Special(SpecialItem::Data),
+                        TableSpecItem::Special(SpecialItem::Totals),
+                        TableSpecItem::Column(Arc::from("Col")),
+                    ])
+                );
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_structured_ref_at_column_shorthand() {
+        // `Sales[@Qty]` — current-row shorthand.
+        let expr = parse_ok("Sales[@Qty]");
+        match expr {
+            Expr::StructuredRef { spec, .. } => {
+                assert_eq!(spec, TableSpecSubtree::ThisRowColumn(Arc::from("Qty")));
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_structured_ref_at_bracketed_column() {
+        // `Sales[@[Qty]]` — bracketed @-form.
+        let expr = parse_ok("Sales[@[Qty]]");
+        match expr {
+            Expr::StructuredRef { spec, .. } => {
+                assert_eq!(spec, TableSpecSubtree::ThisRowColumn(Arc::from("Qty")));
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_structured_ref_at_column_range() {
+        // `Sales[@[Col1]:[Col2]]` — current-row range.
+        let expr = parse_ok("Sales[@[Col1]:[Col2]]");
+        match expr {
+            Expr::StructuredRef { spec, .. } => {
+                assert_eq!(
+                    spec,
+                    TableSpecSubtree::ThisRowColumnRange(
+                        Arc::from("Col1"),
+                        Arc::from("Col2")
+                    )
+                );
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_structured_ref_unknown_special_errors() {
+        // `Sales[[#Foo]]` — `#Foo` is not a recognized special item.
+        let err = parse_err("Sales[[#Foo]]");
+        match err {
+            ParseError::StructuredRefMalformed { reason, .. } => {
+                assert!(reason.contains("special"), "reason: {reason}");
+            }
+            other => panic!("expected StructuredRefMalformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_structured_ref_empty_bracket_errors() {
+        // `Sales[]` — empty bracket content.
+        let err = parse_err("Sales[]");
+        match err {
+            ParseError::StructuredRefMalformed { reason, .. } => {
+                assert!(reason.contains("empty"), "reason: {reason}");
+            }
+            other => panic!("expected StructuredRefMalformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_structured_ref_sum_of_table_column() {
+        // `SUM(Sales[Qty])` — function call with table ref as arg. The
+        // critical integration: structured-ref is just a primary expr
+        // and slots into argument lists like any other.
+        let expr = parse_ok("SUM(Sales[Qty])");
+        match expr {
+            Expr::Function { name, args } => {
+                assert_eq!(name.as_ref(), "SUM");
+                assert_eq!(args.len(), 1);
+                match &args[0] {
+                    Expr::StructuredRef { table_name, spec } => {
+                        assert_eq!(table_name.as_ref(), "Sales");
+                        assert_eq!(spec, &TableSpecSubtree::BareColumn(Arc::from("Qty")));
+                    }
+                    other => panic!("expected StructuredRef arg, got {other:?}"),
+                }
+            }
+            other => panic!("expected Function, got {other:?}"),
         }
     }
 }

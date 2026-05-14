@@ -552,6 +552,16 @@ fn bind_with_context<L: NameLookup>(
                 None => Err(BindError::UnresolvedName(name.clone())),
             }
         }
+        // **W5-112 (Phase 4.8.C):** structured-ref AST exists; the binder
+        // arm lands in 4.8.E (lookup against TableTable) + 4.8.F (BindSite
+        // + this-row resolution). For 4.8.C the AST compiles + the parser
+        // emits StructuredRef; binding any cell containing one surfaces
+        // UnsupportedVariant. This is INTENTIONAL — set_formula at a
+        // structured-ref cell will REJECT until 4.8.E lands.
+        Expr::StructuredRef { .. } => Err(BindError::UnsupportedVariant(
+            "structured table reference binding lands in Phase 4.8.E (W5-114) — \
+             AST + parser shipped in 4.8.C (W5-112)",
+        )),
     }
 }
 
@@ -646,6 +656,7 @@ fn variant_kind(e: &Expr) -> &'static str {
         Expr::Array(_) => "Array",
         Expr::Spill(_) => "Spill",
         Expr::NameRef(_) => "NameRef",
+        Expr::StructuredRef { .. } => "StructuredRef",
     }
 }
 

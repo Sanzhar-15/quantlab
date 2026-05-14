@@ -92,6 +92,81 @@ pub enum Expr {
     /// - `{1, #N/A, 3}` — error literal in an array (per Phase 4.7
     ///   design § 3.3).
     Error(ql_types::ErrorValue),
+
+    /// **W5-112 (Phase 4.8.C):** structured table reference
+    /// `Sales[Qty]`, `Sales[[#Headers], [Qty]]`, `[@Col]`, etc.
+    ///
+    /// `table_name` is the case-preserving identifier preceding the
+    /// outer `[`; the binder canonicalizes to uppercase for lookup
+    /// against `Workbook::tables`. `spec` is the parsed bracket content
+    /// (per design § 6.2). The binder (4.8.E + 4.8.F) resolves to a
+    /// concrete `Range` (or `Address` for `[@Col]` and single-cell
+    /// specifier forms) using table metadata; error variants
+    /// (`BindError::UnknownTable / UnknownTableColumn /
+    /// ThisRowOutsideTable / StructuredRefDegenerateRange`) surface
+    /// problems precisely.
+    StructuredRef {
+        table_name: Arc<str>,
+        spec: TableSpecSubtree,
+    },
+}
+
+/// **W5-112 (Phase 4.8.C):** a structured-reference spec (the parsed
+/// bracket content). Per design § 6.2, three top-level shapes:
+///
+/// - [`BareColumn`] — `Sales[Qty]` — column shorthand without surrounding
+///   `[…]`. Kept distinct from `Combination(vec![Column(c)])` for printer
+///   round-trip; semantically normalized at bind time.
+/// - [`Combination`] — `Sales[[Col]]`, `Sales[[#Headers]]`,
+///   `Sales[[#Data], [Col1]:[Col2]]`, multi-item combinations etc. The
+///   `Vec<TableSpecItem>` carries items in source order; the binder
+///   normalizes to a single `(RowSelector, ColumnSelector)` intersection.
+/// - [`ThisRowColumn`] / [`ThisRowColumnRange`] — `[@Col]` / `[@[C1]:[C2]]`
+///   shorthand for "current row in `Col`". Resolves to a single cell
+///   (`ThisRowColumn`) or a 1-row range (`ThisRowColumnRange`); requires
+///   the binder's owning-cell context (`BindError::ThisRowRequiresOwningCell`
+///   if absent, `BindError::ThisRowOutsideTable` if the formula's cell
+///   isn't inside the table).
+///
+/// [`BareColumn`]: TableSpecSubtree::BareColumn
+/// [`Combination`]: TableSpecSubtree::Combination
+/// [`ThisRowColumn`]: TableSpecSubtree::ThisRowColumn
+/// [`ThisRowColumnRange`]: TableSpecSubtree::ThisRowColumnRange
+#[derive(Clone, Debug, PartialEq)]
+pub enum TableSpecSubtree {
+    /// `Sales[Qty]` — bare column shorthand without surrounding `[…]`.
+    BareColumn(Arc<str>),
+    /// `Sales[[#Data], [Col1]:[Col2]]` and similar. Items in source order.
+    Combination(Vec<TableSpecItem>),
+    /// `[@Col]` — current row in named column.
+    ThisRowColumn(Arc<str>),
+    /// `[@[Col1]:[Col2]]` — current row in column range.
+    ThisRowColumnRange(Arc<str>, Arc<str>),
+}
+
+/// **W5-112 (Phase 4.8.C):** one item inside a structured-reference
+/// `Combination`. Per design § 6.2.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TableSpecItem {
+    /// `[#Headers]`, `[#Totals]`, `[#Data]`, `[#All]`, `[#This Row]`.
+    Special(SpecialItem),
+    /// `[Col]` — single column.
+    Column(Arc<str>),
+    /// `[Col1]:[Col2]` — column range (order-independent at bind time).
+    ColumnRange(Arc<str>, Arc<str>),
+}
+
+/// **W5-112 (Phase 4.8.C):** the 5 Excel special-row specifiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpecialItem {
+    Headers,
+    Totals,
+    Data,
+    All,
+    /// `[#This Row]` — used inside a Combination (the bracketed form).
+    /// The `[@Col]` shorthand is `TableSpecSubtree::ThisRowColumn`,
+    /// not this variant.
+    ThisRow,
 }
 
 /// **W5-87 (Phase 4.6.A part 1):** sheet-qualification for AST references.
@@ -214,6 +289,12 @@ pub fn rewrite_sheet_name_in_expr(expr: &Expr, old_canonical: &str, new_name: &A
             old_canonical,
             new_name,
         ))),
+        // W5-112 (Phase 4.8.C): structured refs have no SheetRef
+        // (table names are workbook-scoped). Clone through.
+        Expr::StructuredRef { table_name, spec } => Expr::StructuredRef {
+            table_name: table_name.clone(),
+            spec: spec.clone(),
+        },
     }
 }
 
