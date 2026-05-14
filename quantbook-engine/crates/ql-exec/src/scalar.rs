@@ -39,10 +39,11 @@
 
 use ql_formula_syntax::Operator;
 use ql_functions::FunctionRegistry;
-use ql_types::{coercion, ErrorValue, Value};
+use ql_types::{coercion, ArrayValue, ErrorValue, Value};
 
 use crate::aggregate_cache::{AggregateCache, NoAggregateCache};
 use crate::env::CellEnv;
+use crate::eval_result::EvalResult;
 use crate::plan::ExprPlan;
 
 /// Evaluate an `ExprPlan` against `env` to produce a `Value`. Total function — never
@@ -374,6 +375,77 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
         // path) lands in W5-102 / Phase 4.7.J; until then, every
         // `ExprPlan::Array` evaluation produces `#CALC!`.
         ExprPlan::Array(_) => Value::Error(ErrorValue::Calc),
+    }
+}
+
+/// **W5-103 (Phase 4.7.J.1) — cell-boundary entry point.** Returns
+/// `EvalResult::Scalar` for every plan shape that does NOT produce an
+/// array at the cell root, and `EvalResult::Array` ONLY for top-level
+/// `ExprPlan::Array` (Phase 4.7.J.1) and, in future, array-returning
+/// function calls (Phase 4.7.M for SEQUENCE; 4.7.N for FILTER/TRANSPOSE).
+///
+/// **Contract divergence from `eval_scalar_with_cache`:** the scalar
+/// evaluator treats `ExprPlan::Array(_)` as array-in-scalar-context and
+/// returns `Value::Error(ErrorValue::Calc)` per design § 6.3. This is
+/// the correct semantics ANYWHERE an array surfaces inside an arithmetic
+/// or comparison context — and it stays unchanged.
+///
+/// At the CELL boundary, however, an array result is a SPILL request,
+/// not an error. The runtime's spill-writeback path (Phase 4.7.J.2)
+/// pattern-matches on `EvalResult::Array(_)` and materializes the
+/// array into per-cell computed-overlay writes. By keeping THIS
+/// function the only path that returns `EvalResult::Array`, every
+/// non-cell-boundary call site continues to produce `#CALC!` for
+/// arrays — preserving the scalar-context contract.
+///
+/// **What about nested array results inside expressions?** Per § 3.3,
+/// array literals at non-root positions are parser-rejected, and binder
+/// validation forbids non-literal cell-plans inside `ExprPlan::Array`.
+/// So at the cell boundary, only the OUTERMOST plan node can be an
+/// `Array`. Any deeper subtree is normal scalar-producing code.
+///
+/// **Materialization detail.** Each cell-plan inside an
+/// `ExprPlan::Array` is a literal (Number / Bool / String / Error) per
+/// binder rules. We still route the per-cell evaluation through
+/// `eval_scalar_with_cache` for uniformity — there's no shortcut here,
+/// since the literal-only restriction is a binder-side invariant and
+/// the evaluator stays plan-shape-agnostic.
+///
+/// **`ArrayValue::new` invariants.** The binder rejects
+/// `ExprPlan::Array(vec![])` (`BindError::EmptyArrayLiteral`) and
+/// `ExprPlan::Array(vec![vec![]])` likewise, AND row-arity mismatch
+/// (`BindError::ArrayRowArityMismatch`). So when we reach this code,
+/// `rows.len() >= 1`, every row has the same `>= 1` width, and the
+/// flattened `cells` vec satisfies `len == rows.len() * cols`.
+/// `ArrayValue::new` therefore CANNOT fail here (the only error case
+/// is `CellCountMismatch`). We assert via `expect` rather than building
+/// a fallback path; per the no-fallbacks rule, a binder regression
+/// should panic loudly, not silently produce `#CALC!`.
+pub fn eval_at_cell_boundary<E: CellEnv>(
+    plan: &ExprPlan,
+    env: &E,
+    registry: &FunctionRegistry,
+    cache: &dyn AggregateCache,
+) -> EvalResult {
+    match plan {
+        ExprPlan::Array(rows) => {
+            // Binder invariants (see doc comment): rows non-empty,
+            // first row determines column count, every row matches.
+            let array_rows = rows.len() as u32;
+            let array_cols = rows[0].len() as u32;
+            let mut cells: Vec<Value> = Vec::with_capacity(rows.len() * rows[0].len());
+            for row in rows {
+                for cell_plan in row {
+                    cells.push(eval_scalar_with_cache(cell_plan, env, registry, cache));
+                }
+            }
+            let array = ArrayValue::new(array_rows, array_cols, cells).expect(
+                "binder validation guarantees rows*cols == cell count; \
+                 reaching ArrayShapeError here means the binder is broken",
+            );
+            EvalResult::Array(array)
+        }
+        _ => EvalResult::Scalar(eval_scalar_with_cache(plan, env, registry, cache)),
     }
 }
 
@@ -1649,5 +1721,109 @@ mod tests {
         // Interim: SUMPRODUCT sees the array as `FnArg::Scalar(#CALC!)`
         // and propagates the error.
         assert_eq!(v, Value::Error(ErrorValue::Calc));
+    }
+
+    // ===== W5-103 (Phase 4.7.J.1) — eval_at_cell_boundary =====
+
+    /// Scalar plans pass straight through as `EvalResult::Scalar`. The
+    /// boundary entry point delegates to `eval_scalar_with_cache` for
+    /// every non-Array plan shape.
+    #[test]
+    fn eval_at_cell_boundary_scalar_plan_returns_scalar() {
+        let env = MapEnv::new();
+        let registry = FunctionRegistry::default();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Number(7.5);
+        let r = eval_at_cell_boundary(&plan, &env, &registry, &cache);
+        assert_eq!(r, EvalResult::Scalar(Value::Number(7.5)));
+    }
+
+    /// `{1,2;3,4}` materializes a 2×2 ArrayValue at the cell boundary.
+    /// Same plan through `eval_scalar_with_cache` would yield `#CALC!`
+    /// (scalar-context contract); the boundary entry point routes
+    /// Array plans differently.
+    #[test]
+    fn eval_at_cell_boundary_2x2_array_literal_returns_array_value() {
+        let env = MapEnv::new();
+        let registry = FunctionRegistry::default();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Array(vec![
+            vec![ExprPlan::Number(1.0), ExprPlan::Number(2.0)],
+            vec![ExprPlan::Number(3.0), ExprPlan::Number(4.0)],
+        ]);
+        let r = eval_at_cell_boundary(&plan, &env, &registry, &cache);
+        match r {
+            EvalResult::Array(a) => {
+                assert_eq!(a.rows(), 2);
+                assert_eq!(a.cols(), 2);
+                assert_eq!(a.cells().len(), 4);
+                assert_eq!(a.at(0, 0), &Value::Number(1.0));
+                assert_eq!(a.at(0, 1), &Value::Number(2.0));
+                assert_eq!(a.at(1, 0), &Value::Number(3.0));
+                assert_eq!(a.at(1, 1), &Value::Number(4.0));
+            }
+            EvalResult::Scalar(v) => panic!("expected array, got Scalar({:?})", v),
+        }
+    }
+
+    /// 1×1 array does NOT auto-scalarize. Spill writeback at the runtime
+    /// (Phase 4.7.J.2) decides what to do with a 1×1 — Excel's behavior
+    /// is to spill it (single-cell spill), but THIS function's contract
+    /// is purely "did the plan produce an array, yes/no." Auto-scalarizing
+    /// here would mask that distinction from the runtime.
+    #[test]
+    fn eval_at_cell_boundary_1x1_array_stays_array() {
+        let env = MapEnv::new();
+        let registry = FunctionRegistry::default();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Array(vec![vec![ExprPlan::Number(42.0)]]);
+        let r = eval_at_cell_boundary(&plan, &env, &registry, &cache);
+        assert!(r.is_array(), "1×1 must remain Array at the boundary");
+    }
+
+    /// Per-cell errors inside the array materialize into the
+    /// `ArrayValue` as `Value::Error(_)` — they do NOT short-circuit
+    /// the surrounding array. (Excel ranks per-cell errors at the same
+    /// level as per-cell numbers; the array as a whole is still an
+    /// array.)
+    #[test]
+    fn eval_at_cell_boundary_array_with_error_cell_preserves_error_per_cell() {
+        let env = MapEnv::new();
+        let registry = FunctionRegistry::default();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Array(vec![vec![
+            ExprPlan::Number(1.0),
+            ExprPlan::Error(ErrorValue::DivZero),
+        ]]);
+        let r = eval_at_cell_boundary(&plan, &env, &registry, &cache);
+        match r {
+            EvalResult::Array(a) => {
+                assert_eq!(a.at(0, 0), &Value::Number(1.0));
+                assert_eq!(a.at(0, 1), &Value::Error(ErrorValue::DivZero));
+            }
+            EvalResult::Scalar(v) => panic!("expected array, got Scalar({:?})", v),
+        }
+    }
+
+    /// `ExprPlan::Function` returning a SCALAR keeps the `Scalar` boundary
+    /// result. (Array-returning functions land in 4.7.M/N; this test
+    /// pins that the dispatch path doesn't accidentally promote a scalar
+    /// function call to an Array.)
+    #[test]
+    fn eval_at_cell_boundary_function_returning_scalar_stays_scalar() {
+        let env = MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        // SUM(1, 2, 3) — registered SUM produces a single Number.
+        let plan = ExprPlan::Function {
+            name: Arc::from("SUM"),
+            args: vec![
+                ExprPlan::Number(1.0),
+                ExprPlan::Number(2.0),
+                ExprPlan::Number(3.0),
+            ],
+        };
+        let r = eval_at_cell_boundary(&plan, &env, &registry, &cache);
+        assert_eq!(r, EvalResult::Scalar(Value::Number(6.0)));
     }
 }
