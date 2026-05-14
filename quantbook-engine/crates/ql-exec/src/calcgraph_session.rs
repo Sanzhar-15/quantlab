@@ -240,6 +240,20 @@ pub(crate) fn walk_plan_for_deps(plan: &ExprPlan, deps: &mut FormulaDeps) {
         ExprPlan::Array(_) | ExprPlan::Error(_) => {
             // No deps; leaf literals.
         }
+        // **W5-115 (Phase 4.8.F):** structured-ref dep extraction.
+        // Treat the resolved range as a range dep (same path as
+        // `AggregateNameRef`); the calcgraph stripe index handles
+        // invalidation when any cell inside the table footprint
+        // changes. 4.8.G adds the `table_to_formulas` reverse index
+        // for `on_table_*` mutation hooks; for now, just the range
+        // is registered.
+        ExprPlan::StructuredRef {
+            table_name, resolved, ..
+        } => {
+            // Reuse the named_ranges slot — semantically equivalent
+            // for the stripe index (the "name" is the table name).
+            deps.named_ranges.push((Arc::clone(table_name), *resolved));
+        }
     }
 }
 
@@ -710,7 +724,7 @@ impl CalcgraphSession {
         // W5-92 (Phase 4.6.D): pass `wb` for names so the two-tier
         // sheet-then-workbook scope chain fires; was `wb.names()`
         // (workbook-scoped only).
-        Ok(bind_with_site(&expr, site, wb, wb)?)
+        Ok(bind_with_site(&expr, site, wb, wb, wb)?)
     }
 
     /// **G3-02 acceptance (hook 1/5).** Mutation hook fired by

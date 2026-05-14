@@ -311,6 +311,17 @@ impl crate::plan::SheetResolver for ql_storage::Workbook {
     }
 }
 
+/// **W5-115 (Phase 4.8.F):** the production `TableLookup` impl —
+/// `&Workbook` resolves table names via `Workbook::lookup_table` (the
+/// case-insensitive lookup against `TableTable` added in Phase 4.8.A).
+/// Production callers pass `&self.workbook` as the `&dyn TableLookup`
+/// argument to `bind_with_site`.
+impl crate::plan::TableLookup for ql_storage::Workbook {
+    fn lookup_table(&self, name: &str) -> Option<&ql_storage::TableMetadata> {
+        self.lookup_table(name)
+    }
+}
+
 /// Project a `NamedTarget` into the binder-side `ResolvedName` vocabulary. Phase
 /// 2A.6 audit M2/M3: `Constant(Blank)` and `Constant(Error)` now map to distinct
 /// `ResolvedName` variants (the binder converts them to specific `BindError`

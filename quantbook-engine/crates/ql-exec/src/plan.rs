@@ -111,6 +111,39 @@ pub enum ExprPlan {
     /// `=#REF!` formulas, `IFERROR(..., #N/A)` fallback args, and error
     /// literals inside `Expr::Array` cells.
     Error(ErrorValue),
+
+    /// **W5-115 (Phase 4.8.F):** structured table reference resolved
+    /// against the workbook's `TableTable`. The binder narrows the
+    /// `TableSpecSubtree` source AST to a concrete [`Range`]; eval
+    /// (Phase 4.8.G) reads the range like an `AggregateNameRef`.
+    ///
+    /// `is_this_row == true` indicates the source spec was a `[@Col]`
+    /// shorthand (or `[[#This Row], [Col]]`): the resolved range
+    /// covers the FULL column's data rows, and the eval layer NARROWS
+    /// to a single cell using the formula's own row. This keeps the
+    /// plan cache cell-INDEPENDENT for these forms (the resolved
+    /// range only depends on the table metadata, not the formula
+    /// cell).
+    ///
+    /// `source` is kept for printer round-trip (the printer renders the
+    /// canonical `Table[…]` form, not the resolved range), error
+    /// messages, and future invalidation hooks.
+    StructuredRef {
+        /// Canonical (uppercase) table name. Used by the dep extractor
+        /// to register the formula in `table_to_formulas` for
+        /// `on_table_*` dirty propagation (Phase 4.8.G).
+        table_name: Arc<str>,
+        /// Original parsed spec subtree (for printer / diagnostics).
+        source: Arc<ql_formula_syntax::TableSpecSubtree>,
+        /// Resolved range. For column refs: the column's data range.
+        /// For `#Headers`: the header row's columns. For `#All`: the
+        /// full footprint. For `[@Col]`: the column's FULL data range
+        /// (eval narrows to current row).
+        resolved: Range,
+        /// `true` iff this is a `[@Col]` / `[[#This Row], [Col]]` form
+        /// that requires cell-time row narrowing.
+        is_this_row: bool,
+    },
 }
 
 /// Error during binding. Phase 2A.1 added `UnresolvedName`; Phase 2A.6 added
@@ -218,6 +251,46 @@ pub enum BindError {
     /// second line of defense.
     #[error("array literal is degenerate (zero rows or zero cells per row)")]
     EmptyArrayLiteral,
+
+    /// **W5-115 (Phase 4.8.F):** structured reference names a table
+    /// that isn't registered in the workbook's `TableTable`. Soft-fail
+    /// candidate per design § 7.4 (mapped to `Value::Error(#NAME?)`
+    /// at the cell value) — 4.8.G/H wires the soft-fail integration.
+    #[error("unknown table {0:?}")]
+    UnknownTable(std::sync::Arc<str>),
+
+    /// **W5-115 (Phase 4.8.F):** structured reference names a column
+    /// that doesn't exist in the named table's column roster.
+    #[error("unknown column {column:?} in table {table:?}")]
+    UnknownTableColumn {
+        table: std::sync::Arc<str>,
+        column: std::sync::Arc<str>,
+    },
+
+    /// **W5-115 (Phase 4.8.F):** `[#Headers]` specifier on a table with
+    /// `has_header == false`.
+    #[error("table {0:?} has no header row; `[#Headers]` is not applicable")]
+    TableHasNoHeader(std::sync::Arc<str>),
+
+    /// **W5-115 (Phase 4.8.F):** `[#Totals]` specifier on a table with
+    /// `has_totals == false`.
+    #[error("table {0:?} has no totals row; `[#Totals]` is not applicable")]
+    TableHasNoTotals(std::sync::Arc<str>),
+
+    /// **W5-115 (Phase 4.8.F):** the spec resolves to a degenerate
+    /// range (e.g. `[#Data]` on a header-only table with zero data rows).
+    /// `ql_types::Range` is inclusive and can't represent zero rows;
+    /// the binder surfaces this rather than constructing a malformed range.
+    #[error("structured reference on table {0:?} resolves to a degenerate (zero-row) range")]
+    StructuredRefDegenerateRange(std::sync::Arc<str>),
+
+    /// **W5-115 (Phase 4.8.F):** `[@Col]` (`ThisRowColumn` /
+    /// `ThisRowColumnRange`) form used without a known owning cell.
+    /// Bind paths that don't have cell context (parse-only, syntax
+    /// validation in tests) surface this; production paths always
+    /// supply a cell via `BindSite::at_cell`.
+    #[error("`[@Col]` shorthand requires an owning cell (none supplied)")]
+    ThisRowRequiresOwningCell,
 }
 
 /// Phase 2B.4 (2026-05-12): bind-time context for a sub-expression. Drives
@@ -373,7 +446,7 @@ pub fn bind_with_names_and_sheets<L: NameLookup>(
     names: &L,
     sheets: &dyn SheetResolver,
 ) -> Result<ExprPlan, BindError> {
-    bind_with_site(
+    bind_with_site_no_tables(
         expr,
         BindSite {
             sheet: owning_sheet,
@@ -412,22 +485,36 @@ impl BindSite {
     }
 }
 
-/// **W5-114 (Phase 4.8.E):** bind with explicit `BindSite` context.
-/// Used by production call sites that have the owning cell address
-/// available. 4.8.F consumes `site.cell` for `[@Col]` resolution; for
-/// now it's plumbed through and ignored by the existing bind logic.
+/// **W5-114 (Phase 4.8.E) / W5-115 (Phase 4.8.F):** bind with explicit
+/// `BindSite` context. Used by production call sites. 4.8.F adds the
+/// `tables` parameter for `Expr::StructuredRef` resolution; legacy
+/// callers can use [`bind_with_site_no_tables`] which supplies an
+/// `EmptyTableLookup` (any structured ref surfaces
+/// `BindError::UnknownTable`).
 pub fn bind_with_site<L: NameLookup>(
     expr: &Expr,
     site: BindSite,
     names: &L,
     sheets: &dyn SheetResolver,
+    tables: &dyn TableLookup,
 ) -> Result<ExprPlan, BindError> {
-    // 4.8.E: cell field plumbed but not yet consumed. 4.8.F adds the
-    // structured-ref resolution arm that reads it.
-    let _ = site.cell;
-    bind_with_context(expr, site.sheet, names, sheets, BindContext::Scalar)
+    bind_with_context_v2(expr, site, names, sheets, tables, BindContext::Scalar)
 }
 
+/// **W5-115 (Phase 4.8.F):** convenience wrapper for legacy call sites
+/// that don't have access to a `TableLookup`. Equivalent to
+/// `bind_with_site(.., &EmptyTableLookup)` — any `Expr::StructuredRef`
+/// surfaces `BindError::UnknownTable`.
+pub fn bind_with_site_no_tables<L: NameLookup>(
+    expr: &Expr,
+    site: BindSite,
+    names: &L,
+    sheets: &dyn SheetResolver,
+) -> Result<ExprPlan, BindError> {
+    bind_with_site(expr, site, names, sheets, &EmptyTableLookup)
+}
+
+#[allow(dead_code)]
 fn bind_with_context<L: NameLookup>(
     expr: &Expr,
     owning_sheet: SheetId,
@@ -435,6 +522,26 @@ fn bind_with_context<L: NameLookup>(
     sheets: &dyn SheetResolver,
     ctx: BindContext,
 ) -> Result<ExprPlan, BindError> {
+    // 4.8.F: legacy entry — no table resolver, no cell context.
+    bind_with_context_v2(
+        expr,
+        BindSite::sheet_only(owning_sheet),
+        names,
+        sheets,
+        &EmptyTableLookup,
+        ctx,
+    )
+}
+
+fn bind_with_context_v2<L: NameLookup>(
+    expr: &Expr,
+    site: BindSite,
+    names: &L,
+    sheets: &dyn SheetResolver,
+    tables: &dyn TableLookup,
+    ctx: BindContext,
+) -> Result<ExprPlan, BindError> {
+    let owning_sheet = site.sheet;
     match expr {
         Expr::Number(n) => Ok(ExprPlan::Number(*n)),
         Expr::Bool(b) => Ok(ExprPlan::Bool(*b)),
@@ -451,28 +558,31 @@ fn bind_with_context<L: NameLookup>(
             // Binary operands are always scalar context regardless of the
             // outer context (Excel doesn't accept `=SUM(A1 + B1:B10)` —
             // each operand to + is scalar).
-            lhs: Box::new(bind_with_context(
+            lhs: Box::new(bind_with_context_v2(
                 lhs,
-                owning_sheet,
+                site,
                 names,
                 sheets,
+                tables,
                 BindContext::Scalar,
             )?),
-            rhs: Box::new(bind_with_context(
+            rhs: Box::new(bind_with_context_v2(
                 rhs,
-                owning_sheet,
+                site,
                 names,
                 sheets,
+                tables,
                 BindContext::Scalar,
             )?),
         }),
         Expr::Unary { op, operand } => Ok(ExprPlan::Unary {
             op: *op,
-            operand: Box::new(bind_with_context(
+            operand: Box::new(bind_with_context_v2(
                 operand,
-                owning_sheet,
+                site,
                 names,
                 sheets,
+                tables,
                 BindContext::Scalar,
             )?),
         }),
@@ -492,7 +602,9 @@ fn bind_with_context<L: NameLookup>(
             };
             let mut bound_args = Vec::with_capacity(args.len());
             for a in args {
-                bound_args.push(bind_with_context(a, owning_sheet, names, sheets, arg_ctx)?);
+                bound_args.push(bind_with_context_v2(
+                    a, site, names, sheets, tables, arg_ctx,
+                )?);
             }
             Ok(ExprPlan::Function {
                 name: name.clone(),
@@ -610,16 +722,12 @@ fn bind_with_context<L: NameLookup>(
                 None => Err(BindError::UnresolvedName(name.clone())),
             }
         }
-        // **W5-112 (Phase 4.8.C):** structured-ref AST exists; the binder
-        // arm lands in 4.8.E (lookup against TableTable) + 4.8.F (BindSite
-        // + this-row resolution). For 4.8.C the AST compiles + the parser
-        // emits StructuredRef; binding any cell containing one surfaces
-        // UnsupportedVariant. This is INTENTIONAL — set_formula at a
-        // structured-ref cell will REJECT until 4.8.E lands.
-        Expr::StructuredRef { .. } => Err(BindError::UnsupportedVariant(
-            "structured table reference binding lands in Phase 4.8.E (W5-114) — \
-             AST + parser shipped in 4.8.C (W5-112)",
-        )),
+        // **W5-115 (Phase 4.8.F):** resolve structured ref against
+        // TableLookup. The `[@Col]` form returns a column-wide range
+        // plus `is_this_row: true`; eval narrows to a single cell.
+        Expr::StructuredRef { table_name, spec } => {
+            resolve_structured_ref(table_name, spec, tables)
+        }
     }
 }
 
@@ -697,9 +805,272 @@ impl SheetResolver for EmptySheetResolver {
     }
 }
 
+/// **W5-115 (Phase 4.8.F):** table-metadata lookup interface. Mirrors
+/// [`NameLookup`] / [`SheetResolver`]: `ql-exec` stays decoupled from
+/// `ql-storage`; production callers wire `Workbook` (via the blanket
+/// impl in `env.rs`). Used by the binder to resolve
+/// `Expr::StructuredRef { table_name, spec }` → `ExprPlan::StructuredRef
+/// { resolved: Range, ... }`.
+///
+/// Lookup contract: case-insensitive on the canonical-uppercase form
+/// (mirrors `TableTable::lookup`).
+pub trait TableLookup {
+    /// Resolve a table name to its metadata, or `None` if not registered.
+    fn lookup_table(&self, name: &str) -> Option<&ql_storage::TableMetadata>;
+}
+
+/// Default empty-resolver. Used by the legacy `bind()` / test entry
+/// points: any structured ref surfaces as
+/// `BindError::UnknownTable(name)`.
+pub(crate) struct EmptyTableLookup;
+
+impl TableLookup for EmptyTableLookup {
+    fn lookup_table(&self, _name: &str) -> Option<&ql_storage::TableMetadata> {
+        None
+    }
+}
+
 /// **W5-99 (Phase 4.7.F):** human-readable variant tag for the
 /// `ArrayCellNotLiteral` error message. Used only on the error
 /// path so the cost is irrelevant.
+/// **W5-115 (Phase 4.8.F):** resolve a parsed structured reference
+/// against the table registry. Produces `ExprPlan::StructuredRef`
+/// with a concrete `Range` (eval reads this) plus a flag indicating
+/// whether the row needs per-cell narrowing (`[@Col]` forms).
+///
+/// Resolution rules per design § 7.2:
+/// - `BareColumn(col)` → column's data range (rows excluding
+///   header/totals).
+/// - `Combination([...])` — normalize to a single (row selector,
+///   column selector) intersection. Multiple `Special` items combine
+///   as union over rows; multiple `Column` items must be contiguous
+///   (Excel canon — no gappy ranges). Currently supports the common
+///   forms: single Special, single Column, single ColumnRange,
+///   `[#Special], [Col]`, `[#Special], [Col1]:[Col2]`. Multi-Special
+///   combinations like `[#Headers], [#Data]` lower to a single union
+///   range when possible (e.g., `headers ∪ data` = `all - totals`).
+/// - `ThisRowColumn(col)` / `ThisRowColumnRange(c1, c2)` → column's
+///   full data range with `is_this_row: true`. Eval narrows.
+fn resolve_structured_ref(
+    table_name: &Arc<str>,
+    spec: &ql_formula_syntax::TableSpecSubtree,
+    tables: &dyn TableLookup,
+) -> Result<ExprPlan, BindError> {
+    use ql_formula_syntax::TableSpecSubtree;
+    let table = tables
+        .lookup_table(table_name.as_ref())
+        .ok_or_else(|| BindError::UnknownTable(Arc::clone(table_name)))?;
+    let canonical_name = Arc::clone(&table.name);
+    // Helper closures for the common error paths.
+    let unknown_column = |col: &Arc<str>| BindError::UnknownTableColumn {
+        table: Arc::clone(&canonical_name),
+        column: Arc::clone(col),
+    };
+
+    let (resolved, is_this_row) = match spec {
+        TableSpecSubtree::BareColumn(col) => {
+            let (idx, _) = table.lookup_column(col).ok_or_else(|| unknown_column(col))?;
+            let range = table
+                .column_data_range(idx)
+                .ok_or_else(|| BindError::StructuredRefDegenerateRange(Arc::clone(&canonical_name)))?;
+            (range, false)
+        }
+        TableSpecSubtree::ThisRowColumn(col) => {
+            let (idx, _) = table.lookup_column(col).ok_or_else(|| unknown_column(col))?;
+            // Eval narrows to one cell; binder hands back the full data
+            // column. If the column has no data rows, the eval narrow
+            // returns degenerate → cell-boundary maps to #VALUE!
+            // (handled at 4.8.G).
+            let range = table
+                .column_data_range(idx)
+                .ok_or_else(|| BindError::StructuredRefDegenerateRange(Arc::clone(&canonical_name)))?;
+            (range, true)
+        }
+        TableSpecSubtree::ThisRowColumnRange(c1, c2) => {
+            let (i1, _) = table.lookup_column(c1).ok_or_else(|| unknown_column(c1))?;
+            let (i2, _) = table.lookup_column(c2).ok_or_else(|| unknown_column(c2))?;
+            let lo = i1.min(i2);
+            let hi = i1.max(i2);
+            let r1 = table
+                .column_data_range(lo)
+                .ok_or_else(|| BindError::StructuredRefDegenerateRange(Arc::clone(&canonical_name)))?;
+            let r2 = table
+                .column_data_range(hi)
+                .ok_or_else(|| BindError::StructuredRefDegenerateRange(Arc::clone(&canonical_name)))?;
+            (
+                Range::new(r1.sheet, r1.start_row, r1.start_col, r2.end_row, r2.end_col),
+                true,
+            )
+        }
+        TableSpecSubtree::Combination(items) => {
+            resolve_sref_combination(&canonical_name, table, items)?
+        }
+    };
+
+    Ok(ExprPlan::StructuredRef {
+        table_name: canonical_name,
+        source: Arc::new(spec.clone()),
+        resolved,
+        is_this_row,
+    })
+}
+
+/// **W5-115 (Phase 4.8.F):** resolve a `Combination` spec to a single
+/// row-selector × column-selector range. Common forms:
+/// - `[#All]` → full footprint.
+/// - `[#Headers]` → header row across all columns.
+/// - `[#Totals]` → totals row.
+/// - `[#Data]` → data rows.
+/// - `[Col]` → single column data.
+/// - `[Col1]:[Col2]` → column range data.
+/// - `[#Special], [Col]` → intersection (e.g. `[#Headers], [Qty]` →
+///   header cell of Qty column).
+/// - `[#Special], [Col1]:[Col2]` → intersection over column range.
+fn resolve_sref_combination(
+    canonical: &Arc<str>,
+    table: &ql_storage::TableMetadata,
+    items: &[ql_formula_syntax::TableSpecItem],
+) -> Result<(Range, bool), BindError> {
+    use ql_formula_syntax::{SpecialItem, TableSpecItem};
+
+    // Walk items: gather special items (row selectors) and column items.
+    let mut row_selectors: Vec<SpecialItem> = Vec::new();
+    let mut col_items: Vec<&TableSpecItem> = Vec::new();
+    for it in items {
+        match it {
+            TableSpecItem::Special(s) => row_selectors.push(*s),
+            other => col_items.push(other),
+        }
+    }
+
+    // Compute the row range.
+    let row_range = compute_row_range(canonical, table, &row_selectors)?;
+
+    // Compute the column range.
+    let col_range = compute_col_range(canonical, table, &col_items)?;
+
+    // Intersect.
+    let resolved = Range::new(
+        table.sheet,
+        row_range.0,
+        col_range.0,
+        row_range.1,
+        col_range.1,
+    );
+
+    // `[[#This Row], [Col]]` → is_this_row. Detected by exactly one
+    // ThisRow item in selectors. Eval narrows.
+    let is_this_row = row_selectors.contains(&SpecialItem::ThisRow);
+
+    Ok((resolved, is_this_row))
+}
+
+/// Resolve the row span from a list of `Special` items. Empty list
+/// defaults to the data range (Excel canon for column-only specs).
+fn compute_row_range(
+    canonical: &Arc<str>,
+    table: &ql_storage::TableMetadata,
+    selectors: &[ql_formula_syntax::SpecialItem],
+) -> Result<(ql_types::RowId, ql_types::RowId), BindError> {
+    use ql_formula_syntax::SpecialItem;
+    if selectors.is_empty() {
+        let data = table
+            .data_range()
+            .ok_or_else(|| BindError::StructuredRefDegenerateRange(Arc::clone(canonical)))?;
+        return Ok((data.start_row, data.end_row));
+    }
+    // Union over rows. The 5 selectors:
+    let mut min_row: Option<ql_types::RowId> = None;
+    let mut max_row: Option<ql_types::RowId> = None;
+    let mut accumulate = |r: Range| {
+        min_row = Some(min_row.map_or(r.start_row, |m| m.min(r.start_row)));
+        max_row = Some(max_row.map_or(r.end_row, |m| m.max(r.end_row)));
+    };
+    for sel in selectors {
+        let r = match sel {
+            SpecialItem::Headers => table
+                .header_range()
+                .ok_or_else(|| BindError::TableHasNoHeader(Arc::clone(canonical)))?,
+            SpecialItem::Totals => table
+                .totals_range()
+                .ok_or_else(|| BindError::TableHasNoTotals(Arc::clone(canonical)))?,
+            SpecialItem::Data => table.data_range().ok_or_else(|| {
+                BindError::StructuredRefDegenerateRange(Arc::clone(canonical))
+            })?,
+            SpecialItem::All => table.all_range(),
+            SpecialItem::ThisRow => {
+                // ThisRow as a row selector inside a Combination means
+                // "the formula's current row". The binder defers actual
+                // row resolution to eval time; here we hand back the
+                // full data range and rely on the caller setting
+                // is_this_row.
+                table.data_range().ok_or_else(|| {
+                    BindError::StructuredRefDegenerateRange(Arc::clone(canonical))
+                })?
+            }
+        };
+        accumulate(r);
+    }
+    Ok((
+        min_row.expect("at least one selector accumulated"),
+        max_row.expect("at least one selector accumulated"),
+    ))
+}
+
+/// Resolve the column span from a list of `Column` / `ColumnRange`
+/// items. Empty list defaults to all columns.
+fn compute_col_range(
+    canonical: &Arc<str>,
+    table: &ql_storage::TableMetadata,
+    col_items: &[&ql_formula_syntax::TableSpecItem],
+) -> Result<(ql_types::ColId, ql_types::ColId), BindError> {
+    use ql_formula_syntax::TableSpecItem;
+    if col_items.is_empty() {
+        // All columns.
+        return Ok((table.top_col, table.top_col + table.cols - 1));
+    }
+    let mut min_col: Option<ql_types::ColId> = None;
+    let mut max_col: Option<ql_types::ColId> = None;
+    for it in col_items {
+        let (lo, hi) = match it {
+            TableSpecItem::Column(col) => {
+                let (idx, _) = table.lookup_column(col).ok_or_else(|| {
+                    BindError::UnknownTableColumn {
+                        table: Arc::clone(canonical),
+                        column: Arc::clone(col),
+                    }
+                })?;
+                let c = table.top_col + idx;
+                (c, c)
+            }
+            TableSpecItem::ColumnRange(c1, c2) => {
+                let (i1, _) = table.lookup_column(c1).ok_or_else(|| {
+                    BindError::UnknownTableColumn {
+                        table: Arc::clone(canonical),
+                        column: Arc::clone(c1),
+                    }
+                })?;
+                let (i2, _) = table.lookup_column(c2).ok_or_else(|| {
+                    BindError::UnknownTableColumn {
+                        table: Arc::clone(canonical),
+                        column: Arc::clone(c2),
+                    }
+                })?;
+                let lo = i1.min(i2);
+                let hi = i1.max(i2);
+                (table.top_col + lo, table.top_col + hi)
+            }
+            TableSpecItem::Special(_) => unreachable!("special items filtered out by caller"),
+        };
+        min_col = Some(min_col.map_or(lo, |m| m.min(lo)));
+        max_col = Some(max_col.map_or(hi, |m| m.max(hi)));
+    }
+    Ok((
+        min_col.expect("at least one column accumulated"),
+        max_col.expect("at least one column accumulated"),
+    ))
+}
+
 fn variant_kind(e: &Expr) -> &'static str {
     match e {
         Expr::Number(_) => "Number",
@@ -1243,6 +1614,298 @@ mod tests {
                 }
             }
             other => panic!("expected ExprPlan::Array, got {other:?}"),
+        }
+    }
+
+    // ===== W5-115 (Phase 4.8.F) — structured-ref binder resolution =====
+
+    use ql_formula_syntax::{SpecialItem, TableSpecItem, TableSpecSubtree};
+    use ql_storage::{TableColumn, TableMetadata};
+
+    /// Mock TableLookup that holds a single test table.
+    struct OneTable(TableMetadata);
+    impl TableLookup for OneTable {
+        fn lookup_table(&self, name: &str) -> Option<&TableMetadata> {
+            if name.eq_ignore_ascii_case(&self.0.name) {
+                Some(&self.0)
+            } else {
+                None
+            }
+        }
+    }
+
+    fn sales_table() -> TableMetadata {
+        // Sales table at sheet 0, A1:D10. Header at row 0, totals at row 9.
+        // Data rows: 1..8 (8 rows). Columns: Region, Product, Qty, Price.
+        let col = |id, name: &str| TableColumn {
+            id,
+            name: Arc::from(name.to_ascii_lowercase().as_str()),
+            display: Arc::from(name),
+            totals_function: None,
+        };
+        TableMetadata {
+            name: Arc::from("SALES"),
+            display_name: Arc::from("Sales"),
+            sheet: 0,
+            top_row: 0,
+            top_col: 0,
+            rows: 10,
+            cols: 4,
+            has_header: true,
+            has_totals: true,
+            columns: vec![
+                col(0, "Region"),
+                col(1, "Product"),
+                col(2, "Qty"),
+                col(3, "Price"),
+            ],
+        }
+    }
+
+    #[test]
+    fn bind_structured_ref_bare_column_resolves_to_data_range() {
+        let tables = OneTable(sales_table());
+        let expr = Expr::StructuredRef {
+            table_name: Arc::from("Sales"),
+            spec: TableSpecSubtree::BareColumn(Arc::from("Qty")),
+        };
+        let plan = bind_with_site(
+            &expr,
+            BindSite::sheet_only(0),
+            &EmptyNameLookup,
+            &EmptySheetResolver,
+            &tables,
+        )
+        .unwrap();
+        match plan {
+            ExprPlan::StructuredRef {
+                table_name,
+                resolved,
+                is_this_row,
+                ..
+            } => {
+                assert_eq!(table_name.as_ref(), "SALES");
+                // Qty is column 2; data rows = 1..8.
+                assert_eq!(resolved.start_row, 1);
+                assert_eq!(resolved.end_row, 8);
+                assert_eq!(resolved.start_col, 2);
+                assert_eq!(resolved.end_col, 2);
+                assert!(!is_this_row);
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_structured_ref_unknown_table_errors() {
+        let tables = EmptyTableLookup;
+        let expr = Expr::StructuredRef {
+            table_name: Arc::from("Sales"),
+            spec: TableSpecSubtree::BareColumn(Arc::from("Qty")),
+        };
+        let err = bind_with_site(
+            &expr,
+            BindSite::sheet_only(0),
+            &EmptyNameLookup,
+            &EmptySheetResolver,
+            &tables,
+        )
+        .unwrap_err();
+        match err {
+            BindError::UnknownTable(name) => assert_eq!(name.as_ref(), "Sales"),
+            other => panic!("expected UnknownTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_structured_ref_unknown_column_errors() {
+        let tables = OneTable(sales_table());
+        let expr = Expr::StructuredRef {
+            table_name: Arc::from("Sales"),
+            spec: TableSpecSubtree::BareColumn(Arc::from("Foobar")),
+        };
+        let err = bind_with_site(
+            &expr,
+            BindSite::sheet_only(0),
+            &EmptyNameLookup,
+            &EmptySheetResolver,
+            &tables,
+        )
+        .unwrap_err();
+        match err {
+            BindError::UnknownTableColumn { table, column } => {
+                assert_eq!(table.as_ref(), "SALES");
+                assert_eq!(column.as_ref(), "Foobar");
+            }
+            other => panic!("expected UnknownTableColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_structured_ref_headers_resolves_to_header_row() {
+        let tables = OneTable(sales_table());
+        let expr = Expr::StructuredRef {
+            table_name: Arc::from("Sales"),
+            spec: TableSpecSubtree::Combination(vec![TableSpecItem::Special(SpecialItem::Headers)]),
+        };
+        let plan = bind_with_site(
+            &expr,
+            BindSite::sheet_only(0),
+            &EmptyNameLookup,
+            &EmptySheetResolver,
+            &tables,
+        )
+        .unwrap();
+        match plan {
+            ExprPlan::StructuredRef { resolved, .. } => {
+                // Header row = row 0, cols 0..3.
+                assert_eq!(resolved.start_row, 0);
+                assert_eq!(resolved.end_row, 0);
+                assert_eq!(resolved.start_col, 0);
+                assert_eq!(resolved.end_col, 3);
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_structured_ref_special_column_intersection() {
+        // `Sales[[#Headers], [Qty]]` → header cell of Qty column (row 0, col 2).
+        let tables = OneTable(sales_table());
+        let expr = Expr::StructuredRef {
+            table_name: Arc::from("Sales"),
+            spec: TableSpecSubtree::Combination(vec![
+                TableSpecItem::Special(SpecialItem::Headers),
+                TableSpecItem::Column(Arc::from("Qty")),
+            ]),
+        };
+        let plan = bind_with_site(
+            &expr,
+            BindSite::sheet_only(0),
+            &EmptyNameLookup,
+            &EmptySheetResolver,
+            &tables,
+        )
+        .unwrap();
+        match plan {
+            ExprPlan::StructuredRef { resolved, .. } => {
+                assert_eq!(resolved.start_row, 0);
+                assert_eq!(resolved.end_row, 0);
+                assert_eq!(resolved.start_col, 2);
+                assert_eq!(resolved.end_col, 2);
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_structured_ref_column_range() {
+        // `Sales[[Qty]:[Price]]` → cols 2..3 over data rows 1..8.
+        let tables = OneTable(sales_table());
+        let expr = Expr::StructuredRef {
+            table_name: Arc::from("Sales"),
+            spec: TableSpecSubtree::Combination(vec![TableSpecItem::ColumnRange(
+                Arc::from("Qty"),
+                Arc::from("Price"),
+            )]),
+        };
+        let plan = bind_with_site(
+            &expr,
+            BindSite::sheet_only(0),
+            &EmptyNameLookup,
+            &EmptySheetResolver,
+            &tables,
+        )
+        .unwrap();
+        match plan {
+            ExprPlan::StructuredRef { resolved, .. } => {
+                assert_eq!(resolved.start_row, 1);
+                assert_eq!(resolved.end_row, 8);
+                assert_eq!(resolved.start_col, 2);
+                assert_eq!(resolved.end_col, 3);
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_structured_ref_all_resolves_to_full_footprint() {
+        let tables = OneTable(sales_table());
+        let expr = Expr::StructuredRef {
+            table_name: Arc::from("Sales"),
+            spec: TableSpecSubtree::Combination(vec![TableSpecItem::Special(SpecialItem::All)]),
+        };
+        let plan = bind_with_site(
+            &expr,
+            BindSite::sheet_only(0),
+            &EmptyNameLookup,
+            &EmptySheetResolver,
+            &tables,
+        )
+        .unwrap();
+        match plan {
+            ExprPlan::StructuredRef { resolved, .. } => {
+                assert_eq!(resolved.start_row, 0);
+                assert_eq!(resolved.end_row, 9);
+                assert_eq!(resolved.start_col, 0);
+                assert_eq!(resolved.end_col, 3);
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_structured_ref_this_row_column_sets_flag() {
+        let tables = OneTable(sales_table());
+        let expr = Expr::StructuredRef {
+            table_name: Arc::from("Sales"),
+            spec: TableSpecSubtree::ThisRowColumn(Arc::from("Qty")),
+        };
+        let plan = bind_with_site(
+            &expr,
+            BindSite::sheet_only(0),
+            &EmptyNameLookup,
+            &EmptySheetResolver,
+            &tables,
+        )
+        .unwrap();
+        match plan {
+            ExprPlan::StructuredRef {
+                resolved,
+                is_this_row,
+                ..
+            } => {
+                assert!(is_this_row, "ThisRowColumn must set is_this_row");
+                // Resolved is FULL column data range; eval narrows at runtime.
+                assert_eq!(resolved.start_row, 1);
+                assert_eq!(resolved.end_row, 8);
+                assert_eq!(resolved.start_col, 2);
+                assert_eq!(resolved.end_col, 2);
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_structured_ref_headers_on_table_without_header_errors() {
+        let mut t = sales_table();
+        t.has_header = false;
+        let tables = OneTable(t);
+        let expr = Expr::StructuredRef {
+            table_name: Arc::from("Sales"),
+            spec: TableSpecSubtree::Combination(vec![TableSpecItem::Special(SpecialItem::Headers)]),
+        };
+        let err = bind_with_site(
+            &expr,
+            BindSite::sheet_only(0),
+            &EmptyNameLookup,
+            &EmptySheetResolver,
+            &tables,
+        )
+        .unwrap_err();
+        match err {
+            BindError::TableHasNoHeader(name) => assert_eq!(name.as_ref(), "SALES"),
+            other => panic!("expected TableHasNoHeader, got {other:?}"),
         }
     }
 }

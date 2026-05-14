@@ -221,6 +221,7 @@ impl<'a> WorkbookTransaction<'a> {
             BindSite::at_cell(ql_types::Address::new(sheet, row, col)),
             self.workbook,
             self.workbook,
+            self.workbook,
         )?;
         self.ops.push(PendingOp::Formula {
             sheet,

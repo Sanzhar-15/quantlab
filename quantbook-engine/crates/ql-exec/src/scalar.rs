@@ -93,6 +93,10 @@ pub fn eval_scalar<E: CellEnv>(plan: &ExprPlan, env: &E) -> Value {
         // `ExprPlan::Array` at the cell-boundary BEFORE calling
         // `eval_scalar_*` and materializing an `ArrayValue` instead.
         ExprPlan::Array(_) => Value::Error(ErrorValue::Calc),
+        // **W5-115 (Phase 4.8.F):** structured-ref in scalar context.
+        // 4.8.G adds actual evaluation. For now the no-registry path
+        // surfaces #CALC! (matches AggregateNameRef precedent).
+        ExprPlan::StructuredRef { .. } => Value::Error(ErrorValue::Calc),
     }
 }
 
@@ -375,6 +379,11 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
         // path) lands in W5-102 / Phase 4.7.J; until then, every
         // `ExprPlan::Array` evaluation produces `#CALC!`.
         ExprPlan::Array(_) => Value::Error(ErrorValue::Calc),
+        // **W5-115 (Phase 4.8.F):** structured-ref in scalar context.
+        // 4.8.G adds real evaluation (read range like AggregateNameRef,
+        // narrow row for is_this_row). For now: #CALC! placeholder so
+        // bind-time tests work without eval support.
+        ExprPlan::StructuredRef { .. } => Value::Error(ErrorValue::Calc),
     }
 }
 

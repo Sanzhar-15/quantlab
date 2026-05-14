@@ -524,6 +524,7 @@ impl<'a> WorkbookRuntime<'a> {
                         BindSite::at_cell(ql_types::Address::new(sheet, row, col)),
                         self.workbook,
                         self.workbook,
+                        self.workbook,
                     )?)
                 })?;
 
@@ -914,6 +915,7 @@ impl<'a> WorkbookRuntime<'a> {
                             reader_row,
                             reader_col,
                         )),
+                        self.workbook,
                         self.workbook,
                         self.workbook,
                     )?)
@@ -1980,6 +1982,7 @@ impl<'a> WorkbookRuntime<'a> {
             BindSite::at_cell(ql_types::Address::new(sheet, row, col)),
             self.workbook,
             self.workbook,
+            self.workbook,
         )?;
         let env = WorkbookEnv::new(self.workbook);
         // **W5-103 megaudit MEDIUM-3 closure (#129):** route through
@@ -2372,6 +2375,7 @@ impl<'a> WorkbookRuntime<'a> {
                                                 )),
                                                 workbook,
                                                 workbook,
+                                                workbook,
                                             )?)
                                         },
                                     ) {
@@ -2519,6 +2523,7 @@ impl<'a> WorkbookRuntime<'a> {
                     Ok(bind_with_site(
                         &expr,
                         BindSite::at_cell(ql_types::Address::new(sheet, row, col)),
+                        workbook,
                         workbook,
                         workbook,
                     )?)
