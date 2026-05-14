@@ -122,17 +122,23 @@ pub fn sequence(args: &[FunctionArg], _ctx: &FunctionContext) -> FunctionReturn 
         1.0
     };
 
-    // Truncate rows/cols toward zero per Excel canon. Reject negative
-    // values as `#VALUE!`. NaN truncates to 0 → falls into the
-    // degenerate branch below.
+    // Truncate rows/cols toward zero per Excel canon. NaN truncates
+    // to 0; non-finite is rejected up front.
     if !rows_f.is_finite() || !cols_f.is_finite() {
+        return FunctionReturn::Scalar(Value::Error(ErrorValue::Value));
+    }
+    // **Codex audit MEDIUM closure**: reject negative dims BEFORE
+    // truncation. `(-0.5).trunc()` is `-0.0` (sign-preserving), which
+    // passes `< 0.0` (since `-0.0 < 0.0` is false). The post-trunc
+    // check would then turn it into `0` and produce a misleading
+    // degenerate-array (#CALC!) instead of the correct #VALUE! that
+    // signals "negative dimension is wrong." Pre-trunc check catches
+    // the (-1.0, 0.0) range correctly.
+    if rows_f < 0.0 || cols_f < 0.0 {
         return FunctionReturn::Scalar(Value::Error(ErrorValue::Value));
     }
     let rows_trunc = rows_f.trunc();
     let cols_trunc = cols_f.trunc();
-    if rows_trunc < 0.0 || cols_trunc < 0.0 {
-        return FunctionReturn::Scalar(Value::Error(ErrorValue::Value));
-    }
 
     // Bound by u32::MAX so cell-count doesn't overflow. Excel's actual
     // hard limit is 1M rows × 16K cols, but our grid-bound check at
@@ -287,6 +293,25 @@ mod tests {
     #[test]
     fn sequence_negative_rows_returns_value_error() {
         let e = expect_scalar_error(sequence(&[n(-1.0)], &ctx()));
+        assert_eq!(e, ErrorValue::Value);
+    }
+
+    /// **Codex audit MEDIUM closure**: `SEQUENCE(-0.5)` must return
+    /// `#VALUE!`, NOT a degenerate array (which surfaces as `#CALC!`).
+    /// Pre-fix: `(-0.5).trunc()` is `-0.0` (sign-preserving f64),
+    /// which passes `< 0.0` (since `-0.0 < 0.0` is false), then
+    /// becomes `0` after `as u32` cast → degenerate ArrayValue →
+    /// #CALC!. The fix moves the negativity check pre-trunc so
+    /// fractional negatives are correctly rejected.
+    #[test]
+    fn sequence_negative_fractional_rows_returns_value_error_not_calc() {
+        let e = expect_scalar_error(sequence(&[n(-0.5)], &ctx()));
+        assert_eq!(e, ErrorValue::Value);
+    }
+
+    #[test]
+    fn sequence_negative_fractional_cols_returns_value_error_not_calc() {
+        let e = expect_scalar_error(sequence(&[n(1.0), n(-0.5)], &ctx()));
         assert_eq!(e, ErrorValue::Value);
     }
 

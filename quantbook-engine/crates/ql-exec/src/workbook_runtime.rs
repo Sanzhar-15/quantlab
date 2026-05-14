@@ -226,6 +226,13 @@ pub enum RuntimeError {
     /// `intern_format` (which handles registration automatically).
     #[error("format id {0} is not registered in the workbook FormatTable")]
     UnknownFormatId(u32),
+
+    /// **W5-106-AUDIT (Codex MEDIUM closure):** recompute_dirty's
+    /// fixed-point loop hit its MAX_ITERATIONS bound with cells still
+    /// dirty. Signals a runaway spill shape transition or workbook
+    /// misconfiguration; the recompute result is partial.
+    #[error("recompute_dirty hit iteration cap with cells still dirty")]
+    RecomputeIterationCap,
 }
 
 impl From<LexError> for RuntimeError {
@@ -2089,8 +2096,16 @@ impl<'a> WorkbookRuntime<'a> {
         let mut prior: HashMap<(SheetId, RowId, ColId), Value> = HashMap::new();
         let mut originally_dirty: HashSet<ql_calcgraph::NodeId> = HashSet::new();
         let mut changed: HashSet<(SheetId, RowId, ColId)> = HashSet::new();
+        // **Codex audit MEDIUM closure**: surface iteration-cap hits
+        // instead of silently breaking. After the loop, if `iter_count`
+        // reached MAX_ITERATIONS AND session.dirty() is still non-empty,
+        // surface a synthetic failure so the caller's `is_complete()`
+        // check (which inspects `failures.is_empty()`) signals the
+        // problem.
+        let mut iter_count: usize = 0;
 
         for _iter in 0..MAX_ITERATIONS {
+            iter_count += 1;
             // Phase 3.4: claim dirty + topo-sort. Edges in the graph
             // model the dep direction (`outgoing(F) = what F depends on`).
             // Tarjan emits SCCs in reverse-topo of the condensation
@@ -2348,6 +2363,27 @@ impl<'a> WorkbookRuntime<'a> {
                 }
             }
         } // end MAX_ITERATIONS loop
+
+        // **Codex audit MEDIUM closure**: if we hit MAX_ITERATIONS
+        // AND session.dirty() is still non-empty, the fixed point
+        // wasn't reached. Surface as a synthetic RecomputeFailure
+        // so the caller's is_complete() check signals the problem
+        // instead of silently returning what looks like a clean
+        // recompute. Per CLAUDE.md no-fallbacks rule.
+        if iter_count == MAX_ITERATIONS && !session.dirty_formulas().is_empty() {
+            failures.push(RecomputeFailure {
+                sheet: 0,
+                row: 0,
+                col: 0,
+                formula_text: Arc::from(format!(
+                    "recompute_dirty hit MAX_ITERATIONS={MAX_ITERATIONS} \
+                     with {} cells still dirty — possible runaway spill \
+                     shape transition or workbook misconfiguration",
+                    session.dirty_formulas().len()
+                )),
+                error: RuntimeError::RecomputeIterationCap,
+            });
+        }
 
         self.graph = session_slot;
         Some(RecomputeResult {
