@@ -298,6 +298,12 @@ impl FunctionRegistry {
     /// Iterator over names registered as `RegisteredFn::Scalar(_)`.
     /// **W5-96 (Phase 4.7.B):** previously was "names registered in the
     /// scalar HashMap"; the unified storage means we filter by variant.
+    ///
+    /// **Ordering is UNSTABLE.** Pre-W5-96 each tier had its own
+    /// `HashMap` with non-deterministic iteration order; post-W5-96
+    /// the order can also shift as entries in other tiers are added
+    /// (single combined HashMap). Callers that need a stable order
+    /// (e.g. coverage reports, snapshot tests) must collect + sort.
     pub fn names(&self) -> impl Iterator<Item = &&'static str> + '_ {
         self.fns
             .iter()

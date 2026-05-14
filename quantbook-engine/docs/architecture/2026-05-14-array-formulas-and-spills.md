@@ -150,24 +150,18 @@ impl ArrayValue {
 
 `Value` itself stays scalar (no `Value::Array(...)` variant). Storage cells remain scalar by Excel canon — spilling MATERIALIZES arrays into per-cell scalars in the computed overlay. The array vs scalar distinction lives at the EVAL boundary via `EvalResult` (still in `ql-exec`).
 
-### 6.2 Function ABI — UNIFY, don't extend
+### 6.2 Function ABI — UNIFY STORAGE, tagged dispatch
 
-Codex HIGH: adding `ArrayFn` as a 4th parallel tier compounds the dispatch sprawl. Better: collapse the existing 3 tiers into ONE dispatch ABI that can carry scalar, range, array, and context.
+Codex HIGH: adding `ArrayFn` as a 4th parallel tier compounds the dispatch sprawl. The right move is to collapse the three parallel HashMaps in `FunctionRegistry` into **one storage map** keyed by name, valued by a tagged enum that distinguishes the tier of the underlying fn pointer.
 
-**Revised dispatch shape** in `ql-functions`:
+**As-shipped dispatch shape** in `ql-functions` (W5-96 / Phase 4.7.B):
 
 ```rust
-// crates/ql-functions/src/registry.rs (revised)
+// crates/ql-functions/src/registry.rs (shipped W5-96)
 pub enum FunctionArg {
     Scalar(Value),
-    Range { sheet: SheetId, range: Range, /* ... existing RangeAwareFn arg shape ... */ },
-    Array(ArrayValue),  // new — array values from `Expr::Array` or another function call
-}
-
-pub struct FunctionContext<'a> {
-    pub eval_ctx: &'a EvalContext,           // existing (date_system, locale, now)
-    pub workbook: &'a dyn FunctionWorkbook,  // existing trait abstraction
-    // Phase 4.7 doesn't change the context shape.
+    Range { values: Vec<Value>, rows: usize, cols: usize },  // matches existing FnArg::Range
+    Array(ArrayValue),                                       // new — from Expr::Array or another fn return
 }
 
 pub enum FunctionReturn {
@@ -175,23 +169,52 @@ pub enum FunctionReturn {
     Array(ArrayValue),  // new — for SEQUENCE / FILTER / TRANSPOSE
 }
 
-pub type FunctionFn = fn(args: &[FunctionArg], ctx: &FunctionContext) -> FunctionReturn;
+pub struct FunctionContext<'a> {
+    pub eval_ctx: &'a EvalContext,
+    // Additive shape — fields can land later without changing the FunctionFn alias.
+    // Workbook access threads through eval-site env in W5-101 (Phase 4.7.G), not here.
+}
+
+pub type FunctionFn = fn(&[FunctionArg], &FunctionContext) -> FunctionReturn;
+
+/// Tagged union — one variant per supported callable shape.
+pub enum RegisteredFn {
+    Scalar(ScalarFn),               // legacy `fn(&[Value]) -> Value`
+    RangeAware(RangeAwareFn),       // legacy `fn(&[FnArg]) -> Value`
+    ContextAware(ContextAwareFn),   // legacy `fn(&[Value], &EvalContext) -> Value`
+    Unified(FunctionFn),            // new array-returning ABI
+}
+
+pub struct FunctionRegistry {
+    fns: HashMap<&'static str, RegisteredFn>,
+}
 ```
 
-Migration:
-- Existing `ScalarFn` / `RangeAwareFn` / `ContextAwareFn` registrations re-route to the unified `FunctionFn` via shim adapters. Adapters live in `ql-functions` itself; downstream callers stay unchanged in v1 by exposing the legacy `register_scalar` / `register_range_aware` / `register_context_aware` helpers that internally build the unified `FunctionFn`.
-- New array-returning functions register directly with the unified ABI.
-- Cleanup of the legacy tier names is a future polish item.
+**Migration:**
+- Existing `register` / `register_range_aware` / `register_context_aware` keep their public signatures; they store the appropriate `RegisteredFn::*` variant. The ~130 `r.register("SUM", scalar_fns::sum)` lines in `default_registry` work unchanged.
+- New array-returning functions register via `register_unified(name, FunctionFn)`.
+- The `lookup_*` filter views (`lookup`, `lookup_range_aware`, `lookup_context_aware`, `lookup_unified`) match on the enum variant and return the tier-specific fn pointer or `None`.
+- `lookup_any(name) -> Option<&RegisteredFn>` is the eval-site entry point that returns the tagged enum directly — one HashMap lookup, one match arm per tier.
 
-**Caller-side dispatch** in `ql-exec::eval`:
+**Why tagged dispatch, not adapter-wrapping:** the alternative ("every register_* shim-wraps the legacy fn into a `FunctionFn`") would require boxing fn pointers (`Box<dyn Fn>`) because a bare `fn` pointer can't capture the wrapped legacy fn pointer. Tagged dispatch keeps fn pointers as plain `fn` values (Copy, no allocation) and pushes the per-tier match into the single eval-site dispatch instead of into per-call adapter calls. Net effect: same single-storage-map win Codex wanted, lower runtime overhead, simpler implementation. Full adapter normalization remains available as a future polish if the eval-site arms grow unwieldy.
+
+**Caller-side dispatch** in `ql-exec::eval` (W5-101 / Phase 4.7.G migration target):
 
 ```rust
-let arg_values: Vec<FunctionArg> = ...;  // materialize from ExprPlan args
-let ret: FunctionReturn = (function.f)(&arg_values, &ctx);
-let eval_result: EvalResult = match ret {
-    FunctionReturn::Scalar(v) => EvalResult::Scalar(v),
-    FunctionReturn::Array(a)  => EvalResult::Array(a),
-};
+match registry.lookup_any(name) {
+    Some(RegisteredFn::Scalar(f)) => /* materialize Vec<Value>, call f */ ,
+    Some(RegisteredFn::RangeAware(f)) => /* materialize Vec<FnArg>, call f */ ,
+    Some(RegisteredFn::ContextAware(f)) => /* materialize Vec<Value> + EvalContext, call f */ ,
+    Some(RegisteredFn::Unified(f)) => {
+        // Materialize Vec<FunctionArg> + FunctionContext; route the return:
+        let ret: FunctionReturn = f(&args, &ctx);
+        let eval_result: EvalResult = match ret {
+            FunctionReturn::Scalar(v) => EvalResult::Scalar(v),
+            FunctionReturn::Array(a)  => EvalResult::Array(a),
+        };
+    }
+    None => /* unresolved function name */ ,
+}
 ```
 
 `EvalResult` (still in `ql-exec`) wraps the ABI-side return at the eval boundary. No cycle.
@@ -550,9 +573,11 @@ The producer-alias model makes the dependency chain explicit: `B3 (reads A3) →
 
 **Verified analogy:** existing range deps work this way. `StripeIndex` tracks "which formulas depend on which (sheet, row/col)" — when A3 is touched, B3 (a reader of A3) gets dirtied via the stripe index. The new behavior: when A3 becomes a spill target, B3's NEXT dep-extraction reroutes A3 → A1. Until B3's deps are re-extracted, the stripe-based dirty propagation still works (touching A3 dirties B3, which then re-extracts and finds the rerouted edge).
 
-### 14.4 Function ABI — DECIDED UNIFY
+### 14.4 Function ABI — DECIDED UNIFIED STORAGE + TAGGED DISPATCH
 
-Per § 6.2: collapse the four tiers into one `FunctionFn` ABI. Legacy `register_scalar_fn` / `register_range_aware_fn` / `register_context_aware_fn` helpers preserved as shim adapters. No new tier.
+Per § 6.2 (and W5-96 implementation): collapse the three parallel HashMaps in `FunctionRegistry` into one storage map keyed by name and valued by the `RegisteredFn` tagged enum. Legacy `register` / `register_range_aware` / `register_context_aware` helpers preserved and store the appropriate `RegisteredFn::*` variant; new array-returning functions register via `register_unified`. Eval site dispatches via `lookup_any` and a single match-on-tier (target: W5-101 / Phase 4.7.G).
+
+Codex pull-up review of W5-96 confirmed the storage-unification win, flagged the doc-vs-impl drift (the original draft said "shim adapters" but the implementation uses tagged dispatch instead — back-ported here), and accepted "full adapter normalization" as a future polish item if the eval-site arms grow unwieldy.
 
 ### 14.5 Implicit intersection (Phase 4.9)
 
