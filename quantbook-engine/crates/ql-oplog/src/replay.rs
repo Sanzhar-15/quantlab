@@ -480,7 +480,60 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             }
             Ok(())
         }
+        Op::RenameTable { old_name, new_name } => {
+            apply_rename_table(workbook, index, old_name, new_name)
+        }
     }
+}
+
+/// **W5-119 (Phase 4.8.I):** replay a `RenameTable`. Validates source
+/// exists, target name is available (TableTable + NameTable shared
+/// namespace), then re-keys the entry. Note: formula text rewrites
+/// arrive as accompanying `Op::PutFormula` ops; this arm doesn't
+/// touch formula cells.
+fn apply_rename_table(
+    workbook: &mut Workbook,
+    index: usize,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), ReplayError> {
+    let old_canonical = old_name.to_ascii_uppercase();
+    let new_canonical: std::sync::Arc<str> =
+        std::sync::Arc::from(new_name.to_ascii_uppercase().as_str());
+
+    // Verify source.
+    if workbook.tables().lookup(&old_canonical).is_none() {
+        return Err(ReplayError::TableNotFound {
+            index,
+            name: old_name.to_owned(),
+        });
+    }
+    // Verify target availability (skip the no-op same-name case).
+    if !old_canonical.eq_ignore_ascii_case(new_name) {
+        if workbook.tables().lookup(&new_canonical).is_some() {
+            return Err(ReplayError::TableCreateRejected {
+                index,
+                name: new_name.to_owned(),
+                reason: "table with this canonical name already exists (rename target)",
+            });
+        }
+        if workbook.names().lookup_ci(&new_canonical).is_some() {
+            return Err(ReplayError::TableCreateRejected {
+                index,
+                name: new_name.to_owned(),
+                reason: "defined-name with this canonical name already exists (rename target)",
+            });
+        }
+    }
+    // Take the entry out, mutate name + display, reinsert under new key.
+    let mut meta = workbook
+        .tables_mut()
+        .remove(&old_canonical)
+        .expect("verified above");
+    meta.name = std::sync::Arc::clone(&new_canonical);
+    meta.display_name = std::sync::Arc::from(new_name);
+    workbook.tables_mut().insert(new_canonical, meta);
+    Ok(())
 }
 
 /// **W5-118 (Phase 4.8.H):** apply a `CreateTable` op against the

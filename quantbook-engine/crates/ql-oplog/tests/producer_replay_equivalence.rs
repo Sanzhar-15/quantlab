@@ -219,10 +219,12 @@ fn apply_producer_side(ops: &[Op], wb: &mut Workbook) {
             // validation here. Not exercised by `realistic_op_sequence`
             // today; assert unreachable so a future addition forces a
             // test author to mirror the producer logic.
-            Op::CreateTable { .. } | Op::DropTable { .. } => unreachable!(
-                "realistic_op_sequence doesn't emit table ops yet; \
-                 update apply_producer_side when adding table coverage"
-            ),
+            Op::CreateTable { .. } | Op::DropTable { .. } | Op::RenameTable { .. } => {
+                unreachable!(
+                    "realistic_op_sequence doesn't emit table ops yet; \
+                     update apply_producer_side when adding table coverage"
+                )
+            }
         }
     }
 }

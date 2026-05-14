@@ -298,6 +298,68 @@ pub fn rewrite_sheet_name_in_expr(expr: &Expr, old_canonical: &str, new_name: &A
     }
 }
 
+/// **W5-119 (Phase 4.8.I):** rewrite every `Expr::StructuredRef`
+/// referencing `old_canonical` (case-insensitive) to the new name.
+/// Mirrors [`rewrite_sheet_name_in_expr`] in spirit but for tables.
+///
+/// Used by `WorkbookRuntime::rename_table` to update formula text
+/// (Excel canon: renames cascade through stored formula text, so
+/// the next bind sees the new name and binds successfully).
+pub fn rewrite_table_ref(expr: &Expr, old_canonical: &str, new_name: &Arc<str>) -> Expr {
+    match expr {
+        Expr::Number(n) => Expr::Number(*n),
+        Expr::String(s) => Expr::String(s.clone()),
+        Expr::Bool(b) => Expr::Bool(*b),
+        Expr::NameRef(n) => Expr::NameRef(n.clone()),
+        Expr::Error(ev) => Expr::Error(*ev),
+        Expr::CellRef(addr) => Expr::CellRef(addr.clone()),
+        Expr::RangeRef(r) => Expr::RangeRef(r.clone()),
+        Expr::Binary { op, lhs, rhs } => Expr::Binary {
+            op: *op,
+            lhs: Box::new(rewrite_table_ref(lhs, old_canonical, new_name)),
+            rhs: Box::new(rewrite_table_ref(rhs, old_canonical, new_name)),
+        },
+        Expr::Unary { op, operand } => Expr::Unary {
+            op: *op,
+            operand: Box::new(rewrite_table_ref(operand, old_canonical, new_name)),
+        },
+        Expr::Function { name, args } => Expr::Function {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| rewrite_table_ref(a, old_canonical, new_name))
+                .collect(),
+        },
+        Expr::Array(rows) => Expr::Array(
+            rows.iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| rewrite_table_ref(cell, old_canonical, new_name))
+                        .collect()
+                })
+                .collect(),
+        ),
+        Expr::Spill(inner) => Expr::Spill(Box::new(rewrite_table_ref(
+            inner,
+            old_canonical,
+            new_name,
+        ))),
+        Expr::StructuredRef { table_name, spec } => {
+            if table_name.eq_ignore_ascii_case(old_canonical) {
+                Expr::StructuredRef {
+                    table_name: new_name.clone(),
+                    spec: spec.clone(),
+                }
+            } else {
+                Expr::StructuredRef {
+                    table_name: table_name.clone(),
+                    spec: spec.clone(),
+                }
+            }
+        }
+    }
+}
+
 fn rewrite_sheet_ref(sheet: &SheetRef, old_canonical: &str, new_name: &Arc<str>) -> SheetRef {
     match sheet {
         SheetRef::Name(n) if n.eq_ignore_ascii_case(old_canonical) => {

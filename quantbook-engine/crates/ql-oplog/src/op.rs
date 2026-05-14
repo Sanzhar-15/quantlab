@@ -171,4 +171,21 @@ pub enum Op {
     /// dropped table re-bind to `BindError::UnknownTable` on next
     /// recompute. Mirrors `WorkbookRuntime::drop_table`.
     DropTable { name: String },
+
+    /// **W5-119 (Phase 4.8.I):** rename a table.
+    ///
+    /// Producer side ALSO rewrites stored formula text (Excel canon —
+    /// per design § 12.2). The op carries `old_name` so replay can
+    /// re-key the `TableTable` entry; producer-side formula-text
+    /// rewrites land as accompanying `Op::PutFormula` entries in the
+    /// same op-log sequence (no `BatchCommit` wrapper today; relies on
+    /// replay-order determinism).
+    ///
+    /// Replay validates: target name available (NameTable + TableTable),
+    /// source name exists. Sheet-scoped names use the workbook's
+    /// shared canonical namespace.
+    RenameTable {
+        old_name: String,
+        new_name: String,
+    },
 }

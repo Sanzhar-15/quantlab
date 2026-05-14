@@ -1609,6 +1609,115 @@ impl<'a> WorkbookRuntime<'a> {
         Ok(())
     }
 
+    /// **W5-119 (Phase 4.8.I):** rename a table. Per design § 12.2 + HIGH-1
+    /// closure (Codex pass-1), this REWRITES STORED FORMULA TEXT — Excel
+    /// canon: the next bind sees the new name and binds successfully.
+    ///
+    /// Process:
+    /// 1. Validate: source exists; target name available (TableTable +
+    ///    NameTable shared namespace); not a no-op (same canonical name).
+    /// 2. Op-log append `Op::RenameTable` (before any mutation).
+    /// 3. Walk every formula cell; parse the text; rewrite via
+    ///    `ast::rewrite_table_ref`; if the AST changed, print it back
+    ///    and emit `Op::PutFormula` + update storage.
+    /// 4. Re-key the `TableTable` entry from old canonical to new
+    ///    canonical; update display_name.
+    ///
+    /// Returns the number of formula cells whose text was rewritten.
+    pub fn rename_table(&mut self, old_name: &str, new_name: &str) -> Result<usize, RuntimeError> {
+        let old_canonical = old_name.to_ascii_uppercase();
+        let new_canonical = new_name.to_ascii_uppercase();
+        if self.workbook.tables().lookup(&old_canonical).is_none() {
+            return Err(RuntimeError::TableNotFound(old_name.to_owned()));
+        }
+        // No-op rename (same canonical) — accept silently without
+        // emitting an op so the log stays compact.
+        if old_canonical == new_canonical {
+            return Ok(0);
+        }
+        // Target uniqueness.
+        if self.workbook.tables().lookup(&new_canonical).is_some() {
+            return Err(RuntimeError::TableCreateRejected {
+                name: new_name.to_owned(),
+                reason: "table with this canonical name already exists (rename target)",
+            });
+        }
+        if self.workbook.names().lookup_ci(&new_canonical).is_some() {
+            return Err(RuntimeError::TableCreateRejected {
+                name: new_name.to_owned(),
+                reason: "defined-name with this canonical name already exists (rename target)",
+            });
+        }
+        // Op-log append BEFORE mutation (W5-103 atomicity). We emit
+        // RenameTable + N PutFormula ops; if the log append fails,
+        // no workbook state has changed yet.
+        if let Some(oplog) = self.oplog.as_deref_mut() {
+            oplog.append(Op::RenameTable {
+                old_name: old_canonical.clone(),
+                new_name: new_canonical.clone(),
+            })?;
+        }
+        // Walk formula cells and rewrite. Collect first to avoid borrow
+        // conflicts (iter holds &workbook; rewrite needs &mut workbook).
+        let new_display_arc: Arc<str> = Arc::from(new_name);
+        let formulas: Vec<(SheetId, RowId, ColId, Arc<str>)> = self
+            .workbook
+            .iter_formulas()
+            .map(|(s, r, c, text)| (s, r, c, Arc::clone(text)))
+            .collect();
+        let mut rewritten = 0;
+        for (s, r, c, text) in formulas {
+            let tokens = match lex(text.as_ref()) {
+                Ok(t) => t,
+                Err(_) => continue, // malformed → leave alone (rewrite is best-effort)
+            };
+            let expr = match parse(tokens) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let new_expr = ql_formula_syntax::rewrite_table_ref(
+                &expr,
+                &old_canonical,
+                &new_display_arc,
+            );
+            if new_expr == expr {
+                continue; // no StructuredRef references the renamed table
+            }
+            let new_text = ql_formula_syntax::print(&new_expr);
+            // Emit PutFormula so replay reconstructs the rewrite.
+            if let Some(oplog) = self.oplog.as_deref_mut() {
+                oplog.append(Op::PutFormula {
+                    sheet: s,
+                    row: r,
+                    col: c,
+                    text: new_text.clone(),
+                })?;
+            }
+            // Update workbook formula text directly (bypass set_formula
+            // to avoid re-running the bind eagerly; the recompute path
+            // will re-bind against the new name at next eval).
+            self.workbook.put_formula(s, r, c, new_text);
+            rewritten += 1;
+        }
+        // Re-key the TableTable entry.
+        let mut meta = self
+            .workbook
+            .tables_mut()
+            .remove(&old_canonical)
+            .expect("verified at top");
+        let new_canonical_arc: Arc<str> = Arc::from(new_canonical.as_str());
+        meta.name = Arc::clone(&new_canonical_arc);
+        meta.display_name = Arc::clone(&new_display_arc);
+        self.workbook
+            .tables_mut()
+            .insert(new_canonical_arc, meta);
+        // Invalidate plan cache by clearing — every formula that
+        // referenced the OLD name now has new text, so cache lookups
+        // miss anyway; the bare invalidation prevents stale entries.
+        self.plan_cache.clear();
+        Ok(rewritten)
+    }
+
     /// **W5-92 (Phase 4.6.D):** create a new sheet,
     /// emitting `Op::AddSheet` into the attached op log (if any). Returns
     /// the new sheet's `SheetId`. Wraps `Workbook::add_sheet_with_chunk_rows`.
@@ -9131,6 +9240,121 @@ mod tests {
         match err {
             RuntimeError::TableNotFound(n) => assert_eq!(n, "Nope"),
             other => panic!("expected TableNotFound, got {other:?}"),
+        }
+    }
+
+    // ===== W5-119 (Phase 4.8.I) — rename_table =====
+
+    #[test]
+    fn rename_table_happy_path_rewrites_formula_text() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.create_table(
+                "Sales",
+                0,
+                0,
+                0,
+                3,
+                1,
+                true,
+                false,
+                vec!["Qty".into()],
+            )
+            .unwrap();
+        }
+        wb.put(ql_types::Address::new(0, 1, 0), Value::Number(10.0));
+        wb.put(ql_types::Address::new(0, 2, 0), Value::Number(20.0));
+        // Formula referencing the table.
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let v = rt.set_formula(0, 10, 0, "SUM(Sales[Qty])").unwrap();
+            assert_eq!(v, Value::Number(30.0));
+        }
+        // Rename Sales → Orders.
+        let rewritten = {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.rename_table("Sales", "Orders").unwrap()
+        };
+        assert_eq!(rewritten, 1, "one formula was rewritten");
+        // Verify table table re-keyed.
+        assert!(wb.lookup_table("Sales").is_none());
+        assert!(wb.lookup_table("Orders").is_some());
+        // Verify formula text rewritten.
+        let text = wb
+            .formula_at(0, 10, 0)
+            .expect("formula present")
+            .clone();
+        assert!(
+            text.contains("Orders"),
+            "formula text should now reference Orders, got: {text}"
+        );
+        assert!(
+            !text.contains("Sales"),
+            "formula text should NOT reference Sales after rename, got: {text}"
+        );
+        // Re-bind + re-eval after rename — value still 30.
+        let v = {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            assert!(rt.recompute_all().is_complete());
+            wb.read(ql_types::Address::new(0, 10, 0))
+        };
+        assert_eq!(v, Value::Number(30.0));
+    }
+
+    #[test]
+    fn rename_table_target_collision_with_table_errors() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.create_table("A", 0, 0, 0, 2, 1, true, false, vec!["x".into()])
+            .unwrap();
+        rt.create_table("B", 0, 0, 5, 2, 1, true, false, vec!["y".into()])
+            .unwrap();
+        let err = rt.rename_table("A", "B").unwrap_err();
+        match err {
+            RuntimeError::TableCreateRejected { reason, .. } => {
+                assert!(reason.contains("rename target"), "reason: {reason}");
+            }
+            other => panic!("expected TableCreateRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_table_missing_source_errors() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt.rename_table("Nope", "Yep").unwrap_err();
+        match err {
+            RuntimeError::TableNotFound(n) => assert_eq!(n, "Nope"),
+            other => panic!("expected TableNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_table_emits_ops() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.create_table("S", 0, 0, 0, 2, 1, true, false, vec!["Q".into()])
+                .unwrap();
+            rt.set_formula(0, 5, 0, "SUM(S[Q])").unwrap();
+            let _ = rt.rename_table("S", "T").unwrap();
+        }
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        // CreateTable + PutFormula + RenameTable + PutFormula (rewrite).
+        assert_eq!(ops.len(), 4, "got {ops:?}");
+        assert!(matches!(&ops[2], Op::RenameTable { old_name, new_name }
+            if old_name == "S" && new_name == "T"));
+        match &ops[3] {
+            Op::PutFormula { text, .. } => {
+                assert!(text.contains('T'));
+            }
+            other => panic!("expected PutFormula for rewrite, got {other:?}"),
         }
     }
 

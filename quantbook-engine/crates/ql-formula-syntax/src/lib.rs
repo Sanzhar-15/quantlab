@@ -33,8 +33,8 @@ pub mod printer;
 pub mod token;
 
 pub use ast::{
-    rewrite_sheet_name_in_expr, CellAddr, Expr, RangeRef, SheetRef, SpecialItem, TableSpecItem,
-    TableSpecSubtree,
+    rewrite_sheet_name_in_expr, rewrite_table_ref, CellAddr, Expr, RangeRef, SheetRef,
+    SpecialItem, TableSpecItem, TableSpecSubtree,
 };
 pub use lexer::{column_letters_to_index, lex, LexError, MAX_COLUMN, MAX_ROW};
 pub use parser::{parse, ParseError};
