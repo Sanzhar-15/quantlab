@@ -518,6 +518,34 @@ impl<'a> WorkbookRuntime<'a> {
                     )?)
                 })?;
 
+        // **W5-103 (Phase 4.7.J.5 / Codex W5-102 MEDIUM-3):** if the
+        // target cell is currently a non-anchor cell of someone else's
+        // spill, dissolve THAT spill first. Per design § 10.2 (user
+        // write into spill target): typing into a spilled cell breaks
+        // the host spill — the host's anchor formula stays put, but
+        // re-eval at the host (next recompute) will see this cell as
+        // a blocker and emit #SPILL!.
+        //
+        // We perform this dissolution UP FRONT (before the old-shape
+        // capture below) because:
+        //   - The host spill's anchor is at a DIFFERENT cell, so its
+        //     footprint isn't covered by `clear_spill_if_present` below.
+        //   - The new formula at (sheet, row, col) needs the host's
+        //     prior computed-overlay value cleared from this cell so
+        //     `write_spill`'s blocking check doesn't see it as occupied.
+        //
+        // No-op when (sheet, row, col) is itself an anchor (the next
+        // `clear_spill_if_present` handles that path) OR is not part
+        // of any spill.
+        if let Some(host_anchor) = self.workbook.spill_target_anchor(sheet, row, col) {
+            if host_anchor != (sheet, row, col) {
+                // Idempotent — `clear_spill_at` errors with
+                // SpillNotFoundError if the anchor isn't registered,
+                // which can't happen here (target_anchor returned Some).
+                let _ = self.workbook.clear_spill_at(host_anchor);
+            }
+        }
+
         // **W5-103 (Phase 4.7.J.2 / Codex W5-102 MEDIUM-4):** clear any
         // PRIOR spill anchored at this cell BEFORE eval. Per design § 8.3:
         // every re-eval at an anchor cell starts by dissolving the old
@@ -6381,6 +6409,141 @@ mod tests {
             graph.formula_deps(c1).unwrap().cells,
             vec![(0, 0, 1)],
             "blocked spill leaves C1's dep untouched"
+        );
+    }
+
+    // ===== W5-103 (Phase 4.7.J.5) — set_formula at spill target =====
+    //
+    // Codex W5-102 MEDIUM-3: typing a formula into a spill TARGET cell
+    // (not its anchor) must dissolve the host spill. Per design § 10.2:
+    // the host's anchor formula stays put; next recompute at the host
+    // sees this cell as a blocker and emits #SPILL!.
+
+    /// Phase 4.7.J.5 — happy path: A1 anchors a 1×3 spill (A1, B1, C1).
+    /// Then set a scalar formula at B1. Result: host spill dissolved
+    /// (B1's value is the new formula; A2/A3 — wait this is horizontal,
+    /// so A1=1, B1=2, C1=3 originally. After dissolving + setting B1=99:
+    /// host spill gone, A1 still has formula text, B1 = 99, C1 = Blank.
+    #[test]
+    fn set_formula_at_spill_target_dissolves_host_spill() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // Spill 1x3 from A1.
+        rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+        // Write a formula at B1 — dissolves the host spill at A1.
+        rt.set_formula(0, 0, 1, "99 + 1").unwrap();
+        drop(rt);
+
+        // Host spill no longer registered.
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0),
+            None,
+            "host spill at A1 must be dissolved"
+        );
+        // B1 has its own formula now.
+        assert_eq!(wb.formula_at(0, 0, 1).map(|s| s.as_ref()), Some("99 + 1"));
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Number(100.0)
+        );
+        // C1 was a target — its computed value got cleared by
+        // clear_spill_at when the host dissolved.
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Blank);
+        // A1 still holds the anchor formula text (re-eval on next
+        // recompute will emit #SPILL! per design § 9.2).
+        assert_eq!(
+            wb.formula_at(0, 0, 0).map(|s| s.as_ref()),
+            Some("{1, 2, 3}")
+        );
+    }
+
+    /// Phase 4.7.J.5 — anchor cell is NOT treated as a "target" by the
+    /// dissolution check. Setting a formula at the anchor follows the
+    /// existing clear-old path (4.7.J.2 MEDIUM-4 closure), not the new
+    /// MEDIUM-3 dissolution path. Verifies that writing a NEW array at
+    /// the same anchor reshapes correctly without spuriously calling
+    /// clear_spill_at twice (which would error the second time).
+    #[test]
+    fn set_formula_at_anchor_does_not_double_clear_spill() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+        // Re-set at anchor — the MEDIUM-3 path sees A1 is both anchor
+        // AND target of itself; the `host_anchor != (sheet, row, col)`
+        // guard prevents a double-clear. Then clear_spill_if_present
+        // dissolves the old footprint.
+        rt.set_formula(0, 0, 0, "{4; 5}").unwrap();
+        drop(rt);
+
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(2, 1))
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Number(4.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 0)), Value::Number(5.0));
+        // Old B1 and C1 cleared.
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Blank);
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Blank);
+    }
+
+    /// Phase 4.7.J.5 — array formula INTO a spill target also dissolves
+    /// the host AND can register a NEW spill rooted at the target cell.
+    /// (Excel canon: typing IS allowed, dissolution propagates.)
+    #[test]
+    fn set_formula_array_at_spill_target_dissolves_then_spills() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // First spill at A1 (horizontal, A1, B1, C1).
+        rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+        // Now set an array formula at B1 — dissolves A1's spill, then
+        // tries to spill at B1. A 1×2 from B1 = B1, C1. The dissolution
+        // clears B1's and C1's prior computed values, so the new spill
+        // sees them as Blank → succeeds.
+        rt.set_formula(0, 0, 1, "{7, 8}").unwrap();
+        drop(rt);
+
+        // Host A1's spill dissolved.
+        assert_eq!(wb.spill_anchor_at(0, 0, 0), None);
+        // B1 is now an anchor for a new 1×2 spill.
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 1).copied(),
+            Some(ql_storage::SpillShape::new(1, 2))
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(7.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Number(8.0));
+    }
+
+    /// Phase 4.7.J.5 — non-target write is unaffected by the
+    /// dissolution check (negative control: no spurious clear when
+    /// the target cell isn't part of any spill).
+    #[test]
+    fn set_formula_at_non_spill_target_unchanged_behavior() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // A1 spills A1..C1.
+        rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+        // Write a formula at D1 (NOT a target).
+        let v = rt.set_formula(0, 0, 3, "10 + 10").unwrap();
+        drop(rt);
+
+        assert_eq!(v, Value::Number(20.0));
+        // Host spill still active.
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(1, 3))
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Number(3.0));
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 3)),
+            Value::Number(20.0)
         );
     }
 }
