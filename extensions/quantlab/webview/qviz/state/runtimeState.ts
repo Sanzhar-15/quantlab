@@ -144,10 +144,23 @@ function sameCapabilities(
 	// capability gate stale after a daemon respawn-with-downgrade.
 	const ai = a.inspector;
 	const bi = b.inspector;
-	if (ai === bi) { return true; }
+	if (ai === bi) {
+		// Megaudit MEDIUM (Opus + Codex, 2026-05-14): also compare
+		// the Front 2 `transformAttributionV1` flag here. A daemon
+		// respawn that flips ONLY this bit would otherwise be reduced
+		// as a no-op, leaving stale runtime state. Mirrors the
+		// inspector-bag pattern; same audit-rationale as M-24 from
+		// 2026-05-11.
+		if (a.transformAttributionV1 !== b.transformAttributionV1) { return false; }
+		return true;
+	}
 	if (ai === undefined || bi === undefined) { return false; }
 	if (ai.previewOffset !== bi.previewOffset) { return false; }
 	if (ai.columnStats !== bi.columnStats) { return false; }
 	if (ai.aggregateFilters !== bi.aggregateFilters) { return false; }
+	// Megaudit MEDIUM (Opus + Codex, 2026-05-14): see above. Same
+	// comparison, applied after the inspector-bag branch so neither
+	// path can skip it.
+	if (a.transformAttributionV1 !== b.transformAttributionV1) { return false; }
 	return true;
 }

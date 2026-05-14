@@ -1212,22 +1212,29 @@ class Daemon:
             f"SELECT (SELECT COUNT(*) FROM __wrapped_inner) AS __total, * "
             f"FROM __wrapped_inner LIMIT {int(n)} OFFSET {int(offset)}"
         )
+        # Megaudit HIGH (Codex, 2026-05-14): keep the COUNT(*) and
+        # LIMIT 0 fallback queries INSIDE the same query_budget block.
+        # Pre-fix, the past-EOF empty-page path executed two extra
+        # DuckDB queries OUTSIDE the timeout/memory enforcement, so a
+        # request with offset past EOF on a wide-table aggregate could
+        # consume unbounded resources. Both queries should respect the
+        # caller-supplied timeout_s + peak_rss_mb.
         with query_budget(timeout_s=timeout_s, peak_rss_mb=peak_rss_mb, conn=self.conn):
             arrow_table = self.conn.execute(wrapped_sql, compiled.params).to_arrow_table()
-        if arrow_table.num_rows > 0:
-            total = int(arrow_table.column("__total")[0].as_py())
-            table = arrow_table.drop_columns(["__total"])
-        else:
-            count_only = self.conn.execute(
-                f"SELECT COUNT(*) FROM ({compiled.sql}) AS _cnt", compiled.params,
-            ).fetchone()
-            total = int(count_only[0]) if count_only else 0
-            # Empty page: re-execute the compiled SQL with LIMIT 0 to get
-            # the right column shape for an empty table.
-            empty_arrow = self.conn.execute(
-                f"SELECT * FROM ({compiled.sql}) AS _e LIMIT 0", compiled.params,
-            ).to_arrow_table()
-            table = empty_arrow
+            if arrow_table.num_rows > 0:
+                total = int(arrow_table.column("__total")[0].as_py())
+                table = arrow_table.drop_columns(["__total"])
+            else:
+                count_only = self.conn.execute(
+                    f"SELECT COUNT(*) FROM ({compiled.sql}) AS _cnt", compiled.params,
+                ).fetchone()
+                total = int(count_only[0]) if count_only else 0
+                # Empty page: re-execute the compiled SQL with LIMIT 0
+                # to get the right column shape for an empty table.
+                empty_arrow = self.conn.execute(
+                    f"SELECT * FROM ({compiled.sql}) AS _e LIMIT 0", compiled.params,
+                ).to_arrow_table()
+                table = empty_arrow
         resp = self._wrap_arrow_or_json(table)
         resp.setdefault("data", {})["total"] = total
         resp["data"]["filtered"] = True
@@ -1267,9 +1274,17 @@ class Daemon:
                     "encoding": "json",
                 }
         arrow_bytes = reader.table_to_arrow_ipc(table)
+        # Megaudit HIGH (Codex, 2026-05-14): TS client's `readCached`
+        # (daemon-client.ts) requires `data.cached` on every Arrow
+        # response. Pre-fix, this site emitted Arrow metadata without
+        # the field, so large fresh previews failed with
+        # `DaemonProtocolError`. Cache-hit Arrow paths in op_aggregate
+        # already include `cached: True`; this is the fresh path's
+        # parallel.
         return {
             "binary": arrow_bytes,
-            "data": {"n": table.num_rows, "bytes": len(arrow_bytes),
+            "data": {"cached": False, "n": table.num_rows,
+                     "bytes": len(arrow_bytes),
                      "columns": table.column_names},
             "encoding": "arrow",
         }

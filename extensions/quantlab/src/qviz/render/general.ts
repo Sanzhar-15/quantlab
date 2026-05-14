@@ -275,10 +275,20 @@ function mapColorFieldDef(enc: Encoding): VegaLiteFieldDef {
 		return base;
 	}
 	const scheme = enc.type === 'ordinal' ? 'tableau10' : 'viridis';
-	const baseScale = base.scale ?? {};
+	// Megaudit HIGH (Sonnet, 2026-05-14): `mapFieldDef` only sets
+	// `base.scale` when `enc.scale` is defined; for color encodings
+	// (ordinal/quantitative/temporal) it's almost always absent. The
+	// previous `base.scale ?? {}` was a CLAUDE.md no-fallback violation
+	// — it silently substituted `{}` for the normal undefined case
+	// instead of treating the two paths explicitly. Now an explicit
+	// branch: when base.scale is set, compose; when absent, emit just
+	// the scheme.
+	const existingScale = base.scale as Record<string, unknown> | undefined;
 	return {
 		...base,
-		scale: { ...baseScale, ...{ scheme } as { scheme: string } },
+		scale: existingScale !== undefined
+			? { ...existingScale, scheme }
+			: { scheme },
 	};
 }
 
@@ -560,8 +570,13 @@ function validateEncodingFields(
 	columns: ColumnData,
 	attribution?: readonly TransformAttribution[] | null,
 ): void {
+	// Megaudit HIGH (Sonnet, 2026-05-14): `y2` was previously omitted
+	// from this channel list, so a missing-column `y2` reference fell
+	// through to the channel-anonymous fallback in `columnsToRows`
+	// (`encoding references field 'X' but no such column in data`),
+	// losing the channel-named format that all other encodings get.
 	const channels: readonly (keyof Encodings)[] =
-		['x', 'y', 'color', 'size', 'shape', 'facet_row', 'facet_col'];
+		['x', 'y', 'y2', 'color', 'size', 'shape', 'facet_row', 'facet_col'];
 	for (const ch of channels) {
 		const enc = encodings[ch] as Encoding | undefined;
 		if (enc !== undefined && columns[enc.field] === undefined) {

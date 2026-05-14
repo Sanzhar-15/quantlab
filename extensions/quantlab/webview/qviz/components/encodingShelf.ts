@@ -103,9 +103,12 @@ export function mountEncodingShelves(root: HTMLElement, store: QvizStore): { dis
 		const state = store.getState();
 		const chartType = state.spec.current?.chart.type ?? null;
 		if (chartType === renderedChartType) {
-			// Same chart type: shelf set unchanged; let the inner
-			// refresh handlers update assignments without remount.
-			if (cleanup === null) { return; }
+			// Same chart type: shelf set unchanged. Inner refresh
+			// handlers (registered inside mountRegularShelves /
+			// mountOhlcvShelf) update assignments without remount.
+			// Megaudit MEDIUM (Opus, 2026-05-14): removed the dead
+			// `if (cleanup === null) return; return;` branch that
+			// was a misleading no-op.
 			return;
 		}
 		// Chart type changed: rebuild the shelf surface from scratch.
@@ -225,6 +228,15 @@ function mountRegularShelves(
 		shelves.set(ch, { container, fieldEl, clearBtn, droppedBadge });
 	}
 
+	// Megaudit MEDIUM (Opus, 2026-05-14): cache the inputs the refresh
+	// reads so unrelated dispatches (inspector toggle, theme bump,
+	// keystroke in a transform textarea) early-return without rebuilding
+	// all 8 shelves' DOM. Mirrors the transformList:renderCards guard
+	// added in Front 2 V2. References are stable: encodings and
+	// attribution arrays are atomically replaced by their reducers.
+	let lastEncodingsRef: unknown = undefined;
+	let lastActiveShelf: RegularChannel | null | undefined = undefined;
+	let lastAttributionRef: unknown = undefined;
 	const refresh = (): void => {
 		const state = store.getState();
 		const encodings = state.spec.current?.chart.encodings;
@@ -232,6 +244,16 @@ function mountRegularShelves(
 		// Front 2 V2 (2026-05-14): fetch fresh attribution once per refresh
 		// instead of per-shelf; same staleness gate for all shelves.
 		const freshAttribution = getFreshAttribution(store);
+		if (
+			encodings === lastEncodingsRef
+			&& active === lastActiveShelf
+			&& freshAttribution === lastAttributionRef
+		) {
+			return;
+		}
+		lastEncodingsRef = encodings;
+		lastActiveShelf = active;
+		lastAttributionRef = freshAttribution;
 		for (const [ch, els] of shelves) {
 			const enc = encodings?.[ch] ?? null;
 			if (enc) {

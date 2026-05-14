@@ -227,8 +227,12 @@ export function mountTransformList(root: HTMLElement, store: QvizStore): { dispo
 		// Skip rebuild if nothing structural changed.
 		const specHash = state.spec.currentHash;
 		const schemaHash = state.schema.info?.schema_hash ?? null;
+		// Megaudit MEDIUM (Sonnet, 2026-05-14): same join-collision
+		// pattern the V2 audit fixed for attributionDigest applies
+		// here. Use JSON.stringify so a transform kind containing a
+		// comma can't collide with two adjacent kinds.
 		const capHash = state.runtime.capabilities
-			? state.runtime.capabilities.transformKinds.join(',')
+			? JSON.stringify(state.runtime.capabilities.transformKinds)
 			: null;
 		if (
 			specHash === lastSpecHash
@@ -554,8 +558,12 @@ function collectProducedNames(t: Transform, out: string[]): void {
 function buildAttributionRow(record: TransformAttribution): HTMLElement {
 	const row = document.createElement('div');
 	row.className = 'qviz-form-attribution';
+	// Megaudit MEDIUM (Sonnet, 2026-05-14): produces also gets the
+	// overflow cap. A `math`/`expr`/`aggregate` on a wide table can
+	// produce many columns; uncapped chips dominate the card the
+	// same way uncapped drops would.
 	if (record.produces.length > 0) {
-		row.appendChild(buildAttributionSection('Produces', record.produces, false));
+		row.appendChild(buildAttributionSection('Produces', record.produces, true));
 	}
 	if (record.drops.length > 0) {
 		row.appendChild(buildAttributionSection('Drops', record.drops, true));

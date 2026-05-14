@@ -197,6 +197,59 @@ export function reduceQuery(state: QueryState, action: Action): QueryState {
 				}),
 			};
 		}
+		case 'daemonStatus': {
+			// Megaudit HIGH (Sonnet, 2026-05-14): a daemon crash /
+			// respawn / unavailable transition invalidates attribution
+			// because the new daemon may have a different version,
+			// different feature flags, or simply a different execution
+			// context. The spec-hash gate alone doesn't catch this
+			// because the spec hasn't changed. Same staleness pattern
+			// the V2 audit caught for `schemaChanged`; we extend the
+			// invalidation chain to the daemon-lifecycle axis too.
+			//
+			// Only crashed/respawning/unavailable invalidate. Idle ->
+			// starting -> ready transitions during normal warmup don't
+			// touch existing lastData.
+			if (
+				action.status !== 'crashed'
+				&& action.status !== 'respawning'
+				&& action.status !== 'unavailable'
+			) {
+				return state;
+			}
+			if (state.lastData === null || state.lastData.attribution === null) {
+				return state;
+			}
+			return {
+				...state,
+				lastData: Object.freeze({
+					...state.lastData,
+					attribution: null,
+				}),
+			};
+		}
+		case 'capabilitiesUpdated': {
+			// Megaudit HIGH (Sonnet, 2026-05-14): when a daemon respawns
+			// as an older version that doesn't advertise
+			// `transformAttributionV1`, attribution must be invalidated
+			// because the new daemon's responses won't include it; old
+			// attribution would persist indefinitely behind the spec-
+			// hash gate. Mirror the schemaChanged + daemonStatus
+			// invalidation pattern.
+			if (action.capabilities.transformAttributionV1 === true) {
+				return state;
+			}
+			if (state.lastData === null || state.lastData.attribution === null) {
+				return state;
+			}
+			return {
+				...state,
+				lastData: Object.freeze({
+					...state.lastData,
+					attribution: null,
+				}),
+			};
+		}
 		default:
 			return state;
 	}

@@ -1339,12 +1339,28 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 			// does the transform), so we pass through verbatim. Absent
 			// on pre-Front-2 daemons; the validator accepts the absence.
 			//
+			// Megaudit HIGH (Codex, 2026-05-14): `inspectorFilters` are
+			// PREPENDED to `spec.transforms` in `daemon.py:op_aggregate`,
+			// so the daemon emits attribution indices for the EFFECTIVE
+			// transform list (inspector filters first, then saved
+			// transforms). The webview maps records to cards by
+			// `record.index` against the SAVED transforms — so without
+			// adjustment, badges/chips point at the wrong transform when
+			// inspector filters are active. Strip the first N records
+			// (one per inspector filter) and subtract N from each
+			// remaining index so the saved spec's transform[0] maps to
+			// record.index=0 again.
+			//
 			// Front 2 audit LOW (Opus, 2026-05-14): empty attribution
 			// arrays (spec has no transforms) are normalized to absent.
-			// The daemon's `_attribution_to_wire` returns `None` for
-			// empty, but a future daemon or middlebox might emit `[]`;
-			// pin the wire-shape promise (absent == no-attribution).
-			const attribution = r.meta.attribution;
+			const rawAttribution = r.meta.attribution;
+			const filterCount = inspectorFilters?.length ?? 0;
+			let attribution: typeof rawAttribution = rawAttribution;
+			if (rawAttribution !== undefined && filterCount > 0) {
+				attribution = rawAttribution
+					.slice(filterCount)
+					.map(rec => ({ ...rec, index: rec.index - filterCount }));
+			}
 			this.postOrLog(panel, {
 				type: 'data',
 				protocolVersion: PROTOCOL_VERSION,

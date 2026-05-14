@@ -168,7 +168,18 @@ function init(): void {
 	// rendering spec_A would dispatch with spec_B's hash if a fresh
 	// requestData landed during the render, clobbering spec_B's
 	// diagnostics with an irrelevant error.
+	// Megaudit HIGH (Codex, 2026-05-14): drop local errors whose
+	// `triggerSpecHash` no longer matches the editor's current spec.
+	// The localErrorReceived reducer arm gates on
+	// `lastSuccessfulSpecHash === action.specHash`, which is correct
+	// for attribution but doesn't catch the case "user edits spec A
+	// to spec B; render of A fails and dispatches; diagnostics shows
+	// error attributed to A while editor shows B". Gate at dispatch
+	// time before the reducer ever sees it.
+	const isErrorForCurrentSpec = (triggerSpecHash: string): boolean =>
+		store.getState().spec.currentHash === triggerSpecHash;
 	const dispatchExtractError = (triggerSpecHash: string, message: string): void => {
+		if (!isErrorForCurrentSpec(triggerSpecHash)) { return; }
 		store.dispatch({
 			type: 'localErrorReceived',
 			specHash: triggerSpecHash,
@@ -177,6 +188,7 @@ function init(): void {
 		});
 	};
 	const dispatchRenderError = (triggerSpecHash: string, stage: string, message: string): void => {
+		if (!isErrorForCurrentSpec(triggerSpecHash)) { return; }
 		store.dispatch({
 			type: 'localErrorReceived',
 			specHash: triggerSpecHash,
@@ -390,7 +402,10 @@ function init(): void {
 				attrForRender);
 		}
 	});
-	void liveSubscription;
+	// liveSubscription is a store-unsubscribe function; called in the
+	// dispose path below to detach. Megaudit MEDIUM (Sonnet,
+	// 2026-05-14): removed `void liveSubscription;` no-op that was
+	// suppressing an unused-locals lint warning without explanation.
 
 	// Step 5.E.1 -- theme refresh via MutationObserver on body.className.
 	// VS Code signals theme changes by toggling body classes

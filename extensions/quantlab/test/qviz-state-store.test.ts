@@ -451,6 +451,120 @@ suite('qviz state -- query slice (stale-result attribution)', () => {
 		assert.ok(Object.isFrozen(a[0].produces), 'inner arrays must be frozen');
 	});
 
+	test('Megaudit HIGH (Sonnet): daemonStatus=crashed clears lastData.attribution', () => {
+		// daemon crash invalidates attribution because the new daemon
+		// may not produce the same indices on respawn. The spec-hash
+		// gate alone doesn't catch this (spec unchanged).
+		const sh = computeSpecHash(spec());
+		let s = setUpRequest(1, sh);
+		s = rootReduce(s, {
+			type: 'dataReceived', requestId: 1, specHash: sh,
+			arrow: new Uint8Array(), elapsedMs: 0, cached: false, diagnostics: [],
+			attribution: [{ index: 0, kind: 'aggregate',
+				produces: ['mean_close'], drops: ['close'],
+				availableAfter: ['date', 'mean_close'] }],
+		});
+		assert.ok(s.query.lastData?.attribution);
+		s = rootReduce(s, { type: 'daemonStatus', status: 'crashed' });
+		assert.strictEqual(s.query.lastData?.attribution, null,
+			'daemon crash must clear attribution');
+		// lastData itself must survive (so the chart on screen keeps
+		// rendering with plain error messages while the daemon respawns).
+		assert.ok(s.query.lastData !== null);
+	});
+
+	test('Megaudit HIGH (Sonnet): daemonStatus=ready does NOT touch lastData', () => {
+		const sh = computeSpecHash(spec());
+		let s = setUpRequest(1, sh);
+		s = rootReduce(s, {
+			type: 'dataReceived', requestId: 1, specHash: sh,
+			arrow: new Uint8Array(), elapsedMs: 0, cached: false, diagnostics: [],
+			attribution: [{ index: 0, kind: 'aggregate',
+				produces: ['mean_close'], drops: ['close'],
+				availableAfter: ['date', 'mean_close'] }],
+		});
+		const before = s.query.lastData;
+		s = rootReduce(s, { type: 'daemonStatus', status: 'ready' });
+		assert.strictEqual(s.query.lastData, before,
+			'ready transitions during warmup must not touch lastData');
+	});
+
+	test('Megaudit HIGH (Sonnet): capabilitiesUpdated to downgraded daemon clears attribution', () => {
+		// A downgraded daemon (no transformAttributionV1) means future
+		// dataReceived responses won't carry attribution. The existing
+		// stale attribution would otherwise persist behind the spec-
+		// hash gate indefinitely.
+		const sh = computeSpecHash(spec());
+		let s = setUpRequest(1, sh);
+		s = rootReduce(s, {
+			type: 'dataReceived', requestId: 1, specHash: sh,
+			arrow: new Uint8Array(), elapsedMs: 0, cached: false, diagnostics: [],
+			attribution: [{ index: 0, kind: 'aggregate',
+				produces: ['mean_close'], drops: ['close'],
+				availableAfter: ['date', 'mean_close'] }],
+		});
+		s = rootReduce(s, {
+			type: 'capabilitiesUpdated',
+			capabilities: {
+				daemonVersion: 1,
+				transformKinds: ['filter', 'aggregate'],
+				chartFamilies: ['timeseries', 'general'],
+				// transformAttributionV1 absent => downgrade.
+			},
+		});
+		assert.strictEqual(s.query.lastData?.attribution, null);
+	});
+
+	test('Megaudit HIGH (Sonnet): capabilitiesUpdated keeping V1 bit preserves attribution', () => {
+		const sh = computeSpecHash(spec());
+		let s = setUpRequest(1, sh);
+		s = rootReduce(s, {
+			type: 'dataReceived', requestId: 1, specHash: sh,
+			arrow: new Uint8Array(), elapsedMs: 0, cached: false, diagnostics: [],
+			attribution: [{ index: 0, kind: 'aggregate',
+				produces: ['mean_close'], drops: ['close'],
+				availableAfter: ['date', 'mean_close'] }],
+		});
+		const before = s.query.lastData;
+		s = rootReduce(s, {
+			type: 'capabilitiesUpdated',
+			capabilities: {
+				daemonVersion: 1,
+				transformKinds: ['filter', 'aggregate'],
+				chartFamilies: ['timeseries', 'general'],
+				transformAttributionV1: true,
+			},
+		});
+		assert.strictEqual(s.query.lastData, before,
+			'same-capability update with V1 still advertised: no-op');
+	});
+
+	test('Megaudit MEDIUM (Opus+Codex): sameCapabilities returns false when only transformAttributionV1 flips', () => {
+		const sh = computeSpecHash(spec());
+		let s = setUpRequest(1, sh);
+		// First seed: daemon advertises V1.
+		s = rootReduce(s, {
+			type: 'capabilitiesUpdated',
+			capabilities: {
+				daemonVersion: 1, transformKinds: ['filter'], chartFamilies: ['general'],
+				transformAttributionV1: true,
+			},
+		});
+		const beforeCaps = s.runtime.capabilities;
+		assert.strictEqual(beforeCaps?.transformAttributionV1, true);
+		// Daemon respawns WITHOUT V1 — everything else identical.
+		s = rootReduce(s, {
+			type: 'capabilitiesUpdated',
+			capabilities: {
+				daemonVersion: 1, transformKinds: ['filter'], chartFamilies: ['general'],
+				// transformAttributionV1 absent.
+			},
+		});
+		assert.notStrictEqual(s.runtime.capabilities, beforeCaps,
+			'capabilities reference must change when V1 bit flips');
+		assert.strictEqual(s.runtime.capabilities?.transformAttributionV1, undefined);
+	});
+
 	test('Front 2 audit MEDIUM: spec-hash gate semantics for renderActiveData', () => {
 		// Documents the contract enforced at the render-trigger call
 		// sites in `webview/qviz-spec/index.ts` (resize observer + live
@@ -1985,6 +2099,25 @@ suite('qviz state -- megaudit cures (Phase 6)', () => {
 		assert.ok(s.inspector.selection !== null);
 		const swapped = rootReduce(s, {
 			type: 'setChartType', family: 'general', chartType: 'pie',
+		});
+		assert.strictEqual(swapped.inspector.selection, null);
+	});
+
+	test('M-9 / Cycle 2 HIGH-1: applyChartTypeWithFit also clears selection', () => {
+		// Megaudit MEDIUM (Opus, 2026-05-14): the Cycle 2 audit HIGH-1
+		// added applyChartTypeWithFit to the same M-9 reducer arm but
+		// no test pinned the new action. This is the regression-pin
+		// test the closure forgot.
+		let s = withSpec(spec());
+		s = rootReduce(s, { type: 'setSelection', x: 42 });
+		assert.ok(s.inspector.selection !== null);
+		const swapped = rootReduce(s, {
+			type: 'applyChartTypeWithFit',
+			family: 'general', chartType: 'pie',
+			encodings: {
+				color: { field: 'a', type: 'nominal' },
+				y: { field: 'b', type: 'quantitative' },
+			},
 		});
 		assert.strictEqual(swapped.inspector.selection, null);
 	});
