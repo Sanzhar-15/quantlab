@@ -51,6 +51,16 @@ pub enum LexError {
     /// in Excel formulas — this is a clean syntax error.
     #[error("quoted string not followed by '!' — only valid as a sheet-name prefix")]
     DanglingQuotedString,
+
+    /// **W5-97 (Phase 4.7.C):** a `#` was followed by characters that
+    /// don't form any recognized error sigil. Excel's error literals are
+    /// `#REF!`, `#VALUE!`, `#N/A`, `#DIV/0!`, `#NULL!`, `#NUM!`, `#NAME?`,
+    /// `#SPILL!`, `#CALC!` (plus Quantbook-specific `#DISCONNECTED!`,
+    /// `#BINDING!`, `#TIMEOUT!`, `#PERMISSION!`, `#AI_NOT_AVAILABLE_V1`,
+    /// `#CIRC!`). The fragment captured is the longest run of sigil-
+    /// looking characters starting at the `#`.
+    #[error("unrecognized error sigil: {0:?}")]
+    InvalidErrorSigil(String),
 }
 
 /// Excel's column-letter upper bound (XFD = 16383, zero-indexed).
@@ -93,6 +103,26 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             ';' => {
                 chars.next();
                 out.push(Token::Semicolon);
+            }
+            // **W5-97 (Phase 4.7.C):** array-literal braces. The parser
+            // consumes these in W5-98 (Phase 4.7.D) to build
+            // `Expr::Array`. Outside an array-literal context the
+            // parser surfaces `ParseError::UnexpectedToken`.
+            '{' => {
+                chars.next();
+                out.push(Token::LBrace);
+            }
+            '}' => {
+                chars.next();
+                out.push(Token::RBrace);
+            }
+            // **W5-97 (Phase 4.7.C):** error-sigil literal. `#` is not
+            // a lexical char anywhere else in Excel formula source, so
+            // we commit to lex-as-error-sigil eagerly and surface
+            // `LexError::InvalidErrorSigil` if the run doesn't match
+            // any of `ErrorValue::ALL`. Greedy match per `lex_error_sigil`.
+            '#' => {
+                out.push(lex_error_sigil(&mut chars)?);
             }
             '+' => {
                 chars.next();
@@ -175,6 +205,72 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
     }
 
     Ok(out)
+}
+
+/// **W5-97 (Phase 4.7.C):** lex an Excel error sigil literal starting
+/// at `#`. Returns `Token::Error(ev)` on a recognized sigil, or
+/// `LexError::InvalidErrorSigil` with the captured fragment.
+///
+/// Strategy: BUILD a candidate fragment via a CLONED iterator so we
+/// can back off without disturbing the real cursor. Collect every
+/// sigil-body char (ASCII letters / digits / `_` / `/` / `!` / `?` /
+/// `.`), then find the LONGEST `ErrorValue::ALL` sigil that is a
+/// prefix of the fragment. Consume only that many chars from the
+/// real iterator — any tail past the sigil end stays in `chars` for
+/// subsequent lex steps.
+///
+/// Edge cases:
+/// - `#REF!5` → `Token::Error(Ref)` + `Token::Number(5)`. The `5` is
+///   re-lexed normally on the next loop iteration.
+/// - `#N/A` (no trailing `!`/`?`) → `Token::Error(NA)`. Sigil consumed
+///   fully; iterator now positioned at whatever follows.
+/// - `#NA` (missing slash) → `InvalidErrorSigil("#NA")` — no sigil
+///   matches.
+/// - Case-insensitive: `#ref!` matches `#REF!`.
+fn lex_error_sigil(chars: &mut Peekable<Chars>) -> Result<Token, LexError> {
+    // PEEK ONLY: build the fragment via a clone so we can back off
+    // unmatched-tail chars without losing them.
+    let mut peek = chars.clone();
+    let mut fragment = String::new();
+    fragment.push('#');
+    peek.next(); // skip the `#` on the clone
+
+    while let Some(&c) = peek.peek() {
+        match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '/' | '.' | '!' | '?' => {
+                fragment.push(c);
+                peek.next();
+            }
+            _ => break,
+        }
+    }
+
+    // Find the longest sigil that is a case-insensitive prefix of
+    // `fragment`. All sigil bytes are ASCII so byte-indexing is safe.
+    let mut best: Option<(ql_types::ErrorValue, usize)> = None;
+    for ev in ql_types::ErrorValue::ALL {
+        let sigil = ev.sigil();
+        if fragment.len() >= sigil.len()
+            && fragment.as_bytes()[..sigil.len()].eq_ignore_ascii_case(sigil.as_bytes())
+        {
+            match best {
+                None => best = Some((ev, sigil.len())),
+                Some((_, prev_len)) if sigil.len() > prev_len => best = Some((ev, sigil.len())),
+                _ => {}
+            }
+        }
+    }
+
+    let (ev, matched_len) = best.ok_or(LexError::InvalidErrorSigil(fragment))?;
+
+    // Consume EXACTLY `matched_len` chars from the real iterator. All
+    // sigil bytes are ASCII (1 char = 1 byte), so byte length and char
+    // count coincide.
+    for _ in 0..matched_len {
+        chars.next();
+    }
+
+    Ok(Token::Error(ev))
 }
 
 fn lex_string(chars: &mut Peekable<Chars>) -> Result<Token, LexError> {
@@ -1177,8 +1273,9 @@ mod tests {
     fn unexpected_char_errors() {
         // `@` is structured-ref territory (Phase 3+). Phase 0 lexer rejects.
         assert!(matches!(lex("@"), Err(LexError::UnexpectedChar('@'))));
-        // `{` array-literal territory; Phase 0 rejects.
-        assert!(matches!(lex("{"), Err(LexError::UnexpectedChar('{'))));
+        // `{` was rejected pre-W5-97 (Phase 4.7.C); now accepted as
+        // `Token::LBrace`. The replacement assertion (lex_ok) lives in
+        // `lbrace_and_rbrace_lex_to_brace_tokens` above.
         // backtick — not in the Excel alphabet at all.
         assert!(matches!(lex("`"), Err(LexError::UnexpectedChar('`'))));
     }
@@ -1493,5 +1590,172 @@ mod tests {
             Token::QuotedSheetName(n) => assert_eq!(n.as_ref(), "A"),
             other => panic!("expected QuotedSheetName, got {other:?}"),
         }
+    }
+
+    // ===== W5-97 (Phase 4.7.C) — array braces + error literals =====
+
+    #[test]
+    fn lbrace_and_rbrace_lex_to_brace_tokens() {
+        let toks = lex_ok("{}");
+        assert_eq!(toks.len(), 2);
+        assert_eq!(toks[0], Token::LBrace);
+        assert_eq!(toks[1], Token::RBrace);
+    }
+
+    #[test]
+    fn array_literal_shape_lexes_to_expected_token_stream() {
+        // Per design § 3.1: `{1, 2; 3, 4}` should lex as
+        // LBrace, Number, Comma, Number, Semicolon, Number, Comma, Number, RBrace.
+        let toks = lex_ok("{1, 2; 3, 4}");
+        assert_eq!(toks.len(), 9);
+        assert_eq!(toks[0], Token::LBrace);
+        assert!(matches!(toks[1], Token::Number(n) if n == 1.0));
+        assert_eq!(toks[2], Token::Comma);
+        assert!(matches!(toks[3], Token::Number(n) if n == 2.0));
+        assert_eq!(toks[4], Token::Semicolon);
+        assert!(matches!(toks[5], Token::Number(n) if n == 3.0));
+        assert_eq!(toks[6], Token::Comma);
+        assert!(matches!(toks[7], Token::Number(n) if n == 4.0));
+        assert_eq!(toks[8], Token::RBrace);
+    }
+
+    #[test]
+    fn error_sigil_ref_lexes() {
+        let toks = lex_ok("#REF!");
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::Ref));
+    }
+
+    #[test]
+    fn error_sigil_value_lexes() {
+        let toks = lex_ok("#VALUE!");
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::Value));
+    }
+
+    #[test]
+    fn error_sigil_na_lexes_without_trailing_punct() {
+        // #N/A is the one canonical sigil that ends without ! or ?.
+        let toks = lex_ok("#N/A");
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::NA));
+    }
+
+    #[test]
+    fn error_sigil_div_zero_with_slash_lexes() {
+        let toks = lex_ok("#DIV/0!");
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn error_sigil_name_with_question_mark_lexes() {
+        let toks = lex_ok("#NAME?");
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::Name));
+    }
+
+    #[test]
+    fn error_sigil_spill_lexes() {
+        let toks = lex_ok("#SPILL!");
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::Spill));
+    }
+
+    #[test]
+    fn error_sigil_calc_lexes() {
+        let toks = lex_ok("#CALC!");
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::Calc));
+    }
+
+    #[test]
+    fn error_sigil_null_lexes() {
+        let toks = lex_ok("#NULL!");
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::Null));
+    }
+
+    #[test]
+    fn error_sigil_num_lexes() {
+        let toks = lex_ok("#NUM!");
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::Num));
+    }
+
+    #[test]
+    fn error_sigil_circ_lexes() {
+        // Quantbook-specific Phase 3.4 sigil.
+        let toks = lex_ok("#CIRC!");
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::Circ));
+    }
+
+    #[test]
+    fn error_sigil_case_insensitive() {
+        let toks = lex_ok("#ref!");
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::Ref));
+        let toks = lex_ok("#Value!");
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::Value));
+        let toks = lex_ok("#n/a");
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::NA));
+    }
+
+    #[test]
+    fn error_sigil_followed_by_digit_does_not_over_consume() {
+        // `#REF!5` → Error(Ref) + Number(5). The `5` is NOT a sigil-
+        // body continuation; the lexer must stop after `!`.
+        let toks = lex_ok("#REF!5");
+        assert_eq!(toks.len(), 2);
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::Ref));
+        assert!(matches!(toks[1], Token::Number(n) if n == 5.0));
+    }
+
+    #[test]
+    fn error_sigil_na_followed_by_letter_does_not_over_consume() {
+        // `#N/A` ends without trailing punct. The next char `5` should
+        // start a separate token.
+        let toks = lex_ok("#N/A 5");
+        assert_eq!(toks.len(), 2);
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::NA));
+        assert!(matches!(toks[1], Token::Number(n) if n == 5.0));
+    }
+
+    #[test]
+    fn error_sigil_in_array_lexes() {
+        // Array literals with error literals (per design § 3.3):
+        // `{1, #N/A, 3}` should lex without issue.
+        let toks = lex_ok("{1, #N/A, 3}");
+        assert_eq!(toks.len(), 7);
+        assert_eq!(toks[0], Token::LBrace);
+        assert!(matches!(toks[1], Token::Number(n) if n == 1.0));
+        assert_eq!(toks[2], Token::Comma);
+        assert_eq!(toks[3], Token::Error(ql_types::ErrorValue::NA));
+        assert_eq!(toks[4], Token::Comma);
+        assert!(matches!(toks[5], Token::Number(n) if n == 3.0));
+        assert_eq!(toks[6], Token::RBrace);
+    }
+
+    #[test]
+    fn invalid_error_sigil_surfaces_clean_error() {
+        // `#NA` (no slash) doesn't match any known sigil — should
+        // surface InvalidErrorSigil, NOT a partial match.
+        let err = lex("#NA").unwrap_err();
+        match err {
+            LexError::InvalidErrorSigil(s) => assert_eq!(s, "#NA"),
+            other => panic!("expected InvalidErrorSigil, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_error_sigil_empty_body_surfaces_clean_error() {
+        // Just `#` with nothing after, or `#` followed by non-sigil chars.
+        let err = lex("#").unwrap_err();
+        assert!(matches!(err, LexError::InvalidErrorSigil(s) if s == "#"));
+    }
+
+    #[test]
+    fn error_sigil_inside_function_call_lexes() {
+        // `IFERROR(#REF!, 0)` should lex cleanly.
+        let toks = lex_ok("IFERROR(#REF!, 0)");
+        // Expected: BareColumn/Ident(IFERROR), LParen, Error(Ref), Comma, Number(0), RParen.
+        assert_eq!(toks.len(), 6);
+        assert_eq!(toks[1], Token::LParen);
+        assert_eq!(toks[2], Token::Error(ql_types::ErrorValue::Ref));
+        assert_eq!(toks[3], Token::Comma);
+        assert!(matches!(toks[4], Token::Number(n) if n == 0.0));
+        assert_eq!(toks[5], Token::RParen);
     }
 }

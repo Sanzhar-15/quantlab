@@ -87,6 +87,23 @@ pub enum Token {
     Colon,
     Semicolon,
 
+    /// **W5-97 (Phase 4.7.C):** `{` — opens an array literal. Used by the
+    /// Phase 4.7 array-literal grammar (`{1,2;3,4}`). Outside that grammar
+    /// the parser rejects it with `ParseError::UnexpectedToken`.
+    LBrace,
+
+    /// **W5-97 (Phase 4.7.C):** `}` — closes an array literal.
+    RBrace,
+
+    /// **W5-97 (Phase 4.7.C):** an Excel error sigil literal (`#REF!`,
+    /// `#N/A`, `#DIV/0!`, `#NUM!`, `#NAME?`, `#NULL!`, `#VALUE!`,
+    /// `#SPILL!`, `#CALC!`, plus the Quantbook-specific sigils like
+    /// `#DISCONNECTED!`). Recognized at lex time so `=IFERROR(#REF!, 0)`
+    /// and array literals `{1, #N/A, 3}` (Phase 4.7.D) tokenize cleanly.
+    /// The parser maps this to `Expr::ErrorLiteral(_)` (4.7.D) — for
+    /// now (4.7.C) the parser treats it as an unexpected token.
+    Error(ql_types::ErrorValue),
+
     /// **W5-88 (Phase 4.6.A part 2):** `!` separator between a sheet
     /// name and a cell/range reference. Only meaningful immediately
     /// after a `SheetName` / `QuotedSheetName` token; appearing
