@@ -2862,11 +2862,11 @@ id = 999
     /// **W5-105 (Phase 4.7.L)** load round-trip: save a workbook with a
     /// spill, load it back, verify:
     ///   - the anchor's formula text survives.
-    ///   - the anchor's computed value survives (lands in user lane —
-    ///     CellWireValue doesn't differentiate user vs computed; this
-    ///     is fine, the caller's `recompute_all` will write_spill →
-    ///     clear_user_at(anchor) → put_computed_at(anchor) to restore
-    ///     the correct lane).
+    ///   - the anchor's computed value survives in the COMPUTED lane
+    ///     (the loader at qbook_format.rs:1449-1453 routes formula
+    ///     cells' non-Blank saved values through `put_computed_at`,
+    ///     preserving the formula-owned-cell invariant "no user-overlay
+    ///     entry on a formula cell").
     ///   - the SpillAnchorTable + target cells (B1, C1) are EMPTY.
     ///     `recompute_all` re-derives them per design § 12.3.
     #[test]
