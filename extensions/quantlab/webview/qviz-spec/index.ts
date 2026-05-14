@@ -51,7 +51,21 @@ interface VSCodeApi {
 	setState(state: unknown): void;
 }
 declare function acquireVsCodeApi(): VSCodeApi;
-const vscode = acquireVsCodeApi();
+
+// Diagnostic bridge (2026-05-14, Codex-co-designed): when the
+// extension host enables `QUANTLAB_QVIZ_WEBVIEW_DEBUG`, the inline
+// pre-bundle bootstrap calls `acquireVsCodeApi()` first and exposes
+// the handle as `window.__qvizDebugAcquireVsCodeApi`. The bundle
+// reuses that handle so we don't violate the one-call-only rule.
+// In normal mode the helper is undefined and the bundle acquires
+// the API itself.
+interface QvizDebugWindow extends Window {
+	__qvizDebugAcquireVsCodeApi?: () => VSCodeApi;
+	__qvizDebugMark?: (stage: string, data?: unknown) => void;
+}
+const vscode = (window as QvizDebugWindow).__qvizDebugAcquireVsCodeApi?.()
+	?? acquireVsCodeApi();
+(window as QvizDebugWindow).__qvizDebugMark?.('bundle-acquired-vscode-api');
 
 let outboundRequestId = 0;
 function nextRequestId(): number { outboundRequestId += 1; return outboundRequestId; }

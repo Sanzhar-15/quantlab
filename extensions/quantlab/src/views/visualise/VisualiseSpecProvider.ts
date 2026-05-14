@@ -47,7 +47,27 @@
 
 import * as vscode from 'vscode';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
+
+// ---------------------------------------------------------------------------
+// Diagnostic bridge (2026-05-14, Codex-co-designed)
+// ---------------------------------------------------------------------------
+// When the env var `QUANTLAB_QVIZ_WEBVIEW_DEBUG=1` is set at extension-host
+// launch, the provider injects an inline `<script>` into the webview HTML
+// that captures uncaught errors, console output, and explicit pipeline
+// marks, then posts each event to the extension host. The host appends
+// each event as NDJSON to a log file an outside tool (Claude's Monitor,
+// `tail -f`, etc.) can stream live.
+//
+// Override the log path with `QUANTLAB_QVIZ_WEBVIEW_DEBUG_LOG=/abs/path`.
+// Default: `${os.tmpdir()}/qviz-webview-debug.log`.
+
+const QVIZ_WEBVIEW_DEBUG_ENABLED = process.env.QUANTLAB_QVIZ_WEBVIEW_DEBUG === '1';
+
+const QVIZ_WEBVIEW_DEBUG_LOG =
+	process.env.QUANTLAB_QVIZ_WEBVIEW_DEBUG_LOG
+	?? path.join(os.tmpdir(), 'qviz-webview-debug.log');
 
 import { getNonce, getWebviewUri } from '../../utils/webview';
 import { generatePromoteScaffold, readExistingScaffold } from '../../qviz/promoteToChart';
@@ -283,11 +303,19 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 			],
 		};
 
-		webviewPanel.webview.html = this.getHtmlForWebview(webviewPanel.webview);
-
+		// Megaudit follow-up (Codex, 2026-05-14): register the message
+		// receiver BEFORE assigning `webview.html`. When the diagnostic
+		// debug bridge (QUANTLAB_QVIZ_WEBVIEW_DEBUG) is on, the inline
+		// bootstrap posts a `qvizDebug` message immediately upon load;
+		// if the receiver isn't registered first, those events are
+		// dropped silently. In normal mode the order is functionally
+		// equivalent (the webview can't post until the html is set
+		// either way), but it makes the debug-mode contract explicit.
 		const messageDisposable = webviewPanel.webview.onDidReceiveMessage(
 			(rawMsg: unknown) => this.handleWebviewMessage(document, webviewPanel, rawMsg),
 		);
+
+		webviewPanel.webview.html = this.getHtmlForWebview(webviewPanel.webview);
 
 		webviewPanel.onDidDispose(() => {
 			messageDisposable.dispose();
@@ -990,6 +1018,20 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 		panel: vscode.WebviewPanel,
 		rawMsg: unknown,
 	): void {
+		// Diagnostic bridge (2026-05-14, Codex-co-designed): intercept
+		// `qvizDebug` BEFORE the protocol validator. The validator
+		// rejects unknown message types with a user-facing error popup;
+		// our debug events MUST bypass it. No-op when the bridge env
+		// var is off.
+		if (
+			QVIZ_WEBVIEW_DEBUG_ENABLED
+			&& rawMsg !== null
+			&& typeof rawMsg === 'object'
+			&& (rawMsg as { type?: unknown }).type === 'qvizDebug'
+		) {
+			this.appendQvizDebugLine(document, rawMsg);
+			return;
+		}
 		const result = validateWebviewMessage(rawMsg);
 		if (!result.ok) {
 			console.error(`VisualiseSpecProvider: invalid webview message: ${result.error}`);
@@ -1947,6 +1989,26 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 		return next;
 	}
 
+	/** Diagnostic bridge (2026-05-14): append one NDJSON line per
+	 *  webview debug event to `QVIZ_WEBVIEW_DEBUG_LOG`. Caller has
+	 *  already gated on the env var. Failures are non-fatal (logged
+	 *  to ext-host console). */
+	private appendQvizDebugLine(document: QvizSpecDocument, raw: unknown): void {
+		try {
+			const body = (raw && typeof raw === 'object') ? (raw as Record<string, unknown>) : { raw };
+			const line = JSON.stringify({
+				hostTs: new Date().toISOString(),
+				document: document.uri.toString(),
+				...body,
+			}) + '\n';
+			fs.promises.appendFile(QVIZ_WEBVIEW_DEBUG_LOG, line, 'utf8').catch(err => {
+				console.error('qviz debug bridge: appendFile failed:', err);
+			});
+		} catch (err) {
+			console.error('qviz debug bridge: serialize failed:', err);
+		}
+	}
+
 	private postOrLog(panel: vscode.WebviewPanel, msg: ExtensionMessage): void {
 		panel.webview.postMessage(msg).then(
 			delivered => {
@@ -1997,6 +2059,20 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 			'node_modules', '@vscode', 'codicons', 'dist', 'codicon.css',
 		]);
 		const nonce = getNonce();
+		// Diagnostic bridge (2026-05-14, Codex-co-designed): when env
+		// QUANTLAB_QVIZ_WEBVIEW_DEBUG is set, inject an inline pre-bundle
+		// script that acquires `vscode` first, captures window.onerror,
+		// unhandledrejection, console.{log,info,warn,error,debug}, and
+		// explicit pipeline marks. Posts each event via vscode.postMessage
+		// immediately so bundle-load failures still reach the host. The
+		// extension host receiver appends each entry to
+		// `process.env.QUANTLAB_QVIZ_WEBVIEW_DEBUG_LOG ??
+		//  $TMPDIR/qviz-webview-debug.log` as NDJSON so an outside tool
+		// (Claude's Monitor, `tail -f`, etc.) can stream diagnoses live.
+		// No-op when the env var is unset. CSP is nonce-based.
+		const debugBridgeScript = QVIZ_WEBVIEW_DEBUG_ENABLED
+			? buildDebugBridgeInlineScript(nonce)
+			: '';
 
 		return `<!DOCTYPE html>
 <html lang="en">
@@ -2009,11 +2085,129 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 	<title>Visualise Spec</title>
 </head>
 <body>
-	<div id="qviz-spec-root"></div>
+	<div id="qviz-spec-root"></div>${debugBridgeScript}
 	<script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
 	}
+}
+
+/** Diagnostic bridge (2026-05-14, Codex-co-designed): pre-bundle
+ *  inline script that captures uncaught errors, rejections, console
+ *  output, and explicit pipeline marks. Posts each event via
+ *  `vscode.postMessage` IMMEDIATELY so bundle-load failures still
+ *  reach the host. The bundle's `acquireVsCodeApi()` is overridden by
+ *  `window.__qvizDebugAcquireVsCodeApi` so the bootstrap's single-call
+ *  handle is reused (avoids the one-call-only rule).
+ *
+ *  Exposes:
+ *    - `window.__qvizDebugPost(entry)` — direct post for the bundle
+ *    - `window.__qvizDebugMark(stage, data?)` — sparse marks at
+ *      high-value pipeline points
+ *    - `window.__qvizDebugAcquireVsCodeApi()` — returns the bootstrap's
+ *      pre-acquired handle so the bundle reuses it
+ *
+ *  Output is appended NDJSON-style to
+ *  `process.env.QUANTLAB_QVIZ_WEBVIEW_DEBUG_LOG ??
+ *   path.join(os.tmpdir(), 'qviz-webview-debug.log')`.
+ *
+ *  CSP-safe: requires only the existing nonce. */
+function buildDebugBridgeInlineScript(nonce: string): string {
+	return `
+	<script nonce="${nonce}">
+		(function() {
+			var w = window;
+			var seq = 0;
+			var vscode = null;
+			var pending = [];
+			function safe(value, depth, seen) {
+				depth = depth || 0;
+				seen = seen || new WeakSet();
+				try {
+					if (value instanceof Error) {
+						return { name: value.name, message: value.message, stack: value.stack };
+					}
+					if (value === null || typeof value !== 'object') { return value; }
+					if (seen.has(value)) { return '[Circular]'; }
+					if (depth >= 4) { return '[MaxDepth]'; }
+					seen.add(value);
+					if (Array.isArray(value)) { return value.slice(0, 32).map(function(v) { return safe(v, depth + 1, seen); }); }
+					var out = {};
+					var keys = Object.keys(value).slice(0, 32);
+					for (var i = 0; i < keys.length; i++) { out[keys[i]] = safe(value[keys[i]], depth + 1, seen); }
+					return out;
+				} catch (_) { return '[Unserializable]'; }
+			}
+			function post(entry) {
+				try {
+					seq += 1;
+					var payload = {
+						type: 'qvizDebug',
+						debugVersion: 1,
+						seq: seq,
+						webviewTs: new Date().toISOString(),
+						href: location.href,
+						readyState: document.readyState,
+					};
+					for (var k in entry) { if (Object.prototype.hasOwnProperty.call(entry, k)) { payload[k] = entry[k]; } }
+					if (vscode !== null) {
+						vscode.postMessage(payload);
+					} else {
+						pending.push(payload);
+					}
+				} catch (_) {}
+			}
+			try {
+				vscode = acquireVsCodeApi();
+				w.__qvizDebugAcquireVsCodeApi = function() { return vscode; };
+			} catch (e) {
+				// acquireVsCodeApi only callable once — if it was already
+				// called somehow (shouldn't happen since we run first),
+				// fall back to buffering. The bundle's drain logic will
+				// pick up pending and emit via the bundle's handle.
+				post({ kind: 'bootstrap-acquire-failed', error: safe(e) });
+			}
+			// Drain anything that was buffered before vscode resolved.
+			if (vscode !== null && pending.length > 0) {
+				var drained = pending; pending = [];
+				for (var j = 0; j < drained.length; j++) { vscode.postMessage(drained[j]); }
+			}
+			w.__qvizDebugPost = post;
+			w.__qvizDebugMark = function(stage, data) {
+				post({ kind: 'mark', stage: String(stage), data: safe(data) });
+			};
+			['log', 'info', 'warn', 'error', 'debug'].forEach(function(level) {
+				var original = console[level];
+				console[level] = function() {
+					var args = [];
+					for (var i = 0; i < arguments.length; i++) { args.push(safe(arguments[i])); }
+					post({ kind: 'console', level: level, args: args });
+					return original.apply(console, arguments);
+				};
+			});
+			w.addEventListener('error', function(ev) {
+				var target = ev.target;
+				post({
+					kind: target && target !== w ? 'resource-error' : 'window-error',
+					message: ev.message,
+					filename: ev.filename,
+					lineno: ev.lineno,
+					colno: ev.colno,
+					error: safe(ev.error),
+					target: target && target !== w ? {
+						tagName: target.tagName,
+						id: target.id,
+						src: target.src || null,
+						href: target.href || null
+					} : undefined
+				});
+			}, true);
+			w.addEventListener('unhandledrejection', function(ev) {
+				post({ kind: 'unhandledrejection', reason: safe(ev.reason) });
+			});
+			post({ kind: 'bootstrap-installed', userAgent: navigator.userAgent });
+		})();
+	</script>`;
 }
 
 // ---------------------------------------------------------------------------
