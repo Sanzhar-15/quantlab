@@ -117,9 +117,7 @@ pub enum ParseError {
     /// structured-ref sub-grammar. `reason` describes what failed
     /// (e.g. "unclosed inner `[`", "unknown special item `#Foo`",
     /// "empty column name").
-    #[error(
-        "malformed structured reference {table_name}[{bracket_content}]: {reason}"
-    )]
+    #[error("malformed structured reference {table_name}[{bracket_content}]: {reason}")]
     StructuredRefMalformed {
         table_name: String,
         bracket_content: String,
@@ -995,7 +993,9 @@ fn parse_structured_ref_spec(
                 reason: "empty bare column name",
             });
         }
-        Ok(crate::ast::TableSpecSubtree::BareColumn(Arc::from(name.as_str())))
+        Ok(crate::ast::TableSpecSubtree::BareColumn(Arc::from(
+            name.as_str(),
+        )))
     }
 }
 
@@ -1197,10 +1197,7 @@ fn parse_sref_combination(
                 .map_err(|_| malformed("unclosed `[` in `[Col1]:[Col2]`"))?;
             let item2 = classify_sref_item(table_name, bracket_content, inner2)?;
             match (item, item2) {
-                (
-                    crate::ast::TableSpecItem::Column(c1),
-                    crate::ast::TableSpecItem::Column(c2),
-                ) => {
+                (crate::ast::TableSpecItem::Column(c1), crate::ast::TableSpecItem::Column(c2)) => {
                     items.push(crate::ast::TableSpecItem::ColumnRange(c1, c2));
                 }
                 _ => {
@@ -2592,7 +2589,11 @@ mod tests {
             match expr {
                 Expr::StructuredRef { spec, .. } => match spec {
                     TableSpecSubtree::Combination(items) => {
-                        assert_eq!(items, vec![TableSpecItem::Special(expected)], "case {src:?}");
+                        assert_eq!(
+                            items,
+                            vec![TableSpecItem::Special(expected)],
+                            "case {src:?}"
+                        );
                     }
                     other => panic!("case {src:?}: expected Combination, got {other:?}"),
                 },
@@ -2690,10 +2691,7 @@ mod tests {
             Expr::StructuredRef { spec, .. } => {
                 assert_eq!(
                     spec,
-                    TableSpecSubtree::ThisRowColumnRange(
-                        Arc::from("Col1"),
-                        Arc::from("Col2")
-                    )
+                    TableSpecSubtree::ThisRowColumnRange(Arc::from("Col1"), Arc::from("Col2"))
                 );
             }
             other => panic!("expected StructuredRef, got {other:?}"),
