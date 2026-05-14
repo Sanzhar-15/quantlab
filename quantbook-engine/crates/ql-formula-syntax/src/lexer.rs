@@ -1948,8 +1948,8 @@ mod tests {
     fn structured_ref_escape_pairs() {
         // `'[`, `']`, `'#`, `'@`, `''` escapes.
         let cases = [
-            ("Tbl['[a]", "'[a"),     // escaped opening bracket inside content
-            ("Tbl[a']]", "a']"),     // escaped closing bracket
+            ("Tbl['[a]", "'[a"), // escaped opening bracket inside content
+            ("Tbl[a']]", "a']"), // escaped closing bracket
             ("Tbl['#Hash]", "'#Hash"),
             ("Tbl['@AtSign]", "'@AtSign"),
             ("Tbl[Bob''s]", "Bob''s"),
@@ -1961,11 +1961,7 @@ mod tests {
                 Token::StructuredRef {
                     bracket_content, ..
                 } => {
-                    assert_eq!(
-                        bracket_content.as_ref(),
-                        expected_content,
-                        "case {src:?}"
-                    );
+                    assert_eq!(bracket_content.as_ref(), expected_content, "case {src:?}");
                 }
                 other => panic!("case {src:?} → expected StructuredRef, got {other:?}"),
             }
