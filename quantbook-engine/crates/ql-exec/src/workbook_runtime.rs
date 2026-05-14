@@ -547,25 +547,52 @@ impl<'a> WorkbookRuntime<'a> {
         // re-eval at the host (next recompute) will see this cell as
         // a blocker and emit #SPILL!.
         //
-        // We perform this dissolution UP FRONT (before the old-shape
-        // capture below) because:
+        // **W5-103 megaudit HIGH-1 closure (#127, all 3 reviewers
+        // cross-confirmed):** capture the host's footprint BEFORE
+        // clearing it so the on_set_value + re-extract passes below
+        // can also walk the host's old footprint. Without this:
+        //   - Readers of OTHER host-target cells (siblings of the
+        //     edited cell) don't dirty.
+        //   - Readers producer-aliased to the host anchor stay
+        //     stale (their alias dep should re-route post-dissolution).
+        //   - The host anchor's formula node is NEVER marked dirty,
+        //     so recompute_dirty leaves it indefinitely stale. The
+        //     storage layer (no spill) and dirty set (anchor not
+        //     dirty) diverge until an unrelated edit touches the
+        //     anchor cell. Sonnet's sharp framing in the megaudit.
+        //
+        // We perform this dissolution UP FRONT (before the
+        // self-spill clear below) because:
         //   - The host spill's anchor is at a DIFFERENT cell, so its
         //     footprint isn't covered by `clear_spill_if_present` below.
         //   - The new formula at (sheet, row, col) needs the host's
         //     prior computed-overlay value cleared from this cell so
         //     `write_spill`'s blocking check doesn't see it as occupied.
         //
-        // No-op when (sheet, row, col) is itself an anchor (the next
-        // `clear_spill_if_present` handles that path) OR is not part
-        // of any spill.
-        if let Some(host_anchor) = self.workbook.spill_target_anchor(sheet, row, col) {
-            if host_anchor != (sheet, row, col) {
-                // Idempotent — `clear_spill_at` errors with
-                // SpillNotFoundError if the anchor isn't registered,
-                // which can't happen here (target_anchor returned Some).
-                let _ = self.workbook.clear_spill_at(host_anchor);
+        // Records (host_anchor, host_shape) when dissolution happens;
+        // the on_set_value + re-extract passes consume this below.
+        let dissolved_host: Option<((SheetId, RowId, ColId), SpillShape)> = {
+            if let Some(host_anchor) = self.workbook.spill_target_anchor(sheet, row, col) {
+                if host_anchor != (sheet, row, col) {
+                    let host_shape = self
+                        .workbook
+                        .spill_anchor_at(host_anchor.0, host_anchor.1, host_anchor.2)
+                        .copied()
+                        .expect(
+                            "spill_target_anchor returned Some — anchor MUST be in anchors table",
+                        );
+                    // Idempotent — `clear_spill_at` errors with
+                    // SpillNotFoundError if the anchor isn't registered,
+                    // which can't happen here (target_anchor returned Some).
+                    let _ = self.workbook.clear_spill_at(host_anchor);
+                    Some((host_anchor, host_shape))
+                } else {
+                    None
+                }
+            } else {
+                None
             }
-        }
+        };
 
         // **W5-103 (Phase 4.7.J.2 / Codex W5-102 MEDIUM-4):** clear any
         // PRIOR spill anchored at this cell BEFORE eval. Per design § 8.3:
@@ -648,30 +675,40 @@ impl<'a> WorkbookRuntime<'a> {
         }
 
         // **W5-103 (Phase 4.7.J.3 / Codex W5-102 MEDIUM-1):** fire
-        // `on_set_value` at every NON-ANCHOR cell in BOTH the OLD and
-        // NEW spill footprints. Anchor cell is covered by
-        // `on_set_formula` above (it calls `mark_dirty_from_cell_write`
-        // internally).
+        // `on_set_value` at every NON-ANCHOR cell in:
+        //   - OLD self-spill footprint (anchored at this cell)
+        //   - NEW spill footprint (anchored at this cell)
+        //   - DISSOLVED HOST footprint (anchored elsewhere — only
+        //     present when J.5 dissolution fired). megaudit HIGH-1.
         //
-        // Why both footprints?
+        // Anchor cells are NOT in `affected` for the self-anchored
+        // shapes — `on_set_formula(sheet, row, col)` above already
+        // dirtied this cell. For the host spill, we DO include the
+        // host anchor (its formula node needs to dirty so the next
+        // recompute re-evaluates the host and emits #SPILL!).
         //
-        // - NEW footprint: range-stripe deps over a target need to
-        //   dirty when the anchor recomputes. Producer-alias rewrite
-        //   (4.7.I) only handles `deps.cells`; range deps go through
-        //   the stripe index keyed at the target address. Firing
-        //   `on_set_value(target)` dirties stripe dependents.
+        // Why each footprint?
         //
-        // - OLD footprint: pre-existing readers indexed under the old
-        //   target cells (4.7.I HIGH-1: bound before the spill
-        //   registered) won't see their dep cell go Blank otherwise.
-        //   Combined with the 4.7.J.4 re-extraction pass below, this
-        //   ensures both dirty-propagation AND graph-edge correctness.
+        // - NEW (self): range-stripe deps over a target need to dirty
+        //   when the anchor recomputes. Producer-alias rewrite (4.7.I)
+        //   only handles `deps.cells`; range deps go through the
+        //   stripe index keyed at target address. Firing on_set_value
+        //   at each target dirties stripe dependents.
         //
-        // Dedupe via HashSet — cells in BOTH old and new shapes only
-        // fire once.
+        // - OLD (self): readers indexed under old target cells (4.7.I
+        //   HIGH-1) wouldn't see their dep cell go Blank otherwise.
+        //
+        // - HOST (dissolved by J.5): readers of OTHER host-target
+        //   cells need to dirty (their dep cell lost the spilled
+        //   value). The host anchor cell ITSELF needs to dirty so
+        //   the next recompute_dirty re-evaluates the host formula
+        //   and produces #SPILL! per design § 9.2.
+        //
+        // Dedupe via HashSet.
         if let Some(g) = self.graph.as_deref_mut() {
             use std::collections::HashSet;
             let mut affected: HashSet<(SheetId, RowId, ColId)> = HashSet::new();
+            // Self-anchored shapes (old + new), excluding self-anchor.
             for shape in [old_spill_shape, new_spill_shape].into_iter().flatten() {
                 for dr in 0..shape.rows {
                     for dc in 0..shape.cols {
@@ -682,8 +719,32 @@ impl<'a> WorkbookRuntime<'a> {
                     }
                 }
             }
+            // Host footprint (if dissolved by J.5). Non-anchor targets
+            // get on_set_value; the host anchor gets mark_dirty directly
+            // (it's a formula node, not in cell_to_formulas[anchor]
+            // for itself).
+            if let Some((host_anchor, host_shape)) = dissolved_host {
+                for dr in 0..host_shape.rows {
+                    for dc in 0..host_shape.cols {
+                        // Skip the host anchor — mark_dirty below.
+                        if dr == 0 && dc == 0 {
+                            continue;
+                        }
+                        affected.insert((host_anchor.0, host_anchor.1 + dr, host_anchor.2 + dc));
+                    }
+                }
+            }
             for (s, r, c) in affected {
                 g.on_set_value(s, r, c);
+            }
+            // **megaudit HIGH-1 closure**: dirty the host anchor's
+            // formula NodeId directly. on_set_value at the anchor cell
+            // wouldn't find it (formulas don't reference themselves),
+            // so use the public(crate) `mark_dirty` API.
+            if let Some((host_anchor, _)) = dissolved_host {
+                if let Some(node) = g.cell_node_for(host_anchor.0, host_anchor.1, host_anchor.2) {
+                    g.mark_dirty(node);
+                }
             }
         }
 
@@ -716,10 +777,19 @@ impl<'a> WorkbookRuntime<'a> {
         // trigger (a refinement of Option a's "invalidate all readers
         // transitively" — we touch only readers in the footprint).
         //
-        // Skip entirely if no spill state changed (neither old nor new
-        // shape exists). Saves a HashSet allocation + lookup for the
-        // overwhelming majority of `set_formula` calls.
-        if old_spill_shape.is_some() || new_spill_shape.is_some() {
+        // **W5-103 megaudit HIGH-1 closure (#127):** the host footprint
+        // (dissolved by J.5 at the top of this function) also needs
+        // re-extraction. A reader producer-aliased to the HOST anchor
+        // (because it referenced any cell in the host's spill) must
+        // be re-routed back to a literal CellRef now that the host
+        // spill is gone. Without this, the reader's alias dep at the
+        // host anchor would over-dirty on unrelated host changes and
+        // miss future writes to the cell it actually references.
+        //
+        // Skip the entire pass if no spill state changed anywhere.
+        let any_self_change = old_spill_shape.is_some() || new_spill_shape.is_some();
+        let any_host_change = dissolved_host.is_some();
+        if any_self_change {
             self.reextract_spill_footprint_readers(
                 sheet,
                 row,
@@ -728,6 +798,20 @@ impl<'a> WorkbookRuntime<'a> {
                 new_spill_shape,
             );
         }
+        if let Some((host_anchor, host_shape)) = dissolved_host {
+            // Re-extract readers in the dissolved host footprint. The
+            // host anchor itself is excluded inside
+            // `reextract_spill_footprint_readers` (it's the function's
+            // anchor parameter — its own deps aren't touched).
+            self.reextract_spill_footprint_readers(
+                host_anchor.0,
+                host_anchor.1,
+                host_anchor.2,
+                Some(host_shape),
+                None,
+            );
+        }
+        let _ = any_host_change; // already consumed via dissolved_host above
 
         Ok(anchor_value)
     }
@@ -853,6 +937,19 @@ impl<'a> WorkbookRuntime<'a> {
             };
             if let Some(g) = self.graph.as_deref_mut() {
                 g.reextract_deps(node, plan.as_ref(), self.workbook);
+                // **megaudit HIGH-1 closure (#127)**: dirty the
+                // re-extracted reader. on_set_value at the OLD/NEW
+                // footprint addresses (fired before this loop) used
+                // the PRE-rewrite cell_to_formulas index. After
+                // reextract_deps moves the reader's index entry, a
+                // reader that USED to be at an old address but NOW
+                // points to a different address would not have been
+                // dirtied by the earlier on_set_value pass (its old
+                // index entry was empty by the time the new index
+                // landed). Marking the reader dirty here ensures the
+                // next recompute_dirty re-evaluates it against the
+                // post-dissolution / post-reshape workbook state.
+                g.mark_dirty(node);
             }
         }
     }
@@ -6805,6 +6902,128 @@ mod tests {
         assert_eq!(
             wb.read(ql_types::Address::new(0, 0, 3)),
             Value::Number(20.0)
+        );
+    }
+
+    // ===== W5-103 megaudit HIGH-1 — host-spill dissolution side-effects =====
+    //
+    // When set_formula writes into a non-anchor target of someone
+    // else's spill (J.5 path), the host's footprint must feed into
+    // the on_set_value + re-extract passes too. Otherwise readers of
+    // OTHER host targets don't dirty, host-aliased readers stay
+    // routed to the dissolved anchor, and the host anchor's own
+    // NodeId is never marked dirty (so recompute_dirty leaves it
+    // indefinitely stale).
+
+    /// Host A1 spills A1..C1. Reader D1 = C1 (aliased to A1 by 4.7.I).
+    /// User sets B1 = 99 (scalar formula) → J.5 dissolves A1's spill.
+    /// After dissolution, D1's dep must be RE-EXTRACTED (no longer
+    /// aliased — A1 isn't a spill anchor anymore; D1 should reference
+    /// C1 literally).
+    #[test]
+    fn set_formula_into_host_target_reextracts_aliased_readers() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            // A1 spills A1..C1.
+            rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+            // D1 = C1. Aliased to A1 via 4.7.I producer-alias.
+            rt.set_formula(0, 0, 3, "C1").unwrap();
+        }
+        let d1 = graph.cell_node_for(0, 0, 3).unwrap();
+        assert_eq!(
+            graph.formula_deps(d1).unwrap().cells,
+            vec![(0, 0, 0)],
+            "D1 starts aliased to host anchor A1"
+        );
+
+        // User sets B1 = 99 (formula) — J.5 dissolves A1's spill.
+        // D1's alias dep must be re-extracted to point at C1 literally.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 1, "99").unwrap();
+        }
+        assert_eq!(
+            graph.formula_deps(d1).unwrap().cells,
+            vec![(0, 0, 2)],
+            "D1's dep must be re-extracted to literal C1 after host dissolution"
+        );
+    }
+
+    /// Host A1 spills A1..C1. User sets B1 = 5 — J.5 dissolves A1.
+    /// The host anchor A1's NodeId must be in the dirty set so the
+    /// next recompute_dirty re-evaluates A1's formula and produces
+    /// #SPILL!. Without this, A1 stays stale indefinitely in
+    /// incremental mode.
+    #[test]
+    fn set_formula_into_host_target_marks_host_anchor_dirty() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+        }
+        let a1 = graph.cell_node_for(0, 0, 0).unwrap();
+        // Clear residue dirty from the first set_formula.
+        let _ = graph.take_dirty();
+        // Now set B1 = 5 — dissolves host A1.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 1, "5").unwrap();
+        }
+        assert!(
+            graph.is_dirty(a1),
+            "host anchor A1's NodeId must be dirty after J.5 dissolution \
+             so recompute_dirty re-evaluates and emits #SPILL!"
+        );
+    }
+
+    /// Host A1 spills A1..C1. Reader X1 = B1 (also aliased to A1).
+    /// User sets C1 = 5 — J.5 dissolves A1. X1 (a reader of a
+    /// DIFFERENT host-target cell) must dirty too, because B1's
+    /// spilled value is gone.
+    #[test]
+    fn set_formula_into_host_target_dirties_readers_of_other_host_targets() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+            // X1 (row 0, col 23) = B1. Aliased to A1.
+            rt.set_formula(0, 0, 23, "B1").unwrap();
+        }
+        let x1 = graph.cell_node_for(0, 0, 23).unwrap();
+        // Clear residue dirty.
+        let _ = graph.take_dirty();
+        // Set C1 = 5 — dissolves host A1.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 2, "5").unwrap();
+        }
+        // X1 references B1 which lost its spilled value. Must dirty.
+        // The on_set_value pass at host footprint addresses (A1, B1)
+        // fires for B1 → cell_to_formulas[(0,0,1)] should contain X1
+        // (post re-extract X1's dep was at (0,0,0) the anchor; pre
+        // re-extract, the on_set_value at B1 dirties via the stale
+        // pre-alias index if it existed).
+        //
+        // More robust check: after re-extraction, X1's dep should be
+        // (0,0,1) literally. AND X1 should be dirty.
+        assert_eq!(
+            graph.formula_deps(x1).unwrap().cells,
+            vec![(0, 0, 1)],
+            "X1's dep re-extracted to literal B1 (no longer aliased)"
+        );
+        assert!(
+            graph.is_dirty(x1),
+            "X1 must dirty: its dep target B1 lost its spilled value"
         );
     }
 
