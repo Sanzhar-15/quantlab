@@ -2518,6 +2518,25 @@ impl<'a> WorkbookRuntime<'a> {
         // doesn't change a formula's identity, only its computed
         // value. Downstream readers were already dirtied by whatever
         // made THIS formula dirty in the first place.
+        //
+        // **W5-108 (Phase 4.7.O) — Codex MEDIUM-5 closure**: clear
+        // the OLD spill footprint BEFORE eval, matching design § 10.3
+        // step 4 ("clear-old-before-eval") and `set_formula`'s
+        // identical ordering at line 621. Pre-fix ordering was
+        // eval → clear → write, which let a formula's eval observe
+        // its own OLD spill-target computed overlays through indirect
+        // reads (named ranges, aggregates). Direct self-reads create
+        // a producer-alias self-loop (Tarjan → #CIRC!) so the gap was
+        // narrow, but the design contract is "clear-before-eval" and
+        // bringing the code into alignment removes a latent
+        // composition footgun.
+        //
+        // We capture old_spill_shape BEFORE clear so the caller
+        // (recompute_dirty's fixed-point loop) can fire hooks for the
+        // dissolved footprint after eval+write_spill complete.
+        let old_spill_shape = self.workbook.spill_anchor_at(sheet, row, col).copied();
+        self.workbook.clear_spill_if_present((sheet, row, col));
+
         let result: crate::eval_result::EvalResult = {
             let env = WorkbookEnv::new(self.workbook);
             crate::scalar::eval_at_cell_boundary(plan.as_ref(), &env, self.registry, agg_cache)
@@ -2529,22 +2548,16 @@ impl<'a> WorkbookRuntime<'a> {
         // write. Deferred; harmless.
         //
         // **W5-106 (Phase 4.7.M / task #136 closure)**: capture the
-        // OLD spill shape BEFORE clear_spill_if_present, and the NEW
-        // shape via write_spill's return. We DON'T fire on_set_value
-        // hooks here — the caller (recompute_dirty in particular)
-        // owns the session reference at this scope (recompute_dirty
-        // `take()`s `self.graph` into a local, so `self.graph` is
-        // `None` during the sorted loop). Bubble the shape info up
-        // via the return; the caller fires hooks against its session.
-        let old_spill_shape = self.workbook.spill_anchor_at(sheet, row, col).copied();
-
+        // NEW shape via write_spill's return. We DON'T fire
+        // on_set_value hooks here — the caller (recompute_dirty in
+        // particular) owns the session reference at this scope
+        // (recompute_dirty `take()`s `self.graph` into a local, so
+        // `self.graph` is `None` during the sorted loop). Bubble the
+        // shape info up via the return; the caller fires hooks
+        // against its session.
         let (anchor_value, new_spill_shape) = match result {
-            crate::eval_result::EvalResult::Scalar(v) => {
-                self.workbook.clear_spill_if_present((sheet, row, col));
-                (v, None)
-            }
+            crate::eval_result::EvalResult::Scalar(v) => (v, None),
             crate::eval_result::EvalResult::Array(array) => {
-                self.workbook.clear_spill_if_present((sheet, row, col));
                 let formula_text_arc = self
                     .workbook
                     .formula_at(sheet, row, col)
