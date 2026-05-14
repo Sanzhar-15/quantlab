@@ -169,18 +169,24 @@ Mirrors `name_to_formulas` (existing in `CalcgraphSession`). Every formula's `ex
 
 ## 5. Lexer changes
 
-### 5.1 New token — REVISED post-Codex (HIGH-5)
+### 5.1 New token — REVISED post-Codex (HIGH-5) + post-4.8.D-impl
 
 ```rust
 Token::StructuredRef {
     table_name: Arc<str>,         // case-preserving
-    /// Unescaped bracket content. Lexer applies OOXML structured-
-    /// reference escape rules (see § 5.4) before emitting.
+    /// Bracket content preserving OOXML `'`-prefix escapes. The lexer
+    /// uses escape-aware bracket balancing (an escaped `]` doesn't
+    /// close the bracket), but it preserves the `'` markers in the
+    /// output so the parser can distinguish syntactic from literal
+    /// occurrences of `[`, `]`, `#`, `@`, `'`. Without this, the parser
+    /// cannot tell `Tbl['[a]` (BareColumn named `[a`) from `Tbl[[a]]`
+    /// (Combination of Column `a`) — both would yield the same
+    /// unescaped string `[a]`.
     bracket_content: Arc<str>,
 }
 ```
 
-`bracket_content` is the bracket text with all escapes resolved; the parser runs the spec sub-grammar on the unescaped string.
+`bracket_content` retains the `'` escape markers; the parser's structured-ref sub-grammar (§ 6.3) resolves them as it walks. The original design draft proposed full unescape at lex time — 4.8.D implementation surfaced the ambiguity; design pivoted to preserve-escapes.
 
 ### 5.4 Bracket escape rules — NEW post-Codex (HIGH-5)
 

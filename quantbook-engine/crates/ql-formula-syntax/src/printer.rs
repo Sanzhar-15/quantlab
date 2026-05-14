@@ -355,12 +355,13 @@ fn print_expr(expr: &Expr, out: &mut String, parent_min_bp: u8) {
             );
         }
         Expr::StructuredRef { table_name, spec } => {
-            // **W5-112 (Phase 4.8.C):** structured-ref round-trip.
-            // Phase 4.8.D will add OOXML-escape-aware emission for
-            // column names containing `[`, `]`, `#`, `@`, `'`. v0 of
-            // the printer in 4.8.C just emits the canonical bracket
-            // form — sufficient for the round-trip tests in this
-            // sub-phase since none use escape-requiring names.
+            // **W5-113 (Phase 4.8.D):** structured-ref round-trip with
+            // OOXML-escape-aware emission. Column names containing `[`,
+            // `]`, `#`, `@`, `'` are escaped with `'` prefix per design
+            // § 5.4 so the lexer's unescape pass recovers the original
+            // name on re-lex. Table names cannot contain any of these
+            // characters (Excel canon: table names are restricted to
+            // alphanumeric + `_` + `.`), so they're emitted verbatim.
             out.push_str(table_name);
             out.push('[');
             print_sref_spec(spec, out);
@@ -369,27 +370,51 @@ fn print_expr(expr: &Expr, out: &mut String, parent_min_bp: u8) {
     }
 }
 
-/// **W5-112 (Phase 4.8.C):** print the bracket content of a structured
-/// reference. v0 — no escape handling (4.8.D adds it). The caller
-/// emits the wrapping `[` and `]`.
+/// **W5-113 (Phase 4.8.D):** apply OOXML structured-reference escapes
+/// to a column-name string when emitting it inside `[...]` bracket
+/// content. Each of `[`, `]`, `#`, `@`, `'` is preceded by `'`. The
+/// lexer's `consume_structured_ref_bracket` reverses this on re-lex.
+fn escape_for_sref(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if matches!(c, '[' | ']' | '#' | '@' | '\'') {
+            out.push('\'');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// **W5-112 (Phase 4.8.C / 4.8.D):** print the bracket content of a
+/// structured reference. Column names are emitted via
+/// [`escape_for_sref`] so the round-trip lex(print(parse(x))) = x for
+/// any well-formed column name.
 fn print_sref_spec(spec: &crate::ast::TableSpecSubtree, out: &mut String) {
     use crate::ast::{SpecialItem, TableSpecItem, TableSpecSubtree};
     match spec {
         TableSpecSubtree::BareColumn(name) => {
-            out.push_str(name);
+            // BareColumn: name is the entire bracket content. Escape
+            // any special chars (lexer unescapes).
+            out.push_str(&escape_for_sref(name));
         }
         TableSpecSubtree::ThisRowColumn(name) => {
+            // Canonical printed form: `@[Col]` (bracketed) so a name
+            // starting with `[` or `#` doesn't collide with the
+            // unbracketed `@Col` shorthand. Always emit brackets for
+            // round-trip stability.
             out.push('@');
-            out.push_str(name);
+            out.push('[');
+            out.push_str(&escape_for_sref(name));
+            out.push(']');
         }
         TableSpecSubtree::ThisRowColumnRange(c1, c2) => {
             out.push('@');
             out.push('[');
-            out.push_str(c1);
+            out.push_str(&escape_for_sref(c1));
             out.push(']');
             out.push(':');
             out.push('[');
-            out.push_str(c2);
+            out.push_str(&escape_for_sref(c2));
             out.push(']');
         }
         TableSpecSubtree::Combination(items) => {
@@ -411,16 +436,16 @@ fn print_sref_spec(spec: &crate::ast::TableSpecSubtree, out: &mut String) {
                     }
                     TableSpecItem::Column(c) => {
                         out.push('[');
-                        out.push_str(c);
+                        out.push_str(&escape_for_sref(c));
                         out.push(']');
                     }
                     TableSpecItem::ColumnRange(c1, c2) => {
                         out.push('[');
-                        out.push_str(c1);
+                        out.push_str(&escape_for_sref(c1));
                         out.push(']');
                         out.push(':');
                         out.push('[');
-                        out.push_str(c2);
+                        out.push_str(&escape_for_sref(c2));
                         out.push(']');
                     }
                 }
@@ -999,5 +1024,141 @@ mod tests {
         let printed = print(&parsed_once);
         let parsed_twice = parse(lex(&printed).expect("lex")).expect("parse");
         assert_eq!(parsed_once, parsed_twice);
+    }
+
+    // ===== W5-113 (Phase 4.8.D) — structured-reference round-trip =====
+
+    #[test]
+    fn print_sref_bare_column() {
+        round_trip("Sales[Qty]", "Sales[Qty]");
+    }
+
+    #[test]
+    fn print_sref_bracketed_column_canonicalizes_to_bare() {
+        // Parser distinguishes BareColumn (`Sales[Qty]`) from
+        // Combination(vec![Column]) (`Sales[[Qty]]`). Printer renders
+        // each in its canonical form. NOT semantically normalized at
+        // parse time per design § 6.2.
+        let e_bare = parse(lex("Sales[Qty]").expect("lex")).expect("parse");
+        assert_eq!(print(&e_bare), "Sales[Qty]");
+        let e_bracketed = parse(lex("Sales[[Qty]]").expect("lex")).expect("parse");
+        assert_eq!(print(&e_bracketed), "Sales[[Qty]]");
+    }
+
+    #[test]
+    fn print_sref_all_5_specifiers() {
+        round_trip("Sales[[#Headers]]", "Sales[[#Headers]]");
+        round_trip("Sales[[#Totals]]", "Sales[[#Totals]]");
+        round_trip("Sales[[#Data]]", "Sales[[#Data]]");
+        round_trip("Sales[[#All]]", "Sales[[#All]]");
+        round_trip("Sales[[#This Row]]", "Sales[[#This Row]]");
+    }
+
+    #[test]
+    fn print_sref_special_column_combination() {
+        round_trip("Sales[[#Headers], [Qty]]", "Sales[[#Headers], [Qty]]");
+    }
+
+    #[test]
+    fn print_sref_column_range() {
+        round_trip("Sales[[Col1]:[Col2]]", "Sales[[Col1]:[Col2]]");
+    }
+
+    #[test]
+    fn print_sref_three_item_combination() {
+        round_trip(
+            "Sales[[#Data], [#Totals], [Col]]",
+            "Sales[[#Data], [#Totals], [Col]]",
+        );
+    }
+
+    #[test]
+    fn print_sref_at_column_shorthand_canonicalizes_to_bracketed() {
+        // `[@Col]` lexes / parses as ThisRowColumn; printer emits the
+        // bracketed form `[@[Col]]` for round-trip stability (a column
+        // starting with `[` or `#` would otherwise collide with the
+        // bare-`@Col` shorthand).
+        let e = parse(lex("Sales[@Qty]").expect("lex")).expect("parse");
+        assert_eq!(print(&e), "Sales[@[Qty]]");
+        // The bracketed form round-trips unchanged.
+        round_trip("Sales[@[Qty]]", "Sales[@[Qty]]");
+    }
+
+    #[test]
+    fn print_sref_at_column_range_round_trips() {
+        round_trip("Sales[@[Col1]:[Col2]]", "Sales[@[Col1]:[Col2]]");
+    }
+
+    // ===== Escape round-trip tests (the heart of 4.8.D) =====
+
+    /// Column name containing `[` is escaped as `'[`. Pin: lex →
+    /// parse extracts unescaped `[`; print → emits with `'[` escape;
+    /// re-lex → unescape back to `[`.
+    #[test]
+    fn print_sref_column_name_with_bracket_round_trips() {
+        // Source: `Tbl['[a]` — column name is `[a`. Print emits
+        // `Tbl['[a]` again (unchanged source canon).
+        round_trip("Tbl['[a]", "Tbl['[a]");
+    }
+
+    #[test]
+    fn print_sref_column_name_with_close_bracket_round_trips() {
+        round_trip("Tbl[a']]", "Tbl[a']]");
+    }
+
+    #[test]
+    fn print_sref_column_name_with_hash_round_trips() {
+        // Column literally named `#Foo` (NOT the #Headers specifier).
+        // Stored as Column("#Foo"); printer escapes as `'#Foo`.
+        let e = parse(lex("Tbl['#Foo]").expect("lex")).expect("parse");
+        match &e {
+            Expr::StructuredRef { spec, .. } => match spec {
+                crate::ast::TableSpecSubtree::BareColumn(name) => {
+                    assert_eq!(name.as_ref(), "#Foo");
+                }
+                other => panic!("expected BareColumn, got {other:?}"),
+            },
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+        let printed = print(&e);
+        assert_eq!(printed, "Tbl['#Foo]");
+    }
+
+    #[test]
+    fn print_sref_column_name_with_at_sign_round_trips() {
+        // Column literally named `@Foo` (NOT the @Col shorthand because
+        // it's in bare-column position, not after `[@`).
+        round_trip("Tbl['@Foo]", "Tbl['@Foo]");
+    }
+
+    #[test]
+    fn print_sref_column_name_with_apostrophe_round_trips() {
+        // `Bob''s` → column name `Bob's`. Apostrophe escapes itself.
+        round_trip("Tbl[Bob''s]", "Tbl[Bob''s]");
+    }
+
+    /// The fundamental property: lex → parse → print → re-lex → re-parse
+    /// produces an identical AST. Pins that escape emission is lossless.
+    #[test]
+    fn print_sref_round_trip_through_parse_print_parse() {
+        let cases = [
+            "Sales[Qty]",
+            "Sales[[#Headers], [Qty]]",
+            "Sales[[Col1]:[Col2]]",
+            "Sales[@[Qty]]",
+            "Sales[@[Col1]:[Col2]]",
+            "Tbl['[a]",
+            "Tbl[a']]",
+            "Tbl['#Foo]",
+            "Tbl['@Foo]",
+            "Tbl[Bob''s]",
+            "SUM(Sales[Qty])",
+        ];
+        for src in cases {
+            let once = parse(lex(src).expect("lex")).expect("parse");
+            let printed = print(&once);
+            let twice = parse(lex(&printed).expect("lex")).expect("parse");
+            assert_eq!(once, twice, "round-trip diverged for {src:?}: printed as {printed:?}");
+        }
     }
 }

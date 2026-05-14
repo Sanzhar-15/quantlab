@@ -943,17 +943,20 @@ fn canonicalize_function_name(name: &Arc<str>) -> Arc<str> {
     Arc::from(upper.as_str())
 }
 
-// ===== W5-112 (Phase 4.8.C): structured-reference sub-grammar =====
+// ===== W5-112 (Phase 4.8.C / 4.8.D): structured-reference sub-grammar =====
 
 /// Parse the bracket content of a structured reference (e.g. `Sales[...]`)
-/// against the spec sub-grammar (design § 6.3). The content has already
-/// been OOXML-unescaped by the lexer.
+/// against the spec sub-grammar (design § 6.3). `bracket_content`
+/// PRESERVES OOXML `'`-prefix escapes per design § 5.1 (post-4.8.D
+/// refactor); this function resolves escapes structurally.
 ///
 /// Top-level shape decision (in order):
-/// 1. Content starts with `@` → `ThisRowColumn` or `ThisRowColumnRange`.
-/// 2. Content starts with `[` → `Combination` (one or more items separated
-///    by `,`, possibly with whitespace).
-/// 3. Otherwise (bare identifier, no leading `[` or `@`) → `BareColumn`.
+/// 1. Content starts with `@` (UNESCAPED) → `ThisRowColumn` or
+///    `ThisRowColumnRange`.
+/// 2. Content starts with `[` (UNESCAPED) → `Combination` (one or more
+///    items separated by `,`, possibly with whitespace).
+/// 3. Otherwise (escape-prefixed first char, or bare identifier) →
+///    `BareColumn` (with escape resolution applied to the name).
 fn parse_structured_ref_spec(
     table_name: &str,
     bracket_content: &str,
@@ -967,16 +970,24 @@ fn parse_structured_ref_spec(
         });
     }
 
+    // Peek at the FIRST syntactic char (skipping over a leading `'X`
+    // escape pair, since the escaped char is literal). We don't ACTUALLY
+    // advance; we just discriminate the parse path.
+    let first_syntactic_byte = trimmed.as_bytes().first().copied();
+    let starts_with_unescaped_at = first_syntactic_byte == Some(b'@');
+    let starts_with_unescaped_open_bracket = first_syntactic_byte == Some(b'[');
+
     let mut cursor = SrefCursor::new(trimmed);
 
-    if cursor.peek() == Some('@') {
+    if starts_with_unescaped_at {
         cursor.advance();
         parse_sref_thisrow(table_name, bracket_content, &mut cursor)
-    } else if cursor.peek() == Some('[') {
+    } else if starts_with_unescaped_open_bracket {
         parse_sref_combination(table_name, bracket_content, &mut cursor)
     } else {
-        // Bare column shorthand. Whole remaining content is the column name.
-        let name = cursor.remaining_trimmed();
+        // Bare column shorthand. Whole remaining content is the column
+        // name; resolve OOXML escapes.
+        let name = unescape_sref_str(trimmed);
         if name.is_empty() {
             return Err(ParseError::StructuredRefMalformed {
                 table_name: table_name.to_owned(),
@@ -984,8 +995,31 @@ fn parse_structured_ref_spec(
                 reason: "empty bare column name",
             });
         }
-        Ok(crate::ast::TableSpecSubtree::BareColumn(Arc::from(name)))
+        Ok(crate::ast::TableSpecSubtree::BareColumn(Arc::from(name.as_str())))
     }
+}
+
+/// **W5-113 (Phase 4.8.D):** resolve OOXML `'X` escape pairs to literal
+/// `X` in a structured-ref content fragment. Per design § 5.4 the 5
+/// recognized escapes are `'[`, `']`, `'#`, `'@`, `''`; we apply the
+/// rule generically (any `'X` resolves to `X`), matching the lexer's
+/// balancer semantic.
+fn unescape_sref_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            // The lexer already guaranteed an escape pair always has
+            // a following char (`DanglingStructuredRefEscape` otherwise).
+            // Defensive: if absent here, drop the `'`.
+            if let Some(escaped) = chars.next() {
+                out.push(escaped);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Lightweight char cursor over a structured-ref bracket content string.
@@ -1016,18 +1050,26 @@ impl<'a> SrefCursor<'a> {
     }
 
     /// Consume a `[...]` group (without leading `[`-consumption — caller
-    /// already consumed the `[`). Returns the inner string with leading/
-    /// trailing whitespace trimmed. The inner `]` is consumed.
+    /// already consumed the `[`). Returns the inner string PRESERVING
+    /// OOXML escapes (caller resolves them via `unescape_sref_str`).
+    /// The inner `]` is consumed.
+    ///
+    /// **4.8.D refactor:** escape-aware traversal. A `'X` 2-char atom
+    /// is skipped together (so an escaped `]` doesn't close the group).
     fn consume_bracket_group(&mut self) -> Result<&'a str, &'static str> {
-        // The lexer already ensured bracket balance at the OUTER level
-        // with escape handling. Here we just walk until the next `]` —
-        // any nested `[` inside is itself an inner spec which the lexer
-        // would have already balanced.
         let mut depth: u32 = 1;
-        let mut end_byte = None;
+        let mut end_byte: Option<usize> = None;
         let bytes = self.rest.as_bytes();
-        for (i, b) in bytes.iter().enumerate() {
-            match *b {
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'\'' {
+                // Skip the 2-char escape atom together. (UTF-8: only ASCII
+                // chars are in the escape set, so byte-offset += 2 works.)
+                i += 2;
+                continue;
+            }
+            match b {
                 b'[' => depth += 1,
                 b']' => {
                     depth -= 1;
@@ -1038,15 +1080,17 @@ impl<'a> SrefCursor<'a> {
                 }
                 _ => {}
             }
+            i += 1;
         }
-        let i = end_byte.ok_or("unclosed `[` inside structured-ref content")?;
-        let inner = &self.rest[..i];
-        self.rest = &self.rest[i + 1..];
+        let end = end_byte.ok_or("unclosed `[` inside structured-ref content")?;
+        let inner = &self.rest[..end];
+        self.rest = &self.rest[end + 1..];
         Ok(inner.trim())
     }
 }
 
 /// Parse the `@...` ThisRow shorthand (caller already consumed the `@`).
+/// Column names are unescaped via `unescape_sref_str`.
 fn parse_sref_thisrow(
     table_name: &str,
     bracket_content: &str,
@@ -1061,24 +1105,30 @@ fn parse_sref_thisrow(
 
     // `@Col` (no inner brackets) — single column.
     if cursor.peek() != Some('[') {
-        let name = cursor.remaining_trimmed();
-        if name.is_empty() {
+        let raw = cursor.remaining_trimmed();
+        if raw.is_empty() {
             return Err(malformed("empty column name after `@`"));
         }
-        return Ok(crate::ast::TableSpecSubtree::ThisRowColumn(Arc::from(name)));
+        let name = unescape_sref_str(raw);
+        return Ok(crate::ast::TableSpecSubtree::ThisRowColumn(Arc::from(
+            name.as_str(),
+        )));
     }
 
     // `@[Col]` or `@[Col1]:[Col2]` — bracketed forms.
     cursor.advance(); // consume `[`
-    let first = cursor
+    let first_raw = cursor
         .consume_bracket_group()
         .map_err(|_| malformed("unclosed `[` after `@`"))?;
-    if first.is_empty() {
+    if first_raw.is_empty() {
         return Err(malformed("empty column name inside `@[...]`"));
     }
+    let first = unescape_sref_str(first_raw);
     cursor.skip_ws();
     if cursor.is_empty() {
-        return Ok(crate::ast::TableSpecSubtree::ThisRowColumn(Arc::from(first)));
+        return Ok(crate::ast::TableSpecSubtree::ThisRowColumn(Arc::from(
+            first.as_str(),
+        )));
     }
     // Expect `:[Col2]`.
     if cursor.peek() != Some(':') {
@@ -1090,19 +1140,20 @@ fn parse_sref_thisrow(
         return Err(malformed("expected `[Col]` after `@[...]:` "));
     }
     cursor.advance(); // `[`
-    let second = cursor
+    let second_raw = cursor
         .consume_bracket_group()
         .map_err(|_| malformed("unclosed `[` in `@[Col1]:[Col2]`"))?;
-    if second.is_empty() {
+    if second_raw.is_empty() {
         return Err(malformed("empty second column in `@[Col1]:[Col2]`"));
     }
+    let second = unescape_sref_str(second_raw);
     cursor.skip_ws();
     if !cursor.is_empty() {
         return Err(malformed("trailing content after `@[Col1]:[Col2]`"));
     }
     Ok(crate::ast::TableSpecSubtree::ThisRowColumnRange(
-        Arc::from(first),
-        Arc::from(second),
+        Arc::from(first.as_str()),
+        Arc::from(second.as_str()),
     ))
 }
 
@@ -1178,22 +1229,31 @@ fn parse_sref_combination(
 
 /// Classify the inner content of a `[item]` against the 3 item shapes:
 /// `Special(item)`, `Column(name)`, or (caller handles ColumnRange).
+/// Column names are unescaped via `unescape_sref_str`; a leading `'#`
+/// in the raw input is a literal `#` in the column name (NOT a special
+/// item).
 fn classify_sref_item(
     table_name: &str,
     bracket_content: &str,
-    inner: &str,
+    inner_raw: &str,
 ) -> Result<crate::ast::TableSpecItem, ParseError> {
-    let trimmed = inner.trim();
-    if trimmed.is_empty() {
+    let trimmed_raw = inner_raw.trim();
+    if trimmed_raw.is_empty() {
         return Err(ParseError::StructuredRefMalformed {
             table_name: table_name.to_owned(),
             bracket_content: bracket_content.to_owned(),
             reason: "empty `[]` item in structured ref",
         });
     }
-    if let Some(rest) = trimmed.strip_prefix('#') {
-        // Special item. Match case-insensitively per Excel canon.
-        let special = match rest.trim().to_ascii_uppercase().as_str() {
+    // Check whether the first char is an UNESCAPED `#`. A leading `'`
+    // means the `#` (or any other char) is literal.
+    let starts_with_unescaped_hash = trimmed_raw.starts_with('#');
+    if starts_with_unescaped_hash {
+        // Special item: take the substring after `#`, unescape it, and
+        // match the special item set case-insensitively.
+        let after_hash = &trimmed_raw[1..];
+        let rest = unescape_sref_str(after_hash.trim());
+        let special = match rest.to_ascii_uppercase().as_str() {
             "HEADERS" => crate::ast::SpecialItem::Headers,
             "TOTALS" => crate::ast::SpecialItem::Totals,
             "DATA" => crate::ast::SpecialItem::Data,
@@ -1209,7 +1269,9 @@ fn classify_sref_item(
         };
         Ok(crate::ast::TableSpecItem::Special(special))
     } else {
-        Ok(crate::ast::TableSpecItem::Column(Arc::from(trimmed)))
+        // Column name. Unescape so a literal `'#Foo` becomes `#Foo`.
+        let name = unescape_sref_str(trimmed_raw);
+        Ok(crate::ast::TableSpecItem::Column(Arc::from(name.as_str())))
     }
 }
 

@@ -542,43 +542,43 @@ fn lex_ident_or_ref(chars: &mut Peekable<Chars>) -> Result<Token, LexError> {
     }
 }
 
-/// **W5-111 (Phase 4.8.B):** consume the bracket content of a structured
-/// reference. The caller has already consumed the opening `[`. Returns
-/// the UNESCAPED content (between the outer `[` and matching `]`); the
-/// closing `]` is also consumed.
+/// **W5-111 (Phase 4.8.B / 4.8.D refactor):** consume the bracket
+/// content of a structured reference. The caller has already consumed
+/// the opening `[`. Returns the content between the outer `[` and
+/// matching `]` PRESERVING the OOXML `'`-prefix escapes; the closing
+/// `]` is consumed but not pushed.
 ///
-/// Per OOXML structured-reference grammar (design doc § 5.4), the
-/// following escape pairs collapse to single characters in the content:
+/// Per OOXML structured-reference grammar (design doc § 5.1 + § 5.4),
+/// the bracket balancer is escape-aware: a `'`-prefixed `]` does NOT
+/// close the bracket (it's a literal `]` inside a column name).
+/// Similarly, `'[` doesn't increment depth. The `'` markers themselves
+/// are PRESERVED in the output so the parser can structurally
+/// distinguish syntactic from literal occurrences of `[`, `]`, `#`,
+/// `@`, `'` (see § 5.1 for the ambiguity that motivated preservation).
 ///
-/// | Source | Resolves to |
-/// |---|---|
-/// | `'[` | literal `[` |
-/// | `']` | literal `]` |
-/// | `'#` | literal `#` |
-/// | `'@` | literal `@` |
-/// | `''` | literal `'` |
-///
-/// Unescaped `[` increments depth; unescaped `]` decrements depth. The
-/// outermost `]` (depth → 0) closes the bracket and is consumed but NOT
-/// pushed to the result.
+/// Escape pairs the balancer recognizes (consumed as 2-char atoms,
+/// emitted as 2-char atoms):
+/// `'[`, `']`, `'#`, `'@`, `''`.
 ///
 /// **Error cases:**
-/// - EOF before matching `]` → `LexError::UnterminatedStructuredRef`.
+/// - EOF before matching unescaped `]` → `LexError::UnterminatedStructuredRef`.
 /// - Trailing `'` with no following character →
 ///   `LexError::DanglingStructuredRefEscape`.
-///
-/// Test surface lives in the lexer test module (Phase 4.8.B), exercising
-/// each escape pair, nested brackets, and the EOF / dangling cases.
 fn consume_structured_ref_bracket(chars: &mut Peekable<Chars>) -> Result<String, LexError> {
     let mut content = String::new();
     let mut depth: u32 = 1; // we've already consumed the opening `[`
     while let Some(c) = chars.next() {
         match c {
             '\'' => {
-                // Escape pair: the NEXT character is taken literally.
-                // Per OOXML, the escape MUST have a following character.
+                // Escape pair: PRESERVE the `'` + next char as a 2-char
+                // atom in the output. The balancer skips bracket-depth
+                // tracking for the next char (so escaped `]` doesn't
+                // close us).
                 match chars.next() {
-                    Some(escaped) => content.push(escaped),
+                    Some(escaped) => {
+                        content.push('\'');
+                        content.push(escaped);
+                    }
                     None => return Err(LexError::DanglingStructuredRefEscape),
                 }
             }
@@ -1939,17 +1939,20 @@ mod tests {
         }
     }
 
-    /// Each of the 5 OOXML escape pairs collapses to a single literal
-    /// character in the bracket content.
+    /// Each of the 5 OOXML escape pairs is PRESERVED as `'X` 2-char
+    /// atoms in the bracket content (the lexer's balancer is escape-
+    /// aware but doesn't substitute — see lexer module doc + design § 5.1).
+    /// The parser's structured-ref sub-grammar resolves the escapes
+    /// structurally (4.8.D refactor).
     #[test]
     fn structured_ref_escape_pairs() {
         // `'[`, `']`, `'#`, `'@`, `''` escapes.
         let cases = [
-            ("Tbl['[a]", "[a"),     // escaped opening bracket inside content
-            ("Tbl[a']]", "a]"),     // escaped closing bracket
-            ("Tbl['#Hash]", "#Hash"),
-            ("Tbl['@AtSign]", "@AtSign"),
-            ("Tbl[Bob''s]", "Bob's"),
+            ("Tbl['[a]", "'[a"),     // escaped opening bracket inside content
+            ("Tbl[a']]", "a']"),     // escaped closing bracket
+            ("Tbl['#Hash]", "'#Hash"),
+            ("Tbl['@AtSign]", "'@AtSign"),
+            ("Tbl[Bob''s]", "Bob''s"),
         ];
         for (src, expected_content) in cases {
             let toks = lex_ok(src);
