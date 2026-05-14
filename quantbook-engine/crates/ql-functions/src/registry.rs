@@ -2,10 +2,34 @@
 //!
 //! Names are stored uppercase per Excel canon. Lookup is case-insensitive: the caller
 //! can pass `"sum"`, `"SUM"`, or `"Sum"` and get the same function.
+//!
+//! ## Storage shape (W5-96 / Phase 4.7.B unification)
+//!
+//! Pre-W5-96 the registry held three parallel `HashMap`s, one per function
+//! tier (`ScalarFn`, `RangeAwareFn`, `ContextAwareFn`). Phase 4.7 needs a
+//! fourth tier (array-returning functions for SEQUENCE / FILTER /
+//! TRANSPOSE), and Codex design review HIGH-1 flagged the proliferation:
+//! the right move at this point is to **unify** the dispatch table into
+//! one map keyed by name, valued by a `RegisteredFn` enum that tags the
+//! tier. Eval-site dispatch becomes one HashMap lookup + one `match`.
+//!
+//! This commit (W5-96) restructures STORAGE without changing the public
+//! `register_*` / `lookup_*` API surface: legacy callers still call
+//! `register("SUM", sum_fn)` and `lookup("SUM")` exactly as before. The
+//! lookup methods filter on the enum variant (e.g. `lookup_range_aware`
+//! returns `Some(raf)` only if the registered fn is
+//! `RegisteredFn::RangeAware(raf)`). Eval-site migration to a single
+//! match-on-enum lands in W5-101 (Phase 4.7.G) when the array-eval path
+//! actually needs it.
+//!
+//! New array-returning functions register via `register_unified(name,
+//! FunctionFn)` and are stored as `RegisteredFn::Unified(_)`. Eval-site
+//! dispatch in W5-101 will route them through a new `match` arm that
+//! returns `EvalResult::Array(_)` to the runtime.
 
 use std::collections::HashMap;
 
-use ql_types::Value;
+use ql_types::{ArrayValue, EvalContext, Value};
 
 use crate::context_aware_fns::ContextAwareFn;
 use crate::range_aware_fns::RangeAwareFn;
@@ -14,20 +38,120 @@ use crate::{date_fns, format, range_fns, scalar_fns, volatile};
 /// Function signature: pre-evaluated args → result Value.
 pub type ScalarFn = fn(&[Value]) -> Value;
 
-/// Phase 0 function registry. Built by `default_registry()` with the W4-4 function set.
+/// **W5-96 (Phase 4.7.B):** unified function-dispatch arg, used by the
+/// new array-returning function tier (`FunctionFn`). Covers all three
+/// shapes the eval site can produce:
 ///
-/// W5-53 adds a parallel `range_aware_fns` table for functions that
-/// need per-argument range-vs-scalar metadata (SUMIF, COUNTIF, etc.).
-/// W5-69 (Phase 4.5.A.0) adds `context_aware_fns` for date/locale/clock-
-/// aware functions that take an extra `&EvalContext` arg. Dispatch order:
-/// range_aware FIRST → context_aware SECOND → scalar LAST. A single name
-/// MUST NOT be registered in more than one table (registration panics on
-/// any cross-table collision).
+/// - `Scalar(Value)` — single pre-evaluated value (analogous to a single
+///   slot in `&[Value]` for the legacy `ScalarFn`).
+/// - `Range { values, rows, cols }` — flat row-major iteration over a
+///   workbook range, with 2D shape preserved (matches `FnArg::Range`
+///   from the legacy `RangeAwareFn` contract).
+/// - `Array(ArrayValue)` — an explicit array value from `Expr::Array`
+///   literal or another function's return. Distinct from `Range`
+///   because `Range` carries workbook-range provenance (used by
+///   VLOOKUP/INDEX shape addressing) while `Array` is a free-floating
+///   2D value.
+///
+/// Conversion `FnArg → FunctionArg`:
+/// - `FnArg::Scalar(v)` → `FunctionArg::Scalar(v)`.
+/// - `FnArg::Range { values, rows, cols }` → `FunctionArg::Range { ... }`.
+///
+/// The eval site (W5-101 / Phase 4.7.G) materializes `FunctionArg` from
+/// `ExprPlan` arg positions before dispatching through `FunctionFn`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FunctionArg {
+    /// Single scalar value.
+    Scalar(Value),
+    /// 2D range with explicit shape; `values.len() == rows * cols`,
+    /// row-major iteration. Matches the existing `FnArg::Range` shape.
+    Range {
+        values: Vec<Value>,
+        rows: usize,
+        cols: usize,
+    },
+    /// Array value (from `Expr::Array` literal or another function's
+    /// `FunctionReturn::Array`).
+    Array(ArrayValue),
+}
+
+/// **W5-96 (Phase 4.7.B):** unified function return — either a scalar or
+/// an array. Arrays returned at the cell-boundary context spill; arrays
+/// returned in scalar context produce `Value::Error(ErrorValue::Calc)`
+/// (Phase 4.7.G enforces this at the eval site per design § 6.3).
+#[derive(Clone, Debug, PartialEq)]
+pub enum FunctionReturn {
+    Scalar(Value),
+    Array(ArrayValue),
+}
+
+impl FunctionReturn {
+    /// True if this is `Array(_)`. Helper for the eval-site spill check.
+    pub fn is_array(&self) -> bool {
+        matches!(self, FunctionReturn::Array(_))
+    }
+}
+
+/// **W5-96 (Phase 4.7.B):** unified function call context. Carries the
+/// `EvalContext` (date_system / locale / now_provider) that the legacy
+/// `ContextAwareFn` received as a bare reference. Struct-of-fields shape
+/// lets us add workbook-level state later (W5-101+) without changing the
+/// function ABI.
+pub struct FunctionContext<'a> {
+    pub eval_ctx: &'a EvalContext,
+}
+
+impl<'a> FunctionContext<'a> {
+    pub fn new(eval_ctx: &'a EvalContext) -> Self {
+        Self { eval_ctx }
+    }
+}
+
+/// **W5-96 (Phase 4.7.B):** unified function ABI. New array-returning
+/// functions (SEQUENCE, FILTER, TRANSPOSE — Phase 4.7.M/N) register
+/// through this signature.
+pub type FunctionFn = fn(&[FunctionArg], &FunctionContext) -> FunctionReturn;
+
+/// **W5-96 (Phase 4.7.B):** tagged-union of all four function-dispatch
+/// tiers, stored as the value in the unified `FunctionRegistry` HashMap.
+/// Pre-W5-96 the registry held three parallel HashMaps; this enum
+/// collapses them and adds the `Unified` variant for array fns.
+///
+/// Eval-site code in `ql-exec::scalar` currently routes through the
+/// legacy filter-views (`lookup_scalar` / `lookup_range_aware` /
+/// `lookup_context_aware`); W5-101 (Phase 4.7.G) migrates that site
+/// to a single `match` on `RegisteredFn`.
+#[derive(Clone, Debug)]
+pub enum RegisteredFn {
+    /// Legacy `fn(&[Value]) -> Value`. Most functions register here.
+    Scalar(ScalarFn),
+    /// Range-aware: `fn(&[FnArg]) -> Value`. Used by SUMIF / VLOOKUP /
+    /// INDEX etc. that need per-arg range-vs-scalar metadata.
+    RangeAware(RangeAwareFn),
+    /// Context-aware: `fn(&[Value], &EvalContext) -> Value`. Used by
+    /// DATE / NOW / TODAY / WEEKDAY etc. that need workbook EvalContext.
+    ContextAware(ContextAwareFn),
+    /// Unified ABI (W5-96+). New array-returning functions (Phase
+    /// 4.7.M/N) register here.
+    Unified(FunctionFn),
+}
+
+/// Phase 0 function registry. Built by `default_registry()` with the
+/// full built-in set (~130 entries by W5-93).
+///
+/// **W5-96 (Phase 4.7.B):** internal storage unified into one HashMap
+/// keyed by name, valued by `RegisteredFn`. Legacy `register_*` /
+/// `lookup_*` methods preserved as filters on the enum variant for
+/// backwards-compat (zero diff on the ~130 existing
+/// `r.register("SUM", scalar_fns::sum)` lines in `default_registry`).
+///
+/// **Disjointness:** a single name maps to ONE `RegisteredFn` (the
+/// HashMap enforces this naturally). The pre-W5-96 "cross-table
+/// disjointness" assertions become "name already registered" — same
+/// semantics, simpler implementation.
 #[derive(Clone, Debug)]
 pub struct FunctionRegistry {
-    fns: HashMap<&'static str, ScalarFn>,
-    range_aware_fns: HashMap<&'static str, RangeAwareFn>,
-    context_aware_fns: HashMap<&'static str, ContextAwareFn>,
+    fns: HashMap<&'static str, RegisteredFn>,
 }
 
 impl Default for FunctionRegistry {
@@ -42,12 +166,30 @@ impl FunctionRegistry {
     pub fn new() -> Self {
         Self {
             fns: HashMap::new(),
-            range_aware_fns: HashMap::new(),
-            context_aware_fns: HashMap::new(),
         }
     }
 
-    /// Register a function under `name`.
+    /// W5-96 internal: assert canonical-uppercase name + insert with
+    /// duplicate panic. Single source of truth for all `register_*`
+    /// methods. The pre-W5-96 cross-table disjointness checks collapse
+    /// to a single "duplicate" panic per the unified map invariant.
+    fn insert_or_panic(&mut self, name: &'static str, f: RegisteredFn, method: &'static str) {
+        assert!(!name.is_empty(), "{method}: name must not be empty");
+        assert!(
+            name.bytes().all(|b| !b.is_ascii_lowercase()),
+            "{method}: name {name:?} must be canonical upper-case; \
+             lookups uppercase the query, so a lower-case key is unreachable"
+        );
+        let prior = self.fns.insert(name, f);
+        assert!(
+            prior.is_none(),
+            "{method}: duplicate registration for {name:?} — silent override \
+             would let a typo replace a built-in"
+        );
+    }
+
+    /// Register a scalar function under `name`. Stored internally as
+    /// `RegisteredFn::Scalar(f)`.
     ///
     /// Phase 2A.7 audit M5: `name` MUST already be canonical upper-case. This is
     /// asserted at registration time so a stray `register("sum", ...)` doesn't
@@ -57,164 +199,153 @@ impl FunctionRegistry {
     /// shim. Phase 2 has a closed default function set; if dynamic registration
     /// ever becomes a real use case, swap this for `Result<(), RegisterError>`.
     pub fn register(&mut self, name: &'static str, f: ScalarFn) {
-        assert!(
-            !name.is_empty(),
-            "FunctionRegistry::register: name must not be empty"
-        );
-        assert!(
-            name.bytes().all(|b| !b.is_ascii_lowercase()),
-            "FunctionRegistry::register: name {name:?} must be canonical upper-case; \
-             lookups uppercase the query, so a lower-case key is unreachable"
-        );
-        // W5-69 (Phase 4.5.A.0): cross-table disjointness — a name
-        // already in range_aware_fns or context_aware_fns cannot also
-        // be registered as scalar.
-        assert!(
-            !self.range_aware_fns.contains_key(name),
-            "FunctionRegistry::register: {name:?} is already registered as a \
-             range-aware function; cannot register in both tables"
-        );
-        assert!(
-            !self.context_aware_fns.contains_key(name),
-            "FunctionRegistry::register: {name:?} is already registered as a \
-             context-aware function; cannot register in both tables"
-        );
-        let prior = self.fns.insert(name, f);
-        assert!(
-            prior.is_none(),
-            "FunctionRegistry::register: duplicate registration for {name:?} — \
-             silent override would let a typo replace a built-in"
-        );
+        self.insert_or_panic(name, RegisteredFn::Scalar(f), "FunctionRegistry::register");
     }
 
-    /// W5-53: register a range-aware function under `name`. Same
-    /// canonical-uppercase requirement + duplicate panic as
-    /// `register`. Cross-table name collision also panics — a name
-    /// cannot live in both `fns` and `range_aware_fns`.
+    /// W5-53: register a range-aware function under `name`. Stored
+    /// internally as `RegisteredFn::RangeAware(f)`. Same canonical-
+    /// uppercase requirement + duplicate panic as `register`.
     pub fn register_range_aware(&mut self, name: &'static str, f: RangeAwareFn) {
-        assert!(
-            !name.is_empty(),
-            "FunctionRegistry::register_range_aware: name must not be empty"
-        );
-        assert!(
-            name.bytes().all(|b| !b.is_ascii_lowercase()),
-            "FunctionRegistry::register_range_aware: name {name:?} must be canonical \
-             upper-case"
-        );
-        assert!(
-            !self.fns.contains_key(name),
-            "FunctionRegistry::register_range_aware: {name:?} is already registered \
-             as a scalar function; cannot register in both tables"
-        );
-        // W5-69 (Phase 4.5.A.0): also disjoint from context_aware_fns.
-        assert!(
-            !self.context_aware_fns.contains_key(name),
-            "FunctionRegistry::register_range_aware: {name:?} is already registered \
-             as a context-aware function; cannot register in both tables"
-        );
-        let prior = self.range_aware_fns.insert(name, f);
-        assert!(
-            prior.is_none(),
-            "FunctionRegistry::register_range_aware: duplicate registration for {name:?}"
+        self.insert_or_panic(
+            name,
+            RegisteredFn::RangeAware(f),
+            "FunctionRegistry::register_range_aware",
         );
     }
 
     /// **W5-69 (Phase 4.5.A.0):** register a context-aware function. These
     /// receive `&EvalContext` (date_system + locale + now_provider) in
-    /// addition to the standard `&[Value]` args. Same canonical-uppercase
-    /// requirement + duplicate panic + cross-table disjointness as the
-    /// other two `register_*` methods.
+    /// addition to the standard `&[Value]` args. Stored internally as
+    /// `RegisteredFn::ContextAware(f)`.
     pub fn register_context_aware(&mut self, name: &'static str, f: ContextAwareFn) {
-        assert!(
-            !name.is_empty(),
-            "FunctionRegistry::register_context_aware: name must not be empty"
-        );
-        assert!(
-            name.bytes().all(|b| !b.is_ascii_lowercase()),
-            "FunctionRegistry::register_context_aware: name {name:?} must be canonical \
-             upper-case"
-        );
-        assert!(
-            !self.fns.contains_key(name),
-            "FunctionRegistry::register_context_aware: {name:?} is already registered \
-             as a scalar function; cannot register in both tables"
-        );
-        assert!(
-            !self.range_aware_fns.contains_key(name),
-            "FunctionRegistry::register_context_aware: {name:?} is already registered \
-             as a range-aware function; cannot register in both tables"
-        );
-        let prior = self.context_aware_fns.insert(name, f);
-        assert!(
-            prior.is_none(),
-            "FunctionRegistry::register_context_aware: duplicate registration for {name:?}"
+        self.insert_or_panic(
+            name,
+            RegisteredFn::ContextAware(f),
+            "FunctionRegistry::register_context_aware",
         );
     }
 
-    /// Case-insensitive lookup. Returns `None` if not registered.
+    /// **W5-96 (Phase 4.7.B):** register a function under the unified
+    /// `FunctionFn` ABI. Used by new array-returning functions
+    /// (SEQUENCE, FILTER, TRANSPOSE — Phase 4.7.M/N). Stored as
+    /// `RegisteredFn::Unified(f)`.
+    pub fn register_unified(&mut self, name: &'static str, f: FunctionFn) {
+        self.insert_or_panic(
+            name,
+            RegisteredFn::Unified(f),
+            "FunctionRegistry::register_unified",
+        );
+    }
+
+    /// Case-insensitive lookup, returning the scalar function if and only
+    /// if the registered entry is `RegisteredFn::Scalar(_)`. Other tiers
+    /// (range-aware, context-aware, unified) return `None` here — the
+    /// caller must check the tier-specific lookup methods.
     pub fn lookup(&self, name: &str) -> Option<ScalarFn> {
-        // Allocate a single uppercase key for the lookup; the registry holds &'static
-        // uppercase names, so we compare on uppercase form.
         let upper = name.to_ascii_uppercase();
-        self.fns.get(upper.as_str()).copied()
+        match self.fns.get(upper.as_str()) {
+            Some(RegisteredFn::Scalar(f)) => Some(*f),
+            _ => None,
+        }
     }
 
-    /// W5-53: case-insensitive lookup in the range-aware table.
-    /// Callers should check this BEFORE `lookup` — if a function is
-    /// range-aware, the dispatch must construct `Vec<FnArg>` rather
-    /// than flattening to `Vec<Value>`.
+    /// W5-53: case-insensitive lookup, returning the range-aware fn iff
+    /// registered as `RegisteredFn::RangeAware(_)`. Callers should check
+    /// this BEFORE `lookup` — if a function is range-aware, the dispatch
+    /// must construct `Vec<FnArg>` rather than flattening to `Vec<Value>`.
     pub fn lookup_range_aware(&self, name: &str) -> Option<RangeAwareFn> {
         let upper = name.to_ascii_uppercase();
-        self.range_aware_fns.get(upper.as_str()).copied()
+        match self.fns.get(upper.as_str()) {
+            Some(RegisteredFn::RangeAware(f)) => Some(*f),
+            _ => None,
+        }
     }
 
-    /// **W5-69 (Phase 4.5.A.0):** case-insensitive lookup in the
-    /// context-aware table. Callers should check this AFTER
-    /// `lookup_range_aware` but BEFORE `lookup`. Dispatch order:
-    /// `range_aware` → `context_aware` → `scalar`.
+    /// **W5-69 (Phase 4.5.A.0):** case-insensitive lookup, returning the
+    /// context-aware fn iff registered as `RegisteredFn::ContextAware(_)`.
+    /// Callers should check this AFTER `lookup_range_aware` but BEFORE
+    /// `lookup`. Dispatch order: `range_aware` → `context_aware` → `scalar`.
     pub fn lookup_context_aware(&self, name: &str) -> Option<ContextAwareFn> {
         let upper = name.to_ascii_uppercase();
-        self.context_aware_fns.get(upper.as_str()).copied()
+        match self.fns.get(upper.as_str()) {
+            Some(RegisteredFn::ContextAware(f)) => Some(*f),
+            _ => None,
+        }
     }
 
-    pub fn names(&self) -> impl Iterator<Item = &&'static str> {
+    /// **W5-96 (Phase 4.7.B):** case-insensitive lookup for the unified
+    /// ABI. Returns `Some(f)` iff the registered entry is
+    /// `RegisteredFn::Unified(_)`. Used by the eval-site array-dispatch
+    /// path (W5-101 / Phase 4.7.G).
+    pub fn lookup_unified(&self, name: &str) -> Option<FunctionFn> {
+        let upper = name.to_ascii_uppercase();
+        match self.fns.get(upper.as_str()) {
+            Some(RegisteredFn::Unified(f)) => Some(*f),
+            _ => None,
+        }
+    }
+
+    /// **W5-96 (Phase 4.7.B):** case-insensitive lookup returning the
+    /// `RegisteredFn` enum directly. Lets the eval site perform a
+    /// single match-on-tier rather than four sequential `lookup_*`
+    /// calls. Migrated callers (W5-101+) use this; pre-W5-96 callers
+    /// keep working through the tier-specific filter views above.
+    pub fn lookup_any(&self, name: &str) -> Option<&RegisteredFn> {
+        let upper = name.to_ascii_uppercase();
+        self.fns.get(upper.as_str())
+    }
+
+    /// Iterator over names registered as `RegisteredFn::Scalar(_)`.
+    /// **W5-96 (Phase 4.7.B):** previously was "names registered in the
+    /// scalar HashMap"; the unified storage means we filter by variant.
+    pub fn names(&self) -> impl Iterator<Item = &&'static str> + '_ {
+        self.fns
+            .iter()
+            .filter(|(_, v)| matches!(v, RegisteredFn::Scalar(_)))
+            .map(|(k, _)| k)
+    }
+
+    /// W5-65 (Phase 4.4.B; Codex MEDIUM 4 fix): names registered as
+    /// `RegisteredFn::RangeAware(_)`.
+    pub fn range_aware_names(&self) -> impl Iterator<Item = &&'static str> + '_ {
+        self.fns
+            .iter()
+            .filter(|(_, v)| matches!(v, RegisteredFn::RangeAware(_)))
+            .map(|(k, _)| k)
+    }
+
+    /// **W5-69 (Phase 4.5.A.0):** names registered as
+    /// `RegisteredFn::ContextAware(_)`.
+    pub fn context_aware_names(&self) -> impl Iterator<Item = &&'static str> + '_ {
+        self.fns
+            .iter()
+            .filter(|(_, v)| matches!(v, RegisteredFn::ContextAware(_)))
+            .map(|(k, _)| k)
+    }
+
+    /// **W5-96 (Phase 4.7.B):** names registered as
+    /// `RegisteredFn::Unified(_)`. For coverage walks that want to
+    /// see the array-returning function set explicitly.
+    pub fn unified_names(&self) -> impl Iterator<Item = &&'static str> + '_ {
+        self.fns
+            .iter()
+            .filter(|(_, v)| matches!(v, RegisteredFn::Unified(_)))
+            .map(|(k, _)| k)
+    }
+
+    /// W5-65 (Phase 4.4.B): convenience iterator over ALL registered
+    /// function names across all tiers. The unified storage makes this
+    /// trivial — `keys()` covers every entry without de-duplication.
+    pub fn names_all(&self) -> impl Iterator<Item = &&'static str> {
         self.fns.keys()
     }
 
-    /// W5-65 (Phase 4.4.B; Codex MEDIUM 4 fix): names registered in the
-    /// range-aware table. The original `names()` only exposes scalar names;
-    /// any coverage report or registry-walk that wants to enumerate ALL
-    /// registered functions (e.g. for matrix-test completeness) must call
-    /// both `names()` and `range_aware_names()`.
-    pub fn range_aware_names(&self) -> impl Iterator<Item = &&'static str> {
-        self.range_aware_fns.keys()
-    }
-
-    /// **W5-69 (Phase 4.5.A.0):** names registered in the context-aware
-    /// table. Same pattern as `range_aware_names()`; coverage walks must
-    /// include this iterator OR use `names_all()` (which chains all 3).
-    pub fn context_aware_names(&self) -> impl Iterator<Item = &&'static str> {
-        self.context_aware_fns.keys()
-    }
-
-    /// W5-65 (Phase 4.4.B): convenience iterator over ALL registered function
-    /// names across all tables (scalar + range-aware + context-aware). The
-    /// three tables are disjoint by registration invariant, so no
-    /// deduplication is needed. **W5-69 (Phase 4.5.A.0):** extended to chain
-    /// the context-aware table.
-    pub fn names_all(&self) -> impl Iterator<Item = &&'static str> {
-        self.fns
-            .keys()
-            .chain(self.range_aware_fns.keys())
-            .chain(self.context_aware_fns.keys())
-    }
-
     pub fn len(&self) -> usize {
-        self.fns.len() + self.range_aware_fns.len() + self.context_aware_fns.len()
+        self.fns.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.fns.is_empty() && self.range_aware_fns.is_empty() && self.context_aware_fns.is_empty()
+        self.fns.is_empty()
     }
 }
 
@@ -500,19 +631,21 @@ mod tests {
     }
 
     #[test]
-    fn scalar_and_range_aware_tables_are_disjoint() {
+    fn scalar_and_range_aware_tiers_are_disjoint() {
+        // W5-96: tier disjointness is now structurally enforced by the
+        // unified HashMap (one name → one RegisteredFn). The test still
+        // verifies that no name resolves through BOTH filter views.
         let r = default_registry();
-        // No name appears in both tables.
-        for (name, _) in r.fns.iter() {
+        for name in r.names() {
             assert!(
-                !r.range_aware_fns.contains_key(name),
-                "name {name:?} is in both fns and range_aware_fns"
+                r.lookup_range_aware(name).is_none(),
+                "name {name:?} resolves as both Scalar and RangeAware"
             );
         }
     }
 
     #[test]
-    #[should_panic(expected = "is already registered as a scalar function")]
+    #[should_panic(expected = "duplicate registration")]
     fn register_range_aware_with_existing_scalar_name_panics() {
         let mut r = FunctionRegistry::new();
         r.register("FOO", scalar_fns::sum);
@@ -569,29 +702,30 @@ mod tests {
     }
 
     #[test]
-    fn context_aware_table_disjoint_from_scalar() {
+    fn context_aware_tier_disjoint_from_scalar() {
+        // W5-96: structurally enforced by the unified HashMap.
         let r = default_registry();
-        for (name, _) in r.fns.iter() {
+        for name in r.names() {
             assert!(
-                !r.context_aware_fns.contains_key(name),
-                "{name:?} appears in both fns and context_aware_fns"
+                r.lookup_context_aware(name).is_none(),
+                "{name:?} resolves as both Scalar and ContextAware"
             );
         }
     }
 
     #[test]
-    fn context_aware_table_disjoint_from_range_aware() {
+    fn context_aware_tier_disjoint_from_range_aware() {
         let r = default_registry();
-        for (name, _) in r.range_aware_fns.iter() {
+        for name in r.range_aware_names() {
             assert!(
-                !r.context_aware_fns.contains_key(name),
-                "{name:?} appears in both range_aware_fns and context_aware_fns"
+                r.lookup_context_aware(name).is_none(),
+                "{name:?} resolves as both RangeAware and ContextAware"
             );
         }
     }
 
     #[test]
-    #[should_panic(expected = "is already registered as a scalar function")]
+    #[should_panic(expected = "duplicate registration")]
     fn register_context_aware_with_existing_scalar_name_panics() {
         let mut r = FunctionRegistry::new();
         r.register("FOO", scalar_fns::sum);
@@ -599,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "is already registered as a range-aware function")]
+    #[should_panic(expected = "duplicate registration")]
     fn register_context_aware_with_existing_range_aware_name_panics() {
         let mut r = FunctionRegistry::new();
         r.register_range_aware("FOO", range_fns::sumif);
@@ -607,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "is already registered as a context-aware function")]
+    #[should_panic(expected = "duplicate registration")]
     fn register_scalar_with_existing_context_aware_name_panics() {
         let mut r = FunctionRegistry::new();
         r.register_context_aware("FOO", echo_date_system_year);
@@ -615,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "is already registered as a context-aware function")]
+    #[should_panic(expected = "duplicate registration")]
     fn register_range_aware_with_existing_context_aware_name_panics() {
         let mut r = FunctionRegistry::new();
         r.register_context_aware("FOO", echo_date_system_year);
@@ -778,5 +912,169 @@ mod tests {
             Value::Number(30.0),
         ]);
         assert_eq!(result, Value::Number(60.0));
+    }
+
+    // ===== W5-96 (Phase 4.7.B) unified ABI =====
+
+    /// Fixture: a unified-tier function that returns a fixed 1×3
+    /// `ArrayValue` so we can verify the array-returning path
+    /// end-to-end through `register_unified` + `lookup_unified`.
+    fn fixed_sequence_3(_args: &[FunctionArg], _ctx: &FunctionContext) -> FunctionReturn {
+        FunctionReturn::Array(ArrayValue::row(vec![
+            Value::Number(1.0),
+            Value::Number(2.0),
+            Value::Number(3.0),
+        ]))
+    }
+
+    /// Fixture: a unified-tier function that echoes its first arg.
+    fn echo_first(args: &[FunctionArg], _ctx: &FunctionContext) -> FunctionReturn {
+        match args.first() {
+            Some(FunctionArg::Scalar(v)) => FunctionReturn::Scalar(v.clone()),
+            Some(FunctionArg::Array(a)) => FunctionReturn::Array(a.clone()),
+            _ => FunctionReturn::Scalar(Value::Error(ql_types::ErrorValue::Value)),
+        }
+    }
+
+    #[test]
+    fn register_unified_and_lookup_unified_round_trip() {
+        let mut r = FunctionRegistry::new();
+        r.register_unified("FIXED_SEQ", fixed_sequence_3);
+        let f = r.lookup_unified("FIXED_SEQ").expect("registered");
+        let ctx = ql_types::EvalContext::default();
+        let fctx = FunctionContext::new(&ctx);
+        let ret = f(&[], &fctx);
+        match ret {
+            FunctionReturn::Array(a) => {
+                assert_eq!(a.rows(), 1);
+                assert_eq!(a.cols(), 3);
+            }
+            FunctionReturn::Scalar(_) => panic!("expected array return"),
+        }
+    }
+
+    #[test]
+    fn lookup_unified_is_case_insensitive() {
+        let mut r = FunctionRegistry::new();
+        r.register_unified("FIXED_SEQ", fixed_sequence_3);
+        assert!(r.lookup_unified("fixed_seq").is_some());
+        assert!(r.lookup_unified("Fixed_Seq").is_some());
+    }
+
+    #[test]
+    fn unified_tier_disjoint_from_other_tiers() {
+        let mut r = FunctionRegistry::new();
+        r.register_unified("UFN", fixed_sequence_3);
+        // The legacy filter views must NOT return the unified fn.
+        assert!(r.lookup("UFN").is_none());
+        assert!(r.lookup_range_aware("UFN").is_none());
+        assert!(r.lookup_context_aware("UFN").is_none());
+        // But lookup_any does see it.
+        assert!(matches!(
+            r.lookup_any("UFN"),
+            Some(RegisteredFn::Unified(_))
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate registration")]
+    fn register_unified_with_existing_scalar_name_panics() {
+        let mut r = FunctionRegistry::new();
+        r.register("FOO", scalar_fns::sum);
+        r.register_unified("FOO", fixed_sequence_3);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate registration")]
+    fn register_scalar_with_existing_unified_name_panics() {
+        let mut r = FunctionRegistry::new();
+        r.register_unified("FOO", fixed_sequence_3);
+        r.register("FOO", scalar_fns::sum);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate registration")]
+    fn duplicate_unified_registration_panics() {
+        let mut r = FunctionRegistry::new();
+        r.register_unified("UFN", fixed_sequence_3);
+        r.register_unified("UFN", fixed_sequence_3);
+    }
+
+    #[test]
+    fn unified_names_returns_only_unified() {
+        let mut r = FunctionRegistry::new();
+        r.register("S", scalar_fns::sum);
+        r.register_range_aware("RA", range_fns::sumif);
+        r.register_context_aware("CA", echo_date_system_year);
+        r.register_unified("UFN", fixed_sequence_3);
+        let names: Vec<&str> = r.unified_names().copied().collect();
+        assert_eq!(names, vec!["UFN"]);
+    }
+
+    #[test]
+    fn names_all_includes_unified() {
+        let mut r = FunctionRegistry::new();
+        r.register("S", scalar_fns::sum);
+        r.register_range_aware("RA", range_fns::sumif);
+        r.register_context_aware("CA", echo_date_system_year);
+        r.register_unified("UFN", fixed_sequence_3);
+        let all: std::collections::HashSet<&str> = r.names_all().copied().collect();
+        assert!(all.contains("S"));
+        assert!(all.contains("RA"));
+        assert!(all.contains("CA"));
+        assert!(all.contains("UFN"));
+        assert_eq!(all.len(), 4);
+        assert_eq!(r.len(), 4);
+    }
+
+    #[test]
+    fn function_arg_array_round_trips_through_unified() {
+        // Verify that a unified fn can receive an ArrayValue arg and
+        // return it unchanged. Closes the FunctionArg::Array surface.
+        let mut r = FunctionRegistry::new();
+        r.register_unified("ECHO", echo_first);
+        let f = r.lookup_unified("ECHO").unwrap();
+        let arr = ArrayValue::row(vec![Value::Number(7.0), Value::Number(8.0)]);
+        let ctx = ql_types::EvalContext::default();
+        let fctx = FunctionContext::new(&ctx);
+        let ret = f(&[FunctionArg::Array(arr.clone())], &fctx);
+        match ret {
+            FunctionReturn::Array(out) => {
+                assert_eq!(out, arr);
+            }
+            FunctionReturn::Scalar(_) => panic!("expected array round-trip"),
+        }
+    }
+
+    #[test]
+    fn function_return_is_array_helper() {
+        let arr = FunctionReturn::Array(ArrayValue::singleton(Value::Number(1.0)));
+        let scalar = FunctionReturn::Scalar(Value::Number(1.0));
+        assert!(arr.is_array());
+        assert!(!scalar.is_array());
+    }
+
+    #[test]
+    fn lookup_any_returns_tagged_enum() {
+        let mut r = FunctionRegistry::new();
+        r.register("S", scalar_fns::sum);
+        r.register_range_aware("RA", range_fns::sumif);
+        r.register_context_aware("CA", echo_date_system_year);
+        r.register_unified("UFN", fixed_sequence_3);
+
+        assert!(matches!(r.lookup_any("S"), Some(RegisteredFn::Scalar(_))));
+        assert!(matches!(
+            r.lookup_any("RA"),
+            Some(RegisteredFn::RangeAware(_))
+        ));
+        assert!(matches!(
+            r.lookup_any("CA"),
+            Some(RegisteredFn::ContextAware(_))
+        ));
+        assert!(matches!(
+            r.lookup_any("UFN"),
+            Some(RegisteredFn::Unified(_))
+        ));
+        assert!(r.lookup_any("missing").is_none());
     }
 }

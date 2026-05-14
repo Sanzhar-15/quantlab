@@ -35,7 +35,10 @@ pub mod wildcard;
 
 pub use context_aware_fns::ContextAwareFn;
 pub use range_aware_fns::{FnArg, RangeAwareFn};
-pub use registry::{default_registry, FunctionRegistry, ScalarFn};
+pub use registry::{
+    default_registry, FunctionArg, FunctionContext, FunctionFn, FunctionRegistry, FunctionReturn,
+    RegisteredFn, ScalarFn,
+};
 pub use volatile::{clear_test_overrides, set_test_now_secs, set_test_rng_seed};
 pub use welford::{
     mean, population_stdev, population_variance, sample_stdev, sample_variance, WelfordState,
