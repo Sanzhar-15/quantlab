@@ -79,6 +79,21 @@ pub enum Op {
     /// against an empty workbook produces the same sequence.
     AddSheet { name: String, chunk_rows: u32 },
 
+    /// **W5-91 (Phase 4.6.C):** rename an existing sheet by id. Mirrors
+    /// `Workbook::rename_sheet`. Carries `old_name` for replay-time
+    /// validation (snapshot-vs-replay reconciliation: if the snapshot
+    /// already has the new name, replay no-ops gracefully when current
+    /// canonical matches the new name). Per design doc § 3.1, the
+    /// producer-side runtime rewrites all stored formula text BEFORE
+    /// emitting this op (and emits `Op::PutFormula` ops for each
+    /// rewritten cell in the same BatchCommit), so replay-on-top-of-
+    /// snapshot OR replay-from-empty both produce correct state.
+    RenameSheet {
+        id: SheetId,
+        old_name: String,
+        new_name: String,
+    },
+
     /// Register a format string at a specific id. Mirrors
     /// `FormatTable::register_at`. Emitted when
     /// `WorkbookRuntime::intern_format` allocates a NEW id; idempotent

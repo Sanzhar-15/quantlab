@@ -32,7 +32,7 @@ pub mod parser;
 pub mod printer;
 pub mod token;
 
-pub use ast::{CellAddr, Expr, RangeRef, SheetRef};
+pub use ast::{rewrite_sheet_name_in_expr, CellAddr, Expr, RangeRef, SheetRef};
 pub use lexer::{column_letters_to_index, lex, LexError, MAX_COLUMN, MAX_ROW};
 pub use parser::{parse, ParseError};
 pub use printer::print;

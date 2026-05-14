@@ -140,6 +140,17 @@ fn apply_producer_side(ops: &[Op], wb: &mut Workbook) {
             Op::AddSheet { name, chunk_rows } => {
                 wb.add_sheet_with_chunk_rows(name.clone(), *chunk_rows);
             }
+            Op::RenameSheet {
+                id,
+                old_name: _,
+                new_name,
+            } => {
+                // W5-91: producer side calls `Workbook::rename_sheet`
+                // directly here (the formula-text rewrite happens at the
+                // `WorkbookRuntime` layer, above the op-log boundary).
+                wb.rename_sheet(*id, new_name.clone())
+                    .expect("producer-side rename_sheet must succeed");
+            }
             Op::RegisterFormat { id, string } => {
                 wb.formats_mut()
                     .register_at(ql_storage::FormatId(*id), string.as_str())

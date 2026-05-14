@@ -146,6 +146,123 @@ impl SheetRef {
     }
 }
 
+/// **W5-91 (Phase 4.6.C):** recursively rewrite every `SheetRef::Name`
+/// in `expr` whose canonical form (ASCII uppercase) matches
+/// `old_canonical` to `SheetRef::Name(new_name)`. Used by
+/// `WorkbookRuntime::rename_sheet` to update stored formula text
+/// after a sheet rename, via a parse → rewrite → print round trip.
+///
+/// Returns a new Expr; the input is not mutated. `Current` and `Id`
+/// sheet refs pass through unchanged. Non-matching `Name` entries
+/// also pass through.
+pub fn rewrite_sheet_name_in_expr(expr: &Expr, old_canonical: &str, new_name: &Arc<str>) -> Expr {
+    match expr {
+        Expr::Number(n) => Expr::Number(*n),
+        Expr::String(s) => Expr::String(s.clone()),
+        Expr::Bool(b) => Expr::Bool(*b),
+        Expr::NameRef(n) => Expr::NameRef(n.clone()),
+        Expr::CellRef(addr) => Expr::CellRef(CellAddr {
+            sheet: rewrite_sheet_ref(&addr.sheet, old_canonical, new_name),
+            col: addr.col,
+            row: addr.row,
+            abs_col: addr.abs_col,
+            abs_row: addr.abs_row,
+        }),
+        Expr::RangeRef(r) => Expr::RangeRef(rewrite_range_ref(r, old_canonical, new_name)),
+        Expr::Binary { op, lhs, rhs } => Expr::Binary {
+            op: *op,
+            lhs: Box::new(rewrite_sheet_name_in_expr(lhs, old_canonical, new_name)),
+            rhs: Box::new(rewrite_sheet_name_in_expr(rhs, old_canonical, new_name)),
+        },
+        Expr::Unary { op, operand } => Expr::Unary {
+            op: *op,
+            operand: Box::new(rewrite_sheet_name_in_expr(operand, old_canonical, new_name)),
+        },
+        Expr::Function { name, args } => Expr::Function {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| rewrite_sheet_name_in_expr(a, old_canonical, new_name))
+                .collect(),
+        },
+        Expr::Array(rows) => Expr::Array(
+            rows.iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| rewrite_sheet_name_in_expr(cell, old_canonical, new_name))
+                        .collect()
+                })
+                .collect(),
+        ),
+        Expr::Spill(inner) => Expr::Spill(Box::new(rewrite_sheet_name_in_expr(
+            inner,
+            old_canonical,
+            new_name,
+        ))),
+    }
+}
+
+fn rewrite_sheet_ref(sheet: &SheetRef, old_canonical: &str, new_name: &Arc<str>) -> SheetRef {
+    match sheet {
+        SheetRef::Name(n) if n.eq_ignore_ascii_case(old_canonical) => {
+            SheetRef::Name(new_name.clone())
+        }
+        other => other.clone(),
+    }
+}
+
+fn rewrite_range_ref(r: &RangeRef, old_canonical: &str, new_name: &Arc<str>) -> RangeRef {
+    match r {
+        RangeRef::Cells {
+            sheet,
+            start_col,
+            start_row,
+            end_col,
+            end_row,
+            abs_start_col,
+            abs_start_row,
+            abs_end_col,
+            abs_end_row,
+        } => RangeRef::Cells {
+            sheet: rewrite_sheet_ref(sheet, old_canonical, new_name),
+            start_col: *start_col,
+            start_row: *start_row,
+            end_col: *end_col,
+            end_row: *end_row,
+            abs_start_col: *abs_start_col,
+            abs_start_row: *abs_start_row,
+            abs_end_col: *abs_end_col,
+            abs_end_row: *abs_end_row,
+        },
+        RangeRef::WholeColumn {
+            sheet,
+            start_col,
+            end_col,
+            abs_start,
+            abs_end,
+        } => RangeRef::WholeColumn {
+            sheet: rewrite_sheet_ref(sheet, old_canonical, new_name),
+            start_col: *start_col,
+            end_col: *end_col,
+            abs_start: *abs_start,
+            abs_end: *abs_end,
+        },
+        RangeRef::WholeRow {
+            sheet,
+            start_row,
+            end_row,
+            abs_start,
+            abs_end,
+        } => RangeRef::WholeRow {
+            sheet: rewrite_sheet_ref(sheet, old_canonical, new_name),
+            start_row: *start_row,
+            end_row: *end_row,
+            abs_start: *abs_start,
+            abs_end: *abs_end,
+        },
+    }
+}
+
 /// Address inside an `Expr`. `sheet: SheetRef::Current` means "the
 /// formula's containing sheet" (resolved during binding). Sheet-
 /// qualified refs (`Sheet1!A1`, `'Q3 2025'!A1`) populate
@@ -373,5 +490,131 @@ mod tests {
         assert_eq!(a, b);
         let c = Expr::Number(2.5);
         assert_ne!(a, c);
+    }
+
+    // W5-91 (Phase 4.6.C) — rewrite_sheet_name_in_expr coverage.
+
+    fn cell(sheet: SheetRef, col: u32, row: u32) -> Expr {
+        Expr::CellRef(CellAddr {
+            sheet,
+            col,
+            row,
+            abs_col: false,
+            abs_row: false,
+        })
+    }
+
+    #[test]
+    fn rewrite_renames_matching_cellref_sheet_name() {
+        let expr = cell(SheetRef::Name(Arc::from("OldSheet")), 0, 0);
+        let new_name: Arc<str> = Arc::from("NewSheet");
+        let out = rewrite_sheet_name_in_expr(&expr, "OLDSHEET", &new_name);
+        match out {
+            Expr::CellRef(addr) => match addr.sheet {
+                SheetRef::Name(n) => assert_eq!(&*n, "NewSheet"),
+                other => panic!("expected SheetRef::Name, got {other:?}"),
+            },
+            other => panic!("expected CellRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_skips_current_and_id_sheet_refs() {
+        // SheetRef::Current passes through untouched.
+        let expr = cell(SheetRef::Current, 0, 0);
+        let new_name: Arc<str> = Arc::from("New");
+        let out = rewrite_sheet_name_in_expr(&expr, "OLD", &new_name);
+        assert_eq!(out, expr);
+
+        // SheetRef::Id passes through untouched (rename hits AST by name,
+        // not by id — Id-bound refs survive across renames by design).
+        let expr_id = cell(SheetRef::Id(7), 0, 0);
+        let out_id = rewrite_sheet_name_in_expr(&expr_id, "OLD", &new_name);
+        assert_eq!(out_id, expr_id);
+    }
+
+    #[test]
+    fn rewrite_non_matching_name_passes_through() {
+        let expr = cell(SheetRef::Name(Arc::from("Other")), 0, 0);
+        let new_name: Arc<str> = Arc::from("New");
+        let out = rewrite_sheet_name_in_expr(&expr, "OLD", &new_name);
+        assert_eq!(out, expr);
+    }
+
+    #[test]
+    fn rewrite_recurses_into_binary_and_function() {
+        let lhs = cell(SheetRef::Name(Arc::from("Old")), 0, 0);
+        let rhs_inner = cell(SheetRef::Name(Arc::from("Old")), 1, 0);
+        let expr = Expr::Binary {
+            op: crate::token::Operator::Plus,
+            lhs: Box::new(lhs),
+            rhs: Box::new(Expr::Function {
+                name: Arc::from("SUM"),
+                args: vec![rhs_inner],
+            }),
+        };
+        let new_name: Arc<str> = Arc::from("Renamed");
+        let out = rewrite_sheet_name_in_expr(&expr, "OLD", &new_name);
+        match out {
+            Expr::Binary { lhs, rhs, .. } => {
+                match *lhs {
+                    Expr::CellRef(addr) => match addr.sheet {
+                        SheetRef::Name(n) => assert_eq!(&*n, "Renamed"),
+                        other => panic!("expected SheetRef::Name, got {other:?}"),
+                    },
+                    other => panic!("expected CellRef in lhs, got {other:?}"),
+                }
+                match *rhs {
+                    Expr::Function { args, .. } => match &args[0] {
+                        Expr::CellRef(addr) => match &addr.sheet {
+                            SheetRef::Name(n) => assert_eq!(&**n, "Renamed"),
+                            other => panic!("expected SheetRef::Name, got {other:?}"),
+                        },
+                        other => panic!("expected CellRef arg, got {other:?}"),
+                    },
+                    other => panic!("expected Function in rhs, got {other:?}"),
+                }
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_recurses_into_rangeref_cells() {
+        let rng = Expr::RangeRef(RangeRef::Cells {
+            sheet: SheetRef::Name(Arc::from("OldSheet")),
+            start_col: 0,
+            start_row: 0,
+            end_col: 2,
+            end_row: 4,
+            abs_start_col: false,
+            abs_start_row: false,
+            abs_end_col: false,
+            abs_end_row: false,
+        });
+        let new_name: Arc<str> = Arc::from("NewSheet");
+        let out = rewrite_sheet_name_in_expr(&rng, "OLDSHEET", &new_name);
+        match out {
+            Expr::RangeRef(RangeRef::Cells { sheet, .. }) => match sheet {
+                SheetRef::Name(n) => assert_eq!(&*n, "NewSheet"),
+                other => panic!("expected SheetRef::Name, got {other:?}"),
+            },
+            other => panic!("expected RangeRef::Cells, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_is_case_insensitive_on_match() {
+        // Stored ref is "oldsheet" lower; canonical comparison key is uppercase.
+        let expr = cell(SheetRef::Name(Arc::from("oldsheet")), 0, 0);
+        let new_name: Arc<str> = Arc::from("NewSheet");
+        let out = rewrite_sheet_name_in_expr(&expr, "OLDSHEET", &new_name);
+        match out {
+            Expr::CellRef(addr) => match addr.sheet {
+                SheetRef::Name(n) => assert_eq!(&*n, "NewSheet"),
+                other => panic!("expected SheetRef::Name, got {other:?}"),
+            },
+            other => panic!("expected CellRef, got {other:?}"),
+        }
     }
 }

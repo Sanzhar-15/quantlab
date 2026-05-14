@@ -351,6 +351,52 @@ impl Workbook {
         None
     }
 
+    /// **Phase 4.6.C (W5-91):** rename a sheet by id. Validates the new
+    /// name via [`validate_sheet_name`] (rejects empty, Excel-reserved
+    /// chars, canonical duplicates) and swaps the sheet's display name.
+    ///
+    /// **DOES NOT touch formula text.** Stored formulas in
+    /// `formula_cells` and `NamedTarget::Formula` entries continue to
+    /// reference the OLD sheet name. The runtime wrapper
+    /// `WorkbookRuntime::rename_sheet` (`ql-exec`) owns the
+    /// tokenization-aware text rewrite + op-log recording per the
+    /// parent design doc § 3.1. Direct callers of this method (loader,
+    /// tests, op-log replay) get bare name swap only.
+    ///
+    /// **Phase 4.6 design doc § 3 (Codex HIGH-1 closure):** the swap is
+    /// fast (O(1) on the sheet's `name` field); the expensive text
+    /// rewrite is the caller's responsibility and is bounded by the
+    /// workbook's total formula text size.
+    pub fn rename_sheet(
+        &mut self,
+        id: SheetId,
+        new_name: impl Into<String>,
+    ) -> Result<(), SheetNameError> {
+        let new_name: String = new_name.into();
+        // Validate first. If the new name canonically matches the CURRENT
+        // sheet name, that's a no-op rename (case-only change is allowed
+        // as a display update; duplicate check rejects all other matches).
+        let current_canonical = self
+            .sheet(id)
+            .map(|s| Self::canonical_sheet_name(s.name()))
+            .ok_or_else(|| SheetNameError::Duplicate {
+                name: format!("<sheet id {id} not found>"),
+            })?;
+        let new_canonical = Self::canonical_sheet_name(&new_name);
+        if new_canonical != current_canonical {
+            // Full validation only when canonical name actually changes.
+            self.validate_sheet_name(&new_name)?;
+        } else if new_name.is_empty() {
+            return Err(SheetNameError::Empty);
+        }
+        // Swap the name. `Sheet::set_name` is private; mutate through
+        // sheet_mut + a new accessor.
+        if let Some(sheet) = self.sheets.get_mut(id as usize) {
+            sheet.set_name(new_name);
+        }
+        Ok(())
+    }
+
     /// **Phase 4.6.AA (W5-86):** validate a sheet name for use with
     /// `add_sheet` / `rename_sheet`. Rejects:
     /// - empty string (Excel canon)
@@ -1060,5 +1106,61 @@ mod tests {
             wb.validate_sheet_name("?starts_with"),
             Err(SheetNameError::ReservedCharacter('?'))
         ));
+    }
+
+    // W5-91 (Phase 4.6.C) — rename_sheet coverage.
+
+    #[test]
+    fn rename_sheet_basic_swaps_name() {
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("Sheet1");
+        wb.rename_sheet(s0, "Renamed").unwrap();
+        assert_eq!(wb.sheet(s0).unwrap().name(), "Renamed");
+        assert_eq!(wb.sheet_id_by_name("Renamed"), Some(s0));
+        assert_eq!(wb.sheet_id_by_name("renamed"), Some(s0));
+        assert_eq!(wb.sheet_id_by_name("Sheet1"), None);
+    }
+
+    #[test]
+    fn rename_sheet_case_only_rename_allowed() {
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("Sheet1");
+        // Same canonical key ⇒ duplicate-check skipped, name still updates.
+        wb.rename_sheet(s0, "SHEET1").unwrap();
+        assert_eq!(wb.sheet(s0).unwrap().name(), "SHEET1");
+        assert_eq!(wb.sheet_id_by_name("sheet1"), Some(s0));
+    }
+
+    #[test]
+    fn rename_sheet_duplicate_target_rejected() {
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("Sheet1");
+        let _ = wb.add_sheet("Sheet2");
+        let err = wb.rename_sheet(s0, "sheet2").unwrap_err();
+        assert!(matches!(err, SheetNameError::Duplicate { .. }));
+        // Original name preserved on failure.
+        assert_eq!(wb.sheet(s0).unwrap().name(), "Sheet1");
+    }
+
+    #[test]
+    fn rename_sheet_empty_rejected() {
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("Sheet1");
+        assert!(matches!(
+            wb.rename_sheet(s0, ""),
+            Err(SheetNameError::Empty)
+        ));
+        assert_eq!(wb.sheet(s0).unwrap().name(), "Sheet1");
+    }
+
+    #[test]
+    fn rename_sheet_unknown_id_errors() {
+        let mut wb = Workbook::new();
+        let _ = wb.add_sheet("Sheet1");
+        // SheetId 7 doesn't exist — surfaces as Duplicate carrying a
+        // synthetic name. (The runtime layer surfaces InvalidSheet
+        // via its own pre-check before calling this.)
+        let err = wb.rename_sheet(7, "Other").unwrap_err();
+        assert!(matches!(err, SheetNameError::Duplicate { .. }));
     }
 }

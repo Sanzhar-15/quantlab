@@ -115,6 +115,37 @@ pub enum ReplayError {
     /// **W5-80.**
     #[error("replay set-cell-format references unregistered format id {id} at op index {index}")]
     FormatNotRegistered { index: usize, id: u32 },
+
+    /// **W5-91 (Phase 4.6.C):** `Op::RenameSheet` referenced a sheet
+    /// whose current name matches neither `old_name` nor `new_name`
+    /// (i.e. the replay state has diverged from what the op recorded).
+    /// Surfaces a clean error rather than silently renaming a different
+    /// sheet.
+    #[error(
+        "replay rename-sheet name mismatch at op index {index}: sheet {id} \
+         expected current name {expected:?}, found {found:?}"
+    )]
+    SheetRenameNameMismatch {
+        index: usize,
+        id: SheetId,
+        expected: String,
+        found: String,
+    },
+
+    /// **W5-91 (Phase 4.6.C):** `Workbook::rename_sheet` refused the
+    /// new name (duplicate, reserved character, empty).
+    #[error(
+        "replay rename-sheet rejected at op index {index}: sheet {id} \
+         from {old_name:?} to {new_name:?} ({source})"
+    )]
+    SheetRenameRejected {
+        index: usize,
+        id: SheetId,
+        old_name: String,
+        new_name: String,
+        #[source]
+        source: ql_storage::SheetNameError,
+    },
 }
 
 /// Wrapper around `ql_storage::FormatTableError` that owns its strings,
@@ -242,6 +273,53 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             // had room for the sheet.
             workbook.add_sheet_with_chunk_rows(name.clone(), *chunk_rows);
             Ok(())
+        }
+        Op::RenameSheet {
+            id,
+            old_name,
+            new_name,
+        } => {
+            // **W5-91 (Phase 4.6.C):** snapshot-vs-replay reconciliation
+            // per design § 3.3. Three cases:
+            //   1. Current sheet name == old_name → fresh rename; apply.
+            //   2. Current sheet name == new_name → already-renamed (likely
+            //      replay-on-top-of-snapshot where the snapshot captured
+            //      the post-rename state). No-op; success.
+            //   3. Current sheet name == neither → divergent state; treat as
+            //      InvalidSheet for the op-log's safety contract.
+            let current = workbook.sheet(*id).map(|s| s.name().to_owned()).ok_or(
+                ReplayError::InvalidSheet {
+                    index,
+                    sheet: *id,
+                    sheet_count: workbook.sheet_count(),
+                },
+            )?;
+            let canonical = |s: &str| ql_storage::Workbook::canonical_sheet_name(s);
+            let cur_c = canonical(&current);
+            let old_c = canonical(old_name);
+            let new_c = canonical(new_name);
+            if cur_c == new_c {
+                // Already renamed (snapshot-authoritative path). No-op.
+                Ok(())
+            } else if cur_c == old_c {
+                workbook
+                    .rename_sheet(*id, new_name.clone())
+                    .map_err(|source| ReplayError::SheetRenameRejected {
+                        index,
+                        id: *id,
+                        old_name: old_name.clone(),
+                        new_name: new_name.clone(),
+                        source,
+                    })?;
+                Ok(())
+            } else {
+                Err(ReplayError::SheetRenameNameMismatch {
+                    index,
+                    id: *id,
+                    expected: old_name.clone(),
+                    found: current,
+                })
+            }
         }
         Op::RegisterFormat { id, string } => {
             // **W5-80:** route through `FormatTable::register_at` so
@@ -763,6 +841,160 @@ mod tests {
         assert_eq!(
             wb.sheet(0).unwrap().format_overlay().get(0, 0),
             Some(ql_storage::FormatId(14))
+        );
+    }
+
+    // ===== W5-91 (Phase 4.6.C) Op::RenameSheet replay =====
+
+    #[test]
+    fn replay_rename_sheet_basic() {
+        // AddSheet + RenameSheet replays into a sheet with the new name.
+        let mut log = OpLog::new();
+        log.append(Op::AddSheet {
+            name: "Sheet1".to_owned(),
+            chunk_rows: 1024,
+        })
+        .unwrap();
+        log.append(Op::RenameSheet {
+            id: 0,
+            old_name: "Sheet1".to_owned(),
+            new_name: "Renamed".to_owned(),
+        })
+        .unwrap();
+
+        let mut wb = Workbook::new();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert_eq!(wb.sheet(0).unwrap().name(), "Renamed");
+    }
+
+    #[test]
+    fn replay_rename_sheet_already_renamed_is_noop() {
+        // Replay-on-top-of-snapshot path: snapshot already has the new
+        // name; replay must NOT error.
+        let mut log = OpLog::new();
+        log.append(Op::RenameSheet {
+            id: 0,
+            old_name: "Sheet1".to_owned(),
+            new_name: "Renamed".to_owned(),
+        })
+        .unwrap();
+
+        let mut wb = Workbook::new();
+        wb.add_sheet("Renamed"); // snapshot already at the new name
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert_eq!(wb.sheet(0).unwrap().name(), "Renamed");
+    }
+
+    #[test]
+    fn replay_rename_sheet_name_mismatch_errors() {
+        // Snapshot has a name that's neither old nor new ⇒ divergent state.
+        let mut log = OpLog::new();
+        log.append(Op::RenameSheet {
+            id: 0,
+            old_name: "Sheet1".to_owned(),
+            new_name: "Renamed".to_owned(),
+        })
+        .unwrap();
+
+        let mut wb = Workbook::new();
+        wb.add_sheet("Something Else");
+        let reg = default_registry();
+        let err = replay_into(&log, &mut wb, &reg).unwrap_err();
+        assert!(matches!(err, ReplayError::SheetRenameNameMismatch { .. }));
+    }
+
+    #[test]
+    fn replay_rename_sheet_invalid_id_errors() {
+        let mut log = OpLog::new();
+        log.append(Op::RenameSheet {
+            id: 7,
+            old_name: "Sheet1".to_owned(),
+            new_name: "Renamed".to_owned(),
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        let err = replay_into(&log, &mut wb, &reg).unwrap_err();
+        assert!(matches!(err, ReplayError::InvalidSheet { .. }));
+    }
+
+    #[test]
+    fn replay_rename_sheet_duplicate_target_errors() {
+        // Two sheets exist; renaming the first to the second's name must
+        // fail through SheetRenameRejected.
+        let mut log = OpLog::new();
+        log.append(Op::AddSheet {
+            name: "Sheet1".to_owned(),
+            chunk_rows: 1024,
+        })
+        .unwrap();
+        log.append(Op::AddSheet {
+            name: "Sheet2".to_owned(),
+            chunk_rows: 1024,
+        })
+        .unwrap();
+        log.append(Op::RenameSheet {
+            id: 0,
+            old_name: "Sheet1".to_owned(),
+            new_name: "Sheet2".to_owned(),
+        })
+        .unwrap();
+
+        let mut wb = Workbook::new();
+        let reg = default_registry();
+        let err = replay_into(&log, &mut wb, &reg).unwrap_err();
+        assert!(matches!(err, ReplayError::SheetRenameRejected { .. }));
+    }
+
+    #[test]
+    fn replay_rename_inside_batchcommit() {
+        // Producer pattern: rewrite-then-rename batched as a single
+        // BatchCommit. Verify the batch replays atomically.
+        let mut log = OpLog::new();
+        log.append(Op::AddSheet {
+            name: "S1".to_owned(),
+            chunk_rows: 1024,
+        })
+        .unwrap();
+        log.append(Op::AddSheet {
+            name: "S2".to_owned(),
+            chunk_rows: 1024,
+        })
+        .unwrap();
+        log.append(Op::PutFormula {
+            sheet: 1, // S2!A1
+            row: 0,
+            col: 0,
+            text: "S1!A1 + 1".to_owned(),
+        })
+        .unwrap();
+        log.append(Op::BatchCommit {
+            ops: vec![
+                Op::PutFormula {
+                    sheet: 1,
+                    row: 0,
+                    col: 0,
+                    text: "SX!A1 + 1".to_owned(),
+                },
+                Op::RenameSheet {
+                    id: 0,
+                    old_name: "S1".to_owned(),
+                    new_name: "SX".to_owned(),
+                },
+            ],
+        })
+        .unwrap();
+
+        let mut wb = Workbook::new();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert_eq!(wb.sheet(0).unwrap().name(), "SX");
+        assert_eq!(
+            wb.formula_at(1, 0, 0).map(|s| s.as_ref().to_owned()),
+            Some("SX!A1 + 1".to_owned())
         );
     }
 }

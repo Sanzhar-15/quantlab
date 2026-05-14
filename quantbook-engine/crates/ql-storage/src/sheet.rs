@@ -70,6 +70,15 @@ impl Sheet {
         &self.name
     }
 
+    /// **Phase 4.6.C (W5-91):** in-place display-name update. Validation
+    /// is the caller's responsibility (see `Workbook::rename_sheet` and
+    /// `Workbook::validate_sheet_name`). This method is low-level and
+    /// loader-only-friendly: it doesn't touch formula text, dependent
+    /// names, or any cache; the runtime wrapper owns those concerns.
+    pub fn set_name(&mut self, new_name: impl Into<String>) {
+        self.name = new_name.into();
+    }
+
     pub fn bounds(&self) -> Bounds {
         self.bounds
     }
