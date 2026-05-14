@@ -1983,12 +1983,12 @@ mod tests {
         assert_eq!(r, EvalResult::Scalar(Value::Error(ErrorValue::Calc)));
     }
 
-    /// `=SEQUENCE(0)` produces a degenerate ArrayValue. The cell-boundary
-    /// returns it as `EvalResult::Array` (degenerate); the runtime
-    /// writeback path later surfaces this as `#CALC!` per design § 8.1
-    /// step c. The boundary itself doesn't error.
+    /// `=SEQUENCE(0)` returns scalar `#NUM!` per design § 13.1
+    /// (W5-108 / Phase 4.7.O Codex M2 closure). Pre-fix returned a
+    /// degenerate ArrayValue which the writeback path mapped to
+    /// `#CALC!`; design says Excel canon is `#NUM!` for `rows < 1`.
     #[test]
-    fn eval_at_cell_boundary_sequence_zero_returns_degenerate_array() {
+    fn eval_at_cell_boundary_sequence_zero_returns_num_error() {
         let env = MapEnv::new();
         let registry = ql_functions::default_registry();
         let cache = NoAggregateCache;
@@ -1998,10 +1998,8 @@ mod tests {
         };
         let r = eval_at_cell_boundary(&plan, &env, &registry, &cache);
         match r {
-            EvalResult::Array(a) => {
-                assert!(a.is_degenerate());
-            }
-            EvalResult::Scalar(v) => panic!("expected degenerate Array, got Scalar({:?})", v),
+            EvalResult::Scalar(Value::Error(ErrorValue::Num)) => {}
+            other => panic!("expected Scalar(#NUM!), got {other:?}"),
         }
     }
 }

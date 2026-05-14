@@ -7959,16 +7959,18 @@ mod tests {
         assert_eq!(wb.read(ql_types::Address::new(0, 1, 2)), Value::Number(6.0));
     }
 
-    /// `=SEQUENCE(0)` → degenerate ArrayValue → write_spill surfaces
-    /// `#CALC!` at the anchor cell. Pins design § 8.1 step c.
+    /// `=SEQUENCE(0)` → scalar `#NUM!` per design § 13.1 (W5-108 /
+    /// Phase 4.7.O Codex M2 closure). Pre-fix returned a degenerate
+    /// ArrayValue which write_spill mapped to `#CALC!`; design says
+    /// Excel canon is `#NUM!` for `rows < 1`.
     #[test]
-    fn set_formula_sequence_zero_rows_produces_calc_error() {
+    fn set_formula_sequence_zero_rows_produces_num_error() {
         let mut wb = make_runtime_workbook();
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
         let v = rt.set_formula(0, 0, 0, "SEQUENCE(0)").unwrap();
         drop(rt);
-        assert_eq!(v, Value::Error(ErrorValue::Calc));
+        assert_eq!(v, Value::Error(ErrorValue::Num));
         assert_eq!(wb.spill_anchor_at(0, 0, 0), None);
     }
 
@@ -8520,8 +8522,12 @@ mod tests {
             "X1 starts aliased to B1"
         );
 
-        // Change A1 to 0 — SEQUENCE(0) is degenerate → B1 = #CALC!,
-        // spill dissolved.
+        // Change A1 to 0 — SEQUENCE(0) → #NUM! per design § 13.1
+        // (W5-108 / Phase 4.7.O Codex M2 closure). The recompute
+        // surfaces a scalar error at B1, the spill dissolves, and
+        // host dissolution still triggers the re-extraction we're
+        // pinning here. Whether B1 ends as #NUM! or #CALC! is
+        // orthogonal to this test's invariant.
         {
             let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
             rt.set_value(0, 0, 0, Value::Number(0.0)).unwrap();

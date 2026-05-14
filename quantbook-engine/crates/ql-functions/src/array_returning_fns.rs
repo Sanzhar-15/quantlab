@@ -149,10 +149,14 @@ pub fn sequence(args: &[FunctionArg], _ctx: &FunctionContext) -> FunctionReturn 
     let rows = rows_trunc as u32;
     let cols = cols_trunc as u32;
 
-    // Degenerate shape: return empty ArrayValue. The cell-boundary
-    // writeback path surfaces this as `#CALC!` (design § 8.1 step c).
+    // **W5-108 (Phase 4.7.O) — Codex MEDIUM-2 closure**: design
+    // § 13.1 specifies `SEQUENCE(0)` → `#NUM!` (and `cols < 1` → same).
+    // Pre-fix returned a degenerate ArrayValue that the cell-boundary
+    // mapped to `#CALC!`, a spec drift from Excel canon. Negativity
+    // is already caught pre-trunc (returns `#VALUE!`); the remaining
+    // zero-after-trunc case lands here.
     if rows == 0 || cols == 0 {
-        return FunctionReturn::Array(ArrayValue::empty(rows, cols));
+        return FunctionReturn::Scalar(Value::Error(ErrorValue::Num));
     }
 
     // Total cell count. Guard against rows*cols overflow even after
@@ -516,19 +520,22 @@ mod tests {
         assert_eq!(arr.cols(), 3);
     }
 
+    /// **W5-108 (Phase 4.7.O) — Codex M2 closure**: SEQUENCE(0) must
+    /// return scalar `#NUM!` per design § 13.1 ("if `rows < 1` →
+    /// `#NUM!`"). Pre-fix returned a degenerate ArrayValue that the
+    /// cell-boundary mapped to `#CALC!`, a spec drift from Excel
+    /// canon (`SEQUENCE(0)` is `#NUM!` in Excel).
     #[test]
-    fn sequence_zero_rows_returns_degenerate_array() {
-        // rows = 0 → ArrayValue::empty(0, 1) (degenerate).
-        let arr = expect_array(sequence(&[n(0.0)], &ctx()));
-        assert!(arr.is_degenerate());
-        assert_eq!(arr.rows(), 0);
-        assert_eq!(arr.cols(), 1);
+    fn sequence_zero_rows_returns_num_error() {
+        let e = expect_scalar_error(sequence(&[n(0.0)], &ctx()));
+        assert_eq!(e, ErrorValue::Num);
     }
 
+    /// Symmetric: `cols < 1` (after `rows >= 1` passes) → `#NUM!`.
     #[test]
-    fn sequence_zero_cols_returns_degenerate_array() {
-        let arr = expect_array(sequence(&[n(3.0), n(0.0)], &ctx()));
-        assert!(arr.is_degenerate());
+    fn sequence_zero_cols_returns_num_error() {
+        let e = expect_scalar_error(sequence(&[n(3.0), n(0.0)], &ctx()));
+        assert_eq!(e, ErrorValue::Num);
     }
 
     #[test]
