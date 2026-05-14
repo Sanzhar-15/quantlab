@@ -116,7 +116,24 @@ use thiserror::Error;
 /// so a v4 reader that somehow saw a v5 `NamedEntry` with `scope: Some`
 /// would deserialize but then mis-route the name to the workbook scope
 /// — the version gate prevents that path).
-pub const WORKBOOK_SCHEMA_VERSION: u32 = 5;
+///
+/// **W5-123 (Phase 4.8.L):** bumped to v6. v6 adds:
+///   - top-level `tables: Option<TablesSection>` — workbook-scoped
+///     table metadata (name, footprint, header/totals flags, ordered
+///     column roster with stable ids + display + canonical names +
+///     optional TotalsFunction). v1-v5 envelopes omit; loader treats
+///     `None` as "no tables registered."
+///
+/// **Compatibility (design § 10.3 + MEDIUM-7 closure):**
+///   - v6 reader loading v1-v5: tables field absent → empty TableTable.
+///   - v5 reader loading v6: refused via the existing
+///     `schema_version > WORKBOOK_SCHEMA_VERSION` check → loud
+///     `UnsupportedSchema`. Silently dropping table metadata would
+///     break formulas referencing `Sales[Qty]` after re-load (the
+///     formula would surface `BindError::UnknownTable` → `#NAME?`
+///     where pre-save it was a valid SUM).
+///   - v6 reader writing v5-compat: NOT supported in 4.8 (Phase 5+).
+pub const WORKBOOK_SCHEMA_VERSION: u32 = 6;
 
 /// The earliest schema version this reader still accepts. v1 fixtures (Phase 1)
 /// continue to load on v2 binaries; older versions would need explicit handling.
@@ -250,6 +267,15 @@ pub enum QbookError {
         #[source]
         source: ql_storage::SheetNameError,
     },
+
+    /// **W5-123 (Phase 4.8.L):** entry in the envelope's `[[tables]]`
+    /// section failed a structural invariant — unknown sheet id, zero
+    /// dims, columns length / cols mismatch, or any other shape error
+    /// that would leave `TableTable` inconsistent. A hand-edited or
+    /// corrupted v6 envelope surfaces here loudly rather than silently
+    /// producing a table that fails to bind formulas downstream.
+    #[error("malformed table {name:?}: {reason}")]
+    MalformedTable { name: String, reason: String },
 }
 
 /// TOML envelope for the workbook. Top-level metadata.
@@ -283,6 +309,13 @@ pub struct WorkbookEnvelope {
     /// as "no custom formats registered" and proceeds with defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub formats: Option<FormatsSection>,
+    /// **W5-123 (Phase 4.8.L):** workbook-scoped table metadata. v6
+    /// envelopes carry the section when at least one table is
+    /// registered; v1-v5 omit (and v6 omits an empty `TableTable` to
+    /// keep TOML minimal). Loader treats `None` as "no tables
+    /// registered."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tables: Option<TablesSection>,
 }
 
 /// **W5-71 (Phase 4.5.A.2):** wire representation of `ql_types::DateSystem`.
@@ -360,6 +393,112 @@ pub struct FormatOverlayEntry {
     pub row: u32,
     pub col: u32,
     pub id: u32,
+}
+
+/// **W5-123 (Phase 4.8.L):** workbook-scoped table metadata. Mirror of
+/// `ql_storage::TableTable` projected into serializable shapes. Each
+/// `TableEntry` preserves stable column ids across save/load (the
+/// loader bypasses `TableTable::allocate_column_id` and `insert`
+/// auto-bumps the allocator past the highest persisted id).
+///
+/// Entries are sorted ascending by canonical (uppercase) name on save
+/// for deterministic diffs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TablesSection {
+    pub entries: Vec<TableEntry>,
+}
+
+/// **W5-123 (Phase 4.8.L):** one entry in `TablesSection`. Mirrors
+/// `ql_storage::TableMetadata`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TableEntry {
+    /// Canonical (uppercase) name. The loader keys `TableTable` by this.
+    pub name: String,
+    /// Case-preserving display name (the form the user typed at create
+    /// time; printed by the formula printer).
+    pub display_name: String,
+    pub sheet: u16,
+    pub top_row: u32,
+    pub top_col: u32,
+    pub rows: u32,
+    pub cols: u32,
+    pub has_header: bool,
+    pub has_totals: bool,
+    pub columns: Vec<TableColumnEntry>,
+}
+
+/// **W5-123 (Phase 4.8.L):** one entry in `TableEntry::columns`.
+/// Mirrors `ql_storage::TableColumn`. `id` is the stable monotonic
+/// id allocated at create / resize time; preserving it across
+/// save/load is necessary so future Phase-5 column-move ops can
+/// reference columns by id rather than position.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TableColumnEntry {
+    pub id: u32,
+    /// Canonical (lowercase) name; used for case-insensitive `Table[Col]`
+    /// lookups via `TableMetadata::lookup_column`.
+    pub name: String,
+    /// Case-preserving display name (the form the user typed; printed
+    /// by `Sales[<display>]`).
+    pub display: String,
+    /// Per-column totals-row function (Phase 4.10 will materialize
+    /// auto-populated totals from this). Omitted on the wire when
+    /// `None` to keep TOML minimal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totals_function: Option<TotalsFunctionWire>,
+}
+
+/// **W5-123 (Phase 4.8.L):** wire representation of
+/// `ql_storage::TotalsFunction`. Serialized as a snake_case string in
+/// TOML for readability.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TotalsFunctionWire {
+    None,
+    Average,
+    Count,
+    CountNums,
+    Max,
+    Min,
+    StdDev,
+    Sum,
+    Variance,
+    Custom,
+}
+
+impl TotalsFunctionWire {
+    pub fn from_runtime(t: ql_storage::TotalsFunction) -> Self {
+        match t {
+            ql_storage::TotalsFunction::None => Self::None,
+            ql_storage::TotalsFunction::Average => Self::Average,
+            ql_storage::TotalsFunction::Count => Self::Count,
+            ql_storage::TotalsFunction::CountNums => Self::CountNums,
+            ql_storage::TotalsFunction::Max => Self::Max,
+            ql_storage::TotalsFunction::Min => Self::Min,
+            ql_storage::TotalsFunction::StdDev => Self::StdDev,
+            ql_storage::TotalsFunction::Sum => Self::Sum,
+            ql_storage::TotalsFunction::Variance => Self::Variance,
+            ql_storage::TotalsFunction::Custom => Self::Custom,
+        }
+    }
+
+    pub fn to_runtime(self) -> ql_storage::TotalsFunction {
+        match self {
+            Self::None => ql_storage::TotalsFunction::None,
+            Self::Average => ql_storage::TotalsFunction::Average,
+            Self::Count => ql_storage::TotalsFunction::Count,
+            Self::CountNums => ql_storage::TotalsFunction::CountNums,
+            Self::Max => ql_storage::TotalsFunction::Max,
+            Self::Min => ql_storage::TotalsFunction::Min,
+            Self::StdDev => ql_storage::TotalsFunction::StdDev,
+            Self::Sum => ql_storage::TotalsFunction::Sum,
+            Self::Variance => ql_storage::TotalsFunction::Variance,
+            Self::Custom => ql_storage::TotalsFunction::Custom,
+        }
+    }
 }
 
 /// Phase 2A.8: workbook-scope defined names. The on-disk wire format mirrors
@@ -1076,6 +1215,47 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
         }
     };
 
+    // **W5-123 (Phase 4.8.L):** serialize `TableTable` if non-empty.
+    // Sorted ascending by canonical (uppercase) name for deterministic
+    // diffs. Empty TableTable → `None` so v1-v5 readers don't see an
+    // unexpected `[[tables]]` block that they'd misinterpret (the
+    // schema-version gate already forces UnsupportedSchema for them,
+    // but omitting on empty also keeps v6 TOML minimal for the common
+    // "no tables yet" case).
+    let tables_section = {
+        let mut entries: Vec<TableEntry> = wb
+            .tables()
+            .iter()
+            .map(|(_canon, meta)| TableEntry {
+                name: meta.name.as_ref().to_owned(),
+                display_name: meta.display_name.as_ref().to_owned(),
+                sheet: meta.sheet,
+                top_row: meta.top_row,
+                top_col: meta.top_col,
+                rows: meta.rows,
+                cols: meta.cols,
+                has_header: meta.has_header,
+                has_totals: meta.has_totals,
+                columns: meta
+                    .columns
+                    .iter()
+                    .map(|c| TableColumnEntry {
+                        id: c.id,
+                        name: c.name.as_ref().to_owned(),
+                        display: c.display.as_ref().to_owned(),
+                        totals_function: c.totals_function.map(TotalsFunctionWire::from_runtime),
+                    })
+                    .collect(),
+            })
+            .collect();
+        if entries.is_empty() {
+            None
+        } else {
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            Some(TablesSection { entries })
+        }
+    };
+
     let envelope = WorkbookEnvelope {
         schema_version: WORKBOOK_SCHEMA_VERSION,
         name: name.to_owned(),
@@ -1085,6 +1265,8 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
         date_system: Some(DateSystemWire::from_runtime(wb.date_system())),
         // **W5-81 (Phase 4.5.D part 5):** persist custom format entries.
         formats: formats_section,
+        // **W5-123 (Phase 4.8.L):** persist workbook tables.
+        tables: tables_section,
     };
     let toml_str = toml::to_string_pretty(&envelope)?;
     fs::write(dir.join("workbook.toml"), toml_str)?;
@@ -1498,6 +1680,74 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                     })?;
                 }
             }
+        }
+    }
+
+    // **W5-123 (Phase 4.8.L):** hydrate `TableTable` from the envelope's
+    // `tables` section. v6+ envelopes carry the section; v1-v5 don't,
+    // so a `None` envelope tables field is the regression-neutral path
+    // (loader leaves `TableTable::default()`).
+    //
+    // Direct `tables_mut().insert(...)` bypasses `WorkbookRuntime::
+    // create_table` validation; that's the intentional loader pattern
+    // (matches how `Workbook::add_sheet` etc. are called bypassing
+    // op-log emission). Per design § 4.3 invariants 1-4 the persisted
+    // shape is already legal (it was validated at create / resize
+    // time on a prior session). We do enforce structural shape
+    // (non-zero dims, columns length matches cols, sheet id exists)
+    // so a corrupted / hand-edited TOML surfaces `MalformedTable`
+    // rather than panicking downstream.
+    if let Some(tables_section) = envelope.tables {
+        for entry in tables_section.entries {
+            if wb.sheet(entry.sheet).is_none() {
+                return Err(QbookError::MalformedTable {
+                    name: entry.name.clone(),
+                    reason: format!("references unknown sheet id {}", entry.sheet),
+                });
+            }
+            if entry.rows == 0 || entry.cols == 0 {
+                return Err(QbookError::MalformedTable {
+                    name: entry.name.clone(),
+                    reason: "table rows and cols must both be > 0".into(),
+                });
+            }
+            if entry.columns.len() != entry.cols as usize {
+                return Err(QbookError::MalformedTable {
+                    name: entry.name.clone(),
+                    reason: format!(
+                        "columns length {} does not match cols {}",
+                        entry.columns.len(),
+                        entry.cols
+                    ),
+                });
+            }
+            let canonical: std::sync::Arc<str> = std::sync::Arc::from(entry.name.as_str());
+            let columns: Vec<ql_storage::TableColumn> = entry
+                .columns
+                .into_iter()
+                .map(|c| ql_storage::TableColumn {
+                    id: c.id,
+                    name: std::sync::Arc::from(c.name.as_str()),
+                    display: std::sync::Arc::from(c.display.as_str()),
+                    totals_function: c.totals_function.map(TotalsFunctionWire::to_runtime),
+                })
+                .collect();
+            let meta = ql_storage::TableMetadata {
+                name: std::sync::Arc::clone(&canonical),
+                display_name: std::sync::Arc::from(entry.display_name.as_str()),
+                sheet: entry.sheet,
+                top_row: entry.top_row,
+                top_col: entry.top_col,
+                rows: entry.rows,
+                cols: entry.cols,
+                has_header: entry.has_header,
+                has_totals: entry.has_totals,
+                columns,
+            };
+            // `insert` auto-bumps `next_column_id` past any persisted
+            // column id (added in 4.8.L to keep the loader-side ids
+            // collision-free with future runtime allocations).
+            wb.tables_mut().insert(canonical, meta);
         }
     }
 
@@ -2961,13 +3211,16 @@ col_extent = 1
     /// **W5-92 (Phase 4.6.D):** updated from version 5 to version 6 after
     /// v5 became the current ship version (adding `NamedEntry.scope`
     /// for sheet-scoped names).
+    /// **W5-123 (Phase 4.8.L):** updated from version 6 to version 7
+    /// after v6 became the current ship version (adding workbook
+    /// `tables` section for TableTable persistence).
     #[test]
     fn future_schema_version_rejected() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("future.qbook");
         fs::create_dir_all(path.join("sheets")).unwrap();
         let toml = r#"
-schema_version = 6
+schema_version = 7
 name = "future"
 
 [[sheets]]
@@ -2982,7 +3235,7 @@ col_extent = 0
 
         let result = load_workbook(&path);
         assert!(
-            matches!(result, Err(QbookError::UnsupportedSchema { found: 6 })),
+            matches!(result, Err(QbookError::UnsupportedSchema { found: 7 })),
             "expected UnsupportedSchema, got {result:?}"
         );
     }
@@ -3124,9 +3377,10 @@ col_extent = 0
     // ===== W5-92 (Phase 4.6.D) sheet-scoped names + schema v5 =====
 
     #[test]
-    fn schema_version_constant_is_five() {
+    fn schema_version_constant_is_six() {
         // Sanity check so future bumps trip this test until the doc is updated.
-        assert_eq!(WORKBOOK_SCHEMA_VERSION, 5);
+        // W5-123 (Phase 4.8.L) bumped from 5 to 6.
+        assert_eq!(WORKBOOK_SCHEMA_VERSION, 6);
     }
 
     #[test]
@@ -3328,6 +3582,325 @@ sheets = [
         assert!(
             matches!(&result, Err(QbookError::MalformedSheet { .. })),
             "expected MalformedSheet, got {result:?}"
+        );
+    }
+
+    // ===== W5-123 (Phase 4.8.L) — schema v6 + TableTable persistence =====
+
+    fn wb_with_table(table_name: &str, columns: &[&str]) -> Workbook {
+        use ql_storage::{TableColumn, TableMetadata};
+        let mut wb = Workbook::new();
+        let sheet_id = wb.add_sheet("Data");
+        let canonical_lower: Vec<Arc<str>> = columns
+            .iter()
+            .map(|c| Arc::from(c.to_ascii_lowercase().as_str()))
+            .collect();
+        let display: Vec<Arc<str>> = columns.iter().map(|c| Arc::from(*c)).collect();
+        let cols: Vec<TableColumn> = canonical_lower
+            .iter()
+            .zip(display.iter())
+            .map(|(n, d)| TableColumn {
+                id: wb.tables_mut().allocate_column_id(),
+                name: Arc::clone(n),
+                display: Arc::clone(d),
+                totals_function: None,
+            })
+            .collect();
+        let canonical_upper: Arc<str> = Arc::from(table_name.to_ascii_uppercase().as_str());
+        let display_name: Arc<str> = Arc::from(table_name);
+        let meta = TableMetadata {
+            name: Arc::clone(&canonical_upper),
+            display_name,
+            sheet: sheet_id,
+            top_row: 0,
+            top_col: 0,
+            rows: 3,
+            cols: columns.len() as u32,
+            has_header: true,
+            has_totals: false,
+            columns: cols,
+        };
+        wb.tables_mut().insert(canonical_upper, meta);
+        wb
+    }
+
+    #[test]
+    fn roundtrip_with_single_table_preserves_metadata() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.qbook");
+        let wb = wb_with_table("Sales", &["Qty", "Price"]);
+        let pre_meta = wb.lookup_table("Sales").unwrap().clone();
+        save_workbook(&wb, "test", &path).unwrap();
+
+        let loaded = load_workbook(&path).unwrap();
+        let post = loaded.lookup_table("Sales").expect("table reloaded");
+        assert_eq!(post.name, pre_meta.name);
+        assert_eq!(post.display_name, pre_meta.display_name);
+        assert_eq!(post.sheet, pre_meta.sheet);
+        assert_eq!(post.top_row, pre_meta.top_row);
+        assert_eq!(post.top_col, pre_meta.top_col);
+        assert_eq!(post.rows, pre_meta.rows);
+        assert_eq!(post.cols, pre_meta.cols);
+        assert_eq!(post.has_header, pre_meta.has_header);
+        assert_eq!(post.has_totals, pre_meta.has_totals);
+        assert_eq!(post.columns.len(), pre_meta.columns.len());
+        for (a, b) in post.columns.iter().zip(pre_meta.columns.iter()) {
+            assert_eq!(a.id, b.id, "column ids must survive verbatim");
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.display, b.display);
+            assert_eq!(a.totals_function, b.totals_function);
+        }
+    }
+
+    #[test]
+    fn roundtrip_with_multiple_tables_preserves_each() {
+        use ql_storage::{TableColumn, TableMetadata};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.qbook");
+        let mut wb = Workbook::new();
+        let sheet_id = wb.add_sheet("Sheet1");
+        // Two tables on the same sheet at non-overlapping locations.
+        for (name, top_row) in &[("Sales", 0u32), ("Orders", 10u32)] {
+            let id = wb.tables_mut().allocate_column_id();
+            let canonical: Arc<str> = Arc::from(name.to_ascii_uppercase().as_str());
+            wb.tables_mut().insert(
+                Arc::clone(&canonical),
+                TableMetadata {
+                    name: Arc::clone(&canonical),
+                    display_name: Arc::from(*name),
+                    sheet: sheet_id,
+                    top_row: *top_row,
+                    top_col: 0,
+                    rows: 3,
+                    cols: 1,
+                    has_header: true,
+                    has_totals: false,
+                    columns: vec![TableColumn {
+                        id,
+                        name: Arc::from("qty"),
+                        display: Arc::from("Qty"),
+                        totals_function: None,
+                    }],
+                },
+            );
+        }
+        save_workbook(&wb, "test", &path).unwrap();
+        let loaded = load_workbook(&path).unwrap();
+        assert!(loaded.lookup_table("Sales").is_some());
+        assert!(loaded.lookup_table("Orders").is_some());
+        assert_eq!(loaded.lookup_table("Sales").unwrap().top_row, 0);
+        assert_eq!(loaded.lookup_table("Orders").unwrap().top_row, 10);
+    }
+
+    #[test]
+    fn roundtrip_with_totals_function_preserves_each_variant() {
+        use ql_storage::{TableColumn, TableMetadata, TotalsFunction};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.qbook");
+        let mut wb = Workbook::new();
+        let sheet_id = wb.add_sheet("Sheet1");
+        let variants = [
+            TotalsFunction::None,
+            TotalsFunction::Average,
+            TotalsFunction::Count,
+            TotalsFunction::CountNums,
+            TotalsFunction::Max,
+            TotalsFunction::Min,
+            TotalsFunction::StdDev,
+            TotalsFunction::Sum,
+            TotalsFunction::Variance,
+            TotalsFunction::Custom,
+        ];
+        let columns: Vec<TableColumn> = variants
+            .iter()
+            .enumerate()
+            .map(|(i, t)| TableColumn {
+                id: wb.tables_mut().allocate_column_id(),
+                name: Arc::from(format!("c{i}").as_str()),
+                display: Arc::from(format!("C{i}").as_str()),
+                totals_function: Some(*t),
+            })
+            .collect();
+        let canonical: Arc<str> = Arc::from("ALLTOTALS");
+        wb.tables_mut().insert(
+            Arc::clone(&canonical),
+            TableMetadata {
+                name: Arc::clone(&canonical),
+                display_name: Arc::from("AllTotals"),
+                sheet: sheet_id,
+                top_row: 0,
+                top_col: 0,
+                rows: 3,
+                cols: variants.len() as u32,
+                has_header: true,
+                has_totals: true,
+                columns,
+            },
+        );
+        save_workbook(&wb, "test", &path).unwrap();
+        let loaded = load_workbook(&path).unwrap();
+        let meta = loaded.lookup_table("AllTotals").unwrap();
+        for (i, v) in variants.iter().enumerate() {
+            assert_eq!(
+                meta.columns[i].totals_function,
+                Some(*v),
+                "totals_function for column {i} must round-trip"
+            );
+        }
+    }
+
+    // (Cross-crate end-to-end test "table + formula + recompute_all
+    // after load" lives in `crates/ql-exec/tests/load_workbook_e2e.rs`
+    // — it needs `WorkbookRuntime` + `default_registry`, which would
+    // require ql-io to dev-depend on ql-exec / ql-functions and create
+    // a dev-circular-dep here.)
+
+    #[test]
+    fn roundtrip_no_tables_omits_section_from_toml() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.qbook");
+        let wb = wb_with("Sheet1", &[]);
+        save_workbook(&wb, "test", &path).unwrap();
+        let toml_str = fs::read_to_string(path.join("workbook.toml")).unwrap();
+        assert!(
+            !toml_str.contains("[[tables.entries]]") && !toml_str.contains("[tables]"),
+            "empty TableTable must not emit a [[tables.entries]] block; got:\n{toml_str}"
+        );
+    }
+
+    #[test]
+    fn v5_envelope_loads_into_v6_with_empty_tables() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v5.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = r#"
+schema_version = 5
+name = "v5_compat"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "Sheet1", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let loaded = load_workbook(&path).unwrap();
+        assert_eq!(loaded.sheet_count(), 1);
+        assert!(loaded.tables().is_empty(), "v5 file → empty TableTable");
+    }
+
+    // (Forward-compat "v7 loud-fails on v6 reader" is covered by the
+    // pre-existing `future_schema_version_rejected` test above — once
+    // 4.8.L bumped to v6, that test was already updated to use v7.)
+
+    #[test]
+    fn malformed_table_unknown_sheet_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        // Build a v6 envelope with a table on a sheet that doesn't
+        // exist in the sheets array.
+        let toml = r#"
+schema_version = 6
+name = "bad"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "Sheet1", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+
+[[tables.entries]]
+name = "PHANTOM"
+display_name = "Phantom"
+sheet = 99
+top_row = 0
+top_col = 0
+rows = 3
+cols = 1
+has_header = true
+has_totals = false
+
+[[tables.entries.columns]]
+id = 0
+name = "qty"
+display = "Qty"
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let err = load_workbook(&path).unwrap_err();
+        assert!(
+            matches!(err, QbookError::MalformedTable { ref name, .. } if name == "PHANTOM"),
+            "expected MalformedTable for PHANTOM, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_table_columns_length_mismatch_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = r#"
+schema_version = 6
+name = "bad"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "Sheet1", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+
+[[tables.entries]]
+name = "SALES"
+display_name = "Sales"
+sheet = 0
+top_row = 0
+top_col = 0
+rows = 3
+cols = 2
+has_header = true
+has_totals = false
+
+[[tables.entries.columns]]
+id = 0
+name = "qty"
+display = "Qty"
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let err = load_workbook(&path).unwrap_err();
+        assert!(
+            matches!(err, QbookError::MalformedTable { ref reason, .. } if reason.contains("columns length")),
+            "expected MalformedTable about columns length, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_table_zero_dims_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = r#"
+schema_version = 6
+name = "bad"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "Sheet1", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+
+[[tables.entries]]
+name = "EMPTY"
+display_name = "Empty"
+sheet = 0
+top_row = 0
+top_col = 0
+rows = 0
+cols = 0
+has_header = false
+has_totals = false
+columns = []
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let err = load_workbook(&path).unwrap_err();
+        assert!(
+            matches!(err, QbookError::MalformedTable { ref reason, .. } if reason.contains("> 0")),
+            "expected MalformedTable about zero dims, got {err:?}"
         );
     }
 }

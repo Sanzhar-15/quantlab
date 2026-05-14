@@ -294,7 +294,16 @@ impl TableTable {
     ///   4.8.H.
     ///
     /// Bumps the generation counter on success.
+    ///
+    /// **W5-123 (Phase 4.8.L):** also auto-bumps `next_column_id` past
+    /// the highest column id in `meta.columns`. The `.qbook` loader
+    /// (Phase 4.8.L persistence) preserves stable column ids verbatim;
+    /// without this self-maintenance the runtime allocator could
+    /// later hand out an id that collides with one already in storage.
     pub fn insert(&mut self, canonical: Arc<str>, meta: TableMetadata) {
+        if let Some(max_id) = meta.columns.iter().map(|c| c.id).max() {
+            self.next_column_id = self.next_column_id.max(max_id + 1);
+        }
         self.tables.insert(canonical, meta);
         self.generation = self.generation.wrapping_add(1);
     }
@@ -503,6 +512,105 @@ mod tests {
         assert_eq!(tt.allocate_column_id(), 0);
         assert_eq!(tt.allocate_column_id(), 1);
         assert_eq!(tt.allocate_column_id(), 2);
+    }
+
+    /// **W5-123 (Phase 4.8.L):** `insert` auto-bumps `next_column_id`
+    /// past any column id in the inserted metadata. Without this, the
+    /// `.qbook` loader (which preserves persisted column ids verbatim)
+    /// would let `allocate_column_id` later hand out an id that
+    /// collides with one already in storage.
+    #[test]
+    fn insert_bumps_next_column_id_past_loaded_ids() {
+        let mut tt = TableTable::new();
+        // Simulate loader inserting a table whose columns have ids
+        // [10, 20, 30] (allocated in a previous session).
+        let canonical: Arc<str> = Arc::from("LOADED");
+        tt.insert(
+            canonical,
+            TableMetadata {
+                name: Arc::from("LOADED"),
+                display_name: Arc::from("Loaded"),
+                sheet: 0,
+                top_row: 0,
+                top_col: 0,
+                rows: 2,
+                cols: 3,
+                has_header: true,
+                has_totals: false,
+                columns: vec![col(10, "A"), col(20, "B"), col(30, "C")],
+            },
+        );
+        // Next allocator call must return 31 (or higher), NEVER ≤ 30.
+        let next = tt.allocate_column_id();
+        assert_eq!(next, 31, "expected allocator to skip past id 30");
+    }
+
+    /// Two `insert` calls: the second table's column ids are LOWER than
+    /// the first's. The allocator must STAY at the higher water mark.
+    #[test]
+    fn insert_preserves_high_water_across_multiple_inserts() {
+        let mut tt = TableTable::new();
+        tt.insert(
+            Arc::from("A"),
+            TableMetadata {
+                name: Arc::from("A"),
+                display_name: Arc::from("A"),
+                sheet: 0,
+                top_row: 0,
+                top_col: 0,
+                rows: 1,
+                cols: 1,
+                has_header: false,
+                has_totals: false,
+                columns: vec![col(100, "X")],
+            },
+        );
+        tt.insert(
+            Arc::from("B"),
+            TableMetadata {
+                name: Arc::from("B"),
+                display_name: Arc::from("B"),
+                sheet: 0,
+                top_row: 0,
+                top_col: 5,
+                rows: 1,
+                cols: 1,
+                has_header: false,
+                has_totals: false,
+                columns: vec![col(5, "Y")],
+            },
+        );
+        assert_eq!(
+            tt.allocate_column_id(),
+            101,
+            "allocator must stay past highest seen (100)"
+        );
+    }
+
+    #[test]
+    fn insert_empty_columns_does_not_change_next_column_id() {
+        let mut tt = TableTable::new();
+        // Pre-bump to 5.
+        for _ in 0..5 {
+            let _ = tt.allocate_column_id();
+        }
+        tt.insert(
+            Arc::from("EMPTY"),
+            TableMetadata {
+                name: Arc::from("EMPTY"),
+                display_name: Arc::from("Empty"),
+                sheet: 0,
+                top_row: 0,
+                top_col: 0,
+                rows: 1,
+                cols: 0,
+                has_header: false,
+                has_totals: false,
+                columns: vec![],
+            },
+        );
+        // Should still hand out 5 next.
+        assert_eq!(tt.allocate_column_id(), 5);
     }
 
     #[test]

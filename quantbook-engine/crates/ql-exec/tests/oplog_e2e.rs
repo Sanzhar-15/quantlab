@@ -757,3 +757,56 @@ fn resize_table_op_log_replay_reconstructs_resize() {
         "post-replay SUM matches producer"
     );
 }
+
+/// **W5-123 (Phase 4.8.L) e2e:** create a workbook with a table +
+/// formula, save it to disk via `ql_io::save_workbook` (v6 schema),
+/// reload via `load_workbook_and_recompute`, verify the table
+/// metadata + formula text + post-load SUM all match the pre-save
+/// state. Pins the full v5→v6 persistence round-trip with a real
+/// `Table[Col]` formula.
+#[test]
+fn save_load_workbook_with_table_and_formula_roundtrips() {
+    use tempfile::TempDir;
+    let reg = default_registry();
+    let mut producer_wb = fresh_wb();
+    {
+        let mut rt = WorkbookRuntime::new(&mut producer_wb, &reg);
+        rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+            .unwrap();
+        rt.set_value(0, 1, 0, Value::Number(10.0)).unwrap();
+        rt.set_value(0, 2, 0, Value::Number(20.0)).unwrap();
+        let v = rt.set_formula(0, 5, 0, "SUM(Sales[Qty])").unwrap();
+        assert_eq!(v, Value::Number(30.0));
+    }
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("with_table.qbook");
+    ql_io::save_workbook(&producer_wb, "with-table", &path).unwrap();
+
+    let (reloaded, recompute) = ql_exec::load_workbook_and_recompute(&path, &reg).unwrap();
+    assert!(
+        recompute.is_complete(),
+        "load+recompute had failures: {:?}",
+        recompute
+    );
+    // Table metadata reloaded.
+    let meta = reloaded
+        .lookup_table("Sales")
+        .expect("table metadata reloaded");
+    assert_eq!(meta.rows, 3);
+    assert_eq!(meta.cols, 1);
+    assert!(meta.has_header);
+    assert!(meta.lookup_column("Qty").is_some());
+    // Formula text reloaded.
+    let text = reloaded
+        .formula_at(0, 5, 0)
+        .expect("formula reloaded")
+        .clone();
+    assert_eq!(text.as_ref(), "SUM(Sales[Qty])");
+    // Post-load recompute produces the same SUM as pre-save.
+    assert_eq!(
+        reloaded.read(Address::new(0, 5, 0)),
+        Value::Number(30.0),
+        "post-load SUM(Sales[Qty]) matches pre-save"
+    );
+}
