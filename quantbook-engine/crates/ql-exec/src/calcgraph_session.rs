@@ -480,9 +480,22 @@ impl CalcgraphSession {
         // (cell_to_formulas reverse index + graph.add_edge) handles
         // spill-target writes uniformly with regular cell writes.
         //
-        // Lazy + no new node types. Only readers of spill targets
-        // get the rerouted edge. Multiple targets of the same anchor
+        // No new node types. Multiple targets of the same anchor
         // collapse to one dep via the dedupe step that follows.
+        //
+        // Hot-path note: this loop runs one `spill_target_anchor`
+        // HashMap lookup PER cell-dep on EVERY `extract_and_register_deps`
+        // call, even when the workbook has zero spills. A future
+        // optimization could add a `Workbook::has_any_spills()` short-
+        // circuit; W5-102 keeps it unconditional for simplicity. (See
+        // W5-102 Codex audit LOW-3.)
+        //
+        // **Lifecycle gap (Codex W5-102 HIGH-1, design § 10.5):** this
+        // rewrite only fires for formulas bound AFTER the spill is
+        // registered. If a reader B1=A2 was bound BEFORE A1 spilled to
+        // A1:A3, its dep stays on (0,1,0) and won't get a graph edge
+        // to the anchor. The re-extraction trigger at spill registration
+        // is Phase 4.7.J's responsibility (writeback path).
         for cell in deps.cells.iter_mut() {
             if let Some(anchor) = workbook.spill_target_anchor(cell.0, cell.1, cell.2) {
                 *cell = anchor;
@@ -3083,11 +3096,15 @@ mod tests {
         );
     }
 
-    /// Two reader formulas, each pointing at a different cell in the
-    /// SAME spill rectangle, must both end up dependent on the anchor —
-    /// AND writing to the anchor must dirty both readers in one pass.
+    /// Two SEPARATE reader formulas, each pointing at a different cell
+    /// in the SAME spill rectangle, must both end up dependent on the
+    /// anchor — AND writing to the anchor must dirty both readers in
+    /// one pass. Tests the cell_to_formulas reverse-index keying.
+    /// (Per Codex W5-102 LOW-2: renamed to clarify this is two-readers,
+    /// not single-formula-two-targets — see
+    /// `producer_alias_single_formula_two_targets_collapse` for that.)
     #[test]
-    fn producer_alias_collapses_multi_target_deps_to_anchor() {
+    fn producer_alias_two_readers_one_anchor_both_dirty_together() {
         let mut wb = ql_storage::Workbook::new();
         // Anchor A1 with shape (3, 1) → A1, A2, A3 all part of spill.
         wb.register_spill((0, 0, 0), ql_storage::SpillShape::new(3, 1))
@@ -3167,6 +3184,96 @@ mod tests {
             deps.cells,
             vec![(0, 0, 0)],
             "A2+A2 must collapse to a single anchor dep after producer-alias rewrite + dedupe"
+        );
+    }
+
+    /// SINGLE formula referencing TWO different cells in the SAME spill
+    /// rectangle must collapse to one anchor dep — the dedupe pass
+    /// after producer-alias rewrite handles two distinct targets
+    /// rewriting to the same anchor. (Codex W5-102 LOW-2 addition.)
+    #[test]
+    fn producer_alias_single_formula_two_targets_collapse() {
+        use ql_formula_syntax::Operator;
+        let mut wb = ql_storage::Workbook::new();
+        wb.register_spill((0, 0, 0), ql_storage::SpillShape::new(3, 1))
+            .expect("register_spill must succeed");
+
+        let mut s = CalcgraphSession::new();
+        // B1 = A2 + A3 — two different targets of the same anchor A1.
+        let plan_b1 = ExprPlan::Binary {
+            op: Operator::Plus,
+            lhs: Box::new(ExprPlan::CellRef {
+                sheet: 0,
+                row: 1, // A2
+                col: 0,
+                abs_col: false,
+                abs_row: false,
+            }),
+            rhs: Box::new(ExprPlan::CellRef {
+                sheet: 0,
+                row: 2, // A3
+                col: 0,
+                abs_col: false,
+                abs_row: false,
+            }),
+        };
+        s.on_set_formula(0, 0, 1, &plan_b1, &wb);
+        let b1 = s.cell_node_for(0, 0, 1).unwrap();
+        let deps = s.formula_deps(b1).unwrap();
+        assert_eq!(
+            deps.cells,
+            vec![(0, 0, 0)],
+            "A2 and A3 both alias to A1; single formula must collapse to one anchor dep"
+        );
+    }
+
+    /// LOW-1 regression: bind B1 = A2 (alias to anchor A1 via spill),
+    /// then rebind B1 = Z1 (no alias). Writing the anchor must NOT
+    /// dirty B1 anymore. Proves remove_formula_deps correctly evicts
+    /// the rewritten anchor address from cell_to_formulas during
+    /// rebind. (Codex W5-102 LOW-1 closure.)
+    #[test]
+    fn producer_alias_rebind_to_non_alias_evicts_anchor_dep() {
+        let mut wb = ql_storage::Workbook::new();
+        wb.register_spill((0, 0, 0), ql_storage::SpillShape::new(2, 1))
+            .expect("register_spill must succeed");
+
+        let mut s = CalcgraphSession::new();
+        // v1: B1 = A2 (aliases to A1).
+        let plan_v1 = ExprPlan::CellRef {
+            sheet: 0,
+            row: 1, // A2
+            col: 0,
+            abs_col: false,
+            abs_row: false,
+        };
+        s.on_set_formula(0, 0, 1, &plan_v1, &wb);
+        let b1 = s.cell_node_for(0, 0, 1).unwrap();
+        assert_eq!(s.formula_deps(b1).unwrap().cells, vec![(0, 0, 0)]);
+
+        // v2: B1 = Z1 (cell far outside any spill).
+        let plan_v2 = ExprPlan::CellRef {
+            sheet: 0,
+            row: 0,
+            col: 25, // Z1
+            abs_col: false,
+            abs_row: false,
+        };
+        s.on_set_formula(0, 0, 1, &plan_v2, &wb);
+        assert_eq!(
+            s.formula_deps(b1).unwrap().cells,
+            vec![(0, 0, 25)],
+            "rebind must overwrite deps, dropping the prior anchor alias"
+        );
+
+        // Clear residue from the two on_set_formula calls.
+        s.take_dirty();
+        // Writing anchor A1 must NOT dirty B1 anymore — the prior
+        // alias dep was evicted.
+        s.on_set_value(0, 0, 0);
+        assert!(
+            !s.is_dirty(b1),
+            "evicted alias dep must not fire on anchor writes after rebind"
         );
     }
 
