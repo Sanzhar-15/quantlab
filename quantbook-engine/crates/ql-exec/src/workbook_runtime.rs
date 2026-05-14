@@ -901,14 +901,22 @@ impl<'a> WorkbookRuntime<'a> {
                 }
                 let r = row + dr;
                 let c = col + dc;
+                // `set_formula` validates `sheet < sheet_count()` at entry
+                // via `validate_cell`; single-threaded code with no Drop
+                // hooks means the sheet cannot disappear mid-function.
+                // Per CLAUDE.md "no fallbacks — errors must be visible"
+                // (megaudit MEDIUM-5 closure), surface this invariant
+                // explicitly via `expect` rather than `unwrap_or(Blank)`.
+                // A `None` here would mean an upstream bug; failing loud
+                // beats silently treating it as "cell empty" and letting
+                // a downstream `register_spill` panic hide the cause.
+                let sheet_ref = self
+                    .workbook
+                    .sheet(sheet)
+                    .expect("write_spill: sheet validated at set_formula entry");
                 let occupied = self.workbook.spill_anchor_at(sheet, r, c).is_some()
                     || self.workbook.formula_at(sheet, r, c).is_some()
-                    || self
-                        .workbook
-                        .sheet(sheet)
-                        .map(|s| s.read(r, c))
-                        .unwrap_or(Value::Blank)
-                        != Value::Blank;
+                    || sheet_ref.read(r, c) != Value::Blank;
                 if occupied {
                     let err = Value::Error(ErrorValue::Spill);
                     self.workbook.clear_user_at(sheet, row, col);
