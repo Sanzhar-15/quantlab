@@ -786,10 +786,9 @@ impl<'a> WorkbookRuntime<'a> {
         // host anchor would over-dirty on unrelated host changes and
         // miss future writes to the cell it actually references.
         //
-        // Skip the entire pass if no spill state changed anywhere.
-        let any_self_change = old_spill_shape.is_some() || new_spill_shape.is_some();
-        let any_host_change = dissolved_host.is_some();
-        if any_self_change {
+        // Skip the entire pass if no SELF spill state changed; the
+        // host-spill pass is gated separately on `dissolved_host`.
+        if old_spill_shape.is_some() || new_spill_shape.is_some() {
             self.reextract_spill_footprint_readers(
                 sheet,
                 row,
@@ -811,7 +810,6 @@ impl<'a> WorkbookRuntime<'a> {
                 None,
             );
         }
-        let _ = any_host_change; // already consumed via dissolved_host above
 
         Ok(anchor_value)
     }
@@ -846,49 +844,46 @@ impl<'a> WorkbookRuntime<'a> {
         // graph. The HashSet dedupes across the old+new union, AND
         // dedupes the anchor cell out (its own deps were handled by
         // on_set_formula above).
-        let reader_info: Vec<(ql_calcgraph::NodeId, SheetId, RowId, ColId, Arc<str>)> = {
+        let reader_info: Vec<(ql_calcgraph::NodeId, SheetId, Arc<str>)> = {
             let g = match self.graph.as_deref() {
                 Some(g) => g,
                 None => return, // No graph attached — nothing to re-extract.
             };
             use std::collections::HashSet;
-            let mut nodes: HashSet<ql_calcgraph::NodeId> = HashSet::new();
+            let mut seen: HashSet<ql_calcgraph::NodeId> = HashSet::new();
+            let mut result: Vec<(ql_calcgraph::NodeId, SheetId, Arc<str>)> = Vec::new();
             for shape in [old_shape, new_shape].into_iter().flatten() {
                 for node in
                     g.readers_in_rect(anchor_sheet, anchor_row, anchor_col, shape.rows, shape.cols)
                 {
-                    // Skip the anchor — its own deps were just (re-)bound
-                    // by on_set_formula.
-                    if let Some((s, r, c)) = g.cell_address_for(node) {
-                        if (s, r, c) == (anchor_sheet, anchor_row, anchor_col) {
-                            continue;
-                        }
-                        // Look up formula text from the workbook. A reader
-                        // without a formula text means cell_to_formulas
-                        // has a stale entry — defensive skip.
-                        if let Some(text) = self.workbook.formula_at(s, r, c) {
-                            nodes.insert(node);
-                            let _ = text; // collected below
-                        }
+                    if !seen.insert(node) {
+                        continue;
                     }
+                    // Skip the anchor — its own deps were just (re-)bound
+                    // by on_set_formula. Resolve address + formula text
+                    // in a single pass.
+                    let Some((s, r, c)) = g.cell_address_for(node) else {
+                        continue;
+                    };
+                    if (s, r, c) == (anchor_sheet, anchor_row, anchor_col) {
+                        continue;
+                    }
+                    // A reader without a formula text means
+                    // cell_to_formulas has a stale entry — defensive skip.
+                    let Some(text) = self.workbook.formula_at(s, r, c).cloned() else {
+                        continue;
+                    };
+                    result.push((node, s, text));
                 }
             }
-            // Resolve each node to (address, text).
-            nodes
-                .into_iter()
-                .filter_map(|node| {
-                    let (s, r, c) = g.cell_address_for(node)?;
-                    let text = self.workbook.formula_at(s, r, c).cloned()?;
-                    Some((node, s, r, c, text))
-                })
-                .collect()
+            result
         };
 
         // Step 2: re-bind + re-extract for each reader. The borrow of
         // `g` from step 1 is released; we now alternate immutable workbook
         // reads (inside the PlanCache miss closure) with mutable graph
         // mutations (reextract_deps).
-        for (node, reader_sheet, _r, _c, text) in reader_info {
+        for (node, reader_sheet, text) in reader_info {
             let name_gen = self.workbook.names().generation();
             let cache_key = PlanCacheKey {
                 text: Arc::clone(&text),
@@ -2220,6 +2215,15 @@ impl<'a> WorkbookRuntime<'a> {
             crate::scalar::eval_at_cell_boundary(plan.as_ref(), &env, self.registry, agg_cache)
         };
 
+        // **Note (Sonnet #128 LOW-1, deferred):** the Array arm here
+        // writes the anchor via `write_spill`; the caller (recompute_all
+        // / recompute_dirty) THEN also calls `put_computed_at(anchor,
+        // anchor_value)` — a no-op duplicate write. Cleanest fix needs
+        // a return-type refactor to differentiate Scalar vs Array
+        // outcomes so the caller's VEQ short-circuit (recompute_dirty)
+        // can still gate the Scalar write while skipping the Array
+        // write. Deferred; the duplicate is harmless (same value, same
+        // cell), and the Array case is rare today (static literals only).
         let anchor_value = match result {
             crate::eval_result::EvalResult::Scalar(v) => {
                 // If this cell was previously a spill anchor but now
@@ -2231,7 +2235,8 @@ impl<'a> WorkbookRuntime<'a> {
             }
             crate::eval_result::EvalResult::Array(array) => {
                 // Always clear prior spill before re-spilling
-                // (design § 8.3). write_spill assumes a clean anchor.
+                // (design § 8.3). write_spill assumes a clean anchor
+                // AND writes the anchor + every target cell itself.
                 self.workbook.clear_spill_if_present((sheet, row, col));
                 // Clone the formula text Arc so write_spill can
                 // put_formula it (idempotent — the formula is
