@@ -527,6 +527,14 @@ impl<'a> WorkbookRuntime<'a> {
         // self-block against its own old footprint.
         //
         // `clear_spill_if_present` is a no-op when no spill exists.
+        //
+        // **W5-103 (Phase 4.7.J.3 / Codex W5-102 MEDIUM-1):** capture
+        // the OLD footprint BEFORE we clear it so the calcgraph hook
+        // pass below can fire `on_set_value` for each cell that lost
+        // its previous spilled value. Otherwise pre-existing readers
+        // indexed under target cells (HIGH-1 problem) won't see that
+        // their dep cell is now Blank.
+        let old_spill_shape = self.workbook.spill_anchor_at(sheet, row, col).copied();
         self.workbook.clear_spill_if_present((sheet, row, col));
 
         // Evaluate at the cell boundary. Returns `EvalResult::Scalar`
@@ -572,7 +580,11 @@ impl<'a> WorkbookRuntime<'a> {
 
         // **Route by EvalResult variant.** Scalar takes the existing
         // single-cell write path; Array routes to spill writeback.
-        let anchor_value = match result {
+        // The Array path also returns the SHAPE of the spill on the
+        // happy path (None on degenerate/bounds/blocked outcomes) so
+        // the calcgraph hook pass below can fire `on_set_value` at
+        // each target cell.
+        let (anchor_value, new_spill_shape) = match result {
             EvalResult::Scalar(v) => {
                 // Existing scalar persistence path. Phase 3.5 (CORR-25):
                 // a formula's output goes to the COMPUTED overlay, not
@@ -582,7 +594,7 @@ impl<'a> WorkbookRuntime<'a> {
                 self.workbook.clear_user_at(sheet, row, col);
                 self.workbook.put_computed_at(sheet, row, col, v.clone());
                 self.workbook.put_formula(sheet, row, col, formula_text);
-                v
+                (v, None)
             }
             EvalResult::Array(array) => self.write_spill(sheet, row, col, array, formula_text),
         };
@@ -599,11 +611,53 @@ impl<'a> WorkbookRuntime<'a> {
             g.on_set_formula(sheet, row, col, plan.as_ref(), self.workbook);
         }
 
+        // **W5-103 (Phase 4.7.J.3 / Codex W5-102 MEDIUM-1):** fire
+        // `on_set_value` at every NON-ANCHOR cell in BOTH the OLD and
+        // NEW spill footprints. Anchor cell is covered by
+        // `on_set_formula` above (it calls `mark_dirty_from_cell_write`
+        // internally).
+        //
+        // Why both footprints?
+        //
+        // - NEW footprint: range-stripe deps over a target need to
+        //   dirty when the anchor recomputes. Producer-alias rewrite
+        //   (4.7.I) only handles `deps.cells`; range deps go through
+        //   the stripe index keyed at the target address. Firing
+        //   `on_set_value(target)` dirties stripe dependents.
+        //
+        // - OLD footprint: pre-existing readers indexed under the old
+        //   target cells (4.7.I HIGH-1: bound before the spill
+        //   registered) won't see their dep cell go Blank otherwise.
+        //   This is a partial workaround until 4.7.J.4 lands proper
+        //   re-extraction; for now, firing on_set_value at the OLD
+        //   targets at least dirties them so their next recompute
+        //   re-reads from the now-Blank target.
+        //
+        // Dedupe via HashSet — cells in BOTH old and new shapes only
+        // fire once.
+        if let Some(g) = self.graph.as_deref_mut() {
+            use std::collections::HashSet;
+            let mut affected: HashSet<(SheetId, RowId, ColId)> = HashSet::new();
+            for shape in [old_spill_shape, new_spill_shape].into_iter().flatten() {
+                for dr in 0..shape.rows {
+                    for dc in 0..shape.cols {
+                        if dr == 0 && dc == 0 {
+                            continue;
+                        }
+                        affected.insert((sheet, row + dr, col + dc));
+                    }
+                }
+            }
+            for (s, r, c) in affected {
+                g.on_set_value(s, r, c);
+            }
+        }
+
         Ok(anchor_value)
     }
 
-    /// **W5-103 (Phase 4.7.J.2)** — spill writeback path. Called from
-    /// `set_formula` when `eval_at_cell_boundary` returns
+    /// **W5-103 (Phase 4.7.J.2 / 4.7.J.3)** — spill writeback path.
+    /// Called from `set_formula` when `eval_at_cell_boundary` returns
     /// `EvalResult::Array`. Performs (per design § 8.1):
     ///
     /// 1. Degenerate check (`rows == 0 || cols == 0` → `#CALC!`).
@@ -615,9 +669,11 @@ impl<'a> WorkbookRuntime<'a> {
     /// Anchor cell ALWAYS gets a formula association (`put_formula`).
     /// Non-anchor targets are formula-less per design § 8.2.
     ///
-    /// **What about target-cell calcgraph invalidation?** That's Phase
-    /// 4.7.J.3 (Codex W5-102 MEDIUM-1). This sub-phase only handles
-    /// storage-layer writeback.
+    /// Returns `(anchor_value, Option<SpillShape>)`. `Some(shape)` only
+    /// on the happy path (step 4); degenerate/bounds/blocked outcomes
+    /// return `None` so the caller knows no new spill footprint exists.
+    /// The caller uses the shape to drive Phase 4.7.J.3's target-cell
+    /// calcgraph invalidation hook.
     fn write_spill(
         &mut self,
         sheet: SheetId,
@@ -625,7 +681,7 @@ impl<'a> WorkbookRuntime<'a> {
         col: ColId,
         array: ArrayValue,
         formula_text: Arc<str>,
-    ) -> Value {
+    ) -> (Value, Option<SpillShape>) {
         // Degenerate-array origin is a function-eval contract (e.g.
         // FILTER with all-false mask without if_empty). Surface as
         // #CALC!, NOT #SPILL!. Design § 8.1 step c.
@@ -634,7 +690,7 @@ impl<'a> WorkbookRuntime<'a> {
             self.workbook.clear_user_at(sheet, row, col);
             self.workbook.put_computed_at(sheet, row, col, err.clone());
             self.workbook.put_formula(sheet, row, col, formula_text);
-            return err;
+            return (err, None);
         }
 
         // Bounds check. `array.rows() / cols()` are `>= 1` (degenerate
@@ -652,7 +708,7 @@ impl<'a> WorkbookRuntime<'a> {
             self.workbook.clear_user_at(sheet, row, col);
             self.workbook.put_computed_at(sheet, row, col, err.clone());
             self.workbook.put_formula(sheet, row, col, formula_text);
-            return err;
+            return (err, None);
         }
 
         // Blocking check. For every NON-ANCHOR cell in the spill
@@ -681,7 +737,7 @@ impl<'a> WorkbookRuntime<'a> {
                     self.workbook.clear_user_at(sheet, row, col);
                     self.workbook.put_computed_at(sheet, row, col, err.clone());
                     self.workbook.put_formula(sheet, row, col, formula_text);
-                    return err;
+                    return (err, None);
                 }
             }
         }
@@ -714,7 +770,7 @@ impl<'a> WorkbookRuntime<'a> {
 
         // Excel's anchor return value = the (0,0) cell of the array.
         // Callers (formula bar UI, op-log replay) see this.
-        array.at(0, 0).clone()
+        (array.at(0, 0).clone(), Some(shape))
     }
 
     /// Set a cell to a literal value (no formula). Clears any existing formula
@@ -5860,6 +5916,154 @@ mod tests {
         drop(rt);
         assert_eq!(wb.spill_anchor_at(0, MAX_ROW, 0), None);
     }
+
+    // ===== W5-103 (Phase 4.7.J.3) — target-cell calcgraph invalidation =====
+
+    /// Phase 4.7.J.3 — happy path: writeback fires `on_set_value` once
+    /// per NON-ANCHOR target cell. A 1×3 spill at A1 fires for B1 and
+    /// C1, NOT for A1 (anchor is covered by on_set_formula's internal
+    /// `mark_dirty_from_cell_write`).
+    ///
+    /// Verified by hook counters: set_value fires twice (B1, C1) on
+    /// top of whatever set_value counter was at before the spill.
+    #[test]
+    fn set_formula_array_writeback_fires_on_set_value_for_each_target() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+        }
+        let counts = graph.hook_counts();
+        assert_eq!(
+            counts.set_value, 2,
+            "1x3 spill must fire on_set_value for B1 and C1 only (anchor excluded)"
+        );
+        assert_eq!(counts.set_formula, 1, "anchor's set_formula hook fired");
+    }
+
+    /// Phase 4.7.J.3 — 2x2 spill fires `on_set_value` three times
+    /// (A1=anchor, B1, A2, B2 — three non-anchor cells).
+    #[test]
+    fn set_formula_array_2x2_fires_three_on_set_value() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 0, "{1, 2; 3, 4}").unwrap();
+        }
+        let counts = graph.hook_counts();
+        assert_eq!(
+            counts.set_value, 3,
+            "2x2 spill: B1, A2, B2 → 3 non-anchor cells"
+        );
+    }
+
+    /// Phase 4.7.J.3 — pre-existing reader of an OLD target dirties
+    /// when the spill DISSOLVES (anchor changes from array to scalar).
+    /// This is the OLD-footprint case: clearing the spill at A1 must
+    /// fire `on_set_value` for A2, A3 so a B1=A2 reader notices that
+    /// A2 is now Blank and re-evaluates.
+    #[test]
+    fn set_formula_dissolving_spill_dirties_old_target_readers() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            // Spill A1:A1+3 horizontally.
+            rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+            // Reader at D1 = B1 (target of the spill).
+            rt.set_formula(0, 0, 3, "B1").unwrap();
+        }
+        // After the reader is bound, the spill is active. D1's dep
+        // got producer-aliased to A1 (4.7.I).
+        let pre_dissolve = graph.hook_counts().set_value;
+
+        // Now dissolve the spill by re-setting A1 to a scalar.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 0, "42").unwrap();
+        }
+        let post_dissolve = graph.hook_counts().set_value;
+        // The dissolution fires on_set_value for B1 and C1 (the OLD
+        // footprint's non-anchor cells). pre-existing readers indexed
+        // under those cells get dirtied via the cell-to-formulas
+        // reverse index.
+        assert_eq!(
+            post_dissolve - pre_dissolve,
+            2,
+            "dissolution must fire on_set_value for B1 and C1 (old footprint)"
+        );
+    }
+
+    /// Phase 4.7.J.3 — a re-spill of DIFFERENT shape fires
+    /// `on_set_value` for the UNION of old and new footprints
+    /// (excluding the anchor), each cell only ONCE. Tests the
+    /// HashSet-based dedupe.
+    #[test]
+    fn set_formula_array_reshape_fires_on_set_value_for_union() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            // First: 1x3 (A1, B1, C1).
+            rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+        }
+        let after_first = graph.hook_counts().set_value;
+
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            // Second: 3x1 (A1, A2, A3). Union with prior {A1,B1,C1}
+            // minus anchor = {B1, C1, A2, A3}. 4 cells.
+            rt.set_formula(0, 0, 0, "{4; 5; 6}").unwrap();
+        }
+        let after_second = graph.hook_counts().set_value;
+        assert_eq!(
+            after_second - after_first,
+            4,
+            "reshape from 1x3 to 3x1 fires on_set_value 4 times: union {{B1,C1,A2,A3}}"
+        );
+    }
+
+    /// Phase 4.7.J.3 — blocked spill DOES NOT fire `on_set_value` at
+    /// non-existent target cells (because no new footprint is
+    /// registered). The OLD footprint cells still fire if there was
+    /// a prior spill at this anchor.
+    #[test]
+    fn set_formula_blocked_spill_does_not_fire_target_hooks() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        // First put a user value at B1 to block the spill.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 1, Value::Number(5.0)).unwrap();
+        }
+        let baseline = graph.hook_counts().set_value;
+        // Now try to spill 1x2 from A1. Blocked.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            let v = rt.set_formula(0, 0, 0, "{1, 2}").unwrap();
+            assert_eq!(v, Value::Error(ErrorValue::Spill));
+        }
+        let after = graph.hook_counts().set_value;
+        assert_eq!(
+            after - baseline,
+            0,
+            "blocked spill must NOT fire on_set_value at B1 (no new footprint, no old footprint either)"
+        );
+    }
+
+    // ===== Phase 4.7.J.2 (continued) — clear-old idempotency =====
 
     /// Phase 4.7.J.2 — clear-old idempotency: setting the SAME array
     /// twice at the same anchor produces stable state (no infinite
