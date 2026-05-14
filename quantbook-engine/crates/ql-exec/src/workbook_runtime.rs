@@ -2161,6 +2161,17 @@ impl<'a> WorkbookRuntime<'a> {
                     } else {
                         let mut had_dirty_dep = false;
                         let mut had_changed_dep = false;
+                        // **Codex audit HIGH-1 closure**: VEQ-defeat for
+                        // producer-aliased deps. A dep that resolves to a
+                        // current spill ANCHOR may have target-value
+                        // changes that the VEQ "changed[anchor]" set
+                        // doesn't capture (anchor value can be invariant
+                        // while target values change — e.g.
+                        // SEQUENCE(3,1,1,A1)'s start=1 is fixed but
+                        // step depends on A1, so C2/C3 vary). Force
+                        // re-eval whenever a dep is a CURRENT spill
+                        // anchor and was dirty in some iteration.
+                        let mut had_aliased_dirty_dep = false;
                         for &(ds, dr, dc) in &deps.cells {
                             if let Some(dep_node) = session.cell_node_for(ds, dr, dc) {
                                 if originally_dirty.contains(&dep_node) {
@@ -2169,13 +2180,18 @@ impl<'a> WorkbookRuntime<'a> {
                                         had_changed_dep = true;
                                         break;
                                     }
+                                    if self.workbook.spill_anchor_at(ds, dr, dc).is_some() {
+                                        had_aliased_dirty_dep = true;
+                                    }
                                 }
                             }
                         }
-                        // Top-level dirty (no dep in dirty set) OR a
-                        // changed dirty-dep → re-eval. Pure-downstream
-                        // with no changed dep → skip.
-                        !had_dirty_dep || had_changed_dep
+                        // Re-eval if: top-level dirty (no dirty dep),
+                        // OR a dirty dep value-changed,
+                        // OR a dirty dep is a spill anchor (target
+                        //    values may have changed even if anchor
+                        //    value didn't).
+                        !had_dirty_dep || had_changed_dep || had_aliased_dirty_dep
                     }
                 } else {
                     // No tracked deps (e.g., `=1+1`). Treat as top-level.
@@ -2219,6 +2235,17 @@ impl<'a> WorkbookRuntime<'a> {
                         // footprints. Readers indexed under those cells
                         // get marked dirty; the fixed-point loop picks them
                         // up in a follow-up iteration.
+                        //
+                        // **Codex audit HIGH-1 closure**: ALSO fire
+                        // on_set_value(anchor) — `cell_to_formulas[anchor]`
+                        // holds readers producer-aliased to this spill
+                        // (4.7.I). They need to dirty even if the anchor's
+                        // OWN value is VEQ-unchanged, because TARGET values
+                        // may have changed (e.g. SEQUENCE(3,1,1,A1): anchor
+                        // value = start = 1 invariant, but C2/C3 vary with
+                        // A1). Over-conservative for direct readers of the
+                        // anchor (they'd re-eval to the same value and
+                        // VEQ-skip the write), but correct.
                         if old_spill_shape.is_some() || new_spill_shape.is_some() {
                             use std::collections::HashSet;
                             let mut affected: HashSet<(SheetId, RowId, ColId)> = HashSet::new();
@@ -2234,6 +2261,79 @@ impl<'a> WorkbookRuntime<'a> {
                             }
                             for (s, r, c) in affected {
                                 session.on_set_value(s, r, c);
+                            }
+                            // Anchor cell — dirties aliased readers.
+                            session.on_set_value(sheet, row, col);
+
+                            // **Codex audit HIGH-2 closure**: re-extract
+                            // readers in the (old, new) footprint. Mirrors
+                            // set_formula's 4.7.J.4 pattern. Required for
+                            // dissolution-via-recompute: aliased readers'
+                            // deps stay pointing at the dissolved anchor;
+                            // future writes to actually-read cells (e.g.
+                            // user typing into a now-free target) miss
+                            // the reader without re-extraction.
+                            //
+                            // Inlined (can't call self.reextract_spill_footprint_readers
+                            // because it accesses self.graph which is None
+                            // during recompute_dirty's session_slot window).
+                            let mut seen: HashSet<ql_calcgraph::NodeId> = HashSet::new();
+                            let mut readers: Vec<(ql_calcgraph::NodeId, SheetId, Arc<str>)> =
+                                Vec::new();
+                            for shape in [old_spill_shape, new_spill_shape].into_iter().flatten() {
+                                for n in
+                                    session.readers_in_rect(sheet, row, col, shape.rows, shape.cols)
+                                {
+                                    if !seen.insert(n) {
+                                        continue;
+                                    }
+                                    let Some((s, r, c)) = session.cell_address_for(n) else {
+                                        continue;
+                                    };
+                                    if (s, r, c) == (sheet, row, col) {
+                                        continue;
+                                    }
+                                    let Some(text) = self.workbook.formula_at(s, r, c).cloned()
+                                    else {
+                                        continue;
+                                    };
+                                    readers.push((n, s, text));
+                                }
+                            }
+                            for (rn, reader_sheet, reader_text) in readers {
+                                let name_gen = self.workbook.names().generation();
+                                let cache_key = PlanCacheKey {
+                                    text: Arc::clone(&reader_text),
+                                    sheet: reader_sheet,
+                                    name_gen,
+                                };
+                                let workbook: &Workbook = self.workbook;
+                                let plan: Arc<crate::plan::ExprPlan> =
+                                    match self.plan_cache.get_or_insert::<_, RuntimeError>(
+                                        cache_key,
+                                        || {
+                                            let tokens = lex(reader_text.as_ref())?;
+                                            let expr = parse(tokens)?;
+                                            Ok(bind_with_names_and_sheets(
+                                                &expr,
+                                                reader_sheet,
+                                                workbook,
+                                                workbook,
+                                            )?)
+                                        },
+                                    ) {
+                                        Ok(p) => p,
+                                        Err(_) => {
+                                            // No-fallbacks rule: bind failure
+                                            // here mirrors set_formula path's
+                                            // mark_dirty handling — surface at
+                                            // reader's own recompute next time.
+                                            session.mark_dirty(rn);
+                                            continue;
+                                        }
+                                    };
+                                session.reextract_deps(rn, plan.as_ref(), self.workbook);
+                                session.mark_dirty(rn);
                             }
                         }
                         succeeded += 1;
@@ -7854,6 +7954,111 @@ mod tests {
         assert_eq!(wb.read(ql_types::Address::new(0, 2, 1)), Value::Blank);
         assert_eq!(wb.read(ql_types::Address::new(0, 3, 1)), Value::Blank);
         assert_eq!(wb.read(ql_types::Address::new(0, 4, 1)), Value::Blank);
+    }
+
+    /// **Codex audit HIGH-1**: aliased readers don't re-eval when
+    /// target values change but anchor value is unchanged.
+    /// C1=SEQUENCE(3,1,1,A1), D1=C3. The anchor's value (start=1) is
+    /// invariant across A1 changes; only C2 and C3 change.
+    /// D1 is producer-aliased to C1 (4.7.I); D1 indexed at C1's
+    /// address. Without the fix, recompute_dirty leaves D1 stale.
+    ///
+    /// Closed by: hook pass ALSO fires on_set_value at the anchor
+    /// cell, so aliased readers (cell_to_formulas[anchor]) get dirtied.
+    #[test]
+    fn recompute_dirty_aliased_reader_sees_target_value_change_when_anchor_unchanged() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(1.0)).unwrap(); // A1 = 1
+                                                                // C1 = SEQUENCE(3, 1, 1, A1) → spill at C1 with step = A1.
+                                                                // C1 = 1, C2 = 1+A1, C3 = 1+2*A1.
+            rt.set_formula(0, 0, 2, "SEQUENCE(3, 1, 1, A1)").unwrap();
+            // D1 = C3 — aliased to C1 via producer-alias rewrite.
+            rt.set_formula(0, 0, 3, "C3").unwrap();
+        }
+        // Initial: A1=1, so C3=1+2*1=3. D1=3.
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 3)), Value::Number(3.0));
+
+        // Change A1 to 2. SEQUENCE result: C1=1 (unchanged!), C2=3, C3=5.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(2.0)).unwrap();
+            let result = rt.recompute_dirty().expect("graph attached");
+            assert!(result.is_complete(), "recompute failures: {result:?}");
+        }
+        // C1's anchor value is still 1.
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Number(1.0));
+        // C3's value changed.
+        assert_eq!(wb.read(ql_types::Address::new(0, 2, 2)), Value::Number(5.0));
+        // D1 = C3 should reflect the new C3 = 5.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 3)),
+            Value::Number(5.0),
+            "D1 must reflect C3's new value even though C1 anchor is unchanged"
+        );
+    }
+
+    /// **Codex audit HIGH-2**: after recompute-time spill dissolution,
+    /// aliased readers don't get re-extracted. Subsequent user writes
+    /// to the (now-free) target cells don't dirty the readers.
+    ///
+    /// A1=3, B1=SEQUENCE(A1) (spill B1..B3). X1=B2 (aliased to B1).
+    /// A1=0 → B1=#CALC!, spill dissolved.
+    /// User set_value(B2, 99). X1 should see B2=99.
+    ///
+    /// Closed by: recompute_dirty calls reextract_spill_footprint_readers
+    /// for the (old, new) footprints, mirroring set_formula 4.7.J.4.
+    #[test]
+    fn recompute_dirty_dissolution_reextracts_aliased_readers() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(3.0)).unwrap();
+            rt.set_formula(0, 0, 1, "SEQUENCE(A1)").unwrap();
+            rt.set_formula(0, 0, 4, "B2").unwrap(); // X1 = B2, aliased to B1.
+        }
+        let x1 = graph.cell_node_for(0, 0, 4).unwrap();
+        assert_eq!(
+            graph.formula_deps(x1).unwrap().cells,
+            vec![(0, 0, 1)],
+            "X1 starts aliased to B1"
+        );
+
+        // Change A1 to 0 — SEQUENCE(0) is degenerate → B1 = #CALC!,
+        // spill dissolved.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(0.0)).unwrap();
+            let result = rt.recompute_dirty().expect("graph attached");
+            assert!(result.is_complete(), "recompute failures: {result:?}");
+        }
+        // X1's dep must be RE-EXTRACTED to literal B2 after the
+        // host dissolution.
+        assert_eq!(
+            graph.formula_deps(x1).unwrap().cells,
+            vec![(0, 1, 1)],
+            "X1's dep re-extracted to literal B2 after spill dissolves"
+        );
+
+        // Canonical test: user writes B2 = 99. X1 should see it.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 1, 1, Value::Number(99.0)).unwrap();
+            let result = rt.recompute_dirty().expect("graph attached");
+            assert!(result.is_complete(), "recompute failures: {result:?}");
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 4)),
+            Value::Number(99.0),
+            "X1 must see B2's user write after dissolution + re-extract"
+        );
     }
 
     /// **#136 closure**: A1 = 3, B1 = SEQUENCE(A1) (spills B1..B3),
