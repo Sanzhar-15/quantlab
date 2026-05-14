@@ -666,7 +666,7 @@ Excel 365+ dynamic arrays canonicalize "array in non-array context → spill or 
 
 ### 14.6 Re-extraction on spill shape change
 
-Per § 10.5: invalidate ALL readers transitively when a spill anchor's footprint changes. Big hammer at edit rate; acceptable per the existing W5-91 rename invalidation pattern. Per-spill reverse mapping deferred.
+Per § 10.5 (post-W5-108 / Phase 4.7.O closure update): targeted re-extraction via `Graph::readers_in_rect`. The original draft proposed an "invalidate ALL readers transitively" big hammer; the shipped 4.7.J HIGH-1 closure went directly to the targeted reverse-map variant. See § 10.5 for the precise decision text.
 
 ### 14.7 Pre-W5-105 (Phase 4.7.L) saved files
 
