@@ -253,6 +253,15 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
     ("CONCAT", "W5-61 polish; 32K cap pinned"),
     // AI / future
     ("AI", "sentinel returns #AI_NOT_AVAILABLE_V1; phase 6.6"),
+    // Phase 4.7.M (W5-106): first array-returning function via the
+    // Unified ABI. Coverage matrix doesn't apply (arg-coverage is per-arg
+    // numeric; the array-return shape is exercised end-to-end in
+    // ql-exec set_formula + eval_at_cell_boundary tests).
+    (
+        "SEQUENCE",
+        "array-returning fn — covered by ql-exec spill tests, not the \
+         scalar arg-coverage matrix",
+    ),
 ];
 
 #[test]

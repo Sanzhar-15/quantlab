@@ -578,6 +578,12 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_range_aware("MODE", range_fns::mode);
     r.register_range_aware("MODE.SNGL", range_fns::mode); // Modern Excel alias
 
+    // **W5-106 (Phase 4.7.M)**: first array-returning function tier.
+    // Returns FunctionReturn::Array at the cell boundary → spills via
+    // `WorkbookRuntime::set_formula` / `recompute_all` write_spill path
+    // (Phase 4.7.J #128 closure).
+    r.register_unified("SEQUENCE", crate::array_returning_fns::sequence);
+
     r
 }
 
@@ -622,8 +628,9 @@ mod tests {
         // WORKDAY, YEARFRAC = 4 — CLOSES V1 wave 18/18) + Phase 4.5.C
         // V2 wave (W5-75: DATEDIF, DAYS360, WEEKNUM, ISOWEEKNUM = 4
         // of 6; NETWORKDAYS.INTL + WORKDAY.INTL deferred to tier-4) +
-        // Phase 4.5.E (W5-83: TEXT = 1).
-        assert_eq!(r.len(), 130);
+        // Phase 4.5.E (W5-83: TEXT = 1) +
+        // Phase 4.7.M (W5-106: SEQUENCE = 1, first array-returning fn).
+        assert_eq!(r.len(), 131);
     }
 
     #[test]

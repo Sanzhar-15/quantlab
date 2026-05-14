@@ -7647,4 +7647,99 @@ mod tests {
             other => panic!("expected BatchCommit, got {other:?}"),
         }
     }
+
+    // ===== W5-106 (Phase 4.7.M) — SEQUENCE through set_formula =====
+
+    /// `=SEQUENCE(3)` at A1 spills 3×1 vertically (A1, A2, A3).
+    #[test]
+    fn set_formula_sequence_rows_only_spills_vertically() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 0, "SEQUENCE(3)").unwrap();
+        drop(rt);
+
+        assert_eq!(v, Value::Number(1.0), "anchor return value");
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(3, 1))
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Number(1.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 0)), Value::Number(2.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 2, 0)), Value::Number(3.0));
+    }
+
+    /// `=SEQUENCE(2, 3)` at A1 spills 2×3 (A1..C2).
+    #[test]
+    fn set_formula_sequence_rows_cols_spills_2d() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "SEQUENCE(2, 3)").unwrap();
+        drop(rt);
+
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(2, 3))
+        );
+        // Row 0: 1, 2, 3.
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Number(1.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(2.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Number(3.0));
+        // Row 1: 4, 5, 6.
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 0)), Value::Number(4.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 1)), Value::Number(5.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 2)), Value::Number(6.0));
+    }
+
+    /// `=SEQUENCE(0)` → degenerate ArrayValue → write_spill surfaces
+    /// `#CALC!` at the anchor cell. Pins design § 8.1 step c.
+    #[test]
+    fn set_formula_sequence_zero_rows_produces_calc_error() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 0, "SEQUENCE(0)").unwrap();
+        drop(rt);
+        assert_eq!(v, Value::Error(ErrorValue::Calc));
+        assert_eq!(wb.spill_anchor_at(0, 0, 0), None);
+    }
+
+    /// `=SEQUENCE(3)` after replay + recompute_all re-derives the spill.
+    /// This is THE 4.7.J #128 acceptance — recompute_all dispatches
+    /// the SEQUENCE function as Array.
+    #[test]
+    fn recompute_all_materializes_sequence_spill() {
+        let mut wb = make_runtime_workbook();
+        wb.put_formula(0, 0, 0, "SEQUENCE(3)");
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let result = rt.recompute_all();
+        drop(rt);
+
+        assert_eq!(result.attempted, 1);
+        assert_eq!(result.succeeded, 1);
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(3, 1))
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Number(1.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 0)), Value::Number(2.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 2, 0)), Value::Number(3.0));
+    }
+
+    /// `=SEQUENCE(3) + 1` (scalar context, not at cell boundary) → #CALC!
+    /// The outer `+ 1` makes SEQUENCE evaluate in scalar-sub-expression
+    /// context; the FunctionReturn::Array routes to #CALC! per design
+    /// § 6.3. End-to-end through set_formula.
+    #[test]
+    fn set_formula_sequence_inside_binary_op_produces_calc_error() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 0, "SEQUENCE(3) + 1").unwrap();
+        drop(rt);
+        assert_eq!(v, Value::Error(ErrorValue::Calc));
+        assert_eq!(wb.spill_anchor_at(0, 0, 0), None);
+    }
 }

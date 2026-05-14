@@ -459,6 +459,71 @@ pub fn eval_at_cell_boundary<E: CellEnv>(
             );
             EvalResult::Array(array)
         }
+        // **W5-106 (Phase 4.7.M)**: top-level array-returning function
+        // call. If the plan is `ExprPlan::Function` AND the registered
+        // function is a Unified-tier callable (the only tier that can
+        // return `FunctionReturn::Array`), dispatch HERE so an Array
+        // return surfaces as `EvalResult::Array` for the spill writeback
+        // path. Scalar returns flow through normally.
+        //
+        // Functions on non-Unified tiers (Scalar / RangeAware /
+        // ContextAware) always return `Value` and can never produce an
+        // Array; they take the scalar fallthrough below.
+        ExprPlan::Function { name, args }
+            if matches!(
+                registry.lookup_any(name),
+                Some(ql_functions::RegisteredFn::Unified(_))
+            ) =>
+        {
+            // Pull out the unified fn pointer. Unwrap is safe — the
+            // guard above just matched it.
+            let uf = match registry.lookup_any(name) {
+                Some(ql_functions::RegisteredFn::Unified(f)) => *f,
+                _ => unreachable!(
+                    "eval_at_cell_boundary: registry contract violated \
+                     between guard and re-lookup"
+                ),
+            };
+            // Materialize args into `FunctionArg`. Mirrors the scalar
+            // dispatch path's arg construction (scalar.rs ~210-258):
+            //   - `AggregateNameRef` → `FunctionArg::Range`.
+            //   - `ExprPlan::Array` → `FunctionArg::Array`.
+            //   - Everything else → `FunctionArg::Scalar(eval)`.
+            use ql_functions::{FunctionArg, FunctionContext, FunctionReturn};
+            let mut f_args: Vec<FunctionArg> = Vec::with_capacity(args.len());
+            for a in args {
+                match a {
+                    ExprPlan::AggregateNameRef { range, .. } => {
+                        let (values, rows, cols) = env.read_range_with_shape(*range);
+                        f_args.push(FunctionArg::Range { values, rows, cols });
+                    }
+                    ExprPlan::Array(rows) => {
+                        let row_count = rows.len() as u32;
+                        let col_count = rows.first().map(|r| r.len()).unwrap_or(0) as u32;
+                        let mut cells: Vec<Value> =
+                            Vec::with_capacity((row_count * col_count) as usize);
+                        for row in rows {
+                            for cell in row {
+                                cells.push(eval_scalar_with_cache(cell, env, registry, cache));
+                            }
+                        }
+                        let av = ArrayValue::new(row_count, col_count, cells)
+                            .expect("ExprPlan::Array passed binder validation; shape intact");
+                        f_args.push(FunctionArg::Array(av));
+                    }
+                    other => {
+                        f_args.push(FunctionArg::Scalar(eval_scalar_with_cache(
+                            other, env, registry, cache,
+                        )));
+                    }
+                }
+            }
+            let ctx = FunctionContext::new(env.eval_context());
+            match uf(&f_args, &ctx) {
+                FunctionReturn::Scalar(v) => EvalResult::Scalar(v),
+                FunctionReturn::Array(a) => EvalResult::Array(a),
+            }
+        }
         _ => EvalResult::Scalar(eval_scalar_with_cache(plan, env, registry, cache)),
     }
 }
@@ -1839,5 +1904,104 @@ mod tests {
         };
         let r = eval_at_cell_boundary(&plan, &env, &registry, &cache);
         assert_eq!(r, EvalResult::Scalar(Value::Number(6.0)));
+    }
+
+    // ===== W5-106 (Phase 4.7.M) — SEQUENCE at the cell boundary =====
+
+    /// `=SEQUENCE(3)` at the cell boundary materializes as
+    /// `EvalResult::Array(ArrayValue(3, 1, [1, 2, 3]))`. Unified-tier
+    /// function dispatch must surface `FunctionReturn::Array` as
+    /// `EvalResult::Array` (not `EvalResult::Scalar(#CALC!)`, which is
+    /// the scalar-context fallback).
+    #[test]
+    fn eval_at_cell_boundary_sequence_returns_array() {
+        let env = MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Function {
+            name: Arc::from("SEQUENCE"),
+            args: vec![ExprPlan::Number(3.0)],
+        };
+        let r = eval_at_cell_boundary(&plan, &env, &registry, &cache);
+        match r {
+            EvalResult::Array(a) => {
+                assert_eq!(a.rows(), 3);
+                assert_eq!(a.cols(), 1);
+                assert_eq!(a.at(0, 0), &Value::Number(1.0));
+                assert_eq!(a.at(1, 0), &Value::Number(2.0));
+                assert_eq!(a.at(2, 0), &Value::Number(3.0));
+            }
+            EvalResult::Scalar(v) => panic!("expected Array, got Scalar({:?})", v),
+        }
+    }
+
+    /// `=SEQUENCE(2, 2)` materializes as `Array(2, 2, [1,2,3,4])`.
+    #[test]
+    fn eval_at_cell_boundary_sequence_2x2_returns_array() {
+        let env = MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Function {
+            name: Arc::from("SEQUENCE"),
+            args: vec![ExprPlan::Number(2.0), ExprPlan::Number(2.0)],
+        };
+        let r = eval_at_cell_boundary(&plan, &env, &registry, &cache);
+        match r {
+            EvalResult::Array(a) => {
+                assert_eq!(a.rows(), 2);
+                assert_eq!(a.cols(), 2);
+                assert_eq!(a.cells().len(), 4);
+            }
+            EvalResult::Scalar(v) => panic!("expected Array, got Scalar({:?})", v),
+        }
+    }
+
+    /// `SEQUENCE` in a non-cell-boundary context (e.g. inside a binary
+    /// op like `SEQUENCE(3) + 1`) takes the scalar-context path and
+    /// produces `#CALC!`. Pins that the cell-boundary array surfacing
+    /// is INTENTIONALLY top-level only.
+    #[test]
+    fn sequence_in_scalar_subexpression_produces_calc_error() {
+        let env = MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        // SEQUENCE(3) + 1 — outer is Binary, SEQUENCE is the lhs.
+        // eval_at_cell_boundary delegates non-Array non-Function plans
+        // to eval_scalar_with_cache, which sees the Function inside
+        // Binary and dispatches it through the scalar arm (returning
+        // #CALC! for the Array return per design § 6.3).
+        let plan = ExprPlan::Binary {
+            op: ql_formula_syntax::Operator::Plus,
+            lhs: Box::new(ExprPlan::Function {
+                name: Arc::from("SEQUENCE"),
+                args: vec![ExprPlan::Number(3.0)],
+            }),
+            rhs: Box::new(ExprPlan::Number(1.0)),
+        };
+        let r = eval_at_cell_boundary(&plan, &env, &registry, &cache);
+        // Binary op with one #CALC! operand propagates #CALC!.
+        assert_eq!(r, EvalResult::Scalar(Value::Error(ErrorValue::Calc)));
+    }
+
+    /// `=SEQUENCE(0)` produces a degenerate ArrayValue. The cell-boundary
+    /// returns it as `EvalResult::Array` (degenerate); the runtime
+    /// writeback path later surfaces this as `#CALC!` per design § 8.1
+    /// step c. The boundary itself doesn't error.
+    #[test]
+    fn eval_at_cell_boundary_sequence_zero_returns_degenerate_array() {
+        let env = MapEnv::new();
+        let registry = ql_functions::default_registry();
+        let cache = NoAggregateCache;
+        let plan = ExprPlan::Function {
+            name: Arc::from("SEQUENCE"),
+            args: vec![ExprPlan::Number(0.0)],
+        };
+        let r = eval_at_cell_boundary(&plan, &env, &registry, &cache);
+        match r {
+            EvalResult::Array(a) => {
+                assert!(a.is_degenerate());
+            }
+            EvalResult::Scalar(v) => panic!("expected degenerate Array, got Scalar({:?})", v),
+        }
     }
 }

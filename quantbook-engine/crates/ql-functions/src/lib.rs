@@ -22,6 +22,7 @@
 //! Literal NIST numacc dataset import (W4-5 follow-up) will add data fixtures via a
 //! `Cargo`-tracked test asset; the Welford shape is locked here.
 
+pub mod array_returning_fns;
 pub mod context_aware_fns;
 pub mod date_fns;
 pub mod format;
