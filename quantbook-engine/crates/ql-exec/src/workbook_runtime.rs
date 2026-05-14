@@ -518,6 +518,28 @@ impl<'a> WorkbookRuntime<'a> {
                     )?)
                 })?;
 
+        // **Phase 2A.3.b op-log emission, BEFORE any storage mutation.**
+        // The contract on this method ("On error, the workbook is unchanged")
+        // requires that op-log append fail BEFORE we touch workbook state.
+        // We emit `PutFormula` only — the evaluated value isn't recorded
+        // because replay re-derives it via `WorkbookRuntime::recompute_all`
+        // (see replay.rs module docs).
+        //
+        // **W5-103 megaudit HIGH-3 closure** (Codex pass-2 finding): pre-4.7.J
+        // ordering had this append BEFORE mutation. The 4.7.J.5 +
+        // 4.7.J.2 clear_spill calls were inserted between bind and append,
+        // which broke atomicity — a failing append would leave the host
+        // spill / old self-spill already dissolved. Restored ordering:
+        // bind → append → (only then) clear_spill mutations.
+        if let Some(oplog) = self.oplog.as_deref_mut() {
+            oplog.append(Op::PutFormula {
+                sheet,
+                row,
+                col,
+                text: formula_text.as_ref().to_owned(),
+            })?;
+        }
+
         // **W5-103 (Phase 4.7.J.5 / Codex W5-102 MEDIUM-3):** if the
         // target cell is currently a non-anchor cell of someone else's
         // spill, dissolve THAT spill first. Per design § 10.2 (user
@@ -592,19 +614,6 @@ impl<'a> WorkbookRuntime<'a> {
                 }
             }
         };
-
-        // Phase 2A.3.b op-log emission, BEFORE mutation. If append fails, no
-        // mutation; workbook stays consistent. We emit `PutFormula` only — the
-        // evaluated value isn't recorded because replay re-derives it via
-        // `WorkbookRuntime::recompute_all` (see replay.rs module docs).
-        if let Some(oplog) = self.oplog.as_deref_mut() {
-            oplog.append(Op::PutFormula {
-                sheet,
-                row,
-                col,
-                text: formula_text.as_ref().to_owned(),
-            })?;
-        }
 
         // **Route by EvalResult variant.** Scalar takes the existing
         // single-cell write path; Array routes to spill writeback.
@@ -2653,6 +2662,73 @@ mod tests {
             }
             other => panic!("expected PutFormula, got {other:?}"),
         }
+    }
+
+    /// **W5-103 megaudit HIGH-3 closure** — oplog must record the
+    /// PutFormula even when set_formula triggers J.5 host-spill
+    /// dissolution. The new ordering (op-log append BEFORE clear_spill)
+    /// is what guarantees workbook/log consistency on failure; the
+    /// happy path here pins that the op IS recorded for the spill-target
+    /// case.
+    #[test]
+    fn set_formula_into_spill_target_emits_put_formula_op() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            // Anchor A1 spills 1×3. Records ONE PutFormula.
+            rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+            // Write a formula at B1 (a spill target) — J.5 dissolves
+            // A1's spill. Records the SECOND PutFormula.
+            rt.set_formula(0, 0, 1, "99").unwrap();
+        }
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        // Exactly 2 PutFormula ops — host-spill dissolution does NOT
+        // emit a third op (no Op::ClearFormula at the host anchor).
+        assert_eq!(
+            ops.len(),
+            2,
+            "two set_formula calls produce exactly two PutFormula ops"
+        );
+        for op in &ops {
+            assert!(
+                matches!(op, Op::PutFormula { .. }),
+                "all ops are PutFormula, got {op:?}"
+            );
+        }
+        // Specifically verify the second op's payload.
+        match &ops[1] {
+            Op::PutFormula {
+                sheet,
+                row,
+                col,
+                text,
+            } => {
+                assert_eq!((*sheet, *row, *col), (0, 0, 1));
+                assert_eq!(text.as_str(), "99");
+            }
+            other => panic!("expected PutFormula for B1, got {other:?}"),
+        }
+    }
+
+    /// **W5-103 megaudit HIGH-3 closure** — re-setting an array formula
+    /// at the same anchor (J.2 clear-old path) records exactly ONE
+    /// PutFormula per call. The op-log emission happens BEFORE the
+    /// clear-old mutation; the clear is a workbook-internal side
+    /// effect that does NOT show up as a separate op.
+    #[test]
+    fn set_formula_array_reshape_records_one_op_per_call() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap(); // 1x3
+            rt.set_formula(0, 0, 0, "{4; 5}").unwrap(); // reshape to 2x1
+        }
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ops.len(), 2, "two set_formula calls → exactly two ops");
     }
 
     #[test]
