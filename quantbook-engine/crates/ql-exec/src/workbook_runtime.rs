@@ -8677,4 +8677,93 @@ mod tests {
             "D1 must update to B5's new value after spill grows"
         );
     }
+
+    // ===== W5-116 (Phase 4.8.G) — structured-ref eval through aggregate =====
+
+    /// **First end-to-end test for Phase 4.8 structured refs.** Set up a
+    /// table `Sales` with a `Qty` column; write `SUM(Sales[Qty])`; assert
+    /// the result matches a hand-summed value. Exercises:
+    /// - 4.8.A: TableMetadata + Workbook::tables_mut().insert.
+    /// - 4.8.B: lexer Token::StructuredRef.
+    /// - 4.8.C: parser Expr::StructuredRef + Combination/BareColumn.
+    /// - 4.8.E: BindSite plumbing (cell address carried).
+    /// - 4.8.F: TableLookup blanket impl + ExprPlan::StructuredRef
+    ///   resolution against TableTable.
+    /// - 4.8.G: eval-side StructuredRef arm in scalar.rs aggregate path.
+    #[test]
+    fn structured_ref_sum_qty_column_works_end_to_end() {
+        use ql_storage::{TableColumn, TableMetadata};
+        let mut wb = make_runtime_workbook();
+        // Build Sales at A1:D5. Header row 0, no totals. 4 data rows.
+        let col = |id, name: &str| TableColumn {
+            id,
+            name: Arc::from(name.to_ascii_lowercase().as_str()),
+            display: Arc::from(name),
+            totals_function: None,
+        };
+        let table = TableMetadata {
+            name: Arc::from("SALES"),
+            display_name: Arc::from("Sales"),
+            sheet: 0,
+            top_row: 0,
+            top_col: 0,
+            rows: 5,
+            cols: 4,
+            has_header: true,
+            has_totals: false,
+            columns: vec![
+                col(0, "Region"),
+                col(1, "Product"),
+                col(2, "Qty"),
+                col(3, "Price"),
+            ],
+        };
+        wb.tables_mut().insert(Arc::clone(&table.name), table);
+        // Seed data: Qty column (col 2) data rows 1..4 with 10, 20, 30, 40.
+        wb.put(ql_types::Address::new(0, 1, 2), Value::Number(10.0));
+        wb.put(ql_types::Address::new(0, 2, 2), Value::Number(20.0));
+        wb.put(ql_types::Address::new(0, 3, 2), Value::Number(30.0));
+        wb.put(ql_types::Address::new(0, 4, 2), Value::Number(40.0));
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // Anchor the formula at a cell outside the table footprint.
+        let v = rt.set_formula(0, 10, 0, "SUM(Sales[Qty])").unwrap();
+        drop(rt);
+        assert_eq!(v, Value::Number(100.0), "SUM(Sales[Qty]) = 10+20+30+40");
+    }
+
+    /// AVERAGE through the same path — confirms the cache fast path
+    /// works for StructuredRef single-arg (not just SUM).
+    #[test]
+    fn structured_ref_average_qty_column_works_end_to_end() {
+        use ql_storage::{TableColumn, TableMetadata};
+        let mut wb = make_runtime_workbook();
+        let table = TableMetadata {
+            name: Arc::from("SALES"),
+            display_name: Arc::from("Sales"),
+            sheet: 0,
+            top_row: 0,
+            top_col: 0,
+            rows: 3,
+            cols: 1,
+            has_header: true,
+            has_totals: false,
+            columns: vec![TableColumn {
+                id: 0,
+                name: Arc::from("qty"),
+                display: Arc::from("Qty"),
+                totals_function: None,
+            }],
+        };
+        wb.tables_mut().insert(Arc::clone(&table.name), table);
+        wb.put(ql_types::Address::new(0, 1, 0), Value::Number(10.0));
+        wb.put(ql_types::Address::new(0, 2, 0), Value::Number(20.0));
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 5, 0, "AVERAGE(Sales[Qty])").unwrap();
+        drop(rt);
+        assert_eq!(v, Value::Number(15.0), "AVERAGE(Sales[Qty]) = 15");
+    }
 }

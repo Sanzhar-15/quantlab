@@ -190,6 +190,15 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                                 let (values, rows, cols) = env.read_range_with_shape(*range);
                                 fn_args.push(FnArg::Range { values, rows, cols });
                             }
+                            // **W5-116 (Phase 4.8.G):** structured-ref in
+                            // range-aware function arg position — read the
+                            // resolved range as a `FnArg::Range` like an
+                            // `AggregateNameRef`. `is_this_row` narrowing
+                            // is deferred (4.8.G.2 + eval-time cell context).
+                            ExprPlan::StructuredRef { resolved, .. } => {
+                                let (values, rows, cols) = env.read_range_with_shape(*resolved);
+                                fn_args.push(FnArg::Range { values, rows, cols });
+                            }
                             other => {
                                 fn_args.push(FnArg::Scalar(eval_scalar_with_cache(
                                     other, env, registry, cache,
@@ -227,6 +236,13 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                         match a {
                             ExprPlan::AggregateNameRef { range, .. } => {
                                 let (values, rows, cols) = env.read_range_with_shape(*range);
+                                f_args.push(FunctionArg::Range { values, rows, cols });
+                            }
+                            // **W5-116 (Phase 4.8.G):** structured-ref same
+                            // shape as AggregateNameRef in unified-ABI
+                            // function arg position.
+                            ExprPlan::StructuredRef { resolved, .. } => {
+                                let (values, rows, cols) = env.read_range_with_shape(*resolved);
                                 f_args.push(FunctionArg::Range { values, rows, cols });
                             }
                             ExprPlan::Array(rows) => {
@@ -289,6 +305,13 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                     // cache (compute on every call) — V1 limitation.
                     let single_range_arg = match args.as_slice() {
                         [ExprPlan::AggregateNameRef { range, .. }] => Some(*range),
+                        // **W5-116 (Phase 4.8.G):** single-StructuredRef
+                        // fast path. `SUM(Sales[Qty])` uses the same
+                        // (range, function_name) aggregate cache key as
+                        // `SUM(Sales)` — the resolved range is the cache
+                        // key, regardless of whether the source was a
+                        // named range or a structured ref.
+                        [ExprPlan::StructuredRef { resolved, .. }] => Some(*resolved),
                         _ => None,
                     };
                     if let Some(range) = single_range_arg {
@@ -317,7 +340,12 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                     // pre-W5-100 path evaluated the Array as scalar (→
                     // #CALC!) and SUM saw a single error value.
                     let has_range_or_array_arg = args.iter().any(|a| {
-                        matches!(a, ExprPlan::AggregateNameRef { .. } | ExprPlan::Array(_))
+                        matches!(
+                            a,
+                            ExprPlan::AggregateNameRef { .. }
+                                | ExprPlan::Array(_)
+                                | ExprPlan::StructuredRef { .. }
+                        )
                     });
                     if has_range_or_array_arg && crate::plan::is_aggregate_function(name) {
                         // Multi-range / mixed aggregate args: materialize
@@ -331,6 +359,11 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                             match a {
                                 ExprPlan::AggregateNameRef { range, .. } => {
                                     flat.extend(env.read_range(*range));
+                                }
+                                // **W5-116 (Phase 4.8.G):** structured-ref
+                                // in multi-range aggregate.
+                                ExprPlan::StructuredRef { resolved, .. } => {
+                                    flat.extend(env.read_range(*resolved));
                                 }
                                 ExprPlan::Array(rows) => {
                                     // **W5-100:** array cells are literal-
