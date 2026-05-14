@@ -628,10 +628,8 @@ impl<'a> WorkbookRuntime<'a> {
         // - OLD footprint: pre-existing readers indexed under the old
         //   target cells (4.7.I HIGH-1: bound before the spill
         //   registered) won't see their dep cell go Blank otherwise.
-        //   This is a partial workaround until 4.7.J.4 lands proper
-        //   re-extraction; for now, firing on_set_value at the OLD
-        //   targets at least dirties them so their next recompute
-        //   re-reads from the now-Blank target.
+        //   Combined with the 4.7.J.4 re-extraction pass below, this
+        //   ensures both dirty-propagation AND graph-edge correctness.
         //
         // Dedupe via HashSet — cells in BOTH old and new shapes only
         // fire once.
@@ -653,7 +651,149 @@ impl<'a> WorkbookRuntime<'a> {
             }
         }
 
+        // **W5-103 (Phase 4.7.J.4 / Codex W5-102 HIGH-1)** —
+        // re-extract deps for any reader whose `cell_to_formulas` index
+        // currently points at a cell in the OLD or NEW spill footprint.
+        // This is the structural counterpart to the on_set_value pass
+        // above: that loop dirties via the EXISTING (possibly stale)
+        // index; this loop updates the index + graph edges to reflect
+        // the new producer-alias topology.
+        //
+        // Two cases handled by ONE pass:
+        //
+        // 1. **New-spill case** (NEW footprint contains pre-existing
+        //    readers): a reader B1=A2 was bound BEFORE A1 spilled, so
+        //    B1's dep is indexed at (0,1,0) with no graph edge to A1.
+        //    After re-extraction with the now-registered spill, the
+        //    producer-alias rewrite (4.7.I) routes B1's dep to A1 and
+        //    creates the graph edge.
+        //
+        // 2. **Dissolution case** (OLD footprint contains anchor-aliased
+        //    readers): a reader B1=A2 bound AFTER A1 spilled was aliased
+        //    to (0,0,0). If A1 now dissolves, B1's stale alias dep at
+        //    (0,0,0) would over-dirty B1 on unrelated A1 changes AND
+        //    miss future A2 writes (since A2 is no longer a target;
+        //    its writes don't reach (0,0,0) via the alias). Re-extracting
+        //    with the spill GONE restores B1's dep to (0,1,0) directly.
+        //
+        // Per design § 10.5 — this is the targeted re-extraction
+        // trigger (a refinement of Option a's "invalidate all readers
+        // transitively" — we touch only readers in the footprint).
+        //
+        // Skip entirely if no spill state changed (neither old nor new
+        // shape exists). Saves a HashSet allocation + lookup for the
+        // overwhelming majority of `set_formula` calls.
+        if old_spill_shape.is_some() || new_spill_shape.is_some() {
+            self.reextract_spill_footprint_readers(
+                sheet,
+                row,
+                col,
+                old_spill_shape,
+                new_spill_shape,
+            );
+        }
+
         Ok(anchor_value)
+    }
+
+    /// **W5-103 (Phase 4.7.J.4 / Codex W5-102 HIGH-1)** — re-extract
+    /// deps for every formula whose `cell_to_formulas` index points at
+    /// any cell in the UNION of the OLD and NEW spill footprints
+    /// anchored at `(sheet, row, col)`. Excludes the anchor cell itself
+    /// (its own deps were already (re-)extracted by `on_set_formula`).
+    ///
+    /// Re-extraction means: re-bind the reader's formula text (via the
+    /// PlanCache, so a cached miss is the only cost when the surrounding
+    /// `name_gen` is stable) and re-run `extract_and_register_deps`. The
+    /// producer-alias rewrite inside `extract_and_register_deps` then
+    /// sees the now-current spill table and routes target-cell CellRefs
+    /// to the anchor (or unroutes them if the spill dissolved).
+    ///
+    /// Defensive on bind failure: a reader whose formula text no longer
+    /// parses (e.g. it was bound under a different name-gen state) is
+    /// skipped. Its broken state surfaces at its own next recompute —
+    /// we don't want to fail the surrounding `set_formula` call because
+    /// of an unrelated reader.
+    fn reextract_spill_footprint_readers(
+        &mut self,
+        anchor_sheet: SheetId,
+        anchor_row: RowId,
+        anchor_col: ColId,
+        old_shape: Option<SpillShape>,
+        new_shape: Option<SpillShape>,
+    ) {
+        // Step 1: collect reader info under an immutable borrow of the
+        // graph. The HashSet dedupes across the old+new union, AND
+        // dedupes the anchor cell out (its own deps were handled by
+        // on_set_formula above).
+        let reader_info: Vec<(ql_calcgraph::NodeId, SheetId, RowId, ColId, Arc<str>)> = {
+            let g = match self.graph.as_deref() {
+                Some(g) => g,
+                None => return, // No graph attached — nothing to re-extract.
+            };
+            use std::collections::HashSet;
+            let mut nodes: HashSet<ql_calcgraph::NodeId> = HashSet::new();
+            for shape in [old_shape, new_shape].into_iter().flatten() {
+                for node in
+                    g.readers_in_rect(anchor_sheet, anchor_row, anchor_col, shape.rows, shape.cols)
+                {
+                    // Skip the anchor — its own deps were just (re-)bound
+                    // by on_set_formula.
+                    if let Some((s, r, c)) = g.cell_address_for(node) {
+                        if (s, r, c) == (anchor_sheet, anchor_row, anchor_col) {
+                            continue;
+                        }
+                        // Look up formula text from the workbook. A reader
+                        // without a formula text means cell_to_formulas
+                        // has a stale entry — defensive skip.
+                        if let Some(text) = self.workbook.formula_at(s, r, c) {
+                            nodes.insert(node);
+                            let _ = text; // collected below
+                        }
+                    }
+                }
+            }
+            // Resolve each node to (address, text).
+            nodes
+                .into_iter()
+                .filter_map(|node| {
+                    let (s, r, c) = g.cell_address_for(node)?;
+                    let text = self.workbook.formula_at(s, r, c).cloned()?;
+                    Some((node, s, r, c, text))
+                })
+                .collect()
+        };
+
+        // Step 2: re-bind + re-extract for each reader. The borrow of
+        // `g` from step 1 is released; we now alternate immutable workbook
+        // reads (inside the PlanCache miss closure) with mutable graph
+        // mutations (reextract_deps).
+        for (node, reader_sheet, _r, _c, text) in reader_info {
+            let name_gen = self.workbook.names().generation();
+            let cache_key = PlanCacheKey {
+                text: Arc::clone(&text),
+                sheet: reader_sheet,
+                name_gen,
+            };
+            let plan: Arc<crate::plan::ExprPlan> = match self
+                .plan_cache
+                .get_or_insert::<_, RuntimeError>(cache_key, || {
+                    let tokens = lex(text.as_ref())?;
+                    let expr = parse(tokens)?;
+                    Ok(bind_with_names_and_sheets(
+                        &expr,
+                        reader_sheet,
+                        self.workbook,
+                        self.workbook,
+                    )?)
+                }) {
+                Ok(p) => p,
+                Err(_) => continue, // Reader's formula no longer binds.
+            };
+            if let Some(g) = self.graph.as_deref_mut() {
+                g.reextract_deps(node, plan.as_ref(), self.workbook);
+            }
+        }
     }
 
     /// **W5-103 (Phase 4.7.J.2 / 4.7.J.3)** — spill writeback path.
@@ -6082,6 +6222,165 @@ mod tests {
         assert_eq!(
             wb.spill_anchor_at(0, 0, 0).copied(),
             Some(ql_storage::SpillShape::new(1, 3))
+        );
+    }
+
+    // ===== W5-103 (Phase 4.7.J.4) — register_spill re-extraction =====
+    //
+    // Closes Codex W5-102 HIGH-1: when a reader formula is bound BEFORE
+    // the spill at its dep cell registers, the reader's cell-dep is
+    // indexed under the target cell and no graph edge to the anchor
+    // exists. Tarjan ordering can then schedule the reader BEFORE the
+    // anchor, reading a stale value. The re-extraction trigger in
+    // `set_formula` walks readers in the new footprint and re-runs
+    // dep extraction so the producer-alias rewrite fires.
+
+    /// Phase 4.7.J.4 — the canonical HIGH-1 scenario:
+    /// 1. Bind reader B1 = A2 (no spill yet at A1; B1's dep is (0,1,0)).
+    /// 2. Set A1 = `{1, 2, 3}` (spills to A1, B1, C1).
+    ///
+    /// Wait — A1's spill goes HORIZONTAL across A1, B1, C1, not vertical.
+    /// To put a target at A2, we need a VERTICAL spill: A1 = `{1;2;3}`
+    /// spills to A1, A2, A3. Then B1 = A2 reads target A2.
+    ///
+    /// After the spill registers, B1's dep MUST be (0,0,0) (the anchor)
+    /// and the graph MUST have a B1 → A1 edge.
+    #[test]
+    fn set_formula_reextract_aliases_pre_existing_reader_to_anchor() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            // B1 = A2 — bound BEFORE any spill exists. Dep recorded at A2.
+            rt.set_formula(0, 0, 1, "A2").unwrap();
+        }
+        let b1_node = graph.cell_node_for(0, 0, 1).unwrap();
+        // Pre-spill: B1's dep is the literal target cell.
+        assert_eq!(
+            graph.formula_deps(b1_node).unwrap().cells,
+            vec![(0, 1, 0)],
+            "pre-spill: B1 depends on A2 literally"
+        );
+
+        // Now A1 spills vertically over A1, A2, A3.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 0, "{1; 2; 3}").unwrap();
+        }
+        let a1_node = graph.cell_node_for(0, 0, 0).unwrap();
+        // Post-spill: B1's dep got re-aliased to the anchor.
+        assert_eq!(
+            graph.formula_deps(b1_node).unwrap().cells,
+            vec![(0, 0, 0)],
+            "post-spill: B1's dep rewritten to the anchor A1 (4.7.J.4 re-extraction)"
+        );
+        // Graph edge B1 → A1 materialized.
+        assert!(
+            graph.graph().outgoing(b1_node).contains(&a1_node),
+            "graph edge B1 → A1 must exist after re-extraction"
+        );
+    }
+
+    /// Phase 4.7.J.4 — dissolution case: a reader bound AFTER the spill
+    /// gets aliased to the anchor. When the spill dissolves, the alias
+    /// must be re-routed back to the underlying target cell.
+    #[test]
+    fn set_formula_reextract_unroutes_alias_after_spill_dissolves() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        // 1. Spill at A1 first.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 0, "{1; 2; 3}").unwrap();
+            // 2. Then reader B1 = A2 — gets aliased to A1.
+            rt.set_formula(0, 0, 1, "A2").unwrap();
+        }
+        let b1 = graph.cell_node_for(0, 0, 1).unwrap();
+        assert_eq!(
+            graph.formula_deps(b1).unwrap().cells,
+            vec![(0, 0, 0)],
+            "B1 aliased to anchor while spill active"
+        );
+
+        // 3. Dissolve spill — set A1 to scalar.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 0, "42").unwrap();
+        }
+        // B1's dep should now be re-routed back to the literal A2.
+        assert_eq!(
+            graph.formula_deps(b1).unwrap().cells,
+            vec![(0, 1, 0)],
+            "post-dissolution: B1's dep restored to A2 (no longer aliased)"
+        );
+    }
+
+    /// Phase 4.7.J.4 — dedupe across the union: a reader at (0,0,4)
+    /// whose dep is in BOTH old (B1, prior shape 1×3) and new (B1, new
+    /// shape 1×4) footprints should be re-extracted ONCE, not twice.
+    /// We assert via the formula_deps content + a hook counter check
+    /// would be ideal but extract_and_register_deps doesn't have a
+    /// dedicated counter; we instead verify the final dep state is
+    /// correct.
+    #[test]
+    fn set_formula_reextract_dedupes_across_old_and_new_footprint() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            // A1 spills 1×3 (A1, B1, C1).
+            rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+            // E1 = B1 — aliased to A1.
+            rt.set_formula(0, 0, 4, "B1").unwrap();
+        }
+        let e1 = graph.cell_node_for(0, 0, 4).unwrap();
+        assert_eq!(graph.formula_deps(e1).unwrap().cells, vec![(0, 0, 0)]);
+
+        // Re-set A1 to a wider spill (1×4, A1..D1). B1 is in both
+        // old AND new footprint. E1 = B1 must STILL be aliased to A1.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 0, "{1, 2, 3, 4}").unwrap();
+        }
+        assert_eq!(
+            graph.formula_deps(e1).unwrap().cells,
+            vec![(0, 0, 0)],
+            "E1 stays aliased to A1 after reshape; re-extraction is idempotent"
+        );
+    }
+
+    /// Phase 4.7.J.4 — blocked spill case: when a writeback returns
+    /// #SPILL! (no new footprint registered), no NEW-footprint readers
+    /// need re-extraction (only OLD-footprint, if any). Verify by
+    /// blocking a spill that has no prior footprint AND a pre-existing
+    /// reader at the would-be target.
+    #[test]
+    fn set_formula_reextract_skipped_on_blocked_spill_with_no_old_footprint() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            // C1 = B1 — pre-existing reader of B1 (no spill yet anywhere).
+            rt.set_formula(0, 0, 2, "B1").unwrap();
+            // B1 user-blocks the spill.
+            rt.set_value(0, 0, 1, Value::Number(99.0)).unwrap();
+            // Try to spill 1×2 at A1: A1, B1. Blocked by B1's user value.
+            rt.set_formula(0, 0, 0, "{1, 2}").unwrap();
+        }
+        let c1 = graph.cell_node_for(0, 0, 2).unwrap();
+        // No new footprint registered → C1's dep stays on (0,0,1) (B1).
+        assert_eq!(
+            graph.formula_deps(c1).unwrap().cells,
+            vec![(0, 0, 1)],
+            "blocked spill leaves C1's dep untouched"
         );
     }
 }

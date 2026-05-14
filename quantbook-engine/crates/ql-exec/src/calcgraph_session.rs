@@ -1007,6 +1007,72 @@ impl CalcgraphSession {
         }
     }
 
+    /// **W5-103 (Phase 4.7.J.4 / Codex W5-102 HIGH-1)** — readers whose
+    /// `cell_to_formulas` reverse index points at ANY cell in the
+    /// rectangle `(anchor_row..anchor_row+rows) × (anchor_col..anchor_col+cols)`
+    /// on `anchor_sheet`. Returns unique `NodeId`s.
+    ///
+    /// Use case: the runtime spill-writeback path (4.7.J.4) calls this
+    /// AFTER `register_spill` succeeds to find every formula whose dep
+    /// extraction was done BEFORE the spill registered. Those readers
+    /// are indexed under the (now-target) cell address; they need
+    /// re-extraction so the producer-alias rewrite fires and the
+    /// graph edge to the anchor materializes.
+    ///
+    /// Anchor cell itself is INCLUDED in the rectangle. The caller
+    /// decides whether to filter it out (the anchor's own deps are
+    /// already handled by `on_set_formula`, so excluding makes sense).
+    pub fn readers_in_rect(
+        &self,
+        anchor_sheet: SheetId,
+        anchor_row: RowId,
+        anchor_col: ColId,
+        rows: u32,
+        cols: u32,
+    ) -> Vec<NodeId> {
+        let mut readers: HashSet<NodeId> = HashSet::new();
+        for dr in 0..rows {
+            for dc in 0..cols {
+                let key = (anchor_sheet, anchor_row + dr, anchor_col + dc);
+                if let Some(set) = self.cell_to_formulas.get(&key) {
+                    for &node in set {
+                        readers.insert(node);
+                    }
+                }
+            }
+        }
+        readers.into_iter().collect()
+    }
+
+    /// **W5-103 (Phase 4.7.J.4 / Codex W5-102 HIGH-1)** — public
+    /// wrapper around `extract_and_register_deps` for external callers
+    /// (notably `WorkbookRuntime`'s spill-writeback path) that need to
+    /// re-run dep extraction for a formula whose TEXT is unchanged but
+    /// whose surrounding WORKBOOK state has shifted in a way that
+    /// affects the producer-alias rewrite (i.e. a spill registered or
+    /// dissolved over one of the formula's cell-deps).
+    ///
+    /// The formula's owning sheet is recovered from
+    /// `cell_address_for(reader_node)`. The caller is responsible for
+    /// providing the up-to-date `plan` and `workbook` references.
+    ///
+    /// Returns `false` if `reader_node` is not a cell node (defensive —
+    /// callers should only pass NodeIds returned by `readers_in_rect`,
+    /// which is itself sourced from `cell_to_formulas`, which only ever
+    /// carries cell nodes); in that case no re-extraction occurs.
+    pub fn reextract_deps(
+        &mut self,
+        reader_node: NodeId,
+        plan: &ExprPlan,
+        workbook: &Workbook,
+    ) -> bool {
+        let Some((reader_sheet, _, _)) = self.cell_address_for(reader_node) else {
+            return false;
+        };
+        self.extract_and_register_deps(reader_node, reader_sheet, plan, workbook);
+        true
+    }
+
     /// **Phase 3.4 acceptance (SCH-3-01..04 entry point).** Atomically
     /// claim the dirty set and run the Phase 0 W3-3 iterative Tarjan
     /// scheduler over it. The returned [`Schedule`] partitions nodes:
