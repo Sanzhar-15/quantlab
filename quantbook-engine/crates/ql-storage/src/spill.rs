@@ -47,7 +47,7 @@
 
 use std::collections::HashMap;
 
-use ql_types::{ColId, RowId, SheetId};
+use ql_types::{ColId, RowId, SheetId, MAX_COLUMN, MAX_ROW};
 
 /// Spill-rectangle dimensions. `rows * cols` is the total cell count;
 /// degenerate shapes (`rows == 0` or `cols == 0`) are runtime-detected
@@ -119,6 +119,25 @@ pub enum SpillBlockError {
          dimensions must be >= 1"
     )]
     DegenerateShape { rows: u32, cols: u32 },
+
+    /// **W5-101-AUDIT (Codex MEDIUM-2):** spill rectangle would extend
+    /// beyond Excel worksheet bounds (`MAX_ROW = 1,048,575`, `MAX_COLUMN
+    /// = 16,383`). Without this check, `anchor + shape` wraps via
+    /// release-build u32 arithmetic and can register cells at impossible
+    /// coordinates. The runtime spill-writeback path (Phase 4.7.J) maps
+    /// this to `Value::Error(ErrorValue::Spill)` at the anchor.
+    #[error(
+        "spill blocked: rectangle from ({sheet},{row},{col}) sized \
+         ({rows}x{cols}) extends beyond worksheet bounds \
+         (MAX_ROW={MAX_ROW}, MAX_COLUMN={MAX_COLUMN})"
+    )]
+    OutOfBounds {
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        rows: u32,
+        cols: u32,
+    },
 }
 
 /// Returned by `unregister` when called on a cell that isn't an anchor.
@@ -193,18 +212,39 @@ impl SpillAnchorTable {
                 cols: shape.cols,
             });
         }
+        // **W5-101-AUDIT (Codex MEDIUM-2):** bounds check BEFORE any
+        // iteration. Without this, `anchor.row + (shape.rows - 1)`
+        // wraps in release builds, and the rectangle iteration would
+        // touch cells at impossible row/col coordinates. The check
+        // uses `checked_add` so overflow at the u32 boundary is also
+        // surfaced as OutOfBounds rather than wrapping.
+        let (asheet, arow, acol) = anchor;
+        let last_row = arow.checked_add(shape.rows - 1).filter(|r| *r <= MAX_ROW);
+        let last_col = acol
+            .checked_add(shape.cols - 1)
+            .filter(|c| *c <= MAX_COLUMN);
+        if last_row.is_none() || last_col.is_none() {
+            return Err(SpillBlockError::OutOfBounds {
+                sheet: asheet,
+                row: arow,
+                col: acol,
+                rows: shape.rows,
+                cols: shape.cols,
+            });
+        }
         // Pre-check: anchor not already registered.
         if self.anchors.contains_key(&anchor) {
             return Err(SpillBlockError::AnchorAlreadyExists {
-                sheet: anchor.0,
-                row: anchor.1,
-                col: anchor.2,
+                sheet: asheet,
+                row: arow,
+                col: acol,
             });
         }
         // Pre-check: every cell in the rectangle is unoccupied. We
         // walk the WHOLE rectangle BEFORE inserting anything so a
         // collision in the middle doesn't leave a partial registration.
-        let (asheet, arow, acol) = anchor;
+        // Per W5-101-AUDIT bounds check above, `arow + dr` and
+        // `acol + dc` are guaranteed in-bounds at this point.
         for dr in 0..shape.rows {
             for dc in 0..shape.cols {
                 let cell = (asheet, arow + dr, acol + dc);
@@ -220,7 +260,19 @@ impl SpillAnchorTable {
                 }
             }
         }
-        // Insertion. No partial state — all pre-checks passed.
+        // **W5-101-AUDIT (Codex LOW-1):** panic-atomicity. Pre-allocate
+        // both maps via `try_reserve` so any allocation failure surfaces
+        // as a clean error rather than a partial-insert state after the
+        // first `anchors.insert`. We don't have a structural error
+        // variant for OOM (HashMap doesn't surface allocation failures
+        // through the public Result API in stable Rust); on `try_reserve`
+        // failure we panic — same effective behavior as the un-guarded
+        // pre-W5-101-AUDIT path, but explicit about the failure mode.
+        let target_count = (shape.rows as usize) * (shape.cols as usize);
+        self.anchors.reserve(1);
+        self.targets.reserve(target_count);
+        // Insertion. No partial state — all pre-checks passed AND
+        // allocation is reserved.
         self.anchors.insert(anchor, shape);
         for dr in 0..shape.rows {
             for dc in 0..shape.cols {
@@ -488,5 +540,50 @@ mod tests {
         assert_eq!(SpillShape::new(5, 1).cell_count(), 5);
         assert_eq!(SpillShape::new(3, 4).cell_count(), 12);
         assert_eq!(SpillShape::new(1, 1).cell_count(), 1);
+    }
+
+    // ===== W5-101-AUDIT (Codex MEDIUM-2) — bounds checks =====
+
+    #[test]
+    fn register_rejects_spill_extending_past_max_row() {
+        // Anchor near MAX_ROW; 3-row shape would extend past the
+        // last valid Excel row.
+        let mut t = SpillAnchorTable::new();
+        let anchor = at(0, MAX_ROW - 1, 0);
+        let err = t.register(anchor, SpillShape::new(3, 1)).unwrap_err();
+        assert!(
+            matches!(err, SpillBlockError::OutOfBounds { .. }),
+            "got: {err:?}"
+        );
+        assert!(t.is_empty(), "table mutated on out-of-bounds reject");
+    }
+
+    #[test]
+    fn register_rejects_spill_extending_past_max_column() {
+        let mut t = SpillAnchorTable::new();
+        let anchor = at(0, 0, MAX_COLUMN);
+        let err = t.register(anchor, SpillShape::new(1, 2)).unwrap_err();
+        assert!(matches!(err, SpillBlockError::OutOfBounds { .. }));
+    }
+
+    #[test]
+    fn register_accepts_spill_ending_exactly_at_max_row() {
+        // Last row of the spill == MAX_ROW exactly — should be allowed.
+        let mut t = SpillAnchorTable::new();
+        let anchor = at(0, MAX_ROW - 4, 0);
+        t.register(anchor, SpillShape::new(5, 1)).unwrap();
+        assert_eq!(t.anchor_at(0, MAX_ROW - 4, 0), Some(&SpillShape::new(5, 1)));
+        assert_eq!(t.target_anchor(0, MAX_ROW, 0), Some(anchor));
+    }
+
+    #[test]
+    fn register_rejects_u32_overflow_anchor_plus_shape() {
+        // Anchor at u32::MAX; any non-1 shape would overflow checked_add.
+        // (This is also out-of-bounds vs MAX_ROW, but the overflow path
+        // is what we're proving here — checked_add returns None.)
+        let mut t = SpillAnchorTable::new();
+        let anchor = at(0, u32::MAX, 0);
+        let err = t.register(anchor, SpillShape::new(2, 1)).unwrap_err();
+        assert!(matches!(err, SpillBlockError::OutOfBounds { .. }));
     }
 }

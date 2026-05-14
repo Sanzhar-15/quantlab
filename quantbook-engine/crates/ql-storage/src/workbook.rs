@@ -616,6 +616,16 @@ impl Workbook {
         Ok(())
     }
 
+    /// **W5-101-AUDIT (Codex LOW-3):** idempotent variant of
+    /// `clear_spill_at`. Returns `true` if a spill was cleared, `false`
+    /// if no anchor was registered at the cell. Friendlier API for the
+    /// runtime spill-writeback path (Phase 4.7.J) which calls "clear
+    /// before re-eval" regardless of whether a prior spill existed.
+    /// Equivalent to `clear_spill_at(anchor).is_ok()` semantically.
+    pub fn clear_spill_if_present(&mut self, anchor: (SheetId, RowId, ColId)) -> bool {
+        self.clear_spill_at(anchor).is_ok()
+    }
+
     /// Read by `Address`.
     ///
     /// - **Missing sheet** (sheet id ≥ `sheet_count()`) → `Value::Error(Ref)`
@@ -1426,4 +1436,43 @@ mod tests {
             .unwrap();
         wb.register_spill((0, 5, 5), crate::SpillShape::new(1, 1))
             .unwrap();
-        assert_eq!(wb.s
+        assert_eq!(wb.spill_anchors().len(), 2);
+    }
+
+    // ===== W5-101-AUDIT (Codex LOW-3) — clear_spill_if_present =====
+
+    #[test]
+    fn workbook_clear_spill_if_present_returns_true_when_cleared() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        wb.register_spill((0, 0, 0), crate::SpillShape::new(2, 1))
+            .unwrap();
+        let cleared = wb.clear_spill_if_present((0, 0, 0));
+        assert!(cleared);
+        assert!(wb.spill_anchor_at(0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn workbook_clear_spill_if_present_returns_false_when_missing() {
+        // Idempotent: calling on a non-anchor is a no-op + returns false.
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        let cleared = wb.clear_spill_if_present((0, 5, 5));
+        assert!(!cleared);
+    }
+
+    #[test]
+    fn workbook_clear_spill_at_clears_anchor_own_computed_overlay() {
+        // Sonnet-anticipated test: verify the anchor cell itself
+        // (the (0,0) of its own spill range) gets its computed
+        // overlay cleared.
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        wb.register_spill((0, 0, 0), crate::SpillShape::new(1, 1))
+            .unwrap();
+        wb.put_computed_at(0, 0, 0, Value::Number(42.0));
+        assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(42.0));
+        wb.clear_spill_at((0, 0, 0)).unwrap();
+        assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Blank);
+    }
+}
