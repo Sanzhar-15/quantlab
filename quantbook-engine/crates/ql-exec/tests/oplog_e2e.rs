@@ -579,18 +579,8 @@ fn create_table_op_log_replay_reconstructs_table() {
     let mut producer_oplog = OpLog::new();
     {
         let mut rt = WorkbookRuntime::with_oplog(&mut producer_wb, &reg, &mut producer_oplog);
-        rt.create_table(
-            "Sales",
-            0,
-            0,
-            0,
-            3,
-            1,
-            true,
-            false,
-            vec!["Qty".into()],
-        )
-        .unwrap();
+        rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+            .unwrap();
     }
     // Producer-side seed values; replay won't re-create cell values
     // unless they were emitted as Op::PutValue (which we DO here).
@@ -610,7 +600,10 @@ fn create_table_op_log_replay_reconstructs_table() {
     replay_into(&producer_oplog, &mut replay_wb, &reg).unwrap();
     // After replay, the table exists and cells are set, but the formula
     // value isn't computed (replay doesn't evaluate).
-    assert!(replay_wb.lookup_table("Sales").is_some(), "table re-registered");
+    assert!(
+        replay_wb.lookup_table("Sales").is_some(),
+        "table re-registered"
+    );
     {
         let mut rt = WorkbookRuntime::new(&mut replay_wb, &reg);
         assert!(rt.recompute_all().is_complete(), "recompute failures");
@@ -640,5 +633,67 @@ fn drop_table_op_log_replay_removes_table() {
 
     let mut replay_wb = fresh_wb();
     replay_into(&producer_oplog, &mut replay_wb, &reg).unwrap();
-    assert!(replay_wb.lookup_table("Sales").is_none(), "table dropped on replay");
+    assert!(
+        replay_wb.lookup_table("Sales").is_none(),
+        "table dropped on replay"
+    );
+}
+
+/// **W5-121 (Phase 4.8.I.2) e2e:** rename_column emits
+/// `Op::RenameColumn` + `Op::PutFormula` for each rewritten cell;
+/// replay against a fresh workbook reconstructs both the renamed
+/// column metadata AND the rewritten formula text, so post-replay
+/// recompute_all evaluates the SUM correctly under the new column
+/// name.
+#[test]
+fn rename_column_op_log_replay_reconstructs_rename() {
+    let mut producer_wb = fresh_wb();
+    let reg = default_registry();
+    let mut producer_oplog = OpLog::new();
+    {
+        let mut rt = WorkbookRuntime::with_oplog(&mut producer_wb, &reg, &mut producer_oplog);
+        rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+            .unwrap();
+        rt.set_value(0, 1, 0, Value::Number(50.0)).unwrap();
+        rt.set_value(0, 2, 0, Value::Number(75.0)).unwrap();
+        let _ = rt.set_formula(0, 10, 0, "SUM(Sales[Qty])").unwrap();
+        let n = rt.rename_column("Sales", "Qty", "Quantity").unwrap();
+        assert_eq!(n, 1, "one formula rewritten");
+    }
+    assert_eq!(
+        producer_wb.read(Address::new(0, 10, 0)),
+        Value::Number(125.0)
+    );
+
+    let mut replay_wb = fresh_wb();
+    replay_into(&producer_oplog, &mut replay_wb, &reg).unwrap();
+    // Column metadata reflects rename.
+    let meta = replay_wb
+        .lookup_table("Sales")
+        .expect("table re-registered");
+    assert!(
+        meta.lookup_column("Quantity").is_some(),
+        "renamed column visible on replay"
+    );
+    assert!(
+        meta.lookup_column("Qty").is_none(),
+        "old column gone on replay"
+    );
+    // Formula text reflects rewrite.
+    let text = replay_wb
+        .formula_at(0, 10, 0)
+        .expect("formula present")
+        .clone();
+    assert!(text.contains("Quantity"), "got: {text}");
+    assert!(!text.contains("Qty"), "got: {text}");
+    // Recompute produces the same value as the producer.
+    {
+        let mut rt = WorkbookRuntime::new(&mut replay_wb, &reg);
+        assert!(rt.recompute_all().is_complete());
+    }
+    assert_eq!(
+        replay_wb.read(Address::new(0, 10, 0)),
+        Value::Number(125.0),
+        "post-replay SUM(Sales[Quantity]) matches producer"
+    );
 }

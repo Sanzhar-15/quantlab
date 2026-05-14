@@ -674,7 +674,7 @@ Each sub-phase ships independently (1 commit + 7 gates green) with self-audit; C
 | 7c | **4.8.G.3** (deferred) | `table_to_formulas` reverse dep index + `on_table_create/rename/drop/resize/rename_column` hooks + plan cache `table_gen` field | ⏳ DEFERRED — current impl uses formula-text rewrite (rename) + name_gen + plan_cache.clear() (rename); targeted invalidation deferred until needed |
 | 8 | **4.8.H** (W5-118) | Workbook runtime: `create_table` / `drop_table` + `Op::CreateTable` / `Op::DropTable` + replay arms + W5-103 atomicity | ✅ shipped `ec3e9cc960a` (9 tests incl. producer→replay e2e) |
 | 9a | **4.8.I** (W5-119) | Workbook runtime: `rename_table` + `ast::rewrite_table_ref` tree-walk + formula text rewrite + `Op::RenameTable` | ✅ shipped `e2d80eee653` (4 tests) |
-| 9b | **4.8.I.2** (deferred) | `rename_column` + `Op::RenameColumn` (same pattern as rename_table but rewrites column refs inside `StructuredRef` specs) | ⏳ DEFERRED |
+| 9b | **4.8.I.2** (W5-121) | `rename_column` + `Op::RenameColumn` (same pattern as rename_table but rewrites column refs inside `StructuredRef` specs) | ✅ shipped (11 tests: 10 unit + 1 e2e replay) |
 | 10 | **4.8.J** (W5-NNN) | `resize_table` (grow rows + add/remove last column) + spill-anchor block (§ 4.3 invariant #5) + `Op::ResizeTable` | ⏳ DEFERRED |
 | 11 | **4.8.K** (W5-NNN) | Op log: additional replay coverage + atomicity edge cases (currently `Op::CreateTable / DropTable / RenameTable` all replay-tested; `RenameColumn / ResizeTable` arrive with 9b + 10) | ⏳ DEFERRED |
 | 12 | **4.8.L** (W5-NNN) | Persistence: schema v5 → v6 + `TableTable` save/load + v5-reader loud-fails on v6 | ⏳ DEFERRED |
@@ -682,7 +682,7 @@ Each sub-phase ships independently (1 commit + 7 gates green) with self-audit; C
 | 14 | **4.8.N** (W5-NNN) | Edge cases: header-only table (empty-data bind error), `A[0]`-style collisions, escape-prefix headers, dropped-table re-binding, soft-fail integration | ⏳ DEFERRED |
 | 15 | **4.8.O** (W5-NNN) | Closing mega-audit (Codex + Sonnet parallel) | ⏳ DEFERRED |
 
-16 sub-phases (15 implementation + 1 design). **9 / 15 implementation sub-phases shipped this session** (plus the design doc).
+16 sub-phases (15 implementation + 1 design). **10 / 15 implementation sub-phases shipped** (4.8.A→I plus 4.8.I.2; plus the design doc).
 
 ### Renumbering note
 
@@ -701,7 +701,7 @@ W5-NNN ids are convention, not load-bearing. Treat the **subphase letter** (G, H
 
 In rough priority order:
 
-1. **4.8.I.2 rename_column** — small (~similar shape to rename_table; AST walker substitutes column refs inside `StructuredRef::spec` items).
+1. ~~**4.8.I.2 rename_column**~~ — ✅ shipped W5-121.
 2. **4.8.J resize_table** — moderate (grow rows + add/remove last column; overlap re-check; dirties via plan cache clear since the resolved range changes).
 3. **4.8.L persistence v5→v6** — moderate (schema bump + TableTable serialize/deserialize in qbook_format.rs; v5-reader loud-fail on v6).
 4. **4.8.G.3 calcgraph hooks** — optional (current rename impl uses formula-text rewrite which works correctly without `table_to_formulas`; the index becomes a perf optimization when tables grow large or rename rate is high).

@@ -177,6 +177,31 @@ pub enum ReplayError {
     /// no-fallbacks doctrine.
     #[error("replay drop-table at op index {index}: table {name:?} not found")]
     TableNotFound { index: usize, name: String },
+
+    /// **W5-121 (Phase 4.8.I.2):** `RenameColumn` op references a column
+    /// that doesn't exist in the target table (case-insensitive). Either
+    /// the source column was already dropped/renamed before this op, or
+    /// the op log has diverged from the snapshot.
+    #[error(
+        "replay rename-column at op index {index}: table {table:?} \
+         has no column {column:?}"
+    )]
+    TableColumnNotFound {
+        index: usize,
+        table: String,
+        column: String,
+    },
+
+    /// **W5-121 (Phase 4.8.I.2):** `RenameColumn` op was rejected by a
+    /// validation rule (target name already in the table, empty, etc.).
+    /// `reason` is a static string describing which invariant fired.
+    #[error("replay rename-column rejected at op index {index}: table {table:?} column {column:?} ({reason})")]
+    TableColumnRejected {
+        index: usize,
+        table: String,
+        column: String,
+        reason: &'static str,
+    },
 }
 
 /// Wrapper around `ql_storage::FormatTableError` that owns its strings,
@@ -468,11 +493,7 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
         ),
         Op::DropTable { name } => {
             let canonical = name.to_ascii_uppercase();
-            if workbook
-                .tables_mut()
-                .remove(canonical.as_str())
-                .is_none()
-            {
+            if workbook.tables_mut().remove(canonical.as_str()).is_none() {
                 return Err(ReplayError::TableNotFound {
                     index,
                     name: name.clone(),
@@ -483,6 +504,11 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
         Op::RenameTable { old_name, new_name } => {
             apply_rename_table(workbook, index, old_name, new_name)
         }
+        Op::RenameColumn {
+            table,
+            old_name,
+            new_name,
+        } => apply_rename_column(workbook, index, table, old_name, new_name),
     }
 }
 
@@ -536,6 +562,68 @@ fn apply_rename_table(
     Ok(())
 }
 
+/// **W5-121 (Phase 4.8.I.2):** replay a `RenameColumn`. Validates the
+/// target table exists, the source column exists (case-insensitive), and
+/// the target column name is available within the table. Mutates the
+/// matching `TableColumn`'s `name` (lowercase canonical) and `display`
+/// (case-preserving). Bumps the `TableTable` generation so plan caches
+/// invalidate. Same-canonical column renames are rejected — the producer
+/// side treats those as a no-op and doesn't emit the op, so receiving
+/// one indicates log divergence.
+fn apply_rename_column(
+    workbook: &mut ql_storage::Workbook,
+    index: usize,
+    table: &str,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), ReplayError> {
+    let table_canonical = table.to_ascii_uppercase();
+    let meta = workbook
+        .tables_mut()
+        .get_mut(&table_canonical)
+        .ok_or_else(|| ReplayError::TableNotFound {
+            index,
+            name: table.to_owned(),
+        })?;
+    let (col_idx, _) =
+        meta.lookup_column(old_name)
+            .ok_or_else(|| ReplayError::TableColumnNotFound {
+                index,
+                table: table.to_owned(),
+                column: old_name.to_owned(),
+            })?;
+    if new_name.is_empty() {
+        return Err(ReplayError::TableColumnRejected {
+            index,
+            table: table.to_owned(),
+            column: new_name.to_owned(),
+            reason: "column name cannot be empty",
+        });
+    }
+    let old_lower = old_name.to_ascii_lowercase();
+    let new_lower = new_name.to_ascii_lowercase();
+    if old_lower == new_lower {
+        return Err(ReplayError::TableColumnRejected {
+            index,
+            table: table.to_owned(),
+            column: new_name.to_owned(),
+            reason: "rename to same canonical column name (producer should not emit)",
+        });
+    }
+    if meta.lookup_column(new_name).is_some() {
+        return Err(ReplayError::TableColumnRejected {
+            index,
+            table: table.to_owned(),
+            column: new_name.to_owned(),
+            reason: "column with this canonical name already exists (rename target)",
+        });
+    }
+    meta.columns[col_idx as usize].name = std::sync::Arc::from(new_lower.as_str());
+    meta.columns[col_idx as usize].display = std::sync::Arc::from(new_name);
+    workbook.tables_mut().bump_generation();
+    Ok(())
+}
+
 /// **W5-118 (Phase 4.8.H):** apply a `CreateTable` op against the
 /// workbook. Validates the same invariants the producer side checks
 /// (mirror via `WorkbookRuntime::create_table`).
@@ -554,8 +642,7 @@ fn apply_create_table(
     column_names: &[String],
 ) -> Result<(), ReplayError> {
     use ql_storage::{TableColumn, TableMetadata};
-    let canonical: std::sync::Arc<str> =
-        std::sync::Arc::from(name.to_ascii_uppercase().as_str());
+    let canonical: std::sync::Arc<str> = std::sync::Arc::from(name.to_ascii_uppercase().as_str());
     if workbook.tables().lookup(&canonical).is_some() {
         return Err(ReplayError::TableCreateRejected {
             index,

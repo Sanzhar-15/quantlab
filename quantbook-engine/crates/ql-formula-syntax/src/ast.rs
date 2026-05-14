@@ -339,11 +339,9 @@ pub fn rewrite_table_ref(expr: &Expr, old_canonical: &str, new_name: &Arc<str>) 
                 })
                 .collect(),
         ),
-        Expr::Spill(inner) => Expr::Spill(Box::new(rewrite_table_ref(
-            inner,
-            old_canonical,
-            new_name,
-        ))),
+        Expr::Spill(inner) => {
+            Expr::Spill(Box::new(rewrite_table_ref(inner, old_canonical, new_name)))
+        }
         Expr::StructuredRef { table_name, spec } => {
             if table_name.eq_ignore_ascii_case(old_canonical) {
                 Expr::StructuredRef {
@@ -356,6 +354,169 @@ pub fn rewrite_table_ref(expr: &Expr, old_canonical: &str, new_name: &Arc<str>) 
                     spec: spec.clone(),
                 }
             }
+        }
+    }
+}
+
+/// **W5-121 (Phase 4.8.I.2):** rewrite every column reference inside an
+/// `Expr::StructuredRef` whose `table_name` matches `table_canonical_upper`
+/// (case-insensitive) and whose spec column name matches `old_col`
+/// (case-insensitive). Substitutes with `new_col` (case-preserving).
+/// Sibling of [`rewrite_table_ref`]; used by
+/// `WorkbookRuntime::rename_column`.
+///
+/// **Cross-table isolation:** structured refs to OTHER tables pass through
+/// unchanged, even if their spec mentions a column with the same name.
+/// **Spec coverage:** walks every variant of [`TableSpecSubtree`] and
+/// [`TableSpecItem`] that holds a column name — `BareColumn`,
+/// `ThisRowColumn`, `ThisRowColumnRange`, and `Combination` items
+/// (`Column`, `ColumnRange`; `Special` passes through).
+pub fn rewrite_column_ref(
+    expr: &Expr,
+    table_canonical_upper: &str,
+    old_col: &str,
+    new_col: &Arc<str>,
+) -> Expr {
+    match expr {
+        Expr::Number(n) => Expr::Number(*n),
+        Expr::String(s) => Expr::String(s.clone()),
+        Expr::Bool(b) => Expr::Bool(*b),
+        Expr::NameRef(n) => Expr::NameRef(n.clone()),
+        Expr::Error(ev) => Expr::Error(*ev),
+        Expr::CellRef(addr) => Expr::CellRef(addr.clone()),
+        Expr::RangeRef(r) => Expr::RangeRef(r.clone()),
+        Expr::Binary { op, lhs, rhs } => Expr::Binary {
+            op: *op,
+            lhs: Box::new(rewrite_column_ref(
+                lhs,
+                table_canonical_upper,
+                old_col,
+                new_col,
+            )),
+            rhs: Box::new(rewrite_column_ref(
+                rhs,
+                table_canonical_upper,
+                old_col,
+                new_col,
+            )),
+        },
+        Expr::Unary { op, operand } => Expr::Unary {
+            op: *op,
+            operand: Box::new(rewrite_column_ref(
+                operand,
+                table_canonical_upper,
+                old_col,
+                new_col,
+            )),
+        },
+        Expr::Function { name, args } => Expr::Function {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| rewrite_column_ref(a, table_canonical_upper, old_col, new_col))
+                .collect(),
+        },
+        Expr::Array(rows) => Expr::Array(
+            rows.iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| {
+                            rewrite_column_ref(cell, table_canonical_upper, old_col, new_col)
+                        })
+                        .collect()
+                })
+                .collect(),
+        ),
+        Expr::Spill(inner) => Expr::Spill(Box::new(rewrite_column_ref(
+            inner,
+            table_canonical_upper,
+            old_col,
+            new_col,
+        ))),
+        Expr::StructuredRef { table_name, spec } => {
+            if table_name.eq_ignore_ascii_case(table_canonical_upper) {
+                Expr::StructuredRef {
+                    table_name: table_name.clone(),
+                    spec: rewrite_spec_column(spec, old_col, new_col),
+                }
+            } else {
+                Expr::StructuredRef {
+                    table_name: table_name.clone(),
+                    spec: spec.clone(),
+                }
+            }
+        }
+    }
+}
+
+fn rewrite_spec_column(
+    spec: &TableSpecSubtree,
+    old_col: &str,
+    new_col: &Arc<str>,
+) -> TableSpecSubtree {
+    match spec {
+        TableSpecSubtree::BareColumn(name) => {
+            if name.eq_ignore_ascii_case(old_col) {
+                TableSpecSubtree::BareColumn(Arc::clone(new_col))
+            } else {
+                TableSpecSubtree::BareColumn(Arc::clone(name))
+            }
+        }
+        TableSpecSubtree::ThisRowColumn(name) => {
+            if name.eq_ignore_ascii_case(old_col) {
+                TableSpecSubtree::ThisRowColumn(Arc::clone(new_col))
+            } else {
+                TableSpecSubtree::ThisRowColumn(Arc::clone(name))
+            }
+        }
+        TableSpecSubtree::ThisRowColumnRange(c1, c2) => {
+            let nc1 = if c1.eq_ignore_ascii_case(old_col) {
+                Arc::clone(new_col)
+            } else {
+                Arc::clone(c1)
+            };
+            let nc2 = if c2.eq_ignore_ascii_case(old_col) {
+                Arc::clone(new_col)
+            } else {
+                Arc::clone(c2)
+            };
+            TableSpecSubtree::ThisRowColumnRange(nc1, nc2)
+        }
+        TableSpecSubtree::Combination(items) => TableSpecSubtree::Combination(
+            items
+                .iter()
+                .map(|item| rewrite_spec_item_column(item, old_col, new_col))
+                .collect(),
+        ),
+    }
+}
+
+fn rewrite_spec_item_column(
+    item: &TableSpecItem,
+    old_col: &str,
+    new_col: &Arc<str>,
+) -> TableSpecItem {
+    match item {
+        TableSpecItem::Special(s) => TableSpecItem::Special(*s),
+        TableSpecItem::Column(name) => {
+            if name.eq_ignore_ascii_case(old_col) {
+                TableSpecItem::Column(Arc::clone(new_col))
+            } else {
+                TableSpecItem::Column(Arc::clone(name))
+            }
+        }
+        TableSpecItem::ColumnRange(c1, c2) => {
+            let nc1 = if c1.eq_ignore_ascii_case(old_col) {
+                Arc::clone(new_col)
+            } else {
+                Arc::clone(c1)
+            };
+            let nc2 = if c2.eq_ignore_ascii_case(old_col) {
+                Arc::clone(new_col)
+            } else {
+                Arc::clone(c2)
+            };
+            TableSpecItem::ColumnRange(nc1, nc2)
         }
     }
 }

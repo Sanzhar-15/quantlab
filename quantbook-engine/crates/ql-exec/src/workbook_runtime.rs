@@ -244,6 +244,22 @@ pub enum RuntimeError {
     /// that doesn't exist.
     #[error("table {0:?} not found")]
     TableNotFound(String),
+
+    /// **W5-121 (Phase 4.8.I.2):** `rename_column` referenced a column
+    /// name (case-insensitive) that does not exist in the target table.
+    #[error("table {table:?} has no column {column:?}")]
+    TableColumnNotFound { table: String, column: String },
+
+    /// **W5-121 (Phase 4.8.I.2):** `rename_column` was rejected by a
+    /// validation rule (target column name already in the table, empty,
+    /// etc.). `reason` is a static string describing which invariant
+    /// fired.
+    #[error("table {table:?} column {column:?} rejected: {reason}")]
+    TableColumnRejected {
+        table: String,
+        column: String,
+        reason: &'static str,
+    },
 }
 
 impl From<LexError> for RuntimeError {
@@ -1675,11 +1691,8 @@ impl<'a> WorkbookRuntime<'a> {
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            let new_expr = ql_formula_syntax::rewrite_table_ref(
-                &expr,
-                &old_canonical,
-                &new_display_arc,
-            );
+            let new_expr =
+                ql_formula_syntax::rewrite_table_ref(&expr, &old_canonical, &new_display_arc);
             if new_expr == expr {
                 continue; // no StructuredRef references the renamed table
             }
@@ -1708,12 +1721,148 @@ impl<'a> WorkbookRuntime<'a> {
         let new_canonical_arc: Arc<str> = Arc::from(new_canonical.as_str());
         meta.name = Arc::clone(&new_canonical_arc);
         meta.display_name = Arc::clone(&new_display_arc);
-        self.workbook
-            .tables_mut()
-            .insert(new_canonical_arc, meta);
+        self.workbook.tables_mut().insert(new_canonical_arc, meta);
         // Invalidate plan cache by clearing — every formula that
         // referenced the OLD name now has new text, so cache lookups
         // miss anyway; the bare invalidation prevents stale entries.
+        self.plan_cache.clear();
+        Ok(rewritten)
+    }
+
+    /// **W5-121 (Phase 4.8.I.2):** rename a column within an existing
+    /// table. Mirrors [`Self::rename_table`] semantics for column refs:
+    /// rewrites stored formula text in every cell whose StructuredRef
+    /// references the renamed column (Excel canon — the next bind sees
+    /// the new name).
+    ///
+    /// Process:
+    /// 1. Validate: table exists; source column exists (case-insensitive);
+    ///    target name available within the table; non-empty; not a no-op
+    ///    (same lowercase canonical).
+    /// 2. Op-log append `Op::RenameColumn` (before any mutation).
+    /// 3. Walk every formula cell; parse the text; rewrite via
+    ///    `ast::rewrite_column_ref` (scoped to refs matching the
+    ///    canonical table name); if the AST changed, print + emit
+    ///    `Op::PutFormula` + update storage.
+    /// 4. Mutate the matching `TableColumn` entry's lowercase canonical
+    ///    `name` and case-preserving `display`; bump TableTable
+    ///    generation so plan caches invalidate.
+    ///
+    /// Returns the number of formula cells whose text was rewritten.
+    /// Cross-table isolation: structured refs to OTHER tables pass
+    /// through unchanged even when they mention a column with the same
+    /// name. Same-canonical rename returns `Ok(0)` without emitting an
+    /// op (mirrors [`Self::rename_table`]).
+    pub fn rename_column(
+        &mut self,
+        table_name: &str,
+        old_col: &str,
+        new_col: &str,
+    ) -> Result<usize, RuntimeError> {
+        let table_canonical = table_name.to_ascii_uppercase();
+        // Validate table exists.
+        let meta = self
+            .workbook
+            .tables()
+            .lookup(&table_canonical)
+            .ok_or_else(|| RuntimeError::TableNotFound(table_name.to_owned()))?;
+        // Validate source column exists.
+        if meta.lookup_column(old_col).is_none() {
+            return Err(RuntimeError::TableColumnNotFound {
+                table: table_name.to_owned(),
+                column: old_col.to_owned(),
+            });
+        }
+        // Empty target rejected.
+        if new_col.is_empty() {
+            return Err(RuntimeError::TableColumnRejected {
+                table: table_name.to_owned(),
+                column: new_col.to_owned(),
+                reason: "column name cannot be empty",
+            });
+        }
+        // No-op rename (same lowercase canonical) — accept silently
+        // without emitting an op. Mirrors `rename_table`. Display-only
+        // case rename is deferred to a future sub-phase.
+        let old_lower = old_col.to_ascii_lowercase();
+        let new_lower = new_col.to_ascii_lowercase();
+        if old_lower == new_lower {
+            return Ok(0);
+        }
+        // Target uniqueness within the table.
+        if meta.lookup_column(new_col).is_some() {
+            return Err(RuntimeError::TableColumnRejected {
+                table: table_name.to_owned(),
+                column: new_col.to_owned(),
+                reason: "column with this canonical name already exists (rename target)",
+            });
+        }
+        // Op-log append BEFORE mutation (W5-103 atomicity). RenameColumn
+        // + N PutFormula ops; if the log append fails, no workbook state
+        // has changed yet.
+        if let Some(oplog) = self.oplog.as_deref_mut() {
+            oplog.append(Op::RenameColumn {
+                table: table_canonical.clone(),
+                old_name: old_col.to_owned(),
+                new_name: new_col.to_owned(),
+            })?;
+        }
+        // Walk formula cells and rewrite. Collect first to avoid borrow
+        // conflicts (iter holds &workbook; rewrite needs &mut workbook).
+        let new_display_arc: Arc<str> = Arc::from(new_col);
+        let formulas: Vec<(SheetId, RowId, ColId, Arc<str>)> = self
+            .workbook
+            .iter_formulas()
+            .map(|(s, r, c, text)| (s, r, c, Arc::clone(text)))
+            .collect();
+        let mut rewritten = 0;
+        for (s, r, c, text) in formulas {
+            let tokens = match lex(text.as_ref()) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let expr = match parse(tokens) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let new_expr = ql_formula_syntax::rewrite_column_ref(
+                &expr,
+                &table_canonical,
+                old_col,
+                &new_display_arc,
+            );
+            if new_expr == expr {
+                continue;
+            }
+            let new_text = ql_formula_syntax::print(&new_expr);
+            if let Some(oplog) = self.oplog.as_deref_mut() {
+                oplog.append(Op::PutFormula {
+                    sheet: s,
+                    row: r,
+                    col: c,
+                    text: new_text.clone(),
+                })?;
+            }
+            self.workbook.put_formula(s, r, c, new_text);
+            rewritten += 1;
+        }
+        // Mutate the column metadata in place.
+        let meta = self
+            .workbook
+            .tables_mut()
+            .get_mut(&table_canonical)
+            .expect("verified at top");
+        let (col_idx, _) = meta
+            .lookup_column(old_col)
+            .expect("verified at top before any mutation");
+        meta.columns[col_idx as usize].name = Arc::from(new_lower.as_str());
+        meta.columns[col_idx as usize].display = Arc::clone(&new_display_arc);
+        // `get_mut` doesn't bump generation; do it explicitly so plan
+        // caches keyed on `TableTable::generation` invalidate.
+        self.workbook.tables_mut().bump_generation();
+        // Invalidate plan cache by clearing — every formula that
+        // referenced the OLD column now has new text, so cache lookups
+        // miss anyway; bare invalidation prevents stale entries.
         self.plan_cache.clear();
         Ok(rewritten)
     }
@@ -2268,10 +2417,8 @@ impl<'a> WorkbookRuntime<'a> {
             self.workbook,
         )?;
         // **W5-117 (Phase 4.8.G.2):** carry cell for `[@Col]` narrowing.
-        let env = WorkbookEnv::with_formula_cell(
-            self.workbook,
-            ql_types::Address::new(sheet, row, col),
-        );
+        let env =
+            WorkbookEnv::with_formula_cell(self.workbook, ql_types::Address::new(sheet, row, col));
         // **W5-103 megaudit MEDIUM-3 closure (#129):** route through
         // `eval_at_cell_boundary` so a top-level array literal like
         // `{1, 2, 3}` returns the anchor value (array.at(0,0)) instead
@@ -9156,11 +9303,31 @@ mod tests {
         let mut wb = make_runtime_workbook();
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-        rt.create_table("A", 0, 0, 0, 5, 2, true, false, vec!["x".into(), "y".into()])
-            .unwrap();
+        rt.create_table(
+            "A",
+            0,
+            0,
+            0,
+            5,
+            2,
+            true,
+            false,
+            vec!["x".into(), "y".into()],
+        )
+        .unwrap();
         // Overlapping footprint should reject.
         let err = rt
-            .create_table("B", 0, 2, 1, 3, 2, true, false, vec!["p".into(), "q".into()])
+            .create_table(
+                "B",
+                0,
+                2,
+                1,
+                3,
+                2,
+                true,
+                false,
+                vec!["p".into(), "q".into()],
+            )
             .unwrap_err();
         match err {
             RuntimeError::TableCreateRejected { reason, .. } => {
@@ -9251,18 +9418,8 @@ mod tests {
         let reg = default_registry();
         {
             let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-            rt.create_table(
-                "Sales",
-                0,
-                0,
-                0,
-                3,
-                1,
-                true,
-                false,
-                vec!["Qty".into()],
-            )
-            .unwrap();
+            rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+                .unwrap();
         }
         wb.put(ql_types::Address::new(0, 1, 0), Value::Number(10.0));
         wb.put(ql_types::Address::new(0, 2, 0), Value::Number(20.0));
@@ -9282,10 +9439,7 @@ mod tests {
         assert!(wb.lookup_table("Sales").is_none());
         assert!(wb.lookup_table("Orders").is_some());
         // Verify formula text rewritten.
-        let text = wb
-            .formula_at(0, 10, 0)
-            .expect("formula present")
-            .clone();
+        let text = wb.formula_at(0, 10, 0).expect("formula present").clone();
         assert!(
             text.contains("Orders"),
             "formula text should now reference Orders, got: {text}"
@@ -9358,11 +9512,185 @@ mod tests {
         }
     }
 
-    /// **End-to-end with op log**: create_table emits Op::CreateTable;
-    /// SUM(Sales[Qty]) using the just-created table works. Validates
-    /// the runtime API end-to-end.
+    // ===== W5-121 (Phase 4.8.I.2) — rename_column =====
+
     #[test]
-    fn create_table_then_sum_column_works() {
+    fn rename_column_happy_path_rewrites_formula_text() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+        }
+        wb.put(ql_types::Address::new(0, 1, 0), Value::Number(10.0));
+        wb.put(ql_types::Address::new(0, 2, 0), Value::Number(20.0));
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let v = rt.set_formula(0, 10, 0, "SUM(Sales[Qty])").unwrap();
+            assert_eq!(v, Value::Number(30.0));
+        }
+        let rewritten = {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.rename_column("Sales", "Qty", "Quantity").unwrap()
+        };
+        assert_eq!(rewritten, 1, "one formula was rewritten");
+        // TableMetadata reflects rename.
+        let meta = wb.lookup_table("Sales").expect("table present");
+        let (idx, col) = meta.lookup_column("Quantity").expect("new column present");
+        assert_eq!(idx, 0);
+        assert_eq!(col.name.as_ref(), "quantity");
+        assert_eq!(col.display.as_ref(), "Quantity");
+        assert!(
+            meta.lookup_column("Qty").is_none(),
+            "old column gone from metadata"
+        );
+        // Formula text rewritten.
+        let text = wb.formula_at(0, 10, 0).expect("formula present").clone();
+        assert!(
+            text.contains("Quantity"),
+            "formula text should reference Quantity, got: {text}"
+        );
+        assert!(
+            !text.contains("Qty"),
+            "formula text should NOT reference Qty after rename, got: {text}"
+        );
+        // Recompute confirms re-bind against the new column name.
+        let v = {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            assert!(rt.recompute_all().is_complete());
+            wb.read(ql_types::Address::new(0, 10, 0))
+        };
+        assert_eq!(v, Value::Number(30.0));
+    }
+
+    #[test]
+    fn rename_column_combination_form_rewritten() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.create_table(
+                "Sales",
+                0,
+                0,
+                0,
+                3,
+                2,
+                true,
+                false,
+                vec!["Qty".into(), "Price".into()],
+            )
+            .unwrap();
+        }
+        wb.put(ql_types::Address::new(0, 1, 0), Value::Number(10.0));
+        wb.put(ql_types::Address::new(0, 2, 0), Value::Number(20.0));
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            // Multi-item combination: select #Data rows of Qty.
+            let v = rt
+                .set_formula(0, 10, 0, "SUM(Sales[[#Data], [Qty]])")
+                .unwrap();
+            assert_eq!(v, Value::Number(30.0));
+        }
+        let rewritten = {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.rename_column("Sales", "Qty", "Quantity").unwrap()
+        };
+        assert_eq!(rewritten, 1);
+        let text = wb.formula_at(0, 10, 0).expect("formula").clone();
+        assert!(text.contains("Quantity"), "got: {text}");
+        assert!(!text.contains("Qty"), "got: {text}");
+        // Other column untouched.
+        let meta = wb.lookup_table("Sales").unwrap();
+        assert!(meta.lookup_column("Price").is_some());
+    }
+
+    #[test]
+    fn rename_column_this_row_form_rewritten() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.create_table(
+                "Sales",
+                0,
+                0,
+                0,
+                3,
+                2,
+                true,
+                false,
+                vec!["Qty".into(), "Doubled".into()],
+            )
+            .unwrap();
+        }
+        wb.put(ql_types::Address::new(0, 1, 0), Value::Number(10.0));
+        wb.put(ql_types::Address::new(0, 2, 0), Value::Number(20.0));
+        // `=Sales[@Qty]*2` at B2 (data row 0).
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let v = rt.set_formula(0, 1, 1, "Sales[@Qty]*2").unwrap();
+            assert_eq!(v, Value::Number(20.0));
+        }
+        let rewritten = {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.rename_column("Sales", "Qty", "Quantity").unwrap()
+        };
+        assert_eq!(rewritten, 1);
+        let text = wb.formula_at(0, 1, 1).expect("formula").clone();
+        assert!(text.contains("Quantity"), "got: {text}");
+        assert!(!text.contains("Qty"), "got: {text}");
+        // Re-eval still produces 20.
+        let v = {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            assert!(rt.recompute_all().is_complete());
+            wb.read(ql_types::Address::new(0, 1, 1))
+        };
+        assert_eq!(v, Value::Number(20.0));
+    }
+
+    #[test]
+    fn rename_column_other_table_unaffected() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            // Two tables with the same column name.
+            rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+            rt.create_table("Orders", 0, 0, 5, 3, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+        }
+        wb.put(ql_types::Address::new(0, 1, 0), Value::Number(10.0));
+        wb.put(ql_types::Address::new(0, 2, 0), Value::Number(20.0));
+        wb.put(ql_types::Address::new(0, 6, 0), Value::Number(100.0));
+        wb.put(ql_types::Address::new(0, 7, 0), Value::Number(200.0));
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.set_formula(0, 10, 0, "SUM(Sales[Qty])").unwrap();
+            rt.set_formula(0, 11, 0, "SUM(Orders[Qty])").unwrap();
+        }
+        let rewritten = {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.rename_column("Sales", "Qty", "Quantity").unwrap()
+        };
+        assert_eq!(rewritten, 1, "only the Sales formula was rewritten");
+        // Sales formula updated.
+        let sales_text = wb.formula_at(0, 10, 0).expect("formula").clone();
+        assert!(sales_text.contains("Quantity"), "got: {sales_text}");
+        // Orders formula untouched.
+        let orders_text = wb.formula_at(0, 11, 0).expect("formula").clone();
+        assert!(orders_text.contains("Qty"), "got: {orders_text}");
+        assert!(!orders_text.contains("Quantity"), "got: {orders_text}");
+        // Orders column metadata untouched too.
+        let orders = wb.lookup_table("Orders").unwrap();
+        assert!(orders.lookup_column("Qty").is_some());
+        assert!(orders.lookup_column("Quantity").is_none());
+    }
+
+    #[test]
+    fn rename_column_target_collision_errors() {
         let mut wb = make_runtime_workbook();
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
@@ -9371,13 +9699,127 @@ mod tests {
             0,
             0,
             0,
-            3,
-            1,
+            2,
+            2,
             true,
             false,
-            vec!["Qty".into()],
+            vec!["Qty".into(), "Price".into()],
         )
         .unwrap();
+        let err = rt.rename_column("Sales", "Qty", "Price").unwrap_err();
+        match err {
+            RuntimeError::TableColumnRejected { reason, .. } => {
+                assert!(reason.contains("rename target"), "reason: {reason}");
+            }
+            other => panic!("expected TableColumnRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_column_missing_source_errors() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.create_table("Sales", 0, 0, 0, 2, 1, true, false, vec!["Qty".into()])
+            .unwrap();
+        let err = rt.rename_column("Sales", "Nope", "Whatever").unwrap_err();
+        match err {
+            RuntimeError::TableColumnNotFound { table, column } => {
+                assert_eq!(table, "Sales");
+                assert_eq!(column, "Nope");
+            }
+            other => panic!("expected TableColumnNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_column_unknown_table_errors() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt.rename_column("Nope", "A", "B").unwrap_err();
+        match err {
+            RuntimeError::TableNotFound(n) => assert_eq!(n, "Nope"),
+            other => panic!("expected TableNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_column_empty_target_errors() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.create_table("Sales", 0, 0, 0, 2, 1, true, false, vec!["Qty".into()])
+            .unwrap();
+        let err = rt.rename_column("Sales", "Qty", "").unwrap_err();
+        match err {
+            RuntimeError::TableColumnRejected { reason, .. } => {
+                assert!(reason.contains("cannot be empty"), "reason: {reason}");
+            }
+            other => panic!("expected TableColumnRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_column_same_canonical_is_noop() {
+        // Display-only case rename (e.g. "Qty" → "QTY") shares the
+        // lowercase canonical, so the runtime accepts silently with
+        // Ok(0) and emits no op. Mirrors `rename_table` policy.
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.create_table("Sales", 0, 0, 0, 2, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+            let n = rt.rename_column("Sales", "Qty", "QTY").unwrap();
+            assert_eq!(n, 0);
+        }
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        // Only the CreateTable op landed; no RenameColumn op emitted.
+        assert_eq!(ops.len(), 1, "got {ops:?}");
+        assert!(matches!(&ops[0], Op::CreateTable { .. }));
+    }
+
+    #[test]
+    fn rename_column_emits_ops() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.create_table("S", 0, 0, 0, 2, 1, true, false, vec!["Q".into()])
+                .unwrap();
+            rt.set_formula(0, 5, 0, "SUM(S[Q])").unwrap();
+            let n = rt.rename_column("S", "Q", "R").unwrap();
+            assert_eq!(n, 1);
+        }
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        // CreateTable + PutFormula + RenameColumn + PutFormula (rewrite).
+        assert_eq!(ops.len(), 4, "got {ops:?}");
+        assert!(
+            matches!(&ops[2], Op::RenameColumn { table, old_name, new_name }
+            if table == "S" && old_name == "Q" && new_name == "R")
+        );
+        match &ops[3] {
+            Op::PutFormula { text, .. } => {
+                assert!(text.contains('R'), "text: {text}");
+                assert!(!text.contains('Q'), "text: {text}");
+            }
+            other => panic!("expected PutFormula for rewrite, got {other:?}"),
+        }
+    }
+
+    /// **End-to-end with op log**: create_table emits Op::CreateTable;
+    /// SUM(Sales[Qty]) using the just-created table works. Validates
+    /// the runtime API end-to-end.
+    #[test]
+    fn create_table_then_sum_column_works() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+            .unwrap();
         drop(rt);
         wb.put(ql_types::Address::new(0, 1, 0), Value::Number(7.0));
         wb.put(ql_types::Address::new(0, 2, 0), Value::Number(13.0));

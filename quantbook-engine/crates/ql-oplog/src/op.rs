@@ -184,7 +184,26 @@ pub enum Op {
     /// Replay validates: target name available (NameTable + TableTable),
     /// source name exists. Sheet-scoped names use the workbook's
     /// shared canonical namespace.
-    RenameTable {
+    RenameTable { old_name: String, new_name: String },
+
+    /// **W5-121 (Phase 4.8.I.2):** rename a single column within a table.
+    ///
+    /// Producer side ALSO rewrites stored formula text in every cell
+    /// referencing the renamed column (Excel canon — same semantic as
+    /// `RenameTable`). The op carries `table` (canonical uppercase) so
+    /// replay can locate the table; `old_name` and `new_name` are case-
+    /// preserving identifiers (replay matches `old_name` case-
+    /// insensitively against `TableColumn::name`, which is stored
+    /// lowercase-canonical). Producer-side formula-text rewrites land as
+    /// accompanying `Op::PutFormula` entries in the same op-log sequence.
+    ///
+    /// Replay validates: target table exists, source column exists,
+    /// target column name available within the table (case-insensitive).
+    /// Same-canonical rename is rejected at producer side (returns
+    /// `Ok(0)` no-op without emitting); replay treats receipt of a
+    /// same-canonical op as a divergence and rejects.
+    RenameColumn {
+        table: String,
         old_name: String,
         new_name: String,
     },
