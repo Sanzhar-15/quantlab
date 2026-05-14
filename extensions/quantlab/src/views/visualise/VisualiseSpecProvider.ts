@@ -77,6 +77,7 @@ import {
 } from '../../qviz/persist';
 import { decideSave } from '../../qviz/saveDecision';
 import { mapDaemonCapsForInit } from '../../qviz/capabilitiesTransform';
+import { stripInspectorFilterAttribution } from '../../qviz/attributionTransform';
 import type { QvizSpec } from '../../qviz/spec';
 import { QvizSpecDocument, type QvizSpecChangeEvent, SaveConflictError } from './QvizSpecDocument';
 
@@ -1353,14 +1354,10 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 			//
 			// Front 2 audit LOW (Opus, 2026-05-14): empty attribution
 			// arrays (spec has no transforms) are normalized to absent.
-			const rawAttribution = r.meta.attribution;
-			const filterCount = inspectorFilters?.length ?? 0;
-			let attribution: typeof rawAttribution = rawAttribution;
-			if (rawAttribution !== undefined && filterCount > 0) {
-				attribution = rawAttribution
-					.slice(filterCount)
-					.map(rec => ({ ...rec, index: rec.index - filterCount }));
-			}
+			const attribution = stripInspectorFilterAttribution(
+				r.meta.attribution as import('../../qviz/messageProtocol').DataMessage['attribution'],
+				inspectorFilters?.length ?? 0,
+			);
 			this.postOrLog(panel, {
 				type: 'data',
 				protocolVersion: PROTOCOL_VERSION,
