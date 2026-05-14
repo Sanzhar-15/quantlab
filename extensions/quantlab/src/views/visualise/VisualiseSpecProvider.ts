@@ -1038,6 +1038,23 @@ export class VisualiseSpecProvider implements vscode.CustomEditorProvider<QvizSp
 			void vscode.window.showErrorMessage(
 				`Visualise spec: malformed webview message (${result.error})`,
 			);
+			// Ghost-bar flicker audit (2026-05-14): if the malformed
+			// message has a recoverable shape (requestId + specHash,
+			// which `requestData` and `edit` both carry), post an
+			// `errorReceived` back so the webview's `query.inflight`
+			// resolves. Without this, the webview leaves inflight set
+			// forever and the skeleton ghost-bars pulse indefinitely
+			// while the toast keeps re-firing every 200ms (the
+			// REQUEST_DATA_DEBOUNCE_MS feedback loop). This is the
+			// counterpart to the webview-side `lastRequestedKey` dedup.
+			if (rawMsg !== null && typeof rawMsg === 'object') {
+				const rid = (rawMsg as { requestId?: unknown }).requestId;
+				const sh = (rawMsg as { specHash?: unknown }).specHash;
+				if (typeof rid === 'number' && typeof sh === 'string') {
+					this.postEnvelopeError(panel, rid, sh,
+						`malformed message: ${result.error}`, 'protocol');
+				}
+			}
 			return;
 		}
 		const msg = result.value;

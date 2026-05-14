@@ -212,6 +212,16 @@ function init(): void {
 	};
 	let resizeTimer: ReturnType<typeof setTimeout> | null = null;
 	const RESIZE_DEBOUNCE_MS = 120;
+	// Ghost-bar flicker audit (Codex, 2026-05-14): if a render fails
+	// on a given (specHash, themeVersion) combo, the chart-canvas
+	// teardown can fire ResizeObserver which would re-attempt the
+	// IDENTICAL failing render every ~120ms. Suppress: remember the
+	// key of the last failure; skip resize retries until the key
+	// genuinely changes (new spec, new theme, new data). Cleared in
+	// the live-subscription's render block on success.
+	let lastFailedResizeKey: string | null = null;
+	const buildResizeKey = (specHash: string, themeVersion: number): string =>
+		`${specHash}\n${themeVersion}`;
 	const resizeObserver = new ResizeObserver(() => {
 		if (resizeTimer !== null) { clearTimeout(resizeTimer); }
 		resizeTimer = setTimeout(() => {
@@ -224,6 +234,10 @@ function init(): void {
 			const spec = state.spec.current;
 			const data = state.query.lastData;
 			if (spec === null || data === null) { return; }
+			// Ghost-bar flicker suppression: skip identical-failing
+			// re-renders.
+			const resizeKey = buildResizeKey(data.specHash, state.ui.themeTokensVersion);
+			if (resizeKey === lastFailedResizeKey) { return; }
 			// Front 2 audit MEDIUM (Opus + Codex, 2026-05-14): when the
 			// spec has been edited but the new dataReceived has not yet
 			// landed, `spec` is the NEW spec while `data` is the OLD
@@ -240,7 +254,11 @@ function init(): void {
 			void renderActiveData(renderer, spec, data.arrow,
 				data.specHash,
 				dispatchExtractError, dispatchRenderError,
-				attrForRender);
+				attrForRender).then(ok => {
+				if (!ok) {
+					lastFailedResizeKey = resizeKey;
+				}
+			});
 		}, RESIZE_DEBOUNCE_MS);
 	});
 	resizeObserver.observe(preview.chartContainer);
@@ -294,13 +312,42 @@ function init(): void {
 	// `lastDispatchedHash` was dead code retained for a comment that
 	// no longer matched the implementation. (Megaudit Theme D D14,
 	// 2026-05-13.)
+	//
+	// Ghost-bar flicker audit (Codex, 2026-05-14): two-step request
+	// de-dup using a (specHash, filtersHash) key. Stops the request-
+	// loop where `requestStarted`'s OWN dispatch fires the subscriber
+	// synchronously, which then re-checks the gate (still null
+	// `lastSuccessfullyRenderedKey` because no render has succeeded)
+	// and re-schedules. Combined with the provider-side errorReceived
+	// fix below, this drains inflight whether the daemon responds or
+	// the validator rejects.
 	let lastDispatchedEditHash: string | null = null;
 	let lastRenderedDataHash: string | null = null;
+	let lastSuccessfullyRenderedKey: string | null = null;
+	let lastRequestedKey: string | null = null;
 	let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-	const scheduleRequestData = (spec: QvizSpec, specHash: string): void => {
+	const chartRequestKey = (specHash: string, filtersHash: string): string =>
+		`${specHash}\n${filtersHash}`;
+	const scheduleRequestData = (
+		spec: QvizSpec, specHash: string, filtersHash: string,
+	): void => {
+		const key = chartRequestKey(specHash, filtersHash);
+		// First short-circuit (synchronous): if we've already requested
+		// or rendered this key, no need to even start the debounce.
+		if (key === lastRequestedKey || key === lastSuccessfullyRenderedKey) {
+			return;
+		}
 		if (debounceTimer !== null) { clearTimeout(debounceTimer); }
 		debounceTimer = setTimeout(() => {
 			debounceTimer = null;
+			// Re-check the key at debounce-fire time using fresh state
+			// (filtersHash may have changed during the 200ms window).
+			const currentFiltersHash = JSON.stringify(store.getState().inspector.filters);
+			const currentKey = chartRequestKey(specHash, currentFiltersHash);
+			if (currentKey === lastRequestedKey || currentKey === lastSuccessfullyRenderedKey) {
+				return;
+			}
+			lastRequestedKey = currentKey;
 			// Step 5.H.2: send `edit` BEFORE `requestData` so VS Code's
 			// undo stack gets the new spec recorded as an edit step.
 			// Provider's handleEdit suppresses the contentChange echo
@@ -350,6 +397,12 @@ function init(): void {
 	// 'fields-missing').
 	let lastObservedSchemaInfo: unknown = null;
 	let lastObservedFiltersHash = '';
+	// Ghost-bar flicker audit (2026-05-14): track lastErrorRequestId so
+	// the live sub can reset `lastRequestedKey` exactly once per error
+	// (otherwise the key-based dedup would persistently block a re-
+	// request after the user edits the spec — but only if their new
+	// hash happens to match a previously-rejected one).
+	let lastObservedErrorRequestId: number | null = null;
 	const liveSubscription = store.subscribe((state) => {
 		// Live-preview trigger. Megaudit MAJOR-33: the prior gate
 		// (`hash !== lastDispatchedHash`) silently swallowed undo when
@@ -378,6 +431,11 @@ function init(): void {
 			// would just be wasted IPC.
 			lastSuccessfullyRenderedHash = null;
 			lastRenderedDataHash = null;
+			// Ghost-bar flicker audit (2026-05-14): also null the key-
+			// based cursors so the new-schema refetch is allowed past
+			// the dedup guard.
+			lastSuccessfullyRenderedKey = null;
+			lastRequestedKey = null;
 		}
 		// Phase 6 (6.D.3): inspector filter edits don't change the spec
 		// hash, but they DO change the data the chart should render. When
@@ -389,9 +447,29 @@ function init(): void {
 			lastObservedFiltersHash = filtersHash;
 			lastSuccessfullyRenderedHash = null;
 			lastRenderedDataHash = null;
+			// Key-based cursors: the (specHash, filtersHash) key itself
+			// encodes the filters change, so the new key naturally
+			// differs from the old. No explicit null needed -- but we
+			// null lastRequestedKey to allow re-request even if the
+			// previous request for the new key was already-issued state
+			// (e.g., user toggled filters back and forth in <200ms).
+			lastRequestedKey = null;
+		}
+		// Ghost-bar flicker audit (2026-05-14): if the inflight state
+		// just cleared via errorReceived (validation failure / daemon
+		// error), the user fixed the spec OR we'll wait for them to.
+		// Reset lastRequestedKey so a future spec edit can re-request
+		// even if the new spec's key matches an earlier-rejected one
+		// (e.g., user undoes their fix).
+		if (state.query.lastErrorRequestId !== null
+			&& state.query.inflight === null
+			&& state.query.lastErrorRequestId !== lastObservedErrorRequestId
+		) {
+			lastObservedErrorRequestId = state.query.lastErrorRequestId;
+			lastRequestedKey = null;
 		}
 		if (spec !== null && hash !== null && hash !== lastSuccessfullyRenderedHash) {
-			scheduleRequestData(spec, hash);
+			scheduleRequestData(spec, hash, filtersHash);
 		}
 		// Render trigger: a fresh data hash OR a theme bump. Theme
 		// bumps re-render the existing chart with new theme tokens
@@ -403,6 +481,11 @@ function init(): void {
 			lastRenderedDataHash = state.query.lastData.specHash;
 			lastRenderedThemeVersion = state.ui.themeTokensVersion;
 			lastSuccessfullyRenderedHash = state.query.lastData.specHash;
+			// Ghost-bar flicker audit (2026-05-14): also mark the key-
+			// based cursor so future schedule-request calls skip when
+			// the (specHash, filtersHash) combo is already on screen.
+			lastSuccessfullyRenderedKey = chartRequestKey(
+				state.query.lastData.specHash, filtersHash);
 			// Front 2 audit MEDIUM: same stale-attribution gate as the
 			// resize path above. Spec edited but new data not yet
 			// arrived -> drop attribution so the error message doesn't
@@ -410,10 +493,22 @@ function init(): void {
 			const attrForRender = state.query.lastData.specHash === state.spec.currentHash
 				? state.query.lastData.attribution
 				: null;
+			// Ghost-bar flicker audit (2026-05-14): pre-render, clear
+			// any stale resize-retry suppression. If THIS render
+			// succeeds, the resize handler will re-render on legit
+			// container size changes. If THIS render fails too, the
+			// resize handler will record the failure key and suppress.
+			lastFailedResizeKey = null;
 			void renderActiveData(renderer, spec, state.query.lastData.arrow,
 				state.query.lastData.specHash,
 				dispatchExtractError, dispatchRenderError,
-				attrForRender);
+				attrForRender).then(ok => {
+				if (!ok) {
+					lastFailedResizeKey = buildResizeKey(
+						state.query.lastData!.specHash,
+						state.ui.themeTokensVersion);
+				}
+			});
 		}
 	});
 	// liveSubscription is a store-unsubscribe function; called in the
@@ -871,7 +966,16 @@ async function renderActiveData(
 	// "column not in data" errors name the responsible transform. `null`
 	// on pre-Front-2 daemons; the renderer falls back to plain messages.
 	attribution: readonly TransformAttribution[] | null,
-): Promise<void> {
+): Promise<boolean> {
+	// Ghost-bar flicker audit (Codex, 2026-05-14): return ok/fail so
+	// the resize-observer caller can suppress retries of an identical
+	// failing render. Without this, a chart whose data fails the
+	// renderer's invariants (e.g., OhlcDataStore "strictly increasing
+	// time values") gets re-attempted every ~120ms because each render
+	// failure tears down the chart canvas → ResizeObserver fires →
+	// re-render. Returns `true` on success, `false` on extract/apply
+	// failure. Live-subscription caller can ignore the result; the
+	// resize handler uses it for retry suppression.
 	let columns: ColumnData;
 	try {
 		columns = extractColumnsFromArrowIpc(arrow);
@@ -881,7 +985,7 @@ async function renderActiveData(
 		const message = `arrow extraction failed: ${(e as Error).message}`;
 		console.error('qviz-spec:', message);
 		dispatchExtractError(triggerSpecHash, message);
-		return;
+		return false;
 	}
 	const theme = readThemeFromCssVars();
 	const result = await renderer.render(spec, columns, theme, attribution);
@@ -891,7 +995,9 @@ async function renderActiveData(
 		const message = `renderer ${result.stage} failed: ${result.error}`;
 		console.warn('qviz-spec:', message);
 		dispatchRenderError(triggerSpecHash, result.stage, message);
+		return false;
 	}
+	return true;
 }
 
 /** Read the VS Code CSS custom properties into a single token bag.
