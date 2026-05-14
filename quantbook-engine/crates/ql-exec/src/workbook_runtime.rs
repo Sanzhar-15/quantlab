@@ -2048,167 +2048,206 @@ impl<'a> WorkbookRuntime<'a> {
         let mut session_slot = self.graph.take();
         let session = session_slot.as_deref_mut()?;
 
-        // Phase 3.4: claim dirty + topo-sort. Edges in the graph
-        // model the dep direction (`outgoing(F) = what F depends on`).
-        // Tarjan emits SCCs in reverse-topo of the condensation
-        // which, for our edge orientation, is dependency-first order.
-        let sched = session.schedule_dirty();
-        let attempted = sched.total_count();
+        // **W5-106 (Phase 4.7.M / task #136 closure)**: fixed-point
+        // loop. Each iteration:
+        //   1. claim + schedule the current dirty set.
+        //   2. snapshot prior + originally_dirty for newly-seen nodes
+        //      (carry across iterations so VEQ short-circuit still
+        //      works on second-iter D1's that depend on iter-1
+        //      formulas).
+        //   3. evaluate cycled + sorted.
+        //   4. if write_spill fired during the sorted loop, it called
+        //      on_set_value at spill-footprint cells, adding to dirty.
+        //   5. loop until session.dirty is empty.
+        //
+        // Bounded by `MAX_ITERATIONS` to prevent runaway in pathological
+        // cases (a workbook configuration that would not terminate).
+        // 100 is generous — any single set_value edit normally needs
+        // ≤ 2 iterations (one for the initial dirty set, one for spill
+        // shape-transition follow-ups).
+        const MAX_ITERATIONS: usize = 100;
+        let mut attempted: usize = 0;
         let mut succeeded = 0;
         let mut failures: Vec<RecomputeFailure> = Vec::new();
         let mut skipped_value_equality: usize = 0;
-        // Phase 3.9 (W5-42): SIMD-eligibility profile. Incremented
-        // each time a re-evaluated formula's plan classifies into a
-        // recognized `SimdShape` (i.e. not `NotApplicable`). V1
-        // observability only — actual bulk SIMD dispatch via
-        // `simd::*` happens on the bench / FormulaRegion path
-        // (Phase 4.7+). The fact that the graph scheduler counts
-        // these tells the IDE / profile reader where region
-        // optimization would pay off.
+        // Phase 3.9 (W5-42): SIMD-eligibility profile. V1 observability
+        // only.
         let mut simd_classified: usize = 0;
 
         // Phase 3.8 (W5-41, VEQ-3-01..03) — value-equality short-
-        // circuit. State for the pass:
-        //   - `prior`: workbook value at each sched node BEFORE we
-        //     touch anything. Snapshotted once, used as the equality
-        //     baseline.
-        //   - `originally_dirty`: NodeIds that were in the dirty set
-        //     coming in to this call. Used to distinguish "top-level
-        //     dirty" (came from an external edit; must re-eval) from
-        //     "downstream dirty" (only here because an upstream
-        //     formula was dirty; check if upstream actually changed).
+        // circuit. State accumulates across fixed-point iterations:
+        //   - `prior`: workbook value at each first-seen node, captured
+        //     BEFORE that iteration's evaluation. Carries across iters
+        //     so VEQ comparisons stay anchored to the pre-recompute
+        //     value, not intermediate spill-write values.
+        //   - `originally_dirty`: NodeIds claimed by ANY iteration's
+        //     schedule. Used to distinguish "top-level dirty" from
+        //     "downstream dirty" for the VEQ decision.
         //   - `changed`: addresses whose value differs from `prior`
-        //     after this pass. Built as we go; downstream formulas
-        //     check membership to decide whether to re-eval.
+        //     after any iteration's write. Built up across iters.
         use std::collections::{HashMap, HashSet};
         let mut prior: HashMap<(SheetId, RowId, ColId), Value> = HashMap::new();
         let mut originally_dirty: HashSet<ql_calcgraph::NodeId> = HashSet::new();
-        for n in sched.sorted.iter().chain(sched.cycled.iter()) {
-            originally_dirty.insert(*n);
-            if let Some(addr) = session.cell_address_for(*n) {
-                prior.insert(
-                    addr,
-                    self.workbook
-                        .read(ql_types::Address::new(addr.0, addr.1, addr.2)),
-                );
-            }
-        }
         let mut changed: HashSet<(SheetId, RowId, ColId)> = HashSet::new();
 
-        // Cycled nodes get `#CIRC!` regardless of whether the formula
-        // still binds. Spec: cycles are terminal Phase 0 errors. Phase
-        // 3.5: `#CIRC!` is a FORMULA-output value (the formula's
-        // resolution), so it routes to the computed overlay. Phase
-        // 3.8: still apply value-equality (the cycle might have been
-        // pre-existing → `#CIRC!` matches prior `#CIRC!`; skip write).
-        let circ = Value::Error(ErrorValue::Circ);
-        for node in &sched.cycled {
-            let Some((sheet, row, col)) = session.cell_address_for(*node) else {
-                continue;
-            };
-            let prior_val = prior.get(&(sheet, row, col));
-            if prior_val == Some(&circ) {
-                skipped_value_equality += 1;
-            } else {
-                self.workbook.put_computed_at(sheet, row, col, circ.clone());
-                changed.insert((sheet, row, col));
+        for _iter in 0..MAX_ITERATIONS {
+            // Phase 3.4: claim dirty + topo-sort. Edges in the graph
+            // model the dep direction (`outgoing(F) = what F depends on`).
+            // Tarjan emits SCCs in reverse-topo of the condensation
+            // which, for our edge orientation, is dependency-first order.
+            let sched = session.schedule_dirty();
+            if sched.total_count() == 0 {
+                break; // Fixed point reached.
             }
-        }
+            attempted += sched.total_count();
 
-        // Sorted nodes evaluate in dependency-first order.
-        for node in &sched.sorted {
-            let Some((sheet, row, col)) = session.cell_address_for(*node) else {
-                continue;
-            };
-            let Some(text) = self.workbook.formula_at(sheet, row, col).cloned() else {
-                continue;
-            };
+            // Snapshot prior + originally_dirty for newly-seen nodes.
+            for n in sched.sorted.iter().chain(sched.cycled.iter()) {
+                originally_dirty.insert(*n);
+                if let Some(addr) = session.cell_address_for(*n) {
+                    prior.entry(addr).or_insert_with(|| {
+                        self.workbook
+                            .read(ql_types::Address::new(addr.0, addr.1, addr.2))
+                    });
+                }
+            }
 
-            // Phase 3.8: VEQ decision — does any upstream of `node`
-            // have a reason to recompute? Cases:
-            //   a) Volatile (NOW/RAND/etc.) — always re-eval (its
-            //      value can change without any cell edit).
-            //   b) Has named-range deps — V1 conservatively re-evals
-            //      (we don't track per-cell-in-range changes yet).
-            //   c) Has at least one direct-cell dep that's a
-            //      formula in the original dirty set AND that
-            //      formula's value changed → re-eval.
-            //   d) Has NO direct-cell dep that's in the original
-            //      dirty set (top-level dirty; came from an external
-            //      edit) → re-eval.
-            //   e) All direct-cell deps are in the dirty set but
-            //      none ended up in `changed` → SKIP.
-            let is_volatile = session.is_volatile(*node);
-            let needs_eval = if is_volatile {
-                true
-            } else if let Some(deps) = session.formula_deps(*node) {
-                if !deps.named_ranges.is_empty() {
-                    true
+            // Cycled nodes get `#CIRC!` regardless of whether the
+            // formula still binds. Phase 3.5: routes to the computed
+            // overlay. Phase 3.8: still apply value-equality.
+            let circ = Value::Error(ErrorValue::Circ);
+            for node in &sched.cycled {
+                let Some((sheet, row, col)) = session.cell_address_for(*node) else {
+                    continue;
+                };
+                let prior_val = prior.get(&(sheet, row, col));
+                if prior_val == Some(&circ) {
+                    skipped_value_equality += 1;
                 } else {
-                    let mut had_dirty_dep = false;
-                    let mut had_changed_dep = false;
-                    for &(ds, dr, dc) in &deps.cells {
-                        if let Some(dep_node) = session.cell_node_for(ds, dr, dc) {
-                            if originally_dirty.contains(&dep_node) {
-                                had_dirty_dep = true;
-                                if changed.contains(&(ds, dr, dc)) {
-                                    had_changed_dep = true;
-                                    break;
+                    self.workbook.put_computed_at(sheet, row, col, circ.clone());
+                    changed.insert((sheet, row, col));
+                }
+            }
+
+            // Sorted nodes evaluate in dependency-first order.
+            for node in &sched.sorted {
+                let Some((sheet, row, col)) = session.cell_address_for(*node) else {
+                    continue;
+                };
+                let Some(text) = self.workbook.formula_at(sheet, row, col).cloned() else {
+                    continue;
+                };
+
+                // Phase 3.8: VEQ decision — does any upstream of `node`
+                // have a reason to recompute? Cases:
+                //   a) Volatile (NOW/RAND/etc.) — always re-eval (its
+                //      value can change without any cell edit).
+                //   b) Has named-range deps — V1 conservatively re-evals
+                //      (we don't track per-cell-in-range changes yet).
+                //   c) Has at least one direct-cell dep that's a
+                //      formula in the original dirty set AND that
+                //      formula's value changed → re-eval.
+                //   d) Has NO direct-cell dep that's in the original
+                //      dirty set (top-level dirty; came from an external
+                //      edit) → re-eval.
+                //   e) All direct-cell deps are in the dirty set but
+                //      none ended up in `changed` → SKIP.
+                let is_volatile = session.is_volatile(*node);
+                let needs_eval = if is_volatile {
+                    true
+                } else if let Some(deps) = session.formula_deps(*node) {
+                    if !deps.named_ranges.is_empty() {
+                        true
+                    } else {
+                        let mut had_dirty_dep = false;
+                        let mut had_changed_dep = false;
+                        for &(ds, dr, dc) in &deps.cells {
+                            if let Some(dep_node) = session.cell_node_for(ds, dr, dc) {
+                                if originally_dirty.contains(&dep_node) {
+                                    had_dirty_dep = true;
+                                    if changed.contains(&(ds, dr, dc)) {
+                                        had_changed_dep = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
+                        // Top-level dirty (no dep in dirty set) OR a
+                        // changed dirty-dep → re-eval. Pure-downstream
+                        // with no changed dep → skip.
+                        !had_dirty_dep || had_changed_dep
                     }
-                    // Top-level dirty (no dep in dirty set) OR a
-                    // changed dirty-dep → re-eval. Pure-downstream
-                    // with no changed dep → skip.
-                    !had_dirty_dep || had_changed_dep
-                }
-            } else {
-                // No tracked deps (e.g., `=1+1`). Treat as top-level.
-                true
-            };
+                } else {
+                    // No tracked deps (e.g., `=1+1`). Treat as top-level.
+                    true
+                };
 
-            if !needs_eval {
-                skipped_value_equality += 1;
-                continue;
-            }
-
-            // Phase 3.6 (W5-39): route through the session's aggregate
-            // cache so `SUM(Sales)`-style formulas hit the cache when
-            // no cell inside `Sales` changed (AGG-3-01).
-            // Phase 3.9 (W5-42): also classify the plan for SIMD
-            // eligibility (SIMD-3-03 profile). We need the plan
-            // post-bind — call a slightly-expanded helper that
-            // returns the value AND the SimdShape classification.
-            let agg_cache = session.aggregate_cache();
-            match self.try_recompute_with_simd_profile(sheet, row, col, &text, agg_cache) {
-                Ok((value, simd_eligible)) => {
-                    if simd_eligible {
-                        simd_classified += 1;
-                    }
-                    // Phase 3.8: value-equality check. If the freshly-
-                    // computed value matches the snapshot, suppress
-                    // the write entirely and don't record this cell
-                    // as `changed` — downstream formulas that depend
-                    // only on this one will skip too.
-                    let prior_val = prior.get(&(sheet, row, col));
-                    if prior_val == Some(&value) {
-                        skipped_value_equality += 1;
-                    } else {
-                        self.workbook.put_computed_at(sheet, row, col, value);
-                        changed.insert((sheet, row, col));
-                    }
-                    succeeded += 1;
+                if !needs_eval {
+                    skipped_value_equality += 1;
+                    continue;
                 }
-                Err(error) => failures.push(RecomputeFailure {
-                    sheet,
-                    row,
-                    col,
-                    formula_text: text,
-                    error,
-                }),
+
+                // Phase 3.6 (W5-39): route through the session's aggregate
+                // cache so `SUM(Sales)`-style formulas hit the cache when
+                // no cell inside `Sales` changed (AGG-3-01).
+                // Phase 3.9 (W5-42): also classify the plan for SIMD
+                // eligibility (SIMD-3-03 profile). We need the plan
+                // post-bind — call a slightly-expanded helper that
+                // returns the value AND the SimdShape classification.
+                let agg_cache = session.aggregate_cache();
+                match self.try_recompute_with_simd_profile(sheet, row, col, &text, agg_cache) {
+                    Ok((value, simd_eligible, old_spill_shape, new_spill_shape)) => {
+                        if simd_eligible {
+                            simd_classified += 1;
+                        }
+                        // Phase 3.8: value-equality check. If the freshly-
+                        // computed value matches the snapshot, suppress
+                        // the write entirely and don't record this cell
+                        // as `changed` — downstream formulas that depend
+                        // only on this one will skip too.
+                        let prior_val = prior.get(&(sheet, row, col));
+                        if prior_val == Some(&value) {
+                            skipped_value_equality += 1;
+                        } else {
+                            self.workbook.put_computed_at(sheet, row, col, value);
+                            changed.insert((sheet, row, col));
+                        }
+                        // **Task #136 hook pass (recompute_dirty side)**: if
+                        // the formula's spill shape changed (or was a new
+                        // spill, or just dissolved), fire on_set_value at
+                        // each non-anchor cell in the UNION of (old, new)
+                        // footprints. Readers indexed under those cells
+                        // get marked dirty; the fixed-point loop picks them
+                        // up in a follow-up iteration.
+                        if old_spill_shape.is_some() || new_spill_shape.is_some() {
+                            use std::collections::HashSet;
+                            let mut affected: HashSet<(SheetId, RowId, ColId)> = HashSet::new();
+                            for shape in [old_spill_shape, new_spill_shape].into_iter().flatten() {
+                                for dr in 0..shape.rows {
+                                    for dc in 0..shape.cols {
+                                        if dr == 0 && dc == 0 {
+                                            continue;
+                                        }
+                                        affected.insert((sheet, row + dr, col + dc));
+                                    }
+                                }
+                            }
+                            for (s, r, c) in affected {
+                                session.on_set_value(s, r, c);
+                            }
+                        }
+                        succeeded += 1;
+                    }
+                    Err(error) => failures.push(RecomputeFailure {
+                        sheet,
+                        row,
+                        col,
+                        formula_text: text,
+                        error,
+                    }),
+                }
             }
-        }
+        } // end MAX_ITERATIONS loop
 
         self.graph = session_slot;
         Some(RecomputeResult {
@@ -2265,7 +2304,7 @@ impl<'a> WorkbookRuntime<'a> {
         agg_cache: &dyn crate::aggregate_cache::AggregateCache,
     ) -> Result<Value, RuntimeError> {
         self.try_recompute_with_simd_profile(sheet, row, col, formula_text, agg_cache)
-            .map(|(v, _)| v)
+            .map(|(v, _, _, _)| v)
     }
 
     /// Phase 3.9 (W5-42): like `try_recompute_with_aggregate_cache`
@@ -2282,7 +2321,7 @@ impl<'a> WorkbookRuntime<'a> {
         col: ColId,
         formula_text: &Arc<str>,
         agg_cache: &dyn crate::aggregate_cache::AggregateCache,
-    ) -> Result<(Value, bool), RuntimeError> {
+    ) -> Result<(Value, bool, Option<SpillShape>, Option<SpillShape>), RuntimeError> {
         let name_gen = self.workbook.names().generation();
         let cache_key = PlanCacheKey {
             text: Arc::clone(formula_text),
@@ -2337,45 +2376,42 @@ impl<'a> WorkbookRuntime<'a> {
         };
 
         // **Note (Sonnet #128 LOW-1, deferred):** the Array arm here
-        // writes the anchor via `write_spill`; the caller (recompute_all
-        // / recompute_dirty) THEN also calls `put_computed_at(anchor,
-        // anchor_value)` — a no-op duplicate write. Cleanest fix needs
-        // a return-type refactor to differentiate Scalar vs Array
-        // outcomes so the caller's VEQ short-circuit (recompute_dirty)
-        // can still gate the Scalar write while skipping the Array
-        // write. Deferred; the duplicate is harmless (same value, same
-        // cell), and the Array case is rare today (static literals only).
-        let anchor_value = match result {
+        // writes the anchor via `write_spill`; the caller also
+        // `put_computed_at(anchor, anchor_value)` — a no-op duplicate
+        // write. Deferred; harmless.
+        //
+        // **W5-106 (Phase 4.7.M / task #136 closure)**: capture the
+        // OLD spill shape BEFORE clear_spill_if_present, and the NEW
+        // shape via write_spill's return. We DON'T fire on_set_value
+        // hooks here — the caller (recompute_dirty in particular)
+        // owns the session reference at this scope (recompute_dirty
+        // `take()`s `self.graph` into a local, so `self.graph` is
+        // `None` during the sorted loop). Bubble the shape info up
+        // via the return; the caller fires hooks against its session.
+        let old_spill_shape = self.workbook.spill_anchor_at(sheet, row, col).copied();
+
+        let (anchor_value, new_spill_shape) = match result {
             crate::eval_result::EvalResult::Scalar(v) => {
-                // If this cell was previously a spill anchor but now
-                // evaluates scalar (e.g. an input changed across the
-                // array/scalar boundary), dissolve the prior spill so
-                // the targets don't keep orphan computed values.
                 self.workbook.clear_spill_if_present((sheet, row, col));
-                v
+                (v, None)
             }
             crate::eval_result::EvalResult::Array(array) => {
-                // Always clear prior spill before re-spilling
-                // (design § 8.3). write_spill assumes a clean anchor
-                // AND writes the anchor + every target cell itself.
                 self.workbook.clear_spill_if_present((sheet, row, col));
-                // Clone the formula text Arc so write_spill can
-                // put_formula it (idempotent — the formula is
-                // already associated with this cell). `expect` per
-                // CLAUDE.md no-fallbacks: we're recomputing, so
-                // formula_at MUST be Some.
                 let formula_text_arc = self
                     .workbook
                     .formula_at(sheet, row, col)
                     .cloned()
                     .expect("recompute: formula_at MUST be Some — we're recomputing this cell");
-                let (anchor_value, _new_shape) =
-                    self.write_spill(sheet, row, col, array, formula_text_arc);
-                anchor_value
+                self.write_spill(sheet, row, col, array, formula_text_arc)
             }
         };
 
-        Ok((anchor_value, simd_eligible))
+        Ok((
+            anchor_value,
+            simd_eligible,
+            old_spill_shape,
+            new_spill_shape,
+        ))
     }
 }
 
@@ -7820,25 +7856,17 @@ mod tests {
         assert_eq!(wb.read(ql_types::Address::new(0, 4, 1)), Value::Blank);
     }
 
-    /// **#136 surface test (CURRENTLY IGNORED — pending #136 closure)**:
-    /// A1 = 3, B1 = SEQUENCE(A1) (spills B1..B3), D1 = B5 (currently
-    /// Blank — references a cell OUTSIDE the spill footprint). Change
-    /// A1 to 5; B1 now spills B1..B5. D1 should see B5 = 5 and update.
+    /// **#136 closure**: A1 = 3, B1 = SEQUENCE(A1) (spills B1..B3),
+    /// D1 = B5 (currently Blank — references a cell OUTSIDE the spill
+    /// footprint). Change A1 to 5; B1 now spills B1..B5. D1 should see
+    /// B5 = 5 and update.
     ///
-    /// Confirmed reproducible 2026-05-14: B1's recompute writes B5
-    /// via write_spill but no on_set_value hook fires. D1's dep at
-    /// (0,4,1) wasn't dirty, so recompute_dirty doesn't re-evaluate
-    /// D1. D1 stays at Blank.
-    ///
-    /// Fix (task #136): recompute_dirty must (a) detect spill-shape
-    /// transitions per formula, (b) fire on_set_value at cells added
-    /// to or removed from the footprint, AND (c) run a fixed-point
-    /// loop so mid-pass dirties (like D1 here) get picked up in a
-    /// follow-up schedule_dirty + eval iteration. Substantial change.
-    ///
-    /// Leaving as #[ignore]'d regression pin until #136 lands.
+    /// Closed by: (a) `try_recompute_with_simd_profile` now fires
+    /// on_set_value for non-anchor cells in (old ∪ new) spill footprint
+    /// after write_spill; (b) `recompute_dirty` wraps schedule+eval in
+    /// a fixed-point loop so mid-pass dirties (D1 dirtied by B1's
+    /// recompute writing B5) get picked up in a follow-up iteration.
     #[test]
-    #[ignore = "task #136: recompute_dirty spill-footprint hooks + fixed-point loop"]
     fn recompute_dirty_sequence_grows_dirties_new_target_readers() {
         use crate::CalcgraphSession;
         let mut wb = make_runtime_workbook();
