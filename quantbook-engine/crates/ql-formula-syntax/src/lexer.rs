@@ -237,7 +237,10 @@ fn lex_error_sigil(chars: &mut Peekable<Chars>) -> Result<Token, LexError> {
 
     while let Some(&c) = peek.peek() {
         match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '/' | '.' | '!' | '?' => {
+            // Body chars of every `ErrorValue::ALL` sigil. The set is
+            // EXACT to the sigils — no `.` (no sigil contains a dot)
+            // and no special punctuation beyond `_`, `/`, `!`, `?`.
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '/' | '!' | '?' => {
                 fragment.push(c);
                 peek.next();
             }
@@ -1275,7 +1278,7 @@ mod tests {
         assert!(matches!(lex("@"), Err(LexError::UnexpectedChar('@'))));
         // `{` was rejected pre-W5-97 (Phase 4.7.C); now accepted as
         // `Token::LBrace`. The replacement assertion (lex_ok) lives in
-        // `lbrace_and_rbrace_lex_to_brace_tokens` above.
+        // `lbrace_and_rbrace_lex_to_brace_tokens` below in this module.
         // backtick — not in the Excel alphabet at all.
         assert!(matches!(lex("`"), Err(LexError::UnexpectedChar('`'))));
     }
@@ -1757,5 +1760,55 @@ mod tests {
         assert_eq!(toks[3], Token::Comma);
         assert!(matches!(toks[4], Token::Number(n) if n == 0.0));
         assert_eq!(toks[5], Token::RParen);
+    }
+
+    // W5-97 closure (Sonnet M1): positive lex tests for the five
+    // Quantbook-specific sigils — guards a future `ErrorValue::ALL`
+    // maintenance regression. `#AI_NOT_AVAILABLE_V1` is structurally
+    // distinct because it ends with a DIGIT (not `!` or `?`), so its
+    // no-over-consume behavior is exercised by `..._not_available_v1`
+    // tests below.
+
+    #[test]
+    fn error_sigil_disconnected_lexes() {
+        let toks = lex_ok("#DISCONNECTED!");
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::Disconnected));
+    }
+
+    #[test]
+    fn error_sigil_binding_lexes() {
+        let toks = lex_ok("#BINDING!");
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::Binding));
+    }
+
+    #[test]
+    fn error_sigil_timeout_lexes() {
+        let toks = lex_ok("#TIMEOUT!");
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::Timeout));
+    }
+
+    #[test]
+    fn error_sigil_permission_lexes() {
+        let toks = lex_ok("#PERMISSION!");
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::Permission));
+    }
+
+    #[test]
+    fn error_sigil_ai_not_available_v1_lexes() {
+        // Ends with `_V1` — a digit-terminated sigil, not `!`/`?`.
+        // Exercises the no-over-consume path on a non-punctuation
+        // terminator (analogous to `#N/A` for the canonical sigils).
+        let toks = lex_ok("#AI_NOT_AVAILABLE_V1");
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::AINotAvailable));
+    }
+
+    #[test]
+    fn error_sigil_ai_not_available_v1_followed_by_space_does_not_over_consume() {
+        // `#AI_NOT_AVAILABLE_V1 5` → AINotAvailable + Number(5).
+        let toks = lex_ok("#AI_NOT_AVAILABLE_V1 5");
+        assert_eq!(toks.len(), 2);
+        assert_eq!(toks[0], Token::Error(ql_types::ErrorValue::AINotAvailable));
+        assert!(matches!(toks[1], Token::Number(n) if n == 5.0));
     }
 }

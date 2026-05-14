@@ -92,7 +92,7 @@ Array cells in v1 — the allowed `array_cell` subset:
 - `NUMBER` (positive or negative literal)
 - `STRING` literal
 - `BOOL` literal (`TRUE` / `FALSE`)
-- `error literal` — `#NULL!`, `#DIV/0!`, `#VALUE!`, `#REF!`, `#NAME?`, `#NUM!`, `#N/A`, `#GETTING_DATA`, `#SPILL!`, `#CALC!` — matches IronCalc's `ArrayNode::Error` variant and is needed for `FILTER(_, _, #N/A)` etc.
+- `error literal` — `#NULL!`, `#DIV/0!`, `#VALUE!`, `#REF!`, `#NAME?`, `#NUM!`, `#N/A`, `#SPILL!`, `#CALC!` — the nine Excel-canon error sigils available as `ErrorValue::ALL` entries in `ql-types`. Needed for `FILTER(_, _, #N/A)` etc. (W5-97 closure / Sonnet M2: `#GETTING_DATA` was listed in the original draft but is not in `ErrorValue::ALL` — it's an Excel-Online-specific volatile data-wait state that we don't model in v1; lifting it would require adding the variant alongside `Disconnected`/`Timeout`. Deferred to Phase 4.10 or whenever a real use case appears.)
 
 NO nested CellRef / RangeRef / Function calls / Unary operators (other than the implicit sign on numeric literals). Codex MEDIUM finding: explicitly document this as a Quantbook v1 subset.
 
