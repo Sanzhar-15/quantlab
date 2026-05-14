@@ -1561,13 +1561,26 @@ impl<'a> WorkbookRuntime<'a> {
                 reason: "defined-name with this canonical name already exists (shared namespace)",
             });
         }
-        // Non-overlap: walk the proposed footprint.
+        // Non-overlap + no spill anchor inside the footprint.
+        // **W5-124 (Phase 4.8.J.2):** spill-anchor invariant § 4.3 #5 —
+        // Excel canon: array formulas can't anchor inside a table.
+        // Previously enforced only at `write_spill` time (the write-side
+        // check consults `Workbook::table_at(anchor)`); creating a
+        // table over an existing anchor was silently allowed, leaving
+        // the table claiming a cell whose value is computed-from-spill.
+        // Single fused loop avoids walking the proposed footprint twice.
         for r in top_row..top_row + rows {
             for c in top_col..top_col + cols {
                 if self.workbook.table_at(sheet, r, c).is_some() {
                     return Err(RuntimeError::TableCreateRejected {
                         name: name.to_owned(),
                         reason: "table footprint overlaps an existing table",
+                    });
+                }
+                if self.workbook.spill_anchor_at(sheet, r, c).is_some() {
+                    return Err(RuntimeError::TableCreateRejected {
+                        name: name.to_owned(),
+                        reason: "table footprint contains a spill anchor",
                     });
                 }
             }
@@ -2007,9 +2020,12 @@ impl<'a> WorkbookRuntime<'a> {
                 }
             }
         }
-        // Footprint-overlap check: only cells NEWLY claimed need
-        // checking (cells in the OLD footprint already belong to this
-        // table).
+        // Footprint-overlap + no-spill-anchor checks: only cells NEWLY
+        // claimed need checking (cells in the OLD footprint already
+        // belong to this table; create_table verified them at creation
+        // time).
+        // **W5-124 (Phase 4.8.J.2):** spill-anchor check mirrors
+        // create_table's, restricted to newly-claimed cells.
         let old_end_row = top_row + old_rows;
         let old_end_col = top_col + old_cols;
         let new_end_row = top_row + new_rows;
@@ -2027,6 +2043,12 @@ impl<'a> WorkbookRuntime<'a> {
                             reason: "new footprint overlaps an existing table",
                         });
                     }
+                }
+                if self.workbook.spill_anchor_at(sheet, r, c).is_some() {
+                    return Err(RuntimeError::TableResizeRejected {
+                        name: name.to_owned(),
+                        reason: "new footprint contains a spill anchor",
+                    });
                 }
             }
         }
@@ -9500,6 +9522,108 @@ mod tests {
         let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
         assert_eq!(ops.len(), 1);
         assert!(matches!(&ops[0], Op::CreateTable { name, .. } if name == "SALES"));
+    }
+
+    // ===== W5-124 (Phase 4.8.J.2) — spill-anchor uniform check =====
+
+    #[test]
+    fn create_table_rejected_when_footprint_contains_spill_anchor() {
+        use ql_storage::SpillShape;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        // Register a spill anchor at (0, 2, 1) covering 3 rows x 1 col.
+        wb.register_spill((0, 2, 1), SpillShape::new(3, 1))
+            .expect("register_spill must succeed on empty workbook");
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // Try to create a table whose footprint covers the anchor.
+        let err = rt
+            .create_table(
+                "T",
+                0,
+                0,
+                0,
+                5,
+                3,
+                true,
+                false,
+                vec!["a".into(), "b".into(), "c".into()],
+            )
+            .unwrap_err();
+        match err {
+            RuntimeError::TableCreateRejected { reason, .. } => {
+                assert!(reason.contains("spill anchor"), "reason: {reason}");
+            }
+            other => panic!("expected TableCreateRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_table_succeeds_when_anchor_is_outside_footprint() {
+        use ql_storage::SpillShape;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        // Anchor at column 10 — outside the table footprint at cols 0-2.
+        wb.register_spill((0, 0, 10), SpillShape::new(2, 1))
+            .expect("register_spill must succeed");
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.create_table(
+            "T",
+            0,
+            0,
+            0,
+            3,
+            3,
+            true,
+            false,
+            vec!["a".into(), "b".into(), "c".into()],
+        )
+        .expect("non-overlapping anchor must not block create_table");
+        assert!(wb.lookup_table("T").is_some());
+    }
+
+    #[test]
+    fn resize_table_grow_rejected_when_new_cells_contain_spill_anchor() {
+        use ql_storage::SpillShape;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            // Initial table covers rows 0-2, col 0.
+            rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+        }
+        // Spill anchor BELOW the table at row 5.
+        wb.register_spill((0, 5, 0), SpillShape::new(2, 1))
+            .expect("register_spill must succeed");
+        // Grow the table to row 10 — would now cover the anchor at row 5.
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt.resize_table("Sales", 10, 1, vec![], vec![]).unwrap_err();
+        match err {
+            RuntimeError::TableResizeRejected { reason, .. } => {
+                assert!(reason.contains("spill anchor"), "reason: {reason}");
+            }
+            other => panic!("expected TableResizeRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resize_table_grow_succeeds_when_anchor_is_outside_new_footprint() {
+        use ql_storage::SpillShape;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+        }
+        // Anchor at row 20 — outside the resized footprint (max row 4).
+        wb.register_spill((0, 20, 0), SpillShape::new(2, 1))
+            .expect("register_spill must succeed");
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.resize_table("Sales", 5, 1, vec![], vec![])
+            .expect("anchor outside new footprint must not block");
+        let meta = wb.lookup_table("Sales").unwrap();
+        assert_eq!(meta.rows, 5);
     }
 
     #[test]

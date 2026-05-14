@@ -781,6 +781,16 @@ fn apply_resize_table(
                     });
                 }
             }
+            // **W5-124 (Phase 4.8.J.2):** spill-anchor check mirrors
+            // producer side. Per design § 4.3 invariant #5, tables
+            // block ALL spill anchors inside their footprint.
+            if workbook.spill_anchor_at(sheet, r, c).is_some() {
+                return Err(ReplayError::TableResizeRejected {
+                    index,
+                    name: name.to_owned(),
+                    reason: "new footprint contains a spill anchor",
+                });
+            }
         }
     }
     // ----- Mutation -----
@@ -884,7 +894,9 @@ fn apply_create_table(
             reason: "table rows and cols must both be > 0",
         });
     }
-    // Non-overlap: check every cell in the footprint.
+    // Non-overlap + no-spill-anchor inside the footprint.
+    // **W5-124 (Phase 4.8.J.2):** spill-anchor check mirrors producer
+    // side per design § 4.3 invariant #5.
     for r in top_row..top_row + rows {
         for c in top_col..top_col + cols {
             if workbook.table_at(sheet, r, c).is_some() {
@@ -892,6 +904,13 @@ fn apply_create_table(
                     index,
                     name: name.to_owned(),
                     reason: "table footprint overlaps an existing table",
+                });
+            }
+            if workbook.spill_anchor_at(sheet, r, c).is_some() {
+                return Err(ReplayError::TableCreateRejected {
+                    index,
+                    name: name.to_owned(),
+                    reason: "table footprint contains a spill anchor",
                 });
             }
         }
