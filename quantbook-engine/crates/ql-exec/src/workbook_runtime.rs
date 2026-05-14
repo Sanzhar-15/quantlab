@@ -564,8 +564,11 @@ impl<'a> WorkbookRuntime<'a> {
         // `ExprPlan` straight from the PlanCache so the hook walks it
         // for cell/range/name + volatile deps without re-binding. The
         // plan is shared by Arc; the hook only needs `&ExprPlan`.
+        // **W5-102 (Phase 4.7.I):** also pass `&Workbook` so the dep
+        // extractor can rewrite spill-target CellRefs to point at the
+        // anchor's formula node (producer-alias model, design § 10.1).
         if let Some(g) = self.graph.as_deref_mut() {
-            g.on_set_formula(sheet, row, col, plan.as_ref());
+            g.on_set_formula(sheet, row, col, plan.as_ref(), self.workbook);
         }
 
         Ok(value)

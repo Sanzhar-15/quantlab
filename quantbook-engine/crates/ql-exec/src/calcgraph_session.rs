@@ -452,6 +452,7 @@ impl CalcgraphSession {
         formula_node: NodeId,
         formula_sheet: SheetId,
         plan: &ExprPlan,
+        workbook: &Workbook,
     ) {
         // First, evict any prior deps for this formula. Required so
         // re-binding a formula whose text changed (e.g. `=A1` → `=B1`)
@@ -469,9 +470,29 @@ impl CalcgraphSession {
         let mut deps = FormulaDeps::default();
         walk_plan_for_deps(plan, &mut deps);
 
+        // **W5-102 (Phase 4.7.I) — PRODUCER-ALIAS REWRITE.** Per design
+        // § 10.1: if a CellRef points to a spill TARGET, reroute the
+        // dependency to the ANCHOR's formula node. The anchor's
+        // formula owns the computed value at the target cell; when
+        // the anchor recomputes, every downstream reader of any
+        // target cell must dirty. By rewriting the dep BEFORE
+        // dedupe + register, the existing cell-dep machinery
+        // (cell_to_formulas reverse index + graph.add_edge) handles
+        // spill-target writes uniformly with regular cell writes.
+        //
+        // Lazy + no new node types. Only readers of spill targets
+        // get the rerouted edge. Multiple targets of the same anchor
+        // collapse to one dep via the dedupe step that follows.
+        for cell in deps.cells.iter_mut() {
+            if let Some(anchor) = workbook.spill_target_anchor(cell.0, cell.1, cell.2) {
+                *cell = anchor;
+            }
+        }
+
         // Register: deduplicate (the walker emits duplicates if the
         // formula references the same cell twice; the session stores
-        // each cell once).
+        // each cell once). Also dedupe across producer-alias rewrites
+        // — multiple targets of the same anchor collapse to one.
         let mut seen_cells: HashSet<(SheetId, RowId, ColId)> = HashSet::new();
         deps.cells.retain(|c| seen_cells.insert(*c));
         let mut seen_names: HashSet<Arc<str>> = HashSet::new();
@@ -620,7 +641,7 @@ impl CalcgraphSession {
             // the correct fallback for any range with `sheet: None`.
             match Self::bind_text(&text, sheet, wb) {
                 Ok(plan) => {
-                    session.extract_and_register_deps(node, sheet, &plan);
+                    session.extract_and_register_deps(node, sheet, &plan, wb);
                     succeeded += 1;
                 }
                 Err(error) => failures.push(RebuildFailure {
@@ -700,7 +721,14 @@ impl CalcgraphSession {
     /// The runtime passes the already-bound `ExprPlan` it just
     /// evaluated; this hook does NOT re-bind. The plan shape is stable
     /// since 2B.4 (Phase 3.2 doesn't add new variants).
-    pub fn on_set_formula(&mut self, sheet: SheetId, row: RowId, col: ColId, plan: &ExprPlan) {
+    pub fn on_set_formula(
+        &mut self,
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        plan: &ExprPlan,
+        workbook: &Workbook,
+    ) {
         self.hook_counts.set_formula = self.hook_counts.set_formula.saturating_add(1);
         // Phase 3.4: distinguish first-time-formula at this cell vs
         // re-bind. The first case needs RETROACTIVE forward edges
@@ -721,7 +749,7 @@ impl CalcgraphSession {
                 }
             }
         }
-        self.extract_and_register_deps(node, sheet, plan);
+        self.extract_and_register_deps(node, sheet, plan, workbook);
         // Phase 3.3: dirty downstream — formulas referencing the cell
         // whose formula text just changed see a (potentially) new
         // value. The formula itself is NOT marked dirty (the runtime
@@ -1150,10 +1178,11 @@ mod tests {
     #[test]
     fn mutation_hooks_each_bump_their_counter() {
         let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
         let plan = ExprPlan::Number(1.0);
         s.on_set_value(0, 0, 0);
-        s.on_set_formula(0, 0, 1, &plan);
-        s.on_set_formula(0, 0, 2, &plan);
+        s.on_set_formula(0, 0, 1, &plan, &wb);
+        s.on_set_formula(0, 0, 2, &plan, &wb);
         s.on_clear_formula(0, 0, 1);
         s.on_set_name("Tax");
         s.on_set_name("Discount");
@@ -1172,10 +1201,11 @@ mod tests {
     #[test]
     fn on_set_formula_is_idempotent_for_cell_node_creation() {
         let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
         let plan = ExprPlan::Number(0.0);
-        s.on_set_formula(0, 3, 7, &plan);
+        s.on_set_formula(0, 3, 7, &plan, &wb);
         let first_node = s.cell_node_for(0, 3, 7).unwrap();
-        s.on_set_formula(0, 3, 7, &plan);
+        s.on_set_formula(0, 3, 7, &plan, &wb);
         let second_node = s.cell_node_for(0, 3, 7).unwrap();
         assert_eq!(
             first_node, second_node,
@@ -1372,6 +1402,7 @@ mod tests {
     fn rebind_replaces_prior_deps() {
         use ql_formula_syntax::Operator;
         let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
         // First plan: =A1+B1 — two cells.
         let plan_v1 = ExprPlan::Binary {
             op: Operator::Plus,
@@ -1390,7 +1421,7 @@ mod tests {
                 abs_row: false,
             }),
         };
-        s.on_set_formula(0, 5, 5, &plan_v1);
+        s.on_set_formula(0, 5, 5, &plan_v1, &wb);
         let node = s.cell_node_for(0, 5, 5).unwrap();
         assert_eq!(s.formula_deps(node).unwrap().cells.len(), 2);
 
@@ -1402,7 +1433,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan_v2);
+        s.on_set_formula(0, 5, 5, &plan_v2, &wb);
         let deps = s.formula_deps(node).unwrap();
         assert_eq!(deps.cells, vec![(0, 0, 2)]);
     }
@@ -1960,6 +1991,7 @@ mod tests {
     #[test]
     fn rebind_clears_cell_reverse_index_for_old_deps() {
         let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
         // Plan v1: =A1 — depends on A1 only.
         let plan_v1 = ExprPlan::CellRef {
             sheet: 0,
@@ -1968,7 +2000,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan_v1);
+        s.on_set_formula(0, 5, 5, &plan_v1, &wb);
         let node = s.cell_node_for(0, 5, 5).unwrap();
         assert_eq!(s.cell_dep_count(), 1, "A1 indexed");
 
@@ -1981,7 +2013,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan_v2);
+        s.on_set_formula(0, 5, 5, &plan_v2, &wb);
         assert_eq!(s.cell_dep_count(), 1, "only B1 now");
 
         // Take dirty (clear residue from the two on_set_formula calls).
@@ -2021,6 +2053,7 @@ mod tests {
     #[test]
     fn rebind_clears_graph_outgoing_edges() {
         let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
         // Add A1 and B1 as formula cells so cell_index has nodes for
         // them (extract_and_register_deps only adds forward edges to
         // dep cells that already have nodes).
@@ -2034,7 +2067,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan_v1);
+        s.on_set_formula(0, 5, 5, &plan_v1, &wb);
         let f = s.cell_node_for(0, 5, 5).unwrap();
         let a1 = s.cell_node_for(0, 0, 0).unwrap();
         let b1 = s.cell_node_for(0, 1, 0).unwrap();
@@ -2049,7 +2082,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 5, 5, &plan_v2);
+        s.on_set_formula(0, 5, 5, &plan_v2, &wb);
 
         // Graph-level outgoing now reflects ONLY the new dep.
         assert_eq!(
@@ -2085,6 +2118,7 @@ mod tests {
     #[test]
     fn h3_no_false_circ_after_rebind_to_constant() {
         let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
         s.or_insert_cell_node(0, 0, 0); // A1 pre-exists as a node
         s.or_insert_cell_node(0, 0, 1); // B1 pre-exists as a node
 
@@ -2096,10 +2130,10 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 0, 1, &plan_b1_v1);
+        s.on_set_formula(0, 0, 1, &plan_b1_v1, &wb);
 
         // Step 2: B1 = "=1" — constant, no deps. clear_outgoing fires.
-        s.on_set_formula(0, 0, 1, &ExprPlan::Number(1.0));
+        s.on_set_formula(0, 0, 1, &ExprPlan::Number(1.0), &wb);
 
         // Step 3: A1 = "=B1"
         let plan_a1 = ExprPlan::CellRef {
@@ -2109,7 +2143,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 0, 0, &plan_a1);
+        s.on_set_formula(0, 0, 0, &plan_a1, &wb);
 
         let a1 = s.cell_node_for(0, 0, 0).unwrap();
         let b1 = s.cell_node_for(0, 0, 1).unwrap();
@@ -2142,6 +2176,7 @@ mod tests {
     #[test]
     fn h4_rebind_clears_stale_range_stripe_dirty() {
         let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
         let _b1_node = s.or_insert_cell_node(0, 0, 1);
 
         // Step 1: B1 = SUM(Sales_A) where Sales_A → A:A.
@@ -2161,7 +2196,7 @@ mod tests {
             name: Arc::from("SUM"),
             args: vec![plan_v1],
         };
-        s.on_set_formula(0, 0, 1, &plan_v1_wrapped);
+        s.on_set_formula(0, 0, 1, &plan_v1_wrapped, &wb);
         let b1 = s.cell_node_for(0, 0, 1).unwrap();
         assert_eq!(
             s.graph().stripe_index().stripe_count(),
@@ -2185,7 +2220,7 @@ mod tests {
             name: Arc::from("SUM"),
             args: vec![plan_v2],
         };
-        s.on_set_formula(0, 0, 1, &plan_v2_wrapped);
+        s.on_set_formula(0, 0, 1, &plan_v2_wrapped, &wb);
 
         // Stripe map: ONLY Column B now (Column A was cleared).
         assert_eq!(s.graph().stripe_index().stripe_count(), 1);
@@ -2238,6 +2273,7 @@ mod tests {
     #[test]
     fn h1_range_induced_cycle_detected() {
         let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
         s.or_insert_cell_node(0, 0, 0);
         s.or_insert_cell_node(0, 0, 1);
 
@@ -2256,7 +2292,7 @@ mod tests {
                 range: b1_range,
             }],
         };
-        s.on_set_formula(0, 0, 0, &plan_a1);
+        s.on_set_formula(0, 0, 0, &plan_a1, &wb);
 
         // B1 = "=A1"
         let plan_b1 = ExprPlan::CellRef {
@@ -2266,7 +2302,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 0, 1, &plan_b1);
+        s.on_set_formula(0, 0, 1, &plan_b1, &wb);
 
         // Drive both into the dirty set.
         s.take_dirty(); // clear any residue from the on_set_formula calls
@@ -2300,6 +2336,7 @@ mod tests {
     #[test]
     fn h1_range_induced_ordering_via_supplemental() {
         let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
         s.or_insert_cell_node(0, 0, 0);
         s.or_insert_cell_node(0, 0, 1);
         s.or_insert_cell_node(0, 0, 2);
@@ -2319,7 +2356,7 @@ mod tests {
                 range: b1_range,
             }],
         };
-        s.on_set_formula(0, 0, 0, &plan_a1);
+        s.on_set_formula(0, 0, 0, &plan_a1, &wb);
 
         // B1 = "=C1"
         let plan_b1 = ExprPlan::CellRef {
@@ -2329,7 +2366,7 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 0, 1, &plan_b1);
+        s.on_set_formula(0, 0, 1, &plan_b1, &wb);
 
         // Drive both A1 and B1 dirty via a literal write to C1: B1
         // depends on C1 (direct cell), A1 depends on B1 (via range).
@@ -2356,6 +2393,7 @@ mod tests {
     #[test]
     fn self_range_cycle_via_supplemental() {
         let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
         s.or_insert_cell_node(0, 0, 0);
 
         // A1 = SUM(A1:A1)
@@ -2373,7 +2411,7 @@ mod tests {
                 range: a1_range,
             }],
         };
-        s.on_set_formula(0, 0, 0, &plan_a1);
+        s.on_set_formula(0, 0, 0, &plan_a1, &wb);
 
         // Force A1 dirty: write to A1's cell (self-fanout via stripe).
         s.take_dirty();
@@ -2394,6 +2432,7 @@ mod tests {
     #[test]
     fn partial_dirty_literal_in_range_no_supplemental() {
         let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
         s.or_insert_cell_node(0, 0, 0);
         // B1 is NOT a formula cell — no node added.
 
@@ -2412,7 +2451,7 @@ mod tests {
                 range: b1_range,
             }],
         };
-        s.on_set_formula(0, 0, 0, &plan_a1);
+        s.on_set_formula(0, 0, 0, &plan_a1, &wb);
 
         // Force A1 into dirty by writing to its own cell (no
         // dependents exist for A1 since it's the only formula).
@@ -2455,6 +2494,7 @@ mod tests {
     #[test]
     fn clear_formula_revokes_outgoing_graph_edges() {
         let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
         s.or_insert_cell_node(0, 0, 0); // A1
         s.or_insert_cell_node(0, 1, 0); // A2
 
@@ -2476,7 +2516,7 @@ mod tests {
                 abs_row: false,
             }),
         };
-        s.on_set_formula(0, 0, 1, &plan_b1);
+        s.on_set_formula(0, 0, 1, &plan_b1, &wb);
         let a1 = s.cell_node_for(0, 0, 0).unwrap();
         let a2 = s.cell_node_for(0, 1, 0).unwrap();
         let b1 = s.cell_node_for(0, 0, 1).unwrap();
@@ -2510,6 +2550,7 @@ mod tests {
     #[test]
     fn clear_formula_revokes_range_stripes() {
         let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
         s.or_insert_cell_node(0, 0, 1); // B1
 
         // B1 = SUM(A:A) — Column A whole-col range.
@@ -2527,7 +2568,7 @@ mod tests {
                 range: col_a,
             }],
         };
-        s.on_set_formula(0, 0, 1, &plan);
+        s.on_set_formula(0, 0, 1, &plan, &wb);
         let b1 = s.cell_node_for(0, 0, 1).unwrap();
         assert_eq!(
             s.graph().stripe_index().stripe_count(),
@@ -2561,6 +2602,7 @@ mod tests {
     #[test]
     fn clear_formula_then_no_phantom_cycle() {
         let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
         s.or_insert_cell_node(0, 0, 0); // A1
 
         // A1 = SUM(A1:A1) — self-range.
@@ -2578,7 +2620,7 @@ mod tests {
                 range: a1_range,
             }],
         };
-        s.on_set_formula(0, 0, 0, &plan);
+        s.on_set_formula(0, 0, 0, &plan, &wb);
         let a1 = s.cell_node_for(0, 0, 0).unwrap();
         assert!(s.graph().dependents_for_cell(0, 0, 0).contains(&a1));
 
@@ -2632,6 +2674,7 @@ mod tests {
     #[test]
     fn build_range_supplemental_dedups_overlapping_ranges() {
         let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
         s.or_insert_cell_node(0, 0, 1); // B1 (the F)
         s.or_insert_cell_node(0, 2, 0); // A3 (the G that's in both ranges)
 
@@ -2664,11 +2707,11 @@ mod tests {
                 },
             ],
         };
-        s.on_set_formula(0, 0, 1, &plan);
+        s.on_set_formula(0, 0, 1, &plan, &wb);
 
         // Make A3 a formula too so it's a NodeId we can find in dirty.
         let a3_plan = ExprPlan::Number(42.0);
-        s.on_set_formula(0, 2, 0, &a3_plan);
+        s.on_set_formula(0, 2, 0, &a3_plan, &wb);
 
         let b1 = s.cell_node_for(0, 0, 1).unwrap();
         let a3 = s.cell_node_for(0, 2, 0).unwrap();
@@ -2706,6 +2749,7 @@ mod tests {
     #[test]
     fn rebind_to_same_plan_yields_same_graph_state() {
         let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
         s.or_insert_cell_node(0, 0, 0); // A1
 
         let plan = ExprPlan::CellRef {
@@ -2715,13 +2759,13 @@ mod tests {
             abs_col: false,
             abs_row: false,
         };
-        s.on_set_formula(0, 0, 1, &plan);
+        s.on_set_formula(0, 0, 1, &plan, &wb);
         let f = s.cell_node_for(0, 0, 1).unwrap();
         let edges_before: Vec<_> = s.graph().outgoing(f).to_vec();
         let stripe_count_before = s.graph().stripe_index().stripe_count();
 
         // Same plan again.
-        s.on_set_formula(0, 0, 1, &plan);
+        s.on_set_formula(0, 0, 1, &plan, &wb);
         let edges_after: Vec<_> = s.graph().outgoing(f).to_vec();
         let stripe_count_after = s.graph().stripe_index().stripe_count();
 
@@ -2969,6 +3013,7 @@ mod tests {
     fn retroactive_edge_when_dep_becomes_formula() {
         use ql_formula_syntax::Operator;
         let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
         // B1 = A1 + 1.
         let plan_b1 = ExprPlan::Binary {
             op: Operator::Plus,
@@ -2981,7 +3026,7 @@ mod tests {
             }),
             rhs: Box::new(ExprPlan::Number(1.0)),
         };
-        s.on_set_formula(0, 0, 1, &plan_b1);
+        s.on_set_formula(0, 0, 1, &plan_b1, &wb);
         let b1 = s.cell_node_for(0, 0, 1).unwrap();
         // A1 isn't a formula yet.
         assert!(s.cell_node_for(0, 0, 0).is_none());
@@ -2992,11 +3037,165 @@ mod tests {
         // Now set A1 = 99 — turns A1 into a formula. Retroactive
         // edge B1 → A1 must materialize.
         let plan_a1 = ExprPlan::Number(99.0);
-        s.on_set_formula(0, 0, 0, &plan_a1);
+        s.on_set_formula(0, 0, 0, &plan_a1, &wb);
         let a1 = s.cell_node_for(0, 0, 0).unwrap();
         assert!(
             s.graph().outgoing(b1).contains(&a1),
             "retroactive edge B1 → A1 must exist after A1 becomes a formula"
+        );
+    }
+
+    // ===== W5-102 (Phase 4.7.I) — producer-alias dep extraction =====
+    //
+    // Spill targets are NOT separate graph nodes. When a reader formula
+    // references a spill TARGET cell, dep extraction must reroute the
+    // dependency to the anchor — the anchor's formula owns the value at
+    // every cell in the spill rectangle. See design doc § 10.1.
+
+    /// Reader formula `B1 = A2` where A2 is the spill TARGET of an
+    /// anchor at A1 (shape 2×1). Dep extraction must record A1, NOT A2,
+    /// as the cell dep — so when A1's anchor recomputes, B1 dirties via
+    /// the regular `on_set_value(anchor)` path.
+    #[test]
+    fn producer_alias_reroutes_target_dep_to_anchor() {
+        let mut wb = ql_storage::Workbook::new();
+        // Spill anchor at A1 with shape (2 rows, 1 col) → claims A1+A2.
+        wb.register_spill((0, 0, 0), ql_storage::SpillShape::new(2, 1))
+            .expect("register_spill must succeed on empty workbook");
+
+        let mut s = CalcgraphSession::new();
+        // B1 = A2 (CellRef to the spill target).
+        let plan_b1 = ExprPlan::CellRef {
+            sheet: 0,
+            row: 1, // A2
+            col: 0,
+            abs_col: false,
+            abs_row: false,
+        };
+        s.on_set_formula(0, 0, 1, &plan_b1, &wb);
+        let b1 = s.cell_node_for(0, 0, 1).unwrap();
+
+        let deps = s.formula_deps(b1).expect("B1 must have deps recorded");
+        assert_eq!(
+            deps.cells,
+            vec![(0, 0, 0)],
+            "B1's dep must be the anchor A1, not the target A2"
+        );
+    }
+
+    /// Two reader formulas, each pointing at a different cell in the
+    /// SAME spill rectangle, must both end up dependent on the anchor —
+    /// AND writing to the anchor must dirty both readers in one pass.
+    #[test]
+    fn producer_alias_collapses_multi_target_deps_to_anchor() {
+        let mut wb = ql_storage::Workbook::new();
+        // Anchor A1 with shape (3, 1) → A1, A2, A3 all part of spill.
+        wb.register_spill((0, 0, 0), ql_storage::SpillShape::new(3, 1))
+            .expect("register_spill must succeed");
+
+        let mut s = CalcgraphSession::new();
+        // C1 = A2 (target).
+        let plan_c1 = ExprPlan::CellRef {
+            sheet: 0,
+            row: 1,
+            col: 0,
+            abs_col: false,
+            abs_row: false,
+        };
+        s.on_set_formula(0, 0, 2, &plan_c1, &wb);
+        // D1 = A3 (different target, same anchor).
+        let plan_d1 = ExprPlan::CellRef {
+            sheet: 0,
+            row: 2,
+            col: 0,
+            abs_col: false,
+            abs_row: false,
+        };
+        s.on_set_formula(0, 0, 3, &plan_d1, &wb);
+
+        let c1 = s.cell_node_for(0, 0, 2).unwrap();
+        let d1 = s.cell_node_for(0, 0, 3).unwrap();
+        assert_eq!(s.formula_deps(c1).unwrap().cells, vec![(0, 0, 0)]);
+        assert_eq!(s.formula_deps(d1).unwrap().cells, vec![(0, 0, 0)]);
+
+        // Clear residue dirty from the two on_set_formula calls.
+        s.take_dirty();
+        // Writing the anchor must dirty BOTH readers in a single hook
+        // call — proving the cell_to_formulas reverse index keys on the
+        // anchor address (not the targets), which is the whole point of
+        // the producer-alias rewrite.
+        s.on_set_value(0, 0, 0);
+        let dirty = s.take_dirty();
+        assert!(dirty.contains(&c1), "C1 must dirty when anchor A1 writes");
+        assert!(dirty.contains(&d1), "D1 must dirty when anchor A1 writes");
+    }
+
+    /// A formula referencing the SAME spill target twice (e.g. `=A2+A2`)
+    /// must dedupe down to a single (anchor) cell dep. The walker emits
+    /// two `(0, 1, 0)` entries; producer-alias rewrites both to
+    /// `(0, 0, 0)`; the dedupe pass collapses them.
+    #[test]
+    fn producer_alias_dedupe_same_target_twice() {
+        use ql_formula_syntax::Operator;
+        let mut wb = ql_storage::Workbook::new();
+        wb.register_spill((0, 0, 0), ql_storage::SpillShape::new(2, 1))
+            .expect("register_spill must succeed");
+
+        let mut s = CalcgraphSession::new();
+        // B1 = A2 + A2 — same target twice.
+        let plan_b1 = ExprPlan::Binary {
+            op: Operator::Plus,
+            lhs: Box::new(ExprPlan::CellRef {
+                sheet: 0,
+                row: 1,
+                col: 0,
+                abs_col: false,
+                abs_row: false,
+            }),
+            rhs: Box::new(ExprPlan::CellRef {
+                sheet: 0,
+                row: 1,
+                col: 0,
+                abs_col: false,
+                abs_row: false,
+            }),
+        };
+        s.on_set_formula(0, 0, 1, &plan_b1, &wb);
+        let b1 = s.cell_node_for(0, 0, 1).unwrap();
+        let deps = s.formula_deps(b1).unwrap();
+        assert_eq!(
+            deps.cells,
+            vec![(0, 0, 0)],
+            "A2+A2 must collapse to a single anchor dep after producer-alias rewrite + dedupe"
+        );
+    }
+
+    /// Negative control: a CellRef to a cell that is NOT part of any
+    /// spill rectangle must be left unchanged by the producer-alias
+    /// rewrite. Without this, an unrelated workbook param would change
+    /// every dep extraction's behavior.
+    #[test]
+    fn producer_alias_leaves_non_target_dep_unchanged() {
+        let mut wb = ql_storage::Workbook::new();
+        // Register a spill far away from the cell B1 reads.
+        wb.register_spill((0, 10, 10), ql_storage::SpillShape::new(2, 2))
+            .expect("register_spill must succeed");
+
+        let mut s = CalcgraphSession::new();
+        // B1 = A2 — A2 is NOT in any spill.
+        let plan_b1 = ExprPlan::CellRef {
+            sheet: 0,
+            row: 1,
+            col: 0,
+            abs_col: false,
+            abs_row: false,
+        };
+        s.on_set_formula(0, 0, 1, &plan_b1, &wb);
+        let b1 = s.cell_node_for(0, 0, 1).unwrap();
+        assert_eq!(
+            s.formula_deps(b1).unwrap().cells,
+            vec![(0, 1, 0)],
+            "non-spill-target deps must be left alone"
         );
     }
 }
