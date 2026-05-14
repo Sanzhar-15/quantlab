@@ -63,6 +63,30 @@ pub enum ParseError {
     /// Unclosed function call or grouping.
     #[error("unclosed {what}")]
     UnclosedDelimiter { what: &'static str },
+
+    /// **W5-89 (Phase 4.6.A part 3):** `Sheet!` with no following ref
+    /// (end-of-input or a non-reference token).
+    #[error("dangling sheet qualifier — '{name}!' must be followed by a cell or range reference")]
+    DanglingBang { name: String },
+
+    /// **W5-89 (Phase 4.6.A part 3):** `Sheet1!Sheet2!X` — chained
+    /// sheet qualifiers. Cross-sheet refs in Excel are flat; only ONE
+    /// `Sheet!` per reference.
+    #[error("double sheet qualifier — only one 'Sheet!' is allowed per reference")]
+    DoubleSheetQualifier,
+
+    /// **W5-89 (Phase 4.6.A part 3):** `Sheet1!A1:Sheet2!B2` —
+    /// mixed-sheet endpoint range. Excel canon: the prefix applies to
+    /// the whole range; specifying it on BOTH endpoints with different
+    /// sheets is invalid.
+    #[error("mixed-sheet range endpoints — both endpoints must reference the same sheet")]
+    MixedSheetRangeEndpoints,
+
+    /// **W5-89 (Phase 4.6.A part 3):** any non-reference term after a
+    /// sheet qualifier — e.g. `Sheet1!SUM` (Function), `Sheet1!"x"`
+    /// (literal), `Sheet1!(A1)` (grouping).
+    #[error("sheet qualifier must be followed by a cell or range reference, got {got}")]
+    SheetQualifierFollowedByNonReference { got: String },
 }
 
 /// Parse a complete formula from `tokens` (lexer output) to an AST.
@@ -310,6 +334,55 @@ impl Parser {
                 })
             }
 
+            // **W5-89 (Phase 4.6.A part 3):** sheet-qualified reference.
+            // Cross-sheet syntax `Sheet!Ref` and `'Sheet name'!Ref`.
+            // The lexer emits SheetName/QuotedSheetName + Bang as a
+            // two-token sequence; the parser consumes them as the
+            // PREFIX of a cell-or-range reference. The inner term must
+            // be a CellRef / BareColumn / BareRow / RangeRef shape —
+            // anything else is `SheetQualifierFollowedByNonReference`.
+            // Recursion: `parse_prefix` returns the FIRST term; range
+            // assembly (`A1:B2`) happens in the outer `parse_expr` loop
+            // via the `:` infix path.
+            Token::SheetName(name) | Token::QuotedSheetName(name) => {
+                // Expect Bang next (lexer guarantees this pairing).
+                match self.advance() {
+                    Some(Token::Bang) => {}
+                    Some(other) => {
+                        return Err(ParseError::Unexpected {
+                            context: "after sheet name",
+                            got: format!("{other:?}"),
+                        });
+                    }
+                    None => {
+                        return Err(ParseError::DanglingBang {
+                            name: name.as_ref().to_owned(),
+                        });
+                    }
+                }
+                // Special-case: bare `Sheet!` with end-of-input or a
+                // non-reference token. Surface as DanglingBang for
+                // clarity (vs the generic "unexpected end" / "unexpected
+                // token" the recursive call would emit).
+                if self.peek().is_none() {
+                    return Err(ParseError::DanglingBang {
+                        name: name.as_ref().to_owned(),
+                    });
+                }
+                let inner = self.parse_prefix()?;
+                Ok(apply_sheet_to_term(inner, name)?)
+            }
+
+            // Bare `!` without a preceding sheet name. The lexer doesn't
+            // emit `Token::Bang` outside the sheet-prefix sequence (it's
+            // only emitted via `try_lex_sheet_name_prefix` /
+            // `lex_quoted_sheet_name`), so reaching this arm means the
+            // user wrote `Sheet1!Sheet2!Foo` and our outer recursion
+            // ended up here. Reject explicitly as DoubleSheetQualifier
+            // — the more specific error than the generic "unexpected
+            // token" the wildcard would surface.
+            Token::Bang => Err(ParseError::DoubleSheetQualifier),
+
             // Grouping `(...)`.
             Token::LParen => {
                 let inner = self.parse_expr(0)?;
@@ -369,6 +442,11 @@ impl Parser {
         // 0-indexed row references here.
         let lhs = number_to_bare_row(lhs)?;
         let rhs = number_to_bare_row(rhs)?;
+        // **W5-89 (Phase 4.6.A part 3):** merge sheet refs across the
+        // range endpoints. Same-sheet, redundant-explicit, and prefix-
+        // on-LHS-only cases collapse to a single SheetRef; mixed-sheet
+        // endpoints reject. See `merge_sheet_refs` for the policy.
+        let merged_sheet = merge_sheet_refs(&sheet_of_term(&lhs), &sheet_of_term(&rhs))?;
         match (lhs, rhs) {
             (Expr::CellRef(a), Expr::CellRef(b)) => {
                 // Sort start/end on each axis (Excel normalizes A2:A1 → A1:A2).
@@ -383,7 +461,7 @@ impl Parser {
                     (b.row, a.row, b.abs_row, a.abs_row)
                 };
                 Ok(Expr::RangeRef(RangeRef::Cells {
-                    sheet: SheetRef::Current,
+                    sheet: merged_sheet.clone(),
                     start_col,
                     start_row,
                     end_col,
@@ -425,7 +503,7 @@ impl Parser {
                     false
                 };
                 Ok(Expr::RangeRef(RangeRef::WholeColumn {
-                    sheet: SheetRef::Current,
+                    sheet: merged_sheet.clone(),
                     start_col: lo,
                     end_col: hi,
                     abs_start,
@@ -462,7 +540,7 @@ impl Parser {
                     false
                 };
                 Ok(Expr::RangeRef(RangeRef::WholeRow {
-                    sheet: SheetRef::Current,
+                    sheet: merged_sheet,
                     start_row: lo,
                     end_row: hi,
                     abs_start,
@@ -473,6 +551,153 @@ impl Parser {
                 detail: "mixed CellRef/Column/Row range operands (e.g. A1:B); Phase 0 only allows matching types",
             }),
         }
+    }
+}
+
+/// **W5-89 (Phase 4.6.A part 3):** attach a sheet name from `Sheet!Ref`
+/// syntax to the inner reference term. The inner term must be a
+/// reference shape (CellRef / RangeRef::*). Anything else is a parse
+/// error. If the inner reference already has a non-`Current` sheet,
+/// that's `DoubleSheetQualifier` (`Sheet1!Sheet2!X`).
+fn apply_sheet_to_term(expr: Expr, name: Arc<str>) -> Result<Expr, ParseError> {
+    // **W5-89:** `Sheet1!5:10` — the lexer emits `Number(5)` for bare
+    // digits. The whole-row range conversion happens in `build_range`
+    // when the `:` infix triggers. Up-front, we convert here so the
+    // sheet prefix attaches to the resulting `WholeRow` singleton (and
+    // the subsequent range merge keeps the prefix). Non-Number Exprs
+    // pass through unchanged.
+    let expr = if matches!(expr, Expr::Number(_)) {
+        number_to_bare_row(expr)?
+    } else {
+        expr
+    };
+    match expr {
+        Expr::CellRef(addr) => {
+            if !matches!(addr.sheet, SheetRef::Current) {
+                return Err(ParseError::DoubleSheetQualifier);
+            }
+            Ok(Expr::CellRef(CellAddr {
+                sheet: SheetRef::Name(name),
+                ..addr
+            }))
+        }
+        Expr::RangeRef(r) => {
+            let updated = match r {
+                RangeRef::Cells {
+                    sheet,
+                    start_col,
+                    start_row,
+                    end_col,
+                    end_row,
+                    abs_start_col,
+                    abs_start_row,
+                    abs_end_col,
+                    abs_end_row,
+                } => {
+                    if !matches!(sheet, SheetRef::Current) {
+                        return Err(ParseError::DoubleSheetQualifier);
+                    }
+                    RangeRef::Cells {
+                        sheet: SheetRef::Name(name),
+                        start_col,
+                        start_row,
+                        end_col,
+                        end_row,
+                        abs_start_col,
+                        abs_start_row,
+                        abs_end_col,
+                        abs_end_row,
+                    }
+                }
+                RangeRef::WholeColumn {
+                    sheet,
+                    start_col,
+                    end_col,
+                    abs_start,
+                    abs_end,
+                } => {
+                    if !matches!(sheet, SheetRef::Current) {
+                        return Err(ParseError::DoubleSheetQualifier);
+                    }
+                    RangeRef::WholeColumn {
+                        sheet: SheetRef::Name(name),
+                        start_col,
+                        end_col,
+                        abs_start,
+                        abs_end,
+                    }
+                }
+                RangeRef::WholeRow {
+                    sheet,
+                    start_row,
+                    end_row,
+                    abs_start,
+                    abs_end,
+                } => {
+                    if !matches!(sheet, SheetRef::Current) {
+                        return Err(ParseError::DoubleSheetQualifier);
+                    }
+                    RangeRef::WholeRow {
+                        sheet: SheetRef::Name(name),
+                        start_row,
+                        end_row,
+                        abs_start,
+                        abs_end,
+                    }
+                }
+            };
+            Ok(Expr::RangeRef(updated))
+        }
+        other => Err(ParseError::SheetQualifierFollowedByNonReference {
+            got: format!("{other:?}"),
+        }),
+    }
+}
+
+/// **W5-89 (Phase 4.6.A part 3):** merge two endpoint `SheetRef`s for
+/// range construction per design § 10.5:
+///
+/// - `(Current, Current)` → `Current` (same-sheet range).
+/// - `(Name(N), Current)` → `Name(N)` (prefix applies to whole range).
+/// - `(Current, Name(_))` → `MixedSheetRangeEndpoints` (Excel requires
+///   the prefix at the start, not on the trailing endpoint).
+/// - `(Name(A), Name(B))` with `A != B` (case-insensitive) →
+///   `MixedSheetRangeEndpoints`.
+/// - `(Name(A), Name(A))` → `Name(A)` (redundant explicit form,
+///   normalized to single-prefix).
+/// - `Id` variants are produced post-bind / by tests; treated symmetrically.
+fn merge_sheet_refs(lhs: &SheetRef, rhs: &SheetRef) -> Result<SheetRef, ParseError> {
+    match (lhs, rhs) {
+        (SheetRef::Current, SheetRef::Current) => Ok(SheetRef::Current),
+        (SheetRef::Name(n), SheetRef::Current) => Ok(SheetRef::Name(n.clone())),
+        (SheetRef::Id(s), SheetRef::Current) => Ok(SheetRef::Id(*s)),
+        (SheetRef::Current, SheetRef::Name(_) | SheetRef::Id(_)) => {
+            Err(ParseError::MixedSheetRangeEndpoints)
+        }
+        (SheetRef::Name(a), SheetRef::Name(b)) => {
+            if a.eq_ignore_ascii_case(b.as_ref()) {
+                Ok(SheetRef::Name(a.clone()))
+            } else {
+                Err(ParseError::MixedSheetRangeEndpoints)
+            }
+        }
+        (SheetRef::Id(a), SheetRef::Id(b)) if a == b => Ok(SheetRef::Id(*a)),
+        // Cross-variant mismatch (Name vs Id) or different Id values.
+        _ => Err(ParseError::MixedSheetRangeEndpoints),
+    }
+}
+
+/// **W5-89 (Phase 4.6.A part 3):** extract the `SheetRef` field from
+/// a reference-shaped Expr. Returns `Current` for non-reference shapes
+/// so the caller's pattern-match logic stays clean (those branches
+/// fail earlier with type-mismatch errors anyway).
+fn sheet_of_term(expr: &Expr) -> SheetRef {
+    match expr {
+        Expr::CellRef(addr) => addr.sheet.clone(),
+        Expr::RangeRef(RangeRef::Cells { sheet, .. })
+        | Expr::RangeRef(RangeRef::WholeColumn { sheet, .. })
+        | Expr::RangeRef(RangeRef::WholeRow { sheet, .. }) => sheet.clone(),
+        _ => SheetRef::Current,
     }
 }
 
@@ -1260,6 +1485,219 @@ mod tests {
                 ));
             }
             _ => panic!(),
+        }
+    }
+
+    // ===== W5-89 / Phase 4.6.A part 3 — cross-sheet parser =====
+
+    fn parse_ok(src: &str) -> Expr {
+        let toks = crate::lex(src).unwrap_or_else(|e| panic!("lex({src:?}) failed: {e}"));
+        parse(toks).unwrap_or_else(|e| panic!("parse({src:?}) failed: {e}"))
+    }
+
+    fn parse_err(src: &str) -> ParseError {
+        let toks = crate::lex(src).unwrap_or_else(|e| panic!("lex({src:?}) failed: {e}"));
+        parse(toks).unwrap_err()
+    }
+
+    #[test]
+    fn parse_sheet_qualified_cellref_unquoted() {
+        let expr = parse_ok("Sheet1!A1");
+        match expr {
+            Expr::CellRef(addr) => {
+                assert_eq!(addr.sheet, SheetRef::Name(Arc::from("Sheet1")));
+                assert_eq!(addr.col, 0);
+                assert_eq!(addr.row, 0);
+            }
+            other => panic!("expected CellRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sheet_qualified_cellref_quoted() {
+        let expr = parse_ok("'Q3 2025'!B5");
+        match expr {
+            Expr::CellRef(addr) => {
+                assert_eq!(addr.sheet, SheetRef::Name(Arc::from("Q3 2025")));
+                assert_eq!(addr.col, 1);
+                assert_eq!(addr.row, 4);
+            }
+            other => panic!("expected CellRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sheet_qualified_quoted_with_escape() {
+        let expr = parse_ok("'Ben''s Sheet'!A1");
+        match expr {
+            Expr::CellRef(addr) => {
+                assert_eq!(addr.sheet, SheetRef::Name(Arc::from("Ben's Sheet")));
+            }
+            other => panic!("expected CellRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sheet_qualified_range_single_prefix() {
+        // Excel-canon: `Sheet1!A1:B2` applies the prefix to the whole range.
+        let expr = parse_ok("Sheet1!A1:B2");
+        match expr {
+            Expr::RangeRef(RangeRef::Cells {
+                sheet,
+                start_col,
+                start_row,
+                end_col,
+                end_row,
+                ..
+            }) => {
+                assert_eq!(sheet, SheetRef::Name(Arc::from("Sheet1")));
+                assert_eq!((start_col, start_row, end_col, end_row), (0, 0, 1, 1));
+            }
+            other => panic!("expected RangeRef::Cells, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sheet_qualified_range_redundant_explicit_form_normalizes() {
+        // `Sheet1!A1:Sheet1!B2` is the redundant explicit form. Both endpoints
+        // resolve to the same sheet; result normalizes to single-prefix.
+        let expr = parse_ok("Sheet1!A1:Sheet1!B2");
+        match expr {
+            Expr::RangeRef(RangeRef::Cells { sheet, .. }) => {
+                assert_eq!(sheet, SheetRef::Name(Arc::from("Sheet1")));
+            }
+            other => panic!("expected RangeRef::Cells, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sheet_qualified_redundant_form_case_insensitive() {
+        // `Sheet1!A1:sheet1!B2` — same canonical name, different case.
+        // Should normalize without erroring.
+        let expr = parse_ok("Sheet1!A1:sheet1!B2");
+        match expr {
+            Expr::RangeRef(RangeRef::Cells { sheet, .. }) => {
+                assert!(matches!(sheet, SheetRef::Name(_)));
+            }
+            other => panic!("expected RangeRef::Cells, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sheet_qualified_whole_column() {
+        let expr = parse_ok("Sheet1!A:A");
+        match expr {
+            Expr::RangeRef(RangeRef::WholeColumn { sheet, .. }) => {
+                assert_eq!(sheet, SheetRef::Name(Arc::from("Sheet1")));
+            }
+            other => panic!("expected WholeColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sheet_qualified_whole_row() {
+        let expr = parse_ok("Sheet1!1:5");
+        match expr {
+            Expr::RangeRef(RangeRef::WholeRow { sheet, .. }) => {
+                assert_eq!(sheet, SheetRef::Name(Arc::from("Sheet1")));
+            }
+            other => panic!("expected WholeRow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_double_sheet_qualifier_rejected() {
+        let err = parse_err("Sheet1!Sheet2!A1");
+        assert!(matches!(err, ParseError::DoubleSheetQualifier));
+    }
+
+    #[test]
+    fn parse_mixed_sheet_range_endpoints_rejected() {
+        let err = parse_err("Sheet1!A1:Sheet2!B2");
+        assert!(matches!(err, ParseError::MixedSheetRangeEndpoints));
+    }
+
+    #[test]
+    fn parse_dangling_bang_at_end_of_input() {
+        let err = parse_err("Sheet1!");
+        match err {
+            ParseError::DanglingBang { name } => assert_eq!(name, "Sheet1"),
+            other => panic!("expected DanglingBang, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sheet_qualified_inside_binary_op() {
+        // `Sheet2!A1 + 1` — the prefix only applies to A1, not the whole expr.
+        let expr = parse_ok("Sheet2!A1+1");
+        match expr {
+            Expr::Binary { op, lhs, rhs } => {
+                assert_eq!(op, Operator::Plus);
+                match lhs.as_ref() {
+                    Expr::CellRef(addr) => {
+                        assert_eq!(addr.sheet, SheetRef::Name(Arc::from("Sheet2")));
+                    }
+                    other => panic!("expected CellRef lhs, got {other:?}"),
+                }
+                assert!(matches!(rhs.as_ref(), Expr::Number(_)));
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sheet_qualified_inside_function_arg() {
+        // `SUM(Sheet1!A1:A10)` — function arg is a cross-sheet range.
+        let expr = parse_ok("SUM(Sheet1!A1:A10)");
+        match expr {
+            Expr::Function { name, args } => {
+                assert_eq!(name.as_ref(), "SUM");
+                assert_eq!(args.len(), 1);
+                match &args[0] {
+                    Expr::RangeRef(RangeRef::Cells { sheet, .. }) => {
+                        assert_eq!(sheet, &SheetRef::Name(Arc::from("Sheet1")));
+                    }
+                    other => panic!("expected Cells RangeRef, got {other:?}"),
+                }
+            }
+            other => panic!("expected Function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unqualified_range_still_works() {
+        // Regression guard: same-sheet ranges still parse to SheetRef::Current.
+        let expr = parse_ok("A1:B2");
+        match expr {
+            Expr::RangeRef(RangeRef::Cells { sheet, .. }) => {
+                assert_eq!(sheet, SheetRef::Current);
+            }
+            other => panic!("expected Cells, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sheet_qualified_absolute_ref() {
+        // `Sheet1!$A$1` — absolute markers preserved alongside sheet prefix.
+        let expr = parse_ok("Sheet1!$A$1");
+        match expr {
+            Expr::CellRef(addr) => {
+                assert_eq!(addr.sheet, SheetRef::Name(Arc::from("Sheet1")));
+                assert!(addr.abs_col);
+                assert!(addr.abs_row);
+            }
+            other => panic!("expected CellRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_dotted_sheet_name() {
+        let expr = parse_ok("Data.2024!A1");
+        match expr {
+            Expr::CellRef(addr) => {
+                assert_eq!(addr.sheet, SheetRef::Name(Arc::from("Data.2024")));
+            }
+            other => panic!("expected CellRef, got {other:?}"),
         }
     }
 }

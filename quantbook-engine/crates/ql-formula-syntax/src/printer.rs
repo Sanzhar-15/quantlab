@@ -56,6 +56,7 @@ fn column_index_to_letters(mut col: u32) -> String {
 }
 
 fn print_cell_addr(addr: &CellAddr, out: &mut String) {
+    print_sheet_prefix(&addr.sheet, out);
     if addr.abs_col {
         out.push('$');
     }
@@ -67,9 +68,54 @@ fn print_cell_addr(addr: &CellAddr, out: &mut String) {
     out.push_str(&(addr.row + 1).to_string());
 }
 
+/// **W5-89 (Phase 4.6.A part 3):** emit `Sheet!` or `'Sheet name'!`
+/// prefix for non-`Current` sheet refs. `Id` is post-bind-only; the
+/// printer panics if asked to render it (a future
+/// `print_with_resolver(expr, id_to_name)` API will handle that path).
+fn print_sheet_prefix(sheet: &SheetRef, out: &mut String) {
+    match sheet {
+        SheetRef::Current => {}
+        SheetRef::Name(name) => {
+            print_sheet_name(name, out);
+            out.push('!');
+        }
+        SheetRef::Id(id) => panic!(
+            "print: SheetRef::Id({id}) requires a sheet-name resolver — use a future print_with_resolver API"
+        ),
+    }
+}
+
+/// **W5-89 (Phase 4.6.A part 3):** emit a sheet name in its canonical
+/// source form. Quotes the name if it contains any character outside
+/// `[A-Za-z0-9_.]`, starts with a digit (would lex as a number/row),
+/// or is empty (defensive — empty names are rejected at registry time
+/// anyway). Embedded `'` is escaped as `''`.
+fn print_sheet_name(name: &str, out: &mut String) {
+    let needs_quoting = name.is_empty()
+        || name.starts_with(|c: char| c.is_ascii_digit())
+        || name
+            .chars()
+            .any(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'));
+    if needs_quoting {
+        out.push('\'');
+        for c in name.chars() {
+            if c == '\'' {
+                out.push('\'');
+                out.push('\'');
+            } else {
+                out.push(c);
+            }
+        }
+        out.push('\'');
+    } else {
+        out.push_str(name);
+    }
+}
+
 fn print_range(r: &RangeRef, out: &mut String) {
     match r {
         RangeRef::Cells {
+            sheet,
             start_col,
             start_row,
             end_col,
@@ -78,8 +124,13 @@ fn print_range(r: &RangeRef, out: &mut String) {
             abs_start_row,
             abs_end_col,
             abs_end_row,
-            ..
         } => {
+            // **W5-89 (Phase 4.6.A part 3):** sheet prefix applies to the
+            // WHOLE range, emitted once at the start (Excel canon). The
+            // trailing endpoint omits the prefix; both endpoints get
+            // `SheetRef::Current` in the synthesized `CellAddr` so
+            // `print_cell_addr` emits no prefix internally.
+            print_sheet_prefix(sheet, out);
             print_cell_addr(
                 &CellAddr {
                     sheet: SheetRef::Current,
@@ -103,12 +154,13 @@ fn print_range(r: &RangeRef, out: &mut String) {
             );
         }
         RangeRef::WholeColumn {
+            sheet,
             start_col,
             end_col,
             abs_start,
             abs_end,
-            ..
         } => {
+            print_sheet_prefix(sheet, out);
             if *abs_start {
                 out.push('$');
             }
@@ -120,12 +172,13 @@ fn print_range(r: &RangeRef, out: &mut String) {
             out.push_str(&column_index_to_letters(*end_col));
         }
         RangeRef::WholeRow {
+            sheet,
             start_row,
             end_row,
             abs_start,
             abs_end,
-            ..
         } => {
+            print_sheet_prefix(sheet, out);
             if *abs_start {
                 out.push('$');
             }
@@ -270,6 +323,7 @@ mod tests {
     use super::*;
     use crate::lexer::lex;
     use crate::parser::parse;
+    use std::sync::Arc;
 
     fn rt(src: &str) -> String {
         let expr = parse(lex(src).expect("lex")).expect("parse");
@@ -648,5 +702,106 @@ mod tests {
         let e = parse(lex("A.B.C").expect("lex")).expect("parse");
         let printed = print(&e);
         assert_eq!(printed, "A.B.C");
+    }
+
+    // ===== W5-89 / Phase 4.6.A part 3 — sheet-prefix printing =====
+
+    /// Helper: parse → print → assert round-trip text matches expected.
+    fn round_trip(src: &str, expected: &str) {
+        let e = parse(lex(src).expect("lex")).expect("parse");
+        assert_eq!(print(&e), expected, "round-trip mismatch for {src:?}");
+    }
+
+    #[test]
+    fn print_unquoted_sheet_prefix_cellref() {
+        round_trip("Sheet1!A1", "Sheet1!A1");
+    }
+
+    #[test]
+    fn print_dotted_sheet_name_unquoted() {
+        round_trip("Data.2024!B5", "Data.2024!B5");
+    }
+
+    #[test]
+    fn print_quoted_sheet_name_with_space() {
+        round_trip("'Q3 2025'!A1", "'Q3 2025'!A1");
+    }
+
+    #[test]
+    fn print_quoted_sheet_name_with_escape() {
+        round_trip("'Ben''s Sheet'!A1", "'Ben''s Sheet'!A1");
+    }
+
+    #[test]
+    fn print_sheet_prefix_on_range() {
+        round_trip("Sheet1!A1:B2", "Sheet1!A1:B2");
+    }
+
+    #[test]
+    fn print_sheet_prefix_on_whole_column() {
+        round_trip("Sheet1!A:A", "Sheet1!A:A");
+    }
+
+    #[test]
+    fn print_sheet_prefix_on_whole_row() {
+        round_trip("Sheet1!1:5", "Sheet1!1:5");
+    }
+
+    #[test]
+    fn print_redundant_explicit_form_normalizes_to_single_prefix() {
+        // `Sheet1!A1:Sheet1!B2` parses + normalizes; print emits single-prefix form.
+        let e = parse(lex("Sheet1!A1:Sheet1!B2").expect("lex")).expect("parse");
+        assert_eq!(print(&e), "Sheet1!A1:B2");
+    }
+
+    #[test]
+    fn print_sheet_prefix_in_binary_expression() {
+        // Printer adds canonical spaces around binary operators.
+        round_trip("Sheet2!A1+1", "Sheet2!A1 + 1");
+    }
+
+    #[test]
+    fn print_sheet_prefix_in_function_arg() {
+        round_trip("SUM(Sheet1!A1:A10)", "SUM(Sheet1!A1:A10)");
+    }
+
+    #[test]
+    fn print_sheet_prefix_preserves_absolute_markers() {
+        round_trip("Sheet1!$A$1", "Sheet1!$A$1");
+    }
+
+    #[test]
+    fn print_sheet_name_with_special_char_is_quoted() {
+        // A sheet name containing `-` would normally need quoting because `-`
+        // is not in `[A-Za-z0-9_.]`. Tested via direct AST construction
+        // (the parser/lexer wouldn't produce this without quoting at the
+        // source).
+        let e = Expr::CellRef(CellAddr {
+            sheet: SheetRef::Name(Arc::from("Sales-Q1")),
+            col: 0,
+            row: 0,
+            abs_col: false,
+            abs_row: false,
+        });
+        assert_eq!(print(&e), "'Sales-Q1'!A1");
+    }
+
+    #[test]
+    fn print_sheet_name_starting_with_digit_is_quoted() {
+        let e = Expr::CellRef(CellAddr {
+            sheet: SheetRef::Name(Arc::from("2024")),
+            col: 0,
+            row: 0,
+            abs_col: false,
+            abs_row: false,
+        });
+        assert_eq!(print(&e), "'2024'!A1");
+    }
+
+    #[test]
+    fn same_sheet_ref_omits_prefix() {
+        // `SheetRef::Current` MUST NOT emit a prefix.
+        round_trip("A1", "A1");
+        round_trip("A1:B2", "A1:B2");
     }
 }
