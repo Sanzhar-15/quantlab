@@ -879,11 +879,7 @@ impl<'a> WorkbookRuntime<'a> {
         // FILTER with all-false mask without if_empty). Surface as
         // #CALC!, NOT #SPILL!. Design § 8.1 step c.
         if array.is_degenerate() {
-            let err = Value::Error(ErrorValue::Calc);
-            self.workbook.clear_user_at(sheet, row, col);
-            self.workbook.put_computed_at(sheet, row, col, err.clone());
-            self.workbook.put_formula(sheet, row, col, formula_text);
-            return (err, None);
+            return self.write_anchor_error(sheet, row, col, ErrorValue::Calc, formula_text);
         }
 
         // Bounds check. `array.rows() / cols()` are `>= 1` (degenerate
@@ -897,11 +893,7 @@ impl<'a> WorkbookRuntime<'a> {
         let out_of_bounds =
             !matches!((end_row, end_col), (Some(r), Some(c)) if r <= MAX_ROW && c <= MAX_COLUMN);
         if out_of_bounds {
-            let err = Value::Error(ErrorValue::Spill);
-            self.workbook.clear_user_at(sheet, row, col);
-            self.workbook.put_computed_at(sheet, row, col, err.clone());
-            self.workbook.put_formula(sheet, row, col, formula_text);
-            return (err, None);
+            return self.write_anchor_error(sheet, row, col, ErrorValue::Spill, formula_text);
         }
 
         // Blocking check. For every NON-ANCHOR cell in the spill
@@ -928,11 +920,13 @@ impl<'a> WorkbookRuntime<'a> {
                     || self.workbook.formula_at(sheet, r, c).is_some()
                     || sheet_ref.read(r, c) != Value::Blank;
                 if occupied {
-                    let err = Value::Error(ErrorValue::Spill);
-                    self.workbook.clear_user_at(sheet, row, col);
-                    self.workbook.put_computed_at(sheet, row, col, err.clone());
-                    self.workbook.put_formula(sheet, row, col, formula_text);
-                    return (err, None);
+                    return self.write_anchor_error(
+                        sheet,
+                        row,
+                        col,
+                        ErrorValue::Spill,
+                        formula_text,
+                    );
                 }
             }
         }
@@ -966,6 +960,28 @@ impl<'a> WorkbookRuntime<'a> {
         // Excel's anchor return value = the (0,0) cell of the array.
         // Callers (formula bar UI, op-log replay) see this.
         (array.at(0, 0).clone(), Some(shape))
+    }
+
+    /// **W5-103 megaudit LOW (Codex pass 2 finding):** anchor-error
+    /// write helper. The three blocked-spill arms in `write_spill`
+    /// (degenerate → `#CALC!`, bounds → `#SPILL!`, blocking →
+    /// `#SPILL!`) all do the same five lines: clear user, write error
+    /// to computed, persist formula text, return `(err, None)`.
+    /// Factor into one helper so a future fix can't update one arm
+    /// and miss another.
+    fn write_anchor_error(
+        &mut self,
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+        error: ErrorValue,
+        formula_text: Arc<str>,
+    ) -> (Value, Option<SpillShape>) {
+        let err = Value::Error(error);
+        self.workbook.clear_user_at(sheet, row, col);
+        self.workbook.put_computed_at(sheet, row, col, err.clone());
+        self.workbook.put_formula(sheet, row, col, formula_text);
+        (err, None)
     }
 
     /// Set a cell to a literal value (no formula). Clears any existing formula
@@ -1347,48 +1363,56 @@ impl<'a> WorkbookRuntime<'a> {
         // cell anchors a spill, dissolve the spill BEFORE clearing the
         // formula. Without this, `SpillAnchorTable` keeps dangling
         // anchor + target entries and the target cells' computed
-        // overlays survive as orphan values that the read cascade
-        // still surfaces — Sonnet megaudit caught this gap.
+        // overlays survive as orphan values — Sonnet megaudit caught
+        // this gap.
         //
-        // Capture the old footprint BEFORE clearing so the calcgraph
-        // hook pass below can fire `on_set_value` for each non-anchor
-        // target. This mirrors `set_formula`'s 4.7.J.3 invalidation
-        // pattern.
+        // **W5-103 megaudit MEDIUM-4 follow-up — op-log atomicity:**
+        // mirror the HIGH-3 fix for set_formula. clear_spill_at MUST
+        // run AFTER op-log append, otherwise a failing append leaves
+        // the spill dissolved with no recorded op (workbook/log
+        // divergence). We capture the dissolved_shape via a read-only
+        // `spill_anchor_at` lookup BEFORE append, and only perform
+        // the actual `clear_spill_at` mutation AFTER the op-log
+        // commits successfully.
         //
         // Re-extraction of readers indexed under the dissolved
-        // footprint is Phase 4.7.K work (full set_value + clear_formula
-        // spill-invalidation closure). For now, the on_set_value pass
-        // dirties any readers via the existing index — under-dirty is
-        // possible if a reader was producer-aliased to the anchor
-        // (their dep is at the anchor cell, which gets dirtied by
-        // `on_clear_formula` below).
+        // footprint is Phase 4.7.K work. For now, the on_set_value
+        // pass below dirties readers via the existing index.
+        //
+        // **Value preservation semantic for spill anchors:** for a
+        // scalar formula, clear_formula moves the computed value to
+        // the user lane (Excel canon: "convert formula to literal").
+        // For a spill anchor, the anchor's computed value came from
+        // the spilled array, not a scalar result — preserving it
+        // would mis-model the spill semantic. We detect spill-anchor
+        // case here so the op-log emits ONLY ClearFormula (no spurious
+        // PutValue with the array.at(0,0) value).
         let dissolved_shape = self.workbook.spill_anchor_at(sheet, row, col).copied();
-        if dissolved_shape.is_some() {
-            // Idempotent: clear_spill_at returns SpillNotFoundError
-            // only if the anchor isn't registered, which can't happen
-            // here (spill_anchor_at returned Some).
-            let _ = self.workbook.clear_spill_at((sheet, row, col));
-        }
+        let is_spill_anchor = dissolved_shape.is_some();
+
         // Producer-replay equivalence: `Workbook::clear_formula` only strips
         // the formula text. Phase 3.5 (CORR-25) made it also drop the
-        // computed-overlay entry (so the cell's prior formula output
-        // doesn't linger uncoupled from a formula). To preserve the
-        // "strip formula, keep value" semantic, we explicitly move the
-        // current value into the user-overlay BEFORE clearing — Excel's
-        // canonical interpretation is "convert formula to literal," and
-        // a literal value lives on the user lane. The op-log path records
-        // PutValue + ClearFormula so replay performs the same
-        // user-overlay write + clear pair.
+        // computed-overlay entry. To preserve the "strip formula, keep
+        // value" semantic for SCALAR formulas, we move the current value
+        // into the user-overlay BEFORE clearing. For SPILL anchors, the
+        // value is part of the spill; we skip preservation.
         //
-        // Order matters: write user BEFORE clear_formula. Otherwise the
-        // computed entry vanishes first and `current_value` would already
-        // be Blank.
+        // Order matters for scalars: read current_value BEFORE
+        // dissolving any state. For spill anchors, current_value is
+        // intentionally not preserved.
         //
-        // Phase 2B.7 audit H2 (2026-05-12): wrap the pair in a single
-        // `Op::BatchCommit` for atomicity. The prior two-append sequence
-        // could partially succeed (PutValue lands, ClearFormula append
-        // fails) and leave the op log without a recoverable replay state.
-        let current_value = self.workbook.read(ql_types::Address::new(sheet, row, col));
+        // Phase 2B.7 audit H2 (2026-05-12): wrap PutValue + ClearFormula
+        // in a single `Op::BatchCommit` for atomicity. The prior
+        // two-append sequence could partially succeed and leave the op
+        // log without a recoverable replay state.
+        let current_value = if is_spill_anchor {
+            // Spill anchor: value is part of the spill, not preserved.
+            // Emit only ClearFormula in the op log; skip put_at below.
+            Value::Blank
+        } else {
+            self.workbook.read(ql_types::Address::new(sheet, row, col))
+        };
+
         if let Some(oplog) = self.oplog.as_deref_mut() {
             let mut log_ops: Vec<Op> = Vec::with_capacity(2);
             if let Some(wire) = CellWireValue::from_value(&current_value) {
@@ -1405,9 +1429,19 @@ impl<'a> WorkbookRuntime<'a> {
                 _ => oplog.append(Op::BatchCommit { ops: log_ops })?,
             }
         }
+
+        // Op-log committed. NOW perform storage mutations.
+        if is_spill_anchor {
+            // `clear_spill_at` returns SpillNotFoundError only if the
+            // anchor isn't registered — can't happen here (we just
+            // looked it up via `spill_anchor_at` above).
+            let _ = self.workbook.clear_spill_at((sheet, row, col));
+        }
         // Phase 3.5: preserve the formula's most-recent value as a USER
         // value before clearing. Blank values are skipped — they're the
-        // storage default; writing Blank explicitly is a no-op.
+        // storage default; writing Blank explicitly is a no-op. For
+        // spill anchors, current_value is Blank by construction (above),
+        // so this is automatically a no-op.
         if !matches!(current_value, Value::Blank) {
             self.workbook.put_at(sheet, row, col, current_value);
         }
@@ -6783,6 +6817,42 @@ mod tests {
             wb.read(ql_types::Address::new(0, 0, 3)),
             Value::Number(20.0)
         );
+    }
+
+    /// **Sonnet megaudit follow-up** — clear_formula at a spill anchor
+    /// must emit exactly ONE op (ClearFormula), no spurious PutValue
+    /// for the array.at(0,0) value. Pins the spill-anchor branch's
+    /// op-log payload AND verifies the new atomicity ordering (op-log
+    /// append happens BEFORE clear_spill_at).
+    #[test]
+    fn clear_formula_at_spill_anchor_emits_only_clear_formula_op() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            // Anchor A1 spills 1×3.
+            rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+            // Clear A1 — should emit ONLY ClearFormula (no PutValue
+            // for the Number(1.0) array.at(0,0) value).
+            rt.clear_formula(0, 0, 0).unwrap();
+        }
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        // 1 PutFormula + 1 ClearFormula = 2 ops total. No PutValue.
+        assert_eq!(ops.len(), 2);
+        assert!(
+            matches!(ops[0], Op::PutFormula { .. }),
+            "first op is the original PutFormula"
+        );
+        match &ops[1] {
+            Op::ClearFormula { sheet, row, col } => {
+                assert_eq!((*sheet, *row, *col), (0, 0, 0));
+            }
+            other => panic!(
+                "clear_formula at spill anchor must emit Op::ClearFormula \
+                 (no PutValue), got {other:?}"
+            ),
+        }
     }
 
     /// Closes design § 10.3 dirty-propagation: clear_formula at an

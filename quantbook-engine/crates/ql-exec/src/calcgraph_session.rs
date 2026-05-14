@@ -1035,7 +1035,16 @@ impl CalcgraphSession {
     /// safe: if it matches, it's THE anchor, not a different cell
     /// that happens to share an address. This invariant is enforced
     /// at insert time, not by this query's API.
-    pub fn readers_in_rect(
+    ///
+    /// **Visibility (megaudit Codex pass-2 MEDIUM):** `pub(crate)` not
+    /// `pub`. This method is only safe as part of `WorkbookRuntime`'s
+    /// spill-mutation choreography (callers must follow with
+    /// `reextract_deps` + dirty/cache invalidation). External callers
+    /// (bindings-wasm, bindings-node, bindings-c, ql-service) would
+    /// misuse it; if a real host caller emerges, expose a higher-level
+    /// API that bundles dirtying + cache invalidation + bind-failure
+    /// reporting + re-extraction together.
+    pub(crate) fn readers_in_rect(
         &self,
         anchor_sheet: SheetId,
         anchor_row: RowId,

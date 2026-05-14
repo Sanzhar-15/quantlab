@@ -405,12 +405,52 @@ No new node types. No parallel adjacency. No eager CellNode creation. Lazy — o
 
 ### 10.2 When a user writes into a spill target
 
-`WorkbookRuntime::set_value(s, r, c, v)`:
+**Implementation note (W5-103, megaudit Codex pass-2 LOW closure):** the
+original design specified a "deferred dissolve" model (mark anchor
+dirty, defer unregister to the next recompute). The shipped 4.7.J.5
+implementation uses an **immediate dissolve** model instead — when
+`set_formula` writes into a non-anchor target cell, the host spill is
+unregistered immediately via `clear_spill_at(host_anchor)` BEFORE the
+new formula installs at the target cell.
+
+Both models produce the same observable user state (host anchor
+eventually emits `#SPILL!` or its replacement value; the target cell
+takes the new user formula/value). The implementation choice is:
+
+- **Immediate dissolve** (shipped): simpler control flow, no
+  spill-blocker race in `write_spill`'s blocking check (no need to
+  treat the just-written target as "still occupied by the host"),
+  no pending-dissolve state to track.
+- **Deferred dissolve** (original design): preserves the host's
+  formula association at the anchor with no intermediate state
+  flicker, but requires a "pending block" flag in the dep extractor
+  + a recompute-time consultation.
+
+Recommend updating Phase 4.7.K (set_value spill invalidation) to also
+use immediate dissolve for consistency.
+
+**Immediate dissolve algorithm** for `WorkbookRuntime::set_formula`
+writing into a non-anchor target cell `(s, r, c)`:
+
+1. Look up `workbook.spill_target_anchor(s, r, c)` — if `Some(host_anchor)`
+   and `host_anchor != (s, r, c)`, call `clear_spill_at(host_anchor)`
+   (dissolves the host's anchor+target map entries + clears every
+   target's computed overlay).
+2. **Op-log append happens BEFORE the dissolve** to preserve atomicity
+   (the rest of `set_formula`'s flow handles this).
+3. Proceed with the normal `set_formula` flow at the target cell. The
+   new formula installs as the cell's own formula; if it's a new array
+   anchor, it can spill there without interference from the (now
+   dissolved) host.
+
+**Deferred dissolve algorithm** for `WorkbookRuntime::set_value(s, r, c, v)`:
 
 1. Check `workbook.spill_target_anchor(s, r, c)`. If `Some(anchor)`:
    a. Mark the anchor's formula node dirty.
    b. DO NOT unregister yet — the next `recompute_dirty` will re-evaluate the anchor, see the user value at this cell as a blocker (§ 9.1), and emit `#SPILL!` (which calls `clear_spill_at` per step 8.1(2)).
 2. Apply the user write normally (clears computed overlay at this cell, writes user overlay).
+
+This deferred form is what 4.7.K originally planned; revisit when 4.7.K lands.
 
 ### 10.3 When a spill anchor's formula is cleared
 
