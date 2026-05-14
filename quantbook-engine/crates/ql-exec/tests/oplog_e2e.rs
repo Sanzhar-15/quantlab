@@ -478,3 +478,93 @@ fn format_persistence_round_trip_through_qbook() {
     // Unbound cell (the TEXT formula's output) renders via General path.
     assert_eq!(rt.read_display(0, 2, 0), "2024-07-04");
 }
+
+/// **W5-108 (Phase 4.7.O) — Codex M4 / Sonnet L3 closure**: op-log
+/// replay of a `PutFormula { text: "SEQUENCE(3)" }` followed by
+/// `recompute_all` MUST reconstruct the spill anchor + target
+/// computed overlays. Design § 12.1 ("no new variants — `Op::PutFormula`
+/// only") relies on this replay-then-recompute equivalence — replay
+/// only restores formula text, and the post-replay recompute is what
+/// re-derives the spill state. Pre-4.7.O the parallel test at
+/// workbook_runtime.rs:7978 used `put_formula` directly, bypassing
+/// the actual replay path; this test pins the boundary itself.
+#[test]
+fn oplog_replay_then_recompute_reconstructs_spill_anchor_for_array_function() {
+    use ql_oplog::Op;
+    use ql_storage::SpillShape;
+
+    // ===== Producer: a single PutFormula op for SEQUENCE(3). =====
+    let mut oplog = OpLog::new();
+    oplog
+        .append(Op::PutFormula {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            text: "SEQUENCE(3)".to_string(),
+        })
+        .unwrap();
+
+    // ===== Replay against a fresh workbook + recompute. =====
+    let mut wb = fresh_wb();
+    let reg = default_registry();
+    replay_into(&oplog, &mut wb, &reg).unwrap();
+    // Sanity: replay restored ONLY the formula text — no spill yet.
+    assert_eq!(wb.spill_anchor_at(0, 0, 0), None);
+    {
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        assert!(
+            rt.recompute_all().is_complete(),
+            "recompute on replayed workbook had failures"
+        );
+    }
+
+    // ===== Spill state must be re-derived. =====
+    assert_eq!(
+        wb.spill_anchor_at(0, 0, 0).copied(),
+        Some(SpillShape::new(3, 1)),
+        "recompute_all must re-register the SEQUENCE spill anchor"
+    );
+    assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(1.0));
+    assert_eq!(wb.read(Address::new(0, 1, 0)), Value::Number(2.0));
+    assert_eq!(wb.read(Address::new(0, 2, 0)), Value::Number(3.0));
+    assert_eq!(
+        wb.formula_at(0, 0, 0).map(|s| s.as_ref()),
+        Some("SEQUENCE(3)")
+    );
+}
+
+/// **W5-108 (Phase 4.7.O) — companion to the spill-reconstruction
+/// test**: replay of a PutFormula with an array literal `{1, 2, 3}`
+/// must ALSO reconstruct the spill via recompute_all. Pins design
+/// § 12.1 for the literal-array path (vs the dynamic-function path
+/// above).
+#[test]
+fn oplog_replay_then_recompute_reconstructs_spill_for_literal_array() {
+    use ql_oplog::Op;
+    use ql_storage::SpillShape;
+
+    let mut oplog = OpLog::new();
+    oplog
+        .append(Op::PutFormula {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            text: "{10, 20, 30}".to_string(),
+        })
+        .unwrap();
+
+    let mut wb = fresh_wb();
+    let reg = default_registry();
+    replay_into(&oplog, &mut wb, &reg).unwrap();
+    {
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        assert!(rt.recompute_all().is_complete());
+    }
+    assert_eq!(
+        wb.spill_anchor_at(0, 0, 0).copied(),
+        Some(SpillShape::new(1, 3))
+    );
+    assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(10.0));
+    assert_eq!(wb.read(Address::new(0, 0, 1)), Value::Number(20.0));
+    assert_eq!(wb.read(Address::new(0, 0, 2)), Value::Number(30.0));
+}

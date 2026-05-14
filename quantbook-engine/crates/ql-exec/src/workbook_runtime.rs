@@ -8088,6 +8088,48 @@ mod tests {
         assert_eq!(v, Value::Error(ErrorValue::Calc));
     }
 
+    /// **W5-108 (Phase 4.7.O) — Sonnet L1 / Codex L1 closure**:
+    /// FILTER composed with SEQUENCE — outer FILTER, inner SEQUENCE.
+    /// Same v1 limitation as TRANSPOSE(SEQUENCE(...)): the inner
+    /// Array-returning function in scalar context collapses to #CALC!.
+    /// Pins design § 6.3 uniformly across the three array-returning
+    /// functions.
+    #[test]
+    fn set_formula_filter_of_sequence_in_arg_position_is_calc_error() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt
+            .set_formula(0, 0, 0, "FILTER(SEQUENCE(3), {TRUE; FALSE; TRUE})")
+            .unwrap();
+        drop(rt);
+        assert_eq!(v, Value::Error(ErrorValue::Calc));
+        assert_eq!(wb.spill_anchor_at(0, 0, 0), None);
+    }
+
+    /// **W5-108 (Phase 4.7.O) — Sonnet L1 / Codex L1 closure**:
+    /// SEQUENCE composed with SEQUENCE — outer SEQUENCE expects a
+    /// scalar `rows` arg; the inner SEQUENCE in scalar context
+    /// returns #CALC!. Coerces to the outer's #VALUE! path via the
+    /// number-coercion fallback (or propagates the error). Either way
+    /// the result is a scalar error, NOT a spill.
+    #[test]
+    fn set_formula_sequence_of_sequence_in_arg_position_is_error() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 0, "SEQUENCE(SEQUENCE(2))").unwrap();
+        drop(rt);
+        // Expect a scalar error (either #CALC! propagated from inner,
+        // or #VALUE! / #NUM! from the outer's coercion of an error
+        // value). Critical invariant: NO spill anchor at the cell.
+        assert!(
+            matches!(v, Value::Error(_)),
+            "expected scalar Error, got {v:?}"
+        );
+        assert_eq!(wb.spill_anchor_at(0, 0, 0), None);
+    }
+
     // ===== W5-107 (Phase 4.7.N.2) — FILTER end-to-end =====
 
     /// `=FILTER({1,2,3,4}, {TRUE,FALSE,TRUE,FALSE})` spills 1×2 with

@@ -326,4 +326,98 @@ mod tests {
             Some("{1, 2, 3}")
         );
     }
+
+    /// **W5-108 (Phase 4.7.O) — Codex M3 / Sonnet M5 closure**:
+    /// `SEQUENCE`-driven spill round-trip. The original 4.7.L test
+    /// used a LITERAL array; this variant uses a dynamic-array
+    /// function whose result depends on a runtime-coerced arg.
+    /// Acceptance: design § 12.3 ("load → recompute → check: the
+    /// spill anchor + targets + computed overlays match the pre-save
+    /// state").
+    #[test]
+    fn spill_sequence_formula_round_trip() {
+        let (_dir, path) = temp_path("spill-sequence-roundtrip.qbook");
+
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.set_formula(s, 0, 0, "SEQUENCE(4)").unwrap();
+        }
+        // Pre-save state.
+        assert_eq!(
+            wb.spill_anchor_at(s, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(4, 1))
+        );
+        assert_eq!(wb.read(Address::new(s, 3, 0)), Value::Number(4.0));
+
+        save_workbook(&wb, "spill-sequence-roundtrip", &path).unwrap();
+
+        let (loaded, result) = load_workbook_and_recompute(&path, &reg).unwrap();
+        assert!(result.is_complete(), "recompute failures: {result:?}");
+
+        // Post-state matches pre-state.
+        assert_eq!(
+            loaded.spill_anchor_at(s, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(4, 1))
+        );
+        for i in 0..4 {
+            assert_eq!(
+                loaded.read(Address::new(s, i, 0)),
+                Value::Number((i + 1) as f64)
+            );
+        }
+        assert_eq!(
+            loaded.formula_at(s, 0, 0).map(|s| s.as_ref()),
+            Some("SEQUENCE(4)")
+        );
+    }
+
+    /// **W5-108 (Phase 4.7.O) — Codex M3 / Sonnet M5 closure**:
+    /// `TRANSPOSE(NamedRange)` round-trip. The named range table +
+    /// the spill anchor table must BOTH survive save/load and the
+    /// re-compute must rebuild the spill correctly.
+    #[test]
+    fn spill_transpose_named_range_round_trip() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+
+        let (_dir, path) = temp_path("spill-transpose-named-roundtrip.qbook");
+
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        wb.set_name("MyRow", NamedTarget::Range(Range::new(s, 0, 0, 0, 2)))
+            .unwrap();
+        wb.put(Address::new(s, 0, 0), Value::Number(10.0));
+        wb.put(Address::new(s, 0, 1), Value::Number(20.0));
+        wb.put(Address::new(s, 0, 2), Value::Number(30.0));
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.set_formula(s, 5, 0, "TRANSPOSE(MyRow)").unwrap();
+        }
+        // Pre-save: 1×3 row at (0, 0..2) transposes to 3×1 column at (5, 0).
+        assert_eq!(
+            wb.spill_anchor_at(s, 5, 0).copied(),
+            Some(ql_storage::SpillShape::new(3, 1))
+        );
+
+        save_workbook(&wb, "spill-transpose-named-roundtrip", &path).unwrap();
+
+        let (loaded, result) = load_workbook_and_recompute(&path, &reg).unwrap();
+        assert!(result.is_complete(), "recompute failures: {result:?}");
+
+        // Post-state.
+        assert_eq!(
+            loaded.spill_anchor_at(s, 5, 0).copied(),
+            Some(ql_storage::SpillShape::new(3, 1)),
+            "TRANSPOSE spill anchor must be re-registered"
+        );
+        assert_eq!(loaded.read(Address::new(s, 5, 0)), Value::Number(10.0));
+        assert_eq!(loaded.read(Address::new(s, 6, 0)), Value::Number(20.0));
+        assert_eq!(loaded.read(Address::new(s, 7, 0)), Value::Number(30.0));
+        // Named range survived too.
+        assert!(loaded.names().lookup_ci("MYROW").is_some());
+    }
 }

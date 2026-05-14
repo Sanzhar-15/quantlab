@@ -1037,6 +1037,22 @@ mod tests {
         assert_eq!(e, ErrorValue::Num);
     }
 
+    /// **W5-108 (Phase 4.7.O) — Sonnet L4 closure**: FILTER with an
+    /// error-valued `if_empty` arg lands the error as the singleton
+    /// cell when all-false. Pre-4.7.O test surface didn't pin this;
+    /// the function's documented behavior was implicit.
+    #[test]
+    fn filter_all_false_with_error_if_empty_returns_error_singleton() {
+        let array = arr(1, 2, vec![Value::Number(1.0), Value::Number(2.0)]);
+        let include = arr(1, 2, vec![b(false), b(false)]);
+        let if_empty = FunctionArg::Scalar(Value::Error(ErrorValue::NA));
+        let result = expect_array(filter(&[array, include, if_empty], &ctx()));
+        // Singleton 1×1 with the error value at (0, 0).
+        assert_eq!(result.rows(), 1);
+        assert_eq!(result.cols(), 1);
+        assert_eq!(result.at(0, 0), &Value::Error(ErrorValue::NA));
+    }
+
     /// W5-107-AUDIT Sonnet LOW closure: if_empty as a degenerate
     /// ArrayValue (rows=0 or cols=0) must NOT panic on `.first()`;
     /// degenerate if_empty falls through to the degenerate-output
