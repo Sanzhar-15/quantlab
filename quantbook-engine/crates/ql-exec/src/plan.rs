@@ -352,8 +352,15 @@ fn bind_with_context<L: NameLookup>(
                 args: bound_args,
             })
         }
-        Expr::Array(_) => Err(BindError::UnsupportedVariant("Array literals are Phase 3+")),
-        Expr::Spill(_) => Err(BindError::UnsupportedVariant("Spill anchors are Phase 3+")),
+        Expr::Array(_) => Err(BindError::UnsupportedVariant(
+            "Array literals — binder support lands in Phase 4.7.F (W5-100)",
+        )),
+        Expr::Spill(_) => Err(BindError::UnsupportedVariant(
+            "Spill-range-ref `A1#` syntax is Phase 4.9",
+        )),
+        Expr::Error(_) => Err(BindError::UnsupportedVariant(
+            "Error literals — binder support lands in Phase 4.7.F (W5-100)",
+        )),
         Expr::NameRef(name) => {
             // Phase 2A.6 audit M1: parser-emitted `NameRef` must always carry a
             // non-empty canonical name. An empty name here means the parser is

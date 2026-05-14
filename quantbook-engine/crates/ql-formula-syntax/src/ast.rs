@@ -78,6 +78,20 @@ pub enum Expr {
     /// `name` is the canonical (uppercased) form as the parser stored it. NameTable
     /// lookup is case-sensitive on this canonical form; the parser owns case-folding.
     NameRef(Arc<str>),
+
+    /// **W5-98 (Phase 4.7.D):** error-sigil literal — `#REF!`, `#N/A`,
+    /// `#DIV/0!`, etc. Emitted by the parser when `Token::Error(ev)` is
+    /// encountered as a primary expression. The binder lowers to
+    /// `ExprPlan::String(_)` (or a dedicated `ExprPlan::Error` variant
+    /// — final shape lands in W5-100 / 4.7.F). At evaluation time the
+    /// value is `Value::Error(ev)`.
+    ///
+    /// Common use sites:
+    /// - `=#REF!` — a formula that simply evaluates to the error.
+    /// - `=IFERROR(SOMETHING(), #N/A)` — explicit error fallback.
+    /// - `{1, #N/A, 3}` — error literal in an array (per Phase 4.7
+    ///   design § 3.3).
+    Error(ql_types::ErrorValue),
 }
 
 /// **W5-87 (Phase 4.6.A part 1):** sheet-qualification for AST references.
@@ -161,6 +175,7 @@ pub fn rewrite_sheet_name_in_expr(expr: &Expr, old_canonical: &str, new_name: &A
         Expr::String(s) => Expr::String(s.clone()),
         Expr::Bool(b) => Expr::Bool(*b),
         Expr::NameRef(n) => Expr::NameRef(n.clone()),
+        Expr::Error(ev) => Expr::Error(*ev),
         Expr::CellRef(addr) => Expr::CellRef(CellAddr {
             sheet: rewrite_sheet_ref(&addr.sheet, old_canonical, new_name),
             col: addr.col,

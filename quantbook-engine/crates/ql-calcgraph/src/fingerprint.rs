@@ -168,6 +168,14 @@ fn hash_expr(expr: &Expr, h: &mut impl Hasher) {
             10u8.hash(h);
             name.as_ref().hash(h);
         }
+        Expr::Error(ev) => {
+            // **W5-98 (Phase 4.7.D):** error literal. Hash by the
+            // sigil string so two cells with the same error fingerprint
+            // identically and so the fingerprint is stable across
+            // potential future ErrorValue discriminant reorders.
+            11u8.hash(h);
+            ev.sigil().hash(h);
+        }
     }
 }
 

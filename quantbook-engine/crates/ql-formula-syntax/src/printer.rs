@@ -308,13 +308,50 @@ fn print_expr(expr: &Expr, out: &mut String, parent_min_bp: u8) {
             // Phase 2A.1: defined-name reference round-trips as the bare name.
             out.push_str(name);
         }
-        Expr::Array(_) | Expr::Spill(_) => {
-            // Audit M1 fix (2026-05-12): Phase 0/1 doesn't construct these; if one
-            // somehow appears in the AST it's a programmer bug, not a print-time
-            // fallback. Loud panic per the no-fallbacks rule.
+        Expr::Error(ev) => {
+            // **W5-98 (Phase 4.7.D):** error literal round-trips as its
+            // canonical sigil — `#REF!`, `#N/A`, `#DIV/0!`, etc. The
+            // lexer's `lex_error_sigil` accepts any case; the printer
+            // emits the canonical (Excel-canon) form.
+            out.push_str(ev.sigil());
+        }
+        Expr::Array(rows) => {
+            // **W5-98 (Phase 4.7.D / 4.7.E):** array literal round-trips
+            // as `{cell, cell; cell, cell}`. Cells separated by `, ` and
+            // rows by `; ` (mirrors Excel canon + the parser grammar).
+            // Empty arrays are rejected at parse time (`EmptyArrayLiteral`),
+            // so `rows` is always non-empty here; defensive `unreachable!`
+            // for the degenerate case.
+            if rows.is_empty() {
+                unreachable!(
+                    "print_expr: Expr::Array with zero rows — parser rejects empty \
+                     literals via ParseError::EmptyArrayLiteral; constructing one \
+                     directly is a programmer bug"
+                );
+            }
+            out.push('{');
+            for (i, row) in rows.iter().enumerate() {
+                if i > 0 {
+                    out.push_str("; ");
+                }
+                for (j, cell) in row.iter().enumerate() {
+                    if j > 0 {
+                        out.push_str(", ");
+                    }
+                    print_expr(cell, out, 0);
+                }
+            }
+            out.push('}');
+        }
+        Expr::Spill(_) => {
+            // `Expr::Spill(Box<Expr>)` is reserved for Excel's `A1#`
+            // spill-range-ref syntax (Phase 4.9). NOT used for runtime
+            // spill anchors — those live in `Workbook::spill_anchors`,
+            // not in the AST. Phase 4.7 does not construct this; loud
+            // panic per the no-fallbacks rule.
             unreachable!(
-                "print_expr: Array/Spill variants are Phase 3+ and not constructed in \
-                 Phase 0/1 ASTs — reaching here means the AST was malformed"
+                "print_expr: Expr::Spill is reserved for Phase 4.9 (Excel `A1#` syntax) \
+                 and not constructed in Phase 4.7 — reaching here means the AST was malformed"
             );
         }
     }
@@ -826,5 +863,69 @@ mod tests {
         // `SheetRef::Current` MUST NOT emit a prefix.
         round_trip("A1", "A1");
         round_trip("A1:B2", "A1:B2");
+    }
+
+    // ===== W5-98 (Phase 4.7.D) — array literals + error literals =====
+
+    #[test]
+    fn print_error_literal_round_trips() {
+        round_trip("#REF!", "#REF!");
+        round_trip("#N/A", "#N/A");
+        round_trip("#DIV/0!", "#DIV/0!");
+        round_trip("#NAME?", "#NAME?");
+        round_trip("#VALUE!", "#VALUE!");
+        round_trip("#NUM!", "#NUM!");
+        round_trip("#NULL!", "#NULL!");
+        round_trip("#SPILL!", "#SPILL!");
+        round_trip("#CALC!", "#CALC!");
+    }
+
+    #[test]
+    fn print_error_literal_canonicalizes_case() {
+        // Lexer accepts case-insensitive; printer emits canonical.
+        let e = parse(lex("#ref!").expect("lex")).expect("parse");
+        assert_eq!(print(&e), "#REF!");
+    }
+
+    #[test]
+    fn print_array_literal_1x3() {
+        round_trip("{1, 2, 3}", "{1, 2, 3}");
+    }
+
+    #[test]
+    fn print_array_literal_3x1() {
+        round_trip("{1; 2; 3}", "{1; 2; 3}");
+    }
+
+    #[test]
+    fn print_array_literal_2x2() {
+        round_trip("{1, 2; 3, 4}", "{1, 2; 3, 4}");
+    }
+
+    #[test]
+    fn print_array_literal_mixed_cells() {
+        round_trip("{1, TRUE, \"hi\", #N/A, -5}", "{1, TRUE, \"hi\", #N/A, -5}");
+    }
+
+    #[test]
+    fn print_array_literal_as_function_arg() {
+        round_trip("SUM({1, 2, 3})", "SUM({1, 2, 3})");
+    }
+
+    #[test]
+    fn print_array_normalizes_whitespace() {
+        // Input has extra whitespace; printer emits canonical spacing.
+        let e = parse(lex("{1,2;3,4}").expect("lex")).expect("parse");
+        assert_eq!(print(&e), "{1, 2; 3, 4}");
+    }
+
+    #[test]
+    fn print_array_round_trip_through_parse_print_parse() {
+        // The fundamental round-trip property — parse(print(parse(s))) == parse(s).
+        let s = "{1, 2; 3, 4}";
+        let parsed_once = parse(lex(s).expect("lex")).expect("parse");
+        let printed = print(&parsed_once);
+        let parsed_twice = parse(lex(&printed).expect("lex")).expect("parse");
+        assert_eq!(parsed_once, parsed_twice);
     }
 }

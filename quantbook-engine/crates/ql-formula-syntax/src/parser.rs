@@ -87,6 +87,30 @@ pub enum ParseError {
     /// (literal), `Sheet1!(A1)` (grouping).
     #[error("sheet qualifier must be followed by a cell or range reference, got {got}")]
     SheetQualifierFollowedByNonReference { got: String },
+
+    /// **W5-98 (Phase 4.7.D):** array literal `{1, 2; 3}` has rows of
+    /// different length. Excel pads missing cells with `#N/A` but
+    /// Quantbook v1 rejects loudly per design § 3.2 — pad-with-N/A
+    /// is a Phase 4.10 polish item. `row` is the zero-based index of
+    /// the OFFENDING row (the first row whose length differs from
+    /// row 0's length).
+    #[error("array literal row {row} has {found} cell(s), expected {expected} (matching row 0)")]
+    ArrayRowArityMismatch { expected: u32, found: u32, row: u32 },
+
+    /// **W5-98 (Phase 4.7.D):** array literal `{}` — zero rows. Excel
+    /// rejects empty arrays (`#VALUE!`); Quantbook v1 rejects at parse
+    /// time. (Degenerate arrays from FUNCTIONS like `FILTER` with an
+    /// all-false mask are different — those are runtime, not syntax.)
+    #[error("empty array literal '{{}}' is not allowed")]
+    EmptyArrayLiteral,
+
+    /// **W5-98 (Phase 4.7.D):** array literal cell uses a token that
+    /// isn't in the allowed subset (NUMBER / BOOL / STRING /
+    /// unary-signed-NUMBER / error literal). Per design § 3.3,
+    /// nested cell refs / function calls / nested arrays are NOT
+    /// allowed in v1 array literals (Phase 4.10 lifts this).
+    #[error("invalid array-cell token in array literal: {got}")]
+    InvalidArrayCellToken { got: String },
 }
 
 /// Parse a complete formula from `tokens` (lexer output) to an AST.
@@ -209,6 +233,24 @@ impl Parser {
         match token {
             Token::Number(n) => Ok(Expr::Number(n)),
             Token::String(s) => Ok(Expr::String(s)),
+
+            // **W5-98 (Phase 4.7.D):** error-sigil literal (`#REF!`,
+            // `#N/A`, etc.). Lexed by `lex_error_sigil` (W5-97). The
+            // parser admits the token as a primary expression in any
+            // position a literal would be valid. Common use sites:
+            // `=#REF!`, `=IFERROR(SOMETHING(), #N/A)`,
+            // `{1, #N/A, 3}` (array — see `parse_array_literal`).
+            Token::Error(ev) => Ok(Expr::Error(ev)),
+
+            // **W5-98 (Phase 4.7.D):** array literal `{1, 2; 3, 4}`.
+            // Delegates to `parse_array_literal` which enforces:
+            //   - non-empty (rejects `{}` with `EmptyArrayLiteral`)
+            //   - uniform row arity (rejects `{1, 2; 3}` with
+            //     `ArrayRowArityMismatch`)
+            //   - restricted cell grammar per design § 3.3 (numbers,
+            //     booleans, strings, error literals, unary-signed
+            //     numbers — no nested refs / functions / arrays).
+            Token::LBrace => self.parse_array_literal(),
 
             // Identifier — either a function call (if next is `(`) or a name-ref.
             // Phase 2A.1 (2026-05-12): a bare identifier outside a function context
@@ -398,6 +440,128 @@ impl Parser {
 
             other => Err(ParseError::Unexpected {
                 context: "prefix",
+                got: format!("{other:?}"),
+            }),
+        }
+    }
+
+    /// **W5-98 (Phase 4.7.D):** parse an array literal `{...}`.
+    /// Caller has already consumed the opening `LBrace`. Consumes
+    /// through the closing `RBrace`.
+    ///
+    /// Grammar (design § 3.1):
+    /// ```text
+    /// array_literal := '{' array_row (';' array_row)* '}'
+    /// array_row    := array_cell (',' array_cell)*
+    /// array_cell   := number | string | bool | error_lit | unary_signed_number
+    /// ```
+    ///
+    /// Errors:
+    /// - `EmptyArrayLiteral` — `{}` (zero rows).
+    /// - `ArrayRowArityMismatch` — row N has different cell count than row 0.
+    /// - `InvalidArrayCellToken` — token not in the v1 restricted cell grammar.
+    /// - `UnclosedDelimiter { what: "{" }` — end-of-input before `}`.
+    fn parse_array_literal(&mut self) -> Result<Expr, ParseError> {
+        // Immediate close — empty literal. Reject.
+        if matches!(self.peek(), Some(Token::RBrace)) {
+            self.advance();
+            return Err(ParseError::EmptyArrayLiteral);
+        }
+        let mut rows: Vec<Vec<Expr>> = Vec::new();
+        let mut expected_arity: Option<u32> = None;
+        loop {
+            // Parse one row.
+            let mut row: Vec<Expr> = Vec::new();
+            // Each row has at least one cell (we just checked we're not
+            // at RBrace; subsequent rows are entered after a Semicolon).
+            row.push(self.parse_array_cell()?);
+            while let Some(Token::Comma) = self.peek() {
+                self.advance();
+                row.push(self.parse_array_cell()?);
+            }
+            // Arity check.
+            let row_arity = row.len() as u32;
+            match expected_arity {
+                None => expected_arity = Some(row_arity),
+                Some(expected) if expected != row_arity => {
+                    return Err(ParseError::ArrayRowArityMismatch {
+                        expected,
+                        found: row_arity,
+                        row: rows.len() as u32,
+                    });
+                }
+                _ => {}
+            }
+            rows.push(row);
+            // Next: either `;` (more rows), `}` (end), or error.
+            match self.advance() {
+                Some(Token::Semicolon) => continue,
+                Some(Token::RBrace) => return Ok(Expr::Array(rows)),
+                Some(other) => {
+                    return Err(ParseError::Unexpected {
+                        context: "array literal",
+                        got: format!("{other:?}"),
+                    });
+                }
+                None => return Err(ParseError::UnclosedDelimiter { what: "{" }),
+            }
+        }
+    }
+
+    /// **W5-98 (Phase 4.7.D):** parse a single array cell per the
+    /// restricted v1 grammar (design § 3.3). Allowed tokens:
+    /// - `Token::Number(n)` → `Expr::Number(n)`
+    /// - `Token::String(s)` → `Expr::String(s)`
+    /// - `Token::Op(Plus|Minus)` + `Token::Number(n)` → folded literal
+    /// - `Token::Ident("TRUE"|"FALSE")` → `Expr::Bool`
+    /// - `Token::Error(ev)` → `Expr::Error(ev)`
+    ///
+    /// Anything else (CellRef, BareColumn, BareRow, LParen, LBrace, etc.)
+    /// surfaces as `InvalidArrayCellToken`. The binder is the second
+    /// line of defense — see `BindError::ArrayRowArityMismatch` for the
+    /// matching binder rule in W5-100 (Phase 4.7.F).
+    fn parse_array_cell(&mut self) -> Result<Expr, ParseError> {
+        let token = self.advance().ok_or(ParseError::UnexpectedEnd {
+            context: "array cell",
+        })?;
+        match token {
+            Token::Number(n) => Ok(Expr::Number(n)),
+            Token::String(s) => Ok(Expr::String(s)),
+            Token::Error(ev) => Ok(Expr::Error(ev)),
+            // Unary-signed number: peek for Number; only allow at the
+            // immediate next position (no `--5` chains).
+            Token::Op(Operator::Minus) => match self.advance() {
+                Some(Token::Number(n)) => Ok(Expr::Number(-n)),
+                Some(other) => Err(ParseError::InvalidArrayCellToken {
+                    got: format!("Op(Minus) followed by {other:?}"),
+                }),
+                None => Err(ParseError::UnexpectedEnd {
+                    context: "array cell after '-'",
+                }),
+            },
+            Token::Op(Operator::Plus) => match self.advance() {
+                Some(Token::Number(n)) => Ok(Expr::Number(n)),
+                Some(other) => Err(ParseError::InvalidArrayCellToken {
+                    got: format!("Op(Plus) followed by {other:?}"),
+                }),
+                None => Err(ParseError::UnexpectedEnd {
+                    context: "array cell after '+'",
+                }),
+            },
+            // TRUE / FALSE come through as `Token::Ident(_)` (4+ letters).
+            Token::Ident(name) => {
+                let upper = name.to_ascii_uppercase();
+                if upper == "TRUE" {
+                    Ok(Expr::Bool(true))
+                } else if upper == "FALSE" {
+                    Ok(Expr::Bool(false))
+                } else {
+                    Err(ParseError::InvalidArrayCellToken {
+                        got: format!("Ident({name:?})"),
+                    })
+                }
+            }
+            other => Err(ParseError::InvalidArrayCellToken {
                 got: format!("{other:?}"),
             }),
         }
@@ -1698,6 +1862,217 @@ mod tests {
                 assert_eq!(addr.sheet, SheetRef::Name(Arc::from("Data.2024")));
             }
             other => panic!("expected CellRef, got {other:?}"),
+        }
+    }
+
+    // ===== W5-98 (Phase 4.7.D) — array literals + error literals =====
+
+    #[test]
+    fn parse_error_literal_ref() {
+        let expr = parse_ok("#REF!");
+        assert_eq!(expr, Expr::Error(ql_types::ErrorValue::Ref));
+    }
+
+    #[test]
+    fn parse_error_literal_na() {
+        let expr = parse_ok("#N/A");
+        assert_eq!(expr, Expr::Error(ql_types::ErrorValue::NA));
+    }
+
+    #[test]
+    fn parse_error_literal_inside_function_call() {
+        let expr = parse_ok("IFERROR(#REF!, 0)");
+        match expr {
+            Expr::Function { name, args } => {
+                assert_eq!(name.as_ref(), "IFERROR");
+                assert_eq!(args.len(), 2);
+                assert_eq!(args[0], Expr::Error(ql_types::ErrorValue::Ref));
+                assert_eq!(args[1], Expr::Number(0.0));
+            }
+            other => panic!("expected Function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_array_literal_1x3() {
+        let expr = parse_ok("{1, 2, 3}");
+        match expr {
+            Expr::Array(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].len(), 3);
+                assert_eq!(rows[0][0], Expr::Number(1.0));
+                assert_eq!(rows[0][1], Expr::Number(2.0));
+                assert_eq!(rows[0][2], Expr::Number(3.0));
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_array_literal_3x1() {
+        let expr = parse_ok("{1; 2; 3}");
+        match expr {
+            Expr::Array(rows) => {
+                assert_eq!(rows.len(), 3);
+                for row in &rows {
+                    assert_eq!(row.len(), 1);
+                }
+                assert_eq!(rows[0][0], Expr::Number(1.0));
+                assert_eq!(rows[1][0], Expr::Number(2.0));
+                assert_eq!(rows[2][0], Expr::Number(3.0));
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_array_literal_2x2() {
+        let expr = parse_ok("{1, 2; 3, 4}");
+        match expr {
+            Expr::Array(rows) => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0].len(), 2);
+                assert_eq!(rows[1].len(), 2);
+                assert_eq!(rows[0][0], Expr::Number(1.0));
+                assert_eq!(rows[0][1], Expr::Number(2.0));
+                assert_eq!(rows[1][0], Expr::Number(3.0));
+                assert_eq!(rows[1][1], Expr::Number(4.0));
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_array_literal_with_bool_string_error_mixed() {
+        // Per design § 3.3: array cells allow NUMBER / BOOL / STRING /
+        // error literal / unary-signed-NUMBER. This test exercises the
+        // full set in one literal.
+        let expr = parse_ok("{1, TRUE, \"hi\", #N/A, -5}");
+        match expr {
+            Expr::Array(rows) => {
+                assert_eq!(rows.len(), 1);
+                let row = &rows[0];
+                assert_eq!(row.len(), 5);
+                assert_eq!(row[0], Expr::Number(1.0));
+                assert_eq!(row[1], Expr::Bool(true));
+                match &row[2] {
+                    Expr::String(s) => assert_eq!(s.as_ref(), "hi"),
+                    other => panic!("expected String, got {other:?}"),
+                }
+                assert_eq!(row[3], Expr::Error(ql_types::ErrorValue::NA));
+                assert_eq!(row[4], Expr::Number(-5.0));
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_array_literal_with_negative_numbers() {
+        let expr = parse_ok("{-1, +2, -3.5}");
+        match expr {
+            Expr::Array(rows) => {
+                assert_eq!(rows[0][0], Expr::Number(-1.0));
+                assert_eq!(rows[0][1], Expr::Number(2.0));
+                assert_eq!(rows[0][2], Expr::Number(-3.5));
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_array_literal_false_lowercase_bool() {
+        let expr = parse_ok("{true, false}");
+        match expr {
+            Expr::Array(rows) => {
+                assert_eq!(rows[0][0], Expr::Bool(true));
+                assert_eq!(rows[0][1], Expr::Bool(false));
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_array_literal_arity_mismatch_rejects() {
+        let err = parse_err("{1, 2; 3}");
+        match err {
+            ParseError::ArrayRowArityMismatch {
+                expected,
+                found,
+                row,
+            } => {
+                assert_eq!(expected, 2);
+                assert_eq!(found, 1);
+                assert_eq!(row, 1);
+            }
+            other => panic!("expected ArrayRowArityMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_array_literal_empty_rejects() {
+        let err = parse_err("{}");
+        assert!(matches!(err, ParseError::EmptyArrayLiteral));
+    }
+
+    #[test]
+    fn parse_array_literal_nested_array_rejects() {
+        // Nested arrays not allowed in v1 — `{` is not a valid cell
+        // token per the restricted array_cell grammar.
+        let err = parse_err("{1, {2, 3}}");
+        match err {
+            ParseError::InvalidArrayCellToken { got } => {
+                assert!(got.contains("LBrace"), "got: {got}");
+            }
+            other => panic!("expected InvalidArrayCellToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_array_literal_cell_ref_rejects() {
+        // Cell references inside array literals are deferred to Phase 4.10.
+        let err = parse_err("{A1, B1}");
+        // Cell refs lex as either CellRef or BareColumn; either way
+        // the array-cell parser rejects them.
+        assert!(
+            matches!(err, ParseError::InvalidArrayCellToken { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_array_literal_function_call_rejects() {
+        // Function calls inside array literals are also rejected — only
+        // literals are allowed per design § 3.3.
+        let err = parse_err("{SUM(1, 2), 3}");
+        assert!(
+            matches!(err, ParseError::InvalidArrayCellToken { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_array_literal_unclosed_rejects() {
+        let err = parse_err("{1, 2");
+        match err {
+            ParseError::UnclosedDelimiter { what } => assert_eq!(what, "{"),
+            other => panic!("expected UnclosedDelimiter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_array_literal_as_function_arg() {
+        // `=SUM({1, 2, 3})` — the array literal is a function argument.
+        let expr = parse_ok("SUM({1, 2, 3})");
+        match expr {
+            Expr::Function { name, args } => {
+                assert_eq!(name.as_ref(), "SUM");
+                assert_eq!(args.len(), 1);
+                match &args[0] {
+                    Expr::Array(rows) => assert_eq!(rows[0].len(), 3),
+                    other => panic!("expected Array arg, got {other:?}"),
+                }
+            }
+            other => panic!("expected Function, got {other:?}"),
         }
     }
 }
