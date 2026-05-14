@@ -485,7 +485,8 @@ impl Workbook {
         row: RowId,
         col: ColId,
     ) -> Option<&crate::TableMetadata> {
-        self.tables.table_at(ql_types::Address::new(sheet, row, col))
+        self.tables
+            .table_at(ql_types::Address::new(sheet, row, col))
     }
 
     /// Phase 2A.1 convenience: register a name → target binding on the workbook's

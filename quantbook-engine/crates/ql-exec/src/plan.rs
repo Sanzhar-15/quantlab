@@ -869,21 +869,25 @@ fn resolve_structured_ref(
 
     let (resolved, is_this_row) = match spec {
         TableSpecSubtree::BareColumn(col) => {
-            let (idx, _) = table.lookup_column(col).ok_or_else(|| unknown_column(col))?;
-            let range = table
-                .column_data_range(idx)
-                .ok_or_else(|| BindError::StructuredRefDegenerateRange(Arc::clone(&canonical_name)))?;
+            let (idx, _) = table
+                .lookup_column(col)
+                .ok_or_else(|| unknown_column(col))?;
+            let range = table.column_data_range(idx).ok_or_else(|| {
+                BindError::StructuredRefDegenerateRange(Arc::clone(&canonical_name))
+            })?;
             (range, false)
         }
         TableSpecSubtree::ThisRowColumn(col) => {
-            let (idx, _) = table.lookup_column(col).ok_or_else(|| unknown_column(col))?;
+            let (idx, _) = table
+                .lookup_column(col)
+                .ok_or_else(|| unknown_column(col))?;
             // Eval narrows to one cell; binder hands back the full data
             // column. If the column has no data rows, the eval narrow
             // returns degenerate → cell-boundary maps to #VALUE!
             // (handled at 4.8.G).
-            let range = table
-                .column_data_range(idx)
-                .ok_or_else(|| BindError::StructuredRefDegenerateRange(Arc::clone(&canonical_name)))?;
+            let range = table.column_data_range(idx).ok_or_else(|| {
+                BindError::StructuredRefDegenerateRange(Arc::clone(&canonical_name))
+            })?;
             (range, true)
         }
         TableSpecSubtree::ThisRowColumnRange(c1, c2) => {
@@ -891,12 +895,12 @@ fn resolve_structured_ref(
             let (i2, _) = table.lookup_column(c2).ok_or_else(|| unknown_column(c2))?;
             let lo = i1.min(i2);
             let hi = i1.max(i2);
-            let r1 = table
-                .column_data_range(lo)
-                .ok_or_else(|| BindError::StructuredRefDegenerateRange(Arc::clone(&canonical_name)))?;
-            let r2 = table
-                .column_data_range(hi)
-                .ok_or_else(|| BindError::StructuredRefDegenerateRange(Arc::clone(&canonical_name)))?;
+            let r1 = table.column_data_range(lo).ok_or_else(|| {
+                BindError::StructuredRefDegenerateRange(Arc::clone(&canonical_name))
+            })?;
+            let r2 = table.column_data_range(hi).ok_or_else(|| {
+                BindError::StructuredRefDegenerateRange(Arc::clone(&canonical_name))
+            })?;
             (
                 Range::new(r1.sheet, r1.start_row, r1.start_col, r2.end_row, r2.end_col),
                 true,
@@ -994,9 +998,9 @@ fn compute_row_range(
             SpecialItem::Totals => table
                 .totals_range()
                 .ok_or_else(|| BindError::TableHasNoTotals(Arc::clone(canonical)))?,
-            SpecialItem::Data => table.data_range().ok_or_else(|| {
-                BindError::StructuredRefDegenerateRange(Arc::clone(canonical))
-            })?,
+            SpecialItem::Data => table
+                .data_range()
+                .ok_or_else(|| BindError::StructuredRefDegenerateRange(Arc::clone(canonical)))?,
             SpecialItem::All => table.all_range(),
             SpecialItem::ThisRow => {
                 // ThisRow as a row selector inside a Combination means
@@ -1004,9 +1008,9 @@ fn compute_row_range(
                 // row resolution to eval time; here we hand back the
                 // full data range and rely on the caller setting
                 // is_this_row.
-                table.data_range().ok_or_else(|| {
-                    BindError::StructuredRefDegenerateRange(Arc::clone(canonical))
-                })?
+                table
+                    .data_range()
+                    .ok_or_else(|| BindError::StructuredRefDegenerateRange(Arc::clone(canonical)))?
             }
         };
         accumulate(r);
@@ -1034,28 +1038,31 @@ fn compute_col_range(
     for it in col_items {
         let (lo, hi) = match it {
             TableSpecItem::Column(col) => {
-                let (idx, _) = table.lookup_column(col).ok_or_else(|| {
-                    BindError::UnknownTableColumn {
-                        table: Arc::clone(canonical),
-                        column: Arc::clone(col),
-                    }
-                })?;
+                let (idx, _) =
+                    table
+                        .lookup_column(col)
+                        .ok_or_else(|| BindError::UnknownTableColumn {
+                            table: Arc::clone(canonical),
+                            column: Arc::clone(col),
+                        })?;
                 let c = table.top_col + idx;
                 (c, c)
             }
             TableSpecItem::ColumnRange(c1, c2) => {
-                let (i1, _) = table.lookup_column(c1).ok_or_else(|| {
-                    BindError::UnknownTableColumn {
-                        table: Arc::clone(canonical),
-                        column: Arc::clone(c1),
-                    }
-                })?;
-                let (i2, _) = table.lookup_column(c2).ok_or_else(|| {
-                    BindError::UnknownTableColumn {
-                        table: Arc::clone(canonical),
-                        column: Arc::clone(c2),
-                    }
-                })?;
+                let (i1, _) =
+                    table
+                        .lookup_column(c1)
+                        .ok_or_else(|| BindError::UnknownTableColumn {
+                            table: Arc::clone(canonical),
+                            column: Arc::clone(c1),
+                        })?;
+                let (i2, _) =
+                    table
+                        .lookup_column(c2)
+                        .ok_or_else(|| BindError::UnknownTableColumn {
+                            table: Arc::clone(canonical),
+                            column: Arc::clone(c2),
+                        })?;
                 let lo = i1.min(i2);
                 let hi = i1.max(i2);
                 (table.top_col + lo, table.top_col + hi)

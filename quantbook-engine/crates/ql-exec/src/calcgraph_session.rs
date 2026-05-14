@@ -248,7 +248,9 @@ pub(crate) fn walk_plan_for_deps(plan: &ExprPlan, deps: &mut FormulaDeps) {
         // for `on_table_*` mutation hooks; for now, just the range
         // is registered.
         ExprPlan::StructuredRef {
-            table_name, resolved, ..
+            table_name,
+            resolved,
+            ..
         } => {
             // Reuse the named_ranges slot — semantically equivalent
             // for the stripe index (the "name" is the table name).
@@ -671,7 +673,11 @@ impl CalcgraphSession {
             // accumulates; we keep going. Phase 3.3 passes the
             // formula's owning sheet so the stripe register can use
             // the correct fallback for any range with `sheet: None`.
-            match Self::bind_text(&text, BindSite::at_cell(ql_types::Address::new(sheet, row, col)), wb) {
+            match Self::bind_text(
+                &text,
+                BindSite::at_cell(ql_types::Address::new(sheet, row, col)),
+                wb,
+            ) {
                 Ok(plan) => {
                     session.extract_and_register_deps(node, sheet, &plan, wb);
                     succeeded += 1;
@@ -714,11 +720,7 @@ impl CalcgraphSession {
     /// **W5-114 (Phase 4.8.E):** signature now takes `BindSite` so
     /// the formula's cell address flows through for structured-ref
     /// `[@Col]` resolution (4.8.F).
-    fn bind_text(
-        text: &str,
-        site: BindSite,
-        wb: &Workbook,
-    ) -> Result<ExprPlan, RuntimeError> {
+    fn bind_text(text: &str, site: BindSite, wb: &Workbook) -> Result<ExprPlan, RuntimeError> {
         let tokens = lex(text)?;
         let expr = parse(tokens)?;
         // W5-92 (Phase 4.6.D): pass `wb` for names so the two-tier

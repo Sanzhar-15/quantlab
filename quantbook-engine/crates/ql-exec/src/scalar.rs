@@ -205,8 +205,7 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                                 let r = narrow_structured_ref(*resolved, *is_this_row, env);
                                 match r {
                                     Ok(range) => {
-                                        let (values, rows, cols) =
-                                            env.read_range_with_shape(range);
+                                        let (values, rows, cols) = env.read_range_with_shape(range);
                                         fn_args.push(FnArg::Range { values, rows, cols });
                                     }
                                     Err(ev) => fn_args.push(FnArg::Scalar(Value::Error(ev))),
@@ -263,8 +262,7 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                                 let r = narrow_structured_ref(*resolved, *is_this_row, env);
                                 match r {
                                     Ok(range) => {
-                                        let (values, rows, cols) =
-                                            env.read_range_with_shape(range);
+                                        let (values, rows, cols) = env.read_range_with_shape(range);
                                         f_args.push(FunctionArg::Range { values, rows, cols });
                                     }
                                     Err(ev) => {

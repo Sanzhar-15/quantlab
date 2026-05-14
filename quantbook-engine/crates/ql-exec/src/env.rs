@@ -121,10 +121,7 @@ impl<'w> WorkbookEnv<'w> {
     /// formula's own cell. Used at eval time when the caller knows
     /// the cell (set_formula, recompute_dirty, recompute_all,
     /// validate_formula).
-    pub fn with_formula_cell(
-        workbook: &'w ql_storage::Workbook,
-        cell: ql_types::Address,
-    ) -> Self {
+    pub fn with_formula_cell(workbook: &'w ql_storage::Workbook, cell: ql_types::Address) -> Self {
         let mut env = Self::new(workbook);
         env.formula_cell = Some(cell);
         env
