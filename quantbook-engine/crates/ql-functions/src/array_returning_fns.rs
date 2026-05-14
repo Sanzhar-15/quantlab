@@ -187,6 +187,83 @@ pub fn sequence(args: &[FunctionArg], _ctx: &FunctionContext) -> FunctionReturn 
     FunctionReturn::Array(arr)
 }
 
+/// **W5-107 (Phase 4.7.N) — TRANSPOSE.** Swap rows ↔ cols. Per
+/// design § 11 and Excel canon.
+///
+/// `TRANSPOSE(array)` — single arg, returns a transposed `ArrayValue`
+/// where `result.at(j, i) = array.at(i, j)`. Result shape is
+/// `(cols, rows)`.
+///
+/// Arg shapes:
+/// - `FunctionArg::Array(a)` → transpose `a`.
+/// - `FunctionArg::Range { values, rows, cols }` — treat as a 2D
+///   array, transpose it. Range arg position acts identically to
+///   Array here (read-only over the cell values).
+/// - `FunctionArg::Scalar(Value::Error(_))` → propagate (left-error
+///   contract).
+/// - `FunctionArg::Scalar(other)` → 1×1 transpose = 1×1 same value
+///   (Excel: a scalar is implicitly a 1×1 array; TRANSPOSE of 1×1 is
+///   1×1 unchanged).
+///
+/// Arity: exactly 1 arg. 0 or ≥ 2 → `#N/A`.
+///
+/// Degenerate input (`rows == 0 || cols == 0`) → degenerate output of
+/// the swapped shape. Cell-boundary writeback surfaces `#CALC!` per
+/// design § 8.1 step c.
+pub fn transpose(args: &[FunctionArg], _ctx: &FunctionContext) -> FunctionReturn {
+    if args.len() != 1 {
+        return FunctionReturn::Scalar(Value::Error(ErrorValue::NA));
+    }
+
+    let (in_rows, in_cols, cells): (u32, u32, Vec<Value>) = match &args[0] {
+        FunctionArg::Scalar(Value::Error(e)) => {
+            return FunctionReturn::Scalar(Value::Error(*e));
+        }
+        FunctionArg::Scalar(v) => {
+            // Excel canon: scalar is implicitly 1×1. TRANSPOSE keeps shape.
+            return FunctionReturn::Array(ArrayValue::singleton(v.clone()));
+        }
+        FunctionArg::Array(a) => {
+            // Materialize cell vec; ArrayValue exposes row-major slice
+            // via `cells()`. Clone is the simplest path; an in-place
+            // permutation would save a copy but adds complexity for
+            // little gain on realistic sizes.
+            (a.rows(), a.cols(), a.cells().to_vec())
+        }
+        FunctionArg::Range { values, rows, cols } => {
+            // Range carries explicit (rows, cols) per the unified ABI.
+            // Bound to u32 for the ArrayValue API.
+            if *rows > u32::MAX as usize || *cols > u32::MAX as usize {
+                return FunctionReturn::Scalar(Value::Error(ErrorValue::Num));
+            }
+            (*rows as u32, *cols as u32, values.clone())
+        }
+    };
+
+    // Degenerate input → degenerate transposed output (swapped shape).
+    // ArrayValue::empty constructs the (rows, cols) variant with no
+    // cells; the cell-boundary path surfaces this as `#CALC!`.
+    if in_rows == 0 || in_cols == 0 {
+        return FunctionReturn::Array(ArrayValue::empty(in_cols, in_rows));
+    }
+
+    // Allocate the output cell vec. Output has (in_cols, in_rows)
+    // shape; `result_cells[j * in_rows + i] = cells[i * in_cols + j]`.
+    let total = (in_rows as usize) * (in_cols as usize);
+    let mut result_cells: Vec<Value> = Vec::with_capacity(total);
+    // Iterate output row-major: outer loop over new rows j (was cols),
+    // inner over new cols i (was rows).
+    for j in 0..in_cols {
+        for i in 0..in_rows {
+            let src_idx = (i as usize) * (in_cols as usize) + (j as usize);
+            result_cells.push(cells[src_idx].clone());
+        }
+    }
+    let arr = ArrayValue::new(in_cols, in_rows, result_cells)
+        .expect("rows*cols == total; ArrayValue::new must succeed");
+    FunctionReturn::Array(arr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,5 +443,185 @@ mod tests {
             ErrorValue::Value,
             "range arg at scalar position: #VALUE! per v1 (implicit intersection deferred)"
         );
+    }
+
+    // ===== W5-107 (Phase 4.7.N.1) — TRANSPOSE =====
+
+    fn arr(rows: u32, cols: u32, cells: Vec<Value>) -> FunctionArg {
+        FunctionArg::Array(ArrayValue::new(rows, cols, cells).unwrap())
+    }
+
+    /// TRANSPOSE of a 1×3 row → 3×1 column.
+    #[test]
+    fn transpose_1x3_to_3x1() {
+        let input = arr(
+            1,
+            3,
+            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)],
+        );
+        let result = expect_array(transpose(&[input], &ctx()));
+        assert_eq!(result.rows(), 3);
+        assert_eq!(result.cols(), 1);
+        assert_eq!(result.at(0, 0), &Value::Number(1.0));
+        assert_eq!(result.at(1, 0), &Value::Number(2.0));
+        assert_eq!(result.at(2, 0), &Value::Number(3.0));
+    }
+
+    /// TRANSPOSE of a 3×1 column → 1×3 row.
+    #[test]
+    fn transpose_3x1_to_1x3() {
+        let input = arr(
+            3,
+            1,
+            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)],
+        );
+        let result = expect_array(transpose(&[input], &ctx()));
+        assert_eq!(result.rows(), 1);
+        assert_eq!(result.cols(), 3);
+        assert_eq!(result.at(0, 0), &Value::Number(1.0));
+        assert_eq!(result.at(0, 1), &Value::Number(2.0));
+        assert_eq!(result.at(0, 2), &Value::Number(3.0));
+    }
+
+    /// TRANSPOSE of a 2×2 — rows ↔ cols swap.
+    /// Input:  {1, 2; 3, 4} → output: {1, 3; 2, 4}.
+    #[test]
+    fn transpose_2x2_swaps_off_diagonal() {
+        let input = arr(
+            2,
+            2,
+            vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+                Value::Number(4.0),
+            ],
+        );
+        let result = expect_array(transpose(&[input], &ctx()));
+        assert_eq!(result.rows(), 2);
+        assert_eq!(result.cols(), 2);
+        // Row 0: 1, 3.
+        assert_eq!(result.at(0, 0), &Value::Number(1.0));
+        assert_eq!(result.at(0, 1), &Value::Number(3.0));
+        // Row 1: 2, 4.
+        assert_eq!(result.at(1, 0), &Value::Number(2.0));
+        assert_eq!(result.at(1, 1), &Value::Number(4.0));
+    }
+
+    /// TRANSPOSE of a non-square 2×3 → 3×2.
+    /// Input:  {1, 2, 3; 4, 5, 6} → output: {1, 4; 2, 5; 3, 6}.
+    #[test]
+    fn transpose_2x3_to_3x2() {
+        let input = arr(
+            2,
+            3,
+            vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+                Value::Number(4.0),
+                Value::Number(5.0),
+                Value::Number(6.0),
+            ],
+        );
+        let result = expect_array(transpose(&[input], &ctx()));
+        assert_eq!(result.rows(), 3);
+        assert_eq!(result.cols(), 2);
+        assert_eq!(result.at(0, 0), &Value::Number(1.0));
+        assert_eq!(result.at(0, 1), &Value::Number(4.0));
+        assert_eq!(result.at(1, 0), &Value::Number(2.0));
+        assert_eq!(result.at(1, 1), &Value::Number(5.0));
+        assert_eq!(result.at(2, 0), &Value::Number(3.0));
+        assert_eq!(result.at(2, 1), &Value::Number(6.0));
+    }
+
+    /// TRANSPOSE of a Range arg — same shape semantics as Array arg.
+    #[test]
+    fn transpose_range_arg() {
+        let input = FunctionArg::Range {
+            values: vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+                Value::Number(4.0),
+            ],
+            rows: 2,
+            cols: 2,
+        };
+        let result = expect_array(transpose(&[input], &ctx()));
+        assert_eq!(result.rows(), 2);
+        assert_eq!(result.cols(), 2);
+        assert_eq!(result.at(0, 1), &Value::Number(3.0));
+        assert_eq!(result.at(1, 0), &Value::Number(2.0));
+    }
+
+    /// TRANSPOSE of a scalar — implicit 1×1 array; result is 1×1
+    /// containing the same value (Excel canon).
+    #[test]
+    fn transpose_scalar_returns_singleton() {
+        let result = expect_array(transpose(&[n(42.0)], &ctx()));
+        assert_eq!(result.rows(), 1);
+        assert_eq!(result.cols(), 1);
+        assert_eq!(result.at(0, 0), &Value::Number(42.0));
+    }
+
+    /// TRANSPOSE of a degenerate input (0 rows) → degenerate with
+    /// swapped shape (0 cols).
+    #[test]
+    fn transpose_degenerate_input_returns_degenerate() {
+        let input = FunctionArg::Array(ArrayValue::empty(0, 3));
+        let result = expect_array(transpose(&[input], &ctx()));
+        assert!(result.is_degenerate());
+        assert_eq!(result.rows(), 3);
+        assert_eq!(result.cols(), 0);
+    }
+
+    /// Error arg propagates per left-error-wins.
+    #[test]
+    fn transpose_error_arg_propagates() {
+        let div0 = FunctionArg::Scalar(Value::Error(ErrorValue::DivZero));
+        let e = expect_scalar_error(transpose(&[div0], &ctx()));
+        assert_eq!(e, ErrorValue::DivZero);
+    }
+
+    /// Arity violations — 0 args → #N/A.
+    #[test]
+    fn transpose_zero_args_returns_na() {
+        let e = expect_scalar_error(transpose(&[], &ctx()));
+        assert_eq!(e, ErrorValue::NA);
+    }
+
+    /// Arity violations — 2 args → #N/A.
+    #[test]
+    fn transpose_two_args_returns_na() {
+        let e = expect_scalar_error(transpose(&[n(1.0), n(2.0)], &ctx()));
+        assert_eq!(e, ErrorValue::NA);
+    }
+
+    /// Idempotent: TRANSPOSE(TRANSPOSE(x)) == x (shape and values).
+    #[test]
+    fn transpose_is_involutive() {
+        let input = arr(
+            2,
+            3,
+            vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+                Value::Number(4.0),
+                Value::Number(5.0),
+                Value::Number(6.0),
+            ],
+        );
+        // Save original cells for comparison.
+        let original_cells: Vec<Value> = match &input {
+            FunctionArg::Array(a) => a.cells().to_vec(),
+            _ => unreachable!(),
+        };
+        let once = expect_array(transpose(&[input], &ctx()));
+        let twice = expect_array(transpose(&[FunctionArg::Array(once)], &ctx()));
+        assert_eq!(twice.rows(), 2);
+        assert_eq!(twice.cols(), 3);
+        assert_eq!(twice.cells(), original_cells.as_slice());
     }
 }

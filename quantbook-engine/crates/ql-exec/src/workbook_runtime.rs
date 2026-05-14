@@ -7915,6 +7915,89 @@ mod tests {
         assert_eq!(wb.spill_anchor_at(0, 0, 0), None);
     }
 
+    // ===== W5-107 (Phase 4.7.N.1) — TRANSPOSE end-to-end =====
+
+    /// `=TRANSPOSE({1, 2, 3})` at A1 spills 3×1 vertically.
+    #[test]
+    fn set_formula_transpose_row_literal_spills_as_column() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "TRANSPOSE({1, 2, 3})").unwrap();
+        drop(rt);
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(3, 1))
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Number(1.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 0)), Value::Number(2.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 2, 0)), Value::Number(3.0));
+    }
+
+    /// `=TRANSPOSE({1; 2; 3})` at A1 spills 1×3 horizontally.
+    #[test]
+    fn set_formula_transpose_column_literal_spills_as_row() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "TRANSPOSE({1; 2; 3})").unwrap();
+        drop(rt);
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(1, 3))
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Number(1.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(2.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Number(3.0));
+    }
+
+    /// `=TRANSPOSE({1, 2; 3, 4})` swaps a 2×2 matrix's off-diagonal.
+    #[test]
+    fn set_formula_transpose_2x2() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "TRANSPOSE({1, 2; 3, 4})").unwrap();
+        drop(rt);
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(2, 2))
+        );
+        // Row 0: 1, 3 (cols of original became rows).
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Number(1.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(3.0));
+        // Row 1: 2, 4.
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 0)), Value::Number(2.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 1, 1)), Value::Number(4.0));
+    }
+
+    /// TRANSPOSE composed with SEQUENCE: `=TRANSPOSE(SEQUENCE(3))`
+    /// produces a 1×3 spill (SEQUENCE(3) is 3×1; transpose to 1×3).
+    /// Tests that the Unified function's Array return flows through
+    /// nested function dispatch via FunctionArg::Scalar(#CALC!) —
+    /// wait, that's scalar context. Let me think.
+    ///
+    /// Actually TRANSPOSE(SEQUENCE(3)) — outer is TRANSPOSE, inner is
+    /// SEQUENCE. The arg materialization for TRANSPOSE sees SEQUENCE
+    /// as an arg position. Args evaluate via `eval_scalar_with_cache`
+    /// which for an Array-returning Unified function in scalar context
+    /// returns #CALC!. So TRANSPOSE receives FunctionArg::Scalar(#CALC!)
+    /// and propagates the error. This pins design § 6.3 (no nested
+    /// array composition in v1).
+    #[test]
+    fn set_formula_transpose_of_sequence_in_arg_position_is_calc_error() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 0, "TRANSPOSE(SEQUENCE(3))").unwrap();
+        drop(rt);
+        // Nested array composition currently surfaces as #CALC! at the
+        // inner function's return. Excel canon DOES support nesting;
+        // this is a v1 limitation (design § 6.3 implicit-intersection
+        // deferral).
+        assert_eq!(v, Value::Error(ErrorValue::Calc));
+    }
+
     // ===== W5-106 (Phase 4.7.M.2) — input-dependent shape transitions =====
 
     /// Shape transition through recompute_dirty: A1 = 3, B1 = SEQUENCE(A1)
