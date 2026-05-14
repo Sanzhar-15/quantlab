@@ -933,6 +933,22 @@ impl CalcgraphSession {
         self.dirty.contains(&node)
     }
 
+    /// **W5-103 megaudit MEDIUM-2 closure (#129):** mark a specific
+    /// `NodeId` dirty without going through the cell-address index.
+    /// Used by `WorkbookRuntime::reextract_spill_footprint_readers`
+    /// when a reader's plan re-bind fails — instead of silently
+    /// swallowing the error (which would leave stale graph state),
+    /// we mark the reader dirty so the next recompute attempts
+    /// re-binding and surfaces the failure at the reader's cell.
+    ///
+    /// `pub(crate)` because this is only safe as part of a coordinated
+    /// recovery: the caller must already know the reader is in an
+    /// inconsistent state; arbitrary external dirtying could mask
+    /// scheduler invariants.
+    pub(crate) fn mark_dirty(&mut self, node: NodeId) {
+        self.dirty.insert(node);
+    }
+
     /// Phase 3.3: claim + clear the dirty set in one move. The Phase
     /// 3.4 Tarjan SCC scheduler will call this once per recompute
     /// cycle. Returning `HashSet<NodeId>` rather than a slice lets
@@ -1082,7 +1098,13 @@ impl CalcgraphSession {
     /// callers should only pass NodeIds returned by `readers_in_rect`,
     /// which is itself sourced from `cell_to_formulas`, which only ever
     /// carries cell nodes); in that case no re-extraction occurs.
-    pub fn reextract_deps(
+    ///
+    /// **Visibility (megaudit Codex pass-2 MEDIUM + Sonnet verify):**
+    /// `pub(crate)` not `pub`. Same misuse risk as `readers_in_rect` —
+    /// this rewires deps without dirtying readers, invalidating
+    /// aggregate cache, or reporting bind failures. Safe only as part
+    /// of `WorkbookRuntime`'s spill-mutation choreography.
+    pub(crate) fn reextract_deps(
         &mut self,
         reader_node: NodeId,
         plan: &ExprPlan,

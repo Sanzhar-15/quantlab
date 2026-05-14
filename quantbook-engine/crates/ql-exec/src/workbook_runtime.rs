@@ -47,7 +47,6 @@ use crate::env::WorkbookEnv;
 use crate::eval_result::EvalResult;
 use crate::plan::{bind_with_names_and_sheets, BindError};
 use crate::plan_cache::{PlanCache, PlanCacheKey, PlanCacheStats};
-use crate::scalar::eval_scalar_with_registry;
 use crate::transaction::WorkbookTransaction;
 
 /// Phase 2A.6 audit H1/L4 (2026-05-12) helper. Confirms `sheet` is in range
@@ -825,7 +824,32 @@ impl<'a> WorkbookRuntime<'a> {
                     )?)
                 }) {
                 Ok(p) => p,
-                Err(_) => continue, // Reader's formula no longer binds.
+                Err(_e) => {
+                    // **Codex audit pass-1 MEDIUM-2 closure (#129):**
+                    // the reader's formula no longer binds (workbook
+                    // state shifted in a way that broke its plan —
+                    // e.g. a referenced name was removed). Per
+                    // CLAUDE.md no-fallbacks, silently `continue` is
+                    // not acceptable — that preserves stale
+                    // `cell_to_formulas` + graph-edge state and the
+                    // failure becomes invisible to the user.
+                    //
+                    // We can't bubble up: the user's set_formula on
+                    // the ANCHOR succeeded; failing it because some
+                    // UNRELATED reader's bind broke would be punitive.
+                    //
+                    // Compromise: mark the reader's NodeId dirty so
+                    // the next recompute re-attempts evaluation. The
+                    // recompute path will produce a visible error at
+                    // the reader's cell. The stale graph state for
+                    // this reader survives until then — accepted as
+                    // a known limitation; a full fix needs a
+                    // structured diagnostics channel (deferred).
+                    if let Some(g) = self.graph.as_deref_mut() {
+                        g.mark_dirty(node);
+                    }
+                    continue;
+                }
             };
             if let Some(g) = self.graph.as_deref_mut() {
                 g.reextract_deps(node, plan.as_ref(), self.workbook);
@@ -916,7 +940,16 @@ impl<'a> WorkbookRuntime<'a> {
                     .workbook
                     .sheet(sheet)
                     .expect("write_spill: sheet asserted at function entry");
+                // **Codex audit pass-1 MEDIUM-1 closure (#129):**
+                // include `spill_target_anchor` in the predicate so a
+                // cell that is a TARGET of another active spill blocks
+                // us even when its materialized value happens to be
+                // `Value::Blank` (possible once SEQUENCE/FILTER land
+                // and an `ArrayValue` carries a Blank slot — the
+                // `Sheet::read != Blank` check alone would miss it,
+                // letting register_spill panic at a collision later).
                 let occupied = self.workbook.spill_anchor_at(sheet, r, c).is_some()
+                    || self.workbook.spill_target_anchor(sheet, r, c).is_some()
                     || self.workbook.formula_at(sheet, r, c).is_some()
                     || sheet_ref.read(r, c) != Value::Blank;
                 if occupied {
@@ -1701,7 +1734,31 @@ impl<'a> WorkbookRuntime<'a> {
         // two-tier sheet-then-workbook scope chain fires.
         let plan = bind_with_names_and_sheets(&expr, sheet, self.workbook, self.workbook)?;
         let env = WorkbookEnv::new(self.workbook);
-        Ok(eval_scalar_with_registry(&plan, &env, self.registry))
+        // **W5-103 megaudit MEDIUM-3 closure (#129):** route through
+        // `eval_at_cell_boundary` so a top-level array literal like
+        // `{1, 2, 3}` returns the anchor value (array.at(0,0)) instead
+        // of `#CALC!` (which is what `eval_scalar_with_registry` would
+        // give per the scalar-context contract at scalar.rs:95).
+        //
+        // Previously the validate path used scalar eval directly, which
+        // made the IDE preview inconsistent with `set_formula`'s actual
+        // spill behavior. With this change, validate and set_formula
+        // produce equivalent anchor-value previews. The IDE doesn't get
+        // the SHAPE of the spill from validate; that would need a
+        // dedicated `ValidationResult` enum (deferred — see GAP-I-04).
+        let nc = crate::aggregate_cache::NoAggregateCache;
+        let result = crate::scalar::eval_at_cell_boundary(&plan, &env, self.registry, &nc);
+        Ok(match result {
+            crate::eval_result::EvalResult::Scalar(v) => v,
+            // Anchor cell preview = array.at(0,0). Degenerate arrays
+            // surface as `#CALC!` per the existing scalar-context
+            // contract (preserved via `into_scalar_for_test`-style
+            // logic inlined here to avoid the cfg(test) gate).
+            crate::eval_result::EvalResult::Array(a) if a.is_degenerate() => {
+                Value::Error(ErrorValue::Calc)
+            }
+            crate::eval_result::EvalResult::Array(a) => a.at(0, 0).clone(),
+        })
     }
 
     pub fn recompute_all(&mut self) -> RecomputeResult {
@@ -3449,6 +3506,35 @@ mod tests {
         assert!(matches!(result, Err(RuntimeError::Parse(_))));
         // No state change.
         assert!(wb.formula_at(0, 0, 0).is_none());
+    }
+
+    /// **W5-103 megaudit MEDIUM-3 closure (#129):** `validate_formula`
+    /// on a top-level array literal must return the anchor value
+    /// (array.at(0,0)), NOT `#CALC!`. Pre-fix the scalar-context
+    /// `eval_scalar_with_registry` path gave #CALC! for arrays,
+    /// making the IDE preview inconsistent with `set_formula`'s
+    /// actual spill behavior.
+    #[test]
+    fn validate_formula_returns_anchor_value_for_top_level_array() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let rt = WorkbookRuntime::new(&mut wb, &reg);
+        // Horizontal: {1, 2, 3} — anchor is array.at(0,0) = Number(1).
+        let v = rt.validate_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+        assert_eq!(
+            v,
+            Value::Number(1.0),
+            "validate_formula on array literal must give anchor value"
+        );
+        // Vertical: {7; 8} — anchor is Number(7).
+        let v = rt.validate_formula(0, 0, 0, "{7; 8}").unwrap();
+        assert_eq!(v, Value::Number(7.0));
+        // 2x2: {1, 2; 3, 4} — anchor is Number(1).
+        let v = rt.validate_formula(0, 0, 0, "{1, 2; 3, 4}").unwrap();
+        assert_eq!(v, Value::Number(1.0));
+        // No state mutation (validate is read-only).
+        assert!(wb.formula_at(0, 0, 0).is_none());
+        assert!(wb.spill_anchor_at(0, 0, 0).is_none());
     }
 
     /// `validate_formula` does NOT pollute the bind-plan cache. A

@@ -430,18 +430,34 @@ Recommend updating Phase 4.7.K (set_value spill invalidation) to also
 use immediate dissolve for consistency.
 
 **Immediate dissolve algorithm** for `WorkbookRuntime::set_formula`
-writing into a non-anchor target cell `(s, r, c)`:
+writing into a non-anchor target cell `(s, r, c)`. The shipped 4.7.J.5
+ordering (atomicity preserved per megaudit HIGH-3):
 
-1. Look up `workbook.spill_target_anchor(s, r, c)` — if `Some(host_anchor)`
-   and `host_anchor != (s, r, c)`, call `clear_spill_at(host_anchor)`
-   (dissolves the host's anchor+target map entries + clears every
-   target's computed overlay).
-2. **Op-log append happens BEFORE the dissolve** to preserve atomicity
-   (the rest of `set_formula`'s flow handles this).
-3. Proceed with the normal `set_formula` flow at the target cell. The
-   new formula installs as the cell's own formula; if it's a new array
-   anchor, it can spill there without interference from the (now
-   dissolved) host.
+1. Lex / parse / bind the new formula text — pure, no mutation.
+2. **Op-log append (`PutFormula { text }`)** — this is the LAST
+   fallible step before any storage mutation. If it fails, return
+   `Err` with workbook unchanged.
+3. Look up `workbook.spill_target_anchor(s, r, c)`. If `Some(host_anchor)`
+   and `host_anchor != (s, r, c)`, call `clear_spill_at(host_anchor)` —
+   dissolves the host's anchor+target map entries + clears every
+   target's computed overlay. (Codex audit pass-1 MEDIUM-3 closure.)
+4. Clear any prior spill anchored AT this cell via
+   `clear_spill_if_present((s, r, c))` (the existing 4.7.J.2
+   self-spill clear-old). The "old shape" for graph invalidation is
+   captured before this call so the post-writeback hooks can fire
+   `on_set_value` for cells that lost their spilled value.
+5. Evaluate at the cell boundary.
+6. Materialize via `write_spill` (Array path) or scalar write.
+7. Fire `on_set_formula` at the anchor.
+8. Fire `on_set_value` for every non-anchor cell in the UNION of
+   (old self-shape, new spill shape) — dedupe via HashSet.
+9. Re-extract deps for any reader indexed under a cell in (old, new)
+   footprint. (HIGH-1 closure for the new spill case; symmetric for
+   dissolution case.)
+
+The new formula installs as the cell's own formula; if it's a new
+array anchor, it can spill there without interference from the (now
+dissolved) host.
 
 **Deferred dissolve algorithm** for `WorkbookRuntime::set_value(s, r, c, v)`:
 
@@ -454,11 +470,34 @@ This deferred form is what 4.7.K originally planned; revisit when 4.7.K lands.
 
 ### 10.3 When a spill anchor's formula is cleared
 
-`WorkbookRuntime::clear_formula(s, r, c)` on an anchor cell:
+`WorkbookRuntime::clear_formula(s, r, c)` on an anchor cell. The
+shipped W5-103 megaudit MEDIUM-4 ordering (atomicity preserved):
 
-1. If `workbook.spill_anchor_at(s, r, c).is_some()`:
-   a. `workbook.clear_spill_at((s, r, c))` — clears target computed overlays AND removes anchor + target map entries.
-2. Apply the formula clear normally.
+1. `validate_cell(s, r, c)` — pure read.
+2. Read `had_formula` via `workbook.formula_at(s, r, c)`. If `false`,
+   early-return `Ok(())` (idempotent).
+3. Read `dissolved_shape = workbook.spill_anchor_at(s, r, c).copied()`
+   — pure read.
+4. Compute `current_value`. For spill anchors, `Value::Blank`
+   (the anchor's value was part of the spill, not preserved as a
+   scalar). For scalar formulas, `workbook.read(...)` — preserves
+   the "convert formula to literal" Excel semantic.
+5. **Op-log append** — `ClearFormula` plus optional `PutValue`
+   (wrapped in `BatchCommit` if both). LAST fallible step before
+   any mutation; if it fails, workbook unchanged.
+6. If `dissolved_shape.is_some()`, call `workbook.clear_spill_at((s, r, c))`
+   — clears target computed overlays AND removes anchor + target
+   map entries.
+7. If `current_value` is non-Blank (i.e. scalar-formula branch), call
+   `workbook.put_at(s, r, c, current_value)` to preserve.
+8. `workbook.clear_formula(s, r, c)` — strips formula text.
+9. Hooks: `on_clear_formula(s, r, c)` for the anchor; then
+   `on_set_value(s, r+dr, c+dc)` for each non-anchor cell in
+   `dissolved_shape` (Sonnet megaudit dirty-propagation).
+
+Re-extraction of readers indexed under dissolved-footprint target
+cells is deferred to Phase 4.7.K (full set_value + clear_formula
+spill-invalidation closure).
 
 ### 10.4 PlanCache invalidation
 
