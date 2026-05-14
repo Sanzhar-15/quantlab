@@ -1,33 +1,36 @@
-# Engine session final handoff — 2026-05-14 (W5-77 → W5-91)
+# Engine session final handoff — 2026-05-14 (W5-77 → W5-93)
 
 **This document is the canonical handoff for the next engine-track Claude window.**
 Read it cover-to-cover, then read `docs/process/audit-protocol.md`, then verify state.
+
+**Last updated:** 2026-05-14 post-W5-93 ship. Original draft covered through W5-91; appended with W5-92 + W5-93 closure detail below.
 
 ---
 
 ## TL;DR (60 seconds)
 
-Branch `feat/quantbook-engine` at HEAD `083ad235d24` (W5-91, Phase 4.6.C
-ship). 16 commits shipped this session on top of W5-76 closure. Two full
-phase waves landed:
+Branch `feat/quantbook-engine` at HEAD `1d5f33edddd` (W5-93, Phase 4.6.E
+closing mega-audit — **Phase 4.6 FULLY CLOSED**). ~20 commits shipped this
+session on top of W5-76 closure. Three full phase waves landed:
 
-- **Phase 4.5.D** (number-format-string mini-language, lexer + AST + parser
-  + renderer + `FormatTable` + sparse `CellFormatOverlay` + op-log ops +
-  `.qbook` schema v3→v4 + runtime wrappers + `TEXT()`). W5-77a → W5-83.
-- **Phase 4.5 closing mega-audit** — W5-84.
-- **Phase 4.6 design + AA/A/B/C** — sheet registry + canonicalizer
-  (W5-86), `SheetRef` AST migration (W5-87), lexer Bang/SheetName/
-  QuotedSheetName tokens (W5-88), parser + printer cross-sheet round
-  trip (W5-89), binder + runtime cross-sheet resolution (W5-90), sheet
-  rename + formula-text rewrite + `Op::RenameSheet` (W5-91, this commit).
+- **Phase 4.5.D + 4.5.E** (number-format-string mini-language end-to-end +
+  closing audit). W5-77a → W5-84.
+- **Phase 4.6 — fully closed:** sheet registry + canonicalizer (W5-86),
+  `SheetRef` AST migration (W5-87), lexer Bang/SheetName/QuotedSheetName
+  tokens (W5-88), parser + printer round-trip (W5-89), binder + runtime
+  cross-sheet resolution (W5-90), sheet rename + formula-text rewrite
+  (W5-91), sheet-scoped names + schema v5 (W5-92), closing mega-audit
+  (W5-93). XS-4-01 + XS-4-02 + XS-4-03 + XS-4-04 all closed.
 
-Workspace tests: **1948 passing / 0 failing** at W5-91 ship.
-All 7 gates green. Working tree clean (after this commit lands).
+Workspace tests: **1984 passing / 0 failing** at W5-93 ship.
+All 7 gates green. Working tree clean.
 Nothing pushed (per CLAUDE.md "never push unless asked").
 
-**Phase 4.6 status:** A + B + C shipped; D + E open.
-- **4.6.D (next):** sheet-scoped names + schema v5.
-- **4.6.E:** closing mega-audit.
+**Phase 4.6 status:** ✅ FULLY CLOSED — AA + A + B + C + D + E all shipped.
+
+**Next phase:** 4.7 — Array formulas + dynamic spills. Multi-week phase per
+MASTER-PLAN §7. Recommended start: design doc + Codex review per the W5-49
+/ W5-85 pattern, then split into ~6-8 sub-phases with audit-after-each.
 
 ---
 
@@ -184,8 +187,120 @@ Phase 4.6.E (closing mega-audit) follows D.
 ## Cycle discipline note
 
 This session ran past the ≤2 cycle CLAUDE.md guideline (user drove with
-`continue` / `proceed` directives throughout the W5-77 → W5-91 wave).
-A fresh session is the right call before opening Phase 4.6.D. If the
-next session inherits this branch state, mega-audit budget for 4.6.E
-should be reserved BEFORE starting 4.6.D rather than after, so the
-cycle budget isn't exhausted on implementation alone.
+`continue` / `proceed` directives throughout the W5-77 → W5-93 wave).
+A fresh session is the right call before opening Phase 4.7.
+
+---
+
+## APPENDIX — W5-92 + W5-93 (Phase 4.6.D + 4.6.E)
+
+Shipped after the initial draft above. HEAD bumped from `083ad235d24`
+(W5-91) through `cce5406b2c7` (W5-92) to `1d5f33edddd` (W5-93).
+
+### W5-92 — Phase 4.6.D (sheet-scoped names + schema v5)
+
+Closes XS-4-03 ("sheet-scoped beats workbook-scoped at owning sheet").
+Five layers wired end-to-end:
+
+- **Storage:** `Sheet::scoped_names: NameTable` field + accessors
+  `scoped_names()`, `scoped_names_mut()`, `set_scoped_name`,
+  `clear_scoped_name`. Reserved-name guard (CORR-06 / `AI`) applies
+  per `NameTable::set`'s rules.
+- **Op log:** `Op::SetName` extended with `scope: Option<SheetId>`
+  (Codex MEDIUM-4 fix — single variant, not new op). `#[serde(default,
+  skip_serializing_if = "Option::is_none")]` keeps v3+old wire shape
+  deserializing unchanged. Replay routes by scope; unknown id →
+  `InvalidSheet`, reserved name → `NameRejected`.
+- **Persistence:** `WORKBOOK_SCHEMA_VERSION` 4→5 per Codex HIGH-2 fix
+  (strict `deny_unknown_fields` envelope requires version bump for new
+  fields). `NamedEntry.scope: Option<u16>` with serde-default for
+  v1-v4 backwards-compat. Save emits scope-sorted entries; load routes
+  by scope; unknown sheet id surfaces as `MalformedName`.
+- **Binder:** `NameLookup` trait extended with `owning_sheet`; new
+  `NameLookup for Workbook` runs the two-tier chain. Production sites
+  in `WorkbookRuntime`, `WorkbookTransaction`, `CalcgraphSession`
+  switched from `wb.names()` to `wb` for the names argument.
+- **Runtime:** `WorkbookRuntime::set_sheet_scoped_name(sheet, name,
+  target)` wrapper emits `Op::SetName { scope: Some(sheet), .. }`.
+
+24 new tests at W5-92 (storage 5, AST already shipped W5-91, env-impl
+5, runtime 5, replay 4, persistence 5).
+
+### W5-93 — Phase 4.6.E (closing mega-audit + fixes)
+
+Pattern: Codex + Sonnet parallel review (W5-52 / W5-67 / W5-76 / W5-84).
+Codex: 2 HIGH + 4 MEDIUM + 1 LOW. Sonnet: 0 HIGH + 4 MEDIUM + 4 LOW
+(Sonnet I.3 was a false positive). Synthesis at
+`docs/audits/2026-05-14-phase-4.6-closing-megaudit.md`.
+
+**HIGH-1 — sheet-name validation at all add-sheet paths:**
+- Storage: new `try_add_sheet_with_chunk_rows` returns
+  `Result<SheetId, SheetNameError>`. Convenience wrappers `add_sheet`
+  + `add_sheet_with_chunk_rows` panic with a clear message on bad
+  input (matches existing `assert!` idiom for storage-layer invariants).
+- Runtime: `WorkbookRuntime::add_sheet` pre-validates → clean error
+  before op-log append (no phantom entries).
+- Replay: routes through fallible variant; new
+  `ReplayError::SheetNameRejected`.
+- Loader: routes through fallible variant; new
+  `QbookError::MalformedSheet`.
+
+**HIGH-2 — `PlanCache` invalidation on `set_sheet_scoped_name`:**
+- Added `self.plan_cache.clear()` at the end of
+  `WorkbookRuntime::set_sheet_scoped_name`. Pre-W5-93 a cached plan
+  bound against workbook-scoped `Rate = 0.05` kept evaluating against
+  that value even after `set_sheet_scoped_name(0, "Rate", 0.21)`
+  because the cache key only included workbook `NameTable::generation()`.
+  Per-sheet generation counter remains a future polish item (design
+  § 10.5).
+
+**MEDIUM (shipped):**
+- Printer: `SheetRef::Id` panic message + pre-bind-only contract
+  documented (resolver-aware print filed as GAP-B-08).
+- Producer-replay equivalence: `realistic_op_sequence` now includes
+  `Op::SetName { scope: Some(_), .. }`; comparator walks each sheet's
+  `scoped_names`.
+- Doc rot: GAP-B-03 + GAP-B-04 marked CLOSED in `known-gaps.md`;
+  `MASTER-PLAN.md` Phase 4.6 entry rewritten with sub-phase commits.
+
+**Deferred as new known-gaps:**
+- GAP-B-06 — `NamedTarget::Formula` text rewrite on rename. Both
+  auditors MEDIUM; deferred to Phase 4.7 alongside named-formula
+  resolution.
+- GAP-B-07 — lexer accepts `A1!B2` (Excel rejects with `#NAME?`).
+  Codex LOW.
+- GAP-B-08 — resolver-aware printer.
+
+**Tests at W5-93:** +12 from W5-92 (1972 → 1984). Storage 4, runtime
+4, replay 2, persistence 2.
+
+### State (snapshot at HEAD `1d5f33edddd`)
+
+- **Branch:** `feat/quantbook-engine`.
+- **HEAD:** `1d5f33edddd` (W5-93).
+- **Tests:** 1984 workspace tests passing.
+- **Gates (all 7 green):** fmt | clippy `-D warnings` | workspace
+  tests | check-build-flags | check-cargo-lock-pins |
+  check-multiversion-clones | cargo audit (1 allowed warning).
+- **Unpushed:** ~20 session commits + prior backlog.
+
+### Phase 4.7 entry guide (next phase)
+
+Recommended approach (mirrors Phase 4.6.AA → 4.6.E):
+
+1. **W5-94 (design)** — Write `docs/architecture/2026-05-14-array-formulas-and-spills.md` covering: array-literal grammar, dynamic-array eval semantics, spill anchor data model, spill blocking + #SPILL! error, spill invalidation on dependency change, `Expr::Array` + `Expr::Spill` ↔ binder ↔ runtime lowering, op-log + persistence implications (probably no schema bump if array values just use existing `CellWireValue` shape). Dispatch Codex review before approval.
+2. **W5-95+ (implementation sub-phases)** target split, audit-after-each:
+   - **4.7.A** — array-literal lexer/parser (`{1,2;3,4}` syntax).
+   - **4.7.B** — bind + scalar/array context propagation.
+   - **4.7.C** — spill anchor data model in storage.
+   - **4.7.D** — spill writeback runtime (computed overlay only).
+   - **4.7.E** — spill blocking + `#SPILL!` error.
+   - **4.7.F** — first dynamic-array functions (start with SEQUENCE
+     + FILTER as the smallest covering pair).
+   - **4.7.G** — spill invalidation + dependency tracking through
+     calcgraph.
+   - **4.7.H** — closing mega-audit (Codex + Sonnet parallel).
+
+Acceptance: ARR-4-01..ARR-4-04 per MASTER-PLAN.
+
+Naturally pair: **GAP-B-06** (named-formula rewrite on rename).
