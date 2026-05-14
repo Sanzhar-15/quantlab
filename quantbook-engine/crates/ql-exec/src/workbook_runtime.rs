@@ -4078,6 +4078,27 @@ mod tests {
                 "{name:?} is range-aware ONLY; must not also appear in the scalar table"
             );
         }
+        // W5-107-AUDIT (Phase 4.7.N — Codex HIGH closure): unified-ABI
+        // array-returning functions that also appear in
+        // is_aggregate_function so the binder routes named-range args
+        // through Range context instead of surfacing
+        // NamedRangeInScalarContext. They live in unified_fns, not
+        // scalar/range_aware tables.
+        for name in &["TRANSPOSE", "FILTER"] {
+            assert!(
+                reg.lookup_unified(name).is_some(),
+                "is_aggregate_function lists {name:?} (unified variant) but \
+                 it's not in default_registry's unified_fns table"
+            );
+            assert!(
+                reg.lookup(name).is_none(),
+                "{name:?} is unified ONLY; must not appear in the scalar table"
+            );
+            assert!(
+                reg.lookup_range_aware(name).is_none(),
+                "{name:?} is unified ONLY; must not appear in the range-aware table"
+            );
+        }
         // Sanity: a known non-aggregate (IF) is in the registry but
         // is_aggregate_function does NOT claim it. We can't directly call
         // is_aggregate_function (private), but we can verify via behavior:
@@ -8066,6 +8087,210 @@ mod tests {
         assert_eq!(
             wb.read(ql_types::Address::new(0, 0, 0)),
             Value::Text(std::sync::Arc::from("none"))
+        );
+    }
+
+    // ===== W5-107-AUDIT (Phase 4.7.N) — Codex HIGH + Sonnet MEDIUM/LOW closure =====
+
+    /// Codex HIGH closure: `=TRANSPOSE(MyRange)` with `MyRange` a named
+    /// range must bind cleanly — `is_aggregate_function` claims TRANSPOSE
+    /// so the binder routes the named-range arg through Range context.
+    /// Before the audit fix, this surfaced `NamedRangeInScalarContext`.
+    #[test]
+    fn set_formula_transpose_with_named_range_arg_binds_and_spills() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+        let mut wb = make_runtime_workbook();
+        wb.set_name("MyRow", NamedTarget::Range(Range::new(0, 0, 0, 0, 2)))
+            .unwrap();
+        wb.put(ql_types::Address::new(0, 0, 0), Value::Number(10.0));
+        wb.put(ql_types::Address::new(0, 0, 1), Value::Number(20.0));
+        wb.put(ql_types::Address::new(0, 0, 2), Value::Number(30.0));
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 5, 0, "TRANSPOSE(MyRow)").unwrap();
+        drop(rt);
+        // 1×3 row → 3×1 column at (5, 0).
+        assert_eq!(
+            wb.spill_anchor_at(0, 5, 0).copied(),
+            Some(ql_storage::SpillShape::new(3, 1))
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 5, 0)),
+            Value::Number(10.0)
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 6, 0)),
+            Value::Number(20.0)
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 7, 0)),
+            Value::Number(30.0)
+        );
+    }
+
+    /// Codex HIGH closure: `=FILTER(Data, Mask)` with both args as named
+    /// ranges must bind. The binder previously rejected this with
+    /// `NamedRangeInScalarContext`.
+    #[test]
+    fn set_formula_filter_with_named_range_args_binds_and_spills() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+        let mut wb = make_runtime_workbook();
+        wb.set_name("Data", NamedTarget::Range(Range::new(0, 0, 0, 0, 3)))
+            .unwrap();
+        wb.set_name("Mask", NamedTarget::Range(Range::new(0, 1, 0, 1, 3)))
+            .unwrap();
+        // Data row: 10, 20, 30, 40.
+        wb.put(ql_types::Address::new(0, 0, 0), Value::Number(10.0));
+        wb.put(ql_types::Address::new(0, 0, 1), Value::Number(20.0));
+        wb.put(ql_types::Address::new(0, 0, 2), Value::Number(30.0));
+        wb.put(ql_types::Address::new(0, 0, 3), Value::Number(40.0));
+        // Mask row: TRUE, FALSE, TRUE, FALSE.
+        wb.put(ql_types::Address::new(0, 1, 0), Value::Boolean(true));
+        wb.put(ql_types::Address::new(0, 1, 1), Value::Boolean(false));
+        wb.put(ql_types::Address::new(0, 1, 2), Value::Boolean(true));
+        wb.put(ql_types::Address::new(0, 1, 3), Value::Boolean(false));
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 5, 0, "FILTER(Data, Mask)").unwrap();
+        drop(rt);
+        // Kept: 10, 30 → 1×2 row at (5, 0).
+        assert_eq!(
+            wb.spill_anchor_at(0, 5, 0).copied(),
+            Some(ql_storage::SpillShape::new(1, 2))
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 5, 0)),
+            Value::Number(10.0)
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 5, 1)),
+            Value::Number(30.0)
+        );
+    }
+
+    /// Sonnet LOW closure: TRANSPOSE referencing live cells via a named
+    /// range must update through recompute_dirty when the source cells
+    /// change. Pins that the producer-alias rewrite + spill-footprint
+    /// hooks work for TRANSPOSE the same as they do for SEQUENCE.
+    #[test]
+    fn recompute_dirty_transpose_with_named_range_updates_on_value_change() {
+        use crate::CalcgraphSession;
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+        let mut wb = make_runtime_workbook();
+        // Name MUST NOT be a 1–3-letter ASCII alpha sequence (e.g. `Src`,
+        // `AAA`) — those lex as a `BareColumn` and produce `Expr::RangeRef`
+        // BEFORE name resolution, shadowing the named range entirely.
+        // Latent product limitation; not in scope for 4.7.N closure.
+        wb.set_name("SrcRow", NamedTarget::Range(Range::new(0, 0, 0, 0, 1)))
+            .unwrap();
+        wb.put(ql_types::Address::new(0, 0, 0), Value::Number(1.0));
+        wb.put(ql_types::Address::new(0, 0, 1), Value::Number(2.0));
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 5, 0, "TRANSPOSE(SrcRow)").unwrap();
+        }
+        assert_eq!(
+            wb.spill_anchor_at(0, 5, 0).copied(),
+            Some(ql_storage::SpillShape::new(2, 1))
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 5, 0)), Value::Number(1.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 6, 0)), Value::Number(2.0));
+
+        // Mutate A1; recompute_dirty re-evaluates TRANSPOSE; spill at
+        // (5,0)+(6,0) reflects the new value.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 0, Value::Number(99.0)).unwrap();
+            let result = rt.recompute_dirty().expect("graph attached");
+            assert!(result.is_complete(), "recompute failures: {result:?}");
+        }
+        assert_eq!(
+            wb.spill_anchor_at(0, 5, 0).copied(),
+            Some(ql_storage::SpillShape::new(2, 1))
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 5, 0)),
+            Value::Number(99.0)
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 6, 0)), Value::Number(2.0));
+    }
+
+    /// Sonnet MEDIUM closure: FILTER shape transition through
+    /// recompute_dirty. Pre: include mask keeps 2 of 4 → 1×2 spill.
+    /// Mutate the mask so 3 of 4 are kept → 1×3 spill. Pins that:
+    /// (a) the spill-footprint hooks fire on FILTER's recompute_dirty
+    /// path, (b) the fixed-point loop catches the mid-pass shape
+    /// transition, (c) old footprint cells are cleared.
+    #[test]
+    fn recompute_dirty_filter_with_named_ranges_grows_footprint() {
+        use crate::CalcgraphSession;
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+        let mut wb = make_runtime_workbook();
+        wb.set_name("Data", NamedTarget::Range(Range::new(0, 0, 0, 0, 3)))
+            .unwrap();
+        wb.set_name("Mask", NamedTarget::Range(Range::new(0, 1, 0, 1, 3)))
+            .unwrap();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            // Data: 10, 20, 30, 40.
+            rt.set_value(0, 0, 0, Value::Number(10.0)).unwrap();
+            rt.set_value(0, 0, 1, Value::Number(20.0)).unwrap();
+            rt.set_value(0, 0, 2, Value::Number(30.0)).unwrap();
+            rt.set_value(0, 0, 3, Value::Number(40.0)).unwrap();
+            // Mask: TRUE, FALSE, TRUE, FALSE.
+            rt.set_value(0, 1, 0, Value::Boolean(true)).unwrap();
+            rt.set_value(0, 1, 1, Value::Boolean(false)).unwrap();
+            rt.set_value(0, 1, 2, Value::Boolean(true)).unwrap();
+            rt.set_value(0, 1, 3, Value::Boolean(false)).unwrap();
+            rt.set_formula(0, 5, 0, "FILTER(Data, Mask)").unwrap();
+        }
+        // Pre: 1×2 — kept 10, 30.
+        assert_eq!(
+            wb.spill_anchor_at(0, 5, 0).copied(),
+            Some(ql_storage::SpillShape::new(1, 2))
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 5, 0)),
+            Value::Number(10.0)
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 5, 1)),
+            Value::Number(30.0)
+        );
+
+        // Flip mask cell (0, 1, 1) so 3 of 4 are kept (TRUE TRUE TRUE FALSE).
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 1, 1, Value::Boolean(true)).unwrap();
+            let result = rt.recompute_dirty().expect("graph attached");
+            assert!(result.is_complete(), "recompute failures: {result:?}");
+        }
+
+        // Post: 1×3 — kept 10, 20, 30. Footprint grew.
+        assert_eq!(
+            wb.spill_anchor_at(0, 5, 0).copied(),
+            Some(ql_storage::SpillShape::new(1, 3)),
+            "FILTER shape grew from 1x2 to 1x3"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 5, 0)),
+            Value::Number(10.0)
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 5, 1)),
+            Value::Number(20.0)
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 5, 2)),
+            Value::Number(30.0)
         );
     }
 

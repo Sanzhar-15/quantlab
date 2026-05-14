@@ -352,6 +352,9 @@ pub fn filter(args: &[FunctionArg], _ctx: &FunctionContext) -> FunctionReturn {
 
     // Walk include cells, building the result. Truthy decision:
     // - Error → propagate immediately (left-error wins).
+    // - Number NaN → #NUM! (IEEE NaN can't be coerced; `!= 0.0` is
+    //   true for NaN, so without this guard FILTER would silently
+    //   keep NaN-masked rows). W5-107-AUDIT Sonnet LOW closure.
     // - Number != 0 → truthy.
     // - Boolean(true) → truthy.
     // - Boolean(false), Number(0), Blank → falsy.
@@ -360,6 +363,9 @@ pub fn filter(args: &[FunctionArg], _ctx: &FunctionContext) -> FunctionReturn {
     for (idx, include_v) in i_cells.iter().enumerate() {
         let truthy = match include_v {
             Value::Error(e) => return FunctionReturn::Scalar(Value::Error(*e)),
+            Value::Number(n) if n.is_nan() => {
+                return FunctionReturn::Scalar(Value::Error(ErrorValue::Num));
+            }
             Value::Number(n) => *n != 0.0,
             Value::Boolean(b) => *b,
             Value::Blank => false,
@@ -368,16 +374,17 @@ pub fn filter(args: &[FunctionArg], _ctx: &FunctionContext) -> FunctionReturn {
             }
         };
         if truthy {
-            // Defensive bound check — index is by construction
-            // < a_cells.len() since length == include length and
-            // we iterate include.
-            if let Some(cell) = a_cells.get(idx) {
-                // Per Excel canon, an Error in the data array
-                // surfaces as a per-cell error in the result
-                // (not propagated as the whole return). FILTER
-                // preserves whatever is in the kept cells.
-                kept.push(cell.clone());
-            }
+            // idx < length == a_cells.len() by construction (we
+            // checked include_matches_shape above). Use [] with
+            // a tight invariant comment instead of `.get()` to
+            // avoid a silently-skipped branch on bug. W5-107-AUDIT
+            // Sonnet LOW closure.
+            let cell = &a_cells[idx];
+            // Per Excel canon, an Error in the data array surfaces
+            // as a per-cell error in the result (not propagated
+            // as the whole return). FILTER preserves whatever is
+            // in the kept cells.
+            kept.push(cell.clone());
         }
     }
 
@@ -385,18 +392,30 @@ pub fn filter(args: &[FunctionArg], _ctx: &FunctionContext) -> FunctionReturn {
     if kept.is_empty() {
         if args.len() == 3 {
             // if_empty provided — 1×1 with that value.
+            // W5-107-AUDIT Sonnet LOW closure: guard against
+            // degenerate Array/Range inputs (rows==0 or cols==0)
+            // — `ArrayValue::first()` panics on them. Surface a
+            // degenerate result instead so cell-boundary maps it
+            // to #CALC!, matching the no-if_empty path.
             let if_empty_v = match &args[2] {
-                FunctionArg::Scalar(v) => v.clone(),
-                // Per Excel canon, if_empty as a non-scalar is
-                // unusual but accepted; we take cell (0, 0).
-                FunctionArg::Array(a) => a.first().clone(),
-                FunctionArg::Range { values, .. } => {
-                    values.first().cloned().unwrap_or(Value::Blank)
+                FunctionArg::Scalar(v) => Some(v.clone()),
+                FunctionArg::Array(a) => {
+                    if a.rows() == 0 || a.cols() == 0 {
+                        None
+                    } else {
+                        Some(a.first().clone())
+                    }
                 }
+                FunctionArg::Range { values, .. } => values.first().cloned(),
             };
-            return FunctionReturn::Array(ArrayValue::singleton(if_empty_v));
+            if let Some(v) = if_empty_v {
+                return FunctionReturn::Array(ArrayValue::singleton(v));
+            }
+            // Degenerate if_empty falls through to the degenerate
+            // output path below.
         }
-        // No if_empty — degenerate output. Cell-boundary surfaces #CALC!.
+        // No if_empty (or degenerate if_empty) — degenerate output.
+        // Cell-boundary surfaces #CALC!.
         let degen_shape = if is_row_vec { (1, 0) } else { (0, 1) };
         return FunctionReturn::Array(ArrayValue::empty(degen_shape.0, degen_shape.1));
     }
@@ -998,5 +1017,31 @@ mod tests {
         let include = arr(1, 1, vec![b(true)]);
         let e = expect_scalar_error(filter(&[array, include], &ctx()));
         assert_eq!(e, ErrorValue::Ref);
+    }
+
+    /// W5-107-AUDIT Sonnet LOW closure: NaN in include surfaces #NUM!
+    /// (IEEE NaN != 0.0 is true, which would have silently kept the
+    /// corresponding row — must surface, not pass).
+    #[test]
+    fn filter_nan_in_include_returns_num_error() {
+        let array = arr(1, 2, vec![Value::Number(10.0), Value::Number(20.0)]);
+        let include = arr(1, 2, vec![Value::Number(f64::NAN), b(true)]);
+        let e = expect_scalar_error(filter(&[array, include], &ctx()));
+        assert_eq!(e, ErrorValue::Num);
+    }
+
+    /// W5-107-AUDIT Sonnet LOW closure: if_empty as a degenerate
+    /// ArrayValue (rows=0 or cols=0) must NOT panic on `.first()`;
+    /// degenerate if_empty falls through to the degenerate-output
+    /// path (cell-boundary surfaces #CALC!).
+    #[test]
+    fn filter_all_false_degenerate_if_empty_array_does_not_panic() {
+        let array = arr(1, 2, vec![Value::Number(1.0), Value::Number(2.0)]);
+        let include = arr(1, 2, vec![b(false), b(false)]);
+        let if_empty = FunctionArg::Array(ArrayValue::empty(0, 1));
+        let result = expect_array(filter(&[array, include, if_empty], &ctx()));
+        // Degenerate output preserves input orientation (1 row).
+        assert_eq!(result.rows(), 1);
+        assert_eq!(result.cols(), 0);
     }
 }

@@ -317,6 +317,18 @@ pub(crate) fn is_aggregate_function(name: &str) -> bool {
             | "MODE.SNGL"
             // Range-aware text completion (W5-61 polish).
             | "CONCAT"
+            // **W5-107 (Phase 4.7.N) — Codex audit HIGH closure**:
+            // array-returning Unified-ABI functions that accept Range
+            // / named-range args. TRANSPOSE accepts a Range (its only
+            // arg). FILTER accepts a Range as both `array` and
+            // `include` args. Without adding them here, the binder
+            // rejects `FILTER(Data, Mask)` with
+            // `NamedRangeInScalarContext` despite the function having
+            // full FunctionArg::Range support in its body. SEQUENCE
+            // is NOT added — it takes only scalar args (rows, cols,
+            // start, step).
+            | "TRANSPOSE"
+            | "FILTER"
     )
 }
 
