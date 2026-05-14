@@ -69,9 +69,26 @@ fn print_cell_addr(addr: &CellAddr, out: &mut String) {
 }
 
 /// **W5-89 (Phase 4.6.A part 3):** emit `Sheet!` or `'Sheet name'!`
-/// prefix for non-`Current` sheet refs. `Id` is post-bind-only; the
-/// printer panics if asked to render it (a future
-/// `print_with_resolver(expr, id_to_name)` API will handle that path).
+/// prefix for non-`Current` sheet refs.
+///
+/// **Contract:** `print` is pre-bind-only. The expected inputs are:
+/// - `SheetRef::Current` — no prefix.
+/// - `SheetRef::Name(_)` — the parser's output for a sheet-qualified
+///   ref; emits `Sheet!` or `'Sheet name'!`.
+///
+/// `SheetRef::Id(_)` would require resolving the id back to a name,
+/// which means threading workbook context through the printer. That
+/// resolver-aware variant is a Phase 4.6.E follow-up polish item
+/// tracked in `docs/known-gaps.md` (GAP-X-01). Until then, calling
+/// `print` on a post-bind AST is a programmer error and panics with
+/// the specific id so the call site is obvious.
+///
+/// **W5-93 (Phase 4.6.E closure):** Codex MEDIUM and Sonnet MEDIUM
+/// converged on this finding. Closure stance: keep the panic (no-
+/// fallbacks rule), improve the message, document the contract.
+/// The current `rewrite_sheet_name_in_expr` path walks pre-bind
+/// ASTs only, so the panic isn't reachable through any production
+/// code path today.
 fn print_sheet_prefix(sheet: &SheetRef, out: &mut String) {
     match sheet {
         SheetRef::Current => {}
@@ -80,7 +97,13 @@ fn print_sheet_prefix(sheet: &SheetRef, out: &mut String) {
             out.push('!');
         }
         SheetRef::Id(id) => panic!(
-            "print: SheetRef::Id({id}) requires a sheet-name resolver — use a future print_with_resolver API"
+            "ql_formula_syntax::print: SheetRef::Id({id}) reached the printer, \
+             but print() is pre-bind-only by contract (see fn doc comment). \
+             The bound id has no associated name string at the AST level; a \
+             resolver-aware print_with_resolver(expr, &workbook) API is \
+             tracked as Phase 4.6.E follow-up. If you're trying to round-trip \
+             a bound expression, re-parse from text instead — the binder \
+             does NOT round-trip back through the printer."
         ),
     }
 }

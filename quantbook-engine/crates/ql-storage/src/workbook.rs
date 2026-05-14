@@ -460,16 +460,22 @@ impl Workbook {
     /// silently — use `ql_exec::WorkbookRuntime::add_sheet` to record the
     /// sheet creation in an attached `OpLog`. Tracked as GAP-O-02 in
     /// `docs/known-gaps.md`.
+    /// Infallible add. Panics on validation failure — `validate_sheet_name`
+    /// catches empty, duplicate-under-canonical-comparison, and reserved-
+    /// character cases at the storage boundary. **W5-93 (Phase 4.6.E
+    /// closure):** Codex HIGH-1 flagged the prior silent acceptance:
+    /// `wb.add_sheet("Sheet1")` + `wb.add_sheet("SHEET1")` previously
+    /// produced two duplicate-canonical sheets without complaint.
+    ///
+    /// Test-friendly: the panic surfaces a bad-name bug immediately.
+    /// Production callers route through `WorkbookRuntime::add_sheet`
+    /// (which pre-validates) or `try_add_sheet_with_chunk_rows`
+    /// (which returns a clean `Err`).
     pub fn add_sheet(&mut self, name: impl Into<String>) -> SheetId {
-        let id = self.sheets.len();
-        assert!(
-            id < SheetId::MAX as usize,
-            "too many sheets (max {}, current {})",
-            SheetId::MAX as usize,
-            id
-        );
-        self.sheets.push(Sheet::new(name));
-        id as SheetId
+        self.try_add_sheet_with_chunk_rows(name, crate::column::chunk_rows_from_env())
+            .expect(
+                "Workbook::add_sheet: name validation failed (empty / duplicate / reserved char)",
+            )
     }
 
     /// Add a sheet with an explicit chunk size. Used by tests AND by ql-io
@@ -477,16 +483,37 @@ impl Workbook {
     /// Audit L7 fix (2026-05-12): doc previously said "test-only" but production
     /// code calls this.
     ///
+    /// **W5-93 (Phase 4.6.E closure):** now panics on validation failure
+    /// via `try_add_sheet_with_chunk_rows().expect(...)`. Fallible
+    /// callers should use `try_add_sheet_with_chunk_rows` directly.
+    ///
     /// **Phase 2B.5 (2026-05-12) — LOW-LEVEL.** Bypasses the op log. Use
     /// `ql_exec::WorkbookRuntime::add_sheet` for op-log-recording sheet
-    /// creation. The qbook loader calls this directly because op-log
-    /// reconstruction is the loader's job (it replays the saved
-    /// `oplog.bin`), not this method's. GAP-O-02.
+    /// creation. The qbook loader uses `try_add_sheet_with_chunk_rows`
+    /// because op-log reconstruction is the loader's job (it replays the
+    /// saved `oplog.bin`), not this method's. GAP-O-02.
     pub fn add_sheet_with_chunk_rows(
         &mut self,
         name: impl Into<String>,
         chunk_rows: u32,
     ) -> SheetId {
+        self.try_add_sheet_with_chunk_rows(name, chunk_rows)
+            .expect("Workbook::add_sheet_with_chunk_rows: name validation failed (empty / duplicate / reserved char)")
+    }
+
+    /// **W5-93 (Phase 4.6.E closure):** fallible add. Validates `name`
+    /// via `validate_sheet_name` and surfaces `SheetNameError` for
+    /// empty, duplicate-under-canonical-comparison, or reserved-
+    /// character (`: \ / ? * [ ]`) inputs. Production callers (loader,
+    /// runtime, replay) use this directly to convert a malformed input
+    /// into a clean error rather than a panic.
+    pub fn try_add_sheet_with_chunk_rows(
+        &mut self,
+        name: impl Into<String>,
+        chunk_rows: u32,
+    ) -> Result<SheetId, SheetNameError> {
+        let name: String = name.into();
+        self.validate_sheet_name(&name)?;
         let id = self.sheets.len();
         assert!(
             id < SheetId::MAX as usize,
@@ -494,7 +521,7 @@ impl Workbook {
             SheetId::MAX as usize
         );
         self.sheets.push(Sheet::with_chunk_rows(name, chunk_rows));
-        id as SheetId
+        Ok(id as SheetId)
     }
 
     pub fn sheet(&self, id: SheetId) -> Option<&Sheet> {
@@ -1162,5 +1189,48 @@ mod tests {
         // via its own pre-check before calling this.)
         let err = wb.rename_sheet(7, "Other").unwrap_err();
         assert!(matches!(err, SheetNameError::Duplicate { .. }));
+    }
+
+    // W5-93 (Phase 4.6.E closure) — sheet-name validation at add_sheet path.
+
+    #[test]
+    fn try_add_sheet_rejects_canonical_duplicate() {
+        // Codex HIGH-1: pre-W5-93 the storage layer silently accepted
+        // duplicate-canonical names like `Sheet1` + `SHEET1`. Now the
+        // fallible variant surfaces a clean error.
+        let mut wb = Workbook::new();
+        wb.try_add_sheet_with_chunk_rows("Sheet1", 16).unwrap();
+        let err = wb.try_add_sheet_with_chunk_rows("SHEET1", 16).unwrap_err();
+        assert!(matches!(err, SheetNameError::Duplicate { .. }));
+        assert_eq!(wb.sheet_count(), 1);
+    }
+
+    #[test]
+    fn try_add_sheet_rejects_reserved_char() {
+        let mut wb = Workbook::new();
+        let err = wb
+            .try_add_sheet_with_chunk_rows("Bad:Sheet", 16)
+            .unwrap_err();
+        assert!(matches!(err, SheetNameError::ReservedCharacter(':')));
+        assert_eq!(wb.sheet_count(), 0);
+    }
+
+    #[test]
+    fn try_add_sheet_rejects_empty_name() {
+        let mut wb = Workbook::new();
+        let err = wb.try_add_sheet_with_chunk_rows("", 16).unwrap_err();
+        assert!(matches!(err, SheetNameError::Empty));
+        assert_eq!(wb.sheet_count(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "name validation failed")]
+    fn add_sheet_panics_on_duplicate() {
+        // The infallible wrapper panics with a clear message rather
+        // than silently producing a corrupt workbook. Closes Codex
+        // HIGH-1 at the test-friendly path.
+        let mut wb = Workbook::new();
+        wb.add_sheet("Sheet1");
+        wb.add_sheet("Sheet1"); // panics here
     }
 }

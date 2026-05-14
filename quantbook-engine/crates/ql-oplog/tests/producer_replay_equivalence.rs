@@ -104,6 +104,27 @@ fn realistic_op_sequence() -> Vec<Op> {
         col: 0,
         id: None,
     });
+    // **W5-93 (Phase 4.6.E closure):** sheet-scoped name on sheet 0.
+    // Codex MEDIUM-3 + Sonnet M.2: the pre-W5-93 realistic sequence
+    // only exercised `scope: None`, so a missing or wrong scope branch
+    // in replay would have passed the equivalence test silently.
+    ops.push(Op::SetName {
+        scope: Some(0),
+        name: "ScopedRate".to_owned(),
+        target: NamedTargetWire::Constant {
+            value: CellWireValue::Number(0.42),
+        },
+    });
+    // And on sheet 1 (Inventory).
+    ops.push(Op::SetName {
+        scope: Some(1),
+        name: "WarehouseBin".to_owned(),
+        target: NamedTargetWire::Cell {
+            sheet: 1,
+            row: 0,
+            col: 0,
+        },
+    });
     ops
 }
 
@@ -284,6 +305,30 @@ fn assert_workbooks_observationally_equal(a: &Workbook, b: &Workbook) {
             overlay_a, overlay_b,
             "CellFormatOverlay differs on sheet {sheet_id}"
         );
+
+        // **W5-93 (Phase 4.6.E closure):** per-sheet `scoped_names`
+        // also has to be compared so a producer/replay divergence
+        // in `Op::SetName { scope: Some(_), .. }` ordering or
+        // routing surfaces here. Codex MEDIUM-3 + Sonnet M.3: the
+        // pre-W5-93 comparator skipped scoped_names entirely, so a
+        // missed routing branch in replay would have passed silently.
+        let scoped_a = a.sheet(sheet_id).unwrap().scoped_names();
+        let scoped_b = b.sheet(sheet_id).unwrap().scoped_names();
+        assert_eq!(
+            scoped_a.len(),
+            scoped_b.len(),
+            "sheet {sheet_id} scoped_names lengths differ"
+        );
+        for (name, _) in scoped_a.iter() {
+            let target_a = scoped_a.lookup_ci(name).expect("present in a");
+            let target_b = scoped_b.lookup_ci(name).unwrap_or_else(|| {
+                panic!("scoped name {name:?} present on sheet {sheet_id} in a but not in b")
+            });
+            assert_eq!(
+                target_a, target_b,
+                "scoped name {name:?} on sheet {sheet_id} target differs"
+            );
+        }
     }
 }
 

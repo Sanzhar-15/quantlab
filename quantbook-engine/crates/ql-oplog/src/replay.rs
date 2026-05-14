@@ -146,6 +146,20 @@ pub enum ReplayError {
         #[source]
         source: ql_storage::SheetNameError,
     },
+
+    /// **W5-93 (Phase 4.6.E closure):** `Op::AddSheet` carried a name
+    /// that fails `Workbook::validate_sheet_name` — empty, duplicate
+    /// under canonical comparison, or an Excel-reserved character.
+    /// Codex HIGH-1 closed: pre-W5-93 the replay path silently
+    /// accepted any name, so an op log produced against a buggy
+    /// storage path could let conflicting sheets enter replay state.
+    #[error("replay add-sheet rejected at op index {index}: name {name:?} ({source})")]
+    SheetNameRejected {
+        index: usize,
+        name: String,
+        #[source]
+        source: ql_storage::SheetNameError,
+    },
 }
 
 /// Wrapper around `ql_storage::FormatTableError` that owns its strings,
@@ -296,12 +310,19 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             Ok(())
         }
         Op::AddSheet { name, chunk_rows } => {
-            // add_sheet panics on SheetId::MAX. Bound check would require
-            // running through a try_add_sheet API which doesn't exist
-            // (Phase 2A.6 audit M1 deferred it). For replay, we trust the
-            // log: a workbook that successfully produced this op originally
-            // had room for the sheet.
-            workbook.add_sheet_with_chunk_rows(name.clone(), *chunk_rows);
+            // **W5-93 (Phase 4.6.E closure):** route through the fallible
+            // `try_add_sheet_with_chunk_rows` and surface a clean
+            // `ReplayError::SheetNameRejected` on validation failure.
+            // Codex HIGH-1 flagged that the prior infallible path
+            // silently accepted duplicate-canonical names + reserved
+            // characters at the replay boundary too.
+            workbook
+                .try_add_sheet_with_chunk_rows(name.clone(), *chunk_rows)
+                .map_err(|source| ReplayError::SheetNameRejected {
+                    index,
+                    name: name.clone(),
+                    source,
+                })?;
             Ok(())
         }
         Op::RenameSheet {
@@ -1127,5 +1148,49 @@ mod tests {
             matches!(err, ReplayError::NameRejected { .. }),
             "expected NameRejected, got {err:?}"
         );
+    }
+
+    // ===== W5-93 (Phase 4.6.E closure) Op::AddSheet name validation =====
+
+    #[test]
+    fn replay_add_sheet_canonical_duplicate_rejected() {
+        // Codex HIGH-1: a hand-crafted log carrying conflicting names
+        // must NOT enter the workbook silently.
+        let mut log = OpLog::new();
+        log.append(Op::AddSheet {
+            name: "Sheet1".to_owned(),
+            chunk_rows: 16,
+        })
+        .unwrap();
+        log.append(Op::AddSheet {
+            name: "SHEET1".to_owned(),
+            chunk_rows: 16,
+        })
+        .unwrap();
+
+        let mut wb = Workbook::new();
+        let reg = default_registry();
+        let err = replay_into(&log, &mut wb, &reg).unwrap_err();
+        assert!(
+            matches!(err, ReplayError::SheetNameRejected { index: 1, .. }),
+            "expected SheetNameRejected at index 1, got {err:?}"
+        );
+        // Replay failed mid-log; the first sheet did land.
+        assert_eq!(wb.sheet_count(), 1);
+    }
+
+    #[test]
+    fn replay_add_sheet_reserved_char_rejected() {
+        let mut log = OpLog::new();
+        log.append(Op::AddSheet {
+            name: "Bad?Sheet".to_owned(),
+            chunk_rows: 16,
+        })
+        .unwrap();
+
+        let mut wb = Workbook::new();
+        let reg = default_registry();
+        let err = replay_into(&log, &mut wb, &reg).unwrap_err();
+        assert!(matches!(err, ReplayError::SheetNameRejected { .. }));
     }
 }

@@ -462,11 +462,17 @@ The full v1 means all of these crates either ship real behavior or have a docume
    Acceptance: DTF-4-01 1900/1904 policy explicit; DTF-4-02 date/time functions match matrix; **DTF-4-03 re-scoped to "format parser has en-US fully populated + extension point for locale; en/de/fr behavior tests move to Phase 4.9"** (Codex HIGH 3); DTF-4-04 storage distinguishes value from display format via sparse format overlay + workbook FormatTable.  
    Effort: ~6-8 sessions implementation + 1 mega-audit per the design doc § 8 (Codex MEDIUM 3 re-estimate; Phase 4.4 reference: estimated 2.5 sessions, took 5).
 
-6. **4.6 Cross-Sheet References And Sheet-Scoped Names**  
-   Extend AST/binder/runtime to support `Sheet1!A1`, quoted sheet names, 3D constraints if chosen, and sheet-scoped names.  
+6. **4.6 Cross-Sheet References And Sheet-Scoped Names** ✅ **FULLY SHIPPED** (W5-85 → W5-93, 2026-05-14)
+   Extended AST/binder/runtime to support `Sheet1!A1`, quoted sheet names, sheet rename with formula-text rewrite, and sheet-scoped names. Sub-phases:
+   - 4.6.AA (W5-86) — sheet registry + canonicalizer (`Workbook::sheet_id_by_name`, `canonical_sheet_name`, `validate_sheet_name`).
+   - 4.6.A (W5-87 → W5-89) — `SheetRef::{Current, Name, Id}` AST migration + lexer Bang/SheetName/QuotedSheetName tokens + parser/printer cross-sheet round-trip.
+   - 4.6.B (W5-90) — `SheetResolver` trait + `bind_with_names_and_sheets` + `BindError::UnknownSheet`. **XS-4-01 closed.**
+   - 4.6.C (W5-91) — `WorkbookRuntime::rename_sheet` + formula-text rewrite + `Op::RenameSheet` with 3-case replay reconciliation.
+   - 4.6.D (W5-92) — sheet-scoped names: `Sheet::scoped_names` + `NameLookup for Workbook` two-tier chain + `Op::SetName { scope, .. }` + schema v5 `NamedEntry.scope`. **XS-4-03 closed.**
+   - 4.6.E (W5-93) — closing mega-audit (Codex + Sonnet parallel). Closed 2 HIGH (sheet-name validation at storage/runtime/replay; PlanCache invalidation on sheet-scoped name change) + 3 MEDIUM (printer doc, producer-replay scope coverage, doc rot) + filed GAP-B-06 (`NamedTarget::Formula` rewrite on rename), GAP-B-07 (`A1!B2` lexer accepts), GAP-B-08 (resolver-aware print).
    References: `.references/ironcalc/base/src/expressions/lexer/ranges.rs`; `.references/ironcalc/base/src/expressions/parser/tests/test_ranges.rs`; `.references/hyperformula/src/DependencyGraph/SheetMapping.ts`; `.references/formualizer/crates/formualizer-eval/src/engine/graph/sheets.rs`.  
-   Acceptance: XS-4-01 cross-sheet cell refs parse, print, bind, and recompute; XS-4-02 quoted names work; XS-4-03 sheet-scoped names resolve before workbook-scoped names; XS-4-04 op-log and xlsx paths preserve sheet identity.  
-   Effort: 1 week.
+   Acceptance: XS-4-01 ✅ cross-sheet cell refs parse, print, bind, and recompute; XS-4-02 ✅ quoted names work; XS-4-03 ✅ sheet-scoped names resolve before workbook-scoped names; XS-4-04 ✅ op-log preserves sheet identity (xlsx is Phase 4.11). **3D references explicit non-goal** per design doc § 10.5.
+   Effort actual: 8 commits W5-86→W5-92 plus W5-93 closure ≈ 1 week as planned. Design doc: `docs/architecture/2026-05-13-cross-sheet-references.md`. Audit prompt + Codex/Sonnet outputs in `docs/audits/2026-05-14-phase-4.6-closing-megaudit-*`.
 
 7. **4.7 Array Formulas And Dynamic Spills**  
    Implement array literals, dynamic-array functions, spill ranges, spill blocking, spill invalidation, and computed-overlay writeback.  

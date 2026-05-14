@@ -744,6 +744,17 @@ impl<'a> WorkbookRuntime<'a> {
             g.on_set_name(name);
         }
 
+        // 6. **W5-93 (Phase 4.6.E closure):** invalidate the plan cache.
+        //    Codex HIGH-2: the cache key currently includes only the
+        //    workbook-scoped `NameTable::generation()` — a sheet-scoped
+        //    name change wouldn't bump that counter, so cached plans
+        //    bound against `=Rate` (resolved to workbook-scoped) would
+        //    keep evaluating against the workbook value even after a
+        //    sheet-scoped `Rate` was registered. Full flush is acceptable
+        //    at edit rate (matches the rename pattern); per-sheet
+        //    generation counters are design § 10.5 future polish.
+        self.plan_cache.clear();
+
         Ok(())
     }
 
@@ -779,12 +790,23 @@ impl<'a> WorkbookRuntime<'a> {
         }
 
         let name: String = name.into();
+        // **W5-93 (Phase 4.6.E closure):** pre-validate the name BEFORE
+        // appending to the op log so a duplicate or reserved-char name
+        // can't leave a phantom `AddSheet` entry followed by a failed
+        // mutation. Codex HIGH-1 flagged that the prior path silently
+        // accepted any name at the storage boundary.
+        self.workbook
+            .validate_sheet_name(&name)
+            .map_err(RuntimeError::SheetName)?;
         if let Some(oplog) = self.oplog.as_deref_mut() {
             oplog.append(Op::AddSheet {
                 name: name.clone(),
                 chunk_rows,
             })?;
         }
+        // Now infallible: validation already passed, so the storage call
+        // can't return an error. Routes through the panicking convenience
+        // wrapper.
         let new_id = self.workbook.add_sheet_with_chunk_rows(name, chunk_rows);
 
         // Phase 3.1: notify calcgraph. Today a counter-bump; Phase 4.6
@@ -5416,5 +5438,81 @@ mod tests {
         assert_eq!(v0, Value::Number(0.21));
         let v1 = rt.set_formula(s1, 0, 0, "Rate").unwrap();
         assert_eq!(v1, Value::Number(0.05));
+    }
+
+    // ===== W5-93 (Phase 4.6.E closure) =====
+
+    #[test]
+    fn add_sheet_rejects_canonical_duplicate() {
+        // Codex HIGH-1: WorkbookRuntime::add_sheet must pre-validate.
+        let mut wb = Workbook::new();
+        wb.add_sheet("Sheet1");
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt.add_sheet("SHEET1", 16).unwrap_err();
+        assert!(matches!(err, RuntimeError::SheetName(_)));
+        // Workbook unchanged (only the original sheet).
+        drop(rt);
+        assert_eq!(wb.sheet_count(), 1);
+    }
+
+    #[test]
+    fn add_sheet_rejects_reserved_char() {
+        let mut wb = Workbook::new();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt.add_sheet("Bad/Sheet", 16).unwrap_err();
+        assert!(matches!(err, RuntimeError::SheetName(_)));
+    }
+
+    #[test]
+    fn add_sheet_with_bad_name_emits_no_oplog_entry() {
+        // Pre-validation must run BEFORE the op log append so a bad
+        // name doesn't leave a phantom AddSheet in the log.
+        use ql_oplog::OpLog;
+        let mut wb = Workbook::new();
+        wb.add_sheet("Sheet1");
+        let reg = default_registry();
+        let mut log = OpLog::new();
+        let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut log);
+        let _ = rt.add_sheet("Sheet1", 16).unwrap_err();
+        drop(rt);
+        let ops: Vec<Op> = log.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(
+            ops.len(),
+            0,
+            "no Op::AddSheet for rejected name; got {ops:?}"
+        );
+    }
+
+    #[test]
+    fn set_sheet_scoped_name_invalidates_plan_cache() {
+        // Codex HIGH-2: a workbook-scoped formula bound BEFORE the
+        // sheet-scoped name was registered must re-bind on next
+        // recompute. Pre-W5-93 the plan cache key only included the
+        // workbook NameTable generation, so the cached plan would
+        // keep using the workbook-scoped value.
+        use ql_storage::NamedTarget;
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S0");
+        wb.set_name("Rate", NamedTarget::Constant(Value::Number(0.05)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // Bind once — `=Rate` resolves to workbook-scoped 0.05.
+        let v0 = rt.set_formula(s0, 0, 0, "Rate").unwrap();
+        assert_eq!(v0, Value::Number(0.05));
+        // Register a sheet-scoped Rate on the same sheet.
+        rt.set_sheet_scoped_name(s0, "Rate", NamedTarget::Constant(Value::Number(0.21)))
+            .unwrap();
+        // Recompute — the cached plan should have been invalidated, so
+        // we re-bind and pick up the sheet-scoped 0.21.
+        let _ = rt.recompute_all();
+        drop(rt);
+        assert_eq!(
+            wb.read(ql_types::Address::new(s0, 0, 0)),
+            Value::Number(0.21),
+            "cache invalidation: sheet-scoped value should win after registration"
+        );
     }
 }

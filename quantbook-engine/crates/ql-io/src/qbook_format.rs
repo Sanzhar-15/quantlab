@@ -236,6 +236,20 @@ pub enum QbookError {
         col: u32,
         why: &'static str,
     },
+
+    /// **W5-93 (Phase 4.6.E closure):** sheet name in the envelope's
+    /// `[[sheets]]` section failed `Workbook::validate_sheet_name`
+    /// (empty, duplicate under canonical comparison, or contains an
+    /// Excel-reserved character `: \ / ? * [ ]`). Codex HIGH-1: the
+    /// loader previously accepted any name silently, so a hand-edited
+    /// `.qbook` could enter storage with conflicting sheets.
+    #[error("malformed sheet {sheet_id}: name {name:?} ({source})")]
+    MalformedSheet {
+        sheet_id: u16,
+        name: String,
+        #[source]
+        source: ql_storage::SheetNameError,
+    },
 }
 
 /// TOML envelope for the workbook. Top-level metadata.
@@ -1267,10 +1281,21 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                 found: sheet_env.id,
             });
         }
-        let sheet_id = wb.add_sheet_with_chunk_rows(sheet_env.name.clone(), sheet_env.chunk_rows);
+        // W5-93 (Phase 4.6.E closure): route through the fallible variant
+        // so a malformed `.qbook` (hand-edited duplicate name, reserved
+        // char, empty) surfaces as `QbookError::MalformedSheet` rather
+        // than a process-killing panic. Previously the loader silently
+        // accepted any name.
+        let sheet_id = wb
+            .try_add_sheet_with_chunk_rows(sheet_env.name.clone(), sheet_env.chunk_rows)
+            .map_err(|source| QbookError::MalformedSheet {
+                sheet_id: sheet_env.id,
+                name: sheet_env.name.clone(),
+                source,
+            })?;
         assert_eq!(
             sheet_id as usize, expected_id,
-            "Workbook::add_sheet_with_chunk_rows returned non-sequential id — programmer error in ql-storage"
+            "Workbook::try_add_sheet_with_chunk_rows returned non-sequential id — programmer error in ql-storage"
         );
 
         // **W5-81 (Phase 4.5.D part 5):** apply the per-sheet cell-format
@@ -3133,5 +3158,61 @@ entries = [
             loaded.names().lookup_ci("R"),
             Some(NamedTarget::Constant(Value::Number(n))) if n == 0.5
         ));
+    }
+
+    // ===== W5-93 (Phase 4.6.E closure) sheet-name validation at load =====
+
+    #[test]
+    fn load_rejects_envelope_with_duplicate_canonical_sheet_names() {
+        // Codex HIGH-1: a hand-edited `.qbook` with two sheets sharing
+        // a canonical name (`Sheet1` + `SHEET1`) must surface as
+        // MalformedSheet rather than enter storage silently.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dup_sheets.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = r#"
+schema_version = 5
+name = "dup_sheets"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "Sheet1", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+  { id = 1, name = "SHEET1", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        fs::write(path.join("sheets").join("1.jsonl"), "").unwrap();
+
+        let result = load_workbook(&path);
+        assert!(
+            matches!(
+                &result,
+                Err(QbookError::MalformedSheet { sheet_id: 1, name, .. }) if name == "SHEET1"
+            ),
+            "expected MalformedSheet at id=1 for SHEET1, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_envelope_with_reserved_char_sheet_name() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad_sheet.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = r#"
+schema_version = 5
+name = "bad_sheet"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "Bad:Sheet", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+
+        let result = load_workbook(&path);
+        assert!(
+            matches!(&result, Err(QbookError::MalformedSheet { .. })),
+            "expected MalformedSheet, got {result:?}"
+        );
     }
 }
