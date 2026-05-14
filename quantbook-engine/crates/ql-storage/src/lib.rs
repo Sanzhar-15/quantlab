@@ -19,6 +19,7 @@ pub mod format_overlay;
 pub mod overlay;
 pub mod sheet;
 pub mod spill;
+pub mod tables;
 pub mod workbook;
 
 pub use column::{chunk_rows_from_env, ColumnStore, DEFAULT_CHUNK_ROWS};
@@ -27,6 +28,7 @@ pub use format_overlay::CellFormatOverlay;
 pub use overlay::SparseOverlay;
 pub use sheet::{Bounds, Sheet};
 pub use spill::{SpillAnchorTable, SpillBlockError, SpillNotFoundError, SpillShape};
+pub use tables::{TableColumn, TableMetadata, TableTable, TotalsFunction};
 pub use workbook::{NameTable, NameTableError, NamedTarget, SheetNameError, Workbook};
 
 #[cfg(test)]

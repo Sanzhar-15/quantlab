@@ -272,6 +272,12 @@ pub struct Workbook {
     /// computed overlays at every target cell. See
     /// `crates/ql-storage/src/spill.rs` module docs.
     spill_anchors: crate::SpillAnchorTable,
+    /// **W5-110 (Phase 4.8.A):** workbook-level table registry. Mirrors
+    /// `names` (the `NameTable`). Mutation API lands in 4.8.H+ via
+    /// `WorkbookRuntime::create_table` etc.; direct access here is for
+    /// the qbook loader + tests. See `crates/ql-storage/src/tables.rs`
+    /// module docs.
+    tables: crate::TableTable,
 }
 
 impl Workbook {
@@ -441,6 +447,45 @@ impl Workbook {
     /// runtime registration of defined names.
     pub fn names_mut(&mut self) -> &mut NameTable {
         &mut self.names
+    }
+
+    // ===== W5-110 (Phase 4.8.A): table registry =====
+
+    /// **W5-110 (Phase 4.8.A):** read access to the workbook's table
+    /// registry. See `crate::TableTable` and the design doc at
+    /// `docs/architecture/2026-05-14-structured-references-and-tables.md`.
+    pub fn tables(&self) -> &crate::TableTable {
+        &self.tables
+    }
+
+    /// **W5-110 (Phase 4.8.A) — LOW-LEVEL.** Mutable access to the
+    /// table registry. Bypasses the op log silently; product mutations
+    /// go through `WorkbookRuntime::create_table` etc. (4.8.H+) which
+    /// emit op-log entries. Direct callers: qbook loader, tests,
+    /// engine-internal reconstruction.
+    pub fn tables_mut(&mut self) -> &mut crate::TableTable {
+        &mut self.tables
+    }
+
+    /// **W5-110 (Phase 4.8.A):** convenience case-insensitive table
+    /// lookup. Returns `None` if no table with that name exists.
+    pub fn lookup_table(&self, name: &str) -> Option<&crate::TableMetadata> {
+        self.tables.lookup(name)
+    }
+
+    /// **W5-110 (Phase 4.8.A):** reverse lookup — which table contains
+    /// the given cell, if any? Used by:
+    /// - the binder for `[@Col]` resolution.
+    /// - `create_table` / `resize_table` overlap validation.
+    /// - `write_spill` to block spill anchors inside table footprints
+    ///   (design § 4.3 invariant #5).
+    pub fn table_at(
+        &self,
+        sheet: SheetId,
+        row: RowId,
+        col: ColId,
+    ) -> Option<&crate::TableMetadata> {
+        self.tables.table_at(ql_types::Address::new(sheet, row, col))
     }
 
     /// Phase 2A.1 convenience: register a name → target binding on the workbook's
