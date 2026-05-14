@@ -1156,6 +1156,57 @@ impl<'a> WorkbookRuntime<'a> {
             }
         }
 
+        // **W5-104 (Phase 4.7.K): spill-aware set_value via
+        // immediate-dissolve.** Mirrors set_formula's 4.7.J.5 path.
+        // Per design § 10.2 (updated to document both immediate and
+        // deferred algorithms — we ship immediate for consistency
+        // with set_formula).
+        //
+        // Two spill-relevant scenarios:
+        //
+        // a) This cell is a TARGET of someone else's spill: dissolve
+        //    that host spill so its anchor re-emits #SPILL! next
+        //    recompute and the new user value isn't shadowed by the
+        //    host's prior computed-overlay write.
+        //
+        // b) This cell is itself a SPILL ANCHOR (had a formula like
+        //    `={1,2,3}`): dissolve its own spill so the targets become
+        //    Blank when the new literal lands at the anchor.
+        //
+        // The host-vs-self distinction matters because `clear_spill_at`
+        // is anchor-keyed: case (a) needs `clear_spill_at(host_anchor)`,
+        // case (b) needs `clear_spill_at((sheet, row, col))`. Both can
+        // happen for the same write only if (sheet, row, col) is both
+        // an anchor of its own spill and a target of another — which
+        // `SpillAnchorTable::register` prevents (no overlapping
+        // rectangles).
+        let dissolved_host: Option<((SheetId, RowId, ColId), SpillShape)> = {
+            if let Some(host_anchor) = self.workbook.spill_target_anchor(sheet, row, col) {
+                if host_anchor != (sheet, row, col) {
+                    let host_shape = self
+                        .workbook
+                        .spill_anchor_at(host_anchor.0, host_anchor.1, host_anchor.2)
+                        .copied()
+                        .expect(
+                            "spill_target_anchor returned Some — anchor MUST be in anchors table",
+                        );
+                    let _ = self.workbook.clear_spill_at(host_anchor);
+                    Some((host_anchor, host_shape))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        // Case (b): self-anchored spill — dissolve before write.
+        // Captures the OLD shape so the calcgraph hook pass can fire
+        // on_set_value at the dissolved footprint (mirrors 4.7.J.3).
+        let dissolved_self_shape = self.workbook.spill_anchor_at(sheet, row, col).copied();
+        if dissolved_self_shape.is_some() {
+            let _ = self.workbook.clear_spill_at((sheet, row, col));
+        }
+
         self.workbook.put_at(sheet, row, col, value);
         self.workbook.clear_formula(sheet, row, col);
 
@@ -1167,6 +1218,76 @@ impl<'a> WorkbookRuntime<'a> {
             g.on_set_value(sheet, row, col);
             if had_formula {
                 g.on_clear_formula(sheet, row, col);
+            }
+        }
+
+        // **W5-104**: dirty-propagation + re-extraction for dissolved
+        // spill footprints. Mirrors set_formula's 4.7.J.3 + 4.7.J.4
+        // patterns. Skip the entire pass if no spill state changed.
+        let any_dissolution = dissolved_host.is_some() || dissolved_self_shape.is_some();
+        if any_dissolution {
+            // Hook pass: fire on_set_value at each non-anchor cell in
+            // the dissolved footprint(s), plus mark_dirty for the host
+            // anchor (since its NodeId isn't in cell_to_formulas for
+            // itself).
+            if let Some(g) = self.graph.as_deref_mut() {
+                use std::collections::HashSet;
+                let mut affected: HashSet<(SheetId, RowId, ColId)> = HashSet::new();
+                // Self-anchored dissolution: non-anchor cells get dirtied.
+                if let Some(shape) = dissolved_self_shape {
+                    for dr in 0..shape.rows {
+                        for dc in 0..shape.cols {
+                            if dr == 0 && dc == 0 {
+                                continue;
+                            }
+                            affected.insert((sheet, row + dr, col + dc));
+                        }
+                    }
+                }
+                // Host-anchored dissolution: non-anchor cells get
+                // dirtied (host anchor handled via mark_dirty below).
+                // The edited cell itself is ALWAYS in the host footprint
+                // (it's why we're here); on_set_value above already
+                // dirtied it, so skip duplicate add.
+                if let Some((host_anchor, host_shape)) = dissolved_host {
+                    for dr in 0..host_shape.rows {
+                        for dc in 0..host_shape.cols {
+                            if dr == 0 && dc == 0 {
+                                continue; // host anchor — mark_dirty below
+                            }
+                            let cell = (host_anchor.0, host_anchor.1 + dr, host_anchor.2 + dc);
+                            if cell == (sheet, row, col) {
+                                continue; // already dirtied via on_set_value above
+                            }
+                            affected.insert(cell);
+                        }
+                    }
+                }
+                for (s, r, c) in affected {
+                    g.on_set_value(s, r, c);
+                }
+                // Host anchor's formula node: mark dirty directly so
+                // recompute_dirty re-evaluates and emits #SPILL!.
+                if let Some((host_anchor, _)) = dissolved_host {
+                    if let Some(node) = g.cell_node_for(host_anchor.0, host_anchor.1, host_anchor.2)
+                    {
+                        g.mark_dirty(node);
+                    }
+                }
+            }
+            // Re-extract readers in dissolved footprints so producer-
+            // alias deps re-route back to literal cell addresses.
+            if let Some(shape) = dissolved_self_shape {
+                self.reextract_spill_footprint_readers(sheet, row, col, Some(shape), None);
+            }
+            if let Some((host_anchor, host_shape)) = dissolved_host {
+                self.reextract_spill_footprint_readers(
+                    host_anchor.0,
+                    host_anchor.1,
+                    host_anchor.2,
+                    Some(host_shape),
+                    None,
+                );
             }
         }
 
@@ -7358,5 +7479,172 @@ mod tests {
             Some(ql_storage::SpillShape::new(1, 3))
         );
         assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Number(3.0));
+    }
+
+    // ===== W5-104 (Phase 4.7.K) — set_value spill invalidation =====
+    //
+    // Per design § 10.2 (immediate-dissolve variant, matching
+    // set_formula's 4.7.J.5): typing a literal value into a spill
+    // target cell dissolves the host spill; typing into a spill
+    // anchor cell dissolves its own spill.
+
+    /// set_value at a spill TARGET cell dissolves the host spill.
+    /// A1 spills A1..C1; user types `5` at B1. After: host spill
+    /// gone, B1 = 5, C1 = Blank, A1 still has formula text "{1,2,3}"
+    /// (re-eval at next recompute emits #SPILL!).
+    #[test]
+    fn set_value_at_spill_target_dissolves_host_spill() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+        rt.set_value(0, 0, 1, Value::Number(5.0)).unwrap();
+        drop(rt);
+
+        assert_eq!(wb.spill_anchor_at(0, 0, 0), None, "host spill dissolved");
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Blank);
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(5.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Blank);
+        // Anchor formula text preserved.
+        assert_eq!(
+            wb.formula_at(0, 0, 0).map(|s| s.as_ref()),
+            Some("{1, 2, 3}")
+        );
+    }
+
+    /// set_value at a spill ANCHOR cell dissolves its own spill.
+    /// A1 spills A1..C1; user types `99` at A1. After: spill gone,
+    /// A1 = 99 (user lane), B1 = Blank, C1 = Blank, A1 has no
+    /// formula text anymore.
+    #[test]
+    fn set_value_at_spill_anchor_dissolves_own_spill() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+        rt.set_value(0, 0, 0, Value::Number(99.0)).unwrap();
+        drop(rt);
+
+        assert_eq!(wb.spill_anchor_at(0, 0, 0), None);
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Number(99.0)
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Blank);
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Blank);
+        // Formula text removed (set_value over a formula clears the formula).
+        assert!(wb.formula_at(0, 0, 0).is_none());
+    }
+
+    /// Negative control: set_value at a cell that isn't part of any
+    /// spill behaves exactly as before this commit.
+    #[test]
+    fn set_value_at_non_spill_cell_unchanged() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+        // D1 is outside A1's 1×3 footprint.
+        rt.set_value(0, 0, 3, Value::Number(99.0)).unwrap();
+        drop(rt);
+
+        // Host spill still active.
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(1, 3))
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Number(1.0));
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 3)),
+            Value::Number(99.0)
+        );
+    }
+
+    /// set_value at spill target marks the host anchor's NodeId dirty
+    /// so recompute_dirty re-evaluates and produces #SPILL!. Mirrors
+    /// 4.7.J #127 host-anchor-dirty test.
+    #[test]
+    fn set_value_at_spill_target_marks_host_anchor_dirty() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+        }
+        let a1 = graph.cell_node_for(0, 0, 0).unwrap();
+        let _ = graph.take_dirty();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 1, Value::Number(5.0)).unwrap();
+        }
+        assert!(
+            graph.is_dirty(a1),
+            "host anchor A1 must be dirty after set_value at target B1"
+        );
+    }
+
+    /// set_value at spill target re-extracts readers aliased to the
+    /// host anchor. X1 = C1 was aliased to A1 via 4.7.I; after
+    /// set_value at B1 dissolves A1's spill, X1's dep should be
+    /// re-extracted to literal (0,0,2) and X1 should be dirty.
+    #[test]
+    fn set_value_at_spill_target_reextracts_aliased_readers() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+            rt.set_formula(0, 0, 23, "C1").unwrap(); // X1 = C1, aliased to A1
+        }
+        let x1 = graph.cell_node_for(0, 0, 23).unwrap();
+        assert_eq!(
+            graph.formula_deps(x1).unwrap().cells,
+            vec![(0, 0, 0)],
+            "X1 starts aliased to host anchor A1"
+        );
+        let _ = graph.take_dirty();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 0, 1, Value::Number(5.0)).unwrap();
+        }
+        // X1's dep re-extracted to literal C1.
+        assert_eq!(
+            graph.formula_deps(x1).unwrap().cells,
+            vec![(0, 0, 2)],
+            "X1's dep re-extracted to literal C1 after host dissolution"
+        );
+        assert!(
+            graph.is_dirty(x1),
+            "X1 must be dirty after re-extraction (dep moved)"
+        );
+    }
+
+    /// set_value over an existing formula at a spill anchor — fires
+    /// BOTH the spill dissolution AND the formula-clearing path. The
+    /// op-log should record PutValue + ClearFormula in a BatchCommit.
+    #[test]
+    fn set_value_over_spill_anchor_formula_emits_batch_commit() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.set_formula(0, 0, 0, "{1, 2, 3}").unwrap();
+            rt.set_value(0, 0, 0, Value::Number(42.0)).unwrap();
+        }
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ops.len(), 2, "PutFormula + BatchCommit");
+        match &ops[1] {
+            Op::BatchCommit { ops: batch } => {
+                assert_eq!(batch.len(), 2);
+                assert!(matches!(batch[0], Op::PutValue { .. }));
+                assert!(matches!(batch[1], Op::ClearFormula { .. }));
+            }
+            other => panic!("expected BatchCommit, got {other:?}"),
+        }
     }
 }
