@@ -1870,7 +1870,7 @@ impl<'a> WorkbookRuntime<'a> {
         let mut failures: Vec<RecomputeFailure> = Vec::new();
 
         for (sheet, row, col, formula_text) in entries {
-            match self.try_recompute_one_cached(sheet, &formula_text) {
+            match self.try_recompute_one_cached(sheet, row, col, &formula_text) {
                 Ok(value) => {
                     // Phase 3.5 (CORR-25): formula outputs route to the
                     // COMPUTED overlay, never the user lane.
@@ -2065,7 +2065,7 @@ impl<'a> WorkbookRuntime<'a> {
             // post-bind — call a slightly-expanded helper that
             // returns the value AND the SimdShape classification.
             let agg_cache = session.aggregate_cache();
-            match self.try_recompute_with_simd_profile(sheet, &text, agg_cache) {
+            match self.try_recompute_with_simd_profile(sheet, row, col, &text, agg_cache) {
                 Ok((value, simd_eligible)) => {
                     if simd_eligible {
                         simd_classified += 1;
@@ -2118,10 +2118,14 @@ impl<'a> WorkbookRuntime<'a> {
     fn try_recompute_one_cached(
         &mut self,
         sheet: SheetId,
+        row: RowId,
+        col: ColId,
         formula_text: &Arc<str>,
     ) -> Result<Value, RuntimeError> {
         self.try_recompute_with_aggregate_cache(
             sheet,
+            row,
+            col,
             formula_text,
             &crate::aggregate_cache::NoAggregateCache,
         )
@@ -2132,13 +2136,19 @@ impl<'a> WorkbookRuntime<'a> {
     /// `SUM(Sales)` / `AVERAGE(Sales)` calls consult + populate the
     /// cache. Used by `recompute_dirty` which owns a session-side
     /// `InMemAggregateCache`.
+    ///
+    /// **W5-103 (#128):** also takes `row, col` so the spill-writeback
+    /// branch inside `try_recompute_with_simd_profile` can materialize
+    /// arrays at the correct anchor cell.
     fn try_recompute_with_aggregate_cache(
         &mut self,
         sheet: SheetId,
+        row: RowId,
+        col: ColId,
         formula_text: &Arc<str>,
         agg_cache: &dyn crate::aggregate_cache::AggregateCache,
     ) -> Result<Value, RuntimeError> {
-        self.try_recompute_with_simd_profile(sheet, formula_text, agg_cache)
+        self.try_recompute_with_simd_profile(sheet, row, col, formula_text, agg_cache)
             .map(|(v, _)| v)
     }
 
@@ -2152,6 +2162,8 @@ impl<'a> WorkbookRuntime<'a> {
     fn try_recompute_with_simd_profile(
         &mut self,
         sheet: SheetId,
+        row: RowId,
+        col: ColId,
         formula_text: &Arc<str>,
         agg_cache: &dyn crate::aggregate_cache::AggregateCache,
     ) -> Result<(Value, bool), RuntimeError> {
@@ -2183,10 +2195,61 @@ impl<'a> WorkbookRuntime<'a> {
         // Pure function over the plan tree; no allocation.
         let simd_eligible = crate::lower::classify(plan.as_ref()).is_applicable();
 
-        let env = WorkbookEnv::new(self.workbook);
-        let value =
-            crate::scalar::eval_scalar_with_cache(plan.as_ref(), &env, self.registry, agg_cache);
-        Ok((value, simd_eligible))
+        // **W5-103 megaudit HIGH-2 closure (#128, all 3 reviewers
+        // cross-confirmed):** route through `eval_at_cell_boundary`
+        // (same entry set_formula uses) so a top-level
+        // `ExprPlan::Array` produces an `EvalResult::Array` here and
+        // materializes via `write_spill` — instead of collapsing to
+        // `#CALC!` (which `eval_scalar_with_cache` returns per the
+        // scalar-context contract at scalar.rs:95).
+        //
+        // Without this, op-log replay of `PutFormula { text: "{1,2,3}" }`
+        // followed by `recompute_all` would write #CALC! at the
+        // anchor instead of spilling — design § 7.3/§ 12.3
+        // "load → recompute re-derives spills" contract broken,
+        // persistence layer (4.7.L) hard-blocked.
+        //
+        // The clear-old + write_spill sequence mirrors set_formula's
+        // 4.7.J.2 pattern. Unlike set_formula, we DO NOT fire
+        // on_set_formula / on_set_value / re-extract hooks: recompute
+        // doesn't change a formula's identity, only its computed
+        // value. Downstream readers were already dirtied by whatever
+        // made THIS formula dirty in the first place.
+        let result: crate::eval_result::EvalResult = {
+            let env = WorkbookEnv::new(self.workbook);
+            crate::scalar::eval_at_cell_boundary(plan.as_ref(), &env, self.registry, agg_cache)
+        };
+
+        let anchor_value = match result {
+            crate::eval_result::EvalResult::Scalar(v) => {
+                // If this cell was previously a spill anchor but now
+                // evaluates scalar (e.g. an input changed across the
+                // array/scalar boundary), dissolve the prior spill so
+                // the targets don't keep orphan computed values.
+                self.workbook.clear_spill_if_present((sheet, row, col));
+                v
+            }
+            crate::eval_result::EvalResult::Array(array) => {
+                // Always clear prior spill before re-spilling
+                // (design § 8.3). write_spill assumes a clean anchor.
+                self.workbook.clear_spill_if_present((sheet, row, col));
+                // Clone the formula text Arc so write_spill can
+                // put_formula it (idempotent — the formula is
+                // already associated with this cell). `expect` per
+                // CLAUDE.md no-fallbacks: we're recomputing, so
+                // formula_at MUST be Some.
+                let formula_text_arc = self
+                    .workbook
+                    .formula_at(sheet, row, col)
+                    .cloned()
+                    .expect("recompute: formula_at MUST be Some — we're recomputing this cell");
+                let (anchor_value, _new_shape) =
+                    self.write_spill(sheet, row, col, array, formula_text_arc);
+                anchor_value
+            }
+        };
+
+        Ok((anchor_value, simd_eligible))
     }
 }
 
@@ -7186,5 +7249,109 @@ mod tests {
             2,
             "clear_formula at 1x3 anchor must fire on_set_value for B1 and C1"
         );
+    }
+
+    // ===== W5-103 megaudit HIGH-2 — recompute paths spill correctly =====
+    //
+    // Closes the all-3-reviewer-confirmed HIGH that op-log replay
+    // + recompute_all collapsed spilled formulas to #CALC! because
+    // the recompute path went through `eval_scalar_with_cache`
+    // directly. With the cell-boundary refactor, recompute now
+    // dispatches Array results through `write_spill`, materializing
+    // the full footprint on every recompute pass.
+
+    /// HIGH-2 acceptance: op-log replay of `PutFormula { text:
+    /// "{1, 2, 3}" }` followed by `recompute_all` MUST produce the
+    /// spill, not `#CALC!`. This is the canonical persistence
+    /// round-trip — the design § 7.3 / § 12.3 "load → recompute
+    /// re-derives spills" contract.
+    #[test]
+    fn recompute_all_materializes_spill_for_array_formula() {
+        let mut wb = make_runtime_workbook();
+        // Simulate the post-replay state: formula text installed, no
+        // computed values, no spill anchor entry. (Op::PutFormula's
+        // replay handler at crates/ql-oplog/src/replay.rs only sets
+        // the formula text; recompute is left to the caller.)
+        wb.put_formula(0, 0, 0, "{1, 2, 3}");
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        let result = rt.recompute_all();
+        drop(rt);
+        assert_eq!(result.attempted, 1);
+        assert_eq!(result.succeeded, 1);
+        assert!(result.failures.is_empty());
+
+        // Spill registered + targets materialized.
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(1, 3)),
+            "recompute_all must register the spill anchor"
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 0)), Value::Number(1.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 1)), Value::Number(2.0));
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Number(3.0));
+    }
+
+    /// recompute_all on a SCALAR formula keeps its existing behavior
+    /// — pre-fix this case used `eval_scalar_with_cache` directly,
+    /// which is what the refactor preserves for non-Array results.
+    /// Regression check.
+    #[test]
+    fn recompute_all_scalar_formula_unchanged() {
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Number(10.0));
+        wb.put_formula(0, 1, 0, "A1 * 2");
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let result = rt.recompute_all();
+        drop(rt);
+        assert_eq!(result.succeeded, 1);
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 1, 0)),
+            Value::Number(20.0)
+        );
+    }
+
+    /// recompute_all on an array formula that would spill out of
+    /// bounds writes #SPILL! at the anchor — same as set_formula's
+    /// bounds-check arm. Pre-fix this case produced #CALC! too
+    /// (silent corruption); post-fix it produces #SPILL!.
+    #[test]
+    fn recompute_all_out_of_bounds_spill_writes_spill_error() {
+        let mut wb = make_runtime_workbook();
+        // Anchor at MAX_ROW with 3-row vertical array → out of bounds.
+        wb.put_formula(0, MAX_ROW, 0, "{1; 2; 3}");
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let result = rt.recompute_all();
+        drop(rt);
+        assert_eq!(result.succeeded, 1);
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, MAX_ROW, 0)),
+            Value::Error(ErrorValue::Spill)
+        );
+        assert_eq!(wb.spill_anchor_at(0, MAX_ROW, 0), None);
+    }
+
+    /// Re-run of recompute_all on an already-spilled formula must
+    /// be idempotent: the spill stays registered with the same
+    /// shape, the target values match. Validates that
+    /// `clear_spill_if_present` inside the recompute path correctly
+    /// dissolves the old footprint before re-spilling.
+    #[test]
+    fn recompute_all_array_formula_idempotent_across_two_passes() {
+        let mut wb = make_runtime_workbook();
+        wb.put_formula(0, 0, 0, "{1, 2, 3}");
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.recompute_all();
+        rt.recompute_all();
+        drop(rt);
+        assert_eq!(
+            wb.spill_anchor_at(0, 0, 0).copied(),
+            Some(ql_storage::SpillShape::new(1, 3))
+        );
+        assert_eq!(wb.read(ql_types::Address::new(0, 0, 2)), Value::Number(3.0));
     }
 }
