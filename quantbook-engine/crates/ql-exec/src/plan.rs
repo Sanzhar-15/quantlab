@@ -365,7 +365,7 @@ fn bind_with_context<L: NameLookup>(
             // Phase 2A.1: resolve the name via the active NameTable; Phase 2A.6
             // audit H2 uses case-insensitive lookup in the `NameTable` impl so
             // every entry point canonicalizes uniformly.
-            match names.lookup_named_target(name) {
+            match names.lookup_named_target(name, owning_sheet) {
                 Some(ResolvedName::Cell(sheet, row, col, abs_col, abs_row)) => {
                     Ok(ExprPlan::CellRef {
                         sheet,
@@ -435,10 +435,16 @@ pub enum ResolvedName {
     ErrorValue(ErrorValue),
 }
 
-/// Name-resolution interface. ql-exec stays decoupled from ql-storage; the
-/// production caller wires a NameTable through this trait.
+/// Name-resolution interface. `ql-exec` stays decoupled from `ql-storage`;
+/// the production caller wires a `Workbook` through this trait.
+///
+/// **W5-92 (Phase 4.6.D):** the trait now takes `owning_sheet` so impls
+/// that hold scoped tables (the `Workbook` blanket impl in
+/// `env.rs`) can run the two-tier chain: sheet-scoped first, then
+/// workbook-scoped. Impls without a sheet axis (legacy
+/// `NameLookup for NameTable`, `EmptyNameLookup`) ignore the parameter.
 pub trait NameLookup {
-    fn lookup_named_target(&self, name: &str) -> Option<ResolvedName>;
+    fn lookup_named_target(&self, name: &str, owning_sheet: SheetId) -> Option<ResolvedName>;
 }
 
 /// Default empty-lookup resolver used by the legacy `bind()` entry point. Always
@@ -446,7 +452,7 @@ pub trait NameLookup {
 struct EmptyNameLookup;
 
 impl NameLookup for EmptyNameLookup {
-    fn lookup_named_target(&self, _name: &str) -> Option<ResolvedName> {
+    fn lookup_named_target(&self, _name: &str, _owning_sheet: SheetId) -> Option<ResolvedName> {
         None
     }
 }

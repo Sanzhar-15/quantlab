@@ -53,6 +53,7 @@ fn realistic_op_sequence() -> Vec<Op> {
     });
     // Named constant.
     ops.push(Op::SetName {
+        scope: None,
         name: "TaxRate".to_owned(),
         target: NamedTargetWire::Constant {
             value: CellWireValue::Number(0.21),
@@ -133,9 +134,25 @@ fn apply_producer_side(ops: &[Op], wb: &mut Workbook) {
             Op::ClearFormula { sheet, row, col } => {
                 wb.clear_formula(*sheet, *row, *col);
             }
-            Op::SetName { name, target } => {
+            Op::SetName {
+                scope,
+                name,
+                target,
+            } => {
                 let t = target.to_target(name).unwrap();
-                wb.set_name(name, t).unwrap();
+                match scope {
+                    None => {
+                        wb.set_name(name, t).unwrap();
+                    }
+                    Some(sheet) => {
+                        // W5-92 (Phase 4.6.D): sheet-scoped name; producer
+                        // mirrors replay by routing through Sheet::set_scoped_name.
+                        wb.sheet_mut(*sheet)
+                            .expect("producer-side sheet lookup must succeed")
+                            .set_scoped_name(name, t)
+                            .expect("producer-side set_scoped_name must succeed");
+                    }
+                }
             }
             Op::AddSheet { name, chunk_rows } => {
                 wb.add_sheet_with_chunk_rows(name.clone(), *chunk_rows);

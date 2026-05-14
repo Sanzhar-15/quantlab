@@ -66,9 +66,25 @@ pub enum Op {
         col: ColId,
     },
 
-    /// Register a defined name. Mirrors `Workbook::set_name`. Reserved-name
-    /// refusal propagates at replay time as `ReplayError::NameRejected`.
+    /// Register a defined name. Mirrors `Workbook::set_name` when
+    /// `scope` is `None`, and `Sheet::set_scoped_name` when `scope` is
+    /// `Some(sheet_id)`. **W5-92 (Phase 4.6.D)** added the optional
+    /// `scope` field per design doc § 8.2 / Codex MEDIUM-4: a single
+    /// op variant covers both scopes rather than two separate ops.
+    ///
+    /// Wire compat: `#[serde(default, skip_serializing_if = "Option::is_none")]`
+    /// keeps v3+old ops deserializing unchanged (missing field → `None`
+    /// = workbook scope, the historical behavior). Sheet-scoped names
+    /// emit the field; workbook-scoped names omit it.
+    ///
+    /// Replay: routes to `Workbook::set_name` (scope `None`) or
+    /// `Sheet::set_scoped_name` (scope `Some`); reserved-name refusal
+    /// surfaces as `ReplayError::NameRejected` in either path. A
+    /// `scope: Some(id)` referencing an unknown sheet surfaces as
+    /// `ReplayError::InvalidSheet`.
     SetName {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<SheetId>,
         name: String,
         target: NamedTargetWire,
     },

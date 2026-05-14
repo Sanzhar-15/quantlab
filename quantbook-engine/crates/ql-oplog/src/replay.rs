@@ -252,17 +252,47 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             workbook.clear_formula(*sheet, *row, *col);
             Ok(())
         }
-        Op::SetName { name, target } => {
+        Op::SetName {
+            scope,
+            name,
+            target,
+        } => {
             let target = target
                 .to_target(name)
                 .map_err(|source| ReplayError::NamedTargetDecode { index, source })?;
-            workbook
-                .set_name(name, target)
-                .map_err(|source| ReplayError::NameRejected {
-                    index,
-                    name: name.clone(),
-                    source,
-                })?;
+            match scope {
+                None => {
+                    // Workbook-scoped (historical path).
+                    workbook.set_name(name, target).map_err(|source| {
+                        ReplayError::NameRejected {
+                            index,
+                            name: name.clone(),
+                            source,
+                        }
+                    })?;
+                }
+                Some(sheet) => {
+                    // **W5-92 (Phase 4.6.D):** sheet-scoped. Validate sheet
+                    // first so an unknown id surfaces as InvalidSheet, not
+                    // a panicking out-of-bounds index.
+                    let sheet_count = workbook.sheet_count();
+                    let sheet_ref =
+                        workbook
+                            .sheet_mut(*sheet)
+                            .ok_or(ReplayError::InvalidSheet {
+                                index,
+                                sheet: *sheet,
+                                sheet_count,
+                            })?;
+                    sheet_ref.set_scoped_name(name, target).map_err(|source| {
+                        ReplayError::NameRejected {
+                            index,
+                            name: name.clone(),
+                            source,
+                        }
+                    })?;
+                }
+            }
             Ok(())
         }
         Op::AddSheet { name, chunk_rows } => {
@@ -507,6 +537,7 @@ mod tests {
     fn replay_set_name_registers_target() {
         let mut log = OpLog::new();
         log.append(Op::SetName {
+            scope: None,
             name: "TaxRate".to_owned(),
             target: NamedTargetWire::Constant {
                 value: CellWireValue::Number(0.21),
@@ -636,6 +667,7 @@ mod tests {
     fn replay_reserved_name_returns_name_rejected() {
         let mut log = OpLog::new();
         log.append(Op::SetName {
+            scope: None,
             name: "AI".to_owned(),
             target: NamedTargetWire::Constant {
                 value: CellWireValue::Number(42.0),
@@ -995,6 +1027,105 @@ mod tests {
         assert_eq!(
             wb.formula_at(1, 0, 0).map(|s| s.as_ref().to_owned()),
             Some("SX!A1 + 1".to_owned())
+        );
+    }
+
+    // ===== W5-92 (Phase 4.6.D) Op::SetName scoped variant =====
+
+    #[test]
+    fn replay_set_name_sheet_scoped_lands_on_sheet() {
+        let mut log = OpLog::new();
+        log.append(Op::AddSheet {
+            name: "S1".to_owned(),
+            chunk_rows: 1024,
+        })
+        .unwrap();
+        log.append(Op::SetName {
+            scope: Some(0),
+            name: "Rate".to_owned(),
+            target: NamedTargetWire::Constant {
+                value: CellWireValue::Number(0.21),
+            },
+        })
+        .unwrap();
+
+        let mut wb = Workbook::new();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        // Sheet-scoped name present on sheet 0.
+        assert!(matches!(
+            wb.sheet(0).unwrap().scoped_names().lookup_ci("Rate"),
+            Some(ql_storage::NamedTarget::Constant(Value::Number(n))) if n == 0.21
+        ));
+        // Workbook-scoped table is empty (sheet-scoped doesn't bleed up).
+        assert!(wb.names().is_empty());
+    }
+
+    #[test]
+    fn replay_set_name_scope_none_lands_on_workbook() {
+        // Backwards-compat: scope: None (the v3+old wire shape) still
+        // routes to the workbook scope, matching the historical behavior.
+        let mut log = OpLog::new();
+        log.append(Op::SetName {
+            scope: None,
+            name: "Rate".to_owned(),
+            target: NamedTargetWire::Constant {
+                value: CellWireValue::Number(0.10),
+            },
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert!(matches!(
+            wb.names().lookup_ci("Rate"),
+            Some(ql_storage::NamedTarget::Constant(Value::Number(n))) if n == 0.10
+        ));
+        // Sheet 0 has no scoped entry.
+        assert!(wb.sheet(0).unwrap().scoped_names().is_empty());
+    }
+
+    #[test]
+    fn replay_set_name_scope_unknown_sheet_errors() {
+        let mut log = OpLog::new();
+        log.append(Op::SetName {
+            scope: Some(7),
+            name: "X".to_owned(),
+            target: NamedTargetWire::Constant {
+                value: CellWireValue::Number(1.0),
+            },
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        let err = replay_into(&log, &mut wb, &reg).unwrap_err();
+        assert!(
+            matches!(err, ReplayError::InvalidSheet { sheet: 7, .. }),
+            "expected InvalidSheet, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn replay_set_name_scope_reserved_name_rejected() {
+        // The reserved-name guard fires on the sheet-scoped path too.
+        let mut log = OpLog::new();
+        log.append(Op::SetName {
+            scope: Some(0),
+            name: "AI".to_owned(),
+            target: NamedTargetWire::Constant {
+                value: CellWireValue::Number(42.0),
+            },
+        })
+        .unwrap();
+
+        let mut wb = fresh_workbook_with_one_sheet();
+        let reg = default_registry();
+        let err = replay_into(&log, &mut wb, &reg).unwrap_err();
+        assert!(
+            matches!(err, ReplayError::NameRejected { .. }),
+            "expected NameRejected, got {err:?}"
         );
     }
 }

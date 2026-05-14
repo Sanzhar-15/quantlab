@@ -192,6 +192,7 @@ mod tests {
                 col: 0,
             },
             Op::SetName {
+                scope: None,
                 name: "TaxRate".to_owned(),
                 target: NamedTargetWire::Constant {
                     value: CellWireValue::Number(0.21),

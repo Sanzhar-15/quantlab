@@ -8,6 +8,7 @@
 use ql_types::{ColId, RowId, Value};
 
 use crate::column::ColumnStore;
+use crate::workbook::{NameTable, NameTableError, NamedTarget};
 
 /// Conservative dimension tracking: max row and max col ever touched. Reads beyond return
 /// `Blank` either way; `Bounds` exists for serialization + UI viewport sizing.
@@ -32,6 +33,13 @@ pub struct Sheet {
     /// `workbook.formats().lookup(id)` to get the format-string, parse,
     /// and render.
     format_overlay: crate::CellFormatOverlay,
+    /// **W5-92 (Phase 4.6.D):** sheet-scoped defined names. Lookup
+    /// resolves sheet-scoped names first, then falls back to the
+    /// workbook-scoped table; this is the storage half of that chain.
+    /// `WorkbookEnv::lookup_named_target_for_sheet` (in `ql-exec`)
+    /// owns the chain-walking logic. Same canonicalization rules as
+    /// the workbook-scoped `NameTable` (ASCII-uppercase canonical).
+    scoped_names: NameTable,
 }
 
 impl Sheet {
@@ -48,6 +56,7 @@ impl Sheet {
             bounds: Bounds::default(),
             chunk_rows,
             format_overlay: crate::CellFormatOverlay::new(),
+            scoped_names: NameTable::new(),
         }
     }
 
@@ -68,6 +77,39 @@ impl Sheet {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// **W5-92 (Phase 4.6.D):** read access to the per-sheet named-target
+    /// table. Storage-layer surface only — bind-time chain walking
+    /// happens in `ql-exec::env::WorkbookEnv`.
+    pub fn scoped_names(&self) -> &NameTable {
+        &self.scoped_names
+    }
+
+    /// **W5-92 (Phase 4.6.D):** mutable access for loader paths +
+    /// op-log replay. Production callers route through
+    /// `WorkbookRuntime::set_sheet_scoped_name` (which emits
+    /// `Op::SetName { scope: Some(_), .. }`).
+    pub fn scoped_names_mut(&mut self) -> &mut NameTable {
+        &mut self.scoped_names
+    }
+
+    /// **W5-92 (Phase 4.6.D):** register a sheet-scoped name. Mirrors
+    /// `Workbook::set_name` (validate, append, propagate generation).
+    /// Reserved-name guard still applies (CORR-06 / `AI`); callers see
+    /// `NameTableError::Reserved` for those.
+    pub fn set_scoped_name(
+        &mut self,
+        name: &str,
+        target: NamedTarget,
+    ) -> Result<(), NameTableError> {
+        self.scoped_names.set(name, target)
+    }
+
+    /// **W5-92 (Phase 4.6.D):** drop a sheet-scoped name. Idempotent
+    /// (no-op for unknown names).
+    pub fn clear_scoped_name(&mut self, name: &str) {
+        self.scoped_names.clear(name);
     }
 
     /// **Phase 4.6.C (W5-91):** in-place display-name update. Validation
@@ -326,5 +368,63 @@ mod tests {
         assert_eq!(s.read(0, 1), Value::Boolean(true));
         assert_eq!(s.read(0, 2), Value::text("hi"));
         assert_eq!(s.read(0, 3), Value::Error(ErrorValue::Ref));
+    }
+
+    // W5-92 (Phase 4.6.D) — sheet-scoped names.
+
+    #[test]
+    fn scoped_names_empty_by_default() {
+        let s = Sheet::new("S");
+        assert!(s.scoped_names().is_empty());
+    }
+
+    #[test]
+    fn set_scoped_name_registers_canonicalized() {
+        let mut s = Sheet::new("S");
+        s.set_scoped_name("TaxRate", NamedTarget::Constant(Value::Number(0.21)))
+            .unwrap();
+        // Canonicalized (uppercase) on-write, matching workbook-scoped
+        // NameTable behavior.
+        assert!(matches!(
+            s.scoped_names().lookup_ci("taxrate"),
+            Some(NamedTarget::Constant(Value::Number(n))) if n == 0.21
+        ));
+        assert_eq!(s.scoped_names().len(), 1);
+    }
+
+    #[test]
+    fn clear_scoped_name_removes_binding() {
+        let mut s = Sheet::new("S");
+        s.set_scoped_name("X", NamedTarget::Constant(Value::Number(1.0)))
+            .unwrap();
+        assert_eq!(s.scoped_names().len(), 1);
+        s.clear_scoped_name("X");
+        assert_eq!(s.scoped_names().len(), 0);
+        assert!(s.scoped_names().lookup_ci("X").is_none());
+    }
+
+    #[test]
+    fn set_scoped_name_reserved_name_rejected() {
+        let mut s = Sheet::new("S");
+        let err = s
+            .set_scoped_name("AI", NamedTarget::Constant(Value::Number(42.0)))
+            .unwrap_err();
+        // Reserved-name guard fires on the sheet-scoped side too.
+        assert!(matches!(err, crate::workbook::NameTableError::Reserved(_)));
+    }
+
+    #[test]
+    fn scoped_names_independent_across_sheets() {
+        let mut s1 = Sheet::new("S1");
+        let mut s2 = Sheet::new("S2");
+        s1.set_scoped_name("Rate", NamedTarget::Constant(Value::Number(0.21)))
+            .unwrap();
+        s2.set_scoped_name("Rate", NamedTarget::Constant(Value::Number(0.10)))
+            .unwrap();
+        // Same name on different sheets → independent values.
+        let r1 = s1.scoped_names().lookup_ci("Rate");
+        let r2 = s2.scoped_names().lookup_ci("Rate");
+        assert!(matches!(r1, Some(NamedTarget::Constant(Value::Number(n))) if n == 0.21));
+        assert!(matches!(r2, Some(NamedTarget::Constant(Value::Number(n))) if n == 0.10));
     }
 }

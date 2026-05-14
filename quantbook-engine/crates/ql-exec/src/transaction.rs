@@ -212,7 +212,10 @@ impl<'a> WorkbookTransaction<'a> {
         // table is stable for the transaction's lifetime — eager binding is
         // safe and surfaces UnresolvedName / UnsupportedVariant before any
         // writes land.
-        let plan = bind_with_names_and_sheets(&expr, sheet, self.workbook.names(), self.workbook)?;
+        // W5-92 (Phase 4.6.D): pass `&Workbook` for names so the two-tier
+        // sheet-then-workbook scope chain fires; was `self.workbook.names()`
+        // (workbook-scoped only).
+        let plan = bind_with_names_and_sheets(&expr, sheet, self.workbook, self.workbook)?;
         self.ops.push(PendingOp::Formula {
             sheet,
             row,

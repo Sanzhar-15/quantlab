@@ -255,8 +255,47 @@ impl CellEnv for MapEnv {
 // `Expr::NameRef`, so this is a safety net for hand-constructed ASTs / tests; it
 // removes a case-sensitivity footgun without breaking any happy path.
 impl NameLookup for NameTable {
-    fn lookup_named_target(&self, name: &str) -> Option<ResolvedName> {
+    /// Legacy single-table lookup. Ignores `owning_sheet` — used by tests
+    /// that don't need the sheet-scoped chain, and by the legacy
+    /// `bind_with_names` entry point. Production callers should pass
+    /// `&Workbook` (see the blanket impl below) so sheet-scoped names
+    /// resolve correctly per Phase 4.6.D § 7.3.
+    fn lookup_named_target(
+        &self,
+        name: &str,
+        _owning_sheet: ql_types::SheetId,
+    ) -> Option<ResolvedName> {
         named_target_to_resolved(self.lookup_ci(name)?)
+    }
+}
+
+/// **W5-92 (Phase 4.6.D):** the production `NameLookup` impl —
+/// `&Workbook` does the two-tier sheet-then-workbook chain per
+/// design doc § 7.3:
+///
+/// 1. If `owning_sheet`'s `scoped_names` table has the name, return it.
+/// 2. Else, fall back to the workbook-scoped `NameTable`.
+///
+/// This matches Excel's resolution rule: sheet-scoped names shadow
+/// workbook-scoped names with the same identifier when accessed from a
+/// formula on that sheet. The production binder call sites pass
+/// `&self.workbook` for the `names` argument; legacy callers that
+/// passed `self.workbook.names()` get workbook-only behavior (no chain
+/// walk) and won't see sheet-scoped names.
+impl NameLookup for ql_storage::Workbook {
+    fn lookup_named_target(
+        &self,
+        name: &str,
+        owning_sheet: ql_types::SheetId,
+    ) -> Option<ResolvedName> {
+        // Tier 1: sheet-scoped lookup against the owning sheet.
+        if let Some(sheet) = self.sheet(owning_sheet) {
+            if let Some(target) = sheet.scoped_names().lookup_ci(name) {
+                return named_target_to_resolved(target);
+            }
+        }
+        // Tier 2: workbook-scoped fallback.
+        named_target_to_resolved(self.names().lookup_ci(name)?)
     }
 }
 
@@ -369,5 +408,79 @@ mod tests {
             e.eval_context().date_system,
             ql_types::DateSystem::Excel1900
         );
+    }
+
+    // ===== W5-92 (Phase 4.6.D) NameLookup for Workbook chain =====
+
+    #[test]
+    fn name_lookup_for_workbook_resolves_workbook_scoped() {
+        let mut wb = ql_storage::Workbook::new();
+        wb.add_sheet("S");
+        wb.set_name("R", NamedTarget::Constant(Value::Number(0.5)))
+            .unwrap();
+        let resolved = NameLookup::lookup_named_target(&wb, "R", 0);
+        assert!(matches!(resolved, Some(ResolvedName::Number(n)) if n == 0.5));
+    }
+
+    #[test]
+    fn name_lookup_for_workbook_resolves_sheet_scoped_only() {
+        let mut wb = ql_storage::Workbook::new();
+        wb.add_sheet("S0");
+        wb.sheet_mut(0)
+            .unwrap()
+            .set_scoped_name("R", NamedTarget::Constant(Value::Number(0.21)))
+            .unwrap();
+        let resolved = NameLookup::lookup_named_target(&wb, "R", 0);
+        assert!(matches!(resolved, Some(ResolvedName::Number(n)) if n == 0.21));
+    }
+
+    #[test]
+    fn name_lookup_for_workbook_sheet_scoped_shadows_workbook_scoped() {
+        // XS-4-03 acceptance: sheet-scoped beats workbook-scoped at the
+        // owning sheet's lookup. From other sheets, workbook-scoped wins.
+        let mut wb = ql_storage::Workbook::new();
+        wb.add_sheet("S0");
+        wb.add_sheet("S1");
+        wb.set_name("R", NamedTarget::Constant(Value::Number(0.05)))
+            .unwrap();
+        wb.sheet_mut(0)
+            .unwrap()
+            .set_scoped_name("R", NamedTarget::Constant(Value::Number(0.21)))
+            .unwrap();
+
+        // Lookup from sheet 0 → sheet-scoped 0.21 wins.
+        let r0 = NameLookup::lookup_named_target(&wb, "R", 0);
+        assert!(
+            matches!(r0, Some(ResolvedName::Number(n)) if n == 0.21),
+            "expected 0.21 (sheet-scoped) from S0, got {r0:?}"
+        );
+        // Lookup from sheet 1 → workbook-scoped 0.05 wins (S1 has no
+        // scoped "R").
+        let r1 = NameLookup::lookup_named_target(&wb, "R", 1);
+        assert!(
+            matches!(r1, Some(ResolvedName::Number(n)) if n == 0.05),
+            "expected 0.05 (workbook-scoped fallback) from S1, got {r1:?}"
+        );
+    }
+
+    #[test]
+    fn name_lookup_for_workbook_unknown_name_returns_none() {
+        let mut wb = ql_storage::Workbook::new();
+        wb.add_sheet("S");
+        let resolved = NameLookup::lookup_named_target(&wb, "Missing", 0);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn name_lookup_for_workbook_owning_sheet_out_of_range_falls_back() {
+        // Defensive: if `owning_sheet` is OOR (loader/test path), we
+        // can't walk the scoped table — fall back to workbook-scoped.
+        // No panic.
+        let mut wb = ql_storage::Workbook::new();
+        wb.add_sheet("S");
+        wb.set_name("R", NamedTarget::Constant(Value::Number(7.0)))
+            .unwrap();
+        let resolved = NameLookup::lookup_named_target(&wb, "R", 99);
+        assert!(matches!(resolved, Some(ResolvedName::Number(n)) if n == 7.0));
     }
 }

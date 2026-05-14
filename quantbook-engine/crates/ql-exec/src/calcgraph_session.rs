@@ -657,12 +657,10 @@ impl CalcgraphSession {
     ) -> Result<ExprPlan, RuntimeError> {
         let tokens = lex(text)?;
         let expr = parse(tokens)?;
-        Ok(bind_with_names_and_sheets(
-            &expr,
-            owning_sheet,
-            wb.names(),
-            wb,
-        )?)
+        // W5-92 (Phase 4.6.D): pass `wb` for names so the two-tier
+        // sheet-then-workbook scope chain fires; was `wb.names()`
+        // (workbook-scoped only).
+        Ok(bind_with_names_and_sheets(&expr, owning_sheet, wb, wb)?)
     }
 
     /// **G3-02 acceptance (hook 1/5).** Mutation hook fired by

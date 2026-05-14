@@ -503,12 +503,14 @@ impl<'a> WorkbookRuntime<'a> {
                 .get_or_insert::<_, RuntimeError>(cache_key, || {
                     let tokens = lex(formula_text.as_ref())?;
                     let expr = parse(tokens)?;
-                    // Phase 2A.1 (2026-05-12): bind against the workbook's NameTable
-                    // so `Expr::NameRef` resolves against defined names.
+                    // Phase 2A.1 (2026-05-12): bind against the workbook's
+                    // NameTable so `Expr::NameRef` resolves against defined
+                    // names. W5-92 (Phase 4.6.D): pass `&Workbook` for names
+                    // so the two-tier sheet-then-workbook chain fires.
                     Ok(bind_with_names_and_sheets(
                         &expr,
                         sheet,
-                        self.workbook.names(),
+                        self.workbook,
                         self.workbook,
                     )?)
                 })?;
@@ -668,6 +670,7 @@ impl<'a> WorkbookRuntime<'a> {
         if let Some(oplog) = self.oplog.as_deref_mut() {
             let target_wire = ql_io::NamedTargetWire::from_target(&target);
             oplog.append(Op::SetName {
+                scope: None,
                 name: name.to_ascii_uppercase(),
                 target: target_wire,
             })?;
@@ -680,6 +683,63 @@ impl<'a> WorkbookRuntime<'a> {
 
         // Phase 3.1: notify calcgraph. Today a counter-bump; Phase 3.3
         // will mark all formulas containing this name dirty.
+        if let Some(g) = self.graph.as_deref_mut() {
+            g.on_set_name(name);
+        }
+
+        Ok(())
+    }
+
+    /// **W5-92 (Phase 4.6.D):** register a sheet-scoped defined name
+    /// through the runtime, emitting `Op::SetName { scope: Some(sheet), .. }`
+    /// into the attached op log (if any). Sheet-scoped names shadow
+    /// workbook-scoped names with the same identifier when accessed
+    /// from a formula on `sheet`, per Excel canon (XS-4-03).
+    ///
+    /// Validation matches `set_name`:
+    /// - `Workbook::sheet(sheet)` must exist; otherwise
+    ///   `RuntimeError::InvalidSheet`.
+    /// - Reserved-name guard fires (currently `AI` per CORR-06); the
+    ///   reserved set is workbook-global, so sheet-scoped names are
+    ///   refused with the same rule.
+    /// - Op-log append failure fails BEFORE the workbook mutation so
+    ///   neither failure mode leaves engine state divergent.
+    pub fn set_sheet_scoped_name(
+        &mut self,
+        sheet: SheetId,
+        name: &str,
+        target: ql_storage::NamedTarget,
+    ) -> Result<(), RuntimeError> {
+        // 1. Validate sheet id exists.
+        let sheet_count = self.workbook.sheet_count();
+        if self.workbook.sheet(sheet).is_none() {
+            return Err(RuntimeError::InvalidSheet { sheet, sheet_count });
+        }
+        // 2. Pre-check reserved-name guard so a rejection doesn't
+        //    leave a phantom op-log entry. We use the workbook's
+        //    `NameTable::would_accept` since the reserved-name set
+        //    is workbook-global (per is_reserved_name in storage).
+        self.workbook.names().would_accept(name)?;
+        // 3. Append op-log entry BEFORE mutation.
+        if let Some(oplog) = self.oplog.as_deref_mut() {
+            let target_wire = ql_io::NamedTargetWire::from_target(&target);
+            oplog.append(Op::SetName {
+                scope: Some(sheet),
+                name: name.to_ascii_uppercase(),
+                target: target_wire,
+            })?;
+        }
+        // 4. Mutate. validation already passed; `set_scoped_name`
+        //    returns Result for forward-compat.
+        self.workbook
+            .sheet_mut(sheet)
+            .expect("sheet existence already validated")
+            .set_scoped_name(name, target)?;
+
+        // 5. Calcgraph notification — fan out the same as workbook-
+        //    scoped sets. Phase 3.3's name→formula tracking is name-
+        //    keyed and doesn't currently distinguish scopes; over-
+        //    invalidation is the conservative direction here.
         if let Some(g) = self.graph.as_deref_mut() {
             g.on_set_name(name);
         }
@@ -1137,7 +1197,9 @@ impl<'a> WorkbookRuntime<'a> {
         validate_cell(self.workbook, sheet, row, col)?;
         let tokens = lex(formula_text)?;
         let expr = parse(tokens)?;
-        let plan = bind_with_names_and_sheets(&expr, sheet, self.workbook.names(), self.workbook)?;
+        // W5-92 (Phase 4.6.D): pass `&Workbook` for names so the
+        // two-tier sheet-then-workbook scope chain fires.
+        let plan = bind_with_names_and_sheets(&expr, sheet, self.workbook, self.workbook)?;
         let env = WorkbookEnv::new(self.workbook);
         Ok(eval_scalar_with_registry(&plan, &env, self.registry))
     }
@@ -1456,11 +1518,10 @@ impl<'a> WorkbookRuntime<'a> {
                 .get_or_insert::<_, RuntimeError>(cache_key, || {
                     let tokens = lex(formula_text.as_ref())?;
                     let expr = parse(tokens)?;
+                    // W5-92 (Phase 4.6.D): pass `workbook` for names so
+                    // the two-tier sheet-then-workbook scope chain fires.
                     Ok(bind_with_names_and_sheets(
-                        &expr,
-                        sheet,
-                        workbook.names(),
-                        workbook,
+                        &expr, sheet, workbook, workbook,
                     )?)
                 })?;
 
@@ -3011,7 +3072,13 @@ mod tests {
         let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            Op::SetName { name, target } => {
+            Op::SetName {
+                scope,
+                name,
+                target,
+            } => {
+                // W5-92 (Phase 4.6.D): workbook-scoped name records scope=None.
+                assert_eq!(*scope, None);
                 // Op log records the canonicalized (uppercase) name.
                 assert_eq!(name, "TAXRATE");
                 // Wire form is NamedTargetWire::Constant for a constant target.
@@ -5248,5 +5315,106 @@ mod tests {
             wb.read(ql_types::Address::new(s1, 0, 1)),
             Value::Number(11.0)
         );
+    }
+
+    // ===== W5-92 (Phase 4.6.D) set_sheet_scoped_name =====
+
+    #[test]
+    fn set_sheet_scoped_name_lands_on_sheet_table() {
+        use ql_storage::NamedTarget;
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S");
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_sheet_scoped_name(s0, "R", NamedTarget::Constant(Value::Number(0.21)))
+            .unwrap();
+        drop(rt);
+        assert!(matches!(
+            wb.sheet(s0).unwrap().scoped_names().lookup_ci("R"),
+            Some(NamedTarget::Constant(Value::Number(n))) if n == 0.21
+        ));
+        // Workbook-scope is untouched.
+        assert!(wb.names().is_empty());
+    }
+
+    #[test]
+    fn set_sheet_scoped_name_invalid_sheet_errors() {
+        use ql_storage::NamedTarget;
+        let mut wb = Workbook::new();
+        let _ = wb.add_sheet("S");
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt
+            .set_sheet_scoped_name(42, "R", NamedTarget::Constant(Value::Number(1.0)))
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::InvalidSheet { sheet: 42, .. }));
+    }
+
+    #[test]
+    fn set_sheet_scoped_name_reserved_name_rejected() {
+        use ql_storage::NamedTarget;
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S");
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt
+            .set_sheet_scoped_name(s0, "AI", NamedTarget::Constant(Value::Number(42.0)))
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Name(_)));
+        // Workbook unmutated.
+        drop(rt);
+        assert!(wb.sheet(s0).unwrap().scoped_names().is_empty());
+    }
+
+    #[test]
+    fn set_sheet_scoped_name_emits_op_with_scope() {
+        use ql_oplog::OpLog;
+        use ql_storage::NamedTarget;
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S");
+        let reg = default_registry();
+        let mut log = OpLog::new();
+        let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut log);
+        rt.set_sheet_scoped_name(s0, "R", NamedTarget::Constant(Value::Number(0.21)))
+            .unwrap();
+        drop(rt);
+        let ops: Vec<Op> = log.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            Op::SetName {
+                scope,
+                name,
+                target,
+            } => {
+                assert_eq!(*scope, Some(s0));
+                assert_eq!(name, "R");
+                assert!(matches!(target, ql_io::NamedTargetWire::Constant { .. }));
+            }
+            other => panic!("expected SetName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn formula_resolves_sheet_scoped_over_workbook_scoped() {
+        // End-to-end: workbook has Rate = 0.05, sheet 0 has scoped Rate = 0.21.
+        // A formula `=Rate` on sheet 0 should evaluate to 0.21 (sheet-scoped
+        // wins). On sheet 1 (no scoped Rate) it should evaluate to 0.05.
+        use ql_storage::NamedTarget;
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S0");
+        let s1 = wb.add_sheet("S1");
+        wb.set_name("Rate", NamedTarget::Constant(Value::Number(0.05)))
+            .unwrap();
+        wb.sheet_mut(s0)
+            .unwrap()
+            .set_scoped_name("Rate", NamedTarget::Constant(Value::Number(0.21)))
+            .unwrap();
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v0 = rt.set_formula(s0, 0, 0, "Rate").unwrap();
+        assert_eq!(v0, Value::Number(0.21));
+        let v1 = rt.set_formula(s1, 0, 0, "Rate").unwrap();
+        assert_eq!(v1, Value::Number(0.05));
     }
 }

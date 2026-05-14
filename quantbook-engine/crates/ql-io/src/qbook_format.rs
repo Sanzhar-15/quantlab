@@ -102,10 +102,21 @@ use thiserror::Error;
 ///   - per-sheet `format_overlay: Option<Vec<FormatOverlayEntry>>` —
 ///     sparse `(row, col, id)` tuples binding cells to format ids.
 ///
-/// Loaders accept v1, v2, v3, AND v4 envelopes. A v3 envelope loaded
-/// by a v4 reader gets an empty FormatTable + all-General overlay
-/// (regression-neutral). v3 readers refuse v4 via `UnsupportedSchema`.
-pub const WORKBOOK_SCHEMA_VERSION: u32 = 4;
+/// **W5-92 (Phase 4.6.D):** bumped to v5. v5 adds:
+///   - `NamedEntry.scope: Option<u16>` — `None` = workbook-scoped
+///     (existing behavior; v1-v4 default), `Some(id)` = sheet-scoped
+///     (new). The field is `#[serde(default, skip_serializing_if = ...)]`
+///     so v1-v4 wire payloads continue to deserialize cleanly with
+///     `scope = None` on every entry.
+///
+/// Loaders accept v1..=v5. v1-v4 envelopes load with all-workbook-
+/// scoped names (regression-neutral). v4 readers refuse v5 via
+/// `UnsupportedSchema` (the schema_version comparison upgrade is the
+/// only fail-loud surface — `NamedEntry` itself uses `serde(default)`
+/// so a v4 reader that somehow saw a v5 `NamedEntry` with `scope: Some`
+/// would deserialize but then mis-route the name to the workbook scope
+/// — the version gate prevents that path).
+pub const WORKBOOK_SCHEMA_VERSION: u32 = 5;
 
 /// The earliest schema version this reader still accepts. v1 fixtures (Phase 1)
 /// continue to load on v2 binaries; older versions would need explicit handling.
@@ -353,6 +364,16 @@ pub struct NamesSection {
 pub struct NamedEntry {
     pub name: String,
     pub target: NamedTargetWire,
+    /// **W5-92 (Phase 4.6.D):** name scope.
+    /// - `None` (default; v1-v4 wire) = workbook-scoped.
+    /// - `Some(sheet_id)` = sheet-scoped; sheet-scoped beats workbook-
+    ///   scoped at lookup time (Excel canon, XS-4-03).
+    ///
+    /// `serde(default)` keeps the field optional in v1-v4 payloads;
+    /// `skip_serializing_if` keeps v1-v4 round-trips byte-stable for
+    /// workbook-scoped names (the common case).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<u16>,
 }
 
 /// Wire-format mirror of `ql_storage::NamedTarget`. Each variant is tagged
@@ -976,22 +997,47 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
         });
     }
 
-    // Phase 2A.8: serialize the workbook's NameTable. Sorted ascending by name
-    // for deterministic on-disk diffs. Omitted (None) when the table is empty
-    // so v1-reader compatibility round-trips cleanly.
-    let names_section = if wb.names().is_empty() {
-        None
-    } else {
-        let mut entries: Vec<NamedEntry> = wb
-            .names()
-            .iter()
-            .map(|(name, target)| NamedEntry {
+    // Phase 2A.8: serialize the workbook's NameTable. Sorted ascending by
+    // (scope, name) for deterministic on-disk diffs (workbook-scoped first
+    // since `None < Some` under derive(Ord); then by name). Omitted (None)
+    // when both workbook-scoped table AND every sheet's scoped_names table
+    // are empty, so v1-reader compatibility round-trips cleanly for the
+    // empty-names common case.
+    //
+    // **W5-92 (Phase 4.6.D):** collects workbook-scoped names first, then
+    // sheet-scoped names from each sheet's `scoped_names` table. The
+    // `scope` field on `NamedEntry` distinguishes the two; legacy v1-v4
+    // readers emit only the workbook-scoped entries (no per-sheet names
+    // existed pre-v5).
+    let names_section = {
+        let mut entries: Vec<NamedEntry> = Vec::new();
+        for (name, target) in wb.names().iter() {
+            entries.push(NamedEntry {
                 name: name.as_ref().to_owned(),
                 target: NamedTargetWire::from_target(target),
-            })
-            .collect();
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        Some(NamesSection { entries })
+                scope: None,
+            });
+        }
+        for sheet_id in 0..wb.sheet_count() as ql_types::SheetId {
+            if let Some(sheet) = wb.sheet(sheet_id) {
+                for (name, target) in sheet.scoped_names().iter() {
+                    entries.push(NamedEntry {
+                        name: name.as_ref().to_owned(),
+                        target: NamedTargetWire::from_target(target),
+                        scope: Some(sheet_id),
+                    });
+                }
+            }
+        }
+        if entries.is_empty() {
+            None
+        } else {
+            // Deterministic ordering: workbook-scoped (scope=None) entries
+            // first, then sheet-scoped grouped by sheet id; within each
+            // group, names sorted ascending.
+            entries.sort_by(|a, b| a.scope.cmp(&b.scope).then(a.name.cmp(&b.name)));
+            Some(NamesSection { entries })
+        }
     };
 
     // **W5-81 (Phase 4.5.D part 5):** serialize custom FormatTable entries
@@ -1374,14 +1420,40 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
     // Phase 2A.9 audit M6: `Workbook::set_name` may now refuse reserved names
     // (currently `AI` per CORR-06). A v2 file that somehow contains a reserved
     // name (e.g., hand-edited TOML) surfaces as `QbookError::MalformedName`.
+    // **W5-92 (Phase 4.6.D):** route by scope. `scope: None` (the v1-v4
+    // historical case) lands in the workbook-scoped `NameTable`;
+    // `scope: Some(id)` lands in that sheet's `scoped_names` table. An
+    // unknown sheet id surfaces as `MalformedName` (the load-time
+    // analog of the op-log replay's `InvalidSheet` — we can't carry the
+    // structural error through `QbookError`'s vocabulary without a new
+    // variant, and `MalformedName` is the right shape for "name's
+    // target is bad").
     if let Some(names_section) = envelope.names {
         for entry in names_section.entries {
             let target = entry.target.to_target(&entry.name)?;
-            wb.set_name(&entry.name, target)
-                .map_err(|e| QbookError::MalformedName {
-                    name: entry.name.clone(),
-                    reason: format!("rejected by NameTable: {e}"),
-                })?;
+            match entry.scope {
+                None => {
+                    wb.set_name(&entry.name, target)
+                        .map_err(|e| QbookError::MalformedName {
+                            name: entry.name.clone(),
+                            reason: format!("rejected by workbook NameTable: {e}"),
+                        })?;
+                }
+                Some(sheet_id) => {
+                    let sheet =
+                        wb.sheet_mut(sheet_id)
+                            .ok_or_else(|| QbookError::MalformedName {
+                                name: entry.name.clone(),
+                                reason: format!("scope refers to unknown sheet id {sheet_id}"),
+                            })?;
+                    sheet.set_scoped_name(&entry.name, target).map_err(|e| {
+                        QbookError::MalformedName {
+                            name: entry.name.clone(),
+                            reason: format!("rejected by sheet {sheet_id} NameTable: {e}"),
+                        }
+                    })?;
+                }
+            }
         }
     }
 
@@ -2746,13 +2818,16 @@ col_extent = 1
     /// No silent forward compat. **W5-81 (Phase 4.5.D part 5):** updated
     /// from version 4 to version 5 after v4 became the current ship
     /// version (adding FormatTable + per-sheet format overlay).
+    /// **W5-92 (Phase 4.6.D):** updated from version 5 to version 6 after
+    /// v5 became the current ship version (adding `NamedEntry.scope`
+    /// for sheet-scoped names).
     #[test]
     fn future_schema_version_rejected() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("future.qbook");
         fs::create_dir_all(path.join("sheets")).unwrap();
         let toml = r#"
-schema_version = 5
+schema_version = 6
 name = "future"
 
 [[sheets]]
@@ -2767,7 +2842,7 @@ col_extent = 0
 
         let result = load_workbook(&path);
         assert!(
-            matches!(result, Err(QbookError::UnsupportedSchema { found: 5 })),
+            matches!(result, Err(QbookError::UnsupportedSchema { found: 6 })),
             "expected UnsupportedSchema, got {result:?}"
         );
     }
@@ -2904,5 +2979,159 @@ col_extent = 0
             entries.is_empty(),
             "expected no .tmp-save-* orphans, got {entries:?}"
         );
+    }
+
+    // ===== W5-92 (Phase 4.6.D) sheet-scoped names + schema v5 =====
+
+    #[test]
+    fn schema_version_constant_is_five() {
+        // Sanity check so future bumps trip this test until the doc is updated.
+        assert_eq!(WORKBOOK_SCHEMA_VERSION, 5);
+    }
+
+    #[test]
+    fn sheet_scoped_name_round_trips_through_save_load() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("scoped.qbook");
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S1");
+        let s1 = wb.add_sheet("S2");
+        // Workbook-scoped name.
+        wb.set_name("Rate", NamedTarget::Constant(Value::Number(0.05)))
+            .unwrap();
+        // Sheet-scoped names — different sheets can hold the same name.
+        wb.sheet_mut(s0)
+            .unwrap()
+            .set_scoped_name("Rate", NamedTarget::Constant(Value::Number(0.21)))
+            .unwrap();
+        wb.sheet_mut(s1)
+            .unwrap()
+            .set_scoped_name("Bonus", NamedTarget::Constant(Value::Number(100.0)))
+            .unwrap();
+
+        save_workbook(&wb, "scoped", &path).unwrap();
+        let loaded = load_workbook(&path).unwrap();
+
+        assert!(matches!(
+            loaded.names().lookup_ci("Rate"),
+            Some(NamedTarget::Constant(Value::Number(n))) if n == 0.05
+        ));
+        assert!(matches!(
+            loaded.sheet(s0).unwrap().scoped_names().lookup_ci("Rate"),
+            Some(NamedTarget::Constant(Value::Number(n))) if n == 0.21
+        ));
+        assert!(matches!(
+            loaded.sheet(s1).unwrap().scoped_names().lookup_ci("Bonus"),
+            Some(NamedTarget::Constant(Value::Number(n))) if n == 100.0
+        ));
+        // Cross-checks: sheet 1 has no "Rate"; sheet 0 has no "Bonus".
+        assert!(loaded
+            .sheet(s1)
+            .unwrap()
+            .scoped_names()
+            .lookup_ci("Rate")
+            .is_none());
+        assert!(loaded
+            .sheet(s0)
+            .unwrap()
+            .scoped_names()
+            .lookup_ci("Bonus")
+            .is_none());
+    }
+
+    #[test]
+    fn v4_envelope_missing_scope_loads_into_workbook_scope() {
+        // Hand-craft a v4 envelope with a `names` entry that has no
+        // `scope` field. The v5 reader must default `scope: None` and
+        // assign the name to the workbook scope (regression-neutral
+        // for pre-v5 files).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy_v4.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let v4_toml = r#"
+schema_version = 4
+name = "legacy_v4"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "S", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+
+[names]
+entries = [
+  { name = "Legacy", target = { kind = "constant", value = { Number = 1.5 } } },
+]
+"#;
+        fs::write(path.join("workbook.toml"), v4_toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+
+        let loaded = load_workbook(&path).unwrap();
+        assert!(matches!(
+            loaded.names().lookup_ci("Legacy"),
+            Some(NamedTarget::Constant(Value::Number(n))) if n == 1.5
+        ));
+        assert!(loaded.sheet(0).unwrap().scoped_names().is_empty());
+    }
+
+    #[test]
+    fn load_rejects_scoped_name_referencing_unknown_sheet() {
+        // A hand-crafted v5 envelope with a scoped entry pointing at a
+        // non-existent sheet must surface MalformedName, not silently
+        // create the sheet or drop the name.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad_scope.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = r#"
+schema_version = 5
+name = "bad_scope"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "S", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+
+[names]
+entries = [
+  { name = "X", scope = 7, target = { kind = "constant", value = { Number = 1.0 } } },
+]
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+
+        let result = load_workbook(&path);
+        assert!(
+            matches!(
+                &result,
+                Err(QbookError::MalformedName { name, .. }) if name == "X"
+            ),
+            "expected MalformedName for X, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn workbook_only_names_round_trip_serializes_without_scope_field() {
+        // Wire-compat check: when no sheet-scoped names exist, the
+        // serialized names entries should NOT emit a `scope` field
+        // (Option::is_none + skip_serializing_if). Round-tripping
+        // through the v4-style on-disk shape lets v4 readers load v5
+        // files cleanly when no sheet-scoped names are present.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wb_only.qbook");
+        let mut wb = Workbook::new();
+        let _ = wb.add_sheet("S");
+        wb.set_name("R", NamedTarget::Constant(Value::Number(0.5)))
+            .unwrap();
+        save_workbook(&wb, "wb_only", &path).unwrap();
+
+        // Read the workbook.toml and verify no `scope =` appears.
+        let toml = fs::read_to_string(path.join("workbook.toml")).unwrap();
+        assert!(
+            !toml.contains("scope ="),
+            "expected workbook-only names to omit scope field, got: {toml}"
+        );
+
+        let loaded = load_workbook(&path).unwrap();
+        assert!(matches!(
+            loaded.names().lookup_ci("R"),
+            Some(NamedTarget::Constant(Value::Number(n))) if n == 0.5
+        ));
     }
 }
