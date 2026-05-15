@@ -96,16 +96,25 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
 /// Tokenize a formula expression body with explicit `(ReferenceMode,
 /// Locale)` context.
 ///
-/// **W5-134 (Phase 4.9.B.1):** signature scaffolding for Phase 4.9.
-/// **No behavior change yet** — `mode` and `locale` are accepted but
-/// not consumed by the lex logic; the current implementation is
-/// equivalent to the pre-W5-134 `lex(input)` for any `(mode, locale)`
-/// pair. Subsequent sub-phases wire them into the lex state:
+/// **Behavior consumed so far:**
 ///
-/// - **4.9.B.2** — locale-parameterized number lexing (decimal
-///   separator switches per `locale`).
+/// - **W5-134 (4.9.B.1):** signature scaffolding only.
+/// - **W5-135 (4.9.B.2):** `locale.decimal_separator` wired into the
+///   number-literal lex loop (`lex_number`). In `Locale::De` /
+///   `Locale::Fr`, `2,34` lexes as `Number(2.34)`; in `Locale::EnUs`
+///   the historical `.` decimal stays unchanged. `2.34` in DE / FR
+///   lexes as `Number(2)` followed by a bare `.` that downstream
+///   arms reject — IronCalc-canonical "DE doesn't accept dot
+///   decimals" behavior.
+///
+/// Still pending:
+///
 /// - **4.9.B.3** — locale-parameterized argument separator + array
-///   row/col separators.
+///   row/col separators (dispatch-level rework). `2,3` in DE
+///   currently still hits the `,` → `Token::Comma` arm at top level
+///   instead of being recognized as a leading-decimal number; same
+///   for `.5` start-of-expression in EN, which already works because
+///   EN's decimal_sep is `.` and the dispatch hard-codes it.
 /// - **4.9.B.4** — R1C1 token emission when `mode == R1C1`.
 ///
 /// This split lets each behavior change land as an independent commit
@@ -113,6 +122,8 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
 /// rewrite.
 #[allow(unused_variables)]
 pub fn lex_with(input: &str, mode: ReferenceMode, locale: Locale) -> Result<Vec<Token>, LexError> {
+    let locale_data = crate::locale::locale_data(locale);
+    let decimal_sep = locale_data.decimal_separator;
     let mut out = Vec::new();
     let mut chars = input.chars().peekable();
 
@@ -224,7 +235,22 @@ pub fn lex_with(input: &str, mode: ReferenceMode, locale: Locale) -> Result<Vec<
                 }
             }
             '"' => out.push(lex_string(&mut chars)?),
-            '0'..='9' | '.' => out.push(lex_number(&mut chars)?),
+            '0'..='9' => out.push(lex_number(&mut chars, decimal_sep)?),
+            // The locale's decimal separator is also a valid start of
+            // a number (`.5` in EN, `,5` in DE/FR). For EN this
+            // restores the prior `'0'..='9' | '.'` arm exactly; for
+            // DE/FR the `,5` path is reachable only when nothing
+            // earlier in the match consumed `,` — currently the `,`
+            // arm above DOES consume it as `Token::Comma`, so DE/FR
+            // leading-`,` decimals are deferred to 4.9.B.3's separator
+            // rework. EN keeps existing `.5` behavior. NOT a guard
+            // arm because `c if c == decimal_sep` would shadow the
+            // earlier specific arms in non-EN locales (Rust match
+            // arms evaluate top-down; guard arms have no special
+            // priority).
+            c if c == decimal_sep && c != ',' && c != ';' => {
+                out.push(lex_number(&mut chars, decimal_sep)?)
+            }
             // **W5-88 (Phase 4.6.A part 2):** quoted sheet name `'...'`.
             // Single-quote has no other lexical role in Excel formulas;
             // bare/unclosed/non-prefix `'...'` surfaces as a clean lex
@@ -339,26 +365,37 @@ fn lex_string(chars: &mut Peekable<Chars>) -> Result<Token, LexError> {
     }
 }
 
-fn lex_number(chars: &mut Peekable<Chars>) -> Result<Token, LexError> {
+/// Consume a number literal. `decimal_sep` is the locale's decimal
+/// separator glyph (`.` for EN, `,` for DE/FR); it's translated to
+/// `.` in the accumulated `raw` string so Rust's `f64::from_str`
+/// (which is locale-invariant on the `.`) parses correctly.
+///
+/// **W5-135 (Phase 4.9.B.2):** `decimal_sep` is the new parameter.
+/// Before this, the function hardcoded `.`.
+fn lex_number(chars: &mut Peekable<Chars>, decimal_sep: char) -> Result<Token, LexError> {
     let mut raw = String::new();
     while let Some(&c) = chars.peek() {
-        match c {
-            '0'..='9' | '.' => {
-                raw.push(c);
-                chars.next();
-            }
-            'e' | 'E' => {
-                raw.push(c);
-                chars.next();
-                // optional sign immediately after exponent
-                if let Some(&sign) = chars.peek() {
-                    if sign == '+' || sign == '-' {
-                        raw.push(sign);
-                        chars.next();
-                    }
+        if c.is_ascii_digit() {
+            raw.push(c);
+            chars.next();
+        } else if c == decimal_sep {
+            // Always push canonical `.` so `f64::from_str` succeeds
+            // regardless of locale. `decimal_sep` is the source glyph;
+            // `.` is the wire/parse glyph.
+            raw.push('.');
+            chars.next();
+        } else if c == 'e' || c == 'E' {
+            raw.push(c);
+            chars.next();
+            // optional sign immediately after exponent
+            if let Some(&sign) = chars.peek() {
+                if sign == '+' || sign == '-' {
+                    raw.push(sign);
+                    chars.next();
                 }
             }
-            _ => break,
+        } else {
+            break;
         }
     }
 
@@ -2202,25 +2239,115 @@ mod tests {
         }
     }
 
-    /// **Behavior-invariance pin (W5-134):** until 4.9.B.2 lands,
-    /// switching locale must NOT change the lex output. Pin this with
-    /// `SUM(1.5, 2.5)` — EN uses `.` decimal + `,` arg; DE will
-    /// eventually swap, but in 4.9.B.1 the lexer hasn't learned that
-    /// yet. If this test fails after 4.9.B.2, that's the signal that
-    /// the behavior change shipped and this test should be deleted.
+    // ===== W5-135 (Phase 4.9.B.2) — locale decimal separator =====
+    //
+    // Tripwire test `lex_with_pre_4_9_b_2_is_locale_invariant` from
+    // W5-134 was deliberately deleted here: it asserted that locale
+    // had NO effect on lex output, which was true at 4.9.B.1 but
+    // false now that 4.9.B.2 wires `decimal_sep`. The tests below
+    // pin the new locale-dependent behavior.
+
     #[test]
-    fn lex_with_pre_4_9_b_2_is_locale_invariant() {
-        let src = "SUM(1.5, 2.5)";
-        let en = lex_with(src, ReferenceMode::A1, Locale::EnUs).unwrap();
-        let de = lex_with(src, ReferenceMode::A1, Locale::De).unwrap();
-        let fr = lex_with(src, ReferenceMode::A1, Locale::Fr).unwrap();
+    fn de_locale_treats_comma_inside_number_as_decimal() {
+        // `2,34` in DE → Number(2.34).
+        let tokens = lex_with("2,34", ReferenceMode::A1, Locale::De).unwrap();
+        assert_eq!(tokens, vec![Token::Number(2.34)]);
+    }
+
+    #[test]
+    fn fr_locale_treats_comma_inside_number_as_decimal() {
+        // `2,5` in FR → Number(2.5).
+        let tokens = lex_with("2,5", ReferenceMode::A1, Locale::Fr).unwrap();
+        assert_eq!(tokens, vec![Token::Number(2.5)]);
+    }
+
+    #[test]
+    fn en_locale_treats_dot_inside_number_as_decimal_unchanged() {
+        // `2.34` in EN-US → Number(2.34). Identical to pre-W5-135.
+        let tokens = lex_with("2.34", ReferenceMode::A1, Locale::EnUs).unwrap();
+        assert_eq!(tokens, vec![Token::Number(2.34)]);
+    }
+
+    /// **Pre-W5-135 behavior preserved in EN.** `2,34` in EN-US
+    /// lexes as `Number(2) Comma Number(34)` — the `,` is the arg
+    /// separator at top level. This must NOT regress.
+    #[test]
+    fn en_locale_treats_comma_outside_number_as_comma_token() {
+        let tokens = lex_with("2,34", ReferenceMode::A1, Locale::EnUs).unwrap();
         assert_eq!(
-            en, de,
-            "4.9.B.1: locale must not yet affect lex output (DE diverged)"
+            tokens,
+            vec![Token::Number(2.0), Token::Comma, Token::Number(34.0)]
         );
-        assert_eq!(
-            en, fr,
-            "4.9.B.1: locale must not yet affect lex output (FR diverged)"
-        );
+    }
+
+    /// **DE rejects `.` as decimal.** Per IronCalc's
+    /// `test_german_locale_does_not_parse` reference: `2.34e-3` in DE
+    /// lexes as `Number(2.0)` followed by an illegal `.` (because in
+    /// DE, `.` is the array-row separator, not the decimal). 4.9.B.2
+    /// implementation: number-lex breaks at `.` in DE; the dispatch
+    /// then sees `.` and falls to `'0'..='9' | <decimal_sep>` — but
+    /// the decimal_sep arm fires only when `c == decimal_sep`, which
+    /// in DE is `,` not `.`. So `.` falls through to the default
+    /// arm → `UnexpectedChar('.')`.
+    #[test]
+    fn de_locale_rejects_dot_decimal() {
+        let result = lex_with("2.34", ReferenceMode::A1, Locale::De);
+        // Either `2.34` returns a number 2 + Illegal `.` + number 34,
+        // OR errors entirely depending on dispatch. The contract is
+        // "dot is NOT decimal in DE." Pin via `err` OR `[Number(2),
+        // ...]` where `...` contains something other than digits-as-
+        // continuation. Either way `Number(2.34)` must NOT appear.
+        match result {
+            Ok(tokens) => {
+                assert_ne!(
+                    tokens,
+                    vec![Token::Number(2.34)],
+                    "DE must not lex `2.34` as Number(2.34)"
+                );
+            }
+            Err(LexError::UnexpectedChar('.')) => {
+                // Acceptable — `.` rejected.
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// **Scientific notation in DE.** `2,5e-3` should lex as
+    /// `Number(0.0025)` — the `,` is decimal, `e-3` is exponent.
+    /// Mirror IronCalc's `test_german_locale` reference.
+    #[test]
+    fn de_locale_scientific_notation_with_comma_decimal() {
+        let tokens = lex_with("2,5e-3", ReferenceMode::A1, Locale::De).unwrap();
+        assert_eq!(tokens, vec![Token::Number(2.5e-3)]);
+    }
+
+    /// **EN happy-path regression pin.** The number-lex changes
+    /// introduce a new dispatch arm and refactor `lex_number`'s body
+    /// from `match c { ... }` to `if c.is_ascii_digit() { ... }
+    /// else if c == decimal_sep { ... }`. Every existing EN number
+    /// representation must continue to round-trip identically.
+    #[test]
+    fn en_number_lex_regression_battery() {
+        let cases: &[(&str, f64)] = &[
+            ("0", 0.0),
+            ("1", 1.0),
+            ("12345", 12345.0),
+            ("0.5", 0.5),
+            (".5", 0.5),
+            ("1.5e3", 1500.0),
+            ("1.5e+3", 1500.0),
+            ("1.5e-3", 0.0015),
+            ("1E10", 1e10),
+        ];
+        for (src, expected) in cases {
+            let tokens = lex_with(src, ReferenceMode::A1, Locale::EnUs).unwrap();
+            match tokens.as_slice() {
+                [Token::Number(n)] => assert_eq!(
+                    *n, *expected,
+                    "EN regression: {src:?} expected {expected}, got {n}"
+                ),
+                other => panic!("EN regression: {src:?} expected single Number, got {other:?}"),
+            }
+        }
     }
 }
