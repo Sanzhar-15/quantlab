@@ -106,16 +106,15 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
 ///   lexes as `Number(2)` followed by a bare `.` that downstream
 ///   arms reject — IronCalc-canonical "DE doesn't accept dot
 ///   decimals" behavior.
-/// - **W5-136 (4.9.B.3):** locale-aware argument + array separators
-///   dispatched at the top of the lex loop. EN keeps `,` → `Comma`
-///   + `;` → `Semicolon` exactly; DE/FR remap source glyphs to
-///   canonical role-tokens (DE `;` → `Comma`, DE `\\` → `Comma`,
-///   DE `.` → `Semicolon`). The parser sees the SAME token vocab
-///   regardless of locale; only the source-glyph mapping changes.
-///   This closes the leading-decimal gap from 4.9.B.2 in DE/FR
-///   (DE `,5` previously hit the deleted literal `,` arm; now it
-///   falls through to the decimal-start arm and lexes as
-///   `Number(0.5)`).
+/// - **W5-136 (4.9.B.3):** locale-aware argument + array separators dispatched at the top of the lex loop.
+///
+/// W5-136 detail: EN keeps `,` → `Comma` + `;` → `Semicolon` exactly;
+/// DE/FR remap source glyphs to canonical role-tokens (DE `;` →
+/// `Comma`, DE `\\` → `Comma`, DE `.` → `Semicolon`). Parser sees the
+/// SAME token vocab regardless of locale; only the source-glyph
+/// mapping changes. Closes the leading-decimal gap from 4.9.B.2 in
+/// DE/FR (DE `,5` lexes as `Number(0.5)` instead of hitting the
+/// deleted literal `,` arm).
 ///
 /// Still pending:
 ///
