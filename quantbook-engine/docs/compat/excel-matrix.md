@@ -152,10 +152,10 @@ as partial, rows with `❌` are missing.
 
 | Function | Status | Tests | Phase | Notes |
 |---|---|---|---|---|
-| LEN | ✅ | 3 | 4.3 V1 | **DIVERGES from Excel for emoji ZWJ sequences.** Rust counts Unicode scalar values (`.chars().count()`); Excel counts UTF-16 code units (`LENB`-like for non-BMP). For ASCII / BMP-plane text, both match. ZWJ family emoji like `👨‍👩‍👧`: Quantbook = 5, Excel = 8. Pin Phase 4.9. |
-| LEFT / RIGHT / MID | ⚠️ | 9 | 4.3 V2 | W5-56: 1-based positions; UTF-8 char-count (UTF-16 canon deferred to 4.9, same divergence class as LEN). Negative num_chars → #VALUE!; MID start < 1 → #VALUE!. |
-| UPPER | ⚠️ | 2 | 4.3 V1 | Rust's Unicode-default mapping. **DIVERGES from Excel for German ß** (Quantbook = `SS`, Excel = `ß`) and any other locale-sensitive mapping (Turkish I, Greek final sigma). For ASCII-only text both match. Pin Phase 4.9 (locale-aware case). |
-| LOWER | ⚠️ | 1 | 4.3 V1 | Rust Unicode-default. Same divergence class as UPPER. Pin Phase 4.9. |
+| LEN | ✅ | 3 | 4.3 V1 | **DIVERGES from Excel for emoji ZWJ sequences.** Rust counts Unicode scalar values (`.chars().count()`); Excel counts UTF-16 code units (`LENB`-like for non-BMP). For ASCII / BMP-plane text, both match. ZWJ family emoji like `👨‍👩‍👧`: Quantbook = 5, Excel = 8. (Originally anticipated for Phase 4.9 — that phase shipped R1C1+locale-separators+`@`, NOT UTF-16 string semantics. Awaiting a future Phase.) |
+| LEFT / RIGHT / MID | ⚠️ | 9 | 4.3 V2 | W5-56: 1-based positions; UTF-8 char-count (UTF-16 canon deferred to a future Phase, same divergence class as LEN). Negative num_chars → #VALUE!; MID start < 1 → #VALUE!. |
+| UPPER | ⚠️ | 2 | 4.3 V1 | Rust's Unicode-default mapping. **DIVERGES from Excel for German ß** (Quantbook = `SS`, Excel = `ß`) and any other locale-sensitive mapping (Turkish I, Greek final sigma). For ASCII-only text both match. (Originally anticipated for Phase 4.9 locale-aware case — that phase did NOT address case mapping. Awaiting a future Phase.) |
+| LOWER | ⚠️ | 1 | 4.3 V1 | Rust Unicode-default. Same divergence class as UPPER. Awaiting a future Phase. |
 | PROPER | ✅ | 6 | 4.3 polish | W5-61: title-case each "word". A word starts after any non-letter character (Unicode). Digits and punctuation break words (Excel canon — `"123abc"` → `"123Abc"`, `"o'neill"` → `"O'Neill"`). |
 | TRIM | ✅ | 1 | 4.3 V1 | Strip + collapse internal space runs |
 | CLEAN | ✅ | 4 | 4.3 polish | W5-61: strip ASCII control chars 0x00–0x1F (tab, LF, CR, and the rest). Chars ≥ 0x20 and all Unicode pass through. |
