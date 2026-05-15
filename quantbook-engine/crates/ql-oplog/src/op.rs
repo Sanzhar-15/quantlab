@@ -265,10 +265,18 @@ pub enum Op {
 /// Kept separate from `ql-formula-syntax::ReferenceMode` so the
 /// wire shape is stable across engine versions (the runtime enum
 /// could be renamed without breaking on-disk op-log files).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReferenceModeWire {
     A1,
     R1C1,
+    /// **W5-151 (Phase 4.9.O MEDIUM-2 closure):** unknown wire value
+    /// from a forward-compat op-log file (e.g. a future engine
+    /// emits `Op::SetReferenceMode { mode: "Mixed" }`). The custom
+    /// `Deserialize` captures the original string; replay surfaces
+    /// `ReplayError::UnknownReferenceMode { index, found }` per
+    /// design § 4.9.J. Save-side `from_runtime` never produces this.
+    /// Mirrors the `LocaleWire::Unknown` pattern (W5-146).
+    Unknown(String),
 }
 
 impl ReferenceModeWire {
@@ -279,11 +287,39 @@ impl ReferenceModeWire {
         }
     }
 
-    pub fn to_runtime(self) -> ql_types::ReferenceMode {
+    /// Convert to runtime `ReferenceMode`. Returns `Err(unknown_value)`
+    /// if the wire was `Unknown(_)`; the replay path maps that to
+    /// `ReplayError::UnknownReferenceMode`.
+    pub fn to_runtime(self) -> Result<ql_types::ReferenceMode, String> {
         match self {
-            Self::A1 => ql_types::ReferenceMode::A1,
-            Self::R1C1 => ql_types::ReferenceMode::R1C1,
+            Self::A1 => Ok(ql_types::ReferenceMode::A1),
+            Self::R1C1 => Ok(ql_types::ReferenceMode::R1C1),
+            Self::Unknown(s) => Err(s),
         }
+    }
+}
+
+impl serde::Serialize for ReferenceModeWire {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        let s = match self {
+            Self::A1 => "A1",
+            Self::R1C1 => "R1C1",
+            // Save-side never produces Unknown from runtime; the
+            // defensive emit preserves whatever string came in.
+            Self::Unknown(s) => s.as_str(),
+        };
+        ser.serialize_str(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ReferenceModeWire {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        Ok(match s.as_str() {
+            "A1" => Self::A1,
+            "R1C1" => Self::R1C1,
+            _ => Self::Unknown(s),
+        })
     }
 }
 

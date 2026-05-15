@@ -222,6 +222,15 @@ pub enum ReplayError {
     /// Captures the offending string for the IDE diagnostic.
     #[error("replay unknown locale at op index {index}: {found:?}")]
     UnknownLocale { index: usize, found: String },
+
+    /// **W5-151 (Phase 4.9.O MEDIUM-2 closure):** `Op::SetReferenceMode`
+    /// wire value didn't match `A1` or `R1C1`. Per design § 4.9.J,
+    /// the forward-compat path captures unknown strings into
+    /// `ReferenceModeWire::Unknown(_)` and replay surfaces this
+    /// distinct error rather than letting the op silently no-op.
+    /// Parallels `UnknownLocale` above.
+    #[error("replay unknown reference mode at op index {index}: {found:?}")]
+    UnknownReferenceMode { index: usize, found: String },
 }
 
 /// Wrapper around `ql_storage::FormatTableError` that owns its strings,
@@ -544,14 +553,18 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             added_columns,
             removed_columns,
         ),
-        // **W5-146 (Phase 4.9.J):** workbook-scope reference-mode
-        // change. Pure metadata; no validation needed beyond the
-        // enum-bounded wire type. Idempotent (set-to-current-value
-        // is a no-op).
-        Op::SetReferenceMode { mode } => {
-            workbook.set_reference_mode(mode.to_runtime());
-            Ok(())
-        }
+        // **W5-146 (Phase 4.9.J) + W5-151 (4.9.O MEDIUM-2 closure):**
+        // workbook-scope reference-mode change. Forward-compat
+        // unknown wire values surface `ReplayError::UnknownReferenceMode`
+        // with the captured string (mirrors the `LocaleWire::Unknown`
+        // path below).
+        Op::SetReferenceMode { mode } => match mode.clone().to_runtime() {
+            Ok(m) => {
+                workbook.set_reference_mode(m);
+                Ok(())
+            }
+            Err(found) => Err(ReplayError::UnknownReferenceMode { index, found }),
+        },
         // **W5-146 (Phase 4.9.J):** workbook-scope locale change.
         // Unknown wire values (forward-compat op-log file) surface
         // `ReplayError::UnknownLocale` with the captured string.
@@ -1805,6 +1818,29 @@ mod tests {
                 assert_eq!(found, "xx");
             }
             other => panic!("expected UnknownLocale, got {other:?}"),
+        }
+    }
+
+    /// **W5-151 (Phase 4.9.O MEDIUM-2 closure):** unknown
+    /// reference-mode wire value (forward-compat) → loud error.
+    /// Mirrors the locale path; pins design § 4.9.J's promised
+    /// `ReplayError::UnknownReferenceMode`.
+    #[test]
+    fn replay_set_reference_mode_unknown_value_errors_loudly() {
+        let mut log = OpLog::new();
+        log.append(Op::SetReferenceMode {
+            mode: crate::op::ReferenceModeWire::Unknown("Mixed".to_string()),
+        })
+        .unwrap();
+        let mut wb = Workbook::new();
+        let reg = default_registry();
+        let err = replay_into(&log, &mut wb, &reg).unwrap_err();
+        match err {
+            ReplayError::UnknownReferenceMode { index, found } => {
+                assert_eq!(index, 0);
+                assert_eq!(found, "Mixed");
+            }
+            other => panic!("expected UnknownReferenceMode, got {other:?}"),
         }
     }
 }

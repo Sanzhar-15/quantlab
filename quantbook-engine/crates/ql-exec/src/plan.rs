@@ -896,21 +896,48 @@ fn bind_implicit_intersection<L: NameLookup>(
         }
 
         // Rule 9: structured ref. Bind via the normal path, then
-        // override `is_this_row: true` so eval narrows to formula row.
-        // This makes `@Sales[Qty]` ≡ `Sales[@Qty]` at eval time.
+        // override `is_this_row: true` ONLY when the spec is a
+        // single column reference (`BareColumn`) — making
+        // `@Sales[Qty]` ≡ `Sales[@Qty]` at eval time.
+        //
+        // **W5-151 (4.9.O MEDIUM-1 closure):** the prior version
+        // forced `is_this_row: true` unconditionally, which broke:
+        //   - `@Sales[[#Headers], [Qty]]` — single header cell
+        //     ought to be idempotent (rule 5), but unconditional
+        //     `is_this_row` would narrow it to formula row →
+        //     `#VALUE!` for any formula not in the header row.
+        //   - `@Sales[#All]` / multi-column refs — semantics differ;
+        //     resolve_structured_ref already returns `is_this_row:
+        //     true` for `ThisRowColumn`/`ThisRowColumnRange` and
+        //     `false` for the special-form combinations that
+        //     resolve to single cells / multi-axis ranges. The
+        //     `@` operator should respect that classification, not
+        //     force-override.
+        //
+        // Discrimination is by spec shape:
+        //   - `BareColumn(_)` → @ overrides to true (the load-bearing
+        //     `=@Sales[Qty]` case).
+        //   - `ThisRowColumn(_)` → resolve_structured_ref already set
+        //     `is_this_row: true`. @ is idempotent.
+        //   - `ThisRowColumnRange(_, _)` → same, already true.
+        //   - `Combination(_)` → pass through what resolve returned
+        //     (`true` if `#This Row` is in the items, else `false`).
         Expr::StructuredRef { table_name, spec } => {
+            use ql_formula_syntax::TableSpecSubtree;
             let plan = resolve_structured_ref(table_name, spec, tables)?;
+            // Only override when @ wraps a bare column reference.
+            let is_bare_column = matches!(spec, TableSpecSubtree::BareColumn(_));
             match plan {
                 ExprPlan::StructuredRef {
                     table_name,
                     source,
                     resolved,
-                    is_this_row: _,
+                    is_this_row,
                 } => Ok(ExprPlan::StructuredRef {
                     table_name,
                     source,
                     resolved,
-                    is_this_row: true,
+                    is_this_row: if is_bare_column { true } else { is_this_row },
                 }),
                 // resolve_structured_ref only ever returns
                 // ExprPlan::StructuredRef; the wildcard arm is
@@ -2918,5 +2945,103 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, BindError::ImplicitIntersectionRequiresAnchor));
+    }
+
+    /// **W5-151 (4.9.O MEDIUM-1 closure):** `@<column-ref>` sets
+    /// `is_this_row: true` on the bound StructuredRef. This is the
+    /// load-bearing case for `=@Sales[Qty]` ≡ `Sales[@Qty]`.
+    #[test]
+    fn at_bare_column_structured_ref_sets_is_this_row_true() {
+        let tables = OneTable(sales_table());
+        let tokens = lex("@Sales[Qty]").unwrap();
+        let expr = parse(tokens).unwrap();
+        let plan = bind_with_site(
+            &expr,
+            BindSite::at_cell(Address {
+                sheet: 0,
+                row: 1,
+                col: 0,
+            }),
+            &EmptyNameLookup,
+            &EmptySheetResolver,
+            &tables,
+        )
+        .unwrap();
+        match plan {
+            ExprPlan::StructuredRef { is_this_row, .. } => {
+                assert!(is_this_row, "@<BareColumn> must set is_this_row=true");
+            }
+            other => panic!("expected ExprPlan::StructuredRef, got {other:?}"),
+        }
+    }
+
+    /// **W5-151 (4.9.O MEDIUM-1 closure):** `@<#Headers, BareCol>`
+    /// combination — `@Sales[[#Headers], [Qty]]` resolves to a single
+    /// header cell. Pre-fix, the binder force-overrode
+    /// `is_this_row: true`, making eval try to narrow the header cell
+    /// to the formula's row (returns `#VALUE!` for any formula not in
+    /// the header row). Post-fix, the @ patch is a NO-OP for non-bare-
+    /// column specs: `is_this_row` stays at whatever
+    /// `resolve_structured_ref` returned (false for `[#Headers]` →
+    /// single header cell is idempotent, rule 5).
+    #[test]
+    fn at_headers_combination_does_not_force_is_this_row() {
+        let tables = OneTable(sales_table());
+        let tokens = lex("@Sales[[#Headers],[Qty]]").unwrap();
+        let expr = parse(tokens).unwrap();
+        let plan = bind_with_site(
+            &expr,
+            BindSite::at_cell(Address {
+                sheet: 0,
+                row: 99,
+                col: 0,
+            }),
+            &EmptyNameLookup,
+            &EmptySheetResolver,
+            &tables,
+        )
+        .unwrap();
+        match plan {
+            ExprPlan::StructuredRef { is_this_row, .. } => {
+                assert!(
+                    !is_this_row,
+                    "@<Headers combination> must preserve is_this_row=false from resolve"
+                );
+            }
+            other => panic!("expected ExprPlan::StructuredRef, got {other:?}"),
+        }
+    }
+
+    /// **W5-151 (4.9.O MEDIUM-1 closure):** `@<#All>` resolves to
+    /// the full 2-D footprint. The @ patch should NOT force
+    /// `is_this_row: true` — design rule 4 says 2-D ranges under @
+    /// are always `#VALUE!`. The `is_this_row` flag is irrelevant
+    /// for 2-D ranges; preserving `resolve`'s false is correct.
+    #[test]
+    fn at_all_combination_does_not_force_is_this_row() {
+        let tables = OneTable(sales_table());
+        let tokens = lex("@Sales[[#All]]").unwrap();
+        let expr = parse(tokens).unwrap();
+        let plan = bind_with_site(
+            &expr,
+            BindSite::at_cell(Address {
+                sheet: 0,
+                row: 1,
+                col: 0,
+            }),
+            &EmptyNameLookup,
+            &EmptySheetResolver,
+            &tables,
+        )
+        .unwrap();
+        match plan {
+            ExprPlan::StructuredRef { is_this_row, .. } => {
+                assert!(
+                    !is_this_row,
+                    "@<#All combination> must preserve is_this_row=false from resolve"
+                );
+            }
+            other => panic!("expected ExprPlan::StructuredRef, got {other:?}"),
+        }
     }
 }

@@ -235,7 +235,14 @@ fn apply_producer_side(ops: &[Op], wb: &mut Workbook) {
             // locale. Pure metadata; mirror replay by calling the
             // matching `Workbook` setter directly.
             Op::SetReferenceMode { mode } => {
-                wb.set_reference_mode(mode.to_runtime());
+                // **W5-151 (4.9.O MEDIUM-2):** `to_runtime` is now
+                // fallible (mirroring LocaleWire); `realistic_op_sequence`
+                // never emits Unknown.
+                wb.set_reference_mode(
+                    mode.clone()
+                        .to_runtime()
+                        .expect("realistic_op_sequence never emits unknown reference modes"),
+                );
             }
             Op::SetLocale { locale } => {
                 wb.set_locale(
