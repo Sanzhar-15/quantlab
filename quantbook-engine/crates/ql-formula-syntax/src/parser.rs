@@ -381,6 +381,25 @@ impl Parser {
                 abs_end: abs,
             })),
 
+            // **W5-143 (Phase 4.9.G):** `@expr` — Excel-365 implicit
+            // intersection. Treated as a prefix unary at bp 70
+            // (matches the existing unary-minus/plus convention):
+            // - Tighter than every binary operator (`+`, `*`, `&`,
+            //   comparison) so `@A1 + B2` parses as `(@A1) + B2`.
+            // - Looser than range `:` (bp 80/81) so `@A:A` parses as
+            //   `@(A:A)` — narrow the whole column to formula's row,
+            //   per Excel canon.
+            // - Composes with sheet prefix via `apply_sheet_to_term`
+            //   which recurses INTO `ImplicitIntersection` (Sheet1!@A1
+            //   → `@<CellRef with sheet>`).
+            // - In-bracket `@` (inside `Sales[@Col]`) never reaches
+            //   here — the lexer absorbs it into the StructuredRef
+            //   bracket_content per OOXML escape rules.
+            Token::At => {
+                let inner = self.parse_expr(70)?;
+                Ok(Expr::ImplicitIntersection(Box::new(inner)))
+            }
+
             // **W5-139 (Phase 4.9.C):** R1C1-style reference token,
             // emitted by `lex_with(.., R1C1, ..)`. Parser folds into
             // an intermediate `Expr::R1C1Ref` carrying both axes
@@ -953,6 +972,17 @@ fn apply_sheet_to_term(expr: Expr, name: Arc<str>) -> Result<Expr, ParseError> {
                 row_axis,
                 col_axis,
             })
+        }
+        // **W5-143 (Phase 4.9.G):** `Sheet1!@A1` — sheet prefix
+        // applies to the WRAPPED reference, not the `@` operator
+        // itself. Recurse into the inner expr; the inner ref
+        // gets the sheet name stamped in. If `apply_sheet_to_term`
+        // fails on the inner (e.g. `Sheet1!@"x"` — string after
+        // `@`), the error propagates up with the original
+        // `SheetQualifierFollowedByNonReference` semantics.
+        Expr::ImplicitIntersection(inner) => {
+            let inner_with_sheet = apply_sheet_to_term(*inner, name)?;
+            Ok(Expr::ImplicitIntersection(Box::new(inner_with_sheet)))
         }
         other => Err(ParseError::SheetQualifierFollowedByNonReference {
             got: format!("{other:?}"),
@@ -3131,6 +3161,154 @@ mod tests {
                 assert_eq!(end_col, AxisSpec::Rel(0));
             }
             other => panic!("expected RangeRef::R1C1Cells, got {other:?}"),
+        }
+    }
+
+    // ===================================================================
+    // W5-143 (Phase 4.9.G) — `@` (implicit intersection) parser tests.
+    // ===================================================================
+
+    /// **`@A1` parses to `ImplicitIntersection(CellRef)`.**
+    #[test]
+    fn at_wraps_cellref_into_implicit_intersection() {
+        match p("@A1") {
+            Expr::ImplicitIntersection(inner) => match *inner {
+                Expr::CellRef(addr) => {
+                    assert_eq!(addr.col, 0);
+                    assert_eq!(addr.row, 0);
+                }
+                other => panic!("expected inner CellRef, got {other:?}"),
+            },
+            other => panic!("expected ImplicitIntersection, got {other:?}"),
+        }
+    }
+
+    /// **`@SUM(A1:A10)` parses with the function as the inner expr.**
+    #[test]
+    fn at_wraps_function_call() {
+        match p("@SUM(A1:A10)") {
+            Expr::ImplicitIntersection(inner) => match *inner {
+                Expr::Function { name, args } => {
+                    assert_eq!(name.as_ref(), "SUM");
+                    assert_eq!(args.len(), 1);
+                }
+                other => panic!("expected inner Function, got {other:?}"),
+            },
+            other => panic!("expected ImplicitIntersection, got {other:?}"),
+        }
+    }
+
+    /// **`@5` parses with a numeric inner.** Useful for testing the
+    /// scalar pass-through case (eval rule § 3.3 #1).
+    #[test]
+    fn at_wraps_scalar_number() {
+        match p("@5") {
+            Expr::ImplicitIntersection(inner) => match *inner {
+                Expr::Number(n) => assert_eq!(n, 5.0),
+                other => panic!("expected inner Number, got {other:?}"),
+            },
+            other => panic!("expected ImplicitIntersection, got {other:?}"),
+        }
+    }
+
+    /// **`@Sales[Qty]` parses with structured-ref inner.** The
+    /// out-of-bracket `@` is distinct from the in-bracket `@` of
+    /// `Sales[@Col]`.
+    #[test]
+    fn at_wraps_structured_ref() {
+        match p("@Sales[Qty]") {
+            Expr::ImplicitIntersection(inner) => match *inner {
+                Expr::StructuredRef { table_name, .. } => {
+                    assert_eq!(table_name.as_ref(), "Sales");
+                }
+                other => panic!("expected inner StructuredRef, got {other:?}"),
+            },
+            other => panic!("expected ImplicitIntersection, got {other:?}"),
+        }
+    }
+
+    /// **`Sales[@Col]` parses as a PLAIN StructuredRef.** No
+    /// ImplicitIntersection wrapping — the in-bracket `@` is part
+    /// of the structured-ref grammar (this-row form).
+    #[test]
+    fn in_bracket_at_does_not_produce_implicit_intersection() {
+        match p("Sales[@Col]") {
+            Expr::StructuredRef { table_name, spec } => {
+                assert_eq!(table_name.as_ref(), "Sales");
+                match spec {
+                    TableSpecSubtree::ThisRowColumn(name) => {
+                        assert_eq!(name.as_ref(), "Col");
+                    }
+                    other => panic!("expected ThisRowColumn, got {other:?}"),
+                }
+            }
+            other => panic!("expected StructuredRef (no @ wrapper), got {other:?}"),
+        }
+    }
+
+    /// **`Sheet1!@A1` — sheet binds to inner ref, `@` wraps.**
+    /// Per design § 3.3 #10 / § 6 q8.
+    #[test]
+    fn sheet_qualified_at_ref_binds_sheet_to_inner() {
+        match p("Sheet1!@A1") {
+            Expr::ImplicitIntersection(inner) => match *inner {
+                Expr::CellRef(addr) => match addr.sheet {
+                    SheetRef::Name(n) => assert_eq!(n.as_ref(), "Sheet1"),
+                    other => panic!("expected SheetRef::Name on inner, got {other:?}"),
+                },
+                other => panic!("expected inner CellRef, got {other:?}"),
+            },
+            other => panic!("expected ImplicitIntersection, got {other:?}"),
+        }
+    }
+
+    /// **`@A:A` — whole-column wrapping.** Inner is a RangeRef.
+    #[test]
+    fn at_wraps_whole_column_range() {
+        match p("@A:A") {
+            Expr::ImplicitIntersection(inner) => match *inner {
+                Expr::RangeRef(_) => {} // success
+                other => panic!("expected inner RangeRef, got {other:?}"),
+            },
+            other => panic!("expected ImplicitIntersection, got {other:?}"),
+        }
+    }
+
+    /// **`@@A1` — nested wrapping is structurally allowed.** Excel
+    /// canon treats double-`@` as user error (the second `@` no-ops
+    /// after the first), but the PARSER accepts the structure
+    /// faithfully. Semantic check happens at bind/eval.
+    #[test]
+    fn nested_at_wraps_twice() {
+        match p("@@A1") {
+            Expr::ImplicitIntersection(outer) => match *outer {
+                Expr::ImplicitIntersection(_) => {} // double wrap
+                other => panic!("expected nested ImplicitIntersection, got {other:?}"),
+            },
+            other => panic!("expected ImplicitIntersection, got {other:?}"),
+        }
+    }
+
+    /// **`@expr` inside a function call.** `SUM(@A1, B2)` →
+    /// Function args = [ImplicitIntersection(A1), CellRef(B2)].
+    #[test]
+    fn at_inside_function_argument() {
+        match p("SUM(@A1, B2)") {
+            Expr::Function { args, .. } => {
+                assert_eq!(args.len(), 2);
+                assert!(matches!(args[0], Expr::ImplicitIntersection(_)));
+                assert!(matches!(args[1], Expr::CellRef(_)));
+            }
+            other => panic!("expected Function, got {other:?}"),
+        }
+    }
+
+    /// **A1 mode parse still works for non-`@` formulas.**
+    #[test]
+    fn at_does_not_affect_non_at_a1_parsing() {
+        match p("A1 + B2") {
+            Expr::Binary { .. } => {}
+            other => panic!("expected Binary, got {other:?}"),
         }
     }
 }

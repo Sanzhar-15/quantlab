@@ -789,6 +789,16 @@ fn bind_with_context_v2<L: NameLookup>(
                 abs_row: matches!(row_axis, AxisSpec::Abs(_)),
             })
         }
+        // **W5-143 (Phase 4.9.G):** implicit-intersection binding +
+        // eval are Phase 4.9.H work (`ExprPlan::ImplicitIntersection`
+        // variant + narrow-per-§-3.3 eval). Until then, the binder
+        // surfaces a clear "unsupported variant" rather than a
+        // fallback that silently passes through.
+        Expr::ImplicitIntersection(_) => Err(BindError::UnsupportedVariant(
+            "Expr::ImplicitIntersection binding is Phase 4.9.H — parser-only \
+             support landed in 4.9.G; eval narrows the operand per design § 3.3 \
+             once the binder + eval arms ship.",
+        )),
     }
 }
 
@@ -1212,6 +1222,8 @@ fn variant_kind(e: &Expr) -> &'static str {
         Expr::StructuredRef { .. } => "StructuredRef",
         // **W5-139 (Phase 4.9.C):** intermediate R1C1 form.
         Expr::R1C1Ref { .. } => "R1C1Ref",
+        // **W5-143 (Phase 4.9.G):**
+        Expr::ImplicitIntersection(_) => "ImplicitIntersection",
     }
 }
 

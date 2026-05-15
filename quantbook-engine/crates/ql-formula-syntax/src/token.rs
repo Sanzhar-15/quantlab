@@ -124,6 +124,23 @@ pub enum Token {
     /// whitespace). The body is the decoded form (no surrounding quotes).
     QuotedSheetName(Arc<str>),
 
+    /// **W5-143 (Phase 4.9.G):** standalone `@` operator — Excel-365
+    /// implicit-intersection. Emitted only when `@` appears OUTSIDE a
+    /// structured-reference bracket (the in-bracket `@` is consumed
+    /// by `consume_structured_ref_bracket` as part of the bracket
+    /// content per OOXML escape rules).
+    ///
+    /// Examples:
+    /// - `=@A1` → `[Token::At, Token::CellRef { A1 }]`
+    /// - `=@SUM(A1:A10)` → `[Token::At, Token::Ident("SUM"), ...]`
+    /// - `=Sheet1!@A1` → `[Token::SheetName, Token::Bang, Token::At, Token::CellRef]`
+    /// - `=Sales[@Col]` → `[Token::StructuredRef { ... }]` (in-bracket `@`
+    ///   stays inside the structured-ref token; NO `Token::At`).
+    ///
+    /// The parser folds `[Token::At, <ref-like expr>]` into
+    /// `Expr::ImplicitIntersection(Box<Expr>)`.
+    At,
+
     /// **W5-138 (Phase 4.9.B.4):** R1C1-style reference. Emitted only
     /// when `lex_with` is called with `ReferenceMode::R1C1`. Each axis
     /// is independently `Abs(n)` (1-indexed) or `Rel(offset)` (signed

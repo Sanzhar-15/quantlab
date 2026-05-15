@@ -332,6 +332,15 @@ pub fn lex_with(input: &str, mode: ReferenceMode, locale: Locale) -> Result<Vec<
                 // returns true. Fall through to next loop iteration.
             }
             '$' | 'A'..='Z' | 'a'..='z' | '_' => out.push(lex_ident_or_ref(&mut chars)?),
+            // **W5-143 (Phase 4.9.G):** standalone `@` — implicit-
+            // intersection operator. In-bracket `@` (inside
+            // `Sales[@Col]`) is consumed by
+            // `consume_structured_ref_bracket` per OOXML escape
+            // rules and never reaches this arm.
+            '@' => {
+                chars.next();
+                out.push(Token::At);
+            }
             other => return Err(LexError::UnexpectedChar(other)),
         }
     }
@@ -1646,15 +1655,67 @@ mod tests {
 
     #[test]
     fn unexpected_char_errors() {
-        // `@` is the implicit-intersection operator (Phase 4.9.G). Before
-        // that ships, the lexer rejects `@` as unexpected. This test
-        // will need to be deleted or inverted in the 4.9.G commit.
-        assert!(matches!(lex("@"), Err(LexError::UnexpectedChar('@'))));
+        // `@` is the implicit-intersection operator. As of W5-143
+        // (Phase 4.9.G), the lexer emits `Token::At` instead of
+        // rejecting; the post-W5-143 assertion lives in
+        // `standalone_at_lexes_to_token_at` below.
         // `{` was rejected pre-W5-97 (Phase 4.7.C); now accepted as
         // `Token::LBrace`. The replacement assertion (lex_ok) lives in
         // `lbrace_and_rbrace_lex_to_brace_tokens` below in this module.
         // backtick — not in the Excel alphabet at all.
         assert!(matches!(lex("`"), Err(LexError::UnexpectedChar('`'))));
+    }
+
+    /// **W5-143 (Phase 4.9.G):** standalone `@` outside brackets
+    /// lexes to `Token::At`. The parser folds it into
+    /// `Expr::ImplicitIntersection`.
+    #[test]
+    fn standalone_at_lexes_to_token_at() {
+        let tokens = lex("@").unwrap();
+        assert_eq!(tokens, vec![Token::At]);
+    }
+
+    /// **W5-143:** `@` followed by a cell ref lexes as two tokens.
+    #[test]
+    fn at_followed_by_cellref_lexes_as_two_tokens() {
+        let tokens = lex("@A1").unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], Token::At);
+        assert!(matches!(tokens[1], Token::CellRef { col: 0, row: 0, .. }));
+    }
+
+    /// **W5-143:** In-bracket `@` is still consumed by the
+    /// structured-ref bracket logic — NOT emitted as `Token::At`.
+    /// `Sales[@Col]` lexes as a single `StructuredRef`.
+    #[test]
+    fn at_inside_structured_ref_brackets_stays_inside_bracket_content() {
+        let tokens = lex("Sales[@Col]").unwrap();
+        assert_eq!(tokens.len(), 1);
+        match &tokens[0] {
+            Token::StructuredRef {
+                table_name,
+                bracket_content,
+            } => {
+                assert_eq!(table_name.as_ref(), "Sales");
+                // OOXML escape rules: bare `@` inside brackets is
+                // the unescape sentinel for `[@Col]` (this-row form).
+                assert_eq!(bracket_content.as_ref(), "@Col");
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    /// **W5-143:** `Sheet1!@A1` lexes as
+    /// SheetName + Bang + At + CellRef — the parser binds the sheet
+    /// to the inner ref and wraps in `@`.
+    #[test]
+    fn sheet_qualified_at_ref_lexes_as_four_tokens() {
+        let tokens = lex("Sheet1!@A1").unwrap();
+        assert_eq!(tokens.len(), 4);
+        assert!(matches!(tokens[0], Token::SheetName(_)));
+        assert!(matches!(tokens[1], Token::Bang));
+        assert_eq!(tokens[2], Token::At);
+        assert!(matches!(tokens[3], Token::CellRef { .. }));
     }
 
     #[test]

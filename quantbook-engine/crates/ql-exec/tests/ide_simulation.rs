@@ -73,7 +73,10 @@ fn ide_02_bind_errors_carry_user_facing_display() {
     // Three error classes the IDE will commonly hit:
     let cases: &[(&str, &str)] = &[
         // (formula text, expected substring in user-facing Display)
-        ("@foo", "unexpected character"),
+        // **W5-143 (Phase 4.9.G):** `@` is now valid (implicit
+        // intersection). Backtick replaces it as the still-invalid
+        // lex char.
+        ("`foo", "unexpected character"),
         ("(1 + 2", "parse error"),
         ("UnresolvedName + 1", "UNRESOLVEDNAME"),
     ];

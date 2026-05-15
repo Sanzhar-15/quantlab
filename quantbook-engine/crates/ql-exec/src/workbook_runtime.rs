@@ -3844,16 +3844,19 @@ mod tests {
         let mut wb = make_runtime_workbook();
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-        // `@` is not in the Phase 0 alphabet — lex error.
+        // **W5-143 (Phase 4.9.G):** `@` is now the implicit-intersection
+        // operator, so it's no longer a lex error. Use backtick (`)
+        // which has no Excel-formula lexical role and stays
+        // unrepresentable.
         let err = rt
-            .set_formula(0, 0, 0, "@foo")
+            .set_formula(0, 0, 0, "`foo")
             .expect_err("expected an error");
         let display = err.to_string();
         assert!(
             display.contains("unexpected character"),
             "Display lost the message: {display:?}"
         );
-        // No debug-syntax leak like `UnexpectedChar('@')`.
+        // No debug-syntax leak like `UnexpectedChar('`')`.
         assert!(
             !display.contains("UnexpectedChar"),
             "Display still leaks Rust variant syntax: {display:?}"
@@ -4117,8 +4120,10 @@ mod tests {
         let mut oplog = OpLog::new();
         {
             let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
-            // `@` is rejected by the lexer.
-            let result = rt.set_formula(0, 0, 0, "@foo");
+            // **W5-143 (Phase 4.9.G):** `@` is now the implicit-
+            // intersection operator. Backtick is still rejected by
+            // the lexer as unexpected char.
+            let result = rt.set_formula(0, 0, 0, "`foo");
             assert!(matches!(result, Err(RuntimeError::Lex(_))));
         }
         assert!(

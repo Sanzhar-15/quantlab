@@ -93,6 +93,25 @@ pub enum Expr {
     ///   design § 3.3).
     Error(ql_types::ErrorValue),
 
+    /// **W5-143 (Phase 4.9.G):** Excel-365 implicit-intersection
+    /// operator `@expr`. The operator narrows / passes-through its
+    /// operand based on the operand's value-level shape (eval rules
+    /// in design § 3.3). The variant is NOT surface-only — printer
+    /// emits `@<inner>` so round-trip through formula text is
+    /// lossless.
+    ///
+    /// Common forms:
+    /// - `@A1` → narrow A1 (a scalar; passes through).
+    /// - `@A1:A10` → narrow a vertical range to the formula's row.
+    /// - `@SUM(...)` → narrow an array-returning function result.
+    /// - `Sheet1!@A1` → sheet-prefix applies to the inner ref; the
+    ///   `@` wraps the result.
+    ///
+    /// Binder + eval live in 4.9.H. For 4.9.G (parser only), the
+    /// binder surfaces `BindError::UnsupportedVariant` and the
+    /// calcgraph stubs panic loudly (`unreachable!()`).
+    ImplicitIntersection(Box<Expr>),
+
     /// **W5-139 (Phase 4.9.C):** intermediate R1C1 single-cell
     /// reference, emitted by the parser when fed `Token::R1C1Ref`
     /// from a `mode == R1C1` lex. Each axis is independently
@@ -323,6 +342,12 @@ pub fn rewrite_sheet_name_in_expr(expr: &Expr, old_canonical: &str, new_name: &A
             table_name: table_name.clone(),
             spec: spec.clone(),
         },
+        // **W5-143 (Phase 4.9.G):** implicit-intersection — recurse
+        // into inner. Sheet ref lives on the wrapped expr (per
+        // `apply_sheet_to_term` placing the sheet INSIDE `@`).
+        Expr::ImplicitIntersection(inner) => Expr::ImplicitIntersection(Box::new(
+            rewrite_sheet_name_in_expr(inner, old_canonical, new_name),
+        )),
     }
 }
 
@@ -392,6 +417,12 @@ pub fn rewrite_table_ref(expr: &Expr, old_canonical: &str, new_name: &Arc<str>) 
                     spec: spec.clone(),
                 }
             }
+        }
+        // **W5-143 (Phase 4.9.G):** implicit-intersection — recurse
+        // into inner (a StructuredRef inside `@` is reachable via
+        // `=@Sales[Qty]`).
+        Expr::ImplicitIntersection(inner) => {
+            Expr::ImplicitIntersection(Box::new(rewrite_table_ref(inner, old_canonical, new_name)))
         }
     }
 }
@@ -482,6 +513,11 @@ pub fn rewrite_column_ref(
             row_axis: *row_axis,
             col_axis: *col_axis,
         },
+        // **W5-143 (Phase 4.9.G):** implicit-intersection — recurse
+        // into inner so `=@Sales[OldCol]` rewrites correctly.
+        Expr::ImplicitIntersection(inner) => Expr::ImplicitIntersection(Box::new(
+            rewrite_column_ref(inner, table_canonical_upper, old_col, new_col),
+        )),
         Expr::StructuredRef { table_name, spec } => {
             if table_name.eq_ignore_ascii_case(table_canonical_upper) {
                 Expr::StructuredRef {

@@ -707,6 +707,15 @@ fn print_expr_ctx(
             out.push(']');
             Ok(())
         }
+        // **W5-143 (Phase 4.9.G):** implicit-intersection — emit
+        // `@<inner>` for round-trip preservation. Inner is printed
+        // with prefix-unary-bp so future binary-context nesting
+        // re-parenthesizes correctly. Today's parser folds `@expr`
+        // greedily so `print(parse("@A1")) == "@A1"`.
+        Expr::ImplicitIntersection(inner) => {
+            out.push('@');
+            print_expr_ctx(inner, ctx, out, 70)
+        }
         // **W5-141 (Phase 4.9.D):** intermediate R1C1 single ref. The
         // emission path depends on `ctx.mode`:
         //
@@ -1961,5 +1970,86 @@ mod tests {
         let expr = parse_a1("2.5");
         let s = print_with(&expr, ReferenceMode::A1, Locale::EnUs, None).unwrap();
         assert_eq!(s, "2.5");
+    }
+
+    // ===================================================================
+    // W5-143 (Phase 4.9.G) — implicit-intersection (`@`) printer tests.
+    // ===================================================================
+
+    /// **`@A1` round-trips.**
+    #[test]
+    fn at_cellref_round_trips() {
+        let expr = parse_a1("@A1");
+        let s = print(&expr);
+        assert_eq!(s, "@A1");
+        // Idempotent through re-parse:
+        assert_eq!(parse_a1(&s), expr);
+    }
+
+    /// **`@A:A` round-trips as `@A:A`.** Range binds tighter than `@`.
+    #[test]
+    fn at_whole_column_round_trips() {
+        let expr = parse_a1("@A:A");
+        let s = print(&expr);
+        assert_eq!(s, "@A:A");
+    }
+
+    /// **`@SUM(...)` round-trips.**
+    #[test]
+    fn at_function_call_round_trips() {
+        let expr = parse_a1("@SUM(A1, B2)");
+        let s = print(&expr);
+        assert_eq!(s, "@SUM(A1, B2)");
+    }
+
+    /// **`Sheet1!@A1` round-trips with sheet attached to inner.**
+    /// The printer emits `@Sheet1!A1` (canonical form: `@` first,
+    /// inner CellRef carries its own sheet prefix). The AST is
+    /// identical to that of `Sheet1!@A1` (Excel accepts both
+    /// orderings), so the semantic round-trip property
+    /// `parse(print(parse(x))) == parse(x)` holds.
+    #[test]
+    fn sheet_at_cellref_round_trips_via_ast() {
+        let expr1 = parse_a1("Sheet1!@A1");
+        let printed = print(&expr1);
+        let expr2 = parse_a1(&printed);
+        assert_eq!(expr1, expr2);
+        // Confirm both source-order variants parse identically too.
+        let expr3 = parse_a1("@Sheet1!A1");
+        assert_eq!(expr1, expr3);
+    }
+
+    /// **`SUM(@A1, B2)` round-trips with @ inside arg.**
+    #[test]
+    fn at_inside_function_arg_round_trips() {
+        let expr = parse_a1("SUM(@A1, B2)");
+        let s = print(&expr);
+        assert_eq!(s, "SUM(@A1, B2)");
+    }
+
+    /// **`@@A1` — nested wrap round-trips.**
+    #[test]
+    fn nested_at_round_trips() {
+        let expr = parse_a1("@@A1");
+        let s = print(&expr);
+        assert_eq!(s, "@@A1");
+    }
+
+    /// **R1C1 mode prints `@` identically.** Mode affects ref form,
+    /// not the `@` operator itself.
+    #[test]
+    fn at_under_r1c1_mode_emits_at_plus_r1c1_ref() {
+        let expr = parse_r1c1("@R1C1");
+        let s = print_with(&expr, ReferenceMode::R1C1, Locale::EnUs, None).unwrap();
+        assert_eq!(s, "@R1C1");
+    }
+
+    /// **DE locale prints `@` identically — `@` is not locale-configurable.**
+    /// (Closes Sonnet H-5 by construction; `@` is invariant across locales.)
+    #[test]
+    fn at_under_de_locale_emits_at_unchanged() {
+        let expr = parse_a1("@A1");
+        let s = print_with(&expr, ReferenceMode::A1, Locale::De, None).unwrap();
+        assert_eq!(s, "@A1");
     }
 }

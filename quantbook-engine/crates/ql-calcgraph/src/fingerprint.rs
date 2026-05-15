@@ -200,6 +200,16 @@ fn hash_expr(expr: &Expr, h: &mut impl Hasher) {
             "hash_expr: Expr::R1C1Ref is parser-intermediate; storage canon (design § 4.4) \
              must lower to absolute CellRef before fingerprinting."
         ),
+        // **W5-143 (Phase 4.9.G):** implicit-intersection. UNLIKE
+        // `Expr::R1C1Ref`, this variant IS preserved through
+        // storage canon (design § 4.2 — "NOT surface-only"). So
+        // the fingerprint must hash it stably. The wrapper +
+        // inner-expr hash combination distinguishes `@A1` from
+        // `A1` and from `@@A1` (nested wrappers).
+        Expr::ImplicitIntersection(inner) => {
+            13u8.hash(h);
+            hash_expr(inner, h);
+        }
     }
 }
 
