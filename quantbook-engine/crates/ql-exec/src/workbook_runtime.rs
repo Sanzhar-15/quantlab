@@ -1717,6 +1717,24 @@ impl<'a> WorkbookRuntime<'a> {
     /// the table footprint are untouched. Formulas referencing the
     /// dropped table re-bind to `BindError::UnknownTable` on next
     /// recompute. Emits `Op::DropTable` to the attached op log (if any).
+    ///
+    /// **W5-155 (Phase 4.8.G.3):** also fires the calcgraph's
+    /// `on_table_drop` hook (W5-154) so formulas previously
+    /// referencing this table get BFS-dirty-fanned. Pre-W5-155 the
+    /// drop completed without notifying the calcgraph — formulas
+    /// with cached `ExprPlan::StructuredRef` plans would continue
+    /// reading the (now-untyped) cell range until something else
+    /// invalidated them. Post-W5-155 the hook fires:
+    /// 1. `table_to_formulas[name]` enumerates the readers.
+    /// 2. Each reader marked dirty + BFS-fanout (W5-91 H2 pattern).
+    /// 3. Next recompute re-binds → `BindError::UnknownTable` →
+    ///    `Value::Error(#NAME?)` per the existing 4.8.F binder.
+    ///
+    /// The hook fires AFTER the op-log append (atomic with the
+    /// mutation, per W5-103) and BEFORE `tables_mut().remove`
+    /// (graph fanout is read-only on workbook state; the order
+    /// is irrelevant for correctness but matches the pre-existing
+    /// rename/resize convention).
     pub fn drop_table(&mut self, name: &str) -> Result<(), RuntimeError> {
         let canonical = name.to_ascii_uppercase();
         if self.workbook.tables().lookup(&canonical).is_none() {
@@ -1726,6 +1744,13 @@ impl<'a> WorkbookRuntime<'a> {
             oplog.append(Op::DropTable {
                 name: canonical.clone(),
             })?;
+        }
+        // **W5-155 (Phase 4.8.G.3):** dirty-fan readers BEFORE
+        // removing the metadata. The hook uses case-insensitive
+        // lookup so either case (canonical-upper or the user's
+        // input casing) reaches the index.
+        if let Some(g) = self.graph.as_deref_mut() {
+            g.on_table_drop(&canonical);
         }
         let _ = self.workbook.tables_mut().remove(&canonical);
         Ok(())
@@ -10046,6 +10071,56 @@ mod tests {
             RuntimeError::TableNotFound(n) => assert_eq!(n, "Nope"),
             other => panic!("expected TableNotFound, got {other:?}"),
         }
+    }
+
+    /// **W5-155 (Phase 4.8.G.3):** `WorkbookRuntime::drop_table` must
+    /// invoke the calcgraph `on_table_drop` hook so any formula
+    /// referencing the dropped table is BFS-dirtied. Pre-W5-155 the
+    /// runtime relied on plan-cache invalidation alone, which left the
+    /// dirty set untouched and missed cells got stale values until an
+    /// unrelated edit happened to touch them.
+    #[test]
+    fn drop_table_fires_on_table_drop_hook_and_dirties_readers() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        // Build: Sales table at A1:A3 (header + 2 data rows) with
+        // column Qty, values 10/20, and B1 = SUM(Sales[Qty]).
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+            rt.set_value(0, 1, 0, Value::Number(10.0)).unwrap();
+            rt.set_value(0, 2, 0, Value::Number(20.0)).unwrap();
+            let v = rt.set_formula(0, 0, 1, "SUM(Sales[Qty])").unwrap();
+            assert_eq!(v, Value::Number(30.0));
+            // Drain dirty so the post-drop assertion is unambiguous.
+            let _ = rt.recompute_dirty().expect("graph attached");
+        }
+        let formula_node = graph
+            .cell_node_for(0, 0, 1)
+            .expect("B1 formula node registered");
+        assert!(
+            !graph.is_dirty(formula_node),
+            "after recompute_dirty B1 should be clean"
+        );
+        let before = graph.hook_counts().table_drop;
+
+        // Drop the table — the hook must fire and dirty B1.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.drop_table("Sales").unwrap();
+        }
+        assert_eq!(
+            graph.hook_counts().table_drop,
+            before + 1,
+            "drop_table must call on_table_drop exactly once"
+        );
+        assert!(
+            graph.is_dirty(formula_node),
+            "B1 = SUM(Sales[Qty]) must be dirty after Sales is dropped"
+        );
     }
 
     // ===== W5-119 (Phase 4.8.I) — rename_table =====
