@@ -33,7 +33,9 @@
 
 use std::sync::Arc;
 
-use ql_formula_syntax::{lex, parse, LexError, ParseError};
+use ql_formula_syntax::{
+    lex, lex_with, parse, print_with, FormulaSite, LexError, ParseError, PrintError,
+};
 use ql_functions::format::{self, FormatString};
 use ql_functions::FunctionRegistry;
 use ql_io::CellWireValue;
@@ -151,6 +153,18 @@ pub enum RuntimeError {
 
     #[error("parse error: {0}")]
     Parse(#[from] ParseError),
+
+    /// **W5-147 (Phase 4.9.K):** the canonicalize step of `set_formula`
+    /// (per design § 4.4) failed. This happens when the parsed AST
+    /// contains an intermediate `Expr::R1C1Ref` with a relative axis
+    /// that the printer can't resolve, or a malformed R1C1 axis. In
+    /// practice the bind site always has a cell anchor, so the only
+    /// reachable case is a hand-built AST with `AxisSpec::Abs(0)` —
+    /// effectively impossible from `set_formula` since the lexer
+    /// already rejects it as `MalformedR1C1`. Kept as a typed error
+    /// for defense-in-depth.
+    #[error("print error: {0}")]
+    Print(#[from] PrintError),
 
     #[error("bind error: {0}")]
     Bind(BindError),
@@ -530,33 +544,66 @@ impl<'a> WorkbookRuntime<'a> {
         // asserts `row <= MAX_ROW && col <= MAX_COLUMN`).
         validate_cell(self.workbook, sheet, row, col)?;
 
-        let formula_text = formula_text.into();
-        // Phase 2B.3: consult the bind-plan cache first. The key includes
-        // the current NameTable generation so a name registration since
-        // the last bind produces a miss → re-bind against the new table.
-        // Cached `Arc<ExprPlan>` is shared with `recompute_all`, so a
-        // subsequent recompute of this cell skips lex/parse/bind entirely.
+        let raw_text = formula_text.into();
+
+        // **W5-147 (Phase 4.9.K):** canonical-storage flow per design §
+        // 4.4. Read the workbook's user-facing mode + locale, lex the
+        // input under those, parse, then `print_with(.., A1, EnUs,
+        // Some(site))` to canonicalize.
+        //
+        // Outputs:
+        // - `canonical_text` is what we store in the op-log + workbook
+        //   formula table. Always A1+EnUs, with R1C1 forms resolved to
+        //   A1 via the formula's own cell anchor.
+        // - `expr` is the parsed AST, fed into bind below.
+        //
+        // The `parse → print_with` round-trip canonicalizes:
+        //   - R1C1Ref → `$E$3` / `A1` (abs flags from AxisSpec).
+        //   - `2,5` (DE) → `2.5` (EN).
+        //   - `SUM(A1; B2)` (DE) → `SUM(A1, B2)` (EN).
+        //   - `@A1` stays `@A1` (implicit intersection is locale + mode
+        //     invariant; preserved through canonicalization).
+        let mode = self.workbook.reference_mode();
+        let locale = self.workbook.locale();
+        let addr = ql_types::Address::new(sheet, row, col);
+        let site = FormulaSite::at_cell(addr);
+
+        let tokens = lex_with(raw_text.as_ref(), mode, locale)?;
+        let expr = parse(tokens)?;
+        let canonical_text: Arc<str> = Arc::from(print_with(
+            &expr,
+            ql_types::ReferenceMode::A1,
+            ql_types::Locale::EnUs,
+            Some(site),
+        )?);
+        // **W5-147:** downstream code (put_formula, write_spill, the
+        // failure-tracking path that reads `formula_text` by name) all
+        // expect a single `formula_text` Arc<str>. Rebind here so the
+        // canonical form propagates through unchanged code paths.
+        let formula_text: Arc<str> = Arc::clone(&canonical_text);
+
+        // Phase 2B.3: consult the bind-plan cache. **W5-147 update**:
+        // the cache key now uses `canonical_text` (not the raw input)
+        // so two writes with different RAW text (`A1` vs `R1C1` for
+        // the same anchor; `2.5` vs `2,5`) but the same canonical form
+        // share a single plan. The NameTable-generation slot still
+        // invalidates on name registration.
         let name_gen = self.workbook.names().generation();
         let cache_key = PlanCacheKey {
-            text: Arc::clone(&formula_text),
+            text: Arc::clone(&canonical_text),
             sheet,
             name_gen,
         };
         let plan: Arc<crate::plan::ExprPlan> =
             self.plan_cache
                 .get_or_insert::<_, RuntimeError>(cache_key, || {
-                    let tokens = lex(formula_text.as_ref())?;
-                    let expr = parse(tokens)?;
-                    // Phase 2A.1 (2026-05-12): bind against the workbook's
-                    // NameTable so `Expr::NameRef` resolves against defined
-                    // names. W5-92 (Phase 4.6.D): pass `&Workbook` for names
-                    // so the two-tier sheet-then-workbook chain fires.
+                    // We already have the parsed `expr` — bind directly.
                     // **W5-114 (Phase 4.8.E):** carry the formula's own cell
                     // address through BindSite; 4.8.F's structured-ref
                     // `[@Col]` resolution reads it.
                     Ok(bind_with_site(
                         &expr,
-                        BindSite::at_cell(ql_types::Address::new(sheet, row, col)),
+                        BindSite::at_cell(addr),
                         self.workbook,
                         self.workbook,
                         self.workbook,
@@ -581,7 +628,11 @@ impl<'a> WorkbookRuntime<'a> {
                 sheet,
                 row,
                 col,
-                text: formula_text.as_ref().to_owned(),
+                // **W5-147 (Phase 4.9.K):** persist CANONICAL (A1+EnUs)
+                // text per design § 4.4. Replay against a fresh
+                // workbook re-applies the canonical text regardless
+                // of the original user-typed mode / locale.
+                text: canonical_text.as_ref().to_owned(),
             })?;
         }
 
@@ -3264,7 +3315,17 @@ impl<'a> WorkbookRuntime<'a> {
         let plan: Arc<crate::plan::ExprPlan> =
             self.plan_cache
                 .get_or_insert::<_, RuntimeError>(cache_key, || {
-                    let tokens = lex(formula_text.as_ref())?;
+                    // **W5-147 (Phase 4.9.K):** formula_text here is the
+                    // CANONICAL (A1+EnUs) text stored at set_formula
+                    // time. Lex with the canonical mode/locale —
+                    // regardless of the workbook's current
+                    // reference_mode + locale settings, the stored text
+                    // is always A1+EnUs per design § 4.4.
+                    let tokens = lex_with(
+                        formula_text.as_ref(),
+                        ql_types::ReferenceMode::A1,
+                        ql_types::Locale::EnUs,
+                    )?;
                     let expr = parse(tokens)?;
                     // W5-92 (Phase 4.6.D): pass `workbook` for names so
                     // the two-tier sheet-then-workbook scope chain fires.
@@ -4614,10 +4675,12 @@ mod tests {
         // SUM(Sales) — Phase 3.6: actual evaluation. Empty range sums to 0.
         let v = rt.set_formula(0, 0, 0, "SUM(Sales)").unwrap();
         assert_eq!(v, Value::Number(0.0));
-        // Formula text was written (no partial-failure short-circuit).
+        // Formula text canonicalized through W5-147's lex→parse→print
+        // pipeline. NameRef "Sales" uppercases to "SALES" per parser
+        // Excel canon.
         assert_eq!(
             wb.formula_at(0, 0, 0).map(|s| s.as_ref()),
-            Some("SUM(Sales)")
+            Some("SUM(SALES)")
         );
     }
 
@@ -10805,6 +10868,73 @@ mod tests {
             rt.set_locale(ql_types::Locale::EnUs).unwrap();
         }
         assert_eq!(oplog.len(), 0);
+    }
+
+    // -------------------------------------------------------------
+    // W5-147 (Phase 4.9.K) — set_formula canonical-storage tests.
+    // -------------------------------------------------------------
+
+    /// **R1C1 input canonicalizes to A1 in storage.** When the
+    /// workbook is in R1C1 mode and user types `R1C1`, the stored
+    /// formula text is `$A$1` (A1+EnUs canon).
+    #[test]
+    fn set_formula_canonicalizes_r1c1_input_to_a1() {
+        let mut wb = make_runtime_workbook();
+        wb.set_reference_mode(ql_types::ReferenceMode::R1C1);
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "R1C1+R2C2").unwrap();
+        drop(rt);
+        // Stored text uses A1 + absolute markers ($) since the source
+        // R1C1Ref `Abs(1),Abs(1)` becomes A1's `$A$1`.
+        assert_eq!(
+            wb.formula_at(0, 0, 0).map(|s| s.as_ref()),
+            Some("$A$1 + $B$2")
+        );
+    }
+
+    /// **Relative R1C1 canonicalizes using the formula's own cell
+    /// as anchor.** `R[-1]C` at cell (1, 0) → `A1` (no `$` — relative
+    /// R1C1 ↔ unprefixed A1).
+    #[test]
+    fn set_formula_canonicalizes_relative_r1c1_to_unprefixed_a1() {
+        let mut wb = make_runtime_workbook();
+        wb.set_reference_mode(ql_types::ReferenceMode::R1C1);
+        wb.put_at(0, 0, 0, ql_types::Value::Number(7.0));
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // At cell (1, 0), R[-1]C means "row above, same column" = A1.
+        rt.set_formula(0, 1, 0, "R[-1]C").unwrap();
+        drop(rt);
+        assert_eq!(wb.formula_at(0, 1, 0).map(|s| s.as_ref()), Some("A1"));
+    }
+
+    /// **DE locale input canonicalizes to EN.** `SUM(2,5; 3,5)`
+    /// (DE — `,` decimal, `;` arg sep) → `SUM(2.5, 3.5)` (EN canon).
+    #[test]
+    fn set_formula_canonicalizes_de_locale_to_en() {
+        let mut wb = make_runtime_workbook();
+        wb.set_locale(ql_types::Locale::De);
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "SUM(2,5; 3,5)").unwrap();
+        drop(rt);
+        assert_eq!(
+            wb.formula_at(0, 0, 0).map(|s| s.as_ref()),
+            Some("SUM(2.5, 3.5)")
+        );
+    }
+
+    /// **`@A1` (implicit intersection) survives canonicalization.**
+    /// The `@` operator is mode + locale invariant per design § 3.3.
+    #[test]
+    fn set_formula_preserves_at_through_canonicalization() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        rt.set_formula(0, 0, 0, "@A1").unwrap();
+        drop(rt);
+        assert_eq!(wb.formula_at(0, 0, 0).map(|s| s.as_ref()), Some("@A1"));
     }
 
     #[test]

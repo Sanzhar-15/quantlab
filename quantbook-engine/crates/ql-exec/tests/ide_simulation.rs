@@ -280,10 +280,13 @@ fn ide_05_save_reload_preserves_state_and_oplog() {
         reloaded_wb.read(Address::new(0, 1, 0)),
         Value::Number(210.0)
     );
-    // Sheet 0 formula text round-tripped.
+    // Sheet 0 formula text round-tripped. W5-147 (Phase 4.9.K)
+    // canonicalizes set_formula input through lex→parse→print, so
+    // the NameRef `TaxRate` is uppercased to `TAXRATE` (parser Excel
+    // canon).
     assert_eq!(
         reloaded_wb.formula_at(0, 1, 0).map(|s| s.as_ref()),
-        Some("A1 * TaxRate")
+        Some("A1 * TAXRATE")
     );
     // Sheet 1 cell values from the paste.
     for r in 0..2u32 {

@@ -202,10 +202,13 @@ mod tests {
         assert!(result.is_complete());
         // Name survived the round-trip + the formula recomputed against it.
         assert_eq!(loaded.read(Address::new(s, 0, 0)), Value::Number(210.0));
-        // Formula text also preserved.
+        // Formula text canonicalized through set_formula's
+        // lex→parse→print_with(A1, EnUs) pipeline (W5-147 / Phase
+        // 4.9.K). NameRef identifiers are uppercased by the parser
+        // per Excel canon, so `TaxRate` round-trips as `TAXRATE`.
         assert_eq!(
             loaded.formula_at(s, 0, 0).map(|t| t.as_ref()),
-            Some("1000 * TaxRate")
+            Some("1000 * TAXRATE")
         );
         // Name is still in the loaded workbook's NameTable.
         assert!(matches!(
