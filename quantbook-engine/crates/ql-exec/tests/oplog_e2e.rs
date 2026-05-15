@@ -810,3 +810,80 @@ fn save_load_workbook_with_table_and_formula_roundtrips() {
         "post-load SUM(Sales[Qty]) matches pre-save"
     );
 }
+
+/// **W5-125 (Phase 4.8.O.1 — Codex HIGH-1) e2e:** verify that the
+/// replay-side footprint-bounds check rejects a `CreateTable` op whose
+/// dimensions extend past MAX_ROW. This pins the producer-replay
+/// symmetry: an op-log entry constructed by hand (bypassing the
+/// producer guard) still fails loudly at replay rather than registering
+/// an out-of-grid table.
+#[test]
+fn replay_rejects_create_table_with_footprint_past_max_row() {
+    use ql_oplog::{Op, ReplayError};
+    use ql_types::MAX_ROW;
+    let mut oplog = ql_oplog::OpLog::new();
+    oplog
+        .append(Op::CreateTable {
+            name: "BAD".to_owned(),
+            sheet: 0,
+            top_row: MAX_ROW - 1,
+            top_col: 0,
+            rows: 3,
+            cols: 1,
+            has_header: true,
+            has_totals: false,
+            column_names: vec!["x".to_owned()],
+        })
+        .unwrap();
+    let mut wb = fresh_wb();
+    let reg = default_registry();
+    let err = replay_into(&oplog, &mut wb, &reg).unwrap_err();
+    match err {
+        ReplayError::TableCreateRejected { reason, .. } => {
+            assert!(reason.contains("MAX_ROW"), "reason: {reason}");
+        }
+        other => panic!("expected TableCreateRejected, got {other:?}"),
+    }
+}
+
+/// **W5-125 (Phase 4.8.O.1 — Codex HIGH-1) e2e:** mirror of the above
+/// for `ResizeTable`. Constructs a valid CreateTable then a
+/// hand-crafted ResizeTable that grows past MAX_ROW.
+#[test]
+fn replay_rejects_resize_table_with_footprint_past_max_row() {
+    use ql_oplog::{Op, ReplayError};
+    use ql_types::MAX_ROW;
+    let mut oplog = ql_oplog::OpLog::new();
+    oplog
+        .append(Op::CreateTable {
+            name: "SALES".to_owned(),
+            sheet: 0,
+            top_row: MAX_ROW - 4,
+            top_col: 0,
+            rows: 3,
+            cols: 1,
+            has_header: true,
+            has_totals: false,
+            column_names: vec!["qty".to_owned()],
+        })
+        .unwrap();
+    // Grow to 10 rows → last_row = MAX_ROW + 5 > MAX_ROW.
+    oplog
+        .append(Op::ResizeTable {
+            name: "SALES".to_owned(),
+            new_rows: 10,
+            new_cols: 1,
+            added_columns: vec![],
+            removed_columns: vec![],
+        })
+        .unwrap();
+    let mut wb = fresh_wb();
+    let reg = default_registry();
+    let err = replay_into(&oplog, &mut wb, &reg).unwrap_err();
+    match err {
+        ReplayError::TableResizeRejected { reason, .. } => {
+            assert!(reason.contains("MAX_ROW"), "reason: {reason}");
+        }
+        other => panic!("expected TableResizeRejected, got {other:?}"),
+    }
+}

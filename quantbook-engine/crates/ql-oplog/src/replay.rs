@@ -698,6 +698,17 @@ fn apply_resize_table(
             reason: "table rows and cols must both be > 0",
         });
     }
+    // **W5-125 (Phase 4.8.O.1 — Codex HIGH-1):** validate footprint
+    // upper bound mirrors producer side.
+    if let Err(reason) =
+        ql_storage::TableMetadata::validate_footprint_bounds(top_row, top_col, new_rows, new_cols)
+    {
+        return Err(ReplayError::TableResizeRejected {
+            index,
+            name: name.to_owned(),
+            reason,
+        });
+    }
     let added_len = added_columns.len() as u32;
     let removed_len = removed_columns.len() as u32;
     if removed_len > old_cols {
@@ -892,6 +903,17 @@ fn apply_create_table(
             index,
             name: name.to_owned(),
             reason: "table rows and cols must both be > 0",
+        });
+    }
+    // **W5-125 (Phase 4.8.O.1 — Codex HIGH-1):** validate footprint
+    // upper bound mirrors producer side.
+    if let Err(reason) =
+        ql_storage::TableMetadata::validate_footprint_bounds(top_row, top_col, rows, cols)
+    {
+        return Err(ReplayError::TableCreateRejected {
+            index,
+            name: name.to_owned(),
+            reason,
         });
     }
     // Non-overlap + no-spill-anchor inside the footprint.

@@ -1711,6 +1711,23 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                     reason: "table rows and cols must both be > 0".into(),
                 });
             }
+            // **W5-125 (Phase 4.8.O.1 — Codex HIGH-1):** validate
+            // footprint upper bound mirrors producer + replay. A hand-
+            // edited / corrupted TOML with `top_row + rows - 1 > MAX_ROW`
+            // would otherwise let a table register cells beyond the
+            // addressable grid, and a u32-overflowing footprint would
+            // skip downstream checks.
+            if let Err(reason) = ql_storage::TableMetadata::validate_footprint_bounds(
+                entry.top_row,
+                entry.top_col,
+                entry.rows,
+                entry.cols,
+            ) {
+                return Err(QbookError::MalformedTable {
+                    name: entry.name.clone(),
+                    reason: reason.to_owned(),
+                });
+            }
             if entry.columns.len() != entry.cols as usize {
                 return Err(QbookError::MalformedTable {
                     name: entry.name.clone(),
@@ -3901,6 +3918,91 @@ columns = []
         assert!(
             matches!(err, QbookError::MalformedTable { ref reason, .. } if reason.contains("> 0")),
             "expected MalformedTable about zero dims, got {err:?}"
+        );
+    }
+
+    // ===== W5-125 (Phase 4.8.O.1) — loader footprint-bounds upper-limit check =====
+
+    #[test]
+    fn malformed_table_rejected_when_footprint_past_max_row() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        // top_row = 1_048_574, rows = 3 → last_row = 1_048_576 > MAX_ROW (1_048_575).
+        let toml = r#"
+schema_version = 6
+name = "bad"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "Sheet1", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+
+[[tables.entries]]
+name = "FAR"
+display_name = "Far"
+sheet = 0
+top_row = 1048574
+top_col = 0
+rows = 3
+cols = 1
+has_header = true
+has_totals = false
+
+[[tables.entries.columns]]
+id = 0
+name = "qty"
+display = "Qty"
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let err = load_workbook(&path).unwrap_err();
+        assert!(
+            matches!(err, QbookError::MalformedTable { ref reason, .. } if reason.contains("MAX_ROW")),
+            "expected MalformedTable about MAX_ROW, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_table_rejected_when_footprint_past_max_column() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        // top_col = 16383, cols = 2 → last_col = 16384 > MAX_COLUMN (16383).
+        let toml = r#"
+schema_version = 6
+name = "bad"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "Sheet1", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+
+[[tables.entries]]
+name = "WIDE"
+display_name = "Wide"
+sheet = 0
+top_row = 0
+top_col = 16383
+rows = 1
+cols = 2
+has_header = true
+has_totals = false
+
+[[tables.entries.columns]]
+id = 0
+name = "a"
+display = "A"
+
+[[tables.entries.columns]]
+id = 1
+name = "b"
+display = "B"
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let err = load_workbook(&path).unwrap_err();
+        assert!(
+            matches!(err, QbookError::MalformedTable { ref reason, .. } if reason.contains("MAX_COLUMN")),
+            "expected MalformedTable about MAX_COLUMN, got {err:?}"
         );
     }
 }

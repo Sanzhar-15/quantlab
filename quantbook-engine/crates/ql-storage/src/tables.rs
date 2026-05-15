@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ql_types::{Address, ColId, Range, RowId, SheetId};
+use ql_types::{Address, ColId, Range, RowId, SheetId, MAX_COLUMN, MAX_ROW};
 
 /// **W5-110 (Phase 4.8.A):** the per-column metadata inside a [`TableMetadata`].
 ///
@@ -217,6 +217,52 @@ impl TableMetadata {
             && addr.row < self.top_row + self.rows
             && addr.col >= self.top_col
             && addr.col < self.top_col + self.cols
+    }
+
+    /// **W5-125 (Phase 4.8.O.1 — closing-megaudit HIGH-1):** validate
+    /// that a footprint anchored at `(top_row, top_col)` with
+    /// `(rows, cols)` extent fits within the Excel address grid.
+    ///
+    /// Producer (`WorkbookRuntime::create_table` / `resize_table`),
+    /// replay (`apply_create_table` / `apply_resize_table`), and the
+    /// v6 `.qbook` loader all call this BEFORE entering any footprint
+    /// loop, which closes two failure modes Codex flagged in the
+    /// 4.8.O megaudit:
+    /// 1. `top_row + rows - 1 > MAX_ROW` (or same for col) — a table
+    ///    can register cells beyond the addressable grid, causing
+    ///    `Sheet::put` panics later on writes into those cells.
+    /// 2. `top_row + rows` overflows `u32` — the footprint loop's
+    ///    `for r in top_row..top_row + rows` becomes either an empty
+    ///    range (skipping all overlap / spill-anchor checks) or runs
+    ///    with wrapped bounds.
+    ///
+    /// Returns a `&'static str` reason on failure for caller-side
+    /// error wrapping (`RuntimeError::TableCreateRejected` /
+    /// `TableResizeRejected`, `ReplayError::*`, `QbookError::MalformedTable`).
+    ///
+    /// **Pre-condition:** `rows > 0 && cols > 0`. Callers enforce
+    /// this separately so they can emit the more specific
+    /// "rows and cols must both be > 0" error for the zero case.
+    pub fn validate_footprint_bounds(
+        top_row: RowId,
+        top_col: ColId,
+        rows: u32,
+        cols: u32,
+    ) -> Result<(), &'static str> {
+        debug_assert!(rows > 0 && cols > 0, "caller must enforce non-zero dims");
+        let last_row = top_row
+            .checked_add(rows - 1)
+            .ok_or("table footprint extends past addressable row range (u32 overflow)")?;
+        if last_row > MAX_ROW {
+            return Err("table footprint extends past MAX_ROW");
+        }
+        let last_col = top_col
+            .checked_add(cols - 1)
+            .ok_or("table footprint extends past addressable column range (u32 overflow)")?;
+        if last_col > MAX_COLUMN {
+            return Err("table footprint extends past MAX_COLUMN");
+        }
+        Ok(())
     }
 }
 
@@ -630,5 +676,52 @@ mod tests {
         // Outside.
         assert!(tt.table_at(Address::new(0, 100, 0)).is_none());
         assert!(tt.table_at(Address::new(1, 0, 0)).is_none());
+    }
+
+    // ===== W5-125 (Phase 4.8.O.1) — footprint-bounds helper =====
+
+    #[test]
+    fn validate_footprint_bounds_accepts_in_range_footprint() {
+        // Pin the happy path: a small table at (0, 0).
+        assert!(TableMetadata::validate_footprint_bounds(0, 0, 3, 2).is_ok());
+        // Exactly at MAX_ROW / MAX_COLUMN.
+        assert!(TableMetadata::validate_footprint_bounds(MAX_ROW, MAX_COLUMN, 1, 1).is_ok());
+        assert!(TableMetadata::validate_footprint_bounds(MAX_ROW - 1, 0, 2, 1).is_ok());
+    }
+
+    #[test]
+    fn validate_footprint_bounds_rejects_past_max_row() {
+        // top_row + rows - 1 = MAX_ROW + 1 → past the grid.
+        let err = TableMetadata::validate_footprint_bounds(MAX_ROW - 1, 0, 3, 1).unwrap_err();
+        assert!(err.contains("MAX_ROW"), "reason: {err}");
+        // Far over.
+        let err2 = TableMetadata::validate_footprint_bounds(MAX_ROW, 0, 100, 1).unwrap_err();
+        assert!(err2.contains("MAX_ROW"), "reason: {err2}");
+    }
+
+    #[test]
+    fn validate_footprint_bounds_rejects_past_max_column() {
+        let err = TableMetadata::validate_footprint_bounds(0, MAX_COLUMN - 1, 1, 3).unwrap_err();
+        assert!(err.contains("MAX_COLUMN"), "reason: {err}");
+    }
+
+    #[test]
+    fn validate_footprint_bounds_rejects_u32_overflow_on_rows() {
+        // top_row + rows - 1 overflows u32 — the loop's `top_row + rows`
+        // expression would wrap silently before this fix.
+        let err = TableMetadata::validate_footprint_bounds(u32::MAX, 0, 2, 1).unwrap_err();
+        assert!(
+            err.contains("u32 overflow") || err.contains("addressable row"),
+            "reason: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_footprint_bounds_rejects_u32_overflow_on_cols() {
+        let err = TableMetadata::validate_footprint_bounds(0, u32::MAX, 1, 2).unwrap_err();
+        assert!(
+            err.contains("u32 overflow") || err.contains("addressable column"),
+            "reason: {err}"
+        );
     }
 }

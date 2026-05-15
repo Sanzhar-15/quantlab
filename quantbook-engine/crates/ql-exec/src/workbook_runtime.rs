@@ -1523,6 +1523,18 @@ impl<'a> WorkbookRuntime<'a> {
                 reason: "table rows and cols must both be > 0",
             });
         }
+        // **W5-125 (Phase 4.8.O.1 — Codex HIGH-1):** validate footprint
+        // upper bound fits within MAX_ROW / MAX_COLUMN. Closes the gap
+        // where `for r in top_row..top_row + rows` either ran beyond
+        // the addressable grid or u32-overflowed silently.
+        if let Err(reason) =
+            ql_storage::TableMetadata::validate_footprint_bounds(top_row, top_col, rows, cols)
+        {
+            return Err(RuntimeError::TableCreateRejected {
+                name: name.to_owned(),
+                reason,
+            });
+        }
         if column_names.len() != cols as usize {
             return Err(RuntimeError::TableCreateRejected {
                 name: name.to_owned(),
@@ -1964,6 +1976,19 @@ impl<'a> WorkbookRuntime<'a> {
             return Err(RuntimeError::TableResizeRejected {
                 name: name.to_owned(),
                 reason: "table rows and cols must both be > 0",
+            });
+        }
+        // **W5-125 (Phase 4.8.O.1 — Codex HIGH-1):** validate footprint
+        // upper bound. `top_row` + `top_col` are inherited from the
+        // existing TableMetadata (so they were validated at create
+        // time), but new_rows / new_cols can extend past the addressable
+        // grid; check before the overlap / spill-anchor walk.
+        if let Err(reason) = ql_storage::TableMetadata::validate_footprint_bounds(
+            top_row, top_col, new_rows, new_cols,
+        ) {
+            return Err(RuntimeError::TableResizeRejected {
+                name: name.to_owned(),
+                reason,
             });
         }
         let added_len = added_columns.len() as u32;
@@ -9624,6 +9649,118 @@ mod tests {
             .expect("anchor outside new footprint must not block");
         let meta = wb.lookup_table("Sales").unwrap();
         assert_eq!(meta.rows, 5);
+    }
+
+    // ===== W5-125 (Phase 4.8.O.1) — footprint-bounds upper-limit check =====
+
+    #[test]
+    fn create_table_rejects_footprint_past_max_row() {
+        use ql_types::MAX_ROW;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // top_row = MAX_ROW - 1, rows = 3 → last row = MAX_ROW + 1 > MAX_ROW.
+        let err = rt
+            .create_table(
+                "Far",
+                0,
+                MAX_ROW - 1,
+                0,
+                3,
+                1,
+                true,
+                false,
+                vec!["Qty".into()],
+            )
+            .unwrap_err();
+        match err {
+            RuntimeError::TableCreateRejected { reason, .. } => {
+                assert!(reason.contains("MAX_ROW"), "reason: {reason}");
+            }
+            other => panic!("expected TableCreateRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_table_rejects_footprint_past_max_column() {
+        use ql_types::MAX_COLUMN;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // top_col = MAX_COLUMN, cols = 2 → last col = MAX_COLUMN + 1 > MAX_COLUMN.
+        let err = rt
+            .create_table(
+                "Wide",
+                0,
+                0,
+                MAX_COLUMN,
+                1,
+                2,
+                true,
+                false,
+                vec!["A".into(), "B".into()],
+            )
+            .unwrap_err();
+        match err {
+            RuntimeError::TableCreateRejected { reason, .. } => {
+                assert!(reason.contains("MAX_COLUMN"), "reason: {reason}");
+            }
+            other => panic!("expected TableCreateRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_table_rejects_footprint_u32_overflow_on_rows() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // top_row = u32::MAX, rows = 2 → top_row + rows wraps. Pre-W5-125 the
+        // footprint loop `for r in u32::MAX..u32::MAX+2 (wrapped to 1)` was
+        // empty and downstream overlap / spill-anchor checks silently skipped.
+        let err = rt
+            .create_table("Wrap", 0, u32::MAX, 0, 2, 1, true, false, vec!["X".into()])
+            .unwrap_err();
+        match err {
+            RuntimeError::TableCreateRejected { reason, .. } => {
+                assert!(
+                    reason.contains("u32 overflow") || reason.contains("addressable"),
+                    "reason: {reason}"
+                );
+            }
+            other => panic!("expected TableCreateRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resize_table_rejects_growing_past_max_row() {
+        use ql_types::MAX_ROW;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            // Create a table near (but inside) MAX_ROW.
+            rt.create_table(
+                "Sales",
+                0,
+                MAX_ROW - 4,
+                0,
+                3,
+                1,
+                true,
+                false,
+                vec!["Qty".into()],
+            )
+            .unwrap();
+        }
+        // Grow to 10 rows → last_row = MAX_ROW - 4 + 9 = MAX_ROW + 5 > MAX_ROW.
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt.resize_table("Sales", 10, 1, vec![], vec![]).unwrap_err();
+        match err {
+            RuntimeError::TableResizeRejected { reason, .. } => {
+                assert!(reason.contains("MAX_ROW"), "reason: {reason}");
+            }
+            other => panic!("expected TableResizeRejected, got {other:?}"),
+        }
     }
 
     #[test]
