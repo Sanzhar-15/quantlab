@@ -89,9 +89,17 @@ pub trait CellEnv {
 /// via the Workbook's sheet lookup + the sheet's `read(row, col)`.
 ///
 /// **W5-71 (Phase 4.5.A.2):** caches an `EvalContext` built from the
-/// workbook's `date_system` at construction time. Locale + NowProvider
-/// stay at their defaults (`EnUs` + `System`) — Phase 4.9 + future
-/// Phase-6.3 WASM bindings will plumb those through too.
+/// workbook's `date_system` at construction time.
+///
+/// **W5-153 (post-4.9.O):** also wires `workbook.locale()` (added by
+/// W5-133 / Phase 4.9.A) through to `EvalContext.locale`. The W5-71
+/// comment that this would happen in "Phase 4.9" was true at the
+/// architecture level but Phase 4.9 (W5-138 → W5-152) shipped the
+/// workbook-side accessor + op-log integration without updating
+/// this constructor. Closing the gap retroactively.
+///
+/// `NowProvider` stays at the default (`System`) — wired by
+/// Phase-6.3 WASM bindings when those land.
 pub struct WorkbookEnv<'w> {
     workbook: &'w ql_storage::Workbook,
     eval_ctx: EvalContext,
@@ -106,8 +114,16 @@ pub struct WorkbookEnv<'w> {
 
 impl<'w> WorkbookEnv<'w> {
     pub fn new(workbook: &'w ql_storage::Workbook) -> Self {
+        // **W5-153 (post-4.9.O):** wire workbook.locale() through.
+        // Pre-fix, eval-side EvalContext.locale was always EnUs
+        // regardless of workbook.set_locale() calls. No production
+        // function reads EvalContext.locale today, so the gap was
+        // latent rather than a correctness bug, but any future
+        // locale-aware eval function (e.g. locale-sensitive TEXT()
+        // formatting) now sees the right locale.
         let eval_ctx = EvalContext {
             date_system: workbook.date_system(),
+            locale: workbook.locale(),
             ..EvalContext::default()
         };
         Self {
@@ -536,5 +552,28 @@ mod tests {
             .unwrap();
         let resolved = NameLookup::lookup_named_target(&wb, "R", 99);
         assert!(matches!(resolved, Some(ResolvedName::Number(n)) if n == 7.0));
+    }
+
+    /// **W5-153 (post-4.9.O):** `WorkbookEnv::new` wires
+    /// `workbook.locale()` through to `EvalContext.locale`. Pre-fix,
+    /// the eval-side locale was always EnUs regardless of
+    /// `workbook.set_locale` calls (latent — no production function
+    /// currently reads `EvalContext.locale`, but the gap would have
+    /// surfaced the moment any locale-aware eval landed).
+    #[test]
+    fn workbook_env_new_propagates_workbook_locale_to_eval_context() {
+        let mut wb = ql_storage::Workbook::new();
+        wb.add_sheet("S");
+        wb.set_locale(ql_types::Locale::De);
+        let env = WorkbookEnv::new(&wb);
+        assert_eq!(env.eval_context().locale, ql_types::Locale::De);
+    }
+
+    #[test]
+    fn workbook_env_new_default_locale_is_en_us() {
+        let mut wb = ql_storage::Workbook::new();
+        wb.add_sheet("S");
+        let env = WorkbookEnv::new(&wb);
+        assert_eq!(env.eval_context().locale, ql_types::Locale::EnUs);
     }
 }

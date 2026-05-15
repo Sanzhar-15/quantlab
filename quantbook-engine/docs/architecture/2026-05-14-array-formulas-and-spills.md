@@ -9,7 +9,7 @@
 
 The original draft was substantively wrong on five HIGH points. This revision encodes the corrected design:
 
-- **HIGH (§ 6.3):** "scalar context returns first cell" was not Excel canon. **Revised:** v1 returns `#CALC!` for array-in-scalar-context; proper implicit intersection / `@` deferred to Phase 4.9.
+- **HIGH (§ 6.3):** "scalar context returns first cell" was not Excel canon. **Revised:** v1 returns `#CALC!` for array-in-scalar-context; proper implicit intersection / `@` was deferred to Phase 4.9 and SHIPPED there (W5-138 → W5-152). The array-in-`@`-scalar-context narrowing (design § 3.3 rule 7 — `@TRANSPOSE(...)` → top-left) remained deferred at Phase 4.9 close as a known gap; cell-boundary spill rewiring (a future Phase) closes it.
 - **HIGH (§ 6 + § 6.2):** `ArrayFn` over `EvalResult` (defined in `ql-exec`) created a `ql-functions` → `ql-exec` reverse-dependency cycle. **Revised:** array value type moves to `ql-types`; function ABI unifies the four tiers into one dispatch shape.
 - **HIGH (§ 10):** parallel `outgoing_spill_targets` adjacency + eager CellNode creation conflicts with the existing calcgraph scheduler. **Revised:** spill targets are PRODUCER ALIASES — at dependency-extraction time, a `CellRef` to a cell with `spill_target_anchor(c) == Some(anchor)` becomes an edge to the anchor's formula node, lazy and graph-shape-preserving.
 - **HIGH (§ 8.3):** missing "always unregister old spill before re-eval" step. **Revised:** explicit unregister-then-eval invariant; even blocked re-eval clears the old footprint first.
@@ -68,7 +68,7 @@ ql-exec           (depends on all of the above)
 
 ### 3.1 Array literal syntax
 
-ASCII-only separators. Match Excel's en-US canonical syntax (deferred locale support is Phase 4.9):
+ASCII-only separators. Match Excel's en-US canonical syntax. Locale-aware array separators (`{1\\2.3\\4}` for DE/FR) SHIPPED in Phase 4.9 (W5-138 lex-side, W5-142 print-side):
 
 ```
 array_literal := '{' array_row (';' array_row)* '}'

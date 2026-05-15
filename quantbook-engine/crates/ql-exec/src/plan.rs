@@ -28,7 +28,10 @@
 //! - `Error(ErrorValue)` — error-sigil literals (W5-99 / Phase 4.7.F).
 //!
 //! Deferred (NOT bound today):
-//! - `Spill(Box<Expr>)` — reserved for Excel's `A1#` spill-range-ref syntax (Phase 4.9).
+//! - `Spill(Box<Expr>)` — reserved for Excel's `A1#` spill-range-ref
+//!   syntax. Originally anticipated for Phase 4.9 but that phase
+//!   closed (W5-138 → W5-152) without adding `A1#` parsing; deferred
+//!   to a future Phase.
 
 use std::sync::Arc;
 

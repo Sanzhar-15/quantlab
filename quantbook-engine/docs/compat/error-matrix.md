@@ -171,7 +171,7 @@ All predicates **introspect** — never propagate errors.
 | `ASIN/ACOS(|x| > 1)` | `#NUM!` | 🟢 |
 | `ATANH(|x| ≥ 1)` | `#NUM!` (Excel canon — rejects ±1, not just ±∞) | 🟢 |
 | `ATAN2(0, 0)` | `#DIV/0!` | 🟢 |
-| `LEN` / `LEFT` / `RIGHT` / `MID` / `FIND` / `SEARCH` | UTF-8 char count (V1); UTF-16 deferred to Phase 4.9 | 🟡 |
+| `LEN` / `LEFT` / `RIGHT` / `MID` / `FIND` / `SEARCH` | UTF-8 char count (V1); UTF-16 deferred (Phase 4.9 scope was R1C1+locales+`@`, not UTF-16 string semantics) | 🟡 |
 | `UPPER` / `LOWER` / `PROPER` | Rust to_uppercase / to_lowercase (Unicode default); `ß → SS` divergence from Excel locale-sensitive | 🟡 |
 | `ROUNDUP` / `ROUNDDOWN` | Binary-float, NOT 15-digit display rounding (`ROUNDUP(0.1+0.2, 1) = 0.4` not `0.3`) | 🟡 |
 | `SEARCH` | Wildcards (W5-61) via `WildcardPattern::search_in`; Unicode case-expansion divergence in returned position | 🟢 / 🟡 (case-expansion) |

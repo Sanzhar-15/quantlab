@@ -430,7 +430,8 @@ pub fn default_registry() -> FunctionRegistry {
     // Engine Phase 4.3 V2 batch #5 — text functions wave 2 (W5-56).
     // All scalar (existing ScalarFn contract). 1-based indices for
     // FIND/SEARCH/MID/REPLACE; UTF-8 char-count semantics (UTF-16
-    // canon deferred to Phase 4.9).
+    // canon deferred to a future Phase — Phase 4.9 was R1C1 +
+    // locales + `@`, not the UTF-16 work originally anticipated).
     r.register("LEFT", scalar_fns::left);
     r.register("RIGHT", scalar_fns::right);
     r.register("MID", scalar_fns::mid);

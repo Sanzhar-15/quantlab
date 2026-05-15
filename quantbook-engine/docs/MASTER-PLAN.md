@@ -427,9 +427,9 @@ The full v1 means all of these crates either ship real behavior or have a docume
    - FN4-04 ✅ matrix updated; coverage 32% → 40%; UPPER/LOWER reclassified ⚠️ partial (Unicode-default mapping diverges from Excel for ß and other locale-sensitive chars); ROUNDUP/ROUNDDOWN reclassified ⚠️ partial (binary-float edge cases vs Excel's 15-digit display rounding); LEN annotated as known scalar-vs-UTF-16 divergence.  
    V1 batch shipped (22 functions): ROUNDUP, ROUNDDOWN, TRUNC, SIGN, EXP, LN, LOG, LOG10, PI, DEGREES, RADIANS, LEN, UPPER, LOWER, TRIM, ISNUMBER, ISTEXT, ISBLANK, ISLOGICAL, ISERROR, ISNA, ISERR. All scalar (per-cell, no range deps beyond what 3.6 already provides). Excel-canon error propagation; W5-48 fixed M7 (DEGREES/RADIANS now sanitize output via `sanitize_f64` so Inf surfaces as `#NUM!`).  
    FN4-01 closure complete (W5-58). Shipped: trig W5-51, SUMIF/COUNTIF W5-53, lookup family W5-54, IFS family + SUMPRODUCT W5-55, text wave 2 W5-56, math completion + hyperbolic W5-57, stats family W5-58. **Phase 4.3 polish wave 1 shipped W5-61 + closed W5-62**: wildcards in SUMIF/COUNTIF/SUMIFS/AVERAGEIF/SEARCH (`?`, `*`, `~` escape; text-cell-only), CONCAT (range-aware, 32K cap), PROPER, CLEAN, CEILING.MATH, FLOOR.MATH, RANK.AVG. Polish remaining (deferred to wave 2 / Phase 4.7+): MODE.MULT (needs spill), CEILING.PRECISE / FLOOR.PRECISE, FN4-03 lazy IF/IFERROR.  
-   Known divergences from Excel canon (documented in matrix, Phase 4.9/4.5 closures):  
-   - UPPER/LOWER: Rust's `to_uppercase`/`to_lowercase` use Unicode default mapping (ß → SS); Excel preserves case-sensitive locale rules. Phase 4.9.  
-   - LEN: Rust scalar count (`.chars().count()`); Excel UTF-16 code unit count. Matches for ASCII/BMP; diverges for emoji ZWJ sequences. Phase 4.9.  
+   Known divergences from Excel canon (still open at Phase 4.9 close):  
+   - UPPER/LOWER: Rust's `to_uppercase`/`to_lowercase` use Unicode default mapping (ß → SS); Excel preserves case-sensitive locale rules. Originally anticipated for Phase 4.9 — that phase shipped R1C1+locale-separators+`@` but NOT locale-sensitive case mapping; awaiting a future Phase.  
+   - LEN: Rust scalar count (`.chars().count()`); Excel UTF-16 code unit count. Matches for ASCII/BMP; diverges for emoji ZWJ sequences. Originally anticipated for Phase 4.9 — that phase did NOT address UTF-16 string semantics; awaiting a future Phase.  
    - ROUNDUP/ROUNDDOWN: binary-float edges (`0.1 + 0.2` rounds up to `0.4` not `0.3`); Phase 4.5 number formats + decimal-aware rounding revisits.  
    Effort: 2-3 weeks (V1 batch + audit closure: ~0.6 day; remaining: 1-2 weeks).
 
@@ -459,7 +459,7 @@ The full v1 means all of these crates either ship real behavior or have a docume
    - **Mid-arc mega-audit** ✅ W5-76 — closed 3 HIGH + 5 MEDIUM on the V1+V2 date wave.
    - **Closing mega-audit** ✅ W5-84 — closed 1 HIGH (fraction `?/?` V2 rejection missing) + 3 MEDIUM (`walk_for_anchor` DateM stop, `.qbook` overlay-id validation, producer-replay equivalence format coverage) + filed GAP-F-12 (format_cache staleness) + GAP-F-13 (built-in table subset for xlsx).  
    References: `.references/ironcalc/base/src/formatter/`; `.references/ironcalc/base/src/functions/date_and_time.rs`; `.references/formualizer/crates/formualizer-workbook/tests/calamine/dates.rs`.  
-   Acceptance: DTF-4-01 1900/1904 policy explicit; DTF-4-02 date/time functions match matrix; **DTF-4-03 re-scoped to "format parser has en-US fully populated + extension point for locale; en/de/fr behavior tests move to Phase 4.9"** (Codex HIGH 3); DTF-4-04 storage distinguishes value from display format via sparse format overlay + workbook FormatTable.  
+   Acceptance: DTF-4-01 1900/1904 policy explicit; DTF-4-02 date/time functions match matrix; **DTF-4-03 re-scoped to "format parser has en-US fully populated + extension point for locale; en/de/fr behavior tests move to Phase 4.9"** (Codex HIGH 3) — **Phase 4.9 (W5-138 → W5-152, 2026-05-15) shipped R1C1 + locale separators + `@` but did NOT add format-string locale tests; those remain deferred to a future Phase**; DTF-4-04 storage distinguishes value from display format via sparse format overlay + workbook FormatTable.  
    Effort: ~6-8 sessions implementation + 1 mega-audit per the design doc § 8 (Codex MEDIUM 3 re-estimate; Phase 4.4 reference: estimated 2.5 sessions, took 5).
 
 6. **4.6 Cross-Sheet References And Sheet-Scoped Names** ✅ **FULLY SHIPPED** (W5-85 → W5-93, 2026-05-14)
@@ -490,8 +490,8 @@ The full v1 means all of these crates either ship real behavior or have a docume
    Add mode-aware parsing/printing for R1C1, localized separators/function names where required, and implicit intersection semantics.  
    References: `.references/ironcalc/base/src/expressions/lexer/test/test_locale.rs`; `.references/ironcalc/base/src/expressions/parser/tests/test_locales.rs`; `.references/ironcalc/base/src/implicit_intersection.rs`; `.references/ironcalc/base/src/expressions/parser/tests/test_implicit_intersection.rs`; `.references/hyperformula/src/parser/addressRepresentationConverters.ts`.  
    Acceptance: LOC-4-01 R1C1 parser/printer round-trips; LOC-4-02 localized separators covered; LOC-4-03 implicit intersection added where Excel requires it; LOC-4-04 IDE can toggle formula display mode.  
-   Effort: 1-2 weeks.  
-   **Status (2026-05-15):** 4.9.AA design draft shipped at `docs/architecture/2026-05-15-r1c1-locales-implicit-intersection.md` — pending Codex pass-1 review. 15-sub-phase split (A→O) mirrors Phase 4.8 structure. Function-name localization OUT-of-scope per LOC-4-02 reading (separators only).
+   Effort: 1-2 weeks (actual: ~2 days).  
+   **Status (2026-05-15): SHIPPED triple-confirmed at `6523001b837` (W5-152).** All 15 sub-phases shipped (AA design + A types + B.1-.4 lexer + C parser+binder + D printer + F locale-printer + G `@`-parser-printer + H `@`-binder + I persistence v6→v7 + J op-log + K runtime+canonical + L round-trip + M coverage matrix + N polish + O closing megaudit). Acceptance closures: LOC-4-01 R1C1 round-trips pinned at lex/parse/bind/print stages; LOC-4-02 EN/DE/FR separators pinned by 30-cell coverage matrix; LOC-4-03 `@` operator + design § 3.3 9-rule narrowing implemented at bind time; LOC-4-04 `WorkbookRuntime::set_reference_mode` + `set_locale` APIs available. Closing megaudit (three-way: self-review + Sonnet + Codex async) found 1 HIGH (PlanCache × `@<range>` cell collision — fixed W5-150) + 2 MEDIUM (W5-151) + 3 LOW (W5-152). +175 net tests (2443 → 2618). Function-name localization remained OUT-of-scope per LOC-4-02 (separators only). Known gaps documented: rule 7 (array-returning function under `@` returns `#CALC!` per existing 4.7.G limit) → cell-boundary spill rewiring; cross-sheet structured refs (`Sheet1.Sales[Qty]`) → later Phase. Full audit trail in `docs/audits/2026-05-15-phase-4.9-*.md`.
 
 10. **4.10 Function Library Expansion Wave 2 - V1 260**  
     Finish the v1 function target. Defer only with explicit product sign-off and matrix entries.  
@@ -850,9 +850,9 @@ The IDE is not a late wrapper. It is how runtime contracts get falsified.
    Why this matters: calamine is read-only; export quality and licensing depend on the writer choice.  
    Decide by Phase 4.11.
 
-5. **How much localization is v1 versus post-v1?**  
+5. **How much localization is v1 versus post-v1?** **DECIDED at Phase 4.9 (W5-138 → W5-152, 2026-05-15).**  
    Why this matters: localized function names and separators affect parser, printer, IDE, and import/export.  
-   Decide by Phase 4.9.
+   **Decision:** v1 ships locale-aware SEPARATORS only (decimal, argument, array row, array col) for EnUs / De / Fr. Function-name localization is OUT-of-scope for v1 per LOC-4-02 reading. UTF-16 string semantics + locale-aware case mapping (UPPER/LOWER) also out-of-scope for Phase 4.9; awaiting a future Phase. See `docs/architecture/2026-05-15-r1c1-locales-implicit-intersection.md` § 2 (non-goals).
 
 6. **What is the collaboration conflict policy for formula versus value concurrent edits?**  
    Why this matters: this is the common conflict and the easiest place to lose user work.  
