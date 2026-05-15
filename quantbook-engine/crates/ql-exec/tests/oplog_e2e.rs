@@ -887,3 +887,108 @@ fn replay_rejects_resize_table_with_footprint_past_max_row() {
         other => panic!("expected TableResizeRejected, got {other:?}"),
     }
 }
+
+/// **W5-127 (Phase 4.8.O.3 — Codex LOW-2 composed coverage):**
+/// producer emits `create_table → rename_column → resize_table` (the
+/// rename targets a column that later gets removed by the resize).
+/// Replay against a fresh workbook must reconstruct the FINAL state
+/// (renamed column metadata, then dropped by resize). Pins
+/// cross-sub-phase replay-order correctness — each op sees the state
+/// produced by the previous one.
+#[test]
+fn composed_create_rename_column_resize_replay_roundtrip() {
+    let mut producer_wb = fresh_wb();
+    let reg = default_registry();
+    let mut producer_oplog = OpLog::new();
+    {
+        let mut rt = WorkbookRuntime::with_oplog(&mut producer_wb, &reg, &mut producer_oplog);
+        rt.create_table(
+            "Sales",
+            0,
+            0,
+            0,
+            3,
+            2,
+            true,
+            false,
+            vec!["Qty".into(), "Price".into()],
+        )
+        .unwrap();
+        // Rename the trailing column.
+        let n = rt.rename_column("Sales", "Price", "Cost").unwrap();
+        assert_eq!(n, 0, "no formulas reference Price yet");
+        // Resize away the just-renamed trailing column.
+        rt.resize_table("Sales", 3, 1, vec![], vec!["Cost".into()])
+            .unwrap();
+    }
+    // Producer side: only Qty remains.
+    let meta = producer_wb.lookup_table("Sales").unwrap();
+    assert_eq!(meta.cols, 1);
+    assert!(meta.lookup_column("Qty").is_some());
+    assert!(meta.lookup_column("Price").is_none());
+    assert!(meta.lookup_column("Cost").is_none());
+
+    // Replay side: same final state.
+    let mut replay_wb = fresh_wb();
+    replay_into(&producer_oplog, &mut replay_wb, &reg).unwrap();
+    let r_meta = replay_wb.lookup_table("Sales").expect("table reloaded");
+    assert_eq!(r_meta.cols, 1);
+    assert!(r_meta.lookup_column("Qty").is_some());
+    assert!(r_meta.lookup_column("Price").is_none());
+    assert!(r_meta.lookup_column("Cost").is_none());
+    // Same column id allocator state — Qty's id matches producer.
+    let producer_qty_id = meta.lookup_column("Qty").unwrap().1.id;
+    let replay_qty_id = r_meta.lookup_column("Qty").unwrap().1.id;
+    assert_eq!(producer_qty_id, replay_qty_id);
+}
+
+/// **W5-127 (Phase 4.8.O.3 — Codex LOW-2 composed coverage):**
+/// save → load → `rename_column` → verify formula text + value
+/// parity. Pins that the persistence × runtime-mutation interaction
+/// holds — a workbook reloaded from disk supports the same formula-
+/// rewriting mutations as a workbook freshly created in memory.
+#[test]
+fn composed_save_load_then_rename_column_roundtrip() {
+    use tempfile::TempDir;
+    let reg = default_registry();
+    let mut producer_wb = fresh_wb();
+    {
+        let mut rt = WorkbookRuntime::new(&mut producer_wb, &reg);
+        rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+            .unwrap();
+        rt.set_value(0, 1, 0, Value::Number(10.0)).unwrap();
+        rt.set_value(0, 2, 0, Value::Number(20.0)).unwrap();
+        let v = rt.set_formula(0, 5, 0, "SUM(Sales[Qty])").unwrap();
+        assert_eq!(v, Value::Number(30.0));
+    }
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("composed.qbook");
+    ql_io::save_workbook(&producer_wb, "composed", &path).unwrap();
+
+    let (mut reloaded, recompute) = ql_exec::load_workbook_and_recompute(&path, &reg).unwrap();
+    assert!(recompute.is_complete());
+    // Sanity: pre-rename load+recompute matches pre-save.
+    assert_eq!(reloaded.read(Address::new(0, 5, 0)), Value::Number(30.0));
+
+    // Now rename a column on the reloaded workbook. The formula text
+    // rewrite must walk over the reloaded formula and produce the
+    // same shape as a never-saved workbook would.
+    {
+        let mut rt = WorkbookRuntime::new(&mut reloaded, &reg);
+        let n = rt.rename_column("Sales", "Qty", "Quantity").unwrap();
+        assert_eq!(n, 1, "one formula rewritten");
+        assert!(rt.recompute_all().is_complete());
+    }
+    let text = reloaded.formula_at(0, 5, 0).expect("formula").clone();
+    assert_eq!(text.as_ref(), "SUM(Sales[Quantity])");
+    assert_eq!(
+        reloaded.read(Address::new(0, 5, 0)),
+        Value::Number(30.0),
+        "post-rename SUM(Sales[Quantity]) value preserved"
+    );
+    // Metadata reflects the rename.
+    let meta = reloaded.lookup_table("Sales").unwrap();
+    assert!(meta.lookup_column("Quantity").is_some());
+    assert!(meta.lookup_column("Qty").is_none());
+}

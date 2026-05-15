@@ -1972,6 +1972,21 @@ impl<'a> WorkbookRuntime<'a> {
                     .collect::<Vec<_>>(),
             )
         };
+        // **W5-127 (Phase 4.8.O.3 — Codex LOW-1):** exact no-op
+        // short-circuit. Mirrors `rename_column`'s same-canonical
+        // semantics. Avoids emitting an `Op::ResizeTable`, bumping
+        // `TableTable::generation`, and clearing the plan cache when
+        // nothing actually changes. The table is known to exist
+        // (snapshot above would have errored). All dims match and no
+        // columns are being added/removed, so there's nothing to
+        // mutate.
+        if new_rows == old_rows
+            && new_cols == old_cols
+            && added_columns.is_empty()
+            && removed_columns.is_empty()
+        {
+            return Ok(());
+        }
         if new_rows == 0 || new_cols == 0 {
             return Err(RuntimeError::TableResizeRejected {
                 name: name.to_owned(),
@@ -10588,6 +10603,45 @@ mod tests {
                 && added_columns == &vec!["Price".to_owned()]
                 && removed_columns.is_empty()
         ));
+    }
+
+    /// **W5-127 (Phase 4.8.O.3 — Codex LOW-1):** exact no-op resize
+    /// (same dims, no column changes) returns `Ok(())` without
+    /// emitting an `Op::ResizeTable`. Mirrors `rename_column`'s
+    /// same-canonical no-op contract — caller-visible behavior is
+    /// unchanged but the op log stays compact.
+    #[test]
+    fn resize_table_exact_noop_emits_nothing() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.create_table(
+                "Sales",
+                0,
+                0,
+                0,
+                3,
+                2,
+                true,
+                false,
+                vec!["Qty".into(), "Price".into()],
+            )
+            .unwrap();
+            // Exact no-op: same dims, empty added + removed.
+            rt.resize_table("Sales", 3, 2, vec![], vec![])
+                .expect("exact no-op must succeed silently");
+        }
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        // Only the CreateTable op landed; no ResizeTable emitted.
+        assert_eq!(ops.len(), 1, "got {ops:?}");
+        assert!(matches!(&ops[0], Op::CreateTable { .. }));
+        // Sanity: table metadata unchanged.
+        let meta = wb.lookup_table("Sales").unwrap();
+        assert_eq!(meta.rows, 3);
+        assert_eq!(meta.cols, 2);
+        assert_eq!(meta.columns.len(), 2);
     }
 
     /// **End-to-end with op log**: create_table emits Op::CreateTable;
