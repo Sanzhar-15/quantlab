@@ -1738,6 +1738,79 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                     ),
                 });
             }
+            // **W5-126 (Phase 4.8.O.2 — Codex MEDIUM-1):** re-validate
+            // the runtime registry invariants at load time. The W5-123
+            // docstring said "loader trusts the file" — Codex flagged
+            // that a hand-edited / corrupted v6 TOML could enter the
+            // engine with state that runtime mutation wouldn't allow.
+            // Concrete failure modes: silent duplicate-name overwrite
+            // (leaks column ids into the allocator); namespace
+            // collision with NameTable; overlapping table footprints
+            // (HashMap-order indeterminism in `Workbook::table_at`);
+            // duplicate or empty column names breaking `lookup_column`.
+            let canonical_upper = entry.name.to_ascii_uppercase();
+            // Name uniqueness against already-loaded tables (catches
+            // duplicate canonical names within the same TablesSection
+            // entries vec, since each insert lands in `wb.tables_mut()`
+            // before the next iteration).
+            if wb.tables().lookup(&canonical_upper).is_some() {
+                return Err(QbookError::MalformedTable {
+                    name: entry.name.clone(),
+                    reason: "duplicate canonical table name in [[tables.entries]]".into(),
+                });
+            }
+            // Shared namespace with NameTable (workbook + sheet-scoped).
+            // NameTable hydration ran above, so any prior conflicts are
+            // already in `wb.names()` / sheet scoped_names. We check
+            // workbook-scoped only; sheet-scoped collisions are caught
+            // by the canonical-name comparison via `lookup_ci`.
+            if wb.names().lookup_ci(&canonical_upper).is_some() {
+                return Err(QbookError::MalformedTable {
+                    name: entry.name.clone(),
+                    reason: "table name collides with a workbook-scoped defined name".into(),
+                });
+            }
+            // Column-level shape: non-empty `name` AND `display`,
+            // unique canonical (lowercase) names, no `u32::MAX`
+            // column ids (closes Codex MEDIUM-2 — `TableTable::insert`
+            // does unchecked `max_id + 1` on the column-id allocator).
+            {
+                use std::collections::HashSet;
+                let mut seen_canon: HashSet<String> = HashSet::new();
+                for col in &entry.columns {
+                    if col.name.is_empty() || col.display.is_empty() {
+                        return Err(QbookError::MalformedTable {
+                            name: entry.name.clone(),
+                            reason: "table column names cannot be empty".into(),
+                        });
+                    }
+                    if col.id == u32::MAX {
+                        return Err(QbookError::MalformedTable {
+                            name: entry.name.clone(),
+                            reason: "column id cannot be u32::MAX (would overflow allocator)"
+                                .into(),
+                        });
+                    }
+                    if !seen_canon.insert(col.name.to_ascii_lowercase()) {
+                        return Err(QbookError::MalformedTable {
+                            name: entry.name.clone(),
+                            reason: "duplicate canonical column name within table".into(),
+                        });
+                    }
+                }
+            }
+            // Footprint non-overlap against tables already inserted in
+            // earlier loop iterations.
+            for r in entry.top_row..entry.top_row + entry.rows {
+                for c in entry.top_col..entry.top_col + entry.cols {
+                    if wb.table_at(entry.sheet, r, c).is_some() {
+                        return Err(QbookError::MalformedTable {
+                            name: entry.name.clone(),
+                            reason: "table footprint overlaps a previously loaded table".into(),
+                        });
+                    }
+                }
+            }
             let canonical: std::sync::Arc<str> = std::sync::Arc::from(entry.name.as_str());
             let columns: Vec<ql_storage::TableColumn> = entry
                 .columns
@@ -4004,5 +4077,354 @@ display = "B"
             matches!(err, QbookError::MalformedTable { ref reason, .. } if reason.contains("MAX_COLUMN")),
             "expected MalformedTable about MAX_COLUMN, got {err:?}"
         );
+    }
+
+    // ===== W5-126 (Phase 4.8.O.2) — loader re-validates runtime invariants =====
+    //
+    // Closes Codex 4.8.O megaudit MEDIUM-1 (loader skipped overlap /
+    // namespace / column dedup checks) and MEDIUM-2 (`max_id + 1`
+    // unchecked at u32::MAX) by surfacing the same shape as
+    // `WorkbookRuntime::create_table` would reject.
+
+    #[test]
+    fn malformed_table_rejected_when_duplicate_canonical_name() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        // Two entries with the same canonical name (case-insensitive).
+        let toml = r#"
+schema_version = 6
+name = "bad"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "Sheet1", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+
+[[tables.entries]]
+name = "SALES"
+display_name = "Sales"
+sheet = 0
+top_row = 0
+top_col = 0
+rows = 2
+cols = 1
+has_header = true
+has_totals = false
+
+[[tables.entries.columns]]
+id = 0
+name = "qty"
+display = "Qty"
+
+[[tables.entries]]
+name = "SALES"
+display_name = "Sales"
+sheet = 0
+top_row = 10
+top_col = 0
+rows = 2
+cols = 1
+has_header = true
+has_totals = false
+
+[[tables.entries.columns]]
+id = 1
+name = "qty"
+display = "Qty"
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let err = load_workbook(&path).unwrap_err();
+        assert!(
+            matches!(err, QbookError::MalformedTable { ref reason, .. } if reason.contains("duplicate canonical table name")),
+            "expected MalformedTable about duplicate canonical, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_table_rejected_when_name_collides_with_defined_name() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        // `Rate` is registered as a defined-name constant; table named
+        // `Rate` collides with it (Excel canon — shared namespace).
+        let toml = r#"
+schema_version = 6
+name = "bad"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "Sheet1", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+
+[[names.entries]]
+name = "Rate"
+target = { kind = "constant", value = { Number = 0.21 } }
+
+[[tables.entries]]
+name = "RATE"
+display_name = "Rate"
+sheet = 0
+top_row = 0
+top_col = 0
+rows = 2
+cols = 1
+has_header = true
+has_totals = false
+
+[[tables.entries.columns]]
+id = 0
+name = "qty"
+display = "Qty"
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let err = load_workbook(&path).unwrap_err();
+        assert!(
+            matches!(err, QbookError::MalformedTable { ref reason, .. } if reason.contains("collides with a workbook-scoped defined name")),
+            "expected MalformedTable about defined-name collision, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_table_rejected_when_footprints_overlap() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        // Two non-duplicate names but overlapping footprints on sheet 0.
+        let toml = r#"
+schema_version = 6
+name = "bad"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "Sheet1", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+
+[[tables.entries]]
+name = "A"
+display_name = "A"
+sheet = 0
+top_row = 0
+top_col = 0
+rows = 5
+cols = 2
+has_header = true
+has_totals = false
+
+[[tables.entries.columns]]
+id = 0
+name = "x"
+display = "X"
+
+[[tables.entries.columns]]
+id = 1
+name = "y"
+display = "Y"
+
+[[tables.entries]]
+name = "B"
+display_name = "B"
+sheet = 0
+top_row = 2
+top_col = 1
+rows = 3
+cols = 2
+has_header = true
+has_totals = false
+
+[[tables.entries.columns]]
+id = 2
+name = "p"
+display = "P"
+
+[[tables.entries.columns]]
+id = 3
+name = "q"
+display = "Q"
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let err = load_workbook(&path).unwrap_err();
+        assert!(
+            matches!(err, QbookError::MalformedTable { ref reason, .. } if reason.contains("overlaps")),
+            "expected MalformedTable about overlap, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_table_rejected_when_column_name_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = r#"
+schema_version = 6
+name = "bad"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "Sheet1", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+
+[[tables.entries]]
+name = "T"
+display_name = "T"
+sheet = 0
+top_row = 0
+top_col = 0
+rows = 2
+cols = 1
+has_header = true
+has_totals = false
+
+[[tables.entries.columns]]
+id = 0
+name = ""
+display = "X"
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let err = load_workbook(&path).unwrap_err();
+        assert!(
+            matches!(err, QbookError::MalformedTable { ref reason, .. } if reason.contains("cannot be empty")),
+            "expected MalformedTable about empty column name, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_table_rejected_when_duplicate_column_name() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        // Two columns with the same canonical (case-insensitive) name.
+        let toml = r#"
+schema_version = 6
+name = "bad"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "Sheet1", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+
+[[tables.entries]]
+name = "T"
+display_name = "T"
+sheet = 0
+top_row = 0
+top_col = 0
+rows = 2
+cols = 2
+has_header = true
+has_totals = false
+
+[[tables.entries.columns]]
+id = 0
+name = "qty"
+display = "Qty"
+
+[[tables.entries.columns]]
+id = 1
+name = "qty"
+display = "QTY"
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let err = load_workbook(&path).unwrap_err();
+        assert!(
+            matches!(err, QbookError::MalformedTable { ref reason, .. } if reason.contains("duplicate canonical column name")),
+            "expected MalformedTable about duplicate column, got {err:?}"
+        );
+    }
+
+    /// **W5-126 / Codex MEDIUM-2:** persisted column id at u32::MAX
+    /// would panic in `TableTable::insert` (`max_id + 1` overflow) or
+    /// wrap in release. Catch at load.
+    #[test]
+    fn malformed_table_rejected_when_column_id_is_u32_max() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = r#"
+schema_version = 6
+name = "bad"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "Sheet1", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+
+[[tables.entries]]
+name = "T"
+display_name = "T"
+sheet = 0
+top_row = 0
+top_col = 0
+rows = 2
+cols = 1
+has_header = true
+has_totals = false
+
+[[tables.entries.columns]]
+id = 4294967295
+name = "qty"
+display = "Qty"
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let err = load_workbook(&path).unwrap_err();
+        assert!(
+            matches!(err, QbookError::MalformedTable { ref reason, .. } if reason.contains("u32::MAX")),
+            "expected MalformedTable about u32::MAX column id, got {err:?}"
+        );
+    }
+
+    /// Happy path: two distinct non-overlapping tables on the same
+    /// sheet — should load cleanly. Pins that the new MEDIUM-1
+    /// validation doesn't reject legitimate multi-table workbooks.
+    #[test]
+    fn load_accepts_two_non_overlapping_tables() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ok.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = r#"
+schema_version = 6
+name = "ok"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "Sheet1", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+
+[[tables.entries]]
+name = "A"
+display_name = "A"
+sheet = 0
+top_row = 0
+top_col = 0
+rows = 3
+cols = 1
+has_header = true
+has_totals = false
+
+[[tables.entries.columns]]
+id = 0
+name = "x"
+display = "X"
+
+[[tables.entries]]
+name = "B"
+display_name = "B"
+sheet = 0
+top_row = 10
+top_col = 0
+rows = 3
+cols = 1
+has_header = true
+has_totals = false
+
+[[tables.entries.columns]]
+id = 1
+name = "y"
+display = "Y"
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let loaded = load_workbook(&path).expect("non-overlapping tables must load");
+        assert!(loaded.lookup_table("A").is_some());
+        assert!(loaded.lookup_table("B").is_some());
     }
 }
