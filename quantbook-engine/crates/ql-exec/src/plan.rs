@@ -304,6 +304,18 @@ pub enum BindError {
     #[error("R1C1 reference has a relative axis but no anchor cell was supplied")]
     R1C1RequiresAnchor,
 
+    /// **W5-144 (Phase 4.9.H):** an `Expr::ImplicitIntersection`
+    /// wrapping a range was bound under a `BindSite` lacking
+    /// `cell` context. Range narrowing per design § 3.3 (rules 2/3/6)
+    /// uses the formula's anchor cell to pick the row/col within
+    /// the range span; without an anchor, resolution is impossible
+    /// and we fail loud rather than silently substitute a default.
+    /// Production storage canon (design § 4.4) ALWAYS supplies a
+    /// `FormulaSite`; only parse-only / syntax-validation bind
+    /// paths can surface this.
+    #[error("`@<range>` narrowing requires a formula-cell anchor (none supplied)")]
+    ImplicitIntersectionRequiresAnchor,
+
     /// **W5-140 (Phase 4.9.C binder):** R1C1 axis resolution
     /// produced a row or column outside the Excel grid
     /// (`MAX_ROW + 1` rows; `MAX_COLUMN + 1` cols, 1-indexed in
@@ -789,15 +801,260 @@ fn bind_with_context_v2<L: NameLookup>(
                 abs_row: matches!(row_axis, AxisSpec::Abs(_)),
             })
         }
-        // **W5-143 (Phase 4.9.G):** implicit-intersection binding +
-        // eval are Phase 4.9.H work (`ExprPlan::ImplicitIntersection`
-        // variant + narrow-per-§-3.3 eval). Until then, the binder
-        // surfaces a clear "unsupported variant" rather than a
-        // fallback that silently passes through.
-        Expr::ImplicitIntersection(_) => Err(BindError::UnsupportedVariant(
-            "Expr::ImplicitIntersection binding is Phase 4.9.H — parser-only \
-             support landed in 4.9.G; eval narrows the operand per design § 3.3 \
-             once the binder + eval arms ship.",
+        // **W5-144 (Phase 4.9.H):** implicit-intersection binding.
+        // Strategy: narrow at BIND TIME wherever the inner shape
+        // allows it, dropping the wrapper. The AST keeps
+        // `Expr::ImplicitIntersection` for round-trip print (per
+        // design § 4.2 "NOT surface-only"); the ExprPlan never
+        // needs a parallel variant because every reachable narrow
+        // case collapses to a normal ExprPlan shape.
+        //
+        // Narrowing rules per design § 3.3 (anchor = `site.cell`):
+        //   1. Scalar / CellRef inner → drop wrapper.
+        //   2. Bounded range, single column → narrow to anchor row.
+        //   3. Bounded range, single row → narrow to anchor col.
+        //   4. Bounded range, 2-D → `ExprPlan::Error(#VALUE!)`.
+        //   5. Single-cell range (`A1:A1`) → idempotent single cell.
+        //   6. WholeColumn / WholeRow → narrow to anchor.
+        //   7. Array literal inner → top-left.
+        //   8. Function inner → keep as-is (scalar return passes
+        //      through; array return → `#CALC!` per existing scalar
+        //      eval limit, known gap).
+        //   9. StructuredRef inner → patch `is_this_row: true` on
+        //      the resolved range so eval narrows to formula row
+        //      (matches `=Sales[@Qty]` semantics).
+        //  10. NameRef resolving to Range → resolve, narrow if
+        //      possible, error if 2-D.
+        //
+        // Out-of-range narrow → `BindError::UnsupportedVariant` to
+        // become #VALUE! at eval time (we surface as ExprPlan::Error
+        // so the cell value is the right ErrorValue without runtime
+        // dispatch overhead).
+        Expr::ImplicitIntersection(inner) => bind_implicit_intersection(
+            inner.as_ref(),
+            owning_sheet,
+            site,
+            names,
+            sheets,
+            tables,
+            ctx,
+        ),
+    }
+}
+
+/// **W5-144 (Phase 4.9.H):** narrow `@expr` at bind time per design
+/// § 3.3. Returns an `ExprPlan` with the wrapper dropped (every
+/// reachable case collapses to an existing ExprPlan shape).
+fn bind_implicit_intersection<L: NameLookup>(
+    inner: &Expr,
+    owning_sheet: SheetId,
+    site: BindSite,
+    names: &L,
+    sheets: &dyn SheetResolver,
+    tables: &dyn TableLookup,
+    ctx: BindContext,
+) -> Result<ExprPlan, BindError> {
+    match inner {
+        // Rule 1 / 5: scalar inputs pass through unchanged. CellRef
+        // is already a single cell (rule 5 — idempotent).
+        Expr::Number(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::Error(_)
+        | Expr::CellRef(_)
+        | Expr::R1C1Ref { .. }
+        | Expr::Unary { .. }
+        | Expr::Binary { .. }
+        | Expr::NameRef(_) => bind_with_context_v2(inner, site, names, sheets, tables, ctx),
+
+        // Rule 8: function inner. The `@` is semantically a no-op for
+        // scalar function returns (most common case). Array returns
+        // currently surface as `#CALC!` in scalar context per existing
+        // 4.7.G limit; the design § 3.3 rule 7 "array → top-left" is
+        // a known v1 gap (deferred to cell-boundary spill rewiring).
+        Expr::Function { .. } => bind_with_context_v2(inner, site, names, sheets, tables, ctx),
+
+        // Rule 7: array literal → top-left.
+        Expr::Array(rows) => {
+            if rows.is_empty() || rows[0].is_empty() {
+                return Err(BindError::EmptyArrayLiteral);
+            }
+            // Bind the top-left cell as a standalone scalar.
+            bind_with_context_v2(
+                &rows[0][0],
+                site,
+                names,
+                sheets,
+                tables,
+                BindContext::Scalar,
+            )
+        }
+
+        // Rules 2 / 3 / 4 / 5 / 6: range narrowing using site.cell.
+        Expr::RangeRef(rr) => {
+            narrow_range_for_implicit_intersection(rr, owning_sheet, site, sheets)
+        }
+
+        // Rule 9: structured ref. Bind via the normal path, then
+        // override `is_this_row: true` so eval narrows to formula row.
+        // This makes `@Sales[Qty]` ≡ `Sales[@Qty]` at eval time.
+        Expr::StructuredRef { table_name, spec } => {
+            let plan = resolve_structured_ref(table_name, spec, tables)?;
+            match plan {
+                ExprPlan::StructuredRef {
+                    table_name,
+                    source,
+                    resolved,
+                    is_this_row: _,
+                } => Ok(ExprPlan::StructuredRef {
+                    table_name,
+                    source,
+                    resolved,
+                    is_this_row: true,
+                }),
+                // resolve_structured_ref only ever returns
+                // ExprPlan::StructuredRef; the wildcard arm is
+                // defensive.
+                other => Ok(other),
+            }
+        }
+
+        // Nested `@@expr` — Excel-canon idempotent. Strip outer
+        // wrapper; recurse on the inner ImplicitIntersection.
+        Expr::ImplicitIntersection(_) => {
+            bind_with_context_v2(inner, site, names, sheets, tables, ctx)
+        }
+
+        // Spill (`A1#`) is reserved for a later Phase 4.9 sub-phase.
+        Expr::Spill(_) => Err(BindError::UnsupportedVariant(
+            "Spill-range-ref `A1#` inside `@` is unsupported in v1; \
+             the design § 3.3 rule for `@A1#` is documented but the \
+             eval-side spill-range expansion is deferred.",
+        )),
+    }
+}
+
+/// **W5-144 (Phase 4.9.H):** apply design § 3.3 rules 2-6 to a
+/// `RangeRef` inner with a formula-cell anchor (`site.cell`).
+fn narrow_range_for_implicit_intersection(
+    rr: &ql_formula_syntax::RangeRef,
+    owning_sheet: SheetId,
+    site: BindSite,
+    sheets: &dyn SheetResolver,
+) -> Result<ExprPlan, BindError> {
+    use ql_formula_syntax::RangeRef;
+    let anchor = site
+        .cell
+        .ok_or(BindError::ImplicitIntersectionRequiresAnchor)?;
+    match rr {
+        RangeRef::Cells {
+            sheet,
+            start_col,
+            start_row,
+            end_col,
+            end_row,
+            abs_start_col,
+            abs_start_row,
+            abs_end_col: _,
+            abs_end_row: _,
+        } => {
+            let sheet_id = resolve_sheet_ref(sheet, owning_sheet, sheets)?;
+            let single_col = start_col == end_col;
+            let single_row = start_row == end_row;
+            match (single_col, single_row) {
+                // Rule 5: single cell — idempotent.
+                (true, true) => Ok(ExprPlan::CellRef {
+                    sheet: sheet_id,
+                    row: *start_row,
+                    col: *start_col,
+                    abs_col: *abs_start_col,
+                    abs_row: *abs_start_row,
+                }),
+                // Rule 2: single column.
+                (true, false) => {
+                    if anchor.row >= *start_row && anchor.row <= *end_row {
+                        Ok(ExprPlan::CellRef {
+                            sheet: sheet_id,
+                            row: anchor.row,
+                            col: *start_col,
+                            // Narrowed coord is row-dependent (formula-row);
+                            // the original abs flag on the col axis stays.
+                            abs_col: *abs_start_col,
+                            abs_row: false,
+                        })
+                    } else {
+                        Ok(ExprPlan::Error(ErrorValue::Value))
+                    }
+                }
+                // Rule 3: single row.
+                (false, true) => {
+                    if anchor.col >= *start_col && anchor.col <= *end_col {
+                        Ok(ExprPlan::CellRef {
+                            sheet: sheet_id,
+                            row: *start_row,
+                            col: anchor.col,
+                            abs_col: false,
+                            abs_row: *abs_start_row,
+                        })
+                    } else {
+                        Ok(ExprPlan::Error(ErrorValue::Value))
+                    }
+                }
+                // Rule 4: 2-D → ALWAYS #VALUE!.
+                (false, false) => Ok(ExprPlan::Error(ErrorValue::Value)),
+            }
+        }
+        // Rule 6: whole column — narrow to anchor row.
+        RangeRef::WholeColumn {
+            sheet,
+            start_col,
+            end_col,
+            abs_start,
+            ..
+        } => {
+            let sheet_id = resolve_sheet_ref(sheet, owning_sheet, sheets)?;
+            if start_col == end_col {
+                // Single column — narrow to anchor row.
+                Ok(ExprPlan::CellRef {
+                    sheet: sheet_id,
+                    row: anchor.row,
+                    col: *start_col,
+                    abs_col: *abs_start,
+                    abs_row: false,
+                })
+            } else {
+                // Multi-column whole-column form (e.g. `A:C`) is
+                // semantically a 2-D range under `@` → #VALUE!.
+                Ok(ExprPlan::Error(ErrorValue::Value))
+            }
+        }
+        // Rule 6: whole row — narrow to anchor col.
+        RangeRef::WholeRow {
+            sheet,
+            start_row,
+            end_row,
+            abs_start,
+            ..
+        } => {
+            let sheet_id = resolve_sheet_ref(sheet, owning_sheet, sheets)?;
+            if start_row == end_row {
+                Ok(ExprPlan::CellRef {
+                    sheet: sheet_id,
+                    row: *start_row,
+                    col: anchor.col,
+                    abs_col: false,
+                    abs_row: *abs_start,
+                })
+            } else {
+                Ok(ExprPlan::Error(ErrorValue::Value))
+            }
+        }
+        // R1C1Cells is parser-intermediate — storage canon lowers
+        // before bind. Reaching here means canonicalization was
+        // bypassed.
+        RangeRef::R1C1Cells { .. } => Err(BindError::UnsupportedVariant(
+            "RangeRef::R1C1Cells inside @ is parser-intermediate; storage canon \
+             must lower to absolute Cells before bind.",
         )),
     }
 }
@@ -2356,4 +2613,306 @@ mod tests {
         let expr = r1c1_expr(AxisSpec::Abs(1), AxisSpec::Abs(1));
         assert_eq!(variant_kind(&expr), "R1C1Ref");
     }
-}
+
+    // ===================================================================
+    // W5-144 (Phase 4.9.H) — `@` (implicit intersection) bind tests.
+    // ===================================================================
+
+    use ql_formula_syntax::{lex, parse};
+
+    fn bind_at(src: &str, anchor: Address) -> Result<ExprPlan, BindError> {
+        let tokens = lex(src).expect("lex");
+        let expr = parse(tokens).expect("parse");
+        bind_with_site(
+            &expr,
+            BindSite::at_cell(anchor),
+            &EmptyNameLookup,
+            &EmptySheetResolver,
+            &EmptyTableLookup,
+        )
+    }
+
+    /// **Rule 1: scalar inner passes through.** `@5` binds to
+    /// `ExprPlan::Number(5)`. The wrapper is dropped at bind time.
+    #[test]
+    fn at_scalar_number_drops_wrapper() {
+        let p = bind_at(
+            "@5",
+            Address {
+                sheet: 0,
+                row: 0,
+                col: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(p, ExprPlan::Number(5.0));
+    }
+
+    /// **Rule 1: boolean inner passes through.**
+    #[test]
+    fn at_scalar_bool_drops_wrapper() {
+        let p = bind_at(
+            "@TRUE",
+            Address {
+                sheet: 0,
+                row: 0,
+                col: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(p, ExprPlan::Bool(true));
+    }
+
+    /// **Rule 5: single CellRef passes through (idempotent).**
+    #[test]
+    fn at_cellref_idempotent() {
+        let p = bind_at(
+            "@A1",
+            Address {
+                sheet: 0,
+                row: 0,
+                col: 0,
+            },
+        )
+        .unwrap();
+        match p {
+            ExprPlan::CellRef { row, col, .. } => {
+                assert_eq!(row, 0);
+                assert_eq!(col, 0);
+            }
+            other => panic!("expected CellRef, got {other:?}"),
+        }
+    }
+
+    /// **Rule 2: bounded range, single column, formula row in span.**
+    /// `@A1:A10` at anchor (B5) → A5.
+    #[test]
+    fn at_single_column_narrows_to_anchor_row() {
+        let p = bind_at(
+            "@A1:A10",
+            Address {
+                sheet: 0,
+                row: 4,
+                col: 1,
+            },
+        )
+        .unwrap();
+        match p {
+            ExprPlan::CellRef { row, col, .. } => {
+                assert_eq!(row, 4); // anchor row
+                assert_eq!(col, 0); // column A
+            }
+            other => panic!("expected CellRef, got {other:?}"),
+        }
+    }
+
+    /// **Rule 2: out of row span → #VALUE!.** `@A1:A10` at row 100.
+    #[test]
+    fn at_single_column_out_of_row_span_returns_value_error() {
+        let p = bind_at(
+            "@A1:A10",
+            Address {
+                sheet: 0,
+                row: 99,
+                col: 5,
+            },
+        )
+        .unwrap();
+        assert_eq!(p, ExprPlan::Error(ErrorValue::Value));
+    }
+
+    /// **Rule 3: bounded range, single row, formula col in span.**
+    /// `@A1:E1` at anchor (C5) → C1.
+    #[test]
+    fn at_single_row_narrows_to_anchor_col() {
+        let p = bind_at(
+            "@A1:E1",
+            Address {
+                sheet: 0,
+                row: 4,
+                col: 2,
+            },
+        )
+        .unwrap();
+        match p {
+            ExprPlan::CellRef { row, col, .. } => {
+                assert_eq!(row, 0); // range row
+                assert_eq!(col, 2); // anchor col
+            }
+            other => panic!("expected CellRef, got {other:?}"),
+        }
+    }
+
+    /// **Rule 3: out of col span → #VALUE!.**
+    #[test]
+    fn at_single_row_out_of_col_span_returns_value_error() {
+        let p = bind_at(
+            "@A1:E1",
+            Address {
+                sheet: 0,
+                row: 4,
+                col: 100,
+            },
+        )
+        .unwrap();
+        assert_eq!(p, ExprPlan::Error(ErrorValue::Value));
+    }
+
+    /// **Rule 4: 2-D range → ALWAYS #VALUE! regardless of anchor.**
+    #[test]
+    fn at_two_d_range_always_returns_value_error() {
+        let p = bind_at(
+            "@A1:E10",
+            Address {
+                sheet: 0,
+                row: 4,
+                col: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(p, ExprPlan::Error(ErrorValue::Value));
+    }
+
+    /// **Rule 5: single-cell range `A1:A1` → single cell.**
+    #[test]
+    fn at_single_cell_range_returns_single_cell() {
+        let p = bind_at(
+            "@A1:A1",
+            Address {
+                sheet: 0,
+                row: 5,
+                col: 5,
+            },
+        )
+        .unwrap();
+        match p {
+            ExprPlan::CellRef { row, col, .. } => {
+                assert_eq!(row, 0);
+                assert_eq!(col, 0);
+            }
+            other => panic!("expected CellRef, got {other:?}"),
+        }
+    }
+
+    /// **Rule 6: WholeColumn `A:A` narrows to anchor row.**
+    #[test]
+    fn at_whole_column_narrows_to_anchor_row() {
+        let p = bind_at(
+            "@A:A",
+            Address {
+                sheet: 0,
+                row: 4,
+                col: 1,
+            },
+        )
+        .unwrap();
+        match p {
+            ExprPlan::CellRef { row, col, .. } => {
+                assert_eq!(row, 4);
+                assert_eq!(col, 0);
+            }
+            other => panic!("expected CellRef, got {other:?}"),
+        }
+    }
+
+    /// **Rule 6: WholeRow `1:1` narrows to anchor col.**
+    #[test]
+    fn at_whole_row_narrows_to_anchor_col() {
+        let p = bind_at(
+            "@1:1",
+            Address {
+                sheet: 0,
+                row: 4,
+                col: 1,
+            },
+        )
+        .unwrap();
+        match p {
+            ExprPlan::CellRef { row, col, .. } => {
+                assert_eq!(row, 0);
+                assert_eq!(col, 1);
+            }
+            other => panic!("expected CellRef, got {other:?}"),
+        }
+    }
+
+    /// **Rule 6: multi-column whole-column `A:B` → #VALUE! (2-D).**
+    #[test]
+    fn at_multi_whole_column_returns_value_error() {
+        let p = bind_at(
+            "@A:B",
+            Address {
+                sheet: 0,
+                row: 4,
+                col: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(p, ExprPlan::Error(ErrorValue::Value));
+    }
+
+    /// **Rule 7: array literal → top-left.** `@{1, 2, 3}` → 1.
+    #[test]
+    fn at_array_literal_returns_top_left() {
+        let p = bind_at(
+            "@{1, 2, 3}",
+            Address {
+                sheet: 0,
+                row: 0,
+                col: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(p, ExprPlan::Number(1.0));
+    }
+
+    /// **Rule 8: function inner — wrapper drops, function binds
+    /// normally.** `@SUM(A1)` binds to `Function(SUM, [CellRef(A1)])`.
+    #[test]
+    fn at_function_inner_drops_wrapper() {
+        let p = bind_at(
+            "@SUM(A1)",
+            Address {
+                sheet: 0,
+                row: 0,
+                col: 0,
+            },
+        )
+        .unwrap();
+        match p {
+            ExprPlan::Function { name, args } => {
+                assert_eq!(name.as_ref(), "SUM");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected Function, got {other:?}"),
+        }
+    }
+
+    /// **Nested `@@5` is idempotent.** `@@5` collapses to
+    /// `ExprPlan::Number(5)`.
+    #[test]
+    fn nested_at_collapses() {
+        let p = bind_at(
+            "@@5",
+            Address {
+                sheet: 0,
+                row: 0,
+                col: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(p, ExprPlan::Number(5.0));
+    }
+
+    /// **`@<range>` without anchor → `ImplicitIntersectionRequiresAnchor`.**
+    #[test]
+    fn at_range_without_anchor_errors() {
+        let tokens = lex("@A1:A10").unwrap();
+        let expr = parse(tokens).unwrap();
+        let err = bind_with_site(
+            &expr,
+            BindSite::sheet_only(0),
+            &EmptyNameLookup,
+            &EmptySheetResolver,
+            &EmptyTableLookup,
+        )
