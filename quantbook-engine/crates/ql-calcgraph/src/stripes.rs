@@ -202,6 +202,13 @@ impl StripeIndex {
                     );
                 }
             }
+            // **W5-139 (Phase 4.9.C):** intermediate R1C1 range —
+            // never reaches stripe registration. Storage canon
+            // lowers to absolute Cells before this code path runs.
+            RangeRef::R1C1Cells { .. } => unreachable!(
+                "StripeIndex::register: RangeRef::R1C1Cells is parser-intermediate; \
+                 storage canon must lower to absolute Cells before stripe registration."
+            ),
         }
     }
 
@@ -307,6 +314,13 @@ pub fn range_contains_rowcol(range: &RangeRef, row: RowId, col: ColId) -> bool {
         RangeRef::WholeRow {
             start_row, end_row, ..
         } => row >= *start_row && row <= *end_row,
+        // **W5-139 (Phase 4.9.C):** intermediate R1C1 range —
+        // shouldn't reach this code path (storage canon lowers to
+        // absolute first).
+        RangeRef::R1C1Cells { .. } => unreachable!(
+            "range_contains_rowcol: RangeRef::R1C1Cells is parser-intermediate; \
+             storage canon must lower to absolute Cells before containment checks."
+        ),
     }
 }
 

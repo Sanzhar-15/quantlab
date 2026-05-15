@@ -39,7 +39,7 @@
 use std::sync::Arc;
 
 use crate::ast::{CellAddr, Expr, RangeRef, SheetRef};
-use crate::token::{Operator, Token};
+use crate::token::{AxisSpec, Operator, Token};
 
 /// Parse error variants.
 ///
@@ -87,6 +87,15 @@ pub enum ParseError {
     /// (literal), `Sheet1!(A1)` (grouping).
     #[error("sheet qualifier must be followed by a cell or range reference, got {got}")]
     SheetQualifierFollowedByNonReference { got: String },
+
+    /// **W5-139 (Phase 4.9.C):** an R1C1 range endpoint pair where
+    /// at least one axis disagrees in relativity (absolute vs
+    /// relative) between the two endpoints. Excel canon forbids
+    /// mixing, e.g. `R1C1:R[10]C5` (start row absolute, end row
+    /// relative) is rejected with this error per design § 3.1.
+    /// Closes Codex MEDIUM + Sonnet H-4 from the 4.9.AA review.
+    #[error("R1C1 range endpoints have mismatched relativity — each axis must be uniformly absolute or relative across both endpoints")]
+    R1C1MixedRelativity,
 
     /// **W5-98 (Phase 4.7.D):** array literal `{1, 2; 3}` has rows of
     /// different length. Excel pads missing cells with `#N/A` but
@@ -371,6 +380,21 @@ impl Parser {
                 abs_start: abs,
                 abs_end: abs,
             })),
+
+            // **W5-139 (Phase 4.9.C):** R1C1-style reference token,
+            // emitted by `lex_with(.., R1C1, ..)`. Parser folds into
+            // an intermediate `Expr::R1C1Ref` carrying both axes
+            // verbatim. The binder lowers to `ExprPlan::CellRef`
+            // using `BindSite::at_cell` for relative-axis
+            // resolution (separate sub-phase). Function-call
+            // disambiguation does NOT apply — `R1C1` etc. can never
+            // be a function name (Excel disallows function names
+            // starting with `R` followed by digit/`C`).
+            Token::R1C1Ref { row_axis, col_axis } => Ok(Expr::R1C1Ref {
+                sheet: SheetRef::Current,
+                row_axis,
+                col_axis,
+            }),
 
             // **W5-112 (Phase 4.8.C):** structured reference. Lexer
             // emitted `StructuredRef { table_name, bracket_content }`
@@ -739,11 +763,64 @@ impl Parser {
                     abs_end,
                 }))
             }
+            // **W5-139 (Phase 4.9.C):** R1C1 endpoint pair —
+            // `R1C1:R10C5`, `R[1]C[1]:R[5]C[5]`, etc. Mixed-
+            // relativity (one endpoint absolute, the other relative)
+            // is REJECTED per design § 3.1 (closes Codex MEDIUM +
+            // Sonnet H-4): the rule is per-axis, so the row axis of
+            // both endpoints must agree in relativity, and the col
+            // axis must independently agree. Cross-form mixing
+            // (R1C1Ref vs CellRef) is rejected via the generic
+            // `InvalidRange` arm below.
+            (
+                Expr::R1C1Ref {
+                    sheet: a_sheet,
+                    row_axis: a_row,
+                    col_axis: a_col,
+                },
+                Expr::R1C1Ref {
+                    sheet: _b_sheet,
+                    row_axis: b_row,
+                    col_axis: b_col,
+                },
+            ) => {
+                if !axis_relativity_matches(&a_row, &b_row)
+                    || !axis_relativity_matches(&a_col, &b_col)
+                {
+                    return Err(ParseError::R1C1MixedRelativity);
+                }
+                // Note: unlike A1 ranges, R1C1 ranges do NOT sort
+                // start ≤ end here — relative offsets can't be
+                // ordered against absolute coords until the binder
+                // resolves both against an anchor. Normalization
+                // happens post-bind. `merged_sheet` already
+                // collapses sheet refs via `merge_sheet_refs`.
+                let _ = a_sheet; // sheet info captured in merged_sheet
+                Ok(Expr::RangeRef(RangeRef::R1C1Cells {
+                    sheet: merged_sheet,
+                    start_row: a_row,
+                    start_col: a_col,
+                    end_row: b_row,
+                    end_col: b_col,
+                }))
+            }
             _ => Err(ParseError::InvalidRange {
                 detail: "mixed CellRef/Column/Row range operands (e.g. A1:B); Phase 0 only allows matching types",
             }),
         }
     }
+}
+
+/// **W5-139 (Phase 4.9.C):** for R1C1 range endpoints, returns true
+/// when both axes are absolute or both axes are relative. Mixed
+/// (one abs, one rel) is the case `build_range` rejects with
+/// `ParseError::R1C1MixedRelativity`. Per-axis check — row and col
+/// are evaluated independently by the caller.
+fn axis_relativity_matches(a: &AxisSpec, b: &AxisSpec) -> bool {
+    matches!(
+        (a, b),
+        (AxisSpec::Abs(_), AxisSpec::Abs(_)) | (AxisSpec::Rel(_), AxisSpec::Rel(_))
+    )
 }
 
 /// **W5-89 (Phase 4.6.A part 3):** attach a sheet name from `Sheet!Ref`
@@ -837,8 +914,45 @@ fn apply_sheet_to_term(expr: Expr, name: Arc<str>) -> Result<Expr, ParseError> {
                         abs_end,
                     }
                 }
+                // **W5-139 (Phase 4.9.C):** intermediate R1C1 range — same
+                // treatment as the absolute-form ranges: refuse a second
+                // qualifier, otherwise stamp the sheet name in.
+                RangeRef::R1C1Cells {
+                    sheet,
+                    start_row,
+                    start_col,
+                    end_row,
+                    end_col,
+                } => {
+                    if !matches!(sheet, SheetRef::Current) {
+                        return Err(ParseError::DoubleSheetQualifier);
+                    }
+                    RangeRef::R1C1Cells {
+                        sheet: SheetRef::Name(name),
+                        start_row,
+                        start_col,
+                        end_row,
+                        end_col,
+                    }
+                }
             };
             Ok(Expr::RangeRef(updated))
+        }
+        // **W5-139 (Phase 4.9.C):** intermediate R1C1 single ref —
+        // same treatment as `Expr::CellRef`.
+        Expr::R1C1Ref {
+            sheet,
+            row_axis,
+            col_axis,
+        } => {
+            if !matches!(sheet, SheetRef::Current) {
+                return Err(ParseError::DoubleSheetQualifier);
+            }
+            Ok(Expr::R1C1Ref {
+                sheet: SheetRef::Name(name),
+                row_axis,
+                col_axis,
+            })
         }
         other => Err(ParseError::SheetQualifierFollowedByNonReference {
             got: format!("{other:?}"),
@@ -888,7 +1002,10 @@ fn sheet_of_term(expr: &Expr) -> SheetRef {
         Expr::CellRef(addr) => addr.sheet.clone(),
         Expr::RangeRef(RangeRef::Cells { sheet, .. })
         | Expr::RangeRef(RangeRef::WholeColumn { sheet, .. })
-        | Expr::RangeRef(RangeRef::WholeRow { sheet, .. }) => sheet.clone(),
+        | Expr::RangeRef(RangeRef::WholeRow { sheet, .. })
+        | Expr::RangeRef(RangeRef::R1C1Cells { sheet, .. }) => sheet.clone(),
+        // **W5-139 (Phase 4.9.C):** intermediate R1C1 single ref.
+        Expr::R1C1Ref { sheet, .. } => sheet.clone(),
         _ => SheetRef::Current,
     }
 }
@@ -2741,6 +2858,279 @@ mod tests {
                 }
             }
             other => panic!("expected Function, got {other:?}"),
+        }
+    }
+
+    // ===================================================================
+    // W5-139 (Phase 4.9.C) — R1C1 parser tests.
+    //
+    // Tokens come from `lex_with(.., R1C1, EnUs)`. The parser folds
+    // `Token::R1C1Ref` → `Expr::R1C1Ref` (single) and
+    // `R1C1Ref Colon R1C1Ref` → `Expr::RangeRef(RangeRef::R1C1Cells)`.
+    // Mixed-relativity range endpoints reject with
+    // `ParseError::R1C1MixedRelativity`. Mixed CellRef/R1C1Ref ranges
+    // reject with the existing `ParseError::InvalidRange`.
+    // ===================================================================
+
+    use crate::lexer::lex_with;
+    use ql_types::{Locale, ReferenceMode};
+
+    fn p_r1c1(src: &str) -> Expr {
+        let tokens = lex_with(src, ReferenceMode::R1C1, Locale::EnUs).expect("lex_with R1C1");
+        parse(tokens).expect("parse")
+    }
+
+    fn perr_r1c1(src: &str) -> ParseError {
+        let tokens = lex_with(src, ReferenceMode::R1C1, Locale::EnUs).expect("lex_with R1C1");
+        parse(tokens).expect_err("expected parse error")
+    }
+
+    /// **Single absolute R1C1 ref** parses to `Expr::R1C1Ref` with
+    /// `SheetRef::Current`.
+    #[test]
+    fn r1c1_parse_absolute_single_ref() {
+        match p_r1c1("R3C5") {
+            Expr::R1C1Ref {
+                sheet,
+                row_axis,
+                col_axis,
+            } => {
+                assert!(matches!(sheet, SheetRef::Current));
+                assert_eq!(row_axis, AxisSpec::Abs(3));
+                assert_eq!(col_axis, AxisSpec::Abs(5));
+            }
+            other => panic!("expected Expr::R1C1Ref, got {other:?}"),
+        }
+    }
+
+    /// **Single relative R1C1 ref.** Both axes relative.
+    #[test]
+    fn r1c1_parse_relative_single_ref() {
+        match p_r1c1("R[-1]C[2]") {
+            Expr::R1C1Ref {
+                row_axis, col_axis, ..
+            } => {
+                assert_eq!(row_axis, AxisSpec::Rel(-1));
+                assert_eq!(col_axis, AxisSpec::Rel(2));
+            }
+            other => panic!("expected Expr::R1C1Ref, got {other:?}"),
+        }
+    }
+
+    /// **Bare `RC`** parses with both axes `Rel(0)`.
+    #[test]
+    fn r1c1_parse_bare_rc_both_axes_rel_zero() {
+        match p_r1c1("RC") {
+            Expr::R1C1Ref {
+                row_axis, col_axis, ..
+            } => {
+                assert_eq!(row_axis, AxisSpec::Rel(0));
+                assert_eq!(col_axis, AxisSpec::Rel(0));
+            }
+            other => panic!("expected Expr::R1C1Ref, got {other:?}"),
+        }
+    }
+
+    /// **R1C1 range `R1C1:R10C5`** — both axes absolute on both
+    /// endpoints. Builds `RangeRef::R1C1Cells`.
+    #[test]
+    fn r1c1_parse_range_both_endpoints_absolute() {
+        match p_r1c1("R1C1:R10C5") {
+            Expr::RangeRef(RangeRef::R1C1Cells {
+                sheet,
+                start_row,
+                start_col,
+                end_row,
+                end_col,
+            }) => {
+                assert!(matches!(sheet, SheetRef::Current));
+                assert_eq!(start_row, AxisSpec::Abs(1));
+                assert_eq!(start_col, AxisSpec::Abs(1));
+                assert_eq!(end_row, AxisSpec::Abs(10));
+                assert_eq!(end_col, AxisSpec::Abs(5));
+            }
+            other => panic!("expected RangeRef::R1C1Cells, got {other:?}"),
+        }
+    }
+
+    /// **R1C1 range `R[1]C[1]:R[5]C[5]`** — both axes relative.
+    #[test]
+    fn r1c1_parse_range_both_endpoints_relative() {
+        match p_r1c1("R[1]C[1]:R[5]C[5]") {
+            Expr::RangeRef(RangeRef::R1C1Cells {
+                start_row,
+                start_col,
+                end_row,
+                end_col,
+                ..
+            }) => {
+                assert_eq!(start_row, AxisSpec::Rel(1));
+                assert_eq!(start_col, AxisSpec::Rel(1));
+                assert_eq!(end_row, AxisSpec::Rel(5));
+                assert_eq!(end_col, AxisSpec::Rel(5));
+            }
+            other => panic!("expected RangeRef::R1C1Cells, got {other:?}"),
+        }
+    }
+
+    /// **Mixed-relativity row axis rejected.** `R1C1:R[10]C5` —
+    /// start row Abs, end row Rel.
+    #[test]
+    fn r1c1_parse_range_mixed_row_relativity_rejected() {
+        let err = perr_r1c1("R1C1:R[10]C5");
+        assert!(matches!(err, ParseError::R1C1MixedRelativity));
+    }
+
+    /// **Mixed-relativity col axis rejected.** `R1C1:R10C[5]` —
+    /// start col Abs, end col Rel.
+    #[test]
+    fn r1c1_parse_range_mixed_col_relativity_rejected() {
+        let err = perr_r1c1("R1C1:R10C[5]");
+        assert!(matches!(err, ParseError::R1C1MixedRelativity));
+    }
+
+    /// **Mixed-relativity both axes rejected.** Sanity that the
+    /// per-axis check fires on the first mismatch, not the second.
+    #[test]
+    fn r1c1_parse_range_mixed_both_axes_rejected() {
+        let err = perr_r1c1("R1C1:R[1]C[1]");
+        assert!(matches!(err, ParseError::R1C1MixedRelativity));
+    }
+
+    /// **Sheet-qualified single R1C1 ref.** `Sheet1!R1C1` → R1C1Ref
+    /// with `SheetRef::Name("Sheet1")`.
+    #[test]
+    fn r1c1_parse_sheet_qualified_single_ref() {
+        match p_r1c1("Sheet1!R3C5") {
+            Expr::R1C1Ref {
+                sheet,
+                row_axis,
+                col_axis,
+            } => {
+                match sheet {
+                    SheetRef::Name(n) => assert_eq!(n.as_ref(), "Sheet1"),
+                    other => panic!("expected SheetRef::Name, got {other:?}"),
+                }
+                assert_eq!(row_axis, AxisSpec::Abs(3));
+                assert_eq!(col_axis, AxisSpec::Abs(5));
+            }
+            other => panic!("expected Expr::R1C1Ref, got {other:?}"),
+        }
+    }
+
+    /// **Sheet-qualified R1C1 range.** `Sheet1!R1C1:R10C5` — sheet
+    /// prefix applies to whole range; trailing endpoint must NOT
+    /// carry a separate prefix (Excel canon).
+    #[test]
+    fn r1c1_parse_sheet_qualified_range() {
+        match p_r1c1("Sheet1!R1C1:R10C5") {
+            Expr::RangeRef(RangeRef::R1C1Cells { sheet, .. }) => match sheet {
+                SheetRef::Name(n) => assert_eq!(n.as_ref(), "Sheet1"),
+                other => panic!("expected SheetRef::Name, got {other:?}"),
+            },
+            other => panic!("expected RangeRef::R1C1Cells, got {other:?}"),
+        }
+    }
+
+    /// **Double-sheet on R1C1 rejected.** `Sheet1!Sheet2!R1C1` —
+    /// only one sheet prefix allowed.
+    #[test]
+    fn r1c1_parse_double_sheet_qualifier_rejected() {
+        let err = perr_r1c1("Sheet1!Sheet2!R1C1");
+        assert!(matches!(err, ParseError::DoubleSheetQualifier));
+    }
+
+    /// **Mixed A1+R1C1 endpoints rejected as InvalidRange.** `A1` in
+    /// R1C1 mode still lexes as `Token::CellRef`, so the parser may
+    /// see `A1:R1C1` — the existing wildcard arm in `build_range`
+    /// catches this as `InvalidRange` (not a new error class).
+    #[test]
+    fn r1c1_parse_mixed_a1_and_r1c1_range_rejected_as_invalid() {
+        let err = perr_r1c1("A1:R1C1");
+        assert!(matches!(err, ParseError::InvalidRange { .. }));
+    }
+
+    /// **R1C1 inside a function call.** `SUM(R1C1, R2C2)` — two R1C1
+    /// refs as args, comma-separated. Exercises the function-call
+    /// + R1C1 composition.
+    #[test]
+    fn r1c1_parse_inside_function_call() {
+        match p_r1c1("SUM(R1C1,R2C2)") {
+            Expr::Function { name, args } => {
+                assert_eq!(name.as_ref(), "SUM");
+                assert_eq!(args.len(), 2);
+                assert!(matches!(args[0], Expr::R1C1Ref { .. }));
+                assert!(matches!(args[1], Expr::R1C1Ref { .. }));
+            }
+            other => panic!("expected Function, got {other:?}"),
+        }
+    }
+
+    /// **R1C1 inside arithmetic.** `R1C1 + R2C2` — binary op around
+    /// two R1C1 refs.
+    #[test]
+    fn r1c1_parse_inside_binary_op() {
+        match p_r1c1("R1C1+R2C2") {
+            Expr::Binary { op, lhs, rhs } => {
+                assert_eq!(op, Operator::Plus);
+                assert!(matches!(*lhs, Expr::R1C1Ref { .. }));
+                assert!(matches!(*rhs, Expr::R1C1Ref { .. }));
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    /// **R1C1 unary minus.** `-R1C1` — exercise unary path.
+    #[test]
+    fn r1c1_parse_unary_minus_in_front_of_r1c1ref() {
+        match p_r1c1("-R1C1") {
+            Expr::Unary { op, operand } => {
+                assert_eq!(op, Operator::Minus);
+                assert!(matches!(*operand, Expr::R1C1Ref { .. }));
+            }
+            other => panic!("expected Unary, got {other:?}"),
+        }
+    }
+
+    /// **A1 mode parser still works.** Confirms the new R1C1 arms
+    /// don't affect the A1 parse path. `A1` (A1 mode) → CellRef.
+    #[test]
+    fn r1c1_a1_mode_cellref_still_parses_in_a1_mode() {
+        match p("A1") {
+            Expr::CellRef(addr) => {
+                assert_eq!(addr.col, 0);
+                assert_eq!(addr.row, 0);
+            }
+            other => panic!("expected CellRef, got {other:?}"),
+        }
+    }
+
+    /// **R1C1 range nested-colon rejected.** `R1C1:R5C5:R10C10` —
+    /// existing nested-range rejection still fires.
+    #[test]
+    fn r1c1_parse_nested_range_rejected() {
+        let err = perr_r1c1("R1C1:R5C5:R10C10");
+        assert!(matches!(err, ParseError::InvalidRange { .. }));
+    }
+
+    /// **Same-relativity ranges round-trip the axis values exactly.**
+    /// `R[2]C:R[5]C` — rows relative, cols both bare (Rel(0)).
+    #[test]
+    fn r1c1_parse_range_rel_row_bare_col_preserves_axis_values() {
+        match p_r1c1("R[2]C:R[5]C") {
+            Expr::RangeRef(RangeRef::R1C1Cells {
+                start_row,
+                start_col,
+                end_row,
+                end_col,
+                ..
+            }) => {
+                assert_eq!(start_row, AxisSpec::Rel(2));
+                assert_eq!(start_col, AxisSpec::Rel(0));
+                assert_eq!(end_row, AxisSpec::Rel(5));
+                assert_eq!(end_col, AxisSpec::Rel(0));
+            }
+            other => panic!("expected RangeRef::R1C1Cells, got {other:?}"),
         }
     }
 }

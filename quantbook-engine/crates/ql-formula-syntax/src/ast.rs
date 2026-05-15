@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use ql_types::{ColId, RowId, SheetId};
 
-use crate::token::Operator;
+use crate::token::{AxisSpec, Operator};
 
 /// A formula expression. Tree-shaped — children are `Box<Expr>` to keep node size bounded.
 #[derive(Clone, Debug, PartialEq)]
@@ -92,6 +92,22 @@ pub enum Expr {
     /// - `{1, #N/A, 3}` — error literal in an array (per Phase 4.7
     ///   design § 3.3).
     Error(ql_types::ErrorValue),
+
+    /// **W5-139 (Phase 4.9.C):** intermediate R1C1 single-cell
+    /// reference, emitted by the parser when fed `Token::R1C1Ref`
+    /// from a `mode == R1C1` lex. Each axis is independently
+    /// absolute (1-indexed) or relative (signed offset from the
+    /// formula's anchor cell). The binder lowers to
+    /// `ExprPlan::CellRef` using `BindSite::at_cell` for relative
+    /// resolution (separate sub-phase). Sheet-qualification is the
+    /// same shape as `CellRef`: parser emits `SheetRef::Current`;
+    /// `apply_sheet_to_term` rewrites to `SheetRef::Name` when a
+    /// `Sheet1!` prefix is present.
+    R1C1Ref {
+        sheet: SheetRef,
+        row_axis: AxisSpec,
+        col_axis: AxisSpec,
+    },
 
     /// **W5-112 (Phase 4.8.C):** structured table reference
     /// `Sales[Qty]`, `Sales[[#Headers], [Qty]]`, `[@Col]`, etc.
@@ -289,6 +305,18 @@ pub fn rewrite_sheet_name_in_expr(expr: &Expr, old_canonical: &str, new_name: &A
             old_canonical,
             new_name,
         ))),
+        // **W5-139 (Phase 4.9.C):** intermediate R1C1 ref carries a
+        // SheetRef just like CellRef — rewrite identically. Axis
+        // values are sheet-agnostic and clone through.
+        Expr::R1C1Ref {
+            sheet,
+            row_axis,
+            col_axis,
+        } => Expr::R1C1Ref {
+            sheet: rewrite_sheet_ref(sheet, old_canonical, new_name),
+            row_axis: *row_axis,
+            col_axis: *col_axis,
+        },
         // W5-112 (Phase 4.8.C): structured refs have no SheetRef
         // (table names are workbook-scoped). Clone through.
         Expr::StructuredRef { table_name, spec } => Expr::StructuredRef {
@@ -342,6 +370,16 @@ pub fn rewrite_table_ref(expr: &Expr, old_canonical: &str, new_name: &Arc<str>) 
         Expr::Spill(inner) => {
             Expr::Spill(Box::new(rewrite_table_ref(inner, old_canonical, new_name)))
         }
+        // **W5-139 (Phase 4.9.C):** R1C1 refs don't reference tables — clone through.
+        Expr::R1C1Ref {
+            sheet,
+            row_axis,
+            col_axis,
+        } => Expr::R1C1Ref {
+            sheet: sheet.clone(),
+            row_axis: *row_axis,
+            col_axis: *col_axis,
+        },
         Expr::StructuredRef { table_name, spec } => {
             if table_name.eq_ignore_ascii_case(old_canonical) {
                 Expr::StructuredRef {
@@ -433,6 +471,17 @@ pub fn rewrite_column_ref(
             old_col,
             new_col,
         ))),
+        // **W5-139 (Phase 4.9.C):** R1C1 refs don't reference table
+        // columns — clone through.
+        Expr::R1C1Ref {
+            sheet,
+            row_axis,
+            col_axis,
+        } => Expr::R1C1Ref {
+            sheet: sheet.clone(),
+            row_axis: *row_axis,
+            col_axis: *col_axis,
+        },
         Expr::StructuredRef { table_name, spec } => {
             if table_name.eq_ignore_ascii_case(table_canonical_upper) {
                 Expr::StructuredRef {
@@ -579,6 +628,21 @@ fn rewrite_range_ref(r: &RangeRef, old_canonical: &str, new_name: &Arc<str>) -> 
             abs_start: *abs_start,
             abs_end: *abs_end,
         },
+        // **W5-139 (Phase 4.9.C):** intermediate R1C1 range — rewrite
+        // sheet only; axis specs are sheet-agnostic.
+        RangeRef::R1C1Cells {
+            sheet,
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+        } => RangeRef::R1C1Cells {
+            sheet: rewrite_sheet_ref(sheet, old_canonical, new_name),
+            start_row: *start_row,
+            start_col: *start_col,
+            end_row: *end_row,
+            end_col: *end_col,
+        },
     }
 }
 
@@ -644,6 +708,21 @@ pub enum RangeRef {
         end_row: RowId,
         abs_start: bool,
         abs_end: bool,
+    },
+    /// **W5-139 (Phase 4.9.C):** intermediate R1C1 rectangular range
+    /// (`R1C1:R10C5`, `R[1]C[1]:R[5]C[5]`). Each endpoint axis is
+    /// `AxisSpec`. Parser-time invariant (enforced in `build_range`):
+    /// per-axis relativity matches across endpoints (e.g. both rows
+    /// absolute, OR both rows relative; same independently for cols).
+    /// Mixed-relativity is rejected with
+    /// `ParseError::R1C1MixedRelativity`. Binder lowers to
+    /// `ExprPlan::RangeRef` (separate sub-phase).
+    R1C1Cells {
+        sheet: SheetRef,
+        start_row: AxisSpec,
+        start_col: AxisSpec,
+        end_row: AxisSpec,
+        end_col: AxisSpec,
     },
 }
 

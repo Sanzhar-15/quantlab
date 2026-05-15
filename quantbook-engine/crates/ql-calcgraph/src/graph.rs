@@ -339,6 +339,13 @@ impl Graph {
             RangeRef::Cells { sheet, .. }
             | RangeRef::WholeColumn { sheet, .. }
             | RangeRef::WholeRow { sheet, .. } => sheet.id(),
+            // **W5-139 (Phase 4.9.C):** intermediate R1C1 range —
+            // shouldn't reach this point (storage canon lowers to
+            // absolute before graph operations). Surface loudly.
+            RangeRef::R1C1Cells { .. } => unreachable!(
+                "range_ref_sheet: RangeRef::R1C1Cells is parser-intermediate; storage \
+                 canon must lower to absolute Cells before graph queries."
+            ),
         }
     }
 

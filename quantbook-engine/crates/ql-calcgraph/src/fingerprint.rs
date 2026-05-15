@@ -189,6 +189,17 @@ fn hash_expr(expr: &Expr, h: &mut impl Hasher) {
             // hashing lands when 4.8.E binder + 4.8.G calcgraph land.
             format!("{spec:?}").hash(h);
         }
+        // **W5-139 (Phase 4.9.C):** intermediate R1C1 forms must NOT
+        // reach the fingerprinter. Per design § 4.4 storage canon,
+        // formula text is canonicalized to A1 BEFORE op-log append;
+        // by the time calcgraph fingerprints anything, every R1C1
+        // input has been lowered to absolute `Expr::CellRef`. A
+        // R1C1Ref slipping through means the canonicalization step
+        // was bypassed — surface that loudly, not silently.
+        Expr::R1C1Ref { .. } => unreachable!(
+            "hash_expr: Expr::R1C1Ref is parser-intermediate; storage canon (design § 4.4) \
+             must lower to absolute CellRef before fingerprinting."
+        ),
     }
 }
 
@@ -293,6 +304,12 @@ fn hash_range_ref(r: &ql_formula_syntax::RangeRef, h: &mut impl Hasher) {
             abs_start.hash(h);
             abs_end.hash(h);
         }
+        // **W5-139 (Phase 4.9.C):** intermediate R1C1 range — same
+        // contract as `Expr::R1C1Ref` above.
+        RangeRef::R1C1Cells { .. } => unreachable!(
+            "hash_range_ref: RangeRef::R1C1Cells is parser-intermediate; storage canon \
+             (design § 4.4) must lower to absolute Cells before fingerprinting."
+        ),
     }
 }
 

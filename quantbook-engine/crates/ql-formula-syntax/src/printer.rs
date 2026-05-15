@@ -212,6 +212,18 @@ fn print_range(r: &RangeRef, out: &mut String) {
             }
             out.push_str(&(*end_row + 1).to_string());
         }
+        // **W5-139 (Phase 4.9.C):** intermediate R1C1 range — same
+        // no-fallback policy as `Expr::R1C1Ref` (see `print_expr`).
+        // `print_with` (4.9.D) will emit R1C1 directly; `print`
+        // panics loudly.
+        RangeRef::R1C1Cells { .. } => {
+            unreachable!(
+                "print_range: RangeRef::R1C1Cells is parser-intermediate and should be \
+                 lowered to RangeRef::Cells by the binder before reaching the printer. \
+                 Use `print_with(.., ReferenceMode::R1C1, .., site)` (Phase 4.9.D) to \
+                 emit R1C1 source text directly."
+            );
+        }
     }
 }
 
@@ -366,6 +378,21 @@ fn print_expr(expr: &Expr, out: &mut String, parent_min_bp: u8) {
             out.push('[');
             print_sref_spec(spec, out);
             out.push(']');
+        }
+        // **W5-139 (Phase 4.9.C):** intermediate R1C1 forms are
+        // parser-time AST and are not expected to reach `print`
+        // (the canonical storage flow per design § 4.4 lowers
+        // R1C1 → absolute via the binder, then prints A1). Phase
+        // 4.9.D adds `print_with(.., R1C1, .., site)` which CAN
+        // emit these — `print` itself stays infallible and panics
+        // loudly per the no-fallbacks rule.
+        Expr::R1C1Ref { .. } => {
+            unreachable!(
+                "print_expr: Expr::R1C1Ref is parser-intermediate and should be lowered \
+                 to ExprPlan::CellRef by the binder before reaching the printer. Use \
+                 `print_with(.., ReferenceMode::R1C1, .., site)` (Phase 4.9.D) to emit \
+                 R1C1 source text directly."
+            );
         }
     }
 }

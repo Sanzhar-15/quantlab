@@ -728,6 +728,19 @@ fn bind_with_context_v2<L: NameLookup>(
         Expr::StructuredRef { table_name, spec } => {
             resolve_structured_ref(table_name, spec, tables)
         }
+        // **W5-139 (Phase 4.9.C):** intermediate R1C1 forms produced
+        // by the parser when fed `mode == R1C1` tokens. The binder
+        // lowering to absolute coords (using `BindSite::at_cell` for
+        // relative axes) is a separate sub-phase. Today: surface a
+        // clear "unsupported variant" rather than a fallback — per
+        // the no-fallbacks rule, callers MUST get a loud error if
+        // an R1C1 expression slips into bind before that sub-phase
+        // ships.
+        Expr::R1C1Ref { .. } => Err(BindError::UnsupportedVariant(
+            "Expr::R1C1Ref binding is Phase 4.9.C-binder / 4.9.H — \
+             parser-intermediate AST must be canonicalized to absolute \
+             form before binding (see design § 4.4 storage canon).",
+        )),
     }
 }
 
@@ -1093,6 +1106,8 @@ fn variant_kind(e: &Expr) -> &'static str {
         Expr::Spill(_) => "Spill",
         Expr::NameRef(_) => "NameRef",
         Expr::StructuredRef { .. } => "StructuredRef",
+        // **W5-139 (Phase 4.9.C):** intermediate R1C1 form.
+        Expr::R1C1Ref { .. } => "R1C1Ref",
     }
 }
 
