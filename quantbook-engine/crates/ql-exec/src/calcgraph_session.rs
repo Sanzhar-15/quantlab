@@ -183,6 +183,12 @@ pub struct FormulaDeps {
     /// resolve to ranges populate this (via `AggregateNameRef`); see
     /// module docs for the limitation around scalar-resolved names.
     pub names: Vec<Arc<str>>,
+    /// **W5-154 (Phase 4.8.G.3 foundation):** table names referenced by
+    /// the formula (via `ExprPlan::StructuredRef.table_name`). Used by
+    /// the `table_to_formulas` reverse index for `on_table_*`
+    /// mutation hooks. Populated alongside `named_ranges` (the
+    /// resolved range still goes there for stripe registration).
+    pub tables: Vec<Arc<str>>,
     /// `true` iff any volatile function appears anywhere in the
     /// plan tree.
     pub is_volatile: bool,
@@ -244,17 +250,19 @@ pub(crate) fn walk_plan_for_deps(plan: &ExprPlan, deps: &mut FormulaDeps) {
         // Treat the resolved range as a range dep (same path as
         // `AggregateNameRef`); the calcgraph stripe index handles
         // invalidation when any cell inside the table footprint
-        // changes. 4.8.G adds the `table_to_formulas` reverse index
-        // for `on_table_*` mutation hooks; for now, just the range
-        // is registered.
+        // changes.
+        //
+        // **W5-154 (Phase 4.8.G.3 foundation):** ALSO push the table
+        // name into `deps.tables` so the `table_to_formulas` reverse
+        // index can find this formula when `on_table_*` mutation
+        // hooks fire (table rename / drop / column rename / resize).
         ExprPlan::StructuredRef {
             table_name,
             resolved,
             ..
         } => {
-            // Reuse the named_ranges slot — semantically equivalent
-            // for the stripe index (the "name" is the table name).
             deps.named_ranges.push((Arc::clone(table_name), *resolved));
+            deps.tables.push(Arc::clone(table_name));
         }
     }
 }
@@ -292,6 +300,19 @@ pub struct CalcgraphSession {
     /// in Phase 3.3 to mark formulas dirty when a named range
     /// changes.
     name_to_formulas: HashMap<Arc<str>, HashSet<NodeId>>,
+    /// **W5-154 (Phase 4.8.G.3 foundation):** reverse index from
+    /// canonical (case-preserved as stored at extract time) table
+    /// name → formula nodes that reference it via
+    /// `ExprPlan::StructuredRef`. Used by `on_table_*` mutation
+    /// hooks (drop / rename / column rename / resize) to BFS-fan
+    /// dirty per the design § 4.5 invalidation contract.
+    /// Symmetric to `name_to_formulas` for the structured-ref path.
+    ///
+    /// Today (W5-154): only `on_table_drop` consumes the index. The
+    /// other 4 hooks (create / rename / column rename / resize) and
+    /// runtime-side wiring land in subsequent commits per the
+    /// design § 4.5 hook list.
+    table_to_formulas: HashMap<Arc<str>, HashSet<NodeId>>,
     /// Phase 3.3 (2026-05-12): reverse index from a cell address to
     /// the formula node-ids that hold a DIRECT cell reference to it
     /// (i.e. `ExprPlan::CellRef`). Range-dep candidates go through
@@ -330,6 +351,10 @@ pub struct HookCounts {
     pub clear_formula: u64,
     pub set_name: u64,
     pub add_sheet: u64,
+    /// **W5-154 (Phase 4.8.G.3 foundation):** counts of `on_table_drop`
+    /// invocations. Follow-up commits add per-hook counts for the
+    /// other 4 table hooks (create / rename / column-rename / resize).
+    pub table_drop: u64,
 }
 
 /// Phase 3.2: aggregate outcome of `rebuild_from_workbook`. Parallel
@@ -588,6 +613,17 @@ impl CalcgraphSession {
                 .or_default()
                 .insert(formula_node);
         }
+        // **W5-154 (Phase 4.8.G.3 foundation):** populate
+        // `table_to_formulas` for every StructuredRef table dep.
+        // Mirrors the `name_to_formulas` pattern above — the
+        // `on_table_*` hooks (drop today; rename/column/resize in
+        // follow-up commits) walk this index to BFS-fan dirty.
+        for table_name in &deps.tables {
+            self.table_to_formulas
+                .entry(Arc::clone(table_name))
+                .or_default()
+                .insert(formula_node);
+        }
         if !deps.is_empty() || deps.is_volatile {
             self.formula_deps.insert(formula_node, deps);
         }
@@ -619,6 +655,20 @@ impl CalcgraphSession {
                     set.remove(&formula_node);
                     if set.is_empty() {
                         self.cell_to_formulas.remove(cell);
+                    }
+                }
+            }
+            // **W5-154 (Phase 4.8.G.3 foundation):** clean
+            // `table_to_formulas` symmetric with `name_to_formulas`.
+            // Re-binding a formula whose StructuredRef target
+            // changed (or whose text changed to no longer mention
+            // the table) MUST drop the stale entry, else
+            // `on_table_drop` would dirty stale formulas.
+            for table_name in &prior.tables {
+                if let Some(set) = self.table_to_formulas.get_mut(table_name) {
+                    set.remove(&formula_node);
+                    if set.is_empty() {
+                        self.table_to_formulas.remove(table_name);
                     }
                 }
             }
@@ -873,6 +923,51 @@ impl CalcgraphSession {
     /// the graph's sheet-id tracking.
     pub fn on_add_sheet(&mut self, _new_sheet: SheetId) {
         self.hook_counts.add_sheet = self.hook_counts.add_sheet.saturating_add(1);
+    }
+
+    /// **W5-154 (Phase 4.8.G.3 foundation):** mutation hook fired by
+    /// `WorkbookRuntime::drop_table`. Walks `table_to_formulas[name]`
+    /// (case-preserved as stored at extract time) and dirty-fans every
+    /// formula that referenced the dropped table. BFS-fanout matches
+    /// the W5-91 / `on_set_name` H2 fix — directly-affected formulas
+    /// seed `mark_dirty_from_cell_write` at their own cell address so
+    /// downstream chains also dirty.
+    ///
+    /// After this hook fires, the next recompute will:
+    /// 1. Find each previously-table-referencing formula in `dirty`.
+    /// 2. Re-bind it (table is gone → `BindError::UnknownTable` →
+    ///    `Value::Error(#NAME?)` per the existing 4.8.F binder).
+    /// 3. The cell value becomes the error; downstream sees the
+    ///    error propagate.
+    ///
+    /// Today (W5-154): the WorkbookRuntime drop_table path does NOT
+    /// yet call this hook (still relies on `plan_cache.clear()`).
+    /// Wiring lands in a follow-up commit; this hook ships as the
+    /// foundation that the wiring will use.
+    pub fn on_table_drop(&mut self, name: &str) {
+        self.hook_counts.table_drop = self.hook_counts.table_drop.saturating_add(1);
+        // Table names are stored in `deps.tables` as the parser's
+        // case-preserving Arc<str>. Look up exact-match first, then
+        // fall back to case-insensitive scan if the exact key isn't
+        // present (covers tables renamed under a different case
+        // during the formula's lifetime — extract captured the
+        // original case, drop_table receives the user-typed name
+        // which may differ).
+        let dependents: Vec<NodeId> = if let Some(set) = self.table_to_formulas.get(name) {
+            set.iter().copied().collect()
+        } else {
+            self.table_to_formulas
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+                .flat_map(|(_, set)| set.iter().copied())
+                .collect()
+        };
+        for n in dependents {
+            self.dirty.insert(n);
+            if let Some((s, r, c)) = self.cell_address_for(n) {
+                self.mark_dirty_from_cell_write(s, r, c);
+            }
+        }
     }
 
     /// Phase 3.3 (single-hop) + Phase 3.4 (BFS): internal fanout —
@@ -3434,5 +3529,166 @@ mod tests {
             vec![(0, 1, 0)],
             "non-spill-target deps must be left alone"
         );
+    }
+
+    // ===================================================================
+    // W5-154 (Phase 4.8.G.3 foundation) — table_to_formulas reverse
+    // index + on_table_drop hook tests.
+    //
+    // Validates the design § 4.5 invalidation contract: every
+    // StructuredRef-bearing formula registers in `table_to_formulas`
+    // at extract time; `on_table_drop` BFS-dirties the indexed
+    // formulas + their downstream chain.
+    // ===================================================================
+
+    /// **W5-154:** `table_to_formulas` populates for StructuredRef
+    /// formulas. `extract_and_register_deps` reads
+    /// `ExprPlan::StructuredRef` and pushes the table name into
+    /// `deps.tables`; the populate loop inserts into
+    /// `table_to_formulas`.
+    #[test]
+    fn table_to_formulas_index_populates_on_structured_ref() {
+        use std::sync::Arc;
+        let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
+        // Synthesize an ExprPlan::StructuredRef directly. Range value
+        // doesn't matter for the index lookup.
+        let plan = ExprPlan::StructuredRef {
+            table_name: Arc::from("Sales"),
+            source: Arc::new(ql_formula_syntax::TableSpecSubtree::BareColumn(Arc::from(
+                "Qty",
+            ))),
+            resolved: ql_types::Range::new(0, 0, 0, 10, 0),
+            is_this_row: false,
+        };
+        s.on_set_formula(0, 5, 5, &plan, &wb);
+        let node = s.cell_node_for(0, 5, 5).unwrap();
+        // The formula registered in `table_to_formulas["Sales"]`.
+        let deps = s.formula_deps(node).unwrap();
+        assert_eq!(deps.tables.as_slice(), &[Arc::<str>::from("Sales")]);
+    }
+
+    /// **W5-154:** `on_table_drop` BFS-fans dirty to the directly-
+    /// referencing formula AND its downstream chain. Mirrors the
+    /// W5-91 H2 fix shape — direct dirty + cell-seeded BFS.
+    #[test]
+    fn on_table_drop_marks_table_referencing_formulas_dirty() {
+        use std::sync::Arc;
+        let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
+        // Formula F1 at (0, 5, 5) references Sales[Qty].
+        let plan_f1 = ExprPlan::StructuredRef {
+            table_name: Arc::from("Sales"),
+            source: Arc::new(ql_formula_syntax::TableSpecSubtree::BareColumn(Arc::from(
+                "Qty",
+            ))),
+            resolved: ql_types::Range::new(0, 0, 0, 10, 0),
+            is_this_row: false,
+        };
+        s.on_set_formula(0, 5, 5, &plan_f1, &wb);
+        let f1 = s.cell_node_for(0, 5, 5).unwrap();
+        s.take_dirty(); // clear any seeding dirty from set_formula
+
+        // Fire the hook.
+        s.on_table_drop("Sales");
+
+        // F1 must be dirty (direct dependency).
+        let dirty = s.take_dirty();
+        assert!(
+            dirty.contains(&f1),
+            "on_table_drop must dirty the formula that references the dropped table"
+        );
+    }
+
+    /// **W5-154:** `on_table_drop` is case-insensitive on lookup.
+    /// Formula registers under `"Sales"` (parser case-preserves);
+    /// `on_table_drop("SALES")` or `on_table_drop("sales")` still
+    /// dirties it via the case-insensitive fallback scan.
+    #[test]
+    fn on_table_drop_is_case_insensitive_via_fallback_scan() {
+        use std::sync::Arc;
+        let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
+        let plan = ExprPlan::StructuredRef {
+            table_name: Arc::from("Sales"),
+            source: Arc::new(ql_formula_syntax::TableSpecSubtree::BareColumn(Arc::from(
+                "Qty",
+            ))),
+            resolved: ql_types::Range::new(0, 0, 0, 10, 0),
+            is_this_row: false,
+        };
+        s.on_set_formula(0, 5, 5, &plan, &wb);
+        let f1 = s.cell_node_for(0, 5, 5).unwrap();
+        s.take_dirty();
+
+        // Lowercase name should still dirty F1.
+        s.on_table_drop("sales");
+        let dirty = s.take_dirty();
+        assert!(
+            dirty.contains(&f1),
+            "on_table_drop must do case-insensitive fallback when exact-match misses"
+        );
+    }
+
+    /// **W5-154:** rebinding a formula whose StructuredRef target
+    /// changed evicts the stale entry from `table_to_formulas`.
+    /// Pre-fix, `on_table_drop("OldTable")` would dirty the formula
+    /// even after rebinding away from it.
+    #[test]
+    fn rebind_evicts_stale_table_to_formulas_entries() {
+        use std::sync::Arc;
+        let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
+        // First plan references "Sales".
+        let plan_v1 = ExprPlan::StructuredRef {
+            table_name: Arc::from("Sales"),
+            source: Arc::new(ql_formula_syntax::TableSpecSubtree::BareColumn(Arc::from(
+                "Qty",
+            ))),
+            resolved: ql_types::Range::new(0, 0, 0, 10, 0),
+            is_this_row: false,
+        };
+        s.on_set_formula(0, 5, 5, &plan_v1, &wb);
+        // Rebind to reference "Costs" instead.
+        let plan_v2 = ExprPlan::StructuredRef {
+            table_name: Arc::from("Costs"),
+            source: Arc::new(ql_formula_syntax::TableSpecSubtree::BareColumn(Arc::from(
+                "Total",
+            ))),
+            resolved: ql_types::Range::new(0, 0, 1, 10, 1),
+            is_this_row: false,
+        };
+        s.on_set_formula(0, 5, 5, &plan_v2, &wb);
+        let f1 = s.cell_node_for(0, 5, 5).unwrap();
+        s.take_dirty();
+
+        // Dropping "Sales" must NOT dirty F1 (it no longer references Sales).
+        s.on_table_drop("Sales");
+        let dirty_after_sales = s.take_dirty();
+        assert!(
+            !dirty_after_sales.contains(&f1),
+            "stale Sales entry must be evicted on rebind to Costs"
+        );
+
+        // Dropping "Costs" MUST dirty F1.
+        s.on_table_drop("Costs");
+        let dirty_after_costs = s.take_dirty();
+        assert!(
+            dirty_after_costs.contains(&f1),
+            "Costs reference must be tracked after rebind"
+        );
+    }
+
+    /// **W5-154:** `HookCounts.table_drop` bumps per invocation
+    /// regardless of whether any formulas were dirty-fanned. Useful
+    /// for ql-profile observability.
+    #[test]
+    fn on_table_drop_bumps_hook_count() {
+        let mut s = CalcgraphSession::new();
+        assert_eq!(s.hook_counts().table_drop, 0);
+        s.on_table_drop("Nonexistent");
+        assert_eq!(s.hook_counts().table_drop, 1);
+        s.on_table_drop("AlsoNonexistent");
+        assert_eq!(s.hook_counts().table_drop, 2);
     }
 }
