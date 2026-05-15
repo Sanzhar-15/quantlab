@@ -10955,4 +10955,304 @@ mod tests {
         assert_eq!(replay_wb.reference_mode(), ql_types::ReferenceMode::R1C1);
         assert_eq!(replay_wb.locale(), ql_types::Locale::De);
     }
-}
+
+    // ===================================================================
+    // W5-148 (Phase 4.9.L) — round-trip + edge case verification.
+    //
+    // End-to-end property tests across the R1C1 + locales + `@`
+    // trifecta. These exercise the full lex/parse/bind/eval/print/
+    // op-log/canonical-storage stack assembled across W5-138 to
+    // W5-147; the goal is to pin observable invariants so the
+    // closing megaudit (4.9.O) has a known-good baseline.
+    // ===================================================================
+
+    /// **Mixed-relativity R1C1 range REJECTED at parse time.**
+    /// `R1C1:R[10]C5` mixes absolute + relative on the row axis →
+    /// `ParseError::R1C1MixedRelativity` (W5-139). The runtime
+    /// surfaces this as `RuntimeError::Parse(_)`.
+    #[test]
+    fn mixed_relativity_r1c1_range_rejected_at_set_formula() {
+        let mut wb = make_runtime_workbook();
+        wb.set_reference_mode(ql_types::ReferenceMode::R1C1);
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt.set_formula(0, 0, 0, "R1C1:R[10]C5").unwrap_err();
+        assert!(matches!(err, RuntimeError::Parse(_)));
+    }
+
+    /// **`Sales[@Col]` vs `@Sales[Qty]` AST disambiguation.**
+    /// Both produce structured-ref evaluation narrowed to the
+    /// formula's row, but the parser path differs (in-bracket `@`
+    /// stays in StructuredRef.bracket_content; outside-bracket `@`
+    /// is `Token::At`). After W5-144's binder patch they
+    /// canonicalize to ExprPlan::StructuredRef with
+    /// `is_this_row: true`, so the OUTPUT VALUE is identical.
+    #[test]
+    fn structured_ref_at_inside_vs_outside_brackets_eval_identically() {
+        use ql_storage::{TableColumn, TableMetadata};
+        let mut wb = make_runtime_workbook();
+        let table = TableMetadata {
+            name: Arc::from("SALES"),
+            display_name: Arc::from("Sales"),
+            sheet: 0,
+            top_row: 0,
+            top_col: 0,
+            rows: 3,
+            cols: 1,
+            has_header: true,
+            has_totals: false,
+            columns: vec![TableColumn {
+                id: 0,
+                name: Arc::from("qty"),
+                display: Arc::from("Qty"),
+                totals_function: None,
+            }],
+        };
+        wb.tables_mut().insert(Arc::clone(&table.name), table);
+        wb.put(
+            ql_types::Address::new(0, 1, 0),
+            ql_types::Value::Number(10.0),
+        );
+        wb.put(
+            ql_types::Address::new(0, 2, 0),
+            ql_types::Value::Number(20.0),
+        );
+
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+
+        // `Sales[@Qty]` at row 1 — narrows to row 1's Qty = 10.
+        let v1 = rt.set_formula(0, 1, 5, "Sales[@Qty]").unwrap();
+        // `@Sales[Qty]` at row 1 — also narrows to row 1's Qty = 10.
+        let v2 = rt.set_formula(0, 1, 6, "@Sales[Qty]").unwrap();
+        assert_eq!(v1, ql_types::Value::Number(10.0));
+        assert_eq!(v2, ql_types::Value::Number(10.0));
+    }
+
+    /// **`@A:A` (whole-column inside `@`) evals at formula's row.**
+    /// `@A:A` at cell (3, 1) → reads A4 (row 3, col 0).
+    #[test]
+    fn at_whole_column_evals_to_anchor_row() {
+        let mut wb = make_runtime_workbook();
+        // Put a marker at A4 so we can distinguish.
+        wb.put(
+            ql_types::Address::new(0, 3, 0),
+            ql_types::Value::Number(99.0),
+        );
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 3, 1, "@A:A").unwrap();
+        assert_eq!(v, ql_types::Value::Number(99.0));
+    }
+
+    /// **`@1:1` (whole-row inside `@`) evals at formula's col.**
+    /// `@1:1` at cell (3, 2) → reads C1 (row 0, col 2).
+    #[test]
+    fn at_whole_row_evals_to_anchor_col() {
+        let mut wb = make_runtime_workbook();
+        wb.put(
+            ql_types::Address::new(0, 0, 2),
+            ql_types::Value::Number(42.0),
+        );
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 3, 2, "@1:1").unwrap();
+        assert_eq!(v, ql_types::Value::Number(42.0));
+    }
+
+    /// **`Sheet1!@A1` resolves with sheet prefix + `@` wrapping.**
+    /// The sheet binds to the inner CellRef (W5-143
+    /// `apply_sheet_to_term` recurses INTO the wrapper).
+    #[test]
+    fn sheet_qualified_at_ref_resolves_correctly() {
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("S");
+        let s1 = wb.add_sheet("Other");
+        wb.put(
+            ql_types::Address::new(s1, 0, 0),
+            ql_types::Value::Number(7.0),
+        );
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // Use the actual sheet name "Other" (s1).
+        let v = rt.set_formula(s0, 0, 0, "Other!@A1").unwrap();
+        assert_eq!(v, ql_types::Value::Number(7.0));
+    }
+
+    /// **R1C1 input + EN locale + same anchor → A1 canonical
+    /// stored.** Round-trip: write `R1C1+R2C2` in R1C1 mode,
+    /// reload (replay), the stored canonical text re-binds and
+    /// evaluates identically.
+    #[test]
+    fn r1c1_input_round_trips_through_oplog_replay() {
+        // Start at default A1 so the runtime's set_reference_mode
+        // call actually emits an Op::SetReferenceMode (no-op when
+        // the value already matches).
+        let mut producer_wb = make_runtime_workbook();
+        producer_wb.put(
+            ql_types::Address::new(0, 0, 0),
+            ql_types::Value::Number(5.0),
+        );
+        producer_wb.put(
+            ql_types::Address::new(0, 1, 1),
+            ql_types::Value::Number(11.0),
+        );
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        let producer_value = {
+            let mut rt = WorkbookRuntime::with_oplog(&mut producer_wb, &reg, &mut oplog);
+            rt.set_reference_mode(ql_types::ReferenceMode::R1C1)
+                .unwrap();
+            rt.set_formula(0, 5, 5, "R1C1+R2C2").unwrap()
+        };
+        assert_eq!(producer_value, ql_types::Value::Number(16.0));
+
+        // Replay into a fresh workbook.
+        let mut replay_wb = make_runtime_workbook();
+        replay_wb.put(
+            ql_types::Address::new(0, 0, 0),
+            ql_types::Value::Number(5.0),
+        );
+        replay_wb.put(
+            ql_types::Address::new(0, 1, 1),
+            ql_types::Value::Number(11.0),
+        );
+        ql_oplog::replay_into(&oplog, &mut replay_wb, &reg).unwrap();
+
+        // Replay restored R1C1 mode + the canonical (A1+EnUs) formula.
+        assert_eq!(replay_wb.reference_mode(), ql_types::ReferenceMode::R1C1);
+        // The stored formula text is the CANONICAL (A1+EnUs) form.
+        assert_eq!(
+            replay_wb.formula_at(0, 5, 5).map(|s| s.as_ref()),
+            Some("$A$1 + $B$2")
+        );
+        // Recompute to verify the canonical text evaluates correctly.
+        let mut rt = WorkbookRuntime::new(&mut replay_wb, &reg);
+        let _ = rt.recompute_all();
+        drop(rt);
+        assert_eq!(
+            replay_wb.read(ql_types::Address::new(0, 5, 5)),
+            ql_types::Value::Number(16.0)
+        );
+    }
+
+    /// **DE locale input round-trips through oplog replay.**
+    /// `SUM(2,5; 3,5)` in DE locale → canonical `SUM(2.5, 3.5)` in
+    /// op-log → replay against fresh workbook → identical result.
+    #[test]
+    fn de_locale_input_round_trips_through_oplog_replay() {
+        let mut producer_wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        let producer_value = {
+            let mut rt = WorkbookRuntime::with_oplog(&mut producer_wb, &reg, &mut oplog);
+            // Start at default EnUs so the runtime's set_locale emits
+            // an Op::SetLocale (no-op when value matches).
+            rt.set_locale(ql_types::Locale::De).unwrap();
+            rt.set_formula(0, 0, 0, "SUM(2,5; 3,5)").unwrap()
+        };
+        assert_eq!(producer_value, ql_types::Value::Number(6.0));
+
+        let mut replay_wb = make_runtime_workbook();
+        ql_oplog::replay_into(&oplog, &mut replay_wb, &reg).unwrap();
+        assert_eq!(replay_wb.locale(), ql_types::Locale::De);
+        assert_eq!(
+            replay_wb.formula_at(0, 0, 0).map(|s| s.as_ref()),
+            Some("SUM(2.5, 3.5)")
+        );
+    }
+
+    /// **`@` survives op-log replay.** `@A1` in producer → `@A1` in
+    /// replayed workbook (mode/locale-invariant).
+    #[test]
+    fn at_operator_round_trips_through_oplog_replay() {
+        let mut producer_wb = make_runtime_workbook();
+        producer_wb.put(
+            ql_types::Address::new(0, 0, 0),
+            ql_types::Value::Number(42.0),
+        );
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        let producer_value = {
+            let mut rt = WorkbookRuntime::with_oplog(&mut producer_wb, &reg, &mut oplog);
+            rt.set_formula(0, 1, 0, "@A1").unwrap()
+        };
+        assert_eq!(producer_value, ql_types::Value::Number(42.0));
+
+        let mut replay_wb = make_runtime_workbook();
+        replay_wb.put(
+            ql_types::Address::new(0, 0, 0),
+            ql_types::Value::Number(42.0),
+        );
+        ql_oplog::replay_into(&oplog, &mut replay_wb, &reg).unwrap();
+        assert_eq!(
+            replay_wb.formula_at(0, 1, 0).map(|s| s.as_ref()),
+            Some("@A1")
+        );
+    }
+
+    /// **Switching reference_mode does NOT mutate stored formula
+    /// text.** Per design § 4.4 storage canon, the stored text is
+    /// always A1+EnUs regardless of the current workbook display
+    /// mode. Verifies the canonical contract: changing the
+    /// reference_mode is a display-only preference.
+    #[test]
+    fn reference_mode_change_leaves_stored_formula_text_canonical() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.set_formula(0, 0, 0, "A1+B2").unwrap();
+        }
+        let stored = wb.formula_at(0, 0, 0).map(|s| s.as_ref().to_owned());
+        // Switch to R1C1.
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.set_reference_mode(ql_types::ReferenceMode::R1C1)
+                .unwrap();
+        }
+        // Stored text unchanged (still canonical A1+EnUs).
+        assert_eq!(
+            wb.formula_at(0, 0, 0).map(|s| s.as_ref().to_owned()),
+            stored
+        );
+    }
+
+    /// **DE locale change does NOT mutate stored formula text.**
+    /// Same canonical contract — locale switch is display-only.
+    #[test]
+    fn locale_change_leaves_stored_formula_text_canonical() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.set_formula(0, 0, 0, "SUM(1.5, 2.5)").unwrap();
+        }
+        let stored = wb.formula_at(0, 0, 0).map(|s| s.as_ref().to_owned());
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.set_locale(ql_types::Locale::De).unwrap();
+        }
+        assert_eq!(
+            wb.formula_at(0, 0, 0).map(|s| s.as_ref().to_owned()),
+            stored
+        );
+    }
+
+    /// **`@scalar` is idempotent: `@5` evaluates to `5`.**
+    /// Design § 3.3 rule 1 — scalar inputs pass through unchanged.
+    #[test]
+    fn at_scalar_idempotent_through_eval() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v = rt.set_formula(0, 0, 0, "@5").unwrap();
+        assert_eq!(v, ql_types::Value::Number(5.0));
+    }
+
+    /// **`@SUM(scalar args)` evaluates identically to `SUM(scalar args)`.**
+    /// Design § 3.3 rule 8 — function inner with scalar return. SUM
+    /// of scalar args returns scalar so the `@` wrap is a no-op.
+    /// (Literal `SUM(A1:A3)` over a Range needs aggregate-arg binding
+    /// which v1 routes via named ranges only; using scalar args here
+    /// keeps the test focused on the `@` semantics.)
