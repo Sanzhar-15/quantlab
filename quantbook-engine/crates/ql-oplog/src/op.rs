@@ -241,4 +241,106 @@ pub enum Op {
         added_columns: Vec<String>,
         removed_columns: Vec<String>,
     },
+
+    /// **W5-146 (Phase 4.9.J):** workbook-scope reference-mode change.
+    /// Serialized as a string `"A1"` or `"R1C1"`. The runtime appends
+    /// this op via `WorkbookRuntime::set_reference_mode`; replay calls
+    /// `Workbook::set_reference_mode(mode)` (a pure metadata update —
+    /// no cell mutations, no formula re-bind).
+    ///
+    /// Unknown wire values (forward-compat) → `ReplayError::UnknownReferenceMode`
+    /// per design § 4.9.J. The serde representation rejects unknowns at
+    /// deserialize time via the standard enum-of-unit-variants path.
+    SetReferenceMode { mode: ReferenceModeWire },
+
+    /// **W5-146 (Phase 4.9.J):** workbook-scope locale change.
+    /// Serialized as a short string `"en"` / `"de"` / `"fr"`. Mirrors
+    /// the qbook envelope's `LocaleWire` (W5-145 / qbook v7). Unknown
+    /// wire values surface `ReplayError::UnknownLocale` per design
+    /// § 4.9.J + Sonnet L-10 closure.
+    SetLocale { locale: LocaleWire },
+}
+
+/// **W5-146 (Phase 4.9.J):** op-log wire form of `ReferenceMode`.
+/// Kept separate from `ql-formula-syntax::ReferenceMode` so the
+/// wire shape is stable across engine versions (the runtime enum
+/// could be renamed without breaking on-disk op-log files).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ReferenceModeWire {
+    A1,
+    R1C1,
+}
+
+impl ReferenceModeWire {
+    pub fn from_runtime(mode: ql_types::ReferenceMode) -> Self {
+        match mode {
+            ql_types::ReferenceMode::A1 => Self::A1,
+            ql_types::ReferenceMode::R1C1 => Self::R1C1,
+        }
+    }
+
+    pub fn to_runtime(self) -> ql_types::ReferenceMode {
+        match self {
+            Self::A1 => ql_types::ReferenceMode::A1,
+            Self::R1C1 => ql_types::ReferenceMode::R1C1,
+        }
+    }
+}
+
+/// **W5-146 (Phase 4.9.J):** op-log wire form of `Locale`. Unknown
+/// strings deserialize to `LocaleWire::Unknown(String)` so the replay
+/// path can surface `ReplayError::UnknownLocale` with the captured
+/// value (closes Sonnet L-10).
+///
+/// Save-side `from_runtime` only emits canonical variants; the
+/// `Unknown` form is read-side only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocaleWire {
+    En,
+    De,
+    Fr,
+    Unknown(String),
+}
+
+impl LocaleWire {
+    pub fn from_runtime(locale: ql_types::Locale) -> Self {
+        match locale {
+            ql_types::Locale::EnUs => Self::En,
+            ql_types::Locale::De => Self::De,
+            ql_types::Locale::Fr => Self::Fr,
+        }
+    }
+
+    pub fn to_runtime(self) -> Result<ql_types::Locale, String> {
+        match self {
+            Self::En => Ok(ql_types::Locale::EnUs),
+            Self::De => Ok(ql_types::Locale::De),
+            Self::Fr => Ok(ql_types::Locale::Fr),
+            Self::Unknown(s) => Err(s),
+        }
+    }
+}
+
+impl serde::Serialize for LocaleWire {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        let s = match self {
+            Self::En => "en",
+            Self::De => "de",
+            Self::Fr => "fr",
+            Self::Unknown(s) => s.as_str(),
+        };
+        ser.serialize_str(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for LocaleWire {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        Ok(match s.as_str() {
+            "en" => Self::En,
+            "de" => Self::De,
+            "fr" => Self::Fr,
+            _ => Self::Unknown(s),
+        })
+    }
 }

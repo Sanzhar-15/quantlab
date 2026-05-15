@@ -31,7 +31,7 @@ pub mod replay;
 
 pub use error::OpLogError;
 pub use log::OpLog;
-pub use op::Op;
+pub use op::{LocaleWire, Op, ReferenceModeWire};
 pub use persistence::{
     load_workbook_with_oplog, save_workbook_with_oplog, PersistenceError, OPLOG_FILENAME,
 };

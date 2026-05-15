@@ -213,6 +213,15 @@ pub enum ReplayError {
         name: String,
         reason: &'static str,
     },
+
+    /// **W5-146 (Phase 4.9.J):** `Op::SetLocale` wire value didn't
+    /// match any known locale code. Mirrors qbook v7's
+    /// `QbookError::UnknownLocale` (W5-145) — a forward-compat
+    /// op-log file with an unrecognized locale string surfaces this
+    /// instead of silently substituting EnUs (closes Sonnet L-10).
+    /// Captures the offending string for the IDE diagnostic.
+    #[error("replay unknown locale at op index {index}: {found:?}")]
+    UnknownLocale { index: usize, found: String },
 }
 
 /// Wrapper around `ql_storage::FormatTableError` that owns its strings,
@@ -535,6 +544,24 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             added_columns,
             removed_columns,
         ),
+        // **W5-146 (Phase 4.9.J):** workbook-scope reference-mode
+        // change. Pure metadata; no validation needed beyond the
+        // enum-bounded wire type. Idempotent (set-to-current-value
+        // is a no-op).
+        Op::SetReferenceMode { mode } => {
+            workbook.set_reference_mode(mode.to_runtime());
+            Ok(())
+        }
+        // **W5-146 (Phase 4.9.J):** workbook-scope locale change.
+        // Unknown wire values (forward-compat op-log file) surface
+        // `ReplayError::UnknownLocale` with the captured string.
+        Op::SetLocale { locale } => match locale.clone().to_runtime() {
+            Ok(loc) => {
+                workbook.set_locale(loc);
+                Ok(())
+            }
+            Err(found) => Err(ReplayError::UnknownLocale { index, found }),
+        },
     }
 }
 
@@ -1726,5 +1753,58 @@ mod tests {
         let reg = default_registry();
         let err = replay_into(&log, &mut wb, &reg).unwrap_err();
         assert!(matches!(err, ReplayError::SheetNameRejected { .. }));
+    }
+
+    // ===================================================================
+    // W5-146 (Phase 4.9.J) — SetReferenceMode + SetLocale replay tests.
+    // ===================================================================
+
+    #[test]
+    fn replay_set_reference_mode_applies_to_workbook() {
+        let mut log = OpLog::new();
+        log.append(Op::SetReferenceMode {
+            mode: crate::op::ReferenceModeWire::R1C1,
+        })
+        .unwrap();
+        let mut wb = Workbook::new();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert_eq!(wb.reference_mode(), ql_types::ReferenceMode::R1C1);
+    }
+
+    #[test]
+    fn replay_set_locale_applies_to_workbook() {
+        let mut log = OpLog::new();
+        log.append(Op::SetLocale {
+            locale: crate::op::LocaleWire::De,
+        })
+        .unwrap();
+        let mut wb = Workbook::new();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert_eq!(wb.locale(), ql_types::Locale::De);
+    }
+
+    /// **Unknown locale wire value (forward-compat) → loud error.**
+    /// Closes Sonnet L-10. The `LocaleWire` deserializer captures
+    /// unknown strings into `Unknown(s)`; replay surfaces them as
+    /// `ReplayError::UnknownLocale { index, found }`.
+    #[test]
+    fn replay_set_locale_unknown_value_errors_loudly() {
+        let mut log = OpLog::new();
+        log.append(Op::SetLocale {
+            locale: crate::op::LocaleWire::Unknown("xx".to_string()),
+        })
+        .unwrap();
+        let mut wb = Workbook::new();
+        let reg = default_registry();
+        let err = replay_into(&log, &mut wb, &reg).unwrap_err();
+        match err {
+            ReplayError::UnknownLocale { index, found } => {
+                assert_eq!(index, 0);
+                assert_eq!(found, "xx");
+            }
+            other => panic!("expected UnknownLocale, got {other:?}"),
+        }
     }
 }

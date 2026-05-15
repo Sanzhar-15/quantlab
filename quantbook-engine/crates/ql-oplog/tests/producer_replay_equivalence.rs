@@ -231,6 +231,20 @@ fn apply_producer_side(ops: &[Op], wb: &mut Workbook) {
                      update apply_producer_side when adding table coverage"
                 )
             }
+            // **W5-146 (Phase 4.9.J):** workbook-scope reference mode /
+            // locale. Pure metadata; mirror replay by calling the
+            // matching `Workbook` setter directly.
+            Op::SetReferenceMode { mode } => {
+                wb.set_reference_mode(mode.to_runtime());
+            }
+            Op::SetLocale { locale } => {
+                wb.set_locale(
+                    locale
+                        .clone()
+                        .to_runtime()
+                        .expect("realistic_op_sequence never emits unknown locales"),
+                );
+            }
         }
     }
 }
