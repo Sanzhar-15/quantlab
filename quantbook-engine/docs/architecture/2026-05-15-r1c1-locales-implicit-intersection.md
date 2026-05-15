@@ -1,181 +1,221 @@
 # Phase 4.9 — R1C1, Locales, Implicit Intersection
 
-**Status:** 4.9.AA design draft, pre-Codex review. Mirrors the 4.7.AA / 4.8.AA pattern.
+**Status:** 4.9.AA design REVISED post-Codex + Sonnet pass-1 review. Mirrors the 4.7.AA / 4.8.AA pattern.
 
-**Phase 4.8 SHIPPED at HEAD `403fabd286e` (W5-130).** This phase's design begins from a clean megaudit-verified base.
+**Phase 4.8 SHIPPED at HEAD `403fabd286e` (W5-130).** Phase 4.9 begins from a clean megaudit-verified base.
 
 ## 0. Mapping to product/master plans
 
-Engine MASTER-PLAN.md § 4.9 lists Phase 4.9 as **R1C1, Localization, Implicit Intersection**. Acceptance criteria:
+Engine MASTER-PLAN.md § 4.9 lists Phase 4.9 as **R1C1, Localization, Implicit Intersection**. Acceptance:
 
 - **LOC-4-01** R1C1 parser/printer round-trips.
 - **LOC-4-02** localized separators covered.
 - **LOC-4-03** implicit intersection added where Excel requires it.
 - **LOC-4-04** IDE can toggle formula display mode.
 
-Effort estimate: 1-2 weeks (master plan).
+Effort: 1-2 weeks. Closed sub-concerns per Codex + Sonnet pass-1:
 
-## 1. Goals
+## 1. Goals (Quantbook UX preferences, not Excel file semantics)
 
-Three orthogonal concerns share enough infrastructure (lexer mode parameter, workbook settings, printer surface) to merit a single phase:
+Three orthogonal concerns share enough infrastructure to merit a single phase:
 
-1. **R1C1 reference syntax** as an alternative display + input mode. `R1C1`, `R[-1]C`, `R[1]C[2]:R3C[2]`. Toggleable per workbook (Excel canon). Storage canon remains A1 — R1C1 is parser+printer surface only.
-
-2. **Locale-aware separators**. Argument separator (`,` en vs `;` de/fr), decimal separator (`.` en vs `,` de). Locale-toggleable per workbook. Storage canon remains EN — locale transforms at edit time.
-
-3. **Implicit intersection operator `@`**. Excel-365 explicit form: `=@A1:A10` in cell `B5` narrows to `A5` (same row). Replaces the pre-365 implicit `=A1:A10` shrink-to-scalar legacy (which our engine intentionally doesn't have — spill takes its place per Phase 4.7).
+1. **R1C1 reference syntax** as an alternative display + input mode. Toggleable per workbook (a Quantbook UX preference — not stored in Excel files, which are mode-neutral). Storage canon stays A1.
+2. **Locale-aware separators** — argument separator, decimal separator, AND array literal separators (Phase 4.7 ships array literals; locale must cover them). Quantbook UX preference; storage stays canonical English.
+3. **Implicit intersection operator `@`** — Excel-365 explicit narrowing operator. **Storage NOT canonical** — `@` is a semantic operator that must round-trip through stored formula text (see § 4.2).
 
 ## 2. Non-goals (deferred)
 
-- **Function-name localization** (`SUMME` for `SUM` in de locale). Out of scope; canonical English-only function names. Deferred to a later polish wave if user demand emerges.
-- **Pre-365 implicit intersection on bare ranges in single-cell contexts** (`=A1:A10` in `B5` → `A5`). Excel-365 replaced this with spill; we follow 365. Only the explicit `@` operator triggers implicit intersection.
-- **Locale data beyond en / de / fr** in v1. Add more locales in a later wave once the parameterization is shipped.
-- **R1C1 absolute/relative semantics in formulas typed into the IDE.** R1C1 is a display mode — when the user types `R[1]C` in cell `B5`, we parse it relative to `B5` and store as `A1`-relative (matching Excel's storage canon).
+- **Function-name localization** (`SUMME` for `SUM`). OOXML stores formulas with English function names; localized names are UI-only. Out of scope for Phase 4.9. (Confirmed by Codex Q4 + Sonnet L-4.)
+- **Pre-365 implicit intersection on bare ranges** (`=A1:A10` in `B5` → `A5`). Spill (Phase 4.7) replaces it. Only the explicit `@` operator triggers narrowing.
+- **Locale data beyond en / de / fr** in v1. Add more once parameterization ships.
+- **R1C1 mixed-relativity range endpoints** (`R[1]C:R10C5`). Parser MUST reject cleanly with a dedicated error (no silent miscompute).
+- **CLDR/ICU integration.** Hardcoded locale tables in Rust for v1; known-gap noted.
 
 ## 3. Spec primer
 
 ### 3.1 R1C1
 
 - Absolute: `R1C1` → row 1, col 1 (== `A1`).
-- Relative: `R[-1]C` → one row above current, same column. `R[2]C[3]` → 2 rows down, 3 cols right.
+- Relative: `R[-1]C` → one row above current cell, same column. `R[2]C[3]` → 2 down, 3 right.
 - Range: `R1C1:R10C5` → A1:E10.
-- Mixed: `R[1]C1` → next row, column 1 (absolute col).
+- Mixed (absolute + relative endpoints) → REJECTED in v1 (parse error). Documented in § 8.
+
+**Resolution timing (closes § 6 q2):** bind-time. Parser emits an intermediate `Expr::CellRef` shape carrying signed `row_offset` / `col_offset` + `abs_row` / `abs_col`; binder lowers to absolute coords using `BindSite::at_cell` (matches the existing 4.8.E plumbing). Printer takes a `FormulaSite` arg and emits relative form when applicable.
 
 ### 3.2 Locales
 
 Locales we ship:
-- `en` (English) — default, current behavior.
-- `de` (German) — `;` arg separator, `,` decimal.
-- `fr` (French) — `;` arg separator, `,` decimal.
+- `en` — `,` arg, `.` decimal, `,` array row, `;` array col (matches Phase 4.7 default).
+- `de` — `;` arg, `,` decimal, `.` array row, `\\` array col (per IronCalc CLDR; tentative — pin during 4.9.E).
+- `fr` — `;` arg, `,` decimal, `.` array row, `\\` array col.
 
-Each locale carries: `arg_separator: char`, `decimal_separator: char`, `range_separator: char` (always `:`), `intersection_operator: char` (always `@`).
+Each `Locale` value carries: `arg_separator: char`, `decimal_separator: char`, `array_row_separator: char`, `array_col_separator: char`. **No `intersection_operator` field** — `@` is invariant across locales (it's also the structured-ref escape sentinel; locale-configuring `@` would break OOXML compat per Sonnet H-5).
 
-### 3.3 Implicit intersection
+**Decimal/list collision (DE example, closes Codex MEDIUM + Sonnet M-1):**
+- `SUM(2,34;5)` in DE locale = `SUM(2.34, 5)` (one literal `2.34`, two args). The lexer is context-free: `,` inside a number-literal is the decimal separator in DE; `;` is the arg separator.
+- `SUM(2,34, 5)` in DE locale is **INVALID** (the second `,` is an arg separator in EN, but DE rejects bare `,` outside number literals → parse error).
+- Test vectors land at 4.9.E.
 
-Excel 365 model:
-- `=@RANGE` → narrow `RANGE` to a single cell using the formula's own row/col context.
-- Rules (from IronCalc reference, validated by Excel canon):
-  - If formula row is within RANGE's row span AND RANGE is a single column → pick that column at formula row.
-  - If formula col is within RANGE's col span AND RANGE is a single row → pick that row at formula col.
-  - If RANGE is a single cell → return that cell (idempotent).
-  - Else → `#VALUE!`.
+### 3.3 Implicit intersection `@` (revised post-Codex H-1)
+
+The `@` operator narrows / passes through its operand based on the operand's value-level shape. Eval rules:
+
+1. **Scalar / single value** → pass through unchanged. `@5` = `5`. `@SUM(A1:A10)` = `SUM(A1:A10)`.
+2. **Bounded range, single column** (e.g. `A1:A10` in cell `B5`):
+   - If formula row IS within range row span → pick that row's cell in that column.
+   - Else → `#VALUE!`.
+3. **Bounded range, single row** (e.g. `A1:E1` in cell `B5`):
+   - If formula col IS within range col span → pick that col's cell in that row.
+   - Else → `#VALUE!`.
+4. **Bounded range, 2-D (multi-row AND multi-column)** → ALWAYS `#VALUE!` regardless of whether formula cell is geometrically inside. (IronCalc-canonical, closes Codex MEDIUM + Sonnet M-6.)
+5. **Single-cell range** (`A1:A1`) → return the single cell (idempotent).
+6. **WholeColumn / WholeRow** (`A:A`, `1:1`) — narrow to formula's row/col in that column/row. `@A:A` in `B5` = `A5`. `@1:1` in `B5` = `B1`. (Closes Sonnet M-4.)
+7. **Array result** (Phase 4.7 array literal or array-returning function) → return array's top-left. (Codex H-1 extension.)
+8. **Named range** → resolve, then apply the rules above to the underlying value.
+9. **Structured ref** — the `@` INSIDE `Sales[@Col]` is unrelated (different parser context; absorbed by `Token::StructuredRef`). The `@` BEFORE a structured ref like `=@Sales[Qty]` IS this operator: it narrows the column to the formula's row.
+10. **Different sheet** — if range is on a different sheet than the formula cell, narrowing rules apply against the formula cell's row/col coordinates against the OTHER sheet's range. (IronCalc reference confirms this is canon.)
+
+**`Sheet1!@A1` (closes § 6 q8 + Sonnet L-7 + Codex MEDIUM):** parsed as sheet-prefix applied to an `@`-wrapped reference. Grammar production extended in 4.9.G; not an edge-case test.
 
 ## 4. Data model changes
 
-### 4.1 `ql-storage::Workbook` additions
+### 4.1 New types in `ql-formula-syntax` (NOT ql-storage — closes Codex HIGH-3)
 
 ```rust
-pub enum ReferenceMode { A1, R1C1 }   // Phase 4.9.A
-pub enum LocaleId { En, De, Fr }       // Phase 4.9.A
+// crates/ql-formula-syntax/src/lib.rs
+pub enum ReferenceMode { A1, R1C1 }
+pub enum LocaleId { En, De, Fr }
 
-impl Workbook {
-    pub fn reference_mode(&self) -> ReferenceMode;
-    pub fn set_reference_mode(&mut self, mode: ReferenceMode);
-    pub fn locale(&self) -> LocaleId;
-    pub fn set_locale(&mut self, locale: LocaleId);
+pub struct LocaleData {
+    pub arg_separator: char,
+    pub decimal_separator: char,
+    pub array_row_separator: char,
+    pub array_col_separator: char,
+    // NO intersection_operator — `@` is invariant.
+}
+
+impl LocaleId {
+    pub fn data(&self) -> &'static LocaleData { /* hardcoded tables */ }
 }
 ```
 
-Defaults: `ReferenceMode::A1`, `LocaleId::En`. Workbook-level settings (not per-sheet). Mode/locale changes do NOT rewrite stored formulas — storage stays canonical (A1 + EN).
+`ql-storage::Workbook` HOLDS instances of `ReferenceMode` / `LocaleId` via accessor pairs (`reference_mode()` / `set_reference_mode()` / `locale()` / `set_locale()`); storage doesn't define the types. This matches the existing layering (date system + format ids live in `ql-types`).
 
-### 4.2 `ql-formula-syntax::ast`
-
-NEW variant for implicit intersection:
+### 4.2 `ql-formula-syntax::ast::Expr::ImplicitIntersection` (revised)
 
 ```rust
 pub enum Expr {
     // ... existing variants ...
-    /// `@RANGE` — Excel-365 implicit intersection. Wraps a
-    /// RangeRef-yielding expression; binder lowers to a single-cell
-    /// `ExprPlan::CellRef` using `BindSite::owning_cell` for
-    /// row/col context.
+    /// `@expr` — Excel-365 implicit intersection. The operator
+    /// narrows/passes-through its operand per the rules in § 3.3.
+    /// **NOT surface-only** — preserved in storage; printer emits
+    /// `@<inner>` so round-trip through formula text is lossless.
     ImplicitIntersection(Box<Expr>),
 }
 ```
 
-No AST changes for R1C1 (storage canon is A1) or locales (storage canon is EN). Both are surface-only.
+**Sub-phase 4.9.G touchpoints** (closes Sonnet H-1) — every AST walker + printer + helper must add a match arm:
 
-### 4.3 `LexerMode` + `LexerLocale` parameters
+- `ast::rewrite_sheet_name_in_expr` — recurse into inner Expr.
+- `ast::rewrite_table_ref` — recurse into inner Expr.
+- `ast::rewrite_column_ref` — recurse into inner Expr.
+- `printer::print_expr` — emit `@<inner>`.
+- `plan::variant_kind` — return `"ImplicitIntersection"`.
+- Future walkers added in Phase 4.9.G's commit must include this arm.
 
-Current `lex(text: &str) -> Result<Vec<Token>, LexError>`. Add overloads:
+### 4.3 Anchor-aware lex + parse + print API (closes Codex H-2 + Sonnet H-3/H-4)
 
 ```rust
-pub fn lex_with(
-    text: &str,
-    mode: ReferenceMode,
-    locale: LocaleId,
-) -> Result<Vec<Token>, LexError>;
+pub struct FormulaSite {
+    pub cell: ql_types::Address,  // formula's owning cell
+}
+
+pub fn lex_with(text: &str, mode: ReferenceMode, locale: LocaleId)
+    -> Result<Vec<Token>, LexError>;
+
+pub fn parse_with(tokens: Vec<Token>, mode: ReferenceMode, site: Option<FormulaSite>)
+    -> Result<Expr, ParseError>;
+
+pub fn print_with(expr: &Expr, mode: ReferenceMode, locale: LocaleId,
+                  site: Option<FormulaSite>) -> Result<String, PrintError>;
 ```
 
-`lex(text)` becomes `lex_with(text, ReferenceMode::A1, LocaleId::En)` for backward compat.
+- `site` required when `mode == R1C1` for relative R1C1 input AND output. If `mode == A1`, `site` is `None`-OK.
+- `print_with(.., R1C1, _, None)` for a formula containing relative refs → `Err(PrintError::R1C1RequiresAnchor)`. NO FALLBACK.
+- Backward-compat shims: `lex(text)` = `lex_with(text, A1, En)`; `print(expr)` = `print_with(expr, A1, En, None)`.
 
-Same for `print(expr)` → `print_with(expr, mode, locale) -> String`.
+### 4.4 Storage canonicalization contract (closes Codex HIGH-6)
+
+The op log + persistence ALWAYS store formula text in canonical form: A1 references, EN locale separators, `@` operator preserved verbatim. User input is parsed in the current `(mode, locale)`, canonicalized BEFORE op-log append:
+
+- `WorkbookRuntime::set_formula(sheet, row, col, user_text)`:
+  1. Read `wb.reference_mode()` + `wb.locale()`.
+  2. `lex_with(user_text, mode, locale)` → tokens.
+  3. `parse_with(tokens, mode, Some(FormulaSite { cell: ... }))` → Expr.
+  4. `print_with(&expr, A1, En, None)` → canonical text. (Always succeeds — `site` only needed for R1C1 OUTPUT.)
+  5. Op-log append `Op::PutFormula { text: canonical_text }`.
+
+This means `Op::PutFormula::text` invariantly carries A1+EN+(operator-preserving) text. A `SetLocale(En)` then replay of an earlier `PutFormula` produces the SAME stored text — no re-parse needed. Same for `SetReferenceMode`.
 
 ## 5. Sub-phase split
 
-Each sub-phase ships 1 commit + 7 gates green + self-audit. Codex pull-up at major milestones; closing megaudit at 4.9.O.
+Each sub-phase: 1 commit + 7 gates green + self-audit. Codex pull-ups at major milestones; closing megaudit at 4.9.O.
 
 | # | Sub-phase | Subject |
 |---|---|---|
-| 0 | **4.9.AA** | This design doc + Codex review (doc only) |
-| 1 | **4.9.A** | `Workbook::reference_mode` + `locale` accessors + `ReferenceMode` / `LocaleId` enums in ql-storage |
-| 2 | **4.9.B** | Lexer R1C1 mode — accept `R1C1`, `R[-1]C`, `R[1]C[2]`, range forms. New `Token::R1C1Cell` / `R1C1Range` variants OR parameterize existing Cell/Range tokens by mode |
-| 3 | **4.9.C** | Parser R1C1 — accepts R1C1 tokens, emits A1-canonical `Expr::CellRef` / `RangeRef`. Relative R1C1 (`R[-1]C`) needs owning-cell context; lift `BindSite` use to parse-time OR resolve at bind-time |
-| 4 | **4.9.D** | Printer R1C1 — `print_with(expr, ReferenceMode::R1C1, ...)` emits R1C1 form. Round-trip: A1-stored → R1C1-printed → R1C1-lexed → A1-parsed → equality holds |
-| 5 | **4.9.E** | Locale lexer — argument separator + decimal separator parameterization. Number-literal lex rules locale-dependent |
-| 6 | **4.9.F** | Locale printer — emit with locale's separators |
-| 7 | **4.9.G** | Implicit intersection lexer + parser — `@` as a unary prefix operator; `Expr::ImplicitIntersection(Box<Expr>)` wrapping a RangeRef expression. Disambiguate vs structured-ref `Sales[@Col]` (different parser context — inside `[`) |
-| 8 | **4.9.H** | Implicit intersection binder + eval — `ExprPlan::ImplicitIntersection(Box<ExprPlan>)`; eval narrows RangeRef to single cell using `BindSite::owning_cell` per § 3.3 rules; OUT-OF-RANGE → `#VALUE!` |
-| 9 | **4.9.I** | Persistence schema v6 → v7 — envelope fields `reference_mode: Option<ReferenceModeWire>`, `locale: Option<LocaleIdWire>`; absent → defaults (A1, En). v6 reader rejects v7 via existing range check. Formulas remain canonical-A1 + canonical-EN on disk |
-| 10 | **4.9.J** | IDE integration — `WorkbookRuntime::set_reference_mode` / `set_locale` (op-log: `SetReferenceMode`, `SetLocale`); IDE reads to determine display + input mode |
-| 11 | **4.9.K** | Op log + replay — new `Op` variants `SetReferenceMode`, `SetLocale`; replay arms apply to `Workbook::set_*` |
-| 12 | **4.9.L** | Round-trip + edge cases — A1↔R1C1, EN↔DE locale, `@A1:A10` in various contexts, `Sales[@Col]` vs `=@SUM(...)` parser disambiguation |
-| 13 | **4.9.M** | Coverage matrix tests — locale × mode × `@`-presence combinations |
-| 14 | **4.9.N** | Polish + deferred-style edge cases (mirror 4.8.N as a polish-wave bucket) |
+| 0 | **4.9.AA** | This design doc + Codex + Sonnet pass-1 review (doc only) |
+| 1 | **4.9.A** | `ReferenceMode` / `LocaleId` / `LocaleData` in `ql-formula-syntax`; `Workbook::reference_mode` / `locale` accessors in `ql-storage` |
+| 2 | **4.9.B** | Lexer: new `Token::R1C1Ref { row_axis: AxisSpec, col_axis: AxisSpec }` where `AxisSpec` carries `kind: Abs(i64)|Rel(i64)`; locale-parameterized separator + decimal lexing (incl. array literal separators per Codex HIGH-4) |
+| 3 | **4.9.C** | Parser: accepts `Token::R1C1Ref` + emits `Expr::CellRef` with intermediate relative/absolute markers; reject mixed-relativity range endpoints with dedicated `ParseError::R1C1MixedRelativity` (closes Codex MEDIUM + Sonnet H-4) |
+| 4 | **4.9.D** | Printer: `print_with(expr, mode, locale, site)` emits A1 or R1C1 (locale-aware separators), uses `site` for relative R1C1 output; fail-loud on missing `site` for R1C1 |
+| 5 | **4.9.E** | Locale-aware lexer for numbers — DE `2,34` vs EN `2.34` context-free rules; test vector table per § 3.2 |
+| 6 | **4.9.F** | Locale-aware printer for numbers + arrays + arg lists |
+| 7 | **4.9.G** | `Token::At` (standalone `@`) + `Expr::ImplicitIntersection` AST variant; parser handles `=@expr`, `=@SUM(...)`, `=Sheet1!@A1`; all walkers + printer + `plan::variant_kind` updated per § 4.2 touchpoint list |
+| 8 | **4.9.H** | Binder + eval — `ExprPlan::ImplicitIntersection`; eval narrows per § 3.3 rules using `BindSite::at_cell`; out-of-range → `#VALUE!` |
+| 9 | **4.9.I** | Persistence v6 → v7: **two-phase load** (closes Sonnet H-2): deserialize a `SchemaVersionProbe { schema_version: u32 }` FIRST, check version, THEN deserialize full envelope. v6 reader sees v7 → clean `UnsupportedSchema { found: 7 }`. New v7 fields `reference_mode: Option<...>` + `locale: Option<...>` use `#[serde(default)]`. Unknown locale string → `QbookError::UnknownLocale { found: String }` via custom deserializer (closes Sonnet M-2). **v7-fields-on-v6-file rejected** by post-deserialize loader assertion: `if schema_version < 7, fields must be absent` (closes Codex HIGH-5) |
+| 10 | **4.9.J** | Op log: `Op::SetReferenceMode` + `Op::SetLocale` variants; replay arms apply to `Workbook::set_*`; `ReplayError::UnknownLocale` for forward-compat unknown values (closes Sonnet L-10) |
+| 11 | **4.9.K** | `WorkbookRuntime::set_reference_mode` + `set_locale` API; canonical-storage contract per § 4.4 wired into `set_formula` |
+| 12 | **4.9.L** | Round-trip + edge cases: A1↔R1C1, EN↔DE, `@A:A`, `@1:1`, `@scalar`, `@function_result`, `Sheet1!@A1`, mixed-relativity rejection, `Sales[@Col]` vs `@Sales[Qty]` parser disambiguation |
+| 13 | **4.9.M** | Coverage matrix tests — `(mode, locale, @-presence)` combinations |
+| 14 | **4.9.N** | Polish + deferred-style edge cases |
 | 15 | **4.9.O** | Closing megaudit (Codex + Sonnet parallel) |
 
-15 implementation sub-phases + 1 design = 16 total. Matches Phase 4.8 structure.
+16 sub-phases. 4.9.J + 4.9.K were previously inverted (Sonnet L-9 flagged); now ops land in J before IDE wiring in K.
 
-## 6. Open questions (need Codex pass-1 + user decisions)
+## 6. Open questions — CLOSED per Codex + Sonnet pass-1
 
-These need resolution BEFORE 4.9.A:
-
-1. **R1C1 tokenization** — option (a) new `Token::R1C1Cell` / `R1C1Range` variants vs option (b) reuse existing `Cell` / `Range` tokens but parameterize the lexer. (b) keeps the parser unchanged. Codex preference?
-
-2. **Relative R1C1 resolution timing** — `R[-1]C` is relative to the formula's owning cell. Resolve at parse-time (parser needs owning-cell context, breaking parser purity) OR bind-time (parser emits a `Relative` marker the binder resolves). Phase 4.8.E shipped `BindSite` plumbing — bind-time resolution matches that pattern.
-
-3. **`@` operator precedence + disambiguation** — `=@SUM(...)` (implicit intersection of function result) vs `=Sales[@Col]` (structured-ref `@`). The parser context matters: inside `[...]` of a structured ref, `@` means "this row"; outside, `@` means implicit intersection. How to teach the parser this without breaking the existing structured-ref escape rules from 4.8.D?
-
-4. **Locale: function name translation** — IN or OUT? Master plan acceptance LOC-4-02 says "localized separators covered" — implying function names are NOT required. Confirm OUT-of-scope.
-
-5. **Locale data source** — hardcode en/de/fr tables in Rust, OR pull from CLDR / ICU at build time. IronCalc uses a `locales.bin` blob (CLDR-derived). For v1 hardcoded is simpler.
-
-6. **Persistence: forward-compat for locales** — if a future v8 adds `LocaleId::Ja`, current v7 reader sees an unknown locale string and... rejects? Falls back to En? Per CLAUDE.md "no fallbacks" — rejects loud.
-
-7. **R1C1 in named ranges + table refs** — does `NamedRange("Rate")` print/lex differently in R1C1 mode? Probably not (names are mode-agnostic). What about `Sales[Qty]`? Likely also unchanged (table refs don't carry cell addresses). Confirm.
-
-8. **`@` outside a formula context (e.g. `Sheet1!@A1`)** — Excel allows this; binder narrows after sheet resolution. Edge case; pin in 4.9.L.
+| Q | Closure |
+|---|---|
+| Q1 R1C1 tokenization | Option (a): new `Token::R1C1Ref` variant. Reuses `:` for range assembly. Codex + Sonnet agree. |
+| Q2 Relative R1C1 timing | Bind-time. Intermediate AST carries offsets + abs/rel markers. Anchor required at print-time too (§ 4.3 API). Codex + Sonnet agree. |
+| Q3 `@` precedence vs `[@Col]` | No ambiguity. Lexer absorbs internal `@` into `Token::StructuredRef`; top-level `@` is `Token::At`. Codex + Sonnet agree. |
+| Q4 Function-name localization | OUT. OOXML stores English. Codex + Sonnet agree. |
+| Q5 Locale data source | Hardcoded en/de/fr in Rust. CLDR deferred to known-gap doc. Codex + Sonnet agree. |
+| Q6 Unknown locale forward-compat | Reject loudly via `QbookError::UnknownLocale`. Codex + Sonnet agree. |
+| Q7 R1C1 in names + tables | Mode-agnostic. `NameRef` + `StructuredRef` pass through unchanged in R1C1 mode. Codex + Sonnet agree. |
+| Q8 `Sheet1!@A1` | First-class in 4.9.G/H grammar production (NOT edge-case test). Codex + Sonnet agree. |
 
 ## 7. Compat with shipped phases
 
-- **Phase 4.7 (arrays + spills)** — implicit intersection (`@`) is the Excel-365 form. Bare ranges in single-cell contexts already spill per 4.7; we don't add a pre-365 implicit-intersection fallback. Codex 4.7.O closure-verified clean.
-- **Phase 4.8 (structured refs + tables)** — the `@` inside `[@Col]` is a different production rule from `@`-prefix outside. Parser already handles `[@Col]` at the structured-ref sub-grammar level. The new `@`-prefix operator outside `[...]` is a new production. Parser tests need both paths.
-- **Persistence v6 → v7** — additive (two optional envelope fields); v6 reader rejects v7 via existing schema-version range check.
+- **Phase 4.7 (arrays + spills)** — `@` is the Excel-365 explicit operator. Bare ranges in single-cell contexts spill (no implicit pre-365 fallback). Array literals' separator parameterization is in scope (Codex HIGH-4); v1 doesn't change array semantics.
+- **Phase 4.8 (structured refs + tables)** — `@` inside `[@Col]` is a different production. Parser tests cover both paths in 4.9.L.
+- **Persistence v6 → v7** — additive envelope fields + two-phase load. v6 reader rejects v7 via version check (not via `deny_unknown_fields`).
 
-## 8. Out of scope (explicit)
+## 8. Out of scope (explicit fail-loud)
 
-- R1C1 in cell-range syntax `R1C1:R10C5` parsing nuances around partial relative (`R[1]C:R10C5` — mixed relative/absolute endpoints). Phase 4.9 supports both fully-absolute and fully-relative range endpoints; mixed-relativity is a polish wave.
-- IDE rendering of mode/locale toggle UI. Engine-side support only.
-- Sheet-scoped locale (different locales per sheet). Workbook-level only.
+- R1C1 mixed-relativity range endpoints (`R[1]C:R10C5`) → `ParseError::R1C1MixedRelativity` (closes Sonnet M-equivalent).
+- IDE mode/locale toggle UI. Engine-side support only.
+- Sheet-scoped locale or R1C1 mode. Workbook-level only.
+- Locale function-name translation (see § 2).
 
 ## 9. Stop conditions
 
-- If 4.9.B (lexer mode) requires deep token-set restructuring, halt and re-design.
-- If `@` parser disambiguation against `[@Col]` breaks the 4.8 structured-ref grammar, halt — that's a regression we cannot ship.
-- If persistence v7 breaks v6 round-trip, halt — backward compat is non-negotiable.
+- If 4.9.B token redesign cascades through the parser broadly, halt and re-design.
+- If `@` disambiguation breaks 4.8.D structured-ref grammar, halt — regression non-negotiable.
+- If two-phase persistence load breaks v6 round-trip, halt — backward compat non-negotiable.
 
 ## 10. Next step
 
-Dispatch Codex pass-1 review on this draft (mirrors 4.7.AA / 4.8.AA review pattern). Codex feedback drives a revision before 4.9.A.
+**Ready for 4.9.A implementation.** Both Codex and Sonnet returned NEEDS-REVISION on the v1 draft; this revision applies all 8 HIGH + 8 MEDIUM findings. Closure-verify Codex pass on this revised doc is recommended before 4.9.A lands (mirror 4.7.AA's verify pattern).
 
-Prompt template: `.codex/prompts/2026-05-15-phase-4.9-design-review.md` (to be written in fresh session — this doc itself is the scope of the review).
+Implementation prompt template: write `.codex/prompts/2026-05-15-phase-4.9-revised-design-verify.md` pointing at this doc + the closed open questions + the two original audit transcripts (`docs/audits/2026-05-15-phase-4.9-design-review-{codex,sonnet}.md`).
