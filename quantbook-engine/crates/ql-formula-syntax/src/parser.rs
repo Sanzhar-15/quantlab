@@ -3027,6 +3027,55 @@ mod tests {
         assert!(matches!(err, ParseError::R1C1MixedRelativity));
     }
 
+    /// **W5-152 (4.9.O Sonnet LOW-3 closure):** PER-AXIS-INDEPENDENT
+    /// relativity is accepted. The rule is "row1.relativity ==
+    /// row2.relativity AND col1.relativity == col2.relativity" —
+    /// rows and cols are independent. `R1C[1]:R10C[5]` has both rows
+    /// absolute AND both cols relative; that's two consistent axes
+    /// → ACCEPTED. The prior test corpus only pinned rejection cases;
+    /// this test pins the cross-axis acceptance.
+    #[test]
+    fn r1c1_parse_range_per_axis_independent_relativity_accepted() {
+        // Both rows absolute (Abs(1), Abs(10)), both cols relative
+        // (Rel(1), Rel(5)). Per-axis consistent → accepted.
+        match p_r1c1("R1C[1]:R10C[5]") {
+            Expr::RangeRef(RangeRef::R1C1Cells {
+                start_row,
+                start_col,
+                end_row,
+                end_col,
+                ..
+            }) => {
+                assert_eq!(start_row, AxisSpec::Abs(1));
+                assert_eq!(start_col, AxisSpec::Rel(1));
+                assert_eq!(end_row, AxisSpec::Abs(10));
+                assert_eq!(end_col, AxisSpec::Rel(5));
+            }
+            other => panic!("expected RangeRef::R1C1Cells, got {other:?}"),
+        }
+    }
+
+    /// **W5-152 (4.9.O Sonnet LOW-3 closure):** complementary axis
+    /// pattern — both rows relative, both cols absolute.
+    #[test]
+    fn r1c1_parse_range_rel_rows_abs_cols_accepted() {
+        match p_r1c1("R[1]C1:R[5]C10") {
+            Expr::RangeRef(RangeRef::R1C1Cells {
+                start_row,
+                start_col,
+                end_row,
+                end_col,
+                ..
+            }) => {
+                assert_eq!(start_row, AxisSpec::Rel(1));
+                assert_eq!(start_col, AxisSpec::Abs(1));
+                assert_eq!(end_row, AxisSpec::Rel(5));
+                assert_eq!(end_col, AxisSpec::Abs(10));
+            }
+            other => panic!("expected RangeRef::R1C1Cells, got {other:?}"),
+        }
+    }
+
     /// **Sheet-qualified single R1C1 ref.** `Sheet1!R1C1` → R1C1Ref
     /// with `SheetRef::Name("Sheet1")`.
     #[test]

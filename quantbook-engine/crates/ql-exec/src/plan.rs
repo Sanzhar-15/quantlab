@@ -952,7 +952,10 @@ fn bind_implicit_intersection<L: NameLookup>(
             bind_with_context_v2(inner, site, names, sheets, tables, ctx)
         }
 
-        // Spill (`A1#`) is reserved for a later Phase 4.9 sub-phase.
+        // Spill-range syntax (`A1#`) is reserved for a future Phase.
+        // NOTE: Phase 4.9 closed without adding `A1#` parsing — this
+        // arm guards future addition (closes 4.9.O Sonnet LOW-1 doc
+        // drift).
         Expr::Spill(_) => Err(BindError::UnsupportedVariant(
             "Spill-range-ref `A1#` inside `@` is unsupported in v1; \
              the design § 3.3 rule for `@A1#` is documented but the \

@@ -31,7 +31,7 @@
 
 use crate::ast::{CellAddr, Expr, RangeRef, SheetRef};
 use crate::token::{AxisSpec, Operator};
-use ql_types::{Locale, ReferenceMode};
+use ql_types::{Locale, ReferenceMode, MAX_COLUMN, MAX_ROW};
 
 /// **W5-141 (Phase 4.9.D):** printer-side anchor cell. Required for
 /// emitting `R[<offset>]C[<offset>]` from relative `Expr::R1C1Ref` or
@@ -265,12 +265,30 @@ fn emit_r1c1_axis_from_spec(axis: AxisSpec, letter: char, out: &mut String) {
 /// printer-side error type). Kept duplicated for now rather than
 /// shared via a third crate — the two sides use different error
 /// enums and the body is ~15 lines.
-fn axis_spec_to_absolute_coord(axis: AxisSpec, anchor: Option<u32>) -> Result<u32, PrintError> {
+/// **W5-152 (4.9.O Sonnet LOW-2 closure):** tightened bound from
+/// `u32::MAX` to `bound` (MAX_ROW or MAX_COLUMN, passed by caller).
+/// Pre-tightening, a synthetic `AxisSpec::Rel(16385)` at anchor 0
+/// would resolve to col 16385 and the printer would emit
+/// `column_index_to_letters(16385)` — a string beyond Excel's
+/// `XFD` max that the lexer would reject on re-parse. Production
+/// paths can't reach this (lexer caps `Abs(n) <= MAX+1` and binder
+/// caps `anchor+offset <= MAX`), but defense-in-depth for
+/// directly-constructed ASTs.
+fn axis_spec_to_absolute_coord(
+    axis: AxisSpec,
+    anchor: Option<u32>,
+    bound: u32,
+) -> Result<u32, PrintError> {
     match axis {
         AxisSpec::Abs(n) => {
             if n == 0 {
                 return Err(PrintError::R1C1AxisOutOfRange {
                     context: "AxisSpec::Abs(0) — R1C1 is 1-indexed",
+                });
+            }
+            if n > bound + 1 {
+                return Err(PrintError::R1C1AxisOutOfRange {
+                    context: "AxisSpec::Abs(n) exceeds Excel grid bound",
                 });
             }
             Ok(n - 1)
@@ -280,9 +298,9 @@ fn axis_spec_to_absolute_coord(axis: AxisSpec, anchor: Option<u32>) -> Result<u3
                 return Err(PrintError::R1C1RequiresAnchor);
             };
             let resolved = anchor as i64 + offset as i64;
-            if !(0..=(u32::MAX as i64)).contains(&resolved) {
+            if !(0..=(bound as i64)).contains(&resolved) {
                 return Err(PrintError::R1C1AxisOutOfRange {
-                    context: "relative R1C1 offset overflowed u32 when anchored",
+                    context: "relative R1C1 offset resolves outside Excel grid",
                 });
             }
             Ok(resolved as u32)
@@ -494,14 +512,26 @@ fn print_range_ctx(r: &RangeRef, ctx: &PrintCtx, out: &mut String) -> Result<(),
                     Ok(())
                 }
                 ReferenceMode::A1 => {
-                    let s_row =
-                        axis_spec_to_absolute_coord(*start_row, ctx.site.map(|s| s.cell.row))?;
-                    let s_col =
-                        axis_spec_to_absolute_coord(*start_col, ctx.site.map(|s| s.cell.col))?;
-                    let e_row =
-                        axis_spec_to_absolute_coord(*end_row, ctx.site.map(|s| s.cell.row))?;
-                    let e_col =
-                        axis_spec_to_absolute_coord(*end_col, ctx.site.map(|s| s.cell.col))?;
+                    let s_row = axis_spec_to_absolute_coord(
+                        *start_row,
+                        ctx.site.map(|s| s.cell.row),
+                        MAX_ROW,
+                    )?;
+                    let s_col = axis_spec_to_absolute_coord(
+                        *start_col,
+                        ctx.site.map(|s| s.cell.col),
+                        MAX_COLUMN,
+                    )?;
+                    let e_row = axis_spec_to_absolute_coord(
+                        *end_row,
+                        ctx.site.map(|s| s.cell.row),
+                        MAX_ROW,
+                    )?;
+                    let e_col = axis_spec_to_absolute_coord(
+                        *end_col,
+                        ctx.site.map(|s| s.cell.col),
+                        MAX_COLUMN,
+                    )?;
                     let abs = |a: &AxisSpec| matches!(a, AxisSpec::Abs(_));
                     if abs(start_col) {
                         out.push('$');
@@ -695,9 +725,15 @@ fn print_expr_ctx(
             Ok(())
         }
         Expr::Spill(_) => {
+            // **W5-152 (4.9.O Sonnet LOW-1 closure):** updated from the
+            // pre-4.9 docstring that claimed Phase 4.9 would add `A1#`
+            // parsing. It didn't — Phase 4.9 closed without spill-range
+            // syntax. `A1#` parsing remains a known gap for a future
+            // phase; this arm guards future addition.
             unreachable!(
-                "print_expr_ctx: Expr::Spill is reserved for Phase 4.9 (Excel `A1#` syntax) \
-                 and not constructed in Phase 4.7 — reaching here means the AST was malformed"
+                "print_expr_ctx: Expr::Spill is reserved for a future Phase \
+                 (Excel `A1#` spill-range syntax not yet added) — reaching \
+                 here means the AST was directly constructed with this variant"
             );
         }
         Expr::StructuredRef { table_name, spec } => {
@@ -741,8 +777,16 @@ fn print_expr_ctx(
                     Ok(())
                 }
                 ReferenceMode::A1 => {
-                    let row = axis_spec_to_absolute_coord(*row_axis, ctx.site.map(|s| s.cell.row))?;
-                    let col = axis_spec_to_absolute_coord(*col_axis, ctx.site.map(|s| s.cell.col))?;
+                    let row = axis_spec_to_absolute_coord(
+                        *row_axis,
+                        ctx.site.map(|s| s.cell.row),
+                        MAX_ROW,
+                    )?;
+                    let col = axis_spec_to_absolute_coord(
+                        *col_axis,
+                        ctx.site.map(|s| s.cell.col),
+                        MAX_COLUMN,
+                    )?;
                     if matches!(col_axis, AxisSpec::Abs(_)) {
                         out.push('$');
                     }
