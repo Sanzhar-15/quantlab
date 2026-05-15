@@ -490,7 +490,8 @@ The full v1 means all of these crates either ship real behavior or have a docume
    Add mode-aware parsing/printing for R1C1, localized separators/function names where required, and implicit intersection semantics.  
    References: `.references/ironcalc/base/src/expressions/lexer/test/test_locale.rs`; `.references/ironcalc/base/src/expressions/parser/tests/test_locales.rs`; `.references/ironcalc/base/src/implicit_intersection.rs`; `.references/ironcalc/base/src/expressions/parser/tests/test_implicit_intersection.rs`; `.references/hyperformula/src/parser/addressRepresentationConverters.ts`.  
    Acceptance: LOC-4-01 R1C1 parser/printer round-trips; LOC-4-02 localized separators covered; LOC-4-03 implicit intersection added where Excel requires it; LOC-4-04 IDE can toggle formula display mode.  
-   Effort: 1-2 weeks.
+   Effort: 1-2 weeks.  
+   **Status (2026-05-15):** 4.9.AA design draft shipped at `docs/architecture/2026-05-15-r1c1-locales-implicit-intersection.md` — pending Codex pass-1 review. 15-sub-phase split (A→O) mirrors Phase 4.8 structure. Function-name localization OUT-of-scope per LOC-4-02 reading (separators only).
 
 10. **4.10 Function Library Expansion Wave 2 - V1 260**  
     Finish the v1 function target. Defer only with explicit product sign-off and matrix entries.  
