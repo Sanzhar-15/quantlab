@@ -42,7 +42,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ql_types::SheetId;
+use ql_types::{ColId, RowId, SheetId};
 
 use crate::plan::ExprPlan;
 
@@ -57,11 +57,20 @@ use crate::plan::ExprPlan;
 /// - `name_gen` — `NameTable::generation()` at the moment of bind. A
 ///   subsequent name registration / removal bumps this, so old plans
 ///   become unreachable.
+/// - `cell_anchor` (W5-150) — `Some((row, col))` when the bind result is
+///   cell-anchor-dependent, `None` otherwise. Set by callers when the
+///   canonical text contains `@` (implicit intersection narrows
+///   `@<range>` at bind time using the formula's own cell — same
+///   canonical text at different cells produces different ExprPlans).
+///   For non-`@` formulas (`SUM(A1:A10)` shared across rows etc.) this
+///   stays `None` so the cache shares plans across cells, preserving
+///   the pre-4.9.O hit-rate. Closes 4.9.O HIGH-1.
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct PlanCacheKey {
     pub text: Arc<str>,
     pub sheet: SheetId,
     pub name_gen: u64,
+    pub cell_anchor: Option<(RowId, ColId)>,
 }
 
 /// Snapshot of cache observability data — exposed via
@@ -181,6 +190,7 @@ mod tests {
             text: Arc::from(text),
             sheet,
             name_gen,
+            cell_anchor: None,
         }
     }
 

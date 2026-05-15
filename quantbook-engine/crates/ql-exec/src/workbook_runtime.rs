@@ -588,11 +588,25 @@ impl<'a> WorkbookRuntime<'a> {
         // the same anchor; `2.5` vs `2,5`) but the same canonical form
         // share a single plan. The NameTable-generation slot still
         // invalidates on name registration.
+        //
+        // **W5-150 (Phase 4.9.O HIGH-1 closure):** `@`-bearing
+        // canonical text narrows AT BIND TIME using the formula's
+        // own cell (W5-144). The bound plan is cell-specific, so
+        // include the cell anchor in the cache key when `@` is
+        // present. Non-`@` formulas keep `cell_anchor: None` so the
+        // cache continues to share plans across cells (preserves
+        // the SUM(A1:A10)-across-rows fast path).
         let name_gen = self.workbook.names().generation();
+        let cell_anchor = if canonical_text.contains('@') {
+            Some((row, col))
+        } else {
+            None
+        };
         let cache_key = PlanCacheKey {
             text: Arc::clone(&canonical_text),
             sheet,
             name_gen,
+            cell_anchor,
         };
         let plan: Arc<crate::plan::ExprPlan> =
             self.plan_cache
@@ -988,10 +1002,18 @@ impl<'a> WorkbookRuntime<'a> {
         // mutations (reextract_deps).
         for (node, reader_sheet, reader_row, reader_col, text) in reader_info {
             let name_gen = self.workbook.names().generation();
+            // **W5-150 (Phase 4.9.O HIGH-1):** cell-aware key when `@`
+            // is present (see set_formula for rationale).
+            let cell_anchor = if text.contains('@') {
+                Some((reader_row, reader_col))
+            } else {
+                None
+            };
             let cache_key = PlanCacheKey {
                 text: Arc::clone(&text),
                 sheet: reader_sheet,
                 name_gen,
+                cell_anchor,
             };
             let plan: Arc<crate::plan::ExprPlan> = match self
                 .plan_cache
@@ -3153,10 +3175,18 @@ impl<'a> WorkbookRuntime<'a> {
                             }
                             for (rn, reader_sheet, reader_row, reader_col, reader_text) in readers {
                                 let name_gen = self.workbook.names().generation();
+                                // **W5-150 (Phase 4.9.O HIGH-1):** cell-aware key when `@`
+                                // is present.
+                                let cell_anchor = if reader_text.contains('@') {
+                                    Some((reader_row, reader_col))
+                                } else {
+                                    None
+                                };
                                 let cache_key = PlanCacheKey {
                                     text: Arc::clone(&reader_text),
                                     sheet: reader_sheet,
                                     name_gen,
+                                    cell_anchor,
                                 };
                                 let workbook: &Workbook = self.workbook;
                                 let plan: Arc<crate::plan::ExprPlan> =
@@ -3301,10 +3331,21 @@ impl<'a> WorkbookRuntime<'a> {
         agg_cache: &dyn crate::aggregate_cache::AggregateCache,
     ) -> Result<(Value, bool, Option<SpillShape>, Option<SpillShape>), RuntimeError> {
         let name_gen = self.workbook.names().generation();
+        // **W5-150 (Phase 4.9.O HIGH-1):** cell-aware key when `@`
+        // is present in the stored formula text. This is the
+        // recompute path — same canonical text at different cells
+        // would otherwise share the cell-specific `@`-narrowed
+        // plan from the first bind, leaking the wrong cell ref.
+        let cell_anchor = if formula_text.contains('@') {
+            Some((row, col))
+        } else {
+            None
+        };
         let cache_key = PlanCacheKey {
             text: Arc::clone(formula_text),
             sheet,
             name_gen,
+            cell_anchor,
         };
         // Borrow split: we need an immutable view of the workbook
         // (for `names()` inside the closure) while holding a mutable
@@ -11490,6 +11531,44 @@ mod tests {
             let key = format!("{:?}|{:?}|{}", cell.mode, cell.locale, cell.input);
             assert!(seen.insert(key.clone()), "duplicate matrix cell: {key}");
         }
+    }
+
+    /// **4.9.O audit verification:** plan cache collision when
+    /// `@<range>` is used at multiple cells in the same runtime
+    /// session. The W5-144 binder narrows `@A:A` at bind time using
+    /// site.cell, producing a cell-specific `ExprPlan::CellRef`.
+    /// But `PlanCacheKey` is `(canonical_text, sheet, name_gen)` —
+    /// no cell coords. Two cells in the same sheet with the same
+    /// canonical text `@A:A` would hit the cache and get the FIRST
+    /// call's narrowed plan, reading the wrong row.
+    ///
+    /// This test must PASS for the engine to be correct under the
+    /// "same `@<range>` formula at multiple cells" workload.
+    #[test]
+    fn plan_cache_at_range_collision_across_cells_regression() {
+        let mut wb = make_runtime_workbook();
+        wb.put(
+            ql_types::Address::new(0, 3, 0),
+            ql_types::Value::Number(11.0),
+        );
+        wb.put(
+            ql_types::Address::new(0, 5, 0),
+            ql_types::Value::Number(99.0),
+        );
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v1 = rt.set_formula(0, 3, 1, "@A:A").unwrap();
+        assert_eq!(
+            v1,
+            ql_types::Value::Number(11.0),
+            "first @A:A at row 3 must read A4"
+        );
+        let v2 = rt.set_formula(0, 5, 1, "@A:A").unwrap();
+        assert_eq!(
+            v2,
+            ql_types::Value::Number(99.0),
+            "second @A:A at row 5 must read A6, NOT the cached A4 plan"
+        );
     }
 
     /// **Coverage matrix axis dimensions.** Sanity-pin that the
