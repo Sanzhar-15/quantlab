@@ -11256,3 +11256,256 @@ mod tests {
     /// (Literal `SUM(A1:A3)` over a Range needs aggregate-arg binding
     /// which v1 routes via named ranges only; using scalar args here
     /// keeps the test focused on the `@` semantics.)
+    #[test]
+    fn at_function_with_scalar_return_passes_through() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let v_no_at = rt.set_formula(0, 5, 0, "SUM(1, 2, 3)").unwrap();
+        let v_with_at = rt.set_formula(0, 5, 1, "@SUM(1, 2, 3)").unwrap();
+        assert_eq!(v_no_at, ql_types::Value::Number(6.0));
+        assert_eq!(v_with_at, ql_types::Value::Number(6.0));
+    }
+
+    // ===================================================================
+    // W5-149 (Phase 4.9.M) — coverage matrix (mode × locale × @-presence).
+    //
+    // Systematic table-driven verification that
+    //   set_formula(text) → stored canonical text
+    // is correct for every (mode, locale, @-presence) cell. The
+    // canonical contract per design § 4.4: stored text is ALWAYS
+    // A1+EnUs regardless of input mode/locale; `@` is mode + locale
+    // invariant and is preserved verbatim through canonicalization.
+    //
+    // Matrix dimensions:
+    //   mode      ∈ {A1, R1C1}                          (2)
+    //   locale    ∈ {EnUs, De, Fr}                       (3)
+    //   @-presence ∈ {none, prefix-cell, prefix-function,
+    //                inside-arg, prefix-rel-ref}        (5)
+    //
+    // = 30 cells. Each cell specifies the input formula in its
+    // (mode, locale) source syntax + the expected canonical
+    // (A1+EnUs) output. The driver feeds set_formula at a fixed
+    // anchor (0, 0) and asserts the stored text matches.
+    // ===================================================================
+
+    /// **Coverage matrix cell.** Anchor is always `(0, 0, 0)` so the
+    /// expected canonical column can hardcode A1 letters.
+    struct MatrixCell {
+        mode: ql_types::ReferenceMode,
+        locale: ql_types::Locale,
+        input: &'static str,
+        expected_canonical: &'static str,
+    }
+
+    /// Build the full 30-cell matrix.
+    fn coverage_matrix() -> Vec<MatrixCell> {
+        use ql_types::{Locale, ReferenceMode};
+        let mut cells = Vec::with_capacity(30);
+
+        // ----- @-presence = none -----
+        for locale in [Locale::EnUs, Locale::De, Locale::Fr] {
+            cells.push(MatrixCell {
+                mode: ReferenceMode::A1,
+                locale,
+                input: "A1",
+                expected_canonical: "A1",
+            });
+        }
+        for locale in [Locale::EnUs, Locale::De, Locale::Fr] {
+            cells.push(MatrixCell {
+                mode: ReferenceMode::R1C1,
+                locale,
+                input: "R1C1",
+                expected_canonical: "$A$1",
+            });
+        }
+
+        // ----- @-presence = prefix-cell -----
+        for locale in [Locale::EnUs, Locale::De, Locale::Fr] {
+            cells.push(MatrixCell {
+                mode: ReferenceMode::A1,
+                locale,
+                input: "@A1",
+                expected_canonical: "@A1",
+            });
+        }
+        for locale in [Locale::EnUs, Locale::De, Locale::Fr] {
+            cells.push(MatrixCell {
+                mode: ReferenceMode::R1C1,
+                locale,
+                input: "@R1C1",
+                expected_canonical: "@$A$1",
+            });
+        }
+
+        // ----- @-presence = prefix-function -----
+        // EN: arg sep `,`. DE+FR: arg sep `;`.
+        cells.push(MatrixCell {
+            mode: ReferenceMode::A1,
+            locale: Locale::EnUs,
+            input: "@SUM(1, 2)",
+            expected_canonical: "@SUM(1, 2)",
+        });
+        cells.push(MatrixCell {
+            mode: ReferenceMode::A1,
+            locale: Locale::De,
+            input: "@SUM(1; 2)",
+            expected_canonical: "@SUM(1, 2)",
+        });
+        cells.push(MatrixCell {
+            mode: ReferenceMode::A1,
+            locale: Locale::Fr,
+            input: "@SUM(1; 2)",
+            expected_canonical: "@SUM(1, 2)",
+        });
+        cells.push(MatrixCell {
+            mode: ReferenceMode::R1C1,
+            locale: Locale::EnUs,
+            input: "@SUM(R1C1, R2C2)",
+            expected_canonical: "@SUM($A$1, $B$2)",
+        });
+        cells.push(MatrixCell {
+            mode: ReferenceMode::R1C1,
+            locale: Locale::De,
+            input: "@SUM(R1C1; R2C2)",
+            expected_canonical: "@SUM($A$1, $B$2)",
+        });
+        cells.push(MatrixCell {
+            mode: ReferenceMode::R1C1,
+            locale: Locale::Fr,
+            input: "@SUM(R1C1; R2C2)",
+            expected_canonical: "@SUM($A$1, $B$2)",
+        });
+
+        // ----- @-presence = inside-arg -----
+        cells.push(MatrixCell {
+            mode: ReferenceMode::A1,
+            locale: Locale::EnUs,
+            input: "SUM(@A1, B2)",
+            expected_canonical: "SUM(@A1, B2)",
+        });
+        cells.push(MatrixCell {
+            mode: ReferenceMode::A1,
+            locale: Locale::De,
+            input: "SUM(@A1; B2)",
+            expected_canonical: "SUM(@A1, B2)",
+        });
+        cells.push(MatrixCell {
+            mode: ReferenceMode::A1,
+            locale: Locale::Fr,
+            input: "SUM(@A1; B2)",
+            expected_canonical: "SUM(@A1, B2)",
+        });
+        cells.push(MatrixCell {
+            mode: ReferenceMode::R1C1,
+            locale: Locale::EnUs,
+            input: "SUM(@R1C1, R2C2)",
+            expected_canonical: "SUM(@$A$1, $B$2)",
+        });
+        cells.push(MatrixCell {
+            mode: ReferenceMode::R1C1,
+            locale: Locale::De,
+            input: "SUM(@R1C1; R2C2)",
+            expected_canonical: "SUM(@$A$1, $B$2)",
+        });
+        cells.push(MatrixCell {
+            mode: ReferenceMode::R1C1,
+            locale: Locale::Fr,
+            input: "SUM(@R1C1; R2C2)",
+            expected_canonical: "SUM(@$A$1, $B$2)",
+        });
+
+        // ----- @-presence = prefix-rel-ref -----
+        // Relative R1C1 inside `@`. At anchor (0, 0), `R[1]C[1]` →
+        // B2; `@R[1]C[1]` → `@B2`. A1 mode equivalent for the
+        // same anchor: `B2` is the relative-coord form.
+        for locale in [Locale::EnUs, Locale::De, Locale::Fr] {
+            cells.push(MatrixCell {
+                mode: ReferenceMode::A1,
+                locale,
+                input: "@B2",
+                expected_canonical: "@B2",
+            });
+        }
+        for locale in [Locale::EnUs, Locale::De, Locale::Fr] {
+            cells.push(MatrixCell {
+                mode: ReferenceMode::R1C1,
+                locale,
+                input: "@R[1]C[1]",
+                expected_canonical: "@B2",
+            });
+        }
+
+        cells
+    }
+
+    /// **Coverage matrix driver.** Walks all 30 cells; for each,
+    /// constructs a workbook in the cell's (mode, locale) state,
+    /// calls `set_formula(0, 0, 0, input)`, and asserts the stored
+    /// text equals `expected_canonical`.
+    #[test]
+    fn coverage_matrix_mode_locale_at_presence_30_cells() {
+        let cells = coverage_matrix();
+        assert_eq!(
+            cells.len(),
+            30,
+            "matrix should have exactly 30 cells (2 modes × 3 locales × 5 @-presence)"
+        );
+        let reg = default_registry();
+        for (i, cell) in cells.iter().enumerate() {
+            let mut wb = make_runtime_workbook();
+            wb.set_reference_mode(cell.mode);
+            wb.set_locale(cell.locale);
+            {
+                let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+                rt.set_formula(0, 0, 0, cell.input).unwrap_or_else(|e| {
+                    panic!(
+                        "matrix cell {i} ({:?}, {:?}, {:?}) — set_formula failed: {:?}",
+                        cell.mode, cell.locale, cell.input, e
+                    );
+                });
+            }
+            let stored = wb.formula_at(0, 0, 0).map(|s| s.as_ref().to_owned());
+            assert_eq!(
+                stored.as_deref(),
+                Some(cell.expected_canonical),
+                "matrix cell {i} ({:?}, {:?}, {:?}) — stored canonical mismatch",
+                cell.mode,
+                cell.locale,
+                cell.input
+            );
+        }
+    }
+
+    /// **Coverage matrix has no duplicate cells.** Every
+    /// (mode, locale, input) triple is unique — sanity that the
+    /// matrix builder didn't accidentally repeat a row.
+    #[test]
+    fn coverage_matrix_has_no_duplicates() {
+        use std::collections::HashSet;
+        let cells = coverage_matrix();
+        let mut seen = HashSet::new();
+        for cell in &cells {
+            let key = format!("{:?}|{:?}|{}", cell.mode, cell.locale, cell.input);
+            assert!(seen.insert(key.clone()), "duplicate matrix cell: {key}");
+        }
+    }
+
+    /// **Coverage matrix axis dimensions.** Sanity-pin that the
+    /// matrix has exactly the documented per-axis counts (so a
+    /// future cell-addition forces the axis-count assertion to
+    /// trip until the doc is updated).
+    #[test]
+    fn coverage_matrix_dimension_counts() {
+        // `Locale` / `ReferenceMode` don't derive `Hash`, so we
+        // count by stringifying their Debug form (cheap + readable).
+        use std::collections::HashSet;
+        let cells = coverage_matrix();
+        let modes: HashSet<String> = cells.iter().map(|c| format!("{:?}", c.mode)).collect();
+        let locales: HashSet<String> = cells.iter().map(|c| format!("{:?}", c.locale)).collect();
+        assert_eq!(modes.len(), 2, "expected 2 modes");
+        assert_eq!(locales.len(), 3, "expected 3 locales");
+        assert_eq!(cells.len(), 30, "expected 30 cells (2 × 3 × 5 @-presence)");
+    }
+}
