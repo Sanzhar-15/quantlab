@@ -41,7 +41,7 @@ pub use lexer::{column_letters_to_index, lex, lex_with, LexError, MAX_COLUMN, MA
 pub use locale::{locale_data, LocaleData};
 pub use parser::{parse, ParseError};
 pub use printer::print;
-pub use token::{Operator, Token};
+pub use token::{AxisSpec, Operator, Token};
 
 #[cfg(test)]
 mod tests {

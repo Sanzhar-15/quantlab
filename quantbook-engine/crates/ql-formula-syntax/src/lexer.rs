@@ -76,6 +76,14 @@ pub enum LexError {
     /// to escape. A trailing `'` is a syntax error.
     #[error("dangling escape `'` at end of structured reference bracket content")]
     DanglingStructuredRefEscape,
+
+    /// **W5-138 (Phase 4.9.B.4):** the lexer committed to an R1C1
+    /// reference (saw `R` followed by `[`, digit, or `C`/`c` while in
+    /// `ReferenceMode::R1C1`) but the remainder of the token did not
+    /// match the R1C1 grammar (e.g. `R1+`, `R[]C1`, `R0C1`, `R1C0`,
+    /// `R[1.5]C`). Captures the consumed fragment for diagnostics.
+    #[error("malformed R1C1 reference: {0:?}")]
+    MalformedR1C1(String),
 }
 
 /// Excel's column-letter upper bound (XFD = 16383, zero-indexed).
@@ -118,17 +126,20 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
 /// DE/FR (DE `,5` lexes as `Number(0.5)` instead of hitting the
 /// deleted literal `,` arm).
 ///
-/// Still pending:
-///
-/// - **4.9.B.4** — R1C1 token emission when `mode == R1C1`.
+/// - **W5-138 (4.9.B.4):** R1C1 token emission. When `mode ==
+///   ReferenceMode::R1C1` AND the next char is `R`/`r` AND the
+///   following char is `[`, an ASCII digit, or `C`/`c`, the lexer
+///   commits to lexing a `Token::R1C1Ref`. Forms accepted: `R1C1`,
+///   `RC`, `R1C`, `RC1`, `R[1]C[-2]`, `R[+3]C`. Out-of-range
+///   absolute axes (`R0`, `R1048577`, `C16385`) surface
+///   `RowTooLarge` / `ColumnTooLarge` / `MalformedR1C1`. Malformed
+///   forms post-commit (`R1+`, `R[]C`, `R[1.5]C`) surface
+///   `MalformedR1C1`. A1 mode is unchanged — `R1` still lexes as
+///   `CellRef { col: 17, row: 0 }`.
 ///
 /// This split lets each behavior change land as an independent commit
 /// with its own test coverage, instead of an atomic ~2k-line lexer
 /// rewrite.
-// TODO(4.9.B.4): remove `#[allow(unused_variables)]` when `mode` is
-// consumed by R1C1-token dispatch. Until then, `mode` is accepted
-// for signature parity but not yet read by the lex state machine.
-#[allow(unused_variables)]
 pub fn lex_with(input: &str, mode: ReferenceMode, locale: Locale) -> Result<Vec<Token>, LexError> {
     let locale_data = crate::locale::locale_data(locale);
     let decimal_sep = locale_data.decimal_separator;
@@ -175,6 +186,23 @@ pub fn lex_with(input: &str, mode: ReferenceMode, locale: Locale) -> Result<Vec<
             chars.next();
             out.push(Token::Semicolon);
             continue;
+        }
+
+        // **W5-138 (Phase 4.9.B.4):** R1C1-mode reference dispatch.
+        // When in R1C1 mode AND the current char is `R`/`r`, peek
+        // the next char to decide whether to commit to R1C1 lex.
+        // Commit-on-`[`, ASCII-digit, or `C`/`c`; back off on
+        // anything else (the `R` is consumed by the identifier
+        // arm below as a bare column letter — A1 fallback for
+        // mode-agnostic identifiers, e.g. `R + 1` arithmetic).
+        // In A1 mode (the default), this block is skipped entirely
+        // and `R1` lexes as a normal A1 `CellRef`.
+        if mode == ReferenceMode::R1C1 && (c == 'R' || c == 'r') {
+            if let Some(tok) = try_lex_r1c1_ref(&mut chars)? {
+                out.push(tok);
+                continue;
+            }
+            // Fall through to the regular identifier/A1 dispatch.
         }
 
         match c {
@@ -820,6 +848,158 @@ fn try_lex_sheet_name_prefix(
     out.push(Token::SheetName(Arc::from(name)));
     out.push(Token::Bang);
     Ok(true)
+}
+
+/// **W5-138 (Phase 4.9.B.4):** try to lex an R1C1-style reference
+/// starting at the current `R`/`r`. Returns:
+///
+/// - `Ok(Some(tok))` — committed and lexed successfully. The real
+///   `chars` cursor has been advanced past the full reference.
+/// - `Ok(None)` — not an R1C1 reference (the char after `R`/`r` is
+///   neither `[`, ASCII digit, nor `C`/`c`). `chars` is untouched;
+///   the caller falls through to the identifier/A1 dispatch.
+/// - `Err(MalformedR1C1)` — committed but the body did not match the
+///   grammar (missing `C`, empty `[]`, `0` for absolute, decimal in
+///   brackets, …). `chars` may have been partially advanced through
+///   the malformed fragment.
+///
+/// Commit rule: peek the char AFTER `R`/`r`. If it is `[`, an ASCII
+/// digit, or `C`/`c`, COMMIT — once committed, any further malformation
+/// is a lex error (no silent fallback). If the lookahead is anything
+/// else, back off without consuming the `R` — the caller's identifier
+/// arm will treat it as a bare column letter (consistent with A1 mode).
+fn try_lex_r1c1_ref(chars: &mut Peekable<Chars>) -> Result<Option<Token>, LexError> {
+    // Peek-only via clone. Don't mutate `chars` until we commit.
+    let mut peek = chars.clone();
+    let r_char = peek.next().expect("caller ensured R/r at boundary");
+    debug_assert!(r_char.eq_ignore_ascii_case(&'R'));
+
+    let should_commit = matches!(peek.peek(), Some('[') | Some('0'..='9'))
+        || matches!(peek.peek(), Some(c) if c.eq_ignore_ascii_case(&'C'));
+    if !should_commit {
+        return Ok(None);
+    }
+
+    let mut fragment = String::new();
+    fragment.push(r_char);
+
+    let row_axis = parse_r1c1_axis(&mut peek, &mut fragment, R1C1Axis::Row)?;
+
+    // Expect a mandatory `C`/`c` separator between axes.
+    match peek.next() {
+        Some(c) if c.eq_ignore_ascii_case(&'C') => fragment.push(c),
+        _ => return Err(LexError::MalformedR1C1(fragment)),
+    }
+
+    let col_axis = parse_r1c1_axis(&mut peek, &mut fragment, R1C1Axis::Col)?;
+
+    // Reject column-letter shadow: `R1C1A` would lex `R1C1` then leave
+    // `A` for the next iter (where it parses as `BareColumn`). That's
+    // correct — `R1C1A` is `R1C1 * A` in some grammars but Excel
+    // forbids juxtaposition; the parser surfaces an error on the dangling
+    // `A`. The lexer is happy to emit the two tokens.
+
+    *chars = peek;
+    Ok(Some(Token::R1C1Ref { row_axis, col_axis }))
+}
+
+/// **W5-138 (Phase 4.9.B.4):** parse one R1C1 axis (row or column).
+///
+/// Grammar (post-`R` or post-`C`):
+///
+/// ```text
+/// axis := '[' signed_int ']'    -- relative offset
+///       | unsigned_int          -- absolute 1-indexed
+///       | (empty)               -- bare R/C ≡ Rel(0)
+/// ```
+///
+/// Validation:
+///
+/// - Absolute `0` rejected (R1C1 is 1-indexed).
+/// - Absolute overflow rejected (`RowTooLarge` / `ColumnTooLarge`).
+/// - Empty `[]`, non-digit body, missing `]` → `MalformedR1C1`.
+fn parse_r1c1_axis(
+    chars: &mut Peekable<Chars>,
+    fragment: &mut String,
+    axis: R1C1Axis,
+) -> Result<crate::token::AxisSpec, LexError> {
+    use crate::token::AxisSpec;
+
+    match chars.peek().copied() {
+        Some('[') => {
+            chars.next();
+            fragment.push('[');
+
+            let mut digits = String::new();
+            if let Some(&sign @ ('+' | '-')) = chars.peek() {
+                digits.push(sign);
+                fragment.push(sign);
+                chars.next();
+            }
+            let mut saw_digit = false;
+            while let Some(&d) = chars.peek() {
+                if d.is_ascii_digit() {
+                    digits.push(d);
+                    fragment.push(d);
+                    chars.next();
+                    saw_digit = true;
+                } else {
+                    break;
+                }
+            }
+            if !saw_digit {
+                return Err(LexError::MalformedR1C1(std::mem::take(fragment)));
+            }
+            match chars.next() {
+                Some(']') => fragment.push(']'),
+                _ => return Err(LexError::MalformedR1C1(std::mem::take(fragment))),
+            }
+            let offset: i32 = digits
+                .parse()
+                .map_err(|_| LexError::MalformedR1C1(std::mem::take(fragment)))?;
+            Ok(AxisSpec::Rel(offset))
+        }
+        Some(c) if c.is_ascii_digit() => {
+            let mut digits = String::new();
+            while let Some(&d) = chars.peek() {
+                if d.is_ascii_digit() {
+                    digits.push(d);
+                    fragment.push(d);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let n: u32 = digits
+                .parse()
+                .map_err(|_| LexError::MalformedR1C1(std::mem::take(fragment)))?;
+            if n == 0 {
+                return Err(LexError::MalformedR1C1(std::mem::take(fragment)));
+            }
+            let max = match axis {
+                R1C1Axis::Row => MAX_ROW + 1,
+                R1C1Axis::Col => MAX_COLUMN + 1,
+            };
+            if n > max {
+                return Err(match axis {
+                    R1C1Axis::Row => LexError::RowTooLarge(std::mem::take(fragment)),
+                    R1C1Axis::Col => LexError::ColumnTooLarge(std::mem::take(fragment)),
+                });
+            }
+            Ok(AxisSpec::Abs(n))
+        }
+        // Bare R or bare C — canonicalize to Rel(0) per Excel R1C1
+        // canon (`RC` means "this row, this col").
+        _ => Ok(AxisSpec::Rel(0)),
+    }
+}
+
+/// **W5-138 (Phase 4.9.B.4):** which axis is being parsed — selects
+/// the right bounds-check and error variant.
+#[derive(Clone, Copy)]
+enum R1C1Axis {
+    Row,
+    Col,
 }
 
 /// Lex a quoted-sheet-name prefix `'...'!`. The caller has just peeked
@@ -2525,5 +2705,268 @@ mod tests {
             Err(LexError::InvalidNumber(s)) => assert_eq!(s, "."),
             other => panic!("expected InvalidNumber(\".\"), got {other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // W5-138 (Phase 4.9.B.4) — R1C1 token emission tests.
+    //
+    // Mode gating: every R1C1 behavior fires only when `mode ==
+    // ReferenceMode::R1C1`. A1 mode is byte-identical to pre-W5-138.
+    // ---------------------------------------------------------------
+
+    use crate::token::AxisSpec;
+
+    fn r1c1(row: AxisSpec, col: AxisSpec) -> Token {
+        Token::R1C1Ref {
+            row_axis: row,
+            col_axis: col,
+        }
+    }
+
+    /// **A1 mode preserved.** `R1` in A1 mode is still a `CellRef`,
+    /// not an R1C1 token. The R1C1 dispatch is mode-gated.
+    #[test]
+    fn r1c1_a1_mode_leaves_r1_as_cellref() {
+        let tokens = lex_with("R1", ReferenceMode::A1, Locale::EnUs).unwrap();
+        // Column R = 17 (0-indexed). Row 0 (0-indexed).
+        assert!(matches!(
+            tokens.as_slice(),
+            [Token::CellRef {
+                col: 17,
+                row: 0,
+                ..
+            }]
+        ));
+    }
+
+    /// **R1C1 absolute pair.** `R1C1` → `R1C1Ref { Abs(1), Abs(1) }`.
+    #[test]
+    fn r1c1_absolute_pair_lexes_to_r1c1ref() {
+        let tokens = lex_with("R1C1", ReferenceMode::R1C1, Locale::EnUs).unwrap();
+        assert_eq!(tokens, vec![r1c1(AxisSpec::Abs(1), AxisSpec::Abs(1))]);
+    }
+
+    /// **R1C1 case-insensitivity.** Lowercase `r1c1` lexes the same.
+    #[test]
+    fn r1c1_lowercase_lexes_same_as_uppercase() {
+        let lo = lex_with("r1c1", ReferenceMode::R1C1, Locale::EnUs).unwrap();
+        let up = lex_with("R1C1", ReferenceMode::R1C1, Locale::EnUs).unwrap();
+        assert_eq!(lo, up);
+    }
+
+    /// **Mixed-case `R1c1` accepted.** Excel canon accepts both
+    /// cases independently per axis-prefix letter.
+    #[test]
+    fn r1c1_mixed_case_axis_prefixes_accepted() {
+        let tokens = lex_with("R1c1", ReferenceMode::R1C1, Locale::EnUs).unwrap();
+        assert_eq!(tokens, vec![r1c1(AxisSpec::Abs(1), AxisSpec::Abs(1))]);
+    }
+
+    /// **Relative `R[-1]C`.** `R[-1]C` → `Rel(-1)` row, `Rel(0)` col.
+    /// Bare `C` canonicalizes to `Rel(0)`.
+    #[test]
+    fn r1c1_relative_negative_row_bare_col_lexes() {
+        let tokens = lex_with("R[-1]C", ReferenceMode::R1C1, Locale::EnUs).unwrap();
+        assert_eq!(tokens, vec![r1c1(AxisSpec::Rel(-1), AxisSpec::Rel(0))]);
+    }
+
+    /// **Relative `R[2]C[3]`.** Both axes relative, positive offsets.
+    #[test]
+    fn r1c1_relative_positive_offsets_both_axes() {
+        let tokens = lex_with("R[2]C[3]", ReferenceMode::R1C1, Locale::EnUs).unwrap();
+        assert_eq!(tokens, vec![r1c1(AxisSpec::Rel(2), AxisSpec::Rel(3))]);
+    }
+
+    /// **Bare `RC` ≡ `Rel(0)` on both axes.** "This cell" form.
+    #[test]
+    fn r1c1_bare_rc_canonicalizes_to_rel_zero() {
+        let tokens = lex_with("RC", ReferenceMode::R1C1, Locale::EnUs).unwrap();
+        assert_eq!(tokens, vec![r1c1(AxisSpec::Rel(0), AxisSpec::Rel(0))]);
+    }
+
+    /// **Mixed `R1C[2]`.** Absolute row, relative col.
+    #[test]
+    fn r1c1_mixed_abs_row_rel_col() {
+        let tokens = lex_with("R1C[2]", ReferenceMode::R1C1, Locale::EnUs).unwrap();
+        assert_eq!(tokens, vec![r1c1(AxisSpec::Abs(1), AxisSpec::Rel(2))]);
+    }
+
+    /// **Explicit `+` sign in brackets.** `R[+3]C` → `Rel(3)`.
+    #[test]
+    fn r1c1_explicit_positive_sign_in_brackets() {
+        let tokens = lex_with("R[+3]C", ReferenceMode::R1C1, Locale::EnUs).unwrap();
+        assert_eq!(tokens, vec![r1c1(AxisSpec::Rel(3), AxisSpec::Rel(0))]);
+    }
+
+    /// **Range `R1C1:R10C5`.** Lexer emits `R1C1Ref + Colon +
+    /// R1C1Ref`; parser builds the range in 4.9.C.
+    #[test]
+    fn r1c1_range_lexes_as_two_refs_joined_by_colon() {
+        let tokens = lex_with("R1C1:R10C5", ReferenceMode::R1C1, Locale::EnUs).unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                r1c1(AxisSpec::Abs(1), AxisSpec::Abs(1)),
+                Token::Colon,
+                r1c1(AxisSpec::Abs(10), AxisSpec::Abs(5)),
+            ]
+        );
+    }
+
+    /// **Bounds: max absolute row.** `R1048576C16384` = (MAX_ROW+1,
+    /// MAX_COLUMN+1) — accepted at the boundary.
+    #[test]
+    fn r1c1_at_grid_boundary_accepted() {
+        let tokens = lex_with("R1048576C16384", ReferenceMode::R1C1, Locale::EnUs).unwrap();
+        assert_eq!(
+            tokens,
+            vec![r1c1(AxisSpec::Abs(1_048_576), AxisSpec::Abs(16_384))]
+        );
+    }
+
+    /// **Row absolute `0` rejected.** R1C1 is 1-indexed.
+    #[test]
+    fn r1c1_absolute_zero_row_rejected_as_malformed() {
+        let result = lex_with("R0C1", ReferenceMode::R1C1, Locale::EnUs);
+        assert!(matches!(result, Err(LexError::MalformedR1C1(_))));
+    }
+
+    /// **Column absolute `0` rejected.** R1C1 is 1-indexed.
+    #[test]
+    fn r1c1_absolute_zero_col_rejected_as_malformed() {
+        let result = lex_with("R1C0", ReferenceMode::R1C1, Locale::EnUs);
+        assert!(matches!(result, Err(LexError::MalformedR1C1(_))));
+    }
+
+    /// **Row over MAX_ROW+1 → `RowTooLarge`.** Distinct error from
+    /// `MalformedR1C1` so the diagnostic matches Excel's "row out of
+    /// range" phrasing.
+    #[test]
+    fn r1c1_row_overflow_uses_row_too_large_error() {
+        let result = lex_with("R1048577C1", ReferenceMode::R1C1, Locale::EnUs);
+        assert!(matches!(result, Err(LexError::RowTooLarge(_))));
+    }
+
+    /// **Col over MAX_COLUMN+1 → `ColumnTooLarge`.**
+    #[test]
+    fn r1c1_col_overflow_uses_column_too_large_error() {
+        let result = lex_with("R1C16385", ReferenceMode::R1C1, Locale::EnUs);
+        assert!(matches!(result, Err(LexError::ColumnTooLarge(_))));
+    }
+
+    /// **`R1` (no `C`) → MalformedR1C1.** Committed on digit, then
+    /// expected `C`/`c` next — but hit EOF.
+    #[test]
+    fn r1c1_missing_c_axis_after_committed_r_rejected() {
+        let result = lex_with("R1", ReferenceMode::R1C1, Locale::EnUs);
+        assert!(matches!(result, Err(LexError::MalformedR1C1(_))));
+    }
+
+    /// **`R1+` → MalformedR1C1.** Committed on digit; `+` is not
+    /// `C`/`c`.
+    #[test]
+    fn r1c1_committed_then_non_c_rejected() {
+        let result = lex_with("R1+", ReferenceMode::R1C1, Locale::EnUs);
+        assert!(matches!(result, Err(LexError::MalformedR1C1(_))));
+    }
+
+    /// **Empty brackets `R[]C` → MalformedR1C1.**
+    #[test]
+    fn r1c1_empty_brackets_rejected() {
+        let result = lex_with("R[]C1", ReferenceMode::R1C1, Locale::EnUs);
+        assert!(matches!(result, Err(LexError::MalformedR1C1(_))));
+    }
+
+    /// **Sign-only brackets `R[+]C` → MalformedR1C1.** Has sign but
+    /// no digit.
+    #[test]
+    fn r1c1_sign_only_brackets_rejected() {
+        let result = lex_with("R[+]C1", ReferenceMode::R1C1, Locale::EnUs);
+        assert!(matches!(result, Err(LexError::MalformedR1C1(_))));
+    }
+
+    /// **Unterminated brackets `R[1C` → MalformedR1C1.** Saw `[1`
+    /// but no `]` before the next token boundary.
+    #[test]
+    fn r1c1_unterminated_brackets_rejected() {
+        let result = lex_with("R[1C", ReferenceMode::R1C1, Locale::EnUs);
+        assert!(matches!(result, Err(LexError::MalformedR1C1(_))));
+    }
+
+    /// **Decimal in brackets `R[1.5]C` → MalformedR1C1.** `1` parsed,
+    /// then `.` is not `]`.
+    #[test]
+    fn r1c1_decimal_in_brackets_rejected() {
+        let result = lex_with("R[1.5]C", ReferenceMode::R1C1, Locale::EnUs);
+        assert!(matches!(result, Err(LexError::MalformedR1C1(_))));
+    }
+
+    /// **Back-off: `Range` in R1C1 mode.** `R` followed by `a` is NOT
+    /// a commit-trigger — falls through to identifier lex. The
+    /// remaining text behaves like the existing identifier dispatch
+    /// (Excel canon would produce different tokens for the same input
+    /// in A1 vs R1C1 modes; here both modes back off on `R`+letter-
+    /// not-C and produce identical tokens).
+    #[test]
+    fn r1c1_back_off_on_r_followed_by_non_c_letter() {
+        let r1c1_tokens = lex_with("Range", ReferenceMode::R1C1, Locale::EnUs).unwrap();
+        let a1_tokens = lex_with("Range", ReferenceMode::A1, Locale::EnUs).unwrap();
+        assert_eq!(r1c1_tokens, a1_tokens);
+    }
+
+    /// **Back-off: bare `R`+space in R1C1 mode falls through to
+    /// identifier lex.** Subsequent `1` lexes as a number.
+    #[test]
+    fn r1c1_back_off_on_r_followed_by_whitespace() {
+        let tokens = lex_with("R 1", ReferenceMode::R1C1, Locale::EnUs).unwrap();
+        // Falls through: `R` becomes BareColumn, then whitespace, then
+        // `1` → Number.
+        assert_eq!(tokens.len(), 2);
+        assert!(matches!(tokens[0], Token::BareColumn { col: 17, .. }));
+        assert!(matches!(tokens[1], Token::Number(n) if n == 1.0));
+    }
+
+    /// **A1 mode unaffected for `RC`.** In A1 mode the dispatch is
+    /// skipped entirely; `RC` lexes as a 2-letter column identifier
+    /// (BareColumn). This is the back-compat invariant.
+    #[test]
+    fn r1c1_dispatch_skipped_in_a1_mode_for_rc() {
+        let a1 = lex_with("RC", ReferenceMode::A1, Locale::EnUs).unwrap();
+        let r1c1_mode = lex_with("RC", ReferenceMode::R1C1, Locale::EnUs).unwrap();
+        assert_ne!(a1, r1c1_mode);
+        assert!(matches!(a1.as_slice(), [Token::BareColumn { .. }]));
+        assert_eq!(r1c1_mode, vec![r1c1(AxisSpec::Rel(0), AxisSpec::Rel(0))]);
+    }
+
+    /// **R1C1 mode + DE locale composes correctly.** Locale separator
+    /// pre-dispatch and R1C1 ref dispatch are independent. `R1C1;R2C2`
+    /// in DE/R1C1 → two refs separated by `Comma` (DE's `;` is arg-sep).
+    #[test]
+    fn r1c1_mode_composes_with_de_locale() {
+        let tokens = lex_with("R1C1;R2C2", ReferenceMode::R1C1, Locale::De).unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                r1c1(AxisSpec::Abs(1), AxisSpec::Abs(1)),
+                Token::Comma,
+                r1c1(AxisSpec::Abs(2), AxisSpec::Abs(2)),
+            ]
+        );
+    }
+
+    /// **Inside a function call `SUM(R1C1,R2C2)`.** Confirms R1C1
+    /// tokens coexist with parens + commas as a parser-ready
+    /// stream.
+    #[test]
+    fn r1c1_inside_function_call_tokenizes_cleanly() {
+        let tokens = lex_with("SUM(R1C1,R2C2)", ReferenceMode::R1C1, Locale::EnUs).unwrap();
+        assert_eq!(tokens.len(), 6);
+        // SUM lexes as BareColumn (parser disambiguates as fn-call later).
+        assert!(matches!(tokens[0], Token::BareColumn { .. }));
+        assert!(matches!(tokens[1], Token::LParen));
+        assert_eq!(tokens[2], r1c1(AxisSpec::Abs(1), AxisSpec::Abs(1)));
+        assert!(matches!(tokens[3], Token::Comma));
+        assert_eq!(tokens[4], r1c1(AxisSpec::Abs(2), AxisSpec::Abs(2)));
+        assert!(matches!(tokens[5], Token::RParen));
     }
 }

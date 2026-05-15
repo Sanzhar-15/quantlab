@@ -124,6 +124,24 @@ pub enum Token {
     /// whitespace). The body is the decoded form (no surrounding quotes).
     QuotedSheetName(Arc<str>),
 
+    /// **W5-138 (Phase 4.9.B.4):** R1C1-style reference. Emitted only
+    /// when `lex_with` is called with `ReferenceMode::R1C1`. Each axis
+    /// is independently `Abs(n)` (1-indexed) or `Rel(offset)` (signed
+    /// offset from formula anchor). Ranges (`R1C1:R10C5`) lex as
+    /// `R1C1Ref + Colon + R1C1Ref` — the colon-join + range assembly
+    /// stays in the parser (4.9.C).
+    ///
+    /// Relative-offset resolution defers to bind time (4.9.C / 4.9.H)
+    /// using `BindSite::at_cell`; the lexer accepts any in-range i32
+    /// offset without applying anchor arithmetic.
+    ///
+    /// Bare `R` / `C` (no digit, no `[]`) are canonicalized to
+    /// `Rel(0)` per Excel R1C1 canon (`RC` ≡ "this cell").
+    R1C1Ref {
+        row_axis: AxisSpec,
+        col_axis: AxisSpec,
+    },
+
     /// **W5-111 (Phase 4.8.B):** structured table reference `Table[Col]`,
     /// `Table[[#Headers], [Col]]`, etc. `table_name` is the case-preserving
     /// identifier preceding `[`; `bracket_content` is the UNESCAPED text
@@ -146,6 +164,23 @@ pub enum Token {
         /// Bracket content with escapes resolved.
         bracket_content: Arc<str>,
     },
+}
+
+/// **W5-138 (Phase 4.9.B.4):** one axis (row OR column) of an R1C1
+/// reference. Either an absolute 1-indexed row/column number, or a
+/// signed relative offset from the formula's anchor cell.
+///
+/// - `Abs(n)` — 1-indexed. `Abs(0)` is invalid (R1C1 is 1-indexed
+///   in source per Excel canon); the lexer rejects it. `Abs(n)` is
+///   bounded by `MAX_ROW + 1` / `MAX_COLUMN + 1` at lex time.
+/// - `Rel(offset)` — signed offset (`R[-1]` = one row above anchor).
+///   Resolution happens at bind time (4.9.C / 4.9.H). The lexer
+///   accepts any value that fits in `i32`; anchor + offset bounds-
+///   check defers to the binder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AxisSpec {
+    Abs(u32),
+    Rel(i32),
 }
 
 /// Operator subtype carried by `Token::Op`.
