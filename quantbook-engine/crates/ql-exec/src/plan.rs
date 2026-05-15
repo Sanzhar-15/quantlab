@@ -32,8 +32,8 @@
 
 use std::sync::Arc;
 
-use ql_formula_syntax::{Expr, Operator, SheetRef};
-use ql_types::{ColId, ErrorValue, Range, RowId, SheetId};
+use ql_formula_syntax::{AxisSpec, Expr, Operator, SheetRef};
+use ql_types::{ColId, ErrorValue, Range, RowId, SheetId, MAX_COLUMN, MAX_ROW};
 
 /// Bound, execution-ready expression. Sheet refs are concrete.
 #[derive(Clone, Debug, PartialEq)]
@@ -291,6 +291,33 @@ pub enum BindError {
     /// supply a cell via `BindSite::at_cell`.
     #[error("`[@Col]` shorthand requires an owning cell (none supplied)")]
     ThisRowRequiresOwningCell,
+
+    /// **W5-140 (Phase 4.9.C binder):** an `Expr::R1C1Ref` with at
+    /// least one relative axis (`AxisSpec::Rel(_)`) was bound under
+    /// a `BindSite` lacking `cell` context. Relative R1C1 axes
+    /// resolve against the formula's anchor cell at bind time per
+    /// design § 3.1; without an anchor, resolution is impossible
+    /// and we fail loud rather than silently substitute a default.
+    /// Production storage canon (design § 4.4) ALWAYS supplies a
+    /// `FormulaSite { cell }`; only parse-only / syntax-validation
+    /// bind paths can surface this.
+    #[error("R1C1 reference has a relative axis but no anchor cell was supplied")]
+    R1C1RequiresAnchor,
+
+    /// **W5-140 (Phase 4.9.C binder):** R1C1 axis resolution
+    /// produced a row or column outside the Excel grid
+    /// (`MAX_ROW + 1` rows; `MAX_COLUMN + 1` cols, 1-indexed in
+    /// source). Either an absolute axis exceeded the grid bound,
+    /// or a relative offset added to the anchor coord overflowed /
+    /// underflowed. Carries the structured-numeric resolution that
+    /// failed so the IDE can render a precise diagnostic.
+    #[error(
+        "R1C1 reference resolves out of grid bounds: row={resolved_row:?}, col={resolved_col:?}"
+    )]
+    R1C1OutOfBounds {
+        resolved_row: Option<i64>,
+        resolved_col: Option<i64>,
+    },
 }
 
 /// Phase 2B.4 (2026-05-12): bind-time context for a sub-expression. Drives
@@ -728,19 +755,96 @@ fn bind_with_context_v2<L: NameLookup>(
         Expr::StructuredRef { table_name, spec } => {
             resolve_structured_ref(table_name, spec, tables)
         }
-        // **W5-139 (Phase 4.9.C):** intermediate R1C1 forms produced
-        // by the parser when fed `mode == R1C1` tokens. The binder
-        // lowering to absolute coords (using `BindSite::at_cell` for
-        // relative axes) is a separate sub-phase. Today: surface a
-        // clear "unsupported variant" rather than a fallback — per
-        // the no-fallbacks rule, callers MUST get a loud error if
-        // an R1C1 expression slips into bind before that sub-phase
-        // ships.
-        Expr::R1C1Ref { .. } => Err(BindError::UnsupportedVariant(
-            "Expr::R1C1Ref binding is Phase 4.9.C-binder / 4.9.H — \
-             parser-intermediate AST must be canonicalized to absolute \
-             form before binding (see design § 4.4 storage canon).",
-        )),
+        // **W5-140 (Phase 4.9.C binder):** lower the intermediate
+        // R1C1 reference to an absolute `ExprPlan::CellRef`.
+        // Absolute axes (`AxisSpec::Abs(n)`) drop straight in as
+        // 0-indexed `n - 1` (R1C1 is 1-indexed in source per Excel
+        // canon; both axis bounds are already enforced at lex time
+        // and re-checked here for defense-in-depth). Relative axes
+        // (`AxisSpec::Rel(offset)`) resolve against the formula's
+        // anchor cell from `site.cell`; without a cell anchor we
+        // fail with `BindError::R1C1RequiresAnchor` rather than
+        // silently substituting `Address::ORIGIN`.
+        //
+        // `abs_col` / `abs_row` flags on the resulting `CellRef`
+        // are derived from the source axis: `Abs(_)` → true,
+        // `Rel(_)` → false. This is exactly what the printer will
+        // need at 4.9.D to re-emit canonical A1 (with `$`
+        // prefixes) vs R1C1 (with brackets), and the canonical-
+        // storage flow at 4.9.K relies on it.
+        Expr::R1C1Ref {
+            sheet,
+            row_axis,
+            col_axis,
+        } => {
+            let anchor_row = site.cell.map(|a| a.row);
+            let anchor_col = site.cell.map(|a| a.col);
+            let row = resolve_r1c1_axis(*row_axis, anchor_row, R1C1Axis::Row)?;
+            let col = resolve_r1c1_axis(*col_axis, anchor_col, R1C1Axis::Col)?;
+            Ok(ExprPlan::CellRef {
+                sheet: resolve_sheet_ref(sheet, owning_sheet, sheets)?,
+                row,
+                col,
+                abs_col: matches!(col_axis, AxisSpec::Abs(_)),
+                abs_row: matches!(row_axis, AxisSpec::Abs(_)),
+            })
+        }
+    }
+}
+
+/// **W5-140 (Phase 4.9.C binder):** which axis is being resolved —
+/// selects bounds and the bounds-error field shape.
+#[derive(Clone, Copy)]
+enum R1C1Axis {
+    Row,
+    Col,
+}
+
+/// **W5-140 (Phase 4.9.C binder):** resolve one R1C1 axis to a
+/// 0-indexed `u32` coordinate.
+///
+/// - `Abs(n)`: returns `n - 1`. `n` is validated to be `1..=MAX+1`
+///   (lex-time check + binder defense-in-depth). `n == 0` should
+///   never reach here (lexer rejects it as `MalformedR1C1`); if it
+///   does, we surface `R1C1OutOfBounds` rather than panicking.
+/// - `Rel(offset)`: returns `anchor + offset` if `anchor.is_some()`
+///   and the sum is in-grid. `anchor.is_none()` →
+///   `R1C1RequiresAnchor`. Out-of-grid → `R1C1OutOfBounds`. The
+///   intermediate sum is computed in `i64` so we can both detect
+///   overflow AND surface the offending negative coord in the
+///   error (rather than wrapping silently).
+fn resolve_r1c1_axis(
+    axis: AxisSpec,
+    anchor: Option<u32>,
+    which: R1C1Axis,
+) -> Result<u32, BindError> {
+    let bound = match which {
+        R1C1Axis::Row => MAX_ROW,
+        R1C1Axis::Col => MAX_COLUMN,
+    };
+    match axis {
+        AxisSpec::Abs(n) => {
+            if n == 0 || n > bound + 1 {
+                return Err(BindError::R1C1OutOfBounds {
+                    resolved_row: matches!(which, R1C1Axis::Row).then_some(n as i64 - 1),
+                    resolved_col: matches!(which, R1C1Axis::Col).then_some(n as i64 - 1),
+                });
+            }
+            Ok(n - 1)
+        }
+        AxisSpec::Rel(offset) => {
+            let Some(anchor) = anchor else {
+                return Err(BindError::R1C1RequiresAnchor);
+            };
+            let resolved = anchor as i64 + offset as i64;
+            if resolved < 0 || resolved > bound as i64 {
+                return Err(BindError::R1C1OutOfBounds {
+                    resolved_row: matches!(which, R1C1Axis::Row).then_some(resolved),
+                    resolved_col: matches!(which, R1C1Axis::Col).then_some(resolved),
+                });
+            }
+            Ok(resolved as u32)
+        }
     }
 }
 
@@ -1929,5 +2033,315 @@ mod tests {
             BindError::TableHasNoHeader(name) => assert_eq!(name.as_ref(), "SALES"),
             other => panic!("expected TableHasNoHeader, got {other:?}"),
         }
+    }
+
+    // ===================================================================
+    // W5-140 (Phase 4.9.C binder) — R1C1 lowering to absolute CellRef.
+    // ===================================================================
+
+    use ql_types::Address;
+
+    fn r1c1_expr(row: AxisSpec, col: AxisSpec) -> Expr {
+        Expr::R1C1Ref {
+            sheet: SheetRef::Current,
+            row_axis: row,
+            col_axis: col,
+        }
+    }
+
+    fn bind_r1c1_at(expr: &Expr, anchor: Address) -> Result<ExprPlan, BindError> {
+        bind_with_site(
+            expr,
+            BindSite::at_cell(anchor),
+            &EmptyNameLookup,
+            &EmptySheetResolver,
+            &EmptyTableLookup,
+        )
+    }
+
+    fn bind_r1c1_no_anchor(expr: &Expr) -> Result<ExprPlan, BindError> {
+        bind_with_site(
+            expr,
+            BindSite::sheet_only(0),
+            &EmptyNameLookup,
+            &EmptySheetResolver,
+            &EmptyTableLookup,
+        )
+    }
+
+    /// **Absolute axes lower with the anchor's sheet.** `R3C5` →
+    /// `CellRef { row: 2, col: 4, abs_row: true, abs_col: true }`.
+    #[test]
+    fn r1c1_bind_absolute_lowers_to_cellref() {
+        let expr = r1c1_expr(AxisSpec::Abs(3), AxisSpec::Abs(5));
+        let p = bind_r1c1_at(
+            &expr,
+            Address {
+                sheet: 0,
+                row: 0,
+                col: 0,
+            },
+        )
+        .unwrap();
+        match p {
+            ExprPlan::CellRef {
+                sheet,
+                row,
+                col,
+                abs_col,
+                abs_row,
+            } => {
+                assert_eq!(sheet, 0);
+                assert_eq!(row, 2);
+                assert_eq!(col, 4);
+                assert!(abs_row);
+                assert!(abs_col);
+            }
+            other => panic!("expected ExprPlan::CellRef, got {other:?}"),
+        }
+    }
+
+    /// **Relative axes lower against the anchor.** Anchor at (5, 5),
+    /// `R[-1]C[2]` → `CellRef { row: 4, col: 7, abs_row: false,
+    /// abs_col: false }`.
+    #[test]
+    fn r1c1_bind_relative_lowers_against_anchor() {
+        let expr = r1c1_expr(AxisSpec::Rel(-1), AxisSpec::Rel(2));
+        let p = bind_r1c1_at(
+            &expr,
+            Address {
+                sheet: 0,
+                row: 5,
+                col: 5,
+            },
+        )
+        .unwrap();
+        match p {
+            ExprPlan::CellRef {
+                row,
+                col,
+                abs_col,
+                abs_row,
+                ..
+            } => {
+                assert_eq!(row, 4);
+                assert_eq!(col, 7);
+                assert!(!abs_row);
+                assert!(!abs_col);
+            }
+            other => panic!("expected ExprPlan::CellRef, got {other:?}"),
+        }
+    }
+
+    /// **Bare `RC` (Rel(0)) on both axes resolves to the anchor cell.**
+    #[test]
+    fn r1c1_bind_bare_rc_resolves_to_anchor() {
+        let expr = r1c1_expr(AxisSpec::Rel(0), AxisSpec::Rel(0));
+        let p = bind_r1c1_at(
+            &expr,
+            Address {
+                sheet: 0,
+                row: 10,
+                col: 7,
+            },
+        )
+        .unwrap();
+        match p {
+            ExprPlan::CellRef { row, col, .. } => {
+                assert_eq!(row, 10);
+                assert_eq!(col, 7);
+            }
+            other => panic!("expected ExprPlan::CellRef, got {other:?}"),
+        }
+    }
+
+    /// **Mixed axes lower correctly with per-axis abs flags.** `R1C[2]`
+    /// at anchor (5, 5) → CellRef { row: 0, col: 7, abs_row: true,
+    /// abs_col: false }.
+    #[test]
+    fn r1c1_bind_mixed_abs_row_rel_col_per_axis_flags() {
+        let expr = r1c1_expr(AxisSpec::Abs(1), AxisSpec::Rel(2));
+        let p = bind_r1c1_at(
+            &expr,
+            Address {
+                sheet: 0,
+                row: 5,
+                col: 5,
+            },
+        )
+        .unwrap();
+        match p {
+            ExprPlan::CellRef {
+                row,
+                col,
+                abs_row,
+                abs_col,
+                ..
+            } => {
+                assert_eq!(row, 0);
+                assert_eq!(col, 7);
+                assert!(abs_row);
+                assert!(!abs_col);
+            }
+            other => panic!("expected ExprPlan::CellRef, got {other:?}"),
+        }
+    }
+
+    /// **Relative axis without anchor fails loudly.** Bind site has
+    /// `cell: None` → `R1C1RequiresAnchor`. Closes design § 3.1
+    /// "bind-time resolution requires anchor."
+    #[test]
+    fn r1c1_bind_relative_without_anchor_rejected() {
+        let expr = r1c1_expr(AxisSpec::Rel(0), AxisSpec::Rel(0));
+        let err = bind_r1c1_no_anchor(&expr).unwrap_err();
+        assert!(matches!(err, BindError::R1C1RequiresAnchor));
+    }
+
+    /// **All-absolute R1C1 binds even without an anchor.** No anchor
+    /// is required when both axes are absolute.
+    #[test]
+    fn r1c1_bind_absolute_no_anchor_still_works() {
+        let expr = r1c1_expr(AxisSpec::Abs(1), AxisSpec::Abs(1));
+        let p = bind_r1c1_no_anchor(&expr).unwrap();
+        match p {
+            ExprPlan::CellRef { row, col, .. } => {
+                assert_eq!(row, 0);
+                assert_eq!(col, 0);
+            }
+            other => panic!("expected ExprPlan::CellRef, got {other:?}"),
+        }
+    }
+
+    /// **Relative offset that underflows the grid → R1C1OutOfBounds.**
+    /// Anchor at (0, 0), `R[-1]C` → resolved row would be -1.
+    #[test]
+    fn r1c1_bind_relative_underflow_rejected() {
+        let expr = r1c1_expr(AxisSpec::Rel(-1), AxisSpec::Rel(0));
+        let err = bind_r1c1_at(
+            &expr,
+            Address {
+                sheet: 0,
+                row: 0,
+                col: 0,
+            },
+        )
+        .unwrap_err();
+        match err {
+            BindError::R1C1OutOfBounds { resolved_row, .. } => {
+                assert_eq!(resolved_row, Some(-1));
+            }
+            other => panic!("expected R1C1OutOfBounds, got {other:?}"),
+        }
+    }
+
+    /// **Relative offset that overflows the grid → R1C1OutOfBounds.**
+    /// Anchor at MAX_ROW, `R[1]C` → resolved row exceeds MAX_ROW.
+    #[test]
+    fn r1c1_bind_relative_overflow_rejected() {
+        let expr = r1c1_expr(AxisSpec::Rel(1), AxisSpec::Rel(0));
+        let err = bind_r1c1_at(
+            &expr,
+            Address {
+                sheet: 0,
+                row: MAX_ROW,
+                col: 0,
+            },
+        )
+        .unwrap_err();
+        match err {
+            BindError::R1C1OutOfBounds { resolved_row, .. } => {
+                assert_eq!(resolved_row, Some(MAX_ROW as i64 + 1));
+            }
+            other => panic!("expected R1C1OutOfBounds, got {other:?}"),
+        }
+    }
+
+    /// **Sheet ref resolved at bind time.** `Sheet1!R1C1` with the
+    /// SheetResolver mapping `Sheet1 → 7` lowers to
+    /// `CellRef { sheet: 7, .. }`.
+    #[test]
+    fn r1c1_bind_sheet_qualified_resolves_sheet_id() {
+        struct OneSheet;
+        impl SheetResolver for OneSheet {
+            fn resolve_sheet(&self, name: &str) -> Option<SheetId> {
+                if name.eq_ignore_ascii_case("Sheet1") {
+                    Some(7)
+                } else {
+                    None
+                }
+            }
+        }
+        let expr = Expr::R1C1Ref {
+            sheet: SheetRef::Name(Arc::from("Sheet1")),
+            row_axis: AxisSpec::Abs(3),
+            col_axis: AxisSpec::Abs(5),
+        };
+        let p = bind_with_site(
+            &expr,
+            BindSite::at_cell(Address {
+                sheet: 0,
+                row: 0,
+                col: 0,
+            }),
+            &EmptyNameLookup,
+            &OneSheet,
+            &EmptyTableLookup,
+        )
+        .unwrap();
+        match p {
+            ExprPlan::CellRef { sheet, .. } => assert_eq!(sheet, 7),
+            other => panic!("expected ExprPlan::CellRef, got {other:?}"),
+        }
+    }
+
+    /// **Unknown sheet on R1C1 ref surfaces UnknownSheet.** Mirrors
+    /// the existing CellRef-side behavior.
+    #[test]
+    fn r1c1_bind_unknown_sheet_errors() {
+        let expr = Expr::R1C1Ref {
+            sheet: SheetRef::Name(Arc::from("Missing")),
+            row_axis: AxisSpec::Abs(1),
+            col_axis: AxisSpec::Abs(1),
+        };
+        let err = bind_r1c1_no_anchor(&expr).unwrap_err();
+        match err {
+            BindError::UnknownSheet(n) => assert_eq!(n.as_ref(), "Missing"),
+            other => panic!("expected UnknownSheet, got {other:?}"),
+        }
+    }
+
+    /// **Absolute axis at the grid boundary lowers OK.** `R1048576C16384`
+    /// = (MAX_ROW + 1, MAX_COLUMN + 1) in source 1-indexed form →
+    /// row MAX_ROW, col MAX_COLUMN in 0-indexed bound form.
+    #[test]
+    fn r1c1_bind_absolute_at_grid_boundary() {
+        let expr = r1c1_expr(AxisSpec::Abs(MAX_ROW + 1), AxisSpec::Abs(MAX_COLUMN + 1));
+        let p = bind_r1c1_no_anchor(&expr).unwrap();
+        match p {
+            ExprPlan::CellRef { row, col, .. } => {
+                assert_eq!(row, MAX_ROW);
+                assert_eq!(col, MAX_COLUMN);
+            }
+            other => panic!("expected ExprPlan::CellRef, got {other:?}"),
+        }
+    }
+
+    /// **Absolute axis exceeding grid bound → R1C1OutOfBounds.**
+    /// Defense-in-depth — lexer already rejects this via
+    /// `RowTooLarge`, but the binder is the second line of defense
+    /// (direct AST construction can bypass the lexer).
+    #[test]
+    fn r1c1_bind_absolute_overflow_rejected() {
+        let expr = r1c1_expr(AxisSpec::Abs(MAX_ROW + 2), AxisSpec::Abs(1));
+        let err = bind_r1c1_no_anchor(&expr).unwrap_err();
+        assert!(matches!(err, BindError::R1C1OutOfBounds { .. }));
+    }
+
+    /// **Variant_kind reports "R1C1Ref" for R1C1 forms.** Used by
+    /// the array-cell rejection diagnostic.
+    #[test]
+    fn r1c1_variant_kind_string() {
+        let expr = r1c1_expr(AxisSpec::Abs(1), AxisSpec::Abs(1));
+        assert_eq!(variant_kind(&expr), "R1C1Ref");
     }
 }
