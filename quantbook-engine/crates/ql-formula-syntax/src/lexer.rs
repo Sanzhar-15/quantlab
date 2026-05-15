@@ -102,10 +102,12 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
 /// - **W5-135 (4.9.B.2):** `locale.decimal_separator` wired into the
 ///   number-literal lex loop (`lex_number`). In `Locale::De` /
 ///   `Locale::Fr`, `2,34` lexes as `Number(2.34)`; in `Locale::EnUs`
-///   the historical `.` decimal stays unchanged. `2.34` in DE / FR
-///   lexes as `Number(2)` followed by a bare `.` that downstream
-///   arms reject — IronCalc-canonical "DE doesn't accept dot
-///   decimals" behavior.
+///   the historical `.` decimal stays unchanged. In DE / FR, `2.34`
+///   was originally expected to surface a lex error at the bare `.`
+///   — but W5-136 added a pre-dispatch that intercepts DE `.` as
+///   `Token::Semicolon` (the array-row separator), so the post-W5-136
+///   reality is `[Number(2), Semicolon, Number(34)]` (three tokens,
+///   parser rejects later).
 /// - **W5-136 (4.9.B.3):** locale-aware argument + array separators dispatched at the top of the lex loop.
 ///
 /// W5-136 detail: EN keeps `,` → `Comma` + `;` → `Semicolon` exactly;
@@ -123,6 +125,9 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
 /// This split lets each behavior change land as an independent commit
 /// with its own test coverage, instead of an atomic ~2k-line lexer
 /// rewrite.
+// TODO(4.9.B.4): remove `#[allow(unused_variables)]` when `mode` is
+// consumed by R1C1-token dispatch. Until then, `mode` is accepted
+// for signature parity but not yet read by the lex state machine.
 #[allow(unused_variables)]
 pub fn lex_with(input: &str, mode: ReferenceMode, locale: Locale) -> Result<Vec<Token>, LexError> {
     let locale_data = crate::locale::locale_data(locale);
@@ -1461,7 +1466,9 @@ mod tests {
 
     #[test]
     fn unexpected_char_errors() {
-        // `@` is structured-ref territory (Phase 3+). Phase 0 lexer rejects.
+        // `@` is the implicit-intersection operator (Phase 4.9.G). Before
+        // that ships, the lexer rejects `@` as unexpected. This test
+        // will need to be deleted or inverted in the 4.9.G commit.
         assert!(matches!(lex("@"), Err(LexError::UnexpectedChar('@'))));
         // `{` was rejected pre-W5-97 (Phase 4.7.C); now accepted as
         // `Token::LBrace`. The replacement assertion (lex_ok) lives in
@@ -2309,36 +2316,28 @@ mod tests {
         );
     }
 
-    /// **DE rejects `.` as decimal.** Per IronCalc's
-    /// `test_german_locale_does_not_parse` reference: `2.34e-3` in DE
-    /// lexes as `Number(2.0)` followed by an illegal `.` (because in
-    /// DE, `.` is the array-row separator, not the decimal). 4.9.B.2
-    /// implementation: number-lex breaks at `.` in DE; the dispatch
-    /// then sees `.` and falls to `'0'..='9' | <decimal_sep>` — but
-    /// the decimal_sep arm fires only when `c == decimal_sep`, which
-    /// in DE is `,` not `.`. So `.` falls through to the default
-    /// arm → `UnexpectedChar('.')`.
+    /// **DE doesn't accept `.` as decimal.** Post-W5-136 outcome:
+    /// number-lex consumes the `2`, breaks at `.` (not a digit, not
+    /// DE's decimal_sep `,`, not exponent). The next loop iteration's
+    /// pre-dispatch intercepts `.` as `Token::Semicolon` (DE's array-
+    /// row separator). Then `34` lex as another number. Result:
+    /// `[Number(2), Semicolon, Number(34)]` — three tokens, not one
+    /// `Number(2.34)`. The parser rejects this stream as invalid
+    /// expression syntax (a number can't follow a Semicolon outside
+    /// an array literal); the lexer is correct.
+    ///
+    /// Originally (pre-W5-136) the `.` would have surfaced as
+    /// `UnexpectedChar`; that path is no longer reachable. Tightened
+    /// per Sonnet mid-arc-audit L-5 to assert the exact post-W5-136
+    /// token stream rather than a too-broad "not Number(2.34)".
     #[test]
-    fn de_locale_rejects_dot_decimal() {
-        let result = lex_with("2.34", ReferenceMode::A1, Locale::De);
-        // Either `2.34` returns a number 2 + Illegal `.` + number 34,
-        // OR errors entirely depending on dispatch. The contract is
-        // "dot is NOT decimal in DE." Pin via `err` OR `[Number(2),
-        // ...]` where `...` contains something other than digits-as-
-        // continuation. Either way `Number(2.34)` must NOT appear.
-        match result {
-            Ok(tokens) => {
-                assert_ne!(
-                    tokens,
-                    vec![Token::Number(2.34)],
-                    "DE must not lex `2.34` as Number(2.34)"
-                );
-            }
-            Err(LexError::UnexpectedChar('.')) => {
-                // Acceptable — `.` rejected.
-            }
-            Err(other) => panic!("unexpected error: {other:?}"),
-        }
+    fn de_locale_dot_not_decimal_splits_into_three_tokens() {
+        let tokens = lex_with("2.34", ReferenceMode::A1, Locale::De).unwrap();
+        assert_eq!(
+            tokens,
+            vec![Token::Number(2.0), Token::Semicolon, Token::Number(34.0)],
+            "DE `2.34` must lex as three tokens, not Number(2.34)"
+        );
     }
 
     /// **Scientific notation in DE.** `2,5e-3` should lex as
@@ -2492,26 +2491,39 @@ mod tests {
         );
     }
 
-    /// **DE `,` outside number context** — `,` is decimal_sep in DE.
-    /// At the loop boundary, `,` falls through pre-dispatch (not a
-    /// role-glyph in DE) AND falls through the digit arm. It hits
-    /// the `c if c == decimal_sep` arm → starts a number. Number-lex
-    /// reads `,` as `.`, raw becomes `.`, parses as 0.0. So `,`
-    /// standalone in DE is `Number(0.0)` followed by whatever's
-    /// next. Pin via `,5,3` → `Number(0.5), Number(0.3)` (no comma
-    /// token between — the comma is consumed as part of each number
-    /// start; the gap shows up only if there's a non-digit / non-
-    /// arg separator between).
+    /// **DE separator dispatch — happy path.** `5;6` in DE: `5` →
+    /// Number, `;` → Comma (DE's arg separator, intercepted by pre-
+    /// dispatch), `6` → Number. Pinned tightly to the role-token
+    /// invariance contract.
     ///
-    /// Edge case: `,5;3` in DE → `Number(0.5), Number(0.3)` because
-    /// `;` is the arg sep (intercepted as Comma) before second number.
+    /// Closes Codex mid-arc-audit LOW on the prior stale comment
+    /// which incorrectly claimed bare `,` in DE produces
+    /// `Number(0.0)`. Actual behavior: bare `,` (no following digit)
+    /// triggers `lex_number` to consume `,` (it's decimal_sep in
+    /// DE), translate to raw `"."`, hit EOF or non-digit, then
+    /// `"."`-parse fails → `LexError::InvalidNumber(".")`. NOT
+    /// `Number(0.0)`. The case is documented for future-self
+    /// reference but not exercised in this test (the happy path is
+    /// the load-bearing pin).
     #[test]
     fn de_locale_separator_pair_dispatch_disambiguates_correctly() {
-        // `5;6` in DE: 5 → Number, ; → Comma (arg sep), 6 → Number.
         let tokens = lex_with("5;6", ReferenceMode::A1, Locale::De).unwrap();
         assert_eq!(
             tokens,
             vec![Token::Number(5.0), Token::Comma, Token::Number(6.0)]
         );
+    }
+
+    /// **DE bare `,` errors loudly.** Pins the actual behavior
+    /// (`InvalidNumber(".")`) corrected from the stale prior claim
+    /// in `de_locale_separator_pair_dispatch_disambiguates_correctly`'s
+    /// docstring. Closes Codex mid-arc-audit LOW.
+    #[test]
+    fn de_locale_bare_comma_errors_invalid_number() {
+        let result = lex_with(",", ReferenceMode::A1, Locale::De);
+        match result {
+            Err(LexError::InvalidNumber(s)) => assert_eq!(s, "."),
+            other => panic!("expected InvalidNumber(\".\"), got {other:?}"),
+        }
     }
 }

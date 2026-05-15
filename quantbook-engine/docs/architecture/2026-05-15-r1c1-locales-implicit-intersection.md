@@ -45,7 +45,7 @@ Three orthogonal concerns share enough infrastructure to merit a single phase:
 ### 3.2 Locales
 
 Locales we ship:
-- `en` — `,` arg, `.` decimal, `,` array row, `;` array col (matches Phase 4.7 default).
+- `en` — `,` arg, `.` decimal, `;` array row, `,` array col (matches Phase 4.7 default `{1,2;3,4}`).
 - `de` — `;` arg, `,` decimal, `.` array row, `\\` array col (per IronCalc CLDR; tentative — pin during 4.9.E).
 - `fr` — `;` arg, `,` decimal, `.` array row, `\\` array col.
 
@@ -169,11 +169,14 @@ Each sub-phase: 1 commit + 7 gates green + self-audit. Codex pull-ups at major m
 | # | Sub-phase | Subject |
 |---|---|---|
 | 0 | **4.9.AA** | This design doc + Codex + Sonnet pass-1 review (doc only) |
-| 1 | **4.9.A** | `ReferenceMode` / `LocaleId` / `LocaleData` in `ql-formula-syntax`; `Workbook::reference_mode` / `locale` accessors in `ql-storage` |
-| 2 | **4.9.B** | Lexer: new `Token::R1C1Ref { row_axis: AxisSpec, col_axis: AxisSpec }` where `AxisSpec` carries `kind: Abs(i64)|Rel(i64)`; locale-parameterized separator + decimal lexing (incl. array literal separators per Codex HIGH-4) |
+| 1 | **4.9.A** (W5-133, shipped) | `ReferenceMode` + `Locale {EnUs, De, Fr}` in `ql-types::eval_context`; `LocaleData` + `locale_data()` in `ql-formula-syntax::locale`; `Workbook::reference_mode` / `locale` accessors in `ql-storage`. Layering refined during implementation — enums in `ql-types`, separator data in `ql-formula-syntax`, no new dep-graph edge. |
+| 2a | **4.9.B.1** (W5-134, shipped) | `lex_with(input, mode, locale)` signature scaffolding. `lex(input)` becomes a backward-compat shim. No behavior change. |
+| 2b | **4.9.B.2** (W5-135, shipped) | Locale-aware decimal separator in `lex_number`. DE `2,34` → `Number(2.34)`. EN unchanged. Subsumed the original 4.9.E "locale-aware number lexer" row below. |
+| 2c | **4.9.B.3** (W5-136, shipped) | Locale-aware arg + array separators via pre-dispatch. EN keeps `,`→`Comma`+`;`→`Semicolon`; DE/FR remap source glyphs to canonical role-tokens. Parser sees the SAME token vocab regardless of locale. |
+| 2d | **4.9.B.4** | Lexer R1C1 mode — new `Token::R1C1Ref { row_axis: AxisSpec, col_axis: AxisSpec }` where `AxisSpec` carries `kind: Abs(u32) \| Rel(i32)`. `mode == R1C1` triggers R1C1-token emission. |
 | 3 | **4.9.C** | Parser: accepts `Token::R1C1Ref` + emits `Expr::CellRef` with intermediate relative/absolute markers; reject mixed-relativity range endpoints with dedicated `ParseError::R1C1MixedRelativity` (closes Codex MEDIUM + Sonnet H-4) |
 | 4 | **4.9.D** | Printer: `print_with(expr, mode, locale, site)` emits A1 or R1C1 (locale-aware separators), uses `site` for relative R1C1 output; fail-loud on missing `site` for R1C1 |
-| 5 | **4.9.E** | Locale-aware lexer for numbers — DE `2,34` vs EN `2.34` context-free rules; test vector table per § 3.2 |
+| 5 | **4.9.E** | ~~Locale-aware lexer for numbers~~ — SHIPPED EARLY as 4.9.B.2. Row retained for numbering continuity. (Originally planned here; folded into the B micro-split during implementation.) |
 | 6 | **4.9.F** | Locale-aware printer for numbers + arrays + arg lists |
 | 7 | **4.9.G** | `Token::At` (standalone `@`) + `Expr::ImplicitIntersection` AST variant; parser handles `=@expr`, `=@SUM(...)`, `=Sheet1!@A1`; all walkers + printer + `plan::variant_kind` updated per § 4.2 touchpoint list |
 | 8 | **4.9.H** | Binder + eval — `ExprPlan::ImplicitIntersection`; eval narrows per § 3.3 rules using `BindSite::at_cell`; out-of-range → `#VALUE!` |
