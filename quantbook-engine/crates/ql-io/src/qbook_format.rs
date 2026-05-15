@@ -1759,11 +1759,17 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                     reason: "duplicate canonical table name in [[tables.entries]]".into(),
                 });
             }
-            // Shared namespace with NameTable (workbook + sheet-scoped).
-            // NameTable hydration ran above, so any prior conflicts are
-            // already in `wb.names()` / sheet scoped_names. We check
-            // workbook-scoped only; sheet-scoped collisions are caught
-            // by the canonical-name comparison via `lookup_ci`.
+            // Shared namespace with NameTable. NameTable hydration ran
+            // above; workbook-scoped conflicts are checked here via
+            // `lookup_ci`. **Sheet-scoped name collisions are
+            // intentionally NOT checked** — `WorkbookRuntime::create_table`
+            // also only checks workbook-scoped names, so loader and
+            // runtime are consistent (design § 13 #3: sheet-scoped
+            // names shadow workbook-scoped within their sheet, and
+            // tables are workbook-scoped, so the binder resolves them
+            // from separate paths). Closing this is a wider design
+            // change that belongs to a future polish wave, not the
+            // loader.
             if wb.names().lookup_ci(&canonical_upper).is_some() {
                 return Err(QbookError::MalformedTable {
                     name: entry.name.clone(),
@@ -1811,7 +1817,17 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                     }
                 }
             }
-            let canonical: std::sync::Arc<str> = std::sync::Arc::from(entry.name.as_str());
+            // **W5-128 (Phase 4.8.O.4 — Codex closure-verify MEDIUM-1 second-pass):**
+            // insert under the UPPERCASE canonical, not the raw
+            // `entry.name`. Engine-saved files always have uppercase
+            // `entry.name`, but a hand-edited TOML with mixed-case
+            // (`name = "Sales"`) would otherwise enter the HashMap
+            // under key "Sales" while `TableTable::lookup` uppercases
+            // every query — silently making the table unfindable.
+            // The new pin in `load_normalizes_mixed_case_table_name`
+            // catches the regression at boundary cases the W5-126
+            // tests missed (those used identical uppercase names).
+            let canonical: std::sync::Arc<str> = std::sync::Arc::from(canonical_upper.as_str());
             let columns: Vec<ql_storage::TableColumn> = entry
                 .columns
                 .into_iter()
@@ -4426,5 +4442,121 @@ display = "Y"
         let loaded = load_workbook(&path).expect("non-overlapping tables must load");
         assert!(loaded.lookup_table("A").is_some());
         assert!(loaded.lookup_table("B").is_some());
+    }
+
+    // ===== W5-128 (Phase 4.8.O.4) — Codex closure-verify MEDIUM-1 second-pass =====
+
+    /// **W5-128 / Codex closure-verify MEDIUM-1:** the loader inserts
+    /// under `canonical_upper`, not the raw `entry.name`. A hand-
+    /// edited TOML with `name = "Sales"` (mixed case) loaded under
+    /// the raw key would have been silently unfindable since
+    /// `TableTable::lookup` uppercases every query. After the fix,
+    /// the table is reachable via the canonical (uppercase) key
+    /// regardless of how `entry.name` was cased on disk.
+    #[test]
+    fn load_normalizes_mixed_case_table_name() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mixed.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        // `entry.name = "Sales"` — mixed-case. Loader must uppercase
+        // before inserting so subsequent lookups find it.
+        let toml = r#"
+schema_version = 6
+name = "mixed"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "Sheet1", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+
+[[tables.entries]]
+name = "Sales"
+display_name = "Sales"
+sheet = 0
+top_row = 0
+top_col = 0
+rows = 2
+cols = 1
+has_header = true
+has_totals = false
+
+[[tables.entries.columns]]
+id = 0
+name = "qty"
+display = "Qty"
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let loaded = load_workbook(&path).expect("mixed-case name must normalize");
+        // Loader must canonicalize the key — `lookup_table` uppercases
+        // every query, so the table must be findable.
+        let meta = loaded
+            .lookup_table("Sales")
+            .expect("table findable post-load");
+        // `meta.name` is the canonical (uppercase) form per design.
+        assert_eq!(meta.name.as_ref(), "SALES");
+        // `meta.display_name` preserves the case-preserving form
+        // straight from the on-disk `display_name`.
+        assert_eq!(meta.display_name.as_ref(), "Sales");
+    }
+
+    /// **W5-128 / Codex closure-verify MEDIUM-1:** two entries with
+    /// the SAME canonical name but DIFFERENT cases (`"Sales"` and
+    /// `"SALES"`). Pre-fix the W5-126 duplicate check missed this
+    /// because the first insert keyed by raw `"Sales"` and the
+    /// second's `lookup("SALES")` returned None against the
+    /// mixed-case key. Post-fix both inserts canonicalize and the
+    /// duplicate-name error fires.
+    #[test]
+    fn malformed_table_rejected_when_mixed_case_duplicate_canonical_name() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = r#"
+schema_version = 6
+name = "bad"
+date_system = "1900"
+sheets = [
+  { id = 0, name = "Sheet1", chunk_rows = 16384, row_extent = 0, col_extent = 0 },
+]
+
+[[tables.entries]]
+name = "Sales"
+display_name = "Sales"
+sheet = 0
+top_row = 0
+top_col = 0
+rows = 2
+cols = 1
+has_header = true
+has_totals = false
+
+[[tables.entries.columns]]
+id = 0
+name = "qty"
+display = "Qty"
+
+[[tables.entries]]
+name = "SALES"
+display_name = "Sales"
+sheet = 0
+top_row = 10
+top_col = 0
+rows = 2
+cols = 1
+has_header = true
+has_totals = false
+
+[[tables.entries.columns]]
+id = 1
+name = "qty"
+display = "Qty"
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let err = load_workbook(&path).unwrap_err();
+        assert!(
+            matches!(err, QbookError::MalformedTable { ref reason, .. } if reason.contains("duplicate canonical table name")),
+            "expected MalformedTable about duplicate canonical, got {err:?}"
+        );
     }
 }
