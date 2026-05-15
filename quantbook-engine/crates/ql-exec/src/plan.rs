@@ -2916,3 +2916,7 @@ mod tests {
             &EmptySheetResolver,
             &EmptyTableLookup,
         )
+        .unwrap_err();
+        assert!(matches!(err, BindError::ImplicitIntersectionRequiresAnchor));
+    }
+}

@@ -124,6 +124,27 @@ use thiserror::Error;
 ///     optional TotalsFunction). v1-v5 envelopes omit; loader treats
 ///     `None` as "no tables registered."
 ///
+/// **W5-145 (Phase 4.9.I):** bumped to v7. v7 adds:
+///   - top-level `reference_mode: Option<ReferenceModeWire>` —
+///     workbook-scope R1C1/A1 preference (W5-133). `None` on v1-v6
+///     and on v7-when-default; loader maps `None` to `ReferenceMode::A1`.
+///   - top-level `locale: Option<LocaleWire>` — workbook-scope EnUs/De/Fr
+///     preference (W5-133). `None` on v1-v6 and on v7-when-default;
+///     loader maps `None` to `Locale::EnUs`.
+///
+/// **Two-phase load (closes Sonnet H-2):** `load_workbook` first
+/// deserializes `SchemaVersionProbe { schema_version: u32 }`,
+/// checks the range, then deserializes the full `WorkbookEnvelope`.
+/// This means a v6 reader sees a v7 file's `schema_version: 7` and
+/// errors with `UnsupportedSchema { found: 7 }` BEFORE serde tries
+/// (and fails) to apply `deny_unknown_fields` to the new fields.
+///
+/// **v7-fields-on-v6-file rejected (closes Codex HIGH-5):** post-
+/// deserialize loader assertion — if `schema_version < 7`, both
+/// `reference_mode` and `locale` MUST be `None`. A hand-edited v6
+/// file with v7 fields surfaces as `QbookError::ForwardCompatFieldOnOldVersion`
+/// rather than silently dropping the field.
+///
 /// **Compatibility (design § 10.3 + MEDIUM-7 closure):**
 ///   - v6 reader loading v1-v5: tables field absent → empty TableTable.
 ///   - v5 reader loading v6: refused via the existing
@@ -132,8 +153,11 @@ use thiserror::Error;
 ///     break formulas referencing `Sales[Qty]` after re-load (the
 ///     formula would surface `BindError::UnknownTable` → `#NAME?`
 ///     where pre-save it was a valid SUM).
-///   - v6 reader writing v5-compat: NOT supported in 4.8 (Phase 5+).
-pub const WORKBOOK_SCHEMA_VERSION: u32 = 6;
+///   - v7 reader loading v1-v6: `reference_mode` + `locale` absent
+///     → default A1 / EnUs (regression-neutral).
+///   - v6 reader loading v7: refused via the two-phase probe →
+///     loud `UnsupportedSchema { found: 7 }`.
+pub const WORKBOOK_SCHEMA_VERSION: u32 = 7;
 
 /// The earliest schema version this reader still accepts. v1 fixtures (Phase 1)
 /// continue to load on v2 binaries; older versions would need explicit handling.
@@ -276,6 +300,29 @@ pub enum QbookError {
     /// producing a table that fails to bind formulas downstream.
     #[error("malformed table {name:?}: {reason}")]
     MalformedTable { name: String, reason: String },
+
+    /// **W5-145 (Phase 4.9.I):** the envelope's `locale` field has a
+    /// string value that doesn't match any known locale. Per design §
+    /// 4.9.I closure of Sonnet M-2 — a v7 file with `locale = "xx"`
+    /// surfaces this rather than silently substituting EnUs. Encoded
+    /// values: `"en"`, `"de"`, `"fr"`.
+    #[error("unknown locale {found:?} (expected one of: \"en\", \"de\", \"fr\")")]
+    UnknownLocale { found: String },
+
+    /// **W5-145 (Phase 4.9.I):** post-deserialize loader assertion
+    /// (closes Codex HIGH-5). A `.qbook` declaring `schema_version <
+    /// 7` but carrying v7-only fields (`reference_mode` or `locale`)
+    /// is malformed — either a hand-edited corruption or a buggy
+    /// down-converter. Surfaced loudly so the user fixes the file
+    /// rather than getting silent field-drop.
+    #[error(
+        "envelope at schema_version {schema_version} carries forward-compat field {field:?}; \
+         only v7+ envelopes may set this field"
+    )]
+    ForwardCompatFieldOnOldVersion {
+        schema_version: u32,
+        field: &'static str,
+    },
 }
 
 /// TOML envelope for the workbook. Top-level metadata.
@@ -316,6 +363,127 @@ pub struct WorkbookEnvelope {
     /// registered."
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tables: Option<TablesSection>,
+
+    /// **W5-145 (Phase 4.9.I):** workbook-scope reference mode (A1
+    /// vs R1C1) per W5-133. v7 envelopes carry the value when it's
+    /// non-default (R1C1); v1-v6 omit (loader maps `None` →
+    /// `ReferenceMode::A1`). Saved through
+    /// `Workbook::reference_mode()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_mode: Option<ReferenceModeWire>,
+
+    /// **W5-145 (Phase 4.9.I):** workbook-scope locale (EnUs / De /
+    /// Fr). v7 envelopes carry the value when it's non-default; v1-v6
+    /// omit (loader maps `None` → `Locale::EnUs`). Custom
+    /// deserializer surfaces unknown strings as
+    /// `QbookError::UnknownLocale` (closes Sonnet M-2). Saved through
+    /// `Workbook::locale()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<LocaleWire>,
+}
+
+/// **W5-145 (Phase 4.9.I):** schema-version probe for the two-phase
+/// load (closes Sonnet H-2). Deserialized FIRST to extract just
+/// the version field, then the full envelope is deserialized only
+/// after the version check passes. This means a v6 reader sees
+/// `schema_version: 7` and surfaces `UnsupportedSchema { found: 7 }`
+/// BEFORE serde tries (and fails with `deny_unknown_fields`) on
+/// the new v7 fields.
+#[derive(Deserialize)]
+struct SchemaVersionProbe {
+    schema_version: u32,
+}
+
+/// **W5-145 (Phase 4.9.I):** wire representation of `ReferenceMode`.
+/// Serialized as a string `"A1"` or `"R1C1"` for human-readable TOML.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReferenceModeWire {
+    A1,
+    R1C1,
+}
+
+impl ReferenceModeWire {
+    pub fn from_runtime(mode: ql_types::ReferenceMode) -> Self {
+        match mode {
+            ql_types::ReferenceMode::A1 => Self::A1,
+            ql_types::ReferenceMode::R1C1 => Self::R1C1,
+        }
+    }
+
+    pub fn to_runtime(self) -> ql_types::ReferenceMode {
+        match self {
+            Self::A1 => ql_types::ReferenceMode::A1,
+            Self::R1C1 => ql_types::ReferenceMode::R1C1,
+        }
+    }
+}
+
+/// **W5-145 (Phase 4.9.I):** wire representation of `Locale`.
+/// Serialized as a short string `"en"` / `"de"` / `"fr"`. Unknown
+/// strings deserialize to `LocaleWire::Unknown(String)` so the
+/// loader can produce `QbookError::UnknownLocale` with the captured
+/// value (closes Sonnet M-2). Save path produces canonical short
+/// strings only (never `Unknown`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocaleWire {
+    En,
+    De,
+    Fr,
+    /// Set by the custom deserializer for any string that doesn't
+    /// match a known locale code. The loader rejects this with
+    /// `QbookError::UnknownLocale` AFTER deserialize succeeds.
+    Unknown(String),
+}
+
+impl LocaleWire {
+    pub fn from_runtime(locale: ql_types::Locale) -> Self {
+        match locale {
+            ql_types::Locale::EnUs => Self::En,
+            ql_types::Locale::De => Self::De,
+            ql_types::Locale::Fr => Self::Fr,
+        }
+    }
+
+    /// Convert to runtime `Locale`. Returns `Err(unknown_value)` if
+    /// the wire was `Unknown(_)`; the loader maps that to
+    /// `QbookError::UnknownLocale`.
+    pub fn to_runtime(self) -> Result<ql_types::Locale, String> {
+        match self {
+            Self::En => Ok(ql_types::Locale::EnUs),
+            Self::De => Ok(ql_types::Locale::De),
+            Self::Fr => Ok(ql_types::Locale::Fr),
+            Self::Unknown(s) => Err(s),
+        }
+    }
+}
+
+impl serde::Serialize for LocaleWire {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        let s = match self {
+            Self::En => "en",
+            Self::De => "de",
+            Self::Fr => "fr",
+            // Save path never produces Unknown (it's read-side only).
+            // If it ever did (e.g. a round-trip from a corrupted load)
+            // we'd serialize the original string verbatim, which is
+            // honest behavior — but `save_workbook` validates the
+            // workbook before write so this is defensive.
+            Self::Unknown(s) => s.as_str(),
+        };
+        ser.serialize_str(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for LocaleWire {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        Ok(match s.as_str() {
+            "en" => Self::En,
+            "de" => Self::De,
+            "fr" => Self::Fr,
+            _ => Self::Unknown(s),
+        })
+    }
 }
 
 /// **W5-71 (Phase 4.5.A.2):** wire representation of `ql_types::DateSystem`.
@@ -1256,6 +1424,21 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
         }
     };
 
+    // **W5-145 (Phase 4.9.I):** persist reference_mode + locale ONLY
+    // when non-default — keeps the TOML minimal for the common A1/EnUs
+    // case. v6→v7 readers see `None` for the default case (interpreted
+    // as A1/EnUs by the loader's default path); the field is only
+    // written when the workbook has been actively set to R1C1 or a
+    // non-EN locale.
+    let reference_mode_wire = match wb.reference_mode() {
+        ql_types::ReferenceMode::A1 => None,
+        mode => Some(ReferenceModeWire::from_runtime(mode)),
+    };
+    let locale_wire = match wb.locale() {
+        ql_types::Locale::EnUs => None,
+        locale => Some(LocaleWire::from_runtime(locale)),
+    };
+
     let envelope = WorkbookEnvelope {
         schema_version: WORKBOOK_SCHEMA_VERSION,
         name: name.to_owned(),
@@ -1267,6 +1450,9 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
         formats: formats_section,
         // **W5-123 (Phase 4.8.L):** persist workbook tables.
         tables: tables_section,
+        // **W5-145 (Phase 4.9.I):** persist non-default reference_mode + locale.
+        reference_mode: reference_mode_wire,
+        locale: locale_wire,
     };
     let toml_str = toml::to_string_pretty(&envelope)?;
     fs::write(dir.join("workbook.toml"), toml_str)?;
@@ -1429,19 +1615,64 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
         return Err(QbookError::MissingFile { file: toml_path });
     }
     let toml_str = fs::read_to_string(&toml_path)?;
-    let envelope: WorkbookEnvelope = toml::from_str(&toml_str)?;
 
-    // Phase 2A.8: accept schema versions in [MIN_SUPPORTED..=current].
-    // v1 envelopes load on v2 binaries (with `names: None`); future v3 will
-    // reject with this same path until callers explicitly opt in.
-    if envelope.schema_version < MIN_SUPPORTED_SCHEMA_VERSION
-        || envelope.schema_version > WORKBOOK_SCHEMA_VERSION
+    // **W5-145 (Phase 4.9.I):** two-phase load (closes Sonnet H-2).
+    // Phase 1: probe just the schema_version field. This lets a vN
+    // reader reject vN+1 files BEFORE serde encounters the new fields
+    // and trips `deny_unknown_fields` with a less informative
+    // `TomlDe` error. `SchemaVersionProbe` derives `Deserialize`
+    // without `deny_unknown_fields`, so it tolerates extra fields.
+    let probe: SchemaVersionProbe = toml::from_str(&toml_str)?;
+    if probe.schema_version < MIN_SUPPORTED_SCHEMA_VERSION
+        || probe.schema_version > WORKBOOK_SCHEMA_VERSION
     {
         return Err(QbookError::UnsupportedSchema {
-            found: envelope.schema_version,
+            found: probe.schema_version,
         });
     }
-    let is_v1 = envelope.schema_version == 1;
+    let schema_version = probe.schema_version;
+    // Phase 2: full envelope deserialization. Now that we know the
+    // version is in range, `deny_unknown_fields` runs against a
+    // shape that we know matches this build.
+    let envelope: WorkbookEnvelope = toml::from_str(&toml_str)?;
+
+    // **W5-145 (Phase 4.9.I):** post-deserialize assertion that v7-only
+    // fields aren't present on a v6-or-older envelope (closes Codex
+    // HIGH-5). serde's `#[serde(default)]` on the new fields means a
+    // hand-edited v6 file with `reference_mode = "R1C1"` would
+    // deserialize cleanly into a Some(_) without the version gate
+    // catching it. We catch it here and refuse loudly.
+    if schema_version < 7 {
+        if envelope.reference_mode.is_some() {
+            return Err(QbookError::ForwardCompatFieldOnOldVersion {
+                schema_version,
+                field: "reference_mode",
+            });
+        }
+        if envelope.locale.is_some() {
+            return Err(QbookError::ForwardCompatFieldOnOldVersion {
+                schema_version,
+                field: "locale",
+            });
+        }
+    }
+
+    // **W5-145 (Phase 4.9.I):** apply v7 fields if present. Unknown
+    // locale strings surface as `QbookError::UnknownLocale` (closes
+    // Sonnet M-2) — the custom Deserialize captured the string into
+    // `LocaleWire::Unknown(s)`; `to_runtime()` returns Err(s) here.
+    let reference_mode = envelope
+        .reference_mode
+        .map(|w| w.to_runtime())
+        .unwrap_or(ql_types::ReferenceMode::A1);
+    let locale = match envelope.locale.clone() {
+        Some(w) => w
+            .to_runtime()
+            .map_err(|found| QbookError::UnknownLocale { found })?,
+        None => ql_types::Locale::EnUs,
+    };
+
+    let is_v1 = schema_version == 1;
 
     // Phase 2A.13 audit cycle-3 H4: counter for legacy-pending migrations so we
     // can warn the user once per load (rather than silently corrupting any
@@ -1459,6 +1690,11 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
         wb.set_date_system(ds_wire.to_runtime());
     }
     // (Else: leave at Workbook::default(), which is Excel1900.)
+    // **W5-145 (Phase 4.9.I):** apply v7 reference_mode + locale.
+    // Defaults already enforced above; setting unconditionally is
+    // a no-op for the default (A1 / EnUs) case.
+    wb.set_reference_mode(reference_mode);
+    wb.set_locale(locale);
     // **W5-81 (Phase 4.5.D part 5):** apply the envelope's FormatsSection.
     // v4 envelopes carry custom format entries (id ≥ 164); v1-v3 don't.
     // Built-ins 0-163 are already in the FormatTable from
@@ -3320,13 +3556,16 @@ col_extent = 1
     /// **W5-123 (Phase 4.8.L):** updated from version 6 to version 7
     /// after v6 became the current ship version (adding workbook
     /// `tables` section for TableTable persistence).
+    /// **W5-145 (Phase 4.9.I):** updated from version 7 to version 8
+    /// after v7 became the current ship version (adding workbook
+    /// `reference_mode` + `locale` for the R1C1/locale preference).
     #[test]
     fn future_schema_version_rejected() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("future.qbook");
         fs::create_dir_all(path.join("sheets")).unwrap();
         let toml = r#"
-schema_version = 7
+schema_version = 8
 name = "future"
 
 [[sheets]]
@@ -3341,7 +3580,7 @@ col_extent = 0
 
         let result = load_workbook(&path);
         assert!(
-            matches!(result, Err(QbookError::UnsupportedSchema { found: 7 })),
+            matches!(result, Err(QbookError::UnsupportedSchema { found: 8 })),
             "expected UnsupportedSchema, got {result:?}"
         );
     }
@@ -3483,10 +3722,10 @@ col_extent = 0
     // ===== W5-92 (Phase 4.6.D) sheet-scoped names + schema v5 =====
 
     #[test]
-    fn schema_version_constant_is_six() {
+    fn schema_version_constant_is_seven() {
         // Sanity check so future bumps trip this test until the doc is updated.
-        // W5-123 (Phase 4.8.L) bumped from 5 to 6.
-        assert_eq!(WORKBOOK_SCHEMA_VERSION, 6);
+        // W5-145 (Phase 4.9.I) bumped from 6 to 7 (workbook reference_mode + locale).
+        assert_eq!(WORKBOOK_SCHEMA_VERSION, 7);
     }
 
     #[test]
@@ -4557,6 +4796,232 @@ display = "Qty"
         assert!(
             matches!(err, QbookError::MalformedTable { ref reason, .. } if reason.contains("duplicate canonical table name")),
             "expected MalformedTable about duplicate canonical, got {err:?}"
+        );
+    }
+
+    // ===================================================================
+    // W5-145 (Phase 4.9.I) — v7 schema bump tests.
+    // ===================================================================
+
+    /// **v7 default workbook round-trips with no `reference_mode` /
+    /// `locale` fields written.** Empty / default workbook omits both
+    /// fields per the save-side `if non-default` guard.
+    #[test]
+    fn v7_default_workbook_omits_reference_mode_and_locale() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.qbook");
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        save_workbook(&wb, "default", &path).unwrap();
+        let toml = fs::read_to_string(path.join("workbook.toml")).unwrap();
+        assert!(!toml.contains("reference_mode"));
+        assert!(!toml.contains("locale"));
+        // Reload and verify defaults.
+        let wb2 = load_workbook(&path).unwrap();
+        assert_eq!(wb2.reference_mode(), ql_types::ReferenceMode::A1);
+        assert_eq!(wb2.locale(), ql_types::Locale::EnUs);
+    }
+
+    /// **v7 R1C1 workbook writes + round-trips `reference_mode`.**
+    #[test]
+    fn v7_r1c1_workbook_round_trips_reference_mode() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("r1c1.qbook");
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        wb.set_reference_mode(ql_types::ReferenceMode::R1C1);
+        save_workbook(&wb, "r1c1", &path).unwrap();
+        let toml = fs::read_to_string(path.join("workbook.toml")).unwrap();
+        assert!(toml.contains("reference_mode = \"R1C1\""));
+        let wb2 = load_workbook(&path).unwrap();
+        assert_eq!(wb2.reference_mode(), ql_types::ReferenceMode::R1C1);
+        assert_eq!(wb2.locale(), ql_types::Locale::EnUs);
+    }
+
+    /// **v7 DE locale round-trips.**
+    #[test]
+    fn v7_de_locale_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("de.qbook");
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        wb.set_locale(ql_types::Locale::De);
+        save_workbook(&wb, "de", &path).unwrap();
+        let toml = fs::read_to_string(path.join("workbook.toml")).unwrap();
+        assert!(toml.contains("locale = \"de\""));
+        let wb2 = load_workbook(&path).unwrap();
+        assert_eq!(wb2.locale(), ql_types::Locale::De);
+    }
+
+    /// **FR locale round-trips.**
+    #[test]
+    fn v7_fr_locale_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fr.qbook");
+        let mut wb = Workbook::new();
+        wb.add_sheet("S");
+        wb.set_locale(ql_types::Locale::Fr);
+        save_workbook(&wb, "fr", &path).unwrap();
+        let wb2 = load_workbook(&path).unwrap();
+        assert_eq!(wb2.locale(), ql_types::Locale::Fr);
+    }
+
+    /// **Unknown locale string surfaces `UnknownLocale`.** Hand-written
+    /// v7 file with `locale = "xx"` rejects loudly (closes Sonnet M-2).
+    #[test]
+    fn v7_unknown_locale_string_rejected_with_captured_value() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad-locale.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = r#"
+schema_version = 7
+name = "bad"
+locale = "xx"
+
+[[sheets]]
+id = 0
+name = "S"
+chunk_rows = 16384
+row_extent = 0
+col_extent = 0
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let err = load_workbook(&path).unwrap_err();
+        match err {
+            QbookError::UnknownLocale { found } => assert_eq!(found, "xx"),
+            other => panic!("expected UnknownLocale, got {other:?}"),
+        }
+    }
+
+    /// **v6 file with `reference_mode` rejected as forward-compat field.**
+    /// Closes Codex HIGH-5.
+    #[test]
+    fn v6_file_with_reference_mode_rejected_as_forward_compat() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v6-rm.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = r#"
+schema_version = 6
+name = "v6"
+reference_mode = "R1C1"
+
+[[sheets]]
+id = 0
+name = "S"
+chunk_rows = 16384
+row_extent = 0
+col_extent = 0
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let err = load_workbook(&path).unwrap_err();
+        match err {
+            QbookError::ForwardCompatFieldOnOldVersion {
+                schema_version,
+                field,
+            } => {
+                assert_eq!(schema_version, 6);
+                assert_eq!(field, "reference_mode");
+            }
+            other => panic!("expected ForwardCompatFieldOnOldVersion, got {other:?}"),
+        }
+    }
+
+    /// **v6 file with `locale` rejected as forward-compat field.**
+    #[test]
+    fn v6_file_with_locale_rejected_as_forward_compat() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v6-loc.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = r#"
+schema_version = 6
+name = "v6"
+locale = "de"
+
+[[sheets]]
+id = 0
+name = "S"
+chunk_rows = 16384
+row_extent = 0
+col_extent = 0
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let err = load_workbook(&path).unwrap_err();
+        match err {
+            QbookError::ForwardCompatFieldOnOldVersion {
+                schema_version,
+                field,
+            } => {
+                assert_eq!(schema_version, 6);
+                assert_eq!(field, "locale");
+            }
+            other => panic!("expected ForwardCompatFieldOnOldVersion, got {other:?}"),
+        }
+    }
+
+    /// **v6 file with neither v7 field loads cleanly on v7 reader.**
+    /// Backward compat: v1-v6 files load with default A1/EnUs.
+    #[test]
+    fn v6_file_without_v7_fields_loads_with_defaults() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v6.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = r#"
+schema_version = 6
+name = "v6"
+
+[[sheets]]
+id = 0
+name = "S"
+chunk_rows = 16384
+row_extent = 0
+col_extent = 0
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let wb = load_workbook(&path).unwrap();
+        assert_eq!(wb.reference_mode(), ql_types::ReferenceMode::A1);
+        assert_eq!(wb.locale(), ql_types::Locale::EnUs);
+    }
+
+    /// **Two-phase load: a v6 reader hitting a v7 file's
+    /// `schema_version: 7` surfaces `UnsupportedSchema { found: 7 }`
+    /// even when the v7 file carries fields the v6 reader doesn't
+    /// recognize.** Closes Sonnet H-2: probe-first ensures the
+    /// version gate runs BEFORE deny_unknown_fields trips on the
+    /// new field.
+    ///
+    /// We can't run a true "v6 reader against v7 file" in this
+    /// test (the build IS v7), but the equivalent verification is
+    /// that `schema_version: 99` (any-out-of-range) is caught by
+    /// the probe AS-IS, not via the full envelope parse.
+    #[test]
+    fn two_phase_load_rejects_out_of_range_via_probe() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("oor.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let toml = r#"
+schema_version = 99
+name = "oor"
+# fields below would fail deny_unknown_fields on the full envelope,
+# but the probe-first design catches the version gate first:
+some_future_field = "ignored"
+
+[[sheets]]
+id = 0
+name = "S"
+chunk_rows = 16384
+row_extent = 0
+col_extent = 0
+"#;
+        fs::write(path.join("workbook.toml"), toml).unwrap();
+        fs::write(path.join("sheets").join("0.jsonl"), "").unwrap();
+        let result = load_workbook(&path);
+        assert!(
+            matches!(result, Err(QbookError::UnsupportedSchema { found: 99 })),
+            "expected UnsupportedSchema(99) via probe, got {result:?}"
         );
     }
 }
