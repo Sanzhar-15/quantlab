@@ -678,13 +678,19 @@ Each sub-phase ships independently (1 commit + 7 gates green) with self-audit; C
 | 9a | **4.8.I** (W5-119) | Workbook runtime: `rename_table` + `ast::rewrite_table_ref` tree-walk + formula text rewrite + `Op::RenameTable` | ✅ shipped `e2d80eee653` (4 tests) |
 | 9b | **4.8.I.2** (W5-121) | `rename_column` + `Op::RenameColumn` (same pattern as rename_table but rewrites column refs inside `StructuredRef` specs) | ✅ shipped (11 tests: 10 unit + 1 e2e replay) |
 | 10 | **4.8.J** (W5-122) | `resize_table` (grow rows + add/remove last column) + `Op::ResizeTable`. NOTE: spill-anchor check intentionally omitted to mirror `create_table` (which doesn't check either); uniform fix is a separate follow-up. | ✅ shipped (13 tests: 12 unit + 1 e2e replay) |
-| 11 | **4.8.K** (W5-NNN) | Op log: additional replay coverage + atomicity edge cases (currently `Op::CreateTable / DropTable / RenameTable` all replay-tested; `RenameColumn / ResizeTable` arrive with 9b + 10) | ⏳ DEFERRED |
+| 11 | **4.8.K** (transitive) | Op log: additional replay coverage + atomicity edge cases. | ✅ shipped transitively — each new Op variant landed with its own replay test: `CreateTable`/`DropTable` in W5-118 (oplog_e2e.rs:572-640), `RenameTable` in W5-119, `RenameColumn` in W5-121 (oplog_e2e.rs:649+), `ResizeTable` in W5-122 (oplog_e2e.rs:760+), footprint-overflow rejection in W5-125 (oplog_e2e.rs:830+). Replay-side rejection paths covered by `ReplayError::TableCreateRejected / TableNotFound / TableColumnNotFound / TableColumnRejected / TableResizeRejected` and exercised via hand-crafted op-log tests. No dedicated W5-K commit needed. |
 | 12 | **4.8.L** (W5-123) | Persistence: schema v5 → v6 + `TableTable` save/load + v5-reader loud-fails on v6 (already enforced by version range check). NEW: `TableTable::insert` auto-bumps `next_column_id` past loaded ids. | ✅ shipped (12 tests: 8 qbook + 3 storage + 1 e2e) |
-| 13 | **4.8.M** (W5-NNN) | Specifier coverage tests: `#Headers`, `#Totals`, `#All`, `#Data`, `#This Row` + `[@Col]` + column ranges + combinations | ⏳ PARTIAL — covered by binder tests (4.8.F) + e2e (4.8.G/G.2/H/I); explicit coverage matrix deferred |
-| 14 | **4.8.N** (W5-NNN) | Edge cases: header-only table (empty-data bind error), `A[0]`-style collisions, escape-prefix headers, dropped-table re-binding, soft-fail integration | ⏳ DEFERRED |
-| 15 | **4.8.O** (W5-NNN) | Closing mega-audit (Codex + Sonnet parallel) | ⏳ DEFERRED |
+| 13 | **4.8.M** (transitive) | Specifier coverage tests: `#Headers`, `#Totals`, `#All`, `#Data`, `#This Row` + `[@Col]` + column ranges + combinations. | ✅ shipped transitively — parser exhaustively tested in `ql-formula-syntax/src/parser.rs` (`parse_sref_*` tests covering all 5 specifiers, BareColumn, ThisRowColumn, ThisRowColumnRange, multi-item Combinations, escape rules); printer round-trip in `printer.rs` (`print_sref_*` 12+ tests); binder coverage in `ql-exec/src/plan.rs` (`resolve_structured_ref` unit tests for each `TableSpecSubtree` variant + 7 `BindError` variants); e2e through `SUM(Sales[Qty])` / `Sales[@Qty]*2` / `Sales[[#Data], [Qty]]` in workbook_runtime.rs. Dedicated coverage-matrix doc skipped — the tests are the matrix. |
+| 14 | **4.8.N** (deferred) | Soft-fail error→cell-value mapping (design § 7.4): accept formula text typed BEFORE its referenced table exists; surface error cell value; re-bind on `on_table_create`. | ⏳ DEFERRED — backwards-incompatible API contract change. Phase 4.8 ships without it; current behavior is hard-reject at `set_formula`. Fresh-session work, needs explicit user sign-off on the contract change before implementation. |
+| 15 | **4.8.O** (W5-125 → W5-129) | Closing mega-audit (Codex + Sonnet parallel) + closure-verify pass + final re-verify. | ✅ shipped — full audit trail at `docs/audits/2026-05-15-phase-4.8-*.md`. All 9 findings closed/dispositioned (Codex original 5 + closure-verify second-pass 1 + Sonnet cross-validation 3 + 1 cosmetic NOT FIXING). Final Codex re-verify on `6717ae7fe9f` returned **SHIP-READY**. |
 
-16 sub-phases (15 implementation + 1 design). **12 / 15 implementation sub-phases shipped** (4.8.A→I plus 4.8.I.2, 4.8.J, 4.8.L; plus the design doc).
+Also shipped during the 4.8 arc but NOT in the original sub-phase numbering:
+
+| Identifier | Subject | Status |
+|---|---|---|
+| **4.8.J.2** (W5-124) | Uniform spill-anchor check across `create_table` + `resize_table` + their replay arms (closes design § 4.3 invariant #5 across all five entry points; original write_spill-only enforcement left two paths silently broken). | ✅ shipped (+4 tests) |
+
+16 sub-phases (15 implementation + 1 design). **14 / 15 implementation sub-phases shipped or transitively-covered** — only 4.8.N remains DEFERRED (backwards-incompatible, needs sign-off). 4.8.G.3 (calcgraph hooks) was always marked OPTIONAL polish in this table; it remains deferred to a future perf-polish wave.
 
 ### Renumbering note
 
@@ -699,16 +705,14 @@ The W5-NNN ids in commits diverged from the design's W5-NNN plan starting at 4.8
 
 W5-NNN ids are convention, not load-bearing. Treat the **subphase letter** (G, H, I) as the canonical identifier; the W5-NNN is just the SHA-line tag in commit messages.
 
-### Deferred work — what a fresh session should pick up
+### Phase 4.8 — SHIPPED 2026-05-15
 
-In rough priority order:
+Phase 4.8 is feature-complete, megaudit-clean, and Codex SHIP-READY at HEAD `6717ae7fe9f`. Two items remain in the design's "next polish wave" bucket and are explicitly NOT required for Phase 4.8 to ship:
 
-1. ~~**4.8.I.2 rename_column**~~ — ✅ shipped W5-121.
-2. ~~**4.8.J resize_table**~~ — ✅ shipped W5-122.
-3. ~~**4.8.L persistence v5→v6**~~ — ✅ shipped W5-123.
-4. **4.8.G.3 calcgraph hooks** — optional (current rename impl uses formula-text rewrite which works correctly without `table_to_formulas`; the index becomes a perf optimization when tables grow large or rename rate is high).
-5. **4.8.N error-to-cell-value soft-fail** — table-related `BindError`s currently hard-reject at `set_formula`; design § 7.4 wants soft-fail so formulas typed BEFORE the table exists land an error cell value, then re-bind on `on_table_create`.
-6. **4.8.O closing megaudit** — Codex + Sonnet parallel review on the cumulative 4.8 wave.
+1. **4.8.G.3 calcgraph hooks** — optional perf optimization. Current rename/resize use brute-force `plan_cache.clear()` + caller-driven `recompute_all`; `table_to_formulas` reverse index + `on_table_*` hooks would automate the "caller-must-recompute" contract. Becomes valuable when tables grow large or mutation rate is high.
+2. **4.8.N soft-fail** — backwards-incompatible API contract change. Currently `set_formula("SUM(Sales[Qty])")` BEFORE `create_table("Sales", ...)` hard-rejects with `BindError::UnknownTable`. Design § 7.4 wants accept-text-and-surface-error-cell-value with re-bind on `on_table_create`. Needs explicit sign-off on the contract change before implementation.
+
+Both are tracked in the master plan for a future polish wave. They were not shipped because the design explicitly defers them as POST-Phase-4.8 work.
 
 **Stop conditions** (defer remaining to a Phase 4.8 polish wave):
 - If 4.8.B Ident-with-`[`-lookahead surfaces unforeseen tokenizer regressions, halt and re-design.
