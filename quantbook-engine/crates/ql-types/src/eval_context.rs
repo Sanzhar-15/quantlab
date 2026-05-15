@@ -44,13 +44,41 @@ pub enum DateSystem {
 
 /// Locale tag for number/date/text rendering + parsing.
 ///
-/// **W5-68 design § 6.4.** V1 ships en-US only; Phase 4.9 populates DE/FR
-/// and friends with full separator + month-name + weekday-name tables.
+/// **W5-68 design § 6.4.** Originally en-US only; **W5-133 (Phase 4.9.A)**
+/// adds `De` + `Fr` per the Phase 4.9 design doc. The locale's formula-
+/// syntax data (arg / decimal / array-row / array-col separators) lives
+/// in `ql-formula-syntax::locale::LocaleData` — `ql-types` defines only
+/// the locale identifier so layering stays clean (storage holds the
+/// identifier; the formula-syntax layer attaches separator semantics).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Locale {
-    /// en-US: decimal `.`, thousands `,`, English month / weekday names.
+    /// en-US: decimal `.`, thousands `,`, arg separator `,`, English
+    /// month / weekday names.
     #[default]
     EnUs,
+    /// de-DE / de-AT / de-CH (Phase 4.9 v1 treats them as one): decimal
+    /// `,`, arg separator `;`, German month / weekday names.
+    De,
+    /// fr-FR (Phase 4.9 v1): decimal `,`, arg separator `;`, French
+    /// month / weekday names.
+    Fr,
+}
+
+/// Formula-text reference mode. A Quantbook user preference at workbook
+/// scope; storage canon stays A1 regardless of this setting.
+///
+/// **W5-133 (Phase 4.9.A).** R1C1 ↔ A1 is a display + input preference,
+/// not an on-disk encoding. See the Phase 4.9 design doc § 1 + § 4.4
+/// (canonicalize-on-input pipeline).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReferenceMode {
+    /// `A1`, `$A$1`, `A1:B10`, `A:A`, `1:1`. Excel's default. Storage canon.
+    #[default]
+    A1,
+    /// `R1C1`, `R[-1]C`, `R[2]C[3]`, `R1C1:R10C5`. Optional input/display
+    /// preference; relative refs (`R[-1]C`) resolve against the formula's
+    /// owning cell at bind time per design § 3.1.
+    R1C1,
 }
 
 /// Source of "what time is it" for NOW() / TODAY() / volatile fns.
@@ -245,5 +273,36 @@ mod tests {
         assert_copy::<DateSystem>();
         assert_copy::<Locale>();
         assert_copy::<NowProvider>();
+        // W5-133: ReferenceMode is Copy too (added Phase 4.9.A).
+        assert_copy::<ReferenceMode>();
+    }
+
+    // ===== W5-133 (Phase 4.9.A) — Locale De/Fr variants + ReferenceMode =====
+
+    #[test]
+    fn locale_has_de_and_fr_variants() {
+        // Phase 4.9.A adds De + Fr alongside the existing EnUs.
+        // Each is a distinct variant.
+        assert_ne!(Locale::EnUs, Locale::De);
+        assert_ne!(Locale::EnUs, Locale::Fr);
+        assert_ne!(Locale::De, Locale::Fr);
+    }
+
+    #[test]
+    fn locale_default_still_enus_after_de_fr_addition() {
+        // Adding new variants must not change the default — every
+        // existing workbook constructed via `Default::default()` MUST
+        // continue to be EnUs.
+        assert_eq!(Locale::default(), Locale::EnUs);
+    }
+
+    #[test]
+    fn reference_mode_default_is_a1() {
+        assert_eq!(ReferenceMode::default(), ReferenceMode::A1);
+    }
+
+    #[test]
+    fn reference_mode_variants_distinct() {
+        assert_ne!(ReferenceMode::A1, ReferenceMode::R1C1);
     }
 }

@@ -79,13 +79,16 @@ The `@` operator narrows / passes through its operand based on the operand's val
 
 ## 4. Data model changes
 
-### 4.1 New types in `ql-formula-syntax` (NOT ql-storage — closes Codex HIGH-3)
+### 4.1 New types — layering across crates (closes Codex HIGH-3)
+
+**Refinement during 4.9.A implementation (W5-133):** the original draft proposed all three types (`ReferenceMode`, `LocaleId`, `LocaleData`) in `ql-formula-syntax`. Codex flagged this as too narrow — `ql-storage::Workbook` needs to hold instances, which would force a new `ql-storage → ql-formula-syntax` dependency. Resolution: split by responsibility:
 
 ```rust
-// crates/ql-formula-syntax/src/lib.rs
-pub enum ReferenceMode { A1, R1C1 }
-pub enum LocaleId { En, De, Fr }
+// crates/ql-types/src/eval_context.rs  -- marker enums (no logic)
+pub enum ReferenceMode { A1, R1C1 }          // default A1
+pub enum Locale { EnUs, De, Fr }              // default EnUs; extends pre-existing single-variant enum
 
+// crates/ql-formula-syntax/src/locale.rs -- syntax-layer data + impl
 pub struct LocaleData {
     pub arg_separator: char,
     pub decimal_separator: char,
@@ -94,12 +97,14 @@ pub struct LocaleData {
     // NO intersection_operator — `@` is invariant.
 }
 
-impl LocaleId {
-    pub fn data(&self) -> &'static LocaleData { /* hardcoded tables */ }
+pub fn locale_data(locale: ql_types::Locale) -> &'static LocaleData {
+    /* hardcoded tables for EnUs / De / Fr */
 }
 ```
 
-`ql-storage::Workbook` HOLDS instances of `ReferenceMode` / `LocaleId` via accessor pairs (`reference_mode()` / `set_reference_mode()` / `locale()` / `set_locale()`); storage doesn't define the types. This matches the existing layering (date system + format ids live in `ql-types`).
+`ql-storage::Workbook` holds `reference_mode: ReferenceMode` + `locale: Locale` with accessor pairs (`reference_mode()` / `set_reference_mode()` / `locale()` / `set_locale()`); no new dep edge needed. This matches the `DateSystem` precedent.
+
+Naming note: kept the pre-existing `Locale` enum (not `LocaleId`) to extend rather than parallel; the W5-68 docstring on `Locale` was scaffolded for exactly this Phase 4.9 extension.
 
 ### 4.2 `ql-formula-syntax::ast::Expr::ImplicitIntersection` (revised)
 

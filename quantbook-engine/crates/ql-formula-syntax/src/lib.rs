@@ -28,6 +28,7 @@
 
 pub mod ast;
 pub mod lexer;
+pub mod locale;
 pub mod parser;
 pub mod printer;
 pub mod token;
@@ -37,6 +38,7 @@ pub use ast::{
     SheetRef, SpecialItem, TableSpecItem, TableSpecSubtree,
 };
 pub use lexer::{column_letters_to_index, lex, LexError, MAX_COLUMN, MAX_ROW};
+pub use locale::{locale_data, LocaleData};
 pub use parser::{parse, ParseError};
 pub use printer::print;
 pub use token::{Operator, Token};

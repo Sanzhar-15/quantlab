@@ -33,7 +33,9 @@ pub use date::{
     UNIX_EPOCH_AS_1904_SERIAL,
 };
 pub use error::{ErrorValue, ParseErrorValueError};
-pub use eval_context::{DateSystem, EvalContext, Locale, NowProvider, DEFAULT_EVAL_CONTEXT};
+pub use eval_context::{
+    DateSystem, EvalContext, Locale, NowProvider, ReferenceMode, DEFAULT_EVAL_CONTEXT,
+};
 pub use value::Value;
 
 #[cfg(test)]

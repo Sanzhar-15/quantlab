@@ -278,6 +278,21 @@ pub struct Workbook {
     /// the qbook loader + tests. See `crates/ql-storage/src/tables.rs`
     /// module docs.
     tables: crate::TableTable,
+    /// **W5-133 (Phase 4.9.A):** formula-text reference mode. A
+    /// workbook-level user preference; default `A1`. Storage canon
+    /// stays A1 regardless of this setting — `R1C1` only affects how
+    /// the lexer/parser interpret user input and how the printer
+    /// emits the stored canonical AST. See Phase 4.9 design doc § 1.
+    reference_mode: ql_types::ReferenceMode,
+    /// **W5-133 (Phase 4.9.A):** locale for separator + decimal rules.
+    /// Workbook-level. Default `EnUs`. Storage canon stays EN
+    /// separators (decimal `.`, arg `,`, array row `;`, array col
+    /// `,`) regardless of this setting; non-EN locales affect only
+    /// the edit-time lex/print transforms. Promoted from
+    /// `EvalContext::locale` (which previously held this for the
+    /// eval layer only) — the persistent home is now the workbook.
+    /// See Phase 4.9 design doc § 1 + § 3.2.
+    locale: ql_types::Locale,
 }
 
 impl Workbook {
@@ -306,6 +321,39 @@ impl Workbook {
     /// rebuild it. Treat this method as loader-only.
     pub fn set_date_system(&mut self, system: ql_types::DateSystem) {
         self.date_system = system;
+    }
+
+    /// **W5-133 (Phase 4.9.A):** the workbook's formula-text
+    /// reference mode (`A1` or `R1C1`). Default `A1`. Phase 4.9
+    /// design doc § 1 + § 4.4.
+    pub fn reference_mode(&self) -> ql_types::ReferenceMode {
+        self.reference_mode
+    }
+
+    /// **W5-133 (Phase 4.9.A):** set the workbook's reference mode.
+    /// Used by the `.qbook` loader (v7) and by
+    /// `WorkbookRuntime::set_reference_mode` (4.9.K). Switching mode
+    /// does NOT rewrite stored formula text — storage canon stays A1.
+    /// Only display + input transforms change.
+    pub fn set_reference_mode(&mut self, mode: ql_types::ReferenceMode) {
+        self.reference_mode = mode;
+    }
+
+    /// **W5-133 (Phase 4.9.A):** the workbook's locale. Default
+    /// `EnUs`. Used by the lexer + printer for separator + decimal
+    /// rules; see `ql-formula-syntax::locale_data` for the per-locale
+    /// data tables.
+    pub fn locale(&self) -> ql_types::Locale {
+        self.locale
+    }
+
+    /// **W5-133 (Phase 4.9.A):** set the workbook's locale. Used by
+    /// the `.qbook` loader (v7) and by `WorkbookRuntime::set_locale`
+    /// (4.9.K). Switching locale does NOT rewrite stored formula text
+    /// — storage canon stays EN separators. Only display + input
+    /// transforms change.
+    pub fn set_locale(&mut self, locale: ql_types::Locale) {
+        self.locale = locale;
     }
 
     /// **W5-79 (Phase 4.5.D part 3):** read access to the workbook's
@@ -1520,5 +1568,55 @@ mod tests {
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Number(42.0));
         wb.clear_spill_at((0, 0, 0)).unwrap();
         assert_eq!(wb.read(Address::new(0, 0, 0)), Value::Blank);
+    }
+
+    // ===== W5-133 (Phase 4.9.A) — reference_mode + locale accessors =====
+
+    #[test]
+    fn workbook_default_reference_mode_is_a1() {
+        let wb = Workbook::new();
+        assert_eq!(wb.reference_mode(), ql_types::ReferenceMode::A1);
+    }
+
+    #[test]
+    fn workbook_default_locale_is_en_us() {
+        let wb = Workbook::new();
+        assert_eq!(wb.locale(), ql_types::Locale::EnUs);
+    }
+
+    #[test]
+    fn workbook_set_reference_mode_round_trips() {
+        let mut wb = Workbook::new();
+        wb.set_reference_mode(ql_types::ReferenceMode::R1C1);
+        assert_eq!(wb.reference_mode(), ql_types::ReferenceMode::R1C1);
+        wb.set_reference_mode(ql_types::ReferenceMode::A1);
+        assert_eq!(wb.reference_mode(), ql_types::ReferenceMode::A1);
+    }
+
+    #[test]
+    fn workbook_set_locale_round_trips_all_variants() {
+        let mut wb = Workbook::new();
+        for locale in [
+            ql_types::Locale::EnUs,
+            ql_types::Locale::De,
+            ql_types::Locale::Fr,
+        ] {
+            wb.set_locale(locale);
+            assert_eq!(wb.locale(), locale);
+        }
+    }
+
+    /// Setting reference_mode + locale together — neither setter
+    /// clobbers the other (they're independent fields).
+    #[test]
+    fn workbook_reference_mode_and_locale_are_independent() {
+        let mut wb = Workbook::new();
+        wb.set_reference_mode(ql_types::ReferenceMode::R1C1);
+        wb.set_locale(ql_types::Locale::De);
+        assert_eq!(wb.reference_mode(), ql_types::ReferenceMode::R1C1);
+        assert_eq!(wb.locale(), ql_types::Locale::De);
+        wb.set_reference_mode(ql_types::ReferenceMode::A1);
+        // Locale unchanged.
+        assert_eq!(wb.locale(), ql_types::Locale::De);
     }
 }
