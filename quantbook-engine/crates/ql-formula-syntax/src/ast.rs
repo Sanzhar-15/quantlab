@@ -936,4 +936,132 @@ mod tests {
             other => panic!("expected CellRef, got {other:?}"),
         }
     }
+
+    // ===== W5-129 (Phase 4.8.O.5 — Sonnet cross-validation LOW-NEW-1) =====
+    //
+    // `rewrite_column_ref` was previously tested only transitively via
+    // the `oplog_e2e` `rename_column_op_log_replay_reconstructs_rename`
+    // end-to-end test. Sonnet's W5-128 cross-validation pass confirmed
+    // the code is correct but flagged the missing unit-level pins.
+    // These 5 tests target each non-Combination spec variant + the
+    // string-literal immunity property + the cross-table isolation guard.
+
+    fn sref(table_name: &str, spec: TableSpecSubtree) -> Expr {
+        Expr::StructuredRef {
+            table_name: Arc::from(table_name),
+            spec,
+        }
+    }
+
+    #[test]
+    fn rewrite_column_ref_string_literal_is_immune() {
+        // `="The Qty column"` — the string literal contains "Qty" but
+        // it's `Expr::String`, not a StructuredRef. The walker must
+        // pass it through unchanged.
+        let expr = Expr::String(Arc::from("The Qty column"));
+        let new_col: Arc<str> = Arc::from("Quantity");
+        let out = rewrite_column_ref(&expr, "SALES", "Qty", &new_col);
+        match out {
+            Expr::String(s) => assert_eq!(&*s, "The Qty column"),
+            other => panic!("expected String pass-through, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_column_ref_special_item_passes_through() {
+        // `Sales[[#Headers], [Qty]]` — the `#Headers` SpecialItem must
+        // pass through; only the `Qty` Column item gets rewritten.
+        let spec = TableSpecSubtree::Combination(vec![
+            TableSpecItem::Special(SpecialItem::Headers),
+            TableSpecItem::Column(Arc::from("Qty")),
+        ]);
+        let new_col: Arc<str> = Arc::from("Quantity");
+        let out = rewrite_column_ref(&sref("Sales", spec), "SALES", "Qty", &new_col);
+        match out {
+            Expr::StructuredRef { spec, .. } => match spec {
+                TableSpecSubtree::Combination(items) => {
+                    assert_eq!(items.len(), 2);
+                    match &items[0] {
+                        TableSpecItem::Special(SpecialItem::Headers) => {}
+                        other => panic!("expected Headers, got {other:?}"),
+                    }
+                    match &items[1] {
+                        TableSpecItem::Column(c) => assert_eq!(&**c, "Quantity"),
+                        other => panic!("expected Column(Quantity), got {other:?}"),
+                    }
+                }
+                other => panic!("expected Combination, got {other:?}"),
+            },
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_column_ref_this_row_column_range_rewrites_both_endpoints() {
+        // `Sales[@[Qty]:[Qty]]` — both endpoints reference "Qty"; the
+        // walker rewrites BOTH. (Cross-test exists in oplog_e2e but
+        // not for this specific spec variant.)
+        let spec = TableSpecSubtree::ThisRowColumnRange(Arc::from("Qty"), Arc::from("Qty"));
+        let new_col: Arc<str> = Arc::from("Quantity");
+        let out = rewrite_column_ref(&sref("Sales", spec), "SALES", "Qty", &new_col);
+        match out {
+            Expr::StructuredRef { spec, .. } => match spec {
+                TableSpecSubtree::ThisRowColumnRange(c1, c2) => {
+                    assert_eq!(&*c1, "Quantity");
+                    assert_eq!(&*c2, "Quantity");
+                }
+                other => panic!("expected ThisRowColumnRange, got {other:?}"),
+            },
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_column_ref_column_range_rewrites_only_matching_endpoint() {
+        // `Sales[[Qty]:[Price]]` with rename Qty→Quantity — only c1
+        // (the matching endpoint) gets rewritten. c2 ("Price") stays.
+        let spec = TableSpecSubtree::Combination(vec![TableSpecItem::ColumnRange(
+            Arc::from("Qty"),
+            Arc::from("Price"),
+        )]);
+        let new_col: Arc<str> = Arc::from("Quantity");
+        let out = rewrite_column_ref(&sref("Sales", spec), "SALES", "Qty", &new_col);
+        match out {
+            Expr::StructuredRef { spec, .. } => match spec {
+                TableSpecSubtree::Combination(items) => match &items[0] {
+                    TableSpecItem::ColumnRange(c1, c2) => {
+                        assert_eq!(&**c1, "Quantity");
+                        assert_eq!(&**c2, "Price");
+                    }
+                    other => panic!("expected ColumnRange, got {other:?}"),
+                },
+                other => panic!("expected Combination, got {other:?}"),
+            },
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_column_ref_cross_table_isolation_holds() {
+        // `Inventory[Qty]` when renaming `Sales.Qty` — the table
+        // canonical doesn't match, so the spec must pass through
+        // unchanged. This is the guard at `rewrite_column_ref`'s
+        // `table_name.eq_ignore_ascii_case(table_canonical_upper)`
+        // check, exercised at unit level.
+        let spec = TableSpecSubtree::BareColumn(Arc::from("Qty"));
+        let new_col: Arc<str> = Arc::from("Quantity");
+        let out = rewrite_column_ref(&sref("Inventory", spec), "SALES", "Qty", &new_col);
+        match out {
+            Expr::StructuredRef { table_name, spec } => {
+                assert_eq!(&*table_name, "Inventory");
+                match spec {
+                    TableSpecSubtree::BareColumn(c) => {
+                        assert_eq!(&*c, "Qty", "cross-table column must NOT be rewritten")
+                    }
+                    other => panic!("expected BareColumn, got {other:?}"),
+                }
+            }
+            other => panic!("expected StructuredRef, got {other:?}"),
+        }
+    }
 }
