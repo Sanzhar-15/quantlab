@@ -81,9 +81,9 @@ pub enum PrintError {
 #[derive(Clone, Copy)]
 struct PrintCtx {
     mode: ReferenceMode,
-    /// Reserved for 4.9.F (locale-aware separators). Accepted now for
-    /// signature stability; 4.9.D doesn't read it.
-    #[allow(dead_code)]
+    /// **W5-142 (Phase 4.9.F):** drives decimal separator in
+    /// `print_number_with_locale`, function arg separator, and array
+    /// row/col separators. Lookup via `crate::locale::locale_data`.
     locale: Locale,
     site: Option<FormulaSite>,
 }
@@ -540,14 +540,37 @@ fn print_string_literal(s: &str, out: &mut String) {
     out.push('"');
 }
 
-fn print_number(n: f64, out: &mut String) {
-    // Use Rust's default f64 Display which matches Excel's general number formatting
-    // closely (e.g., 2.0 prints as "2", 2.5 as "2.5", 1e10 as "10000000000").
+/// **W5-142 (Phase 4.9.F):** locale-aware number printer.
+///
+/// Replaces the canonical `.` decimal separator with the locale's
+/// decimal glyph in the formatted output. Rust's `f64` Display
+/// always emits `.` regardless of locale (it's a numeric, not
+/// locale-aware, formatter), so we do a single byte substitution.
+///
+/// Scientific notation (`1e10`) — `e`/`E` are locale-invariant per
+/// W5-135 design (numeric exponent marker is not separable from
+/// decimal-separator choice in the lex direction either).
+fn print_number_with_locale(n: f64, decimal_sep: char, out: &mut String) {
     if n.fract() == 0.0 && n.abs() < 1.0e16 {
-        // Integer-valued f64 → no decimal point.
+        // Integer-valued f64 → no decimal point. Decimal sep irrelevant.
         out.push_str(&format!("{}", n as i64));
     } else {
-        out.push_str(&format!("{n}"));
+        let canonical = format!("{n}");
+        if decimal_sep == '.' {
+            // Hot path: EN locale emits the canonical form verbatim.
+            out.push_str(&canonical);
+        } else {
+            // DE/FR: swap `.` → locale glyph. f64 Display only emits a
+            // single `.` per number (no thousands sep in `{n}` output),
+            // so byte-level substitution is safe.
+            for c in canonical.chars() {
+                if c == '.' {
+                    out.push(decimal_sep);
+                } else {
+                    out.push(c);
+                }
+            }
+        }
     }
 }
 
@@ -567,7 +590,9 @@ fn print_expr_ctx(
 ) -> Result<(), PrintError> {
     match expr {
         Expr::Number(n) => {
-            print_number(*n, out);
+            // **W5-142 (Phase 4.9.F):** locale-aware decimal separator.
+            let locale_data = crate::locale::locale_data(ctx.locale);
+            print_number_with_locale(*n, locale_data.decimal_separator, out);
             Ok(())
         }
         Expr::Bool(b) => {
@@ -614,11 +639,16 @@ fn print_expr_ctx(
             }
         },
         Expr::Function { name, args } => {
+            // **W5-142 (Phase 4.9.F):** locale-aware argument separator.
+            // EN: `,` → ", ". DE/FR: `;` → "; ". Trailing space kept
+            // for readability; matches existing EN canonical style.
+            let arg_sep = crate::locale::locale_data(ctx.locale).arg_separator;
             out.push_str(name);
             out.push('(');
             for (i, a) in args.iter().enumerate() {
                 if i > 0 {
-                    out.push_str(", ");
+                    out.push(arg_sep);
+                    out.push(' ');
                 }
                 print_expr_ctx(a, ctx, out, 0)?;
             }
@@ -634,6 +664,9 @@ fn print_expr_ctx(
             Ok(())
         }
         Expr::Array(rows) => {
+            // **W5-142 (Phase 4.9.F):** locale-aware array row/col
+            // separators. EN: row=`;`, col=`,`. DE/FR: row=`.`, col=`\\`.
+            // Both followed by space for readability.
             if rows.is_empty() {
                 unreachable!(
                     "print_expr_ctx: Expr::Array with zero rows — parser rejects empty \
@@ -641,14 +674,19 @@ fn print_expr_ctx(
                      directly is a programmer bug"
                 );
             }
+            let ld = crate::locale::locale_data(ctx.locale);
+            let row_sep = ld.array_row_separator;
+            let col_sep = ld.array_col_separator;
             out.push('{');
             for (i, row) in rows.iter().enumerate() {
                 if i > 0 {
-                    out.push_str("; ");
+                    out.push(row_sep);
+                    out.push(' ');
                 }
                 for (j, cell) in row.iter().enumerate() {
                     if j > 0 {
-                        out.push_str(", ");
+                        out.push(col_sep);
+                        out.push(' ');
                     }
                     print_expr_ctx(cell, ctx, out, 0)?;
                 }
@@ -1773,5 +1811,155 @@ mod tests {
         let expr = parse_a1("$1:$5");
         let s = print_with(&expr, ReferenceMode::R1C1, Locale::EnUs, None).unwrap();
         assert_eq!(s, "R1:R5");
+    }
+
+    // ===================================================================
+    // W5-142 (Phase 4.9.F) — locale-aware print_with tests.
+    //
+    // Three locale-affected emission sites:
+    //   1. Number decimal separator (print_number_with_locale).
+    //   2. Function-call argument separator.
+    //   3. Array literal row + col separators.
+    //
+    // Per locale table (matches the lexer-side W5-138 tables):
+    //   EN: arg=`,`  decimal=`.`  row=`;`  col=`,`
+    //   DE: arg=`;`  decimal=`,`  row=`.`  col=`\\`
+    //   FR: same as DE
+    // ===================================================================
+
+    /// **DE: decimal in number literal uses `,`.** `2.5` parses in
+    /// A1+EN, prints in A1+DE as `2,5`.
+    #[test]
+    fn print_with_de_locale_uses_comma_for_decimal() {
+        let expr = parse_a1("2.5");
+        let s = print_with(&expr, ReferenceMode::A1, Locale::De, None).unwrap();
+        assert_eq!(s, "2,5");
+    }
+
+    /// **DE: integer-valued numbers have no decimal — no glyph
+    /// affected.** `42` in DE → `42` (no separator emitted at all).
+    #[test]
+    fn print_with_de_locale_integer_unchanged() {
+        let expr = parse_a1("42");
+        let s = print_with(&expr, ReferenceMode::A1, Locale::De, None).unwrap();
+        assert_eq!(s, "42");
+    }
+
+    /// **FR: matches DE (per design § 3.2).** Same decimal glyph.
+    #[test]
+    fn print_with_fr_locale_uses_comma_for_decimal() {
+        let expr = parse_a1("3.14");
+        let s = print_with(&expr, ReferenceMode::A1, Locale::Fr, None).unwrap();
+        assert_eq!(s, "3,14");
+    }
+
+    /// **DE: function argument separator is `;`.** `SUM(A1, B2)` in
+    /// EN → `SUM(A1; B2)` in DE. EN's `,` arg → DE's `;`.
+    #[test]
+    fn print_with_de_locale_uses_semicolon_for_function_args() {
+        let expr = parse_a1("SUM(A1, B2)");
+        let s = print_with(&expr, ReferenceMode::A1, Locale::De, None).unwrap();
+        assert_eq!(s, "SUM(A1; B2)");
+    }
+
+    /// **EN: function argument separator stays `,`.** Sanity that
+    /// EN doesn't drift from pre-W5-142 behavior.
+    #[test]
+    fn print_with_en_locale_function_args_stay_comma() {
+        let expr = parse_a1("SUM(A1, B2)");
+        let s = print_with(&expr, ReferenceMode::A1, Locale::EnUs, None).unwrap();
+        assert_eq!(s, "SUM(A1, B2)");
+    }
+
+    /// **DE: array row sep = `.`, col sep = `\\`.** `{1, 2; 3, 4}` in
+    /// EN → `{1\ 2. 3\ 4}` in DE (EN canonical printer adds spaces
+    /// after each separator).
+    #[test]
+    fn print_with_de_locale_array_uses_backslash_and_dot() {
+        let expr = parse_a1("{1, 2; 3, 4}");
+        let s = print_with(&expr, ReferenceMode::A1, Locale::De, None).unwrap();
+        assert_eq!(s, "{1\\ 2. 3\\ 4}");
+    }
+
+    /// **EN: array separators stay `,` / `;`.** Sanity backstop.
+    #[test]
+    fn print_with_en_locale_array_stays_comma_semicolon() {
+        let expr = parse_a1("{1, 2; 3, 4}");
+        let s = print_with(&expr, ReferenceMode::A1, Locale::EnUs, None).unwrap();
+        assert_eq!(s, "{1, 2; 3, 4}");
+    }
+
+    /// **DE: number + arg sep + array sep compose.**
+    /// `SUM(2.5, 3.5)` in EN → `SUM(2,5; 3,5)` in DE.
+    #[test]
+    fn print_with_de_locale_compound_function_and_decimals() {
+        let expr = parse_a1("SUM(2.5, 3.5)");
+        let s = print_with(&expr, ReferenceMode::A1, Locale::De, None).unwrap();
+        assert_eq!(s, "SUM(2,5; 3,5)");
+    }
+
+    /// **DE: array with decimals.** `{1.5, 2.5}` → `{1,5\ 2,5}`.
+    /// Validates that the decimal swap and array col-sep swap don't
+    /// collide (DE col-sep is `\\`, not `,` — but the lexer's
+    /// pre-dispatch maps `,` inside a number to decimal, so this is
+    /// unambiguous on the parse side too).
+    #[test]
+    fn print_with_de_locale_array_with_decimals() {
+        let expr = parse_a1("{1.5, 2.5}");
+        let s = print_with(&expr, ReferenceMode::A1, Locale::De, None).unwrap();
+        assert_eq!(s, "{1,5\\ 2,5}");
+    }
+
+    /// **EN ↔ DE round-trip via lex_with + parse + print_with.**
+    /// Source `SUM(2,5; 3,5)` in DE locale → tokens → AST → DE print
+    /// → same source text (modulo formatter spaces).
+    #[test]
+    fn print_with_de_round_trip_through_lex_parse() {
+        use crate::lexer::lex_with;
+        let tokens = lex_with("SUM(2,5; 3,5)", ReferenceMode::A1, Locale::De).expect("lex DE");
+        let expr = parse(tokens).expect("parse DE tokens");
+        let printed = print_with(&expr, ReferenceMode::A1, Locale::De, None).unwrap();
+        assert_eq!(printed, "SUM(2,5; 3,5)");
+    }
+
+    /// **DE + R1C1 mode compose.** Both axes orthogonal: mode controls
+    /// ref form, locale controls separator glyphs. `SUM(R1C1, R2C2)`
+    /// in R1C1+DE → `SUM(R1C1; R2C2)`.
+    #[test]
+    fn print_with_r1c1_de_combines_correctly() {
+        let expr = parse_r1c1("SUM(R1C1,R2C2)");
+        let s = print_with(&expr, ReferenceMode::R1C1, Locale::De, None).unwrap();
+        assert_eq!(s, "SUM(R1C1; R2C2)");
+    }
+
+    /// **DE scientific-notation numbers preserve `e`.** `1e10` is
+    /// integer-valued (1e10 == 10000000000) so emits no separator
+    /// at all. Sanity that we don't accidentally inject locale glyph
+    /// when there's no decimal in the formatted output.
+    #[test]
+    fn print_with_de_locale_scientific_integer() {
+        let expr = parse_a1("1e10");
+        let s = print_with(&expr, ReferenceMode::A1, Locale::De, None).unwrap();
+        assert_eq!(s, "10000000000");
+    }
+
+    /// **DE scientific with fractional mantissa.** `1.5e3` = 1500
+    /// (integer); test a true fractional like `0.00001` to force the
+    /// `{n}` non-integer branch. Rust's f64 Display emits this as
+    /// `0.00001` — locale swap yields `0,00001`.
+    #[test]
+    fn print_with_de_locale_small_fraction() {
+        let expr = parse_a1("0.00001");
+        let s = print_with(&expr, ReferenceMode::A1, Locale::De, None).unwrap();
+        assert_eq!(s, "0,00001");
+    }
+
+    /// **EN print remains decimal-`.` after locale plumbing.** Round
+    /// out coverage: confirms no accidental EN drift.
+    #[test]
+    fn print_with_en_locale_decimal_stays_dot() {
+        let expr = parse_a1("2.5");
+        let s = print_with(&expr, ReferenceMode::A1, Locale::EnUs, None).unwrap();
+        assert_eq!(s, "2.5");
     }
 }
