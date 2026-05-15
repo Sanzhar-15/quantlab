@@ -37,7 +37,7 @@ pub use ast::{
     rewrite_column_ref, rewrite_sheet_name_in_expr, rewrite_table_ref, CellAddr, Expr, RangeRef,
     SheetRef, SpecialItem, TableSpecItem, TableSpecSubtree,
 };
-pub use lexer::{column_letters_to_index, lex, LexError, MAX_COLUMN, MAX_ROW};
+pub use lexer::{column_letters_to_index, lex, lex_with, LexError, MAX_COLUMN, MAX_ROW};
 pub use locale::{locale_data, LocaleData};
 pub use parser::{parse, ParseError};
 pub use printer::print;

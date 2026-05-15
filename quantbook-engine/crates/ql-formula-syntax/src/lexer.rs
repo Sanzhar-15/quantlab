@@ -11,6 +11,8 @@ use std::iter::Peekable;
 use std::str::Chars;
 use std::sync::Arc;
 
+use ql_types::{Locale, ReferenceMode};
+
 use crate::token::{Operator, Token};
 
 /// Lex error — narrow, structured.
@@ -82,7 +84,35 @@ pub const MAX_COLUMN: u32 = 16_383;
 pub const MAX_ROW: u32 = 1_048_575;
 
 /// Tokenize a formula expression body (without the leading `=`).
+///
+/// **W5-134 (Phase 4.9.B.1):** Backward-compat shim that delegates to
+/// [`lex_with`] with `(ReferenceMode::A1, Locale::EnUs)` — the engine's
+/// historical hardcoded defaults. New call sites that need mode or
+/// locale awareness should call `lex_with` directly.
 pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
+    lex_with(input, ReferenceMode::A1, Locale::EnUs)
+}
+
+/// Tokenize a formula expression body with explicit `(ReferenceMode,
+/// Locale)` context.
+///
+/// **W5-134 (Phase 4.9.B.1):** signature scaffolding for Phase 4.9.
+/// **No behavior change yet** — `mode` and `locale` are accepted but
+/// not consumed by the lex logic; the current implementation is
+/// equivalent to the pre-W5-134 `lex(input)` for any `(mode, locale)`
+/// pair. Subsequent sub-phases wire them into the lex state:
+///
+/// - **4.9.B.2** — locale-parameterized number lexing (decimal
+///   separator switches per `locale`).
+/// - **4.9.B.3** — locale-parameterized argument separator + array
+///   row/col separators.
+/// - **4.9.B.4** — R1C1 token emission when `mode == R1C1`.
+///
+/// This split lets each behavior change land as an independent commit
+/// with its own test coverage, instead of an atomic ~2k-line lexer
+/// rewrite.
+#[allow(unused_variables)]
+pub fn lex_with(input: &str, mode: ReferenceMode, locale: Locale) -> Result<Vec<Token>, LexError> {
     let mut out = Vec::new();
     let mut chars = input.chars().peekable();
 
@@ -2121,5 +2151,76 @@ mod tests {
                 // StructuredRef.
             }
         }
+    }
+
+    // ===== W5-134 (Phase 4.9.B.1) — lex_with signature scaffolding =====
+
+    /// `lex(input)` and `lex_with(input, A1, EnUs)` must produce
+    /// identical token streams — the shim is a pure delegation. Pin
+    /// across the representative grammar to catch any future drift.
+    #[test]
+    fn lex_and_lex_with_a1_enus_match_on_representative_inputs() {
+        let cases = [
+            "",
+            "1",
+            "1+2*3",
+            "SUM(A1, A2, A3)",
+            "A1:B10",
+            "'Sheet 1'!A1",
+            "{1, 2; 3, 4}",
+            "\"hello\"",
+            "#REF!",
+            "Sales[Qty]",
+            "Sales[@Qty]*2",
+            "FALSE",
+            "1.5e-3",
+        ];
+        for src in cases {
+            let a = lex(src);
+            let b = lex_with(src, ReferenceMode::A1, Locale::EnUs);
+            assert_eq!(a, b, "lex vs lex_with diverge on input: {src:?}");
+        }
+    }
+
+    /// **W5-134 contract:** `lex_with(input, mode, locale)` accepts
+    /// any `(mode, locale)` pair without panicking — even on inputs
+    /// that the eventual 4.9.B.4 R1C1 lexer would parse differently.
+    /// The current behavior is mode/locale-invariant (no consumption).
+    /// This pins the "scaffolding only" contract — a future cycle
+    /// that wires `mode` MUST consciously update or delete this test.
+    #[test]
+    fn lex_with_accepts_all_mode_locale_combinations_without_panic() {
+        let src = "SUM(A1, A2)";
+        for mode in [ReferenceMode::A1, ReferenceMode::R1C1] {
+            for locale in [Locale::EnUs, Locale::De, Locale::Fr] {
+                let result = lex_with(src, mode, locale);
+                assert!(
+                    result.is_ok(),
+                    "lex_with panicked on ({mode:?}, {locale:?}) for {src:?}"
+                );
+            }
+        }
+    }
+
+    /// **Behavior-invariance pin (W5-134):** until 4.9.B.2 lands,
+    /// switching locale must NOT change the lex output. Pin this with
+    /// `SUM(1.5, 2.5)` — EN uses `.` decimal + `,` arg; DE will
+    /// eventually swap, but in 4.9.B.1 the lexer hasn't learned that
+    /// yet. If this test fails after 4.9.B.2, that's the signal that
+    /// the behavior change shipped and this test should be deleted.
+    #[test]
+    fn lex_with_pre_4_9_b_2_is_locale_invariant() {
+        let src = "SUM(1.5, 2.5)";
+        let en = lex_with(src, ReferenceMode::A1, Locale::EnUs).unwrap();
+        let de = lex_with(src, ReferenceMode::A1, Locale::De).unwrap();
+        let fr = lex_with(src, ReferenceMode::A1, Locale::Fr).unwrap();
+        assert_eq!(
+            en, de,
+            "4.9.B.1: locale must not yet affect lex output (DE diverged)"
+        );
+        assert_eq!(
+            en, fr,
+            "4.9.B.1: locale must not yet affect lex output (FR diverged)"
+        );
     }
 }
