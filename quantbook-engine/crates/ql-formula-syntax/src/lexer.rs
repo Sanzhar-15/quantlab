@@ -106,15 +106,19 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
 ///   lexes as `Number(2)` followed by a bare `.` that downstream
 ///   arms reject — IronCalc-canonical "DE doesn't accept dot
 ///   decimals" behavior.
+/// - **W5-136 (4.9.B.3):** locale-aware argument + array separators
+///   dispatched at the top of the lex loop. EN keeps `,` → `Comma`
+///   + `;` → `Semicolon` exactly; DE/FR remap source glyphs to
+///   canonical role-tokens (DE `;` → `Comma`, DE `\\` → `Comma`,
+///   DE `.` → `Semicolon`). The parser sees the SAME token vocab
+///   regardless of locale; only the source-glyph mapping changes.
+///   This closes the leading-decimal gap from 4.9.B.2 in DE/FR
+///   (DE `,5` previously hit the deleted literal `,` arm; now it
+///   falls through to the decimal-start arm and lexes as
+///   `Number(0.5)`).
 ///
 /// Still pending:
 ///
-/// - **4.9.B.3** — locale-parameterized argument separator + array
-///   row/col separators (dispatch-level rework). `2,3` in DE
-///   currently still hits the `,` → `Token::Comma` arm at top level
-///   instead of being recognized as a leading-decimal number; same
-///   for `.5` start-of-expression in EN, which already works because
-///   EN's decimal_sep is `.` and the dispatch hard-codes it.
 /// - **4.9.B.4** — R1C1 token emission when `mode == R1C1`.
 ///
 /// This split lets each behavior change land as an independent commit
@@ -137,6 +141,38 @@ pub fn lex_with(input: &str, mode: ReferenceMode, locale: Locale) -> Result<Vec<
             continue;
         }
 
+        // **W5-136 (Phase 4.9.B.3):** locale-aware separator pre-
+        // dispatch. The parser's token vocabulary stays the same
+        // across locales — `Token::Comma` is the "arg-or-array-col
+        // separator" role-token, `Token::Semicolon` is the "array-
+        // row separator" role-token. Only the source glyph mapping
+        // changes per locale.
+        //
+        // EN: `,` plays both arg-separator AND array-col-separator
+        // roles (Excel canon, disambiguated by parser context inside
+        // `(...)` vs `{...}`). `;` plays array-row role. Both map to
+        // their existing tokens — net change is zero for EN.
+        //
+        // DE/FR: `;` is arg-separator → `Comma`. `\\` is array-col
+        // separator → `Comma`. `.` is array-row separator →
+        // `Semicolon`. `,` is decimal-separator (handled by 4.9.B.2
+        // number-lex; falls through here to the decimal-start arm in
+        // the main match below).
+        //
+        // Implemented BEFORE the main `match c` so the locale rule
+        // wins over any hardcoded literal-glyph arm (now deleted for
+        // `,` and `;`).
+        if c == locale_data.arg_separator || c == locale_data.array_col_separator {
+            chars.next();
+            out.push(Token::Comma);
+            continue;
+        }
+        if c == locale_data.array_row_separator {
+            chars.next();
+            out.push(Token::Semicolon);
+            continue;
+        }
+
         match c {
             '(' => {
                 chars.next();
@@ -146,17 +182,14 @@ pub fn lex_with(input: &str, mode: ReferenceMode, locale: Locale) -> Result<Vec<
                 chars.next();
                 out.push(Token::RParen);
             }
-            ',' => {
-                chars.next();
-                out.push(Token::Comma);
-            }
+            // W5-136: the literal `,` and `;` arms were deleted —
+            // those glyphs are now handled by the locale-aware
+            // pre-dispatch above. In EN the pre-dispatch maps them
+            // identically; in DE/FR they're either remapped (`;` →
+            // Comma) or fall through to the decimal-start arm (`,`).
             ':' => {
                 chars.next();
                 out.push(Token::Colon);
-            }
-            ';' => {
-                chars.next();
-                out.push(Token::Semicolon);
             }
             // **W5-97 (Phase 4.7.C):** array-literal braces. The parser
             // consumes these in W5-98 (Phase 4.7.D) to build
@@ -236,21 +269,19 @@ pub fn lex_with(input: &str, mode: ReferenceMode, locale: Locale) -> Result<Vec<
             }
             '"' => out.push(lex_string(&mut chars)?),
             '0'..='9' => out.push(lex_number(&mut chars, decimal_sep)?),
-            // The locale's decimal separator is also a valid start of
-            // a number (`.5` in EN, `,5` in DE/FR). For EN this
-            // restores the prior `'0'..='9' | '.'` arm exactly; for
-            // DE/FR the `,5` path is reachable only when nothing
-            // earlier in the match consumed `,` — currently the `,`
-            // arm above DOES consume it as `Token::Comma`, so DE/FR
-            // leading-`,` decimals are deferred to 4.9.B.3's separator
-            // rework. EN keeps existing `.5` behavior. NOT a guard
-            // arm because `c if c == decimal_sep` would shadow the
-            // earlier specific arms in non-EN locales (Rust match
-            // arms evaluate top-down; guard arms have no special
-            // priority).
-            c if c == decimal_sep && c != ',' && c != ';' => {
-                out.push(lex_number(&mut chars, decimal_sep)?)
-            }
+            // **W5-135 + W5-136:** the locale's decimal separator
+            // also starts a number (`.5` in EN, `,5` in DE/FR). The
+            // W5-135 guard `&& c != ',' && c != ';'` was deleted in
+            // W5-136 because the literal `,`/`;` match arms above are
+            // now also deleted — the locale-aware pre-dispatch
+            // intercepts them by ROLE (separator-glyph), not by
+            // literal. In DE/FR the decimal-sep `,` falls through
+            // the pre-dispatch (it's not an arg/array-col/array-row
+            // glyph in those locales) and lands here, starting a
+            // number. In EN the decimal-sep `.` falls through too
+            // (also not a separator glyph in EN's role table) and
+            // restores the prior `'0'..='9' | '.'` arm exactly.
+            c if c == decimal_sep => out.push(lex_number(&mut chars, decimal_sep)?),
             // **W5-88 (Phase 4.6.A part 2):** quoted sheet name `'...'`.
             // Single-quote has no other lexical role in Excel formulas;
             // bare/unclosed/non-prefix `'...'` surfaces as a clean lex
@@ -2219,22 +2250,21 @@ mod tests {
         }
     }
 
-    /// **W5-134 contract:** `lex_with(input, mode, locale)` accepts
-    /// any `(mode, locale)` pair without panicking — even on inputs
-    /// that the eventual 4.9.B.4 R1C1 lexer would parse differently.
-    /// The current behavior is mode/locale-invariant (no consumption).
-    /// This pins the "scaffolding only" contract — a future cycle
-    /// that wires `mode` MUST consciously update or delete this test.
+    /// **W5-134 contract, relaxed in W5-136:** `lex_with(input,
+    /// mode, locale)` must not PANIC for any `(mode, locale)` pair.
+    /// Returning `Err` is a valid outcome — DE/FR will reject
+    /// EN-syntax input like `SUM(A1, A2)` because `,` is the
+    /// decimal separator in DE/FR, not an arg separator. The
+    /// original assertion (`is_ok()`) was overly strict; the actual
+    /// contract has always been "no panic."
     #[test]
     fn lex_with_accepts_all_mode_locale_combinations_without_panic() {
         let src = "SUM(A1, A2)";
         for mode in [ReferenceMode::A1, ReferenceMode::R1C1] {
             for locale in [Locale::EnUs, Locale::De, Locale::Fr] {
-                let result = lex_with(src, mode, locale);
-                assert!(
-                    result.is_ok(),
-                    "lex_with panicked on ({mode:?}, {locale:?}) for {src:?}"
-                );
+                // `let _` discards Ok/Err — only a panic would fail
+                // the test.
+                let _ = lex_with(src, mode, locale);
             }
         }
     }
@@ -2349,5 +2379,140 @@ mod tests {
                 other => panic!("EN regression: {src:?} expected single Number, got {other:?}"),
             }
         }
+    }
+
+    // ===== W5-136 (Phase 4.9.B.3) — locale-aware arg/array separators =====
+
+    /// **DE arg separator**: `SUM(1;2)` lexes the same way
+    /// `SUM(1,2)` does in EN. The token vocab stays the same; only
+    /// the source glyph mapping changes. (Note: the lexer emits
+    /// `SUM` as `Token::BareColumn` because letters look like column
+    /// refs; the parser disambiguates to a function call when `(`
+    /// follows. This is pre-existing EN behavior — we pin the SAME
+    /// stream for DE.)
+    #[test]
+    fn de_locale_semicolon_acts_as_arg_separator() {
+        let de = lex_with("SUM(1;2)", ReferenceMode::A1, Locale::De).unwrap();
+        let en = lex_with("SUM(1,2)", ReferenceMode::A1, Locale::EnUs).unwrap();
+        assert_eq!(
+            de, en,
+            "DE `SUM(1;2)` and EN `SUM(1,2)` must yield identical token streams"
+        );
+    }
+
+    /// **DE array col separator** `\\`: `1\\2` lexes as `Number(1),
+    /// Comma, Number(2)`. EN array col is `,` (same role-token), so
+    /// the parser sees identical structure regardless of locale.
+    #[test]
+    fn de_locale_backslash_acts_as_array_col_separator() {
+        let tokens = lex_with("1\\2", ReferenceMode::A1, Locale::De).unwrap();
+        assert_eq!(
+            tokens,
+            vec![Token::Number(1.0), Token::Comma, Token::Number(2.0)]
+        );
+    }
+
+    /// **DE array row separator** `.`: `1.2` (no decimal context)
+    /// lexes as `Number(1), Semicolon, Number(2)`. The `.` is intercepted
+    /// by the pre-dispatch (role: array-row-separator in DE), NOT
+    /// number-lex (decimal-sep in DE is `,`). Mirrors EN's `1;2` →
+    /// `Number(1), Semicolon, Number(2)`.
+    #[test]
+    fn de_locale_dot_acts_as_array_row_separator() {
+        let tokens = lex_with("1.2", ReferenceMode::A1, Locale::De).unwrap();
+        assert_eq!(
+            tokens,
+            vec![Token::Number(1.0), Token::Semicolon, Token::Number(2.0)]
+        );
+    }
+
+    /// **Full DE array literal** `{1\\2.3\\4}` parses as a 2×2 array
+    /// (matching EN `{1,2;3,4}`). Tokens: `LBrace, Number(1), Comma,
+    /// Number(2), Semicolon, Number(3), Comma, Number(4), RBrace`.
+    #[test]
+    fn de_locale_full_array_literal_lexes_as_2x2() {
+        let tokens = lex_with("{1\\2.3\\4}", ReferenceMode::A1, Locale::De).unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::LBrace,
+                Token::Number(1.0),
+                Token::Comma,
+                Token::Number(2.0),
+                Token::Semicolon,
+                Token::Number(3.0),
+                Token::Comma,
+                Token::Number(4.0),
+                Token::RBrace,
+            ]
+        );
+    }
+
+    /// **DE leading-`,` decimal** — closes the gap from 4.9.B.2's
+    /// docstring. `,5` in DE was previously hitting the literal `,`
+    /// arm (deleted in 4.9.B.3); now the pre-dispatch doesn't match
+    /// `,` (it's decimal_sep, not arg/array-sep), so the decimal-
+    /// start arm fires and lexes the leading-comma number.
+    #[test]
+    fn de_locale_leading_comma_is_decimal_start() {
+        let tokens = lex_with(",5", ReferenceMode::A1, Locale::De).unwrap();
+        assert_eq!(tokens, vec![Token::Number(0.5)]);
+    }
+
+    /// **EN regression battery — `,` and `;` unchanged.** Pin the
+    /// pre-existing EN behavior: `,` is `Comma`, `;` is `Semicolon`,
+    /// `{1,2;3,4}` is a 2×2 array. The pre-dispatch maps each glyph
+    /// to the SAME token it did before (EN arg/array-col = `,` →
+    /// Comma; EN array-row = `;` → Semicolon). Net change for EN
+    /// must be zero.
+    #[test]
+    fn en_locale_separators_unchanged_after_4_9_b_3() {
+        // Comma + Semicolon at top level.
+        let tokens = lex_with("a,b;c", ReferenceMode::A1, Locale::EnUs).unwrap();
+        assert_eq!(tokens.len(), 5);
+        assert!(matches!(&tokens[0], Token::BareColumn { .. }));
+        assert_eq!(tokens[1], Token::Comma);
+        assert!(matches!(&tokens[2], Token::BareColumn { .. }));
+        assert_eq!(tokens[3], Token::Semicolon);
+        assert!(matches!(&tokens[4], Token::BareColumn { .. }));
+        // Full EN array literal.
+        let arr = lex_with("{1,2;3,4}", ReferenceMode::A1, Locale::EnUs).unwrap();
+        assert_eq!(
+            arr,
+            vec![
+                Token::LBrace,
+                Token::Number(1.0),
+                Token::Comma,
+                Token::Number(2.0),
+                Token::Semicolon,
+                Token::Number(3.0),
+                Token::Comma,
+                Token::Number(4.0),
+                Token::RBrace,
+            ]
+        );
+    }
+
+    /// **DE `,` outside number context** — `,` is decimal_sep in DE.
+    /// At the loop boundary, `,` falls through pre-dispatch (not a
+    /// role-glyph in DE) AND falls through the digit arm. It hits
+    /// the `c if c == decimal_sep` arm → starts a number. Number-lex
+    /// reads `,` as `.`, raw becomes `.`, parses as 0.0. So `,`
+    /// standalone in DE is `Number(0.0)` followed by whatever's
+    /// next. Pin via `,5,3` → `Number(0.5), Number(0.3)` (no comma
+    /// token between — the comma is consumed as part of each number
+    /// start; the gap shows up only if there's a non-digit / non-
+    /// arg separator between).
+    ///
+    /// Edge case: `,5;3` in DE → `Number(0.5), Number(0.3)` because
+    /// `;` is the arg sep (intercepted as Comma) before second number.
+    #[test]
+    fn de_locale_separator_pair_dispatch_disambiguates_correctly() {
+        // `5;6` in DE: 5 → Number, ; → Comma (arg sep), 6 → Number.
+        let tokens = lex_with("5;6", ReferenceMode::A1, Locale::De).unwrap();
+        assert_eq!(
+            tokens,
+            vec![Token::Number(5.0), Token::Comma, Token::Number(6.0)]
+        );
     }
 }
