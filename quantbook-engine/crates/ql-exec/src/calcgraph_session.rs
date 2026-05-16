@@ -355,6 +355,9 @@ pub struct HookCounts {
     /// invocations. Follow-up commits add per-hook counts for the
     /// other 4 table hooks (create / rename / column-rename / resize).
     pub table_drop: u64,
+    /// **W5-157 (Phase 4.8.G.3):** counts of `on_table_rename`
+    /// invocations.
+    pub table_rename: u64,
 }
 
 /// Phase 3.2: aggregate outcome of `rebuild_from_workbook`. Parallel
@@ -963,6 +966,97 @@ impl CalcgraphSession {
                 .flat_map(|(_, set)| set.iter().copied())
                 .collect()
         };
+        for n in dependents {
+            self.dirty.insert(n);
+            if let Some((s, r, c)) = self.cell_address_for(n) {
+                self.mark_dirty_from_cell_write(s, r, c);
+            }
+        }
+    }
+
+    /// **W5-157 (Phase 4.8.G.3):** mutation hook fired by
+    /// `WorkbookRuntime::rename_table`. The runtime has already:
+    /// (a) rewritten formula text from `Old[Col]` → `New[Col]` via
+    /// `ast::rewrite_table_ref` + `put_formula` (storage layer —
+    /// bypasses `on_set_formula`), (b) re-keyed `TableTable` from
+    /// `OLD` → `NEW`, (c) cleared the plan cache. The calcgraph
+    /// session is therefore stale in two places:
+    ///
+    /// 1. `table_to_formulas[OLD]` still points at the readers — a
+    ///    later `on_table_drop(NEW)` would miss them.
+    /// 2. `formula_deps[F].tables` still contains the Arc<str> for
+    ///    `OLD` — a later re-bind of F would call `remove_formula_deps`
+    ///    which walks `deps.tables` to clean up `table_to_formulas`,
+    ///    missing the moved-to-`NEW` entry and leaking it.
+    ///
+    /// This hook fixes both: re-keys the reverse index from `OLD` →
+    /// `NEW`, substitutes the matching Arc<str> in each dependent's
+    /// `deps.tables` with a fresh `Arc::from(NEW)`, and dirty-fans the
+    /// readers so the next `recompute_dirty` re-binds against the new
+    /// table name. The resolved Range is unchanged by rename (same
+    /// data cells), so VEQ will typically suppress the value write —
+    /// but the re-bind refreshes the plan cache entry under the new
+    /// canonical name and keeps the calcgraph consistent.
+    ///
+    /// Names arrive as canonical uppercase from the runtime (per
+    /// `rename_table`'s `to_ascii_uppercase()` normalization). The
+    /// case-insensitive fallback on lookup is defensive only.
+    pub fn on_table_rename(&mut self, old_name: &str, new_name: &str) {
+        self.hook_counts.table_rename = self.hook_counts.table_rename.saturating_add(1);
+        // 1. Find dependents under the old key (exact then case-insensitive).
+        let dependents: Vec<NodeId> = if let Some(set) = self.table_to_formulas.get(old_name) {
+            set.iter().copied().collect()
+        } else {
+            self.table_to_formulas
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(old_name))
+                .flat_map(|(_, set)| set.iter().copied())
+                .collect()
+        };
+        if dependents.is_empty() {
+            return;
+        }
+
+        let new_arc: Arc<str> = Arc::from(new_name);
+
+        // 2. Substitute the old Arc with `new_arc` in each dependent's
+        //    `deps.tables`. Matches case-insensitively in case the
+        //    original Arc held a different casing than the runtime's
+        //    canonical uppercase (defensive; today's binder canonicalizes
+        //    via `Arc::clone(&table.name)` which is uppercase).
+        for &n in &dependents {
+            if let Some(deps) = self.formula_deps.get_mut(&n) {
+                for t in deps.tables.iter_mut() {
+                    if t.eq_ignore_ascii_case(old_name) {
+                        *t = Arc::clone(&new_arc);
+                    }
+                }
+            }
+        }
+
+        // 3. Re-key `table_to_formulas`: remove every entry whose key
+        //    matches `old_name` case-insensitively, then insert the
+        //    dependents under the canonical `new_arc`. Handles the
+        //    edge case where the index held a different casing (so
+        //    we don't leak the old Arc allocation).
+        let keys_to_remove: Vec<Arc<str>> = self
+            .table_to_formulas
+            .keys()
+            .filter(|k| k.eq_ignore_ascii_case(old_name))
+            .cloned()
+            .collect();
+        for k in keys_to_remove {
+            self.table_to_formulas.remove(&k);
+        }
+        let target = self
+            .table_to_formulas
+            .entry(Arc::clone(&new_arc))
+            .or_default();
+        for n in &dependents {
+            target.insert(*n);
+        }
+
+        // 4. Dirty-fan (same pattern as on_table_drop / on_set_name).
         for n in dependents {
             self.dirty.insert(n);
             if let Some((s, r, c)) = self.cell_address_for(n) {
@@ -3691,5 +3785,154 @@ mod tests {
         assert_eq!(s.hook_counts().table_drop, 1);
         s.on_table_drop("AlsoNonexistent");
         assert_eq!(s.hook_counts().table_drop, 2);
+    }
+
+    // W5-157 (Phase 4.8.G.3) — on_table_rename hook tests.
+
+    /// **W5-157:** `on_table_rename` re-keys `table_to_formulas` so a
+    /// subsequent `on_table_drop` under the NEW name finds the
+    /// dependent formulas, and dirty-fans them.
+    #[test]
+    fn on_table_rename_rekeys_index_and_dirties_readers() {
+        use std::sync::Arc;
+        let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
+        let plan = ExprPlan::StructuredRef {
+            table_name: Arc::from("SALES"),
+            source: Arc::new(ql_formula_syntax::TableSpecSubtree::BareColumn(Arc::from(
+                "Qty",
+            ))),
+            resolved: ql_types::Range::new(0, 0, 0, 10, 0),
+            is_this_row: false,
+        };
+        s.on_set_formula(0, 5, 5, &plan, &wb);
+        let f1 = s.cell_node_for(0, 5, 5).unwrap();
+        s.take_dirty();
+
+        s.on_table_rename("SALES", "ORDERS");
+        // Drain the rename's own dirty fanout so the next take_dirty()
+        // reflects only the drop's effect.
+        s.take_dirty();
+
+        // Re-key check: dropping under the OLD name must NOT dirty F1.
+        s.on_table_drop("SALES");
+        let after_old_drop = s.take_dirty();
+        assert!(
+            !after_old_drop.contains(&f1),
+            "after rename, dropping the OLD name must not dirty the reader"
+        );
+
+        // Dropping under the NEW name MUST dirty F1.
+        s.on_table_drop("ORDERS");
+        let after_new_drop = s.take_dirty();
+        assert!(
+            after_new_drop.contains(&f1),
+            "after rename, dropping the NEW name must dirty the reader"
+        );
+    }
+
+    /// **W5-157:** the hook itself dirties the readers (independent of
+    /// later drop / drop-after-rename behavior).
+    #[test]
+    fn on_table_rename_dirties_readers_directly() {
+        use std::sync::Arc;
+        let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
+        let plan = ExprPlan::StructuredRef {
+            table_name: Arc::from("SALES"),
+            source: Arc::new(ql_formula_syntax::TableSpecSubtree::BareColumn(Arc::from(
+                "Qty",
+            ))),
+            resolved: ql_types::Range::new(0, 0, 0, 10, 0),
+            is_this_row: false,
+        };
+        s.on_set_formula(0, 5, 5, &plan, &wb);
+        let f1 = s.cell_node_for(0, 5, 5).unwrap();
+        s.take_dirty();
+
+        s.on_table_rename("SALES", "ORDERS");
+        let dirty = s.take_dirty();
+        assert!(
+            dirty.contains(&f1),
+            "on_table_rename must dirty the reader directly"
+        );
+    }
+
+    /// **W5-157:** `formula_deps[F].tables` is updated in-place so a
+    /// subsequent `remove_formula_deps(F)` (rebind / clear) cleans up
+    /// the right `table_to_formulas` entry.
+    #[test]
+    fn on_table_rename_updates_formula_deps_tables_in_place() {
+        use std::sync::Arc;
+        let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
+        let plan = ExprPlan::StructuredRef {
+            table_name: Arc::from("SALES"),
+            source: Arc::new(ql_formula_syntax::TableSpecSubtree::BareColumn(Arc::from(
+                "Qty",
+            ))),
+            resolved: ql_types::Range::new(0, 0, 0, 10, 0),
+            is_this_row: false,
+        };
+        s.on_set_formula(0, 5, 5, &plan, &wb);
+        let f1 = s.cell_node_for(0, 5, 5).unwrap();
+
+        s.on_table_rename("SALES", "ORDERS");
+
+        let deps = s.formula_deps(f1).expect("deps registered");
+        assert!(
+            deps.tables.iter().any(|t| t.as_ref() == "ORDERS"),
+            "deps.tables must contain ORDERS after rename — got {:?}",
+            deps.tables
+        );
+        assert!(
+            !deps.tables.iter().any(|t| t.as_ref() == "SALES"),
+            "deps.tables must not retain SALES after rename — got {:?}",
+            deps.tables
+        );
+    }
+
+    /// **W5-157:** `HookCounts.table_rename` bumps per invocation.
+    #[test]
+    fn on_table_rename_bumps_hook_count() {
+        let mut s = CalcgraphSession::new();
+        assert_eq!(s.hook_counts().table_rename, 0);
+        s.on_table_rename("Foo", "Bar");
+        assert_eq!(s.hook_counts().table_rename, 1);
+        s.on_table_rename("Bar", "Baz");
+        assert_eq!(s.hook_counts().table_rename, 2);
+    }
+
+    /// **W5-157:** case-insensitive fallback when the index key
+    /// casing differs from the runtime-supplied `old_name`.
+    #[test]
+    fn on_table_rename_case_insensitive_fallback() {
+        use std::sync::Arc;
+        let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
+        let plan = ExprPlan::StructuredRef {
+            table_name: Arc::from("Sales"), // mixed-case Arc
+            source: Arc::new(ql_formula_syntax::TableSpecSubtree::BareColumn(Arc::from(
+                "Qty",
+            ))),
+            resolved: ql_types::Range::new(0, 0, 0, 10, 0),
+            is_this_row: false,
+        };
+        s.on_set_formula(0, 5, 5, &plan, &wb);
+        let f1 = s.cell_node_for(0, 5, 5).unwrap();
+        s.take_dirty();
+
+        // Runtime canonicalizes to uppercase before calling the hook.
+        s.on_table_rename("SALES", "ORDERS");
+        let dirty = s.take_dirty();
+        assert!(
+            dirty.contains(&f1),
+            "case-insensitive lookup must reach the reader"
+        );
+
+        // The deps.tables entry must be substituted (not retained as "Sales").
+        let deps = s.formula_deps(f1).unwrap();
+        assert!(deps.tables.iter().any(|t| t.as_ref() == "ORDERS"));
+        assert!(!deps.tables.iter().any(|t| t.as_ref() == "Sales"));
     }
 }

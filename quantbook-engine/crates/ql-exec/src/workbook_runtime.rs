@@ -1915,6 +1915,16 @@ impl<'a> WorkbookRuntime<'a> {
         meta.name = Arc::clone(&new_canonical_arc);
         meta.display_name = Arc::clone(&new_display_arc);
         self.workbook.tables_mut().insert(new_canonical_arc, meta);
+        // **W5-157 (Phase 4.8.G.3):** fire the calcgraph hook to
+        // re-key `table_to_formulas[OLD] → [NEW]`, substitute the
+        // Arc<str> in each reader's `deps.tables` so a future
+        // `remove_formula_deps` cleans up correctly, and dirty-fan
+        // the readers. Without this, a subsequent `drop_table(NEW)`
+        // would miss every formula that previously bound against
+        // `OLD` (the index still keys them under the stale name).
+        if let Some(g) = self.graph.as_deref_mut() {
+            g.on_table_rename(&old_canonical, &new_canonical);
+        }
         // Invalidate plan cache by clearing — every formula that
         // referenced the OLD name now has new text, so cache lookups
         // miss anyway; the bare invalidation prevents stale entries.
@@ -10354,6 +10364,68 @@ mod tests {
             }
             other => panic!("expected PutFormula for rewrite, got {other:?}"),
         }
+    }
+
+    /// **W5-157 (Phase 4.8.G.3):** `rename_table` fires
+    /// `on_table_rename` so the calcgraph reverse index re-keys
+    /// from OLD → NEW. A subsequent `drop_table(NEW)` must then
+    /// produce `#NAME?` at the reader. Without the hook, the
+    /// index stays under OLD and `drop_table(NEW)` would miss
+    /// every previously-bound formula.
+    #[test]
+    fn rename_table_then_drop_new_name_emits_name_error() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+            rt.set_value(0, 1, 0, Value::Number(10.0)).unwrap();
+            rt.set_value(0, 2, 0, Value::Number(20.0)).unwrap();
+            let v = rt.set_formula(0, 0, 1, "SUM(Sales[Qty])").unwrap();
+            assert_eq!(v, Value::Number(30.0));
+            let _ = rt.recompute_dirty().expect("graph attached");
+        }
+        let before_rename_count = graph.hook_counts().table_rename;
+
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            let rewritten = rt.rename_table("Sales", "Orders").unwrap();
+            assert_eq!(rewritten, 1, "B1's formula text was rewritten");
+            // Drain the rename's dirty fanout — B1 re-binds against Orders
+            // and produces the same Number(30.0) (same cells, same data).
+            let _ = rt.recompute_dirty().expect("graph attached");
+        }
+        assert_eq!(
+            graph.hook_counts().table_rename,
+            before_rename_count + 1,
+            "rename_table must fire on_table_rename exactly once"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Number(30.0),
+            "post-rename: same cells, same value"
+        );
+
+        // Now drop under the NEW name — the index must find B1.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.drop_table("Orders").unwrap();
+            let result = rt.recompute_dirty().expect("graph attached");
+            assert!(
+                result.failures.is_empty(),
+                "no structural failures: {:?}",
+                result.failures
+            );
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Error(ErrorValue::Name),
+            "rename(Sales→Orders) then drop(Orders): B1 must be #NAME? — \
+             proves on_table_rename re-keyed the calcgraph index"
+        );
     }
 
     // ===== W5-121 (Phase 4.8.I.2) — rename_column =====
