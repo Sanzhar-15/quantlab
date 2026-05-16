@@ -240,6 +240,16 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "TEXTJOIN",
         "W5-167; unit tests pin delimiter join + ignore_empty + range flatten + Excel 32,767 cap",
     ),
+    // W5-173 (Phase 4.10 polish, NUMBERVALUE) — closes a deferred Wave 2
+    // entry. Unit tests pin Microsoft canon: locale-default separators,
+    // explicit-separator override, decimal == group → #VALUE!, multi-decimal
+    // → #VALUE!, group-after-decimal → #VALUE!, trailing `%` divides by 100,
+    // empty / whitespace text → 0 (NOT #VALUE!), internal space + NBSP
+    // ignored, leading sign at position 0 only.
+    (
+        "NUMBERVALUE",
+        "W5-173; unit tests pin Microsoft NUMBERVALUE canon (separator override + percent suffix + empty-text-is-zero)",
+    ),
     // W5-168 (Phase 4.10.F) — financial TVM + cash-flow.
     (
         "PMT",

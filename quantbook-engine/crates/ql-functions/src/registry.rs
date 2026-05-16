@@ -588,6 +588,11 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_context_aware("FIXED", scalar_fns::fixed_ctx);
     r.register_context_aware("DOLLAR", scalar_fns::dollar_ctx);
 
+    // Phase 4.10 polish (W5-173) — NUMBERVALUE: like VALUE but with
+    // explicit decimal + group separator args. Trailing `%` divides by
+    // 100 per Microsoft canon. Empty/blank text → 0 (NOT #VALUE!).
+    r.register_context_aware("NUMBERVALUE", scalar_fns::numbervalue_ctx);
+
     // Engine Phase 4.3 V2 batch — range-aware (W5-53, GAP-F-05
     // closure). These use the new `RangeAwareFn` table because the
     // existing `ScalarFn = fn(&[Value]) -> Value` contract can't
@@ -732,8 +737,11 @@ mod tests {
         // = 7 TVM scalars + NPV, IRR = 2 cash-flow range-aware = 9
         // total) +
         // Phase 4.10.G (W5-169: XLOOKUP, XMATCH = 2 modern lookups +
-        // ADDRESS = 1 scalar text formatter = 3 total; CLOSES Wave 2).
-        assert_eq!(r.len(), 180);
+        // ADDRESS = 1 scalar text formatter = 3 total; CLOSES Wave 2) +
+        // Phase 4.10 polish (W5-173: NUMBERVALUE = 1 locale-explicit
+        // text-to-number variant of VALUE; closes Wave 2 deferred-list
+        // entry per handoff 2026-05-16).
+        assert_eq!(r.len(), 181);
     }
 
     #[test]

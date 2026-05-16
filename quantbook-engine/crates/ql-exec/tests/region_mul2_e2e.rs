@@ -445,6 +445,25 @@ fn e2e_textjoin_registered() {
 }
 
 #[test]
+fn e2e_numbervalue_basic_enus() {
+    // W5-173 dispatch-gap defense — three paths through numbervalue_ctx so a
+    // registry typo (e.g. accidentally swapping with value_ctx) trips the test.
+    // =NUMBERVALUE("1.5") → 1.5 (default EnUs separators).
+    let result = eval_source_with_registry(r#"NUMBERVALUE("1.5")"#, &[]);
+    assert_eq!(result, Value::Number(1.5));
+    // =NUMBERVALUE("50%") → 0.5 (trailing % branch, NOT exercised by VALUE).
+    let result = eval_source_with_registry(r#"NUMBERVALUE("50%")"#, &[]);
+    assert_eq!(result, Value::Number(0.5));
+    // =NUMBERVALUE("1,234.56", ".", ",") → 1234.56 (explicit separator args
+    // — VALUE only takes 1 arg, so this confirms the right fn is dispatched).
+    let result = eval_source_with_registry(r#"NUMBERVALUE("1,234.56", ".", ",")"#, &[]);
+    assert_eq!(result, Value::Number(1234.56));
+    // =NUMBERVALUE("") → 0 (canonical divergence from VALUE which is #VALUE!).
+    let result = eval_source_with_registry(r#"NUMBERVALUE("")"#, &[]);
+    assert_eq!(result, Value::Number(0.0));
+}
+
+#[test]
 fn e2e_address_basic() {
     // =ADDRESS(1, 1) → "$A$1" (default abs_num=1, a1=TRUE).
     let result = eval_source_with_registry("ADDRESS(1, 1)", &[]);

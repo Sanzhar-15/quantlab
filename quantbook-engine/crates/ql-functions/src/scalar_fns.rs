@@ -2298,6 +2298,19 @@ fn locale_decimal_separator(locale: ql_types::Locale) -> char {
     }
 }
 
+/// **W5-173:** Group (thousands) separator for the workbook's locale.
+/// Mirrors the pair used by `format_grouped` so NUMBERVALUE's default
+/// `group_separator` round-trips with FIXED/DOLLAR output. Fr uses a
+/// regular ASCII space (NBSP would be more faithful to Office Fr, but
+/// `format_grouped` emits regular space and we keep the inverse aligned).
+fn locale_group_separator(locale: ql_types::Locale) -> char {
+    match locale {
+        ql_types::Locale::EnUs => ',',
+        ql_types::Locale::De => '.',
+        ql_types::Locale::Fr => ' ',
+    }
+}
+
 /// **W5-167:** `VALUE(text, &ctx)` — parse text as a number respecting
 /// the workbook's locale (decimal separator). Excel canon allows
 /// currency prefixes, percent suffixes, and date/time strings; V1
@@ -2346,6 +2359,169 @@ pub fn value_ctx(args: &[Value], ctx: &ql_types::EvalContext) -> Value {
             Err(e) => Value::Error(e),
         },
         Err(_) => Value::Error(ErrorValue::Value),
+    }
+}
+
+/// **W5-173 (Phase 4.10 polish):** resolve an optional separator argument
+/// for `NUMBERVALUE`. Microsoft canon:
+/// - Omitted or `Value::Blank` → caller-supplied locale default.
+/// - Text longer than one char → only the FIRST character is used.
+/// - Empty string `""` → `#VALUE!` (NOT locale default — strict per docs).
+/// - `Value::Error` → propagate the error.
+/// - Other types (Number, Boolean) → text-coerce then take first char.
+fn resolve_separator(arg: Option<&Value>, default: char) -> Result<char, ErrorValue> {
+    match arg {
+        None | Some(Value::Blank) => Ok(default),
+        Some(Value::Error(e)) => Err(*e),
+        Some(v) => {
+            let s = coerce_text(v)?;
+            match s.chars().next() {
+                Some(c) => Ok(c),
+                None => Err(ErrorValue::Value),
+            }
+        }
+    }
+}
+
+/// **W5-173 (Phase 4.10 polish):** `NUMBERVALUE(text, [decimal_sep],
+/// [group_sep])` — locale-explicit text-to-number conversion. Differs
+/// from `VALUE` in three ways per Microsoft canon:
+///
+/// 1. Empty or whitespace-only `text` → `0` (VALUE returns `#VALUE!`).
+/// 2. Caller supplies decimal + group separators explicitly; defaults
+///    come from the workbook locale.
+/// 3. Trailing `%` characters each divide the result by 100 (so
+///    `NUMBERVALUE("50%%")` → `0.005`).
+///
+/// V1 strict semantics:
+/// - `decimal_separator == group_separator` → `#VALUE!`.
+/// - Decimal separator appearing more than once in `text` → `#VALUE!`.
+/// - Group separator appearing AFTER the decimal in `text` → `#VALUE!`.
+/// - Group separator may appear any number of times BEFORE the decimal
+///   without enforcement of 3-digit grouping (matches Excel: `"1,2,3"`
+///   → `123`).
+/// - ASCII space + NBSP (`U+00A0`) inside `text` are ignored per the
+///   "spaces inside the Text argument are ignored" rule.
+/// - Leading sign (`+` or `-`) accepted at the start; sign elsewhere
+///   → `#VALUE!`.
+/// - Non-digit / non-separator / non-sign / non-space characters
+///   → `#VALUE!` (no currency symbol parsing, no scientific notation).
+///
+/// Error propagation: `Value::Error` in ANY arg short-circuits with
+/// the first error encountered (text arg first).
+pub fn numbervalue_ctx(args: &[Value], ctx: &ql_types::EvalContext) -> Value {
+    if args.is_empty() || args.len() > 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    for a in args {
+        if let Value::Error(e) = a {
+            return Value::Error(*e);
+        }
+    }
+    // Numbers pass through (no separator interpretation needed).
+    if let Value::Number(n) = &args[0] {
+        return Value::Number(*n);
+    }
+    // Blank text → 0 per Microsoft canon ("empty string Text → 0").
+    if matches!(&args[0], Value::Blank) {
+        return Value::Number(0.0);
+    }
+    let raw = match coerce_text(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Value::Number(0.0);
+    }
+
+    let decimal_sep = match resolve_separator(args.get(1), locale_decimal_separator(ctx.locale)) {
+        Ok(c) => c,
+        Err(e) => return Value::Error(e),
+    };
+    let group_sep = match resolve_separator(args.get(2), locale_group_separator(ctx.locale)) {
+        Ok(c) => c,
+        Err(e) => return Value::Error(e),
+    };
+    if decimal_sep == group_sep {
+        return Value::Error(ErrorValue::Value);
+    }
+
+    // Strip trailing `%` markers (with whitespace between them tolerated
+    // since we re-trim each iteration). Each `%` divides the parsed
+    // result by 100.
+    let mut work: &str = trimmed;
+    let mut percent_count: i32 = 0;
+    loop {
+        let te = work.trim_end();
+        match te.strip_suffix('%') {
+            Some(stripped) => {
+                percent_count += 1;
+                work = stripped;
+            }
+            None => {
+                work = te;
+                break;
+            }
+        }
+    }
+    let work = work.trim_start();
+    if work.is_empty() {
+        return Value::Error(ErrorValue::Value);
+    }
+
+    // Pull off leading sign so it lands first in the rebuilt string,
+    // before any group-separator characters are skipped.
+    let (sign_prefix, body): (&str, &str) = match work.chars().next() {
+        Some('+') => ("", &work[1..]),
+        Some('-') => ("-", &work[1..]),
+        _ => ("", work),
+    };
+
+    let mut out = String::with_capacity(body.len() + 1);
+    out.push_str(sign_prefix);
+    let mut saw_decimal = false;
+    let mut saw_digit = false;
+    for c in body.chars() {
+        // Internal ASCII space and NBSP ignored (Microsoft canon).
+        if c == ' ' || c == '\u{00A0}' {
+            continue;
+        }
+        if c == decimal_sep {
+            if saw_decimal {
+                return Value::Error(ErrorValue::Value);
+            }
+            saw_decimal = true;
+            out.push('.');
+        } else if c == group_sep {
+            if saw_decimal {
+                // Group AFTER decimal → reject per Microsoft canon.
+                return Value::Error(ErrorValue::Value);
+            }
+            // Otherwise skip silently (don't enforce 3-digit grouping).
+        } else if c.is_ascii_digit() {
+            out.push(c);
+            saw_digit = true;
+        } else {
+            return Value::Error(ErrorValue::Value);
+        }
+    }
+    if !saw_digit {
+        return Value::Error(ErrorValue::Value);
+    }
+
+    let parsed: f64 = match out.parse() {
+        Ok(n) => n,
+        Err(_) => return Value::Error(ErrorValue::Value),
+    };
+    let adjusted = if percent_count > 0 {
+        parsed / 100f64.powi(percent_count)
+    } else {
+        parsed
+    };
+    match ql_types::coercion::sanitize_f64(adjusted) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
     }
 }
 
@@ -5398,6 +5574,347 @@ mod tests {
             value_ctx(&[Value::text("hello")], &ctx),
             Value::Error(ErrorValue::Value)
         );
+    }
+
+    // --- NUMBERVALUE (W5-173) ---
+
+    #[test]
+    fn numbervalue_basic_enus() {
+        let ctx = ctx_default();
+        assert_eq!(numbervalue_ctx(&[Value::text("1.5")], &ctx), n(1.5));
+        assert_eq!(numbervalue_ctx(&[Value::text("1234.56")], &ctx), n(1234.56));
+        assert_eq!(numbervalue_ctx(&[Value::text("-7.25")], &ctx), n(-7.25));
+        assert_eq!(numbervalue_ctx(&[Value::text("+8.5")], &ctx), n(8.5));
+    }
+
+    #[test]
+    fn numbervalue_blank_is_zero() {
+        let ctx = ctx_default();
+        assert_eq!(numbervalue_ctx(&[Value::Blank], &ctx), n(0.0));
+    }
+
+    #[test]
+    fn numbervalue_empty_string_is_zero() {
+        // Microsoft canon: "if an empty string is used as Text, the result is 0".
+        let ctx = ctx_default();
+        assert_eq!(numbervalue_ctx(&[Value::text("")], &ctx), n(0.0));
+    }
+
+    #[test]
+    fn numbervalue_whitespace_only_is_zero() {
+        let ctx = ctx_default();
+        assert_eq!(numbervalue_ctx(&[Value::text("   ")], &ctx), n(0.0));
+        assert_eq!(numbervalue_ctx(&[Value::text("\t\n")], &ctx), n(0.0));
+    }
+
+    #[test]
+    fn numbervalue_explicit_decimal_separator() {
+        let ctx = ctx_default();
+        // EnUs locale, but caller forces ',' as decimal — must ALSO supply
+        // a different group separator (',' would collide with the default
+        // EnUs group ',' → #VALUE! per the decimal==group rule).
+        assert_eq!(
+            numbervalue_ctx(
+                &[Value::text("1,5"), Value::text(","), Value::text(".")],
+                &ctx
+            ),
+            n(1.5)
+        );
+    }
+
+    #[test]
+    fn numbervalue_explicit_group_separator() {
+        let ctx = ctx_default();
+        // "1,234.5" with decimal='.' group=',' → 1234.5.
+        assert_eq!(
+            numbervalue_ctx(
+                &[Value::text("1,234.5"), Value::text("."), Value::text(","),],
+                &ctx
+            ),
+            n(1234.5)
+        );
+    }
+
+    #[test]
+    fn numbervalue_decimal_equals_group_is_value_error() {
+        let ctx = ctx_default();
+        assert_eq!(
+            numbervalue_ctx(
+                &[Value::text("1.5"), Value::text(","), Value::text(",")],
+                &ctx
+            ),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn numbervalue_multiple_decimals_is_value_error() {
+        let ctx = ctx_default();
+        assert_eq!(
+            numbervalue_ctx(&[Value::text("1.2.3")], &ctx),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn numbervalue_group_after_decimal_is_value_error() {
+        let ctx = ctx_default();
+        // "1.234,5" with decimal='.' group=',': after '.' we see ',' → reject.
+        assert_eq!(
+            numbervalue_ctx(
+                &[Value::text("1.234,5"), Value::text("."), Value::text(","),],
+                &ctx
+            ),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn numbervalue_multiple_groups_ok() {
+        let ctx = ctx_default();
+        // EnUs defaults: decimal='.' group=','. "1,234,567" → 1234567.
+        assert_eq!(
+            numbervalue_ctx(&[Value::text("1,234,567")], &ctx),
+            n(1234567.0)
+        );
+        // Excel also accepts non-3-digit groupings: "1,2,3" → 123.
+        assert_eq!(numbervalue_ctx(&[Value::text("1,2,3")], &ctx), n(123.0));
+    }
+
+    #[test]
+    fn numbervalue_percent_suffix_divides_by_100() {
+        let ctx = ctx_default();
+        assert_eq!(numbervalue_ctx(&[Value::text("50%")], &ctx), n(0.5));
+        assert_eq!(numbervalue_ctx(&[Value::text("3.5%")], &ctx), n(0.035));
+        // Negative + percent.
+        assert_eq!(numbervalue_ctx(&[Value::text("-25%")], &ctx), n(-0.25));
+    }
+
+    #[test]
+    fn numbervalue_multiple_percent_divides_by_100_n() {
+        let ctx = ctx_default();
+        // 50%% = 50 / 100 / 100 = 0.005.
+        assert_eq!(numbervalue_ctx(&[Value::text("50%%")], &ctx), n(0.005));
+        // Three percent signs: 50 / 1e6.
+        assert_eq!(numbervalue_ctx(&[Value::text("50%%%")], &ctx), n(0.000_05));
+    }
+
+    #[test]
+    fn numbervalue_percent_with_trailing_whitespace() {
+        let ctx = ctx_default();
+        // Trailing whitespace AFTER %s is tolerated by the trim-then-strip loop.
+        assert_eq!(numbervalue_ctx(&[Value::text("50%  ")], &ctx), n(0.5));
+        assert_eq!(numbervalue_ctx(&[Value::text("50 % ")], &ctx), n(0.5));
+    }
+
+    #[test]
+    fn numbervalue_leading_sign_only_at_start() {
+        let ctx = ctx_default();
+        // Sign embedded in middle of digits → reject.
+        assert_eq!(
+            numbervalue_ctx(&[Value::text("1-5")], &ctx),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            numbervalue_ctx(&[Value::text("1+5")], &ctx),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn numbervalue_letters_fail() {
+        let ctx = ctx_default();
+        assert_eq!(
+            numbervalue_ctx(&[Value::text("hello")], &ctx),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            numbervalue_ctx(&[Value::text("1.5abc")], &ctx),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            numbervalue_ctx(&[Value::text("$100")], &ctx),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn numbervalue_internal_spaces_ignored() {
+        let ctx = ctx_default();
+        // Microsoft example: " 3 000 " → 3000.
+        assert_eq!(numbervalue_ctx(&[Value::text(" 3 000 ")], &ctx), n(3000.0));
+        // NBSP inside (U+00A0) also ignored.
+        assert_eq!(
+            numbervalue_ctx(&[Value::text("1\u{00A0}234")], &ctx),
+            n(1234.0)
+        );
+    }
+
+    #[test]
+    fn numbervalue_multi_char_separator_uses_first_char() {
+        let ctx = ctx_default();
+        // "..." → first char is '.', so decimal_sep = '.'.
+        assert_eq!(
+            numbervalue_ctx(&[Value::text("1.5"), Value::text("...")], &ctx),
+            n(1.5)
+        );
+    }
+
+    #[test]
+    fn numbervalue_empty_separator_arg_is_value_error() {
+        let ctx = ctx_default();
+        assert_eq!(
+            numbervalue_ctx(&[Value::text("1.5"), Value::text("")], &ctx),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            numbervalue_ctx(
+                &[Value::text("1.5"), Value::text("."), Value::text("")],
+                &ctx
+            ),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn numbervalue_blank_separator_uses_default() {
+        let ctx = ctx_default();
+        // Blank decimal_separator → fall back to locale '.'.
+        assert_eq!(
+            numbervalue_ctx(&[Value::text("1.5"), Value::Blank], &ctx),
+            n(1.5)
+        );
+        assert_eq!(
+            numbervalue_ctx(&[Value::text("1,234.5"), Value::Blank, Value::Blank], &ctx),
+            n(1234.5)
+        );
+    }
+
+    #[test]
+    fn numbervalue_default_locale_de() {
+        let ctx = ctx_de();
+        // De locale defaults: decimal=',' group='.'. "1.234,5" → 1234.5.
+        assert_eq!(numbervalue_ctx(&[Value::text("1.234,5")], &ctx), n(1234.5));
+    }
+
+    #[test]
+    fn numbervalue_default_locale_fr() {
+        let ctx = ctx_fr();
+        // Fr locale defaults: decimal=',' group=' '. "1 234,5" → 1234.5.
+        assert_eq!(numbervalue_ctx(&[Value::text("1 234,5")], &ctx), n(1234.5));
+    }
+
+    #[test]
+    fn numbervalue_number_passes_through() {
+        let ctx = ctx_default();
+        assert_eq!(numbervalue_ctx(&[n(42.0)], &ctx), n(42.0));
+        // Even with explicit separators that don't match — number bypasses parsing.
+        assert_eq!(
+            numbervalue_ctx(&[n(-3.5), Value::text(","), Value::text(".")], &ctx),
+            n(-3.5)
+        );
+    }
+
+    #[test]
+    fn numbervalue_error_in_text_propagates() {
+        let ctx = ctx_default();
+        assert_eq!(
+            numbervalue_ctx(&[Value::Error(ErrorValue::Ref)], &ctx),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn numbervalue_error_in_separator_propagates() {
+        let ctx = ctx_default();
+        assert_eq!(
+            numbervalue_ctx(&[Value::text("1.5"), Value::Error(ErrorValue::Name)], &ctx),
+            Value::Error(ErrorValue::Name)
+        );
+        // Error in group_sep too.
+        assert_eq!(
+            numbervalue_ctx(
+                &[
+                    Value::text("1.5"),
+                    Value::text("."),
+                    Value::Error(ErrorValue::DivZero),
+                ],
+                &ctx
+            ),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn numbervalue_arity_violations() {
+        let ctx = ctx_default();
+        // 0 args.
+        assert_eq!(numbervalue_ctx(&[], &ctx), Value::Error(ErrorValue::Value));
+        // 4 args.
+        assert_eq!(
+            numbervalue_ctx(
+                &[
+                    Value::text("1.5"),
+                    Value::text("."),
+                    Value::text(","),
+                    Value::text("?"),
+                ],
+                &ctx
+            ),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn numbervalue_only_separators_no_digits_fails() {
+        let ctx = ctx_default();
+        // ",." — no digits → reject.
+        assert_eq!(
+            numbervalue_ctx(&[Value::text(",.")], &ctx),
+            Value::Error(ErrorValue::Value)
+        );
+        // Only a sign.
+        assert_eq!(
+            numbervalue_ctx(&[Value::text("-")], &ctx),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn numbervalue_boolean_text_fails() {
+        let ctx = ctx_default();
+        // Excel coerces TRUE/FALSE to "TRUE"/"FALSE" then fails letters check.
+        assert_eq!(
+            numbervalue_ctx(&[Value::Boolean(true)], &ctx),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            numbervalue_ctx(&[Value::Boolean(false)], &ctx),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn numbervalue_zero_with_group_only_ok() {
+        let ctx = ctx_default();
+        // "1,000" → 1000 (no decimal).
+        assert_eq!(numbervalue_ctx(&[Value::text("1,000")], &ctx), n(1000.0));
+    }
+
+    #[test]
+    fn numbervalue_decimal_with_no_integer_part() {
+        let ctx = ctx_default();
+        // ".5" → 0.5.
+        assert_eq!(numbervalue_ctx(&[Value::text(".5")], &ctx), n(0.5));
+        // "-.25" → -0.25.
+        assert_eq!(numbervalue_ctx(&[Value::text("-.25")], &ctx), n(-0.25));
+    }
+
+    #[test]
+    fn numbervalue_trailing_decimal_ok() {
+        let ctx = ctx_default();
+        // "5." → 5.
+        assert_eq!(numbervalue_ctx(&[Value::text("5.")], &ctx), n(5.0));
     }
 
     // --- FIXED ---
