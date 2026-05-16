@@ -508,9 +508,12 @@ pub(crate) fn compute_sln(cost: f64, salvage: f64, life: f64) -> Result<f64, Err
 /// `SYD(cost, salvage, life, per) = (cost − salvage) ·
 /// (life − per + 1) · 2 / (life · (life + 1))`.
 ///
-/// Per Microsoft canon (`life <= 0` or `per > life` or `per <= 0`
-/// → `#NUM!`) — distinct from SLN's `#DIV/0!` for the same
-/// degenerate `life = 0` case. We mirror Microsoft + IronCalc here.
+/// `per > life` or `per <= 0` → `#NUM!`. **`life = 0` → `#NUM!` per
+/// IronCalc convention** (W5-182.1 Opus MEDIUM-2 closure: Microsoft's
+/// SYD doc is silent on the error code for the degenerate case, so
+/// the asymmetry vs SLN's `#DIV/0!` reflects IronCalc's choice, not
+/// documented Microsoft canon. Verified by direct read of
+/// `support.microsoft.com/.../syd-function-...`).
 pub(crate) fn compute_syd(cost: f64, salvage: f64, life: f64, per: f64) -> Result<f64, ErrorValue> {
     if life == 0.0 {
         return Err(ErrorValue::Num);
@@ -590,6 +593,12 @@ pub fn syd(args: &[Value]) -> Value {
 /// for the `factor` arg only (rejects Boolean); our `arg_num`
 /// allows Boolean coercion uniformly across all args. Deliberate
 /// divergence for consistency with the rest of the financial family.
+///
+/// **Microsoft-canon divergence (W5-182.1 Opus MEDIUM-9 closure):**
+/// Microsoft's DDB doc states "All five arguments must be positive
+/// numbers." We follow IronCalc in accepting `cost == 0` (returns 0)
+/// and `salvage == 0` (allows full depreciation to zero). Both
+/// produce sensible numeric results rather than `#NUM!`.
 pub(crate) fn compute_ddb(
     cost: f64,
     salvage: f64,
@@ -632,16 +641,42 @@ pub(crate) fn compute_ddb(
 /// period (when `period = life + 1` with `month ≠ 12`) is the
 /// complementary partial year using `(12 − month) / 12`.
 ///
-/// Validation per Microsoft + IronCalc:
+/// Validation per Microsoft + IronCalc + W5-182.1 audit closures:
 /// - `month == 12 && period > life` → `#NUM!` (no partial last period
 ///   when `month = 12`, so `period = life + 1` only valid for
 ///   `month < 12`).
 /// - `period > life + 1` → `#NUM!`.
 /// - `month <= 0` or `month > 12` → `#NUM!`.
-/// - `period <= 0` → `#NUM!`.
+/// - `period < 1` → `#NUM!` (W5-182.1: tightened from `<= 0`; fractional
+///   `period in (0, 1)` previously slipped past and silently returned
+///   period-2's depreciation).
 /// - `cost < 0` → `#NUM!`.
+/// - `life < 1` → `#NUM!` (W5-182.1: Codex caught `DB(1000, 100, 0, 1, 7)`
+///   returning 583.33; Opus caught `DB(1000, 100, 0.5, 1, 6)` returning
+///   495. The rate calculation handles `1/0 → ∞` cleanly in Rust IEEE
+///   and fractional life under 1 gives `(salvage/cost)^(1/0.5) = ^2`
+///   which produces a weird-but-finite rate. Both rejected here per
+///   Microsoft's "number of periods" implication. Fractional `life > 1`
+///   is still accepted — see "Fractional-life inheritance" below.).
+/// - `life > i32::MAX || period > i32::MAX` → `#NUM!` (W5-182.1: defensive
+///   DoS guard; `life.floor() as i32` saturates and the iteration loop
+///   would otherwise run billions of times. Soundness divergence from
+///   IronCalc which has the same overflow).
 /// - `cost == 0` → return `0` directly (short-circuit before the
 ///   `(salvage/cost)` division would NaN).
+///
+/// **Engine convention note (matches DDB factor divergence):** IronCalc
+/// uses `get_number_no_bools` for the `month` arg (rejects Boolean);
+/// our `arg_num` allows Boolean coercion uniformly across all five args.
+/// `DB(_, _, _, _, TRUE)` evaluates as `month = 1` here, but `#VALUE!`
+/// in IronCalc. Same family convention as the DDB `factor` divergence.
+///
+/// **Fractional-life inheritance from IronCalc (MEDIUM-4 from Opus
+/// audit):** rate is computed with raw `life`; iteration count and
+/// last-period detection use `life.floor() as i32`. For `life = 5.99`
+/// the rate is a 5.99-year rate but the schedule is a 5-year schedule.
+/// Documented as inherited IronCalc quirk rather than fixed because
+/// Excel's true behavior for fractional life is unverified.
 pub(crate) fn compute_db(
     cost: f64,
     salvage: f64,
@@ -649,12 +684,31 @@ pub(crate) fn compute_db(
     period: f64,
     month: f64,
 ) -> Result<f64, ErrorValue> {
+    // **W5-182.1 (Codex HIGH-1 / Opus MEDIUM-5 + MEDIUM-6 + MEDIUM-7
+    // closures):** the original validation chain (a verbatim port of
+    // IronCalc) missed `life <= 0`, `period < 1` (which only `period <= 0`
+    // covered for the integer case), and extreme inputs that overflow
+    // `i32`. Three audit-driven additions:
+    //
+    // 1. `life <= 0` — Codex repro `DB(1000, 100, 0, 1, 7)` returned
+    //    583.33 because `(0.1)^(1/0) → 0`, so `rate → 1`. Now `#NUM!`.
+    // 2. `period < 1.0` — Opus repro `DB(1000, 100, 5, 0.5, 12)` returned
+    //    period-2's value (232.74) silently because `0.5.floor() == 0`
+    //    fell through both `period_int == 1` and `period_int == life_int + 1`.
+    // 3. `life > i32::MAX as f64 || period > i32::MAX as f64` — Opus
+    //    repro `DB(_, _, 1e15, _, _)` saturated `life_int` to `i32::MAX`,
+    //    making `life_int + 1` panic in debug / wrap in release. Adding
+    //    a finite-input guard is a deliberate divergence from IronCalc
+    //    (they have the same overflow). Soundness > IronCalc fidelity.
     if (month == 12.0 && period > life)
         || period > life + 1.0
         || month <= 0.0
         || month > 12.0
-        || period <= 0.0
+        || period < 1.0
         || cost < 0.0
+        || life < 1.0
+        || life > i32::MAX as f64
+        || period > i32::MAX as f64
     {
         return Err(ErrorValue::Num);
     }
@@ -2080,14 +2134,26 @@ mod tests {
     }
 
     #[test]
-    fn db_full_year_period_equals_life_succeeds() {
-        // month=12, period=life is valid (period > life is rejected;
-        // period == life passes).
-        let result = db(&[n(1_000_000.0), n(100_000.0), n(6.0), n(6.0)]);
-        // Verify it produced a Number (not an error).
-        matches!(result, Value::Number(_))
-            .then_some(())
-            .expect("expected Number");
+    fn db_full_year_period_equals_life_pins_value() {
+        // **W5-182.1 (Opus HIGH-1 / Codex LOW-1 closure):** previously
+        // only `matches!(_, Number(_))` — a regression returning 0 or
+        // `cost` or the wrong intermediate would pass silently. Now
+        // pins the actual value computed via the canonical formula:
+        // first-period accumulated = cost*rate (month=12 → no partial).
+        // Loop runs life - 2 = 4 iterations (periods 2..5). Final
+        // return = rate * (cost - accumulated_through_5).
+        let rate = db_microsoft_rate();
+        let mut acc = 1_000_000.0 * rate; // period 1 (month=12)
+        for _ in 0..4 {
+            // periods 2..5: 4 iterations = (life - 2) with life=6
+            acc += (1_000_000.0 - acc) * rate;
+        }
+        let expected = rate * (1_000_000.0 - acc);
+        approx(
+            db(&[n(1_000_000.0), n(100_000.0), n(6.0), n(6.0)]),
+            expected,
+            1e-6,
+        );
     }
 
     #[test]
@@ -2191,6 +2257,113 @@ mod tests {
                 Value::Error(ErrorValue::Name)
             ]),
             Value::Error(ErrorValue::Name)
+        );
+    }
+
+    // --- DB W5-182.1 audit closures ---
+
+    /// Codex HIGH-1: `life = 0` previously slipped past validation
+    /// because the existing rejections were `period > life` (only
+    /// when `month == 12`) and `period > life + 1`. With `life = 0`,
+    /// `month < 12`, and `period = 1`, validation passed, then
+    /// `(salvage/cost)^(1/0) → (salvage/cost)^∞ → 0` for normal
+    /// `salvage < cost`, giving `rate = 1.0` and a finite return.
+    #[test]
+    fn db_zero_life_is_num() {
+        assert_eq!(
+            db(&[n(1000.0), n(100.0), n(0.0), n(1.0), n(6.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+        // Also caught for the previously-existing `month == 12 && period > life`
+        // path, but now uniformly via the explicit `life <= 0` guard.
+        assert_eq!(
+            db(&[n(1000.0), n(100.0), n(0.0), n(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn db_negative_life_is_num() {
+        assert_eq!(
+            db(&[n(1000.0), n(100.0), n(-1.0), n(1.0), n(6.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn db_fractional_life_below_one_is_num() {
+        // Codex HIGH-1 / Opus MEDIUM-5 closure: `life = 0.5` previously
+        // passed because `period > life + 1 = 1.5` is false for period=1.
+        assert_eq!(
+            db(&[n(1000.0), n(100.0), n(0.5), n(1.0), n(6.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    /// Opus MEDIUM-6: fractional `period < 1` (e.g., `period = 0.5`)
+    /// previously slipped past `period <= 0` and silently returned
+    /// period-2's depreciation. Now rejected by the tightened
+    /// `period < 1.0` validation.
+    #[test]
+    fn db_fractional_period_below_one_is_num() {
+        assert_eq!(
+            db(&[n(1000.0), n(100.0), n(5.0), n(0.5), n(12.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+        // Edge: period = 0.999... → floor=0 → caught.
+        assert_eq!(
+            db(&[n(1000.0), n(100.0), n(5.0), n(0.999_999_999), n(12.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    /// Opus MEDIUM-7: `life > i32::MAX` previously saturated `life_int`
+    /// to `i32::MAX`, then `life_int + 1` panicked (debug) / wrapped
+    /// (release). Iteration `0..(period_int - 2)` would also run
+    /// billions of times for huge period. Now both rejected upfront.
+    #[test]
+    fn db_huge_life_rejected() {
+        // 1e15 > i32::MAX ≈ 2.15e9 → rejected by the DoS guard.
+        assert_eq!(
+            db(&[n(1000.0), n(100.0), n(1e15), n(1.0), n(6.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+        // i32::MAX itself is borderline; `i32::MAX as f64` ≈ 2.147e9.
+        // Use `i32::MAX as f64 + 1.0` to be safely above the threshold.
+        let just_over = i32::MAX as f64 + 1.0;
+        assert_eq!(
+            db(&[n(1000.0), n(100.0), n(just_over), n(1.0), n(6.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    /// Documents the W5-182 / W5-182.1 deliberate divergence vs IronCalc:
+    /// our `arg_num` allows Boolean for the optional `month` arg
+    /// (TRUE → 1, FALSE → 0). IronCalc rejects via `get_number_no_bools`.
+    /// Same family-wide convention as DDB's `factor`.
+    #[test]
+    fn db_boolean_month_coerces_to_number() {
+        // TRUE → month = 1 → first-month partial year.
+        let with_true = db(&[
+            n(1_000_000.0),
+            n(100_000.0),
+            n(6.0),
+            n(1.0),
+            Value::Boolean(true),
+        ]);
+        let with_one = db(&[n(1_000_000.0), n(100_000.0), n(6.0), n(1.0), n(1.0)]);
+        assert_eq!(with_true, with_one);
+
+        // FALSE → month = 0 → rejected by `month <= 0` validation.
+        assert_eq!(
+            db(&[
+                n(1_000_000.0),
+                n(100_000.0),
+                n(6.0),
+                n(1.0),
+                Value::Boolean(false)
+            ]),
+            Value::Error(ErrorValue::Num)
         );
     }
 }

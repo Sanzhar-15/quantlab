@@ -329,7 +329,7 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
     // (default 12) controls partial first / last periods.
     (
         "DB",
-        "W5-182; unit tests pin Microsoft fixtures (DB(1M,100k,6,k,7) for k=1..7) + partial first/last period semantics + validation #NUM! paths",
+        "W5-182 + W5-182.1; unit tests pin Microsoft fixtures (DB(1M,100k,6,k,7) for k=1, 2, 6, 7 — period=6 value-pinned in W5-182.1 after Opus HIGH-1) + W5-182.1 audit closures (life<=0, period<1, life>i32::MAX, Boolean month coercion) + validation #NUM! paths",
     ),
     // W5-168 (Phase 4.10.F) — financial TVM + cash-flow.
     (
