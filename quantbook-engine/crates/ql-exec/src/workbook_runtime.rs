@@ -2310,7 +2310,98 @@ impl<'a> WorkbookRuntime<'a> {
         // / column roster on next eval. Targeted invalidation via
         // `table_to_formulas` is design § 4.5 / 4.8.G.3 (deferred).
         self.plan_cache.clear();
+        // **W5-159 (Phase 4.8.G.3):** the resolved range each reader
+        // bound against is now stale (rows or cols changed). Re-extract
+        // deps for every reader so the calcgraph's range stripes
+        // reflect the new range — without this, cell writes inside
+        // the NEW range but OUTSIDE the OLD range would silently miss
+        // the formula's stripe and never dirty it. Must run BEFORE
+        // the hook fires (which dirty-fans via BFS through the
+        // freshly-registered stripes).
+        self.reextract_table_readers(&canonical);
+        if let Some(g) = self.graph.as_deref_mut() {
+            g.on_table_resize(&canonical);
+        }
         Ok(())
+    }
+
+    /// **W5-159 (Phase 4.8.G.3):** re-bind every formula registered
+    /// against `table_canonical` and call `reextract_deps` so the
+    /// calcgraph's range-stripe state matches the new resolved range.
+    /// Used after `resize_table` mutates `TableMetadata.rows`/`.cols`.
+    ///
+    /// Pattern mirrors `reextract_spill_footprint_readers` (W5-103):
+    /// step 1 collects readers under an immutable graph borrow; step 2
+    /// re-binds + re-extracts under alternating immutable workbook /
+    /// mutable graph borrows. A bind failure (e.g., a column was
+    /// removed by the resize) marks the reader dirty so
+    /// `recompute_dirty`'s W5-156 bind-error mapping produces `#NAME?`
+    /// at the cell.
+    fn reextract_table_readers(&mut self, table_canonical: &str) {
+        // Step 1: collect (node, sheet, row, col, text) under an
+        // immutable borrow of the graph + workbook.
+        let reader_info: Vec<(ql_calcgraph::NodeId, SheetId, RowId, ColId, Arc<str>)> = {
+            let g = match self.graph.as_deref() {
+                Some(g) => g,
+                None => return,
+            };
+            g.dependents_for_table(table_canonical)
+                .into_iter()
+                .filter_map(|n| {
+                    let (s, r, c) = g.cell_address_for(n)?;
+                    let text = self.workbook.formula_at(s, r, c).cloned()?;
+                    Some((n, s, r, c, text))
+                })
+                .collect()
+        };
+
+        // Step 2: re-bind + re-extract.
+        for (node, sheet, row, col, text) in reader_info {
+            let name_gen = self.workbook.names().generation();
+            let cell_anchor = if text.contains('@') {
+                Some((row, col))
+            } else {
+                None
+            };
+            let cache_key = PlanCacheKey {
+                text: Arc::clone(&text),
+                sheet,
+                name_gen,
+                cell_anchor,
+            };
+            let plan: Arc<crate::plan::ExprPlan> = match self
+                .plan_cache
+                .get_or_insert::<_, RuntimeError>(cache_key, || {
+                    // W5-147: stored text is canonical A1+EnUs.
+                    let tokens = lex_with(
+                        text.as_ref(),
+                        ql_types::ReferenceMode::A1,
+                        ql_types::Locale::EnUs,
+                    )?;
+                    let expr = parse(tokens)?;
+                    Ok(bind_with_site(
+                        &expr,
+                        BindSite::at_cell(ql_types::Address::new(sheet, row, col)),
+                        self.workbook,
+                        self.workbook,
+                        self.workbook,
+                    )?)
+                }) {
+                Ok(p) => p,
+                Err(_) => {
+                    // Bind broken by the resize (e.g., column removed).
+                    // Mark dirty; recompute_dirty's W5-156 mapping at
+                    // workbook_runtime.rs:3266 will produce #NAME?.
+                    if let Some(g) = self.graph.as_deref_mut() {
+                        g.mark_dirty(node);
+                    }
+                    continue;
+                }
+            };
+            if let Some(g) = self.graph.as_deref_mut() {
+                g.reextract_deps(node, plan.as_ref(), self.workbook);
+            }
+        }
     }
 
     /// **W5-92 (Phase 4.6.D):** create a new sheet,
@@ -10832,6 +10923,80 @@ mod tests {
         let meta = wb.lookup_table("Sales").unwrap();
         assert_eq!(meta.rows, 5);
         assert_eq!(meta.cols, 1);
+    }
+
+    /// **W5-159 (Phase 4.8.G.3):** the correctness bug the hook +
+    /// re-extract closes. After `resize_table` grows the data range,
+    /// a cell write into the NEW row (outside the OLD range) must
+    /// dirty the formula via the calcgraph's range stripe and
+    /// `recompute_dirty` must pick it up. Pre-W5-159 the stripe
+    /// stayed registered at the OLD range; the write silently missed;
+    /// the formula kept its post-resize-but-pre-write value
+    /// indefinitely (until something else dirtied it). The
+    /// `recompute_all` path in the existing W5-122 test happened to
+    /// work because full passes don't rely on stripes — so this gap
+    /// only surfaces on the incremental path.
+    #[test]
+    fn resize_table_grow_then_recompute_dirty_picks_up_new_range_writes() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        // Initial: header at row 0, data at rows 1-2 = 10, 20 → SUM = 30.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+            rt.set_value(0, 1, 0, Value::Number(10.0)).unwrap();
+            rt.set_value(0, 2, 0, Value::Number(20.0)).unwrap();
+            let v = rt.set_formula(0, 10, 0, "SUM(Sales[Qty])").unwrap();
+            assert_eq!(v, Value::Number(30.0));
+            let _ = rt.recompute_dirty().expect("graph attached");
+        }
+        // Grow the table from 3 rows (header + 2 data) to 5 rows
+        // (header + 4 data). recompute_dirty after the resize.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.resize_table("Sales", 5, 1, vec![], vec![]).unwrap();
+            let result = rt.recompute_dirty().expect("graph attached");
+            assert!(result.failures.is_empty(), "no structural failures");
+        }
+        // Existing cells in rows 3-4 are blank → SUM unchanged at 30.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 10, 0)),
+            Value::Number(30.0),
+            "post-resize: rows 3-4 are blank → SUM stays 30"
+        );
+
+        // **THE CRITICAL ASSERTION:** write a NEW value into row 3
+        // (inside the new range, outside the old range). The formula's
+        // stripe MUST cover this cell after W5-159's re-extract.
+        // recompute_dirty MUST pick up the change.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 3, 0, Value::Number(40.0)).unwrap();
+            let result = rt.recompute_dirty().expect("graph attached");
+            assert!(result.failures.is_empty());
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 10, 0)),
+            Value::Number(70.0),
+            "post-resize write at row 3: SUM = 10+20+40 = 70. \
+             Pre-W5-159 this stayed at 30 because the stripe was stale."
+        );
+
+        // Same for row 4.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.set_value(0, 4, 0, Value::Number(50.0)).unwrap();
+            let result = rt.recompute_dirty().expect("graph attached");
+            assert!(result.failures.is_empty());
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 10, 0)),
+            Value::Number(120.0),
+            "row 4 write: SUM = 10+20+40+50 = 120"
+        );
     }
 
     #[test]

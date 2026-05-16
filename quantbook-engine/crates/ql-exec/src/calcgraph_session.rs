@@ -361,6 +361,9 @@ pub struct HookCounts {
     /// **W5-158 (Phase 4.8.G.3):** counts of `on_column_rename`
     /// invocations.
     pub column_rename: u64,
+    /// **W5-159 (Phase 4.8.G.3):** counts of `on_table_resize`
+    /// invocations.
+    pub table_resize: u64,
 }
 
 /// Phase 3.2: aggregate outcome of `rebuild_from_workbook`. Parallel
@@ -1128,6 +1131,67 @@ impl CalcgraphSession {
             if let Some((s, r, c)) = self.cell_address_for(n) {
                 self.mark_dirty_from_cell_write(s, r, c);
             }
+        }
+    }
+
+    /// **W5-159 (Phase 4.8.G.3):** mutation hook fired by
+    /// `WorkbookRuntime::resize_table`. The runtime has already
+    /// mutated `TableMetadata.rows` / `.cols` / `.columns` in place,
+    /// bumped `TableTable::generation`, and cleared the plan cache.
+    /// The table's resolved data Range is now different from what
+    /// every reader's cached `ExprPlan::StructuredRef.resolved`
+    /// holds — and the calcgraph's range stripes for those readers
+    /// were registered at the OLD range, so cell writes inside the
+    /// NEW (e.g. grown) range but OUTSIDE the old range would
+    /// silently miss the formula and never dirty it.
+    ///
+    /// The hook itself does the dirty-fan; the runtime caller is
+    /// responsible for **re-extracting** each reader's deps so the
+    /// graph's stripe state reflects the new range. See
+    /// `WorkbookRuntime::reextract_table_readers` — the
+    /// re-extraction pattern mirrors the spill-mutation choreography
+    /// (`reextract_spill_footprint_readers`).
+    ///
+    /// Like `on_column_rename`, the fanout is coarse — every
+    /// formula in `table_to_formulas[table_name]` is marked dirty,
+    /// not just those whose resolved range overlaps the resized
+    /// region. The reverse index doesn't track ranges; precision
+    /// would need a range-bucketed index. Coarse matches design
+    /// § 8.1 and is cheap at edit rate.
+    pub fn on_table_resize(&mut self, table_name: &str) {
+        self.hook_counts.table_resize = self.hook_counts.table_resize.saturating_add(1);
+        let dependents: Vec<NodeId> = if let Some(set) = self.table_to_formulas.get(table_name) {
+            set.iter().copied().collect()
+        } else {
+            self.table_to_formulas
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(table_name))
+                .flat_map(|(_, set)| set.iter().copied())
+                .collect()
+        };
+        for n in dependents {
+            self.dirty.insert(n);
+            if let Some((s, r, c)) = self.cell_address_for(n) {
+                self.mark_dirty_from_cell_write(s, r, c);
+            }
+        }
+    }
+
+    /// **W5-159 (Phase 4.8.G.3):** query the table-reverse-index for
+    /// every formula `NodeId` that referenced `table_name` at its
+    /// last bind. Used by `WorkbookRuntime::reextract_table_readers`
+    /// to walk + re-bind + re-extract deps after a table mutation
+    /// that changed the resolved range (today: resize). Case-
+    /// insensitive fallback mirrors the hook lookup.
+    pub(crate) fn dependents_for_table(&self, table_name: &str) -> Vec<NodeId> {
+        if let Some(set) = self.table_to_formulas.get(table_name) {
+            set.iter().copied().collect()
+        } else {
+            self.table_to_formulas
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(table_name))
+                .flat_map(|(_, set)| set.iter().copied())
+                .collect()
         }
     }
 
@@ -4052,6 +4116,73 @@ mod tests {
         assert_eq!(s.hook_counts().column_rename, 1);
         s.on_column_rename("T", "b", "c");
         assert_eq!(s.hook_counts().column_rename, 2);
+    }
+
+    // W5-159 (Phase 4.8.G.3) — on_table_resize hook tests.
+
+    /// **W5-159:** `on_table_resize` dirty-fans every reader of the
+    /// resized table.
+    #[test]
+    fn on_table_resize_dirties_readers() {
+        use std::sync::Arc;
+        let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
+        let plan = ExprPlan::StructuredRef {
+            table_name: Arc::from("SALES"),
+            source: Arc::new(ql_formula_syntax::TableSpecSubtree::BareColumn(Arc::from(
+                "Qty",
+            ))),
+            resolved: ql_types::Range::new(0, 0, 0, 10, 0),
+            is_this_row: false,
+        };
+        s.on_set_formula(0, 5, 5, &plan, &wb);
+        let f1 = s.cell_node_for(0, 5, 5).unwrap();
+        s.take_dirty();
+
+        s.on_table_resize("SALES");
+        let dirty = s.take_dirty();
+        assert!(dirty.contains(&f1), "resize must dirty the reader");
+    }
+
+    /// **W5-159:** `dependents_for_table` query returns the readers
+    /// indexed under the (case-insensitive) table name.
+    #[test]
+    fn dependents_for_table_returns_indexed_readers() {
+        use std::sync::Arc;
+        let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
+        let plan = ExprPlan::StructuredRef {
+            table_name: Arc::from("SALES"),
+            source: Arc::new(ql_formula_syntax::TableSpecSubtree::BareColumn(Arc::from(
+                "Qty",
+            ))),
+            resolved: ql_types::Range::new(0, 0, 0, 10, 0),
+            is_this_row: false,
+        };
+        s.on_set_formula(0, 5, 5, &plan, &wb);
+        let f1 = s.cell_node_for(0, 5, 5).unwrap();
+
+        // Exact match.
+        let deps = s.dependents_for_table("SALES");
+        assert_eq!(deps, vec![f1]);
+
+        // Case-insensitive.
+        let deps_ci = s.dependents_for_table("sales");
+        assert_eq!(deps_ci, vec![f1]);
+
+        // Miss.
+        assert!(s.dependents_for_table("Orders").is_empty());
+    }
+
+    /// **W5-159:** `HookCounts.table_resize` bumps per invocation.
+    #[test]
+    fn on_table_resize_bumps_hook_count() {
+        let mut s = CalcgraphSession::new();
+        assert_eq!(s.hook_counts().table_resize, 0);
+        s.on_table_resize("Foo");
+        assert_eq!(s.hook_counts().table_resize, 1);
+        s.on_table_resize("Foo");
+        assert_eq!(s.hook_counts().table_resize, 2);
     }
 
     /// **W5-158:** `on_column_rename` case-insensitive table-name
