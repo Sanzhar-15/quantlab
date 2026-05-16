@@ -1032,4 +1032,21 @@ mod tests {
         let cash = r(vec![n(-1000.0), Value::Error(ErrorValue::Ref), n(600.0)]);
         assert_eq!(irr(&[cash]), Value::Error(ErrorValue::Ref));
     }
+
+    /// **W5-172 (Codex LOW-3 closure):** the previous Wave 2 audit
+    /// flagged that no test exercised the bisection-fallback path —
+    /// only N-R convergence + the upfront sign-change rejection were
+    /// covered. This test deliberately forces N-R to fail by passing
+    /// a guess (50.0) far from the true root for `[-1, 2]` (IRR=100%).
+    ///
+    /// At guess=50, N-R computes `new_iter ≈ 50 - 1250 = -1200` on
+    /// the first step, hits the `new_rate <= -1.0` guard, returns Err.
+    /// Bisection over `[-0.99999, 100]` then runs: `NPV(-0.99999) ≈
+    /// 200000` (positive), `NPV(100) ≈ -0.98` (negative), so f1*f2<0
+    /// and the bracketing finds rate=1.0 by halving.
+    #[test]
+    fn irr_bisection_fallback_when_newton_diverges() {
+        let cash = r(vec![n(-1.0), n(2.0)]);
+        approx(irr(&[cash, s(n(50.0))]), 1.0, 1e-6);
+    }
 }
