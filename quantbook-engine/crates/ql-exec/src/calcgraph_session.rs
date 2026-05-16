@@ -358,6 +358,9 @@ pub struct HookCounts {
     /// **W5-157 (Phase 4.8.G.3):** counts of `on_table_rename`
     /// invocations.
     pub table_rename: u64,
+    /// **W5-158 (Phase 4.8.G.3):** counts of `on_column_rename`
+    /// invocations.
+    pub column_rename: u64,
 }
 
 /// Phase 3.2: aggregate outcome of `rebuild_from_workbook`. Parallel
@@ -1057,6 +1060,69 @@ impl CalcgraphSession {
         }
 
         // 4. Dirty-fan (same pattern as on_table_drop / on_set_name).
+        for n in dependents {
+            self.dirty.insert(n);
+            if let Some((s, r, c)) = self.cell_address_for(n) {
+                self.mark_dirty_from_cell_write(s, r, c);
+            }
+        }
+    }
+
+    /// **W5-158 (Phase 4.8.G.3):** mutation hook fired by
+    /// `WorkbookRuntime::rename_column`. The runtime has already:
+    /// (a) rewritten formula text from `Table[Old]` → `Table[New]`
+    /// via `ast::rewrite_column_ref` + `put_formula` (storage layer
+    /// — bypasses `on_set_formula`), (b) mutated the column's
+    /// canonical name + display in-place (same column index → same
+    /// resolved range), (c) bumped `TableTable::generation` and
+    /// cleared the plan cache.
+    ///
+    /// Unlike `on_table_rename`, the table NAME is unchanged so
+    /// `table_to_formulas` keys + `formula_deps[F].tables` Arcs are
+    /// already consistent. The remaining gap is the dirty set:
+    /// without dirty-fan, `recompute_dirty` skips the renamed
+    /// formulas and the post-rename plan cache never repopulates.
+    /// Steady-state values are typically identical (same column
+    /// index, same data range) so VEQ suppresses the writes — but
+    /// the formula's cached plan stays at the OLD `BareColumn(...)`
+    /// source spec until a data edit forces a re-bind, which is
+    /// brittle for any caller that introspects plans between edits
+    /// (debug tooling, ql-profile, future structured-ref query
+    /// helpers).
+    ///
+    /// This hook does a **coarse dirty-fan**: every formula in
+    /// `table_to_formulas[table_name]` is marked dirty, not just
+    /// those whose AST referenced the renamed column. The reverse
+    /// index doesn't track columns; narrowing would require a
+    /// column-level index or per-formula plan walk. Coarse matches
+    /// design § 8.1 "a table ref is just a range ref, period" —
+    /// at edit-rate the extra VEQ-suppressed re-evals are
+    /// negligible.
+    ///
+    /// Also fires the rescue path for formulas that bound against
+    /// the table but failed on the OLD column (e.g., replay-time
+    /// `Op::PutFormula` followed by W5-156 `#NAME?` mapping when
+    /// the column didn't yet exist): a subsequent `rename_column`
+    /// that creates the now-referenced name needs the formula to
+    /// re-bind. Today such formulas WON'T be in the reverse index
+    /// (the failed bind didn't register deps), so they remain
+    /// stuck at `#NAME?` until manually edited. Tracking that is
+    /// the deferred 4.8.N soft-fail work; this hook covers the
+    /// successful-bind case only.
+    ///
+    /// `old_col` / `new_col` are accepted for symmetry + future
+    /// narrowing; today only `table_name` drives the fanout.
+    pub fn on_column_rename(&mut self, table_name: &str, _old_col: &str, _new_col: &str) {
+        self.hook_counts.column_rename = self.hook_counts.column_rename.saturating_add(1);
+        let dependents: Vec<NodeId> = if let Some(set) = self.table_to_formulas.get(table_name) {
+            set.iter().copied().collect()
+        } else {
+            self.table_to_formulas
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(table_name))
+                .flat_map(|(_, set)| set.iter().copied())
+                .collect()
+        };
         for n in dependents {
             self.dirty.insert(n);
             if let Some((s, r, c)) = self.cell_address_for(n) {
@@ -3901,6 +3967,118 @@ mod tests {
         assert_eq!(s.hook_counts().table_rename, 1);
         s.on_table_rename("Bar", "Baz");
         assert_eq!(s.hook_counts().table_rename, 2);
+    }
+
+    // W5-158 (Phase 4.8.G.3) — on_column_rename hook tests.
+
+    /// **W5-158:** `on_column_rename` dirty-fans every reader of the
+    /// affected table — coarse, table-keyed (the reverse index
+    /// doesn't track columns).
+    #[test]
+    fn on_column_rename_dirties_all_table_readers() {
+        use std::sync::Arc;
+        let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
+        // Two readers of Sales: F1 references [Qty], F2 references [Price].
+        let qty_plan = ExprPlan::StructuredRef {
+            table_name: Arc::from("SALES"),
+            source: Arc::new(ql_formula_syntax::TableSpecSubtree::BareColumn(Arc::from(
+                "Qty",
+            ))),
+            resolved: ql_types::Range::new(0, 0, 0, 10, 0),
+            is_this_row: false,
+        };
+        let price_plan = ExprPlan::StructuredRef {
+            table_name: Arc::from("SALES"),
+            source: Arc::new(ql_formula_syntax::TableSpecSubtree::BareColumn(Arc::from(
+                "Price",
+            ))),
+            resolved: ql_types::Range::new(0, 0, 1, 10, 1),
+            is_this_row: false,
+        };
+        s.on_set_formula(0, 5, 5, &qty_plan, &wb);
+        s.on_set_formula(0, 6, 5, &price_plan, &wb);
+        let f1 = s.cell_node_for(0, 5, 5).unwrap();
+        let f2 = s.cell_node_for(0, 6, 5).unwrap();
+        s.take_dirty();
+
+        s.on_column_rename("SALES", "Qty", "Quantity");
+        let dirty = s.take_dirty();
+        assert!(dirty.contains(&f1), "F1 (Qty reader) must dirty");
+        // Coarse: F2 (Price reader, untouched by the rename) also dirties.
+        // VEQ at recompute_dirty will suppress the actual write.
+        assert!(
+            dirty.contains(&f2),
+            "F2 (Price reader) coarse-dirtied — by design"
+        );
+    }
+
+    /// **W5-158:** `on_column_rename` does NOT touch
+    /// `formula_deps[F].tables` (table name unchanged → no Arc
+    /// substitution needed). Regression guard against accidentally
+    /// copying the on_table_rename Arc-rewrite logic.
+    #[test]
+    fn on_column_rename_leaves_deps_tables_unchanged() {
+        use std::sync::Arc;
+        let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
+        let plan = ExprPlan::StructuredRef {
+            table_name: Arc::from("SALES"),
+            source: Arc::new(ql_formula_syntax::TableSpecSubtree::BareColumn(Arc::from(
+                "Qty",
+            ))),
+            resolved: ql_types::Range::new(0, 0, 0, 10, 0),
+            is_this_row: false,
+        };
+        s.on_set_formula(0, 5, 5, &plan, &wb);
+        let f1 = s.cell_node_for(0, 5, 5).unwrap();
+
+        s.on_column_rename("SALES", "Qty", "Quantity");
+
+        let deps = s.formula_deps(f1).unwrap();
+        assert_eq!(
+            deps.tables.iter().map(|t| t.as_ref()).collect::<Vec<_>>(),
+            vec!["SALES"],
+            "deps.tables unchanged by column rename"
+        );
+    }
+
+    /// **W5-158:** `HookCounts.column_rename` bumps per invocation.
+    #[test]
+    fn on_column_rename_bumps_hook_count() {
+        let mut s = CalcgraphSession::new();
+        assert_eq!(s.hook_counts().column_rename, 0);
+        s.on_column_rename("T", "a", "b");
+        assert_eq!(s.hook_counts().column_rename, 1);
+        s.on_column_rename("T", "b", "c");
+        assert_eq!(s.hook_counts().column_rename, 2);
+    }
+
+    /// **W5-158:** `on_column_rename` case-insensitive table-name
+    /// fallback when the reverse-index key casing differs.
+    #[test]
+    fn on_column_rename_case_insensitive_table_lookup() {
+        use std::sync::Arc;
+        let mut s = CalcgraphSession::new();
+        let wb = ql_storage::Workbook::new();
+        let plan = ExprPlan::StructuredRef {
+            table_name: Arc::from("Sales"), // mixed-case Arc
+            source: Arc::new(ql_formula_syntax::TableSpecSubtree::BareColumn(Arc::from(
+                "Qty",
+            ))),
+            resolved: ql_types::Range::new(0, 0, 0, 10, 0),
+            is_this_row: false,
+        };
+        s.on_set_formula(0, 5, 5, &plan, &wb);
+        let f1 = s.cell_node_for(0, 5, 5).unwrap();
+        s.take_dirty();
+
+        s.on_column_rename("SALES", "Qty", "Quantity");
+        let dirty = s.take_dirty();
+        assert!(
+            dirty.contains(&f1),
+            "case-insensitive table lookup must reach the reader"
+        );
     }
 
     /// **W5-157:** case-insensitive fallback when the index key

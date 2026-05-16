@@ -2063,6 +2063,16 @@ impl<'a> WorkbookRuntime<'a> {
         // `get_mut` doesn't bump generation; do it explicitly so plan
         // caches keyed on `TableTable::generation` invalidate.
         self.workbook.tables_mut().bump_generation();
+        // **W5-158 (Phase 4.8.G.3):** fire the calcgraph hook so the
+        // dirty set picks up every reader of this table. Coarse —
+        // table-keyed rather than column-keyed (the reverse index
+        // doesn't track columns). VEQ at recompute time suppresses
+        // the typical no-op writes; the hook's value is keeping
+        // the post-rename plan cache + dirty state machine
+        // consistent for downstream tooling (debug, ql-profile).
+        if let Some(g) = self.graph.as_deref_mut() {
+            g.on_column_rename(&table_canonical, old_col, new_col);
+        }
         // Invalidate plan cache by clearing — every formula that
         // referenced the OLD column now has new text, so cache lookups
         // miss anyway; bare invalidation prevents stale entries.
@@ -10724,6 +10734,66 @@ mod tests {
             }
             other => panic!("expected PutFormula for rewrite, got {other:?}"),
         }
+    }
+
+    /// **W5-158 (Phase 4.8.G.3):** `rename_column` fires the
+    /// `on_column_rename` hook → readers are in the dirty set →
+    /// `recompute_dirty` re-binds them against the new column
+    /// name. The cell value is unchanged (same column index, same
+    /// data range; VEQ suppresses the write) but the hook
+    /// observability + dirty/clean state are correct.
+    #[test]
+    fn rename_column_fires_hook_and_keeps_value_consistent() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+            rt.set_value(0, 1, 0, Value::Number(10.0)).unwrap();
+            rt.set_value(0, 2, 0, Value::Number(20.0)).unwrap();
+            let v = rt.set_formula(0, 0, 1, "SUM(Sales[Qty])").unwrap();
+            assert_eq!(v, Value::Number(30.0));
+            let _ = rt.recompute_dirty().expect("graph attached");
+        }
+        let before = graph.hook_counts().column_rename;
+        let formula_node = graph
+            .cell_node_for(0, 0, 1)
+            .expect("B1 formula node registered");
+        assert!(!graph.is_dirty(formula_node), "clean baseline");
+
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            let rewritten = rt.rename_column("Sales", "Qty", "Quantity").unwrap();
+            assert_eq!(rewritten, 1);
+        }
+        assert_eq!(
+            graph.hook_counts().column_rename,
+            before + 1,
+            "hook fired exactly once"
+        );
+        assert!(
+            graph.is_dirty(formula_node),
+            "post-rename: B1 must be in the dirty set so recompute re-binds"
+        );
+
+        // Recompute drains the dirty set; value stays at 30 (VEQ suppresses).
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            let result = rt.recompute_dirty().expect("graph attached");
+            assert!(result.failures.is_empty());
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Number(30.0),
+            "post-rename value unchanged (same column index, same data)"
+        );
+        assert!(
+            !graph.is_dirty(formula_node),
+            "recompute drained the dirty set"
+        );
     }
 
     // ===== W5-122 (Phase 4.8.J) — resize_table =====
