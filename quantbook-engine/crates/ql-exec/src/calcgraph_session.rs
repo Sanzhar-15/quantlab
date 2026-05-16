@@ -940,10 +940,11 @@ impl CalcgraphSession {
     /// 3. The cell value becomes the error; downstream sees the
     ///    error propagate.
     ///
-    /// Today (W5-154): the WorkbookRuntime drop_table path does NOT
-    /// yet call this hook (still relies on `plan_cache.clear()`).
-    /// Wiring lands in a follow-up commit; this hook ships as the
-    /// foundation that the wiring will use.
+    /// **W5-155** wired this hook into `WorkbookRuntime::drop_table`.
+    /// **W5-156** added the paired plan-cache flush (HIGH-1 closure)
+    /// and the bind-error → cell-value mapping in
+    /// `recompute_dirty` / `recompute_all` (HIGH-2 closure) so the
+    /// hook's dirty fanout actually materializes as `#NAME?` cells.
     pub fn on_table_drop(&mut self, name: &str) {
         self.hook_counts.table_drop = self.hook_counts.table_drop.saturating_add(1);
         // Table names are stored in `deps.tables` as the parser's

@@ -1746,13 +1746,26 @@ impl<'a> WorkbookRuntime<'a> {
             })?;
         }
         // **W5-155 (Phase 4.8.G.3):** dirty-fan readers BEFORE
-        // removing the metadata. The hook uses case-insensitive
-        // lookup so either case (canonical-upper or the user's
-        // input casing) reaches the index.
+        // removing the metadata. The hook receives the canonical
+        // uppercase name; the index is keyed identically so the
+        // exact-match path always hits.
         if let Some(g) = self.graph.as_deref_mut() {
             g.on_table_drop(&canonical);
         }
         let _ = self.workbook.tables_mut().remove(&canonical);
+        // **W5-156 (Phase 4.8.G.3 — HIGH-1 closure):** invalidate
+        // the plan cache. `PlanCacheKey` doesn't include
+        // `TableTable::generation()`, so a pre-drop cached plan
+        // (`ExprPlan::StructuredRef { resolved: <pre-drop range> }`)
+        // would HIT on the next recompute and silently read the
+        // old cells — masking the W5-154 hook's dirty fanout and
+        // violating the design § 12.4 contract ("re-bind to
+        // BindError::UnknownTable → emit #NAME?"). Matches the
+        // brute-force pattern in `rename_table` / `rename_column`
+        // / `resize_table`. A future polish (table_gen in the
+        // cache key) would replace this full flush with targeted
+        // invalidation.
+        self.plan_cache.clear();
         Ok(())
     }
 
@@ -2879,13 +2892,33 @@ impl<'a> WorkbookRuntime<'a> {
                     succeeded += 1;
                 }
                 Err(error) => {
-                    failures.push(RecomputeFailure {
-                        sheet,
-                        row,
-                        col,
-                        formula_text,
-                        error,
-                    });
+                    // **W5-156 (Phase 4.8.G.3 — HIGH-2 closure):**
+                    // mirror `recompute_dirty`'s table-bind-error
+                    // mapping so the recompute_all path (used by
+                    // replay + headless callers) also honors
+                    // design § 12.4 — dropped-table refs emit
+                    // `#NAME?`, not a recompute failure with a
+                    // stale cell value.
+                    if let RuntimeError::Bind(
+                        BindError::UnknownTable(_) | BindError::UnknownTableColumn { .. },
+                    ) = &error
+                    {
+                        self.workbook.put_computed_at(
+                            sheet,
+                            row,
+                            col,
+                            Value::Error(ErrorValue::Name),
+                        );
+                        succeeded += 1;
+                    } else {
+                        failures.push(RecomputeFailure {
+                            sheet,
+                            row,
+                            col,
+                            formula_text,
+                            error,
+                        });
+                    }
                 }
             }
         }
@@ -3250,13 +3283,45 @@ impl<'a> WorkbookRuntime<'a> {
                         }
                         succeeded += 1;
                     }
-                    Err(error) => failures.push(RecomputeFailure {
-                        sheet,
-                        row,
-                        col,
-                        formula_text: text,
-                        error,
-                    }),
+                    Err(error) => {
+                        // **W5-156 (Phase 4.8.G.3 — HIGH-2 closure):**
+                        // table-related bind failures during recompute
+                        // emit `#NAME?` per design § 12.4 ("re-bind to
+                        // BindError::UnknownTable → emit #NAME?") and
+                        // the `plan.rs:260` UnknownTable docstring.
+                        // Typical trigger: `drop_table` invalidates the
+                        // plan cache (W5-156 HIGH-1 fix), the on_table_drop
+                        // hook marks the reader dirty, recompute re-binds
+                        // and discovers the table is gone. Without this
+                        // mapping the cell would keep its pre-drop value
+                        // (failures collection only surfaces the error
+                        // to the caller; the cell overlay stays stale).
+                        // Counts as `succeeded` because the formula
+                        // evaluated to a well-defined error value, not
+                        // a structural recompute failure.
+                        if let RuntimeError::Bind(
+                            BindError::UnknownTable(_) | BindError::UnknownTableColumn { .. },
+                        ) = &error
+                        {
+                            let v = Value::Error(ErrorValue::Name);
+                            let prior_val = prior.get(&(sheet, row, col));
+                            if prior_val == Some(&v) {
+                                skipped_value_equality += 1;
+                            } else {
+                                self.workbook.put_computed_at(sheet, row, col, v);
+                                changed.insert((sheet, row, col));
+                            }
+                            succeeded += 1;
+                        } else {
+                            failures.push(RecomputeFailure {
+                                sheet,
+                                row,
+                                col,
+                                formula_text: text,
+                                error,
+                            });
+                        }
+                    }
                 }
             }
         } // end MAX_ITERATIONS loop
@@ -10073,14 +10138,18 @@ mod tests {
         }
     }
 
-    /// **W5-155 (Phase 4.8.G.3):** `WorkbookRuntime::drop_table` must
-    /// invoke the calcgraph `on_table_drop` hook so any formula
-    /// referencing the dropped table is BFS-dirtied. Pre-W5-155 the
-    /// runtime relied on plan-cache invalidation alone, which left the
-    /// dirty set untouched and missed cells got stale values until an
-    /// unrelated edit happened to touch them.
+    /// **W5-155 / W5-156 (Phase 4.8.G.3):** `WorkbookRuntime::drop_table`
+    /// must (a) invoke the calcgraph `on_table_drop` hook so any
+    /// formula referencing the dropped table is BFS-dirtied, (b)
+    /// invalidate the plan cache so the next bind doesn't HIT a stale
+    /// `ExprPlan::StructuredRef`, and (c) write `#NAME?` to those
+    /// cells on the next `recompute_dirty`. W5-155 shipped (a) but not
+    /// (b) or (c), leaving the hook functionally inert (the cache hit
+    /// served the pre-drop range and eval read the same data cells).
+    /// W5-156 closes HIGH-1 (cache flush in `drop_table`) + HIGH-2
+    /// (bind-error → cell-value mapping at recompute_dirty:3266).
     #[test]
-    fn drop_table_fires_on_table_drop_hook_and_dirties_readers() {
+    fn drop_table_fires_on_table_drop_hook_and_emits_name_error() {
         use crate::CalcgraphSession;
         let mut wb = make_runtime_workbook();
         let reg = default_registry();
@@ -10120,6 +10189,68 @@ mod tests {
         assert!(
             graph.is_dirty(formula_node),
             "B1 = SUM(Sales[Qty]) must be dirty after Sales is dropped"
+        );
+
+        // **W5-156 HIGH-2 closure:** recompute must produce `#NAME?`
+        // at B1, not preserve the pre-drop `Number(30.0)`. Tests both
+        // the cache-flush (HIGH-1) and the bind-error → cell-value
+        // mapping (HIGH-2) end-to-end.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            let result = rt.recompute_dirty().expect("graph attached");
+            assert!(
+                result.failures.is_empty(),
+                "table-related bind errors should map to #NAME? cells, \
+                 not RecomputeFailure entries — got: {:?}",
+                result.failures
+            );
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Error(ErrorValue::Name),
+            "B1 = SUM(Sales[Qty]) must produce #NAME? after Sales is dropped"
+        );
+    }
+
+    /// **W5-156 (Phase 4.8.G.3 — HIGH-2 closure):** transitive BFS
+    /// fanout. C1 = B1 + 1 depends on B1 = SUM(Sales[Qty]). Dropping
+    /// Sales must dirty BOTH B1 (direct reader) AND C1 (transitive via
+    /// the W5-91 H2 BFS pattern from `mark_dirty_from_cell_write`);
+    /// recompute then propagates #NAME? through the chain.
+    #[test]
+    fn drop_table_propagates_name_error_through_chain() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.create_table("Sales", 0, 0, 0, 3, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+            rt.set_value(0, 1, 0, Value::Number(10.0)).unwrap();
+            rt.set_value(0, 2, 0, Value::Number(20.0)).unwrap();
+            rt.set_formula(0, 0, 1, "SUM(Sales[Qty])").unwrap(); // B1 = 30
+            rt.set_formula(0, 0, 2, "B1 + 1").unwrap(); // C1 = 31
+            assert_eq!(
+                wb.read(ql_types::Address::new(0, 0, 2)),
+                Value::Number(31.0)
+            );
+        }
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.drop_table("Sales").unwrap();
+            let result = rt.recompute_dirty().expect("graph attached");
+            assert!(result.failures.is_empty(), "no structural failures");
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Error(ErrorValue::Name),
+            "B1: direct reader of dropped table → #NAME?"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 2)),
+            Value::Error(ErrorValue::Name),
+            "C1 = B1 + 1: transitive #NAME? propagation"
         );
     }
 
