@@ -207,6 +207,39 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "SUMXMY2",
         "W5-166; unit tests pin Σ(x-y)² + zero-diff",
     ),
+    // W5-167 (Phase 4.10.E) — text utility fillins.
+    (
+        "CHAR",
+        "W5-167; unit tests pin code 1..=255 + Unicode codepoint mapping (Windows-1252 128-159 divergence documented in matrix)",
+    ),
+    (
+        "CODE",
+        "W5-167; unit tests pin first-char codepoint + empty-string → #VALUE!",
+    ),
+    (
+        "UNICODE",
+        "W5-167; unit tests pin first-char Unicode codepoint (canonical match vs Excel)",
+    ),
+    (
+        "UNICHAR",
+        "W5-167; unit tests pin code 1..=char::MAX + surrogate handling",
+    ),
+    (
+        "VALUE",
+        "W5-167; unit tests pin locale-aware decimal parsing + strict reject of wrong-locale `.`",
+    ),
+    (
+        "FIXED",
+        "W5-167; unit tests pin locale-aware thousands grouping + half-away rounding + negative decimals",
+    ),
+    (
+        "DOLLAR",
+        "W5-167; unit tests pin `$`-prefix + negative as `-$` + locale-aware separators",
+    ),
+    (
+        "TEXTJOIN",
+        "W5-167; unit tests pin delimiter join + ignore_empty + range flatten + Excel 32,767 cap",
+    ),
     // Math (default coercion paths cover most; per-fn overrides deferred)
     ("ABS", "default; deferred"),
     ("SQRT", "domain error #NUM!; deferred"),

@@ -415,6 +415,13 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("PERMUTATIONA", scalar_fns::permutationa);
     r.register("SUMSQ", scalar_fns::sumsq);
 
+    // Phase 4.10.E (W5-167) — text utility fillins.
+    // Scalar — codepoint round-trip.
+    r.register("CHAR", scalar_fns::char_fn);
+    r.register("CODE", scalar_fns::code_fn);
+    r.register("UNICODE", scalar_fns::unicode_fn);
+    r.register("UNICHAR", scalar_fns::unichar_fn);
+
     // Math
     r.register("ABS", scalar_fns::abs);
     r.register("SQRT", scalar_fns::sqrt);
@@ -564,6 +571,11 @@ pub fn default_registry() -> FunctionRegistry {
     // surface as `#VALUE!`. Companion `format::render` shipped W5-78.
     r.register_context_aware("TEXT", format::text_ctx);
 
+    // Phase 4.10.E (W5-167) — locale-aware text utilities.
+    r.register_context_aware("VALUE", scalar_fns::value_ctx);
+    r.register_context_aware("FIXED", scalar_fns::fixed_ctx);
+    r.register_context_aware("DOLLAR", scalar_fns::dollar_ctx);
+
     // Engine Phase 4.3 V2 batch — range-aware (W5-53, GAP-F-05
     // closure). These use the new `RangeAwareFn` table because the
     // existing `ScalarFn = fn(&[Value]) -> Value` contract can't
@@ -603,6 +615,9 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_range_aware("SUMX2MY2", range_fns::sumx2my2);
     r.register_range_aware("SUMX2PY2", range_fns::sumx2py2);
     r.register_range_aware("SUMXMY2", range_fns::sumxmy2);
+
+    // Phase 4.10.E (W5-167) — TEXTJOIN (range-aware variadic).
+    r.register_range_aware("TEXTJOIN", range_fns::textjoin);
 
     // Engine Phase 4.3 V2 batch #7 — stats family (W5-58).
     // Closes FN4-01 (100 functions). LARGE/SMALL are k-th order;
@@ -688,8 +703,12 @@ mod tests {
         // Phase 4.10.D (W5-166: FACT, FACTDOUBLE, COMBIN, COMBINA,
         // PERMUT, PERMUTATIONA, SUMSQ = 7 scalar combinatorics +
         // SUMX2MY2, SUMX2PY2, SUMXMY2 = 3 range-aware paired-array
-        // sum-of-squares = 10 total).
-        assert_eq!(r.len(), 160);
+        // sum-of-squares = 10 total) +
+        // Phase 4.10.E (W5-167: CHAR, CODE, UNICODE, UNICHAR = 4
+        // scalar codepoint round-trip + VALUE, FIXED, DOLLAR = 3
+        // locale-aware context-aware + TEXTJOIN = 1 range-aware
+        // variadic join = 8 total).
+        assert_eq!(r.len(), 168);
     }
 
     #[test]

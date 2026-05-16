@@ -1534,6 +1534,91 @@ pub fn mode(args: &[FnArg]) -> Value {
     }
 }
 
+/// **W5-167 (Phase 4.10.E):** `TEXTJOIN(delimiter, ignore_empty, args...)`
+///  — variadic join with a separator. Per Excel canon:
+///  - `delimiter` (1st arg): scalar text. Blank → empty string.
+///  - `ignore_empty` (2nd arg): bool; TRUE → skip empty strings and blanks.
+///  - `args...` (3rd onward): scalars + ranges. Ranges flatten row-major.
+///  - Errors in any arg propagate.
+///  - Total result length cap: 32,767 chars (Excel canon — matches CONCAT
+///    / REPT). Exceeded → `#VALUE!`.
+///  - Numbers / bools coerce to text representation.
+pub fn textjoin(args: &[FnArg]) -> Value {
+    if args.len() < 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    // Excel's text-result cap (matches CONCAT / REPT).
+    const EXCEL_TEXT_CAP_CHARS: usize = 32_767;
+    // 1: delimiter (scalar text).
+    let delim = match &args[0] {
+        FnArg::Scalar(v) => match coercion::to_text_for_arg(v) {
+            Ok(s) => s,
+            Err(e) => return Value::Error(e),
+        },
+        FnArg::Range { .. } => return Value::Error(ErrorValue::Value),
+    };
+    // 2: ignore_empty (bool).
+    let ignore_empty = match &args[1] {
+        FnArg::Scalar(Value::Boolean(b)) => *b,
+        FnArg::Scalar(Value::Number(n)) => *n != 0.0,
+        FnArg::Scalar(Value::Blank) => false,
+        FnArg::Scalar(Value::Error(e)) => return Value::Error(*e),
+        // Per Excel canon: strict coercion of the ignore_empty arg. Text
+        // / Range → #VALUE!.
+        _ => return Value::Error(ErrorValue::Value),
+    };
+    // 3+: variadic args. Collect text values into a Vec, then join with
+    // delim. This avoids special-casing "is this the first/last element"
+    // throughout the loop.
+    let mut parts: Vec<String> = Vec::new();
+    let mut char_count: usize = 0;
+    let push = |parts: &mut Vec<String>, char_count: &mut usize, text: String| -> Option<Value> {
+        if ignore_empty && text.is_empty() {
+            return None;
+        }
+        *char_count = char_count.saturating_add(text.chars().count());
+        if *char_count > EXCEL_TEXT_CAP_CHARS {
+            return Some(Value::Error(ErrorValue::Value));
+        }
+        parts.push(text);
+        None
+    };
+    for arg in &args[2..] {
+        match arg {
+            FnArg::Scalar(v) => match coercion::to_text_for_arg(v) {
+                Ok(s) => {
+                    if let Some(err) = push(&mut parts, &mut char_count, s) {
+                        return err;
+                    }
+                }
+                Err(e) => return Value::Error(e),
+            },
+            FnArg::Range { values, .. } => {
+                for v in values {
+                    match coercion::to_text_for_arg(v) {
+                        Ok(s) => {
+                            if let Some(err) = push(&mut parts, &mut char_count, s) {
+                                return err;
+                            }
+                        }
+                        Err(e) => return Value::Error(e),
+                    }
+                }
+            }
+        }
+    }
+    // Account for delimiter chars in the final length check.
+    let delim_count = delim.chars().count();
+    if !parts.is_empty() {
+        let total_delim_chars = delim_count.saturating_mul(parts.len().saturating_sub(1));
+        char_count = char_count.saturating_add(total_delim_chars);
+        if char_count > EXCEL_TEXT_CAP_CHARS {
+            return Value::Error(ErrorValue::Value);
+        }
+    }
+    Value::text(parts.join(&delim))
+}
+
 /// `CONCAT(text1, [text2], ...)` — concatenate scalar values AND
 /// flattened range cells into one string. Differs from CONCATENATE in
 /// that it accepts range arguments (CONCATENATE only accepts scalars).
@@ -2651,6 +2736,125 @@ mod tests {
         let x = r(vec![n(1.0)]);
         assert_eq!(sumxmy2(&[x]), Value::Error(ErrorValue::Value));
         assert_eq!(sumxmy2(&[]), Value::Error(ErrorValue::Value));
+    }
+
+    // === W5-167 (Phase 4.10.E) — TEXTJOIN ===
+
+    #[test]
+    fn textjoin_basic() {
+        // TEXTJOIN(", ", TRUE, "a", "b", "c") → "a, b, c".
+        assert_eq!(
+            textjoin(&[
+                s(t(", ")),
+                s(Value::Boolean(true)),
+                s(t("a")),
+                s(t("b")),
+                s(t("c")),
+            ]),
+            t("a, b, c")
+        );
+    }
+
+    #[test]
+    fn textjoin_ignore_empty_true_skips_empty_strings() {
+        // TEXTJOIN(",", TRUE, "a", "", "b") → "a,b" (skips empty).
+        assert_eq!(
+            textjoin(&[
+                s(t(",")),
+                s(Value::Boolean(true)),
+                s(t("a")),
+                s(t("")),
+                s(t("b")),
+            ]),
+            t("a,b")
+        );
+    }
+
+    #[test]
+    fn textjoin_ignore_empty_false_keeps_empty_strings() {
+        // TEXTJOIN(",", FALSE, "a", "", "b") → "a,,b".
+        assert_eq!(
+            textjoin(&[
+                s(t(",")),
+                s(Value::Boolean(false)),
+                s(t("a")),
+                s(t("")),
+                s(t("b")),
+            ]),
+            t("a,,b")
+        );
+    }
+
+    #[test]
+    fn textjoin_range_flattens() {
+        let range = r(vec![t("x"), t("y"), t("z")]);
+        assert_eq!(
+            textjoin(&[s(t("-")), s(Value::Boolean(true)), range]),
+            t("x-y-z")
+        );
+    }
+
+    #[test]
+    fn textjoin_error_in_arg_propagates() {
+        assert_eq!(
+            textjoin(&[
+                s(t(",")),
+                s(Value::Boolean(true)),
+                s(t("a")),
+                s(Value::Error(ErrorValue::Ref)),
+            ]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn textjoin_too_few_args_is_value_error() {
+        // Need at least 3 args (delim, ignore_empty, ≥1 value).
+        assert_eq!(textjoin(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(textjoin(&[s(t(","))]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            textjoin(&[s(t(",")), s(Value::Boolean(true))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn textjoin_empty_delimiter() {
+        // delim="" → just concatenation.
+        assert_eq!(
+            textjoin(&[
+                s(t("")),
+                s(Value::Boolean(true)),
+                s(t("a")),
+                s(t("b")),
+                s(t("c")),
+            ]),
+            t("abc")
+        );
+    }
+
+    #[test]
+    fn textjoin_coerces_numbers_and_bools() {
+        assert_eq!(
+            textjoin(&[
+                s(t(",")),
+                s(Value::Boolean(false)),
+                s(n(1.0)),
+                s(Value::Boolean(true)),
+                s(n(2.5)),
+            ]),
+            t("1,TRUE,2.5")
+        );
+    }
+
+    #[test]
+    fn textjoin_range_with_ignore_empty_skips_blanks() {
+        // Range with Blank cells; ignore_empty=TRUE skips them.
+        let range = r(vec![t("a"), Value::Blank, t("b")]);
+        assert_eq!(
+            textjoin(&[s(t(",")), s(Value::Boolean(true)), range]),
+            t("a,b")
+        );
     }
 
     // --- SUMPRODUCT ---

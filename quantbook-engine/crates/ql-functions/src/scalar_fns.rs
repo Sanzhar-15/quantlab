@@ -2252,6 +2252,288 @@ pub fn rept(args: &[Value]) -> Value {
     Value::text(text.repeat(n as usize))
 }
 
+// ===== W5-167 (Phase 4.10.E) — locale-aware text utilities =====
+
+/// Decimal separator for data-formatting purposes. Mirrors
+/// `ql_formula_syntax::locale::locale_data(_).decimal_separator` but
+/// inlined here to keep ql-functions independent of ql-formula-syntax.
+fn locale_decimal_separator(locale: ql_types::Locale) -> char {
+    match locale {
+        ql_types::Locale::EnUs => '.',
+        ql_types::Locale::De | ql_types::Locale::Fr => ',',
+    }
+}
+
+/// **W5-167:** `VALUE(text, &ctx)` — parse text as a number respecting
+/// the workbook's locale (decimal separator). Excel canon allows
+/// currency prefixes, percent suffixes, and date/time strings; V1
+/// supports trimmed numeric strings only. Non-parseable → `#VALUE!`.
+///
+/// Locale-aware: `Locale::EnUs` uses `.` as decimal; `De` / `Fr` use
+/// `,`. Thousands grouping is NOT parsed in V1 (a future polish wave
+/// can add it; Excel accepts "1,234.5" → 1234.5).
+pub fn value_ctx(args: &[Value], ctx: &ql_types::EvalContext) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    // Numbers pass through.
+    if let Value::Number(n) = &args[0] {
+        return Value::Number(*n);
+    }
+    // Blank → 0 per Excel canon.
+    if matches!(&args[0], Value::Blank) {
+        return Value::Number(0.0);
+    }
+    let s = match coerce_text(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Value::Error(ErrorValue::Value);
+    }
+    let decimal_sep = locale_decimal_separator(ctx.locale);
+    // Replace locale decimal with `.` for Rust's f64 parser; reject
+    // strings containing the wrong decimal char as a safeguard
+    // against ambiguous "1.5" being mis-parsed in De locale.
+    let normalized: String = if decimal_sep == '.' {
+        trimmed.to_owned()
+    } else {
+        // Reject `.` glyph in non-`.` locale; only the locale's decimal
+        // is accepted. (Strict: closes a class of locale-confusion bugs.)
+        if trimmed.contains('.') {
+            return Value::Error(ErrorValue::Value);
+        }
+        trimmed.replace(decimal_sep, ".")
+    };
+    match normalized.parse::<f64>() {
+        Ok(n) => match ql_types::coercion::sanitize_f64(n) {
+            Ok(n) => Value::Number(n),
+            Err(e) => Value::Error(e),
+        },
+        Err(_) => Value::Error(ErrorValue::Value),
+    }
+}
+
+/// Shared formatter for FIXED / DOLLAR. Rounds to `decimals` (negative
+/// values round to that many digits LEFT of the decimal point), then
+/// formats with the locale's thousands + decimal separators unless
+/// `no_commas` is TRUE (FIXED only — DOLLAR always groups).
+///
+/// Returns the formatted text and the sign (so DOLLAR can wrap it in
+/// the currency prefix appropriately).
+fn format_grouped(n: f64, decimals: i32, no_commas: bool, locale: ql_types::Locale) -> String {
+    let (thousands_sep, decimal_sep): (char, char) = match locale {
+        ql_types::Locale::EnUs => (',', '.'),
+        ql_types::Locale::De => ('.', ','),
+        ql_types::Locale::Fr => (' ', ','),
+    };
+    // Round to the specified decimals. Negative decimals round LEFT of
+    // the decimal point (e.g., FIXED(1234.567, -2) = "1,200").
+    let factor = 10f64.powi(decimals);
+    // Half-away-from-zero rounding (Excel canon for FIXED/DOLLAR).
+    let rounded = (n * factor).round() / factor;
+    let sign = rounded.is_sign_negative();
+    let abs = rounded.abs();
+    // For decimals < 0, format with 0 fractional digits; the rounding
+    // above already zeroed the lower digits.
+    let display_decimals = decimals.max(0) as usize;
+    let formatted = format!("{:.*}", display_decimals, abs);
+    // Split into integer + fractional parts on `.` (Rust's `format!`
+    // always uses `.`).
+    let (int_part, frac_part) = match formatted.find('.') {
+        Some(i) => (&formatted[..i], Some(&formatted[i + 1..])),
+        None => (formatted.as_str(), None),
+    };
+    let int_grouped = if no_commas {
+        int_part.to_owned()
+    } else {
+        group_thousands(int_part, thousands_sep)
+    };
+    let mut out = String::new();
+    if sign {
+        out.push('-');
+    }
+    out.push_str(&int_grouped);
+    if let Some(frac) = frac_part {
+        out.push(decimal_sep);
+        out.push_str(frac);
+    }
+    out
+}
+
+fn group_thousands(int_str: &str, sep: char) -> String {
+    let chars: Vec<char> = int_str.chars().rev().collect();
+    let mut out: Vec<char> = Vec::with_capacity(chars.len() + chars.len() / 3);
+    for (i, c) in chars.iter().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(sep);
+        }
+        out.push(*c);
+    }
+    out.iter().rev().collect()
+}
+
+/// **W5-167:** `FIXED(number, [decimals=2], [no_commas=FALSE], &ctx)` —
+/// format a number as text with fixed decimal places and locale-aware
+/// thousands grouping. Excel canon: half-away-from-zero rounding;
+/// negative `decimals` rounds left of the decimal point.
+pub fn fixed_ctx(args: &[Value], ctx: &ql_types::EvalContext) -> Value {
+    if args.is_empty() || args.len() > 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let n = match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => n,
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    let decimals = if args.len() >= 2 {
+        match coerce_numeric(&args[1]) {
+            NumericArg::Number(d) => d.trunc() as i32,
+            NumericArg::Skip => 2,
+            NumericArg::Error(e) => return Value::Error(e),
+        }
+    } else {
+        2
+    };
+    let no_commas = if args.len() == 3 {
+        match &args[2] {
+            Value::Boolean(b) => *b,
+            Value::Number(n) => *n != 0.0,
+            Value::Blank => false,
+            Value::Error(e) => return Value::Error(*e),
+            _ => {
+                // Excel coerces strict; non-bool/num/blank → #VALUE!.
+                return Value::Error(ErrorValue::Value);
+            }
+        }
+    } else {
+        false
+    };
+    Value::text(format_grouped(n, decimals, no_commas, ctx.locale))
+}
+
+/// **W5-167:** `DOLLAR(number, [decimals=2], &ctx)` — like `FIXED` but
+/// prefixed with `$`. Negative values prefix `-` then `$` (V1 — locale-
+/// specific currency symbol + accounting parens deferred to Phase 4.5
+/// number-format polish wave).
+///
+/// Always groups thousands (no `no_commas` arg). Locale-aware
+/// decimal + thousands separators.
+pub fn dollar_ctx(args: &[Value], ctx: &ql_types::EvalContext) -> Value {
+    if args.is_empty() || args.len() > 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let n = match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => n,
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    let decimals = if args.len() == 2 {
+        match coerce_numeric(&args[1]) {
+            NumericArg::Number(d) => d.trunc() as i32,
+            NumericArg::Skip => 2,
+            NumericArg::Error(e) => return Value::Error(e),
+        }
+    } else {
+        2
+    };
+    let formatted = format_grouped(n, decimals, false, ctx.locale);
+    // Prefix `$`. For negatives, `format_grouped` already wrote `-`;
+    // splice `$` after it to produce `-$1,234.50`.
+    let prefixed = if let Some(rest) = formatted.strip_prefix('-') {
+        format!("-${}", rest)
+    } else {
+        format!("${}", formatted)
+    };
+    Value::text(prefixed)
+}
+
+// ===== W5-167 (Phase 4.10.E) — character codepoint round-trip =====
+
+/// **W5-167:** `CHAR(code)` — codepoint → character. Excel canon:
+/// code in 1..=255 maps to Windows-1252. For V1 we use Unicode
+/// codepoint mapping (`char::from_u32`); ASCII (1-127) is identical
+/// to Windows-1252; positions 128-159 DIVERGE because Windows-1252
+/// fills that range with extra glyphs while Unicode has C1 control
+/// characters. Document the divergence in the matrix.
+/// code < 1 or > 255 → #VALUE!. Truncate toward zero.
+pub fn char_fn(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let n = match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => n.trunc(),
+        NumericArg::Skip => return Value::Error(ErrorValue::Value),
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    if !(1.0..=255.0).contains(&n) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let code = n as u32;
+    match char::from_u32(code) {
+        Some(c) => Value::text(c.to_string()),
+        None => Value::Error(ErrorValue::Value),
+    }
+}
+
+/// **W5-167:** `CODE(text)` — first character → codepoint. Excel canon:
+/// returns the Windows-1252 code; we return the Unicode codepoint of
+/// the first scalar value (same as Windows-1252 for chars 1-127,
+/// diverges for 128-159 control range). Empty string → #VALUE!.
+pub fn code_fn(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let s = match coerce_text(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    match s.chars().next() {
+        Some(c) => Value::Number(c as u32 as f64),
+        None => Value::Error(ErrorValue::Value),
+    }
+}
+
+/// **W5-167:** `UNICODE(text)` — first character → Unicode codepoint.
+/// Same as CODE but explicitly Unicode-canonical (Excel's UNICODE
+/// matches us exactly across all codepoints). Empty string → #VALUE!.
+pub fn unicode_fn(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let s = match coerce_text(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    match s.chars().next() {
+        Some(c) => Value::Number(c as u32 as f64),
+        None => Value::Error(ErrorValue::Value),
+    }
+}
+
+/// **W5-167:** `UNICHAR(code)` — Unicode codepoint → character. Excel
+/// canon: code in 1..=1114111, surrogates (0xD800..=0xDFFF) → #N/A,
+/// code < 1 → #VALUE!. Truncate toward zero.
+pub fn unichar_fn(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let n = match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => n.trunc(),
+        NumericArg::Skip => return Value::Error(ErrorValue::Value),
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    if n < 1.0 || n > (char::MAX as u32 as f64) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let code = n as u32;
+    match char::from_u32(code) {
+        Some(c) => Value::text(c.to_string()),
+        None => Value::Error(ErrorValue::NA),
+    }
+}
+
 /// `EXACT(text1, text2)` — case-sensitive equality. Returns TRUE/
 /// FALSE. Numbers coerce to text first.
 pub fn exact(args: &[Value]) -> Value {
@@ -4676,6 +4958,225 @@ mod tests {
         assert_eq!(
             sumsq(&[n(1.0), Value::Error(ErrorValue::Ref), n(3.0)]),
             Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    // === W5-167 (Phase 4.10.E) — text utility fillins ===
+
+    fn ctx_default() -> ql_types::EvalContext {
+        ql_types::EvalContext::default()
+    }
+    fn ctx_de() -> ql_types::EvalContext {
+        ql_types::EvalContext {
+            locale: ql_types::Locale::De,
+            ..ql_types::EvalContext::default()
+        }
+    }
+    fn ctx_fr() -> ql_types::EvalContext {
+        ql_types::EvalContext {
+            locale: ql_types::Locale::Fr,
+            ..ql_types::EvalContext::default()
+        }
+    }
+
+    // --- CHAR ---
+
+    #[test]
+    fn char_ascii_basic() {
+        assert_eq!(char_fn(&[n(65.0)]), Value::text("A"));
+        assert_eq!(char_fn(&[n(97.0)]), Value::text("a"));
+        assert_eq!(char_fn(&[n(32.0)]), Value::text(" "));
+    }
+
+    #[test]
+    fn char_truncates_toward_zero() {
+        assert_eq!(char_fn(&[n(65.9)]), Value::text("A"));
+    }
+
+    #[test]
+    fn char_out_of_range_is_value_error() {
+        assert_eq!(char_fn(&[n(0.0)]), Value::Error(ErrorValue::Value));
+        assert_eq!(char_fn(&[n(256.0)]), Value::Error(ErrorValue::Value));
+        assert_eq!(char_fn(&[n(-1.0)]), Value::Error(ErrorValue::Value));
+    }
+
+    // --- CODE ---
+
+    #[test]
+    fn code_ascii_basic() {
+        assert_eq!(code_fn(&[Value::text("A")]), n(65.0));
+        assert_eq!(code_fn(&[Value::text("ABC")]), n(65.0)); // first char
+    }
+
+    #[test]
+    fn code_empty_string_is_value_error() {
+        assert_eq!(code_fn(&[Value::text("")]), Value::Error(ErrorValue::Value));
+    }
+
+    // --- UNICODE / UNICHAR ---
+
+    #[test]
+    fn unicode_basic() {
+        assert_eq!(unicode_fn(&[Value::text("A")]), n(65.0));
+        // Beyond ASCII: 'é' is U+00E9 = 233.
+        assert_eq!(unicode_fn(&[Value::text("é")]), n(233.0));
+    }
+
+    #[test]
+    fn unichar_basic() {
+        assert_eq!(unichar_fn(&[n(65.0)]), Value::text("A"));
+        assert_eq!(unichar_fn(&[n(233.0)]), Value::text("é"));
+    }
+
+    #[test]
+    fn unichar_zero_is_value_error() {
+        assert_eq!(unichar_fn(&[n(0.0)]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn unichar_surrogate_is_na() {
+        // Surrogate codepoint 0xD800: char::from_u32 returns None.
+        assert_eq!(
+            unichar_fn(&[n(0xD800 as f64)]),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    // --- VALUE ---
+
+    #[test]
+    fn value_basic_enus() {
+        let ctx = ctx_default();
+        assert_eq!(value_ctx(&[Value::text("1.5")], &ctx), n(1.5));
+        assert_eq!(value_ctx(&[Value::text("  42  ")], &ctx), n(42.0));
+        assert_eq!(value_ctx(&[Value::text("-2.71")], &ctx), n(-2.71));
+    }
+
+    #[test]
+    fn value_locale_aware_decimal_de() {
+        let ctx = ctx_de();
+        // De locale: `,` is decimal.
+        assert_eq!(value_ctx(&[Value::text("1,5")], &ctx), n(1.5));
+        // De locale: `.` in number → reject (closes locale-confusion bug).
+        assert_eq!(
+            value_ctx(&[Value::text("1.5")], &ctx),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn value_locale_aware_decimal_fr() {
+        let ctx = ctx_fr();
+        // Use a value that's not PI-adjacent (clippy::approx_constant).
+        assert_eq!(value_ctx(&[Value::text("2,71")], &ctx), n(2.71));
+    }
+
+    #[test]
+    fn value_number_passes_through() {
+        // Excel canon: VALUE on a number returns the number.
+        let ctx = ctx_default();
+        assert_eq!(value_ctx(&[n(42.0)], &ctx), n(42.0));
+    }
+
+    #[test]
+    fn value_blank_is_zero() {
+        let ctx = ctx_default();
+        assert_eq!(value_ctx(&[Value::Blank], &ctx), n(0.0));
+    }
+
+    #[test]
+    fn value_empty_string_is_value_error() {
+        let ctx = ctx_default();
+        assert_eq!(
+            value_ctx(&[Value::text("")], &ctx),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            value_ctx(&[Value::text("   ")], &ctx),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn value_non_numeric_text_is_value_error() {
+        let ctx = ctx_default();
+        assert_eq!(
+            value_ctx(&[Value::text("hello")], &ctx),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // --- FIXED ---
+
+    #[test]
+    fn fixed_default_decimals_enus() {
+        let ctx = ctx_default();
+        // FIXED(1234.567) → "1,234.57" (default decimals=2, half-away).
+        assert_eq!(fixed_ctx(&[n(1234.567)], &ctx), Value::text("1,234.57"));
+    }
+
+    #[test]
+    fn fixed_zero_decimals() {
+        let ctx = ctx_default();
+        assert_eq!(
+            fixed_ctx(&[n(1234.567), n(0.0)], &ctx),
+            Value::text("1,235")
+        );
+    }
+
+    #[test]
+    fn fixed_negative_decimals() {
+        let ctx = ctx_default();
+        // FIXED(1234.567, -2) → round to nearest 100.
+        assert_eq!(
+            fixed_ctx(&[n(1234.567), n(-2.0)], &ctx),
+            Value::text("1,200")
+        );
+    }
+
+    #[test]
+    fn fixed_no_commas() {
+        let ctx = ctx_default();
+        assert_eq!(
+            fixed_ctx(&[n(1234.567), n(2.0), Value::Boolean(true)], &ctx),
+            Value::text("1234.57")
+        );
+    }
+
+    #[test]
+    fn fixed_locale_de() {
+        let ctx = ctx_de();
+        // De: thousands `.`, decimal `,`.
+        assert_eq!(fixed_ctx(&[n(1234.567)], &ctx), Value::text("1.234,57"));
+    }
+
+    #[test]
+    fn fixed_negative_value() {
+        let ctx = ctx_default();
+        assert_eq!(fixed_ctx(&[n(-1234.5)], &ctx), Value::text("-1,234.50"));
+    }
+
+    // --- DOLLAR ---
+
+    #[test]
+    fn dollar_default_decimals() {
+        let ctx = ctx_default();
+        assert_eq!(dollar_ctx(&[n(1234.5)], &ctx), Value::text("$1,234.50"));
+    }
+
+    #[test]
+    fn dollar_negative_value() {
+        let ctx = ctx_default();
+        // V1: prefix `-$` (accounting parens deferred to Phase 4.5 polish).
+        assert_eq!(dollar_ctx(&[n(-1234.5)], &ctx), Value::text("-$1,234.50"));
+    }
+
+    #[test]
+    fn dollar_zero_decimals() {
+        let ctx = ctx_default();
+        assert_eq!(
+            dollar_ctx(&[n(1234.5), n(0.0)], &ctx),
+            Value::text("$1,235")
         );
     }
 

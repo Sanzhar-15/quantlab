@@ -166,7 +166,7 @@ as partial, rows with `❌` are missing.
 | CLEAN | ✅ | 4 | 4.3 polish | W5-61: strip ASCII control chars 0x00–0x1F (tab, LF, CR, and the rest). Chars ≥ 0x20 and all Unicode pass through. |
 | CONCATENATE | ⚠️ | 4 | 4.3 V2 | W5-56: variadic scalar args, no range support (Excel CONCATENATE is the legacy non-range version). Errors propagate. CONCAT (range-aware variant) deferred to next batch. |
 | CONCAT | ✅ | 7 | 4.3 polish | W5-61: range-aware variant of CONCATENATE. Accepts ranges (flattens row-major) and scalars. Blanks become empty strings (no skip). Numbers / bools coerce to text representation. Errors propagate (first one returned). Variadic; ≥1 arg required. |
-| TEXTJOIN | ❌ | 0 | 4.3 | |
+| TEXTJOIN | ✅ | 9 | 4.10.E | W5-167: variadic delimiter join. RangeAwareFn — accepts scalars + ranges; ranges flatten row-major. Args: `delimiter` (scalar text; blank→empty), `ignore_empty` (bool; TRUE skips empty strings and blanks), `args...`. Errors propagate. Excel 32,767-char cap enforced (matches CONCAT/REPT). |
 | FIND | ⚠️ | 5 | 4.3 V2 | W5-56: case-SENSITIVE substring search; 1-based result; not found → #VALUE!. Optional start_num. Empty needle returns start_num. No wildcards (FIND never supports wildcards in Excel anyway). |
 | SEARCH | ✅ | 7 | 4.3 polish | W5-56 + W5-61: case-INSENSITIVE substring search. **Wildcards `?` (single char) and `*` (any chars) supported W5-61.** Escape with `~` (`~?`, `~*`, `~~`). Same start_num + not-found semantics as FIND. Empty needle returns start_num. |
 | SUBSTITUTE | ⚠️ | 4 | 4.3 V2 | W5-56: case-sensitive find-and-replace. Optional instance_num replaces only the Nth occurrence (1-based). Empty old_text is a no-op (Excel canon). |
@@ -174,9 +174,12 @@ as partial, rows with `❌` are missing.
 | REPT | ⚠️ | 3 | 4.3 V2 | W5-56: text repeat. Excel canonical 32,767-character cap enforced (returns #VALUE! when exceeded). Negative num_times → #VALUE!. |
 | EXACT | ✅ | 2 | 4.3 V2 | W5-56: case-sensitive equality. Numbers coerce to text before compare. |
 | TEXT | ✅ | 28 | 4.5.E | W5-83: render Value via parsed Excel format string. Built on the W5-77→W5-82 format module (parser+renderer+FormatTable+overlay+runtime). Parse failures (incl. V2-deferred [Red]/conditionals/elapsed/fraction) surface as #VALUE!. Tests in `format::text_fn::tests` + `workbook_runtime::tests::text_formula_*` + e2e `format_persistence_round_trip_through_qbook`. |
-| VALUE / NUMBERVALUE | ❌ | 0 | 4.3 | Text → number coercion as function |
-| FIXED / DOLLAR | ❌ | 0 | 4.5 | |
-| CHAR / CODE / UNICODE / UNICHAR | ❌ | 0 | 4.3 | |
+| VALUE | ✅ | 7 | 4.10.E | W5-167: parse text as number, locale-aware decimal separator (EnUs `.`; De/Fr `,`). ContextAwareFn. Trim whitespace; reject empty / non-numeric → #VALUE!. Numbers pass through; Blank → 0. **Strict locale-confusion guard**: in De/Fr locale, `.` in the numeric string → #VALUE! (closes ambiguity for "1.5" vs "1,5"). Currency prefixes + thousands grouping NOT parsed in V1; bundle with Phase 4.5 polish wave. |
+| NUMBERVALUE | ❌ | 0 | Wave 3 | Like VALUE but takes explicit decimal/group separators as args. Defer. |
+| FIXED | ✅ | 6 | 4.10.E | W5-167: number → text with fixed decimals + locale-aware thousands grouping. ContextAwareFn. Default decimals=2; negative decimals round LEFT of decimal point; `no_commas=TRUE` suppresses grouping. Half-away-from-zero rounding. Locale-aware separators (EnUs: `,` thousands `.` decimal; De: `.` thousands `,` decimal; Fr: ` ` thousands `,` decimal). |
+| DOLLAR | ✅ | 3 | 4.10.E | W5-167: currency text with `$` prefix. ContextAwareFn. Always groups thousands. Negatives → `-$1,234.50` (V1 — accounting parens + locale-specific currency symbol deferred to Phase 4.5 polish). |
+| CHAR / CODE | ✅ | 5 | 4.10.E | W5-167: codepoint round-trip for code 1..=255. **DIVERGENCE**: Excel uses Windows-1252; we use Unicode codepoint mapping. Identical for 1-127 ASCII; positions 128-159 differ (Windows-1252 has extra glyphs; Unicode has C1 control characters). Document divergence; bundle Windows-1252 polish with deferred UTF-16 work. |
+| UNICODE / UNICHAR | ✅ | 5 | 4.10.E | W5-167: full Unicode codepoint round-trip. UNICHAR: code 1..=char::MAX; surrogates (0xD800..=0xDFFF) → #N/A. Canonical match vs Excel. |
 | REGEX / REGEXMATCH / REGEXEXTRACT / REGEXREPLACE | ❌ | 0 | post-v1 | Google Sheets extension; not in Excel canon |
 | LEFTB / RIGHTB / MIDB / LENB / FINDB / SEARCHB | ❌ | 0 | 4.10 | Byte-length variants (DBCS) |
 | TEXTBEFORE / TEXTAFTER / TEXTSPLIT | ❌ | 0 | 4.7 | Modern Excel; array-result |
