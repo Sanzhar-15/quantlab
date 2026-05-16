@@ -277,6 +277,19 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "IRR",
         "W5-168; unit tests pin Newton-Raphson + bisection fallback + sign-change requirement",
     ),
+    // W5-169 (Phase 4.10.G) — modern lookups + ADDRESS.
+    (
+        "XLOOKUP",
+        "W5-169; unit tests pin 4 match modes + 2 search modes + if_not_found + 1D shape requirement",
+    ),
+    (
+        "XMATCH",
+        "W5-169; unit tests pin position return + match/search modes",
+    ),
+    (
+        "ADDRESS",
+        "W5-169; unit tests pin all 4 abs_num modes + A1/R1C1 styles + sheet quoting + col-letter conversion",
+    ),
     // Math (default coercion paths cover most; per-fn overrides deferred)
     ("ABS", "default; deferred"),
     ("SQRT", "domain error #NUM!; deferred"),

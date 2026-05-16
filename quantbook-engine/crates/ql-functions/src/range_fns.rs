@@ -459,6 +459,237 @@ pub fn r#match(args: &[FnArg]) -> Value {
     }
 }
 
+// ===== W5-169 (Phase 4.10.G) — XLOOKUP / XMATCH =====
+
+/// Decode the `match_mode` arg of XLOOKUP / XMATCH per Excel canon:
+/// 0=exact (default), -1=exact-or-next-smaller, 1=exact-or-next-larger,
+/// 2=wildcard. Returns Err on out-of-range or invalid input.
+fn decode_xlookup_match_mode(arg: Option<&FnArg>) -> Result<i32, ErrorValue> {
+    match arg {
+        None => Ok(0),
+        Some(FnArg::Scalar(Value::Number(n))) => {
+            let m = n.trunc() as i32;
+            if !(-1..=2).contains(&m) {
+                return Err(ErrorValue::Value);
+            }
+            Ok(m)
+        }
+        Some(FnArg::Scalar(Value::Blank)) => Ok(0),
+        Some(FnArg::Scalar(Value::Boolean(b))) => Ok(if *b { 1 } else { 0 }),
+        Some(FnArg::Scalar(Value::Error(e))) => Err(*e),
+        _ => Err(ErrorValue::Value),
+    }
+}
+
+/// Decode the `search_mode` arg of XLOOKUP / XMATCH per Excel canon:
+/// 1=first→last (default), -1=last→first, 2=binary ascending,
+/// -2=binary descending. V1 implementation uses linear scan in all
+/// modes — the binary modes give the same RESULT but lose the perf
+/// advantage; document the divergence.
+fn decode_xlookup_search_mode(arg: Option<&FnArg>) -> Result<i32, ErrorValue> {
+    match arg {
+        None => Ok(1),
+        Some(FnArg::Scalar(Value::Number(n))) => {
+            let m = n.trunc() as i32;
+            if !matches!(m, 1 | -1 | 2 | -2) {
+                return Err(ErrorValue::Value);
+            }
+            Ok(m)
+        }
+        Some(FnArg::Scalar(Value::Blank)) => Ok(1),
+        Some(FnArg::Scalar(Value::Error(e))) => Err(*e),
+        _ => Err(ErrorValue::Value),
+    }
+}
+
+/// Wildcard match (per the existing W5-61 wildcard infrastructure):
+/// `?` matches any single char; `*` matches any sequence; `~` escapes.
+fn xlookup_wildcard_match(pattern: &Value, cell: &Value) -> bool {
+    let pat = match pattern {
+        Value::Text(s) => s.as_ref(),
+        _ => return lookup_eq(pattern, cell),
+    };
+    let text = match cell {
+        Value::Text(s) => s.as_ref(),
+        // Coerce non-text cells to text representation; wildcards on
+        // non-text are useful only when pattern is non-wildcard, in
+        // which case lookup_eq handles type-coercion.
+        _ => return lookup_eq(pattern, cell),
+    };
+    crate::wildcard::WildcardPattern::compile(pat).matches(text)
+}
+
+/// Find the XLOOKUP / XMATCH index per (match_mode, search_mode). Returns
+/// the 0-based index into `hay`, or `None` if no match.
+fn xlookup_find_index(
+    needle: &Value,
+    hay: &[Value],
+    match_mode: i32,
+    search_mode: i32,
+) -> Option<usize> {
+    use std::cmp::Ordering;
+    // Direction-aware iteration helper.
+    let reverse = search_mode < 0;
+    let indices: Box<dyn Iterator<Item = usize>> = if reverse {
+        Box::new((0..hay.len()).rev())
+    } else {
+        Box::new(0..hay.len())
+    };
+    let mut best_smaller: Option<usize> = None;
+    let mut best_larger: Option<usize> = None;
+    for i in indices {
+        let cell = &hay[i];
+        let eq = match match_mode {
+            2 => xlookup_wildcard_match(needle, cell),
+            _ => lookup_eq(needle, cell),
+        };
+        if eq {
+            return Some(i);
+        }
+        if match_mode == -1 || match_mode == 1 {
+            match lookup_cmp(cell, needle) {
+                Some(Ordering::Less) if match_mode == -1 => {
+                    // Track the LARGEST cell that's still < needle.
+                    let take = match best_smaller {
+                        None => true,
+                        Some(j) => matches!(lookup_cmp(cell, &hay[j]), Some(Ordering::Greater)),
+                    };
+                    if take {
+                        best_smaller = Some(i);
+                    }
+                }
+                Some(Ordering::Greater) if match_mode == 1 => {
+                    // Track the SMALLEST cell that's still > needle.
+                    let take = match best_larger {
+                        None => true,
+                        Some(j) => matches!(lookup_cmp(cell, &hay[j]), Some(Ordering::Less)),
+                    };
+                    if take {
+                        best_larger = Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    match match_mode {
+        -1 => best_smaller,
+        1 => best_larger,
+        _ => None,
+    }
+}
+
+/// **W5-169 (Phase 4.10.G):** `XLOOKUP(lookup_value, lookup_array,
+/// return_array, [if_not_found], [match_mode=0], [search_mode=1])` —
+/// modern replacement for VLOOKUP / HLOOKUP / INDEX+MATCH. V1 returns
+/// scalar results only (2D return_array → Phase 4.7 spill).
+///
+/// **Match modes** (per Excel canon):
+/// - `0` exact (default).
+/// - `-1` exact or next smaller.
+/// - `1` exact or next larger.
+/// - `2` wildcard (`?`, `*`, `~` escape).
+///
+/// **Search modes**:
+/// - `1` first→last (default).
+/// - `-1` last→first.
+/// - `2` binary ascending — V1 uses linear scan (same result, no
+///   perf advantage). Caller must pre-sort.
+/// - `-2` binary descending — same V1 caveat.
+///
+/// `if_not_found`: returned on no match. If omitted, `#N/A`.
+pub fn xlookup(args: &[FnArg]) -> Value {
+    if !(3..=6).contains(&args.len()) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let needle = match &args[0] {
+        FnArg::Scalar(v) => v,
+        FnArg::Range { .. } => return Value::Error(ErrorValue::Value),
+    };
+    if let Value::Error(e) = needle {
+        return Value::Error(*e);
+    }
+    let (hay, hay_rows, hay_cols) = match &args[1] {
+        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
+    };
+    let (ret, ret_rows, ret_cols) = match &args[2] {
+        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
+    };
+    // V1: lookup_array must be 1D (single row OR single column) and
+    // return_array must have the same length. 2D return_array → Phase
+    // 4.7 spill.
+    if hay_rows != 1 && hay_cols != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    if ret.len() != hay.len() {
+        return Value::Error(ErrorValue::Value);
+    }
+    // V1 scalar return only.
+    if ret_rows != 1 && ret_cols != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let match_mode = match decode_xlookup_match_mode(args.get(4)) {
+        Ok(m) => m,
+        Err(e) => return Value::Error(e),
+    };
+    let search_mode = match decode_xlookup_search_mode(args.get(5)) {
+        Ok(m) => m,
+        Err(e) => return Value::Error(e),
+    };
+    match xlookup_find_index(needle, hay, match_mode, search_mode) {
+        Some(i) => ret[i].clone(),
+        None => {
+            // if_not_found: clone the scalar arg if provided; else #N/A.
+            if let Some(arg) = args.get(3) {
+                match arg {
+                    FnArg::Scalar(v) => v.clone(),
+                    FnArg::Range { .. } => Value::Error(ErrorValue::Value),
+                }
+            } else {
+                Value::Error(ErrorValue::NA)
+            }
+        }
+    }
+}
+
+/// **W5-169 (Phase 4.10.G):** `XMATCH(lookup_value, lookup_array,
+/// [match_mode=0], [search_mode=1])` — modern replacement for MATCH.
+/// Returns the 1-based position in `lookup_array`. Same match_mode +
+/// search_mode semantics as `XLOOKUP`. No match → `#N/A`.
+pub fn xmatch(args: &[FnArg]) -> Value {
+    if !(2..=4).contains(&args.len()) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let needle = match &args[0] {
+        FnArg::Scalar(v) => v,
+        FnArg::Range { .. } => return Value::Error(ErrorValue::Value),
+    };
+    if let Value::Error(e) = needle {
+        return Value::Error(*e);
+    }
+    let (hay, hay_rows, hay_cols) = match &args[1] {
+        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
+    };
+    if hay_rows != 1 && hay_cols != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let match_mode = match decode_xlookup_match_mode(args.get(2)) {
+        Ok(m) => m,
+        Err(e) => return Value::Error(e),
+    };
+    let search_mode = match decode_xlookup_search_mode(args.get(3)) {
+        Ok(m) => m,
+        Err(e) => return Value::Error(e),
+    };
+    match xlookup_find_index(needle, hay, match_mode, search_mode) {
+        Some(i) => Value::Number((i + 1) as f64),
+        None => Value::Error(ErrorValue::NA),
+    }
+}
+
 /// `INDEX(array, row_num, [col_num])` — return the element at the
 /// (1-based) row + col position of `array`. For a 1D array (single
 /// row or column), `col_num` is optional and the second arg is
@@ -2855,6 +3086,166 @@ mod tests {
             textjoin(&[s(t(",")), s(Value::Boolean(true)), range]),
             t("a,b")
         );
+    }
+
+    // === W5-169 (Phase 4.10.G) — XLOOKUP / XMATCH ===
+
+    // --- XLOOKUP ---
+
+    #[test]
+    fn xlookup_exact_match() {
+        // XLOOKUP("b", [a,b,c], [1,2,3]) → 2.
+        let hay = r(vec![t("a"), t("b"), t("c")]);
+        let ret = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(xlookup(&[s(t("b")), hay, ret]), n(2.0));
+    }
+
+    #[test]
+    fn xlookup_no_match_returns_na_by_default() {
+        let hay = r(vec![t("a"), t("b"), t("c")]);
+        let ret = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            xlookup(&[s(t("z")), hay, ret]),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn xlookup_if_not_found_when_no_match() {
+        let hay = r(vec![t("a"), t("b"), t("c")]);
+        let ret = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            xlookup(&[s(t("z")), hay, ret, s(t("default"))]),
+            t("default")
+        );
+    }
+
+    #[test]
+    fn xlookup_match_mode_next_smaller() {
+        // Hay = [10, 20, 30, 40, 50]. Look up 25 with match_mode=-1 →
+        // largest cell ≤ 25 = 20 (index 1).
+        let hay = r(vec![n(10.0), n(20.0), n(30.0), n(40.0), n(50.0)]);
+        let ret = r(vec![
+            t("ten"),
+            t("twenty"),
+            t("thirty"),
+            t("forty"),
+            t("fifty"),
+        ]);
+        assert_eq!(
+            xlookup(&[s(n(25.0)), hay, ret, s(t("none")), s(n(-1.0))]),
+            t("twenty")
+        );
+    }
+
+    #[test]
+    fn xlookup_match_mode_next_larger() {
+        // Hay = [10,20,30,40,50]. Look up 25, match_mode=1 → smallest
+        // cell ≥ 25 = 30 (index 2).
+        let hay = r(vec![n(10.0), n(20.0), n(30.0), n(40.0), n(50.0)]);
+        let ret = r(vec![
+            t("ten"),
+            t("twenty"),
+            t("thirty"),
+            t("forty"),
+            t("fifty"),
+        ]);
+        assert_eq!(
+            xlookup(&[s(n(25.0)), hay, ret, s(t("none")), s(n(1.0))]),
+            t("thirty")
+        );
+    }
+
+    #[test]
+    fn xlookup_wildcard_match() {
+        let hay = r(vec![t("apple"), t("banana"), t("cherry")]);
+        let ret = r(vec![n(1.0), n(2.0), n(3.0)]);
+        // Pattern "ban*" matches "banana" at index 1.
+        assert_eq!(
+            xlookup(&[s(t("ban*")), hay, ret, s(t("none")), s(n(2.0))]),
+            n(2.0)
+        );
+    }
+
+    #[test]
+    fn xlookup_search_mode_reverse() {
+        // Hay has duplicates: [a, b, c, b]. Default search picks index 1;
+        // reverse search picks index 3.
+        let hay = r(vec![t("a"), t("b"), t("c"), t("b")]);
+        let ret = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        // Forward → 2.
+        assert_eq!(
+            xlookup(&[
+                s(t("b")),
+                hay.clone(),
+                ret.clone(),
+                s(Value::Blank),
+                s(n(0.0))
+            ]),
+            n(2.0)
+        );
+        // Reverse → 4.
+        assert_eq!(
+            xlookup(&[s(t("b")), hay, ret, s(Value::Blank), s(n(0.0)), s(n(-1.0))]),
+            n(4.0)
+        );
+    }
+
+    #[test]
+    fn xlookup_shape_mismatch_is_value_error() {
+        let hay = r(vec![n(1.0), n(2.0)]);
+        let ret = r(vec![t("a"), t("b"), t("c")]);
+        assert_eq!(
+            xlookup(&[s(n(1.0)), hay, ret]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn xlookup_too_few_args_is_value_error() {
+        assert_eq!(xlookup(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            xlookup(&[s(n(1.0)), r(vec![n(1.0)])]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn xlookup_invalid_match_mode_is_value_error() {
+        let hay = r(vec![t("a")]);
+        let ret = r(vec![n(1.0)]);
+        assert_eq!(
+            xlookup(&[s(t("a")), hay, ret, s(Value::Blank), s(n(99.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // --- XMATCH ---
+
+    #[test]
+    fn xmatch_basic() {
+        // XMATCH("b", [a,b,c]) → 2.
+        let hay = r(vec![t("a"), t("b"), t("c")]);
+        assert_eq!(xmatch(&[s(t("b")), hay]), n(2.0));
+    }
+
+    #[test]
+    fn xmatch_no_match_is_na() {
+        let hay = r(vec![t("a"), t("b")]);
+        assert_eq!(xmatch(&[s(t("z")), hay]), Value::Error(ErrorValue::NA));
+    }
+
+    #[test]
+    fn xmatch_reverse_search() {
+        let hay = r(vec![t("a"), t("b"), t("c"), t("b")]);
+        // Reverse: last "b" is at position 4.
+        assert_eq!(xmatch(&[s(t("b")), hay, s(n(0.0)), s(n(-1.0))]), n(4.0));
+    }
+
+    #[test]
+    fn xmatch_wildcard_mode() {
+        let hay = r(vec![t("apple"), t("banana"), t("cherry")]);
+        assert_eq!(xmatch(&[s(t("*err*")), hay, s(n(2.0))]), n(3.0));
     }
 
     // --- SUMPRODUCT ---

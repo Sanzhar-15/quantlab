@@ -431,6 +431,9 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("IPMT", financial_fns::ipmt);
     r.register("PPMT", financial_fns::ppmt);
 
+    // Phase 4.10.G (W5-169) — ADDRESS (scalar text formatter).
+    r.register("ADDRESS", scalar_fns::address);
+
     // Math
     r.register("ABS", scalar_fns::abs);
     r.register("SQRT", scalar_fns::sqrt);
@@ -632,6 +635,10 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_range_aware("NPV", financial_fns::npv);
     r.register_range_aware("IRR", financial_fns::irr);
 
+    // Phase 4.10.G (W5-169) — modern lookups (range-aware).
+    r.register_range_aware("XLOOKUP", range_fns::xlookup);
+    r.register_range_aware("XMATCH", range_fns::xmatch);
+
     // Engine Phase 4.3 V2 batch #7 — stats family (W5-58).
     // Closes FN4-01 (100 functions). LARGE/SMALL are k-th order;
     // RANK is 1-based with tie semantics; MEDIAN handles even-count
@@ -723,8 +730,10 @@ mod tests {
         // variadic join = 8 total) +
         // Phase 4.10.F (W5-168: PMT, FV, PV, NPER, RATE, IPMT, PPMT
         // = 7 TVM scalars + NPV, IRR = 2 cash-flow range-aware = 9
-        // total).
-        assert_eq!(r.len(), 177);
+        // total) +
+        // Phase 4.10.G (W5-169: XLOOKUP, XMATCH = 2 modern lookups +
+        // ADDRESS = 1 scalar text formatter = 3 total; CLOSES Wave 2).
+        assert_eq!(r.len(), 180);
     }
 
     #[test]

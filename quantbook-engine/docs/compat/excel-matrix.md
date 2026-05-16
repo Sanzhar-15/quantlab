@@ -205,13 +205,13 @@ as partial, rows with `❌` are missing.
 | VLOOKUP | ⚠️ | 8 | 4.3 V2 | (see Aggregates/Conditional section for full notes; W5-54 shipped) |
 | HLOOKUP | ⚠️ | 2 | 4.3 V2 | (see W5-54 above) |
 | LOOKUP | ❌ | 0 | 4.10 | Vector & array forms; less common — defer past V1 wave 1 |
-| XLOOKUP | ❌ | 0 | 4.7 | Dynamic-array; modern Excel |
+| XLOOKUP | ✅ | 10 | 4.10.G | W5-169: scalar-return V1. Modes: match_mode (0=exact, -1=exact-or-next-smaller, 1=exact-or-next-larger, 2=wildcard); search_mode (1=forward, -1=reverse, ±2=binary — V1 uses linear scan, same result, no perf advantage). `if_not_found` arg returned on miss (default `#N/A`). lookup_array must be 1D; 2D return_array → `#VALUE!` (spill semantics await Phase 4.7 polish). |
 | MATCH | ⚠️ | 7 | 4.3 V2 | W5-54 (see notes above) |
-| XMATCH | ❌ | 0 | 4.10 | Modern Excel; same family as MATCH |
+| XMATCH | ✅ | 4 | 4.10.G | W5-169: modern MATCH variant. Returns 1-based position; same match_mode + search_mode semantics as XLOOKUP. No match → `#N/A`. |
 | INDEX | ⚠️ | 5 | 4.3 V2 | W5-54 (see notes above) |
 | OFFSET | ❌ | 0 | 4.7 | Volatile; whitelisted in 3.2 but not implemented |
 | INDIRECT | ❌ | 0 | 4.7 | Volatile; whitelisted in 3.2 but not implemented |
-| ADDRESS | ❌ | 0 | 4.10 | |
+| ADDRESS | ✅ | 8 | 4.10.G | W5-169: cell address text formatter. `abs_num`: 1=$A$1 (default), 2=A$1, 3=$A1, 4=A1. `a1`: TRUE → A1 style (default), FALSE → R1C1. `sheet_text`: optional prefix; auto-quoted if it contains anything other than `[A-Za-z0-9_]`. row/col must be ≥ 1 → otherwise `#VALUE!`. Multi-letter columns supported (Z, AA, ZZ, AAA). |
 | ROW / COLUMN / ROWS / COLUMNS | ❌ | 0 | 4.10 | |
 | TRANSPOSE | ❌ | 0 | 4.7 | Array-result |
 | FILTER / SORT / SORTBY / UNIQUE | ❌ | 0 | 4.7 | Dynamic-array; modern Excel |

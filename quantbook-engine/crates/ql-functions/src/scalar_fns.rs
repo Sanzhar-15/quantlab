@@ -2449,6 +2449,128 @@ pub fn dollar_ctx(args: &[Value], ctx: &ql_types::EvalContext) -> Value {
     Value::text(prefixed)
 }
 
+// ===== W5-169 (Phase 4.10.G) — ADDRESS =====
+
+/// Convert a 1-based column number to its A1 letter sequence.
+/// 1 → "A", 26 → "Z", 27 → "AA", 702 → "ZZ", 703 → "AAA", ...
+fn col_to_letters(mut col: u32) -> String {
+    let mut buf = String::new();
+    while col > 0 {
+        let rem = (col - 1) % 26;
+        buf.push((b'A' + rem as u8) as char);
+        col = (col - 1) / 26;
+    }
+    buf.chars().rev().collect()
+}
+
+/// **W5-169:** `ADDRESS(row_num, col_num, [abs_num=1], [a1=TRUE],
+/// [sheet_text])` — return a cell address as text.
+///
+/// - `abs_num`: 1=$A$1 (default), 2=A$1 (row absolute only),
+///   3=$A1 (column absolute only), 4=A1 (neither).
+/// - `a1`: TRUE (default) → A1 style; FALSE → R1C1 style.
+/// - `sheet_text`: optional sheet prefix. Quoted with single quotes
+///   if it contains anything other than `[A-Za-z0-9_]`.
+///
+/// `row_num`, `col_num` must be ≥ 1; otherwise `#VALUE!`. Non-integer
+/// args truncate toward zero.
+pub fn address(args: &[Value]) -> Value {
+    if !(2..=5).contains(&args.len()) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let row = match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => n.trunc() as i64,
+        NumericArg::Skip => 0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    let col = match coerce_numeric(&args[1]) {
+        NumericArg::Number(n) => n.trunc() as i64,
+        NumericArg::Skip => 0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    if row < 1 || col < 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let abs_num = if args.len() >= 3 {
+        match coerce_numeric(&args[2]) {
+            NumericArg::Number(n) => n.trunc() as i32,
+            NumericArg::Skip => 1,
+            NumericArg::Error(e) => return Value::Error(e),
+        }
+    } else {
+        1
+    };
+    if !(1..=4).contains(&abs_num) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let a1_style = if args.len() >= 4 {
+        match &args[3] {
+            Value::Boolean(b) => *b,
+            Value::Number(n) => *n != 0.0,
+            Value::Blank => true,
+            Value::Error(e) => return Value::Error(*e),
+            _ => return Value::Error(ErrorValue::Value),
+        }
+    } else {
+        true
+    };
+    let sheet_text: Option<String> = if args.len() == 5 {
+        match &args[4] {
+            Value::Text(s) => Some(s.as_ref().to_owned()),
+            Value::Blank => None,
+            Value::Error(e) => return Value::Error(*e),
+            other => match coerce_text(other) {
+                Ok(s) => Some(s),
+                Err(e) => return Value::Error(e),
+            },
+        }
+    } else {
+        None
+    };
+    let row_abs = matches!(abs_num, 1 | 2);
+    let col_abs = matches!(abs_num, 1 | 3);
+    let body = if a1_style {
+        let mut out = String::new();
+        if col_abs {
+            out.push('$');
+        }
+        out.push_str(&col_to_letters(col as u32));
+        if row_abs {
+            out.push('$');
+        }
+        out.push_str(&row.to_string());
+        out
+    } else {
+        // R1C1: absolute = `R{n}`, relative = `R[{n}]`. Excel's
+        // ADDRESS in R1C1 mode emits the literal coords as offsets
+        // when relative — matches Excel canon.
+        let r_part = if row_abs {
+            format!("R{}", row)
+        } else {
+            format!("R[{}]", row)
+        };
+        let c_part = if col_abs {
+            format!("C{}", col)
+        } else {
+            format!("C[{}]", col)
+        };
+        format!("{}{}", r_part, c_part)
+    };
+    let result = match sheet_text {
+        Some(s) if !s.is_empty() => {
+            let needs_quote = s.chars().any(|c| !c.is_ascii_alphanumeric() && c != '_');
+            let prefix = if needs_quote {
+                format!("'{}'", s.replace('\'', "''"))
+            } else {
+                s
+            };
+            format!("{}!{}", prefix, body)
+        }
+        _ => body,
+    };
+    Value::text(result)
+}
+
 // ===== W5-167 (Phase 4.10.E) — character codepoint round-trip =====
 
 /// **W5-167:** `CHAR(code)` — codepoint → character. Excel canon:
@@ -5178,6 +5300,91 @@ mod tests {
             dollar_ctx(&[n(1234.5), n(0.0)], &ctx),
             Value::text("$1,235")
         );
+    }
+
+    // === W5-169 (Phase 4.10.G) — ADDRESS ===
+
+    #[test]
+    fn address_default_abs() {
+        // ADDRESS(1, 1) → "$A$1" (default abs_num=1, a1=TRUE).
+        assert_eq!(address(&[n(1.0), n(1.0)]), Value::text("$A$1"));
+        assert_eq!(address(&[n(5.0), n(2.0)]), Value::text("$B$5"));
+    }
+
+    #[test]
+    fn address_abs_modes() {
+        // 1=$A$1 (both abs), 2=A$1 (row abs), 3=$A1 (col abs), 4=A1.
+        assert_eq!(address(&[n(1.0), n(1.0), n(1.0)]), Value::text("$A$1"));
+        assert_eq!(address(&[n(1.0), n(1.0), n(2.0)]), Value::text("A$1"));
+        assert_eq!(address(&[n(1.0), n(1.0), n(3.0)]), Value::text("$A1"));
+        assert_eq!(address(&[n(1.0), n(1.0), n(4.0)]), Value::text("A1"));
+    }
+
+    #[test]
+    fn address_invalid_abs_is_value_error() {
+        assert_eq!(
+            address(&[n(1.0), n(1.0), n(5.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn address_col_letters_multi() {
+        // Column 26 → Z; 27 → AA; 702 → ZZ; 703 → AAA.
+        assert_eq!(address(&[n(1.0), n(26.0)]), Value::text("$Z$1"));
+        assert_eq!(address(&[n(1.0), n(27.0)]), Value::text("$AA$1"));
+        assert_eq!(address(&[n(1.0), n(702.0)]), Value::text("$ZZ$1"));
+        assert_eq!(address(&[n(1.0), n(703.0)]), Value::text("$AAA$1"));
+    }
+
+    #[test]
+    fn address_r1c1_style() {
+        // a1=FALSE → R1C1 style.
+        assert_eq!(
+            address(&[n(2.0), n(3.0), n(1.0), Value::Boolean(false)]),
+            Value::text("R2C3")
+        );
+        // abs_num=4 + R1C1 → R[2]C[3] (relative).
+        assert_eq!(
+            address(&[n(2.0), n(3.0), n(4.0), Value::Boolean(false)]),
+            Value::text("R[2]C[3]")
+        );
+    }
+
+    #[test]
+    fn address_with_sheet_text() {
+        // ADDRESS(1, 1, 1, TRUE, "Sheet1") → "Sheet1!$A$1".
+        assert_eq!(
+            address(&[
+                n(1.0),
+                n(1.0),
+                n(1.0),
+                Value::Boolean(true),
+                Value::text("Sheet1"),
+            ]),
+            Value::text("Sheet1!$A$1")
+        );
+    }
+
+    #[test]
+    fn address_sheet_with_space_gets_quoted() {
+        assert_eq!(
+            address(&[
+                n(1.0),
+                n(1.0),
+                n(1.0),
+                Value::Boolean(true),
+                Value::text("My Sheet"),
+            ]),
+            Value::text("'My Sheet'!$A$1")
+        );
+    }
+
+    #[test]
+    fn address_invalid_coords_is_value_error() {
+        assert_eq!(address(&[n(0.0), n(1.0)]), Value::Error(ErrorValue::Value));
+        assert_eq!(address(&[n(1.0), n(0.0)]), Value::Error(ErrorValue::Value));
+        assert_eq!(address(&[n(-5.0), n(1.0)]), Value::Error(ErrorValue::Value));
     }
 
     // --- Hyperbolic trig ---
