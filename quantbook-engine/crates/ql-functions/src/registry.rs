@@ -392,6 +392,20 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("XOR", scalar_fns::xor);
     r.register("SWITCH", scalar_fns::switch);
 
+    // Phase 4.10.C (W5-165) — *A-variant aggregates + info scalars.
+    // *A variants (text counts as 0, bool as 0/1).
+    r.register("AVERAGEA", scalar_fns::averagea);
+    r.register("MAXA", scalar_fns::maxa);
+    r.register("MINA", scalar_fns::mina);
+    // Info scalars.
+    r.register("NA", scalar_fns::na);
+    r.register("ERROR.TYPE", scalar_fns::error_type);
+    r.register("TYPE", scalar_fns::type_of);
+    r.register("ISEVEN", scalar_fns::iseven);
+    r.register("ISODD", scalar_fns::isodd);
+    r.register("ISNONTEXT", scalar_fns::isnontext);
+    r.register("N", scalar_fns::n_value);
+
     // Math
     r.register("ABS", scalar_fns::abs);
     r.register("SQRT", scalar_fns::sqrt);
@@ -653,8 +667,11 @@ mod tests {
         // Phase 4.10.A (W5-163: IFS, IFNA, XOR, SWITCH = 4 logical
         // fillins; first batch of Function Library Wave 2) +
         // Phase 4.10.B (W5-164: MINIFS, MAXIFS, COUNTBLANK = 3
-        // conditional-aggregate fillins).
-        assert_eq!(r.len(), 140);
+        // conditional-aggregate fillins) +
+        // Phase 4.10.C (W5-165: AVERAGEA, MAXA, MINA = 3 *A-variants
+        // + NA, ERROR.TYPE, TYPE, ISEVEN, ISODD, ISNONTEXT, N = 7
+        // info scalars = 10 total).
+        assert_eq!(r.len(), 150);
     }
 
     #[test]

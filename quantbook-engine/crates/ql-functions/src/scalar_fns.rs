@@ -230,6 +230,93 @@ pub fn stdev_p(args: &[Value]) -> Value {
     }
 }
 
+// ===== W5-165 (Phase 4.10.C) — `*A`-variant aggregates =====
+//
+// AVERAGEA / MAXA / MINA coerce more permissively than their base
+// counterparts. Per Excel canon:
+// - Number → as-is.
+// - Boolean → 1.0 (TRUE) / 0.0 (FALSE).
+// - Text → 0.0 (including empty string "").
+// - Blank → SKIPPED (NOT counted for AVERAGEA's denominator).
+// - Error → propagate.
+//
+// vs AVERAGE / MAX / MIN which skip text + bool entirely.
+
+/// **W5-165 (Phase 4.10.C):** `*A`-variant coercion. See module-level
+/// comment for the coercion canon. `Skip` is reserved for blanks.
+enum AVariantArg {
+    Number(f64),
+    Skip,
+    Error(ErrorValue),
+}
+
+fn coerce_a_variant(v: &Value) -> AVariantArg {
+    match v {
+        Value::Number(n) => AVariantArg::Number(*n),
+        Value::Boolean(b) => AVariantArg::Number(if *b { 1.0 } else { 0.0 }),
+        Value::Text(_) => AVariantArg::Number(0.0),
+        Value::Blank => AVariantArg::Skip,
+        Value::Error(e) => AVariantArg::Error(*e),
+    }
+}
+
+/// **W5-165:** `AVERAGEA(args...)` — like `AVERAGE` but text counts
+/// as 0 and bool counts as 0/1 in BOTH sum and denominator. Empty
+/// input → `#DIV/0!`. Errors propagate.
+pub fn averagea(args: &[Value]) -> Value {
+    let mut total = 0.0_f64;
+    let mut count: usize = 0;
+    for v in args {
+        match coerce_a_variant(v) {
+            AVariantArg::Number(n) => {
+                total += n;
+                count += 1;
+            }
+            AVariantArg::Skip => {}
+            AVariantArg::Error(e) => return Value::Error(e),
+        }
+    }
+    if count == 0 {
+        return Value::Error(ErrorValue::DivZero);
+    }
+    match coercion::sanitize_f64(total / count as f64) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// **W5-165:** `MAXA(args...)` — like `MAX` but text/bool participate
+/// (per `*A` canon). Empty input → 0 (matches MAX canon).
+pub fn maxa(args: &[Value]) -> Value {
+    let mut acc: Option<f64> = None;
+    for v in args {
+        match coerce_a_variant(v) {
+            AVariantArg::Number(n) => {
+                acc = Some(acc.map_or(n, |a| a.max(n)));
+            }
+            AVariantArg::Skip => {}
+            AVariantArg::Error(e) => return Value::Error(e),
+        }
+    }
+    Value::Number(acc.unwrap_or(0.0))
+}
+
+/// **W5-165:** `MINA(args...)` — like `MIN` but text/bool participate.
+/// Empty input → 0 (matches MIN canon).
+pub fn mina(args: &[Value]) -> Value {
+    let mut acc: Option<f64> = None;
+    for v in args {
+        match coerce_a_variant(v) {
+            AVariantArg::Number(n) => {
+                acc = Some(acc.map_or(n, |a| a.min(n)));
+            }
+            AVariantArg::Skip => {}
+            AVariantArg::Error(e) => return Value::Error(e),
+        }
+    }
+    Value::Number(acc.unwrap_or(0.0))
+}
+
 // ===== Logical =====
 
 /// `IF(cond, then, else)` — exactly 3 args; cond coerced to bool; selects branch.
@@ -2031,6 +2118,157 @@ pub fn iserr(args: &[Value]) -> Value {
     })
 }
 
+// ===== W5-165 (Phase 4.10.C) — info scalar fillins =====
+
+/// **W5-165:** `NA()` — returns `#N/A`. Arity 0. Non-zero args →
+/// `#VALUE!` (matches Excel canon).
+pub fn na(args: &[Value]) -> Value {
+    if !args.is_empty() {
+        return Value::Error(ErrorValue::Value);
+    }
+    Value::Error(ErrorValue::NA)
+}
+
+/// **W5-165:** `ERROR.TYPE(value)` — returns the numeric error-type
+/// code per Excel canon:
+/// - `#NULL!` → 1
+/// - `#DIV/0!` → 2
+/// - `#VALUE!` → 3
+/// - `#REF!` → 4
+/// - `#NAME?` → 5
+/// - `#NUM!` → 6
+/// - `#N/A` → 7
+///
+/// Non-error value → `#N/A` (matches Excel canon; verified against
+/// IronCalc).
+///
+/// Quantbook-specific sigils (`#SPILL!`, `#CALC!`, `#DISCONNECTED!`,
+/// `#BINDING!`, `#TIMEOUT!`) are mapped to extension codes 8-12 since
+/// Excel doesn't enumerate them; Excel's official table stops at 7.
+pub fn error_type(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    match &args[0] {
+        Value::Error(e) => {
+            let code = match e {
+                ErrorValue::Null => 1,
+                ErrorValue::DivZero => 2,
+                ErrorValue::Value => 3,
+                ErrorValue::Ref => 4,
+                ErrorValue::Name => 5,
+                ErrorValue::Num => 6,
+                ErrorValue::NA => 7,
+                // Quantbook-specific sigils — Excel doesn't enumerate them.
+                // Use 8+ codes for the engine's extension errors so a
+                // formula like ERROR.TYPE(#TIMEOUT!) returns SOMETHING
+                // distinguishable rather than collapsing to a plain
+                // canonical code. Callers that care about Excel canon
+                // strict should branch on the cell's value first.
+                ErrorValue::Spill => 8,
+                ErrorValue::Calc => 9,
+                ErrorValue::Disconnected => 10,
+                ErrorValue::Binding => 11,
+                ErrorValue::Timeout => 12,
+                // Any future variants default to 0; loud-fail vs
+                // silent-mapping: the function still returns a number
+                // so the formula doesn't break, but the unknown code
+                // is observably distinct.
+                #[allow(unreachable_patterns)]
+                _ => 0,
+            };
+            Value::Number(code as f64)
+        }
+        _ => Value::Error(ErrorValue::NA),
+    }
+}
+
+/// **W5-165:** `TYPE(value)` — returns the numeric type code per
+/// Excel canon: 1=Number, 2=Text, 4=Boolean, 16=Error. Excel's
+/// 64=Array code is unreachable on this scalar path; range / array
+/// shapes are flattened by the eval dispatch before reaching here.
+/// Blank → 1 (Number) per Excel canon (blank coerces to 0).
+pub fn type_of(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let code = match &args[0] {
+        Value::Number(_) | Value::Blank => 1,
+        Value::Text(_) => 2,
+        Value::Boolean(_) => 4,
+        Value::Error(_) => 16,
+    };
+    Value::Number(code as f64)
+}
+
+/// **W5-165:** `ISEVEN(n)` — TRUE iff `n` truncates to an even integer.
+/// Non-numeric arg (text, blank-coerced-loose path) → `#VALUE!`.
+/// Negative numbers truncate toward zero (Excel canon — `ISEVEN(-2.5)`
+/// truncates to -2, even). Errors propagate.
+pub fn iseven(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let n = match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => n,
+        // Blank → coerces to 0 → even.
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    let truncated = n.trunc() as i64;
+    Value::Boolean(truncated % 2 == 0)
+}
+
+/// **W5-165:** `ISODD(n)` — mirror of `ISEVEN`. Truncate toward zero
+/// then check parity.
+pub fn isodd(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let n = match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => n,
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    let truncated = n.trunc() as i64;
+    Value::Boolean(truncated % 2 != 0)
+}
+
+/// **W5-165:** `ISNONTEXT(value)` — TRUE unless the value is a Text.
+/// Inverse of `ISTEXT`. Blank → TRUE (not text). Numbers / bools /
+/// errors → TRUE.
+pub fn isnontext(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    Value::Boolean(!matches!(args[0], Value::Text(_)))
+}
+
+/// **W5-165:** `N(value)` — coerce to number per Excel canon:
+/// - Number → same.
+/// - Blank → 0.
+/// - Boolean → 1 (TRUE) / 0 (FALSE).
+/// - Text → 0 (NOT `#VALUE!` — Excel canon; verified against
+///   IronCalc).
+/// - Error → propagate.
+///
+/// Date values are stored as Number in this engine (no separate
+/// `Value::Date` variant); dates round-trip through Number → N is
+/// identity for date serials.
+pub fn n_value(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    match &args[0] {
+        Value::Number(n) => Value::Number(*n),
+        Value::Blank => Value::Number(0.0),
+        Value::Boolean(true) => Value::Number(1.0),
+        Value::Boolean(false) => Value::Number(0.0),
+        Value::Text(_) => Value::Number(0.0),
+        Value::Error(e) => Value::Error(*e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2538,6 +2776,210 @@ mod tests {
         assert_eq!(
             switch(&[nan.clone(), nan.clone(), Value::text("matched")]),
             Value::Error(ErrorValue::NA)
+        );
+    }
+
+    // ===== W5-165 (Phase 4.10.C) — `*A` variants + info scalars =====
+
+    // ----- AVERAGEA -----
+
+    #[test]
+    fn averagea_counts_text_and_bool() {
+        // [10, TRUE, "hi", FALSE] → (10 + 1 + 0 + 0) / 4 = 2.75.
+        assert_eq!(
+            averagea(&[
+                n(10.0),
+                Value::Boolean(true),
+                Value::text("hi"),
+                Value::Boolean(false)
+            ]),
+            n(2.75)
+        );
+    }
+
+    #[test]
+    fn averagea_skips_blanks() {
+        // Blanks NOT counted in denominator.
+        // [10, Blank, 20] → (10 + 20) / 2 = 15.
+        assert_eq!(averagea(&[n(10.0), Value::Blank, n(20.0)]), n(15.0));
+    }
+
+    #[test]
+    fn averagea_empty_is_div_zero() {
+        assert_eq!(averagea(&[]), Value::Error(ErrorValue::DivZero));
+        // All-blank also div_zero (every arg skipped).
+        assert_eq!(
+            averagea(&[Value::Blank, Value::Blank]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn averagea_propagates_errors() {
+        assert_eq!(
+            averagea(&[n(10.0), Value::Error(ErrorValue::Num)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    // ----- MAXA -----
+
+    #[test]
+    fn maxa_text_counts_as_zero() {
+        // [-5, "hi"] → max(-5, 0) = 0. (Diverges from MAX, which would skip "hi".)
+        assert_eq!(maxa(&[n(-5.0), Value::text("hi")]), n(0.0));
+    }
+
+    #[test]
+    fn maxa_true_is_one() {
+        // [0.5, TRUE] → max(0.5, 1) = 1.
+        assert_eq!(maxa(&[n(0.5), Value::Boolean(true)]), n(1.0));
+    }
+
+    #[test]
+    fn maxa_empty_is_zero() {
+        assert_eq!(maxa(&[]), n(0.0));
+    }
+
+    // ----- MINA -----
+
+    #[test]
+    fn mina_text_counts_as_zero() {
+        // [5, "hi"] → min(5, 0) = 0.
+        assert_eq!(mina(&[n(5.0), Value::text("hi")]), n(0.0));
+    }
+
+    #[test]
+    fn mina_false_is_zero() {
+        // [5, FALSE] → min(5, 0) = 0.
+        assert_eq!(mina(&[n(5.0), Value::Boolean(false)]), n(0.0));
+    }
+
+    #[test]
+    fn mina_empty_is_zero() {
+        assert_eq!(mina(&[]), n(0.0));
+    }
+
+    // ----- NA -----
+
+    #[test]
+    fn na_returns_na_with_no_args() {
+        assert_eq!(na(&[]), Value::Error(ErrorValue::NA));
+    }
+
+    #[test]
+    fn na_with_args_is_value_error() {
+        assert_eq!(na(&[n(1.0)]), Value::Error(ErrorValue::Value));
+    }
+
+    // ----- ERROR.TYPE -----
+
+    #[test]
+    fn error_type_canonical_codes() {
+        assert_eq!(error_type(&[Value::Error(ErrorValue::Null)]), n(1.0));
+        assert_eq!(error_type(&[Value::Error(ErrorValue::DivZero)]), n(2.0));
+        assert_eq!(error_type(&[Value::Error(ErrorValue::Value)]), n(3.0));
+        assert_eq!(error_type(&[Value::Error(ErrorValue::Ref)]), n(4.0));
+        assert_eq!(error_type(&[Value::Error(ErrorValue::Name)]), n(5.0));
+        assert_eq!(error_type(&[Value::Error(ErrorValue::Num)]), n(6.0));
+        assert_eq!(error_type(&[Value::Error(ErrorValue::NA)]), n(7.0));
+    }
+
+    #[test]
+    fn error_type_non_error_returns_na() {
+        // Per Excel canon: ERROR.TYPE on a non-error value returns #N/A.
+        assert_eq!(error_type(&[n(42.0)]), Value::Error(ErrorValue::NA));
+        assert_eq!(
+            error_type(&[Value::text("hello")]),
+            Value::Error(ErrorValue::NA)
+        );
+        assert_eq!(error_type(&[Value::Blank]), Value::Error(ErrorValue::NA));
+    }
+
+    #[test]
+    fn error_type_wrong_arity_is_value_error() {
+        assert_eq!(error_type(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            error_type(&[Value::Error(ErrorValue::Ref), n(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ----- TYPE -----
+
+    #[test]
+    fn type_of_codes() {
+        assert_eq!(type_of(&[n(42.0)]), n(1.0));
+        assert_eq!(type_of(&[Value::Blank]), n(1.0)); // Blank → 1 (coerces to 0/Number)
+        assert_eq!(type_of(&[Value::text("hi")]), n(2.0));
+        assert_eq!(type_of(&[Value::Boolean(true)]), n(4.0));
+        assert_eq!(type_of(&[Value::Error(ErrorValue::Ref)]), n(16.0));
+    }
+
+    // ----- ISEVEN / ISODD -----
+
+    #[test]
+    fn iseven_basic() {
+        assert_eq!(iseven(&[n(2.0)]), Value::Boolean(true));
+        assert_eq!(iseven(&[n(3.0)]), Value::Boolean(false));
+        assert_eq!(iseven(&[n(0.0)]), Value::Boolean(true));
+        // Truncate toward zero.
+        assert_eq!(iseven(&[n(2.9)]), Value::Boolean(true));
+        assert_eq!(iseven(&[n(-2.5)]), Value::Boolean(true));
+    }
+
+    #[test]
+    fn iseven_text_is_value_error() {
+        assert_eq!(
+            iseven(&[Value::text("abc")]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn iseven_blank_is_true() {
+        // Blank → 0 → even.
+        assert_eq!(iseven(&[Value::Blank]), Value::Boolean(true));
+    }
+
+    #[test]
+    fn isodd_basic() {
+        assert_eq!(isodd(&[n(1.0)]), Value::Boolean(true));
+        assert_eq!(isodd(&[n(2.0)]), Value::Boolean(false));
+        assert_eq!(isodd(&[n(-3.5)]), Value::Boolean(true)); // trunc → -3
+    }
+
+    // ----- ISNONTEXT -----
+
+    #[test]
+    fn isnontext_basic() {
+        assert_eq!(isnontext(&[Value::text("hi")]), Value::Boolean(false));
+        assert_eq!(isnontext(&[n(1.0)]), Value::Boolean(true));
+        assert_eq!(isnontext(&[Value::Boolean(true)]), Value::Boolean(true));
+        assert_eq!(isnontext(&[Value::Blank]), Value::Boolean(true));
+        assert_eq!(
+            isnontext(&[Value::Error(ErrorValue::Ref)]),
+            Value::Boolean(true)
+        );
+    }
+
+    // ----- N -----
+
+    #[test]
+    fn n_value_coerces() {
+        assert_eq!(n_value(&[n(42.0)]), n(42.0));
+        assert_eq!(n_value(&[Value::Blank]), n(0.0));
+        assert_eq!(n_value(&[Value::Boolean(true)]), n(1.0));
+        assert_eq!(n_value(&[Value::Boolean(false)]), n(0.0));
+        // Excel canon: text → 0 (NOT #VALUE!).
+        assert_eq!(n_value(&[Value::text("hello")]), n(0.0));
+    }
+
+    #[test]
+    fn n_value_propagates_errors() {
+        assert_eq!(
+            n_value(&[Value::Error(ErrorValue::Ref)]),
+            Value::Error(ErrorValue::Ref)
         );
     }
 

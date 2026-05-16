@@ -125,6 +125,47 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "SWITCH",
         "W5-163; unit tests pin type-strictness + caseK error propagation; matrix overrides deferred",
     ),
+    // W5-165 (Phase 4.10.C) — *A variants + info scalars.
+    (
+        "AVERAGEA",
+        "W5-165; unit tests pin text→0 + bool→1/0 + skip-blanks; matrix overrides deferred",
+    ),
+    (
+        "MAXA",
+        "W5-165; unit tests pin text→0 + empty→0; matrix overrides deferred",
+    ),
+    (
+        "MINA",
+        "W5-165; unit tests pin text→0 + empty→0; matrix overrides deferred",
+    ),
+    (
+        "NA",
+        "W5-165; trivial — returns #N/A; unit tests pin arity",
+    ),
+    (
+        "ERROR.TYPE",
+        "W5-165; unit tests pin all 7 canonical error codes + non-error → #N/A",
+    ),
+    (
+        "TYPE",
+        "W5-165; unit tests pin Number=1, Text=2, Boolean=4, Error=16",
+    ),
+    (
+        "ISEVEN",
+        "W5-165; unit tests pin truncate-toward-zero parity",
+    ),
+    (
+        "ISODD",
+        "W5-165; unit tests pin truncate-toward-zero parity",
+    ),
+    (
+        "ISNONTEXT",
+        "W5-165; unit tests pin inverse-of-ISTEXT contract",
+    ),
+    (
+        "N",
+        "W5-165; unit tests pin Excel canon (text→0 NOT #VALUE!)",
+    ),
     // Math (default coercion paths cover most; per-fn overrides deferred)
     ("ABS", "default; deferred"),
     ("SQRT", "domain error #NUM!; deferred"),

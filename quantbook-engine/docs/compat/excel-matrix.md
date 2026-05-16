@@ -87,6 +87,7 @@ as partial, rows with `❌` are missing.
 | QUARTILE / QUARTILE.INC / QUARTILE.EXC | ❌ | 0 | 4.10 | |
 | CORREL / COVARIANCE.P / COVARIANCE.S | ❌ | 0 | 4.10 | |
 | PEARSON / RSQ / SLOPE / INTERCEPT | ❌ | 0 | 4.10 | |
+| AVERAGEA / MAXA / MINA | ✅ | 10 | 4.10.C | W5-165: `*A`-variant aggregates. Per Excel canon: Number → as-is; Boolean → 1/0; Text → 0 (including ""); Blank → SKIPPED. Errors propagate. AVERAGEA: empty / all-blank → #DIV/0!. MAXA / MINA: empty / all-blank → 0. DIVERGES from base AVERAGE / MAX / MIN which skip text + bool entirely. |
 | FREQUENCY | ❌ | 0 | 4.10 | Array-result; needs 4.7 |
 | NORM.DIST / NORM.S.DIST / NORM.INV / NORM.S.INV | ❌ | 0 | 4.10 | |
 | T.DIST / T.INV / CHISQ.DIST / CHISQ.INV / F.DIST / F.INV | ❌ | 0 | 4.10 | |
@@ -223,10 +224,13 @@ as partial, rows with `❌` are missing.
 | ISERROR | ✅ | 2 | 4.3 V1 | TRUE for ANY error |
 | ISNA | ✅ | 1 | 4.3 V1 | TRUE only for `#N/A` |
 | ISERR | ✅ | 1 | 4.3 V1 | TRUE for errors EXCEPT `#N/A` |
-| ISFORMULA / ISEVEN / ISODD / ISREF | ❌ | 0 | 4.3 | |
-| ISNONTEXT | ❌ | 0 | 4.3 | |
-| TYPE / N | ❌ | 0 | 4.3 | |
-| NA / ERROR.TYPE | ❌ | 0 | 4.3 | |
+| ISFORMULA / ISREF | ❌ | 0 | Wave 3 reference-tier | Need a `Reference { sheet, row, col }` arg tier; bundle with FORMULATEXT / ROW / COLUMN etc. |
+| ISEVEN / ISODD | ✅ | 4 | 4.10.C | W5-165: truncate toward zero (matches Excel canon — `ISEVEN(-2.5)` truncates to -2 → even). Blank coerces to 0 → ISEVEN(blank) = TRUE. Text → #VALUE!. |
+| ISNONTEXT | ✅ | 1 | 4.10.C | W5-165: inverse of ISTEXT. Blank / Number / Boolean / Error → TRUE; only Text → FALSE. |
+| TYPE | ✅ | 1 | 4.10.C | W5-165: 1=Number (Blank also coerces to 1), 2=Text, 4=Boolean, 16=Error. Excel's 64=Array unreachable on this scalar path; flattening happens in eval dispatch. |
+| N | ✅ | 2 | 4.10.C | W5-165: Number → same; Blank → 0; Boolean → 1/0; **Text → 0 (NOT `#VALUE!` per Excel canon; verified vs IronCalc)**; Error → propagate. Date values (stored as Number) round-trip identically. |
+| NA | ✅ | 2 | 4.10.C | W5-165: arity 0 → `#N/A`. Args → `#VALUE!`. |
+| ERROR.TYPE | ✅ | 3 | 4.10.C | W5-165: 1=#NULL!, 2=#DIV/0!, 3=#VALUE!, 4=#REF!, 5=#NAME?, 6=#NUM!, 7=#N/A. Non-error → #N/A. Quantbook-specific sigils (#SPILL!, #CALC!, #DISCONNECTED!, #BINDING!, #TIMEOUT!) get extension codes 8-12. |
 | INFO | ❌ | 0 | 4.7 | Volatile; whitelisted but not implemented |
 | CELL | ❌ | 0 | 4.7 | Volatile; whitelisted but not implemented |
 | SHEET / SHEETS | ❌ | 0 | 4.6 | Depends on cross-sheet machinery |

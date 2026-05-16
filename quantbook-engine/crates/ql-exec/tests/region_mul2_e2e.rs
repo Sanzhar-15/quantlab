@@ -21,7 +21,7 @@ use ql_exec::{
 };
 use ql_formula_syntax::{lex, parse, SheetRef};
 use ql_functions::default_registry;
-use ql_types::Value;
+use ql_types::{ErrorValue, Value};
 
 /// Run a single source formula through the scalar pipeline against a MapEnv with the
 /// given pre-populated cells, evaluated as if it lives on sheet 0. Returns the
@@ -241,6 +241,68 @@ fn e2e_minifs_maxifs_countblank_registered() {
         registry.lookup_range_aware("COUNTBLANK").is_some(),
         "COUNTBLANK registered"
     );
+}
+
+// ===== W5-165 (Phase 4.10.C) — *A variants + info scalars e2e =====
+
+#[test]
+fn e2e_averagea_text_counts_as_zero() {
+    // =AVERAGEA(A1, A2, A3) with A1=10, A2="hi", A3=20 → (10+0+20)/3 ≈ 10.
+    let result = eval_source_with_registry(
+        "AVERAGEA(A1, A2, A3)",
+        &[
+            ((0, 0, 0), Value::Number(10.0)),
+            ((0, 1, 0), Value::text("hi")),
+            ((0, 2, 0), Value::Number(20.0)),
+        ],
+    );
+    assert_eq!(result, Value::Number(10.0));
+}
+
+#[test]
+fn e2e_maxa_diverges_from_max_on_text() {
+    // =MAXA(A1, A2) with A1=-5, A2="hi" → max(-5, 0) = 0.
+    // MAX would skip "hi" and return -5; MAXA counts "hi" as 0.
+    let result = eval_source_with_registry(
+        "MAXA(A1, A2)",
+        &[
+            ((0, 0, 0), Value::Number(-5.0)),
+            ((0, 1, 0), Value::text("hi")),
+        ],
+    );
+    assert_eq!(result, Value::Number(0.0));
+}
+
+#[test]
+fn e2e_na_returns_na_sigil() {
+    // =NA() → #N/A
+    let result = eval_source_with_registry("NA()", &[]);
+    assert_eq!(result, Value::Error(ErrorValue::NA));
+}
+
+#[test]
+fn e2e_error_type_dispatches_on_dotted_name() {
+    // =ERROR.TYPE(A1) where A1 holds a #REF! error → 4.
+    let result = eval_source_with_registry(
+        "ERROR.TYPE(A1)",
+        &[((0, 0, 0), Value::Error(ErrorValue::Ref))],
+    );
+    assert_eq!(result, Value::Number(4.0));
+}
+
+#[test]
+fn e2e_iseven_isodd_basic() {
+    let result_even = eval_source_with_registry("ISEVEN(A1)", &[((0, 0, 0), Value::Number(4.0))]);
+    assert_eq!(result_even, Value::Boolean(true));
+    let result_odd = eval_source_with_registry("ISODD(A1)", &[((0, 0, 0), Value::Number(5.0))]);
+    assert_eq!(result_odd, Value::Boolean(true));
+}
+
+#[test]
+fn e2e_n_value_text_coerces_to_zero() {
+    // =N(A1) with A1="hello" → 0 (Excel canon — NOT #VALUE!).
+    let result = eval_source_with_registry("N(A1)", &[((0, 0, 0), Value::text("hello"))]);
+    assert_eq!(result, Value::Number(0.0));
 }
 
 #[test]
