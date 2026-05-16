@@ -2623,13 +2623,56 @@ pub fn fixed_ctx(args: &[Value], ctx: &ql_types::EvalContext) -> Value {
     Value::text(format_grouped(n, decimals, no_commas, ctx.locale))
 }
 
-/// **W5-167:** `DOLLAR(number, [decimals=2], &ctx)` — like `FIXED` but
-/// prefixed with `$`. Negative values prefix `-` then `$` (V1 — locale-
-/// specific currency symbol + accounting parens deferred to Phase 4.5
-/// number-format polish wave).
+/// Per-locale rendering rules for `DOLLAR` output. Captures the three
+/// independent axes of variation between Excel's locales: which
+/// currency symbol to use, which side of the number it sits on, and
+/// whether negatives wrap in accounting parens or take a leading minus.
+struct CurrencyStyle {
+    /// Currency glyph (e.g. `$`, `€`).
+    symbol: &'static str,
+    /// `true` → symbol BEFORE the number (`$1,234.50`); `false` → AFTER
+    /// the number with a leading ASCII space (`1.234,50 €`).
+    prefix: bool,
+    /// `true` → negatives wrap in accounting parens with no minus sign
+    /// (`($1,234.50)`); `false` → negatives take a leading minus
+    /// (`-1.234,50 €`).
+    negative_parens: bool,
+}
+
+/// **W5-175 (Phase 4.10 polish):** map locale → DOLLAR rendering style.
+/// EnUs follows the US accounting convention ($-prefix + parens);
+/// De and Fr both render the euro as a trailing symbol with a leading
+/// minus for negatives (matches the typical Excel German/French
+/// regional defaults — diverges from "regional setting can also do
+/// parens" but that variation is Windows-level rather than locale-
+/// level so V1 picks one canonical form per locale).
+fn locale_currency_style(locale: ql_types::Locale) -> CurrencyStyle {
+    match locale {
+        ql_types::Locale::EnUs => CurrencyStyle {
+            symbol: "$",
+            prefix: true,
+            negative_parens: true,
+        },
+        ql_types::Locale::De | ql_types::Locale::Fr => CurrencyStyle {
+            symbol: "€",
+            prefix: false,
+            negative_parens: false,
+        },
+    }
+}
+
+/// **W5-167 (initial) + W5-175 (locale + accounting polish):**
+/// `DOLLAR(number, [decimals=2], &ctx)` — like `FIXED` but with a
+/// locale-specific currency symbol and accounting-style negative
+/// formatting per `locale_currency_style`.
 ///
-/// Always groups thousands (no `no_commas` arg). Locale-aware
-/// decimal + thousands separators.
+/// V1 locale outputs:
+/// - EnUs: `$1,234.50` / `($1,234.50)` (US accounting style — parens, no minus)
+/// - De:   `1.234,50 €` / `-1.234,50 €`
+/// - Fr:   `1 234,50 €` / `-1 234,50 €`
+///
+/// Always groups thousands (no `no_commas` arg). Locale-aware decimal
+/// + thousands separators flow through `format_grouped`.
 pub fn dollar_ctx(args: &[Value], ctx: &ql_types::EvalContext) -> Value {
     if args.is_empty() || args.len() > 2 {
         return Value::Error(ErrorValue::Value);
@@ -2649,14 +2692,28 @@ pub fn dollar_ctx(args: &[Value], ctx: &ql_types::EvalContext) -> Value {
         2
     };
     let formatted = format_grouped(n, decimals, false, ctx.locale);
-    // Prefix `$`. For negatives, `format_grouped` already wrote `-`;
-    // splice `$` after it to produce `-$1,234.50`.
-    let prefixed = if let Some(rest) = formatted.strip_prefix('-') {
-        format!("-${}", rest)
-    } else {
-        format!("${}", formatted)
+    // Split off `format_grouped`'s leading minus so the currency
+    // symbol can be glued to the magnitude regardless of sign.
+    let (is_negative, magnitude) = match formatted.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, formatted.as_str()),
     };
-    Value::text(prefixed)
+    let style = locale_currency_style(ctx.locale);
+    let with_symbol = if style.prefix {
+        format!("{}{}", style.symbol, magnitude)
+    } else {
+        format!("{} {}", magnitude, style.symbol)
+    };
+    let final_text = if is_negative {
+        if style.negative_parens {
+            format!("({})", with_symbol)
+        } else {
+            format!("-{}", with_symbol)
+        }
+    } else {
+        with_symbol
+    };
+    Value::text(final_text)
 }
 
 // ===== W5-169 (Phase 4.10.G) — ADDRESS =====
@@ -5987,10 +6044,11 @@ mod tests {
     }
 
     #[test]
-    fn dollar_negative_value() {
+    fn dollar_negative_uses_accounting_parens_enus() {
+        // W5-175: EnUs uses accounting style — parens, no minus sign,
+        // currency symbol stays INSIDE the parens.
         let ctx = ctx_default();
-        // V1: prefix `-$` (accounting parens deferred to Phase 4.5 polish).
-        assert_eq!(dollar_ctx(&[n(-1234.5)], &ctx), Value::text("-$1,234.50"));
+        assert_eq!(dollar_ctx(&[n(-1234.5)], &ctx), Value::text("($1,234.50)"));
     }
 
     #[test]
@@ -6000,6 +6058,89 @@ mod tests {
             dollar_ctx(&[n(1234.5), n(0.0)], &ctx),
             Value::text("$1,235")
         );
+    }
+
+    #[test]
+    fn dollar_zero_value_has_no_parens() {
+        // Boundary: DOLLAR(0) is positive, NOT negative — no parens.
+        let ctx = ctx_default();
+        assert_eq!(dollar_ctx(&[n(0.0)], &ctx), Value::text("$0.00"));
+    }
+
+    #[test]
+    fn dollar_de_locale_euro_suffix() {
+        // W5-175: De locale uses '€' as suffix with leading space,
+        // `.` thousands + `,` decimal per format_grouped.
+        let ctx = ctx_de();
+        assert_eq!(dollar_ctx(&[n(1234.5)], &ctx), Value::text("1.234,50 €"));
+    }
+
+    #[test]
+    fn dollar_de_negative_uses_minus_prefix() {
+        // De does NOT use accounting parens — leading minus, suffix €.
+        let ctx = ctx_de();
+        assert_eq!(dollar_ctx(&[n(-1234.5)], &ctx), Value::text("-1.234,50 €"));
+    }
+
+    #[test]
+    fn dollar_fr_locale_euro_suffix_with_space_grouping() {
+        // W5-175: Fr locale uses ASCII-space as thousands grouping
+        // (per format_grouped) + ',' decimal + '€' suffix.
+        let ctx = ctx_fr();
+        assert_eq!(dollar_ctx(&[n(1234.5)], &ctx), Value::text("1 234,50 €"));
+    }
+
+    #[test]
+    fn dollar_fr_negative_uses_minus_prefix() {
+        let ctx = ctx_fr();
+        assert_eq!(dollar_ctx(&[n(-1234.5)], &ctx), Value::text("-1 234,50 €"));
+    }
+
+    #[test]
+    fn dollar_negative_decimals_round_left_enus() {
+        // Negative `decimals` rounds left of the decimal point per the
+        // FIXED contract that DOLLAR inherits. -1234.5 → round to nearest
+        // 10 = -1230 → "($1,230)" in accounting style.
+        let ctx = ctx_default();
+        assert_eq!(
+            dollar_ctx(&[n(-1234.5), n(-1.0)], &ctx),
+            Value::text("($1,230)")
+        );
+    }
+
+    #[test]
+    fn dollar_error_in_number_propagates() {
+        let ctx = ctx_default();
+        assert_eq!(
+            dollar_ctx(&[Value::Error(ErrorValue::Ref)], &ctx),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn dollar_error_in_decimals_propagates() {
+        let ctx = ctx_default();
+        assert_eq!(
+            dollar_ctx(&[n(1.0), Value::Error(ErrorValue::Name)], &ctx),
+            Value::Error(ErrorValue::Name)
+        );
+    }
+
+    #[test]
+    fn dollar_arity_violations() {
+        let ctx = ctx_default();
+        assert_eq!(dollar_ctx(&[], &ctx), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            dollar_ctx(&[n(1.0), n(2.0), n(3.0)], &ctx),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn dollar_blank_is_treated_as_zero() {
+        // NumericArg::Skip path: Blank → 0 (matches FIXED behavior).
+        let ctx = ctx_default();
+        assert_eq!(dollar_ctx(&[Value::Blank], &ctx), Value::text("$0.00"));
     }
 
     // === W5-169 (Phase 4.10.G) — ADDRESS ===

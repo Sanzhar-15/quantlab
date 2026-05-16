@@ -432,9 +432,10 @@ fn e2e_fixed_default_format() {
 
 #[test]
 fn e2e_dollar_negative() {
-    // =DOLLAR(-1234.5) → "-$1,234.50".
+    // W5-175: EnUs now uses accounting parens for negatives.
+    // =DOLLAR(-1234.5) → "($1,234.50)".
     let result = eval_source_with_registry("DOLLAR(-1234.5)", &[]);
-    assert_eq!(result, Value::text("-$1,234.50"));
+    assert_eq!(result, Value::text("($1,234.50)"));
 }
 
 #[test]

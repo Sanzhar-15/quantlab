@@ -234,7 +234,7 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
     ),
     (
         "DOLLAR",
-        "W5-167; unit tests pin `$`-prefix + negative as `-$` + locale-aware separators",
+        "W5-167 + W5-175; unit tests pin per-locale currency symbol (EnUs `$` prefix; De/Fr `€` suffix), accounting parens for EnUs negatives, leading minus for De/Fr negatives, locale-aware separators",
     ),
     (
         "TEXTJOIN",
