@@ -5917,6 +5917,17 @@ mod tests {
         assert_eq!(numbervalue_ctx(&[Value::text("5.")], &ctx), n(5.0));
     }
 
+    #[test]
+    fn numbervalue_fr_locale_space_after_decimal_pins_divergence() {
+        // Documented divergence (excel-matrix.md): when group_separator
+        // is ASCII space (Fr locale default), the universal "spaces are
+        // ignored" rule short-circuits the "group after decimal → #VALUE!"
+        // rule. Excel rejects "1,234 5" with #VALUE!; we accept it as
+        // 1.2345. Pin so the regression direction is explicit.
+        let ctx = ctx_fr();
+        assert_eq!(numbervalue_ctx(&[Value::text("1,234 5")], &ctx), n(1.2345));
+    }
+
     // --- FIXED ---
 
     #[test]
