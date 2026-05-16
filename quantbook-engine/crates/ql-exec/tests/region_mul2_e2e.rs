@@ -390,6 +390,78 @@ fn e2e_npv_irr_registered() {
     assert!(registry.lookup_range_aware("IRR").is_some());
 }
 
+// ===== W5-170 (Wave 2 closing megaudit MEDIUM-1) — fill e2e dispatch
+// gap for batches 4.10.E and 4.10.G. Unit tests covered the function
+// contracts; these prove the registry dispatch path works through the
+// lex/parse/bind/eval pipeline. =====
+
+#[test]
+fn e2e_char_code_basic() {
+    // =CHAR(65) → "A".
+    let result = eval_source_with_registry("CHAR(65)", &[]);
+    assert_eq!(result, Value::text("A"));
+    // =CODE("Z") → 90.
+    let result = eval_source_with_registry(r#"CODE("Z")"#, &[]);
+    assert_eq!(result, Value::Number(90.0));
+}
+
+#[test]
+fn e2e_unicode_unichar_basic() {
+    // =UNICODE("é") → 233.
+    let result = eval_source_with_registry(r#"UNICODE("é")"#, &[]);
+    assert_eq!(result, Value::Number(233.0));
+    // =UNICHAR(233) → "é".
+    let result = eval_source_with_registry("UNICHAR(233)", &[]);
+    assert_eq!(result, Value::text("é"));
+}
+
+#[test]
+fn e2e_value_basic_enus() {
+    // =VALUE("2.71") → 2.71 (default locale EnUs; non-PI-adjacent value
+    // to keep clippy::approx_constant happy).
+    let result = eval_source_with_registry(r#"VALUE("2.71")"#, &[]);
+    assert_eq!(result, Value::Number(2.71));
+}
+
+#[test]
+fn e2e_fixed_default_format() {
+    // =FIXED(1234.567) → "1,234.57" (default decimals=2, EnUs locale).
+    let result = eval_source_with_registry("FIXED(1234.567)", &[]);
+    assert_eq!(result, Value::text("1,234.57"));
+}
+
+#[test]
+fn e2e_dollar_negative() {
+    // =DOLLAR(-1234.5) → "-$1,234.50".
+    let result = eval_source_with_registry("DOLLAR(-1234.5)", &[]);
+    assert_eq!(result, Value::text("-$1,234.50"));
+}
+
+#[test]
+fn e2e_textjoin_registered() {
+    // TEXTJOIN is RangeAwareFn; smoke-check via registry lookup.
+    let registry = default_registry();
+    assert!(registry.lookup_range_aware("TEXTJOIN").is_some());
+}
+
+#[test]
+fn e2e_address_basic() {
+    // =ADDRESS(1, 1) → "$A$1" (default abs_num=1, a1=TRUE).
+    let result = eval_source_with_registry("ADDRESS(1, 1)", &[]);
+    assert_eq!(result, Value::text("$A$1"));
+    // =ADDRESS(5, 27, 4) → "AA5" (col 27 = AA, abs_num=4 = no $).
+    let result = eval_source_with_registry("ADDRESS(5, 27, 4)", &[]);
+    assert_eq!(result, Value::text("AA5"));
+}
+
+#[test]
+fn e2e_xlookup_xmatch_registered() {
+    // XLOOKUP / XMATCH are RangeAwareFn; smoke-check via registry.
+    let registry = default_registry();
+    assert!(registry.lookup_range_aware("XLOOKUP").is_some());
+    assert!(registry.lookup_range_aware("XMATCH").is_some());
+}
+
 #[test]
 fn e2e_var_s_via_alias() {
     // =VAR(A1, A2, A3) → sample variance of [1, 2, 3] = 1
