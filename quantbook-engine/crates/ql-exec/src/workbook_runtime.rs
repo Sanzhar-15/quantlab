@@ -2116,13 +2116,17 @@ impl<'a> WorkbookRuntime<'a> {
     /// Re-binding picks up the new range/columns on next eval via the
     /// cleared plan cache.
     ///
-    /// **Caller responsibility:** resize bumps `TableTable::generation`
-    /// and clears the plan cache, but does NOT dirty individual
-    /// formula cells. Cached SUM values etc. from BEFORE the resize
-    /// remain materialized in the COMPUTED overlay until the caller
-    /// re-triggers eval (typically via [`Self::recompute_all`]).
-    /// Targeted dirty-propagation via a `table_to_formulas` reverse
-    /// index is design § 4.5 / sub-phase 4.8.G.3 (deferred).
+    /// **W5-159 (Phase 4.8.G.3):** resize bumps `TableTable::generation`,
+    /// clears the plan cache, **re-extracts deps for every table reader**
+    /// (via [`Self::reextract_table_readers`] so range stripes reflect
+    /// the new range — critical: pre-W5-159 a write into the new growth
+    /// area silently missed the formula's stripe), and fires the
+    /// [`CalcgraphSession::on_table_resize`] hook to BFS-dirty-fan
+    /// downstream readers. Downstream evaluation via
+    /// [`Self::recompute_dirty`] then refreshes the `COMPUTED` overlay
+    /// against the new metadata. With no graph attached, the
+    /// `reextract_table_readers` step is a no-op and callers must use
+    /// [`Self::recompute_all`] to pick up post-resize changes.
     pub fn resize_table(
         &mut self,
         name: &str,
@@ -2306,9 +2310,12 @@ impl<'a> WorkbookRuntime<'a> {
             });
         }
         self.workbook.tables_mut().bump_generation();
-        // Plan cache clear so formulas re-bind against the new range
-        // / column roster on next eval. Targeted invalidation via
-        // `table_to_formulas` is design § 4.5 / 4.8.G.3 (deferred).
+        // Full plan-cache flush so formulas re-bind against the new
+        // range/column roster on next eval. Targeted `table_gen`-keyed
+        // invalidation (W5-160) is optional polish; the brute-force
+        // clear is correct, just coarser. Dirty propagation is
+        // handled below via `reextract_table_readers` + the W5-159
+        // `on_table_resize` hook.
         self.plan_cache.clear();
         // **W5-159 (Phase 4.8.G.3):** the resolved range each reader
         // bound against is now stale (rows or cols changed). Re-extract
@@ -11097,6 +11104,58 @@ mod tests {
         assert_eq!(meta.columns.len(), 1);
         assert!(meta.lookup_column("Qty").is_some());
         assert!(meta.lookup_column("Price").is_none());
+    }
+
+    /// **W5-159 / W5-156 (Phase 4.8.G.3 — Codex closing-megaudit LOW
+    /// closure):** resize removing a column that a formula references
+    /// must (a) reach the formula via `reextract_table_readers`
+    /// (re-bind fails with UnknownTableColumn → mark_dirty), and
+    /// (b) be mapped to `#NAME?` by recompute_dirty's W5-156 failure
+    /// arm. End-to-end this proves the W5-156 + W5-159 mapping covers
+    /// `UnknownTableColumn` in addition to `UnknownTable`.
+    #[test]
+    fn resize_table_remove_referenced_column_emits_name_error() {
+        use crate::CalcgraphSession;
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut graph = CalcgraphSession::new();
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.create_table(
+                "Sales",
+                0,
+                0,
+                0,
+                3,
+                2,
+                true,
+                false,
+                vec!["Qty".into(), "Price".into()],
+            )
+            .unwrap();
+            rt.set_value(0, 1, 1, Value::Number(10.0)).unwrap();
+            rt.set_value(0, 2, 1, Value::Number(20.0)).unwrap();
+            let v = rt.set_formula(0, 0, 3, "SUM(Sales[Price])").unwrap();
+            assert_eq!(v, Value::Number(30.0));
+            let _ = rt.recompute_dirty().expect("graph attached");
+        }
+        // Drop the Price column.
+        {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.resize_table("Sales", 3, 1, vec![], vec!["Price".into()])
+                .unwrap();
+            let result = rt.recompute_dirty().expect("graph attached");
+            assert!(
+                result.failures.is_empty(),
+                "UnknownTableColumn must map to #NAME?, not RecomputeFailure — got: {:?}",
+                result.failures
+            );
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 3)),
+            Value::Error(ErrorValue::Name),
+            "SUM(Sales[Price]) → #NAME? after Price is removed by resize"
+        );
     }
 
     #[test]

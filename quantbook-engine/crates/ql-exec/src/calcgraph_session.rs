@@ -308,10 +308,11 @@ pub struct CalcgraphSession {
     /// dirty per the design § 4.5 invalidation contract.
     /// Symmetric to `name_to_formulas` for the structured-ref path.
     ///
-    /// Today (W5-154): only `on_table_drop` consumes the index. The
-    /// other 4 hooks (create / rename / column rename / resize) and
-    /// runtime-side wiring land in subsequent commits per the
-    /// design § 4.5 hook list.
+    /// Consumed by `on_table_drop` (W5-154/W5-155), `on_table_rename`
+    /// (W5-157), `on_column_rename` (W5-158), and `on_table_resize`
+    /// (W5-159). The 5th hook `on_table_create` is deferred behind
+    /// 4.8.N soft-fail (no pending pre-create reads to discover until
+    /// `set_formula` accepts bind-failed text).
     table_to_formulas: HashMap<Arc<str>, HashSet<NodeId>>,
     /// Phase 3.3 (2026-05-12): reverse index from a cell address to
     /// the formula node-ids that hold a DIRECT cell reference to it
@@ -352,8 +353,10 @@ pub struct HookCounts {
     pub set_name: u64,
     pub add_sheet: u64,
     /// **W5-154 (Phase 4.8.G.3 foundation):** counts of `on_table_drop`
-    /// invocations. Follow-up commits add per-hook counts for the
-    /// other 4 table hooks (create / rename / column-rename / resize).
+    /// invocations. Sister counters below (`table_rename`,
+    /// `column_rename`, `table_resize`) cover the other shipped
+    /// table-mutation hooks (W5-157 through W5-159). `on_table_create`
+    /// is deferred behind 4.8.N soft-fail.
     pub table_drop: u64,
     /// **W5-157 (Phase 4.8.G.3):** counts of `on_table_rename`
     /// invocations.

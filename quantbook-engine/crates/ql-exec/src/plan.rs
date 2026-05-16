@@ -256,14 +256,19 @@ pub enum BindError {
     EmptyArrayLiteral,
 
     /// **W5-115 (Phase 4.8.F):** structured reference names a table
-    /// that isn't registered in the workbook's `TableTable`. Soft-fail
-    /// candidate per design § 7.4 (mapped to `Value::Error(#NAME?)`
-    /// at the cell value) — 4.8.G/H wires the soft-fail integration.
+    /// that isn't registered in the workbook's `TableTable`. Mapped to
+    /// `Value::Error(#NAME?)` at the cell value by `recompute_dirty`
+    /// and `recompute_all` (W5-156, workbook_runtime.rs:2882 + :3266).
+    /// `set_formula` still hard-rejects this variant; soft-acceptance
+    /// of pre-existing-table refs awaits 4.8.N.
     #[error("unknown table {0:?}")]
     UnknownTable(std::sync::Arc<str>),
 
     /// **W5-115 (Phase 4.8.F):** structured reference names a column
-    /// that doesn't exist in the named table's column roster.
+    /// that doesn't exist in the named table's column roster. Mapped
+    /// to `Value::Error(#NAME?)` at the cell value by `recompute_dirty`
+    /// and `recompute_all` (W5-156) alongside `UnknownTable` — covers
+    /// the resize-removes-referenced-column case (W5-159).
     #[error("unknown column {column:?} in table {table:?}")]
     UnknownTableColumn {
         table: std::sync::Arc<str>,
