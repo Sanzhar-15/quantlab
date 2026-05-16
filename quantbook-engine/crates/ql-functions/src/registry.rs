@@ -406,6 +406,15 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("ISNONTEXT", scalar_fns::isnontext);
     r.register("N", scalar_fns::n_value);
 
+    // Phase 4.10.D (W5-166) — combinatorics + SUMSQ (scalar tier).
+    r.register("FACT", scalar_fns::fact);
+    r.register("FACTDOUBLE", scalar_fns::factdouble);
+    r.register("COMBIN", scalar_fns::combin);
+    r.register("COMBINA", scalar_fns::combina);
+    r.register("PERMUT", scalar_fns::permut);
+    r.register("PERMUTATIONA", scalar_fns::permutationa);
+    r.register("SUMSQ", scalar_fns::sumsq);
+
     // Math
     r.register("ABS", scalar_fns::abs);
     r.register("SQRT", scalar_fns::sqrt);
@@ -590,6 +599,11 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_range_aware("MAXIFS", range_fns::maxifs);
     r.register_range_aware("COUNTBLANK", range_fns::countblank);
 
+    // Phase 4.10.D (W5-166) — paired sum-of-squares (range-aware).
+    r.register_range_aware("SUMX2MY2", range_fns::sumx2my2);
+    r.register_range_aware("SUMX2PY2", range_fns::sumx2py2);
+    r.register_range_aware("SUMXMY2", range_fns::sumxmy2);
+
     // Engine Phase 4.3 V2 batch #7 — stats family (W5-58).
     // Closes FN4-01 (100 functions). LARGE/SMALL are k-th order;
     // RANK is 1-based with tie semantics; MEDIAN handles even-count
@@ -670,8 +684,12 @@ mod tests {
         // conditional-aggregate fillins) +
         // Phase 4.10.C (W5-165: AVERAGEA, MAXA, MINA = 3 *A-variants
         // + NA, ERROR.TYPE, TYPE, ISEVEN, ISODD, ISNONTEXT, N = 7
-        // info scalars = 10 total).
-        assert_eq!(r.len(), 150);
+        // info scalars = 10 total) +
+        // Phase 4.10.D (W5-166: FACT, FACTDOUBLE, COMBIN, COMBINA,
+        // PERMUT, PERMUTATIONA, SUMSQ = 7 scalar combinatorics +
+        // SUMX2MY2, SUMX2PY2, SUMXMY2 = 3 range-aware paired-array
+        // sum-of-squares = 10 total).
+        assert_eq!(r.len(), 160);
     }
 
     #[test]

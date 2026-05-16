@@ -1432,6 +1432,220 @@ pub fn lcm(args: &[Value]) -> Value {
     Value::Number(result as f64)
 }
 
+// ===== W5-166 (Phase 4.10.D) — combinatorics + sum-of-squares =====
+
+/// Helper: coerce a single arg, truncate toward zero, require non-negative.
+/// Returns the truncated `i64` value or an `ErrorValue` describing why.
+fn coerce_nonneg_int(v: &Value) -> Result<i64, ErrorValue> {
+    let n = match coerce_numeric(v) {
+        NumericArg::Number(n) => n,
+        // Blank → 0 (Excel canon for combinatoric args).
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Err(e),
+    };
+    let truncated = n.trunc();
+    if truncated < 0.0 {
+        return Err(ErrorValue::Num);
+    }
+    // Cap at i64 range; FACT/COMBIN overflow detection happens later.
+    if truncated > i64::MAX as f64 {
+        return Err(ErrorValue::Num);
+    }
+    Ok(truncated as i64)
+}
+
+/// **W5-166:** `FACT(n)` — factorial. Excel canon: truncate toward zero
+/// (`FACT(2.9) = 2! = 2`), negative → #NUM!, n > 170 → #NUM! (f64
+/// overflow at 170! ≈ 7.26e306; 171! exceeds f64::MAX).
+pub fn fact(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let n = match coerce_nonneg_int(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    if n > 170 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let mut result = 1.0_f64;
+    for k in 2..=n {
+        result *= k as f64;
+    }
+    match coercion::sanitize_f64(result) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// **W5-166:** `FACTDOUBLE(n)` — double factorial: `n!! = n*(n-2)*(n-4)*...`.
+/// Excel canon: `FACTDOUBLE(0) = 1`, `FACTDOUBLE(-1) = 1` (special case),
+/// `n < -1` → #NUM!. Even and odd values are independently chained.
+/// Truncate toward zero. Overflow → #NUM! via `sanitize_f64`.
+pub fn factdouble(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let raw = match coerce_numeric(&args[0]) {
+        NumericArg::Number(n) => n,
+        NumericArg::Skip => 0.0,
+        NumericArg::Error(e) => return Value::Error(e),
+    };
+    let n = raw.trunc() as i64;
+    // Special cases: FACTDOUBLE(-1) = 1, FACTDOUBLE(0) = 1.
+    if n == -1 || n == 0 {
+        return Value::Number(1.0);
+    }
+    if n < -1 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let mut result = 1.0_f64;
+    let mut k = n;
+    while k > 1 {
+        result *= k as f64;
+        k -= 2;
+    }
+    match coercion::sanitize_f64(result) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// **W5-166:** `COMBIN(n, k)` — combinations without repetition (the
+/// binomial coefficient `C(n, k) = n! / (k!(n-k)!)`). Excel canon
+/// (verified vs IronCalc `fn_combin`): truncate args toward zero,
+/// require non-negative, `k > n` → #NUM!. Iterative product avoids
+/// factorial overflow for large n.
+pub fn combin(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let n = match coerce_nonneg_int(&args[0]) {
+        Ok(n) => n as f64,
+        Err(e) => return Value::Error(e),
+    };
+    let k = match coerce_nonneg_int(&args[1]) {
+        Ok(k) => k as f64,
+        Err(e) => return Value::Error(e),
+    };
+    if k > n {
+        return Value::Error(ErrorValue::Num);
+    }
+    // Iterative C(n,k) = product over i in 0..k of (n - i) / (i + 1).
+    let mut result = 1.0_f64;
+    let k_int = k as i64;
+    for i in 0..k_int {
+        result *= (n - i as f64) / (i as f64 + 1.0);
+    }
+    match coercion::sanitize_f64(result) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// **W5-166:** `COMBINA(n, k)` — combinations WITH repetition:
+/// `C(n + k - 1, k)`. Excel canon (verified vs IronCalc `fn_combina`):
+/// `n = 0, k > 0` → #NUM! (degenerate). Other non-negative integer
+/// args accepted; truncate toward zero.
+pub fn combina(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let n = match coerce_nonneg_int(&args[0]) {
+        Ok(n) => n as f64,
+        Err(e) => return Value::Error(e),
+    };
+    let k = match coerce_nonneg_int(&args[1]) {
+        Ok(k) => k as f64,
+        Err(e) => return Value::Error(e),
+    };
+    // Excel canon: n=0, k>0 → #NUM!. n=0, k=0 → 1.
+    if n == 0.0 && k > 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let mut result = 1.0_f64;
+    let k_int = k as i64;
+    for i in 0..k_int {
+        result *= (n + i as f64) / (i as f64 + 1.0);
+    }
+    match coercion::sanitize_f64(result) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// **W5-166:** `PERMUT(n, k)` — permutations without repetition:
+/// `P(n, k) = n! / (n - k)!`. Excel canon: truncate toward zero,
+/// non-negative integers, `k > n` → #NUM!. Iterative product.
+pub fn permut(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let n = match coerce_nonneg_int(&args[0]) {
+        Ok(n) => n as f64,
+        Err(e) => return Value::Error(e),
+    };
+    let k = match coerce_nonneg_int(&args[1]) {
+        Ok(k) => k as f64,
+        Err(e) => return Value::Error(e),
+    };
+    if k > n {
+        return Value::Error(ErrorValue::Num);
+    }
+    let mut result = 1.0_f64;
+    let k_int = k as i64;
+    for i in 0..k_int {
+        result *= n - i as f64;
+    }
+    match coercion::sanitize_f64(result) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// **W5-166:** `PERMUTATIONA(n, k)` — permutations WITH repetition:
+/// `n^k`. Excel canon: truncate toward zero, non-negative integers.
+/// `n = 0, k = 0` → 1 (mathematical convention); `n = 0, k > 0` →
+/// 0; `n > 0, k = 0` → 1. Overflow → #NUM!.
+pub fn permutationa(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let n = match coerce_nonneg_int(&args[0]) {
+        Ok(n) => n as f64,
+        Err(e) => return Value::Error(e),
+    };
+    let k = match coerce_nonneg_int(&args[1]) {
+        Ok(k) => k as f64,
+        Err(e) => return Value::Error(e),
+    };
+    // 0^0 = 1 by mathematical convention; f64::powf already follows this.
+    let result = n.powf(k);
+    match coercion::sanitize_f64(result) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// **W5-166:** `SUMSQ(args...)` — variadic sum of squares. ScalarFn
+/// over scalar args; range args flatten through eval dispatch (same
+/// as `SUM`). Per Excel canon: text + blank skipped, bool coerced
+/// (TRUE=1, FALSE=0), errors propagate. Empty input → 0.
+pub fn sumsq(args: &[Value]) -> Value {
+    let mut total = 0.0_f64;
+    for v in args {
+        match coerce_numeric(v) {
+            NumericArg::Number(n) => total += n * n,
+            NumericArg::Skip => {}
+            NumericArg::Error(e) => return Value::Error(e),
+        }
+    }
+    match coercion::sanitize_f64(total) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
 // ===== Hyperbolic trig (W5-57, Phase 4.3 V2) =====
 
 /// `SINH(number)` — hyperbolic sine. Overflow → #NUM! via
@@ -4307,6 +4521,162 @@ mod tests {
     #[test]
     fn lcm_negative_arg_is_num() {
         assert_eq!(lcm(&[n(4.0), n(-6.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    // === W5-166 (Phase 4.10.D) — combinatorics + SUMSQ ===
+
+    // --- FACT ---
+
+    #[test]
+    fn fact_basic() {
+        assert_eq!(fact(&[n(0.0)]), n(1.0));
+        assert_eq!(fact(&[n(1.0)]), n(1.0));
+        assert_eq!(fact(&[n(5.0)]), n(120.0));
+        assert_eq!(fact(&[n(10.0)]), n(3628800.0));
+    }
+
+    #[test]
+    fn fact_truncates_toward_zero() {
+        // FACT(2.9) = 2! = 2.
+        assert_eq!(fact(&[n(2.9)]), n(2.0));
+    }
+
+    #[test]
+    fn fact_negative_is_num_error() {
+        assert_eq!(fact(&[n(-1.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn fact_above_170_is_num_error() {
+        // 170! is f64-finite (~7.26e306). 171! overflows.
+        assert_eq!(fact(&[n(171.0)]), Value::Error(ErrorValue::Num));
+        // 170 itself is finite.
+        match fact(&[n(170.0)]) {
+            Value::Number(_) => {}
+            other => panic!("FACT(170) expected number, got {other:?}"),
+        }
+    }
+
+    // --- FACTDOUBLE ---
+
+    #[test]
+    fn factdouble_basic() {
+        assert_eq!(factdouble(&[n(0.0)]), n(1.0));
+        assert_eq!(factdouble(&[n(-1.0)]), n(1.0)); // Excel canon special case
+        assert_eq!(factdouble(&[n(5.0)]), n(15.0)); // 5*3*1
+        assert_eq!(factdouble(&[n(6.0)]), n(48.0)); // 6*4*2
+        assert_eq!(factdouble(&[n(7.0)]), n(105.0)); // 7*5*3*1
+    }
+
+    #[test]
+    fn factdouble_negative_below_minus_one_is_num_error() {
+        assert_eq!(factdouble(&[n(-2.0)]), Value::Error(ErrorValue::Num));
+        assert_eq!(factdouble(&[n(-3.5)]), Value::Error(ErrorValue::Num));
+    }
+
+    // --- COMBIN ---
+
+    #[test]
+    fn combin_basic() {
+        // C(5, 2) = 10.
+        assert_eq!(combin(&[n(5.0), n(2.0)]), n(10.0));
+        // C(5, 0) = 1.
+        assert_eq!(combin(&[n(5.0), n(0.0)]), n(1.0));
+        // C(5, 5) = 1.
+        assert_eq!(combin(&[n(5.0), n(5.0)]), n(1.0));
+        // C(10, 3) = 120.
+        assert_eq!(combin(&[n(10.0), n(3.0)]), n(120.0));
+    }
+
+    #[test]
+    fn combin_k_greater_than_n_is_num_error() {
+        assert_eq!(combin(&[n(5.0), n(10.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn combin_negative_is_num_error() {
+        assert_eq!(combin(&[n(-5.0), n(2.0)]), Value::Error(ErrorValue::Num));
+        assert_eq!(combin(&[n(5.0), n(-2.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    // --- COMBINA ---
+
+    #[test]
+    fn combina_basic() {
+        // C(n+k-1, k): COMBINA(5, 2) = C(6, 2) = 15.
+        assert_eq!(combina(&[n(5.0), n(2.0)]), n(15.0));
+        // COMBINA(3, 2) = C(4, 2) = 6.
+        assert_eq!(combina(&[n(3.0), n(2.0)]), n(6.0));
+        // COMBINA(n, 0) = 1.
+        assert_eq!(combina(&[n(5.0), n(0.0)]), n(1.0));
+        // COMBINA(0, 0) = 1.
+        assert_eq!(combina(&[n(0.0), n(0.0)]), n(1.0));
+    }
+
+    #[test]
+    fn combina_n_zero_k_positive_is_num_error() {
+        // Excel + IronCalc: degenerate case.
+        assert_eq!(combina(&[n(0.0), n(3.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    // --- PERMUT ---
+
+    #[test]
+    fn permut_basic() {
+        // P(5, 2) = 5!/(5-2)! = 20.
+        assert_eq!(permut(&[n(5.0), n(2.0)]), n(20.0));
+        // P(5, 5) = 120.
+        assert_eq!(permut(&[n(5.0), n(5.0)]), n(120.0));
+        // P(5, 0) = 1.
+        assert_eq!(permut(&[n(5.0), n(0.0)]), n(1.0));
+    }
+
+    #[test]
+    fn permut_k_greater_than_n_is_num_error() {
+        assert_eq!(permut(&[n(5.0), n(10.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    // --- PERMUTATIONA ---
+
+    #[test]
+    fn permutationa_basic() {
+        // n^k: PERMUTATIONA(3, 2) = 9.
+        assert_eq!(permutationa(&[n(3.0), n(2.0)]), n(9.0));
+        // PERMUTATIONA(5, 3) = 125.
+        assert_eq!(permutationa(&[n(5.0), n(3.0)]), n(125.0));
+        // PERMUTATIONA(0, 0) = 1 (mathematical convention).
+        assert_eq!(permutationa(&[n(0.0), n(0.0)]), n(1.0));
+        // PERMUTATIONA(0, k>0) = 0.
+        assert_eq!(permutationa(&[n(0.0), n(3.0)]), n(0.0));
+        // PERMUTATIONA(n>0, 0) = 1.
+        assert_eq!(permutationa(&[n(5.0), n(0.0)]), n(1.0));
+    }
+
+    // --- SUMSQ ---
+
+    #[test]
+    fn sumsq_basic() {
+        // 1² + 2² + 3² = 14.
+        assert_eq!(sumsq(&[n(1.0), n(2.0), n(3.0)]), n(14.0));
+    }
+
+    #[test]
+    fn sumsq_empty_is_zero() {
+        assert_eq!(sumsq(&[]), n(0.0));
+    }
+
+    #[test]
+    fn sumsq_skips_blanks() {
+        // Blanks contribute 0.
+        assert_eq!(sumsq(&[n(3.0), Value::Blank, n(4.0)]), n(25.0));
+    }
+
+    #[test]
+    fn sumsq_propagates_errors() {
+        assert_eq!(
+            sumsq(&[n(1.0), Value::Error(ErrorValue::Ref), n(3.0)]),
+            Value::Error(ErrorValue::Ref)
+        );
     }
 
     // --- Hyperbolic trig ---

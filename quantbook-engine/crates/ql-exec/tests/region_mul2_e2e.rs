@@ -305,6 +305,67 @@ fn e2e_n_value_text_coerces_to_zero() {
     assert_eq!(result, Value::Number(0.0));
 }
 
+// ===== W5-166 (Phase 4.10.D) — combinatorics + sum-of-squares e2e =====
+
+#[test]
+fn e2e_fact_basic() {
+    // =FACT(5) → 120.
+    let result = eval_source_with_registry("FACT(5)", &[]);
+    assert_eq!(result, Value::Number(120.0));
+}
+
+#[test]
+fn e2e_factdouble_basic() {
+    // =FACTDOUBLE(7) → 7*5*3*1 = 105.
+    let result = eval_source_with_registry("FACTDOUBLE(7)", &[]);
+    assert_eq!(result, Value::Number(105.0));
+}
+
+#[test]
+fn e2e_combin_combina() {
+    // =COMBIN(10, 3) → 120.
+    let result = eval_source_with_registry("COMBIN(10, 3)", &[]);
+    assert_eq!(result, Value::Number(120.0));
+    // =COMBINA(5, 2) → C(6, 2) = 15.
+    let result = eval_source_with_registry("COMBINA(5, 2)", &[]);
+    assert_eq!(result, Value::Number(15.0));
+}
+
+#[test]
+fn e2e_permut_permutationa() {
+    // =PERMUT(5, 2) → 20.
+    let result = eval_source_with_registry("PERMUT(5, 2)", &[]);
+    assert_eq!(result, Value::Number(20.0));
+    // =PERMUTATIONA(3, 2) → 9.
+    let result = eval_source_with_registry("PERMUTATIONA(3, 2)", &[]);
+    assert_eq!(result, Value::Number(9.0));
+}
+
+#[test]
+fn e2e_sumsq_basic() {
+    // =SUMSQ(A1, A2, A3) with A1=1, A2=2, A3=3 → 1+4+9 = 14.
+    let result = eval_source_with_registry(
+        "SUMSQ(A1, A2, A3)",
+        &[
+            ((0, 0, 0), Value::Number(1.0)),
+            ((0, 1, 0), Value::Number(2.0)),
+            ((0, 2, 0), Value::Number(3.0)),
+        ],
+    );
+    assert_eq!(result, Value::Number(14.0));
+}
+
+#[test]
+fn e2e_paired_sum_variants_registered() {
+    // Range-aware paired-sum variants take Range args which need
+    // named-range bindings; unit tests in range_fns cover the
+    // contracts. This is a registry-dispatch smoke check.
+    let registry = default_registry();
+    assert!(registry.lookup_range_aware("SUMX2MY2").is_some());
+    assert!(registry.lookup_range_aware("SUMX2PY2").is_some());
+    assert!(registry.lookup_range_aware("SUMXMY2").is_some());
+}
+
 #[test]
 fn e2e_var_s_via_alias() {
     // =VAR(A1, A2, A3) → sample variance of [1, 2, 3] = 1

@@ -986,6 +986,90 @@ pub fn averageifs(args: &[FnArg]) -> Value {
     }
 }
 
+// ===== W5-166 (Phase 4.10.D) — paired sum-of-squares variants =====
+//
+// SUMX2MY2 / SUMX2PY2 / SUMXMY2 are all 2-arg, paired array iterators.
+// Per Excel canon (verified vs IronCalc `fn_sumx2my2` / `fn_sumx2py2` /
+// `fn_sumxmy2`): both args must be ranges of the same flat length;
+// shape mismatch → #VALUE!. Non-numeric cells coerce to 0 (lenient,
+// matches SUMPRODUCT). Errors propagate.
+
+#[derive(Clone, Copy)]
+enum PairedOp {
+    /// Σ(x² - y²)
+    X2MY2,
+    /// Σ(x² + y²)
+    X2PY2,
+    /// Σ(x - y)²
+    XMY2,
+}
+
+fn paired_sum_inner(args: &[FnArg], op: PairedOp) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let (xs, x_rows, x_cols) = match &args[0] {
+        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
+    };
+    let (ys, y_rows, y_cols) = match &args[1] {
+        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
+    };
+    // W5-60 strict 2D shape check.
+    if x_rows != y_rows || x_cols != y_cols {
+        return Value::Error(ErrorValue::Value);
+    }
+    let mut total = 0.0_f64;
+    for (xv, yv) in xs.iter().zip(ys.iter()) {
+        // Errors propagate per Excel canon.
+        if let Value::Error(e) = xv {
+            return Value::Error(*e);
+        }
+        if let Value::Error(e) = yv {
+            return Value::Error(*e);
+        }
+        // Coerce to numeric; non-numeric (text / blank / bool that
+        // can't coerce strict) → 0. Matches IronCalc's `unwrap_or(0.0)`.
+        let x = match coerce_numeric(xv) {
+            NumericArg::Number(n) => n,
+            NumericArg::Skip => 0.0,
+            NumericArg::Error(_) => 0.0, // unreachable — propagated above
+        };
+        let y = match coerce_numeric(yv) {
+            NumericArg::Number(n) => n,
+            NumericArg::Skip => 0.0,
+            NumericArg::Error(_) => 0.0,
+        };
+        total += match op {
+            PairedOp::X2MY2 => x * x - y * y,
+            PairedOp::X2PY2 => x * x + y * y,
+            PairedOp::XMY2 => (x - y) * (x - y),
+        };
+    }
+    match coercion::sanitize_f64(total) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// **W5-166 (Phase 4.10.D):** `SUMX2MY2(array_x, array_y)` — Σ(x² - y²).
+/// Excel canon: same flat shape required. Non-numeric cells coerce to
+/// 0. Errors in either array propagate.
+pub fn sumx2my2(args: &[FnArg]) -> Value {
+    paired_sum_inner(args, PairedOp::X2MY2)
+}
+
+/// **W5-166 (Phase 4.10.D):** `SUMX2PY2(array_x, array_y)` — Σ(x² + y²).
+pub fn sumx2py2(args: &[FnArg]) -> Value {
+    paired_sum_inner(args, PairedOp::X2PY2)
+}
+
+/// **W5-166 (Phase 4.10.D):** `SUMXMY2(array_x, array_y)` — Σ(x - y)².
+pub fn sumxmy2(args: &[FnArg]) -> Value {
+    paired_sum_inner(args, PairedOp::XMY2)
+}
+
 /// **W5-164 (Phase 4.10.B):** `MINIFS(min_range, criteria_range1,
 /// criteria1, [crit_range2, crit2, ...])` — minimum of cells in
 /// `min_range` where ALL criteria pairs match elementwise. Excel
@@ -2483,6 +2567,90 @@ mod tests {
             countblank(&[s(Value::Blank)]),
             Value::Error(ErrorValue::Value)
         );
+    }
+
+    // === W5-166 (Phase 4.10.D) — paired sum-of-squares variants ===
+
+    // --- SUMX2MY2 ---
+
+    #[test]
+    fn sumx2my2_basic() {
+        // Σ(x² - y²): [1,2,3]² - [4,5,6]² = (1-16) + (4-25) + (9-36)
+        // = -15 - 21 - 27 = -63.
+        let x = r(vec![n(1.0), n(2.0), n(3.0)]);
+        let y = r(vec![n(4.0), n(5.0), n(6.0)]);
+        assert_eq!(sumx2my2(&[x, y]), n(-63.0));
+    }
+
+    #[test]
+    fn sumx2my2_shape_mismatch_is_value_error() {
+        let x = r(vec![n(1.0), n(2.0)]);
+        let y = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(sumx2my2(&[x, y]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn sumx2my2_scalar_arg_is_value_error() {
+        let x = r(vec![n(1.0), n(2.0)]);
+        assert_eq!(sumx2my2(&[x, s(n(3.0))]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn sumx2my2_text_coerces_to_zero() {
+        // Per IronCalc canon: non-numeric → 0.
+        // [1, text]² - [2, 3]² = (1-4) + (0-9) = -12.
+        let x = r(vec![n(1.0), t("hello")]);
+        let y = r(vec![n(2.0), n(3.0)]);
+        assert_eq!(sumx2my2(&[x, y]), n(-12.0));
+    }
+
+    #[test]
+    fn sumx2my2_error_propagates() {
+        let x = r(vec![n(1.0), Value::Error(ErrorValue::Ref)]);
+        let y = r(vec![n(2.0), n(3.0)]);
+        assert_eq!(sumx2my2(&[x, y]), Value::Error(ErrorValue::Ref));
+    }
+
+    // --- SUMX2PY2 ---
+
+    #[test]
+    fn sumx2py2_basic() {
+        // Σ(x² + y²): [1,2]² + [3,4]² = (1+9) + (4+16) = 30.
+        let x = r(vec![n(1.0), n(2.0)]);
+        let y = r(vec![n(3.0), n(4.0)]);
+        assert_eq!(sumx2py2(&[x, y]), n(30.0));
+    }
+
+    #[test]
+    fn sumx2py2_shape_mismatch_is_value_error() {
+        let x = r(vec![n(1.0)]);
+        let y = r(vec![n(1.0), n(2.0)]);
+        assert_eq!(sumx2py2(&[x, y]), Value::Error(ErrorValue::Value));
+    }
+
+    // --- SUMXMY2 ---
+
+    #[test]
+    fn sumxmy2_basic() {
+        // Σ(x-y)²: ([1,2,3] - [4,5,6])² = (-3)² + (-3)² + (-3)² = 27.
+        let x = r(vec![n(1.0), n(2.0), n(3.0)]);
+        let y = r(vec![n(4.0), n(5.0), n(6.0)]);
+        assert_eq!(sumxmy2(&[x, y]), n(27.0));
+    }
+
+    #[test]
+    fn sumxmy2_zero_diff() {
+        // Same arrays → 0.
+        let x = r(vec![n(1.0), n(2.0), n(3.0)]);
+        let y = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(sumxmy2(&[x, y]), n(0.0));
+    }
+
+    #[test]
+    fn sumxmy2_wrong_arity_is_value_error() {
+        let x = r(vec![n(1.0)]);
+        assert_eq!(sumxmy2(&[x]), Value::Error(ErrorValue::Value));
+        assert_eq!(sumxmy2(&[]), Value::Error(ErrorValue::Value));
     }
 
     // --- SUMPRODUCT ---

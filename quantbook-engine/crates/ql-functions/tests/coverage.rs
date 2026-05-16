@@ -166,6 +166,47 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "N",
         "W5-165; unit tests pin Excel canon (text→0 NOT #VALUE!)",
     ),
+    // W5-166 (Phase 4.10.D) — combinatorics + sum-of-squares variants.
+    (
+        "FACT",
+        "W5-166; unit tests pin truncate-toward-zero + n>170 → #NUM!",
+    ),
+    (
+        "FACTDOUBLE",
+        "W5-166; unit tests pin FACTDOUBLE(-1)=1 special case + n<-1 → #NUM!",
+    ),
+    (
+        "COMBIN",
+        "W5-166; unit tests pin C(n,k) + k>n → #NUM!",
+    ),
+    (
+        "COMBINA",
+        "W5-166; unit tests pin C(n+k-1,k) + n=0,k>0 → #NUM!",
+    ),
+    (
+        "PERMUT",
+        "W5-166; unit tests pin P(n,k) + k>n → #NUM!",
+    ),
+    (
+        "PERMUTATIONA",
+        "W5-166; unit tests pin n^k (incl. 0^0=1, 0^k=0)",
+    ),
+    (
+        "SUMSQ",
+        "W5-166; unit tests pin sum-of-squares + blank-skip + error propagation",
+    ),
+    (
+        "SUMX2MY2",
+        "W5-166; unit tests pin Σ(x²-y²) + shape validation + non-numeric → 0",
+    ),
+    (
+        "SUMX2PY2",
+        "W5-166; unit tests pin Σ(x²+y²) + shape validation",
+    ),
+    (
+        "SUMXMY2",
+        "W5-166; unit tests pin Σ(x-y)² + zero-diff",
+    ),
     // Math (default coercion paths cover most; per-fn overrides deferred)
     ("ABS", "default; deferred"),
     ("SQRT", "domain error #NUM!; deferred"),

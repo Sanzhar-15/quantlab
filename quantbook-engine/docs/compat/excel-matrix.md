@@ -141,12 +141,15 @@ as partial, rows with `❌` are missing.
 | DEGREES | ✅ | 1 | 4.3 V1 | Radians → degrees |
 | RADIANS | ✅ | 1 | 4.3 V1 | Degrees → radians |
 | SIGN | ✅ | 1 | 4.3 V1 | -1/0/1 |
-| FACT / FACTDOUBLE / COMBIN / COMBINA / PERMUT / PERMUTATIONA | ❌ | 0 | 4.10 | |
+| FACT / FACTDOUBLE | ✅ | 6 | 4.10.D | W5-166: factorial + double factorial. FACT truncates toward zero, n<0 → #NUM!, n>170 → #NUM! (f64 overflow). FACTDOUBLE(0)=1, FACTDOUBLE(-1)=1 (Excel canon special case), n<-1 → #NUM!. |
+| COMBIN / COMBINA | ✅ | 6 | 4.10.D | W5-166: combinations without/with repetition. Iterative product avoids factorial overflow for large n. Truncate args toward zero; non-negative integers; k>n → #NUM!. COMBINA: n=0,k>0 → #NUM! (degenerate; verified vs IronCalc); n=0,k=0 → 1. |
+| PERMUT / PERMUTATIONA | ✅ | 3 | 4.10.D | W5-166: permutations without/with repetition. PERMUT: P(n,k)=n!/(n-k)!; k>n → #NUM!. PERMUTATIONA: n^k; 0^0=1 (mathematical convention via `f64::powf`). |
 | GCD / LCM | ✅ | 6 | 4.3 V2 | W5-57: variadic non-negative integers. Negative arg → #NUM!. Non-integer truncated toward zero (Excel canon). LCM with any 0 returns 0; GCD with all-0 returns 0. Range args not supported (V1 scalar-only). |
 | RAND / RANDBETWEEN | ✅ | 3+ | 3.7 | xorshift64, seeded test fixture |
 | RANDARRAY | ❌ | 0 | 4.7 | Array-result; needs 4.7 |
 | SUMPRODUCT | ✅ | 7 | 4.3 V2 | W5-55: element-wise multiply arrays then sum. All arrays must have same length. Non-numeric cells treated as 0 (lenient — Excel canon for SUMPRODUCT). Error cells propagate. Scalar args act as constant multipliers. |
-| SUMSQ / SUMX2MY2 / SUMX2PY2 / SUMXMY2 | ❌ | 0 | 4.10 | |
+| SUMSQ | ✅ | 4 | 4.10.D | W5-166: variadic sum of squares (ScalarFn; range args flatten via dispatch like SUM). Text + blank skipped, bool coerced (TRUE=1, FALSE=0), errors propagate. Empty → 0. |
+| SUMX2MY2 / SUMX2PY2 / SUMXMY2 | ✅ | 9 | 4.10.D | W5-166: paired array sum-of-squares variants. RangeAwareFn; both args must be ranges; W5-60 strict 2D-shape check (shape mismatch → #VALUE!). Non-numeric cells coerce to 0 (lenient, matches IronCalc canon). Errors in either array propagate. |
 | AGGREGATE | ❌ | 0 | 4.10 | Conditional aggregation; depends on 4.7 |
 | SUBTOTAL | ❌ | 0 | 4.10 | |
 
