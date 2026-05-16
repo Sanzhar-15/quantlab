@@ -366,6 +366,30 @@ fn e2e_paired_sum_variants_registered() {
     assert!(registry.lookup_range_aware("SUMXMY2").is_some());
 }
 
+// ===== W5-168 (Phase 4.10.F) — financial e2e =====
+
+#[test]
+fn e2e_pmt_zero_rate() {
+    // =PMT(0, 10, 100) → -(100 + 0) / 10 = -10.
+    let result = eval_source_with_registry("PMT(0, 10, 100)", &[]);
+    assert_eq!(result, Value::Number(-10.0));
+}
+
+#[test]
+fn e2e_pv_zero_rate() {
+    // =PV(0, 10, -50) → -fv - pmt*nper = -0 - (-50)*10 = 500.
+    let result = eval_source_with_registry("PV(0, 10, -50)", &[]);
+    assert_eq!(result, Value::Number(500.0));
+}
+
+#[test]
+fn e2e_npv_irr_registered() {
+    // NPV / IRR take Range args; unit tests cover the contracts.
+    let registry = default_registry();
+    assert!(registry.lookup_range_aware("NPV").is_some());
+    assert!(registry.lookup_range_aware("IRR").is_some());
+}
+
 #[test]
 fn e2e_var_s_via_alias() {
     // =VAR(A1, A2, A3) → sample variance of [1, 2, 3] = 1

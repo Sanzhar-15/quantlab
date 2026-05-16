@@ -245,8 +245,12 @@ as partial, rows with `❌` are missing.
 
 | Function | Status | Tests | Phase | Notes |
 |---|---|---|---|---|
-| PMT / IPMT / PPMT / PV / FV / NPER / RATE | ❌ | 0 | 4.10 | TVM core |
-| NPV / XNPV / IRR / XIRR / MIRR | ❌ | 0 | 4.10 | |
+| PMT / FV / PV / NPER | ✅ | 9 | 4.10.F | W5-168: TVM equation `pv*(1+rate)^nper + pmt*(1+rate*type)*((1+rate)^nper - 1)/rate + fv = 0` (rate≠0); `pmt*nper + pv + fv = 0` (rate=0). `type=0` end of period; `type=1` (or any nonzero) beginning. Sign convention: outflows negative. Verified against IronCalc references. Returns `#NUM!` on undefined inputs (rate ≤ -1, NaN/Inf results). |
+| RATE | ✅ | 1 | 4.10.F | W5-168: Newton-Raphson, 50 iterations max, eps=1e-7. Guess defaults to 0.1 (Excel canon). Fails to converge → `#NUM!`. Initial guess ≤ -1 → `#VALUE!`. |
+| IPMT / PPMT | ✅ | 3 | 4.10.F | W5-168: interest + principal portions of period `k` payment. Invariant: `IPMT(k) + PPMT(k) = PMT`. Period < 1 or > nper+1 → `#NUM!`. |
+| NPV | ✅ | 5 | 4.10.F | W5-168: Σ values[i] / (1+rate)^(i+1) (values are END-of-period cash flows; first value discounted). Variadic — accepts scalar + range args; ranges flatten row-major. Per Excel canon: non-numeric cells (text, bool) SKIPPED, blanks skipped, errors propagate. Empty cash-flow → `#NUM!`. |
+| IRR | ✅ | 6 | 4.10.F | W5-168: Newton-Raphson around guess (default 0.1), bisection fallback over `[-0.99999, 100]`, 50 iterations max, eps=1e-8 / 1e-10. Requires sign-change in cash-flow → otherwise `#NUM!`. Non-numeric cells in range → `#VALUE!` (stricter than NPV per IronCalc canon). |
+| XNPV / XIRR / MIRR | ❌ | 0 | Wave 3 | Date-indexed variants; bundle with Wave 3 reference-tier / extended date arithmetic. |
 | PRICE / YIELD / DURATION / MDURATION | ❌ | 0 | post-v1 | Bond math |
 | DB / DDB / SLN / SYD / VDB | ❌ | 0 | 4.10 | Depreciation |
 | FVSCHEDULE / RRI / PDURATION | ❌ | 0 | post-v1 | |

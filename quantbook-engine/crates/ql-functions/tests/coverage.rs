@@ -240,6 +240,43 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "TEXTJOIN",
         "W5-167; unit tests pin delimiter join + ignore_empty + range flatten + Excel 32,767 cap",
     ),
+    // W5-168 (Phase 4.10.F) — financial TVM + cash-flow.
+    (
+        "PMT",
+        "W5-168; unit tests pin TVM equation against IronCalc reference",
+    ),
+    (
+        "FV",
+        "W5-168; unit tests pin future-value formula + zero-rate edge",
+    ),
+    (
+        "PV",
+        "W5-168; unit tests pin present-value formula + inverse-of-PMT check",
+    ),
+    (
+        "NPER",
+        "W5-168; unit tests pin period count + zero-rate edge",
+    ),
+    (
+        "RATE",
+        "W5-168; unit tests pin Newton-Raphson convergence on known rate",
+    ),
+    (
+        "IPMT",
+        "W5-168; unit tests pin first-period interest + IPMT+PPMT=PMT invariant",
+    ),
+    (
+        "PPMT",
+        "W5-168; unit tests pin via IPMT+PPMT=PMT invariant",
+    ),
+    (
+        "NPV",
+        "W5-168; unit tests pin discount formula + skip-non-numeric + error propagation",
+    ),
+    (
+        "IRR",
+        "W5-168; unit tests pin Newton-Raphson + bisection fallback + sign-change requirement",
+    ),
     // Math (default coercion paths cover most; per-fn overrides deferred)
     ("ABS", "default; deferred"),
     ("SQRT", "domain error #NUM!; deferred"),

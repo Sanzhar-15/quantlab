@@ -33,7 +33,7 @@ use ql_types::{ArrayValue, EvalContext, Value};
 
 use crate::context_aware_fns::ContextAwareFn;
 use crate::range_aware_fns::RangeAwareFn;
-use crate::{date_fns, format, range_fns, scalar_fns, volatile};
+use crate::{date_fns, financial_fns, format, range_fns, scalar_fns, volatile};
 
 /// Function signature: pre-evaluated args → result Value.
 pub type ScalarFn = fn(&[Value]) -> Value;
@@ -422,6 +422,15 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("UNICODE", scalar_fns::unicode_fn);
     r.register("UNICHAR", scalar_fns::unichar_fn);
 
+    // Phase 4.10.F (W5-168) — financial TVM family (scalar).
+    r.register("PMT", financial_fns::pmt);
+    r.register("FV", financial_fns::fv);
+    r.register("PV", financial_fns::pv);
+    r.register("NPER", financial_fns::nper);
+    r.register("RATE", financial_fns::rate);
+    r.register("IPMT", financial_fns::ipmt);
+    r.register("PPMT", financial_fns::ppmt);
+
     // Math
     r.register("ABS", scalar_fns::abs);
     r.register("SQRT", scalar_fns::sqrt);
@@ -619,6 +628,10 @@ pub fn default_registry() -> FunctionRegistry {
     // Phase 4.10.E (W5-167) — TEXTJOIN (range-aware variadic).
     r.register_range_aware("TEXTJOIN", range_fns::textjoin);
 
+    // Phase 4.10.F (W5-168) — financial cash-flow family (range-aware).
+    r.register_range_aware("NPV", financial_fns::npv);
+    r.register_range_aware("IRR", financial_fns::irr);
+
     // Engine Phase 4.3 V2 batch #7 — stats family (W5-58).
     // Closes FN4-01 (100 functions). LARGE/SMALL are k-th order;
     // RANK is 1-based with tie semantics; MEDIAN handles even-count
@@ -707,8 +720,11 @@ mod tests {
         // Phase 4.10.E (W5-167: CHAR, CODE, UNICODE, UNICHAR = 4
         // scalar codepoint round-trip + VALUE, FIXED, DOLLAR = 3
         // locale-aware context-aware + TEXTJOIN = 1 range-aware
-        // variadic join = 8 total).
-        assert_eq!(r.len(), 168);
+        // variadic join = 8 total) +
+        // Phase 4.10.F (W5-168: PMT, FV, PV, NPER, RATE, IPMT, PPMT
+        // = 7 TVM scalars + NPV, IRR = 2 cash-flow range-aware = 9
+        // total).
+        assert_eq!(r.len(), 177);
     }
 
     #[test]
