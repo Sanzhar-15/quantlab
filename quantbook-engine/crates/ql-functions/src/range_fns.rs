@@ -1521,6 +1521,153 @@ pub fn correl(args: &[FnArg]) -> Value {
     }
 }
 
+/// **W5-178 (Phase 4.10 polish / Wave 3 regression batch):** running
+/// sums for least-squares linear regression. Shared by `SLOPE` and
+/// `INTERCEPT` (both walk the same sums and differ only in the final
+/// formula). Mirrors the loop in IronCalc `fn_slope` / `fn_intercept`
+/// at `.references/ironcalc/base/src/functions/statistical/correl.rs`.
+pub(crate) struct LinearFitSums {
+    pub n: f64,
+    pub sum_x: f64,
+    pub sum_y: f64,
+    pub sum_x2: f64,
+    pub sum_xy: f64,
+}
+
+/// **W5-178:** walk `ys_raw` / `xs_raw` paired, dropping any pair where
+/// either side is non-numeric (matching CORREL's IronCalc-canon skip
+/// rule — Booleans NOT coerced to 1/0). Errors propagate immediately.
+///
+/// Note the argument ORDER: Excel SLOPE/INTERCEPT take `(known_y's,
+/// known_x's)` — Y first. The caller is responsible for passing the
+/// raw slices in the natural Excel order; this helper just pairs and
+/// filters.
+fn collect_linear_fit(ys_raw: &[Value], xs_raw: &[Value]) -> Result<LinearFitSums, ErrorValue> {
+    let mut sums = LinearFitSums {
+        n: 0.0,
+        sum_x: 0.0,
+        sum_y: 0.0,
+        sum_x2: 0.0,
+        sum_xy: 0.0,
+    };
+    for (yv, xv) in ys_raw.iter().zip(xs_raw.iter()) {
+        if let Value::Error(e) = yv {
+            return Err(*e);
+        }
+        if let Value::Error(e) = xv {
+            return Err(*e);
+        }
+        let y_opt = if let Value::Number(n) = yv {
+            Some(*n)
+        } else {
+            None
+        };
+        let x_opt = if let Value::Number(n) = xv {
+            Some(*n)
+        } else {
+            None
+        };
+        if let (Some(y), Some(x)) = (y_opt, x_opt) {
+            sums.n += 1.0;
+            sums.sum_x += x;
+            sums.sum_y += y;
+            sums.sum_x2 += x * x;
+            sums.sum_xy += x * y;
+        }
+    }
+    Ok(sums)
+}
+
+/// **W5-178:** least-squares slope from pre-computed sums.
+/// `m = (n·Σxy − Σx·Σy) / (n·Σx² − (Σx)²)`. Returns `#DIV/0!` if
+/// the denominator is zero (constant x-array) or non-finite.
+pub(crate) fn compute_slope(sums: &LinearFitSums) -> Result<f64, ErrorValue> {
+    if sums.n < 2.0 {
+        return Err(ErrorValue::DivZero);
+    }
+    let denom = sums.n * sums.sum_x2 - sums.sum_x * sums.sum_x;
+    if denom == 0.0 || !denom.is_finite() {
+        return Err(ErrorValue::DivZero);
+    }
+    let num = sums.n * sums.sum_xy - sums.sum_x * sums.sum_y;
+    let m = num / denom;
+    if !m.is_finite() {
+        return Err(ErrorValue::Num);
+    }
+    Ok(m)
+}
+
+/// **W5-178:** least-squares intercept. `b = (Σy − m·Σx) / n` using
+/// the slope computed by `compute_slope`. Inherits its #DIV/0! when
+/// the slope is undefined.
+pub(crate) fn compute_intercept(sums: &LinearFitSums) -> Result<f64, ErrorValue> {
+    let m = compute_slope(sums)?;
+    let b = (sums.sum_y - m * sums.sum_x) / sums.n;
+    if !b.is_finite() {
+        return Err(ErrorValue::Num);
+    }
+    Ok(b)
+}
+
+/// Shared dispatch for SLOPE / INTERCEPT. Both take `(known_y, known_x)`
+/// as ranges of identical shape (Y first per Excel canon — opposite
+/// of CORREL's `(x, y)` order, which causes plenty of user confusion
+/// in Excel itself).
+fn slope_intercept_dispatch(
+    args: &[FnArg],
+    finish: impl Fn(&LinearFitSums) -> Result<f64, ErrorValue>,
+) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let (ys_raw, y_rows, y_cols) = match &args[0] {
+        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
+    };
+    let (xs_raw, x_rows, x_cols) = match &args[1] {
+        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
+    };
+    if y_rows != x_rows || y_cols != x_cols {
+        // Shape mismatch follows the in-codebase paired-array
+        // convention (#VALUE!) — Microsoft canon says #N/A but we
+        // match CORREL + SUMX2MY2 family for engine consistency.
+        return Value::Error(ErrorValue::Value);
+    }
+    let sums = match collect_linear_fit(ys_raw, xs_raw) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    match finish(&sums) {
+        Ok(v) => match coercion::sanitize_f64(v) {
+            Ok(n) => Value::Number(n),
+            Err(e) => Value::Error(e),
+        },
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// **W5-178 (Phase 4.10 polish / Wave 3 regression batch):**
+/// `SLOPE(known_y's, known_x's)` — slope of the least-squares
+/// regression line. RangeAwareFn; both args MUST be ranges of
+/// identical shape. Note Excel's Y-first arg order.
+///
+/// Excel canon (verified against IronCalc `fn_slope`): pairs with
+/// non-numeric on EITHER side are dropped; need ≥2 numeric pairs
+/// → otherwise `#DIV/0!`; constant x-array (`Σx² · n - (Σx)² = 0`)
+/// → `#DIV/0!`.
+pub fn slope(args: &[FnArg]) -> Value {
+    slope_intercept_dispatch(args, compute_slope)
+}
+
+/// **W5-178 (Phase 4.10 polish / Wave 3 regression batch):**
+/// `INTERCEPT(known_y's, known_x's)` — y-intercept of the least-
+/// squares regression line. Same semantics + canon as SLOPE.
+/// Computed as `intercept = ȳ − slope · x̄` after deriving slope.
+pub fn intercept(args: &[FnArg]) -> Value {
+    slope_intercept_dispatch(args, compute_intercept)
+}
+
 /// **W5-164 (Phase 4.10.B):** `MINIFS(min_range, criteria_range1,
 /// criteria1, [crit_range2, crit2, ...])` — minimum of cells in
 /// `min_range` where ALL criteria pairs match elementwise. Excel
@@ -3341,6 +3488,186 @@ mod tests {
         let x = r(vec![n(1.0), n(2.0), n(3.0)]);
         let y = r(vec![n(1.0), Value::Error(ErrorValue::Name), n(3.0)]);
         assert_eq!(correl(&[x, y]), Value::Error(ErrorValue::Name));
+    }
+
+    // === W5-178 (Phase 4.10 polish / Wave 3 regression batch)
+    //     — SLOPE + INTERCEPT ===
+
+    fn approx_scalar(actual: Value, expected: f64, tol: f64) {
+        match actual {
+            Value::Number(got) => assert!(
+                (got - expected).abs() < tol,
+                "expected ≈ {expected}, got {got}"
+            ),
+            other => panic!("expected Number, got {other:?}"),
+        }
+    }
+
+    // --- SLOPE ---
+
+    #[test]
+    fn slope_perfect_y_equals_2x() {
+        // y = 2x exactly; slope = 2.
+        // Excel arg order: SLOPE(known_y, known_x).
+        let ys = r(vec![n(2.0), n(4.0), n(6.0), n(8.0)]);
+        let xs = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        approx_scalar(slope(&[ys, xs]), 2.0, 1e-9);
+    }
+
+    #[test]
+    fn slope_known_fixture() {
+        // y = 3x + 5 on x=[1,2,3,4]: ys=[8,11,14,17].
+        //   Σx=10 Σy=50 Σx²=30 Σxy=140 n=4
+        //   num = 4·140 − 10·50 = 60. denom = 4·30 − 100 = 20.
+        //   slope = 60/20 = 3.0.
+        let ys = r(vec![n(8.0), n(11.0), n(14.0), n(17.0)]);
+        let xs = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        approx_scalar(slope(&[ys, xs]), 3.0, 1e-9);
+    }
+
+    #[test]
+    fn slope_negative() {
+        // y = -2x + 1: ys=[-1,-3,-5].
+        //   Σx=6 Σy=-9 Σx²=14 Σxy=-22 n=3
+        //   num = 3·(-22) − 6·(-9) = -66 + 54 = -12. denom = 3·14 − 36 = 6.
+        //   slope = -12/6 = -2.0.
+        let ys = r(vec![n(-1.0), n(-3.0), n(-5.0)]);
+        let xs = r(vec![n(1.0), n(2.0), n(3.0)]);
+        approx_scalar(slope(&[ys, xs]), -2.0, 1e-9);
+    }
+
+    #[test]
+    fn slope_skips_non_numeric_pairs() {
+        // Drop pair (t, 99). Remaining: ys=[2,6], xs=[1,3]. slope=2.
+        let ys = r(vec![n(2.0), t("skip"), n(6.0)]);
+        let xs = r(vec![n(1.0), n(2.0), n(3.0)]);
+        approx_scalar(slope(&[ys, xs]), 2.0, 1e-9);
+    }
+
+    #[test]
+    fn slope_constant_x_is_div_zero() {
+        // Constant x → denom = 0 → #DIV/0!.
+        let ys = r(vec![n(1.0), n(2.0), n(3.0)]);
+        let xs = r(vec![n(5.0), n(5.0), n(5.0)]);
+        assert_eq!(slope(&[ys, xs]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn slope_too_few_pairs_is_div_zero() {
+        // 1 valid pair → #DIV/0!.
+        let ys = r(vec![n(1.0), t("a")]);
+        let xs = r(vec![n(2.0), n(3.0)]);
+        assert_eq!(slope(&[ys, xs]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn slope_shape_mismatch_is_value_error() {
+        let ys = r(vec![n(1.0), n(2.0)]);
+        let xs = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(slope(&[ys, xs]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn slope_arity_violations() {
+        assert_eq!(slope(&[]), Value::Error(ErrorValue::Value));
+        let ys = r(vec![n(1.0), n(2.0)]);
+        assert_eq!(
+            slope(std::slice::from_ref(&ys)),
+            Value::Error(ErrorValue::Value)
+        );
+        let xs = r(vec![n(1.0), n(2.0)]);
+        let z = r(vec![n(1.0), n(2.0)]);
+        assert_eq!(slope(&[ys, xs, z]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn slope_scalar_args_are_value_error() {
+        assert_eq!(
+            slope(&[s(n(1.0)), s(n(2.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn slope_error_in_y_propagates() {
+        let ys = r(vec![Value::Error(ErrorValue::Ref), n(2.0), n(3.0)]);
+        let xs = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(slope(&[ys, xs]), Value::Error(ErrorValue::Ref));
+    }
+
+    #[test]
+    fn slope_error_in_x_propagates() {
+        let ys = r(vec![n(1.0), n(2.0), n(3.0)]);
+        let xs = r(vec![n(1.0), Value::Error(ErrorValue::Name), n(3.0)]);
+        assert_eq!(slope(&[ys, xs]), Value::Error(ErrorValue::Name));
+    }
+
+    // --- INTERCEPT ---
+
+    #[test]
+    fn intercept_y_equals_2x_baseline_is_zero() {
+        // y = 2x → intercept = 0.
+        let ys = r(vec![n(2.0), n(4.0), n(6.0), n(8.0)]);
+        let xs = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        approx_scalar(intercept(&[ys, xs]), 0.0, 1e-9);
+    }
+
+    #[test]
+    fn intercept_known_fixture() {
+        // y = 3x + 5 on x=[1,2,3,4]: ys=[8,11,14,17]. slope = 3.
+        // intercept = (Σy − slope · Σx) / n = (50 − 3·10) / 4 = 20/4 = 5.
+        let ys = r(vec![n(8.0), n(11.0), n(14.0), n(17.0)]);
+        let xs = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        approx_scalar(intercept(&[ys, xs]), 5.0, 1e-9);
+    }
+
+    #[test]
+    fn intercept_negative_slope_known_fixture() {
+        // y = -2x + 10: x=[1,2,3], y=[8, 6, 4].
+        // Σx=6 Σy=18 Σx²=14 Σxy=32 n=3.
+        // slope = (3·32 - 6·18) / (3·14 - 36) = (96-108)/6 = -2.
+        // intercept = (18 - (-2)·6)/3 = (18+12)/3 = 10.
+        let ys = r(vec![n(8.0), n(6.0), n(4.0)]);
+        let xs = r(vec![n(1.0), n(2.0), n(3.0)]);
+        approx_scalar(intercept(&[ys, xs]), 10.0, 1e-9);
+    }
+
+    #[test]
+    fn intercept_inherits_slope_div_zero_on_constant_x() {
+        let ys = r(vec![n(1.0), n(2.0), n(3.0)]);
+        let xs = r(vec![n(5.0), n(5.0), n(5.0)]);
+        assert_eq!(intercept(&[ys, xs]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn intercept_too_few_pairs_is_div_zero() {
+        let ys = r(vec![n(1.0), t("a")]);
+        let xs = r(vec![n(2.0), n(3.0)]);
+        assert_eq!(intercept(&[ys, xs]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn intercept_shape_mismatch_is_value_error() {
+        let ys = r(vec![n(1.0), n(2.0)]);
+        let xs = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(intercept(&[ys, xs]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn intercept_arity_and_scalar_validation() {
+        assert_eq!(intercept(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            intercept(&[s(n(1.0)), s(n(2.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn intercept_skips_non_numeric_pairs() {
+        // Drop pair (TRUE, 99). Remaining: ys=[2,6], xs=[1,3]. slope=2, intercept=0.
+        let ys = r(vec![n(2.0), Value::Boolean(true), n(6.0)]);
+        let xs = r(vec![n(1.0), n(2.0), n(3.0)]);
+        approx_scalar(intercept(&[ys, xs]), 0.0, 1e-9);
     }
 
     // === W5-167 (Phase 4.10.E) — TEXTJOIN ===

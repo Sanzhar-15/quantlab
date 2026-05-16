@@ -650,6 +650,12 @@ pub fn default_registry() -> FunctionRegistry {
     // shape. First Wave 3 statistical function ported from IronCalc.
     r.register_range_aware("CORREL", range_fns::correl);
 
+    // Phase 4.10 polish (W5-178) — SLOPE + INTERCEPT: least-squares
+    // linear regression. Share `compute_slope` (intercept needs slope
+    // first). Note Excel's Y-first arg order: `SLOPE(known_y, known_x)`.
+    r.register_range_aware("SLOPE", range_fns::slope);
+    r.register_range_aware("INTERCEPT", range_fns::intercept);
+
     // Phase 4.10.G (W5-169) — modern lookups (range-aware).
     r.register_range_aware("XLOOKUP", range_fns::xlookup);
     r.register_range_aware("XMATCH", range_fns::xmatch);
@@ -751,8 +757,9 @@ mod tests {
         // Phase 4.10 polish (W5-173: NUMBERVALUE = 1 locale-explicit
         // text-to-number variant of VALUE; W5-174: MIRR = 1 closed-form
         // Modified IRR; W5-177: CORREL = 1 Pearson correlation
-        // coefficient — first Wave 3 statistical starter).
-        assert_eq!(r.len(), 183);
+        // coefficient; W5-178: SLOPE + INTERCEPT = 2 least-squares
+        // regression — Wave 3 regression batch).
+        assert_eq!(r.len(), 185);
     }
 
     #[test]

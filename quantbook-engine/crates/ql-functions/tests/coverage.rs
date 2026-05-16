@@ -269,6 +269,21 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "CORREL",
         "W5-177; unit tests pin Pearson coefficient against known fixtures + skip-non-numeric-pair + constant-array → #DIV/0!",
     ),
+    // W5-178 (Phase 4.10 polish / Wave 3 regression batch) — SLOPE +
+    // INTERCEPT ported from IronCalc `fn_slope` / `fn_intercept`.
+    // Share `LinearFitSums` + `compute_slope` (intercept needs slope
+    // first). Unit tests pin known-fixture slope/intercept against
+    // hand-computed values, sign-coverage, constant-x → #DIV/0!,
+    // shape mismatch, error propagation, skip-non-numeric per
+    // CORREL's IronCalc-canon rule.
+    (
+        "SLOPE",
+        "W5-178; unit tests pin known-fixture slope (m=2 on y=2x baseline + manual y=ax+b case) + skip-non-numeric-pair + constant-x → #DIV/0!",
+    ),
+    (
+        "INTERCEPT",
+        "W5-178; unit tests pin known-fixture intercept (b=0 on y=2x + manual y=ax+b) + slope-failure inheritance",
+    ),
     // W5-168 (Phase 4.10.F) — financial TVM + cash-flow.
     (
         "PMT",

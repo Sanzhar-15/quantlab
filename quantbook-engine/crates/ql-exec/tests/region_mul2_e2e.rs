@@ -446,6 +446,19 @@ fn e2e_textjoin_registered() {
 }
 
 #[test]
+fn e2e_slope_intercept_registered() {
+    // W5-178: SLOPE + INTERCEPT are RangeAwareFns; registry-lookup
+    // smoke check per the W5-176 / W5-177 pattern (range-arg
+    // construction not reachable via `bind(&ast, 0)` without
+    // named-range scaffolding).
+    let registry = default_registry();
+    assert!(registry.lookup_range_aware("SLOPE").is_some());
+    assert!(registry.lookup_range_aware("slope").is_some());
+    assert!(registry.lookup_range_aware("INTERCEPT").is_some());
+    assert!(registry.lookup_range_aware("intercept").is_some());
+}
+
+#[test]
 fn e2e_correl_registered() {
     // W5-177: CORREL is RangeAwareFn; range-arg construction can't go
     // through the lightweight `bind(&ast, 0)` test helper without
