@@ -491,6 +491,83 @@ fn finish(result: Result<f64, ErrorValue>) -> Value {
     }
 }
 
+/// **W5-180 (Phase 4.10 polish / Wave 3 depreciation batch starter):**
+/// straight-line depreciation per Microsoft + IronCalc.
+/// `SLN(cost, salvage, life) = (cost − salvage) / life`. `life = 0`
+/// → `#DIV/0!` per Excel canon (note: SYD's identical degenerate
+/// case returns `#NUM!` instead — asymmetric but documented).
+pub(crate) fn compute_sln(cost: f64, salvage: f64, life: f64) -> Result<f64, ErrorValue> {
+    if life == 0.0 {
+        return Err(ErrorValue::DivZero);
+    }
+    Ok((cost - salvage) / life)
+}
+
+/// **W5-180 (Phase 4.10 polish / Wave 3 depreciation batch starter):**
+/// sum-of-years digits depreciation per Microsoft + IronCalc.
+/// `SYD(cost, salvage, life, per) = (cost − salvage) ·
+/// (life − per + 1) · 2 / (life · (life + 1))`.
+///
+/// Per Microsoft canon (`life <= 0` or `per > life` or `per <= 0`
+/// → `#NUM!`) — distinct from SLN's `#DIV/0!` for the same
+/// degenerate `life = 0` case. We mirror Microsoft + IronCalc here.
+pub(crate) fn compute_syd(cost: f64, salvage: f64, life: f64, per: f64) -> Result<f64, ErrorValue> {
+    if life == 0.0 {
+        return Err(ErrorValue::Num);
+    }
+    if per > life || per <= 0.0 {
+        return Err(ErrorValue::Num);
+    }
+    Ok(((cost - salvage) * (life - per + 1.0) * 2.0) / (life * (life + 1.0)))
+}
+
+/// **W5-180:** `SLN(cost, salvage, life)` — straight-line depreciation.
+/// Three args required; `Blank` arg coerces to `0` per the existing
+/// `arg_num` contract.
+pub fn sln(args: &[Value]) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let cost = match arg_num(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let salvage = match arg_num(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let life = match arg_num(&args[2]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    finish(compute_sln(cost, salvage, life))
+}
+
+/// **W5-180:** `SYD(cost, salvage, life, per)` — sum-of-years digits
+/// depreciation. Four args required.
+pub fn syd(args: &[Value]) -> Value {
+    if args.len() != 4 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let cost = match arg_num(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let salvage = match arg_num(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let life = match arg_num(&args[2]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let per = match arg_num(&args[3]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    finish(compute_syd(cost, salvage, life, per))
+}
+
 /// `PMT(rate, nper, pv, [fv=0], [type=0])`
 pub fn pmt(args: &[Value]) -> Value {
     if !(3..=5).contains(&args.len()) {
@@ -1377,5 +1454,188 @@ mod tests {
         //   bottom = -90.91 * 1.1 = -100.
         // ratio = 1.5; (n-1)=3; result = 1.5^(1/3) - 1 ≈ 0.14471.
         approx(mirr(&[cash, s(n(0.10)), s(n(0.10))]), 0.14471, 1e-4);
+    }
+
+    // --- SLN (W5-180) ---
+
+    #[test]
+    fn sln_basic() {
+        // SLN(10000, 1000, 5) = (10000-1000)/5 = 1800.
+        approx(sln(&[n(10000.0), n(1000.0), n(5.0)]), 1800.0, 1e-9);
+    }
+
+    #[test]
+    fn sln_no_salvage() {
+        // SLN(10000, 0, 10) = 1000.
+        approx(sln(&[n(10000.0), n(0.0), n(10.0)]), 1000.0, 1e-9);
+    }
+
+    #[test]
+    fn sln_microsoft_example() {
+        // Microsoft docs: SLN(30000, 7500, 10) = 2250.
+        approx(sln(&[n(30000.0), n(7500.0), n(10.0)]), 2250.0, 1e-9);
+    }
+
+    #[test]
+    fn sln_life_zero_is_div_zero() {
+        assert_eq!(
+            sln(&[n(100.0), n(10.0), n(0.0)]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn sln_negative_life_passes_through() {
+        // Per IronCalc canon: no upfront check on sign — formula
+        // runs and produces a negative result. Excel docs don't
+        // explicitly reject; matching IronCalc.
+        approx(sln(&[n(1000.0), n(0.0), n(-5.0)]), -200.0, 1e-9);
+    }
+
+    #[test]
+    fn sln_wrong_arity() {
+        assert_eq!(sln(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(sln(&[n(100.0), n(10.0)]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            sln(&[n(100.0), n(10.0), n(5.0), n(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn sln_error_in_arg_propagates() {
+        assert_eq!(
+            sln(&[Value::Error(ErrorValue::Ref), n(10.0), n(5.0)]),
+            Value::Error(ErrorValue::Ref)
+        );
+        assert_eq!(
+            sln(&[n(100.0), Value::Error(ErrorValue::Name), n(5.0)]),
+            Value::Error(ErrorValue::Name)
+        );
+    }
+
+    #[test]
+    fn sln_blank_coerces_to_zero() {
+        // Blank salvage → 0. (10000 - 0) / 5 = 2000.
+        approx(sln(&[n(10000.0), Value::Blank, n(5.0)]), 2000.0, 1e-9);
+    }
+
+    // --- SYD (W5-180) ---
+
+    #[test]
+    fn syd_microsoft_example_first_year() {
+        // Microsoft docs example: SYD(30000, 7500, 10, 1) ≈ 4090.909.
+        // Compute expected via the formula directly to avoid awkward
+        // digit-grouping in a literal (clippy::inconsistent_digit_grouping).
+        let expected = 22500.0 * 10.0 * 2.0 / (10.0 * 11.0);
+        approx(
+            syd(&[n(30000.0), n(7500.0), n(10.0), n(1.0)]),
+            expected,
+            1e-9,
+        );
+    }
+
+    #[test]
+    fn syd_microsoft_example_final_year() {
+        // SYD(30000, 7500, 10, 10) = (22500 * 1 * 2) / (10 * 11).
+        let expected = 22500.0 * 1.0 * 2.0 / (10.0 * 11.0);
+        approx(
+            syd(&[n(30000.0), n(7500.0), n(10.0), n(10.0)]),
+            expected,
+            1e-9,
+        );
+    }
+
+    #[test]
+    fn syd_zero_per_is_num() {
+        assert_eq!(
+            syd(&[n(100.0), n(10.0), n(5.0), n(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn syd_negative_per_is_num() {
+        assert_eq!(
+            syd(&[n(100.0), n(10.0), n(5.0), n(-1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn syd_per_exceeds_life_is_num() {
+        assert_eq!(
+            syd(&[n(100.0), n(10.0), n(5.0), n(6.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn syd_life_zero_is_num() {
+        // SYD asymmetry with SLN: life=0 returns #NUM! here, not
+        // #DIV/0!. Microsoft + IronCalc both confirm.
+        assert_eq!(
+            syd(&[n(100.0), n(10.0), n(0.0), n(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn syd_per_equals_life_succeeds() {
+        // per = life boundary case; should succeed (the constraint
+        // is `per > life`, not `>=`).
+        approx(
+            syd(&[n(100.0), n(0.0), n(5.0), n(5.0)]),
+            (100.0 * 1.0 * 2.0) / (5.0 * 6.0),
+            1e-9,
+        );
+    }
+
+    #[test]
+    fn syd_wrong_arity() {
+        assert_eq!(syd(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            syd(&[n(100.0), n(10.0), n(5.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            syd(&[n(100.0), n(10.0), n(5.0), n(1.0), n(0.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn syd_error_in_arg_propagates() {
+        // Error in any of the four positional args.
+        assert_eq!(
+            syd(&[Value::Error(ErrorValue::Ref), n(10.0), n(5.0), n(1.0)]),
+            Value::Error(ErrorValue::Ref)
+        );
+        assert_eq!(
+            syd(&[n(100.0), n(10.0), n(5.0), Value::Error(ErrorValue::Name)]),
+            Value::Error(ErrorValue::Name)
+        );
+    }
+
+    #[test]
+    fn syd_sum_over_periods_equals_total_depreciation() {
+        // Invariant: Σ SYD(cost, salvage, life, k) for k=1..life
+        // = (cost - salvage). Pin to verify the formula's sum
+        // identity, which is the whole point of "sum-of-years".
+        let cost = 30000.0;
+        let salvage = 7500.0;
+        let life = 10.0;
+        let mut total = 0.0;
+        for k in 1..=10 {
+            match syd(&[n(cost), n(salvage), n(life), n(k as f64)]) {
+                Value::Number(d) => total += d,
+                other => panic!("expected Number, got {other:?}"),
+            }
+        }
+        assert!(
+            (total - (cost - salvage)).abs() < 1e-6,
+            "expected {}, got {total}",
+            cost - salvage
+        );
     }
 }

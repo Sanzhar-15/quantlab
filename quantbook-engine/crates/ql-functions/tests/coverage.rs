@@ -301,6 +301,19 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "STEYX",
         "W5-179; unit tests pin known-fixture sey (zero on perfect-line + manual scatter case) + n>=3 requirement",
     ),
+    // W5-180 (Phase 4.10 polish / Wave 3 depreciation batch starter) —
+    // SLN + SYD: closed-form straight-line + sum-of-years digits
+    // depreciation. Scalar; both ported from IronCalc `fn_sln` /
+    // `fn_syd`. Asymmetric degenerate-case canon: SLN(life=0) →
+    // #DIV/0!; SYD(life=0) → #NUM!. Pinned by tests.
+    (
+        "SLN",
+        "W5-180; unit tests pin (cost-salvage)/life formula + life=0 → #DIV/0! + Microsoft example fixture",
+    ),
+    (
+        "SYD",
+        "W5-180; unit tests pin (cost-salvage)·(life-per+1)·2/(life·(life+1)) + per>life / per<=0 / life=0 → #NUM! + Microsoft example fixture (SYD(30k,7.5k,10,1)≈4090.91)",
+    ),
     // W5-168 (Phase 4.10.F) — financial TVM + cash-flow.
     (
         "PMT",

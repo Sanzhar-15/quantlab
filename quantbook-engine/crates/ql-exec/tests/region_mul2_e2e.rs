@@ -446,6 +446,26 @@ fn e2e_textjoin_registered() {
 }
 
 #[test]
+fn e2e_sln_syd_depreciation() {
+    // W5-180: SLN + SYD are ScalarFns; we can evaluate them directly
+    // through the lightweight `bind(&ast, 0)` test helper (no range
+    // construction needed).
+    // SLN(30000, 7500, 10) = 2250 (Microsoft docs example).
+    let result = eval_source_with_registry("SLN(30000, 7500, 10)", &[]);
+    assert_eq!(result, Value::Number(2250.0));
+    // SYD(30000, 7500, 10, 1) ≈ 4090.909... (first-year depreciation).
+    let result = eval_source_with_registry("SYD(30000, 7500, 10, 1)", &[]);
+    let expected = 22500.0 * 10.0 * 2.0 / (10.0 * 11.0);
+    match result {
+        Value::Number(got) => assert!(
+            (got - expected).abs() < 1e-9,
+            "expected ≈ {expected}, got {got}"
+        ),
+        other => panic!("expected Number, got {other:?}"),
+    }
+}
+
+#[test]
 fn e2e_pearson_rsq_steyx_registered() {
     // W5-179: PEARSON + RSQ + STEYX are RangeAwareFns; registry-lookup
     // smoke check per the W5-176 / W5-177 / W5-178 pattern.
