@@ -250,6 +250,16 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "NUMBERVALUE",
         "W5-173; unit tests pin Microsoft NUMBERVALUE canon (separator override + percent suffix + empty-text-is-zero)",
     ),
+    // W5-174 (Phase 4.10 polish, MIRR) — closes second Wave 2 deferred
+    // entry. Unit tests pin Microsoft Excel canonical example (≈12.61%),
+    // sign-coverage guard (no-positive / no-negative → #DIV/0!), arity,
+    // scalar/range arg validation, text+bool skip per IRR/NPV canon,
+    // error propagation, finance_rate < -1 → #NUM!, and both
+    // rate==-1 special-case branches (IronCalc-ported cancellation).
+    (
+        "MIRR",
+        "W5-174; unit tests pin Excel MIRR canon (closed-form + sign-coverage + rate-edge cancellations)",
+    ),
     // W5-168 (Phase 4.10.F) — financial TVM + cash-flow.
     (
         "PMT",

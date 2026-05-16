@@ -250,7 +250,8 @@ as partial, rows with `❌` are missing.
 | IPMT / PPMT | ✅ | 3 | 4.10.F | W5-168: interest + principal portions of period `k` payment. Invariant: `IPMT(k) + PPMT(k) = PMT`. Period < 1 or > nper+1 → `#NUM!`. |
 | NPV | ✅ | 5 | 4.10.F | W5-168: Σ values[i] / (1+rate)^(i+1) (values are END-of-period cash flows; first value discounted). Variadic — accepts scalar + range args; ranges flatten row-major. Per Excel canon: non-numeric cells (text, bool) SKIPPED, blanks skipped, errors propagate. Empty cash-flow → `#NUM!`. |
 | IRR | ✅ | 6 | 4.10.F | W5-168: Newton-Raphson around guess (default 0.1), bisection fallback over `[-0.99999, 100]`, 50 iterations max, eps=1e-8 / 1e-10. Requires sign-change in cash-flow → otherwise `#NUM!`. Non-numeric cells in range → `#VALUE!` (stricter than NPV per IronCalc canon). |
-| XNPV / XIRR / MIRR | ❌ | 0 | Wave 3 | Date-indexed variants; bundle with Wave 3 reference-tier / extended date arithmetic. |
+| MIRR | ✅ | 13 | 4.10 polish | W5-174: Modified IRR — closed-form per Microsoft + IronCalc port. Formula: `((-NPV(reinvest, pos) · (1+reinvest)^n) / (NPV(finance, neg) · (1+finance)))^(1/(n-1)) − 1` where `pos` / `neg` are the cash flows with opposite-sign terms zeroed. Excel canon: requires ≥1 positive AND ≥1 negative cash flow → otherwise `#DIV/0!`. Text + Bool + Blank cells in range SKIPPED per IRR/NPV convention (W5-171 closure pattern). `finance_rate < -1` → `#NUM!` via `compute_npv` guard. `finance_rate == -1` and `reinvest_rate == -1` get IronCalc cancellation analysis so the result stays defined where it makes sense. |
+| XNPV / XIRR | ❌ | 0 | Wave 3 | Date-indexed variants of NPV / IRR; bundle with Wave 3 reference-tier / extended date arithmetic (needs DAYS or YEARFRAC-based discount-period math). |
 | PRICE / YIELD / DURATION / MDURATION | ❌ | 0 | post-v1 | Bond math |
 | DB / DDB / SLN / SYD / VDB | ❌ | 0 | 4.10 | Depreciation |
 | FVSCHEDULE / RRI / PDURATION | ❌ | 0 | post-v1 | |

@@ -445,6 +445,17 @@ fn e2e_textjoin_registered() {
 }
 
 #[test]
+fn e2e_mirr_registered() {
+    // W5-174: MIRR is RangeAwareFn; range-arg construction can't go
+    // through the lightweight `bind(&ast, 0)` test helper without
+    // named-range / table-ref scaffolding, so we smoke-check via
+    // registry dispatch (same pattern as XLOOKUP / XMATCH / TEXTJOIN).
+    let registry = default_registry();
+    assert!(registry.lookup_range_aware("MIRR").is_some());
+    assert!(registry.lookup_range_aware("mirr").is_some()); // case-insensitive
+}
+
+#[test]
 fn e2e_numbervalue_basic_enus() {
     // W5-173 dispatch-gap defense — three paths through numbervalue_ctx so a
     // registry typo (e.g. accidentally swapping with value_ctx) trips the test.

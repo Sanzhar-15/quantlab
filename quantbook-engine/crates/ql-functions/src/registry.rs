@@ -640,6 +640,11 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_range_aware("NPV", financial_fns::npv);
     r.register_range_aware("IRR", financial_fns::irr);
 
+    // Phase 4.10 polish (W5-174) — MIRR: closed-form Modified IRR
+    // using separate rates for negative (financing) and positive
+    // (reinvestment) cash flows. RangeAwareFn; first arg must be range.
+    r.register_range_aware("MIRR", financial_fns::mirr);
+
     // Phase 4.10.G (W5-169) — modern lookups (range-aware).
     r.register_range_aware("XLOOKUP", range_fns::xlookup);
     r.register_range_aware("XMATCH", range_fns::xmatch);
@@ -739,9 +744,10 @@ mod tests {
         // Phase 4.10.G (W5-169: XLOOKUP, XMATCH = 2 modern lookups +
         // ADDRESS = 1 scalar text formatter = 3 total; CLOSES Wave 2) +
         // Phase 4.10 polish (W5-173: NUMBERVALUE = 1 locale-explicit
-        // text-to-number variant of VALUE; closes Wave 2 deferred-list
-        // entry per handoff 2026-05-16).
-        assert_eq!(r.len(), 181);
+        // text-to-number variant of VALUE; W5-174: MIRR = 1 closed-form
+        // Modified IRR — closes second + first Wave 2 deferred-list
+        // entries per handoff 2026-05-16).
+        assert_eq!(r.len(), 182);
     }
 
     #[test]

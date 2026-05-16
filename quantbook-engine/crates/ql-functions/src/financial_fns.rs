@@ -384,6 +384,101 @@ pub(crate) fn compute_irr(values: &[f64], guess: f64) -> Result<f64, ErrorValue>
     Err(ErrorValue::Num)
 }
 
+/// **W5-174 (Phase 4.10 polish, MIRR):** Modified Internal Rate of
+/// Return — combines a `reinvest_rate` for positive cash flows with a
+/// `finance_rate` for negative cash flows. Closed-form (no iteration):
+///
+/// $$ MIRR = \left( \frac{-NPV(r_r, v_+) \cdot (1 + r_r)^n}{NPV(r_f, v_-) \cdot (1 + r_f)} \right)^{1/(n-1)} - 1 $$
+///
+/// where `r_r` is the reinvest rate, `r_f` is the finance rate,
+/// `v_+` / `v_-` are the per-period cash flows with the opposite-sign
+/// terms zeroed, and `n = values.len()`.
+///
+/// Excel canon: requires at least one positive AND at least one
+/// negative cash flow (otherwise `#DIV/0!`). `finance_rate = -1` and
+/// `reinvest_rate = -1` get IronCalc-style cancellation handling so
+/// the result remains defined where it makes sense.
+pub(crate) fn compute_mirr(
+    values: &[f64],
+    finance_rate: f64,
+    reinvest_rate: f64,
+) -> Result<f64, ErrorValue> {
+    let mut positives = Vec::with_capacity(values.len());
+    let mut negatives = Vec::with_capacity(values.len());
+    let mut has_positive = false;
+    let mut has_negative = false;
+    let mut last_negative_index: Option<usize> = None;
+    for (i, &v) in values.iter().enumerate() {
+        if v > 0.0 {
+            positives.push(v);
+            negatives.push(0.0);
+            has_positive = true;
+        } else if v < 0.0 {
+            positives.push(0.0);
+            negatives.push(v);
+            has_negative = true;
+            last_negative_index = Some(i);
+        } else {
+            // Exactly zero — contributes to neither stream.
+            positives.push(0.0);
+            negatives.push(0.0);
+        }
+    }
+    if !has_positive || !has_negative {
+        return Err(ErrorValue::DivZero);
+    }
+    let n = values.len();
+    let years = n as f64;
+
+    // top = -NPV(reinvest_rate, positives) * (1 + reinvest_rate)^n.
+    // Special-case reinvest_rate == -1: `compute_npv` would reject
+    // (rate <= -1), but analytically all but the LAST positive term
+    // cancel — port IronCalc's limit (positives.last()).
+    let top = if reinvest_rate == -1.0 {
+        *positives
+            .last()
+            .expect("values non-empty: has_positive ensured")
+    } else {
+        let npv_pos = compute_npv(reinvest_rate, &positives)?;
+        -npv_pos * (1.0 + reinvest_rate).powi(n as i32)
+    };
+
+    // bottom = NPV(finance_rate, negatives) * (1 + finance_rate).
+    // Symmetric special case for finance_rate == -1: if the only
+    // negative is at index 0, bottom equals that term; otherwise
+    // |bottom| → ∞ and the eventual ratio → 0 → result = -1
+    // (IronCalc treats the magnitude as effectively infinite).
+    let bottom = if finance_rate == -1.0 {
+        let last_idx = last_negative_index.expect("values non-empty: has_negative ensured");
+        if last_idx == 0 {
+            negatives[0]
+        } else {
+            f64::INFINITY
+        }
+    } else {
+        let npv_neg = compute_npv(finance_rate, &negatives)?;
+        npv_neg * (1.0 + finance_rate)
+    };
+
+    if bottom == 0.0 {
+        return Err(ErrorValue::DivZero);
+    }
+    let ratio = top / bottom;
+    if ratio < 0.0 {
+        // Even/odd root of a negative — surface as #NUM! per Excel
+        // canon. Reached only with pathological sign distributions.
+        return Err(ErrorValue::Num);
+    }
+    let result = ratio.powf(1.0 / (years - 1.0)) - 1.0;
+    if result.is_infinite() {
+        return Err(ErrorValue::DivZero);
+    }
+    if result.is_nan() {
+        return Err(ErrorValue::Num);
+    }
+    Ok(result)
+}
+
 // ===== ScalarFn wrappers (registered as ScalarFn) =====
 
 fn finish(result: Result<f64, ErrorValue>) -> Value {
@@ -769,6 +864,55 @@ pub fn irr(args: &[FnArg]) -> Value {
     finish(compute_irr(&values, guess))
 }
 
+/// **W5-174 (Phase 4.10 polish):** `MIRR(values, finance_rate,
+/// reinvest_rate)` — Modified Internal Rate of Return. Like `IRR`
+/// but uses separate rates for negative (financing) and positive
+/// (reinvestment) cash flows. RangeAwareFn: first arg MUST be a
+/// range; scalar `finance_rate` + `reinvest_rate` follow.
+///
+/// Excel canon: range must contain at least one positive AND one
+/// negative cash flow (otherwise `#DIV/0!`). Text + Boolean + Blank
+/// cells in the range are SKIPPED per the IRR/NPV convention
+/// (W5-171 closure pattern).
+pub fn mirr(args: &[FnArg]) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let values = match &args[0] {
+        FnArg::Range { values, .. } => {
+            let mut out = Vec::new();
+            for v in values {
+                match v {
+                    Value::Number(n) => out.push(*n),
+                    Value::Blank => {} // skip per Excel canon
+                    Value::Error(e) => return Value::Error(*e),
+                    _ => {} // skip text/bool per Excel canon
+                }
+            }
+            out
+        }
+        FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
+    };
+    if values.is_empty() {
+        return Value::Error(ErrorValue::Num);
+    }
+    let finance_rate = match &args[1] {
+        FnArg::Scalar(v) => match arg_num(v) {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        },
+        FnArg::Range { .. } => return Value::Error(ErrorValue::Value),
+    };
+    let reinvest_rate = match &args[2] {
+        FnArg::Scalar(v) => match arg_num(v) {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        },
+        FnArg::Range { .. } => return Value::Error(ErrorValue::Value),
+    };
+    finish(compute_mirr(&values, finance_rate, reinvest_rate))
+}
+
 // ===== Tests =====
 
 #[cfg(test)]
@@ -1048,5 +1192,190 @@ mod tests {
     fn irr_bisection_fallback_when_newton_diverges() {
         let cash = r(vec![n(-1.0), n(2.0)]);
         approx(irr(&[cash, s(n(50.0))]), 1.0, 1e-6);
+    }
+
+    // --- MIRR (W5-174) ---
+
+    /// Microsoft Excel canonical example from MIRR docs page:
+    /// initial outflow $120k, five years of inflows $39k/$30k/$21k/
+    /// $37k/$46k, finance_rate=10%, reinvest_rate=12% → ≈ 12.61%.
+    #[test]
+    fn mirr_microsoft_example() {
+        let cash = r(vec![
+            n(-120_000.0),
+            n(39_000.0),
+            n(30_000.0),
+            n(21_000.0),
+            n(37_000.0),
+            n(46_000.0),
+        ]);
+        approx(mirr(&[cash, s(n(0.10)), s(n(0.12))]), 0.126094, 1e-5);
+    }
+
+    #[test]
+    fn mirr_no_positive_is_div_zero() {
+        let cash = r(vec![n(-1.0), n(-2.0), n(-3.0)]);
+        assert_eq!(
+            mirr(&[cash, s(n(0.10)), s(n(0.12))]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn mirr_no_negative_is_div_zero() {
+        let cash = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            mirr(&[cash, s(n(0.10)), s(n(0.12))]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn mirr_all_zero_is_div_zero() {
+        let cash = r(vec![n(0.0), n(0.0), n(0.0)]);
+        assert_eq!(
+            mirr(&[cash, s(n(0.10)), s(n(0.12))]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn mirr_single_value_is_div_zero() {
+        // n=1 → must be either positive-only or negative-only, both
+        // caught by the sign-coverage guard. n=1 also dodges the
+        // (n-1)=0 division-by-zero implicitly.
+        let cash = r(vec![n(10.0)]);
+        assert_eq!(
+            mirr(&[cash, s(n(0.10)), s(n(0.12))]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn mirr_wrong_arity() {
+        let cash = r(vec![n(-1.0), n(2.0)]);
+        // 1 arg — use `from_ref` (clippy::cloned_ref_to_slice_refs).
+        assert_eq!(
+            mirr(std::slice::from_ref(&cash)),
+            Value::Error(ErrorValue::Value)
+        );
+        // 2 args
+        assert_eq!(
+            mirr(&[cash.clone(), s(n(0.10))]),
+            Value::Error(ErrorValue::Value)
+        );
+        // 4 args
+        assert_eq!(
+            mirr(&[cash, s(n(0.10)), s(n(0.12)), s(n(0.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn mirr_scalar_first_arg_is_value_error() {
+        // Excel requires `values` to be an array. A bare scalar → #VALUE!.
+        assert_eq!(
+            mirr(&[s(n(-1.0)), s(n(0.10)), s(n(0.12))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn mirr_range_rate_is_value_error() {
+        // finance_rate / reinvest_rate must be scalars.
+        let cash = r(vec![n(-1.0), n(2.0)]);
+        let rate_range = r(vec![n(0.10), n(0.11)]);
+        assert_eq!(
+            mirr(&[cash.clone(), rate_range.clone(), s(n(0.12))]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            mirr(&[cash, s(n(0.10)), rate_range]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn mirr_error_in_range_propagates() {
+        let cash = r(vec![n(-1.0), Value::Error(ErrorValue::Ref), n(2.0)]);
+        assert_eq!(
+            mirr(&[cash, s(n(0.10)), s(n(0.12))]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn mirr_skips_text_and_bool_per_excel_canon() {
+        // Mixed range with text + bool — both skipped per Excel canon
+        // (matches the IRR/NPV W5-171 closure). Computation runs on
+        // the numeric subset only.
+        let cash = r(vec![
+            n(-120_000.0),
+            Value::text("ignored"),
+            n(39_000.0),
+            Value::Boolean(true),
+            n(30_000.0),
+            n(21_000.0),
+            n(37_000.0),
+            n(46_000.0),
+        ]);
+        approx(mirr(&[cash, s(n(0.10)), s(n(0.12))]), 0.126094, 1e-5);
+    }
+
+    #[test]
+    fn mirr_error_in_finance_rate_propagates() {
+        let cash = r(vec![n(-1.0), n(2.0)]);
+        assert_eq!(
+            mirr(&[cash, s(Value::Error(ErrorValue::Name)), s(n(0.12))]),
+            Value::Error(ErrorValue::Name)
+        );
+    }
+
+    #[test]
+    fn mirr_invalid_finance_rate_is_num() {
+        // finance_rate < -1 → compute_npv rejects with #NUM!.
+        let cash = r(vec![n(-1.0), n(2.0)]);
+        assert_eq!(
+            mirr(&[cash, s(n(-1.5)), s(n(0.12))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn mirr_finance_rate_minus_one_special_single_negative_at_index_0() {
+        // Special-case branch in compute_mirr: finance_rate == -1 with
+        // the only negative at index 0 → bottom = negatives[0] (finite).
+        // values=[-1, 2]: positives=[0, 2], negatives=[-1, 0], n=2.
+        // top with reinvest_rate=0: NPV(0, [0, 2]) = 0/1 + 2/1 = 2; top = -2*1 = -2.
+        // bottom = -1.
+        // ratio = 2; (n-1)=1; result = 2^1 - 1 = 1.
+        let cash = r(vec![n(-1.0), n(2.0)]);
+        approx(mirr(&[cash, s(n(-1.0)), s(n(0.0))]), 1.0, 1e-9);
+    }
+
+    #[test]
+    fn mirr_reinvest_rate_minus_one_special() {
+        // reinvest_rate = -1 branch: top = positives.last() = 2.
+        // finance_rate=0: NPV(0, [-1, 0]) = -1; bottom = -1 * 1 = -1.
+        // ratio = -2 → ratio < 0 → return #NUM!. Pins the
+        // ratio-negative guard along this branch.
+        let cash = r(vec![n(-1.0), n(2.0)]);
+        assert_eq!(
+            mirr(&[cash, s(n(0.0)), s(n(-1.0))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn mirr_zero_in_values_neutral() {
+        // Zero values neither positive nor negative — neutral. The
+        // sign-coverage guard treats them as neither stream.
+        let cash = r(vec![n(-100.0), n(0.0), n(0.0), n(150.0)]);
+        // top with rr=0.1: NPV(0.1, [0, 0, 0, 150]) = 150/1.1^4 ≈ 102.45;
+        //   top = -102.45 * 1.1^4 ≈ -150.
+        // bottom with fr=0.1: NPV(0.1, [-100, 0, 0, 0]) = -100/1.1 ≈ -90.91;
+        //   bottom = -90.91 * 1.1 = -100.
+        // ratio = 1.5; (n-1)=3; result = 1.5^(1/3) - 1 ≈ 0.14471.
+        approx(mirr(&[cash, s(n(0.10)), s(n(0.10))]), 0.14471, 1e-4);
     }
 }
