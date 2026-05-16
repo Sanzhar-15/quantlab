@@ -645,6 +645,11 @@ pub fn default_registry() -> FunctionRegistry {
     // (reinvestment) cash flows. RangeAwareFn; first arg must be range.
     r.register_range_aware("MIRR", financial_fns::mirr);
 
+    // Phase 4.10 polish (W5-177) — CORREL: Pearson correlation
+    // coefficient. RangeAwareFn; both args must be ranges of identical
+    // shape. First Wave 3 statistical function ported from IronCalc.
+    r.register_range_aware("CORREL", range_fns::correl);
+
     // Phase 4.10.G (W5-169) — modern lookups (range-aware).
     r.register_range_aware("XLOOKUP", range_fns::xlookup);
     r.register_range_aware("XMATCH", range_fns::xmatch);
@@ -745,9 +750,9 @@ mod tests {
         // ADDRESS = 1 scalar text formatter = 3 total; CLOSES Wave 2) +
         // Phase 4.10 polish (W5-173: NUMBERVALUE = 1 locale-explicit
         // text-to-number variant of VALUE; W5-174: MIRR = 1 closed-form
-        // Modified IRR — closes second + first Wave 2 deferred-list
-        // entries per handoff 2026-05-16).
-        assert_eq!(r.len(), 182);
+        // Modified IRR; W5-177: CORREL = 1 Pearson correlation
+        // coefficient — first Wave 3 statistical starter).
+        assert_eq!(r.len(), 183);
     }
 
     #[test]

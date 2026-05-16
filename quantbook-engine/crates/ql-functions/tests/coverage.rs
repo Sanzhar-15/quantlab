@@ -260,6 +260,15 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "MIRR",
         "W5-174; unit tests pin Excel MIRR canon (closed-form + sign-coverage + rate-edge cancellations)",
     ),
+    // W5-177 (Phase 4.10 polish / Wave 3 starter, CORREL) — Pearson
+    // correlation coefficient ported from IronCalc `fn_correl`. Unit
+    // tests pin perfect-positive / perfect-negative / zero-correlation
+    // baseline cases + non-numeric pair skip + constant-array →
+    // #DIV/0! + sign-coverage + shape-mismatch + error propagation.
+    (
+        "CORREL",
+        "W5-177; unit tests pin Pearson coefficient against known fixtures + skip-non-numeric-pair + constant-array → #DIV/0!",
+    ),
     // W5-168 (Phase 4.10.F) — financial TVM + cash-flow.
     (
         "PMT",

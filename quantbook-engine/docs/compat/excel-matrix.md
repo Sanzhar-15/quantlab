@@ -85,8 +85,9 @@ as partial, rows with `❌` are missing.
 | RANK.AVG | ✅ | 7 | 4.3 polish | W5-61: average rank for tied values. Tie of size k starting at base rank r returns r + (k-1)/2. Otherwise identical semantics to RANK / RANK.EQ. |
 | PERCENTILE / PERCENTILE.INC / PERCENTILE.EXC | ❌ | 0 | 4.10 | |
 | QUARTILE / QUARTILE.INC / QUARTILE.EXC | ❌ | 0 | 4.10 | |
-| CORREL / COVARIANCE.P / COVARIANCE.S | ❌ | 0 | 4.10 | |
-| PEARSON / RSQ / SLOPE / INTERCEPT | ❌ | 0 | 4.10 | |
+| CORREL | ✅ | 14 | 4.10 polish | W5-177: Pearson correlation coefficient ported from IronCalc `fn_correl`. Closed-form sum-of-cross-products: `r = (n·Σxy − Σx·Σy) / √((n·Σx² − (Σx)²) · (n·Σy² − (Σy)²))`. RangeAwareFn; both args MUST be ranges of identical shape. Excel canon: pairs with non-numeric on EITHER side are skipped (Text/Boolean/Blank all map to "drop the pair" — Booleans NOT coerced to 1/0 unlike SUM). Need ≥2 numeric pairs → otherwise `#DIV/0!`. Constant array on either side → `#DIV/0!`. Errors in either array propagate. **Shape-mismatch divergence**: Microsoft canon says `#N/A`; we follow IronCalc + the in-codebase paired-array convention (SUMX2MY2 / SUMX2PY2 / SUMXMY2) which uses `#VALUE!`. Consistent within the engine but diverges from Excel for this specific error code. |
+| COVARIANCE.P / COVARIANCE.S | ❌ | 0 | Wave 3 | Same paired-array shape; defer with correlation/regression batch. |
+| PEARSON / RSQ / SLOPE / INTERCEPT / STEYX | ❌ | 0 | Wave 3 | Bundle correlation + regression batch; IronCalc references are in `.references/ironcalc/base/src/functions/statistical/pearson.rs` and `correl.rs::fn_slope/fn_intercept/fn_steyx`. |
 | AVERAGEA / MAXA / MINA | ✅ | 10 | 4.10.C | W5-165: `*A`-variant aggregates. Per Excel canon: Number → as-is; Boolean → 1/0; Text → 0 (including ""); Blank → SKIPPED. Errors propagate. AVERAGEA: empty / all-blank → #DIV/0!. MAXA / MINA: empty / all-blank → 0. DIVERGES from base AVERAGE / MAX / MIN which skip text + bool entirely. |
 | FREQUENCY | ❌ | 0 | 4.10 | Array-result; needs 4.7 |
 | NORM.DIST / NORM.S.DIST / NORM.INV / NORM.S.INV | ❌ | 0 | 4.10 | |

@@ -446,6 +446,17 @@ fn e2e_textjoin_registered() {
 }
 
 #[test]
+fn e2e_correl_registered() {
+    // W5-177: CORREL is RangeAwareFn; range-arg construction can't go
+    // through the lightweight `bind(&ast, 0)` test helper without
+    // named-range / table-ref scaffolding. Smoke-check via registry
+    // dispatch (same pattern as XLOOKUP / XMATCH / TEXTJOIN / MIRR).
+    let registry = default_registry();
+    assert!(registry.lookup_range_aware("CORREL").is_some());
+    assert!(registry.lookup_range_aware("correl").is_some()); // case-insensitive
+}
+
+#[test]
 fn e2e_mirr_registered() {
     // W5-174: MIRR is RangeAwareFn; range-arg construction can't go
     // through the lightweight `bind(&ast, 0)` test helper without
