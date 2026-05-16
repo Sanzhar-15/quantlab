@@ -446,6 +446,25 @@ fn e2e_textjoin_registered() {
 }
 
 #[test]
+fn e2e_db_depreciation() {
+    // W5-182: DB is ScalarFn; evaluable through `bind(&ast, 0)`.
+    // Microsoft docs first-period example: rate=0.319; result =
+    // 1_000_000 * 0.319 * 7/12 = 186083.333...
+    let expected = 1_000_000.0
+        * (((1.0 - (100_000.0_f64 / 1_000_000.0).powf(1.0 / 6.0)) * 1000.0).round() / 1000.0)
+        * 7.0
+        / 12.0;
+    let result = eval_source_with_registry("DB(1000000, 100000, 6, 1, 7)", &[]);
+    match result {
+        Value::Number(got) => assert!(
+            (got - expected).abs() < 1e-6,
+            "expected ≈ {expected}, got {got}"
+        ),
+        other => panic!("expected Number, got {other:?}"),
+    }
+}
+
+#[test]
 fn e2e_ddb_depreciation() {
     // W5-181: DDB is ScalarFn; evaluable through `bind(&ast, 0)`.
     // Microsoft docs example: DDB(2400, 300, 10, 1) = 480.

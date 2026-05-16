@@ -617,6 +617,113 @@ pub(crate) fn compute_ddb(
     Ok(f64::max(value - f64::max(salvage, new_value), 0.0))
 }
 
+/// **W5-182 (Phase 4.10 polish / Wave 3 depreciation batch):**
+/// fixed-declining-balance depreciation per Microsoft + IronCalc.
+/// `DB(cost, salvage, life, period, [month=12])`.
+///
+/// Unlike DDB (closed-form), DB iterates period-by-period because
+/// each period's depreciation depends on the accumulated book-value
+/// from prior periods (not just `cost · (1 − rate)^k`). The rate
+/// itself uses an Excel-specific 3-decimal rounding:
+///
+///   `rate = round((1 − (salvage/cost)^(1/life)) · 1000) / 1000`
+///
+/// First period is partial (uses `month / 12` of the rate); last
+/// period (when `period = life + 1` with `month ≠ 12`) is the
+/// complementary partial year using `(12 − month) / 12`.
+///
+/// Validation per Microsoft + IronCalc:
+/// - `month == 12 && period > life` → `#NUM!` (no partial last period
+///   when `month = 12`, so `period = life + 1` only valid for
+///   `month < 12`).
+/// - `period > life + 1` → `#NUM!`.
+/// - `month <= 0` or `month > 12` → `#NUM!`.
+/// - `period <= 0` → `#NUM!`.
+/// - `cost < 0` → `#NUM!`.
+/// - `cost == 0` → return `0` directly (short-circuit before the
+///   `(salvage/cost)` division would NaN).
+pub(crate) fn compute_db(
+    cost: f64,
+    salvage: f64,
+    life: f64,
+    period: f64,
+    month: f64,
+) -> Result<f64, ErrorValue> {
+    if (month == 12.0 && period > life)
+        || period > life + 1.0
+        || month <= 0.0
+        || month > 12.0
+        || period <= 0.0
+        || cost < 0.0
+    {
+        return Err(ErrorValue::Num);
+    }
+    if cost == 0.0 {
+        return Ok(0.0);
+    }
+    // Excel's 3-decimal rate rounding — peculiar but canonical.
+    // Without the round, the cumulative-through-life would equal
+    // exactly `cost − salvage`; the rounding deliberately introduces
+    // a small per-period error that the last-partial-period absorbs.
+    let rate = ((1.0 - (salvage / cost).powf(1.0 / life)) * 1000.0).round() / 1000.0;
+
+    // First-period depreciation (partial: month/12 fraction).
+    let mut accumulated = cost * rate * month / 12.0;
+    let period_int = period.floor() as i32;
+    let life_int = life.floor() as i32;
+
+    if period_int == 1 {
+        return Ok(accumulated);
+    }
+
+    // Iterate (period - 2) times so `accumulated` ends up as the
+    // cumulative depreciation through period (k − 1).
+    for _ in 0..(period_int - 2) {
+        accumulated += (cost - accumulated) * rate;
+    }
+
+    if period_int == life_int + 1 {
+        // Last partial period — complementary (12 − month)/12 fraction.
+        return Ok((cost - accumulated) * rate * (12.0 - month) / 12.0);
+    }
+    Ok(rate * (cost - accumulated))
+}
+
+/// **W5-182:** `DB(cost, salvage, life, period, [month=12])` —
+/// fixed-declining-balance depreciation. Four required args;
+/// `month` optional (default 12). Truncates `month` to integer
+/// per Microsoft + IronCalc.
+pub fn db(args: &[Value]) -> Value {
+    if !(4..=5).contains(&args.len()) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let cost = match arg_num(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let salvage = match arg_num(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let life = match arg_num(&args[2]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let period = match arg_num(&args[3]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let month = if args.len() == 5 {
+        match arg_num(&args[4]) {
+            Ok(n) => n.trunc(),
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        12.0
+    };
+    finish(compute_db(cost, salvage, life, period, month))
+}
+
 /// **W5-181:** `DDB(cost, salvage, life, period, [factor=2])`.
 /// Four required args; `factor` optional (default 2 = double-
 /// declining-balance; pass 1 for single-declining-balance, etc).
@@ -1888,6 +1995,197 @@ mod tests {
             ddb(&[
                 n(100.0),
                 n(10.0),
+                n(5.0),
+                n(1.0),
+                Value::Error(ErrorValue::Name)
+            ]),
+            Value::Error(ErrorValue::Name)
+        );
+    }
+
+    // --- DB (W5-182) ---
+    //
+    // Microsoft canonical fixture: DB(1_000_000, 100_000, 6, k, 7).
+    // The published rate is round((1-(0.1)^(1/6))*1000)/1000 = 0.319.
+    // Each period's expected value is computed against the canonical
+    // formula in-test rather than hard-coded so the tolerance is
+    // tied to the formula's intermediate float behavior, not to a
+    // rounded Microsoft display string.
+
+    fn db_microsoft_rate() -> f64 {
+        ((1.0 - (100_000.0_f64 / 1_000_000.0).powf(1.0 / 6.0)) * 1000.0).round() / 1000.0
+    }
+
+    #[test]
+    fn db_microsoft_rate_is_canonical() {
+        // Sanity-check the published 0.319 rate so any later float
+        // drift is caught here, not silently downstream.
+        assert!((db_microsoft_rate() - 0.319).abs() < 1e-12);
+    }
+
+    #[test]
+    fn db_microsoft_first_period_partial() {
+        // DB(1M, 100k, 6, 1, 7): first period uses month/12 fraction.
+        // = 1_000_000 * 0.319 * 7/12 = 186_083.333...
+        let expected = 1_000_000.0 * db_microsoft_rate() * 7.0 / 12.0;
+        approx(
+            db(&[n(1_000_000.0), n(100_000.0), n(6.0), n(1.0), n(7.0)]),
+            expected,
+            1e-6,
+        );
+    }
+
+    #[test]
+    fn db_microsoft_second_period() {
+        // Period 2: rate * (cost - first_period_dep).
+        let rate = db_microsoft_rate();
+        let first = 1_000_000.0 * rate * 7.0 / 12.0;
+        let expected = rate * (1_000_000.0 - first);
+        approx(
+            db(&[n(1_000_000.0), n(100_000.0), n(6.0), n(2.0), n(7.0)]),
+            expected,
+            1e-6,
+        );
+    }
+
+    #[test]
+    fn db_microsoft_last_partial_period() {
+        // Period 7 = life + 1: complementary (12-month)/12 fraction.
+        // Verify by computing the iterative cumulative through period 6,
+        // then applying the last-partial formula.
+        let rate = db_microsoft_rate();
+        let mut acc = 1_000_000.0 * rate * 7.0 / 12.0; // period 1
+        for _ in 0..5 {
+            // periods 2..6 (5 iterations: loop runs period-2 = 7-2 = 5 times)
+            acc += (1_000_000.0 - acc) * rate;
+        }
+        let expected = (1_000_000.0 - acc) * rate * (12.0 - 7.0) / 12.0;
+        approx(
+            db(&[n(1_000_000.0), n(100_000.0), n(6.0), n(7.0), n(7.0)]),
+            expected,
+            1e-6,
+        );
+    }
+
+    #[test]
+    fn db_default_month_is_12() {
+        // Omitting `month` uses 12 (full first year, no last-partial).
+        // DB(1M, 100k, 6, 1) with implicit month=12.
+        let expected = 1_000_000.0 * db_microsoft_rate(); // month/12 = 1
+        approx(
+            db(&[n(1_000_000.0), n(100_000.0), n(6.0), n(1.0)]),
+            expected,
+            1e-6,
+        );
+    }
+
+    #[test]
+    fn db_full_year_period_equals_life_succeeds() {
+        // month=12, period=life is valid (period > life is rejected;
+        // period == life passes).
+        let result = db(&[n(1_000_000.0), n(100_000.0), n(6.0), n(6.0)]);
+        // Verify it produced a Number (not an error).
+        matches!(result, Value::Number(_))
+            .then_some(())
+            .expect("expected Number");
+    }
+
+    #[test]
+    fn db_month_12_period_exceeds_life_is_num() {
+        // month=12 + period > life rejects (no last-partial branch
+        // available when month=12).
+        assert_eq!(
+            db(&[n(1_000_000.0), n(100_000.0), n(6.0), n(7.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn db_period_exceeds_life_plus_one_is_num() {
+        // Even with month<12, period > life+1 rejects.
+        assert_eq!(
+            db(&[n(1_000_000.0), n(100_000.0), n(6.0), n(8.0), n(7.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn db_zero_month_is_num() {
+        assert_eq!(
+            db(&[n(1000.0), n(100.0), n(5.0), n(1.0), n(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn db_month_exceeds_12_is_num() {
+        assert_eq!(
+            db(&[n(1000.0), n(100.0), n(5.0), n(1.0), n(13.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn db_zero_period_is_num() {
+        assert_eq!(
+            db(&[n(1000.0), n(100.0), n(5.0), n(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn db_negative_period_is_num() {
+        assert_eq!(
+            db(&[n(1000.0), n(100.0), n(5.0), n(-1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn db_negative_cost_is_num() {
+        assert_eq!(
+            db(&[n(-1000.0), n(100.0), n(5.0), n(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn db_zero_cost_returns_zero() {
+        // Short-circuit to avoid (salvage/0) NaN. Documented in canon.
+        approx(db(&[n(0.0), n(0.0), n(5.0), n(1.0)]), 0.0, 1e-12);
+    }
+
+    #[test]
+    fn db_month_fractional_truncates() {
+        // month=7.7 → trunc to 7; should equal DB with month=7.
+        let r1 = db(&[n(1_000_000.0), n(100_000.0), n(6.0), n(1.0), n(7.7)]);
+        let r2 = db(&[n(1_000_000.0), n(100_000.0), n(6.0), n(1.0), n(7.0)]);
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn db_wrong_arity() {
+        assert_eq!(db(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            db(&[n(1000.0), n(100.0), n(5.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            db(&[n(1000.0), n(100.0), n(5.0), n(1.0), n(12.0), n(0.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn db_error_in_arg_propagates() {
+        assert_eq!(
+            db(&[Value::Error(ErrorValue::Ref), n(100.0), n(5.0), n(1.0)]),
+            Value::Error(ErrorValue::Ref)
+        );
+        assert_eq!(
+            db(&[
+                n(1000.0),
+                n(100.0),
                 n(5.0),
                 n(1.0),
                 Value::Error(ErrorValue::Name)

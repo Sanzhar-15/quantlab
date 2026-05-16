@@ -439,8 +439,15 @@ pub fn default_registry() -> FunctionRegistry {
     // Phase 4.10 polish (W5-181) — DDB: double-declining-balance.
     // Closed-form (no period iteration despite the name); optional
     // `factor` arg (default 2). Salvage floor stops depreciation
-    // before over-depreciating. DB / VDB still deferred.
+    // before over-depreciating.
     r.register("DDB", financial_fns::ddb);
+
+    // Phase 4.10 polish (W5-182) — DB: fixed-declining-balance.
+    // Period-iterating (each period depends on accumulated book
+    // value); Excel-specific 3-decimal rate rounding; optional
+    // `month` arg (default 12) for partial first / last periods.
+    // VDB still deferred.
+    r.register("DB", financial_fns::db);
 
     // Phase 4.10.G (W5-169) — ADDRESS (scalar text formatter).
     r.register("ADDRESS", scalar_fns::address);
@@ -781,8 +788,9 @@ mod tests {
         // regression; W5-179: PEARSON + RSQ + STEYX = 3 — CLOSES the
         // Wave 3 regression batch; W5-180: SLN + SYD = 2 — Wave 3
         // depreciation batch starter; W5-181: DDB = 1 — closed-form
-        // double-declining-balance).
-        assert_eq!(r.len(), 191);
+        // double-declining-balance; W5-182: DB = 1 — period-iterating
+        // fixed-declining-balance).
+        assert_eq!(r.len(), 192);
     }
 
     #[test]

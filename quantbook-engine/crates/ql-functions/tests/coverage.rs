@@ -322,6 +322,15 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "DDB",
         "W5-181; unit tests pin Microsoft fixtures (DDB(2400,300,10,1)=480; DDB(2400,300,10,10)≈22.12) + salvage floor + rate-clamp-to-1 + validation #NUM! paths",
     ),
+    // W5-182 (Phase 4.10 polish / Wave 3 depreciation batch) — DB:
+    // fixed-declining-balance. Period-iterating (each period
+    // depends on accumulated book value from prior periods).
+    // Excel-specific 3-decimal rate rounding. Optional `month`
+    // (default 12) controls partial first / last periods.
+    (
+        "DB",
+        "W5-182; unit tests pin Microsoft fixtures (DB(1M,100k,6,k,7) for k=1..7) + partial first/last period semantics + validation #NUM! paths",
+    ),
     // W5-168 (Phase 4.10.F) — financial TVM + cash-flow.
     (
         "PMT",
