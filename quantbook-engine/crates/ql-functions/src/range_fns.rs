@@ -483,9 +483,9 @@ fn decode_xlookup_match_mode(arg: Option<&FnArg>) -> Result<i32, ErrorValue> {
 
 /// Decode the `search_mode` arg of XLOOKUP / XMATCH per Excel canon:
 /// 1=first→last (default), -1=last→first, 2=binary ascending,
-/// -2=binary descending. V1 implementation uses linear scan in all
-/// modes — the binary modes give the same RESULT but lose the perf
-/// advantage; document the divergence.
+/// -2=binary descending. Linear scan handles ±1 modes; W5-176
+/// `xlookup_find_index_binary` handles ±2 with real binary search
+/// (matches Excel: unsorted input → undefined / `#N/A`).
 fn decode_xlookup_search_mode(arg: Option<&FnArg>) -> Result<i32, ErrorValue> {
     match arg {
         None => Ok(1),
@@ -519,6 +519,90 @@ fn xlookup_wildcard_match(pattern: &Value, cell: &Value) -> bool {
     crate::wildcard::WildcardPattern::compile(pat).matches(text)
 }
 
+/// **W5-176 (Phase 4.10 polish):** binary search over a sorted `hay`.
+/// `descending` selects ascending (`false`, `search_mode=2`) vs
+/// descending (`true`, `search_mode=-2`) sort. Per Excel canon: the
+/// caller is responsible for the sort invariant — if `hay` is unsorted,
+/// results are undefined (typically `#N/A` because the bisection
+/// branches into a region that doesn't contain the needle). This
+/// matches Excel's own behavior, which does NOT validate sort order.
+///
+/// `match_mode` 2 (wildcard) is rejected upstream and never reaches
+/// here; this function handles `0`, `-1`, `1`.
+fn xlookup_find_index_binary(
+    needle: &Value,
+    hay: &[Value],
+    match_mode: i32,
+    descending: bool,
+) -> Option<usize> {
+    use std::cmp::Ordering;
+    if hay.is_empty() {
+        return None;
+    }
+    // Lower-bound binary search: find the insertion point where
+    // `needle` would maintain sort order. On exact equality, return
+    // immediately (we don't need to find the FIRST equal-index because
+    // duplicates are caller-error per Excel's binary contract).
+    let mut lo = 0usize;
+    let mut hi = hay.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let ord = match lookup_cmp(&hay[mid], needle) {
+            Some(o) => o,
+            None => {
+                // Incomparable cell (type mismatch or Error in hay).
+                // The sort invariant is broken — fall through to None.
+                // Matches Excel: binary lookup over heterogeneously-
+                // typed data returns nothing rather than guessing.
+                return None;
+            }
+        };
+        match (descending, ord) {
+            (_, Ordering::Equal) => return Some(mid),
+            (false, Ordering::Less) | (true, Ordering::Greater) => lo = mid + 1,
+            (false, Ordering::Greater) | (true, Ordering::Less) => hi = mid,
+        }
+    }
+    // No exact match. `lo` is the insertion point. Map to the
+    // requested approximation per match_mode + sort direction.
+    match match_mode {
+        0 => None,
+        1 => {
+            // Caller wants the SMALLEST cell ≥ needle (in absolute terms).
+            // Ascending: insertion point `lo` is the first cell > needle.
+            // Descending: `lo - 1` is the last cell > needle (smallest > needle).
+            if descending {
+                if lo > 0 {
+                    Some(lo - 1)
+                } else {
+                    None
+                }
+            } else if lo < hay.len() {
+                Some(lo)
+            } else {
+                None
+            }
+        }
+        -1 => {
+            // Caller wants the LARGEST cell ≤ needle (in absolute terms).
+            // Ascending: `lo - 1` is the last cell < needle.
+            // Descending: insertion point `lo` is the first cell < needle.
+            if descending {
+                if lo < hay.len() {
+                    Some(lo)
+                } else {
+                    None
+                }
+            } else if lo > 0 {
+                Some(lo - 1)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Find the XLOOKUP / XMATCH index per (match_mode, search_mode). Returns
 /// the 0-based index into `hay`, or `None` if no match.
 fn xlookup_find_index(
@@ -528,6 +612,13 @@ fn xlookup_find_index(
     search_mode: i32,
 ) -> Option<usize> {
     use std::cmp::Ordering;
+    // **W5-176:** real binary search for search_mode ±2. Match_mode 2
+    // (wildcard) + binary modes are rejected upstream as #VALUE!, so
+    // any (±2) we see here goes through the binary path with
+    // match_mode in {0, -1, 1}.
+    if search_mode == 2 || search_mode == -2 {
+        return xlookup_find_index_binary(needle, hay, match_mode, search_mode == -2);
+    }
     // Direction-aware iteration helper.
     let reverse = search_mode < 0;
     let indices: Box<dyn Iterator<Item = usize>> = if reverse {
@@ -593,9 +684,11 @@ fn xlookup_find_index(
 /// **Search modes**:
 /// - `1` first→last (default).
 /// - `-1` last→first.
-/// - `2` binary ascending — V1 uses linear scan (same result, no
-///   perf advantage). Caller must pre-sort.
-/// - `-2` binary descending — same V1 caveat.
+/// - `2` binary ascending. Caller must pre-sort ascending; W5-176
+///   replaced the V1 linear scan with real binary search. Unsorted
+///   input yields undefined results (typically `#N/A`) — matches
+///   Excel canon (Excel itself does not validate sort order).
+/// - `-2` binary descending — symmetric requirement.
 ///
 /// `if_not_found`: returned on no match. If omitted, `#N/A`.
 pub fn xlookup(args: &[FnArg]) -> Value {
@@ -3263,6 +3356,301 @@ mod tests {
             ]),
             Value::Error(ErrorValue::Value)
         );
+    }
+
+    // --- W5-176: real binary search ---
+
+    #[test]
+    fn xlookup_binary_asc_exact_match() {
+        // Sorted ascending [1, 3, 5, 7, 9, 11], needle 7 → index 3 → ret[3].
+        let hay = r(vec![n(1.0), n(3.0), n(5.0), n(7.0), n(9.0), n(11.0)]);
+        let ret = r(vec![t("a"), t("b"), t("c"), t("d"), t("e"), t("f")]);
+        assert_eq!(
+            xlookup(&[s(n(7.0)), hay, ret, s(Value::Blank), s(n(0.0)), s(n(2.0)),]),
+            t("d")
+        );
+    }
+
+    #[test]
+    fn xlookup_binary_asc_no_match_returns_na() {
+        // Default if_not_found: omit args[3] entirely so positional
+        // match_mode/search_mode would shift. Instead pass an explicit
+        // #N/A as if_not_found — the function's no-match branch returns
+        // that arg verbatim, so we get NA + verify the binary miss.
+        let hay = r(vec![n(1.0), n(3.0), n(5.0), n(7.0)]);
+        let ret = r(vec![t("a"), t("b"), t("c"), t("d")]);
+        assert_eq!(
+            xlookup(&[
+                s(n(4.0)),
+                hay,
+                ret,
+                s(Value::Error(ErrorValue::NA)),
+                s(n(0.0)),
+                s(n(2.0)),
+            ]),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn xlookup_binary_asc_next_smaller() {
+        // match_mode=-1: largest cell ≤ needle. needle=4 in [1,3,5,7] → 3 (ret[1]).
+        let hay = r(vec![n(1.0), n(3.0), n(5.0), n(7.0)]);
+        let ret = r(vec![t("a"), t("b"), t("c"), t("d")]);
+        assert_eq!(
+            xlookup(&[
+                s(n(4.0)),
+                hay.clone(),
+                ret.clone(),
+                s(Value::Error(ErrorValue::NA)),
+                s(n(-1.0)),
+                s(n(2.0)),
+            ]),
+            t("b")
+        );
+        // needle BEFORE all: no smaller cell → #N/A.
+        assert_eq!(
+            xlookup(&[
+                s(n(0.0)),
+                hay.clone(),
+                ret.clone(),
+                s(Value::Error(ErrorValue::NA)),
+                s(n(-1.0)),
+                s(n(2.0)),
+            ]),
+            Value::Error(ErrorValue::NA)
+        );
+        // needle AFTER all: largest cell is last index.
+        assert_eq!(
+            xlookup(&[
+                s(n(99.0)),
+                hay,
+                ret,
+                s(Value::Error(ErrorValue::NA)),
+                s(n(-1.0)),
+                s(n(2.0)),
+            ]),
+            t("d")
+        );
+    }
+
+    #[test]
+    fn xlookup_binary_asc_next_larger() {
+        // match_mode=1: smallest cell ≥ needle. needle=4 in [1,3,5,7] → 5 (ret[2]).
+        let hay = r(vec![n(1.0), n(3.0), n(5.0), n(7.0)]);
+        let ret = r(vec![t("a"), t("b"), t("c"), t("d")]);
+        assert_eq!(
+            xlookup(&[
+                s(n(4.0)),
+                hay.clone(),
+                ret.clone(),
+                s(Value::Error(ErrorValue::NA)),
+                s(n(1.0)),
+                s(n(2.0)),
+            ]),
+            t("c")
+        );
+        // needle BEFORE all: smallest cell is first index.
+        assert_eq!(
+            xlookup(&[
+                s(n(0.0)),
+                hay.clone(),
+                ret.clone(),
+                s(Value::Error(ErrorValue::NA)),
+                s(n(1.0)),
+                s(n(2.0)),
+            ]),
+            t("a")
+        );
+        // needle AFTER all: no larger cell → #N/A.
+        assert_eq!(
+            xlookup(&[
+                s(n(99.0)),
+                hay,
+                ret,
+                s(Value::Error(ErrorValue::NA)),
+                s(n(1.0)),
+                s(n(2.0)),
+            ]),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn xlookup_binary_desc_exact_match() {
+        // Sorted descending [11, 9, 7, 5, 3, 1], needle 7 → index 2 → ret[2].
+        let hay = r(vec![n(11.0), n(9.0), n(7.0), n(5.0), n(3.0), n(1.0)]);
+        let ret = r(vec![t("a"), t("b"), t("c"), t("d"), t("e"), t("f")]);
+        assert_eq!(
+            xlookup(&[s(n(7.0)), hay, ret, s(Value::Blank), s(n(0.0)), s(n(-2.0)),]),
+            t("c")
+        );
+    }
+
+    #[test]
+    fn xlookup_binary_desc_next_smaller() {
+        // match_mode=-1 in descending list [10, 8, 5, 3, 1], needle 6
+        // → largest ≤ 6 = 5 at index 2.
+        let hay = r(vec![n(10.0), n(8.0), n(5.0), n(3.0), n(1.0)]);
+        let ret = r(vec![t("a"), t("b"), t("c"), t("d"), t("e")]);
+        assert_eq!(
+            xlookup(&[
+                s(n(6.0)),
+                hay,
+                ret,
+                s(Value::Error(ErrorValue::NA)),
+                s(n(-1.0)),
+                s(n(-2.0)),
+            ]),
+            t("c")
+        );
+    }
+
+    #[test]
+    fn xlookup_binary_desc_next_larger() {
+        // match_mode=1 in descending list [10, 8, 5, 3, 1], needle 6
+        // → smallest ≥ 6 = 8 at index 1.
+        let hay = r(vec![n(10.0), n(8.0), n(5.0), n(3.0), n(1.0)]);
+        let ret = r(vec![t("a"), t("b"), t("c"), t("d"), t("e")]);
+        assert_eq!(
+            xlookup(&[
+                s(n(6.0)),
+                hay,
+                ret,
+                s(Value::Error(ErrorValue::NA)),
+                s(n(1.0)),
+                s(n(-2.0)),
+            ]),
+            t("b")
+        );
+    }
+
+    #[test]
+    fn xlookup_binary_desc_needle_at_extremes() {
+        let hay = r(vec![n(10.0), n(8.0), n(5.0), n(3.0), n(1.0)]);
+        let ret = r(vec![t("a"), t("b"), t("c"), t("d"), t("e")]);
+        // needle > max in descending → only smaller candidates exist.
+        // match_mode=-1: largest ≤ 99 = 10 at index 0.
+        assert_eq!(
+            xlookup(&[
+                s(n(99.0)),
+                hay.clone(),
+                ret.clone(),
+                s(Value::Error(ErrorValue::NA)),
+                s(n(-1.0)),
+                s(n(-2.0)),
+            ]),
+            t("a")
+        );
+        // match_mode=1: no larger cell → #N/A.
+        assert_eq!(
+            xlookup(&[
+                s(n(99.0)),
+                hay.clone(),
+                ret.clone(),
+                s(Value::Error(ErrorValue::NA)),
+                s(n(1.0)),
+                s(n(-2.0)),
+            ]),
+            Value::Error(ErrorValue::NA)
+        );
+        // needle < min in descending → only larger candidates exist.
+        // match_mode=1: smallest ≥ 0 = 1 at index 4.
+        assert_eq!(
+            xlookup(&[
+                s(n(0.0)),
+                hay.clone(),
+                ret.clone(),
+                s(Value::Error(ErrorValue::NA)),
+                s(n(1.0)),
+                s(n(-2.0)),
+            ]),
+            t("e")
+        );
+        // match_mode=-1: no smaller cell → #N/A.
+        assert_eq!(
+            xlookup(&[
+                s(n(0.0)),
+                hay,
+                ret,
+                s(Value::Error(ErrorValue::NA)),
+                s(n(-1.0)),
+                s(n(-2.0)),
+            ]),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn xlookup_binary_unsorted_input_diverges_from_linear() {
+        // Unsorted hay [5, 2, 8, 1, 9]. Linear scan (mode 1) would
+        // find needle=8 at index 2. Binary search bisects under the
+        // assumption that data is sorted — it lands somewhere in the
+        // wrong region and returns #N/A. This matches Excel canon:
+        // unsorted input to binary mode → undefined / #N/A.
+        let hay = r(vec![n(5.0), n(2.0), n(8.0), n(1.0), n(9.0)]);
+        let ret = r(vec![t("a"), t("b"), t("c"), t("d"), t("e")]);
+        // Sanity check: linear scan finds it.
+        assert_eq!(
+            xlookup(&[
+                s(n(8.0)),
+                hay.clone(),
+                ret.clone(),
+                s(Value::Blank),
+                s(n(0.0)),
+                s(n(1.0)),
+            ]),
+            t("c")
+        );
+        // Binary search misses on the same unsorted data → #N/A.
+        // (Bisection path: mid=2 hay[2]=8 → equal → returns index 2,
+        // so this PARTICULAR needle happens to be discoverable. Use
+        // a different needle that bisection misses.)
+        // needle=2 actually exists at index 1 but binary bisects:
+        // mid=2 (hay[2]=8 > 2), hi=2; mid=1 (hay[1]=2 == 2) → found.
+        // To get a MISS we need a needle whose binary path lands wrong.
+        // needle=1 exists at index 3 but binary: mid=2 (8>1) hi=2;
+        // mid=1 (2>1) hi=1; mid=0 (5>1) hi=0; lo=hi=0 → not found.
+        assert_eq!(
+            xlookup(&[
+                s(n(1.0)),
+                hay,
+                ret,
+                s(Value::Error(ErrorValue::NA)),
+                s(n(0.0)),
+                s(n(2.0)),
+            ]),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn xlookup_binary_empty_hay_is_na() {
+        // V1: lookup_array empty isn't possible through normal range
+        // construction, but the binary helper still handles it
+        // defensively. Skipped through the public API since `r(vec![])`
+        // would have rows=1, cols=0 which most ranges treat as 0-element.
+        // Instead test via the helper directly.
+        let result = xlookup_find_index_binary(&n(5.0), &[], 0, false);
+        assert_eq!(result, None);
+    }
+
+    // --- XMATCH binary search (W5-176) ---
+
+    #[test]
+    fn xmatch_binary_asc_exact() {
+        let hay = r(vec![n(1.0), n(3.0), n(5.0), n(7.0)]);
+        // search_mode arg position is 3 for xmatch (no return_array).
+        assert_eq!(
+            xmatch(&[s(n(5.0)), hay, s(n(0.0)), s(n(2.0))]),
+            n(3.0) // 1-based position
+        );
+    }
+
+    #[test]
+    fn xmatch_binary_desc_exact() {
+        let hay = r(vec![n(10.0), n(8.0), n(5.0), n(3.0), n(1.0)]);
+        assert_eq!(xmatch(&[s(n(5.0)), hay, s(n(0.0)), s(n(-2.0))]), n(3.0));
     }
 
     #[test]

@@ -300,11 +300,11 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
     // W5-169 (Phase 4.10.G) — modern lookups + ADDRESS.
     (
         "XLOOKUP",
-        "W5-169; unit tests pin 4 match modes + 2 search modes + if_not_found + 1D shape requirement",
+        "W5-169 + W5-176; unit tests pin 4 match modes + 4 search modes (linear ±1 + real binary ±2) + ascending/descending bisection + unsorted-input divergence + if_not_found + 1D shape requirement",
     ),
     (
         "XMATCH",
-        "W5-169; unit tests pin position return + match/search modes",
+        "W5-169 + W5-176; unit tests pin position return + match/search modes incl. binary ±2 (shared `xlookup_find_index` dispatch)",
     ),
     (
         "ADDRESS",
