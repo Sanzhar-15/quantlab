@@ -446,6 +446,17 @@ fn e2e_textjoin_registered() {
 }
 
 #[test]
+fn e2e_ddb_depreciation() {
+    // W5-181: DDB is ScalarFn; evaluable through `bind(&ast, 0)`.
+    // Microsoft docs example: DDB(2400, 300, 10, 1) = 480.
+    let result = eval_source_with_registry("DDB(2400, 300, 10, 1)", &[]);
+    assert_eq!(result, Value::Number(480.0));
+    // With explicit factor=1 (single-declining): DDB(1000, 0, 10, 1, 1) = 100.
+    let result = eval_source_with_registry("DDB(1000, 0, 10, 1, 1)", &[]);
+    assert_eq!(result, Value::Number(100.0));
+}
+
+#[test]
 fn e2e_sln_syd_depreciation() {
     // W5-180: SLN + SYD are ScalarFns; we can evaluate them directly
     // through the lightweight `bind(&ast, 0)` test helper (no range

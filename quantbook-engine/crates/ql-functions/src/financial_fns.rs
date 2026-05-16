@@ -568,6 +568,89 @@ pub fn syd(args: &[Value]) -> Value {
     finish(compute_syd(cost, salvage, life, per))
 }
 
+/// **W5-181 (Phase 4.10 polish / Wave 3 depreciation batch):**
+/// double-declining-balance depreciation per Microsoft + IronCalc.
+/// `DDB(cost, salvage, life, period, [factor=2])` — accelerated
+/// depreciation where the rate is `factor / life` (capped at 1.0).
+///
+/// Closed-form despite the name (no period iteration):
+/// - `rate = min(factor / life, 1)`.
+/// - If `rate == 1`: value at start of `period` is `cost` when
+///   `period == 1`, otherwise `0`.
+/// - Else: `value = cost · (1 − rate)^(period − 1)`.
+/// - `new_value = cost · (1 − rate)^period`.
+/// - `result = max(value − max(salvage, new_value), 0)`.
+///   The `max(salvage, new_value)` floor ensures depreciation stops
+///   once the asset reaches salvage (Excel canon — diverges from
+///   pure DDB which can over-depreciate).
+///
+/// Per IronCalc + Microsoft: `period > life`, `cost < 0`,
+/// `salvage < 0`, `period <= 0`, or `factor <= 0` → `#NUM!`.
+/// **Engine convention note:** IronCalc uses `get_number_no_bools`
+/// for the `factor` arg only (rejects Boolean); our `arg_num`
+/// allows Boolean coercion uniformly across all args. Deliberate
+/// divergence for consistency with the rest of the financial family.
+pub(crate) fn compute_ddb(
+    cost: f64,
+    salvage: f64,
+    life: f64,
+    period: f64,
+    factor: f64,
+) -> Result<f64, ErrorValue> {
+    if period > life || cost < 0.0 || salvage < 0.0 || period <= 0.0 || factor <= 0.0 {
+        return Err(ErrorValue::Num);
+    }
+    let mut rate = factor / life;
+    if rate > 1.0 {
+        rate = 1.0;
+    }
+    let value = if rate == 1.0 {
+        if period == 1.0 {
+            cost
+        } else {
+            0.0
+        }
+    } else {
+        cost * (1.0 - rate).powf(period - 1.0)
+    };
+    let new_value = cost * (1.0 - rate).powf(period);
+    Ok(f64::max(value - f64::max(salvage, new_value), 0.0))
+}
+
+/// **W5-181:** `DDB(cost, salvage, life, period, [factor=2])`.
+/// Four required args; `factor` optional (default 2 = double-
+/// declining-balance; pass 1 for single-declining-balance, etc).
+pub fn ddb(args: &[Value]) -> Value {
+    if !(4..=5).contains(&args.len()) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let cost = match arg_num(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let salvage = match arg_num(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let life = match arg_num(&args[2]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let period = match arg_num(&args[3]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let factor = if args.len() == 5 {
+        match arg_num(&args[4]) {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        2.0
+    };
+    finish(compute_ddb(cost, salvage, life, period, factor))
+}
+
 /// `PMT(rate, nper, pv, [fv=0], [type=0])`
 pub fn pmt(args: &[Value]) -> Value {
     if !(3..=5).contains(&args.len()) {
@@ -1636,6 +1719,180 @@ mod tests {
             (total - (cost - salvage)).abs() < 1e-6,
             "expected {}, got {total}",
             cost - salvage
+        );
+    }
+
+    // --- DDB (W5-181) ---
+
+    #[test]
+    fn ddb_microsoft_example_first_year() {
+        // Microsoft docs: DDB(2400, 300, 10, 1) = 480 (default factor=2).
+        // rate=0.2; value=2400; new_value=1920; result=max(2400-max(300,1920),0)=480.
+        approx(ddb(&[n(2400.0), n(300.0), n(10.0), n(1.0)]), 480.0, 1e-9);
+    }
+
+    #[test]
+    fn ddb_microsoft_example_final_year() {
+        // DDB(2400, 300, 10, 10) ≈ 22.12.
+        // value = 2400·0.8^9; new_value = 2400·0.8^10; new_value<salvage=300
+        // so floor kicks in: result = value − 300.
+        let expected = 2400.0 * 0.8_f64.powi(9) - 300.0;
+        approx(
+            ddb(&[n(2400.0), n(300.0), n(10.0), n(10.0)]),
+            expected,
+            1e-9,
+        );
+    }
+
+    #[test]
+    fn ddb_life_in_months() {
+        // DDB(2400, 300, 120, 1, 2) = 40 (Microsoft docs example).
+        // rate=2/120; value=2400; new_value=2400·(118/120)=2360;
+        // result=max(2400-max(300,2360),0)=40.
+        approx(
+            ddb(&[n(2400.0), n(300.0), n(120.0), n(1.0), n(2.0)]),
+            40.0,
+            1e-9,
+        );
+    }
+
+    #[test]
+    fn ddb_explicit_factor_one_single_declining() {
+        // factor=1: rate=1/life=0.1. DDB(1000, 0, 10, 1, 1):
+        // value=1000; new_value=900; result=max(1000-max(0,900),0)=100.
+        approx(
+            ddb(&[n(1000.0), n(0.0), n(10.0), n(1.0), n(1.0)]),
+            100.0,
+            1e-9,
+        );
+    }
+
+    #[test]
+    fn ddb_rate_clamps_to_one_when_factor_exceeds_life() {
+        // factor=5, life=1 → rate=5/1=5, clamped to 1.
+        // period=1, rate==1: value = cost = 1000; new_value = 0;
+        // result = max(1000 - max(0, 0), 0) = 1000.
+        approx(
+            ddb(&[n(1000.0), n(0.0), n(1.0), n(1.0), n(5.0)]),
+            1000.0,
+            1e-9,
+        );
+    }
+
+    #[test]
+    fn ddb_rate_one_zero_after_first_period() {
+        // factor=5, life=1, rate clamped to 1. period=1 returns cost
+        // (covered above); the rate==1 branch says period>1 returns 0
+        // — but with life=1, period>life=1 already rejects as #NUM!.
+        // Construct a case where the rate-clamp branch is exercised
+        // without tripping period>life: factor=10, life=2 →
+        // rate=10/2=5, clamped to 1. period=2 (==life, valid):
+        // value = 0 (rate==1, period!=1 branch); new_value = 0.
+        // result = max(0 - max(0, 0), 0) = 0.
+        approx(
+            ddb(&[n(1000.0), n(0.0), n(2.0), n(2.0), n(10.0)]),
+            0.0,
+            1e-9,
+        );
+    }
+
+    #[test]
+    fn ddb_salvage_floor_clamps_to_zero() {
+        // High salvage immediately floors out:
+        // DDB(1000, 999, 10, 2, 2): rate=0.2; value=1000·0.8=800;
+        // new_value=1000·0.64=640; max(salvage=999, new_value=640)=999;
+        // result = max(800 - 999, 0) = 0.
+        approx(
+            ddb(&[n(1000.0), n(999.0), n(10.0), n(2.0), n(2.0)]),
+            0.0,
+            1e-9,
+        );
+    }
+
+    #[test]
+    fn ddb_period_exceeds_life_is_num() {
+        assert_eq!(
+            ddb(&[n(100.0), n(10.0), n(5.0), n(6.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn ddb_zero_period_is_num() {
+        assert_eq!(
+            ddb(&[n(100.0), n(10.0), n(5.0), n(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn ddb_negative_period_is_num() {
+        assert_eq!(
+            ddb(&[n(100.0), n(10.0), n(5.0), n(-1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn ddb_negative_cost_is_num() {
+        assert_eq!(
+            ddb(&[n(-100.0), n(10.0), n(5.0), n(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn ddb_negative_salvage_is_num() {
+        assert_eq!(
+            ddb(&[n(100.0), n(-10.0), n(5.0), n(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn ddb_zero_factor_is_num() {
+        assert_eq!(
+            ddb(&[n(100.0), n(10.0), n(5.0), n(1.0), n(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn ddb_negative_factor_is_num() {
+        assert_eq!(
+            ddb(&[n(100.0), n(10.0), n(5.0), n(1.0), n(-1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn ddb_wrong_arity() {
+        assert_eq!(ddb(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            ddb(&[n(100.0), n(10.0), n(5.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            ddb(&[n(100.0), n(10.0), n(5.0), n(1.0), n(2.0), n(0.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn ddb_error_in_arg_propagates() {
+        assert_eq!(
+            ddb(&[Value::Error(ErrorValue::Ref), n(10.0), n(5.0), n(1.0)]),
+            Value::Error(ErrorValue::Ref)
+        );
+        assert_eq!(
+            ddb(&[
+                n(100.0),
+                n(10.0),
+                n(5.0),
+                n(1.0),
+                Value::Error(ErrorValue::Name)
+            ]),
+            Value::Error(ErrorValue::Name)
         );
     }
 }

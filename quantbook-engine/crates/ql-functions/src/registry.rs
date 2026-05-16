@@ -432,10 +432,15 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("PPMT", financial_fns::ppmt);
 
     // Phase 4.10 polish (W5-180) — depreciation batch starter (scalar).
-    // SLN + SYD are closed-form formulas; DDB / DB / VDB deferred to
-    // a follow-on cycle (period-iteration logic + factor arg).
+    // SLN + SYD are closed-form formulas with two/three required args.
     r.register("SLN", financial_fns::sln);
     r.register("SYD", financial_fns::syd);
+
+    // Phase 4.10 polish (W5-181) — DDB: double-declining-balance.
+    // Closed-form (no period iteration despite the name); optional
+    // `factor` arg (default 2). Salvage floor stops depreciation
+    // before over-depreciating. DB / VDB still deferred.
+    r.register("DDB", financial_fns::ddb);
 
     // Phase 4.10.G (W5-169) — ADDRESS (scalar text formatter).
     r.register("ADDRESS", scalar_fns::address);
@@ -775,8 +780,9 @@ mod tests {
         // coefficient; W5-178: SLOPE + INTERCEPT = 2 least-squares
         // regression; W5-179: PEARSON + RSQ + STEYX = 3 — CLOSES the
         // Wave 3 regression batch; W5-180: SLN + SYD = 2 — Wave 3
-        // depreciation batch starter).
-        assert_eq!(r.len(), 190);
+        // depreciation batch starter; W5-181: DDB = 1 — closed-form
+        // double-declining-balance).
+        assert_eq!(r.len(), 191);
     }
 
     #[test]

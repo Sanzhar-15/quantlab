@@ -314,6 +314,14 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "SYD",
         "W5-180; unit tests pin (cost-salvage)·(life-per+1)·2/(life·(life+1)) + per>life / per<=0 / life=0 → #NUM! + Microsoft example fixture (SYD(30k,7.5k,10,1)≈4090.91)",
     ),
+    // W5-181 (Phase 4.10 polish / Wave 3 depreciation batch) — DDB:
+    // double-declining-balance. Closed-form with salvage floor.
+    // Optional `factor` (default 2). Validation rejects period>life
+    // / period<=0 / cost<0 / salvage<0 / factor<=0 with #NUM!.
+    (
+        "DDB",
+        "W5-181; unit tests pin Microsoft fixtures (DDB(2400,300,10,1)=480; DDB(2400,300,10,10)≈22.12) + salvage floor + rate-clamp-to-1 + validation #NUM! paths",
+    ),
     // W5-168 (Phase 4.10.F) — financial TVM + cash-flow.
     (
         "PMT",
