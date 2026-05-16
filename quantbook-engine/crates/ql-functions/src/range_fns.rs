@@ -638,6 +638,13 @@ pub fn xlookup(args: &[FnArg]) -> Value {
         Ok(m) => m,
         Err(e) => return Value::Error(e),
     };
+    // **W5-171 (Codex MEDIUM-3):** wildcard + binary modes are
+    // mutually exclusive per Excel canon (wildcard requires linear
+    // scan; binary requires sorted input). IronCalc rejects this
+    // combo; mirror that.
+    if match_mode == 2 && (search_mode == 2 || search_mode == -2) {
+        return Value::Error(ErrorValue::Value);
+    }
     match xlookup_find_index(needle, hay, match_mode, search_mode) {
         Some(i) => ret[i].clone(),
         None => {
@@ -684,6 +691,11 @@ pub fn xmatch(args: &[FnArg]) -> Value {
         Ok(m) => m,
         Err(e) => return Value::Error(e),
     };
+    // **W5-171 (Codex MEDIUM-3):** wildcard + binary modes mutually
+    // exclusive (mirrors xlookup; IronCalc canon).
+    if match_mode == 2 && (search_mode == 2 || search_mode == -2) {
+        return Value::Error(ErrorValue::Value);
+    }
     match xlookup_find_index(needle, hay, match_mode, search_mode) {
         Some(i) => Value::Number((i + 1) as f64),
         None => Value::Error(ErrorValue::NA),
@@ -3216,6 +3228,48 @@ mod tests {
         let ret = r(vec![n(1.0)]);
         assert_eq!(
             xlookup(&[s(t("a")), hay, ret, s(Value::Blank), s(n(99.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    /// **W5-171 (Codex MEDIUM-3):** wildcard + binary modes are
+    /// mutually exclusive per Excel canon (wildcard requires linear
+    /// scan; binary requires sorted input). Verified vs IronCalc.
+    #[test]
+    fn xlookup_wildcard_plus_binary_is_value_error() {
+        let hay = r(vec![t("apple"), t("banana")]);
+        let ret = r(vec![n(1.0), n(2.0)]);
+        // match_mode=2 (wildcard) + search_mode=2 (binary asc) → #VALUE!
+        assert_eq!(
+            xlookup(&[
+                s(t("ap*")),
+                hay.clone(),
+                ret.clone(),
+                s(Value::Blank),
+                s(n(2.0)),
+                s(n(2.0)),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+        // match_mode=2 + search_mode=-2 (binary desc) → #VALUE!
+        assert_eq!(
+            xlookup(&[
+                s(t("ap*")),
+                hay,
+                ret,
+                s(Value::Blank),
+                s(n(2.0)),
+                s(n(-2.0)),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn xmatch_wildcard_plus_binary_is_value_error() {
+        let hay = r(vec![t("apple")]);
+        assert_eq!(
+            xmatch(&[s(t("ap*")), hay, s(n(2.0)), s(n(2.0))]),
             Value::Error(ErrorValue::Value)
         );
     }

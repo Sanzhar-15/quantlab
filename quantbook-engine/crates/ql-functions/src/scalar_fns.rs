@@ -546,7 +546,13 @@ pub fn switch(args: &[Value]) -> Value {
 ///   are non-error.
 fn values_match_strict(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => x.to_bits() == y.to_bits() && !x.is_nan(),
+        // **W5-171 (Codex MEDIUM-1):** numeric equality is type-strict
+        // (Number ≠ "1") but NOT bit-pattern strict. `0 == -0` (their
+        // bit patterns differ but Excel treats them as equal). NaN
+        // never matches anything (per type-strict contract + Excel's
+        // numeric-equality semantics). Previous draft used
+        // `to_bits() == to_bits()` which rejected `0 == -0`.
+        (Value::Number(x), Value::Number(y)) => !x.is_nan() && !y.is_nan() && x == y,
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
         (Value::Text(x), Value::Text(y)) => x.eq_ignore_ascii_case(y),
         (Value::Blank, Value::Blank) => true,
@@ -1481,7 +1487,9 @@ pub fn fact(args: &[Value]) -> Value {
 /// **W5-166:** `FACTDOUBLE(n)` — double factorial: `n!! = n*(n-2)*(n-4)*...`.
 /// Excel canon: `FACTDOUBLE(0) = 1`, `FACTDOUBLE(-1) = 1` (special case),
 /// `n < -1` → #NUM!. Even and odd values are independently chained.
-/// Truncate toward zero. Overflow → #NUM! via `sanitize_f64`.
+/// Truncate toward zero. Overflow → #NUM! (detected mid-loop per
+/// W5-171 / Codex HIGH-2 — pre-fix could loop billions of iterations
+/// for pathological inputs before sanitize_f64 caught the inf).
 pub fn factdouble(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::Error(ErrorValue::Value);
@@ -1491,8 +1499,11 @@ pub fn factdouble(args: &[Value]) -> Value {
         NumericArg::Skip => 0.0,
         NumericArg::Error(e) => return Value::Error(e),
     };
+    if raw.trunc() > 300.0 {
+        // 300!! > f64::MAX; bail before the loop ever runs.
+        return Value::Error(ErrorValue::Num);
+    }
     let n = raw.trunc() as i64;
-    // Special cases: FACTDOUBLE(-1) = 1, FACTDOUBLE(0) = 1.
     if n == -1 || n == 0 {
         return Value::Number(1.0);
     }
@@ -1503,6 +1514,10 @@ pub fn factdouble(args: &[Value]) -> Value {
     let mut k = n;
     while k > 1 {
         result *= k as f64;
+        // Codex HIGH-2: bail on overflow before more iterations.
+        if !result.is_finite() {
+            return Value::Error(ErrorValue::Num);
+        }
         k -= 2;
     }
     match coercion::sanitize_f64(result) {
@@ -1514,8 +1529,12 @@ pub fn factdouble(args: &[Value]) -> Value {
 /// **W5-166:** `COMBIN(n, k)` — combinations without repetition (the
 /// binomial coefficient `C(n, k) = n! / (k!(n-k)!)`). Excel canon
 /// (verified vs IronCalc `fn_combin`): truncate args toward zero,
-/// require non-negative, `k > n` → #NUM!. Iterative product avoids
-/// factorial overflow for large n.
+/// require non-negative, `k > n` → #NUM!.
+///
+/// **W5-171 (Codex HIGH-2):** uses the `C(n, k) = C(n, n-k)` symmetry
+/// to iterate at most `min(k, n-k)` times (was: always `k` times).
+/// Adds an inner finite-check so overflow bails immediately instead
+/// of looping billions of times for pathological inputs.
 pub fn combin(args: &[Value]) -> Value {
     if args.len() != 2 {
         return Value::Error(ErrorValue::Value);
@@ -1531,11 +1550,15 @@ pub fn combin(args: &[Value]) -> Value {
     if k > n {
         return Value::Error(ErrorValue::Num);
     }
-    // Iterative C(n,k) = product over i in 0..k of (n - i) / (i + 1).
+    // C(n, k) = C(n, n-k). Pick the smaller half for fewer iterations.
+    let k_eff = k.min(n - k);
     let mut result = 1.0_f64;
-    let k_int = k as i64;
+    let k_int = k_eff as i64;
     for i in 0..k_int {
         result *= (n - i as f64) / (i as f64 + 1.0);
+        if !result.is_finite() {
+            return Value::Error(ErrorValue::Num);
+        }
     }
     match coercion::sanitize_f64(result) {
         Ok(n) => Value::Number(n),
@@ -1547,6 +1570,9 @@ pub fn combin(args: &[Value]) -> Value {
 /// `C(n + k - 1, k)`. Excel canon (verified vs IronCalc `fn_combina`):
 /// `n = 0, k > 0` → #NUM! (degenerate). Other non-negative integer
 /// args accepted; truncate toward zero.
+///
+/// **W5-171 (Codex HIGH-2):** inner finite-check bails early on
+/// overflow instead of looping for huge `k`.
 pub fn combina(args: &[Value]) -> Value {
     if args.len() != 2 {
         return Value::Error(ErrorValue::Value);
@@ -1567,6 +1593,9 @@ pub fn combina(args: &[Value]) -> Value {
     let k_int = k as i64;
     for i in 0..k_int {
         result *= (n + i as f64) / (i as f64 + 1.0);
+        if !result.is_finite() {
+            return Value::Error(ErrorValue::Num);
+        }
     }
     match coercion::sanitize_f64(result) {
         Ok(n) => Value::Number(n),
@@ -1576,7 +1605,9 @@ pub fn combina(args: &[Value]) -> Value {
 
 /// **W5-166:** `PERMUT(n, k)` — permutations without repetition:
 /// `P(n, k) = n! / (n - k)!`. Excel canon: truncate toward zero,
-/// non-negative integers, `k > n` → #NUM!. Iterative product.
+/// non-negative integers, `k > n` → #NUM!.
+///
+/// **W5-171 (Codex HIGH-2):** inner finite-check bails on overflow.
 pub fn permut(args: &[Value]) -> Value {
     if args.len() != 2 {
         return Value::Error(ErrorValue::Value);
@@ -1596,6 +1627,9 @@ pub fn permut(args: &[Value]) -> Value {
     let k_int = k as i64;
     for i in 0..k_int {
         result *= n - i as f64;
+        if !result.is_finite() {
+            return Value::Error(ErrorValue::Num);
+        }
     }
     match coercion::sanitize_f64(result) {
         Ok(n) => Value::Number(n),
@@ -2463,6 +2497,80 @@ fn col_to_letters(mut col: u32) -> String {
     buf.chars().rev().collect()
 }
 
+/// **W5-171 (Codex MEDIUM-4):** sheet-name quoting rules ported from
+/// IronCalc's `name_needs_quoting` at
+/// `.references/ironcalc/base/src/expressions/utils/mod.rs:249`.
+///
+/// Quote if name:
+/// 1. contains any of `space () ' $ , ; - + { }`
+/// 2. starts with a digit
+/// 3. parses as an A1 cell reference (e.g. `B1048576` — within
+///    Excel's grid limit XFD1048576)
+/// 4. parses as an R1C1 cell reference (e.g. `R5C`, `RC2`, `R[-1]C[2]`)
+///
+/// V1 simpler than IronCalc — uses constrained pattern matching
+/// rather than a full ref parser. Catches the common cases that
+/// matter for round-trip safety.
+fn sheet_name_needs_quoting(name: &str) -> bool {
+    // Rule 1 + 2: quotable chars + leading digit.
+    for (i, c) in name.chars().enumerate() {
+        if matches!(
+            c,
+            ' ' | '(' | ')' | '\'' | '$' | ',' | ';' | '-' | '+' | '{' | '}'
+        ) {
+            return true;
+        }
+        if i == 0 && c.is_ascii_digit() {
+            return true;
+        }
+    }
+    // Rule 3: A1 reference detection. Form: 1..=3 letters then digits.
+    // Reject if column exceeds Excel's XFD (16384) or row exceeds
+    // 1048576 — those are valid sheet names per IronCalc.
+    if let Some(rest) = name.strip_prefix(|c: char| c.is_ascii_alphabetic()) {
+        let letters_end = rest
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(rest.len());
+        let col_part_len = 1 + letters_end;
+        if col_part_len <= 3 {
+            let row_part = &name[col_part_len..];
+            if !row_part.is_empty() && row_part.chars().all(|c| c.is_ascii_digit()) {
+                // Decode column letters (case-insensitive).
+                let mut col: u32 = 0;
+                for c in name[..col_part_len].chars() {
+                    col = col * 26 + (c.to_ascii_uppercase() as u32 - 'A' as u32 + 1);
+                }
+                let row: u64 = row_part.parse().unwrap_or(u64::MAX);
+                if (1..=16384).contains(&col) && (1..=1_048_576).contains(&row) {
+                    return true;
+                }
+            }
+        }
+    }
+    // Rule 4: R1C1 reference detection. Form: starts with 'R', contains
+    // 'C' (case-insensitive); middle parts are digits/brackets/minus.
+    if let Some(first) = name.chars().next() {
+        if first.eq_ignore_ascii_case(&'R') && name.len() >= 2 {
+            let has_c = name.chars().skip(1).any(|c| c.eq_ignore_ascii_case(&'C'));
+            let all_valid = name.chars().enumerate().all(|(i, c)| {
+                if i == 0 {
+                    c.eq_ignore_ascii_case(&'R')
+                } else {
+                    c.eq_ignore_ascii_case(&'C')
+                        || c.is_ascii_digit()
+                        || c == '['
+                        || c == ']'
+                        || c == '-'
+                }
+            });
+            if has_c && all_valid {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// **W5-169:** `ADDRESS(row_num, col_num, [abs_num=1], [a1=TRUE],
 /// [sheet_text])` — return a cell address as text.
 ///
@@ -2558,8 +2666,11 @@ pub fn address(args: &[Value]) -> Value {
     };
     let result = match sheet_text {
         Some(s) if !s.is_empty() => {
-            let needs_quote = s.chars().any(|c| !c.is_ascii_alphanumeric() && c != '_');
-            let prefix = if needs_quote {
+            // **W5-171 (Codex MEDIUM-4):** ported IronCalc quote rules —
+            // see `sheet_name_needs_quoting`. Previous V1 rule overquoted
+            // dot names ("Data.2024") and missed cell-ref-shaped names
+            // ("A1", "R1C1", "B1048576").
+            let prefix = if sheet_name_needs_quoting(&s) {
                 format!("'{}'", s.replace('\'', "''"))
             } else {
                 s
@@ -3394,6 +3505,20 @@ mod tests {
         assert_eq!(
             switch(&[nan.clone(), nan.clone(), Value::text("matched")]),
             Value::Error(ErrorValue::NA)
+        );
+    }
+
+    /// **W5-171 (Codex MEDIUM-1):** `0 == -0` matches per Excel canon.
+    /// Previous bit-pattern strict comparison rejected this.
+    #[test]
+    fn switch_positive_zero_matches_negative_zero() {
+        assert_eq!(
+            switch(&[n(0.0), n(-0.0), Value::text("matched")]),
+            Value::text("matched")
+        );
+        assert_eq!(
+            switch(&[n(-0.0), n(0.0), Value::text("matched")]),
+            Value::text("matched")
         );
     }
 
@@ -4978,6 +5103,16 @@ mod tests {
         assert_eq!(factdouble(&[n(-3.5)]), Value::Error(ErrorValue::Num));
     }
 
+    /// **W5-171 (Codex HIGH-2):** very large `n` would loop billions of
+    /// iterations before sanitize_f64 caught the overflow. Early bail
+    /// returns #NUM! immediately.
+    #[test]
+    fn factdouble_huge_arg_is_num_error_fast() {
+        assert_eq!(factdouble(&[n(1e12)]), Value::Error(ErrorValue::Num));
+        // Boundary: 300 is just above the f64 overflow point for !!.
+        assert_eq!(factdouble(&[n(301.0)]), Value::Error(ErrorValue::Num));
+    }
+
     // --- COMBIN ---
 
     #[test]
@@ -5001,6 +5136,43 @@ mod tests {
     fn combin_negative_is_num_error() {
         assert_eq!(combin(&[n(-5.0), n(2.0)]), Value::Error(ErrorValue::Num));
         assert_eq!(combin(&[n(5.0), n(-2.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    /// **W5-171 (Codex HIGH-2):** uses `C(n,k) = C(n, n-k)` symmetry —
+    /// COMBIN(1000, 999) = COMBIN(1000, 1) = 1000 with 1 iteration
+    /// instead of 999.
+    #[test]
+    fn combin_symmetry_handles_large_k() {
+        assert_eq!(combin(&[n(1000.0), n(999.0)]), n(1000.0));
+        assert_eq!(combin(&[n(1000.0), n(1.0)]), n(1000.0));
+    }
+
+    /// **W5-171 (Codex HIGH-2):** inner finite-check bails on overflow
+    /// instead of looping further. C(1030, 515) overflows f64.
+    #[test]
+    fn combin_overflow_is_num_error() {
+        assert_eq!(
+            combin(&[n(1030.0), n(515.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    /// **W5-171 (Codex HIGH-2):** COMBINA inner finite-check.
+    #[test]
+    fn combina_overflow_is_num_error() {
+        // COMBINA(2, 2000) = C(2001, 2000) = 2001 — fine. Try larger.
+        // COMBINA(1000, 1000) = C(1999, 1000) — large.
+        assert_eq!(
+            combina(&[n(1000.0), n(1000.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    /// **W5-171 (Codex HIGH-2):** PERMUT inner finite-check.
+    #[test]
+    fn permut_overflow_is_num_error() {
+        // PERMUT(200, 200) = 200! → overflow.
+        assert_eq!(permut(&[n(200.0), n(200.0)]), Value::Error(ErrorValue::Num));
     }
 
     // --- COMBINA ---
@@ -5385,6 +5557,92 @@ mod tests {
         assert_eq!(address(&[n(0.0), n(1.0)]), Value::Error(ErrorValue::Value));
         assert_eq!(address(&[n(1.0), n(0.0)]), Value::Error(ErrorValue::Value));
         assert_eq!(address(&[n(-5.0), n(1.0)]), Value::Error(ErrorValue::Value));
+    }
+
+    // === W5-171 (Codex MEDIUM-4) — ADDRESS sheet quoting closures ===
+
+    #[test]
+    fn address_dot_name_not_quoted() {
+        // Dot names like "Data.2024" are valid Excel sheet names, NOT
+        // quoted (per IronCalc canon). Previous V1 overquoted them.
+        assert_eq!(
+            address(&[
+                n(1.0),
+                n(1.0),
+                n(1.0),
+                Value::Boolean(true),
+                Value::text("Data.2024"),
+            ]),
+            Value::text("Data.2024!$A$1")
+        );
+    }
+
+    #[test]
+    fn address_a1_reference_name_gets_quoted() {
+        // "A1" looks like a cell ref → must be quoted to disambiguate.
+        assert_eq!(
+            address(&[
+                n(1.0),
+                n(1.0),
+                n(1.0),
+                Value::Boolean(true),
+                Value::text("A1"),
+            ]),
+            Value::text("'A1'!$A$1")
+        );
+        // B1048576 is the last row of column B in Excel — valid cell ref.
+        assert_eq!(
+            address(&[
+                n(1.0),
+                n(1.0),
+                n(1.0),
+                Value::Boolean(true),
+                Value::text("B1048576"),
+            ]),
+            Value::text("'B1048576'!$A$1")
+        );
+    }
+
+    #[test]
+    fn address_r1c1_reference_name_gets_quoted() {
+        assert_eq!(
+            address(&[
+                n(1.0),
+                n(1.0),
+                n(1.0),
+                Value::Boolean(true),
+                Value::text("R1C1"),
+            ]),
+            Value::text("'R1C1'!$A$1")
+        );
+    }
+
+    #[test]
+    fn address_leading_digit_name_gets_quoted() {
+        assert_eq!(
+            address(&[
+                n(1.0),
+                n(1.0),
+                n(1.0),
+                Value::Boolean(true),
+                Value::text("2024Plan"),
+            ]),
+            Value::text("'2024Plan'!$A$1")
+        );
+    }
+
+    #[test]
+    fn address_single_quote_in_name_gets_doubled() {
+        assert_eq!(
+            address(&[
+                n(1.0),
+                n(1.0),
+                n(1.0),
+                Value::Boolean(true),
+                Value::text("O'Brien"),
+            ]),
+            Value::text("'O''Brien'!$A$1")
+        );
     }
 
     // --- Hyperbolic trig ---

@@ -198,7 +198,17 @@ pub(crate) fn compute_rate(
     if guess <= -1.0 {
         return Err(ErrorValue::Value);
     }
-    let mut rate = guess;
+    // **W5-171 (Codex MEDIUM-2):** near-zero `rate` in the iteration
+    // would `0/0` inside `f` and `f'` (division by `rate` and `rate*rate`).
+    // Perturb a near-zero current iterate to a small epsilon so N-R
+    // can step away. Matches Excel canon — `RATE(...,0)` typically
+    // converges from a perturbation rather than producing #NUM!.
+    const NEAR_ZERO: f64 = 1e-12;
+    let mut rate = if guess.abs() < NEAR_ZERO {
+        NEAR_ZERO
+    } else {
+        guess
+    };
     let max_iterations = 50;
     let eps = 1e-7;
     let annuity_type = if period_start { 1.0 } else { 0.0 };
@@ -210,7 +220,7 @@ pub(crate) fn compute_rate(
         let f = pv * tt + pmt * (1.0 + rate * annuity_type) * (tt - 1.0) / rate + fv;
         let f_prime = pv * nper * t - pmt * (tt - 1.0) / (rate * rate)
             + pmt * (1.0 + rate * annuity_type) * t * nper / rate;
-        if f_prime == 0.0 {
+        if f_prime == 0.0 || !f.is_finite() || !f_prime.is_finite() {
             return Err(ErrorValue::Num);
         }
         let new_rate = rate - f / f_prime;
@@ -220,7 +230,12 @@ pub(crate) fn compute_rate(
         if (new_rate - rate).abs() < eps {
             return Ok(new_rate);
         }
-        rate = new_rate;
+        // Same near-zero guard on the iterate itself, not just the guess.
+        rate = if new_rate.abs() < NEAR_ZERO {
+            NEAR_ZERO
+        } else {
+            new_rate
+        };
     }
     Err(ErrorValue::Num)
 }
@@ -337,11 +352,13 @@ pub(crate) fn compute_irr(values: &[f64], guess: f64) -> Result<f64, ErrorValue>
     let f1 = compute_npv(x1, values)?;
     let f2 = compute_npv(x2, values)?;
     if f1 * f2 > 0.0 {
-        // Root not in interval; try N-R at the edges.
+        // Root not in interval; try N-R at a much larger guess.
+        // **W5-171 (Codex MEDIUM-5):** removed the symmetric "-2.0"
+        // edge probe — it was dead code because `compute_npv` rejects
+        // `rate <= -1` upstream (at the validation in this function's
+        // own entry). The IronCalc version had the same bug; the
+        // dropped probe was never a useful path.
         if let Ok(r) = irr_newton(values, 200.0) {
-            return Ok(r);
-        }
-        if let Ok(r) = irr_newton(values, -2.0) {
             return Ok(r);
         }
         return Err(ErrorValue::Num);
@@ -719,15 +736,16 @@ pub fn irr(args: &[FnArg]) -> Value {
     }
     let values = match &args[0] {
         FnArg::Range { values, .. } => {
-            // Per IronCalc: numeric values only; non-numeric (text, bool)
-            // → #VALUE!. Blank → skip. Errors propagate.
+            // **W5-171 (Codex HIGH-1):** Per Microsoft + IronCalc: IRR
+            // IGNORES text and logical cells (same as NPV). Earlier draft
+            // rejected with #VALUE! — incorrect.
             let mut out = Vec::new();
             for v in values {
                 match v {
                     Value::Number(n) => out.push(*n),
-                    Value::Blank => {}
+                    Value::Blank => {} // skip
                     Value::Error(e) => return Value::Error(*e),
-                    _ => return Value::Error(ErrorValue::Value),
+                    _ => {} // skip text/bool per Excel canon
                 }
             }
             out
@@ -839,6 +857,21 @@ mod tests {
     }
 
     // --- RATE ---
+
+    /// **W5-171 (Codex MEDIUM-2):** RATE with guess=0 must NOT
+    /// silently produce #NUM!. Near-zero iterate gets perturbed to
+    /// a small epsilon to break out of the 0/0 trap.
+    #[test]
+    fn rate_zero_guess_perturbs_and_converges() {
+        // FV grew 1000 → 1000*1.05^10 ≈ 1628.89 → rate ≈ 5%. With
+        // guess=0 (would have hit 0/0 pre-fix), should still converge.
+        let fv_at_5pct = 1000.0 * 1.05_f64.powi(10);
+        approx(
+            rate(&[n(10.0), n(0.0), n(-1000.0), n(fv_at_5pct), n(0.0), n(0.0)]),
+            0.05,
+            1e-4,
+        );
+    }
 
     #[test]
     fn rate_zero_pmt() {
@@ -978,8 +1011,25 @@ mod tests {
     }
 
     #[test]
-    fn irr_text_in_range_is_value_error() {
-        let cash = r(vec![n(-1000.0), Value::text("ouch"), n(600.0)]);
-        assert_eq!(irr(&[cash]), Value::Error(ErrorValue::Value));
+    fn irr_skips_text_and_bool_per_excel_canon() {
+        // **W5-171 (Codex HIGH-1):** Per Microsoft + IronCalc: IRR
+        // IGNORES non-numeric cells (same as NPV). Cash flow
+        // [-1000, "skip", TRUE, 600, 600] effectively becomes
+        // [-1000, 600, 600] → IRR ≈ 13.07%.
+        let cash = r(vec![
+            n(-1000.0),
+            Value::text("skip"),
+            Value::Boolean(true),
+            n(600.0),
+            n(600.0),
+        ]);
+        approx(irr(&[cash]), 0.13066, 1e-4);
+    }
+
+    #[test]
+    fn irr_error_in_range_propagates() {
+        // Errors still propagate even though text/bool are skipped.
+        let cash = r(vec![n(-1000.0), Value::Error(ErrorValue::Ref), n(600.0)]);
+        assert_eq!(irr(&[cash]), Value::Error(ErrorValue::Ref));
     }
 }

@@ -177,7 +177,7 @@ as partial, rows with `❌` are missing.
 | VALUE | ✅ | 7 | 4.10.E | W5-167: parse text as number, locale-aware decimal separator (EnUs `.`; De/Fr `,`). ContextAwareFn. Trim whitespace; reject empty / non-numeric → #VALUE!. Numbers pass through; Blank → 0. **Strict locale-confusion guard**: in De/Fr locale, `.` in the numeric string → #VALUE! (closes ambiguity for "1.5" vs "1,5"). Currency prefixes + thousands grouping NOT parsed in V1; bundle with Phase 4.5 polish wave. |
 | NUMBERVALUE | ❌ | 0 | Wave 3 | Like VALUE but takes explicit decimal/group separators as args. Defer. |
 | FIXED | ✅ | 6 | 4.10.E | W5-167: number → text with fixed decimals + locale-aware thousands grouping. ContextAwareFn. Default decimals=2; negative decimals round LEFT of decimal point; `no_commas=TRUE` suppresses grouping. Half-away-from-zero rounding. Locale-aware separators (EnUs: `,` thousands `.` decimal; De: `.` thousands `,` decimal; Fr: ` ` thousands `,` decimal). |
-| DOLLAR | ✅ | 3 | 4.10.E | W5-167: currency text with `$` prefix. ContextAwareFn. Always groups thousands. Negatives → `-$1,234.50` (V1 — accounting parens + locale-specific currency symbol deferred to Phase 4.5 polish). |
+| DOLLAR | ⚠️ | 3 | 4.10.E | W5-167: currency text with `$` prefix. ContextAwareFn. Always groups thousands. **V1 DIVERGENCE per W5-171 (Codex LOW-1):** Excel formats negatives with accounting parens (`($1,234.50)`) by default and uses locale-specific currency symbols (€, £, ¥). V1 uses `-$1,234.50` prefix and `$` only. Locale-aware currency symbols + accounting style deferred to a Phase 4.5 polish wave. |
 | CHAR / CODE | ✅ | 5 | 4.10.E | W5-167: codepoint round-trip for code 1..=255. **DIVERGENCE**: Excel uses Windows-1252; we use Unicode codepoint mapping. Identical for 1-127 ASCII; positions 128-159 differ (Windows-1252 has extra glyphs; Unicode has C1 control characters). Document divergence; bundle Windows-1252 polish with deferred UTF-16 work. |
 | UNICODE / UNICHAR | ✅ | 5 | 4.10.E | W5-167: full Unicode codepoint round-trip. UNICHAR: code 1..=char::MAX; surrogates (0xD800..=0xDFFF) → #N/A. Canonical match vs Excel. |
 | REGEX / REGEXMATCH / REGEXEXTRACT / REGEXREPLACE | ❌ | 0 | post-v1 | Google Sheets extension; not in Excel canon |
@@ -205,7 +205,7 @@ as partial, rows with `❌` are missing.
 | VLOOKUP | ⚠️ | 8 | 4.3 V2 | (see Aggregates/Conditional section for full notes; W5-54 shipped) |
 | HLOOKUP | ⚠️ | 2 | 4.3 V2 | (see W5-54 above) |
 | LOOKUP | ❌ | 0 | 4.10 | Vector & array forms; less common — defer past V1 wave 1 |
-| XLOOKUP | ✅ | 10 | 4.10.G | W5-169: scalar-return V1. Modes: match_mode (0=exact, -1=exact-or-next-smaller, 1=exact-or-next-larger, 2=wildcard); search_mode (1=forward, -1=reverse, ±2=binary — V1 uses linear scan, same result, no perf advantage). `if_not_found` arg returned on miss (default `#N/A`). lookup_array must be 1D; 2D return_array → `#VALUE!` (spill semantics await Phase 4.7 polish). |
+| XLOOKUP | ✅ | 10 | 4.10.G | W5-169: scalar-return V1. Modes: match_mode (0=exact, -1=exact-or-next-smaller, 1=exact-or-next-larger, 2=wildcard); search_mode (1=forward, -1=reverse, ±2=binary). **W5-171 (Codex MEDIUM-3) divergence**: binary modes (`±2`) currently scan linearly — Excel relies on sorted input for `±2`; on unsorted data Excel returns invalid results, we return the same as `±1`. Real binary search deferred. Wildcard + binary (`match_mode=2 search_mode=±2`) rejected with `#VALUE!` (Excel + IronCalc canon). `if_not_found` arg returned on miss (default `#N/A`). lookup_array must be 1D; 2D return_array → `#VALUE!` (spill semantics await Phase 4.7 polish). |
 | MATCH | ⚠️ | 7 | 4.3 V2 | W5-54 (see notes above) |
 | XMATCH | ✅ | 4 | 4.10.G | W5-169: modern MATCH variant. Returns 1-based position; same match_mode + search_mode semantics as XLOOKUP. No match → `#N/A`. |
 | INDEX | ⚠️ | 5 | 4.3 V2 | W5-54 (see notes above) |
@@ -255,7 +255,7 @@ as partial, rows with `❌` are missing.
 | DB / DDB / SLN / SYD / VDB | ❌ | 0 | 4.10 | Depreciation |
 | FVSCHEDULE / RRI / PDURATION | ❌ | 0 | post-v1 | |
 | ACCRINT / ACCRINTM / COUPDAYS / COUPNCD / COUPPCD | ❌ | 0 | post-v1 | Bond accrual |
-| Currency / formatted (DOLLAR, etc.) | ❌ | 0 | 4.5 | Display-level; depends on TEXT/format parser |
+| Currency / formatted (locale-specific symbols, accounting style) | ⚠️ | 0 | Phase 4.5 polish wave | DOLLAR shipped W5-167 (4.10.E) with `$` only + `-$X` for negatives; locale-specific currency symbols (€/£/¥) + accounting parens deferred. |
 
 ### Engineering (post-v1 unless flagged)
 
@@ -349,7 +349,7 @@ as partial, rows with `❌` are missing.
 | Feature | Status | Phase | Notes |
 |---|---|---|---|
 | Array literals `{1,2;3,4}` | ❌ | 4.7 | Lex tokens `{`, `}`, `\`, `;` not in 4.1 scope |
-| Dynamic-array functions (XLOOKUP, FILTER, etc.) | ❌ | 4.7 | |
+| Dynamic-array functions (SPILL semantics for FILTER, SEQUENCE, etc.) | ⚠️ | 4.7 | XLOOKUP shipped W5-169 scalar-return only; FILTER + SEQUENCE shipped 4.7.M/N. True dynamic-array spill semantics still 4.7. |
 | Spill ranges (`A1#`) | ❌ | 4.7 | |
 | Spill blocking (`#SPILL!`) | ❌ | 4.7 | |
 | Spill invalidation on resize | ❌ | 4.7 | |
