@@ -158,6 +158,65 @@ fn e2e_iferror_with_safe_value() {
     assert_eq!(result, Value::Number(0.0));
 }
 
+// ===== W5-163 (Phase 4.10.A) — Logical fillins e2e =====
+
+#[test]
+fn e2e_ifs_first_match() {
+    // =IFS(A1 < 0, "neg", A1 = 0, "zero", A1 > 0, "pos") with A1=5 → "pos"
+    let result = eval_source_with_registry(
+        r#"IFS(A1 < 0, "neg", A1 = 0, "zero", A1 > 0, "pos")"#,
+        &[((0, 0, 0), Value::Number(5.0))],
+    );
+    assert_eq!(result, Value::text("pos"));
+}
+
+#[test]
+fn e2e_ifna_passes_value_through() {
+    // =IFNA(A1, "fallback") with A1=42 → 42 (non-#N/A passes through).
+    // The unit tests in scalar_fns cover the #N/A → fallback branch;
+    // this e2e proves the registry dispatch path works for IFNA.
+    let result = eval_source_with_registry(
+        r#"IFNA(A1, "fallback")"#,
+        &[((0, 0, 0), Value::Number(42.0))],
+    );
+    assert_eq!(result, Value::Number(42.0));
+}
+
+#[test]
+fn e2e_xor_parity() {
+    // =XOR(A1 > 0, A2 > 0, A3 > 0) with A1=5, A2=-1, A3=10 → XOR(true,false,true) = false (even)
+    let result = eval_source_with_registry(
+        "XOR(A1 > 0, A2 > 0, A3 > 0)",
+        &[
+            ((0, 0, 0), Value::Number(5.0)),
+            ((0, 1, 0), Value::Number(-1.0)),
+            ((0, 2, 0), Value::Number(10.0)),
+        ],
+    );
+    assert_eq!(result, Value::Boolean(false));
+}
+
+#[test]
+fn e2e_switch_with_default() {
+    // =SWITCH(A1, 1, "one", 2, "two", "other") with A1=3 → "other"
+    let result = eval_source_with_registry(
+        r#"SWITCH(A1, 1, "one", 2, "two", "other")"#,
+        &[((0, 0, 0), Value::Number(3.0))],
+    );
+    assert_eq!(result, Value::text("other"));
+}
+
+#[test]
+fn e2e_switch_type_strict_no_match() {
+    // =SWITCH(A1, "1", "string match", 1, "number match") with A1=1 (number)
+    // → "number match" (Number↔String never matches per Codex HIGH-1 closure).
+    let result = eval_source_with_registry(
+        r#"SWITCH(A1, "1", "string match", 1, "number match")"#,
+        &[((0, 0, 0), Value::Number(1.0))],
+    );
+    assert_eq!(result, Value::text("number match"));
+}
+
 #[test]
 fn e2e_var_s_via_alias() {
     // =VAR(A1, A2, A3) → sample variance of [1, 2, 3] = 1

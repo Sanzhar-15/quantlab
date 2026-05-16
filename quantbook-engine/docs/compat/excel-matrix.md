@@ -99,14 +99,14 @@ as partial, rows with `❌` are missing.
 | Function | Status | Tests | Phase | Notes |
 |---|---|---|---|---|
 | IF | ⚠️ | 8+ | 0 (eager) | Eager both-branch eval; lazy semantics → 4.3 (FN4-03) |
-| IFS | ❌ | 0 | 4.3 | Multi-condition selector |
+| IFS | ✅ | 6 | 4.10.A | W5-163: variadic test+value pairs; first true wins. Errors in tests propagate. No match → #N/A. Odd arg count silently discards trailing unpaired arg (matches Excel canon). Empty → #VALUE!. Non-bool tests coerce via `to_logical`. |
 | IFERROR | ⚠️ | 5+ | 0 (eager) | Eager eval; lazy → 4.3 |
-| IFNA | ❌ | 0 | 4.3 | |
+| IFNA | ✅ | 4 | 4.10.A | W5-163: like IFERROR but only catches `#N/A`. Other errors propagate. Exactly 2 args. |
 | AND / OR | ✅ | 5+ | 0 | Eager; truthy semantics per Excel |
 | NOT | ✅ | 3+ | 0 | |
-| XOR | ❌ | 0 | 4.3 | |
+| XOR | ✅ | 8 | 4.10.A | W5-163: variadic parity (true iff odd count of true args). Mirrors AND/OR arg handling: skip blanks, coerce non-bool via `to_logical`, propagate errors, require ≥1 non-blank → otherwise #VALUE!. |
 | TRUE / FALSE | ⚠️ | — | 0 | Parsed as identifiers; promoted at bind; explicit `Bool` Token deferred to 4.1 follow-up |
-| SWITCH | ❌ | 0 | 4.3 | |
+| SWITCH | ✅ | 10 | 4.10.A | W5-163: type-strict equality (Number≠"1"; verified vs IronCalc + Microsoft docs). Errors in caseK values PROPAGATE (Codex HIGH-1 correction). NaN never matches. Odd args after expression → trailing unpaired arg is the default. No match + no default → #N/A. Case-insensitive ASCII String equality. |
 
 ### Math & Trigonometry
 

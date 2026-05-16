@@ -386,6 +386,12 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("NOT", scalar_fns::not);
     r.register("IFERROR", scalar_fns::iferror);
 
+    // Phase 4.10.A (W5-163) — logical fillins.
+    r.register("IFS", scalar_fns::ifs);
+    r.register("IFNA", scalar_fns::ifna);
+    r.register("XOR", scalar_fns::xor);
+    r.register("SWITCH", scalar_fns::switch);
+
     // Math
     r.register("ABS", scalar_fns::abs);
     r.register("SQRT", scalar_fns::sqrt);
@@ -638,8 +644,10 @@ mod tests {
         // Phase 4.5.E (W5-83: TEXT = 1) +
         // Phase 4.7.M (W5-106: SEQUENCE = 1, first array-returning fn) +
         // Phase 4.7.N (W5-107: TRANSPOSE + FILTER = 2, second + third
-        // array-returning fns).
-        assert_eq!(r.len(), 133);
+        // array-returning fns) +
+        // Phase 4.10.A (W5-163: IFS, IFNA, XOR, SWITCH = 4 logical
+        // fillins; first batch of Function Library Wave 2).
+        assert_eq!(r.len(), 137);
     }
 
     #[test]

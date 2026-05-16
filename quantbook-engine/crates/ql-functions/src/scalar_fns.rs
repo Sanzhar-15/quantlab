@@ -332,6 +332,141 @@ pub fn iferror(args: &[Value]) -> Value {
     }
 }
 
+/// **W5-163 (Phase 4.10.A):** `IFNA(value, fallback)` — like `IFERROR`
+/// but only catches `#N/A`. Other errors propagate. Variadic check:
+/// exactly 2 args required.
+pub fn ifna(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    match &args[0] {
+        Value::Error(ErrorValue::NA) => args[1].clone(),
+        v => v.clone(),
+    }
+}
+
+/// **W5-163 (Phase 4.10.A):** `IFS(test1, value1, test2, value2, ...)`
+/// — multi-condition selector. Returns `valueK` for the first true
+/// `testK`. Excel canon:
+/// - Variadic; ≥2 args.
+/// - Errors in tests propagate (mirrors `IF`, contrasts with `SWITCH`
+///   which propagates errors in caseK values too).
+/// - No match → `#N/A`. Odd arg count → unpaired trailing arg is
+///   silently discarded (no match found → still `#N/A`; matches
+///   Excel canon, not a syntax error).
+/// - Empty input → `#VALUE!`.
+pub fn ifs(args: &[Value]) -> Value {
+    if args.is_empty() {
+        return Value::Error(ErrorValue::Value);
+    }
+    let mut i = 0;
+    while i + 1 < args.len() {
+        match &args[i] {
+            Value::Error(e) => return Value::Error(*e),
+            other => match coercion::to_logical(other) {
+                Ok(true) => return args[i + 1].clone(),
+                Ok(false) => {}
+                Err(e) => return Value::Error(e),
+            },
+        }
+        i += 2;
+    }
+    Value::Error(ErrorValue::NA)
+}
+
+/// **W5-163 (Phase 4.10.A):** `XOR(args...)` — variadic logical XOR;
+/// true iff an odd number of args are true. Mirrors `AND` / `OR`
+/// arg handling: skip blanks, coerce non-bool via `to_logical`,
+/// propagate errors, require ≥1 non-blank → otherwise `#VALUE!`.
+pub fn xor(args: &[Value]) -> Value {
+    if args.is_empty() {
+        return Value::Error(ErrorValue::Value);
+    }
+    let mut count: u64 = 0;
+    let mut any_non_blank = false;
+    for v in args {
+        match v {
+            Value::Error(e) => return Value::Error(*e),
+            Value::Blank => {}
+            other => {
+                any_non_blank = true;
+                match coercion::to_logical(other) {
+                    Ok(true) => count += 1,
+                    Ok(false) => {}
+                    Err(e) => return Value::Error(e),
+                }
+            }
+        }
+    }
+    if !any_non_blank {
+        return Value::Error(ErrorValue::Value);
+    }
+    Value::Boolean(count % 2 == 1)
+}
+
+/// **W5-163 (Phase 4.10.A):** `SWITCH(expression, value1, result1,
+/// value2, result2, ..., [default])` — value-matching selector.
+///
+/// Per Excel canon + Codex pre-review (verified against IronCalc
+/// `compare_values` + `logical/switch.rs` + Microsoft docs):
+/// - **Type-strict equality**: Number ≠ "1" (Number↔String never
+///   match). NaN never matches NaN.
+/// - **Errors in caseK values PROPAGATE** (NOT skipped — corrects
+///   the v1 design-doc draft).
+/// - Errors in `expression` propagate.
+/// - Variadic ≥3 args (1 expression + at least 1 value+result pair).
+/// - Even args after expression → no default → `#N/A` on no match.
+/// - Odd args after expression → trailing unpaired arg is the
+///   default.
+pub fn switch(args: &[Value]) -> Value {
+    if args.len() < 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let expr = &args[0];
+    if let Value::Error(e) = expr {
+        return Value::Error(*e);
+    }
+    let mut i = 1;
+    while i + 1 < args.len() {
+        let v = &args[i];
+        // Codex HIGH-1: errors in caseK PROPAGATE before the no-match
+        // → #N/A path runs.
+        if let Value::Error(e) = v {
+            return Value::Error(*e);
+        }
+        if values_match_strict(expr, v) {
+            return args[i + 1].clone();
+        }
+        i += 2;
+    }
+    // i == args.len() - 1 → trailing unpaired arg is the default.
+    if i < args.len() {
+        return args[i].clone();
+    }
+    Value::Error(ErrorValue::NA)
+}
+
+/// **W5-163 (Phase 4.10.A):** type-strict equality used by `SWITCH`.
+/// - Number == Number iff bitwise equal (NaN never matches anything).
+/// - Boolean == Boolean iff exact.
+/// - String == String iff case-INsensitive ASCII equal (matches
+///   Excel canon; Unicode case-folding awaits the deferred UTF-16
+///   work tracked in the matrix).
+/// - Blank == Blank.
+/// - Cross-type (Number↔String, Bool↔Number, Bool↔String, etc.) →
+///   never matches.
+/// - Error values handled upstream; this helper assumes both sides
+///   are non-error.
+fn values_match_strict(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => x.to_bits() == y.to_bits() && !x.is_nan(),
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Text(x), Value::Text(y)) => x.eq_ignore_ascii_case(y),
+        (Value::Blank, Value::Blank) => true,
+        _ => false,
+    }
+}
+
 // ===== Math =====
 
 /// `ABS(x)` — absolute value.
@@ -2114,6 +2249,296 @@ mod tests {
         assert_eq!(iferror(&[Value::Error(ErrorValue::Ref), n(42.0)]), n(42.0));
         // Non-error passes through.
         assert_eq!(iferror(&[n(7.0), n(42.0)]), n(7.0));
+    }
+
+    // ===== W5-163 (Phase 4.10.A) — Logical fillins =====
+
+    // ----- IFNA -----
+
+    #[test]
+    fn ifna_replaces_na_with_fallback() {
+        assert_eq!(ifna(&[Value::Error(ErrorValue::NA), n(7.0)]), n(7.0));
+    }
+
+    #[test]
+    fn ifna_passes_non_na_value_through() {
+        assert_eq!(ifna(&[n(42.0), n(7.0)]), n(42.0));
+        assert_eq!(ifna(&[Value::text("ok"), n(7.0)]), Value::text("ok"));
+    }
+
+    #[test]
+    fn ifna_propagates_non_na_errors() {
+        // Unlike IFERROR, IFNA only catches #N/A. Other errors pass through.
+        assert_eq!(
+            ifna(&[Value::Error(ErrorValue::Ref), n(7.0)]),
+            Value::Error(ErrorValue::Ref)
+        );
+        assert_eq!(
+            ifna(&[Value::Error(ErrorValue::Value), n(7.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            ifna(&[Value::Error(ErrorValue::DivZero), n(7.0)]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn ifna_wrong_arity_returns_value_error() {
+        assert_eq!(ifna(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(ifna(&[n(1.0)]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            ifna(&[n(1.0), n(2.0), n(3.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ----- IFS -----
+
+    #[test]
+    fn ifs_returns_first_matching_value() {
+        assert_eq!(
+            ifs(&[
+                Value::Boolean(false),
+                n(1.0),
+                Value::Boolean(true),
+                n(2.0),
+                Value::Boolean(true),
+                n(3.0),
+            ]),
+            n(2.0)
+        );
+    }
+
+    #[test]
+    fn ifs_no_match_returns_na() {
+        assert_eq!(
+            ifs(&[Value::Boolean(false), n(1.0), Value::Boolean(false), n(2.0),]),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn ifs_empty_args_is_value_error() {
+        assert_eq!(ifs(&[]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn ifs_odd_arg_count_silently_discards_trailing() {
+        // 3 args: test1=false, value1=1, trailing test2=true (no paired value).
+        // Excel canon: trailing unpaired arg is silently discarded; no match
+        // among complete pairs → #N/A.
+        assert_eq!(
+            ifs(&[Value::Boolean(false), n(1.0), Value::Boolean(true),]),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn ifs_propagates_test_errors() {
+        // Error in test1 propagates immediately, even if a later test would match.
+        assert_eq!(
+            ifs(&[
+                Value::Error(ErrorValue::Ref),
+                n(1.0),
+                Value::Boolean(true),
+                n(2.0),
+            ]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn ifs_coerces_numeric_test_via_to_logical() {
+        // Non-zero number is truthy.
+        assert_eq!(ifs(&[n(1.0), Value::text("yes")]), Value::text("yes"));
+        // Zero is falsy → #N/A.
+        assert_eq!(
+            ifs(&[n(0.0), Value::text("yes")]),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    // ----- XOR -----
+
+    #[test]
+    fn xor_zero_trues_is_false() {
+        assert_eq!(
+            xor(&[Value::Boolean(false), Value::Boolean(false)]),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn xor_one_true_is_true() {
+        assert_eq!(
+            xor(&[Value::Boolean(true), Value::Boolean(false)]),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn xor_two_trues_is_false() {
+        // Even count of true → false.
+        assert_eq!(
+            xor(&[Value::Boolean(true), Value::Boolean(true)]),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn xor_three_trues_is_true() {
+        // Odd count of true → true.
+        assert_eq!(
+            xor(&[
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Boolean(true),
+            ]),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn xor_empty_args_is_value_error() {
+        assert_eq!(xor(&[]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn xor_all_blanks_is_value_error() {
+        // Mirrors AND/OR canon: no non-blank arg → #VALUE!.
+        assert_eq!(
+            xor(&[Value::Blank, Value::Blank]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn xor_propagates_errors() {
+        assert_eq!(
+            xor(&[Value::Boolean(true), Value::Error(ErrorValue::Ref)]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn xor_skips_blanks_and_coerces_numeric() {
+        // 1 (truthy) + Blank (skipped) + 0 (falsy) → 1 true → odd → true.
+        assert_eq!(xor(&[n(1.0), Value::Blank, n(0.0)]), Value::Boolean(true));
+    }
+
+    // ----- SWITCH -----
+
+    #[test]
+    fn switch_returns_first_matching_result() {
+        assert_eq!(
+            switch(&[
+                n(2.0),
+                n(1.0),
+                Value::text("one"),
+                n(2.0),
+                Value::text("two")
+            ]),
+            Value::text("two")
+        );
+    }
+
+    #[test]
+    fn switch_no_match_no_default_is_na() {
+        assert_eq!(
+            switch(&[
+                n(3.0),
+                n(1.0),
+                Value::text("one"),
+                n(2.0),
+                Value::text("two")
+            ]),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn switch_default_branch_when_no_match() {
+        // Odd arg count after expression → trailing arg is the default.
+        assert_eq!(
+            switch(&[
+                n(3.0),
+                n(1.0),
+                Value::text("one"),
+                n(2.0),
+                Value::text("two"),
+                Value::text("other"),
+            ]),
+            Value::text("other")
+        );
+    }
+
+    #[test]
+    fn switch_type_strict_number_vs_string_never_matches() {
+        // SWITCH(1, "1", "Text", 1, "Number") → "Number" (type-strict per Excel canon).
+        assert_eq!(
+            switch(&[
+                n(1.0),
+                Value::text("1"),
+                Value::text("Text"),
+                n(1.0),
+                Value::text("Number"),
+            ]),
+            Value::text("Number")
+        );
+    }
+
+    #[test]
+    fn switch_case_insensitive_string_match() {
+        assert_eq!(
+            switch(&[
+                Value::text("HELLO"),
+                Value::text("hello"),
+                Value::text("matched"),
+            ]),
+            Value::text("matched")
+        );
+    }
+
+    #[test]
+    fn switch_too_few_args_is_value_error() {
+        assert_eq!(switch(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(switch(&[n(1.0)]), Value::Error(ErrorValue::Value));
+        assert_eq!(switch(&[n(1.0), n(2.0)]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn switch_error_in_expression_propagates() {
+        assert_eq!(
+            switch(&[Value::Error(ErrorValue::Ref), n(1.0), Value::text("one"),]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn switch_error_in_case_value_propagates() {
+        // Codex HIGH-1: errors in caseK PROPAGATE (verified vs IronCalc).
+        // Pre-correction draft had "skip errors" — wrong.
+        assert_eq!(
+            switch(&[
+                n(2.0),
+                n(1.0),
+                Value::text("one"),
+                Value::Error(ErrorValue::Ref),
+                Value::text("won't reach"),
+            ]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn switch_nan_never_matches() {
+        // NaN ≠ NaN per type-strict equality contract.
+        let nan = Value::Number(f64::NAN);
+        assert_eq!(
+            switch(&[nan.clone(), nan.clone(), Value::text("matched")]),
+            Value::Error(ErrorValue::NA)
+        );
     }
 
     // ===== math =====

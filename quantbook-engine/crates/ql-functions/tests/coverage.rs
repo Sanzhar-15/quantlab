@@ -106,6 +106,25 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "NOT",
         "deferred — Phase 4.4.C will add logical override tests",
     ),
+    // W5-163 (Phase 4.10.A) — logical fillins. Unit tests in
+    // scalar_fns::tests pin each function's contract; per-fn matrix
+    // overrides deferred to a future Phase 4.4.C / 4.10 polish wave.
+    (
+        "IFS",
+        "W5-163; unit tests pin contract; matrix overrides deferred",
+    ),
+    (
+        "IFNA",
+        "W5-163; unit tests pin contract; matrix overrides deferred",
+    ),
+    (
+        "XOR",
+        "W5-163; unit tests pin contract; matrix overrides deferred",
+    ),
+    (
+        "SWITCH",
+        "W5-163; unit tests pin type-strictness + caseK error propagation; matrix overrides deferred",
+    ),
     // Math (default coercion paths cover most; per-fn overrides deferred)
     ("ABS", "default; deferred"),
     ("SQRT", "domain error #NUM!; deferred"),
