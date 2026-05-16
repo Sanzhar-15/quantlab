@@ -75,7 +75,8 @@ as partial, rows with `❌` are missing.
 | COUNTIFS | ⚠️ | 3 | 4.3 V2 | W5-55: multi-condition AND count. Errors in range cells don't propagate (Excel canon). |
 | AVERAGEIF | ⚠️ | 6 | 4.3 V2 | W5-55: same predicate suite as SUMIF; #DIV/0! on no matches; optional separate average_range. **W5-60 KNOWN DIVERGENCE**: same as SUMIF — when `average_range` size differs from `range`, Quantbook does a flat-index zip; Excel anchors the top-left of `average_range` and uses `range`'s shape. Behavior matches only when sizes are equal. Pin Phase 4.3 polish or 4.10. |
 | AVERAGEIFS | ⚠️ | 2 | 4.3 V2 | W5-55: multi-condition AND average; #DIV/0! on no matches. |
-| MINIFS / MAXIFS | ❌ | 0 | 4.3 | Multi-condition min/max |
+| MINIFS / MAXIFS | ✅ | 9 | 4.10.B | W5-164: multi-condition min/max. Mirrors SUMIFS / AVERAGEIFS shape: value_range first, then (criteria_range, criteria) pairs; W5-60 2D-shape enforcement applies. **Excel canon**: no matching numeric cells → `0` (NOT `#NUM!` or `#DIV/0!`; verified vs IronCalc `fn_minifs` / `fn_maxifs`). Same predicate suite as SUMIFS (numbers, text, bool, blank, `<=>≠` comparators, W5-61 wildcards). Errors in value_range propagate. |
+| COUNTBLANK | ✅ | 6 | 4.10.B | W5-164: count blank cells in a single range. Per Excel canon (verified vs IronCalc `fn_countblank`): both `Value::Blank` AND empty strings (`""`) count as blank; errors are NOT blank (skipped). Single range arg required (scalar → `#VALUE!`; use COUNTIF for scalar shapes). |
 | MEDIAN | ✅ | 6 | 4.3 V2 | W5-58: even-count averages two middles; mixed scalar/range args supported; empty → #NUM!; text in range → #VALUE! (strict, matches SUM/AVERAGE). |
 | MODE / MODE.SNGL | ✅ | 5 | 4.3 V2 | W5-58: most frequent value; first-appearance tie-break; no repeats → #N/A; empty → #NUM!. Float bit-pattern equality (exact, no epsilon). MODE.SNGL is a registry alias of MODE. |
 | MODE.MULT | ❌ | 0 | 4.7 | Returns array of multiple modes — needs dynamic-array spill. |

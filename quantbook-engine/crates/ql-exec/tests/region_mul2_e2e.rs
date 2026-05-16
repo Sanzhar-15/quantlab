@@ -217,6 +217,32 @@ fn e2e_switch_type_strict_no_match() {
     assert_eq!(result, Value::text("number match"));
 }
 
+// ===== W5-164 (Phase 4.10.B) — Conditional-aggregate fillins e2e =====
+//
+// These functions take Range args which need named-range or table-ref
+// bindings to work through the lightweight `bind(&ast, 0)` test
+// helper. The unit tests in range_fns::tests cover the function
+// contracts directly; this e2e proves they're discoverable via the
+// registry (smoke test only).
+
+#[test]
+fn e2e_minifs_maxifs_countblank_registered() {
+    use ql_functions::default_registry;
+    let registry = default_registry();
+    assert!(
+        registry.lookup_range_aware("MINIFS").is_some(),
+        "MINIFS registered"
+    );
+    assert!(
+        registry.lookup_range_aware("MAXIFS").is_some(),
+        "MAXIFS registered"
+    );
+    assert!(
+        registry.lookup_range_aware("COUNTBLANK").is_some(),
+        "COUNTBLANK registered"
+    );
+}
+
 #[test]
 fn e2e_var_s_via_alias() {
     // =VAR(A1, A2, A3) → sample variance of [1, 2, 3] = 1

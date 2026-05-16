@@ -986,6 +986,102 @@ pub fn averageifs(args: &[FnArg]) -> Value {
     }
 }
 
+/// **W5-164 (Phase 4.10.B):** `MINIFS(min_range, criteria_range1,
+/// criteria1, [crit_range2, crit2, ...])` — minimum of cells in
+/// `min_range` where ALL criteria pairs match elementwise. Excel
+/// canon (verified vs IronCalc `fn_minifs`): no matching numeric
+/// cells → `0` (not `#NUM!` or `#DIV/0!`). Mirrors `SUMIFS` shape +
+/// W5-60 2D-shape enforcement.
+pub fn minifs(args: &[FnArg]) -> Value {
+    minmaxifs_inner(args, MinMax::Min)
+}
+
+/// **W5-164 (Phase 4.10.B):** `MAXIFS(max_range, criteria_range1,
+/// criteria1, ...)` — maximum of cells where ALL criteria match.
+/// No matching cells → `0` (Excel canon).
+pub fn maxifs(args: &[FnArg]) -> Value {
+    minmaxifs_inner(args, MinMax::Max)
+}
+
+#[derive(Clone, Copy)]
+enum MinMax {
+    Min,
+    Max,
+}
+
+fn minmaxifs_inner(args: &[FnArg], op: MinMax) -> Value {
+    if args.len() < 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let (value_range, vr_rows, vr_cols) = match &args[0] {
+        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
+    };
+    let (pairs, (exp_rows, exp_cols)) = match parse_ifs_pairs(args, 1) {
+        Ok(x) => x,
+        Err(e) => return Value::Error(e),
+    };
+    if vr_rows != exp_rows || vr_cols != exp_cols {
+        return Value::Error(ErrorValue::Value);
+    }
+    let total_cells = exp_rows * exp_cols;
+    let mut acc: Option<f64> = None;
+    for i in 0..total_cells {
+        let mut all_match = true;
+        for (range, pred) in &pairs {
+            if !pred.matches(&range[i]) {
+                all_match = false;
+                break;
+            }
+        }
+        if !all_match {
+            continue;
+        }
+        match coerce_numeric(&value_range[i]) {
+            NumericArg::Number(n) => {
+                acc = Some(match (acc, op) {
+                    (None, _) => n,
+                    (Some(a), MinMax::Min) => a.min(n),
+                    (Some(a), MinMax::Max) => a.max(n),
+                });
+            }
+            NumericArg::Skip => {}
+            NumericArg::Error(e) => return Value::Error(e),
+        }
+    }
+    // Excel canon: no matching numeric cells → 0 (not #NUM!).
+    let result = acc.unwrap_or(0.0);
+    match coercion::sanitize_f64(result) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// **W5-164 (Phase 4.10.B):** `COUNTBLANK(range)` — count blank
+/// cells in a single range. Per Excel canon (verified vs IronCalc
+/// `fn_countblank`): both `Value::Blank` AND empty strings (`""`)
+/// count as blank. Errors are NOT blank (skipped). Single arg
+/// required. Scalar arg is rejected with `#VALUE!` (use COUNTIF for
+/// scalar counts).
+pub fn countblank(args: &[FnArg]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let values = match &args[0] {
+        FnArg::Range { values, .. } => values.as_slice(),
+        FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
+    };
+    let mut count: usize = 0;
+    for v in values {
+        match v {
+            Value::Blank => count += 1,
+            Value::Text(s) if s.is_empty() => count += 1,
+            _ => {}
+        }
+    }
+    Value::Number(count as f64)
+}
+
 /// `SUMPRODUCT(array1, [array2], ...)` — element-wise multiply all
 /// arrays and sum the products.
 ///
@@ -2248,6 +2344,144 @@ mod tests {
         assert_eq!(
             averageifs(&[vals, r1, s(n(99.0))]),
             Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    // === W5-164 (Phase 4.10.B) — MINIFS / MAXIFS / COUNTBLANK ===
+
+    // --- MINIFS ---
+
+    #[test]
+    fn minifs_single_condition() {
+        let labels = r(vec![t("a"), t("b"), t("a"), t("b")]);
+        let vals = r(vec![n(30.0), n(10.0), n(20.0), n(40.0)]);
+        // labels="a" → vals[0]=30, vals[2]=20 → min=20.
+        assert_eq!(minifs(&[vals, labels, s(t("a"))]), n(20.0));
+    }
+
+    #[test]
+    fn minifs_two_conditions() {
+        let l1 = r(vec![t("a"), t("a"), t("b"), t("b")]);
+        let l2 = r(vec![t("x"), t("y"), t("x"), t("y")]);
+        let vals = r(vec![n(10.0), n(20.0), n(30.0), n(40.0)]);
+        // a AND x → vals[0]=10. Only one match → min=10.
+        assert_eq!(minifs(&[vals, l1, s(t("a")), l2, s(t("x"))]), n(10.0));
+    }
+
+    #[test]
+    fn minifs_no_match_returns_zero() {
+        // Excel canon: no matching numeric cells → 0 (NOT #NUM!).
+        let labels = r(vec![t("a"), t("b")]);
+        let vals = r(vec![n(10.0), n(20.0)]);
+        assert_eq!(minifs(&[vals, labels, s(t("z"))]), n(0.0));
+    }
+
+    #[test]
+    fn minifs_with_comparator_criteria() {
+        let nums = r(vec![n(5.0), n(15.0), n(25.0), n(35.0)]);
+        let vals = r(vec![n(100.0), n(50.0), n(200.0), n(75.0)]);
+        // nums > 10 → matches positions 1,2,3 → vals: 50, 200, 75 → min=50.
+        assert_eq!(minifs(&[vals, nums, s(t(">10"))]), n(50.0));
+    }
+
+    #[test]
+    fn minifs_error_in_value_range_propagates() {
+        let labels = r(vec![t("a"), t("a")]);
+        let vals = r(vec![n(10.0), Value::Error(ErrorValue::Ref)]);
+        assert_eq!(
+            minifs(&[vals, labels, s(t("a"))]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn minifs_shape_mismatch_is_value_error() {
+        let labels = r(vec![t("a"), t("a"), t("b")]);
+        let vals = r(vec![n(10.0), n(20.0)]); // shape mismatch
+        assert_eq!(
+            minifs(&[vals, labels, s(t("a"))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn minifs_too_few_args_is_value_error() {
+        assert_eq!(minifs(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(minifs(&[s(n(1.0))]), Value::Error(ErrorValue::Value));
+        let labels = r(vec![t("a")]);
+        assert_eq!(minifs(&[labels]), Value::Error(ErrorValue::Value));
+    }
+
+    // --- MAXIFS ---
+
+    #[test]
+    fn maxifs_single_condition() {
+        let labels = r(vec![t("a"), t("b"), t("a"), t("b")]);
+        let vals = r(vec![n(30.0), n(10.0), n(20.0), n(40.0)]);
+        // labels="a" → vals[0]=30, vals[2]=20 → max=30.
+        assert_eq!(maxifs(&[vals, labels, s(t("a"))]), n(30.0));
+    }
+
+    #[test]
+    fn maxifs_no_match_returns_zero() {
+        // Excel canon (mirrors MINIFS): no match → 0.
+        let labels = r(vec![t("a"), t("b")]);
+        let vals = r(vec![n(10.0), n(20.0)]);
+        assert_eq!(maxifs(&[vals, labels, s(t("z"))]), n(0.0));
+    }
+
+    #[test]
+    fn maxifs_error_in_value_range_propagates() {
+        let labels = r(vec![t("a"), t("a")]);
+        let vals = r(vec![n(10.0), Value::Error(ErrorValue::Num)]);
+        assert_eq!(
+            maxifs(&[vals, labels, s(t("a"))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    // --- COUNTBLANK ---
+
+    #[test]
+    fn countblank_counts_blanks() {
+        let range = r(vec![n(1.0), Value::Blank, n(3.0), Value::Blank]);
+        assert_eq!(countblank(&[range]), n(2.0));
+    }
+
+    #[test]
+    fn countblank_counts_empty_strings() {
+        // Excel canon: empty strings ALSO count as blank for COUNTBLANK.
+        let range = r(vec![n(1.0), t(""), n(3.0)]);
+        assert_eq!(countblank(&[range]), n(1.0));
+    }
+
+    #[test]
+    fn countblank_does_not_count_non_empty_text() {
+        let range = r(vec![t("hi"), n(1.0)]);
+        assert_eq!(countblank(&[range]), n(0.0));
+    }
+
+    #[test]
+    fn countblank_does_not_count_errors_as_blank() {
+        // Excel canon: errors are NOT blank.
+        let range = r(vec![Value::Error(ErrorValue::Ref), n(1.0)]);
+        assert_eq!(countblank(&[range]), n(0.0));
+    }
+
+    #[test]
+    fn countblank_wrong_arity_is_value_error() {
+        assert_eq!(countblank(&[]), Value::Error(ErrorValue::Value));
+        let r1 = r(vec![n(1.0)]);
+        let r2 = r(vec![n(2.0)]);
+        assert_eq!(countblank(&[r1, r2]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn countblank_scalar_arg_is_value_error() {
+        // Use COUNTIF for scalar shapes; COUNTBLANK requires a range.
+        assert_eq!(
+            countblank(&[s(Value::Blank)]),
+            Value::Error(ErrorValue::Value)
         );
     }
 

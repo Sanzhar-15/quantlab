@@ -571,6 +571,11 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_range_aware("AVERAGEIFS", range_fns::averageifs);
     r.register_range_aware("SUMPRODUCT", range_fns::sumproduct);
 
+    // Phase 4.10.B (W5-164) — conditional-aggregate fillins.
+    r.register_range_aware("MINIFS", range_fns::minifs);
+    r.register_range_aware("MAXIFS", range_fns::maxifs);
+    r.register_range_aware("COUNTBLANK", range_fns::countblank);
+
     // Engine Phase 4.3 V2 batch #7 — stats family (W5-58).
     // Closes FN4-01 (100 functions). LARGE/SMALL are k-th order;
     // RANK is 1-based with tie semantics; MEDIAN handles even-count
@@ -646,8 +651,10 @@ mod tests {
         // Phase 4.7.N (W5-107: TRANSPOSE + FILTER = 2, second + third
         // array-returning fns) +
         // Phase 4.10.A (W5-163: IFS, IFNA, XOR, SWITCH = 4 logical
-        // fillins; first batch of Function Library Wave 2).
-        assert_eq!(r.len(), 137);
+        // fillins; first batch of Function Library Wave 2) +
+        // Phase 4.10.B (W5-164: MINIFS, MAXIFS, COUNTBLANK = 3
+        // conditional-aggregate fillins).
+        assert_eq!(r.len(), 140);
     }
 
     #[test]

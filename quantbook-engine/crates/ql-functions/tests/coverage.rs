@@ -253,6 +253,21 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
     ("AVERAGEIF", "V1 anchoring divergence in matrix"),
     ("AVERAGEIFS", "2D shape validation pinned in W5-60"),
     ("SUMPRODUCT", "2D shape validation pinned in W5-60"),
+    // W5-164 (Phase 4.10.B) — conditional-aggregate fillins. Unit
+    // tests pin no-match → 0 (MINIFS/MAXIFS) and blank/empty-string
+    // detection (COUNTBLANK); matrix overrides deferred.
+    (
+        "MINIFS",
+        "W5-164; unit tests pin no-match → 0 + shape validation; matrix overrides deferred",
+    ),
+    (
+        "MAXIFS",
+        "W5-164; unit tests pin no-match → 0 + error propagation; matrix overrides deferred",
+    ),
+    (
+        "COUNTBLANK",
+        "W5-164; unit tests pin Blank + empty-string detection; matrix overrides deferred",
+    ),
     // (HLOOKIP moved to EXPECTED_COVERED in W5-67 — Sonnet mega-audit S1
     // flagged that the prior "transitively covered by VLOOKUP" reason was
     // false; HLOOKUP is a separate function body, not an alias.)
