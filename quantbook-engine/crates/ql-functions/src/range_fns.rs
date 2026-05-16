@@ -1448,6 +1448,57 @@ pub(crate) fn compute_correl(xs: &[f64], ys: &[f64]) -> Result<f64, ErrorValue> 
     Ok(r)
 }
 
+/// **W5-179 (Phase 4.10 polish / Wave 3 regression batch closure):**
+/// shared FnArg → numeric xy-pairs extraction used by CORREL,
+/// PEARSON, RSQ, and STEYX. Both args MUST be ranges of identical
+/// shape. Pairs where EITHER cell is non-numeric (Text / Boolean /
+/// Blank) are dropped per the IronCalc `values_from_range` rule —
+/// Booleans NOT coerced to 1/0 (diverges from SUM canon). Errors
+/// propagate immediately.
+///
+/// **Shape-mismatch divergence:** returns `Err(#VALUE!)` per the
+/// in-codebase paired-array convention (SUMX2MY2 family from W5-166,
+/// CORREL/SLOPE/INTERCEPT from W5-177/178). Microsoft canon says
+/// `#N/A` — engine-wide divergence flagged in `excel-matrix.md`.
+fn collect_xy_pairs(a: &FnArg, b: &FnArg) -> Result<(Vec<f64>, Vec<f64>), ErrorValue> {
+    let (a_raw, a_rows, a_cols) = match a {
+        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Scalar(_) => return Err(ErrorValue::Value),
+    };
+    let (b_raw, b_rows, b_cols) = match b {
+        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
+        FnArg::Scalar(_) => return Err(ErrorValue::Value),
+    };
+    if a_rows != b_rows || a_cols != b_cols {
+        return Err(ErrorValue::Value);
+    }
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    for (av, bv) in a_raw.iter().zip(b_raw.iter()) {
+        if let Value::Error(e) = av {
+            return Err(*e);
+        }
+        if let Value::Error(e) = bv {
+            return Err(*e);
+        }
+        let x_opt = if let Value::Number(n) = av {
+            Some(*n)
+        } else {
+            None
+        };
+        let y_opt = if let Value::Number(n) = bv {
+            Some(*n)
+        } else {
+            None
+        };
+        if let (Some(x), Some(y)) = (x_opt, y_opt) {
+            xs.push(x);
+            ys.push(y);
+        }
+    }
+    Ok((xs, ys))
+}
+
 /// **W5-177 (Phase 4.10 polish / Wave 3 starter):** `CORREL(array1,
 /// array2)` — Pearson correlation coefficient of two same-shape data
 /// sets. RangeAwareFn; both args MUST be ranges.
@@ -1461,59 +1512,58 @@ pub(crate) fn compute_correl(xs: &[f64], ys: &[f64]) -> Result<f64, ErrorValue> 
 /// - Need ≥2 numeric pairs → otherwise `#DIV/0!`.
 /// - Constant array on either side (denom == 0) → `#DIV/0!`.
 ///
-/// **Shape-mismatch divergence:** Microsoft canon says `#N/A` for
-/// shape mismatch; IronCalc + our existing paired-array family
-/// (SUMX2MY2, SUMX2PY2, SUMXMY2 from W5-166) use `#VALUE!`. CORREL
-/// follows the in-codebase convention (`#VALUE!`) for consistency
-/// with the W5-166 family; this is a deliberate engine-wide
-/// divergence from Microsoft canon documented in `excel-matrix.md`.
+/// **W5-179 refactor:** body extracted into `collect_xy_pairs`
+/// (shared with PEARSON, RSQ, STEYX); semantics unchanged.
 pub fn correl(args: &[FnArg]) -> Value {
     if args.len() != 2 {
         return Value::Error(ErrorValue::Value);
     }
-    let (xs_raw, x_rows, x_cols) = match &args[0] {
-        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
-        FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
+    let (xs, ys) = match collect_xy_pairs(&args[0], &args[1]) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
     };
-    let (ys_raw, y_rows, y_cols) = match &args[1] {
-        FnArg::Range { values, rows, cols } => (values.as_slice(), *rows, *cols),
-        FnArg::Scalar(_) => return Value::Error(ErrorValue::Value),
-    };
-    if x_rows != y_rows || x_cols != y_cols {
-        return Value::Error(ErrorValue::Value);
-    }
-    let mut xs: Vec<f64> = Vec::new();
-    let mut ys: Vec<f64> = Vec::new();
-    for (xv, yv) in xs_raw.iter().zip(ys_raw.iter()) {
-        if let Value::Error(e) = xv {
-            return Value::Error(*e);
-        }
-        if let Value::Error(e) = yv {
-            return Value::Error(*e);
-        }
-        // Per IronCalc `values_from_range`: only `Value::Number`
-        // contributes. Text / Boolean / Blank all map to None — the
-        // pair is dropped if EITHER side is non-numeric.
-        let x_opt = if let Value::Number(n) = xv {
-            Some(*n)
-        } else {
-            None
-        };
-        let y_opt = if let Value::Number(n) = yv {
-            Some(*n)
-        } else {
-            None
-        };
-        if let (Some(x), Some(y)) = (x_opt, y_opt) {
-            xs.push(x);
-            ys.push(y);
-        }
-    }
     if xs.len() < 2 {
         return Value::Error(ErrorValue::DivZero);
     }
     match compute_correl(&xs, &ys) {
         Ok(r) => match coercion::sanitize_f64(r) {
+            Ok(n) => Value::Number(n),
+            Err(e) => Value::Error(e),
+        },
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// **W5-179 (Phase 4.10 polish / Wave 3 regression batch closure):**
+/// `PEARSON(array1, array2)` — Pearson product-moment correlation
+/// coefficient. Mathematically IDENTICAL to `CORREL` per Microsoft +
+/// IronCalc (`fn_pearson` and `fn_correl` produce the same number on
+/// the same input). Excel exposes them as two separate functions for
+/// terminology / discoverability; we route both through the same
+/// kernel.
+pub fn pearson(args: &[FnArg]) -> Value {
+    correl(args)
+}
+
+/// **W5-179 (Phase 4.10 polish / Wave 3 regression batch closure):**
+/// `RSQ(known_y, known_x)` — coefficient of determination
+/// `R² = CORREL²` per Microsoft + IronCalc. Same arg-order
+/// indifference as CORREL (the formula is symmetric in x/y), though
+/// Excel docs label them `(known_y's, known_x's)` for consistency
+/// with SLOPE / INTERCEPT.
+pub fn rsq(args: &[FnArg]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let (xs, ys) = match collect_xy_pairs(&args[0], &args[1]) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
+    };
+    if xs.len() < 2 {
+        return Value::Error(ErrorValue::DivZero);
+    }
+    match compute_correl(&xs, &ys) {
+        Ok(r) => match coercion::sanitize_f64(r * r) {
             Ok(n) => Value::Number(n),
             Err(e) => Value::Error(e),
         },
@@ -1666,6 +1716,86 @@ pub fn slope(args: &[FnArg]) -> Value {
 /// Computed as `intercept = ȳ − slope · x̄` after deriving slope.
 pub fn intercept(args: &[FnArg]) -> Value {
     slope_intercept_dispatch(args, compute_intercept)
+}
+
+/// **W5-179 (Phase 4.10 polish / Wave 3 regression batch closure):**
+/// standard error of the predicted y in least-squares regression.
+/// `sey = √(SSE / (n − 2))` where `SSE = Σ(y − ŷ)²` and
+/// `ŷ = intercept + slope · x`.
+///
+/// Two-pass: first pass builds `LinearFitSums` and derives slope +
+/// intercept via `compute_slope` (so the slope-derivation `#DIV/0!`
+/// path is shared with SLOPE / INTERCEPT). Second pass walks the
+/// preserved pairs to compute residuals.
+///
+/// Requires ≥3 numeric pairs (denominator is `n − 2`); caller passes
+/// `(ys, xs)` in Y-first order matching Excel's STEYX signature.
+pub(crate) fn compute_steyx(ys: &[f64], xs: &[f64]) -> Result<f64, ErrorValue> {
+    debug_assert_eq!(ys.len(), xs.len());
+    let n = ys.len() as f64;
+    if n < 3.0 {
+        return Err(ErrorValue::DivZero);
+    }
+    let mut sums = LinearFitSums {
+        n: 0.0,
+        sum_x: 0.0,
+        sum_y: 0.0,
+        sum_x2: 0.0,
+        sum_xy: 0.0,
+    };
+    for (&y, &x) in ys.iter().zip(xs.iter()) {
+        sums.n += 1.0;
+        sums.sum_x += x;
+        sums.sum_y += y;
+        sums.sum_x2 += x * x;
+        sums.sum_xy += x * y;
+    }
+    let slope = compute_slope(&sums)?;
+    let intercept = (sums.sum_y - slope * sums.sum_x) / sums.n;
+    if !intercept.is_finite() {
+        return Err(ErrorValue::Num);
+    }
+    let mut sse = 0.0;
+    for (&y, &x) in ys.iter().zip(xs.iter()) {
+        let y_hat = intercept + slope * x;
+        let diff = y - y_hat;
+        sse += diff * diff;
+    }
+    let dof = n - 2.0;
+    let sey = (sse / dof).sqrt();
+    if !sey.is_finite() {
+        return Err(ErrorValue::Num);
+    }
+    Ok(sey)
+}
+
+/// **W5-179 (Phase 4.10 polish / Wave 3 regression batch closure):**
+/// `STEYX(known_y, known_x)` — standard error of the predicted y.
+/// RangeAwareFn; same Y-first arg order as SLOPE / INTERCEPT.
+///
+/// Excel canon (verified against IronCalc `fn_steyx`):
+/// - Both args must be ranges of identical shape.
+/// - Need ≥3 numeric pairs (denominator is `n − 2`) → otherwise
+///   `#DIV/0!`.
+/// - Constant x-array → `#DIV/0!` (inherits from `compute_slope`).
+/// - Pairs with non-numeric on EITHER side dropped (Boolean NOT
+///   coerced to 1/0); errors propagate immediately.
+pub fn steyx(args: &[FnArg]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    // Excel arg order is (known_y, known_x) — Y first.
+    let (ys, xs) = match collect_xy_pairs(&args[0], &args[1]) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
+    };
+    match compute_steyx(&ys, &xs) {
+        Ok(v) => match coercion::sanitize_f64(v) {
+            Ok(n) => Value::Number(n),
+            Err(e) => Value::Error(e),
+        },
+        Err(e) => Value::Error(e),
+    }
 }
 
 /// **W5-164 (Phase 4.10.B):** `MINIFS(min_range, criteria_range1,
@@ -3668,6 +3798,178 @@ mod tests {
         let ys = r(vec![n(2.0), Value::Boolean(true), n(6.0)]);
         let xs = r(vec![n(1.0), n(2.0), n(3.0)]);
         approx_scalar(intercept(&[ys, xs]), 0.0, 1e-9);
+    }
+
+    // === W5-179 (Phase 4.10 polish / Wave 3 regression batch closure)
+    //     — PEARSON + RSQ + STEYX ===
+
+    // --- PEARSON (delegates to CORREL) ---
+
+    #[test]
+    fn pearson_matches_correl_perfect_positive() {
+        // PEARSON ≡ CORREL contract: same input, same output.
+        let x = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        let y = r(vec![n(2.0), n(4.0), n(6.0), n(8.0)]);
+        approx_scalar(pearson(&[x, y]), 1.0, 1e-9);
+    }
+
+    #[test]
+    fn pearson_matches_correl_known_fixture() {
+        // Same fixture as `correl_known_microsoft_example`: x=[1,2,3],
+        // y=[4,6,9] → r ≈ 0.993399267.
+        let x = r(vec![n(1.0), n(2.0), n(3.0)]);
+        let y = r(vec![n(4.0), n(6.0), n(9.0)]);
+        approx_scalar(pearson(&[x, y]), 0.993399267, 1e-6);
+    }
+
+    #[test]
+    fn pearson_propagates_div_zero_from_constant_array() {
+        let x = r(vec![n(5.0), n(5.0), n(5.0)]);
+        let y = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(pearson(&[x, y]), Value::Error(ErrorValue::DivZero));
+    }
+
+    // --- RSQ ---
+
+    #[test]
+    fn rsq_perfect_positive_is_one() {
+        // r=1 → r²=1.
+        let x = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        let y = r(vec![n(2.0), n(4.0), n(6.0), n(8.0)]);
+        approx_scalar(rsq(&[x, y]), 1.0, 1e-9);
+    }
+
+    #[test]
+    fn rsq_perfect_negative_is_one() {
+        // r=-1 → r²=1. Same magnitude.
+        let x = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        let y = r(vec![n(-1.0), n(-2.0), n(-3.0), n(-4.0)]);
+        approx_scalar(rsq(&[x, y]), 1.0, 1e-9);
+    }
+
+    #[test]
+    fn rsq_known_fixture() {
+        // CORREL = 0.993399267 → RSQ ≈ 0.986841...
+        let x = r(vec![n(1.0), n(2.0), n(3.0)]);
+        let y = r(vec![n(4.0), n(6.0), n(9.0)]);
+        approx_scalar(rsq(&[x, y]), 0.993399267_f64.powi(2), 1e-6);
+    }
+
+    #[test]
+    fn rsq_constant_array_is_div_zero() {
+        let x = r(vec![n(1.0), n(2.0), n(3.0)]);
+        let y = r(vec![n(7.0), n(7.0), n(7.0)]);
+        assert_eq!(rsq(&[x, y]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn rsq_too_few_pairs_is_div_zero() {
+        let x = r(vec![n(1.0), t("a")]);
+        let y = r(vec![n(2.0), n(3.0)]);
+        assert_eq!(rsq(&[x, y]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn rsq_shape_mismatch_is_value_error() {
+        let x = r(vec![n(1.0), n(2.0)]);
+        let y = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(rsq(&[x, y]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn rsq_arity_violations() {
+        assert_eq!(rsq(&[]), Value::Error(ErrorValue::Value));
+        let x = r(vec![n(1.0), n(2.0)]);
+        let y = r(vec![n(1.0), n(2.0)]);
+        let z = r(vec![n(1.0), n(2.0)]);
+        assert_eq!(rsq(&[x, y, z]), Value::Error(ErrorValue::Value));
+    }
+
+    // --- STEYX ---
+
+    #[test]
+    fn steyx_perfect_line_is_zero() {
+        // y = 2x exactly → all residuals zero → SSE = 0 → sey = 0.
+        let ys = r(vec![n(2.0), n(4.0), n(6.0), n(8.0)]);
+        let xs = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        approx_scalar(steyx(&[ys, xs]), 0.0, 1e-9);
+    }
+
+    #[test]
+    fn steyx_manual_scatter_fixture() {
+        // ys=[1,3,5,6], xs=[1,2,3,4]:
+        //   slope = (4·46 − 10·15) / (4·30 − 100) = 34/20 = 1.7
+        //   intercept = (15 − 1.7·10) / 4 = -0.5
+        //   ŷ = [1.2, 2.9, 4.6, 6.3]
+        //   residuals = [-0.2, 0.1, 0.4, -0.3]
+        //   SSE = 0.04 + 0.01 + 0.16 + 0.09 = 0.30
+        //   sey = √(0.30 / 2) ≈ 0.387298335...
+        let ys = r(vec![n(1.0), n(3.0), n(5.0), n(6.0)]);
+        let xs = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        approx_scalar(steyx(&[ys, xs]), 0.387298334620742, 1e-9);
+    }
+
+    #[test]
+    fn steyx_too_few_pairs_is_div_zero() {
+        // 2 valid pairs → dof = 0 → #DIV/0!.
+        let ys = r(vec![n(1.0), n(2.0)]);
+        let xs = r(vec![n(1.0), n(2.0)]);
+        assert_eq!(steyx(&[ys, xs]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn steyx_exactly_three_pairs_succeeds() {
+        // n=3 boundary — dof=1. Hand-compute:
+        //   ys=[2, 5, 7], xs=[1, 2, 3]: Σx=6 Σy=14 Σx²=14 Σxy=33
+        //   slope = (3·33 − 6·14)/(3·14 − 36) = (99-84)/6 = 2.5
+        //   intercept = (14 − 2.5·6)/3 = (14-15)/3 = -0.333...
+        //   ŷ = [2.166..., 4.666..., 7.166...]
+        //   residuals = [-0.166..., 0.333..., -0.166...]
+        //   SSE = 0.02777... + 0.11111... + 0.02777... = 0.16666...
+        //   sey = √(0.16666/1) ≈ 0.408248...
+        let ys = r(vec![n(2.0), n(5.0), n(7.0)]);
+        let xs = r(vec![n(1.0), n(2.0), n(3.0)]);
+        approx_scalar(steyx(&[ys, xs]), 0.408248290463863, 1e-9);
+    }
+
+    #[test]
+    fn steyx_constant_x_is_div_zero() {
+        // Constant x → slope #DIV/0! → STEYX inherits.
+        let ys = r(vec![n(1.0), n(2.0), n(3.0)]);
+        let xs = r(vec![n(5.0), n(5.0), n(5.0)]);
+        assert_eq!(steyx(&[ys, xs]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn steyx_skips_non_numeric_pairs() {
+        // Drop (TRUE, 99). Remaining: ys=[2,6,8], xs=[1,3,4]. Still
+        // need n≥3 — passes (3 pairs). Perfect line y=2x → sey=0.
+        let ys = r(vec![n(2.0), Value::Boolean(true), n(6.0), n(8.0)]);
+        let xs = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        approx_scalar(steyx(&[ys, xs]), 0.0, 1e-9);
+    }
+
+    #[test]
+    fn steyx_shape_mismatch_is_value_error() {
+        let ys = r(vec![n(1.0), n(2.0), n(3.0)]);
+        let xs = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        assert_eq!(steyx(&[ys, xs]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn steyx_arity_and_scalar_validation() {
+        assert_eq!(steyx(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            steyx(&[s(n(1.0)), s(n(2.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn steyx_error_propagation() {
+        let ys = r(vec![n(1.0), Value::Error(ErrorValue::Ref), n(3.0)]);
+        let xs = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(steyx(&[ys, xs]), Value::Error(ErrorValue::Ref));
     }
 
     // === W5-167 (Phase 4.10.E) — TEXTJOIN ===

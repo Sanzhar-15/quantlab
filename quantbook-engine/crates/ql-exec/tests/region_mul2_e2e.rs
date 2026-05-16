@@ -446,6 +446,19 @@ fn e2e_textjoin_registered() {
 }
 
 #[test]
+fn e2e_pearson_rsq_steyx_registered() {
+    // W5-179: PEARSON + RSQ + STEYX are RangeAwareFns; registry-lookup
+    // smoke check per the W5-176 / W5-177 / W5-178 pattern.
+    let registry = default_registry();
+    assert!(registry.lookup_range_aware("PEARSON").is_some());
+    assert!(registry.lookup_range_aware("pearson").is_some());
+    assert!(registry.lookup_range_aware("RSQ").is_some());
+    assert!(registry.lookup_range_aware("rsq").is_some());
+    assert!(registry.lookup_range_aware("STEYX").is_some());
+    assert!(registry.lookup_range_aware("steyx").is_some());
+}
+
+#[test]
 fn e2e_slope_intercept_registered() {
     // W5-178: SLOPE + INTERCEPT are RangeAwareFns; registry-lookup
     // smoke check per the W5-176 / W5-177 pattern (range-arg

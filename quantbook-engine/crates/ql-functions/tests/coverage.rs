@@ -284,6 +284,23 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "INTERCEPT",
         "W5-178; unit tests pin known-fixture intercept (b=0 on y=2x + manual y=ax+b) + slope-failure inheritance",
     ),
+    // W5-179 (Phase 4.10 polish / Wave 3 regression batch closure) —
+    // PEARSON + RSQ + STEYX. PEARSON is a thin wrapper over
+    // `correl(args)` (Microsoft + IronCalc both confirm they share
+    // formula). RSQ multiplies CORREL by itself. STEYX is the only
+    // real new work — two-pass over pairs to compute residuals.
+    (
+        "PEARSON",
+        "W5-179; unit tests pin PEARSON==CORREL contract + delegation invariant on known fixtures",
+    ),
+    (
+        "RSQ",
+        "W5-179; unit tests pin R² = CORREL² invariant on perfect/known fixtures + same #DIV/0! paths",
+    ),
+    (
+        "STEYX",
+        "W5-179; unit tests pin known-fixture sey (zero on perfect-line + manual scatter case) + n>=3 requirement",
+    ),
     // W5-168 (Phase 4.10.F) — financial TVM + cash-flow.
     (
         "PMT",

@@ -656,6 +656,15 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_range_aware("SLOPE", range_fns::slope);
     r.register_range_aware("INTERCEPT", range_fns::intercept);
 
+    // Phase 4.10 polish (W5-179) — PEARSON + RSQ + STEYX: close the
+    // Wave 3 regression batch. PEARSON is mathematically identical to
+    // CORREL (Microsoft + IronCalc both confirm); RSQ is CORREL²;
+    // STEYX is the standard error of the predicted y (two-pass over
+    // the pairs for residuals).
+    r.register_range_aware("PEARSON", range_fns::pearson);
+    r.register_range_aware("RSQ", range_fns::rsq);
+    r.register_range_aware("STEYX", range_fns::steyx);
+
     // Phase 4.10.G (W5-169) — modern lookups (range-aware).
     r.register_range_aware("XLOOKUP", range_fns::xlookup);
     r.register_range_aware("XMATCH", range_fns::xmatch);
@@ -758,8 +767,9 @@ mod tests {
         // text-to-number variant of VALUE; W5-174: MIRR = 1 closed-form
         // Modified IRR; W5-177: CORREL = 1 Pearson correlation
         // coefficient; W5-178: SLOPE + INTERCEPT = 2 least-squares
-        // regression — Wave 3 regression batch).
-        assert_eq!(r.len(), 185);
+        // regression; W5-179: PEARSON + RSQ + STEYX = 3 — CLOSES the
+        // Wave 3 regression batch).
+        assert_eq!(r.len(), 188);
     }
 
     #[test]
