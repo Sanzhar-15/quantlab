@@ -446,8 +446,14 @@ pub fn default_registry() -> FunctionRegistry {
     // Period-iterating (each period depends on accumulated book
     // value); Excel-specific 3-decimal rate rounding; optional
     // `month` arg (default 12) for partial first / last periods.
-    // VDB still deferred.
     r.register("DB", financial_fns::db);
+
+    // Phase 4.10 polish (W5-183) — VDB: variable-declining-balance
+    // (CLOSES Wave 3 depreciation batch). Period range + DDB-to-SLN
+    // crossover + optional no_switch flag. Most complex single
+    // function in the depreciation batch. IronCalc has it in docs
+    // nav only; ported directly from Microsoft examples.
+    r.register("VDB", financial_fns::vdb);
 
     // Phase 4.10.G (W5-169) — ADDRESS (scalar text formatter).
     r.register("ADDRESS", scalar_fns::address);
@@ -789,8 +795,9 @@ mod tests {
         // Wave 3 regression batch; W5-180: SLN + SYD = 2 — Wave 3
         // depreciation batch starter; W5-181: DDB = 1 — closed-form
         // double-declining-balance; W5-182: DB = 1 — period-iterating
-        // fixed-declining-balance).
-        assert_eq!(r.len(), 192);
+        // fixed-declining-balance; W5-183: VDB = 1 — CLOSES Wave 3
+        // depreciation batch).
+        assert_eq!(r.len(), 193);
     }
 
     #[test]

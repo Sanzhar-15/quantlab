@@ -446,6 +446,23 @@ fn e2e_textjoin_registered() {
 }
 
 #[test]
+fn e2e_vdb_depreciation() {
+    // W5-183: VDB is ScalarFn; evaluable through `bind(&ast, 0)`.
+    // Microsoft docs first-year example: VDB(2400, 300, 10, 0, 1) = 480.
+    let result = eval_source_with_registry("VDB(2400, 300, 10, 0, 1)", &[]);
+    assert_eq!(result, Value::Number(480.0));
+    // Microsoft factor=1.5 partial-year example:
+    // VDB(2400, 300, 10, 0, 0.875, 1.5) = 315.00.
+    let result = eval_source_with_registry("VDB(2400, 300, 10, 0, 0.875, 1.5)", &[]);
+    match result {
+        Value::Number(got) => {
+            assert!((got - 315.0).abs() < 0.01, "expected ≈ 315, got {got}")
+        }
+        other => panic!("expected Number, got {other:?}"),
+    }
+}
+
+#[test]
 fn e2e_db_depreciation() {
     // W5-182: DB is ScalarFn; evaluable through `bind(&ast, 0)`.
     // Microsoft docs first-period example: rate=0.319; result =

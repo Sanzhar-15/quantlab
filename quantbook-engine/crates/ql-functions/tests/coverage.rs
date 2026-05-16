@@ -331,6 +331,15 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "DB",
         "W5-182 + W5-182.1; unit tests pin Microsoft fixtures (DB(1M,100k,6,k,7) for k=1, 2, 6, 7 — period=6 value-pinned in W5-182.1 after Opus HIGH-1) + W5-182.1 audit closures (life<=0, period<1, life>i32::MAX, Boolean month coercion) + validation #NUM! paths",
     ),
+    // W5-183 (Phase 4.10 polish / CLOSES Wave 3 depreciation batch)
+    // — VDB: variable-declining-balance with DDB-to-SLN crossover.
+    // IronCalc has VDB in docs nav only (no Rust impl); algorithm
+    // ported directly from Microsoft canon. Tests pin all 6
+    // Microsoft documented examples + edge cases.
+    (
+        "VDB",
+        "W5-183; unit tests pin all 6 Microsoft fixtures (VDB(2400,300,10×{365,12,1},0,1) = $1.32/$40/$480; VDB(2400,300,120,6,18) = $396.31; factor=1.5 variants $311.81 and $315.00) + no_switch=TRUE branch + start==end + cost==0 + DoS guard + validation #NUM! paths",
+    ),
     // W5-168 (Phase 4.10.F) — financial TVM + cash-flow.
     (
         "PMT",

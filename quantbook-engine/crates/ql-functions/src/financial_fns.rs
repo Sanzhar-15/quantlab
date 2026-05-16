@@ -778,6 +778,187 @@ pub fn db(args: &[Value]) -> Value {
     finish(compute_db(cost, salvage, life, period, month))
 }
 
+/// **W5-183 (Phase 4.10 polish / CLOSES Wave 3 depreciation batch):**
+/// variable-declining-balance depreciation per Microsoft canon.
+/// `VDB(cost, salvage, life, start_period, end_period, [factor=2],
+/// [no_switch=FALSE])`.
+///
+/// Most complex of the depreciation batch — period-iteration with
+/// DDB-to-SLN crossover. IronCalc has it in docs nav but NOT in
+/// Rust source (only stubbed); algorithm ported from Microsoft
+/// docs examples + the canonical period-iteration form.
+///
+/// ## Algorithm
+///
+/// For each period `i` from 0 to `ceil(end_period) - 1`:
+///   1. Compute DDB depreciation: `min(book * (factor/life), book − salvage)`,
+///      floored at 0.
+///   2. If `!no_switch` and SLN-from-here `(book − salvage) / (life − i)`
+///      exceeds the DDB amount: switch to SLN permanently from this
+///      period onward (lock in the SLN per-period amount at the
+///      moment of switch).
+///   3. Compute overlap fraction `[max(i, start), min(i+1, end)]`.
+///      Add `(overlap * period_dep)` to the total.
+///   4. Subtract the FULL `period_dep` from `book` (not the overlap
+///      fraction — depreciation continues whether or not the period
+///      is in the requested range).
+///
+/// ## Validation (Microsoft: "All arguments except no_switch must be
+/// positive numbers")
+///
+/// - `cost < 0`, `salvage < 0`, `life <= 0`, `factor <= 0` → `#NUM!`.
+/// - `start_period < 0` or `end_period < start_period` → `#NUM!`.
+/// - `end_period > life` → `#NUM!` (depreciation beyond the asset's
+///   life is undefined).
+/// - `life > i32::MAX` or `end_period > i32::MAX` → `#NUM!` (DoS guard
+///   matching W5-182.1).
+/// - `cost == 0` short-circuits to `0`.
+/// - `start_period == end_period` returns `0` (empty range).
+///
+/// **Engine convention** (matches DDB / DB family): all numeric args
+/// use `arg_num` which accepts Boolean coercion; `no_switch` uses
+/// `arg_type` for explicit Boolean semantics.
+pub(crate) fn compute_vdb(
+    cost: f64,
+    salvage: f64,
+    life: f64,
+    start_period: f64,
+    end_period: f64,
+    factor: f64,
+    no_switch: bool,
+) -> Result<f64, ErrorValue> {
+    if cost < 0.0
+        || salvage < 0.0
+        || life <= 0.0
+        || start_period < 0.0
+        || end_period < start_period
+        || end_period > life
+        || factor <= 0.0
+        || life > i32::MAX as f64
+        || end_period > i32::MAX as f64
+    {
+        return Err(ErrorValue::Num);
+    }
+    if start_period == end_period {
+        return Ok(0.0);
+    }
+    if cost == 0.0 {
+        return Ok(0.0);
+    }
+
+    let rate = factor / life;
+    let mut book = cost;
+    let mut total = 0.0_f64;
+    let mut switched_to_sln = false;
+    let mut sln_per_period = 0.0_f64;
+
+    let end_ceil = end_period.ceil() as i32;
+
+    for period in 0..end_ceil {
+        let period_f = period as f64;
+
+        // DDB depreciation for this period, capped by remaining book
+        // above salvage (salvage floor — matches our DDB impl).
+        let ddb_period = (book * rate).min(book - salvage).max(0.0);
+
+        // Determine actual depreciation amount with DDB → SLN switch.
+        let period_dep = if no_switch {
+            ddb_period
+        } else {
+            // Periods remaining including this one. Guarded against
+            // div-by-zero (validation ensures end_period <= life so
+            // period <= life - 1, hence life - period >= 1).
+            let periods_remaining = (life - period_f).max(1.0);
+            let sln_now = (book - salvage) / periods_remaining;
+
+            if !switched_to_sln && sln_now > ddb_period {
+                switched_to_sln = true;
+                sln_per_period = sln_now;
+            }
+
+            if switched_to_sln {
+                sln_per_period
+            } else {
+                ddb_period
+            }
+        };
+
+        // Overlap of this period [period_f, period_f+1] with the
+        // requested range [start_period, end_period].
+        let overlap_start = period_f.max(start_period);
+        let overlap_end = (period_f + 1.0).min(end_period);
+        let overlap = (overlap_end - overlap_start).max(0.0);
+
+        total += period_dep * overlap;
+
+        // Book depletes by the full period's depreciation (not just
+        // the overlap fraction) — depreciation accrues whether or not
+        // the period is in the requested range.
+        book -= period_dep;
+        // Defensive floor (DDB salvage cap should keep this redundant,
+        // but float drift over many periods could overshoot).
+        if book < salvage {
+            book = salvage;
+        }
+    }
+
+    Ok(total)
+}
+
+/// **W5-183:** `VDB(cost, salvage, life, start_period, end_period,
+/// [factor=2], [no_switch=FALSE])`. Five required args; `factor` +
+/// `no_switch` optional.
+pub fn vdb(args: &[Value]) -> Value {
+    if !(5..=7).contains(&args.len()) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let cost = match arg_num(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let salvage = match arg_num(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let life = match arg_num(&args[2]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let start_period = match arg_num(&args[3]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let end_period = match arg_num(&args[4]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let factor = if args.len() >= 6 {
+        match arg_num(&args[5]) {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        2.0
+    };
+    let no_switch = if args.len() == 7 {
+        match arg_type(&args[6]) {
+            Ok(b) => b,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        false
+    };
+    finish(compute_vdb(
+        cost,
+        salvage,
+        life,
+        start_period,
+        end_period,
+        factor,
+        no_switch,
+    ))
+}
+
 /// **W5-181:** `DDB(cost, salvage, life, period, [factor=2])`.
 /// Four required args; `factor` optional (default 2 = double-
 /// declining-balance; pass 1 for single-declining-balance, etc).
@@ -2365,5 +2546,322 @@ mod tests {
             ]),
             Value::Error(ErrorValue::Num)
         );
+    }
+
+    // --- VDB (W5-183) — CLOSES Wave 3 depreciation batch ---
+    //
+    // All six Microsoft documented examples are pinned; expected
+    // values are direct quotes from
+    // https://support.microsoft.com/.../vdb-function-...
+
+    #[test]
+    fn vdb_microsoft_example_first_day() {
+        // VDB(2400, 300, 10*365, 0, 1) = $1.32 (first day of 10-year life).
+        approx(
+            vdb(&[n(2400.0), n(300.0), n(3650.0), n(0.0), n(1.0)]),
+            1.32,
+            0.01,
+        );
+    }
+
+    #[test]
+    fn vdb_microsoft_example_first_month() {
+        // VDB(2400, 300, 10*12, 0, 1) = $40.00 (first month).
+        approx(
+            vdb(&[n(2400.0), n(300.0), n(120.0), n(0.0), n(1.0)]),
+            40.0,
+            0.005,
+        );
+    }
+
+    #[test]
+    fn vdb_microsoft_example_first_year() {
+        // VDB(2400, 300, 10, 0, 1) = $480.00 (first year, factor=2 default).
+        approx(
+            vdb(&[n(2400.0), n(300.0), n(10.0), n(0.0), n(1.0)]),
+            480.0,
+            1e-9,
+        );
+    }
+
+    #[test]
+    fn vdb_microsoft_example_months_6_to_18() {
+        // VDB(2400, 300, 10*12, 6, 18) = $396.31 (months 7 through 18).
+        approx(
+            vdb(&[n(2400.0), n(300.0), n(120.0), n(6.0), n(18.0)]),
+            396.31,
+            0.01,
+        );
+    }
+
+    #[test]
+    fn vdb_microsoft_example_factor_1_5_months_6_to_18() {
+        // VDB(2400, 300, 10*12, 6, 18, 1.5) = $311.81.
+        approx(
+            vdb(&[n(2400.0), n(300.0), n(120.0), n(6.0), n(18.0), n(1.5)]),
+            311.81,
+            0.01,
+        );
+    }
+
+    #[test]
+    fn vdb_microsoft_example_partial_first_year_factor_1_5() {
+        // VDB(2400, 300, 10, 0, 0.875, 1.5) = $315.00.
+        // rate = 1.5/10 = 0.15; period-1 DDB = 2400 * 0.15 = 360.
+        // SLN = (2400-300)/10 = 210; DDB > SLN, no switch.
+        // Fraction 0.875 * 360 = 315.00.
+        approx(
+            vdb(&[n(2400.0), n(300.0), n(10.0), n(0.0), n(0.875), n(1.5)]),
+            315.0,
+            0.01,
+        );
+    }
+
+    #[test]
+    fn vdb_no_switch_keeps_ddb_throughout() {
+        // With no_switch=TRUE, the SLN crossover never triggers — VDB
+        // sums pure DDB over the range. For period 0..life with rate=0.2:
+        // Sum of all DDB = cost - book_at_life = cost - cost*(0.8^life).
+        // But DDB is capped at salvage, so over full life, total deprecation
+        // equals cost - salvage = 2100.
+        let cost = 2400.0;
+        let salvage = 300.0;
+        let life = 10.0;
+        let total_with_switch = match vdb(&[
+            n(cost),
+            n(salvage),
+            n(life),
+            n(0.0),
+            n(life),
+            n(2.0),
+            Value::Boolean(false),
+        ]) {
+            Value::Number(x) => x,
+            other => panic!("expected Number, got {other:?}"),
+        };
+        let total_no_switch = match vdb(&[
+            n(cost),
+            n(salvage),
+            n(life),
+            n(0.0),
+            n(life),
+            n(2.0),
+            Value::Boolean(true),
+        ]) {
+            Value::Number(x) => x,
+            other => panic!("expected Number, got {other:?}"),
+        };
+        // Both should equal cost - salvage = 2100 over the full life
+        // (DDB salvage cap ensures full depreciation either way).
+        approx(
+            vdb(&[n(cost), n(salvage), n(life), n(0.0), n(life)]),
+            2100.0,
+            1e-9,
+        );
+        // The switched form should equal cost - salvage = 2100.
+        assert!(
+            (total_with_switch - 2100.0).abs() < 1e-9,
+            "switch form total should be 2100, got {total_with_switch}"
+        );
+        // The no_switch form should also reach salvage (DDB cap), so total
+        // also equals 2100 over full life. Confirming both forms agree on
+        // the cost-salvage invariant when summing over the full life.
+        assert!(
+            (total_no_switch - 2100.0).abs() < 1e-9,
+            "no_switch form total should be 2100, got {total_no_switch}"
+        );
+    }
+
+    #[test]
+    fn vdb_no_switch_diverges_from_default_partial_range() {
+        // Where the difference matters is in mid-life partial ranges,
+        // because no_switch holds DDB while default mode would switch
+        // to SLN. With DDB on a 10-year asset (rate=0.2) starting from
+        // year 5, the no_switch sum will be smaller than the default
+        // because by then SLN is greater than DDB.
+        let switched = match vdb(&[n(1000.0), n(100.0), n(10.0), n(5.0), n(10.0)]) {
+            Value::Number(x) => x,
+            other => panic!("expected Number, got {other:?}"),
+        };
+        let no_switch = match vdb(&[
+            n(1000.0),
+            n(100.0),
+            n(10.0),
+            n(5.0),
+            n(10.0),
+            n(2.0),
+            Value::Boolean(true),
+        ]) {
+            Value::Number(x) => x,
+            other => panic!("expected Number, got {other:?}"),
+        };
+        // With switching enabled, the late-life range hits more SLN
+        // (which is larger by that point), so the sum should be ≥ no_switch.
+        assert!(
+            switched >= no_switch,
+            "switched ({switched}) should be ≥ no_switch ({no_switch})"
+        );
+    }
+
+    // --- VDB validation closures ---
+
+    #[test]
+    fn vdb_start_equals_end_returns_zero() {
+        // Empty range → 0 (depreciation over an empty period is 0).
+        approx(
+            vdb(&[n(2400.0), n(300.0), n(10.0), n(3.0), n(3.0)]),
+            0.0,
+            1e-12,
+        );
+    }
+
+    #[test]
+    fn vdb_cost_zero_returns_zero() {
+        approx(vdb(&[n(0.0), n(0.0), n(10.0), n(0.0), n(10.0)]), 0.0, 1e-12);
+    }
+
+    #[test]
+    fn vdb_end_before_start_is_num() {
+        assert_eq!(
+            vdb(&[n(2400.0), n(300.0), n(10.0), n(5.0), n(3.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn vdb_end_exceeds_life_is_num() {
+        assert_eq!(
+            vdb(&[n(2400.0), n(300.0), n(10.0), n(0.0), n(11.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn vdb_negative_start_is_num() {
+        assert_eq!(
+            vdb(&[n(2400.0), n(300.0), n(10.0), n(-1.0), n(5.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn vdb_zero_life_is_num() {
+        assert_eq!(
+            vdb(&[n(2400.0), n(300.0), n(0.0), n(0.0), n(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn vdb_negative_cost_is_num() {
+        assert_eq!(
+            vdb(&[n(-2400.0), n(300.0), n(10.0), n(0.0), n(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn vdb_negative_salvage_is_num() {
+        assert_eq!(
+            vdb(&[n(2400.0), n(-300.0), n(10.0), n(0.0), n(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn vdb_zero_factor_is_num() {
+        assert_eq!(
+            vdb(&[n(2400.0), n(300.0), n(10.0), n(0.0), n(1.0), n(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn vdb_huge_life_rejected() {
+        // i32 overflow guard matching W5-182.1 DB pattern.
+        assert_eq!(
+            vdb(&[n(2400.0), n(300.0), n(1e15), n(0.0), n(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn vdb_wrong_arity() {
+        assert_eq!(vdb(&[]), Value::Error(ErrorValue::Value));
+        // 4 args (need at least 5)
+        assert_eq!(
+            vdb(&[n(2400.0), n(300.0), n(10.0), n(0.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        // 8 args (max is 7)
+        assert_eq!(
+            vdb(&[
+                n(2400.0),
+                n(300.0),
+                n(10.0),
+                n(0.0),
+                n(1.0),
+                n(2.0),
+                Value::Boolean(false),
+                n(0.0)
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn vdb_error_in_arg_propagates() {
+        assert_eq!(
+            vdb(&[
+                Value::Error(ErrorValue::Ref),
+                n(300.0),
+                n(10.0),
+                n(0.0),
+                n(1.0)
+            ]),
+            Value::Error(ErrorValue::Ref)
+        );
+        // Error in the optional no_switch arg too.
+        assert_eq!(
+            vdb(&[
+                n(2400.0),
+                n(300.0),
+                n(10.0),
+                n(0.0),
+                n(1.0),
+                n(2.0),
+                Value::Error(ErrorValue::Name)
+            ]),
+            Value::Error(ErrorValue::Name)
+        );
+    }
+
+    #[test]
+    fn vdb_boolean_no_switch_coerces() {
+        // no_switch arg is Boolean. TRUE = no switch; FALSE = default
+        // switching behavior. Confirms `arg_type` coercion.
+        let with_true = vdb(&[
+            n(2400.0),
+            n(300.0),
+            n(10.0),
+            n(0.0),
+            n(1.0),
+            n(2.0),
+            Value::Boolean(true),
+        ]);
+        let with_false = vdb(&[
+            n(2400.0),
+            n(300.0),
+            n(10.0),
+            n(0.0),
+            n(1.0),
+            n(2.0),
+            Value::Boolean(false),
+        ]);
+        // For period 1 of a 10-year asset with factor=2: DDB=$480, SLN=$210.
+        // DDB > SLN → no switch triggers regardless of no_switch flag.
+        // Both should return $480.
+        approx(with_true, 480.0, 1e-9);
+        approx(with_false, 480.0, 1e-9);
     }
 }
