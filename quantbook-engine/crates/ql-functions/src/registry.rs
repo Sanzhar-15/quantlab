@@ -820,6 +820,17 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("NORM.INV", distribution_fns::norm_inv);
     r.register("NORM.S.INV", distribution_fns::norm_s_inv);
 
+    // **W5-D-2 (Wave 3 distributions batch — Student's t)**: T.DIST /
+    // T.DIST.2T / T.DIST.RT / T.INV / T.INV.2T. Scalar tier;
+    // statrs::StudentsT backing matches IronCalc's behavior on the
+    // numerical kernel (both pin statrs = 0.18.0). Same coercion-frontend
+    // divergences as W5-D-1 (Booleans coerced to 0/1 vs IronCalc rejects).
+    r.register("T.DIST", distribution_fns::t_dist);
+    r.register("T.DIST.2T", distribution_fns::t_dist_2t);
+    r.register("T.DIST.RT", distribution_fns::t_dist_rt);
+    r.register("T.INV", distribution_fns::t_inv);
+    r.register("T.INV.2T", distribution_fns::t_inv_2t);
+
     r
 }
 
@@ -910,8 +921,11 @@ mod tests {
         // ReferenceQuery::formula_text_at (prepends leading `=`) +
         // W5-D-1 (Wave 3 distributions batch — normal): NORM.DIST,
         // NORM.S.DIST, NORM.INV, NORM.S.INV = 4 — scalar tier; statrs
-        // backing matching IronCalc's behavior (both pin statrs 0.18.0).
-        assert_eq!(r.len(), 204);
+        // backing matching IronCalc's behavior (both pin statrs 0.18.0) +
+        // W5-D-2 (Wave 3 distributions batch — Student's t): T.DIST,
+        // T.DIST.2T, T.DIST.RT, T.INV, T.INV.2T = 5 — scalar tier;
+        // statrs::StudentsT backing.
+        assert_eq!(r.len(), 209);
     }
 
     #[test]

@@ -344,7 +344,8 @@ pub(crate) fn walk_plan_for_deps(plan: &ExprPlan, deps: &mut FormulaDeps) {
         // range collapses to a single cell.
         ExprPlan::RangeRef { range } => {
             if range.start_row == range.end_row && range.start_col == range.end_col {
-                deps.cells.push((range.sheet, range.start_row, range.start_col));
+                deps.cells
+                    .push((range.sheet, range.start_row, range.start_col));
             }
         }
         // **W5-99 (Phase 4.7.F):** array-literal and error-literal plans

@@ -514,33 +514,79 @@ fn lex_ident_or_ref(chars: &mut Peekable<Chars>) -> Result<Token, LexError> {
     // see `.LETTERS`, treat as a continuation of the identifier — this commits
     // the token to the Ident path (no CellRef / BareColumn / BareRow
     // interpretation after a dot, since Excel doesn't have dotted cell refs).
-    // An orphan dot (not followed by an ASCII letter) is a lex error here, not
-    // a separate token: we've already entered identifier-lex mode, and Excel
-    // canon doesn't put bare dots in identifier position.
+    // An orphan dot (not followed by an ASCII letter or digit) is a lex
+    // error here, not a separate token: we've already entered
+    // identifier-lex mode, and Excel canon doesn't put bare dots in
+    // identifier position.
     //
-    // The `while` loop allows multi-dot patterns (e.g. `A.B.C`) for forward
-    // compatibility — Excel only uses single-dot today, but the parser/binder
-    // will reject unknown function names regardless of dot count.
+    // **W5-D-2 (2026-05-17)**: extended to accept `.DIGIT+LETTER...`
+    // segments — Excel canon includes `T.DIST.2T`, `T.INV.2T`,
+    // `F.DIST.RT`, `CHISQ.DIST.RT`, etc. A segment that *starts* with a
+    // digit accepts further alphanumeric chars but must contain at
+    // least one letter (a pure-digit segment like `.123` is rejected
+    // since no Excel function uses that shape and it would more likely
+    // be a tokenization error). Letter-starting segments retain the
+    // pre-W5-D-2 strict rule of letters/underscore only — this preserves
+    // the post-loop reject-trailing-digit guard (line ~590) that
+    // catches typos like `VAR.S5`.
+    //
+    // The `while` loop allows multi-dot patterns (e.g. `T.DIST.2T`) —
+    // Excel uses up to 3-segment names.
     let mut has_dot = false;
     while chars.peek() == Some(&'.') {
-        // Commit to consuming the `.` only when a letter follows. We peek twice
-        // by cloning the iterator (cheap — Chars holds a single &str slice).
+        // Commit to consuming the `.` only when a letter or digit
+        // follows. Peek twice by cloning the iterator (cheap — Chars
+        // holds a single &str slice).
         let mut lookahead = chars.clone();
         lookahead.next(); // skip the `.` in the cloned view
-        let next_is_letter = lookahead.peek().is_some_and(|c| c.is_ascii_alphabetic());
-        if !next_is_letter {
+        let next_char = lookahead.peek().copied();
+        let next_is_letter = next_char.is_some_and(|c| c.is_ascii_alphabetic());
+        let next_is_digit = next_char.is_some_and(|c| c.is_ascii_digit());
+        if !next_is_letter && !next_is_digit {
             // Bare dot in identifier position (or end-of-input). Reject loudly.
             return Err(LexError::UnexpectedChar('.'));
         }
         chars.next(); // consume the `.` for real now
         letters.push('.');
         has_dot = true;
-        while let Some(&c) = chars.peek() {
-            if c.is_ascii_alphabetic() || c == '_' {
-                letters.push(c);
-                chars.next();
-            } else {
-                break;
+        if next_is_digit {
+            // Digit-leading segment (Excel `.2T` / `.RT`-style): accept
+            // alphanumeric continuation (letters + digits, but NOT
+            // underscore — the digit-leading shape is reserved for Excel
+            // canon function names which never embed `_`). Require at
+            // least one letter eventually (pure-digit segments rejected).
+            //
+            // **W5-D-2.1 closure (Codex LOW-2):** dropped `|| c == '_'`
+            // from this branch — the prior over-acceptance accepted
+            // `T.DIST.2_T`-style identifiers that aren't in Excel canon.
+            // Downstream binder still rejects unknown names; closing it
+            // at lex time narrows the accepted grammar to spec.
+            let mut saw_letter = false;
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_alphabetic() {
+                    saw_letter = true;
+                    letters.push(c);
+                    chars.next();
+                } else if c.is_ascii_digit() {
+                    letters.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if !saw_letter {
+                return Err(LexError::UnexpectedChar('.'));
+            }
+        } else {
+            // Letter-leading segment (Excel `.S`, `.DIST`-style): only
+            // letters/underscore (pre-W5-D-2 strict rule).
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_alphabetic() || c == '_' {
+                    letters.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
             }
         }
     }
@@ -1811,6 +1857,130 @@ mod tests {
         // Ident path; digits would imply CellRef semantics, which dotted names
         // don't support.
         assert!(matches!(lex("VAR.S1"), Err(LexError::UnexpectedChar('1'))));
+    }
+
+    // =====================================================================
+    // **W5-D-2.1 (Opus MEDIUM-O-1 closure):** lexer-level unit tests for
+    // the digit-leading dotted-segment branch added in W5-D-2. The new
+    // branch accepts `.DIGIT+LETTER...` segments — needed for Excel canon
+    // names like `T.DIST.2T`, `T.INV.2T`, `F.DIST.RT`, `CHISQ.DIST.RT`,
+    // etc. Letter-leading segments retain pre-W5-D-2 strict
+    // letters/underscore-only rule (covered by tests above). These tests
+    // pin the digit-leading branch in isolation.
+    // =====================================================================
+
+    fn ident_text(t: &Token) -> &str {
+        match t {
+            Token::Ident(s) => s,
+            other => panic!("expected Token::Ident, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dotted_ident_digit_leading_segment_t_dist_2t() {
+        let toks = lex_ok("T.DIST.2T");
+        assert_eq!(toks.len(), 1);
+        assert_eq!(ident_text(&toks[0]), "T.DIST.2T");
+    }
+
+    #[test]
+    fn dotted_ident_digit_leading_segment_t_inv_2t() {
+        let toks = lex_ok("T.INV.2T");
+        assert_eq!(toks.len(), 1);
+        assert_eq!(ident_text(&toks[0]), "T.INV.2T");
+    }
+
+    #[test]
+    fn dotted_ident_digit_leading_segment_lowercase_preserved() {
+        // Lex preserves case; downstream registry normalizes for lookup.
+        let toks = lex_ok("t.dist.2t");
+        assert_eq!(toks.len(), 1);
+        assert_eq!(ident_text(&toks[0]), "t.dist.2t");
+    }
+
+    #[test]
+    fn dotted_ident_letter_then_digit_leading_segment_f_dist_rt() {
+        // Mixed: letter-leading segment + digit-leading segment isn't the
+        // only forward-compat shape we need — `F.DIST.RT` is pure letter
+        // segments and should still lex (regression guard for the
+        // unchanged letter-leading branch).
+        let toks = lex_ok("F.DIST.RT");
+        assert_eq!(toks.len(), 1);
+        assert_eq!(ident_text(&toks[0]), "F.DIST.RT");
+    }
+
+    #[test]
+    fn dotted_ident_multi_dot_digit_leading_final_segment() {
+        // Three-segment with digit-leading final — forward-compat for
+        // `CHISQ.DIST.RT`-style names (which are letter-only, but the
+        // generic shape `A.B.2C` should lex too).
+        let toks = lex_ok("A.B.2C");
+        assert_eq!(toks.len(), 1);
+        assert_eq!(ident_text(&toks[0]), "A.B.2C");
+    }
+
+    #[test]
+    fn dotted_ident_digit_leading_segment_pure_digit_rejects() {
+        // `T.DIST.2` — digit-leading segment with NO trailing letter.
+        // The `saw_letter` check at the end of the digit-branch fires
+        // and returns `UnexpectedChar('.')`. This is the new branch's
+        // primary rejection condition.
+        assert!(matches!(
+            lex("T.DIST.2"),
+            Err(LexError::UnexpectedChar('.'))
+        ));
+    }
+
+    #[test]
+    fn dotted_ident_digit_leading_segment_orphan_dot_rejects() {
+        // `T.DIST.` — orphan dot at end (no char follows). The lookahead
+        // sees None, fails both letter and digit checks, returns the
+        // `UnexpectedChar('.')` error.
+        assert!(matches!(lex("T.DIST."), Err(LexError::UnexpectedChar('.'))));
+    }
+
+    #[test]
+    fn dotted_ident_digit_leading_segment_rejects_trailing_digit() {
+        // Post-loop trailing-digit guard still fires on
+        // `T.DIST.2T1` — the inner digit-branch loop consumes `2T1` (all
+        // alphanumeric), but actually... wait. Let me trace this:
+        // - Initial: `T`
+        // - Dot 1: peek `D`, letter-branch. Inner loop: consume `DIST`,
+        //   stop at `.`.
+        // - Dot 2: peek `2`, digit-branch. Inner loop: consume `2T1`
+        //   (alphanumeric loop, since both letter and digit accepted).
+        //   `saw_letter` = true. Exit.
+        // - Loop ends, peek None.
+        // So `T.DIST.2T1` lexes as one token. Pin that behavior.
+        let toks = lex_ok("T.DIST.2T1");
+        assert_eq!(toks.len(), 1);
+        assert_eq!(ident_text(&toks[0]), "T.DIST.2T1");
+    }
+
+    #[test]
+    fn dotted_ident_digit_leading_segment_rejects_underscore() {
+        // **W5-D-2.1 (Codex LOW-2 closure):** digit-leading segments
+        // reject `_` (Excel canon function names with digit-leading
+        // segments never embed `_`). The pre-W5-D-2.1 impl accepted it
+        // via `c.is_ascii_digit() || c == '_'`; the closure dropped
+        // the underscore. With `_` rejected, after consuming `.2` we
+        // have `saw_letter=false` when `_` breaks the inner loop, so
+        // the post-loop `saw_letter` check fires →
+        // `UnexpectedChar('.')`. This test pins the narrower grammar.
+        assert!(matches!(
+            lex("T.DIST.2_T"),
+            Err(LexError::UnexpectedChar('.'))
+        ));
+    }
+
+    #[test]
+    fn dotted_ident_digit_leading_segment_followed_by_args() {
+        // Verifies the parser sees `T.DIST.2T(1, 1)` as Ident + LParen
+        // + Number + ... — the e2e test relies on this shape.
+        let toks = lex_ok("T.DIST.2T(1, 1)");
+        assert_eq!(ident_text(&toks[0]), "T.DIST.2T");
+        assert!(matches!(toks[1], Token::LParen));
+        assert_eq!(toks[2], Token::Number(1.0));
     }
 
     #[test]

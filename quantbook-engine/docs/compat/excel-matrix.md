@@ -98,7 +98,12 @@ as partial, rows with `❌` are missing.
 | NORM.S.DIST | ✅ | 8 | Wave 3 D-1 (W5-D-1) | W5-D-1: standard normal (mean=0, sd=1) PDF/CDF; 2 args. Same error semantics. LibreOffice Φ(z) anchors at z=0, 1, -2, 8 pinned. |
 | NORM.INV | ✅ | 9 | Wave 3 D-1 (W5-D-1) | W5-D-1: inverse normal CDF; 3 args. `0 < prob < 1` strict; `sd > 0` strict. Else `#NUM!`. CI-upper anchor at p=0.975 (≈1.95996398) pinned; inverse-of-CDF round-trip verified. |
 | NORM.S.INV | ✅ | 9 | Wave 3 D-1 (W5-D-1) | W5-D-1: standard-normal inverse CDF; 1 arg. Same domain. |
-| T.DIST / T.INV / CHISQ.DIST / CHISQ.INV / F.DIST / F.INV | ❌ | 0 | 4.10 | |
+| T.DIST | ✅ | 10 | Wave 3 D-2 (W5-D-2) | W5-D-2: Student's t PDF/CDF via `statrs::StudentsT` (pinned 0.18.0; matches IronCalc). 3 args. `cumulative=TRUE` → left-tailed CDF, `FALSE` → PDF. `df` truncated to integer; `df < 1` → `#NUM!`. Closed-form df=1 anchors (1/π, ¾) + large-df→Normal convergence pinned. |
+| T.DIST.2T | ✅ | 8 | Wave 3 D-2 (W5-D-2) | W5-D-2: two-tailed Student's t probability `P(\|T\| ≥ x)` = `2·(1 - CDF(x))`; 2 args. `x < 0` → `#NUM!` (Microsoft canon: x must be non-negative). `df < 1` → `#NUM!`. Result clamped to `[0, 1]` (defensive against float overshoot in far tails). |
+| T.DIST.RT | ✅ | 8 | Wave 3 D-2 (W5-D-2) | W5-D-2: right-tailed Student's t probability `P(T ≥ x)` = `1 - CDF(x)`; 2 args. Unlike T.DIST.2T, negative `x` is allowed (gives > 0.5). `df < 1` → `#NUM!`. Round-trip with T.DIST (CDF + RT = 1) pinned. |
+| T.INV | ✅ | 9 | Wave 3 D-2 (W5-D-2) | W5-D-2: left-tailed inverse Student's t CDF; 2 args. `0 < probability < 1` strict; `df < 1` → `#NUM!`. LibreOffice anchor T.INV(0.975, 10) ≈ 2.22814 pinned; inverse-of-CDF round-trip verified. |
+| T.INV.2T | ✅ | 10 | Wave 3 D-2 (W5-D-2) | W5-D-2: two-tailed inverse Student's t. Returns positive critical x s.t. `P(\|T\| ≥ x) = p`. Inverts via `CDF⁻¹(1 - p/2).abs()`. `0 < p ≤ 1` (upper-inclusive per IronCalc + Microsoft canon). `df < 1` → `#NUM!`. LibreOffice anchor T.INV.2T(0.05, 30) ≈ 2.04227 pinned. |
+| CHISQ.DIST / CHISQ.INV / F.DIST / F.INV | ❌ | 0 | 4.10 | |
 | BINOM.DIST / BINOM.INV / POISSON.DIST / EXPON.DIST | ❌ | 0 | 4.10 | |
 | GAMMA / GAMMA.DIST / GAMMA.INV / GAMMALN | ❌ | 0 | 4.10 | |
 | BETA.DIST / BETA.INV | ❌ | 0 | 4.10 | |

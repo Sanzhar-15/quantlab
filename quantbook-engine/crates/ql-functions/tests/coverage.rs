@@ -686,6 +686,50 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
          tests (Φ⁻¹(0.5)=0, Φ⁻¹(0.975) LibreOffice anchor, round-trip, \
          #NUM! domain, error class, arity); scalar arg-coverage matrix N/A",
     ),
+    // W5-D-2 (Wave 3 distributions batch — Student's t). T.DIST /
+    // T.DIST.2T / T.DIST.RT / T.INV / T.INV.2T. Scalar tier;
+    // statrs::StudentsT backing. Same coverage shape as W5-D-1: per-fn
+    // unit tests + e2e dispatcher round-trip; ≥8 tests per fn (anchor /
+    // LibreOffice cross-check / round-trip / domain error / text-arg /
+    // error-arg / arity); statrs gives ~15 sig fig accuracy.
+    (
+        "T.DIST",
+        "distribution fn (W5-D-2) — covered by distribution_fns unit \
+         tests (CDF=0.5 at symmetry, df=1 closed-form PDF/CDF anchors \
+         (1/π, ¾), df-truncation, df<1 #NUM!, large-df→Normal \
+         convergence, text-arg #VALUE!, error propagation, arity); \
+         scalar arg-coverage matrix N/A for statistical distributions",
+    ),
+    (
+        "T.DIST.2T",
+        "distribution fn (W5-D-2) — covered by distribution_fns unit \
+         tests (two-tail at zero = 1, df=1 anchor (0.5), negative-x \
+         #NUM!, df<1 #NUM!, [0,1]-clamp in far tail, error class, \
+         arity); scalar arg-coverage matrix N/A",
+    ),
+    (
+        "T.DIST.RT",
+        "distribution fn (W5-D-2) — covered by distribution_fns unit \
+         tests (right-tail at zero = 0.5, df=1 anchor (0.25), negative-x \
+         allowed (above 0.5), df<1 #NUM!, round-trip with T.DIST sum=1, \
+         error class, arity); scalar arg-coverage matrix N/A",
+    ),
+    (
+        "T.INV",
+        "distribution fn (W5-D-2) — covered by distribution_fns unit \
+         tests (Φ⁻¹(0.5)=0, T.INV(0.975, 10) LibreOffice anchor \
+         (2.2281...), round-trip with T.DIST, strict (0,1) domain \
+         #NUM!, df<1 #NUM!, error class, arity); scalar arg-coverage \
+         matrix N/A",
+    ),
+    (
+        "T.INV.2T",
+        "distribution fn (W5-D-2) — covered by distribution_fns unit \
+         tests (T.INV.2T(0.05, 30) LibreOffice anchor 2.04227..., \
+         round-trip with T.DIST.2T, p=1 boundary case accepted, p>1 \
+         #NUM!, returns positive abs value, df<1 #NUM!, error class, \
+         arity); scalar arg-coverage matrix N/A",
+    ),
 ];
 
 #[test]
