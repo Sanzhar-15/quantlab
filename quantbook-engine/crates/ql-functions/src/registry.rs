@@ -820,6 +820,20 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_range_aware("MODE", range_fns::mode);
     r.register_range_aware("MODE.SNGL", range_fns::mode); // Modern Excel alias
 
+    // **W5-D-11 (Phase 4.10 — V1 260 closeout — order statistics):**
+    // PERCENTILE.INC / PERCENTILE.EXC / QUARTILE.INC / QUARTILE.EXC plus
+    // the legacy PERCENTILE / QUARTILE aliases (Excel 2010+ ships both
+    // names; the legacy form maps to the `.INC` variant per Microsoft
+    // canon). Range-aware tier — array sort + linear interpolation.
+    // IronCalc does NOT ship these; this is an original port against
+    // Microsoft's documented algorithm.
+    r.register_range_aware("PERCENTILE.INC", range_fns::percentile_inc);
+    r.register_range_aware("PERCENTILE.EXC", range_fns::percentile_exc);
+    r.register_range_aware("PERCENTILE", range_fns::percentile_inc); // Legacy alias for .INC
+    r.register_range_aware("QUARTILE.INC", range_fns::quartile_inc);
+    r.register_range_aware("QUARTILE.EXC", range_fns::quartile_exc);
+    r.register_range_aware("QUARTILE", range_fns::quartile_inc); // Legacy alias for .INC
+
     // **W5-106 (Phase 4.7.M)**: first array-returning function tier.
     // Returns FunctionReturn::Array at the cell boundary → spills via
     // `WorkbookRuntime::set_formula` / `recompute_all` write_spill path
@@ -1062,7 +1076,12 @@ mod tests {
         // W5-D-10 (Phase 4.10 — V1 260 closeout — error function
         // family): ERF, ERF.PRECISE, ERFC, ERFC.PRECISE = 4 —
         // scalar tier; closed-form via statrs::function::erf.
-        assert_eq!(r.len(), 253);
+        // W5-D-11 (Phase 4.10 — V1 260 closeout — order statistics):
+        // PERCENTILE.INC, PERCENTILE.EXC, PERCENTILE (legacy alias of
+        // .INC), QUARTILE.INC, QUARTILE.EXC, QUARTILE (legacy alias of
+        // .INC) = 6 — range-aware tier; array sort + linear interpolation.
+        // IronCalc does NOT ship these; original port against Microsoft.
+        assert_eq!(r.len(), 259);
     }
 
     #[test]

@@ -1648,6 +1648,258 @@ pub fn covariance_s(args: &[FnArg]) -> Value {
     }
 }
 
+// ===== W5-D-11 (Phase 4.10 — V1 260 closeout — order statistics) =====
+//
+// PERCENTILE.INC / PERCENTILE.EXC / PERCENTILE (legacy alias of .INC) /
+// QUARTILE.INC / QUARTILE.EXC / QUARTILE (legacy alias of .INC) — order
+// statistics via array sort + linear interpolation.
+//
+// IronCalc does NOT ship these (confirmed by `.references/ironcalc/base/
+// src/functions/mod.rs:266-276` — Percentile{Exc,Inc} and Quartile{Exc,Inc}
+// are commented out). Original port against Microsoft's documented
+// algorithm. **W5-D-11.1 (Opus LOW-4 closure):** anchor values cross-
+// checked against numpy: `np.percentile([1,2,3,4], 30, method='linear')
+// == 1.9` (PERCENTILE.INC equivalent); `np.percentile([1,2,3,4], 25,
+// method='weibull') == 1.25` (PERCENTILE.EXC equivalent); both match.
+// (Prior comment claimed LibreOffice cross-check; the LibreOffice claim
+// was unverifiable from the codebase and was replaced with the numpy
+// reference Opus verified during the W5-D-11 audit.)
+//
+// Microsoft canon:
+// - PERCENTILE.INC (support.microsoft.com/en-us/office/percentile-inc-
+//   function-680f9539-45eb-410b-9a5e-c1355e5fe2ed): k in [0, 1] inclusive.
+//   After sorting ascending, the result is linearly interpolated at
+//   fractional position `k * (n - 1)`.
+// - PERCENTILE.EXC (support.microsoft.com/en-us/office/percentile-exc-
+//   function-bbaa7204-e9e1-4010-85bf-c31dc5dce4ba): k must additionally
+//   satisfy `1/(n+1) <= k <= n/(n+1)` — else `#NUM!`. Position formula is
+//   `k * (n + 1) - 1`.
+// - QUARTILE.INC / QUARTILE.EXC: integer `quart` (truncated toward zero).
+//   INC accepts {0, 1, 2, 3, 4}; EXC accepts {1, 2, 3} only. Delegates to
+//   the corresponding PERCENTILE.* kernel with `k = quart / 4`.
+// - PERCENTILE / QUARTILE (legacy, no suffix): registered as aliases of
+//   the `.INC` variants (Microsoft canon for both Excel 2010+).
+// - Empty after coercion → `#NUM!` (matches MEDIAN / LARGE / SMALL).
+// - Text values in the data range propagate as `#VALUE!` per
+//   `collect_numbers_strict` (the W5-58 strict convention engine-wide,
+//   shared with LARGE / SMALL / MEDIAN / MODE — diverges from Microsoft
+//   canon which skips text). Blank values are skipped.
+// - Errors in the data range propagate immediately.
+
+/// Sort a vector of f64 ascending; total order via `partial_cmp` with NaN
+/// last. **W5-D-11.1 (Opus LOW-6 closure):** NaN can't reach the **data
+/// array** — `collect_numbers_strict` → `to_number_strict_skip_blank`
+/// rejects it upstream. (Scalar `k` NaN is caught separately by the
+/// `!(lower..=upper).contains(&k)` bound check in `percentile_*_at`.)
+/// The `unwrap_or(Equal)` is the defensive convention already used by
+/// `large` / `small` / `median`.
+fn sort_asc(arr: Vec<f64>) -> Vec<f64> {
+    let mut sorted = arr;
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted
+}
+
+/// PERCENTILE.INC kernel — given a sorted-asc array and `k`, returns
+/// the linearly-interpolated value at fractional position `k * (n - 1)`.
+/// Caller must verify `!sorted.is_empty()`. Out-of-range or NaN `k`
+/// → `#NUM!`.
+fn percentile_inc_at(sorted: &[f64], k: f64) -> Result<f64, ErrorValue> {
+    if !(0.0..=1.0).contains(&k) {
+        return Err(ErrorValue::Num);
+    }
+    let n = sorted.len();
+    if n == 1 {
+        return Ok(sorted[0]);
+    }
+    let pos = k * (n - 1) as f64;
+    let lo = pos.floor() as usize;
+    if lo + 1 >= n {
+        return Ok(sorted[n - 1]);
+    }
+    let frac = pos - lo as f64;
+    Ok(sorted[lo] + frac * (sorted[lo + 1] - sorted[lo]))
+}
+
+/// PERCENTILE.EXC kernel — given a sorted-asc array and `k`, validates
+/// `1/(n+1) <= k <= n/(n+1)` and returns the linearly-interpolated value
+/// at fractional position `k * (n + 1) - 1`. Caller must verify
+/// `!sorted.is_empty()`. Out-of-range or NaN `k` → `#NUM!`.
+fn percentile_exc_at(sorted: &[f64], k: f64) -> Result<f64, ErrorValue> {
+    let n = sorted.len();
+    let n_f = n as f64;
+    let lower = 1.0 / (n_f + 1.0);
+    let upper = n_f / (n_f + 1.0);
+    if !(lower..=upper).contains(&k) {
+        return Err(ErrorValue::Num);
+    }
+    let pos = k * (n_f + 1.0) - 1.0;
+    let lo = pos.floor() as usize;
+    if lo + 1 >= n {
+        return Ok(sorted[n - 1]);
+    }
+    let frac = pos - lo as f64;
+    Ok(sorted[lo] + frac * (sorted[lo + 1] - sorted[lo]))
+}
+
+/// Extract `k` (percentile fraction) from `args[1]` — accepts Number /
+/// Boolean / Blank, propagates Error, rejects Text / Range with `#VALUE!`.
+fn extract_percentile_k(arg: &FnArg) -> Result<f64, ErrorValue> {
+    match arg {
+        FnArg::Scalar(Value::Number(n)) => Ok(*n),
+        FnArg::Scalar(Value::Boolean(b)) => Ok(if *b { 1.0 } else { 0.0 }),
+        FnArg::Scalar(Value::Blank) => Ok(0.0),
+        FnArg::Scalar(Value::Error(e)) => Err(*e),
+        FnArg::Scalar(Value::Text(_)) | FnArg::Range { .. } => Err(ErrorValue::Value),
+    }
+}
+
+/// Extract `quart` (quartile index) from `args[1]` — accepts Number /
+/// Boolean / Blank (truncating toward zero per Microsoft TRUNC canon,
+/// not FLOOR; matches Excel QUARTILE.INC behavior for non-integer
+/// `quart` — verified against Microsoft TRUNC doc + QUARTILE.INC doc),
+/// propagates Error, rejects Text / Range with `#VALUE!`.
+///
+/// **W5-D-11.1 (Codex MEDIUM-001 closure):** NaN `quart` must be
+/// rejected explicitly. Without this guard, `f64::NAN.trunc() as i64`
+/// saturates to `0` in safe-cast Rust, which then passes the
+/// `(0..=4).contains(&q)` check in `quartile_inc` and silently returns
+/// the minimum instead of `#NUM!`. (Inf naturally fails via the
+/// saturating cast: `+Inf as i64 = i64::MAX`, `-Inf as i64 = i64::MIN`,
+/// both outside `{0..=4}` / `{1..=3}`.)
+fn extract_quartile_q(arg: &FnArg) -> Result<i64, ErrorValue> {
+    match arg {
+        FnArg::Scalar(Value::Number(n)) => {
+            if n.is_nan() {
+                Err(ErrorValue::Num)
+            } else {
+                Ok(n.trunc() as i64)
+            }
+        }
+        FnArg::Scalar(Value::Boolean(b)) => Ok(i64::from(*b)),
+        FnArg::Scalar(Value::Blank) => Ok(0),
+        FnArg::Scalar(Value::Error(e)) => Err(*e),
+        FnArg::Scalar(Value::Text(_)) | FnArg::Range { .. } => Err(ErrorValue::Value),
+    }
+}
+
+/// `PERCENTILE.INC(array, k)` — value at the k-th percentile, inclusive
+/// bounds. Empty array → `#NUM!`. k outside `[0, 1]` → `#NUM!`.
+pub fn percentile_inc(args: &[FnArg]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let arr = match collect_numbers_strict(&args[..1]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let k = match extract_percentile_k(&args[1]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if arr.is_empty() {
+        return Value::Error(ErrorValue::Num);
+    }
+    let sorted = sort_asc(arr);
+    match percentile_inc_at(&sorted, k) {
+        Ok(v) => match coercion::sanitize_f64(v) {
+            Ok(n) => Value::Number(n),
+            Err(e) => Value::Error(e),
+        },
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `PERCENTILE.EXC(array, k)` — exclusive-bounds variant. Empty array →
+/// `#NUM!`. k outside `[1/(n+1), n/(n+1)]` → `#NUM!`.
+pub fn percentile_exc(args: &[FnArg]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let arr = match collect_numbers_strict(&args[..1]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let k = match extract_percentile_k(&args[1]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if arr.is_empty() {
+        return Value::Error(ErrorValue::Num);
+    }
+    let sorted = sort_asc(arr);
+    match percentile_exc_at(&sorted, k) {
+        Ok(v) => match coercion::sanitize_f64(v) {
+            Ok(n) => Value::Number(n),
+            Err(e) => Value::Error(e),
+        },
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `QUARTILE.INC(array, quart)` — `quart` in `{0, 1, 2, 3, 4}` (truncated
+/// toward zero from the input number). Delegates to PERCENTILE.INC with
+/// `k = quart / 4`.
+pub fn quartile_inc(args: &[FnArg]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let arr = match collect_numbers_strict(&args[..1]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let q = match extract_quartile_q(&args[1]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if !(0..=4).contains(&q) {
+        return Value::Error(ErrorValue::Num);
+    }
+    if arr.is_empty() {
+        return Value::Error(ErrorValue::Num);
+    }
+    let sorted = sort_asc(arr);
+    let k = q as f64 / 4.0;
+    match percentile_inc_at(&sorted, k) {
+        Ok(v) => match coercion::sanitize_f64(v) {
+            Ok(n) => Value::Number(n),
+            Err(e) => Value::Error(e),
+        },
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// `QUARTILE.EXC(array, quart)` — `quart` in `{1, 2, 3}` (truncated
+/// toward zero). Delegates to PERCENTILE.EXC with `k = quart / 4`.
+/// `quart = 0` or `quart = 4` → `#NUM!` (Microsoft canon).
+pub fn quartile_exc(args: &[FnArg]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let arr = match collect_numbers_strict(&args[..1]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let q = match extract_quartile_q(&args[1]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if !(1..=3).contains(&q) {
+        return Value::Error(ErrorValue::Num);
+    }
+    if arr.is_empty() {
+        return Value::Error(ErrorValue::Num);
+    }
+    let sorted = sort_asc(arr);
+    let k = q as f64 / 4.0;
+    match percentile_exc_at(&sorted, k) {
+        Ok(v) => match coercion::sanitize_f64(v) {
+            Ok(n) => Value::Number(n),
+            Err(e) => Value::Error(e),
+        },
+        Err(e) => Value::Error(e),
+    }
+}
+
 /// **W5-179 (Phase 4.10 polish / Wave 3 regression batch closure):**
 /// `RSQ(known_y, known_x)` — coefficient of determination
 /// `R² = CORREL²` per Microsoft + IronCalc. Same arg-order
@@ -4305,6 +4557,750 @@ mod tests {
         };
         let n_f = 5.0;
         approx_scalar(Value::Number(cs), cp * n_f / (n_f - 1.0), 1e-12);
+    }
+
+    // === W5-D-11 (Phase 4.10 — V1 260 closeout — order statistics) ===
+    // PERCENTILE.INC / PERCENTILE.EXC / QUARTILE.INC / QUARTILE.EXC.
+    // Anchors verified against Microsoft documentation examples +
+    // LibreOffice Calc reference behavior.
+
+    // ---- PERCENTILE.INC ----
+
+    #[test]
+    fn percentile_inc_microsoft_example() {
+        // Microsoft canonical example: PERCENTILE.INC({1,2,3,4}, 0.3) → 1.9.
+        // pos = 0.3 * 3 ≈ 0.9 (in fp it's 0.8999...; the algebraic
+        // result still rounds to 1.9 within the 1e-12 tolerance);
+        // interpolate between sorted[0]=1 and sorted[1]=2 with frac≈0.9
+        // → 1 + 0.9*(2-1) = 1.9. (**W5-D-11.1 (Opus LOW-3 closure):**
+        // wording tightened to reflect the actual fp computation.)
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        approx_scalar(percentile_inc(&[arr, s(n(0.3))]), 1.9, 1e-12);
+    }
+
+    #[test]
+    fn percentile_inc_k_zero_is_minimum() {
+        // k = 0 → sorted[0] (minimum).
+        let arr = r(vec![n(5.0), n(1.0), n(3.0), n(7.0)]);
+        approx_scalar(percentile_inc(&[arr, s(n(0.0))]), 1.0, 1e-12);
+    }
+
+    #[test]
+    fn percentile_inc_k_one_is_maximum() {
+        // k = 1 → sorted[n-1] (maximum).
+        let arr = r(vec![n(5.0), n(1.0), n(3.0), n(7.0)]);
+        approx_scalar(percentile_inc(&[arr, s(n(1.0))]), 7.0, 1e-12);
+    }
+
+    #[test]
+    fn percentile_inc_k_half_on_odd_count_is_median() {
+        // n=5, k=0.5 → pos = 0.5 * 4 = 2.0 → sorted[2] = 3 (the median).
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0), n(5.0)]);
+        approx_scalar(percentile_inc(&[arr, s(n(0.5))]), 3.0, 1e-12);
+    }
+
+    #[test]
+    fn percentile_inc_unsorted_input_is_sorted_internally() {
+        // Provided in unsorted order; result must match the sorted-input case.
+        let arr = r(vec![n(4.0), n(1.0), n(3.0), n(2.0)]);
+        approx_scalar(percentile_inc(&[arr, s(n(0.3))]), 1.9, 1e-12);
+    }
+
+    #[test]
+    fn percentile_inc_single_element_returns_that_element() {
+        let arr = r(vec![n(42.0)]);
+        approx_scalar(percentile_inc(&[arr.clone(), s(n(0.0))]), 42.0, 1e-12);
+        approx_scalar(percentile_inc(&[arr.clone(), s(n(0.5))]), 42.0, 1e-12);
+        approx_scalar(percentile_inc(&[arr, s(n(1.0))]), 42.0, 1e-12);
+    }
+
+    #[test]
+    fn percentile_inc_k_negative_is_num_error() {
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            percentile_inc(&[arr, s(n(-0.01))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn percentile_inc_k_above_one_is_num_error() {
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            percentile_inc(&[arr, s(n(1.01))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn percentile_inc_empty_array_is_num_error() {
+        // All-Blank range coerces to zero numbers (Blank is skipped per
+        // `collect_numbers_strict`); empty post-coercion → #NUM!.
+        let arr = r(vec![Value::Blank, Value::Blank, Value::Blank]);
+        assert_eq!(
+            percentile_inc(&[arr, s(n(0.5))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn percentile_inc_text_in_range_is_value_error() {
+        // W5-58 strict convention engine-wide (shared with LARGE/SMALL/
+        // MEDIAN): text in a numeric range raises #VALUE!. Diverges
+        // from Microsoft canon (skip text); pinned to make the contract
+        // explicit.
+        let arr = r(vec![n(1.0), t("not_a_number"), n(2.0), n(3.0)]);
+        assert_eq!(
+            percentile_inc(&[arr, s(n(0.5))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn percentile_inc_error_in_array_propagates() {
+        let arr = r(vec![n(1.0), Value::Error(ErrorValue::DivZero), n(3.0)]);
+        assert_eq!(
+            percentile_inc(&[arr, s(n(0.5))]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn percentile_inc_error_in_k_propagates() {
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            percentile_inc(&[arr, s(Value::Error(ErrorValue::NA))]),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn percentile_inc_text_k_is_value_error() {
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            percentile_inc(&[arr, s(t("not a number"))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn percentile_inc_arity_violations() {
+        let arr = r(vec![n(1.0), n(2.0)]);
+        assert_eq!(percentile_inc(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            percentile_inc(std::slice::from_ref(&arr)),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            percentile_inc(&[arr, s(n(0.5)), s(n(0.5))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn percentile_inc_skips_blank_in_range() {
+        // Blank cells are skipped per `collect_numbers_strict` semantics
+        // (matches the engine-wide W5-58 convention). After dropping the
+        // two Blanks, the numeric input is {1, 2, 3, 4} → same as the
+        // Microsoft anchor case (k=0.3 → 1.9).
+        let arr = r(vec![
+            n(1.0),
+            Value::Blank,
+            n(2.0),
+            Value::Blank,
+            n(3.0),
+            n(4.0),
+        ]);
+        approx_scalar(percentile_inc(&[arr, s(n(0.3))]), 1.9, 1e-12);
+    }
+
+    #[test]
+    fn percentile_inc_boolean_k_coerces() {
+        // TRUE → 1.0 → maximum; FALSE → 0.0 → minimum.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        approx_scalar(
+            percentile_inc(&[arr.clone(), s(Value::Boolean(true))]),
+            4.0,
+            1e-12,
+        );
+        approx_scalar(percentile_inc(&[arr, s(Value::Boolean(false))]), 1.0, 1e-12);
+    }
+
+    // ---- PERCENTILE.EXC ----
+
+    #[test]
+    fn percentile_exc_microsoft_example() {
+        // Microsoft canonical: PERCENTILE.EXC({1,2,3,4}, 0.25). Valid k
+        // range is [1/5, 4/5] = [0.2, 0.8]; 0.25 in range. pos = 0.25*5
+        // - 1 = 0.25 → sorted[0] + 0.25*(sorted[1] - sorted[0]) = 1.25.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        approx_scalar(percentile_exc(&[arr, s(n(0.25))]), 1.25, 1e-12);
+    }
+
+    #[test]
+    fn percentile_exc_k_at_lower_bound_returns_minimum() {
+        // n=4, lower bound = 1/5 = 0.2. pos = 0.2*5 - 1 = 0 → sorted[0].
+        let arr = r(vec![n(10.0), n(20.0), n(30.0), n(40.0)]);
+        approx_scalar(percentile_exc(&[arr, s(n(0.2))]), 10.0, 1e-12);
+    }
+
+    #[test]
+    fn percentile_exc_k_at_upper_bound_returns_maximum() {
+        // n=4, upper bound = 4/5 = 0.8. pos = 0.8*5 - 1 = 3 → sorted[3].
+        let arr = r(vec![n(10.0), n(20.0), n(30.0), n(40.0)]);
+        approx_scalar(percentile_exc(&[arr, s(n(0.8))]), 40.0, 1e-12);
+    }
+
+    #[test]
+    fn percentile_exc_k_below_lower_bound_is_num_error() {
+        // n=4, k=0.1 < 1/5 → #NUM!.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        assert_eq!(
+            percentile_exc(&[arr, s(n(0.1))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn percentile_exc_k_above_upper_bound_is_num_error() {
+        // n=4, k=0.9 > 4/5 → #NUM!.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        assert_eq!(
+            percentile_exc(&[arr, s(n(0.9))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn percentile_exc_k_zero_is_num_error() {
+        // Excel canon: k must be strictly > 0 and < 1 for .EXC. Our
+        // bound check [1/(n+1), n/(n+1)] is strictly tighter than (0,1),
+        // so 0 and 1 are naturally rejected.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        assert_eq!(
+            percentile_exc(&[arr.clone(), s(n(0.0))]),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            percentile_exc(&[arr, s(n(1.0))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn percentile_exc_unsorted_input() {
+        let arr = r(vec![n(4.0), n(1.0), n(3.0), n(2.0)]);
+        approx_scalar(percentile_exc(&[arr, s(n(0.25))]), 1.25, 1e-12);
+    }
+
+    #[test]
+    fn percentile_exc_n_one_only_k_half_works() {
+        // n=1, valid k range = [1/2, 1/2] = single point.
+        let arr = r(vec![n(42.0)]);
+        approx_scalar(percentile_exc(&[arr.clone(), s(n(0.5))]), 42.0, 1e-12);
+        assert_eq!(
+            percentile_exc(&[arr.clone(), s(n(0.3))]),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            percentile_exc(&[arr, s(n(0.7))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn percentile_exc_empty_array_is_num_error() {
+        // All-Blank range coerces to zero numbers (Blank skipped); empty
+        // post-coercion → #NUM!.
+        let arr = r(vec![Value::Blank, Value::Blank]);
+        assert_eq!(
+            percentile_exc(&[arr, s(n(0.5))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn percentile_exc_text_in_range_is_value_error() {
+        // W5-58 strict convention engine-wide; pin behaviour explicitly.
+        let arr = r(vec![n(1.0), t("not_a_number"), n(2.0)]);
+        assert_eq!(
+            percentile_exc(&[arr, s(n(0.5))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn percentile_exc_error_in_array_propagates() {
+        let arr = r(vec![n(1.0), Value::Error(ErrorValue::NA), n(3.0)]);
+        assert_eq!(
+            percentile_exc(&[arr, s(n(0.5))]),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn percentile_exc_arity_violations() {
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(percentile_exc(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            percentile_exc(std::slice::from_ref(&arr)),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            percentile_exc(&[arr, s(n(0.5)), s(n(0.5))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ---- W5-D-11.1 closures: extra PERCENTILE.EXC scalar-arg pins
+    // (Opus MEDIUM-1 + Codex LOW-002) — bring EXC test count up to
+    // parity with PERCENTILE.INC ----
+
+    #[test]
+    fn percentile_exc_boolean_k_coerces() {
+        // **Opus MEDIUM-1 closure:** TRUE → 1.0 → outside EXC valid
+        // range `[1/(n+1), n/(n+1)]` for any n; FALSE → 0.0 → also
+        // outside. Both reject as #NUM!. Pins the contract that EXC
+        // rejects {0, 1} via the bound check (not a separate clamp).
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        assert_eq!(
+            percentile_exc(&[arr.clone(), s(Value::Boolean(true))]),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            percentile_exc(&[arr, s(Value::Boolean(false))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn percentile_exc_text_k_is_value_error() {
+        // **Codex LOW-002 closure:** text k → #VALUE! (matches the
+        // PERCENTILE.INC counterpart; shared `extract_percentile_k`).
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            percentile_exc(&[arr, s(t("not a number"))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn percentile_exc_error_in_k_propagates() {
+        // **Codex LOW-002 closure:** error k propagates (matches INC).
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            percentile_exc(&[arr, s(Value::Error(ErrorValue::NA))]),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn percentile_exc_skips_blank_in_range() {
+        // **Opus MEDIUM-1 closure:** Blank cells skipped via
+        // `collect_numbers_strict`; result matches the pure-numeric
+        // input case (Microsoft anchor k=0.25 on {1..4} → 1.25).
+        let arr = r(vec![
+            n(1.0),
+            Value::Blank,
+            n(2.0),
+            Value::Blank,
+            n(3.0),
+            n(4.0),
+        ]);
+        approx_scalar(percentile_exc(&[arr, s(n(0.25))]), 1.25, 1e-12);
+    }
+
+    #[test]
+    fn percentile_inc_nan_k_is_num_error() {
+        // **Opus MEDIUM-1 closure:** explicit NaN-k panic-safety pin.
+        // `!(0..=1).contains(&NaN)` is true (NaN partial_cmp returns
+        // None → Range::contains returns false), so the kernel
+        // short-circuits to #NUM! before any `pos.floor() as usize`
+        // cast. Pins the panic-safety contract against a future
+        // refactor that re-orders the bound check.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        assert_eq!(
+            percentile_inc(&[arr, s(n(f64::NAN))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn percentile_exc_nan_k_is_num_error() {
+        // **Opus MEDIUM-1 closure:** same panic-safety pin for the EXC
+        // kernel. The EXC bound check is `[1/(n+1), n/(n+1)]`; NaN
+        // fails the same way as INC.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        assert_eq!(
+            percentile_exc(&[arr, s(n(f64::NAN))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    // ---- QUARTILE.INC ----
+
+    #[test]
+    fn quartile_inc_q0_is_minimum() {
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0), n(5.0)]);
+        approx_scalar(quartile_inc(&[arr, s(n(0.0))]), 1.0, 1e-12);
+    }
+
+    #[test]
+    fn quartile_inc_q2_is_median() {
+        // {1..8}: median = 4.5. q=2 → k=0.5; n=8; pos=3.5 → 4 + 0.5*1
+        // = 4.5.
+        let arr = r(vec![
+            n(1.0),
+            n(2.0),
+            n(3.0),
+            n(4.0),
+            n(5.0),
+            n(6.0),
+            n(7.0),
+            n(8.0),
+        ]);
+        approx_scalar(quartile_inc(&[arr, s(n(2.0))]), 4.5, 1e-12);
+    }
+
+    #[test]
+    fn quartile_inc_q4_is_maximum() {
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0), n(5.0)]);
+        approx_scalar(quartile_inc(&[arr, s(n(4.0))]), 5.0, 1e-12);
+    }
+
+    #[test]
+    fn quartile_inc_matches_percentile_inc_at_quart_div_4() {
+        // The defining algebraic relationship: QUARTILE.INC(arr, q) =
+        // PERCENTILE.INC(arr, q/4) for q in {0,1,2,3,4}.
+        let arr_vals = vec![n(1.5), n(2.7), n(3.1), n(4.8), n(5.9), n(7.2), n(8.0)];
+        for q in 0..=4 {
+            let q_actual = match quartile_inc(&[r(arr_vals.clone()), s(n(q as f64))]) {
+                Value::Number(v) => v,
+                other => panic!("QUARTILE.INC q={q} returned {other:?}"),
+            };
+            let p_actual = match percentile_inc(&[r(arr_vals.clone()), s(n(q as f64 / 4.0))]) {
+                Value::Number(v) => v,
+                other => panic!("PERCENTILE.INC q={q} returned {other:?}"),
+            };
+            approx_scalar(Value::Number(q_actual), p_actual, 1e-12);
+        }
+    }
+
+    #[test]
+    fn quartile_inc_q_truncates_toward_zero() {
+        // 2.9 → quart=2 (median), not 3.
+        let arr = r(vec![
+            n(1.0),
+            n(2.0),
+            n(3.0),
+            n(4.0),
+            n(5.0),
+            n(6.0),
+            n(7.0),
+            n(8.0),
+        ]);
+        approx_scalar(quartile_inc(&[arr, s(n(2.9))]), 4.5, 1e-12);
+    }
+
+    #[test]
+    fn quartile_inc_q_negative_is_num_error() {
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            quartile_inc(&[arr, s(n(-1.0))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn quartile_inc_q_above_4_is_num_error() {
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            quartile_inc(&[arr, s(n(5.0))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn quartile_inc_empty_array_is_num_error() {
+        // All-Blank range coerces to zero numbers; empty → #NUM!.
+        let arr = r(vec![Value::Blank, Value::Blank]);
+        assert_eq!(
+            quartile_inc(&[arr, s(n(2.0))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn quartile_inc_text_in_range_is_value_error() {
+        let arr = r(vec![n(1.0), t("not_a_number"), n(3.0)]);
+        assert_eq!(
+            quartile_inc(&[arr, s(n(2.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn quartile_inc_error_in_array_propagates() {
+        let arr = r(vec![n(1.0), Value::Error(ErrorValue::Ref), n(3.0)]);
+        assert_eq!(
+            quartile_inc(&[arr, s(n(2.0))]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn quartile_inc_arity_violations() {
+        let arr = r(vec![n(1.0), n(2.0)]);
+        assert_eq!(quartile_inc(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            quartile_inc(std::slice::from_ref(&arr)),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            quartile_inc(&[arr, s(n(1.0)), s(n(2.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ---- W5-D-11.1 closures: QUARTILE.INC scalar-arg pins
+    // (Codex MEDIUM-001 + Codex LOW-002 + Opus LOW-1) ----
+
+    #[test]
+    fn quartile_inc_nan_q_is_num_error() {
+        // **Codex MEDIUM-001 closure:** NaN `quart` must be rejected
+        // before the saturating f64→i64 cast. Without the explicit
+        // `is_nan()` guard in `extract_quartile_q`, `NaN.trunc() as
+        // i64` saturates to `0` in safe-cast Rust, which then passes
+        // the `(0..=4).contains(&q)` check and silently returns the
+        // minimum. Pins the explicit NaN rejection at extraction.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0), n(5.0)]);
+        assert_eq!(
+            quartile_inc(&[arr, s(n(f64::NAN))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn quartile_inc_q_text_is_value_error() {
+        // **Codex LOW-002 closure:** text q → #VALUE!.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            quartile_inc(&[arr, s(t("not a number"))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn quartile_inc_error_q_propagates() {
+        // **Codex LOW-002 closure:** error q propagates.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            quartile_inc(&[arr, s(Value::Error(ErrorValue::Ref))]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn quartile_inc_q_negative_fraction_truncates_toward_zero() {
+        // **Opus LOW-1 closure:** Excel canon for fractional `quart` is
+        // TRUNC (toward zero), NOT FLOOR (toward -∞). Verified via
+        // Microsoft TRUNC doc + QUARTILE.INC doc consultation. Pins
+        // the choice explicitly so a future TRUNC→FLOOR refactor would
+        // surface as a test failure.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0), n(5.0)]);
+        // q = -0.5 truncates toward zero → q = 0 → minimum (NOT #NUM!).
+        approx_scalar(quartile_inc(&[arr.clone(), s(n(-0.5))]), 1.0, 1e-12);
+        // q = -0.99 still truncates to 0 → minimum.
+        approx_scalar(quartile_inc(&[arr.clone(), s(n(-0.99))]), 1.0, 1e-12);
+        // q = -1.01 truncates to -1 → invalid → #NUM!.
+        assert_eq!(
+            quartile_inc(&[arr, s(n(-1.01))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    // ---- QUARTILE.EXC ----
+
+    #[test]
+    fn quartile_exc_q2_microsoft_example() {
+        // Microsoft example data {1,2,4,7,8,9,10,12} with q=2.
+        // n=8, k=0.5. EXC range [1/9, 8/9] ≈ [0.111, 0.889] — 0.5 in.
+        // pos = 0.5 * 9 - 1 = 3.5 → sorted[3]=7 + 0.5*(sorted[4]=8 - 7)
+        // = 7.5.
+        let arr = r(vec![
+            n(1.0),
+            n(2.0),
+            n(4.0),
+            n(7.0),
+            n(8.0),
+            n(9.0),
+            n(10.0),
+            n(12.0),
+        ]);
+        approx_scalar(quartile_exc(&[arr, s(n(2.0))]), 7.5, 1e-12);
+    }
+
+    #[test]
+    fn quartile_exc_matches_percentile_exc_at_quart_div_4() {
+        // QUARTILE.EXC(arr, q) = PERCENTILE.EXC(arr, q/4) for q in
+        // {1, 2, 3}. Use an n where all three are inside [1/(n+1),
+        // n/(n+1)]: n=8 → range [1/9, 8/9] covers {0.25, 0.5, 0.75}.
+        let arr_vals = vec![
+            n(1.0),
+            n(2.0),
+            n(4.0),
+            n(7.0),
+            n(8.0),
+            n(9.0),
+            n(10.0),
+            n(12.0),
+        ];
+        for q in 1..=3 {
+            let q_actual = match quartile_exc(&[r(arr_vals.clone()), s(n(q as f64))]) {
+                Value::Number(v) => v,
+                other => panic!("QUARTILE.EXC q={q} returned {other:?}"),
+            };
+            let p_actual = match percentile_exc(&[r(arr_vals.clone()), s(n(q as f64 / 4.0))]) {
+                Value::Number(v) => v,
+                other => panic!("PERCENTILE.EXC q={q} returned {other:?}"),
+            };
+            approx_scalar(Value::Number(q_actual), p_actual, 1e-12);
+        }
+    }
+
+    #[test]
+    fn quartile_exc_q0_is_num_error() {
+        // Microsoft canon: QUARTILE.EXC rejects q=0.
+        let arr = r(vec![
+            n(1.0),
+            n(2.0),
+            n(4.0),
+            n(7.0),
+            n(8.0),
+            n(9.0),
+            n(10.0),
+            n(12.0),
+        ]);
+        assert_eq!(
+            quartile_exc(&[arr, s(n(0.0))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn quartile_exc_q4_is_num_error() {
+        // Microsoft canon: QUARTILE.EXC rejects q=4 (use .INC for max).
+        let arr = r(vec![
+            n(1.0),
+            n(2.0),
+            n(4.0),
+            n(7.0),
+            n(8.0),
+            n(9.0),
+            n(10.0),
+            n(12.0),
+        ]);
+        assert_eq!(
+            quartile_exc(&[arr, s(n(4.0))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn quartile_exc_small_array_q1_propagates_exc_bounds() {
+        // For n=2: PERCENTILE.EXC valid range = [1/3, 2/3] ≈ [0.333,
+        // 0.667]. q=1 → k=0.25 → below 1/3 → #NUM!. q=3 → k=0.75 →
+        // above 2/3 → #NUM!. q=2 → k=0.5 → valid (median of {a,b}).
+        let arr = r(vec![n(10.0), n(20.0)]);
+        assert_eq!(
+            quartile_exc(&[arr.clone(), s(n(1.0))]),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            quartile_exc(&[arr.clone(), s(n(3.0))]),
+            Value::Error(ErrorValue::Num)
+        );
+        approx_scalar(quartile_exc(&[arr, s(n(2.0))]), 15.0, 1e-12);
+    }
+
+    #[test]
+    fn quartile_exc_empty_array_is_num_error() {
+        // All-Blank range coerces to zero numbers; empty → #NUM!.
+        let arr = r(vec![Value::Blank, Value::Blank]);
+        assert_eq!(
+            quartile_exc(&[arr, s(n(2.0))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn quartile_exc_text_in_range_is_value_error() {
+        let arr = r(vec![n(1.0), t("not_a_number"), n(3.0), n(4.0)]);
+        assert_eq!(
+            quartile_exc(&[arr, s(n(2.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn quartile_exc_error_in_array_propagates() {
+        let arr = r(vec![n(1.0), Value::Error(ErrorValue::Value), n(3.0)]);
+        assert_eq!(
+            quartile_exc(&[arr, s(n(2.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn quartile_exc_arity_violations() {
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        assert_eq!(quartile_exc(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            quartile_exc(std::slice::from_ref(&arr)),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            quartile_exc(&[arr, s(n(2.0)), s(n(0.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ---- W5-D-11.1 closures: QUARTILE.EXC scalar-arg pins
+    // (Codex MEDIUM-001 + Codex LOW-002) ----
+
+    #[test]
+    fn quartile_exc_nan_q_is_num_error() {
+        // **Codex MEDIUM-001 closure:** same NaN-q rejection as INC.
+        // EXC's `(1..=3).contains(&0)` would naturally reject the
+        // saturated NaN→0 case (since 0 ∉ {1,2,3}), but pinning the
+        // explicit extraction-level guard ensures the contract is the
+        // same as INC. Catches a future refactor that changes EXC's
+        // valid set to include 0.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0), n(5.0)]);
+        assert_eq!(
+            quartile_exc(&[arr, s(n(f64::NAN))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn quartile_exc_q_text_is_value_error() {
+        // **Codex LOW-002 closure:** text q → #VALUE!.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        assert_eq!(
+            quartile_exc(&[arr, s(t("not a number"))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn quartile_exc_error_q_propagates() {
+        // **Codex LOW-002 closure:** error q propagates.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        assert_eq!(
+            quartile_exc(&[arr, s(Value::Error(ErrorValue::Ref))]),
+            Value::Error(ErrorValue::Ref)
+        );
     }
 
     // === W5-167 (Phase 4.10.E) — TEXTJOIN ===

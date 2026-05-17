@@ -399,6 +399,35 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "ERFC.PRECISE",
         "W5-D-10; **alias of ERFC** — Excel 2010 renamed for naming consistency. Pin alias parity at 6 x-values + arity.",
     ),
+    // W5-D-11 (Phase 4.10 — V1 260 closeout — order statistics).
+    // PERCENTILE.INC / PERCENTILE.EXC / QUARTILE.INC / QUARTILE.EXC +
+    // legacy PERCENTILE / QUARTILE aliases. Range-aware; array sort +
+    // linear interpolation. IronCalc does NOT ship these; original port
+    // against Microsoft documented algorithm.
+    (
+        "PERCENTILE.INC",
+        "W5-D-11; unit tests pin Microsoft example (k=0.3 on {1..4} → 1.9), k=0 → min, k=1 → max, k=0.5 on odd count → median, unsorted-input parity, single-element early return, k<0 and k>1 → #NUM!, NaN k → #NUM! (panic-safety; W5-D-11.1 closure), empty → #NUM! (via all-Blank range), text in range → #VALUE! (engine-wide W5-58 strict convention; diverges from Microsoft skip-text canon), Blank in range skipped, error/text k propagation, Boolean k coerces TRUE→1/FALSE→0, arity.",
+    ),
+    (
+        "PERCENTILE.EXC",
+        "W5-D-11; unit tests pin Microsoft example (k=0.25 on {1..4} → 1.25), k at lower bound 1/(n+1) → min, k at upper bound n/(n+1) → max, k below 1/(n+1) or above n/(n+1) → #NUM! (Excel exclusive-bounds canon), k=0 and k=1 rejected, NaN k → #NUM! (panic-safety; W5-D-11.1 closure), unsorted-input parity, n=1 single-point valid range, empty → #NUM!, text in range → #VALUE! (W5-58 strict), Blank in range skipped (W5-D-11.1 closure), Boolean k coerces TRUE→1/FALSE→0 (both fall outside EXC bounds → #NUM!), text/error k propagation, arity.",
+    ),
+    (
+        "PERCENTILE",
+        "W5-D-11; **legacy alias of PERCENTILE.INC** (Excel 2010+ canon — same shared kernel, registered separately for name-equivalence). **W5-D-11.1 (Codex LOW-001 closure):** alias-parity verified via fn-pointer address comparison in the W5-D-11 e2e dispatch test.",
+    ),
+    (
+        "QUARTILE.INC",
+        "W5-D-11; unit tests pin q=0 → min, q=2 → median (sample {1..8} → 4.5), q=4 → max, algebraic equivalence with PERCENTILE.INC(arr, q/4) for q in {0..4}, q truncates toward zero per Microsoft TRUNC canon (2.9 → 2; W5-D-11.1: q=-0.5/-0.99 → minimum, q=-1.01 → #NUM!), q<0 or q>4 (post-truncation) → #NUM!, NaN q → #NUM! (W5-D-11.1 Codex MEDIUM-001 closure: prevents saturating NaN→0 cast bypassing bound check), empty → #NUM!, text in range → #VALUE! (W5-58 strict), text/error q propagation, arity.",
+    ),
+    (
+        "QUARTILE.EXC",
+        "W5-D-11; unit tests pin Microsoft example (q=2 on {1,2,4,7,8,9,10,12} → 7.5), algebraic equivalence with PERCENTILE.EXC(arr, q/4) for q in {1,2,3}, q=0 and q=4 → #NUM! (Microsoft canon), small-array exclusive-bounds propagation (n=2: q=1 and q=3 → #NUM!), NaN q → #NUM! (W5-D-11.1 closure), empty → #NUM!, text in range → #VALUE! (W5-58 strict), text/error q propagation, arity.",
+    ),
+    (
+        "QUARTILE",
+        "W5-D-11; **legacy alias of QUARTILE.INC** (Excel 2010+ canon — same shared kernel, registered separately). **W5-D-11.1 (Codex LOW-001 closure):** alias-parity verified via fn-pointer address comparison in the W5-D-11 e2e dispatch test.",
+    ),
     // W5-180 (Phase 4.10 polish / Wave 3 depreciation batch starter) —
     // SLN + SYD: closed-form straight-line + sum-of-years digits
     // depreciation. Scalar; both ported from IronCalc `fn_sln` /

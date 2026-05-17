@@ -700,6 +700,71 @@ fn e2e_covariance_p_s_registered() {
 }
 
 #[test]
+fn e2e_percentile_quartile_registered() {
+    // **W5-D-11 (Phase 4.10 — V1 260 closeout):** smoke-check registry
+    // dispatch for the order-statistics family. All RangeAwareFn — same
+    // registry-lookup pattern used by sibling paired-array fns (CORREL /
+    // COVARIANCE.* / MIRR). Verifies:
+    // 1. Case-insensitive lookup of all 6 registered names.
+    // 2. Dotted-name routing for `.INC` / `.EXC` (regular letter-leading
+    //    dotted-ident path; the same path COVARIANCE.P/.S uses).
+    // 3. Legacy alias parity: PERCENTILE registers to the same fn as
+    //    PERCENTILE.INC, and QUARTILE registers to QUARTILE.INC (Excel
+    //    2010+ canon). **W5-D-11.1 (Codex LOW-001 closure):**
+    //    strengthened from `.is_some()` to comparing fn-pointer
+    //    addresses via `usize`-cast equality so a future regression
+    //    that re-points PERCENTILE/QUARTILE to the `.EXC` variants
+    //    would fail the test rather than passing the presence check.
+    let registry = default_registry();
+    // .INC / .EXC variants.
+    let p_inc = registry.lookup_range_aware("PERCENTILE.INC");
+    let p_exc = registry.lookup_range_aware("PERCENTILE.EXC");
+    let q_inc = registry.lookup_range_aware("QUARTILE.INC");
+    let q_exc = registry.lookup_range_aware("QUARTILE.EXC");
+    let p_alias = registry.lookup_range_aware("PERCENTILE");
+    let q_alias = registry.lookup_range_aware("QUARTILE");
+    assert!(p_inc.is_some());
+    assert!(p_exc.is_some());
+    assert!(q_inc.is_some());
+    assert!(q_exc.is_some());
+    assert!(p_alias.is_some());
+    assert!(q_alias.is_some());
+    // Alias parity via fn-pointer address comparison. Casting an `fn`
+    // pointer to `*const ()` then to `usize` exposes the address;
+    // matching addresses prove the legacy alias and the `.INC` variant
+    // route through the same code.
+    let addr = |f: ql_functions::RangeAwareFn| f as *const () as usize;
+    assert_eq!(
+        addr(p_alias.unwrap()),
+        addr(p_inc.unwrap()),
+        "PERCENTILE alias must point to PERCENTILE.INC"
+    );
+    assert_eq!(
+        addr(q_alias.unwrap()),
+        addr(q_inc.unwrap()),
+        "QUARTILE alias must point to QUARTILE.INC"
+    );
+    // Disjointness sanity: .INC and .EXC are different fns.
+    assert_ne!(
+        addr(p_inc.unwrap()),
+        addr(p_exc.unwrap()),
+        "PERCENTILE.INC and PERCENTILE.EXC must be distinct fns"
+    );
+    assert_ne!(
+        addr(q_inc.unwrap()),
+        addr(q_exc.unwrap()),
+        "QUARTILE.INC and QUARTILE.EXC must be distinct fns"
+    );
+    // Case-insensitive on all 6.
+    assert!(registry.lookup_range_aware("percentile.inc").is_some());
+    assert!(registry.lookup_range_aware("Percentile.Exc").is_some());
+    assert!(registry.lookup_range_aware("quartile.inc").is_some());
+    assert!(registry.lookup_range_aware("Quartile.Exc").is_some());
+    assert!(registry.lookup_range_aware("percentile").is_some());
+    assert!(registry.lookup_range_aware("quartile").is_some());
+}
+
+#[test]
 fn e2e_mirr_registered() {
     // W5-174: MIRR is RangeAwareFn; range-arg construction can't go
     // through the lightweight `bind(&ast, 0)` test helper without
