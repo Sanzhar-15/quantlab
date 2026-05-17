@@ -466,6 +466,17 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("ISNONTEXT", scalar_fns::isnontext);
     r.register("N", scalar_fns::n_value);
 
+    // **W5-D-8 (Phase 4.10 — V1 260 closeout — engineering bit ops):**
+    // BITAND / BITOR / BITXOR / BITLSHIFT / BITRSHIFT. Scalar tier.
+    // Excel canon: both args in `[0, 2^48 - 1]` integer; shift amount
+    // `|s| <= 53`. Negative shift inverts direction. Result overflow
+    // → `#NUM!`. Ported from IronCalc `engineering/bit_operations.rs`.
+    r.register("BITAND", scalar_fns::bitand);
+    r.register("BITOR", scalar_fns::bitor);
+    r.register("BITXOR", scalar_fns::bitxor);
+    r.register("BITLSHIFT", scalar_fns::bitlshift);
+    r.register("BITRSHIFT", scalar_fns::bitrshift);
+
     // Phase 4.10.D (W5-166) — combinatorics + SUMSQ (scalar tier).
     r.register("FACT", scalar_fns::fact);
     r.register("FACTDOUBLE", scalar_fns::factdouble);
@@ -1017,7 +1028,11 @@ mod tests {
         // closed-form, XIRR Newton-Raphson with bisection fallback
         // (matches IronCalc's `compute_xirr` pattern). Closes the
         // final Wave-3-tagged matrix item.
-        assert_eq!(r.len(), 238);
+        // W5-D-8 (Phase 4.10 — V1 260 closeout — engineering bit
+        // ops): BITAND, BITOR, BITXOR, BITLSHIFT, BITRSHIFT = 5 —
+        // scalar tier; Excel canon `[0, 2^48-1]` domain + `|shift|
+        // <= 53`. First V1-260-closeout batch after Wave 3.
+        assert_eq!(r.len(), 243);
     }
 
     #[test]

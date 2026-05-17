@@ -550,6 +550,43 @@ fn e2e_correl_registered() {
 }
 
 #[test]
+fn e2e_bit_ops_through_dispatcher() {
+    // **W5-D-8 (Phase 4.10 — V1 260 closeout):** end-to-end dispatch
+    // tests for BIT* engineering family. All scalar; verify the
+    // formula parser + registry lookup route correctly.
+    // BITAND(12, 10) = 8 (0b1100 & 0b1010).
+    assert_eq!(
+        eval_source_with_registry("BITAND(12, 10)", &[]),
+        Value::Number(8.0)
+    );
+    // BITOR(12, 10) = 14.
+    assert_eq!(
+        eval_source_with_registry("BITOR(12, 10)", &[]),
+        Value::Number(14.0)
+    );
+    // BITXOR(12, 10) = 6.
+    assert_eq!(
+        eval_source_with_registry("BITXOR(12, 10)", &[]),
+        Value::Number(6.0)
+    );
+    // BITLSHIFT(1, 3) = 8.
+    assert_eq!(
+        eval_source_with_registry("BITLSHIFT(1, 3)", &[]),
+        Value::Number(8.0)
+    );
+    // BITRSHIFT(8, 3) = 1.
+    assert_eq!(
+        eval_source_with_registry("BITRSHIFT(8, 3)", &[]),
+        Value::Number(1.0)
+    );
+    // Case-insensitive lookup.
+    assert_eq!(
+        eval_source_with_registry("bitand(12, 10)", &[]),
+        Value::Number(8.0)
+    );
+}
+
+#[test]
 fn e2e_xnpv_xirr_registered() {
     // **W5-D-7 (Wave 3 closure — CLOSES Wave 3):** smoke-check
     // registry dispatch for XNPV / XIRR. Same pattern as sibling

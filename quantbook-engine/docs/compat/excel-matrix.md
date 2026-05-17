@@ -307,7 +307,11 @@ as partial, rows with `❌` are missing.
 
 | Function | Status | Tests | Phase | Notes |
 |---|---|---|---|---|
-| BITAND / BITOR / BITXOR / BITLSHIFT / BITRSHIFT | ❌ | 0 | 4.10 | |
+| BITAND | ✅ | 10 | 4.10 V1-260 closeout (W5-D-8) | W5-D-8: bitwise AND. Both args `[0, 2^48-1]` integer. Closed-form `0b1100 & 0b1010 = 8`. |
+| BITOR | ✅ | 10 | 4.10 V1-260 closeout (W5-D-8) | W5-D-8: bitwise OR. Same domain. `0b1100 \| 0b1010 = 14`. |
+| BITXOR | ✅ | 9 | 4.10 V1-260 closeout (W5-D-8) | W5-D-8: bitwise XOR. Same domain. `0b1100 ^ 0b1010 = 6`. Self-XOR = 0. |
+| BITLSHIFT | ✅ | 11 | 4.10 V1-260 closeout (W5-D-8) | W5-D-8: bitwise left shift. `number` in `[0, 2^48-1]`; `\|shift\| ≤ 53`. **Negative shift inverts direction** (Excel canon). Result overflow → `#NUM!`. |
+| BITRSHIFT | ✅ | 11 | 4.10 V1-260 closeout (W5-D-8) | W5-D-8: bitwise right shift. Same domain. Negative-shift inverts to left-shift. Round-trip with BITLSHIFT pinned. |
 | DEC2BIN / BIN2DEC / DEC2HEX / HEX2DEC / DEC2OCT / OCT2DEC | ❌ | 0 | 4.10 | Base conversion |
 | COMPLEX / IMABS / IMARGUMENT / IMCONJUGATE | ❌ | 0 | post-v1 | Complex-number math |
 | ERF / ERFC | ❌ | 0 | 4.10 | (W5-D-5.1 MEDIUM-O-1 closure: GAMMA/GAMMALN moved to their own rows in the Statistical section — they shipped in W5-D-5.) |

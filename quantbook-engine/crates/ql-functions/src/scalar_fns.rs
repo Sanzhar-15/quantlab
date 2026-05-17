@@ -3231,6 +3231,208 @@ pub fn n_value(args: &[Value]) -> Value {
     }
 }
 
+// =====================================================================
+// W5-D-8 (Phase 4.10 — V1 260 closeout): BIT* engineering fns
+// =====================================================================
+//
+// BITAND / BITOR / BITXOR / BITLSHIFT / BITRSHIFT. All scalar; both
+// args via `to_number_strict`. Excel canon: 2^48 - 1 upper bound on
+// the integer-valued numeric args (Microsoft + IronCalc both pin).
+//
+// Reference: `.references/ironcalc/base/src/functions/engineering/bit_operations.rs`.
+
+/// Excel BIT-family canon upper bound: 2^48 - 1 = 281_474_976_710_655.
+const BIT_MAX: f64 = 281_474_976_710_655.0;
+
+/// **W5-D-8** shared validation for BITAND / BITOR / BITXOR. Verifies
+/// both args are non-negative integers in `[0, 2^48 - 1]`. Returns
+/// the i64 pair on success.
+fn validate_bit_pair(a: f64, b: f64) -> Result<(i64, i64), ErrorValue> {
+    if a.trunc() != a || b.trunc() != b {
+        return Err(ErrorValue::Num);
+    }
+    if a < 0.0 || b < 0.0 {
+        return Err(ErrorValue::Num);
+    }
+    if a > BIT_MAX || b > BIT_MAX {
+        return Err(ErrorValue::Num);
+    }
+    // **W5-D-8.1 (Opus MEDIUM closure):** `a` and `b` are already
+    // integers (verified by the `.trunc() != a` check above); the
+    // `as i64` cast is exact. Removed redundant `.trunc()` calls.
+    Ok((a as i64, b as i64))
+}
+
+/// **W5-D-8** shared validation for BITLSHIFT / BITRSHIFT. The
+/// first arg must be a non-negative integer in `[0, 2^48 - 1]`;
+/// the shift arg's absolute value must be `<= 53` (per Excel canon
+/// — wider shifts would push the result outside f64's safe integer
+/// range). Returns `(number, shift)` as i64.
+///
+/// **Note**: IronCalc truncates the shift arg without an integer
+/// check (`number.trunc() == number` only enforced on the first
+/// arg). We follow IronCalc for parity; this means
+/// `BITLSHIFT(1, 2.7) = BITLSHIFT(1, 2) = 4`. Document.
+fn validate_bit_shift(number: f64, shift: f64) -> Result<(i64, i64), ErrorValue> {
+    if number.trunc() != number {
+        return Err(ErrorValue::Num);
+    }
+    if !(0.0..=BIT_MAX).contains(&number) {
+        return Err(ErrorValue::Num);
+    }
+    if shift.abs() > 53.0 {
+        return Err(ErrorValue::Num);
+    }
+    // **W5-D-8.1 (Opus MEDIUM closure):** `number` is already integer
+    // (verified above); `shift` is intentionally truncated per the
+    // IronCalc canon (no integer-rejection check on shift).
+    Ok((number as i64, shift.trunc() as i64))
+}
+
+/// **BITAND(number1, number2)** — bitwise AND. Both args must be
+/// non-negative integers in `[0, 2^48 - 1]`.
+pub fn bitand(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let a = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let b = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    match validate_bit_pair(a, b) {
+        Ok((x, y)) => Value::Number((x & y) as f64),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// **BITOR(number1, number2)** — bitwise OR. Same domain as BITAND.
+pub fn bitor(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let a = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let b = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    match validate_bit_pair(a, b) {
+        Ok((x, y)) => Value::Number((x | y) as f64),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// **BITXOR(number1, number2)** — bitwise XOR. Same domain as BITAND.
+pub fn bitxor(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let a = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let b = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    match validate_bit_pair(a, b) {
+        Ok((x, y)) => Value::Number((x ^ y) as f64),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// **BITLSHIFT(number, shift_amount)** — bitwise left shift.
+///
+/// - `number` in `[0, 2^48 - 1]` integer.
+/// - `|shift_amount| <= 53`.
+/// - Negative `shift_amount` shifts right by `|shift|` (Excel canon).
+/// - Result overflow (`|result| > 2^48 - 1`) → `#NUM!`.
+pub fn bitlshift(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let number = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let shift = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let (n_i, s_i) = match validate_bit_shift(number, shift) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
+    };
+    // **W5-D-8.1 (Codex MEDIUM-001 + Opus HIGH-1/HIGH-2 closure):**
+    // perform shift in f64 (mantissa 53 bits exactly represents all
+    // in-domain results — number ≤ 2^48-1, |shift| ≤ 53, so any
+    // mathematical result fits in 2^53 exactly OR overflows visibly
+    // beyond BIT_MAX). Replaces the prior i64 `wrapping_shl`/
+    // `wrapping_shr` which would silently wrap high bits and pass
+    // the `abs()` post-check incorrectly (e.g. `BITLSHIFT(2^48-1, 16)`
+    // wrapped to `-65536` instead of returning `#NUM!`).
+    let n_f = n_i as f64;
+    let result_f = if s_i >= 0 {
+        n_f * 2f64.powi(s_i as i32)
+    } else {
+        n_f * 2f64.powi(-((-s_i) as i32))
+    };
+    // **Domain check** (not abs-check). 0..=BIT_MAX bounds catch both
+    // wrap-to-negative and wrap-to-zero failure modes.
+    if !(0.0..=BIT_MAX).contains(&result_f) || !result_f.is_finite() {
+        return Value::Error(ErrorValue::Num);
+    }
+    // Re-floor: `n_f * 2^s` is always an exact integer when n_i is i64
+    // and |s| ≤ 53, but floor() is defensive against future refactors.
+    Value::Number(result_f.floor())
+}
+
+/// **BITRSHIFT(number, shift_amount)** — bitwise right shift.
+///
+/// - `number` in `[0, 2^48 - 1]` integer.
+/// - `|shift_amount| <= 53`.
+/// - Negative `shift_amount` shifts left by `|shift|` (Excel canon).
+/// - Result overflow (`|result| > 2^48 - 1`) → `#NUM!`.
+pub fn bitrshift(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let number = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let shift = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let (n_i, s_i) = match validate_bit_shift(number, shift) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
+    };
+    // **W5-D-8.1 (Codex MEDIUM-001 + Opus HIGH-1/HIGH-2 closure):**
+    // same f64-multiplication strategy as `bitlshift` — the
+    // negative-shift branch (which acts as left shift) had the same
+    // wrap-overflow bug.
+    let n_f = n_i as f64;
+    let result_f = if s_i >= 0 {
+        // Right shift: floor(n / 2^s).
+        (n_f / 2f64.powi(s_i as i32)).floor()
+    } else {
+        // Negative shift = left shift by |shift|.
+        n_f * 2f64.powi((-s_i) as i32)
+    };
+    if !(0.0..=BIT_MAX).contains(&result_f) || !result_f.is_finite() {
+        return Value::Error(ErrorValue::Num);
+    }
+    Value::Number(result_f.floor())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6415,5 +6617,513 @@ mod tests {
             assert_eq!(f(&[]), Value::Error(ErrorValue::Value));
             assert_eq!(f(&[n(0.0), n(0.0)]), Value::Error(ErrorValue::Value));
         }
+    }
+
+    // ===== W5-D-8 (Phase 4.10 — V1 260 closeout — BIT* engineering) =====
+
+    // --- BITAND ---
+
+    #[test]
+    fn bitand_basic_closed_form() {
+        // 0b1100 & 0b1010 = 0b1000 = 8.
+        assert_eq!(bitand(&[n(12.0), n(10.0)]), Value::Number(8.0));
+    }
+
+    #[test]
+    fn bitand_zero_identity() {
+        assert_eq!(bitand(&[n(0.0), n(255.0)]), Value::Number(0.0));
+        assert_eq!(bitand(&[n(255.0), n(0.0)]), Value::Number(0.0));
+    }
+
+    #[test]
+    fn bitand_self_identity() {
+        // x & x = x.
+        assert_eq!(bitand(&[n(42.0), n(42.0)]), Value::Number(42.0));
+    }
+
+    #[test]
+    fn bitand_max_value_canon() {
+        // 2^48-1 & 2^48-1 = 2^48-1 (the canonical upper bound is included).
+        assert_eq!(
+            bitand(&[n(281_474_976_710_655.0), n(281_474_976_710_655.0)]),
+            Value::Number(281_474_976_710_655.0)
+        );
+    }
+
+    #[test]
+    fn bitand_above_max_is_num_error() {
+        assert_eq!(
+            bitand(&[n(281_474_976_710_656.0), n(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            bitand(&[n(0.0), n(281_474_976_710_656.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn bitand_negative_is_num_error() {
+        assert_eq!(bitand(&[n(-1.0), n(1.0)]), Value::Error(ErrorValue::Num));
+        assert_eq!(bitand(&[n(1.0), n(-1.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn bitand_non_integer_is_num_error() {
+        assert_eq!(bitand(&[n(1.5), n(1.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn bitand_text_arg_is_value_error() {
+        assert_eq!(
+            bitand(&[Value::text("x"), n(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn bitand_error_arg_propagates() {
+        assert_eq!(
+            bitand(&[Value::Error(ErrorValue::Ref), n(1.0)]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn bitand_arity_mismatch_returns_value() {
+        assert_eq!(bitand(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(bitand(&[n(1.0)]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            bitand(&[n(1.0), n(2.0), n(3.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // --- BITOR ---
+
+    #[test]
+    fn bitor_basic_closed_form() {
+        // 0b1100 | 0b1010 = 0b1110 = 14.
+        assert_eq!(bitor(&[n(12.0), n(10.0)]), Value::Number(14.0));
+    }
+
+    #[test]
+    fn bitor_zero_identity() {
+        // x | 0 = x.
+        assert_eq!(bitor(&[n(42.0), n(0.0)]), Value::Number(42.0));
+    }
+
+    #[test]
+    fn bitor_self_identity() {
+        // x | x = x.
+        assert_eq!(bitor(&[n(42.0), n(42.0)]), Value::Number(42.0));
+    }
+
+    #[test]
+    fn bitor_max_value_canon() {
+        // 0 | (2^48-1) = 2^48-1.
+        assert_eq!(
+            bitor(&[n(0.0), n(281_474_976_710_655.0)]),
+            Value::Number(281_474_976_710_655.0)
+        );
+    }
+
+    #[test]
+    fn bitor_above_max_is_num_error() {
+        assert_eq!(
+            bitor(&[n(281_474_976_710_656.0), n(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn bitor_negative_is_num_error() {
+        assert_eq!(bitor(&[n(-1.0), n(0.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn bitor_non_integer_is_num_error() {
+        assert_eq!(bitor(&[n(1.5), n(1.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn bitor_text_arg_is_value_error() {
+        assert_eq!(
+            bitor(&[Value::text("x"), n(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn bitor_error_arg_propagates() {
+        assert_eq!(
+            bitor(&[Value::Error(ErrorValue::DivZero), n(1.0)]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn bitor_arity_mismatch_returns_value() {
+        assert_eq!(bitor(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(bitor(&[n(1.0)]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            bitor(&[n(1.0), n(2.0), n(3.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // --- BITXOR ---
+
+    #[test]
+    fn bitxor_basic_closed_form() {
+        // 0b1100 ^ 0b1010 = 0b0110 = 6.
+        assert_eq!(bitxor(&[n(12.0), n(10.0)]), Value::Number(6.0));
+    }
+
+    #[test]
+    fn bitxor_self_zero() {
+        // x ^ x = 0.
+        assert_eq!(bitxor(&[n(42.0), n(42.0)]), Value::Number(0.0));
+    }
+
+    #[test]
+    fn bitxor_zero_identity() {
+        // x ^ 0 = x.
+        assert_eq!(bitxor(&[n(42.0), n(0.0)]), Value::Number(42.0));
+    }
+
+    #[test]
+    fn bitxor_above_max_is_num_error() {
+        assert_eq!(
+            bitxor(&[n(281_474_976_710_656.0), n(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn bitxor_negative_is_num_error() {
+        assert_eq!(bitxor(&[n(0.0), n(-1.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn bitxor_non_integer_is_num_error() {
+        assert_eq!(bitxor(&[n(1.0), n(2.5)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn bitxor_text_arg_is_value_error() {
+        assert_eq!(
+            bitxor(&[Value::text("x"), n(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn bitxor_error_arg_propagates() {
+        assert_eq!(
+            bitxor(&[Value::Error(ErrorValue::Ref), n(1.0)]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn bitxor_arity_mismatch_returns_value() {
+        assert_eq!(bitxor(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            bitxor(&[n(1.0), n(2.0), n(3.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // --- BITLSHIFT ---
+
+    #[test]
+    fn bitlshift_basic_closed_form() {
+        // 1 << 3 = 8.
+        assert_eq!(bitlshift(&[n(1.0), n(3.0)]), Value::Number(8.0));
+        // 5 << 2 = 20.
+        assert_eq!(bitlshift(&[n(5.0), n(2.0)]), Value::Number(20.0));
+    }
+
+    #[test]
+    fn bitlshift_zero_shift_identity() {
+        // x << 0 = x.
+        assert_eq!(bitlshift(&[n(42.0), n(0.0)]), Value::Number(42.0));
+    }
+
+    #[test]
+    fn bitlshift_negative_shift_is_right_shift() {
+        // 8 << -2 = 8 >> 2 = 2 (Excel canon: negative shift inverts).
+        assert_eq!(bitlshift(&[n(8.0), n(-2.0)]), Value::Number(2.0));
+    }
+
+    #[test]
+    fn bitlshift_shift_above_53_is_num_error() {
+        assert_eq!(bitlshift(&[n(1.0), n(54.0)]), Value::Error(ErrorValue::Num));
+        assert_eq!(
+            bitlshift(&[n(1.0), n(-54.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn bitlshift_result_overflow_is_num_error() {
+        // 2^47 << 2 = 2^49 > 2^48-1 → #NUM!.
+        assert_eq!(
+            bitlshift(&[n(140_737_488_355_328.0), n(2.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn bitlshift_number_above_max_is_num_error() {
+        assert_eq!(
+            bitlshift(&[n(281_474_976_710_656.0), n(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn bitlshift_negative_number_is_num_error() {
+        assert_eq!(bitlshift(&[n(-1.0), n(0.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn bitlshift_non_integer_number_is_num_error() {
+        assert_eq!(bitlshift(&[n(1.5), n(0.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn bitlshift_text_arg_is_value_error() {
+        assert_eq!(
+            bitlshift(&[Value::text("x"), n(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn bitlshift_error_arg_propagates() {
+        assert_eq!(
+            bitlshift(&[Value::Error(ErrorValue::Ref), n(1.0)]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn bitlshift_arity_mismatch_returns_value() {
+        assert_eq!(bitlshift(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            bitlshift(&[n(1.0), n(2.0), n(3.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // --- BITRSHIFT ---
+
+    #[test]
+    fn bitrshift_basic_closed_form() {
+        // 8 >> 3 = 1.
+        assert_eq!(bitrshift(&[n(8.0), n(3.0)]), Value::Number(1.0));
+        // 20 >> 2 = 5.
+        assert_eq!(bitrshift(&[n(20.0), n(2.0)]), Value::Number(5.0));
+    }
+
+    #[test]
+    fn bitrshift_zero_shift_identity() {
+        assert_eq!(bitrshift(&[n(42.0), n(0.0)]), Value::Number(42.0));
+    }
+
+    #[test]
+    fn bitrshift_negative_shift_is_left_shift() {
+        // 2 >> -3 = 2 << 3 = 16 (Excel canon: negative shift inverts).
+        assert_eq!(bitrshift(&[n(2.0), n(-3.0)]), Value::Number(16.0));
+    }
+
+    #[test]
+    fn bitrshift_shift_above_53_is_num_error() {
+        assert_eq!(bitrshift(&[n(1.0), n(54.0)]), Value::Error(ErrorValue::Num));
+        assert_eq!(
+            bitrshift(&[n(1.0), n(-54.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn bitrshift_negative_shift_overflow_is_num_error() {
+        // 2^47 >> -2 = 2^47 << 2 = 2^49 > 2^48-1 → #NUM!.
+        assert_eq!(
+            bitrshift(&[n(140_737_488_355_328.0), n(-2.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn bitrshift_number_above_max_is_num_error() {
+        assert_eq!(
+            bitrshift(&[n(281_474_976_710_656.0), n(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn bitrshift_negative_number_is_num_error() {
+        assert_eq!(bitrshift(&[n(-1.0), n(0.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn bitrshift_non_integer_number_is_num_error() {
+        assert_eq!(bitrshift(&[n(1.5), n(0.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn bitrshift_text_arg_is_value_error() {
+        assert_eq!(
+            bitrshift(&[Value::text("x"), n(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn bitrshift_error_arg_propagates() {
+        assert_eq!(
+            bitrshift(&[Value::Error(ErrorValue::DivZero), n(1.0)]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn bitrshift_arity_mismatch_returns_value() {
+        assert_eq!(bitrshift(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            bitrshift(&[n(1.0), n(2.0), n(3.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // --- Round-trip properties ---
+
+    #[test]
+    fn bit_lshift_rshift_round_trip() {
+        // (x << s) >> s = x when no overflow.
+        let original = 42i64;
+        let shifted = match bitlshift(&[n(original as f64), n(3.0)]) {
+            Value::Number(v) => v,
+            _ => panic!("bitlshift failed"),
+        };
+        assert_eq!(
+            bitrshift(&[n(shifted), n(3.0)]),
+            Value::Number(original as f64)
+        );
+    }
+
+    #[test]
+    fn bit_xor_or_and_identity() {
+        // **W5-D-8.1 (Opus MEDIUM closure):** the algebraic identity
+        // `a ^ b = (a | b) - (a & b)` is UNCONDITIONAL on non-negative
+        // integers — not just when bits are disjoint. (For
+        // bit-disjoint values, a&b=0 so a^b=a|b; the general identity
+        // accounts for the carry difference.) Prior docstring claimed
+        // "no carry overlap" condition was needed; that's wrong.
+        let a = 0b110110_i64 as f64;
+        let b = 0b101011_i64 as f64;
+        let and_v = match bitand(&[n(a), n(b)]) {
+            Value::Number(v) => v,
+            _ => panic!(),
+        };
+        let or_v = match bitor(&[n(a), n(b)]) {
+            Value::Number(v) => v,
+            _ => panic!(),
+        };
+        let xor_v = match bitxor(&[n(a), n(b)]) {
+            Value::Number(v) => v,
+            _ => panic!(),
+        };
+        assert!((xor_v - (or_v - and_v)).abs() < 1e-9);
+    }
+
+    // ===== W5-D-8.1 audit-closure regression tests =====
+
+    #[test]
+    fn bitlshift_high_bit_wrap_to_negative_regression() {
+        // **W5-D-8.1 (Codex MEDIUM-001 + Opus HIGH-2 closure):** the
+        // i64 `wrapping_shl` of `2^48 - 1 << 16` produces `-65536`
+        // (high bits wrap, sign bit set). Old impl's `result.abs()
+        // > BIT_MAX` check accepted this as a valid result. New
+        // impl uses f64 multiplication + domain check — `2^64 -
+        // 2^16` is far above BIT_MAX, so #NUM!.
+        assert_eq!(
+            bitlshift(&[n(281_474_976_710_655.0), n(16.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn bitlshift_high_bit_wrap_to_zero_regression() {
+        // **W5-D-8.1 (Opus HIGH-1 closure):** `2^16 << 48` mathematically
+        // equals `2^64`, which exceeds BIT_MAX. The old i64
+        // `wrapping_shl` produced 0 (all bits shifted past the i64
+        // sign bit), abs check passed, returned 0. Now correctly #NUM!.
+        assert_eq!(
+            bitlshift(&[n(65_536.0), n(48.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn bitlshift_wrap_family_regression() {
+        // **W5-D-8.1 (Opus HIGH-1 closure):** Opus identified
+        // `n = 2^k, s = 64 - k` for k ∈ [0, 16] as the general
+        // wrap-to-zero shape. Sample 3 points to pin the family.
+        for k in [0u32, 8u32, 16u32] {
+            let n_v = (1u64 << k) as f64;
+            let s = (64 - k) as f64;
+            assert_eq!(
+                bitlshift(&[n(n_v), n(s)]),
+                Value::Error(ErrorValue::Num),
+                "BITLSHIFT(2^{k}, {s}) should overflow",
+            );
+        }
+    }
+
+    #[test]
+    fn bitrshift_negative_shift_overflow_wrap_regression() {
+        // **W5-D-8.1 (Codex MEDIUM-001 closure):** BITRSHIFT with
+        // negative shift takes the left-shift branch — same
+        // wrap-overflow risk as BITLSHIFT. Verify the f64
+        // multiplication fix applies symmetrically.
+        // BITRSHIFT(2^48-1, -16) = BITLSHIFT(2^48-1, 16) → #NUM!.
+        assert_eq!(
+            bitrshift(&[n(281_474_976_710_655.0), n(-16.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn bitxor_max_value_canon() {
+        // **W5-D-8.1 (Opus MEDIUM closure):** missing max-canon
+        // test for BITXOR. (BITAND and BITOR had max-canon tests;
+        // BITXOR didn't.) `(2^48-1) ^ 0 = 2^48-1`.
+        assert_eq!(
+            bitxor(&[n(281_474_976_710_655.0), n(0.0)]),
+            Value::Number(281_474_976_710_655.0)
+        );
+        // `(2^48-1) ^ (2^48-1) = 0` (self-XOR).
+        assert_eq!(
+            bitxor(&[n(281_474_976_710_655.0), n(281_474_976_710_655.0)]),
+            Value::Number(0.0)
+        );
+    }
+
+    #[test]
+    fn bitlshift_non_integer_shift_silently_truncated() {
+        // **W5-D-8.1 (Opus LOW closure):** IronCalc canon (which we
+        // follow): shift arg's fractional part is silently truncated
+        // — only the FIRST arg has an integer-rejection check. Pin
+        // this divergence from a stricter validator that future
+        // refactors might be tempted to add.
+        // BITLSHIFT(1, 2.9) = BITLSHIFT(1, 2) = 4.
+        assert_eq!(bitlshift(&[n(1.0), n(2.9)]), Value::Number(4.0));
+        // BITRSHIFT(8, 2.9) = BITRSHIFT(8, 2) = 2.
+        assert_eq!(bitrshift(&[n(8.0), n(2.9)]), Value::Number(2.0));
     }
 }

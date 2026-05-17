@@ -328,6 +328,31 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "XIRR",
         "W5-D-7; unit tests pin Microsoft canonical example → ≈0.37336 + round-trip XNPV(xirr_result, ...) ≈ 0 + all-positive/all-negative cash flows → #NUM! + optional guess defaults to 0.1 + guess <= -1 → #VALUE! + empty cells substituted as 0.0 (XIRR-specific divergence from XNPV) + text in values → #VALUE! + length mismatch / date-order #NUM! + error propagation + arity",
     ),
+    // W5-D-8 (Phase 4.10 — V1 260 closeout — engineering bit ops).
+    // BITAND / BITOR / BITXOR / BITLSHIFT / BITRSHIFT. Scalar tier.
+    // Excel canon: `[0, 2^48 - 1]` integer domain; `|shift| <= 53`;
+    // result overflow → `#NUM!`. Ported from IronCalc
+    // `engineering/bit_operations.rs`.
+    (
+        "BITAND",
+        "W5-D-8; unit tests pin closed-form 0b1100 & 0b1010 = 8, zero/self identities, max-value canon (2^48-1), above-max #NUM!, negative #NUM!, non-integer #NUM!, text/error/arity-under-over",
+    ),
+    (
+        "BITOR",
+        "W5-D-8; unit tests pin closed-form 0b1100 | 0b1010 = 14, zero/self identities, above-max #NUM!, negative #NUM!, non-integer #NUM!, text/error/arity",
+    ),
+    (
+        "BITXOR",
+        "W5-D-8; unit tests pin closed-form 0b1100 ^ 0b1010 = 6, self-XOR=0, zero identity, above-max/negative/non-integer #NUM!, text/error/arity",
+    ),
+    (
+        "BITLSHIFT",
+        "W5-D-8; unit tests pin closed-form `1<<3=8`, `5<<2=20`, zero-shift identity, **negative-shift inverts to right-shift** (Excel canon), |shift|>53 #NUM!, result overflow >2^48-1 #NUM!, above-max/negative/non-integer #NUM!, text/error/arity",
+    ),
+    (
+        "BITRSHIFT",
+        "W5-D-8; unit tests pin closed-form `8>>3=1`, `20>>2=5`, zero-shift identity, **negative-shift inverts to left-shift** (Excel canon), |shift|>53 #NUM!, result overflow #NUM!, above-max/negative/non-integer #NUM!, text/error/arity. Round-trip with BITLSHIFT pinned.",
+    ),
     // W5-180 (Phase 4.10 polish / Wave 3 depreciation batch starter) —
     // SLN + SYD: closed-form straight-line + sum-of-years digits
     // depreciation. Scalar; both ported from IronCalc `fn_sln` /
