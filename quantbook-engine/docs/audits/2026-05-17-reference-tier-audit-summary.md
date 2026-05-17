@@ -112,3 +112,69 @@ After Step 1.1 closures land:
 - Net gates: all green, test count up by ≥3.
 
 Ready for Step 2 (ROW/COLUMN/ROWS/COLUMNS implementation + Step 2.A audit).
+
+---
+
+## Audit cycle 3 — Step 2 (ROW/COLUMN/ROWS/COLUMNS implementation)
+
+**Scope:** working-tree Step 2 changes — `crates/ql-functions/src/reference_fns.rs` (NEW, 4 fn impls + 28 unit tests), `crates/ql-functions/src/{lib,registry}.rs`, `crates/ql-exec/src/plan.rs` (registry-side invariant test), `crates/ql-exec/tests/reference_fns_e2e.rs` (NEW, 32 e2e tests), `crates/ql-functions/tests/coverage.rs` (4 entries), `docs/compat/excel-matrix.md` (4 rows).
+**HEAD baseline:** `4efabe35deb` (post-Step-1.1). Pre-audit gates: 3173 tests passing.
+
+**Codex audit:** `2026-05-17-rt-step-2-codex.md` — **1 HIGH + 3 MEDIUM + 2 LOW = 6 findings.**
+**Opus audit:** `2026-05-17-rt-step-2-opus.md` — **3 HIGH + 9 MEDIUM + 12 LOW = 24 findings.**
+
+### Severity reconciliation
+
+| Finding | Codex | Opus | Reconciled | Rationale |
+|---------|-------|------|------------|-----------|
+| `ROW(SUM(A1:A3))` bind-fails (design example divergence) | HIGH-1 | — | **HIGH** | Codex-only. Design's named Microsoft-canon case fails at bind. Same gap affects Step 3/4 examples for ISREF/ISFORMULA/FORMULATEXT. |
+| Named-range + cross-sheet + structured-ref coverage absent | MED-2/3 | HIGH-1 | **HIGH** | Convergent. Opus rates higher. Plan checklist enumerated these as Step 2 requirements; gaps include dedicated materializer + walker paths that ship without test coverage. |
+| CellRef materializer reads value AND silently coerces `Value::Error` to `RefArg::Reference` | — | HIGH-2 | **HIGH** | Opus-only. Real error-propagation bug: `ROW(Sheet99!A1)` where Sheet99 missing returns `1` instead of `#REF!`. Reachability is low today (no `delete_sheet` API) but the gap is architectural. |
+| Stale doc on `is_reference_aware_function` | LOW-1 | HIGH-3 | **MEDIUM** | Opus's HIGH framing overrates; doc-only. But two factual errors (false claim + nonexistent test name reference) — MEDIUM per severity rule. |
+| `ROWS`/`COLUMNS` u32 underflow on non-normalized Range | MED-1 | LOW-3 | **MEDIUM** | Codex's framing emphasizes public-API reachability. Take higher. |
+| E2E gap for `=ROW()` formula-cell happy path | MED-2 (sub) | MED-2 | **MEDIUM** | Convergent. Resolved by S2-HIGH-1's added tests. |
+| Coverage-note `EXPLICITLY_DEFERRED` overclaims | LOW-2 | MED-7 | **MEDIUM** | Take higher. |
+| Structured-ref boundary guard untested | MED-3 | (subsumed in HIGH-1) | **MEDIUM** | Same area as HIGH-1. |
+| Step 2 invariant only covers 4 of 7 names | — | MED-5 | **MEDIUM** | Real test gap. ISREF/ISFORMULA/FORMULATEXT in matcher but not yet registered; typo in those would slip through Step 2. |
+| Misc MEDIUMs (ROW(1×3) test, walker doc, matrix counts, args.len()!=1 boundary, Range.values dead, design § 5.6 shape() drift) | — | MED-1/3/4/6/8/9 | **LOW** | Reconciled down — doc-only or unreachable-today concerns. |
+
+### Final HIGH list (must-close in Step 2.1)
+
+| ID | Subject | Fix shape |
+|----|---------|-----------|
+| **S2-HIGH-1** | Coverage gaps: named-range, cross-sheet, formula-cell `=ROW()`, structured-ref | Add named-range + cross-sheet + WorkbookRuntime formula-cell tests in Step 2.1; defer structured-ref + implicit-intersection (`@ROW(A1:A10)`) to Step 5 cross-cutting suite with explicit rationale in plan file. |
+| **S2-HIGH-2** | CellRef materializer eats `Value::Error` | Mirror the fallthrough arm's error mapping in the CellRef arm — `match read_cell { Value::Error(ev) => RefArg::Error(ev), ok => RefArg::Reference { ok } }`. Smaller fix (preserve `value` field for forward compat); a future cycle can drop the field entirely if no consumer materializes. |
+| **S2-HIGH-3** | `ROW(SUM(A1:A3))` bind-fails | Document the v1 scope: nested `SUM(A1:A3)`-style literal-range subcalls bind-fail per S1-MED-γ AggregateArg defer. The Microsoft-canon `#VALUE!` requires AggregateArg-side literal RangeRef binding (out of scope for RT-V1). Update `reference_fns.rs` doc-comment + design § 5.6 + excel-matrix Notes to make the scope explicit. Add an explicit e2e test pinning the v1 behavior (`ROW(SUM(A1:A3)) → BindError`) so a future regression is caught. The named-range form (`ROW(SUM(NamedRange))`) DOES work and is tested as part of S2-HIGH-1's named-range coverage. |
+
+### MEDIUM closures (5 items)
+
+| ID | Subject | Fix shape |
+|----|---------|-----------|
+| **S2-MED-α** | Stale doc on `is_reference_aware_function` (Opus HIGH-3 reconciled to MED) | Rewrite doc-comment to reflect post-Step-2 state + reference the correct test names. |
+| **S2-MED-β** | u32 underflow on non-normalized Range | Range arithmetic already safe in v1 paths (binder normalizes via `Range::new`). Add defensive `checked_sub`-style guard in `rows`/`columns` impls OR add a debug_assert. Document the public-API risk for follow-up. |
+| **S2-MED-γ** | Step 2 invariant only covers 4 of 7 names | Extend `step_2_reference_aware_names_registered_in_reference_tier` to ALSO assert ISREF/ISFORMULA/FORMULATEXT are NOT yet in `lookup_reference_aware` (and ARE in `is_reference_aware_function`). |
+| **S2-MED-δ** | `EXPLICITLY_DEFERRED` coverage notes overclaim | Tighten the reason strings — say "reference-aware fn (W5-RT-2); covered by reference_fns unit tests (anchor / range / array literal / error propagation / arity / non-reference) + e2e dispatch tests; matrix N/A. Cross-sheet + named-range coverage in S2.1 closure tests; structured-ref in Step 5 cross-cutting suite." |
+| **S2-MED-ε** | Walker `RangeRef` arm doc stale post-Step-2 | Update the inline comment claiming "the only v1 consumers (ISFORMULA / FORMULATEXT...)"; ROW/COLUMN/ROWS/COLUMNS also consume but through the address-only walker route. |
+
+### LOW closures (cherry-picked)
+
+Opus's 12 LOWs + Codex's 2 LOWs: most are doc/naming/test-helper polish. Step 2.1 takes only items that touch correctness or surfaced files; the rest deferred to post-mini-phase polish wave.
+
+| ID | Subject | Action |
+|----|---------|--------|
+| **S2-LOW-1** | Matrix `excel-matrix.md` test counts mismatch (`9+8 e2e` etc.) | Recompute against actual test count, update. |
+| **S2-LOW-2** | Microsoft canon `ROW({1,2,3})` 1×3 shape not specifically tested | Add unit test in reference_fns.rs. |
+| **S2-LOW-3** | Step 2.1 fixes design § 5.6 `av.shape()` drift to `av.rows()/cols()` | Doc fix in design. |
+| Deferred LOWs (10 items) | Test-name consistency, helper extraction, defensive arms doc, symmetric arity coverage, etc. | Post-mini-phase polish; tracked in Step 6 closure docs. |
+
+### Cross-cutting pattern signals (Step 2 cycle)
+
+1. **Coverage gaps tend to slip when test infrastructure differs.** Named-range / cross-sheet / structured-ref / formula-cell-context each require non-trivial test setup (NameTable / sheet resolver / WorkbookRuntime). The Step 2 implementation defaulted to `MapEnv` + `eval_with_map` for ergonomic reasons; the more expensive setups were silently skipped. **Pattern signal:** when plan checklist enumerates coverage classes, verify each by-grep before claiming Step complete.
+
+2. **Materializer arms must follow uniform error-propagation contract.** The CellRef arm's silent error coercion (HIGH-2) violates the fallthrough arm's `Value::Error → RefArg::Error(ev)` mapping. **Pattern signal:** when adding new dispatcher arms, the error-mapping pattern must be replicated explicitly — not left implicit.
+
+3. **Design-doc Microsoft-canon examples are contract.** The `ROW(SUM(A1:A3))` example shipped in design § 5.6 but the impl can't reach it (S1-MED-γ AggregateArg defer affects Step 2/3/4 cross-fn examples). **Pattern signal:** when deferring a binder feature, audit the design examples that depend on it AND list them as known-divergence at deferral time.
+
+4. **Doc-comments referencing "added in this commit" rot the moment that commit lands.** Opus HIGH-3's claim about `is_reference_aware_function` is the same pattern as Step 1's HIGH-O-1. **Pattern signal:** prefer doc-comments that reference test-name + module location (line independent) and that describe present state without "added recently" / "in this commit" language.
+
+5. **Test-class coverage matrix is load-bearing for plan-completion claims.** The plan's checklist line 87 names 8 categories; impl shipped 5. **Pattern signal:** before checking a plan item complete, grep the impl-tree for ALL categories listed and document deferrals explicitly.
