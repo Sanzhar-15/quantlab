@@ -707,8 +707,8 @@ pub(crate) fn compute_db(
         || period < 1.0
         || cost < 0.0
         || life < 1.0
-        || life > i32::MAX as f64
-        || period > i32::MAX as f64
+        || life >= i32::MAX as f64
+        || period >= i32::MAX as f64
     {
         return Err(ErrorValue::Num);
     }
@@ -793,10 +793,11 @@ pub fn db(args: &[Value]) -> Value {
 /// For each period `i` from 0 to `ceil(end_period) - 1`:
 ///   1. Compute DDB depreciation: `min(book * (factor/life), book − salvage)`,
 ///      floored at 0.
-///   2. If `!no_switch` and SLN-from-here `(book − salvage) / (life − i)`
+///   2. If `!no_switch` and SLN-from-here `(book − salvage) / max(life − i, 1)`
 ///      exceeds the DDB amount: switch to SLN permanently from this
 ///      period onward (lock in the SLN per-period amount at the
-///      moment of switch).
+///      moment of switch). The `max(_, 1)` floor matters only for
+///      fractional `life` (W5-183.1 Opus MEDIUM-1).
 ///   3. Compute overlap fraction `[max(i, start), min(i+1, end)]`.
 ///      Add `(overlap * period_dep)` to the total.
 ///   4. Subtract the FULL `period_dep` from `book` (not the overlap
@@ -804,20 +805,40 @@ pub fn db(args: &[Value]) -> Value {
 ///      is in the requested range).
 ///
 /// ## Validation (Microsoft: "All arguments except no_switch must be
-/// positive numbers")
+/// positive numbers" — augmented per W5-183.1 audit closures)
 ///
 /// - `cost < 0`, `salvage < 0`, `life <= 0`, `factor <= 0` → `#NUM!`.
+/// - `salvage > cost` → `#NUM!` (W5-183.1 Codex HIGH-1: LibreOffice +
+///   OpenFormula reject; previously silently returned `0` because
+///   `book - salvage < 0` clamped DDB to `0` and the negative SLN
+///   check never triggered a switch). `salvage == cost` returns `0`
+///   (no depreciation possible) — the rule is `>`, not `>=`.
 /// - `start_period < 0` or `end_period < start_period` → `#NUM!`.
 /// - `end_period > life` → `#NUM!` (depreciation beyond the asset's
 ///   life is undefined).
-/// - `life > i32::MAX` or `end_period > i32::MAX` → `#NUM!` (DoS guard
-///   matching W5-182.1).
-/// - `cost == 0` short-circuits to `0`.
+/// - `life >= i32::MAX` or `end_period >= i32::MAX` → `#NUM!` (W5-183.1
+///   Opus HIGH-1 / Codex MEDIUM-1: DoS guard tightened from `>` to `>=`.
+///   Exactly `i32::MAX as f64` previously passed validation, then
+///   `end_ceil = i32::MAX`, then the loop ran ~2.15 billion times
+///   per cell. Same off-by-one corrected in `compute_db` this commit.).
+/// - `cost == 0` short-circuits to `0` (W5-183.1 Opus LOW-1: motive
+///   is "no depreciation possible from a zero-cost asset"; unlike DB
+///   there's no `salvage/cost` division to guard against NaN).
 /// - `start_period == end_period` returns `0` (empty range).
 ///
 /// **Engine convention** (matches DDB / DB family): all numeric args
-/// use `arg_num` which accepts Boolean coercion; `no_switch` uses
-/// `arg_type` for explicit Boolean semantics.
+/// use `arg_num` which accepts Boolean coercion (TRUE→1, FALSE→0);
+/// `no_switch` uses `arg_type` which extends `arg_num` with explicit
+/// boolean semantics (non-zero numeric → TRUE; blank → FALSE; errors
+/// propagate). This is **not** "Boolean-strict" — Boolean inputs
+/// pass through naturally but numeric coercion is also accepted
+/// (W5-183.1 Opus MEDIUM-2 / Codex LOW-2 — corrected from prior
+/// "Boolean-strict" wording).
+///
+/// **Microsoft-canon divergence (W5-183.1 Opus MEDIUM-8):** Microsoft
+/// VDB doc says "All arguments except no_switch must be positive
+/// numbers." We follow the DDB family in accepting `cost == 0` and
+/// `salvage == 0` (both return sensible numeric results).
 pub(crate) fn compute_vdb(
     cost: f64,
     salvage: f64,
@@ -827,15 +848,25 @@ pub(crate) fn compute_vdb(
     factor: f64,
     no_switch: bool,
 ) -> Result<f64, ErrorValue> {
+    // **W5-183.1 audit closures:**
+    // - `salvage > cost` rejection (Codex HIGH-1) — LibreOffice +
+    //   OpenFormula reject; previously silently returned 0 because
+    //   `book - salvage < 0` clamps DDB to 0 and the negative SLN
+    //   check never triggers a switch.
+    // - DoS guard tightened `>` → `>=` (Opus HIGH-1 / Codex MEDIUM-1).
+    //   Exactly `i32::MAX as f64` previously passed validation, then
+    //   `end_ceil = i32::MAX`, then the loop ran ~2.15 billion times
+    //   per cell. Same off-by-one fixed in `compute_db` this commit.
     if cost < 0.0
         || salvage < 0.0
+        || salvage > cost
         || life <= 0.0
         || start_period < 0.0
         || end_period < start_period
         || end_period > life
         || factor <= 0.0
-        || life > i32::MAX as f64
-        || end_period > i32::MAX as f64
+        || life >= i32::MAX as f64
+        || end_period >= i32::MAX as f64
     {
         return Err(ErrorValue::Num);
     }
@@ -865,9 +896,13 @@ pub(crate) fn compute_vdb(
         let period_dep = if no_switch {
             ddb_period
         } else {
-            // Periods remaining including this one. Guarded against
-            // div-by-zero (validation ensures end_period <= life so
-            // period <= life - 1, hence life - period >= 1).
+            // Periods remaining including this one. The `.max(1.0)`
+            // floor matters for FRACTIONAL `life`: integer life
+            // guarantees `period <= life - 1` so `life - period >= 1`,
+            // but for `life = 4.5` the last iteration has
+            // `period_f = 4` and `life - 4 = 0.5 < 1` (W5-183.1
+            // Opus MEDIUM-1 closure — corrects the prior comment
+            // that claimed the floor was redundant).
             let periods_remaining = (life - period_f).max(1.0);
             let sln_now = (book - salvage) / periods_remaining;
 
@@ -2504,13 +2539,19 @@ mod tests {
     /// billions of times for huge period. Now both rejected upfront.
     #[test]
     fn db_huge_life_rejected() {
-        // 1e15 > i32::MAX ≈ 2.15e9 → rejected by the DoS guard.
+        // 1e15 >> i32::MAX ≈ 2.15e9 → rejected by the DoS guard.
         assert_eq!(
             db(&[n(1000.0), n(100.0), n(1e15), n(1.0), n(6.0)]),
             Value::Error(ErrorValue::Num)
         );
-        // i32::MAX itself is borderline; `i32::MAX as f64` ≈ 2.147e9.
-        // Use `i32::MAX as f64 + 1.0` to be safely above the threshold.
+        // **W5-183.1 (Opus HIGH-1 closure):** boundary tightened
+        // `>` → `>=`. EXACTLY `i32::MAX as f64` previously passed
+        // (just like VDB's bug), then `life_int + 1` overflowed.
+        // Now rejected uniformly.
+        assert_eq!(
+            db(&[n(1000.0), n(100.0), n(i32::MAX as f64), n(1.0), n(6.0)]),
+            Value::Error(ErrorValue::Num)
+        );
         let just_over = i32::MAX as f64 + 1.0;
         assert_eq!(
             db(&[n(1000.0), n(100.0), n(just_over), n(1.0), n(6.0)]),
@@ -2617,73 +2658,79 @@ mod tests {
         );
     }
 
+    /// **W5-183.1 (Opus MEDIUM-5 closure):** previously named
+    /// `vdb_no_switch_keeps_ddb_throughout` and asserted both forms
+    /// summed to `cost - salvage = 2100` for fixture (2400/300/10).
+    /// That's actually the **salvage-cap invariant**, not a `no_switch`
+    /// invariant — for fixture (2400/300/10) the DDB schedule HAPPENS
+    /// to hit the salvage cap in the final period. Codex hand-traced
+    /// (1000/100/10) where the cap does NOT bottom out in 10 periods,
+    /// giving total = 892.6258176 ≠ 900. Pin both fixtures so the
+    /// false-invariant claim cannot resurface.
     #[test]
-    fn vdb_no_switch_keeps_ddb_throughout() {
-        // With no_switch=TRUE, the SLN crossover never triggers — VDB
-        // sums pure DDB over the range. For period 0..life with rate=0.2:
-        // Sum of all DDB = cost - book_at_life = cost - cost*(0.8^life).
-        // But DDB is capped at salvage, so over full life, total deprecation
-        // equals cost - salvage = 2100.
-        let cost = 2400.0;
-        let salvage = 300.0;
-        let life = 10.0;
-        let total_with_switch = match vdb(&[
-            n(cost),
-            n(salvage),
-            n(life),
-            n(0.0),
-            n(life),
-            n(2.0),
-            Value::Boolean(false),
-        ]) {
-            Value::Number(x) => x,
-            other => panic!("expected Number, got {other:?}"),
-        };
-        let total_no_switch = match vdb(&[
-            n(cost),
-            n(salvage),
-            n(life),
-            n(0.0),
-            n(life),
-            n(2.0),
-            Value::Boolean(true),
-        ]) {
-            Value::Number(x) => x,
-            other => panic!("expected Number, got {other:?}"),
-        };
-        // Both should equal cost - salvage = 2100 over the full life
-        // (DDB salvage cap ensures full depreciation either way).
+    fn vdb_no_switch_full_life_salvage_cap_fixture() {
+        // (2400/300/10): DDB schedule hits salvage cap in period 9
+        // (book drops below salvage*1.05 in period 8 → cap kicks in).
+        // Total no_switch depreciation = cost - salvage = 2100 exactly.
         approx(
-            vdb(&[n(cost), n(salvage), n(life), n(0.0), n(life)]),
+            vdb(&[
+                n(2400.0),
+                n(300.0),
+                n(10.0),
+                n(0.0),
+                n(10.0),
+                n(2.0),
+                Value::Boolean(true),
+            ]),
             2100.0,
             1e-9,
-        );
-        // The switched form should equal cost - salvage = 2100.
-        assert!(
-            (total_with_switch - 2100.0).abs() < 1e-9,
-            "switch form total should be 2100, got {total_with_switch}"
-        );
-        // The no_switch form should also reach salvage (DDB cap), so total
-        // also equals 2100 over full life. Confirming both forms agree on
-        // the cost-salvage invariant when summing over the full life.
-        assert!(
-            (total_no_switch - 2100.0).abs() < 1e-9,
-            "no_switch form total should be 2100, got {total_no_switch}"
         );
     }
 
     #[test]
-    fn vdb_no_switch_diverges_from_default_partial_range() {
-        // Where the difference matters is in mid-life partial ranges,
-        // because no_switch holds DDB while default mode would switch
-        // to SLN. With DDB on a 10-year asset (rate=0.2) starting from
-        // year 5, the no_switch sum will be smaller than the default
-        // because by then SLN is greater than DDB.
-        let switched = match vdb(&[n(1000.0), n(100.0), n(10.0), n(5.0), n(10.0)]) {
-            Value::Number(x) => x,
-            other => panic!("expected Number, got {other:?}"),
+    fn vdb_no_switch_full_life_below_cost_salvage_when_cap_not_reached() {
+        // (1000/100/10): cost/salvage ratio is 10:1; DDB rate 0.2
+        // halves book ~every 3.1 periods. After 10 periods book ≈
+        // 107.3741824 (still above salvage=100), so the cap never
+        // engages. Total depreciation = cost - book ≈ 892.6258176,
+        // NOT 900 = cost - salvage. This contrasts with the (2400/
+        // 300/10) fixture above and proves the W5-183 docstring
+        // claim about no_switch "full depreciation either way" is
+        // fixture-specific, not general.
+        // Independent verification: Codex audit (LibreOffice port).
+        approx(
+            vdb(&[
+                n(1000.0),
+                n(100.0),
+                n(10.0),
+                n(0.0),
+                n(10.0),
+                n(2.0),
+                Value::Boolean(true),
+            ]),
+            892.6258176,
+            1e-6,
+        );
+    }
+
+    /// **W5-183.1 (Codex MEDIUM-2 / Opus MEDIUM-4 closure):**
+    /// previously asserted only `switched >= no_switch` inequality —
+    /// would pass even if the switch was a no-op. Replaced with exact
+    /// values from Codex's LibreOffice cross-check.
+    #[test]
+    fn vdb_default_vs_no_switch_partial_late_range_libreoffice() {
+        // VDB(1000, 100, 10, 5, 10) = 227.68 (default: switches to SLN
+        // mid-life since SLN > DDB by period 5+).
+        // VDB(1000, 100, 10, 5, 10, 2, TRUE) = 220.3058176 (no_switch
+        // stays on the decaying DDB schedule throughout, smaller sum).
+        let extract = |args: Vec<Value>| -> f64 {
+            match vdb(&args) {
+                Value::Number(x) => x,
+                other => panic!("expected Number, got {other:?}"),
+            }
         };
-        let no_switch = match vdb(&[
+        let switched = extract(vec![n(1000.0), n(100.0), n(10.0), n(5.0), n(10.0)]);
+        let locked = extract(vec![
             n(1000.0),
             n(100.0),
             n(10.0),
@@ -2691,15 +2738,69 @@ mod tests {
             n(10.0),
             n(2.0),
             Value::Boolean(true),
-        ]) {
-            Value::Number(x) => x,
-            other => panic!("expected Number, got {other:?}"),
-        };
-        // With switching enabled, the late-life range hits more SLN
-        // (which is larger by that point), so the sum should be ≥ no_switch.
+        ]);
         assert!(
-            switched >= no_switch,
-            "switched ({switched}) should be ≥ no_switch ({no_switch})"
+            (switched - 227.68).abs() < 1e-2,
+            "switched expected ≈ 227.68, got {switched}"
+        );
+        assert!(
+            (locked - 220.3058176).abs() < 1e-6,
+            "locked expected ≈ 220.3058176, got {locked}"
+        );
+        // Meaningful divergence of ~7.37 between the two modes —
+        // proves the switch flag actually matters for this fixture.
+        assert!(
+            (switched - locked).abs() > 5.0,
+            "expected meaningful divergence > 5.0 between switched ({switched}) and locked ({locked})"
+        );
+    }
+
+    // --- W5-183.1 LibreOffice cross-check fixtures (Codex MEDIUM-2 fill-in) ---
+    //
+    // Independent reference values Codex computed by running the
+    // LibreOffice / OpenFormula VDB algorithm in Python. Pinned here
+    // to provide non-Microsoft canonical verification beyond the 6
+    // Microsoft docs examples.
+
+    #[test]
+    fn vdb_libreoffice_periods_5_to_7() {
+        // VDB(1000, 100, 10, 5, 7) = 117.9648 — exercises the
+        // crossover region (period 5 marks roughly where SLN > DDB
+        // for this fixture).
+        approx(
+            vdb(&[n(1000.0), n(100.0), n(10.0), n(5.0), n(7.0)]),
+            117.9648,
+            1e-4,
+        );
+    }
+
+    #[test]
+    fn vdb_libreoffice_fractional_overlap_half_period_boundary() {
+        // VDB(1000, 100, 10, 0.5, 1.5) = 180 — half of period 1 +
+        // half of period 2. Exercises the fractional-overlap math
+        // at both start and end of the range.
+        // Period 1: book=1000, ddb=200; sln=(1000-100)/10=90; DDB > SLN, no switch.
+        // Overlap of [0,1] with [0.5,1.5] = 0.5. Contribution = 200 * 0.5 = 100.
+        // Book after period 1 (full update): 800.
+        // Period 2: book=800, ddb=160; sln=(800-100)/9 ≈ 77.78; DDB > SLN, no switch.
+        // Overlap of [1,2] with [0.5,1.5] = 0.5. Contribution = 160 * 0.5 = 80.
+        // Total = 100 + 80 = 180.
+        approx(
+            vdb(&[n(1000.0), n(100.0), n(10.0), n(0.5), n(1.5)]),
+            180.0,
+            1e-9,
+        );
+    }
+
+    #[test]
+    fn vdb_libreoffice_fractional_overlap_mid_life() {
+        // VDB(1000, 100, 10, 2.3, 4.7) = 249.344 — covers partial
+        // period 3 (fraction 0.7), all of period 4, partial period 5
+        // (fraction 0.7). Hand-traced via Codex's LibreOffice port.
+        approx(
+            vdb(&[n(1000.0), n(100.0), n(10.0), n(2.3), n(4.7)]),
+            249.344,
+            1e-3,
         );
     }
 
@@ -2776,12 +2877,126 @@ mod tests {
         );
     }
 
+    /// **W5-183.1 (Opus HIGH-1 / Codex MEDIUM-1 closure):** DoS
+    /// guard was off-by-one — `>` allowed exactly `i32::MAX as f64`
+    /// to pass validation, then loop ran ~2.15B iterations. Now `>=`.
+    /// Pin both `1e15` (far above) and `i32::MAX as f64` (boundary)
+    /// AND the end_period side of the guard.
     #[test]
     fn vdb_huge_life_rejected() {
-        // i32 overflow guard matching W5-182.1 DB pattern.
+        // 1e15 >> i32::MAX ≈ 2.147e9 — rejected (was always rejected).
         assert_eq!(
             vdb(&[n(2400.0), n(300.0), n(1e15), n(0.0), n(1.0)]),
             Value::Error(ErrorValue::Num)
+        );
+        // **W5-183.1 boundary fix:** EXACTLY i32::MAX as f64 must
+        // now reject. Under W5-183 with `>` guard, this passed and
+        // triggered the 2.15B-iteration loop.
+        assert_eq!(
+            vdb(&[n(2400.0), n(300.0), n(i32::MAX as f64), n(0.0), n(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn vdb_huge_end_period_rejected() {
+        // **W5-183.1 (Opus MEDIUM-6 closure):** end_period side of
+        // the DoS guard was untested. Pin it explicitly.
+        assert_eq!(
+            vdb(&[n(2400.0), n(300.0), n(10.0), n(0.0), n(i32::MAX as f64)]),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            vdb(&[n(2400.0), n(300.0), n(10.0), n(0.0), n(1e15)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    /// **W5-183.1 (Codex HIGH-1 closure):** `salvage > cost`
+    /// previously slipped past validation and silently returned 0.
+    /// LibreOffice / OpenFormula reject; we now match.
+    #[test]
+    fn vdb_salvage_exceeds_cost_is_num() {
+        assert_eq!(
+            vdb(&[n(100.0), n(200.0), n(10.0), n(0.0), n(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+        // Boundary: salvage = cost exactly returns 0 (zero
+        // depreciation possible from a fully-recoverable asset).
+        approx(
+            vdb(&[n(100.0), n(100.0), n(10.0), n(0.0), n(10.0)]),
+            0.0,
+            1e-12,
+        );
+    }
+
+    /// **W5-183.1 (Opus MEDIUM-9 closure):** explicit negative-factor
+    /// validation test (previously only `zero_factor` was pinned).
+    #[test]
+    fn vdb_negative_factor_is_num() {
+        assert_eq!(
+            vdb(&[n(2400.0), n(300.0), n(10.0), n(0.0), n(1.0), n(-1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    /// **W5-183.1 (Opus MEDIUM-9 closure):** explicit negative-life
+    /// validation (the `life <= 0` chain covers this, but pin it
+    /// directly so a refactor that splits the chain can't regress).
+    #[test]
+    fn vdb_negative_life_is_num() {
+        assert_eq!(
+            vdb(&[n(2400.0), n(300.0), n(-10.0), n(0.0), n(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    /// **W5-183.1 (Opus MEDIUM-10 closure):** start_period=0 explicit
+    /// boundary test. Microsoft examples all use start=0 implicitly;
+    /// pin that the start=0 path is exercised correctly.
+    #[test]
+    fn vdb_start_period_zero_returns_full_first_period() {
+        // VDB(2400, 300, 10, 0, 1) = 480 (first full year).
+        approx(
+            vdb(&[n(2400.0), n(300.0), n(10.0), n(0.0), n(1.0)]),
+            480.0,
+            1e-9,
+        );
+    }
+
+    /// **W5-183.1 (Opus LOW-2 closure):** start == end == 0 boundary —
+    /// both upper and lower bounds at the start of life.
+    #[test]
+    fn vdb_start_zero_equals_end_zero_returns_zero() {
+        approx(
+            vdb(&[n(2400.0), n(300.0), n(10.0), n(0.0), n(0.0)]),
+            0.0,
+            1e-12,
+        );
+    }
+
+    /// **W5-183.1 (Opus LOW-3 closure):** additivity invariant.
+    /// VDB(start, k) + VDB(k, end) = VDB(start, end) for any k in
+    /// `[start, end]`. Pin one concrete partition to catch
+    /// regressions in either the overlap math or the per-period
+    /// book accounting.
+    #[test]
+    fn vdb_additivity_invariant() {
+        // VDB(2400, 300, 120, 0, 18) should equal
+        // VDB(2400, 300, 120, 0, 6) + VDB(2400, 300, 120, 6, 18).
+        let extract = |args: Vec<Value>| -> f64 {
+            match vdb(&args) {
+                Value::Number(x) => x,
+                other => panic!("expected Number, got {other:?}"),
+            }
+        };
+        let whole = extract(vec![n(2400.0), n(300.0), n(120.0), n(0.0), n(18.0)]);
+        let left = extract(vec![n(2400.0), n(300.0), n(120.0), n(0.0), n(6.0)]);
+        let right = extract(vec![n(2400.0), n(300.0), n(120.0), n(6.0), n(18.0)]);
+        assert!(
+            (whole - (left + right)).abs() < 1e-9,
+            "additivity violated: whole={whole}, left+right={}",
+            left + right
         );
     }
 
@@ -2836,32 +3051,103 @@ mod tests {
         );
     }
 
+    /// **W5-183.1 (Opus MEDIUM-3 closure):** previously the fixture
+    /// used `VDB(2400, 300, 10, 0, 1, 2, TRUE/FALSE)` which produces
+    /// $480 in BOTH cases (period 1 DDB > SLN so the switch flag is
+    /// inert). The test would pass even if `no_switch` was completely
+    /// ignored. Replaced with a fixture where the flag genuinely
+    /// changes the output, plus a numeric-coercion-equivalence test.
     #[test]
-    fn vdb_boolean_no_switch_coerces() {
-        // no_switch arg is Boolean. TRUE = no switch; FALSE = default
-        // switching behavior. Confirms `arg_type` coercion.
-        let with_true = vdb(&[
-            n(2400.0),
-            n(300.0),
+    fn vdb_boolean_no_switch_genuinely_changes_result() {
+        // Fixture chosen so the switch matters mid-life:
+        // VDB(1000, 100, 10, 5, 10) with TRUE vs FALSE diverges by ~7.37.
+        // Verified independently against LibreOffice / OpenFormula.
+        let extract = |args: Vec<Value>| -> f64 {
+            match vdb(&args) {
+                Value::Number(x) => x,
+                other => panic!("expected Number, got {other:?}"),
+            }
+        };
+        let with_true = extract(vec![
+            n(1000.0),
+            n(100.0),
             n(10.0),
-            n(0.0),
-            n(1.0),
+            n(5.0),
+            n(10.0),
             n(2.0),
             Value::Boolean(true),
         ]);
-        let with_false = vdb(&[
-            n(2400.0),
-            n(300.0),
+        let with_false = extract(vec![
+            n(1000.0),
+            n(100.0),
             n(10.0),
-            n(0.0),
-            n(1.0),
+            n(5.0),
+            n(10.0),
             n(2.0),
             Value::Boolean(false),
         ]);
-        // For period 1 of a 10-year asset with factor=2: DDB=$480, SLN=$210.
-        // DDB > SLN → no switch triggers regardless of no_switch flag.
-        // Both should return $480.
-        approx(with_true, 480.0, 1e-9);
-        approx(with_false, 480.0, 1e-9);
+        assert!(
+            (with_true - 220.3058176).abs() < 1e-6,
+            "no_switch=TRUE expected ≈ 220.3058176, got {with_true}"
+        );
+        assert!(
+            (with_false - 227.68).abs() < 1e-2,
+            "no_switch=FALSE expected ≈ 227.68, got {with_false}"
+        );
+        assert!(
+            (with_true - with_false).abs() > 5.0,
+            "no_switch TRUE/FALSE must produce meaningfully \
+             different results — TRUE={with_true}, FALSE={with_false}"
+        );
+    }
+
+    /// **W5-183.1 (Opus MEDIUM-2 closure):** the `no_switch` arg uses
+    /// `arg_type`, which is NOT "Boolean-strict" (despite earlier doc
+    /// wording). It extends `arg_num` with numeric-to-bool coercion:
+    /// non-zero numeric → TRUE; zero/blank → FALSE; errors propagate.
+    /// Pin equivalence between Boolean and numeric forms.
+    #[test]
+    fn vdb_no_switch_numeric_coerces_to_bool() {
+        // n(1.0) should be equivalent to Boolean(true) via `arg_type`.
+        let bool_true = vdb(&[
+            n(1000.0),
+            n(100.0),
+            n(10.0),
+            n(5.0),
+            n(10.0),
+            n(2.0),
+            Value::Boolean(true),
+        ]);
+        let num_one = vdb(&[
+            n(1000.0),
+            n(100.0),
+            n(10.0),
+            n(5.0),
+            n(10.0),
+            n(2.0),
+            n(1.0),
+        ]);
+        assert_eq!(bool_true, num_one);
+
+        // n(0.0) should be equivalent to Boolean(false).
+        let bool_false = vdb(&[
+            n(1000.0),
+            n(100.0),
+            n(10.0),
+            n(5.0),
+            n(10.0),
+            n(2.0),
+            Value::Boolean(false),
+        ]);
+        let num_zero = vdb(&[
+            n(1000.0),
+            n(100.0),
+            n(10.0),
+            n(5.0),
+            n(10.0),
+            n(2.0),
+            n(0.0),
+        ]);
+        assert_eq!(bool_false, num_zero);
     }
 }

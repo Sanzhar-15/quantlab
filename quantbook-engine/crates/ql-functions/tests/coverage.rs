@@ -338,7 +338,7 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
     // Microsoft documented examples + edge cases.
     (
         "VDB",
-        "W5-183; unit tests pin all 6 Microsoft fixtures (VDB(2400,300,10×{365,12,1},0,1) = $1.32/$40/$480; VDB(2400,300,120,6,18) = $396.31; factor=1.5 variants $311.81 and $315.00) + no_switch=TRUE branch + start==end + cost==0 + DoS guard + validation #NUM! paths",
+        "W5-183 + W5-183.1; unit tests pin all 6 Microsoft fixtures (VDB(2400,300,10×{365,12,1},0,1) = $1.32/$40/$480; VDB(2400,300,120,6,18) = $396.31; factor=1.5 variants $311.81 and $315.00) + 5 LibreOffice/OpenFormula cross-check fixtures from Codex audit (VDB(1000,100,10,5,7) = 117.9648; periods 5..10 default/no_switch divergence; (0.5,1.5) and (2.3,4.7) fractional overlap) + W5-183.1 audit closures (salvage>cost → #NUM!, i32::MAX boundary tightened, no_switch genuinely-changes-result fixture, additivity invariant, negative-factor/-life/start=0 validations)",
     ),
     // W5-168 (Phase 4.10.F) — financial TVM + cash-flow.
     (
