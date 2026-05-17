@@ -730,6 +730,91 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
          #NUM!, returns positive abs value, df<1 #NUM!, error class, \
          arity); scalar arg-coverage matrix N/A",
     ),
+    // W5-D-3 (Wave 3 distributions batch — chi-squared + F).
+    // CHISQ.DIST / CHISQ.DIST.RT / CHISQ.INV / CHISQ.INV.RT +
+    // F.DIST / F.DIST.RT / F.INV / F.INV.RT. Scalar tier;
+    // statrs::ChiSquared + statrs::FisherSnedecor backing. Same
+    // coverage shape as W5-D-1 / W5-D-2: per-fn unit tests + e2e
+    // dispatcher round-trip. ≥10 tests per fn (anchor / LibreOffice
+    // cross-check / round-trip / domain error / text-arg / error-arg /
+    // arity-under-and-over).
+    (
+        "CHISQ.DIST",
+        "distribution fn (W5-D-3) — covered by distribution_fns unit \
+         tests (CDF=0 at zero, df=2 closed-form PDF/CDF anchors \
+         (0.5, 1-e^-1), 5% critical value (df=1, x≈3.84 → 0.95) \
+         LibreOffice anchor, negative-x #NUM!, df<1 #NUM!, df>10^10 \
+         #NUM! (IronCalc ceiling), text-arg #VALUE!, error \
+         propagation, arity-under-and-over); scalar arg-coverage \
+         matrix N/A",
+    ),
+    (
+        "CHISQ.DIST.RT",
+        "distribution fn (W5-D-3) — covered by distribution_fns unit \
+         tests (P(X>0)=1, df=2 anchor e^-1, 5% critical anchor, \
+         round-trip with CHISQ.DIST sum=1, statrs sf() rather than \
+         1-cdf() for numerical stability, negative-x #NUM!, df<1 #NUM!, \
+         error class, arity); scalar arg-coverage matrix N/A",
+    ),
+    (
+        "CHISQ.INV",
+        "distribution fn (W5-D-3) — covered by distribution_fns unit \
+         tests (CHISQ.INV(0,df)=0 — note p=0 ACCEPTED (inclusive domain \
+         differs from T.INV/NORM.INV strict), df=2 closed-form 2*ln(2), \
+         classic critical 3.84 at p=0.95 df=1 anchor, inverse-of-CDF \
+         round-trip, p>1 / p<0 #NUM!, df<1 #NUM!, text/error/arity); \
+         scalar arg-coverage matrix N/A",
+    ),
+    (
+        "CHISQ.INV.RT",
+        "distribution fn (W5-D-3) — covered by distribution_fns unit \
+         tests (CHISQ.INV.RT(1,df)=0, df=2 anchor 2*ln(2), 5% critical \
+         anchor at p=0.05 df=1, round-trip with CHISQ.DIST.RT, p=0 \
+         **domain-accepted but observably #NUM!** — the range check \
+         admits 0, but `inverse_cdf(1.0 - 0.0) = inverse_cdf(1.0)` is \
+         non-finite and the `!result.is_finite()` guard surfaces \
+         #NUM!; pinned by `chisq_inv_rt_at_zero_prob_is_num_error` \
+         test. p>1/p<0 #NUM!, df<1 #NUM!, text/error/arity); scalar \
+         arg-coverage matrix N/A",
+    ),
+    (
+        "F.DIST",
+        "distribution fn (W5-D-3) — covered by distribution_fns unit \
+         tests (CDF=0 at zero, F(n,n) CDF=0.5 at x=1 symmetry, F(10,10) \
+         pdf(1) closed-form 630/1024 ≈ 0.6152, 95th-percentile (5,10) \
+         statrs-internal x≈3.3258 → CDF≈0.95 anchor, negative-x #NUM!, \
+         df1<1 OR df2<1 #NUM!, text/error/arity-under-and-over); scalar \
+         arg-coverage matrix N/A. **Note**: `df1=2 pdf(0)` is NOT tested \
+         — statrs returns 0 (handles 0/0 limit by zeroing) while true \
+         math gives 1; out of W5-D-3 scope.",
+    ),
+    (
+        "F.DIST.RT",
+        "distribution fn (W5-D-3) — covered by distribution_fns unit \
+         tests (P(F>0)=1, F(n,n) RT=0.5 at x=1, 5% critical anchor, \
+         round-trip with F.DIST sum=1, uses 1-cdf() per IronCalc canon \
+         (NOT sf()), negative-x #NUM!, df<1 #NUM!, text/error/arity); \
+         scalar arg-coverage matrix N/A",
+    ),
+    (
+        "F.INV",
+        "distribution fn (W5-D-3) — covered by distribution_fns unit \
+         tests (F.INV(0,df1,df2)=0 — p=0 ACCEPTED (inclusive domain), \
+         F.INV(0.5, n, n) = 1 median anchor, classic 95% critical for \
+         (5,10)=3.3258 LibreOffice anchor, inverse-of-CDF round-trip, \
+         p>1/p<0 #NUM!, df<1 #NUM!, text/error/arity); scalar \
+         arg-coverage matrix N/A",
+    ),
+    (
+        "F.INV.RT",
+        "distribution fn (W5-D-3) — covered by distribution_fns unit \
+         tests (F.INV.RT(1,df1,df2)=0 (upper-inclusive p=1 ACCEPTED), \
+         F.INV.RT(0.5, n, n) = 1 median anchor, 5% critical for \
+         (5,10)=3.3258, round-trip with F.DIST.RT, p=0 REJECTED \
+         (lower-strict — diverges from F.INV/CHISQ.INV/CHISQ.INV.RT \
+         which accept p=0 inclusive), p>1 #NUM!, df<1 #NUM!, \
+         text/error/arity); scalar arg-coverage matrix N/A",
+    ),
 ];
 
 #[test]

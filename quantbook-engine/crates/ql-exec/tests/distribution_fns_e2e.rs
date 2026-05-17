@@ -315,3 +315,218 @@ fn t_inv_t_dist_round_trip_through_dispatcher() {
     let formula = format!("T.DIST({t}, 5, TRUE)");
     assert_close(eval(&formula), 0.83);
 }
+
+// =====================================================================
+// W5-D-3: CHISQ.* + F.* — chi-squared + Fisher-Snedecor F distributions
+// =====================================================================
+//
+// Verify dispatcher routing for dotted names + the new
+// digit-leading-segment lexer extension (T.* established this in
+// W5-D-2). `F.DIST.RT` and `F.INV.RT` exercise the same lexer path
+// (`.RT` is a letter-leading segment, identical to W5-D-2's
+// `T.DIST.RT`); `CHISQ.DIST.RT` etc. test 3-segment letter chains.
+
+// ---------------------------------------------------------------------
+// CHISQ.DIST
+// ---------------------------------------------------------------------
+
+#[test]
+fn chisq_dist_cdf_at_zero_through_dispatcher_returns_zero() {
+    assert_close(eval("CHISQ.DIST(0, 1, TRUE)"), 0.0);
+}
+
+#[test]
+fn chisq_dist_libreoffice_anchor_through_dispatcher() {
+    // CHISQ.DIST(2, 2, TRUE) = 1 - e^-1.
+    assert_close(eval("CHISQ.DIST(2, 2, TRUE)"), 1.0 - (-1.0_f64).exp());
+}
+
+#[test]
+fn chisq_dist_negative_x_through_dispatcher_returns_num_error() {
+    assert_eq!(
+        eval("CHISQ.DIST(-1, 1, TRUE)"),
+        Value::Error(ErrorValue::Num)
+    );
+}
+
+// ---------------------------------------------------------------------
+// CHISQ.DIST.RT
+// ---------------------------------------------------------------------
+
+#[test]
+fn chisq_dist_rt_at_zero_through_dispatcher_returns_one() {
+    assert_close(eval("CHISQ.DIST.RT(0, 1)"), 1.0);
+}
+
+#[test]
+fn chisq_dist_rt_libreoffice_anchor_through_dispatcher() {
+    // P(X > 2) = e^-1 for df=2.
+    assert_close(eval("CHISQ.DIST.RT(2, 2)"), (-1.0_f64).exp());
+}
+
+// ---------------------------------------------------------------------
+// CHISQ.INV
+// ---------------------------------------------------------------------
+
+#[test]
+fn chisq_inv_at_zero_prob_through_dispatcher_returns_zero() {
+    // p=0 ACCEPTED (inclusive domain).
+    assert_close(eval("CHISQ.INV(0, 1)"), 0.0);
+}
+
+#[test]
+fn chisq_inv_libreoffice_anchor_through_dispatcher() {
+    // CHISQ.INV(0.95, 1) ≈ 3.841458820694124 — classic chi-squared crit.
+    assert_close(eval("CHISQ.INV(0.95, 1)"), 3.841_458_820_694_124);
+}
+
+#[test]
+fn chisq_inv_p_above_one_through_dispatcher_returns_num_error() {
+    assert_eq!(eval("CHISQ.INV(1.5, 1)"), Value::Error(ErrorValue::Num));
+}
+
+// ---------------------------------------------------------------------
+// CHISQ.INV.RT
+// ---------------------------------------------------------------------
+
+#[test]
+fn chisq_inv_rt_libreoffice_anchor_through_dispatcher() {
+    // CHISQ.INV.RT(0.05, 1) ≈ 3.841459 (matches CHISQ.INV(0.95, 1)).
+    assert_close(eval("CHISQ.INV.RT(0.05, 1)"), 3.841_458_820_694_124);
+}
+
+#[test]
+fn chisq_inv_rt_at_one_prob_through_dispatcher_returns_zero() {
+    assert_close(eval("CHISQ.INV.RT(1, 1)"), 0.0);
+}
+
+#[test]
+fn chisq_inv_rt_at_zero_prob_through_dispatcher_returns_num_error() {
+    // **W5-D-3.1 (Codex LOW-2 closure):** `p == 0` is admitted by the
+    // range check but `inverse_cdf(1.0)` is non-finite → `#NUM!` via
+    // the impl's `!result.is_finite()` guard. Pin this through the
+    // dispatcher to prevent future docs from misreading "p=0 ACCEPTED"
+    // as "p=0 returns a finite value".
+    assert_eq!(eval("CHISQ.INV.RT(0, 1)"), Value::Error(ErrorValue::Num));
+}
+
+// ---------------------------------------------------------------------
+// F.DIST
+// ---------------------------------------------------------------------
+
+#[test]
+fn f_dist_cdf_symmetry_through_dispatcher() {
+    // F(n, n) CDF at 1 = 0.5.
+    assert_close(eval("F.DIST(1, 10, 10, TRUE)"), 0.5);
+}
+
+#[test]
+fn f_dist_libreoffice_anchor_through_dispatcher() {
+    // Use statrs's F.INV(0.95, 5, 10) value (3.3258345304130046) as
+    // input for an exact round-trip pin; statrs's inverse_cdf is
+    // approximate vs true F-distribution math (~5e-7 off) — see
+    // f_inv_libreoffice_anchor_95_pct_5_10 docstring.
+    let result = eval("F.DIST(3.3258345304130046, 5, 10, TRUE)");
+    match result {
+        Value::Number(n) => assert!((n - 0.95).abs() < 1e-9, "expected ≈ 0.95, got {n}"),
+        other => panic!("expected Number ≈ 0.95, got {other:?}"),
+    }
+}
+
+#[test]
+fn f_dist_negative_x_through_dispatcher_returns_num_error() {
+    assert_eq!(
+        eval("F.DIST(-1, 5, 10, TRUE)"),
+        Value::Error(ErrorValue::Num)
+    );
+}
+
+// ---------------------------------------------------------------------
+// F.DIST.RT
+// ---------------------------------------------------------------------
+
+#[test]
+fn f_dist_rt_at_zero_through_dispatcher_returns_one() {
+    assert_close(eval("F.DIST.RT(0, 5, 10)"), 1.0);
+}
+
+#[test]
+fn f_dist_rt_symmetry_through_dispatcher() {
+    assert_close(eval("F.DIST.RT(1, 10, 10)"), 0.5);
+}
+
+// ---------------------------------------------------------------------
+// F.INV
+// ---------------------------------------------------------------------
+
+#[test]
+fn f_inv_libreoffice_anchor_through_dispatcher() {
+    // statrs's internal value, not the true F-distribution math value
+    // (statrs's inverse_cdf for FisherSnedecor is Newton-Raphson with
+    // tolerance; ~5e-7 off true value 3.325835018413022).
+    assert_close(eval("F.INV(0.95, 5, 10)"), 3.325_834_530_413_004_6);
+}
+
+#[test]
+fn f_inv_at_half_equal_dfs_through_dispatcher() {
+    assert_close(eval("F.INV(0.5, 10, 10)"), 1.0);
+}
+
+#[test]
+fn f_inv_p_negative_through_dispatcher_returns_num_error() {
+    assert_eq!(eval("F.INV(-0.1, 5, 10)"), Value::Error(ErrorValue::Num));
+}
+
+// ---------------------------------------------------------------------
+// F.INV.RT
+// ---------------------------------------------------------------------
+
+#[test]
+fn f_inv_rt_libreoffice_anchor_through_dispatcher() {
+    // Same statrs-internal value as F.INV(0.95, 5, 10) by definition.
+    assert_close(eval("F.INV.RT(0.05, 5, 10)"), 3.325_834_530_413_004_6);
+}
+
+#[test]
+fn f_inv_rt_at_one_through_dispatcher_returns_zero() {
+    // p=1 upper-inclusive → x=0.
+    assert_close(eval("F.INV.RT(1, 5, 10)"), 0.0);
+}
+
+#[test]
+fn f_inv_rt_at_zero_prob_through_dispatcher_returns_num_error() {
+    // p=0 REJECTED (lower-strict, diverges from F.INV).
+    assert_eq!(eval("F.INV.RT(0, 5, 10)"), Value::Error(ErrorValue::Num));
+}
+
+// ---------------------------------------------------------------------
+// Cross-cutting: case-insensitivity + round-trip + arity
+// ---------------------------------------------------------------------
+
+#[test]
+fn chisq_f_dist_case_insensitive_lookup_works() {
+    assert_close(eval("chisq.dist(0, 1, TRUE)"), 0.0);
+    assert_close(eval("Chisq.Dist.RT(0, 1)"), 1.0);
+    assert_close(eval("f.dist(1, 10, 10, TRUE)"), 0.5);
+    assert_close(eval("F.Inv.RT(0.5, 10, 10)"), 1.0);
+}
+
+#[test]
+fn chisq_inv_chisq_dist_round_trip_through_dispatcher() {
+    // Nested: CHISQ.DIST(CHISQ.INV(p, df), df, TRUE) ≈ p.
+    let inner = eval("CHISQ.INV(0.73, 5)");
+    let x = match inner {
+        Value::Number(n) => n,
+        other => panic!("CHISQ.INV returned {other:?}"),
+    };
+    let formula = format!("CHISQ.DIST({x}, 5, TRUE)");
+    assert_close(eval(&formula), 0.73);
+}
+
+#[test]
+fn chisq_f_dist_arity_mismatch_through_dispatcher_returns_value() {
+    assert_eq!(eval("CHISQ.DIST()"), Value::Error(ErrorValue::Value));
+    assert_eq!(eval("CHISQ.INV.RT()"), Value::Error(ErrorValue::Value));
+    assert_eq!(eval("F.DIST()"), Value::Error(ErrorValue::Value));
+    assert_eq!(eval("F.INV.RT()"), Value::Error(ErrorValue::Value));
+}

@@ -2,8 +2,11 @@
 //!
 //! - **W5-D-1**: NORM.DIST / NORM.S.DIST / NORM.INV / NORM.S.INV —
 //!   normal-distribution PDF / CDF / inverse-CDF.
-//! - **W5-D-2 (this commit)**: T.DIST / T.DIST.2T / T.DIST.RT / T.INV /
-//!   T.INV.2T — Student's t-distribution variants.
+//! - **W5-D-2**: T.DIST / T.DIST.2T / T.DIST.RT / T.INV / T.INV.2T —
+//!   Student's t-distribution variants.
+//! - **W5-D-3 (this commit)**: CHISQ.DIST / CHISQ.DIST.RT / CHISQ.INV /
+//!   CHISQ.INV.RT + F.DIST / F.DIST.RT / F.INV / F.INV.RT —
+//!   chi-squared and Fisher-Snedecor F distribution variants.
 //!
 //! ## Implementation strategy
 //!
@@ -13,6 +16,9 @@
 //! - **NORM.\*** → `statrs::distribution::Normal`
 //! - **T.\*** → `statrs::distribution::StudentsT` (location=0, scale=1,
 //!   freedom=df)
+//! - **CHISQ.\*** → `statrs::distribution::ChiSquared` (freedom=df)
+//! - **F.\*** → `statrs::distribution::FisherSnedecor` (freedom_1=df1,
+//!   freedom_2=df2)
 //!
 //! For inputs that successfully coerce to identical f64 tuples, our
 //! `dist.pdf(x)` / `dist.cdf(x)` / `dist.inverse_cdf(p)` calls produce
@@ -54,6 +60,39 @@
 //!   `CDF⁻¹(1 - p/2).abs()`. `0 < p <= 1` (upper-inclusive per
 //!   Microsoft + IronCalc canon); `df >= 1`. Else `#NUM!`.
 //!
+//! **W5-D-3 (chi-squared):**
+//!
+//! - `CHISQ.DIST(x, deg_freedom, cumulative)` — 3 args. Left-tailed
+//!   CDF (cumulative=TRUE) or PDF (FALSE). `x >= 0` else `#NUM!`. `df`
+//!   truncated to integer; `df` in `[1, 10^10]` else `#NUM!`.
+//! - `CHISQ.DIST.RT(x, deg_freedom)` — 2 args. Right-tailed `P(X > x)`
+//!   via `statrs`'s survival-function `dist.sf(x)` (better numerical
+//!   properties than `1 - cdf(x)` for chi-squared in the far right
+//!   tail). Same domain checks as CHISQ.DIST minus `cumulative`.
+//! - `CHISQ.INV(probability, deg_freedom)` — 2 args. Left-tailed
+//!   inverse CDF. `0 <= p <= 1` INCLUSIVE (note: differs from
+//!   T.INV/NORM.INV's strict `(0, 1)`). `df` in `[1, 10^10]`. Else
+//!   `#NUM!`.
+//! - `CHISQ.INV.RT(probability, deg_freedom)` — 2 args. Right-tailed
+//!   inverse: solves `p = P(X > x) = 1 - CDF(x)`, returns
+//!   `inverse_cdf(1 - p)`. Same domain as CHISQ.INV.
+//!
+//! **W5-D-3 (Fisher-Snedecor F):**
+//!
+//! - `F.DIST(x, deg_freedom1, deg_freedom2, cumulative)` — 4 args.
+//!   Left-tailed CDF or PDF. `x >= 0`; `df1 >= 1`; `df2 >= 1`. Else
+//!   `#NUM!`.
+//! - `F.DIST.RT(x, deg_freedom1, deg_freedom2)` — 3 args. Right-tailed
+//!   `P(F > x)` = `1 - CDF(x)`. Same domain checks as F.DIST minus
+//!   `cumulative`.
+//! - `F.INV(probability, deg_freedom1, deg_freedom2)` — 3 args.
+//!   Left-tailed inverse CDF. `0 <= p <= 1` INCLUSIVE; `df1 >= 1`;
+//!   `df2 >= 1`. Else `#NUM!`.
+//! - `F.INV.RT(probability, deg_freedom1, deg_freedom2)` — 3 args.
+//!   Right-tailed inverse: solves `p = P(F > x) = 1 - CDF(x)`,
+//!   returns `inverse_cdf(1 - p)`. `0 < p <= 1` (lower-strict,
+//!   upper-inclusive per IronCalc canon).
+//!
 //! ## Arg coercion
 //!
 //! Numeric args (`x`, `mean`, `sd`, `prob`, `deg_freedom`) are coerced
@@ -74,6 +113,41 @@
 //! T.INV.2T returns `.abs()` of the inverse-CDF result (defensive
 //! given the strict `p > 0` domain check, since `target_cdf = 1 - p/2`
 //! is always `>= 0.5` ⇒ `inverse_cdf` always returns `>= 0`).
+//!
+//! **W5-D-3 (CHISQ.\* + F.\* fns)** also truncate all `deg_freedom*`
+//! args via `.trunc()`. **CHISQ.\* alone** enforces a `df <= 10^10`
+//! ceiling via `MAX_CHISQ_DEGREES_OF_FREEDOM` (matches IronCalc's
+//! `chisq.rs` constant). **F.\* has no explicit df ceiling** — statrs
+//! `FisherSnedecor::new` only rejects NaN / `<= 0`, and IronCalc's
+//! `fisher.rs` does not impose an upper bound. (W5-D-3.1 Codex LOW-3
+//! closure: prior sentence ambiguously read as applying to both
+//! families; clarified here.)
+//!
+//! All four right-tailed variants (CHISQ.DIST.RT, F.DIST.RT,
+//! CHISQ.INV.RT, F.INV.RT) reject negative results from fp drift —
+//! since chi-squared and F are non-negative random variables, a
+//! negative `1 - cdf(x)` or `inverse_cdf` result signals a fp anomaly
+//! and surfaces as `#NUM!`. CHISQ.DIST.RT uses `statrs`'s
+//! `dist.sf(x)` (survival function) directly for better numerical
+//! stability vs `1 - dist.cdf(x)` in the far right tail; F.DIST.RT
+//! uses `1 - dist.cdf(x)` matching IronCalc canon.
+//!
+//! **Microsoft canon divergences in W5-D-3 (W5-D-3.1 Codex LOW-3
+//! closure):**
+//!
+//! 1. **F.INV.RT lower-strict `0 < p`**: matches IronCalc's
+//!    `fisher.rs` exactly. Microsoft's F.INV.RT support page is
+//!    ambiguous on whether `p == 0` is accepted; IronCalc rejects, we
+//!    follow. F.INV / CHISQ.INV / CHISQ.INV.RT all accept `p == 0`
+//!    inclusive.
+//! 2. **F.* has no `df >= 10^10` upper bound**: Microsoft's F.INV /
+//!    F.DIST support pages say `deg_freedom2 >= 10^10` returns
+//!    `#NUM!`. IronCalc's `fisher.rs` does NOT impose this bound; we
+//!    follow IronCalc. If Microsoft-doc parity becomes the stronger
+//!    contract, add the guard symmetrically across the 4 F.* fns.
+//! 3. **F-pdf at `x=0` with `df1=2`**: Microsoft + true math give 1;
+//!    statrs returns 0 (special-cases the 0/0 limit by zeroing). We
+//!    inherit statrs's behavior; no test pinned for this corner.
 //!
 //! ## IronCalc divergences (W5-D-1.1 doc closure of Opus HIGH-O-2)
 //!
@@ -97,9 +171,19 @@
 //! to `Error::ERROR` (= `#ERROR!`); we normalize all distribution
 //! errors to `#NUM!` (closer to Excel canon).
 
-use statrs::distribution::{Continuous, ContinuousCDF, Normal, StudentsT};
+use statrs::distribution::{
+    ChiSquared, Continuous, ContinuousCDF, FisherSnedecor, Normal, StudentsT,
+};
 
 use ql_types::{coercion, ErrorValue, Value};
+
+/// **W5-D-3 canon ceiling for chi-squared degrees of freedom.** IronCalc
+/// caps `df` at 10^10 (in `chisq.rs`) to avoid pathological compute
+/// times in the far tails when `df` is in the millions. F.* doesn't
+/// have an explicit ceiling in IronCalc — `FisherSnedecor::new` rejects
+/// NaN / `<= 0` and that's the only guard. Match IronCalc on both
+/// (ceiling for CHISQ.*, none for F.*).
+const MAX_CHISQ_DEGREES_OF_FREEDOM: f64 = 10_000_000_000.0;
 
 /// Standard-normal distribution constructor. Cannot fail at runtime:
 /// `Normal::new(0.0, 1.0)` is a compile-time-valid call — statrs only
@@ -429,6 +513,309 @@ pub fn t_inv_2t(args: &[Value]) -> Value {
     // armor against future statrs precision regressions near
     // target_cdf=0.5.
     finite_or_num(dist.inverse_cdf(target_cdf).abs())
+}
+
+// =====================================================================
+// W5-D-3: Chi-squared distribution (CHISQ.DIST / CHISQ.DIST.RT /
+// CHISQ.INV / CHISQ.INV.RT)
+// =====================================================================
+//
+// `statrs::ChiSquared::new(df)` parameterizes by degrees of freedom
+// alone. statrs rejects only NaN or `df <= 0`; our coercion + pre-check
+// (`df.trunc() in [1, 10^10]`) rules both out, so `.expect()` is
+// principled (No-Fallbacks rule).
+
+/// Build a chi-squared distribution with `df` degrees of freedom.
+/// Call sites pre-check `df in [1, 10^10]` and coercion rejects NaN, so
+/// construction cannot fail. `.expect()` per No-Fallbacks rule
+/// (W5-D-1.1 closure pattern).
+fn chi_squared_with(df: f64) -> ChiSquared {
+    ChiSquared::new(df).expect(
+        "upstream sanitize_f64 + df in [1, 10^10] pre-check guarantee ChiSquared::new succeeds",
+    )
+}
+
+/// **CHISQ.DIST(x, deg_freedom, cumulative)** — chi-squared PDF
+/// (`cumulative=FALSE`) or left-tailed CDF (`cumulative=TRUE`).
+///
+/// - Args: 3 required.
+/// - `x >= 0` else `#NUM!` (chi-squared is non-negative).
+/// - `deg_freedom` truncated to integer; must be in `[1, 10^10]` else
+///   `#NUM!`.
+pub fn chisq_dist(args: &[Value]) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let x = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let df = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    let cumulative = match coercion::to_logical(&args[2]) {
+        Ok(b) => b,
+        Err(e) => return Value::Error(e),
+    };
+    if x < 0.0 || !(1.0..=MAX_CHISQ_DEGREES_OF_FREEDOM).contains(&df) {
+        return Value::Error(ErrorValue::Num);
+    }
+    let dist = chi_squared_with(df);
+    finite_or_num(if cumulative { dist.cdf(x) } else { dist.pdf(x) })
+}
+
+/// **CHISQ.DIST.RT(x, deg_freedom)** — right-tailed chi-squared
+/// probability `P(X > x)`. Uses `statrs`'s survival-function
+/// `dist.sf(x)` directly for better numerical properties in the far
+/// right tail vs `1 - dist.cdf(x)` (matches IronCalc canon).
+///
+/// - Args: 2 required.
+/// - `x >= 0` else `#NUM!`.
+/// - `df` in `[1, 10^10]` else `#NUM!`.
+pub fn chisq_dist_rt(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let x = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let df = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    if x < 0.0 || !(1.0..=MAX_CHISQ_DEGREES_OF_FREEDOM).contains(&df) {
+        return Value::Error(ErrorValue::Num);
+    }
+    let dist = chi_squared_with(df);
+    let result = dist.sf(x);
+    if !result.is_finite() || result < 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    Value::number(result)
+}
+
+/// **CHISQ.INV(probability, deg_freedom)** — left-tailed inverse
+/// chi-squared CDF.
+///
+/// - Args: 2 required.
+/// - `0 <= probability <= 1` INCLUSIVE (note: differs from
+///   T.INV/NORM.INV's strict `(0, 1)`; matches IronCalc + Microsoft
+///   canon). `CHISQ.INV(0, df) = 0`; `CHISQ.INV(1, df)` would be
+///   infinity and is rejected via the inline `!result.is_finite()`
+///   guard (W5-D-3.1 LOW-O-1 closure: prior docstring incorrectly
+///   said "via `finite_or_num`" — the impl uses the inline check + a
+///   `result < 0.0` defense, since the inverse path also needs the
+///   negative-result guard).
+/// - `df` in `[1, 10^10]` else `#NUM!`.
+pub fn chisq_inv(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let p = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let df = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    if !(0.0..=1.0).contains(&p) || !(1.0..=MAX_CHISQ_DEGREES_OF_FREEDOM).contains(&df) {
+        return Value::Error(ErrorValue::Num);
+    }
+    let dist = chi_squared_with(df);
+    let x = dist.inverse_cdf(p);
+    if !x.is_finite() || x < 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    Value::number(x)
+}
+
+/// **CHISQ.INV.RT(probability, deg_freedom)** — right-tailed inverse
+/// chi-squared. Solves `p = P(X > x) = 1 - CDF(x)`, returns
+/// `inverse_cdf(1 - p)`.
+///
+/// - Args: 2 required.
+/// - Same domain as CHISQ.INV (`p` inclusive `[0, 1]`, `df` in
+///   `[1, 10^10]`).
+pub fn chisq_inv_rt(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let p = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let df = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    if !(0.0..=1.0).contains(&p) || !(1.0..=MAX_CHISQ_DEGREES_OF_FREEDOM).contains(&df) {
+        return Value::Error(ErrorValue::Num);
+    }
+    let dist = chi_squared_with(df);
+    let x = dist.inverse_cdf(1.0 - p);
+    if !x.is_finite() || x < 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    Value::number(x)
+}
+
+// =====================================================================
+// W5-D-3: Fisher-Snedecor F distribution (F.DIST / F.DIST.RT / F.INV /
+// F.INV.RT)
+// =====================================================================
+//
+// `statrs::FisherSnedecor::new(df1, df2)` parameterizes by both
+// degree-of-freedom args. statrs rejects NaN or `<= 0`; our coercion +
+// pre-check (`df1.trunc() >= 1`, `df2.trunc() >= 1`) rule both out.
+
+/// Build an F (Fisher-Snedecor) distribution. Call sites pre-check
+/// `df1 >= 1` AND `df2 >= 1` and coercion rejects NaN; construction
+/// cannot fail. `.expect()` per No-Fallbacks rule.
+fn fisher_snedecor_with(df1: f64, df2: f64) -> FisherSnedecor {
+    FisherSnedecor::new(df1, df2).expect(
+        "upstream sanitize_f64 + df1>=1 + df2>=1 pre-check guarantee FisherSnedecor::new succeeds",
+    )
+}
+
+/// **F.DIST(x, deg_freedom1, deg_freedom2, cumulative)** — F-distribution
+/// PDF (`cumulative=FALSE`) or left-tailed CDF (`cumulative=TRUE`).
+///
+/// - Args: 4 required.
+/// - `x >= 0` else `#NUM!` (F is non-negative).
+/// - `df1 >= 1` AND `df2 >= 1` (truncated to integer) else `#NUM!`.
+pub fn f_dist(args: &[Value]) -> Value {
+    if args.len() != 4 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let x = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let df1 = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    let df2 = match coercion::to_number_strict(&args[2]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    let cumulative = match coercion::to_logical(&args[3]) {
+        Ok(b) => b,
+        Err(e) => return Value::Error(e),
+    };
+    if x < 0.0 || df1 < 1.0 || df2 < 1.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let dist = fisher_snedecor_with(df1, df2);
+    finite_or_num(if cumulative { dist.cdf(x) } else { dist.pdf(x) })
+}
+
+/// **F.DIST.RT(x, deg_freedom1, deg_freedom2)** — right-tailed
+/// F-distribution probability `P(F > x)` = `1 - CDF(x)` (matches
+/// IronCalc canon — uses `1 - cdf(x)` rather than `sf(x)`).
+///
+/// - Args: 3 required.
+/// - `x >= 0`; `df1 >= 1`; `df2 >= 1`. Else `#NUM!`.
+pub fn f_dist_rt(args: &[Value]) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let x = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let df1 = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    let df2 = match coercion::to_number_strict(&args[2]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    if x < 0.0 || df1 < 1.0 || df2 < 1.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let dist = fisher_snedecor_with(df1, df2);
+    let result = 1.0 - dist.cdf(x);
+    if !result.is_finite() || result < 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    Value::number(result)
+}
+
+/// **F.INV(probability, deg_freedom1, deg_freedom2)** — left-tailed
+/// inverse F-distribution CDF.
+///
+/// - Args: 3 required.
+/// - `0 <= probability <= 1` INCLUSIVE (like CHISQ.INV; differs from
+///   T.INV's strict). `df1 >= 1`, `df2 >= 1`. Else `#NUM!`.
+/// - **W5-D-3.1 (Opus LOW-O-2 closure):** `F.INV(0, df1, df2) = 0`;
+///   `F.INV(1, df1, df2)` returns `#NUM!` via the inline
+///   `!x.is_finite()` guard — the F right-tail is unbounded so
+///   `inverse_cdf(1.0)` is non-finite. Matches CHISQ.INV's
+///   domain-accepted-but-observably-#NUM! behavior at `p == 1`.
+pub fn f_inv(args: &[Value]) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let p = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let df1 = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    let df2 = match coercion::to_number_strict(&args[2]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    if !(0.0..=1.0).contains(&p) || df1 < 1.0 || df2 < 1.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let dist = fisher_snedecor_with(df1, df2);
+    let x = dist.inverse_cdf(p);
+    if !x.is_finite() || x < 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    Value::number(x)
+}
+
+/// **F.INV.RT(probability, deg_freedom1, deg_freedom2)** — right-tailed
+/// inverse F-distribution. Solves `p = P(F > x) = 1 - CDF(x)`, returns
+/// `inverse_cdf(1 - p)`.
+///
+/// - Args: 3 required.
+/// - `0 < p <= 1` (lower-strict, upper-inclusive per IronCalc canon).
+///   `df1 >= 1`, `df2 >= 1`. Else `#NUM!`.
+pub fn f_inv_rt(args: &[Value]) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let p = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let df1 = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    let df2 = match coercion::to_number_strict(&args[2]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    if p <= 0.0 || p > 1.0 || df1 < 1.0 || df2 < 1.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let dist = fisher_snedecor_with(df1, df2);
+    let x = dist.inverse_cdf(1.0 - p);
+    if !x.is_finite() || x < 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    Value::number(x)
 }
 
 // =====================================================================
@@ -1328,6 +1715,990 @@ mod tests {
         );
         assert_eq!(
             t_inv_2t(&[Value::number(0.5), Value::number(10.0), Value::number(0.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== CHISQ.DIST =====
+    //
+    // Closed-form anchor: chi-squared with df=2 is exponential(1/2),
+    // CDF(x) = 1 - exp(-x/2), PDF(x) = 0.5 * exp(-x/2). At x=0:
+    // CDF=0, PDF=0.5. At x=2: CDF = 1-e^-1, PDF = 0.5*e^-1.
+
+    #[test]
+    fn chisq_dist_cdf_at_zero_returns_zero() {
+        assert_close(
+            chisq_dist(&[Value::number(0.0), Value::number(1.0), Value::Boolean(true)]),
+            0.0,
+        );
+    }
+
+    #[test]
+    fn chisq_dist_pdf_at_zero_df_two_libreoffice_anchor() {
+        // For df=2: pdf(0) = 0.5 exactly (exponential(1/2) density at 0).
+        assert_close(
+            chisq_dist(&[
+                Value::number(0.0),
+                Value::number(2.0),
+                Value::Boolean(false),
+            ]),
+            0.5,
+        );
+    }
+
+    #[test]
+    fn chisq_dist_cdf_at_two_df_two_libreoffice_anchor() {
+        // For df=2: CDF(2) = 1 - e^-1.
+        assert_close(
+            chisq_dist(&[Value::number(2.0), Value::number(2.0), Value::Boolean(true)]),
+            1.0 - (-1.0_f64).exp(),
+        );
+    }
+
+    #[test]
+    fn chisq_dist_libreoffice_anchor_df_one_at_3_84() {
+        // CHISQ.DIST(3.841459, 1, TRUE) ≈ 0.95 (standard 5% critical).
+        // LibreOffice cross-check: result ≈ 0.95.
+        let result = chisq_dist(&[
+            Value::number(3.841_458_820_694_124),
+            Value::number(1.0),
+            Value::Boolean(true),
+        ]);
+        match result {
+            Value::Number(n) => assert!(
+                approx(n, 0.95, 1e-9),
+                "expected ≈ 0.95, got {n} (diff = {})",
+                (n - 0.95).abs()
+            ),
+            other => panic!("expected Number ≈ 0.95, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chisq_dist_negative_x_is_num_error() {
+        assert_eq!(
+            chisq_dist(&[
+                Value::number(-1.0),
+                Value::number(1.0),
+                Value::Boolean(true)
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn chisq_dist_df_less_than_one_is_num_error() {
+        assert_eq!(
+            chisq_dist(&[Value::number(1.0), Value::number(0.5), Value::Boolean(true)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn chisq_dist_df_above_max_is_num_error() {
+        // **W5-D-3.1 (Opus LOW-O-6 closure):** reference the named
+        // constant rather than the literal `1e11` so a future change
+        // to `MAX_CHISQ_DEGREES_OF_FREEDOM` keeps the test aligned.
+        assert_eq!(
+            chisq_dist(&[
+                Value::number(5.0),
+                Value::number(super::MAX_CHISQ_DEGREES_OF_FREEDOM + 1.0),
+                Value::Boolean(true)
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn chisq_dist_text_arg_is_value_error() {
+        assert_eq!(
+            chisq_dist(&[
+                Value::text("nope"),
+                Value::number(1.0),
+                Value::Boolean(true)
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn chisq_dist_error_arg_propagates() {
+        assert_eq!(
+            chisq_dist(&[
+                Value::Error(ErrorValue::Ref),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn chisq_dist_arity_mismatch_returns_value() {
+        assert_eq!(chisq_dist(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            chisq_dist(&[Value::number(1.0), Value::number(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            chisq_dist(&[
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+                Value::number(0.0)
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== CHISQ.DIST.RT =====
+
+    #[test]
+    fn chisq_dist_rt_at_zero_returns_one() {
+        // P(X > 0) = 1 for any df.
+        assert_close(
+            chisq_dist_rt(&[Value::number(0.0), Value::number(1.0)]),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn chisq_dist_rt_at_two_df_two_libreoffice_anchor() {
+        // P(X > 2) = exp(-1) for df=2 (exponential(1/2)).
+        assert_close(
+            chisq_dist_rt(&[Value::number(2.0), Value::number(2.0)]),
+            (-1.0_f64).exp(),
+        );
+    }
+
+    #[test]
+    fn chisq_dist_rt_libreoffice_anchor_df_one_at_3_84() {
+        // P(X > 3.841459) ≈ 0.05 for df=1.
+        let result = chisq_dist_rt(&[Value::number(3.841_458_820_694_124), Value::number(1.0)]);
+        match result {
+            Value::Number(n) => assert!(approx(n, 0.05, 1e-9), "expected ≈ 0.05, got {n}"),
+            other => panic!("expected Number ≈ 0.05, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chisq_dist_rt_round_trip_with_chisq_dist() {
+        // CDF + RT = 1.
+        let x = 5.0;
+        let df = 10.0;
+        let cdf = match chisq_dist(&[Value::number(x), Value::number(df), Value::Boolean(true)]) {
+            Value::Number(n) => n,
+            other => panic!("CDF returned {other:?}"),
+        };
+        let rt = match chisq_dist_rt(&[Value::number(x), Value::number(df)]) {
+            Value::Number(n) => n,
+            other => panic!("RT returned {other:?}"),
+        };
+        assert!(approx(cdf + rt, 1.0, 1e-12));
+    }
+
+    #[test]
+    fn chisq_dist_rt_negative_x_is_num_error() {
+        assert_eq!(
+            chisq_dist_rt(&[Value::number(-0.5), Value::number(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn chisq_dist_rt_df_less_than_one_is_num_error() {
+        assert_eq!(
+            chisq_dist_rt(&[Value::number(1.0), Value::number(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn chisq_dist_rt_text_arg_is_value_error() {
+        assert_eq!(
+            chisq_dist_rt(&[Value::number(1.0), Value::text("one")]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn chisq_dist_rt_error_arg_propagates() {
+        assert_eq!(
+            chisq_dist_rt(&[Value::Error(ErrorValue::DivZero), Value::number(1.0)]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn chisq_dist_rt_arity_mismatch_returns_value() {
+        assert_eq!(chisq_dist_rt(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            chisq_dist_rt(&[Value::number(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            chisq_dist_rt(&[Value::number(1.0), Value::number(1.0), Value::number(0.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== CHISQ.INV =====
+
+    #[test]
+    fn chisq_inv_at_zero_returns_zero() {
+        // CHISQ.INV(0, df) = 0 — note `p == 0` is ACCEPTED (inclusive
+        // domain), unlike T.INV / NORM.INV which reject endpoints.
+        assert_close(chisq_inv(&[Value::number(0.0), Value::number(1.0)]), 0.0);
+    }
+
+    #[test]
+    fn chisq_inv_at_one_is_num_error() {
+        // **W5-D-3.1 (Opus LOW-O-3 closure):** pin the inclusive-upper
+        // boundary `p == 1`. Range check admits 1.0, but
+        // `inverse_cdf(1.0)` is non-finite (chi-squared right-tail is
+        // unbounded) and the `!result.is_finite()` guard surfaces
+        // `#NUM!`. Matches IronCalc.
+        assert_eq!(
+            chisq_inv(&[Value::number(1.0), Value::number(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn chisq_inv_at_half_df_two_libreoffice_anchor() {
+        // For df=2: CDF(x) = 1 - exp(-x/2) = 0.5 ⇒ x = 2*ln(2).
+        assert_close(
+            chisq_inv(&[Value::number(0.5), Value::number(2.0)]),
+            2.0 * 2.0_f64.ln(),
+        );
+    }
+
+    #[test]
+    fn chisq_inv_95_pct_df_one_libreoffice_anchor() {
+        // Classic critical value: CHISQ.INV(0.95, 1) ≈ 3.841458820694124.
+        assert_close(
+            chisq_inv(&[Value::number(0.95), Value::number(1.0)]),
+            3.841_458_820_694_124,
+        );
+    }
+
+    #[test]
+    fn chisq_inv_inverse_of_chisq_dist_round_trip() {
+        // chisq_dist(chisq_inv(p, df), df, TRUE) ≈ p.
+        let p = 0.73;
+        let df = 5.0;
+        let x = match chisq_inv(&[Value::number(p), Value::number(df)]) {
+            Value::Number(n) => n,
+            other => panic!("CHISQ.INV returned {other:?}"),
+        };
+        let p_back = match chisq_dist(&[Value::number(x), Value::number(df), Value::Boolean(true)])
+        {
+            Value::Number(n) => n,
+            other => panic!("CHISQ.DIST returned {other:?}"),
+        };
+        assert!(approx(p, p_back, 1e-12));
+    }
+
+    #[test]
+    fn chisq_inv_p_above_one_is_num_error() {
+        // p > 1 outside probability domain.
+        assert_eq!(
+            chisq_inv(&[Value::number(1.5), Value::number(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn chisq_inv_p_negative_is_num_error() {
+        assert_eq!(
+            chisq_inv(&[Value::number(-0.1), Value::number(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn chisq_inv_df_less_than_one_is_num_error() {
+        assert_eq!(
+            chisq_inv(&[Value::number(0.5), Value::number(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn chisq_inv_text_arg_is_value_error() {
+        assert_eq!(
+            chisq_inv(&[Value::text("half"), Value::number(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn chisq_inv_error_arg_propagates() {
+        assert_eq!(
+            chisq_inv(&[Value::Error(ErrorValue::Ref), Value::number(1.0)]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn chisq_inv_arity_mismatch_returns_value() {
+        assert_eq!(chisq_inv(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            chisq_inv(&[Value::number(0.5)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            chisq_inv(&[Value::number(0.5), Value::number(1.0), Value::number(0.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== CHISQ.INV.RT =====
+
+    #[test]
+    fn chisq_inv_rt_at_one_returns_zero() {
+        // P(X > x) = 1 ⇒ x = 0.
+        assert_close(chisq_inv_rt(&[Value::number(1.0), Value::number(1.0)]), 0.0);
+    }
+
+    #[test]
+    fn chisq_inv_rt_at_zero_prob_is_num_error() {
+        // **W5-D-3.1 (Codex LOW-2 + Opus LOW-O-3 closure):** the range
+        // check `0.0..=1.0` admits `p == 0`, but the next line computes
+        // `inverse_cdf(1.0 - 0.0) = inverse_cdf(1.0)` which is non-finite
+        // for the unbounded-right chi-squared. The `!result.is_finite()`
+        // guard surfaces `#NUM!`. This test pins that
+        // domain-accepted-but-observably-#NUM! behavior so the coverage
+        // docs claim of "p=0 ACCEPTED" cannot be misread as "p=0 returns
+        // a finite value".
+        assert_eq!(
+            chisq_inv_rt(&[Value::number(0.0), Value::number(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn chisq_inv_rt_at_half_df_two_libreoffice_anchor() {
+        // For df=2: same as CHISQ.INV(0.5, 2) by symmetry through
+        // p ↔ 1-p substitution. Result: 2*ln(2).
+        assert_close(
+            chisq_inv_rt(&[Value::number(0.5), Value::number(2.0)]),
+            2.0 * 2.0_f64.ln(),
+        );
+    }
+
+    #[test]
+    fn chisq_inv_rt_5_pct_df_one_libreoffice_anchor() {
+        // CHISQ.INV.RT(0.05, 1) ≈ 3.841459 (same as CHISQ.INV(0.95, 1)
+        // by definition).
+        assert_close(
+            chisq_inv_rt(&[Value::number(0.05), Value::number(1.0)]),
+            3.841_458_820_694_124,
+        );
+    }
+
+    #[test]
+    fn chisq_inv_rt_round_trip_with_chisq_dist_rt() {
+        // chisq_dist_rt(chisq_inv_rt(p, df), df) ≈ p.
+        let p = 0.10;
+        let df = 7.0;
+        let x = match chisq_inv_rt(&[Value::number(p), Value::number(df)]) {
+            Value::Number(n) => n,
+            other => panic!("CHISQ.INV.RT returned {other:?}"),
+        };
+        let p_back = match chisq_dist_rt(&[Value::number(x), Value::number(df)]) {
+            Value::Number(n) => n,
+            other => panic!("CHISQ.DIST.RT returned {other:?}"),
+        };
+        assert!(approx(p, p_back, 1e-12));
+    }
+
+    #[test]
+    fn chisq_inv_rt_p_above_one_is_num_error() {
+        assert_eq!(
+            chisq_inv_rt(&[Value::number(1.5), Value::number(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn chisq_inv_rt_p_negative_is_num_error() {
+        assert_eq!(
+            chisq_inv_rt(&[Value::number(-0.1), Value::number(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn chisq_inv_rt_df_less_than_one_is_num_error() {
+        assert_eq!(
+            chisq_inv_rt(&[Value::number(0.5), Value::number(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn chisq_inv_rt_text_arg_is_value_error() {
+        assert_eq!(
+            chisq_inv_rt(&[Value::number(0.5), Value::text("ten")]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn chisq_inv_rt_error_arg_propagates() {
+        assert_eq!(
+            chisq_inv_rt(&[Value::Error(ErrorValue::DivZero), Value::number(1.0)]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn chisq_inv_rt_arity_mismatch_returns_value() {
+        assert_eq!(chisq_inv_rt(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            chisq_inv_rt(&[Value::number(0.5)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            chisq_inv_rt(&[Value::number(0.5), Value::number(1.0), Value::number(0.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== F.DIST =====
+    //
+    // F-distribution symmetry: F(df1, df2) with df1=df2 has F(1)=0.5
+    // by CDF symmetry. Useful as a closed-form anchor.
+
+    #[test]
+    fn f_dist_cdf_at_zero_returns_zero() {
+        assert_close(
+            f_dist(&[
+                Value::number(0.0),
+                Value::number(5.0),
+                Value::number(10.0),
+                Value::Boolean(true),
+            ]),
+            0.0,
+        );
+    }
+
+    #[test]
+    fn f_dist_cdf_at_one_equal_dfs_is_half() {
+        // F(df1, df2) with df1=df2: P(F<=1) = 0.5 by CDF symmetry around 1.
+        assert_close(
+            f_dist(&[
+                Value::number(1.0),
+                Value::number(10.0),
+                Value::number(10.0),
+                Value::Boolean(true),
+            ]),
+            0.5,
+        );
+    }
+
+    #[test]
+    fn f_dist_pdf_at_one_equal_dfs_closed_form() {
+        // **W5-D-3.1 (Opus MEDIUM-O-3 closure):** strengthened from a
+        // bare positive-finite check to a closed-form anchor.
+        //
+        // For F(n, n) at x=1, the PDF simplifies to a closed form via
+        // the Beta-function ratio. For n=10:
+        //   pdf(1) = (1 / B(5, 5)) * (5^10 / 10^10)
+        //          = (1 / B(5, 5)) * (1/2)^10
+        //          = (1 / B(5, 5)) / 1024
+        //   B(5, 5) = Γ(5)·Γ(5) / Γ(10) = (4!)^2 / 9! = 576 / 362880
+        //          = 1/630
+        //   ⇒ pdf(1) = 630 / 1024 = 0.615234375 (exact).
+        assert_close(
+            f_dist(&[
+                Value::number(1.0),
+                Value::number(10.0),
+                Value::number(10.0),
+                Value::Boolean(false),
+            ]),
+            630.0 / 1024.0,
+        );
+    }
+
+    #[test]
+    fn f_dist_statrs_self_consistent_95th_percentile_round_trip() {
+        // **W5-D-3.1 (Opus LOW-O-5 closure):** renamed from
+        // `f_dist_libreoffice_anchor_5_10_at_3_3258` to reflect what
+        // this test actually pins. It is NOT a LibreOffice anchor —
+        // it's a self-consistency pin against statrs's own F.INV value.
+        //
+        // F.DIST(x, 5, 10, TRUE) ≈ 0.95 at the statrs-computed 95th
+        // percentile. Input is statrs's own F.INV(0.95, 5, 10) value
+        // (`3.3258345304130046`); statrs's F.INV is approximate
+        // (Newton-Raphson) and diverges from the true mathematical
+        // value (`3.325835018413022` per R/LibreOffice) by ~5e-7. By
+        // using statrs's self-consistent value the CDF round-trip is
+        // exact to 1e-12 — pinning *statrs's internal consistency*
+        // rather than agreement with an external reference. The
+        // `f_inv_inverse_of_f_dist_round_trip` test elsewhere pins the
+        // generic property; this one targets the specific 95th-pct
+        // critical value.
+        let result = f_dist(&[
+            Value::number(3.325_834_530_413_004_6),
+            Value::number(5.0),
+            Value::number(10.0),
+            Value::Boolean(true),
+        ]);
+        match result {
+            Value::Number(n) => assert!(approx(n, 0.95, 1e-9), "expected ≈ 0.95, got {n}"),
+            other => panic!("expected Number ≈ 0.95, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn f_dist_negative_x_is_num_error() {
+        assert_eq!(
+            f_dist(&[
+                Value::number(-1.0),
+                Value::number(5.0),
+                Value::number(10.0),
+                Value::Boolean(true)
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn f_dist_df_less_than_one_is_num_error() {
+        // df1 < 1.
+        assert_eq!(
+            f_dist(&[
+                Value::number(1.0),
+                Value::number(0.5),
+                Value::number(10.0),
+                Value::Boolean(true)
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+        // df2 < 1.
+        assert_eq!(
+            f_dist(&[
+                Value::number(1.0),
+                Value::number(5.0),
+                Value::number(0.0),
+                Value::Boolean(true)
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn f_dist_text_arg_is_value_error() {
+        assert_eq!(
+            f_dist(&[
+                Value::text("nope"),
+                Value::number(5.0),
+                Value::number(10.0),
+                Value::Boolean(true)
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn f_dist_error_arg_propagates() {
+        assert_eq!(
+            f_dist(&[
+                Value::Error(ErrorValue::Ref),
+                Value::number(5.0),
+                Value::number(10.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn f_dist_arity_mismatch_returns_value() {
+        assert_eq!(f_dist(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            f_dist(&[Value::number(1.0), Value::number(5.0), Value::number(10.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            f_dist(&[
+                Value::number(1.0),
+                Value::number(5.0),
+                Value::number(10.0),
+                Value::Boolean(true),
+                Value::number(0.0)
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== F.DIST.RT =====
+
+    #[test]
+    fn f_dist_rt_at_zero_returns_one() {
+        assert_close(
+            f_dist_rt(&[Value::number(0.0), Value::number(5.0), Value::number(10.0)]),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn f_dist_rt_at_one_equal_dfs_is_half() {
+        assert_close(
+            f_dist_rt(&[Value::number(1.0), Value::number(10.0), Value::number(10.0)]),
+            0.5,
+        );
+    }
+
+    #[test]
+    fn f_dist_rt_statrs_self_consistent_5_pct_round_trip() {
+        // **W5-D-3.1 (Opus LOW-O-5 closure):** renamed from
+        // `f_dist_rt_libreoffice_anchor_5_10_at_3_3258`. Same
+        // self-consistency note as
+        // `f_dist_statrs_self_consistent_95th_percentile_round_trip`:
+        // input is statrs's own F.INV value, not the true F-math 95th
+        // percentile. Pins statrs's internal consistency (CDF + RT = 1
+        // at statrs's inverse value).
+        let result = f_dist_rt(&[
+            Value::number(3.325_834_530_413_004_6),
+            Value::number(5.0),
+            Value::number(10.0),
+        ]);
+        match result {
+            Value::Number(n) => assert!(approx(n, 0.05, 1e-9), "expected ≈ 0.05, got {n}"),
+            other => panic!("expected Number ≈ 0.05, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn f_dist_rt_round_trip_with_f_dist() {
+        // CDF + RT = 1.
+        let x = 2.5;
+        let df1 = 5.0;
+        let df2 = 10.0;
+        let cdf = match f_dist(&[
+            Value::number(x),
+            Value::number(df1),
+            Value::number(df2),
+            Value::Boolean(true),
+        ]) {
+            Value::Number(n) => n,
+            other => panic!("F.DIST returned {other:?}"),
+        };
+        let rt = match f_dist_rt(&[Value::number(x), Value::number(df1), Value::number(df2)]) {
+            Value::Number(n) => n,
+            other => panic!("F.DIST.RT returned {other:?}"),
+        };
+        assert!(approx(cdf + rt, 1.0, 1e-12));
+    }
+
+    #[test]
+    fn f_dist_rt_negative_x_is_num_error() {
+        assert_eq!(
+            f_dist_rt(&[Value::number(-1.0), Value::number(5.0), Value::number(10.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn f_dist_rt_df_less_than_one_is_num_error() {
+        assert_eq!(
+            f_dist_rt(&[Value::number(1.0), Value::number(0.0), Value::number(10.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn f_dist_rt_text_arg_is_value_error() {
+        assert_eq!(
+            f_dist_rt(&[Value::number(1.0), Value::text("five"), Value::number(10.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn f_dist_rt_error_arg_propagates() {
+        assert_eq!(
+            f_dist_rt(&[
+                Value::Error(ErrorValue::DivZero),
+                Value::number(5.0),
+                Value::number(10.0),
+            ]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn f_dist_rt_arity_mismatch_returns_value() {
+        assert_eq!(f_dist_rt(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            f_dist_rt(&[Value::number(1.0), Value::number(5.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            f_dist_rt(&[
+                Value::number(1.0),
+                Value::number(5.0),
+                Value::number(10.0),
+                Value::number(0.0)
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== F.INV =====
+
+    #[test]
+    fn f_inv_at_zero_returns_zero() {
+        // F.INV(0, df1, df2) = 0 (p == 0 ACCEPTED, inclusive domain).
+        assert_close(
+            f_inv(&[Value::number(0.0), Value::number(5.0), Value::number(10.0)]),
+            0.0,
+        );
+    }
+
+    #[test]
+    fn f_inv_at_one_is_num_error() {
+        // **W5-D-3.1 (Opus LOW-O-3 closure):** pin inclusive-upper
+        // boundary `p == 1`. Range check admits 1.0, but
+        // `inverse_cdf(1.0)` is non-finite (F right-tail is unbounded)
+        // and the `!result.is_finite()` guard surfaces `#NUM!`.
+        assert_eq!(
+            f_inv(&[Value::number(1.0), Value::number(5.0), Value::number(10.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn f_inv_at_half_equal_dfs_returns_one() {
+        // F(df1=df2) median is 1.
+        assert_close(
+            f_inv(&[Value::number(0.5), Value::number(10.0), Value::number(10.0)]),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn f_inv_libreoffice_anchor_95_pct_5_10() {
+        // F.INV(0.95, 5, 10) → statrs's internal Newton-Raphson result
+        // `3.3258345304130046`. True mathematical value (per
+        // R/LibreOffice) is `3.325835018413022` — statrs's approximation
+        // diverges by ~5e-7. We pin statrs's value (= IronCalc's value)
+        // since both projects use the same statrs 0.18.0 pin and thus
+        // the same numerical kernel.
+        assert_close(
+            f_inv(&[Value::number(0.95), Value::number(5.0), Value::number(10.0)]),
+            3.325_834_530_413_004_6,
+        );
+    }
+
+    #[test]
+    fn f_inv_inverse_of_f_dist_round_trip() {
+        // f_dist(f_inv(p, df1, df2), df1, df2, TRUE) ≈ p.
+        let p = 0.73;
+        let df1 = 5.0;
+        let df2 = 10.0;
+        let x = match f_inv(&[Value::number(p), Value::number(df1), Value::number(df2)]) {
+            Value::Number(n) => n,
+            other => panic!("F.INV returned {other:?}"),
+        };
+        let p_back = match f_dist(&[
+            Value::number(x),
+            Value::number(df1),
+            Value::number(df2),
+            Value::Boolean(true),
+        ]) {
+            Value::Number(n) => n,
+            other => panic!("F.DIST returned {other:?}"),
+        };
+        assert!(approx(p, p_back, 1e-12));
+    }
+
+    #[test]
+    fn f_inv_p_above_one_is_num_error() {
+        assert_eq!(
+            f_inv(&[Value::number(1.5), Value::number(5.0), Value::number(10.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn f_inv_p_negative_is_num_error() {
+        assert_eq!(
+            f_inv(&[Value::number(-0.1), Value::number(5.0), Value::number(10.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn f_inv_df_less_than_one_is_num_error() {
+        assert_eq!(
+            f_inv(&[Value::number(0.5), Value::number(0.0), Value::number(10.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn f_inv_text_arg_is_value_error() {
+        assert_eq!(
+            f_inv(&[Value::text("half"), Value::number(5.0), Value::number(10.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn f_inv_error_arg_propagates() {
+        assert_eq!(
+            f_inv(&[
+                Value::Error(ErrorValue::Ref),
+                Value::number(5.0),
+                Value::number(10.0)
+            ]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn f_inv_arity_mismatch_returns_value() {
+        assert_eq!(f_inv(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            f_inv(&[Value::number(0.5), Value::number(5.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            f_inv(&[
+                Value::number(0.5),
+                Value::number(5.0),
+                Value::number(10.0),
+                Value::number(0.0)
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== F.INV.RT =====
+
+    #[test]
+    fn f_inv_rt_at_one_returns_zero() {
+        // p=1 (upper-inclusive per IronCalc canon) → x=0.
+        assert_close(
+            f_inv_rt(&[Value::number(1.0), Value::number(5.0), Value::number(10.0)]),
+            0.0,
+        );
+    }
+
+    #[test]
+    fn f_inv_rt_at_half_equal_dfs_returns_one() {
+        assert_close(
+            f_inv_rt(&[Value::number(0.5), Value::number(10.0), Value::number(10.0)]),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn f_inv_rt_libreoffice_anchor_5_pct_5_10() {
+        // F.INV.RT(0.05, 5, 10) = F.INV(0.95, 5, 10) by definition.
+        // Pins statrs's internal value (= IronCalc's value); see
+        // `f_inv_libreoffice_anchor_95_pct_5_10` for the statrs vs
+        // true-F-distribution divergence note.
+        assert_close(
+            f_inv_rt(&[Value::number(0.05), Value::number(5.0), Value::number(10.0)]),
+            3.325_834_530_413_004_6,
+        );
+    }
+
+    #[test]
+    fn f_inv_rt_round_trip_with_f_dist_rt() {
+        // f_dist_rt(f_inv_rt(p, df1, df2), df1, df2) ≈ p.
+        let p = 0.10;
+        let df1 = 7.0;
+        let df2 = 15.0;
+        let x = match f_inv_rt(&[Value::number(p), Value::number(df1), Value::number(df2)]) {
+            Value::Number(n) => n,
+            other => panic!("F.INV.RT returned {other:?}"),
+        };
+        let p_back = match f_dist_rt(&[Value::number(x), Value::number(df1), Value::number(df2)]) {
+            Value::Number(n) => n,
+            other => panic!("F.DIST.RT returned {other:?}"),
+        };
+        assert!(approx(p, p_back, 1e-12));
+    }
+
+    #[test]
+    fn f_inv_rt_at_zero_prob_is_num_error() {
+        // p=0 REJECTED (lower-strict, unlike F.INV/CHISQ.INV which
+        // accept p=0). Matches IronCalc canon.
+        assert_eq!(
+            f_inv_rt(&[Value::number(0.0), Value::number(5.0), Value::number(10.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn f_inv_rt_p_negative_is_num_error() {
+        // **W5-D-3.1 (Codex LOW-4 closure):** pin negative-p rejection
+        // independently of the p=0 boundary. Without this test, a
+        // future edit that flipped `p <= 0.0` to `p < 0.0` (admitting
+        // exactly zero) wouldn't be caught — the `p=0` test would
+        // start passing for the wrong reason.
+        assert_eq!(
+            f_inv_rt(&[Value::number(-0.1), Value::number(5.0), Value::number(10.0),]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn f_inv_rt_p_above_one_is_num_error() {
+        assert_eq!(
+            f_inv_rt(&[Value::number(1.5), Value::number(5.0), Value::number(10.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn f_inv_rt_df_less_than_one_is_num_error() {
+        assert_eq!(
+            f_inv_rt(&[Value::number(0.5), Value::number(0.0), Value::number(10.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn f_inv_rt_text_arg_is_value_error() {
+        assert_eq!(
+            f_inv_rt(&[Value::number(0.5), Value::text("five"), Value::number(10.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn f_inv_rt_error_arg_propagates() {
+        assert_eq!(
+            f_inv_rt(&[
+                Value::Error(ErrorValue::DivZero),
+                Value::number(5.0),
+                Value::number(10.0),
+            ]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn f_inv_rt_arity_mismatch_returns_value() {
+        assert_eq!(f_inv_rt(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            f_inv_rt(&[Value::number(0.5), Value::number(5.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            f_inv_rt(&[
+                Value::number(0.5),
+                Value::number(5.0),
+                Value::number(10.0),
+                Value::number(0.0)
+            ]),
             Value::Error(ErrorValue::Value)
         );
     }

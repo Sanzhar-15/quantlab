@@ -831,6 +831,20 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("T.INV", distribution_fns::t_inv);
     r.register("T.INV.2T", distribution_fns::t_inv_2t);
 
+    // **W5-D-3 (Wave 3 distributions batch — chi-squared + F)**:
+    // CHISQ.DIST / CHISQ.DIST.RT / CHISQ.INV / CHISQ.INV.RT +
+    // F.DIST / F.DIST.RT / F.INV / F.INV.RT. Scalar tier;
+    // statrs::ChiSquared + statrs::FisherSnedecor backing. Same
+    // coercion-frontend divergences as W5-D-1 / W5-D-2.
+    r.register("CHISQ.DIST", distribution_fns::chisq_dist);
+    r.register("CHISQ.DIST.RT", distribution_fns::chisq_dist_rt);
+    r.register("CHISQ.INV", distribution_fns::chisq_inv);
+    r.register("CHISQ.INV.RT", distribution_fns::chisq_inv_rt);
+    r.register("F.DIST", distribution_fns::f_dist);
+    r.register("F.DIST.RT", distribution_fns::f_dist_rt);
+    r.register("F.INV", distribution_fns::f_inv);
+    r.register("F.INV.RT", distribution_fns::f_inv_rt);
+
     r
 }
 
@@ -924,8 +938,12 @@ mod tests {
         // backing matching IronCalc's behavior (both pin statrs 0.18.0) +
         // W5-D-2 (Wave 3 distributions batch — Student's t): T.DIST,
         // T.DIST.2T, T.DIST.RT, T.INV, T.INV.2T = 5 — scalar tier;
-        // statrs::StudentsT backing.
-        assert_eq!(r.len(), 209);
+        // statrs::StudentsT backing +
+        // W5-D-3 (Wave 3 distributions batch — chi-squared + F):
+        // CHISQ.DIST, CHISQ.DIST.RT, CHISQ.INV, CHISQ.INV.RT, F.DIST,
+        // F.DIST.RT, F.INV, F.INV.RT = 8 — scalar tier;
+        // statrs::ChiSquared + statrs::FisherSnedecor backing.
+        assert_eq!(r.len(), 217);
     }
 
     #[test]
