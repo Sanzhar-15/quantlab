@@ -11,6 +11,11 @@ path = "src/lib.rs"
 
 [dependencies]
 ql-types = { path = "../ql-types" }
+# **W5-D-1 (Wave 3 distributions batch):** statrs ports IronCalc's
+# statistical distributions (NORM.* / T.* / CHISQ.* / F.* / BINOM.* /
+# POISSON.* / GAMMA.* / BETA.*). Pinned to IronCalc's version for
+# behavioral parity.
+statrs = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

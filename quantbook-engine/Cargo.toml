@@ -101,6 +101,13 @@ serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.149"
 toml = "=0.9.7"
 
+# Statistical distributions (Wave 3 distributions batch: NORM.* / T.* /
+# CHISQ.* / F.* / BINOM.* / POISSON.* / GAMMA.* / BETA.*). IronCalc uses
+# the same crate at the same pin — matching their version for canon
+# behavioral compatibility. `default-features = false` keeps the crate
+# minimal (no rand integration).
+statrs = { version = "=0.18.0", default-features = false }
+
 [profile.dev]
 opt-level = 0
 debug = true

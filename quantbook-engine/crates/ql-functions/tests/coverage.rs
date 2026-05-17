@@ -652,6 +652,40 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
          named-cell + 1×1 range + cell-with-error-value not-propagated); \
          scalar arg-coverage matrix N/A",
     ),
+    // W5-D-1 (Wave 3 distributions batch — normal). NORM.DIST / NORM.S.DIST
+    // / NORM.INV / NORM.S.INV. Scalar tier; statrs backing matching
+    // IronCalc. Coverage via per-fn unit tests (anchor / LibreOffice
+    // cross-check / round-trip / error class / arity); statrs gives
+    // ~15 sig fig accuracy out-of-the-box. Scalar arg-coverage matrix
+    // N/A — distribution fns aren't symmetric across the matrix's
+    // input dimensions.
+    (
+        "NORM.DIST",
+        "distribution fn (W5-D-1) — covered by distribution_fns unit \
+         tests (mean=0/sd=1 PDF + CDF anchors, LibreOffice cross-checks, \
+         #NUM! for sd <= 0, #VALUE! for text args, error propagation, \
+         arity); scalar arg-coverage matrix N/A for statistical \
+         distributions",
+    ),
+    (
+        "NORM.S.DIST",
+        "distribution fn (W5-D-1) — covered by distribution_fns unit \
+         tests (Φ(z) anchors at 0/1/-2/8 LibreOffice cross-checks, PDF + \
+         CDF, error class, arity); scalar arg-coverage matrix N/A",
+    ),
+    (
+        "NORM.INV",
+        "distribution fn (W5-D-1) — covered by distribution_fns unit \
+         tests (CI-upper anchor at 0.975 LibreOffice cross-check, \
+         inverse-of-CDF round-trip, #NUM! for prob outside (0,1) or \
+         sd <= 0, error propagation, arity); scalar arg-coverage matrix N/A",
+    ),
+    (
+        "NORM.S.INV",
+        "distribution fn (W5-D-1) — covered by distribution_fns unit \
+         tests (Φ⁻¹(0.5)=0, Φ⁻¹(0.975) LibreOffice anchor, round-trip, \
+         #NUM! domain, error class, arity); scalar arg-coverage matrix N/A",
+    ),
 ];
 
 #[test]

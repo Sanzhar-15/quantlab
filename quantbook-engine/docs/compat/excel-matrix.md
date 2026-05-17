@@ -94,7 +94,10 @@ as partial, rows with `❌` are missing.
 | STEYX | ✅ | 9 | 4.10 polish | W5-179: standard error of the predicted y in least-squares regression. Formula `sey = √(SSE / (n − 2))` where `SSE = Σ(y − ŷ)²` and `ŷ = intercept + slope · x`. RangeAwareFn `STEYX(known_y, known_x)` — Y-first like SLOPE / INTERCEPT. Two-pass: first builds `LinearFitSums` and derives slope + intercept via `compute_slope`; second walks the preserved pairs for residuals. Requires ≥3 numeric pairs (denominator is `n − 2`) → otherwise `#DIV/0!`. Constant x-array → `#DIV/0!` (inherits from `compute_slope`). Same non-numeric-pair skip + shape-mismatch divergence as CORREL. |
 | AVERAGEA / MAXA / MINA | ✅ | 10 | 4.10.C | W5-165: `*A`-variant aggregates. Per Excel canon: Number → as-is; Boolean → 1/0; Text → 0 (including ""); Blank → SKIPPED. Errors propagate. AVERAGEA: empty / all-blank → #DIV/0!. MAXA / MINA: empty / all-blank → 0. DIVERGES from base AVERAGE / MAX / MIN which skip text + bool entirely. |
 | FREQUENCY | ❌ | 0 | 4.10 | Array-result; needs 4.7 |
-| NORM.DIST / NORM.S.DIST / NORM.INV / NORM.S.INV | ❌ | 0 | 4.10 | |
+| NORM.DIST | ✅ | 9 | Wave 3 D-1 (W5-D-1) | W5-D-1: normal PDF/CDF via `statrs::Normal` (pinned 0.18.0; matches IronCalc's pin). 4 args; `cumulative=TRUE` → CDF, `FALSE` → PDF. `sd <= 0` → `#NUM!`. Text args → `#VALUE!`. Error propagation. LibreOffice anchors pinned. |
+| NORM.S.DIST | ✅ | 8 | Wave 3 D-1 (W5-D-1) | W5-D-1: standard normal (mean=0, sd=1) PDF/CDF; 2 args. Same error semantics. LibreOffice Φ(z) anchors at z=0, 1, -2, 8 pinned. |
+| NORM.INV | ✅ | 9 | Wave 3 D-1 (W5-D-1) | W5-D-1: inverse normal CDF; 3 args. `0 < prob < 1` strict; `sd > 0` strict. Else `#NUM!`. CI-upper anchor at p=0.975 (≈1.95996398) pinned; inverse-of-CDF round-trip verified. |
+| NORM.S.INV | ✅ | 9 | Wave 3 D-1 (W5-D-1) | W5-D-1: standard-normal inverse CDF; 1 arg. Same domain. |
 | T.DIST / T.INV / CHISQ.DIST / CHISQ.INV / F.DIST / F.INV | ❌ | 0 | 4.10 | |
 | BINOM.DIST / BINOM.INV / POISSON.DIST / EXPON.DIST | ❌ | 0 | 4.10 | |
 | GAMMA / GAMMA.DIST / GAMMA.INV / GAMMALN | ❌ | 0 | 4.10 | |

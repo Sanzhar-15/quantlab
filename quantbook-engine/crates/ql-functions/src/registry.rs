@@ -34,7 +34,10 @@ use ql_types::{ArrayValue, EvalContext, Value};
 use crate::context_aware_fns::ContextAwareFn;
 use crate::range_aware_fns::RangeAwareFn;
 use crate::reference_aware_fns::{ArgContract, ReferenceAwareFn};
-use crate::{date_fns, financial_fns, format, range_fns, reference_fns, scalar_fns, volatile};
+use crate::{
+    date_fns, distribution_fns, financial_fns, format, range_fns, reference_fns, scalar_fns,
+    volatile,
+};
 
 /// Function signature: pre-evaluated args → result Value.
 pub type ScalarFn = fn(&[Value]) -> Value;
@@ -808,6 +811,15 @@ pub fn default_registry() -> FunctionRegistry {
         ArgContract::Eager,
     );
 
+    // **W5-D-1 (Wave 3 distributions batch — normal)**: NORM.DIST /
+    // NORM.S.DIST / NORM.INV / NORM.S.INV. Scalar tier; statrs::Normal
+    // backing matches IronCalc's behavior exactly (both projects pin
+    // statrs = 0.18.0). See `distribution_fns` module for canon semantics.
+    r.register("NORM.DIST", distribution_fns::norm_dist);
+    r.register("NORM.S.DIST", distribution_fns::norm_s_dist);
+    r.register("NORM.INV", distribution_fns::norm_inv);
+    r.register("NORM.S.INV", distribution_fns::norm_s_inv);
+
     r
 }
 
@@ -893,10 +905,13 @@ mod tests {
         // — reference-tier information batch; ISREF uses LazyShape
         // (first user-facing fn through that contract), ISFORMULA
         // uses Eager + workbook ReferenceQuery::is_formula_at +
-        // W5-RT-4 (RT-V1-01 Step 4 — CLOSES the mini-phase):
+        // W5-RT-4 (RT-V1-01 Step 4 — CLOSES the reference-tier mini-phase):
         // FORMULATEXT = 1 — reference-tier text batch; Eager +
-        // ReferenceQuery::formula_text_at (prepends leading `=`).
-        assert_eq!(r.len(), 200);
+        // ReferenceQuery::formula_text_at (prepends leading `=`) +
+        // W5-D-1 (Wave 3 distributions batch — normal): NORM.DIST,
+        // NORM.S.DIST, NORM.INV, NORM.S.INV = 4 — scalar tier; statrs
+        // backing matching IronCalc's behavior (both pin statrs 0.18.0).
+        assert_eq!(r.len(), 204);
     }
 
     #[test]
