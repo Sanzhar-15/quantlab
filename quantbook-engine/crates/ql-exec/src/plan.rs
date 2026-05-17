@@ -485,6 +485,53 @@ pub(crate) fn is_aggregate_function(name: &str) -> bool {
             // bind as `AggregateNameRef`). Eval-side dispatch routes
             // via the parallel `lookup_range_aware` table.
             | "SUBTOTAL"
+            // **W5-D-13.1 (Phase 4.10 V1-260 megaudit closure — Codex
+            // HIGH-001 / Opus HIGH-1)**: SUBTOTAL was the ONLY fn
+            // admitted by the W5-D-12 closure; the same systemic gap
+            // affected 28 other range-aware fns that take range args.
+            // The per-batch audits missed this because the unit tests
+            // construct FnArg::Range directly (bypassing the binder)
+            // and registry-lookup smoke tests prove the symbol is
+            // registered but NOT that the binder routes range args to
+            // it. Admitting all of them here closes the gap.
+            //
+            // Phase 4.10 statistical paired-array fns (W5-177, W5-178,
+            // W5-179, W5-D-6) — take 2 ranges:
+            | "CORREL"
+            | "PEARSON"
+            | "RSQ"
+            | "STEYX"
+            | "SLOPE"
+            | "INTERCEPT"
+            | "COVARIANCE.P"
+            | "COVARIANCE.S"
+            | "SUMX2MY2"
+            | "SUMX2PY2"
+            | "SUMXMY2"
+            // Phase 4.10 financial cash-flow fns (W5-168, W5-174,
+            // W5-D-7) — take 1-2 ranges:
+            | "NPV"
+            | "IRR"
+            | "MIRR"
+            | "XNPV"
+            | "XIRR"
+            // Phase 4.10 modern lookup fns (W5-169) — take ranges:
+            | "XLOOKUP"
+            | "XMATCH"
+            // Phase 4.10 order-statistics fns (W5-D-11) — take 1
+            // range:
+            | "PERCENTILE.INC"
+            | "PERCENTILE.EXC"
+            | "PERCENTILE"
+            | "QUARTILE.INC"
+            | "QUARTILE.EXC"
+            | "QUARTILE"
+            // Phase 4.10 conditional aggregates / text join
+            // (W5-65-ish, W5-167):
+            | "MINIFS"
+            | "MAXIFS"
+            | "COUNTBLANK"
+            | "TEXTJOIN"
     )
 }
 

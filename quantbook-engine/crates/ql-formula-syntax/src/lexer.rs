@@ -669,6 +669,38 @@ fn lex_ident_or_ref(chars: &mut Peekable<Chars>) -> Result<Token, LexError> {
             return Ok(Token::Ident(Arc::from(full)));
         }
 
+        // **W5-D-13.1 (Phase 4.10 V1-260 megaudit Codex HIGH-002 / Opus
+        // HIGH-2 closure):** when the letter prefix exceeds 3 chars
+        // (cannot be a valid Excel column ref — max XFD is 3 letters),
+        // fall back to Ident emission with `letters + digits` rather
+        // than continuing into the CellRef parse path that would
+        // surface `ColumnTooLarge`. This unlocks fn names like
+        // `ATAN2`, `DAYS360`, `SUMXMY2` — registered fns previously
+        // unreachable from formula source because the lex errored
+        // before the parser could disambiguate.
+        //
+        // The trailing-letter branch above (W5-D-9) handles
+        // `DEC2BIN`-style names; this branch handles `LETTERS{>3}DIG+`
+        // names. 3-or-fewer-letter prefixes (like `LOG10`, `LOG2`)
+        // continue through the CellRef path and the parser does the
+        // CellRef→fn override per the `parser.rs` ambiguity rule.
+        //
+        // Constraints same as W5-D-9 path: skip when `$` markers are
+        // set since those are clearly intended as cell refs.
+        if !leading_dollar && !mid_dollar && letters.len() > 3 {
+            let mut full = letters;
+            full.push_str(&row_digits);
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    full.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            return Ok(Token::Ident(Arc::from(full)));
+        }
+
         let row_1based: u32 = row_digits
             .parse()
             .map_err(|_| LexError::RowTooLarge(row_digits.clone()))?;
@@ -2092,17 +2124,92 @@ mod tests {
     fn log2_still_lex_as_cellref_no_regression() {
         // Companion to the LOG10 regression guard — LOG2 is 3-letter
         // prefix + digit; should still lex as CellRef.
-        // (Note: ATAN2 has a 4-letter prefix which exceeds the
-        // column-letter limit, so it can't lex standalone as a
-        // CellRef regardless; it only works as `ATAN2(...)` via the
-        // parser's fn-name override. Not a regression for the
-        // letters-digits-letters extension.)
+        // **W5-D-13.1 megaudit closure**: prior comment claimed ATAN2
+        // "works via parser's fn-name override" — that was incorrect
+        // (the lexer errored before the parser saw the tokens). The
+        // W5-D-13.1 letters>3+digit Ident-fallback now makes ATAN2,
+        // DAYS360, and SUMXMY2 lex as `Ident` directly. Tests for
+        // those names pinned below.
         let toks = lex_ok("LOG2");
         assert!(
             matches!(toks[0], Token::CellRef { .. }),
             "LOG2 should remain CellRef, got {:?}",
             toks[0]
         );
+    }
+
+    #[test]
+    fn atan2_lexes_as_ident_via_letters_gt3_digit_fallback() {
+        // **W5-D-13.1 (Phase 4.10 V1-260 megaudit Codex HIGH-002 / Opus
+        // HIGH-2 closure):** ATAN2 has a 4-letter prefix that exceeds
+        // the 3-letter column-ref limit. Previously errored with
+        // `ColumnTooLarge("ATAN")` before the parser could see the
+        // tokens. The new letters>3+digit Ident-fallback emits a
+        // single Ident("ATAN2") so the parser can dispatch as a
+        // function call.
+        let toks = lex_ok("ATAN2");
+        match &toks[0] {
+            Token::Ident(text) => assert_eq!(text.as_ref(), "ATAN2"),
+            other => panic!("expected Ident('ATAN2'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn atan2_call_form_lexes_correctly() {
+        // ATAN2(1, 1) — full function-call form.
+        let toks = lex_ok("ATAN2(1, 1)");
+        match &toks[0] {
+            Token::Ident(text) => assert_eq!(text.as_ref(), "ATAN2"),
+            other => panic!("expected Ident('ATAN2'), got {other:?}"),
+        }
+        assert!(matches!(toks[1], Token::LParen));
+    }
+
+    #[test]
+    fn sumxmy2_lexes_as_ident_via_letters_gt3_digit_fallback() {
+        // **W5-D-13.1 closure:** SUMXMY2 has 6-letter prefix — also
+        // unreachable under the prior CellRef parse path.
+        let toks = lex_ok("SUMXMY2");
+        match &toks[0] {
+            Token::Ident(text) => assert_eq!(text.as_ref(), "SUMXMY2"),
+            other => panic!("expected Ident('SUMXMY2'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sumxmy2_call_form_lexes_correctly() {
+        let toks = lex_ok("SUMXMY2(A1:A3,B1:B3)");
+        match &toks[0] {
+            Token::Ident(text) => assert_eq!(text.as_ref(), "SUMXMY2"),
+            other => panic!("expected Ident('SUMXMY2'), got {other:?}"),
+        }
+        assert!(matches!(toks[1], Token::LParen));
+    }
+
+    #[test]
+    fn days360_lexes_as_ident_via_letters_gt3_digit_fallback() {
+        // **W5-D-13.1 closure:** DAYS360 has 4-letter prefix `DAYS`
+        // followed by 3-digit `360`. Previously errored with
+        // `ColumnTooLarge("DAYS")`.
+        let toks = lex_ok("DAYS360");
+        match &toks[0] {
+            Token::Ident(text) => assert_eq!(text.as_ref(), "DAYS360"),
+            other => panic!("expected Ident('DAYS360'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dollar_prefix_letters_gt3_digit_falls_through_to_cellref_path() {
+        // **W5-D-13.1 closure guard:** `$ATAN2` has the leading-$
+        // absolute-column marker, which signals user intent for a
+        // CellRef. The letters>3+digit Ident-fallback skips when
+        // `leading_dollar` is set; we surface `ColumnTooLarge` as
+        // before. Pins the behavior so a future refactor doesn't
+        // accidentally accept `$ATAN2` as an Ident.
+        match lex("$ATAN2") {
+            Err(LexError::ColumnTooLarge(s)) => assert_eq!(s, "ATAN"),
+            other => panic!("expected ColumnTooLarge, got {other:?}"),
+        }
     }
 
     #[test]

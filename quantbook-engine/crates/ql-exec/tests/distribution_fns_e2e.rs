@@ -600,9 +600,13 @@ fn binom_inv_through_dispatcher_returns_smallest_k_with_cdf_at_least_alpha() {
 }
 
 #[test]
-fn binom_inv_p_one_through_dispatcher_returns_num_error() {
-    // p = 1 STRICT (diverges from BINOM.DIST inclusive).
-    assert_eq!(eval("BINOM.INV(10, 1, 0.5)"), Value::Error(ErrorValue::Num));
+fn binom_inv_p_one_through_dispatcher_returns_trials() {
+    // **W5-D-13.1 (Phase 4.10 V1-260 megaudit Opus MEDIUM-2 closure):**
+    // p = 1 ACCEPTED per Microsoft canon (inclusive both ends, matching
+    // BINOM.DIST). At p=1 the binomial is deterministic at n, so
+    // `inverse_cdf(any alpha in (0,1))` = n. Prior strict-upper
+    // `(0.0..1.0)` half-open range incorrectly rejected this.
+    assert_close(eval("BINOM.INV(10, 1, 0.5)"), 10.0);
 }
 
 #[test]

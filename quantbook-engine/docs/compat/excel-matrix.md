@@ -174,7 +174,7 @@ as partial, rows with `❌` are missing.
 | LN | ✅ | 2 | 4.3 V1 | Natural log; non-positive → `#NUM!` |
 | LOG | ✅ | 3 | 4.3 V1 | Optional base; base=1 or non-positive → `#NUM!` |
 | LOG10 | ✅ | 1 | 4.3 V1 | Base-10 log; non-positive → `#NUM!` |
-| SIN / COS / TAN / ASIN / ACOS / ATAN / ATAN2 | ✅ | 13 | 4.3 V2 | W5-51; ATAN2 uses Excel `(x, y)` arg order (not Rust's `(y, x)`); ATAN2(0,0)→#DIV/0!; ASIN/ACOS domain `|x|>1`→#NUM!; TAN(π/2) returns huge-finite (Excel canon, not error) |
+| SIN / COS / TAN / ASIN / ACOS / ATAN / ATAN2 | ✅ | 13 | 4.3 V2 | W5-51; ATAN2 uses Excel `(x, y)` arg order (not Rust's `(y, x)`); ATAN2(0,0)→#DIV/0!; ASIN/ACOS domain `|x|>1`→#NUM!; TAN(π/2) returns huge-finite (Excel canon, not error). **W5-D-13.1 megaudit closure (Codex HIGH-002 / Opus HIGH-2):** ATAN2 was previously unreachable from formula source (`ATAN2(1,1)` lex-errored with `ColumnTooLarge("ATAN")` — 4-letter prefix exceeded the 3-letter column-ref limit). The W5-D-13.1 lexer letters>3+digit Ident-fallback now emits `Ident("ATAN2")` so the parser dispatches correctly. |
 | SINH / COSH / TANH / ASINH / ACOSH / ATANH | ✅ | 8 | 4.3 V2 | W5-57: hyperbolic + inverse hyperbolic. ACOSH domain x≥1 → #NUM! otherwise. ATANH domain \|x\|<1 (Excel canon: ATANH(±1) → #NUM!, not ±∞). SINH/COSH overflow → #NUM! via sanitize_f64. |
 | PI | ✅ | 2 | 4.3 V1 | Constant; arity check |
 | DEGREES | ✅ | 1 | 4.3 V1 | Radians → degrees |
@@ -188,7 +188,7 @@ as partial, rows with `❌` are missing.
 | RANDARRAY | ❌ | 0 | 4.7 | Array-result; needs 4.7 |
 | SUMPRODUCT | ✅ | 7 | 4.3 V2 | W5-55: element-wise multiply arrays then sum. All arrays must have same length. Non-numeric cells treated as 0 (lenient — Excel canon for SUMPRODUCT). Error cells propagate. Scalar args act as constant multipliers. |
 | SUMSQ | ✅ | 4 | 4.10.D | W5-166: variadic sum of squares (ScalarFn; range args flatten via dispatch like SUM). Text + blank skipped, bool coerced (TRUE=1, FALSE=0), errors propagate. Empty → 0. |
-| SUMX2MY2 / SUMX2PY2 / SUMXMY2 | ✅ | 9 | 4.10.D | W5-166: paired array sum-of-squares variants. RangeAwareFn; both args must be ranges; W5-60 strict 2D-shape check (shape mismatch → #VALUE!). Non-numeric cells coerce to 0 (lenient, matches IronCalc canon). Errors in either array propagate. |
+| SUMX2MY2 / SUMX2PY2 / SUMXMY2 | ✅ | 9 | 4.10.D | W5-166: paired array sum-of-squares variants. RangeAwareFn; both args must be ranges; W5-60 strict 2D-shape check (shape mismatch → #VALUE!). Non-numeric cells coerce to 0 (lenient, matches IronCalc canon). Errors in either array propagate. **W5-D-13.1 megaudit closure (Codex HIGH-002 / Opus HIGH-2):** SUMXMY2 was previously unreachable from formula source (`SUMXMY2(...)` lex-errored with `ColumnTooLarge("SUMXMY")`). The W5-D-13.1 lexer letters>3+digit Ident-fallback fixed it. SUMX2MY2 / SUMX2PY2 were already reachable via the W5-D-9 letters-digits-letters extension. Also admitted to `is_aggregate_function` in W5-D-13.1 for named-range arg support. |
 | AGGREGATE | ❌ | 0 | 4.10 | Conditional aggregation; depends on 4.7 |
 | SUBTOTAL | 🟡 | 31 | 4.10 V1-260 sealer (W5-D-12) | W5-D-12: conditional aggregate dispatcher. Range-aware; routes function_num ∈ {1..=11, 101..=111} to AVERAGE/COUNT/COUNTA/MAX/MIN/PRODUCT/STDEV.S/STDEV.P/SUM/VAR.S/VAR.P. **v1 divergences (documented)**: (1) 101..=111 normalize to 1..=11 because the engine has no hidden-row metadata; (2) nested SUBTOTAL calls in arg ranges are NOT skipped (engine evaluates args before dispatch — AST not available); (3) inherited from dispatched aggregates: text in data → #VALUE! (vs IronCalc/Excel skip); Boolean in data → coerced 1/0 (vs skip); Blank scalar → skipped (vs IronCalc push-as-0); PRODUCT of empty → 0 (vs 1.0 multiplicative identity). function_num truncates toward zero. NaN function_num → #NUM! (error-code consistency, not panic-safety). Boolean function_num coerces TRUE→1/FALSE→0 (IronCalc match, Excel-divergent). Text function_num always → #VALUE! (engine W5-58 strict, vs IronCalc lenient parse). **W5-D-12.1 binder admission is PARTIAL**: named-range args (`SUBTOTAL(9, SalesRange)`) work; literal range args (`SUBTOTAL(9, A1:A10)`) do NOT bind in v1 — same engine-wide `AggregateArg`-side deferral that affects standalone `SUM(A1:A10)`. Scalar args + named ranges supported. IronCalc reference: `subtotal.rs` line-by-line on dispatch shape; row-visibility + nested-skip + data-coercion semantics differ. **CLOSES Phase 4.10 V1-260 at 260 registered fns.** 🟡 = partial: numeric work shipped, literal-range-arg lift pending engine-wide. |
 
@@ -228,14 +228,14 @@ as partial, rows with `❌` are missing.
 | Function | Status | Tests | Phase | Notes |
 |---|---|---|---|---|
 | NOW / TODAY | ✅ | 5+ | 3.7 | Approximate Excel-1900 epoch; precise leap-year handling → 4.5 |
-| DATE / TIME / DATEVALUE / TIMEVALUE | ❌ | 0 | 4.5 | |
-| YEAR / MONTH / DAY / HOUR / MINUTE / SECOND | ❌ | 0 | 4.5 | |
-| WEEKDAY / WEEKNUM / ISOWEEKNUM | ❌ | 0 | 4.5 | |
-| DAYS / DAYS360 / NETWORKDAYS / NETWORKDAYS.INTL | ❌ | 0 | 4.5 | |
-| WORKDAY / WORKDAY.INTL | ❌ | 0 | 4.5 | |
-| EDATE / EOMONTH | ❌ | 0 | 4.5 | |
-| DATEDIF | ❌ | 0 | 4.5 | Excel-specific; leap-month edge cases |
-| YEARFRAC | ❌ | 0 | 4.5 | Multiple day-count bases |
+| DATE / TIME / DATEVALUE / TIMEVALUE | ✅ | 125 | 4.5 (W5-75 + W5-76) | W5-D-13.1 matrix drift closure: all 4 registered via `register_context_aware` (date_fns module). 125 date/time unit tests cover the whole 4.5 family (this row + the next 5). |
+| YEAR / MONTH / DAY / HOUR / MINUTE / SECOND | ✅ | (see DATE row) | 4.5 (W5-75 + W5-76) | W5-D-13.1: all 6 registered; tests counted in DATE row. |
+| WEEKDAY / WEEKNUM / ISOWEEKNUM | ✅ | (see DATE row) | 4.5 V2 (W5-75) | W5-D-13.1: all 3 registered; tests counted in DATE row. |
+| DAYS / DAYS360 / NETWORKDAYS / NETWORKDAYS.INTL | ⚠️ | (see DATE row) | 4.5 V2 (W5-75) | W5-D-13.1: DAYS, DAYS360, NETWORKDAYS registered. **NETWORKDAYS.INTL not registered** (locale-aware variant — defer). DAYS360 was previously also blocked at lex time (4-letter prefix); W5-D-13.1 lexer Ident-fallback closure makes it reachable from source text. |
+| WORKDAY / WORKDAY.INTL | ⚠️ | (see DATE row) | 4.5 V2 (W5-75) | W5-D-13.1: WORKDAY registered. **WORKDAY.INTL not registered** (locale-aware variant — defer). |
+| EDATE / EOMONTH | ✅ | (see DATE row) | 4.5 (W5-75) | W5-D-13.1: both registered; tests counted in DATE row. |
+| DATEDIF | ✅ | (see DATE row) | 4.5 V2 (W5-75) | W5-D-13.1: registered. Excel-specific; leap-month edge cases covered in date_fns tests. |
+| YEARFRAC | ✅ | (see DATE row) | 4.5 V2 (W5-75) | W5-D-13.1: registered. Multiple day-count bases supported via the `basis` arg. |
 
 ### Lookup & Reference
 
@@ -255,7 +255,7 @@ as partial, rows with `❌` are missing.
 | COLUMN | ✅ | 8+6 e2e | RT-V1-01 Step 2 (W5-RT-2) | W5-RT-2: symmetric to ROW; 1-indexed column index. |
 | ROWS | ✅ | 8+8 e2e | RT-V1-01 Step 2 (W5-RT-2) | W5-RT-2: row count of arg. Accepts Reference, Range, Array literal (HIGH-C: `ROWS({1,2,3;4,5,6})=2`). Whole-column `ROWS(A:A)=1_048_576`. Non-reference → `#VALUE!`; error propagation. |
 | COLUMNS | ✅ | 8+6 e2e | RT-V1-01 Step 2 (W5-RT-2) | W5-RT-2: column count; symmetric to ROWS. Whole-row `COLUMNS(1:1)=16_384`. |
-| TRANSPOSE | ❌ | 0 | 4.7 | Array-result |
+| TRANSPOSE | ✅ | 12 | 4.7.N (W5-107) | W5-D-13.1 matrix drift closure: registered via `register_unified` (array-returning Unified-ABI). Returns array; spills via the cell-boundary write_spill path. Admitted to `is_aggregate_function` since W5-107 for named-range/Range arg support. |
 | FILTER / SORT / SORTBY / UNIQUE | ❌ | 0 | 4.7 | Dynamic-array; modern Excel |
 | CHOOSE | ✅ | 5 | 4.3 V2 | W5-54 (see notes above) |
 | CHOOSEROWS / CHOOSECOLS | ❌ | 0 | 4.7 | Dynamic-array companions |

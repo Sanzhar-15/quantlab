@@ -147,8 +147,11 @@
 //!   `number_s ≤ number_s2 ≤ trials`.
 //! - `BINOM.INV(trials, probability_s, alpha)` — 3 args. Inverse via
 //!   `DiscreteCDF::inverse_cdf`, returns smallest `k` such that
-//!   `CDF(k) >= alpha`. `0 ≤ p < 1` strict-upper (DIFFERS from BINOM.
-//!   DIST which is inclusive both); `0 < alpha < 1` strict both ends.
+//!   `CDF(k) >= alpha`. `0 ≤ p ≤ 1` inclusive both (matches Microsoft
+//!   canon and BINOM.DIST; W5-D-13.1 megaudit Opus MEDIUM-2 closure
+//!   relaxed the prior strict-upper that incorrectly rejected p=1).
+//!   `0 < alpha < 1` strict both ends. Degenerate cases short-
+//!   circuited: p=0 → 0; p=1 → trials; n=0 → 0.
 //! - `NEGBINOM.DIST(number_f, number_s, probability_s, cumulative)` —
 //!   4 args. PMF (`cumulative=FALSE`) or CDF (`TRUE`). `number_f >=
 //!   0`, `number_s >= 1`, `0 < p < 1` strict both. statrs uses
@@ -1141,7 +1144,13 @@ pub fn binom_inv(args: &[Value]) -> Value {
         Ok(n) => n,
         Err(e) => return Value::Error(e),
     };
-    if trials < 0.0 || !(0.0..1.0).contains(&p) || alpha <= 0.0 || alpha >= 1.0 {
+    // **W5-D-13.1 (Phase 4.10 V1-260 megaudit Opus MEDIUM-2 closure):**
+    // accept `p == 1.0` per Microsoft canon (which says `0 <= p <= 1`
+    // inclusive). At `p = 1.0` the binomial is deterministic at `n`
+    // (every trial succeeds), so `inverse_cdf(alpha)` for any
+    // `alpha ∈ (0, 1)` is exactly `n`. Prior strict-upper `(0.0..1.0)`
+    // half-open range over-rejected this valid input.
+    if trials < 0.0 || !(0.0..=1.0).contains(&p) || alpha <= 0.0 || alpha >= 1.0 {
         return Value::Error(ErrorValue::Num);
     }
     let n = match to_u64_index(trials) {
@@ -1168,6 +1177,14 @@ pub fn binom_inv(args: &[Value]) -> Value {
     // the "IronCalc divergences" module-level section.
     if p == 0.0 || n == 0 {
         return Value::number(0.0);
+    }
+    // **W5-D-13.1 megaudit Opus MEDIUM-2 closure (p=1 short-circuit):**
+    // at `p = 1.0` the distribution is deterministic at `n` — every
+    // trial succeeds. Return `n` directly to avoid statrs corner
+    // (statrs's Binomial at p=1 has the same bisection-search-returns-
+    // None panic shape as p=0).
+    if p == 1.0 {
+        return Value::number(n as f64);
     }
     let dist = binomial_with(p, n);
     let k = dist.inverse_cdf(alpha);
@@ -1437,13 +1454,31 @@ pub fn lognorm_inv(args: &[Value]) -> Value {
 /// conversion and would hang too — we follow the W5-D-4 BINOM.INV
 /// precedent of explicitly diverging from IronCalc to protect engine
 /// availability.
+///
+/// **W5-D-13.1 (Phase 4.10 V1-260 megaudit Codex HIGH-3 closure):**
+/// the W5-D-5.1 finite-rate guard was insufficient. For finite-but-
+/// subnormal `scale` (e.g. `f64::MIN_POSITIVE / 2.0 = 1.11e-308`),
+/// `1.0 / scale ≈ 8.98e307` is finite but enormous. `Gamma::new`
+/// accepts it, but `inverse_cdf` panics inside statrs with
+/// `Result::unwrap() on Err value: XInvalid` because the
+/// distribution becomes numerically degenerate (effectively a Dirac
+/// at 0). Reject subnormal scale outright — the iterative kernels
+/// cannot operate reliably on parameters at the f64 subnormal
+/// boundary. Compiled probe verified `f64::MIN_POSITIVE` and above
+/// work; `f64::MIN_POSITIVE / 2.0` and below panic.
 fn gamma_dist_with(alpha: f64, scale: f64) -> Option<Gamma> {
+    // Reject subnormal scale to prevent statrs panic on numerically
+    // degenerate parameters. Subnormals are < f64::MIN_POSITIVE
+    // (~2.225e-308).
+    if scale < f64::MIN_POSITIVE {
+        return None;
+    }
     let rate = 1.0 / scale;
     if !rate.is_finite() {
         return None;
     }
     Some(Gamma::new(alpha, rate).expect(
-        "upstream sanitize_f64 + alpha>0 + scale>0 + finite-rate guard guarantee Gamma::new succeeds",
+        "upstream sanitize_f64 + alpha>0 + scale>=MIN_POSITIVE + finite-rate guard guarantee Gamma::new succeeds",
     ))
 }
 
@@ -4113,12 +4148,26 @@ mod tests {
     }
 
     #[test]
-    fn binom_inv_p_one_is_num_error() {
-        // p = 1 REJECTED (strict upper, differs from BINOM.DIST
-        // inclusive). Matches IronCalc.
-        assert_eq!(
-            binom_inv(&[Value::number(10.0), Value::number(1.0), Value::number(0.5),]),
-            Value::Error(ErrorValue::Num)
+    fn binom_inv_p_one_returns_trials() {
+        // **W5-D-13.1 (Phase 4.10 V1-260 megaudit Opus MEDIUM-2 closure):**
+        // p = 1 ACCEPTED per Microsoft canon (inclusive upper). At p=1
+        // the binomial is deterministic at n (every trial succeeds),
+        // so `inverse_cdf(any alpha in (0,1))` = n exactly. Prior
+        // strict-upper `(0.0..1.0)` half-open range incorrectly
+        // rejected this valid input.
+        assert_close(
+            binom_inv(&[Value::number(10.0), Value::number(1.0), Value::number(0.5)]),
+            10.0,
+        );
+        // Edge: alpha near upper limit.
+        assert_close(
+            binom_inv(&[Value::number(7.0), Value::number(1.0), Value::number(0.99)]),
+            7.0,
+        );
+        // Edge: alpha near lower limit.
+        assert_close(
+            binom_inv(&[Value::number(3.0), Value::number(1.0), Value::number(0.01)]),
+            3.0,
         );
     }
 
@@ -5149,6 +5198,72 @@ mod tests {
         );
         assert_eq!(
             gamma_inv(&[Value::number(0.5), Value::number(1.0), Value::number(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn gamma_inv_subnormal_scale_is_num_error_not_panic() {
+        // **W5-D-13.1 (Phase 4.10 V1-260 megaudit Codex HIGH-3 closure):**
+        // subnormal `beta_scale` (below f64::MIN_POSITIVE ≈ 2.225e-308)
+        // yields finite-but-enormous rate ≈ 8.98e307 which previously
+        // passed the W5-D-5.1 `is_finite()` guard and then panicked inside
+        // statrs's `inverse_cdf` with `Result::unwrap() on Err value:
+        // XInvalid`. The new `scale < f64::MIN_POSITIVE` guard in
+        // `gamma_dist_with` rejects these as `#NUM!` cleanly.
+        assert_eq!(
+            gamma_inv(&[
+                Value::number(0.5),
+                Value::number(1.0),
+                Value::number(f64::MIN_POSITIVE / 2.0),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+        // Same probe at p = 1.0 (the Codex probe).
+        assert_eq!(
+            gamma_inv(&[
+                Value::number(1.0),
+                Value::number(0.5),
+                Value::number(f64::MIN_POSITIVE / 2.0),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+        // The smallest finite-subnormal value (5e-324) also rejected.
+        assert_eq!(
+            gamma_inv(&[
+                Value::number(0.5),
+                Value::number(1.0),
+                Value::number(5e-324),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+        // f64::MIN_POSITIVE itself (normal but smallest-normal) STILL
+        // works — only subnormals are excluded.
+        match gamma_inv(&[
+            Value::number(0.5),
+            Value::number(1.0),
+            Value::number(f64::MIN_POSITIVE),
+        ]) {
+            Value::Number(_) | Value::Error(_) => {
+                // Either a number or a defensible error code — just
+                // must not panic.
+            }
+            other => panic!("unexpected result for MIN_POSITIVE: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gamma_dist_subnormal_scale_is_num_error_not_panic() {
+        // **W5-D-13.1 (Codex HIGH-3 closure):** the same subnormal-
+        // scale guard protects GAMMA.DIST (which also routes through
+        // gamma_dist_with).
+        assert_eq!(
+            gamma_dist(&[
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::number(f64::MIN_POSITIVE / 2.0),
+                Value::Boolean(false),
+            ]),
             Value::Error(ErrorValue::Num)
         );
     }

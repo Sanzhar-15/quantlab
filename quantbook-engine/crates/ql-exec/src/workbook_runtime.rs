@@ -5204,6 +5204,39 @@ mod tests {
             // is_aggregate_function so range args bind as
             // AggregateNameRef. Eval-side routes via lookup_range_aware.
             "SUBTOTAL",
+            // **W5-D-13.1 (Phase 4.10 V1-260 megaudit closure):**
+            // 28 additional range-aware fns admitted to
+            // is_aggregate_function in one batch — the same systemic
+            // gap the W5-D-12 closure caught only for SUBTOTAL. Per
+            // megaudit Codex HIGH-001 + Opus HIGH-1.
+            "CORREL",
+            "PEARSON",
+            "RSQ",
+            "STEYX",
+            "SLOPE",
+            "INTERCEPT",
+            "COVARIANCE.P",
+            "COVARIANCE.S",
+            "SUMX2MY2",
+            "SUMX2PY2",
+            "SUMXMY2",
+            "NPV",
+            "IRR",
+            "MIRR",
+            "XNPV",
+            "XIRR",
+            "XLOOKUP",
+            "XMATCH",
+            "PERCENTILE.INC",
+            "PERCENTILE.EXC",
+            "PERCENTILE",
+            "QUARTILE.INC",
+            "QUARTILE.EXC",
+            "QUARTILE",
+            "MINIFS",
+            "MAXIFS",
+            "COUNTBLANK",
+            "TEXTJOIN",
         ] {
             assert!(
                 reg.lookup_range_aware(name).is_some(),
@@ -5242,6 +5275,218 @@ mod tests {
         // a NameRef to a range used inside IF surfaces
         // NamedRangeInScalarContext (since IF's args are scalar context).
         // That behaviour is pinned by `nag_04_named_range_in_scalar_positions_errors_precisely`.
+    }
+
+    /// **W5-D-13.1 (Phase 4.10 V1-260 megaudit closure — Codex HIGH-001,
+    /// Opus HIGH-1 / HIGH-3):** prove that the 28 range-aware fns
+    /// admitted to `is_aggregate_function` in this closure actually
+    /// route range args through `AggregateNameRef` end-to-end, not just
+    /// pass the registry-lookup smoke test. This is the e2e armor the
+    /// W5-D-12 SUBTOTAL closure should have had but didn't, scaled to
+    /// cover the systemic case.
+    ///
+    /// Each test sets up a named range, then drives a formula through
+    /// `set_formula` (which exercises lex → parse → bind → eval). A
+    /// pre-W5-D-13.1 build would fail every one of these with
+    /// `Bind(NamedRangeInScalarContext("SALES"))`.
+    #[test]
+    fn w5_d_13_1_subtotal_named_range_binds_and_evaluates() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+
+        let mut wb = make_runtime_workbook();
+        wb.put_at(0, 0, 0, Value::Number(1.0));
+        wb.put_at(0, 1, 0, Value::Number(2.0));
+        wb.put_at(0, 2, 0, Value::Number(3.0));
+        wb.set_name("Sales", NamedTarget::Range(Range::new(0, 0, 0, 2, 0)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // SUBTOTAL(9, Sales) = SUM(Sales) = 6. The Codex W5-D-12
+        // HIGH-001 closure recommendation that was never shipped.
+        let v = rt.set_formula(0, 5, 0, "SUBTOTAL(9, Sales)").unwrap();
+        assert_eq!(v, Value::Number(6.0));
+        // SUBTOTAL(1, Sales) = AVERAGE(Sales) = 2.
+        let v = rt.set_formula(0, 5, 1, "SUBTOTAL(1, Sales)").unwrap();
+        assert_eq!(v, Value::Number(2.0));
+    }
+
+    #[test]
+    fn w5_d_13_1_percentile_quartile_named_range_binds_and_evaluates() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+
+        let mut wb = make_runtime_workbook();
+        for i in 0..4 {
+            wb.put_at(0, i as u32, 0, Value::Number((i + 1) as f64));
+        }
+        wb.set_name("Data", NamedTarget::Range(Range::new(0, 0, 0, 3, 0)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // PERCENTILE.INC(Data, 0.3) = 1.9 (Microsoft anchor).
+        let v = rt
+            .set_formula(0, 5, 0, "PERCENTILE.INC(Data, 0.3)")
+            .unwrap();
+        match v {
+            Value::Number(n) => assert!((n - 1.9).abs() < 1e-12, "got {n}"),
+            other => panic!("expected Number(1.9), got {other:?}"),
+        }
+        // PERCENTILE.EXC(Data, 0.25) = 1.25.
+        let v = rt
+            .set_formula(0, 5, 1, "PERCENTILE.EXC(Data, 0.25)")
+            .unwrap();
+        match v {
+            Value::Number(n) => assert!((n - 1.25).abs() < 1e-12, "got {n}"),
+            other => panic!("expected Number(1.25), got {other:?}"),
+        }
+        // QUARTILE.INC(Data, 2) = median = 2.5.
+        let v = rt.set_formula(0, 5, 2, "QUARTILE.INC(Data, 2)").unwrap();
+        match v {
+            Value::Number(n) => assert!((n - 2.5).abs() < 1e-12, "got {n}"),
+            other => panic!("expected Number(2.5), got {other:?}"),
+        }
+        // Legacy alias PERCENTILE (Excel 2010+) matches .INC.
+        let v = rt.set_formula(0, 5, 3, "PERCENTILE(Data, 0.3)").unwrap();
+        match v {
+            Value::Number(n) => assert!((n - 1.9).abs() < 1e-12, "got {n}"),
+            other => panic!("expected Number(1.9), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn w5_d_13_1_paired_array_stats_named_range_binds_and_evaluates() {
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+
+        let mut wb = make_runtime_workbook();
+        // X = [1, 2, 3, 4]; Y = [2, 4, 6, 8] — perfect linear y=2x.
+        for i in 0..4 {
+            wb.put_at(0, i as u32, 0, Value::Number((i + 1) as f64));
+            wb.put_at(0, i as u32, 1, Value::Number(((i + 1) * 2) as f64));
+        }
+        // **Note**: name must NOT collide with valid Excel column-letter
+        // patterns (e.g. `Ys` lexes as BareColumn col=668). Use names
+        // with >3 letters or underscores. `XValues`/`YValues` are safe.
+        wb.set_name("XValues", NamedTarget::Range(Range::new(0, 0, 0, 3, 0)))
+            .unwrap();
+        wb.set_name("YValues", NamedTarget::Range(Range::new(0, 0, 1, 3, 1)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // CORREL(YValues, XValues) = 1.0 (perfect positive correlation).
+        let v = rt.set_formula(0, 5, 0, "CORREL(YValues, XValues)").unwrap();
+        match v {
+            Value::Number(n) => assert!((n - 1.0).abs() < 1e-12, "got {n}"),
+            other => panic!("expected Number(1.0), got {other:?}"),
+        }
+        // SLOPE(YValues, XValues) = 2.0.
+        let v = rt.set_formula(0, 5, 1, "SLOPE(YValues, XValues)").unwrap();
+        match v {
+            Value::Number(n) => assert!((n - 2.0).abs() < 1e-12, "got {n}"),
+            other => panic!("expected Number(2.0), got {other:?}"),
+        }
+        // COVARIANCE.P(XValues, YValues) = 2.5.
+        let v = rt
+            .set_formula(0, 5, 2, "COVARIANCE.P(XValues, YValues)")
+            .unwrap();
+        match v {
+            Value::Number(n) => assert!((n - 2.5).abs() < 1e-12, "got {n}"),
+            other => panic!("expected Number(2.5), got {other:?}"),
+        }
+        // PEARSON(YValues, XValues) = 1.0 (alias of CORREL).
+        let v = rt
+            .set_formula(0, 5, 3, "PEARSON(YValues, XValues)")
+            .unwrap();
+        match v {
+            Value::Number(n) => assert!((n - 1.0).abs() < 1e-12, "got {n}"),
+            other => panic!("expected Number(1.0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn w5_d_13_1_atan2_and_sumxmy2_via_source_text() {
+        // **W5-D-13.1 (Phase 4.10 V1-260 megaudit closure — Codex HIGH-002
+        // / Opus HIGH-2):** the lexer letters>3+digit Ident-fallback
+        // makes ATAN2, SUMXMY2, and DAYS360 reachable from formula
+        // source text. End-to-end test via `set_formula`.
+        use ql_storage::NamedTarget;
+        use ql_types::Range;
+
+        let mut wb = make_runtime_workbook();
+        for i in 0..3 {
+            wb.put_at(0, i as u32, 0, Value::Number((i + 1) as f64));
+            wb.put_at(0, i as u32, 1, Value::Number((i + 1) as f64));
+        }
+        wb.set_name("XData", NamedTarget::Range(Range::new(0, 0, 0, 2, 0)))
+            .unwrap();
+        wb.set_name("YData", NamedTarget::Range(Range::new(0, 0, 1, 2, 1)))
+            .unwrap();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        // ATAN2(1, 0) = 0 (angle along +x axis; Excel arg order x, y).
+        let v = rt.set_formula(0, 5, 0, "ATAN2(1, 0)").unwrap();
+        match v {
+            Value::Number(n) => assert!((n - 0.0).abs() < 1e-12, "got {n}"),
+            other => panic!("expected Number(0.0), got {other:?}"),
+        }
+        // SUMXMY2(XData, YData) = 0 (XData == YData, so squared diffs = 0).
+        let v = rt.set_formula(0, 5, 1, "SUMXMY2(XData, YData)").unwrap();
+        match v {
+            Value::Number(n) => assert!((n - 0.0).abs() < 1e-12, "got {n}"),
+            other => panic!("expected Number(0.0), got {other:?}"),
+        }
+    }
+
+    /// **W5-D-13.1 (Phase 4.10 V1-260 megaudit closure — Codex MEDIUM-003
+    /// / Opus MEDIUM-5):** the original
+    /// `is_aggregate_function_lists_only_registered_aggregates` invariant
+    /// pins only ONE direction (matcher → registry). The OPPOSITE
+    /// direction (registry → matcher) was NEVER enforced, which is
+    /// exactly why the W5-D-12 closure shipped a SUBTOTAL-only fix
+    /// without anyone noticing that 28 other range-aware fns had the
+    /// same admission gap.
+    ///
+    /// This invariant fills the gap: every range-aware-registered fn
+    /// MUST be admitted by `is_aggregate_function`. Some range-aware
+    /// fns may legitimately NOT need range args (none currently), so
+    /// this is enforced as an allowlist of EXCEPTIONS — fns that are
+    /// range-aware-registered but deliberately not admitted.
+    ///
+    /// If a future range-aware fn is registered with scalar-only args
+    /// (no range args needed at all), it must be added to
+    /// `range_aware_fns_that_do_not_need_aggregate_admission` below
+    /// with a justification.
+    #[test]
+    fn every_range_aware_fn_is_admitted_to_is_aggregate_function() {
+        use crate::plan::is_aggregate_function;
+        let reg = default_registry();
+        // Allowlist: range-aware fns that DO NOT need is_aggregate_function
+        // admission because they don't accept range/named-range args.
+        // **Empty as of W5-D-13.1** — every range-aware-registered fn
+        // currently needs admission. If a future scalar-only RangeAwareFn
+        // ships, it must be explicitly listed here with rationale.
+        let exceptions: &[&str] = &[];
+
+        let mut missing: Vec<&str> = Vec::new();
+        for &name in reg.range_aware_names() {
+            if exceptions.contains(&name) {
+                continue;
+            }
+            if !is_aggregate_function(name) {
+                missing.push(name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "W5-D-13.1 invariant: every range-aware fn must be admitted to \
+             is_aggregate_function (binder admission gate for named-range \
+             args). Missing {} fns: {:?}. Fix: add them to the matcher in \
+             plan.rs::is_aggregate_function, OR add to the exceptions \
+             allowlist above with rationale.",
+            missing.len(),
+            missing
+        );
     }
 
     /// Phase 2B.7 audit closure (test gaps #5 and #6): the existing NAG

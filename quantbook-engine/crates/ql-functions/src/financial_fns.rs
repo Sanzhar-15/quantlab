@@ -1692,7 +1692,13 @@ fn validate_xnpv_xirr_dates(values: &[f64], dates: &[f64]) -> Result<(), ErrorVa
 /// `XNPV(rate, values, dates)` — net present value of a cash flow
 /// schedule with irregular payment periods. 3 args required.
 ///
-/// - `rate > 0` STRICT (matches IronCalc canon — `rate <= 0` → `#NUM!`).
+/// - `rate > -1` STRICT (the `(1 + rate)^t` denominator requires
+///   `1 + rate > 0`; `rate <= -1` → `#NUM!`). **W5-D-13.1 megaudit
+///   Opus LOW-3 closure:** prior strict `rate > 0` was over-strict and
+///   Excel-incompat. Excel accepts negative rates as long as
+///   `1 + rate > 0`. Microsoft docs imply `rate > 0` for the typical
+///   discount-rate semantics but actual Excel function evaluates
+///   correctly for `rate ∈ (-1, 0)`.
 /// - `values` + `dates` same length; both ranges; rejects empty/non-
 ///   numeric cells (IronCalc canon).
 /// - Dates floored to integer; all dates in `[0, 2_958_465]` (Excel
@@ -1713,7 +1719,11 @@ pub fn xnpv(args: &[FnArg]) -> Value {
         },
         FnArg::Range { .. } => return Value::Error(ErrorValue::Value),
     };
-    if rate <= 0.0 {
+    // **W5-D-13.1 megaudit Opus LOW-3 closure:** require `1 + rate > 0`
+    // (i.e., `rate > -1`), not `rate > 0`. The math requires the
+    // (1+rate)^t denominator be positive; negative rates with
+    // 1+rate > 0 are mathematically defined and Excel-canonical.
+    if rate <= -1.0 {
         return Value::Error(ErrorValue::Num);
     }
     // Per IronCalc canon: values-arg non-numeric → #NUM!;
@@ -3537,21 +3547,56 @@ mod tests {
     }
 
     #[test]
-    fn xnpv_rate_at_or_below_zero_is_num_error() {
+    fn xnpv_rate_at_or_below_negative_one_is_num_error() {
+        // **W5-D-13.1 (Phase 4.10 V1-260 megaudit Opus LOW-3 closure):**
+        // XNPV now accepts negative rates (rate ∈ (-1, 0]) per Excel
+        // canon. Only `rate <= -1` is rejected because the `(1+rate)^t`
+        // denominator requires `1+rate > 0`.
         let values = r(vec![n(-100.0), n(110.0)]);
         let dates = r(vec![n2(40000.0), n2(40365.0)]);
-        // rate = 0.
+        // rate = -1 → 1+rate = 0 → division-by-zero territory → #NUM!.
         assert_eq!(
-            xnpv(&[s(n(0.0)), values, dates]),
+            xnpv(&[s(n(-1.0)), values, dates]),
             Value::Error(ErrorValue::Num)
         );
-        // rate < 0.
+        // rate < -1 → 1+rate < 0 → fractional power undefined → #NUM!.
         let values2 = r(vec![n(-100.0), n(110.0)]);
         let dates2 = r(vec![n2(40000.0), n2(40365.0)]);
         assert_eq!(
-            xnpv(&[s(n(-0.01)), values2, dates2]),
+            xnpv(&[s(n(-1.5)), values2, dates2]),
             Value::Error(ErrorValue::Num)
         );
+    }
+
+    #[test]
+    fn xnpv_negative_rate_in_neg_one_zero_open_interval_works() {
+        // **W5-D-13.1 megaudit Opus LOW-3 closure:** rate ∈ (-1, 0)
+        // is now accepted (previously incorrectly rejected as #NUM!).
+        // For a -5% rate the discount factor (1 + r)^t < 1 for t > 0
+        // when r < 0; cash flows in the future are worth MORE than
+        // their face value.
+        let values = r(vec![n(-100.0), n(110.0)]);
+        let dates = r(vec![n2(40000.0), n2(40365.0)]);
+        // Just verify the computation succeeds and produces a finite
+        // numeric result; exact value depends on the discount formula.
+        match xnpv(&[s(n(-0.05)), values, dates]) {
+            Value::Number(v) if v.is_finite() => {
+                // Sanity: at rate=-0.05, the future +110 is discounted
+                // UP (worth more than 110). So XNPV should be > 110 -
+                // 100 = 10.
+                assert!(v > 10.0, "expected XNPV > 10 at rate=-0.05, got {v}");
+            }
+            other => panic!("expected finite Number, got {other:?}"),
+        }
+        // Rate = 0 (zero discount): XNPV ≡ sum of values.
+        let values2 = r(vec![n(-100.0), n(110.0)]);
+        let dates2 = r(vec![n2(40000.0), n2(40365.0)]);
+        match xnpv(&[s(n(0.0)), values2, dates2]) {
+            Value::Number(v) => {
+                assert!((v - 10.0).abs() < 1e-9, "rate=0 sum should be 10, got {v}");
+            }
+            other => panic!("expected Number(10.0), got {other:?}"),
+        }
     }
 
     #[test]

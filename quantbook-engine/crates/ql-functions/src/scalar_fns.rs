@@ -3477,10 +3477,20 @@ fn parse_places_arg(args: &[Value]) -> Result<Option<i32>, ErrorValue> {
     if args.len() != 2 {
         return Ok(None);
     }
-    let p = match coercion::to_number_strict(&args[1]) {
-        Ok(n) => n.trunc() as i32,
-        Err(e) => return Err(e),
-    };
+    let raw = coercion::to_number_strict(&args[1])?;
+    // **W5-D-13.1 (Phase 4.10 V1-260 megaudit Opus LOW-1 closure):**
+    // explicit NaN guard for defense-in-depth consistency with the
+    // W5-D-11.1 `extract_quartile_q` and W5-D-12 SUBTOTAL guards. The
+    // upstream `to_number_strict` → `sanitize_f64` already rejects NaN
+    // here, but a future refactor that swaps the coercion path could
+    // silently leak NaN to the `as i32` saturating cast (NaN → 0 in
+    // safe-cast Rust ≥1.45), which would fall outside the (1..=10)
+    // bound and surface as #NUM! anyway — but the explicit guard
+    // makes the contract clear.
+    if raw.is_nan() {
+        return Err(ErrorValue::Num);
+    }
+    let p = raw.trunc() as i32;
     if !(1..=10).contains(&p) {
         return Err(ErrorValue::Num);
     }
@@ -3603,22 +3613,37 @@ pub fn dec2hex(args: &[Value]) -> Value {
     )
 }
 
-/// **BIN2DEC(number)** — binary digits (as a numeric input) → decimal.
+/// **BIN2DEC(number)** — binary digits → decimal.
 ///
-/// - 1 arg required. Excel canon: input is a NUMBER (not a string),
-///   stringified and parsed as base-2 digits. So `BIN2DEC(101) = 5`,
+/// - 1 arg required. Excel canon: input accepted as Number, Text,
+///   Boolean, or Blank — all are stringified per
+///   `collect_base_decode_arg` then parsed as base-2 digits. So
+///   `BIN2DEC(101) = 5`, `BIN2DEC("101") = 5`,
 ///   `BIN2DEC(1111111111) = -1` (high bit treated as sign).
+/// - **W5-D-13.1 (Phase 4.10 V1-260 megaudit Opus MEDIUM-1 closure):**
+///   refactored to use `collect_base_decode_arg` for parity with
+///   HEX2DEC / OCT2DEC. Prior impl used `to_number_strict` which
+///   rejected Text input — a divergence from Excel canon (Excel
+///   accepts `BIN2DEC("101")`) and from the sibling base-conversion
+///   fns (HEX2DEC / OCT2DEC accept Text).
 /// - Non-binary digits in the stringified form → `#NUM!`.
 pub fn bin2dec(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::Error(ErrorValue::Value);
     }
-    let raw = match coercion::to_number_strict(&args[0]) {
-        Ok(n) => n,
+    let text = match collect_base_decode_arg(&args[0]) {
+        Ok(s) => s,
         Err(e) => return Value::Error(e),
     };
-    // Stringify then parse as base 2. Matches IronCalc's pattern.
-    let text = format!("{raw}");
+    // Excel canon: empty input → 0 (matches HEX2DEC/OCT2DEC). Empty
+    // string from a Blank arg.
+    if text.is_empty() {
+        return Value::Number(0.0);
+    }
+    // Length > 10 chars → #NUM! (matches the BIN_MAX 10-digit bound).
+    if text.len() > 10 {
+        return Value::Error(ErrorValue::Num);
+    }
     let parsed = match i64::from_str_radix(&text, 2) {
         Ok(n) => n,
         Err(_) => return Value::Error(ErrorValue::Num),
@@ -7664,8 +7689,23 @@ mod tests {
     }
 
     #[test]
-    fn bin2dec_text_arg_is_value_error() {
-        assert_eq!(bin2dec(&[t("101")]), Value::Error(ErrorValue::Value));
+    fn bin2dec_text_arg_now_accepted() {
+        // **W5-D-13.1 (Phase 4.10 V1-260 megaudit Opus MEDIUM-1 closure):**
+        // BIN2DEC now accepts Text input for parity with HEX2DEC /
+        // OCT2DEC and Excel canon. `BIN2DEC("101") = 5` (same as
+        // `BIN2DEC(101)`). Prior strict-Text-rejection was an
+        // engine-internal divergence not justified by Excel docs.
+        assert_eq!(bin2dec(&[t("101")]), Value::Number(5.0));
+        assert_eq!(bin2dec(&[t("1111111111")]), Value::Number(-1.0));
+        // Non-binary digits in text → #NUM!.
+        assert_eq!(bin2dec(&[t("102")]), Value::Error(ErrorValue::Num));
+        assert_eq!(bin2dec(&[t("not_binary")]), Value::Error(ErrorValue::Num));
+        // Boolean and Blank also accepted (parity with HEX2DEC).
+        assert_eq!(
+            bin2dec(&[Value::Boolean(true)]),
+            Value::Error(ErrorValue::Num)
+        ); // "TRUE" not binary
+        assert_eq!(bin2dec(&[Value::Blank]), Value::Number(0.0)); // "" → 0
     }
 
     #[test]

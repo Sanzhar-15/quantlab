@@ -5713,6 +5713,36 @@ mod tests {
     }
 
     #[test]
+    fn subtotal_nested_subtotal_value_in_args_not_skipped_engine_divergence() {
+        // **W5-D-13.1 (Phase 4.10 V1-260 megaudit Opus MEDIUM-4 closure):**
+        // pin the documented engine divergence from Excel for nested-
+        // SUBTOTAL handling. Excel canon: outer SUBTOTAL skips any
+        // arg-range cells whose formula is also a SUBTOTAL (the
+        // "subtotal of subtotals" double-counting guard). v1 engine
+        // does NOT have AST access at eval time — by the time
+        // `subtotal()` receives FnArgs, nested-SUBTOTAL values look
+        // identical to ordinary numeric values. So our engine sums
+        // them in.
+        //
+        // This test pins the engine's behavior: passing a scalar value
+        // that simulates the result of a nested SUBTOTAL (here just a
+        // plain `3` representing `SUBTOTAL(9, 1, 2)` = 3) is treated
+        // as a regular numeric value and summed. A future refactor
+        // that walks ExprPlan to detect nested-SUBTOTAL calls (a path
+        // toward Excel parity) would break this test, which is the
+        // signal we want.
+        //
+        // Test data: outer = SUBTOTAL(9, [pre-computed inner sum=3], 4)
+        // → 7. Excel: outer would skip the inner-SUBTOTAL result → 4.
+        let pre_computed_inner_sum = n(3.0);
+        let other_data = n(4.0);
+        assert_eq!(
+            subtotal(&[s(n(9.0)), s(pre_computed_inner_sum), s(other_data)]),
+            Value::Number(7.0)
+        );
+    }
+
+    #[test]
     fn subtotal_scalar_data_args_supported() {
         // SUBTOTAL(9, 1, 2, 3) = 6 (scalar data args treated like a
         // 1-element range each).
