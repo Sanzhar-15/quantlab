@@ -815,6 +815,86 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
          which accept p=0 inclusive), p>1 #NUM!, df<1 #NUM!, \
          text/error/arity); scalar arg-coverage matrix N/A",
     ),
+    // W5-D-4 (Wave 3 distributions batch — discrete + remaining
+    // continuous). BINOM.* / NEGBINOM.* / POISSON.* / EXPON.* /
+    // LOGNORM.*. statrs Binomial / NegativeBinomial / Poisson /
+    // LogNormal kernels + closed-form EXPON.DIST. First
+    // discrete-distribution batch. **W5-D-4.1 (Codex LOW-2 + Opus
+    // MEDIUM-O-3 closure):** Per-fn ≥8 tests (design § 7 MEDIUM-δ
+    // threshold; actual counts range 8-11 per fn). Closed-form
+    // anchors for symmetric / degenerate cases.
+    (
+        "BINOM.DIST",
+        "distribution fn (W5-D-4) — covered by distribution_fns unit \
+         tests (pmf(0)=1/1024 and pmf(5)=252/1024 for n=10 p=0.5 \
+         closed-form anchors, CDF(0)=pmf(0), CDF(n)=1, k>n #NUM!, p \
+         outside [0,1] #NUM!, negative k #NUM!, text/error/arity-both, \
+         degenerate-n=0 regression); scalar arg-coverage matrix N/A. \
+         W5-D-4.1 closure of Opus LOW-O-1: dropped pmf(10) claim — \
+         test not pinned (would be redundant with pmf(0) by symmetry).",
+    ),
+    (
+        "BINOM.DIST.RANGE",
+        "distribution fn (W5-D-4, VARIADIC 3-or-4) — covered by \
+         distribution_fns unit tests (full range [0,n]=1, single-point \
+         3-arg form = pmf, middle window [4,6]=672/1024, lower==0 \
+         short-circuit (avoids cdf(0-1) underflow), reversed range \
+         #NUM!, upper>trials #NUM!, text/error/arity); scalar \
+         arg-coverage matrix N/A",
+    ),
+    (
+        "BINOM.INV",
+        "distribution fn (W5-D-4) — covered by distribution_fns unit \
+         tests (smallest k with CDF(k)>=alpha; for n=10 p=0.5 \
+         alpha=0.5 → k=5; tiny-alpha anchor; **p=1 STRICT** (diverges \
+         from BINOM.DIST inclusive both ends), p=0 ACCEPTED via \
+         inline degenerate-distribution short-circuit (statrs's \
+         default inverse_cdf panics on degenerate; documented), \
+         alpha strict (0,1), text/error/arity); scalar arg-coverage \
+         matrix N/A",
+    ),
+    (
+        "NEGBINOM.DIST",
+        "distribution fn (W5-D-4) — covered by distribution_fns unit \
+         tests (pmf(0;r=1,p=0.5)=p^r=0.5, pmf(1;r=1,p=0.5)=(1-p)·p=0.25, \
+         CDF(0)=pmf(0)=0.5 closed-form, r<1 #NUM!, p at strict \
+         endpoints #NUM!, negative f #NUM!, text/error/arity); scalar \
+         arg-coverage matrix N/A",
+    ),
+    (
+        "POISSON.DIST",
+        "distribution fn (W5-D-4) — covered by distribution_fns unit \
+         tests (pmf(0;λ=1)=e^-1 closed-form, CDF(1;λ=1)=2e^-1 \
+         closed-form, **λ=0 degenerate special case** (statrs rejects; \
+         handled inline; P(X=0)=1, P(X>0)=0, CDF=1 for any k≥0), \
+         negative x or λ #NUM!, text/error/arity); scalar arg-coverage \
+         matrix N/A",
+    ),
+    (
+        "EXPON.DIST",
+        "distribution fn (W5-D-4) — covered by distribution_fns unit \
+         tests (closed-form CDF=1-e^(-λx) PDF=λe^(-λx); PDF(0;λ=1)=1, \
+         CDF(0)=0, CDF(1;λ=1)=1-e^-1, PDF(1;λ=1)=e^-1, CDF(1;λ=2) \
+         anchor, x<0 #NUM!, λ<=0 STRICT #NUM!, text/error/arity); \
+         scalar arg-coverage matrix N/A. **No statrs kernel** — pure \
+         closed-form math.",
+    ),
+    (
+        "LOGNORM.DIST",
+        "distribution fn (W5-D-4) — covered by distribution_fns unit \
+         tests (CDF(1;μ=0,σ=1) = Φ(0) = 0.5 closed-form, PDF(1;μ=0,σ=1) \
+         = 1/√(2π) closed-form, negative μ accepted (underlying \
+         normal's mean), x≤0 STRICT #NUM!, σ≤0 STRICT #NUM!, \
+         text/error/arity); scalar arg-coverage matrix N/A",
+    ),
+    (
+        "LOGNORM.INV",
+        "distribution fn (W5-D-4) — covered by distribution_fns unit \
+         tests (LOGNORM.INV(0.5,μ,σ) = exp(μ) median closed-form for \
+         μ=0 (=1) and μ=5 (=e^5), round-trip with LOGNORM.DIST, \
+         p∈(0,1) STRICT both ends, σ≤0 #NUM!, text/error/arity); \
+         scalar arg-coverage matrix N/A",
+    ),
 ];
 
 #[test]

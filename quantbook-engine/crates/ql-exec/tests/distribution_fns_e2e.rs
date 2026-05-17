@@ -530,3 +530,220 @@ fn chisq_f_dist_arity_mismatch_through_dispatcher_returns_value() {
     assert_eq!(eval("F.DIST()"), Value::Error(ErrorValue::Value));
     assert_eq!(eval("F.INV.RT()"), Value::Error(ErrorValue::Value));
 }
+
+// =====================================================================
+// W5-D-4: Discrete + remaining continuous distributions
+// =====================================================================
+//
+// First discrete-distribution batch. BINOM.DIST.RANGE is variadic
+// (3 or 4 args). Verify dispatcher routes correctly for both arities.
+
+// ---------------------------------------------------------------------
+// BINOM.DIST
+// ---------------------------------------------------------------------
+
+#[test]
+fn binom_dist_pmf_at_zero_through_dispatcher_closed_form() {
+    // pmf(0; n=10, p=0.5) = 1/1024.
+    assert_close(eval("BINOM.DIST(0, 10, 0.5, FALSE)"), 1.0 / 1024.0);
+}
+
+#[test]
+fn binom_dist_pmf_at_five_through_dispatcher_closed_form() {
+    // pmf(5; n=10, p=0.5) = 252/1024.
+    assert_close(eval("BINOM.DIST(5, 10, 0.5, FALSE)"), 252.0 / 1024.0);
+}
+
+#[test]
+fn binom_dist_cdf_at_n_through_dispatcher_returns_one() {
+    assert_close(eval("BINOM.DIST(10, 10, 0.5, TRUE)"), 1.0);
+}
+
+#[test]
+fn binom_dist_k_greater_than_n_through_dispatcher_returns_num_error() {
+    assert_eq!(
+        eval("BINOM.DIST(11, 10, 0.5, TRUE)"),
+        Value::Error(ErrorValue::Num)
+    );
+}
+
+// ---------------------------------------------------------------------
+// BINOM.DIST.RANGE
+// ---------------------------------------------------------------------
+
+#[test]
+fn binom_dist_range_full_through_dispatcher_returns_one() {
+    assert_close(eval("BINOM.DIST.RANGE(10, 0.5, 0, 10)"), 1.0);
+}
+
+#[test]
+fn binom_dist_range_three_arg_form_through_dispatcher() {
+    // 3-arg form = single-point probability = pmf.
+    assert_close(eval("BINOM.DIST.RANGE(10, 0.5, 5)"), 252.0 / 1024.0);
+}
+
+#[test]
+fn binom_dist_range_reversed_through_dispatcher_returns_num_error() {
+    assert_eq!(
+        eval("BINOM.DIST.RANGE(10, 0.5, 6, 4)"),
+        Value::Error(ErrorValue::Num)
+    );
+}
+
+// ---------------------------------------------------------------------
+// BINOM.INV
+// ---------------------------------------------------------------------
+
+#[test]
+fn binom_inv_through_dispatcher_returns_smallest_k_with_cdf_at_least_alpha() {
+    assert_close(eval("BINOM.INV(10, 0.5, 0.5)"), 5.0);
+}
+
+#[test]
+fn binom_inv_p_one_through_dispatcher_returns_num_error() {
+    // p = 1 STRICT (diverges from BINOM.DIST inclusive).
+    assert_eq!(eval("BINOM.INV(10, 1, 0.5)"), Value::Error(ErrorValue::Num));
+}
+
+#[test]
+fn binom_inv_trials_zero_through_dispatcher_panic_regression() {
+    // **W5-D-4.1 (Codex HIGH-1 + Opus HIGH-O-1 closure):** end-to-end
+    // panic-regression pin for `BINOM.INV(0, p, alpha)` (trials=0
+    // degenerate). Without the inline `n == 0` short-circuit, statrs's
+    // `DiscreteCDF::inverse_cdf` panics through
+    // `integral_bisection_search.unwrap()`. Returns 0 (the only valid k
+    // for a distribution concentrated at 0).
+    assert_close(eval("BINOM.INV(0, 0.5, 0.5)"), 0.0);
+}
+
+// ---------------------------------------------------------------------
+// NEGBINOM.DIST
+// ---------------------------------------------------------------------
+
+#[test]
+fn negbinom_dist_pmf_at_zero_through_dispatcher_closed_form() {
+    // pmf(0; r=1, p=0.5) = 0.5.
+    assert_close(eval("NEGBINOM.DIST(0, 1, 0.5, FALSE)"), 0.5);
+}
+
+#[test]
+fn negbinom_dist_r_zero_through_dispatcher_returns_num_error() {
+    assert_eq!(
+        eval("NEGBINOM.DIST(0, 0.5, 0.5, FALSE)"),
+        Value::Error(ErrorValue::Num)
+    );
+}
+
+// ---------------------------------------------------------------------
+// POISSON.DIST
+// ---------------------------------------------------------------------
+
+#[test]
+fn poisson_dist_pmf_at_zero_lambda_one_through_dispatcher() {
+    assert_close(eval("POISSON.DIST(0, 1, FALSE)"), (-1.0_f64).exp());
+}
+
+#[test]
+fn poisson_dist_lambda_zero_degenerate_through_dispatcher() {
+    // λ=0 special case: P(X=0) = 1.
+    assert_close(eval("POISSON.DIST(0, 0, FALSE)"), 1.0);
+    // P(X=5) = 0 for degenerate-at-0.
+    assert_close(eval("POISSON.DIST(5, 0, FALSE)"), 0.0);
+}
+
+#[test]
+fn poisson_dist_negative_lambda_through_dispatcher_returns_num_error() {
+    assert_eq!(
+        eval("POISSON.DIST(0, -1, FALSE)"),
+        Value::Error(ErrorValue::Num)
+    );
+}
+
+// ---------------------------------------------------------------------
+// EXPON.DIST
+// ---------------------------------------------------------------------
+
+#[test]
+fn expon_dist_cdf_at_one_lambda_one_through_dispatcher() {
+    assert_close(eval("EXPON.DIST(1, 1, TRUE)"), 1.0 - (-1.0_f64).exp());
+}
+
+#[test]
+fn expon_dist_pdf_at_zero_through_dispatcher_returns_lambda() {
+    assert_close(eval("EXPON.DIST(0, 2, FALSE)"), 2.0);
+}
+
+#[test]
+fn expon_dist_lambda_zero_through_dispatcher_returns_num_error() {
+    assert_eq!(
+        eval("EXPON.DIST(1, 0, TRUE)"),
+        Value::Error(ErrorValue::Num)
+    );
+}
+
+// ---------------------------------------------------------------------
+// LOGNORM.DIST
+// ---------------------------------------------------------------------
+
+#[test]
+fn lognorm_dist_cdf_at_one_standard_through_dispatcher_returns_half() {
+    assert_close(eval("LOGNORM.DIST(1, 0, 1, TRUE)"), 0.5);
+}
+
+#[test]
+fn lognorm_dist_x_zero_through_dispatcher_returns_num_error() {
+    assert_eq!(
+        eval("LOGNORM.DIST(0, 0, 1, TRUE)"),
+        Value::Error(ErrorValue::Num)
+    );
+}
+
+// ---------------------------------------------------------------------
+// LOGNORM.INV
+// ---------------------------------------------------------------------
+
+#[test]
+fn lognorm_inv_median_through_dispatcher_returns_exp_mean() {
+    assert_close(eval("LOGNORM.INV(0.5, 0, 1)"), 1.0);
+}
+
+#[test]
+fn lognorm_inv_p_one_through_dispatcher_returns_num_error() {
+    assert_eq!(eval("LOGNORM.INV(1, 0, 1)"), Value::Error(ErrorValue::Num));
+}
+
+// ---------------------------------------------------------------------
+// Cross-cutting: case-insensitivity + nested round-trip + arity
+// ---------------------------------------------------------------------
+
+#[test]
+fn binom_poisson_case_insensitive_lookup_works() {
+    assert_close(eval("binom.dist(0, 10, 0.5, FALSE)"), 1.0 / 1024.0);
+    assert_close(eval("Binom.Dist.Range(10, 0.5, 0, 10)"), 1.0);
+    assert_close(eval("poisson.dist(0, 1, FALSE)"), (-1.0_f64).exp());
+    assert_close(eval("LogNorm.Inv(0.5, 0, 1)"), 1.0);
+}
+
+#[test]
+fn lognorm_inv_dist_round_trip_through_dispatcher() {
+    // Nested LOGNORM.DIST(LOGNORM.INV(p, μ, σ), μ, σ, TRUE) ≈ p.
+    let inner = eval("LOGNORM.INV(0.73, 1, 0.5)");
+    let x = match inner {
+        Value::Number(n) => n,
+        other => panic!("LOGNORM.INV returned {other:?}"),
+    };
+    let formula = format!("LOGNORM.DIST({x}, 1, 0.5, TRUE)");
+    assert_close(eval(&formula), 0.73);
+}
+
+#[test]
+fn w5_d_4_arity_mismatch_through_dispatcher_returns_value() {
+    assert_eq!(eval("BINOM.DIST()"), Value::Error(ErrorValue::Value));
+    assert_eq!(eval("BINOM.DIST.RANGE()"), Value::Error(ErrorValue::Value));
+    assert_eq!(eval("BINOM.INV()"), Value::Error(ErrorValue::Value));
+    assert_eq!(eval("NEGBINOM.DIST()"), Value::Error(ErrorValue::Value));
+    assert_eq!(eval("POISSON.DIST()"), Value::Error(ErrorValue::Value));
+    assert_eq!(eval("EXPON.DIST()"), Value::Error(ErrorValue::Value));
+    assert_eq!(eval("LOGNORM.DIST()"), Value::Error(ErrorValue::Value));
+    assert_eq!(eval("LOGNORM.INV()"), Value::Error(ErrorValue::Value));
+}

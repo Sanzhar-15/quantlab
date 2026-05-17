@@ -4,9 +4,14 @@
 //!   normal-distribution PDF / CDF / inverse-CDF.
 //! - **W5-D-2**: T.DIST / T.DIST.2T / T.DIST.RT / T.INV / T.INV.2T —
 //!   Student's t-distribution variants.
-//! - **W5-D-3 (this commit)**: CHISQ.DIST / CHISQ.DIST.RT / CHISQ.INV /
+//! - **W5-D-3**: CHISQ.DIST / CHISQ.DIST.RT / CHISQ.INV /
 //!   CHISQ.INV.RT + F.DIST / F.DIST.RT / F.INV / F.INV.RT —
 //!   chi-squared and Fisher-Snedecor F distribution variants.
+//! - **W5-D-4 (this commit)**: BINOM.DIST / BINOM.DIST.RANGE /
+//!   BINOM.INV / NEGBINOM.DIST / POISSON.DIST / EXPON.DIST /
+//!   LOGNORM.DIST / LOGNORM.INV — discrete (binomial + neg-binomial +
+//!   Poisson) + continuous (exponential + log-normal) distributions.
+//!   **First discrete-distribution batch.**
 //!
 //! ## Implementation strategy
 //!
@@ -19,6 +24,15 @@
 //! - **CHISQ.\*** → `statrs::distribution::ChiSquared` (freedom=df)
 //! - **F.\*** → `statrs::distribution::FisherSnedecor` (freedom_1=df1,
 //!   freedom_2=df2)
+//! - **BINOM.\*** → `statrs::distribution::Binomial` (probability=p,
+//!   trials=n)
+//! - **NEGBINOM.\*** → `statrs::distribution::NegativeBinomial`
+//!   (successes=r, probability=p)
+//! - **POISSON.\*** → `statrs::distribution::Poisson` (lambda=mean)
+//! - **EXPON.\*** → closed-form (no statrs needed):
+//!   CDF=`1 - exp(-λx)`, PDF=`λ·exp(-λx)`.
+//! - **LOGNORM.\*** → `statrs::distribution::LogNormal` (location=mean,
+//!   scale=sd) — parameters are the underlying normal's mean / sd.
 //!
 //! For inputs that successfully coerce to identical f64 tuples, our
 //! `dist.pdf(x)` / `dist.cdf(x)` / `dist.inverse_cdf(p)` calls produce
@@ -93,6 +107,39 @@
 //!   returns `inverse_cdf(1 - p)`. `0 < p <= 1` (lower-strict,
 //!   upper-inclusive per IronCalc canon).
 //!
+//! **W5-D-4 (discrete + remaining continuous):**
+//!
+//! - `BINOM.DIST(number_s, trials, probability_s, cumulative)` — 4
+//!   args. PMF (`cumulative=FALSE`) or CDF (`TRUE`).
+//!   `number_s.trunc()` in `[0, trials]`; `trials.trunc() >= 0`;
+//!   `0 <= p <= 1`. Else `#NUM!`. `number_s`, `trials` converted to
+//!   u64 via truncation + u64::MAX bounds check.
+//! - `BINOM.DIST.RANGE(trials, probability_s, number_s, [number_s2])`
+//!   — **VARIADIC** 3 or 4 args. Returns `P(number_s ≤ X ≤
+//!   number_s2)`. When `number_s2` omitted, defaults to `number_s`
+//!   (single-point probability). Same domain checks plus
+//!   `number_s ≤ number_s2 ≤ trials`.
+//! - `BINOM.INV(trials, probability_s, alpha)` — 3 args. Inverse via
+//!   `DiscreteCDF::inverse_cdf`, returns smallest `k` such that
+//!   `CDF(k) >= alpha`. `0 ≤ p < 1` strict-upper (DIFFERS from BINOM.
+//!   DIST which is inclusive both); `0 < alpha < 1` strict both ends.
+//! - `NEGBINOM.DIST(number_f, number_s, probability_s, cumulative)` —
+//!   4 args. PMF (`cumulative=FALSE`) or CDF (`TRUE`). `number_f >=
+//!   0`, `number_s >= 1`, `0 < p < 1` strict both. statrs uses
+//!   `NegativeBinomial::new(number_s, probability_s)`.
+//! - `POISSON.DIST(x, mean, cumulative)` — 3 args. PMF or CDF.
+//!   `x.trunc() >= 0`, `mean >= 0` (NOT strict — `mean=0` accepted,
+//!   degenerate at 0). Else `#NUM!`. Special-case `mean == 0.0`
+//!   handled inline (statrs rejects `Poisson::new(0.0)`).
+//! - `EXPON.DIST(x, lambda, cumulative)` — 3 args. Closed-form, no
+//!   statrs: `CDF = 1 - exp(-λx)`, `PDF = λ·exp(-λx)`. `x >= 0`,
+//!   `lambda > 0` strict. Else `#NUM!`.
+//! - `LOGNORM.DIST(x, mean, standard_dev, cumulative)` — 4 args. PDF
+//!   or CDF. `x > 0` STRICT (log-normal undefined at 0); `sd > 0`
+//!   strict. `mean` is the underlying normal's mean (can be negative).
+//! - `LOGNORM.INV(probability, mean, standard_dev)` — 3 args. Inverse
+//!   CDF. `0 < p < 1` strict both; `sd > 0`.
+//!
 //! ## Arg coercion
 //!
 //! Numeric args (`x`, `mean`, `sd`, `prob`, `deg_freedom`) are coerced
@@ -132,6 +179,19 @@
 //! stability vs `1 - dist.cdf(x)` in the far right tail; F.DIST.RT
 //! uses `1 - dist.cdf(x)` matching IronCalc canon.
 //!
+//! **W5-D-4 (BINOM.\* / NEGBINOM.\* / POISSON.\* fns)** convert
+//! integer-typed args (`number_s`, `trials`, `number_s2`, `number_f`,
+//! `x` for POISSON) from f64 to u64 via `.trunc()` after pre-checking
+//! `>= 0.0 && <= u64::MAX as f64`. statrs's discrete distributions
+//! (`Binomial`, `NegativeBinomial`, `Poisson`) take u64 args for the
+//! observation point. Negative or NaN integer args → `#NUM!`.
+//! **POISSON.DIST `mean == 0.0`** is special-cased inline (statrs's
+//! `Poisson::new(0.0)` rejects); we return the degenerate-at-0
+//! distribution (`P(X=0)=1`, `P(X>0)=0`, `CDF(k)=1` for any k≥0).
+//! **EXPON.DIST** uses closed-form math directly (no statrs Continuous
+//! kernel needed); kept here for module cohesion since the rest of
+//! W5-D-4 is statrs-backed.
+//!
 //! **Microsoft canon divergences in W5-D-3 (W5-D-3.1 Codex LOW-3
 //! closure):**
 //!
@@ -148,6 +208,18 @@
 //! 3. **F-pdf at `x=0` with `df1=2`**: Microsoft + true math give 1;
 //!    statrs returns 0 (special-cases the 0/0 limit by zeroing). We
 //!    inherit statrs's behavior; no test pinned for this corner.
+//!
+//! **W5-D-4.1 (Codex HIGH-1 + Opus MEDIUM-O-2 closure): BINOM.INV
+//! degenerate-distribution panic avoidance.** IronCalc has the same
+//! statrs 0.18.0 pin as we do, and would panic for `BINOM.INV(0,
+//! 0.5, 0.5)` (trials=0) or `BINOM.INV(10, 0, 0.5)` (p=0) — statrs's
+//! default `DiscreteCDF::inverse_cdf` calls `integral_bisection_search`
+//! which returns `None` for constant-CDF (degenerate) distributions,
+//! then `.unwrap()`s. We short-circuit both corners explicitly and
+//! return the mathematically-correct value 0 (only valid `k` for a
+//! distribution concentrated at 0). **This is an intentional IronCalc-
+//! divergent behavior** — Microsoft canon doesn't cover these corners,
+//! and producing a value beats producing a panic.
 //!
 //! ## IronCalc divergences (W5-D-1.1 doc closure of Opus HIGH-O-2)
 //!
@@ -172,10 +244,30 @@
 //! errors to `#NUM!` (closer to Excel canon).
 
 use statrs::distribution::{
-    ChiSquared, Continuous, ContinuousCDF, FisherSnedecor, Normal, StudentsT,
+    Binomial, ChiSquared, Continuous, ContinuousCDF, Discrete, DiscreteCDF, FisherSnedecor,
+    LogNormal, NegativeBinomial, Normal, Poisson, StudentsT,
 };
 
 use ql_types::{coercion, ErrorValue, Value};
+
+/// **W5-D-4 helper**: coerce an f64 to u64 for discrete-distribution
+/// observation indices. Returns `None` if the value is negative, NaN,
+/// or `>= u64::MAX as f64`. Caller pre-truncates via `.trunc()`.
+///
+/// **W5-D-4.1 (Codex MEDIUM-1 + Opus MEDIUM-O-1 closure):** the upper
+/// guard is `>=` not `>` because `u64::MAX as f64` rounds up to `2^64`
+/// in IEEE-754. With the looser `>` check, the f64 value `2^64.0`
+/// would pass the guard, and `as u64` saturation would silently yield
+/// `u64::MAX` — violating the "exceeds u64::MAX → #NUM!" contract.
+/// Using `>=` against `u64::MAX as f64` (= `2^64.0`) rejects both
+/// `2^64` and anything above.
+fn to_u64_index(v: f64) -> Option<u64> {
+    if v.is_nan() || v < 0.0 || v >= u64::MAX as f64 {
+        None
+    } else {
+        Some(v as u64)
+    }
+}
 
 /// **W5-D-3 canon ceiling for chi-squared degrees of freedom.** IronCalc
 /// caps `df` at 10^10 (in `chisq.rs`) to avoid pathological compute
@@ -816,6 +908,429 @@ pub fn f_inv_rt(args: &[Value]) -> Value {
         return Value::Error(ErrorValue::Num);
     }
     Value::number(x)
+}
+
+// =====================================================================
+// W5-D-4: Binomial distribution (BINOM.DIST / BINOM.DIST.RANGE /
+// BINOM.INV) — first discrete distribution
+// =====================================================================
+//
+// `statrs::Binomial::new(p, n)` parameterizes by probability AND trial
+// count. Observation point passed as u64 to `cdf` / `pmf`. statrs
+// rejects NaN p, p outside [0, 1].
+
+/// Build a Binomial distribution. Call sites pre-check
+/// `0 <= p <= 1` (NaN already rejected by `to_number_strict`) so
+/// `Binomial::new` cannot fail. `.expect()` per No-Fallbacks rule.
+fn binomial_with(p: f64, n: u64) -> Binomial {
+    Binomial::new(p, n)
+        .expect("upstream sanitize_f64 + p in [0,1] pre-check guarantee Binomial::new succeeds")
+}
+
+/// **BINOM.DIST(number_s, trials, probability_s, cumulative)** —
+/// binomial PMF (`cumulative=FALSE`) or CDF (`cumulative=TRUE`).
+///
+/// - Args: 4 required.
+/// - `number_s.trunc()` in `[0, trials]`; `trials.trunc() >= 0`;
+///   `0 <= p <= 1` (inclusive both ends). Else `#NUM!`.
+/// - `trials` capped at `u64::MAX` (overflow → `#NUM!`).
+pub fn binom_dist(args: &[Value]) -> Value {
+    if args.len() != 4 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let number_s = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    let trials = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    let p = match coercion::to_number_strict(&args[2]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let cumulative = match coercion::to_logical(&args[3]) {
+        Ok(b) => b,
+        Err(e) => return Value::Error(e),
+    };
+    if trials < 0.0 || number_s < 0.0 || number_s > trials || !(0.0..=1.0).contains(&p) {
+        return Value::Error(ErrorValue::Num);
+    }
+    let n = match to_u64_index(trials) {
+        Some(n) => n,
+        None => return Value::Error(ErrorValue::Num),
+    };
+    let k = match to_u64_index(number_s) {
+        Some(k) => k,
+        None => return Value::Error(ErrorValue::Num),
+    };
+    let dist = binomial_with(p, n);
+    finite_or_num(if cumulative { dist.cdf(k) } else { dist.pmf(k) })
+}
+
+/// **BINOM.DIST.RANGE(trials, probability_s, number_s, [number_s2])**
+/// — probability of `[number_s, number_s2]` successes in `trials`
+/// independent trials. **VARIADIC** (3 or 4 args). When `number_s2`
+/// omitted, defaults to `number_s` (single-point probability =
+/// `dist.pmf(number_s)`).
+///
+/// Computed as `CDF(upper) - CDF(lower - 1)` when `lower > 0`, else
+/// `CDF(upper)` directly. (**W5-D-4.1 Opus LOW-O-5 closure**: prior
+/// comment said "underflow"; in Rust, `0u64 - 1u64` is debug-panic /
+/// release-wrap, not undefined behavior. The short-circuit avoids
+/// that branch entirely.)
+pub fn binom_dist_range(args: &[Value]) -> Value {
+    if !(3..=4).contains(&args.len()) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let trials = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    let p = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let number_s = match coercion::to_number_strict(&args[2]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    let number_s2 = if args.len() == 4 {
+        match coercion::to_number_strict(&args[3]) {
+            Ok(n) => n.trunc(),
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        number_s
+    };
+    if trials < 0.0
+        || number_s < 0.0
+        || number_s2 < 0.0
+        || number_s > number_s2
+        || number_s2 > trials
+        || !(0.0..=1.0).contains(&p)
+    {
+        return Value::Error(ErrorValue::Num);
+    }
+    let n = match to_u64_index(trials) {
+        Some(n) => n,
+        None => return Value::Error(ErrorValue::Num),
+    };
+    let lower = match to_u64_index(number_s) {
+        Some(v) => v,
+        None => return Value::Error(ErrorValue::Num),
+    };
+    let upper = match to_u64_index(number_s2) {
+        Some(v) => v,
+        None => return Value::Error(ErrorValue::Num),
+    };
+    let dist = binomial_with(p, n);
+    let prob = if lower == 0 {
+        dist.cdf(upper)
+    } else {
+        dist.cdf(upper) - dist.cdf(lower - 1)
+    };
+    // **W5-D-4.1 (Opus LOW-O-3 closure):** apply the same fp-drift
+    // defense as CHISQ.DIST.RT / F.DIST.RT (negative-result reject) —
+    // `cdf(upper) - cdf(lower - 1)` is mathematically `>= 0` but
+    // statrs's two cdf calls each have their own rounding error;
+    // subtracting them can produce a slightly-negative result near
+    // the tails. Surface as `#NUM!` rather than silently propagating
+    // a nonsensical negative probability.
+    if !prob.is_finite() || prob < 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    Value::number(prob)
+}
+
+/// **BINOM.INV(trials, probability_s, alpha)** — smallest `k` such
+/// that `CDF(k) >= alpha`. Returns the result as a Number.
+///
+/// - Args: 3 required.
+/// - `trials >= 0`, `0 <= p < 1` (note: STRICT upper for `p`,
+///   inclusive lower — diverges from BINOM.DIST inclusive-both),
+///   `0 < alpha < 1` strict both. Else `#NUM!`.
+pub fn binom_inv(args: &[Value]) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let trials = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    let p = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let alpha = match coercion::to_number_strict(&args[2]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    if trials < 0.0 || !(0.0..1.0).contains(&p) || alpha <= 0.0 || alpha >= 1.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let n = match to_u64_index(trials) {
+        Some(n) => n,
+        None => return Value::Error(ErrorValue::Num),
+    };
+    // **W5-D-4.1 (Codex HIGH-1 + Opus HIGH-O-1 closure):** Short-circuit
+    // **both** known statrs degenerate-distribution panics for Binomial:
+    //
+    // 1. `p == 0.0`: distribution is degenerate at 0 (P(X=0)=1).
+    //    `Binomial::new(0.0, n)` succeeds, but `cdf(k) = 1.0` for all
+    //    `k >= 0` means the default `DiscreteCDF::inverse_cdf`'s
+    //    `integral_bisection_search` returns `None` → `.unwrap()`
+    //    panics.
+    // 2. `n == 0` (trials == 0): single-point distribution at 0 for any
+    //    `p`. `Binomial::new(p, 0)` succeeds, `cdf(0) = 1.0`,
+    //    same bisection-search-returns-None panic shape.
+    //
+    // For both: the only valid `k` (smallest with `CDF(k) >= alpha` for
+    // any `alpha ∈ (0, 1)`) is 0. **This diverges from IronCalc**,
+    // which has the same statrs pin and would also panic on these
+    // inputs. Microsoft canon doesn't cover these corners; the
+    // mathematical interpretation gives 0 unambiguously. Documented in
+    // the "IronCalc divergences" module-level section.
+    if p == 0.0 || n == 0 {
+        return Value::number(0.0);
+    }
+    let dist = binomial_with(p, n);
+    let k = dist.inverse_cdf(alpha);
+    Value::number(k as f64)
+}
+
+// =====================================================================
+// W5-D-4: Negative-binomial distribution (NEGBINOM.DIST)
+// =====================================================================
+//
+// `statrs::NegativeBinomial::new(r, p)` parameterizes by successes
+// (`r`, can be fractional) AND probability. `r` doesn't need u64
+// conversion — statrs accepts f64. Observation `number_f` (failures)
+// is u64.
+
+/// Build a NegativeBinomial. Call sites pre-check `r >= 1` AND
+/// `0 < p < 1` strict both; `to_number_strict` rejects NaN.
+fn negative_binomial_with(r: f64, p: f64) -> NegativeBinomial {
+    NegativeBinomial::new(r, p).expect(
+        "upstream sanitize_f64 + r>=1 + p in (0,1) pre-check guarantee NegativeBinomial::new succeeds",
+    )
+}
+
+/// **NEGBINOM.DIST(number_f, number_s, probability_s, cumulative)** —
+/// PMF or CDF.
+///
+/// - Args: 4 required.
+/// - `number_f >= 0`, `number_s >= 1` (truncated), `0 < p < 1` strict
+///   both. Else `#NUM!`.
+pub fn negbinom_dist(args: &[Value]) -> Value {
+    if args.len() != 4 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let number_f = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    let number_s = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    let p = match coercion::to_number_strict(&args[2]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let cumulative = match coercion::to_logical(&args[3]) {
+        Ok(b) => b,
+        Err(e) => return Value::Error(e),
+    };
+    if number_f < 0.0 || number_s < 1.0 || p <= 0.0 || p >= 1.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let f_u = match to_u64_index(number_f) {
+        Some(v) => v,
+        None => return Value::Error(ErrorValue::Num),
+    };
+    let dist = negative_binomial_with(number_s, p);
+    finite_or_num(if cumulative {
+        dist.cdf(f_u)
+    } else {
+        dist.pmf(f_u)
+    })
+}
+
+// =====================================================================
+// W5-D-4: Poisson distribution (POISSON.DIST)
+// =====================================================================
+//
+// `statrs::Poisson::new(lambda)` requires `lambda > 0`. `lambda == 0`
+// is the degenerate distribution at 0 — handled inline since statrs
+// rejects.
+
+/// Build a Poisson distribution. Call sites pre-check `lambda > 0.0`;
+/// `to_number_strict` rejects NaN. (`lambda == 0` is handled inline
+/// in `poisson_dist`, never reaches this helper.)
+fn poisson_with(lambda: f64) -> Poisson {
+    Poisson::new(lambda)
+        .expect("upstream sanitize_f64 + lambda > 0 pre-check guarantee Poisson::new succeeds")
+}
+
+/// **POISSON.DIST(x, mean, cumulative)** — Poisson PMF or CDF.
+///
+/// - Args: 3 required.
+/// - `x.trunc() >= 0` (cast to u64); `mean >= 0` (NOT strict — `mean=0`
+///   accepted, degenerate at 0). Else `#NUM!`.
+/// - **Special case `mean == 0.0`**: returns degenerate distribution
+///   (`P(X=0)=1`, `P(X>0)=0`; `CDF(k)=1` for any `k >= 0`). statrs's
+///   `Poisson::new(0.0)` rejects, so this is handled inline.
+pub fn poisson_dist(args: &[Value]) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let x = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    let lambda = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let cumulative = match coercion::to_logical(&args[2]) {
+        Ok(b) => b,
+        Err(e) => return Value::Error(e),
+    };
+    if x < 0.0 || lambda < 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let k = match to_u64_index(x) {
+        Some(v) => v,
+        None => return Value::Error(ErrorValue::Num),
+    };
+    // Special-case lambda == 0.0: degenerate distribution at 0.
+    // For cumulative: CDF(k) = 1 for any k >= 0. For PMF: P(X=0) = 1,
+    // P(X>0) = 0.
+    if lambda == 0.0 {
+        let result = if cumulative || k == 0 { 1.0 } else { 0.0 };
+        return Value::number(result);
+    }
+    let dist = poisson_with(lambda);
+    finite_or_num(if cumulative { dist.cdf(k) } else { dist.pmf(k) })
+}
+
+// =====================================================================
+// W5-D-4: Exponential distribution (EXPON.DIST) — closed-form
+// =====================================================================
+//
+// No statrs kernel — closed-form math directly. Kept in this module
+// for cohesion with the rest of the distribution fns.
+
+/// **EXPON.DIST(x, lambda, cumulative)** — exponential PDF or CDF.
+/// Closed-form: `CDF(x) = 1 - exp(-λx)`, `PDF(x) = λ·exp(-λx)`.
+///
+/// - Args: 3 required.
+/// - `x >= 0`; `lambda > 0` STRICT. Else `#NUM!`.
+pub fn expon_dist(args: &[Value]) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let x = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let lambda = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let cumulative = match coercion::to_logical(&args[2]) {
+        Ok(b) => b,
+        Err(e) => return Value::Error(e),
+    };
+    if x < 0.0 || lambda <= 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let result = if cumulative {
+        1.0 - (-lambda * x).exp()
+    } else {
+        lambda * (-lambda * x).exp()
+    };
+    finite_or_num(result)
+}
+
+// =====================================================================
+// W5-D-4: Log-normal distribution (LOGNORM.DIST / LOGNORM.INV)
+// =====================================================================
+//
+// `statrs::LogNormal::new(location, scale)` parameterizes by the
+// underlying normal's mean (location) and sd (scale). LogNormal::new
+// rejects NaN location or `scale <= 0`; pre-check + coercion rule
+// these out.
+
+/// Build a LogNormal. Call sites pre-check `sd > 0.0`;
+/// `to_number_strict` rejects NaN on both args.
+fn log_normal_with(mean: f64, sd: f64) -> LogNormal {
+    LogNormal::new(mean, sd)
+        .expect("upstream sanitize_f64 + sd > 0 pre-check guarantee LogNormal::new succeeds")
+}
+
+/// **LOGNORM.DIST(x, mean, standard_dev, cumulative)** — log-normal
+/// PDF or CDF.
+///
+/// - Args: 4 required.
+/// - `x > 0` STRICT (log-normal is undefined at x=0); `sd > 0` STRICT.
+///   Else `#NUM!`. `mean` may be negative (it's the underlying
+///   normal's mean).
+pub fn lognorm_dist(args: &[Value]) -> Value {
+    if args.len() != 4 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let x = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let mean = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let sd = match coercion::to_number_strict(&args[2]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let cumulative = match coercion::to_logical(&args[3]) {
+        Ok(b) => b,
+        Err(e) => return Value::Error(e),
+    };
+    if x <= 0.0 || sd <= 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let dist = log_normal_with(mean, sd);
+    finite_or_num(if cumulative { dist.cdf(x) } else { dist.pdf(x) })
+}
+
+/// **LOGNORM.INV(probability, mean, standard_dev)** — inverse
+/// log-normal CDF.
+///
+/// - Args: 3 required.
+/// - `0 < p < 1` STRICT both; `sd > 0` strict. Else `#NUM!`.
+pub fn lognorm_inv(args: &[Value]) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let p = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let mean = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let sd = match coercion::to_number_strict(&args[2]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    if p <= 0.0 || p >= 1.0 || sd <= 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let dist = log_normal_with(mean, sd);
+    finite_or_num(dist.inverse_cdf(p))
 }
 
 // =====================================================================
@@ -2698,6 +3213,1106 @@ mod tests {
                 Value::number(5.0),
                 Value::number(10.0),
                 Value::number(0.0)
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== BINOM.DIST =====
+    //
+    // Closed-form anchors: for n=10, p=0.5, pmf(k) = C(10, k) / 1024.
+    // pmf(0) = 1/1024, pmf(5) = 252/1024, pmf(10) = 1/1024.
+    // CDF(k) = sum_{i=0..k} pmf(i).
+
+    #[test]
+    fn binom_dist_pmf_at_zero_n_10_p_half_closed_form() {
+        // pmf(0; 10, 0.5) = 0.5^10 = 1/1024.
+        assert_close(
+            binom_dist(&[
+                Value::number(0.0),
+                Value::number(10.0),
+                Value::number(0.5),
+                Value::Boolean(false),
+            ]),
+            1.0 / 1024.0,
+        );
+    }
+
+    #[test]
+    fn binom_dist_pmf_at_five_n_10_p_half_closed_form() {
+        // pmf(5; 10, 0.5) = C(10, 5) / 1024 = 252/1024.
+        assert_close(
+            binom_dist(&[
+                Value::number(5.0),
+                Value::number(10.0),
+                Value::number(0.5),
+                Value::Boolean(false),
+            ]),
+            252.0 / 1024.0,
+        );
+    }
+
+    #[test]
+    fn binom_dist_cdf_at_n_returns_one() {
+        // CDF(10; 10, 0.5) = 1.0 (all outcomes).
+        assert_close(
+            binom_dist(&[
+                Value::number(10.0),
+                Value::number(10.0),
+                Value::number(0.5),
+                Value::Boolean(true),
+            ]),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn binom_dist_cdf_at_zero_equals_pmf_zero() {
+        // CDF(0) = pmf(0) = 1/1024.
+        assert_close(
+            binom_dist(&[
+                Value::number(0.0),
+                Value::number(10.0),
+                Value::number(0.5),
+                Value::Boolean(true),
+            ]),
+            1.0 / 1024.0,
+        );
+    }
+
+    #[test]
+    fn binom_dist_k_greater_than_n_is_num_error() {
+        assert_eq!(
+            binom_dist(&[
+                Value::number(11.0),
+                Value::number(10.0),
+                Value::number(0.5),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn binom_dist_p_outside_unit_is_num_error() {
+        // p > 1.
+        assert_eq!(
+            binom_dist(&[
+                Value::number(5.0),
+                Value::number(10.0),
+                Value::number(1.5),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+        // p < 0.
+        assert_eq!(
+            binom_dist(&[
+                Value::number(5.0),
+                Value::number(10.0),
+                Value::number(-0.1),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn binom_dist_negative_k_is_num_error() {
+        assert_eq!(
+            binom_dist(&[
+                Value::number(-1.0),
+                Value::number(10.0),
+                Value::number(0.5),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn binom_dist_trials_at_u64_max_boundary_is_num_error() {
+        // **W5-D-4.1 (Codex MEDIUM-1 + Opus MEDIUM-O-1 closure):**
+        // `u64::MAX as f64` rounds up to `2^64` in IEEE-754. The
+        // `to_u64_index` helper uses `>=` not `>` to reject this
+        // boundary value cleanly. With the looser `>` check, `2^64.0`
+        // would pass the guard and `as u64` would silently saturate
+        // to `u64::MAX`. This test pins the boundary rejection.
+        let two_pow_64 = u64::MAX as f64; // = 2^64.0 due to f64 rounding
+        assert_eq!(
+            binom_dist(&[
+                Value::number(0.0),
+                Value::number(two_pow_64),
+                Value::number(0.5),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn binom_dist_text_arg_is_value_error() {
+        assert_eq!(
+            binom_dist(&[
+                Value::text("nope"),
+                Value::number(10.0),
+                Value::number(0.5),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn binom_dist_error_arg_propagates() {
+        assert_eq!(
+            binom_dist(&[
+                Value::Error(ErrorValue::Ref),
+                Value::number(10.0),
+                Value::number(0.5),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn binom_dist_arity_mismatch_returns_value() {
+        assert_eq!(binom_dist(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            binom_dist(&[Value::number(5.0), Value::number(10.0), Value::number(0.5),]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            binom_dist(&[
+                Value::number(5.0),
+                Value::number(10.0),
+                Value::number(0.5),
+                Value::Boolean(true),
+                Value::number(0.0),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== BINOM.DIST.RANGE =====
+
+    #[test]
+    fn binom_dist_range_full_returns_one() {
+        // [0, 10] covers all outcomes — sum = 1.
+        assert_close(
+            binom_dist_range(&[
+                Value::number(10.0),
+                Value::number(0.5),
+                Value::number(0.0),
+                Value::number(10.0),
+            ]),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn binom_dist_range_single_point_equals_pmf() {
+        // [5, 5] = pmf(5) = 252/1024.
+        assert_close(
+            binom_dist_range(&[
+                Value::number(10.0),
+                Value::number(0.5),
+                Value::number(5.0),
+                Value::number(5.0),
+            ]),
+            252.0 / 1024.0,
+        );
+    }
+
+    #[test]
+    fn binom_dist_range_three_arg_form_is_single_point() {
+        // When number_s2 omitted, defaults to number_s — same as
+        // [number_s, number_s] = pmf(number_s).
+        assert_close(
+            binom_dist_range(&[Value::number(10.0), Value::number(0.5), Value::number(5.0)]),
+            252.0 / 1024.0,
+        );
+    }
+
+    #[test]
+    fn binom_dist_range_middle_window_4_to_6() {
+        // [4, 6] = pmf(4) + pmf(5) + pmf(6)
+        //        = (210 + 252 + 210) / 1024 = 672/1024.
+        assert_close(
+            binom_dist_range(&[
+                Value::number(10.0),
+                Value::number(0.5),
+                Value::number(4.0),
+                Value::number(6.0),
+            ]),
+            672.0 / 1024.0,
+        );
+    }
+
+    #[test]
+    fn binom_dist_range_lower_zero_equals_cdf_upper() {
+        // [0, k] = CDF(k). This pins the `if lower == 0` branch in
+        // the impl that avoids the `cdf(0 - 1)` branch (would
+        // debug-panic / release-wrap on u64).
+        // CDF(5; 10, 0.5) = 638/1024.
+        assert_close(
+            binom_dist_range(&[
+                Value::number(10.0),
+                Value::number(0.5),
+                Value::number(0.0),
+                Value::number(5.0),
+            ]),
+            638.0 / 1024.0,
+        );
+    }
+
+    #[test]
+    fn binom_dist_range_lower_above_upper_is_num_error() {
+        assert_eq!(
+            binom_dist_range(&[
+                Value::number(10.0),
+                Value::number(0.5),
+                Value::number(6.0),
+                Value::number(4.0),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn binom_dist_range_upper_above_trials_is_num_error() {
+        assert_eq!(
+            binom_dist_range(&[
+                Value::number(10.0),
+                Value::number(0.5),
+                Value::number(5.0),
+                Value::number(11.0),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn binom_dist_range_text_arg_is_value_error() {
+        assert_eq!(
+            binom_dist_range(&[Value::text("ten"), Value::number(0.5), Value::number(0.0),]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn binom_dist_range_error_arg_propagates() {
+        assert_eq!(
+            binom_dist_range(&[
+                Value::Error(ErrorValue::DivZero),
+                Value::number(0.5),
+                Value::number(0.0),
+            ]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn binom_dist_range_arity_mismatch_returns_value() {
+        assert_eq!(binom_dist_range(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            binom_dist_range(&[Value::number(10.0), Value::number(0.5)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            binom_dist_range(&[
+                Value::number(10.0),
+                Value::number(0.5),
+                Value::number(0.0),
+                Value::number(5.0),
+                Value::number(0.0),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== BINOM.INV =====
+
+    #[test]
+    fn binom_inv_smallest_k_with_cdf_at_least_half() {
+        // CDF(5; 10, 0.5) = 638/1024 ≈ 0.623 — first k where CDF >= 0.5.
+        // (CDF(4) = 386/1024 ≈ 0.377.)
+        assert_close(
+            binom_inv(&[Value::number(10.0), Value::number(0.5), Value::number(0.5)]),
+            5.0,
+        );
+    }
+
+    #[test]
+    fn binom_inv_small_alpha_returns_small_k() {
+        // alpha = 0.001: CDF(0) = 1/1024 ≈ 0.000977 < 0.001;
+        // CDF(1) = 11/1024 ≈ 0.01074 >= 0.001 ⇒ k = 1.
+        assert_close(
+            binom_inv(&[
+                Value::number(10.0),
+                Value::number(0.5),
+                Value::number(0.001),
+            ]),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn binom_inv_p_one_is_num_error() {
+        // p = 1 REJECTED (strict upper, differs from BINOM.DIST
+        // inclusive). Matches IronCalc.
+        assert_eq!(
+            binom_inv(&[Value::number(10.0), Value::number(1.0), Value::number(0.5),]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn binom_inv_p_zero_accepted_but_returns_zero() {
+        // p = 0 ACCEPTED (inclusive lower). Binomial with p=0 is
+        // degenerate at 0, so inverse_cdf(any alpha) = 0.
+        assert_close(
+            binom_inv(&[Value::number(10.0), Value::number(0.0), Value::number(0.5)]),
+            0.0,
+        );
+    }
+
+    #[test]
+    fn binom_inv_trials_zero_returns_zero_panic_regression() {
+        // **W5-D-4.1 (Codex HIGH-1 + Opus HIGH-O-1 closure):** trials=0
+        // is also a degenerate Binomial distribution (single point at
+        // 0, regardless of p). Without the inline `n == 0`
+        // short-circuit, statrs's `DiscreteCDF::inverse_cdf` panics
+        // via `integral_bisection_search` returning `None`. This
+        // regression test pins the panic-avoidance behavior.
+        assert_close(
+            binom_inv(&[Value::number(0.0), Value::number(0.5), Value::number(0.5)]),
+            0.0,
+        );
+    }
+
+    #[test]
+    fn binom_dist_trials_zero_degenerate_pmf_at_zero() {
+        // **W5-D-4.1 (Opus LOW-O-4 closure):** BINOM.DIST with
+        // trials=0 (degenerate single-point at 0). statrs's
+        // `Binomial::pmf(0)` with n=0 returns 1.0. Pins this
+        // non-panicking degenerate corner so a future change to
+        // `binom_dist` can't regress.
+        assert_close(
+            binom_dist(&[
+                Value::number(0.0),
+                Value::number(0.0),
+                Value::number(0.5),
+                Value::Boolean(false),
+            ]),
+            1.0,
+        );
+        // CDF(0; 0, p) = 1.0 (all probability at the only outcome).
+        assert_close(
+            binom_dist(&[
+                Value::number(0.0),
+                Value::number(0.0),
+                Value::number(0.5),
+                Value::Boolean(true),
+            ]),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn binom_inv_alpha_outside_strict_unit_is_num_error() {
+        // alpha = 0 STRICT lower.
+        assert_eq!(
+            binom_inv(&[Value::number(10.0), Value::number(0.5), Value::number(0.0),]),
+            Value::Error(ErrorValue::Num)
+        );
+        // alpha = 1 STRICT upper.
+        assert_eq!(
+            binom_inv(&[Value::number(10.0), Value::number(0.5), Value::number(1.0),]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn binom_inv_negative_trials_is_num_error() {
+        assert_eq!(
+            binom_inv(&[Value::number(-1.0), Value::number(0.5), Value::number(0.5),]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn binom_inv_text_arg_is_value_error() {
+        assert_eq!(
+            binom_inv(&[Value::text("ten"), Value::number(0.5), Value::number(0.5),]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn binom_inv_error_arg_propagates() {
+        assert_eq!(
+            binom_inv(&[
+                Value::Error(ErrorValue::Ref),
+                Value::number(0.5),
+                Value::number(0.5),
+            ]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn binom_inv_arity_mismatch_returns_value() {
+        assert_eq!(binom_inv(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            binom_inv(&[Value::number(10.0), Value::number(0.5)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            binom_inv(&[
+                Value::number(10.0),
+                Value::number(0.5),
+                Value::number(0.5),
+                Value::number(0.0),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== NEGBINOM.DIST =====
+    //
+    // NegativeBinomial(r=successes, p): NEGBINOM.DIST(f, r, p,
+    // cumulative) where f=failures. For r=1, p=0.5: pmf(0) = p^1 = 0.5
+    // (probability of 0 failures before 1st success), pmf(1) =
+    // (1-p)*p = 0.25, pmf(2) = (1-p)^2 * p = 0.125.
+
+    #[test]
+    fn negbinom_dist_pmf_at_zero_r_1_p_half_closed_form() {
+        // pmf(0; r=1, p=0.5) = 0.5^1 = 0.5.
+        assert_close(
+            negbinom_dist(&[
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::number(0.5),
+                Value::Boolean(false),
+            ]),
+            0.5,
+        );
+    }
+
+    #[test]
+    fn negbinom_dist_pmf_at_one_r_1_p_half_closed_form() {
+        // pmf(1; r=1, p=0.5) = 0.5 * 0.5 = 0.25.
+        assert_close(
+            negbinom_dist(&[
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::number(0.5),
+                Value::Boolean(false),
+            ]),
+            0.25,
+        );
+    }
+
+    #[test]
+    fn negbinom_dist_cdf_at_zero_r_1_p_half_closed_form() {
+        // CDF(0) = pmf(0) = 0.5.
+        assert_close(
+            negbinom_dist(&[
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::number(0.5),
+                Value::Boolean(true),
+            ]),
+            0.5,
+        );
+    }
+
+    #[test]
+    fn negbinom_dist_number_s_less_than_one_is_num_error() {
+        assert_eq!(
+            negbinom_dist(&[
+                Value::number(0.0),
+                Value::number(0.5),
+                Value::number(0.5),
+                Value::Boolean(false),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn negbinom_dist_p_at_endpoints_is_num_error() {
+        // p = 0 STRICT lower.
+        assert_eq!(
+            negbinom_dist(&[
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::number(0.0),
+                Value::Boolean(false),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+        // p = 1 STRICT upper.
+        assert_eq!(
+            negbinom_dist(&[
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(false),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn negbinom_dist_negative_failures_is_num_error() {
+        assert_eq!(
+            negbinom_dist(&[
+                Value::number(-1.0),
+                Value::number(1.0),
+                Value::number(0.5),
+                Value::Boolean(false),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn negbinom_dist_text_arg_is_value_error() {
+        assert_eq!(
+            negbinom_dist(&[
+                Value::text("nope"),
+                Value::number(1.0),
+                Value::number(0.5),
+                Value::Boolean(false),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn negbinom_dist_error_arg_propagates() {
+        assert_eq!(
+            negbinom_dist(&[
+                Value::Error(ErrorValue::DivZero),
+                Value::number(1.0),
+                Value::number(0.5),
+                Value::Boolean(false),
+            ]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn negbinom_dist_arity_mismatch_returns_value() {
+        assert_eq!(negbinom_dist(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            negbinom_dist(&[Value::number(0.0), Value::number(1.0), Value::number(0.5),]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            negbinom_dist(&[
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::number(0.5),
+                Value::Boolean(false),
+                Value::number(0.0),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== POISSON.DIST =====
+
+    #[test]
+    fn poisson_dist_pmf_at_zero_lambda_one_closed_form() {
+        // pmf(0; λ=1) = e^-1 ≈ 0.367879441.
+        assert_close(
+            poisson_dist(&[
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::Boolean(false),
+            ]),
+            (-1.0_f64).exp(),
+        );
+    }
+
+    #[test]
+    fn poisson_dist_cdf_at_one_lambda_one_closed_form() {
+        // CDF(1; λ=1) = pmf(0) + pmf(1) = e^-1 + e^-1 = 2*e^-1.
+        assert_close(
+            poisson_dist(&[Value::number(1.0), Value::number(1.0), Value::Boolean(true)]),
+            2.0 * (-1.0_f64).exp(),
+        );
+    }
+
+    #[test]
+    fn poisson_dist_lambda_zero_degenerate_pmf_at_zero() {
+        // Special case: λ=0 → degenerate at 0. P(X=0) = 1, P(X>0) = 0.
+        assert_close(
+            poisson_dist(&[
+                Value::number(0.0),
+                Value::number(0.0),
+                Value::Boolean(false),
+            ]),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn poisson_dist_lambda_zero_degenerate_pmf_at_positive_k() {
+        assert_close(
+            poisson_dist(&[
+                Value::number(5.0),
+                Value::number(0.0),
+                Value::Boolean(false),
+            ]),
+            0.0,
+        );
+    }
+
+    #[test]
+    fn poisson_dist_lambda_zero_degenerate_cdf_at_any_k() {
+        // CDF for degenerate is 1.0 for any k >= 0.
+        assert_close(
+            poisson_dist(&[Value::number(5.0), Value::number(0.0), Value::Boolean(true)]),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn poisson_dist_negative_x_is_num_error() {
+        assert_eq!(
+            poisson_dist(&[
+                Value::number(-1.0),
+                Value::number(1.0),
+                Value::Boolean(false),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn poisson_dist_negative_lambda_is_num_error() {
+        assert_eq!(
+            poisson_dist(&[
+                Value::number(0.0),
+                Value::number(-0.5),
+                Value::Boolean(false),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn poisson_dist_text_arg_is_value_error() {
+        assert_eq!(
+            poisson_dist(&[
+                Value::text("five"),
+                Value::number(1.0),
+                Value::Boolean(false),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn poisson_dist_error_arg_propagates() {
+        assert_eq!(
+            poisson_dist(&[
+                Value::Error(ErrorValue::Ref),
+                Value::number(1.0),
+                Value::Boolean(false),
+            ]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn poisson_dist_arity_mismatch_returns_value() {
+        assert_eq!(poisson_dist(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            poisson_dist(&[Value::number(0.0), Value::number(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            poisson_dist(&[
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::Boolean(false),
+                Value::number(0.0),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== EXPON.DIST =====
+    //
+    // Closed-form: CDF(x) = 1 - exp(-λx), PDF(x) = λ·exp(-λx).
+
+    #[test]
+    fn expon_dist_pdf_at_zero_lambda_one_closed_form() {
+        // PDF(0; λ=1) = 1 * exp(0) = 1.
+        assert_close(
+            expon_dist(&[
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::Boolean(false),
+            ]),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn expon_dist_cdf_at_zero_returns_zero() {
+        assert_close(
+            expon_dist(&[Value::number(0.0), Value::number(1.0), Value::Boolean(true)]),
+            0.0,
+        );
+    }
+
+    #[test]
+    fn expon_dist_cdf_at_one_lambda_one_closed_form() {
+        // CDF(1; λ=1) = 1 - e^-1.
+        assert_close(
+            expon_dist(&[Value::number(1.0), Value::number(1.0), Value::Boolean(true)]),
+            1.0 - (-1.0_f64).exp(),
+        );
+    }
+
+    #[test]
+    fn expon_dist_pdf_at_one_lambda_one_closed_form() {
+        // PDF(1; λ=1) = 1 * e^-1.
+        assert_close(
+            expon_dist(&[
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(false),
+            ]),
+            (-1.0_f64).exp(),
+        );
+    }
+
+    #[test]
+    fn expon_dist_lambda_2_at_1_cdf() {
+        // CDF(1; λ=2) = 1 - e^-2.
+        assert_close(
+            expon_dist(&[Value::number(1.0), Value::number(2.0), Value::Boolean(true)]),
+            1.0 - (-2.0_f64).exp(),
+        );
+    }
+
+    #[test]
+    fn expon_dist_negative_x_is_num_error() {
+        assert_eq!(
+            expon_dist(&[
+                Value::number(-1.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn expon_dist_lambda_zero_or_negative_is_num_error() {
+        // λ = 0 STRICT.
+        assert_eq!(
+            expon_dist(&[Value::number(1.0), Value::number(0.0), Value::Boolean(true),]),
+            Value::Error(ErrorValue::Num)
+        );
+        // λ < 0.
+        assert_eq!(
+            expon_dist(&[
+                Value::number(1.0),
+                Value::number(-0.5),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn expon_dist_text_arg_is_value_error() {
+        assert_eq!(
+            expon_dist(&[Value::text("x"), Value::number(1.0), Value::Boolean(true),]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn expon_dist_error_arg_propagates() {
+        assert_eq!(
+            expon_dist(&[
+                Value::Error(ErrorValue::Ref),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn expon_dist_arity_mismatch_returns_value() {
+        assert_eq!(expon_dist(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            expon_dist(&[Value::number(1.0), Value::number(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            expon_dist(&[
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+                Value::number(0.0),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== LOGNORM.DIST =====
+    //
+    // LogNormal(μ, σ): X = exp(N(μ, σ²)). For μ=0, σ=1 at x=1:
+    // CDF(1) = Φ((ln(1) - 0)/1) = Φ(0) = 0.5.
+    // PDF(1) = 1/(x·σ·√(2π)) · exp(-(ln(x)-μ)²/(2σ²))
+    //        = 1/(1 · 1 · √(2π)) · exp(0) = 1/√(2π).
+
+    #[test]
+    fn lognorm_dist_cdf_at_one_standard_returns_half() {
+        // CDF(1; μ=0, σ=1) = Φ(0) = 0.5.
+        assert_close(
+            lognorm_dist(&[
+                Value::number(1.0),
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            0.5,
+        );
+    }
+
+    #[test]
+    fn lognorm_dist_pdf_at_one_standard_closed_form() {
+        // PDF(1; μ=0, σ=1) = 1/√(2π) ≈ 0.39894228.
+        assert_close(
+            lognorm_dist(&[
+                Value::number(1.0),
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::Boolean(false),
+            ]),
+            1.0 / (2.0 * std::f64::consts::PI).sqrt(),
+        );
+    }
+
+    #[test]
+    fn lognorm_dist_negative_mean_accepted() {
+        // mean (μ) may be negative (it's the underlying normal's mean).
+        // Sanity: positive result for valid inputs.
+        let result = lognorm_dist(&[
+            Value::number(1.0),
+            Value::number(-2.0),
+            Value::number(1.0),
+            Value::Boolean(true),
+        ]);
+        match result {
+            Value::Number(n) => {
+                assert!((0.0..=1.0).contains(&n), "CDF out of range: {n}");
+            }
+            other => panic!("expected Number, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lognorm_dist_x_zero_or_negative_is_num_error() {
+        // x = 0 STRICT (log-normal undefined at 0).
+        assert_eq!(
+            lognorm_dist(&[
+                Value::number(0.0),
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+        // x < 0.
+        assert_eq!(
+            lognorm_dist(&[
+                Value::number(-1.0),
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn lognorm_dist_sd_zero_or_negative_is_num_error() {
+        assert_eq!(
+            lognorm_dist(&[
+                Value::number(1.0),
+                Value::number(0.0),
+                Value::number(0.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            lognorm_dist(&[
+                Value::number(1.0),
+                Value::number(0.0),
+                Value::number(-1.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn lognorm_dist_text_arg_is_value_error() {
+        assert_eq!(
+            lognorm_dist(&[
+                Value::text("x"),
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn lognorm_dist_error_arg_propagates() {
+        assert_eq!(
+            lognorm_dist(&[
+                Value::Error(ErrorValue::Ref),
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn lognorm_dist_arity_mismatch_returns_value() {
+        assert_eq!(lognorm_dist(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            lognorm_dist(&[Value::number(1.0), Value::number(0.0), Value::number(1.0),]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            lognorm_dist(&[
+                Value::number(1.0),
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+                Value::number(0.0),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== LOGNORM.INV =====
+
+    #[test]
+    fn lognorm_inv_median_at_half_returns_exp_mean() {
+        // LogNormal median = exp(μ). For μ=0: median = 1.
+        assert_close(
+            lognorm_inv(&[Value::number(0.5), Value::number(0.0), Value::number(1.0)]),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn lognorm_inv_median_with_nonzero_mean() {
+        // LogNormal(μ=5, σ=1) median = exp(5) ≈ 148.413159.
+        assert_close(
+            lognorm_inv(&[Value::number(0.5), Value::number(5.0), Value::number(1.0)]),
+            5.0_f64.exp(),
+        );
+    }
+
+    #[test]
+    fn lognorm_inv_inverse_of_lognorm_dist_round_trip() {
+        // lognorm_dist(lognorm_inv(p, μ, σ), μ, σ, TRUE) ≈ p.
+        let p = 0.73;
+        let mean = 1.5;
+        let sd = 0.5;
+        let x = match lognorm_inv(&[Value::number(p), Value::number(mean), Value::number(sd)]) {
+            Value::Number(n) => n,
+            other => panic!("LOGNORM.INV returned {other:?}"),
+        };
+        let p_back = match lognorm_dist(&[
+            Value::number(x),
+            Value::number(mean),
+            Value::number(sd),
+            Value::Boolean(true),
+        ]) {
+            Value::Number(n) => n,
+            other => panic!("LOGNORM.DIST returned {other:?}"),
+        };
+        assert!(approx(p, p_back, 1e-12));
+    }
+
+    #[test]
+    fn lognorm_inv_p_at_endpoints_is_num_error() {
+        // p = 0 STRICT lower.
+        assert_eq!(
+            lognorm_inv(&[Value::number(0.0), Value::number(0.0), Value::number(1.0),]),
+            Value::Error(ErrorValue::Num)
+        );
+        // p = 1 STRICT upper.
+        assert_eq!(
+            lognorm_inv(&[Value::number(1.0), Value::number(0.0), Value::number(1.0),]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn lognorm_inv_sd_zero_is_num_error() {
+        assert_eq!(
+            lognorm_inv(&[Value::number(0.5), Value::number(0.0), Value::number(0.0),]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn lognorm_inv_text_arg_is_value_error() {
+        assert_eq!(
+            lognorm_inv(&[Value::text("half"), Value::number(0.0), Value::number(1.0),]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn lognorm_inv_error_arg_propagates() {
+        assert_eq!(
+            lognorm_inv(&[
+                Value::Error(ErrorValue::Ref),
+                Value::number(0.0),
+                Value::number(1.0),
+            ]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn lognorm_inv_arity_mismatch_returns_value() {
+        assert_eq!(lognorm_inv(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            lognorm_inv(&[Value::number(0.5), Value::number(0.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            lognorm_inv(&[
+                Value::number(0.5),
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::number(0.0),
             ]),
             Value::Error(ErrorValue::Value)
         );

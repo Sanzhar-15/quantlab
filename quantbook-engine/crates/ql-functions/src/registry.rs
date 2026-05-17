@@ -845,6 +845,22 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("F.INV", distribution_fns::f_inv);
     r.register("F.INV.RT", distribution_fns::f_inv_rt);
 
+    // **W5-D-4 (Wave 3 distributions batch — discrete + remaining
+    // continuous)**: BINOM.DIST / BINOM.DIST.RANGE / BINOM.INV /
+    // NEGBINOM.DIST / POISSON.DIST / EXPON.DIST / LOGNORM.DIST /
+    // LOGNORM.INV. Scalar tier. statrs::Binomial / NegativeBinomial /
+    // Poisson / LogNormal backing; EXPON.DIST closed-form (no
+    // statrs). First discrete-distribution batch. BINOM.DIST.RANGE is
+    // variadic (3 or 4 args).
+    r.register("BINOM.DIST", distribution_fns::binom_dist);
+    r.register("BINOM.DIST.RANGE", distribution_fns::binom_dist_range);
+    r.register("BINOM.INV", distribution_fns::binom_inv);
+    r.register("NEGBINOM.DIST", distribution_fns::negbinom_dist);
+    r.register("POISSON.DIST", distribution_fns::poisson_dist);
+    r.register("EXPON.DIST", distribution_fns::expon_dist);
+    r.register("LOGNORM.DIST", distribution_fns::lognorm_dist);
+    r.register("LOGNORM.INV", distribution_fns::lognorm_inv);
+
     r
 }
 
@@ -942,8 +958,14 @@ mod tests {
         // W5-D-3 (Wave 3 distributions batch — chi-squared + F):
         // CHISQ.DIST, CHISQ.DIST.RT, CHISQ.INV, CHISQ.INV.RT, F.DIST,
         // F.DIST.RT, F.INV, F.INV.RT = 8 — scalar tier;
-        // statrs::ChiSquared + statrs::FisherSnedecor backing.
-        assert_eq!(r.len(), 217);
+        // statrs::ChiSquared + statrs::FisherSnedecor backing +
+        // W5-D-4 (Wave 3 distributions batch — discrete + remaining
+        // continuous): BINOM.DIST, BINOM.DIST.RANGE, BINOM.INV,
+        // NEGBINOM.DIST, POISSON.DIST, EXPON.DIST, LOGNORM.DIST,
+        // LOGNORM.INV = 8 — scalar tier; statrs Binomial /
+        // NegativeBinomial / Poisson / LogNormal + closed-form
+        // EXPON.DIST. First discrete-distribution batch.
+        assert_eq!(r.len(), 225);
     }
 
     #[test]
