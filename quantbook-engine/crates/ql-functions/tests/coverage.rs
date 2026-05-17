@@ -614,6 +614,31 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
          implicit-intersection deferred to Step 5; scalar arg-coverage \
          matrix N/A",
     ),
+    // W5-RT-3 (RT-V1-01 Step 3) — reference-tier information batch.
+    // ISREF takes ArgContract::LazyShape (no eager-eval of arg);
+    // ISFORMULA takes Eager + queries the workbook's ReferenceQuery::
+    // is_formula_at. Coverage via per-fn unit tests + ql-exec e2e
+    // (binder→materializer chain) + workbook-runtime e2e (ISFORMULA
+    // happy path requires real formula-bearing cells). Scalar
+    // arg-coverage matrix N/A for the reference-tier ABI.
+    (
+        "ISREF",
+        "reference-aware fn (W5-RT-3) — LazyShape contract; covered by \
+         reference_fns unit tests (each PlanKind variant + arity + \
+         defensive Eager arms) + ql-exec e2e (binder→lazy-materializer \
+         chain confirms NO eval of args); scalar arg-coverage matrix \
+         N/A for the reference-tier ABI",
+    ),
+    (
+        "ISFORMULA",
+        "reference-aware fn (W5-RT-3) — Eager contract; covered by \
+         reference_fns unit tests (NoOpReferenceQuery FALSE path + \
+         arity + multi-cell #N/A + non-reference #N/A + error \
+         propagation) + ql-exec WorkbookEnv-backed storage-level e2e \
+         (formula-vs-literal cell TRUE/FALSE via Workbook::put_formula) \
+         + Step 3.1 cell-with-error-value pinning (S3-HIGH-1); scalar \
+         arg-coverage matrix N/A",
+    ),
 ];
 
 #[test]

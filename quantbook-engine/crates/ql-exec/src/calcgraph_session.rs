@@ -270,22 +270,39 @@ pub(crate) fn walk_plan_for_deps(plan: &ExprPlan, deps: &mut FormulaDeps) {
             if is_volatile_function(name) {
                 deps.is_volatile = true;
             }
-            // **W5-RT-1 / Step 1.1 (S1-HIGH-A closure):** shape-aware
-            // dep walking for reference-aware fns. For
-            // ROW/COLUMN/ROWS/COLUMNS/ISREF the result depends on the
-            // ADDRESS or SHAPE of args, not on their VALUE. The walker
-            // routes their arg lists through
-            // `walk_plan_for_address_only_deps`, which skips value-deps
-            // on direct CellRef/RangeRef but walks Binary/Unary/Function
-            // normally — the materializer evaluates those eagerly, so
-            // their inner inputs DO affect the eager-eval result class
-            // (e.g., `ROW(A1+1)` evaluates A1+1; A1 must stay tracked).
+            // **W5-RT-3.1 (S3-HIGH-2 closure — Codex MEDIUM-1 + Opus
+            // HIGH-S3-O-2 convergent):** the dep walker now distinguishes
+            // THREE policies per fn-name:
             //
-            // ISFORMULA and FORMULATEXT take the normal walker —
-            // value-deps over-recompute is the v1 cost (their result
-            // depends on formula-status which we don't track separately
-            // yet; see design § 8 R8).
-            if is_address_only_reference_fn(name) {
+            // 1. **ISREF** (LazyShape contract): NO arg walking at all.
+            //    ISREF inspects the syntactic shape of its arg via
+            //    `materialize_ref_arg_lazy` — it never evaluates Binary
+            //    / Unary / Function subtrees, so registering their inner
+            //    value-deps / volatility is pure waste. `ISREF(NOW())`
+            //    must NOT mark the formula volatile; `ISREF(A1+1)` must
+            //    NOT register A1's dep.
+            //
+            // 2. **ROW / COLUMN / ROWS / COLUMNS** (Eager + address-only):
+            //    `walk_plan_for_address_only_deps` — skips value-deps on
+            //    direct CellRef/RangeRef (their address is the input,
+            //    addresses don't change without structural events), but
+            //    recurses normally on Binary/Unary/Function subtrees
+            //    because the eager materializer DOES evaluate those.
+            //    `ROW(A1+1)` must keep A1's dep.
+            //
+            // 3. **ISFORMULA / FORMULATEXT** (Eager + workbook query):
+            //    normal walker — value-deps as v1 cost per design § 8
+            //    R8. A future `formula_status_deps` kind would
+            //    differentiate; out of v1 scope.
+            //
+            // The previous Step 1.1 design routed ISREF through path 2,
+            // which produced wrong behavior under LazyShape (Step 3
+            // audit caught this).
+            if name.as_ref() == "ISREF" {
+                // LazyShape contract: NO arg walking. The args' inner
+                // value-deps / volatility / structural deps don't
+                // affect ISREF's result.
+            } else if is_address_only_reference_fn(name) {
                 for arg in args {
                     walk_plan_for_address_only_deps(arg, deps);
                 }
@@ -299,38 +316,37 @@ pub(crate) fn walk_plan_for_deps(plan: &ExprPlan, deps: &mut FormulaDeps) {
             deps.named_ranges.push((Arc::clone(name), *range));
             deps.names.push(Arc::clone(name));
         }
-        // **W5-RT-1 / Step 1.1 (S1-MED-δ closure):** literal range refs
-        // bind to `ExprPlan::RangeRef { range }` inside reference-aware
-        // fn arg lists. In v1, the consumers are:
-        //   - ROW / COLUMN / ROWS / COLUMNS / ISREF (W5-RT-2 Step 2):
-        //     route their args through `walk_plan_for_address_only_deps`,
-        //     which has its OWN `ExprPlan::RangeRef` arm (a no-op,
-        //     skipping value-deps). This arm is NOT reached for those.
-        //   - ISFORMULA / FORMULATEXT (Step 3/4 W5-RT-3/W5-RT-4): take
-        //     the normal walker path; multi-cell range arg → #N/A per
-        //     design § 5.6, so result is value-independent and no
-        //     dep is needed.
-        //
-        // Result for both consumer classes: no value-dep needed for a
-        // literal range arg. This arm is a no-op.
-        //
-        // Single-cell `ISFORMULA(A1)` / `FORMULATEXT(A1)` go through
-        // `ExprPlan::CellRef` (not RangeRef) and DO register the cell
-        // dep — the formula-status they query can flip with
-        // `set_formula` / `clear_formula`, and we don't yet track
-        // formula-status deps separately from value-deps (design § 8
-        // R8). v1 cost.
+        // **W5-RT-3.1 (S3-HIGH-3 / Codex Step 3 HIGH-2 closure):**
+        // literal range refs bind to `ExprPlan::RangeRef { range }`
+        // inside reference-aware fn arg lists. Consumers:
+        //   - ROW/COLUMN/ROWS/COLUMNS: route through
+        //     `walk_plan_for_address_only_deps`, which has its own
+        //     `RangeRef` arm (no-op — addresses don't change without
+        //     structural events). This arm is NOT reached for those.
+        //   - ISREF (LazyShape): the `ExprPlan::Function` arm's
+        //     `name == "ISREF"` branch SHORT-CIRCUITS all arg walking.
+        //     This arm is NOT reached for ISREF either.
+        //   - **ISFORMULA / FORMULATEXT (W5-RT-3 / W5-RT-4):** route
+        //     through the normal walker AND can take 1×1-range args
+        //     (treated as single-cell per design § 2.4). When the range
+        //     is 1×1, push a cell-dep so the formula correctly dirties
+        //     when the referenced cell's value/formula-status changes.
+        //     Multi-cell ranges → `#N/A` per Microsoft canon (value-
+        //     independent), so no dep is needed.
         //
         // The initial Step 1 implementation pushed a synthetic name
         // `__rt_literal_range__` into `named_ranges` here, which leaked
         // a private marker through the public `FormulaDeps.named_ranges`
-        // field (Opus MEDIUM-O-6 / Codex LOW-3). Step 1.1 drops the
-        // push entirely — the dep is unnecessary for the only v1
-        // consumers (ISFORMULA / FORMULATEXT multi-cell → #N/A).
-        // If a future iterating reference-aware fn needs literal-range
-        // value-deps, add a `FormulaDeps.literal_ranges: Vec<Range>`
-        // field then.
-        ExprPlan::RangeRef { range: _ } => {}
+        // field. Step 1.1 (S1-MED-δ) dropped that push, but in doing so
+        // also dropped the legitimate 1×1 dep for `ISFORMULA(A1:A1)`.
+        // Step 3.1 restores the 1×1 cell-dep narrowly — pushed into
+        // `deps.cells` directly (no synthetic marker), only when the
+        // range collapses to a single cell.
+        ExprPlan::RangeRef { range } => {
+            if range.start_row == range.end_row && range.start_col == range.end_col {
+                deps.cells.push((range.sheet, range.start_row, range.start_col));
+            }
+        }
         // **W5-99 (Phase 4.7.F):** array-literal and error-literal plans
         // have NO dependencies — they're pure constants. Array cells
         // are also restricted to literals (Number/Bool/String/Error),

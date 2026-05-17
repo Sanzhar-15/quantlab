@@ -1,8 +1,12 @@
-//! Reference-aware function impls (W5-RT-2 / RT-V1-01 Step 2).
+//! Reference-aware function impls.
 //!
-//! Implements ROW / COLUMN / ROWS / COLUMNS — the address-only subset of
-//! the reference-tier mini-phase. All four register through
-//! `RegisteredFn::ReferenceAware` with `ArgContract::Eager`.
+//! - **W5-RT-2 / Step 2** — address-only batch: ROW / COLUMN / ROWS /
+//!   COLUMNS (`ArgContract::Eager`).
+//! - **W5-RT-3 / Step 3** — information batch: ISREF
+//!   (`ArgContract::LazyShape` — first user-facing fn through that
+//!   contract) + ISFORMULA (`Eager` + `ReferenceQuery::is_formula_at`).
+//! - **W5-RT-4 / Step 4** — text batch: FORMULATEXT (`Eager` +
+//!   `ReferenceQuery::formula_text_at`). Pending.
 //!
 //! Design doc: `docs/architecture/2026-05-17-reference-tier-design.md` § 5.6.
 //! Audit summary: `docs/audits/2026-05-17-reference-tier-audit-summary.md`.
@@ -14,9 +18,10 @@
 //! - **`#REF!` propagation:** any `RefArg::Error(ev)` arg propagates `ev`
 //!   first (per HIGH-F closure).
 //! - **Non-reference args:** `Scalar` / `Shape` / `Array` (for ROW/COLUMN
-//!   only; ROWS/COLUMNS accept arrays) → `#VALUE!`.
+//!   only; ROWS/COLUMNS accept arrays) → `#VALUE!`. ISFORMULA returns
+//!   `#N/A` per Microsoft canon (documented IronCalc-#VALUE! divergence).
 //! - **Arity mismatch:** > 1 arg for ROW/COLUMN → `#N/A`; wrong arity for
-//!   ROWS/COLUMNS → `#N/A`.
+//!   ROWS/COLUMNS/ISREF/ISFORMULA → `#N/A`.
 //! - **Calling-cell context:** `ROW()` / `COLUMN()` with no arg use
 //!   `RefContext::formula_cell`. If `None` (test envs without a formula
 //!   cell), return `#REF!`.
@@ -24,10 +29,15 @@
 //!   top-left (Excel pre-365 implicit intersection). At the cell boundary,
 //!   the dispatcher guard in `eval_at_cell_boundary` intercepts and
 //!   returns `#CALC!` — implemented in W5-RT-1, NOT here.
+//! - **Lazy contract (ISREF):** `ArgContract::LazyShape` means the
+//!   dispatcher's `materialize_ref_arg_lazy` produces `RefArg::Shape(_)`
+//!   without ever calling `eval_scalar_with_cache`. `ISREF(1/0)` returns
+//!   FALSE without surfacing `#DIV/0!`; `ISREF(NOW())` does NOT mark the
+//!   formula volatile (per Step 3.1 walker fix).
 
 use ql_types::{ErrorValue, Value};
 
-use crate::reference_aware_fns::{RefArg, RefContext};
+use crate::reference_aware_fns::{PlanKind, RefArg, RefContext};
 
 /// **ROW([ref])** — returns the 1-indexed row number of `ref`'s top-left
 /// cell, or of the calling cell if `ref` is omitted.
@@ -153,6 +163,114 @@ pub fn columns(args: &[RefArg], _ctx: &RefContext) -> Value {
 }
 
 // =====================================================================
+// W5-RT-3 (RT-V1-01 Step 3): ISREF + ISFORMULA — information-fn batch
+// =====================================================================
+//
+// ISREF uses `ArgContract::LazyShape` (the FIRST user-facing fn through
+// that contract — Step 1's tests validated the path via placeholders).
+// The dispatcher's `materialize_ref_arg_lazy` produces `RefArg::Shape(_)`
+// without evaluating the arg, so `ISREF(1/0) = FALSE` does NOT surface
+// `#DIV/0!` (HIGH-B closure from pre-review).
+//
+// ISFORMULA uses `ArgContract::Eager` + queries the workbook via
+// `RefContext::workbook.is_formula_at` (the `ReferenceQuery` trait the
+// Step 1 infrastructure wired). Single-cell Reference / 1×1 Range arg
+// → call the workbook query; multi-cell range / Array / Scalar /
+// Shape → `#N/A` per Microsoft canon (HIGH-D / S1-MEDIUM-1 closures
+// in the design).
+//
+// FORMULATEXT (Step 4) follows the same Eager-contract pattern.
+
+/// **ISREF(arg)** — TRUE iff `arg`'s expression shape is a reference
+/// (single-cell or range) OR a reference-returning function. Does NOT
+/// evaluate `arg` (HIGH-B closure: `ISREF(1/0)` returns FALSE without
+/// surfacing `#DIV/0!`).
+///
+/// - `ISREF(A1)` → TRUE.
+/// - `ISREF(A1:B3)` → TRUE.
+/// - `ISREF(NamedCell)` → TRUE (resolves to AggregateNameRef → RangeRef).
+/// - `ISREF(SUM(NamedRange))` → FALSE (SUM does not return a reference).
+///   Note: `ISREF(SUM(A1:A3))` literal-range form bind-fails per
+///   S1-MED-γ AggregateArg defer (pinned by `isref_of_sum_literal_range_bind_fails_v1_scope`).
+/// - `ISREF(1+2)` → FALSE.
+/// - `ISREF(123)` / `ISREF("text")` → FALSE.
+/// - `ISREF(1/0)` → FALSE (no eval; div-by-zero not surfaced).
+/// - `ISREF(#REF!)` → FALSE (`#REF!` literal is not a reference).
+/// - `ISREF()` / `ISREF(a, b)` → `#N/A` (arity).
+///
+/// v1 has no reference-returning fns (OFFSET / INDIRECT deferred), so
+/// `ISREF(<any function call>)` always returns FALSE. When reference-
+/// returning fns ship in a follow-up, `PlanKind::Function { returns_reference }`
+/// will distinguish; the v1 dispatcher emits `returns_reference: false`
+/// unconditionally.
+pub fn isref(args: &[RefArg], _ctx: &RefContext) -> Value {
+    match args {
+        [RefArg::Shape(PlanKind::CellRef | PlanKind::RangeRef)] => Value::Boolean(true),
+        [RefArg::Shape(PlanKind::Function {
+            returns_reference: true,
+        })] => Value::Boolean(true),
+        [RefArg::Shape(_)] => Value::Boolean(false),
+        // Defensive: Eager-contract args would surface as Reference /
+        // Range / Scalar / Array / Error. ISREF uses LazyShape so the
+        // dispatcher emits only `RefArg::Shape(_)` for the arg slot;
+        // these arms are unreachable under the contract but kept for
+        // defense-in-depth.
+        [RefArg::Reference { .. } | RefArg::Range { .. }] => Value::Boolean(true),
+        [RefArg::Scalar(_) | RefArg::Array(_) | RefArg::Error(_)] => Value::Boolean(false),
+        _ => Value::Error(ErrorValue::NA),
+    }
+}
+
+/// **ISFORMULA(ref)** — TRUE iff the cell at `ref` stores a formula
+/// (vs. literal / blank). Queries workbook storage via `RefContext::
+/// workbook.is_formula_at`.
+///
+/// - `ISFORMULA(A1)` where A1 = `=1+2` → TRUE.
+/// - `ISFORMULA(A1)` where A1 holds a literal `5` → FALSE.
+/// - `ISFORMULA(BlankCell)` → FALSE.
+/// - `ISFORMULA(A1:B3)` → `#N/A` (multi-cell range; per Microsoft canon).
+/// - `ISFORMULA("text")` / `ISFORMULA(123)` / `ISFORMULA(SUM(NamedRange))`
+///   → `#N/A` (non-reference arg). The design diverges here from the
+///   `#VALUE!` IronCalc returns; Microsoft canon says `#N/A` for any
+///   non-reference arg (Microsoft 2024). Note: `ISFORMULA(SUM(A1:A3))`
+///   literal-range form bind-fails per S1-MED-γ AggregateArg defer
+///   (pinned by `isformula_of_sum_literal_range_bind_fails_v1_scope`).
+/// - `ISFORMULA(#REF!)` → `#REF!` (error propagation).
+/// - `ISFORMULA()` / `ISFORMULA(a, b)` → `#N/A` (arity).
+///
+/// v1 cost (design § 8 R8): the dep-walker registers a value-dep on
+/// the referenced cell, so the formula recomputes when the cell's
+/// value changes — even though only the formula-status (formula vs
+/// literal) matters. A future `formula_status_deps` kind would fix
+/// this; out of v1 scope.
+pub fn isformula(args: &[RefArg], ctx: &RefContext) -> Value {
+    match args {
+        [RefArg::Error(ev)] => Value::Error(*ev),
+        [RefArg::Reference { address, .. }] => Value::Boolean(ctx.workbook.is_formula_at(
+            address.sheet,
+            address.row,
+            address.col,
+        )),
+        // 1×1 range: treat as single-cell.
+        [RefArg::Range { range, .. }]
+            if range.start_row == range.end_row && range.start_col == range.end_col =>
+        {
+            Value::Boolean(ctx.workbook.is_formula_at(
+                range.sheet,
+                range.start_row,
+                range.start_col,
+            ))
+        }
+        // Multi-cell range OR any non-reference shape → #N/A per
+        // Microsoft canon (design § 2.4 MEDIUM-1 closure).
+        [RefArg::Range { .. } | RefArg::Array(_) | RefArg::Scalar(_) | RefArg::Shape(_)] => {
+            Value::Error(ErrorValue::NA)
+        }
+        _ => Value::Error(ErrorValue::NA),
+    }
+}
+
+// =====================================================================
 // Tests — each fn ≥ 8 per the design § 7 + audit-discipline MEDIUM-δ
 // =====================================================================
 //
@@ -187,7 +305,6 @@ mod tests {
     fn cell_ref(sheet: u16, row: u32, col: u32) -> RefArg {
         RefArg::Reference {
             address: Address::new(sheet, row, col),
-            value: Value::Blank,
         }
     }
 
@@ -536,6 +653,217 @@ mod tests {
         assert_eq!(
             rows(&[RefArg::Shape(PlanKind::RangeRef)], &ctx),
             Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== ISREF =====
+    //
+    // ISREF uses ArgContract::LazyShape — the dispatcher produces only
+    // `RefArg::Shape(PlanKind)` for the arg slot. Unit tests call the
+    // impl directly with `RefArg::Shape(_)` variants. The e2e tests
+    // (in reference_fns_e2e.rs) exercise the full binder→dispatcher→
+    // lazy-materializer chain via real `ISREF(A1)` strings.
+
+    #[test]
+    fn isref_of_cellref_shape_is_true() {
+        let ctx = ctx_no_cell();
+        assert_eq!(
+            isref(&[RefArg::Shape(PlanKind::CellRef)], &ctx),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn isref_of_rangeref_shape_is_true() {
+        let ctx = ctx_no_cell();
+        assert_eq!(
+            isref(&[RefArg::Shape(PlanKind::RangeRef)], &ctx),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn isref_of_function_call_shape_is_false_when_not_reference_returning() {
+        let ctx = ctx_no_cell();
+        // v1: SUM etc. — Function { returns_reference: false } → FALSE.
+        assert_eq!(
+            isref(
+                &[RefArg::Shape(PlanKind::Function {
+                    returns_reference: false
+                })],
+                &ctx
+            ),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn isref_of_function_call_shape_is_true_when_reference_returning() {
+        let ctx = ctx_no_cell();
+        // Future case: when OFFSET / INDIRECT ship as reference-returning
+        // fns, the dispatcher will emit `returns_reference: true`.
+        // ISREF must return TRUE for that shape. v1 dispatcher hardcodes
+        // `false`, so this test pins the future-correct path.
+        assert_eq!(
+            isref(
+                &[RefArg::Shape(PlanKind::Function {
+                    returns_reference: true
+                })],
+                &ctx
+            ),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn isref_of_literal_shape_is_false() {
+        let ctx = ctx_no_cell();
+        // Number / Bool / String / Array / Binary / Unary all collapse
+        // to PlanKind::Literal per the dispatcher's lazy materializer.
+        assert_eq!(
+            isref(&[RefArg::Shape(PlanKind::Literal)], &ctx),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn isref_of_error_shape_is_false() {
+        let ctx = ctx_no_cell();
+        // `#REF!` literal → PlanKind::Error → FALSE.
+        assert_eq!(
+            isref(&[RefArg::Shape(PlanKind::Error)], &ctx),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn isref_arity_zero_returns_na() {
+        let ctx = ctx_no_cell();
+        assert_eq!(isref(&[], &ctx), Value::Error(ErrorValue::NA));
+    }
+
+    #[test]
+    fn isref_arity_two_returns_na() {
+        let ctx = ctx_no_cell();
+        assert_eq!(
+            isref(
+                &[
+                    RefArg::Shape(PlanKind::CellRef),
+                    RefArg::Shape(PlanKind::CellRef)
+                ],
+                &ctx
+            ),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    // Defense-in-depth: ISREF with Eager-materialized args (unreachable
+    // via the LazyShape contract, but pinned for impl robustness).
+
+    #[test]
+    fn isref_with_reference_eager_arg_returns_true_defensive() {
+        let ctx = ctx_no_cell();
+        // Eager-contract path is unreachable via LazyShape; defensive arm.
+        assert_eq!(isref(&[cell_ref(0, 0, 0)], &ctx), Value::Boolean(true));
+    }
+
+    #[test]
+    fn isref_with_scalar_eager_arg_returns_false_defensive() {
+        let ctx = ctx_no_cell();
+        assert_eq!(
+            isref(&[RefArg::Scalar(Value::number(42.0))], &ctx),
+            Value::Boolean(false)
+        );
+    }
+
+    // ===== ISFORMULA =====
+    //
+    // ISFORMULA uses ArgContract::Eager — the dispatcher emits Reference
+    // / Range / Array / Scalar / Error per the materializer. Unit tests
+    // construct each shape directly. The e2e tests exercise the full
+    // chain with a real workbook backing.
+    //
+    // Note: the unit tests use NoOpReferenceQuery (via ctx_no_cell), so
+    // `ctx.workbook.is_formula_at` always returns false. To test the
+    // TRUE-when-formula path, use the e2e file with a real WorkbookEnv.
+
+    #[test]
+    fn isformula_of_cellref_with_noop_workbook_returns_false() {
+        let ctx = ctx_no_cell();
+        // NoOpReferenceQuery → no formula at any address → FALSE.
+        assert_eq!(isformula(&[cell_ref(0, 0, 0)], &ctx), Value::Boolean(false));
+    }
+
+    #[test]
+    fn isformula_of_single_cell_range_with_noop_workbook_returns_false() {
+        let ctx = ctx_no_cell();
+        // 1×1 range — treated as single-cell. NoOp → FALSE.
+        assert_eq!(
+            isformula(&[range_ref(0, 5, 5, 5, 5)], &ctx),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn isformula_of_multi_cell_range_returns_na() {
+        let ctx = ctx_no_cell();
+        // Microsoft canon: multi-cell → #N/A.
+        assert_eq!(
+            isformula(&[range_ref(0, 0, 0, 2, 1)], &ctx),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn isformula_of_text_scalar_returns_na() {
+        let ctx = ctx_no_cell();
+        // Microsoft canon (vs IronCalc's #VALUE!): non-reference → #N/A.
+        assert_eq!(
+            isformula(&[RefArg::Scalar(Value::Text("text".into()))], &ctx),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn isformula_of_number_scalar_returns_na() {
+        let ctx = ctx_no_cell();
+        assert_eq!(
+            isformula(&[RefArg::Scalar(Value::number(42.0))], &ctx),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn isformula_of_array_literal_returns_na() {
+        let ctx = ctx_no_cell();
+        let av = ql_types::ArrayValue::new(2, 2, vec![Value::number(1.0); 4]).unwrap();
+        assert_eq!(
+            isformula(&[RefArg::Array(av)], &ctx),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn isformula_propagates_error_arg() {
+        let ctx = ctx_no_cell();
+        assert_eq!(
+            isformula(&[RefArg::Error(ErrorValue::Ref)], &ctx),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn isformula_arity_zero_returns_na() {
+        let ctx = ctx_no_cell();
+        assert_eq!(isformula(&[], &ctx), Value::Error(ErrorValue::NA));
+    }
+
+    #[test]
+    fn isformula_arity_two_returns_na() {
+        let ctx = ctx_no_cell();
+        assert_eq!(
+            isformula(&[cell_ref(0, 0, 0), cell_ref(0, 0, 1)], &ctx),
+            Value::Error(ErrorValue::NA)
         );
     }
 }

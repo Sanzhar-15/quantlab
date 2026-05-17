@@ -50,10 +50,28 @@ pub enum RefArg {
     /// vs LazyShape — it can't express "Eager with materialized Range". A future iterating
     /// fn would need an `ArgContract::EagerWithValues` variant; defer until needed.
     Range { range: Range, values: Vec<Value> },
-    /// A single-cell reference with both [`Address`] and the dereferenced [`Value`].
-    /// ROW/COLUMN read the address; ISFORMULA/FORMULATEXT use the address to call
-    /// [`ReferenceQuery::is_formula_at`] / [`ReferenceQuery::formula_text_at`].
-    Reference { address: Address, value: Value },
+    /// A single-cell reference carrying only the [`Address`].
+    ///
+    /// **W5-RT-3.1 (S3-HIGH-1 closure):** the original variant carried a
+    /// `value: Value` field intended for fns that wanted both coordinates
+    /// AND the dereferenced value. No v1 consumer reads it. The S2-HIGH-2
+    /// closure added error-coercion in the CellRef materializer arm to
+    /// surface missing-sheet errors as `RefArg::Error(...)`; that fix
+    /// inadvertently conflated "the ref's cell happens to hold an error
+    /// value" with "the ref is itself invalid", breaking `ISFORMULA(A1)`
+    /// when A1 holds a literal `#N/A` or evaluates to `#DIV/0!`. The
+    /// right architectural shape — observed in both Step 3 audits
+    /// independently — is to NOT read the cell value in the materializer
+    /// at all: drop the `value` field, the materializer emits Reference
+    /// from address alone, and the per-fn impl queries `read_cell` /
+    /// `is_formula_at` / `formula_text_at` directly when it needs the
+    /// value. ROW/COLUMN/ROWS/COLUMNS don't need it. ISFORMULA/FORMULATEXT
+    /// query formula-status / formula-text via `ReferenceQuery`, not via
+    /// the cell's evaluated value. Missing-sheet errors are caught at
+    /// bind time (`BindError::UnknownSheet`), not at eval time — so the
+    /// hypothetical case that motivated S2-HIGH-2 is closed off
+    /// elsewhere.
+    Reference { address: Address },
     /// An array literal (`{1,2,3;4,5,6}`) — supports `ROWS`/`COLUMNS` over arrays per
     /// Microsoft canon (HIGH-C closure).
     Array(ArrayValue),
@@ -208,7 +226,6 @@ mod tests {
         };
         let _ = RefArg::Reference {
             address: Address::new(0, 0, 0),
-            value: Value::number(1.0),
         };
         let _ = RefArg::Array(
             ArrayValue::new(1, 1, vec![Value::number(1.0)]).expect("1x1 array constructs"),

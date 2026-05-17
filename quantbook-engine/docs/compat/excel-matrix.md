@@ -238,7 +238,8 @@ as partial, rows with `❌` are missing.
 | ISERROR | ✅ | 2 | 4.3 V1 | TRUE for ANY error |
 | ISNA | ✅ | 1 | 4.3 V1 | TRUE only for `#N/A` |
 | ISERR | ✅ | 1 | 4.3 V1 | TRUE for errors EXCEPT `#N/A` |
-| ISFORMULA / ISREF | ❌ | 0 | Wave 3 reference-tier | Need a `Reference { sheet, row, col }` arg tier; bundle with FORMULATEXT / ROW / COLUMN etc. |
+| ISREF | ✅ | 10+11 e2e | RT-V1-01 Step 3 (W5-RT-3) | W5-RT-3: TRUE for cell/range refs (and reference-returning fns in future). Uses `ArgContract::LazyShape` — does NOT evaluate arg, so `ISREF(1/0)` returns FALSE (no #DIV/0!). v1: no reference-returning fns, so `ISREF(SUM(...))` = FALSE always. |
+| ISFORMULA | ✅ | 9+10 e2e | RT-V1-01 Step 3 (W5-RT-3) | W5-RT-3: TRUE iff cell stores a formula. Uses `Eager` + `ReferenceQuery::is_formula_at`. Multi-cell range → `#N/A` (Microsoft canon; IronCalc returns `#VALUE!` divergence documented). Non-reference → `#N/A`. v1 cost: registers value-dep on referenced cell (formula-status dep kind deferred per design § 8 R8). |
 | ISEVEN / ISODD | ✅ | 4 | 4.10.C | W5-165: truncate toward zero (matches Excel canon — `ISEVEN(-2.5)` truncates to -2 → even). Blank coerces to 0 → ISEVEN(blank) = TRUE. Text → #VALUE!. |
 | ISNONTEXT | ✅ | 1 | 4.10.C | W5-165: inverse of ISTEXT. Blank / Number / Boolean / Error → TRUE; only Text → FALSE. |
 | TYPE | ✅ | 1 | 4.10.C | W5-165: 1=Number (Blank also coerces to 1), 2=Text, 4=Boolean, 16=Error. Excel's 64=Array unreachable on this scalar path; flattening happens in eval dispatch. |

@@ -789,6 +789,14 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_reference_aware("ROWS", reference_fns::rows, ArgContract::Eager);
     r.register_reference_aware("COLUMNS", reference_fns::columns, ArgContract::Eager);
 
+    // **W5-RT-3 (RT-V1-01 Step 3)**: reference-aware tier — information
+    // batch. ISREF uses `ArgContract::LazyShape` (first user-facing fn
+    // through that contract); ISFORMULA uses `Eager` + queries the
+    // workbook's `ReferenceQuery::is_formula_at` for formula-status.
+    // FORMULATEXT (Step 4) follows the Eager + workbook-query pattern.
+    r.register_reference_aware("ISREF", reference_fns::isref, ArgContract::LazyShape);
+    r.register_reference_aware("ISFORMULA", reference_fns::isformula, ArgContract::Eager);
+
     r
 }
 
@@ -869,8 +877,12 @@ mod tests {
         // depreciation batch) +
         // W5-RT-2 (RT-V1-01 Step 2): ROW, COLUMN, ROWS, COLUMNS = 4
         // — reference-tier address-only batch; first fns through the
-        // new ReferenceAware tier (W5-RT-1).
-        assert_eq!(r.len(), 197);
+        // new ReferenceAware tier (W5-RT-1) +
+        // W5-RT-3 (RT-V1-01 Step 3): ISREF + ISFORMULA = 2
+        // — reference-tier information batch; ISREF uses LazyShape
+        // (first user-facing fn through that contract), ISFORMULA
+        // uses Eager + workbook ReferenceQuery::is_formula_at.
+        assert_eq!(r.len(), 199);
     }
 
     #[test]

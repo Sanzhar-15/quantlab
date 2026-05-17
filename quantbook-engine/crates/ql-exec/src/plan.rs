@@ -1756,8 +1756,9 @@ mod tests {
     fn step_2_reference_aware_names_registered_in_reference_tier() {
         use ql_functions::default_registry;
         let reg = default_registry();
-        // Registered in Step 2 — must be present in all expected places.
-        for name in &["ROW", "COLUMN", "ROWS", "COLUMNS"] {
+        // Registered in Step 2 + Step 3 — must be present in all expected
+        // places. Step 4 (FORMULATEXT) registers in the next batch.
+        for name in &["ROW", "COLUMN", "ROWS", "COLUMNS", "ISREF", "ISFORMULA"] {
             assert!(
                 reg.lookup_reference_aware(name).is_some(),
                 "Step 2 registered {name:?} but lookup_reference_aware can't find it"
@@ -1779,27 +1780,44 @@ mod tests {
                 reg.lookup_unified(name).is_none(),
                 "{name:?} is reference-aware ONLY; must not appear in unified table"
             );
-        }
-        // **S2-MED-γ closure:** Step 3/4 names — matcher pre-lists them
-        // (binder routes their args correctly when the impls land), but
-        // registry must NOT have them yet (typo guard).
-        for name in &["ISREF", "ISFORMULA", "FORMULATEXT"] {
+            // **Step 3.1 (S3-MED-γ closure):** also check the
+            // context-aware tier — completeness even though HashMap
+            // disjointness structurally prevents collision.
             assert!(
-                is_reference_aware_function(name),
-                "{name:?} should be in the matcher (Step 3/4 pre-listing)"
-            );
-            assert!(
-                reg.lookup_reference_aware(name).is_none(),
-                "{name:?} is Step 3/4 work; must NOT yet be registered in \
-                 the reference-aware tier"
-            );
-            // Disjointness for not-yet-registered: must not resolve
-            // ANYWHERE in the registry yet.
-            assert!(
-                reg.lookup(name).is_none(),
-                "{name:?} not yet registered; should not appear in scalar table"
+                reg.lookup_context_aware(name).is_none(),
+                "{name:?} is reference-aware ONLY; must not appear in context-aware table"
             );
         }
+        // **S2-MED-γ + Step 3 update:** FORMULATEXT remains
+        // Step 4-pending. Matcher pre-lists it (binder routes its args
+        // correctly), but registry must NOT have it yet (typo guard).
+        // Step 3.1: extend disjointness to all four non-reference-aware
+        // tiers.
+        assert!(
+            is_reference_aware_function("FORMULATEXT"),
+            "FORMULATEXT should be in the matcher (Step 4 pre-listing)"
+        );
+        assert!(
+            reg.lookup_reference_aware("FORMULATEXT").is_none(),
+            "FORMULATEXT is Step 4 work; must NOT yet be registered in \
+             the reference-aware tier"
+        );
+        assert!(
+            reg.lookup("FORMULATEXT").is_none(),
+            "FORMULATEXT not yet registered; should not appear in scalar table"
+        );
+        assert!(
+            reg.lookup_range_aware("FORMULATEXT").is_none(),
+            "FORMULATEXT not yet registered; should not appear in range-aware table"
+        );
+        assert!(
+            reg.lookup_context_aware("FORMULATEXT").is_none(),
+            "FORMULATEXT not yet registered; should not appear in context-aware table"
+        );
+        assert!(
+            reg.lookup_unified("FORMULATEXT").is_none(),
+            "FORMULATEXT not yet registered; should not appear in unified table"
+        );
     }
 
     #[test]
