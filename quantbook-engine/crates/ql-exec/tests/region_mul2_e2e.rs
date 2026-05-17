@@ -550,6 +550,25 @@ fn e2e_correl_registered() {
 }
 
 #[test]
+fn e2e_covariance_p_s_registered() {
+    // **W5-D-6.1 (Opus MEDIUM-O-1 closure):** smoke-check registry
+    // dispatch for COVARIANCE.P / COVARIANCE.S. Same pattern as
+    // sibling paired-array fns (CORREL / SLOPE / INTERCEPT /
+    // PEARSON / RSQ / STEYX). **Novel code path**: COVARIANCE.P
+    // and COVARIANCE.S are the first Wave-3 paired-array fns with
+    // a literal dot in the canonical name — verifies the
+    // case-insensitive lexer + registry lookup handle the dotted
+    // form correctly through the same path as NORM.DIST / T.DIST / etc.
+    let registry = default_registry();
+    assert!(registry.lookup_range_aware("COVARIANCE.P").is_some());
+    assert!(registry.lookup_range_aware("covariance.p").is_some());
+    assert!(registry.lookup_range_aware("Covariance.P").is_some());
+    assert!(registry.lookup_range_aware("COVARIANCE.S").is_some());
+    assert!(registry.lookup_range_aware("covariance.s").is_some());
+    assert!(registry.lookup_range_aware("Covariance.S").is_some());
+}
+
+#[test]
 fn e2e_mirr_registered() {
     // W5-174: MIRR is RangeAwareFn; range-arg construction can't go
     // through the lightweight `bind(&ast, 0)` test helper without

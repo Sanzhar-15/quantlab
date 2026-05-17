@@ -301,6 +301,20 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "STEYX",
         "W5-179; unit tests pin known-fixture sey (zero on perfect-line + manual scatter case) + n>=3 requirement",
     ),
+    // W5-D-6 (Wave 3 closure — paired-array statistics) — COVARIANCE.P
+    // + COVARIANCE.S. Same paired-array shape as CORREL/PEARSON/RSQ/
+    // STEYX; reuses `collect_xy_pairs` + a shared `compute_covariance`
+    // kernel parameterized by `divisor_offset` (0 for population, 1
+    // for sample). Population variant accepts n>=1 (returns 0 for
+    // single pair); sample variant requires n>=2 (else #DIV/0!).
+    (
+        "COVARIANCE.P",
+        "W5-D-6; unit tests pin closed-form covariance on y=2x (cov=2.5) and y=-2x (cov=-2.5) + Bessel-correction-free divisor + constant-array → cov=0 + single-pair → 0 + skip-non-numeric pair + #VALUE! shape mismatch + #DIV/0! no-pairs + error propagation + arity",
+    ),
+    (
+        "COVARIANCE.S",
+        "W5-D-6; unit tests pin Bessel-corrected sample covariance + Microsoft canonical example (data1=[3,2,4,5,6], data2=[9,7,12,15,17]) → 6.5 + COVARIANCE.S = COVARIANCE.P * n/(n-1) algebraic relationship + single-pair → #DIV/0! + shape/error/arity coverage",
+    ),
     // W5-180 (Phase 4.10 polish / Wave 3 depreciation batch starter) —
     // SLN + SYD: closed-form straight-line + sum-of-years digits
     // depreciation. Scalar; both ported from IronCalc `fn_sln` /

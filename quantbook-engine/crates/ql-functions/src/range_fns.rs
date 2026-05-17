@@ -1406,6 +1406,52 @@ pub fn sumxmy2(args: &[FnArg]) -> Value {
     paired_sum_inner(args, PairedOp::XMY2)
 }
 
+/// **W5-D-6 (Wave 3 closure — paired-array statistics):** shared
+/// covariance kernel. Two-pass mean-then-deviation formula matching
+/// IronCalc's `fn_covariance_p` / `fn_covariance_s` line-by-line.
+///
+/// - `divisor_offset = 0.0` ⇒ population variant (divides by `n`).
+/// - `divisor_offset = 1.0` ⇒ sample variant (divides by `n - 1`,
+///   Bessel correction).
+///
+/// **Kernel pre-condition**: equal-length numeric slices,
+/// `xs.len() == ys.len()`. **Minimum-n enforcement is the caller's
+/// responsibility**: COVARIANCE.P accepts `n >= 1` and produces 0
+/// for `n == 1` (single point, dx·dy=0); COVARIANCE.S requires
+/// `n >= 2` and returns `#DIV/0!` otherwise. (**W5-D-6.1 Codex LOW-001
+/// closure**: prior docstring inherited the CORREL `n >= 2`
+/// precondition note from a code-block-adjacency oversight; split
+/// here so the kernel contract reads cleanly.)
+pub(crate) fn compute_covariance(
+    xs: &[f64],
+    ys: &[f64],
+    divisor_offset: f64,
+) -> Result<f64, ErrorValue> {
+    debug_assert_eq!(
+        xs.len(),
+        ys.len(),
+        "compute_covariance requires equal-length slices"
+    );
+    let n = xs.len() as f64;
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    for (&x, &y) in xs.iter().zip(ys.iter()) {
+        sum_x += x;
+        sum_y += y;
+    }
+    let mean_x = sum_x / n;
+    let mean_y = sum_y / n;
+    let mut sum_prod = 0.0;
+    for (&x, &y) in xs.iter().zip(ys.iter()) {
+        sum_prod += (x - mean_x) * (y - mean_y);
+    }
+    let cov = sum_prod / (n - divisor_offset);
+    if !cov.is_finite() {
+        return Err(ErrorValue::Num);
+    }
+    Ok(cov)
+}
+
 /// **W5-177 (Phase 4.10 polish / Wave 3 starter):** Pearson correlation
 /// coefficient — closed-form sum-of-cross-products variant per IronCalc
 /// port:
@@ -1543,6 +1589,63 @@ pub fn correl(args: &[FnArg]) -> Value {
 /// kernel.
 pub fn pearson(args: &[FnArg]) -> Value {
     correl(args)
+}
+
+/// **W5-D-6 (Wave 3 closure — paired-array statistics):**
+/// `COVARIANCE.P(array1, array2)` — population covariance of two
+/// same-shape data sets. RangeAwareFn; both args MUST be ranges.
+///
+/// Excel canon (verified against IronCalc `fn_covariance_p` at
+/// `.references/ironcalc/base/src/functions/statistical/covariance.rs`):
+/// - Both args ranges of identical shape; else `#VALUE!` (engine
+///   convention; Microsoft says `#N/A`).
+/// - Pairs where EITHER cell is non-numeric are dropped (same as
+///   CORREL).
+/// - Errors in either array propagate immediately.
+/// - Need `≥1` numeric pair → otherwise `#DIV/0!`.
+/// - Formula: `sum((x_i - x̄)(y_i - ȳ)) / n` (population divisor).
+pub fn covariance_p(args: &[FnArg]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let (xs, ys) = match collect_xy_pairs(&args[0], &args[1]) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
+    };
+    if xs.is_empty() {
+        return Value::Error(ErrorValue::DivZero);
+    }
+    match compute_covariance(&xs, &ys, 0.0) {
+        Ok(v) => match coercion::sanitize_f64(v) {
+            Ok(n) => Value::Number(n),
+            Err(e) => Value::Error(e),
+        },
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// **W5-D-6 (Wave 3 closure — paired-array statistics):**
+/// `COVARIANCE.S(array1, array2)` — sample covariance. Identical to
+/// COVARIANCE.P except divisor is `n - 1` (Bessel's correction) and
+/// requires `n ≥ 2`.
+pub fn covariance_s(args: &[FnArg]) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let (xs, ys) = match collect_xy_pairs(&args[0], &args[1]) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
+    };
+    if xs.len() < 2 {
+        return Value::Error(ErrorValue::DivZero);
+    }
+    match compute_covariance(&xs, &ys, 1.0) {
+        Ok(v) => match coercion::sanitize_f64(v) {
+            Ok(n) => Value::Number(n),
+            Err(e) => Value::Error(e),
+        },
+        Err(e) => Value::Error(e),
+    }
 }
 
 /// **W5-179 (Phase 4.10 polish / Wave 3 regression batch closure):**
@@ -3970,6 +4073,238 @@ mod tests {
         let ys = r(vec![n(1.0), Value::Error(ErrorValue::Ref), n(3.0)]);
         let xs = r(vec![n(1.0), n(2.0), n(3.0)]);
         assert_eq!(steyx(&[ys, xs]), Value::Error(ErrorValue::Ref));
+    }
+
+    // === W5-D-6 (Wave 3 closure — paired-array statistics) ===
+    // COVARIANCE.P + COVARIANCE.S: population vs sample covariance.
+
+    // --- COVARIANCE.P ---
+
+    #[test]
+    fn covariance_p_perfect_positive_relationship() {
+        // x = [1, 2, 3, 4], y = 2x = [2, 4, 6, 8].
+        // mean_x = 2.5, mean_y = 5.
+        // Σ(dx*dy) = (-1.5)(-3) + (-0.5)(-1) + (0.5)(1) + (1.5)(3)
+        //         = 4.5 + 0.5 + 0.5 + 4.5 = 10.
+        // cov = 10 / 4 = 2.5.
+        let x = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        let y = r(vec![n(2.0), n(4.0), n(6.0), n(8.0)]);
+        approx_scalar(covariance_p(&[x, y]), 2.5, 1e-12);
+    }
+
+    #[test]
+    fn covariance_p_perfect_negative_relationship() {
+        // x = [1, 2, 3, 4], y = -2x.
+        let x = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        let y = r(vec![n(-2.0), n(-4.0), n(-6.0), n(-8.0)]);
+        approx_scalar(covariance_p(&[x, y]), -2.5, 1e-12);
+    }
+
+    #[test]
+    fn covariance_p_constant_array_returns_zero() {
+        // Constant y → all dy = 0 → cov = 0 (unlike CORREL which
+        // returns #DIV/0! since denom = 0). Confirms COVARIANCE.P
+        // handles the zero-variance case finitely.
+        let x = r(vec![n(1.0), n(2.0), n(3.0)]);
+        let y = r(vec![n(5.0), n(5.0), n(5.0)]);
+        approx_scalar(covariance_p(&[x, y]), 0.0, 1e-12);
+    }
+
+    #[test]
+    fn covariance_p_single_pair_returns_zero() {
+        // n=1 valid for population: dx*dy = 0 (single point), cov = 0.
+        let x = r(vec![n(5.0)]);
+        let y = r(vec![n(10.0)]);
+        approx_scalar(covariance_p(&[x, y]), 0.0, 1e-12);
+    }
+
+    #[test]
+    fn covariance_p_skips_pairs_with_nonnumeric() {
+        // Pair (n, text) dropped; pair (text, n) dropped. Effective
+        // remaining: ([2, 3], [4, 6]) → mean_x=2.5, mean_y=5,
+        // Σ(dx*dy) = (-0.5)(-1) + (0.5)(1) = 1, cov = 1/2 = 0.5.
+        let x = r(vec![n(1.0), n(2.0), n(3.0), t("ignored")]);
+        let y = r(vec![t("dropped"), n(4.0), n(6.0), n(99.0)]);
+        approx_scalar(covariance_p(&[x, y]), 0.5, 1e-12);
+    }
+
+    #[test]
+    fn covariance_p_no_numeric_pairs_is_div_zero() {
+        let x = r(vec![t("a"), t("b")]);
+        let y = r(vec![t("c"), t("d")]);
+        assert_eq!(covariance_p(&[x, y]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn covariance_p_skips_booleans_and_blanks() {
+        // **W5-D-6.1 (Opus LOW closure):** pin Boolean / Blank skip
+        // semantics inherited from `collect_xy_pairs` (W5-179). Booleans
+        // and Blanks are NOT coerced to 0/1 — the whole pair is dropped
+        // (matches CORREL IronCalc-canon rule).
+        // Effective remaining: ([2, 4], [3, 5]) → mean_x=3, mean_y=4,
+        // Σ(dx·dy) = (-1)(-1) + (1)(1) = 2, cov = 2/2 = 1.
+        let x = r(vec![n(2.0), Value::Boolean(true), n(4.0), Value::Blank]);
+        let y = r(vec![n(3.0), n(99.0), n(5.0), n(99.0)]);
+        approx_scalar(covariance_p(&[x, y]), 1.0, 1e-12);
+    }
+
+    #[test]
+    fn covariance_p_shape_mismatch_is_value_error() {
+        let x = r(vec![n(1.0), n(2.0), n(3.0)]);
+        let y = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        assert_eq!(covariance_p(&[x, y]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn covariance_p_error_propagation() {
+        let x = r(vec![n(1.0), Value::Error(ErrorValue::Ref), n(3.0)]);
+        let y = r(vec![n(2.0), n(4.0), n(6.0)]);
+        assert_eq!(covariance_p(&[x, y]), Value::Error(ErrorValue::Ref));
+    }
+
+    #[test]
+    fn covariance_p_arity_violations() {
+        // **W5-D-6.1 (Opus arity asymmetry closure):** cover under-,
+        // single-, AND over-arity for symmetry with `covariance_s`
+        // (which already had all three).
+        assert_eq!(covariance_p(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(covariance_p(&[s(n(1.0))]), Value::Error(ErrorValue::Value));
+        // Scalar pair (n,n) instead of (range,range) → #VALUE!.
+        assert_eq!(
+            covariance_p(&[s(n(1.0)), s(n(2.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+        // 3+ args → #VALUE!.
+        let x = r(vec![n(1.0), n(2.0)]);
+        let y = r(vec![n(3.0), n(4.0)]);
+        let extra = r(vec![n(0.0)]);
+        assert_eq!(
+            covariance_p(&[x, y, extra]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // --- COVARIANCE.S ---
+
+    #[test]
+    fn covariance_s_perfect_positive_uses_bessel_correction() {
+        // Same x, y as covariance_p_perfect_positive_relationship:
+        // Σ(dx*dy) = 10. Sample divisor is n-1 = 3, so cov = 10/3.
+        let x = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        let y = r(vec![n(2.0), n(4.0), n(6.0), n(8.0)]);
+        approx_scalar(covariance_s(&[x, y]), 10.0 / 3.0, 1e-12);
+    }
+
+    #[test]
+    fn covariance_s_bessel_transform_of_microsoft_p_example() {
+        // **W5-D-6.1 (Codex MEDIUM-001 closure):** renamed from
+        // `covariance_s_microsoft_example`. This dataset is
+        // Microsoft's COVARIANCE.**P** canonical example (NOT .S):
+        //   data1 = [3, 2, 4, 5, 6], data2 = [9, 7, 12, 15, 17].
+        //   Σ(dx·dy) = (-1)(-3) + (-2)(-5) + 0 + (1)(3) + (2)(5) = 26.
+        //   COVARIANCE.P canonical anchor: 26/5 = 5.2.
+        //   COVARIANCE.S Bessel transform:  26/4 = 6.5.
+        // Microsoft COVARIANCE.P anchor:
+        //   https://support.microsoft.com/en-us/office/covariance-p-function-6f0e1e6d-956d-4e4b-9943-cfef0bf9edfc
+        let x = r(vec![n(3.0), n(2.0), n(4.0), n(5.0), n(6.0)]);
+        let y = r(vec![n(9.0), n(7.0), n(12.0), n(15.0), n(17.0)]);
+        approx_scalar(covariance_s(&[x, y]), 6.5, 1e-12);
+        // Pin the matching COVARIANCE.P canonical anchor for symmetry.
+        let x2 = r(vec![n(3.0), n(2.0), n(4.0), n(5.0), n(6.0)]);
+        let y2 = r(vec![n(9.0), n(7.0), n(12.0), n(15.0), n(17.0)]);
+        approx_scalar(covariance_p(&[x2, y2]), 5.2, 1e-12);
+    }
+
+    #[test]
+    fn covariance_s_microsoft_canonical_anchor() {
+        // **W5-D-6.1 (Codex MEDIUM-001 closure):** Microsoft's actual
+        // COVARIANCE.S canonical example:
+        //   data1 = [2, 4, 8], data2 = [5, 11, 12].
+        //   mean_x = 14/3 ≈ 4.667, mean_y = 28/3 ≈ 9.333.
+        //   Σ(dx·dy) = (2 - 14/3)(5 - 28/3)
+        //           + (4 - 14/3)(11 - 28/3)
+        //           + (8 - 14/3)(12 - 28/3)
+        //           = (-8/3)(-13/3) + (-2/3)(5/3) + (10/3)(8/3)
+        //           = 104/9 - 10/9 + 80/9 = 174/9 = 58/3.
+        //   cov_s = (58/3) / 2 = 29/3 ≈ 9.6667.
+        // Microsoft COVARIANCE.S anchor:
+        //   https://support.microsoft.com/en-us/office/covariance-s-function-0a539b74-7371-42aa-a18f-1f5320314977
+        let x = r(vec![n(2.0), n(4.0), n(8.0)]);
+        let y = r(vec![n(5.0), n(11.0), n(12.0)]);
+        approx_scalar(covariance_s(&[x, y]), 29.0 / 3.0, 1e-12);
+    }
+
+    #[test]
+    fn covariance_s_single_pair_is_div_zero() {
+        // Sample requires n >= 2 (n-1 in denominator).
+        let x = r(vec![n(5.0)]);
+        let y = r(vec![n(10.0)]);
+        assert_eq!(covariance_s(&[x, y]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn covariance_s_constant_array_returns_zero() {
+        let x = r(vec![n(1.0), n(2.0), n(3.0)]);
+        let y = r(vec![n(5.0), n(5.0), n(5.0)]);
+        approx_scalar(covariance_s(&[x, y]), 0.0, 1e-12);
+    }
+
+    #[test]
+    fn covariance_s_skips_pairs_with_nonnumeric() {
+        // Same fixture as covariance_p; effective n=2; Σ(dx*dy)=1;
+        // cov_s = 1 / (2 - 1) = 1.
+        let x = r(vec![n(1.0), n(2.0), n(3.0), t("ignored")]);
+        let y = r(vec![t("dropped"), n(4.0), n(6.0), n(99.0)]);
+        approx_scalar(covariance_s(&[x, y]), 1.0, 1e-12);
+    }
+
+    #[test]
+    fn covariance_s_no_numeric_pairs_is_div_zero() {
+        let x = r(vec![t("a"), t("b")]);
+        let y = r(vec![t("c"), t("d")]);
+        assert_eq!(covariance_s(&[x, y]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn covariance_s_shape_mismatch_is_value_error() {
+        let x = r(vec![n(1.0), n(2.0), n(3.0)]);
+        let y = r(vec![n(1.0), n(2.0)]);
+        assert_eq!(covariance_s(&[x, y]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn covariance_s_error_propagation() {
+        let x = r(vec![n(1.0), n(2.0), n(3.0)]);
+        let y = r(vec![n(1.0), Value::Error(ErrorValue::DivZero), n(3.0)]);
+        assert_eq!(covariance_s(&[x, y]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn covariance_s_arity_violations() {
+        assert_eq!(covariance_s(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(covariance_s(&[s(n(1.0))]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            covariance_s(&[s(n(1.0)), s(n(2.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn covariance_s_population_relationship() {
+        // For n>1: COVARIANCE.S = COVARIANCE.P * n / (n - 1).
+        // Pins the algebraic relationship between the two variants.
+        let x = r(vec![n(1.0), n(2.0), n(3.0), n(4.0), n(5.0)]);
+        let y = r(vec![n(2.0), n(3.0), n(5.0), n(7.0), n(11.0)]);
+        let cp = match covariance_p(&[x.clone(), y.clone()]) {
+            Value::Number(v) => v,
+            other => panic!("COVARIANCE.P returned {other:?}"),
+        };
+        let cs = match covariance_s(&[x, y]) {
+            Value::Number(v) => v,
+            other => panic!("COVARIANCE.S returned {other:?}"),
+        };
+        let n_f = 5.0;
+        approx_scalar(Value::Number(cs), cp * n_f / (n_f - 1.0), 1e-12);
     }
 
     // === W5-167 (Phase 4.10.E) — TEXTJOIN ===

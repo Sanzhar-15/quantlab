@@ -749,6 +749,15 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_range_aware("RSQ", range_fns::rsq);
     r.register_range_aware("STEYX", range_fns::steyx);
 
+    // **W5-D-6 (Wave 3 closure — paired-array statistics):**
+    // COVARIANCE.P / COVARIANCE.S. Population (divisor n) + sample
+    // (divisor n-1) covariance via the shared `compute_covariance`
+    // kernel. RangeAwareFn; both args must be ranges of identical
+    // shape. Closes the Wave 3 paired-array gap noted in
+    // excel-matrix.md alongside CORREL/PEARSON/RSQ/STEYX.
+    r.register_range_aware("COVARIANCE.P", range_fns::covariance_p);
+    r.register_range_aware("COVARIANCE.S", range_fns::covariance_s);
+
     // Phase 4.10.G (W5-169) — modern lookups (range-aware).
     r.register_range_aware("XLOOKUP", range_fns::xlookup);
     r.register_range_aware("XMATCH", range_fns::xmatch);
@@ -984,12 +993,17 @@ mod tests {
         // LOGNORM.INV = 8 — scalar tier; statrs Binomial /
         // NegativeBinomial / Poisson / LogNormal + closed-form
         // EXPON.DIST. First discrete-distribution batch +
-        // W5-D-5 (Wave 3 distributions batch — CLOSES WAVE 3):
-        // GAMMA, GAMMA.DIST, GAMMA.INV, GAMMALN, GAMMALN.PRECISE,
-        // BETA.DIST, BETA.INV, CONFIDENCE.NORM, CONFIDENCE.T = 9 —
-        // scalar tier; statrs Gamma/Beta + statrs::function::gamma
-        // + CONFIDENCE.* reusing W5-D-1/W5-D-2 helpers.
-        assert_eq!(r.len(), 234);
+        // W5-D-5 (Wave 3 distributions batch — CLOSES WAVE 3
+        // distributions): GAMMA, GAMMA.DIST, GAMMA.INV, GAMMALN,
+        // GAMMALN.PRECISE, BETA.DIST, BETA.INV, CONFIDENCE.NORM,
+        // CONFIDENCE.T = 9 — scalar tier; statrs Gamma/Beta +
+        // statrs::function::gamma + CONFIDENCE.* reusing W5-D-1/W5-D-2
+        // helpers.
+        // W5-D-6 (Wave 3 closure — paired-array statistics):
+        // COVARIANCE.P, COVARIANCE.S = 2 — range-aware tier;
+        // population vs sample covariance via shared compute_covariance
+        // kernel. Closes the Wave 3 paired-array gap.
+        assert_eq!(r.len(), 236);
     }
 
     #[test]
