@@ -550,6 +550,48 @@ fn e2e_correl_registered() {
 }
 
 #[test]
+fn e2e_base_conversion_through_dispatcher() {
+    // **W5-D-9 (Phase 4.10 — V1 260 closeout):** end-to-end dispatch
+    // tests for base-conversion family. All scalar; verify parser +
+    // registry routing for both directions.
+    // DEC2BIN(5) = "101".
+    assert_eq!(
+        eval_source_with_registry("DEC2BIN(5)", &[]),
+        Value::text("101")
+    );
+    // DEC2OCT(8) = "10".
+    assert_eq!(
+        eval_source_with_registry("DEC2OCT(8)", &[]),
+        Value::text("10")
+    );
+    // DEC2HEX(255) = "FF".
+    assert_eq!(
+        eval_source_with_registry("DEC2HEX(255)", &[]),
+        Value::text("FF")
+    );
+    // BIN2DEC(101) = 5.
+    assert_eq!(
+        eval_source_with_registry("BIN2DEC(101)", &[]),
+        Value::Number(5.0)
+    );
+    // OCT2DEC("10") = 8.
+    assert_eq!(
+        eval_source_with_registry(r#"OCT2DEC("10")"#, &[]),
+        Value::Number(8.0)
+    );
+    // HEX2DEC("FF") = 255.
+    assert_eq!(
+        eval_source_with_registry(r#"HEX2DEC("FF")"#, &[]),
+        Value::Number(255.0)
+    );
+    // Case-insensitive lookup.
+    assert_eq!(
+        eval_source_with_registry("dec2bin(5)", &[]),
+        Value::text("101")
+    );
+}
+
+#[test]
 fn e2e_bit_ops_through_dispatcher() {
     // **W5-D-8 (Phase 4.10 — V1 260 closeout):** end-to-end dispatch
     // tests for BIT* engineering family. All scalar; verify the

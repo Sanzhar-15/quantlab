@@ -312,7 +312,12 @@ as partial, rows with `❌` are missing.
 | BITXOR | ✅ | 9 | 4.10 V1-260 closeout (W5-D-8) | W5-D-8: bitwise XOR. Same domain. `0b1100 ^ 0b1010 = 6`. Self-XOR = 0. |
 | BITLSHIFT | ✅ | 11 | 4.10 V1-260 closeout (W5-D-8) | W5-D-8: bitwise left shift. `number` in `[0, 2^48-1]`; `\|shift\| ≤ 53`. **Negative shift inverts direction** (Excel canon). Result overflow → `#NUM!`. |
 | BITRSHIFT | ✅ | 11 | 4.10 V1-260 closeout (W5-D-8) | W5-D-8: bitwise right shift. Same domain. Negative-shift inverts to left-shift. Round-trip with BITLSHIFT pinned. |
-| DEC2BIN / BIN2DEC / DEC2HEX / HEX2DEC / DEC2OCT / OCT2DEC | ❌ | 0 | 4.10 | Base conversion |
+| DEC2BIN | ✅ | 11 | 4.10 V1-260 closeout (W5-D-9) | W5-D-9: decimal → binary string. 1-2 args. `number` in `[-512, 511]`. Negative two's-complement → 10 digits. Optional `places` in `[1, 10]` zero-pads positive output. |
+| DEC2OCT | ✅ | 10 | 4.10 V1-260 closeout (W5-D-9) | W5-D-9: decimal → octal string. 1-2 args. `number` in `[-2^29, 2^29-1]`. Same negative + places semantics. |
+| DEC2HEX | ✅ | 11 | 4.10 V1-260 closeout (W5-D-9) | W5-D-9: decimal → hex string. 1-2 args. `number` in `[-2^39, 2^39-1]`. **Uppercase canon**. Same negative + places semantics. |
+| BIN2DEC | ✅ | 8 | 4.10 V1-260 closeout (W5-D-9) | W5-D-9: binary numeric → decimal. **Strict 1-arg** (Microsoft canon). Takes NUMBER not text. High-bit-set sign-extends to negative. |
+| OCT2DEC | ✅ | 8 | 4.10 V1-260 closeout (W5-D-9) | W5-D-9: octal → decimal. **Strict 1-arg**. **W5-D-9.1 closure**: auto-coerces Number → string (Excel canon; `OCT2DEC(10) = 8`). Length>10 → `#NUM!`. High-bit sign-extension. |
+| HEX2DEC | ✅ | 8 | 4.10 V1-260 closeout (W5-D-9) | W5-D-9: hex → decimal. **Strict 1-arg**. **W5-D-9.1 closure**: auto-coerces Number → string (Excel canon; `HEX2DEC(10) = 16`). Length>10 → `#NUM!`. Mixed case accepted. High-bit sign-extension. |
 | COMPLEX / IMABS / IMARGUMENT / IMCONJUGATE | ❌ | 0 | post-v1 | Complex-number math |
 | ERF / ERFC | ❌ | 0 | 4.10 | (W5-D-5.1 MEDIUM-O-1 closure: GAMMA/GAMMALN moved to their own rows in the Statistical section — they shipped in W5-D-5.) |
 | CONVERT | ❌ | 0 | post-v1 | Unit conversion (large table) |

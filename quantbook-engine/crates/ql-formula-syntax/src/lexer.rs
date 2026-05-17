@@ -628,6 +628,47 @@ fn lex_ident_or_ref(chars: &mut Peekable<Chars>) -> Result<Token, LexError> {
             }
         }
 
+        // **W5-D-9 (Phase 4.10 — V1 260 closeout, base conversion):**
+        // If letters follow the digits AND we don't have absolute-`$`
+        // markers AND there's a non-empty letter prefix, treat the
+        // whole thing (`letters + digits + more letters`) as a single
+        // Ident token rather than a CellRef. This unlocks Excel
+        // function names with embedded digits like `DEC2BIN`,
+        // `BIN2DEC`, `HEX2DEC`, `OCT2DEC`, `DEC2HEX`, `DEC2OCT`.
+        //
+        // Without this: `DEC2BIN` lexes as `DEC2` (CellRef row 2, col
+        // DEC) + `BIN` (Ident) — parser sees CellRef-not-followed-by-
+        // LParen and treats DEC2 as a literal cell reference, then
+        // `BIN(...)` becomes its own fn call, leaving the original
+        // `DEC2` as orphan tokens. Parser surfaces as
+        // `Trailing { count: ... }`.
+        //
+        // Constraints:
+        // - Skip this path if absolute markers are set (`$DEC2BIN` or
+        //   `DEC$2BIN` would be malformed for both interpretations).
+        // - The trailing letter run accepts letters and underscores
+        //   (matching the leading-ident-run rule).
+        if !leading_dollar
+            && !mid_dollar
+            && !letters.is_empty()
+            && chars.peek().is_some_and(|c| c.is_ascii_alphabetic())
+        {
+            let mut full = letters;
+            full.push_str(&row_digits);
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    full.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            // Trailing `$` / `.` / digits at end of ident are not valid
+            // — defer to caller error path. The lexer is committed to
+            // Ident here; downstream parser handles unknown names.
+            return Ok(Token::Ident(Arc::from(full)));
+        }
+
         let row_1based: u32 = row_digits
             .parse()
             .map_err(|_| LexError::RowTooLarge(row_digits.clone()))?;
@@ -1981,6 +2022,110 @@ mod tests {
         assert_eq!(ident_text(&toks[0]), "T.DIST.2T");
         assert!(matches!(toks[1], Token::LParen));
         assert_eq!(toks[2], Token::Number(1.0));
+    }
+
+    // ===== W5-D-9.1 — `letters-digits-letters` ident-lex extension =====
+    //
+    // Cross-cutting lexer change to support Excel function names with
+    // embedded digits like `DEC2BIN` / `BIN2DEC` / `HEX2DEC` /
+    // `OCT2DEC` / `DEC2HEX` / `DEC2OCT`. **Codex W5-D-9 LOW-2 + Opus
+    // W5-D-9 MEDIUM-2 closure**: direct lexer tests for the new
+    // branch, replacing the prior-only e2e-coverage approach.
+
+    #[test]
+    fn ident_letters_digits_letters_lexes_as_single_ident() {
+        // `DEC2BIN` should be a single Ident token (not CellRef("DEC2")
+        // + Ident("BIN")).
+        let toks = lex_ok("DEC2BIN");
+        assert_eq!(toks.len(), 1);
+        assert!(matches!(toks[0], Token::Ident(_)));
+        if let Token::Ident(s) = &toks[0] {
+            assert_eq!(s.as_ref(), "DEC2BIN");
+        }
+    }
+
+    #[test]
+    fn ident_letters_digits_letters_with_lparen() {
+        // `DEC2BIN(5)` should lex as Ident + LParen + Number + RParen.
+        let toks = lex_ok("DEC2BIN(5)");
+        assert!(matches!(toks[0], Token::Ident(_)));
+        if let Token::Ident(s) = &toks[0] {
+            assert_eq!(s.as_ref(), "DEC2BIN");
+        }
+        assert!(matches!(toks[1], Token::LParen));
+        assert_eq!(toks[2], Token::Number(5.0));
+    }
+
+    #[test]
+    fn ident_bin2dec_hex2dec_oct2dec_all_lex_as_idents() {
+        // All 6 base-conversion fns should be single Ident tokens.
+        for name in [
+            "DEC2BIN", "DEC2OCT", "DEC2HEX", "BIN2DEC", "OCT2DEC", "HEX2DEC",
+        ] {
+            let toks = lex_ok(name);
+            assert_eq!(toks.len(), 1, "{name} should be 1 token");
+            assert!(matches!(toks[0], Token::Ident(_)), "{name} should be Ident");
+            if let Token::Ident(s) = &toks[0] {
+                assert_eq!(s.as_ref(), name);
+            }
+        }
+    }
+
+    #[test]
+    fn log10_still_lexes_as_cellref_no_regression() {
+        // **W5-D-9.1 regression guard**: existing trailing-digit-only
+        // patterns (LOG10, ATAN2, LOG2) must NOT be affected by the
+        // letters-digits-letters extension. They have no letters
+        // after the digits, so the new branch is not triggered.
+        let toks = lex_ok("LOG10");
+        assert!(
+            matches!(toks[0], Token::CellRef { .. }),
+            "LOG10 should remain CellRef, got {:?}",
+            toks[0]
+        );
+        if let Token::CellRef { text, .. } = &toks[0] {
+            assert_eq!(text.as_ref(), "LOG10");
+        }
+    }
+
+    #[test]
+    fn log2_still_lex_as_cellref_no_regression() {
+        // Companion to the LOG10 regression guard — LOG2 is 3-letter
+        // prefix + digit; should still lex as CellRef.
+        // (Note: ATAN2 has a 4-letter prefix which exceeds the
+        // column-letter limit, so it can't lex standalone as a
+        // CellRef regardless; it only works as `ATAN2(...)` via the
+        // parser's fn-name override. Not a regression for the
+        // letters-digits-letters extension.)
+        let toks = lex_ok("LOG2");
+        assert!(
+            matches!(toks[0], Token::CellRef { .. }),
+            "LOG2 should remain CellRef, got {:?}",
+            toks[0]
+        );
+    }
+
+    #[test]
+    fn ident_letters_digits_letters_with_dollar_falls_through() {
+        // `$DEC2BIN` has a leading $ (absolute-column marker). The
+        // letters-digits-letters branch is GUARDED OUT in this case
+        // — the lexer falls through to the CellRef row-parse path,
+        // which sees `2BIN` (digits then non-digit) and produces a
+        // CellRef-like emit OR an error. Either way, `$DEC2BIN`
+        // should NOT lex as `Ident("$DEC2BIN")`.
+        let result = lex("$DEC2BIN");
+        // Whatever path it takes, the first token (if any) must NOT
+        // be Ident("$DEC2BIN"). The CellRef fallback will produce a
+        // CellRef + extra tokens or a row-parse error.
+        if let Ok(toks) = result {
+            if let Token::Ident(s) = &toks[0] {
+                assert_ne!(
+                    s.as_ref(),
+                    "$DEC2BIN",
+                    "$DEC2BIN must not lex as single Ident"
+                );
+            }
+        }
     }
 
     #[test]

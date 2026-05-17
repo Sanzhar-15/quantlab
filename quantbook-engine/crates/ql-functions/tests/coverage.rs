@@ -353,6 +353,33 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "BITRSHIFT",
         "W5-D-8; unit tests pin closed-form `8>>3=1`, `20>>2=5`, zero-shift identity, **negative-shift inverts to left-shift** (Excel canon), |shift|>53 #NUM!, result overflow #NUM!, above-max/negative/non-integer #NUM!, text/error/arity. Round-trip with BITLSHIFT pinned.",
     ),
+    // W5-D-9 (Phase 4.10 — V1 260 closeout — base conversion).
+    // DEC2BIN/OCT/HEX (decimal→string) + BIN2DEC/OCT2DEC/HEX2DEC
+    // (target base→decimal). 10-digit two's-complement canon.
+    (
+        "DEC2BIN",
+        "W5-D-9; unit tests pin closed-form 5→\"101\", 511→\"111111111\", negative -1→\"1111111111\" two's-complement (10 digits), -512→\"1000000000\", out-of-range `[-512, 511]` #NUM!, places zero-padding, places<result.len() for positive #NUM! (negative ignores places), places in `[1,10]`, text/error/arity",
+    ),
+    (
+        "DEC2OCT",
+        "W5-D-9; unit tests pin closed-form 8→\"10\", 64→\"100\", max 2^29-1, -1 two's-complement, out-of-range #NUM!, places zero-padding + too-small #NUM!, text/error/arity",
+    ),
+    (
+        "DEC2HEX",
+        "W5-D-9; unit tests pin closed-form 10→\"A\", 255→\"FF\", 2748→\"ABC\" (uppercase canon), max 2^39-1, -1 two's-complement, out-of-range #NUM!, places zero-padding + too-small #NUM!, text/error/arity",
+    ),
+    (
+        "BIN2DEC",
+        "W5-D-9; unit tests pin closed-form 101→5, 111111111→511, high-bit-set 1111111111→-1 (sign extension), 1000000000→-512, non-binary digit #NUM!, **takes NUMBER not text** (text→#VALUE!), round-trip with DEC2BIN, error/arity. **Strict 1-arg** (Microsoft canon; tighter than IronCalc's silent 1-2-arg).",
+    ),
+    (
+        "OCT2DEC",
+        "W5-D-9; unit tests pin closed-form \"10\"→8, \"777\"→511, high-bit 7777777777→-1, length>10 #NUM!, invalid octal digit #NUM!, **W5-D-9.1 closure**: auto-coerces Number→string (Excel canon: OCT2DEC(10)=8). Round-trip with DEC2OCT, error/arity. **Strict 1-arg** (Microsoft canon).",
+    ),
+    (
+        "HEX2DEC",
+        "W5-D-9; unit tests pin closed-form \"A\"→10, \"FF\"→255, mixed case \"ff\"→255, high-bit FFFFFFFFFF→-1, 8000000000→-2^39, length>10 #NUM!, invalid hex digit #NUM!, **W5-D-9.1 closure**: auto-coerces Number→string (Excel canon: HEX2DEC(10)=16). Round-trip with DEC2HEX, error/arity. **Strict 1-arg** (Microsoft canon).",
+    ),
     // W5-180 (Phase 4.10 polish / Wave 3 depreciation batch starter) —
     // SLN + SYD: closed-form straight-line + sum-of-years digits
     // depreciation. Scalar; both ported from IronCalc `fn_sln` /

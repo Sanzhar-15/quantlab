@@ -3433,6 +3433,306 @@ pub fn bitrshift(args: &[Value]) -> Value {
     Value::Number(result_f.floor())
 }
 
+// =====================================================================
+// W5-D-9 (Phase 4.10 — V1 260 closeout): base conversion family
+// =====================================================================
+//
+// DEC2BIN / DEC2HEX / DEC2OCT (decimal → string in target base) +
+// BIN2DEC / HEX2DEC / OCT2DEC (target base → decimal). All scalar.
+//
+// Excel canon (verified vs IronCalc `engineering/number_basis.rs`):
+//
+// - Each base is **10 digits maximum** in its representation. The
+//   most significant bit is the sign bit (two's-complement). So:
+//   - Binary range: [-2^9, 2^9 - 1] = [-512, 511]
+//   - Octal range:  [-2^29, 2^29 - 1] = [-536_870_912, 536_870_911]
+//   - Hex range:    [-2^39, 2^39 - 1] = [-549_755_813_888, 549_755_813_887]
+//
+// - Negative inputs to DEC2* are encoded as two's-complement: the
+//   value gets `2^(N*log2(base))` added to it before formatting, so
+//   the output is 10 digits with the high digit set.
+// - For positive DEC2* output, the optional `places` arg
+//   (`[1, 10]`) zero-pads the output. Negative DEC2* output is
+//   always 10 digits (high digit signals sign).
+// - *2DEC: input is parsed as the target base; if high bit is set,
+//   the value is sign-extended to a negative decimal.
+//
+// **Microsoft canon divergence (intentional)**: Microsoft documents
+// *2DEC as taking 1 argument only. IronCalc silently accepts 1-2
+// args (ignores the second). We follow Microsoft strict 1-arg per
+// codebase tighter-than-IronCalc convention.
+
+/// Excel base-10-digit constants (used for two's-complement
+/// encoding/decoding in DEC2BIN/HEX/OCT and BIN2DEC/HEX2DEC/OCT2DEC).
+const BIN_MAX: i64 = 1_024; // 2^10
+const BIN_HALF: i64 = 512; // 2^9
+const OCT_MAX: i64 = 1_073_741_824; // 8^10 = 2^30
+const OCT_HALF: i64 = 536_870_912; // 2^29
+const HEX_MAX: i64 = 1_099_511_627_776; // 16^10 = 2^40
+const HEX_HALF: i64 = 549_755_813_888; // 2^39
+
+/// **W5-D-9 helper** — parse a DEC2* `places` arg. Returns `None`
+/// when not provided; `Err(#NUM!)` for out-of-range `[1, 10]`.
+fn parse_places_arg(args: &[Value]) -> Result<Option<i32>, ErrorValue> {
+    if args.len() != 2 {
+        return Ok(None);
+    }
+    let p = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n.trunc() as i32,
+        Err(e) => return Err(e),
+    };
+    if !(1..=10).contains(&p) {
+        return Err(ErrorValue::Num);
+    }
+    Ok(Some(p))
+}
+
+/// **W5-D-9 helper** — coerce arg[0] into the i64 input for DEC2*
+/// fns, with range pre-check. `lo / hi` bounds reflect the
+/// two's-complement 10-digit-in-target-base canon.
+fn collect_dec_input(arg: &Value, lo: i64, hi: i64) -> Result<i64, ErrorValue> {
+    let raw = coercion::to_number_strict(arg)?;
+    let truncated = raw.trunc() as i64;
+    if truncated < lo || truncated > hi {
+        return Err(ErrorValue::Num);
+    }
+    Ok(truncated)
+}
+
+/// **W5-D-9 helper** — finish a DEC2* fn: encode `value` (after
+/// two's-complement adjustment if negative) and zero-pad to
+/// `places` digits if provided. `radix_max` is the wrap point
+/// (`BIN_MAX`/`OCT_MAX`/`HEX_MAX`); `format` is the format-spec
+/// shape character (`b`/`o`/`X`).
+fn finish_dec_conversion(
+    value: i64,
+    radix_max: i64,
+    places: Option<i32>,
+    formatter: fn(i64, usize) -> String,
+    raw_formatter: fn(i64) -> String,
+) -> Value {
+    let adjusted = if value < 0 { value + radix_max } else { value };
+    let raw = raw_formatter(adjusted);
+    match places {
+        Some(p) => {
+            // Negative input ALWAYS produces 10-digit (wrapped) output;
+            // `places` rejection applies only to positive values.
+            if value >= 0 && p < raw.len() as i32 {
+                return Value::Error(ErrorValue::Num);
+            }
+            Value::text(formatter(adjusted, p as usize))
+        }
+        None => Value::text(raw),
+    }
+}
+
+/// **DEC2BIN(number, [places])** — decimal to binary string.
+///
+/// - `number` in `[-512, 511]` integer.
+/// - `places` in `[1, 10]` if provided; positive values are
+///   zero-padded, negative always produce 10 digits.
+pub fn dec2bin(args: &[Value]) -> Value {
+    if !(1..=2).contains(&args.len()) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let value = match collect_dec_input(&args[0], -BIN_HALF, BIN_HALF - 1) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let places = match parse_places_arg(args) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
+    };
+    finish_dec_conversion(
+        value,
+        BIN_MAX,
+        places,
+        |v, w| format!("{v:0w$b}"),
+        |v| format!("{v:b}"),
+    )
+}
+
+/// **DEC2OCT(number, [places])** — decimal to octal string.
+///
+/// - `number` in `[-2^29, 2^29 - 1]` integer.
+/// - `places` semantics same as DEC2BIN.
+pub fn dec2oct(args: &[Value]) -> Value {
+    if !(1..=2).contains(&args.len()) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let value = match collect_dec_input(&args[0], -OCT_HALF, OCT_HALF - 1) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let places = match parse_places_arg(args) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
+    };
+    finish_dec_conversion(
+        value,
+        OCT_MAX,
+        places,
+        |v, w| format!("{v:0w$o}"),
+        |v| format!("{v:o}"),
+    )
+}
+
+/// **DEC2HEX(number, [places])** — decimal to hexadecimal string.
+///
+/// - `number` in `[-2^39, 2^39 - 1]` integer.
+/// - `places` semantics same as DEC2BIN.
+/// - Output uses uppercase hex digits.
+pub fn dec2hex(args: &[Value]) -> Value {
+    if !(1..=2).contains(&args.len()) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let value = match collect_dec_input(&args[0], -HEX_HALF, HEX_HALF - 1) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let places = match parse_places_arg(args) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
+    };
+    finish_dec_conversion(
+        value,
+        HEX_MAX,
+        places,
+        |v, w| format!("{v:0w$X}"),
+        |v| format!("{v:X}"),
+    )
+}
+
+/// **BIN2DEC(number)** — binary digits (as a numeric input) → decimal.
+///
+/// - 1 arg required. Excel canon: input is a NUMBER (not a string),
+///   stringified and parsed as base-2 digits. So `BIN2DEC(101) = 5`,
+///   `BIN2DEC(1111111111) = -1` (high bit treated as sign).
+/// - Non-binary digits in the stringified form → `#NUM!`.
+pub fn bin2dec(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let raw = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    // Stringify then parse as base 2. Matches IronCalc's pattern.
+    let text = format!("{raw}");
+    let parsed = match i64::from_str_radix(&text, 2) {
+        Ok(n) => n,
+        Err(_) => return Value::Error(ErrorValue::Num),
+    };
+    // Bit-pattern within [0, 1023]; sign-extend if high bit set.
+    if !(0..BIN_MAX).contains(&parsed) {
+        return Value::Error(ErrorValue::Num);
+    }
+    let result = if parsed >= BIN_HALF {
+        parsed - BIN_MAX
+    } else {
+        parsed
+    };
+    Value::Number(result as f64)
+}
+
+/// **W5-D-9.1 (Opus LOW-3 closure)**: coerce an arg into a string
+/// for HEX2DEC / OCT2DEC. Excel canon: auto-coerce Number (via
+/// integer rendering), Boolean (TRUE/FALSE), Blank (""). Text:
+/// pass through. Error: propagate. Matches IronCalc's
+/// `get_string` behavior.
+fn collect_base_decode_arg(arg: &Value) -> Result<String, ErrorValue> {
+    match arg {
+        Value::Text(s) => Ok((**s).to_string()),
+        Value::Number(n) => {
+            // Stringify integer-valued numbers without scientific
+            // notation. Excel canon: `HEX2DEC(10) = 16` because "10"
+            // is parsed as hex.
+            if n.fract() != 0.0 {
+                // Non-integer numeric input would stringify as "1.5";
+                // Excel rejects such cases as #NUM! via parse failure
+                // on the `.` char. Let the parser do the work.
+                Ok(format!("{n}"))
+            } else {
+                Ok(format!("{:.0}", n))
+            }
+        }
+        Value::Boolean(true) => Ok("TRUE".to_string()),
+        Value::Boolean(false) => Ok("FALSE".to_string()),
+        Value::Blank => Ok(String::new()),
+        Value::Error(e) => Err(*e),
+    }
+}
+
+/// **HEX2DEC(number)** — hex string → decimal.
+///
+/// - 1 arg required (Microsoft canon; tighter than IronCalc's
+///   silent 1-2-arg acceptance).
+/// - **W5-D-9.1 (Opus LOW-3 closure)**: input is auto-coerced from
+///   Number (via integer rendering) / Boolean / Blank, matching
+///   Excel canon. `HEX2DEC(10) = 16` (Number `10` → "10" → parse as
+///   hex). Prior strict-Text-only impl returned `#VALUE!` for
+///   numeric inputs — Excel-incompat.
+/// - Length > 10 chars → `#NUM!`.
+/// - Bit pattern in `[0, 16^10)`; sign-extend if high bit set.
+pub fn hex2dec(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let text = match collect_base_decode_arg(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    if text.len() > 10 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let parsed = match i64::from_str_radix(&text, 16) {
+        Ok(n) => n,
+        Err(_) => return Value::Error(ErrorValue::Num),
+    };
+    if parsed < 0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let result = if parsed >= HEX_HALF {
+        parsed - HEX_MAX
+    } else {
+        parsed
+    };
+    Value::Number(result as f64)
+}
+
+/// **OCT2DEC(number)** — octal string → decimal.
+///
+/// - 1 arg required.
+/// - **W5-D-9.1 (Opus LOW-3 closure)**: input auto-coerced (same as
+///   HEX2DEC). `OCT2DEC(10) = 8` (Number `10` → "10" → parse as octal).
+/// - Length > 10 chars → `#NUM!`.
+/// - Bit pattern in `[0, 8^10)`; sign-extend if high bit set.
+pub fn oct2dec(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let text = match collect_base_decode_arg(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(e),
+    };
+    if text.len() > 10 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let parsed = match i64::from_str_radix(&text, 8) {
+        Ok(n) => n,
+        Err(_) => return Value::Error(ErrorValue::Num),
+    };
+    if parsed < 0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let result = if parsed >= OCT_HALF {
+        parsed - OCT_MAX
+    } else {
+        parsed
+    };
+    Value::Number(result as f64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7125,5 +7425,426 @@ mod tests {
         assert_eq!(bitlshift(&[n(1.0), n(2.9)]), Value::Number(4.0));
         // BITRSHIFT(8, 2.9) = BITRSHIFT(8, 2) = 2.
         assert_eq!(bitrshift(&[n(8.0), n(2.9)]), Value::Number(2.0));
+    }
+
+    // ===== W5-D-9 (Phase 4.10 — V1 260 closeout) — base conversion =====
+    // Note: reuses the `t(s)` text-helper defined earlier in this test
+    // module (line ~4527).
+
+    // --- DEC2BIN ---
+
+    #[test]
+    fn dec2bin_basic() {
+        assert_eq!(dec2bin(&[n(0.0)]), t("0"));
+        assert_eq!(dec2bin(&[n(1.0)]), t("1"));
+        assert_eq!(dec2bin(&[n(5.0)]), t("101"));
+        // Max positive: 2^9 - 1 = 511.
+        assert_eq!(dec2bin(&[n(511.0)]), t("111111111"));
+    }
+
+    #[test]
+    fn dec2bin_negative_twos_complement_10_digits() {
+        // -1 → 1023 → "1111111111" (10 chars).
+        assert_eq!(dec2bin(&[n(-1.0)]), t("1111111111"));
+        // -512 → 512 → "1000000000" (10 chars).
+        assert_eq!(dec2bin(&[n(-512.0)]), t("1000000000"));
+    }
+
+    #[test]
+    fn dec2bin_out_of_range_is_num_error() {
+        assert_eq!(dec2bin(&[n(512.0)]), Value::Error(ErrorValue::Num));
+        assert_eq!(dec2bin(&[n(-513.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn dec2bin_with_places_zero_pads() {
+        // DEC2BIN(5, 8) = "00000101" (8-wide).
+        assert_eq!(dec2bin(&[n(5.0), n(8.0)]), t("00000101"));
+        // DEC2BIN(0, 4) = "0000".
+        assert_eq!(dec2bin(&[n(0.0), n(4.0)]), t("0000"));
+    }
+
+    #[test]
+    fn dec2bin_places_too_small_for_positive_is_num_error() {
+        // DEC2BIN(255, 4): result is 8 chars, won't fit in 4 → #NUM!.
+        assert_eq!(dec2bin(&[n(255.0), n(4.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn dec2bin_negative_ignores_places() {
+        // Negative ALWAYS produces 10 digits regardless of places.
+        assert_eq!(dec2bin(&[n(-1.0), n(3.0)]), t("1111111111"));
+    }
+
+    #[test]
+    fn dec2bin_places_out_of_range_is_num_error() {
+        assert_eq!(dec2bin(&[n(1.0), n(0.0)]), Value::Error(ErrorValue::Num));
+        assert_eq!(dec2bin(&[n(1.0), n(11.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn dec2bin_text_arg_is_value_error() {
+        assert_eq!(dec2bin(&[t("x")]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn dec2bin_error_arg_propagates() {
+        assert_eq!(
+            dec2bin(&[Value::Error(ErrorValue::Ref)]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn dec2bin_arity_mismatch_returns_value() {
+        assert_eq!(dec2bin(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            dec2bin(&[n(1.0), n(2.0), n(3.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // --- DEC2OCT ---
+
+    #[test]
+    fn dec2oct_basic() {
+        assert_eq!(dec2oct(&[n(0.0)]), t("0"));
+        assert_eq!(dec2oct(&[n(8.0)]), t("10"));
+        assert_eq!(dec2oct(&[n(64.0)]), t("100"));
+        // 2^29 - 1 = 536870911 = 0o3777777777 (10 digits).
+        assert_eq!(dec2oct(&[n(536_870_911.0)]), t("3777777777"));
+    }
+
+    #[test]
+    fn dec2oct_negative_twos_complement() {
+        // -1 → 2^30 - 1 = 1073741823 = 0o7777777777 (10 digits).
+        assert_eq!(dec2oct(&[n(-1.0)]), t("7777777777"));
+    }
+
+    #[test]
+    fn dec2oct_out_of_range_is_num_error() {
+        assert_eq!(dec2oct(&[n(536_870_912.0)]), Value::Error(ErrorValue::Num));
+        assert_eq!(dec2oct(&[n(-536_870_913.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn dec2oct_with_places_zero_pads() {
+        assert_eq!(dec2oct(&[n(8.0), n(4.0)]), t("0010"));
+    }
+
+    #[test]
+    fn dec2oct_places_too_small_is_num_error() {
+        // DEC2OCT(64, 1): result "100" is 3 chars, won't fit in 1.
+        assert_eq!(dec2oct(&[n(64.0), n(1.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn dec2oct_text_arg_is_value_error() {
+        assert_eq!(dec2oct(&[t("x")]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn dec2oct_error_arg_propagates() {
+        assert_eq!(
+            dec2oct(&[Value::Error(ErrorValue::Ref)]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn dec2oct_arity_mismatch_returns_value() {
+        assert_eq!(dec2oct(&[]), Value::Error(ErrorValue::Value));
+    }
+
+    // --- DEC2HEX ---
+
+    #[test]
+    fn dec2hex_basic() {
+        assert_eq!(dec2hex(&[n(0.0)]), t("0"));
+        assert_eq!(dec2hex(&[n(10.0)]), t("A"));
+        assert_eq!(dec2hex(&[n(255.0)]), t("FF"));
+        // 2^39 - 1 = 549_755_813_887.
+        assert_eq!(dec2hex(&[n(549_755_813_887.0)]), t("7FFFFFFFFF"));
+    }
+
+    #[test]
+    fn dec2hex_negative_twos_complement() {
+        // -1 → 2^40 - 1 = 1099511627775 = 0xFFFFFFFFFF.
+        assert_eq!(dec2hex(&[n(-1.0)]), t("FFFFFFFFFF"));
+    }
+
+    #[test]
+    fn dec2hex_out_of_range_is_num_error() {
+        assert_eq!(
+            dec2hex(&[n(549_755_813_888.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            dec2hex(&[n(-549_755_813_889.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn dec2hex_with_places_zero_pads() {
+        assert_eq!(dec2hex(&[n(10.0), n(4.0)]), t("000A"));
+    }
+
+    #[test]
+    fn dec2hex_places_too_small_is_num_error() {
+        // DEC2HEX(255, 1): result "FF" is 2 chars, won't fit in 1.
+        assert_eq!(dec2hex(&[n(255.0), n(1.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn dec2hex_uppercase_output() {
+        // Excel canon: hex output is uppercase.
+        assert_eq!(dec2hex(&[n(2748.0)]), t("ABC"));
+    }
+
+    #[test]
+    fn dec2hex_text_arg_is_value_error() {
+        assert_eq!(dec2hex(&[t("x")]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn dec2hex_error_arg_propagates() {
+        assert_eq!(
+            dec2hex(&[Value::Error(ErrorValue::DivZero)]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn dec2hex_arity_mismatch_returns_value() {
+        assert_eq!(dec2hex(&[]), Value::Error(ErrorValue::Value));
+    }
+
+    // --- BIN2DEC ---
+
+    #[test]
+    fn bin2dec_basic() {
+        // 101 → 5.
+        assert_eq!(bin2dec(&[n(101.0)]), Value::Number(5.0));
+        // 0 → 0.
+        assert_eq!(bin2dec(&[n(0.0)]), Value::Number(0.0));
+        // 111111111 → 511.
+        assert_eq!(bin2dec(&[n(111_111_111.0)]), Value::Number(511.0));
+    }
+
+    #[test]
+    fn bin2dec_high_bit_set_is_negative() {
+        // 1111111111 (10 ones) → -1 (sign extended).
+        assert_eq!(bin2dec(&[n(1_111_111_111.0)]), Value::Number(-1.0));
+        // 1000000000 → -512.
+        assert_eq!(bin2dec(&[n(1_000_000_000.0)]), Value::Number(-512.0));
+    }
+
+    #[test]
+    fn bin2dec_round_trip_with_dec2bin_positive() {
+        // bin2dec(dec2bin(x)) = x for x in [0, 511].
+        for x in [0i64, 1, 5, 42, 255, 511] {
+            let bin_text = match dec2bin(&[n(x as f64)]) {
+                Value::Text(s) => s,
+                other => panic!("dec2bin returned {other:?}"),
+            };
+            let bin_as_num: f64 = bin_text.parse().expect("parse bin");
+            assert_eq!(
+                bin2dec(&[n(bin_as_num)]),
+                Value::Number(x as f64),
+                "round-trip failed for {x}"
+            );
+        }
+    }
+
+    #[test]
+    fn bin2dec_non_binary_digit_is_num_error() {
+        // "102" not a binary digit → parse fails.
+        assert_eq!(bin2dec(&[n(102.0)]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn bin2dec_text_arg_is_value_error() {
+        assert_eq!(bin2dec(&[t("101")]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn bin2dec_error_arg_propagates() {
+        assert_eq!(
+            bin2dec(&[Value::Error(ErrorValue::Ref)]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn bin2dec_arity_mismatch_returns_value() {
+        assert_eq!(bin2dec(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(bin2dec(&[n(1.0), n(1.0)]), Value::Error(ErrorValue::Value));
+    }
+
+    // --- HEX2DEC ---
+
+    #[test]
+    fn hex2dec_basic() {
+        assert_eq!(hex2dec(&[t("0")]), Value::Number(0.0));
+        assert_eq!(hex2dec(&[t("A")]), Value::Number(10.0));
+        assert_eq!(hex2dec(&[t("FF")]), Value::Number(255.0));
+        // Mixed case accepted.
+        assert_eq!(hex2dec(&[t("ff")]), Value::Number(255.0));
+    }
+
+    #[test]
+    fn hex2dec_high_bit_is_negative() {
+        // FFFFFFFFFF (10 F's = 2^40 - 1) → -1.
+        assert_eq!(hex2dec(&[t("FFFFFFFFFF")]), Value::Number(-1.0));
+        // 8000000000 = 2^39 = HEX_HALF → -549755813888.
+        assert_eq!(
+            hex2dec(&[t("8000000000")]),
+            Value::Number(-549_755_813_888.0)
+        );
+    }
+
+    #[test]
+    fn hex2dec_round_trip_with_dec2hex() {
+        for x in [0i64, 10, 255, 549_755_813_887_i64] {
+            let hex_text = match dec2hex(&[n(x as f64)]) {
+                Value::Text(s) => s,
+                other => panic!("dec2hex returned {other:?}"),
+            };
+            assert_eq!(
+                hex2dec(&[t(&hex_text)]),
+                Value::Number(x as f64),
+                "round-trip failed for {x}"
+            );
+        }
+    }
+
+    #[test]
+    fn hex2dec_too_long_is_num_error() {
+        assert_eq!(
+            hex2dec(&[t("12345678901")]), // 11 chars
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn hex2dec_invalid_hex_is_num_error() {
+        assert_eq!(hex2dec(&[t("GG")]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn hex2dec_number_arg_excel_canon_auto_coerces() {
+        // **W5-D-9.1 (Opus LOW-3 closure):** Excel canon auto-coerces
+        // Number → string. `HEX2DEC(10) = 16` because "10" parses
+        // as hex. Prior strict-Text impl returned `#VALUE!` — incorrect.
+        assert_eq!(hex2dec(&[n(10.0)]), Value::Number(16.0));
+        assert_eq!(hex2dec(&[n(255.0)]), Value::Number(597.0)); // "255" as hex = 0x255
+    }
+
+    #[test]
+    fn hex2dec_error_arg_propagates() {
+        assert_eq!(
+            hex2dec(&[Value::Error(ErrorValue::Ref)]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn hex2dec_arity_mismatch_returns_value() {
+        assert_eq!(hex2dec(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(hex2dec(&[t("A"), n(1.0)]), Value::Error(ErrorValue::Value));
+    }
+
+    // --- OCT2DEC ---
+
+    #[test]
+    fn oct2dec_basic() {
+        assert_eq!(oct2dec(&[t("0")]), Value::Number(0.0));
+        assert_eq!(oct2dec(&[t("10")]), Value::Number(8.0));
+        assert_eq!(oct2dec(&[t("777")]), Value::Number(511.0));
+    }
+
+    #[test]
+    fn oct2dec_high_bit_is_negative() {
+        // 7777777777 (10 sevens = 2^30 - 1) → -1.
+        assert_eq!(oct2dec(&[t("7777777777")]), Value::Number(-1.0));
+    }
+
+    #[test]
+    fn oct2dec_round_trip_with_dec2oct() {
+        for x in [0i64, 8, 64, 536_870_911_i64] {
+            let oct_text = match dec2oct(&[n(x as f64)]) {
+                Value::Text(s) => s,
+                other => panic!("dec2oct returned {other:?}"),
+            };
+            assert_eq!(
+                oct2dec(&[t(&oct_text)]),
+                Value::Number(x as f64),
+                "round-trip failed for {x}"
+            );
+        }
+    }
+
+    #[test]
+    fn oct2dec_too_long_is_num_error() {
+        assert_eq!(oct2dec(&[t("12345678901")]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn oct2dec_invalid_octal_is_num_error() {
+        // 8 not octal digit.
+        assert_eq!(oct2dec(&[t("8")]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn oct2dec_number_arg_excel_canon_auto_coerces() {
+        // **W5-D-9.1 (Opus LOW-3 closure):** `OCT2DEC(10) = 8`
+        // (auto-coerces Number → "10" → parse as octal).
+        assert_eq!(oct2dec(&[n(10.0)]), Value::Number(8.0));
+    }
+
+    #[test]
+    fn oct2dec_error_arg_propagates() {
+        assert_eq!(
+            oct2dec(&[Value::Error(ErrorValue::Ref)]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn oct2dec_arity_mismatch_returns_value() {
+        assert_eq!(oct2dec(&[]), Value::Error(ErrorValue::Value));
+    }
+
+    // ===== W5-D-9.1 audit-closure regression tests =====
+
+    #[test]
+    fn bin2dec_out_of_range_with_valid_binary_digits_is_num_error() {
+        // **W5-D-9.1 (Codex LOW-1 + Opus MEDIUM-1 closure):**
+        // Excel canon: binary inputs are limited to 10 digits. The
+        // value `11111111111` (11 ones) is valid binary but parses
+        // to `2047`, which exceeds `BIN_MAX = 1024` → `#NUM!`.
+        // Pins the post-parse range-check path (the parser itself
+        // accepts the string).
+        assert_eq!(
+            bin2dec(&[n(11_111_111_111.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn dec2oct_places_boundary_exact_fit() {
+        // **W5-D-9.1 (Codex LOW-1 closure):** places EXACTLY equal to
+        // result length succeeds (no error, no extra padding).
+        // DEC2OCT(8) = "10" (2 chars); places = 2 → "10".
+        assert_eq!(dec2oct(&[n(8.0), n(2.0)]), Value::text("10"));
+    }
+
+    #[test]
+    fn dec2hex_negative_ignores_places() {
+        // **W5-D-9.1 (Codex LOW-1 closure):** negative DEC2HEX
+        // ALWAYS produces 10 digits regardless of places (matches
+        // DEC2BIN behavior). Pin this for hex too.
+        assert_eq!(dec2hex(&[n(-1.0), n(3.0)]), Value::text("FFFFFFFFFF"));
     }
 }

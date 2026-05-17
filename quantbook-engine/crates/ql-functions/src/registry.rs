@@ -477,6 +477,19 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("BITLSHIFT", scalar_fns::bitlshift);
     r.register("BITRSHIFT", scalar_fns::bitrshift);
 
+    // **W5-D-9 (Phase 4.10 — V1 260 closeout — base conversion):**
+    // DEC2BIN / DEC2OCT / DEC2HEX (decimal → string) + BIN2DEC /
+    // OCT2DEC / HEX2DEC (target base → decimal). Scalar tier.
+    // 10-digit two's-complement canon (binary [-512, 511]; octal
+    // [-2^29, 2^29-1]; hex [-2^39, 2^39-1]). Ported from IronCalc
+    // `engineering/number_basis.rs`.
+    r.register("DEC2BIN", scalar_fns::dec2bin);
+    r.register("DEC2OCT", scalar_fns::dec2oct);
+    r.register("DEC2HEX", scalar_fns::dec2hex);
+    r.register("BIN2DEC", scalar_fns::bin2dec);
+    r.register("OCT2DEC", scalar_fns::oct2dec);
+    r.register("HEX2DEC", scalar_fns::hex2dec);
+
     // Phase 4.10.D (W5-166) — combinatorics + SUMSQ (scalar tier).
     r.register("FACT", scalar_fns::fact);
     r.register("FACTDOUBLE", scalar_fns::factdouble);
@@ -1032,7 +1045,10 @@ mod tests {
         // ops): BITAND, BITOR, BITXOR, BITLSHIFT, BITRSHIFT = 5 —
         // scalar tier; Excel canon `[0, 2^48-1]` domain + `|shift|
         // <= 53`. First V1-260-closeout batch after Wave 3.
-        assert_eq!(r.len(), 243);
+        // W5-D-9 (Phase 4.10 — V1 260 closeout — base conversion):
+        // DEC2BIN, DEC2OCT, DEC2HEX, BIN2DEC, OCT2DEC, HEX2DEC = 6 —
+        // scalar tier; 10-digit two's-complement canon per base.
+        assert_eq!(r.len(), 249);
     }
 
     #[test]
