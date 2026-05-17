@@ -10,3 +10,30 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+# **Phase 4.11 architecture** (locked W5-D-14, 2026-05-18):
+# - Hybrid reader: calamine for cell grid + zip/quick-xml for OOXML
+#   metadata calamine compresses (scoped names, tables, styles, date1904,
+#   feature inventory). See `docs/audits/2026-05-18-phase-4-11-
+#   architecture-codex.md` for the full architectural rationale.
+# - Writer: umya-spreadsheet for `UpdateOriginal` mode (preserves opaque
+#   OOXML parts). rust_xlsxwriter for `NewWorkbook` mode lands later.
+
+# Reader: cell-grid backend (workspace-pinned per Phase 0 audit).
+calamine = { workspace = true }
+
+# Hybrid reader OOXML scanner (zip access + streaming XML parse).
+zip = { version = "=0.6.6", default-features = false, features = ["deflate"] }
+quick-xml = "=0.36.2"
+
+# Writer: round-trip / update-original backend.
+umya-spreadsheet = "=2.2.0"
+
+# Workspace shared.
+ql-storage = { path = "../ql-storage" }
+ql-exec = { path = "../ql-exec" }
+ql-functions = { path = "../ql-functions" }
+ql-types = { path = "../ql-types" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Test fixtures live in this crate; tests load .xlsx via ql_io_xlsx itself.
