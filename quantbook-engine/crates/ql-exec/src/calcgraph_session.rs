@@ -301,10 +301,18 @@ pub(crate) fn walk_plan_for_deps(plan: &ExprPlan, deps: &mut FormulaDeps) {
         }
         // **W5-RT-1 / Step 1.1 (S1-MED-δ closure):** literal range refs
         // bind to `ExprPlan::RangeRef { range }` inside reference-aware
-        // fn arg lists. In v1, this arm is only reachable when ISFORMULA
-        // or FORMULATEXT takes a literal range — both of which return
-        // `#N/A` for multi-cell ranges per Microsoft canon, so the
-        // result is value-independent. No deps registered.
+        // fn arg lists. In v1, the consumers are:
+        //   - ROW / COLUMN / ROWS / COLUMNS / ISREF (W5-RT-2 Step 2):
+        //     route their args through `walk_plan_for_address_only_deps`,
+        //     which has its OWN `ExprPlan::RangeRef` arm (a no-op,
+        //     skipping value-deps). This arm is NOT reached for those.
+        //   - ISFORMULA / FORMULATEXT (Step 3/4 W5-RT-3/W5-RT-4): take
+        //     the normal walker path; multi-cell range arg → #N/A per
+        //     design § 5.6, so result is value-independent and no
+        //     dep is needed.
+        //
+        // Result for both consumer classes: no value-dep needed for a
+        // literal range arg. This arm is a no-op.
         //
         // Single-cell `ISFORMULA(A1)` / `FORMULATEXT(A1)` go through
         // `ExprPlan::CellRef` (not RangeRef) and DO register the cell

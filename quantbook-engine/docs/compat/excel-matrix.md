@@ -217,7 +217,10 @@ as partial, rows with `❌` are missing.
 | OFFSET | ❌ | 0 | 4.7 | Volatile; whitelisted in 3.2 but not implemented |
 | INDIRECT | ❌ | 0 | 4.7 | Volatile; whitelisted in 3.2 but not implemented |
 | ADDRESS | ✅ | 8 | 4.10.G | W5-169: cell address text formatter. `abs_num`: 1=$A$1 (default), 2=A$1, 3=$A1, 4=A1. `a1`: TRUE → A1 style (default), FALSE → R1C1. `sheet_text`: optional prefix; auto-quoted if it contains anything other than `[A-Za-z0-9_]`. row/col must be ≥ 1 → otherwise `#VALUE!`. Multi-letter columns supported (Z, AA, ZZ, AAA). |
-| ROW / COLUMN / ROWS / COLUMNS | ❌ | 0 | 4.10 | |
+| ROW | ✅ | 9+8 e2e | RT-V1-01 Step 2 (W5-RT-2) | W5-RT-2: 1-indexed row of arg's top-left cell (Reference / Range / single-cell Range), or calling cell's row if omitted. Multi-cell range arg in scalar context returns top-left row (Excel pre-365 implicit-intersection); at cell-boundary `#CALC!` (S1-HIGH-B/E guard prevents silent truncation). `ROW(#REF!)` → `#REF!` (HIGH-F). Array literal → `#VALUE!` in scalar context. |
+| COLUMN | ✅ | 8+6 e2e | RT-V1-01 Step 2 (W5-RT-2) | W5-RT-2: symmetric to ROW; 1-indexed column index. |
+| ROWS | ✅ | 8+8 e2e | RT-V1-01 Step 2 (W5-RT-2) | W5-RT-2: row count of arg. Accepts Reference, Range, Array literal (HIGH-C: `ROWS({1,2,3;4,5,6})=2`). Whole-column `ROWS(A:A)=1_048_576`. Non-reference → `#VALUE!`; error propagation. |
+| COLUMNS | ✅ | 8+6 e2e | RT-V1-01 Step 2 (W5-RT-2) | W5-RT-2: column count; symmetric to ROWS. Whole-row `COLUMNS(1:1)=16_384`. |
 | TRANSPOSE | ❌ | 0 | 4.7 | Array-result |
 | FILTER / SORT / SORTBY / UNIQUE | ❌ | 0 | 4.7 | Dynamic-array; modern Excel |
 | CHOOSE | ✅ | 5 | 4.3 V2 | W5-54 (see notes above) |

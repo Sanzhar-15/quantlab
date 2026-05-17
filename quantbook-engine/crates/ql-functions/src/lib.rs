@@ -30,6 +30,7 @@ pub mod format;
 pub mod range_aware_fns;
 pub mod range_fns;
 pub mod reference_aware_fns;
+pub mod reference_fns;
 pub mod registry;
 pub mod scalar_fns;
 pub mod volatile;

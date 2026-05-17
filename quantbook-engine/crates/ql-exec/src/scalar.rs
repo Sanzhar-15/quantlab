@@ -574,10 +574,28 @@ fn materialize_ref_arg_eager<E: CellEnv>(
         ExprPlan::CellRef {
             sheet, row, col, ..
         } => {
+            // **W5-RT-2 / Step 2.1 (S2-HIGH-2 closure):** mirror the
+            // fallthrough arm's error mapping. If `env.read_cell` returns
+            // `Value::Error(_)` (e.g., out-of-bounds sheet → #REF! per
+            // env.rs:178-181), propagate as `RefArg::Error` so the per-fn
+            // impl returns the canonical error (e.g., `ROW(Sheet99!A1)`
+            // → #REF!, not 1). Pre-Step-2.1 the arm wrapped the error in
+            // `RefArg::Reference { value: Error }` and the per-fn impls
+            // silently ignored it via the `..` pattern, masking the error.
+            //
+            // Note: today this path is unreachable from end-user formulas
+            // (the workbook runtime has no `delete_sheet` API and binder
+            // rejects unknown-sheet refs at bind time, not at eval). Fixing
+            // the arm now preserves the error-propagation invariant for
+            // any future deletion path and matches the contract the
+            // fallthrough arm honors.
             let value = env.read_cell(*sheet, *row, *col);
-            RefArg::Reference {
-                address: ql_types::Address::new(*sheet, *row, *col),
-                value,
+            match value {
+                Value::Error(ev) => RefArg::Error(ev),
+                ok => RefArg::Reference {
+                    address: ql_types::Address::new(*sheet, *row, *col),
+                    value: ok,
+                },
             }
         }
         ExprPlan::AggregateNameRef { range, .. } => RefArg::Range {

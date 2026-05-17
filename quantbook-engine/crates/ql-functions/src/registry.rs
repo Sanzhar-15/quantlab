@@ -34,7 +34,7 @@ use ql_types::{ArrayValue, EvalContext, Value};
 use crate::context_aware_fns::ContextAwareFn;
 use crate::range_aware_fns::RangeAwareFn;
 use crate::reference_aware_fns::{ArgContract, ReferenceAwareFn};
-use crate::{date_fns, financial_fns, format, range_fns, scalar_fns, volatile};
+use crate::{date_fns, financial_fns, format, range_fns, reference_fns, scalar_fns, volatile};
 
 /// Function signature: pre-evaluated args → result Value.
 pub type ScalarFn = fn(&[Value]) -> Value;
@@ -776,6 +776,19 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_unified("TRANSPOSE", crate::array_returning_fns::transpose);
     r.register_unified("FILTER", crate::array_returning_fns::filter);
 
+    // **W5-RT-2 (RT-V1-01 Step 2)**: reference-aware tier — address-only
+    // batch. ROW / COLUMN return the 1-indexed row/col of a Reference or
+    // Range arg (or of the calling cell if omitted). ROWS / COLUMNS return
+    // the row/column count of a Reference / Range / Array literal arg.
+    // All four use `ArgContract::Eager` — the dispatcher's eager
+    // materializer (S1-HIGH-A walker is shape-aware so deps are correct
+    // for nested arithmetic args). See `reference_fns` for the impls and
+    // `docs/architecture/2026-05-17-reference-tier-design.md` § 5.6.
+    r.register_reference_aware("ROW", reference_fns::row, ArgContract::Eager);
+    r.register_reference_aware("COLUMN", reference_fns::column, ArgContract::Eager);
+    r.register_reference_aware("ROWS", reference_fns::rows, ArgContract::Eager);
+    r.register_reference_aware("COLUMNS", reference_fns::columns, ArgContract::Eager);
+
     r
 }
 
@@ -853,8 +866,11 @@ mod tests {
         // depreciation batch starter; W5-181: DDB = 1 — closed-form
         // double-declining-balance; W5-182: DB = 1 — period-iterating
         // fixed-declining-balance; W5-183: VDB = 1 — CLOSES Wave 3
-        // depreciation batch).
-        assert_eq!(r.len(), 193);
+        // depreciation batch) +
+        // W5-RT-2 (RT-V1-01 Step 2): ROW, COLUMN, ROWS, COLUMNS = 4
+        // — reference-tier address-only batch; first fns through the
+        // new ReferenceAware tier (W5-RT-1).
+        assert_eq!(r.len(), 197);
     }
 
     #[test]

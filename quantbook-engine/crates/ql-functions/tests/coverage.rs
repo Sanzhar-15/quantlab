@@ -573,6 +573,47 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
          array_returning_fns unit tests, not the scalar arg-coverage \
          matrix",
     ),
+    // W5-RT-2 (RT-V1-01 Step 2) — reference-tier address-only batch.
+    // These functions take RefArg shapes (Reference / Range / Array /
+    // Error), NOT scalar Values; the scalar arg-coverage matrix does not
+    // apply. Coverage is via per-fn unit tests in `reference_fns.rs`
+    // (8+ tests per fn covering anchor / range / whole-column / array
+    // literal / error propagation / arity / non-reference) and e2e
+    // dispatch tests in ql-exec.
+    (
+        "ROW",
+        "reference-aware fn (W5-RT-2) — covered by reference_fns unit \
+         tests (anchor / range / array literal / error propagation / \
+         arity / non-reference) + ql-exec reference_fns_e2e (binder→ \
+         dispatcher chain) + reference_fns_coverage_extensions (named- \
+         range / cross-sheet / formula-cell happy path); structured- \
+         ref + implicit-intersection deferred to Step 5 cross-cutting \
+         suite. Scalar arg-coverage matrix N/A for reference-tier ABI",
+    ),
+    (
+        "COLUMN",
+        "reference-aware fn (W5-RT-2) — covered by reference_fns unit \
+         tests + ql-exec reference_fns_e2e + reference_fns_coverage_ \
+         extensions (named-range / cross-sheet); structured-ref + \
+         implicit-intersection deferred to Step 5; scalar arg-coverage \
+         matrix N/A",
+    ),
+    (
+        "ROWS",
+        "reference-aware fn (W5-RT-2) — covered by reference_fns unit \
+         tests + ql-exec reference_fns_e2e + reference_fns_coverage_ \
+         extensions (named-range / cross-sheet); structured-ref + \
+         implicit-intersection deferred to Step 5; scalar arg-coverage \
+         matrix N/A",
+    ),
+    (
+        "COLUMNS",
+        "reference-aware fn (W5-RT-2) — covered by reference_fns unit \
+         tests + ql-exec reference_fns_e2e + reference_fns_coverage_ \
+         extensions (named-range / cross-sheet); structured-ref + \
+         implicit-intersection deferred to Step 5; scalar arg-coverage \
+         matrix N/A",
+    ),
 ];
 
 #[test]

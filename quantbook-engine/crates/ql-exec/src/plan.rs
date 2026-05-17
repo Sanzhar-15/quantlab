@@ -493,11 +493,20 @@ pub(crate) fn is_aggregate_function(name: &str) -> bool {
 /// - Everything else → bound as Scalar sub-expression (the per-fn impl
 ///   surfaces `#VALUE!` / `#N/A` for non-reference args per Excel canon).
 ///
-/// Pinned via the `accepts_special_arg_lists_only_registered_reference_aware`
-/// invariant test (added in this commit). v1 always returns false until the
-/// 7 reference-aware fns are registered in Step 2 / 3 / 4 — that ordering
-/// is intentional: Step 1 ships the infrastructure with no user-facing fn
-/// dispatching through it, gates green.
+/// **Step 2.1 (S2-MED-α closure):** pinned by two invariant tests:
+///
+/// - `accepts_special_arg_lists_only_registered_reference_aware_matcher_pin`
+///   (this module's test mod) — every name the matcher returns true for
+///   must be in the design's enumeration; typo guard. Direction:
+///   matcher → list-of-7.
+/// - `step_2_reference_aware_names_registered_in_reference_tier` —
+///   registry-side: every Step 2 / 3 / 4 currently-registered
+///   reference-aware fn must be recognized by the matcher AND
+///   disjointly NOT resolve in any other tier. Direction: registry →
+///   matcher. Currently covers 4 of 7 (ROW/COLUMN/ROWS/COLUMNS via
+///   W5-RT-2 Step 2); extends as Step 3 (ISREF/ISFORMULA) and Step 4
+///   (FORMULATEXT) ship. The matcher pre-lists all 7 by design so the
+///   binder routing is stable as registrations land.
 pub(crate) fn is_reference_aware_function(name: &str) -> bool {
     matches!(
         name,
@@ -1725,6 +1734,70 @@ mod tests {
                 !is_reference_aware_function(name),
                 "{name:?} is NOT supposed to be reference-aware but matcher \
                  returns true"
+            );
+        }
+    }
+
+    /// **W5-RT-2 (RT-V1-01 Step 2):** registry-side invariant for the 4
+    /// fns registered in this step (ROW / COLUMN / ROWS / COLUMNS). ISREF
+    /// / ISFORMULA / FORMULATEXT register in Step 3 / 4; this test
+    /// extends as those land. Sister to the matcher-pin test above.
+    ///
+    /// Disjointness: every registered reference-aware name must NOT
+    /// also resolve through any other tier — mirrors the
+    /// `is_aggregate_function_lists_only_registered_aggregates` pattern
+    /// (workbook_runtime.rs:5158).
+    ///
+    /// **Step 2.1 (S2-MED-γ closure):** also asserts the Step 3/4 names
+    /// (ISREF / ISFORMULA / FORMULATEXT) are NOT yet registered — the
+    /// matcher pre-lists them so a typo in those names slipping through
+    /// Step 2 would otherwise be invisible until Step 3 / 4 ship.
+    #[test]
+    fn step_2_reference_aware_names_registered_in_reference_tier() {
+        use ql_functions::default_registry;
+        let reg = default_registry();
+        // Registered in Step 2 — must be present in all expected places.
+        for name in &["ROW", "COLUMN", "ROWS", "COLUMNS"] {
+            assert!(
+                reg.lookup_reference_aware(name).is_some(),
+                "Step 2 registered {name:?} but lookup_reference_aware can't find it"
+            );
+            assert!(
+                is_reference_aware_function(name),
+                "{name:?} is registered as reference-aware but matcher returns false"
+            );
+            // Disjointness: must not resolve as any other tier.
+            assert!(
+                reg.lookup(name).is_none(),
+                "{name:?} is reference-aware ONLY; must not appear in scalar table"
+            );
+            assert!(
+                reg.lookup_range_aware(name).is_none(),
+                "{name:?} is reference-aware ONLY; must not appear in range-aware table"
+            );
+            assert!(
+                reg.lookup_unified(name).is_none(),
+                "{name:?} is reference-aware ONLY; must not appear in unified table"
+            );
+        }
+        // **S2-MED-γ closure:** Step 3/4 names — matcher pre-lists them
+        // (binder routes their args correctly when the impls land), but
+        // registry must NOT have them yet (typo guard).
+        for name in &["ISREF", "ISFORMULA", "FORMULATEXT"] {
+            assert!(
+                is_reference_aware_function(name),
+                "{name:?} should be in the matcher (Step 3/4 pre-listing)"
+            );
+            assert!(
+                reg.lookup_reference_aware(name).is_none(),
+                "{name:?} is Step 3/4 work; must NOT yet be registered in \
+                 the reference-aware tier"
+            );
+            // Disjointness for not-yet-registered: must not resolve
+            // ANYWHERE in the registry yet.
+            assert!(
+                reg.lookup(name).is_none(),
+                "{name:?} not yet registered; should not appear in scalar table"
             );
         }
     }
