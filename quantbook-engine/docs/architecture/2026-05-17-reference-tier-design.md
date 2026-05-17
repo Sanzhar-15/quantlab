@@ -1,6 +1,11 @@
 # Wave 3 — Reference-tier mini-phase
 
-**Status:** Design v2, 2026-05-17. **Parallel Codex + separate-Opus pre-review CLOSED** (44 findings: 8 HIGH + 11 MEDIUM + 13 LOW after reconciliation). v1 superseded by this revision. See `docs/audits/2026-05-17-reference-tier-pre-review-summary.md` for the reconciliation; raw transcripts at `docs/audits/2026-05-17-reference-tier-design-codex.md` + `docs/audits/2026-05-17-reference-tier-design-opus.md`.
+**Status: SHIPPED** (2026-05-17). Mini-phase RT-V1-01 closed in 10 commits (W5-RT-1 through W5-RT-4.1 + cross-cutting + closure docs) on `feat/quantbook-engine`. Final state: 7 reference-tier fns registered (200 total in default_registry); 3276+ tests passing (+194 from 3082 baseline); 5 audit cycles complete (pre-review + Steps 1-4); 21 HIGH findings closed across cycles + audit transcripts preserved at `docs/audits/2026-05-17-rt-step-{1,2,3,4}-{codex,opus}.md`.
+
+**Status history:**
+- **2026-05-17, v1**: design draft 1; parallel Codex + Opus pre-review (44 findings: 8 HIGH + 11 MEDIUM + 13 LOW after reconciliation).
+- **2026-05-17, v2**: design rewritten incorporating all HIGH+MEDIUM closures (see `docs/audits/2026-05-17-reference-tier-pre-review-summary.md` + raw transcripts at `2026-05-17-reference-tier-design-codex.md` + `2026-05-17-reference-tier-design-opus.md`).
+- **2026-05-17, Shipped**: Steps 1-4 implementation + Step 5 cross-cutting + Step 6 closure docs landed.
 
 **Spec ID:** RT-V1-01 (reference-tier wave 1, spec doc 01).
 **Mini-phase ID:** RT-1.
