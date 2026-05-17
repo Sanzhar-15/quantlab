@@ -380,6 +380,25 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "HEX2DEC",
         "W5-D-9; unit tests pin closed-form \"A\"→10, \"FF\"→255, mixed case \"ff\"→255, high-bit FFFFFFFFFF→-1, 8000000000→-2^39, length>10 #NUM!, invalid hex digit #NUM!, **W5-D-9.1 closure**: auto-coerces Number→string (Excel canon: HEX2DEC(10)=16). Round-trip with DEC2HEX, error/arity. **Strict 1-arg** (Microsoft canon).",
     ),
+    // W5-D-10 (Phase 4.10 — V1 260 closeout — error function family).
+    // ERF / ERF.PRECISE / ERFC / ERFC.PRECISE via statrs::function::erf.
+    // Companion to GAMMA family from W5-D-5.
+    (
+        "ERF",
+        "W5-D-10; unit tests pin closed-form ERF(0)=0, ERF(1)≈0.84270, ERF(2)≈0.99532, odd-function property ERF(-x)=-ERF(x), large-x → 1 limit, 2-arg definite-integral form ERF(a,b)=ERF(b)-ERF(a), swap anti-symmetry, text/error/arity. VARIADIC 1-2 args.",
+    ),
+    (
+        "ERF.PRECISE",
+        "W5-D-10; **alias of ERF (1-arg form)** — Excel 2010 renamed for naming consistency. Pin alias parity at 6 x-values + strict 1-arg (rejects 2-arg integral form) + text/arity.",
+    ),
+    (
+        "ERFC",
+        "W5-D-10; unit tests pin closed-form ERFC(0)=1, complement identity ERFC(x)+ERF(x)=1 across [-2, 3], ERFC(1)≈0.15730, large-positive → 0, large-negative → 2 (statrs stable rational approximation; no naive 1-erf(x) cancellation), text/error/arity.",
+    ),
+    (
+        "ERFC.PRECISE",
+        "W5-D-10; **alias of ERFC** — Excel 2010 renamed for naming consistency. Pin alias parity at 6 x-values + arity.",
+    ),
     // W5-180 (Phase 4.10 polish / Wave 3 depreciation batch starter) —
     // SLN + SYD: closed-form straight-line + sum-of-years digits
     // depreciation. Scalar; both ported from IronCalc `fn_sln` /

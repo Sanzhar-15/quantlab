@@ -12,12 +12,17 @@
 //!   LOGNORM.DIST / LOGNORM.INV — discrete (binomial + neg-binomial +
 //!   Poisson) + continuous (exponential + log-normal) distributions.
 //!   First discrete-distribution batch.
-//! - **W5-D-5 (this commit, CLOSES Wave 3)**: GAMMA / GAMMA.DIST /
-//!   GAMMA.INV / GAMMALN / GAMMALN.PRECISE / BETA.DIST / BETA.INV /
+//! - **W5-D-5 (CLOSES Wave 3)**: GAMMA / GAMMA.DIST / GAMMA.INV /
+//!   GAMMALN / GAMMALN.PRECISE / BETA.DIST / BETA.INV /
 //!   CONFIDENCE.NORM / CONFIDENCE.T — gamma family (function +
 //!   distribution + ln) + beta distribution (variadic with optional
 //!   [A, B] bounds) + confidence-interval margins for normal +
 //!   Student's t. All continuous.
+//! - **W5-D-10 (this commit, Phase 4.10 V1-260 closeout)**: ERF /
+//!   ERF.PRECISE / ERFC / ERFC.PRECISE — Gauss error function +
+//!   complement. Companion to gamma family; closes the special-
+//!   function cohort. Closed-form via `statrs::function::erf::{erf,
+//!   erfc}`.
 //!
 //! ## Implementation strategy
 //!
@@ -314,6 +319,7 @@ use statrs::distribution::{
     Beta, Binomial, ChiSquared, Continuous, ContinuousCDF, Discrete, DiscreteCDF, FisherSnedecor,
     Gamma, LogNormal, NegativeBinomial, Normal, Poisson, StudentsT,
 };
+use statrs::function::erf::{erf as erf_fn, erfc as erfc_fn};
 use statrs::function::gamma::{gamma as gamma_fn, ln_gamma};
 
 use ql_types::{coercion, ErrorValue, Value};
@@ -1800,6 +1806,85 @@ pub fn confidence_t(args: &[Value]) -> Value {
         return Value::Error(ErrorValue::Num);
     }
     finite_or_num(t_crit * sd / size.sqrt())
+}
+
+// =====================================================================
+// W5-D-10 (Phase 4.10 V1-260 closeout): Error function family
+// =====================================================================
+//
+// ERF / ERFC and their Excel 2010 `.PRECISE` aliases. Closed-form via
+// `statrs::function::erf::{erf, erfc}` — Abramowitz-Stegun-style
+// rational approximations, accurate to ~10-13 significant figures
+// across the f64 range.
+//
+// References:
+// - `.references/ironcalc/base/src/functions/engineering/bessel.rs:127-177`
+// - statrs `~/.cargo/registry/src/.../statrs-0.18.0/src/function/erf.rs`
+//
+// Identity: `erfc(x) = 1 - erf(x)`. For large `x` (≈ |x| > 5), `erf`
+// approaches ±1 and `erfc` approaches 0/2; statrs handles both via
+// stable rational approximation (no naive `1 - erf(x)` cancellation
+// at large positive x).
+
+/// **ERF(lower, [upper])** — Gauss error function. **VARIADIC 1-2 args.**
+///
+/// - 1 arg: returns `erf(lower)` (definite integral from 0 to lower
+///   of `(2/√π)·e^(-t²) dt`).
+/// - 2 args: returns `erf(upper) - erf(lower)` (definite integral
+///   from lower to upper).
+/// - Non-finite result → `#NUM!`.
+pub fn erf_excel(args: &[Value]) -> Value {
+    if !(1..=2).contains(&args.len()) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let lower = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let result = if args.len() == 2 {
+        let upper = match coercion::to_number_strict(&args[1]) {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        };
+        erf_fn(upper) - erf_fn(lower)
+    } else {
+        erf_fn(lower)
+    };
+    finite_or_num(result)
+}
+
+/// **ERF.PRECISE(x)** — alias of `ERF(x)` (1-arg form). Excel 2010
+/// introduced `.PRECISE` variants for naming consistency; the impl
+/// is identical.
+pub fn erf_precise(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let x = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    finite_or_num(erf_fn(x))
+}
+
+/// **ERFC(x)** — complementary error function = `1 - erf(x)`. statrs
+/// computes via stable rational approximation (no cancellation at
+/// large positive x).
+pub fn erfc_excel(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let x = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    finite_or_num(erfc_fn(x))
+}
+
+/// **ERFC.PRECISE(x)** — alias of `ERFC(x)`. Same pattern as
+/// `ERF.PRECISE`.
+pub fn erfc_precise(args: &[Value]) -> Value {
+    erfc_excel(args)
 }
 
 // =====================================================================
@@ -5932,5 +6017,259 @@ mod tests {
             ]),
             Value::Error(ErrorValue::Value)
         );
+    }
+
+    // ===== W5-D-10 (Phase 4.10 V1-260 closeout) — ERF / ERFC family =====
+
+    // --- ERF ---
+
+    #[test]
+    fn erf_at_zero_returns_zero_closed_form() {
+        // ERF(0) = 0 (identity: integral from 0 to 0 is 0).
+        assert_close(erf_excel(&[Value::number(0.0)]), 0.0);
+    }
+
+    #[test]
+    fn erf_odd_function_property() {
+        // ERF(-x) = -ERF(x) (odd function).
+        let x = 1.5;
+        let pos = match erf_excel(&[Value::number(x)]) {
+            Value::Number(n) => n,
+            other => panic!("erf returned {other:?}"),
+        };
+        let neg = match erf_excel(&[Value::number(-x)]) {
+            Value::Number(n) => n,
+            other => panic!("erf returned {other:?}"),
+        };
+        assert!(approx(pos, -neg, 1e-12));
+    }
+
+    #[test]
+    fn erf_at_one_libreoffice_anchor() {
+        // ERF(1) ≈ 0.8427007929497149 (standard reference value).
+        assert_close(erf_excel(&[Value::number(1.0)]), 0.842_700_792_949_714_9);
+    }
+
+    #[test]
+    fn erf_at_two_libreoffice_anchor() {
+        // ERF(2) ≈ 0.9953222650189527.
+        assert_close(erf_excel(&[Value::number(2.0)]), 0.995_322_265_018_952_7);
+    }
+
+    #[test]
+    fn erf_large_positive_approaches_one() {
+        // ERF(x) → 1 as x → ∞. ERF(5) ≈ 1 to ~12 sig figs.
+        let result = erf_excel(&[Value::number(5.0)]);
+        match result {
+            Value::Number(n) => assert!((1.0 - n).abs() < 1e-10, "expected ≈ 1, got {n}"),
+            other => panic!("erf returned {other:?}"),
+        }
+    }
+
+    #[test]
+    fn erf_two_arg_definite_integral() {
+        // ERF(0, 1) = ERF(1) - ERF(0) = ERF(1) ≈ 0.8427.
+        assert_close(
+            erf_excel(&[Value::number(0.0), Value::number(1.0)]),
+            0.842_700_792_949_714_9,
+        );
+        // ERF(1, 2) = ERF(2) - ERF(1) ≈ 0.9953 - 0.8427 ≈ 0.1526.
+        assert_close(
+            erf_excel(&[Value::number(1.0), Value::number(2.0)]),
+            0.995_322_265_018_952_7 - 0.842_700_792_949_714_9,
+        );
+    }
+
+    #[test]
+    fn erf_two_arg_swapped_negates() {
+        // ERF(upper, lower) = -ERF(lower, upper) by anti-symmetry of
+        // the definite integral.
+        let forward = match erf_excel(&[Value::number(0.0), Value::number(1.5)]) {
+            Value::Number(n) => n,
+            other => panic!("{other:?}"),
+        };
+        let reverse = match erf_excel(&[Value::number(1.5), Value::number(0.0)]) {
+            Value::Number(n) => n,
+            other => panic!("{other:?}"),
+        };
+        assert!(approx(forward, -reverse, 1e-12));
+    }
+
+    #[test]
+    fn erf_text_arg_is_value_error() {
+        assert_eq!(
+            erf_excel(&[Value::text("x")]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn erf_error_arg_propagates() {
+        assert_eq!(
+            erf_excel(&[Value::Error(ErrorValue::Ref)]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn erf_2_arg_error_propagates_from_either_position() {
+        // **W5-D-10.1 (Opus LOW-2 closure):** the 2-arg form must
+        // propagate errors from BOTH arg positions. Prior coverage
+        // only pinned arg[0] (via the 1-arg form). Now pin arg[1]
+        // explicitly.
+        // Error in lower (args[0]):
+        assert_eq!(
+            erf_excel(&[Value::Error(ErrorValue::DivZero), Value::number(1.0)]),
+            Value::Error(ErrorValue::DivZero)
+        );
+        // Error in upper (args[1]):
+        assert_eq!(
+            erf_excel(&[Value::number(0.0), Value::Error(ErrorValue::Ref)]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn erf_arity_mismatch_returns_value() {
+        assert_eq!(erf_excel(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            erf_excel(&[Value::number(0.0), Value::number(1.0), Value::number(2.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // --- ERF.PRECISE ---
+
+    #[test]
+    fn erf_precise_matches_erf_1_arg() {
+        // ERF.PRECISE(x) ≡ ERF(x) for 1-arg form. Pin alias parity.
+        for x in [0.0, 0.5, 1.0, 1.5, 2.0, -1.0] {
+            let a = erf_excel(&[Value::number(x)]);
+            let b = erf_precise(&[Value::number(x)]);
+            assert_eq!(a, b, "ERF.PRECISE diverges from ERF at x={x}");
+        }
+    }
+
+    #[test]
+    fn erf_precise_rejects_2_args() {
+        // ERF.PRECISE is STRICTLY 1-arg (Excel canon; PRECISE
+        // variants don't accept the definite-integral form).
+        assert_eq!(
+            erf_precise(&[Value::number(0.0), Value::number(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn erf_precise_text_arg_is_value_error() {
+        assert_eq!(
+            erf_precise(&[Value::text("x")]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn erf_precise_arity_mismatch_returns_value() {
+        assert_eq!(erf_precise(&[]), Value::Error(ErrorValue::Value));
+    }
+
+    // --- ERFC ---
+
+    #[test]
+    fn erfc_at_zero_returns_one_closed_form() {
+        // ERFC(0) = 1 - ERF(0) = 1.
+        assert_close(erfc_excel(&[Value::number(0.0)]), 1.0);
+    }
+
+    #[test]
+    fn erfc_complement_identity() {
+        // ERFC(x) + ERF(x) = 1 identity (closed-form definition).
+        for x in [-2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0] {
+            let erf_v = match erf_excel(&[Value::number(x)]) {
+                Value::Number(n) => n,
+                _ => panic!(),
+            };
+            let erfc_v = match erfc_excel(&[Value::number(x)]) {
+                Value::Number(n) => n,
+                _ => panic!(),
+            };
+            assert!(
+                approx(erf_v + erfc_v, 1.0, 1e-12),
+                "ERF({x}) + ERFC({x}) = {} ≠ 1",
+                erf_v + erfc_v
+            );
+        }
+    }
+
+    #[test]
+    fn erfc_at_one_libreoffice_anchor() {
+        // ERFC(1) = 1 - ERF(1) ≈ 0.1572992070502851.
+        assert_close(
+            erfc_excel(&[Value::number(1.0)]),
+            1.0 - 0.842_700_792_949_714_9,
+        );
+    }
+
+    #[test]
+    fn erfc_large_positive_approaches_zero() {
+        // ERFC(x) → 0 as x → ∞. statrs uses stable rational
+        // approximation (no naive 1 - erf(x) cancellation).
+        let result = erfc_excel(&[Value::number(5.0)]);
+        match result {
+            Value::Number(n) => assert!(n.abs() < 1e-10, "expected ≈ 0, got {n}"),
+            other => panic!("erfc returned {other:?}"),
+        }
+    }
+
+    #[test]
+    fn erfc_large_negative_approaches_two() {
+        // ERFC(-∞) = 2. ERFC(-5) ≈ 2.
+        let result = erfc_excel(&[Value::number(-5.0)]);
+        match result {
+            Value::Number(n) => assert!((2.0 - n).abs() < 1e-10, "expected ≈ 2, got {n}"),
+            other => panic!("erfc returned {other:?}"),
+        }
+    }
+
+    #[test]
+    fn erfc_text_arg_is_value_error() {
+        assert_eq!(
+            erfc_excel(&[Value::text("x")]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn erfc_error_arg_propagates() {
+        assert_eq!(
+            erfc_excel(&[Value::Error(ErrorValue::DivZero)]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn erfc_arity_mismatch_returns_value() {
+        assert_eq!(erfc_excel(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            erfc_excel(&[Value::number(0.0), Value::number(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // --- ERFC.PRECISE ---
+
+    #[test]
+    fn erfc_precise_matches_erfc() {
+        // ERFC.PRECISE(x) ≡ ERFC(x). Pin alias parity.
+        for x in [0.0, 0.5, 1.0, 1.5, 2.0, -1.0] {
+            let a = erfc_excel(&[Value::number(x)]);
+            let b = erfc_precise(&[Value::number(x)]);
+            assert_eq!(a, b, "ERFC.PRECISE diverges from ERFC at x={x}");
+        }
+    }
+
+    #[test]
+    fn erfc_precise_arity_mismatch_returns_value() {
+        assert_eq!(erfc_precise(&[]), Value::Error(ErrorValue::Value));
     }
 }

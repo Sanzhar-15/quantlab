@@ -490,6 +490,17 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("OCT2DEC", scalar_fns::oct2dec);
     r.register("HEX2DEC", scalar_fns::hex2dec);
 
+    // **W5-D-10 (Phase 4.10 — V1 260 closeout — error function
+    // family):** ERF / ERF.PRECISE / ERFC / ERFC.PRECISE. Scalar
+    // tier. Closed-form via `statrs::function::erf::{erf, erfc}`
+    // (Abramowitz-Stegun rational approximation). Companion to GAMMA
+    // family from W5-D-5. ERF is variadic (1-2 args; 2 args returns
+    // `erf(upper) - erf(lower)` definite-integral form).
+    r.register("ERF", distribution_fns::erf_excel);
+    r.register("ERF.PRECISE", distribution_fns::erf_precise);
+    r.register("ERFC", distribution_fns::erfc_excel);
+    r.register("ERFC.PRECISE", distribution_fns::erfc_precise);
+
     // Phase 4.10.D (W5-166) — combinatorics + SUMSQ (scalar tier).
     r.register("FACT", scalar_fns::fact);
     r.register("FACTDOUBLE", scalar_fns::factdouble);
@@ -1048,7 +1059,10 @@ mod tests {
         // W5-D-9 (Phase 4.10 — V1 260 closeout — base conversion):
         // DEC2BIN, DEC2OCT, DEC2HEX, BIN2DEC, OCT2DEC, HEX2DEC = 6 —
         // scalar tier; 10-digit two's-complement canon per base.
-        assert_eq!(r.len(), 249);
+        // W5-D-10 (Phase 4.10 — V1 260 closeout — error function
+        // family): ERF, ERF.PRECISE, ERFC, ERFC.PRECISE = 4 —
+        // scalar tier; closed-form via statrs::function::erf.
+        assert_eq!(r.len(), 253);
     }
 
     #[test]

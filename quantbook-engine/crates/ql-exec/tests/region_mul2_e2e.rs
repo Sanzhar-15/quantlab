@@ -550,6 +550,44 @@ fn e2e_correl_registered() {
 }
 
 #[test]
+fn e2e_erf_erfc_through_dispatcher() {
+    // **W5-D-10 (Phase 4.10 — V1 260 closeout):** end-to-end dispatch
+    // for ERF / ERF.PRECISE / ERFC / ERFC.PRECISE. All scalar.
+    // ERF(0) = 0.
+    assert_eq!(eval_source_with_registry("ERF(0)", &[]), Value::Number(0.0));
+    // ERFC(0) = 1.
+    assert_eq!(
+        eval_source_with_registry("ERFC(0)", &[]),
+        Value::Number(1.0)
+    );
+    // ERF + ERFC complement identity (verify both paths route).
+    let erf_v = match eval_source_with_registry("ERF(1)", &[]) {
+        Value::Number(n) => n,
+        _ => panic!("ERF(1) failed"),
+    };
+    let erfc_v = match eval_source_with_registry("ERFC(1)", &[]) {
+        Value::Number(n) => n,
+        _ => panic!("ERFC(1) failed"),
+    };
+    assert!((erf_v + erfc_v - 1.0).abs() < 1e-12);
+    // PRECISE aliases (dotted names work through the regular
+    // letter-leading dotted-ident path). **W5-D-10.1 (Codex LOW +
+    // Opus LOW-3 closure):** prior comment referenced the W5-D-2
+    // digit-leading-segment lexer extension, but `.PRECISE` segments
+    // are letter-only — the W5-D-2 extension is NOT exercised here.
+    assert_eq!(
+        eval_source_with_registry("ERF.PRECISE(0)", &[]),
+        Value::Number(0.0)
+    );
+    assert_eq!(
+        eval_source_with_registry("ERFC.PRECISE(0)", &[]),
+        Value::Number(1.0)
+    );
+    // Case-insensitive.
+    assert_eq!(eval_source_with_registry("erf(0)", &[]), Value::Number(0.0));
+}
+
+#[test]
 fn e2e_base_conversion_through_dispatcher() {
     // **W5-D-9 (Phase 4.10 — V1 260 closeout):** end-to-end dispatch
     // tests for base-conversion family. All scalar; verify parser +

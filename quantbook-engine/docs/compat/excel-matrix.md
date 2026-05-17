@@ -319,7 +319,10 @@ as partial, rows with `❌` are missing.
 | OCT2DEC | ✅ | 8 | 4.10 V1-260 closeout (W5-D-9) | W5-D-9: octal → decimal. **Strict 1-arg**. **W5-D-9.1 closure**: auto-coerces Number → string (Excel canon; `OCT2DEC(10) = 8`). Length>10 → `#NUM!`. High-bit sign-extension. |
 | HEX2DEC | ✅ | 8 | 4.10 V1-260 closeout (W5-D-9) | W5-D-9: hex → decimal. **Strict 1-arg**. **W5-D-9.1 closure**: auto-coerces Number → string (Excel canon; `HEX2DEC(10) = 16`). Length>10 → `#NUM!`. Mixed case accepted. High-bit sign-extension. |
 | COMPLEX / IMABS / IMARGUMENT / IMCONJUGATE | ❌ | 0 | post-v1 | Complex-number math |
-| ERF / ERFC | ❌ | 0 | 4.10 | (W5-D-5.1 MEDIUM-O-1 closure: GAMMA/GAMMALN moved to their own rows in the Statistical section — they shipped in W5-D-5.) |
+| ERF | ✅ | 10 | 4.10 V1-260 closeout (W5-D-10) | W5-D-10: Gauss error function via `statrs::function::erf::erf`. VARIADIC 1-2 args. With 1 arg: returns `erf(x)`; 2 args: definite-integral `erf(b) - erf(a)`. Closed-form anchors: `ERF(0)=0`, `ERF(1)≈0.84270`, `ERF(2)≈0.99532`. Odd-function symmetry pinned. |
+| ERF.PRECISE | ✅ | 4 | 4.10 V1-260 closeout (W5-D-10) | W5-D-10: alias of ERF (1-arg form). Excel 2010 PRECISE variant. Pin alias parity at 6 x-values. Rejects 2-arg form. |
+| ERFC | ✅ | 8 | 4.10 V1-260 closeout (W5-D-10) | W5-D-10: complementary error function via `statrs::function::erf::erfc`. `ERFC(x) = 1 - ERF(x)` identity pinned. statrs uses stable rational approximation (no cancellation at large positive x). |
+| ERFC.PRECISE | ✅ | 2 | 4.10 V1-260 closeout (W5-D-10) | W5-D-10: alias of ERFC. Excel 2010 PRECISE variant. Alias parity pinned. |
 | CONVERT | ❌ | 0 | post-v1 | Unit conversion (large table) |
 
 ### Database (DGET, DSUM, etc.) — defer post-v1
