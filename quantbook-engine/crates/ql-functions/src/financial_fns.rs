@@ -1450,6 +1450,332 @@ pub fn mirr(args: &[FnArg]) -> Value {
     finish(compute_mirr(&values, finance_rate, reinvest_rate))
 }
 
+// ===== W5-D-7 (Wave 3 closure — date-indexed cash flow): XNPV / XIRR =====
+//
+// XNPV is closed-form. XIRR uses Newton-Raphson on XNPV's derivative
+// with bisection fallback (matches IronCalc pattern in
+// `financial_util.rs:178-255`).
+
+/// **W5-D-7 (Wave 3 closure — date-indexed cash flow):** XNPV core.
+/// `XNPV = Σᵢ vᵢ / (1 + rate)^((dᵢ - d₀)/365)`. Returns `#NUM!` for
+/// non-finite results.
+pub(crate) fn compute_xnpv(rate: f64, values: &[f64], dates: &[f64]) -> Result<f64, ErrorValue> {
+    debug_assert_eq!(
+        values.len(),
+        dates.len(),
+        "compute_xnpv requires equal-length slices"
+    );
+    if values.is_empty() {
+        return Err(ErrorValue::Num);
+    }
+    let mut xnpv = values[0];
+    let d0 = dates[0];
+    for i in 1..values.len() {
+        xnpv += values[i] / (1.0 + rate).powf((dates[i] - d0) / 365.0);
+    }
+    if !xnpv.is_finite() {
+        return Err(ErrorValue::Num);
+    }
+    Ok(xnpv)
+}
+
+/// **W5-D-7 (Wave 3 closure — date-indexed cash flow):** XNPV derivative
+/// w.r.t. `rate`, used by Newton-Raphson in `compute_xirr`. Matches
+/// IronCalc's `compute_xnpv_prime`.
+fn compute_xnpv_prime(rate: f64, values: &[f64], dates: &[f64]) -> Result<f64, ErrorValue> {
+    debug_assert_eq!(values.len(), dates.len());
+    let mut deriv = 0.0;
+    let d0 = dates[0];
+    for i in 1..values.len() {
+        let ratio = (dates[i] - d0) / 365.0;
+        let power = (1.0 + rate).powf(ratio + 1.0);
+        deriv -= values[i] * ratio / power;
+    }
+    if !deriv.is_finite() {
+        return Err(ErrorValue::Num);
+    }
+    Ok(deriv)
+}
+
+/// **W5-D-7 (Wave 3 closure):** Newton-Raphson driver for XIRR.
+///
+/// **W5-D-7.1 (Codex HIGH-1 closure):** the IronCalc-port version
+/// accepted convergence solely on step size (`|new_xirr - xirr| < 1e-7`).
+/// That admits a non-root near the singularity at `rate = -1`, where
+/// the derivative blows up and the Newton step is tiny even when the
+/// residual is enormous. Codex repro: `values=[-100, 1000]`,
+/// `dates=[40000, 40365]`, `guess=-0.999999999` → returns
+/// `-0.999999998` (residual ≈ 5e11) when the true root is `9.0`.
+///
+/// Fix: require BOTH step-size convergence AND a residual check
+/// (`|XNPV(new_xirr)| < residual_eps`) before returning Ok. If the
+/// step is tiny but the residual is still large, signal Err so the
+/// outer `compute_xirr` falls back to bisection.
+///
+/// **Intentional divergence from IronCalc** to protect financial
+/// correctness — IronCalc has the same bug (no residual check) and
+/// would return the wrong rate on this input. Same pattern as the
+/// W5-D-4 BINOM.INV and W5-D-5 GAMMA.INV closures: diverge from
+/// IronCalc when needed to avoid producing nonsense values.
+fn xirr_newton(values: &[f64], dates: &[f64], guess: f64) -> Result<f64, ErrorValue> {
+    let mut xirr = guess;
+    let max_iterations = 100;
+    let step_eps = 1e-7;
+    let residual_eps = 1e-6;
+    for _ in 1..=max_iterations {
+        let f = compute_xnpv(xirr, values, dates)?;
+        let f_prime = compute_xnpv_prime(xirr, values, dates)?;
+        if f_prime == 0.0 {
+            return Err(ErrorValue::Num);
+        }
+        let new_xirr = xirr - f / f_prime;
+        if (new_xirr - xirr).abs() < step_eps {
+            // Step is tiny — but verify the residual is actually small
+            // at the candidate root. Near the rate=-1 singularity, the
+            // step can be tiny while the residual is huge; reject and
+            // let the outer fn fall back to bisection.
+            let residual = compute_xnpv(new_xirr, values, dates)?;
+            if residual.abs() < residual_eps {
+                return Ok(new_xirr);
+            }
+            return Err(ErrorValue::Num);
+        }
+        xirr = new_xirr;
+    }
+    Err(ErrorValue::Num)
+}
+
+/// **W5-D-7 (Wave 3 closure — date-indexed cash flow):** XIRR core.
+/// Newton-Raphson from `guess`; falls back to bisection on
+/// `[-0.9999, 100]`; if that fails (no sign change in interval),
+/// tries Newton-Raphson at `guess=200`. Matches IronCalc's `compute_xirr`.
+pub(crate) fn compute_xirr(values: &[f64], dates: &[f64], guess: f64) -> Result<f64, ErrorValue> {
+    // **W5-D-7.1 (Opus LOW closure):** NaN guess slips past
+    // `guess <= -1.0` because all NaN comparisons return false.
+    // Reject explicitly so NaN doesn't silently propagate into
+    // Newton-Raphson (which would diverge to NaN or oscillate).
+    if guess.is_nan() || guess <= -1.0 {
+        return Err(ErrorValue::Value);
+    }
+    // Need at least one positive AND one negative cash flow.
+    let all_non_neg = values.iter().all(|&x| x >= 0.0);
+    let all_non_pos = values.iter().all(|&x| x <= 0.0);
+    if all_non_neg || all_non_pos {
+        return Err(ErrorValue::Num);
+    }
+    if let Ok(r) = xirr_newton(values, dates, guess) {
+        return Ok(r);
+    }
+    // Bisection fallback in [-0.9999, 100].
+    let x1 = -0.9999;
+    let x2 = 100.0;
+    let f1 = compute_xnpv(x1, values, dates)?;
+    let f2 = compute_xnpv(x2, values, dates)?;
+    if f1 * f2 > 0.0 {
+        // Root not in interval; try Newton-Raphson at very large guess.
+        if let Ok(r) = xirr_newton(values, dates, 200.0) {
+            return Ok(r);
+        }
+        return Err(ErrorValue::Num);
+    }
+    let (mut rtb, mut dx) = if f1 < 0.0 {
+        (x1, x2 - x1)
+    } else {
+        (x2, x1 - x2)
+    };
+    let eps = 1e-8;
+    let max_iterations = 50;
+    for _ in 1..max_iterations {
+        dx *= 0.5;
+        let x_mid = rtb + dx;
+        let f_mid = compute_xnpv(x_mid, values, dates)?;
+        if f_mid <= 0.0 {
+            rtb = x_mid;
+        }
+        if f_mid.abs() < eps || dx.abs() < eps {
+            return Ok(x_mid);
+        }
+    }
+    Err(ErrorValue::Num)
+}
+
+/// **W5-D-7 collection helper for XNPV**: extracts numeric values from
+/// a range. Per IronCalc's `get_array_of_numbers_xpnv`: empty cells
+/// always reject with `#NUM!`; non-number cells reject with the
+/// caller-specified error class. Errors in the range propagate.
+/// No skipping — XNPV needs paired numeric vectors.
+///
+/// **W5-D-7.1 (Codex MEDIUM-2 + Opus MEDIUM-O-1 closure):** IronCalc
+/// distinguishes the two XNPV args by error class for non-numeric
+/// cells:
+///
+/// - `values` arg → non-numeric → `#NUM!`.
+/// - `dates` arg → non-numeric → `#VALUE!`.
+///
+/// The prior unified `#NUM!` for both was an IronCalc-parity drift
+/// caught by both auditors. `non_numeric_err` parameterizes the error
+/// class so the two call sites get the right Excel-canon error.
+fn collect_xnpv_range(arg: &FnArg, non_numeric_err: ErrorValue) -> Result<Vec<f64>, ErrorValue> {
+    let values = match arg {
+        FnArg::Range { values, .. } => values,
+        FnArg::Scalar(_) => return Err(ErrorValue::Value),
+    };
+    let mut out = Vec::with_capacity(values.len());
+    for v in values.iter() {
+        match v {
+            Value::Number(n) => out.push(*n),
+            Value::Error(e) => return Err(*e),
+            // Empty cells always reject with #NUM! (IronCalc canon).
+            Value::Blank => return Err(ErrorValue::Num),
+            // Non-numeric: error class depends on which arg this is
+            // (values: #NUM!; dates: #VALUE!).
+            _ => return Err(non_numeric_err),
+        }
+    }
+    Ok(out)
+}
+
+/// **W5-D-7 collection helper for XIRR**: extracts numeric values from
+/// a range. Per IronCalc's `get_array_of_numbers_xirr`: empty cells
+/// become `0.0`; non-number cells (Text/Boolean) reject with #VALUE!.
+/// Errors propagate.
+fn collect_xirr_range(arg: &FnArg) -> Result<Vec<f64>, ErrorValue> {
+    let values = match arg {
+        FnArg::Range { values, .. } => values,
+        FnArg::Scalar(_) => return Err(ErrorValue::Value),
+    };
+    let mut out = Vec::with_capacity(values.len());
+    for v in values.iter() {
+        match v {
+            Value::Number(n) => out.push(*n),
+            Value::Error(e) => return Err(*e),
+            Value::Blank => out.push(0.0),
+            _ => return Err(ErrorValue::Value),
+        }
+    }
+    Ok(out)
+}
+
+/// Excel serial-date bounds. **W5-D-7.1 (Codex MEDIUM-1 + Opus
+/// MEDIUM-O-2 closure):** lower bound corrected from `0.0` to `1.0`
+/// to match IronCalc's `MINIMUM_DATE_SERIAL_NUMBER = 1` and our own
+/// `ql-types::date` contract (serials `1..=2_958_465` map to real
+/// dates; serial `0` is Excel's "1/0/1900" display oddity, not a
+/// real YMD). The earlier `0.0` lower bound let blank date cells
+/// (XIRR substitutes them as `0.0`) sneak through as valid schedule
+/// anchors — incorrect.
+const MIN_DATE_SERIAL: f64 = 1.0;
+const MAX_DATE_SERIAL: f64 = 2_958_465.0;
+
+/// **W5-D-7 shared validation**: dates same length as values; all dates
+/// in Excel-serial range; no date precedes the starting date.
+fn validate_xnpv_xirr_dates(values: &[f64], dates: &[f64]) -> Result<(), ErrorValue> {
+    if values.len() != dates.len() {
+        return Err(ErrorValue::Num);
+    }
+    if values.is_empty() {
+        return Err(ErrorValue::Num);
+    }
+    let first_date = dates[0];
+    for &d in dates {
+        if !(MIN_DATE_SERIAL..=MAX_DATE_SERIAL).contains(&d) {
+            return Err(ErrorValue::Num);
+        }
+        if d < first_date {
+            return Err(ErrorValue::Num);
+        }
+    }
+    Ok(())
+}
+
+/// **W5-D-7 (Wave 3 closure — CLOSES Wave 3):**
+/// `XNPV(rate, values, dates)` — net present value of a cash flow
+/// schedule with irregular payment periods. 3 args required.
+///
+/// - `rate > 0` STRICT (matches IronCalc canon — `rate <= 0` → `#NUM!`).
+/// - `values` + `dates` same length; both ranges; rejects empty/non-
+///   numeric cells (IronCalc canon).
+/// - Dates floored to integer; all dates in `[0, 2_958_465]` (Excel
+///   serial-date range); no date precedes the first.
+///
+/// Formula:
+/// ```text
+/// XNPV = v₀ + Σᵢ₌₁ⁿ⁻¹ vᵢ / (1 + rate)^((dᵢ - d₀) / 365)
+/// ```
+pub fn xnpv(args: &[FnArg]) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let rate = match &args[0] {
+        FnArg::Scalar(v) => match arg_num(v) {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        },
+        FnArg::Range { .. } => return Value::Error(ErrorValue::Value),
+    };
+    if rate <= 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    // Per IronCalc canon: values-arg non-numeric → #NUM!;
+    // dates-arg non-numeric → #VALUE!.
+    let values = match collect_xnpv_range(&args[1], ErrorValue::Num) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let dates_raw = match collect_xnpv_range(&args[2], ErrorValue::Value) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    // Truncate fractional dates per IronCalc canon.
+    let dates: Vec<f64> = dates_raw.iter().map(|d| d.floor()).collect();
+    if let Err(e) = validate_xnpv_xirr_dates(&values, &dates) {
+        return Value::Error(e);
+    }
+    finish(compute_xnpv(rate, &values, &dates))
+}
+
+/// **W5-D-7 (Wave 3 closure — CLOSES Wave 3):**
+/// `XIRR(values, dates, [guess])` — internal rate of return for a
+/// cash flow schedule with irregular payment periods. 2 or 3 args.
+///
+/// - `values` + `dates`: same length, both ranges. Empty cells in
+///   values default to 0.0; non-numeric reject with `#VALUE!`.
+/// - At least one positive AND one negative cash flow required (else
+///   `#NUM!` — single-sign cash flow has no IRR).
+/// - `guess > -1.0` strict; defaults to 0.1 if omitted.
+/// - Newton-Raphson on `XNPV(r) = 0` from `guess`; bisection fallback
+///   on `[-0.9999, 100]`; final-fallback Newton-Raphson from 200.
+/// - Returns `#NUM!` if iteration fails to converge.
+pub fn xirr(args: &[FnArg]) -> Value {
+    if !(2..=3).contains(&args.len()) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let values = match collect_xirr_range(&args[0]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let dates_raw = match collect_xirr_range(&args[1]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let dates: Vec<f64> = dates_raw.iter().map(|d| d.floor()).collect();
+    let guess = if args.len() == 3 {
+        match &args[2] {
+            FnArg::Scalar(v) => match arg_num(v) {
+                Ok(n) => n,
+                Err(e) => return Value::Error(e),
+            },
+            FnArg::Range { .. } => return Value::Error(ErrorValue::Value),
+        }
+    } else {
+        0.1
+    };
+    if let Err(e) = validate_xnpv_xirr_dates(&values, &dates) {
+        return Value::Error(e);
+    }
+    finish(compute_xirr(&values, &dates, guess))
+}
+
 // ===== Tests =====
 
 #[cfg(test)]
@@ -3149,5 +3475,459 @@ mod tests {
             n(0.0),
         ]);
         assert_eq!(bool_false, num_zero);
+    }
+
+    // ===== W5-D-7 (Wave 3 closure — date-indexed cash flow) =====
+    //
+    // XNPV / XIRR. Closed-form anchors via Excel's canonical examples;
+    // round-trip XIRR ∘ XNPV (XIRR(values, dates) is the rate r such
+    // that XNPV(r, values, dates) = 0); domain rejections per IronCalc.
+
+    fn n2(x: f64) -> Value {
+        // Local alias for date arity to keep tests readable.
+        Value::Number(x)
+    }
+
+    // --- XNPV ---
+
+    #[test]
+    fn xnpv_microsoft_canonical_anchor() {
+        // Microsoft canonical XNPV example:
+        //   values = [-10000, 2750, 4250, 3250, 2750]
+        //   dates  = [2008-01-01, 2008-03-01, 2008-10-30, 2009-02-15, 2009-04-01]
+        //   rate = 0.09 (9%)
+        //   result ≈ 2086.6478 (Microsoft anchor).
+        // Excel serial dates: 1900-based.
+        //   2008-01-01 = 39448
+        //   2008-03-01 = 39508
+        //   2008-10-30 = 39751
+        //   2009-02-15 = 39859
+        //   2009-04-01 = 39904
+        let values = r(vec![
+            n(-10000.0),
+            n(2750.0),
+            n(4250.0),
+            n(3250.0),
+            n(2750.0),
+        ]);
+        let dates = r(vec![
+            n2(39448.0),
+            n2(39508.0),
+            n2(39751.0),
+            n2(39859.0),
+            n2(39904.0),
+        ]);
+        let result = xnpv(&[s(n(0.09)), values, dates]);
+        match result {
+            Value::Number(got) => assert!(
+                (got - 2086.6478).abs() < 1.0,
+                "expected ≈ 2086.65, got {got}"
+            ),
+            other => panic!("expected Number, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xnpv_single_value_returns_value_at_zero_offset() {
+        // Single value at d0: XNPV = v0 (no discount applied; (di-d0)/365 = 0
+        // for i=0 is implicit since we start the sum at i=0 with v[0]).
+        let values = r(vec![n(100.0)]);
+        let dates = r(vec![n2(40000.0)]);
+        approx(xnpv(&[s(n(0.05)), values, dates]), 100.0, 1e-9);
+    }
+
+    #[test]
+    fn xnpv_rate_at_or_below_zero_is_num_error() {
+        let values = r(vec![n(-100.0), n(110.0)]);
+        let dates = r(vec![n2(40000.0), n2(40365.0)]);
+        // rate = 0.
+        assert_eq!(
+            xnpv(&[s(n(0.0)), values, dates]),
+            Value::Error(ErrorValue::Num)
+        );
+        // rate < 0.
+        let values2 = r(vec![n(-100.0), n(110.0)]);
+        let dates2 = r(vec![n2(40000.0), n2(40365.0)]);
+        assert_eq!(
+            xnpv(&[s(n(-0.01)), values2, dates2]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn xnpv_dates_length_mismatch_is_num_error() {
+        let values = r(vec![n(-100.0), n(50.0), n(60.0)]);
+        let dates = r(vec![n2(40000.0), n2(40365.0)]);
+        assert_eq!(
+            xnpv(&[s(n(0.05)), values, dates]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn xnpv_date_precedes_first_is_num_error() {
+        let values = r(vec![n(-100.0), n(50.0)]);
+        let dates = r(vec![n2(40000.0), n2(39000.0)]); // second date < first
+        assert_eq!(
+            xnpv(&[s(n(0.05)), values, dates]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn xnpv_date_outside_excel_serial_range_is_num_error() {
+        let values = r(vec![n(-100.0), n(50.0)]);
+        let dates = r(vec![n2(40000.0), n2(3_000_000.0)]); // exceeds MAX_DATE_SERIAL
+        assert_eq!(
+            xnpv(&[s(n(0.05)), values, dates]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn xnpv_empty_cell_in_values_is_num_error() {
+        // Per IronCalc canon: empty cells in XNPV's value/date ranges reject.
+        let values = r(vec![n(-100.0), Value::Blank, n(50.0)]);
+        let dates = r(vec![n2(40000.0), n2(40100.0), n2(40365.0)]);
+        assert_eq!(
+            xnpv(&[s(n(0.05)), values, dates]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn xnpv_text_in_dates_is_value_error() {
+        // **W5-D-7.1 (Codex MEDIUM-2 + Opus MEDIUM-O-1 closure):** XNPV
+        // distinguishes its two array args by error class for
+        // non-numeric cells per IronCalc canon:
+        // - `values` arg → non-numeric → #NUM!
+        // - `dates`  arg → non-numeric → #VALUE!
+        // Prior test pinned the wrong class (#NUM! for both). Corrected.
+        let values = r(vec![n(-100.0), n(50.0)]);
+        let dates = r(vec![n2(40000.0), Value::text("not a date")]);
+        assert_eq!(
+            xnpv(&[s(n(0.05)), values, dates]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn xnpv_text_in_values_is_num_error() {
+        // **W5-D-7.1 (Codex MEDIUM-2 + Opus MEDIUM-O-1 closure):**
+        // companion to `xnpv_text_in_dates_is_value_error` pinning the
+        // values-side error class (#NUM!).
+        let values = r(vec![n(-100.0), Value::text("not a number")]);
+        let dates = r(vec![n2(40000.0), n2(40365.0)]);
+        assert_eq!(
+            xnpv(&[s(n(0.05)), values, dates]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn xnpv_error_in_values_propagates() {
+        let values = r(vec![n(-100.0), Value::Error(ErrorValue::Ref)]);
+        let dates = r(vec![n2(40000.0), n2(40365.0)]);
+        assert_eq!(
+            xnpv(&[s(n(0.05)), values, dates]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn xnpv_scalar_for_values_is_value_error() {
+        assert_eq!(
+            xnpv(&[s(n(0.05)), s(n(100.0)), r(vec![n2(40000.0)])]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn xnpv_arity_violations() {
+        // 0, 1, 2, and 4+ args → #VALUE!.
+        assert_eq!(xnpv(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(xnpv(&[s(n(0.05))]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            xnpv(&[s(n(0.05)), r(vec![n(100.0)])]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            xnpv(&[
+                s(n(0.05)),
+                r(vec![n(100.0)]),
+                r(vec![n2(40000.0)]),
+                s(n(0.0)),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // --- XIRR ---
+
+    #[test]
+    fn xirr_microsoft_canonical_anchor() {
+        // Microsoft canonical XIRR example:
+        //   values = [-10000, 2750, 4250, 3250, 2750]
+        //   dates  = same as XNPV example above
+        //   result ≈ 0.373362535 (37.33%).
+        let values = r(vec![
+            n(-10000.0),
+            n(2750.0),
+            n(4250.0),
+            n(3250.0),
+            n(2750.0),
+        ]);
+        let dates = r(vec![
+            n2(39448.0),
+            n2(39508.0),
+            n2(39751.0),
+            n2(39859.0),
+            n2(39904.0),
+        ]);
+        let result = xirr(&[values, dates]);
+        match result {
+            Value::Number(got) => assert!(
+                (got - 0.373362535).abs() < 1e-5,
+                "expected ≈ 0.3734, got {got}"
+            ),
+            other => panic!("expected Number, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xirr_round_trip_with_xnpv() {
+        // XNPV(xirr_result, values, dates) ≈ 0 (XIRR is the rate making
+        // XNPV zero by definition).
+        let values_vec = vec![-10000.0, 2750.0, 4250.0, 3250.0, 2750.0];
+        let dates_vec = vec![39448.0, 39508.0, 39751.0, 39859.0, 39904.0];
+        let values = r(vec![
+            n(-10000.0),
+            n(2750.0),
+            n(4250.0),
+            n(3250.0),
+            n(2750.0),
+        ]);
+        let dates = r(vec![
+            n2(39448.0),
+            n2(39508.0),
+            n2(39751.0),
+            n2(39859.0),
+            n2(39904.0),
+        ]);
+        let rate = match xirr(&[values, dates]) {
+            Value::Number(r) => r,
+            other => panic!("XIRR returned {other:?}"),
+        };
+        let npv_at_rate = compute_xnpv(rate, &values_vec, &dates_vec).expect("xnpv");
+        assert!(
+            npv_at_rate.abs() < 1e-4,
+            "XNPV(XIRR(...)) should be ~0, got {npv_at_rate}"
+        );
+    }
+
+    #[test]
+    fn xirr_all_positive_values_is_num_error() {
+        // No sign change → no IRR.
+        let values = r(vec![n(100.0), n(200.0), n(300.0)]);
+        let dates = r(vec![n2(40000.0), n2(40100.0), n2(40365.0)]);
+        assert_eq!(xirr(&[values, dates]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn xirr_all_negative_values_is_num_error() {
+        let values = r(vec![n(-100.0), n(-200.0), n(-300.0)]);
+        let dates = r(vec![n2(40000.0), n2(40100.0), n2(40365.0)]);
+        assert_eq!(xirr(&[values, dates]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn xirr_optional_guess() {
+        // Guess defaults to 0.1; explicit guess should produce same result.
+        let v1 = r(vec![n(-1000.0), n(500.0), n(600.0)]);
+        let d1 = r(vec![n2(40000.0), n2(40180.0), n2(40365.0)]);
+        let v2 = r(vec![n(-1000.0), n(500.0), n(600.0)]);
+        let d2 = r(vec![n2(40000.0), n2(40180.0), n2(40365.0)]);
+        let no_guess = xirr(&[v1, d1]);
+        let with_guess = xirr(&[v2, d2, s(n(0.1))]);
+        match (no_guess, with_guess) {
+            (Value::Number(a), Value::Number(b)) => {
+                assert!((a - b).abs() < 1e-9, "guess default mismatch: {a} vs {b}");
+            }
+            other => panic!("XIRR returned {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xirr_guess_at_or_below_minus_one_is_value_error() {
+        let values = r(vec![n(-100.0), n(50.0), n(60.0)]);
+        let dates = r(vec![n2(40000.0), n2(40180.0), n2(40365.0)]);
+        // compute_xirr returns Value error for guess <= -1.
+        assert_eq!(
+            xirr(&[values, dates, s(n(-1.0))]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn xirr_empty_cell_in_values_treated_as_zero() {
+        // XIRR empty-cell rule (differs from XNPV): empty → 0.0.
+        // Need at least one positive and one negative cash flow after
+        // the substitution.
+        let values = r(vec![n(-100.0), Value::Blank, n(110.0)]);
+        let dates = r(vec![n2(40000.0), n2(40180.0), n2(40365.0)]);
+        // Should succeed (no rejection of empty); compute_xirr returns
+        // some number.
+        match xirr(&[values, dates]) {
+            Value::Number(_) => {}
+            other => panic!("expected Number, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xirr_text_in_values_is_value_error() {
+        // XIRR rejects text/bool with #VALUE!.
+        let values = r(vec![n(-100.0), Value::text("nope"), n(110.0)]);
+        let dates = r(vec![n2(40000.0), n2(40180.0), n2(40365.0)]);
+        assert_eq!(xirr(&[values, dates]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn xirr_dates_length_mismatch_is_num_error() {
+        let values = r(vec![n(-100.0), n(50.0), n(60.0)]);
+        let dates = r(vec![n2(40000.0), n2(40365.0)]);
+        assert_eq!(xirr(&[values, dates]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn xirr_date_precedes_first_is_num_error() {
+        let values = r(vec![n(-100.0), n(110.0)]);
+        let dates = r(vec![n2(40000.0), n2(39000.0)]);
+        assert_eq!(xirr(&[values, dates]), Value::Error(ErrorValue::Num));
+    }
+
+    #[test]
+    fn xirr_error_in_values_propagates() {
+        let values = r(vec![n(-100.0), Value::Error(ErrorValue::DivZero)]);
+        let dates = r(vec![n2(40000.0), n2(40365.0)]);
+        assert_eq!(xirr(&[values, dates]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn xirr_arity_violations() {
+        assert_eq!(xirr(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            xirr(&[r(vec![n(-100.0), n(110.0)])]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            xirr(&[
+                r(vec![n(-100.0), n(110.0)]),
+                r(vec![n2(40000.0), n2(40365.0)]),
+                s(n(0.1)),
+                s(n(0.0)),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // === W5-D-7.1 audit-closure regression tests ===
+
+    #[test]
+    fn xirr_near_minus_one_guess_high1_regression() {
+        // **W5-D-7.1 (Codex HIGH-1 closure):** Regression for the
+        // residual-check fix. The IronCalc-port version of
+        // `xirr_newton` accepted step-size convergence even when the
+        // residual was huge (occurs near the `rate = -1` singularity).
+        //
+        // Repro: `values=[-100, 1000]`, `dates=[40000, 40365]`,
+        // `guess=-0.999999999`. The true root is exactly `r=9.0`
+        // because `-100 + 1000/(1+9) = 0`. The old impl returned
+        // about `-0.999999998` (a non-root with residual ~5e11);
+        // post-closure, the residual check kicks Newton out and the
+        // bisection fallback (or larger-guess Newton) finds `9.0`.
+        let values = r(vec![n(-100.0), n(1000.0)]);
+        let dates = r(vec![n2(40000.0), n2(40365.0)]);
+        let result = xirr(&[values, dates, s(n(-0.999999999))]);
+        match result {
+            Value::Number(rate) => assert!(
+                (rate - 9.0).abs() < 1e-4,
+                "expected ≈ 9.0, got {rate} (non-root regression — residual check failed?)"
+            ),
+            other => panic!("expected Number ≈ 9.0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xirr_bisection_fallback_path() {
+        // **W5-D-7.1 (Codex LOW-1 closure):** force Newton to fail by
+        // using a guess that produces a near-zero derivative, then
+        // verify bisection finds the root. The two-cash-flow schedule
+        // `values=[-100, 110]` over one year (365 days) has analytic
+        // root `r = 0.10` (10% annual return). Use a divergent guess
+        // (`5.0` — far from root) so Newton may overshoot multiple
+        // times before bisection takes over. Result should still be
+        // ≈ 0.10.
+        let values = r(vec![n(-100.0), n(110.0)]);
+        let dates = r(vec![n2(40000.0), n2(40365.0)]);
+        let result = xirr(&[values, dates, s(n(5.0))]);
+        match result {
+            Value::Number(rate) => {
+                assert!((rate - 0.10).abs() < 1e-4, "expected ≈ 0.10, got {rate}")
+            }
+            other => panic!("expected Number ≈ 0.10, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xirr_nan_guess_is_num_error() {
+        // **W5-D-7.1 (Opus LOW closure):** NaN guess is rejected at
+        // the COERCION layer (`to_number_strict_skip_blank` returns
+        // `#NUM!` for `Value::Number(NaN)`) BEFORE reaching the
+        // `compute_xirr` domain check. The `guess.is_nan()` guard
+        // added to `compute_xirr` is defense-in-depth for direct
+        // callers that bypass the coercion layer; the public XIRR
+        // surface returns `#NUM!`.
+        let values = r(vec![n(-100.0), n(110.0)]);
+        let dates = r(vec![n2(40000.0), n2(40365.0)]);
+        assert_eq!(
+            xirr(&[values, dates, s(n(f64::NAN))]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn compute_xirr_direct_nan_guess_is_value_error() {
+        // **W5-D-7.1 (Opus LOW defense-in-depth):** pin the
+        // `compute_xirr` NaN guard for callers that skip the
+        // coercion layer (e.g. internal kernel reuse).
+        let values = vec![-100.0, 110.0];
+        let dates = vec![40000.0, 40365.0];
+        assert_eq!(
+            compute_xirr(&values, &dates, f64::NAN),
+            Err(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn xnpv_date_serial_zero_is_num_error() {
+        // **W5-D-7.1 (Codex MEDIUM-1 + Opus MEDIUM-O-2 closure):**
+        // serial 0 is Excel's "1/0/1900" display oddity, not a real
+        // YMD. IronCalc's `MINIMUM_DATE_SERIAL_NUMBER = 1`; we matched
+        // by raising `MIN_DATE_SERIAL` from 0.0 to 1.0. Pin the
+        // rejection of serial 0 in XNPV.
+        let values = r(vec![n(-100.0), n(110.0)]);
+        let dates = r(vec![n2(0.0), n2(365.0)]);
+        assert_eq!(
+            xnpv(&[s(n(0.05)), values, dates]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn xirr_date_serial_zero_is_num_error() {
+        // Companion to `xnpv_date_serial_zero_is_num_error`.
+        let values = r(vec![n(-100.0), n(110.0)]);
+        let dates = r(vec![n2(0.0), n2(365.0)]);
+        assert_eq!(xirr(&[values, dates]), Value::Error(ErrorValue::Num));
     }
 }

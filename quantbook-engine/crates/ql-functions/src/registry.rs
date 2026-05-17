@@ -729,6 +729,15 @@ pub fn default_registry() -> FunctionRegistry {
     // (reinvestment) cash flows. RangeAwareFn; first arg must be range.
     r.register_range_aware("MIRR", financial_fns::mirr);
 
+    // **W5-D-7 (Wave 3 closure — CLOSES Wave 3):** XNPV / XIRR —
+    // date-indexed cash flow. Both RangeAwareFn with 2 ranges
+    // (values + dates). XIRR uses Newton-Raphson on XNPV's
+    // derivative with bisection fallback, matching IronCalc's
+    // `financial_util.rs` pattern. Closes the final Wave-3-tagged
+    // matrix item.
+    r.register_range_aware("XNPV", financial_fns::xnpv);
+    r.register_range_aware("XIRR", financial_fns::xirr);
+
     // Phase 4.10 polish (W5-177) — CORREL: Pearson correlation
     // coefficient. RangeAwareFn; both args must be ranges of identical
     // shape. First Wave 3 statistical function ported from IronCalc.
@@ -1003,7 +1012,12 @@ mod tests {
         // COVARIANCE.P, COVARIANCE.S = 2 — range-aware tier;
         // population vs sample covariance via shared compute_covariance
         // kernel. Closes the Wave 3 paired-array gap.
-        assert_eq!(r.len(), 236);
+        // W5-D-7 (Wave 3 closure — CLOSES WAVE 3 — date-indexed
+        // cash flow): XNPV, XIRR = 2 — range-aware tier; XNPV
+        // closed-form, XIRR Newton-Raphson with bisection fallback
+        // (matches IronCalc's `compute_xirr` pattern). Closes the
+        // final Wave-3-tagged matrix item.
+        assert_eq!(r.len(), 238);
     }
 
     #[test]

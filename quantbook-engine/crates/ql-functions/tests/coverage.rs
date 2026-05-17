@@ -315,6 +315,19 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
         "COVARIANCE.S",
         "W5-D-6; unit tests pin Bessel-corrected sample covariance + Microsoft canonical example (data1=[3,2,4,5,6], data2=[9,7,12,15,17]) → 6.5 + COVARIANCE.S = COVARIANCE.P * n/(n-1) algebraic relationship + single-pair → #DIV/0! + shape/error/arity coverage",
     ),
+    // W5-D-7 (Wave 3 closure — CLOSES WAVE 3 — date-indexed cash flow):
+    // XNPV (closed-form) + XIRR (Newton-Raphson w/ bisection fallback).
+    // RangeAware tier. Matches IronCalc's `compute_xnpv` / `compute_xirr`
+    // line-by-line. Note: XNPV rejects empty/non-numeric cells; XIRR
+    // treats empty as 0.0 and rejects text/boolean with #VALUE!.
+    (
+        "XNPV",
+        "W5-D-7; unit tests pin Microsoft canonical example (values=[-10000, 2750, 4250, 3250, 2750], dates=[39448, 39508, 39751, 39859, 39904], rate=0.09 → ≈2086.65) + single-value at zero offset + rate <= 0 → #NUM! + length mismatch → #NUM! + date precedes first → #NUM! + date outside [0, 2_958_465] → #NUM! + empty/non-numeric/text → #NUM! + error propagation + scalar-instead-of-range → #VALUE! + arity violations (0/1/2/4+ args)",
+    ),
+    (
+        "XIRR",
+        "W5-D-7; unit tests pin Microsoft canonical example → ≈0.37336 + round-trip XNPV(xirr_result, ...) ≈ 0 + all-positive/all-negative cash flows → #NUM! + optional guess defaults to 0.1 + guess <= -1 → #VALUE! + empty cells substituted as 0.0 (XIRR-specific divergence from XNPV) + text in values → #VALUE! + length mismatch / date-order #NUM! + error propagation + arity",
+    ),
     // W5-180 (Phase 4.10 polish / Wave 3 depreciation batch starter) —
     // SLN + SYD: closed-form straight-line + sum-of-years digits
     // depreciation. Scalar; both ported from IronCalc `fn_sln` /

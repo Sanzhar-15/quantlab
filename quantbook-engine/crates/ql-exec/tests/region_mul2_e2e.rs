@@ -550,6 +550,20 @@ fn e2e_correl_registered() {
 }
 
 #[test]
+fn e2e_xnpv_xirr_registered() {
+    // **W5-D-7 (Wave 3 closure — CLOSES Wave 3):** smoke-check
+    // registry dispatch for XNPV / XIRR. Same pattern as sibling
+    // financial range-aware fns (NPV / IRR / MIRR). Verifies
+    // case-insensitive lookup works for the new uppercase canonical
+    // names.
+    let registry = default_registry();
+    assert!(registry.lookup_range_aware("XNPV").is_some());
+    assert!(registry.lookup_range_aware("xnpv").is_some());
+    assert!(registry.lookup_range_aware("XIRR").is_some());
+    assert!(registry.lookup_range_aware("xirr").is_some());
+}
+
+#[test]
 fn e2e_covariance_p_s_registered() {
     // **W5-D-6.1 (Opus MEDIUM-O-1 closure):** smoke-check registry
     // dispatch for COVARIANCE.P / COVARIANCE.S. Same pattern as
