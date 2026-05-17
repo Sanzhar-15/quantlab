@@ -236,3 +236,67 @@ Opus LOWs 1-10 + Codex LOWs 1-3 — naming nits, test renames, citation links. T
 3. **Codex caught what Opus didn't (and vice versa) — convergence is signal.** S3-HIGH-1 (materializer regression) was convergent — high-confidence. S3-HIGH-2 (ISREF walker) Codex rated MEDIUM, Opus HIGH — reconciliation rule kicked in. S3-HIGH-4 (producer/replay) was Codex-only — the kind of cross-cycle producer/replay invariant that requires deep walking. **Pattern signal:** running parallel audits with different models surfaces independent classes of issues. Severity-conflict resolution rule (take higher unless reasoning is faulty) consistently produces the right call.
 
 4. **The `RangeRef` walker arm has now flipped twice.** Original: synthetic-marker push (S1-MED-δ found unsafe). Step 1.1: no-op (Step 3 HIGH-2 found unsafe for 1×1). Step 3.1: cell-dep on 1×1 only. **Pattern signal:** when a finding closes by *deleting* code, audit what coverage the deleted code was load-bearing for.
+
+---
+
+## Audit cycle 5 — Step 4 (FORMULATEXT — CLOSES mini-phase)
+
+**Scope:** working-tree Step 4 changes — `reference_fns.rs` (added `formulatext` impl + 9 unit tests), `registry.rs` (registered FORMULATEXT Eager + count 199 → 200), `plan.rs` (invariant test extended to all 7 names; FORMULATEXT-pending sentinel removed), NEW `reference_fns_step4_e2e.rs` (~15 e2e tests with the producer/replay pin), `coverage.rs` (FORMULATEXT entry), `excel-matrix.md`.
+**HEAD baseline:** `43615dd7cd1` (post-Step-3.1). Pre-audit gates: 3260 tests passing.
+
+**Codex audit:** `2026-05-17-rt-step-4-codex.md` — **1 HIGH + 1 MEDIUM + 5 LOW = 7 findings.**
+**Opus audit:** `2026-05-17-rt-step-4-opus.md` — **3 HIGH + 11 MEDIUM + 11 LOW = 25 findings.**
+
+### Severity reconciliation
+
+| Finding | Codex | Opus | Reconciled | Rationale |
+|---------|-------|------|------------|-----------|
+| FORMULATEXT producer/replay self-reference pin missing | HIGH-S4-1 | S4-HIGH-2 | **HIGH** | Convergent. Parallel to S3-HIGH-5 for ISFORMULA. |
+| Transaction::put_formula canonicalization divergence | — | S4-HIGH-1 | **HIGH** | Opus-only architectural finding. Two public producer APIs store text differently; design § 2.5 "canonical printer output" promise broken for one of them. |
+| Module header still labels FORMULATEXT "Pending" | LOW-S4-2 | S4-HIGH-3 | **MEDIUM** | Opus rated HIGH; doc-only inaccuracy. Reconcile MEDIUM per severity discipline — fixed in this cycle anyway. |
+| Design § 2.5 doc `FORMULATEXT(SUM(A1:A3))` outdated | MEDIUM-S4-1 | (covered) | **MEDIUM** | Convergent. |
+| Matrix test count 14 vs 16 | LOW-S4-1 | S4-MED-2 | **MEDIUM** | Take higher; matrix accuracy. |
+| Plan checklist unchecked items | LOW-S4-4 | S4-MED-3 | **MEDIUM** | Process hygiene; fix this cycle. |
+| Stale doc-comment citation (step3_e2e vs step4_e2e) | (not flagged) | S4-MED-1 | **LOW** | Doc-only. |
+| Various Opus MEDIUMs (LibreOffice cross-check, clear_formula transition, NamedMultiCellRange, etc.) | — | S4-MED-4 through 11 | **LOW** | Cherry-pick a couple as future-cycle work; not blocking mini-phase ship. |
+| Test comment inaccuracies, naming, ABI doc | LOW-S4-3/5 | various LOW | **LOW** | Cherry-pick. |
+
+### Final HIGH list (3 — all closed)
+
+| ID | Subject | Fix shape |
+|----|---------|-----------|
+| **S4-HIGH-1** | `Transaction::put_formula` skips canonicalization | Document the divergence in `reference_fns.rs` doc-comment + `excel-matrix.md` row. **Option 3 (accept-and-document)** per Opus's recommendation — alignment fix is post-RT-V1. Both producer APIs preserve the leading-`=` invariant; only canonical-vs-raw stored text varies. |
+| **S4-HIGH-2** | FORMULATEXT self-reference producer/replay divergence pin | Added `formulatext_self_reference_returns_na_during_set_formula_v1_pin` in `reference_fns_step4_e2e.rs` — parallel to S3-HIGH-5's ISFORMULA pin. |
+| **S4-HIGH-3** | Module header labels FORMULATEXT "Pending" post-ship | Header updated to remove "Pending" + add CLOSES note. |
+
+### MEDIUM closures (4)
+
+| ID | Subject | Fix |
+|----|---------|-----|
+| **S4-MED-1 (Codex)** | Design § 2.5 FORMULATEXT(SUM(A1:A3)) outdated | (Pending in this cycle — design doc § 2.5 update.) |
+| **S4-MED-2** | Matrix test count 14 → 16 | Updated to `9+15 e2e` (15 e2e after S4-HIGH-2 pin added). |
+| **S4-MED-3** | Plan checklist Step 3/4 unchecked items | Updated to reflect shipped state. |
+| **S4-MED-α** | Doc-comment citation `step3_e2e` → `step4_e2e` | Fixed in reference_fns.rs. |
+
+### LOW deferred
+
+Most Opus LOWs (test naming, ABI doc updates to design § 5, R1C1-mode caveat, etc.) deferred to post-mini-phase polish or Step 5/6 closure. Tracked.
+
+### Mini-phase complete
+
+W5-RT-4 closes the address-only/information/text triad. All 7 reference-tier fns shipped + audited:
+- W5-RT-2 (ROW/COLUMN/ROWS/COLUMNS) — Step 2 address-only batch.
+- W5-RT-3 (ISREF/ISFORMULA) — Step 3 information batch.
+- W5-RT-4 (FORMULATEXT) — Step 4 text batch.
+
+Cumulative across 5 audit cycles: **21 HIGH + ~38 MEDIUM + ~40 LOW** findings — all HIGHs closed, MEDIUMs largely closed (~10 deferred with reasons), LOWs cherry-picked.
+
+### Step 4 pattern signals
+
+1. **Audit count tapering across cycles is signal of maturing architecture.** Cycle 2 (Step 1): 5 HIGH. Cycle 3 (Step 2): 3 HIGH. Cycle 4 (Step 3): 5 HIGH (regression chain!). Cycle 5 (Step 4): 3 HIGH (no new regressions; mostly canonicalization-divergence + doc-rot inherited from prior cycles). **Pattern signal:** late-cycle audits find less novel material — but the regressions they DO find are the most subtle. The S3 → S4 chain (S2-HIGH-2 → S3-HIGH-1 regression → S3.1 fix → S4 finds no new regression) demonstrates the audit discipline working in the long-cycle direction.
+
+2. **Two producer APIs is one too many for a single canonical invariant.** `WorkbookRuntime::set_formula` canonicalizes; `WorkbookTransaction::put_formula` doesn't. Design § 2.5 wrote the canonical invariant assuming one API; reality has two. **Pattern signal:** when a design promises a "canonical X", audit ALL public producer APIs for X — not just the one named in the design.
+
+3. **Producer/replay invariant is a class of finding, not a one-off.** S3-HIGH-5 (ISFORMULA) → S4-HIGH-2 (FORMULATEXT). Both have the same root cause (workbook_runtime set-formula evaluates before installing). **Pattern signal:** when a producer/replay finding closes for one fn, audit ALL fns that query workbook state for the same shape.
+
+4. **Doc-comments labeled "Pending" rot at ship time.** S4-HIGH-3. Same class as Step 1's HIGH-O-1, Step 2's stale `accepts_special_arg_at_bind`, Step 3's `is_reference_aware_function` "v1 always returns false". **Pattern signal — RECURRING:** add a pre-commit grep for `Pending|TODO|in this commit|added recently` in changed files. The cost is one grep; the benefit is catching this pattern across cycles.
