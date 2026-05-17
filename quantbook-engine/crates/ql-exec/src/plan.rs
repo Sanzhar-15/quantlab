@@ -477,6 +477,14 @@ pub(crate) fn is_aggregate_function(name: &str) -> bool {
             // start, step).
             | "TRANSPOSE"
             | "FILTER"
+            // **W5-D-12 (Phase 4.10 V1-260 sealer) — Codex HIGH-001
+            // closure**: SUBTOTAL is a range-aware conditional
+            // aggregate. Without admission here, the binder rejects
+            // `=SUBTOTAL(9, SalesRange)` with NamedRangeInScalarContext
+            // (the function lookup succeeds, but its range arg can't
+            // bind as `AggregateNameRef`). Eval-side dispatch routes
+            // via the parallel `lookup_range_aware` table.
+            | "SUBTOTAL"
     )
 }
 

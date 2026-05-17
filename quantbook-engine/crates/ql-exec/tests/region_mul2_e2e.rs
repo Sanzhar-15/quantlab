@@ -765,6 +765,55 @@ fn e2e_percentile_quartile_registered() {
 }
 
 #[test]
+fn e2e_subtotal_registered() {
+    // **W5-D-12 (Phase 4.10 — V1 260 sealer):** smoke-check registry
+    // dispatch for SUBTOTAL. RangeAwareFn; same registry-lookup pattern
+    // used by sibling conditional aggregates (SUMIF / COUNTIF / SUMIFS).
+    // Verifies case-insensitive lookup + dotted-name-not-required path.
+    let registry = default_registry();
+    assert!(registry.lookup_range_aware("SUBTOTAL").is_some());
+    assert!(registry.lookup_range_aware("subtotal").is_some());
+    assert!(registry.lookup_range_aware("SubTotal").is_some());
+}
+
+#[test]
+fn e2e_subtotal_scalar_args_dispatch() {
+    // **W5-D-12.1 (Codex HIGH-001 closure):** prove SUBTOTAL actually
+    // routes through the binder + dispatcher with real formula source.
+    // Scalar data args sidestep the v1 limitation that literal
+    // `A1:A3` RangeRefs in AggregateArg context aren't yet supported
+    // (a documented engine-wide v1 gap tracked at plan.rs:706-731, NOT
+    // specific to SUBTOTAL). SUBTOTAL(9, 1, 2, 3) → SUM = 6.
+    assert_eq!(
+        eval_source_with_registry("SUBTOTAL(9, 1, 2, 3)", &[]),
+        Value::Number(6.0)
+    );
+}
+
+#[test]
+fn e2e_subtotal_109_normalizes_to_sum() {
+    // **W5-D-12.1 (Codex HIGH-001 closure):** verify the 101..=111
+    // normalization path is reachable through the real binder +
+    // dispatcher. SUBTOTAL(109, 10, 20, 30) ≡ SUM-style dispatch
+    // (v1 has no hidden-row metadata) → 60.
+    assert_eq!(
+        eval_source_with_registry("SUBTOTAL(109, 10, 20, 30)", &[]),
+        Value::Number(60.0)
+    );
+}
+
+#[test]
+fn e2e_subtotal_invalid_function_num_is_value_error() {
+    // **W5-D-12.1 (Codex HIGH-001 closure):** invalid function_num →
+    // #VALUE! through the real dispatcher path.
+    use ql_types::ErrorValue;
+    assert_eq!(
+        eval_source_with_registry("SUBTOTAL(12, 1, 2, 3)", &[]),
+        Value::Error(ErrorValue::Value)
+    );
+}
+
+#[test]
 fn e2e_mirr_registered() {
     // W5-174: MIRR is RangeAwareFn; range-arg construction can't go
     // through the lightweight `bind(&ast, 0)` test helper without

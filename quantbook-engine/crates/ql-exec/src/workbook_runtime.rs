@@ -5198,6 +5198,12 @@ mod tests {
             "MODE",
             "MODE.SNGL",
             "CONCAT",
+            // **W5-D-12 (Phase 4.10 V1-260 sealer) — Codex HIGH-001
+            // closure:** SUBTOTAL is range-aware (dispatches to scalar
+            // aggregates based on function_num) and admitted to
+            // is_aggregate_function so range args bind as
+            // AggregateNameRef. Eval-side routes via lookup_range_aware.
+            "SUBTOTAL",
         ] {
             assert!(
                 reg.lookup_range_aware(name).is_some(),

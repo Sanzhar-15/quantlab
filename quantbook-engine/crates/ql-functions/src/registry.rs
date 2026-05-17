@@ -834,6 +834,14 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_range_aware("QUARTILE.EXC", range_fns::quartile_exc);
     r.register_range_aware("QUARTILE", range_fns::quartile_inc); // Legacy alias for .INC
 
+    // **W5-D-12 (Phase 4.10 — V1 260 sealer):** SUBTOTAL — conditional
+    // aggregate dispatcher. Routes to AVERAGE/COUNT/COUNTA/MAX/MIN/
+    // PRODUCT/STDEV.S/STDEV.P/SUM/VAR.S/VAR.P based on function_num
+    // (1..=11). 101..=111 normalize to 1..=11 (v1 has no hidden-row
+    // metadata; documented divergence). Closes Phase 4.10 V1-260 at
+    // 260 registered fns.
+    r.register_range_aware("SUBTOTAL", range_fns::subtotal);
+
     // **W5-106 (Phase 4.7.M)**: first array-returning function tier.
     // Returns FunctionReturn::Array at the cell boundary → spills via
     // `WorkbookRuntime::set_formula` / `recompute_all` write_spill path
@@ -1081,7 +1089,11 @@ mod tests {
         // .INC), QUARTILE.INC, QUARTILE.EXC, QUARTILE (legacy alias of
         // .INC) = 6 — range-aware tier; array sort + linear interpolation.
         // IronCalc does NOT ship these; original port against Microsoft.
-        assert_eq!(r.len(), 259);
+        // W5-D-12 (Phase 4.10 — V1 260 sealer): SUBTOTAL = 1 — range-
+        // aware conditional aggregate dispatcher (function_num 1..=11
+        // and 101..=111). v1 normalizes 101..=111 to 1..=11 (no hidden-
+        // row metadata in engine). **CLOSES Phase 4.10 V1-260 at 260.**
+        assert_eq!(r.len(), 260);
     }
 
     #[test]

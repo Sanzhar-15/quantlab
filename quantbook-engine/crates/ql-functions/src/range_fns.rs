@@ -1900,6 +1900,130 @@ pub fn quartile_exc(args: &[FnArg]) -> Value {
     }
 }
 
+// ===== W5-D-12 (Phase 4.10 — V1 260 sealer — SUBTOTAL) =====
+//
+// `SUBTOTAL(function_num, ref1, [ref2], ...)` — conditional aggregate
+// that dispatches to one of 11 aggregate kernels based on `function_num`:
+// 1=AVERAGE, 2=COUNT, 3=COUNTA, 4=MAX, 5=MIN, 6=PRODUCT, 7=STDEV.S,
+// 8=STDEV.P, 9=SUM, 10=VAR.S, 11=VAR.P. The 101..=111 range is the
+// "ignore hidden rows" Excel canon (e.g. `SUBTOTAL(109, ...)` = SUM
+// skipping hidden rows). The engine has no hidden-row metadata in v1
+// — 101..=111 are normalized to 1..=11 (documented divergence).
+//
+// Excel canon also says SUBTOTAL skips NESTED `SUBTOTAL` calls in its
+// arg ranges (the "subtotal of subtotals" double-counting guard). The
+// engine evaluates args before calling the fn, so by the time we see
+// `FnArg::Range`'s values they've already been computed; we cannot
+// detect that a value originated from a nested SUBTOTAL. v1 ships
+// without nested-skip (documented divergence). In practice nested
+// SUBTOTAL skipping only matters with multi-level outline/group views
+// which are not part of v1.
+//
+// IronCalc reference: `.references/ironcalc/base/src/functions/subtotal.rs`
+// (line-by-line; IronCalc has full row-visibility metadata + AST access
+// during evaluation, so it implements both behaviors fully). The
+// numeric-dispatch shape matches IronCalc exactly; only the row-
+// visibility + nested-skip semantics differ. Microsoft docs:
+// support.microsoft.com/en-us/office/subtotal-function-7b027003-f060-4ade-9040-e478765b9939
+//
+// **W5-D-12.1 (binder admission — partial; NOT a full literal-range
+// lift):** SUBTOTAL was added to `is_aggregate_function` in
+// `ql-exec::plan` so NAMED-RANGE args (`SUBTOTAL(9, SalesRange)`) bind
+// through `AggregateNameRef`. Literal range refs in arg position
+// (`SUBTOTAL(9, A1:A10)`) remain unbindable in v1 — this is a
+// pre-existing engine-wide gap (see `plan.rs:706-731` and the
+// `AggregateArg`-side deferral doc-comment at `plan.rs:380-383`) that
+// affects every aggregate including standalone `SUM(A1:A10)`. Scalar
+// args (`SUBTOTAL(9, A1, A2, A3)`) and named-range args work today;
+// literal range lifting is tracked as a follow-up across all
+// aggregates, not as SUBTOTAL-specific work.
+//
+// Edge cases:
+// - args.len() < 2 → `#VALUE!` (Excel canon: needs function_num + ≥1 ref).
+// - function_num outside `{1..=11, 101..=111}` → `#VALUE!`.
+// - NaN function_num → `#NUM!` (explicit error-code consistency;
+//   without the guard, `NaN.trunc() as i64` saturates to 0 in safe-
+//   cast Rust ≥1.45 and falls to the `_` arm as `#VALUE!`, diverging
+//   from the engine's NaN-input `#NUM!` convention established by
+//   W5-D-11.1 `extract_quartile_q`).
+// - Errors in data ranges propagate (inherited from the underlying
+//   aggregate kernel — except COUNT/COUNTA which count or skip errors
+//   per their individual canon).
+//
+// **W5-D-12.1 (Opus HIGH-002 closure) — engine-IronCalc/Excel
+// divergences inherited from the dispatched scalar aggregates**
+// (documented; not unique to SUBTOTAL):
+// - **Text in data range → `#VALUE!`** (engine W5-58 strict; IronCalc
+//   + Excel canon skip text). Same divergence already documented for
+//   sibling order-statistic fns (LARGE/SMALL/MEDIAN/MODE/PERCENTILE/
+//   QUARTILE).
+// - **Boolean in data range → coerced to 1/0** (engine; IronCalc +
+//   Excel canon skip booleans).
+// - **Blank scalar in data → skipped** (engine; IronCalc pushes `0.0`
+//   per `subtotal_get_values:184`, which affects PRODUCT — IronCalc
+//   PRODUCT of `[blank, 5]` = 0; our engine = 5).
+// - **PRODUCT of empty range → 0** (engine `scalar_fns::product`
+//   `total.unwrap_or(0.0)`; IronCalc returns 1.0 multiplicative
+//   identity). Engine choice matches the standalone PRODUCT convention.
+// - **Boolean function_num** → coerced (TRUE → 1 = AVG; FALSE → 0 =
+//   #VALUE!); matches IronCalc, diverges from Excel which rejects
+//   Boolean function_num as `#VALUE!` outright.
+// - **Text function_num** → `#VALUE!` always (engine W5-58 strict;
+//   IronCalc lenient-parses "9" → 9.0 via `cast_to_number`).
+
+/// `SUBTOTAL(function_num, ref1, [ref2], ...)` — conditional aggregate
+/// dispatcher. See module-level W5-D-12 block for the canon discussion
+/// and v1 divergences (no hidden-row metadata; no nested-SUBTOTAL skip).
+pub fn subtotal(args: &[FnArg]) -> Value {
+    if args.len() < 2 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let fn_num = match &args[0] {
+        FnArg::Scalar(Value::Number(n)) => {
+            if n.is_nan() {
+                return Value::Error(ErrorValue::Num);
+            }
+            n.trunc() as i64
+        }
+        FnArg::Scalar(Value::Boolean(b)) => i64::from(*b),
+        FnArg::Scalar(Value::Blank) => 0,
+        FnArg::Scalar(Value::Error(e)) => return Value::Error(*e),
+        FnArg::Scalar(Value::Text(_)) | FnArg::Range { .. } => {
+            return Value::Error(ErrorValue::Value)
+        }
+    };
+    // Normalize 101..=111 to 1..=11 (v1: no hidden-row metadata).
+    let normalized = match fn_num {
+        1..=11 => fn_num,
+        101..=111 => fn_num - 100,
+        _ => return Value::Error(ErrorValue::Value),
+    };
+    // Flatten data args (positions 1..n) to Vec<Value> for dispatch to
+    // the scalar aggregates. Scalar args contribute their value; Range
+    // args contribute their flattened values.
+    let mut flat: Vec<Value> = Vec::new();
+    for arg in &args[1..] {
+        match arg {
+            FnArg::Scalar(v) => flat.push(v.clone()),
+            FnArg::Range { values, .. } => flat.extend_from_slice(values),
+        }
+    }
+    match normalized {
+        1 => crate::scalar_fns::average(&flat),
+        2 => crate::scalar_fns::count(&flat),
+        3 => crate::scalar_fns::counta(&flat),
+        4 => crate::scalar_fns::max(&flat),
+        5 => crate::scalar_fns::min(&flat),
+        6 => crate::scalar_fns::product(&flat),
+        7 => crate::scalar_fns::stdev_s(&flat),
+        8 => crate::scalar_fns::stdev_p(&flat),
+        9 => crate::scalar_fns::sum(&flat),
+        10 => crate::scalar_fns::var_s(&flat),
+        11 => crate::scalar_fns::var_p(&flat),
+        _ => unreachable!("normalized to 1..=11 above"),
+    }
+}
+
 /// **W5-179 (Phase 4.10 polish / Wave 3 regression batch closure):**
 /// `RSQ(known_y, known_x)` — coefficient of determination
 /// `R² = CORREL²` per Microsoft + IronCalc. Same arg-order
@@ -5300,6 +5424,337 @@ mod tests {
         assert_eq!(
             quartile_exc(&[arr, s(Value::Error(ErrorValue::Ref))]),
             Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    // === W5-D-12 (Phase 4.10 — V1 260 sealer — SUBTOTAL) ===
+    // function_num dispatch over the 11 aggregate kernels.
+
+    #[test]
+    fn subtotal_sum_function_num_9() {
+        // SUBTOTAL(9, {1, 2, 3, 4}) → SUM = 10.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        assert_eq!(subtotal(&[s(n(9.0)), arr]), Value::Number(10.0));
+    }
+
+    #[test]
+    fn subtotal_average_function_num_1() {
+        // SUBTOTAL(1, {1, 2, 3, 4}) → AVG = 2.5.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        assert_eq!(subtotal(&[s(n(1.0)), arr]), Value::Number(2.5));
+    }
+
+    #[test]
+    fn subtotal_count_function_num_2() {
+        // COUNT counts numeric values only.
+        let arr = r(vec![n(1.0), t("skip"), n(2.0), Value::Blank, n(3.0)]);
+        assert_eq!(subtotal(&[s(n(2.0)), arr]), Value::Number(3.0));
+    }
+
+    #[test]
+    fn subtotal_counta_function_num_3() {
+        // COUNTA counts all non-blank values.
+        let arr = r(vec![n(1.0), t("count_me"), n(2.0), Value::Blank, n(3.0)]);
+        assert_eq!(subtotal(&[s(n(3.0)), arr]), Value::Number(4.0));
+    }
+
+    #[test]
+    fn subtotal_max_function_num_4() {
+        let arr = r(vec![n(5.0), n(1.0), n(3.0), n(7.0), n(2.0)]);
+        assert_eq!(subtotal(&[s(n(4.0)), arr]), Value::Number(7.0));
+    }
+
+    #[test]
+    fn subtotal_min_function_num_5() {
+        let arr = r(vec![n(5.0), n(1.0), n(3.0), n(7.0), n(2.0)]);
+        assert_eq!(subtotal(&[s(n(5.0)), arr]), Value::Number(1.0));
+    }
+
+    #[test]
+    fn subtotal_product_function_num_6() {
+        // PRODUCT: 2*3*4 = 24.
+        let arr = r(vec![n(2.0), n(3.0), n(4.0)]);
+        assert_eq!(subtotal(&[s(n(6.0)), arr]), Value::Number(24.0));
+    }
+
+    #[test]
+    fn subtotal_stdev_s_function_num_7() {
+        // STDEV.S of {2, 4, 4, 4, 5, 5, 7, 9}: mean=5; sum of squared
+        // deviations = 32; sample variance = 32/7 ≈ 4.5714; STDEV.S =
+        // sqrt(4.5714) ≈ 2.138089935299395 (textbook sample sd).
+        let arr = r(vec![
+            n(2.0),
+            n(4.0),
+            n(4.0),
+            n(4.0),
+            n(5.0),
+            n(5.0),
+            n(7.0),
+            n(9.0),
+        ]);
+        approx_scalar(subtotal(&[s(n(7.0)), arr]), 2.138_089_935_299_395, 1e-12);
+    }
+
+    #[test]
+    fn subtotal_stdev_p_function_num_8() {
+        // STDEV.P of {2, 4, 4, 4, 5, 5, 7, 9}: population variance =
+        // 32/8 = 4.0; STDEV.P = sqrt(4) = 2.0 (textbook population sd).
+        let arr = r(vec![
+            n(2.0),
+            n(4.0),
+            n(4.0),
+            n(4.0),
+            n(5.0),
+            n(5.0),
+            n(7.0),
+            n(9.0),
+        ]);
+        approx_scalar(subtotal(&[s(n(8.0)), arr]), 2.0, 1e-12);
+    }
+
+    #[test]
+    fn subtotal_var_s_function_num_10() {
+        // VAR.S of {2, 4, 4, 4, 5, 5, 7, 9} = 32/7 ≈ 4.5714 (Bessel-
+        // corrected sample variance).
+        let arr = r(vec![
+            n(2.0),
+            n(4.0),
+            n(4.0),
+            n(4.0),
+            n(5.0),
+            n(5.0),
+            n(7.0),
+            n(9.0),
+        ]);
+        approx_scalar(subtotal(&[s(n(10.0)), arr]), 32.0 / 7.0, 1e-12);
+    }
+
+    #[test]
+    fn subtotal_var_p_function_num_11() {
+        // VAR.P of {2, 4, 4, 4, 5, 5, 7, 9} = 32/8 = 4.0 (population).
+        let arr = r(vec![
+            n(2.0),
+            n(4.0),
+            n(4.0),
+            n(4.0),
+            n(5.0),
+            n(5.0),
+            n(7.0),
+            n(9.0),
+        ]);
+        approx_scalar(subtotal(&[s(n(11.0)), arr]), 4.0, 1e-12);
+    }
+
+    #[test]
+    fn subtotal_101_normalizes_to_average() {
+        // 101..=111 are the "ignore hidden rows" Excel variants. The
+        // engine has no hidden-row metadata in v1, so 101 normalizes
+        // to 1 (AVERAGE). Pins the documented v1 divergence.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        assert_eq!(subtotal(&[s(n(101.0)), arr]), Value::Number(2.5));
+    }
+
+    #[test]
+    fn subtotal_109_normalizes_to_sum() {
+        // 109 ≡ SUM-skip-hidden; v1 has no hidden-row metadata so
+        // normalizes to 9 (SUM).
+        let arr = r(vec![n(1.0), n(2.0), n(3.0), n(4.0)]);
+        assert_eq!(subtotal(&[s(n(109.0)), arr]), Value::Number(10.0));
+    }
+
+    #[test]
+    fn subtotal_fractional_function_num_truncates() {
+        // function_num truncates toward zero per Microsoft canon (same
+        // as QUARTILE). 9.7 → 9 (SUM). 9.99 → 9. 0.5 → 0 (invalid).
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(subtotal(&[s(n(9.7)), arr.clone()]), Value::Number(6.0));
+        assert_eq!(subtotal(&[s(n(9.99)), arr.clone()]), Value::Number(6.0));
+        assert_eq!(subtotal(&[s(n(0.5)), arr]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn subtotal_function_num_zero_is_value_error() {
+        // 0 outside the valid {1..=11, 101..=111} set.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(subtotal(&[s(n(0.0)), arr]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn subtotal_function_num_12_is_value_error() {
+        // Excel canon: only 1..=11 and 101..=111 valid; 12 is unused.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            subtotal(&[s(n(12.0)), arr]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn subtotal_function_num_100_is_value_error() {
+        // 100 not in either valid set (101..=111 starts at 101).
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            subtotal(&[s(n(100.0)), arr]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn subtotal_function_num_112_is_value_error() {
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            subtotal(&[s(n(112.0)), arr]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn subtotal_function_num_negative_is_value_error() {
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            subtotal(&[s(n(-1.0)), arr]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn subtotal_function_num_nan_is_num_error() {
+        // **W5-D-12.1 (Opus LOW-002 closure):** the `is_nan()` guard
+        // exists for **error-code consistency**, not panic-safety. Rust
+        // ≥1.45's saturating cast already makes `NaN.trunc() as i64= 0`
+        // panic-safe — without the guard, NaN would fall to the `_`
+        // arm and surface as `#VALUE!`. With the guard, NaN routes to
+        // `#NUM!`, matching the engine-wide NaN-input convention
+        // established by `extract_quartile_q` (W5-D-11.1 Codex
+        // MEDIUM-001 closure). Pinning the explicit error code
+        // defends against a refactor that removes the guard.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            subtotal(&[s(n(f64::NAN)), arr]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn subtotal_function_num_lenient_text_still_value_error() {
+        // **W5-D-12.1 (Opus MEDIUM-002 closure):** IronCalc lenient-
+        // parses parseable text via `cast_to_number` — `"9"` → 9.0 →
+        // SUM dispatch. Our engine uses strict text-rejection per the
+        // W5-58 convention (text → #VALUE! always). Pin the divergence
+        // explicitly so a future refactor that adds lenient parsing
+        // would surface as a test failure.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(subtotal(&[s(t("9")), arr]), Value::Error(ErrorValue::Value));
+    }
+
+    #[test]
+    fn subtotal_counta_counts_errors_in_range() {
+        // **W5-D-12.1 (Opus MEDIUM-003 closure):** COUNTA counts errors
+        // (matches Excel canon + IronCalc `subtotal_counta` line 432-
+        // 435 which treats Error like a non-blank value). The dispatch
+        // routes function_num=3 to `scalar_fns::counta` which counts
+        // everything non-blank, including Error. Pin this matrix
+        // intersection so a future refactor of `counta` semantics
+        // would catch the SUBTOTAL impact too.
+        let arr = r(vec![n(1.0), Value::Error(ErrorValue::DivZero), n(3.0)]);
+        assert_eq!(subtotal(&[s(n(3.0)), arr]), Value::Number(3.0));
+    }
+
+    #[test]
+    fn subtotal_count_skips_errors_in_range() {
+        // **W5-D-12.1 (Opus MEDIUM-003 closure):** dual pin —
+        // function_num=2 routes to `scalar_fns::count` which counts
+        // numeric only; errors don't propagate AND don't count
+        // (matches Excel COUNT canon + IronCalc `subtotal_count` line
+        // 502-509). Same data fixture as counta but expected = 2.0.
+        let arr = r(vec![n(1.0), Value::Error(ErrorValue::DivZero), n(3.0)]);
+        assert_eq!(subtotal(&[s(n(2.0)), arr]), Value::Number(2.0));
+    }
+
+    #[test]
+    fn subtotal_function_num_text_is_value_error() {
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            subtotal(&[s(t("nine")), arr]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn subtotal_function_num_error_propagates() {
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            subtotal(&[s(Value::Error(ErrorValue::NA)), arr]),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn subtotal_arity_violations() {
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        // No args.
+        assert_eq!(subtotal(&[]), Value::Error(ErrorValue::Value));
+        // Only function_num, no data refs.
+        assert_eq!(subtotal(&[s(n(9.0))]), Value::Error(ErrorValue::Value));
+        // function_num alone (range form) also invalid.
+        assert_eq!(
+            subtotal(std::slice::from_ref(&arr)),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn subtotal_multiple_ranges_concatenate() {
+        // Multiple refs flatten in order: SUBTOTAL(9, {1, 2}, {3, 4})
+        // → SUM of {1, 2, 3, 4} = 10.
+        let arr1 = r(vec![n(1.0), n(2.0)]);
+        let arr2 = r(vec![n(3.0), n(4.0)]);
+        assert_eq!(subtotal(&[s(n(9.0)), arr1, arr2]), Value::Number(10.0));
+    }
+
+    #[test]
+    fn subtotal_scalar_data_args_supported() {
+        // SUBTOTAL(9, 1, 2, 3) = 6 (scalar data args treated like a
+        // 1-element range each).
+        assert_eq!(
+            subtotal(&[s(n(9.0)), s(n(1.0)), s(n(2.0)), s(n(3.0))]),
+            Value::Number(6.0)
+        );
+    }
+
+    #[test]
+    fn subtotal_boolean_function_num_coerces() {
+        // TRUE → 1 → AVERAGE; FALSE → 0 → #VALUE!.
+        let arr = r(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(
+            subtotal(&[s(Value::Boolean(true)), arr.clone()]),
+            Value::Number(2.0)
+        );
+        assert_eq!(
+            subtotal(&[s(Value::Boolean(false)), arr]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn subtotal_error_in_data_propagates_via_dispatched_kernel() {
+        // Error in data range surfaces through the dispatched aggregate
+        // (SUM/AVG/etc.). #DIV/0! in args[1..] → #DIV/0! result.
+        let arr = r(vec![n(1.0), Value::Error(ErrorValue::DivZero), n(3.0)]);
+        assert_eq!(
+            subtotal(&[s(n(9.0)), arr]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn subtotal_empty_numeric_data_for_average_is_div_zero() {
+        // SUBTOTAL(1, blank, blank) → AVERAGE of zero numeric values
+        // → #DIV/0! (inherited from `scalar_fns::average`).
+        let arr = r(vec![Value::Blank, Value::Blank]);
+        assert_eq!(
+            subtotal(&[s(n(1.0)), arr]),
+            Value::Error(ErrorValue::DivZero)
         );
     }
 
