@@ -895,6 +895,88 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
          p∈(0,1) STRICT both ends, σ≤0 #NUM!, text/error/arity); \
          scalar arg-coverage matrix N/A",
     ),
+    // W5-D-5 (Wave 3 distributions batch — CLOSES Wave 3).
+    // Gamma family + beta + confidence intervals.
+    // statrs::function::gamma::{gamma, ln_gamma} for closed-form Γ
+    // and ln(Γ); statrs::Gamma / statrs::Beta for distributions;
+    // CONFIDENCE.* reuses W5-D-1/W5-D-2 helpers. Per-fn ≥8 tests.
+    (
+        "GAMMA",
+        "distribution fn (W5-D-5) — covered by distribution_fns unit \
+         tests (closed-form Γ(1)=1, Γ(5)=24, Γ(0.5)=√π, Γ(-0.5)=-2√π, \
+         negative-integer poles #NUM!, Γ(0)=Inf→#NUM!, text/error/\
+         arity); scalar arg-coverage matrix N/A. **Not a distribution** \
+         — the gamma function itself via statrs::function::gamma::gamma.",
+    ),
+    (
+        "GAMMA.DIST",
+        "distribution fn (W5-D-5) — covered by distribution_fns unit \
+         tests (CDF=0 at zero, α=1/β=1 reduces to exponential(1) — \
+         CDF(1)=1-e⁻¹ and PDF(0)=1 closed-form, negative x #NUM!, \
+         α≤0 OR β≤0 STRICT #NUM!, text/error/arity-both); scalar \
+         arg-coverage matrix N/A. Excel shape-scale converted to \
+         statrs shape-rate via `rate=1/scale`.",
+    ),
+    (
+        "GAMMA.INV",
+        "distribution fn (W5-D-5) — covered by distribution_fns unit \
+         tests (GAMMA.INV(0,α,β)=0 inclusive lower, α=1/β=1 inverse \
+         exp(1) gives p=0.5 → ln(2), round-trip with GAMMA.DIST, p \
+         outside [0,1] #NUM!, α≤0/β≤0 #NUM!, text/error/arity); \
+         scalar arg-coverage matrix N/A",
+    ),
+    (
+        "GAMMALN",
+        "distribution fn (W5-D-5) — covered by distribution_fns unit \
+         tests (closed-form: ln(Γ(1))=0, ln(Γ(2))=0, ln(Γ(4))=ln(6), \
+         ln(Γ(0.5))=½·ln(π), negative x #NUM!, x=0 ln(Inf)→#NUM!, \
+         text/error/arity); scalar arg-coverage matrix N/A. Uses \
+         statrs::function::gamma::ln_gamma.",
+    ),
+    (
+        "GAMMALN.PRECISE",
+        "distribution fn (W5-D-5) — **alias of GAMMALN** (Excel 2010 \
+         renamed for naming consistency; same numerical impl). \
+         Covered by alias-equality tests at x=4 and x=0.5 + \
+         independent error-class tests. Coverage shape ≥5 since alias.",
+    ),
+    (
+        "BETA.DIST",
+        "distribution fn (W5-D-5, VARIADIC 4-6) — covered by \
+         distribution_fns unit tests (Beta(1,1) is U(0,1) — CDF(0.5)=0.5, \
+         PDF(0.5)=1 closed-form, optional [A,B] bounds with U(0,10) \
+         test PDF=0.1 and CDF=0.5 at x=5, x outside [A,B] #NUM!, \
+         A=B #NUM!, α≤0/β≤0 #NUM!, text/error/arity-both); scalar \
+         arg-coverage matrix N/A. PDF scaled by 1/(B-A) Jacobian.",
+    ),
+    (
+        "BETA.INV",
+        "distribution fn (W5-D-5, VARIADIC 3-5) — covered by \
+         distribution_fns unit tests (Beta(1,1)=U(0,1) → inverse(0.5)=0.5, \
+         round-trip with BETA.DIST, U(0,10) inverse(0.7)=7, p at \
+         endpoints STRICT #NUM!, B≤A #NUM!, α≤0/β≤0 #NUM!, \
+         text/error/arity-both); scalar arg-coverage matrix N/A.",
+    ),
+    (
+        "CONFIDENCE.NORM",
+        "distribution fn (W5-D-5) — covered by distribution_fns unit \
+         tests (z(0.975)≈1.95996 at α=0.05/σ=1/n=1, margin scales \
+         linearly with σ, margin scales as 1/√n, size uses .floor() \
+         not .trunc(), α at strict endpoints #NUM!, σ≤0 #NUM!, size<1 \
+         #NUM!, text/error/arity); scalar arg-coverage matrix N/A. \
+         Reuses W5-D-1 standard_normal helper.",
+    ),
+    (
+        "CONFIDENCE.T",
+        "distribution fn (W5-D-5) — covered by distribution_fns unit \
+         tests (t(0.975, df=9)/√10 statrs-internal anchor 0.71536, \
+         size uses .trunc() not .floor() (diverges from \
+         CONFIDENCE.NORM), large-n approaches CONFIDENCE.NORM, \
+         **size<2 #DIV/0! not #NUM!** (Excel canon — only fn in \
+         distribution_fns returning #DIV/0!), α at strict endpoints \
+         #NUM!, σ≤0 #NUM!, text/error/arity); scalar arg-coverage \
+         matrix N/A. Reuses W5-D-2 students_t_with helper.",
+    ),
 ];
 
 #[test]

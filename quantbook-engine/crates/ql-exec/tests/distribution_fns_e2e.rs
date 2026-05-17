@@ -747,3 +747,248 @@ fn w5_d_4_arity_mismatch_through_dispatcher_returns_value() {
     assert_eq!(eval("LOGNORM.DIST()"), Value::Error(ErrorValue::Value));
     assert_eq!(eval("LOGNORM.INV()"), Value::Error(ErrorValue::Value));
 }
+
+// =====================================================================
+// W5-D-5: Gamma family + Beta + Confidence intervals (CLOSES WAVE 3)
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// GAMMA
+// ---------------------------------------------------------------------
+
+#[test]
+fn gamma_at_one_through_dispatcher_closed_form() {
+    assert_close(eval("GAMMA(1)"), 1.0);
+}
+
+#[test]
+fn gamma_at_half_through_dispatcher_returns_sqrt_pi() {
+    assert_close(eval("GAMMA(0.5)"), std::f64::consts::PI.sqrt());
+}
+
+#[test]
+fn gamma_negative_integer_through_dispatcher_returns_num_error() {
+    assert_eq!(eval("GAMMA(-1)"), Value::Error(ErrorValue::Num));
+}
+
+// ---------------------------------------------------------------------
+// GAMMA.DIST
+// ---------------------------------------------------------------------
+
+#[test]
+fn gamma_dist_alpha_one_at_one_through_dispatcher_closed_form() {
+    // CDF(1; 1, 1) = 1 - e⁻¹.
+    assert_close(eval("GAMMA.DIST(1, 1, 1, TRUE)"), 1.0 - (-1.0_f64).exp());
+}
+
+#[test]
+fn gamma_dist_negative_x_through_dispatcher_returns_num_error() {
+    assert_eq!(
+        eval("GAMMA.DIST(-1, 1, 1, TRUE)"),
+        Value::Error(ErrorValue::Num)
+    );
+}
+
+// ---------------------------------------------------------------------
+// GAMMA.INV
+// ---------------------------------------------------------------------
+
+#[test]
+fn gamma_inv_alpha_one_at_half_through_dispatcher_closed_form() {
+    // For α=1, β=1: inverse CDF at p=0.5 = ln(2).
+    assert_close(eval("GAMMA.INV(0.5, 1, 1)"), 2.0_f64.ln());
+}
+
+#[test]
+fn gamma_inv_p_at_zero_through_dispatcher_returns_zero() {
+    // p=0 inclusive lower.
+    assert_close(eval("GAMMA.INV(0, 1, 1)"), 0.0);
+}
+
+// ---------------------------------------------------------------------
+// GAMMALN + GAMMALN.PRECISE
+// ---------------------------------------------------------------------
+
+#[test]
+fn gamma_ln_at_one_through_dispatcher_returns_zero() {
+    assert_close(eval("GAMMALN(1)"), 0.0);
+}
+
+#[test]
+fn gamma_ln_at_four_through_dispatcher_closed_form() {
+    // ln(Γ(4)) = ln(3!) = ln(6).
+    assert_close(eval("GAMMALN(4)"), 6.0_f64.ln());
+}
+
+#[test]
+fn gamma_ln_precise_alias_through_dispatcher() {
+    // PRECISE alias must match GAMMALN at every x.
+    let a = eval("GAMMALN(4)");
+    let b = eval("GAMMALN.PRECISE(4)");
+    assert_eq!(a, b);
+}
+
+#[test]
+fn gamma_ln_negative_x_through_dispatcher_returns_num_error() {
+    assert_eq!(eval("GAMMALN(-1)"), Value::Error(ErrorValue::Num));
+}
+
+// ---------------------------------------------------------------------
+// BETA.DIST (variadic 4-6)
+// ---------------------------------------------------------------------
+
+#[test]
+fn beta_dist_uniform_cdf_through_dispatcher_returns_half() {
+    // Beta(1, 1) is U(0,1): CDF(0.5) = 0.5.
+    assert_close(eval("BETA.DIST(0.5, 1, 1, TRUE)"), 0.5);
+}
+
+#[test]
+fn beta_dist_with_optional_bounds_through_dispatcher() {
+    // U(0, 10) PDF at x=5 = 0.1.
+    assert_close(eval("BETA.DIST(5, 1, 1, FALSE, 0, 10)"), 0.1);
+}
+
+#[test]
+fn beta_dist_x_outside_bounds_through_dispatcher_returns_num_error() {
+    assert_eq!(
+        eval("BETA.DIST(-0.5, 1, 1, TRUE)"),
+        Value::Error(ErrorValue::Num)
+    );
+}
+
+// ---------------------------------------------------------------------
+// BETA.INV (variadic 3-5)
+// ---------------------------------------------------------------------
+
+#[test]
+fn beta_inv_uniform_at_half_through_dispatcher_returns_half() {
+    assert_close(eval("BETA.INV(0.5, 1, 1)"), 0.5);
+}
+
+#[test]
+fn beta_inv_with_optional_bounds_through_dispatcher() {
+    // U(0, 10) inverse at p=0.7 = 7.
+    assert_close(eval("BETA.INV(0.7, 1, 1, 0, 10)"), 7.0);
+}
+
+#[test]
+fn beta_inv_p_at_endpoints_through_dispatcher_returns_num_error() {
+    assert_eq!(eval("BETA.INV(0, 1, 1)"), Value::Error(ErrorValue::Num));
+    assert_eq!(eval("BETA.INV(1, 1, 1)"), Value::Error(ErrorValue::Num));
+}
+
+// ---------------------------------------------------------------------
+// CONFIDENCE.NORM
+// ---------------------------------------------------------------------
+
+#[test]
+fn confidence_norm_through_dispatcher_returns_z_critical_over_sqrt_n() {
+    // CONFIDENCE.NORM(0.05, 1, 1) ≈ 1.95996.
+    assert_close(eval("CONFIDENCE.NORM(0.05, 1, 1)"), 1.959_963_984_540_054);
+}
+
+#[test]
+fn confidence_norm_alpha_zero_through_dispatcher_returns_num_error() {
+    assert_eq!(
+        eval("CONFIDENCE.NORM(0, 1, 1)"),
+        Value::Error(ErrorValue::Num)
+    );
+}
+
+// ---------------------------------------------------------------------
+// CONFIDENCE.T
+// ---------------------------------------------------------------------
+
+#[test]
+fn confidence_t_size_less_than_two_through_dispatcher_returns_div_zero() {
+    // **WARNING: CONFIDENCE.T returns #DIV/0! not #NUM!** for size<2.
+    // Unique error class in distribution_fns. Pin this through the
+    // dispatcher.
+    assert_eq!(
+        eval("CONFIDENCE.T(0.05, 1, 1)"),
+        Value::Error(ErrorValue::DivZero)
+    );
+}
+
+#[test]
+fn confidence_t_size_10_through_dispatcher_statrs_self_consistent() {
+    // CONFIDENCE.T(0.05, 1, 10) — statrs-internal Newton-Raphson value.
+    assert_close(eval("CONFIDENCE.T(0.05, 1, 10)"), 0.715_356_905_970_664_3);
+}
+
+// ---------------------------------------------------------------------
+// Cross-cutting: case-insensitivity + round-trip + arity
+// ---------------------------------------------------------------------
+
+#[test]
+fn w5_d_5_case_insensitive_lookup_works() {
+    assert_close(eval("gamma(1)"), 1.0);
+    assert_close(eval("Gamma.Dist(1, 1, 1, TRUE)"), 1.0 - (-1.0_f64).exp());
+    assert_close(eval("GammaLn(1)"), 0.0);
+    assert_close(eval("gammaln.precise(1)"), 0.0);
+    assert_close(eval("beta.dist(0.5, 1, 1, TRUE)"), 0.5);
+    assert_close(eval("Beta.Inv(0.5, 1, 1)"), 0.5);
+    assert_close(eval("confidence.norm(0.05, 1, 1)"), 1.959_963_984_540_054);
+}
+
+#[test]
+fn gamma_inv_dist_round_trip_through_dispatcher() {
+    let inner = eval("GAMMA.INV(0.73, 2, 3)");
+    let x = match inner {
+        Value::Number(n) => n,
+        other => panic!("GAMMA.INV returned {other:?}"),
+    };
+    let formula = format!("GAMMA.DIST({x}, 2, 3, TRUE)");
+    assert_close(eval(&formula), 0.73);
+}
+
+#[test]
+fn gamma_inv_p_one_through_dispatcher_returns_num_error() {
+    // **W5-D-5.1 (Codex LOW-1 + Opus LOW-O-1 closure):** GAMMA.INV
+    // accepts `p == 1` per inclusive domain, but `inverse_cdf(1.0)`
+    // returns `+Inf` so the finite-result guard surfaces `#NUM!`.
+    // Pin this through the dispatcher.
+    assert_eq!(eval("GAMMA.INV(1, 1, 1)"), Value::Error(ErrorValue::Num));
+}
+
+#[test]
+fn gamma_inv_subnormal_scale_through_dispatcher_panic_regression() {
+    // **W5-D-5.1 (Codex HIGH-1 closure):** end-to-end pin for the
+    // subnormal-scale non-termination fix. Without the
+    // `is_finite()` guard in `gamma_dist_with`, this would hang
+    // indefinitely in statrs's `inverse_cdf` bracketing loop.
+    assert_eq!(
+        eval("GAMMA.INV(0.5, 1, 5E-324)"),
+        Value::Error(ErrorValue::Num)
+    );
+}
+
+#[test]
+fn beta_inv_dist_round_trip_through_dispatcher() {
+    // **W5-D-5.1 (Codex LOW-2 closure):** add dispatcher round-trip
+    // for BETA.* paired with the existing GAMMA.* round-trip, to
+    // give the variadic Beta pair the same registry/parser/dispatcher
+    // coverage. Includes optional [A, B] bounds to exercise the
+    // transformed-domain path.
+    let inner = eval("BETA.INV(0.73, 2, 5, 0, 10)");
+    let x = match inner {
+        Value::Number(n) => n,
+        other => panic!("BETA.INV returned {other:?}"),
+    };
+    let formula = format!("BETA.DIST({x}, 2, 5, TRUE, 0, 10)");
+    assert_close(eval(&formula), 0.73);
+}
+
+#[test]
+fn w5_d_5_arity_mismatch_through_dispatcher_returns_value() {
+    assert_eq!(eval("GAMMA()"), Value::Error(ErrorValue::Value));
+    assert_eq!(eval("GAMMA.DIST()"), Value::Error(ErrorValue::Value));
+    assert_eq!(eval("GAMMA.INV()"), Value::Error(ErrorValue::Value));
+    assert_eq!(eval("GAMMALN()"), Value::Error(ErrorValue::Value));
+    assert_eq!(eval("GAMMALN.PRECISE()"), Value::Error(ErrorValue::Value));
+    assert_eq!(eval("BETA.DIST()"), Value::Error(ErrorValue::Value));
+    assert_eq!(eval("BETA.INV()"), Value::Error(ErrorValue::Value));
+    assert_eq!(eval("CONFIDENCE.NORM()"), Value::Error(ErrorValue::Value));
+    assert_eq!(eval("CONFIDENCE.T()"), Value::Error(ErrorValue::Value));
+}

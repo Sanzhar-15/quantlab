@@ -7,11 +7,17 @@
 //! - **W5-D-3**: CHISQ.DIST / CHISQ.DIST.RT / CHISQ.INV /
 //!   CHISQ.INV.RT + F.DIST / F.DIST.RT / F.INV / F.INV.RT —
 //!   chi-squared and Fisher-Snedecor F distribution variants.
-//! - **W5-D-4 (this commit)**: BINOM.DIST / BINOM.DIST.RANGE /
+//! - **W5-D-4**: BINOM.DIST / BINOM.DIST.RANGE /
 //!   BINOM.INV / NEGBINOM.DIST / POISSON.DIST / EXPON.DIST /
 //!   LOGNORM.DIST / LOGNORM.INV — discrete (binomial + neg-binomial +
 //!   Poisson) + continuous (exponential + log-normal) distributions.
-//!   **First discrete-distribution batch.**
+//!   First discrete-distribution batch.
+//! - **W5-D-5 (this commit, CLOSES Wave 3)**: GAMMA / GAMMA.DIST /
+//!   GAMMA.INV / GAMMALN / GAMMALN.PRECISE / BETA.DIST / BETA.INV /
+//!   CONFIDENCE.NORM / CONFIDENCE.T — gamma family (function +
+//!   distribution + ln) + beta distribution (variadic with optional
+//!   [A, B] bounds) + confidence-interval margins for normal +
+//!   Student's t. All continuous.
 //!
 //! ## Implementation strategy
 //!
@@ -33,6 +39,21 @@
 //!   CDF=`1 - exp(-λx)`, PDF=`λ·exp(-λx)`.
 //! - **LOGNORM.\*** → `statrs::distribution::LogNormal` (location=mean,
 //!   scale=sd) — parameters are the underlying normal's mean / sd.
+//! - **GAMMA / GAMMALN / GAMMALN.PRECISE** → closed-form via
+//!   `statrs::function::gamma::{gamma, ln_gamma}` (NOT
+//!   distribution-backed — these are the gamma / log-gamma functions
+//!   themselves, not the Gamma distribution).
+//! - **GAMMA.DIST / GAMMA.INV** → `statrs::distribution::Gamma`
+//!   (shape=alpha, rate=1/beta_scale). Note: statrs uses
+//!   shape-rate, Excel uses shape-scale; convert at call site.
+//! - **BETA.\*** → `statrs::distribution::Beta` (alpha, beta).
+//!   Optional `[A, B]` bounds shift the [0, 1] standard Beta to
+//!   `[A, B]` via `t = (x - A) / (B - A)`.
+//! - **CONFIDENCE.NORM** → reuses NORM standard normal (W5-D-1
+//!   `standard_normal()` helper). Returns
+//!   `z(1 - α/2) · σ / √n` margin.
+//! - **CONFIDENCE.T** → reuses StudentsT (W5-D-2 `students_t_with`)
+//!   with `df = n - 1`. Returns `t_crit · σ / √n` margin.
 //!
 //! For inputs that successfully coerce to identical f64 tuples, our
 //! `dist.pdf(x)` / `dist.cdf(x)` / `dist.inverse_cdf(p)` calls produce
@@ -140,6 +161,43 @@
 //! - `LOGNORM.INV(probability, mean, standard_dev)` — 3 args. Inverse
 //!   CDF. `0 < p < 1` strict both; `sd > 0`.
 //!
+//! **W5-D-5 (gamma family + beta + confidence intervals):**
+//!
+//! - `GAMMA(x)` — 1 arg. Closed-form gamma function via
+//!   `statrs::function::gamma::gamma`. Reject `x < 0 && x.floor() ==
+//!   x` (gamma is undefined at non-positive integers). Non-finite
+//!   result → `#NUM!`.
+//! - `GAMMA.DIST(x, alpha, beta, cumulative)` — 4 args. Gamma
+//!   distribution PDF/CDF. `x >= 0`, `alpha > 0`, `beta > 0` strict.
+//!   statrs `Gamma::new(alpha, 1/beta)` (shape-rate; Excel passes
+//!   shape-scale).
+//! - `GAMMA.INV(probability, alpha, beta)` — 3 args. Inverse gamma
+//!   CDF. `0 <= p <= 1` INCLUSIVE; `alpha > 0`, `beta > 0`. Else
+//!   `#NUM!`.
+//! - `GAMMALN(x)` and `GAMMALN.PRECISE(x)` — 1 arg each. Log-gamma
+//!   `ln(Γ(x))` via `statrs::function::gamma::ln_gamma`. Reject
+//!   `x < 0`. (PRECISE is an alias of GAMMALN — Excel introduced it
+//!   for naming consistency; same impl.)
+//! - `BETA.DIST(x, alpha, beta, cumulative, [A], [B])` — **VARIADIC
+//!   4-6 args**. Optional `[A, B]` bounds default to `[0, 1]`
+//!   (standard Beta). Transforms via `t = (x - A) / (B - A)`. PDF
+//!   scaled by `1 / (B - A)` per Jacobian. `x ∈ [A, B]`, `A < B`,
+//!   `alpha > 0`, `beta > 0`.
+//! - `BETA.INV(probability, alpha, beta, [A], [B])` — **VARIADIC
+//!   3-5 args**. Same optional bounds. `0 < p < 1` STRICT both;
+//!   `A < B`, `alpha > 0`, `beta > 0`. Returns
+//!   `A + t * (B - A)` where `t = inverse_cdf(p)`.
+//! - `CONFIDENCE.NORM(alpha, standard_dev, size)` — 3 args. Returns
+//!   `z(1 - α/2) · σ / √n` (two-sided normal CI half-width).
+//!   `0 < α < 1` strict, `σ > 0`, `size.floor() >= 1`. **Note: size
+//!   uses `.floor()`, NOT `.trunc()`** — matches IronCalc.
+//! - `CONFIDENCE.T(alpha, standard_dev, size)` — 3 args. Same as
+//!   NORM but with `t(1 - α/2; df=n-1)` critical value. `size.trunc()
+//!   >= 2` (df=n-1 must be ≥ 1). **`size < 2.0` returns `#DIV/0!`**
+//!   (matches IronCalc + Excel canon — different error class from
+//!   `#NUM!`). **Note: size uses `.trunc()`** (IronCalc divergence
+//!   from CONFIDENCE.NORM's `.floor()`).
+//!
 //! ## Arg coercion
 //!
 //! Numeric args (`x`, `mean`, `sd`, `prob`, `deg_freedom`) are coerced
@@ -178,6 +236,15 @@
 //! `dist.sf(x)` (survival function) directly for better numerical
 //! stability vs `1 - dist.cdf(x)` in the far right tail; F.DIST.RT
 //! uses `1 - dist.cdf(x)` matching IronCalc canon.
+//!
+//! **W5-D-5 (CONFIDENCE.NORM / CONFIDENCE.T)** apply `.floor()` and
+//! `.trunc()` respectively to the `size` argument before integer
+//! conversion. The divergence is deliberate — matches IronCalc which
+//! itself follows Excel canon. `.floor(-0.5) = -1` vs `.trunc(-0.5) =
+//! 0`, but both fns reject `size < 1` (NORM) / `size < 2` (T) so the
+//! divergence is invisible for in-domain inputs. `CONFIDENCE.T`
+//! returns `#DIV/0!` (not `#NUM!`) for `size < 2` per Excel canon —
+//! the only fn in distribution_fns that surfaces `#DIV/0!`.
 //!
 //! **W5-D-4 (BINOM.\* / NEGBINOM.\* / POISSON.\* fns)** convert
 //! integer-typed args (`number_s`, `trials`, `number_s2`, `number_f`,
@@ -244,9 +311,10 @@
 //! errors to `#NUM!` (closer to Excel canon).
 
 use statrs::distribution::{
-    Binomial, ChiSquared, Continuous, ContinuousCDF, Discrete, DiscreteCDF, FisherSnedecor,
-    LogNormal, NegativeBinomial, Normal, Poisson, StudentsT,
+    Beta, Binomial, ChiSquared, Continuous, ContinuousCDF, Discrete, DiscreteCDF, FisherSnedecor,
+    Gamma, LogNormal, NegativeBinomial, Normal, Poisson, StudentsT,
 };
+use statrs::function::gamma::{gamma as gamma_fn, ln_gamma};
 
 use ql_types::{coercion, ErrorValue, Value};
 
@@ -1331,6 +1399,407 @@ pub fn lognorm_inv(args: &[Value]) -> Value {
     }
     let dist = log_normal_with(mean, sd);
     finite_or_num(dist.inverse_cdf(p))
+}
+
+// =====================================================================
+// W5-D-5: Gamma family (GAMMA / GAMMA.DIST / GAMMA.INV / GAMMALN /
+// GAMMALN.PRECISE)
+// =====================================================================
+//
+// `statrs::function::gamma::{gamma, ln_gamma}` for the closed-form
+// gamma/log-gamma functions (NOT distribution-backed for GAMMA itself
+// — these are the gamma functions). `statrs::distribution::Gamma` for
+// GAMMA.DIST / GAMMA.INV (shape-rate parameterization; Excel passes
+// shape-scale so we convert via `rate = 1/scale`).
+
+/// Build a Gamma distribution from Excel shape (alpha) and scale
+/// (beta) parameters. Converts to statrs's shape-rate parameterization
+/// via `rate = 1/scale`. Call sites pre-check `alpha > 0` AND
+/// `beta > 0`; `to_number_strict` rejects NaN. Construction cannot
+/// fail when `rate` is finite. `.expect()` per No-Fallbacks rule.
+///
+/// **W5-D-5.1 (Codex HIGH-1 closure):** returns `Option<Gamma>`
+/// because `1.0 / scale` overflows to `+Inf` for subnormal `scale`
+/// (e.g. `5e-324`), which statrs 0.18.0 accepts (`Gamma::new` only
+/// rejects NaN / `<= 0`, and infinite `rate` alone passes — only
+/// `shape=Inf && rate=Inf` is rejected). statrs's `inverse_cdf`
+/// then hangs in its bracketing loop because `cdf(any-finite-high) =
+/// 0.0` so the doubling `while self.cdf(high) < p` never exits.
+///
+/// Callers must short-circuit `#NUM!` on `None`. Microsoft canon
+/// doesn't cover this corner; IronCalc has the same unchecked
+/// conversion and would hang too — we follow the W5-D-4 BINOM.INV
+/// precedent of explicitly diverging from IronCalc to protect engine
+/// availability.
+fn gamma_dist_with(alpha: f64, scale: f64) -> Option<Gamma> {
+    let rate = 1.0 / scale;
+    if !rate.is_finite() {
+        return None;
+    }
+    Some(Gamma::new(alpha, rate).expect(
+        "upstream sanitize_f64 + alpha>0 + scale>0 + finite-rate guard guarantee Gamma::new succeeds",
+    ))
+}
+
+/// **GAMMA(x)** — gamma function `Γ(x)`. Not the gamma distribution.
+///
+/// - Args: 1 required.
+/// - Reject `x < 0 && x.floor() == x` (gamma function has poles at
+///   non-positive integers).
+/// - Non-finite result → `#NUM!`.
+pub fn gamma_fn_excel(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let x = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    // Gamma function poles: non-positive integers (0, -1, -2, ...).
+    // statrs's `gamma(0)` returns +Inf; `gamma(-1)` returns NaN; etc.
+    // IronCalc's check is `x < 0.0 && x.floor() == x` — explicit
+    // rejection of negative integers. We also reject 0 implicitly via
+    // the finite-result guard (gamma(0) = +Inf → #NUM!).
+    if x < 0.0 && x.floor() == x {
+        return Value::Error(ErrorValue::Num);
+    }
+    finite_or_num(gamma_fn(x))
+}
+
+/// **GAMMA.DIST(x, alpha, beta, cumulative)** — gamma distribution
+/// PDF (`cumulative=FALSE`) or CDF (`cumulative=TRUE`).
+///
+/// - Args: 4 required.
+/// - `x >= 0`; `alpha > 0`; `beta > 0` STRICT. Else `#NUM!`.
+/// - `alpha` is the shape parameter; `beta` is the scale parameter
+///   (Excel canon). statrs uses shape-rate, so we pass
+///   `rate = 1/beta` to the constructor.
+pub fn gamma_dist(args: &[Value]) -> Value {
+    if args.len() != 4 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let x = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let alpha = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let beta_scale = match coercion::to_number_strict(&args[2]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let cumulative = match coercion::to_logical(&args[3]) {
+        Ok(b) => b,
+        Err(e) => return Value::Error(e),
+    };
+    if x < 0.0 || alpha <= 0.0 || beta_scale <= 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    // **W5-D-5.1 (Codex HIGH-1 closure):** subnormal `beta_scale`
+    // (e.g. `5e-324`) yields `rate = 1/scale = +Inf`. statrs accepts
+    // it but produces non-spec results / hangs in `inverse_cdf`. The
+    // helper now returns `None` for non-finite rate; surface `#NUM!`.
+    let dist = match gamma_dist_with(alpha, beta_scale) {
+        Some(d) => d,
+        None => return Value::Error(ErrorValue::Num),
+    };
+    finite_or_num(if cumulative { dist.cdf(x) } else { dist.pdf(x) })
+}
+
+/// **GAMMA.INV(probability, alpha, beta)** — inverse gamma CDF.
+///
+/// - Args: 3 required.
+/// - `0 <= probability <= 1` INCLUSIVE; `alpha > 0`; `beta > 0`. Else
+///   `#NUM!`.
+/// - Negative result (from fp drift) rejected via inline guard.
+pub fn gamma_inv(args: &[Value]) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let p = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let alpha = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let beta_scale = match coercion::to_number_strict(&args[2]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    if !(0.0..=1.0).contains(&p) || alpha <= 0.0 || beta_scale <= 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    // **W5-D-5.1 (Codex HIGH-1 closure):** non-finite-rate guard
+    // (see `gamma_dist_with` docstring). Without this short-circuit
+    // statrs's `inverse_cdf` enters an infinite bracketing loop for
+    // subnormal `beta_scale`.
+    let dist = match gamma_dist_with(alpha, beta_scale) {
+        Some(d) => d,
+        None => return Value::Error(ErrorValue::Num),
+    };
+    let x = dist.inverse_cdf(p);
+    if !x.is_finite() || x < 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    Value::number(x)
+}
+
+/// **GAMMALN(x)** — natural log of the absolute value of `Γ(x)`,
+/// computed via `statrs::function::gamma::ln_gamma`.
+///
+/// - Args: 1 required.
+/// - `x >= 0`; else `#NUM!`. (Excel canon: GAMMALN is defined for
+///   positive reals; `x=0` produces `+Inf` and surfaces as `#NUM!`
+///   via the finite-result guard.)
+pub fn gamma_ln(args: &[Value]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let x = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    if x < 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    finite_or_num(ln_gamma(x))
+}
+
+/// **GAMMALN.PRECISE(x)** — alias for `GAMMALN`. Excel introduced
+/// `.PRECISE` variants in 2010 for naming consistency; the
+/// implementation is identical.
+pub fn gamma_ln_precise(args: &[Value]) -> Value {
+    gamma_ln(args)
+}
+
+// =====================================================================
+// W5-D-5: Beta distribution (BETA.DIST / BETA.INV)
+// =====================================================================
+//
+// `statrs::Beta::new(alpha, beta)` parameterizes the standard Beta on
+// `[0, 1]`. Excel adds optional `[A, B]` bounds to shift the domain
+// to `[A, B]` via `t = (x - A) / (B - A)`. PDF must be scaled by
+// `1 / (B - A)` (Jacobian).
+
+/// Build a standard Beta distribution. Call sites pre-check `alpha >
+/// 0` AND `beta > 0`; `to_number_strict` rejects NaN. Construction
+/// cannot fail. `.expect()` per No-Fallbacks rule.
+fn beta_dist_with(alpha: f64, beta_param: f64) -> Beta {
+    Beta::new(alpha, beta_param)
+        .expect("upstream sanitize_f64 + alpha>0 + beta>0 pre-check guarantee Beta::new succeeds")
+}
+
+/// **BETA.DIST(x, alpha, beta, cumulative, [A], [B])** — beta
+/// distribution PDF or CDF on optional `[A, B]` domain.
+///
+/// - Args: **VARIADIC 4-6 required.** `A` defaults to 0, `B` defaults
+///   to 1.
+/// - `alpha > 0`, `beta > 0`, `A < B`, `A <= x <= B`. Else `#NUM!`.
+/// - PDF scaled by `1 / (B - A)` (Jacobian for change of variables
+///   `t = (x - A) / (B - A)`).
+pub fn beta_dist(args: &[Value]) -> Value {
+    if !(4..=6).contains(&args.len()) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let x = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let alpha = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let beta_param = match coercion::to_number_strict(&args[2]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let cumulative = match coercion::to_logical(&args[3]) {
+        Ok(b) => b,
+        Err(e) => return Value::Error(e),
+    };
+    let a = if args.len() >= 5 {
+        match coercion::to_number_strict(&args[4]) {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        0.0
+    };
+    let b = if args.len() >= 6 {
+        match coercion::to_number_strict(&args[5]) {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        1.0
+    };
+    if alpha <= 0.0 || beta_param <= 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    if b == a || x < a || x > b {
+        return Value::Error(ErrorValue::Num);
+    }
+    let width = b - a;
+    let t = (x - a) / width;
+    let dist = beta_dist_with(alpha, beta_param);
+    let result = if cumulative {
+        dist.cdf(t)
+    } else {
+        // General-interval beta PDF: f_X(x) = f_T(t) / (B - A).
+        dist.pdf(t) / width
+    };
+    finite_or_num(result)
+}
+
+/// **BETA.INV(probability, alpha, beta, [A], [B])** — inverse beta
+/// CDF on optional `[A, B]` domain.
+///
+/// - Args: **VARIADIC 3-5 required.** `A` defaults to 0, `B` defaults
+///   to 1.
+/// - `0 < probability < 1` STRICT both ends; `alpha > 0`; `beta > 0`;
+///   `A < B`. Else `#NUM!`.
+/// - Returns `A + t * (B - A)` where `t = inverse_cdf(probability)`.
+pub fn beta_inv(args: &[Value]) -> Value {
+    if !(3..=5).contains(&args.len()) {
+        return Value::Error(ErrorValue::Value);
+    }
+    let p = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let alpha = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let beta_param = match coercion::to_number_strict(&args[2]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let a = if args.len() >= 4 {
+        match coercion::to_number_strict(&args[3]) {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        0.0
+    };
+    let b = if args.len() >= 5 {
+        match coercion::to_number_strict(&args[4]) {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        1.0
+    };
+    if alpha <= 0.0 || beta_param <= 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    if p <= 0.0 || p >= 1.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    if b <= a {
+        return Value::Error(ErrorValue::Num);
+    }
+    let dist = beta_dist_with(alpha, beta_param);
+    let t = dist.inverse_cdf(p);
+    // **W5-D-5.1 (Opus LOW-O-3 closure):** added `t < 0.0` defensive
+    // guard for parity with GAMMA.INV. Beta distribution is supported
+    // on `[0, 1]`, so `inverse_cdf` should never return negative —
+    // but a fp-drift result of e.g. `-1e-15` would silently propagate
+    // a non-spec value through the affine transform `a + t·(b-a)`.
+    // Surface as `#NUM!` instead.
+    if !t.is_finite() || t < 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    Value::number(a + t * (b - a))
+}
+
+// =====================================================================
+// W5-D-5: Confidence-interval margins (CONFIDENCE.NORM / CONFIDENCE.T)
+// =====================================================================
+//
+// Reuse `standard_normal()` (W5-D-1) and `students_t_with(df)`
+// (W5-D-2). The returned value is the CI half-width (margin), not the
+// CI bounds themselves.
+
+/// **CONFIDENCE.NORM(alpha, standard_dev, size)** — half-width of a
+/// two-sided `(1 - alpha) · 100%` normal confidence interval:
+/// `z(1 - α/2) · σ / √n`.
+///
+/// - Args: 3 required.
+/// - `0 < alpha < 1` strict; `sd > 0` strict; `size.floor() >= 1`.
+///   Else `#NUM!`. Non-finite quantile → `#NUM!`.
+/// - **Size uses `.floor()`** (IronCalc canon).
+pub fn confidence_norm(args: &[Value]) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let alpha = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let sd = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let size = match coercion::to_number_strict(&args[2]) {
+        Ok(n) => n.floor(),
+        Err(e) => return Value::Error(e),
+    };
+    if alpha <= 0.0 || alpha >= 1.0 || sd <= 0.0 || size < 1.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    let dist = standard_normal();
+    let quantile = dist.inverse_cdf(1.0 - alpha / 2.0);
+    if !quantile.is_finite() {
+        return Value::Error(ErrorValue::Num);
+    }
+    finite_or_num(quantile * sd / size.sqrt())
+}
+
+/// **CONFIDENCE.T(alpha, standard_dev, size)** — half-width of a
+/// two-sided `(1 - alpha) · 100%` Student's t confidence interval:
+/// `t(1 - α/2; df=n-1) · σ / √n`.
+///
+/// - Args: 3 required.
+/// - `0 < alpha < 1` strict; `sd > 0` strict. Else `#NUM!`.
+/// - `size.trunc() >= 2` (df = n - 1 must be `>= 1`). Else
+///   **`#DIV/0!`** (NOT `#NUM!`) — matches IronCalc + Excel canon.
+/// - **Size uses `.trunc()`** (IronCalc divergence from
+///   CONFIDENCE.NORM's `.floor()`).
+pub fn confidence_t(args: &[Value]) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ErrorValue::Value);
+    }
+    let alpha = match coercion::to_number_strict(&args[0]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let sd = match coercion::to_number_strict(&args[1]) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let size = match coercion::to_number_strict(&args[2]) {
+        Ok(n) => n.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    if alpha <= 0.0 || alpha >= 1.0 || sd <= 0.0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    if size < 2.0 {
+        return Value::Error(ErrorValue::DivZero);
+    }
+    let df = size - 1.0;
+    let dist = students_t_with(df);
+    let t_crit = dist.inverse_cdf(1.0 - alpha / 2.0);
+    if !t_crit.is_finite() {
+        return Value::Error(ErrorValue::Num);
+    }
+    finite_or_num(t_crit * sd / size.sqrt())
 }
 
 // =====================================================================
@@ -4312,6 +4781,1153 @@ mod tests {
                 Value::number(0.5),
                 Value::number(0.0),
                 Value::number(1.0),
+                Value::number(0.0),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== GAMMA =====
+    //
+    // Closed-form Γ function. Γ(n) = (n-1)! for positive integers.
+    // Γ(0.5) = √π ≈ 1.7724538509055159.
+    // Γ(1) = 1, Γ(2) = 1, Γ(3) = 2, Γ(4) = 6, Γ(5) = 24.
+
+    #[test]
+    fn gamma_at_one_returns_one_closed_form() {
+        // Γ(1) = 0! = 1.
+        assert_close(gamma_fn_excel(&[Value::number(1.0)]), 1.0);
+    }
+
+    #[test]
+    fn gamma_at_five_returns_24_closed_form() {
+        // Γ(5) = 4! = 24.
+        assert_close(gamma_fn_excel(&[Value::number(5.0)]), 24.0);
+    }
+
+    #[test]
+    fn gamma_at_half_returns_sqrt_pi_closed_form() {
+        // Γ(0.5) = √π.
+        assert_close(
+            gamma_fn_excel(&[Value::number(0.5)]),
+            std::f64::consts::PI.sqrt(),
+        );
+    }
+
+    #[test]
+    fn gamma_at_negative_half_closed_form() {
+        // Γ(-0.5) = -2√π.
+        assert_close(
+            gamma_fn_excel(&[Value::number(-0.5)]),
+            -2.0 * std::f64::consts::PI.sqrt(),
+        );
+    }
+
+    #[test]
+    fn gamma_negative_integer_is_num_error() {
+        // Γ has poles at negative integers.
+        assert_eq!(
+            gamma_fn_excel(&[Value::number(-1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            gamma_fn_excel(&[Value::number(-5.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn gamma_at_zero_is_num_error() {
+        // Γ(0) = +Inf → #NUM! via finite-result guard.
+        assert_eq!(
+            gamma_fn_excel(&[Value::number(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn gamma_text_arg_is_value_error() {
+        assert_eq!(
+            gamma_fn_excel(&[Value::text("x")]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn gamma_error_arg_propagates() {
+        assert_eq!(
+            gamma_fn_excel(&[Value::Error(ErrorValue::Ref)]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn gamma_arity_mismatch_returns_value() {
+        assert_eq!(gamma_fn_excel(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            gamma_fn_excel(&[Value::number(1.0), Value::number(2.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== GAMMA.DIST =====
+    //
+    // For α=1 (shape=1), Gamma(1, β) is exponential with rate 1/β.
+    // CDF(x; 1, β) = 1 - exp(-x/β). PDF(x; 1, β) = (1/β)·exp(-x/β).
+
+    #[test]
+    fn gamma_dist_cdf_at_zero_returns_zero() {
+        assert_close(
+            gamma_dist(&[
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            0.0,
+        );
+    }
+
+    #[test]
+    fn gamma_dist_cdf_alpha_one_beta_one_at_one_closed_form() {
+        // For α=1, β=1: CDF(1) = 1 - e^-1 (matches EXPON.DIST(1, 1, TRUE)).
+        assert_close(
+            gamma_dist(&[
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            1.0 - (-1.0_f64).exp(),
+        );
+    }
+
+    #[test]
+    fn gamma_dist_pdf_alpha_one_beta_one_at_zero_closed_form() {
+        // For α=1, β=1: PDF(0) = 1/1 · e^0 = 1.
+        assert_close(
+            gamma_dist(&[
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(false),
+            ]),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn gamma_dist_negative_x_is_num_error() {
+        assert_eq!(
+            gamma_dist(&[
+                Value::number(-1.0),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn gamma_dist_alpha_or_beta_zero_is_num_error() {
+        // α = 0 STRICT.
+        assert_eq!(
+            gamma_dist(&[
+                Value::number(1.0),
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+        // β = 0 STRICT.
+        assert_eq!(
+            gamma_dist(&[
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::number(0.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn gamma_dist_text_arg_is_value_error() {
+        assert_eq!(
+            gamma_dist(&[
+                Value::text("x"),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn gamma_dist_error_arg_propagates() {
+        assert_eq!(
+            gamma_dist(&[
+                Value::Error(ErrorValue::Ref),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn gamma_dist_arity_mismatch_returns_value() {
+        assert_eq!(gamma_dist(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            gamma_dist(&[Value::number(1.0), Value::number(1.0), Value::number(1.0),]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            gamma_dist(&[
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+                Value::number(0.0),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== GAMMA.INV =====
+
+    #[test]
+    fn gamma_inv_at_zero_returns_zero() {
+        // p = 0 INCLUSIVE — Gamma.INV(0, ...) = 0.
+        assert_close(
+            gamma_inv(&[Value::number(0.0), Value::number(1.0), Value::number(1.0)]),
+            0.0,
+        );
+    }
+
+    #[test]
+    fn gamma_inv_inverse_of_gamma_dist_round_trip() {
+        // gamma_dist(gamma_inv(p, α, β), α, β, TRUE) ≈ p.
+        let p = 0.73;
+        let alpha = 2.0;
+        let beta = 3.0;
+        let x = match gamma_inv(&[Value::number(p), Value::number(alpha), Value::number(beta)]) {
+            Value::Number(n) => n,
+            other => panic!("GAMMA.INV returned {other:?}"),
+        };
+        let p_back = match gamma_dist(&[
+            Value::number(x),
+            Value::number(alpha),
+            Value::number(beta),
+            Value::Boolean(true),
+        ]) {
+            Value::Number(n) => n,
+            other => panic!("GAMMA.DIST returned {other:?}"),
+        };
+        assert!(approx(p, p_back, 1e-12));
+    }
+
+    #[test]
+    fn gamma_inv_alpha_one_at_half_closed_form() {
+        // For α=1, β=1: Inverse of `1 - exp(-x)` at p=0.5 is ln(2).
+        assert_close(
+            gamma_inv(&[Value::number(0.5), Value::number(1.0), Value::number(1.0)]),
+            2.0_f64.ln(),
+        );
+    }
+
+    #[test]
+    fn gamma_inv_p_above_one_is_num_error() {
+        assert_eq!(
+            gamma_inv(&[Value::number(1.5), Value::number(1.0), Value::number(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn gamma_inv_p_negative_is_num_error() {
+        assert_eq!(
+            gamma_inv(&[Value::number(-0.1), Value::number(1.0), Value::number(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn gamma_inv_alpha_or_beta_zero_is_num_error() {
+        assert_eq!(
+            gamma_inv(&[Value::number(0.5), Value::number(0.0), Value::number(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            gamma_inv(&[Value::number(0.5), Value::number(1.0), Value::number(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn gamma_inv_text_arg_is_value_error() {
+        assert_eq!(
+            gamma_inv(&[Value::text("half"), Value::number(1.0), Value::number(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn gamma_inv_error_arg_propagates() {
+        assert_eq!(
+            gamma_inv(&[
+                Value::Error(ErrorValue::Ref),
+                Value::number(1.0),
+                Value::number(1.0),
+            ]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn gamma_inv_arity_mismatch_returns_value() {
+        assert_eq!(gamma_inv(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            gamma_inv(&[Value::number(0.5), Value::number(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            gamma_inv(&[
+                Value::number(0.5),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::number(0.0),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn gamma_inv_subnormal_scale_non_termination_regression() {
+        // **W5-D-5.1 (Codex HIGH-1 closure):** subnormal `beta_scale`
+        // (e.g. `5e-324`, the smallest positive f64 subnormal) yields
+        // `rate = 1/scale = +Inf`. statrs 0.18.0 accepts `Gamma::new
+        // (1, +Inf)` and `inverse_cdf` enters an infinite bracketing
+        // loop. Codex's audit confirmed this with a 2-second
+        // compiled-probe timeout. The W5-D-5.1 closure adds an
+        // `is_finite()` guard in `gamma_dist_with` that returns
+        // `None` for non-finite rate, surfaced here as `#NUM!`.
+        assert_eq!(
+            gamma_inv(&[
+                Value::number(0.5),
+                Value::number(1.0),
+                Value::number(5e-324),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn gamma_dist_subnormal_scale_returns_num_error() {
+        // **W5-D-5.1 (Codex HIGH-1 closure):** companion to
+        // `gamma_inv_subnormal_scale_non_termination_regression`.
+        // GAMMA.DIST with subnormal scale would produce non-spec
+        // results via statrs's infinite-rate Gamma. Pin `#NUM!`.
+        assert_eq!(
+            gamma_dist(&[
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::number(5e-324),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn gamma_inv_at_one_is_num_error() {
+        // **W5-D-5.1 (Codex LOW-1 + Opus LOW-O-1 closure):** the
+        // domain check admits `p == 1.0`, but `inverse_cdf(1.0)`
+        // returns `+Inf` for unbounded-right Gamma, then the
+        // `!is_finite()` guard surfaces `#NUM!`. Pin the inclusive-
+        // upper-but-observably-#NUM! behavior so docs can't be
+        // misread.
+        assert_eq!(
+            gamma_inv(&[Value::number(1.0), Value::number(1.0), Value::number(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    // ===== GAMMALN =====
+    //
+    // ln(Γ(n)) = ln((n-1)!). ln(Γ(1)) = ln(0!) = 0. ln(Γ(2)) = ln(1) = 0.
+    // ln(Γ(3)) = ln(2) ≈ 0.6931472. ln(Γ(4)) = ln(6) ≈ 1.7917595.
+
+    #[test]
+    fn gamma_ln_at_one_returns_zero_closed_form() {
+        // ln(Γ(1)) = ln(1) = 0.
+        assert_close(gamma_ln(&[Value::number(1.0)]), 0.0);
+    }
+
+    #[test]
+    fn gamma_ln_at_two_returns_zero_closed_form() {
+        // ln(Γ(2)) = ln(1!) = ln(1) = 0.
+        assert_close(gamma_ln(&[Value::number(2.0)]), 0.0);
+    }
+
+    #[test]
+    fn gamma_ln_at_four_returns_ln_six_closed_form() {
+        // ln(Γ(4)) = ln(3!) = ln(6).
+        assert_close(gamma_ln(&[Value::number(4.0)]), 6.0_f64.ln());
+    }
+
+    #[test]
+    fn gamma_ln_at_half_returns_half_ln_pi_closed_form() {
+        // ln(Γ(0.5)) = ln(√π) = 0.5 · ln(π).
+        assert_close(
+            gamma_ln(&[Value::number(0.5)]),
+            0.5 * std::f64::consts::PI.ln(),
+        );
+    }
+
+    #[test]
+    fn gamma_ln_negative_x_is_num_error() {
+        assert_eq!(
+            gamma_ln(&[Value::number(-1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn gamma_ln_at_zero_is_num_error() {
+        // ln(Γ(0)) = ln(+Inf) = +Inf → #NUM!.
+        assert_eq!(
+            gamma_ln(&[Value::number(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn gamma_ln_text_arg_is_value_error() {
+        assert_eq!(
+            gamma_ln(&[Value::text("x")]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn gamma_ln_error_arg_propagates() {
+        assert_eq!(
+            gamma_ln(&[Value::Error(ErrorValue::DivZero)]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn gamma_ln_arity_mismatch_returns_value() {
+        assert_eq!(gamma_ln(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            gamma_ln(&[Value::number(1.0), Value::number(2.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== GAMMALN.PRECISE (alias of GAMMALN) =====
+
+    #[test]
+    fn gamma_ln_precise_matches_gamma_ln_at_four() {
+        // PRECISE is an alias — must return identical values.
+        let a = gamma_ln(&[Value::number(4.0)]);
+        let b = gamma_ln_precise(&[Value::number(4.0)]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn gamma_ln_precise_matches_gamma_ln_at_half() {
+        let a = gamma_ln(&[Value::number(0.5)]);
+        let b = gamma_ln_precise(&[Value::number(0.5)]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn gamma_ln_precise_negative_x_is_num_error() {
+        assert_eq!(
+            gamma_ln_precise(&[Value::number(-1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn gamma_ln_precise_text_arg_is_value_error() {
+        assert_eq!(
+            gamma_ln_precise(&[Value::text("x")]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn gamma_ln_precise_arity_mismatch_returns_value() {
+        assert_eq!(gamma_ln_precise(&[]), Value::Error(ErrorValue::Value));
+    }
+
+    // ===== BETA.DIST =====
+    //
+    // Beta(1, 1) is uniform on [0, 1]: PDF(t) = 1, CDF(t) = t.
+    // Beta(α, β) at x=0: PDF=0 (if α>1), CDF=0.
+    // Beta(α, β) at x=1: PDF=0 (if β>1), CDF=1.
+
+    #[test]
+    fn beta_dist_uniform_cdf_at_half_returns_half_closed_form() {
+        // Beta(1, 1) is U(0,1): CDF(0.5) = 0.5.
+        assert_close(
+            beta_dist(&[
+                Value::number(0.5),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            0.5,
+        );
+    }
+
+    #[test]
+    fn beta_dist_uniform_pdf_at_half_returns_one_closed_form() {
+        // Beta(1, 1) is U(0,1): PDF(0.5) = 1.
+        assert_close(
+            beta_dist(&[
+                Value::number(0.5),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(false),
+            ]),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn beta_dist_cdf_at_one_returns_one_closed_form() {
+        // Beta(2, 3): CDF(1) = 1.
+        assert_close(
+            beta_dist(&[
+                Value::number(1.0),
+                Value::number(2.0),
+                Value::number(3.0),
+                Value::Boolean(true),
+            ]),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn beta_dist_optional_bounds_scaling() {
+        // Beta(1,1) on [0, 10] is U(0, 10): PDF = 1/10 = 0.1 at x=5,
+        // CDF = 5/10 = 0.5.
+        assert_close(
+            beta_dist(&[
+                Value::number(5.0),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(false),
+                Value::number(0.0),
+                Value::number(10.0),
+            ]),
+            0.1,
+        );
+        assert_close(
+            beta_dist(&[
+                Value::number(5.0),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+                Value::number(0.0),
+                Value::number(10.0),
+            ]),
+            0.5,
+        );
+    }
+
+    #[test]
+    fn beta_dist_x_outside_bounds_is_num_error() {
+        // x < A.
+        assert_eq!(
+            beta_dist(&[
+                Value::number(-0.5),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+        // x > B.
+        assert_eq!(
+            beta_dist(&[
+                Value::number(1.5),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn beta_dist_a_equals_b_is_num_error() {
+        // A == B → #NUM! (zero-width interval).
+        assert_eq!(
+            beta_dist(&[
+                Value::number(5.0),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+                Value::number(5.0),
+                Value::number(5.0),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn beta_dist_alpha_or_beta_zero_is_num_error() {
+        assert_eq!(
+            beta_dist(&[
+                Value::number(0.5),
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            beta_dist(&[
+                Value::number(0.5),
+                Value::number(1.0),
+                Value::number(0.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn beta_dist_text_arg_is_value_error() {
+        assert_eq!(
+            beta_dist(&[
+                Value::text("x"),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn beta_dist_error_arg_propagates() {
+        assert_eq!(
+            beta_dist(&[
+                Value::Error(ErrorValue::Ref),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+            ]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn beta_dist_arity_mismatch_returns_value() {
+        // Below 4 args.
+        assert_eq!(beta_dist(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            beta_dist(&[Value::number(0.5), Value::number(1.0), Value::number(1.0),]),
+            Value::Error(ErrorValue::Value)
+        );
+        // Above 6 args.
+        assert_eq!(
+            beta_dist(&[
+                Value::number(0.5),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::number(0.0),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn beta_dist_5_arg_variant_with_a_only() {
+        // **W5-D-5.1 (Opus LOW-O-4 closure):** the 5-arg form
+        // (A provided, B defaults to 1) wasn't exercised in W5-D-5.
+        // Pin: Beta(1, 1) shifted to start at A=2 on [2, 1]... wait,
+        // that's reversed. With A=2 and B defaulting to 1, A > B and
+        // the impl rejects. Use A=0 so the default B=1 produces a
+        // valid [0, 1] domain — same as 4-arg form, but exercises
+        // the args.len() == 5 branch.
+        assert_close(
+            beta_dist(&[
+                Value::number(0.5),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(true),
+                Value::number(0.0),
+            ]),
+            0.5,
+        );
+    }
+
+    #[test]
+    fn beta_dist_pdf_at_lower_bound_a() {
+        // **W5-D-5.1 (Opus LOW-O-5 closure):** PDF at x=A boundary
+        // not pinned (only PDF at x=B-side via earlier tests). For
+        // Beta(1,1) shifted to [0, 10], PDF(0) = 1/(B-A) = 0.1
+        // (uniform density at the lower boundary).
+        assert_close(
+            beta_dist(&[
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::Boolean(false),
+                Value::number(0.0),
+                Value::number(10.0),
+            ]),
+            0.1,
+        );
+    }
+
+    // ===== BETA.INV =====
+
+    #[test]
+    fn beta_inv_uniform_at_half_returns_half_closed_form() {
+        // Beta(1, 1) is U(0,1): inverse CDF at 0.5 = 0.5.
+        assert_close(
+            beta_inv(&[Value::number(0.5), Value::number(1.0), Value::number(1.0)]),
+            0.5,
+        );
+    }
+
+    #[test]
+    fn beta_inv_inverse_of_beta_dist_round_trip() {
+        // beta_dist(beta_inv(p, α, β), α, β, TRUE) ≈ p.
+        let p = 0.73;
+        let alpha = 2.0;
+        let beta_param = 5.0;
+        let x = match beta_inv(&[
+            Value::number(p),
+            Value::number(alpha),
+            Value::number(beta_param),
+        ]) {
+            Value::Number(n) => n,
+            other => panic!("BETA.INV returned {other:?}"),
+        };
+        let p_back = match beta_dist(&[
+            Value::number(x),
+            Value::number(alpha),
+            Value::number(beta_param),
+            Value::Boolean(true),
+        ]) {
+            Value::Number(n) => n,
+            other => panic!("BETA.DIST returned {other:?}"),
+        };
+        assert!(approx(p, p_back, 1e-12));
+    }
+
+    #[test]
+    fn beta_inv_optional_bounds_scaling() {
+        // U(0, 10) inverse at p=0.7 = 7.
+        assert_close(
+            beta_inv(&[
+                Value::number(0.7),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::number(0.0),
+                Value::number(10.0),
+            ]),
+            7.0,
+        );
+    }
+
+    #[test]
+    fn beta_inv_4_arg_variant_with_a_only() {
+        // **W5-D-5.1 (Opus LOW-O-4 closure):** 4-arg form (A provided,
+        // B defaults to 1). For Beta(1, 1) with A=0, default B=1 →
+        // U(0, 1); inverse(0.5) = 0.5. Exercises the args.len() == 4
+        // branch specifically.
+        assert_close(
+            beta_inv(&[
+                Value::number(0.5),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::number(0.0),
+            ]),
+            0.5,
+        );
+    }
+
+    #[test]
+    fn beta_inv_p_at_endpoints_is_num_error() {
+        // p = 0 STRICT.
+        assert_eq!(
+            beta_inv(&[Value::number(0.0), Value::number(1.0), Value::number(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+        // p = 1 STRICT.
+        assert_eq!(
+            beta_inv(&[Value::number(1.0), Value::number(1.0), Value::number(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn beta_inv_b_below_a_is_num_error() {
+        assert_eq!(
+            beta_inv(&[
+                Value::number(0.5),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::number(10.0),
+                Value::number(5.0),
+            ]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn beta_inv_alpha_or_beta_zero_is_num_error() {
+        assert_eq!(
+            beta_inv(&[Value::number(0.5), Value::number(0.0), Value::number(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            beta_inv(&[Value::number(0.5), Value::number(1.0), Value::number(0.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn beta_inv_text_arg_is_value_error() {
+        assert_eq!(
+            beta_inv(&[Value::text("half"), Value::number(1.0), Value::number(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn beta_inv_error_arg_propagates() {
+        assert_eq!(
+            beta_inv(&[
+                Value::Error(ErrorValue::Ref),
+                Value::number(1.0),
+                Value::number(1.0),
+            ]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn beta_inv_arity_mismatch_returns_value() {
+        assert_eq!(beta_inv(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            beta_inv(&[Value::number(0.5), Value::number(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        // Above 5 args.
+        assert_eq!(
+            beta_inv(&[
+                Value::number(0.5),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::number(0.0),
+                Value::number(1.0),
+                Value::number(0.0),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== CONFIDENCE.NORM =====
+    //
+    // Margin = z(1 - α/2) · σ / √n. For α=0.05, σ=1, n=1: margin
+    // = z(0.975) / √1 = z(0.975) ≈ 1.959963984540054.
+
+    #[test]
+    fn confidence_norm_alpha_5pct_size_1_returns_z_critical() {
+        // CONFIDENCE.NORM(0.05, 1, 1) = z(0.975) · 1 / √1 ≈ 1.96.
+        assert_close(
+            confidence_norm(&[Value::number(0.05), Value::number(1.0), Value::number(1.0)]),
+            1.959_963_984_540_054,
+        );
+    }
+
+    #[test]
+    fn confidence_norm_size_4_halves_margin() {
+        // For n=4: margin = z · σ / 2 → 1.96 / 2 = 0.98.
+        assert_close(
+            confidence_norm(&[Value::number(0.05), Value::number(1.0), Value::number(4.0)]),
+            1.959_963_984_540_054 / 2.0,
+        );
+    }
+
+    #[test]
+    fn confidence_norm_sd_scales_margin_linearly() {
+        // Doubling σ doubles the margin.
+        let m1 =
+            match confidence_norm(&[Value::number(0.05), Value::number(1.0), Value::number(1.0)]) {
+                Value::Number(n) => n,
+                other => panic!("returned {other:?}"),
+            };
+        let m2 =
+            match confidence_norm(&[Value::number(0.05), Value::number(2.0), Value::number(1.0)]) {
+                Value::Number(n) => n,
+                other => panic!("returned {other:?}"),
+            };
+        assert!(approx(m2, 2.0 * m1, 1e-12));
+    }
+
+    #[test]
+    fn confidence_norm_size_floors_fractional() {
+        // size = 4.9 floors to 4 — same result as size = 4.
+        let a = confidence_norm(&[Value::number(0.05), Value::number(1.0), Value::number(4.9)]);
+        let b = confidence_norm(&[Value::number(0.05), Value::number(1.0), Value::number(4.0)]);
+        match (a, b) {
+            (Value::Number(x), Value::Number(y)) => assert!(approx(x, y, 1e-15)),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confidence_norm_vs_t_floor_trunc_divergence_visible_at_negative_fractional_size() {
+        // **W5-D-5.1 (Opus LOW-O-2 closure):** the `.floor()` vs
+        // `.trunc()` divergence between CONFIDENCE.NORM and
+        // CONFIDENCE.T is invisible for positive in-domain sizes
+        // (both produce the integer floor). They diverge only for
+        // negative fractional sizes:
+        //   .floor(-1.5) = -2   (NORM uses this)
+        //   .trunc(-1.5) = -1   (T uses this)
+        // Both fns then reject (size < 1 for NORM, size < 2 for T).
+        // The divergence is in WHICH integer the rejection check
+        // sees, but both reject for negative inputs anyway. This
+        // test documents the divergence; the actual observable
+        // difference is only on the boundary cases, where both reject.
+        // Pin: both return #NUM!/`#DIV/0!` for negative fractional
+        // size — confirming the divergence has no user-visible
+        // semantic consequence in the valid-input domain.
+        assert_eq!(
+            confidence_norm(&[Value::number(0.05), Value::number(1.0), Value::number(-1.5)]),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            confidence_t(&[Value::number(0.05), Value::number(1.0), Value::number(-1.5)]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn confidence_norm_alpha_at_endpoints_is_num_error() {
+        // α = 0 STRICT.
+        assert_eq!(
+            confidence_norm(&[Value::number(0.0), Value::number(1.0), Value::number(1.0),]),
+            Value::Error(ErrorValue::Num)
+        );
+        // α = 1 STRICT.
+        assert_eq!(
+            confidence_norm(&[Value::number(1.0), Value::number(1.0), Value::number(1.0),]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn confidence_norm_sd_zero_or_negative_is_num_error() {
+        // **W5-D-5.1 (Opus MEDIUM-O-2 closure):** the test name
+        // promised both `sd=0` and `sd<0` but only asserted `sd=0`.
+        // A regression flipping `sd <= 0.0` to `sd < 0.0` would slip
+        // through. Added the `sd<0` assertion.
+        // sd = 0 STRICT.
+        assert_eq!(
+            confidence_norm(&[Value::number(0.05), Value::number(0.0), Value::number(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+        // sd < 0.
+        assert_eq!(
+            confidence_norm(&[Value::number(0.05), Value::number(-1.0), Value::number(1.0)]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn confidence_norm_size_less_than_one_is_num_error() {
+        // size=0.9 floors to 0 → < 1 → #NUM!.
+        assert_eq!(
+            confidence_norm(&[Value::number(0.05), Value::number(1.0), Value::number(0.9),]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn confidence_norm_text_arg_is_value_error() {
+        assert_eq!(
+            confidence_norm(&[Value::text("five"), Value::number(1.0), Value::number(1.0),]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn confidence_norm_error_arg_propagates() {
+        assert_eq!(
+            confidence_norm(&[
+                Value::Error(ErrorValue::Ref),
+                Value::number(1.0),
+                Value::number(1.0),
+            ]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn confidence_norm_arity_mismatch_returns_value() {
+        assert_eq!(confidence_norm(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            confidence_norm(&[Value::number(0.05), Value::number(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            confidence_norm(&[
+                Value::number(0.05),
+                Value::number(1.0),
+                Value::number(1.0),
+                Value::number(0.0),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    // ===== CONFIDENCE.T =====
+    //
+    // Margin = t(1 - α/2; df=n-1) · σ / √n.
+
+    #[test]
+    fn confidence_t_alpha_5pct_size_10_statrs_self_consistent() {
+        // CONFIDENCE.T(0.05, 1, 10) = t(0.975; df=9) / √10.
+        // True math gives ≈ 0.71531056. statrs's `inverse_cdf` is
+        // Newton-Raphson approximate (~5e-5 off true value for df=9);
+        // we pin statrs's value (`0.7153569059706643`) per the W5-D-3
+        // statrs self-consistency pattern.
+        let result = confidence_t(&[Value::number(0.05), Value::number(1.0), Value::number(10.0)]);
+        match result {
+            Value::Number(n) => assert!(
+                approx(n, 0.715_356_905_970_664_3, 1e-9),
+                "expected ≈ 0.715357, got {n}"
+            ),
+            other => panic!("expected Number ≈ 0.715357, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confidence_t_size_less_than_two_is_div_zero() {
+        // **WARNING: CONFIDENCE.T returns `#DIV/0!`, NOT `#NUM!`** for
+        // size < 2 (df = n - 1 < 1). Matches IronCalc + Excel canon.
+        // Unique error class in distribution_fns.
+        assert_eq!(
+            confidence_t(&[Value::number(0.05), Value::number(1.0), Value::number(1.0),]),
+            Value::Error(ErrorValue::DivZero)
+        );
+        assert_eq!(
+            confidence_t(&[Value::number(0.05), Value::number(1.0), Value::number(0.0),]),
+            Value::Error(ErrorValue::DivZero)
+        );
+    }
+
+    #[test]
+    fn confidence_t_size_truncs_fractional() {
+        // size=10.9 truncates to 10. Same as size=10.
+        let a = confidence_t(&[Value::number(0.05), Value::number(1.0), Value::number(10.9)]);
+        let b = confidence_t(&[Value::number(0.05), Value::number(1.0), Value::number(10.0)]);
+        match (a, b) {
+            (Value::Number(x), Value::Number(y)) => assert!(approx(x, y, 1e-15)),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confidence_t_large_size_approaches_norm() {
+        // As n → ∞, CONFIDENCE.T → CONFIDENCE.NORM (t-dist converges to
+        // normal). For n=10000, the two should agree to ~1e-4.
+        let t_margin = match confidence_t(&[
+            Value::number(0.05),
+            Value::number(1.0),
+            Value::number(10000.0),
+        ]) {
+            Value::Number(n) => n,
+            other => panic!("returned {other:?}"),
+        };
+        let norm_margin = match confidence_norm(&[
+            Value::number(0.05),
+            Value::number(1.0),
+            Value::number(10000.0),
+        ]) {
+            Value::Number(n) => n,
+            other => panic!("returned {other:?}"),
+        };
+        assert!(approx(t_margin, norm_margin, 1e-3));
+    }
+
+    #[test]
+    fn confidence_t_alpha_at_endpoints_is_num_error() {
+        assert_eq!(
+            confidence_t(&[Value::number(0.0), Value::number(1.0), Value::number(10.0),]),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            confidence_t(&[Value::number(1.0), Value::number(1.0), Value::number(10.0),]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn confidence_t_sd_zero_is_num_error() {
+        assert_eq!(
+            confidence_t(&[Value::number(0.05), Value::number(0.0), Value::number(10.0),]),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn confidence_t_text_arg_is_value_error() {
+        assert_eq!(
+            confidence_t(&[
+                Value::text("alpha"),
+                Value::number(1.0),
+                Value::number(10.0),
+            ]),
+            Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn confidence_t_error_arg_propagates() {
+        assert_eq!(
+            confidence_t(&[
+                Value::Error(ErrorValue::Ref),
+                Value::number(1.0),
+                Value::number(10.0),
+            ]),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn confidence_t_arity_mismatch_returns_value() {
+        assert_eq!(confidence_t(&[]), Value::Error(ErrorValue::Value));
+        assert_eq!(
+            confidence_t(&[Value::number(0.05), Value::number(1.0)]),
+            Value::Error(ErrorValue::Value)
+        );
+        assert_eq!(
+            confidence_t(&[
+                Value::number(0.05),
+                Value::number(1.0),
+                Value::number(10.0),
                 Value::number(0.0),
             ]),
             Value::Error(ErrorValue::Value)

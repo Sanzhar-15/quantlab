@@ -861,6 +861,25 @@ pub fn default_registry() -> FunctionRegistry {
     r.register("LOGNORM.DIST", distribution_fns::lognorm_dist);
     r.register("LOGNORM.INV", distribution_fns::lognorm_inv);
 
+    // **W5-D-5 (Wave 3 distributions batch — CLOSES WAVE 3): gamma
+    // family + beta + confidence intervals.** GAMMA / GAMMA.DIST /
+    // GAMMA.INV / GAMMALN / GAMMALN.PRECISE / BETA.DIST / BETA.INV /
+    // CONFIDENCE.NORM / CONFIDENCE.T. Scalar tier. statrs::Gamma /
+    // statrs::Beta backing for distributions; closed-form via
+    // statrs::function::gamma::{gamma, ln_gamma} for the gamma
+    // functions; CONFIDENCE.* reuses standard_normal() (W5-D-1) +
+    // students_t_with (W5-D-2). BETA.DIST/INV are variadic (4-6 /
+    // 3-5 args).
+    r.register("GAMMA", distribution_fns::gamma_fn_excel);
+    r.register("GAMMA.DIST", distribution_fns::gamma_dist);
+    r.register("GAMMA.INV", distribution_fns::gamma_inv);
+    r.register("GAMMALN", distribution_fns::gamma_ln);
+    r.register("GAMMALN.PRECISE", distribution_fns::gamma_ln_precise);
+    r.register("BETA.DIST", distribution_fns::beta_dist);
+    r.register("BETA.INV", distribution_fns::beta_inv);
+    r.register("CONFIDENCE.NORM", distribution_fns::confidence_norm);
+    r.register("CONFIDENCE.T", distribution_fns::confidence_t);
+
     r
 }
 
@@ -964,8 +983,13 @@ mod tests {
         // NEGBINOM.DIST, POISSON.DIST, EXPON.DIST, LOGNORM.DIST,
         // LOGNORM.INV = 8 — scalar tier; statrs Binomial /
         // NegativeBinomial / Poisson / LogNormal + closed-form
-        // EXPON.DIST. First discrete-distribution batch.
-        assert_eq!(r.len(), 225);
+        // EXPON.DIST. First discrete-distribution batch +
+        // W5-D-5 (Wave 3 distributions batch — CLOSES WAVE 3):
+        // GAMMA, GAMMA.DIST, GAMMA.INV, GAMMALN, GAMMALN.PRECISE,
+        // BETA.DIST, BETA.INV, CONFIDENCE.NORM, CONFIDENCE.T = 9 —
+        // scalar tier; statrs Gamma/Beta + statrs::function::gamma
+        // + CONFIDENCE.* reusing W5-D-1/W5-D-2 helpers.
+        assert_eq!(r.len(), 234);
     }
 
     #[test]

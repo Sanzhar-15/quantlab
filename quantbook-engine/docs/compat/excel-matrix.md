@@ -119,8 +119,15 @@ as partial, rows with `❌` are missing.
 | EXPON.DIST | ✅ | 10 | Wave 3 D-4 (W5-D-4) | W5-D-4: exponential PDF/CDF **closed-form** (no statrs kernel): `CDF=1-e^(-λx)`, `PDF=λe^(-λx)`. 3 args. `x ≥ 0`, `λ > 0` STRICT. |
 | LOGNORM.DIST | ✅ | 8 | Wave 3 D-4 (W5-D-4) | W5-D-4: log-normal PDF/CDF via `statrs::LogNormal`. 4 args. `x > 0` STRICT (log-normal undefined at 0); `σ > 0` strict. `μ` may be negative (underlying normal's mean). Closed-form anchors: CDF(1;μ=0,σ=1) = Φ(0) = 0.5, PDF(1;μ=0,σ=1) = 1/√(2π). |
 | LOGNORM.INV | ✅ | 8 | Wave 3 D-4 (W5-D-4) | W5-D-4: inverse log-normal CDF via `statrs::LogNormal`. 3 args. `0 < p < 1` strict both; `σ > 0` strict. Closed-form median: `LOGNORM.INV(0.5, μ, σ) = exp(μ)`. |
-| GAMMA / GAMMA.DIST / GAMMA.INV / GAMMALN | ❌ | 0 | 4.10 | |
-| BETA.DIST / BETA.INV | ❌ | 0 | 4.10 | |
+| GAMMA | ✅ | 9 | Wave 3 D-5 (W5-D-5) | W5-D-5: gamma function `Γ(x)` via `statrs::function::gamma::gamma` (NOT distribution-backed). Closed-form anchors: `Γ(1)=1`, `Γ(5)=24`, `Γ(0.5)=√π`, `Γ(-0.5)=-2√π`. Reject negative integers (poles); `Γ(0)=Inf → #NUM!` via finite-result guard. |
+| GAMMA.DIST | ✅ | 8 | Wave 3 D-5 (W5-D-5) | W5-D-5: gamma distribution PDF/CDF via `statrs::Gamma`. 4 args. `x ≥ 0`, `α > 0`, `β > 0` STRICT. Excel shape-scale `(α, β)` converted to statrs shape-rate via `rate=1/β`. α=1 reduces to exponential(1) — closed-form anchors verified. |
+| GAMMA.INV | ✅ | 9 | Wave 3 D-5 (W5-D-5) | W5-D-5: inverse gamma CDF. 3 args. `0 ≤ p ≤ 1` INCLUSIVE; `α > 0`, `β > 0`. Closed-form anchor: GAMMA.INV(0.5, 1, 1) = ln(2). |
+| GAMMALN | ✅ | 9 | Wave 3 D-5 (W5-D-5) | W5-D-5: `ln(Γ(x))` via `statrs::function::gamma::ln_gamma`. 1 arg. `x ≥ 0`; reject negative. Closed-form anchors: `ln(Γ(1))=0`, `ln(Γ(4))=ln(6)`, `ln(Γ(0.5))=½·ln(π)`. |
+| GAMMALN.PRECISE | ✅ | 5 | Wave 3 D-5 (W5-D-5) | W5-D-5: **alias of GAMMALN** (Excel 2010 renamed for naming consistency; same impl). Covered by alias-equality tests + independent error/arity tests. |
+| BETA.DIST | ✅ | 10 | Wave 3 D-5 (W5-D-5) | W5-D-5: beta distribution PDF/CDF via `statrs::Beta`. **VARIADIC 4-6 args**: optional `[A, B]` bounds default to `[0, 1]`. Transforms via `t=(x-A)/(B-A)`; PDF scaled by `1/(B-A)` Jacobian. Beta(1,1) is U(0,1) — closed-form anchors. `α > 0`, `β > 0`, `A < B`, `A ≤ x ≤ B`. |
+| BETA.INV | ✅ | 9 | Wave 3 D-5 (W5-D-5) | W5-D-5: inverse beta CDF. **VARIADIC 3-5 args**: optional `[A, B]`. `0 < p < 1` STRICT both; `α > 0`, `β > 0`, `A < B`. Returns `A + t·(B-A)` where `t=inverse_cdf(p)`. |
+| CONFIDENCE.NORM | ✅ | 10 | Wave 3 D-5 (W5-D-5) | W5-D-5: normal-CI half-width `z(1-α/2)·σ/√n`. 3 args. `0 < α < 1` strict, `σ > 0`, `size.floor() ≥ 1`. Size uses `.floor()` (matches IronCalc). Reuses W5-D-1 `standard_normal()` helper. |
+| CONFIDENCE.T | ✅ | 9 | Wave 3 D-5 (W5-D-5) | W5-D-5: Student's-t CI half-width `t(1-α/2; df=n-1)·σ/√n`. 3 args. **`size < 2` → `#DIV/0!`** (NOT `#NUM!` — Excel canon; only fn in distribution_fns returning `#DIV/0!`). Size uses `.trunc()` (diverges from CONFIDENCE.NORM's `.floor()`). Reuses W5-D-2 `students_t_with`. |
 | TREND / FORECAST / LINEST / LOGEST | ❌ | 0 | 4.10 | Array-result; needs 4.7 |
 
 ### Logical
@@ -301,7 +308,7 @@ as partial, rows with `❌` are missing.
 | BITAND / BITOR / BITXOR / BITLSHIFT / BITRSHIFT | ❌ | 0 | 4.10 | |
 | DEC2BIN / BIN2DEC / DEC2HEX / HEX2DEC / DEC2OCT / OCT2DEC | ❌ | 0 | 4.10 | Base conversion |
 | COMPLEX / IMABS / IMARGUMENT / IMCONJUGATE | ❌ | 0 | post-v1 | Complex-number math |
-| ERF / ERFC / GAMMA / GAMMALN | ❌ | 0 | 4.10 | |
+| ERF / ERFC | ❌ | 0 | 4.10 | (W5-D-5.1 MEDIUM-O-1 closure: GAMMA/GAMMALN moved to their own rows in the Statistical section — they shipped in W5-D-5.) |
 | CONVERT | ❌ | 0 | post-v1 | Unit conversion (large table) |
 
 ### Database (DGET, DSUM, etc.) — defer post-v1
