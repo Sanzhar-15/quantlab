@@ -797,6 +797,17 @@ pub fn default_registry() -> FunctionRegistry {
     r.register_reference_aware("ISREF", reference_fns::isref, ArgContract::LazyShape);
     r.register_reference_aware("ISFORMULA", reference_fns::isformula, ArgContract::Eager);
 
+    // **W5-RT-4 (RT-V1-01 Step 4 — CLOSES the reference-tier mini-phase)**:
+    // FORMULATEXT returns the canonical formula text at a referenced cell,
+    // with leading `=` (e.g., `"=SUM(B1:B3)"`). Eager contract + queries
+    // `ReferenceQuery::formula_text_at`. Multi-cell range → `#N/A` per
+    // Microsoft canon (documented IronCalc divergence).
+    r.register_reference_aware(
+        "FORMULATEXT",
+        reference_fns::formulatext,
+        ArgContract::Eager,
+    );
+
     r
 }
 
@@ -881,8 +892,11 @@ mod tests {
         // W5-RT-3 (RT-V1-01 Step 3): ISREF + ISFORMULA = 2
         // — reference-tier information batch; ISREF uses LazyShape
         // (first user-facing fn through that contract), ISFORMULA
-        // uses Eager + workbook ReferenceQuery::is_formula_at.
-        assert_eq!(r.len(), 199);
+        // uses Eager + workbook ReferenceQuery::is_formula_at +
+        // W5-RT-4 (RT-V1-01 Step 4 — CLOSES the mini-phase):
+        // FORMULATEXT = 1 — reference-tier text batch; Eager +
+        // ReferenceQuery::formula_text_at (prepends leading `=`).
+        assert_eq!(r.len(), 200);
     }
 
     #[test]

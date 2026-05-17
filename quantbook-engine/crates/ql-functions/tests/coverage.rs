@@ -639,6 +639,19 @@ const EXPLICITLY_DEFERRED: &[(&str, &str)] = &[
          + Step 3.1 cell-with-error-value pinning (S3-HIGH-1); scalar \
          arg-coverage matrix N/A",
     ),
+    // W5-RT-4 (RT-V1-01 Step 4 — CLOSES the reference-tier mini-phase) —
+    // FORMULATEXT. Eager contract + ReferenceQuery::formula_text_at;
+    // returns canonical formula text with leading `=` per Excel canon.
+    (
+        "FORMULATEXT",
+        "reference-aware fn (W5-RT-4) — Eager contract; covered by \
+         reference_fns unit tests (NoOpReferenceQuery NA path + arity + \
+         multi-cell #N/A + non-reference #N/A + error propagation) + \
+         ql-exec WorkbookEnv-backed storage-level e2e (formula text \
+         with leading `=` via Workbook::put_formula + cross-sheet + \
+         named-cell + 1×1 range + cell-with-error-value not-propagated); \
+         scalar arg-coverage matrix N/A",
+    ),
 ];
 
 #[test]

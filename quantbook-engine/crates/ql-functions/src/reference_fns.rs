@@ -6,7 +6,8 @@
 //!   (`ArgContract::LazyShape` — first user-facing fn through that
 //!   contract) + ISFORMULA (`Eager` + `ReferenceQuery::is_formula_at`).
 //! - **W5-RT-4 / Step 4** — text batch: FORMULATEXT (`Eager` +
-//!   `ReferenceQuery::formula_text_at`). Pending.
+//!   `ReferenceQuery::formula_text_at` — prepends `=` to stored text per
+//!   Excel canon). **CLOSES the RT-V1-01 mini-phase.**
 //!
 //! Design doc: `docs/architecture/2026-05-17-reference-tier-design.md` § 5.6.
 //! Audit summary: `docs/audits/2026-05-17-reference-tier-audit-summary.md`.
@@ -263,6 +264,93 @@ pub fn isformula(args: &[RefArg], ctx: &RefContext) -> Value {
         }
         // Multi-cell range OR any non-reference shape → #N/A per
         // Microsoft canon (design § 2.4 MEDIUM-1 closure).
+        [RefArg::Range { .. } | RefArg::Array(_) | RefArg::Scalar(_) | RefArg::Shape(_)] => {
+            Value::Error(ErrorValue::NA)
+        }
+        _ => Value::Error(ErrorValue::NA),
+    }
+}
+
+// =====================================================================
+// W5-RT-4 (RT-V1-01 Step 4): FORMULATEXT — text batch (CLOSES mini-phase)
+// =====================================================================
+
+/// **FORMULATEXT(ref)** — returns the canonical formula text at `ref`
+/// with a leading `=` (e.g., `"=SUM(B1:B3)"`). Queries workbook storage
+/// via `RefContext::workbook.formula_text_at`.
+///
+/// - `FORMULATEXT(A1)` where A1 = `=1+2` → `"=1+2"`.
+/// - `FORMULATEXT(BlankCell)` / `FORMULATEXT(LiteralCell)` → `#N/A`
+///   (no formula).
+/// - `FORMULATEXT(A1:A1)` → same as `FORMULATEXT(A1)` (1×1-range
+///   single-cell treatment).
+/// - `FORMULATEXT(A1:B3)` → `#N/A` (multi-cell range; Microsoft canon).
+/// - `FORMULATEXT("text")` / `FORMULATEXT(123)` / non-reference →
+///   `#N/A` (Microsoft canon; IronCalc returns `#ERROR!` divergence
+///   documented).
+/// - `FORMULATEXT(#REF!)` → `#REF!` (error propagation).
+/// - `FORMULATEXT()` / arity > 1 → `#N/A`.
+/// - Note: `FORMULATEXT(SUM(A1:A3))` literal-range form bind-fails per
+///   S1-MED-γ AggregateArg defer (pinned in `reference_fns_step4_e2e`).
+///   The named-range form `FORMULATEXT(SUM(NamedRange))` evaluates
+///   eagerly and returns `#N/A` (SUM result is Scalar, not Reference).
+///
+/// **Producer API canonicalization divergence (S4-HIGH-1 doc closure):**
+/// the stored formula text depends on which producer API wrote it:
+/// - `WorkbookRuntime::set_formula(...)` canonicalizes via
+///   `parse → print_with(...EnUs...)`. `FORMULATEXT` returns the
+///   canonical A1/EnUs form with leading `=`.
+/// - `WorkbookTransaction::put_formula(...)` stores raw user-typed text
+///   verbatim (parsing/binding only for validation). `FORMULATEXT`
+///   returns the raw text with leading `=`.
+///
+/// Both paths satisfy the leading-`=` invariant; the canonicalization
+/// invariant holds for set_formula only. v1-accepted divergence;
+/// future post-RT-V1 cycle may align the two paths.
+///
+/// **Producer/replay self-reference divergence (S4-HIGH-2 / parallel
+/// to S3-HIGH-5 for ISFORMULA):** `=FORMULATEXT(A1)` typed at A1 returns
+/// `#N/A` on producer side (`set_formula` evaluates BEFORE installing
+/// the formula → `formula_text_at(A1) = None`) but `"=FORMULATEXT(A1)"`
+/// on replay (op-log restores formula text BEFORE recompute). Documented
+/// v1 divergence; fix is a workbook_runtime restructure out of v1 scope.
+/// Pinned by `formulatext_self_reference_returns_na_during_set_formula_v1_pin`.
+///
+/// **Source-text retention (HIGH-D closure from pre-review):** the
+/// workbook stores canonical printer-output formula text (no leading
+/// `=`) via `Workbook::formula_at`. `ReferenceQuery::formula_text_at`
+/// (impl on `WorkbookEnv` in `ql-exec/src/env.rs`) prepends `=` at
+/// the boundary so callers receive the Excel-canonical FORMULATEXT
+/// shape directly.
+///
+/// v1 cost: same as ISFORMULA — value-deps on referenced cell instead
+/// of formula-status / formula-text deps. Acceptable per design § 8 R8.
+pub fn formulatext(args: &[RefArg], ctx: &RefContext) -> Value {
+    match args {
+        [RefArg::Error(ev)] => Value::Error(*ev),
+        [RefArg::Reference { address, .. }] => {
+            match ctx
+                .workbook
+                .formula_text_at(address.sheet, address.row, address.col)
+            {
+                Some(text) => Value::Text(text.into()),
+                None => Value::Error(ErrorValue::NA),
+            }
+        }
+        // 1×1 range: treat as single-cell.
+        [RefArg::Range { range, .. }]
+            if range.start_row == range.end_row && range.start_col == range.end_col =>
+        {
+            match ctx
+                .workbook
+                .formula_text_at(range.sheet, range.start_row, range.start_col)
+            {
+                Some(text) => Value::Text(text.into()),
+                None => Value::Error(ErrorValue::NA),
+            }
+        }
+        // Multi-cell range OR any non-reference shape → #N/A per
+        // Microsoft canon (matches ISFORMULA's pattern).
         [RefArg::Range { .. } | RefArg::Array(_) | RefArg::Scalar(_) | RefArg::Shape(_)] => {
             Value::Error(ErrorValue::NA)
         }
@@ -863,6 +951,96 @@ mod tests {
         let ctx = ctx_no_cell();
         assert_eq!(
             isformula(&[cell_ref(0, 0, 0), cell_ref(0, 0, 1)], &ctx),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    // ===== FORMULATEXT (W5-RT-4 Step 4) =====
+    //
+    // FORMULATEXT uses ArgContract::Eager + ReferenceQuery::formula_text_at.
+    // Unit tests use NoOpReferenceQuery → always returns None → #N/A.
+    // The e2e tests in `reference_fns_step4_e2e.rs` exercise the
+    // formula-bearing happy paths via a real Workbook + put_formula.
+
+    #[test]
+    fn formulatext_of_cellref_with_noop_workbook_returns_na() {
+        let ctx = ctx_no_cell();
+        // NoOpReferenceQuery → no formula at any address → #N/A.
+        assert_eq!(
+            formulatext(&[cell_ref(0, 0, 0)], &ctx),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn formulatext_of_single_cell_range_with_noop_workbook_returns_na() {
+        let ctx = ctx_no_cell();
+        // 1×1 range — treated as single-cell. NoOp → #N/A.
+        assert_eq!(
+            formulatext(&[range_ref(0, 5, 5, 5, 5)], &ctx),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn formulatext_of_multi_cell_range_returns_na() {
+        let ctx = ctx_no_cell();
+        // Microsoft canon: multi-cell → #N/A.
+        assert_eq!(
+            formulatext(&[range_ref(0, 0, 0, 2, 1)], &ctx),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn formulatext_of_text_scalar_returns_na() {
+        let ctx = ctx_no_cell();
+        // Microsoft canon (vs IronCalc #ERROR!): non-reference → #N/A.
+        assert_eq!(
+            formulatext(&[RefArg::Scalar(Value::Text("text".into()))], &ctx),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn formulatext_of_number_scalar_returns_na() {
+        let ctx = ctx_no_cell();
+        assert_eq!(
+            formulatext(&[RefArg::Scalar(Value::number(42.0))], &ctx),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn formulatext_of_array_literal_returns_na() {
+        let ctx = ctx_no_cell();
+        let av = ql_types::ArrayValue::new(2, 2, vec![Value::number(1.0); 4]).unwrap();
+        assert_eq!(
+            formulatext(&[RefArg::Array(av)], &ctx),
+            Value::Error(ErrorValue::NA)
+        );
+    }
+
+    #[test]
+    fn formulatext_propagates_error_arg() {
+        let ctx = ctx_no_cell();
+        assert_eq!(
+            formulatext(&[RefArg::Error(ErrorValue::Ref)], &ctx),
+            Value::Error(ErrorValue::Ref)
+        );
+    }
+
+    #[test]
+    fn formulatext_arity_zero_returns_na() {
+        let ctx = ctx_no_cell();
+        assert_eq!(formulatext(&[], &ctx), Value::Error(ErrorValue::NA));
+    }
+
+    #[test]
+    fn formulatext_arity_two_returns_na() {
+        let ctx = ctx_no_cell();
+        assert_eq!(
+            formulatext(&[cell_ref(0, 0, 0), cell_ref(0, 0, 1)], &ctx),
             Value::Error(ErrorValue::NA)
         );
     }

@@ -120,21 +120,31 @@ ISFORMULA needs read access to the workbook's storage to query "does cell at (sh
 ### 2.5 FORMULATEXT
 
 ```
-FORMULATEXT(A1)           → "=SUM(B1:B3)" (canonical printer output + leading `=`)
-FORMULATEXT(BlankCell)    → #N/A
-FORMULATEXT(LiteralCell)  → #N/A   (no formula)
-FORMULATEXT(A1:B3)        → #N/A   (multi-cell; per Microsoft canon; v1 takes IronCalc divergence)
-FORMULATEXT("text")       → #N/A
-FORMULATEXT(123)          → #N/A
-FORMULATEXT(#REF!)        → #REF!  (error propagation)
-FORMULATEXT(SUM(A1:A3))   → #N/A
+FORMULATEXT(A1)              → "=SUM(B1:B3)" (canonical OR raw printer output + leading `=`; see canonicalization note below)
+FORMULATEXT(BlankCell)       → #N/A
+FORMULATEXT(LiteralCell)     → #N/A   (no formula)
+FORMULATEXT(A1:B3)           → #N/A   (multi-cell; per Microsoft canon; v1 takes IronCalc divergence)
+FORMULATEXT("text")          → #N/A
+FORMULATEXT(123)             → #N/A
+FORMULATEXT(#REF!)           → #REF!  (error propagation)
+FORMULATEXT(SUM(A1:A3))      → BIND-FAIL (v1 scope per S1-MED-γ AggregateArg defer; pinned by `formulatext_of_sum_literal_range_bind_fails_v1_scope`)
+FORMULATEXT(SUM(NamedRange)) → #N/A    (named-range form works; SUM evaluates eagerly to Scalar; not a reference)
 ```
 
-**Source-text retention — RESOLVED (HIGH-D closure).** `crates/ql-storage/src/workbook.rs:874` exposes `Workbook::formula_at(sheet, row, col) -> Option<&Arc<str>>` returning the canonical printer output (from `parse → print_with(...EnUs...)` at `workbook_runtime.rs:573`). FORMULATEXT prepends `=` at the function boundary and returns the result as `Value::Text`.
+**Source-text retention — RESOLVED (HIGH-D closure).** `crates/ql-storage/src/workbook.rs:874` exposes `Workbook::formula_at(sheet, row, col) -> Option<&Arc<str>>` returning the stored formula text. FORMULATEXT prepends `=` at the function boundary and returns the result as `Value::Text`.
 
-**Documented divergence from Excel:** we return *canonicalized A1/EnUs printer output*, not the raw user-typed source text. IronCalc also returns canonicalized (English, no spaces). The user-visible difference: spacing / case differences typed by the user are normalized. Acceptable v1; not a correctness issue.
+**Documented divergence — canonicalization-per-producer-API (S4-HIGH-1 closure):** TWO public producer APIs write formulas and the stored text shape differs:
+
+- **`WorkbookRuntime::set_formula(...)`** canonicalizes via `parse → print_with(...EnUs...)` at `workbook_runtime.rs:573`. FORMULATEXT returns the canonical A1/EnUs printer output with leading `=`.
+- **`WorkbookTransaction::put_formula(...)`** (used for paste-block / batch writes per `transaction.rs:5-78`) stores raw user-typed text verbatim. FORMULATEXT returns the raw text with leading `=`.
+
+Both APIs satisfy the leading-`=` invariant. v1 acceptance: this is a known divergence. Both forms parse to the same AST, so the divergence is purely cosmetic (spacing/case in formula text). Alignment is post-RT-V1 work (Opus pre-review S4-HIGH-1 Option 1 or 2 path: canonicalize at FORMULATEXT boundary OR at Transaction).
+
+**Documented divergence from Excel:** we return printer output (canonical or raw, per above), not necessarily the exact user-typed source text. IronCalc also returns canonicalized (English, no spaces). Acceptable v1; not a correctness issue.
 
 **Documented divergence from Excel-365 spill:** Excel-365 dynamic-array FORMULATEXT spills over multi-cell ranges, one formula per cell. v1 stance: multi-cell → `#N/A`, matching IronCalc's divergence. Spill-form FORMULATEXT is a follow-up.
+
+**Producer/replay self-reference divergence (S4-HIGH-2 / parallel to S3-HIGH-5):** `=FORMULATEXT(A1)` typed at A1 returns `#N/A` producer-side (set_formula evaluates BEFORE installing formula text) but the full text replay-side (op-log restores formula_cells BEFORE recompute). Real producer/replay invariant break. Fix is workbook_runtime restructure (pending-formula overlay OR atomic pre-install with rollback); v1 accepts the divergence with explicit pinning tests in `reference_fns_step4_e2e.rs`.
 
 ## 3. Current tier architecture (verified 2026-05-17)
 

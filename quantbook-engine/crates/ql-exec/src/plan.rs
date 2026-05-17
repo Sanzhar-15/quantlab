@@ -1756,9 +1756,18 @@ mod tests {
     fn step_2_reference_aware_names_registered_in_reference_tier() {
         use ql_functions::default_registry;
         let reg = default_registry();
-        // Registered in Step 2 + Step 3 — must be present in all expected
-        // places. Step 4 (FORMULATEXT) registers in the next batch.
-        for name in &["ROW", "COLUMN", "ROWS", "COLUMNS", "ISREF", "ISFORMULA"] {
+        // Registered in Step 2 + Step 3 + Step 4 — all 7 reference-tier
+        // fns must be present in all expected places. The mini-phase
+        // (RT-V1-01) is now COMPLETE.
+        for name in &[
+            "ROW",
+            "COLUMN",
+            "ROWS",
+            "COLUMNS",
+            "ISREF",
+            "ISFORMULA",
+            "FORMULATEXT",
+        ] {
             assert!(
                 reg.lookup_reference_aware(name).is_some(),
                 "Step 2 registered {name:?} but lookup_reference_aware can't find it"
@@ -1788,36 +1797,11 @@ mod tests {
                 "{name:?} is reference-aware ONLY; must not appear in context-aware table"
             );
         }
-        // **S2-MED-γ + Step 3 update:** FORMULATEXT remains
-        // Step 4-pending. Matcher pre-lists it (binder routes its args
-        // correctly), but registry must NOT have it yet (typo guard).
-        // Step 3.1: extend disjointness to all four non-reference-aware
-        // tiers.
-        assert!(
-            is_reference_aware_function("FORMULATEXT"),
-            "FORMULATEXT should be in the matcher (Step 4 pre-listing)"
-        );
-        assert!(
-            reg.lookup_reference_aware("FORMULATEXT").is_none(),
-            "FORMULATEXT is Step 4 work; must NOT yet be registered in \
-             the reference-aware tier"
-        );
-        assert!(
-            reg.lookup("FORMULATEXT").is_none(),
-            "FORMULATEXT not yet registered; should not appear in scalar table"
-        );
-        assert!(
-            reg.lookup_range_aware("FORMULATEXT").is_none(),
-            "FORMULATEXT not yet registered; should not appear in range-aware table"
-        );
-        assert!(
-            reg.lookup_context_aware("FORMULATEXT").is_none(),
-            "FORMULATEXT not yet registered; should not appear in context-aware table"
-        );
-        assert!(
-            reg.lookup_unified("FORMULATEXT").is_none(),
-            "FORMULATEXT not yet registered; should not appear in unified table"
-        );
+        // **Step 4 update (W5-RT-4):** FORMULATEXT now registered.
+        // The pending-name sentinel block from Step 2/3 is removed —
+        // mini-phase RT-V1-01 is COMPLETE. The loop above covers all 7
+        // names with full disjointness across scalar / range-aware /
+        // context-aware / unified tiers.
     }
 
     #[test]
