@@ -115,6 +115,18 @@ pub enum ExprPlan {
     /// literals inside `Expr::Array` cells.
     Error(ErrorValue),
 
+    /// **W5-RT-1 (RT-V1-01):** literal range reference (`A1:B3`) lowered
+    /// from `Expr::RangeRef` in `BindContext::ReferenceArg`. Carries the
+    /// resolved [`Range`] directly, without requiring a name. Used as an
+    /// argument to reference-aware functions (ROWS, COLUMNS, ROW with a
+    /// range arg, etc.). Distinct from `AggregateNameRef` (which needs a
+    /// name) and `StructuredRef` (which needs a table); the only path
+    /// that reaches this variant today is `Expr::RangeRef` bound in
+    /// `ReferenceArg` context. See design § 5.4.
+    RangeRef {
+        range: Range,
+    },
+
     /// **W5-115 (Phase 4.8.F):** structured table reference resolved
     /// against the workbook's `TableTable`. The binder narrows the
     /// `TableSpecSubtree` source AST to a concrete [`Range`]; eval
@@ -352,8 +364,24 @@ enum BindContext {
     /// Inside the argument list of an aggregate function (SUM, AVERAGE,
     /// MIN, MAX, COUNT, etc. — see `is_aggregate_function`). NameRefs
     /// resolving to ranges bind to `ExprPlan::AggregateNameRef`; named
-    /// formulas still error (Engine Phase 4 work).
+    /// formulas still error (Engine Phase 4 work). Step 1.1 closure
+    /// (S1-LOW-2): the design v2 proposed renaming the matcher to
+    /// `accepts_special_arg_at_bind`; that rename did not ship (see
+    /// S1-HIGH-D — parallel-matcher approach kept instead). Doc-comment
+    /// reverted to reference the actual matcher.
     AggregateArg,
+    /// **W5-RT-1 (RT-V1-01):** inside the argument list of a reference-aware
+    /// function (ROW, COLUMN, ROWS, COLUMNS, ISREF, ISFORMULA, FORMULATEXT).
+    /// Same shape as `AggregateArg` for NameRef-resolves-to-range AND
+    /// (NEW) accepts literal `Expr::RangeRef` lowering to
+    /// `ExprPlan::RangeRef { range }`. CellRef args bind as
+    /// `ExprPlan::CellRef` unchanged. The scope of the `RangeRef`
+    /// lowering is intentionally narrow in v1: only this context accepts
+    /// literal ranges. `AggregateArg`-side enabling (which would make
+    /// `SUM(A1:B3)` work — currently a `BindError::UnsupportedVariant`)
+    /// is a separate follow-up since the multi-tier dispatcher (scalar /
+    /// range-aware / unified) would also need new `RangeRef` arms.
+    ReferenceArg,
 }
 
 /// Phase 2B.4 (2026-05-12): hardcoded list of functions whose arguments
@@ -449,6 +477,31 @@ pub(crate) fn is_aggregate_function(name: &str) -> bool {
             // start, step).
             | "TRANSPOSE"
             | "FILTER"
+    )
+}
+
+/// **W5-RT-1 (RT-V1-01):** classifier for the reference-aware dispatch tier.
+/// These functions take their args under `BindContext::ReferenceArg` rather
+/// than `Scalar` or `AggregateArg`. ReferenceArg context accepts:
+///
+/// - `Expr::CellRef` → `ExprPlan::CellRef` (unchanged).
+/// - `Expr::RangeRef` → `ExprPlan::RangeRef { range }` (NEW; the only context
+///   that accepts literal ranges at bind time today).
+/// - `Expr::NameRef` resolving to a `NamedTarget::Range` →
+///   `ExprPlan::AggregateNameRef` (same as `AggregateArg` semantics).
+/// - `Expr::Array(_)` → `ExprPlan::Array(_)` for `ROWS({1,2,3;4,5,6})`.
+/// - Everything else → bound as Scalar sub-expression (the per-fn impl
+///   surfaces `#VALUE!` / `#N/A` for non-reference args per Excel canon).
+///
+/// Pinned via the `accepts_special_arg_lists_only_registered_reference_aware`
+/// invariant test (added in this commit). v1 always returns false until the
+/// 7 reference-aware fns are registered in Step 2 / 3 / 4 — that ordering
+/// is intentional: Step 1 ships the infrastructure with no user-facing fn
+/// dispatching through it, gates green.
+pub(crate) fn is_reference_aware_function(name: &str) -> bool {
+    matches!(
+        name,
+        "ROW" | "COLUMN" | "ROWS" | "COLUMNS" | "ISREF" | "ISFORMULA" | "FORMULATEXT"
     )
 }
 
@@ -633,16 +686,41 @@ fn bind_with_context_v2<L: NameLookup>(
                 BindContext::Scalar,
             )?),
         }),
-        Expr::RangeRef(_) => Err(BindError::UnsupportedVariant(
-            "literal RangeRef in non-Function context is unsupported in v1; \
-             use a named range (Phase 2B.4 AggregateNameRef) or wrap in an \
-             aggregate function. (Updated W5-108 / Phase 4.7.O; original \
-             Phase 0 W4-1 message referenced \"no function dispatch yet\" \
-             which has been in place since Phase 2A.)",
-        )),
+        Expr::RangeRef(rr) => {
+            // **W5-RT-1 (RT-V1-01):** literal range args are accepted inside
+            // a reference-aware function arg list (`BindContext::ReferenceArg`)
+            // — they lower to `ExprPlan::RangeRef { range }`. Outside that
+            // context the rejection stands (W5-108 / Phase 4.7.O message
+            // preserved).
+            //
+            // AggregateArg-side enabling (which would let `SUM(A1:B3)` bind)
+            // is deferred: every Scalar/RangeAware/Unified dispatcher arm
+            // would also need new `ExprPlan::RangeRef` handling, which is
+            // out of scope for the reference-tier mini-phase. Tracked as a
+            // follow-up in the design doc § 5.4.
+            if ctx == BindContext::ReferenceArg {
+                let range = resolve_range_ref_to_range(rr, owning_sheet, sheets)?;
+                Ok(ExprPlan::RangeRef { range })
+            } else {
+                Err(BindError::UnsupportedVariant(
+                    "literal RangeRef in non-Function context is unsupported in v1; \
+                     use a named range (Phase 2B.4 AggregateNameRef) or wrap in an \
+                     aggregate function. (Updated W5-108 / Phase 4.7.O; original \
+                     Phase 0 W4-1 message referenced \"no function dispatch yet\" \
+                     which has been in place since Phase 2A. W5-RT-1 added literal \
+                     RangeRef support inside reference-aware fn arg lists only.)",
+                ))
+            }
+        }
         Expr::Function { name, args } => {
-            // Phase 2B.4: switch context for aggregate-function arg lists.
-            let arg_ctx = if is_aggregate_function(name) {
+            // **W5-RT-1 (RT-V1-01):** reference-aware fns take args under
+            // `ReferenceArg` context (literal RangeRef + range NameRef both
+            // accepted; CellRef passes through). Aggregate/range-aware/
+            // unified-tier fns keep the existing `AggregateArg` context.
+            // Plain scalar fns get `Scalar` (rejects range args).
+            let arg_ctx = if is_reference_aware_function(name) {
+                BindContext::ReferenceArg
+            } else if is_aggregate_function(name) {
                 BindContext::AggregateArg
             } else {
                 BindContext::Scalar
@@ -748,11 +826,17 @@ fn bind_with_context_v2<L: NameLookup>(
                 Some(ResolvedName::Bool(b)) => Ok(ExprPlan::Bool(b)),
                 Some(ResolvedName::Text(s)) => Ok(ExprPlan::String(s)),
                 // Phase 2B.4: context-aware Range handling.
+                // W5-RT-1 (RT-V1-01): reference-aware fn arg context
+                // accepts named ranges with the same shape as aggregate
+                // arg — the materializer treats `AggregateNameRef` as a
+                // `RefArg::Range` consumer.
                 Some(ResolvedName::Range(range)) => match ctx {
-                    BindContext::AggregateArg => Ok(ExprPlan::AggregateNameRef {
-                        name: name.clone(),
-                        range,
-                    }),
+                    BindContext::AggregateArg | BindContext::ReferenceArg => {
+                        Ok(ExprPlan::AggregateNameRef {
+                            name: name.clone(),
+                            range,
+                        })
+                    }
                     BindContext::Scalar => Err(BindError::NamedRangeInScalarContext(name.clone())),
                 },
                 // Phase 2B.4: named formulas still unsupported (Engine Phase 4).
@@ -1542,10 +1626,108 @@ fn resolve_sheet_ref(
     }
 }
 
+/// **W5-RT-1 (RT-V1-01):** resolve `Expr::RangeRef` to a [`Range`] WITHOUT
+/// implicit-intersection narrowing. Used by the reference-aware binder path
+/// for ROW/COLUMN/ROWS/COLUMNS args. Whole-column resolves to the full row
+/// range `0..=MAX_ROW`, whole-row to `0..=MAX_COLUMN`. R1C1 cells inside `@`
+/// is parser-intermediate (storage canon is A1) and is rejected here too.
+fn resolve_range_ref_to_range(
+    rr: &ql_formula_syntax::RangeRef,
+    owning_sheet: SheetId,
+    sheets: &dyn SheetResolver,
+) -> Result<Range, BindError> {
+    use ql_formula_syntax::RangeRef;
+    match rr {
+        RangeRef::Cells {
+            sheet,
+            start_col,
+            start_row,
+            end_col,
+            end_row,
+            ..
+        } => {
+            let sheet_id = resolve_sheet_ref(sheet, owning_sheet, sheets)?;
+            Ok(Range::new(
+                sheet_id, *start_row, *start_col, *end_row, *end_col,
+            ))
+        }
+        RangeRef::WholeColumn {
+            sheet,
+            start_col,
+            end_col,
+            ..
+        } => {
+            let sheet_id = resolve_sheet_ref(sheet, owning_sheet, sheets)?;
+            Ok(Range::new(sheet_id, 0, *start_col, MAX_ROW, *end_col))
+        }
+        RangeRef::WholeRow {
+            sheet,
+            start_row,
+            end_row,
+            ..
+        } => {
+            let sheet_id = resolve_sheet_ref(sheet, owning_sheet, sheets)?;
+            Ok(Range::new(sheet_id, *start_row, 0, *end_row, MAX_COLUMN))
+        }
+        RangeRef::R1C1Cells { .. } => Err(BindError::UnsupportedVariant(
+            "RangeRef::R1C1Cells in reference-aware fn arg is parser-intermediate; \
+             storage canon is A1. Should not reach the binder.",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ql_formula_syntax::{CellAddr, RangeRef, SheetRef};
+
+    /// **W5-RT-1 / Step 1.1 (S1-HIGH-C closure):** matcher-only direction
+    /// of the `accepts_special_arg_lists_only_registered_reference_aware`
+    /// invariant — pin the 7 names the binder treats as reference-aware.
+    /// At Step 1 (no fns registered) the registry-side direction is
+    /// trivially satisfied (empty loop); Step 2/3/4 add the registry-side
+    /// assertions (every name in `reg.lookup_reference_aware` is also in
+    /// the matcher).
+    ///
+    /// The matcher-only direction prevents typo drift in this commit:
+    /// future-me adding a name to one place and forgetting the other is
+    /// caught at test time, not at user-facing-failure time.
+    #[test]
+    fn accepts_special_arg_lists_only_registered_reference_aware_matcher_pin() {
+        // Every reference-aware name the design v2 enumerates must be
+        // recognized by the matcher.
+        for name in &[
+            "ROW",
+            "COLUMN",
+            "ROWS",
+            "COLUMNS",
+            "ISREF",
+            "ISFORMULA",
+            "FORMULATEXT",
+        ] {
+            assert!(
+                is_reference_aware_function(name),
+                "design v2 enumerates {name:?} as reference-aware but matcher \
+                 returns false"
+            );
+        }
+        // Sentinel non-reference-aware names (typo guard).
+        for name in &[
+            "RAW",
+            "COLUM",
+            "ISFOMULA",
+            "FORMULATXT",
+            "SUM",
+            "IF",
+            "VLOOKUP",
+        ] {
+            assert!(
+                !is_reference_aware_function(name),
+                "{name:?} is NOT supposed to be reference-aware but matcher \
+                 returns true"
+            );
+        }
+    }
 
     #[test]
     fn bind_number() {

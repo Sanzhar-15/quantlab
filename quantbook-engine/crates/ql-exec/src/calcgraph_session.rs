@@ -163,6 +163,45 @@ pub(crate) fn is_volatile_function(name: &str) -> bool {
     )
 }
 
+/// **W5-RT-1 (RT-V1-01) — Step 1.1 / S1-HIGH-D rename:** reference-aware
+/// functions whose result depends only on the **address or syntactic shape**
+/// of their argument — NOT on the referenced cell's value. The dep walker
+/// routes their arg lists through [`walk_plan_for_address_only_deps`]
+/// instead of the normal walker.
+///
+/// - `ROW(A1)` / `COLUMN(A1)`: result = A1's address indices; A1's value
+///   is irrelevant.
+/// - `ROWS(A1:B3)` / `COLUMNS(A1:B3)`: result = range dimensions; cell
+///   values inside are irrelevant.
+/// - `ISREF(arg)`: result = syntactic shape of `arg`; no evaluation at all.
+///
+/// `ISFORMULA` and `FORMULATEXT` are NOT in this list — their result
+/// depends on storage metadata (formula-vs-literal, formula source text)
+/// of the referenced cell. They keep value-deps as a v1 cost (the right
+/// fix is a `formula_status_deps` dep kind that fires only on
+/// `on_set_formula` / `on_clear_formula`, not on `set_value` — out of v1
+/// scope per design § 8 R8).
+///
+/// **Audit context (S1-HIGH-A from `2026-05-17-rt-step-1-codex.md`):** the
+/// initial Step 1 implementation suppressed *all* arg walking by fn name,
+/// which dropped value-deps for non-reference arg shapes too — e.g.,
+/// `ROW(A1+1)` lost A1's dep because the walker never descended into the
+/// `Binary` arm even though the eager materializer evaluated A1+1 at
+/// dispatch time. This pinned a false invariant ("ref-aware fn result
+/// depends only on its arg's address") that the materializer doesn't
+/// honor for non-reference shapes. The Step 1.1 closure switches to
+/// **shape-aware** suppression — only direct `CellRef` / `RangeRef` args
+/// skip value-deps; everything else (Binary / Unary / Function / etc.)
+/// walks normally. See [`walk_plan_for_address_only_deps`] for the
+/// per-shape rules.
+///
+/// **Invariant pin:** the `dep_suppressed_reference_fns_match_design`
+/// test (S1-MED-ζ closure) asserts the list contents against the design's
+/// explicit enumeration; spelling drift will surface there.
+pub(crate) fn is_address_only_reference_fn(name: &str) -> bool {
+    matches!(name, "ROW" | "COLUMN" | "ROWS" | "COLUMNS" | "ISREF")
+}
+
 /// Phase 3.2 — direct-dep collection extracted from walking a bound
 /// `ExprPlan`. Fields are owned (no borrows) so the caller can pass
 /// the collection around or store it without lifetime ceremony.
@@ -231,14 +270,59 @@ pub(crate) fn walk_plan_for_deps(plan: &ExprPlan, deps: &mut FormulaDeps) {
             if is_volatile_function(name) {
                 deps.is_volatile = true;
             }
-            for arg in args {
-                walk_plan_for_deps(arg, deps);
+            // **W5-RT-1 / Step 1.1 (S1-HIGH-A closure):** shape-aware
+            // dep walking for reference-aware fns. For
+            // ROW/COLUMN/ROWS/COLUMNS/ISREF the result depends on the
+            // ADDRESS or SHAPE of args, not on their VALUE. The walker
+            // routes their arg lists through
+            // `walk_plan_for_address_only_deps`, which skips value-deps
+            // on direct CellRef/RangeRef but walks Binary/Unary/Function
+            // normally — the materializer evaluates those eagerly, so
+            // their inner inputs DO affect the eager-eval result class
+            // (e.g., `ROW(A1+1)` evaluates A1+1; A1 must stay tracked).
+            //
+            // ISFORMULA and FORMULATEXT take the normal walker —
+            // value-deps over-recompute is the v1 cost (their result
+            // depends on formula-status which we don't track separately
+            // yet; see design § 8 R8).
+            if is_address_only_reference_fn(name) {
+                for arg in args {
+                    walk_plan_for_address_only_deps(arg, deps);
+                }
+            } else {
+                for arg in args {
+                    walk_plan_for_deps(arg, deps);
+                }
             }
         }
         ExprPlan::AggregateNameRef { name, range } => {
             deps.named_ranges.push((Arc::clone(name), *range));
             deps.names.push(Arc::clone(name));
         }
+        // **W5-RT-1 / Step 1.1 (S1-MED-δ closure):** literal range refs
+        // bind to `ExprPlan::RangeRef { range }` inside reference-aware
+        // fn arg lists. In v1, this arm is only reachable when ISFORMULA
+        // or FORMULATEXT takes a literal range — both of which return
+        // `#N/A` for multi-cell ranges per Microsoft canon, so the
+        // result is value-independent. No deps registered.
+        //
+        // Single-cell `ISFORMULA(A1)` / `FORMULATEXT(A1)` go through
+        // `ExprPlan::CellRef` (not RangeRef) and DO register the cell
+        // dep — the formula-status they query can flip with
+        // `set_formula` / `clear_formula`, and we don't yet track
+        // formula-status deps separately from value-deps (design § 8
+        // R8). v1 cost.
+        //
+        // The initial Step 1 implementation pushed a synthetic name
+        // `__rt_literal_range__` into `named_ranges` here, which leaked
+        // a private marker through the public `FormulaDeps.named_ranges`
+        // field (Opus MEDIUM-O-6 / Codex LOW-3). Step 1.1 drops the
+        // push entirely — the dep is unnecessary for the only v1
+        // consumers (ISFORMULA / FORMULATEXT multi-cell → #N/A).
+        // If a future iterating reference-aware fn needs literal-range
+        // value-deps, add a `FormulaDeps.literal_ranges: Vec<Range>`
+        // field then.
+        ExprPlan::RangeRef { range: _ } => {}
         // **W5-99 (Phase 4.7.F):** array-literal and error-literal plans
         // have NO dependencies — they're pure constants. Array cells
         // are also restricted to literals (Number/Bool/String/Error),
@@ -264,6 +348,64 @@ pub(crate) fn walk_plan_for_deps(plan: &ExprPlan, deps: &mut FormulaDeps) {
             deps.named_ranges.push((Arc::clone(table_name), *resolved));
             deps.tables.push(Arc::clone(table_name));
         }
+    }
+}
+
+/// **W5-RT-1 / Step 1.1 (S1-HIGH-A closure):** shape-aware dep walker for
+/// args of address-only reference-aware functions (ROW/COLUMN/ROWS/COLUMNS/
+/// ISREF — see [`is_address_only_reference_fn`]). The default walker
+/// [`walk_plan_for_deps`] would register value-deps on every direct
+/// reference; this walker preserves the dep-suppress semantics for the
+/// shapes that *truly* don't affect the calling fn's result, while still
+/// recursing into eagerly-evaluated subtrees whose inputs DO affect it.
+///
+/// **Per-shape policy:**
+///
+/// - `CellRef` — no value-dep. The fn returns the cell's row/col index;
+///   the cell's value is irrelevant. Addresses are stable under value
+///   edits (only structural row/col-insert events change them, which
+///   would be tracked separately by a future structural-dep mechanism).
+/// - `RangeRef { range }` — no value-dep. ROWS/COLUMNS read `start_row` /
+///   `end_row` / `start_col` / `end_col` from the resolved range; cell
+///   values inside are irrelevant.
+/// - `AggregateNameRef { name, range }` — register the NAME dep so name
+///   rename / retarget invalidates this formula, but do NOT push to
+///   `named_ranges` (no cell-stripe registration; range values don't
+///   affect the result).
+/// - `StructuredRef { table_name, resolved }` — register the TABLE name
+///   dep so `on_table_*` mutation hooks fire, but no value-dep on the
+///   resolved range.
+/// - Everything else (Binary / Unary / Function / Array / Error / Number
+///   / Bool / String) — walk normally via [`walk_plan_for_deps`]. The
+///   eager materializer evaluates these args at dispatch time, so their
+///   inner inputs DO affect the (typically `#VALUE!`) result class and
+///   any error propagation. `ROW(A1+1)` MUST keep A1's dep; `ROW(NOW())`
+///   MUST mark the formula volatile.
+///
+/// **Audit context (Codex S1-HIGH-1 / Opus S1-HIGH-3):** the initial
+/// Step 1 implementation suppressed *all* arg walking by fn name, which
+/// broke this invariant for non-reference arg shapes — `ROW(A1+1)` lost
+/// A1's dep entirely. The Codex audit caught the asymmetry between
+/// materializer eager-eval and walker suppression; the Opus audit
+/// documented the resulting volatile re-firing under suppressed deps.
+/// Step 1.1 closes both by making the walker shape-aware.
+fn walk_plan_for_address_only_deps(plan: &ExprPlan, deps: &mut FormulaDeps) {
+    match plan {
+        // Direct reference shapes: skip value-deps. Address is the input.
+        ExprPlan::CellRef { .. } | ExprPlan::RangeRef { .. } => {}
+        // Structural-dep only: rename / retarget invalidates this
+        // formula, but cell-stripe values inside the range don't.
+        ExprPlan::AggregateNameRef { name, .. } => {
+            deps.names.push(Arc::clone(name));
+        }
+        ExprPlan::StructuredRef { table_name, .. } => {
+            deps.tables.push(Arc::clone(table_name));
+        }
+        // Non-reference shapes: walk normally. The eager materializer
+        // evaluates them; their inputs affect the result class and
+        // error propagation. Wasted CPU under volatile / nested calls
+        // is acceptable v1 cost (see S1-HIGH-E doc note).
+        _ => walk_plan_for_deps(plan, deps),
     }
 }
 
@@ -1558,6 +1700,38 @@ mod tests {
     use super::*;
     use crate::plan::BindError;
     use ql_types::Value;
+
+    /// **W5-RT-1 / Step 1.1 (S1-MED-ζ closure):** pin the address-only
+    /// reference-aware fn list against the design's explicit enumeration.
+    /// Spelling drift in `is_address_only_reference_fn` is caught here;
+    /// adding ISFORMULA or FORMULATEXT to the list by accident (the design
+    /// reserves them for value-dep / formula-status-dep over-recompute
+    /// per § 8 R8) would also fail.
+    #[test]
+    fn dep_suppressed_reference_fns_match_design() {
+        // Address-only — value-deps suppressed for these.
+        for name in &["ROW", "COLUMN", "ROWS", "COLUMNS", "ISREF"] {
+            assert!(
+                is_address_only_reference_fn(name),
+                "design § 5.3 lists {name:?} as address-only but matcher returns false"
+            );
+        }
+        // Reference-aware but NOT address-only — value-deps kept as v1 cost.
+        for name in &["ISFORMULA", "FORMULATEXT"] {
+            assert!(
+                !is_address_only_reference_fn(name),
+                "{name:?} should keep value-deps (formula-status / source-text \
+                 access) — must not be in is_address_only_reference_fn"
+            );
+        }
+        // Typo guards.
+        for name in &["RAW", "COLUM", "ISREFENCE", "SUM", "IF"] {
+            assert!(
+                !is_address_only_reference_fn(name),
+                "{name:?} is not reference-aware; must not be in the suppressed list"
+            );
+        }
+    }
 
     fn workbook_with_formulas(formulas: &[(SheetId, RowId, ColId, &str)]) -> Workbook {
         let mut wb = Workbook::new();

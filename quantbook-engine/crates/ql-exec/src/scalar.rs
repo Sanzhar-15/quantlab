@@ -80,6 +80,10 @@ pub fn eval_scalar<E: CellEnv>(plan: &ExprPlan, env: &E) -> Value {
         // semantics must go through `eval_scalar_with_registry` or
         // `eval_scalar_with_cache`.
         ExprPlan::AggregateNameRef { .. } => Value::Error(ErrorValue::Calc),
+        // **W5-RT-1 (RT-V1-01):** literal range refs only reach reference-
+        // aware functions; in this no-registry path there's no dispatcher
+        // to consume them. Mirrors the `AggregateNameRef` precedent.
+        ExprPlan::RangeRef { .. } => Value::Error(ErrorValue::Calc),
         // **W5-99 (Phase 4.7.F):** error literal — return the error
         // value directly. Used by `=#REF!` formulas and error literals
         // inside array cells.
@@ -430,6 +434,32 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
                         f(&evaluated)
                     }
                 }
+                Some(RegisteredFn::ReferenceAware(rf, contract)) => {
+                    // **W5-RT-1 (RT-V1-01):** reference-aware tier
+                    // dispatch. Materialize each arg per the fn's
+                    // `ArgContract`: `Eager` produces `RefArg::Scalar`/
+                    // `Reference`/`Range`/`Array`/`Error`; `LazyShape`
+                    // produces `RefArg::Shape(PlanKind)` without
+                    // evaluating the arg (used by ISREF). See
+                    // `ql-functions::reference_aware_fns` for the
+                    // ABI definitions.
+                    use ql_functions::{ArgContract, RefContext};
+                    let mut ref_args: Vec<ql_functions::RefArg> = Vec::with_capacity(args.len());
+                    for a in args {
+                        ref_args.push(match contract {
+                            ArgContract::Eager => {
+                                materialize_ref_arg_eager(a, env, registry, cache)
+                            }
+                            ArgContract::LazyShape => materialize_ref_arg_lazy(a),
+                        });
+                    }
+                    let ctx = RefContext::new(
+                        env.eval_context(),
+                        env.formula_cell_for_sref(),
+                        env.reference_query(),
+                    );
+                    rf(&ref_args, &ctx)
+                }
                 None => Value::Error(ErrorValue::Name),
             }
         }
@@ -437,6 +467,13 @@ pub fn eval_scalar_with_cache<E: CellEnv>(
         // supposed to surface `BindError::NamedRangeInScalarContext`
         // before we ever evaluate. Defensive fallback: `#CALC!`.
         ExprPlan::AggregateNameRef { .. } => Value::Error(ErrorValue::Calc),
+        // **W5-RT-1 (RT-V1-01):** literal range refs only reach reference-
+        // aware functions via the materializer. Outside that context
+        // (e.g., a stray RangeRef arg to a non-reference-aware fn that
+        // accepted it through some future change) returns #CALC!. The
+        // binder gates this — `BindContext::ReferenceArg` is the only
+        // context that produces `ExprPlan::RangeRef`.
+        ExprPlan::RangeRef { .. } => Value::Error(ErrorValue::Calc),
         // **W5-99 (Phase 4.7.F):** error literal — return the error
         // value directly. Same shape as the no-registry `eval_scalar`
         // arm above.
@@ -497,6 +534,124 @@ fn narrow_structured_ref<E: CellEnv + ?Sized>(
         cell.row,
         resolved.end_col,
     ))
+}
+
+/// **W5-RT-1 (RT-V1-01):** eager materializer for reference-aware fns
+/// using `ArgContract::Eager`. Each `ExprPlan` arg becomes a `RefArg`
+/// variant per its plan shape; `Value::Error(_)` results from eval
+/// surface as `RefArg::Error(ev)` for per-fn error-class propagation
+/// (HIGH-F closure).
+///
+/// Coordinate-only path for `AggregateNameRef`/`RangeRef`/`StructuredRef`:
+/// no `read_range_with_shape` call — ROWS/COLUMNS need dimensions, not
+/// values, and `WorkbookEnv::read_range_with_shape` clamps to populated
+/// bounds (env.rs:222) which would give wrong dimensions for
+/// `ROWS(A:A)`. Values stay empty in v1; if a future iterating
+/// reference-aware fn needs them, it can lazily call `read_range`.
+///
+/// **Step 1.1 / S1-HIGH-E note (volatile-asymmetry under dep-suppress):**
+/// the fall-through `other` arm eagerly evaluates `ExprPlan::Function`
+/// args via `eval_scalar_with_cache`. For dep-suppressed reference-aware
+/// fns (ROW / COLUMN / ROWS / COLUMNS / ISREF — see
+/// [`crate::calcgraph_session::is_address_only_reference_fn`]), the
+/// walker's shape-aware policy (Step 1.1 / S1-HIGH-A closure) recurses
+/// into Function arg subtrees via `walk_plan_for_address_only_deps`'s
+/// fall-through. So volatile / value deps inside the fn-arg subtree DO
+/// register, the formula IS marked volatile when needed, and recomputes
+/// on cycles. The eager-eval of e.g. `ROW(NOW())` produces a Value that
+/// the per-fn impl coerces to `#VALUE!` (Number isn't a reference);
+/// wasted CPU per recompute is the acceptable v1 cost. If a future
+/// Eager-contract reference-aware fn actually consumed the
+/// Function-arg's value to inform its result, revisit this trade-off.
+fn materialize_ref_arg_eager<E: CellEnv>(
+    plan: &ExprPlan,
+    env: &E,
+    registry: &FunctionRegistry,
+    cache: &dyn AggregateCache,
+) -> ql_functions::RefArg {
+    use ql_functions::RefArg;
+    match plan {
+        ExprPlan::CellRef {
+            sheet, row, col, ..
+        } => {
+            let value = env.read_cell(*sheet, *row, *col);
+            RefArg::Reference {
+                address: ql_types::Address::new(*sheet, *row, *col),
+                value,
+            }
+        }
+        ExprPlan::AggregateNameRef { range, .. } => RefArg::Range {
+            range: *range,
+            values: vec![],
+        },
+        ExprPlan::RangeRef { range } => RefArg::Range {
+            range: *range,
+            values: vec![],
+        },
+        ExprPlan::StructuredRef {
+            resolved,
+            is_this_row,
+            ..
+        } => match narrow_structured_ref(*resolved, *is_this_row, env) {
+            Ok(range) => RefArg::Range {
+                range,
+                values: vec![],
+            },
+            Err(ev) => RefArg::Error(ev),
+        },
+        ExprPlan::Array(rows) => {
+            // Materialize cells into an ArrayValue (mirrors the
+            // Unified-tier path at scalar.rs ~273-294).
+            let row_count = rows.len() as u32;
+            let col_count = rows.first().map(|r| r.len()).unwrap_or(0) as u32;
+            let mut cells: Vec<Value> = Vec::with_capacity((row_count * col_count) as usize);
+            for row in rows {
+                for cell in row {
+                    cells.push(eval_scalar_with_cache(cell, env, registry, cache));
+                }
+            }
+            let av = ArrayValue::new(row_count, col_count, cells)
+                .expect("ExprPlan::Array passed binder validation; shape intact");
+            RefArg::Array(av)
+        }
+        ExprPlan::Error(ev) => RefArg::Error(*ev),
+        other => {
+            let v = eval_scalar_with_cache(other, env, registry, cache);
+            match v {
+                Value::Error(ev) => RefArg::Error(ev),
+                ok => RefArg::Scalar(ok),
+            }
+        }
+    }
+}
+
+/// **W5-RT-1 (RT-V1-01):** lazy materializer for reference-aware fns
+/// using `ArgContract::LazyShape`. The arg's `ExprPlan` shape is
+/// translated to a `PlanKind` without any evaluation — no
+/// `eval_scalar_with_cache` call, no aggregate cache touch, no
+/// volatile-fn re-firing. ISREF uses this path (HIGH-B closure).
+fn materialize_ref_arg_lazy(plan: &ExprPlan) -> ql_functions::RefArg {
+    use ql_functions::{PlanKind, RefArg};
+    let kind = match plan {
+        ExprPlan::CellRef { .. } => PlanKind::CellRef,
+        ExprPlan::AggregateNameRef { .. }
+        | ExprPlan::RangeRef { .. }
+        | ExprPlan::StructuredRef { .. } => PlanKind::RangeRef,
+        // No reference-returning fns in v1 — see design § 1 out-of-scope
+        // ("Reference-returning fns (OFFSET-class)"). `returns_reference`
+        // stays false; ISREF on a function call returns FALSE accordingly.
+        ExprPlan::Function { .. } => PlanKind::Function {
+            returns_reference: false,
+        },
+        ExprPlan::Number(_)
+        | ExprPlan::Bool(_)
+        | ExprPlan::String(_)
+        | ExprPlan::Array(_)
+        | ExprPlan::Binary { .. }
+        | ExprPlan::Unary { .. } => PlanKind::Literal,
+        ExprPlan::Error(_) => PlanKind::Error,
+    };
+    RefArg::Shape(kind)
 }
 
 /// **W5-117 (Phase 4.8.G.2):** access the formula cell from an env if
@@ -656,6 +811,63 @@ pub fn eval_at_cell_boundary<E: CellEnv>(
                 FunctionReturn::Scalar(v) => EvalResult::Scalar(v),
                 FunctionReturn::Array(a) => EvalResult::Array(a),
             }
+        }
+        // **W5-RT-1 (RT-V1-01) / HIGH-E + Step 1.1 S1-HIGH-B closures:** at
+        // the cell boundary, ROW/COLUMN with a single multi-cell range or
+        // array arg returns `#CALC!` instead of silently truncating to
+        // top-left. In modern Excel-compatible workbooks `=ROW(A1:A5)`
+        // typed at the cell root spills `{1;2;3;4;5}`; until v1 of the
+        // spill path lands, an explicit error is the correct stance —
+        // silent scalar truncation would be a wrong-result regression.
+        //
+        // Scalar context (e.g. `=ROW(A1:A5)+0` as a sub-expression) is
+        // unaffected — the per-fn impl returns top-left there, matching
+        // Excel pre-365 implicit-intersection semantics.
+        //
+        // **S1-HIGH-B (Codex):** the initial Step 1 guard checked only
+        // RangeRef / AggregateNameRef / Array; `ROW(Sales[Qty])` bypassed
+        // it because StructuredRef takes a different plan shape. Step
+        // 1.1 closure adds the StructuredRef branch, narrowing first via
+        // `narrow_structured_ref` so `Sales[@Qty]` (single-cell after
+        // `[@]` narrowing) is NOT rejected while `Sales[Qty]` (full
+        // column) IS rejected when multi-cell.
+        ExprPlan::Function { name, args }
+            if args.len() == 1
+                && matches!(name.as_ref(), "ROW" | "COLUMN")
+                && matches!(
+                    registry.lookup_any(name),
+                    Some(ql_functions::RegisteredFn::ReferenceAware(_, _))
+                ) =>
+        {
+            let multi_cell = match &args[0] {
+                ExprPlan::RangeRef { range } => {
+                    range.start_row != range.end_row || range.start_col != range.end_col
+                }
+                ExprPlan::AggregateNameRef { range, .. } => {
+                    range.start_row != range.end_row || range.start_col != range.end_col
+                }
+                ExprPlan::StructuredRef {
+                    resolved,
+                    is_this_row,
+                    ..
+                } => match narrow_structured_ref(*resolved, *is_this_row, env) {
+                    Ok(range) => {
+                        range.start_row != range.end_row || range.start_col != range.end_col
+                    }
+                    // Narrowing-error case (e.g., formula cell outside
+                    // the table's data range) — defer to scalar eval to
+                    // surface the error normally; not multi-cell.
+                    Err(_) => false,
+                },
+                ExprPlan::Array(rows) => {
+                    rows.len() != 1 || rows.first().map(|r| r.len()).unwrap_or(0) != 1
+                }
+                _ => false,
+            };
+            if multi_cell {
+                return EvalResult::Scalar(Value::Error(ErrorValue::Calc));
+            }
+            EvalResult::Scalar(eval_scalar_with_cache(plan, env, registry, cache))
         }
         _ => EvalResult::Scalar(eval_scalar_with_cache(plan, env, registry, cache)),
     }

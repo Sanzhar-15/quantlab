@@ -29,6 +29,7 @@ pub mod financial_fns;
 pub mod format;
 pub mod range_aware_fns;
 pub mod range_fns;
+pub mod reference_aware_fns;
 pub mod registry;
 pub mod scalar_fns;
 pub mod volatile;
@@ -37,6 +38,10 @@ pub mod wildcard;
 
 pub use context_aware_fns::ContextAwareFn;
 pub use range_aware_fns::{FnArg, RangeAwareFn};
+pub use reference_aware_fns::{
+    ArgContract, NoOpReferenceQuery, PlanKind, RefArg, RefContext, ReferenceAwareFn,
+    ReferenceQuery, NO_OP_REFERENCE_QUERY,
+};
 pub use registry::{
     default_registry, FunctionArg, FunctionContext, FunctionFn, FunctionRegistry, FunctionReturn,
     RegisteredFn, ScalarFn,

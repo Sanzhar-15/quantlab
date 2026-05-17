@@ -33,6 +33,7 @@ use ql_types::{ArrayValue, EvalContext, Value};
 
 use crate::context_aware_fns::ContextAwareFn;
 use crate::range_aware_fns::RangeAwareFn;
+use crate::reference_aware_fns::{ArgContract, ReferenceAwareFn};
 use crate::{date_fns, financial_fns, format, range_fns, scalar_fns, volatile};
 
 /// Function signature: pre-evaluated args → result Value.
@@ -134,6 +135,14 @@ pub enum RegisteredFn {
     /// Unified ABI (W5-96+). New array-returning functions (Phase
     /// 4.7.M/N) register here.
     Unified(FunctionFn),
+    /// **W5-RT-1 (RT-V1-01):** reference-aware tier. The dispatcher passes
+    /// `RefArg`s materialized per the fn's [`ArgContract`] — eager
+    /// evaluation with address preservation for ROW/COLUMN/ROWS/COLUMNS/
+    /// ISFORMULA/FORMULATEXT, or lazy syntactic-shape inspection for ISREF.
+    /// See `reference_aware_fns` module for the type definitions and
+    /// `docs/architecture/2026-05-17-reference-tier-design.md` for the
+    /// design rationale.
+    ReferenceAware(ReferenceAwareFn, ArgContract),
 }
 
 /// Phase 0 function registry. Built by `default_registry()` with the
@@ -237,6 +246,31 @@ impl FunctionRegistry {
         );
     }
 
+    /// **W5-RT-1 (RT-V1-01):** register a reference-aware function under
+    /// `name` with its per-fn `ArgContract`. Stored as
+    /// `RegisteredFn::ReferenceAware(f, contract)`. The dispatcher (in
+    /// `ql-exec::scalar`) reads both fields via `lookup_reference_aware`
+    /// (or the unified `lookup_any` + match-on-`RegisteredFn`) to decide
+    /// whether to eager-evaluate or lazy-shape-inspect each arg. Step 1.1
+    /// closure (S1-LOW-1): the previous doc comment referenced a
+    /// `contract_of(name)` helper that doesn't exist; corrected here.
+    ///
+    /// Same canonical-uppercase requirement + duplicate panic as
+    /// `register` / `register_range_aware` / `register_context_aware` /
+    /// `register_unified`.
+    pub fn register_reference_aware(
+        &mut self,
+        name: &'static str,
+        f: ReferenceAwareFn,
+        contract: ArgContract,
+    ) {
+        self.insert_or_panic(
+            name,
+            RegisteredFn::ReferenceAware(f, contract),
+            "FunctionRegistry::register_reference_aware",
+        );
+    }
+
     /// Case-insensitive lookup, returning the scalar function if and only
     /// if the registered entry is `RegisteredFn::Scalar(_)`. Other tiers
     /// (range-aware, context-aware, unified) return `None` here — the
@@ -281,6 +315,19 @@ impl FunctionRegistry {
         let upper = name.to_ascii_uppercase();
         match self.fns.get(upper.as_str()) {
             Some(RegisteredFn::Unified(f)) => Some(*f),
+            _ => None,
+        }
+    }
+
+    /// **W5-RT-1 (RT-V1-01):** case-insensitive lookup for the
+    /// reference-aware tier. Returns `Some((f, contract))` iff the
+    /// registered entry is `RegisteredFn::ReferenceAware(_, _)`. The
+    /// `ArgContract` lets the dispatcher pick eager-vs-lazy
+    /// materialization without a second lookup.
+    pub fn lookup_reference_aware(&self, name: &str) -> Option<(ReferenceAwareFn, ArgContract)> {
+        let upper = name.to_ascii_uppercase();
+        match self.fns.get(upper.as_str()) {
+            Some(RegisteredFn::ReferenceAware(f, c)) => Some((*f, *c)),
             _ => None,
         }
     }
@@ -336,6 +383,16 @@ impl FunctionRegistry {
         self.fns
             .iter()
             .filter(|(_, v)| matches!(v, RegisteredFn::Unified(_)))
+            .map(|(k, _)| k)
+    }
+
+    /// **W5-RT-1 (RT-V1-01):** names registered as
+    /// `RegisteredFn::ReferenceAware(_, _)`. For coverage walks that
+    /// want to see the reference-aware function set explicitly.
+    pub fn reference_aware_names(&self) -> impl Iterator<Item = &&'static str> + '_ {
+        self.fns
+            .iter()
+            .filter(|(_, v)| matches!(v, RegisteredFn::ReferenceAware(_, _)))
             .map(|(k, _)| k)
     }
 

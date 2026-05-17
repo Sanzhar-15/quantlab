@@ -12,6 +12,7 @@
 //! `ql-storage` directly and the SIMD path (W4-2) doesn't go through this trait at all —
 //! it reads Arrow chunks via `ColumnStore::iter_chunks` for batch processing.
 
+use ql_functions::{ReferenceQuery, NO_OP_REFERENCE_QUERY};
 use ql_storage::{NameTable, NamedTarget};
 use ql_types::{
     ColId, ErrorValue, EvalContext, Range, RowId, SheetId, Value, DEFAULT_EVAL_CONTEXT,
@@ -82,6 +83,19 @@ pub trait CellEnv {
     /// `None` — only `WorkbookEnv::with_formula_cell` overrides.
     fn formula_cell_for_sref(&self) -> Option<ql_types::Address> {
         None
+    }
+
+    /// **W5-RT-1 (RT-V1-01):** workbook-introspection accessor for the
+    /// reference-aware dispatch tier (ISFORMULA / FORMULATEXT). Default
+    /// returns a no-op singleton; `WorkbookEnv` overrides to delegate to
+    /// its underlying `&Workbook` via `Workbook::formula_at`.
+    ///
+    /// Test envs (`MapEnv`) and any env without workbook backing inherit
+    /// the default — `is_formula_at` returns `false`, `formula_text_at`
+    /// returns `None`. Tests that exercise ISFORMULA / FORMULATEXT must
+    /// use `WorkbookEnv` (standard for cell-boundary tests).
+    fn reference_query(&self) -> &dyn ReferenceQuery {
+        &NO_OP_REFERENCE_QUERY
     }
 }
 
@@ -275,6 +289,33 @@ impl<'w> CellEnv for WorkbookEnv<'w> {
     /// `[@Col]` arm uses this for row narrowing.
     fn formula_cell_for_sref(&self) -> Option<ql_types::Address> {
         self.formula_cell
+    }
+
+    /// **W5-RT-1 (RT-V1-01):** workbook-introspection accessor for
+    /// ISFORMULA / FORMULATEXT. `WorkbookEnv` implements
+    /// `ReferenceQuery` directly (delegating to the underlying
+    /// `&Workbook::formula_at`), so we return `self`.
+    fn reference_query(&self) -> &dyn ReferenceQuery {
+        self
+    }
+}
+
+/// **W5-RT-1 (RT-V1-01):** `ReferenceQuery` impl for `WorkbookEnv`. Delegates to
+/// `Workbook::formula_at`, which retains the canonicalized printer output (no
+/// leading `=`); the `formula_text_at` impl prepends `=` so callers receive the
+/// Excel-canonical FORMULATEXT shape directly.
+impl<'w> ReferenceQuery for WorkbookEnv<'w> {
+    fn is_formula_at(&self, sheet: SheetId, row: RowId, col: ColId) -> bool {
+        self.workbook.formula_at(sheet, row, col).is_some()
+    }
+
+    fn formula_text_at(&self, sheet: SheetId, row: RowId, col: ColId) -> Option<String> {
+        self.workbook.formula_at(sheet, row, col).map(|arc| {
+            let mut out = String::with_capacity(arc.len() + 1);
+            out.push('=');
+            out.push_str(arc.as_ref());
+            out
+        })
     }
 }
 
