@@ -178,3 +178,61 @@ Opus's 12 LOWs + Codex's 2 LOWs: most are doc/naming/test-helper polish. Step 2.
 4. **Doc-comments referencing "added in this commit" rot the moment that commit lands.** Opus HIGH-3's claim about `is_reference_aware_function` is the same pattern as Step 1's HIGH-O-1. **Pattern signal:** prefer doc-comments that reference test-name + module location (line independent) and that describe present state without "added recently" / "in this commit" language.
 
 5. **Test-class coverage matrix is load-bearing for plan-completion claims.** The plan's checklist line 87 names 8 categories; impl shipped 5. **Pattern signal:** before checking a plan item complete, grep the impl-tree for ALL categories listed and document deferrals explicitly.
+
+---
+
+## Audit cycle 4 — Step 3 (ISREF + ISFORMULA implementation)
+
+**Scope:** working-tree Step 3 changes — `reference_fns.rs` (added ISREF + ISFORMULA + 19 unit tests), `registry.rs` (registered LazyShape + Eager), `plan.rs` (invariant test extended), new `reference_fns_step3_e2e.rs` (~22 e2e tests), `coverage.rs` (2 new entries), `excel-matrix.md` rows.
+**HEAD baseline:** `98ca4e697b3` (post-Step-2.1). Pre-audit gates: 3229 tests passing.
+
+**Codex audit:** `2026-05-17-rt-step-3-codex.md` — **4 HIGH + 1 MEDIUM + 3 LOW = 8 findings.**
+**Opus audit:** `2026-05-17-rt-step-3-opus.md` — **4 HIGH + 10 MEDIUM + 10 LOW = 24 findings.**
+
+### Severity reconciliation
+
+| Finding | Codex | Opus | Reconciled | Rationale |
+|---------|-------|------|------------|-----------|
+| S2-HIGH-2 closure regression — CellRef materializer error-coerces, ISFORMULA(A1) returns A1's value-error instead of TRUE/FALSE | HIGH-1 | HIGH-S3-O-1 | **HIGH** | Convergent. The S2-HIGH-2 closure was the wrong architectural fix; both audits independently caught it via live ISFORMULA probe. The right shape: drop `value` field from `RefArg::Reference` entirely. |
+| ISREF (LazyShape) walker policy wrong — `ISREF(NOW())` spuriously volatile; `ISREF(A1+1)` registers A1 dep | MEDIUM-1 | HIGH-S3-O-2 | **HIGH** | Convergent (Codex rated MED, Opus HIGH). Take higher: real semantics violation. The LazyShape contract guarantees no-eval; the walker should match — NO arg walking for ISREF. |
+| 1×1 RangeRef arm no-op — `ISFORMULA(A1:A1)` doesn't dirty when A1 changes | HIGH-2 | (subsumed) | **HIGH** | Codex-only. Real correctness bug introduced by the S1-MED-δ closure (dropped synthetic marker but also dropped the legitimate 1×1 dep). |
+| `ISREF(SUM(A1:A3))` / `ISFORMULA(SUM(A1:A3))` bind-fail | HIGH-3 | (covered in MEDIUMs) | **HIGH** | S2-HIGH-3 propagation; Step 3 doc-comments still reference the design example. Resolved by doc-update + pinning bind-fail tests. |
+| Producer/replay divergence for `=ISFORMULA(A1)` when A1 is being set | HIGH-4 | (not flagged) | **HIGH** | Codex-only. Real producer-replay invariant break. Workbook-runtime restructure required; documented + pinned with v1-divergence test. |
+| ISREF-no-eval instrumented test missing | — | HIGH-S3-O-3 | **MEDIUM** | Plan checklist item not delivered. Critical lazy-semantics test exists (`isref_of_divide_by_zero_returns_false_without_eval`); deeper instrumentation is plan-item-pending — reclassify as MEDIUM. |
+| "workbook-runtime e2e" claim in coverage doc but tests use storage-level put_formula | — | HIGH-S3-O-4 | **MEDIUM** | Doc-only inaccuracy; the tests still cover the path correctly. Reclassify to MEDIUM. |
+| `lookup_context_aware` missing from disjointness check | — | (LOW) | **LOW** | Already structurally enforced by HashMap; doc-only gap. |
+| Various MEDIUMs (doc lies, design divergence, untested paths) | — | MED-1 through 10 | mixed | Some are doc-fixes, some real but small. Cherry-pick. |
+| Doc / count / naming nits | LOW-1/2/3 | LOW-1 through 10 | various **LOW** | Apply in this cycle's doc edits; defer most to post-mini-phase polish. |
+
+### Final HIGH list (5 issues — must-close)
+
+| ID | Subject | Fix shape |
+|----|---------|-----------|
+| **S3-HIGH-1** | CellRef materializer regression from S2-HIGH-2 | **REVERT S2-HIGH-2** + drop `value` field from `RefArg::Reference`. Per-fn impls only need address; if a future fn wants the value, it calls `env.read_cell` directly. Missing-sheet errors are caught at bind time (`BindError::UnknownSheet`), not eval. |
+| **S3-HIGH-2** | LazyShape walker policy (ISREF) | New `ExprPlan::Function` arm branch: `if name == "ISREF" { /* no arg walking */ }` before the address-only branch. Fixes `ISREF(NOW())` spurious volatility + `ISREF(A1+1)` spurious A1 dep. |
+| **S3-HIGH-3** | 1×1 RangeRef walker no-op | Walker's `ExprPlan::RangeRef` arm now pushes a cell-dep when `start_row == end_row && start_col == end_col`. Multi-cell ranges stay no-op (result is `#N/A` anyway). Restores `=ISFORMULA(A1:A1)` dirtying. |
+| **S3-HIGH-4** | `ROW/ISREF/ISFORMULA(SUM(A1:A3))` bind-fail | Update doc-comments in `reference_fns.rs` to remove `ROW(SUM(A1:A3))` / `ISREF(SUM(A1:A3))` / `ISFORMULA(SUM(A1:A3))` from happy-path examples (S2-HIGH-3 → S3-HIGH-4). Add explicit `*_of_sum_literal_range_bind_fails_v1_scope` pinning tests for ISREF + ISFORMULA. |
+| **S3-HIGH-5** | Producer/replay divergence for `=ISFORMULA(A1)` when A1 is being set | Documented v1 divergence. `WorkbookRuntime::set_formula` evaluates BEFORE storing the formula; replay does the reverse. v1 acceptance: the divergence is real but only affects ISFORMULA-on-the-being-set-cell (rare in practice). Fix is a workbook_runtime restructure (out of scope for Step 3.1). Add pinning test + design-doc note. |
+
+### MEDIUM closures (cherry-picked)
+
+| ID | Subject | Fix shape |
+|----|---------|-----------|
+| **S3-MED-α** | Coverage-doc accuracy ("workbook-runtime e2e" claim) | Rephrase to "WorkbookEnv-backed storage-level e2e" — accurate description of what the tests actually do. |
+| **S3-MED-β** | ISREF-no-eval instrumented test | Add one test that exercises the no-eval invariant beyond the existing `1/0` shape — use a volatile-fn invocation in ISREF's arg and verify the formula is NOT marked volatile. |
+| **S3-MED-γ** | `lookup_context_aware` missing in disjointness check | Add the missing check to `step_2_reference_aware_names_registered_in_reference_tier` for completeness. |
+| **S3-MED-δ** | Module header stale (Step 2-only description) | Update `reference_fns.rs` file-level doc to cover both batches + LazyShape contract introduction. |
+
+### LOW deferred (no fixes this cycle)
+
+Opus LOWs 1-10 + Codex LOWs 1-3 — naming nits, test renames, citation links. Tracked for post-mini-phase polish.
+
+### Step 3 pattern signals captured
+
+1. **Architectural fixes have second-order regression potential.** S2-HIGH-2 (CellRef error coercion) seemed correct in isolation; Step 3 audits caught that it conflated "ref is invalid" with "ref points to error-valued cell". **Pattern signal:** when adding error-coercion in a materializer arm, audit ALL consumers' semantics — not just the one motivating the fix. The "no value carried in `RefArg::Reference`" shape is the architecturally-correct invariant; the S2-HIGH-2 closure papered over it instead of removing the field.
+
+2. **Walker policy must match each contract.** Step 1.1's address-only walker was designed for Eager fns (ROW/COLUMN/ROWS/COLUMNS). Adding ISREF with LazyShape exposed the asymmetry: the materializer doesn't eval, but the walker walks anyway. **Pattern signal:** each dispatcher contract (Eager / LazyShape / future variants) needs a matched walker policy. Stage future audits to verify both surfaces together.
+
+3. **Codex caught what Opus didn't (and vice versa) — convergence is signal.** S3-HIGH-1 (materializer regression) was convergent — high-confidence. S3-HIGH-2 (ISREF walker) Codex rated MEDIUM, Opus HIGH — reconciliation rule kicked in. S3-HIGH-4 (producer/replay) was Codex-only — the kind of cross-cycle producer/replay invariant that requires deep walking. **Pattern signal:** running parallel audits with different models surfaces independent classes of issues. Severity-conflict resolution rule (take higher unless reasoning is faulty) consistently produces the right call.
+
+4. **The `RangeRef` walker arm has now flipped twice.** Original: synthetic-marker push (S1-MED-δ found unsafe). Step 1.1: no-op (Step 3 HIGH-2 found unsafe for 1×1). Step 3.1: cell-dep on 1×1 only. **Pattern signal:** when a finding closes by *deleting* code, audit what coverage the deleted code was load-bearing for.
