@@ -11,6 +11,7 @@ use crate::error::XlsxError;
 use crate::read::workbook_xml::WorkbookProperties;
 use ql_storage::{NamedTarget, Workbook};
 use ql_types::{Address, ColId, Range, RowId, SheetId, Value};
+use std::borrow::Cow;
 
 /// Walk `workbook_props.defined_names` and register each name with
 /// the appropriate scope on the workbook. Returns the number of
@@ -105,7 +106,7 @@ fn parse_name_target(
     // Address target: split off sheet name at the rightmost `!` that
     // isn't inside quotes. We anchor on the simplest case first.
     let (sheet_part, rest) = split_sheet_ref(trimmed)?;
-    let sheet_id = *sheet_lookup.get(sheet_part)?;
+    let sheet_id = *sheet_lookup.get(sheet_part.as_ref())?;
 
     // Single cell vs range.
     if let Some((lhs, rhs)) = rest.split_once(':') {
@@ -119,23 +120,46 @@ fn parse_name_target(
 }
 
 /// Split `Sheet!$A$1` (or `'Sheet 1'!$A$1`) into `("Sheet", "$A$1")`.
-fn split_sheet_ref(text: &str) -> Option<(&str, &str)> {
-    // Quoted sheet name path.
+///
+/// Returns `(sheet_name, rest)`. The sheet name is borrowed for
+/// unquoted inputs and owned (`Cow::Owned`) when the input was
+/// `''`-escape-quoted and required string-building.
+fn split_sheet_ref(text: &str) -> Option<(Cow<'_, str>, &str)> {
+    // Quoted sheet name path. Handle `''`-escaped single quotes
+    // (Excel's escape for embedded `'` in a sheet name).
+    //
+    // **W5-D-14.2.3 (separate-Opus M-4 closure):** scan for an
+    // *unescaped* closing single quote — i.e., `'` NOT followed by
+    // another `'`. The previous version found the first `'` blindly,
+    // which split `'O''Brien'!$A$1` at the wrong place.
     if let Some(after_open) = text.strip_prefix('\'') {
-        // For now, support unescaped names only — `''`-escaped single
-        // quotes in sheet names is a follow-up edge case (real-world
-        // incidence is near zero).
-        let end_quote = after_open.find('\'')?;
-        let sheet_name = &after_open[..end_quote];
-        let after = &after_open[end_quote + 1..];
-        let rest = after.strip_prefix('!')?;
-        return Some((sheet_name, rest));
+        let mut unescaped = String::new();
+        let mut iter = after_open.char_indices().peekable();
+        while let Some((idx, c)) = iter.next() {
+            if c == '\'' {
+                // `''` is the Excel escape for a literal single quote.
+                if matches!(iter.peek(), Some((_, '\''))) {
+                    unescaped.push('\'');
+                    iter.next();
+                    continue;
+                }
+                // Unescaped quote — closing.
+                // `idx` is the byte index of the closing quote in
+                // `after_open`; everything after that is the rest of
+                // the formula text.
+                let after = &after_open[idx + c.len_utf8()..];
+                let rest = after.strip_prefix('!')?;
+                return Some((Cow::Owned(unescaped), rest));
+            }
+            unescaped.push(c);
+        }
+        return None;
     }
     // Unquoted: split at first `!`.
     let bang = text.find('!')?;
     let sheet_name = &text[..bang];
     let rest = &text[bang + 1..];
-    Some((sheet_name, rest))
+    Some((Cow::Borrowed(sheet_name), rest))
 }
 
 /// Parse `$A$1` → `(row=0, col=0)`. Accepts mixed-mode (`A$1`,
@@ -256,5 +280,21 @@ mod tests {
         // Target sheet not in workbook — falls back to formula path
         // in caller.
         assert!(parse_name_target("Unknown!$A$1", &l).is_none());
+    }
+
+    #[test]
+    fn parse_escaped_single_quote_in_sheet_name() {
+        // **W5-D-14.2.3 (separate-Opus M-4 closure):** `''`-escaped
+        // single quote in quoted sheet name.
+        let mut l = HashMap::new();
+        l.insert("O'Brien".to_string(), 2);
+        match parse_name_target("'O''Brien'!$D$7", &l).unwrap() {
+            NamedTarget::Cell(a) => {
+                assert_eq!(a.sheet, 2);
+                assert_eq!(a.row, 6);
+                assert_eq!(a.col, 3);
+            }
+            other => panic!("expected Cell, got {other:?}"),
+        }
     }
 }

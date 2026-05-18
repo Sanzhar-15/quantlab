@@ -505,17 +505,16 @@ fn inject_custom_formats_into_styles_xml(
 
     // Case 1: existing <numFmts> — replace it entirely. (Unlikely
     // since umya doesn't emit any, but handle defensively.)
+    //
+    // **W5-D-14.2.3 (separate-Opus M-1 closure):** check the
+    // non-self-closing `</numFmts>` form FIRST. The self-close `/>`
+    // search runs over the FULL remainder of the document, so if
+    // `<numFmts>` has self-closing children (`<numFmt ../>`), the
+    // `find("/>")` would match the CHILD's `/>` and truncate at the
+    // wrong place. Closing-tag form lets us cleanly bracket the
+    // outer element.
     if let Some(start) = text.find("<numFmts") {
-        // Find the matching close: either self-close "/>" or "</numFmts>".
         let after = start + "<numFmts".len();
-        if let Some(self_close_rel) = text[after..].find("/>") {
-            let end = after + self_close_rel + 2;
-            let mut out = String::with_capacity(text.len() + numfmts.len());
-            out.push_str(&text[..start]);
-            out.push_str(&numfmts);
-            out.push_str(&text[end..]);
-            return Ok(out.into_bytes());
-        }
         if let Some(close_rel) = text[after..].find("</numFmts>") {
             let end = after + close_rel + "</numFmts>".len();
             let mut out = String::with_capacity(text.len() + numfmts.len());
@@ -523,6 +522,19 @@ fn inject_custom_formats_into_styles_xml(
             out.push_str(&numfmts);
             out.push_str(&text[end..]);
             return Ok(out.into_bytes());
+        }
+        // Truly self-closing `<numFmts ... />` form: find the FIRST
+        // `>` after the tag name and require the preceding byte to be
+        // `/`. That bounds the search to the actual element close.
+        if let Some(gt_rel) = text[after..].find('>') {
+            let end = after + gt_rel + 1;
+            if text[after..end].ends_with("/>") {
+                let mut out = String::with_capacity(text.len() + numfmts.len());
+                out.push_str(&text[..start]);
+                out.push_str(&numfmts);
+                out.push_str(&text[end..]);
+                return Ok(out.into_bytes());
+            }
         }
     }
 
@@ -666,21 +678,45 @@ fn format_number_literal(n: f64) -> String {
 /// Quote a sheet name if it contains characters that require quoting
 /// in OOXML formula text. Single quotes in the name get doubled
 /// (`'O''Brien'` for a sheet literally named `O'Brien`).
+///
+/// **W5-D-14.2.3 (separate-Opus M-11 closure):** also quote sheet
+/// names that match the cell-reference pattern `^[A-Za-z]+\d+$`
+/// (e.g. `A1`, `R1C1`, `XFD1048576`). Excel parses `A1!$B$2`
+/// ambiguously when `A1` is unquoted; quoting disambiguates.
 fn quote_sheet_name(name: &str) -> String {
-    // Excel quotes if name contains anything other than `[A-Za-z0-9_]`
-    // or starts with a digit. Conservative: quote if any non-ident char.
     let needs_quote = name.is_empty()
         || name
             .chars()
             .next()
             .map(|c| c.is_ascii_digit())
             .unwrap_or(false)
-        || name.chars().any(|c| !c.is_ascii_alphanumeric() && c != '_');
+        || name.chars().any(|c| !c.is_ascii_alphanumeric() && c != '_')
+        || looks_like_cell_ref(name);
     if needs_quote {
         format!("'{}'", name.replace('\'', "''"))
     } else {
         name.to_string()
     }
+}
+
+/// Does `name` match `^[A-Za-z]+\d+$` (cell-reference pattern)?
+fn looks_like_cell_ref(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    if i == 0 {
+        return false;
+    }
+    let digit_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    i == bytes.len() && i > digit_start
 }
 
 /// Column index (0-based) → Excel A1 column letter (`A`, `Z`, `AA`...).
@@ -721,17 +757,12 @@ fn inject_defined_names_into_workbook_xml(
     }
     block.push_str("</definedNames>");
 
-    // Case 1: existing <definedNames> — replace.
+    // Case 1: existing <definedNames> — replace. Check `</tag>` form
+    // FIRST so self-closing child elements (`<definedName .../>`)
+    // don't confuse the outer close detection
+    // (separate-Opus M-1 closure).
     if let Some(start) = text.find("<definedNames") {
         let after = start + "<definedNames".len();
-        if let Some(self_close_rel) = text[after..].find("/>") {
-            let end = after + self_close_rel + 2;
-            let mut out = String::with_capacity(text.len() + block.len());
-            out.push_str(&text[..start]);
-            out.push_str(&block);
-            out.push_str(&text[end..]);
-            return Ok(out.into_bytes());
-        }
         if let Some(close_rel) = text[after..].find("</definedNames>") {
             let end = after + close_rel + "</definedNames>".len();
             let mut out = String::with_capacity(text.len() + block.len());
@@ -739,6 +770,16 @@ fn inject_defined_names_into_workbook_xml(
             out.push_str(&block);
             out.push_str(&text[end..]);
             return Ok(out.into_bytes());
+        }
+        if let Some(gt_rel) = text[after..].find('>') {
+            let end = after + gt_rel + 1;
+            if text[after..end].ends_with("/>") {
+                let mut out = String::with_capacity(text.len() + block.len());
+                out.push_str(&text[..start]);
+                out.push_str(&block);
+                out.push_str(&text[end..]);
+                return Ok(out.into_bytes());
+            }
         }
     }
 
@@ -960,16 +1001,9 @@ fn inject_table_parts_into_sheet_xml(
     block.push_str("</tableParts>");
 
     // Replace existing <tableParts.../> or </tableParts> if present.
+    // Check `</tag>` form FIRST (separate-Opus M-1 closure).
     if let Some(start) = text.find("<tableParts") {
         let after = start + "<tableParts".len();
-        if let Some(self_close_rel) = text[after..].find("/>") {
-            let end = after + self_close_rel + 2;
-            let mut out = String::with_capacity(text.len() + block.len());
-            out.push_str(&text[..start]);
-            out.push_str(&block);
-            out.push_str(&text[end..]);
-            return Ok(out.into_bytes());
-        }
         if let Some(close_rel) = text[after..].find("</tableParts>") {
             let end = after + close_rel + "</tableParts>".len();
             let mut out = String::with_capacity(text.len() + block.len());
@@ -977,6 +1011,16 @@ fn inject_table_parts_into_sheet_xml(
             out.push_str(&block);
             out.push_str(&text[end..]);
             return Ok(out.into_bytes());
+        }
+        if let Some(gt_rel) = text[after..].find('>') {
+            let end = after + gt_rel + 1;
+            if text[after..end].ends_with("/>") {
+                let mut out = String::with_capacity(text.len() + block.len());
+                out.push_str(&text[..start]);
+                out.push_str(&block);
+                out.push_str(&text[end..]);
+                return Ok(out.into_bytes());
+            }
         }
     }
 

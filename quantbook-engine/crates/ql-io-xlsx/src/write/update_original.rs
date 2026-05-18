@@ -63,12 +63,26 @@ pub(crate) fn export_update_original(
         zip::ZipArchive::new(std::io::Cursor::new(source.original_bytes.as_slice()))
             .map_err(XlsxError::Zip)?;
 
-    // Enumerate shadow part names. Used to skip duplicates when
-    // walking the original.
+    // Enumerate shadow part names. Used in step 3a/3b for precedence
+    // decisions.
     let mut shadow_part_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for i in 0..shadow_zip.len() {
         let entry = shadow_zip.by_index(i).map_err(XlsxError::Zip)?;
         shadow_part_names.insert(entry.name().to_string());
+    }
+
+    // Enumerate original part names — used so step 3a can decide
+    // whether to skip shadow's version of an "original-wins" part
+    // (theme, docProps, customXml). Without this check we'd silently
+    // replace the original's theme/docProps with umya's stubs even
+    // though `classify_part` flags them as Preserve.
+    //
+    // **W5-D-14.2.3 (separate-Opus H-1 closure).**
+    let mut original_part_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for i in 0..original_zip.len() {
+        let entry = original_zip.by_index(i).map_err(XlsxError::Zip)?;
+        original_part_names.insert(entry.name().to_string());
     }
 
     // Track which original parts we'll preserve so we can merge their
@@ -90,11 +104,29 @@ pub(crate) fn export_update_original(
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
         // Step 3a: write every shadow part EXCEPT [Content_Types].xml
-        // (we'll write the merged version at the end).
+        // (merged later) AND EXCEPT "original-wins" parts where the
+        // original also has them. Original-wins parts get written by
+        // step 3b — writing shadow's stub here would clobber the real
+        // content.
+        //
+        // **W5-D-14.2.3 (separate-Opus H-1 closure):** prior version
+        // wrote shadow first unconditionally, so for paths shadow ALSO
+        // emits (theme1.xml, docProps/app.xml, docProps/core.xml) the
+        // original's bytes were dropped — even though `classify_part`
+        // marks those paths Preserve. Verified empirically:
+        // basic_text.xlsx round-trip lost
+        // `<dc:creator>Nicolas Hatcher</dc:creator>` and the original
+        // theme1.xml (8390 bytes) was replaced by umya's stub (6518).
         for i in 0..shadow_zip.len() {
             let mut entry = shadow_zip.by_index(i).map_err(XlsxError::Zip)?;
             let name = entry.name().to_string();
             if name == "[Content_Types].xml" {
+                continue;
+            }
+            if matches!(classify_part(&name), PartAction::Preserve)
+                && original_part_names.contains(&name)
+            {
+                // Original wins; step 3b will emit it.
                 continue;
             }
             let mut content = Vec::new();
@@ -103,15 +135,35 @@ pub(crate) fn export_update_original(
             writer.write_all(&content)?;
         }
 
-        // Step 3b: walk the original. For each part that's preserve-
-        // allowed AND not already in shadow, carry it through.
+        // Step 3b: walk the original. Two paths:
+        // (1) original-wins parts that ALSO exist in shadow — skipped
+        //     in step 3a, write here.
+        // (2) parts that aren't in shadow at all — classify_part
+        //     decides.
         for i in 0..original_zip.len() {
             let mut entry = original_zip.by_index(i).map_err(XlsxError::Zip)?;
             let name = entry.name().to_string();
-            if shadow_part_names.contains(&name) {
+            if name == "[Content_Types].xml" {
                 continue;
             }
-            match classify_part(&name) {
+            let action = classify_part(&name);
+            let in_shadow = shadow_part_names.contains(&name);
+
+            if in_shadow {
+                // Only write original if it's an original-wins
+                // (Preserve) path. Otherwise shadow's content was
+                // already written in step 3a.
+                if matches!(action, PartAction::Preserve) {
+                    let mut content = Vec::new();
+                    entry.read_to_end(&mut content)?;
+                    writer.start_file(&name, opts).map_err(XlsxError::Zip)?;
+                    writer.write_all(&content)?;
+                    preserved_part_paths.push(name);
+                }
+                continue;
+            }
+
+            match action {
                 PartAction::Preserve => {
                     let mut content = Vec::new();
                     entry.read_to_end(&mut content)?;
@@ -131,9 +183,10 @@ pub(crate) fn export_update_original(
                     // already-rendered-by-shadow parts.
                 }
                 PartAction::OwnedByShadow => {
-                    // Shadow's version takes precedence; skipped above
-                    // by shadow_part_names membership check, but this
-                    // branch is the explicit documentation of the rule.
+                    // Shadow's version takes precedence; documentation
+                    // branch (we don't hit it in practice because
+                    // shadow's membership check above handles the
+                    // common case).
                 }
             }
         }
@@ -222,7 +275,15 @@ fn classify_part(name: &str) -> PartAction {
     if name.starts_with("xl/theme/") {
         return PartAction::Preserve;
     }
-    if name.starts_with("xl/customXml/") || name.starts_with("xl/customProperty/") {
+    // `xl/customXml/` IS a directory (item1.xml, itemProps1.xml...).
+    if name.starts_with("xl/customXml/") {
+        return PartAction::Preserve;
+    }
+    // `xl/customProperty.xml` is a SINGLE file, not a directory.
+    // **W5-D-14.2.3 (separate-Opus H-3 closure):** the prior code
+    // checked `starts_with("xl/customProperty/")` which never matches
+    // the real path.
+    if name == "xl/customProperty.xml" {
         return PartAction::Preserve;
     }
     if name.starts_with("docProps/") {
@@ -262,13 +323,21 @@ fn classify_part(name: &str) -> PartAction {
             "slicers-and-timelines",
         ));
     }
-    if name.starts_with("xl/queryTables/") || name.starts_with("xl/connections/") {
+    // `xl/queryTables/` is a directory; `xl/connections.xml` is a
+    // single file. Both relate to Power Query / external data.
+    // **W5-D-14.2.3 (separate-Opus H-3 closure):** the prior code
+    // checked `starts_with("xl/connections/")` which never matches
+    // the real `xl/connections.xml` path — workbook had its
+    // connections feature silently dropped without a `dropped_features`
+    // entry.
+    if name.starts_with("xl/queryTables/") || name == "xl/connections.xml" {
         return PartAction::DropAsUnsupported(UnsupportedFeatureKind::Other("query-tables"));
     }
     if name.starts_with("xl/externalLinks/") {
         return PartAction::DropAsUnsupported(UnsupportedFeatureKind::ExternalLinks);
     }
-    if name.starts_with("xl/richData/") || name.starts_with("xl/cellMetadata/") {
+    // `xl/cellMetadata.xml` is a single file too (W5-D-14.2.3 H-3 fix).
+    if name.starts_with("xl/richData/") || name == "xl/cellMetadata.xml" {
         return PartAction::DropAsUnsupported(UnsupportedFeatureKind::Other("rich-data"));
     }
     if name.starts_with("xl/printerSettings/") {
@@ -516,4 +585,6 @@ impl<'a> ScopedFileGuard<'a> {
 
 impl Drop for ScopedFileGuard<'_> {
     fn drop(&mut self) {
-        let _ = std::fs::remove_fi
+        let _ = std::fs::remove_file(self.path);
+    }
+}

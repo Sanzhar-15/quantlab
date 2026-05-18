@@ -645,6 +645,69 @@ fn w5_d_14_2_update_original_round_trip_preserves_cell_edits() {
 }
 
 #[test]
+fn w5_d_14_2_3_update_original_preserves_original_theme_bytes() {
+    // **W5-D-14.2.3 (separate-Opus H-1 closure):** the prior assertion
+    // only checked that an `xl/theme/*` path existed in the output,
+    // which passed even when shadow's umya-default theme had clobbered
+    // the original's content. This test compares BYTE-FOR-BYTE: the
+    // output's theme1.xml must equal the original's theme1.xml.
+    let registry = ql_functions::default_registry();
+    let import_opts = XlsxImportOptions {
+        recompute: RecomputeMode::Skip,
+        preserve_package: true,
+        ..Default::default()
+    };
+    let result = import_xlsx_path(BASIC_TEXT_FIXTURE, &registry, import_opts).unwrap();
+    let preservation = result.preservation.expect("preservation requested");
+
+    // Capture the original theme bytes for comparison.
+    let original_bytes = preservation.original_bytes.clone();
+    let original_theme = {
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&original_bytes)).unwrap();
+        let mut entry = zip.by_name("xl/theme/theme1.xml").unwrap();
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut buf).unwrap();
+        buf
+    };
+    assert!(
+        !original_theme.is_empty(),
+        "fixture should have a non-empty xl/theme/theme1.xml"
+    );
+
+    let tmp = std::env::temp_dir().join("w5-d-14-2-3-theme-bytes.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let export_opts = XlsxExportOptions {
+        mode: ExportMode::UpdateOriginal {
+            source: preservation,
+        },
+        formula_cache: FormulaCachePolicy::WriteRecomputed,
+        ..Default::default()
+    };
+    export_xlsx_path(&result.workbook, &registry, &tmp, export_opts).unwrap();
+
+    // Read the output's theme1.xml.
+    let output_bytes = std::fs::read(&tmp).unwrap();
+    let output_theme = {
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&output_bytes)).unwrap();
+        let mut entry = zip.by_name("xl/theme/theme1.xml").unwrap();
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut buf).unwrap();
+        buf
+    };
+
+    assert_eq!(
+        output_theme,
+        original_theme,
+        "output theme1.xml differs from original — H-1 regression. \
+         original={}B, output={}B",
+        original_theme.len(),
+        output_theme.len()
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
 fn w5_d_14_2_2_strict_update_original_does_not_overwrite_output_on_drop() {
     // **W5-D-14.2.2 (Codex audit H-B closure):** in Strict mode, a
     // workbook whose original contained VBA must NOT overwrite the
@@ -791,5 +854,4 @@ fn import_ironcalc_example_fixture_with_recompute_doesnt_panic() {
     // Report exists; whether formula_failures is empty depends on
     // engine fn coverage. Don't assert; just confirm the report is
     // structurally present.
-    let _ = result.report.formula_failures.len();
-}
+    let _ = result.report.formula_failures.l
