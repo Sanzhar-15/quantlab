@@ -1296,6 +1296,14 @@ pub fn mround(args: &[Value]) -> Value {
 
 /// `ODD(number)` — round AWAY from zero to the nearest odd integer.
 /// ODD(0) = 1 per Excel canon.
+///
+/// **W5-D-PM12-2 (megaudit Opus-A HIGH-2 closure):** previously the
+/// `away as i64` cast + the subsequent `±1` adjustment could panic
+/// in debug ("attempt to add/subtract with overflow") for inputs
+/// near or beyond `i64::MAX as f64`. The crash was reproducible on
+/// `import_xlsx_path` of `EVEN_ODD.xlsx` from the IronCalc corpus.
+/// Now we reject any input whose ceiling/floor is outside the safe
+/// `i64::MIN+1 ..= i64::MAX-1` window as `#NUM!`.
 pub fn odd(args: &[Value]) -> Value {
     let n = match one_number(args, 1, 1) {
         Ok(n) => n,
@@ -1304,10 +1312,13 @@ pub fn odd(args: &[Value]) -> Value {
     if n == 0.0 {
         return Value::Number(1.0);
     }
-    // Round away from zero to the next integer of the right parity.
     let away = if n > 0.0 { n.ceil() } else { n.floor() };
+    // Reject out-of-range so the subsequent `as i64` + `±1` is safe.
+    // Leave headroom of 1 for the ±1 bump.
+    if !away.is_finite() || away >= (i64::MAX as f64) || away <= (i64::MIN as f64) {
+        return Value::Error(ErrorValue::Num);
+    }
     let away_i = away as i64;
-    // If even, bump by ±1 to get to odd.
     let adjusted = if away_i % 2 == 0 {
         if n > 0.0 {
             away_i + 1
@@ -1322,6 +1333,9 @@ pub fn odd(args: &[Value]) -> Value {
 
 /// `EVEN(number)` — round AWAY from zero to the nearest even
 /// integer. EVEN(0) = 0.
+///
+/// **W5-D-PM12-2 (megaudit Opus-A HIGH-2 closure):** same overflow
+/// fix as ODD.
 pub fn even(args: &[Value]) -> Value {
     let n = match one_number(args, 1, 1) {
         Ok(n) => n,
@@ -1331,6 +1345,9 @@ pub fn even(args: &[Value]) -> Value {
         return Value::Number(0.0);
     }
     let away = if n > 0.0 { n.ceil() } else { n.floor() };
+    if !away.is_finite() || away >= (i64::MAX as f64) || away <= (i64::MIN as f64) {
+        return Value::Error(ErrorValue::Num);
+    }
     let away_i = away as i64;
     let adjusted = if away_i % 2 != 0 {
         if n > 0.0 {

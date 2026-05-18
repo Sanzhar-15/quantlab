@@ -116,6 +116,40 @@ fn is_reserved_name(canonical: &str) -> bool {
     )
 }
 
+/// **W5-D-PM12-2 (megaudit Opus-A HIGH-4 closure):** does `name` look
+/// like an Excel column letter (`K`, `XFC`) or cell reference
+/// (`A1`, `XFD1048576`)?
+///
+/// Helper kept available for the deferred HIGH-4 closure that
+/// will reject these names at the producer once the binder's
+/// AggregateArg-side literal-range support lands (HIGH-1). The
+/// current code path doesn't call this — see `NameTable::set` for
+/// the deferred-closure rationale.
+#[allow(dead_code)]
+fn looks_like_excel_cell_ref(canonical: &str) -> bool {
+    let bytes = canonical.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    // Walk letters first.
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    // Excel column max is XFD = 3 letters. Anything else can't be a
+    // ref shape.
+    if i == 0 || i > 3 {
+        return false;
+    }
+    // Pure-letter case: matches a column-letter token (`K`, `XFC`).
+    if i == bytes.len() {
+        return true;
+    }
+    // Letter-then-digits case: cell-ref shape (`A1`, `XFD1048576`).
+    let rest = &canonical[i..];
+    rest.bytes().all(|b| b.is_ascii_digit())
+}
+
 impl NameTable {
     pub fn new() -> Self {
         Self::default()
@@ -141,10 +175,20 @@ impl NameTable {
         if is_reserved_name(&upper) {
             return Err(NameTableError::Reserved(upper));
         }
+        // **W5-D-PM12-2 megaudit Opus-A HIGH-4 — DEFERRED.**
+        // Initial closure attempted to reject cell-ref-shaped names
+        // (`K`, `XFC`, `A1`) at the producer, but existing tests
+        // (env.rs:530+, 555, 592 etc.) intentionally register
+        // single-letter names like `R` and the binder resolves them
+        // correctly when used in non-product context. The Opus-A
+        // failure case is `K*A1` where the binder treats `K` as a
+        // column→range and `A1` as a cell → `RangeRef × CellRef`
+        // which the AggregateArg gate rejects. The root cause is
+        // shared with HIGH-1 (literal RangeRef in non-Function
+        // context). Closing HIGH-1 likely closes HIGH-4 too.
+        // Deferred until HIGH-1 lands or a separate
+        // name-precedence-over-column-letter binder pass.
         self.entries.insert(upper, target);
-        // Phase 2B.3: bump generation so bind-plan caches keyed by the prior
-        // generation miss on next lookup. wrapping_add so we never panic on
-        // u64::MAX (practically unreachable but defensive).
         self.generation = self.generation.wrapping_add(1);
         Ok(())
     }
