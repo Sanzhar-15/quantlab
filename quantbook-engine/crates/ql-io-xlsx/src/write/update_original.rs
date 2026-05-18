@@ -444,7 +444,14 @@ fn collect_default_extensions(xml: &str) -> std::collections::HashSet<String> {
 
 /// Generate a sibling temp path for the shadow export. Uses the
 /// output's filename + a unique suffix.
+///
+/// **W5-D-14.2 self-audit HIGH-1 fix:** the counter MUST be
+/// module-static (not per-call); a per-call `AtomicU64::new(0)`
+/// returns `0` every time, defeating concurrent-call dedup. Two
+/// threads exporting to the same parent dir would otherwise race
+/// on the same shadow filename.
 fn sibling_tmp_path(output_path: &std::path::Path) -> std::path::PathBuf {
+    static SHADOW_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let parent = output_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
@@ -453,8 +460,7 @@ fn sibling_tmp_path(output_path: &std::path::Path) -> std::path::PathBuf {
         .and_then(|s| s.to_str())
         .unwrap_or("ql-export");
     let pid = std::process::id();
-    let counter = std::sync::atomic::AtomicU64::new(0);
-    let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let n = SHADOW_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     parent.join(format!(".{stem}.ql-shadow-{pid}-{n}.xlsx"))
 }
 

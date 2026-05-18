@@ -785,6 +785,12 @@ struct TableExport {
     sheet_idx: usize,
     /// Full footprint range in A1 form (e.g. `B2:D10`).
     ref_a1: String,
+    /// AutoFilter range — same as `ref_a1` minus the totals row when
+    /// `has_totals`. Excel rejects autoFilter ranges that overlap the
+    /// totals row.
+    ///
+    /// **W5-D-14.2 self-audit HIGH-2 fix.**
+    autofilter_ref: String,
     /// Columns: stable id + display name + totals function.
     columns: Vec<TableColumnExport>,
     /// Header row present.
@@ -820,6 +826,22 @@ fn collect_table_exports(workbook: &Workbook) -> Vec<TableExport> {
             col_letter(last_col),
             last_row + 1
         );
+        // **W5-D-14.2 self-audit HIGH-2 fix:** the autoFilter range
+        // excludes the totals row. Excel treats the totals row as
+        // "below the filter"; including it produces a filter dropdown
+        // on cells that aren't part of the filterable data.
+        let autofilter_last_row = if t.has_totals && last_row > t.top_row {
+            last_row - 1
+        } else {
+            last_row
+        };
+        let autofilter_ref = format!(
+            "{}{}:{}{}",
+            col_letter(t.top_col),
+            t.top_row + 1,
+            col_letter(last_col),
+            autofilter_last_row + 1
+        );
         let columns = t
             .columns
             .iter()
@@ -836,6 +858,7 @@ fn collect_table_exports(workbook: &Workbook) -> Vec<TableExport> {
             name: t.display_name.to_string(),
             sheet_idx,
             ref_a1,
+            autofilter_ref,
             columns,
             has_header: t.has_header,
             has_totals: t.has_totals,
@@ -864,10 +887,10 @@ fn render_table_xml(t: &TableExport) -> String {
         if t.has_totals { 1 } else { 0 },
     ));
     // <autoFilter> follows ref if header present (Excel requires it
-    // for the filter dropdown). Use the data range if totals present,
-    // else the full ref.
+    // for the filter dropdown). Use `autofilter_ref` which excludes
+    // the totals row when `has_totals` (HIGH-2 fix).
     if t.has_header {
-        s.push_str(&format!(r#"<autoFilter ref="{}"/>"#, t.ref_a1));
+        s.push_str(&format!(r#"<autoFilter ref="{}"/>"#, t.autofilter_ref));
     }
     s.push_str(&format!(r#"<tableColumns count="{}">"#, t.columns.len()));
     for c in &t.columns {

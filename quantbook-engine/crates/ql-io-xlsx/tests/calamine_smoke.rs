@@ -431,6 +431,59 @@ fn w5_d_14_2_round_trip_preserves_workbook_scoped_name_range() {
 }
 
 #[test]
+fn w5_d_14_2_round_trip_preserves_sheet_scoped_name() {
+    // **W5-D-14.2 self-audit L-6 closure:** sheet-scope name targeting
+    // a cell. localSheetId attribute must survive round-trip and the
+    // name must land in `Sheet::scoped_names`, not workbook-level.
+    use ql_storage::{NamedTarget, Workbook};
+    use ql_types::Address;
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("Sheet1");
+    let sheet = wb.sheet_mut(s).unwrap();
+    sheet
+        .set_scoped_name("LocalCell", NamedTarget::Cell(Address::new(s, 2, 1)))
+        .unwrap();
+
+    let tmp = std::env::temp_dir().join("w5-d-14-2-roundtrip-scoped-name.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+    export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Workbook-scope: should NOT contain the name.
+    assert!(
+        result.workbook.names().lookup_ci("LocalCell").is_none(),
+        "sheet-scoped name leaked into workbook scope"
+    );
+
+    // Sheet-scope: should be on sheet 0.
+    let s0 = result.workbook.sheet(0).unwrap();
+    let target = s0
+        .scoped_names()
+        .lookup_ci("LocalCell")
+        .expect("sheet-scoped name LocalCell missing on sheet 0");
+    match target {
+        NamedTarget::Cell(a) => {
+            assert_eq!(a.sheet, 0);
+            assert_eq!(a.row, 2);
+            assert_eq!(a.col, 1);
+        }
+        other => panic!("expected Cell target, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
 fn w5_d_14_2_round_trip_preserves_table() {
     // **W5-D-14.2 (HIGH-3 closure):** Quantbook tables export to
     // `xl/tables/table*.xml` and re-import via the existing tables
