@@ -2992,6 +2992,45 @@ impl<'a> WorkbookRuntime<'a> {
     }
 
     pub fn recompute_all(&mut self) -> RecomputeResult {
+        // **Tier C1 (2026-05-18 — Phase 4.12 Opus-B H-2 closure):**
+        // cycle detection. `recompute_all` is the no-session-attached
+        // fallback used by `.qbook` load + replay. Before this fix,
+        // cyclic formulas like `=A1+1` in A1 silently produced
+        // wrong values on each call (1, then 2, then 3, …) because
+        // HashMap-order evaluation just re-read the prior value.
+        //
+        // Strategy: build an ephemeral `CalcgraphSession` from the
+        // current workbook, mark every formula dirty, run Tarjan
+        // SCC via `schedule_dirty`, and write `#CIRC!` for every
+        // cell in a cycle. The acyclic remainder evaluates through
+        // the existing HashMap-order loop unchanged.
+        //
+        // `rebuild_from_workbook` parses every formula a second
+        // time (the existing loop below also parses each via
+        // `try_recompute_one_cached`). Acceptable cost for the
+        // load/replay path; `recompute_dirty` is the performance
+        // path with session-attached callers.
+        let cycled_cells: std::collections::HashSet<(SheetId, RowId, ColId)> = {
+            use crate::calcgraph_session::CalcgraphSession;
+            let mut session = CalcgraphSession::rebuild_from_workbook(self.workbook).session;
+            let formula_addrs: Vec<(SheetId, RowId, ColId)> = self
+                .workbook
+                .iter_formulas()
+                .map(|(s, r, c, _)| (s, r, c))
+                .collect();
+            for (s, r, c) in &formula_addrs {
+                if let Some(node) = session.cell_node_for(*s, *r, *c) {
+                    session.mark_dirty(node);
+                }
+            }
+            let sched = session.schedule_dirty();
+            sched
+                .cycled
+                .into_iter()
+                .filter_map(|n| session.cell_address_for(n))
+                .collect()
+        };
+
         // Snapshot the formula list so we don't hold a borrow during eval.
         let entries: Vec<(SheetId, RowId, ColId, Arc<str>)> = self
             .workbook
@@ -3003,6 +3042,16 @@ impl<'a> WorkbookRuntime<'a> {
         let mut failures: Vec<RecomputeFailure> = Vec::new();
 
         for (sheet, row, col, formula_text) in entries {
+            // Tier C1: cycled cells short-circuit to #CIRC! without
+            // running bind/eval. Matches `recompute_dirty`'s contract
+            // (cycled cells contribute to `attempted` but not
+            // `succeeded` — `succeeded` is reserved for sorted-path
+            // evaluations).
+            if cycled_cells.contains(&(sheet, row, col)) {
+                self.workbook
+                    .put_computed_at(sheet, row, col, Value::Error(ErrorValue::Circ));
+                continue;
+            }
             match self.try_recompute_one_cached(sheet, row, col, &formula_text) {
                 Ok(value) => {
                     // Phase 3.5 (CORR-25): formula outputs route to the
@@ -4558,6 +4607,115 @@ mod tests {
         rt.set_value(0, 0, 0, Value::Number(5.0)).unwrap();
         let v = rt.set_formula(0, 1, 0, "A1 + 10").unwrap();
         assert_eq!(v, Value::Number(15.0));
+    }
+
+    // ===== Tier C1 (2026-05-18) — Phase 4.12 Opus-B H-2 closure =====
+
+    /// `recompute_all` (no session attached — the `.qbook` load / replay
+    /// path) must detect cycles and emit `#CIRC!` for cycled cells.
+    /// Before this fix, a self-referential formula like `A1 = A1 + 1`
+    /// silently produced 1, then 2, then 3, … on successive calls
+    /// because HashMap-order evaluation just re-read the prior value.
+    #[test]
+    fn recompute_all_emits_circ_for_self_referential_a1_plus_one() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        wb.put_formula(0, 0, 0, "A1 + 1");
+        let (attempted, succeeded, failed_count) = {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let r = rt.recompute_all();
+            // Repeated calls stay at #CIRC! — they don't drift.
+            let _ = rt.recompute_all();
+            (r.attempted, r.succeeded, r.failures.len())
+        };
+        // Cycled cells contribute to attempted but not succeeded.
+        assert_eq!(attempted, 1);
+        assert_eq!(succeeded, 0);
+        assert_eq!(failed_count, 0);
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Error(ErrorValue::Circ),
+            "self-referential A1 = A1+1 must resolve to #CIRC!, not a stale incremented value"
+        );
+    }
+
+    /// 2-cycle: A1 = B1 + 1, B1 = A1 - 1. Both cells in the SCC must
+    /// resolve to `#CIRC!`. Mirrors the existing `recompute_dirty`
+    /// reference test (`recompute_dirty_writes_circ_error_for_cycle_members`).
+    #[test]
+    fn recompute_all_emits_circ_for_two_cycle_a1_b1() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        wb.put_formula(0, 0, 0, "B1 + 1");
+        wb.put_formula(0, 0, 1, "A1 - 1");
+        let (attempted, succeeded, failed_count) = {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let r = rt.recompute_all();
+            (r.attempted, r.succeeded, r.failures.len())
+        };
+        assert_eq!(attempted, 2);
+        assert_eq!(succeeded, 0);
+        assert_eq!(failed_count, 0);
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Error(ErrorValue::Circ),
+            "A1 in 2-cycle must be #CIRC!"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Error(ErrorValue::Circ),
+            "B1 in 2-cycle must be #CIRC!"
+        );
+    }
+
+    /// Acyclic mix with a cycle: A1 = 5, B1 = A1 * 2, C1 = C1 + 1
+    /// (self-referential). A1 and B1 evaluate normally; C1 emits
+    /// `#CIRC!`. Verifies cycle detection doesn't pollute the
+    /// acyclic remainder.
+    #[test]
+    fn recompute_all_isolates_cycle_from_acyclic_formulas() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        wb.put_at(0, 0, 0, Value::Number(5.0));
+        wb.put_formula(0, 0, 1, "A1 * 2");
+        wb.put_formula(0, 0, 2, "C1 + 1");
+        let (attempted, succeeded, failed_count) = {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let r = rt.recompute_all();
+            (r.attempted, r.succeeded, r.failures.len())
+        };
+        assert_eq!(attempted, 2, "B1 + C1 are the formulas");
+        assert_eq!(succeeded, 1, "B1 evaluates; C1 is cycled");
+        assert_eq!(failed_count, 0);
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Number(10.0)
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 2)),
+            Value::Error(ErrorValue::Circ)
+        );
+    }
+
+    /// Cycle value must be stable across repeated `recompute_all`
+    /// calls — no drift between iterations. Before this fix, A1 in
+    /// `A1 = A1 + 1` returned 1, 2, 3, … instead of #CIRC! each time.
+    #[test]
+    fn recompute_all_repeated_calls_are_idempotent_on_cycle() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        wb.put_formula(0, 0, 0, "A1 + 1");
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            for _ in 0..5 {
+                rt.recompute_all();
+            }
+        }
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Error(ErrorValue::Circ),
+            "cycle value must remain #CIRC! across repeated recompute_all calls (no drift)"
+        );
     }
 
     // ===== Phase 2B.2 — RecomputeResult contract =====
