@@ -13,7 +13,12 @@
 //! - `set_value(sheet, row, col, value)` — literal-only write; clears any existing
 //!   formula association. Phase 3.5: `clear_formula` cascades to drop the
 //!   computed-overlay entry too.
-//! - `recompute_all()` — legacy HashMap-order full pass; no graph awareness.
+//! - `recompute_all()` — HashMap-order full pass. Tier C1 (2026-05-18,
+//!   Phase 4.12 Opus-B H-2 closure) added an ephemeral
+//!   `CalcgraphSession`-based cycle-detection pre-pass: cycled cells
+//!   short-circuit to `#CIRC!` before the eval loop runs. Acyclic
+//!   formulas still evaluate in HashMap order (GAP-R-01 stale-
+//!   intermediate caveat unchanged).
 //! - `recompute_dirty()` (Phase 3.4 W5-37) — incremental graph-driven recompute.
 //!   Runs Tarjan SCC over the attached `CalcgraphSession`'s dirty set; cycled
 //!   members get `Value::Error(ErrorValue::Circ)`. Phase 3.6 routes aggregates
@@ -3002,14 +3007,43 @@ impl<'a> WorkbookRuntime<'a> {
         // Strategy: build an ephemeral `CalcgraphSession` from the
         // current workbook, mark every formula dirty, run Tarjan
         // SCC via `schedule_dirty`, and write `#CIRC!` for every
-        // cell in a cycle. The acyclic remainder evaluates through
-        // the existing HashMap-order loop unchanged.
+        // cell in a cycle BEFORE the HashMap-order eval loop runs.
+        // The acyclic remainder evaluates through the existing
+        // HashMap-order loop; any cell that reads from a cycled
+        // cell sees the freshly-written `#CIRC!` and propagates it
+        // via standard error semantics.
         //
         // `rebuild_from_workbook` parses every formula a second
         // time (the existing loop below also parses each via
         // `try_recompute_one_cached`). Acceptable cost for the
         // load/replay path; `recompute_dirty` is the performance
         // path with session-attached callers.
+        //
+        // **Post-audit closures (2026-05-18 Tier C1 audit):**
+        //
+        // - *Codex H-1*: cycled cells are now written in a pre-pass
+        //   below, not lazily inside the eval loop. This matches
+        //   `recompute_dirty`'s cycle-first ordering (see line 3160+
+        //   below). Without the pre-pass, HashMap-order could
+        //   evaluate a non-cycled dependent (`B1 = A1+1`) before the
+        //   cycled cell (`A1 = A1+1`) was overwritten, and B1 would
+        //   read A1's stale prior value.
+        //
+        // - *Codex H-2*: cycled-cell pre-pass also clears any
+        //   pre-existing spill anchor at the same address before
+        //   writing `#CIRC!`. Without this, an old `SEQUENCE(3)`
+        //   spill anchor that gets overwritten with a circular
+        //   formula leaves stale spill target overlays in A2/A3.
+        //
+        // - *Opus H-1*: bind-failed formula nodes (those whose
+        //   parse/bind errored inside `rebuild_from_workbook`) are
+        //   inserted into the session's cell index but registered
+        //   with zero outgoing edges. Tarjan therefore cannot place
+        //   them in a non-trivial SCC nor mark them as self-loops,
+        //   so the `cycled` set correctly excludes them. They flow
+        //   into the existing HashMap-order eval loop and the
+        //   parse/bind error surfaces via the normal `failures`
+        //   pathway.
         let cycled_cells: std::collections::HashSet<(SheetId, RowId, ColId)> = {
             use crate::calcgraph_session::CalcgraphSession;
             let mut session = CalcgraphSession::rebuild_from_workbook(self.workbook).session;
@@ -3031,6 +3065,19 @@ impl<'a> WorkbookRuntime<'a> {
                 .collect()
         };
 
+        // **Codex H-1 / H-2 closure pre-pass:** write `#CIRC!` to
+        // every cycled cell BEFORE running the HashMap-order eval
+        // loop, and clear any spill anchor that previously lived at
+        // the same address. Order matters: writing `#CIRC!` before
+        // the loop guarantees a non-cycled dependent that reads
+        // from a cycled cell sees the error sigil and propagates
+        // it, instead of reading a stale prior value.
+        for &(sheet, row, col) in &cycled_cells {
+            self.workbook.clear_spill_if_present((sheet, row, col));
+            self.workbook
+                .put_computed_at(sheet, row, col, Value::Error(ErrorValue::Circ));
+        }
+
         // Snapshot the formula list so we don't hold a borrow during eval.
         let entries: Vec<(SheetId, RowId, ColId, Arc<str>)> = self
             .workbook
@@ -3042,14 +3089,14 @@ impl<'a> WorkbookRuntime<'a> {
         let mut failures: Vec<RecomputeFailure> = Vec::new();
 
         for (sheet, row, col, formula_text) in entries {
-            // Tier C1: cycled cells short-circuit to #CIRC! without
-            // running bind/eval. Matches `recompute_dirty`'s contract
-            // (cycled cells contribute to `attempted` but not
-            // `succeeded` — `succeeded` is reserved for sorted-path
-            // evaluations).
+            // Tier C1: cycled cells were already written to `#CIRC!`
+            // in the pre-pass above and any stale spill cleared.
+            // Match `recompute_dirty`'s cycled-cell accounting:
+            // cycled cells contribute to `attempted` but NOT to
+            // `succeeded` (the VEQ short-circuit logic that
+            // `recompute_dirty` runs in addition does not apply
+            // here — `recompute_all` is the legacy full-pass path).
             if cycled_cells.contains(&(sheet, row, col)) {
-                self.workbook
-                    .put_computed_at(sheet, row, col, Value::Error(ErrorValue::Circ));
                 continue;
             }
             match self.try_recompute_one_cached(sheet, row, col, &formula_text) {
@@ -4715,6 +4762,112 @@ mod tests {
             wb.read(ql_types::Address::new(0, 0, 0)),
             Value::Error(ErrorValue::Circ),
             "cycle value must remain #CIRC! across repeated recompute_all calls (no drift)"
+        );
+    }
+
+    /// **Tier C1 audit Codex H-1 closure:** a non-cycled dependent
+    /// of a cycled cell must propagate `#CIRC!`, not read the
+    /// cycled cell's stale prior value. Before the pre-pass fix,
+    /// HashMap-order could evaluate B1 (=A1+1) before A1's `#CIRC!`
+    /// was written, so B1 would compute `prior(A1) + 1`. With the
+    /// pre-pass, A1 is `#CIRC!` before any non-cycled eval runs,
+    /// so B1 sees the error sigil and propagates it.
+    #[test]
+    fn recompute_all_dependent_of_cycle_propagates_circ_error() {
+        // Seed A1 with a non-cycle prior value to make the test
+        // hostile to the lazy-write bug: if the bug were still
+        // present, B1 might read `A1=42` and write 43 to B1
+        // instead of `#CIRC!`.
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        wb.put_at(0, 0, 0, Value::Number(42.0));
+        wb.put_formula(0, 0, 0, "A1 + 1");
+        wb.put_formula(0, 0, 1, "A1 + 1");
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.recompute_all();
+        }
+        // A1 is cycled → #CIRC!.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Error(ErrorValue::Circ),
+            "self-referential A1 must be #CIRC!"
+        );
+        // B1 is non-cycled but reads A1 — must propagate #CIRC!.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 1)),
+            Value::Error(ErrorValue::Circ),
+            "B1 reads cycled A1 and must propagate #CIRC!, not the stale prior value 42"
+        );
+    }
+
+    /// **Tier C1 audit Codex H-2 closure:** if a previously-spilling
+    /// anchor (e.g. `A1 = SEQUENCE(3)`) gets overwritten with a
+    /// circular formula, the old spill must be cleared so stale
+    /// targets A2/A3 don't survive next to the `#CIRC!` anchor.
+    #[test]
+    fn recompute_all_clears_stale_spill_when_anchor_becomes_circular() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        wb.put_formula(0, 0, 0, "SEQUENCE(3)");
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.recompute_all();
+        }
+        // After first recompute: A1 spilled to A1:A3.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Number(1.0),
+            "A1 anchor spill body[0]"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 1, 0)),
+            Value::Number(2.0),
+            "A2 spill body[1]"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 2, 0)),
+            Value::Number(3.0),
+            "A3 spill body[2]"
+        );
+        assert!(
+            wb.spill_anchor_at(0, 0, 0).is_some(),
+            "spill anchor registered at A1"
+        );
+
+        // Overwrite A1 with a circular formula. `put_formula` goes
+        // through the workbook directly (bypassing the runtime's
+        // spill-aware set_formula); this mimics the `.qbook` load /
+        // replay scenario where formula text arrives without the
+        // runtime spill-cleanup pipeline.
+        wb.put_formula(0, 0, 0, "A1 + 1");
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.recompute_all();
+        }
+        // A1 becomes #CIRC!.
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 0, 0)),
+            Value::Error(ErrorValue::Circ),
+            "A1 now circular → #CIRC!"
+        );
+        // Old spill anchor must be cleared.
+        assert!(
+            wb.spill_anchor_at(0, 0, 0).is_none(),
+            "stale spill anchor at A1 must be cleared when A1 becomes circular"
+        );
+        // Stale spill targets in A2, A3 must be cleared too (the
+        // spill body lived in the computed overlay; clearing the
+        // anchor unwinds the body).
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 1, 0)),
+            Value::Blank,
+            "A2 must not retain stale spill body value 2"
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(0, 2, 0)),
+            Value::Blank,
+            "A3 must not retain stale spill body value 3"
         );
     }
 

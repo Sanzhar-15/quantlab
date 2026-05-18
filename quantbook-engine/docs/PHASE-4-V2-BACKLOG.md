@@ -110,19 +110,77 @@ Phase 4 ("IDE must open imported xlsx, show formulas, edit formulas").
 
 ## Tier C — RECOMPUTE / OP-LOG (correctness)
 
-### C1. Cycle detection in `recompute_all`
+### ~~C1.~~ Cycle detection in `recompute_all` — ✅ SHIPPED 2026-05-18 at `3451d90a03f` (+ audit closures)
 
 - **Source:** Phase 4.12 Opus-B H-2.
-- **Impact:** `=A1+1` in cell A1 returns 1, then 2, then 3 on
-  successive `recompute_all` calls (silent value mutation, no
-  `#CIRC!` emission). Affects the `.qbook` load + replay path.
-- **Scope:** `crates/ql-exec/src/workbook_runtime.rs::recompute_all`
-  needs the SCC analysis that `recompute_dirty` already does.
-  Either share the cycle-detection pass or have `recompute_all`
-  delegate to a graph-aware path.
-- **Effort:** 1-3 days. Risk: changing `recompute_all` semantics may
-  affect existing replay paths — careful regression testing needed.
-- **Probe regression:** `crates/ql-exec/tests/p412_function_arg_fuzz.rs::self_referential_formula_direct` + `two_cycle_a1_b1`.
+- **Impact (pre-fix):** `=A1+1` in cell A1 returned 1, then 2, then 3
+  on successive `recompute_all` calls (silent value mutation, no
+  `#CIRC!`). Affected the `.qbook` load + replay path.
+- **Fix:** before the HashMap-order eval loop, build an ephemeral
+  `CalcgraphSession` via `rebuild_from_workbook`, mark every formula
+  dirty, run Tarjan SCC via `schedule_dirty`, and short-circuit
+  cycled cells to `Value::Error(ErrorValue::Circ)`. Acyclic
+  formulas evaluate through the existing HashMap path unchanged.
+- **Post-audit closures (parallel Codex + Opus pass):** pre-pass
+  cycled writes BEFORE main loop so dependents propagate `#CIRC!`
+  (Codex H-1); `clear_spill_if_present` for cycled cells so stale
+  spill bodies are unwound (Codex H-2); bind-failed-node safety
+  documented (Opus H-1); doc-comment polish (Codex L-1, Opus L-1).
+  See `docs/audits/2026-05-18-tier-c1-consolidated.md` +
+  `tier-c1-codex.md` + `tier-c1-opus.md`.
+- **Regression tests:** 6 in `crates/ql-exec/src/workbook_runtime.rs::tests`:
+  4 originals (`recompute_all_emits_circ_for_self_referential_a1_plus_one`,
+  `recompute_all_emits_circ_for_two_cycle_a1_b1`,
+  `recompute_all_isolates_cycle_from_acyclic_formulas`,
+  `recompute_all_repeated_calls_are_idempotent_on_cycle`) + 2 audit
+  closures (`recompute_all_dependent_of_cycle_propagates_circ_error`,
+  `recompute_all_clears_stale_spill_when_anchor_becomes_circular`).
+
+### C1.a (perf) — share parsed plans between rebuild + eval
+
+- **Source:** Tier C1 audit Codex M-4 / Opus M-2.
+- **Impact:** 2× lex+parse cost on cold `.qbook` load. Measurable on
+  10K-formula workbooks.
+- **Scope:** thread `rebuild_from_workbook`'s bound plans forward
+  into the runtime's `PlanCache` so the eval loop reuses the
+  binds. Or change `rebuild_from_workbook` to optionally return
+  `HashMap<NodeId, ExprPlan>`.
+- **Effort:** 1-2 days. Trigger: bench shows > 5% of cold-load time
+  is double-parse cost.
+
+### C1.b (perf) — full-dirty supplemental adjacency
+
+- **Source:** Tier C1 audit Codex M-3.
+- **Impact:** `build_range_supplemental` is `O(|dirty|² × avg_ranges)`.
+  When every formula is marked dirty (cold-load path), this
+  dominates for 10K+ formula workbooks with range/named-range/
+  table refs.
+- **Scope:** add a full-dirty optimized scheduler path using per-
+  sheet row/col stripe-bucket lookups for dirty formulas inside
+  ranges.
+- **Effort:** 2-4 days.
+
+### C1.c (coverage) — richer cycle topology tests for `recompute_all`
+
+- **Source:** Tier C1 audit Codex L-1 / Opus M-1.
+- **Impact:** missing direct test coverage for 3-cycle, `SUM(A:A)`
+  range self-loop, named-range cycle, cross-sheet cycle, table-
+  column cycle.
+- **Scope:** add 5-6 regression tests in
+  `crates/ql-exec/src/workbook_runtime.rs::tests`.
+- **Effort:** ~half a day.
+
+### C1.d (replay) — `replay_into` → `recompute_all` integration
+
+- **Source:** Tier C1 audit Codex M-2.
+- **Impact:** `ql-oplog::replay::replay_into` does not call
+  `recompute_all` at end of replay. Phase 5 callers that read
+  workbook values immediately after replay will see stale formula
+  outputs (no cycle detection yet ran).
+- **Scope:** add `replay_into_and_recompute` entry point that
+  composes the existing replay with a `recompute_all` call. Or
+  document a contract for Phase 5 replay wrappers.
+- **Effort:** half-day with tests.
 
 ### C2. `Op::BatchCommit` replay depth guard
 
