@@ -126,6 +126,33 @@ pub fn import_xlsx_bytes(
     // (calamine drops `localSheetId`).
     let workbook_props = read::workbook_xml::parse_workbook_xml(&package)?;
 
+    // **W5-D-PM-3 (megaudit Opus-B HIGH-7 closure):** zero-sheet
+    // workbook is invalid OOXML — Excel rejects on any meaningful
+    // operation. The prior import accepted silently. Strict mode
+    // had no way to fire because `feature_inventory` was clean.
+    // Reject early as a typed error.
+    if workbook_props.sheets.is_empty() {
+        return Err(XlsxError::MalformedOoxml {
+            part: "xl/workbook.xml".to_string(),
+            message: "workbook has no <sheet> elements (Excel requires ≥1 sheet)".to_string(),
+        });
+    }
+
+    // **W5-D-PM-3 (megaudit Opus-A HIGH-3 closure):** record any
+    // hidden / veryHidden sheets in the feature inventory.
+    // Quantbook's `Sheet` doesn't model visibility state, so on
+    // export via `UpdateOriginal` the shadow's workbook.xml
+    // replaces the original's `state` attrs — silently dropping
+    // the visibility. The inventory entry lets Strict mode surface
+    // the loss + Permissive callers see it.
+    for sheet in &workbook_props.sheets {
+        if !matches!(sheet.state, read::workbook_xml::SheetState::Visible) {
+            report
+                .feature_inventory
+                .record(UnsupportedFeatureKind::HiddenSheets);
+        }
+    }
+
     // **W5-D-14b — Phase 0b**: scan for unsupported OOXML features.
     // Populates `report.feature_inventory`; respects
     // `options.unsupported_policy` further down.
@@ -162,6 +189,34 @@ pub fn import_xlsx_bytes(
     let sheet_rels_paths = read::sheet_parts::build_sheet_rels_paths(&package, &workbook_props)?;
     let _tables_imported =
         read::tables_import::import_tables(&package, &mut workbook, &sheet_rels_paths)?;
+
+    // **W5-D-PM-3 (megaudit Opus-B HIGH-8 closure):** emit warnings
+    // for `<sheet r:id="...">` entries whose r:id doesn't resolve
+    // to any entry in `xl/_rels/workbook.xml.rels`. Prior to this,
+    // such sheets were silently dropped from the part-path lookup
+    // — the user thought their workbook imported when 1+ sheets
+    // had no usable worksheet part.
+    {
+        let sheet_part_paths_check =
+            read::sheet_parts::build_sheet_part_paths(&package, &workbook_props)?;
+        for (idx, (sheet, part_path)) in workbook_props
+            .sheets
+            .iter()
+            .zip(sheet_part_paths_check.iter())
+            .enumerate()
+        {
+            if part_path.is_empty() {
+                report.warnings.push(XlsxWarning {
+                    location: format!("sheet[{}] '{}'", idx, sheet.name),
+                    message: format!(
+                        "sheet r:id={:?} doesn't resolve via xl/_rels/workbook.xml.rels; \
+                         sheet content will be empty",
+                        sheet.r_id
+                    ),
+                });
+            }
+        }
+    }
 
     // **W5-D-14d — Phase 2d**: import styles. Parses `xl/styles.xml`
     // for custom number formats (`numFmtId >= 164`) and registers
@@ -304,15 +359,26 @@ pub fn export_xlsx_path(
     let out_path = out.as_ref();
     match options.mode {
         ExportMode::NewWorkbook => {
+            // **W5-D-PM-3 (megaudit Opus-A HIGH-2 closure):** previously
+            // NewWorkbook ignored `unsupported_policy`. Things that
+            // SHOULD be dropped (Constant(Error)/Constant(Blank)
+            // named-target values; future-deferred features) never
+            // populated `dropped_features` and never triggered Strict.
+            // Now collect drops + enforce policy. The exporter populates
+            // `report.dropped_features`; we apply Strict here.
             let mut report =
                 write::umya_export::export_new_workbook(workbook, out_path, options.formula_cache)?;
-            // **W5-D-14.2 (HIGH-7 partial — dropped_features population):**
-            // NewWorkbook mode doesn't preserve opaque parts from any
-            // import (there's no import context here), so this stays
-            // empty unless a future caller wires
-            // `XlsxExportOptions::dropped_features_hint`. The field
-            // itself now consumes for UpdateOriginal callers below.
             report.warnings.shrink_to_fit();
+            if !report.dropped_features.is_empty()
+                && options.unsupported_policy == UnsupportedPolicy::Strict
+            {
+                let first = report.dropped_features[0].clone();
+                return Err(XlsxError::UnsupportedFeature {
+                    feature: first.kind,
+                    part: first.part,
+                    detail: first.detail,
+                });
+            }
             Ok(report)
         }
         ExportMode::UpdateOriginal { source } => write::update_original::export_update_original(

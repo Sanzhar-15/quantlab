@@ -205,6 +205,18 @@ pub(crate) fn export_update_original(
         writer.finish().map_err(XlsxError::Zip)?;
     }
 
+    // **W5-D-PM-3 (megaudit self H-2 / Opus-A MEDIUM-1 closure):**
+    // scan the ORIGINAL's worksheet xmls for inline-feature
+    // signatures (`<conditionalFormatting>`, `<dataValidations>`,
+    // `<mergeCells>`, `<hyperlinks>`, `<sheetProtection>`). These
+    // are not standalone parts (so `classify_part` never sees them),
+    // but the shadow's worksheet xml REPLACES the original's — they
+    // get clobbered. Without this scan, Strict mode would silently
+    // permit the loss. Now each inline feature found gets a
+    // `dropped` entry that the policy enforcement below honours.
+    let inline_drops = scan_inline_features(&source.original_bytes)?;
+    dropped.extend(inline_drops);
+
     // **W5-D-14.2.2 (Codex audit H-B closure):** enforce the
     // unsupported-policy decision BEFORE writing the output. Prior
     // ordering wrote the (lossy) file first and then errored, which
@@ -358,6 +370,56 @@ fn classify_part(name: &str) -> PartAction {
     // emit. Skip silently for v1 (these are rare and usually
     // workbook-level extensions we'd need explicit support for).
     PartAction::DropSilently
+}
+
+/// **W5-D-PM-3 (megaudit self H-2 / Opus-A MEDIUM-1 closure):** scan
+/// the original zip for inline-feature signatures inside worksheet
+/// xmls. Returns one `UnsupportedFeature` entry per (sheet path,
+/// feature kind) pair found.
+///
+/// Detection is substring-based, scoped to `xl/worksheets/*.xml`.
+/// False positives possible (a literal `<conditionalFormatting>` in
+/// a cell value would match) but real-world cell content doesn't
+/// contain XML element syntax — they'd be escaped to entities.
+fn scan_inline_features(original_bytes: &[u8]) -> Result<Vec<UnsupportedFeature>, XlsxError> {
+    let mut out = Vec::new();
+    let mut zip =
+        zip::ZipArchive::new(std::io::Cursor::new(original_bytes)).map_err(XlsxError::Zip)?;
+    let inline_signatures: &[(&str, UnsupportedFeatureKind)] = &[
+        (
+            "<conditionalFormatting",
+            UnsupportedFeatureKind::ConditionalFormatting,
+        ),
+        ("<dataValidations", UnsupportedFeatureKind::DataValidation),
+        ("<mergeCells", UnsupportedFeatureKind::Other("mergeCells")),
+        ("<hyperlinks", UnsupportedFeatureKind::Hyperlinks),
+        ("<sheetProtection", UnsupportedFeatureKind::Protection),
+    ];
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).map_err(XlsxError::Zip)?;
+        let name = entry.name().to_string();
+        if !name.starts_with("xl/worksheets/") || !name.ends_with(".xml") {
+            continue;
+        }
+        let mut content = String::new();
+        if entry.read_to_string(&mut content).is_err() {
+            continue;
+        }
+        for (sig, kind) in inline_signatures {
+            if content.contains(sig) {
+                out.push(UnsupportedFeature {
+                    kind: *kind,
+                    part: name.clone(),
+                    detail: format!(
+                        "UpdateOriginal v1 does not preserve inline-in-sheet feature {:?}; \
+                         shadow's worksheet xml replaces the original",
+                        sig
+                    ),
+                });
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Read an entry's content as UTF-8 text. Returns the empty string if

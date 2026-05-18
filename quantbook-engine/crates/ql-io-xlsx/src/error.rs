@@ -115,6 +115,15 @@ pub enum UnsupportedFeatureKind {
     PivotTables,
     /// VBA macros (`xl/vbaProject.bin`).
     Macros,
+    /// **W5-D-PM-3 (megaudit Opus-A HIGH-3 closure):** sheet
+    /// visibility state (`state="hidden"` / `"veryHidden"`).
+    /// Quantbook's `Sheet` doesn't model state; on
+    /// `UpdateOriginal` export we silently lose the attribute
+    /// because the shadow's `xl/workbook.xml` replaces the
+    /// original's. Recording this in the import inventory lets
+    /// Strict mode surface the loss and Permissive callers see it
+    /// in `dropped_features`.
+    HiddenSheets,
     /// Any other OOXML part not modeled by the engine. Used as a
     /// catch-all so the inventory is exhaustive even for parts we
     /// haven't enumerated yet.

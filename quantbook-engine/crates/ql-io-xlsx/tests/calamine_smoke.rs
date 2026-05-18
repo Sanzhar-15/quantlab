@@ -1389,6 +1389,214 @@ fn w5_d_pm_2_sheet_name_with_control_char_rejected() {
 }
 
 #[test]
+fn w5_d_pm_3_zero_sheet_workbook_rejected() {
+    // **W5-D-PM-3 (megaudit Opus-B HIGH-7 closure):** workbook with
+    // `<sheets/>` empty (no `<sheet>` children) must be rejected as
+    // malformed, not silently accepted as a zero-sheet workbook.
+    use std::io::Write;
+    use zip::write::FileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let mut bytes: Vec<u8> = Vec::new();
+    {
+        let mut zw = ZipWriter::new(std::io::Cursor::new(&mut bytes));
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+        zw.start_file("[Content_Types].xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>").unwrap();
+        zw.start_file("xl/workbook.xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheets/></workbook>").unwrap();
+        zw.finish().unwrap();
+    }
+    let registry = ql_functions::default_registry();
+    let result = ql_io_xlsx::import_xlsx_bytes(&bytes, &registry, XlsxImportOptions::default());
+    assert!(
+        matches!(result, Err(ql_io_xlsx::XlsxError::MalformedOoxml { .. })),
+        "expected MalformedOoxml for zero-sheet workbook, got {result:?}"
+    );
+}
+
+#[test]
+fn w5_d_pm_3_unknown_r_id_surfaces_visibly() {
+    // **W5-D-PM-3 (megaudit Opus-B HIGH-8 closure):** `<sheet
+    // r:id="rIdMissing">` with no matching rel entry must surface
+    // visibly — either as a calamine error during cell-grid load
+    // OR (if calamine accepts the workbook structure) as an
+    // `XlsxWarning` in the import report. Either way, NOT a silent
+    // drop.
+    use std::io::Write;
+    use zip::write::FileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let mut bytes: Vec<u8> = Vec::new();
+    {
+        let mut zw = ZipWriter::new(std::io::Cursor::new(&mut bytes));
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+        zw.start_file("[Content_Types].xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>").unwrap();
+        zw.start_file("xl/workbook.xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheets><sheet name=\"Real\" sheetId=\"1\" r:id=\"rId1\"/><sheet name=\"Phantom\" sheetId=\"2\" r:id=\"rIdMissing\"/></sheets></workbook>").unwrap();
+        zw.start_file("xl/_rels/workbook.xml.rels", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships>").unwrap();
+        zw.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData/></worksheet>").unwrap();
+        zw.finish().unwrap();
+    }
+    let registry = ql_functions::default_registry();
+    let result = ql_io_xlsx::import_xlsx_bytes(
+        &bytes,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    );
+    match result {
+        Err(_) => { /* calamine catches it — visible. OK. */ }
+        Ok(r) => {
+            assert!(
+                r.report
+                    .warnings
+                    .iter()
+                    .any(|w| w.message.contains("rIdMissing")),
+                "import succeeded but no warning emitted; should NOT silently drop"
+            );
+        }
+    }
+}
+
+#[test]
+fn w5_d_pm_3_hidden_sheet_records_inventory_entry() {
+    // **W5-D-PM-3 (megaudit Opus-A HIGH-3 closure):** sheet with
+    // `state="hidden"` records `HiddenSheets` in the feature
+    // inventory (Quantbook's Sheet doesn't model state; we surface
+    // the loss).
+    use std::io::Write;
+    use zip::write::FileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let mut bytes: Vec<u8> = Vec::new();
+    {
+        let mut zw = ZipWriter::new(std::io::Cursor::new(&mut bytes));
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+        zw.start_file("[Content_Types].xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>").unwrap();
+        zw.start_file("xl/workbook.xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheets><sheet name=\"Visible\" sheetId=\"1\" r:id=\"rId1\"/><sheet name=\"Hidden\" sheetId=\"2\" state=\"hidden\" r:id=\"rId2\"/></sheets></workbook>").unwrap();
+        zw.start_file("xl/_rels/workbook.xml.rels", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/><Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet2.xml\"/></Relationships>").unwrap();
+        zw.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData/></worksheet>").unwrap();
+        zw.start_file("xl/worksheets/sheet2.xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData/></worksheet>").unwrap();
+        zw.finish().unwrap();
+    }
+    let registry = ql_functions::default_registry();
+    let result = ql_io_xlsx::import_xlsx_bytes(
+        &bytes,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        result
+            .report
+            .feature_inventory
+            .counts
+            .contains_key(&ql_io_xlsx::UnsupportedFeatureKind::HiddenSheets),
+        "expected HiddenSheets in inventory, got {:?}",
+        result.report.feature_inventory.counts
+    );
+}
+
+#[test]
+fn w5_d_pm_3_new_workbook_strict_errors_on_constant_error_name() {
+    // **W5-D-PM-3 (megaudit Opus-A HIGH-2 closure):** NewWorkbook
+    // mode now honors UnsupportedPolicy::Strict. A workbook with a
+    // named range pointing at `Constant(Error)` (which can't be
+    // OOXML-serialised) must error in Strict mode instead of
+    // silently dropping the name.
+    use ql_storage::{NamedTarget, Workbook};
+    use ql_types::{ErrorValue, Value};
+
+    let mut wb = Workbook::new();
+    wb.add_sheet("Sheet1");
+    wb.set_name(
+        "Bad",
+        NamedTarget::Constant(Value::Error(ErrorValue::Value)),
+    )
+    .unwrap();
+
+    let tmp = std::env::temp_dir().join("w5-d-pm-3-strict-name.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+    let opts = XlsxExportOptions {
+        unsupported_policy: ql_io_xlsx::UnsupportedPolicy::Strict,
+        ..Default::default()
+    };
+    let result = export_xlsx_path(&wb, &registry, &tmp, opts);
+    assert!(
+        matches!(
+            result,
+            Err(ql_io_xlsx::XlsxError::UnsupportedFeature { .. })
+        ),
+        "expected UnsupportedFeature in Strict mode, got {result:?}"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn w5_d_pm_3_update_original_strict_catches_inline_cf() {
+    // **W5-D-PM-3 (megaudit self H-2 / Opus-A MEDIUM-1 closure):**
+    // UpdateOriginal mode with Strict policy must error when the
+    // original's worksheet xml contains inline features that the
+    // shadow's xml replaces (CF, DV, mergeCells, hyperlinks).
+    use std::io::Write;
+    use zip::write::FileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let mut original_bytes: Vec<u8> = Vec::new();
+    {
+        let mut zw = ZipWriter::new(std::io::Cursor::new(&mut original_bytes));
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+        zw.start_file("[Content_Types].xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>").unwrap();
+        zw.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData/><conditionalFormatting sqref=\"A1\"><cfRule type=\"cellIs\" operator=\"greaterThan\"/></conditionalFormatting></worksheet>").unwrap();
+        zw.finish().unwrap();
+    }
+    let registry = ql_functions::default_registry();
+    let wb = ql_storage::Workbook::new();
+    let preservation = ql_io_xlsx::XlsxPreservation {
+        original_bytes,
+        known_parts: std::collections::HashMap::new(),
+    };
+    let tmp = std::env::temp_dir().join("w5-d-pm-3-update-original-cf.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let opts = XlsxExportOptions {
+        mode: ExportMode::UpdateOriginal {
+            source: preservation,
+        },
+        unsupported_policy: ql_io_xlsx::UnsupportedPolicy::Strict,
+        ..Default::default()
+    };
+    let result = export_xlsx_path(&wb, &registry, &tmp, opts);
+    assert!(
+        matches!(
+            result,
+            Err(ql_io_xlsx::XlsxError::UnsupportedFeature {
+                feature: ql_io_xlsx::UnsupportedFeatureKind::ConditionalFormatting,
+                ..
+            })
+        ),
+        "expected ConditionalFormatting UnsupportedFeature in Strict mode, got {result:?}"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
 fn w5_d_15_2_blank_cell_with_format_overlay_round_trips() {
     // **W5-D-15.2 (Codex audit HIGH-4 / self-audit H-1 closure):** a
     // cell with NO value and NO formula but a registered format

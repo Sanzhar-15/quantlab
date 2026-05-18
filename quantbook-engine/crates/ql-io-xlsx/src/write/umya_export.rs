@@ -339,6 +339,24 @@ pub(crate) fn export_new_workbook(
     // `<definedName name="X" [localSheetId="N"]>target</definedName>`.
     let defined_names = collect_defined_names(workbook)?;
 
+    // **W5-D-PM-3 (megaudit Opus-A HIGH-2 closure):** populate
+    // `report.dropped_features` with names that couldn't be rendered
+    // (Constant(Error)/Constant(Blank) targets). `collect_defined_names`
+    // silently drops these; without this surfacing, NewWorkbook
+    // Strict mode never fires for them.
+    let dropped_named_count = count_undeserializable_names(workbook);
+    for _ in 0..dropped_named_count {
+        report
+            .dropped_features
+            .push(crate::report::UnsupportedFeature {
+                kind: crate::error::UnsupportedFeatureKind::Other("named-range-constant"),
+                part: "xl/workbook.xml".to_string(),
+                detail: "named range with Error/Blank constant target cannot \
+                         serialize to OOXML formula text"
+                    .to_string(),
+            });
+    }
+
     // **W5-D-14.2 (HIGH-3 closure):** collect tables. Tables write to
     // their own `xl/tables/table{N}.xml` parts AND require updates to
     // sheet rels + worksheet `<tableParts>` + `[Content_Types].xml`.
@@ -972,6 +990,31 @@ struct DefinedNameOut {
 /// Walk Quantbook's `NameTable` and render each name as a
 /// `DefinedNameOut`. Sheet-name lookups go through the workbook's
 /// `Sheet::name()` (case-preserving display).
+/// **W5-D-PM-3 (megaudit Opus-A HIGH-2 closure):** count named
+/// targets whose `render_named_target` returns None — these will
+/// be silently dropped from the export. The count is used to
+/// populate `XlsxExportReport.dropped_features` so Strict mode can
+/// fire on them.
+fn count_undeserializable_names(workbook: &Workbook) -> usize {
+    let mut count = 0;
+    for (_name, target) in workbook.names().iter() {
+        if render_named_target(workbook, target).is_none() {
+            count += 1;
+        }
+    }
+    let sheet_count = workbook.sheet_count();
+    for sheet_idx in 0..sheet_count {
+        if let Some(sheet) = workbook.sheet(sheet_idx as u16) {
+            for (_name, target) in sheet.scoped_names().iter() {
+                if render_named_target(workbook, target).is_none() {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
 fn collect_defined_names(workbook: &Workbook) -> Result<Vec<DefinedNameOut>, XlsxError> {
     let mut out: Vec<DefinedNameOut> = Vec::new();
 
