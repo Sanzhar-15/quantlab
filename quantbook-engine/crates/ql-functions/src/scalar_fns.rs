@@ -665,7 +665,15 @@ pub fn r#mod(args: &[Value]) -> Value {
     }
     // Excel: MOD(x, d) = x - d * INT(x/d), result has sign of d.
     let result = x - d * (x / d).floor();
-    Value::Number(result)
+    // **W5-D-PM12-1 (megaudit Codex HIGH-2 closure):** sanitize the
+    // result so non-finite outcomes (overflow / NaN from edge inputs
+    // like `MOD(f64::MAX, f64::MIN_POSITIVE)`) surface as `#NUM!`
+    // instead of leaking into `Value::Number(Inf)`. Per the
+    // ql_types::coercion contract.
+    match ql_types::sanitize_f64(result) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
 }
 
 /// `POWER(base, exponent)` — same semantics as `Operator::Pow`.
@@ -1355,7 +1363,13 @@ pub fn quotient(args: &[Value]) -> Value {
     if den == 0.0 {
         return Value::Error(ErrorValue::DivZero);
     }
-    Value::Number((num / den).trunc())
+    // **W5-D-PM12-1 (megaudit Codex HIGH-2 closure):** sanitize for
+    // overflow / NaN. `QUOTIENT(f64::MAX, f64::MIN_POSITIVE).trunc()`
+    // is `Inf`; we surface `#NUM!` per the contract.
+    match ql_types::sanitize_f64((num / den).trunc()) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
 }
 
 /// Helper for GCD / LCM: collect args as non-negative integers.
@@ -4555,6 +4569,41 @@ mod tests {
     #[test]
     fn mod_zero_divisor() {
         assert_eq!(r#mod(&[n(10.0), n(0.0)]), Value::Error(ErrorValue::DivZero));
+    }
+
+    #[test]
+    fn w5_d_pm12_1_mod_overflow_sanitized_to_num_error() {
+        // **W5-D-PM12-1 (megaudit Codex HIGH-2 closure):** MOD must
+        // surface non-finite results as #NUM!, not leak as
+        // Value::Number(Inf/NaN).
+        let result = r#mod(&[n(f64::MAX), n(f64::MIN_POSITIVE)]);
+        assert!(
+            matches!(result, Value::Error(ErrorValue::Num)) || matches!(result, Value::Number(_)),
+            "MOD must not leak NaN/Inf; got {:?}",
+            result
+        );
+        // If finite, sanity-check the value.
+        if let Value::Number(n_val) = result {
+            assert!(n_val.is_finite(), "MOD result must be finite, got {n_val}");
+        }
+    }
+
+    #[test]
+    fn w5_d_pm12_1_quotient_overflow_sanitized_to_num_error() {
+        // **W5-D-PM12-1 (megaudit Codex HIGH-2 closure):** QUOTIENT
+        // overflow → #NUM!, not Number(Inf).
+        let result = quotient(&[n(f64::MAX), n(f64::MIN_POSITIVE)]);
+        assert!(
+            matches!(result, Value::Error(ErrorValue::Num)) || matches!(result, Value::Number(_)),
+            "QUOTIENT must not leak NaN/Inf; got {:?}",
+            result
+        );
+        if let Value::Number(n_val) = result {
+            assert!(
+                n_val.is_finite(),
+                "QUOTIENT result must be finite, got {n_val}"
+            );
+        }
     }
 
     #[test]

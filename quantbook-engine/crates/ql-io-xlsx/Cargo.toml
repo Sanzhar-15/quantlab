@@ -37,3 +37,6 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 # Test fixtures live in this crate; tests load .xlsx via ql_io_xlsx itself.
+# Phase 4.12 megaudit Opus-A: `opus_a_phase_4_12_ide_proof.rs` exercises the
+# IDE proof point (xlsx → .qbook → xlsx) which requires ql-oplog persistence.
+ql-oplog = { path = "../ql-oplog" }

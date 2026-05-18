@@ -2141,6 +2141,7 @@ dependencies = [
  "calamine",
  "ql-exec",
  "ql-functions",
+ "ql-oplog",
  "ql-storage",
  "ql-types",
  "quick-xml 0.36.2",

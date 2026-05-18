@@ -693,6 +693,16 @@ pub fn networkdays_ctx(args: &[Value], ctx: &EvalContext) -> Value {
     if matches!(ctx.date_system, DateSystem::Excel1900) && (start_int == 0 || end_int == 0) {
         return Value::Error(ErrorValue::Num);
     }
+    // **W5-D-PM12-1 (megaudit Codex HIGH-1 closure):** both endpoints
+    // must be within the legal Excel serial-date range. Without this
+    // check, `NETWORKDAYS(1, 1_000_000_000_000)` would iterate a
+    // ~1-trillion-element loop. `MAX_EXCEL_SERIAL_DAY = 2_958_465`
+    // (12/31/9999).
+    if !(0..=ql_types::MAX_EXCEL_SERIAL_DAY).contains(&start_int)
+        || !(0..=ql_types::MAX_EXCEL_SERIAL_DAY).contains(&end_int)
+    {
+        return Value::Error(ErrorValue::Num);
+    }
     let (lo, hi, sign) = if start_int <= end_int {
         (start_int, end_int, 1i64)
     } else {
@@ -729,6 +739,15 @@ pub fn workday_ctx(args: &[Value], ctx: &EvalContext) -> Value {
     // **W5-76 (Phase 4.5 mega-audit MEDIUM, serial-0 policy):** reject
     // Excel1900 serial 0 at start. Mirrors WEEKDAY / NETWORKDAYS.
     if matches!(ctx.date_system, DateSystem::Excel1900) && cur == 0 {
+        return Value::Error(ErrorValue::Num);
+    }
+    // **W5-D-PM12-1 (megaudit Codex HIGH-1 closure):** start must be a
+    // legal Excel serial date. Without this check,
+    // `WORKDAY(1_000_000_000_000, 0)` returned the huge serial
+    // unchanged; `WORKDAY(-1, 0)` returned a negative serial. Both
+    // violate the date-serial contract (`MAX_EXCEL_SERIAL_DAY =
+    // 2_958_465`).
+    if !(0..=ql_types::MAX_EXCEL_SERIAL_DAY).contains(&cur) {
         return Value::Error(ErrorValue::Num);
     }
     if days == 0 {
@@ -1650,6 +1669,42 @@ mod tests_wave3 {
         assert_eq!(
             workday_ctx(&[start, n(1.0), n(0.0)], &ctx_1900()),
             Value::Error(ErrorValue::Value)
+        );
+    }
+
+    #[test]
+    fn w5_d_pm12_1_workday_out_of_range_start_rejected() {
+        // **W5-D-PM12-1 (megaudit Codex HIGH-1 closure):**
+        // WORKDAY(1e12, 0) must return #NUM!, not echo the bogus
+        // serial back. WORKDAY(-1, 0) similarly.
+        assert_eq!(
+            workday_ctx(&[n(1e12), n(0.0)], &ctx_1900()),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            workday_ctx(&[n(-1.0), n(0.0)], &ctx_1900()),
+            Value::Error(ErrorValue::Num)
+        );
+        // One past MAX_EXCEL_SERIAL_DAY (12/31/9999):
+        let oob = (ql_types::MAX_EXCEL_SERIAL_DAY as f64) + 1.0;
+        assert_eq!(
+            workday_ctx(&[n(oob), n(0.0)], &ctx_1900()),
+            Value::Error(ErrorValue::Num)
+        );
+    }
+
+    #[test]
+    fn w5_d_pm12_1_networkdays_out_of_range_endpoints_rejected() {
+        // **W5-D-PM12-1 (megaudit Codex HIGH-1 closure):**
+        // NETWORKDAYS(1, 1e12) would have iterated ~1-trillion loop;
+        // must return #NUM! immediately.
+        assert_eq!(
+            networkdays_ctx(&[n(1.0), n(1e12)], &ctx_1900()),
+            Value::Error(ErrorValue::Num)
+        );
+        assert_eq!(
+            networkdays_ctx(&[n(-100.0), n(1.0)], &ctx_1900()),
+            Value::Error(ErrorValue::Num)
         );
     }
 
