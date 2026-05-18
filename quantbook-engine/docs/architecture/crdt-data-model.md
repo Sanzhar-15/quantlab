@@ -1,11 +1,15 @@
 ---
 title: Phase 5.1 — CRDT Data Model Decision (Loro Container Shape)
-status: DRAFT — design awaiting audit checkpoint + user sign-off
+status: AUDIT-CLOSED — Codex + Opus design review complete; revisions applied
 phase: 5.1
 date: 2026-05-18
+revised: 2026-05-19 (post-audit corrections)
 predecessor: docs/phase5/entry-plan.md
 master_plan: docs/MASTER-PLAN.md § Phase 5 § 5.1
-audit_required: parallel Codex + separate-Opus design review BEFORE 5.2 code
+audit_transcripts:
+  - docs/audits/2026-05-19-phase-5-1-codex.md
+  - docs/audits/2026-05-19-phase-5-1-opus.md
+  - docs/audits/2026-05-19-phase-5-1-consolidated.md
 ---
 
 # Phase 5.1 — CRDT Data Model Decision
@@ -93,11 +97,25 @@ on by:
 The result: if peer A pushes `Op::PutValue { A1, 5 }` and peer B
 pushes `Op::PutValue { A1, 7 }` concurrently, the merged log
 contains BOTH ops in causal order. Deterministic replay then
-applies them in that order → final value = 7 (later in causal
-order).
+applies them in that order → final value = whichever op came
+later in the deterministic merge order.
 
-This **is** last-writer-wins on Lamport timestamps. It is the
-canonical CRDT-list semantic. We get it for free from Loro.
+**Post-audit correction (2026-05-19, Codex V1):** the pre-audit
+draft of this section claimed Loro's merge rule is "Lamport
+timestamp" and the resulting semantic is "LWW on Lamport
+timestamps." Both descriptions were imprecise. The actual Loro
+merge rule (verified against `loro-internal-1.12.0/src/container/richtext/tracker/crdt_rope.rs:163,192`)
+is **Fugue/origin-based ordering with peer-id tiebreaker** for
+concurrent inserts at the same origin position. Both pushes
+are preserved (not overwritten); the merged order is
+deterministic and receive-order-independent given unique peer
+IDs. The SEMANTIC LWW outcome at the engine level — "whichever
+peer's PutValue ran last wins the cell value" — emerges
+because deterministic replay applies both ops in causal/origin
+order and the second write overwrites the first. We get this
+for free from Loro + the engine's deterministic replay path
+(Phase 4); we do NOT get it from Loro alone choosing one push
+over the other.
 
 ## Why Option A is the right Phase 5 V1
 
@@ -406,45 +424,175 @@ Audit transcripts will land at:
 No 5.2 commits land until the consolidated audit doc is signed
 off.
 
-## Open questions for the audit checkpoint
+## Post-audit decisions (2026-05-19)
 
-1. **Op-log compaction policy**: at what version-vector age do
-   we trim old ops? Master plan § 5.5 says
-   `ShallowSnapshot` is the answer; 5.1 design defers the
-   when-to-snapshot policy to 5.5.
+The parallel Codex + Opus audit (transcripts in `docs/audits/2026-05-19-phase-5-1-{codex,opus,consolidated}.md`)
+closed the gating audit checkpoint. Decisions locked in:
 
-2. **Per-peer peer-IDs**: how are peer IDs assigned? Loro's
-   default is per-doc random `u64`; for collaboration we likely
-   want stable user-derived IDs. 5.2 picks.
+### D-1: Format-id wire format changes — `FormatId = { peer_id, counter }`
 
-3. **`Op::BatchCommit` atomicity under merge**: today's replay
-   applies a batch's inner ops sequentially. With concurrent
-   peer appends, the inner ops are STILL contiguous in the
-   merged log (Loro preserves list-push contiguity per
-   peer). Verify this with Loro docs + a probe test.
+**Source:** Opus H-1 + Codex V4 (independent confirmations).
 
-4. **Sheet-rename cross-peer correctness**: peer A renames
-   sheet "S" → "X" while peer B writes a cell with
-   `=S!A1+1`. After merge:
-   - If A's RenameSheet op is causally-before B's PutFormula:
-     B's formula text references "S" which no longer exists →
-     bind fails → `#NAME?`. Correct.
-   - If B's PutFormula is causally-before A's RenameSheet: A's
-     producer-side rewrite should catch B's text and emit a
-     PutFormula correcting it. But A doesn't see B's op until
-     merge → A's BatchCommit may not include the rewrite for
-     B's text. Bug? Phase 5.3 must address.
+The pre-audit design left format-id collision resolution as
+open question 5 ("Phase 5.3 may switch to UUID"). Audit
+verified the collision is a real bug: two peers concurrently
+calling `intern_format("X")` and `intern_format("Y")` both
+predict next-id N from the same workbook base, both emit
+`Op::RegisterFormat { id: N, string: <different> }`. Replay's
+`FormatTable::register_at` rejects the second with
+`FormatRejectedSource::IdCollision`. Result: replay fails
+deterministically rather than merging cleanly.
 
-5. **Format id collision**: two peers each call
-   `intern_format("X")` concurrently → both emit
-   `RegisterFormat { id: N, string: "X" }` with the SAME
-   predicted id. On merge, replay sees two register ops at the
-   same id with the same string → idempotent OK. But what
-   about `intern_format("X")` × `intern_format("Y")` predicting
-   id N? Two different strings at the same id → replay's
-   `FormatTable::register_at` rejects the second with
-   `FormatRejectedSource::IdCollision`. Phase 5.3 must
-   resolve.
+**Resolution:** Phase 5.2 changes `FormatId` from `u32` to a
+tagged tuple:
+
+```rust
+pub enum FormatId {
+    Builtin(u32),        // Excel-canonical ids 0–163 (unchanged)
+    Custom(PeerId, u32), // Phase 5 custom ids: peer-id + per-peer counter
+}
+```
+
+Each peer's allocator increments only its own `Custom` counter;
+two peers can't collide. Built-in ids stay `u32` for round-trip
+with Excel's id space.
+
+**Schema impact:**
+- `Op::RegisterFormat.id`, `Op::SetCellFormat.id`,
+  `ql_storage::FormatId`, `Workbook::formats_mut().intern`
+  signature, `.qbook` envelope cell-format-id encoding, xlsx
+  `cellXfs` numFmtId mapping all change.
+- Wire-format bump: `WORKBOOK_SCHEMA_VERSION` increments.
+- Backwards compat: old `.qbook` files with `u32` ids load as
+  `FormatId::Builtin(n)` if `n ≤ 163` or
+  `FormatId::Custom(LegacyPeer, n - FIRST_CUSTOM_FORMAT_ID)`
+  for migration. (Phase 5.2 designs the migration path.)
+
+**Why not UUID?** UUIDs are bigger (128-bit), opaque to humans,
+and don't carry the peer-of-origin information that
+collaboration tooling wants. The tagged tuple gives the same
+collision-freedom with better debuggability.
+
+### D-2: AddSheet name collision — auto-rename in 5.2
+
+**Source:** Opus H-3.
+
+The pre-audit design said "AddSheet S × AddSheet S → first
+wins; second errors via NameRejected" with auto-rename
+deferred to Phase 5.3. Audit pushed back: spreadsheet users
+expect Google Sheets behavior where both adds succeed with
+auto-disambiguation (S and S(2)). Silent rejection of the
+second is worse UX than auto-rename.
+
+**Resolution:** Phase 5.2 acceptance criterion: AddSheet
+collision auto-renames the SECOND ADD (in deterministic merge
+order) to `<name>(2)`. If `<name>(2)` is also taken, escalate
+to `<name>(3)`, etc.
+
+This is a producer/replay path change, not a wire-format
+change. The `Op::AddSheet { name }` op is unchanged; replay
+re-resolves the final name at apply time when a collision is
+detected. Producer-side emits the original name; replay-side
+disambiguates.
+
+### D-3: RenameSheet × concurrent edit — known V1 limitation
+
+**Source:** Opus H-2 + Codex V5.
+
+The pre-audit design described this as "edit's formula text
+references the old name → bind fails → `#NAME?`." Codex
+verified the actual bug shape:
+
+- Bind error type is `BindError::UnknownSheet("S")`, NOT
+  `BindError::UnresolvedName("S")` (different code path).
+- `recompute_all` (post-Tier-C1) does NOT map
+  `BindError::UnknownSheet` to `Value::Error(ErrorValue::Name)`
+  — only `UnknownTable` and `UnknownTableColumn` get that
+  treatment in `cells.rs::recompute_dirty` and `recompute_all`
+  (`workbook_runtime/recompute.rs:179`).
+- Result: the cell retains its stale pre-recompute value AND
+  the formula appears as a `RecomputeFailure` in
+  `RecomputeResult::failures`. Worse than `#NAME?` — the user
+  sees the formula text but a wrong value.
+
+**Resolution:** Phase 5.2 adds the missing
+`BindError::UnknownSheet → ErrorValue::Name` mapping in
+`recompute_all` and `recompute_dirty` so the cell at least
+shows `#NAME?` after the merge. Phase 5.3 adds a causality-
+aware rename-repair pass: at merge time, the replay sweep
+walks formulas added causally-before the RenameSheet op and
+rewrites their text in-place (the same way the producer-side
+rename does for visible formulas).
+
+Documented as a **known Phase 5.2 V1 limitation**: concurrent
+cross-sheet formula additions may surface as `#NAME?` until
+manual edit or until 5.3 ships the causality-aware repair.
+
+### D-4: Spill semantics — replay defers to recompute, not per-op
+
+**Source:** Codex V3.
+
+The pre-audit design described spill semantics as "set_formula-
+before-set_value-at-target ordering preserved by op log." This
+described the producer-side path, but **replay does not work
+that way**.
+
+Codex's verification (`crates/ql-oplog/src/replay.rs:328`):
+replay's `PutFormula` handler stores the formula text via
+`workbook.put_formula(...)` but does NOT evaluate the formula
+nor materialize the spill. Spills are derived from final
+replay state by `recompute_all`/`recompute_dirty` AFTER replay
+completes. The `write_spill` blocking check
+(`cells.rs:669`) runs at recompute time, not at replay time.
+
+**Implication for CRDT correctness:** concurrent
+`PutFormula(A1, "SEQUENCE(3)")` + `PutValue(A2, 5)` from two
+peers produces the same recompute outcome regardless of merge
+order, because:
+
+1. Replay applies both ops (in either order) — final workbook
+   state has A1's formula text + A2's literal value.
+2. `recompute_all` is called once post-replay.
+3. `recompute_all` evaluates A1's formula → array result
+   → `write_spill` checks A2 → A2 is occupied → spill blocked
+   → A1 emits `#SPILL!`.
+
+The CRDT correctness story holds, but for a different reason
+than the pre-audit draft claimed. Updated wording in this
+revision.
+
+## Open questions — post-audit status
+
+All 5 pre-audit open questions are resolved or formally deferred
+post the 2026-05-19 audit. Status summary:
+
+1. **Op-log compaction policy** — deferred to Phase 5.5
+   (unchanged). Opus L-1 adds a 5.2 acceptance criterion: a
+   probe test exercising 1M ops measures export size with vs
+   without `ExportMode::ShallowSnapshot` to set a baseline.
+
+2. **Per-peer peer-IDs** — deferred to Phase 5.2 (unchanged).
+   Loro's default is per-doc random `u64`; Phase 5.2 wires
+   stable user-derived IDs at session-start.
+
+3. **`Op::BatchCommit` atomicity under merge** — **VERIFIED
+   correct** by Codex V2. `OpLog::append` serializes the whole
+   `BatchCommit { ops: Vec<Op> }` as ONE JSON blob and pushes
+   ONCE into the LoroList. A concurrent peer's op can land
+   before or after the BatchCommit entry but cannot interleave
+   between its nested ops. Atomicity holds.
+
+4. **Sheet-rename cross-peer correctness** — **partially
+   addressed by D-3** (above). The actual bug shape is
+   `BindError::UnknownSheet` not mapped to `#NAME?` by
+   recompute_all. Phase 5.2 adds the missing mapping; Phase 5.3
+   adds the causality-aware rename-repair pass. Documented as
+   a known V1 limitation.
+
+5. **Format id collision** — **CLOSED in 5.1 by D-1** (above).
+   `FormatId` switches from `u32` to a tagged tuple
+   (Builtin | Custom(peer_id, counter)) in Phase 5.2. Schema
+   bump documented; backwards-compat migration path defined.
 
 ## Cross-references
 
