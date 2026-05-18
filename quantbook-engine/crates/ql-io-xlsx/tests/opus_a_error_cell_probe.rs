@@ -1,6 +1,8 @@
 //! Investigate why Error cells become Text on round-trip.
 
-use ql_io_xlsx::{export_xlsx_path, import_xlsx_path, RecomputeMode, XlsxExportOptions, XlsxImportOptions};
+use ql_io_xlsx::{
+    export_xlsx_path, import_xlsx_path, RecomputeMode, XlsxExportOptions, XlsxImportOptions,
+};
 use ql_storage::Workbook;
 use ql_types::{ErrorValue, Value};
 

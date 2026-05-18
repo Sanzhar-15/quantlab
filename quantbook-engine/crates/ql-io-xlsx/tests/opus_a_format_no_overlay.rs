@@ -1,7 +1,9 @@
 //! Probe: workbook registers custom format codes (164+) but no cells
 //! use them via the overlay. Does the format code still survive round-trip?
 
-use ql_io_xlsx::{export_xlsx_path, import_xlsx_path, RecomputeMode, XlsxExportOptions, XlsxImportOptions};
+use ql_io_xlsx::{
+    export_xlsx_path, import_xlsx_path, RecomputeMode, XlsxExportOptions, XlsxImportOptions,
+};
 use ql_storage::Workbook;
 use ql_types::Value;
 
@@ -33,7 +35,15 @@ fn format_registered_but_not_used_anywhere_round_trips() {
         println!("--- xl/styles.xml ---\n{}", sx);
     }
 
-    let r = import_xlsx_path(&tmp, &registry(), XlsxImportOptions { recompute: RecomputeMode::Skip, ..Default::default() }).unwrap();
+    let r = import_xlsx_path(
+        &tmp,
+        &registry(),
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     println!("--- after re-import ---");
     for (id, c) in r.workbook.formats().iter() {
         if id.0 >= ql_storage::FIRST_CUSTOM_FORMAT_ID {
@@ -62,7 +72,7 @@ fn overlay_on_unpopulated_builtin() {
         let sheet = wb.sheet_mut(s).unwrap();
         sheet.format_overlay_mut().set(0, 0, FormatId(38)); // not pre-populated; renders as color
         sheet.format_overlay_mut().set(0, 1, FormatId(46)); // also not pre-populated
-        sheet.format_overlay_mut().set(0, 2, FormatId(9));  // pre-populated "0%"
+        sheet.format_overlay_mut().set(0, 2, FormatId(9)); // pre-populated "0%"
     }
     let tmp = std::env::temp_dir().join("opus-a-unpopulated-builtin.xlsx");
     let _ = std::fs::remove_file(&tmp);
@@ -80,13 +90,26 @@ fn overlay_on_unpopulated_builtin() {
         e.read_to_string(&mut sx).unwrap();
         println!("--- sheet1.xml ---\n{}", sx);
     }
-    let r = import_xlsx_path(&tmp, &registry(), XlsxImportOptions { recompute: RecomputeMode::Skip, ..Default::default() }).unwrap();
+    let r = import_xlsx_path(
+        &tmp,
+        &registry(),
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let sheet2 = r.workbook.sheet(s).unwrap();
     for c in 0..3 {
         let v = sheet2.read(0, c);
         let f = sheet2.format_overlay().get(0, c);
-        println!("(0,{}) value={:?} overlay={:?} ({:?})",
-            c, v, f, f.and_then(|i| r.workbook.formats().lookup(i)));
+        println!(
+            "(0,{}) value={:?} overlay={:?} ({:?})",
+            c,
+            v,
+            f,
+            f.and_then(|i| r.workbook.formats().lookup(i))
+        );
     }
     let _ = std::fs::remove_file(&tmp);
 }
@@ -99,6 +122,9 @@ fn empty_workbook_round_trip() {
     let tmp = std::env::temp_dir().join("opus-a-empty.xlsx");
     let _ = std::fs::remove_file(&tmp);
     let r = export_xlsx_path(&wb, &registry(), &tmp, XlsxExportOptions::default());
-    println!("export empty workbook: {:?}", r.as_ref().err().map(|e| format!("{e}")));
+    println!(
+        "export empty workbook: {:?}",
+        r.as_ref().err().map(|e| format!("{e}"))
+    );
     let _ = std::fs::remove_file(&tmp);
 }

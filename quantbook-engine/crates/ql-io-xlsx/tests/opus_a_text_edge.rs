@@ -1,6 +1,8 @@
 //! Text edge cases.
 
-use ql_io_xlsx::{export_xlsx_path, import_xlsx_path, RecomputeMode, XlsxExportOptions, XlsxImportOptions};
+use ql_io_xlsx::{
+    export_xlsx_path, import_xlsx_path, RecomputeMode, XlsxExportOptions, XlsxImportOptions,
+};
 use ql_storage::Workbook;
 use ql_types::Value;
 
@@ -17,7 +19,7 @@ fn text_with_whitespace_xml_chars_newlines() {
     wb.put_at(s, 0, 1, Value::text("multi\nline\ntext"));
     wb.put_at(s, 0, 2, Value::text("xml-bad: < & > \" '"));
     wb.put_at(s, 0, 3, Value::text("tabs\there"));
-    wb.put_at(s, 0, 4, Value::text(""));    // empty string
+    wb.put_at(s, 0, 4, Value::text("")); // empty string
     wb.put_at(s, 0, 5, Value::text("\u{0009}control"));
     wb.put_at(s, 0, 6, Value::text("emoji ❤️🎉 mix"));
 
@@ -25,7 +27,15 @@ fn text_with_whitespace_xml_chars_newlines() {
     let _ = std::fs::remove_file(&tmp);
     export_xlsx_path(&wb, &registry(), &tmp, XlsxExportOptions::default()).unwrap();
 
-    let r = import_xlsx_path(&tmp, &registry(), XlsxImportOptions { recompute: RecomputeMode::Skip, ..Default::default() }).unwrap();
+    let r = import_xlsx_path(
+        &tmp,
+        &registry(),
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let sheet = r.workbook.sheet(s).unwrap();
     for c in 0..7 {
         let orig = wb.sheet(s).unwrap().read(0, c);
@@ -50,10 +60,22 @@ fn very_long_text() {
     let tmp = std::env::temp_dir().join("opus-a-huge-text.xlsx");
     let _ = std::fs::remove_file(&tmp);
     export_xlsx_path(&wb, &registry(), &tmp, XlsxExportOptions::default()).unwrap();
-    let r = import_xlsx_path(&tmp, &registry(), XlsxImportOptions { recompute: RecomputeMode::Skip, ..Default::default() }).unwrap();
+    let r = import_xlsx_path(
+        &tmp,
+        &registry(),
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let back = r.workbook.sheet(s).unwrap().read(0, 0);
     match back {
-        Value::Text(t) => println!("huge text round-trip len={} (orig={})", t.as_ref().len(), huge.len()),
+        Value::Text(t) => println!(
+            "huge text round-trip len={} (orig={})",
+            t.as_ref().len(),
+            huge.len()
+        ),
         other => println!("UNEXPECTED: {:?}", other),
     }
     let _ = std::fs::remove_file(&tmp);
@@ -82,7 +104,15 @@ fn date1900_survives() {
         println!("date1900 export workbook.xml: {}", sx);
     }
 
-    let r = import_xlsx_path(&tmp, &registry(), XlsxImportOptions { recompute: RecomputeMode::Skip, ..Default::default() }).unwrap();
+    let r = import_xlsx_path(
+        &tmp,
+        &registry(),
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     println!("imported date system: {:?}", r.workbook.date_system());
     let _ = std::fs::remove_file(&tmp);
 }

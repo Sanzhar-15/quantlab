@@ -26,10 +26,16 @@ fn skip_cache_round_trip_behavior() {
 
     let tmp = std::env::temp_dir().join("opus-a-skipcache.xlsx");
     let _ = std::fs::remove_file(&tmp);
-    let rep = export_xlsx_path(&wb, &registry(), &tmp, XlsxExportOptions {
-        formula_cache: FormulaCachePolicy::SkipCache,
-        ..Default::default()
-    }).unwrap();
+    let rep = export_xlsx_path(
+        &wb,
+        &registry(),
+        &tmp,
+        XlsxExportOptions {
+            formula_cache: FormulaCachePolicy::SkipCache,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     println!("formula_caches_written={}", rep.formula_caches_written);
 
     // Inspect XML.
@@ -43,7 +49,15 @@ fn skip_cache_round_trip_behavior() {
     }
 
     // Re-import with Skip — preserves whatever was written.
-    let r = import_xlsx_path(&tmp, &registry(), XlsxImportOptions { recompute: RecomputeMode::Skip, ..Default::default() }).unwrap();
+    let r = import_xlsx_path(
+        &tmp,
+        &registry(),
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let sheet = r.workbook.sheet(s).unwrap();
     println!("(0,0)={:?}", sheet.read(0, 0));
     println!("(0,1)={:?}", sheet.read(0, 1));
@@ -66,11 +80,28 @@ fn recompute_strict_on_unknown_function() {
     let _ = std::fs::remove_file(&tmp);
     export_xlsx_path(&wb, &registry(), &tmp, XlsxExportOptions::default()).unwrap();
 
-    let r = import_xlsx_path(&tmp, &registry(), XlsxImportOptions { recompute: RecomputeMode::Strict, ..Default::default() });
-    println!("strict-recompute outcome: {:?}", r.as_ref().err().map(|e| format!("{e}")));
+    let r = import_xlsx_path(
+        &tmp,
+        &registry(),
+        XlsxImportOptions {
+            recompute: RecomputeMode::Strict,
+            ..Default::default()
+        },
+    );
+    println!(
+        "strict-recompute outcome: {:?}",
+        r.as_ref().err().map(|e| format!("{e}"))
+    );
 
     // BestEffort should succeed.
-    let r2 = import_xlsx_path(&tmp, &registry(), XlsxImportOptions { recompute: RecomputeMode::BestEffort, ..Default::default() });
+    let r2 = import_xlsx_path(
+        &tmp,
+        &registry(),
+        XlsxImportOptions {
+            recompute: RecomputeMode::BestEffort,
+            ..Default::default()
+        },
+    );
     match r2 {
         Ok(rr) => {
             println!("besteffort: failures={}", rr.report.formula_failures.len());
