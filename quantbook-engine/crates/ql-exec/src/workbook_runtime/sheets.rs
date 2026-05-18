@@ -332,4 +332,53 @@ mod tests {
             Value::Number(11.0)
         );
     }
+
+    // ===== W5-93 (Phase 4.6.E closure) — add_sheet pre-validation =====
+    //
+    // **Tier D1 Step 3.4 cleanup:** these add_sheet tests were missed
+    // by Step 3.3 (left behind under the original W5-93 banner in
+    // mod.rs). Moved here alongside Step 3.4's names extraction.
+
+    #[test]
+    fn add_sheet_rejects_canonical_duplicate() {
+        // Codex HIGH-1: WorkbookRuntime::add_sheet must pre-validate.
+        let mut wb = Workbook::new();
+        wb.add_sheet("Sheet1");
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt.add_sheet("SHEET1", 16).unwrap_err();
+        assert!(matches!(err, RuntimeError::SheetName(_)));
+        // Workbook unchanged (only the original sheet).
+        drop(rt);
+        assert_eq!(wb.sheet_count(), 1);
+    }
+
+    #[test]
+    fn add_sheet_rejects_reserved_char() {
+        let mut wb = Workbook::new();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt.add_sheet("Bad/Sheet", 16).unwrap_err();
+        assert!(matches!(err, RuntimeError::SheetName(_)));
+    }
+
+    #[test]
+    fn add_sheet_with_bad_name_emits_no_oplog_entry() {
+        // Pre-validation must run BEFORE the op log append so a bad
+        // name doesn't leave a phantom AddSheet in the log.
+        use ql_oplog::{Op, OpLog};
+        let mut wb = Workbook::new();
+        wb.add_sheet("Sheet1");
+        let reg = default_registry();
+        let mut log = OpLog::new();
+        let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut log);
+        let _ = rt.add_sheet("Sheet1", 16).unwrap_err();
+        drop(rt);
+        let ops: Vec<Op> = log.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(
+            ops.len(),
+            0,
+            "no Op::AddSheet for rejected name; got {ops:?}"
+        );
+    }
 }
