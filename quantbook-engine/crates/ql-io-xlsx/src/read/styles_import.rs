@@ -45,17 +45,40 @@ pub(crate) fn register_custom_formats(
             continue;
         }
         let id = FormatId(entry.num_fmt_id);
-        workbook
-            .formats_mut()
-            .register_at(id, &entry.format_code)
-            .map_err(|e| XlsxError::MalformedOoxml {
-                part: "xl/styles.xml".to_string(),
-                message: format!(
-                    "numFmt registration failed for id {}: {:?}",
-                    entry.num_fmt_id, e
-                ),
-            })?;
-        count += 1;
+        // **W5-D-14.1 (audit HIGH-8 closure):** real-world xlsx files
+        // from LibreOffice / Google Sheets sometimes emit
+        // `<numFmt numFmtId="164" formatCode="General"/>` — a
+        // declaration at a custom id (≥ 164) whose format string
+        // already exists as a built-in (id 0 = "General"). Quantbook's
+        // `FormatTable::register_at` rejects this with
+        // `StringCollision`. The Excel behavior is to accept the
+        // redundant declaration (the cell using `s` with `numFmtId=164`
+        // still renders as General). We treat collisions where the
+        // existing string matches as idempotent no-ops; only TRUE
+        // string collisions at the same id still error.
+        match workbook.formats_mut().register_at(id, &entry.format_code) {
+            Ok(()) => {
+                count += 1;
+            }
+            Err(ql_storage::FormatTableError::StringCollision { existing_id, .. }) => {
+                // The string is already registered at a DIFFERENT id
+                // (typically a built-in). The OOXML file re-declares
+                // it at a custom id — semantically redundant but
+                // benign. Skip silently; cells referencing the custom
+                // id will render via the existing (built-in) format.
+                let _ = existing_id;
+                continue;
+            }
+            Err(e) => {
+                return Err(XlsxError::MalformedOoxml {
+                    part: "xl/styles.xml".to_string(),
+                    message: format!(
+                        "numFmt registration failed for id {}: {:?}",
+                        entry.num_fmt_id, e
+                    ),
+                });
+            }
+        }
     }
     Ok(count)
 }
@@ -116,6 +139,28 @@ mod tests {
             wb.formats().lookup(FormatId(165)),
             Some("yyyy-mm-dd hh:mm:ss")
         );
+    }
+
+    #[test]
+    fn libreoffice_general_at_custom_id_is_idempotent() {
+        // **W5-D-14.1 (audit HIGH-8 closure):** LibreOffice's
+        // `libreoffice_888_example.xlsx` declares `<numFmt
+        // numFmtId="164" formatCode="General"/>`. The string "General"
+        // is already registered at id 0 (builtin). Previously this
+        // collision threw `MalformedOoxml`; the closure treats it as
+        // a benign no-op.
+        let mut wb = Workbook::new();
+        let baseline = wb.formats().len();
+        let idx = StyleIndex {
+            num_fmts: vec![NumFmtEntry {
+                num_fmt_id: 164,
+                format_code: "General".to_string(),
+            }],
+            cell_xfs: vec![],
+        };
+        let n = register_custom_formats(&mut wb, &idx).unwrap();
+        assert_eq!(n, 0, "redundant General declaration is not a new entry");
+        assert_eq!(wb.formats().len(), baseline);
     }
 
     #[test]

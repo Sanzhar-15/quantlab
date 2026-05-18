@@ -133,6 +133,174 @@ fn round_trip_ironcalc_basic_text_preserves_sheet_count() {
 }
 
 #[test]
+fn w5_d_14_1_round_trip_preserves_formula_with_cached_value() {
+    // **W5-D-14.1 (audit HIGH-1 closure):** umya's `set_value_*`
+    // setters internally call `remove_formula()`. The fix reorders
+    // the calls — apply value FIRST, then `set_formula`. This pins
+    // the round-trip behavior end-to-end.
+    use ql_storage::Workbook;
+    use ql_types::Value;
+
+    let registry = ql_functions::default_registry();
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("Sheet1");
+    wb.put_at(s, 0, 0, Value::Number(2.0));
+    wb.put_at(s, 0, 1, Value::Number(3.0));
+    // Formula cell with cached value.
+    wb.put_at(s, 0, 2, Value::Number(5.0));
+    wb.put_formula(s, 0, 2, "A1+B1");
+
+    let tmp = std::env::temp_dir().join("ql-io-xlsx-rt-formula-cache.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    export_xlsx_path(
+        &wb,
+        &registry,
+        &tmp,
+        XlsxExportOptions {
+            formula_cache: FormulaCachePolicy::WriteRecomputed,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Formula text preserved.
+    let formula = result.workbook.formula_at(0, 0, 2);
+    assert!(
+        formula.is_some(),
+        "formula at C1 should survive round-trip (W5-D-14.1 HIGH-1 closure)"
+    );
+    assert_eq!(formula.unwrap().as_ref(), "A1+B1");
+    // Cached value preserved.
+    assert_eq!(
+        result.workbook.sheet(0).unwrap().read(0, 2),
+        Value::Number(5.0)
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn w5_d_14_1_round_trip_preserves_date1904() {
+    // **W5-D-14.1 (audit HIGH-2 closure):** umya 2.2.0 doesn't expose
+    // workbookPr/@date1904. Our post-process zip patch injects the
+    // attribute when the source workbook is 1904. Verify round-trip.
+    use ql_storage::Workbook;
+    use ql_types::{DateSystem, Value};
+
+    let registry = ql_functions::default_registry();
+    let mut wb = Workbook::new();
+    wb.add_sheet("Sheet1");
+    wb.put_at(0, 0, 0, Value::Number(40000.0));
+    wb.set_date_system(DateSystem::Excel1904);
+
+    let tmp = std::env::temp_dir().join("ql-io-xlsx-rt-date1904.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        result.workbook.date_system(),
+        DateSystem::Excel1904,
+        "date1904 should round-trip (W5-D-14.1 HIGH-2 closure)"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn w5_d_14_1_round_trip_preserves_error_values() {
+    // **W5-D-14.1 (audit HIGH-6 closure):** error values now export
+    // via `Cell::set_error` (which routes through `guess_typed_data`
+    // → `CellRawValue::Error`), not `set_value_string` (which writes
+    // plain text). Verify all 7 Excel error sigils round-trip as
+    // `Value::Error(_)`, not `Value::Text("#…")`.
+    use ql_storage::Workbook;
+    use ql_types::{ErrorValue, Value};
+
+    let registry = ql_functions::default_registry();
+    let mut wb = Workbook::new();
+    wb.add_sheet("Sheet1");
+    let cases = [
+        ErrorValue::DivZero,
+        ErrorValue::NA,
+        ErrorValue::Name,
+        ErrorValue::Null,
+        ErrorValue::Num,
+        ErrorValue::Ref,
+        ErrorValue::Value,
+    ];
+    for (i, err) in cases.iter().enumerate() {
+        wb.put_at(0, i as u32, 0, Value::Error(*err));
+    }
+
+    let tmp = std::env::temp_dir().join("ql-io-xlsx-rt-errors.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for (i, err) in cases.iter().enumerate() {
+        let got = result.workbook.sheet(0).unwrap().read(i as u32, 0);
+        match got {
+            Value::Error(e) => assert_eq!(
+                e,
+                *err,
+                "error variant should match for sigil {}",
+                err.sigil()
+            ),
+            other => panic!("expected Error({err:?}), got {other:?}"),
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn w5_d_14_1_libreoffice_general_at_custom_id_does_not_error() {
+    // **W5-D-14.1 (audit HIGH-8 closure):** LibreOffice's
+    // `libreoffice_888_example.xlsx` declares
+    // `<numFmt numFmtId="164" formatCode="General"/>` which previously
+    // triggered `StringCollision` because "General" is already at
+    // builtin id 0. The closure makes redundant declarations benign.
+    let registry = ql_functions::default_registry();
+    let opts = XlsxImportOptions {
+        recompute: RecomputeMode::Skip,
+        ..Default::default()
+    };
+    let result = import_xlsx_path(
+        "../../.references/ironcalc/xlsx/tests/libreoffice_888_example.xlsx",
+        &registry,
+        opts,
+    );
+    assert!(
+        result.is_ok(),
+        "LibreOffice fixture should import after HIGH-8 closure, got {:?}",
+        result.err()
+    );
+}
+
+#[test]
 fn import_ironcalc_example_fixture_with_recompute_doesnt_panic() {
     // **W5-D-14a:** larger fixture with formulas. Run recompute in
     // best-effort mode. The point is: the pipeline doesn't panic

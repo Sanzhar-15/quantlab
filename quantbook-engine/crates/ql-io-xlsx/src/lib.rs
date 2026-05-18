@@ -152,9 +152,16 @@ pub fn import_xlsx_bytes(
     // with the workbook's TableTable. Tables are now available for
     // structured-ref binding (e.g. `=Sales[Qty]`) immediately after
     // import. Closes Phase 4.11 acceptance XLSX-4-03 (tables-side).
-    let sheet_names = grid.sheet_names();
+    //
+    // **W5-D-14.1 (audit HIGH-9 closure):** the sheet → rels-path map
+    // is now derived from `xl/_rels/workbook.xml.rels` (the
+    // OOXML-spec-correct path) instead of the prior 1:1 sheet-index
+    // heuristic. Real-world workbooks where sheets have been
+    // deleted/reordered no longer attach tables to the wrong sheet.
+    let _sheet_names_unused_post_w5_d_14_1 = grid.sheet_names();
+    let sheet_rels_paths = read::sheet_parts::build_sheet_rels_paths(&package, &workbook_props)?;
     let _tables_imported =
-        read::tables_import::import_tables(&package, &mut workbook, &sheet_names)?;
+        read::tables_import::import_tables(&package, &mut workbook, &sheet_rels_paths)?;
 
     // **W5-D-14d — Phase 2d**: import styles. Parses `xl/styles.xml`
     // for custom number formats (`numFmtId >= 164`) and registers
