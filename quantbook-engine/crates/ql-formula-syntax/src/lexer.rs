@@ -28,6 +28,16 @@ pub enum LexError {
     #[error("unterminated string literal")]
     UnterminatedString,
 
+    /// **W5-D-PM12-2 (megaudit Opus-B HIGH-4 closure):** a string
+    /// literal contained a control character (NUL, BEL, ESC, etc.).
+    /// Excel rejects these; adjacent ecosystems (TOML, JSONL, XLSX
+    /// shared-strings, C interop) treat NUL as either invalid or
+    /// string-terminating. Round-tripping silently would smuggle
+    /// invisible content past UI filters and corrupt the boundary
+    /// with C bindings.
+    #[error("control character {0:?} not allowed in string literal")]
+    ControlCharInString(char),
+
     #[error("invalid number: {0:?}")]
     InvalidNumber(String),
 
@@ -432,7 +442,19 @@ fn lex_string(chars: &mut Peekable<Chars>) -> Result<Token, LexError> {
                     return Ok(Token::String(Arc::from(s)));
                 }
             }
-            Some(c) => s.push(c),
+            Some(c) => {
+                // **W5-D-PM12-2 (megaudit Opus-B HIGH-4 closure):**
+                // reject control characters (NUL, BEL, ESC, etc.) in
+                // string literals. Excel rejects; downstream
+                // ecosystems (TOML, JSONL, XLSX shared-strings, C
+                // bindings) treat them as terminators or invalid.
+                // Tab / CR / LF are intentionally permitted —
+                // Excel allows them in cell text.
+                if c.is_control() && c != '\t' && c != '\n' && c != '\r' {
+                    return Err(LexError::ControlCharInString(c));
+                }
+                s.push(c);
+            }
         }
     }
 }

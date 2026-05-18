@@ -1,6 +1,6 @@
 ---
 title: Phase 4 exit packet (4.1 → 4.11 + 4.12 megaudit close)
-status: DRAFT (Phase 4.12 megaudit in flight 2026-05-18; will mark ACTIVE once closures land)
+status: ACTIVE — Phase 4.12 megaudit closed 2026-05-18. 5 of 19 HIGHs closed in W5-D-PM12-1/2/3 batches; remaining 14 deferred to Phase 5 prep with explicit rationale per `docs/audits/2026-05-18-phase-4-12-megaudit-consolidated.md`.
 date: 2026-05-18
 supersedes_pointer: docs/MASTER-PLAN.md
 ---
@@ -154,15 +154,36 @@ The two ⚠️ gaps are documented as forward work; not blocking ship.
    real Excel corpus is verified by Phase 4.12 Codex audit. Any
    divergences surfaced should be ranked + closed before 0.2.0.
 
-## Closure status
+## Closure status — ACTIVE
 
-This packet is DRAFT pending Phase 4.12 megaudit closures. Will
-flip to ACTIVE once:
-- All HIGH findings from Phase 4.12 megaudit are either closed or
-  explicitly deferred with rationale.
-- Master plan Phase 4 is marked COMPLETE.
-- Memory `current_work.md` is updated with the Phase 4 → Phase 5
-  handoff.
+Phase 4.12 megaudit closed 2026-05-18 with the 5-way parallel pass.
+19 unique HIGHs found; 5 closed in W5-D-PM12-1/2/3 batches; 14
+deferred to Phase 5 prep with rationale per
+`docs/audits/2026-05-18-phase-4-12-megaudit-consolidated.md`.
+
+The deferred HIGHs are quality / edge-case / architectural items
+that don't break the A4-01..A4-04 acceptance bar but represent real
+forward work. Each has explicit disposition:
+
+- **API-stability (BEFORE 0.2.0):** `#[non_exhaustive]` pass +
+  deprecated-field removal (3 HIGHs).
+- **Phase 5 prep architectural:** WorkbookRuntime monolith split,
+  ql-oplog ↔ ql-io cleanup, post-process Patcher (3 HIGHs).
+- **Persistence:** oplog.bin magic bytes (Phase 5 redesigns; 1 HIGH).
+- **Parser / binder:** literal-range bind, omitted-arg, recursion
+  depth (3 HIGHs).
+- **Recompute:** cycle detection, BatchCommit replay depth (2 HIGHs).
+- **Cross-feature:** TRANSPOSE × structured-ref, read_display ×
+  locale (2 HIGHs).
+
+Final commits this phase: `9134dad63a3` pre-artifacts →
+`347b73a6e7f` Codex closures → `004d77f39c1` audit docs →
+`9b6ad27e9d6` Opus-A/B audit docs + EVEN/ODD fix → THIS commit
+NUL-in-strings closure + consolidated doc + exit-packet ACTIVE.
+
+Phase 4 SHIPS. Phase 5 entry-state requirements per master plan
+verified: ✅ graph runtime exists (calcgraph in ql-exec), ✅ value /
+formula / name / table / format models stable.
 
 Co-author: Claude Opus 4.7 (1M context) per the session-long
 collaboration on Phase 4 implementation.
