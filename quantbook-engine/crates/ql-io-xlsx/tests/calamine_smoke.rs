@@ -967,6 +967,103 @@ fn w5_d_15_round_trip_dedup_shared_format_id() {
 }
 
 #[test]
+fn w5_d_15_1_empty_sheet_before_styled_sheet_preserves_alignment() {
+    // **W5-D-15.1 (Codex audit HIGH-3 closure):** the prior export
+    // logic skipped `sheet_fixes.push(fixes)` for empty-bounds
+    // sheets, misaligning the per-sheet fixes vector. A workbook
+    // with `[empty_sheet, styled_sheet]` would emit the styled
+    // sheet's fixes against `sheet1.xml` (the empty one) instead of
+    // `sheet2.xml`. This test pins the alignment by round-tripping
+    // a workbook with that exact shape.
+    use ql_storage::{FormatId, Workbook, FIRST_CUSTOM_FORMAT_ID};
+    use ql_types::Value;
+
+    let mut wb = Workbook::new();
+    let _empty = wb.add_sheet("Empty");
+    let styled = wb.add_sheet("Styled");
+    let custom = wb.formats_mut().intern("0.0000");
+    assert!(custom.0 >= FIRST_CUSTOM_FORMAT_ID);
+    wb.put_at(styled, 0, 0, Value::Number(42.0));
+    wb.sheet_mut(styled)
+        .unwrap()
+        .format_overlay_mut()
+        .set(0, 0, custom);
+
+    let tmp = std::env::temp_dir().join("w5-d-15-1-empty-then-styled.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+    export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(result.workbook.sheet_count(), 2);
+    // Empty sheet should NOT have a format overlay.
+    assert!(
+        result
+            .workbook
+            .sheet(0)
+            .unwrap()
+            .format_overlay()
+            .is_empty(),
+        "empty sheet should have no overlay (HIGH-3 misalignment regression)"
+    );
+    // Styled sheet should have the overlay at (0, 0).
+    assert_eq!(
+        result.workbook.sheet(1).unwrap().format_overlay().get(0, 0),
+        Some(FormatId(FIRST_CUSTOM_FORMAT_ID)),
+        "styled sheet at index 1 must have overlay preserved"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn w5_d_15_1_libreoffice_apply_number_format_default_true() {
+    // **W5-D-15.1 (self-audit H-2 closure):** LibreOffice-generated
+    // xlsx files commonly emit `<cellXfs>/<xf numFmtId="..." />` WITHOUT
+    // the `applyNumberFormat` attribute. Per OOXML spec, default is
+    // true (= apply the format). Prior to the fix, our parser
+    // defaulted to false and silently dropped these on import.
+    //
+    // The libreoffice fixture has cellXfs with numFmtId=165 +
+    // numFmtId=166 (custom formats) and NO applyNumberFormat attr.
+    // After the fix, at least one cell in the file should have a
+    // populated overlay entry referencing one of those custom ids.
+    let registry = ql_functions::default_registry();
+    let opts = XlsxImportOptions {
+        recompute: RecomputeMode::Skip,
+        ..Default::default()
+    };
+    let result = import_xlsx_path(
+        "../../.references/ironcalc/xlsx/tests/libreoffice_888_example.xlsx",
+        &registry,
+        opts,
+    )
+    .unwrap();
+    // At least one sheet should have at least one populated overlay
+    // entry from the fixture's cellXfs roster.
+    let any_overlay = (0..result.workbook.sheet_count() as u16).any(|sid| {
+        result
+            .workbook
+            .sheet(sid)
+            .map(|s| !s.format_overlay().is_empty())
+            .unwrap_or(false)
+    });
+    assert!(
+        any_overlay,
+        "libreoffice fixture should populate at least one format_overlay \
+         entry (W5-D-15.1 H-2 regression — applyNumberFormat default flipped)"
+    );
+}
+
+#[test]
 fn import_ironcalc_example_fixture_with_recompute_doesnt_panic() {
     // **W5-D-14a:** larger fixture with formulas. Run recompute in
     // best-effort mode. The point is: the pipeline doesn't panic

@@ -117,6 +117,15 @@ pub(crate) fn parse_styles_xml(package: &XlsxPackage) -> Result<StyleIndex, Xlsx
                 let tag = std::str::from_utf8(local_name.as_ref())
                     .unwrap_or("")
                     .to_string();
+                // **W5-D-15.1 (self-audit H-2 root-cause closure):**
+                // LibreOffice emits `<xf>...</xf>` (non-self-closing,
+                // with `<alignment>` / `<protection>` children) — those
+                // come through as `Event::Start`, NOT `Event::Empty`.
+                // Without this branch, every cellXf in a LibreOffice
+                // file was silently dropped from the index.
+                if tag == "xf" && element_stack.last().map(String::as_str) == Some("cellXfs") {
+                    idx.cell_xfs.push(parse_xf_attrs(&e));
+                }
                 element_stack.push(tag);
             }
             Event::Empty(e) => {
@@ -172,13 +181,22 @@ fn parse_numfmt_attrs(e: &quick_xml::events::BytesStart) -> Option<NumFmtEntry> 
 
 fn parse_xf_attrs(e: &quick_xml::events::BytesStart) -> CellXf {
     let mut num_fmt_id: u32 = 0;
-    let mut apply_number_format = false;
+    // **W5-D-15.1 (self-audit H-2 closure):** the OOXML schema
+    // default for `applyNumberFormat` on `<cellXfs>/<xf>` is TRUE
+    // when the attribute is absent. LibreOffice-generated files
+    // commonly omit the attr but still expect the numFmtId to be
+    // applied — verified empirically against
+    // `libreoffice_888_example.xlsx` (numFmtId=165 xf with no
+    // applyNumberFormat attr → format IS applied per the spec).
+    // The prior `false` default silently dropped these on import.
+    let mut apply_number_format = true;
     for attr in e.attributes().with_checks(false).flatten() {
         let key = attr.key.as_ref();
         let val = attr.unescape_value().unwrap_or_default();
         if key == b"numFmtId" {
             num_fmt_id = val.parse::<u32>().unwrap_or(0);
         } else if key == b"applyNumberFormat" {
+            // Explicit attr: "1"/"true" → apply; "0"/"false" → don't.
             apply_number_format = val == "1" || val.eq_ignore_ascii_case("true");
         }
     }
@@ -267,7 +285,10 @@ mod tests {
         // Only the 3 cellXfs, not the cellStyleXfs.
         assert_eq!(idx.cell_xfs.len(), 3);
         assert_eq!(idx.cell_xfs[0].num_fmt_id, 0);
-        assert!(!idx.cell_xfs[0].apply_number_format);
+        // **W5-D-15.1 (self-audit H-2 closure):** OOXML default for
+        // `applyNumberFormat` is `true` when the attr is absent.
+        // Cell xfs with no attribute now read as `true`.
+        assert!(idx.cell_xfs[0].apply_number_format);
         assert_eq!(idx.cell_xfs[1].num_fmt_id, 164);
         assert!(idx.cell_xfs[1].apply_number_format);
         // `"true"` also recognized.

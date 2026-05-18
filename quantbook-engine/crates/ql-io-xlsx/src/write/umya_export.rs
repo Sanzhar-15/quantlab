@@ -115,74 +115,90 @@ pub(crate) fn export_new_workbook(
             .map_err(|e| XlsxError::Export(format!("umya new_sheet({sheet_name}) failed: {e}")))?;
 
         let bounds = sheet.bounds();
-        if bounds.row_extent == 0 || bounds.col_extent == 0 {
-            // Empty sheet — done.
-            continue;
-        }
+        // **W5-D-15.1 (Codex audit HIGH-3 closure):** the prior code
+        // `continue`-d for empty-bounds sheets, skipping the
+        // `sheet_fixes.push(fixes)` at end of loop. That misaligned
+        // the per-sheet fixes vector for any subsequent non-empty
+        // sheet — sheet N's fixes landed on sheet N-1's xml. Now the
+        // cell-walk is gated on non-empty bounds; format-overlay
+        // scheduling + `sheet_fixes.push` run unconditionally.
+        let has_cells_to_walk = bounds.row_extent > 0 && bounds.col_extent > 0;
+        if has_cells_to_walk {
+            let ws = spreadsheet
+                .get_sheet_by_name_mut(&sheet_name)
+                .ok_or_else(|| {
+                    XlsxError::Export(format!(
+                        "umya sheet {sheet_name} disappeared after new_sheet"
+                    ))
+                })?;
+            for row in 0..bounds.row_extent {
+                for col in 0..bounds.col_extent {
+                    let value = sheet.read(row, col);
+                    let formula = formula_map.get(&(sheet_id, row, col));
 
-        // Get the worksheet handle for cell writes. umya uses
-        // 1-indexed (col, row) coordinates; Quantbook is 0-indexed
-        // (row, col). Convert at write time.
-        let ws = spreadsheet
-            .get_sheet_by_name_mut(&sheet_name)
-            .ok_or_else(|| {
-                XlsxError::Export(format!(
-                    "umya sheet {sheet_name} disappeared after new_sheet"
-                ))
-            })?;
+                    let umya_col = col + 1;
+                    let umya_row = row + 1;
 
-        // Walk every (row, col) within bounds. This is O(rows * cols)
-        // and inefficient for large sparse sheets; W5-D-14e
-        // follow-up: switch to column-wise iteration via ColumnStore.
-        for row in 0..bounds.row_extent {
-            for col in 0..bounds.col_extent {
-                let value = sheet.read(row, col);
-                let formula = formula_map.get(&(sheet_id, row, col));
-
-                let umya_col = col + 1;
-                let umya_row = row + 1;
-
-                match (formula, &value) {
-                    (Some(formula_text), val) => {
-                        // **W5-D-14.1 (audit HIGH-1 closure — phase
-                        // 1):** umya's `set_value_*` setters internally
-                        // call `remove_formula()`, so we apply the
-                        // value FIRST then call `set_formula` (which
-                        // doesn't touch the raw value).
-                        let cell = ws.get_cell_mut((umya_col, umya_row));
-                        let cache_written = if formula_cache == FormulaCachePolicy::WriteRecomputed
-                            && !matches!(val, Value::Blank)
-                        {
-                            apply_value_to_cell(cell, val);
-                            true
-                        } else {
-                            false
-                        };
-                        cell.set_formula(formula_text.as_str());
-                        if cache_written {
-                            report.formula_caches_written += 1;
-                        }
-                        // **W5-D-14.1 (audit HIGH-1 closure — phase 2):**
-                        // umya's writer sets `t="str"` on any formula
-                        // cell (`cell_value.rs::get_data_type_crate`
-                        // returns "str" for Some(formula) regardless
-                        // of raw_value type). Calamine then reads the
-                        // `<v>` content as text. Schedule a post-
-                        // process fix: remove `t="str"` for cells
-                        // whose cached value is numeric/boolean (the
-                        // default cell type "n" lets calamine restore
-                        // the number).
-                        if cache_written && matches!(val, Value::Number(_) | Value::Boolean(_)) {
-                            fixes.push(CellFix {
-                                cell_ref: cell_ref_a1(row, col),
-                                kind: CellFixKind::RemoveStrType,
-                            });
-                        }
-                        // For formula cells with Error cached value:
-                        // umya hardcodes `#VALUE!` (umya
-                        // `worksheet.rs:524-526`). Schedule sigil fix.
-                        if let Value::Error(e) = val {
+                    match (formula, &value) {
+                        (Some(formula_text), val) => {
+                            // **W5-D-14.1 (audit HIGH-1 closure — phase
+                            // 1):** umya's `set_value_*` setters internally
+                            // call `remove_formula()`, so we apply the
+                            // value FIRST then call `set_formula` (which
+                            // doesn't touch the raw value).
+                            let cell = ws.get_cell_mut((umya_col, umya_row));
+                            let cache_written = if formula_cache
+                                == FormulaCachePolicy::WriteRecomputed
+                                && !matches!(val, Value::Blank)
+                            {
+                                apply_value_to_cell(cell, val);
+                                true
+                            } else {
+                                false
+                            };
+                            cell.set_formula(formula_text.as_str());
                             if cache_written {
+                                report.formula_caches_written += 1;
+                            }
+                            // **W5-D-14.1 (audit HIGH-1 closure — phase 2):**
+                            // umya's writer sets `t="str"` on any formula
+                            // cell (`cell_value.rs::get_data_type_crate`
+                            // returns "str" for Some(formula) regardless
+                            // of raw_value type). Calamine then reads the
+                            // `<v>` content as text. Schedule a post-
+                            // process fix: remove `t="str"` for cells
+                            // whose cached value is numeric/boolean (the
+                            // default cell type "n" lets calamine restore
+                            // the number).
+                            if cache_written && matches!(val, Value::Number(_) | Value::Boolean(_))
+                            {
+                                fixes.push(CellFix {
+                                    cell_ref: cell_ref_a1(row, col),
+                                    kind: CellFixKind::RemoveStrType,
+                                });
+                            }
+                            // For formula cells with Error cached value:
+                            // umya hardcodes `#VALUE!` (umya
+                            // `worksheet.rs:524-526`). Schedule sigil fix.
+                            if let Value::Error(e) = val {
+                                if cache_written {
+                                    fixes.push(CellFix {
+                                        cell_ref: cell_ref_a1(row, col),
+                                        kind: CellFixKind::OverrideErrorSigil(e.sigil()),
+                                    });
+                                }
+                            }
+                        }
+                        (None, Value::Blank) => {
+                            // Skip blank cells (no formula, no value).
+                        }
+                        (None, val) => {
+                            let cell = ws.get_cell_mut((umya_col, umya_row));
+                            apply_value_to_cell(cell, val);
+                            // **W5-D-14.1 (audit HIGH-6 closure):** umya
+                            // hardcodes `#VALUE!` for any error cell.
+                            // Schedule the actual sigil patch.
+                            if let Value::Error(e) = val {
                                 fixes.push(CellFix {
                                     cell_ref: cell_ref_a1(row, col),
                                     kind: CellFixKind::OverrideErrorSigil(e.sigil()),
@@ -190,38 +206,33 @@ pub(crate) fn export_new_workbook(
                             }
                         }
                     }
-                    (None, Value::Blank) => {
-                        // Skip blank cells (no formula, no value).
+                    if !matches!(value, Value::Blank) || formula.is_some() {
+                        report.cells_written += 1;
                     }
-                    (None, val) => {
-                        let cell = ws.get_cell_mut((umya_col, umya_row));
-                        apply_value_to_cell(cell, val);
-                        // **W5-D-14.1 (audit HIGH-6 closure):** umya
-                        // hardcodes `#VALUE!` for any error cell.
-                        // Schedule the actual sigil patch.
-                        if let Value::Error(e) = val {
-                            fixes.push(CellFix {
-                                cell_ref: cell_ref_a1(row, col),
-                                kind: CellFixKind::OverrideErrorSigil(e.sigil()),
-                            });
-                        }
-                    }
-                }
-                if !matches!(value, Value::Blank) || formula.is_some() {
-                    report.cells_written += 1;
                 }
             }
-        }
+        } // end `if has_cells_to_walk`
 
         // **W5-D-15:** schedule `s="N"` fixes for every cell with a
         // format overlay entry. MUST run AFTER the cell-walk fixes
         // (RemoveStrType / OverrideErrorSigil) so their needles —
         // which match on the literal `<c r="..." t="..."` prefix —
         // aren't disrupted by an inserted `s="..."` attribute.
+        //
+        // **W5-D-15.1 (self-audit H-3 closure):** the prior version
+        // walked `format_overlay().iter()` directly — HashMap
+        // iteration order, which is non-deterministic. The
+        // `cellxfs_roster` order (and therefore every cell's emitted
+        // `s="N"`) varied run-to-run. Now we sort entries by
+        // (FormatId, row, col) so the roster is byte-stable across
+        // runs and the per-cell `s="N"` values are deterministic.
         let sheet_view = workbook
             .sheet(sheet_id)
             .ok_or_else(|| XlsxError::Export(format!("sheet {sheet_id} missing during export")))?;
-        for ((row, col), fid) in sheet_view.format_overlay().iter() {
+        let mut overlay_entries: Vec<((u32, u32), FormatId)> =
+            sheet_view.format_overlay().iter().collect();
+        overlay_entries.sort_by_key(|a| (a.1 .0, a.0 .0, a.0 .1));
+        for ((row, col), fid) in overlay_entries {
             let xf_index = match format_to_xf_index.get(&fid) {
                 Some(idx) => *idx,
                 None => {
