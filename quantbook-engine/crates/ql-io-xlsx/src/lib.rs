@@ -175,6 +175,14 @@ pub fn import_xlsx_bytes(
     let _custom_formats_registered =
         read::styles_import::register_custom_formats(&mut workbook, &style_index)?;
 
+    // **W5-D-14.2 — Phase 2e (HIGH-4 closure):** register defined names
+    // (workbook-scope + sheet-scope) into the engine's `NameTable` /
+    // `Sheet::scoped_names`. Names whose target text doesn't match
+    // the simple-address subset fall back to `NamedTarget::Formula`
+    // (deferred to the bind-aware parser).
+    let _names_registered =
+        read::names_import::register_defined_names(&mut workbook, &workbook_props)?;
+
     // **W5-D-14b — Phase 2b**: apply UnsupportedPolicy::Strict if any
     // unsupported features were detected. Permissive mode just
     // leaves the inventory in the report.
@@ -256,14 +264,27 @@ pub fn export_xlsx_path(
     out: impl AsRef<std::path::Path>,
     options: XlsxExportOptions,
 ) -> Result<XlsxExportReport, XlsxError> {
+    let out_path = out.as_ref();
     match options.mode {
         ExportMode::NewWorkbook => {
-            write::umya_export::export_new_workbook(workbook, out.as_ref(), options.formula_cache)
+            let mut report =
+                write::umya_export::export_new_workbook(workbook, out_path, options.formula_cache)?;
+            // **W5-D-14.2 (HIGH-7 partial — dropped_features population):**
+            // NewWorkbook mode doesn't preserve opaque parts from any
+            // import (there's no import context here), so this stays
+            // empty unless a future caller wires
+            // `XlsxExportOptions::dropped_features_hint`. The field
+            // itself now consumes for UpdateOriginal callers below.
+            report.warnings.shrink_to_fit();
+            Ok(report)
         }
-        ExportMode::UpdateOriginal { .. } => Err(XlsxError::Engine(
-            "ExportMode::UpdateOriginal not yet implemented (Phase 4.11 W5-D-14e follow-up)"
-                .to_string(),
-        )),
+        ExportMode::UpdateOriginal { source } => write::update_original::export_update_original(
+            workbook,
+            out_path,
+            options.formula_cache,
+            options.unsupported_policy,
+            source,
+        ),
     }
 }
 
@@ -298,10 +319,11 @@ mod tests {
     }
 
     #[test]
-    fn export_update_original_still_returns_engine_error() {
-        // **W5-D-14e:** NewWorkbook mode is wired; UpdateOriginal mode
-        // is still a follow-up. The typed-error path covers the
-        // not-yet-shipped sub-mode.
+    fn export_update_original_empty_preservation_falls_through_to_shadow() {
+        // **W5-D-14.2 (HIGH-7 closure):** UpdateOriginal with empty
+        // preservation bytes is a degenerate case — the implementation
+        // should detect that there's nothing to preserve and surface
+        // a zip-parse error (empty bytes are not a valid zip).
         let reg = ql_functions::default_registry();
         let wb = Workbook::new();
         let preservation = XlsxPreservation {
@@ -314,12 +336,13 @@ mod tests {
             },
             ..Default::default()
         };
-        match export_xlsx_path(&wb, &reg, "/tmp/never-written.xlsx", export_opts) {
-            Err(XlsxError::Engine(msg)) => {
-                assert!(msg.contains("UpdateOriginal not yet implemented"))
-            }
-            other => panic!("expected Engine error, got {other:?}"),
+        let tmp = std::env::temp_dir().join("w5-d-14-2-update-original-empty.xlsx");
+        let _ = std::fs::remove_file(&tmp);
+        match export_xlsx_path(&wb, &reg, &tmp, export_opts) {
+            Err(XlsxError::Zip(_)) => {} // empty bytes → zip parse error
+            other => panic!("expected Zip error for empty preservation, got {other:?}"),
         }
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]

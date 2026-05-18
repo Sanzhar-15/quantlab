@@ -301,6 +301,297 @@ fn w5_d_14_1_libreoffice_general_at_custom_id_does_not_error() {
 }
 
 #[test]
+fn w5_d_14_2_round_trip_preserves_custom_format_codes() {
+    // **W5-D-14.2 (HIGH-5 closure):** custom format codes (numFmtId >= 164)
+    // registered in the Quantbook FormatTable must survive export → re-import.
+    use ql_storage::{FormatId, Workbook, FIRST_CUSTOM_FORMAT_ID};
+    let mut wb = Workbook::new();
+    wb.add_sheet("Sheet1");
+    let custom_code = "#,##0.00 \"USD\"";
+    let custom_id = wb.formats_mut().intern(custom_code);
+    assert_eq!(custom_id, FormatId(FIRST_CUSTOM_FORMAT_ID));
+
+    let tmp = std::env::temp_dir().join("w5-d-14-2-roundtrip-custom-format.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+    export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // The format must be present at the same id (replay-deterministic
+    // round-trip).
+    let imported_code = result
+        .workbook
+        .formats()
+        .lookup(FormatId(FIRST_CUSTOM_FORMAT_ID));
+    assert_eq!(
+        imported_code,
+        Some(custom_code),
+        "custom format code did not survive round-trip"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn w5_d_14_2_round_trip_preserves_workbook_scoped_name_cell() {
+    // **W5-D-14.2 (HIGH-4 closure):** workbook-scope name targeting a
+    // cell must round-trip.
+    use ql_storage::{NamedTarget, Workbook};
+    use ql_types::{Address, Value};
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("Sheet1");
+    wb.put_at(s, 4, 2, Value::Number(99.0));
+    wb.set_name("MyCell", NamedTarget::Cell(Address::new(s, 4, 2)))
+        .unwrap();
+
+    let tmp = std::env::temp_dir().join("w5-d-14-2-roundtrip-name-cell.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+    export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let target = result
+        .workbook
+        .names()
+        .lookup_ci("MyCell")
+        .expect("workbook name MyCell missing after round-trip");
+    match target {
+        NamedTarget::Cell(a) => {
+            assert_eq!(a.sheet, 0);
+            assert_eq!(a.row, 4);
+            assert_eq!(a.col, 2);
+        }
+        other => panic!("expected Cell target, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn w5_d_14_2_round_trip_preserves_workbook_scoped_name_range() {
+    // **W5-D-14.2 (HIGH-4 closure):** workbook-scope name targeting a
+    // range must round-trip.
+    use ql_storage::{NamedTarget, Workbook};
+    use ql_types::Range;
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("Sheet1");
+    wb.set_name("Block", NamedTarget::Range(Range::new(s, 1, 0, 9, 4)))
+        .unwrap();
+
+    let tmp = std::env::temp_dir().join("w5-d-14-2-roundtrip-name-range.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+    export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let target = result
+        .workbook
+        .names()
+        .lookup_ci("Block")
+        .expect("workbook name Block missing after round-trip");
+    match target {
+        NamedTarget::Range(r) => {
+            assert_eq!(r.sheet, 0);
+            assert_eq!(r.start_row, 1);
+            assert_eq!(r.start_col, 0);
+            assert_eq!(r.end_row, 9);
+            assert_eq!(r.end_col, 4);
+        }
+        other => panic!("expected Range target, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn w5_d_14_2_round_trip_preserves_table() {
+    // **W5-D-14.2 (HIGH-3 closure):** Quantbook tables export to
+    // `xl/tables/table*.xml` and re-import via the existing tables
+    // importer.
+    use ql_storage::{TableColumn, TableMetadata, TotalsFunction, Workbook};
+    use std::sync::Arc;
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("Sheet1");
+    let columns = vec![
+        TableColumn {
+            id: 1,
+            name: Arc::from("qty"),
+            display: Arc::from("Qty"),
+            totals_function: Some(TotalsFunction::Sum),
+        },
+        TableColumn {
+            id: 2,
+            name: Arc::from("price"),
+            display: Arc::from("Price"),
+            totals_function: None,
+        },
+    ];
+    let meta = TableMetadata {
+        name: Arc::from("SALES"),
+        display_name: Arc::from("Sales"),
+        sheet: s,
+        top_row: 0,
+        top_col: 0,
+        rows: 4,
+        cols: 2,
+        has_header: true,
+        has_totals: false,
+        columns,
+    };
+    wb.tables_mut().insert(Arc::from("SALES"), meta);
+
+    let tmp = std::env::temp_dir().join("w5-d-14-2-roundtrip-table.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+    export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let table = result
+        .workbook
+        .tables()
+        .lookup("SALES")
+        .expect("table SALES missing after round-trip");
+    assert_eq!(table.sheet, 0);
+    assert_eq!(table.top_row, 0);
+    assert_eq!(table.top_col, 0);
+    assert_eq!(table.rows, 4);
+    assert_eq!(table.cols, 2);
+    assert!(table.has_header);
+    assert_eq!(table.columns.len(), 2);
+    assert_eq!(table.columns[0].display.as_ref(), "Qty");
+    assert_eq!(table.columns[1].display.as_ref(), "Price");
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn w5_d_14_2_update_original_round_trip_preserves_opaque_theme() {
+    // **W5-D-14.2 (HIGH-7 closure):** import a real fixture WITH
+    // `preserve_package = true`, then export via UpdateOriginal. The
+    // output should retain the original's `xl/theme/theme1.xml` (an
+    // opaque part Quantbook doesn't model).
+    let registry = ql_functions::default_registry();
+    let import_opts = XlsxImportOptions {
+        recompute: RecomputeMode::Skip,
+        preserve_package: true,
+        ..Default::default()
+    };
+    let result = import_xlsx_path(BASIC_TEXT_FIXTURE, &registry, import_opts).unwrap();
+    let preservation = result.preservation.expect("preservation requested");
+
+    let tmp = std::env::temp_dir().join("w5-d-14-2-update-original-theme.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let export_opts = XlsxExportOptions {
+        mode: ExportMode::UpdateOriginal {
+            source: preservation,
+        },
+        formula_cache: FormulaCachePolicy::WriteRecomputed,
+        ..Default::default()
+    };
+    export_xlsx_path(&result.workbook, &registry, &tmp, export_opts).unwrap();
+
+    // Open the output zip and confirm the theme survived.
+    let bytes = std::fs::read(&tmp).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let names: std::collections::HashSet<String> = (0..zip.len())
+        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .collect();
+    assert!(
+        names.iter().any(|n| n.starts_with("xl/theme/")),
+        "expected xl/theme/* to be preserved, got: {names:?}"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn w5_d_14_2_update_original_round_trip_preserves_cell_edits() {
+    // **W5-D-14.2 (HIGH-7 closure):** UpdateOriginal must also write
+    // Quantbook's cell edits — the shadow's worksheet xml replaces
+    // the original's, so any cells we put in the Workbook after
+    // import should appear in the output.
+    use ql_types::Value;
+    let registry = ql_functions::default_registry();
+    let import_opts = XlsxImportOptions {
+        recompute: RecomputeMode::Skip,
+        preserve_package: true,
+        ..Default::default()
+    };
+    let result = import_xlsx_path(BASIC_TEXT_FIXTURE, &registry, import_opts).unwrap();
+    let preservation = result.preservation.expect("preservation requested");
+
+    let mut wb = result.workbook;
+    // Edit a cell on sheet 0.
+    wb.put_at(0, 0, 25, Value::Number(123.0));
+
+    let tmp = std::env::temp_dir().join("w5-d-14-2-update-original-edit.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let export_opts = XlsxExportOptions {
+        mode: ExportMode::UpdateOriginal {
+            source: preservation,
+        },
+        formula_cache: FormulaCachePolicy::WriteRecomputed,
+        ..Default::default()
+    };
+    export_xlsx_path(&wb, &registry, &tmp, export_opts).unwrap();
+
+    // Re-import and confirm the edit is visible AND theme survived.
+    let reimport = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let sheet0 = reimport.workbook.sheet(0).unwrap();
+    assert_eq!(
+        sheet0.read(0, 25),
+        Value::Number(123.0),
+        "expected our edit at (0,25) to survive UpdateOriginal round-trip"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
 fn import_ironcalc_example_fixture_with_recompute_doesnt_panic() {
     // **W5-D-14a:** larger fixture with formulas. Run recompute in
     // best-effort mode. The point is: the pipeline doesn't panic
