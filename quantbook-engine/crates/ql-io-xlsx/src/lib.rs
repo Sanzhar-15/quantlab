@@ -147,6 +147,15 @@ pub fn import_xlsx_bytes(
     // every date serial in the workbook depends on it.
     workbook.set_date_system(workbook_props.date_system);
 
+    // **W5-D-14c — Phase 2c**: import tables. Walks each sheet's
+    // `.rels` file, resolves table xml paths, parses each, registers
+    // with the workbook's TableTable. Tables are now available for
+    // structured-ref binding (e.g. `=Sales[Qty]`) immediately after
+    // import. Closes Phase 4.11 acceptance XLSX-4-03 (tables-side).
+    let sheet_names = grid.sheet_names();
+    let _tables_imported =
+        read::tables_import::import_tables(&package, &mut workbook, &sheet_names)?;
+
     // **W5-D-14b — Phase 2b**: apply UnsupportedPolicy::Strict if any
     // unsupported features were detected. Permissive mode just
     // leaves the inventory in the report.
