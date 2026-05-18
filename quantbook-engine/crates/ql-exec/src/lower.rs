@@ -48,6 +48,7 @@ use ql_types::ColId;
 
 /// Recognized SIMD-friendly shapes. `NotApplicable` triggers a per-cell scalar fallback.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum SimdShape {
     /// `out[i] = input_col[i] * scalar`. THE OG-02 pattern.
     MulScalar { input_col: ColId, scalar: f64 },

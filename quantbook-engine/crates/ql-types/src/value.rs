@@ -25,6 +25,13 @@ use crate::error::ErrorValue;
 /// `size_of::<Value>()` is 24 bytes on 64-bit including the discriminant + padding).
 ///
 /// `Default` is `Blank` (matches Excel's empty-cell semantics).
+///
+/// **Stability:** NOT `#[non_exhaustive]`. Variants map to Excel's
+/// canonical value types and are semantically stable. Adding a new
+/// variant (e.g. first-class references, inline arrays, lambda
+/// values) is a MAJOR-version bump (0.x → 0.y) — `_ => ...` catch-all
+/// arms would conflict with the no-fallbacks rule by hiding new
+/// variants from existing pattern matches.
 #[derive(Clone, Debug, Default)]
 pub enum Value {
     /// Empty cell (`Blank`). Coerces to 0.0 numerically, "" textually, false logically.

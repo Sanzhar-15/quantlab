@@ -75,6 +75,7 @@ pub struct NameTable {
 /// NameRef path instead of the function-call path. Now the registration
 /// itself is refused.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum NameTableError {
     /// The name is reserved by the engine. Per CORR-06: `AI`. Future
     /// reservations belong in `is_reserved_name` below.
@@ -88,6 +89,7 @@ pub enum NameTableError {
 /// allow reserved-name-table entries like `AI`; sheet names reject
 /// Excel-reserved characters; etc.).
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SheetNameError {
     /// Empty string — Excel canon rejects.
     #[error("sheet name cannot be empty")]

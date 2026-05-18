@@ -36,6 +36,7 @@ impl fmt::Display for V2Token {
 /// All ways `format::parse` can refuse an input string. Each variant
 /// carries enough position info to surface a single-line diagnostic.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum FormatParseError {
     /// Empty input.
     Empty,

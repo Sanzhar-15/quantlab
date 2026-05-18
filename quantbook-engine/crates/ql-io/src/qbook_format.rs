@@ -182,6 +182,7 @@ const ATOMIC_SAVE_MARKER_FILENAME: &str = ".atomic-save-marker-v1";
 
 /// Errors that can occur during save / load.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum QbookError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -894,23 +895,7 @@ impl NamedTargetWire {
 /// Map `ErrorValue` to its canonical Excel-style text form (`#REF!`, `#VALUE!`, etc.).
 /// Used by both wire-format serialization and the user-visible representation per spec.
 pub fn error_to_canonical_text(e: ErrorValue) -> String {
-    match e {
-        ErrorValue::Ref => "#REF!".to_string(),
-        ErrorValue::Value => "#VALUE!".to_string(),
-        ErrorValue::NA => "#N/A".to_string(),
-        ErrorValue::DivZero => "#DIV/0!".to_string(),
-        ErrorValue::Null => "#NULL!".to_string(),
-        ErrorValue::Num => "#NUM!".to_string(),
-        ErrorValue::Name => "#NAME?".to_string(),
-        ErrorValue::Spill => "#SPILL!".to_string(),
-        ErrorValue::Calc => "#CALC!".to_string(),
-        ErrorValue::Disconnected => "#DISCONNECTED!".to_string(),
-        ErrorValue::Binding => "#BINDING!".to_string(),
-        ErrorValue::Timeout => "#TIMEOUT!".to_string(),
-        ErrorValue::Permission => "#PERMISSION!".to_string(),
-        ErrorValue::AINotAvailable => "#AI_NOT_AVAILABLE_V1".to_string(),
-        ErrorValue::Circ => "#CIRC!".to_string(),
-    }
+    e.sigil().to_string()
 }
 
 fn parse_canonical_error_text(s: &str) -> Option<ErrorValue> {

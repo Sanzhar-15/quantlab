@@ -182,6 +182,7 @@ impl FormatTable {
 
 /// Errors from `register_at` collisions.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum FormatTableError {
     /// An id is already taken with a different string.
     IdCollision {

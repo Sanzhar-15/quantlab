@@ -70,6 +70,16 @@
 //!   are the scheduler entry points; `cell_address_for(NodeId)` is
 //!   the inverse of `cell_node_for` for the runtime's evaluation
 //!   loop.
+//!
+//! # Stability
+//!
+//! Pre-0.2.0 the public API surface is in flux. Error enums
+//! (`BindError`, `RuntimeError`) and `SimdShape` carry
+//! `#[non_exhaustive]` — downstream consumers must include a `_` arm
+//! when matching across crate boundaries. `ExprPlan` (the plan IR),
+//! `ResolvedName`, and `EvalResult` are exhaustive by design;
+//! adding a variant is a MAJOR-version event because every scalar /
+//! aggregate / spill evaluator dispatcher must gain a new arm.
 
 pub mod aggregate_cache;
 pub mod calcgraph_session;

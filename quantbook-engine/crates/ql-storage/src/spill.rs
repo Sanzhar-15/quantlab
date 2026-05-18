@@ -79,6 +79,7 @@ impl SpillShape {
 /// `Value::Error(ErrorValue::Spill)` at the anchor cell; the storage
 /// layer surfaces them structurally so callers can distinguish causes.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SpillBlockError {
     /// A non-anchor cell inside the proposed spill rectangle is
     /// already a target of a DIFFERENT existing spill. The runtime

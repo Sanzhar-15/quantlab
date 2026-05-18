@@ -745,10 +745,7 @@ fn w5_d_14_2_2_strict_update_original_does_not_overwrite_output_on_drop() {
 
     let registry = ql_functions::default_registry();
     let wb = ql_storage::Workbook::new();
-    let preservation = ql_io_xlsx::XlsxPreservation {
-        original_bytes,
-        known_parts: std::collections::HashMap::new(),
-    };
+    let preservation = ql_io_xlsx::XlsxPreservation::new(original_bytes);
     let export_opts = XlsxExportOptions {
         mode: ExportMode::UpdateOriginal {
             source: preservation,
@@ -802,10 +799,7 @@ fn w5_d_14_2_2_permissive_update_original_populates_dropped_features() {
 
     let registry = ql_functions::default_registry();
     let wb = ql_storage::Workbook::new();
-    let preservation = ql_io_xlsx::XlsxPreservation {
-        original_bytes,
-        known_parts: std::collections::HashMap::new(),
-    };
+    let preservation = ql_io_xlsx::XlsxPreservation::new(original_bytes);
     let export_opts = XlsxExportOptions {
         mode: ExportMode::UpdateOriginal {
             source: preservation,
@@ -1570,10 +1564,7 @@ fn w5_d_pm_3_update_original_strict_catches_inline_cf() {
     }
     let registry = ql_functions::default_registry();
     let wb = ql_storage::Workbook::new();
-    let preservation = ql_io_xlsx::XlsxPreservation {
-        original_bytes,
-        known_parts: std::collections::HashMap::new(),
-    };
+    let preservation = ql_io_xlsx::XlsxPreservation::new(original_bytes);
     let tmp = std::env::temp_dir().join("w5-d-pm-3-update-original-cf.xlsx");
     let _ = std::fs::remove_file(&tmp);
     let opts = XlsxExportOptions {

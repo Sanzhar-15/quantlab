@@ -24,6 +24,7 @@ pub struct XlsxImportOptions {
 
 /// Whether to recompute formulas after raw-loading the workbook.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RecomputeMode {
     /// Recompute every formula; report failures but keep imported
     /// cached values on failure. **Default.** This is the safest mode:
@@ -47,6 +48,7 @@ pub enum RecomputeMode {
 /// What happens when the importer / exporter detects a feature the
 /// engine doesn't model.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UnsupportedPolicy {
     /// Detect-and-report: every unsupported feature is added to the
     /// import / export report; the operation succeeds. **Default.**
@@ -78,6 +80,7 @@ pub struct XlsxExportOptions {
 /// Whether the export generates a new workbook or updates an existing
 /// one (from a prior import).
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub enum ExportMode {
     /// Generate a fresh xlsx from Quantbook state. Use for workbooks
     /// that originated in Quantbook (not imported from xlsx). The
@@ -100,6 +103,7 @@ pub enum ExportMode {
 
 /// Whether to write formula cached values into the output.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FormulaCachePolicy {
     /// Write the engine's recomputed values as cached values. Excel
     /// will display these immediately on open; recalc happens when

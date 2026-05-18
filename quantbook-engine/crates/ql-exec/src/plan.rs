@@ -166,6 +166,7 @@ pub enum ExprPlan {
 /// `thiserror::Error` for consistency with the rest of the error surface.
 /// Display strings are now user-facing (suitable for IDE diagnostics).
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum BindError {
     /// The Expr contains a variant not supported in this build. Currently
     /// reachable from:

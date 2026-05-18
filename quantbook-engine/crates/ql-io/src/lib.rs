@@ -4,6 +4,16 @@
 //! See `qbook_format.rs` for the format spec + implementation.
 //!
 //! Foreign-format support (xlsx, ods) lives in `ql-io-xlsx` / `ql-io-ods` crates.
+//!
+//! # Stability
+//!
+//! Pre-0.2.0 the public API surface is in flux. `QbookError` carries
+//! `#[non_exhaustive]` — downstream consumers must include a `_` arm
+//! when matching across crate boundaries. Wire enums (`CellWireValue`,
+//! `NamedTargetWire`, `ReferenceModeWire`, `LocaleWire`,
+//! `DateSystemWire`, `TotalsFunctionWire`) are exhaustive by design;
+//! adding a variant requires bumping `WORKBOOK_SCHEMA_VERSION` and
+//! coordinating all producer/consumer sites in one major-version cut.
 
 pub mod qbook_format;
 

@@ -25,6 +25,16 @@
 //! The `AI()` reservation per CORR-06 / T4-D05 is canonicalized at parser
 //! level and dispatches through `ql_functions::default_registry` to a
 //! sentinel that returns `Error(AINotAvailable)`.
+//!
+//! # Stability
+//!
+//! Pre-0.2.0 the public API surface is in flux. Error enums carry
+//! `#[non_exhaustive]` (`LexError`, `ParseError`, `PrintError`) —
+//! downstream consumers must include a `_` arm when matching across
+//! crate boundaries. AST primitives (`Expr`, `Token`, `Operator`,
+//! `AxisSpec`, `SpecialItem`, `SheetRef`, `RangeRef`,
+//! `TableSpecItem`, `TableSpecSubtree`) are exhaustive by design;
+//! the formula-language vocabulary is Excel-spec-bounded.
 
 pub mod ast;
 pub mod lexer;

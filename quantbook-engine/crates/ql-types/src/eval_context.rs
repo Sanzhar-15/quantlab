@@ -50,6 +50,12 @@ pub enum DateSystem {
 /// in `ql-formula-syntax::locale::LocaleData` — `ql-types` defines only
 /// the locale identifier so layering stays clean (storage holds the
 /// identifier; the formula-syntax layer attaches separator semantics).
+/// **Stability:** NOT `#[non_exhaustive]`. Adding a new locale is a
+/// MAJOR-version event because every locale-specific dispatcher
+/// (lexer, printer, format renderer, scalar text functions) must
+/// gain a handler. The exhaustive match enforces that contract at
+/// compile time; `#[non_exhaustive]` would push the failure to a
+/// runtime `unreachable!()`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Locale {
     /// en-US: decimal `.`, thousands `,`, arg separator `,`, English
@@ -93,6 +99,7 @@ pub enum ReferenceMode {
 /// OR migrate this enum to a trait object. Scaffolding contract: callers
 /// must guard `System` behind a target check OR set `Test` explicitly.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum NowProvider {
     /// Native system clock + local UTC offset (queried at fire time).
     #[default]

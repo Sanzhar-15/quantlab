@@ -14,6 +14,7 @@ use thiserror::Error;
 /// implementation. Each variant should carry enough context (file path,
 /// part name, XML element, etc.) to localize the failure.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum XlsxError {
     /// Filesystem I/O failed (file not found, permission denied, etc.).
     #[error("xlsx file I/O error: {0}")]
@@ -64,26 +65,6 @@ pub enum XlsxError {
         detail: String,
     },
 
-    /// **DEPRECATED — never constructed; slated for removal in 0.2.**
-    ///
-    /// **W5-D-PM-5 (megaudit Opus-C HIGH-3 closure):** the hybrid-reader
-    /// reconciliation step described in `calamine_grid.rs:60-62` never
-    /// landed (calamine's sheet order is used unchanged at
-    /// `convert.rs:33`). This variant is dead code that forces callers
-    /// writing exhaustive matches on `XlsxError` to handle a case that
-    /// cannot happen. Kept for one cycle as `#[deprecated]` to ease the
-    /// transition; remove in 0.2.0.
-    #[deprecated(
-        since = "0.1.1",
-        note = "Never constructed; reconciliation pass was never implemented. \
-                Will be removed in 0.2.0."
-    )]
-    #[error("xlsx hybrid-reader reconciliation failure: {message}")]
-    Reconciliation {
-        /// Description of the disagreement.
-        message: String,
-    },
-
     /// Export couldn't write the output file (umya or generated path).
     #[error("xlsx export error: {0}")]
     Export(String),
@@ -101,6 +82,7 @@ pub enum XlsxError {
 /// import/export reports. The variants here track exactly what the
 /// hybrid reader's feature inventory detects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum UnsupportedFeatureKind {
     /// Conditional formatting rules (`xl/worksheets/sheet*.xml`
     /// `<conditionalFormatting>`).

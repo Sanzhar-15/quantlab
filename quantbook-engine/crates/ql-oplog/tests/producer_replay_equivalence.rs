@@ -252,6 +252,9 @@ fn apply_producer_side(ops: &[Op], wb: &mut Workbook) {
                         .expect("realistic_op_sequence never emits unknown locales"),
                 );
             }
+            _ => unreachable!(
+                "Op gained a variant — extend apply_producer_side when adding op coverage"
+            ),
         }
     }
 }

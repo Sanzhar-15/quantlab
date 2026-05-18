@@ -45,6 +45,7 @@ pub const OPLOG_FILENAME: &str = "oplog.bin";
 /// both [`QbookError`] (from the underlying workbook persistence) and
 /// [`OpLogError`] (from Loro snapshot encode/decode).
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum PersistenceError {
     /// Workbook persistence layer error (I/O, schema, malformed cell, etc.).
     #[error("workbook persistence error: {0}")]

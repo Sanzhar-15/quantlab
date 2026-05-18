@@ -50,6 +50,7 @@ use crate::op::Op;
 
 /// Errors emitted by `replay_into`.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ReplayError {
     /// An op-log entry failed to deserialize (corrupted log data).
     #[error("replay deserialize error at op index {0}: {1}")]
@@ -237,6 +238,7 @@ pub enum ReplayError {
 /// so `ReplayError` can stay `Clone + std::error::Error` without
 /// borrowing into the table.
 #[derive(Clone, Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum FormatRejectedSource {
     #[error("format id {id} already bound to {existing:?}, can't re-bind to {attempted:?}")]
     IdCollision {
@@ -275,6 +277,9 @@ impl From<ql_storage::FormatTableError> for FormatRejectedSource {
                 existing_id: existing_id.0,
                 attempted_id: attempted_id.0,
             },
+            _ => unreachable!(
+                "FormatTableError gained a variant — extend FormatRejectedSource::From"
+            ),
         }
     }
 }

@@ -24,6 +24,7 @@ use crate::token::{Operator, Token};
 /// (Phase 2B.2 removed `LoadAndRecomputeError`; recompute failures are now
 /// aggregated in `RecomputeResult` rather than surfaced as a wrapping enum.)
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum LexError {
     #[error("unterminated string literal")]
     UnterminatedString,

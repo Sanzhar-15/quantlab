@@ -5,6 +5,13 @@
 //! the JSON shape; Week 4 ql-exec wires recompute-time fields as it lands.
 //!
 //! See `_QUANTBOOK-v1-SPECIFICATION.md` Part V §1 OG-06.
+//!
+//! # Stability
+//!
+//! Pre-0.2.0 the public API surface is in flux. `NodeKind` mirrors
+//! `ql_calcgraph::Node` and is exhaustive by design — variant
+//! additions are MAJOR-version events that ship in lockstep with
+//! calcgraph node-kind additions.
 
 pub mod graph_profile;
 pub mod timings;

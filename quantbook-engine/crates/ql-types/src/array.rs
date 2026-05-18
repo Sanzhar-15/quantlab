@@ -62,6 +62,7 @@ pub struct ArrayValue {
 /// user-visible array errors (degenerate result, out-of-bounds spill, etc.)
 /// surface as `Value::Error(ErrorValue::*)` at the eval boundary, not here.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ArrayShapeError {
     /// Number of cells supplied doesn't match `rows * cols`.
     CellCountMismatch {

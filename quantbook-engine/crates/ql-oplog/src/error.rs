@@ -11,6 +11,7 @@ use thiserror::Error;
 ///    on-disk op-log data.
 /// 3. Loro's own export/import surface its own errors via `loro::LoroError`.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum OpLogError {
     /// JSON serialization of an `Op` failed. Should be unreachable for
     /// well-formed `Op` values produced by our own code.

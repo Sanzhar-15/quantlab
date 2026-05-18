@@ -18,7 +18,12 @@ use std::fmt;
 use std::str::FromStr;
 
 /// Excel + Quantbook error surface. Cheap (1 byte enum), `Copy`, structurally compared.
+///
+/// Marked `#[non_exhaustive]`: Excel periodically introduces new error
+/// sigils (e.g. `#FIELD!`, `#PYTHON!`, `#BUSY!`), so downstream consumers
+/// must include a `_` arm when matching across crate boundaries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ErrorValue {
     /// `#REF!` — formula refers to a cell/range that no longer exists.
     Ref,

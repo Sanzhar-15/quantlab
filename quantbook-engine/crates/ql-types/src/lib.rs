@@ -11,6 +11,18 @@
 //! - [`address`] — cell coordinate types: `SheetId`, `RowId`, `ColId`, `Address`, `Range`.
 //!
 //! Spec: `.plans/_QUANTBOOK-v1-SPECIFICATION.md` Part V §2 Week 2 Day 1-2.
+//!
+//! # Stability
+//!
+//! Pre-0.2.0 the public API surface is in flux. Variants will be added.
+//! Enums carrying `#[non_exhaustive]` (`ErrorValue`, `ArrayShapeError`,
+//! `NowProvider`) MAY gain variants in 0.x — downstream consumers must
+//! include a `_` arm when matching across crate boundaries.
+//!
+//! Enums NOT carrying `#[non_exhaustive]` (`Value`, `Locale`,
+//! `DateSystem`, `ReferenceMode`) treat any variant addition as a
+//! MAJOR-version event — exhaustive matching is intentional so adding
+//! a variant forces every dispatcher to gain a new arm.
 
 pub mod address;
 pub mod array;

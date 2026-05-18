@@ -12,6 +12,16 @@
 //! Design locks (from spec): chunk-replace, not cell-mutate. Result columns from recompute
 //! swap whole chunks via `ColumnStore::replace_chunk`; cell-level writes go through the
 //! overlay (`ColumnStore::put`) and are never applied to the base array directly.
+//!
+//! # Stability
+//!
+//! Pre-0.2.0 the public API surface is in flux. Error enums carry
+//! `#[non_exhaustive]` (`FormatTableError`, `NameTableError`,
+//! `SheetNameError`, `SpillBlockError`) — downstream consumers must
+//! include a `_` arm when matching across crate boundaries. Data
+//! enums (`NamedTarget`, `TotalsFunction`) are exhaustive by design;
+//! variant additions are MAJOR-version events because every
+//! dispatcher (wire-format, replay, runtime) must gain a new arm.
 
 pub mod column;
 pub mod format;

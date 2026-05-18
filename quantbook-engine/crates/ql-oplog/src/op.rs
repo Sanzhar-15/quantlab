@@ -39,6 +39,7 @@ use ql_types::{ColId, RowId, SheetId};
 /// A mutation operation recordable in the op log.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, tag = "kind")]
+#[non_exhaustive]
 pub enum Op {
     /// Single literal cell write. Mirrors `WorkbookRuntime::set_value`.
     PutValue {

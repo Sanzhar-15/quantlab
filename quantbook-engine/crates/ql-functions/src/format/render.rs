@@ -741,26 +741,7 @@ fn render_text_section(value: &Value, section: &Section) -> String {
 // ============================================================================
 
 fn error_sigil(e: ErrorValue) -> &'static str {
-    // Excel-canon error sigils. Mirrors `Display for ErrorValue` in
-    // ql-types::error (kept in lockstep — extend together when new
-    // variants land).
-    match e {
-        ErrorValue::Num => "#NUM!",
-        ErrorValue::Value => "#VALUE!",
-        ErrorValue::DivZero => "#DIV/0!",
-        ErrorValue::Ref => "#REF!",
-        ErrorValue::Name => "#NAME?",
-        ErrorValue::Null => "#NULL!",
-        ErrorValue::NA => "#N/A",
-        ErrorValue::Calc => "#CALC!",
-        ErrorValue::Spill => "#SPILL!",
-        ErrorValue::Disconnected => "#DISCONNECTED!",
-        ErrorValue::Binding => "#BINDING!",
-        ErrorValue::Timeout => "#TIMEOUT!",
-        ErrorValue::Permission => "#PERMISSION!",
-        ErrorValue::AINotAvailable => "#AI_NOT_AVAILABLE_V1",
-        ErrorValue::Circ => "#CIRC!",
-    }
+    e.sigil()
 }
 
 // ============================================================================

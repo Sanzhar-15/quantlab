@@ -26,6 +26,16 @@
 //! (deterministic Vec ordering on `dependents_for_cell`), and M3 (MAX_ROW bound on
 //! chunk arithmetic). See commit message + the audit findings.
 //!
+//! # Stability
+//!
+//! Pre-0.2.0 the public API surface is in flux. `Node` and
+//! `StripeType` are exhaustive by design — adding a node-kind or
+//! stripe-direction is a MAJOR-version event because every graph
+//! traversal, fingerprint dispatcher, and stripe-index consumer
+//! must gain a new arm. Phase 5 may introduce CRDT-aware node
+//! kinds; that will be a coordinated cut, not a per-variant
+//! addition.
+//!
 //! ## Design intent (recap)
 //!
 //! This is the most architecturally risky crate in Phase 0. Without it, the 25M-cell

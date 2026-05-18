@@ -47,6 +47,7 @@ use crate::token::{AxisSpec, Operator, Token};
 /// hand-rolled Display + std::error::Error. Strings identical to prior
 /// hand-rolled formatters; consistency with the other error types.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ParseError {
     /// Reached end of token stream while expecting more input.
     #[error("unexpected end of input in {context}")]

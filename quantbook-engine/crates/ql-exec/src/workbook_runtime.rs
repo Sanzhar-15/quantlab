@@ -143,6 +143,7 @@ pub(crate) fn validate_cell(
 /// from `Workbook::put_at`. Phase 2A.6 audit H4 added `ConflictingOps` for
 /// the `WorkbookTransaction` mixed-kind-on-same-cell case.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RuntimeError {
     // Phase 2A.11 audit M16: switched from `{0:?}` debug formatters to `{0}`
     // Display now that LexError + BindError implement thiserror::Error with

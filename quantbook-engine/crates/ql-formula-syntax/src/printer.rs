@@ -62,6 +62,7 @@ impl FormulaSite {
 /// supplies a `FormulaSite`; only synthetic / test paths can surface
 /// this error.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum PrintError {
     /// Anchor cell required for R1C1-mode emission of a relative ref.
     #[error("R1C1 emission requires a FormulaSite anchor (mode is R1C1 and a relative reference was encountered)")]

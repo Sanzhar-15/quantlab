@@ -38,6 +38,16 @@
 //! must survive). NOT read-only-full (delays write integration).
 //! Round-trip spine catches library/model mismatches while the design
 //! is still malleable.
+//!
+//! # Stability
+//!
+//! Pre-0.2.0 the public API surface is in flux. The `XlsxPreservation`
+//! struct and the `XlsxError`, `UnsupportedFeatureKind`, `ExportMode`,
+//! `RecomputeMode`, `UnsupportedPolicy`, `FormulaCachePolicy` enums
+//! all carry `#[non_exhaustive]` — downstream consumers must include
+//! a `_` arm when matching across crate boundaries, and must
+//! construct `XlsxPreservation` through `XlsxPreservation::new(bytes)`
+//! rather than the struct-literal syntax.
 
 #![deny(missing_docs)]
 
@@ -324,14 +334,11 @@ pub fn import_xlsx_bytes(
     };
 
     // Phase 4 — preservation handle. We stash the original bytes
-    // verbatim. The deprecated `known_parts` field is initialized
-    // empty for backwards-compat; UpdateOriginal mode reads from
-    // `original_bytes` directly.
-    #[allow(deprecated)]
+    // verbatim; UpdateOriginal mode reads from `original_bytes`
+    // directly.
     let preservation = if options.preserve_package {
         Some(XlsxPreservation {
             original_bytes: bytes.to_vec(),
-            known_parts: std::collections::HashMap::new(),
         })
     } else {
         None
@@ -429,10 +436,8 @@ mod tests {
         // a zip-parse error (empty bytes are not a valid zip).
         let reg = ql_functions::default_registry();
         let wb = Workbook::new();
-        #[allow(deprecated)]
         let preservation = XlsxPreservation {
             original_bytes: Vec::new(),
-            known_parts: std::collections::HashMap::new(),
         };
         let export_opts = XlsxExportOptions {
             mode: ExportMode::UpdateOriginal {

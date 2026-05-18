@@ -21,6 +21,17 @@
 //!
 //! Literal NIST numacc dataset import (W4-5 follow-up) will add data fixtures via a
 //! `Cargo`-tracked test asset; the Welford shape is locked here.
+//!
+//! # Stability
+//!
+//! Pre-0.2.0 the public API surface is in flux. Error enums
+//! (`FormatParseError`, `format::error::V2Token`) carry
+//! `#[non_exhaustive]` — downstream consumers must include a `_` arm
+//! when matching across crate boundaries. Function-registry dispatch
+//! enums (`RegisteredFn`, `FunctionArg`, `FunctionReturn`, `FnArg`,
+//! `RefArg`, `PlanKind`, `ArgContract`) are exhaustive by design;
+//! adding a new dispatch tier is a MAJOR-version event because every
+//! eval site needs the corresponding new arm.
 
 pub mod array_returning_fns;
 pub mod context_aware_fns;
