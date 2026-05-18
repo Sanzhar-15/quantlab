@@ -6,6 +6,7 @@
 //! scoped defined names) + feature-inventory detection.
 
 pub(crate) mod calamine_grid;
+pub(crate) mod cell_styles_xml;
 pub(crate) mod convert;
 pub(crate) mod feature_inventory;
 pub(crate) mod names_import;

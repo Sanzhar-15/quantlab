@@ -827,6 +827,146 @@ fn w5_d_14_2_2_permissive_update_original_populates_dropped_features() {
 }
 
 #[test]
+fn w5_d_15_round_trip_per_cell_custom_format_application() {
+    // **W5-D-15 (Phase 4.11 XLSX-4-03 closure):** a cell with an
+    // applied custom format code round-trips through export →
+    // re-import, ending up at the same (row, col) with a FormatId
+    // that maps to the same format code.
+    use ql_storage::{FormatId, Workbook, FIRST_CUSTOM_FORMAT_ID};
+    use ql_types::Value;
+
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("Sheet1");
+    let custom_code = "yyyy-mm-dd";
+    let custom_id = wb.formats_mut().intern(custom_code);
+    assert_eq!(custom_id, FormatId(FIRST_CUSTOM_FORMAT_ID));
+    // Place a cell value + apply the format to (0, 0).
+    wb.put_at(s, 0, 0, Value::Number(45000.0));
+    let sheet = wb.sheet_mut(s).unwrap();
+    sheet.format_overlay_mut().set(0, 0, custom_id);
+
+    let tmp = std::env::temp_dir().join("w5-d-15-roundtrip-cell-fmt.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+    export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Format code survives in FormatTable.
+    let imported_code = result
+        .workbook
+        .formats()
+        .lookup(FormatId(FIRST_CUSTOM_FORMAT_ID));
+    assert_eq!(imported_code, Some(custom_code));
+
+    // Cell at (0, 0) still references that FormatId via the overlay.
+    let imported_overlay = result.workbook.sheet(0).unwrap().format_overlay();
+    assert_eq!(
+        imported_overlay.get(0, 0),
+        Some(FormatId(FIRST_CUSTOM_FORMAT_ID)),
+        "expected (0,0) to have the custom FormatId after round-trip"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn w5_d_15_round_trip_per_cell_builtin_format_application() {
+    // **W5-D-15:** built-in formatId 14 ("m/d/yyyy") is in the
+    // FormatTable defaults — applying it to a cell should also
+    // round-trip even though no `<numFmt>` is registered (built-ins
+    // are implicit in OOXML).
+    use ql_storage::{FormatId, Workbook};
+    use ql_types::Value;
+
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("Sheet1");
+    wb.put_at(s, 2, 1, Value::Number(45000.0));
+    let sheet = wb.sheet_mut(s).unwrap();
+    let builtin = FormatId(14);
+    sheet.format_overlay_mut().set(2, 1, builtin);
+
+    let tmp = std::env::temp_dir().join("w5-d-15-roundtrip-builtin-fmt.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+    export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let imported_overlay = result.workbook.sheet(0).unwrap().format_overlay();
+    assert_eq!(
+        imported_overlay.get(2, 1),
+        Some(FormatId(14)),
+        "built-in formatId 14 did not survive round-trip"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn w5_d_15_round_trip_dedup_shared_format_id() {
+    // **W5-D-15:** two cells sharing the same FormatId should reuse
+    // the same cellXf slot — the cellXfs roster has exactly one
+    // entry past the default.
+    use ql_storage::{Workbook, FIRST_CUSTOM_FORMAT_ID};
+    use ql_types::Value;
+
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("Sheet1");
+    // Use a code that's not in the built-in roster so `intern` allocates ≥164.
+    let custom_code = "#,##0.00 \"€\"";
+    let fmt = wb.formats_mut().intern(custom_code);
+    assert!(
+        fmt.0 >= FIRST_CUSTOM_FORMAT_ID,
+        "expected custom format id >= 164, got {}",
+        fmt.0
+    );
+    wb.put_at(s, 0, 0, Value::Number(0.42));
+    wb.put_at(s, 1, 0, Value::Number(0.55));
+    let sheet = wb.sheet_mut(s).unwrap();
+    sheet.format_overlay_mut().set(0, 0, fmt);
+    sheet.format_overlay_mut().set(1, 0, fmt);
+
+    let tmp = std::env::temp_dir().join("w5-d-15-roundtrip-dedup.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+    export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let overlay = result.workbook.sheet(0).unwrap().format_overlay();
+    assert_eq!(overlay.get(0, 0), Some(fmt));
+    assert_eq!(overlay.get(1, 0), Some(fmt));
+    assert_eq!(result.workbook.formats().lookup(fmt), Some(custom_code));
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
 fn import_ironcalc_example_fixture_with_recompute_doesnt_panic() {
     // **W5-D-14a:** larger fixture with formulas. Run recompute in
     // best-effort mode. The point is: the pipeline doesn't panic
@@ -854,4 +994,5 @@ fn import_ironcalc_example_fixture_with_recompute_doesnt_panic() {
     // Report exists; whether formula_failures is empty depends on
     // engine fn coverage. Don't assert; just confirm the report is
     // structurally present.
-    let _ = result.report.formula_failures.l
+    let _ = result.report.formula_failures.len();
+}

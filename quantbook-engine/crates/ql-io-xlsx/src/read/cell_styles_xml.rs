@@ -1,0 +1,165 @@
+//! Scan a worksheet xml for per-cell style index references.
+//!
+//! **W5-D-15 (Phase 4.11 XLSX-4-03 closure — per-cell format
+//! application).** Closes the remaining round-trip gap: cells in
+//! OOXML carry a `<c r="A1" s="3"/>` reference into the
+//! `<cellXfs>` table; calamine does not expose this attribute, so
+//! we parse the worksheet xml directly.
+//!
+//! Output is a per-sheet `Vec<(RowId, ColId, u32)>` where the `u32`
+//! is the cellXf index (0-based into `StyleIndex::cell_xfs`). The
+//! caller maps that to a `FormatId` via
+//! `cell_xfs[s].num_fmt_id` + `apply_number_format`.
+
+use crate::error::XlsxError;
+use ql_types::{ColId, RowId};
+use quick_xml::events::Event;
+use quick_xml::Reader;
+
+/// Parse a worksheet xml string for `<c r="..." s="..."/>` pairs.
+/// Cells without an `s` attribute, or with `s="0"` (default xf),
+/// are NOT included — they render as General and don't need a
+/// `format_overlay` entry.
+pub(crate) fn parse_cell_styles_xml(
+    content: &str,
+    part_path: &str,
+) -> Result<Vec<(RowId, ColId, u32)>, XlsxError> {
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+
+    let mut out: Vec<(RowId, ColId, u32)> = Vec::new();
+    let mut buf = Vec::new();
+    loop {
+        let evt = reader
+            .read_event_into(&mut buf)
+            .map_err(|e| XlsxError::XmlParse {
+                part: part_path.to_string(),
+                source: e,
+            })?;
+        match evt {
+            Event::Start(e) | Event::Empty(e) => {
+                let local_name = e.local_name();
+                let tag = std::str::from_utf8(local_name.as_ref()).unwrap_or("");
+                if tag == "c" {
+                    let mut r_attr: Option<String> = None;
+                    let mut s_attr: Option<u32> = None;
+                    for attr in e.attributes().with_checks(false).flatten() {
+                        let key = attr.key.as_ref();
+                        if key == b"r" {
+                            r_attr = Some(attr.unescape_value().unwrap_or_default().to_string());
+                        } else if key == b"s" {
+                            if let Ok(n) = attr.unescape_value().unwrap_or_default().parse::<u32>()
+                            {
+                                s_attr = Some(n);
+                            }
+                        }
+                    }
+                    // Skip cells that don't reference a non-default style.
+                    let (r_ref, s_idx) = match (r_attr, s_attr) {
+                        (Some(r), Some(s)) if s != 0 => (r, s),
+                        _ => continue,
+                    };
+                    if let Some((row, col)) = parse_a1_cell(&r_ref) {
+                        out.push((row, col, s_idx));
+                    }
+                    // Malformed refs are silently skipped — the
+                    // calamine grid path would have rejected them
+                    // already.
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(out)
+}
+
+/// Parse `A1` / `BC42` into `(row, col)` zero-indexed. Returns
+/// `None` for malformed refs (empty, no digits, etc.).
+fn parse_a1_cell(text: &str) -> Option<(RowId, ColId)> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    if i == 0 || i == bytes.len() {
+        return None;
+    }
+    let col_letters = &text[..i];
+    let row_digits = &text[i..];
+    let mut col: u32 = 0;
+    for c in col_letters.chars() {
+        if !c.is_ascii_alphabetic() {
+            return None;
+        }
+        col = col * 26 + (c.to_ascii_uppercase() as u32 - b'A' as u32 + 1);
+    }
+    let col = col.checked_sub(1)?;
+    let row: u32 = row_digits.parse().ok()?;
+    if row == 0 {
+        return None;
+    }
+    Some((row - 1, col))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_styled_cells() {
+        let xml = r#"<?xml version="1.0"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" s="3"><v>1</v></c>
+      <c r="B1" s="0"><v>2</v></c>
+      <c r="C1"><v>3</v></c>
+      <c r="D1" s="5"/>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        let out = parse_cell_styles_xml(xml, "xl/worksheets/sheet1.xml").unwrap();
+        // A1 (s=3) and D1 (s=5) — skip B1 (s=0 default) and C1 (no s).
+        assert_eq!(out.len(), 2);
+        assert!(out.contains(&(0, 0, 3)));
+        assert!(out.contains(&(0, 3, 5)));
+    }
+
+    #[test]
+    fn empty_sheet_returns_empty_vec() {
+        let xml = r#"<worksheet xmlns="..."><sheetData/></worksheet>"#;
+        let out = parse_cell_styles_xml(xml, "xl/worksheets/sheet1.xml").unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parses_a1_cell_basic() {
+        assert_eq!(parse_a1_cell("A1"), Some((0, 0)));
+        assert_eq!(parse_a1_cell("Z9"), Some((8, 25)));
+        assert_eq!(parse_a1_cell("AA10"), Some((9, 26)));
+    }
+
+    #[test]
+    fn parses_a1_cell_rejects_malformed() {
+        assert!(parse_a1_cell("").is_none());
+        assert!(parse_a1_cell("1A").is_none());
+        assert!(parse_a1_cell("A").is_none());
+        assert!(parse_a1_cell("A0").is_none());
+    }
+
+    #[test]
+    fn skips_unparseable_cell_refs_gracefully() {
+        // Cells with malformed `r` attrs are silently skipped.
+        let xml = r#"<worksheet>
+          <sheetData>
+            <c r="" s="3"/>
+            <c r="garbage" s="4"/>
+            <c r="A1" s="7"/>
+          </sheetData>
+        </worksheet>"#;
+        let out = parse_cell_styles_xml(xml, "test").unwrap();
+        assert_eq!(out, vec![(0, 0, 7)]);
+    }
+}

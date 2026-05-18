@@ -33,28 +33,40 @@ pub(crate) fn build_sheet_rels_paths(
     package: &XlsxPackage,
     workbook_props: &WorkbookProperties,
 ) -> Result<Vec<String>, XlsxError> {
-    // Read xl/_rels/workbook.xml.rels for the rId → part-path map.
+    let part_paths = build_sheet_part_paths(package, workbook_props)?;
+    Ok(part_paths
+        .into_iter()
+        .map(|p| {
+            if p.is_empty() {
+                String::new()
+            } else {
+                derive_sheet_rels_path(&p)
+            }
+        })
+        .collect())
+}
+
+/// **W5-D-15:** companion to `build_sheet_rels_paths` — returns the
+/// worksheet PART paths themselves (e.g. `xl/worksheets/sheet5.xml`)
+/// instead of the rels paths. Used by the per-cell-style scanner to
+/// load each sheet's xml content directly.
+///
+/// Empty string slot if the workbook.xml.rels lookup misses for a
+/// sheet (corrupt workbook — caller decides whether to error).
+pub(crate) fn build_sheet_part_paths(
+    package: &XlsxPackage,
+    workbook_props: &WorkbookProperties,
+) -> Result<Vec<String>, XlsxError> {
     let workbook_rels = read_relationships(package, "xl/_rels/workbook.xml.rels")?;
     let mut rid_to_part: HashMap<String, String> = HashMap::new();
     for rel in workbook_rels {
-        // Resolve the relative target against xl/_rels/workbook.xml.rels.
         let part_path = resolve_rel_target("xl/_rels/workbook.xml.rels", &rel.target);
         rid_to_part.insert(rel.id, part_path);
     }
-
-    // For each sheet in workbook order (per workbook.xml), look up
-    // its r:id → part path, then derive the rels path from the
-    // worksheet part path.
-    //
-    // Example: r:id rId4 → xl/worksheets/sheet5.xml → rels path
-    // `xl/worksheets/_rels/sheet5.xml.rels`.
     let mut paths = Vec::with_capacity(workbook_props.sheets.len());
     for sheet in &workbook_props.sheets {
-        let rels_path = match rid_to_part.get(&sheet.r_id) {
-            Some(part_path) => derive_sheet_rels_path(part_path),
-            None => String::new(),
-        };
-        paths.push(rels_path);
+        let part_path = rid_to_part.get(&sheet.r_id).cloned().unwrap_or_default();
+        paths.push(part_path);
     }
     Ok(paths)
 }

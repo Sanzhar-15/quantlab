@@ -175,6 +175,43 @@ pub fn import_xlsx_bytes(
     let _custom_formats_registered =
         read::styles_import::register_custom_formats(&mut workbook, &style_index)?;
 
+    // **W5-D-15 — Phase 2d-bis (XLSX-4-03 per-cell format closure):**
+    // walk each sheet's worksheet xml, parse `<c r="..." s="N"/>`
+    // pairs, and populate `Sheet::format_overlay`. Cells with `s="0"`
+    // or absent `s` use General — no overlay entry needed.
+    let sheet_part_paths = read::sheet_parts::build_sheet_part_paths(&package, &workbook_props)?;
+    for (sheet_idx, part_path) in sheet_part_paths.iter().enumerate() {
+        if part_path.is_empty() {
+            continue;
+        }
+        let Some(content) = package.read_part_string(part_path)? else {
+            continue;
+        };
+        let styled_cells = read::cell_styles_xml::parse_cell_styles_xml(&content, part_path)?;
+        if styled_cells.is_empty() {
+            continue;
+        }
+        let Some(sheet) = workbook.sheet_mut(sheet_idx as ql_types::SheetId) else {
+            continue;
+        };
+        for (row, col, xf_idx) in styled_cells {
+            // Resolve xf_idx → cellXf → numFmtId.
+            let Some(xf) = style_index.cell_xfs.get(xf_idx as usize) else {
+                continue;
+            };
+            if !xf.apply_number_format {
+                // Cell renders as General — don't populate overlay.
+                continue;
+            }
+            if xf.num_fmt_id == 0 {
+                // General format — implicit. No overlay entry.
+                continue;
+            }
+            let fmt_id = ql_storage::FormatId(xf.num_fmt_id);
+            sheet.format_overlay_mut().set(row, col, fmt_id);
+        }
+    }
+
     // **W5-D-14.2 — Phase 2e (HIGH-4 closure):** register defined names
     // (workbook-scope + sheet-scope) into the engine's `NameTable` /
     // `Sheet::scoped_names`. Names whose target text doesn't match

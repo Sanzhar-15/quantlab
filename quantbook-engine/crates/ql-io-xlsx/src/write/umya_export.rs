@@ -17,7 +17,7 @@
 use crate::error::XlsxError;
 use crate::options::FormulaCachePolicy;
 use crate::report::XlsxExportReport;
-use ql_storage::{NamedTarget, Workbook, FIRST_CUSTOM_FORMAT_ID};
+use ql_storage::{FormatId, NamedTarget, Workbook, FIRST_CUSTOM_FORMAT_ID};
 use ql_types::Value;
 
 /// Per-cell fix instruction. **W5-D-14.1 umya-bug workaround:** umya
@@ -45,6 +45,10 @@ enum CellFixKind {
     /// Replace the hardcoded `#VALUE!` sigil with the actual error
     /// sigil.
     OverrideErrorSigil(&'static str),
+    /// **W5-D-15:** inject `s="N"` into the cell's opening tag.
+    /// `N` is the cellXfs index. We dedup unique FormatIds at the
+    /// collection site so each FormatId maps to one xf slot.
+    SetStyle(u32),
 }
 
 /// Convert (col, row) (both 0-indexed) to an A1-style ref.
@@ -84,6 +88,15 @@ pub(crate) fn export_new_workbook(
     // sheet ORDER INDEX (which matches the OOXML sheet1.xml, sheet2.xml
     // numbering for fresh-generated workbooks).
     let mut sheet_fixes: Vec<Vec<CellFix>> = Vec::with_capacity(workbook.sheet_count());
+
+    // **W5-D-15:** build a `FormatId → xf_index` dedup map. Index 0
+    // is reserved for the default xf (numFmtId=0, no applyNumberFormat).
+    // First custom xf gets index 1, next gets 2, etc. The order in
+    // the `cellxfs_roster` Vec is the order they'll be emitted in
+    // `<cellXfs>`.
+    let mut format_to_xf_index: std::collections::HashMap<FormatId, u32> =
+        std::collections::HashMap::new();
+    let mut cellxfs_roster: Vec<FormatId> = Vec::new();
 
     let sheet_count = workbook.sheet_count();
     for sheet_id in 0..sheet_count as u16 {
@@ -199,6 +212,30 @@ pub(crate) fn export_new_workbook(
                 }
             }
         }
+
+        // **W5-D-15:** schedule `s="N"` fixes for every cell with a
+        // format overlay entry. MUST run AFTER the cell-walk fixes
+        // (RemoveStrType / OverrideErrorSigil) so their needles —
+        // which match on the literal `<c r="..." t="..."` prefix —
+        // aren't disrupted by an inserted `s="..."` attribute.
+        let sheet_view = workbook
+            .sheet(sheet_id)
+            .ok_or_else(|| XlsxError::Export(format!("sheet {sheet_id} missing during export")))?;
+        for ((row, col), fid) in sheet_view.format_overlay().iter() {
+            let xf_index = match format_to_xf_index.get(&fid) {
+                Some(idx) => *idx,
+                None => {
+                    let idx = (cellxfs_roster.len() as u32) + 1; // slot 0 reserved
+                    format_to_xf_index.insert(fid, idx);
+                    cellxfs_roster.push(fid);
+                    idx
+                }
+            };
+            fixes.push(CellFix {
+                cell_ref: cell_ref_a1(row, col),
+                kind: CellFixKind::SetStyle(xf_index),
+            });
+        }
         sheet_fixes.push(fixes);
     }
 
@@ -248,7 +285,8 @@ pub(crate) fn export_new_workbook(
         || needs_cell_fixes
         || !custom_formats.is_empty()
         || !defined_names.is_empty()
-        || !tables.is_empty();
+        || !tables.is_empty()
+        || !cellxfs_roster.is_empty();
     if needs_post_process {
         post_process_zip(
             output_path,
@@ -257,6 +295,7 @@ pub(crate) fn export_new_workbook(
             &custom_formats,
             &defined_names,
             &tables,
+            &cellxfs_roster,
         )?;
     }
 
@@ -283,6 +322,7 @@ fn post_process_zip(
     custom_formats: &[(u32, String)],
     defined_names: &[DefinedNameOut],
     tables: &[TableExport],
+    cellxfs_roster: &[FormatId],
 ) -> Result<(), XlsxError> {
     use std::io::{Read, Write};
 
@@ -315,8 +355,13 @@ fn post_process_zip(
                 if !defined_names.is_empty() {
                     content = inject_defined_names_into_workbook_xml(content, defined_names)?;
                 }
-            } else if name == "xl/styles.xml" && !custom_formats.is_empty() {
-                content = inject_custom_formats_into_styles_xml(content, custom_formats)?;
+            } else if name == "xl/styles.xml" {
+                if !custom_formats.is_empty() {
+                    content = inject_custom_formats_into_styles_xml(content, custom_formats)?;
+                }
+                if !cellxfs_roster.is_empty() {
+                    content = inject_cell_xfs_into_styles_xml(content, cellxfs_roster)?;
+                }
             } else if name == "[Content_Types].xml" && !tables.is_empty() {
                 content = inject_table_overrides_into_content_types(content, tables)?;
             } else if let Some(sheet_idx) = sheet_index_from_path(&name) {
@@ -411,6 +456,22 @@ fn apply_cell_fixes_to_sheet_xml(
                 // anchors the match so we only patch the targeted cell.
                 let needle = format!(r#"<c r="{}" t="e"><v>#VALUE!</v>"#, fix.cell_ref);
                 let replacement = format!(r#"<c r="{}" t="e"><v>{}</v>"#, fix.cell_ref, sigil);
+                text = text.replace(&needle, &replacement);
+            }
+            CellFixKind::SetStyle(xf_index) => {
+                // Pattern: `<c r="C5"` → `<c r="C5" s="N"`.
+                // Anchors on the full `r="..."` attr to avoid
+                // collisions with cells whose ref is a prefix
+                // (e.g. matching A1 inside AA1's r-attr is prevented
+                // by the closing `"`). We insert s="..." immediately
+                // after the closing quote of the `r` attr — this
+                // works for both `<c r="C5">` AND `<c r="C5"/>` AND
+                // `<c r="C5" t="...">` forms.
+                let needle = format!(r#"<c r="{}""#, fix.cell_ref);
+                let replacement = format!(r#"<c r="{}" s="{}""#, fix.cell_ref, xf_index);
+                // The needle is the leading prefix of the cell tag;
+                // multiple occurrences across the sheet for different
+                // cells are impossible (cell refs are unique).
                 text = text.replace(&needle, &replacement);
             }
         }
@@ -555,6 +616,74 @@ fn inject_custom_formats_into_styles_xml(
 
     Err(XlsxError::Export(
         "styles.xml missing <styleSheet> root element".to_string(),
+    ))
+}
+
+/// **W5-D-15 (XLSX-4-03 per-cell format closure):** replace umya's
+/// default `<cellXfs>` block with one that enumerates every FormatId
+/// referenced by any cell. Slot 0 is the default xf (numFmtId=0, no
+/// applyNumberFormat); slots 1..N follow the `cellxfs_roster` order
+/// (which matches the `xf_index` values minted at the cell-fix
+/// collection site so `<c s="N">` round-trips correctly).
+fn inject_cell_xfs_into_styles_xml(
+    content: Vec<u8>,
+    cellxfs_roster: &[FormatId],
+) -> Result<Vec<u8>, XlsxError> {
+    let text = String::from_utf8(content)
+        .map_err(|e| XlsxError::Export(format!("styles.xml is not valid UTF-8: {e}")))?;
+
+    let count = cellxfs_roster.len() + 1;
+    let mut block = String::with_capacity(64 * count);
+    block.push_str(&format!(r#"<cellXfs count="{}">"#, count));
+    // Slot 0: default xf.
+    block.push_str(r#"<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>"#);
+    for fid in cellxfs_roster {
+        block.push_str(&format!(
+            concat!(
+                r#"<xf numFmtId="{}" fontId="0" fillId="0" borderId="0" xfId="0" "#,
+                r#"applyNumberFormat="1"/>"#,
+            ),
+            fid.0,
+        ));
+    }
+    block.push_str("</cellXfs>");
+
+    // Case 1: existing <cellXfs> — replace. Closing-tag form first.
+    if let Some(start) = text.find("<cellXfs") {
+        let after = start + "<cellXfs".len();
+        if let Some(close_rel) = text[after..].find("</cellXfs>") {
+            let end = after + close_rel + "</cellXfs>".len();
+            let mut out = String::with_capacity(text.len() + block.len());
+            out.push_str(&text[..start]);
+            out.push_str(&block);
+            out.push_str(&text[end..]);
+            return Ok(out.into_bytes());
+        }
+        if let Some(gt_rel) = text[after..].find('>') {
+            let end = after + gt_rel + 1;
+            if text[after..end].ends_with("/>") {
+                let mut out = String::with_capacity(text.len() + block.len());
+                out.push_str(&text[..start]);
+                out.push_str(&block);
+                out.push_str(&text[end..]);
+                return Ok(out.into_bytes());
+            }
+        }
+    }
+
+    // Case 2: no existing <cellXfs> — insert at the end of styleSheet
+    // (before </styleSheet>). umya always emits a cellXfs block so
+    // this path is defensive only.
+    if let Some(idx) = text.rfind("</styleSheet>") {
+        let mut out = String::with_capacity(text.len() + block.len());
+        out.push_str(&text[..idx]);
+        out.push_str(&block);
+        out.push_str(&text[idx..]);
+        return Ok(out.into_bytes());
+    }
+
+    Err(XlsxError::Export(
+        "styles.xml missing </styleSheet> close — cannot inject <cellXfs>".to_string(),
     ))
 }
 
