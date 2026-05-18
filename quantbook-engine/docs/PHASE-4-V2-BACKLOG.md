@@ -232,6 +232,33 @@ clean Phase 5 work if not done first.
   corrected by the moves.
 - **Audit:** parallel Codex + separate-Opus pass per the engine
   audit-discipline rule — see `docs/audits/2026-05-18-tier-d1-*.md`.
+  2 MEDIUMs + 1 LOW closed in the closure commit; 4 LOWs deferred
+  to D1.a below.
+
+### D1.a (polish) — Tier D1 test-cluster re-partitioning
+
+- **Source:** Tier D1 audit Codex L-2 through L-5.
+- **Impact:** zero behavioral / semantic / gate impact. Pure
+  organizational cleanup.
+- **Scope:** move 4 misplaced test clusters to their semantically
+  correct owning-submodule:
+  1. `add_sheet_rejects_*` tests in `validate.rs::tests` →
+     `sheets.rs::tests`.
+  2. `clear_formula_rejects_invalid_*` tests in
+     `validate.rs::tests` → `cells.rs::tests`.
+  3. W5-147 `set_formula` canonicalization tests in
+     `tables.rs::tests` → `cells.rs::tests`;
+     `set_reference_mode_op_round_trips_through_replay` in
+     `tables.rs::tests` → `config.rs::tests`.
+  4. Pure table-API tests in `cells.rs::tests`
+     (`drop_table_removes_metadata...`,
+     `drop_table_missing_errors`) → `tables.rs::tests`.
+- **Effort:** ~1-2 hours mechanical.
+- **Risk:** none — tests are byte-identical, just relocated.
+- **Why deferred:** bundling came from the natural Phase-2B.7 /
+  W5-147 / W5-148-149 banner cluster boundaries during the
+  D1 extraction. Re-partitioning is appropriate polish but not
+  worth holding D1 closure for.
 
 ### D2. `ql-oplog → ql-io` reverse dependency cleanup
 

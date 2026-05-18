@@ -44,51 +44,12 @@ use ql_types::{ColId, RowId, SheetId, MAX_COLUMN, MAX_ROW};
 
 use crate::plan_cache::{PlanCache, PlanCacheStats};
 
-// **Tier D1 (2026-05-18 — Phase 5 prep, monolith split):** sibling
-// submodules under `crate::workbook_runtime`. Each submodule adds an
-// `impl<'a> WorkbookRuntime<'a> { ... }` block to extend the struct
-// without changing its public API surface. See
-// `docs/architecture/workbook-runtime-split-design.md`.
-//
-// Step 1 (2026-05-18, commit 79c1ebeefa7): error/result types →
-//   `error.rs`. Re-exported here so callers continue to import
-//   `RuntimeError` / `RecomputeFailure` / `RecomputeResult` from
-//   `crate::workbook_runtime` unchanged.
-// Step 3.1 (2026-05-18): format API (intern_format, set_cell_format,
-//   read_display) → `formats.rs`. No public re-export needed (methods
-//   stay on `WorkbookRuntime`).
-// Step 3.2 (2026-05-18): workbook config setters (set_reference_mode,
-//   set_locale) → `config.rs`. As a side effect, the rename_table doc
-//   that was previously misattached to set_reference_mode now correctly
-//   attaches to pub fn rename_table.
-// Step 3.3 (2026-05-18): sheet API (add_sheet, rename_sheet) + the
-//   private `rewrite_formula_text_for_sheet_rename` helper → `sheets.rs`.
-// Step 3.4 (2026-05-18): defined-name API (set_name,
-//   set_sheet_scoped_name) → `names.rs`. Folded-in cleanup: 3
-//   misplaced add_sheet W5-93 tests that should have moved with
-//   Step 3.3 now live in sheets.rs::tests.
-// Step 3.5 (2026-05-18): table mutation API (create_table, drop_table,
-//   rename_table, rename_column, resize_table, reextract_table_readers
-//   private helper) → `tables.rs`. Biggest single step: ~819 LOC impl
-//   + ~1,380 LOC tests (W5-116/118/119/121/122 clusters).
-// Step 3.6 (2026-05-18): recompute pipeline (recompute_all,
-//   recompute_dirty, try_recompute_one_cached,
-//   try_recompute_with_aggregate_cache, try_recompute_with_simd_profile)
-//   → `recompute.rs`. Test clusters: recompute_all, Tier C1, 2B.2, 2B.3,
-//   2B.4, Phase 3.1 calcgraph integration.
-// Step 3.7 (2026-05-18): cell mutation API (set_formula, set_value,
-//   clear_formula, write_spill, write_anchor_error,
-//   reextract_spill_footprint_readers) → `cells.rs`. Largest method-
-//   LOC step: set_formula alone is 417 LOC. Test clusters: set_formula
-//   + set_value + Phase 2A.3.b + Phase 2B.5 + W5-83/90/103-107/124/
-//   125/148/149.
-// Step 3.8 (2026-05-18, FINAL method-extraction step): validation +
-//   transaction API (transaction, validate_formula) → `validate.rs`.
-//   Phase 2B.7 input-validation test cluster (~564 LOC) moved with
-//   it. mod.rs is now down to <600 LOC — close to the ≤ 250 Step 4
-//   final-cleanup target (remaining is constructors + validate_sheet
-//   / validate_cell helpers + Phase 2A.1 named-range tests still in
-//   the inline test module).
+// **Tier D1 (2026-05-18) — Phase 5 prep monolith split.** Sibling
+// submodules under `crate::workbook_runtime`. Each adds an
+// `impl<'a> WorkbookRuntime<'a>` block extending the same struct
+// without changing the public API. Full per-step history with
+// commit hashes lives in `docs/PHASE-4-V2-BACKLOG.md` § D1; design
+// in `docs/architecture/workbook-runtime-split-design.md`.
 mod cells;
 mod config;
 mod error;
@@ -102,9 +63,14 @@ pub use error::{RecomputeFailure, RecomputeResult, RuntimeError};
 
 /// Phase 2A.6 audit H1/L4 (2026-05-12) helper. Confirms `sheet` is in range
 /// before any work that would otherwise panic inside `Workbook::put_at`.
-/// `pub(crate)` so `WorkbookTransaction` can call the same validator at
-/// `put_value` / `put_formula` buffering time.
-pub(crate) fn validate_sheet(workbook: &Workbook, sheet: SheetId) -> Result<(), RuntimeError> {
+///
+/// **Tier D1 audit L-1 closure (2026-05-18):** tightened from
+/// `pub(crate)` to private. The original comment claimed
+/// `WorkbookTransaction` needed it, but `WorkbookTransaction`
+/// actually imports `validate_cell` (which internally calls
+/// `validate_sheet`), not `validate_sheet` directly. No external
+/// caller exists.
+fn validate_sheet(workbook: &Workbook, sheet: SheetId) -> Result<(), RuntimeError> {
     let count = workbook.sheet_count();
     if (sheet as usize) >= count {
         return Err(RuntimeError::InvalidSheet {
@@ -153,9 +119,6 @@ pub(crate) fn validate_cell(
     }
     Ok(())
 }
-
-// (Tier D1 Step 1: error/result types moved to error.rs above —
-//  see the mod declaration + pub use at the top of this file.)
 
 /// Live-formula facade. Wraps a `&mut Workbook` + `&FunctionRegistry`.
 ///
@@ -281,19 +244,4 @@ impl<'a> WorkbookRuntime<'a> {
     pub fn cache_stats(&self) -> PlanCacheStats {
         self.plan_cache.stats()
     }
-
-    // (Tier D1 Step 3.7: 6 cell methods + spill helpers moved
-    //  to cells.rs sibling submodule.)
-
-    // **Tier D1 Step 3.7 + 3.8:** all cell-mutation, recompute,
-    // validation, and transaction methods have been moved to sibling
-    // submodules. See the `mod <name>;` block at the top of this
-    // file. mod.rs now holds only the struct decl, constructors,
-    // `cache_stats`, and `validate_sheet` / `validate_cell` shared
-    // helpers.
 }
-
-// **Tier D1 Step 4:** every method test cluster has been partitioned
-// to the sibling submodule that owns the methods. The inline `mod
-// tests` block previously here is gone; submodule-level tests run
-// alongside their methods.

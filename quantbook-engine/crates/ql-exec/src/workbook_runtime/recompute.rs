@@ -36,6 +36,28 @@ use crate::plan_cache::PlanCacheKey;
 use super::{RecomputeFailure, RecomputeResult, RuntimeError, WorkbookRuntime};
 
 impl<'a> WorkbookRuntime<'a> {
+    /// Re-evaluate every formula in the workbook. Used after `load_workbook` to
+    /// refresh stale values (the qbook loader stores formula text + a sentinel
+    /// value; this method computes the real value).
+    ///
+    /// Iteration order is HashMap-arbitrary, so cross-cell dependencies may
+    /// evaluate in a non-deterministic order. Engine Phase 3 calcgraph
+    /// integration will add topological scheduling for deterministic + correct
+    /// dependency resolution (see `docs/MASTER-PLAN.md` Phase 3.4; tracked as
+    /// GAP-R-01 in `docs/known-gaps.md`).
+    ///
+    /// Phase 2B.2 (2026-05-12): signature changed from `Result<usize,
+    /// RuntimeError>` to `RecomputeResult` (always returns; no Result
+    /// wrapper). The prior shape short-circuited on first failure and
+    /// dropped per-cell context; the new shape continues past failures
+    /// and aggregates them. See [`RecomputeResult`] for the contract.
+    ///
+    /// Cells that fail structurally (lex/parse/bind) keep their
+    /// pre-recompute values and formula text. Cells that succeed have
+    /// their value replaced. Cells whose evaluation produces an Excel-
+    /// canon error value (`#DIV/0!`, `#VALUE!`, etc.) are counted as
+    /// succeeded — those error values are normal cell contents per
+    /// Excel canon, not structural failures.
     pub fn recompute_all(&mut self) -> RecomputeResult {
         // **Tier C1 (2026-05-18 — Phase 4.12 Opus-B H-2 closure):**
         // cycle detection. `recompute_all` is the no-session-attached
