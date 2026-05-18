@@ -502,16 +502,15 @@ The full v1 means all of these crates either ship real behavior or have a docume
 
     **Status (2026-05-17 → 2026-05-18): SHIPPED at 260/260 registered fns** through MASTER-PLAN marker `5d117724f27` (impl HEAD `517bcab08b7` for W5-D-12.1 audit transcripts; subsequent megaudit closure W5-D-13.1 lands on top). Path: W5-D-1..W5-D-7 Wave 3 distributions (+38 → 238), W5-D-8 BIT* (+5 → 243), W5-D-9 base conversion (+6 → 249), W5-D-10 ERF/ERFC family (+4 → 253), W5-D-11 PERCENTILE/QUARTILE (+6 → 259), W5-D-12 SUBTOTAL (+1 → **260** — V1-260 hit). 12 closeout-arc batches with ship+audit commit pairs each (24 audit transcript files: 1 Codex + 1 Opus per batch). Matrix coverage 82% post-W5-D-13.1 megaudit closure per `scripts/report-compat-coverage.sh`. Acceptance: FN4-260-01 ✅ 260 registered; FN4-260-02 ✅ every fn has matrix-backed tests + coverage-discipline EXPLICITLY_DEFERRED entry; FN4-260-03 ✅ unregistered fns produce `#NAME?`. Per-batch audit-discipline rule (parallel Codex + separate-Opus) caught Codex 1H/2M/7L + Opus 5H/10M/20L across the 5 V1-260 closeout batches; all closed in-commit per the `.1` convention. **W5-D-13.1 phase megaudit** (2026-05-18, parallel Codex + Opus + self) caught 6 ADDITIONAL HIGH issues invisible at the per-batch level: 28 range-aware fns missing from `is_aggregate_function` binder admission (extending the W5-D-12 SUBTOTAL-only fix to the whole family), 3 fns unreachable from formula source text (ATAN2/SUMXMY2/DAYS360 — lexer letters>3+digit gap), `GAMMA.INV` finite-subnormal-scale panic (incomplete W5-D-5.1 closure), W5-D-12 closure shipped without recommended named-range e2e test, audit-discipline systemic blind spot for dispatch-path coverage, 21 fns in Date/Time + TRANSPOSE marked ❌ but registered (matrix-registry drift). All 6 HIGHs closed in W5-D-13.1. Known follow-ups (deferred, NOT regressions): (a) literal range refs in `AggregateArg` context (`SUM(A1:A10)`, `CORREL(A1:A4, B1:B4)`) remain unbindable — pre-existing engine-wide gap at `plan.rs:706-731` and `plan.rs:380-383`, affects EVERY aggregate not just Phase 4.10 fns; named-range and scalar-args paths work today via W5-D-13.1; (b) Batch E remainders LOOKUP vector form + LEFTB/RIGHTB/MIDB/LENB/FINDB/SEARCHB byte-length variants. Full audit trail: 24 per-batch transcripts at `docs/audits/2026-05-17-w5-d-*.md` + 3 megaudit transcripts at `docs/audits/2026-05-17-phase-4-10-megaudit-{codex,opus,self}.md`.
 
-11. **4.11 XLSX Import/Export**  
-    Make `ql-io-xlsx` real: workbook load, formulas, cached values, names, sheets, tables, formats, date systems, and export. Start with calamine for read; choose writer deliberately.  
-    References: `.references/formualizer/crates/formualizer-workbook/src/backends/calamine.rs`; `.references/formualizer/crates/formualizer-workbook/src/backends/umya.rs`; `.references/formualizer/crates/formualizer-testkit/src/xlsx.rs`; `.references/ironcalc/base/src/model.rs`.  
-    Acceptance: XLSX-4-01 import common workbooks; XLSX-4-02 formulas recalc through graph; XLSX-4-03 names/tables/formats survive round-trip where supported; XLSX-4-04 corruption and unsupported features surface visible errors.  
-    Effort: 2-4 weeks.
+11. **4.11 XLSX Import/Export** ✅ SHIPPED 2026-05-18 (W5-D-14a → W5-D-15.2 + W5-D-PM-1..5)
+    Make `ql-io-xlsx` real: workbook load, formulas, cached values, names, sheets, tables, formats, date systems, and export.
+    Acceptance: XLSX-4-01 ✅ import common workbooks (177/177 IronCalc fixtures); XLSX-4-02 ✅ formulas recalc through graph; XLSX-4-03 ✅ names/tables/formats/per-cell-application all survive round-trip; XLSX-4-04 ✅ corruption and unsupported features surface via `dropped_features` + Strict policy.
+    Shipped: 11 commits W5-D-14a → W5-D-15.2 + 5 megaudit closure batches (W5-D-PM-1..5) closing 17 of 20 unique HIGHs from a 5-way parallel megaudit. Phase 4.11 megaudit transcripts at `docs/audits/2026-05-18-phase-4-11-megaudit-{design,codex,opus-a,opus-b,opus-c,self,consolidated}.md`. 3 deferred items tracked in `docs/PHASE-4-V2-BACKLOG.md`.
 
-12. **4.12 Phase 4 Megaudit And Compatibility Freeze**  
-    Audit parser, functions, arrays, tables, xlsx, and compatibility matrix.  
-    Acceptance: A4-01 all gates green; A4-02 compatibility matrix is complete enough to guide users; A4-03 Excel corpus smoke suite green; A4-04 test count at least 2x Phase 3 exit count or exception documented.  
-    Effort: 4-6 days.
+12. **4.12 Phase 4 Megaudit And Compatibility Freeze** ✅ SHIPPED 2026-05-18 (W5-D-PM12, PM12-1..PM12-3)
+    Audit parser, functions, arrays, tables, xlsx, and compatibility matrix.
+    Acceptance: A4-01 ✅ all gates green (4135 workspace tests); A4-02 ✅ compatibility matrix (311 rows, 83% coverage); A4-03 ✅ Excel corpus smoke green (177/177 fixtures); A4-04 ✅ test count 4135 / 946 Phase 3 exit = 4.37× (target ≥ 2× cleared).
+    Shipped: 5-way parallel megaudit (Codex / Opus-A / Opus-B / Opus-C / self) caught 19 unique HIGHs invisible at per-sub-phase level; 5 closed (correctness + panic + matrix integrity + NUL-in-strings + parser-and-semantics index); 14 deferred to Phase 5 prep with explicit dispositions in `docs/audits/2026-05-18-phase-4-12-megaudit-consolidated.md` + tracked in `docs/PHASE-4-V2-BACKLOG.md`. Phase 4 exit packet at `docs/phase4/exit-packet.md` (ACTIVE).
 
 **Audit Checkpoints**
 
@@ -523,20 +522,23 @@ The full v1 means all of these crates either ship real behavior or have a docume
 - IDE must open an imported `.xlsx`, show formulas, edit formulas, save `.qbook`, and export `.xlsx`.
 - Formula bar must handle cross-sheet refs, arrays/spills, and localized/R1C1 modes if enabled.
 
-**Exit Criteria**
+**Exit Criteria** — ALL MET (Phase 4 SHIPS 2026-05-18)
 
-- Excel compatibility matrix exists and drives work.
-- Function target is reached or explicitly adjusted.
-- xlsx import/export works for v1 corpus.
-- Arrays/spills/tables/cross-sheet references are graph-integrated.
+- ✅ Excel compatibility matrix exists and drives work (`docs/compat/excel-matrix.md`, 311 rows, 83% coverage).
+- ✅ Function target reached (260 registered fns, V1-260 hit `5d117724f27`).
+- ✅ xlsx import/export works for v1 corpus (177/177 IronCalc fixtures).
+- ✅ Arrays/spills/tables/cross-sheet references are graph-integrated.
+
+**Phase 4 SHIPPED at HEAD `3b8939d9522` on `feat/quantbook-engine`.** Exit packet: `docs/phase4/exit-packet.md` (ACTIVE). Phase 4.11 + 4.12 megaudits closed 17 + 5 = 22 HIGHs invisible at per-batch level; 14 deferred to Phase 5 prep with explicit rationale.
 
 **Documentation Deliverables**
 
-- `docs/phase4/entry-plan.md`.
-- `docs/phase4/exit-packet.md`.
-- `docs/compat/excel-matrix.md`.
-- `docs/architecture/parser-and-semantics.md`.
-- Updated legal/provenance notes.
+- `docs/phase4/entry-plan.md` ⚠️ MISSING (Phase 4 was opportunistic; documented as v1 deferred per Phase 4.12 megaudit self-audit H-1).
+- `docs/phase4/exit-packet.md` ✅ ACTIVE (2026-05-18).
+- `docs/compat/excel-matrix.md` ✅ 311 rows, 83% coverage.
+- `docs/architecture/parser-and-semantics.md` ✅ INDEX shipped 2026-05-18 (W5-D-PM12) pointing at 9 underlying architecture docs.
+- Updated legal/provenance notes ⚠️ EXISTS per-source in `.references/` but no top-level summary; deferred.
+- `docs/PHASE-4-V2-BACKLOG.md` ✅ (NEW 2026-05-18) — aggregated 14 deferred HIGHs from Phase 4.11+4.12 megaudits.
 
 ## Phase 5 - Multi-User CRDT Collaboration
 

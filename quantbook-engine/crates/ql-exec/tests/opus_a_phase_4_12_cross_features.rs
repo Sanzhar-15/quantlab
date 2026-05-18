@@ -881,7 +881,8 @@ fn i26_structured_ref_from_third_sheet() {
     let s_report = wb.add_sheet("Report");
     let reg = default_registry();
     let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-    rt.set_value(s_table, 0, 0, Value::Text("X".into())).unwrap();
+    rt.set_value(s_table, 0, 0, Value::Text("X".into()))
+        .unwrap();
     rt.set_value(s_table, 1, 0, Value::Number(5.0)).unwrap();
     rt.set_value(s_table, 2, 0, Value::Number(10.0)).unwrap();
     rt.create_table(
@@ -912,11 +913,8 @@ fn i27_named_range_survives_sheet_rename() {
     let mut rt = WorkbookRuntime::new(&mut wb, &reg);
     rt.set_value(s, 0, 0, Value::Number(10.0)).unwrap();
     rt.set_value(s, 1, 0, Value::Number(20.0)).unwrap();
-    rt.set_name(
-        "MyRange",
-        NamedTarget::Range(Range::new(s, 0, 0, 1, 0)),
-    )
-    .unwrap();
+    rt.set_name("MyRange", NamedTarget::Range(Range::new(s, 0, 0, 1, 0)))
+        .unwrap();
     rt.set_formula(s, 5, 0, "SUM(MyRange)").unwrap();
     rt.rename_sheet(s, "RenamedData").unwrap();
     let _ = rt.recompute_all();
