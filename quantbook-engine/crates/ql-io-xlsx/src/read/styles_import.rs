@@ -44,6 +44,24 @@ pub(crate) fn register_custom_formats(
         if entry.num_fmt_id < ql_storage::FIRST_CUSTOM_FORMAT_ID {
             continue;
         }
+        // **W5-D-PM-2 (megaudit Opus-B HIGH-1 closure):** reject
+        // attacker-controlled numFmtIds beyond Excel's plausible
+        // ceiling. Excel's legal numFmtId range tops out at ~32767;
+        // anything higher is either malformed or a hostile attempt
+        // to trigger the `FormatTable::register_at` arithmetic
+        // overflow at `format.rs:153` (`self.next_custom_id = id.0 + 1`
+        // panics on u32::MAX).
+        const MAX_PLAUSIBLE_NUMFMT_ID: u32 = u16::MAX as u32; // 65535
+        if entry.num_fmt_id > MAX_PLAUSIBLE_NUMFMT_ID {
+            return Err(XlsxError::MalformedOoxml {
+                part: "xl/styles.xml".to_string(),
+                message: format!(
+                    "numFmtId {} exceeds plausible ceiling {} (rejecting to \
+                     avoid FormatTable overflow)",
+                    entry.num_fmt_id, MAX_PLAUSIBLE_NUMFMT_ID
+                ),
+            });
+        }
         let id = FormatId(entry.num_fmt_id);
         // **W5-D-14.1 (audit HIGH-8 closure):** real-world xlsx files
         // from LibreOffice / Google Sheets sometimes emit

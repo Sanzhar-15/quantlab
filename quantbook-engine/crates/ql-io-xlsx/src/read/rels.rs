@@ -145,10 +145,23 @@ pub(crate) fn resolve_rel_target(rels_path: &str, target: &str) -> String {
         base.clear();
     }
 
+    // **W5-D-PM-2 (megaudit Opus-B HIGH-3 closure — SECURITY):**
+    // reject `..` walks that escape the package root. A hostile xlsx
+    // with `<Relationship Target="../../../etc/passwd"/>` would
+    // otherwise produce a path that escapes the zip-package
+    // boundary. The resolved path is downstream used in zip-entry
+    // comparisons + error messages; opens path-confusion-style
+    // attacks if any caller ever writes to disk using these paths.
     let mut segments: Vec<&str> = base.split('/').filter(|s| !s.is_empty()).collect();
     for part in target.split('/') {
         if part == ".." {
-            segments.pop();
+            if segments.pop().is_none() {
+                // `..` walked past the package root. Return a
+                // sentinel empty path so the caller's zip lookup
+                // fails (no entry at "" exists) and the downstream
+                // surface produces a typed error.
+                return String::new();
+            }
         } else if part != "." && !part.is_empty() {
             segments.push(part);
         }

@@ -250,6 +250,21 @@ fn parse_sheet_attrs<'a>(
             message: "<sheet> element missing required name attribute".to_string(),
         });
     }
+    // **W5-D-PM-2 (megaudit Opus-B HIGH-4 closure):** reject sheet
+    // names containing control characters (NUL, BEL, etc.). Excel's
+    // sheet-name rules forbid these; LibreOffice does too. Without
+    // this check, hostile fixtures with `"Sheet\x00Foo"` import
+    // cleanly, export via umya, then real Excel rejects with a
+    // repair dialog when the user opens the output.
+    if name
+        .chars()
+        .any(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r')
+    {
+        return Err(XlsxError::MalformedOoxml {
+            part: part.to_string(),
+            message: "<sheet name=...> contains control character(s) — Excel rejects".to_string(),
+        });
+    }
     Ok(Some(SheetMeta {
         name,
         sheet_id,

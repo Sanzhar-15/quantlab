@@ -43,7 +43,16 @@ impl XlsxPackage {
             Err(zip::result::ZipError::FileNotFound) => return Ok(None),
             Err(e) => return Err(XlsxError::Zip(e)),
         };
-        let mut content = String::with_capacity(file.size() as usize);
+        // **W5-D-PM-2 (megaudit Opus-B HIGH-5 closure — DoS):**
+        // cap the pre-allocation. A hostile zip can declare a 4 GiB
+        // entry size; the prior `String::with_capacity(file.size()
+        // as usize)` would pre-allocate that much before reading a
+        // single byte. Cap at 64 MiB; for legitimate larger files
+        // (rare in xlsx — sharedStrings or huge sheetData) the
+        // String grows dynamically.
+        const MAX_PREALLOC: u64 = 64 * 1024 * 1024;
+        let prealloc = file.size().min(MAX_PREALLOC) as usize;
+        let mut content = String::with_capacity(prealloc);
         file.read_to_string(&mut content)?;
         Ok(Some(content))
     }

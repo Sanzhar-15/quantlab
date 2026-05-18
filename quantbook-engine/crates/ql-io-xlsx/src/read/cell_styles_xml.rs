@@ -76,7 +76,16 @@ pub(crate) fn parse_cell_styles_xml(
 }
 
 /// Parse `A1` / `BC42` into `(row, col)` zero-indexed. Returns
-/// `None` for malformed refs (empty, no digits, etc.).
+/// `None` for malformed refs (empty, no digits, etc.) AND for refs
+/// outside Excel's address grid (col > MAX_COLUMN, row > MAX_ROW).
+///
+/// **W5-D-PM-2 (megaudit Opus-B HIGH-2 / self M-6 closure):** the
+/// prior version accepted arbitrary letter counts + row digit
+/// strings. Hostile inputs like `<c r="XFE1" s="3"/>` (col 16384,
+/// one past MAX_COLUMN) silently stored entries in
+/// `Sheet::format_overlay`, then round-tripped as malformed output.
+/// `parse_a1_cell` now bounds-checks against ql_types::MAX_ROW /
+/// MAX_COLUMN.
 fn parse_a1_cell(text: &str) -> Option<(RowId, ColId)> {
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -86,6 +95,12 @@ fn parse_a1_cell(text: &str) -> Option<(RowId, ColId)> {
     if i == 0 || i == bytes.len() {
         return None;
     }
+    // Excel's max column label is "XFD" = 3 letters. Anything longer
+    // is out-of-range; reject early to avoid u32 overflow and to
+    // honor the address grid.
+    if i > 3 {
+        return None;
+    }
     let col_letters = &text[..i];
     let row_digits = &text[i..];
     let mut col: u32 = 0;
@@ -93,14 +108,20 @@ fn parse_a1_cell(text: &str) -> Option<(RowId, ColId)> {
         if !c.is_ascii_alphabetic() {
             return None;
         }
-        col = col * 26 + (c.to_ascii_uppercase() as u32 - b'A' as u32 + 1);
+        col = col
+            .checked_mul(26)?
+            .checked_add(c.to_ascii_uppercase() as u32 - b'A' as u32 + 1)?;
     }
     let col = col.checked_sub(1)?;
     let row: u32 = row_digits.parse().ok()?;
     if row == 0 {
         return None;
     }
-    Some((row - 1, col))
+    let row_zero_idx = row - 1;
+    if col > ql_types::MAX_COLUMN || row_zero_idx > ql_types::MAX_ROW {
+        return None;
+    }
+    Some((row_zero_idx, col))
 }
 
 #[cfg(test)]

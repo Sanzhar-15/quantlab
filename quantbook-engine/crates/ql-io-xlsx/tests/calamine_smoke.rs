@@ -1247,6 +1247,148 @@ fn w5_d_pm_1_blank_overlay_below_existing_row_keeps_sorted() {
 }
 
 #[test]
+fn w5_d_pm_2_numfmt_id_overflow_rejected() {
+    // **W5-D-PM-2 (megaudit Opus-B HIGH-1 closure):** attacker-
+    // controlled numFmtId near u32::MAX must be rejected, not
+    // panic the importer via FormatTable::register_at's
+    // `next_custom_id = id.0 + 1` overflow.
+    use std::io::Write;
+    use zip::write::FileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let mut bytes: Vec<u8> = Vec::new();
+    {
+        let mut zw = ZipWriter::new(std::io::Cursor::new(&mut bytes));
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+        zw.start_file("[Content_Types].xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>").unwrap();
+        zw.start_file("xl/workbook.xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheets><sheet name=\"S\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>").unwrap();
+        zw.start_file("xl/_rels/workbook.xml.rels", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships>").unwrap();
+        zw.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData/></worksheet>").unwrap();
+        zw.start_file("xl/styles.xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><numFmts count=\"1\"><numFmt numFmtId=\"4294967295\" formatCode=\"custom\"/></numFmts></styleSheet>").unwrap();
+        zw.finish().unwrap();
+    }
+    let registry = ql_functions::default_registry();
+    let opts = XlsxImportOptions::default();
+    let result = ql_io_xlsx::import_xlsx_bytes(&bytes, &registry, opts);
+    assert!(
+        matches!(result, Err(ql_io_xlsx::XlsxError::MalformedOoxml { .. })),
+        "expected MalformedOoxml for u32::MAX numFmtId, got {result:?}"
+    );
+}
+
+#[test]
+fn w5_d_pm_2_oob_cell_ref_skipped_silently() {
+    // **W5-D-PM-2 (megaudit Opus-B HIGH-2 closure):** `<c r="XFE1" s="1"/>`
+    // (col 16384, one past MAX_COLUMN) must NOT be stored in
+    // format_overlay. parse_a1_cell rejects; the cell is silently
+    // skipped (downgrade from panic surface to silent skip is the
+    // immediate fix; surfacing as a warning is a follow-up).
+    use std::io::Write;
+    use zip::write::FileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let mut bytes: Vec<u8> = Vec::new();
+    {
+        let mut zw = ZipWriter::new(std::io::Cursor::new(&mut bytes));
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+        zw.start_file("[Content_Types].xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>").unwrap();
+        zw.start_file("xl/workbook.xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheets><sheet name=\"S\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>").unwrap();
+        zw.start_file("xl/_rels/workbook.xml.rels", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships>").unwrap();
+        zw.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData><row r=\"1\"><c r=\"XFE1\" s=\"1\"/><c r=\"A1048577\" s=\"1\"/></row></sheetData></worksheet>").unwrap();
+        zw.start_file("xl/styles.xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><cellXfs count=\"2\"><xf numFmtId=\"0\"/><xf numFmtId=\"164\" applyNumberFormat=\"1\"/></cellXfs><numFmts count=\"1\"><numFmt numFmtId=\"164\" formatCode=\"yyyy-mm-dd\"/></numFmts></styleSheet>").unwrap();
+        zw.finish().unwrap();
+    }
+    let registry = ql_functions::default_registry();
+    let result = ql_io_xlsx::import_xlsx_bytes(
+        &bytes,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // OOB refs are silently skipped — overlay should be empty.
+    let overlay = result.workbook.sheet(0).unwrap().format_overlay();
+    assert_eq!(overlay.len(), 0, "OOB cell refs should NOT be stored");
+}
+
+#[test]
+fn w5_d_pm_2_path_traversal_rels_rejected() {
+    // **W5-D-PM-2 (megaudit Opus-B HIGH-3 closure — SECURITY):**
+    // `<Relationship Target="../../../etc/passwd"/>` must NOT
+    // resolve outside the package root. `resolve_rel_target` now
+    // returns an empty path when `..` walks past the root; the
+    // downstream zip lookup fails and the part is silently absent.
+    use ql_io_xlsx::import_xlsx_bytes;
+    use std::io::Write;
+    use zip::write::FileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let mut bytes: Vec<u8> = Vec::new();
+    {
+        let mut zw = ZipWriter::new(std::io::Cursor::new(&mut bytes));
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+        zw.start_file("[Content_Types].xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>").unwrap();
+        zw.start_file("xl/workbook.xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheets><sheet name=\"S\" sheetId=\"1\" r:id=\"rEvil\"/></sheets></workbook>").unwrap();
+        zw.start_file("xl/_rels/workbook.xml.rels", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rEvil\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"../../../etc/passwd\"/></Relationships>").unwrap();
+        zw.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData/></worksheet>").unwrap();
+        zw.finish().unwrap();
+    }
+    let registry = ql_functions::default_registry();
+    // Should NOT panic; should NOT crash. The unknown-r:id-resolves-
+    // to-empty-path is now safe behavior (the sheet's part path is
+    // empty, downstream loops skip it).
+    let _ = import_xlsx_bytes(&bytes, &registry, XlsxImportOptions::default());
+}
+
+#[test]
+fn w5_d_pm_2_sheet_name_with_control_char_rejected() {
+    // **W5-D-PM-2 (megaudit Opus-B HIGH-4 closure):** sheet names
+    // containing NUL / control chars must be rejected, not silently
+    // round-tripped into output that Excel rejects.
+    use std::io::Write;
+    use zip::write::FileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let mut bytes: Vec<u8> = Vec::new();
+    {
+        let mut zw = ZipWriter::new(std::io::Cursor::new(&mut bytes));
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+        zw.start_file("[Content_Types].xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>").unwrap();
+        zw.start_file("xl/workbook.xml", opts).unwrap();
+        // Sheet name contains a literal NUL char (via XML entity).
+        zw.write_all(b"<?xml version=\"1.0\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheets><sheet name=\"Sheet\x07Bad\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>").unwrap();
+        zw.start_file("xl/_rels/workbook.xml.rels", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships>").unwrap();
+        zw.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+        zw.write_all(b"<?xml version=\"1.0\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData/></worksheet>").unwrap();
+        zw.finish().unwrap();
+    }
+    let registry = ql_functions::default_registry();
+    let result = ql_io_xlsx::import_xlsx_bytes(&bytes, &registry, XlsxImportOptions::default());
+    assert!(
+        matches!(result, Err(ql_io_xlsx::XlsxError::MalformedOoxml { .. })),
+        "expected MalformedOoxml for sheet name with control char, got {result:?}"
+    );
+}
+
+#[test]
 fn w5_d_15_2_blank_cell_with_format_overlay_round_trips() {
     // **W5-D-15.2 (Codex audit HIGH-4 / self-audit H-1 closure):** a
     // cell with NO value and NO formula but a registered format
