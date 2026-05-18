@@ -1,3 +1,5 @@
+#![allow(clippy::approx_constant, unused_imports, dead_code)]
+
 //! Opus-A megaudit deep probe — round-trip invariants.
 //!
 //! Goes beyond the count-equivalence corpus probe to verify cell-level,
@@ -29,7 +31,9 @@ fn import_skip(path: &std::path::Path) -> Option<XlsxImportResult> {
     .ok()
 }
 
-fn round_trip(path: &std::path::Path) -> Option<(XlsxImportResult, XlsxImportResult, std::path::PathBuf)> {
+fn round_trip(
+    path: &std::path::Path,
+) -> Option<(XlsxImportResult, XlsxImportResult, std::path::PathBuf)> {
     let first = import_skip(path)?;
     let tmp = std::env::temp_dir().join(format!(
         "opus-a-deep-{}-{}.xlsx",
@@ -37,7 +41,13 @@ fn round_trip(path: &std::path::Path) -> Option<(XlsxImportResult, XlsxImportRes
         std::process::id(),
     ));
     let _ = std::fs::remove_file(&tmp);
-    export_xlsx_path(&first.workbook, &registry(), &tmp, XlsxExportOptions::default()).ok()?;
+    export_xlsx_path(
+        &first.workbook,
+        &registry(),
+        &tmp,
+        XlsxExportOptions::default(),
+    )
+    .ok()?;
     let second = import_skip(&tmp)?;
     Some((first, second, tmp))
 }
@@ -167,7 +177,10 @@ fn deep_name_round_trip() {
                 None => {
                     dropped += 1;
                     if details.len() < 60 {
-                        details.push(format!("{} DROP name={:?} target={:?}", short, name, target1));
+                        details.push(format!(
+                            "{} DROP name={:?} target={:?}",
+                            short, name, target1
+                        ));
                     }
                 }
                 Some(target2) => {
@@ -193,7 +206,9 @@ fn deep_name_round_trip() {
                 if matches!(target1, NamedTarget::Formula(_)) {
                     formula_fallbacks += 1;
                 }
-                let look = s2_opt.as_ref().and_then(|s| s.scoped_names().lookup_ci(name));
+                let look = s2_opt
+                    .as_ref()
+                    .and_then(|s| s.scoped_names().lookup_ci(name));
                 match look {
                     None => {
                         dropped += 1;
@@ -226,7 +241,10 @@ fn deep_name_round_trip() {
     println!("Total names (orig): {}", total_names);
     println!("  Dropped:         {}", dropped);
     println!("  Diverged:        {}", diverged);
-    println!("  FormulaFallbacks (subset of total): {}", formula_fallbacks);
+    println!(
+        "  FormulaFallbacks (subset of total): {}",
+        formula_fallbacks
+    );
     println!("--- First 60 details ---");
     for d in &details {
         println!("  {}", d);
@@ -279,7 +297,10 @@ fn deep_tables_round_trip() {
                 Some(t2) => {
                     let mut diffs: Vec<String> = Vec::new();
                     if t1.display_name != t2.display_name {
-                        diffs.push(format!("display: {:?} vs {:?}", t1.display_name, t2.display_name));
+                        diffs.push(format!(
+                            "display: {:?} vs {:?}",
+                            t1.display_name, t2.display_name
+                        ));
                     }
                     if t1.sheet != t2.sheet {
                         diffs.push(format!("sheet: {} vs {}", t1.sheet, t2.sheet));
@@ -327,7 +348,12 @@ fn deep_tables_round_trip() {
                     if !diffs.is_empty() {
                         diverged += 1;
                         if details.len() < 60 {
-                            details.push(format!("{} DIV table={:?} {}", short, canon, diffs.join("; ")));
+                            details.push(format!(
+                                "{} DIV table={:?} {}",
+                                short,
+                                canon,
+                                diffs.join("; ")
+                            ));
                         }
                     }
                 }
@@ -584,7 +610,7 @@ fn deep_formula_text_round_trip() {
 #[test]
 #[ignore]
 fn deep_synthetic_cross_feature() {
-    use ql_storage::{TableColumn, TableMetadata, TotalsFunction, FormatId};
+    use ql_storage::{FormatId, TableColumn, TableMetadata, TotalsFunction};
     use ql_types::{Address, DateSystem, Range};
     use std::sync::Arc;
 
@@ -607,16 +633,17 @@ fn deep_synthetic_cross_feature() {
     wb.put_at(s2, 0, 0, Value::Number(100.0));
 
     // Workbook-scoped names: cell, range, number, text, boolean.
-    wb.set_name("MyCell", NamedTarget::Cell(Address::new(s1, 0, 0))).unwrap();
-    wb.set_name(
-        "MyRange",
-        NamedTarget::Range(Range::new(s1, 0, 0, 1, 2)),
-    )
-    .unwrap();
+    wb.set_name("MyCell", NamedTarget::Cell(Address::new(s1, 0, 0)))
+        .unwrap();
+    wb.set_name("MyRange", NamedTarget::Range(Range::new(s1, 0, 0, 1, 2)))
+        .unwrap();
     wb.set_name("Pi", NamedTarget::Constant(Value::Number(3.14)))
         .unwrap();
-    wb.set_name("Greeting", NamedTarget::Constant(Value::text("hello \"world\"")))
-        .unwrap();
+    wb.set_name(
+        "Greeting",
+        NamedTarget::Constant(Value::text("hello \"world\"")),
+    )
+    .unwrap();
     wb.set_name("Flag", NamedTarget::Constant(Value::Boolean(true)))
         .unwrap();
     // Sheet-scoped name.
@@ -632,8 +659,10 @@ fn deep_synthetic_cross_feature() {
     let custom_id_2 = wb.formats_mut().intern("#,##0.00 \"USD\"");
     let custom_id_3 = wb.formats_mut().intern("0.00;[Red]-0.00;\"-\"");
     let custom_id_4 = wb.formats_mut().intern("#,##0 \"& <foo>\""); // XML-special chars
-    println!("synthetic custom ids: {} {} {} {}",
-        custom_id_1.0, custom_id_2.0, custom_id_3.0, custom_id_4.0);
+    println!(
+        "synthetic custom ids: {} {} {} {}",
+        custom_id_1.0, custom_id_2.0, custom_id_3.0, custom_id_4.0
+    );
     // Overlay entries.
     {
         let sheet = wb.sheet_mut(s1).unwrap();
@@ -674,10 +703,17 @@ fn deep_synthetic_cross_feature() {
 
     let tmp = std::env::temp_dir().join("opus-a-synth.xlsx");
     let _ = std::fs::remove_file(&tmp);
-    let exp_report = export_xlsx_path(&wb, &registry(), &tmp, XlsxExportOptions::default()).unwrap();
+    let exp_report =
+        export_xlsx_path(&wb, &registry(), &tmp, XlsxExportOptions::default()).unwrap();
     println!("export.cells_written = {}", exp_report.cells_written);
-    println!("export.formula_caches_written = {}", exp_report.formula_caches_written);
-    println!("export.dropped_features = {:?}", exp_report.dropped_features);
+    println!(
+        "export.formula_caches_written = {}",
+        exp_report.formula_caches_written
+    );
+    println!(
+        "export.dropped_features = {:?}",
+        exp_report.dropped_features
+    );
     println!("export.warnings = {:?}", exp_report.warnings);
 
     let second = import_skip(&tmp).expect("re-import");
@@ -732,7 +768,13 @@ fn deep_synthetic_cross_feature() {
         }
         match second.workbook.formats().lookup(id) {
             Some(c2) => {
-                println!("custom fmt {} orig={:?} new={:?} match={}", id.0, code, c2, code == c2);
+                println!(
+                    "custom fmt {} orig={:?} new={:?} match={}",
+                    id.0,
+                    code,
+                    c2,
+                    code == c2
+                );
             }
             None => {
                 println!("custom fmt {} {:?} DROPPED", id.0, code);
@@ -747,7 +789,12 @@ fn deep_synthetic_cross_feature() {
         let code_new = v2.and_then(|f| second.workbook.formats().lookup(f));
         println!(
             "overlay ({},{}) orig_id={} ({:?}) new={:?} ({:?})",
-            r, c, fid.0, code_orig, v2.map(|f| f.0), code_new
+            r,
+            c,
+            fid.0,
+            code_orig,
+            v2.map(|f| f.0),
+            code_new
         );
     }
 
@@ -758,13 +805,25 @@ fn deep_synthetic_cross_feature() {
             Some(t2) => {
                 println!(
                     "table {:?} hdr=({},{}) tot=({},{}) display=({:?},{:?}) cols={}",
-                    canon, t1.has_header, t2.has_header, t1.has_totals, t2.has_totals,
-                    t1.display_name, t2.display_name, t2.columns.len(),
+                    canon,
+                    t1.has_header,
+                    t2.has_header,
+                    t1.has_totals,
+                    t2.has_totals,
+                    t1.display_name,
+                    t2.display_name,
+                    t2.columns.len(),
                 );
                 for (i, (c1, c2)) in t1.columns.iter().zip(t2.columns.iter()).enumerate() {
                     println!(
                         "  col[{}] id=({}->{}) display=({:?}->{:?}) totals=({:?}->{:?})",
-                        i, c1.id, c2.id, c1.display, c2.display, c1.totals_function, c2.totals_function
+                        i,
+                        c1.id,
+                        c2.id,
+                        c1.display,
+                        c2.display,
+                        c1.totals_function,
+                        c2.totals_function
                     );
                 }
             }
@@ -780,8 +839,7 @@ fn deep_synthetic_cross_feature() {
 #[test]
 #[ignore]
 fn deep_update_original_strict_policy() {
-    let candidate = std::path::Path::new(FIXTURE_ROOT)
-        .join("ironcalc/xlsx/tests/example.xlsx");
+    let candidate = std::path::Path::new(FIXTURE_ROOT).join("ironcalc/xlsx/tests/example.xlsx");
     if !candidate.exists() {
         println!("skip: missing fixture {}", candidate.display());
         return;
@@ -800,8 +858,15 @@ fn deep_update_original_strict_policy() {
     )
     .expect("import");
     let preservation = result.preservation.expect("preservation");
-    println!("imported {}, original_bytes={}", candidate.display(), preservation.original_bytes.len());
-    println!("feature_inventory: {:?}", result.report.feature_inventory.counts);
+    println!(
+        "imported {}, original_bytes={}",
+        candidate.display(),
+        preservation.original_bytes.len()
+    );
+    println!(
+        "feature_inventory: {:?}",
+        result.report.feature_inventory.counts
+    );
 
     // UpdateOriginal with Permissive.
     let tmp_perm = std::env::temp_dir().join("opus-a-perm.xlsx");
@@ -827,7 +892,10 @@ fn deep_update_original_strict_policy() {
         perm_report.warnings.len()
     );
     for d in &perm_report.dropped_features {
-        println!("  PERM-DROP kind={:?} part={:?} detail={:?}", d.kind, d.part, d.detail);
+        println!(
+            "  PERM-DROP kind={:?} part={:?} detail={:?}",
+            d.kind, d.part, d.detail
+        );
     }
     // Re-import and check.
     if let Ok(re) = import_xlsx_path(
@@ -838,7 +906,8 @@ fn deep_update_original_strict_policy() {
             ..Default::default()
         },
     ) {
-        println!("perm re-import: sheets={} fml={} ovrl={} names={} tables={}",
+        println!(
+            "perm re-import: sheets={} fml={} ovrl={} names={} tables={}",
             re.workbook.sheet_count(),
             re.workbook.iter_formulas().count(),
             (0..re.workbook.sheet_count() as u16)
@@ -868,7 +937,10 @@ fn deep_update_original_strict_policy() {
             formula_cache: FormulaCachePolicy::WriteRecomputed,
         },
     );
-    println!("strict outcome: {:?}", strict_outcome.as_ref().err().map(|e| format!("{e}")));
+    println!(
+        "strict outcome: {:?}",
+        strict_outcome.as_ref().err().map(|e| format!("{e}"))
+    );
     // Cleanup whatever the strict path may have left.
     let _ = std::fs::remove_file(&tmp_strict);
 }
@@ -885,13 +957,29 @@ fn deep_strict_with_vba() {
     {
         use std::io::Write;
         let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-        let opts = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let opts =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         let parts: &[(&str, &str)] = &[
-            ("[Content_Types].xml", r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.ms-excel.sheet.macroEnabled.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/vbaProject.bin" ContentType="application/vnd.ms-office.vbaProject"/></Types>"#),
-            ("_rels/.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#),
-            ("xl/_rels/workbook.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#),
-            ("xl/workbook.xml", r#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#),
-            ("xl/worksheets/sheet1.xml", r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/></worksheet>"#),
+            (
+                "[Content_Types].xml",
+                r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.ms-excel.sheet.macroEnabled.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/vbaProject.bin" ContentType="application/vnd.ms-office.vbaProject"/></Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/></worksheet>"#,
+            ),
             ("xl/vbaProject.bin", "fake-vba-bytes"),
         ];
         for (name, content) in parts {
@@ -916,7 +1004,10 @@ fn deep_strict_with_vba() {
     .expect("import-vba");
     let preservation = result.preservation.unwrap();
 
-    println!("vba inventory: {:?}", result.report.feature_inventory.counts);
+    println!(
+        "vba inventory: {:?}",
+        result.report.feature_inventory.counts
+    );
 
     // Permissive UpdateOriginal — VBA should land in dropped_features.
     let tmp_perm = std::env::temp_dir().join("opus-a-vba-perm.xlsx");
@@ -926,13 +1017,21 @@ fn deep_strict_with_vba() {
         &registry,
         &tmp_perm,
         XlsxExportOptions {
-            mode: ExportMode::UpdateOriginal { source: preservation.clone() },
+            mode: ExportMode::UpdateOriginal {
+                source: preservation.clone(),
+            },
             unsupported_policy: UnsupportedPolicy::Permissive,
             formula_cache: FormulaCachePolicy::WriteRecomputed,
         },
     )
     .expect("perm export with vba");
-    println!("vba perm dropped: {:?}", perm.dropped_features.iter().map(|d| format!("{:?}", d.kind)).collect::<Vec<_>>());
+    println!(
+        "vba perm dropped: {:?}",
+        perm.dropped_features
+            .iter()
+            .map(|d| format!("{:?}", d.kind))
+            .collect::<Vec<_>>()
+    );
     let _ = std::fs::remove_file(&tmp_perm);
 
     // Strict UpdateOriginal — should error.
@@ -943,12 +1042,17 @@ fn deep_strict_with_vba() {
         &registry,
         &tmp_strict,
         XlsxExportOptions {
-            mode: ExportMode::UpdateOriginal { source: preservation },
+            mode: ExportMode::UpdateOriginal {
+                source: preservation,
+            },
             unsupported_policy: UnsupportedPolicy::Strict,
             formula_cache: FormulaCachePolicy::WriteRecomputed,
         },
     );
-    println!("vba strict outcome: {:?}", strict.as_ref().err().map(|e| format!("{e}")));
+    println!(
+        "vba strict outcome: {:?}",
+        strict.as_ref().err().map(|e| format!("{e}"))
+    );
     println!("vba strict result_path_exists: {}", tmp_strict.exists());
     let _ = std::fs::remove_file(&tmp_strict);
     let _ = std::fs::remove_file(&tmp_in);

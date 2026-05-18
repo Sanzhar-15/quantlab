@@ -1105,6 +1105,148 @@ fn w5_d_15_2_cross_sheet_roster_byte_deterministic() {
 }
 
 #[test]
+fn w5_d_pm_1_formula_with_error_cache_round_trips_as_error() {
+    // **W5-D-PM-1 (megaudit Codex HIGH-2 / Opus-A HIGH-1 closure):**
+    // a formula cell whose cached value is `Value::Error(_)` must
+    // round-trip as `Value::Error(same variant)` — NOT as
+    // `Value::Text("#DIV/0!")`. Empirical impact pre-fix: 10.1% of
+    // corpus cells diverged this way.
+    use ql_storage::Workbook;
+    use ql_types::{ErrorValue, Value};
+
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("Sheet1");
+    wb.put_at(s, 0, 0, Value::Error(ErrorValue::DivZero));
+    wb.put_formula(s, 0, 0, "1/0");
+    wb.put_at(s, 1, 0, Value::Error(ErrorValue::NA));
+    wb.put_formula(s, 1, 0, "NA()");
+    wb.put_at(s, 2, 0, Value::Error(ErrorValue::Name));
+    wb.put_formula(s, 2, 0, "UNKNOWNFUNC()");
+
+    let tmp = std::env::temp_dir().join("w5-d-pm-1-formula-error.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+    export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let sheet = result.workbook.sheet(0).unwrap();
+    assert_eq!(sheet.read(0, 0), Value::Error(ErrorValue::DivZero));
+    assert_eq!(sheet.read(1, 0), Value::Error(ErrorValue::NA));
+    assert_eq!(sheet.read(2, 0), Value::Error(ErrorValue::Name));
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn w5_d_pm_1_formula_with_boolean_cache_round_trips_as_boolean() {
+    // **W5-D-PM-1 (megaudit Codex HIGH-1 closure):** formula cell with
+    // boolean cached value must round-trip as Boolean, not Text("TRUE").
+    use ql_storage::Workbook;
+    use ql_types::Value;
+
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("Sheet1");
+    wb.put_at(s, 0, 0, Value::Boolean(true));
+    wb.put_formula(s, 0, 0, "TRUE()");
+    wb.put_at(s, 1, 0, Value::Boolean(false));
+    wb.put_formula(s, 1, 0, "FALSE()");
+
+    let tmp = std::env::temp_dir().join("w5-d-pm-1-formula-bool.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+    export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let sheet = result.workbook.sheet(0).unwrap();
+    assert_eq!(sheet.read(0, 0), Value::Boolean(true));
+    assert_eq!(sheet.read(1, 0), Value::Boolean(false));
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn w5_d_pm_1_blank_overlay_below_existing_row_keeps_sorted() {
+    // **W5-D-PM-1 (megaudit Codex HIGH-3 closure):** W5-D-15.2's
+    // `insert_style_only_cell` appended new `<row>` elements at
+    // end-of-sheetData regardless of row order. A workbook with
+    // overlay-only at row 0 + value at row 5 would emit
+    // `<sheetData>...<row r="6">...</row><row r="1">.../></row>...`
+    // — invalid OOXML order. Now we insert sorted.
+    use ql_storage::Workbook;
+    use ql_types::Value;
+
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("Sheet1");
+    let custom = wb.formats_mut().intern("yyyy-mm-dd");
+    // Overlay-only at (0, 0).
+    wb.sheet_mut(s)
+        .unwrap()
+        .format_overlay_mut()
+        .set(0, 0, custom);
+    // Value at (5, 0) — bigger row.
+    wb.put_at(s, 5, 0, Value::Number(42.0));
+
+    let tmp = std::env::temp_dir().join("w5-d-pm-1-row-order.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+    export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+
+    // Inspect the sheet xml's row order.
+    let bytes = std::fs::read(&tmp).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut sheet_xml = String::new();
+    std::io::Read::read_to_string(
+        &mut zip.by_name("xl/worksheets/sheet1.xml").unwrap(),
+        &mut sheet_xml,
+    )
+    .unwrap();
+
+    let pos_row_1 = sheet_xml.find(r#"<row r="1""#).expect("row 1 missing");
+    let pos_row_6 = sheet_xml.find(r#"<row r="6""#).expect("row 6 missing");
+    assert!(
+        pos_row_1 < pos_row_6,
+        "row order violated (row 6 appears before row 1)"
+    );
+
+    // Re-import sanity.
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        result.workbook.sheet(0).unwrap().read(5, 0),
+        Value::Number(42.0)
+    );
+    assert_eq!(
+        result.workbook.sheet(0).unwrap().format_overlay().get(0, 0),
+        Some(custom)
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
 fn w5_d_15_2_blank_cell_with_format_overlay_round_trips() {
     // **W5-D-15.2 (Codex audit HIGH-4 / self-audit H-1 closure):** a
     // cell with NO value and NO formula but a registered format

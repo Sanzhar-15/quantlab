@@ -39,16 +39,32 @@ struct CellFix {
 #[derive(Debug, Clone)]
 enum CellFixKind {
     /// Remove the `t="str"` attribute from this cell. Used for
-    /// formula cells whose cached value is numeric (Number / Boolean).
-    /// After removal the cell has default type "n".
+    /// formula cells whose cached value is numeric. After removal
+    /// the cell has default type "n".
     RemoveStrType,
     /// Replace the hardcoded `#VALUE!` sigil with the actual error
-    /// sigil.
+    /// sigil. Used only for non-formula error cells (umya emits
+    /// `<c r="A1" t="e"><v>#VALUE!</v></c>` regardless of the
+    /// actual error variant).
     OverrideErrorSigil(&'static str),
     /// **W5-D-15:** inject `s="N"` into the cell's opening tag.
-    /// `N` is the cellXfs index. We dedup unique FormatIds at the
-    /// collection site so each FormatId maps to one xf slot.
+    /// `N` is the cellXfs index.
     SetStyle(u32),
+    /// **W5-D-PM-1 (megaudit Codex HIGH-2 / Opus-A HIGH-1 closure):**
+    /// rewrite `t="str"` → `t="e"` on a formula cell whose cached
+    /// value is `Value::Error`. umya emits all formula cells with
+    /// `t="str"` regardless of cached-value type; for Number/Boolean
+    /// we rely on `RemoveStrType` to drop the attr (default "n"
+    /// covers both). For Error, the default "n" is wrong — we need
+    /// `t="e"` so the consumer parses the `<v>{sigil}</v>` as an
+    /// error type, not a string.
+    ConvertFormulaToErrorType,
+    /// **W5-D-PM-1 (megaudit Codex HIGH-1 closure):** rewrite
+    /// `t="str"` → `t="b"` AND `<v>TRUE</v>` / `<v>FALSE</v>` →
+    /// `<v>1</v>` / `<v>0</v>` on a formula cell with Boolean
+    /// cached value. OOXML wants boolean cells with `t="b"` and
+    /// `<v>1|0</v>`.
+    ConvertFormulaToBoolType(bool),
 }
 
 /// Convert (col, row) (both 0-indexed) to an A1-style ref.
@@ -188,22 +204,44 @@ pub(crate) fn export_new_workbook(
                             // whose cached value is numeric/boolean (the
                             // default cell type "n" lets calamine restore
                             // the number).
-                            if cache_written && matches!(val, Value::Number(_) | Value::Boolean(_))
-                            {
-                                fixes.push(CellFix {
-                                    cell_ref: cell_ref_a1(row, col),
-                                    kind: CellFixKind::RemoveStrType,
-                                });
-                            }
-                            // For formula cells with Error cached value:
-                            // umya hardcodes `#VALUE!` (umya
-                            // `worksheet.rs:524-526`). Schedule sigil fix.
-                            if let Value::Error(e) = val {
-                                if cache_written {
-                                    fixes.push(CellFix {
-                                        cell_ref: cell_ref_a1(row, col),
-                                        kind: CellFixKind::OverrideErrorSigil(e.sigil()),
-                                    });
+                            // RemoveStrType handles formula cells with Number
+                            // cached values (default cell type "n" round-trips).
+                            // Boolean / Error formula cells need DIFFERENT
+                            // post-process patches because the default "n"
+                            // would still misread the value.
+                            if cache_written {
+                                match val {
+                                    Value::Number(_) => {
+                                        fixes.push(CellFix {
+                                            cell_ref: cell_ref_a1(row, col),
+                                            kind: CellFixKind::RemoveStrType,
+                                        });
+                                    }
+                                    // **W5-D-PM-1 (Codex HIGH-1 closure):**
+                                    // boolean formula cache — rewrite
+                                    // `t="str"` → `t="b"` AND `<v>TRUE</v>`
+                                    // / `<v>FALSE</v>` → `<v>1</v>` /
+                                    // `<v>0</v>`. Without this the cell
+                                    // round-trips as text "TRUE"/"FALSE".
+                                    Value::Boolean(b) => {
+                                        fixes.push(CellFix {
+                                            cell_ref: cell_ref_a1(row, col),
+                                            kind: CellFixKind::ConvertFormulaToBoolType(*b),
+                                        });
+                                    }
+                                    // **W5-D-PM-1 (Codex HIGH-2 / Opus-A
+                                    // HIGH-1 closure):** error formula
+                                    // cache — rewrite `t="str"` → `t="e"`.
+                                    // The sigil in `<v>` is already correct
+                                    // (umya passes our value through). 10 %
+                                    // of corpus impacted before the fix.
+                                    Value::Error(_) => {
+                                        fixes.push(CellFix {
+                                            cell_ref: cell_ref_a1(row, col),
+                                            kind: CellFixKind::ConvertFormulaToErrorType,
+                                        });
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -506,6 +544,58 @@ fn apply_cell_fixes_to_sheet_xml(
                     text = insert_style_only_cell(text, &fix.cell_ref, *xf_index)?;
                 }
             }
+            CellFixKind::ConvertFormulaToErrorType => {
+                // **W5-D-PM-1 (megaudit closure):** rewrite
+                // `<c r="C5" t="str">` → `<c r="C5" t="e">`.
+                // umya emits formula+Error cells with `t="str"` and
+                // the correct sigil in `<v>`. Just flip the type.
+                let needle = format!(r#"<c r="{}" t="str""#, fix.cell_ref);
+                let replacement = format!(r#"<c r="{}" t="e""#, fix.cell_ref);
+                text = text.replace(&needle, &replacement);
+            }
+            CellFixKind::ConvertFormulaToBoolType(b) => {
+                // **W5-D-PM-1 (megaudit closure):** rewrite
+                // `<c r="C5" t="str">...<v>TRUE</v>...</c>` →
+                // `<c r="C5" t="b">...<v>1</v>...</c>`.
+                // Two passes: type attr + value content. The value
+                // content needle anchors on the closing `</c>` end
+                // of this specific cell tag to avoid false positives.
+                let type_needle = format!(r#"<c r="{}" t="str""#, fix.cell_ref);
+                let type_replacement = format!(r#"<c r="{}" t="b""#, fix.cell_ref);
+                text = text.replace(&type_needle, &type_replacement);
+                // Value content: umya emits `<v>TRUE</v>` or
+                // `<v>FALSE</v>`. The patch is scoped to the cell's
+                // tag — but `text.replace` is global. Anchor with
+                // the cell ref by looking for the cell tag prefix +
+                // value pattern between `<v>` and `</v>`.
+                let bool_str = if *b { "TRUE" } else { "FALSE" };
+                let bool_int = if *b { "1" } else { "0" };
+                // Match the entire `<c r="X" t="b"><f>...</f><v>BOOL_STR</v>`
+                // sequence and replace the value. The `t="b"` was
+                // just set above, so the cell now reads
+                // `<c r="X" t="b"><f>...</f><v>BOOL_STR</v>`.
+                // We need to find this cell's value element
+                // specifically.
+                let cell_open = format!(r#"<c r="{}" t="b""#, fix.cell_ref);
+                if let Some(open_idx) = text.find(&cell_open) {
+                    let after_open = open_idx + cell_open.len();
+                    // Find the cell's closing `</c>`.
+                    if let Some(close_rel) = text[after_open..].find("</c>") {
+                        let cell_end = after_open + close_rel;
+                        let body = &text[after_open..cell_end];
+                        let v_needle = format!("<v>{}</v>", bool_str);
+                        let v_replacement = format!("<v>{}</v>", bool_int);
+                        if body.contains(&v_needle) {
+                            let new_body = body.replace(&v_needle, &v_replacement);
+                            let mut out = String::with_capacity(text.len());
+                            out.push_str(&text[..after_open]);
+                            out.push_str(&new_body);
+                            out.push_str(&text[cell_end..]);
+                            text = out;
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(text.into_bytes())
@@ -579,15 +669,24 @@ fn insert_style_only_cell(
     }
 
     // Case 2: no `<row r="K">` — synthesize one and insert into
-    // `<sheetData>` in row-sorted order. For simplicity we insert at
-    // the END of sheetData; Excel rejects out-of-order rows on save
-    // but tolerates them on open. The realistic scenario for this
-    // path is a sheet whose ONLY content is format-overlay entries
-    // (no values, no formulas), in which case `<sheetData>` is empty
-    // or has only `<row>` elements we already injected.
+    // `<sheetData>` in row-sorted position.
+    //
+    // **W5-D-PM-1 (megaudit Codex HIGH-3 closure):** the prior W5-D-15.2
+    // version inserted at the END of `<sheetData>` regardless of row
+    // order. OOXML schema requires `<row>` elements in ascending `r`
+    // order. Excel tolerates non-sorted rows on open but emits a
+    // repair dialog on save. Now we scan for the first existing
+    // `<row r="L">` where L > K and inject the new row BEFORE it.
+    // Fall through to before `</sheetData>` only if no such row
+    // exists (all existing rows have r ≤ K).
     let new_row = format!(r#"<row r="{}">{}</row>"#, row_number, new_cell);
-    // Prefer to insert before `</sheetData>` to keep ordering with
-    // any previously injected rows.
+    if let Some(insert_before) = find_row_insertion_point(&text, row_number) {
+        let mut out = String::with_capacity(text.len() + new_row.len());
+        out.push_str(&text[..insert_before]);
+        out.push_str(&new_row);
+        out.push_str(&text[insert_before..]);
+        return Ok(out);
+    }
     if let Some(close_idx) = text.rfind("</sheetData>") {
         let mut out = String::with_capacity(text.len() + new_row.len());
         out.push_str(&text[..close_idx]);
@@ -609,6 +708,31 @@ fn insert_style_only_cell(
     Err(XlsxError::Export(
         "worksheet xml: missing <sheetData> — cannot inject style-only cell".to_string(),
     ))
+}
+
+/// **W5-D-PM-1 (megaudit Codex HIGH-3 closure):** scan a worksheet
+/// xml for the first `<row r="L">` where L > `target_row`. Returns
+/// the byte index where a new `<row r="target_row">` should be
+/// inserted to preserve ascending row order. Returns `None` if no
+/// such row exists (caller falls through to inserting before
+/// `</sheetData>`).
+fn find_row_insertion_point(text: &str, target_row: u32) -> Option<usize> {
+    // Walk for every `<row r="N"` occurrence; pick the first N > target_row.
+    let mut cursor = 0;
+    while let Some(rel) = text[cursor..].find("<row r=\"") {
+        let start = cursor + rel;
+        let after = start + "<row r=\"".len();
+        // Find closing `"`.
+        let close_quote = text[after..].find('"')?;
+        let n_str = &text[after..after + close_quote];
+        if let Ok(n) = n_str.parse::<u32>() {
+            if n > target_row {
+                return Some(start);
+            }
+        }
+        cursor = after + close_quote;
+    }
+    None
 }
 
 /// Parse the row number from an A1-style cell ref (e.g. `"BC42"` → `42`).

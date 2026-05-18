@@ -1,3 +1,5 @@
+#![allow(clippy::approx_constant, unused_imports, dead_code)]
+
 //! **Phase 4.11 megaudit corpus probe.**
 //!
 //! Imports every `.xlsx` in `.references/`, attempts a round-trip
@@ -79,7 +81,12 @@ fn run_one(path: &std::path::Path) -> FixtureReport {
         path.file_stem().and_then(|s| s.to_str()).unwrap_or("x")
     ));
     let _ = std::fs::remove_file(&tmp);
-    match export_xlsx_path(&first.workbook, &registry, &tmp, XlsxExportOptions::default()) {
+    match export_xlsx_path(
+        &first.workbook,
+        &registry,
+        &tmp,
+        XlsxExportOptions::default(),
+    ) {
         Ok(_) => r.export_ok = true,
         Err(e) => {
             r.error = Some(format!("export: {e:?}"));

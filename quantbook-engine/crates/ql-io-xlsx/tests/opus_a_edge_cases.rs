@@ -1,3 +1,5 @@
+#![allow(clippy::approx_constant, unused_imports, dead_code)]
+
 //! Adversarial / edge case probes for Phase 4.11 round-trip.
 
 use ql_io_xlsx::{
@@ -32,19 +34,52 @@ fn table_column_id_renumbering() {
         has_header: true,
         has_totals: false,
         columns: vec![
-            TableColumn { id: 5, name: Arc::from("a"), display: Arc::from("A"), totals_function: None },
-            TableColumn { id: 7, name: Arc::from("b"), display: Arc::from("B"), totals_function: None },
-            TableColumn { id: 12, name: Arc::from("c"), display: Arc::from("C"), totals_function: None },
+            TableColumn {
+                id: 5,
+                name: Arc::from("a"),
+                display: Arc::from("A"),
+                totals_function: None,
+            },
+            TableColumn {
+                id: 7,
+                name: Arc::from("b"),
+                display: Arc::from("B"),
+                totals_function: None,
+            },
+            TableColumn {
+                id: 12,
+                name: Arc::from("c"),
+                display: Arc::from("C"),
+                totals_function: None,
+            },
         ],
     };
     wb.tables_mut().insert(t.name.clone(), t);
     let tmp = std::env::temp_dir().join("opus-a-sparse-ids.xlsx");
     let _ = std::fs::remove_file(&tmp);
     export_xlsx_path(&wb, &registry(), &tmp, XlsxExportOptions::default()).unwrap();
-    let r = import_xlsx_path(&tmp, &registry(), XlsxImportOptions { recompute: RecomputeMode::Skip, ..Default::default() }).unwrap();
+    let r = import_xlsx_path(
+        &tmp,
+        &registry(),
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let imported = r.workbook.tables().lookup("SPARSE").unwrap();
-    for (orig, back) in wb.tables().lookup("SPARSE").unwrap().columns.iter().zip(imported.columns.iter()) {
-        println!("col display={:?} orig_id={} back_id={}", orig.display, orig.id, back.id);
+    for (orig, back) in wb
+        .tables()
+        .lookup("SPARSE")
+        .unwrap()
+        .columns
+        .iter()
+        .zip(imported.columns.iter())
+    {
+        println!(
+            "col display={:?} orig_id={} back_id={}",
+            orig.display, orig.id, back.id
+        );
     }
     let _ = std::fs::remove_file(&tmp);
 }
@@ -60,7 +95,8 @@ fn unicode_survival() {
     let s_en = wb.add_sheet("Sheet1");
     let s_ru = wb.add_sheet("Лист");
     // Quantbook may reject some chars; try a few.
-    let s_emoji_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wb.add_sheet("test 📊")));
+    let s_emoji_result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wb.add_sheet("test 📊")));
     println!("emoji sheet: {:?}", s_emoji_result.is_ok());
 
     wb.put_at(s_en, 0, 0, Value::text("héllo"));
@@ -94,8 +130,18 @@ fn unicode_survival() {
         has_header: true,
         has_totals: false,
         columns: vec![
-            TableColumn { id: 1, name: Arc::from("дата"), display: Arc::from("Дата"), totals_function: None },
-            TableColumn { id: 2, name: Arc::from("vаlue"), display: Arc::from("Vаlue"), totals_function: None },
+            TableColumn {
+                id: 1,
+                name: Arc::from("дата"),
+                display: Arc::from("Дата"),
+                totals_function: None,
+            },
+            TableColumn {
+                id: 2,
+                name: Arc::from("vаlue"),
+                display: Arc::from("Vаlue"),
+                totals_function: None,
+            },
         ],
     };
     wb.tables_mut().insert(t.name.clone(), t);
@@ -105,7 +151,15 @@ fn unicode_survival() {
     let exp = export_xlsx_path(&wb, &registry(), &tmp, XlsxExportOptions::default());
     match exp {
         Ok(_) => {
-            let r = import_xlsx_path(&tmp, &registry(), XlsxImportOptions { recompute: RecomputeMode::Skip, ..Default::default() }).unwrap();
+            let r = import_xlsx_path(
+                &tmp,
+                &registry(),
+                XlsxImportOptions {
+                    recompute: RecomputeMode::Skip,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             println!("Unicode round-trip OK");
             for sid in 0..r.workbook.sheet_count() as u16 {
                 let s = r.workbook.sheet(sid).unwrap();
@@ -162,7 +216,15 @@ fn custom_format_byte_for_byte_preservation_with_special_chars() {
     }
     println!("--- xl/styles.xml ---\n{}\n", styles_xml);
 
-    let r = import_xlsx_path(&tmp, &registry(), XlsxImportOptions { recompute: RecomputeMode::Skip, ..Default::default() }).unwrap();
+    let r = import_xlsx_path(
+        &tmp,
+        &registry(),
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     for (id, c) in r.workbook.formats().iter() {
         if id.0 >= ql_storage::FIRST_CUSTOM_FORMAT_ID {
             println!("after roundtrip id={} code={:?}", id.0, c);
@@ -180,7 +242,8 @@ fn name_case_round_trip() {
     let mut wb = Workbook::new();
     wb.add_sheet("S1");
     // Mix-case set; lookup case-insensitive.
-    wb.set_name("MixedCaseName", NamedTarget::Constant(Value::Number(7.0))).unwrap();
+    wb.set_name("MixedCaseName", NamedTarget::Constant(Value::Number(7.0)))
+        .unwrap();
     let tmp = std::env::temp_dir().join("opus-a-name-case.xlsx");
     let _ = std::fs::remove_file(&tmp);
     export_xlsx_path(&wb, &registry(), &tmp, XlsxExportOptions::default()).unwrap();
@@ -195,7 +258,15 @@ fn name_case_round_trip() {
     }
     println!("workbook.xml: {}", wbxml);
 
-    let r = import_xlsx_path(&tmp, &registry(), XlsxImportOptions { recompute: RecomputeMode::Skip, ..Default::default() }).unwrap();
+    let r = import_xlsx_path(
+        &tmp,
+        &registry(),
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     for (n, t) in r.workbook.names().iter() {
         println!("imported name canonical={:?} target={:?}", n, t);
     }
@@ -210,14 +281,32 @@ fn name_case_round_trip() {
 fn name_numeric_constant_precision() {
     let mut wb = Workbook::new();
     wb.add_sheet("S1");
-    wb.set_name("Tiny", NamedTarget::Constant(Value::Number(1e-15))).unwrap();
-    wb.set_name("Huge", NamedTarget::Constant(Value::Number(1e16))).unwrap();
-    wb.set_name("PiMore", NamedTarget::Constant(Value::Number(3.141592653589793))).unwrap();
-    wb.set_name("Negint", NamedTarget::Constant(Value::Number(-123456789012345f64))).unwrap();
+    wb.set_name("Tiny", NamedTarget::Constant(Value::Number(1e-15)))
+        .unwrap();
+    wb.set_name("Huge", NamedTarget::Constant(Value::Number(1e16)))
+        .unwrap();
+    wb.set_name(
+        "PiMore",
+        NamedTarget::Constant(Value::Number(3.141592653589793)),
+    )
+    .unwrap();
+    wb.set_name(
+        "Negint",
+        NamedTarget::Constant(Value::Number(-123456789012345f64)),
+    )
+    .unwrap();
     let tmp = std::env::temp_dir().join("opus-a-name-numeric.xlsx");
     let _ = std::fs::remove_file(&tmp);
     export_xlsx_path(&wb, &registry(), &tmp, XlsxExportOptions::default()).unwrap();
-    let r = import_xlsx_path(&tmp, &registry(), XlsxImportOptions { recompute: RecomputeMode::Skip, ..Default::default() }).unwrap();
+    let r = import_xlsx_path(
+        &tmp,
+        &registry(),
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     for (n, t) in r.workbook.names().iter() {
         println!("imported {:?} = {:?}", n, t);
     }
@@ -254,13 +343,26 @@ fn overlay_on_text_and_error_and_shared_string() {
     let tmp = std::env::temp_dir().join("opus-a-overlay-mixed.xlsx");
     let _ = std::fs::remove_file(&tmp);
     export_xlsx_path(&wb, &registry(), &tmp, XlsxExportOptions::default()).unwrap();
-    let r = import_xlsx_path(&tmp, &registry(), XlsxImportOptions { recompute: RecomputeMode::Skip, ..Default::default() }).unwrap();
+    let r = import_xlsx_path(
+        &tmp,
+        &registry(),
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let sheet2 = r.workbook.sheet(s).unwrap();
     for c in 0..4 {
         let v = sheet2.read(0, c);
         let f = sheet2.format_overlay().get(0, c);
-        println!("(0,{}) value={:?} overlay={:?} ({:?})",
-            c, v, f, f.and_then(|i| r.workbook.formats().lookup(i)));
+        println!(
+            "(0,{}) value={:?} overlay={:?} ({:?})",
+            c,
+            v,
+            f,
+            f.and_then(|i| r.workbook.formats().lookup(i))
+        );
     }
 
     // Dump worksheet xml to inspect.
@@ -315,7 +417,15 @@ fn sheet_scoped_name_with_orphan_target() {
         e.read_to_string(&mut s).unwrap();
         println!("--- workbook.xml ---\n{}", s);
     }
-    let r = import_xlsx_path(&tmp, &registry(), XlsxImportOptions { recompute: RecomputeMode::Skip, ..Default::default() }).unwrap();
+    let r = import_xlsx_path(
+        &tmp,
+        &registry(),
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     for sid in 0..r.workbook.sheet_count() as u16 {
         let sheet = r.workbook.sheet(sid).unwrap();
         for (n, t) in sheet.scoped_names().iter() {
@@ -348,7 +458,10 @@ fn import_strict_with_drawings() {
         },
     )
     .unwrap();
-    println!("permissive: inventory={:?}", r.report.feature_inventory.counts);
+    println!(
+        "permissive: inventory={:?}",
+        r.report.feature_inventory.counts
+    );
 
     // Strict: should error.
     let r2 = import_xlsx_path(
