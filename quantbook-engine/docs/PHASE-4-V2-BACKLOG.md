@@ -15,45 +15,49 @@ that are documented + repro-able but were deferred due to scope.
 
 ---
 
-## Tier A — SHIP BEFORE 0.2.0 RELEASE (API stability commitments)
+## Tier A — SHIP BEFORE 0.2.0 RELEASE (API stability commitments) — ✅ SHIPPED 2026-05-18 at commit `40bb584a25b`
 
-These break public-API consumers if not landed before the next major
-version bump. Each is mechanical, low-design-risk work.
+A1–A4 all closed in a single Tier A commit. Selective marker
+discipline: applied to growth-likely enums (errors, options, `Op`)
+where consumers aren't exhaustive data-dispatchers; skipped for
+pervasively-matched stable enums (`Value`, `Locale`, `Expr`,
+parser AST, registry dispatch) where `_ => unreachable!()` arms
+would conflict with the no-fallbacks rule. Each crate's lib.rs
+now carries a `# Stability` section documenting which enums carry
+the marker and which are exhaustive by design.
 
-### A1. `#[non_exhaustive]` pass on all public enums
+### ~~A1.~~ `#[non_exhaustive]` pass — DONE (selective)
 
 - **Source:** Phase 4.12 Opus-C HIGH-1.
-- **Scope:** every `pub enum` exported via `pub use` across crates
-  (`ql-types`, `ql-storage`, `ql-functions`, `ql-exec`, `ql-io-xlsx`,
-  `ql-oplog`). Currently only one enum has `#[non_exhaustive]`.
-- **Effort:** ~2-4 hours including doc updates + a release-note entry.
-- **Risk:** breaks any downstream that exhaustively matches without
-  a `_ => ...` arm — intentional surfacing.
-- **Test:** existing test suite catches breakage; should also add a
-  doc test asserting non-exhaustive patterns work.
+- **Applied to:** `ErrorValue`, `ArrayShapeError`, `NowProvider`
+  (ql-types); `FormatTableError`, `SpillBlockError`,
+  `NameTableError`, `SheetNameError` (ql-storage); `LexError`,
+  `ParseError`, `PrintError` (ql-formula-syntax); `FormatParseError`
+  (ql-functions); `BindError`, `RuntimeError`, `SimdShape`
+  (ql-exec); `XlsxError`, `UnsupportedFeatureKind`, `RecomputeMode`,
+  `UnsupportedPolicy`, `ExportMode`, `FormulaCachePolicy` +
+  `XlsxPreservation` struct (ql-io-xlsx); `OpLogError`,
+  `PersistenceError`, `ReplayError`, `FormatRejectedSource`, `Op`
+  (ql-oplog — `Op` is critical for Phase 5 prep); `QbookError`
+  (ql-io).
+- **Skipped (exhaustive by design):** `Value`, `Locale`, `DateSystem`,
+  `ReferenceMode`, `NamedTarget`, `TotalsFunction`, parser AST
+  primitives, registry dispatch types, `ExprPlan`, `ResolvedName`,
+  `EvalResult`, wire enums, `Node`, `StripeType`, `NodeKind`.
 
-### A2. Remove deprecated `XlsxPreservation.known_parts`
+### ~~A2.~~ Removed `XlsxPreservation.known_parts` — DONE
 
-- **Source:** Phase 4.11 megaudit Opus-C HIGH-2 (deprecated in
-  W5-D-PM-4+5, slated for 0.2.0).
-- **Scope:** delete the field + `#[allow(deprecated)]` shims at the
-  two internal call sites + 3 test sites.
-- **Effort:** ~30 minutes.
+Field removed; 3 internal + 3 external test sites updated.
+`XlsxPreservation::new(bytes)` constructor added for external
+struct-literal callers (struct is now `#[non_exhaustive]`).
 
-### A3. Remove deprecated `XlsxError::Reconciliation`
+### ~~A3.~~ Removed `XlsxError::Reconciliation` — DONE
 
-- **Source:** Phase 4.11 megaudit Opus-C HIGH-3 (deprecated in
-  W5-D-PM-4+5, slated for 0.2.0).
-- **Scope:** delete the variant + any internal references.
-- **Effort:** ~30 minutes.
+### ~~A4.~~ Per-crate stability docs — DONE
 
-### A4. Public API stability docs per crate
-
-- **Source:** Phase 4.12 Opus-C MEDIUM-11.
-- **Scope:** add a top-of-`lib.rs` comment block in each public-API
-  crate documenting what's stable vs internal-only. Covers
-  `ql-types`, `ql-storage`, `ql-functions`, `ql-io-xlsx`.
-- **Effort:** ~2 hours.
+`# Stability` sections added to 10 crate lib.rs files: ql-types,
+ql-storage, ql-formula-syntax, ql-functions, ql-exec, ql-io-xlsx,
+ql-oplog, ql-io, ql-calcgraph, ql-profile.
 
 ---
 
