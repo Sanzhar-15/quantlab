@@ -90,31 +90,83 @@ pub struct XlsxImportResult {
 
 /// Import an xlsx workbook from a filesystem path.
 ///
-/// **W5-D-14 (Phase 4.11 round-trip spine):** stub returning
-/// `XlsxError::Engine("not yet implemented")`. Implementation arrives
-/// in the next W5-D-14 commit (calamine grid reader + OOXML scanner +
-/// recompute pass).
+/// **W5-D-14a (Phase 4.11 round-trip spine):** minimum viable import
+/// — sheets + cells + formula text via calamine, with recompute pass
+/// via the engine. Date system, scoped names, tables, styles, and
+/// feature inventory land in subsequent W5-D-14 commits per the plan.
 pub fn import_xlsx_path(
-    _path: impl AsRef<std::path::Path>,
-    _registry: &FunctionRegistry,
-    _options: XlsxImportOptions,
+    path: impl AsRef<std::path::Path>,
+    registry: &FunctionRegistry,
+    options: XlsxImportOptions,
 ) -> Result<XlsxImportResult, XlsxError> {
-    Err(XlsxError::Engine(
-        "import_xlsx_path not yet implemented (Phase 4.11 W5-D-14 in progress)".to_string(),
-    ))
+    let bytes = std::fs::read(path.as_ref())?;
+    import_xlsx_bytes(&bytes, registry, options)
 }
 
 /// Import an xlsx workbook from an in-memory byte buffer.
 ///
-/// **W5-D-14:** stub. Implementation in next W5-D-14 commit.
+/// **W5-D-14a:** see `import_xlsx_path`.
 pub fn import_xlsx_bytes(
-    _bytes: &[u8],
-    _registry: &FunctionRegistry,
-    _options: XlsxImportOptions,
+    bytes: &[u8],
+    registry: &FunctionRegistry,
+    options: XlsxImportOptions,
 ) -> Result<XlsxImportResult, XlsxError> {
-    Err(XlsxError::Engine(
-        "import_xlsx_bytes not yet implemented (Phase 4.11 W5-D-14 in progress)".to_string(),
-    ))
+    let mut report = XlsxImportReport::default();
+
+    // Phase 1 — build the calamine grid reader. Calamine takes
+    // ownership of the byte buffer (it needs random-access reads
+    // into the zip).
+    let mut grid = read::calamine_grid::CalamineGrid::from_bytes(bytes.to_vec())?;
+
+    // Phase 2 — raw-load cells + formula text into a fresh
+    // Workbook. No recompute yet (per Codex's
+    // "raw-load first, recompute as separate phase" architecture).
+    let (workbook, _cells_loaded, _formulas_loaded) =
+        read::convert::build_workbook_from_grid(&mut grid, &mut report)?;
+
+    // Phase 3 — recompute (dispatched by RecomputeMode).
+    let workbook = match options.recompute {
+        RecomputeMode::Skip => workbook,
+        RecomputeMode::BestEffort => {
+            read::convert::recompute_loaded_workbook(workbook, registry, &mut report)?
+        }
+        RecomputeMode::Strict => {
+            let recomputed =
+                read::convert::recompute_loaded_workbook(workbook, registry, &mut report)?;
+            if !report.formula_failures.is_empty() {
+                // Strict mode: any failure is fatal.
+                return Err(XlsxError::Engine(format!(
+                    "strict recompute failed: {} formula(s) couldn't be evaluated; first: \
+                     sheet={}, row={}, col={}, formula={:?}, reason={}",
+                    report.formula_failures.len(),
+                    report.formula_failures[0].sheet,
+                    report.formula_failures[0].row,
+                    report.formula_failures[0].col,
+                    report.formula_failures[0].formula,
+                    report.formula_failures[0].reason,
+                )));
+            }
+            recomputed
+        }
+    };
+
+    // Phase 4 — preservation handle. W5-D-14a stores only the raw
+    // bytes; the parts-index hookup arrives with the OOXML scanner
+    // in a follow-up commit.
+    let preservation = if options.preserve_package {
+        Some(XlsxPreservation {
+            original_bytes: bytes.to_vec(),
+            known_parts: std::collections::HashMap::new(),
+        })
+    } else {
+        None
+    };
+
+    Ok(XlsxImportResult {
+        workbook,
+        report,
+        preservation,
+    })
 }
 
 /// Export a `Workbook` to an xlsx file.
@@ -138,22 +190,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_api_stubs_return_engine_error() {
-        // **W5-D-14 scaffolding pin:** the public entry points exist
-        // and return a typed error (not a panic) when called before
-        // the implementation lands. This locks the API surface in
-        // place so callers can write integration code against it
-        // while the impl is in progress.
+    fn import_nonexistent_file_returns_io_error() {
+        // **W5-D-14a:** import path now wired through calamine. A
+        // missing file surfaces as `XlsxError::Io`, not a panic.
         let reg = ql_functions::default_registry();
         let opts = XlsxImportOptions::default();
-        match import_xlsx_path("nonexistent.xlsx", &reg, opts.clone()) {
-            Err(XlsxError::Engine(msg)) => assert!(msg.contains("not yet implemented")),
-            other => panic!("expected Engine error, got {other:?}"),
+        match import_xlsx_path("/tmp/this-file-does-not-exist-xlsxio.xlsx", &reg, opts) {
+            Err(XlsxError::Io(_)) => {}
+            other => panic!("expected Io error, got {other:?}"),
         }
-        match import_xlsx_bytes(&[], &reg, opts) {
-            Err(XlsxError::Engine(msg)) => assert!(msg.contains("not yet implemented")),
-            other => panic!("expected Engine error, got {other:?}"),
+    }
+
+    #[test]
+    fn import_invalid_bytes_returns_calamine_error() {
+        // **W5-D-14a:** invalid bytes (not a zip) surface as a
+        // calamine error, not a panic.
+        let reg = ql_functions::default_registry();
+        let opts = XlsxImportOptions::default();
+        match import_xlsx_bytes(b"not an xlsx file", &reg, opts) {
+            Err(XlsxError::Calamine(_)) => {}
+            other => panic!("expected Calamine error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn export_stub_still_returns_engine_error() {
+        // **W5-D-14a:** export not yet wired (umya integration lands
+        // in next W5-D-14 commit). Public API still returns a typed
+        // error per the no-fallbacks rule.
+        let reg = ql_functions::default_registry();
         let wb = Workbook::new();
         let export_opts = XlsxExportOptions::default();
         match export_xlsx_path(&wb, &reg, "/tmp/never-written.xlsx", export_opts) {
