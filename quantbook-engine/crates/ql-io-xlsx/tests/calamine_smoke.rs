@@ -63,6 +63,46 @@ fn import_ironcalc_basic_text_with_preservation_carries_bytes() {
 }
 
 #[test]
+fn import_ironcalc_basic_text_records_date_system() {
+    // **W5-D-14b smoke test:** the OOXML scanner parses
+    // `xl/workbook.xml/<workbookPr date1904=…>` and the import sets
+    // the workbook's date system accordingly. basic_text.xlsx uses
+    // the default 1900 system; this asserts the wiring works
+    // end-to-end. (A 1904 fixture would require generating one;
+    // unit tests in workbook_xml.rs already cover the 1904 parse.)
+    let registry = ql_functions::default_registry();
+    let opts = XlsxImportOptions {
+        recompute: RecomputeMode::Skip,
+        ..Default::default()
+    };
+    let result = import_xlsx_path(BASIC_TEXT_FIXTURE, &registry, opts)
+        .expect("basic_text.xlsx import succeeds");
+    assert_eq!(
+        result.workbook.date_system(),
+        ql_types::DateSystem::Excel1900,
+        "basic_text.xlsx should use the default 1900 date system"
+    );
+}
+
+#[test]
+fn import_ironcalc_basic_text_inventory_is_clean() {
+    // **W5-D-14b smoke test:** basic_text.xlsx is a minimal fixture
+    // with no CF / DV / comments / drawings — feature inventory
+    // should be clean.
+    let registry = ql_functions::default_registry();
+    let opts = XlsxImportOptions {
+        recompute: RecomputeMode::Skip,
+        ..Default::default()
+    };
+    let result = import_xlsx_path(BASIC_TEXT_FIXTURE, &registry, opts).unwrap();
+    assert!(
+        result.report.feature_inventory.is_clean(),
+        "basic_text.xlsx should have clean inventory, got {:?}",
+        result.report.feature_inventory.counts
+    );
+}
+
+#[test]
 fn import_ironcalc_example_fixture_with_recompute_doesnt_panic() {
     // **W5-D-14a:** larger fixture with formulas. Run recompute in
     // best-effort mode. The point is: the pipeline doesn't panic

@@ -105,13 +105,31 @@ pub fn import_xlsx_path(
 
 /// Import an xlsx workbook from an in-memory byte buffer.
 ///
-/// **W5-D-14a:** see `import_xlsx_path`.
+/// **W5-D-14a:** calamine grid → Workbook + recompute pass.
+/// **W5-D-14b:** OOXML scanner — `xl/workbook.xml` for date system +
+/// scoped defined names, feature inventory for unsupported parts
+/// (CF, DV, comments, drawings, etc.).
 pub fn import_xlsx_bytes(
     bytes: &[u8],
     registry: &FunctionRegistry,
     options: XlsxImportOptions,
 ) -> Result<XlsxImportResult, XlsxError> {
     let mut report = XlsxImportReport::default();
+
+    // **W5-D-14b — Phase 0**: build the OOXML package handle. Shared
+    // between the workbook-properties parse, the feature-inventory
+    // scan, and (later) the styles + tables parsers.
+    let package = read::package::XlsxPackage::from_bytes(bytes.to_vec());
+
+    // **W5-D-14b — Phase 0a**: parse `xl/workbook.xml` for the date
+    // system + scoped defined names. Authoritative for these
+    // (calamine drops `localSheetId`).
+    let workbook_props = read::workbook_xml::parse_workbook_xml(&package)?;
+
+    // **W5-D-14b — Phase 0b**: scan for unsupported OOXML features.
+    // Populates `report.feature_inventory`; respects
+    // `options.unsupported_policy` further down.
+    read::feature_inventory::scan_unsupported_features(&package, &mut report.feature_inventory)?;
 
     // Phase 1 — build the calamine grid reader. Calamine takes
     // ownership of the byte buffer (it needs random-access reads
@@ -121,8 +139,37 @@ pub fn import_xlsx_bytes(
     // Phase 2 — raw-load cells + formula text into a fresh
     // Workbook. No recompute yet (per Codex's
     // "raw-load first, recompute as separate phase" architecture).
-    let (workbook, _cells_loaded, _formulas_loaded) =
+    let (mut workbook, _cells_loaded, _formulas_loaded) =
         read::convert::build_workbook_from_grid(&mut grid, &mut report)?;
+
+    // **W5-D-14b — Phase 2a**: apply workbook-level properties from
+    // the OOXML scanner. Date system is the most-load-bearing —
+    // every date serial in the workbook depends on it.
+    workbook.set_date_system(workbook_props.date_system);
+
+    // **W5-D-14b — Phase 2b**: apply UnsupportedPolicy::Strict if any
+    // unsupported features were detected. Permissive mode just
+    // leaves the inventory in the report.
+    if options.unsupported_policy == UnsupportedPolicy::Strict
+        && !report.feature_inventory.is_clean()
+    {
+        // Pick the first kind to put in the error; full inventory is
+        // already in the report.
+        let (first_kind, _count) = report
+            .feature_inventory
+            .counts
+            .iter()
+            .next()
+            .expect("inventory non-empty per is_clean() check");
+        return Err(XlsxError::UnsupportedFeature {
+            feature: *first_kind,
+            part: "workbook".to_string(),
+            detail: format!(
+                "strict mode rejected {} unsupported feature kind(s); see import report",
+                report.feature_inventory.counts.len()
+            ),
+        });
+    }
 
     // Phase 3 — recompute (dispatched by RecomputeMode).
     let workbook = match options.recompute {
@@ -150,9 +197,9 @@ pub fn import_xlsx_bytes(
         }
     };
 
-    // Phase 4 — preservation handle. W5-D-14a stores only the raw
-    // bytes; the parts-index hookup arrives with the OOXML scanner
-    // in a follow-up commit.
+    // Phase 4 — preservation handle. W5-D-14b stores the original
+    // bytes; the known-parts map is still empty (parts-index hookup
+    // for round-trip patching arrives with the writer in W5-D-14c).
     let preservation = if options.preserve_package {
         Some(XlsxPreservation {
             original_bytes: bytes.to_vec(),
@@ -202,14 +249,16 @@ mod tests {
     }
 
     #[test]
-    fn import_invalid_bytes_returns_calamine_error() {
-        // **W5-D-14a:** invalid bytes (not a zip) surface as a
-        // calamine error, not a panic.
+    fn import_invalid_bytes_returns_zip_error() {
+        // **W5-D-14b:** invalid bytes (not a zip) surface as a
+        // structured xlsx error. After W5-D-14b the OOXML scanner
+        // runs first (package handle), so the failure is `Zip` not
+        // `Calamine` (pre-W5-D-14b ordering).
         let reg = ql_functions::default_registry();
         let opts = XlsxImportOptions::default();
         match import_xlsx_bytes(b"not an xlsx file", &reg, opts) {
-            Err(XlsxError::Calamine(_)) => {}
-            other => panic!("expected Calamine error, got {other:?}"),
+            Err(XlsxError::Zip(_)) | Err(XlsxError::Calamine(_)) => {}
+            other => panic!("expected Zip or Calamine error, got {other:?}"),
         }
     }
 
