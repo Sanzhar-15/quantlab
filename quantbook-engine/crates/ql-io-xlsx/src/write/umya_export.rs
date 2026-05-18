@@ -91,12 +91,30 @@ pub(crate) fn export_new_workbook(
 
     // **W5-D-15:** build a `FormatId → xf_index` dedup map. Index 0
     // is reserved for the default xf (numFmtId=0, no applyNumberFormat).
-    // First custom xf gets index 1, next gets 2, etc. The order in
-    // the `cellxfs_roster` Vec is the order they'll be emitted in
-    // `<cellXfs>`.
-    let mut format_to_xf_index: std::collections::HashMap<FormatId, u32> =
-        std::collections::HashMap::new();
-    let mut cellxfs_roster: Vec<FormatId> = Vec::new();
+    // First custom xf gets index 1, next gets 2, etc.
+    //
+    // **W5-D-15.2 (separate-Opus M-4 closure):** pre-compute the
+    // roster across ALL sheets in a single sweep so the order is a
+    // function of the set of FormatIds, not of which sheet first
+    // touched them. Sort by `FormatId` for byte determinism — the
+    // per-sheet intra-sort from W5-D-15.1 fixes intra-sheet but
+    // doesn't bound cross-sheet contribution order. BTreeSet handles
+    // both at once.
+    let mut sorted_format_ids: std::collections::BTreeSet<FormatId> =
+        std::collections::BTreeSet::new();
+    for sheet_id in 0..workbook.sheet_count() as u16 {
+        if let Some(sheet) = workbook.sheet(sheet_id) {
+            for (_addr, fid) in sheet.format_overlay().iter() {
+                sorted_format_ids.insert(fid);
+            }
+        }
+    }
+    let cellxfs_roster: Vec<FormatId> = sorted_format_ids.iter().copied().collect();
+    let format_to_xf_index: std::collections::HashMap<FormatId, u32> = cellxfs_roster
+        .iter()
+        .enumerate()
+        .map(|(i, fid)| (*fid, (i as u32) + 1)) // slot 0 reserved for default
+        .collect();
 
     let sheet_count = workbook.sheet_count();
     for sheet_id in 0..sheet_count as u16 {
@@ -232,15 +250,11 @@ pub(crate) fn export_new_workbook(
         let mut overlay_entries: Vec<((u32, u32), FormatId)> =
             sheet_view.format_overlay().iter().collect();
         overlay_entries.sort_by_key(|a| (a.1 .0, a.0 .0, a.0 .1));
+
         for ((row, col), fid) in overlay_entries {
             let xf_index = match format_to_xf_index.get(&fid) {
                 Some(idx) => *idx,
-                None => {
-                    let idx = (cellxfs_roster.len() as u32) + 1; // slot 0 reserved
-                    format_to_xf_index.insert(fid, idx);
-                    cellxfs_roster.push(fid);
-                    idx
-                }
+                None => continue, // unreachable — roster pre-populated for all FormatIds
             };
             fixes.push(CellFix {
                 cell_ref: cell_ref_a1(row, col),
@@ -479,11 +493,18 @@ fn apply_cell_fixes_to_sheet_xml(
                 // works for both `<c r="C5">` AND `<c r="C5"/>` AND
                 // `<c r="C5" t="...">` forms.
                 let needle = format!(r#"<c r="{}""#, fix.cell_ref);
-                let replacement = format!(r#"<c r="{}" s="{}""#, fix.cell_ref, xf_index);
-                // The needle is the leading prefix of the cell tag;
-                // multiple occurrences across the sheet for different
-                // cells are impossible (cell refs are unique).
-                text = text.replace(&needle, &replacement);
+                if text.contains(&needle) {
+                    let replacement = format!(r#"<c r="{}" s="{}""#, fix.cell_ref, xf_index);
+                    text = text.replace(&needle, &replacement);
+                } else {
+                    // **W5-D-15.2 (Codex audit HIGH-4 / separate-Opus
+                    // H-1 closure):** umya doesn't emit `<c>` for
+                    // value-less cells. Inject a fresh
+                    // `<c r="A1" s="N"/>` element into the matching
+                    // `<row>` (or create the row if needed) so the
+                    // format overlay survives the round-trip.
+                    text = insert_style_only_cell(text, &fix.cell_ref, *xf_index)?;
+                }
             }
         }
     }
@@ -494,6 +515,115 @@ fn apply_cell_fixes_to_sheet_xml(
 /// missing, insert a fresh `<workbookPr date1904="1"/>` after the
 /// opening `<workbook>` tag. UTF-8 text manipulation — OOXML is
 /// always UTF-8.
+/// **W5-D-15.2:** insert a style-only cell into the worksheet xml's
+/// `<sheetData>`. Used when a cell has a format overlay but no
+/// value/formula — umya skips emitting such cells, so we synthesize
+/// `<c r="A1" s="N"/>` and place it inside the matching `<row r="K">`
+/// element (creating the row if needed).
+///
+/// Excel tolerates non-sorted cells within a row and slightly stale
+/// `spans` attributes; we don't bother updating either.
+fn insert_style_only_cell(
+    text: String,
+    cell_ref: &str,
+    xf_index: u32,
+) -> Result<String, XlsxError> {
+    let row_number = match parse_row_number_from_ref(cell_ref) {
+        Some(n) => n,
+        None => {
+            // Malformed cell ref — nothing to do.
+            return Ok(text);
+        }
+    };
+    let new_cell = format!(r#"<c r="{}" s="{}"/>"#, cell_ref, xf_index);
+
+    // Case 1: `<row r="K">...</row>` exists — inject before `</row>`.
+    let open_attr = format!(r#"<row r="{}""#, row_number);
+    if let Some(open_idx) = text.find(&open_attr) {
+        // Find the closing `>` of the opening `<row>` tag.
+        let after_open = open_idx + open_attr.len();
+        let open_end = match text[after_open..].find('>') {
+            Some(i) => after_open + i + 1,
+            None => {
+                return Err(XlsxError::Export(
+                    "worksheet xml: malformed <row> opening tag".to_string(),
+                ));
+            }
+        };
+        // Self-closing `<row .../>` form (umya rarely emits this but
+        // handle defensively): convert to the long form with the cell
+        // inside.
+        if text[after_open..open_end].ends_with("/>") {
+            // Strip the trailing `/>` and replace with `>...new_cell...</row>`.
+            let self_close_start = open_end - 2;
+            let mut out = String::with_capacity(text.len() + new_cell.len() + 16);
+            out.push_str(&text[..self_close_start]);
+            out.push('>');
+            out.push_str(&new_cell);
+            out.push_str("</row>");
+            out.push_str(&text[open_end..]);
+            return Ok(out);
+        }
+        // Long-form `<row ...>...</row>`. Find the matching `</row>`.
+        if let Some(close_rel) = text[open_end..].find("</row>") {
+            let close_idx = open_end + close_rel;
+            let mut out = String::with_capacity(text.len() + new_cell.len());
+            out.push_str(&text[..close_idx]);
+            out.push_str(&new_cell);
+            out.push_str(&text[close_idx..]);
+            return Ok(out);
+        }
+        return Err(XlsxError::Export(
+            "worksheet xml: <row> opening without matching </row>".to_string(),
+        ));
+    }
+
+    // Case 2: no `<row r="K">` — synthesize one and insert into
+    // `<sheetData>` in row-sorted order. For simplicity we insert at
+    // the END of sheetData; Excel rejects out-of-order rows on save
+    // but tolerates them on open. The realistic scenario for this
+    // path is a sheet whose ONLY content is format-overlay entries
+    // (no values, no formulas), in which case `<sheetData>` is empty
+    // or has only `<row>` elements we already injected.
+    let new_row = format!(r#"<row r="{}">{}</row>"#, row_number, new_cell);
+    // Prefer to insert before `</sheetData>` to keep ordering with
+    // any previously injected rows.
+    if let Some(close_idx) = text.rfind("</sheetData>") {
+        let mut out = String::with_capacity(text.len() + new_row.len());
+        out.push_str(&text[..close_idx]);
+        out.push_str(&new_row);
+        out.push_str(&text[close_idx..]);
+        return Ok(out);
+    }
+    // `<sheetData/>` self-closing — replace with the long form.
+    if let Some(idx) = text.find("<sheetData/>") {
+        let mut out = String::with_capacity(text.len() + new_row.len() + 16);
+        out.push_str(&text[..idx]);
+        out.push_str("<sheetData>");
+        out.push_str(&new_row);
+        out.push_str("</sheetData>");
+        out.push_str(&text[idx + "<sheetData/>".len()..]);
+        return Ok(out);
+    }
+
+    Err(XlsxError::Export(
+        "worksheet xml: missing <sheetData> — cannot inject style-only cell".to_string(),
+    ))
+}
+
+/// Parse the row number from an A1-style cell ref (e.g. `"BC42"` → `42`).
+fn parse_row_number_from_ref(cell_ref: &str) -> Option<u32> {
+    let bytes = cell_ref.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    if i == 0 || i == bytes.len() {
+        return None;
+    }
+    cell_ref[i..].parse::<u32>().ok().filter(|n| *n > 0)
+}
+
 fn inject_date1904_into_workbook_xml(content: Vec<u8>) -> Result<Vec<u8>, XlsxError> {
     let text = String::from_utf8(content)
         .map_err(|e| XlsxError::Export(format!("workbook.xml is not valid UTF-8: {e}")))?;

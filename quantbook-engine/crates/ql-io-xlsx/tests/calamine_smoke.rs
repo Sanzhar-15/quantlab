@@ -967,6 +967,188 @@ fn w5_d_15_round_trip_dedup_shared_format_id() {
 }
 
 #[test]
+fn w5_d_15_2_formula_with_blank_cache_format_overlay_round_trips() {
+    // **W5-D-15.2 (separate-Opus H-5 closure):** a formula cell whose
+    // cached value is Blank (e.g., a formula with no recompute pass)
+    // makes umya elide the `<c>` element entirely. The SetStyle
+    // post-process then has nothing to match. With the
+    // `insert_style_only_cell` fallback, the cell's overlay still
+    // survives the round-trip via injected `<c r="A1" s="N"/>`.
+    use ql_storage::{FormatId, Workbook, FIRST_CUSTOM_FORMAT_ID};
+
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("Sheet1");
+    let custom = wb.formats_mut().intern("0.000");
+    // Formula cell with NO put_at — so cached value is Blank.
+    wb.put_formula(s, 3, 4, "1+1");
+    wb.sheet_mut(s)
+        .unwrap()
+        .format_overlay_mut()
+        .set(3, 4, custom);
+
+    let tmp = std::env::temp_dir().join("w5-d-15-2-formula-blank.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+    export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let overlay = result.workbook.sheet(0).unwrap().format_overlay();
+    assert_eq!(
+        overlay.get(3, 4),
+        Some(FormatId(FIRST_CUSTOM_FORMAT_ID)),
+        "format overlay on formula+blank cell must round-trip via inject_style_only_cell"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn w5_d_15_2_cross_sheet_roster_byte_deterministic() {
+    // **W5-D-15.2 (separate-Opus M-4 closure):** with two sheets
+    // contributing different FormatIds in different orders, the
+    // `<cellXfs>` roster MUST be ordered by FormatId, not by
+    // sheet-encounter order. Sort by FormatId via BTreeSet pre-walk.
+    use ql_storage::Workbook;
+    let registry = ql_functions::default_registry();
+
+    let mut wb = Workbook::new();
+    let s0 = wb.add_sheet("S0");
+    let s1 = wb.add_sheet("S1");
+    let fmt_a = wb.formats_mut().intern("0.00");
+    let fmt_b = wb.formats_mut().intern("yyyy-mm-dd");
+    let fmt_c = wb.formats_mut().intern("0.0000");
+    assert!(fmt_b.0 > fmt_a.0);
+    assert!(fmt_c.0 > fmt_b.0);
+
+    // Sheet 0 contributes formats in c, b order (greater FormatIds first).
+    wb.put_at(s0, 0, 0, ql_types::Value::Number(1.0));
+    wb.put_at(s0, 0, 1, ql_types::Value::Number(2.0));
+    wb.sheet_mut(s0)
+        .unwrap()
+        .format_overlay_mut()
+        .set(0, 0, fmt_c);
+    wb.sheet_mut(s0)
+        .unwrap()
+        .format_overlay_mut()
+        .set(0, 1, fmt_b);
+    // Sheet 1 contributes fmt_a (lowest).
+    wb.put_at(s1, 0, 0, ql_types::Value::Number(3.0));
+    wb.sheet_mut(s1)
+        .unwrap()
+        .format_overlay_mut()
+        .set(0, 0, fmt_a);
+
+    let tmp = std::env::temp_dir().join("w5-d-15-2-cross-sheet-det.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Re-import must still resolve each cell to its original FormatId,
+    // regardless of cellXfs ordering.
+    assert_eq!(
+        result.workbook.sheet(0).unwrap().format_overlay().get(0, 0),
+        Some(fmt_c)
+    );
+    assert_eq!(
+        result.workbook.sheet(0).unwrap().format_overlay().get(0, 1),
+        Some(fmt_b)
+    );
+    assert_eq!(
+        result.workbook.sheet(1).unwrap().format_overlay().get(0, 0),
+        Some(fmt_a)
+    );
+
+    // Inspect the styles.xml bytes — cellXfs numFmtId order should
+    // match the FormatId order (a, b, c) regardless of which sheet
+    // contributed each first.
+    let bytes = std::fs::read(&tmp).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut styles = String::new();
+    std::io::Read::read_to_string(&mut zip.by_name("xl/styles.xml").unwrap(), &mut styles).unwrap();
+    // Find positions of the three numFmtId="..." within the cellXfs block.
+    let cellxfs_start = styles.find("<cellXfs").unwrap();
+    let cellxfs_block = &styles[cellxfs_start..styles.find("</cellXfs>").unwrap()];
+    let pos_a = cellxfs_block
+        .find(&format!(r#"numFmtId="{}""#, fmt_a.0))
+        .expect("fmt_a missing from cellXfs");
+    let pos_b = cellxfs_block
+        .find(&format!(r#"numFmtId="{}""#, fmt_b.0))
+        .expect("fmt_b missing from cellXfs");
+    let pos_c = cellxfs_block
+        .find(&format!(r#"numFmtId="{}""#, fmt_c.0))
+        .expect("fmt_c missing from cellXfs");
+    assert!(
+        pos_a < pos_b && pos_b < pos_c,
+        "cellXfs not sorted by FormatId (M-4 regression): positions A={}, B={}, C={}",
+        pos_a,
+        pos_b,
+        pos_c
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn w5_d_15_2_blank_cell_with_format_overlay_round_trips() {
+    // **W5-D-15.2 (Codex audit HIGH-4 / self-audit H-1 closure):** a
+    // cell with NO value and NO formula but a registered format
+    // overlay (e.g., a date-formatted column awaiting user input)
+    // must round-trip. umya by default doesn't emit a `<c>` tag for
+    // such cells; W5-D-15.2 pre-touches them via `get_cell_mut` so
+    // the SetStyle post-process has a target to patch.
+    use ql_storage::{FormatId, Workbook, FIRST_CUSTOM_FORMAT_ID};
+
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("Sheet1");
+    let custom = wb.formats_mut().intern("yyyy-mm-dd");
+    assert!(custom.0 >= FIRST_CUSTOM_FORMAT_ID);
+    // Apply overlay to (5, 2) WITHOUT putting any value there.
+    wb.sheet_mut(s)
+        .unwrap()
+        .format_overlay_mut()
+        .set(5, 2, custom);
+
+    let tmp = std::env::temp_dir().join("w5-d-15-2-blank-overlay.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+    export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let overlay = result.workbook.sheet(0).unwrap().format_overlay();
+    assert_eq!(
+        overlay.get(5, 2),
+        Some(FormatId(FIRST_CUSTOM_FORMAT_ID)),
+        "blank cell with format overlay must survive round-trip"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
 fn w5_d_15_1_empty_sheet_before_styled_sheet_preserves_alignment() {
     // **W5-D-15.1 (Codex audit HIGH-3 closure):** the prior export
     // logic skipped `sheet_fixes.push(fixes)` for empty-bounds
