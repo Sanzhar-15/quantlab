@@ -80,6 +80,31 @@
 //! `ResolvedName`, and `EvalResult` are exhaustive by design;
 //! adding a variant is a MAJOR-version event because every scalar /
 //! aggregate / spill evaluator dispatcher must gain a new arm.
+//!
+//! # Module layout (Tier D1 split, 2026-05-18)
+//!
+//! `workbook_runtime` is a module directory with 9 sibling
+//! submodules — each adds an `impl<'a> WorkbookRuntime<'a>` block to
+//! the same struct via the sibling-module impl pattern. See
+//! `docs/architecture/workbook-runtime-split-design.md`.
+//!
+//! - `workbook_runtime::mod` — struct, 4 constructors, `cache_stats`,
+//!   `validate_sheet` / `validate_cell` shared helpers.
+//! - `workbook_runtime::error` — `RuntimeError` + `RecomputeFailure`
+//!   + `RecomputeResult` (re-exported at module root).
+//! - `workbook_runtime::cells` — `set_formula`, `set_value`,
+//!   `clear_formula`, spill helpers.
+//! - `workbook_runtime::recompute` — `recompute_all`, `recompute_dirty`,
+//!   recompute orchestrators.
+//! - `workbook_runtime::tables` — table mutation API.
+//! - `workbook_runtime::sheets` — sheet mutation API.
+//! - `workbook_runtime::names` — defined-name registration.
+//! - `workbook_runtime::formats` — format intern + cell-format binding.
+//! - `workbook_runtime::config` — workbook-scoped reference-mode + locale.
+//! - `workbook_runtime::validate` — `validate_formula` + `transaction`.
+//!
+//! Public API is unchanged: every method stays on `WorkbookRuntime`
+//! and `pub use error::*` re-exports the result types.
 
 pub mod aggregate_cache;
 pub mod calcgraph_session;

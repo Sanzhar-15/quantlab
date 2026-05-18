@@ -198,17 +198,40 @@ Phase 4 ("IDE must open imported xlsx, show formulas, edit formulas").
 These are Phase 5 (CRDT collaboration) prerequisites that block
 clean Phase 5 work if not done first.
 
-### D1. `WorkbookRuntime` monolith split
+### ~~D1.~~ `WorkbookRuntime` monolith split — ✅ SHIPPED 2026-05-18
 
 - **Source:** Phase 4.12 Opus-C HIGH-2.
-- **Scope:** `crates/ql-exec/src/workbook_runtime.rs` is 12 413 LOC.
-  Phase 5 will add CRDT-aware mutation paths on top of this surface.
-  Split by concern: cell mutation, name management, table management,
-  recompute pipeline, op-log integration.
-- **Effort:** 5-10 days. High design risk — propose a refactor plan
-  + dispatch the split as its own audit cycle.
-- **Risk:** breaks every test that constructs a `WorkbookRuntime`
-  by name. Use type aliases for transitional compat if needed.
+- **Design:** `docs/architecture/workbook-runtime-split-design.md`
+  (committed `2e8566e35f0`).
+- **Mechanical extractions (8 commits):**
+  - Step 1 (`79c1ebeefa7`): `error.rs` (RuntimeError, RecomputeFailure, RecomputeResult).
+  - Step 3.1 (`2761e1f88cf`): `formats.rs` (intern_format, set_cell_format, read_display).
+  - Step 3.2 (`be154f4918d`): `config.rs` (set_reference_mode, set_locale).
+  - Step 3.3 (`c37c556dd0f`): `sheets.rs` (add_sheet, rename_sheet, rewrite helper).
+  - Step 3.4 (`a48e985c5ec`): `names.rs` (set_name, set_sheet_scoped_name).
+  - Step 3.5 (`aa6e37800ff`): `tables.rs` (6 methods + reextract_table_readers).
+  - Step 3.6 (`c8d4cf95f70`): `recompute.rs` (recompute_all + recompute_dirty + 3 helpers).
+  - Step 3.7 (`de7f87c5334`): `cells.rs` (set_formula + set_value + clear_formula + 3 spill helpers).
+  - Step 3.8 (`69ede106a61`): `validate.rs` (validate_formula + transaction).
+- **Step 4 final cleanup:** Phase 2A.1 named-range tests partitioned
+  to `names.rs::tests`; lib.rs `# Stability` section updated; this
+  backlog entry marked done.
+- **Result:** `mod.rs` trimmed from 12,725 → 299 LOC
+  (**97.6% reduction**). 9 sibling submodules under
+  `crate::workbook_runtime`, average ~1,484 LOC each (heavily
+  skewed: cells.rs 5,131, recompute.rs 3,152, tables.rs 2,199;
+  rest under 800 LOC each).
+- **Public API:** byte-for-byte identical. `WorkbookRuntime` and
+  re-exported types resolve from `crate::workbook_runtime` as before.
+- **Gates:** 4141 / 4141 tests passing across every commit (zero
+  drift). cargo fmt + clippy `--workspace --all-targets -D warnings`
+  + doc all clean.
+- **Side-effect fixes:** two pre-existing doc-comment
+  misattachments (rename_table doc → set_reference_mode in Step 3.2,
+  validate_cell doc → rewrite_formula_text helper in Step 3.3)
+  corrected by the moves.
+- **Audit:** parallel Codex + separate-Opus pass per the engine
+  audit-discipline rule — see `docs/audits/2026-05-18-tier-d1-*.md`.
 
 ### D2. `ql-oplog → ql-io` reverse dependency cleanup
 
