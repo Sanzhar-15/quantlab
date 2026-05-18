@@ -239,18 +239,25 @@ pub fn import_xlsx_bytes(
 
 /// Export a `Workbook` to an xlsx file.
 ///
-/// **W5-D-14:** stub. Implementation in next W5-D-14 commit (umya
-/// `UpdateOriginal` backend). `NewWorkbook` mode (rust_xlsxwriter)
-/// lands in W5-D-17.
+/// **W5-D-14e:** `ExportMode::NewWorkbook` wired through
+/// umya-spreadsheet. Cells + formula text + cached values
+/// round-trip. `ExportMode::UpdateOriginal` (preserve opaque OOXML
+/// parts from a prior import) lands in a follow-up.
 pub fn export_xlsx_path(
-    _workbook: &Workbook,
+    workbook: &Workbook,
     _registry: &FunctionRegistry,
-    _out: impl AsRef<std::path::Path>,
-    _options: XlsxExportOptions,
+    out: impl AsRef<std::path::Path>,
+    options: XlsxExportOptions,
 ) -> Result<XlsxExportReport, XlsxError> {
-    Err(XlsxError::Engine(
-        "export_xlsx_path not yet implemented (Phase 4.11 W5-D-14 in progress)".to_string(),
-    ))
+    match options.mode {
+        ExportMode::NewWorkbook => {
+            write::umya_export::export_new_workbook(workbook, out.as_ref(), options.formula_cache)
+        }
+        ExportMode::UpdateOriginal { .. } => Err(XlsxError::Engine(
+            "ExportMode::UpdateOriginal not yet implemented (Phase 4.11 W5-D-14e follow-up)"
+                .to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -284,15 +291,26 @@ mod tests {
     }
 
     #[test]
-    fn export_stub_still_returns_engine_error() {
-        // **W5-D-14a:** export not yet wired (umya integration lands
-        // in next W5-D-14 commit). Public API still returns a typed
-        // error per the no-fallbacks rule.
+    fn export_update_original_still_returns_engine_error() {
+        // **W5-D-14e:** NewWorkbook mode is wired; UpdateOriginal mode
+        // is still a follow-up. The typed-error path covers the
+        // not-yet-shipped sub-mode.
         let reg = ql_functions::default_registry();
         let wb = Workbook::new();
-        let export_opts = XlsxExportOptions::default();
+        let preservation = XlsxPreservation {
+            original_bytes: Vec::new(),
+            known_parts: std::collections::HashMap::new(),
+        };
+        let export_opts = XlsxExportOptions {
+            mode: ExportMode::UpdateOriginal {
+                source: preservation,
+            },
+            ..Default::default()
+        };
         match export_xlsx_path(&wb, &reg, "/tmp/never-written.xlsx", export_opts) {
-            Err(XlsxError::Engine(msg)) => assert!(msg.contains("not yet implemented")),
+            Err(XlsxError::Engine(msg)) => {
+                assert!(msg.contains("UpdateOriginal not yet implemented"))
+            }
             other => panic!("expected Engine error, got {other:?}"),
         }
     }

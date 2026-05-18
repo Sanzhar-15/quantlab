@@ -1,11 +1,15 @@
 //! xlsx writer behind a backend boundary.
 //!
-//! **Phase 4.11 W5-D-14 — scaffolding.** Two backends planned:
-//! - `umya_roundtrip` (W5-D-14): `ExportMode::UpdateOriginal` mode;
-//!   loads the preserved original xlsx package and patches it.
-//! - `generated` (W5-D-17): `ExportMode::NewWorkbook` mode;
-//!   generates a clean package from engine state via rust_xlsxwriter.
+//! **W5-D-14e (this commit):** `umya_export` writes `NewWorkbook`
+//! mode (generate fresh xlsx from Quantbook state). Cells + formula
+//! text + cached values. Round-trip semantic-equivalence smoke test
+//! lives in `tests/calamine_smoke.rs`.
 //!
-//! The backend boundary is defined at the public-API level (the
-//! `ExportMode` enum). Each backend submodule has its own private
-//! interface; the public surface stays stable.
+//! **Future**:
+//! - `ExportMode::UpdateOriginal` — load the preserved original
+//!   package, patch supported parts, opaquely preserve unknown OOXML
+//!   parts (CF / DV / comments / drawings). Lands as a follow-up.
+//! - Per-cell styles (FormatId → numFmtId via cellXfs).
+//! - Tables / named ranges round-trip.
+
+pub(crate) mod umya_export;

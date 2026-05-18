@@ -5,7 +5,10 @@
 //! workbook, populates sheets + cells + formulas, and runs through
 //! recompute without panicking.
 
-use ql_io_xlsx::{import_xlsx_path, RecomputeMode, XlsxImportOptions};
+use ql_io_xlsx::{
+    export_xlsx_path, import_xlsx_path, ExportMode, FormulaCachePolicy, RecomputeMode,
+    XlsxExportOptions, XlsxImportOptions,
+};
 
 const BASIC_TEXT_FIXTURE: &str = "../../.references/ironcalc/xlsx/tests/basic_text.xlsx";
 
@@ -100,6 +103,33 @@ fn import_ironcalc_basic_text_inventory_is_clean() {
         "basic_text.xlsx should have clean inventory, got {:?}",
         result.report.feature_inventory.counts
     );
+}
+
+#[test]
+fn round_trip_ironcalc_basic_text_preserves_sheet_count() {
+    // **W5-D-14e end-to-end round-trip smoke**: import an xlsx,
+    // export it back via NewWorkbook mode, re-import — sheet count
+    // should be preserved exactly.
+    let registry = ql_functions::default_registry();
+    let opts = XlsxImportOptions {
+        recompute: RecomputeMode::Skip,
+        ..Default::default()
+    };
+    let first = import_xlsx_path(BASIC_TEXT_FIXTURE, &registry, opts.clone()).unwrap();
+    let original_sheet_count = first.workbook.sheet_count();
+
+    let tmp = std::env::temp_dir().join("ql-io-xlsx-rt-sheet-count.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let export_opts = XlsxExportOptions {
+        mode: ExportMode::NewWorkbook,
+        formula_cache: FormulaCachePolicy::WriteRecomputed,
+        ..Default::default()
+    };
+    export_xlsx_path(&first.workbook, &registry, &tmp, export_opts).unwrap();
+
+    let second = import_xlsx_path(&tmp, &registry, opts).unwrap();
+    assert_eq!(second.workbook.sheet_count(), original_sheet_count);
+    let _ = std::fs::remove_file(&tmp);
 }
 
 #[test]
