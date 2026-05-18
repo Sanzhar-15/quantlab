@@ -152,9 +152,12 @@ pub(crate) fn export_update_original(
         writer.finish().map_err(XlsxError::Zip)?;
     }
 
-    std::fs::write(output_path, out_buf)?;
-
-    // Step 4: report / enforce policy.
+    // **W5-D-14.2.2 (Codex audit H-B closure):** enforce the
+    // unsupported-policy decision BEFORE writing the output. Prior
+    // ordering wrote the (lossy) file first and then errored, which
+    // could destroy a caller's pre-existing file at `output_path`
+    // under `Strict` mode. The contract is "Strict means no-loss";
+    // touching the user's destination on a drop violates it.
     if !dropped.is_empty() {
         match unsupported_policy {
             UnsupportedPolicy::Permissive => {
@@ -170,6 +173,8 @@ pub(crate) fn export_update_original(
             }
         }
     }
+
+    std::fs::write(output_path, out_buf)?;
 
     Ok(report)
 }
@@ -188,53 +193,86 @@ enum PartAction {
 }
 
 /// Classify an original-package part path. The preserve list is
-/// deliberately conservative: only paths whose meaning is fully opaque
-/// to Quantbook get preserved (we never preserve a part we could
-/// silently mis-render after Quantbook touched the data model).
+/// deliberately narrow.
+///
+/// **W5-D-14.2.2 (Codex audit H-A closure):** any part that is
+/// REACHED via a sheet-level relationship (drawings, charts, comments,
+/// embeddings, media, oleObjects) cannot be preserved by the
+/// shadow+overlay strategy alone — the shadow's worksheet xml +
+/// sheet rels REPLACE the original's, so the `<drawing r:id="...">`
+/// inline anchor and the matching `<Relationship>` are both gone.
+/// Without those references, the preserved part exists in the zip
+/// but is unreachable.
+///
+/// Until we ship the sheet-rels + inline-anchor merge (v2 of
+/// UpdateOriginal), sheet-anchored parts are honestly DROPPED with
+/// a `dropped_features` entry. Only the parts that survive via
+/// workbook-level / root-level rels (theme, customXml, docProps) are
+/// preserved — and even those rely on the shadow's rels rendering
+/// the same rel target paths (e.g. `xl/theme/theme1.xml`).
 fn classify_part(name: &str) -> PartAction {
     // VBA macros: drop. Security model is "no macros round-trip".
     if name == "xl/vbaProject.bin" || name.starts_with("xl/activeX/") {
         return PartAction::DropAsUnsupported(UnsupportedFeatureKind::Macros);
     }
 
-    // The big standalone-opaque parts. Preserve everything under
-    // these prefixes that isn't already in shadow.
-    let preserve_prefixes = [
-        "xl/theme/",
-        "xl/drawings/",
-        "xl/charts/",
-        "xl/media/",
-        "xl/embeddings/",
-        "xl/customXml/",
-        "xl/customProperty/",
-        "xl/printerSettings/",
-        "xl/pivotCache/",
-        "xl/pivotTables/",
-        "xl/slicers/",
-        "xl/slicerCaches/",
-        "xl/timelines/",
-        "xl/timelineCaches/",
-        "xl/queryTables/",
-        "xl/threadedComments/",
-        "xl/persons/",
-        "xl/connections/",
-        "xl/externalLinks/",
-        "xl/richData/",
-        "xl/cellMetadata/",
-        // docProps lives outside xl/. Most authors care about author /
-        // company metadata surviving; preserve. (Excel will rewrite
-        // app.xml's <AppVersion> on next save anyway.)
-        "docProps/",
-    ];
-    for p in preserve_prefixes {
-        if name.starts_with(p) {
-            return PartAction::Preserve;
-        }
+    // **Workbook- / root-anchored parts** — these survive via rels
+    // umya/shadow emits at workbook/root level (or via fixed-path
+    // conventions Excel understands).
+    if name.starts_with("xl/theme/") {
+        return PartAction::Preserve;
+    }
+    if name.starts_with("xl/customXml/") || name.starts_with("xl/customProperty/") {
+        return PartAction::Preserve;
+    }
+    if name.starts_with("docProps/") {
+        return PartAction::Preserve;
     }
 
-    // Exact-path comments preservation. comments1.xml etc.
+    // **Sheet-anchored parts** — drop honestly until v2 rels-merge.
+    // Each variant maps to the closest `UnsupportedFeatureKind` so
+    // `dropped_features` is informative.
+    if name.starts_with("xl/drawings/") {
+        return PartAction::DropAsUnsupported(UnsupportedFeatureKind::Drawings);
+    }
+    if name.starts_with("xl/charts/") {
+        return PartAction::DropAsUnsupported(UnsupportedFeatureKind::Drawings);
+    }
+    if name.starts_with("xl/media/") {
+        return PartAction::DropAsUnsupported(UnsupportedFeatureKind::Images);
+    }
+    if name.starts_with("xl/embeddings/") {
+        return PartAction::DropAsUnsupported(UnsupportedFeatureKind::Other("embeddings"));
+    }
     if name.starts_with("xl/comments") && name.ends_with(".xml") {
-        return PartAction::Preserve;
+        return PartAction::DropAsUnsupported(UnsupportedFeatureKind::Comments);
+    }
+    if name.starts_with("xl/threadedComments/") || name.starts_with("xl/persons/") {
+        return PartAction::DropAsUnsupported(UnsupportedFeatureKind::Comments);
+    }
+    if name.starts_with("xl/pivotCache/") || name.starts_with("xl/pivotTables/") {
+        return PartAction::DropAsUnsupported(UnsupportedFeatureKind::PivotTables);
+    }
+    if name.starts_with("xl/slicers/")
+        || name.starts_with("xl/slicerCaches/")
+        || name.starts_with("xl/timelines/")
+        || name.starts_with("xl/timelineCaches/")
+    {
+        return PartAction::DropAsUnsupported(UnsupportedFeatureKind::Other(
+            "slicers-and-timelines",
+        ));
+    }
+    if name.starts_with("xl/queryTables/") || name.starts_with("xl/connections/") {
+        return PartAction::DropAsUnsupported(UnsupportedFeatureKind::Other("query-tables"));
+    }
+    if name.starts_with("xl/externalLinks/") {
+        return PartAction::DropAsUnsupported(UnsupportedFeatureKind::ExternalLinks);
+    }
+    if name.starts_with("xl/richData/") || name.starts_with("xl/cellMetadata/") {
+        return PartAction::DropAsUnsupported(UnsupportedFeatureKind::Other("rich-data"));
+    }
+    if name.starts_with("xl/printerSettings/") {
+        return PartAction::DropAsUnsupported(UnsupportedFeatureKind::Other("printer-settings"));
     }
 
     // calcChain — Excel will rebuild on first open; safe to drop, and
@@ -478,6 +516,4 @@ impl<'a> ScopedFileGuard<'a> {
 
 impl Drop for ScopedFileGuard<'_> {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(self.path);
-    }
-}
+        let _ = std::fs::remove_fi

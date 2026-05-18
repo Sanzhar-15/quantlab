@@ -645,6 +645,125 @@ fn w5_d_14_2_update_original_round_trip_preserves_cell_edits() {
 }
 
 #[test]
+fn w5_d_14_2_2_strict_update_original_does_not_overwrite_output_on_drop() {
+    // **W5-D-14.2.2 (Codex audit H-B closure):** in Strict mode, a
+    // workbook whose original contained VBA must NOT overwrite the
+    // user's destination — the error must surface BEFORE the write.
+    // We synthesize a minimal "original" with a vbaProject.bin entry,
+    // pass it as preservation, and assert: (1) Strict errors; (2) the
+    // pre-existing file at output_path is byte-identical to its
+    // pre-export contents.
+    use std::io::Write;
+    use zip::write::FileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    // Build a minimal "original" xlsx-shaped zip with vbaProject.bin.
+    let mut original_bytes: Vec<u8> = Vec::new();
+    {
+        let mut zw = ZipWriter::new(std::io::Cursor::new(&mut original_bytes));
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+        zw.start_file("[Content_Types].xml", opts).unwrap();
+        zw.write_all(
+            b"<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"xml\" ContentType=\"application/xml\"/></Types>",
+        )
+        .unwrap();
+        zw.start_file("xl/vbaProject.bin", opts).unwrap();
+        zw.write_all(b"FAKE-VBA-BYTES").unwrap();
+        zw.finish().unwrap();
+    }
+
+    // Place a "pre-existing" file at the output path so we can detect
+    // overwrite.
+    let tmp = std::env::temp_dir().join("w5-d-14-2-2-strict-no-overwrite.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let sentinel = b"SENTINEL-DO-NOT-OVERWRITE";
+    std::fs::write(&tmp, sentinel).unwrap();
+
+    let registry = ql_functions::default_registry();
+    let wb = ql_storage::Workbook::new();
+    let preservation = ql_io_xlsx::XlsxPreservation {
+        original_bytes,
+        known_parts: std::collections::HashMap::new(),
+    };
+    let export_opts = XlsxExportOptions {
+        mode: ExportMode::UpdateOriginal {
+            source: preservation,
+        },
+        unsupported_policy: ql_io_xlsx::UnsupportedPolicy::Strict,
+        ..Default::default()
+    };
+
+    let res = export_xlsx_path(&wb, &registry, &tmp, export_opts);
+    assert!(
+        matches!(res, Err(ql_io_xlsx::XlsxError::UnsupportedFeature { .. })),
+        "expected UnsupportedFeature error in Strict mode, got {res:?}"
+    );
+
+    // Verify the sentinel file at output_path is UNCHANGED.
+    let after = std::fs::read(&tmp).expect("output path must still exist");
+    assert_eq!(
+        after.as_slice(),
+        sentinel,
+        "Strict-mode UpdateOriginal overwrote the destination — H-B regression"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn w5_d_14_2_2_permissive_update_original_populates_dropped_features() {
+    // **W5-D-14.2.2 (Codex audit H-A/H-B closure):** Permissive mode
+    // with a VBA-containing original returns OK + populates
+    // `dropped_features` with the VBA drop.
+    use std::io::Write;
+    use zip::write::FileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let mut original_bytes: Vec<u8> = Vec::new();
+    {
+        let mut zw = ZipWriter::new(std::io::Cursor::new(&mut original_bytes));
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+        zw.start_file("[Content_Types].xml", opts).unwrap();
+        zw.write_all(
+            b"<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"xml\" ContentType=\"application/xml\"/></Types>",
+        )
+        .unwrap();
+        zw.start_file("xl/vbaProject.bin", opts).unwrap();
+        zw.write_all(b"FAKE-VBA-BYTES").unwrap();
+        zw.finish().unwrap();
+    }
+
+    let tmp = std::env::temp_dir().join("w5-d-14-2-2-permissive-vba.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+
+    let registry = ql_functions::default_registry();
+    let wb = ql_storage::Workbook::new();
+    let preservation = ql_io_xlsx::XlsxPreservation {
+        original_bytes,
+        known_parts: std::collections::HashMap::new(),
+    };
+    let export_opts = XlsxExportOptions {
+        mode: ExportMode::UpdateOriginal {
+            source: preservation,
+        },
+        unsupported_policy: ql_io_xlsx::UnsupportedPolicy::Permissive,
+        ..Default::default()
+    };
+
+    let report = export_xlsx_path(&wb, &registry, &tmp, export_opts).unwrap();
+    assert!(
+        report
+            .dropped_features
+            .iter()
+            .any(|f| matches!(f.kind, ql_io_xlsx::UnsupportedFeatureKind::Macros)),
+        "expected dropped_features to contain a Macros entry, got {:?}",
+        report.dropped_features
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
 fn import_ironcalc_example_fixture_with_recompute_doesnt_panic() {
     // **W5-D-14a:** larger fixture with formulas. Run recompute in
     // best-effort mode. The point is: the pipeline doesn't panic

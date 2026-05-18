@@ -914,9 +914,15 @@ fn render_table_xml(t: &TableExport) -> String {
 }
 
 /// Map Quantbook's `TotalsFunction` to the OOXML
-/// `totalsRowFunction` attribute. Returns `None` for `None` /
-/// `Custom` (custom totals are represented inline in the cell, not
-/// via the attribute).
+/// `totalsRowFunction` attribute. Returns `None` only for the
+/// `None` variant (no totals function configured); `Custom` round-
+/// trips as `totalsRowFunction="custom"` per the OOXML schema so
+/// Excel doesn't silently downgrade the column to "no totals".
+///
+/// **W5-D-14.2.2 (Codex audit H-E closure):** the prior mapping
+/// dropped `Custom` to `None`, which on round-trip turned a
+/// table column with a custom totals formula into one with no
+/// totals function metadata.
 fn totals_function_attr(tf: ql_storage::TotalsFunction) -> Option<&'static str> {
     use ql_storage::TotalsFunction::*;
     match tf {
@@ -929,7 +935,7 @@ fn totals_function_attr(tf: ql_storage::TotalsFunction) -> Option<&'static str> 
         StdDev => Some("stdDev"),
         Sum => Some("sum"),
         Variance => Some("var"),
-        Custom => Option::None,
+        Custom => Some("custom"),
     }
 }
 
