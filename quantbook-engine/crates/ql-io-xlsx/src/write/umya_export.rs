@@ -1,18 +1,20 @@
 //! umya-spreadsheet writer — `NewWorkbook` mode.
 //!
-//! **W5-D-14e scope**: minimal viable exporter. Writes:
-//! - Sheets (one per Quantbook sheet, in workbook order).
-//! - Cell values (Number / Boolean / Text / Error).
-//! - Formula text + cached values.
+//! Post-W5-D-15.2 / megaudit closure, this module covers:
+//! - Sheets, cell values (Number / Boolean / Text / Error), formula
+//!   text + cached values.
+//! - Tables export (xl/tables/table*.xml + sheet rels + Content_Types).
+//! - Custom format codes export (xl/styles.xml/<numFmts>) +
+//!   per-cell format APPLICATION (cellXfs + s="N").
+//! - Workbook-scoped + sheet-scoped named ranges (definedNames).
+//! - Atomic write-then-rename for concurrent-safe output.
+//! - umya 2.2.0 bug workarounds (t="str" on numeric/boolean/error
+//!   formula cells, hardcoded #VALUE! sigil, missing date1904 attr).
 //!
-//! NOT in this commit (W5-D-14e follow-ups):
-//! - Tables / styles / named ranges round-trip.
-//! - `ExportMode::UpdateOriginal` (load preservation + patch).
-//! - Conditional formatting / data validation preservation.
-//!
-//! The `UpdateOriginal` mode arrives in a follow-up; this slice
-//! proves the umya integration works end-to-end on the cell layer
-//! first.
+//! Companion: `update_original` for the `ExportMode::UpdateOriginal`
+//! path. Deferred to v2: rels-graph merge + sheet-inline-anchor
+//! merge (CF / DV / mergeCells / hyperlinks preservation) — see
+//! `update_original.rs` module doc for rationale.
 
 use crate::error::XlsxError;
 use crate::options::FormulaCachePolicy;
@@ -498,7 +500,57 @@ fn post_process_zip(
 
         writer.finish().map_err(XlsxError::Zip)?;
     }
-    std::fs::write(path, out_buf)?;
+    // **W5-D-PM-4 (megaudit Opus-B HIGH-6 closure):** atomic write
+    // via write-tmp + rename. Concurrent exports to the same
+    // `output_path` would otherwise interleave bytes, producing
+    // corrupt output (3 of 4 concurrent calls were observed to fail
+    // empirically). POSIX `rename` is atomic on the same filesystem.
+    atomic_write_to_path(path, &out_buf)?;
+    Ok(())
+}
+
+/// **W5-D-PM-4 (megaudit Opus-B HIGH-6 closure):** write `bytes` to
+/// `final_path` atomically via tmp + rename. On the same
+/// filesystem, `rename(2)` is atomic — concurrent writers either
+/// see the old file or the new file, never a partial / interleaved
+/// state.
+/// Crate-visible wrapper so sibling modules (`update_original`)
+/// can use the same atomic-write helper without duplicating code.
+pub(crate) fn atomic_write_to_path_public(
+    final_path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(), XlsxError> {
+    atomic_write_to_path(final_path, bytes)
+}
+
+fn atomic_write_to_path(final_path: &std::path::Path, bytes: &[u8]) -> Result<(), XlsxError> {
+    let parent = final_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let stem = final_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("ql-output");
+    // Use a per-call counter + pid + nanosecond timestamp so
+    // concurrent writers don't collide on this tmp path either.
+    static WRITE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = WRITE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp = parent.join(format!(".{stem}.tmp-{pid}-{n}-{nanos}"));
+    std::fs::write(&tmp, bytes)?;
+    // `rename` clobbers an existing destination atomically on POSIX.
+    // On Windows this may not be atomic-when-target-exists; for our
+    // workflow that's acceptable (Windows isn't a target platform
+    // for this engine).
+    if let Err(e) = std::fs::rename(&tmp, final_path) {
+        // Best-effort cleanup of the tmp file on failure.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(XlsxError::Io(e));
+    }
     Ok(())
 }
 

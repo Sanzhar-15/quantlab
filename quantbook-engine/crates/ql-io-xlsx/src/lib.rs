@@ -222,10 +222,8 @@ pub fn import_xlsx_bytes(
     // for custom number formats (`numFmtId >= 164`) and registers
     // them with the workbook's FormatTable via `register_at` so the
     // imported id matches the OOXML id exactly (replay-determinism
-    // for round-trip). Per-cell application (mapping `<c s="N">` to
-    // a FormatId) is deferred to the worksheet-XML pass in a
-    // follow-up commit; W5-D-14d locks in the FormatTable
-    // population so the per-cell wiring can land cleanly.
+    // for round-trip). Per-cell application landed in W5-D-15 — see
+    // the cell-styles scanner wiring below.
     let style_index = read::styles_xml::parse_styles_xml(&package)?;
     let _custom_formats_registered =
         read::styles_import::register_custom_formats(&mut workbook, &style_index)?;
@@ -325,9 +323,11 @@ pub fn import_xlsx_bytes(
         }
     };
 
-    // Phase 4 — preservation handle. W5-D-14b stores the original
-    // bytes; the known-parts map is still empty (parts-index hookup
-    // for round-trip patching arrives with the writer in W5-D-14c).
+    // Phase 4 — preservation handle. We stash the original bytes
+    // verbatim. The deprecated `known_parts` field is initialized
+    // empty for backwards-compat; UpdateOriginal mode reads from
+    // `original_bytes` directly.
+    #[allow(deprecated)]
     let preservation = if options.preserve_package {
         Some(XlsxPreservation {
             original_bytes: bytes.to_vec(),
@@ -429,6 +429,7 @@ mod tests {
         // a zip-parse error (empty bytes are not a valid zip).
         let reg = ql_functions::default_registry();
         let wb = Workbook::new();
+        #[allow(deprecated)]
         let preservation = XlsxPreservation {
             original_bytes: Vec::new(),
             known_parts: std::collections::HashMap::new(),

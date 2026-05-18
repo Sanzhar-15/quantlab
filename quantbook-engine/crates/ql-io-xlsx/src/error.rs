@@ -64,10 +64,20 @@ pub enum XlsxError {
         detail: String,
     },
 
-    /// The hybrid reader's calamine view disagreed with the OOXML
-    /// scanner view on a load-bearing property (sheet count/order,
-    /// formula text for a cell, etc.). Pre-W5-D-14 design assumption:
-    /// these are import errors, not best-effort guesses.
+    /// **DEPRECATED — never constructed; slated for removal in 0.2.**
+    ///
+    /// **W5-D-PM-5 (megaudit Opus-C HIGH-3 closure):** the hybrid-reader
+    /// reconciliation step described in `calamine_grid.rs:60-62` never
+    /// landed (calamine's sheet order is used unchanged at
+    /// `convert.rs:33`). This variant is dead code that forces callers
+    /// writing exhaustive matches on `XlsxError` to handle a case that
+    /// cannot happen. Kept for one cycle as `#[deprecated]` to ease the
+    /// transition; remove in 0.2.0.
+    #[deprecated(
+        since = "0.1.1",
+        note = "Never constructed; reconciliation pass was never implemented. \
+                Will be removed in 0.2.0."
+    )]
     #[error("xlsx hybrid-reader reconciliation failure: {message}")]
     Reconciliation {
         /// Description of the disagreement.

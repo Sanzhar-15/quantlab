@@ -22,9 +22,22 @@ pub struct XlsxPreservation {
     /// starting point for `UpdateOriginal` mode.
     pub original_bytes: Vec<u8>,
 
-    /// Map from OOXML part path → content for parts the importer
-    /// recognized. The exporter patches these; unknown parts stay
-    /// as-is in `original_bytes`.
+    /// **DEPRECATED — slated for removal in the next major version.**
+    ///
+    /// **W5-D-PM-5 (megaudit Opus-C HIGH-2 / self M-3 / Opus-B M-11
+    /// closure):** this field is never populated by the importer
+    /// and never read by the exporter. The original design intent
+    /// (cache decompressed parts to avoid re-parse in
+    /// `UpdateOriginal`) never materialized; `UpdateOriginal` reads
+    /// `original_bytes` directly. The field stays for now to avoid
+    /// breaking callers that pattern-match `XlsxPreservation { .. }`;
+    /// new callers should set it to `HashMap::new()` and not rely
+    /// on its presence.
+    #[deprecated(
+        since = "0.1.1",
+        note = "Always empty; UpdateOriginal reads from original_bytes directly. \
+                Will be removed in 0.2.0."
+    )]
     pub known_parts: HashMap<String, Vec<u8>>,
 }
 

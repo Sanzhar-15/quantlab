@@ -239,7 +239,9 @@ pub(crate) fn export_update_original(
         }
     }
 
-    std::fs::write(output_path, out_buf)?;
+    // **W5-D-PM-4 (megaudit Opus-B HIGH-6 closure):** atomic write
+    // via tmp + rename. See `umya_export::atomic_write_to_path`.
+    crate::write::umya_export::atomic_write_to_path_public(output_path, &out_buf)?;
 
     Ok(report)
 }

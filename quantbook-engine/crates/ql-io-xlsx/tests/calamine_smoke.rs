@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! End-to-end smoke test against an IronCalc fixture.
 //!
 //! **W5-D-14a (Phase 4.11 round-trip spine):** prove that the
