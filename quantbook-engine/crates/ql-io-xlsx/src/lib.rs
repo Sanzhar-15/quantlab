@@ -156,6 +156,18 @@ pub fn import_xlsx_bytes(
     let _tables_imported =
         read::tables_import::import_tables(&package, &mut workbook, &sheet_names)?;
 
+    // **W5-D-14d — Phase 2d**: import styles. Parses `xl/styles.xml`
+    // for custom number formats (`numFmtId >= 164`) and registers
+    // them with the workbook's FormatTable via `register_at` so the
+    // imported id matches the OOXML id exactly (replay-determinism
+    // for round-trip). Per-cell application (mapping `<c s="N">` to
+    // a FormatId) is deferred to the worksheet-XML pass in a
+    // follow-up commit; W5-D-14d locks in the FormatTable
+    // population so the per-cell wiring can land cleanly.
+    let style_index = read::styles_xml::parse_styles_xml(&package)?;
+    let _custom_formats_registered =
+        read::styles_import::register_custom_formats(&mut workbook, &style_index)?;
+
     // **W5-D-14b — Phase 2b**: apply UnsupportedPolicy::Strict if any
     // unsupported features were detected. Permissive mode just
     // leaves the inventory in the report.
