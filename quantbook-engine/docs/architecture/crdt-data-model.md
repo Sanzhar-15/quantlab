@@ -446,28 +446,27 @@ the same `replay_into` internally.
 
 ## `ql-collab` crate scope
 
-**Phase 5.2.a (2026-05-19, ✅ shipped at `66a571b30af`):** scaffold
-ships with the following module surface:
+**Phase 5 V1 COMPLETE 2026-05-19.** Current 5-module surface (verified against `crates/ql-collab/src/lib.rs`):
 
 ```rust
-// crates/ql-collab/src/lib.rs (current state)
+// crates/ql-collab/src/lib.rs
 
-pub mod peer;        // PeerId newtype (u64 wrapper)
-pub mod session;     // CollabSession: per-peer state holder
-pub mod transport;   // trait Transport + NoopTransport test impl
+pub mod peer;        // PeerId newtype (u64 wrapper, 16-hex Display)
+pub mod presence;    // PresenceState + per-peer LoroMap (5.6 V1+V2)
+pub mod session;     // CollabSession + UndoGroupGuard (5.2.a..5.5 V2 V1)
+pub mod transport;   // Transport trait + NoopTransport + LoopbackTransport (5.5 V1+V2 V1)
+pub mod undo;        // pub use loro::UndoManager (5.4 V1+V2 V1+V2 V1.1)
 
 pub use peer::PeerId;
-pub use session::{CollabSession, CollabSessionError};
-pub use transport::{NoopTransport, Transport, TransportError};
+pub use presence::{PresenceError, PresenceState};
+pub use session::{CollabSession, CollabSessionError, UndoGroupGuard};
+pub use transport::{LoopbackTransport, NoopTransport, Transport, TransportError};
+pub use undo::UndoManager;
 ```
 
-Reserved (not yet populated, named in `docs/MASTER-PLAN.md` §541):
-- `presence` — Phase 5.6 cursor + selection map.
-- `undo` — Phase 5.4 peer-local undo via Loro `UndoManager`.
+Full surface (~31 public methods + 5 types, 67 unit tests + 1 integration test) inventory at `docs/phase5/v1-exit-packet.md` § "Final API surface (ql-collab)".
 
-Phase 5.2.a totals ~11 unit tests + ~600 LOC of scaffold. Phase
-5.2.b onward populates richer behavior; full Phase 5.2 crate LOC
-estimate remains 1,500-2,500 LOC + tests.
+Phase 5.2.a scaffold (`66a571b30af`) populated peer/session/transport. Subsequent V1 ships populated presence (`c677e244704` + `d4b3cdb2dc2`) and undo (`89c02b9d83e` + `6138a7203f6` + `7cbdc689ea9`). Presence + undo are NO LONGER "reserved" — both shipped V1+V2 V1.
 
 Current Cargo.toml deps (verified against `crates/ql-collab/Cargo.toml`):
 - `ql-oplog` — for `OpLog` + `Op` + `merge_bytes` + `import_bytes` + `export_bytes`.
@@ -707,10 +706,12 @@ post the 2026-05-19 audit. Status summary:
    adds the causality-aware rename-repair pass. Documented as
    a known V1 limitation.
 
-5. **Format id collision** — **CLOSED in 5.1 by D-1** (above).
-   `FormatId` switches from `u32` to a tagged tuple
-   (Builtin | Custom(peer_id, counter)) in Phase 5.2. Schema
-   bump documented; backwards-compat migration path defined.
+5. **Format id collision** — **DESIGN RESOLVED in 5.1 by D-1;
+   IMPLEMENTATION PENDING** (above). `FormatId` switches from
+   `u32` to a tagged tuple (Builtin | Custom(peer_id, counter))
+   in Phase 5.2 D-1 (next-session multi-day arc; see
+   `docs/phase5/d-1-starting-checklist.md`). Schema bump
+   documented; backwards-compat migration path defined.
 
 ## Cross-references
 
@@ -729,8 +730,7 @@ post the 2026-05-19 audit. Status summary:
 ## Documentation deliverables (Phase 5.1 closure)
 
 - `docs/architecture/crdt-data-model.md` ✅ THIS DOC.
-- `docs/audits/2026-05-19-phase-5-1-codex.md` — pending.
-- `docs/audits/2026-05-19-phase-5-1-opus.md` — pending.
-- `docs/audits/2026-05-19-phase-5-1-consolidated.md` — pending.
-- `docs/MASTER-PLAN.md` § Phase 5.1 update marking design
-  shipped + audit pending — pending.
+- `docs/audits/2026-05-19-phase-5-1-codex.md` ✅ shipped.
+- `docs/audits/2026-05-19-phase-5-1-opus.md` ✅ shipped.
+- `docs/audits/2026-05-19-phase-5-1-consolidated.md` ✅ shipped.
+- `docs/MASTER-PLAN.md` § Phase 5.1 update — see `docs/phase5/v1-exit-packet.md` for the canonical Phase 5 V1 closeout.

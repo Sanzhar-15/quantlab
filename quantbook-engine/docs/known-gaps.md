@@ -1,7 +1,7 @@
 # Known engine gaps — checklist with target phases
 
 **Status:** Living document, updated at each phase boundary  
-**Date last touched:** 2026-05-13 (Engine Phase 4.5 FULLY CLOSED — all 6 sub-phases (A.0/A/B/C/D/E) shipped. W5-84 closing mega-audit fixed 1 HIGH (fraction-format V2 rejection) + 3 MEDIUM (walk_for_anchor DateM, .qbook overlay-id validation, producer-replay equivalence). Registry at 130 entries.)  
+**Date last touched:** 2026-05-19 (Phase 5 V1 COMPLETE — see `docs/phase5/v1-exit-packet.md` for the full closeout. GAP-C-03 / C-04 / C-05 status updates this date.)  
 **Companion:** `docs/MASTER-PLAN.md`
 
 Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a gap is closed, move its row to the "Closed" section at the bottom and reference the closing commit.

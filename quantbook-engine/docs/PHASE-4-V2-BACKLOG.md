@@ -246,9 +246,9 @@ clean Phase 5 work if not done first.
   2. ✅ `clear_formula_rejects_invalid_*` → `cells.rs::tests` (`9b45ee656eb`).
   3. ✅ W5-147 `set_formula` canonicalization tests (4) →
      `cells.rs::tests`; `set_reference_mode_op_round_trips_through_replay`
-     → `config.rs::tests` (this commit).
+     → `config.rs::tests` (`93210e43567`).
   4. ✅ `drop_table_removes_metadata...` + `drop_table_missing_errors`
-     → `tables.rs::tests` (this commit).
+     → `tables.rs::tests` (`93210e43567`).
 - **Total relocated:** 9 tests across 4 commits. Zero risk per
   D1.a's "byte-identical" framing.
 

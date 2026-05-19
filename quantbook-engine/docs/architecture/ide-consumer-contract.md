@@ -48,14 +48,16 @@ Engine Phase 6.1 will formalize this as a `WorkbookSession` struct that owns wb 
 ### 2.1 Open / load
 
 ```rust
-let (wb, oplog) = ql_oplog::load_workbook_with_oplog(path)?;
+let (wb, oplog) = ql_io::load_workbook_with_oplog(path)?;
 ```
 
 - Loads the `.qbook/` directory.
 - `oplog.bin` MUST be present (Phase 2A.3.c contract; load fails with `MissingFile` otherwise).
 - The IDE then renders the grid by walking cells via `wb.sheet(id)?.read(row, col)` for each visible cell, and `wb.formula_at(sheet, row, col)` for the formula bar.
 
-If the workbook has no op log (legacy save or external tool), use the bare `ql_io::load_workbook(path)` and construct a fresh empty `OpLog::new()` — but note that subsequent saves via `save_workbook_with_oplog` will write the new (empty-then-growing) log over the absent one.
+**Tier D2 (2026-05-19, `e15e8908742`):** the persistence API moved from `ql_oplog::{load,save}_workbook_with_oplog` to `ql_io::{load,save}_workbook_with_oplog`. The old import paths fail to compile.
+
+If the workbook has no op log (legacy save or external tool), use the bare `ql_io::load_workbook(path)` and construct a fresh empty `OpLog::new()` — but note that subsequent saves via `ql_io::save_workbook_with_oplog` will write the new (empty-then-growing) log over the absent one.
 
 ### 2.2 Edit a single cell
 
@@ -171,7 +173,7 @@ Hit/miss counters in the bind-plan cache visible via `rt.cache_stats()` — IDE 
 ### 2.10 Save
 
 ```rust
-ql_oplog::save_workbook_with_oplog(&wb, &oplog, "name", path)?;
+ql_io::save_workbook_with_oplog(&wb, &oplog, "name", path)?;
 ```
 
 Atomic save (`.qbook/` + `oplog.bin` ride the same temp-then-rename protocol). The op log persists in full — any future session reloading this `.qbook` sees the same history.
@@ -187,11 +189,24 @@ Atomic save (`.qbook/` + `oplog.bin` ride the same temp-then-rename protocol). T
 
 The IDE will need these eventually; they're not blocking the Phase 2B.6 vertical slice:
 
-- **On-keystroke validation.** Today, the IDE has to call `set_formula` to know whether a formula is valid; that COMMITS the formula. A dry-run `WorkbookRuntime::validate_formula(sheet, row, col, text) -> Result<Value, RuntimeError>` is missing. Filed as GAP-I-04 (Phase 2B.6 follow-up if scope allows).
-- **Undo / redo.** The op log captures history; an inverse-op replay would let the IDE undo. GAP-C-04 (Engine Phase 5.4).
+- ~~**On-keystroke validation.**~~ ✅ SHIPPED in Phase 2B.7: `WorkbookRuntime::validate_formula(sheet, row, col, text) -> Result<Value, RuntimeError>` exists. Closes GAP-I-04.
+- ~~**Undo / redo.**~~ ✅ SHIPPED in Phase 5.4 V1/V2 V1/V2 V1.1 (2026-05-19). See `docs/phase5/v1-exit-packet.md` § "Final API surface (ql-collab)" — `CollabSession::{undo,redo,can_undo,can_redo,undo_count,redo_count,clear_undo_stack,start_undo_group,end_undo_group,start_undo_group_scoped,set_undo_merge_interval}`.
 - **Incremental dependency-aware recompute.** `recompute_all` re-walks every formula. The IDE wants "this cell changed → recompute its dependents only." GAP-R-01 (Engine Phase 3 — calcgraph integration).
-- **Cross-sheet diagnostics on rename.** Renaming sheet 0 would invalidate every `Sheet0!A1` reference; today nothing detects this. GAP-B-04 / Phase 4.6.
+- **Cross-sheet diagnostics on rename.** ✅ Phase 5.2 D-3 shipped the `BindError::UnknownSheet → #NAME?` mapping. Causality-aware rename-repair pass at merge time is deferred to Phase 5.3.
 - **Long-running cancellation.** No `Cancel-token` on long operations. Engine Phase 6.1 work.
+
+### 4.1 Phase 5 collaboration surface (preview — for Phase 5.7 IDE vertical slice)
+
+Phase 5 V1 (2026-05-19) added the engine-side multi-user CRDT collaboration substrate as the `ql-collab` crate. Full API inventory at `docs/phase5/v1-exit-packet.md` § "Final API surface (ql-collab)". IDE callers will use:
+
+- **`ql_collab::CollabSession`** — per-peer session holder. Wraps an `OpLog` + `loro::UndoManager` + optional `Box<dyn Transport>`.
+- **`CollabSession::new(peer_id) -> Result<Self, _>`** + **`from_snapshot(peer_id, bytes)`** — construction.
+- **Op log:** `append_op` / `merge_bytes` / `export_bytes`.
+- **Undo:** `undo` / `redo` / `start_undo_group_scoped` (returns RAII `UndoGroupGuard` — recommended for paste/fill-down/table-import).
+- **Transport:** `attach_transport<T: Transport + Send + 'static>` / `flush_to_transport` / `poll_remote` / `poll_remote_with_limit`. V1 ships `NoopTransport` + `LoopbackTransport::pair()` (in-process 2-peer); Phase 5.5 V2 V2/V3 will add WebSocket.
+- **Presence:** `update_presence(state)` / `peer_presence(peer)` / `clear_presence` / `peers_with_presence` / `sweep_presence` (V2 — caller-opt-in clean-slate on rejoin).
+
+**D-1 pending:** `FormatId` is still `u32` (per ql-storage::FormatId); Phase 5.2 D-1 will switch it to a tagged tuple `{ Builtin(u32) | Custom(PeerId, u32) }`. IDE callers that observe FormatId today (e.g. cell-format-id lookups) will need to handle both variants post-D-1.
 
 ## 5. Acceptance pattern (`crates/ql-exec/tests/ide_simulation.rs`)
 

@@ -1,11 +1,11 @@
 ---
 title: Phase 5 V1 exit packet (5.1 → 5.6 V1+V2 + 5.4 V2 V1+V1.1 + 5.5 V2 V1 + D1.a)
-status: ACTIVE — Phase 5 V1 surface complete 2026-05-19. D-1 (FormatId tagged tuple, multi-day) is the only remaining major Phase 5 item before the 5.8 megaudit.
+status: ACTIVE — Phase 5 V1 surface complete 2026-05-19. D-1 (FormatId tagged tuple, multi-day) is the next major Phase 5.2 item; 5.3, 5.5 V2 V2/V3, 5.7, and 5.8 also remain.
 date: 2026-05-19
 updated: 2026-05-19 (post-exit-packet additions: 5.6 V2 sweep_presence + D1.a 4-cluster closure)
 predecessor: docs/phase4/exit-packet.md + docs/phase5/entry-plan.md
 successor: docs/phase5/d-1-starting-checklist.md (fresh-session entry for the multi-day D-1 arc)
-supersedes_pointer: docs/phase5/entry-plan.md (entry-plan stays as scope reference; this packet is the closeout)
+supersedes_pointer: docs/phase5/entry-plan.md (entry-plan stays as historical scope reference; this packet is the closeout)
 ---
 
 # Phase 5 V1 exit packet — multi-user CRDT collaboration substrate
@@ -181,9 +181,10 @@ twice, etc.).
 ## Index-padding race incidents
 
 The `cargo fmt --all` × `git add` race noted in user memory
-(`git_index_padding_race.md`) recurred **2 times** this session:
-- Phase 5.5 V1 (`3590aa6d89e`) — caught by self-audit reading git diff; repaired in `924750819bc`.
-- Phase 5.4 V2 V1 (`6138a7203f6`) — caught by BOTH Codex + Opus 2-way audit via clean-checkout verification; repaired in `e199a5fda5a`.
+(`git_index_padding_race.md`) recurred **3 times** this session:
+1. Phase 5.5 V1 (`3590aa6d89e`, truncated `session.rs` + `transport.rs`) — caught by self-audit reading git diff; repaired in `924750819bc`.
+2. Phase 5.4 V2 V1 (`6138a7203f6`, truncated `session.rs`) — caught by BOTH Codex + Opus 2-way audit via clean-checkout verification; repaired in `e199a5fda5a`.
+3. Phase 5.4 V2 V1.1 audit-closure commit + 5.4 V2 V1 audit-closure commit + D1.a cluster 2 commit each hit `ERR_CHILD_PROCESS_STDIO_MAXBUFFER` in the pre-commit hook (recovered via re-stage + retry; no truncation made it into the blob those times — different failure mode than incidents 1+2 but same root cause: cargo fmt × git add timing on large files).
 
 The recurring pre-commit-hook `ERR_CHILD_PROCESS_STDIO_MAXBUFFER`
 error pattern is well-documented; mitigation (re-stage + commit
@@ -271,7 +272,7 @@ Phase 5 V1 added **91 net tests** to the engine.
 - `docs/architecture/crdt-data-model.md` — full CRDT design with all D-1..D-4 markers.
 - `docs/known-gaps.md` — GAP-C-03 / C-04 / C-05 closed at V1; remaining items.
 - `docs/MASTER-PLAN.md` §541-621 — Phase 5 sub-items + acceptance.
-- `docs/audits/2026-05-19-*.md` — 8 audit transcripts (4 cycles × 2 auditors).
+- `docs/audits/2026-05-19-*.md` — 23 audit transcripts across 11 audit cycles (each cycle produced 2-3 docs: Codex + Opus + Consolidated, with 5.6 V1 missing Opus due to Anthropic 529 × 3 retries and 5.4 V2 V1.1 Codex-only per documented justification).
 
 ## Verdict
 

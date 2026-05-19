@@ -542,6 +542,8 @@ The full v1 means all of these crates either ship real behavior or have a docume
 
 ## Phase 5 - Multi-User CRDT Collaboration
 
+**Status (2026-05-19): Phase 5 V1 COMPLETE.** Canonical record: `docs/phase5/v1-exit-packet.md`. Remaining: D-1 (multi-day), 5.3 conflict resolution, 5.5 V2 V2/V3 production transport, 5.7 IDE slice, 5.8 megaudit. D-1 fresh-session entry: `docs/phase5/d-1-starting-checklist.md`.
+
 **Purpose:** Turn collaboration from a single-writer op log into real multi-user CRDT state for sheets, cells, names, tables, presence, undo/redo, and offline sync.
 
 **Entry State Required**
@@ -557,52 +559,37 @@ The full v1 means all of these crates either ship real behavior or have a docume
 
 **Sub-items**
 
-1. **5.1 Collaboration Data Model Decision**  
-   Define which entities are Loro documents/maps/lists: workbook metadata, sheets, cells, formulas, names, tables, formats, and presence. Decide how computed values are derived rather than merged.  
-   References: Loro docs through pinned crate examples; `crates/ql-oplog/src/op.rs`; `.references/hyperformula/src/Serialization.ts` for separation of model/evaluation state.  
-   Acceptance: COL-DM-01 model doc checked in; COL-DM-02 computed state excluded from authoritative CRDT merge; COL-DM-03 conflict policy documented per entity.  
-   Effort: 3-5 days. Uncertain: final Loro container shape.
+1. **5.1 Collaboration Data Model Decision** ✅ SHIPPED 2026-05-19 (`918d7efdd91` + `df52cb44ad2`).
+   Loro container shape locked = Option A op-log preservation; 4 audit decisions D-1..D-4 recorded in `docs/architecture/crdt-data-model.md`. D-2/D-3/D-4 implemented; D-1 pending (multi-day).
 
-2. **5.2 `ql-collab` Core Documents**  
-   Implement collaborative workbook document, import/export, peer merge, version vectors, and conversion to/from `Workbook`.  
-   References: `ql-oplog` persistence; `.references/formualizer/crates/formualizer-workbook/src/session.rs`; `.references/formualizer/crates/formualizer-sheetport/src/session.rs`.  
-   Acceptance: DOC5-01 two docs merge cells/names/sheets; DOC5-02 deterministic materialization; DOC5-03 corrupt/unsupported CRDT state errors visibly.  
-   Effort: 1-2 weeks.
+2. **5.2 `ql-collab` Core Documents** 🟡 IN PROGRESS.
+   - ✅ D-2 (`1ca19e2fa37`) AddSheet auto-rename.
+   - ✅ D-3 (`e71312d4bcd`) UnknownSheet → #NAME?.
+   - ✅ D-4 (`2f217a2067a`) OpLog::merge_bytes + 2-peer spill probe.
+   - ✅ 5.2.a scaffold (`66a571b30af`).
+   - ✅ 5.2.b PeerId → LoroDoc wiring (`ef056f50bee`).
+   - ⏳ D-1 (FormatId tagged tuple, multi-day) — see `docs/phase5/d-1-starting-checklist.md`.
 
-3. **5.3 Conflict Resolution Semantics**  
-   Define last-writer, multi-value, delete/update, formula/value, sheet rename, and name collision behavior. Add conflict diagnostics where user action is required.  
-   References: `crates/ql-oplog/src/replay.rs`; `.references/formualizer/crates/formualizer-workbook/src/transaction.rs`; `.references/hyperformula/src/CrudOperations.ts`.  
-   Acceptance: CON-5-01 formula/value concurrent edits deterministic; CON-5-02 sheet/name conflicts deterministic; CON-5-03 conflicts visible in IDE diagnostics.  
-   Effort: 4-7 days.
+3. **5.3 Conflict Resolution Semantics** — future. Causality-aware rename-repair pass. 4-7 days. (V1 ships `BindError::UnknownSheet → #NAME?` as the simple case per Phase 5.2 D-3.)
 
-4. **5.4 Undo/Redo And Operation Grouping**  
-   Build local undo/redo over collaborative ops without corrupting remote history. Transaction commits remain one undo unit.  
-   References: `.references/formualizer/crates/formualizer-eval/src/engine/graph/snapshot.rs`; `.references/formualizer/crates/formualizer-sheetport/src/batch.rs`; `.references/hyperformula/src/CrudOperations.ts`.  
-   Acceptance: UND-5-01 local undo reverts local transaction; UND-5-02 remote edits remain; UND-5-03 redo works after sync where valid; UND-5-04 impossible redo reports visible conflict.  
-   Effort: 1 week.
+4. **5.4 Undo/Redo And Operation Grouping** ✅ V1 + V2 V1 + V2 V1.1 SHIPPED 2026-05-19.
+   - V1 (`89c02b9d83e`): 7 undo/redo methods on CollabSession wrapping `loro::UndoManager`; presence-origin commits auto-excluded.
+   - V2 V1 (`6138a7203f6` + `e199a5fda5a`): `start_undo_group` / `end_undo_group` + `set_undo_merge_interval`.
+   - V2 V1.1 (`7cbdc689ea9`): RAII `start_undo_group_scoped` returning `UndoGroupGuard` (panic/Err-safe). Codex audit PASS.
+   - V2 V2 pending: push/pop listeners (lower priority, speculative).
 
-5. **5.5 Transport Layer And Offline Sync**  
-   Implement WebSocket transport, file/session identity, offline queue, reconnect merge, and backpressure policy.  
-   References: `.references/formualizer/crates/formualizer-sheetport/src/session.rs`; `tokio` pinned workspace deps; VS Code stock WebSocket-compatible APIs.  
-   Acceptance: NET-5-01 two peers sync online; NET-5-02 offline edits merge after reconnect; NET-5-03 transport errors do not lose local edits; NET-5-04 protocol version mismatch is explicit.  
-   Effort: 1-2 weeks.
+5. **5.5 Transport Layer And Offline Sync** 🟡 V1 + V2 V1 SHIPPED 2026-05-19; V2 V2/V3 pending.
+   - V1 (`924750819bc`): `Transport` trait + `NoopTransport` + `LoopbackTransport::pair()`.
+   - V2 V1 (`ffd8f6e5f05`): `CollabSession::{attach,detach,has}_transport` + `flush_to_transport` + `poll_remote` (+ `_with_limit`).
+   - V2 V2 / V3 pending: WebSocket impl + reconnect + auto-flush + version-vector delta exports.
 
-6. **5.6 Presence And Awareness**  
-   Add cursor/selection/user metadata presence as ephemeral collaboration state. Presence must not dirty workbook graph.  
-   References: VS Code APIs; Loro awareness examples if available; `.references/formualizer/crates/formualizer-sheetport/src/session.rs`.  
-   Acceptance: PRE-5-01 remote selections show in IDE; PRE-5-02 presence expires; PRE-5-03 presence never persists into `.qbook` as workbook data.  
-   Effort: 3-5 days.
+6. **5.6 Presence And Awareness** ✅ V1 + V2 SHIPPED 2026-05-19.
+   - V1 (`c677e244704`): `"presence"` LoroMap + `PresenceState` + 4 CollabSession methods.
+   - V2 (`d4b3cdb2dc2`): `sweep_presence` caller-opt-in clean-slate.
 
-7. **5.7 Collaboration IDE Vertical Slice**  
-   Two IDE windows edit one workbook, go offline, edit conflicting cells/names, reconnect, and resolve/display conflicts.  
-   References: Phase 2B IDE slice; Phase 3 graph diagnostics.  
-   Acceptance: IDE-5-01 two-window sync; IDE-5-02 offline reconnect; IDE-5-03 conflict diagnostics; IDE-5-04 undo/redo works with remote edits.  
-   Effort: 1 week.
+7. **5.7 Collaboration IDE Vertical Slice** — future. Depends on D-1 + 5.3 + 5.5 V2 V2/V3.
 
-8. **5.8 Phase 5 Megaudit**  
-   Audit CRDT merge soundness, data loss risks, transport failure modes, and security boundaries.  
-   Acceptance: A5-01 all gates green; A5-02 randomized peer-merge tests checked in; A5-03 no silent conflict drops; A5-04 test count discipline met.  
-   Effort: 4-6 days.
+8. **5.8 Phase 5 Megaudit** — future. Depends on 5.1-5.7 complete.
 
 **Audit Checkpoints**
 
@@ -622,10 +609,12 @@ The full v1 means all of these crates either ship real behavior or have a docume
 
 **Documentation Deliverables**
 
-- `docs/phase5/entry-plan.md`.
-- `docs/phase5/exit-packet.md`.
-- `docs/architecture/collaboration-crdt.md`.
-- Protocol/versioning notes.
+- `docs/phase5/entry-plan.md` ✅ (status: SUPERSEDED-BY-EXIT-PACKET).
+- `docs/phase5/v1-exit-packet.md` ✅ (Phase 5 V1 canonical closeout 2026-05-19).
+- `docs/phase5/d-1-starting-checklist.md` ✅ (D-1 fresh-session entry).
+- `docs/architecture/crdt-data-model.md` ✅ (locked design with D-1..D-4 status markers).
+- 23 audit transcripts at `docs/audits/2026-05-19-*` covering 11 audit cycles.
+- Protocol/versioning notes — pending D-1 + 5.5 V2 V2/V3 work.
 
 ## Phase 6 - Product Surfaces
 

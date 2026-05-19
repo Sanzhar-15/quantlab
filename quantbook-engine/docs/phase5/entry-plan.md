@@ -1,6 +1,6 @@
 ---
 title: Phase 5 entry plan — Multi-User CRDT Collaboration
-status: SUPERSEDED-BY-EXIT-PACKET — Phase 5 V1 COMPLETE 2026-05-19. See `docs/phase5/v1-exit-packet.md` for the canonical session record. D-1 (multi-day) is the only remaining major Phase 5 item; see `docs/phase5/d-1-starting-checklist.md`.
+status: SUPERSEDED-BY-EXIT-PACKET — Phase 5 V1 COMPLETE 2026-05-19. See `docs/phase5/v1-exit-packet.md` for the canonical session record. D-1 (multi-day) is the next major Phase 5.2 item; 5.3, 5.5 V2 V2/V3, 5.7, and 5.8 also remain. D-1 fresh-session entry: `docs/phase5/d-1-starting-checklist.md`.
 date: 2026-05-19
 predecessor: docs/phase4/exit-packet.md
 successor: docs/phase5/v1-exit-packet.md (closeout) + docs/phase5/d-1-starting-checklist.md (D-1 entry)
