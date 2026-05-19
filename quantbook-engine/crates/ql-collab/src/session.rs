@@ -9,10 +9,13 @@
 //!   inverse ops + retracts originals from the visible `"ops"`
 //!   list (NOT physical removal). Presence-origin commits
 //!   excluded. See [`session::CollabSession::undo`].
-//! - **Phase 5.5** — automatic transport integration: append a
-//!   local op → broadcast bytes via [`crate::Transport::send`];
-//!   poll [`crate::Transport::try_recv`] for remote bytes →
-//!   `merge_bytes`.
+//! - **Phase 5.5** — transport layer. V1 shipped at
+//!   `924750819bc` (LoopbackTransport for in-process 2-peer
+//!   tests); V2 pending — WebSocket impl + auto-flush
+//!   (append a local op → broadcast bytes via
+//!   [`crate::Transport::send`]; poll
+//!   [`crate::Transport::try_recv`] for remote bytes →
+//!   `merge_bytes`).
 //! - ~~**Phase 5.6**~~ ✅ V1 shipped at `c677e244704` — `presence`
 //!   module + 4 `CollabSession` methods (`update_presence` /
 //!   `peer_presence` / `clear_presence` / `peers_with_presence`).

@@ -370,21 +370,32 @@ cursor movement doesn't pollute the undo stack.
   reachable from a shared `&OpLog` (Codex+Opus 5.4 V1 audit
   closure).
 
-## Transport (Phase 5.5 preview)
+## Transport (Phase 5.5 — V1 partially shipped)
+
+**V1 ✅ shipped at `924750819bc` (2026-05-19):** `Transport`
+trait + `NoopTransport` (5.2.a) + `LoopbackTransport` (5.5 V1)
+— in-process paired endpoints for 2-peer tests. The
+`LoopbackTransport::pair()` constructor returns two endpoints
+whose sends route to each other's recv queues; `Send + Sync`
+so multi-threaded test patterns work too. Drain-before-Closed
+semantic per the trait contract.
 
 Loro's wire format:
 - `LoroDoc::export(ExportMode::Updates(version_vector))` →
   bytes carrying only ops new-to-the-peer-since-version-vector.
 - `LoroDoc::import(bytes)` → merge into local doc.
 
-Phase 5.5 wraps these with a WebSocket transport (or any
-bidirectional byte channel). Each peer pushes version-vector
+**V2 pending:** WebSocket transport (or any bidirectional byte
+channel) for production. Each peer pushes version-vector
 updates to the server; server fan-outs to other peers; each
-peer imports.
+peer imports. V2 also adds auto-flush wiring on `CollabSession`
+(append a local op → push via attached `Transport`). V1's
+`LoopbackTransport` is sufficient for engine-side tests.
 
-5.1 does NOT pick a transport (WS vs Server-Sent Events vs
-custom protocol) — that's 5.5's call. 5.1 just confirms the
-substrate works regardless.
+5.1 does NOT pick a production transport (WS vs Server-Sent
+Events vs custom protocol) — that's 5.5 V2's call. 5.1 just
+confirms the substrate works regardless; 5.5 V1 proves it via
+LoopbackTransport.
 
 ## Backwards compatibility with `.qbook` envelope
 

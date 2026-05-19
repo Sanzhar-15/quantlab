@@ -1,10 +1,12 @@
 //! `Transport` trait — wire-byte channel for Phase 5 collaboration.
 //!
-//! **Phase 5.2.a (2026-05-19, scaffold ship):** defines the trait
-//! shape that Phase 5.5 will implement (WebSocket or
-//! Server-Sent-Events or custom protocol — the choice is 5.5's
-//! call). Tests in the meantime use [`NoopTransport`] which
-//! discards all traffic.
+//! **Phase 5.2.a (2026-05-19, scaffold):** trait shape defined.
+//! **Phase 5.5 V1 (2026-05-19, `924750819bc`):** `LoopbackTransport`
+//! shipped — in-process paired endpoints for 2-peer tests.
+//! **Phase 5.5 V2 (pending):** WebSocket impl + reconnect /
+//! offline sync semantics.
+//!
+//! Tests can also use [`NoopTransport`] which discards traffic.
 //!
 //! The contract is intentionally minimal:
 //!
@@ -153,11 +155,23 @@ impl Transport for NoopTransport {
 /// ## Close semantics
 ///
 /// Each endpoint has its OWN `closed` flag (separate
-/// `AtomicBool`). `a.close()` shuts down endpoint A — A's
-/// `send` + `try_recv` both return `TransportError::Closed`. B
-/// is unaffected: B can still `send` (bytes land in A's inbox
-/// but A won't drain them) and `try_recv` (drains any bytes
-/// already in B's inbox).
+/// `AtomicBool`). `a.close()` shuts down endpoint A:
+/// - A's `send` returns `TransportError::Closed` immediately.
+/// - A's `try_recv` drains any already-queued bytes FIRST and
+///   only returns `Closed` once the queue is empty (per the
+///   `Transport` trait contract at the trait docstring).
+/// - B is unaffected: B can still `send` (bytes land in A's
+///   inbox; A drains them on the next try_recv before reporting
+///   Closed) and `try_recv` (drains B's inbox).
+///
+/// ## Atomic ordering caveat
+///
+/// `close` uses `AtomicBool` with `Relaxed` ordering. For
+/// cross-thread "close then send" semantics, callers must use
+/// external synchronization — a thread that observes
+/// `is_closed() == true` after another thread's `close()` is NOT
+/// guaranteed by this transport alone (the atomic only protects
+/// the flag itself, not the surrounding sequence).
 pub struct LoopbackTransport {
     /// Channel WE drain via `try_recv`. The peer's `send` writes
     /// here.
@@ -241,16 +255,36 @@ impl Transport for LoopbackTransport {
     }
 
     fn try_recv(&mut self) -> Result<Option<Vec<u8>>, TransportError> {
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(TransportError::Closed);
-        }
-        Ok(self
+        // Trait contract (transport.rs:71-74): "Closed only when the
+        // channel is permanently closed AND its internal queue is
+        // empty." So drain any already-queued bytes first; only
+        // return Closed when both closed AND drained.
+        // Codex + Opus 5.5 V1 audit MEDIUM/HIGH closure: pre-closure
+        // we returned Closed immediately on close, violating the
+        // contract.
+        let mut queue = self
             .inbox
             .lock()
-            .map_err(|e| TransportError::Io(format!("loopback inbox lock poisoned: {e}")))?
-            .pop_front())
+            .map_err(|e| TransportError::Io(format!("loopback inbox lock poisoned: {e}")))?;
+        if let Some(bytes) = queue.pop_front() {
+            return Ok(Some(bytes));
+        }
+        // Queue empty — now distinguish "open but empty" from "closed".
+        if self.closed.load(Ordering::Relaxed) {
+            Err(TransportError::Closed)
+        } else {
+            Ok(None)
+        }
     }
 }
+
+// Codex + Opus 5.5 V1 audit closure: pin the Send+Sync contract
+// the docstring promises. If a future refactor accidentally adds
+// a non-Send/Sync field, this stops compiling.
+const _ASSERT_LOOPBACK_TRANSPORT_SEND_SYNC: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<LoopbackTransport>();
+};
 
 #[cfg(test)]
 mod tests {
@@ -346,22 +380,38 @@ mod tests {
         a.close();
         assert!(a.is_closed());
         assert!(!b.is_closed(), "close is per-endpoint");
-        // B can still send (bytes go into A's inbox but A won't drain).
+        // B can still send. Bytes land in A's inbox; A is closed so
+        // any subsequent A.try_recv first drains them, then returns
+        // Closed (Codex+Opus 5.5 V1 audit closure — drain-before-close
+        // matches the Transport trait contract at transport.rs:71-74).
         b.send(b"orphan").unwrap();
-        // A's send and recv are both blocked.
+        // A's send is blocked immediately.
         assert!(matches!(a.send(b"x"), Err(TransportError::Closed)));
+        // A's try_recv drains the queued byte first (contract: only
+        // return Closed when closed AND drained).
+        assert_eq!(a.try_recv().unwrap(), Some(b"orphan".to_vec()));
+        // Now empty + closed → Closed.
         assert!(matches!(a.try_recv(), Err(TransportError::Closed)));
         // B's recv still works (B's inbox is independent).
         assert_eq!(b.try_recv().unwrap(), None);
     }
 
     #[test]
-    fn loopback_close_blocks_own_send_and_recv() {
+    fn loopback_close_blocks_send_but_drains_recv() {
+        // Renamed from loopback_close_blocks_own_send_and_recv — the
+        // prior version asserted try_recv returned Closed immediately
+        // on close, violating the trait contract that promises queue
+        // drains before Closed.
         let (mut a, mut b) = LoopbackTransport::pair();
-        b.send(b"queued").unwrap();
+        b.send(b"first").unwrap();
+        b.send(b"second").unwrap();
         a.close();
-        // A had a pending message but closing blocks even draining it.
+        // A drains both queued bytes first (contract: drain before Closed).
+        assert_eq!(a.try_recv().unwrap(), Some(b"first".to_vec()));
+        assert_eq!(a.try_recv().unwrap(), Some(b"second".to_vec()));
+        // Now empty + closed → Closed.
         assert!(matches!(a.try_recv(), Err(TransportError::Closed)));
+        // Send is blocked regardless of queue state.
         assert!(matches!(a.send(b"nope"), Err(TransportError::Closed)));
     }
 
