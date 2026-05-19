@@ -400,14 +400,52 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             // Codex HIGH-1 flagged that the prior infallible path
             // silently accepted duplicate-canonical names + reserved
             // characters at the replay boundary too.
-            workbook
-                .try_add_sheet_with_chunk_rows(name.clone(), *chunk_rows)
-                .map_err(|source| ReplayError::SheetNameRejected {
-                    index,
-                    name: name.clone(),
-                    source,
-                })?;
-            Ok(())
+            //
+            // **Phase 5.2 D-2 closure (2026-05-19):** auto-rename on
+            // duplicate-canonical-name. Phase 5 multi-peer scenario:
+            // peer A and peer B both call `add_sheet("S")` locally;
+            // each producer-side validates against its own snapshot
+            // (no collision visible); both emit
+            // `Op::AddSheet { name: "S", ... }`; merged log has both.
+            // First replay succeeds; second hits the duplicate guard.
+            // Pre-D-2 we rejected the second op (worse UX than Google
+            // Sheets, which auto-renames to S(2)). Now we walk
+            // `<name>(2)`, `<name>(3)`, … until we find a free name.
+            // `Empty` + `ReservedCharacter` still reject — auto-rename
+            // only resolves the collaboration-collision case.
+            let mut chosen = name.clone();
+            let mut suffix = 2u32;
+            const AUTO_RENAME_CEILING: u32 = 10_000;
+            loop {
+                match workbook.try_add_sheet_with_chunk_rows(chosen.clone(), *chunk_rows) {
+                    Ok(_) => return Ok(()),
+                    Err(ql_storage::SheetNameError::Duplicate { .. }) => {
+                        chosen = format!("{name}({suffix})");
+                        suffix += 1;
+                        if suffix > AUTO_RENAME_CEILING {
+                            // Pathological: more than 10k sheets all
+                            // share the same base name (impossible in
+                            // realistic workbooks; max sheets per
+                            // workbook is 65,535). Surface a clean
+                            // error rather than loop forever.
+                            return Err(ReplayError::SheetNameRejected {
+                                index,
+                                name: name.clone(),
+                                source: ql_storage::SheetNameError::Duplicate {
+                                    name: name.clone(),
+                                },
+                            });
+                        }
+                    }
+                    Err(other) => {
+                        return Err(ReplayError::SheetNameRejected {
+                            index,
+                            name: name.clone(),
+                            source: other,
+                        });
+                    }
+                }
+            }
         }
         Op::RenameSheet {
             id,
@@ -1740,9 +1778,18 @@ mod tests {
     // ===== W5-93 (Phase 4.6.E closure) Op::AddSheet name validation =====
 
     #[test]
-    fn replay_add_sheet_canonical_duplicate_rejected() {
-        // Codex HIGH-1: a hand-crafted log carrying conflicting names
-        // must NOT enter the workbook silently.
+    fn replay_add_sheet_canonical_duplicate_auto_renames() {
+        // **Phase 5.2 D-2 closure (2026-05-19):** auto-rename replaces
+        // the pre-D-2 behavior of rejecting duplicate-canonical names
+        // at replay. Phase 5 collaboration scenario: peer A and peer B
+        // both call `add_sheet("Sheet1")` locally with no collision
+        // visible at producer time; both append the op; merged log
+        // has both. Per the Google Sheets / Excel Online pattern, the
+        // second auto-renames to `Sheet1(2)` rather than rejecting.
+        //
+        // Pre-D-2 this test was `replay_add_sheet_canonical_duplicate_rejected`
+        // asserting `ReplayError::SheetNameRejected`. The D-2 spec
+        // (5.1 audit Opus H-3) inverted that expectation.
         let mut log = OpLog::new();
         log.append(Op::AddSheet {
             name: "Sheet1".to_owned(),
@@ -1757,13 +1804,70 @@ mod tests {
 
         let mut wb = Workbook::new();
         let reg = default_registry();
-        let err = replay_into(&log, &mut wb, &reg).unwrap_err();
-        assert!(
-            matches!(err, ReplayError::SheetNameRejected { index: 1, .. }),
-            "expected SheetNameRejected at index 1, got {err:?}"
+        replay_into(&log, &mut wb, &reg).expect("auto-rename succeeds");
+        assert_eq!(wb.sheet_count(), 2);
+        // First sheet keeps its name.
+        assert_eq!(wb.sheet(0).unwrap().name(), "Sheet1");
+        // Second sheet auto-renamed (original was "SHEET1" which is
+        // a canonical-duplicate of "Sheet1"; suffix starts at (2)).
+        assert_eq!(wb.sheet(1).unwrap().name(), "SHEET1(2)");
+    }
+
+    #[test]
+    fn replay_add_sheet_auto_rename_walks_suffix_until_free() {
+        // Three peers concurrently add "Sheet1"; replay should
+        // produce Sheet1, Sheet1(2), Sheet1(3).
+        let mut log = OpLog::new();
+        for _ in 0..3 {
+            log.append(Op::AddSheet {
+                name: "Sheet1".to_owned(),
+                chunk_rows: 16,
+            })
+            .unwrap();
+        }
+
+        let mut wb = Workbook::new();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert_eq!(wb.sheet_count(), 3);
+        assert_eq!(wb.sheet(0).unwrap().name(), "Sheet1");
+        assert_eq!(wb.sheet(1).unwrap().name(), "Sheet1(2)");
+        assert_eq!(wb.sheet(2).unwrap().name(), "Sheet1(3)");
+    }
+
+    #[test]
+    fn replay_add_sheet_auto_rename_skips_already_taken_suffix() {
+        // Pre-existing "Sheet1(2)" forces the second AddSheet("Sheet1")
+        // to skip to (3). Verifies the loop genuinely walks until
+        // it finds a free slot.
+        let mut log = OpLog::new();
+        log.append(Op::AddSheet {
+            name: "Sheet1".to_owned(),
+            chunk_rows: 16,
+        })
+        .unwrap();
+        log.append(Op::AddSheet {
+            name: "Sheet1(2)".to_owned(),
+            chunk_rows: 16,
+        })
+        .unwrap();
+        log.append(Op::AddSheet {
+            name: "Sheet1".to_owned(),
+            chunk_rows: 16,
+        })
+        .unwrap();
+
+        let mut wb = Workbook::new();
+        let reg = default_registry();
+        replay_into(&log, &mut wb, &reg).unwrap();
+        assert_eq!(wb.sheet_count(), 3);
+        assert_eq!(wb.sheet(0).unwrap().name(), "Sheet1");
+        assert_eq!(wb.sheet(1).unwrap().name(), "Sheet1(2)");
+        assert_eq!(
+            wb.sheet(2).unwrap().name(),
+            "Sheet1(3)",
+            "auto-rename must skip already-taken (2) and land on (3)"
         );
-        // Replay failed mid-log; the first sheet did land.
-        assert_eq!(wb.sheet_count(), 1);
     }
 
     #[test]
