@@ -50,6 +50,7 @@ use ql_oplog::{Op, OpLog, OpLogError, PRESENCE_COMMIT_ORIGIN};
 
 use crate::peer::PeerId;
 use crate::presence::{self, PresenceError, PresenceState};
+use crate::transport::{Transport, TransportError};
 
 /// Errors emitted by `CollabSession` operations.
 #[derive(Debug, Error)]
@@ -71,6 +72,13 @@ pub enum CollabSessionError {
     /// operation (e.g. mid-transaction).
     #[error("undo/redo error: {0}")]
     Undo(#[from] loro::LoroError),
+
+    /// **Phase 5.5 V2 (2026-05-19):** the attached `Transport`
+    /// returned an error during `flush_to_transport` or
+    /// `poll_remote`. The local `OpLog` state is unaffected — the
+    /// caller can retry the flush/poll or detach the transport.
+    #[error("transport error: {0}")]
+    Transport(#[from] TransportError),
 }
 
 /// Per-peer collaboration state holder.
@@ -96,6 +104,15 @@ pub struct CollabSession {
     /// `LoroDoc` clone (`loro-internal::undo:166,670`) — it doesn't
     /// borrow from `log`'s doc and won't UAF when `log` drops first.
     undo: loro::UndoManager,
+    /// **Phase 5.5 V2 V1 (2026-05-19):** optional attached
+    /// transport. `None` until `attach_transport` is called.
+    /// Boxed + `Send` so callers can move sessions between
+    /// threads with attached transports.
+    ///
+    /// V2 V1 scope: caller drives flush + poll explicitly
+    /// (no auto-flush on append). V2 V2 / V3 will add
+    /// auto-flush + version-vector delta exports.
+    transport: Option<Box<dyn Transport + Send>>,
 }
 
 impl CollabSession {
@@ -118,7 +135,12 @@ impl CollabSession {
         let mut log = OpLog::new();
         log.set_peer_id(peer_id.as_u64())?;
         let undo = make_undo_manager(&log);
-        Ok(Self { peer_id, log, undo })
+        Ok(Self {
+            peer_id,
+            log,
+            undo,
+            transport: None,
+        })
     }
 
     /// Construct a session by importing a shared snapshot. Use this
@@ -142,7 +164,12 @@ impl CollabSession {
         let mut log = OpLog::import_bytes(bytes)?;
         log.set_peer_id(peer_id.as_u64())?;
         let undo = make_undo_manager(&log);
-        Ok(Self { peer_id, log, undo })
+        Ok(Self {
+            peer_id,
+            log,
+            undo,
+            transport: None,
+        })
     }
 
     /// Stable peer id assigned at session creation.
@@ -194,6 +221,80 @@ impl CollabSession {
     /// True iff the log has no ops (session just opened, no edits yet).
     pub fn is_empty(&self) -> bool {
         self.log.is_empty()
+    }
+
+    /// **Phase 5.5 V2 V1 (2026-05-19):** attach a `Transport`
+    /// implementation to this session. Subsequent
+    /// [`flush_to_transport`] calls push the session's current
+    /// snapshot through it; [`poll_remote`] drains incoming
+    /// bytes and merges them.
+    ///
+    /// Returns `Some(previous)` if a transport was already
+    /// attached and got replaced. V2 V1 does NOT auto-flush on
+    /// `append_op` — caller drives flush + poll explicitly. V3
+    /// will add auto-flush + version-vector delta exports.
+    pub fn attach_transport<T: Transport + Send + 'static>(
+        &mut self,
+        transport: T,
+    ) -> Option<Box<dyn Transport + Send>> {
+        self.transport.replace(Box::new(transport))
+    }
+
+    /// **Phase 5.5 V2 V1 (2026-05-19):** detach the current
+    /// transport. Returns it for caller cleanup; returns `None`
+    /// if no transport was attached.
+    pub fn detach_transport(&mut self) -> Option<Box<dyn Transport + Send>> {
+        self.transport.take()
+    }
+
+    /// **Phase 5.5 V2 V1 (2026-05-19):** true iff a transport is
+    /// currently attached.
+    pub fn has_transport(&self) -> bool {
+        self.transport.is_some()
+    }
+
+    /// **Phase 5.5 V2 V1 (2026-05-19):** export the current
+    /// session snapshot and push it through the attached
+    /// transport. No-op (returns `Ok(false)`) if no transport
+    /// attached.
+    ///
+    /// Returns `Ok(true)` if bytes were sent. Errors propagate
+    /// from either the underlying `OpLog::export_bytes` or the
+    /// transport's `send`. The local `OpLog` is unaffected by
+    /// transport errors — caller can retry the flush.
+    ///
+    /// V2 V1 sends the FULL snapshot each call (O(state)). V3
+    /// will track per-transport version vectors and send deltas
+    /// only.
+    pub fn flush_to_transport(&mut self) -> Result<bool, CollabSessionError> {
+        let Some(transport) = self.transport.as_mut() else {
+            return Ok(false);
+        };
+        let bytes = self.log.export_bytes()?;
+        transport.send(&bytes)?;
+        Ok(true)
+    }
+
+    /// **Phase 5.5 V2 V1 (2026-05-19):** drain the attached
+    /// transport's recv queue, merging each blob into the local
+    /// `OpLog`. Returns the number of blobs merged.
+    ///
+    /// Returns `Ok(0)` if no transport attached. Stops draining
+    /// at the first `try_recv` returning `None` (queue empty);
+    /// propagates `Closed` / `Io` errors as
+    /// `CollabSessionError::Transport`. Per the trait contract,
+    /// any already-queued bytes are drained BEFORE `Closed`
+    /// surfaces.
+    pub fn poll_remote(&mut self) -> Result<usize, CollabSessionError> {
+        let Some(transport) = self.transport.as_mut() else {
+            return Ok(0);
+        };
+        let mut merged = 0usize;
+        while let Some(bytes) = transport.try_recv()? {
+            self.log.merge_bytes(&bytes)?;
+            merged += 1;
+        }
+        Ok(merged)
     }
 
     /// **Phase 5.6 V1 (2026-05-19):** write this session's own
@@ -321,6 +422,7 @@ impl std::fmt::Debug for CollabSession {
             .field("op_count", &self.log.len())
             .field("undo_count", &self.undo.undo_count())
             .field("redo_count", &self.undo.redo_count())
+            .field("transport_attached", &self.transport.is_some())
             .finish()
     }
 }
@@ -780,6 +882,143 @@ mod tests {
         assert!(
             b_iter_after >= 1,
             "B's own op must survive A's local undo (local-only semantics)"
+        );
+    }
+
+    #[test]
+    fn attach_transport_returns_none_when_no_prior() {
+        use crate::transport::NoopTransport;
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        assert!(!s.has_transport());
+        let prior = s.attach_transport(NoopTransport::new());
+        assert!(prior.is_none());
+        assert!(s.has_transport());
+    }
+
+    #[test]
+    fn attach_transport_returns_previous_on_replace() {
+        use crate::transport::NoopTransport;
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.attach_transport(NoopTransport::new());
+        let prior = s.attach_transport(NoopTransport::new());
+        assert!(prior.is_some(), "second attach must return the first");
+    }
+
+    #[test]
+    fn detach_transport_returns_box_then_clears() {
+        use crate::transport::NoopTransport;
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.attach_transport(NoopTransport::new());
+        assert!(s.has_transport());
+        let detached = s.detach_transport();
+        assert!(detached.is_some());
+        assert!(!s.has_transport());
+        assert!(s.detach_transport().is_none(), "second detach is None");
+    }
+
+    #[test]
+    fn flush_to_transport_noop_without_attached() {
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        let flushed = s.flush_to_transport().unwrap();
+        assert!(!flushed, "flush with no transport returns false");
+    }
+
+    #[test]
+    fn poll_remote_noop_without_attached() {
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        let drained = s.poll_remote().unwrap();
+        assert_eq!(drained, 0, "poll with no transport returns 0");
+    }
+
+    #[test]
+    fn flush_to_transport_pushes_bytes_via_attached() {
+        use crate::transport::LoopbackTransport;
+        let (tx_a, mut tx_b) = LoopbackTransport::pair();
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 42.0)).unwrap();
+        s.attach_transport(tx_a);
+
+        assert_eq!(
+            tx_b.pending_recv(),
+            0,
+            "transport idle until flush is called"
+        );
+        let flushed = s.flush_to_transport().unwrap();
+        assert!(flushed);
+        assert_eq!(tx_b.pending_recv(), 1, "flush pushed exactly one blob");
+
+        // Sanity: the pushed bytes are a valid Loro snapshot
+        // (poll on B's side drains them).
+        let received = tx_b.try_recv().unwrap().expect("tx_b drains one blob");
+        assert!(!received.is_empty());
+    }
+
+    #[test]
+    fn poll_remote_drains_attached_transport() {
+        use crate::transport::LoopbackTransport;
+        let (tx_a, tx_b) = LoopbackTransport::pair();
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        // Pre-populate tx_a's inbox by writing into tx_b's outbox via
+        // tx_b's send. (tx_b.send → tx_a.inbox)
+        let snapshot = {
+            let other = CollabSession::new(PeerId::new(2)).unwrap();
+            other.export_bytes().unwrap()
+        };
+        let mut tx_b = tx_b; // own it for send
+        tx_b.send(&snapshot).unwrap();
+        tx_b.send(&snapshot).unwrap();
+
+        s.attach_transport(tx_a);
+        let drained = s.poll_remote().unwrap();
+        assert_eq!(drained, 2, "poll drained both queued blobs");
+
+        // Next poll is a no-op (queue empty).
+        let drained2 = s.poll_remote().unwrap();
+        assert_eq!(drained2, 0);
+    }
+
+    #[test]
+    fn two_sessions_converge_via_attached_loopback() {
+        use crate::transport::LoopbackTransport;
+        let (tx_a, tx_b) = LoopbackTransport::pair();
+
+        let base = CollabSession::new(PeerId::new(1)).unwrap();
+        let base_bytes = base.export_bytes().unwrap();
+
+        let mut peer_a = CollabSession::from_snapshot(PeerId::new(0xa), &base_bytes).unwrap();
+        peer_a.attach_transport(tx_a);
+        let mut peer_b = CollabSession::from_snapshot(PeerId::new(0xb), &base_bytes).unwrap();
+        peer_b.attach_transport(tx_b);
+
+        // A appends + flushes; B polls.
+        peer_a.append_op(put_value(0, 0, 0, 10.0)).unwrap();
+        peer_a.flush_to_transport().unwrap();
+        let drained_b = peer_b.poll_remote().unwrap();
+        assert_eq!(drained_b, 1);
+        assert!(peer_b.op_count() >= peer_a.op_count());
+
+        // Reverse: B appends + flushes; A polls.
+        peer_b.append_op(put_value(0, 1, 0, 20.0)).unwrap();
+        peer_b.flush_to_transport().unwrap();
+        let drained_a = peer_a.poll_remote().unwrap();
+        assert_eq!(drained_a, 1);
+        assert_eq!(peer_a.op_count(), peer_b.op_count());
+    }
+
+    #[test]
+    fn debug_includes_transport_attached() {
+        use crate::transport::NoopTransport;
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        let d_pre = format!("{s:?}");
+        assert!(
+            d_pre.contains("transport_attached: false"),
+            "Debug must include transport_attached: false: {d_pre}"
+        );
+        s.attach_transport(NoopTransport::new());
+        let d_post = format!("{s:?}");
+        assert!(
+            d_post.contains("transport_attached: true"),
+            "Debug must reflect attached: {d_post}"
         );
     }
 
