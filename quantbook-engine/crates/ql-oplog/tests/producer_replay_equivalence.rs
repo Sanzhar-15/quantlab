@@ -23,8 +23,7 @@
 //! "synthetic by hand."
 
 use ql_functions::default_registry;
-use ql_io::{CellWireValue, NamedTargetWire};
-use ql_oplog::{replay_into, Op, OpLog};
+use ql_oplog::{replay_into, CellWireValue, NamedTargetWire, Op, OpLog};
 use ql_storage::{NamedTarget, Workbook};
 use ql_types::{Address, Value};
 

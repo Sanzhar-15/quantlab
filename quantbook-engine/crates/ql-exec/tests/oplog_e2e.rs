@@ -301,7 +301,7 @@ fn replayed_workbook_supports_load_recompute_convenience() {
 /// yields a workbook observationally equal to the producer's final state.
 #[test]
 fn producer_save_load_replay_recompute_round_trip_yields_equivalent_workbook() {
-    use ql_oplog::{load_workbook_with_oplog, save_workbook_with_oplog};
+    use ql_io::{load_workbook_with_oplog, save_workbook_with_oplog};
     use tempfile::TempDir;
 
     // ===== Produce =====

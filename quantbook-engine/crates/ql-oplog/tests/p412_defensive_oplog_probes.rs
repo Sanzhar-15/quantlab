@@ -9,8 +9,7 @@
 
 use std::panic;
 
-use ql_io::CellWireValue;
-use ql_oplog::{replay_into, Op, OpLog};
+use ql_oplog::{replay_into, CellWireValue, Op, OpLog};
 
 fn try_catch<R>(f: impl FnOnce() -> R + std::panic::UnwindSafe) -> Result<R, String> {
     panic::catch_unwind(f).map_err(|payload| {

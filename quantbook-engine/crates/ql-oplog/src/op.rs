@@ -33,7 +33,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use ql_io::{CellWireValue, NamedTargetWire};
+use crate::wire::{CellWireValue, NamedTargetWire};
 use ql_types::{ColId, RowId, SheetId};
 
 /// A mutation operation recordable in the op log.

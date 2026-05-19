@@ -147,7 +147,7 @@ impl OpLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ql_io::{CellWireValue, NamedTargetWire};
+    use crate::wire::{CellWireValue, NamedTargetWire};
 
     fn put_value(sheet: u16, row: u32, col: u32, n: f64) -> Op {
         Op::PutValue {

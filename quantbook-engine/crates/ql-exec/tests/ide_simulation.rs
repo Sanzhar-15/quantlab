@@ -16,7 +16,8 @@
 
 use ql_exec::{BindError, RuntimeError, WorkbookRuntime};
 use ql_functions::default_registry;
-use ql_oplog::{load_workbook_with_oplog, save_workbook_with_oplog, OpLog};
+use ql_io::{load_workbook_with_oplog, save_workbook_with_oplog};
+use ql_oplog::OpLog;
 use ql_storage::{NamedTarget, Workbook};
 use ql_types::{Address, Value};
 use tempfile::TempDir;

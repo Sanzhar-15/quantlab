@@ -17,12 +17,13 @@ path = "src/lib.rs"
 ql-types     = { path = "../ql-types" }
 ql-storage   = { path = "../ql-storage" }
 ql-functions = { path = "../ql-functions" }
-ql-io        = { path = "../ql-io" }
+# **Tier D2 (2026-05-19) — Phase 4.12 Opus-C HIGH-3 closure:** `ql-io`
+# removed. Wire-vocabulary types (`CellWireValue`, `NamedTargetWire`)
+# moved to `ql-oplog::wire`; persistence functions
+# (`save_workbook_with_oplog`, `load_workbook_with_oplog`,
+# `PersistenceError`) moved to `ql-io::oplog_persistence`. Phase 5
+# CRDT integration now sees `ql-oplog` as a dependency floor.
 loro         = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 thiserror    = { workspace = true }
-
-[dev-dependencies]
-# Phase 2A.3.c: persistence round-trip tests need temp dirs.
-tempfile = { workspace = true }

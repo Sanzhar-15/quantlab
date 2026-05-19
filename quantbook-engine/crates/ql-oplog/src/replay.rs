@@ -76,19 +76,27 @@ pub enum ReplayError {
     },
 
     /// Decoding the on-wire `CellWireValue` failed (e.g., unknown error sigil).
+    ///
+    /// **Tier D2 (2026-05-19):** source type changed from
+    /// `ql_io::QbookError` to `crate::wire::WireDecodeError` so replay
+    /// doesn't depend on `ql-io`. The on-wire variant set is identical;
+    /// only the wrapping error type changed.
     #[error("replay value-decode error at op index {index}: {source}")]
     ValueDecode {
         index: usize,
         #[source]
-        source: ql_io::QbookError,
+        source: crate::wire::WireDecodeError,
     },
 
     /// Decoding the on-wire `NamedTargetWire` failed.
+    ///
+    /// **Tier D2 (2026-05-19):** source type changed from
+    /// `ql_io::QbookError` to `crate::wire::WireDecodeError`.
     #[error("replay named-target decode error at op index {index}: {source}")]
     NamedTargetDecode {
         index: usize,
         #[source]
-        source: ql_io::QbookError,
+        source: crate::wire::WireDecodeError,
     },
 
     /// `Workbook::set_name` refused the name (reserved per CORR-06).
@@ -1045,8 +1053,8 @@ fn validate_cell(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::{CellWireValue, NamedTargetWire};
     use ql_functions::default_registry;
-    use ql_io::{CellWireValue, NamedTargetWire};
     use ql_storage::NamedTarget;
     use ql_types::Address;
 

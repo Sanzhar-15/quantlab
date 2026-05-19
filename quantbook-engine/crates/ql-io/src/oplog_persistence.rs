@@ -1,4 +1,14 @@
-//! Phase 2A.3.c (2026-05-12) — `.qbook/` ↔ op-log persistence.
+//! `.qbook/` ↔ op-log persistence.
+//!
+//! **Tier D2 (2026-05-19) — Phase 4.12 Opus-C HIGH-3 closure:** this
+//! module moved from `ql-oplog::persistence` to `ql-io::oplog_persistence`.
+//! The move inverts the prior `ql-oplog → ql-io` dependency direction
+//! so Phase 5 CRDT integration sees `ql-oplog` as a dependency floor.
+//! External callers that previously imported
+//! `ql_oplog::save_workbook_with_oplog` (etc.) now import from
+//! `ql_io::oplog_persistence::*` (re-exported at `ql_io::*`).
+//!
+//! Phase 2A.3.c (2026-05-12) — original `.qbook/` ↔ op-log persistence.
 //!
 //! Adds `oplog.bin` as a sidecar file inside the `.qbook/` directory. The
 //! sidecar is written by `save_workbook_with_oplog` using the closure-based
@@ -31,12 +41,11 @@
 use std::fs;
 use std::path::Path;
 
-use ql_io::{load_workbook, save_workbook_extending, QbookError};
+use crate::qbook_format::{load_workbook, save_workbook_extending, QbookError};
 use ql_storage::Workbook;
 use thiserror::Error;
 
-use crate::log::OpLog;
-use crate::OpLogError;
+use ql_oplog::{OpLog, OpLogError};
 
 /// Filename used for the op-log sidecar inside a `.qbook/` directory.
 pub const OPLOG_FILENAME: &str = "oplog.bin";
@@ -107,11 +116,11 @@ pub fn load_workbook_with_oplog(path: &Path) -> Result<(Workbook, OpLog), Persis
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ql_io::CellWireValue;
+    use ql_oplog::CellWireValue;
     use ql_types::{Address, Value};
     use tempfile::TempDir;
 
-    use crate::Op;
+    use ql_oplog::Op;
 
     fn fresh_workbook_with_cell() -> Workbook {
         let mut wb = Workbook::new();
@@ -168,7 +177,7 @@ mod tests {
         let path = dir.path().join("nooplog.qbook");
         let wb = fresh_workbook_with_cell();
         // Save WITHOUT oplog (plain ql_io::save_workbook).
-        ql_io::save_workbook(&wb, "nooplog", &path).unwrap();
+        crate::save_workbook(&wb, "nooplog", &path).unwrap();
 
         let result = load_workbook_with_oplog(&path);
         match result {
@@ -189,7 +198,7 @@ mod tests {
         save_workbook_with_oplog(&wb, &oplog, "test", &path).unwrap();
 
         // Plain load — no oplog returned, but the workbook is intact.
-        let loaded = ql_io::load_workbook(&path).unwrap();
+        let loaded = crate::load_workbook(&path).unwrap();
         assert_eq!(loaded.read(Address::new(0, 0, 0)), Value::Number(42.0));
         // And the oplog.bin file is still on disk.
         assert!(path.join(OPLOG_FILENAME).is_file());
@@ -211,7 +220,7 @@ mod tests {
         let mut wb2 = Workbook::new();
         wb2.add_sheet("S");
         wb2.put_at(0, 0, 0, Value::Number(99.0));
-        ql_io::save_workbook(&wb2, "v2", &path).unwrap();
+        crate::save_workbook(&wb2, "v2", &path).unwrap();
 
         // oplog.bin is gone.
         assert!(
@@ -219,7 +228,7 @@ mod tests {
             "save_workbook (no oplog) must drop existing oplog.bin"
         );
         // Workbook is the new one.
-        let loaded = ql_io::load_workbook(&path).unwrap();
+        let loaded = crate::load_workbook(&path).unwrap();
         assert_eq!(loaded.read(Address::new(0, 0, 0)), Value::Number(99.0));
     }
 

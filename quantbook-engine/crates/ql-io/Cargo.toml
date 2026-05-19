@@ -12,6 +12,11 @@ path = "src/lib.rs"
 [dependencies]
 ql-types    = { path = "../ql-types" }
 ql-storage  = { path = "../ql-storage" }
+# **Tier D2 (2026-05-19) — Phase 4.12 Opus-C HIGH-3 closure:** added
+# `ql-oplog` dep. Wire-vocabulary types live in `ql-oplog::wire`;
+# `ql-io::oplog_persistence` (formerly `ql-oplog::persistence`) needs
+# `OpLog` + `OpLogError` from `ql-oplog`.
+ql-oplog    = { path = "../ql-oplog" }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 toml        = { workspace = true }

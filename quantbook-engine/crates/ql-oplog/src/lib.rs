@@ -38,13 +38,21 @@
 pub mod error;
 pub mod log;
 pub mod op;
-pub mod persistence;
 pub mod replay;
+pub mod wire;
 
 pub use error::OpLogError;
 pub use log::OpLog;
 pub use op::{LocaleWire, Op, ReferenceModeWire};
-pub use persistence::{
-    load_workbook_with_oplog, save_workbook_with_oplog, PersistenceError, OPLOG_FILENAME,
-};
 pub use replay::{replay_into, ReplayError};
+pub use wire::{CellWireValue, NamedTargetWire, WireDecodeError};
+
+// **Tier D2 (2026-05-19) — Phase 4.12 Opus-C HIGH-3 closure**: the
+// `persistence` module (save_workbook_with_oplog / load_workbook_with_oplog
+// / PersistenceError) moved to `ql-io::oplog_persistence`. The move
+// inverts the prior `ql-oplog → ql-io` dependency so Phase 5 CRDT
+// integration sees `ql-oplog` as a dependency floor.
+//
+// External callers that previously imported `ql_oplog::save_workbook_with_oplog`
+// (etc.) now import from `ql_io` instead. The on-disk file shape is
+// unchanged: `oplog.bin` sidecar inside `.qbook/` directories.

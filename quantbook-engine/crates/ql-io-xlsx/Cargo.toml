@@ -40,3 +40,7 @@ thiserror = { workspace = true }
 # Phase 4.12 megaudit Opus-A: `opus_a_phase_4_12_ide_proof.rs` exercises the
 # IDE proof point (xlsx → .qbook → xlsx) which requires ql-oplog persistence.
 ql-oplog = { path = "../ql-oplog" }
+# Tier D2 (2026-05-19): the .qbook persistence functions
+# (`save_workbook_with_oplog` / `load_workbook_with_oplog`) moved from
+# ql-oplog to ql-io. Test imports them from ql-io now.
+ql-io = { path = "../ql-io" }

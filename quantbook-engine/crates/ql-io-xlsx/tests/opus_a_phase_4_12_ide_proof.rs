@@ -673,7 +673,8 @@ fn p10_sweep_calc_tests_recompute_failure_rate() {
 #[test]
 #[ignore]
 fn p13_full_ide_proof_point_xlsx_qbook_xlsx() {
-    use ql_oplog::{load_workbook_with_oplog, save_workbook_with_oplog, OpLog};
+    use ql_io::{load_workbook_with_oplog, save_workbook_with_oplog};
+    use ql_oplog::OpLog;
     use std::env::temp_dir;
 
     // STAGE 1: Build a workbook with rich features (skipping
@@ -849,7 +850,8 @@ fn p15_edit_imported_literal_range_formula() {
 #[test]
 #[ignore]
 fn p14_qbook_persistence_with_full_phase4_features() {
-    use ql_oplog::{load_workbook_with_oplog, save_workbook_with_oplog, OpLog};
+    use ql_io::{load_workbook_with_oplog, save_workbook_with_oplog};
+    use ql_oplog::OpLog;
     use std::env::temp_dir;
     let mut wb = Workbook::new();
     let s1 = wb.add_sheet("Data");

@@ -15,10 +15,20 @@
 //! adding a variant requires bumping `WORKBOOK_SCHEMA_VERSION` and
 //! coordinating all producer/consumer sites in one major-version cut.
 
+pub mod oplog_persistence;
 pub mod qbook_format;
 
+// Wire-format types live in `ql-oplog::wire` post Tier D2 (2026-05-19).
+// `ql-io` re-exports them so external callers that import
+// `ql_io::CellWireValue` / `ql_io::NamedTargetWire` /
+// `ql_io::error_to_canonical_text` continue to compile.
+pub use ql_oplog::wire::{error_to_canonical_text, CellWireValue, NamedTargetWire};
+
+pub use oplog_persistence::{
+    load_workbook_with_oplog, save_workbook_with_oplog, PersistenceError, OPLOG_FILENAME,
+};
 pub use qbook_format::{
-    error_to_canonical_text, load_workbook, save_workbook, save_workbook_extending, CellRecord,
-    CellWireValue, NamedEntry, NamedTargetWire, NamesSection, QbookError, SheetEnvelope,
-    WorkbookEnvelope, MIN_SUPPORTED_SCHEMA_VERSION, WORKBOOK_SCHEMA_VERSION,
+    load_workbook, save_workbook, save_workbook_extending, CellRecord, NamedEntry, NamesSection,
+    QbookError, SheetEnvelope, WorkbookEnvelope, MIN_SUPPORTED_SCHEMA_VERSION,
+    WORKBOOK_SCHEMA_VERSION,
 };

@@ -73,8 +73,9 @@ use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use ql_storage::{NamedTarget, Sheet, Workbook};
-use ql_types::{Address, ColId, ErrorValue, Range, RowId, SheetId, Value, MAX_COLUMN, MAX_ROW};
+use ql_oplog::wire::{CellWireValue, NamedTargetWire, WireDecodeError};
+use ql_storage::{Sheet, Workbook};
+use ql_types::{ColId, RowId, SheetId, Value, MAX_COLUMN, MAX_ROW};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -324,6 +325,16 @@ pub enum QbookError {
         schema_version: u32,
         field: &'static str,
     },
+
+    /// **Tier D2 (2026-05-19) — Phase 4.12 Opus-C HIGH-3 closure**: wire-
+    /// type decode failure (unknown error sigil, out-of-range axis on a
+    /// named cell/range, etc.). Wraps the smaller `WireDecodeError` owned
+    /// by `ql-oplog` so the `?` operator works at qbook-load call sites
+    /// without explicit `.map_err`. Call sites that want to attach
+    /// file/line context still use `.map_err(|e| QbookError::MalformedCell
+    /// { file, line, detail: e.to_string() })`.
+    #[error("wire decode error: {0}")]
+    Wire(#[from] WireDecodeError),
 }
 
 /// TOML envelope for the workbook. Top-level metadata.
@@ -698,26 +709,10 @@ pub struct NamedEntry {
     pub scope: Option<u16>,
 }
 
-/// Wire-format mirror of `ql_storage::NamedTarget`. Each variant is tagged
-/// explicitly so the on-disk shape is self-describing and survives schema bumps.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-pub enum NamedTargetWire {
-    /// `NamedTarget::Cell` — single-cell anchor at `$Sheet!$Row,$Col`.
-    Cell { sheet: u16, row: u32, col: u32 },
-    /// `NamedTarget::Range` — rectangular range.
-    Range {
-        sheet: u16,
-        start_row: u32,
-        start_col: u32,
-        end_row: u32,
-        end_col: u32,
-    },
-    /// `NamedTarget::Constant(Value)` — reuses the cell wire-value vocabulary.
-    Constant { value: CellWireValue },
-    /// `NamedTarget::Formula(Arc<str>)` — raw formula source (without `=`).
-    Formula { source: String },
-}
+// (Tier D2 (2026-05-19): `NamedTargetWire` moved to
+//  `ql_oplog::wire::NamedTargetWire`. Re-exported via `ql_io::lib.rs`
+//  for backwards compat with external callers. Used here by the
+//  `NamedEntry` struct + the save/load routines below.)
 
 /// JSONL cell record — one line per non-blank or formula-bearing cell.
 ///
@@ -740,184 +735,11 @@ pub struct CellRecord {
     pub formula: Option<String>,
 }
 
-/// Wire-format mirror of `ql_types::Value`. Phase 1 W5-6 doesn't add Serialize to
-/// ql-types directly (keeps the types crate lean); ql-io owns the encoding.
-///
-/// Phase 2A.8 (megaudit M11): added `Pending` variant for formula-bearing cells
-/// whose saved value would be `Value::Blank` (because the formula hasn't been
-/// evaluated yet, or its result really is Blank). Previously this case was
-/// encoded as `Error("#NULL!")`, conflating "not yet evaluated" with a real
-/// Excel `#NULL!` error. The v2 reader recognizes `Pending` as "needs
-/// recompute"; for v1 files, the loader auto-rewrites `Error(#NULL!)` to
-/// `Pending` when the same cell has a `formula` field.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub enum CellWireValue {
-    Number(f64),
-    Boolean(bool),
-    Text(String),
-    Error(String), // Stored as the canonical "#REF!" / "#VALUE!" / etc. text form.
-    /// Formula-bearing cell with no evaluated value. Recompute resolves it.
-    Pending,
-}
-
-impl CellWireValue {
-    pub fn from_value(v: &Value) -> Option<Self> {
-        match v {
-            Value::Blank => None,
-            Value::Number(n) => Some(CellWireValue::Number(*n)),
-            Value::Boolean(b) => Some(CellWireValue::Boolean(*b)),
-            Value::Text(s) => Some(CellWireValue::Text(s.as_ref().to_owned())),
-            Value::Error(e) => Some(CellWireValue::Error(error_to_canonical_text(*e))),
-        }
-    }
-
-    /// Decode the wire value into a `ql_types::Value`. `Pending` decodes to
-    /// `Value::Blank` — the cell is in a transient state until recompute runs.
-    pub fn to_value(&self) -> Result<Value, QbookError> {
-        match self {
-            CellWireValue::Number(n) => Ok(Value::number(*n)),
-            CellWireValue::Boolean(b) => Ok(Value::Boolean(*b)),
-            CellWireValue::Text(s) => Ok(Value::text(s.as_str())),
-            CellWireValue::Error(s) => match parse_canonical_error_text(s) {
-                Some(e) => Ok(Value::Error(e)),
-                None => Err(QbookError::MalformedCell {
-                    file: PathBuf::new(),
-                    line: 0,
-                    detail: format!("unknown error variant: {s:?}"),
-                }),
-            },
-            CellWireValue::Pending => Ok(Value::Blank),
-        }
-    }
-
-    /// True iff this is the Phase 2A.8 Pending sentinel (formula-bearing cell
-    /// with no evaluated value).
-    pub fn is_pending(&self) -> bool {
-        matches!(self, CellWireValue::Pending)
-    }
-}
-
-impl NamedTargetWire {
-    /// Project a runtime `NamedTarget` into the wire shape for serialization.
-    pub fn from_target(t: &NamedTarget) -> Self {
-        match t {
-            NamedTarget::Cell(addr) => NamedTargetWire::Cell {
-                sheet: addr.sheet,
-                row: addr.row,
-                col: addr.col,
-            },
-            NamedTarget::Range(r) => NamedTargetWire::Range {
-                sheet: r.sheet,
-                start_row: r.start_row,
-                start_col: r.start_col,
-                end_row: r.end_row,
-                end_col: r.end_col,
-            },
-            NamedTarget::Constant(v) => NamedTargetWire::Constant {
-                // NamedTarget::Constant(Value::Blank) is unusual but valid; map
-                // to Number(0.0) sentinel? No — preserve the variant by emitting
-                // Error("BLANK_SENTINEL")? Also wrong. The cleanest answer: refuse
-                // to serialize Blank constants — the user shouldn't have one,
-                // and we'd round-trip-lose it anyway.
-                //
-                // In practice, `from_value(&Value::Blank)` returns None. So to
-                // serialize a Blank constant we'd need a dedicated wire variant.
-                // For Phase 2A.8 we deny it at save time via the conversion
-                // helper below; this match arm assumes from_value returns Some.
-                value: CellWireValue::from_value(v).unwrap_or(CellWireValue::Pending),
-            },
-            NamedTarget::Formula(src) => NamedTargetWire::Formula {
-                source: src.as_ref().to_owned(),
-            },
-        }
-    }
-
-    /// Decode the wire shape back into a `NamedTarget`. Carries the name only
-    /// for error reporting; the caller embeds the result in a `NameTable`.
-    pub fn to_target(&self, name_for_error: &str) -> Result<NamedTarget, QbookError> {
-        match self {
-            NamedTargetWire::Cell { sheet, row, col } => {
-                if *row > MAX_ROW {
-                    return Err(QbookError::MalformedName {
-                        name: name_for_error.to_owned(),
-                        reason: format!("Cell.row {row} exceeds MAX_ROW {MAX_ROW}"),
-                    });
-                }
-                if *col > MAX_COLUMN {
-                    return Err(QbookError::MalformedName {
-                        name: name_for_error.to_owned(),
-                        reason: format!("Cell.col {col} exceeds MAX_COLUMN {MAX_COLUMN}"),
-                    });
-                }
-                Ok(NamedTarget::Cell(Address::new(*sheet, *row, *col)))
-            }
-            NamedTargetWire::Range {
-                sheet,
-                start_row,
-                start_col,
-                end_row,
-                end_col,
-            } => {
-                for (label, v, max) in [
-                    ("start_row", *start_row, MAX_ROW),
-                    ("start_col", *start_col, MAX_COLUMN),
-                    ("end_row", *end_row, MAX_ROW),
-                    ("end_col", *end_col, MAX_COLUMN),
-                ] {
-                    if v > max {
-                        return Err(QbookError::MalformedName {
-                            name: name_for_error.to_owned(),
-                            reason: format!("Range.{label} {v} exceeds max {max}"),
-                        });
-                    }
-                }
-                Ok(NamedTarget::Range(Range::new(
-                    *sheet, *start_row, *start_col, *end_row, *end_col,
-                )))
-            }
-            NamedTargetWire::Constant { value } => {
-                let v = value.to_value().map_err(|e| match e {
-                    QbookError::MalformedCell { detail, .. } => QbookError::MalformedName {
-                        name: name_for_error.to_owned(),
-                        reason: format!("Constant decode: {detail}"),
-                    },
-                    other => other,
-                })?;
-                Ok(NamedTarget::Constant(v))
-            }
-            NamedTargetWire::Formula { source } => {
-                Ok(NamedTarget::Formula(std::sync::Arc::from(source.as_str())))
-            }
-        }
-    }
-}
-
-/// Map `ErrorValue` to its canonical Excel-style text form (`#REF!`, `#VALUE!`, etc.).
-/// Used by both wire-format serialization and the user-visible representation per spec.
-pub fn error_to_canonical_text(e: ErrorValue) -> String {
-    e.sigil().to_string()
-}
-
-fn parse_canonical_error_text(s: &str) -> Option<ErrorValue> {
-    Some(match s {
-        "#REF!" => ErrorValue::Ref,
-        "#VALUE!" => ErrorValue::Value,
-        "#N/A" => ErrorValue::NA,
-        "#DIV/0!" => ErrorValue::DivZero,
-        "#NULL!" => ErrorValue::Null,
-        "#NUM!" => ErrorValue::Num,
-        "#NAME?" => ErrorValue::Name,
-        "#SPILL!" => ErrorValue::Spill,
-        "#CALC!" => ErrorValue::Calc,
-        "#DISCONNECTED!" => ErrorValue::Disconnected,
-        "#BINDING!" => ErrorValue::Binding,
-        "#TIMEOUT!" => ErrorValue::Timeout,
-        "#PERMISSION!" => ErrorValue::Permission,
-        "#AI_NOT_AVAILABLE_V1" => ErrorValue::AINotAvailable,
-        "#CIRC!" => ErrorValue::Circ,
-        _ => return None,
-    })
-}
+// (Tier D2 (2026-05-19): `CellWireValue`, `error_to_canonical_text`,
+//  `parse_canonical_error_text`, and the `impl` blocks moved to
+//  `ql_oplog::wire`. Re-exported via `ql_io::lib.rs` for backwards
+//  compat. The `to_value()` return type is now `WireDecodeError`,
+//  which `QbookError` wraps via a `#[from]` impl below.)
 
 /// Save a `Workbook` to `path` (a `.qbook/` directory). **Crash-safe atomic save**
 /// per the Phase 2A.8 megaudit H2 closure:
@@ -1830,14 +1652,17 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                 // matters for the recompute pass.
                 Value::Blank
             } else {
-                rec.value.to_value().map_err(|e| match e {
-                    QbookError::MalformedCell { detail, .. } => QbookError::MalformedCell {
+                // Tier D2 (2026-05-19): `to_value()` now returns
+                // `WireDecodeError`. Attach the qbook-specific
+                // file/line context as `QbookError::MalformedCell` so
+                // load-failure diagnostics keep the same shape.
+                rec.value
+                    .to_value()
+                    .map_err(|e| QbookError::MalformedCell {
                         file: sheet_path.clone(),
                         line: line_no + 1,
-                        detail,
-                    },
-                    other => other,
-                })?
+                        detail: e.to_string(),
+                    })?
             };
             // Phase 3.5 (CORR-25, 2026-05-12) — OVR-3-03: load routes
             // cells with formulas to the COMPUTED overlay; cells without
@@ -2109,6 +1934,14 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    // Tier D2 (2026-05-19): these test imports used to come from the
+    // file-level `use ql_types::{..., ErrorValue, Range};` block which
+    // was trimmed after wire-types moved to ql-oplog. Tests still need
+    // them; import directly here.
+    use ql_oplog::wire::error_to_canonical_text;
+    use ql_storage::NamedTarget;
+    use ql_types::{Address, ErrorValue, Range};
 
     fn cell(row: u32, col: u32, v: Value) -> ((SheetId, RowId, ColId), Value) {
         ((0, row, col), v)
@@ -2496,9 +2329,15 @@ col_extent = 0
 
     #[test]
     fn wire_value_unknown_error_text_errors() {
+        // Tier D2 (2026-05-19): `to_value` now returns `WireDecodeError`
+        // not `QbookError`. The unknown-sigil variant is
+        // `WireDecodeError::UnknownErrorSigil`.
         let wire = CellWireValue::Error("#NOT_A_REAL_ERROR".to_string());
         let result = wire.to_value();
-        assert!(matches!(result, Err(QbookError::MalformedCell { .. })));
+        assert!(matches!(
+            result,
+            Err(WireDecodeError::UnknownErrorSigil { .. })
+        ));
     }
 
     // ===== nan / inf handling =====
