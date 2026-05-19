@@ -130,34 +130,10 @@ mod tests {
         wb
     }
 
-    // ===== Phase 2B.7 — audit closure: input validation + dry-run + cleanup =====
-
-    /// Phase 2B.7 audit H1: `add_sheet` rejects `chunk_rows == 0` BEFORE
-    /// any op-log append. Without this check, the workbook gets a sheet
-    /// with `chunk_rows = 0` and the first cell write panics inside the
-    /// column store — and the op log has a phantom AddSheet entry that
-    /// would replay the same poison state on next load.
-    #[test]
-    fn add_sheet_rejects_zero_chunk_rows() {
-        use ql_oplog::OpLog;
-        let mut wb = Workbook::new();
-        let reg = default_registry();
-        let mut oplog = OpLog::new();
-        let result = {
-            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
-            rt.add_sheet("Bad", 0)
-        };
-        match result {
-            Err(RuntimeError::InvalidChunkRows(0)) => {}
-            other => panic!("expected InvalidChunkRows(0), got {other:?}"),
-        }
-        // No sheet added; no op-log entry.
-        assert_eq!(wb.sheet_count(), 0);
-        assert!(
-            oplog.is_empty(),
-            "op log must stay empty on validation failure"
-        );
-    }
+    // ===== Phase 2B.7 — audit closure: clear_formula validation =====
+    // (`add_sheet_rejects_zero_chunk_rows` moved to sheets.rs::tests per
+    // D1.a re-partitioning; clear_formula_rejects_* will move to
+    // cells.rs::tests in a future D1.a closure.)
 
     /// Phase 2B.7 audit (correctness L4): `clear_formula` propagates
     /// `RuntimeError::InvalidSheet` / `InvalidCell` from `validate_cell`.

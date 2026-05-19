@@ -235,30 +235,29 @@ clean Phase 5 work if not done first.
   2 MEDIUMs + 1 LOW closed in the closure commit; 4 LOWs deferred
   to D1.a below.
 
-### D1.a (polish) — Tier D1 test-cluster re-partitioning
+### D1.a (polish) — Tier D1 test-cluster re-partitioning — **PARTIAL**
 
 - **Source:** Tier D1 audit Codex L-2 through L-5.
 - **Impact:** zero behavioral / semantic / gate impact. Pure
   organizational cleanup.
 - **Scope:** move 4 misplaced test clusters to their semantically
   correct owning-submodule:
-  1. `add_sheet_rejects_*` tests in `validate.rs::tests` →
-     `sheets.rs::tests`.
+  1. ✅ `add_sheet_rejects_zero_chunk_rows` in `validate.rs::tests`
+     → `sheets.rs::tests` (shipped 2026-05-19 in `d4b3cdb2dc2`+).
   2. `clear_formula_rejects_invalid_*` tests in
-     `validate.rs::tests` → `cells.rs::tests`.
+     `validate.rs::tests` → `cells.rs::tests`. **PENDING.**
   3. W5-147 `set_formula` canonicalization tests in
      `tables.rs::tests` → `cells.rs::tests`;
      `set_reference_mode_op_round_trips_through_replay` in
-     `tables.rs::tests` → `config.rs::tests`.
+     `tables.rs::tests` → `config.rs::tests`. **PENDING.**
   4. Pure table-API tests in `cells.rs::tests`
      (`drop_table_removes_metadata...`,
-     `drop_table_missing_errors`) → `tables.rs::tests`.
-- **Effort:** ~1-2 hours mechanical.
+     `drop_table_missing_errors`) → `tables.rs::tests`. **PENDING.**
+- **Effort:** remaining ~1 hour mechanical.
 - **Risk:** none — tests are byte-identical, just relocated.
-- **Why deferred:** bundling came from the natural Phase-2B.7 /
-  W5-147 / W5-148-149 banner cluster boundaries during the
-  D1 extraction. Re-partitioning is appropriate polish but not
-  worth holding D1 closure for.
+- **Why partial:** cluster 1 shipped as a session-end demonstrator
+  of the D1.a pattern; clusters 2-4 left for a fresh session
+  (or as opportunistic batch work).
 
 ### ~~D2.~~ `ql-oplog → ql-io` reverse dependency cleanup — ✅ SHIPPED 2026-05-19 at `e15e8908742`
 
