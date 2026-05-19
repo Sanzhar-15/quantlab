@@ -45,7 +45,7 @@ pub use error::OpLogError;
 pub use log::{OpLog, PRESENCE_COMMIT_ORIGIN};
 pub use op::{LocaleWire, Op, ReferenceModeWire};
 pub use replay::{replay_into, ReplayError};
-pub use wire::{CellWireValue, NamedTargetWire, WireDecodeError};
+pub use wire::{CellWireValue, FormatIdWire, NamedTargetWire, WireDecodeError};
 
 // Phase 5.2 D-1 step 1.1 (2026-05-19) — re-export `ql_types::PeerId`
 // for ergonomics. PeerId lived briefly at `ql_oplog::PeerId` in step 1

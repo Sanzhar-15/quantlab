@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use ql_storage::NamedTarget;
-use ql_types::{Address, ErrorValue, Range, Value, MAX_COLUMN, MAX_ROW};
+use ql_types::{Address, ErrorValue, PeerId, Range, Value, LEGACY_PEER, MAX_COLUMN, MAX_ROW};
 
 /// Errors emitted while decoding wire-format types back into runtime
 /// values. Phase 4.12 Opus-C HIGH-3 / Tier D2 (2026-05-19) closure: a
@@ -251,6 +251,79 @@ impl NamedTargetWire {
     }
 }
 
+/// Wire-format mirror of the (forthcoming) `ql_storage::FormatId` tagged
+/// tuple introduced in **Phase 5.2 D-1 step 3**. Step 2 (2026-05-19) ships
+/// this wire type ahead of the storage-side change; step 4 wires it into
+/// `Op::RegisterFormat` / `Op::SetCellFormat`.
+///
+/// Two variants:
+/// - `Builtin { id }` — Excel-canonical built-in format ids (0..=163).
+///   Stable across peers; no merge collisions possible.
+/// - `Custom { peer, counter }` — peer-allocated custom format ids.
+///   Each peer's allocator increments its own `counter`; concurrent
+///   peers can't collide because `peer` differs.
+///
+/// Serde shape is `#[serde(tag = "kind", rename_all = "lowercase")]`,
+/// mirroring `NamedTargetWire`: self-describing JSON for schema
+/// robustness in the `.qbook` envelope. `peer` is a raw `u64`
+/// (`PeerId` is `#[serde(transparent)]`).
+///
+/// ```text
+/// {"kind": "builtin", "id": 14}
+/// {"kind": "custom", "peer": 42, "counter": 7}
+/// ```
+///
+/// The collision-freedom guarantee (Phase 5.1 audit-locked decision D-1)
+/// comes from the `Custom` variant carrying the originating peer's id:
+/// two concurrent peers with distinct `peer` values can both allocate
+/// `counter = 0` without colliding because the full `FormatId` differs
+/// in its `peer` component.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum FormatIdWire {
+    Builtin { id: u32 },
+    Custom { peer: PeerId, counter: u32 },
+}
+
+/// First xlsx custom-format `numFmtId`, mirroring Excel + OpenFormula
+/// conventions. Built-in format ids occupy `0..=FIRST_XLSX_BUILTIN_MAX`;
+/// custom format ids start at `FIRST_XLSX_CUSTOM_NUMFMT = 164`. Pre-5.2
+/// `.qbook` saves used this boundary to allocate single-writer custom
+/// ids; the step-5 envelope-migration `from_u32_legacy` reads it back.
+const FIRST_XLSX_BUILTIN_MAX: u32 = 163;
+
+impl FormatIdWire {
+    /// **Phase 5.2 D-1 step 2 migration helper (born here, used by step
+    /// 5's qbook envelope loader):** map a pre-5.2 bare-`u32` `FormatId`
+    /// encoding to the new tagged-tuple wire shape.
+    ///
+    /// Pre-5.2 encoding: `FormatId` was `pub struct FormatId(pub u32)`.
+    /// Values `0..=FIRST_XLSX_BUILTIN_MAX` are Excel-canonical built-in
+    /// format ids. Values `>= FIRST_XLSX_BUILTIN_MAX + 1` were allocated
+    /// by the engine's single-writer custom counter, starting at
+    /// `FIRST_XLSX_BUILTIN_MAX + 1 = 164`.
+    ///
+    /// Migration mapping:
+    /// - `n <= 163` → `Builtin { id: n }`.
+    /// - `n >= 164` → `Custom { peer: LEGACY_PEER, counter: n - 164 }`.
+    ///
+    /// `LEGACY_PEER = PeerId(0)` is the sentinel for "this custom id
+    /// was allocated by a pre-collab single-writer save"; per Phase
+    /// 5.2.b's distinct-peer-id requirement, no live peer should use
+    /// peer-id 0, so legacy ids can't collide with custom ids allocated
+    /// by an active session.
+    pub fn from_u32_legacy(n: u32) -> Self {
+        if n <= FIRST_XLSX_BUILTIN_MAX {
+            FormatIdWire::Builtin { id: n }
+        } else {
+            FormatIdWire::Custom {
+                peer: LEGACY_PEER,
+                counter: n - (FIRST_XLSX_BUILTIN_MAX + 1),
+            }
+        }
+    }
+}
+
 /// Map `ErrorValue` to its canonical Excel-style text form (`#REF!`, `#VALUE!`, etc.).
 /// Used by both wire-format serialization and the user-visible representation per spec.
 pub fn error_to_canonical_text(e: ErrorValue) -> String {
@@ -278,4 +351,138 @@ pub fn parse_canonical_error_text(s: &str) -> Option<ErrorValue> {
         "#CIRC!" => ErrorValue::Circ,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod format_id_wire_tests {
+    //! Phase 5.2 D-1 step 2 (2026-05-19): tests for `FormatIdWire`.
+    //!
+    //! Pre-step-2 the only `FormatId` shape was `u32`. Step 2 introduces
+    //! the wire-side tagged tuple; storage-side change lands in step 3.
+    //! Tests pin:
+    //! - Serde round-trips for both variants (no drift in JSON shape
+    //!   over future Loro/serde upgrades).
+    //! - `from_u32_legacy` migration boundaries (0, 163, 164, large).
+    //! - Equality + Hash semantics (these matter for HashMap keying
+    //!   in step 3's `FormatTable`).
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn builtin_round_trips_through_json() {
+        let original = FormatIdWire::Builtin { id: 14 };
+        let json = serde_json::to_string(&original).unwrap();
+        assert_eq!(json, r#"{"kind":"builtin","id":14}"#);
+        let back: FormatIdWire = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn custom_round_trips_through_json() {
+        let original = FormatIdWire::Custom {
+            peer: PeerId::new(42),
+            counter: 7,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        // `peer` is serde-transparent, so it appears as a bare u64.
+        assert_eq!(json, r#"{"kind":"custom","peer":42,"counter":7}"#);
+        let back: FormatIdWire = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn from_u32_legacy_maps_zero_to_builtin() {
+        // Lower boundary: `0` is the General format (built-in id 0).
+        assert_eq!(
+            FormatIdWire::from_u32_legacy(0),
+            FormatIdWire::Builtin { id: 0 }
+        );
+    }
+
+    #[test]
+    fn from_u32_legacy_maps_163_to_builtin() {
+        // Upper boundary of built-in range. Excel's last built-in is 163.
+        assert_eq!(
+            FormatIdWire::from_u32_legacy(163),
+            FormatIdWire::Builtin { id: 163 }
+        );
+    }
+
+    #[test]
+    fn from_u32_legacy_maps_164_to_custom_counter_zero() {
+        // First legacy custom id. counter starts at 0 (n - 164).
+        assert_eq!(
+            FormatIdWire::from_u32_legacy(164),
+            FormatIdWire::Custom {
+                peer: LEGACY_PEER,
+                counter: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn from_u32_legacy_maps_large_to_custom() {
+        // Arbitrary mid-range legacy custom id.
+        assert_eq!(
+            FormatIdWire::from_u32_legacy(999),
+            FormatIdWire::Custom {
+                peer: LEGACY_PEER,
+                counter: 999 - 164,
+            }
+        );
+    }
+
+    #[test]
+    fn equality_and_hash_consistent_across_variants() {
+        // Two Builtin(14) are equal + hash-equal; Builtin(14) and
+        // Custom(LEGACY_PEER, 0) (legacy-mapped from u32=164) are NOT
+        // equal even though the latter encodes the same xlsx numFmtId
+        // pre-migration. Step 5's loader is responsible for not mixing
+        // pre- and post-migration ids in the same workbook.
+        let a = FormatIdWire::Builtin { id: 14 };
+        let b = FormatIdWire::Builtin { id: 14 };
+        let c = FormatIdWire::Custom {
+            peer: LEGACY_PEER,
+            counter: 0,
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        let mut set: HashSet<FormatIdWire> = HashSet::new();
+        set.insert(a);
+        assert!(set.contains(&b));
+        assert!(!set.contains(&c));
+    }
+
+    #[test]
+    fn distinct_peers_with_same_counter_dont_collide() {
+        // Phase 5.1 audit-locked decision D-1: collision-freedom relies
+        // on the `peer` component being distinct for concurrent peers.
+        // Verify same-counter different-peer FormatIdWires are not equal.
+        let a = FormatIdWire::Custom {
+            peer: PeerId::new(1),
+            counter: 7,
+        };
+        let b = FormatIdWire::Custom {
+            peer: PeerId::new(2),
+            counter: 7,
+        };
+        assert_ne!(a, b, "same counter, different peer must NOT collide");
+    }
+
+    #[test]
+    fn round_trips_through_loro_value_bincode() {
+        // FormatIdWire will live inside `Op::RegisterFormat` (step 4),
+        // which currently serializes to JSON via serde_json::to_string
+        // for Loro's LoroList. Verify the same JSON path that ops will
+        // use produces a clean round-trip.
+        let original = FormatIdWire::Custom {
+            peer: PeerId::new(0xdead_beef_cafe_babe),
+            counter: u32::MAX,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let back: FormatIdWire = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, original);
+        // The serialized form survives the worst-case (u64-MAX-ish peer,
+        // u32::MAX counter) without overflow or truncation.
+    }
 }

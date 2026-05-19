@@ -100,13 +100,14 @@ This is the suggested order to keep the codebase in a compile-clean intermediate
 - Commit: `Phase 5.2 D-1 step 1 — move PeerId to ql-oplog layer`
   + `Phase 5.2 D-1 step 1.1 — move PeerId to ql-types + serde + LEGACY_PEER`.
 
-### Step 2: Introduce `FormatIdWire` in ql-oplog (1-2 hours)
+### Step 2: Introduce `FormatIdWire` in ql-oplog (1-2 hours) — ✅ SHIPPED 2026-05-19
 
-- Add `ql-oplog::wire::FormatIdWire` enum mirroring the planned tagged tuple. This is the "destination shape" for Op variants.
-- Do NOT yet change `Op::RegisterFormat.id` — keep as u32 for compilation.
-- Add `FormatIdWire::from_u32_legacy(n: u32) -> FormatIdWire` (the migration helper).
-- Tests: round-trip FormatIdWire through serde JSON.
-- Commit: `Phase 5.2 D-1 step 2 — introduce FormatIdWire in ql-oplog::wire`.
+- ✅ Added `ql_oplog::wire::FormatIdWire` enum mirroring the planned tagged tuple. Two variants: `Builtin { id: u32 }` + `Custom { peer: PeerId, counter: u32 }`. Tagged-struct serde shape (`#[serde(tag = "kind", rename_all = "lowercase")]`) matches `NamedTargetWire`'s pattern.
+- ✅ Did NOT change `Op::RegisterFormat.id` — that's step 4.
+- ✅ Added `FormatIdWire::from_u32_legacy(n: u32) -> FormatIdWire` migration helper using `LEGACY_PEER` from step 1.1. Maps `0..=163` → `Builtin`, `>=164` → `Custom { peer: LEGACY_PEER, counter: n - 164 }`.
+- ✅ Tests: 9 unit tests pinning serde JSON round-trips for both variants, `from_u32_legacy` boundaries (0 / 163 / 164 / large), equality + hash consistency, distinct-peer collision-freedom.
+- ✅ Re-exported as `ql_oplog::FormatIdWire`.
+- Commit: pending (`Phase 5.2 D-1 step 2 — introduce FormatIdWire in ql-oplog::wire`).
 
 ### Step 3: Change `ql-storage::FormatId` to the tagged tuple (2-3 hours)
 
