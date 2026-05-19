@@ -55,7 +55,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::peer::PeerId;
+use ql_oplog::PeerId;
 
 /// Per-peer ephemeral state: cursor position + active selection +
 /// typing indicator.

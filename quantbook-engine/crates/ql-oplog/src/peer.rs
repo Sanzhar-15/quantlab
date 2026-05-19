@@ -1,20 +1,26 @@
 //! Per-peer identifier for Phase 5 collaboration.
 //!
-//! **Phase 5.2.a (2026-05-19):** `PeerId` is a thin newtype around
-//! `u64` matching Loro's native peer-id type. Stable per-session;
-//! the user-facing collaboration tooling decides how to assign IDs
-//! (random vs user-derived vs server-allocated).
+//! **Phase 5.2.a (2026-05-19):** introduced as `ql_collab::PeerId`.
+//! **Phase 5.2 D-1 step 1 (2026-05-19):** moved to `ql_oplog::PeerId`
+//! so the op-log layer (where ops are tagged with peer-of-origin) can
+//! reference it without a reverse `ql-oplog → ql-collab` dep. `ql-collab`
+//! re-exports `ql_oplog::PeerId` to keep its public surface stable.
+//!
+//! `PeerId` is a thin newtype around `u64` matching Loro's native peer-id
+//! type. Stable per-session; the user-facing collaboration tooling decides
+//! how to assign IDs (random vs user-derived vs server-allocated).
 //!
 //! Used by:
-//! - [`crate::session::CollabSession`] — attached at session-create
-//!   time AND passed through to `OpLog::set_peer_id` → Loro's
+//! - [`crate::OpLog::set_peer_id`] — wires through to Loro's
 //!   `LoroDoc::set_peer_id` so concurrent appends carry the right
-//!   origin in the CRDT merge metadata (Phase 5.2.b 2026-05-19;
-//!   5.2.a stored this as a label only).
-//! - Phase 5.6 presence module — keys the `presence` `LoroMap`
-//!   in 16-hex `Display` form so each peer's cursor position
-//!   lives at its own slot (✅ shipped at `c677e244704`).
-//! - Phase 5 D-1 (pending) — the `FormatId::Custom { peer, counter }`
+//!   origin in the CRDT merge metadata (Phase 5.2.b).
+//! - `ql_collab::CollabSession` — attached at session-create time
+//!   and passed to `OpLog::set_peer_id`. Re-exported as
+//!   `ql_collab::PeerId` for back-compat.
+//! - `ql_collab::presence` — keys the `"presence"` `LoroMap` in
+//!   16-hex `Display` form so each peer's cursor position lives at
+//!   its own slot (Phase 5.6 V1 at `c677e244704`).
+//! - Phase 5 D-1 (in progress) — the `FormatId::Custom(PeerId, u32)`
 //!   variant will use this type for collision-free format-id
 //!   allocation across peers.
 

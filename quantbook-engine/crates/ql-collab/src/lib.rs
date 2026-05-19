@@ -9,8 +9,9 @@
 //!
 //! ## Module layout
 //!
-//! - [`peer`] — `PeerId` type. Stable per-session identifier used
-//!   to attribute ops + presence state. Wraps Loro's `u64` peer id.
+//! - `PeerId` — re-exported from [`ql_oplog::PeerId`] (Phase 5.2 D-1
+//!   step 1, 2026-05-19; originally `ql_collab::peer::PeerId` at 5.2.a).
+//!   Stable per-session identifier; wraps Loro's `u64`.
 //! - [`session`] — `CollabSession`: per-peer state holder that
 //!   wraps an `OpLog`, manages local appends, and exposes
 //!   `merge_bytes` + `export_bytes` for transport integration.
@@ -58,14 +59,19 @@
 //!   `CollabSession::op_log()` (`&OpLog`) which would silently clear
 //!   an attached `UndoManager`'s stacks per Loro's internal
 //!   subscription behavior (`loro-internal::undo:654-662`).
+//! - **Phase 5.2 D-1 step 1 (2026-05-19):** `PeerId` moved from
+//!   `ql_collab::peer::PeerId` to `ql_oplog::peer::PeerId` (preparation
+//!   for `FormatId::Custom(PeerId, u32)`). `ql_collab::PeerId` is now
+//!   a re-export of `ql_oplog::PeerId` — public surface unchanged,
+//!   external callers using `ql_collab::PeerId` keep working.
 
-pub mod peer;
 pub mod presence;
 pub mod session;
 pub mod transport;
 pub mod undo;
 
-pub use peer::PeerId;
+pub use ql_oplog::PeerId;
+
 pub use presence::{PresenceError, PresenceState};
 pub use session::{CollabSession, CollabSessionError, UndoGroupGuard};
 pub use transport::{LoopbackTransport, NoopTransport, Transport, TransportError};

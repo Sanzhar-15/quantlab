@@ -199,7 +199,7 @@ impl OpLog {
     /// into the `"presence"` LoroMap.
     ///
     /// `peer_key` is a string identifier (typically the 16-hex form of
-    /// `ql_collab::PeerId::Display`); `json` is an opaque blob — the
+    /// [`PeerId::Display`](crate::PeerId)); `json` is an opaque blob — the
     /// typed `PresenceState` encoding lives in `ql_collab::presence`.
     /// This layer doesn't interpret the bytes.
     ///

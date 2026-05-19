@@ -49,9 +49,8 @@
 
 use thiserror::Error;
 
-use ql_oplog::{Op, OpLog, OpLogError, PRESENCE_COMMIT_ORIGIN};
+use ql_oplog::{Op, OpLog, OpLogError, PeerId, PRESENCE_COMMIT_ORIGIN};
 
-use crate::peer::PeerId;
 use crate::presence::{self, PresenceError, PresenceState};
 use crate::transport::{Transport, TransportError};
 

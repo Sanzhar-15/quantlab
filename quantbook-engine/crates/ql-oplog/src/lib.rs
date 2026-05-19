@@ -38,12 +38,14 @@
 pub mod error;
 pub mod log;
 pub mod op;
+pub mod peer;
 pub mod replay;
 pub mod wire;
 
 pub use error::OpLogError;
 pub use log::{OpLog, PRESENCE_COMMIT_ORIGIN};
 pub use op::{LocaleWire, Op, ReferenceModeWire};
+pub use peer::PeerId;
 pub use replay::{replay_into, ReplayError};
 pub use wire::{CellWireValue, NamedTargetWire, WireDecodeError};
 
