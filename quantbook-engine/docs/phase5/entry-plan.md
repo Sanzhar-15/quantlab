@@ -34,12 +34,24 @@ Verified against `docs/phase4/exit-packet.md`:
 | Entry requirement | Status |
 |---|---|
 | Phase 3 graph runtime exists | ✅ (`crates/ql-exec` + `crates/ql-calcgraph`) |
-| Phase 4 semantics broad enough (value / formula / name / table / format models stable) | ✅ (4131+ workspace tests, 260 fns, xlsx I/O, structured refs, locale, dates) |
-| Stable operation vocabulary from `ql-oplog` | ⚠️ exists but Phase 4.12 Opus-C HIGH-3 flagged a dependency-direction issue (`ql-oplog::Op` reaches into `ql-io::CellWireValue`) — see Phase 5 prep below |
+| Phase 4 semantics broad enough (value / formula / name / table / format models stable) | ✅ (4160 workspace tests, 260 fns, xlsx I/O, structured refs, locale, dates) |
+| Stable operation vocabulary from `ql-oplog` | ✅ (Phase 4.12 Opus-C HIGH-3 dependency-direction issue closed at Tier D2, `e15e8908742` — `ql-oplog` is now the dependency floor; `CellWireValue` + `NamedTargetWire` moved to `ql_oplog::wire`) |
 | Storage semantics for computed vs user state | ✅ (per `docs/architecture/calcgraph-runtime.md` — computed overlay separated) |
 | IDE proof surface | Phase 6 work; Phase 5 produces the engine-side data model. |
 
 ## Phase 5 prep — work to land BEFORE 5.1
+
+> **2026-05-19 status update:** Most Phase 5 prep is SHIPPED.
+> - Tier A (`#[non_exhaustive]` pass + deprecated removals): ✅ shipped pre-session.
+> - Tier C1 (cycle detection in recompute_all): ✅ shipped this session.
+> - Tier D1 (WorkbookRuntime monolith → 9-submodule split): ✅ shipped this session.
+> - Tier D2 (ql-oplog → ql-io reverse dep cleanup): ✅ shipped this session at `e15e8908742`.
+> - Tier D3 (oplog.bin magic bytes + version header): pending — bundle into D-1 schema work.
+> - Tier B (parser/binder gaps): deferred (Phase 6 IDE work).
+> - Tier C2 (BatchCommit depth guard): pending — low priority.
+>
+> Phase 5.1 design + audit closed; Phase 5.2 D-2 / D-3 / D-4 shipped;
+> 5.2.a scaffold shipped. The list below is kept for historical record.
 
 Per `docs/PHASE-4-V2-BACKLOG.md` Tier A + D (and select B/C/D from
 the Phase 4.12 megaudit), these items should land before Phase 5
@@ -88,9 +100,9 @@ post-merge.
 
 | ID | Item | Effort | Notes |
 |---|---|---|---|
-| 5.1 | Collaboration Data Model Decision | 3-5 days | Loro container shape decision. Audit checkpoint AFTER 5.1 (design audit). |
-| 5.2 | `ql-collab` Core Documents | 1-2 weeks | Two-peer merge for cells/names/sheets. |
-| 5.3 | Conflict Resolution Semantics | 4-7 days | Last-writer / multi-value / delete-vs-update. |
+| 5.1 | Collaboration Data Model Decision | 3-5 days | **✅ AUDIT-CLOSED 2026-05-19** (`918d7efdd91` + `df52cb44ad2`). Loro container shape locked = Option A op-log preservation; 4 audit decisions D-1..D-4 recorded in design doc. |
+| 5.2 | `ql-collab` Core Documents | 1-2 weeks | **🟡 IN PROGRESS** — 5.2.a scaffold shipped `66a571b30af` (PeerId + CollabSession + Transport); D-2 / D-3 / D-4 closures shipped (`1ca19e2fa37` / `e71312d4bcd` / `2f217a2067a`); D-1 (FormatId tagged tuple, schema-breaking) pending. |
+| 5.3 | Conflict Resolution Semantics | 4-7 days | Causality-aware rename-repair pass; multi-value / delete-vs-update. Loro merge is Fugue/origin-based (not Lamport LWW — corrected by Phase 5.1 audit). |
 | 5.4 | Undo/Redo + Operation Grouping | 1 week | Local undo over collaborative ops. |
 | 5.5 | Transport Layer + Offline Sync | 1-2 weeks | WebSocket + reconnect merge. |
 | 5.6 | Presence + Awareness | 3-5 days | Ephemeral state; must not dirty workbook graph. |
@@ -101,20 +113,34 @@ Total Phase 5 effort estimate: **~7-12 weeks**.
 
 ## Risks at entry
 
-1. **Loro container shape uncertain** — 5.1 is mostly design work.
-   Codex + Opus design review recommended before any code.
-2. **`oplog.bin` schema versioning is non-existent** — Phase 5 needs
-   to land magic bytes + version up-front (D3 above).
-3. **`WorkbookRuntime` monolith** (Phase 4.12 Opus-C HIGH-2) — if
-   not split before 5.2, the CRDT-aware mutation paths will live
-   in a 13K+ LOC file alongside existing single-writer paths. Hard
-   to review, hard to test boundaries.
-4. **Cycle-detection gap in `recompute_all`** (Phase 4.12 Opus-B H-2)
-   — Phase 5 replay paths inherit this bug if not closed first.
-5. **API stability** — Phase 5 will expose `ql-collab` types into
-   the public API. The Tier A `#[non_exhaustive]` pass should
-   precede Phase 5 to avoid 0.2.0-breaking churn on Phase-5-added
-   variants.
+> **2026-05-19 update:** risks 1, 3, 4, 5 are CLOSED. Only risk 2
+> (oplog.bin schema versioning) remains open — bundle into D-1 schema
+> work.
+
+1. ~~**Loro container shape uncertain**~~ — ✅ CLOSED. 5.1 design
+   audit-closed at `918d7efdd91` + `df52cb44ad2`. Option A
+   (op-log preservation on top of Loro `LoroList`) locked.
+2. **`oplog.bin` schema versioning is non-existent** — Phase 5
+   needs magic bytes + version header (Tier D3). Bundle into D-1
+   tagged-tuple FormatId schema work (next session).
+3. ~~**`WorkbookRuntime` monolith**~~ — ✅ CLOSED. Tier D1 split
+   shipped this session: 12,725-LOC `workbook_runtime.rs` → 9
+   sibling submodules + 247-LOC `mod.rs`. Public API surface
+   byte-for-byte identical; 4160 tests passing.
+4. ~~**Cycle-detection gap in `recompute_all`**~~ — ✅ CLOSED.
+   Tier C1 shipped at `3451d90a03f` + audit closures
+   `8137697b5fc`. Replay paths now inherit cycle detection via
+   ephemeral `CalcgraphSession`.
+5. ~~**API stability**~~ — ✅ CLOSED. Tier A
+   `#[non_exhaustive]` pass + deprecated removals + per-crate
+   stability docs shipped at `40bb584a25b`. Phase 5 additions
+   to `Op`, error types, etc. won't break 0.2.0 consumers.
+6. **`ql-collab` scaffold limitation (Phase 5.2.a)** — `PeerId`
+   is stored as a label but not yet passed to `LoroDoc::set_peer_id`.
+   Multi-peer convergence works (Loro per-doc-random ids are
+   distinct) but stable peer-id wiring is deferred to Phase 5.5
+   transport handshake. See `crates/ql-collab/src/peer.rs`
+   module docstring for full context.
 
 ## Audit checkpoints
 

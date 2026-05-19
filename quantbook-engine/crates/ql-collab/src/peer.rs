@@ -6,12 +6,16 @@
 //! (random vs user-derived vs server-allocated).
 //!
 //! Used by:
-//! - [`crate::session::CollabSession`] — attached at session-create
-//!   time; passed to Loro's `LoroDoc::set_peer_id` so concurrent
-//!   appends carry the right origin.
-//! - Phase 5.6 presence module — keys the `presence` `LoroMap` so
-//!   each peer's cursor position lives at its own slot.
-//! - Phase 5 D-1 (deferred) — the `FormatId::Custom { peer, counter }`
+//! - [`crate::session::CollabSession`] — stored at session-create
+//!   time as a stable label. **Phase 5.2.a scaffold limitation:**
+//!   not yet passed to Loro's `LoroDoc::set_peer_id`; each peer's
+//!   doc gets Loro's default random per-doc peer id until Phase 5.5
+//!   wires the stable id through during the transport handshake.
+//!   Multi-peer convergence still works because the random ids are
+//!   distinct (verified by Phase 5.2 D-4 2-peer probe).
+//! - Phase 5.6 presence module — will key the `presence` `LoroMap`
+//!   so each peer's cursor position lives at its own slot.
+//! - Phase 5 D-1 (pending) — the `FormatId::Custom { peer, counter }`
 //!   variant will use this type for collision-free format-id
 //!   allocation across peers.
 
@@ -20,8 +24,11 @@
 /// Wraps a `u64` to match Loro's native peer-id type. Stable for
 /// the lifetime of a `CollabSession`; the user-facing tooling
 /// decides assignment policy (random / user-derived /
-/// server-allocated). Two peers MUST have distinct IDs or Loro's
-/// concurrent-append merge will produce non-deterministic results.
+/// server-allocated). Two peers SHOULD have distinct IDs to keep
+/// presence / undo / format-id allocation deterministic. (Loro's
+/// own merge rule uses its `LoroDoc` peer id, which is
+/// independently per-doc-random in Phase 5.2.a — see module
+/// docstring.)
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub struct PeerId(pub u64);
 

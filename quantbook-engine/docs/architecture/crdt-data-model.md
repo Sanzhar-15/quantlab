@@ -284,19 +284,22 @@ benefit from it.
 
 ## Conflict resolution semantics (Phase 5.3 preview)
 
-The 5.1 design picks Option A → conflict semantics are entirely
-LWW by Lamport-timestamp at the op-log level. Phase 5.3
-formalizes this with these defaults:
+The 5.1 design picks Option A → conflicts resolve by Loro's
+underlying merge order: **Fugue/origin-based with peer-id
+tiebreaker** (per `loro-internal-1.12.0/src/container/richtext/tracker/crdt_rope.rs:163,192`),
+NOT Lamport timestamps. The op-log replay path observes the
+final causal order; the LAST op in that order wins for each
+target. Phase 5.3 formalizes this with these defaults:
 
 | Concurrent op pair | Resolution |
 |---|---|
-| `PutValue { A1, v_a }` × `PutValue { A1, v_b }` | LWW |
-| `PutFormula { A1, f_a }` × `PutFormula { A1, f_b }` | LWW |
-| `PutValue { A1, v_a }` × `PutFormula { A1, f_b }` | LWW (op-log replay-order natural) |
-| `ClearFormula { A1 }` × `PutFormula { A1, f }` | LWW |
-| `SetName { foo, t_a }` × `SetName { foo, t_b }` | LWW |
-| `AddSheet "S"` × `AddSheet "S"` | First wins; second's replay errors via NameRejected (existing replay path). Phase 5.3 can add a "rename second to S(2)" auto-resolution. |
-| `RenameSheet { 0, A, B }` × concurrent edit on sheet 0 | Edit's formula text written under old name → after merge, formula references old name → bind fails → `BindError::UnknownTable` or unresolved sheet → emit `#NAME?` per design § 12.4. Phase 5.3 hardens this. |
+| `PutValue { A1, v_a }` × `PutValue { A1, v_b }` | Last-in-causal-order wins (Fugue/origin) |
+| `PutFormula { A1, f_a }` × `PutFormula { A1, f_b }` | Last-in-causal-order wins |
+| `PutValue { A1, v_a }` × `PutFormula { A1, f_b }` | Last-in-causal-order wins; replay applies both and recompute observes final state |
+| `ClearFormula { A1 }` × `PutFormula { A1, f }` | Last-in-causal-order wins |
+| `SetName { foo, t_a }` × `SetName { foo, t_b }` | Last-in-causal-order wins |
+| `AddSheet "S"` × `AddSheet "S"` | **Both succeed; second in causal order auto-renames to `S(2)`** (Phase 5.2 D-2 ✅ shipped `1ca19e2fa37`). Escalates to `S(3)`, etc. on cascading collision; `AUTO_RENAME_CEILING = 10_000`. |
+| `RenameSheet { 0, A, B }` × concurrent edit on sheet 0 | Edit's formula text written under old name → after merge, formula references old name → bind fails → `BindError::UnknownSheet` → emit `#NAME?` (Phase 5.2 D-3 ✅ shipped `e71312d4bcd`). Phase 5.3 adds the causality-aware rename-repair pass. |
 | `DropTable "T"` × concurrent edit referencing T | Edit appends with old table-ref → bind fails post-merge → `#NAME?`. |
 
 The 5.3 audit checkpoint validates these defaults against the
@@ -355,32 +358,53 @@ the same `replay_into` internally.
 
 ## `ql-collab` crate scope
 
-Currently empty (`crates/ql-collab/src/lib.rs` is a 17-line
-placeholder).
-
-Phase 5.2 populates it with:
+**Phase 5.2.a (2026-05-19, ✅ shipped at `66a571b30af`):** scaffold
+ships with the following module surface:
 
 ```rust
-// crates/ql-collab/src/lib.rs
+// crates/ql-collab/src/lib.rs (current state)
 
+pub mod peer;        // PeerId newtype (u64 wrapper)
 pub mod session;     // CollabSession: per-peer state holder
-pub mod transport;   // trait Transport: send/recv update bytes
-pub mod presence;    // Presence map updates
-pub mod undo;        // peer-local undo via Loro UndoManager
+pub mod transport;   // trait Transport + NoopTransport test impl
+
+pub use peer::PeerId;
+pub use session::{CollabSession, CollabSessionError};
+pub use transport::{NoopTransport, Transport, TransportError};
 ```
 
-Each module is small (~200-400 LOC). Total Phase 5.2 crate
-LOC estimate: ~1,500-2,500 LOC + tests.
+Reserved (not yet populated, named in `docs/MASTER-PLAN.md` §541):
+- `presence` — Phase 5.6 cursor + selection map.
+- `undo` — Phase 5.4 peer-local undo via Loro `UndoManager`.
 
-The crate depends on:
-- `ql-oplog` (for the LoroDoc + Op vocabulary)
-- `ql-storage` (to apply replay)
-- `ql-exec` (for `WorkbookRuntime` integration)
+Phase 5.2.a totals ~11 unit tests + ~600 LOC of scaffold. Phase
+5.2.b onward populates richer behavior; full Phase 5.2 crate LOC
+estimate remains 1,500-2,500 LOC + tests.
 
-It does NOT depend on `ql-io` or `ql-io-xlsx` — Phase 4.12
-Opus-C HIGH-3 (`ql-oplog → ql-io` cleanup, Tier D2 in v2
-backlog) is a separate pre-5.2 item. Phase 5.1 design assumes
-Tier D2 closes before 5.2.
+Current Cargo.toml deps (verified against `crates/ql-collab/Cargo.toml`):
+- `ql-oplog` — for `OpLog` + `Op` + `merge_bytes` + `import_bytes` + `export_bytes`.
+- `ql-storage` — forward-looking for Phase 5.5/5.7 replay integration
+  (currently used only in doc examples; kept to avoid Cargo churn
+  when replay wiring lands).
+- `ql-functions` — same forward-looking justification (registry
+  needed by replay).
+- `thiserror` — `CollabSessionError` + `TransportError`.
+
+It does NOT depend on `ql-io` or `ql-io-xlsx`. Phase 4.12 Opus-C
+HIGH-3 (`ql-oplog → ql-io` cleanup, Tier D2 in v2 backlog) closed
+this session at commit `e15e8908742`. `ql-oplog` is the dependency
+floor.
+
+**Known scaffold limitation (Phase 5.2.a, deferred to Phase 5.5):**
+`CollabSession` stores `PeerId` but does NOT yet pass it to
+`LoroDoc::set_peer_id`. The op log writes ops under Loro's default
+random per-doc peer id. Multi-peer convergence still works for the
+shipped 2-peer probe test (Phase 5.2 D-4 at `2f217a2067a`) because
+each peer gets a distinct random Loro peer id at session-create.
+Phase 5.5 (Transport layer) adds the stable-peer-id wiring as part
+of the connect handshake. Until then, the `PeerId` newtype is a
+*label* (used in presence and FormatId D-1), not a Loro merge-rule
+input.
 
 ## Decision matrix summary
 
