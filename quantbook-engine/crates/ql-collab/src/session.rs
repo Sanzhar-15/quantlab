@@ -4,12 +4,11 @@
 //! with peer-id-aware operations + transport plumbing. Subsequent
 //! phases populate richer behavior:
 //!
-//! - ~~**Phase 5.4**~~ ✅ V1 shipped at `89c02b9d83e` + V2 V1
-//!   shipped at `6138a7203f6` — V1: 7 undo/redo methods wrapping
-//!   per-peer `loro::UndoManager`; undo retracts originals from
-//!   the visible `"ops"` list. V2 V1: `start_undo_group` /
-//!   `end_undo_group` + `set_undo_merge_interval` for atomic
-//!   multi-cell operations + auto-merge of rapid typing.
+//! - ~~**Phase 5.4**~~ ✅ V1 + V2 V1 + V2 V1.1 shipped — V1
+//!   `89c02b9d83e`: 7 undo/redo methods. V2 V1 `6138a7203f6` +
+//!   `e199a5fda5a`: `start_undo_group` / `end_undo_group` +
+//!   `set_undo_merge_interval`. V2 V1.1: `start_undo_group_scoped`
+//!   returns RAII `UndoGroupGuard` for panic/Err-safe grouping.
 //!   Presence-origin commits auto-excluded.
 //! - **Phase 5.5** — transport layer. V1 shipped at
 //!   `924750819bc` (LoopbackTransport for in-process 2-peer
@@ -486,11 +485,11 @@ impl CollabSession {
     /// between `start_undo_group` and `end_undo_group` returns
     /// `Err` (via `?`) or panics, the group stays open and the
     /// next `start_undo_group` will fail with the deterministic
-    /// `UndoGroupAlreadyStarted` error. V2 V1 does NOT ship a
-    /// RAII guard; callers must close the group on every exit
-    /// path (e.g. via a `scopeguard::defer!` block or an explicit
-    /// try-block). V2 V1.1 will add a closure-based helper
-    /// (Codex+Opus 5.4 V2 V1 audit MEDIUM-3 follow-up).
+    /// `UndoGroupAlreadyStarted` error. **Prefer
+    /// [`start_undo_group_scoped`]** (Phase 5.4 V2 V1.1 — RAII
+    /// guard that auto-closes the group on scope exit, including
+    /// on panic-unwind) over manual start/end pairing for any
+    /// code path that can return `Err` mid-group.
     ///
     /// Closes GAP-C-04's "command grouping" half. Merge-interval
     /// auto-grouping is the complement — see
@@ -530,6 +529,41 @@ impl CollabSession {
         self.undo.set_merge_interval(interval_ms);
     }
 
+    /// **Phase 5.4 V2 V1.1 (2026-05-19):** RAII variant of
+    /// [`start_undo_group`]. Returns an [`UndoGroupGuard`] that
+    /// holds a `&mut` borrow of this session; `Drop` on the
+    /// guard automatically calls [`end_undo_group`].
+    ///
+    /// Panic-safe: if any code between this call and the guard's
+    /// drop panics (including the body of a paste / fill-down /
+    /// table-import operation), the guard's `Drop` still runs
+    /// during unwinding and closes the group cleanly. Compare
+    /// the manual start/end pattern which leaks group state on
+    /// panic.
+    ///
+    /// Usage:
+    /// ```ignore
+    /// {
+    ///     let mut guard = session.start_undo_group_scoped()?;
+    ///     for (row, col, value) in paste_data {
+    ///         guard.append_op(Op::PutValue { sheet: 0, row, col, value })?;
+    ///     }
+    ///     // guard drops here → end_undo_group runs.
+    /// }
+    /// // All N PutValue ops are now one undo unit.
+    /// ```
+    ///
+    /// The guard implements `Deref<Target = CollabSession>` +
+    /// `DerefMut`, so all of `CollabSession`'s methods are
+    /// callable directly on the guard.
+    ///
+    /// Errors from [`start_undo_group`] propagate (nested call
+    /// returns `Err(CollabSessionError::Undo(LoroError::UndoGroupAlreadyStarted))`).
+    pub fn start_undo_group_scoped(&mut self) -> Result<UndoGroupGuard<'_>, CollabSessionError> {
+        self.start_undo_group()?;
+        Ok(UndoGroupGuard { session: self })
+    }
+
     /// **Phase 5.6 V1 (2026-05-19):** list every peer with a
     /// presence entry in the shared map.
     ///
@@ -559,6 +593,51 @@ impl std::fmt::Debug for CollabSession {
             .field("redo_count", &self.undo.redo_count())
             .field("transport_attached", &self.transport.is_some())
             .finish()
+    }
+}
+
+/// **Phase 5.4 V2 V1.1 (2026-05-19):** RAII guard returned by
+/// [`CollabSession::start_undo_group_scoped`]. `Drop` calls
+/// `end_undo_group` automatically — runs on scope exit, on `?`
+/// propagation, AND on panic-unwind. Use this in any code path
+/// that can fail mid-group; the manual `start_undo_group` /
+/// `end_undo_group` pair only handles the happy path.
+///
+/// Implements `Deref<Target = CollabSession>` + `DerefMut`, so
+/// all `CollabSession` methods are callable directly on the
+/// guard during its lifetime.
+pub struct UndoGroupGuard<'a> {
+    session: &'a mut CollabSession,
+}
+
+impl std::fmt::Debug for UndoGroupGuard<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UndoGroupGuard")
+            .field("session", &self.session)
+            .finish()
+    }
+}
+
+impl std::ops::Deref for UndoGroupGuard<'_> {
+    type Target = CollabSession;
+    fn deref(&self) -> &CollabSession {
+        self.session
+    }
+}
+
+impl std::ops::DerefMut for UndoGroupGuard<'_> {
+    fn deref_mut(&mut self) -> &mut CollabSession {
+        self.session
+    }
+}
+
+impl Drop for UndoGroupGuard<'_> {
+    fn drop(&mut self) {
+        // `end_undo_group` is infallible per Loro 1.12.0; safe in
+        // Drop. If the group has already been closed manually
+        // (shouldn't happen via this guard, but defensively), Loro
+        // treats it as a no-op.
+        self.session.end_undo_group();
     }
 }
 
@@ -971,6 +1050,113 @@ mod tests {
         // Recovery works after explicit end.
         s.end_undo_group();
         assert!(s.start_undo_group().is_ok(), "fresh start after end works");
+        s.end_undo_group();
+    }
+
+    #[test]
+    fn scoped_undo_group_collapses_on_drop() {
+        // Phase 5.4 V2 V1.1: RAII guard drops at scope exit and
+        // calls end_undo_group. 3 appends inside the guard scope
+        // collapse to 1 undo unit.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        assert_eq!(s.undo_count(), 0);
+        {
+            let mut guard = s.start_undo_group_scoped().unwrap();
+            guard.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+            guard.append_op(put_value(0, 0, 1, 2.0)).unwrap();
+            guard.append_op(put_value(0, 0, 2, 3.0)).unwrap();
+        } // guard drops here → end_undo_group
+        assert_eq!(s.undo_count(), 1, "RAII guard must close group on drop");
+        // One undo retracts all 3.
+        assert!(s.undo().unwrap());
+        assert_eq!(s.op_log().iter().count(), 0);
+    }
+
+    #[test]
+    fn scoped_undo_group_closes_on_early_return_with_err() {
+        // V2 V1.1 panic/Err safety: even if the body of the
+        // closure returns Err via `?`, the guard's Drop still
+        // runs and closes the group. Pin this so callers can
+        // rely on it.
+        fn try_op(s: &mut CollabSession) -> Result<(), CollabSessionError> {
+            let mut guard = s.start_undo_group_scoped()?;
+            guard.append_op(put_value(0, 0, 0, 1.0))?;
+            // Simulate a mid-group error by returning Err here.
+            // The guard's Drop runs as we unwind to the caller.
+            // We use a contrived CollabSession-error to exercise
+            // the propagation path.
+            return Err(CollabSessionError::OpLog(
+                ql_oplog::OpLogError::SchemaMismatch("forced error for test"),
+            ));
+            #[allow(unreachable_code)]
+            {
+                guard.append_op(put_value(0, 0, 1, 2.0))?;
+                Ok(())
+            }
+        }
+
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        let result = try_op(&mut s);
+        assert!(result.is_err(), "forced error must propagate");
+        // After the error, the group is closed (one append got
+        // through before the forced error; that one is in a
+        // (now closed) undo group).
+        assert_eq!(
+            s.undo_count(),
+            1,
+            "guard Drop must close group even on Err early-return"
+        );
+        // A subsequent start_undo_group_scoped must succeed (no
+        // leaked open group).
+        let _guard = s.start_undo_group_scoped().unwrap();
+    }
+
+    #[test]
+    fn scoped_undo_group_supports_deref_to_session() {
+        // The guard implements Deref + DerefMut, so callers can
+        // invoke CollabSession methods directly on the guard
+        // (append_op, peer_id, op_count, etc.).
+        let mut s = CollabSession::new(PeerId::new(7)).unwrap();
+        let mut guard = s.start_undo_group_scoped().unwrap();
+        assert_eq!(guard.peer_id(), PeerId::new(7), "Deref reads work");
+        assert_eq!(guard.op_count(), 0);
+        guard.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        assert_eq!(guard.op_count(), 1, "DerefMut writes work");
+        drop(guard);
+        assert_eq!(s.undo_count(), 1);
+    }
+
+    #[test]
+    fn scoped_undo_group_nested_returns_err() {
+        // Nested start_undo_group_scoped (without ending the
+        // outer first) must return Err, just like the non-
+        // scoped variant.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        let _guard1 = s.start_undo_group_scoped().unwrap();
+        // Cannot call start_undo_group_scoped on s while guard1
+        // is alive (borrow checker). Test the equivalent via
+        // the underlying method on the guarded session:
+        // ... actually the borrow checker prevents this at
+        // compile time, which is GOOD — the RAII guard makes
+        // accidental nesting a compile error rather than a
+        // runtime error. Document this fact:
+        // let _guard2 = s.start_undo_group_scoped(); // <-- borrow error
+        //
+        // To verify the runtime contract still holds for
+        // non-scoped nesting, drop guard1 then re-test:
+        drop(_guard1);
+        // Now manually open a non-scoped group + try to start
+        // a scoped one.
+        s.start_undo_group().unwrap();
+        let is_err = {
+            let result = s.start_undo_group_scoped();
+            let is_err = matches!(&result, Err(CollabSessionError::Undo(_)));
+            // Drop `result` here so its potential Ok-arm borrow
+            // doesn't extend into the `s.end_undo_group()` call.
+            drop(result);
+            is_err
+        };
+        assert!(is_err, "scoped variant must also return Err on nested call");
         s.end_undo_group();
     }
 

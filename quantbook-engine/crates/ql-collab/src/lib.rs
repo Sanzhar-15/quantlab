@@ -24,12 +24,12 @@
 //! - [`presence`] — per-peer ephemeral cursor + selection state
 //!   (Phase 5.6 V1 ship 2026-05-19). `PresenceState` JSON-encoded
 //!   into the shared `LoroDoc`'s `"presence"` LoroMap (LWW per key).
-//! - [`undo`] — peer-local undo/redo via Loro's `UndoManager`
-//!   (Phase 5.4 V1 ship 2026-05-19 + V2 V1 ship `6138a7203f6`).
-//!   V1: 7 undo/redo methods + presence-origin commit exclusion.
-//!   V2 V1: atomic grouping (`start_undo_group` /
-//!   `end_undo_group`) + auto-merge interval. V2 V2 pending —
-//!   push/pop listeners + RAII closure helper.
+//! - [`undo`] — peer-local undo/redo via Loro's `UndoManager`.
+//!   V1 ship 2026-05-19 (`89c02b9d83e`): 7 undo/redo methods.
+//!   V2 V1 (`6138a7203f6` + `e199a5fda5a`): atomic grouping +
+//!   merge-interval. V2 V1.1: RAII `start_undo_group_scoped`
+//!   returning `UndoGroupGuard`. V2 V2 pending — push/pop
+//!   listeners.
 //!
 //! ## Stability
 //!
@@ -67,6 +67,6 @@ pub mod undo;
 
 pub use peer::PeerId;
 pub use presence::{PresenceError, PresenceState};
-pub use session::{CollabSession, CollabSessionError};
+pub use session::{CollabSession, CollabSessionError, UndoGroupGuard};
 pub use transport::{LoopbackTransport, NoopTransport, Transport, TransportError};
 pub use undo::UndoManager;

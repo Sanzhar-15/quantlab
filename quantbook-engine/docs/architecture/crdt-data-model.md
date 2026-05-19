@@ -353,12 +353,17 @@ order) stays.
 - `can_undo() -> bool` / `can_redo() -> bool`
 - `undo_count() -> usize` / `redo_count() -> usize`
 - `clear_undo_stack()`
-- **V2 V1 (`6138a7203f6`):**
+- **V2 V1 (`6138a7203f6` + `e199a5fda5a`):**
   `start_undo_group() -> Result<(), _>` /
   `end_undo_group()` — atomic multi-op grouping for paste /
   fill-down / table-import operations.
 - **V2 V1:** `set_undo_merge_interval(i64)` — auto-merge
   consecutive changes within the window (typing IDE hint).
+- **V2 V1.1:** `start_undo_group_scoped() -> Result<UndoGroupGuard<'_>, _>`
+  — RAII variant. `Drop` auto-closes the group on scope exit,
+  including on panic-unwind and `?` propagation. Use this
+  over the manual start/end pair for any code path that can
+  fail mid-group.
 
 Plus `pub use loro::UndoManager` in `ql_collab::undo` for
 callers wanting raw access. Presence-origin commits
@@ -368,11 +373,10 @@ cursor movement doesn't pollute the undo stack.
 ### V1 / V2 V1 limitations / V2 V2 follow-ups
 
 - No push/pop listeners (`UndoManager::set_on_push` / `set_on_pop`) — defer to V2 V2.
-- No RAII closure helper (`with_undo_group(|s| { ... })`) — V2 V1
-  ships explicit start/end; group leaks on panic/error mid-group
-  must be handled by caller (e.g. `scopeguard::defer!`).
-  V2 V1.1 will add the closure helper (Codex+Opus 5.4 V2 V1
-  audit MEDIUM-3 follow-up).
+- ~~No RAII closure helper~~ — V2 V1.1 ships
+  `start_undo_group_scoped` + `UndoGroupGuard`. Manual
+  start/end pair still exists for ergonomic flexibility but
+  the RAII variant is recommended.
 - `set_peer_id` after construction silently CLEARS the undo
   stack per Loro's internal subscription. V1 made
   `OpLog::set_peer_id` `&mut self` so the footgun isn't

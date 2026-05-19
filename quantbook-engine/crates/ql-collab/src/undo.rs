@@ -24,9 +24,13 @@
 //!   multi-op grouping (Phase 5.4 V2 V1 ship `6138a7203f6`).
 //! - `set_undo_merge_interval(ms)` — auto-merge consecutive
 //!   changes within the window (Phase 5.4 V2 V1).
+//! - `start_undo_group_scoped()` — RAII variant returning
+//!   `UndoGroupGuard<'_>`; `Drop` auto-closes the group on
+//!   scope exit, including on panic-unwind and `?` propagation
+//!   (Phase 5.4 V2 V1.1).
 //!
 //! V2 V2 follow-up: push/pop listeners (`UndoManager::set_on_push`
-//! / `set_on_pop`) + RAII `with_undo_group` closure helper.
+//! / `set_on_pop`).
 //!
 //! ## Presence-exclude
 //!
