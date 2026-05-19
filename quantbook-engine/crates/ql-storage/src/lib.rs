@@ -67,21 +67,22 @@ mod tests {
     fn workbook_default_has_format_table_with_builtins() {
         let wb = Workbook::new();
         assert_eq!(wb.formats().lookup(FormatId::GENERAL), Some("General"));
-        assert_eq!(wb.formats().lookup(FormatId(14)), Some("m/d/yyyy"));
+        assert_eq!(wb.formats().lookup(FormatId::Builtin(14)), Some("m/d/yyyy"));
     }
 
     #[test]
     fn workbook_intern_returns_existing_builtin_id() {
         let mut wb = Workbook::new();
         let id = wb.formats_mut().intern("0.00");
-        assert_eq!(id, FormatId(2));
+        assert_eq!(id, FormatId::Builtin(2));
     }
 
     #[test]
     fn workbook_intern_new_string_allocates_custom_id() {
         let mut wb = Workbook::new();
         let id = wb.formats_mut().intern("\"⚓\" #,##0");
-        assert_eq!(id.0, FIRST_CUSTOM_FORMAT_ID);
+        // Step 3: first custom = Custom(LEGACY_PEER, 0); legacy u32 = 164.
+        assert_eq!(id.to_legacy_u32(), Some(FIRST_CUSTOM_FORMAT_ID));
     }
 
     #[test]
@@ -93,8 +94,8 @@ mod tests {
     #[test]
     fn sheet_format_overlay_set_and_clear_round_trip() {
         let mut s = Sheet::new("Sheet1");
-        s.format_overlay_mut().set(3, 5, FormatId(14));
-        assert_eq!(s.format_overlay().get(3, 5), Some(FormatId(14)));
+        s.format_overlay_mut().set(3, 5, FormatId::Builtin(14));
+        assert_eq!(s.format_overlay().get(3, 5), Some(FormatId::Builtin(14)));
         s.format_overlay_mut().clear(3, 5);
         assert!(s.format_overlay().get(3, 5).is_none());
     }

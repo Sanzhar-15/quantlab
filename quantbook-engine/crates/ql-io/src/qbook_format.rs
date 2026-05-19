@@ -1108,7 +1108,16 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
                     .map(|((r, c), fid)| FormatOverlayEntry {
                         row: r,
                         col: c,
-                        id: fid.0,
+                        // Phase 5.2 D-1 step 3: pre-step-5 envelope
+                        // still uses bare-u32 ids. `to_legacy_u32()`
+                        // returns None only for non-LEGACY peer ids,
+                        // which can't exist pre-step-4 (no multi-peer
+                        // producer yet). expect() makes the invariant
+                        // load-bearing — step 5 changes the envelope
+                        // schema to carry FormatIdWire directly.
+                        id: fid
+                            .to_legacy_u32()
+                            .expect("pre-step-4 FormatId must be expressible as legacy u32"),
                     })
                     .collect();
                 entries.sort_by_key(|e| (e.row, e.col));
@@ -1176,9 +1185,16 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
         let mut entries: Vec<FormatEntry> = wb
             .formats()
             .iter()
-            .filter(|(id, _)| id.0 >= ql_storage::FIRST_CUSTOM_FORMAT_ID)
+            // Phase 5.2 D-1 step 3: `id.is_custom()` replaces the
+            // pre-step-3 `id.0 >= FIRST_CUSTOM_FORMAT_ID` filter.
+            // Persist only custom (peer-allocated) entries; built-ins
+            // re-seed from `FormatTable::default()` on load.
+            .filter(|(id, _)| id.is_custom())
             .map(|(id, s)| FormatEntry {
-                id: id.0,
+                // Same expect-pattern as the format_overlay save above.
+                id: id
+                    .to_legacy_u32()
+                    .expect("pre-step-4 FormatId must be expressible as legacy u32"),
                 string: s.to_owned(),
             })
             .collect();
@@ -1509,8 +1525,14 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
     // pre-seeded builtins; mismatches surface as `MalformedFormat`.
     if let Some(ref fs) = envelope.formats {
         for entry in &fs.entries {
+            // Phase 5.2 D-1 step 3: pre-step-5 envelopes carry
+            // bare-u32 ids. Convert via the legacy migration helper:
+            // n <= 163 → Builtin(n); n >= 164 → Custom(LEGACY_PEER, n - 164).
             wb.formats_mut()
-                .register_at(ql_storage::FormatId(entry.id), entry.string.as_str())
+                .register_at(
+                    ql_storage::FormatId::legacy_from_u32(entry.id),
+                    entry.string.as_str(),
+                )
                 .map_err(|err| QbookError::MalformedFormat {
                     id: entry.id,
                     details: format!("{err:?}"),
@@ -1556,8 +1578,12 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
             // Snapshot the set of registered ids BEFORE the overlay
             // mutation so we don't borrow `wb` twice (mutable on the
             // sheet + immutable on `wb.formats()`).
-            let known_ids: std::collections::HashSet<u32> =
-                wb.formats().iter().map(|(id, _)| id.0).collect();
+            //
+            // Phase 5.2 D-1 step 3: HashSet keys are now `FormatId`
+            // (the enum) rather than `u32`. Overlay-entry lookup
+            // converts `entry.id` via `legacy_from_u32` before query.
+            let known_ids: std::collections::HashSet<ql_storage::FormatId> =
+                wb.formats().iter().map(|(id, _)| id).collect();
             let sheet_mut = wb.sheet_mut(sheet_id).expect("just-added sheet must exist");
             for entry in overlay_entries {
                 // Bounds-check to mirror the cell-record validation
@@ -1572,7 +1598,8 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                         why: "out-of-range row/col",
                     });
                 }
-                if !known_ids.contains(&entry.id) {
+                let fid = ql_storage::FormatId::legacy_from_u32(entry.id);
+                if !known_ids.contains(&fid) {
                     return Err(QbookError::MalformedFormatOverlay {
                         sheet: sheet_id,
                         row: entry.row,
@@ -1580,11 +1607,9 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                         why: "format id not registered in FormatTable",
                     });
                 }
-                sheet_mut.format_overlay_mut().set(
-                    entry.row,
-                    entry.col,
-                    ql_storage::FormatId(entry.id),
-                );
+                sheet_mut
+                    .format_overlay_mut()
+                    .set(entry.row, entry.col, fid);
             }
         }
 
@@ -2947,7 +2972,7 @@ sheets = [
         // Round-trip: built-ins still present after load.
         let loaded = load_workbook(&path).unwrap();
         assert_eq!(
-            loaded.formats().lookup(ql_storage::FormatId(14)),
+            loaded.formats().lookup(ql_storage::FormatId::Builtin(14)),
             Some("m/d/yyyy")
         );
         // The TOML envelope should NOT contain a `[formats]` table (built-
@@ -2968,8 +2993,16 @@ sheets = [
         // Intern two custom formats.
         let id_a = wb.formats_mut().intern("\"⚓\" #,##0.00");
         let id_b = wb.formats_mut().intern("0.0000");
-        assert_eq!(id_a.0, ql_storage::FIRST_CUSTOM_FORMAT_ID);
-        assert_eq!(id_b.0, ql_storage::FIRST_CUSTOM_FORMAT_ID + 1);
+        // Step 3: first custom = Custom(LEGACY_PEER, 0); legacy u32 = 164.
+        // Second custom = Custom(LEGACY_PEER, 1); legacy u32 = 165.
+        assert_eq!(
+            id_a.to_legacy_u32(),
+            Some(ql_storage::FIRST_CUSTOM_FORMAT_ID)
+        );
+        assert_eq!(
+            id_b.to_legacy_u32(),
+            Some(ql_storage::FIRST_CUSTOM_FORMAT_ID + 1)
+        );
         save_workbook(&wb, "custom_formats", &path).unwrap();
         let loaded = load_workbook(&path).unwrap();
         // Both custom entries survive.
@@ -2977,7 +3010,7 @@ sheets = [
         assert_eq!(loaded.formats().lookup(id_b), Some("0.0000"));
         // Built-ins still present too.
         assert_eq!(
-            loaded.formats().lookup(ql_storage::FormatId(0)),
+            loaded.formats().lookup(ql_storage::FormatId::Builtin(0)),
             Some("General")
         );
     }
@@ -2993,30 +3026,31 @@ sheets = [
         wb.sheet_mut(s0)
             .unwrap()
             .format_overlay_mut()
-            .set(0, 0, ql_storage::FormatId(14)); // m/d/yyyy
+            .set(0, 0, ql_storage::FormatId::Builtin(14)); // m/d/yyyy
         wb.sheet_mut(s0)
             .unwrap()
             .format_overlay_mut()
-            .set(3, 5, ql_storage::FormatId(4)); // #,##0.00
-        wb.sheet_mut(s1)
-            .unwrap()
-            .format_overlay_mut()
-            .set(10, 20, ql_storage::FormatId(49)); // @
+            .set(3, 5, ql_storage::FormatId::Builtin(4)); // #,##0.00
+        wb.sheet_mut(s1).unwrap().format_overlay_mut().set(
+            10,
+            20,
+            ql_storage::FormatId::Builtin(49),
+        ); // @
         save_workbook(&wb, "overlay", &path).unwrap();
         let loaded = load_workbook(&path).unwrap();
         // Sheet A overlay round-trips.
         assert_eq!(
             loaded.sheet(s0).unwrap().format_overlay().get(0, 0),
-            Some(ql_storage::FormatId(14))
+            Some(ql_storage::FormatId::Builtin(14))
         );
         assert_eq!(
             loaded.sheet(s0).unwrap().format_overlay().get(3, 5),
-            Some(ql_storage::FormatId(4))
+            Some(ql_storage::FormatId::Builtin(4))
         );
         // Sheet B overlay round-trips.
         assert_eq!(
             loaded.sheet(s1).unwrap().format_overlay().get(10, 20),
-            Some(ql_storage::FormatId(49))
+            Some(ql_storage::FormatId::Builtin(49))
         );
         // Sheet A doesn't see Sheet B's binding.
         assert_eq!(loaded.sheet(s0).unwrap().format_overlay().get(10, 20), None);
@@ -3067,13 +3101,16 @@ sheets = [
         let loaded = load_workbook(&path).unwrap();
         // Built-ins were re-seeded by FormatTable::default().
         assert_eq!(
-            loaded.formats().lookup(ql_storage::FormatId(0)),
+            loaded.formats().lookup(ql_storage::FormatId::Builtin(0)),
             Some("General")
         );
         // No custom entries.
         for id in ql_storage::FIRST_CUSTOM_FORMAT_ID..(ql_storage::FIRST_CUSTOM_FORMAT_ID + 10) {
             assert!(
-                loaded.formats().lookup(ql_storage::FormatId(id)).is_none(),
+                loaded
+                    .formats()
+                    .lookup(ql_storage::FormatId::legacy_from_u32(id))
+                    .is_none(),
                 "v3 envelope must not produce custom format at id {id}"
             );
         }

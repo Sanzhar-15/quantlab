@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn set_then_get() {
         let mut o = CellFormatOverlay::new();
-        let id = FormatId(14);
+        let id = FormatId::Builtin(14);
         assert_eq!(o.set(5, 3, id), None);
         assert_eq!(o.get(5, 3), Some(id));
     }
@@ -111,16 +111,19 @@ mod tests {
     #[test]
     fn set_overwrites_and_returns_prior() {
         let mut o = CellFormatOverlay::new();
-        assert_eq!(o.set(5, 3, FormatId(14)), None);
-        assert_eq!(o.set(5, 3, FormatId(15)), Some(FormatId(14)));
-        assert_eq!(o.get(5, 3), Some(FormatId(15)));
+        assert_eq!(o.set(5, 3, FormatId::Builtin(14)), None);
+        assert_eq!(
+            o.set(5, 3, FormatId::Builtin(15)),
+            Some(FormatId::Builtin(14))
+        );
+        assert_eq!(o.get(5, 3), Some(FormatId::Builtin(15)));
     }
 
     #[test]
     fn clear_removes_entry() {
         let mut o = CellFormatOverlay::new();
-        o.set(5, 3, FormatId(14));
-        assert_eq!(o.clear(5, 3), Some(FormatId(14)));
+        o.set(5, 3, FormatId::Builtin(14));
+        assert_eq!(o.clear(5, 3), Some(FormatId::Builtin(14)));
         assert_eq!(o.get(5, 3), None);
     }
 
@@ -133,8 +136,8 @@ mod tests {
     #[test]
     fn clear_all_wipes_overlay() {
         let mut o = CellFormatOverlay::new();
-        o.set(0, 0, FormatId(14));
-        o.set(1, 1, FormatId(15));
+        o.set(0, 0, FormatId::Builtin(14));
+        o.set(1, 1, FormatId::Builtin(15));
         o.clear_all();
         assert!(o.is_empty());
     }
@@ -142,19 +145,21 @@ mod tests {
     #[test]
     fn count_refs_returns_match_count() {
         let mut o = CellFormatOverlay::new();
-        o.set(0, 0, FormatId(14));
-        o.set(0, 1, FormatId(14));
-        o.set(0, 2, FormatId(15));
-        assert_eq!(o.count_refs(FormatId(14)), 2);
-        assert_eq!(o.count_refs(FormatId(15)), 1);
-        assert_eq!(o.count_refs(FormatId(999)), 0);
+        o.set(0, 0, FormatId::Builtin(14));
+        o.set(0, 1, FormatId::Builtin(14));
+        o.set(0, 2, FormatId::Builtin(15));
+        assert_eq!(o.count_refs(FormatId::Builtin(14)), 2);
+        assert_eq!(o.count_refs(FormatId::Builtin(15)), 1);
+        // 999 maps to Custom(LEGACY_PEER, 835) under the new shape;
+        // never registered, so count is 0.
+        assert_eq!(o.count_refs(FormatId::legacy_from_u32(999)), 0);
     }
 
     #[test]
     fn iter_returns_all_entries() {
         let mut o = CellFormatOverlay::new();
-        o.set(0, 0, FormatId(14));
-        o.set(1, 1, FormatId(15));
+        o.set(0, 0, FormatId::Builtin(14));
+        o.set(1, 1, FormatId::Builtin(15));
         let collected: Vec<_> = o.iter().collect();
         assert_eq!(collected.len(), 2);
     }
@@ -162,12 +167,12 @@ mod tests {
     #[test]
     fn distinct_addresses_isolated() {
         let mut o = CellFormatOverlay::new();
-        o.set(0, 0, FormatId(14));
-        o.set(0, 1, FormatId(15));
-        o.set(1, 0, FormatId(16));
-        assert_eq!(o.get(0, 0), Some(FormatId(14)));
-        assert_eq!(o.get(0, 1), Some(FormatId(15)));
-        assert_eq!(o.get(1, 0), Some(FormatId(16)));
+        o.set(0, 0, FormatId::Builtin(14));
+        o.set(0, 1, FormatId::Builtin(15));
+        o.set(1, 0, FormatId::Builtin(16));
+        assert_eq!(o.get(0, 0), Some(FormatId::Builtin(14)));
+        assert_eq!(o.get(0, 1), Some(FormatId::Builtin(15)));
+        assert_eq!(o.get(1, 0), Some(FormatId::Builtin(16)));
         assert_eq!(o.get(1, 1), None);
     }
 }

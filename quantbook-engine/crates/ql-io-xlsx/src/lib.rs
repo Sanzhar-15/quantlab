@@ -270,7 +270,13 @@ pub fn import_xlsx_bytes(
                 // General format — implicit. No overlay entry.
                 continue;
             }
-            let fmt_id = ql_storage::FormatId(xf.num_fmt_id);
+            // Phase 5.2 D-1 step 3: xlsx import uses the legacy
+            // u32 → FormatId migration helper. n <= 163 → Builtin(n);
+            // n >= 164 → Custom(LEGACY_PEER, n - 164). Step 6 may
+            // change xlsx import to allocate non-legacy peer ids
+            // (e.g. for collab-aware imports); pre-step-6 all xlsx
+            // ids land under LEGACY_PEER.
+            let fmt_id = ql_storage::FormatId::legacy_from_u32(xf.num_fmt_id);
             sheet.format_overlay_mut().set(row, col, fmt_id);
         }
     }

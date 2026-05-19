@@ -19,7 +19,7 @@
 use crate::error::XlsxError;
 use crate::options::FormulaCachePolicy;
 use crate::report::XlsxExportReport;
-use ql_storage::{FormatId, NamedTarget, Workbook, FIRST_CUSTOM_FORMAT_ID};
+use ql_storage::{FormatId, NamedTarget, Workbook};
 use ql_types::Value;
 
 /// Per-cell fix instruction. **W5-D-14.1 umya-bug workaround:** umya
@@ -289,7 +289,18 @@ pub(crate) fn export_new_workbook(
             .ok_or_else(|| XlsxError::Export(format!("sheet {sheet_id} missing during export")))?;
         let mut overlay_entries: Vec<((u32, u32), FormatId)> =
             sheet_view.format_overlay().iter().collect();
-        overlay_entries.sort_by_key(|a| (a.1 .0, a.0 .0, a.0 .1));
+        // Phase 5.2 D-1 step 3: sort key uses `to_legacy_u32` (was the
+        // pre-step-3 `.0` field). Non-LEGACY peer ids can't yet appear
+        // here (step 6 will handle multi-peer xlsx export); expect()
+        // makes the invariant load-bearing for step 6.
+        overlay_entries.sort_by_key(|a| {
+            (
+                a.1.to_legacy_u32()
+                    .expect("pre-step-6 xlsx export sees only legacy FormatId"),
+                a.0 .0,
+                a.0 .1,
+            )
+        });
 
         for ((row, col), fid) in overlay_entries {
             let xf_index = match format_to_xf_index.get(&fid) {
@@ -324,12 +335,21 @@ pub(crate) fn export_new_workbook(
     let needs_cell_fixes = sheet_fixes.iter().any(|f| !f.is_empty());
 
     // **W5-D-14.2 (HIGH-5 closure):** collect custom-format codes (≥164).
+    // Phase 5.2 D-1 step 3: `is_custom()` replaces the pre-step-3
+    // `id.0 >= FIRST_CUSTOM_FORMAT_ID` filter. xlsx export sees only
+    // legacy FormatId values pre-step-6, so `to_legacy_u32` always
+    // returns Some; the expect() makes the invariant load-bearing
+    // for step 6 (multi-peer xlsx export).
     let custom_formats: Vec<(u32, String)> = workbook
         .formats()
         .iter()
         .filter_map(|(id, code)| {
-            if id.0 >= FIRST_CUSTOM_FORMAT_ID {
-                Some((id.0, code.to_string()))
+            if id.is_custom() {
+                Some((
+                    id.to_legacy_u32()
+                        .expect("pre-step-6 xlsx export sees only legacy FormatId"),
+                    code.to_string(),
+                ))
             } else {
                 None
             }
@@ -978,7 +998,10 @@ fn inject_cell_xfs_into_styles_xml(
                 r#"<xf numFmtId="{}" fontId="0" fillId="0" borderId="0" xfId="0" "#,
                 r#"applyNumberFormat="1"/>"#,
             ),
-            fid.0,
+            // Phase 5.2 D-1 step 3: pre-step-6 xlsx export sees only
+            // legacy FormatId; non-LEGACY peer ids can't yet appear.
+            fid.to_legacy_u32()
+                .expect("pre-step-6 xlsx export sees only legacy FormatId"),
         ));
     }
     block.push_str("</cellXfs>");

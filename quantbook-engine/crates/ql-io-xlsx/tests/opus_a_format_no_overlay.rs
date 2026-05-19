@@ -19,7 +19,7 @@ fn format_registered_but_not_used_anywhere_round_trips() {
     wb.put_at(s, 0, 0, Value::Number(42.0));
     let id_a = wb.formats_mut().intern("yyyy-mm-dd");
     let id_b = wb.formats_mut().intern("0.000%");
-    println!("orig ids: {} {}", id_a.0, id_b.0);
+    println!("orig ids: {:?} {:?}", id_a, id_b);
     // No overlay entries — the cell at A1 has no format.
 
     let tmp = std::env::temp_dir().join("opus-a-fmt-no-overlay.xlsx");
@@ -46,8 +46,8 @@ fn format_registered_but_not_used_anywhere_round_trips() {
     .unwrap();
     println!("--- after re-import ---");
     for (id, c) in r.workbook.formats().iter() {
-        if id.0 >= ql_storage::FIRST_CUSTOM_FORMAT_ID {
-            println!("  id={} = {:?}", id.0, c);
+        if id.is_custom() {
+            println!("  id={:?} = {:?}", id, c);
         }
     }
     let _ = std::fs::remove_file(&tmp);
@@ -70,9 +70,9 @@ fn overlay_on_unpopulated_builtin() {
     wb.put_at(s, 0, 2, Value::Number(0.07));
     {
         let sheet = wb.sheet_mut(s).unwrap();
-        sheet.format_overlay_mut().set(0, 0, FormatId(38)); // not pre-populated; renders as color
-        sheet.format_overlay_mut().set(0, 1, FormatId(46)); // also not pre-populated
-        sheet.format_overlay_mut().set(0, 2, FormatId(9)); // pre-populated "0%"
+        sheet.format_overlay_mut().set(0, 0, FormatId::Builtin(38)); // not pre-populated; renders as color
+        sheet.format_overlay_mut().set(0, 1, FormatId::Builtin(46)); // also not pre-populated
+        sheet.format_overlay_mut().set(0, 2, FormatId::Builtin(9)); // pre-populated "0%"
     }
     let tmp = std::env::temp_dir().join("opus-a-unpopulated-builtin.xlsx");
     let _ = std::fs::remove_file(&tmp);

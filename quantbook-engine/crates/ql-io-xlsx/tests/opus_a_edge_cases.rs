@@ -166,8 +166,8 @@ fn unicode_survival() {
                 println!("sheet[{}] name={:?}", sid, s.name());
             }
             for (id, code) in r.workbook.formats().iter() {
-                if id.0 >= ql_storage::FIRST_CUSTOM_FORMAT_ID {
-                    println!("fmt {} = {:?}", id.0, code);
+                if id.is_custom() {
+                    println!("fmt {:?} = {:?}", id, code);
                 }
             }
             for (name, target) in r.workbook.names().iter() {
@@ -201,7 +201,7 @@ fn custom_format_byte_for_byte_preservation_with_special_chars() {
     let id_amp = wb.formats_mut().intern("#,##0 \"& foo\"");
     let id_lt = wb.formats_mut().intern("0;[<5]0.00");
     let id_quot = wb.formats_mut().intern("0.00 \"x\" 0.00");
-    println!("ids: {} {} {}", id_amp.0, id_lt.0, id_quot.0);
+    println!("ids: {:?} {:?} {:?}", id_amp, id_lt, id_quot);
     let tmp = std::env::temp_dir().join("opus-a-format-bytes.xlsx");
     let _ = std::fs::remove_file(&tmp);
     export_xlsx_path(&wb, &registry(), &tmp, XlsxExportOptions::default()).unwrap();
@@ -226,8 +226,8 @@ fn custom_format_byte_for_byte_preservation_with_special_chars() {
     )
     .unwrap();
     for (id, c) in r.workbook.formats().iter() {
-        if id.0 >= ql_storage::FIRST_CUSTOM_FORMAT_ID {
-            println!("after roundtrip id={} code={:?}", id.0, c);
+        if id.is_custom() {
+            println!("after roundtrip id={:?} code={:?}", id, c);
         }
     }
     let _ = std::fs::remove_file(&tmp);
@@ -331,7 +331,7 @@ fn overlay_on_text_and_error_and_shared_string() {
 
     let fmt_text = wb.formats_mut().intern("@");
     let fmt_money = wb.formats_mut().intern("$#,##0.00");
-    let fmt_date = ql_storage::FormatId(14); // built-in
+    let fmt_date = ql_storage::FormatId::Builtin(14); // built-in
     {
         let sheet = wb.sheet_mut(s).unwrap();
         sheet.format_overlay_mut().set(0, 0, fmt_text);

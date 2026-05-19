@@ -122,8 +122,13 @@ pub enum RuntimeError {
     /// "RegisterFormat before SetCellFormat" ordering; mirrors replay's
     /// `FormatNotRegistered`. Callers should obtain the id via
     /// `intern_format` (which handles registration automatically).
-    #[error("format id {0} is not registered in the workbook FormatTable")]
-    UnknownFormatId(u32),
+    ///
+    /// Phase 5.2 D-1 step 3: payload changed from `u32` to
+    /// `ql_storage::FormatId` (tagged tuple) — error messages now
+    /// distinguish `Builtin(n)` from `Custom(peer, counter)` rather
+    /// than only carrying the legacy u32.
+    #[error("format id {0:?} is not registered in the workbook FormatTable")]
+    UnknownFormatId(ql_storage::FormatId),
 
     /// **W5-106-AUDIT (Codex MEDIUM closure):** recompute_dirty's
     /// fixed-point loop hit its MAX_ITERATIONS bound with cells still

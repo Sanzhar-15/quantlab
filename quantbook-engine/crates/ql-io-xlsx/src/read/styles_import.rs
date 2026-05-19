@@ -62,7 +62,10 @@ pub(crate) fn register_custom_formats(
                 ),
             });
         }
-        let id = FormatId(entry.num_fmt_id);
+        // Phase 5.2 D-1 step 3: xlsx import uses legacy u32 → FormatId
+        // migration. Custom xlsx numFmtIds (>= 164) land under
+        // LEGACY_PEER per the migration contract.
+        let id = FormatId::legacy_from_u32(entry.num_fmt_id);
         // **W5-D-14.1 (audit HIGH-8 closure):** real-world xlsx files
         // from LibreOffice / Google Sheets sometimes emit
         // `<numFmt numFmtId="164" formatCode="General"/>` — a
@@ -152,9 +155,12 @@ mod tests {
         assert_eq!(n, 2);
         assert_eq!(wb.formats().len(), baseline + 2);
         // Lookup by id should hit.
-        assert_eq!(wb.formats().lookup(FormatId(164)), Some("yyyy-mm-dd"));
         assert_eq!(
-            wb.formats().lookup(FormatId(165)),
+            wb.formats().lookup(FormatId::legacy_from_u32(164)),
+            Some("yyyy-mm-dd")
+        );
+        assert_eq!(
+            wb.formats().lookup(FormatId::legacy_from_u32(165)),
             Some("yyyy-mm-dd hh:mm:ss")
         );
     }
@@ -188,7 +194,7 @@ mod tests {
         // fail with MalformedOoxml.
         let mut wb = Workbook::new();
         wb.formats_mut()
-            .register_at(FormatId(164), "yyyy-mm-dd")
+            .register_at(FormatId::legacy_from_u32(164), "yyyy-mm-dd")
             .unwrap();
         let idx = StyleIndex {
             num_fmts: vec![NumFmtEntry {
@@ -220,6 +226,9 @@ mod tests {
         register_custom_formats(&mut wb, &idx).unwrap();
         // Second call: same id, same string → should succeed.
         register_custom_formats(&mut wb, &idx).unwrap();
-        assert_eq!(wb.formats().lookup(FormatId(164)), Some("yyyy-mm-dd"));
+        assert_eq!(
+            wb.formats().lookup(FormatId::legacy_from_u32(164)),
+            Some("yyyy-mm-dd")
+        );
     }
 }

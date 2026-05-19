@@ -48,17 +48,27 @@ impl<'a> WorkbookRuntime<'a> {
         // New string — predict the id the table will allocate so we can
         // emit the op BEFORE mutating (append-before-mutate ordering,
         // matching set_name / set_value).
-        let id = FormatId(self.workbook.formats().next_custom_id());
+        //
+        // Phase 5.2 D-1 step 3: FormatTable now allocates under its
+        // `local_peer`. Predicted id is `Custom(local_peer, counter)`.
+        // Pre-step-4 the Op still carries a bare-u32 id; convert via
+        // `to_legacy_u32`. At step 3 all FormatTables default to
+        // LEGACY_PEER so the conversion always succeeds; the
+        // expect() makes the invariant load-bearing for step 4.
+        let formats = self.workbook.formats();
+        let id = FormatId::Custom(formats.local_peer(), formats.next_custom_counter());
         if let Some(oplog) = self.oplog.as_deref_mut() {
             oplog.append(Op::RegisterFormat {
-                id: id.0,
+                id: id.to_legacy_u32().expect(
+                    "pre-step-4 FormatTable peer must be LEGACY_PEER so Op u32 is expressible",
+                ),
                 string: s.to_owned(),
             })?;
         }
         let allocated = self.workbook.formats_mut().intern(s);
         debug_assert_eq!(
             allocated, id,
-            "FormatTable::intern allocated a different id than next_custom_id predicted"
+            "FormatTable::intern allocated a different id than next_custom_counter predicted"
         );
         Ok(allocated)
     }
@@ -85,7 +95,7 @@ impl<'a> WorkbookRuntime<'a> {
         // an op log that ever reaches the wire is well-formed.
         if let Some(fid) = id {
             if self.workbook.formats().lookup(fid).is_none() {
-                return Err(RuntimeError::UnknownFormatId(fid.0));
+                return Err(RuntimeError::UnknownFormatId(fid));
             }
         }
         if let Some(oplog) = self.oplog.as_deref_mut() {
@@ -93,7 +103,12 @@ impl<'a> WorkbookRuntime<'a> {
                 sheet,
                 row,
                 col,
-                id: id.map(|f| f.0),
+                // Phase 5.2 D-1 step 3: Op still carries bare-u32
+                // (step 4 will change to FormatIdWire). Convert.
+                id: id.map(|f| {
+                    f.to_legacy_u32()
+                        .expect("pre-step-4 FormatId must be expressible as legacy u32")
+                }),
             })?;
         }
         // Apply the mutation. After append-success this cannot fail.
@@ -201,7 +216,7 @@ mod tests {
             let id = rt.intern_format("General").unwrap();
             assert_eq!(id, FormatId::GENERAL);
             let id2 = rt.intern_format("0.00").unwrap();
-            assert_eq!(id2, FormatId(2));
+            assert_eq!(id2, FormatId::Builtin(2));
         }
         // No RegisterFormat ops should have been emitted — both strings
         // are pre-populated built-ins.
@@ -217,12 +232,16 @@ mod tests {
         {
             let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut log);
             let id = rt.intern_format("\"€\" #,##0.00").unwrap();
-            assert_eq!(id.0, ql_storage::FIRST_CUSTOM_FORMAT_ID);
+            // Step 3: first custom under LEGACY_PEER, counter=0.
+            // Round-trips to legacy u32 = 164 (FIRST_CUSTOM_FORMAT_ID).
+            assert_eq!(id.to_legacy_u32(), Some(ql_storage::FIRST_CUSTOM_FORMAT_ID));
+            assert_eq!(id, FormatId::Custom(ql_types::LEGACY_PEER, 0));
         }
         let ops: Vec<_> = log.iter().collect::<Result<_, _>>().unwrap();
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             Op::RegisterFormat { id, string } => {
+                // Pre-step-4: Op still carries bare u32 = 164.
                 assert_eq!(*id, ql_storage::FIRST_CUSTOM_FORMAT_ID);
                 assert_eq!(string, "\"€\" #,##0.00");
             }
@@ -253,12 +272,13 @@ mod tests {
         let mut log = OpLog::new();
         {
             let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut log);
-            rt.set_cell_format(s, 3, 5, Some(FormatId(14))).unwrap();
+            rt.set_cell_format(s, 3, 5, Some(FormatId::Builtin(14)))
+                .unwrap();
         }
         // Overlay updated.
         assert_eq!(
             wb.sheet(s).unwrap().format_overlay().get(3, 5),
-            Some(FormatId(14))
+            Some(FormatId::Builtin(14))
         );
         // Op recorded.
         let ops: Vec<_> = log.iter().collect::<Result<_, _>>().unwrap();
@@ -275,7 +295,7 @@ mod tests {
         wb.sheet_mut(s)
             .unwrap()
             .format_overlay_mut()
-            .set(0, 0, FormatId(14));
+            .set(0, 0, FormatId::Builtin(14));
         let reg = default_registry();
         let mut log = OpLog::new();
         {
@@ -295,10 +315,14 @@ mod tests {
         let s = wb.add_sheet("S");
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-        let err = rt
-            .set_cell_format(s, 0, 0, Some(FormatId(9999)))
-            .unwrap_err();
-        assert!(matches!(err, RuntimeError::UnknownFormatId(9999)));
+        let bad_id = FormatId::legacy_from_u32(9999);
+        let err = rt.set_cell_format(s, 0, 0, Some(bad_id)).unwrap_err();
+        // Step 3: UnknownFormatId carries FormatId (was u32 pre-step-3).
+        // legacy_from_u32(9999) = Custom(LEGACY_PEER, 9999 - 164) = 9835.
+        assert!(matches!(
+            err,
+            RuntimeError::UnknownFormatId(fid) if fid == bad_id
+        ));
     }
 
     // ===== W5-82 — read_display integration =====
@@ -323,7 +347,7 @@ mod tests {
         wb.sheet_mut(s)
             .unwrap()
             .format_overlay_mut()
-            .set(0, 0, FormatId(14)); // m/d/yyyy
+            .set(0, 0, FormatId::Builtin(14)); // m/d/yyyy
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
         assert_eq!(rt.read_display(s, 0, 0), "7/4/2024");
@@ -373,7 +397,7 @@ mod tests {
         wb.sheet_mut(s)
             .unwrap()
             .format_overlay_mut()
-            .set(0, 0, FormatId(14));
+            .set(0, 0, FormatId::Builtin(14));
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
         assert_eq!(rt.read_display(s, 0, 0), "#DIV/0!");
@@ -387,7 +411,7 @@ mod tests {
         wb.sheet_mut(s)
             .unwrap()
             .format_overlay_mut()
-            .set(0, 0, FormatId(49)); // @
+            .set(0, 0, FormatId::Builtin(49)); // @
         let reg = default_registry();
         let mut rt = WorkbookRuntime::new(&mut wb, &reg);
         assert_eq!(rt.read_display(s, 0, 0), "hello");
@@ -410,7 +434,7 @@ mod tests {
         replay_wb.add_sheet("S");
         ql_oplog::replay_into(&log, &mut replay_wb, &reg).unwrap();
         // Format registered.
-        let custom_id = FormatId(ql_storage::FIRST_CUSTOM_FORMAT_ID);
+        let custom_id = FormatId::legacy_from_u32(ql_storage::FIRST_CUSTOM_FORMAT_ID);
         assert_eq!(
             replay_wb.formats().lookup(custom_id),
             Some("\"€\" #,##0.00")

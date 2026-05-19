@@ -189,8 +189,11 @@ fn apply_producer_side(ops: &[Op], wb: &mut Workbook) {
                     .expect("producer-side rename_sheet must succeed");
             }
             Op::RegisterFormat { id, string } => {
+                // Step 3: convert Op's u32 to the new FormatId enum
+                // shape via the legacy migration helper. Mirrors
+                // ql_oplog::replay's handler.
                 wb.formats_mut()
-                    .register_at(ql_storage::FormatId(*id), string.as_str())
+                    .register_at(ql_storage::FormatId::legacy_from_u32(*id), string.as_str())
                     .expect("producer-side register_at must succeed");
             }
             Op::SetCellFormat {
@@ -202,8 +205,11 @@ fn apply_producer_side(ops: &[Op], wb: &mut Workbook) {
                 let s = wb.sheet_mut(*sheet).expect("sheet exists");
                 match id {
                     Some(raw_id) => {
-                        s.format_overlay_mut()
-                            .set(*row, *col, ql_storage::FormatId(*raw_id));
+                        s.format_overlay_mut().set(
+                            *row,
+                            *col,
+                            ql_storage::FormatId::legacy_from_u32(*raw_id),
+                        );
                     }
                     None => {
                         s.format_overlay_mut().clear(*row, *col);
@@ -312,35 +318,28 @@ fn assert_workbooks_observationally_equal(a: &Workbook, b: &Workbook) {
     // bug in `RegisterFormat` / `SetCellFormat` ordering or id-
     // prediction slip through with matching cell values but mismatched
     // formats).
-    let formats_a: std::collections::HashMap<u32, String> = a
+    // Step 3: HashMap keyed by FormatId (enum) rather than u32 — the
+    // FormatId enum derives Hash + Eq, so this works directly without
+    // any to_legacy_u32 hop.
+    let formats_a: std::collections::HashMap<ql_storage::FormatId, String> = a
         .formats()
         .iter()
-        .map(|(id, s)| (id.0, s.to_owned()))
+        .map(|(id, s)| (id, s.to_owned()))
         .collect();
-    let formats_b: std::collections::HashMap<u32, String> = b
+    let formats_b: std::collections::HashMap<ql_storage::FormatId, String> = b
         .formats()
         .iter()
-        .map(|(id, s)| (id.0, s.to_owned()))
+        .map(|(id, s)| (id, s.to_owned()))
         .collect();
     assert_eq!(
         formats_a, formats_b,
         "FormatTable contents differ between producer and replay"
     );
     for sheet_id in 0..(a.sheet_count() as u16) {
-        let overlay_a: std::collections::HashMap<(u32, u32), u32> = a
-            .sheet(sheet_id)
-            .unwrap()
-            .format_overlay()
-            .iter()
-            .map(|((r, c), fid)| ((r, c), fid.0))
-            .collect();
-        let overlay_b: std::collections::HashMap<(u32, u32), u32> = b
-            .sheet(sheet_id)
-            .unwrap()
-            .format_overlay()
-            .iter()
-            .map(|((r, c), fid)| ((r, c), fid.0))
-            .collect();
+        let overlay_a: std::collections::HashMap<(u32, u32), ql_storage::FormatId> =
+            a.sheet(sheet_id).unwrap().format_overlay().iter().collect();
+        let overlay_b: std::collections::HashMap<(u32, u32), ql_storage::FormatId> =
+            b.sheet(sheet_id).unwrap().format_overlay().iter().collect();
         assert_eq!(
             overlay_a, overlay_b,
             "CellFormatOverlay differs on sheet {sheet_id}"

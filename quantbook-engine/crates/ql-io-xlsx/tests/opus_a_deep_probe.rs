@@ -397,15 +397,17 @@ fn deep_format_codes_round_trip() {
         };
         let short = path.file_name().unwrap().to_string_lossy().to_string();
         for (id, code) in first.workbook.formats().iter() {
-            if id.0 < ql_storage::FIRST_CUSTOM_FORMAT_ID {
+            if !id.is_custom() {
                 continue;
             }
             total_customs += 1;
+            // Step 3: id is the full FormatId enum; Debug-print via {:?}
+            // shows variant + payload (e.g. `Custom(LEGACY_PEER, 36)`).
             match second.workbook.formats().lookup(id) {
                 None => {
                     dropped += 1;
                     if details.len() < 60 {
-                        details.push(format!("{} DROP id={} code={:?}", short, id.0, code));
+                        details.push(format!("{} DROP id={:?} code={:?}", short, id, code));
                     }
                 }
                 Some(code2) => {
@@ -413,8 +415,8 @@ fn deep_format_codes_round_trip() {
                         diverged += 1;
                         if details.len() < 60 {
                             details.push(format!(
-                                "{} DIV id={} c1={:?} c2={:?}",
-                                short, id.0, code, code2
+                                "{} DIV id={:?} c1={:?} c2={:?}",
+                                short, id, code, code2
                             ));
                         }
                     }
@@ -483,8 +485,8 @@ fn deep_overlay_round_trip() {
                         dropped_entries += 1;
                         if details.len() < 40 {
                             details.push(format!(
-                                "{} DROP sheet[{}] r={} c={} fid1={}",
-                                short, sid, r, c, fid1.0
+                                "{} DROP sheet[{}] r={} c={} fid1={:?}",
+                                short, sid, r, c, fid1
                             ));
                         }
                         continue;
@@ -499,8 +501,8 @@ fn deep_overlay_round_trip() {
                         wrong_id += 1;
                         if details.len() < 40 {
                             details.push(format!(
-                                "{} DIVID sheet[{}] r={} c={} fid1={} code1={:?} fid2={} code2={:?}",
-                                short, sid, r, c, fid1.0, code1, fid2.0, code2
+                                "{} DIVID sheet[{}] r={} c={} fid1={:?} code1={:?} fid2={:?} code2={:?}",
+                                short, sid, r, c, fid1, code1, fid2, code2
                             ));
                         }
                     }
@@ -512,8 +514,8 @@ fn deep_overlay_round_trip() {
                         wrong_code_for_same_id += 1;
                         if details.len() < 40 {
                             details.push(format!(
-                                "{} DIVCODE sheet[{}] r={} c={} fid={} c1={:?} c2={:?}",
-                                short, sid, r, c, fid1.0, code1, code2
+                                "{} DIVCODE sheet[{}] r={} c={} fid={:?} c1={:?} c2={:?}",
+                                short, sid, r, c, fid1, code1, code2
                             ));
                         }
                     }
@@ -660,8 +662,8 @@ fn deep_synthetic_cross_feature() {
     let custom_id_3 = wb.formats_mut().intern("0.00;[Red]-0.00;\"-\"");
     let custom_id_4 = wb.formats_mut().intern("#,##0 \"& <foo>\""); // XML-special chars
     println!(
-        "synthetic custom ids: {} {} {} {}",
-        custom_id_1.0, custom_id_2.0, custom_id_3.0, custom_id_4.0
+        "synthetic custom ids: {:?} {:?} {:?} {:?}",
+        custom_id_1, custom_id_2, custom_id_3, custom_id_4
     );
     // Overlay entries.
     {
@@ -670,7 +672,7 @@ fn deep_synthetic_cross_feature() {
         sheet.format_overlay_mut().set(0, 1, custom_id_2);
         sheet.format_overlay_mut().set(0, 2, custom_id_3);
         sheet.format_overlay_mut().set(0, 3, custom_id_4);
-        sheet.format_overlay_mut().set(0, 4, FormatId(14)); // built-in
+        sheet.format_overlay_mut().set(0, 4, FormatId::Builtin(14)); // built-in
     }
 
     // A table.
@@ -763,21 +765,21 @@ fn deep_synthetic_cross_feature() {
 
     // Format codes.
     for (id, code) in wb.formats().iter() {
-        if id.0 < ql_storage::FIRST_CUSTOM_FORMAT_ID {
+        if !id.is_custom() {
             continue;
         }
         match second.workbook.formats().lookup(id) {
             Some(c2) => {
                 println!(
-                    "custom fmt {} orig={:?} new={:?} match={}",
-                    id.0,
+                    "custom fmt {:?} orig={:?} new={:?} match={}",
+                    id,
                     code,
                     c2,
                     code == c2
                 );
             }
             None => {
-                println!("custom fmt {} {:?} DROPPED", id.0, code);
+                println!("custom fmt {:?} {:?} DROPPED", id, code);
             }
         }
     }
@@ -788,13 +790,8 @@ fn deep_synthetic_cross_feature() {
         let code_orig = wb.formats().lookup(fid);
         let code_new = v2.and_then(|f| second.workbook.formats().lookup(f));
         println!(
-            "overlay ({},{}) orig_id={} ({:?}) new={:?} ({:?})",
-            r,
-            c,
-            fid.0,
-            code_orig,
-            v2.map(|f| f.0),
-            code_new
+            "overlay ({},{}) orig_id={:?} ({:?}) new={:?} ({:?})",
+            r, c, fid, code_orig, v2, code_new
         );
     }
 

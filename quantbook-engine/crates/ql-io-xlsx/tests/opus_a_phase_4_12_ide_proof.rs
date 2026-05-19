@@ -261,8 +261,13 @@ fn p4_roundtrip_multi_feature_workbook() {
     // Was the custom format preserved? Walk the format table directly.
     let mut custom_formats: Vec<(u32, String)> = Vec::new();
     for (id, s) in wb2.formats().iter() {
-        if id.0 >= ql_storage::FIRST_CUSTOM_FORMAT_ID {
-            custom_formats.push((id.0, s.to_owned()));
+        // Step 3: `is_custom()` replaces the pre-step-3 `id.0 >= 164` filter.
+        if id.is_custom() {
+            custom_formats.push((
+                id.to_legacy_u32()
+                    .expect("pre-step-6 xlsx test sees only legacy FormatId"),
+                s.to_owned(),
+            ));
         }
     }
     println!("[P4] custom formats post-roundtrip: {custom_formats:?}");
@@ -766,7 +771,7 @@ fn p13_full_ide_proof_point_xlsx_qbook_xlsx() {
         .workbook
         .formats()
         .iter()
-        .filter(|(id, _)| id.0 >= ql_storage::FIRST_CUSTOM_FORMAT_ID)
+        .filter(|(id, _)| id.is_custom())
         .count();
     println!("[P13] Stage 6: name preserved={has_name}, custom_formats={custom_count}");
     if !has_name {
@@ -884,7 +889,7 @@ fn p14_qbook_persistence_with_full_phase4_features() {
     let custom_count: usize = wb2
         .formats()
         .iter()
-        .filter(|(id, _)| id.0 >= ql_storage::FIRST_CUSTOM_FORMAT_ID)
+        .filter(|(id, _)| id.is_custom())
         .count();
     println!(
         "[P14] post-qbook-rt: locale={locale_after:?}, date={date_after:?}, \

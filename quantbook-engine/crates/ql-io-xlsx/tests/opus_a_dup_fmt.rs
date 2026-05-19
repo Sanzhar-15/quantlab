@@ -71,8 +71,8 @@ fn two_custom_ids_with_same_format_code() {
         Ok(res) => {
             println!("import OK");
             for (id, c) in res.workbook.formats().iter() {
-                if id.0 >= ql_storage::FIRST_CUSTOM_FORMAT_ID {
-                    println!("  id={} code={:?}", id.0, c);
+                if id.is_custom() {
+                    println!("  id={:?} code={:?}", id, c);
                 }
             }
             let sheet = res.workbook.sheet(0).unwrap();
@@ -152,7 +152,9 @@ fn libreoffice_general_at_custom_id_round_trip() {
     );
     println!(
         "formats[164] = {:?}",
-        r.workbook.formats().lookup(ql_storage::FormatId(164))
+        r.workbook
+            .formats()
+            .lookup(ql_storage::FormatId::legacy_from_u32(164))
     );
     // The cell references xf 1 → numFmtId=164. But the styles_import
     // closure for the "General-at-custom-id" case treats register_at

@@ -65,7 +65,7 @@ fn run_one(path: &std::path::Path) -> FixtureReport {
         .workbook
         .formats()
         .iter()
-        .filter(|(id, _)| id.0 >= ql_storage::FIRST_CUSTOM_FORMAT_ID)
+        .filter(|(id, _)| id.is_custom())
         .count();
     r.names = first.workbook.names().len();
     r.tables = first.workbook.tables().len();
@@ -112,7 +112,7 @@ fn run_one(path: &std::path::Path) -> FixtureReport {
         .workbook
         .formats()
         .iter()
-        .filter(|(id, _)| id.0 >= ql_storage::FIRST_CUSTOM_FORMAT_ID)
+        .filter(|(id, _)| id.is_custom())
         .count();
 
     r.semantic_equivalent = Some(

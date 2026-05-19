@@ -310,7 +310,7 @@ fn w5_d_14_2_round_trip_preserves_custom_format_codes() {
     wb.add_sheet("Sheet1");
     let custom_code = "#,##0.00 \"USD\"";
     let custom_id = wb.formats_mut().intern(custom_code);
-    assert_eq!(custom_id, FormatId(FIRST_CUSTOM_FORMAT_ID));
+    assert_eq!(custom_id, FormatId::legacy_from_u32(FIRST_CUSTOM_FORMAT_ID));
 
     let tmp = std::env::temp_dir().join("w5-d-14-2-roundtrip-custom-format.xlsx");
     let _ = std::fs::remove_file(&tmp);
@@ -332,7 +332,7 @@ fn w5_d_14_2_round_trip_preserves_custom_format_codes() {
     let imported_code = result
         .workbook
         .formats()
-        .lookup(FormatId(FIRST_CUSTOM_FORMAT_ID));
+        .lookup(FormatId::legacy_from_u32(FIRST_CUSTOM_FORMAT_ID));
     assert_eq!(
         imported_code,
         Some(custom_code),
@@ -834,7 +834,7 @@ fn w5_d_15_round_trip_per_cell_custom_format_application() {
     let s = wb.add_sheet("Sheet1");
     let custom_code = "yyyy-mm-dd";
     let custom_id = wb.formats_mut().intern(custom_code);
-    assert_eq!(custom_id, FormatId(FIRST_CUSTOM_FORMAT_ID));
+    assert_eq!(custom_id, FormatId::legacy_from_u32(FIRST_CUSTOM_FORMAT_ID));
     // Place a cell value + apply the format to (0, 0).
     wb.put_at(s, 0, 0, Value::Number(45000.0));
     let sheet = wb.sheet_mut(s).unwrap();
@@ -859,14 +859,14 @@ fn w5_d_15_round_trip_per_cell_custom_format_application() {
     let imported_code = result
         .workbook
         .formats()
-        .lookup(FormatId(FIRST_CUSTOM_FORMAT_ID));
+        .lookup(FormatId::legacy_from_u32(FIRST_CUSTOM_FORMAT_ID));
     assert_eq!(imported_code, Some(custom_code));
 
     // Cell at (0, 0) still references that FormatId via the overlay.
     let imported_overlay = result.workbook.sheet(0).unwrap().format_overlay();
     assert_eq!(
         imported_overlay.get(0, 0),
-        Some(FormatId(FIRST_CUSTOM_FORMAT_ID)),
+        Some(FormatId::legacy_from_u32(FIRST_CUSTOM_FORMAT_ID)),
         "expected (0,0) to have the custom FormatId after round-trip"
     );
 
@@ -886,7 +886,7 @@ fn w5_d_15_round_trip_per_cell_builtin_format_application() {
     let s = wb.add_sheet("Sheet1");
     wb.put_at(s, 2, 1, Value::Number(45000.0));
     let sheet = wb.sheet_mut(s).unwrap();
-    let builtin = FormatId(14);
+    let builtin = FormatId::Builtin(14);
     sheet.format_overlay_mut().set(2, 1, builtin);
 
     let tmp = std::env::temp_dir().join("w5-d-15-roundtrip-builtin-fmt.xlsx");
@@ -907,7 +907,7 @@ fn w5_d_15_round_trip_per_cell_builtin_format_application() {
     let imported_overlay = result.workbook.sheet(0).unwrap().format_overlay();
     assert_eq!(
         imported_overlay.get(2, 1),
-        Some(FormatId(14)),
+        Some(FormatId::Builtin(14)),
         "built-in formatId 14 did not survive round-trip"
     );
 
@@ -919,7 +919,7 @@ fn w5_d_15_round_trip_dedup_shared_format_id() {
     // **W5-D-15:** two cells sharing the same FormatId should reuse
     // the same cellXf slot — the cellXfs roster has exactly one
     // entry past the default.
-    use ql_storage::{Workbook, FIRST_CUSTOM_FORMAT_ID};
+    use ql_storage::Workbook;
     use ql_types::Value;
 
     let mut wb = Workbook::new();
@@ -928,9 +928,9 @@ fn w5_d_15_round_trip_dedup_shared_format_id() {
     let custom_code = "#,##0.00 \"€\"";
     let fmt = wb.formats_mut().intern(custom_code);
     assert!(
-        fmt.0 >= FIRST_CUSTOM_FORMAT_ID,
-        "expected custom format id >= 164, got {}",
-        fmt.0
+        fmt.is_custom(),
+        "expected custom format id (>= 164 in legacy u32), got {:?}",
+        fmt
     );
     wb.put_at(s, 0, 0, Value::Number(0.42));
     wb.put_at(s, 1, 0, Value::Number(0.55));
@@ -998,7 +998,7 @@ fn w5_d_15_2_formula_with_blank_cache_format_overlay_round_trips() {
     let overlay = result.workbook.sheet(0).unwrap().format_overlay();
     assert_eq!(
         overlay.get(3, 4),
-        Some(FormatId(FIRST_CUSTOM_FORMAT_ID)),
+        Some(FormatId::legacy_from_u32(FIRST_CUSTOM_FORMAT_ID)),
         "format overlay on formula+blank cell must round-trip via inject_style_only_cell"
     );
 
@@ -1020,8 +1020,13 @@ fn w5_d_15_2_cross_sheet_roster_byte_deterministic() {
     let fmt_a = wb.formats_mut().intern("0.00");
     let fmt_b = wb.formats_mut().intern("yyyy-mm-dd");
     let fmt_c = wb.formats_mut().intern("0.0000");
-    assert!(fmt_b.0 > fmt_a.0);
-    assert!(fmt_c.0 > fmt_b.0);
+    // Step 3: ordering check via legacy u32 round-trip (test pre-step-6
+    // sees only LEGACY_PEER customs, so to_legacy_u32 succeeds).
+    let fmt_a_n = fmt_a.to_legacy_u32().unwrap();
+    let fmt_b_n = fmt_b.to_legacy_u32().unwrap();
+    let fmt_c_n = fmt_c.to_legacy_u32().unwrap();
+    assert!(fmt_b_n > fmt_a_n);
+    assert!(fmt_c_n > fmt_b_n);
 
     // Sheet 0 contributes formats in c, b order (greater FormatIds first).
     wb.put_at(s0, 0, 0, ql_types::Value::Number(1.0));
@@ -1080,13 +1085,13 @@ fn w5_d_15_2_cross_sheet_roster_byte_deterministic() {
     let cellxfs_start = styles.find("<cellXfs").unwrap();
     let cellxfs_block = &styles[cellxfs_start..styles.find("</cellXfs>").unwrap()];
     let pos_a = cellxfs_block
-        .find(&format!(r#"numFmtId="{}""#, fmt_a.0))
+        .find(&format!(r#"numFmtId="{}""#, fmt_a_n))
         .expect("fmt_a missing from cellXfs");
     let pos_b = cellxfs_block
-        .find(&format!(r#"numFmtId="{}""#, fmt_b.0))
+        .find(&format!(r#"numFmtId="{}""#, fmt_b_n))
         .expect("fmt_b missing from cellXfs");
     let pos_c = cellxfs_block
-        .find(&format!(r#"numFmtId="{}""#, fmt_c.0))
+        .find(&format!(r#"numFmtId="{}""#, fmt_c_n))
         .expect("fmt_c missing from cellXfs");
     assert!(
         pos_a < pos_b && pos_b < pos_c,
@@ -1601,7 +1606,7 @@ fn w5_d_15_2_blank_cell_with_format_overlay_round_trips() {
     let mut wb = Workbook::new();
     let s = wb.add_sheet("Sheet1");
     let custom = wb.formats_mut().intern("yyyy-mm-dd");
-    assert!(custom.0 >= FIRST_CUSTOM_FORMAT_ID);
+    assert!(custom.is_custom());
     // Apply overlay to (5, 2) WITHOUT putting any value there.
     wb.sheet_mut(s)
         .unwrap()
@@ -1625,7 +1630,7 @@ fn w5_d_15_2_blank_cell_with_format_overlay_round_trips() {
     let overlay = result.workbook.sheet(0).unwrap().format_overlay();
     assert_eq!(
         overlay.get(5, 2),
-        Some(FormatId(FIRST_CUSTOM_FORMAT_ID)),
+        Some(FormatId::legacy_from_u32(FIRST_CUSTOM_FORMAT_ID)),
         "blank cell with format overlay must survive round-trip"
     );
 
@@ -1648,7 +1653,7 @@ fn w5_d_15_1_empty_sheet_before_styled_sheet_preserves_alignment() {
     let _empty = wb.add_sheet("Empty");
     let styled = wb.add_sheet("Styled");
     let custom = wb.formats_mut().intern("0.0000");
-    assert!(custom.0 >= FIRST_CUSTOM_FORMAT_ID);
+    assert!(custom.is_custom());
     wb.put_at(styled, 0, 0, Value::Number(42.0));
     wb.sheet_mut(styled)
         .unwrap()
@@ -1683,7 +1688,7 @@ fn w5_d_15_1_empty_sheet_before_styled_sheet_preserves_alignment() {
     // Styled sheet should have the overlay at (0, 0).
     assert_eq!(
         result.workbook.sheet(1).unwrap().format_overlay().get(0, 0),
-        Some(FormatId(FIRST_CUSTOM_FORMAT_ID)),
+        Some(FormatId::legacy_from_u32(FIRST_CUSTOM_FORMAT_ID)),
         "styled sheet at index 1 must have overlay preserved"
     );
 

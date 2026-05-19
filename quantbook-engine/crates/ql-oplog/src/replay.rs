@@ -245,22 +245,27 @@ pub enum ReplayError {
 /// Wrapper around `ql_storage::FormatTableError` that owns its strings,
 /// so `ReplayError` can stay `Clone + std::error::Error` without
 /// borrowing into the table.
+///
+/// Phase 5.2 D-1 step 3: `id` / `existing_id` / `attempted_id` are now
+/// `ql_storage::FormatId` (tagged tuple) rather than the pre-step-3
+/// `u32`. Display formatting uses the FormatId's `Debug` impl so error
+/// messages identify both built-in and peer-allocated custom variants.
 #[derive(Clone, Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum FormatRejectedSource {
-    #[error("format id {id} already bound to {existing:?}, can't re-bind to {attempted:?}")]
+    #[error("format id {id:?} already bound to {existing:?}, can't re-bind to {attempted:?}")]
     IdCollision {
-        id: u32,
+        id: ql_storage::FormatId,
         existing: String,
         attempted: String,
     },
     #[error(
-        "format string {string:?} already at id {existing_id}, can't bind to id {attempted_id}"
+        "format string {string:?} already at id {existing_id:?}, can't bind to id {attempted_id:?}"
     )]
     StringCollision {
         string: String,
-        existing_id: u32,
-        attempted_id: u32,
+        existing_id: ql_storage::FormatId,
+        attempted_id: ql_storage::FormatId,
     },
 }
 
@@ -272,7 +277,7 @@ impl From<ql_storage::FormatTableError> for FormatRejectedSource {
                 existing,
                 attempted,
             } => FormatRejectedSource::IdCollision {
-                id: id.0,
+                id,
                 existing,
                 attempted,
             },
@@ -282,8 +287,8 @@ impl From<ql_storage::FormatTableError> for FormatRejectedSource {
                 attempted_id,
             } => FormatRejectedSource::StringCollision {
                 string,
-                existing_id: existing_id.0,
-                attempted_id: attempted_id.0,
+                existing_id,
+                attempted_id,
             },
             _ => unreachable!(
                 "FormatTableError gained a variant — extend FormatRejectedSource::From"
@@ -499,7 +504,13 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             // collisions surface as `FormatRejected` (rather than the
             // panic-on-duplicate behavior `intern` would have via the
             // by_string fast path; `register_at` is the explicit-id form).
-            let fid = ql_storage::FormatId(*id);
+            //
+            // Phase 5.2 D-1 step 3: `Op::RegisterFormat.id` is still a
+            // bare `u32` (step 4 will change to `FormatIdWire`); convert
+            // through the legacy migration helper. Pre-step-4 callers
+            // ALL went through the LEGACY_PEER path so this conversion
+            // is lossless for existing saved data.
+            let fid = ql_storage::FormatId::legacy_from_u32(*id);
             workbook
                 .formats_mut()
                 .register_at(fid, string.as_str())
@@ -520,7 +531,9 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             // producer bugs where `SetCellFormat` was emitted without
             // a preceding `RegisterFormat`. `None` means clear.
             if let Some(raw_id) = id {
-                let fid = ql_storage::FormatId(*raw_id);
+                // Phase 5.2 D-1 step 3: same legacy conversion as
+                // RegisterFormat above. Step 4 changes Op shape.
+                let fid = ql_storage::FormatId::legacy_from_u32(*raw_id);
                 if workbook.formats().lookup(fid).is_none() {
                     return Err(ReplayError::FormatNotRegistered { index, id: *raw_id });
                 }
@@ -1352,7 +1365,10 @@ mod tests {
         let reg = default_registry();
         replay_into(&log, &mut wb, &reg).unwrap();
         assert_eq!(
-            wb.formats().lookup(ql_storage::FormatId(200)),
+            // Step 3: replayed Op::RegisterFormat with id=200 routes
+            // through legacy_from_u32 → Custom(LEGACY_PEER, 200-164=36).
+            wb.formats()
+                .lookup(ql_storage::FormatId::legacy_from_u32(200)),
             Some("\"€\" #,##0.00")
         );
     }
@@ -1372,7 +1388,8 @@ mod tests {
         let reg = default_registry();
         replay_into(&log, &mut wb, &reg).unwrap();
         assert_eq!(
-            wb.formats().lookup(ql_storage::FormatId(0)),
+            // Step 3: id=0 → Builtin(0) via legacy_from_u32.
+            wb.formats().lookup(ql_storage::FormatId::Builtin(0)),
             Some("General")
         );
     }
@@ -1395,7 +1412,10 @@ mod tests {
                 assert_eq!(index, 0);
                 assert!(matches!(
                     source,
-                    FormatRejectedSource::IdCollision { id: 0, .. }
+                    FormatRejectedSource::IdCollision {
+                        id: ql_storage::FormatId::Builtin(0),
+                        ..
+                    }
                 ));
             }
             other => panic!("expected FormatRejected, got {other:?}"),
@@ -1423,7 +1443,8 @@ mod tests {
         replay_into(&log, &mut wb, &reg).unwrap();
         assert_eq!(
             wb.sheet(0).unwrap().format_overlay().get(3, 5),
-            Some(ql_storage::FormatId(200))
+            // Step 3: Op id=200 → Custom(LEGACY_PEER, 36) via legacy_from_u32.
+            Some(ql_storage::FormatId::legacy_from_u32(200))
         );
     }
 
@@ -1518,7 +1539,7 @@ mod tests {
         replay_into(&log, &mut wb, &reg).unwrap();
         assert_eq!(
             wb.sheet(0).unwrap().format_overlay().get(0, 0),
-            Some(ql_storage::FormatId(14))
+            Some(ql_storage::FormatId::Builtin(14))
         );
     }
 

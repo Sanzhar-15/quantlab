@@ -405,7 +405,8 @@ fn format_persistence_round_trip_through_qbook() {
         let mut rt = WorkbookRuntime::new(&mut producer_wb, &reg);
         // Number value with built-in date format.
         rt.set_value(0, 0, 0, Value::Number(45477.0)).unwrap(); // 2024-07-04
-        rt.set_cell_format(0, 0, 0, Some(FormatId(14))).unwrap();
+        rt.set_cell_format(0, 0, 0, Some(FormatId::Builtin(14)))
+            .unwrap();
         // Number value with custom format.
         rt.set_value(0, 1, 0, Value::Number(1234.5)).unwrap();
         custom_id = rt.intern_format("#,##0.00").unwrap();
@@ -441,7 +442,7 @@ fn format_persistence_round_trip_through_qbook() {
     // Per-sheet overlay: bindings survived.
     assert_eq!(
         loaded_wb.sheet(0).unwrap().format_overlay().get(0, 0),
-        Some(FormatId(14)),
+        Some(FormatId::Builtin(14)),
         "built-in id 14 binding must survive round-trip"
     );
     assert_eq!(
