@@ -130,45 +130,9 @@ mod tests {
         wb
     }
 
-    // ===== Phase 2B.7 — audit closure: clear_formula validation =====
-    // (`add_sheet_rejects_zero_chunk_rows` moved to sheets.rs::tests per
-    // D1.a re-partitioning; clear_formula_rejects_* will move to
-    // cells.rs::tests in a future D1.a closure.)
-
-    /// Phase 2B.7 audit (correctness L4): `clear_formula` propagates
-    /// `RuntimeError::InvalidSheet` / `InvalidCell` from `validate_cell`.
-    #[test]
-    fn clear_formula_rejects_invalid_sheet() {
-        let mut wb = make_runtime_workbook(); // 1 sheet
-        let reg = default_registry();
-        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-        let result = rt.clear_formula(99, 0, 0);
-        assert!(
-            matches!(
-                result,
-                Err(RuntimeError::InvalidSheet {
-                    sheet: 99,
-                    sheet_count: 1
-                })
-            ),
-            "expected InvalidSheet, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn clear_formula_rejects_invalid_cell() {
-        let mut wb = make_runtime_workbook();
-        let reg = default_registry();
-        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-        let result = rt.clear_formula(0, 1_048_576, 0);
-        assert!(
-            matches!(
-                result,
-                Err(RuntimeError::InvalidCell { row: 1_048_576, .. })
-            ),
-            "expected InvalidCell, got {result:?}"
-        );
-    }
+    // (`add_sheet_rejects_zero_chunk_rows` moved to `sheets.rs::tests`;
+    // `clear_formula_rejects_*` moved to `cells.rs::tests` per Tier D1
+    // audit Codex L-2/L-3 D1.a re-partitioning.)
 
     /// Phase 2B.7 (closes GAP-I-04): `validate_formula` runs the full
     /// pipeline but doesn't mutate the workbook or the op log. The IDE

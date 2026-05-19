@@ -1275,6 +1275,46 @@ mod tests {
         assert!(wb.formula_at(0, 0, 0).is_none());
     }
 
+    /// Phase 2B.7 audit (correctness L4): `clear_formula` propagates
+    /// `RuntimeError::InvalidSheet` / `InvalidCell` from `validate_cell`.
+    ///
+    /// Phase 5 V1 D1.a re-partitioning: moved from
+    /// `validate.rs::tests` to its natural owning submodule
+    /// `cells.rs::tests` (clear_formula lives in cells.rs).
+    #[test]
+    fn clear_formula_rejects_invalid_sheet() {
+        let mut wb = make_runtime_workbook(); // 1 sheet
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let result = rt.clear_formula(99, 0, 0);
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::InvalidSheet {
+                    sheet: 99,
+                    sheet_count: 1
+                })
+            ),
+            "expected InvalidSheet, got {result:?}"
+        );
+    }
+
+    /// D1.a moved from validate.rs::tests (see partner test above).
+    #[test]
+    fn clear_formula_rejects_invalid_cell() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let result = rt.clear_formula(0, 1_048_576, 0);
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::InvalidCell { row: 1_048_576, .. })
+            ),
+            "expected InvalidCell, got {result:?}"
+        );
+    }
+
     /// Phase 2A.6 audit H1/L4 (2026-05-12): invalid sheet ids surface as
     /// `RuntimeError::InvalidSheet` instead of panicking inside `Workbook::put_at`.
     #[test]
