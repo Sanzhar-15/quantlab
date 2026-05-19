@@ -125,6 +125,36 @@ impl OpLog {
         self.cached_len == 0
     }
 
+    /// **Phase 5.2.b (2026-05-19):** set this log's Loro peer id.
+    ///
+    /// Wraps `LoroDoc::set_peer_id`. Used by `ql_collab::CollabSession`
+    /// to wire its stable `PeerId` through to Loro so concurrent
+    /// appends carry the right origin in the CRDT merge metadata.
+    ///
+    /// Loro takes `&self` (interior mutability), so this method is
+    /// `&self` too. Idempotent — calling it twice with the same id
+    /// is a no-op.
+    ///
+    /// **Caller pitfalls** (from `loro::LoroDoc::set_peer_id`):
+    /// 1. NEVER reuse the same peer id across concurrent writers
+    ///    (multiple tabs / devices for the same user). Duplicate peer
+    ///    ids corrupt the document via conflicting OpIDs.
+    /// 2. Avoid pinning a peer id to a stable user/device identity
+    ///    unless you also enforce single-ownership locking. Prefer a
+    ///    per-process-random peer id.
+    /// 3. Setting peer id AFTER an import is safe — existing imported
+    ///    ops retain their original peer ids; only this log's future
+    ///    appends use the new id.
+    pub fn set_peer_id(&self, peer: u64) -> Result<(), OpLogError> {
+        self.doc.set_peer_id(peer)?;
+        Ok(())
+    }
+
+    /// Current Loro peer id for this log. Wraps `LoroDoc::peer_id`.
+    pub fn peer_id(&self) -> u64 {
+        self.doc.peer_id()
+    }
+
     /// Export the log to a binary blob suitable for on-disk persistence.
     /// Uses Loro's `ExportMode::Snapshot` — includes full state + history,
     /// compressed.
@@ -292,5 +322,26 @@ mod tests {
             matches!(result, Err(OpLogError::Loro(_))),
             "expected Loro error for garbage bytes, got {result:?}"
         );
+    }
+
+    #[test]
+    fn set_peer_id_changes_doc_peer_id() {
+        let log = OpLog::new();
+        let before = log.peer_id();
+        log.set_peer_id(0xdead_beef_cafe_babe).unwrap();
+        assert_eq!(log.peer_id(), 0xdead_beef_cafe_babe);
+        assert_ne!(log.peer_id(), before, "set_peer_id must replace default");
+    }
+
+    #[test]
+    fn set_peer_id_after_import_works() {
+        // Origin writes ops under peer 11.
+        let origin = OpLog::new();
+        origin.set_peer_id(11).unwrap();
+        let bytes = origin.export_bytes().unwrap();
+        // Reborn imports + reassigns peer id; future appends use 22.
+        let reborn = OpLog::import_bytes(&bytes).unwrap();
+        reborn.set_peer_id(22).unwrap();
+        assert_eq!(reborn.peer_id(), 22);
     }
 }

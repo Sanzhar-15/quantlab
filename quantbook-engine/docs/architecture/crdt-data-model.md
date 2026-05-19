@@ -395,16 +395,14 @@ HIGH-3 (`ql-oplog → ql-io` cleanup, Tier D2 in v2 backlog) closed
 this session at commit `e15e8908742`. `ql-oplog` is the dependency
 floor.
 
-**Known scaffold limitation (Phase 5.2.a, deferred to Phase 5.5):**
-`CollabSession` stores `PeerId` but does NOT yet pass it to
-`LoroDoc::set_peer_id`. The op log writes ops under Loro's default
-random per-doc peer id. Multi-peer convergence still works for the
-shipped 2-peer probe test (Phase 5.2 D-4 at `2f217a2067a`) because
-each peer gets a distinct random Loro peer id at session-create.
-Phase 5.5 (Transport layer) adds the stable-peer-id wiring as part
-of the connect handshake. Until then, the `PeerId` newtype is a
-*label* (used in presence and FormatId D-1), not a Loro merge-rule
-input.
+**Peer-id wiring (Phase 5.2.b 2026-05-19, ✅ closed):** the
+scaffold's known limitation — `PeerId` stored as a label only — was
+closed by adding `OpLog::set_peer_id` and calling it from
+`CollabSession::new` + `CollabSession::from_snapshot`. The configured
+`PeerId` now propagates to `LoroDoc::set_peer_id`, so Loro's CRDT
+merge metadata attributes each session's appends correctly. Caller
+pitfall (from Loro docs): concurrent sessions MUST use distinct peer
+ids — duplicate ids corrupt the document via conflicting OpIDs.
 
 ## Decision matrix summary
 

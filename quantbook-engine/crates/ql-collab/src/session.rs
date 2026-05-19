@@ -15,13 +15,18 @@
 //! - **Phase 5.7** — IDE binding: `CollabSession` becomes the engine
 //!   handle that the IDE attaches to each open workbook.
 //!
-//! What ships in 5.2.a:
+//! What ships in 5.2.a (5.2.b update 2026-05-19):
 //!
 //! - `CollabSession::new(peer_id)` — fresh session with an empty
-//!   `OpLog` and the peer-id stamp.
+//!   `OpLog` and the peer-id wired through to
+//!   `LoroDoc::set_peer_id` (Phase 5.2.b — was a label-only stamp
+//!   in 5.2.a). Returns `Result` because Loro's `set_peer_id` is
+//!   fallible.
 //! - `CollabSession::from_snapshot(peer_id, bytes)` — fork from a
 //!   shared base snapshot (used by both peers in the D-4 probe
-//!   pattern).
+//!   pattern). The reborn session's peer id is `peer_id`; existing
+//!   ops in the imported snapshot retain their original
+//!   attribution.
 //! - `append_op(&mut self, Op)` — local append; delegates to
 //!   `OpLog::append`.
 //! - `merge_bytes(&mut self, &[u8])` — pull a remote peer's
@@ -69,13 +74,17 @@ impl CollabSession {
     /// Construct a fresh session with an empty op log.
     ///
     /// Use this when no shared base snapshot exists yet (the first
-    /// peer to open a brand-new workbook). Phase 5.2.b will document
-    /// the policy for peer-id assignment; for now the caller picks.
-    pub fn new(peer_id: PeerId) -> Self {
-        Self {
-            peer_id,
-            log: OpLog::new(),
-        }
+    /// peer to open a brand-new workbook). The `peer_id` is wired
+    /// through to the underlying `LoroDoc::set_peer_id` so Loro's
+    /// CRDT merge metadata attributes this session's appends to
+    /// `peer_id` (not Loro's default random per-doc id).
+    ///
+    /// **Caller pitfall:** two concurrent sessions MUST use distinct
+    /// peer ids — see `OpLog::set_peer_id` for details.
+    pub fn new(peer_id: PeerId) -> Result<Self, CollabSessionError> {
+        let log = OpLog::new();
+        log.set_peer_id(peer_id.as_u64())?;
+        Ok(Self { peer_id, log })
     }
 
     /// Construct a session by importing a shared snapshot. Use this
@@ -84,12 +93,13 @@ impl CollabSession {
     ///
     /// `bytes` is a `LoroDoc::export(ExportMode::Snapshot)` produced
     /// by an earlier `CollabSession::export_bytes` call (typically
-    /// from the workbook owner / first peer).
+    /// from the workbook owner / first peer). After import, this
+    /// session's peer id is set to `peer_id` — distinct from the
+    /// peer ids carried by the already-imported ops.
     pub fn from_snapshot(peer_id: PeerId, bytes: &[u8]) -> Result<Self, CollabSessionError> {
-        Ok(Self {
-            peer_id,
-            log: OpLog::import_bytes(bytes)?,
-        })
+        let log = OpLog::import_bytes(bytes)?;
+        log.set_peer_id(peer_id.as_u64())?;
+        Ok(Self { peer_id, log })
     }
 
     /// Stable peer id assigned at session creation.
@@ -169,7 +179,7 @@ mod tests {
 
     #[test]
     fn new_session_is_empty() {
-        let s = CollabSession::new(PeerId::new(1));
+        let s = CollabSession::new(PeerId::new(1)).unwrap();
         assert_eq!(s.peer_id(), PeerId::new(1));
         assert_eq!(s.op_count(), 0);
         assert!(s.is_empty());
@@ -177,7 +187,7 @@ mod tests {
 
     #[test]
     fn append_grows_log() {
-        let mut s = CollabSession::new(PeerId::new(1));
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
         s.append_op(Op::AddSheet {
             name: "S".to_owned(),
             chunk_rows: 16384,
@@ -190,7 +200,7 @@ mod tests {
 
     #[test]
     fn from_snapshot_reconstructs_op_count() {
-        let mut origin = CollabSession::new(PeerId::new(1));
+        let mut origin = CollabSession::new(PeerId::new(1)).unwrap();
         origin
             .append_op(Op::AddSheet {
                 name: "S".to_owned(),
@@ -208,7 +218,7 @@ mod tests {
     #[test]
     fn merge_bytes_grows_log_with_remote_ops() {
         // Two peers, shared base, each appends; one merges the other.
-        let mut base = CollabSession::new(PeerId::new(0));
+        let mut base = CollabSession::new(PeerId::new(100)).unwrap();
         base.append_op(Op::AddSheet {
             name: "S".to_owned(),
             chunk_rows: 16384,
@@ -233,10 +243,35 @@ mod tests {
 
     #[test]
     fn debug_impl_includes_peer_id_and_count() {
-        let mut s = CollabSession::new(PeerId::new(42));
+        let mut s = CollabSession::new(PeerId::new(42)).unwrap();
         s.append_op(put_value(0, 0, 0, 1.0)).ok();
         let d = format!("{s:?}");
         assert!(d.contains("peer_id"), "Debug must include peer_id: {d}");
         assert!(d.contains("op_count"), "Debug must include op_count: {d}");
+    }
+
+    #[test]
+    fn peer_id_is_wired_to_underlying_loro_doc() {
+        // Regression: prior to Phase 5.2.b the PeerId was stored on
+        // CollabSession but never passed to LoroDoc::set_peer_id, so
+        // op attribution at the CRDT layer used Loro's random
+        // per-doc peer id. After 5.2.b the configured PeerId MUST
+        // appear as the underlying log's peer_id().
+        let s = CollabSession::new(PeerId::new(0xdead_beef_cafe_babe)).unwrap();
+        assert_eq!(s.peer_id().as_u64(), 0xdead_beef_cafe_babe);
+        assert_eq!(s.op_log().peer_id(), 0xdead_beef_cafe_babe);
+    }
+
+    #[test]
+    fn from_snapshot_overrides_imported_peer_id() {
+        // The origin session writes ops under PeerId(11). The reborn
+        // session imports the snapshot but uses its own PeerId(22)
+        // for future appends — the imported ops keep their original
+        // attribution (Loro semantics), but log.peer_id() reflects
+        // the reborn's configured PeerId.
+        let origin = CollabSession::new(PeerId::new(11)).unwrap();
+        let bytes = origin.export_bytes().unwrap();
+        let reborn = CollabSession::from_snapshot(PeerId::new(22), &bytes).unwrap();
+        assert_eq!(reborn.op_log().peer_id(), 22);
     }
 }

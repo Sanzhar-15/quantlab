@@ -135,12 +135,12 @@ Total Phase 5 effort estimate: **~7-12 weeks**.
    `#[non_exhaustive]` pass + deprecated removals + per-crate
    stability docs shipped at `40bb584a25b`. Phase 5 additions
    to `Op`, error types, etc. won't break 0.2.0 consumers.
-6. **`ql-collab` scaffold limitation (Phase 5.2.a)** — `PeerId`
-   is stored as a label but not yet passed to `LoroDoc::set_peer_id`.
-   Multi-peer convergence works (Loro per-doc-random ids are
-   distinct) but stable peer-id wiring is deferred to Phase 5.5
-   transport handshake. See `crates/ql-collab/src/peer.rs`
-   module docstring for full context.
+6. ~~**`ql-collab` scaffold limitation (Phase 5.2.a)**~~ — ✅ CLOSED
+   2026-05-19 at Phase 5.2.b. `OpLog::set_peer_id` added; called
+   from `CollabSession::new` + `from_snapshot`. PeerId now wired
+   through to Loro's merge metadata. Caller pitfall (concurrent
+   sessions MUST use distinct peer ids) documented in
+   `crates/ql-collab/src/peer.rs` + `crates/ql-oplog/src/log.rs`.
 
 ## Audit checkpoints
 
