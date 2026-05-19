@@ -243,9 +243,10 @@ clean Phase 5 work if not done first.
 - **Scope:** move 4 misplaced test clusters to their semantically
   correct owning-submodule:
   1. ✅ `add_sheet_rejects_zero_chunk_rows` in `validate.rs::tests`
-     → `sheets.rs::tests` (shipped 2026-05-19 in `d4b3cdb2dc2`+).
-  2. `clear_formula_rejects_invalid_*` tests in
-     `validate.rs::tests` → `cells.rs::tests`. **PENDING.**
+     → `sheets.rs::tests` (shipped 2026-05-19 in `06252f2b638`).
+  2. ✅ `clear_formula_rejects_invalid_*` tests in
+     `validate.rs::tests` → `cells.rs::tests` (shipped 2026-05-19
+     in `9b45ee656eb`).
   3. W5-147 `set_formula` canonicalization tests in
      `tables.rs::tests` → `cells.rs::tests`;
      `set_reference_mode_op_round_trips_through_replay` in
