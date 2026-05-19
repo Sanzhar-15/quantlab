@@ -374,4 +374,11 @@ mod tests {
         assert!(d.contains("inbox_len"), "Debug must include inbox_len: {d}");
         assert!(
             d.contains("outbox_len"),
-            "Debug must i
+            "Debug must include outbox_len: {d}"
+        );
+        assert!(
+            d.contains("closed: true"),
+            "Debug must include closed state: {d}"
+        );
+    }
+}

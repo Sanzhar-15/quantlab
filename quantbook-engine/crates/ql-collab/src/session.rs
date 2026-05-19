@@ -867,4 +867,7 @@ mod tests {
         let result = CollabSession::from_snapshot(PeerId::new(u64::MAX), &bytes);
         assert!(
             matches!(result, Err(CollabSessionError::OpLog(_))),
-     
+            "from_snapshot(u64::MAX) must fail; got {result:?}"
+        );
+    }
+}
