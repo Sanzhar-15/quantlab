@@ -258,11 +258,16 @@ V1 treats this as ACCEPTABLE because:
    (Loro doesn't expose this) or a load-time `presence_remove`
    sweep (forward work).
 
-V2 may add the eviction sweep (`docs/PHASE-4-V2-BACKLOG.md` or
-a 5.6 V2 plan, TBD). Until then, callers expecting "clean
-slate on reopen" must call `CollabSession::clear_presence`
-after `from_snapshot` and re-`update_presence` with current
-state.
+**V2 ✅ shipped 2026-05-19:** `CollabSession::sweep_presence()`
+clears all presence entries (own + remote) and returns the
+count. Caller-opt-in by design — sessions that WANT to see
+other peers' last-known positions (e.g. an IDE rejoining a
+live collab session) skip the sweep; sessions wanting a clean
+slate (cold restart of a `.qbook`) call sweep after
+`from_snapshot`.
+
+Earlier `clear_presence` (V1) remains for the "leave session"
+use case (removes only own peer's entry).
 
 ### Snapshot container: `"snapshot"` LoroMap (reserved, V2)
 

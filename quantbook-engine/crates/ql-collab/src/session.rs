@@ -18,9 +18,10 @@
 //!   typed methods; explicit-drive (caller invokes flush + poll
 //!   on a tick). V2 V2 / V3 pending — auto-flush + version-
 //!   vector deltas + WebSocket impl.
-//! - ~~**Phase 5.6**~~ ✅ V1 shipped at `c677e244704` — `presence`
-//!   module + 4 `CollabSession` methods (`update_presence` /
-//!   `peer_presence` / `clear_presence` / `peers_with_presence`).
+//! - ~~**Phase 5.6**~~ ✅ V1 + V2 shipped — V1 `c677e244704`:
+//!   `presence` module + 4 typed methods. V2: `sweep_presence`
+//!   (caller-opt-in clean-slate on rejoin; closes V1 known
+//!   persistence limitation).
 //! - **Phase 5.7** — IDE binding: `CollabSession` becomes the engine
 //!   handle that the IDE attaches to each open workbook.
 //!
@@ -562,6 +563,34 @@ impl CollabSession {
     pub fn start_undo_group_scoped(&mut self) -> Result<UndoGroupGuard<'_>, CollabSessionError> {
         self.start_undo_group()?;
         Ok(UndoGroupGuard { session: self })
+    }
+
+    /// **Phase 5.6 V2 (2026-05-19):** clear ALL presence entries
+    /// from the shared `"presence"` LoroMap. Returns the number
+    /// of entries removed.
+    ///
+    /// Use after [`from_snapshot`] when the caller wants a clean
+    /// slate — without this call, presence entries persist across
+    /// `.qbook` save/load (V1 known limitation: presence lives in
+    /// the same `LoroDoc` that gets exported into `oplog.bin`).
+    ///
+    /// Typical pattern for "rejoin with clean presence":
+    /// ```ignore
+    /// let mut s = CollabSession::from_snapshot(peer_id, bytes)?;
+    /// s.sweep_presence()?;
+    /// // Presence is empty; first update_presence sets self fresh.
+    /// ```
+    ///
+    /// Caller-opt-in by design: a session that WANTS to see other
+    /// peers' last-known positions (e.g. an IDE rejoining a live
+    /// collab session) skips the sweep.
+    pub fn sweep_presence(&mut self) -> Result<usize, CollabSessionError> {
+        let keys = self.log.presence_peers();
+        let count = keys.len();
+        for key in keys {
+            self.log.presence_remove(&key)?;
+        }
+        Ok(count)
     }
 
     /// **Phase 5.6 V1 (2026-05-19):** list every peer with a
@@ -1636,6 +1665,71 @@ mod tests {
         assert!(
             d.contains("redo_count"),
             "Debug must include redo_count: {d}"
+        );
+    }
+
+    #[test]
+    fn sweep_presence_clears_all_entries_and_returns_count() {
+        // Phase 5.6 V2: sweep_presence removes ALL presence
+        // entries (including own + remote peers) and returns the
+        // count cleared. Closes the V1 "stale presence after
+        // .qbook reload" known limitation as a caller-opt-in.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.update_presence(PresenceState::at_cell(0, 0, 0)).unwrap();
+        // Simulate a remote peer's presence via the lower-level
+        // OpLog write (we don't have a multi-peer setup in this
+        // test).
+        s.log
+            .presence_set("0000000000000002", r#"{"sheet":1,"row":2,"col":3,"selection_end_row":2,"selection_end_col":3,"typing":false}"#)
+            .unwrap();
+        assert_eq!(s.peers_with_presence().unwrap().len(), 2);
+
+        let cleared = s.sweep_presence().unwrap();
+        assert_eq!(cleared, 2, "sweep returns count of removed entries");
+        assert!(s.peers_with_presence().unwrap().is_empty());
+        assert_eq!(s.peer_presence(PeerId::new(1)).unwrap(), None);
+        assert_eq!(s.peer_presence(PeerId::new(2)).unwrap(), None);
+
+        // Subsequent update_presence works (sweep didn't corrupt
+        // the LoroMap).
+        s.update_presence(PresenceState::at_cell(2, 5, 5)).unwrap();
+        assert_eq!(s.peers_with_presence().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sweep_presence_on_empty_map_returns_zero() {
+        // Edge case: sweep on a session with no presence entries
+        // returns Ok(0), not an error.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        let cleared = s.sweep_presence().unwrap();
+        assert_eq!(cleared, 0);
+        // Sweep is idempotent — second call also returns 0.
+        let cleared2 = s.sweep_presence().unwrap();
+        assert_eq!(cleared2, 0);
+    }
+
+    #[test]
+    fn sweep_presence_after_from_snapshot_gives_clean_slate() {
+        // Acceptance: documented rejoin pattern. Origin writes
+        // presence + exports. Reborn imports + sweeps → empty.
+        let mut origin = CollabSession::new(PeerId::new(0xa)).unwrap();
+        origin
+            .update_presence(PresenceState::at_cell(0, 3, 4))
+            .unwrap();
+        let bytes = origin.export_bytes().unwrap();
+
+        let mut reborn = CollabSession::from_snapshot(PeerId::new(0xa), &bytes).unwrap();
+        // Without sweep: reborn sees origin's stale entry.
+        assert_eq!(
+            reborn.peers_with_presence().unwrap().len(),
+            1,
+            "without sweep, reborn inherits origin's presence"
+        );
+        // With sweep: clean slate.
+        reborn.sweep_presence().unwrap();
+        assert!(
+            reborn.peers_with_presence().unwrap().is_empty(),
+            "after sweep, reborn has no presence entries"
         );
     }
 
