@@ -20,3 +20,7 @@ ql-oplog     = { path = "../ql-oplog" }
 ql-storage   = { path = "../ql-storage" }
 ql-functions = { path = "../ql-functions" }
 thiserror    = { workspace = true }
+# Phase 5.6 (2026-05-19) — presence state serde + JSON encoding for
+# Loro's `presence` LoroMap (per-peer ephemeral cursor / selection).
+serde        = { workspace = true }
+serde_json   = { workspace = true }

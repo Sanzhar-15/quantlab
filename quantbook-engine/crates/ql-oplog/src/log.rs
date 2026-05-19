@@ -33,6 +33,14 @@ use crate::op::Op;
 /// etc.) but `"ops"` is reserved.
 const OPS_CONTAINER: &str = "ops";
 
+/// **Phase 5.6 (2026-05-19):** Loro container name for the per-peer
+/// ephemeral presence map (cursor + selection + typing indicator).
+/// Per the audit-closed Phase 5.1 design at
+/// `docs/architecture/crdt-data-model.md` § Presence container.
+/// Keys are peer-id strings; values are opaque JSON blobs (the
+/// typed `PresenceState` encoding lives in `ql_collab::presence`).
+const PRESENCE_CONTAINER: &str = "presence";
+
 /// Append-only operation log backed by Loro.
 ///
 /// Construct via `OpLog::new()` for a fresh log or `OpLog::import_bytes(...)`
@@ -158,6 +166,79 @@ impl OpLog {
     /// Current Loro peer id for this log. Wraps `LoroDoc::peer_id`.
     pub fn peer_id(&self) -> u64 {
         self.doc.peer_id()
+    }
+
+    /// **Phase 5.6 (2026-05-19):** write the given peer's presence blob
+    /// into the `"presence"` LoroMap.
+    ///
+    /// `peer_key` is a string identifier (typically the 16-hex form of
+    /// `ql_collab::PeerId::Display`); `json` is an opaque blob — the
+    /// typed `PresenceState` encoding lives in `ql_collab::presence`.
+    /// This layer doesn't interpret the bytes.
+    ///
+    /// LWW semantics per peer: a later `presence_set` for the same
+    /// `peer_key` from any peer (including the same peer in a different
+    /// session) replaces the previous value at merge time. Concurrent
+    /// `presence_set` calls for DIFFERENT `peer_key`s are independent
+    /// and both survive merge.
+    ///
+    /// Triggers `doc.commit()` so the write is durable through
+    /// `export_bytes` / `merge_bytes` immediately.
+    pub fn presence_set(&mut self, peer_key: &str, json: &str) -> Result<(), OpLogError> {
+        let map = self.doc.get_map(PRESENCE_CONTAINER);
+        map.insert(peer_key, LoroValue::from(json))?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// **Phase 5.6 (2026-05-19):** read the given peer's presence blob.
+    /// Returns `None` if the peer has no presence entry.
+    ///
+    /// Surfaces `OpLogError::SchemaMismatch` if the `"presence"` map
+    /// holds a non-string or container value at `peer_key` (only
+    /// reachable if a future writer puts wrong-shape data into the
+    /// container; current API only writes strings).
+    pub fn presence_get(&self, peer_key: &str) -> Result<Option<String>, OpLogError> {
+        let map = self.doc.get_map(PRESENCE_CONTAINER);
+        let Some(entry) = map.get(peer_key) else {
+            return Ok(None);
+        };
+        let value = match entry {
+            ValueOrContainer::Value(v) => v,
+            ValueOrContainer::Container(_) => {
+                return Err(OpLogError::SchemaMismatch(
+                    "presence LoroMap holds a container value; expected JSON string",
+                ));
+            }
+        };
+        match value {
+            LoroValue::String(s) => Ok(Some(s.to_string())),
+            _ => Err(OpLogError::SchemaMismatch(
+                "presence LoroMap holds a non-string LoroValue; expected JSON string",
+            )),
+        }
+    }
+
+    /// **Phase 5.6 (2026-05-19):** remove the given peer's presence
+    /// entry. Idempotent — deleting a non-existent key is a no-op
+    /// (Loro returns Ok). Triggers `doc.commit()`.
+    pub fn presence_remove(&mut self, peer_key: &str) -> Result<(), OpLogError> {
+        let map = self.doc.get_map(PRESENCE_CONTAINER);
+        map.delete(peer_key)?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// **Phase 5.6 (2026-05-19):** list the peer keys currently
+    /// represented in the `"presence"` map.
+    ///
+    /// Order is Loro's iteration order (not stable across versions).
+    /// Callers wanting deterministic order should sort the result.
+    pub fn presence_peers(&self) -> Vec<String> {
+        let map = self.doc.get_map(PRESENCE_CONTAINER);
+        let mut out = Vec::with_capacity(map.len());
+        map.for_each(|key, _| out.push(key.to_owned()));
+        out
     }
 
     /// Export the log to a binary blob suitable for on-disk persistence.
@@ -362,6 +443,66 @@ mod tests {
         reborn.append(put_value(0, 1, 0, 2.0)).unwrap();
         assert_eq!(reborn.len(), 2);
         assert_eq!(reborn.peer_id(), 22);
+    }
+
+    #[test]
+    fn presence_set_get_round_trip() {
+        let mut log = OpLog::new();
+        // Initially empty.
+        assert!(log.presence_get("peer-a").unwrap().is_none());
+        assert!(log.presence_peers().is_empty());
+
+        // Write.
+        log.presence_set("peer-a", r#"{"sheet":0,"row":1,"col":2}"#)
+            .unwrap();
+        let read = log.presence_get("peer-a").unwrap().unwrap();
+        assert_eq!(read, r#"{"sheet":0,"row":1,"col":2}"#);
+        assert_eq!(log.presence_peers(), vec!["peer-a".to_owned()]);
+
+        // Overwrite (LWW).
+        log.presence_set("peer-a", r#"{"sheet":1,"row":0,"col":0}"#)
+            .unwrap();
+        assert_eq!(
+            log.presence_get("peer-a").unwrap().unwrap(),
+            r#"{"sheet":1,"row":0,"col":0}"#
+        );
+
+        // Independent key.
+        log.presence_set("peer-b", "{}").unwrap();
+        let mut peers = log.presence_peers();
+        peers.sort();
+        assert_eq!(peers, vec!["peer-a".to_owned(), "peer-b".to_owned()]);
+
+        // Remove.
+        log.presence_remove("peer-a").unwrap();
+        assert!(log.presence_get("peer-a").unwrap().is_none());
+        assert_eq!(log.presence_peers(), vec!["peer-b".to_owned()]);
+    }
+
+    #[test]
+    fn presence_survives_export_import_round_trip() {
+        let mut log = OpLog::new();
+        log.presence_set("peer-a", r#"{"sheet":0}"#).unwrap();
+        let bytes = log.export_bytes().unwrap();
+        let restored = OpLog::import_bytes(&bytes).unwrap();
+        assert_eq!(
+            restored.presence_get("peer-a").unwrap().unwrap(),
+            r#"{"sheet":0}"#
+        );
+    }
+
+    #[test]
+    fn presence_independent_from_op_log() {
+        // Presence writes MUST NOT increment the op log cached_len.
+        let mut log = OpLog::new();
+        log.presence_set("peer-a", "{}").unwrap();
+        assert_eq!(log.len(), 0, "presence is not in the 'ops' container");
+        assert!(log.is_empty());
+
+        // And vice-versa: appending an op MUST NOT touch presence.
+        log.append(put_value(0, 0, 0, 1.0)).unwrap();
+        assert_eq!(log.len(), 1);
+        assert!(log.presence_get("peer-a").unwrap().is_some());
     }
 
     #[test]

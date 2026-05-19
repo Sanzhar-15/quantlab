@@ -42,6 +42,7 @@ use thiserror::Error;
 use ql_oplog::{Op, OpLog, OpLogError};
 
 use crate::peer::PeerId;
+use crate::presence::{self, PresenceError, PresenceState};
 
 /// Errors emitted by `CollabSession` operations.
 #[derive(Debug, Error)]
@@ -51,6 +52,11 @@ pub enum CollabSessionError {
     /// etc.). Surfaces the wrapped `OpLogError` for diagnosis.
     #[error("op log error: {0}")]
     OpLog(#[from] OpLogError),
+
+    /// A presence-layer call failed (serde, peer-key parse,
+    /// underlying OpLog).
+    #[error("presence error: {0}")]
+    Presence(#[from] PresenceError),
 }
 
 /// Per-peer collaboration state holder.
@@ -164,6 +170,67 @@ impl CollabSession {
     /// True iff the log has no ops (session just opened, no edits yet).
     pub fn is_empty(&self) -> bool {
         self.log.is_empty()
+    }
+
+    /// **Phase 5.6 V1 (2026-05-19):** write this session's own
+    /// presence state into the shared `"presence"` LoroMap.
+    ///
+    /// Uses the session's `PeerId` as the map key (16-hex
+    /// `Display` form). Subsequent calls overwrite the previous
+    /// value (LWW per peer); merges with other peers'
+    /// presence writes preserve all distinct peers.
+    pub fn update_presence(&mut self, state: PresenceState) -> Result<(), CollabSessionError> {
+        let key = presence::peer_key(self.peer_id);
+        let json = serde_json::to_string(&state).map_err(PresenceError::Serialize)?;
+        self.log.presence_set(&key, &json)?;
+        Ok(())
+    }
+
+    /// **Phase 5.6 V1 (2026-05-19):** read a peer's most recent
+    /// presence state. Returns `Ok(None)` if the peer has never
+    /// updated its presence in this session (or has been removed
+    /// via `clear_presence`).
+    pub fn peer_presence(&self, peer: PeerId) -> Result<Option<PresenceState>, CollabSessionError> {
+        let key = presence::peer_key(peer);
+        let Some(json) = self.log.presence_get(&key)? else {
+            return Ok(None);
+        };
+        let state: PresenceState =
+            serde_json::from_str(&json).map_err(|source| PresenceError::Deserialize {
+                peer_key: key,
+                source,
+            })?;
+        Ok(Some(state))
+    }
+
+    /// **Phase 5.6 V1 (2026-05-19):** remove this session's own
+    /// presence entry from the shared map. Use this when the
+    /// peer leaves the session (window close, disconnect). After
+    /// removal, other peers' `peer_presence(self_id)` returns
+    /// `Ok(None)`.
+    pub fn clear_presence(&mut self) -> Result<(), CollabSessionError> {
+        let key = presence::peer_key(self.peer_id);
+        self.log.presence_remove(&key)?;
+        Ok(())
+    }
+
+    /// **Phase 5.6 V1 (2026-05-19):** list every peer with a
+    /// presence entry in the shared map.
+    ///
+    /// Order is Loro's iteration order. Sort the result if you
+    /// need determinism.
+    ///
+    /// Returns `Err(CollabSessionError::Presence(PresenceError::PeerKeyParse))`
+    /// if a key in the map can't be parsed as a `PeerId` (only
+    /// reachable if a future writer uses an incompatible
+    /// encoding).
+    pub fn peers_with_presence(&self) -> Result<Vec<PeerId>, CollabSessionError> {
+        let keys = self.log.presence_peers();
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            out.push(presence::parse_peer_key(&k)?);
+        }
+        Ok(out)
     }
 }
 
@@ -307,6 +374,90 @@ mod tests {
         reborn.append_op(put_value(0, 0, 0, 99.0)).unwrap();
         assert_eq!(reborn.op_count(), 2);
         assert_eq!(reborn.op_log().peer_id(), 22);
+    }
+
+    #[test]
+    fn presence_round_trip_within_one_session() {
+        let mut s = CollabSession::new(PeerId::new(7)).unwrap();
+        // No presence yet.
+        assert_eq!(s.peer_presence(PeerId::new(7)).unwrap(), None);
+        assert!(s.peers_with_presence().unwrap().is_empty());
+
+        // Set our own.
+        let state = PresenceState {
+            sheet: 1,
+            row: 10,
+            col: 5,
+            selection_end_row: 12,
+            selection_end_col: 7,
+            typing: true,
+        };
+        s.update_presence(state).unwrap();
+
+        let read = s.peer_presence(PeerId::new(7)).unwrap().unwrap();
+        assert_eq!(read, state);
+        let peers = s.peers_with_presence().unwrap();
+        assert_eq!(peers, vec![PeerId::new(7)]);
+
+        // Overwrite (LWW per key).
+        let state2 = PresenceState::at_cell(0, 0, 0);
+        s.update_presence(state2).unwrap();
+        let read2 = s.peer_presence(PeerId::new(7)).unwrap().unwrap();
+        assert_eq!(read2, state2);
+        assert_eq!(s.peers_with_presence().unwrap().len(), 1);
+
+        // Clear.
+        s.clear_presence().unwrap();
+        assert_eq!(s.peer_presence(PeerId::new(7)).unwrap(), None);
+        assert!(s.peers_with_presence().unwrap().is_empty());
+    }
+
+    #[test]
+    fn presence_two_peer_merge_preserves_both() {
+        // Both peers fork from the same empty base. Each writes
+        // its own presence; one merges the other's snapshot. After
+        // merge BOTH peers see BOTH presences (LoroMap LWW per key
+        // keeps distinct keys).
+        let base = CollabSession::new(PeerId::new(1)).unwrap();
+        let base_bytes = base.export_bytes().unwrap();
+
+        let mut peer_a = CollabSession::from_snapshot(PeerId::new(0x0a), &base_bytes).unwrap();
+        peer_a
+            .update_presence(PresenceState::at_cell(0, 3, 4))
+            .unwrap();
+
+        let mut peer_b = CollabSession::from_snapshot(PeerId::new(0x0b), &base_bytes).unwrap();
+        peer_b
+            .update_presence(PresenceState::at_cell(1, 100, 200))
+            .unwrap();
+
+        // Peer A merges peer B's snapshot.
+        let b_bytes = peer_b.export_bytes().unwrap();
+        peer_a.merge_bytes(&b_bytes).unwrap();
+
+        // Peer A now sees BOTH presences.
+        let a = peer_a.peer_presence(PeerId::new(0x0a)).unwrap().unwrap();
+        assert_eq!(a, PresenceState::at_cell(0, 3, 4));
+        let b = peer_a.peer_presence(PeerId::new(0x0b)).unwrap().unwrap();
+        assert_eq!(b, PresenceState::at_cell(1, 100, 200));
+
+        let mut peers = peer_a.peers_with_presence().unwrap();
+        peers.sort();
+        assert_eq!(peers, vec![PeerId::new(0x0a), PeerId::new(0x0b)]);
+    }
+
+    #[test]
+    fn presence_does_not_dirty_op_log() {
+        // Updating presence MUST NOT add ops to the op log
+        // (presence is a separate Loro container).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        let baseline_ops = s.op_count();
+        s.update_presence(PresenceState::at_cell(0, 0, 0)).unwrap();
+        assert_eq!(
+            s.op_count(),
+            baseline_ops,
+            "update_presence must not append to the op log"
+        );
     }
 
     #[test]
