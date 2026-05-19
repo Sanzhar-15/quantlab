@@ -142,6 +142,30 @@ impl OpLog {
         let cached_len = list.len();
         Ok(Self { doc, cached_len })
     }
+
+    /// **Phase 5.2 D-4 (2026-05-19):** merge another peer's snapshot
+    /// into this log via Loro's CRDT merge. Concurrent appends to
+    /// the `"ops"` LoroList are preserved in deterministic causal
+    /// order (Fugue/origin-based with peer-id tiebreaker per
+    /// `loro-internal::container::richtext::tracker::crdt_rope`).
+    ///
+    /// Typical pattern for multi-peer collaboration:
+    /// 1. Both peers start from a shared snapshot (`import_bytes`).
+    /// 2. Each peer appends its own ops independently.
+    /// 3. Peer A exports its current state via `export_bytes`.
+    /// 4. Peer B calls `merge_bytes(&a_bytes)` — peer B's log now
+    ///    contains both peers' ops in causal order.
+    /// 5. Replay against a workbook reconstructs the merged state.
+    /// 6. `WorkbookRuntime::recompute_all` resolves derived state
+    ///    (spills, formula values) from the merged final state.
+    ///
+    /// Returns the new `len()` after merge.
+    pub fn merge_bytes(&mut self, bytes: &[u8]) -> Result<usize, OpLogError> {
+        self.doc.import(bytes)?;
+        let list: LoroList = self.doc.get_list(OPS_CONTAINER);
+        self.cached_len = list.len();
+        Ok(self.cached_len)
+    }
 }
 
 #[cfg(test)]
