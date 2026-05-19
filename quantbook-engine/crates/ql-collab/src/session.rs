@@ -4,9 +4,11 @@
 //! with peer-id-aware operations + transport plumbing. Subsequent
 //! phases populate richer behavior:
 //!
-//! - **Phase 5.4** — undo manager integration (per-peer Loro
-//!   `UndoManager` tracks local appends; undo removes them from
-//!   the log).
+//! - ~~**Phase 5.4**~~ ✅ V1 shipped at `89c02b9d83e` — per-peer
+//!   Loro `UndoManager` tracks local appends. Undo APPENDS
+//!   inverse ops + retracts originals from the visible `"ops"`
+//!   list (NOT physical removal). Presence-origin commits
+//!   excluded. See [`session::CollabSession::undo`].
 //! - **Phase 5.5** — automatic transport integration: append a
 //!   local op → broadcast bytes via [`crate::Transport::send`];
 //!   poll [`crate::Transport::try_recv`] for remote bytes →
@@ -83,11 +85,13 @@ pub enum CollabSessionError {
 pub struct CollabSession {
     peer_id: PeerId,
     log: OpLog,
-    /// Phase 5.4 V1 — peer-local undo/redo. Declared LAST so it
-    /// drops FIRST (Rust drops fields in reverse declaration
-    /// order), giving Loro's internal subscriptions a chance to
-    /// unsubscribe before the underlying `LoroDoc` (inside `log`)
-    /// goes out of scope.
+    /// Phase 5.4 V1 — peer-local undo/redo.
+    ///
+    /// Drop-order note (Codex 5.4 V1 audit LOW): Rust drops fields
+    /// in DECLARATION order, so this drops LAST (after `log`).
+    /// That is safe here because `loro::UndoManager` owns its own
+    /// `LoroDoc` clone (`loro-internal::undo:166,670`) — it doesn't
+    /// borrow from `log`'s doc and won't UAF when `log` drops first.
     undo: loro::UndoManager,
 }
 
@@ -108,7 +112,7 @@ impl CollabSession {
     /// - `PeerId(u64::MAX)` is a Loro-reserved sentinel and returns
     ///   `CollabSessionError::OpLog`.
     pub fn new(peer_id: PeerId) -> Result<Self, CollabSessionError> {
-        let log = OpLog::new();
+        let mut log = OpLog::new();
         log.set_peer_id(peer_id.as_u64())?;
         let undo = make_undo_manager(&log);
         Ok(Self { peer_id, log, undo })
@@ -132,7 +136,7 @@ impl CollabSession {
     ///   concurrent session — see `OpLog::set_peer_id` for details.
     /// - `PeerId(u64::MAX)` is reserved.
     pub fn from_snapshot(peer_id: PeerId, bytes: &[u8]) -> Result<Self, CollabSessionError> {
-        let log = OpLog::import_bytes(bytes)?;
+        let mut log = OpLog::import_bytes(bytes)?;
         log.set_peer_id(peer_id.as_u64())?;
         let undo = make_undo_manager(&log);
         Ok(Self { peer_id, log, undo })
@@ -686,6 +690,94 @@ mod tests {
         assert_eq!(s.redo_count(), 0);
         assert!(!s.can_undo());
         assert!(!s.can_redo());
+    }
+
+    #[test]
+    fn undo_retracts_visible_op_from_op_log_len() {
+        // Codex 5.4 V1 audit HIGH closure: after undo, the visible
+        // `"ops"` LoroList shrinks (Loro retracts the original op).
+        // Pre-closure `OpLog::cached_len` was stale; post-closure
+        // `len()` queries Loro directly so it tracks correctly.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s.append_op(put_value(0, 0, 1, 2.0)).unwrap();
+        assert_eq!(s.op_count(), 2);
+        assert_eq!(s.op_log().iter().count(), 2);
+
+        assert!(s.undo().unwrap());
+        // op_count + iter().count() must agree post-undo.
+        assert_eq!(s.op_log().iter().count(), s.op_count());
+        assert_eq!(s.op_count(), 1, "visible op count must shrink to 1");
+
+        // Redo restores.
+        assert!(s.redo().unwrap());
+        assert_eq!(s.op_log().iter().count(), s.op_count());
+        assert_eq!(s.op_count(), 2);
+    }
+
+    #[test]
+    fn reborn_session_has_empty_undo_stack() {
+        // Codex 5.4 V1 audit C3 closure: imported ops are NOT
+        // undoable by the reborn peer (Loro local-only undo
+        // semantics — `loro-internal::undo:615-643` composes
+        // imported events into `remote_event` rather than pushing
+        // them onto the undo stack).
+        let mut origin = CollabSession::new(PeerId::new(11)).unwrap();
+        origin.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        origin.append_op(put_value(0, 0, 1, 2.0)).unwrap();
+        assert!(origin.can_undo());
+        let bytes = origin.export_bytes().unwrap();
+
+        let reborn = CollabSession::from_snapshot(PeerId::new(22), &bytes).unwrap();
+        assert_eq!(
+            reborn.undo_count(),
+            0,
+            "reborn session must NOT inherit origin's undo stack"
+        );
+        assert!(!reborn.can_undo());
+        // But it sees the imported ops in the log.
+        assert_eq!(reborn.op_count(), 2);
+    }
+
+    #[test]
+    fn local_undo_after_remote_merge_preserves_remote_ops() {
+        // Codex 5.4 V1 audit C2 closure: peer A appends, B merges A's
+        // bytes, A undoes A's append, B re-merges. After re-merge, B
+        // sees A's op as retracted (Loro propagates the undo's inverse
+        // through the CRDT). The remote contribution from B's own
+        // appends survives unchanged.
+        let base = CollabSession::new(PeerId::new(1)).unwrap();
+        let base_bytes = base.export_bytes().unwrap();
+
+        let mut peer_a = CollabSession::from_snapshot(PeerId::new(0xa1), &base_bytes).unwrap();
+        peer_a.append_op(put_value(0, 0, 0, 10.0)).unwrap();
+
+        let mut peer_b = CollabSession::from_snapshot(PeerId::new(0xb1), &base_bytes).unwrap();
+        peer_b.append_op(put_value(0, 1, 0, 20.0)).unwrap();
+        peer_b.merge_bytes(&peer_a.export_bytes().unwrap()).unwrap();
+        let b_count_before = peer_b.op_count();
+        assert!(b_count_before >= 2, "B sees A's + B's ops");
+
+        // A undoes its append. iter().count() shrinks on A.
+        assert!(peer_a.undo().unwrap());
+        let a_iter = peer_a.op_log().iter().count();
+        assert!(
+            a_iter < 1 || a_iter == 0,
+            "A's visible ops shrink post-undo, got {a_iter}"
+        );
+
+        // B merges A's post-undo state. A's retract should propagate.
+        peer_b.merge_bytes(&peer_a.export_bytes().unwrap()).unwrap();
+        let b_iter_after = peer_b.op_log().iter().count();
+        assert!(
+            b_iter_after < b_count_before,
+            "B's visible op count must shrink after merging A's undo (was {b_count_before}, now {b_iter_after})"
+        );
+        // But B still sees its OWN op — undo is local-only.
+        assert!(
+            b_iter_after >= 1,
+            "B's own op must survive A's local undo (local-only semantics)"
+        );
     }
 
     #[test]

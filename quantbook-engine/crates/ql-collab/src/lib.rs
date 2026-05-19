@@ -38,6 +38,18 @@
 //!   fallible (`u64::MAX` is reserved), so the constructor must
 //!   propagate the error. Internal-only at the time of the change;
 //!   no external callers.
+//! - **Phase 5.4 V1 (2026-05-19, `89c02b9d83e` + audit closure):**
+//!   `CollabSessionError::Undo(loro::LoroError)` variant added.
+//!   Exposes `loro::LoroError` in the public error surface — pre-0.2.0
+//!   this couples consumers to the loro crate version; a stable API
+//!   would wrap it in a ql-collab-owned error. Will be re-typed
+//!   before 0.2.0.
+//! - **Phase 5.4 V1 audit closure (2026-05-19):**
+//!   `ql_oplog::OpLog::set_peer_id` signature changed from `&self`
+//!   to `&mut self`. Prevents accidental peer-id changes through
+//!   `CollabSession::op_log()` (`&OpLog`) which would silently clear
+//!   an attached `UndoManager`'s stacks per Loro's internal
+//!   subscription behavior (`loro-internal::undo:654-662`).
 
 pub mod peer;
 pub mod presence;

@@ -328,20 +328,47 @@ Phase 4.12 megaudit's cycle-detection / spill / drop-table
 invariants — every Phase 4 edge case must survive the CRDT
 merge.
 
-## Undo/redo (Phase 5.4 preview)
+## Undo/redo (Phase 5.4 — V1 shipped)
 
+**Phase 5.4 V1 ✅ shipped at `89c02b9d83e` (2026-05-19).**
 Loro 1.x exposes `LoroDoc::set_peer_id` + `UndoManager`. Each
-peer has its own undo stack tracking THEIR appends only.
-Undoing a peer's op removes that op from the log (semantically;
-implementation may use tombstones).
+peer has its own undo stack tracking THEIR local appends only.
+Undoing APPENDS an inverse op AND retracts the original from
+the visible `"ops"` LoroList — so `OpLog::len()` shrinks
+post-undo. (V1 implementation correction: prior "remove from
+the log (semantically; tombstones)" wording was imprecise;
+Loro neither physically removes nor tombstones — it composes
+a remote-event-style retraction. See `ql_collab::CollabSession::undo`.)
 
 This is local-undo, NOT collaborative-undo. Two users editing
 the same cell + one user undoing their edit produces a sane
-result: their edit is removed from the log; the other user's
-edit (if later in causal order) stays.
+result: their edit retracts from the visible log AND propagates
+to peers via merge; the other user's edit (if later in causal
+order) stays.
 
-Phase 5.4 wires this; 5.1 just confirms Loro provides the
-primitive.
+### V1 wired surface
+
+`ql_collab::CollabSession` exposes 7 typed methods:
+- `undo() -> Result<bool, _>` / `redo() -> Result<bool, _>`
+- `can_undo() -> bool` / `can_redo() -> bool`
+- `undo_count() -> usize` / `redo_count() -> usize`
+- `clear_undo_stack()`
+
+Plus `pub use loro::UndoManager` in `ql_collab::undo` for
+callers wanting raw access. Presence-origin commits
+(`PRESENCE_COMMIT_ORIGIN = "presence:"`) are auto-excluded so
+cursor movement doesn't pollute the undo stack.
+
+### V1 limitations / V2 follow-ups
+
+- No grouping API (`group_start` / `group_end`) — defer to V2.
+- No merge-interval tuning (Loro's default 0 ms) — defer to V2.
+- No push/pop listeners — defer to V2.
+- `set_peer_id` after construction silently CLEARS the undo
+  stack per Loro's internal subscription. V1 made
+  `OpLog::set_peer_id` `&mut self` so the footgun isn't
+  reachable from a shared `&OpLog` (Codex+Opus 5.4 V1 audit
+  closure).
 
 ## Transport (Phase 5.5 preview)
 

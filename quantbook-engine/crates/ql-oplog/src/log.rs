@@ -46,7 +46,14 @@ const PRESENCE_CONTAINER: &str = "presence";
 /// `UndoManager::add_exclude_origin_prefix` so cursor movements
 /// don't pollute the undo stack. Exported as `pub` so the higher-
 /// layer (ql-collab) can reference the same string constant.
-pub const PRESENCE_COMMIT_ORIGIN: &str = "presence";
+///
+/// **Reserved-namespace convention:** trailing `":"` so the prefix
+/// `presence:` only matches deliberately-namespaced origins (e.g.
+/// a future `presence:typing` would also be excluded; an
+/// independent `"presence-foo"` origin would NOT). This protects
+/// against accidental over-exclusion as more origins land
+/// (Codex+Opus 5.4 V1 audit findings A4/M5).
+pub const PRESENCE_COMMIT_ORIGIN: &str = "presence:";
 
 /// Append-only operation log backed by Loro.
 ///
@@ -55,16 +62,12 @@ pub const PRESENCE_COMMIT_ORIGIN: &str = "presence";
 /// reads through `iter` / `len` / `is_empty`.
 pub struct OpLog {
     doc: LoroDoc,
-    /// Cached count to avoid round-tripping into Loro for `len()`. Always
-    /// equal to `doc.get_list(OPS_CONTAINER).len()`; updated on append
-    /// and on import.
-    cached_len: usize,
 }
 
 impl std::fmt::Debug for OpLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpLog")
-            .field("cached_len", &self.cached_len)
+            .field("len", &self.len())
             .field("doc", &"<LoroDoc>")
             .finish()
     }
@@ -81,7 +84,6 @@ impl OpLog {
     pub fn new() -> Self {
         Self {
             doc: LoroDoc::new(),
-            cached_len: 0,
         }
     }
 
@@ -93,7 +95,6 @@ impl OpLog {
         let list: LoroList = self.doc.get_list(OPS_CONTAINER);
         list.push(LoroValue::from(json.as_str()))?;
         self.doc.commit();
-        self.cached_len += 1;
         Ok(())
     }
 
@@ -130,14 +131,21 @@ impl OpLog {
         })
     }
 
-    /// Number of ops in the log.
+    /// Number of ops currently visible in the `"ops"` LoroList.
+    ///
+    /// **Phase 5.4 V1 (2026-05-19):** queries Loro directly each call
+    /// (was a cached `usize` field through 5.6). Codex 5.4 V1 audit
+    /// HIGH found the cache became stale after `loro::UndoManager`
+    /// retracted ops from the visible list. Returning Loro's
+    /// authoritative count is correct by construction; per-call
+    /// cost is one container handle lookup + a length read.
     pub fn len(&self) -> usize {
-        self.cached_len
+        self.doc.get_list(OPS_CONTAINER).len()
     }
 
     /// True iff `len() == 0`.
     pub fn is_empty(&self) -> bool {
-        self.cached_len == 0
+        self.len() == 0
     }
 
     /// **Phase 5.2.b (2026-05-19):** set this log's Loro peer id.
@@ -165,7 +173,19 @@ impl OpLog {
     ///    appends use the new id.
     /// 4. Loro reserves `u64::MAX` as a sentinel; passing it returns
     ///    `OpLogError::Loro(LoroError::InvalidPeerID)`.
-    pub fn set_peer_id(&self, peer: u64) -> Result<(), OpLogError> {
+    /// 5. **Phase 5.4 V1 (2026-05-19):** if a `loro::UndoManager`
+    ///    (constructed via [`new_undo_manager`]) is alive, Loro
+    ///    SILENTLY CLEARS its undo + redo stacks on the peer-id
+    ///    change (`loro-internal::undo:654-662`). Callers must
+    ///    treat post-construction peer-id changes as undo-stack-
+    ///    invalidating events.
+    ///
+    /// Signature note: `&mut self` (Phase 5.4 V1 audit closure)
+    /// even though Loro's `LoroDoc::set_peer_id` is `&self`. The
+    /// `&mut` prevents accidental peer-id changes through a shared
+    /// `&OpLog` (`CollabSession::op_log()`) which would silently
+    /// clear an attached `UndoManager`'s stacks per pitfall 5.
+    pub fn set_peer_id(&mut self, peer: u64) -> Result<(), OpLogError> {
         self.doc.set_peer_id(peer)?;
         Ok(())
     }
@@ -285,14 +305,13 @@ impl OpLog {
     }
 
     /// Reconstruct an `OpLog` from a previously-exported snapshot.
-    /// Probes the `"ops"` container to set the cached length; if the
-    /// snapshot doesn't carry our shape, returns `OpLogError::SchemaMismatch`.
+    /// If the snapshot doesn't carry our `"ops"` container shape,
+    /// subsequent `iter` / `len` calls operate on an empty list
+    /// (Loro creates absent root containers on first access).
     pub fn import_bytes(bytes: &[u8]) -> Result<Self, OpLogError> {
         let doc = LoroDoc::new();
         doc.import(bytes)?;
-        let list: LoroList = doc.get_list(OPS_CONTAINER);
-        let cached_len = list.len();
-        Ok(Self { doc, cached_len })
+        Ok(Self { doc })
     }
 
     /// **Phase 5.2 D-4 (2026-05-19):** merge another peer's snapshot
@@ -314,9 +333,7 @@ impl OpLog {
     /// Returns the new `len()` after merge.
     pub fn merge_bytes(&mut self, bytes: &[u8]) -> Result<usize, OpLogError> {
         self.doc.import(bytes)?;
-        let list: LoroList = self.doc.get_list(OPS_CONTAINER);
-        self.cached_len = list.len();
-        Ok(self.cached_len)
+        Ok(self.len())
     }
 }
 
@@ -448,7 +465,7 @@ mod tests {
 
     #[test]
     fn set_peer_id_changes_doc_peer_id() {
-        let log = OpLog::new();
+        let mut log = OpLog::new();
         let before = log.peer_id();
         log.set_peer_id(0xdead_beef_cafe_babe).unwrap();
         assert_eq!(log.peer_id(), 0xdead_beef_cafe_babe);
@@ -539,7 +556,7 @@ mod tests {
         // duplicate-peer-id scenario the docstrings warn against,
         // but we want to verify the data IS still single-valued
         // post-merge rather than corrupted.
-        let base = OpLog::new();
+        let mut base = OpLog::new();
         base.set_peer_id(1).unwrap();
         let base_bytes = base.export_bytes().unwrap();
 
@@ -577,7 +594,7 @@ mod tests {
 
     #[test]
     fn presence_independent_from_op_log() {
-        // Presence writes MUST NOT increment the op log cached_len.
+        // Presence writes MUST NOT increment the op log len.
         let mut log = OpLog::new();
         log.presence_set("peer-a", "{}").unwrap();
         assert_eq!(log.len(), 0, "presence is not in the 'ops' container");
@@ -594,7 +611,7 @@ mod tests {
         // Loro 1.12.0 reserves u64::MAX as an internal sentinel
         // (`LoroError::InvalidPeerID`). Pin the rejection behavior so
         // a future Loro upgrade can't silently change it.
-        let log = OpLog::new();
+        let mut log = OpLog::new();
         let result = log.set_peer_id(u64::MAX);
         assert!(
             matches!(result, Err(OpLogError::Loro(_))),
