@@ -431,6 +431,8 @@ closed the gating audit checkpoint. Decisions locked in:
 
 ### D-1: Format-id wire format changes — `FormatId = { peer_id, counter }`
 
+**Status:** ⏳ PENDING — multi-day schema-breaking work; queued for next session.
+
 **Source:** Opus H-1 + Codex V4 (independent confirmations).
 
 The pre-audit design left format-id collision resolution as
@@ -475,6 +477,8 @@ collision-freedom with better debuggability.
 
 ### D-2: AddSheet name collision — auto-rename in 5.2
 
+**Status:** ✅ SHIPPED at commit `1ca19e2fa37` (2026-05-19) — `Op::AddSheet` replay handler now auto-renames to `<name>(2)`, `<name>(3)`, … on `SheetNameError::Duplicate` with `AUTO_RENAME_CEILING = 10_000`. `Empty` + `ReservedCharacter` still reject. Cross-ref `crates/ql-oplog/src/replay.rs`.
+
 **Source:** Opus H-3.
 
 The pre-audit design said "AddSheet S × AddSheet S → first
@@ -496,6 +500,8 @@ detected. Producer-side emits the original name; replay-side
 disambiguates.
 
 ### D-3: RenameSheet × concurrent edit — known V1 limitation
+
+**Status:** ✅ SHIPPED at commit `e71312d4bcd` (2026-05-19) — `BindError::UnknownSheet(_)` now maps to `Value::Error(ErrorValue::Name)` in both `recompute_all` and `recompute_dirty`, matching the existing `UnknownTable` / `UnknownTableColumn` treatment. Phase 5.3 will add the causality-aware rename-repair pass; until then `RenameSheet × concurrent-edit` produces `#NAME?` (documented known V1 limitation). Cross-ref `crates/ql-exec/src/workbook_runtime/recompute.rs`.
 
 **Source:** Opus H-2 + Codex V5.
 
@@ -529,6 +535,8 @@ cross-sheet formula additions may surface as `#NAME?` until
 manual edit or until 5.3 ships the causality-aware repair.
 
 ### D-4: Spill semantics — replay defers to recompute, not per-op
+
+**Status:** ✅ SHIPPED at commit `2f217a2067a` (2026-05-19) — `OpLog::merge_bytes(&[u8]) -> Result<usize, OpLogError>` added (delegates to `LoroDoc::import`). 4 probe tests at `crates/ql-exec/tests/phase_5_2_d4_spill_2peer_probe.rs` verify spill blocking survives 2-peer CRDT merge in BOTH merge directions. First multi-peer test in the engine; establishes the pattern for Phase 5.3-5.7.
 
 **Source:** Codex V3.
 

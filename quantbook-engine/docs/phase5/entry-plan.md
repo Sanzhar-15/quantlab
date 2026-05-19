@@ -1,9 +1,17 @@
 ---
 title: Phase 5 entry plan — Multi-User CRDT Collaboration
-status: DRAFT (entry plan; Phase 5 not yet started)
-date: 2026-05-18
+status: ACTIVE — Phase 5.1 design AUDIT-CLOSED (2026-05-19); Phase 5.2.a scaffold SHIPPED (`66a571b30af`); D-2/D-3/D-4 shipped; D-1 (FormatId tagged tuple) pending.
+date: 2026-05-19
 predecessor: docs/phase4/exit-packet.md
 master_plan: docs/MASTER-PLAN.md §541-621
+shipped_commits:
+  - 918d7efdd91  # Phase 5.1 design — CRDT Data Model Decision (Loro container shape)
+  - df52cb44ad2  # Phase 5.1 audit closures — design corrections + 4 decisions locked
+  - e15e8908742  # Tier D2 — ql-oplog → ql-io reverse dep cleanup (Phase 4.12 Opus-C HIGH-3 closure)
+  - e71312d4bcd  # Phase 5.2 D-3 closure — map BindError::UnknownSheet to #NAME?
+  - 1ca19e2fa37  # Phase 5.2 D-2 closure — AddSheet auto-rename on duplicate-canonical
+  - 2f217a2067a  # Phase 5.2 D-4 closure — 2-peer spill probe + OpLog::merge_bytes
+  - 66a571b30af  # Phase 5.2.a — ql-collab scaffold (PeerId + CollabSession + Transport)
 ---
 
 # Phase 5 entry plan — CRDT collaboration

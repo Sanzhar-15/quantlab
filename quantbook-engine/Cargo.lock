@@ -2071,6 +2071,12 @@ dependencies = [
 [[package]]
 name = "ql-collab"
 version = "0.1.0"
+dependencies = [
+ "ql-functions",
+ "ql-oplog",
+ "ql-storage",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "ql-connectors"
@@ -2121,6 +2127,7 @@ dependencies = [
 name = "ql-io"
 version = "0.1.0"
 dependencies = [
+ "ql-oplog",
  "ql-storage",
  "ql-types",
  "serde",
@@ -2141,6 +2148,7 @@ dependencies = [
  "calamine",
  "ql-exec",
  "ql-functions",
+ "ql-io",
  "ql-oplog",
  "ql-storage",
  "ql-types",
@@ -2156,12 +2164,10 @@ version = "0.1.0"
 dependencies = [
  "loro",
  "ql-functions",
- "ql-io",
  "ql-storage",
  "ql-types",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.18",
 ]
 
