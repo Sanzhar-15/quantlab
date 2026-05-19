@@ -24,3 +24,6 @@ thiserror    = { workspace = true }
 # Loro's `presence` LoroMap (per-peer ephemeral cursor / selection).
 serde        = { workspace = true }
 serde_json   = { workspace = true }
+# Phase 5.4 V1 (2026-05-19) — direct dep on `loro::UndoManager`
+# wrapped by `CollabSession` for peer-local undo/redo.
+loro         = { workspace = true }

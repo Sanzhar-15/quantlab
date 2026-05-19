@@ -23,7 +23,7 @@
 //! probes the `"ops"` LoroList; if absent (or the wrong shape), the
 //! import returns `OpLogError::SchemaMismatch`.
 
-use loro::{ExportMode, LoroDoc, LoroList, LoroValue, ValueOrContainer};
+use loro::{CommitOptions, ExportMode, LoroDoc, LoroList, LoroValue, ValueOrContainer};
 
 use crate::error::OpLogError;
 use crate::op::Op;
@@ -40,6 +40,13 @@ const OPS_CONTAINER: &str = "ops";
 /// Keys are peer-id strings; values are opaque JSON blobs (the
 /// typed `PresenceState` encoding lives in `ql_collab::presence`).
 const PRESENCE_CONTAINER: &str = "presence";
+
+/// **Phase 5.4 V1 (2026-05-19):** commit-origin tag for presence
+/// writes. `ql_collab::CollabSession` wires this to Loro's
+/// `UndoManager::add_exclude_origin_prefix` so cursor movements
+/// don't pollute the undo stack. Exported as `pub` so the higher-
+/// layer (ql-collab) can reference the same string constant.
+pub const PRESENCE_COMMIT_ORIGIN: &str = "presence";
 
 /// Append-only operation log backed by Loro.
 ///
@@ -182,12 +189,15 @@ impl OpLog {
     /// `presence_set` calls for DIFFERENT `peer_key`s are independent
     /// and both survive merge.
     ///
-    /// Triggers `doc.commit()` so the write is durable through
-    /// `export_bytes` / `merge_bytes` immediately.
+    /// Triggers `doc.commit_with(origin=PRESENCE_COMMIT_ORIGIN)` so
+    /// the write is durable through `export_bytes` / `merge_bytes`
+    /// immediately AND is excluded from `UndoManager` (Phase 5.4
+    /// V1 wires `add_exclude_origin_prefix(PRESENCE_COMMIT_ORIGIN)`).
     pub fn presence_set(&mut self, peer_key: &str, json: &str) -> Result<(), OpLogError> {
         let map = self.doc.get_map(PRESENCE_CONTAINER);
         map.insert(peer_key, LoroValue::from(json))?;
-        self.doc.commit();
+        self.doc
+            .commit_with(CommitOptions::new().origin(PRESENCE_COMMIT_ORIGIN));
         Ok(())
     }
 
@@ -221,12 +231,38 @@ impl OpLog {
 
     /// **Phase 5.6 (2026-05-19):** remove the given peer's presence
     /// entry. Idempotent — deleting a non-existent key is a no-op
-    /// (Loro returns Ok). Triggers `doc.commit()`.
+    /// (Loro returns Ok). Triggers
+    /// `doc.commit_with(origin=PRESENCE_COMMIT_ORIGIN)` so the
+    /// tombstone propagates AND is excluded from undo.
     pub fn presence_remove(&mut self, peer_key: &str) -> Result<(), OpLogError> {
         let map = self.doc.get_map(PRESENCE_CONTAINER);
         map.delete(peer_key)?;
-        self.doc.commit();
+        self.doc
+            .commit_with(CommitOptions::new().origin(PRESENCE_COMMIT_ORIGIN));
         Ok(())
+    }
+
+    /// **Phase 5.4 V1 (2026-05-19):** construct a Loro `UndoManager`
+    /// bound to this log's underlying `LoroDoc`.
+    ///
+    /// Per Loro 1.12.0 docs (`lib.rs:3708`):
+    /// - "Local-only: undo/redo affects only local operations from
+    ///   the bound peer; it does not revert remote edits."
+    /// - "keep the `peer_id` stable while an `UndoManager` is in
+    ///   use."
+    ///
+    /// Callers MUST construct the manager AFTER `set_peer_id` and
+    /// SHOULD NOT change the peer id while it's alive. The returned
+    /// manager subscribes to the doc's commit stream; subsequent
+    /// `append` / `presence_set` / `presence_remove` calls feed it.
+    ///
+    /// Presence writes use the `PRESENCE_COMMIT_ORIGIN` origin
+    /// (see [`presence_set`]). To exclude them from the undo stack
+    /// call `manager.add_exclude_origin_prefix(PRESENCE_COMMIT_ORIGIN)`
+    /// after construction. The `ql_collab::CollabSession`
+    /// integration does this automatically.
+    pub fn new_undo_manager(&self) -> loro::UndoManager {
+        loro::UndoManager::new(&self.doc)
     }
 
     /// **Phase 5.6 (2026-05-19):** list the peer keys currently

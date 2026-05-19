@@ -2072,9 +2072,12 @@ dependencies = [
 name = "ql-collab"
 version = "0.1.0"
 dependencies = [
+ "loro",
  "ql-functions",
  "ql-oplog",
  "ql-storage",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

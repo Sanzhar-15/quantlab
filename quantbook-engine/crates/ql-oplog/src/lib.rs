@@ -42,7 +42,7 @@ pub mod replay;
 pub mod wire;
 
 pub use error::OpLogError;
-pub use log::OpLog;
+pub use log::{OpLog, PRESENCE_COMMIT_ORIGIN};
 pub use op::{LocaleWire, Op, ReferenceModeWire};
 pub use replay::{replay_into, ReplayError};
 pub use wire::{CellWireValue, NamedTargetWire, WireDecodeError};

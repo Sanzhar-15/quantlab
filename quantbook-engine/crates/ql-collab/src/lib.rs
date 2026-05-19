@@ -19,8 +19,9 @@
 //! - [`presence`] — per-peer ephemeral cursor + selection state
 //!   (Phase 5.6 V1 ship 2026-05-19). `PresenceState` JSON-encoded
 //!   into the shared `LoroDoc`'s `"presence"` LoroMap (LWW per key).
-//! - [`undo`] — reserved name; Phase 5.4 populates with peer-local
-//!   undo via Loro's `UndoManager`.
+//! - [`undo`] — peer-local undo/redo via Loro's `UndoManager`
+//!   (Phase 5.4 V1 ship 2026-05-19). `CollabSession` wires the
+//!   manager + auto-excludes presence-origin commits.
 //!
 //! ## Stability
 //!
@@ -42,8 +43,10 @@ pub mod peer;
 pub mod presence;
 pub mod session;
 pub mod transport;
+pub mod undo;
 
 pub use peer::PeerId;
 pub use presence::{PresenceError, PresenceState};
 pub use session::{CollabSession, CollabSessionError};
 pub use transport::{NoopTransport, Transport, TransportError};
+pub use undo::UndoManager;

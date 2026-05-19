@@ -41,7 +41,7 @@
 
 use thiserror::Error;
 
-use ql_oplog::{Op, OpLog, OpLogError};
+use ql_oplog::{Op, OpLog, OpLogError, PRESENCE_COMMIT_ORIGIN};
 
 use crate::peer::PeerId;
 use crate::presence::{self, PresenceError, PresenceState};
@@ -59,6 +59,13 @@ pub enum CollabSessionError {
     /// underlying OpLog).
     #[error("presence error: {0}")]
     Presence(#[from] PresenceError),
+
+    /// **Phase 5.4 V1:** a Loro `UndoManager` call (`undo` /
+    /// `redo`) returned an error. Reachable when the underlying
+    /// document is in an invalid state for the requested
+    /// operation (e.g. mid-transaction).
+    #[error("undo/redo error: {0}")]
+    Undo(#[from] loro::LoroError),
 }
 
 /// Per-peer collaboration state holder.
@@ -76,6 +83,12 @@ pub enum CollabSessionError {
 pub struct CollabSession {
     peer_id: PeerId,
     log: OpLog,
+    /// Phase 5.4 V1 — peer-local undo/redo. Declared LAST so it
+    /// drops FIRST (Rust drops fields in reverse declaration
+    /// order), giving Loro's internal subscriptions a chance to
+    /// unsubscribe before the underlying `LoroDoc` (inside `log`)
+    /// goes out of scope.
+    undo: loro::UndoManager,
 }
 
 impl CollabSession {
@@ -97,7 +110,8 @@ impl CollabSession {
     pub fn new(peer_id: PeerId) -> Result<Self, CollabSessionError> {
         let log = OpLog::new();
         log.set_peer_id(peer_id.as_u64())?;
-        Ok(Self { peer_id, log })
+        let undo = make_undo_manager(&log);
+        Ok(Self { peer_id, log, undo })
     }
 
     /// Construct a session by importing a shared snapshot. Use this
@@ -120,7 +134,8 @@ impl CollabSession {
     pub fn from_snapshot(peer_id: PeerId, bytes: &[u8]) -> Result<Self, CollabSessionError> {
         let log = OpLog::import_bytes(bytes)?;
         log.set_peer_id(peer_id.as_u64())?;
-        Ok(Self { peer_id, log })
+        let undo = make_undo_manager(&log);
+        Ok(Self { peer_id, log, undo })
     }
 
     /// Stable peer id assigned at session creation.
@@ -216,6 +231,62 @@ impl CollabSession {
         Ok(())
     }
 
+    /// **Phase 5.4 V1 (2026-05-19):** undo this session's last
+    /// local op. Loro's `UndoManager` semantically inverts it by
+    /// appending an inverse op (NOT by physical removal). Returns
+    /// `Ok(true)` if an undo stack item was consumed,
+    /// `Ok(false)` if the stack was empty.
+    ///
+    /// Local-only per Loro's `UndoManager` contract — remote ops
+    /// from other peers (merged via `merge_bytes`) are NOT
+    /// affected.
+    ///
+    /// Presence updates are excluded from the undo stack by
+    /// construction (see `CollabSession::new`), so cursor movements
+    /// don't consume undo slots.
+    pub fn undo(&mut self) -> Result<bool, CollabSessionError> {
+        Ok(self.undo.undo()?)
+    }
+
+    /// **Phase 5.4 V1 (2026-05-19):** redo the last undone op.
+    /// Returns `Ok(true)` if a redo stack item was consumed,
+    /// `Ok(false)` if the stack was empty.
+    pub fn redo(&mut self) -> Result<bool, CollabSessionError> {
+        Ok(self.undo.redo()?)
+    }
+
+    /// **Phase 5.4 V1 (2026-05-19):** true iff the undo stack has
+    /// at least one item.
+    pub fn can_undo(&self) -> bool {
+        self.undo.can_undo()
+    }
+
+    /// **Phase 5.4 V1 (2026-05-19):** true iff the redo stack has
+    /// at least one item.
+    pub fn can_redo(&self) -> bool {
+        self.undo.can_redo()
+    }
+
+    /// **Phase 5.4 V1 (2026-05-19):** number of items currently
+    /// on the undo stack.
+    pub fn undo_count(&self) -> usize {
+        self.undo.undo_count()
+    }
+
+    /// **Phase 5.4 V1 (2026-05-19):** number of items currently
+    /// on the redo stack.
+    pub fn redo_count(&self) -> usize {
+        self.undo.redo_count()
+    }
+
+    /// **Phase 5.4 V1 (2026-05-19):** clear both undo and redo
+    /// stacks. Use when starting a fresh logical session (e.g.
+    /// opening a new workbook tab while reusing the
+    /// `CollabSession` shell).
+    pub fn clear_undo_stack(&self) {
+        self.undo.clear();
+    }
+
     /// **Phase 5.6 V1 (2026-05-19):** list every peer with a
     /// presence entry in the shared map.
     ///
@@ -241,8 +312,23 @@ impl std::fmt::Debug for CollabSession {
         f.debug_struct("CollabSession")
             .field("peer_id", &self.peer_id)
             .field("op_count", &self.log.len())
+            .field("undo_count", &self.undo.undo_count())
+            .field("redo_count", &self.undo.redo_count())
             .finish()
     }
+}
+
+/// Construct + configure a Loro `UndoManager` bound to `log`'s
+/// underlying doc.
+///
+/// Phase 5.4 V1 setup: register `PRESENCE_COMMIT_ORIGIN` as an
+/// exclude prefix so cursor-movement commits don't fill the
+/// undo stack. (Phase 5.6 V1 tags presence writes with that
+/// origin via `OpLog::presence_set` / `presence_remove`.)
+fn make_undo_manager(log: &OpLog) -> loro::UndoManager {
+    let mut undo = log.new_undo_manager();
+    undo.add_exclude_origin_prefix(PRESENCE_COMMIT_ORIGIN);
+    undo
 }
 
 #[cfg(test)]
@@ -518,6 +604,102 @@ mod tests {
             peer_b.peer_presence(PeerId::new(0xaa)).unwrap(),
             None,
             "B must see A as cleared after merging the tombstone"
+        );
+    }
+
+    #[test]
+    fn undo_redo_local_appends() {
+        // Append two ops, undo both, redo both. Verify can_undo /
+        // can_redo / undo_count / redo_count track correctly.
+        let mut s = CollabSession::new(PeerId::new(7)).unwrap();
+        assert!(!s.can_undo());
+        assert!(!s.can_redo());
+        assert_eq!(s.undo_count(), 0);
+        assert_eq!(s.redo_count(), 0);
+
+        s.append_op(Op::AddSheet {
+            name: "S1".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        assert!(s.can_undo());
+        assert_eq!(s.undo_count(), 2);
+        assert_eq!(s.redo_count(), 0);
+
+        // Undo the second op.
+        assert!(s.undo().unwrap());
+        assert_eq!(s.undo_count(), 1);
+        assert_eq!(s.redo_count(), 1);
+        assert!(s.can_redo());
+
+        // Undo the first op.
+        assert!(s.undo().unwrap());
+        assert_eq!(s.undo_count(), 0);
+        assert_eq!(s.redo_count(), 2);
+        assert!(!s.can_undo());
+
+        // Undo on empty stack returns false.
+        assert!(!s.undo().unwrap());
+
+        // Redo both back.
+        assert!(s.redo().unwrap());
+        assert!(s.redo().unwrap());
+        assert_eq!(s.undo_count(), 2);
+        assert_eq!(s.redo_count(), 0);
+        assert!(!s.can_redo());
+        assert!(!s.redo().unwrap());
+    }
+
+    #[test]
+    fn presence_updates_do_not_consume_undo_stack() {
+        // 5.4 V1 acceptance: cursor movement (presence_set) MUST
+        // NOT push items onto the undo stack. Otherwise every
+        // keystroke would burn an undo slot.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        let baseline_undo = s.undo_count();
+
+        for row in 0..10 {
+            s.update_presence(PresenceState::at_cell(0, row, 0))
+                .unwrap();
+        }
+
+        assert_eq!(
+            s.undo_count(),
+            baseline_undo,
+            "presence writes must be excluded from the undo stack \
+             (PRESENCE_COMMIT_ORIGIN excludes them via UndoManager::add_exclude_origin_prefix)"
+        );
+    }
+
+    #[test]
+    fn clear_undo_stack_resets_both_stacks() {
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s.append_op(put_value(0, 0, 1, 2.0)).unwrap();
+        s.undo().unwrap();
+        assert_eq!(s.undo_count(), 1);
+        assert_eq!(s.redo_count(), 1);
+
+        s.clear_undo_stack();
+        assert_eq!(s.undo_count(), 0);
+        assert_eq!(s.redo_count(), 0);
+        assert!(!s.can_undo());
+        assert!(!s.can_redo());
+    }
+
+    #[test]
+    fn debug_includes_undo_redo_counts() {
+        let mut s = CollabSession::new(PeerId::new(42)).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        let d = format!("{s:?}");
+        assert!(
+            d.contains("undo_count"),
+            "Debug must include undo_count: {d}"
+        );
+        assert!(
+            d.contains("redo_count"),
+            "Debug must include redo_count: {d}"
         );
     }
 
