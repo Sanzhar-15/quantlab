@@ -132,8 +132,11 @@ impl OpLog {
     /// appends carry the right origin in the CRDT merge metadata.
     ///
     /// Loro takes `&self` (interior mutability), so this method is
-    /// `&self` too. Idempotent — calling it twice with the same id
-    /// is a no-op.
+    /// `&self` too. Calling it twice with the same id leaves the
+    /// peer id unchanged but is NOT a strict no-op at Loro's
+    /// internal layer: Loro re-stores the atom and emits a
+    /// `peer_id_change_subs` notification each call. Avoid calling
+    /// repeatedly in hot paths.
     ///
     /// **Caller pitfalls** (from `loro::LoroDoc::set_peer_id`):
     /// 1. NEVER reuse the same peer id across concurrent writers
@@ -145,6 +148,8 @@ impl OpLog {
     /// 3. Setting peer id AFTER an import is safe — existing imported
     ///    ops retain their original peer ids; only this log's future
     ///    appends use the new id.
+    /// 4. Loro reserves `u64::MAX` as a sentinel; passing it returns
+    ///    `OpLogError::Loro(LoroError::InvalidPeerID)`.
     pub fn set_peer_id(&self, peer: u64) -> Result<(), OpLogError> {
         self.doc.set_peer_id(peer)?;
         Ok(())
@@ -336,12 +341,39 @@ mod tests {
     #[test]
     fn set_peer_id_after_import_works() {
         // Origin writes ops under peer 11.
-        let origin = OpLog::new();
+        let mut origin = OpLog::new();
         origin.set_peer_id(11).unwrap();
+        // Append a real op so the snapshot carries committed history
+        // (Codex/Opus 5.2.b audit caught: prior version of this test
+        // exported an empty doc, so the "imported ops retain peer 11"
+        // promise was never exercised).
+        origin.append(put_value(0, 0, 0, 1.0)).unwrap();
         let bytes = origin.export_bytes().unwrap();
+
         // Reborn imports + reassigns peer id; future appends use 22.
-        let reborn = OpLog::import_bytes(&bytes).unwrap();
+        let mut reborn = OpLog::import_bytes(&bytes).unwrap();
         reborn.set_peer_id(22).unwrap();
         assert_eq!(reborn.peer_id(), 22);
+        // The imported op is still readable (so the snapshot round-trip
+        // survived the peer-id change).
+        let read: Vec<Op> = reborn.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(read.len(), 1);
+        // Reborn can append further ops under its new peer id.
+        reborn.append(put_value(0, 1, 0, 2.0)).unwrap();
+        assert_eq!(reborn.len(), 2);
+        assert_eq!(reborn.peer_id(), 22);
+    }
+
+    #[test]
+    fn set_peer_id_max_is_rejected_as_loro_sentinel() {
+        // Loro 1.12.0 reserves u64::MAX as an internal sentinel
+        // (`LoroError::InvalidPeerID`). Pin the rejection behavior so
+        // a future Loro upgrade can't silently change it.
+        let log = OpLog::new();
+        let result = log.set_peer_id(u64::MAX);
+        assert!(
+            matches!(result, Err(OpLogError::Loro(_))),
+            "u64::MAX must be rejected as a Loro sentinel; got {result:?}"
+        );
     }
 }

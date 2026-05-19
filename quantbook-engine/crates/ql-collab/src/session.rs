@@ -79,8 +79,13 @@ impl CollabSession {
     /// CRDT merge metadata attributes this session's appends to
     /// `peer_id` (not Loro's default random per-doc id).
     ///
-    /// **Caller pitfall:** two concurrent sessions MUST use distinct
-    /// peer ids — see `OpLog::set_peer_id` for details.
+    /// **Caller pitfalls** (from `OpLog::set_peer_id`):
+    /// - Two concurrent sessions MUST use distinct peer ids.
+    ///   Duplicate ids corrupt the document via conflicting OpIDs.
+    /// - Prefer per-process-random peer ids over user-/device-pinned
+    ///   ids unless your transport layer enforces single-ownership.
+    /// - `PeerId(u64::MAX)` is a Loro-reserved sentinel and returns
+    ///   `CollabSessionError::OpLog`.
     pub fn new(peer_id: PeerId) -> Result<Self, CollabSessionError> {
         let log = OpLog::new();
         log.set_peer_id(peer_id.as_u64())?;
@@ -95,7 +100,15 @@ impl CollabSession {
     /// by an earlier `CollabSession::export_bytes` call (typically
     /// from the workbook owner / first peer). After import, this
     /// session's peer id is set to `peer_id` — distinct from the
-    /// peer ids carried by the already-imported ops.
+    /// peer ids carried by the already-imported ops. Imported ops
+    /// retain their original peer-id attribution (Loro semantics);
+    /// only this session's future appends carry `peer_id`.
+    ///
+    /// **Caller pitfalls** (same as `CollabSession::new`):
+    /// - The new `peer_id` MUST differ from every peer already
+    ///   represented in the imported snapshot AND from every other
+    ///   concurrent session — see `OpLog::set_peer_id` for details.
+    /// - `PeerId(u64::MAX)` is reserved.
     pub fn from_snapshot(peer_id: PeerId, bytes: &[u8]) -> Result<Self, CollabSessionError> {
         let log = OpLog::import_bytes(bytes)?;
         log.set_peer_id(peer_id.as_u64())?;
@@ -269,9 +282,49 @@ mod tests {
         // for future appends — the imported ops keep their original
         // attribution (Loro semantics), but log.peer_id() reflects
         // the reborn's configured PeerId.
-        let origin = CollabSession::new(PeerId::new(11)).unwrap();
+        //
+        // Codex/Opus 5.2.b audit caught: the prior version exported
+        // an empty origin, so the "imported ops retain peer 11"
+        // promise was never exercised. Now we append before export
+        // and assert the imported op survives the peer-id change.
+        let mut origin = CollabSession::new(PeerId::new(11)).unwrap();
+        origin
+            .append_op(Op::AddSheet {
+                name: "S".to_owned(),
+                chunk_rows: 16384,
+            })
+            .unwrap();
         let bytes = origin.export_bytes().unwrap();
-        let reborn = CollabSession::from_snapshot(PeerId::new(22), &bytes).unwrap();
+
+        let mut reborn = CollabSession::from_snapshot(PeerId::new(22), &bytes).unwrap();
         assert_eq!(reborn.op_log().peer_id(), 22);
+        assert_eq!(
+            reborn.op_count(),
+            1,
+            "imported op must survive peer-id swap"
+        );
+        // Reborn can append under its new peer id.
+        reborn.append_op(put_value(0, 0, 0, 99.0)).unwrap();
+        assert_eq!(reborn.op_count(), 2);
+        assert_eq!(reborn.op_log().peer_id(), 22);
+    }
+
+    #[test]
+    fn peer_id_max_is_rejected_by_constructors() {
+        // PeerId(u64::MAX) is Loro's reserved sentinel; both
+        // constructors should surface the error.
+        let result = CollabSession::new(PeerId::new(u64::MAX));
+        assert!(
+            matches!(result, Err(CollabSessionError::OpLog(_))),
+            "new(u64::MAX) must fail; got {result:?}"
+        );
+        // For from_snapshot we need a valid empty snapshot first.
+        let origin = CollabSession::new(PeerId::new(1)).unwrap();
+        let bytes = origin.export_bytes().unwrap();
+        let result = CollabSession::from_snapshot(PeerId::new(u64::MAX), &bytes);
+        assert!(
+            matches!(result, Err(CollabSessionError::OpLog(_))),
+            "from_snapshot(u64::MAX) must fail; got {result:?}"
+        );
     }
 }

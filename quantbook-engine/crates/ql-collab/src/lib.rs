@@ -27,6 +27,15 @@
 //! will populate the reserved modules and may shift trait shapes.
 //! No `#[non_exhaustive]` on enums yet — locked at Phase 5.8
 //! megaudit per the engine audit-discipline rule.
+//!
+//! ### Pre-stability API changes (logged)
+//!
+//! - **Phase 5.2.b (2026-05-19, `ef056f50bee`):** `CollabSession::new`
+//!   return type changed from `Self` to
+//!   `Result<Self, CollabSessionError>`. Loro's `set_peer_id` is
+//!   fallible (`u64::MAX` is reserved), so the constructor must
+//!   propagate the error. Internal-only at the time of the change;
+//!   no external callers.
 
 pub mod peer;
 pub mod session;

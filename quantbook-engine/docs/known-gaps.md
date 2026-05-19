@@ -111,9 +111,9 @@ Every gap below carries a target Engine phase per `docs/MASTER-PLAN.md`. When a 
 |---|---|---|---|---|
 | GAP-C-01 | Loro op log is single-writer history, not multi-user CRDT state | `ql-oplog/src/log.rs` is append-only log only | Engine | Engine Phase 5.1 (collab data model decision) |
 | GAP-C-02 | No conflict resolution semantics for concurrent peer edits | Out-of-scope today | Engine | Engine Phase 5.3 |
-| GAP-C-03 | `ql-collab` is a 15-line stub | `ql-collab/src/lib.rs` | Engine | Engine Phase 5.2 |
+| ~~GAP-C-03~~ | ~~`ql-collab` is a 15-line stub~~ — **CLOSED** in Engine Phase 5.2.a (`66a571b30af`) + 5.2.b (`ef056f50bee`). `ql-collab` now contains `PeerId` newtype + `CollabSession` (with `OpLog::set_peer_id` wired through to Loro's CRDT merge metadata) + `Transport` trait + `NoopTransport` test impl. ~600 LOC + 14 unit tests. Reserved modules (`presence`, `undo`) remain unpopulated — see GAP-C-04 + Phase 5.6. |
 | GAP-C-04 | No undo/redo model defined; transactions exist but command grouping is informal | `ql-exec/src/transaction.rs` doesn't expose inverse ops | Engine | Engine Phase 5.4 |
-| GAP-C-05 | No transport layer (WebSocket / offline sync) | Stub crate `ql-collab` empty | Engine | Engine Phase 5.5 |
+| GAP-C-05 | No transport layer (WebSocket / offline sync) — the `Transport` trait shape ships at Phase 5.2.a (`crates/ql-collab/src/transport.rs`) but the only impl is `NoopTransport` (test stub). | `crates/ql-collab/src/transport.rs::NoopTransport` is the only `Transport` impl | Engine | Engine Phase 5.5 |
 
 ### Product surfaces
 

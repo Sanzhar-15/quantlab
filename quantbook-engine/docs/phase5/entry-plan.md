@@ -1,6 +1,6 @@
 ---
 title: Phase 5 entry plan — Multi-User CRDT Collaboration
-status: ACTIVE — Phase 5.1 design AUDIT-CLOSED (2026-05-19); Phase 5.2.a scaffold SHIPPED (`66a571b30af`); D-2/D-3/D-4 shipped; D-1 (FormatId tagged tuple) pending.
+status: ACTIVE — Phase 5.1 design AUDIT-CLOSED (2026-05-19); Phase 5.2.a scaffold SHIPPED (`66a571b30af`); D-2/D-3/D-4 shipped; Phase 5.2.b PeerId → LoroDoc wiring SHIPPED (`ef056f50bee`); D-1 (FormatId tagged tuple) pending.
 date: 2026-05-19
 predecessor: docs/phase4/exit-packet.md
 master_plan: docs/MASTER-PLAN.md §541-621
@@ -12,6 +12,7 @@ shipped_commits:
   - 1ca19e2fa37  # Phase 5.2 D-2 closure — AddSheet auto-rename on duplicate-canonical
   - 2f217a2067a  # Phase 5.2 D-4 closure — 2-peer spill probe + OpLog::merge_bytes
   - 66a571b30af  # Phase 5.2.a — ql-collab scaffold (PeerId + CollabSession + Transport)
+  - ef056f50bee  # Phase 5.2.b — wire PeerId through to LoroDoc::set_peer_id (closes handoff-audit M-8)
 ---
 
 # Phase 5 entry plan — CRDT collaboration
@@ -101,7 +102,7 @@ post-merge.
 | ID | Item | Effort | Notes |
 |---|---|---|---|
 | 5.1 | Collaboration Data Model Decision | 3-5 days | **✅ AUDIT-CLOSED 2026-05-19** (`918d7efdd91` + `df52cb44ad2`). Loro container shape locked = Option A op-log preservation; 4 audit decisions D-1..D-4 recorded in design doc. |
-| 5.2 | `ql-collab` Core Documents | 1-2 weeks | **🟡 IN PROGRESS** — 5.2.a scaffold shipped `66a571b30af` (PeerId + CollabSession + Transport); D-2 / D-3 / D-4 closures shipped (`1ca19e2fa37` / `e71312d4bcd` / `2f217a2067a`); D-1 (FormatId tagged tuple, schema-breaking) pending. |
+| 5.2 | `ql-collab` Core Documents | 1-2 weeks | **🟡 IN PROGRESS** — 5.2.a scaffold shipped `66a571b30af` (PeerId + CollabSession + Transport); D-2 / D-3 / D-4 closures shipped (`1ca19e2fa37` / `e71312d4bcd` / `2f217a2067a`); 5.2.b PeerId → LoroDoc wiring shipped `ef056f50bee`; D-1 (FormatId tagged tuple, schema-breaking) pending. |
 | 5.3 | Conflict Resolution Semantics | 4-7 days | Causality-aware rename-repair pass; multi-value / delete-vs-update. Loro merge is Fugue/origin-based (not Lamport LWW — corrected by Phase 5.1 audit). |
 | 5.4 | Undo/Redo + Operation Grouping | 1 week | Local undo over collaborative ops. |
 | 5.5 | Transport Layer + Offline Sync | 1-2 weeks | WebSocket + reconnect merge. |
