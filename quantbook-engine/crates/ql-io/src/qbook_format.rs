@@ -1117,7 +1117,7 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
                         // schema to carry FormatIdWire directly.
                         id: fid
                             .to_legacy_u32()
-                            .expect("pre-step-4 FormatId must be expressible as legacy u32"),
+                            .expect("pre-step-5 qbook envelope sees only legacy FormatId"),
                     })
                     .collect();
                 entries.sort_by_key(|e| (e.row, e.col));
@@ -1194,7 +1194,7 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
                 // Same expect-pattern as the format_overlay save above.
                 id: id
                     .to_legacy_u32()
-                    .expect("pre-step-4 FormatId must be expressible as legacy u32"),
+                    .expect("pre-step-5 qbook envelope sees only legacy FormatId"),
                 string: s.to_owned(),
             })
             .collect();

@@ -55,6 +55,17 @@ use ql_types::{PeerId, LEGACY_PEER};
 ///
 /// Mirrors `ql_oplog::wire::FormatIdWire`; the wire type is the
 /// `Op::RegisterFormat` / `Op::SetCellFormat` payload (step 4).
+///
+/// **Builtin(n) range invariant (step 3 audit Codex+Opus MEDIUM-1):**
+/// `FormatId::Builtin(n)` is contractually valid ONLY for
+/// `n <= FIRST_XLSX_BUILTIN_MAX` (= 163). The enum's tuple variant
+/// can't enforce this at the type level (Rust syntax limitation), so
+/// the invariant is documentary. **Callers MUST use
+/// [`FormatId::legacy_from_u32`] for u32 values that may exceed
+/// 163** — that helper routes 164+ to `Custom(LEGACY_PEER, n - 164)`.
+/// Directly constructing `Builtin(200)` breaks `to_legacy_u32` ↔
+/// `legacy_from_u32` round-trip (becomes asymmetric in the
+/// storage→u32→storage direction).
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum FormatId {
     /// Excel-canonical built-in format id (`0..=163`).
@@ -248,11 +259,38 @@ impl FormatTable {
     /// allocations. Existing entries are NOT relabeled — they keep
     /// the peer they were originally allocated under.
     ///
+    /// **Counter resync (step 3 audit Codex HIGH-1 closure):** scans
+    /// `by_id` for existing `Custom(peer, _)` entries and sets
+    /// `next_custom_counter` to `max(c) + 1` so the new peer's
+    /// allocator doesn't overwrite entries already registered for it
+    /// (e.g. via replay of a remote peer's `Op::RegisterFormat`).
+    /// Without this scan, a sequence like:
+    ///
+    /// 1. `register_at(Custom(P, 0), "X")` (replay; local peer ≠ P)
+    /// 2. `set_local_peer(P)`
+    /// 3. `intern("Y")`
+    ///
+    /// would overwrite the entry at `Custom(P, 0)` (was "X", becomes
+    /// "Y") because the counter wasn't reset.
+    ///
     /// Step 4 will call this from `CollabSession::attach` when a
     /// multi-peer session takes over from the default
     /// `LEGACY_PEER`-tagged construction.
     pub fn set_local_peer(&mut self, peer: PeerId) {
         self.local_peer = peer;
+        // Resync counter to max(existing Custom(peer, c).c) + 1, or 0
+        // if no such entry exists. This guarantees subsequent `intern`
+        // calls allocate fresh counters past anything replayed for
+        // this peer.
+        let max_existing = self
+            .by_id
+            .keys()
+            .filter_map(|fid| match fid {
+                FormatId::Custom(p, c) if *p == peer => Some(*c),
+                _ => None,
+            })
+            .max();
+        self.next_custom_counter = max_existing.map(|c| c + 1).unwrap_or(0);
     }
 
     /// Look up the format string for `id`. Returns `None` if the id has
@@ -294,6 +332,19 @@ impl FormatTable {
     /// For ids tagged with `self.local_peer`, advances the local
     /// counter past the registered counter so subsequent `intern`
     /// calls don't collide.
+    ///
+    /// KNOWN LIMITATION (step 3 audit Codex HIGH-2; fix deferred to
+    /// step 4): the by-string dedup map is global, not peer-scoped.
+    /// Two peers independently interning the same string produces
+    /// `Custom(A, 0)` and `Custom(B, 0)` (collision-free `FormatId`s
+    /// by D-1 design). But replaying both ops here fails with
+    /// `StringCollision` because the second `register_at` sees the
+    /// string already mapped to the first peer's id. Step 4 will
+    /// restructure `by_string` to a peer-scoped map plus a separate
+    /// built-in string map. Until then, cross-peer same-string
+    /// replays REJECT. Test
+    /// `cross_peer_same_string_collision_is_known_limitation` pins
+    /// this behavior so step 4 explicitly notices when it fixes it.
     pub fn register_at(&mut self, id: FormatId, s: &str) -> Result<(), FormatTableError> {
         if let Some(existing) = self.by_id.get(&id) {
             if existing == s {
@@ -457,10 +508,14 @@ mod tests {
     #[test]
     fn register_at_replays_known_id() {
         let mut t = FormatTable::new();
-        // Step 3: ids land as Builtin or Custom variants; register_at
-        // accepts either.
-        t.register_at(FormatId::Builtin(200), "REPLAY").unwrap();
-        assert_eq!(t.lookup(FormatId::Builtin(200)), Some("REPLAY"));
+        // Step 3 audit Codex+Opus MEDIUM-1 closure: id 200 in legacy
+        // u32 encoding is `Custom(LEGACY_PEER, 36)` per legacy_from_u32
+        // (NOT `Builtin(200)` — Builtin invariant is 0..=163 per
+        // docstring). Test now uses the migration helper to construct
+        // the id, matching how real replay would resolve it.
+        let id_200 = FormatId::legacy_from_u32(200);
+        t.register_at(id_200, "REPLAY").unwrap();
+        assert_eq!(t.lookup(id_200), Some("REPLAY"));
     }
 
     #[test]
@@ -510,9 +565,12 @@ mod tests {
     #[test]
     fn register_at_string_collision_errors() {
         let mut t = FormatTable::new();
-        // "General" is already at Builtin(0); registering it at a different id errors.
+        // "General" is already at Builtin(0); registering it at a different
+        // id errors. Step 3 audit MEDIUM-1 closure: use `legacy_from_u32(200)`
+        // (= Custom(LEGACY_PEER, 36)) instead of `Builtin(200)` since the
+        // Builtin variant is contractually 0..=163.
         let err = t
-            .register_at(FormatId::Builtin(200), "General")
+            .register_at(FormatId::legacy_from_u32(200), "General")
             .unwrap_err();
         assert!(matches!(err, FormatTableError::StringCollision { .. }));
     }
@@ -591,9 +649,157 @@ mod tests {
 
     #[test]
     fn legacy_round_trip_through_helpers() {
-        for n in [0_u32, 1, 14, 163, 164, 165, 999, 10_000] {
+        // Step 3 audit Codex LOW (closure): added u32::MAX edge to pin
+        // checked arithmetic. counter = u32::MAX - 164 = 4_294_967_131
+        // fits in u32; reverse adds 164 back without overflow.
+        for n in [
+            0_u32,
+            1,
+            14,
+            163,
+            164,
+            165,
+            999,
+            10_000,
+            u32::MAX - 1,
+            u32::MAX,
+        ] {
             let id = FormatId::legacy_from_u32(n);
             assert_eq!(id.to_legacy_u32(), Some(n), "round-trip failed for {n}");
         }
+    }
+
+    // ===== Step 3 audit closure tests (2026-05-19) =====
+
+    /// **Codex HIGH-1 closure:** verify `set_local_peer` resyncs the
+    /// counter past any existing `Custom(peer, _)` entries so a
+    /// subsequent `intern` doesn't overwrite a replayed entry.
+    ///
+    /// Pre-fix scenario: replay registers `Custom(P, 0)` → "X" while
+    /// local_peer = LEGACY. Then `set_local_peer(P)`; intern("Y")
+    /// would allocate `Custom(P, 0)` (counter unchanged at 0) and
+    /// CORRUPT the existing entry. Post-fix: set_local_peer scans
+    /// by_id, finds Custom(P, 0), bumps counter to 1; intern("Y")
+    /// allocates Custom(P, 1).
+    #[test]
+    fn set_local_peer_resyncs_counter_past_replayed_remote_entries() {
+        let mut t = FormatTable::with_peer(LEGACY_PEER);
+        // Simulate replay of a remote peer's Op::RegisterFormat.
+        let remote_peer = PeerId::new(0xa1);
+        t.register_at(FormatId::Custom(remote_peer, 0), "X")
+            .unwrap();
+        t.register_at(FormatId::Custom(remote_peer, 1), "Y")
+            .unwrap();
+        t.register_at(FormatId::Custom(remote_peer, 3), "Z")
+            .unwrap();
+        // Counter still 0 because remote_peer ≠ local_peer.
+        assert_eq!(t.next_custom_counter(), 0);
+
+        // Now take over as remote_peer.
+        t.set_local_peer(remote_peer);
+        // Counter must have advanced past the max(0, 1, 3) = 3 → 4.
+        assert_eq!(
+            t.next_custom_counter(),
+            4,
+            "set_local_peer must scan + reset counter past existing Custom(new_peer, _) entries"
+        );
+
+        // intern("NEW") allocates Custom(remote_peer, 4) — does NOT
+        // overwrite any of the replayed entries.
+        let new_id = t.intern("NEW");
+        assert_eq!(new_id, FormatId::Custom(remote_peer, 4));
+        // Replayed entries survive.
+        assert_eq!(t.lookup(FormatId::Custom(remote_peer, 0)), Some("X"));
+        assert_eq!(t.lookup(FormatId::Custom(remote_peer, 1)), Some("Y"));
+        assert_eq!(t.lookup(FormatId::Custom(remote_peer, 3)), Some("Z"));
+        assert_eq!(t.lookup(new_id), Some("NEW"));
+    }
+
+    #[test]
+    fn set_local_peer_resets_counter_to_zero_when_no_existing_entries() {
+        // If the new peer has no Custom(new_peer, _) entries yet,
+        // counter resets to 0 (fresh allocator namespace).
+        let mut t = FormatTable::with_peer(LEGACY_PEER);
+        let _ = t.intern("A"); // Custom(LEGACY, 0)
+        let _ = t.intern("B"); // Custom(LEGACY, 1)
+        assert_eq!(t.next_custom_counter(), 2);
+
+        t.set_local_peer(PeerId::new(0xb2));
+        // No Custom(0xb2, _) entries → counter resets to 0.
+        assert_eq!(t.next_custom_counter(), 0);
+        let next = t.intern("C");
+        assert_eq!(next, FormatId::Custom(PeerId::new(0xb2), 0));
+    }
+
+    /// **Codex HIGH-2: KNOWN LIMITATION (deferred to step 4).** Two
+    /// peers independently interning the same format string produces
+    /// `Custom(A, 0)` + `Custom(B, 0)` — collision-free `FormatId`s
+    /// by Phase 5.1 D-1 design. But replaying both currently fails
+    /// with `StringCollision` because the by_string dedup map is
+    /// global (not peer-scoped).
+    ///
+    /// Step 4 will restructure `by_string` to
+    /// `HashMap<(PeerId, String), FormatId>` + a separate map for
+    /// built-in strings. Until then, this test pins the CURRENT
+    /// rejection so step 4 explicitly notices when it removes the
+    /// false-positive collision.
+    ///
+    /// Today no production caller hits this scenario (multi-peer
+    /// wiring is step 4 work); single-writer mode + LEGACY_PEER
+    /// dedupe correctly via the existing by_string map.
+    #[test]
+    fn cross_peer_same_string_collision_is_known_limitation() {
+        let mut t = FormatTable::with_peer(LEGACY_PEER);
+        let peer_a = PeerId::new(0xa);
+        let peer_b = PeerId::new(0xb);
+
+        // Replay peer A's op.
+        t.register_at(FormatId::Custom(peer_a, 0), "yyyy-mm-dd")
+            .unwrap();
+        // Replay peer B's op for the same string. Step 4 will accept;
+        // pre-step-4 rejects with StringCollision.
+        let result = t.register_at(FormatId::Custom(peer_b, 0), "yyyy-mm-dd");
+        assert!(
+            matches!(result, Err(FormatTableError::StringCollision { .. })),
+            "Step 3 KNOWN LIMITATION: cross-peer same-string is rejected. \
+             Step 4 must restructure by_string to allow it. Got: {result:?}"
+        );
+    }
+
+    /// **Opus L4 closure:** pin that `Builtin(0)` and
+    /// `Custom(LEGACY_PEER, 0)` (which would round-trip to legacy
+    /// u32=164) hash + compare as DIFFERENT FormatIds. The
+    /// derive(Eq) and derive(Hash) on enum variants guarantee this,
+    /// but a regression test documents the invariant.
+    #[test]
+    fn builtin_and_custom_with_same_inner_zero_are_distinct() {
+        use std::collections::HashMap;
+        let b = FormatId::Builtin(0);
+        let c = FormatId::Custom(LEGACY_PEER, 0);
+        assert_ne!(b, c, "Eq must distinguish variants with same inner value");
+        let mut map: HashMap<FormatId, &str> = HashMap::new();
+        map.insert(b, "builtin");
+        map.insert(c, "custom");
+        assert_eq!(map.len(), 2, "Hash must distinguish variants");
+        assert_eq!(map.get(&b), Some(&"builtin"));
+        assert_eq!(map.get(&c), Some(&"custom"));
+    }
+
+    /// **Opus M2 closure:** pin that `register_at(Builtin(N), s)` does
+    /// NOT advance the local counter. The counter advancement logic
+    /// is only triggered by `Custom(local_peer, c)` ids.
+    #[test]
+    fn register_at_builtin_does_not_advance_counter() {
+        let mut t = FormatTable::with_peer(LEGACY_PEER);
+        let baseline = t.next_custom_counter();
+        // Register a built-in that wasn't pre-loaded (V2-deferred ids
+        // like 12, 38, 46).
+        t.register_at(FormatId::Builtin(12), "# ?/?").unwrap();
+        t.register_at(FormatId::Builtin(38), "[Red]0").unwrap();
+        assert_eq!(
+            t.next_custom_counter(),
+            baseline,
+            "register_at(Builtin(_)) must not advance the custom counter"
+        );
     }
 }
