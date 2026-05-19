@@ -11,16 +11,29 @@
 //! which gives the desired "last position update wins per peer"
 //! semantics.
 //!
-//! ## Persistence
+//! ## Persistence (V1 known limitation)
 //!
-//! Presence updates DO survive `OpLog::export_bytes` /
-//! `import_bytes` (they live in the same `LoroDoc`), but the
-//! `.qbook` envelope (`ql_io::oplog_persistence`) writes the
-//! whole snapshot, so cold-restart presence will land in the new
-//! session. Phase 5.6 V2 may add envelope-level filtering if
-//! "rejoin and see stale presence" turns out to be undesirable
-//! UX; V1 keeps the data so the multi-peer round-trip test
-//! pattern works.
+//! The pre-implementation design (Phase 5.1) said "presence does
+//! NOT persist across `.qbook` save/load." V1 implementation
+//! deviates: presence DOES persist because it lives in the same
+//! `LoroDoc` that gets exported into `oplog.bin`. Cold restart
+//! restores stale presence entries.
+//!
+//! V1 treats this as ACCEPTABLE because (a) rejoining peers
+//! overwrite their own entry on first `update_presence`; (b)
+//! stale absent-peer entries are visually distinguishable in
+//! the IDE (Phase 5.7); (c) eviction would require either
+//! per-container export filtering (Loro doesn't expose this in
+//! 1.12.0) or a load-time sweep (forward work).
+//!
+//! V2 may add the eviction sweep. Until then, callers that
+//! want "clean slate on reopen" should call
+//! [`crate::CollabSession::clear_presence`] after
+//! [`crate::CollabSession::from_snapshot`] and re-
+//! `update_presence` with current state.
+//!
+//! Cross-ref: `docs/architecture/crdt-data-model.md` §
+//! Presence container.
 //!
 //! ## Concurrency
 //!

@@ -106,7 +106,7 @@ post-merge.
 | 5.3 | Conflict Resolution Semantics | 4-7 days | Causality-aware rename-repair pass; multi-value / delete-vs-update. Loro merge is Fugue/origin-based (not Lamport LWW — corrected by Phase 5.1 audit). |
 | 5.4 | Undo/Redo + Operation Grouping | 1 week | Local undo over collaborative ops. |
 | 5.5 | Transport Layer + Offline Sync | 1-2 weeks | WebSocket + reconnect merge. |
-| 5.6 | Presence + Awareness | 3-5 days | Ephemeral state; must not dirty workbook graph. |
+| 5.6 | Presence + Awareness | 3-5 days | **🟢 V1 SHIPPED `c677e244704`** — `"presence"` LoroMap + `PresenceState` + 4 CollabSession methods + 11 tests. V2 follow-up: load-time presence-eviction sweep + presence-changed callbacks. Known V1 limitation: presence persists across `.qbook` save/load (Codex 5.6 audit MED-1). |
 | 5.7 | IDE Vertical Slice | 1 week | Two-window editing. |
 | 5.8 | Phase 5 Megaudit | 4-6 days | Randomized peer-merge tests + transport failure modes. |
 

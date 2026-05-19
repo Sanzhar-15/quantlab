@@ -215,17 +215,20 @@ LoroDoc
 
 ### Presence container: `"presence"` LoroMap (per-peer ephemeral)
 
-New for Phase 5.6. Holds the per-peer cursor + selection +
-typing indicator. Keys are peer-IDs (UUIDs); values are JSON
-blobs with `{sheet, row, col, selection_end_row,
+**Phase 5.6 V1 ✅ shipped at `c677e244704` (2026-05-19).**
+Holds the per-peer cursor + selection + typing indicator. Keys
+are `ql_collab::PeerId` in 16-hex `Display` form (the audit
+during 5.6 V1 deviated from the pre-implementation "UUIDs"
+language since PeerId is u64-native to match Loro's PeerID type);
+values are JSON blobs with `{sheet, row, col, selection_end_row,
 selection_end_col, typing: bool}`.
 
 ```
 LoroDoc
 ├── LoroList "ops"
 └── LoroMap "presence"
-    ├── "peer-uuid-A": "{\"sheet\":0,\"row\":3,\"col\":2,...}"
-    └── "peer-uuid-B": "{\"sheet\":1,\"row\":0,\"col\":0,...}"
+    ├── "0000000000000001": "{\"sheet\":0,\"row\":3,\"col\":2,...}"
+    └── "0000000000000002": "{\"sheet\":1,\"row\":0,\"col\":0,...}"
 ```
 
 **Why MOM (Map of Maps) is wrong for cells but right for presence**:
@@ -237,11 +240,29 @@ LoroDoc
   its own key. LoroMap LWW merge gives "last position update
   wins per peer," which is exactly the desired semantic.
 
-Presence updates do NOT persist across `.qbook` save/load.
-Phase 5.6 wires the in-memory presence map; `.qbook` envelope
-v8 may or may not persist it depending on whether the use case
-demands "rejoin a session and see where teammates were" — out
-of 5.1 scope.
+**Persistence (V1 known limitation):** the pre-implementation
+design said "Presence updates do NOT persist across `.qbook`
+save/load." The V1 implementation persists presence *de facto*
+because it lives in the same `LoroDoc` as `"ops"`, and
+`oplog_persistence::save_workbook_with_oplog` writes the
+WHOLE Loro snapshot to `oplog.bin`. So a cold restart DOES
+restore stale presence entries.
+
+V1 treats this as ACCEPTABLE because:
+1. Presence keys are peer-ids; on reopen the rejoining peer's
+   own entry is overwritten on first `update_presence` call.
+2. Stale entries from peers not in the current session are
+   visually distinguishable in the IDE (Phase 5.7) since they
+   point at stale positions for absent peers.
+3. Eviction would require either per-container export filtering
+   (Loro doesn't expose this) or a load-time `presence_remove`
+   sweep (forward work).
+
+V2 may add the eviction sweep (`docs/PHASE-4-V2-BACKLOG.md` or
+a 5.6 V2 plan, TBD). Until then, callers expecting "clean
+slate on reopen" must call `CollabSession::clear_presence`
+after `from_snapshot` and re-`update_presence` with current
+state.
 
 ### Snapshot container: `"snapshot"` LoroMap (reserved, V2)
 

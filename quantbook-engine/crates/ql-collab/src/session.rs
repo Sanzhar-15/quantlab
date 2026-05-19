@@ -11,7 +11,9 @@
 //!   local op → broadcast bytes via [`crate::Transport::send`];
 //!   poll [`crate::Transport::try_recv`] for remote bytes →
 //!   `merge_bytes`.
-//! - **Phase 5.6** — presence map updates (per-peer cursor + selection).
+//! - ~~**Phase 5.6**~~ ✅ V1 shipped at `c677e244704` — `presence`
+//!   module + 4 `CollabSession` methods (`update_presence` /
+//!   `peer_presence` / `clear_presence` / `peers_with_presence`).
 //! - **Phase 5.7** — IDE binding: `CollabSession` becomes the engine
 //!   handle that the IDE attaches to each open workbook.
 //!
@@ -444,6 +446,79 @@ mod tests {
         let mut peers = peer_a.peers_with_presence().unwrap();
         peers.sort();
         assert_eq!(peers, vec![PeerId::new(0x0a), PeerId::new(0x0b)]);
+    }
+
+    #[test]
+    fn presence_merge_is_commutative() {
+        // Audit-discipline closure (Codex 5.6 V1 LOW-1): the
+        // existing 2-peer test only verifies one merge direction.
+        // This test exercises BOTH directions and asserts the
+        // final state is identical.
+        fn make_pair() -> (CollabSession, CollabSession) {
+            let base = CollabSession::new(PeerId::new(1)).unwrap();
+            let base_bytes = base.export_bytes().unwrap();
+            let mut a = CollabSession::from_snapshot(PeerId::new(0xa1), &base_bytes).unwrap();
+            a.update_presence(PresenceState::at_cell(0, 1, 2)).unwrap();
+            let mut b = CollabSession::from_snapshot(PeerId::new(0xb1), &base_bytes).unwrap();
+            b.update_presence(PresenceState::at_cell(3, 4, 5)).unwrap();
+            (a, b)
+        }
+
+        // Direction 1: A merges B.
+        let (mut a1, b1) = make_pair();
+        a1.merge_bytes(&b1.export_bytes().unwrap()).unwrap();
+
+        // Direction 2: B merges A (fresh pair to avoid state pollution).
+        let (a2, mut b2) = make_pair();
+        b2.merge_bytes(&a2.export_bytes().unwrap()).unwrap();
+
+        // Both ended states must agree on the peer set + per-peer
+        // values.
+        let mut a1_peers = a1.peers_with_presence().unwrap();
+        let mut b2_peers = b2.peers_with_presence().unwrap();
+        a1_peers.sort();
+        b2_peers.sort();
+        assert_eq!(a1_peers, b2_peers);
+        for peer in a1_peers {
+            assert_eq!(
+                a1.peer_presence(peer).unwrap(),
+                b2.peer_presence(peer).unwrap(),
+                "peer {peer:?} state must agree across merge directions"
+            );
+        }
+    }
+
+    #[test]
+    fn presence_tombstone_propagates_through_merge() {
+        // Audit-discipline closure (Codex 5.6 V1 LOW-1 / C4): peer A
+        // sets presence, B merges + sees A. Then A clears its
+        // presence and re-exports. B merges the cleared snapshot
+        // and MUST observe A as gone.
+        let base = CollabSession::new(PeerId::new(1)).unwrap();
+        let base_bytes = base.export_bytes().unwrap();
+
+        let mut peer_a = CollabSession::from_snapshot(PeerId::new(0xaa), &base_bytes).unwrap();
+        peer_a
+            .update_presence(PresenceState::at_cell(0, 0, 0))
+            .unwrap();
+
+        let mut peer_b = CollabSession::from_snapshot(PeerId::new(0xbb), &base_bytes).unwrap();
+        peer_b.merge_bytes(&peer_a.export_bytes().unwrap()).unwrap();
+        assert!(
+            peer_b.peer_presence(PeerId::new(0xaa)).unwrap().is_some(),
+            "B must initially see A's presence after first merge"
+        );
+
+        // A leaves the session.
+        peer_a.clear_presence().unwrap();
+
+        // B pulls A's new state.
+        peer_b.merge_bytes(&peer_a.export_bytes().unwrap()).unwrap();
+        assert_eq!(
+            peer_b.peer_presence(PeerId::new(0xaa)).unwrap(),
+            None,
+            "B must see A as cleared after merging the tombstone"
+        );
     }
 
     #[test]

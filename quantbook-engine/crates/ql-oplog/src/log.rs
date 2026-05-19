@@ -492,6 +492,54 @@ mod tests {
     }
 
     #[test]
+    fn presence_same_key_lww_under_concurrent_merge() {
+        // Audit-discipline closure (Codex 5.6 V1 LOW-1 / C2): two
+        // peers writing to the SAME presence key produces ONE
+        // surviving value at merge time (LoroMap LWW by Lamport
+        // then peer id). Pin the behavior so a future Loro upgrade
+        // can't silently change it.
+        //
+        // The "same key, different peers" case is the deliberate
+        // duplicate-peer-id scenario the docstrings warn against,
+        // but we want to verify the data IS still single-valued
+        // post-merge rather than corrupted.
+        let base = OpLog::new();
+        base.set_peer_id(1).unwrap();
+        let base_bytes = base.export_bytes().unwrap();
+
+        let mut peer_a = OpLog::import_bytes(&base_bytes).unwrap();
+        peer_a.set_peer_id(10).unwrap();
+        peer_a
+            .presence_set("shared-key", r#"{"from":"A"}"#)
+            .unwrap();
+
+        let mut peer_b = OpLog::import_bytes(&base_bytes).unwrap();
+        peer_b.set_peer_id(20).unwrap();
+        peer_b
+            .presence_set("shared-key", r#"{"from":"B"}"#)
+            .unwrap();
+
+        // A merges B.
+        peer_a.merge_bytes(&peer_b.export_bytes().unwrap()).unwrap();
+
+        // Exactly one value survives — LWW by (lamport, peer_id).
+        // Both peers had lamport=1 so peer-id tiebreaker picks B's
+        // value (20 > 10). Whichever loro chose, assert it's ONE of
+        // the two writes (no corruption) and that listing peers
+        // returns exactly one entry.
+        let value = peer_a.presence_get("shared-key").unwrap().unwrap();
+        assert!(
+            value == r#"{"from":"A"}"# || value == r#"{"from":"B"}"#,
+            "same-key concurrent write must produce one of the two values, got {value:?}"
+        );
+        assert_eq!(
+            peer_a.presence_peers(),
+            vec!["shared-key".to_owned()],
+            "same-key concurrent write must yield exactly one map entry"
+        );
+    }
+
+    #[test]
     fn presence_independent_from_op_log() {
         // Presence writes MUST NOT increment the op log cached_len.
         let mut log = OpLog::new();

@@ -11,8 +11,9 @@
 //!   `LoroDoc::set_peer_id` so concurrent appends carry the right
 //!   origin in the CRDT merge metadata (Phase 5.2.b 2026-05-19;
 //!   5.2.a stored this as a label only).
-//! - Phase 5.6 presence module — will key the `presence` `LoroMap`
-//!   so each peer's cursor position lives at its own slot.
+//! - Phase 5.6 presence module — keys the `presence` `LoroMap`
+//!   in 16-hex `Display` form so each peer's cursor position
+//!   lives at its own slot (✅ shipped at `c677e244704`).
 //! - Phase 5 D-1 (pending) — the `FormatId::Custom { peer, counter }`
 //!   variant will use this type for collision-free format-id
 //!   allocation across peers.
