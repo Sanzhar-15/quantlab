@@ -10,3 +10,13 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+# **Phase 5.2.a (2026-05-19) — ql-collab scaffold.** Per the audit-
+# closed design at `docs/architecture/crdt-data-model.md`,
+# ql-collab is the Phase 5 collaboration crate. Depends on
+# ql-oplog (the dependency floor post Tier D2) for OpLog + Op +
+# merge_bytes. ql-storage gives us Workbook for replay
+# integration; ql-functions provides the registry needed by replay.
+ql-oplog     = { path = "../ql-oplog" }
+ql-storage   = { path = "../ql-storage" }
+ql-functions = { path = "../ql-functions" }
+thiserror    = { workspace = true }
