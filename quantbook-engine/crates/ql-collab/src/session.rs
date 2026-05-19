@@ -781,6 +781,49 @@ mod tests {
     }
 
     #[test]
+    fn two_sessions_exchange_state_via_loopback_transport() {
+        // Phase 5.5 V1 integration: drive two CollabSessions
+        // through a LoopbackTransport pair. V1 doesn't auto-
+        // flush appends to the transport (5.5 V2 work), so the
+        // test manually exports/sends/recvs/merges to verify the
+        // wire actually carries the right bytes.
+        use crate::transport::{LoopbackTransport, Transport};
+        let (mut tx_a, mut tx_b) = LoopbackTransport::pair();
+
+        let base = CollabSession::new(PeerId::new(1)).unwrap();
+        let base_bytes = base.export_bytes().unwrap();
+
+        let mut peer_a = CollabSession::from_snapshot(PeerId::new(0xa), &base_bytes).unwrap();
+        let mut peer_b = CollabSession::from_snapshot(PeerId::new(0xb), &base_bytes).unwrap();
+
+        // Peer A appends an op, exports, sends over the wire.
+        peer_a.append_op(put_value(0, 0, 0, 42.0)).unwrap();
+        let a_bytes = peer_a.export_bytes().unwrap();
+        tx_a.send(&a_bytes).unwrap();
+
+        // Peer B drains the transport and merges.
+        let received = tx_b
+            .try_recv()
+            .unwrap()
+            .expect("tx_b must receive A's bytes");
+        assert_eq!(received, a_bytes);
+        peer_b.merge_bytes(&received).unwrap();
+        assert!(peer_b.op_count() >= 1, "B must see A's op after merge");
+
+        // Reverse direction: B appends, sends to A.
+        peer_b.append_op(put_value(0, 1, 0, 99.0)).unwrap();
+        tx_b.send(&peer_b.export_bytes().unwrap()).unwrap();
+        let b_received = tx_a
+            .try_recv()
+            .unwrap()
+            .expect("tx_a must receive B's bytes");
+        peer_a.merge_bytes(&b_received).unwrap();
+
+        // After the exchange, both sessions converge on the same op count.
+        assert_eq!(peer_a.op_count(), peer_b.op_count());
+    }
+
+    #[test]
     fn debug_includes_undo_redo_counts() {
         let mut s = CollabSession::new(PeerId::new(42)).unwrap();
         s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
@@ -824,7 +867,4 @@ mod tests {
         let result = CollabSession::from_snapshot(PeerId::new(u64::MAX), &bytes);
         assert!(
             matches!(result, Err(CollabSessionError::OpLog(_))),
-            "from_snapshot(u64::MAX) must fail; got {result:?}"
-        );
-    }
-}
+     

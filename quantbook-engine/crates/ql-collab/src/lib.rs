@@ -14,8 +14,11 @@
 //! - [`session`] — `CollabSession`: per-peer state holder that
 //!   wraps an `OpLog`, manages local appends, and exposes
 //!   `merge_bytes` + `export_bytes` for transport integration.
-//! - [`transport`] — `Transport` trait: the wire-byte channel
-//!   abstraction (Phase 5.5 will add a WebSocket impl).
+//! - [`transport`] — `Transport` trait + 2 impls: `NoopTransport`
+//!   (test stub, records sends + returns None forever) and
+//!   `LoopbackTransport` (Phase 5.5 V1 ship 2026-05-19 —
+//!   in-process paired endpoints for 2-peer round-trip tests).
+//!   Phase 5.5 V2 will add a WebSocket impl.
 //! - [`presence`] — per-peer ephemeral cursor + selection state
 //!   (Phase 5.6 V1 ship 2026-05-19). `PresenceState` JSON-encoded
 //!   into the shared `LoroDoc`'s `"presence"` LoroMap (LWW per key).
@@ -60,5 +63,5 @@ pub mod undo;
 pub use peer::PeerId;
 pub use presence::{PresenceError, PresenceState};
 pub use session::{CollabSession, CollabSessionError};
-pub use transport::{NoopTransport, Transport, TransportError};
+pub use transport::{LoopbackTransport, NoopTransport, Transport, TransportError};
 pub use undo::UndoManager;
