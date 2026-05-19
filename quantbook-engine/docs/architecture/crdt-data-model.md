@@ -446,18 +446,19 @@ the same `replay_into` internally.
 
 ## `ql-collab` crate scope
 
-**Phase 5 V1 COMPLETE 2026-05-19.** Current 5-module surface (verified against `crates/ql-collab/src/lib.rs`):
+**Phase 5 V1 COMPLETE 2026-05-19. D-1 step 1.1 (2026-05-19) moved PeerId to `ql_types`.** Current 4-module surface (verified against `crates/ql-collab/src/lib.rs`):
 
 ```rust
 // crates/ql-collab/src/lib.rs
 
-pub mod peer;        // PeerId newtype (u64 wrapper, 16-hex Display)
 pub mod presence;    // PresenceState + per-peer LoroMap (5.6 V1+V2)
 pub mod session;     // CollabSession + UndoGroupGuard (5.2.a..5.5 V2 V1)
 pub mod transport;   // Transport trait + NoopTransport + LoopbackTransport (5.5 V1+V2 V1)
 pub mod undo;        // pub use loro::UndoManager (5.4 V1+V2 V1+V2 V1.1)
 
-pub use peer::PeerId;
+// PeerId lives in ql_types (D-1 step 1.1); re-exported through ql_oplog.
+pub use ql_oplog::PeerId;
+
 pub use presence::{PresenceError, PresenceState};
 pub use session::{CollabSession, CollabSessionError, UndoGroupGuard};
 pub use transport::{LoopbackTransport, NoopTransport, Transport, TransportError};

@@ -50,12 +50,11 @@ Sites that need updating, grouped by crate:
 ### `ql-oplog` (wire format)
 
 - `crates/ql-oplog/src/op.rs`:
-  - `Op::RegisterFormat { id: u32, string: String }` → `Op::RegisterFormat { id: FormatId, string: String }`. Since FormatId is not currently in ql-oplog (it lives in ql-storage), need to introduce a wire-format type:
-    - Option A (clean): add `ql-oplog::FormatIdWire` that mirrors the tagged tuple, with `from_storage`/`to_storage` conversions at the boundary.
-    - Option B (couple): make ql-oplog depend on ql-storage. Currently doesn't — Tier D2 made ql-oplog the dependency floor.
-    - **Recommend Option A.** Matches the pattern of `CellWireValue` / `NamedTargetWire` already in `ql_oplog::wire`.
+  - `Op::RegisterFormat { id: u32, string: String }` → `Op::RegisterFormat { id: FormatIdWire, string: String }`. Since FormatId is owned by `ql-storage` and `ql-oplog` already depends on `ql-storage` (verified 2026-05-19; the doc previously claimed otherwise), introduce a wire-format type:
+    - Option A (clean): add `ql-oplog::FormatIdWire` that mirrors the tagged tuple, with `from_storage`/`to_storage` conversions at the boundary. Matches the pattern of `CellWireValue` / `NamedTargetWire` already in `ql_oplog::wire`. **Recommended.**
+    - Option B (direct re-use): `Op::RegisterFormat { id: ql_storage::FormatId, ... }`. Simpler but couples wire shape to storage shape — diverges from existing `CellWireValue` pattern.
   - `Op::SetCellFormat { sheet, row, col, id: FormatId }` (currently has `id: FormatId` per the audit doc) — sync to new shape.
-  - `PeerId` needs to be accessible at this layer for the `Custom(PeerId, u32)` variant. Either: (a) move `ql-collab::PeerId` down to `ql-oplog::PeerId`; (b) introduce a copy at ql-oplog level. **Recommend (a)** since PeerId is a Loro-native u64 — fits naturally at the op log layer.
+  - `PeerId` for `FormatIdWire::Custom(PeerId, u32)`: **shipped at step 1.1 in `ql_types::PeerId`** (✅ commit pending — was briefly at `ql_oplog::PeerId` in step 1 `aaa54d32f4d` but the step-1 audit caught a forthcoming Cargo cycle for step 3's `ql_storage::FormatId::Custom(PeerId, _)`; ql-storage can't depend on ql-oplog). `ql-oplog` + `ql-collab` re-export `ql_types::PeerId` for back-compat.
 
 ### `ql-io` (persistence envelope)
 
@@ -63,7 +62,7 @@ Sites that need updating, grouped by crate:
   - Cell-format-id encoding in the envelope JSON. Old: bare u32 number. New: tagged variant (e.g. `{"Builtin": 14}` or `{"Custom": [peer_hex, counter]}`).
   - **Schema bump:** `WORKBOOK_SCHEMA_VERSION` increments.
   - Backwards-compat migration in the loader: if envelope schema version < N, read `u32` and convert to `FormatId::Builtin(n)` for `n ≤ 163` else `FormatId::Custom(LEGACY_PEER, n - 164)`.
-  - **Sentinel `LEGACY_PEER` constant proposal:** `pub const LEGACY_PEER: PeerId = PeerId::new(0)` in `ql-oplog::peer` (the new home for PeerId per D-1 step 1). PeerId(0) is a reserved sentinel — Loro accepts it as a valid peer-id but Phase 5.2.b documents that "two concurrent sessions MUST use distinct peer ids," so production callers will avoid 0; LegacyPeer claiming 0 is safe. Alternative: `PeerId(u64::MAX - 1)` (Loro rejects MAX itself but MAX-1 is valid). Pick one in step 1.
+  - **Sentinel `LEGACY_PEER` constant: ✅ shipped at step 1.1** as `pub const LEGACY_PEER: PeerId = PeerId::new(0)` in `ql_types::peer`. PeerId(0) is a reserved sentinel — Loro accepts it as a valid peer-id but Phase 5.2.b documents that "two concurrent sessions MUST use distinct peer ids," so production callers will avoid 0; LegacyPeer claiming 0 is safe. (Alternative `PeerId(u64::MAX - 1)` was considered but `0` is the more obvious sentinel.)
 
 ### `ql-io-xlsx` (xlsx interop)
 
@@ -84,12 +83,22 @@ Sites that need updating, grouped by crate:
 
 This is the suggested order to keep the codebase in a compile-clean intermediate state after each step:
 
-### Step 1: Introduce `PeerId` at ql-oplog layer (1-2 hours)
+### Step 1: Introduce `PeerId` at ql-types layer (1-2 hours) — ✅ SHIPPED 2026-05-19
 
-- Move `ql-collab::peer::PeerId` to `ql-oplog::peer::PeerId` (or copy-then-re-export to avoid breaking ql-collab callers).
-- `ql-collab` re-exports `ql_oplog::PeerId` to keep its public surface stable.
+- ✅ Step 1 (commit `aaa54d32f4d`): moved `ql_collab::peer::PeerId` to
+  `ql_oplog::peer::PeerId`. `ql_collab` re-exports `ql_oplog::PeerId`.
+- ✅ Step 1.1 (commit pending after Codex audit): moved PeerId AGAIN
+  to `ql_types::peer::PeerId` after the step-1 audit caught a
+  forthcoming Cargo cycle. `ql-oplog` already depends on `ql-storage`;
+  step 3's `ql_storage::FormatId::Custom(PeerId, _)` referencing a
+  type living in `ql-oplog` would loop. `ql-types` is the true
+  dependency floor — both `ql-storage` and `ql-oplog` depend on it.
+  Also adds `#[serde(transparent)]` derives + `LEGACY_PEER` constant
+  (= `PeerId(0)`) for step 5's qbook migration.
+- `ql-oplog` + `ql-collab` re-export `ql_types::PeerId` for back-compat.
 - Verify gates green.
-- Commit: `Phase 5.2 D-1 step 1 — move PeerId to ql-oplog layer`.
+- Commit: `Phase 5.2 D-1 step 1 — move PeerId to ql-oplog layer`
+  + `Phase 5.2 D-1 step 1.1 — move PeerId to ql-types + serde + LEGACY_PEER`.
 
 ### Step 2: Introduce `FormatIdWire` in ql-oplog (1-2 hours)
 

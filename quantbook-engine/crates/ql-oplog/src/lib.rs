@@ -38,16 +38,25 @@
 pub mod error;
 pub mod log;
 pub mod op;
-pub mod peer;
 pub mod replay;
 pub mod wire;
 
 pub use error::OpLogError;
 pub use log::{OpLog, PRESENCE_COMMIT_ORIGIN};
 pub use op::{LocaleWire, Op, ReferenceModeWire};
-pub use peer::PeerId;
 pub use replay::{replay_into, ReplayError};
 pub use wire::{CellWireValue, NamedTargetWire, WireDecodeError};
+
+// Phase 5.2 D-1 step 1.1 (2026-05-19) — re-export `ql_types::PeerId`
+// for ergonomics. PeerId lived briefly at `ql_oplog::PeerId` in step 1
+// (commit aaa54d32f4d) but the step-1 audit caught a forthcoming Cargo
+// cycle: `ql_storage::FormatId::Custom(PeerId, _)` (step 3) cannot
+// reference a type living in `ql-oplog` because `ql-oplog` already
+// depends on `ql-storage`. PeerId moved to `ql_types` (the true
+// dependency floor); `ql-oplog` re-exports for back-compat so callers
+// like `ql_collab::CollabSession` (which already imports from
+// ql-oplog for `Op` + `OpLog`) can keep using a single import line.
+pub use ql_types::PeerId;
 
 // **Tier D2 (2026-05-19) — Phase 4.12 Opus-C HIGH-3 closure**: the
 // `persistence` module (save_workbook_with_oplog / load_workbook_with_oplog

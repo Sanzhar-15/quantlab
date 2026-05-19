@@ -10,3 +10,10 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+# Phase 5.2 D-1 step 1.1 (2026-05-19) — `PeerId` (and forthcoming
+# `FormatId` tagged tuple) need serde for wire-format round-trips.
+serde = { workspace = true }
+
+[dev-dependencies]
+# Step-1.1 unit test verifies PeerId's serde-transparent JSON shape.
+serde_json = { workspace = true }

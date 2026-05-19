@@ -30,6 +30,7 @@ pub mod coercion;
 pub mod date;
 pub mod error;
 pub mod eval_context;
+pub mod peer;
 pub mod value;
 
 pub use address::{Address, ColId, Range, RowId, SheetId, MAX_COLUMN, MAX_ROW};
@@ -48,6 +49,7 @@ pub use error::{ErrorValue, ParseErrorValueError};
 pub use eval_context::{
     DateSystem, EvalContext, Locale, NowProvider, ReferenceMode, DEFAULT_EVAL_CONTEXT,
 };
+pub use peer::{PeerId, LEGACY_PEER};
 pub use value::Value;
 
 #[cfg(test)]

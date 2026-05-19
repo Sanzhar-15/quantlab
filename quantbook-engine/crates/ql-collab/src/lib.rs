@@ -9,9 +9,12 @@
 //!
 //! ## Module layout
 //!
-//! - `PeerId` — re-exported from [`ql_oplog::PeerId`] (Phase 5.2 D-1
-//!   step 1, 2026-05-19; originally `ql_collab::peer::PeerId` at 5.2.a).
-//!   Stable per-session identifier; wraps Loro's `u64`.
+//! - `PeerId` — re-exported from [`ql_types::PeerId`] (Phase 5.2 D-1
+//!   step 1.1, 2026-05-19; originally `ql_collab::peer::PeerId` at
+//!   5.2.a, briefly relocated to `ql_oplog::PeerId` at step 1, finally
+//!   at `ql_types::PeerId` after the step-1 Codex audit caught a
+//!   forthcoming Cargo cycle). Stable per-session identifier; wraps
+//!   Loro's `u64`.
 //! - [`session`] — `CollabSession`: per-peer state holder that
 //!   wraps an `OpLog`, manages local appends, and exposes
 //!   `merge_bytes` + `export_bytes` for transport integration.
@@ -59,17 +62,36 @@
 //!   `CollabSession::op_log()` (`&OpLog`) which would silently clear
 //!   an attached `UndoManager`'s stacks per Loro's internal
 //!   subscription behavior (`loro-internal::undo:654-662`).
-//! - **Phase 5.2 D-1 step 1 (2026-05-19):** `PeerId` moved from
-//!   `ql_collab::peer::PeerId` to `ql_oplog::peer::PeerId` (preparation
-//!   for `FormatId::Custom(PeerId, u32)`). `ql_collab::PeerId` is now
-//!   a re-export of `ql_oplog::PeerId` — public surface unchanged,
-//!   external callers using `ql_collab::PeerId` keep working.
+//! - **Phase 5.2 D-1 step 1 (2026-05-19, `aaa54d32f4d`):** `PeerId`
+//!   moved from `ql_collab::peer::PeerId` to `ql_oplog::peer::PeerId`.
+//!   Brief intermediate placement; superseded same-day by step 1.1.
+//! - **Phase 5.2 D-1 step 1.1 (2026-05-19):** Codex audit on step 1
+//!   caught (a) PeerId lacked `Serialize`/`Deserialize` (blocks step
+//!   2's serde-derived `FormatIdWire`); (b) `ql_storage::FormatId::Custom(PeerId, _)`
+//!   in step 3 would form a Cargo cycle (`ql-oplog -> ql-storage` exists;
+//!   making `ql-storage -> ql-oplog` for PeerId would loop). Step 1.1
+//!   moved PeerId to `ql_types::PeerId` (the true dependency floor —
+//!   `ql-storage`, `ql-oplog`, and `ql-collab` all depend on it),
+//!   added `#[serde(transparent)]` derives, and shipped the
+//!   `LEGACY_PEER` sentinel (= `PeerId(0)`) for step 5's qbook
+//!   migration. `ql_collab::PeerId` now re-exports `ql_types::PeerId`.
+//!
+//!   **Back-compat surface:** `use ql_collab::PeerId;` keeps working
+//!   unchanged (both step 1 and step 1.1 preserve the re-export).
+//!   `use ql_collab::peer::PeerId;` (the old module path) was broken
+//!   by step 1 and stays broken — `pub mod peer` is gone. Workspace
+//!   grep confirms no such caller existed; external consumers were
+//!   already using `ql_collab::PeerId` (the re-export).
 
 pub mod presence;
 pub mod session;
 pub mod transport;
 pub mod undo;
 
+// PeerId actually lives in `ql_types` post step 1.1, but ql-collab
+// re-exports via `ql_oplog::PeerId` (itself a re-export) to avoid
+// adding a new direct `ql-types` Cargo dep on ql-collab. External
+// callers using `use ql_collab::PeerId;` resolve identically.
 pub use ql_oplog::PeerId;
 
 pub use presence::{PresenceError, PresenceState};
