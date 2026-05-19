@@ -4,11 +4,13 @@
 //! with peer-id-aware operations + transport plumbing. Subsequent
 //! phases populate richer behavior:
 //!
-//! - ~~**Phase 5.4**~~ ✅ V1 shipped at `89c02b9d83e` — per-peer
-//!   Loro `UndoManager` tracks local appends. Undo APPENDS
-//!   inverse ops + retracts originals from the visible `"ops"`
-//!   list (NOT physical removal). Presence-origin commits
-//!   excluded. See [`session::CollabSession::undo`].
+//! - ~~**Phase 5.4**~~ ✅ V1 shipped at `89c02b9d83e` + V2 V1
+//!   shipped at `6138a7203f6` — V1: 7 undo/redo methods wrapping
+//!   per-peer `loro::UndoManager`; undo retracts originals from
+//!   the visible `"ops"` list. V2 V1: `start_undo_group` /
+//!   `end_undo_group` + `set_undo_merge_interval` for atomic
+//!   multi-cell operations + auto-merge of rapid typing.
+//!   Presence-origin commits auto-excluded.
 //! - **Phase 5.5** — transport layer. V1 shipped at
 //!   `924750819bc` (LoopbackTransport for in-process 2-peer
 //!   tests). V2 V1 shipped at `ffd8f6e5f05` —
@@ -475,9 +477,20 @@ impl CollabSession {
     /// per-cell undo would surprise the user.
     ///
     /// Pair with [`end_undo_group`]. Calling `start_undo_group`
-    /// while a group is already open is Loro-defined behavior;
-    /// V1 callers SHOULD treat it as undefined and avoid nesting
-    /// until V2 V2 firms up the contract.
+    /// while a group is already open returns
+    /// `Err(CollabSessionError::Undo(LoroError::UndoGroupAlreadyStarted))`
+    /// deterministically (Loro 1.12.0 `loro-internal::undo:674-688`).
+    /// Nesting is NOT supported.
+    ///
+    /// **Caller pitfall — panic / error mid-group:** if a call
+    /// between `start_undo_group` and `end_undo_group` returns
+    /// `Err` (via `?`) or panics, the group stays open and the
+    /// next `start_undo_group` will fail with the deterministic
+    /// `UndoGroupAlreadyStarted` error. V2 V1 does NOT ship a
+    /// RAII guard; callers must close the group on every exit
+    /// path (e.g. via a `scopeguard::defer!` block or an explicit
+    /// try-block). V2 V1.1 will add a closure-based helper
+    /// (Codex+Opus 5.4 V2 V1 audit MEDIUM-3 follow-up).
     ///
     /// Closes GAP-C-04's "command grouping" half. Merge-interval
     /// auto-grouping is the complement — see
@@ -503,9 +516,13 @@ impl CollabSession {
     /// window auto-merge into a single undo unit — useful for
     /// rapid typing where per-keystroke undo is too granular.
     ///
-    /// `0` (Loro default) disables auto-merge. Phase 5.4 V1 used
-    /// the default; V2 V1 callers can opt in via this method.
-    /// Recommended IDE settings: 200-500 ms for typing windows.
+    /// `0` (Loro default) disables auto-merge. Negative values
+    /// behave as `0` (Loro stores the raw `i64` and the compare
+    /// `now - last_undo_time < interval_ms` is false for any
+    /// non-negative elapsed time vs a negative threshold). Phase
+    /// 5.4 V1 used the default; V2 V1 callers can opt in via
+    /// this method. Recommended IDE settings: 200-500 ms for
+    /// typing windows.
     ///
     /// Orthogonal to [`start_undo_group`] / [`end_undo_group`] —
     /// explicit groups take precedence over the interval.
@@ -935,6 +952,38 @@ mod tests {
         assert!(s.redo().unwrap());
         assert_eq!(s.op_log().iter().count(), 5);
         assert_eq!(s.undo_count(), 1);
+        assert_eq!(s.redo_count(), 0, "redo consumed the only redo item");
+    }
+
+    #[test]
+    fn nested_start_undo_group_returns_already_started_error() {
+        // Codex+Opus 5.4 V2 V1 audit MEDIUM-1 closure: Loro's
+        // group_start returns `Err(LoroError::UndoGroupAlreadyStarted)`
+        // deterministically. Pin the contract so a future Loro
+        // upgrade can't silently change it.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.start_undo_group().unwrap();
+        let err = s.start_undo_group().unwrap_err();
+        assert!(
+            matches!(err, CollabSessionError::Undo(_)),
+            "nested start_undo_group must return Undo(LoroError::UndoGroupAlreadyStarted), got {err:?}"
+        );
+        // Recovery works after explicit end.
+        s.end_undo_group();
+        assert!(s.start_undo_group().is_ok(), "fresh start after end works");
+        s.end_undo_group();
+    }
+
+    #[test]
+    fn empty_undo_group_pushes_no_unit() {
+        // Codex+Opus 5.4 V2 V1 audit LOW-1 closure: a group with
+        // no appends between start and end must NOT push a phantom
+        // undo unit onto the stack.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        let baseline = s.undo_count();
+        s.start_undo_group().unwrap();
+        s.end_undo_group();
+        assert_eq!(s.undo_count(), baseline, "empty group must not push a unit");
     }
 
     #[test]
@@ -1433,4 +1482,7 @@ mod tests {
         let result = CollabSession::from_snapshot(PeerId::new(u64::MAX), &bytes);
         assert!(
             matches!(result, Err(CollabSessionError::OpLog(_))),
-            "from_snapshot(u64::MAX) must fail; got {
+            "from_snapshot(u64::MAX) must fail; got {result:?}"
+        );
+    }
+}

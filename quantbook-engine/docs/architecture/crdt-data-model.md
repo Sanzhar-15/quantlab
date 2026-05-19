@@ -346,29 +346,41 @@ result: their edit retracts from the visible log AND propagates
 to peers via merge; the other user's edit (if later in causal
 order) stays.
 
-### V1 wired surface
+### Wired surface (V1 + V2 V1)
 
-`ql_collab::CollabSession` exposes 7 typed methods:
+`ql_collab::CollabSession` exposes 10 typed methods:
 - `undo() -> Result<bool, _>` / `redo() -> Result<bool, _>`
 - `can_undo() -> bool` / `can_redo() -> bool`
 - `undo_count() -> usize` / `redo_count() -> usize`
 - `clear_undo_stack()`
+- **V2 V1 (`6138a7203f6`):**
+  `start_undo_group() -> Result<(), _>` /
+  `end_undo_group()` — atomic multi-op grouping for paste /
+  fill-down / table-import operations.
+- **V2 V1:** `set_undo_merge_interval(i64)` — auto-merge
+  consecutive changes within the window (typing IDE hint).
 
 Plus `pub use loro::UndoManager` in `ql_collab::undo` for
 callers wanting raw access. Presence-origin commits
 (`PRESENCE_COMMIT_ORIGIN = "presence:"`) are auto-excluded so
 cursor movement doesn't pollute the undo stack.
 
-### V1 limitations / V2 follow-ups
+### V1 / V2 V1 limitations / V2 V2 follow-ups
 
-- No grouping API (`group_start` / `group_end`) — defer to V2.
-- No merge-interval tuning (Loro's default 0 ms) — defer to V2.
-- No push/pop listeners — defer to V2.
+- No push/pop listeners (`UndoManager::set_on_push` / `set_on_pop`) — defer to V2 V2.
+- No RAII closure helper (`with_undo_group(|s| { ... })`) — V2 V1
+  ships explicit start/end; group leaks on panic/error mid-group
+  must be handled by caller (e.g. `scopeguard::defer!`).
+  V2 V1.1 will add the closure helper (Codex+Opus 5.4 V2 V1
+  audit MEDIUM-3 follow-up).
 - `set_peer_id` after construction silently CLEARS the undo
   stack per Loro's internal subscription. V1 made
   `OpLog::set_peer_id` `&mut self` so the footgun isn't
   reachable from a shared `&OpLog` (Codex+Opus 5.4 V1 audit
   closure).
+- Nested `start_undo_group` returns
+  `Err(CollabSessionError::Undo(LoroError::UndoGroupAlreadyStarted))`
+  deterministically — nesting is NOT supported.
 
 ## Transport (Phase 5.5 — V1 partially shipped)
 

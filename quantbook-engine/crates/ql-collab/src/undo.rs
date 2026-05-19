@@ -12,7 +12,7 @@
 //! 5.4 preview): each peer has its own undo stack tracking
 //! THEIR appends only.
 //!
-//! ## V1 surface
+//! ## Surface (V1 + V2 V1)
 //!
 //! [`crate::CollabSession`] exposes:
 //! - `undo()` / `redo()` — perform the action; returns `bool`
@@ -20,11 +20,13 @@
 //! - `can_undo()` / `can_redo()` — peek without consuming.
 //! - `undo_count()` / `redo_count()` — how many stack items.
 //! - `clear_undo_stack()` — reset both stacks.
+//! - `start_undo_group()` / `end_undo_group()` — atomic
+//!   multi-op grouping (Phase 5.4 V2 V1 ship `6138a7203f6`).
+//! - `set_undo_merge_interval(ms)` — auto-merge consecutive
+//!   changes within the window (Phase 5.4 V2 V1).
 //!
-//! V1 does NOT yet expose grouping (`group_start` /
-//! `group_end`), merge-interval tuning, or push/pop listeners.
-//! Those are 5.4 V2 work — the design doc lists them as
-//! follow-ups.
+//! V2 V2 follow-up: push/pop listeners (`UndoManager::set_on_push`
+//! / `set_on_pop`) + RAII `with_undo_group` closure helper.
 //!
 //! ## Presence-exclude
 //!
@@ -37,11 +39,11 @@
 //!
 //! ## Important V1 semantics
 //!
-//! - Undo creates INVERSE OPS rather than physically removing
-//!   the original. `OpLog::len()` therefore counts both forward
-//!   and inverse ops; "how many user-perceived ops survived"
-//!   needs different bookkeeping (5.4 V2 may add an undoable-op
-//!   counter).
+//! - Undo retracts originals from the visible `"ops"` LoroList
+//!   (Phase 5.4 V1 audit closure made `OpLog::len()` query Loro
+//!   directly rather than cache; visible count shrinks on undo
+//!   and grows on redo). See test
+//!   `undo_retracts_visible_op_from_op_log_len`.
 //! - Undo on peer A's manager only affects A's appends. Peer B's
 //!   ops are untouched even after A undoes. This is Loro's
 //!   "local-only" guarantee.

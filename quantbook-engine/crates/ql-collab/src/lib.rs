@@ -25,8 +25,11 @@
 //!   (Phase 5.6 V1 ship 2026-05-19). `PresenceState` JSON-encoded
 //!   into the shared `LoroDoc`'s `"presence"` LoroMap (LWW per key).
 //! - [`undo`] — peer-local undo/redo via Loro's `UndoManager`
-//!   (Phase 5.4 V1 ship 2026-05-19). `CollabSession` wires the
-//!   manager + auto-excludes presence-origin commits.
+//!   (Phase 5.4 V1 ship 2026-05-19 + V2 V1 ship `6138a7203f6`).
+//!   V1: 7 undo/redo methods + presence-origin commit exclusion.
+//!   V2 V1: atomic grouping (`start_undo_group` /
+//!   `end_undo_group`) + auto-merge interval. V2 V2 pending —
+//!   push/pop listeners + RAII closure helper.
 //!
 //! ## Stability
 //!
