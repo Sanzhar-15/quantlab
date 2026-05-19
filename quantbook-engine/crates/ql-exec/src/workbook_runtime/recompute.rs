@@ -176,8 +176,22 @@ impl<'a> WorkbookRuntime<'a> {
                     // design § 12.4 — dropped-table refs emit
                     // `#NAME?`, not a recompute failure with a
                     // stale cell value.
+                    //
+                    // **Phase 5.2 D-3 closure (2026-05-19):** also map
+                    // `BindError::UnknownSheet` to `#NAME?`. Surfaces
+                    // in Phase 5 multi-peer collaboration: peer A
+                    // renames sheet `S → X`; peer B concurrently
+                    // writes `=S!A1+1`; merged log → B's formula
+                    // references the now-missing sheet `S`. Phase
+                    // 5.1 audit (Codex V5) verified the pre-fix
+                    // behavior was to leave the cell with its stale
+                    // pre-recompute value AND emit a
+                    // RecomputeFailure — worse than `#NAME?` from
+                    // the user's perspective. This maps it cleanly.
                     if let RuntimeError::Bind(
-                        BindError::UnknownTable(_) | BindError::UnknownTableColumn { .. },
+                        BindError::UnknownTable(_)
+                        | BindError::UnknownTableColumn { .. }
+                        | BindError::UnknownSheet(_),
                     ) = &error
                     {
                         self.workbook.put_computed_at(
@@ -576,8 +590,16 @@ impl<'a> WorkbookRuntime<'a> {
                         // Counts as `succeeded` because the formula
                         // evaluated to a well-defined error value, not
                         // a structural recompute failure.
+                        //
+                        // **Phase 5.2 D-3 closure (2026-05-19):** also
+                        // map `BindError::UnknownSheet` here. Mirror of
+                        // the `recompute_all` change for cross-sheet
+                        // bind failures (rename-sheet × concurrent
+                        // formula edit in Phase 5 multi-peer merge).
                         if let RuntimeError::Bind(
-                            BindError::UnknownTable(_) | BindError::UnknownTableColumn { .. },
+                            BindError::UnknownTable(_)
+                            | BindError::UnknownTableColumn { .. }
+                            | BindError::UnknownSheet(_),
                         ) = &error
                         {
                             let v = Value::Error(ErrorValue::Name);
@@ -3171,4 +3193,114 @@ mod tests {
     }
 
     // (Tier D1 Step 3.1: W5-82 format tests moved to formats.rs::tests.)
+
+    // ===== Phase 5.2 D-3 closure (2026-05-19) =====
+    //
+    // BindError::UnknownSheet → #NAME? mapping in recompute_all +
+    // recompute_dirty. Phase 5.1 audit (Codex V5) verified the
+    // pre-fix behavior was to leave the cell with a stale value
+    // AND emit a RecomputeFailure for unknown-sheet bind errors —
+    // worse than #NAME?. These tests verify the closure works for
+    // both recompute paths.
+
+    /// `recompute_all` maps cross-sheet ref to a missing sheet name
+    /// to `#NAME?`. Pre-D-3 the cell retained stale state + emitted
+    /// a RecomputeFailure.
+    #[test]
+    fn recompute_all_maps_unknown_sheet_to_name_error() {
+        use ql_storage::Workbook;
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("Sheet1");
+        let s1 = wb.add_sheet("Sheet2");
+        wb.put_at(s1, 0, 0, Value::Number(42.0));
+        // Set a formula on Sheet1 referencing Sheet2!A1.
+        wb.put_formula(s0, 0, 0, "Sheet2!A1 + 1");
+
+        let reg = default_registry();
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            let r = rt.recompute_all();
+            // Both formulas (in case there are others) succeed when
+            // sheet exists.
+            assert!(r.failures.is_empty());
+            assert_eq!(
+                wb.read(ql_types::Address::new(s0, 0, 0)),
+                Value::Number(43.0),
+                "baseline: formula evaluates correctly when sheet exists"
+            );
+        }
+
+        // Now hand-mutate to reference a nonexistent sheet.
+        // `Sheet2` exists in the workbook but rename it to break
+        // the formula's reference (formula text is canonical and
+        // not auto-rewritten via this low-level mutation path).
+        wb.put_formula(s0, 0, 0, "DeletedSheet!A1 + 1");
+
+        let r = {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.recompute_all()
+        };
+
+        assert!(
+            r.failures.is_empty(),
+            "unknown-sheet bind error must map to #NAME?, not a RecomputeFailure (got: {:?})",
+            r.failures
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(s0, 0, 0)),
+            Value::Error(ErrorValue::Name),
+            "cell must show #NAME? after rebind to missing sheet"
+        );
+    }
+
+    /// `recompute_dirty` maps cross-sheet ref to a missing sheet name
+    /// to `#NAME?`. Mirror of the recompute_all test above.
+    ///
+    /// Setup mirrors `recompute_dirty_writes_circ_error_for_cycle_members`
+    /// (the W5-37 SCH-3-02 reference test in workbook_runtime/mod.rs):
+    /// pre-populate the workbook with the unbindable formula via the
+    /// low-level `put_formula` (bypasses set_formula's bind-fail
+    /// short-circuit), rebuild a CalcgraphSession, then mark the
+    /// cell dirty manually so recompute_dirty processes it.
+    #[test]
+    fn recompute_dirty_maps_unknown_sheet_to_name_error() {
+        use crate::CalcgraphSession;
+        use ql_storage::Workbook;
+        let mut wb = Workbook::new();
+        let s0 = wb.add_sheet("Sheet1");
+        // Hand-write the formula text directly. `WorkbookRuntime::set_formula`
+        // would refuse because bind fails on the unknown sheet ref —
+        // but the .qbook cold-load path uses `put_formula` to seed
+        // formula text without binding, and Phase 5 op-log replay
+        // does the same. This test recreates that scenario.
+        wb.put_formula(s0, 0, 0, "DeletedSheet!A1 + 1");
+
+        let reg = default_registry();
+        // Rebuild a session from the workbook so the formula cell
+        // gets a node. `on_set_value(s0, 0, 0)` doesn't dirty A1
+        // itself (it dirties formulas that READ A1), so use the
+        // crate-private `mark_dirty` to explicitly dirty A1's own
+        // node.
+        let rebuild = CalcgraphSession::rebuild_from_workbook(&wb);
+        let mut graph = rebuild.session;
+        let node = graph
+            .cell_node_for(s0, 0, 0)
+            .expect("formula cell has a node after rebuild");
+        graph.mark_dirty(node);
+
+        let r = {
+            let mut rt = WorkbookRuntime::with_graph(&mut wb, &reg, &mut graph);
+            rt.recompute_dirty().unwrap()
+        };
+        assert!(
+            r.failures.is_empty(),
+            "unknown-sheet must map to #NAME? in recompute_dirty too (got: {:?})",
+            r.failures
+        );
+        assert_eq!(
+            wb.read(ql_types::Address::new(s0, 0, 0)),
+            Value::Error(ErrorValue::Name),
+            "cell must show #NAME? for unknown-sheet bind error"
+        );
+    }
 }
