@@ -110,13 +110,23 @@ This is the suggested order to keep the codebase in a compile-clean intermediate
 - ✅ Codex+Opus 2-way audit closure (commit `<step-2 audit closure>`) added `#[serde(deny_unknown_fields)]` + 4 rejection tests + renamed misleading test (`round_trips_through_loro_value_bincode` → `round_trips_worst_case_through_serde_json`).
 - Commits: `135bbb99f75` (initial ship) + audit closure commit (see audit transcripts at `docs/audits/2026-05-19-phase-5-2-d-1-step-2-*`).
 
-### Step 3: Change `ql-storage::FormatId` to the tagged tuple (2-3 hours)
+### Step 3: Change `ql-storage::FormatId` to the tagged tuple — ✅ SHIPPED 2026-05-19 (`af803f1a3f2`)
 
-- Update `format.rs` enum definition + all internal logic (`register_at`, `intern`, `lookup`, etc.).
-- `FormatTable` may need a `peer_id: PeerId` field set at construction.
-- All ql-storage tests pass.
-- ql-exec / ql-io / ql-io-xlsx will likely fail to compile at this point — that's expected, fix in subsequent steps.
-- Commit: `Phase 5.2 D-1 step 3 — FormatId enum in ql-storage (breaks downstream)`.
+**Scope expansion vs original plan:** Original plan was "ql-storage change, downstream breaks, fix in steps 4-6." But the project's gates-clean-every-commit discipline made that untenable — `cargo test --workspace` failing for 3+ commits would break CI bisection. Step 3 ships the schema change + ALL 241 downstream callsites in 6 crates as a single gates-clean commit.
+
+- ✅ FormatId enum: `Builtin(u32)` + `Custom(PeerId, u32)`. Accessors: `is_builtin()`, `is_custom()`, `GENERAL`.
+- ✅ Migration helpers: `FormatId::legacy_from_u32(n)` + `FormatId::to_legacy_u32() -> Option<u32>` (None for non-LEGACY peer Customs).
+- ✅ FormatTable carries `local_peer: PeerId` (default LEGACY_PEER); `with_peer(peer)` constructor + `set_local_peer(peer)` setter for step 4 CollabSession integration.
+- ✅ `next_custom_id() -> u32` renamed to `next_custom_counter() -> u32`.
+- ✅ 8 new format.rs tests pin peer-aware allocation + cross-peer collision-freedom + legacy round-trip.
+- ✅ Downstream cascades:
+  - ql-oplog: `FormatRejectedSource::id` u32 → FormatId. Replay converts Op u32 via `legacy_from_u32` (step 4 will drop this when Op carries FormatIdWire).
+  - ql-io: qbook envelope save/load uses `to_legacy_u32().expect(...)` + `is_custom()`. Pre-step-5 envelope still u32-shaped.
+  - ql-io-xlsx: xlsx import/export uses `legacy_from_u32` / `to_legacy_u32().expect(...)`. Pre-step-6 xlsx sees only LEGACY_PEER.
+  - ql-exec: `RuntimeError::UnknownFormatId(u32)` → `UnknownFormatId(FormatId)`. `intern_format` allocates `Custom(local_peer, counter)`.
+- ✅ Verified: 4244 workspace tests passing (+7 from new tests); fmt + clippy clean; no truncation.
+- ⚠️ **2-way audit DEFERRED to fresh session** per CLAUDE.md max-2-cycles rule. Cycle 3 of session was an explicit override; audit awaits step 4 cycle.
+- Commit: `af803f1a3f2`.
 
 ### Step 4: Update `Op::RegisterFormat` / `Op::SetCellFormat` to use FormatIdWire (1-2 hours)
 
