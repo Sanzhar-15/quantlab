@@ -140,4 +140,27 @@ mod tests {
         }
         assert_eq!(oplog.len(), 0);
     }
+
+    /// Phase 5 V1 D1.a re-partitioning (2026-05-19): moved from
+    /// tables.rs::tests. Verifies that both `Op::SetReferenceMode`
+    /// `Op::SetLocale` round-trip through replay correctly — natural
+    /// test for config.rs's two methods.
+    #[test]
+    fn set_reference_mode_op_round_trips_through_replay() {
+        // Producer side: append Op::SetReferenceMode + Op::SetLocale.
+        let mut producer_wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut producer_wb, &reg, &mut oplog);
+            rt.set_reference_mode(ql_types::ReferenceMode::R1C1)
+                .unwrap();
+            rt.set_locale(ql_types::Locale::De).unwrap();
+        }
+        // Replay side: fresh workbook, replay the log → same state.
+        let mut replay_wb = make_runtime_workbook();
+        ql_oplog::replay_into(&oplog, &mut replay_wb, &reg).unwrap();
+        assert_eq!(replay_wb.reference_mode(), ql_types::ReferenceMode::R1C1);
+        assert_eq!(replay_wb.locale(), ql_types::Locale::De);
+    }
 }

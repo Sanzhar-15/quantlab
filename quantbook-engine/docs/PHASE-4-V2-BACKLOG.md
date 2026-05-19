@@ -235,30 +235,22 @@ clean Phase 5 work if not done first.
   2 MEDIUMs + 1 LOW closed in the closure commit; 4 LOWs deferred
   to D1.a below.
 
-### D1.a (polish) — Tier D1 test-cluster re-partitioning — **PARTIAL**
+### ~~D1.a~~ (polish) — Tier D1 test-cluster re-partitioning — **✅ SHIPPED 2026-05-19**
 
 - **Source:** Tier D1 audit Codex L-2 through L-5.
 - **Impact:** zero behavioral / semantic / gate impact. Pure
-  organizational cleanup.
-- **Scope:** move 4 misplaced test clusters to their semantically
-  correct owning-submodule:
-  1. ✅ `add_sheet_rejects_zero_chunk_rows` in `validate.rs::tests`
-     → `sheets.rs::tests` (shipped 2026-05-19 in `06252f2b638`).
-  2. ✅ `clear_formula_rejects_invalid_*` tests in
-     `validate.rs::tests` → `cells.rs::tests` (shipped 2026-05-19
-     in `9b45ee656eb`).
-  3. W5-147 `set_formula` canonicalization tests in
-     `tables.rs::tests` → `cells.rs::tests`;
-     `set_reference_mode_op_round_trips_through_replay` in
-     `tables.rs::tests` → `config.rs::tests`. **PENDING.**
-  4. Pure table-API tests in `cells.rs::tests`
-     (`drop_table_removes_metadata...`,
-     `drop_table_missing_errors`) → `tables.rs::tests`. **PENDING.**
-- **Effort:** remaining ~1 hour mechanical.
-- **Risk:** none — tests are byte-identical, just relocated.
-- **Why partial:** cluster 1 shipped as a session-end demonstrator
-  of the D1.a pattern; clusters 2-4 left for a fresh session
-  (or as opportunistic batch work).
+  organizational cleanup. Workspace test count unchanged
+  throughout (4222 → 4222).
+- **All 4 clusters shipped 2026-05-19:**
+  1. ✅ `add_sheet_rejects_zero_chunk_rows` → `sheets.rs::tests` (`06252f2b638`).
+  2. ✅ `clear_formula_rejects_invalid_*` → `cells.rs::tests` (`9b45ee656eb`).
+  3. ✅ W5-147 `set_formula` canonicalization tests (4) →
+     `cells.rs::tests`; `set_reference_mode_op_round_trips_through_replay`
+     → `config.rs::tests` (this commit).
+  4. ✅ `drop_table_removes_metadata...` + `drop_table_missing_errors`
+     → `tables.rs::tests` (this commit).
+- **Total relocated:** 9 tests across 4 commits. Zero risk per
+  D1.a's "byte-identical" framing.
 
 ### ~~D2.~~ `ql-oplog → ql-io` reverse dependency cleanup — ✅ SHIPPED 2026-05-19 at `e15e8908742`
 

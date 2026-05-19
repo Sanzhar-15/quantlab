@@ -1056,6 +1056,39 @@ mod tests {
 
     // ===== W5-119 (Phase 4.8.I) — rename_table =====
 
+    /// Phase 5 V1 D1.a cluster 4 (2026-05-19): moved from
+    /// cells.rs::tests. drop_table's impl lives in tables.rs;
+    /// the test belongs here next to create_table tests.
+    #[test]
+    fn drop_table_removes_metadata_and_emits_op() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut oplog = OpLog::new();
+        {
+            let mut rt = WorkbookRuntime::with_oplog(&mut wb, &reg, &mut oplog);
+            rt.create_table("Sales", 0, 0, 0, 2, 1, true, false, vec!["Qty".into()])
+                .unwrap();
+            rt.drop_table("Sales").unwrap();
+        }
+        assert!(wb.lookup_table("Sales").is_none());
+        let ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(&ops[1], Op::DropTable { name } if name == "SALES"));
+    }
+
+    /// D1.a cluster 4: moved from cells.rs::tests (see partner above).
+    #[test]
+    fn drop_table_missing_errors() {
+        let mut wb = make_runtime_workbook();
+        let reg = default_registry();
+        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+        let err = rt.drop_table("Nope").unwrap_err();
+        match err {
+            RuntimeError::TableNotFound(n) => assert_eq!(n, "Nope"),
+            other => panic!("expected TableNotFound, got {other:?}"),
+        }
+    }
+
     #[test]
     fn rename_table_happy_path_rewrites_formula_text() {
         let mut wb = make_runtime_workbook();
@@ -2109,91 +2142,8 @@ mod tests {
     }
 
     // (Tier D1 Step 3.2: W5-146 config tests moved to
-    //  config.rs::tests.)
-
-    // -------------------------------------------------------------
-    // W5-147 (Phase 4.9.K) — set_formula canonical-storage tests.
-    // -------------------------------------------------------------
-
-    /// **R1C1 input canonicalizes to A1 in storage.** When the
-    /// workbook is in R1C1 mode and user types `R1C1`, the stored
-    /// formula text is `$A$1` (A1+EnUs canon).
-    #[test]
-    fn set_formula_canonicalizes_r1c1_input_to_a1() {
-        let mut wb = make_runtime_workbook();
-        wb.set_reference_mode(ql_types::ReferenceMode::R1C1);
-        let reg = default_registry();
-        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-        rt.set_formula(0, 0, 0, "R1C1+R2C2").unwrap();
-        drop(rt);
-        // Stored text uses A1 + absolute markers ($) since the source
-        // R1C1Ref `Abs(1),Abs(1)` becomes A1's `$A$1`.
-        assert_eq!(
-            wb.formula_at(0, 0, 0).map(|s| s.as_ref()),
-            Some("$A$1 + $B$2")
-        );
-    }
-
-    /// **Relative R1C1 canonicalizes using the formula's own cell
-    /// as anchor.** `R[-1]C` at cell (1, 0) → `A1` (no `$` — relative
-    /// R1C1 ↔ unprefixed A1).
-    #[test]
-    fn set_formula_canonicalizes_relative_r1c1_to_unprefixed_a1() {
-        let mut wb = make_runtime_workbook();
-        wb.set_reference_mode(ql_types::ReferenceMode::R1C1);
-        wb.put_at(0, 0, 0, ql_types::Value::Number(7.0));
-        let reg = default_registry();
-        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-        // At cell (1, 0), R[-1]C means "row above, same column" = A1.
-        rt.set_formula(0, 1, 0, "R[-1]C").unwrap();
-        drop(rt);
-        assert_eq!(wb.formula_at(0, 1, 0).map(|s| s.as_ref()), Some("A1"));
-    }
-
-    /// **DE locale input canonicalizes to EN.** `SUM(2,5; 3,5)`
-    /// (DE — `,` decimal, `;` arg sep) → `SUM(2.5, 3.5)` (EN canon).
-    #[test]
-    fn set_formula_canonicalizes_de_locale_to_en() {
-        let mut wb = make_runtime_workbook();
-        wb.set_locale(ql_types::Locale::De);
-        let reg = default_registry();
-        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-        rt.set_formula(0, 0, 0, "SUM(2,5; 3,5)").unwrap();
-        drop(rt);
-        assert_eq!(
-            wb.formula_at(0, 0, 0).map(|s| s.as_ref()),
-            Some("SUM(2.5, 3.5)")
-        );
-    }
-
-    /// **`@A1` (implicit intersection) survives canonicalization.**
-    /// The `@` operator is mode + locale invariant per design § 3.3.
-    #[test]
-    fn set_formula_preserves_at_through_canonicalization() {
-        let mut wb = make_runtime_workbook();
-        let reg = default_registry();
-        let mut rt = WorkbookRuntime::new(&mut wb, &reg);
-        rt.set_formula(0, 0, 0, "@A1").unwrap();
-        drop(rt);
-        assert_eq!(wb.formula_at(0, 0, 0).map(|s| s.as_ref()), Some("@A1"));
-    }
-
-    #[test]
-    fn set_reference_mode_op_round_trips_through_replay() {
-        // Producer side: append Op::SetReferenceMode + Op::SetLocale.
-        let mut producer_wb = make_runtime_workbook();
-        let reg = default_registry();
-        let mut oplog = OpLog::new();
-        {
-            let mut rt = WorkbookRuntime::with_oplog(&mut producer_wb, &reg, &mut oplog);
-            rt.set_reference_mode(ql_types::ReferenceMode::R1C1)
-                .unwrap();
-            rt.set_locale(ql_types::Locale::De).unwrap();
-        }
-        // Replay side: fresh workbook, replay the log → same state.
-        let mut replay_wb = make_runtime_workbook();
-        ql_oplog::replay_into(&oplog, &mut replay_wb, &reg).unwrap();
-        assert_eq!(replay_wb.reference_mode(), ql_types::ReferenceMode::R1C1);
-        assert_eq!(replay_wb.locale(), ql_types::Locale::De);
-    }
+    //  config.rs::tests; D1.a cluster 3: W5-147 set_formula
+    //  canonicalization tests moved to cells.rs::tests; D1.a
+    //  cluster 3: set_reference_mode_op_round_trips_through_replay
+    //  moved to config.rs::tests.)
 }
