@@ -200,8 +200,24 @@ const BUILTIN_FORMATS: &[(u32, &str)] = &[
 pub struct FormatTable {
     /// `id → string`. Sparse (only entries that exist).
     by_id: HashMap<FormatId, String>,
-    /// `string → id`. Used by `intern` for dedup.
-    by_string: HashMap<String, FormatId>,
+    /// `string → Builtin(n)`. Built-in format strings are global —
+    /// "General" must always resolve to `Builtin(0)` regardless of
+    /// peer. Used by `intern` for built-in lookup (Excel-canonical
+    /// strings short-circuit before peer-namespaced lookup).
+    ///
+    /// Phase 5.2 D-1 step 4 restructure (Codex audit HIGH-2 closure):
+    /// was previously a single global `HashMap<String, FormatId>`
+    /// that rejected cross-peer same-string allocations. Now split
+    /// into separate built-in vs peer-namespaced maps.
+    by_builtin_string: HashMap<String, FormatId>,
+    /// `(peer, string) → Custom(peer, _)`. Used by `intern` for
+    /// per-peer dedup. Two peers interning the same string produce
+    /// distinct `Custom` ids with distinct counters — Phase 5.1 D-1
+    /// audit-locked design.
+    ///
+    /// Phase 5.2 D-1 step 4 restructure (Codex audit HIGH-2 closure):
+    /// see above.
+    by_custom_string: HashMap<(PeerId, String), FormatId>,
     /// Next `Custom(local_peer, _)` counter to hand out. Each peer's
     /// counter is independent; concurrent peers can't collide because
     /// the `PeerId` differs. Starts at `0` (post-5.2; pre-5.2 used
@@ -210,7 +226,7 @@ pub struct FormatTable {
     /// Peer id used when allocating `Custom` ids via `intern`.
     /// Set at construction; defaults to `LEGACY_PEER` (= `PeerId(0)`)
     /// for backward compat with pre-collab single-writer mode.
-    /// `CollabSession::attach` (step 4) updates this via
+    /// `CollabSession::attach` (step 7 IDE work) updates this via
     /// [`Self::set_local_peer`] when a multi-peer session takes over.
     local_peer: PeerId,
 }
@@ -236,14 +252,15 @@ impl FormatTable {
     pub fn with_peer(peer: PeerId) -> Self {
         let mut t = Self {
             by_id: HashMap::new(),
-            by_string: HashMap::new(),
+            by_builtin_string: HashMap::new(),
+            by_custom_string: HashMap::new(),
             next_custom_counter: 0,
             local_peer: peer,
         };
         for (id, s) in BUILTIN_FORMATS {
             let fid = FormatId::Builtin(*id);
             t.by_id.insert(fid, (*s).to_string());
-            t.by_string.insert((*s).to_string(), fid);
+            t.by_builtin_string.insert((*s).to_string(), fid);
         }
         t
     }
@@ -304,6 +321,15 @@ impl FormatTable {
     /// otherwise allocates a new `FormatId::Custom(local_peer, counter)`
     /// and stores both directions.
     ///
+    /// **Lookup order (Phase 5.2 D-1 step 4 restructure):**
+    /// 1. `by_builtin_string` first — Excel built-ins are global; e.g.
+    ///    `intern("General")` always returns `Builtin(0)` regardless of
+    ///    `local_peer`.
+    /// 2. `by_custom_string[(local_peer, s)]` — this peer's own custom
+    ///    dedup map. A remote peer's `Custom(other_peer, _)` with the
+    ///    same string does NOT short-circuit our allocation.
+    /// 3. Allocate fresh `Custom(local_peer, counter)`.
+    ///
     /// **Replay determinism:** the allocator is monotonic in insertion
     /// order WITHIN A PEER. As long as the op-log replays
     /// `Op::RegisterFormat` events in the same order they were
@@ -311,13 +337,17 @@ impl FormatTable {
     /// peers, the `peer` component of each `Custom` keeps ids distinct
     /// even when counter values collide.
     pub fn intern(&mut self, s: &str) -> FormatId {
-        if let Some(id) = self.by_string.get(s) {
+        if let Some(id) = self.by_builtin_string.get(s) {
+            return *id;
+        }
+        if let Some(id) = self.by_custom_string.get(&(self.local_peer, s.to_string())) {
             return *id;
         }
         let id = FormatId::Custom(self.local_peer, self.next_custom_counter);
         self.next_custom_counter += 1;
         self.by_id.insert(id, s.to_string());
-        self.by_string.insert(s.to_string(), id);
+        self.by_custom_string
+            .insert((self.local_peer, s.to_string()), id);
         id
     }
 
@@ -327,25 +357,23 @@ impl FormatTable {
     ///
     /// **Replay use case:** `Op::RegisterFormat { id, string }` calls
     /// this to reproduce the original allocator state — including ids
-    /// allocated by OTHER peers (post-step-3).
+    /// allocated by OTHER peers.
     ///
     /// For ids tagged with `self.local_peer`, advances the local
     /// counter past the registered counter so subsequent `intern`
     /// calls don't collide.
     ///
-    /// KNOWN LIMITATION (step 3 audit Codex HIGH-2; fix deferred to
-    /// step 4): the by-string dedup map is global, not peer-scoped.
-    /// Two peers independently interning the same string produces
-    /// `Custom(A, 0)` and `Custom(B, 0)` (collision-free `FormatId`s
-    /// by D-1 design). But replaying both ops here fails with
-    /// `StringCollision` because the second `register_at` sees the
-    /// string already mapped to the first peer's id. Step 4 will
-    /// restructure `by_string` to a peer-scoped map plus a separate
-    /// built-in string map. Until then, cross-peer same-string
-    /// replays REJECT. Test
-    /// `cross_peer_same_string_collision_is_known_limitation` pins
-    /// this behavior so step 4 explicitly notices when it fixes it.
+    /// **Step 4 by_string restructure (Codex step-3 audit HIGH-2
+    /// closure):** Custom and Builtin variants use SEPARATE dedup
+    /// maps. Two peers can register the same string under their own
+    /// `Custom(peer, _)` ids without collision (Phase 5.1 D-1
+    /// audit-locked design). Cross-variant string collisions are
+    /// allowed too — e.g. LibreOffice writes `<numFmt numFmtId="164"
+    /// formatCode="General"/>` (Custom variant) while "General" also
+    /// lives at `Builtin(0)`; both coexist.
     pub fn register_at(&mut self, id: FormatId, s: &str) -> Result<(), FormatTableError> {
+        // Step 1: id-side dedup. If `id` is already present, must map
+        // to the same string (else IdCollision — a real corruption).
         if let Some(existing) = self.by_id.get(&id) {
             if existing == s {
                 return Ok(());
@@ -356,21 +384,46 @@ impl FormatTable {
                 attempted: s.to_string(),
             });
         }
-        if let Some(existing_id) = self.by_string.get(s) {
-            if *existing_id == id {
-                return Ok(());
+        // Step 2: string-side dedup, routed by variant.
+        match id {
+            FormatId::Builtin(_) => {
+                if let Some(existing_id) = self.by_builtin_string.get(s) {
+                    if *existing_id == id {
+                        return Ok(());
+                    }
+                    return Err(FormatTableError::StringCollision {
+                        string: s.to_string(),
+                        existing_id: *existing_id,
+                        attempted_id: id,
+                    });
+                }
             }
-            return Err(FormatTableError::StringCollision {
-                string: s.to_string(),
-                existing_id: *existing_id,
-                attempted_id: id,
-            });
+            FormatId::Custom(peer, _) => {
+                if let Some(existing_id) = self.by_custom_string.get(&(peer, s.to_string())) {
+                    if *existing_id == id {
+                        return Ok(());
+                    }
+                    return Err(FormatTableError::StringCollision {
+                        string: s.to_string(),
+                        existing_id: *existing_id,
+                        attempted_id: id,
+                    });
+                }
+            }
         }
+        // Step 3: insert into by_id + the appropriate string map.
         self.by_id.insert(id, s.to_string());
-        self.by_string.insert(s.to_string(), id);
-        // If `id` is a Custom-variant for OUR peer, advance the local
-        // counter so subsequent `intern` calls allocate fresh counters
-        // past any replayed ones.
+        match id {
+            FormatId::Builtin(_) => {
+                self.by_builtin_string.insert(s.to_string(), id);
+            }
+            FormatId::Custom(peer, _) => {
+                self.by_custom_string.insert((peer, s.to_string()), id);
+            }
+        }
+        // Step 4: if `id` is a Custom-variant for OUR peer, advance
+        // the local counter so subsequent `intern` calls allocate
+        // fresh counters past any replayed ones.
         if let FormatId::Custom(peer, counter) = id {
             if peer == self.local_peer && counter >= self.next_custom_counter {
                 self.next_custom_counter = counter + 1;
@@ -563,14 +616,23 @@ mod tests {
     }
 
     #[test]
-    fn register_at_string_collision_errors() {
-        let mut t = FormatTable::new();
-        // "General" is already at Builtin(0); registering it at a different
-        // id errors. Step 3 audit MEDIUM-1 closure: use `legacy_from_u32(200)`
-        // (= Custom(LEGACY_PEER, 36)) instead of `Builtin(200)` since the
-        // Builtin variant is contractually 0..=163.
+    fn register_at_string_collision_errors_same_variant_namespace() {
+        // Step 4 by_string restructure: collision is detected
+        // WITHIN-variant only (Builtin vs Builtin; same-peer Custom
+        // vs same-peer Custom). Cross-variant collisions (e.g. Custom
+        // attempting "General" while Builtin(0) owns it) are ALLOWED —
+        // see `cross_peer_same_string_now_succeeds_after_step4_restructure`
+        // and the LibreOffice "redundant General-at-custom-id" pattern
+        // in xlsx import.
+        //
+        // This test pins WITHIN-namespace collision: same-peer trying
+        // to register the same string at two different Custom counters
+        // is producer corruption.
+        let mut t = FormatTable::with_peer(PeerId::new(0xa));
+        t.register_at(FormatId::Custom(PeerId::new(0xa), 0), "MY_FMT")
+            .unwrap();
         let err = t
-            .register_at(FormatId::legacy_from_u32(200), "General")
+            .register_at(FormatId::Custom(PeerId::new(0xa), 1), "MY_FMT")
             .unwrap_err();
         assert!(matches!(err, FormatTableError::StringCollision { .. }));
     }
@@ -731,24 +793,17 @@ mod tests {
         assert_eq!(next, FormatId::Custom(PeerId::new(0xb2), 0));
     }
 
-    /// **Codex HIGH-2: KNOWN LIMITATION (deferred to step 4).** Two
-    /// peers independently interning the same format string produces
-    /// `Custom(A, 0)` + `Custom(B, 0)` — collision-free `FormatId`s
-    /// by Phase 5.1 D-1 design. But replaying both currently fails
-    /// with `StringCollision` because the by_string dedup map is
-    /// global (not peer-scoped).
-    ///
-    /// Step 4 will restructure `by_string` to
-    /// `HashMap<(PeerId, String), FormatId>` + a separate map for
-    /// built-in strings. Until then, this test pins the CURRENT
-    /// rejection so step 4 explicitly notices when it removes the
-    /// false-positive collision.
-    ///
-    /// Today no production caller hits this scenario (multi-peer
-    /// wiring is step 4 work); single-writer mode + LEGACY_PEER
-    /// dedupe correctly via the existing by_string map.
+    /// **Step 4 closure of step-3 audit Codex HIGH-2:** two peers
+    /// independently interning the same format string produces
+    /// collision-free `Custom(A, 0)` + `Custom(B, 0)` `FormatId`s per
+    /// Phase 5.1 D-1 audit-locked design. Step 4 restructured
+    /// `by_string` into separate `by_builtin_string` + `by_custom_string`
+    /// maps, the latter keyed by `(PeerId, String)`. This test now
+    /// ASSERTS the cross-peer same-string registration SUCCEEDS (was
+    /// pinned-as-rejection in cycle 4 step-3 audit; inverted in cycle
+    /// 5 step 4 ship).
     #[test]
-    fn cross_peer_same_string_collision_is_known_limitation() {
+    fn cross_peer_same_string_now_succeeds_after_step4_restructure() {
         let mut t = FormatTable::with_peer(LEGACY_PEER);
         let peer_a = PeerId::new(0xa);
         let peer_b = PeerId::new(0xb);
@@ -756,13 +811,62 @@ mod tests {
         // Replay peer A's op.
         t.register_at(FormatId::Custom(peer_a, 0), "yyyy-mm-dd")
             .unwrap();
-        // Replay peer B's op for the same string. Step 4 will accept;
-        // pre-step-4 rejects with StringCollision.
-        let result = t.register_at(FormatId::Custom(peer_b, 0), "yyyy-mm-dd");
-        assert!(
-            matches!(result, Err(FormatTableError::StringCollision { .. })),
-            "Step 3 KNOWN LIMITATION: cross-peer same-string is rejected. \
-             Step 4 must restructure by_string to allow it. Got: {result:?}"
+        // Replay peer B's op for the SAME string. Step 4 by_string
+        // restructure: both succeed; ids coexist in by_id.
+        t.register_at(FormatId::Custom(peer_b, 0), "yyyy-mm-dd")
+            .unwrap();
+        // Both ids resolve back to the same string.
+        assert_eq!(t.lookup(FormatId::Custom(peer_a, 0)), Some("yyyy-mm-dd"));
+        assert_eq!(t.lookup(FormatId::Custom(peer_b, 0)), Some("yyyy-mm-dd"));
+        // Same-peer same-string is still idempotent.
+        t.register_at(FormatId::Custom(peer_a, 0), "yyyy-mm-dd")
+            .unwrap();
+        // Same-peer DIFFERENT-counter same-string is StringCollision
+        // (would produce two distinct Custom(A, _) ids for one string
+        // — that IS a producer bug).
+        let err = t
+            .register_at(FormatId::Custom(peer_a, 1), "yyyy-mm-dd")
+            .unwrap_err();
+        assert!(matches!(err, FormatTableError::StringCollision { .. }));
+    }
+
+    /// Step 4 by_string restructure: built-in strings remain global.
+    /// `intern("General")` always returns `Builtin(0)` regardless of
+    /// `local_peer` — built-ins are not peer-scoped.
+    #[test]
+    fn builtin_string_intern_is_global_across_peers() {
+        let mut t = FormatTable::with_peer(PeerId::new(0xa));
+        let id = t.intern("General");
+        assert_eq!(id, FormatId::GENERAL);
+        // Switch peers; "General" still resolves to Builtin(0).
+        t.set_local_peer(PeerId::new(0xb));
+        assert_eq!(t.intern("General"), FormatId::GENERAL);
+    }
+
+    /// Step 4 by_string restructure: two peers calling intern() for
+    /// the same NON-built-in string each get their own Custom id.
+    /// (Validates the producer-side dedup is peer-scoped.)
+    #[test]
+    fn intern_same_custom_string_under_distinct_peers_allocates_distinct_ids() {
+        let mut t_a = FormatTable::with_peer(PeerId::new(0xa));
+        let mut t_b = FormatTable::with_peer(PeerId::new(0xb));
+        let id_a = t_a.intern("yyyy-mm-dd");
+        let id_b = t_b.intern("yyyy-mm-dd");
+        // Each peer allocates its own Custom(peer, 0).
+        assert_eq!(id_a, FormatId::Custom(PeerId::new(0xa), 0));
+        assert_eq!(id_b, FormatId::Custom(PeerId::new(0xb), 0));
+        // Cross-peer same-string SAME table also works (audit-closure
+        // scenario): register A's id into B's table, then intern same
+        // string locally — local peer gets its own Custom.
+        let mut t_mixed = FormatTable::with_peer(PeerId::new(0xa));
+        t_mixed
+            .register_at(FormatId::Custom(PeerId::new(0xb), 0), "yyyy-mm-dd")
+            .unwrap();
+        let local_id = t_mixed.intern("yyyy-mm-dd");
+        assert_eq!(
+            local_id,
+            FormatId::Custom(PeerId::new(0xa), 0),
+            "intern under local peer must NOT short-circuit to a remote peer's Custom"
         );
     }
 

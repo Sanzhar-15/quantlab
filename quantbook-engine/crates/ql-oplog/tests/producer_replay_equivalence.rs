@@ -74,9 +74,11 @@ fn realistic_op_sequence() -> Vec<Op> {
     // realistic sequence so the equivalence comparator exercises the
     // FormatTable + CellFormatOverlay paths.
     //
-    // Register a custom format id (164 = first custom).
+    // Register a custom format id. Step 4: Op carries FormatIdWire.
+    // legacy_from_u32(164) = Custom { peer: LEGACY_PEER, counter: 0 } —
+    // matches the pre-5.2 semantics of "first custom" id 164.
     ops.push(Op::RegisterFormat {
-        id: 164,
+        id: ql_oplog::FormatIdWire::from_u32_legacy(164),
         string: "\"€\" #,##0.00".to_owned(),
     });
     // Bind a cell on sheet 0 to a built-in id 14 (m/d/yyyy) — no
@@ -86,14 +88,14 @@ fn realistic_op_sequence() -> Vec<Op> {
         sheet: 0,
         row: 0,
         col: 0,
-        id: Some(14),
+        id: Some(ql_oplog::FormatIdWire::Builtin { id: 14 }),
     });
     // Bind another cell to the custom id.
     ops.push(Op::SetCellFormat {
         sheet: 0,
         row: 1,
         col: 0,
-        id: Some(164),
+        id: Some(ql_oplog::FormatIdWire::from_u32_legacy(164)),
     });
     // And clear a binding (Op::SetCellFormat with None on a previously-
     // bound cell). Tests the clear path.
@@ -189,11 +191,10 @@ fn apply_producer_side(ops: &[Op], wb: &mut Workbook) {
                     .expect("producer-side rename_sheet must succeed");
             }
             Op::RegisterFormat { id, string } => {
-                // Step 3: convert Op's u32 to the new FormatId enum
-                // shape via the legacy migration helper. Mirrors
-                // ql_oplog::replay's handler.
+                // Step 4: Op carries FormatIdWire directly. Convert
+                // to storage via `to_storage()`. Mirrors ql_oplog::replay.
                 wb.formats_mut()
-                    .register_at(ql_storage::FormatId::legacy_from_u32(*id), string.as_str())
+                    .register_at(id.to_storage(), string.as_str())
                     .expect("producer-side register_at must succeed");
             }
             Op::SetCellFormat {
@@ -204,12 +205,8 @@ fn apply_producer_side(ops: &[Op], wb: &mut Workbook) {
             } => {
                 let s = wb.sheet_mut(*sheet).expect("sheet exists");
                 match id {
-                    Some(raw_id) => {
-                        s.format_overlay_mut().set(
-                            *row,
-                            *col,
-                            ql_storage::FormatId::legacy_from_u32(*raw_id),
-                        );
+                    Some(wire_id) => {
+                        s.format_overlay_mut().set(*row, *col, wire_id.to_storage());
                     }
                     None => {
                         s.format_overlay_mut().clear(*row, *col);

@@ -122,8 +122,14 @@ pub enum ReplayError {
     /// registered yet. The producer SHOULD always emit `RegisterFormat`
     /// BEFORE `SetCellFormat` for any custom id; replay enforces that.
     /// **W5-80.**
-    #[error("replay set-cell-format references unregistered format id {id} at op index {index}")]
-    FormatNotRegistered { index: usize, id: u32 },
+    ///
+    /// **Phase 5.2 D-1 step 4:** `id` changed from `u32` to
+    /// `ql_storage::FormatId` (the converted-from-wire shape).
+    #[error("replay set-cell-format references unregistered format id {id:?} at op index {index}")]
+    FormatNotRegistered {
+        index: usize,
+        id: ql_storage::FormatId,
+    },
 
     /// **W5-91 (Phase 4.6.C):** `Op::RenameSheet` referenced a sheet
     /// whose current name matches neither `old_name` nor `new_name`
@@ -505,12 +511,12 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             // panic-on-duplicate behavior `intern` would have via the
             // by_string fast path; `register_at` is the explicit-id form).
             //
-            // Phase 5.2 D-1 step 3: `Op::RegisterFormat.id` is still a
-            // bare `u32` (step 4 will change to `FormatIdWire`); convert
-            // through the legacy migration helper. Pre-step-4 callers
-            // ALL went through the LEGACY_PEER path so this conversion
-            // is lossless for existing saved data.
-            let fid = ql_storage::FormatId::legacy_from_u32(*id);
+            // Phase 5.2 D-1 step 4: `Op::RegisterFormat.id` is now
+            // `FormatIdWire`. Convert to `ql_storage::FormatId` via
+            // `to_storage()`. The pre-step-4 `legacy_from_u32` migration
+            // helper is no longer needed for the wire-replay path; it's
+            // reserved for envelope-load migration in step 5.
+            let fid = id.to_storage();
             workbook
                 .formats_mut()
                 .register_at(fid, string.as_str())
@@ -530,12 +536,11 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             // **W5-80:** require the id to be registered. Catches
             // producer bugs where `SetCellFormat` was emitted without
             // a preceding `RegisterFormat`. `None` means clear.
-            if let Some(raw_id) = id {
-                // Phase 5.2 D-1 step 3: same legacy conversion as
-                // RegisterFormat above. Step 4 changes Op shape.
-                let fid = ql_storage::FormatId::legacy_from_u32(*raw_id);
+            if let Some(wire_id) = id {
+                // Phase 5.2 D-1 step 4: same wire→storage conversion.
+                let fid = wire_id.to_storage();
                 if workbook.formats().lookup(fid).is_none() {
-                    return Err(ReplayError::FormatNotRegistered { index, id: *raw_id });
+                    return Err(ReplayError::FormatNotRegistered { index, id: fid });
                 }
                 workbook
                     .sheet_mut(*sheet)
@@ -1356,7 +1361,9 @@ mod tests {
     fn replay_register_format_installs_custom_id() {
         let mut log = OpLog::new();
         log.append(Op::RegisterFormat {
-            id: 200,
+            // Step 4: Op carries FormatIdWire. id=200 (>=164) maps to
+            // Custom(LEGACY_PEER, 36) via from_u32_legacy.
+            id: crate::FormatIdWire::from_u32_legacy(200),
             string: "\"€\" #,##0.00".to_owned(),
         })
         .unwrap();
@@ -1365,8 +1372,6 @@ mod tests {
         let reg = default_registry();
         replay_into(&log, &mut wb, &reg).unwrap();
         assert_eq!(
-            // Step 3: replayed Op::RegisterFormat with id=200 routes
-            // through legacy_from_u32 → Custom(LEGACY_PEER, 200-164=36).
             wb.formats()
                 .lookup(ql_storage::FormatId::legacy_from_u32(200)),
             Some("\"€\" #,##0.00")
@@ -1379,7 +1384,7 @@ mod tests {
         // (pre-populated by Workbook::default). Replay must not error.
         let mut log = OpLog::new();
         log.append(Op::RegisterFormat {
-            id: 0,
+            id: crate::FormatIdWire::Builtin { id: 0 },
             string: "General".to_owned(),
         })
         .unwrap();
@@ -1388,7 +1393,6 @@ mod tests {
         let reg = default_registry();
         replay_into(&log, &mut wb, &reg).unwrap();
         assert_eq!(
-            // Step 3: id=0 → Builtin(0) via legacy_from_u32.
             wb.formats().lookup(ql_storage::FormatId::Builtin(0)),
             Some("General")
         );
@@ -1400,7 +1404,7 @@ mod tests {
         // id 0 must surface as `FormatRejected`.
         let mut log = OpLog::new();
         log.append(Op::RegisterFormat {
-            id: 0,
+            id: crate::FormatIdWire::Builtin { id: 0 },
             string: "WRONG".to_owned(),
         })
         .unwrap();
@@ -1426,7 +1430,7 @@ mod tests {
     fn replay_set_cell_format_binds_overlay() {
         let mut log = OpLog::new();
         log.append(Op::RegisterFormat {
-            id: 200,
+            id: crate::FormatIdWire::from_u32_legacy(200),
             string: "0.000".to_owned(),
         })
         .unwrap();
@@ -1434,7 +1438,7 @@ mod tests {
             sheet: 0,
             row: 3,
             col: 5,
-            id: Some(200),
+            id: Some(crate::FormatIdWire::from_u32_legacy(200)),
         })
         .unwrap();
 
@@ -1443,7 +1447,6 @@ mod tests {
         replay_into(&log, &mut wb, &reg).unwrap();
         assert_eq!(
             wb.sheet(0).unwrap().format_overlay().get(3, 5),
-            // Step 3: Op id=200 → Custom(LEGACY_PEER, 36) via legacy_from_u32.
             Some(ql_storage::FormatId::legacy_from_u32(200))
         );
     }
@@ -1452,7 +1455,7 @@ mod tests {
     fn replay_set_cell_format_with_none_clears_overlay() {
         let mut log = OpLog::new();
         log.append(Op::RegisterFormat {
-            id: 200,
+            id: crate::FormatIdWire::from_u32_legacy(200),
             string: "0.000".to_owned(),
         })
         .unwrap();
@@ -1460,7 +1463,7 @@ mod tests {
             sheet: 0,
             row: 3,
             col: 5,
-            id: Some(200),
+            id: Some(crate::FormatIdWire::from_u32_legacy(200)),
         })
         .unwrap();
         // Now clear via id=None.
@@ -1486,7 +1489,7 @@ mod tests {
             sheet: 0,
             row: 0,
             col: 0,
-            id: Some(999),
+            id: Some(crate::FormatIdWire::from_u32_legacy(999)),
         })
         .unwrap();
 
@@ -1495,7 +1498,8 @@ mod tests {
         match replay_into(&log, &mut wb, &reg) {
             Err(ReplayError::FormatNotRegistered { index, id }) => {
                 assert_eq!(index, 0);
-                assert_eq!(id, 999);
+                // Step 4: id field is now FormatId, not u32.
+                assert_eq!(id, ql_storage::FormatId::legacy_from_u32(999));
             }
             other => panic!("expected FormatNotRegistered, got {other:?}"),
         }
@@ -1508,7 +1512,7 @@ mod tests {
             sheet: 99,
             row: 0,
             col: 0,
-            id: Some(0),
+            id: Some(crate::FormatIdWire::Builtin { id: 0 }),
         })
         .unwrap();
 
@@ -1530,7 +1534,7 @@ mod tests {
             sheet: 0,
             row: 0,
             col: 0,
-            id: Some(14),
+            id: Some(crate::FormatIdWire::Builtin { id: 14 }),
         })
         .unwrap();
 

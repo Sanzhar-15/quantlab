@@ -256,7 +256,7 @@ fn replay_set_cell_format_without_register() {
         sheet: 0,
         row: 0,
         col: 0,
-        id: Some(99999),
+        id: Some(ql_oplog::FormatIdWire::from_u32_legacy(99999)),
     })
     .unwrap();
     let r = replay_into(&log, &mut wb, &registry);

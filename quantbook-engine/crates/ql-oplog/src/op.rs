@@ -118,20 +118,32 @@ pub enum Op {
     /// is a no-op). Re-registering at the same id with a DIFFERENT
     /// string fails at `FormatTable::register_at` and surfaces as
     /// `ReplayError::FormatRejected`. Shipped W5-80 (Phase 4.5.D part 4).
-    RegisterFormat { id: u32, string: String },
+    ///
+    /// **Phase 5.2 D-1 step 4 (2026-05-20):** `id` changed from `u32`
+    /// to [`crate::wire::FormatIdWire`] (tagged tuple `Builtin(u32)` /
+    /// `Custom(PeerId, u32)`). The `from_u32_legacy` migration helper
+    /// converts pre-5.2 saves to the new shape at envelope-load time
+    /// (step 5).
+    RegisterFormat {
+        id: crate::wire::FormatIdWire,
+        string: String,
+    },
 
     /// Set or clear a cell's format id. Mirrors
     /// `CellFormatOverlay::set` (when `id` is `Some`) and `::clear`
     /// (when `id` is `None`). The id MUST resolve in the workbook's
     /// `FormatTable` at replay time; an unknown id surfaces as
     /// `ReplayError::FormatNotRegistered`. Shipped W5-80.
+    ///
+    /// **Phase 5.2 D-1 step 4 (2026-05-20):** `id` changed from
+    /// `Option<u32>` to `Option<FormatIdWire>`.
     SetCellFormat {
         sheet: SheetId,
         row: RowId,
         col: ColId,
         /// `None` ⇒ clear the overlay entry (cell falls back to General).
         /// `Some(id)` ⇒ bind the cell to that format id.
-        id: Option<u32>,
+        id: Option<crate::wire::FormatIdWire>,
     },
 
     /// One transaction's ops applied atomically at replay time. Produced

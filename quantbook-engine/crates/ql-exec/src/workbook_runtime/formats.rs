@@ -49,19 +49,18 @@ impl<'a> WorkbookRuntime<'a> {
         // emit the op BEFORE mutating (append-before-mutate ordering,
         // matching set_name / set_value).
         //
-        // Phase 5.2 D-1 step 3: FormatTable now allocates under its
-        // `local_peer`. Predicted id is `Custom(local_peer, counter)`.
-        // Pre-step-4 the Op still carries a bare-u32 id; convert via
-        // `to_legacy_u32`. At step 3 all FormatTables default to
-        // LEGACY_PEER so the conversion always succeeds; the
-        // expect() makes the invariant load-bearing for step 4.
+        // Phase 5.2 D-1 step 4 (2026-05-20): Op::RegisterFormat now
+        // carries `FormatIdWire` directly. Drop the pre-step-4
+        // `to_legacy_u32().expect(...)` conversion. The producer
+        // predicts the id from `FormatTable::next_custom_counter()`
+        // under `local_peer`, emits the FormatIdWire op, then
+        // allocates via `intern`. Debug-assert that prediction
+        // matches actual allocation.
         let formats = self.workbook.formats();
         let id = FormatId::Custom(formats.local_peer(), formats.next_custom_counter());
         if let Some(oplog) = self.oplog.as_deref_mut() {
             oplog.append(Op::RegisterFormat {
-                id: id.to_legacy_u32().expect(
-                    "pre-step-4 FormatTable peer must be LEGACY_PEER so Op u32 is expressible",
-                ),
+                id: ql_oplog::FormatIdWire::from_storage(id),
                 string: s.to_owned(),
             })?;
         }
@@ -103,12 +102,9 @@ impl<'a> WorkbookRuntime<'a> {
                 sheet,
                 row,
                 col,
-                // Phase 5.2 D-1 step 3: Op still carries bare-u32
-                // (step 4 will change to FormatIdWire). Convert.
-                id: id.map(|f| {
-                    f.to_legacy_u32()
-                        .expect("pre-step-4 FormatId must be expressible as legacy u32")
-                }),
+                // Phase 5.2 D-1 step 4: Op carries FormatIdWire directly;
+                // drop the pre-step-4 to_legacy_u32 expect.
+                id: id.map(ql_oplog::FormatIdWire::from_storage),
             })?;
         }
         // Apply the mutation. After append-success this cannot fail.
@@ -241,8 +237,15 @@ mod tests {
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             Op::RegisterFormat { id, string } => {
-                // Pre-step-4: Op still carries bare u32 = 164.
-                assert_eq!(*id, ql_storage::FIRST_CUSTOM_FORMAT_ID);
+                // Step 4: Op carries FormatIdWire. First custom under
+                // LEGACY_PEER = Custom { peer: LEGACY_PEER, counter: 0 }.
+                assert_eq!(
+                    *id,
+                    ql_oplog::FormatIdWire::Custom {
+                        peer: ql_types::LEGACY_PEER,
+                        counter: 0
+                    }
+                );
                 assert_eq!(string, "\"€\" #,##0.00");
             }
             other => panic!("expected RegisterFormat, got {other:?}"),
@@ -282,9 +285,13 @@ mod tests {
         );
         // Op recorded.
         let ops: Vec<_> = log.iter().collect::<Result<_, _>>().unwrap();
-        assert!(ops
-            .iter()
-            .any(|o| matches!(o, Op::SetCellFormat { id: Some(14), .. })));
+        assert!(ops.iter().any(|o| matches!(
+            o,
+            Op::SetCellFormat {
+                id: Some(ql_oplog::FormatIdWire::Builtin { id: 14 }),
+                ..
+            }
+        )));
     }
 
     #[test]

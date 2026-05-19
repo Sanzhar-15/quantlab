@@ -322,6 +322,28 @@ impl FormatIdWire {
             }
         }
     }
+
+    /// **Phase 5.2 D-1 step 4 (2026-05-20):** project the storage-side
+    /// [`ql_storage::FormatId`] into the wire shape. Each variant
+    /// maps directly to its wire-side counterpart with identical
+    /// payload.
+    pub fn from_storage(id: ql_storage::FormatId) -> Self {
+        match id {
+            ql_storage::FormatId::Builtin(n) => FormatIdWire::Builtin { id: n },
+            ql_storage::FormatId::Custom(peer, counter) => FormatIdWire::Custom { peer, counter },
+        }
+    }
+
+    /// **Phase 5.2 D-1 step 4 (2026-05-20):** decode the wire shape
+    /// into the storage-side [`ql_storage::FormatId`]. Inverse of
+    /// [`from_storage`]. Lossless — both types carry the same
+    /// information.
+    pub fn to_storage(self) -> ql_storage::FormatId {
+        match self {
+            FormatIdWire::Builtin { id } => ql_storage::FormatId::Builtin(id),
+            FormatIdWire::Custom { peer, counter } => ql_storage::FormatId::Custom(peer, counter),
+        }
+    }
 }
 
 /// Map `ErrorValue` to its canonical Excel-style text form (`#REF!`, `#VALUE!`, etc.).

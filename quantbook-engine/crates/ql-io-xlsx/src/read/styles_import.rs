@@ -166,13 +166,24 @@ mod tests {
     }
 
     #[test]
-    fn libreoffice_general_at_custom_id_is_idempotent() {
-        // **W5-D-14.1 (audit HIGH-8 closure):** LibreOffice's
+    fn libreoffice_general_at_custom_id_registers_under_custom_namespace() {
+        // **W5-D-14.1 (audit HIGH-8 closure) + Phase 5.2 D-1 step 4
+        // by_string restructure:** LibreOffice's
         // `libreoffice_888_example.xlsx` declares `<numFmt
         // numFmtId="164" formatCode="General"/>`. The string "General"
-        // is already registered at id 0 (builtin). Previously this
-        // collision threw `MalformedOoxml`; the closure treats it as
-        // a benign no-op.
+        // is already registered at id Builtin(0).
+        //
+        // Pre-step-4: the second registration collided (single by_string
+        // map) and the loader silently skipped it. Test asserted
+        // `n == 0` (nothing added).
+        //
+        // Post-step-4 (this test name + assertion updated): Builtin
+        // and Custom variants have separate namespaces, so
+        // `register_at(Custom(LEGACY_PEER, 0), "General")` SUCCEEDS.
+        // Both Builtin(0) → "General" and Custom(LEGACY_PEER, 0) →
+        // "General" coexist. Cells with numFmtId=164 in the cell's xf
+        // bind to Custom(LEGACY_PEER, 0); lookup resolves to "General"
+        // identically — same render behavior.
         let mut wb = Workbook::new();
         let baseline = wb.formats().len();
         let idx = StyleIndex {
@@ -183,8 +194,18 @@ mod tests {
             cell_xfs: vec![],
         };
         let n = register_custom_formats(&mut wb, &idx).unwrap();
-        assert_eq!(n, 0, "redundant General declaration is not a new entry");
-        assert_eq!(wb.formats().len(), baseline);
+        assert_eq!(
+            n, 1,
+            "post-step-4 by_string restructure: cross-variant string \
+             registration succeeds (Custom and Builtin namespaces are separate)"
+        );
+        assert_eq!(wb.formats().len(), baseline + 1);
+        // Both ids resolve to "General".
+        assert_eq!(wb.formats().lookup(FormatId::Builtin(0)), Some("General"));
+        assert_eq!(
+            wb.formats().lookup(FormatId::legacy_from_u32(164)),
+            Some("General")
+        );
     }
 
     #[test]

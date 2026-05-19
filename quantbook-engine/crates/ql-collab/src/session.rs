@@ -160,7 +160,19 @@ impl CollabSession {
     ///   ids unless your transport layer enforces single-ownership.
     /// - `PeerId(u64::MAX)` is a Loro-reserved sentinel and returns
     ///   `CollabSessionError::OpLog`.
+    /// - **Phase 5.2 D-1 step 4 (Opus step-2 L4 closure):**
+    ///   `PeerId(0)` is reserved as `LEGACY_PEER` — the sentinel used
+    ///   by the qbook envelope's pre-5.2 u32 → tagged-tuple FormatId
+    ///   migration. Active multi-peer sessions MUST use a non-zero
+    ///   peer id; debug builds assert this here so misuse fails
+    ///   loudly in tests.
     pub fn new(peer_id: PeerId) -> Result<Self, CollabSessionError> {
+        debug_assert_ne!(
+            peer_id.as_u64(),
+            0,
+            "PeerId(0) is LEGACY_PEER (reserved for pre-collab single-writer + qbook migration). \
+             Active CollabSession peers MUST use a non-zero PeerId."
+        );
         let mut log = OpLog::new();
         log.set_peer_id(peer_id.as_u64())?;
         let undo = make_undo_manager(&log);
