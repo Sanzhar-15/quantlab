@@ -260,15 +260,33 @@ clean Phase 5 work if not done first.
   D1 extraction. Re-partitioning is appropriate polish but not
   worth holding D1 closure for.
 
-### D2. `ql-oplog → ql-io` reverse dependency cleanup
+### ~~D2.~~ `ql-oplog → ql-io` reverse dependency cleanup — ✅ SHIPPED 2026-05-19 at `e15e8908742`
 
-- **Source:** Phase 4.12 Opus-C HIGH-3.
-- **Scope:** `ql-oplog::Op` reaches into `ql-io::CellWireValue` for
-  its mutation vocabulary — Phase 5 CRDT integration will want
-  `ql-oplog` to be the dependency floor, not depend on I/O.
-- **Effort:** 1-2 days. Define an intermediate type owned by
-  `ql-oplog` (or `ql-storage`) that `ql-io::CellWireValue` converts
-  to/from.
+- **Source:** Phase 4.12 Opus-C HIGH-3; Phase 5.1 audit (Opus M-3)
+  established this as a Phase 5.2 hard prerequisite.
+- **Resolution:**
+  - Wire-vocabulary types (`CellWireValue`, `NamedTargetWire`,
+    `error_to_canonical_text`, `parse_canonical_error_text`)
+    moved from `ql-io::qbook_format` to new
+    `ql-oplog::wire` module.
+  - Persistence module (`save_workbook_with_oplog`,
+    `load_workbook_with_oplog`, `PersistenceError`) moved
+    from `ql-oplog::persistence` to new
+    `ql-io::oplog_persistence`.
+  - New `WireDecodeError` enum owned by `ql-oplog::wire`
+    replaces `ql_io::QbookError` as the return type for
+    `CellWireValue::to_value` and `NamedTargetWire::to_target`.
+    `QbookError` gains a `#[from] WireDecodeError` variant so
+    the `?` operator works at qbook-load call sites.
+  - Cargo.toml: `ql-oplog` dropped its `ql-io` dep;
+    `ql-io` added a `ql-oplog` dep.
+- **External API compat:** `ql_io::CellWireValue` etc. preserved
+  via re-export from `ql_io::lib.rs`. External callers of
+  `ql_oplog::save_workbook_with_oplog` etc. must switch to
+  `ql_io::...` (3 test files updated).
+- **On-disk format:** unchanged. `oplog.bin` is still the same
+  Loro snapshot; cell records serialize the same variant set.
+- **Gates:** 4141 tests passing, fmt + clippy + doc clean.
 
 ### D3. `oplog.bin` magic bytes + version header
 
