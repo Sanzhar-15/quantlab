@@ -107,7 +107,8 @@ This is the suggested order to keep the codebase in a compile-clean intermediate
 - ✅ Added `FormatIdWire::from_u32_legacy(n: u32) -> FormatIdWire` migration helper using `LEGACY_PEER` from step 1.1. Maps `0..=163` → `Builtin`, `>=164` → `Custom { peer: LEGACY_PEER, counter: n - 164 }`.
 - ✅ Tests: 9 unit tests pinning serde JSON round-trips for both variants, `from_u32_legacy` boundaries (0 / 163 / 164 / large), equality + hash consistency, distinct-peer collision-freedom.
 - ✅ Re-exported as `ql_oplog::FormatIdWire`.
-- Commit: pending (`Phase 5.2 D-1 step 2 — introduce FormatIdWire in ql-oplog::wire`).
+- ✅ Codex+Opus 2-way audit closure (commit `<step-2 audit closure>`) added `#[serde(deny_unknown_fields)]` + 4 rejection tests + renamed misleading test (`round_trips_through_loro_value_bincode` → `round_trips_worst_case_through_serde_json`).
+- Commits: `135bbb99f75` (initial ship) + audit closure commit (see audit transcripts at `docs/audits/2026-05-19-phase-5-2-d-1-step-2-*`).
 
 ### Step 3: Change `ql-storage::FormatId` to the tagged tuple (2-3 hours)
 

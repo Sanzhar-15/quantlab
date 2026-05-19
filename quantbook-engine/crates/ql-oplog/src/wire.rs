@@ -279,7 +279,7 @@ impl NamedTargetWire {
 /// `counter = 0` without colliding because the full `FormatId` differs
 /// in its `peer` component.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum FormatIdWire {
     Builtin { id: u32 },
     Custom { peer: PeerId, counter: u32 },
@@ -470,11 +470,16 @@ mod format_id_wire_tests {
     }
 
     #[test]
-    fn round_trips_through_loro_value_bincode() {
-        // FormatIdWire will live inside `Op::RegisterFormat` (step 4),
-        // which currently serializes to JSON via serde_json::to_string
-        // for Loro's LoroList. Verify the same JSON path that ops will
-        // use produces a clean round-trip.
+    fn round_trips_worst_case_through_serde_json() {
+        // Renamed from `round_trips_through_loro_value_bincode` per
+        // Opus D-1 step 2 audit M2 — the test uses serde_json (which
+        // is the actual `Op` wire path: log.rs:94, 129 serialize via
+        // serde_json::to_string into Loro's LoroList values), not
+        // bincode or LoroValue's native binary format.
+        //
+        // FormatIdWire will live inside `Op::RegisterFormat` (step 4).
+        // The same JSON path that ops use must survive worst-case
+        // PeerId + counter values without overflow or truncation.
         let original = FormatIdWire::Custom {
             peer: PeerId::new(0xdead_beef_cafe_babe),
             counter: u32::MAX,
@@ -482,7 +487,63 @@ mod format_id_wire_tests {
         let json = serde_json::to_string(&original).unwrap();
         let back: FormatIdWire = serde_json::from_str(&json).unwrap();
         assert_eq!(back, original);
-        // The serialized form survives the worst-case (u64-MAX-ish peer,
-        // u32::MAX counter) without overflow or truncation.
+    }
+
+    // ===== Codex+Opus D-1 step 2 audit M1 closure =====
+    //
+    // `#[serde(deny_unknown_fields)]` rejects payloads carrying fields
+    // the variant doesn't expect. The audit-locked rule "no fallbacks
+    // — errors must be visible" requires that producer bugs (writing
+    // an extra/misnamed field) fail loudly rather than silently drop
+    // the unknown data. The tests below pin the rejection contract so
+    // a future serde upgrade or accidental attribute removal can't
+    // weaken the schema.
+
+    #[test]
+    fn rejects_unknown_field_in_builtin_variant() {
+        // `counter` is a Custom-variant field; appearing inside Builtin
+        // is producer corruption.
+        let json = r#"{"kind":"builtin","id":14,"counter":7}"#;
+        let result: Result<FormatIdWire, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "deny_unknown_fields must reject unknown field; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_field_in_custom_variant() {
+        // Symmetric to the Builtin case: `id` doesn't belong in Custom.
+        let json = r#"{"kind":"custom","peer":42,"counter":7,"id":99}"#;
+        let result: Result<FormatIdWire, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "deny_unknown_fields must reject unknown field; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_arbitrary_top_level_extra_field() {
+        // A producer that drifts the schema (e.g. adds `"comment":
+        // "..."` for human readability) must be rejected so we catch
+        // the drift before it lands in saved `.qbook` files.
+        let json = r#"{"kind":"builtin","id":14,"comment":"general format"}"#;
+        let result: Result<FormatIdWire, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "extra fields must be rejected; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_kind_tag() {
+        // A future variant `{"kind": "tombstoned", ...}` MUST NOT
+        // silently fall through. Pin that unknown `kind` tags error.
+        let json = r#"{"kind":"tombstoned","id":14}"#;
+        let result: Result<FormatIdWire, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "unknown kind tag must be rejected; got {result:?}"
+        );
     }
 }
