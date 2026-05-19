@@ -11,11 +11,12 @@
 //!   excluded. See [`session::CollabSession::undo`].
 //! - **Phase 5.5** — transport layer. V1 shipped at
 //!   `924750819bc` (LoopbackTransport for in-process 2-peer
-//!   tests); V2 pending — WebSocket impl + auto-flush
-//!   (append a local op → broadcast bytes via
-//!   [`crate::Transport::send`]; poll
-//!   [`crate::Transport::try_recv`] for remote bytes →
-//!   `merge_bytes`).
+//!   tests). V2 V1 shipped at `ffd8f6e5f05` —
+//!   `CollabSession::{attach,detach,has}_transport` +
+//!   `flush_to_transport` + `poll_remote` (+ `_with_limit`)
+//!   typed methods; explicit-drive (caller invokes flush + poll
+//!   on a tick). V2 V2 / V3 pending — auto-flush + version-
+//!   vector deltas + WebSocket impl.
 //! - ~~**Phase 5.6**~~ ✅ V1 shipped at `c677e244704` — `presence`
 //!   module + 4 `CollabSession` methods (`update_presence` /
 //!   `peer_presence` / `clear_presence` / `peers_with_presence`).
@@ -52,6 +53,22 @@ use crate::peer::PeerId;
 use crate::presence::{self, PresenceError, PresenceState};
 use crate::transport::{Transport, TransportError};
 
+/// **Phase 5.5 V2 V1 audit closure (2026-05-19):** default cap on
+/// the number of blobs `CollabSession::poll_remote` drains per
+/// call. Prevents one poll from starving the calling thread when
+/// an externally-fed transport produces faster than we merge.
+/// Callers wanting a different bound use `poll_remote_with_limit`.
+pub const DEFAULT_POLL_REMOTE_LIMIT: usize = 64;
+
+// Phase 5.5 V2 V1 audit closure: pin the Send contract the
+// docstring promises ("callers can move sessions between threads
+// with attached transports"). If a future Loro dep bump or field
+// addition breaks Send, this stops compiling.
+const _ASSERT_COLLAB_SESSION_SEND: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<CollabSession>();
+};
+
 /// Errors emitted by `CollabSession` operations.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -74,9 +91,20 @@ pub enum CollabSessionError {
     Undo(#[from] loro::LoroError),
 
     /// **Phase 5.5 V2 (2026-05-19):** the attached `Transport`
-    /// returned an error during `flush_to_transport` or
-    /// `poll_remote`. The local `OpLog` state is unaffected — the
-    /// caller can retry the flush/poll or detach the transport.
+    /// returned an error.
+    ///
+    /// For `flush_to_transport`: the local `OpLog` is unaffected
+    /// (the snapshot export happened first; the failed step was
+    /// `Transport::send`). Caller can retry the flush.
+    ///
+    /// For `poll_remote`: any bytes successfully drained BEFORE
+    /// the error were already `merge_bytes`'d into the local
+    /// `OpLog` — those merges persist. The error indicates the
+    /// transport itself is misbehaving (`Io`) — `Closed` is
+    /// handled gracefully by `poll_remote` itself (returns
+    /// `Ok(merged)`, see Codex+Opus 5.5 V2 V1 audit closure).
+    /// Caller should detach + reattach a new transport instead
+    /// of retrying poll.
     #[error("transport error: {0}")]
     Transport(#[from] TransportError),
 }
@@ -258,12 +286,17 @@ impl CollabSession {
     /// transport. No-op (returns `Ok(false)`) if no transport
     /// attached.
     ///
-    /// Returns `Ok(true)` if bytes were sent. Errors propagate
-    /// from either the underlying `OpLog::export_bytes` or the
-    /// transport's `send`. The local `OpLog` is unaffected by
-    /// transport errors — caller can retry the flush.
+    /// Returns `Ok(true)` if bytes were sent. Errors:
+    /// - `CollabSessionError::OpLog` if `OpLog::export_bytes`
+    ///   fails (Loro encode error).
+    /// - `CollabSessionError::Transport` if `Transport::send`
+    ///   fails (Closed, Io).
     ///
-    /// V2 V1 sends the FULL snapshot each call (O(state)). V3
+    /// In both error cases the local `OpLog` is unaffected
+    /// (export runs first, send is the last step). Caller can
+    /// retry the flush after addressing the underlying cause.
+    ///
+    /// V2 V1 sends the FULL snapshot each call (O(state)). V2 V2
     /// will track per-transport version vectors and send deltas
     /// only.
     pub fn flush_to_transport(&mut self) -> Result<bool, CollabSessionError> {
@@ -275,24 +308,63 @@ impl CollabSession {
         Ok(true)
     }
 
-    /// **Phase 5.5 V2 V1 (2026-05-19):** drain the attached
-    /// transport's recv queue, merging each blob into the local
-    /// `OpLog`. Returns the number of blobs merged.
+    /// **Phase 5.5 V2 V1 (2026-05-19, audit-tightened):** drain
+    /// the attached transport's recv queue up to a default cap
+    /// (`DEFAULT_POLL_REMOTE_LIMIT = 64` blobs), merging each
+    /// blob into the local `OpLog`. Returns the number of blobs
+    /// merged.
     ///
-    /// Returns `Ok(0)` if no transport attached. Stops draining
-    /// at the first `try_recv` returning `None` (queue empty);
-    /// propagates `Closed` / `Io` errors as
-    /// `CollabSessionError::Transport`. Per the trait contract,
-    /// any already-queued bytes are drained BEFORE `Closed`
-    /// surfaces.
+    /// For unbounded drain (or a different cap), use
+    /// [`poll_remote_with_limit`]. The cap prevents one
+    /// `poll_remote` call from starving the calling thread when
+    /// a future externally-fed transport is producing faster
+    /// than we drain.
+    ///
+    /// Returns `Ok(0)` if no transport attached.
+    /// `TransportError::Closed` is handled gracefully — the
+    /// trait contract guarantees Closed only after the queue
+    /// drains, so the merge count reflects all queued blobs and
+    /// the function returns `Ok(merged)`. `Io` errors propagate
+    /// as `CollabSessionError::Transport` — any merges before
+    /// the error already persist in the local `OpLog`.
     pub fn poll_remote(&mut self) -> Result<usize, CollabSessionError> {
+        self.poll_remote_with_limit(DEFAULT_POLL_REMOTE_LIMIT)
+    }
+
+    /// **Phase 5.5 V2 V1 (2026-05-19, audit-tightened):** like
+    /// [`poll_remote`] but with an explicit per-call cap on the
+    /// number of blobs to drain.
+    ///
+    /// `max_blobs == 0` is a no-op (returns `Ok(0)` even if
+    /// blobs are queued — call again with a non-zero cap).
+    ///
+    /// Returns `Ok(merged)` where `merged <= max_blobs`. If the
+    /// returned count equals `max_blobs`, more blobs may still
+    /// be queued — call again. If less, the queue drained
+    /// (either empty or transport reported `Closed`).
+    pub fn poll_remote_with_limit(
+        &mut self,
+        max_blobs: usize,
+    ) -> Result<usize, CollabSessionError> {
         let Some(transport) = self.transport.as_mut() else {
             return Ok(0);
         };
         let mut merged = 0usize;
-        while let Some(bytes) = transport.try_recv()? {
-            self.log.merge_bytes(&bytes)?;
-            merged += 1;
+        while merged < max_blobs {
+            match transport.try_recv() {
+                Ok(Some(bytes)) => {
+                    self.log.merge_bytes(&bytes)?;
+                    merged += 1;
+                }
+                Ok(None) => break,
+                Err(TransportError::Closed) => {
+                    // Trait contract: Closed only after queue drains. Any
+                    // already-drained bytes are accounted in `merged`.
+                    // Treat as graceful end-of-stream.
+                    break;
+                }
+                Err(other) => return Err(CollabSessionError::Transport(other)),
+            }
         }
         Ok(merged)
     }
@@ -1003,6 +1075,125 @@ mod tests {
         let drained_a = peer_a.poll_remote().unwrap();
         assert_eq!(drained_a, 1);
         assert_eq!(peer_a.op_count(), peer_b.op_count());
+    }
+
+    #[test]
+    fn flush_to_transport_errors_when_transport_closed() {
+        // Codex+Opus 5.5 V2 V1 audit closure: missing test for
+        // flush-on-closed-transport. Attach a LoopbackTransport,
+        // close it, then attempt flush — expect Transport::Closed.
+        use crate::transport::LoopbackTransport;
+        let (tx_a, _tx_b) = LoopbackTransport::pair();
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        // Close BEFORE attaching: close() takes &self so we can do
+        // this on the raw transport.
+        tx_a.close();
+        s.attach_transport(tx_a);
+        let result = s.flush_to_transport();
+        assert!(
+            matches!(
+                result,
+                Err(CollabSessionError::Transport(TransportError::Closed))
+            ),
+            "flush on closed transport must Err(Closed), got {result:?}"
+        );
+        // Local OpLog unaffected — op still in the log.
+        assert!(s.op_count() >= 1);
+    }
+
+    #[test]
+    fn poll_remote_treats_closed_as_graceful_end_of_stream() {
+        // Codex+Opus 5.5 V2 V1 audit closure: pin partial-merge-
+        // then-Closed semantics. The trait contract guarantees
+        // Closed only after queue drains; CollabSession::poll_remote
+        // returns Ok(merged) on Closed (NOT Err) so the caller sees
+        // the merge count.
+        use crate::transport::LoopbackTransport;
+        let (tx_a, mut tx_b) = LoopbackTransport::pair();
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+
+        // Queue 3 snapshots in tx_a's inbox.
+        let snapshot = {
+            let other = CollabSession::new(PeerId::new(2)).unwrap();
+            other.export_bytes().unwrap()
+        };
+        for _ in 0..3 {
+            tx_b.send(&snapshot).unwrap();
+        }
+        // Close tx_a's endpoint. Per trait contract, A.try_recv
+        // drains 3 queued blobs first, then returns Closed.
+        tx_a.close();
+        s.attach_transport(tx_a);
+
+        let drained = s.poll_remote().unwrap();
+        assert_eq!(
+            drained, 3,
+            "poll_remote must drain all queued blobs even when transport is closed"
+        );
+        // Next poll: queue is empty + closed → still Ok(0) (graceful).
+        let drained2 = s.poll_remote().unwrap();
+        assert_eq!(drained2, 0);
+    }
+
+    #[test]
+    fn poll_remote_with_limit_caps_drain() {
+        // Codex+Opus 5.5 V2 V1 audit closure (H1): poll_remote_with_limit
+        // bounds the drain. Pre-populate 10 blobs, drain 4 at a time.
+        use crate::transport::LoopbackTransport;
+        let (tx_a, mut tx_b) = LoopbackTransport::pair();
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+
+        let snapshot = {
+            let other = CollabSession::new(PeerId::new(2)).unwrap();
+            other.export_bytes().unwrap()
+        };
+        for _ in 0..10 {
+            tx_b.send(&snapshot).unwrap();
+        }
+        s.attach_transport(tx_a);
+
+        let d1 = s.poll_remote_with_limit(4).unwrap();
+        assert_eq!(d1, 4, "first call drains 4");
+        let d2 = s.poll_remote_with_limit(4).unwrap();
+        assert_eq!(d2, 4, "second call drains 4");
+        let d3 = s.poll_remote_with_limit(4).unwrap();
+        assert_eq!(d3, 2, "third call drains the remaining 2");
+        let d4 = s.poll_remote_with_limit(4).unwrap();
+        assert_eq!(d4, 0, "queue empty");
+
+        // limit = 0 is a no-op even with queued blobs.
+        tx_b.send(&snapshot).unwrap();
+        let d5 = s.poll_remote_with_limit(0).unwrap();
+        assert_eq!(d5, 0, "limit=0 must be a no-op");
+    }
+
+    #[test]
+    fn attach_flush_detach_reattach_cycle() {
+        // Codex+Opus 5.5 V2 V1 audit closure: missing test for
+        // full attach-flush-detach-reattach lifecycle.
+        use crate::transport::LoopbackTransport;
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+
+        // Cycle 1: attach, flush, detach.
+        let (tx_a1, tx_b1) = LoopbackTransport::pair();
+        s.attach_transport(tx_a1);
+        assert!(s.flush_to_transport().unwrap());
+        assert_eq!(tx_b1.pending_recv(), 1, "first cycle: 1 blob in tx_b1");
+        let detached1 = s.detach_transport();
+        assert!(detached1.is_some());
+        assert!(!s.has_transport());
+
+        // Cycle 2: attach DIFFERENT transport, flush, detach.
+        let (tx_a2, tx_b2) = LoopbackTransport::pair();
+        s.attach_transport(tx_a2);
+        s.append_op(put_value(0, 0, 1, 2.0)).unwrap();
+        assert!(s.flush_to_transport().unwrap());
+        assert_eq!(tx_b2.pending_recv(), 1, "second cycle: 1 blob in tx_b2");
+        // tx_b1 unaffected by the second cycle.
+        assert_eq!(tx_b1.pending_recv(), 1, "tx_b1 isolated from second attach");
+        s.detach_transport();
     }
 
     #[test]

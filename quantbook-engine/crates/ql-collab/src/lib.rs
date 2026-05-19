@@ -15,10 +15,12 @@
 //!   wraps an `OpLog`, manages local appends, and exposes
 //!   `merge_bytes` + `export_bytes` for transport integration.
 //! - [`transport`] — `Transport` trait + 2 impls: `NoopTransport`
-//!   (test stub, records sends + returns None forever) and
-//!   `LoopbackTransport` (Phase 5.5 V1 ship 2026-05-19 —
-//!   in-process paired endpoints for 2-peer round-trip tests).
-//!   Phase 5.5 V2 will add a WebSocket impl.
+//!   (test stub) and `LoopbackTransport` (Phase 5.5 V1 ship
+//!   2026-05-19 — in-process paired endpoints for 2-peer
+//!   round-trip tests). Phase 5.5 V2 V1 (2026-05-19, `ffd8f6e5f05`)
+//!   added `CollabSession` typed transport methods
+//!   (attach/detach/flush/poll). Phase 5.5 V2 V2 / V3 pending —
+//!   auto-flush + version-vector deltas + WebSocket impl.
 //! - [`presence`] — per-peer ephemeral cursor + selection state
 //!   (Phase 5.6 V1 ship 2026-05-19). `PresenceState` JSON-encoded
 //!   into the shared `LoroDoc`'s `"presence"` LoroMap (LWW per key).

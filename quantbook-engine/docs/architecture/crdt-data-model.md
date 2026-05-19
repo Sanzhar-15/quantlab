@@ -380,22 +380,30 @@ whose sends route to each other's recv queues; `Send + Sync`
 so multi-threaded test patterns work too. Drain-before-Closed
 semantic per the trait contract.
 
+**V2 V1 ✅ shipped at `ffd8f6e5f05` (2026-05-19):**
+`CollabSession` exposes 5 typed transport methods:
+`attach_transport` / `detach_transport` / `has_transport` /
+`flush_to_transport` / `poll_remote` (+ `poll_remote_with_limit`
+for bounded drain). Explicit-drive — caller invokes flush + poll
+on a tick; V2 V2 will add auto-flush on append.
+
 Loro's wire format:
 - `LoroDoc::export(ExportMode::Updates(version_vector))` →
   bytes carrying only ops new-to-the-peer-since-version-vector.
 - `LoroDoc::import(bytes)` → merge into local doc.
 
-**V2 pending:** WebSocket transport (or any bidirectional byte
-channel) for production. Each peer pushes version-vector
-updates to the server; server fan-outs to other peers; each
-peer imports. V2 also adds auto-flush wiring on `CollabSession`
-(append a local op → push via attached `Transport`). V1's
-`LoopbackTransport` is sufficient for engine-side tests.
+**V2 V2 / V3 pending:** auto-flush on append (track per-
+transport version vector + send deltas, not full snapshots);
+WebSocket transport for production; reconnect + offline sync.
+Each peer pushes version-vector updates to the server; server
+fan-outs to other peers; each peer imports. V1's
+`LoopbackTransport` + V2 V1's `attach_transport`/`flush`/`poll`
+wrappers are sufficient for engine-side tests.
 
 5.1 does NOT pick a production transport (WS vs Server-Sent
-Events vs custom protocol) — that's 5.5 V2's call. 5.1 just
-confirms the substrate works regardless; 5.5 V1 proves it via
-LoopbackTransport.
+Events vs custom protocol) — that's 5.5 V2 V2's call. 5.1 just
+confirms the substrate works regardless; 5.5 V1 + V2 V1 prove
+it via LoopbackTransport + the CollabSession wrappers.
 
 ## Backwards compatibility with `.qbook` envelope
 

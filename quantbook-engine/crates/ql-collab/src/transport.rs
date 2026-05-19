@@ -3,7 +3,14 @@
 //! **Phase 5.2.a (2026-05-19, scaffold):** trait shape defined.
 //! **Phase 5.5 V1 (2026-05-19, `924750819bc`):** `LoopbackTransport`
 //! shipped — in-process paired endpoints for 2-peer tests.
-//! **Phase 5.5 V2 (pending):** WebSocket impl + reconnect /
+//! **Phase 5.5 V2 V1 (2026-05-19, `ffd8f6e5f05` + audit closure):**
+//! `CollabSession` exposes 5 typed transport methods
+//! (`attach_transport` / `detach_transport` / `has_transport` /
+//! `flush_to_transport` / `poll_remote` (+ `poll_remote_with_limit`)).
+//! V2 V1 is "explicit drive" — caller invokes flush + poll on a
+//! tick.
+//! **Phase 5.5 V2 V2 / V3 (pending):** auto-flush on append +
+//! version-vector delta exports + WebSocket impl + reconnect /
 //! offline sync semantics.
 //!
 //! Tests can also use [`NoopTransport`] which discards traffic.

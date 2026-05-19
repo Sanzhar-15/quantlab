@@ -16,6 +16,7 @@ shipped_commits:
   - c677e244704  # Phase 5.6 V1 — presence map (per-peer cursor + selection LoroMap LWW)
   - 89c02b9d83e  # Phase 5.4 V1 — peer-local undo/redo via Loro UndoManager
   - 924750819bc  # Phase 5.5 V1 — LoopbackTransport for 2-peer round-trip tests
+  - ffd8f6e5f05  # Phase 5.5 V2 V1 — CollabSession transport wrappers (attach/detach/flush/poll)
 ---
 
 # Phase 5 entry plan — CRDT collaboration
@@ -108,7 +109,7 @@ post-merge.
 | 5.2 | `ql-collab` Core Documents | 1-2 weeks | **🟡 IN PROGRESS** — 5.2.a scaffold shipped `66a571b30af` (PeerId + CollabSession + Transport); D-2 / D-3 / D-4 closures shipped (`1ca19e2fa37` / `e71312d4bcd` / `2f217a2067a`); 5.2.b PeerId → LoroDoc wiring shipped `ef056f50bee`; D-1 (FormatId tagged tuple, schema-breaking) pending. |
 | 5.3 | Conflict Resolution Semantics | 4-7 days | Causality-aware rename-repair pass; multi-value / delete-vs-update. Loro merge is Fugue/origin-based (not Lamport LWW — corrected by Phase 5.1 audit). |
 | 5.4 | Undo/Redo + Operation Grouping | 1 week | **🟢 V1 SHIPPED `89c02b9d83e`** — `CollabSession::{undo,redo,can_undo,can_redo,undo_count,redo_count,clear_undo_stack}` wraps `loro::UndoManager`; presence-origin commits excluded. V2 follow-up: `group_start`/`group_end`, merge-interval tuning, push/pop listeners. |
-| 5.5 | Transport Layer + Offline Sync | 1-2 weeks | **🟡 V1 SHIPPED `924750819bc`** — `Transport` trait + `NoopTransport` + `LoopbackTransport` (in-process paired endpoints, Send+Sync, drain-before-Closed). V2 pending: WebSocket impl + reconnect + auto-flush on CollabSession. |
+| 5.5 | Transport Layer + Offline Sync | 1-2 weeks | **🟡 V1 SHIPPED `924750819bc`** + **V2 V1 SHIPPED `ffd8f6e5f05`** — V1: `Transport` trait + `NoopTransport` + `LoopbackTransport`. V2 V1: `CollabSession::{attach,detach,has}_transport` + `flush_to_transport` + `poll_remote` (+ `_with_limit`) typed methods; explicit-drive. V2 V2 / V3 pending: auto-flush on append + version-vector delta exports + WebSocket impl + reconnect/offline sync. |
 | 5.6 | Presence + Awareness | 3-5 days | **🟢 V1 SHIPPED `c677e244704`** — `"presence"` LoroMap + `PresenceState` + 4 CollabSession methods + 11 tests. V2 follow-up: load-time presence-eviction sweep + presence-changed callbacks. Known V1 limitation: presence persists across `.qbook` save/load (Codex 5.6 audit MED-1). |
 | 5.7 | IDE Vertical Slice | 1 week | Two-window editing. |
 | 5.8 | Phase 5 Megaudit | 4-6 days | Randomized peer-merge tests + transport failure modes. |
