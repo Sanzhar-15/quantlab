@@ -1,8 +1,10 @@
 ---
-title: Phase 5 V1 exit packet (5.1 → 5.6 V1 + 5.4 V2 V1.1)
+title: Phase 5 V1 exit packet (5.1 → 5.6 V1+V2 + 5.4 V2 V1+V1.1 + 5.5 V2 V1 + D1.a)
 status: ACTIVE — Phase 5 V1 surface complete 2026-05-19. D-1 (FormatId tagged tuple, multi-day) is the only remaining major Phase 5 item before the 5.8 megaudit.
 date: 2026-05-19
+updated: 2026-05-19 (post-exit-packet additions: 5.6 V2 sweep_presence + D1.a 4-cluster closure)
 predecessor: docs/phase4/exit-packet.md + docs/phase5/entry-plan.md
+successor: docs/phase5/d-1-starting-checklist.md (fresh-session entry for the multi-day D-1 arc)
 supersedes_pointer: docs/phase5/entry-plan.md (entry-plan stays as scope reference; this packet is the closeout)
 ---
 
@@ -24,9 +26,9 @@ auto-flush) + Phase 5.7 IDE vertical slice remain ahead of the
 
 | ID | Criterion | Status | Evidence |
 |---|---|---|---|
-| A5V1-01 | All workspace gates green | ✅ | 4219 workspace tests passing; fmt + clippy clean across modified crates |
+| A5V1-01 | All workspace gates green | ✅ | 4222 workspace tests passing; fmt + clippy clean workspace-wide |
 | A5V1-02 | CRDT data model audit-closed | ✅ | `docs/architecture/crdt-data-model.md` + `docs/audits/2026-05-19-phase-5-1-{codex,opus,consolidated}.md` |
-| A5V1-03 | `ql-collab` substantively populated | ✅ | 4 submodules (peer / session / transport / presence / undo) + 60 unit tests + 1 integration test |
+| A5V1-03 | `ql-collab` substantively populated | ✅ | 5 modules (peer / session / transport / presence / undo) + ~30 public methods + 67 unit tests + 1 integration test |
 | A5V1-04 | Op-log + Loro merge semantics verified for multi-peer | ✅ | `crates/ql-exec/tests/phase_5_2_d4_spill_2peer_probe.rs` (4 tests) + 8 paired LoopbackTransport tests + 2-peer round-trip via attached transport |
 | A5V1-05 | Audit discipline preserved | ✅ | 2-way Codex + Opus audit dispatched after every substantive cycle; 7 of 10 cycles caught HIGH/MEDIUM findings convergently |
 
@@ -49,8 +51,17 @@ All five acceptance criteria empirically met.
 | 5.5 V2 V1 | CollabSession transport wrappers (attach/detach/flush/poll) | ✅ SHIPPED | `ffd8f6e5f05` + `ad9b18fe133` (audit closures) |
 | 5.4 V2 V1 | Undo grouping + merge-interval | ✅ SHIPPED | `6138a7203f6` + `e199a5fda5a` (truncation fix + audit closures) |
 | 5.4 V2 V1.1 | RAII UndoGroupGuard (panic/Err-safe grouping) | ✅ SHIPPED | `7cbdc689ea9` + `d49e873f237` (Codex audit PASS) |
+| **Phase 5 V1 exit packet** (this doc) | ✅ shipped | `b8b2e04e0d7` |
+| 5.6 V2 (sweep_presence — closes V1 persistence known-limitation) | ✅ shipped | `d4b3cdb2dc2` |
+| D1.a cluster 1 (add_sheet_rejects test → sheets.rs) | ✅ shipped | `06252f2b638` |
+| D1.a cluster 2 (clear_formula_rejects_* → cells.rs) | ✅ shipped | `9b45ee656eb` + `4528dc62c3b` (backlog status) |
+| D1.a clusters 3+4 (set_formula canonicalization + drop_table) — **D1.a COMPLETE** | ✅ shipped | `93210e43567` |
 
-13 ship commits + 8 audit-closure commits + 2 truncation-fix commits = **23 commits** in the Phase 5 V1 arc.
+**23 commits to exit-packet ship + 7 post-exit-packet commits = 30 commits total** in the Phase 5 V1 arc.
+
+Post-exit-packet adds (2026-05-19 session-end additions):
+- Phase 5.6 V2 sweep_presence (+3 tests; closes V1 persistence known-limitation).
+- D1.a re-partitioning across 4 clusters (9 tests relocated; net 0 workspace test count change since these are byte-identical relocations).
 
 ## Final API surface (ql-collab)
 
@@ -105,11 +116,12 @@ impl CollabSession {
     pub fn poll_remote(&mut self) -> Result<usize, _>;
     pub fn poll_remote_with_limit(&mut self, max: usize) -> Result<usize, _>;
 
-    // Presence (5.6 V1)
+    // Presence (5.6 V1 + V2)
     pub fn update_presence(&mut self, state: PresenceState) -> Result<(), _>;
     pub fn peer_presence(&self, peer: PeerId) -> Result<Option<PresenceState>, _>;
     pub fn clear_presence(&mut self) -> Result<(), _>;
     pub fn peers_with_presence(&self) -> Result<Vec<PeerId>, _>;
+    pub fn sweep_presence(&mut self) -> Result<usize, _>;  // V2: clear all, return count
 }
 
 // Transport
@@ -133,7 +145,7 @@ pub struct UndoGroupGuard<'a> { ... }  // Drop calls end_undo_group
 impl Deref<Target = CollabSession> + DerefMut for UndoGroupGuard
 ```
 
-Total: **~30 public methods + 5 types** on `ql-collab`.
+Total: **~31 public methods + 5 types** on `ql-collab` (was 30 at exit-packet; +1 sweep_presence in V2 follow-up).
 
 ## Audit-locked decisions (Phase 5.1)
 
@@ -191,9 +203,11 @@ session.
 | Phase 5.5 V1 ship + audit | 4196 (+9) |
 | Phase 5.5 V2 V1 ship + audit | 4209 (+13) |
 | Phase 5.4 V2 V1 ship + audit | 4215 (+6) |
-| Phase 5.4 V2 V1.1 ship | **4219** (+4) |
+| Phase 5.4 V2 V1.1 ship | 4219 (+4) |
+| Phase 5.6 V2 sweep_presence | 4222 (+3) |
+| D1.a clusters 1-4 (relocations) | **4222** (0 net; byte-identical) |
 
-Phase 5 V1 added **88 net tests** to the engine.
+Phase 5 V1 added **91 net tests** to the engine.
 
 ## What's deferred (forward work for next session(s))
 
@@ -229,16 +243,27 @@ Phase 5 V1 added **88 net tests** to the engine.
 ### Minor (V2 V2 polish)
 
 - **Phase 5.4 V2 V2 — UndoManager push/pop listeners** (lower
-  priority; UndoManager already exposed via `pub use loro::UndoManager`).
-- **Phase 5.6 V2 — Presence eviction sweep on `from_snapshot`** (closes
-  the V1 known persistence limitation).
+  priority; UndoManager already exposed via `pub use loro::UndoManager`;
+  Loro's API surface is complex — couples to `UndoOrRedo`,
+  `CounterSpan`, `DiffEvent`, `UndoItemMeta`; defer until Phase 5.7
+  IDE surfaces a concrete consumer need).
+- ~~**Phase 5.6 V2 — Presence eviction sweep**~~ — ✅ SHIPPED
+  `d4b3cdb2dc2` as `CollabSession::sweep_presence` (caller-opt-in).
 
 ### Infrastructure
 
 - **Tier D3 — `oplog.bin` magic bytes + version header.** Bundle
-  with D-1 schema work.
+  with D-1 schema work (it's the discriminator the loader uses to
+  detect old envelope schemas for migration).
 - **Tier C2 — BatchCommit depth guard.** Low priority.
-- **Index-padding race root-cause** in husky precommit hook.
+- ~~**Tier D1.a — test-cluster re-partitioning**~~ — ✅ SHIPPED
+  across 4 commits (`06252f2b638`, `9b45ee656eb`, `4528dc62c3b`,
+  `93210e43567`). 9 tests relocated to their semantically correct
+  owning submodules. Pure mechanical, net 0 test count change.
+- **Index-padding race root-cause** in husky precommit hook —
+  recurring `ERR_CHILD_PROCESS_STDIO_MAXBUFFER` on large-file edits
+  + cargo fmt × git add race. 3 incidents this session; mitigation
+  (re-stage + retry) reliable but root cause is forward work.
 
 ## Cross-references
 
