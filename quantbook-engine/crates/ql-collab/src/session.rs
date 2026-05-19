@@ -467,6 +467,52 @@ impl CollabSession {
         self.undo.clear();
     }
 
+    /// **Phase 5.4 V2 V1 (2026-05-19):** begin a new undo group.
+    /// All subsequent appends merge into a SINGLE undo unit on
+    /// the undo stack; one `undo()` call after `end_undo_group`
+    /// reverts all of them as a unit. Useful for atomic multi-
+    /// cell operations (paste, fill-down, table import) where
+    /// per-cell undo would surprise the user.
+    ///
+    /// Pair with [`end_undo_group`]. Calling `start_undo_group`
+    /// while a group is already open is Loro-defined behavior;
+    /// V1 callers SHOULD treat it as undefined and avoid nesting
+    /// until V2 V2 firms up the contract.
+    ///
+    /// Closes GAP-C-04's "command grouping" half. Merge-interval
+    /// auto-grouping is the complement — see
+    /// [`set_undo_merge_interval`].
+    pub fn start_undo_group(&mut self) -> Result<(), CollabSessionError> {
+        Ok(self.undo.group_start()?)
+    }
+
+    /// **Phase 5.4 V2 V1 (2026-05-19):** close the current undo
+    /// group started by [`start_undo_group`]. All appends since
+    /// the matching `start_undo_group` are now a single undo
+    /// unit.
+    ///
+    /// Loro's `group_end` is infallible; calling it without a
+    /// matching `group_start` is a no-op. Safe to call in `Drop`
+    /// guards.
+    pub fn end_undo_group(&mut self) {
+        self.undo.group_end();
+    }
+
+    /// **Phase 5.4 V2 V1 (2026-05-19):** set the auto-merge
+    /// interval in milliseconds. Consecutive changes within this
+    /// window auto-merge into a single undo unit — useful for
+    /// rapid typing where per-keystroke undo is too granular.
+    ///
+    /// `0` (Loro default) disables auto-merge. Phase 5.4 V1 used
+    /// the default; V2 V1 callers can opt in via this method.
+    /// Recommended IDE settings: 200-500 ms for typing windows.
+    ///
+    /// Orthogonal to [`start_undo_group`] / [`end_undo_group`] —
+    /// explicit groups take precedence over the interval.
+    pub fn set_undo_merge_interval(&mut self, interval_ms: i64) {
+        self.undo.set_merge_interval(interval_ms);
+    }
+
     /// **Phase 5.6 V1 (2026-05-19):** list every peer with a
     /// presence entry in the shared map.
     ///
@@ -851,6 +897,93 @@ mod tests {
             "presence writes must be excluded from the undo stack \
              (PRESENCE_COMMIT_ORIGIN excludes them via UndoManager::add_exclude_origin_prefix)"
         );
+    }
+
+    #[test]
+    fn undo_group_collapses_appends_to_single_unit() {
+        // Phase 5.4 V2 V1 acceptance: 5 appends inside a group
+        // collapse to ONE undo stack item. A single undo() call
+        // reverts all 5 as a unit.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        assert_eq!(s.undo_count(), 0);
+
+        s.start_undo_group().unwrap();
+        for col in 0..5 {
+            s.append_op(put_value(0, 0, col, col as f64)).unwrap();
+        }
+        s.end_undo_group();
+
+        // After group_end, the stack has ONE item, not 5.
+        assert_eq!(
+            s.undo_count(),
+            1,
+            "5 grouped appends must collapse to 1 undo unit"
+        );
+
+        // One undo reverts all 5 (the visible op count must drop
+        // to ≤ 0 — Loro retracts all 5 from the visible list).
+        assert!(s.undo().unwrap());
+        assert_eq!(s.undo_count(), 0);
+        assert_eq!(s.redo_count(), 1);
+        assert_eq!(
+            s.op_log().iter().count(),
+            0,
+            "all 5 grouped ops retracted from visible log"
+        );
+
+        // Redo restores all 5 as a unit too.
+        assert!(s.redo().unwrap());
+        assert_eq!(s.op_log().iter().count(), 5);
+        assert_eq!(s.undo_count(), 1);
+    }
+
+    #[test]
+    fn undo_group_appends_outside_group_remain_individual() {
+        // Phase 5.4 V2 V1: appends BEFORE a group + appends INSIDE
+        // a group + appends AFTER must produce 3 distinct undo
+        // stack items.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+
+        s.start_undo_group().unwrap();
+        s.append_op(put_value(0, 0, 1, 2.0)).unwrap();
+        s.append_op(put_value(0, 0, 2, 3.0)).unwrap();
+        s.end_undo_group();
+
+        s.append_op(put_value(0, 0, 3, 4.0)).unwrap();
+
+        assert_eq!(
+            s.undo_count(),
+            3,
+            "before + grouped + after = 3 undo units (got {})",
+            s.undo_count()
+        );
+    }
+
+    #[test]
+    fn end_undo_group_without_start_is_noop() {
+        // Loro's group_end is infallible; calling it without a
+        // matching start should be safe (acts as a no-op).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.end_undo_group(); // No panic.
+        s.end_undo_group(); // Idempotent.
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        // Stray group_end didn't corrupt the stack.
+        assert_eq!(s.undo_count(), 1);
+    }
+
+    #[test]
+    fn set_undo_merge_interval_does_not_panic() {
+        // Smoke test: setting the merge interval doesn't panic
+        // and is callable in both directions (enable + disable).
+        // Actual merge-interval behavior is Loro's responsibility;
+        // we just expose the knob.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.set_undo_merge_interval(0); // Loro default — disabled.
+        s.set_undo_merge_interval(500); // 500ms typing window.
+        s.set_undo_merge_interval(0); // Back to disabled.
+                                      // Op-log unaffected by interval changes.
+        assert_eq!(s.op_count(), 0);
     }
 
     #[test]
@@ -1300,7 +1433,4 @@ mod tests {
         let result = CollabSession::from_snapshot(PeerId::new(u64::MAX), &bytes);
         assert!(
             matches!(result, Err(CollabSessionError::OpLog(_))),
-            "from_snapshot(u64::MAX) must fail; got {result:?}"
-        );
-    }
-}
+            "from_snapshot(u64::MAX) must fail; got {
