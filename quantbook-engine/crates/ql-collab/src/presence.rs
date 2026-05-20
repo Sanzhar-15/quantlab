@@ -16,7 +16,8 @@
 //! The pre-implementation design (Phase 5.1) said "presence does
 //! NOT persist across `.qbook` save/load." V1 implementation
 //! deviates: presence DOES persist because it lives in the same
-//! `LoroDoc` that gets exported into `oplog.bin`. Cold restart
+//! `LoroDoc` whose snapshot is wrapped into the post-Tier-D3
+//! `oplog.bin` file format (Phase 5.2 D-1 step 7). Cold restart
 //! restores stale presence entries.
 //!
 //! V1 treats this as ACCEPTABLE because (a) rejoining peers

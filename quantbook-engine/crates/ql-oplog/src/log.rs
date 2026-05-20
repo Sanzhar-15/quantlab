@@ -16,12 +16,18 @@
 //! ## Persistence
 //!
 //! `export_bytes` produces a `Vec<u8>` via `ExportMode::Snapshot`. The
-//! resulting blob includes the full state plus history; suitable for
-//! `oplog.bin` on-disk persistence (Phase 2A.3.c).
+//! resulting blob includes the full state plus history; **suitable for
+//! transport to other peers** (consumed by `merge_bytes` on the
+//! receiver). For `.qbook/oplog.bin` file persistence, the
+//! `ql_io::oplog_persistence` layer wraps this blob in a Quantlab
+//! header (Phase 5.2 D-1 step 7 — Tier D3: `OPLOG_MAGIC` + version u32).
+//! Do NOT write `export_bytes()` output directly to `oplog.bin`;
+//! use `save_workbook_with_oplog` instead.
 //!
-//! `import_bytes` reconstructs an `OpLog` from such a blob. The reader
-//! probes the `"ops"` LoroList; if absent (or the wrong shape), the
-//! import returns `OpLogError::SchemaMismatch`.
+//! `import_bytes` reconstructs an `OpLog` from such a blob (raw Loro
+//! snapshot — the persistence layer strips the Quantlab header before
+//! calling this fn). The reader probes the `"ops"` LoroList; if absent
+//! (or the wrong shape), the import returns `OpLogError::SchemaMismatch`.
 
 use loro::{CommitOptions, ExportMode, LoroDoc, LoroList, LoroValue, ValueOrContainer};
 

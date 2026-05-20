@@ -26,6 +26,7 @@ pub use ql_oplog::wire::{error_to_canonical_text, CellWireValue, NamedTargetWire
 
 pub use oplog_persistence::{
     load_workbook_with_oplog, save_workbook_with_oplog, PersistenceError, OPLOG_FILENAME,
+    OPLOG_HEADER_LEN, OPLOG_MAGIC, OPLOG_MIN_SUPPORTED_SCHEMA_VERSION, OPLOG_SCHEMA_VERSION,
 };
 pub use qbook_format::{
     load_workbook, save_workbook, save_workbook_extending, CellRecord, NamedEntry, NamesSection,

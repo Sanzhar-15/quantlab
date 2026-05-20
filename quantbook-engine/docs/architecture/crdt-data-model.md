@@ -434,7 +434,10 @@ parquet cell data. Op log persistence (`ql-oplog::persistence`)
 saves the LoroDoc snapshot as `oplog.bin`.
 
 Phase 5 preserves both. The CRDT additions are purely additive:
-- `.qbook/oplog.bin` remains the same Loro snapshot blob.
+- `.qbook/oplog.bin` carries the same Loro snapshot blob, now wrapped
+  in a Quantlab Tier D3 header (`OPLOG_MAGIC` + version u32) added by
+  step 7 (2026-05-20). The Loro snapshot body is unchanged — the header
+  enables format-identification + forward-rejection of unknown versions.
 - Loading a `.qbook` still produces a single-writer-equivalent
   workbook (no peer IDs, no presence).
 - Joining a session = load `.qbook` locally + receive Loro

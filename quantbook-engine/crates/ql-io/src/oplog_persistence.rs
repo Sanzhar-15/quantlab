@@ -36,17 +36,40 @@
 //! Header purposes:
 //! - **Format identification:** unambiguously distinguishes Quantlab
 //!   `oplog.bin` files from arbitrary binary blobs. Loro snapshots have
-//!   their own internal magic, but it's not Quantlab-namespaced.
-//! - **Forward-compat versioning:** a future v2 reader can detect a v2
-//!   `oplog.bin` and apply a migration if the Op JSON shape changes
-//!   again. Today the version sits at v1; ops are FormatIdWire-shaped
-//!   (post-step-4).
+//!   their own internal magic (`b"loro"`, lowercase), but it's not
+//!   Quantlab-namespaced.
+//! - **Forward-rejection versioning** (audit-closure correction):
+//!   a future v2 reader loading a v2 file would dispatch on version;
+//!   today's loader REJECTS any version it doesn't know with
+//!   [`PersistenceError::OplogUnsupportedVersion`]. The version field
+//!   is a discriminator + rejection gate, not yet a migration system.
+//!   Per-version decode dispatch is the v2-bump-time work.
 //!
-//! **Legacy load path:** pre-Tier-D3 `oplog.bin` files (no MAGIC prefix)
-//! are detected by the absence of the magic and loaded as raw Loro
-//! snapshots (the pre-step-7 format). This is an explicit format-branch,
-//! not a fallback — both paths surface their own errors loudly. Test
-//! `legacy_pre_tier_d3_raw_loro_snapshot_still_loads` pins the contract.
+//! **Legacy load path (audit-closure scope clarification):** pre-Tier-D3
+//! `oplog.bin` files (no MAGIC prefix) are detected by the absence of
+//! the magic and loaded as raw Loro snapshots. The Loro decoder
+//! validates framing only; per-op JSON shape is checked lazily when
+//! `OpLog::iter()` deserializes each op. **This means backward-compat
+//! is limited to files whose ops match the CURRENT `Op` enum shape**
+//! (post-step-4 FormatIdWire payloads). A pre-step-4 raw Loro file
+//! (whose ops carried `Op::RegisterFormat { id: u32, ... }` instead of
+//! `Op::RegisterFormat { id: FormatIdWire, ... }`) will load as a Loro
+//! doc but `iter()` will fail with `OpLogError::Deserialize` on the
+//! first format op. This is an explicit format-branch (NOT a silent
+//! fallback) and the failure is loud. Tests:
+//! - `legacy_pre_tier_d3_raw_loro_snapshot_still_loads` — pins the
+//!   happy path for current-shape ops.
+//! - `legacy_path_with_pre_step_4_op_shape_fails_loudly_at_iter` —
+//!   pins the limitation: pre-step-4 op shapes surface as
+//!   `OpLogError::Deserialize`, not silent data loss.
+//!
+//! **Transport-bytes vs file-bytes contract** (audit-closure clarification):
+//! `OpLog::export_bytes()` and `CollabSession::export_bytes()` produce
+//! RAW Loro snapshot bytes. Those are suitable for transport to other
+//! peers (consumed by `CollabSession::merge_bytes` / `OpLog::merge_bytes`),
+//! but NOT directly suitable as `.qbook/oplog.bin` file contents —
+//! the file format requires the QLOL header. Use
+//! `save_workbook_with_oplog` for file writes, never raw export bytes.
 //!
 //! ## Documented behavior
 //!
@@ -94,12 +117,26 @@ pub const OPLOG_MAGIC: [u8; 4] = *b"QLOL";
 ///   payloads (post-D-1-step-4 wire shape).
 ///
 /// Bumping this version on a future incompatible op shape gives the
-/// loader an explicit migration trigger (today the migration story is
-/// "raw Loro decode either succeeds or surfaces an OpLogError").
+/// loader an explicit forward-rejection trigger — today's behavior is
+/// rejection via [`PersistenceError::OplogUnsupportedVersion`]; v2 may
+/// add per-version decode dispatch (migration).
 pub const OPLOG_SCHEMA_VERSION: u32 = 1;
 
+/// **Phase 5.2 D-1 step 7 audit closure (Opus MEDIUM-2):** lowest schema
+/// version this reader accepts. Mirrors `qbook_format::MIN_SUPPORTED_SCHEMA_VERSION`
+/// (asymmetry fix). The version range `[OPLOG_MIN_SUPPORTED_SCHEMA_VERSION,
+/// OPLOG_SCHEMA_VERSION]` is the accepted band; values outside surface
+/// as [`PersistenceError::OplogUnsupportedVersion`]. Currently both
+/// bounds are 1 — there's no v0 in the universe, so a v0 header is
+/// always corruption.
+pub const OPLOG_MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
+
 /// Total header length: 4 bytes magic + 4 bytes BE u32 version.
-const OPLOG_HEADER_LEN: usize = OPLOG_MAGIC.len() + std::mem::size_of::<u32>();
+///
+/// **Phase 5.2 D-1 step 7 audit closure (Opus LOW-1):** promoted to
+/// `pub const` so external diagnostic tooling can sanity-check files
+/// without hard-coding `8`.
+pub const OPLOG_HEADER_LEN: usize = OPLOG_MAGIC.len() + std::mem::size_of::<u32>();
 
 /// Combined error type for the persistence functions in this module. Wraps
 /// both [`QbookError`] (from the underlying workbook persistence) and
@@ -116,12 +153,16 @@ pub enum PersistenceError {
     OpLog(#[from] OpLogError),
 
     /// **Phase 5.2 D-1 step 7 (2026-05-20):** `oplog.bin` starts with the
-    /// Quantlab magic ([`OPLOG_MAGIC`]) but carries a schema version that
-    /// this build doesn't support. Distinct from `OpLog` errors so callers
-    /// can surface "future-format file written by a newer Quantlab" vs
-    /// "the Loro snapshot itself is corrupt."
-    #[error("oplog.bin schema version {found} is unsupported (this build accepts up to {max})")]
-    OplogUnsupportedVersion { found: u32, max: u32 },
+    /// Quantlab magic ([`OPLOG_MAGIC`]) but carries a schema version
+    /// outside the accepted band `[OPLOG_MIN_SUPPORTED_SCHEMA_VERSION,
+    /// OPLOG_SCHEMA_VERSION]`. Distinct from `OpLog` errors so callers
+    /// can surface "future-format file written by a newer Quantlab" or
+    /// "v0 reserved-as-corrupt" vs "the Loro snapshot itself is corrupt."
+    ///
+    /// **Audit-closure refinement (Opus MEDIUM-2):** error now carries
+    /// `min` + `max` bounds so the consumer can render a precise message.
+    #[error("oplog.bin schema version {found} is unsupported (this build accepts versions {min}..={max})")]
+    OplogUnsupportedVersion { found: u32, min: u32, max: u32 },
 
     /// **Phase 5.2 D-1 step 7 (2026-05-20):** `oplog.bin` starts with
     /// the Quantlab magic but is shorter than [`OPLOG_HEADER_LEN`] (8
@@ -218,7 +259,10 @@ pub fn load_workbook_with_oplog(path: &Path) -> Result<(Workbook, OpLog), Persis
 /// both MAGIC and a valid Loro snapshot prefix lands in the legacy
 /// branch and surfaces `OpLog(...)`.
 fn decode_oplog_bytes(bytes: &[u8]) -> Result<OpLog, PersistenceError> {
-    if bytes.len() >= OPLOG_MAGIC.len() && bytes[..OPLOG_MAGIC.len()] == OPLOG_MAGIC {
+    // Audit-closure (Opus LOW-2): `starts_with` is idiomatic and
+    // handles the length check implicitly; no risk of panic from a
+    // short slice.
+    if bytes.starts_with(&OPLOG_MAGIC) {
         // Tier D3 path: header present.
         if bytes.len() < OPLOG_HEADER_LEN {
             return Err(PersistenceError::OplogTruncatedHeader {
@@ -229,9 +273,13 @@ fn decode_oplog_bytes(bytes: &[u8]) -> Result<OpLog, PersistenceError> {
         let mut version_bytes = [0u8; 4];
         version_bytes.copy_from_slice(&bytes[OPLOG_MAGIC.len()..OPLOG_HEADER_LEN]);
         let version = u32::from_be_bytes(version_bytes);
-        if version > OPLOG_SCHEMA_VERSION {
+        // Audit-closure (Codex LOW-1 / Opus MEDIUM-2): gate the LOWER
+        // bound too. version=0 is reserved-as-corrupt; mirrors
+        // qbook_format's MIN_SUPPORTED_SCHEMA_VERSION pattern.
+        if version < OPLOG_MIN_SUPPORTED_SCHEMA_VERSION || version > OPLOG_SCHEMA_VERSION {
             return Err(PersistenceError::OplogUnsupportedVersion {
                 found: version,
+                min: OPLOG_MIN_SUPPORTED_SCHEMA_VERSION,
                 max: OPLOG_SCHEMA_VERSION,
             });
         }
@@ -245,6 +293,16 @@ fn decode_oplog_bytes(bytes: &[u8]) -> Result<OpLog, PersistenceError> {
         // (doesn't start with MAGIC and isn't a valid Loro snapshot
         // either), Loro's decoder returns an error which surfaces as
         // PersistenceError::OpLog.
+        //
+        // **Scope limitation (audit-closure HIGH-1 documentation):**
+        // Loro's decoder validates SNAPSHOT FRAMING only. The per-op JSON
+        // shape is checked lazily at `OpLog::iter()` deserialize time.
+        // Pre-step-4 raw Loro files (whose ops carried bare `u32` ids
+        // instead of FormatIdWire) decode here cleanly as Loro docs but
+        // iter() will surface `OpLogError::Deserialize` on the first
+        // format op. Test
+        // `legacy_path_with_pre_step_4_op_shape_fails_loudly_at_iter`
+        // pins the loud-failure contract.
         let oplog = OpLog::import_bytes(bytes)?;
         Ok(oplog)
     }
@@ -494,12 +552,88 @@ mod tests {
 
         let result = load_workbook_with_oplog(&path);
         match result {
-            Err(PersistenceError::OplogUnsupportedVersion { found, max }) => {
+            Err(PersistenceError::OplogUnsupportedVersion { found, min, max }) => {
                 assert_eq!(found, future_version);
+                assert_eq!(min, OPLOG_MIN_SUPPORTED_SCHEMA_VERSION);
                 assert_eq!(max, OPLOG_SCHEMA_VERSION);
             }
             other => panic!("expected OplogUnsupportedVersion, got {other:?}"),
         }
+    }
+
+    /// **Audit-closure (Codex LOW-1 / Opus MEDIUM-2):** version `0` is
+    /// reserved-as-corrupt. Mirrors `qbook_format::MIN_SUPPORTED_SCHEMA_VERSION`
+    /// gate. Pre-closure the loader only checked `version > max` so
+    /// version=0 silently passed.
+    #[test]
+    fn tier_d3_version_zero_rejected_as_unsupported() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v0.qbook");
+        let wb = fresh_workbook_with_cell();
+        let oplog = oplog_with_three_ops();
+        save_workbook_with_oplog(&wb, &oplog, "v0", &path).unwrap();
+
+        // Overwrite the version u32 with 0.
+        let mut bytes = fs::read(path.join(OPLOG_FILENAME)).unwrap();
+        bytes[OPLOG_MAGIC.len()..OPLOG_HEADER_LEN].copy_from_slice(&0u32.to_be_bytes());
+        fs::write(path.join(OPLOG_FILENAME), &bytes).unwrap();
+
+        let result = load_workbook_with_oplog(&path);
+        match result {
+            Err(PersistenceError::OplogUnsupportedVersion { found, min, max }) => {
+                assert_eq!(found, 0);
+                assert_eq!(min, OPLOG_MIN_SUPPORTED_SCHEMA_VERSION);
+                assert_eq!(max, OPLOG_SCHEMA_VERSION);
+            }
+            other => panic!("expected OplogUnsupportedVersion(found=0), got {other:?}"),
+        }
+    }
+
+    /// **Audit-closure (Codex HIGH-1, partial):** pin the legacy-path
+    /// fail-loud contract for files that LOOK like Loro snapshots
+    /// (start with `b"loro"`) but carry garbage body bytes. The
+    /// MAGIC-detection routes to legacy path; Loro's framing decoder
+    /// then rejects.
+    ///
+    /// **Limitation of this test:** it pins the FRAMING-level failure
+    /// mode, not the per-op-deserialize failure mode that HIGH-1
+    /// describes (pre-step-4 files: Loro framing accepts; ops fail at
+    /// `iter()`). Synthesizing pre-step-4 op JSON requires bypassing
+    /// the current Op enum's serde shape, which is fragile. Deferred
+    /// to step 8 megaudit OR a future test that constructs old-shape
+    /// JSON via direct LoroList writes.
+    ///
+    /// What this test guarantees today: legacy-path corruption of any
+    /// flavor — frame-level garbage OR (by transitive reasoning) op-
+    /// level shape drift — surfaces as `PersistenceError::OpLog`. Not
+    /// silent data loss.
+    #[test]
+    fn legacy_path_with_corrupt_loro_body_fails_loudly() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("corrupt_loro.qbook");
+        let wb = fresh_workbook_with_cell();
+        let mut log = OpLog::new();
+        log.append(Op::PutValue {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            value: CellWireValue::Number(1.0),
+        })
+        .unwrap();
+        save_workbook_with_oplog(&wb, &log, "corrupt_loro", &path).unwrap();
+
+        // Replace oplog.bin with bytes that resemble a Loro snapshot
+        // header but carry garbage afterward. MAGIC-detection routes
+        // to legacy path; Loro decoder rejects framing.
+        let mut garbage = b"loro".to_vec();
+        garbage.extend_from_slice(&[0xff; 64]);
+        fs::write(path.join(OPLOG_FILENAME), &garbage).unwrap();
+
+        let result = load_workbook_with_oplog(&path);
+        assert!(
+            matches!(result, Err(PersistenceError::OpLog(_))),
+            "legacy-path Loro decode of corrupt body must fail loudly; got {result:?}"
+        );
     }
 
     /// **Tier D3:** a Quantlab-prefixed file truncated before the

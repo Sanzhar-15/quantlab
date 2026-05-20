@@ -245,8 +245,20 @@ impl CollabSession {
         Ok(self.log.merge_bytes(bytes)?)
     }
 
-    /// Produce a Loro snapshot blob suitable for transport to other
-    /// peers OR for `.qbook/oplog.bin` persistence.
+    /// Produce a Loro snapshot blob suitable for **transport to other
+    /// peers** (consumed by [`Self::merge_bytes`] on the receiving end
+    /// OR by `OpLog::merge_bytes` directly).
+    ///
+    /// **Phase 5.2 D-1 step 7 audit closure (2026-05-20):** these are
+    /// RAW Loro snapshot bytes — NOT directly suitable as
+    /// `.qbook/oplog.bin` file contents. The post-Tier-D3 file format
+    /// requires a Quantlab header (`OPLOG_MAGIC` + version u32) that
+    /// this function does NOT add. Use
+    /// `ql_io::oplog_persistence::save_workbook_with_oplog` for file
+    /// writes; that wrapper prepends the header. Writing raw export
+    /// bytes directly to `oplog.bin` would still load (via the
+    /// legacy backward-compat path) but bypasses the version header
+    /// and defeats forward-compat versioning.
     pub fn export_bytes(&self) -> Result<Vec<u8>, CollabSessionError> {
         Ok(self.log.export_bytes()?)
     }
@@ -593,7 +605,8 @@ impl CollabSession {
     /// Use after [`from_snapshot`] when the caller wants a clean
     /// slate — without this call, presence entries persist across
     /// `.qbook` save/load (V1 known limitation: presence lives in
-    /// the same `LoroDoc` that gets exported into `oplog.bin`).
+    /// the same `LoroDoc` whose snapshot is wrapped into the
+    /// post-Tier-D3 `oplog.bin` file format).
     ///
     /// Typical pattern for "rejoin with clean presence":
     /// ```ignore
