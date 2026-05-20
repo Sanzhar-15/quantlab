@@ -103,8 +103,9 @@ pub use ql_oplog::PeerId;
 pub use presence::{PresenceError, PresenceState};
 pub use repair::{
     repair_column_rename_chain, repair_sheet_rename_chain, repair_table_rename_chain,
-    AmbiguousSkip, ColumnAmbiguousSkip, ColumnRepairReport, ColumnRewriteSummary, RepairReport,
-    SheetRewriteSummary, TableAmbiguousSkip, TableRepairReport, TableRewriteSummary,
+    ColumnAmbiguousSkip, ColumnRepairReport, ColumnRewriteSummary, SheetAmbiguousSkip,
+    SheetRepairReport, SheetRewriteSummary, TableAmbiguousSkip, TableRepairReport,
+    TableRewriteSummary,
 };
 pub use session::{CollabSession, CollabSessionError, SyncReport, UndoGroupGuard};
 pub use transport::{LoopbackTransport, NoopTransport, Transport, TransportError};

@@ -78,7 +78,7 @@ pub fn rebuild_workbook(&self, registry: &FunctionRegistry)
 |---|---|---|---|
 | 1 — Conflict matrix probes | `5595d8dcfb0` + `a6babc65b51` (fmt) | `03408fa17bd` | 9-test conflict matrix probe; discovered peer-id stability invariant for CRDT determinism |
 | 2 — Concurrent RenameSheet replay fix | `1ed2bbba78a` | `f426683fee0` | Replay case 2+3 unification; D-2 auto-disambig for cross-sheet target collision; deprecated `SheetRenameNameMismatch` |
-| 3 (CORE) — Rename-repair pass (sheets) | `e76a9ce5499` + lockfile `4222d11fe7b` | `6bb76e3ade3` | NEW `ql_collab::repair_sheet_rename_chain` + `RepairReport` + `SheetRewriteSummary` + `AmbiguousSkip` + safety guard |
+| 3 (CORE) — Rename-repair pass (sheets) | `e76a9ce5499` + lockfile `4222d11fe7b` | `6bb76e3ade3` | NEW `ql_collab::repair_sheet_rename_chain` + `SheetRepairReport` + `SheetRewriteSummary` + `SheetAmbiguousSkip` + safety guard (types renamed from `RepairReport` / `AmbiguousSkip` in post-5.3 Tier H8 closure) |
 | 4 — Extend to tables/columns | `7126eb44396` | `6752ca2545c` | `apply_rename_table` + `apply_rename_column` advisory-skip; NEW `repair_table_rename_chain` + `TableRepairReport`; auto-disambig revert closure |
 | 5 (megaudit) | 3-way Codex + Opus-A + Opus-B | step 5a-5d (4 sub-cycles) | 9 HIGHs surfaced; 4 sub-cycles of closure work |
 | 5a — Trivial closures + DropTable advisory-skip | `524615b7418` | (closure cycle) | Batched 7 findings: DropTable + atomicity docstring + 8 doc / test prose cleanups |

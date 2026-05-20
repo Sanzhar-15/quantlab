@@ -93,7 +93,7 @@
 //!
 //! Closure: **skip rules where `old_canonical` is currently held by
 //! ANY sheet in the workbook**. The `ambiguous_skipped` field of
-//! `RepairReport` surfaces these for diagnostics (no silent loss —
+//! `SheetRepairReport` surfaces these for diagnostics (no silent loss —
 //! per the no-fallback rule).
 //!
 //! ## Known limitations (V1, post-step-5 megaudit closure)
@@ -161,7 +161,7 @@ use std::sync::Arc;
 /// logging / diagnostics. Per the no-fallback rule (CLAUDE.md), this
 /// surfaces *what was done* rather than silently absorbing the work.
 #[derive(Debug, Clone, Default)]
-pub struct RepairReport {
+pub struct SheetRepairReport {
     /// Total number of formulas whose text was rewritten by the pass.
     pub formulas_rewritten: usize,
 
@@ -176,10 +176,10 @@ pub struct RepairReport {
     /// sheet — applying the rewrite would corrupt formulas that
     /// legitimately reference the current holder. Surfaced for
     /// diagnostics per the no-fallback rule.
-    pub ambiguous_rules_skipped: Vec<AmbiguousSkip>,
+    pub ambiguous_rules_skipped: Vec<SheetAmbiguousSkip>,
 }
 
-/// Per-sheet summary line in [`RepairReport`].
+/// Per-sheet summary line in [`SheetRepairReport`].
 #[derive(Debug, Clone)]
 pub struct SheetRewriteSummary {
     pub sheet: SheetId,
@@ -193,7 +193,7 @@ pub struct SheetRewriteSummary {
 /// to apply because doing so would have corrupted a valid current
 /// reference. See the safety guard in the module docs.
 #[derive(Debug, Clone)]
-pub struct AmbiguousSkip {
+pub struct SheetAmbiguousSkip {
     /// Sheet id whose chain produced this rule.
     pub origin_sheet: SheetId,
     /// Historic canonical name (the rule's "old" side).
@@ -209,7 +209,7 @@ pub struct AmbiguousSkip {
 /// every formula in `workbook` whose text references a historic
 /// (pre-rename) sheet name. See module docs for the algorithm.
 ///
-/// Returns a [`RepairReport`] describing what was changed. The report
+/// Returns a [`SheetRepairReport`] describing what was changed. The report
 /// is informational; the workbook is mutated in place.
 ///
 /// **Errors**: only propagates `OpLogError` from iterating the op log
@@ -227,7 +227,7 @@ pub struct AmbiguousSkip {
 pub fn repair_sheet_rename_chain(
     workbook: &mut Workbook,
     log: &OpLog,
-) -> Result<RepairReport, OpLogError> {
+) -> Result<SheetRepairReport, OpLogError> {
     // ===== Phase 1: walk op log; collect historic old_names per sheet.
     //
     // **Phase 5.3 step 5 megaudit (Opus-A Probe X HIGH-latent, 2026-05-20):**
@@ -269,7 +269,7 @@ pub fn repair_sheet_rename_chain(
     // corrupt the current holder's formula refs — Codex+Opus HIGH closure).
     let mut rules: Vec<(String, Arc<str>, SheetId)> = Vec::new();
     let mut sheet_rewrites: Vec<SheetRewriteSummary> = Vec::new();
-    let mut ambiguous_rules_skipped: Vec<AmbiguousSkip> = Vec::new();
+    let mut ambiguous_rules_skipped: Vec<SheetAmbiguousSkip> = Vec::new();
     let mut sheet_ids: Vec<SheetId> = historic_by_sheet.keys().copied().collect();
     sheet_ids.sort_unstable();
     for sheet_id in sheet_ids {
@@ -311,7 +311,7 @@ pub fn repair_sheet_rename_chain(
             // would cascade-rewrite formulas that legitimately
             // reference sheet 0. The guard catches both.
             if let Some(holder) = canonical_to_current_sheet.get(hc) {
-                ambiguous_rules_skipped.push(AmbiguousSkip {
+                ambiguous_rules_skipped.push(SheetAmbiguousSkip {
                     origin_sheet: sheet_id,
                     historic_canonical: hc.clone(),
                     current_holder_sheet: *holder,
@@ -332,7 +332,7 @@ pub fn repair_sheet_rename_chain(
     // (Audit closure: Opus MEDIUM-2 — empty `rules` should NOT incur
     // the per-formula iteration cost.)
     if rules.is_empty() {
-        return Ok(RepairReport {
+        return Ok(SheetRepairReport {
             formulas_rewritten: 0,
             sheet_rewrites,
             ambiguous_rules_skipped,
@@ -364,7 +364,7 @@ pub fn repair_sheet_rename_chain(
         workbook.put_formula(sheet, row, col, new_text);
     }
 
-    Ok(RepairReport {
+    Ok(SheetRepairReport {
         formulas_rewritten: rewrite_count,
         sheet_rewrites,
         ambiguous_rules_skipped,

@@ -440,11 +440,10 @@ This is the largest single deferred work item — multi-week scope.
 - **Workaround (in V1):** `CollabSession::rebuild_workbook` constructs the workbook internally and drops it on Err — caller never sees the partial state.
 - **Disposition:** V2 — workbook snapshot/restore around `replay_into` OR two-phase replay (dry-run validate + apply).
 
-### H8. API naming asymmetry — `RepairReport` vs `TableRepairReport` vs `ColumnRepairReport`
+### H8. API naming asymmetry — `RepairReport` vs `TableRepairReport` vs `ColumnRepairReport` — ✅ CLOSED 2026-05-20
 
 - **Source:** step 5b LOW-3 + step 5c LOW deferred.
-- **Behavior:** sheet repair returns `RepairReport`; table returns `TableRepairReport`; column returns `ColumnRepairReport`. Same asymmetry for `AmbiguousSkip` vs prefixed table/column variants.
-- **Disposition:** **PRE-IDE-BINDING RENAME OPPORTUNITY (Phase 5.7 prep).** Rename `RepairReport` → `SheetRepairReport` + `AmbiguousSkip` → `SheetAmbiguousSkip`. Single-commit mechanical refactor. Last chance before IDE consumes the API in 5.7.
+- **Closure:** post-5.3 single-commit mechanical refactor. Renamed `RepairReport` → `SheetRepairReport` + `AmbiguousSkip` → `SheetAmbiguousSkip` across `ql_collab` source + 2 test files + 2 docs. Workspace tests stayed at 4361 / 0; fmt + clippy clean. Closed BEFORE Phase 5.7 IDE binding consumes the API. **No remaining work.**
 
 ### H9. Production wiring delivery to IDE (Phase 5.7 work)
 

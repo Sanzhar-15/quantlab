@@ -56,7 +56,7 @@ use ql_storage::Workbook;
 use crate::presence::{self, PresenceError, PresenceState};
 use crate::repair::{
     repair_column_rename_chain, repair_sheet_rename_chain, repair_table_rename_chain,
-    ColumnRepairReport, RepairReport, TableRepairReport,
+    ColumnRepairReport, SheetRepairReport, TableRepairReport,
 };
 use crate::transport::{Transport, TransportError};
 
@@ -149,7 +149,7 @@ pub struct SyncReport {
     pub ops_replayed: usize,
     /// Sheet rename-repair pass diagnostics (formulas rewritten,
     /// ambiguous-skipped rules).
-    pub sheet_repair: RepairReport,
+    pub sheet_repair: SheetRepairReport,
     /// Table rename-repair pass diagnostics.
     pub table_repair: TableRepairReport,
     /// Column rename-repair pass diagnostics (Phase 5.3 step 5c —

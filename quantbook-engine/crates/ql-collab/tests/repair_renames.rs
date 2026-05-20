@@ -22,7 +22,7 @@
 //! load-bearing property. Recompute correctness is a downstream concern
 //! pinned at the row-7 test in `crates/ql-exec/tests/phase_5_3_conflict_matrix_probe.rs`.
 
-use ql_collab::{repair_sheet_rename_chain, RepairReport};
+use ql_collab::{repair_sheet_rename_chain, SheetRepairReport};
 use ql_oplog::{replay_into, Op, OpLog};
 use ql_storage::Workbook;
 
@@ -540,7 +540,7 @@ fn repair_converges_across_merge_directions() {
     );
 }
 
-// ===== Test 10: RepairReport structure =====
+// ===== Test 10: SheetRepairReport structure =====
 
 /// **Step 3:** verify the report's structure carries useful diagnostic
 /// information for callers (no-fallback rule — surface what was done).
@@ -564,7 +564,7 @@ fn repair_report_carries_diagnostic_information() {
     );
 
     let mut wb = replay_to_workbook(&log);
-    let report: RepairReport = repair_sheet_rename_chain(&mut wb, &log).unwrap();
+    let report: SheetRepairReport = repair_sheet_rename_chain(&mut wb, &log).unwrap();
 
     assert_eq!(report.formulas_rewritten, 1);
     assert_eq!(report.sheet_rewrites.len(), 1);
