@@ -708,7 +708,7 @@ post the 2026-05-19 audit. Status summary:
    a known V1 limitation.
 
 5. **Format id collision** — **DESIGN RESOLVED in 5.1; D-1 STEPS
-   1–4 IMPLEMENTED (2026-05-19 / 2026-05-20); STEPS 5–8 PENDING.**
+   1–5 IMPLEMENTED (2026-05-19 / 2026-05-20); STEPS 6–8 PENDING.**
    `FormatId` now a tagged tuple `Builtin(u32) | Custom(PeerId, u32)`
    in `ql_storage::format` (step 3 `af803f1a3f2`). `FormatIdWire`
    the wire-side counterpart in `ql_oplog::wire` (step 2
@@ -718,12 +718,18 @@ post the 2026-05-19 audit. Status summary:
    ((peer, string)-keyed) so cross-peer same-string registrations
    succeed (step 4 + step-3-audit-closure). `lookup_string` helper
    ensures producer dedup is peer-scoped (step-4-audit-closure
-   `e97e646270a`). **Pending:** step 5 qbook envelope schema bump
-   + legacy loader, step 6 xlsx FormatId↔numFmtId mapping, step 7
-   Tier D3 oplog.bin magic bytes + version header, step 8 megaudit.
-   See `docs/phase5/d-1-starting-checklist.md` for the execution
-   plan + per-step audit transcripts at
-   `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..4}-*.md`.
+   `e97e646270a`). `.qbook` envelope schema bumped v7→v8 with
+   `FormatEntryId` untagged enum routing v8 Wire and v<8 LegacyU32
+   shapes through `to_storage()` (step 5 `2ae5bfcab28`); save path
+   emits Wire directly, dropping pre-step-5 `to_legacy_u32().expect()`
+   panics. Step-5 audit closure (`30ef2637d6f`) added `FormatTableError::
+   CounterOverflow` + `BuiltinOutOfRange` variants with `register_at`
+   pre-validation, plus a post-deserialize guard rejecting v8-shaped
+   ids in v<8 envelopes. **Pending:** step 6 xlsx FormatId↔numFmtId
+   mapping, step 7 Tier D3 oplog.bin magic bytes + version header,
+   step 8 megaudit. See `docs/phase5/d-1-starting-checklist.md` for
+   the execution plan + per-step audit transcripts at
+   `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..5}-*.md`.
 
 ## Cross-references
 

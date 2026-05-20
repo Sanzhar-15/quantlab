@@ -142,9 +142,9 @@ This is the suggested order to keep the codebase in a compile-clean intermediate
 
 **Step 4 audit (`e97e646270a`) — 2nd consecutive DIVERGENT-HIGH cycle**. Codex H1: `WorkbookRuntime::intern_format` global `iter().find()` bypasses peer scoping; closed via new `FormatTable::lookup_string(s)` helper. Codex M1: counter overflow at 3 sites; closed with `checked_add(1).expect(...)`. Codex M2: `from_snapshot` missing peer-id guard; closed. 6 new tests; +6 net workspace tests (4251 → 4257). Full transcripts at `docs/audits/2026-05-20-phase-5-2-d-1-step-4-{codex,opus,consolidated}.md`.
 
-### Step 5: Backwards-compat in `qbook_format` (2-3 hours) — ⏳ NEXT
+### Step 5: Backwards-compat in `qbook_format` — ✅ SHIPPED 2026-05-20 (`2ae5bfcab28` + audit `30ef2637d6f`)
 
-Starts on the foundation step 4 + step 4 audit laid. Step 5 substrate is clean:
+Foundation step 4 + step 4 audit substrate is clean:
 
 - ✅ Producer/replay symmetry verified (step 4 audit Codex H1 closure).
 - ✅ FormatIdWire round-trip-tested both directions (Codex L1 + Opus L1 closures).
@@ -152,16 +152,24 @@ Starts on the foundation step 4 + step 4 audit laid. Step 5 substrate is clean:
 - ✅ PeerId(0) guard at both CollabSession constructors (Codex M2 closure).
 - ✅ by_string peer-scope structurally correct + test-pinned.
 
-Step 5 work:
-- Bump `qbook_format::WORKBOOK_SCHEMA_VERSION` (currently 7) → 8.
-- Add legacy loader: detect schema version < 8, read old u32-shaped `FormatEntry.id` + `FormatOverlayEntry.id`, migrate via `FormatId::legacy_from_u32`.
-- Drop the `to_legacy_u32().expect()` sites in qbook_format save path (envelope now carries FormatIdWire directly).
-- Fixture tests: load a saved-at-schema-7 .qbook fixture, verify migration produces correct `Custom(LEGACY_PEER, _)` ids.
-- Update `MIN_SUPPORTED_SCHEMA_VERSION` reasoning + `UnsupportedSchema` error path if needed.
-- Per Opus step-4 M3: include "step-4 changed Op JSON shape; this commit's schema bump gates the legacy loader" in the commit message.
-- Commit: `Phase 5.2 D-1 step 5 — qbook envelope schema bump + legacy loader`.
+Step 5 shipped:
+- ✅ Bumped `WORKBOOK_SCHEMA_VERSION` 7 → 8.
+- ✅ New `FormatEntryId` untagged enum: `Wire(FormatIdWire)` for v8 envelopes, `LegacyU32(u32)` for v1-v7. `to_storage()` dispatches per variant; `from_storage(fid)` always emits `Wire`. Migration is transparent at the deserialization boundary.
+- ✅ `FormatEntry.id` + `FormatOverlayEntry.id` types `u32 → FormatEntryId`.
+- ✅ Save path emits `FormatEntryId::from_storage(fid)` directly. Dropped `to_legacy_u32().expect()` panics at 2 sites — v8 envelopes express non-LEGACY peer Custom ids losslessly.
+- ✅ `QbookError::MalformedFormat.id` `u32 → ql_storage::FormatId` (mirrors step-4 ReplayError change).
+- ✅ 5 new tests at ship: v7-legacy-migration, v8-multi-peer-round-trip, on-disk-shape inspection, untagged dispatch unambiguity, from_storage Wire-emission.
 
-### Step 6: xlsx export / import (1-2 hours)
+**Step 5 audit (`30ef2637d6f`) — 3rd consecutive DIVERGENT-HIGH cycle**. Codex caught 2 HIGH (counter-overflow panic on load with `Custom(LEGACY_PEER, u32::MAX)`; `Builtin(>163)` load+resave drops entry) + 1 MEDIUM (v<8 envelopes accepting v8 wire-shaped ids). Opus PASSED structurally, caught 1 MEDIUM (docstring claims inline TOML shape but `to_string_pretty` emits section-header form) + 2 LOW. All 6 findings closed:
+- ✅ HIGH-1: `FormatTableError::CounterOverflow { peer }` + `register_at` pre-validates before mutation. Load surfaces `MalformedFormat(CounterOverflow)`.
+- ✅ HIGH-2: `FormatTableError::BuiltinOutOfRange { id }` + `register_at` pre-validates. Load surfaces `MalformedFormat(BuiltinOutOfRange)`.
+- ✅ MEDIUM-1: post-deserialize loader guard rejects `FormatEntryId::Wire(_)` in v<8 envelopes.
+- ✅ Opus MEDIUM: docstring updated to describe section-header form honestly.
+- ✅ Opus LOWs: strengthened on-disk-shape test assertion + added two-peer round-trip + sort-determinism test.
+
+8 new tests at audit closure (+3 ql-storage, +5 ql-io qbook_format). Workspace tests: 4257 → 4262 (step 5 ship) → 4270 (audit closure). Full transcripts at `docs/audits/2026-05-20-phase-5-2-d-1-step-5-{codex,opus,consolidated}.md`.
+
+### Step 6: xlsx export / import (1-2 hours) — ⏳ NEXT
 
 - Flatten `FormatId` → xlsx `numFmtId` on export.
 - Inflate xlsx `numFmtId` → `FormatId::Builtin(n)` on import.
@@ -176,21 +184,21 @@ Step 5 work:
 
 ### Step 8: Full-arc megaudit (mandatory per discipline rule)
 
-**Per-step audits (steps 1-4) already shipped** — 4 cycles, 2 DIVERGENT-HIGH cycles caught forward-activating bugs that the alternative (defer all audits to step 8) would have shipped. Transcripts at `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..4}-{codex,opus,consolidated}.md`.
+**Per-step audits (steps 1-5) already shipped** — 5 cycles, 3 consecutive DIVERGENT-HIGH cycles (steps 3, 4, 5) caught forward-activating bugs that the alternative (defer all audits to step 8) would have shipped. Transcripts at `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..5}-{codex,opus,consolidated}.md`.
 
-Step 8 scope (after steps 5-7 ship):
-- Per-step audits for steps 5, 6, 7 same as 1-4 pattern.
+Step 8 scope (after steps 6-7 ship):
+- Per-step audits for steps 6, 7 same as 1-5 pattern.
 - Then a **full-arc megaudit**: cross-step invariants (schema round-trip end-to-end, old `.qbook` → new envelope → old format export — does the value survive?), workspace-wide grep for any remaining `to_legacy_u32().expect()` or pre-D-1 patterns, fixture coverage gap analysis.
 - Verify clean-checkout `cargo check` (don't trust pre-commit hook gates alone — the index-padding race struck 3 times in the V1 session; 0 times in D-1 so far).
 
-**Estimated total: ~12 hours spent on steps 1-4 + 4 audits (2026-05-19/20); ~3-7h remaining for steps 5-8.** Step 5 (qbook backwards-compat) is the riskiest of the remaining work; allocate time for old `.qbook` fixture tests.
+**Estimated total: ~14 hours spent on steps 1-5 + 5 audits (2026-05-19/20); ~2-5h remaining for steps 6-8.** All schema-breaking work is complete (steps 1-5); steps 6-7 are surface-level format-id mapping work.
 
 ## Pre-flight checklist
 
-Before resuming D-1 at step 5, verify:
+Before resuming D-1 at step 6, verify:
 
-- [ ] HEAD is at the most recent commit on `feat/quantbook-engine` (`e97e646270a` as of 2026-05-20 session-end — step 4 audit closures; preceded by `6a4b8b0922f` step 4 ship).
-- [ ] `cargo test --workspace` reports **4257** passed.
+- [ ] HEAD is at the most recent commit on `feat/quantbook-engine` (`30ef2637d6f` as of 2026-05-20 session-end — step 5 audit closures; preceded by `2ae5bfcab28` step 5 ship + `d5c6b2ae11c` step 4 doc refresh).
+- [ ] `cargo test --workspace` reports **4270** passed.
 - [ ] `cargo fmt --all -- --check` clean.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - [ ] No uncommitted source files (`git status --short | grep -v '^??'` empty).
