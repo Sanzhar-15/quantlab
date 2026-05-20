@@ -560,7 +560,7 @@ The full v1 means all of these crates either ship real behavior or have a docume
 **Sub-items**
 
 1. **5.1 Collaboration Data Model Decision** ✅ SHIPPED 2026-05-19 (`918d7efdd91` + `df52cb44ad2`).
-   Loro container shape locked = Option A op-log preservation; 4 audit decisions D-1..D-4 recorded in `docs/architecture/crdt-data-model.md`. D-2/D-3/D-4 implemented; D-1 pending (multi-day).
+   Loro container shape locked = Option A op-log preservation; 4 audit decisions D-1..D-4 recorded in `docs/architecture/crdt-data-model.md`. D-2/D-3/D-4 implemented; D-1 steps 1-4 of 8 shipped (see 5.2).
 
 2. **5.2 `ql-collab` Core Documents** 🟡 IN PROGRESS.
    - ✅ D-2 (`1ca19e2fa37`) AddSheet auto-rename.
@@ -568,7 +568,7 @@ The full v1 means all of these crates either ship real behavior or have a docume
    - ✅ D-4 (`2f217a2067a`) OpLog::merge_bytes + 2-peer spill probe.
    - ✅ 5.2.a scaffold (`66a571b30af`).
    - ✅ 5.2.b PeerId → LoroDoc wiring (`ef056f50bee`).
-   - ⏳ D-1 (FormatId tagged tuple, multi-day) — see `docs/phase5/d-1-starting-checklist.md`.
+   - 🟡 **D-1 (FormatId tagged tuple, multi-day) — steps 1-4 of 8 shipped + audited 2026-05-19/20.** PeerId in `ql_types::peer` (`1e383dc9eeb`); FormatIdWire in `ql_oplog::wire` (`135bbb99f75`); FormatId enum in `ql_storage::format` + 241-callsite cascade (`af803f1a3f2`); Op::* carries FormatIdWire + by_string peer-scope restructure (`6a4b8b0922f`). Per-step Codex+Opus audits at each ship (4 cycles, 2 DIVERGENT-HIGH cycles caught forward-activating bugs). Remaining: step 5 (qbook envelope schema bump + legacy loader), step 6 (xlsx FormatId↔numFmtId), step 7 (Tier D3 oplog.bin magic bytes + version header), step 8 (full-arc megaudit). See `docs/phase5/d-1-starting-checklist.md` + audit transcripts.
 
 3. **5.3 Conflict Resolution Semantics** — future. Causality-aware rename-repair pass. 4-7 days. (V1 ships `BindError::UnknownSheet → #NAME?` as the simple case per Phase 5.2 D-3.)
 

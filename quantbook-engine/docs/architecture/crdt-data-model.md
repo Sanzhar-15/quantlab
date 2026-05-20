@@ -707,12 +707,23 @@ post the 2026-05-19 audit. Status summary:
    adds the causality-aware rename-repair pass. Documented as
    a known V1 limitation.
 
-5. **Format id collision** — **DESIGN RESOLVED in 5.1 by D-1;
-   IMPLEMENTATION PENDING** (above). `FormatId` switches from
-   `u32` to a tagged tuple (Builtin | Custom(peer_id, counter))
-   in Phase 5.2 D-1 (next-session multi-day arc; see
-   `docs/phase5/d-1-starting-checklist.md`). Schema bump
-   documented; backwards-compat migration path defined.
+5. **Format id collision** — **DESIGN RESOLVED in 5.1; D-1 STEPS
+   1–4 IMPLEMENTED (2026-05-19 / 2026-05-20); STEPS 5–8 PENDING.**
+   `FormatId` now a tagged tuple `Builtin(u32) | Custom(PeerId, u32)`
+   in `ql_storage::format` (step 3 `af803f1a3f2`). `FormatIdWire`
+   the wire-side counterpart in `ql_oplog::wire` (step 2
+   `135bbb99f75`). `Op::RegisterFormat` + `Op::SetCellFormat` carry
+   `FormatIdWire` (step 4 `6a4b8b0922f`). `FormatTable::by_string`
+   restructured into `by_builtin_string` (global) + `by_custom_string`
+   ((peer, string)-keyed) so cross-peer same-string registrations
+   succeed (step 4 + step-3-audit-closure). `lookup_string` helper
+   ensures producer dedup is peer-scoped (step-4-audit-closure
+   `e97e646270a`). **Pending:** step 5 qbook envelope schema bump
+   + legacy loader, step 6 xlsx FormatId↔numFmtId mapping, step 7
+   Tier D3 oplog.bin magic bytes + version header, step 8 megaudit.
+   See `docs/phase5/d-1-starting-checklist.md` for the execution
+   plan + per-step audit transcripts at
+   `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..4}-*.md`.
 
 ## Cross-references
 

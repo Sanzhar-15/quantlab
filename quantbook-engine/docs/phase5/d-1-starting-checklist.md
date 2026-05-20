@@ -8,7 +8,7 @@ design_ref: docs/architecture/crdt-data-model.md § "D-1: Format-id wire format 
 
 # Phase 5.2 D-1 — fresh-session starting checklist
 
-D-1 is the **next major Phase 5.2 item** — multi-day, schema-breaking. After D-1, Phase 5 still has 5.3 (conflict resolution), 5.5 V2 V2/V3 (production transport), 5.7 (IDE vertical slice), and 5.8 (megaudit) ahead. This doc is a runway for the next session — assumes you've read `v1-exit-packet.md` for context.
+D-1 is the **active Phase 5.2 item** — multi-day, schema-breaking. **Steps 1-4 of 8 shipped + audited 2026-05-19/20; steps 5-8 pending.** After D-1, Phase 5 still has 5.3 (conflict resolution), 5.5 V2 V2/V3 (production transport), 5.7 (IDE vertical slice), and 5.8 (megaudit) ahead. This doc is the D-1 execution plan + status — fresh sessions reading this should start at the first unchecked step (currently step 5). Per-step audit transcripts: `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..4}-{codex,opus,consolidated}.md`.
 
 ## TL;DR
 
@@ -54,7 +54,7 @@ Sites that need updating, grouped by crate:
     - Option A (clean): add `ql-oplog::FormatIdWire` that mirrors the tagged tuple, with `from_storage`/`to_storage` conversions at the boundary. Matches the pattern of `CellWireValue` / `NamedTargetWire` already in `ql_oplog::wire`. **Recommended.**
     - Option B (direct re-use): `Op::RegisterFormat { id: ql_storage::FormatId, ... }`. Simpler but couples wire shape to storage shape — diverges from existing `CellWireValue` pattern.
   - `Op::SetCellFormat { sheet, row, col, id: FormatId }` (currently has `id: FormatId` per the audit doc) — sync to new shape.
-  - `PeerId` for `FormatIdWire::Custom(PeerId, u32)`: **shipped at step 1.1 in `ql_types::PeerId`** (✅ commit pending — was briefly at `ql_oplog::PeerId` in step 1 `aaa54d32f4d` but the step-1 audit caught a forthcoming Cargo cycle for step 3's `ql_storage::FormatId::Custom(PeerId, _)`; ql-storage can't depend on ql-oplog). `ql-oplog` + `ql-collab` re-export `ql_types::PeerId` for back-compat.
+  - `PeerId` for `FormatIdWire::Custom(PeerId, u32)`: **✅ shipped at step 1.1 in `ql_types::PeerId`** (`1e383dc9eeb`) — was briefly at `ql_oplog::PeerId` in step 1 (`aaa54d32f4d`) but the step-1 audit caught a forthcoming Cargo cycle for step 3's `ql_storage::FormatId::Custom(PeerId, _)` (ql-storage can't depend on ql-oplog). `ql-oplog` + `ql-collab` re-export `ql_types::PeerId` for back-compat.
 
 ### `ql-io` (persistence envelope)
 
@@ -128,18 +128,37 @@ This is the suggested order to keep the codebase in a compile-clean intermediate
 - ⚠️ **2-way audit DEFERRED to fresh session** per CLAUDE.md max-2-cycles rule. Cycle 3 of session was an explicit override; audit awaits step 4 cycle.
 - Commit: `af803f1a3f2`.
 
-### Step 4: Update `Op::RegisterFormat` / `Op::SetCellFormat` to use FormatIdWire (1-2 hours)
+### Step 4: Update `Op::RegisterFormat` / `Op::SetCellFormat` to use FormatIdWire — ✅ SHIPPED 2026-05-20 (`6a4b8b0922f` + audit `e97e646270a`)
 
-- Wire-format bump in Op enum.
-- Update producer (`ql-exec::workbook_runtime::formats`) + replay (`ql-oplog::replay`) to use the new shape.
-- Tests update.
-- Commit: `Phase 5.2 D-1 step 4 — Op wire format uses FormatIdWire`.
+**Scope expanded from original 1-2h to 2-3h:** step 3's audit caught the cross-peer same-string KNOWN LIMITATION, which was deferred to step 4's by_string restructure. Step 4 deliverables:
 
-### Step 5: Backwards-compat in `qbook_format` (2-3 hours)
+- ✅ `Op::RegisterFormat { id: u32 → FormatIdWire }` + `Op::SetCellFormat { id: Option<u32> → Option<FormatIdWire> }`.
+- ✅ `ReplayError::FormatNotRegistered { id: u32 → ql_storage::FormatId }`.
+- ✅ `FormatIdWire::from_storage(FormatId) → Self` + `to_storage(self) → FormatId` conversions in `ql-oplog::wire`.
+- ✅ Producer (`ql-exec::workbook_runtime::formats`) + replay (`ql-oplog::replay`) drop the legacy_from_u32/to_legacy_u32 expects.
+- ✅ `FormatTable::by_string` restructured: `by_builtin_string: HashMap<String, FormatId>` (global) + `by_custom_string: HashMap<(PeerId, String), FormatId>` (peer-scoped). Closes step-3 KNOWN LIMITATION.
+- ✅ Tests updated across 9 files; new tests pin the new structure.
+- ✅ `debug_assert_ne!(peer, 0)` added to `CollabSession::new` + `from_snapshot` (Opus L4 closure).
 
-- Schema version bump.
-- Old-format loader: detect schema version, migrate `u32` → `FormatId` via legacy mapping.
-- Tests: load a fixture saved at the old schema, verify successful migration.
+**Step 4 audit (`e97e646270a`) — 2nd consecutive DIVERGENT-HIGH cycle**. Codex H1: `WorkbookRuntime::intern_format` global `iter().find()` bypasses peer scoping; closed via new `FormatTable::lookup_string(s)` helper. Codex M1: counter overflow at 3 sites; closed with `checked_add(1).expect(...)`. Codex M2: `from_snapshot` missing peer-id guard; closed. 6 new tests; +6 net workspace tests (4251 → 4257). Full transcripts at `docs/audits/2026-05-20-phase-5-2-d-1-step-4-{codex,opus,consolidated}.md`.
+
+### Step 5: Backwards-compat in `qbook_format` (2-3 hours) — ⏳ NEXT
+
+Starts on the foundation step 4 + step 4 audit laid. Step 5 substrate is clean:
+
+- ✅ Producer/replay symmetry verified (step 4 audit Codex H1 closure).
+- ✅ FormatIdWire round-trip-tested both directions (Codex L1 + Opus L1 closures).
+- ✅ Counter overflow safe (Codex M1 closure).
+- ✅ PeerId(0) guard at both CollabSession constructors (Codex M2 closure).
+- ✅ by_string peer-scope structurally correct + test-pinned.
+
+Step 5 work:
+- Bump `qbook_format::WORKBOOK_SCHEMA_VERSION` (currently 7) → 8.
+- Add legacy loader: detect schema version < 8, read old u32-shaped `FormatEntry.id` + `FormatOverlayEntry.id`, migrate via `FormatId::legacy_from_u32`.
+- Drop the `to_legacy_u32().expect()` sites in qbook_format save path (envelope now carries FormatIdWire directly).
+- Fixture tests: load a saved-at-schema-7 .qbook fixture, verify migration produces correct `Custom(LEGACY_PEER, _)` ids.
+- Update `MIN_SUPPORTED_SCHEMA_VERSION` reasoning + `UnsupportedSchema` error path if needed.
+- Per Opus step-4 M3: include "step-4 changed Op JSON shape; this commit's schema bump gates the legacy loader" in the commit message.
 - Commit: `Phase 5.2 D-1 step 5 — qbook envelope schema bump + legacy loader`.
 
 ### Step 6: xlsx export / import (1-2 hours)
@@ -155,23 +174,27 @@ This is the suggested order to keep the codebase in a compile-clean intermediate
 - This is the discriminator the loader uses to know whether to apply legacy FormatId migration.
 - Commit: `Tier D3 — oplog.bin magic bytes + schema version header`.
 
-### Step 8: Audit (mandatory per discipline rule)
+### Step 8: Full-arc megaudit (mandatory per discipline rule)
 
-- 2-way Codex + Opus audit of the full D-1 arc. Multi-step schema change is exactly the kind of cycle the audit-discipline rule was written for.
-- Verify clean-checkout `cargo check` (don't trust pre-commit hook gates alone — the index-padding race struck twice this session).
+**Per-step audits (steps 1-4) already shipped** — 4 cycles, 2 DIVERGENT-HIGH cycles caught forward-activating bugs that the alternative (defer all audits to step 8) would have shipped. Transcripts at `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..4}-{codex,opus,consolidated}.md`.
 
-**Estimated total: 10-14 hours = ~2 working days.** Step 5 (backwards-compat) is the riskiest; allocate time for old `.qbook` fixture tests.
+Step 8 scope (after steps 5-7 ship):
+- Per-step audits for steps 5, 6, 7 same as 1-4 pattern.
+- Then a **full-arc megaudit**: cross-step invariants (schema round-trip end-to-end, old `.qbook` → new envelope → old format export — does the value survive?), workspace-wide grep for any remaining `to_legacy_u32().expect()` or pre-D-1 patterns, fixture coverage gap analysis.
+- Verify clean-checkout `cargo check` (don't trust pre-commit hook gates alone — the index-padding race struck 3 times in the V1 session; 0 times in D-1 so far).
+
+**Estimated total: ~12 hours spent on steps 1-4 + 4 audits (2026-05-19/20); ~3-7h remaining for steps 5-8.** Step 5 (qbook backwards-compat) is the riskiest of the remaining work; allocate time for old `.qbook` fixture tests.
 
 ## Pre-flight checklist
 
-Before starting D-1, verify:
+Before resuming D-1 at step 5, verify:
 
-- [ ] HEAD is at the most recent commit on `feat/quantbook-engine` (`2e945454cb5` as of 2026-05-19 session-end — `93210e43567` is the D1.a closure preceding the doc-refresh commit).
-- [ ] `cargo test --workspace` reports **4222** passed.
+- [ ] HEAD is at the most recent commit on `feat/quantbook-engine` (`e97e646270a` as of 2026-05-20 session-end — step 4 audit closures; preceded by `6a4b8b0922f` step 4 ship).
+- [ ] `cargo test --workspace` reports **4257** passed.
 - [ ] `cargo fmt --all -- --check` clean.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - [ ] No uncommitted source files (`git status --short | grep -v '^??'` empty).
-- [ ] You've read `v1-exit-packet.md` (10 min) and `crdt-data-model.md` § D-1 (5 min).
+- [ ] You've read this doc's Step 4 + Step 5 sections (most-recent + next), `docs/audits/2026-05-20-phase-5-2-d-1-step-4-consolidated.md` (most-recent audit), and `crdt-data-model.md` § "Format id collision" (overall design status). `v1-exit-packet.md` is broader Phase 5 V1 context if needed.
 
 **Cargo invocation pattern (Linux VM → Mac host):** cargo is NOT on PATH on the Linux VM where Claude runs. ALL cargo commands MUST go through the `mac` bridge:
 

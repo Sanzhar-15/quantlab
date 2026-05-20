@@ -206,7 +206,7 @@ Phase 5 V1 (2026-05-19) added the engine-side multi-user CRDT collaboration subs
 - **Transport:** `attach_transport<T: Transport + Send + 'static>` / `flush_to_transport` / `poll_remote` / `poll_remote_with_limit`. V1 ships `NoopTransport` + `LoopbackTransport::pair()` (in-process 2-peer); Phase 5.5 V2 V2/V3 will add WebSocket.
 - **Presence:** `update_presence(state)` / `peer_presence(peer)` / `clear_presence` / `peers_with_presence` / `sweep_presence` (V2 — caller-opt-in clean-slate on rejoin).
 
-**D-1 pending:** `FormatId` is still `u32` (per ql-storage::FormatId); Phase 5.2 D-1 will switch it to a tagged tuple `{ Builtin(u32) | Custom(PeerId, u32) }`. IDE callers that observe FormatId today (e.g. cell-format-id lookups) will need to handle both variants post-D-1.
+**D-1 (steps 1-4 of 8 shipped 2026-05-19/20, steps 5-8 pending):** `FormatId` is now `enum { Builtin(u32), Custom(PeerId, u32) }` in `ql-storage::format` (was `struct FormatId(pub u32)` pre-D-1). IDE callers MUST pattern-match the variant rather than reading `.0`. Use `FormatId::is_builtin()` / `is_custom()` / `GENERAL` accessors. For pre-D-1 bare-u32 ids (xlsx import, qbook envelope load), use `FormatId::legacy_from_u32(n)` migration helper (n ≤ 163 → Builtin; n ≥ 164 → Custom(LEGACY_PEER, n - 164)). `Op::RegisterFormat` + `Op::SetCellFormat` carry `FormatIdWire` on the wire. Step 5 (qbook envelope schema bump) + step 6 (xlsx FormatId↔numFmtId) + step 7 (oplog.bin magic bytes) + step 8 (megaudit) remain.
 
 ## 5. Acceptance pattern (`crates/ql-exec/tests/ide_simulation.rs`)
 
