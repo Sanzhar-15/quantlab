@@ -1,6 +1,6 @@
 ---
 title: Phase 5 entry plan — Multi-User CRDT Collaboration
-status: SUPERSEDED-BY-EXIT-PACKET — Phase 5 V1 COMPLETE 2026-05-19. **D-1 SHIPPED 2026-05-20** (all 8 steps + 7 per-step audits + 1 megaudit). See `docs/phase5/d-1-exit-packet.md` (D-1 closure record) + `docs/phase5/v1-exit-packet.md` (canonical V1 record) + `docs/phase5/d-1-starting-checklist.md` (D-1 execution-trace history). 5.3, 5.5 V2 V2/V3, 5.7, and 5.8 also remain.
+status: SUPERSEDED-BY-EXIT-PACKETS — Phase 5 V1 COMPLETE 2026-05-19. **D-1 SHIPPED 2026-05-20** + **5.3 SHIPPED 2026-05-20**. See `docs/phase5/d-1-exit-packet.md` (D-1 closure) + `docs/phase5/5-3-exit-packet.md` (5.3 closure) + `docs/phase5/v1-exit-packet.md` (canonical V1 record) + `docs/phase5/d-1-starting-checklist.md` (D-1 execution-trace history). 5.5 V2 V2/V3, 5.7, and 5.8 remain.
 date: 2026-05-19
 predecessor: docs/phase4/exit-packet.md
 successor: docs/phase5/v1-exit-packet.md (closeout) + docs/phase5/d-1-starting-checklist.md (D-1 entry)
@@ -113,7 +113,7 @@ post-merge.
 |---|---|---|---|
 | 5.1 | Collaboration Data Model Decision | 3-5 days | **✅ AUDIT-CLOSED 2026-05-19** (`918d7efdd91` + `df52cb44ad2`). Loro container shape locked = Option A op-log preservation; 4 audit decisions D-1..D-4 recorded in design doc. |
 | 5.2 | `ql-collab` Core Documents | 1-2 weeks | **🟡 IN PROGRESS** — 5.2.a scaffold; D-2/D-3/D-4; 5.2.b; **D-1 ✅ SHIPPED 2026-05-20** (all 8 steps + 7 per-step audits + 1 megaudit; see `docs/phase5/d-1-exit-packet.md`). |
-| 5.3 | Conflict Resolution Semantics | 4-7 days | Causality-aware rename-repair pass; multi-value / delete-vs-update. Loro merge is Fugue/origin-based (not Lamport LWW — corrected by Phase 5.1 audit). |
+| 5.3 | Conflict Resolution Semantics | ✅ SHIPPED 2026-05-20 (4 days actual) | Causality-aware rename-repair pass for sheets + tables + columns. `ql_collab::repair_{sheet,table,column}_rename_chain` + `CollabSession::rebuild_workbook` wrapper. See `docs/phase5/5-3-exit-packet.md`. |
 | 5.4 | Undo/Redo + Operation Grouping | 1 week | **🟢 V1 + V2 V1 + V2 V1.1 SHIPPED 2026-05-19** — V1 `89c02b9d83e`: 7 undo/redo methods, presence-origin excluded. V2 V1 `6138a7203f6` + `e199a5fda5a`: grouping + merge-interval. V2 V1.1: `start_undo_group_scoped` returns `UndoGroupGuard` (RAII, panic/Err-safe). V2 V2 follow-up: push/pop listeners. |
 | 5.5 | Transport Layer + Offline Sync | 1-2 weeks | **🟡 V1 SHIPPED `924750819bc`** + **V2 V1 SHIPPED `ffd8f6e5f05`** — V1: `Transport` trait + `NoopTransport` + `LoopbackTransport`. V2 V1: `CollabSession::{attach,detach,has}_transport` + `flush_to_transport` + `poll_remote` (+ `_with_limit`) typed methods; explicit-drive. V2 V2 / V3 pending: auto-flush on append + version-vector delta exports + WebSocket impl + reconnect/offline sync. |
 | 5.6 | Presence + Awareness | 3-5 days | **🟢 V1 + V2 SHIPPED** — V1 `c677e244704`: `"presence"` LoroMap + `PresenceState` + 4 CollabSession methods + 11 tests. V2 `d4b3cdb2dc2`: `sweep_presence` (caller-opt-in clean-slate; closes V1 persistence known-limitation). Remaining V2 V2: presence-changed callbacks (lower priority). |

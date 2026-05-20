@@ -380,6 +380,93 @@ This is the largest single deferred work item — multi-week scope.
 
 ---
 
+## Tier H — PHASE 5.3 V1 LIMITATIONS (deferred to V2)
+
+**Source:** Phase 5.3 step 5 three-way megaudit + per-step audits at steps 1-5c. See `docs/phase5/5-3-exit-packet.md` § "V1 limitations" + 20 audit transcripts at `docs/audits/2026-05-20-phase-5-3-*.md`.
+
+**Added:** 2026-05-20 by Phase 5.3 step 6 exit packet (per step 5 megaudit H-D2 closure — V1 limitations MUST land in durable doc before `.plans/_active.md` archives).
+
+### H1. Helper duplication — 6 call sites of `ql_formula_syntax::{lex, parse, print, rewrite_*}`
+
+- **Source:** step 5 megaudit Codex M1 + Opus-B M1 (convergent); step 5c LOW grew to 6 sites.
+- **Sites:**
+  1. `crates/ql-collab/src/repair.rs:430` (`rewrite_formula_with_rename` — sheet)
+  2. `crates/ql-collab/src/repair.rs:623` (`rewrite_formula_with_table_rename`)
+  3. `crates/ql-collab/src/repair.rs:945` (`rewrite_formula_with_column_rename`) — added in step 5c
+  4. `crates/ql-exec/src/workbook_runtime/sheets.rs:43` (`rewrite_formula_text_for_sheet_rename`)
+  5. `crates/ql-exec/src/workbook_runtime/tables.rs:336` (inline `rename_table`)
+  6. `crates/ql-exec/src/workbook_runtime/tables.rs:484` (inline `rename_column`)
+- **Disposition:** promote to a single public `rewrite_formula_text(text: &str, rewrite: NameRewrite<'_>) -> Option<String>` in `ql-formula-syntax` (~50 LOC add, ~52 LOC remove, net -2 LOC; signature in step 5 Opus-B verdict). Single-commit refactor; do BEFORE V2 work that adds a 7th site.
+
+### H2. Cross-source target collision hard-fails (tables + columns)
+
+- **Source:** step 4 audit closure (Codex+Opus convergent HIGH) — V1 limitation revert of an unsound auto-disambig.
+- **Behavior:** `RenameTable { _, X } × RenameTable { _, X }` (different sources, same target) hard-fails replay via `TableCreateRejected`. Same for `RenameColumn`.
+- **Why revert was right at V1:** the prior auto-disambig (X → X(2)) interacted with the repair pass's name-based chain to produce silent formula corruption.
+- **Disposition:** V2 closure requires API change — replay must synthesize a "correction op" capturing the disambig outcome + thread it through to repair. Or: stable table/column IDs on wire ops (eliminates name-based chain entirely).
+
+### H3. Concurrent table-rename × column-rename loses column intent
+
+- **Source:** step 5c audit closure (Codex HIGH + Opus HIGH-1 convergent).
+- **Behavior:** `apply_rename_column` advisory-skips when its wire table is missing (because peer A renamed it concurrently). Column rename op is silently dropped.
+- **Workaround (in V1):** `repair_column_rename_chain` resolves the wire table through the table-rename chain, so formulas referencing the column by its current canonical still get rewritten where possible.
+- **Disposition:** V2 — causality-aware tracking via Loro op-ids that re-targets the column op to the renamed-to table canonical.
+
+### H4. Case-only rename policy inconsistency across sheet/table/column
+
+- **Source:** step 5 megaudit Opus-A V1 LIM #5 + per-step audit findings.
+- **Behavior:**
+  - Sheet `S → s` — APPLIES (post-step-2 audit closure).
+  - Table `T → t` — silent NO-OP.
+  - Column `A → a` — REJECTS as `TableColumnRejected` divergence.
+- **Disposition:** V2 — align all three on "case-only changes mutate display" (sheet's current behavior). Trivial code change; needs cross-handler test coverage.
+
+### H5. Concurrent-rename intermediate names lost in edge cases
+
+- **Source:** step 5 megaudit Opus-A V1 LIM #6 + step 3 docstring acknowledgment.
+- **Behavior:** chain S1→S2→S3 captures intermediate "S2" via `old_name`. But adversarial peer interleavings where `old_name` doesn't reflect what current was at apply-time can lose the intermediate.
+- **Disposition:** V2 — causality-aware tracking via Loro op-ids.
+
+### H6. Cross-sheet historic-name ambiguity (neither historic currently held)
+
+- **Source:** step 5 megaudit Opus-A Scenario D + step 3 docstring.
+- **Behavior:** two sheets had the same canonical name at different chain points, AND neither sheet currently holds that name. Rules from both sheets land in the vec; winner determined by substitution-order consumption (sheet_id-sorted iteration). Rare.
+- **Disposition:** V2 if it surfaces in practice; otherwise document + leave.
+
+### H7. `replay_into` non-atomic on Err
+
+- **Source:** step 5 megaudit Opus-A HIGH-1.
+- **Behavior:** half-merged workbook state on replay Err. Caller MUST discard per docstring.
+- **Workaround (in V1):** `CollabSession::rebuild_workbook` constructs the workbook internally and drops it on Err — caller never sees the partial state.
+- **Disposition:** V2 — workbook snapshot/restore around `replay_into` OR two-phase replay (dry-run validate + apply).
+
+### H8. API naming asymmetry — `RepairReport` vs `TableRepairReport` vs `ColumnRepairReport`
+
+- **Source:** step 5b LOW-3 + step 5c LOW deferred.
+- **Behavior:** sheet repair returns `RepairReport`; table returns `TableRepairReport`; column returns `ColumnRepairReport`. Same asymmetry for `AmbiguousSkip` vs prefixed table/column variants.
+- **Disposition:** **PRE-IDE-BINDING RENAME OPPORTUNITY (Phase 5.7 prep).** Rename `RepairReport` → `SheetRepairReport` + `AmbiguousSkip` → `SheetAmbiguousSkip`. Single-commit mechanical refactor. Last chance before IDE consumes the API in 5.7.
+
+### H9. Production wiring delivery to IDE (Phase 5.7 work)
+
+- **Source:** step 5b Opus HIGH-1 (rhetoric / framing).
+- **Behavior:** `CollabSession::rebuild_workbook` is shipped as the API entry point but has ZERO non-test callers in the engine. The user-visible D-3 closure only happens when 5.7 IDE binding actually wires `rebuild_workbook` into the IDE's merge-then-recompute path.
+- **Disposition:** Phase 5.7 work. NOT a 5.3 follow-up.
+
+### H10. Whitespace canonicalization side effect on repair-touched formulas
+
+- **Source:** step 5 megaudit Opus-A Scenario F.
+- **Behavior:** repair pass routes through `lex → parse → rewrite → print`. Printer canonicalizes whitespace, operator spacing, function-name case. So `"SUM(  t[a] )    +1"` becomes `"SUM(T2[a]) + 1"` post-repair. Unrelated formulas (no rule applies) preserve original text.
+- **Disposition:** V2 — surgical diff-only rewrite path using source spans rather than parse/print round-trip.
+
+### H11. Mismatched workbook ↔ log silent corruption (raw API only)
+
+- **Source:** step 5b Opus HIGH-latent.
+- **Behavior:** `repair_*` functions trust the workbook is in post-replay state for the log. Calling with a stale / wrong workbook silently corrupts formulas.
+- **Workaround (in V1):** `rebuild_workbook` constructs the workbook internally — eliminates the misuse class for production callers. Raw `repair_*` callers' problem.
+- **Disposition:** V2 — debug-assert that for each rename in the log, the workbook's current canonical matches the post-replay expectation. Tricky to make precise without re-implementing replay; deferred.
+
+---
+
 ## Smaller items (Phase 4.12 MEDIUMs worth tracking)
 
 From the Phase 4.12 megaudit consolidated doc, ~28 MEDIUMs total.

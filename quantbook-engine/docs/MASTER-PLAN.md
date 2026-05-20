@@ -542,7 +542,7 @@ The full v1 means all of these crates either ship real behavior or have a docume
 
 ## Phase 5 - Multi-User CRDT Collaboration
 
-**Status (2026-05-20): Phase 5 V1 + D-1 COMPLETE.** Canonical records: `docs/phase5/v1-exit-packet.md` (V1) + `docs/phase5/d-1-exit-packet.md` (D-1 closure). Remaining: 5.3 conflict resolution, 5.5 V2 V2/V3 production transport, 5.7 IDE slice, 5.8 Phase 5 megaudit (separate from D-1 step 8).
+**Status (2026-05-20): Phase 5 V1 + D-1 + 5.3 COMPLETE.** Canonical records: `docs/phase5/v1-exit-packet.md` (V1) + `docs/phase5/d-1-exit-packet.md` (D-1 closure) + `docs/phase5/5-3-exit-packet.md` (5.3 closure). Remaining: 5.5 V2 V2/V3 production transport, 5.7 IDE slice, 5.8 Phase 5 megaudit (separate from D-1 step 8 + 5.3 step 5 megaudits).
 
 **Purpose:** Turn collaboration from a single-writer op log into real multi-user CRDT state for sheets, cells, names, tables, presence, undo/redo, and offline sync.
 
@@ -570,7 +570,7 @@ The full v1 means all of these crates either ship real behavior or have a docume
    - ✅ 5.2.b PeerId → LoroDoc wiring (`ef056f50bee`).
    - ✅ **D-1 (FormatId tagged tuple, multi-day) — SHIPPED 2026-05-20.** All 8 steps + 7 per-step audits + 1 full-arc 3-way megaudit complete. **16/16 audit cycles caught real bugs.** Workspace tests: 4222 → 4291 (+69). See `docs/phase5/d-1-exit-packet.md` for the closure record + `docs/phase5/d-1-starting-checklist.md` for execution-trace history.
 
-3. **5.3 Conflict Resolution Semantics** — future. Causality-aware rename-repair pass. 4-7 days. (V1 ships `BindError::UnknownSheet → #NAME?` as the simple case per Phase 5.2 D-3.)
+3. **5.3 Conflict Resolution Semantics** ✅ SHIPPED 2026-05-20. Causality-aware rename-repair pass for sheets + tables + columns. 4 days actual (vs 4-7 day estimate). All 6 steps + 14 audit cycles complete. **14/14 audit cycles caught real bugs.** Workspace tests: 4291 → 4361 (+70). New public API: `ql_collab::repair_{sheet,table,column}_rename_chain` + `CollabSession::rebuild_workbook` convenience wrapper. See `docs/phase5/5-3-exit-packet.md` for the closure record + 20 audit transcripts at `docs/audits/2026-05-20-phase-5-3-*.md`. 13 V1 limitations tracked at `docs/PHASE-4-V2-BACKLOG.md` Tier H. **Production-visible D-3 closure happens at step 5.7 IDE binding** (rebuild_workbook is shipped as the API entry; IDE has to wire it).
 
 4. **5.4 Undo/Redo And Operation Grouping** ✅ V1 + V2 V1 + V2 V1.1 SHIPPED 2026-05-19.
    - V1 (`89c02b9d83e`): 7 undo/redo methods on CollabSession wrapping `loro::UndoManager`; presence-origin commits auto-excluded.

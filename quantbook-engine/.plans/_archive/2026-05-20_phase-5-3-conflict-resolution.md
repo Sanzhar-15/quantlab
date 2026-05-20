@@ -1,14 +1,15 @@
 ---
 name: 2026-05-20_phase-5-3-conflict-resolution
 date: 2026-05-20
-status: STEPS-1-4-SHIPPED-AUDIT-CLOSED — steps 5 (3-way megaudit) + 6 (exit packet) remain
-arc_estimate: 4-5 days (4 cycles spent; ~1 cycle remaining for step 5+6)
-current_head: 6752ca2545c on feat/quantbook-engine (step 4 audit closures)
-workspace_tests: 4334 / 0 with --test-threads=1
+status: done
+exit_packet: docs/phase5/5-3-exit-packet.md (canonical closure record)
+arc_estimate: 4-5 days (4 days actual)
+final_head: 24e9a775c98 on feat/quantbook-engine (step 5c audit closure; step 6 exit packet commit pending)
+workspace_tests: 4361 / 0 with --test-threads=1
 predecessor: docs/phase5/d-1-exit-packet.md (D-1 SHIPPED 2026-05-20 at HEAD 6289c4f3d4a)
 audit_discipline: parallel Codex+Opus per ship + 3-way megaudit at closure (per D-1 precedent)
-audit_cycles_in_phase_5_3: 8 (4 per-step + 4 closure), 6 consecutive divergent-HIGH
-audit_transcripts: docs/audits/2026-05-20-phase-5-3-step-{1,2,3,4}-{codex,opus,consolidated}.md (12 files)
+audit_cycles_in_phase_5_3: 14 (4 per-step + 4 closure + 1 megaudit + 2 per-ship + 3 audit-closure cycles), 7 consecutive divergent-HIGH
+audit_transcripts: docs/audits/2026-05-20-phase-5-3-step-{1,2,3,4,5,5b,5c}-{codex,opus,opus-a,opus-b,consolidated}.md (20 files)
 ---
 
 # Phase 5.3 — Conflict Resolution Semantics

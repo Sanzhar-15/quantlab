@@ -1,6 +1,6 @@
 ---
 title: Phase 5 V1 exit packet (5.1 → 5.6 V1+V2 + 5.4 V2 V1+V1.1 + 5.5 V2 V1 + D1.a)
-status: ACTIVE — Phase 5 V1 surface complete 2026-05-19. **D-1 SHIPPED 2026-05-20** (all 8 steps + 7 per-step audits + 1 megaudit). See `docs/phase5/d-1-exit-packet.md`. 5.3, 5.5 V2 V2/V3, 5.7, and 5.8 also remain.
+status: ACTIVE — Phase 5 V1 surface complete 2026-05-19. **D-1 SHIPPED 2026-05-20** (all 8 steps + 7 per-step audits + 1 megaudit). **5.3 SHIPPED 2026-05-20** (all 6 steps + 14 audit cycles). See `docs/phase5/d-1-exit-packet.md` + `docs/phase5/5-3-exit-packet.md`. 5.5 V2 V2/V3, 5.7, and 5.8 remain.
 date: 2026-05-19
 updated: 2026-05-20 (post-exit-packet additions: 5.6 V2 sweep_presence + D1.a 4-cluster closure + D-1 ALL STEPS SHIPPED)
 predecessor: docs/phase4/exit-packet.md + docs/phase5/entry-plan.md
@@ -19,7 +19,8 @@ V2 V1), and ephemeral presence (5.6 V1).
 
 Phase 5.2 D-1 (FormatId tagged tuple) ✅ SHIPPED 2026-05-20 — see
 `docs/phase5/d-1-exit-packet.md`. Phase 5.3 conflict resolution
-+ Phase 5.5 V2 V2/V3 (WebSocket / auto-flush) + Phase 5.7 IDE
+✅ SHIPPED 2026-05-20 — see `docs/phase5/5-3-exit-packet.md`.
+Phase 5.5 V2 V2/V3 (WebSocket / auto-flush) + Phase 5.7 IDE
 vertical slice remain ahead of the 5.8 megaudit.
 
 ## Acceptance criteria status (Phase 5 V1)
@@ -223,9 +224,19 @@ Phase 5 V1 added **91 net tests** to the engine.
   `ql-io::qbook_format` (v7→v8) + `oplog_persistence` (Tier D3
   header), `ql-io-xlsx::write::umya_export` (XlsxNumFmtTranslation).
 
-- **Phase 5.3 — Conflict resolution semantics.** Causality-aware
-  rename-repair pass at merge time (currently V1 emits `#NAME?`
-  for concurrent edits to renamed sheets). 4-7 days estimated.
+- **Phase 5.3 — Conflict resolution semantics.** ✅ **SHIPPED
+  2026-05-20** (4 days actual vs 4-7 day estimate; HEAD
+  `24e9a775c98` post-step-6 exit packet). 6 steps + 14 audit cycles
+  (14/14 caught real bugs). Causality-aware rename-repair pass at
+  merge time for sheets + tables + columns:
+  `ql_collab::repair_{sheet,table,column}_rename_chain` +
+  `CollabSession::rebuild_workbook` production-wiring wrapper. The
+  D-3 `#NAME?` simple-case from Phase 5.2 still ships as the
+  raw-replay-without-repair fallback; production callers route
+  through `rebuild_workbook` which atomically replays + repairs.
+  See `docs/phase5/5-3-exit-packet.md` + 20 audit transcripts at
+  `docs/audits/2026-05-20-phase-5-3-*.md`. 13 V1 limitations tracked
+  at `docs/PHASE-4-V2-BACKLOG.md` Tier H.
 
 - **Phase 5.5 V2 V2 / V3 — Production transport.** WebSocket impl
   + reconnect / offline sync + auto-flush on append (with
