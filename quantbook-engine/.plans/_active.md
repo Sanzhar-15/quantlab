@@ -1,10 +1,14 @@
 ---
 name: 2026-05-20_phase-5-3-conflict-resolution
 date: 2026-05-20
-status: AWAITING-USER-SIGNOFF
-arc_estimate: 4-5 days (matches design-doc estimate of 4-7 days)
+status: STEPS-1-4-SHIPPED-AUDIT-CLOSED — steps 5 (3-way megaudit) + 6 (exit packet) remain
+arc_estimate: 4-5 days (4 cycles spent; ~1 cycle remaining for step 5+6)
+current_head: 6752ca2545c on feat/quantbook-engine (step 4 audit closures)
+workspace_tests: 4334 / 0 with --test-threads=1
 predecessor: docs/phase5/d-1-exit-packet.md (D-1 SHIPPED 2026-05-20 at HEAD 6289c4f3d4a)
-audit_discipline: parallel Codex+Opus per ship + 3-way megaudit at closure (per D-1 precedent — 17/17 audit cycles caught real bugs)
+audit_discipline: parallel Codex+Opus per ship + 3-way megaudit at closure (per D-1 precedent)
+audit_cycles_in_phase_5_3: 8 (4 per-step + 4 closure), 6 consecutive divergent-HIGH
+audit_transcripts: docs/audits/2026-05-20-phase-5-3-step-{1,2,3,4}-{codex,opus,consolidated}.md (12 files)
 ---
 
 # Phase 5.3 — Conflict Resolution Semantics
@@ -70,45 +74,72 @@ Surfaces what was done (for caller logging) + what couldn't be repaired (analogo
 
 ## Phased plan
 
-### Step 1 — Conflict matrix test pinning (~1 day)
-NEW: `crates/ql-exec/tests/phase_5_3_conflict_matrix_probe.rs`. 7 probe tests following the D-4 pattern. Most should PASS already (Loro CRDT handles last-in-causal-order). Failures = real gaps that become step 1.5 work.
+### Step 1 — Conflict matrix test pinning ✅ SHIPPED 2026-05-20
+- Ship: `5595d8dcfb0` + fmt-reconcile `a6babc65b51`
+- Audit closure: `03408fa17bd` (3rd consecutive divergent-HIGH cycle)
+- Tests: 9 (added new row 7 RenameSheet pre-fix during audit closure)
+- KEY DISCOVERY: CRDT convergence requires STABLE non-zero peer-ids. `fork_with_peer(base, peer_id)` helper. Documented in `crdt-data-model.md` § "Peer-id stability is a precondition for CRDT convergence".
+- Audit transcripts: `docs/audits/2026-05-20-phase-5-3-step-1-{codex,opus,consolidated}.md`
 
-**Per-step audit (Codex + Opus parallel)** — discipline rule.
+### Step 2 — Concurrent RenameSheet replay fix ✅ SHIPPED 2026-05-20
+- Ship: `1ed2bbba78a`
+- Audit closure: `f426683fee0` (4th consecutive divergent-HIGH cycle — both auditors caught HIGH-1: cross-sheet target collision still hard-failed pre-closure)
+- Tests: 7 (added 2 audit-closure regressions: cross-sheet auto-disambig + case-only rename)
+- Replay handler: unified case 2+3 logic; D-2-style auto-disambig for cross-sheet target collision; case-only renames apply via display equality check
+- Variant deprecation: `ReplayError::SheetRenameNameMismatch` `#[deprecated]`
+- Audit transcripts: `docs/audits/2026-05-20-phase-5-3-step-2-{codex,opus,consolidated}.md`
 
-### Step 2 — Concurrent RenameSheet replay fix (~0.5 day)
-Edit `crates/ql-oplog/src/replay.rs:486-532`. Change case 3 from error to "apply rename to current name." Add 2-peer probe test pinning convergence.
+### Step 3 — Rename-repair pass ✅ SHIPPED 2026-05-20 (CORE 5.3 WORK)
+- Ship: `e76a9ce5499` + lockfile `4222d11fe7b`
+- Audit closure: `6bb76e3ade3` (5th consecutive divergent-HIGH cycle — both auditors caught HIGH: cascade corruption from rule iteration)
+- Tests: 13 (10 original + 3 audit closures)
+- NEW MODULE: `ql_collab::repair_sheet_rename_chain` + `RepairReport` + `SheetRewriteSummary` + `AmbiguousSkip`
+- Algorithm: chain-based + safety guard (skip rules where `old_canonical` is currently held by ANY sheet — closes cascade + reused-name corruption)
+- Row 7 of conflict matrix: MODIFIED to assert post-repair behavior (resolves to correct value instead of #NAME?)
+- Audit transcripts: `docs/audits/2026-05-20-phase-5-3-step-3-{codex,opus,consolidated}.md`
+- Deferred (V2): helper unification (now 3 call sites; would prevent step-4 expansion to 5+); production wiring (caller-driven by design)
 
-**Per-step audit** — auditors typically find policy edges (e.g., what if sheet was BOTH renamed AND dropped concurrently? Step 2 needs a clear answer).
+### Step 4 — RenameTable/RenameColumn extension ✅ SHIPPED 2026-05-20
+- Ship: `7126eb44396`
+- Audit closure: `6752ca2545c` (6th consecutive divergent-HIGH cycle — both auditors caught 2 HIGHs: (a) auto-disambig + repair mismatch corrupts cross-table formulas; (b) column repair pass missing)
+- Tests: 14 (6 replay + 8 table repair; 2 reframed for hard-fail post-revert; 2 new for transitive chain + BatchCommit)
+- Replay: `apply_rename_table` + `apply_rename_column` — advisory-skip for missing source (concurrent rename); hard-reject on cross-source target collision (audit-CLOSURE revert)
+- NEW: `repair_table_rename_chain` + `TableRepairReport` + `TableRewriteSummary` + `TableAmbiguousSkip`
+- Audit transcripts: `docs/audits/2026-05-20-phase-5-3-step-4-{codex,opus,consolidated}.md`
 
-### Step 3 — Rename-repair pass (~1.5-2 days, CORE 5.3 WORK)
-- NEW: `crates/ql-collab/src/repair.rs` — `repair_sheet_rename_chain` + `RepairReport` + `UnresolvedRepair` (~150 LOC).
-- Edit `crates/ql-collab/src/lib.rs` — re-export.
-- NEW: `crates/ql-collab/tests/repair_renames.rs` (~300 LOC) — 2-peer probes covering:
-  - Concurrent rename + concurrent edit (the canonical case)
-  - Transitive rename chain (S1→S2→S3 across multiple peers)
-  - Rename-back (S1→S2→S1; chain collapses)
-  - Rename-then-drop (formula gets rewritten to dropped sheet → #NAME?)
-  - No-op case (formula references unrenamed sheet)
+**Step 4 audit REVERT** (Codex+Opus HIGH × 2):
+- Pre-closure: replay auto-disambig'd target collision via X → X(2) suffix walk (mirroring step 2). Repair pass keyed history by op's wire `new_name="X"` → mis-mapped to actual canonical X(2) → silent cross-table reference corruption.
+- Post-closure: REVERTED auto-disambig. Cross-source target collision now hard-fails with `TableCreateRejected` / `TableColumnRejected`. V1 limitation documented.
+- Preserved: advisory-skip for missing-source (the original Opus step-1-audit M-2 closure).
 
-**Per-step audit** — highest-impact step; audit thoroughly.
+**V1 limitations stack from step 4 audit closure** (deferred to V2 / step 5 megaudit assessment):
+- Cross-source target collision hard-fails (tables, columns)
+- Column repair pass missing
+- DropTable hard-fails on concurrent RenameTable (Opus M-1)
+- Case-only rename policy inconsistency across sheet/table/column (Opus M-3)
+- Helper duplication (5+ call sites; Opus step-3 M-1 deferred from step 3 audit)
+- Production wiring missing (Opus step-3 M-3)
 
-### Step 4 — RenameTable/RenameColumn extension (~0.5 day)
-**Step 1 audit (Opus MEDIUM-2) confirmed**: `apply_rename_table` at `replay.rs:680-723` keys lookups solely by `old_canonical` (line 691); `apply_rename_column` at `replay.rs:733-755` (line 749) same. **Identical bug shape to RenameSheet** — two peers concurrently renaming the same table (T→T1 vs T→T2) produces a merged log where the second op's `old_name="T"` no longer resolves → `ReplayError::TableNotFound`. Same root cause, same architectural fix.
+### Step 5 — 3-way megaudit (~0.5 day) ⏳ NEXT
+Codex (cross-step + grep) + Opus-A (empirical 2-peer + adversarial randomized interleavings + production wiring check) + Opus-B (doc completeness + helper duplication + cross-crate consistency).
 
-Step 4 work:
-- Apply step 2's "last-in-causal-order wins; rename current" policy to `apply_rename_table` (`replay.rs:691`) and `apply_rename_column` (`replay.rs:749`).
-- Extend step 3's `repair_sheet_rename_chain` module with `repair_table_rename_chain` + `repair_column_rename_chain` (or factor out a generic chain-rewrite helper). Rewrite formula text references `T → T1` and `T[X] → T[Y]` via the existing formula-rewrite producer-side machinery.
-- 2-peer probe tests mirroring step 3's coverage.
+**Megaudit MUST re-examine the V1 limitations stack** from step 4 audit closure (above) for V2 prioritization. Specifically:
+- Is the cross-source target collision hard-fail acceptable as V1? Or should V2 thread a disambig-trace through replay→repair?
+- Should column repair pass land in V1, or is the gap acceptable?
+- Audit-prompt the auditors to construct ADVERSARIAL probes attempting to break the safety guard via odd scenarios (e.g., 3+ chained renames + cross-sheet ambiguity + concurrent edits)
 
-**Effort revised down** from "0-1 day investigation" to "~0.5 day implementation" because the bug shape and fix are now known.
-
-**Per-step audit (Codex + Opus parallel).**
-
-### Step 5 — 3-way megaudit (~0.5 day)
-Codex (cross-step + grep) + Opus-A (empirical 2-peer + adversarial randomized interleavings) + Opus-B (doc completeness + cross-crate). Per D-1 precedent.
+Per D-1 step-8 megaudit pattern: dispatch all 3 lanes IN PARALLEL (not sequential) to avoid anchoring.
 
 ### Step 6 — Exit packet + handoff refresh (~0.5 day)
-Write `docs/phase5/5-3-exit-packet.md` mirroring D-1 structure. Refresh 6 surfaces (MASTER-PLAN, v1-exit-packet, entry-plan, crdt-data-model, ide-consumer-contract, MEMORY). Final commit. Verify gates.
+Write `docs/phase5/5-3-exit-packet.md` mirroring `d-1-exit-packet.md` structure. Refresh:
+- `docs/MASTER-PLAN.md` § Phase 5.2 sub-items
+- `docs/phase5/v1-exit-packet.md` (5.3 status row → ✅)
+- `docs/phase5/entry-plan.md` (5.3 table row)
+- `docs/architecture/crdt-data-model.md` (final V1 state + audit-locked limitations)
+- `docs/architecture/ide-consumer-contract.md` (5.3-introduced API: `repair_sheet_rename_chain`, `repair_table_rename_chain`, etc.)
+- `MEMORY.md` + `current_work.md` (handoff)
+
+Final commit. Verify clean checkout + 3-fold gates.
 
 ## Risk register
 
@@ -123,15 +154,29 @@ Write `docs/phase5/5-3-exit-packet.md` mirroring D-1 structure. Refresh 6 surfac
 
 ## Open questions for the user (sign-off needed)
 
-1. **Priority confirmation**: D-1 exit packet recommended 5.3 next. You said "take off from wherever is optimal." Is 5.3 the right call vs. 5.5 V2 V2/V3 production transport (larger scope, unblocks IDE) or 5.7 IDE slice (depends on 5.3 + 5.5)?
-2. **D-5.3-3 policy on concurrent renames**: "last-in-causal-order wins; rename current to new" vs. alternative ("first wins; second becomes auto-rename like D-2 AddSheet"). I've recommended the former (matches SetName); flagging in case you prefer the AddSheet-style auto-rename for consistency.
-3. **D-5.3-4 module location**: `ql-collab/src/repair.rs` vs. `ql-exec/src/repair.rs`. I picked ql-collab (CRDT concern). Flagging in case you have a different read of the layering.
-4. **Step 4 scope**: should RenameTable/RenameColumn repair be IN scope for 5.3, or deferred to a follow-up? My read: investigate in step 4, extend if cheap, defer if not. Acceptable?
+ALL CLOSED:
+1. ~~Priority confirmation (5.3 vs 5.5 V2 V2/V3 vs other)~~ → user said "Proceed with 5.3 as planned" (AskUserQuestion at session start). After 5.3 ships, the recommended sequence is **5.5 V2 V2/V3 (production transport) → 5.7 IDE slice → 5.8 Phase 5 megaudit** per D-1 exit packet priority guidance.
+2. ~~D-5.3-3 policy~~ → user said "Last-in-causal-order wins; apply to current". Shipped in step 2.
+3. ~~D-5.3-4 module location~~ → engineered's-discretion call: `ql-collab/src/repair.rs` shipped.
+4. ~~Step 4 scope~~ → shipped + audit-closure REVERTED auto-disambig (V1 limitation). Column repair pass deferred to V2.
+
+## Audit-cycle observations (steps 1-4)
+
+Each step's parallel Codex+Opus audit found at least one HIGH that the engineer's confirmation bias missed. The 6-consecutive divergent-HIGH pattern is **structurally validated**:
+
+| Step | Codex HIGHs | Opus HIGHs | Convergent | Notable |
+|---|---|---|---|---|
+| 1 | 1 (row 3 degenerate) | 1 (same) | YES | Tests were tautological — same value for both winners |
+| 2 | 1 (cross-sheet target collision still hard-fails) | 1 (same) | YES | My step-2 fix was incomplete |
+| 3 | 2 (cascade + reused-name) | 1 (same root cause) | YES | Single safety guard closed both scenarios |
+| 4 | 2 (auto-disambig + repair mismatch + column repair gap) | 2 (same) | YES | Closure REQUIRED revert; can't fix in-place without API change |
+
+In every cycle, the audit closure surfaced V1 limitations to document. Step 5 megaudit should consolidate all V1 limitations into a single section of the exit packet, and surface helper-unification + production-wiring as actionable V2 follow-ups.
 
 ## Exit criteria
 
-- All 6 step tasks marked complete.
-- Workspace tests at 4291 + N (≥ 4310 expected from probe tests + repair tests).
+- All 6 step tasks marked complete. **CURRENT: 4/6 complete (steps 1-4); steps 5-6 remain.**
+- Workspace tests at 4291 + N. **CURRENT: 4334** (+43 net across 5.3).
 - fmt + clippy clean.
 - 5.3 exit packet shipped.
 - 5+ audit cycles run (one per shipped step + megaudit).
