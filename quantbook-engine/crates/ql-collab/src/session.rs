@@ -49,9 +49,14 @@
 
 use thiserror::Error;
 
-use ql_oplog::{Op, OpLog, OpLogError, PeerId, PRESENCE_COMMIT_ORIGIN};
+use ql_functions::FunctionRegistry;
+use ql_oplog::{replay_into, Op, OpLog, OpLogError, PeerId, ReplayError, PRESENCE_COMMIT_ORIGIN};
+use ql_storage::Workbook;
 
 use crate::presence::{self, PresenceError, PresenceState};
+use crate::repair::{
+    repair_sheet_rename_chain, repair_table_rename_chain, RepairReport, TableRepairReport,
+};
 use crate::transport::{Transport, TransportError};
 
 /// **Phase 5.5 V2 V1 audit closure (2026-05-19):** default cap on
@@ -108,6 +113,35 @@ pub enum CollabSessionError {
     /// of retrying poll.
     #[error("transport error: {0}")]
     Transport(#[from] TransportError),
+
+    /// **Phase 5.3 step 5b (2026-05-20) — production wiring closure
+    /// (Opus-A Scenario E HIGH).** `sync_workbook` invoked
+    /// `replay_into` on the session's `OpLog` and replay failed at
+    /// some op index. Per the `replay_into` caller contract
+    /// (Phase 5.3 step 5 megaudit closure — see
+    /// `ql_oplog::replay_into` docs), the workbook passed by
+    /// mut-ref is now in a HALF-MERGED state and MUST be discarded
+    /// by the caller. The session's `OpLog` is unaffected (replay
+    /// reads only).
+    #[error("replay error: {0}")]
+    Replay(#[from] ReplayError),
+}
+
+/// **Phase 5.3 step 5b (2026-05-20) — production wiring closure
+/// (Opus-A Scenario E HIGH):** result of
+/// [`CollabSession::sync_workbook`]. Combines the replay op count
+/// with the two repair reports so callers can log a single
+/// diagnostic surface.
+#[derive(Debug, Clone, Default)]
+pub struct SyncReport {
+    /// Total ops applied by `replay_into`. Same as the success
+    /// value of `replay_into` itself.
+    pub ops_replayed: usize,
+    /// Sheet rename-repair pass diagnostics (formulas rewritten,
+    /// ambiguous-skipped rules).
+    pub sheet_repair: RepairReport,
+    /// Table rename-repair pass diagnostics.
+    pub table_repair: TableRepairReport,
 }
 
 /// Per-peer collaboration state holder.
@@ -273,15 +307,95 @@ impl CollabSession {
 
     /// Borrow the underlying `OpLog` for replay against a `Workbook`.
     ///
-    /// Typical usage:
+    /// **Prefer [`Self::sync_workbook`] over this raw accessor** when
+    /// rebuilding a workbook after a `merge_bytes` — `sync_workbook`
+    /// atomically pairs `replay_into` with the Phase 5.3 rename-repair
+    /// passes (audit-locked D-5.3-1 caller contract). Raw `op_log()`
+    /// is kept for snapshot inspection + tests.
+    ///
+    /// Typical usage (raw):
     /// ```ignore
     /// let session = CollabSession::from_snapshot(peer_id, &bytes)?;
     /// let mut wb = ql_storage::Workbook::new();
     /// let reg = ql_functions::default_registry();
     /// ql_oplog::replay_into(session.op_log(), &mut wb, &reg)?;
     /// ```
+    ///
+    /// Preferred usage for collaboration flows:
+    /// ```ignore
+    /// let mut session = CollabSession::from_snapshot(peer_id, &bytes)?;
+    /// session.merge_bytes(&peer_b_bytes)?;
+    /// let mut wb = ql_storage::Workbook::new();
+    /// let reg = ql_functions::default_registry();
+    /// let report = session.sync_workbook(&mut wb, &reg)?;
+    /// // log report.ops_replayed / report.sheet_repair / report.table_repair
+    /// ```
     pub fn op_log(&self) -> &OpLog {
         &self.log
+    }
+
+    /// **Phase 5.3 step 5b (2026-05-20) — production wiring closure
+    /// (Opus-A Scenario E HIGH, audit-locked D-5.3-1):**
+    /// atomically rebuild `workbook` from this session's `OpLog`,
+    /// running:
+    ///
+    ///   1. `ql_oplog::replay_into(self.op_log(), workbook, registry)`
+    ///   2. `repair_sheet_rename_chain(workbook, self.op_log())`
+    ///   3. `repair_table_rename_chain(workbook, self.op_log())`
+    ///
+    /// in that order. This is the **caller-driven repair contract**
+    /// from the Phase 5.3 step 3 audit-locked design decision D-5.3-1:
+    /// repair is NOT auto-invoked by `merge_bytes` (callers may want
+    /// manual control for batch-merge scenarios), but the production
+    /// path through `CollabSession` MUST pair replay + repair to close
+    /// the D-3 V1 limitation (concurrent-rename formulas → `#NAME?`).
+    /// Pre-step-5b no production caller wired this in — the 5.3 ship
+    /// was correct in-principle but not in-practice. This wrapper
+    /// closes that gap.
+    ///
+    /// # Error handling
+    ///
+    /// On `Err(_)`, the `workbook` may be in a partial state per the
+    /// `replay_into` caller contract (Phase 5.3 step 5 megaudit
+    /// closure on atomicity — see `ql_oplog::replay_into` docs). The
+    /// caller MUST discard the workbook on error rather than reuse
+    /// the partial state. The session's `OpLog` is unaffected.
+    ///
+    /// The function reads `self` immutably (via `self.op_log()`);
+    /// repair mutates the workbook only.
+    ///
+    /// # Empty-log fast path
+    ///
+    /// When `self.op_count() == 0` the function returns immediately
+    /// with `SyncReport::default()` (no replay, no repair work).
+    ///
+    /// # Caller pitfalls
+    ///
+    /// - The caller must pass a FRESH `Workbook` (e.g.,
+    ///   `Workbook::new()`), not a workbook from a previous replay
+    ///   against a different log — `replay_into` applies ops on top
+    ///   of whatever state the workbook holds, so reusing a stale
+    ///   workbook silently double-applies ops.
+    /// - The `registry` parameter is reserved for future replay-side
+    ///   recompute integration (today replay persists formula text
+    ///   without re-evaluating; callers drive evaluation through
+    ///   `recompute_all` after this returns).
+    pub fn sync_workbook(
+        &self,
+        workbook: &mut Workbook,
+        registry: &FunctionRegistry,
+    ) -> Result<SyncReport, CollabSessionError> {
+        if self.log.is_empty() {
+            return Ok(SyncReport::default());
+        }
+        let ops_replayed = replay_into(&self.log, workbook, registry)?;
+        let sheet_repair = repair_sheet_rename_chain(workbook, &self.log)?;
+        let table_repair = repair_table_rename_chain(workbook, &self.log)?;
+        Ok(SyncReport {
+            ops_replayed,
+            sheet_repair,
+            table_repair,
+        })
     }
 
     /// Current number of ops in the log. Cheap (cached).
