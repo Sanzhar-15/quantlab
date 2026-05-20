@@ -40,6 +40,12 @@ tempfile  = { workspace = true }
 # Phase 2B.3: BPC-04 test wires bind-plan-cache stats into Timings to prove
 # the visibility contract.
 ql-profile = { path = "../ql-profile" }
+# Phase 5.3 step 3 (2026-05-20) — row 7 of the conflict-matrix probe
+# test (`phase_5_3_conflict_matrix_probe.rs`) asserts the post-repair
+# state of formulas authored against concurrently-renamed sheet names.
+# Direction: dev-only; ql-collab → ql-exec has no Cargo cycle since
+# ql-collab does not depend on ql-exec (they are siblings).
+ql-collab  = { path = "../ql-collab" }
 
 # Phase 0 OG-02 hot path bench (Week 4 acceptance run).
 [[bench]]

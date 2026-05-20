@@ -84,6 +84,12 @@
 //!   already using `ql_collab::PeerId` (the re-export).
 
 pub mod presence;
+// Phase 5.3 step 3 (2026-05-20) — rename-repair pass. Caller-driven
+// post-merge cleanup that rewrites formula text referencing pre-rename
+// sheet names. See `repair.rs` module docs + `docs/architecture/crdt-data-model.md`
+// § "Conflict resolution semantics" rows for the RenameSheet × concurrent
+// edit closure that this module ships.
+pub mod repair;
 pub mod session;
 pub mod transport;
 pub mod undo;
@@ -95,6 +101,7 @@ pub mod undo;
 pub use ql_oplog::PeerId;
 
 pub use presence::{PresenceError, PresenceState};
+pub use repair::{repair_sheet_rename_chain, RepairReport, SheetRewriteSummary};
 pub use session::{CollabSession, CollabSessionError, UndoGroupGuard};
 pub use transport::{LoopbackTransport, NoopTransport, Transport, TransportError};
 pub use undo::UndoManager;

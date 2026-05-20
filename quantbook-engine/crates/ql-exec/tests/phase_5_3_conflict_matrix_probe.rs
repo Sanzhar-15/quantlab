@@ -497,37 +497,26 @@ fn row6_addsheet_same_name_auto_renames_via_d2() {
     );
 }
 
-// ===== Row 7: RenameSheet × concurrent edit on sheet (PRE-FIX) =====
+// ===== Row 7: RenameSheet × concurrent edit on sheet (POST-STEP-3) =====
 
-/// **Conflict-matrix row 7 (PRE-FIX behavior):** peer A renames
-/// sheet "S" to "S2"; peer B concurrently writes a formula at A1
-/// referencing "S!A1" (the old name). Per D-3 V1 limitation
-/// (`crdt-data-model.md:615-648`), the merged log replays such
-/// that peer B's formula references "S" which no longer exists
-/// → `BindError::UnknownSheet` → `Value::Error(ErrorValue::Name)`.
+/// **Conflict-matrix row 7 (Phase 5.3 step 3 — REPAIR PASS APPLIED):**
+/// peer A renames sheet "S" to "S2"; peer B concurrently writes a
+/// formula at A2 referencing "S!A1" (the old name). After merge +
+/// `ql_collab::repair_sheet_rename_chain` + recompute, the formula's
+/// text is REWRITTEN to "S2!A1" and the cell resolves to 42.0 (the
+/// literal at S2!A1, originally at S!A1 before rename).
 ///
-/// **This test will be MODIFIED by Phase 5.3 step 3** when the
-/// rename-repair pass ships. Post-step-3, the formula's text
-/// will be REWRITTEN to "S2!A1" by the repair pass, and the
-/// expected value flips from `#NAME?` to whatever S2!A1 holds.
+/// **Pre-step-3 behavior** (kept here as historical context):
+/// without the repair pass, the formula bind-failed at recompute →
+/// `Value::Error(ErrorValue::Name)` per the D-3 V1 limitation. Step
+/// 3's rename-repair pass closes that limitation.
 ///
-/// **Audit closure (Codex MEDIUM-1 + Opus MEDIUM-1):** pinning
-/// the pre-fix behavior closes the matrix-doc/test-doc alignment
-/// gap. Step 3 modifying this test is the OBSERVABLE step-3 win.
-///
-/// **Audit closure (Codex deferred-from-survey)**: replay's
-/// `RenameSheet` handler currently HARD-FAILS on concurrent
-/// `RenameSheet × RenameSheet` (case 3 at `replay.rs:524-531`).
-/// This test exercises the safer scenario `RenameSheet × PutFormula`
-/// which doesn't trip the hard-fail; the harder case is pinned in
-/// step 2's tests.
-///
-/// We must use a base log with at least one cell at S!A1 (so peer B's
-/// formula has something to reference), and place peer B's formula
-/// at A2 of the same sheet so the reference is observable.
+/// **Test is intentionally bidirectional via `fork_apply_merge_both_directions`**
+/// — both peers, after merge + repair, must converge to the same
+/// formula text + resolved value.
 #[test]
-fn row7_rename_sheet_concurrent_edit_yields_name_error_pre_step_3_fix() {
-    // Base: sheet S with a literal at S!A1.
+fn row7_rename_sheet_concurrent_edit_resolves_via_repair_pass() {
+    // Base: sheet S with a literal at S!A1 = 42.0.
     let mut base_log = base_with_sheet();
     base_log
         .append(Op::PutValue {
@@ -539,35 +528,100 @@ fn row7_rename_sheet_concurrent_edit_yields_name_error_pre_step_3_fix() {
         .unwrap();
     let base = base_log.export_bytes().unwrap();
 
-    let (wb_a, wb_b) = fork_apply_merge_both_directions(
-        &base,
-        Op::RenameSheet {
+    // Use the bidirectional helper to fork the two peers + apply
+    // their concurrent ops + cross-merge — but we have to interpose
+    // the repair pass between replay and recompute. The fork helper
+    // doesn't know about repair (it's a step-2-and-earlier helper),
+    // so we duplicate its logic inline here for the step 3 case.
+    let mut peer_a = OpLog::import_bytes(&base).unwrap();
+    peer_a.set_peer_id(1).unwrap();
+    peer_a
+        .append(Op::RenameSheet {
             id: 0,
             old_name: "S".to_owned(),
             new_name: "S2".to_owned(),
-        },
-        Op::PutFormula {
+        })
+        .unwrap();
+    let mut peer_b_for_a = OpLog::import_bytes(&base).unwrap();
+    peer_b_for_a.set_peer_id(2).unwrap();
+    peer_b_for_a
+        .append(Op::PutFormula {
             sheet: 0,
             row: 1,
             col: 0,
             text: "S!A1".to_owned(),
-        },
-    );
+        })
+        .unwrap();
+    peer_a
+        .merge_bytes(&peer_b_for_a.export_bytes().unwrap())
+        .unwrap();
+
+    // Symmetric peer B view.
+    let mut peer_b = OpLog::import_bytes(&base).unwrap();
+    peer_b.set_peer_id(2).unwrap();
+    peer_b
+        .append(Op::PutFormula {
+            sheet: 0,
+            row: 1,
+            col: 0,
+            text: "S!A1".to_owned(),
+        })
+        .unwrap();
+    let mut peer_a_for_b = OpLog::import_bytes(&base).unwrap();
+    peer_a_for_b.set_peer_id(1).unwrap();
+    peer_a_for_b
+        .append(Op::RenameSheet {
+            id: 0,
+            old_name: "S".to_owned(),
+            new_name: "S2".to_owned(),
+        })
+        .unwrap();
+    peer_b
+        .merge_bytes(&peer_a_for_b.export_bytes().unwrap())
+        .unwrap();
+
+    // Replay + REPAIR PASS (Phase 5.3 step 3 work) + recompute.
+    let replay_repair_recompute = |log: &OpLog| -> Workbook {
+        let mut wb = Workbook::new();
+        let reg = default_registry();
+        replay_into(log, &mut wb, &reg).expect("replay must succeed");
+        // **Step 3 closure point**: the repair pass rewrites concurrent
+        // formula text referencing pre-rename sheet names. Without
+        // this call, recompute would surface #NAME? (D-3 V1 limitation).
+        let report = ql_collab::repair_sheet_rename_chain(&mut wb, log)
+            .expect("repair_sheet_rename_chain must succeed");
+        assert_eq!(
+            report.formulas_rewritten, 1,
+            "exactly 1 formula (peer B's =S!A1) must be rewritten"
+        );
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.recompute_all();
+        }
+        wb
+    };
+
+    let wb_a = replay_repair_recompute(&peer_a);
+    let wb_b = replay_repair_recompute(&peer_b);
 
     let a2_a = wb_a.read(Address::new(0, 1, 0));
     let a2_b = wb_b.read(Address::new(0, 1, 0));
 
-    assert_eq!(a2_a, a2_b, "convergence on S2!A2");
-    // **PRE-FIX assertion**: bind fails → #NAME?. After Phase 5.3
-    // step 3 ships the rename-repair pass, this should resolve to
-    // Number(42.0) — the repair pass rewrites "S!A1" → "S2!A1" and
-    // bind succeeds. Step 3 will modify the assertion.
+    assert_eq!(a2_a, a2_b, "convergence on S2!A2 across merge directions");
+    // **POST-STEP-3 assertion**: repair rewrote `S!A1` → `S2!A1`; the
+    // cell at S2!A1 is the literal 42.0 from the base log.
     assert_eq!(
         a2_a,
-        Value::Error(ErrorValue::Name),
-        "PRE-FIX (D-3 V1 limitation): formula references old sheet name → \
-         BindError::UnknownSheet → #NAME?; got {a2_a:?}. \
-         Phase 5.3 step 3 will fix this via rename-repair."
+        Value::Number(42.0),
+        "post-repair: formula resolves correctly via rewritten text (S!A1 → S2!A1); \
+         got {a2_a:?}. Without the repair pass, this would be #NAME? (D-3 V1 limitation)."
+    );
+
+    // Pin the formula text directly to confirm the repair did its job.
+    assert_eq!(
+        wb_a.formula_at(0, 1, 0).map(|s| s.to_string()),
+        Some("S2!A1".to_string()),
+        "formula text post-repair must reference current sheet name (S2)"
     );
 }
 

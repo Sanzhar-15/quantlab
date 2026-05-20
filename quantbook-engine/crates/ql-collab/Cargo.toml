@@ -27,3 +27,13 @@ serde_json   = { workspace = true }
 # Phase 5.4 V1 (2026-05-19) — direct dep on `loro::UndoManager`
 # wrapped by `CollabSession` for peer-local undo/redo.
 loro         = { workspace = true }
+# Phase 5.3 step 3 (2026-05-20) — rename-repair pass uses
+# `ql_formula_syntax::{lex, parse, print, rewrite_sheet_name_in_expr}`
+# to rewrite formula text post-merge when peers concurrently rename
+# sheets. Same machinery the producer-side rename in ql-exec uses;
+# see `crates/ql-collab/src/repair.rs`.
+ql-formula-syntax = { path = "../ql-formula-syntax" }
+# ql-types provides Address/SheetId/RowId/ColId — already a transitive
+# dep via ql-storage but pulled in explicitly for the repair module's
+# return-type construction.
+ql-types     = { path = "../ql-types" }
