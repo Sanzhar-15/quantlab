@@ -137,13 +137,18 @@
 //!   print round-trip.
 //!
 //! - **Table + column renames** (Step 4 ✅ shipped 2026-05-20 for
-//!   tables; column repair pass deferred to V2):
+//!   tables; Step 5c ✅ shipped 2026-05-20 for columns —
+//!   step 5 megaudit Opus-A V1 LIM #3 closure):
 //!   `Op::RenameTable` → [`repair_table_rename_chain`] (this module).
-//!   `Op::RenameColumn` repair pass is V2 (Step 5 megaudit Opus-A V1
-//!   LIM #3 + Opus-B MEDIUM-5; tracked in PHASE-4-V2-BACKLOG.md
-//!   Tier H). Until V2, concurrent column renames produce `#NAME?` /
-//!   `#REF?` for concurrent formula edits referencing the old column
-//!   name.
+//!   `Op::RenameColumn` → [`repair_column_rename_chain`] (this module).
+//!   Both use the same chain-based algorithm + safety guard pattern
+//!   as the sheet repair. The column variant is additionally scoped
+//!   per table (rules keyed by `(table_canonical, col_canonical)`).
+//!   The canonical repair sequence at
+//!   [`crate::CollabSession::rebuild_workbook`] runs:
+//!     `replay_into → sheet repair → table repair → column repair`.
+//!   Order matters: column repair runs LAST because column rules need
+//!   the post-table-repair canonical name to bind correctly.
 
 use ql_oplog::{Op, OpLog, OpLogError};
 use ql_storage::Workbook;
@@ -651,4 +656,293 @@ pub struct TableRewriteSummary {
 pub struct TableAmbiguousSkip {
     pub origin_table_current_canonical: String,
     pub historic_canonical: String,
+}
+
+/// **Phase 5.3 step 5c (2026-05-20) — column-rename analog of
+/// [`repair_sheet_rename_chain`] + [`repair_table_rename_chain`].**
+/// Closes Phase 5.3 step 5 megaudit Opus-A V1 LIM #3 HIGH (the column
+/// repair pass was the largest single V1 limitation post step 4).
+///
+/// After a CRDT merge with concurrent column renames, formulas using
+/// `T[col]` structured references may reference column names that no
+/// longer exist in their table. This pass rewrites the formula text
+/// to reference the current column name.
+///
+/// Algorithm mirrors the table version, with one important
+/// modification: rules are keyed by `(table_canonical, col_canonical)`
+/// pair, because columns are scoped per table. A column rename
+/// affects only formula refs of the form `T[col]` for that specific
+/// table — refs to OTHER tables' columns of the same name are
+/// untouched.
+///
+/// The chain walker uses the table canonical AS RECORDED in each
+/// `Op::RenameColumn` op. If the table itself was renamed
+/// concurrently and the column rename's table is no longer current,
+/// the rule is silently dropped (V1 limitation — same pattern as the
+/// concurrent-rename intermediate-names case for sheets / tables; see
+/// module docs § Known limitations). Production-side renames always
+/// emit the column op AFTER the table rename in the same chain, so
+/// this affects only adversarial cross-peer interleavings.
+///
+/// **Order matters when chained with the other repair passes:**
+/// the canonical sequence is `replay_into` → `repair_sheet_rename_chain`
+/// → `repair_table_rename_chain` → `repair_column_rename_chain` →
+/// `recompute_all`. [`crate::CollabSession::rebuild_workbook`] runs
+/// these in order; manual callers should mirror.
+///
+/// Returns [`ColumnRepairReport`] for diagnostics (formulas rewritten,
+/// ambiguous-skipped rules, per-column summaries). Caller-driven per
+/// audit-locked D-5.3-1.
+///
+/// # Safety guard (matches sheet + table closure)
+///
+/// Skip rules where `(table_canonical, old_col_canonical)` is
+/// CURRENTLY held by some column in the same table. Without this
+/// guard, the cascade-corruption HIGH from step 3 audit + the
+/// reused-name corruption HIGH would recur for columns.
+pub fn repair_column_rename_chain(
+    workbook: &mut Workbook,
+    log: &OpLog,
+) -> Result<ColumnRepairReport, OpLogError> {
+    // ===== Phase 1: walk op log; for each Op::RenameColumn, record
+    // (table_canonical, old_col_canonical) → eventual new_col_canonical.
+    //
+    // historic_by_current_per_table[(table_canonical_UPPER, new_col_canonical_LOWER)] =
+    //   Vec<historic_col_canonicals_LOWER>
+    let mut historic_by_current: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for op_result in log.iter() {
+        let op = op_result?;
+        collect_column_renames(&op, &mut historic_by_current);
+    }
+
+    // ===== Phase 2: snapshot per-table current column canonicals.
+    // Iterate workbook tables; for each, collect its current set of
+    // column canonicals + display names.
+    //
+    // current_columns_per_table[table_canonical] = HashMap<col_canonical, display_arc>
+    let mut current_columns_per_table: HashMap<String, HashMap<String, Arc<str>>> = HashMap::new();
+    for (table_canonical_arc, meta) in workbook.tables().iter() {
+        let table_canonical: String = table_canonical_arc.to_string();
+        let mut cols = HashMap::new();
+        for col in meta.columns.iter() {
+            cols.insert(col.name.to_string(), Arc::clone(&col.display));
+        }
+        current_columns_per_table.insert(table_canonical, cols);
+    }
+
+    // ===== Phase 3: build rules + ambiguous-skip records.
+    //
+    // For each (table_canonical, current_col_canonical) → historic
+    // canonicals: look up the current column's display in the snapshot.
+    // For each historic that doesn't match current AND isn't held by
+    // another column in the same table, add a rule:
+    //   (table_canonical_UPPER, historic_col_canonical_LOWER, current_col_display_arc).
+    //
+    // Sort iteration for deterministic order (matches table + sheet
+    // closure pattern from step 3 audit).
+    let mut rules: Vec<(String, String, Arc<str>)> = Vec::new();
+    let mut column_rewrites: Vec<ColumnRewriteSummary> = Vec::new();
+    let mut ambiguous_rules_skipped: Vec<ColumnAmbiguousSkip> = Vec::new();
+    let mut keys: Vec<&(String, String)> = historic_by_current.keys().collect();
+    keys.sort();
+    for &(ref table_canonical, ref current_col_canonical) in &keys {
+        // Skip if table isn't in current workbook (concurrent table drop
+        // or rename — V1 limitation, same pattern as table-rename intermediate-names).
+        let Some(cols_in_table) = current_columns_per_table.get(table_canonical) else {
+            continue;
+        };
+        // Skip if the column itself isn't in current workbook (column
+        // was dropped or further renamed beyond what the chain captures).
+        let Some(current_col_display) = cols_in_table.get(current_col_canonical) else {
+            continue;
+        };
+        let current_col_display_arc = Arc::clone(current_col_display);
+
+        // Dedupe historic canonicals; drop ones matching current (no-op renames).
+        let historic = historic_by_current
+            .get(&(table_canonical.clone(), current_col_canonical.clone()))
+            .cloned()
+            .unwrap_or_default();
+        let mut historic_canonicals: Vec<String> = historic
+            .into_iter()
+            .filter(|c| c != current_col_canonical)
+            .collect();
+        historic_canonicals.sort();
+        historic_canonicals.dedup();
+
+        for hc in &historic_canonicals {
+            // Safety guard: if `hc` is currently held by ANY column in
+            // the same table, skip the rule + record. Without this,
+            // applying T[hc] → T[current_col_display] would corrupt a
+            // legitimate reference to the column that currently holds
+            // `hc`.
+            if let Some(holder_display) = cols_in_table.get(hc) {
+                ambiguous_rules_skipped.push(ColumnAmbiguousSkip {
+                    table_canonical: table_canonical.clone(),
+                    historic_canonical: hc.clone(),
+                    current_holder_col_canonical: hc.clone(),
+                    current_holder_col_display: holder_display.to_string(),
+                });
+                continue;
+            }
+            rules.push((
+                table_canonical.clone(),
+                hc.clone(),
+                Arc::clone(&current_col_display_arc),
+            ));
+        }
+
+        column_rewrites.push(ColumnRewriteSummary {
+            table_canonical: table_canonical.clone(),
+            current_col_canonical: current_col_canonical.clone(),
+            current_col_display_name: current_col_display_arc.to_string(),
+            historic_canonicals,
+        });
+    }
+
+    // ===== Phase 4: fast-path no-op when no rules survive.
+    if rules.is_empty() {
+        return Ok(ColumnRepairReport {
+            formulas_rewritten: 0,
+            column_rewrites,
+            ambiguous_rules_skipped,
+        });
+    }
+
+    // ===== Phase 5: walk formulas, collect updates.
+    let mut to_update: Vec<(SheetId, u32, u32, String)> = Vec::new();
+    for (sheet, row, col, text) in workbook.iter_formulas() {
+        let mut current_text = text.to_string();
+        let mut changed = false;
+        for (table_canonical, old_col_canonical, new_col_display) in &rules {
+            if let Some(rewritten) = rewrite_formula_with_column_rename(
+                &current_text,
+                table_canonical,
+                old_col_canonical,
+                new_col_display,
+            ) {
+                current_text = rewritten;
+                changed = true;
+            }
+        }
+        if changed {
+            to_update.push((sheet, row, col, current_text));
+        }
+    }
+    let rewrite_count = to_update.len();
+
+    // ===== Phase 6: apply updates.
+    for (sheet, row, col, new_text) in to_update {
+        workbook.put_formula(sheet, row, col, new_text);
+    }
+
+    Ok(ColumnRepairReport {
+        formulas_rewritten: rewrite_count,
+        column_rewrites,
+        ambiguous_rules_skipped,
+    })
+}
+
+/// Walk an `Op` (including BatchCommit-nested) and accumulate column
+/// rename chains keyed by `(table_canonical_UPPER, new_col_canonical_LOWER)`.
+/// Mirrors [`collect_table_renames`].
+fn collect_column_renames(
+    op: &Op,
+    historic_by_current: &mut HashMap<(String, String), Vec<String>>,
+) {
+    match op {
+        Op::RenameColumn {
+            table,
+            old_name,
+            new_name,
+        } => {
+            let table_canonical = table.to_ascii_uppercase();
+            let old_c = old_name.to_ascii_lowercase();
+            let new_c = new_name.to_ascii_lowercase();
+            historic_by_current
+                .entry((table_canonical.clone(), new_c.clone()))
+                .or_default()
+                .push(old_c.clone());
+            // Propagate prior: if (table, old_c) had historic entries,
+            // move them under (table, new_c).
+            if let Some(prior) = historic_by_current.remove(&(table_canonical.clone(), old_c)) {
+                for p in prior {
+                    historic_by_current
+                        .entry((table_canonical.clone(), new_c.clone()))
+                        .or_default()
+                        .push(p);
+                }
+            }
+        }
+        Op::BatchCommit { ops } => {
+            for inner in ops {
+                collect_column_renames(inner, historic_by_current);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Column-rename analog of [`rewrite_formula_with_rename`] +
+/// [`rewrite_formula_with_table_rename`]. Routes through
+/// `ql_formula_syntax::rewrite_column_ref`.
+fn rewrite_formula_with_column_rename(
+    text: &str,
+    table_canonical_upper: &str,
+    old_col_canonical: &str,
+    new_col_display: &Arc<str>,
+) -> Option<String> {
+    let stripped = text.strip_prefix('=').unwrap_or(text);
+    let tokens = ql_formula_syntax::lex(stripped).ok()?;
+    let expr = ql_formula_syntax::parse(tokens).ok()?;
+    let rewritten = ql_formula_syntax::rewrite_column_ref(
+        &expr,
+        table_canonical_upper,
+        old_col_canonical,
+        new_col_display,
+    );
+    if rewritten == expr {
+        return None;
+    }
+    let printed = ql_formula_syntax::print(&rewritten);
+    let with_eq = if text.starts_with('=') {
+        format!("={printed}")
+    } else {
+        printed
+    };
+    Some(with_eq)
+}
+
+/// Report for [`repair_column_rename_chain`].
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct ColumnRepairReport {
+    pub formulas_rewritten: usize,
+    pub column_rewrites: Vec<ColumnRewriteSummary>,
+    pub ambiguous_rules_skipped: Vec<ColumnAmbiguousSkip>,
+}
+
+/// Per-column summary line in [`ColumnRepairReport`].
+#[derive(Debug, Clone)]
+pub struct ColumnRewriteSummary {
+    /// Table canonical (uppercase) the column belongs to.
+    pub table_canonical: String,
+    /// Current column canonical (lowercase) post-replay.
+    pub current_col_canonical: String,
+    /// Current column display name post-replay.
+    pub current_col_display_name: String,
+    /// Historic column canonicals from this column's chain.
+    pub historic_canonicals: Vec<String>,
+}
+
+/// Skipped column rule due to current-holder ambiguity (some other
+/// column in the same table currently holds the historic canonical).
+#[derive(Debug, Clone)]
+pub struct ColumnAmbiguousSkip {
+    pub table_canonical: String,
+    pub historic_canonical: String,
+    /// Current canonical of the column that holds `historic_canonical`.
+    pub current_holder_col_canonical: String,
+    /// Display name of the current holder.
+    pub current_holder_col_display: String,
 }

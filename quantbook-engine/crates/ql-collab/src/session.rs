@@ -55,7 +55,8 @@ use ql_storage::Workbook;
 
 use crate::presence::{self, PresenceError, PresenceState};
 use crate::repair::{
-    repair_sheet_rename_chain, repair_table_rename_chain, RepairReport, TableRepairReport,
+    repair_column_rename_chain, repair_sheet_rename_chain, repair_table_rename_chain,
+    ColumnRepairReport, RepairReport, TableRepairReport,
 };
 use crate::transport::{Transport, TransportError};
 
@@ -151,21 +152,26 @@ pub struct SyncReport {
     pub sheet_repair: RepairReport,
     /// Table rename-repair pass diagnostics.
     pub table_repair: TableRepairReport,
+    /// Column rename-repair pass diagnostics (Phase 5.3 step 5c —
+    /// closes Opus-A megaudit V1 LIM #3 HIGH).
+    pub column_repair: ColumnRepairReport,
 }
 
-/// Phase 5.3 step 5b audit closure (Opus MEDIUM-2): one-line
-/// `Display` impl for log-line diagnostic use. Format:
-/// `"sync: ops=N sheet_rewrites=N(skip=N) table_rewrites=N(skip=N)"`.
+/// Phase 5.3 step 5b audit closure (Opus MEDIUM-2) + step 5c update:
+/// one-line `Display` impl for log-line diagnostic use. Format:
+/// `"sync: ops=N sheet_rewrites=N(skip=N) table_rewrites=N(skip=N) column_rewrites=N(skip=N)"`.
 impl std::fmt::Display for SyncReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "sync: ops={} sheet_rewrites={}(skip={}) table_rewrites={}(skip={})",
+            "sync: ops={} sheet_rewrites={}(skip={}) table_rewrites={}(skip={}) column_rewrites={}(skip={})",
             self.ops_replayed,
             self.sheet_repair.formulas_rewritten,
             self.sheet_repair.ambiguous_rules_skipped.len(),
             self.table_repair.formulas_rewritten,
             self.table_repair.ambiguous_rules_skipped.len(),
+            self.column_repair.formulas_rewritten,
+            self.column_repair.ambiguous_rules_skipped.len(),
         )
     }
 }
@@ -367,17 +373,26 @@ impl CollabSession {
         &self.log
     }
 
-    /// **Phase 5.3 step 5b + 5b audit closure (2026-05-20) — production
-    /// wiring closure (Opus-A Scenario E HIGH, audit-locked D-5.3-1):**
-    /// atomically rebuild a FRESH `Workbook` from this session's
-    /// `OpLog`, running:
+    /// **Phase 5.3 step 5b + 5b audit closure + step 5c (2026-05-20) —
+    /// production wiring closure (Opus-A Scenario E HIGH + V1 LIM #3,
+    /// audit-locked D-5.3-1):** atomically rebuild a FRESH `Workbook`
+    /// from this session's `OpLog`, running:
     ///
     ///   1. `let mut wb = Workbook::new();`
     ///   2. `ql_oplog::replay_into(self.op_log(), &mut wb, registry)`
     ///   3. `repair_sheet_rename_chain(&mut wb, self.op_log())`
     ///   4. `repair_table_rename_chain(&mut wb, self.op_log())`
+    ///   5. `repair_column_rename_chain(&mut wb, self.op_log())`
     ///
-    /// in that order. Returns `(wb, SyncReport)` — the caller owns the
+    /// in that order. **Order matters**: sheet repair must run before
+    /// table repair (sheet renames can affect table refs via
+    /// fully-qualified `Sheet!Table[col]` paths, but currently the
+    /// formula language doesn't support this — order is preserved for
+    /// V2 future-proofing). Table repair must run before column repair
+    /// because column rules are keyed by `(table_canonical, ...)` and
+    /// would fail to match if the table is still under its historic
+    /// name post-replay (V1 limitation acknowledged in
+    /// `repair_column_rename_chain` docs). Returns `(wb, SyncReport)` — the caller owns the
     /// returned workbook and is responsible for downstream evaluation
     /// (`WorkbookRuntime::recompute_all`).
     ///
@@ -450,12 +465,14 @@ impl CollabSession {
         let ops_replayed = replay_into(&self.log, &mut workbook, registry)?;
         let sheet_repair = repair_sheet_rename_chain(&mut workbook, &self.log)?;
         let table_repair = repair_table_rename_chain(&mut workbook, &self.log)?;
+        let column_repair = repair_column_rename_chain(&mut workbook, &self.log)?;
         Ok((
             workbook,
             SyncReport {
                 ops_replayed,
                 sheet_repair,
                 table_repair,
+                column_repair,
             },
         ))
     }
