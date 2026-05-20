@@ -132,7 +132,7 @@ pub fn rebuild_workbook(&self, registry: &FunctionRegistry)
 
 ## V1 limitations (audit-locked, tracked in `PHASE-4-V2-BACKLOG.md` Tier H)
 
-These were surfaced by the step 5 megaudit + per-step audits, deemed legitimate V1 trade-offs, and deferred to V2:
+These were surfaced by the step 5 megaudit + per-step audits, deemed legitimate V1 trade-offs, and deferred to V2 (except items marked ✅ — closed post-5.3 as pre-IDE-binding cleanup):
 
 1. **Cross-source target collision hard-fails (tables, columns)** — peer A `T1→X` + peer B `T2→X` errors `TableCreateRejected`. Step 4 audit revert closed an unsound auto-disambig path; V2 closure requires API change (synthesized correction op at replay).
 2. **Concurrent table-rename × column-rename** loses column-rename intent — `apply_rename_column` advisory-skips when its wire table is missing (step 5c HIGH-1 closure). V2 closure: causality-aware tracking via Loro op-ids.
@@ -142,10 +142,10 @@ These were surfaced by the step 5 megaudit + per-step audits, deemed legitimate 
 6. **Cross-sheet historic-name ambiguity** when neither historic is currently held — substitution-order consumption picks winner (step 5 megaudit Opus-A finding). Rare; V2 closure unclear.
 7. **`replay_into` non-atomic on Err** — half-merged workbook state. Caller MUST discard (docstring contract; step 5 megaudit Opus-A HIGH; `rebuild_workbook` wraps so callers don't see partial state).
 8. **Mismatched workbook ↔ log silent corruption** — `repair_sheet_rename_chain` trusts post-replay workbook. `rebuild_workbook` eliminates this for production callers (no longer takes workbook by mut-ref). Raw callers' problem (step 5b Opus HIGH-latent).
-9. **Helper duplication** — 6 call sites of `ql_formula_syntax::{lex, parse, print, rewrite_*}` across ql-collab + ql-exec. V2: promote helper to `ql-formula-syntax` (single `rewrite_formula_text(text, NameRewrite)` signature).
+9. ~~**Helper duplication**~~ — ✅ CLOSED 2026-05-20 in post-5.3 V2 Tier H1 commit `8085f42bf5b`. Promoted to single public `ql_formula_syntax::rewrite_formula_text(text, NameRewrite)` helper; 6 call sites consolidated.
 10. **Production wiring missing for IDE** — `rebuild_workbook` ships as the API entry point; Phase 5.7 IDE binding will actually call it (step 5b Opus HIGH-1 framing closure).
 11. **Whitespace canonicalization side effect** — repair-touched formulas get `parse → print`-normalized whitespace + operator spacing + function-name case (step 5 megaudit Opus-A Scenario F). V2: surgical diff-only rewrite.
-12. **API naming asymmetry** — `RepairReport` vs `TableRepairReport` vs `ColumnRepairReport`; `AmbiguousSkip` vs prefixed variants. Step 5b LOW-3 deferred; step 5c re-flagged. **Last chance before IDE binding consumes the API in 5.7 — recommend rename in step 7 prep.**
+12. ~~**API naming asymmetry**~~ — ✅ CLOSED 2026-05-20 in post-5.3 V2 Tier H8 commit `7eded6214dd`. Renamed `RepairReport` → `SheetRepairReport` + `AmbiguousSkip` → `SheetAmbiguousSkip` for symmetry with table/column variants. Pre-IDE-binding so non-breaking.
 13. **`lookup_column` docstring** said "uppercases" but code lowercases — step 4 Opus L-3 fixed in step 5a.
 
 ## Cross-references
@@ -172,4 +172,4 @@ Phase 5 still has 3 sub-items post-5.3. **Recommended priority order** (unchange
 
 **Recommended trade-off framing:** Phase 5.3 closes the most user-visible correctness gap (concurrent rename + merge across all three rename surfaces) in-principle. Phase 5.7 closes the gap in-practice (real users hitting the IDE). 5.5 unblocks 5.7. 5.8 is the final megaudit before Phase 5 graduation.
 
-The 3 remaining items are independent (in priority); the natural sequence is 5.5 → 5.7 → 5.8. Pre-5.7 prep: consider renaming `RepairReport` → `SheetRepairReport` + `AmbiguousSkip` → `SheetAmbiguousSkip` for API symmetry (V1 LIM #12 — step 5b + 5c LOW deferred; last chance before IDE consumes the API).
+The 3 remaining items are independent (in priority); the natural sequence is 5.5 → 5.7 → 5.8. **Pre-5.7 prep already done post-5.3** (commits `7eded6214dd` + `8085f42bf5b`): V2 Tier H8 (API naming symmetry — `RepairReport` → `SheetRepairReport`) + V2 Tier H1 (helper unification — 6 sites → 1 `rewrite_formula_text` helper). Both were "last chance before IDE binding consumes the API"; closed before they could ossify.
