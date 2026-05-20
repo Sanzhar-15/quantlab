@@ -20,8 +20,33 @@
 //! ## Sidecar filename
 //!
 //! `oplog.bin` — binary `Loro::ExportMode::Snapshot` blob (per
-//! [`OpLog::export_bytes`]). Versioning is handled inside the Loro snapshot
-//! format; this layer is content-agnostic.
+//! [`OpLog::export_bytes`]).
+//!
+//! ## Phase 5.2 D-1 step 7 — Tier D3 magic-bytes header (2026-05-20)
+//!
+//! `oplog.bin` files written post-Tier-D3 are prefixed with an 8-byte
+//! Quantlab header:
+//!
+//! ```text
+//! offset 0..4  : OPLOG_MAGIC = b"QLOL" (Quantlab OpLog)
+//! offset 4..8  : OPLOG_SCHEMA_VERSION as big-endian u32
+//! offset 8..   : Loro snapshot bytes (unchanged)
+//! ```
+//!
+//! Header purposes:
+//! - **Format identification:** unambiguously distinguishes Quantlab
+//!   `oplog.bin` files from arbitrary binary blobs. Loro snapshots have
+//!   their own internal magic, but it's not Quantlab-namespaced.
+//! - **Forward-compat versioning:** a future v2 reader can detect a v2
+//!   `oplog.bin` and apply a migration if the Op JSON shape changes
+//!   again. Today the version sits at v1; ops are FormatIdWire-shaped
+//!   (post-step-4).
+//!
+//! **Legacy load path:** pre-Tier-D3 `oplog.bin` files (no MAGIC prefix)
+//! are detected by the absence of the magic and loaded as raw Loro
+//! snapshots (the pre-step-7 format). This is an explicit format-branch,
+//! not a fallback — both paths surface their own errors loudly. Test
+//! `legacy_pre_tier_d3_raw_loro_snapshot_still_loads` pins the contract.
 //!
 //! ## Documented behavior
 //!
@@ -50,6 +75,32 @@ use ql_oplog::{OpLog, OpLogError};
 /// Filename used for the op-log sidecar inside a `.qbook/` directory.
 pub const OPLOG_FILENAME: &str = "oplog.bin";
 
+/// **Phase 5.2 D-1 step 7 (2026-05-20):** 4-byte magic prefix on
+/// post-Tier-D3 `oplog.bin` files. ASCII `"QLOL"` (Quantlab OpLog).
+/// Format-identifies the file as Quantlab-owned + version-prefixes the
+/// Loro snapshot bytes that follow.
+///
+/// Files lacking this prefix are pre-Tier-D3 raw Loro snapshots —
+/// detected by the load path and routed through the legacy decode
+/// (explicit format branch; not a silent fallback).
+pub const OPLOG_MAGIC: [u8; 4] = *b"QLOL";
+
+/// **Phase 5.2 D-1 step 7 (2026-05-20):** schema version of the
+/// post-Tier-D3 `oplog.bin` wrapper. Serialized as big-endian u32 at
+/// offset 4..8 right after [`OPLOG_MAGIC`].
+///
+/// - `1` (current): Quantlab op-log header v1. Loro snapshot body
+///   contains FormatIdWire-shaped `Op::RegisterFormat` + `Op::SetCellFormat`
+///   payloads (post-D-1-step-4 wire shape).
+///
+/// Bumping this version on a future incompatible op shape gives the
+/// loader an explicit migration trigger (today the migration story is
+/// "raw Loro decode either succeeds or surfaces an OpLogError").
+pub const OPLOG_SCHEMA_VERSION: u32 = 1;
+
+/// Total header length: 4 bytes magic + 4 bytes BE u32 version.
+const OPLOG_HEADER_LEN: usize = OPLOG_MAGIC.len() + std::mem::size_of::<u32>();
+
 /// Combined error type for the persistence functions in this module. Wraps
 /// both [`QbookError`] (from the underlying workbook persistence) and
 /// [`OpLogError`] (from Loro snapshot encode/decode).
@@ -63,6 +114,21 @@ pub enum PersistenceError {
     /// Op-log encode/decode error (Loro internal, serde_json, etc.).
     #[error("op log error: {0}")]
     OpLog(#[from] OpLogError),
+
+    /// **Phase 5.2 D-1 step 7 (2026-05-20):** `oplog.bin` starts with the
+    /// Quantlab magic ([`OPLOG_MAGIC`]) but carries a schema version that
+    /// this build doesn't support. Distinct from `OpLog` errors so callers
+    /// can surface "future-format file written by a newer Quantlab" vs
+    /// "the Loro snapshot itself is corrupt."
+    #[error("oplog.bin schema version {found} is unsupported (this build accepts up to {max})")]
+    OplogUnsupportedVersion { found: u32, max: u32 },
+
+    /// **Phase 5.2 D-1 step 7 (2026-05-20):** `oplog.bin` starts with
+    /// the Quantlab magic but is shorter than [`OPLOG_HEADER_LEN`] (8
+    /// bytes) — the version u32 can't be read. Indicates corruption or
+    /// a malformed Quantlab-prefixed file.
+    #[error("oplog.bin has Quantlab magic but header is truncated ({found_bytes} bytes; need {required})")]
+    OplogTruncatedHeader { found_bytes: usize, required: usize },
 }
 
 /// Save a workbook AND its op log to `path` atomically. Both files land
@@ -70,6 +136,11 @@ pub enum PersistenceError {
 /// which the workbook is updated but the op log isn't (or vice versa).
 ///
 /// Overwrites any prior `oplog.bin` in the target.
+///
+/// **Phase 5.2 D-1 step 7 (2026-05-20):** the written `oplog.bin` is
+/// prefixed with the 8-byte Tier D3 header (4-byte [`OPLOG_MAGIC`] +
+/// big-endian [`OPLOG_SCHEMA_VERSION`] u32). Pre-Tier-D3 files lacked
+/// the prefix; the load path detects and handles both shapes.
 pub fn save_workbook_with_oplog(
     wb: &Workbook,
     oplog: &OpLog,
@@ -79,7 +150,14 @@ pub fn save_workbook_with_oplog(
     // Export the Loro snapshot bytes FIRST. Failing here (e.g., a
     // serde_json NaN/Inf rejection nested inside an Op::PutValue) surfaces
     // before we touch the filesystem.
-    let bytes = oplog.export_bytes()?;
+    let loro_bytes = oplog.export_bytes()?;
+
+    // Phase 5.2 D-1 step 7: prepend the Quantlab Tier D3 header.
+    // Layout: 4 bytes MAGIC + 4 bytes BE version + Loro snapshot.
+    let mut bytes = Vec::with_capacity(OPLOG_HEADER_LEN + loro_bytes.len());
+    bytes.extend_from_slice(&OPLOG_MAGIC);
+    bytes.extend_from_slice(&OPLOG_SCHEMA_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&loro_bytes);
 
     // Hand off to ql-io. The closure writes `oplog.bin` into the temp
     // directory; the atomic rename then moves it into place with the rest
@@ -98,8 +176,18 @@ pub fn save_workbook_with_oplog(
 /// - [`PersistenceError::Qbook(QbookError::MissingFile)`] specifically when
 ///   `oplog.bin` is missing — the caller asked for the op log; surfacing
 ///   the absence loudly is the no-fallbacks-rule answer.
+/// - [`PersistenceError::OplogUnsupportedVersion`] if `oplog.bin` carries
+///   a Quantlab magic prefix but the schema version is beyond what this
+///   build supports.
+/// - [`PersistenceError::OplogTruncatedHeader`] if `oplog.bin` starts
+///   with the Quantlab magic but is too short to contain the version u32.
 /// - [`PersistenceError::OpLog`] if `oplog.bin` is present but Loro can't
 ///   decode it (corruption, version mismatch in the Loro snapshot format).
+///
+/// **Phase 5.2 D-1 step 7 (2026-05-20):** load handles both Tier-D3
+/// headered files (post-step-7) AND pre-Tier-D3 raw Loro snapshots
+/// (backward compat). Format detection is by MAGIC prefix; both paths
+/// surface their own errors loudly per the no-fallbacks rule.
 pub fn load_workbook_with_oplog(path: &Path) -> Result<(Workbook, OpLog), PersistenceError> {
     let wb = load_workbook(path)?;
     let oplog_path = path.join(OPLOG_FILENAME);
@@ -109,8 +197,57 @@ pub fn load_workbook_with_oplog(path: &Path) -> Result<(Workbook, OpLog), Persis
         }));
     }
     let bytes = fs::read(&oplog_path).map_err(QbookError::Io)?;
-    let oplog = OpLog::import_bytes(&bytes)?;
+    let oplog = decode_oplog_bytes(&bytes)?;
     Ok((wb, oplog))
+}
+
+/// **Phase 5.2 D-1 step 7 (2026-05-20):** decode `oplog.bin` bytes,
+/// stripping the Tier D3 header if present. Pre-Tier-D3 files (raw Loro
+/// snapshots with no Quantlab prefix) decode via the legacy path.
+///
+/// Format detection is by the 4-byte MAGIC prefix:
+/// - Bytes start with [`OPLOG_MAGIC`] → parse u32 version (bytes 4..8).
+///   Reject if version > [`OPLOG_SCHEMA_VERSION`] or if bytes are
+///   truncated before the version u32 fully present. Decode remainder
+///   as Loro snapshot.
+/// - Bytes don't start with [`OPLOG_MAGIC`] → legacy raw Loro snapshot.
+///   Decode entire byte slice as Loro snapshot.
+///
+/// This is an explicit format branch, not a silent fallback — both
+/// branches surface their own decode errors. A garbage file that lacks
+/// both MAGIC and a valid Loro snapshot prefix lands in the legacy
+/// branch and surfaces `OpLog(...)`.
+fn decode_oplog_bytes(bytes: &[u8]) -> Result<OpLog, PersistenceError> {
+    if bytes.len() >= OPLOG_MAGIC.len() && bytes[..OPLOG_MAGIC.len()] == OPLOG_MAGIC {
+        // Tier D3 path: header present.
+        if bytes.len() < OPLOG_HEADER_LEN {
+            return Err(PersistenceError::OplogTruncatedHeader {
+                found_bytes: bytes.len(),
+                required: OPLOG_HEADER_LEN,
+            });
+        }
+        let mut version_bytes = [0u8; 4];
+        version_bytes.copy_from_slice(&bytes[OPLOG_MAGIC.len()..OPLOG_HEADER_LEN]);
+        let version = u32::from_be_bytes(version_bytes);
+        if version > OPLOG_SCHEMA_VERSION {
+            return Err(PersistenceError::OplogUnsupportedVersion {
+                found: version,
+                max: OPLOG_SCHEMA_VERSION,
+            });
+        }
+        // Strip header; remainder is the Loro snapshot.
+        let loro_bytes = &bytes[OPLOG_HEADER_LEN..];
+        let oplog = OpLog::import_bytes(loro_bytes)?;
+        Ok(oplog)
+    } else {
+        // Legacy path: pre-Tier-D3 raw Loro snapshot. Decode the whole
+        // byte slice as a Loro snapshot. If the file is actually garbage
+        // (doesn't start with MAGIC and isn't a valid Loro snapshot
+        // either), Loro's decoder returns an error which surfaces as
+        // PersistenceError::OpLog.
+        let oplog = OpLog::import_bytes(bytes)?;
+        Ok(oplog)
+    }
 }
 
 #[cfg(test)]
@@ -298,6 +435,156 @@ mod tests {
         assert!(
             matches!(result, Err(PersistenceError::OpLog(_))),
             "expected OpLog error for corrupted oplog.bin, got {result:?}"
+        );
+    }
+
+    // ===== Phase 5.2 D-1 step 7 — Tier D3 magic header tests (2026-05-20) =====
+
+    /// **Tier D3:** the round-trip suite already exercises save → load
+    /// symmetry. This test inspects the bytes on disk to pin the
+    /// post-Tier-D3 wire format: the file MUST start with
+    /// `OPLOG_MAGIC` (b"QLOL") followed by the schema version as a
+    /// big-endian u32.
+    #[test]
+    fn tier_d3_oplog_bin_starts_with_quantlab_magic_and_version_header() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("magic.qbook");
+        let wb = fresh_workbook_with_cell();
+        let oplog = oplog_with_three_ops();
+        save_workbook_with_oplog(&wb, &oplog, "magic", &path).unwrap();
+
+        let bytes = fs::read(path.join(OPLOG_FILENAME)).unwrap();
+        assert!(
+            bytes.len() >= OPLOG_HEADER_LEN,
+            "post-Tier-D3 oplog.bin must contain at least the 8-byte header"
+        );
+        assert_eq!(
+            &bytes[..OPLOG_MAGIC.len()],
+            &OPLOG_MAGIC,
+            "first 4 bytes must be OPLOG_MAGIC (b\"QLOL\")"
+        );
+        let mut version_bytes = [0u8; 4];
+        version_bytes.copy_from_slice(&bytes[OPLOG_MAGIC.len()..OPLOG_HEADER_LEN]);
+        assert_eq!(
+            u32::from_be_bytes(version_bytes),
+            OPLOG_SCHEMA_VERSION,
+            "version u32 (bytes 4..8, big-endian) must match current schema"
+        );
+    }
+
+    /// **Tier D3:** a Quantlab-prefixed file with a schema version
+    /// beyond what this build supports must surface
+    /// `PersistenceError::OplogUnsupportedVersion` — NOT silently
+    /// decode (which could mis-interpret a future op shape) and NOT
+    /// fall back to the legacy raw-Loro path (which would also
+    /// mis-interpret).
+    #[test]
+    fn tier_d3_future_schema_version_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("future.qbook");
+        let wb = fresh_workbook_with_cell();
+        let oplog = oplog_with_three_ops();
+        save_workbook_with_oplog(&wb, &oplog, "future", &path).unwrap();
+
+        // Overwrite the version u32 with one beyond the current.
+        let mut bytes = fs::read(path.join(OPLOG_FILENAME)).unwrap();
+        let future_version = OPLOG_SCHEMA_VERSION + 1;
+        bytes[OPLOG_MAGIC.len()..OPLOG_HEADER_LEN].copy_from_slice(&future_version.to_be_bytes());
+        fs::write(path.join(OPLOG_FILENAME), &bytes).unwrap();
+
+        let result = load_workbook_with_oplog(&path);
+        match result {
+            Err(PersistenceError::OplogUnsupportedVersion { found, max }) => {
+                assert_eq!(found, future_version);
+                assert_eq!(max, OPLOG_SCHEMA_VERSION);
+            }
+            other => panic!("expected OplogUnsupportedVersion, got {other:?}"),
+        }
+    }
+
+    /// **Tier D3:** a Quantlab-prefixed file truncated before the
+    /// version u32 is fully present surfaces
+    /// `PersistenceError::OplogTruncatedHeader` — NOT a Loro decode
+    /// error (which would mis-attribute the corruption).
+    #[test]
+    fn tier_d3_truncated_header_surfaces_distinct_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("truncated.qbook");
+        let wb = fresh_workbook_with_cell();
+        let oplog = oplog_with_three_ops();
+        save_workbook_with_oplog(&wb, &oplog, "truncated", &path).unwrap();
+
+        // Truncate to MAGIC + 2 bytes (less than the 8-byte header).
+        let bytes = fs::read(path.join(OPLOG_FILENAME)).unwrap();
+        let truncated = &bytes[..OPLOG_MAGIC.len() + 2];
+        fs::write(path.join(OPLOG_FILENAME), truncated).unwrap();
+
+        let result = load_workbook_with_oplog(&path);
+        match result {
+            Err(PersistenceError::OplogTruncatedHeader {
+                found_bytes,
+                required,
+            }) => {
+                assert_eq!(found_bytes, OPLOG_MAGIC.len() + 2);
+                assert_eq!(required, OPLOG_HEADER_LEN);
+            }
+            other => panic!("expected OplogTruncatedHeader, got {other:?}"),
+        }
+    }
+
+    /// **Tier D3 backward compat:** a pre-Tier-D3 `oplog.bin` (raw Loro
+    /// snapshot with NO Quantlab MAGIC prefix) must still load via the
+    /// legacy decode path. Construct one by exporting Loro bytes
+    /// directly + writing them without the header prefix that
+    /// `save_workbook_with_oplog` would prepend.
+    #[test]
+    fn legacy_pre_tier_d3_raw_loro_snapshot_still_loads() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.qbook");
+        let wb = fresh_workbook_with_cell();
+        let oplog = oplog_with_three_ops();
+
+        // Save with header so the .qbook directory + envelope exist.
+        save_workbook_with_oplog(&wb, &oplog, "legacy", &path).unwrap();
+
+        // Now replace oplog.bin with a raw Loro snapshot (no header) —
+        // simulates a pre-Tier-D3 file written by an older Quantlab.
+        let raw_loro = oplog.export_bytes().unwrap();
+        assert_ne!(
+            &raw_loro[..OPLOG_MAGIC.len().min(raw_loro.len())],
+            &OPLOG_MAGIC,
+            "Loro snapshot's first bytes must not collide with OPLOG_MAGIC \
+             (else the legacy-path detection breaks)"
+        );
+        fs::write(path.join(OPLOG_FILENAME), &raw_loro).unwrap();
+
+        // Load via the legacy path: must succeed, ops survive.
+        let (_, loaded_log) = load_workbook_with_oplog(&path)
+            .expect("legacy raw-Loro oplog.bin must load via the backward-compat path");
+        let loaded_ops: Vec<Op> = loaded_log.iter().collect::<Result<_, _>>().unwrap();
+        let original_ops: Vec<Op> = oplog.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(loaded_ops, original_ops);
+    }
+
+    /// **Tier D3:** an empty file (0 bytes) doesn't start with MAGIC →
+    /// routes to legacy path → Loro decode fails → surfaces
+    /// `PersistenceError::OpLog`. Pins the boundary: zero-length is
+    /// not a special case.
+    #[test]
+    fn tier_d3_empty_oplog_bin_routes_to_legacy_path_and_loro_errors() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("empty_oplog.qbook");
+        let wb = fresh_workbook_with_cell();
+        let oplog = oplog_with_three_ops();
+        save_workbook_with_oplog(&wb, &oplog, "empty_oplog", &path).unwrap();
+
+        // Replace oplog.bin with an empty file.
+        fs::write(path.join(OPLOG_FILENAME), b"").unwrap();
+
+        let result = load_workbook_with_oplog(&path);
+        assert!(
+            matches!(result, Err(PersistenceError::OpLog(_))),
+            "empty oplog.bin must route to legacy decode + surface OpLog error; got {result:?}"
         );
     }
 }
