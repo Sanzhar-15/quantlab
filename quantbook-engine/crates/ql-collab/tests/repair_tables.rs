@@ -183,14 +183,16 @@ fn step4_concurrent_same_table_rename_does_not_hard_fail() {
     assert_eq!(count, 1, "exactly one table after merge");
 }
 
-// ===== Test 4: Step 4 replay auto-disambiguation — cross-table target collision =====
+// ===== Test 4: Step 4 audit closure — cross-table target collision V1 limitation =====
 
-/// **Step 4 audit property (mirrors step 2 for sheets D-2-style
-/// auto-rename)**: two peers concurrently rename DIFFERENT tables to
-/// the SAME target. Pre-step-4: TableCreateRejected hard-fail. Post-
-/// step-4: auto-disambiguate via suffix walk (X → X(2)).
+/// **Step 4 audit closure (Codex+Opus HIGH-1, 2026-05-20):** two
+/// peers concurrently rename DIFFERENT tables to the SAME target.
+/// Pre-audit-closure: replay auto-disambig'd to {X, X(2)} but the
+/// repair pass mishandled the auto-disambig'd canonical, causing
+/// silent formula corruption. Post-audit-closure: replay HARD-FAILS
+/// via `TableCreateRejected`. Documented V1 limitation.
 #[test]
-fn step4_cross_table_target_collision_auto_disambiguates() {
+fn step4_audit_cross_table_target_collision_hard_fails() {
     // Base: 2 tables T1 + T3.
     let mut base_log = OpLog::new();
     base_log
@@ -244,18 +246,105 @@ fn step4_cross_table_target_collision_auto_disambiguates() {
         .unwrap();
     peer_a.merge_bytes(&peer_b.export_bytes().unwrap()).unwrap();
 
-    let wb = replay_to_workbook(&peer_a);
-    // Both renames apply — one as X, the other as X(2) (auto-disambig).
-    let mut names: Vec<String> = wb
-        .tables()
-        .iter()
-        .map(|(_, meta)| meta.display_name.as_ref().to_owned())
-        .collect();
-    names.sort();
+    // Replay must hard-fail with TableCreateRejected. V1 limitation.
+    let mut wb = Workbook::new();
+    let reg = ql_functions::default_registry();
+    let result = replay_into(&peer_a, &mut wb, &reg);
+    assert!(
+        result.is_err(),
+        "post-audit-closure: cross-source target collision hard-fails (V1 limitation, audit-locked)"
+    );
+}
+
+// ===== Test 7: Audit closure — transitive chain T → T2 → T3 + concurrent formula =====
+
+/// **Step 4 audit closure (Opus LOW-2):** transitive table rename
+/// chain (sequential single-peer T → T2 → T3) with a concurrent
+/// peer's formula referencing the original name. Repair must
+/// rewrite `T[A]` → `T3[A]` (skipping the intermediate T2).
+#[test]
+fn step4_audit_transitive_table_chain_to_final_name() {
+    let base = base_with_table("T").export_bytes().unwrap();
+
+    let mut peer_a = fork_with_peer(&base, PEER_A_ID);
+    peer_a
+        .append(Op::RenameTable {
+            old_name: "T".to_owned(),
+            new_name: "T2".to_owned(),
+        })
+        .unwrap();
+    peer_a
+        .append(Op::RenameTable {
+            old_name: "T2".to_owned(),
+            new_name: "T3".to_owned(),
+        })
+        .unwrap();
+
+    let mut peer_b = fork_with_peer(&base, PEER_B_ID);
+    peer_b
+        .append(Op::PutFormula {
+            sheet: 0,
+            row: 5,
+            col: 0,
+            text: "T[A]".to_owned(),
+        })
+        .unwrap();
+
+    peer_a.merge_bytes(&peer_b.export_bytes().unwrap()).unwrap();
+    let mut wb = replay_to_workbook(&peer_a);
+
+    let _report = repair_table_rename_chain(&mut wb, &peer_a).unwrap();
+
     assert_eq!(
-        names,
-        vec!["X".to_string(), "X(2)".to_string()],
-        "post-step-4: cross-table target collision auto-disambiguates"
+        wb.formula_at(0, 5, 0).map(|s| s.to_string()),
+        Some("T3[A]".to_string()),
+        "transitive chain: T → T2 → T3 rewrites T references directly to T3 (skipping intermediate T2)"
+    );
+}
+
+// ===== Test 8: Audit closure — BatchCommit traversal =====
+
+/// **Step 4 audit closure (Opus MEDIUM-4):** verify that
+/// `collect_table_renames` correctly walks BatchCommit-nested
+/// `Op::RenameTable` ops. The recursive code-path is exercised on
+/// real CRDT-merge scenarios where producer-side bundles rename +
+/// PutFormula in one BatchCommit.
+#[test]
+fn step4_audit_batchcommit_nested_table_rename_traverses_correctly() {
+    let base = base_with_table("T").export_bytes().unwrap();
+
+    // Peer A: BatchCommit-wrapped rename.
+    let mut peer_a = fork_with_peer(&base, PEER_A_ID);
+    peer_a
+        .append(Op::BatchCommit {
+            ops: vec![Op::RenameTable {
+                old_name: "T".to_owned(),
+                new_name: "T2".to_owned(),
+            }],
+        })
+        .unwrap();
+    // Peer B: concurrent formula referencing the old name.
+    let mut peer_b = fork_with_peer(&base, PEER_B_ID);
+    peer_b
+        .append(Op::PutFormula {
+            sheet: 0,
+            row: 5,
+            col: 0,
+            text: "T[A]".to_owned(),
+        })
+        .unwrap();
+    peer_a.merge_bytes(&peer_b.export_bytes().unwrap()).unwrap();
+
+    let mut wb = replay_to_workbook(&peer_a);
+    let report = repair_table_rename_chain(&mut wb, &peer_a).unwrap();
+
+    assert_eq!(
+        report.formulas_rewritten, 1,
+        "BatchCommit-nested RenameTable must be discovered by the chain walker"
+    );
+    assert_eq!(
+        wb.formula_at(0, 5, 0).map(|s| s.to_string()),
+        Some("T2[A]".to_string())
     );
 }
 

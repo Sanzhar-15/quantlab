@@ -393,13 +393,16 @@ pub fn repair_table_rename_chain(
     // value we map back from.
     let mut historic_by_current: HashMap<String, Vec<String>> = HashMap::new();
     // Use causal-order replay to know which historic name maps to
-    // which final canonical: replay the chain in op order, tracking
-    // each "current -> next" hop. After all ops, historic_by_current
-    // maps "current canonical (post-merge)" to its chain of old names.
-    let mut canonical_chain: HashMap<String, String> = HashMap::new(); // old -> new
+    // which final canonical: walk ops in order, accumulating each
+    // hop's old_name under historic_by_current[new_name].
+    //
+    // **Audit closure (Opus MEDIUM-2):** previously also threaded
+    // a `canonical_chain: HashMap<String, String>` through the
+    // walker, but its `while let Some(next)` lookup result was
+    // never read — pure dead state. Removed.
     for op_result in log.iter() {
         let op = op_result?;
-        collect_table_renames(&op, &mut canonical_chain, &mut historic_by_current);
+        collect_table_renames(&op, &mut historic_by_current);
     }
 
     // Phase 2: snapshot current canonical names.
@@ -413,10 +416,18 @@ pub fn repair_table_rename_chain(
     // For each current table, walk its historic chain. Skip rules where
     // the old_canonical is currently held by ANY table (safety guard
     // mirroring step 3 audit closure).
+    //
+    // **Audit closure (Codex+Opus MEDIUM, 2026-05-20):** sort the
+    // current canonicals before iteration for deterministic rule
+    // order. HashSet iteration is non-deterministic; both the rules
+    // vec and the `table_rewrites` report would otherwise vary across
+    // runs.
     let mut rules: Vec<(String, Arc<str>)> = Vec::new();
     let mut table_rewrites: Vec<TableRewriteSummary> = Vec::new();
     let mut ambiguous_rules_skipped: Vec<TableAmbiguousSkip> = Vec::new();
-    for current_canonical in &current_table_canonicals {
+    let mut sorted_current_canonicals: Vec<&String> = current_table_canonicals.iter().collect();
+    sorted_current_canonicals.sort();
+    for current_canonical in sorted_current_canonicals {
         let Some(historic_set) = historic_by_current.get(current_canonical) else {
             continue;
         };
@@ -490,38 +501,24 @@ pub fn repair_table_rename_chain(
     })
 }
 
-/// Walk an `Op` (including BatchCommit-nested) and update the
-/// (old → new) canonical chain + accumulate historic canonicals
-/// per current canonical.
-fn collect_table_renames(
-    op: &Op,
-    canonical_chain: &mut HashMap<String, String>,
-    historic_by_current: &mut HashMap<String, Vec<String>>,
-) {
+/// Walk an `Op` (including BatchCommit-nested) and accumulate
+/// historic table canonicals per current canonical. Transitive
+/// chain propagation: when an op renames `old_c → new_c`, any
+/// historic entries previously keyed under `old_c` move to `new_c`
+/// (along with `old_c` itself).
+fn collect_table_renames(op: &Op, historic_by_current: &mut HashMap<String, Vec<String>>) {
     match op {
         Op::RenameTable { old_name, new_name } => {
             let old_c = old_name.to_ascii_uppercase();
             let new_c = new_name.to_ascii_uppercase();
-            // Resolve the ROOT historic for this old name (if it was
-            // itself a renamed intermediate). Walk forward through the
-            // existing chain.
-            let mut chain_root = old_c.clone();
-            while let Some(next) = canonical_chain.get(&chain_root) {
-                if next == &chain_root {
-                    break;
-                }
-                chain_root = next.clone();
-            }
-            // Record old_c → new_c hop.
-            canonical_chain.insert(old_c.clone(), new_c.clone());
             // historic_by_current[new_c] gets old_c appended (the
             // most recent old name for this final canonical).
             historic_by_current
                 .entry(new_c.clone())
                 .or_default()
                 .push(old_c.clone());
-            // Also propagate prior chain: if old_c had its own
-            // historic entries, move them to new_c.
+            // Propagate prior chain: if old_c had its own historic
+            // entries, move them to new_c.
             if let Some(prior) = historic_by_current.remove(&old_c) {
                 for p in prior {
                     historic_by_current
@@ -533,7 +530,7 @@ fn collect_table_renames(
         }
         Op::BatchCommit { ops } => {
             for inner in ops {
-                collect_table_renames(inner, canonical_chain, historic_by_current);
+                collect_table_renames(inner, historic_by_current);
             }
         }
         _ => {}

@@ -89,10 +89,14 @@ fn step4_concurrent_rename_table_different_targets_no_hard_fail() {
     assert_eq!(wb_a.tables().iter().count(), 1);
 }
 
-/// **Step 4**: cross-table target collision (different sources, same
-/// target). Post-step-4 auto-disambiguation produces {X, X(2)}.
+/// **Step 4 audit closure (Codex+Opus HIGH-1, 2026-05-20):**
+/// cross-table target collision (different sources, same target).
+/// Pre-audit-closure: auto-disambig produced {X, X(2)} but the
+/// repair pass mis-handled the auto-disambig'd canonical, causing
+/// silent formula corruption. Post-audit-closure: REVERTED to
+/// hard-reject via `TableCreateRejected`. V1 limitation.
 #[test]
-fn step4_concurrent_rename_table_cross_target_auto_disambiguates() {
+fn step4_audit_cross_table_target_collision_hard_fails() {
     let mut base_log = OpLog::new();
     base_log
         .append(Op::AddSheet {
@@ -144,14 +148,15 @@ fn step4_concurrent_rename_table_cross_target_auto_disambiguates() {
         .unwrap();
     peer_a.merge_bytes(&peer_b.export_bytes().unwrap()).unwrap();
 
-    let wb = replay_into_fresh(&peer_a);
-    let mut names: Vec<String> = wb
-        .tables()
-        .iter()
-        .map(|(_, meta)| meta.display_name.as_ref().to_owned())
-        .collect();
-    names.sort();
-    assert_eq!(names, vec!["X".to_string(), "X(2)".to_string()]);
+    // Replay must hard-fail with TableCreateRejected on the second
+    // rename's target collision (V1 limitation, audit-closed).
+    let mut wb = Workbook::new();
+    let reg = ql_functions::default_registry();
+    let result = replay_into(&peer_a, &mut wb, &reg);
+    assert!(
+        result.is_err(),
+        "cross-source target collision must hard-fail post-audit-closure (V1 limitation)"
+    );
 }
 
 // ===== RenameColumn: concurrent rename =====
@@ -197,11 +202,13 @@ fn step4_concurrent_rename_column_different_targets_no_hard_fail() {
     assert_eq!(meta.columns[1].display.as_ref(), "B");
 }
 
-/// **Step 4 for columns**: cross-column target collision (two peers
-/// rename DIFFERENT columns to the same target). Auto-disambiguation
-/// produces e.g. {Z, Z(2)}.
+/// **Step 4 audit closure (Codex+Opus HIGH-2, 2026-05-20):**
+/// cross-column target collision. Pre-audit-closure: auto-disambig
+/// produced {Z, Z(2)} but no column repair pass landed → silent
+/// formula-binding to wrong column. Post-audit-closure: REVERTED
+/// to hard-reject. V1 limitation.
 #[test]
-fn step4_concurrent_rename_column_cross_target_auto_disambiguates() {
+fn step4_audit_cross_column_target_collision_hard_fails() {
     let base = base_with_table("T", vec!["A".to_owned(), "B".to_owned()])
         .export_bytes()
         .unwrap();
@@ -224,19 +231,12 @@ fn step4_concurrent_rename_column_cross_target_auto_disambiguates() {
         .unwrap();
     peer_a.merge_bytes(&peer_b.export_bytes().unwrap()).unwrap();
 
-    let wb = replay_into_fresh(&peer_a);
-    let meta = wb.tables().lookup("T").unwrap();
-    let mut col_displays: Vec<String> = meta
-        .columns
-        .iter()
-        .map(|c| c.display.as_ref().to_owned())
-        .collect();
-    col_displays.sort();
-    // One column was renamed to Z, the other auto-disambiguated to Z(2).
-    assert_eq!(
-        col_displays,
-        vec!["Z".to_string(), "Z(2)".to_string()],
-        "auto-disambig: {{Z, Z(2)}} present; got {col_displays:?}"
+    let mut wb = Workbook::new();
+    let reg = ql_functions::default_registry();
+    let result = replay_into(&peer_a, &mut wb, &reg);
+    assert!(
+        result.is_err(),
+        "cross-source column target collision must hard-fail post-audit-closure (V1 limitation)"
     );
 }
 
