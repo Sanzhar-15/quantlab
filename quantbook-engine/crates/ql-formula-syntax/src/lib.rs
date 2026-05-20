@@ -41,6 +41,11 @@ pub mod lexer;
 pub mod locale;
 pub mod parser;
 pub mod printer;
+// Phase 5.3 V2 Tier H1 closure (2026-05-20) — unified formula-text
+// rewriter for sheet / table / column renames. Consolidates 6 call
+// sites of the `lex → parse → rewrite → print` round-trip from
+// `ql-collab` + `ql-exec` into a single helper.
+pub mod rewrite_text;
 pub mod token;
 
 pub use ast::{
@@ -51,6 +56,7 @@ pub use lexer::{column_letters_to_index, lex, lex_with, LexError, MAX_COLUMN, MA
 pub use locale::{locale_data, LocaleData};
 pub use parser::{parse, ParseError};
 pub use printer::{print, print_with, FormulaSite, PrintError};
+pub use rewrite_text::{rewrite_formula_text, NameRewrite};
 pub use token::{AxisSpec, Operator, Token};
 
 #[cfg(test)]

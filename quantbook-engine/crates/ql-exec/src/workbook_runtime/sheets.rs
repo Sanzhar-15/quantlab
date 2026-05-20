@@ -34,29 +34,21 @@ use super::{RuntimeError, WorkbookRuntime};
 /// Defensive: if `lex` or `parse` fails (corrupted historical text),
 /// returns `None` rather than propagating an error — the rename
 /// shouldn't break otherwise-recoverable workbooks.
+/// Sheet-rename variant of [`ql_formula_syntax::rewrite_formula_text`].
+/// V2 Tier H1 closure (2026-05-20): formerly an open-coded duplicate
+/// of the lex/parse/rewrite/print round-trip; now a thin wrapper.
 fn rewrite_formula_text_for_sheet_rename(
     text: &str,
     old_canonical: &str,
     new_name: &Arc<str>,
 ) -> Option<String> {
-    let stripped = text.strip_prefix('=').unwrap_or(text);
-    let tokens = ql_formula_syntax::lex(stripped).ok()?;
-    let expr = ql_formula_syntax::parse(tokens).ok()?;
-    let rewritten = ql_formula_syntax::rewrite_sheet_name_in_expr(&expr, old_canonical, new_name);
-    if rewritten == expr {
-        // Nothing changed; preserve the original text (avoids spurious
-        // op-log entries and skips the round-trip-printing's canonical-
-        // form rewrites for formulas that have no sheet references).
-        return None;
-    }
-    let printed = ql_formula_syntax::print(&rewritten);
-    // Preserve a leading `=` if the original had one.
-    let with_eq = if text.starts_with('=') {
-        format!("={printed}")
-    } else {
-        printed
-    };
-    Some(with_eq)
+    ql_formula_syntax::rewrite_formula_text(
+        text,
+        ql_formula_syntax::NameRewrite::Sheet {
+            old_canonical,
+            new_display: new_name,
+        },
+    )
 }
 
 impl<'a> WorkbookRuntime<'a> {

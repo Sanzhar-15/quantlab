@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use ql_formula_syntax::{lex, lex_with, parse};
+use ql_formula_syntax::{lex_with, parse};
 use ql_oplog::Op;
 use ql_types::{ColId, RowId, SheetId};
 
@@ -318,22 +318,18 @@ impl<'a> WorkbookRuntime<'a> {
             .iter_formulas()
             .map(|(s, r, c, text)| (s, r, c, Arc::clone(text)))
             .collect();
+        // V2 Tier H1 closure (2026-05-20): use the unified helper.
         let mut rewritten = 0;
         for (s, r, c, text) in formulas {
-            let tokens = match lex(text.as_ref()) {
-                Ok(t) => t,
-                Err(_) => continue, // malformed → leave alone (rewrite is best-effort)
+            let Some(new_text) = ql_formula_syntax::rewrite_formula_text(
+                text.as_ref(),
+                ql_formula_syntax::NameRewrite::Table {
+                    old_canonical: &old_canonical,
+                    new_display: &new_display_arc,
+                },
+            ) else {
+                continue; // malformed OR no table reference matched
             };
-            let expr = match parse(tokens) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let new_expr =
-                ql_formula_syntax::rewrite_table_ref(&expr, &old_canonical, &new_display_arc);
-            if new_expr == expr {
-                continue; // no StructuredRef references the renamed table
-            }
-            let new_text = ql_formula_syntax::print(&new_expr);
             // Emit PutFormula so replay reconstructs the rewrite.
             if let Some(oplog) = self.oplog.as_deref_mut() {
                 oplog.append(Op::PutFormula {
@@ -462,26 +458,19 @@ impl<'a> WorkbookRuntime<'a> {
             .iter_formulas()
             .map(|(s, r, c, text)| (s, r, c, Arc::clone(text)))
             .collect();
+        // V2 Tier H1 closure (2026-05-20): use the unified helper.
         let mut rewritten = 0;
         for (s, r, c, text) in formulas {
-            let tokens = match lex(text.as_ref()) {
-                Ok(t) => t,
-                Err(_) => continue,
+            let Some(new_text) = ql_formula_syntax::rewrite_formula_text(
+                text.as_ref(),
+                ql_formula_syntax::NameRewrite::Column {
+                    table_canonical_upper: &table_canonical,
+                    old_col,
+                    new_display: &new_display_arc,
+                },
+            ) else {
+                continue; // malformed OR no column reference matched
             };
-            let expr = match parse(tokens) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let new_expr = ql_formula_syntax::rewrite_column_ref(
-                &expr,
-                &table_canonical,
-                old_col,
-                &new_display_arc,
-            );
-            if new_expr == expr {
-                continue;
-            }
-            let new_text = ql_formula_syntax::print(&new_expr);
             if let Some(oplog) = self.oplog.as_deref_mut() {
                 oplog.append(Op::PutFormula {
                     sheet: s,

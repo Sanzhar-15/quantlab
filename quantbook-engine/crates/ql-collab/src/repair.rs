@@ -398,49 +398,23 @@ fn collect_rename_old_names(op: &Op, historic: &mut HashMap<SheetId, Vec<String>
 // step 5b production-wiring closure) which atomically pairs
 // `replay_into` + `repair_*`.
 
-/// Rewrite `text` (formula source) substituting every reference to
-/// `old_canonical` (a canonical-uppercase sheet name) with `new_name`
-/// (the new display name).
+/// Sheet-rename variant of [`ql_formula_syntax::rewrite_formula_text`].
 ///
-/// Mirror of the producer-side helper at
-/// `crates/ql-exec/src/workbook_runtime/sheets.rs:37-60`. Kept here
-/// because ql-collab has no dep on ql-exec (direction: ql-collab is
-/// below ql-exec). Both helpers route through
-/// `ql_formula_syntax::{lex, parse, rewrite_sheet_name_in_expr, print}`.
-///
-/// **TODO (Opus step 3 audit MEDIUM-1, deferred-to-step-4 follow-up)**:
-/// promote this + `rewrite_formula_with_table_rename` +
-/// `rewrite_formula_with_column_rename` (this module) AND
-/// `rewrite_formula_text_for_sheet_rename` (sheets.rs:37-60) AND
-/// the inlined table/column rewrites (tables.rs:316-336, 471-490)
-/// to a single public helper in `ql-formula-syntax`. All 5+ call
-/// sites would converge on one implementation, preventing drift.
-/// Deferred to a separate refactor commit to keep step 4 scoped to
-/// the audit-locked algorithm + tests.
-///
-/// Returns `None` when:
-/// - The text doesn't lex/parse (formula is malformed — caller should
-///   not surface this as an error; recompute will surface it).
-/// - The parsed AST doesn't reference `old_canonical` (no rewrite).
+/// Phase 5.3 V2 Tier H1 closure (2026-05-20): formerly a duplicate of
+/// the lex/parse/rewrite/print round-trip across 6 call sites; now a
+/// thin wrapper over the unified helper.
 fn rewrite_formula_with_rename(
     text: &str,
     old_canonical: &str,
     new_name: &Arc<str>,
 ) -> Option<String> {
-    let stripped = text.strip_prefix('=').unwrap_or(text);
-    let tokens = ql_formula_syntax::lex(stripped).ok()?;
-    let expr = ql_formula_syntax::parse(tokens).ok()?;
-    let rewritten = ql_formula_syntax::rewrite_sheet_name_in_expr(&expr, old_canonical, new_name);
-    if rewritten == expr {
-        return None;
-    }
-    let printed = ql_formula_syntax::print(&rewritten);
-    let with_eq = if text.starts_with('=') {
-        format!("={printed}")
-    } else {
-        printed
-    };
-    Some(with_eq)
+    ql_formula_syntax::rewrite_formula_text(
+        text,
+        ql_formula_syntax::NameRewrite::Sheet {
+            old_canonical,
+            new_display: new_name,
+        },
+    )
 }
 
 /// **Phase 5.3 step 4 (2026-05-20):** table-rename analog of
@@ -613,27 +587,20 @@ fn collect_table_renames(op: &Op, historic_by_current: &mut HashMap<String, Vec<
     }
 }
 
-/// Table-rename analog of [`rewrite_formula_with_rename`]. Routes
-/// through `ql_formula_syntax::rewrite_table_ref`.
+/// Table-rename variant of [`ql_formula_syntax::rewrite_formula_text`].
+/// V2 Tier H1 closure (2026-05-20).
 fn rewrite_formula_with_table_rename(
     text: &str,
     old_canonical: &str,
     new_name: &Arc<str>,
 ) -> Option<String> {
-    let stripped = text.strip_prefix('=').unwrap_or(text);
-    let tokens = ql_formula_syntax::lex(stripped).ok()?;
-    let expr = ql_formula_syntax::parse(tokens).ok()?;
-    let rewritten = ql_formula_syntax::rewrite_table_ref(&expr, old_canonical, new_name);
-    if rewritten == expr {
-        return None;
-    }
-    let printed = ql_formula_syntax::print(&rewritten);
-    let with_eq = if text.starts_with('=') {
-        format!("={printed}")
-    } else {
-        printed
-    };
-    Some(with_eq)
+    ql_formula_syntax::rewrite_formula_text(
+        text,
+        ql_formula_syntax::NameRewrite::Table {
+            old_canonical,
+            new_display: new_name,
+        },
+    )
 }
 
 /// Report for [`repair_table_rename_chain`].
@@ -972,34 +939,22 @@ fn collect_column_renames_with_resolve<F>(
     }
 }
 
-/// Column-rename analog of [`rewrite_formula_with_rename`] +
-/// [`rewrite_formula_with_table_rename`]. Routes through
-/// `ql_formula_syntax::rewrite_column_ref`.
+/// Column-rename variant of [`ql_formula_syntax::rewrite_formula_text`].
+/// V2 Tier H1 closure (2026-05-20).
 fn rewrite_formula_with_column_rename(
     text: &str,
     table_canonical_upper: &str,
     old_col_canonical: &str,
     new_col_display: &Arc<str>,
 ) -> Option<String> {
-    let stripped = text.strip_prefix('=').unwrap_or(text);
-    let tokens = ql_formula_syntax::lex(stripped).ok()?;
-    let expr = ql_formula_syntax::parse(tokens).ok()?;
-    let rewritten = ql_formula_syntax::rewrite_column_ref(
-        &expr,
-        table_canonical_upper,
-        old_col_canonical,
-        new_col_display,
-    );
-    if rewritten == expr {
-        return None;
-    }
-    let printed = ql_formula_syntax::print(&rewritten);
-    let with_eq = if text.starts_with('=') {
-        format!("={printed}")
-    } else {
-        printed
-    };
-    Some(with_eq)
+    ql_formula_syntax::rewrite_formula_text(
+        text,
+        ql_formula_syntax::NameRewrite::Column {
+            table_canonical_upper,
+            old_col: old_col_canonical,
+            new_display: new_col_display,
+        },
+    )
 }
 
 /// Report for [`repair_column_rename_chain`].
