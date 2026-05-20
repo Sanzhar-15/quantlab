@@ -743,10 +743,15 @@ post the 2026-05-19 audit. Status summary:
    `OPLOG_MIN_SUPPORTED_SCHEMA_VERSION` gate (rejects v0), refined
    legacy-path scope docs (backward-compat only for current Op enum
    shape — pre-step-4 op shapes fail at iter() loudly), and corrected
-   doc drift across 5 sites. **Pending:** step 8 full-arc megaudit. See
-   `docs/phase5/d-1-starting-checklist.md` for the execution plan +
-   per-step audit transcripts at
-   `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..7}-*.md`.
+   doc drift across 5 sites. **Step 8 full-arc 3-way megaudit shipped
+   (`8fc8376ff93` + `6e32c269c22`):** 3 HIGH + 6 MEDIUM + 2 LOW closed
+   (release-build PeerId(0) guard, xlsx import/export unresolved-overlay
+   reports, cross-crate doc drift, MIN_SUPPORTED gate, etc.). See
+   `docs/phase5/d-1-exit-packet.md` for the D-1 closure record +
+   `docs/phase5/d-1-starting-checklist.md` for execution-trace history.
+   Per-step audit transcripts at
+   `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..7}-*.md`; step 8
+   megaudit transcripts at `docs/audits/2026-05-20-phase-5-2-d-1-step-8-megaudit-*.md`.
 
 ## Cross-references
 

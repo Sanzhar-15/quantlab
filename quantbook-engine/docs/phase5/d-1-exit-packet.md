@@ -12,7 +12,7 @@ audit_transcripts: docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..7}-{codex,
 
 **SHIPPED.** All 8 steps + 7 per-step audits + 1 full-arc megaudit closed.
 
-- **Final HEAD:** `<this commit>` on `feat/quantbook-engine`.
+- **Final HEAD:** `6e32c269c22` on `feat/quantbook-engine` (D-1 exit packet + 7 surface refreshes commit; preceded by `8fc8376ff93` megaudit closures).
 - **Workspace tests:** 4291 passing / 0 failed (+69 net from pre-D-1 baseline of 4222).
 - **fmt + clippy:** clean workspace-wide.
 - **Audit cycles:** 16 (7 per-step + 7 per-step closures + 1 megaudit + 1 megaudit closure) — all 16 caught real bugs (per-step audits captured forward-activating bugs that the alternative "defer all to megaudit" would have shipped).
@@ -67,7 +67,7 @@ pub enum FormatId {
 | 5 | `2ae5bfcab28` | `30ef2637d6f` | qbook envelope v7→v8 + FormatEntryId untagged enum |
 | 6 | `19f6aa1b008` | `2ba66ee3710` | xlsx FormatId↔numFmtId (dedup-by-code + LEGACY counter preservation + Strict policy) |
 | 7 | `0ccc859958f` | `0ad835f6060` | Tier D3 oplog.bin magic + version header |
-| 8 (megaudit) | (3-way audits) | `<this commit>` | Cross-step closure: import/export unresolved overlay reports + release-build guard + 5 NEW adversarial tests |
+| 8 (megaudit) | (3-way audits) | `8fc8376ff93` + `6e32c269c22` (exit packet) | Cross-step closure: import/export unresolved overlay reports + release-build guard + 5 NEW adversarial tests |
 
 Plus 4 doc-refresh commits (one per cycle that shipped through cycles 2, 5, 6, 7).
 
@@ -131,8 +131,11 @@ The discipline rule of mandatory parallel 2-way (per-step) + 3-way (megaudit) au
 
 ## What's next for Phase 5
 
-After D-1, Phase 5.2 still has:
-- **5.3** Conflict resolution (causality-aware rename-repair) — 4-7 days.
-- **5.5 V2 V2/V3** Production transport (WebSocket + reconnect + offline sync) — 1-2 weeks.
-- **5.7** IDE vertical slice — depends on D-1 + 5.3 + 5.5 V2 V2.
-- **5.8** Phase 5 megaudit (separate from D-1 step 8 megaudit; randomized peer-merge tests + transport failure modes) — 4-6 days.
+After D-1, Phase 5 still has 4 sub-items. **Recommended priority order** (closure megaudit Codex MEDIUM):
+
+1. **5.3** Conflict resolution (causality-aware rename-repair). **START HERE unless the user overrides.** 4-7 days, contained scope, completes the V1 merge-correctness story. V1 currently emits `BindError::UnknownSheet → #NAME?` as the simple case (D-3 shipped); 5.3 is the full causality story.
+2. **5.5 V2 V2/V3** Production transport (WebSocket + reconnect + offline sync + auto-flush on append). Largest remaining scope (1-2 weeks). Unblocks the IDE.
+3. **5.7** IDE vertical slice (two-window editing demo with multi-peer presence + format collaboration). **Depends on D-1 + 5.3 + 5.5 V2 V2** — don't start until all three are done.
+4. **5.8** Phase 5 megaudit (separate from D-1 step 8 megaudit). 4-6 days; randomized peer-merge tests + transport failure modes. Run AFTER 5.3 + 5.5 stabilize.
+
+**Recommended trade-off framing:** D-1 + D-2/D-3/D-4 + 5.4 + 5.6 already give the V1 + a multi-peer-aware FormatId architecture. 5.3 closes the most user-visible correctness gap (concurrent rename + merge); 5.5 V2 V2/V3 closes the transport gap; 5.7 closes the demo gap. 5.8 is the final megaudit before Phase 5 graduation. Going in order (5.3 → 5.5 → 5.7 → 5.8) is the default; the user may reorder if they have transport pressure or demo deadlines.

@@ -17,10 +17,10 @@ end: CRDT data model decision (5.1), op-log semantic decisions
 undo (5.4 V1 + V2 V1 + V2 V1.1), in-process transport (5.5 V1 +
 V2 V1), and ephemeral presence (5.6 V1).
 
-Phase 5.2 D-1 (FormatId tagged tuple, schema-breaking, multi-day)
-+ Phase 5.3 conflict resolution + Phase 5.5 V2 V2/V3 (WebSocket /
-auto-flush) + Phase 5.7 IDE vertical slice remain ahead of the
-5.8 megaudit.
+Phase 5.2 D-1 (FormatId tagged tuple) ✅ SHIPPED 2026-05-20 — see
+`docs/phase5/d-1-exit-packet.md`. Phase 5.3 conflict resolution
++ Phase 5.5 V2 V2/V3 (WebSocket / auto-flush) + Phase 5.7 IDE
+vertical slice remain ahead of the 5.8 megaudit.
 
 ## Acceptance criteria status (Phase 5 V1)
 
@@ -214,17 +214,14 @@ Phase 5 V1 added **91 net tests** to the engine.
 
 ### Major (multi-day)
 
-- **Phase 5.2 D-1 — FormatId tagged tuple.** Schema-breaking
-  change to `FormatId` (currently `u32` newtype) → tagged tuple
-  `{ Builtin(u32), Custom(PeerId, u32) }`. Touches `ql-storage`,
-  `ql-oplog::Op` (RegisterFormat / SetCellFormat),
-  `format_overlay`, `.qbook` envelope schema bump, xlsx cellXfs
-  numFmtId mapping. Backwards-compat migration: old `.qbook`
-  files load as `Builtin(n)` if `n ≤ 163`, else
-  `Custom(LegacyPeer, n - FIRST_CUSTOM_FORMAT_ID)`. Wire-format
-  bump: `WORKBOOK_SCHEMA_VERSION` increments. **Recommend
-  starting this in a fresh session** — multi-day, not session-
-  shippable end-to-end.
+- **Phase 5.2 D-1 — FormatId tagged tuple.** ✅ **SHIPPED 2026-05-20.**
+  All 8 steps + 7 per-step audits + 1 full-arc 3-way megaudit
+  complete. See `docs/phase5/d-1-exit-packet.md` for the closure
+  record (final HEAD `6e32c269c22`; workspace tests 4222 → 4291;
+  16/16 audit cycles caught real bugs). Touched `ql-types::peer`,
+  `ql-storage::format`, `ql-oplog::wire` + `op` + `replay`,
+  `ql-io::qbook_format` (v7→v8) + `oplog_persistence` (Tier D3
+  header), `ql-io-xlsx::write::umya_export` (XlsxNumFmtTranslation).
 
 - **Phase 5.3 — Conflict resolution semantics.** Causality-aware
   rename-repair pass at merge time (currently V1 emits `#NAME?`

@@ -595,24 +595,24 @@ mod tests {
         }
     }
 
-    /// **Audit-closure (Codex HIGH-1, partial):** pin the legacy-path
+    /// **Audit-closure (Codex HIGH-1, part 1 of 2):** pin the legacy-path
     /// fail-loud contract for files that LOOK like Loro snapshots
     /// (start with `b"loro"`) but carry garbage body bytes. The
     /// MAGIC-detection routes to legacy path; Loro's framing decoder
     /// then rejects.
     ///
-    /// **Limitation of this test:** it pins the FRAMING-level failure
-    /// mode, not the per-op-deserialize failure mode that HIGH-1
+    /// **Scope of this test:** it pins the FRAMING-level failure
+    /// mode. The per-op-deserialize failure mode that HIGH-1 also
     /// describes (pre-step-4 files: Loro framing accepts; ops fail at
-    /// `iter()`). Synthesizing pre-step-4 op JSON requires bypassing
-    /// the current Op enum's serde shape, which is fragile. Deferred
-    /// to step 8 megaudit OR a future test that constructs old-shape
-    /// JSON via direct LoroList writes.
+    /// `iter()`) is pinned by part 2 — see
+    /// `crates/ql-oplog/tests/d1_step8_legacy_op_shape.rs` (D-1 step 8
+    /// megaudit closure, 2026-05-20). That file synthesizes pre-step-4
+    /// op JSON via direct `LoroDoc::get_list("ops").push(LoroValue::String(json))`
+    /// — a technique Opus-A's step-8 megaudit proved feasible.
     ///
-    /// What this test guarantees today: legacy-path corruption of any
-    /// flavor — frame-level garbage OR (by transitive reasoning) op-
-    /// level shape drift — surfaces as `PersistenceError::OpLog`. Not
-    /// silent data loss.
+    /// Both tests together guarantee: legacy-path corruption of any
+    /// flavor — frame-level garbage OR per-op shape drift — surfaces
+    /// as `PersistenceError::OpLog`. Not silent data loss.
     #[test]
     fn legacy_path_with_corrupt_loro_body_fails_loudly() {
         let dir = TempDir::new().unwrap();

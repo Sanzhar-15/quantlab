@@ -8,7 +8,7 @@ design_ref: docs/architecture/crdt-data-model.md § "D-1: Format-id wire format 
 
 # Phase 5.2 D-1 — fresh-session starting checklist
 
-D-1 is the **active Phase 5.2 item** — multi-day, schema-breaking. **Steps 1-7 of 8 shipped + audited 2026-05-19/20; step 8 (full-arc megaudit) pending.** After D-1, Phase 5 still has 5.3 (conflict resolution), 5.5 V2 V2/V3 (production transport), 5.7 (IDE vertical slice), and 5.8 (Phase 5 megaudit, separate from D-1 step 8) ahead. This doc is the D-1 execution plan + status — fresh sessions reading this should start at the first unchecked step (currently step 8). Per-step audit transcripts: `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..7}-{codex,opus,consolidated}.md`. **Step 8 megaudit closure shipped 2026-05-20 (`<this commit>`):** 3 HIGH + 6 MEDIUM + 1 LOW closed from the 3-way parallel megaudit (Codex + Opus-A + Opus-B); D-1 then signed off as DONE. Three findings deferred to V2 with documented rationale (Opus-B MEDIUM-4 fixture coverage gap, Codex LOW version-coupling enforcement, Opus-B LOW-3 pre-D-1 read_display fallback).
+D-1 is **✅ COMPLETE (SHIPPED 2026-05-20)** — multi-day, schema-breaking. All 8 steps + 7 per-step audits + 1 full-arc 3-way megaudit closed; **see `docs/phase5/d-1-exit-packet.md` for the closure record**. This doc is preserved as D-1's execution-trace history. Per-step audit transcripts: `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..7}-{codex,opus,consolidated}.md`. Step 8 megaudit transcripts: `docs/audits/2026-05-20-phase-5-2-d-1-step-8-megaudit-{codex,opus-a,opus-b,consolidated}.md`. After D-1, Phase 5 still has 5.3 (conflict resolution), 5.5 V2 V2/V3 (production transport), 5.7 (IDE vertical slice), and 5.8 (Phase 5 megaudit, separate from D-1 step 8) ahead — see MASTER-PLAN.md.
 
 ## TL;DR
 
@@ -205,23 +205,35 @@ Initial ship:
 
 2 new tests at audit closure (version 0 rejection, legacy corrupt-Loro fail-loud). Workspace tests: 4277 → 4282 (step 7 ship) → 4284 (audit closure). Full transcripts at `docs/audits/2026-05-20-phase-5-2-d-1-step-7-{codex,opus,consolidated}.md`.
 
-### Step 8: Full-arc megaudit (mandatory per discipline rule) — ⏳ NEXT
+### Step 8: Full-arc megaudit — ✅ SHIPPED 2026-05-20 (`8fc8376ff93` megaudit closures + `6e32c269c22` exit packet)
 
-**Per-step audits (steps 1-7) already shipped** — 7 cycles, **5 consecutive DIVERGENT-HIGH cycles** (steps 3, 4, 5, 6, 7) caught forward-activating bugs that the alternative (defer all audits to step 8) would have shipped. Transcripts at `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..7}-{codex,opus,consolidated}.md`.
+3-way parallel megaudit pattern (Codex + Opus-A + Opus-B) with non-overlapping scopes:
+- **Codex** (cross-step round-trip + workspace grep + step-7 HIGH-1 carryover): PASS on round-trip + grep; 2 MEDIUM (xlsx import/export unresolved-overlay symmetry) + 1 LOW.
+- **Opus-A** (empirical round-trip + adversarial pre-step-4 op synthesis): **CLEAN PASS** (34 probe tests, all passed). Confirmed step-7 HIGH-1 closure correct AND proved the deferred adversarial test feasible.
+- **Opus-B** (fixture coverage + cross-crate invariants + doc drift): 3 HIGH (release-build LEGACY_PEER guard no-op; d-1-checklist intro drift; oplog_persistence docstring references non-existent test) + 4 MEDIUM + 3 LOW.
 
-Step 8 scope:
-- **Full-arc megaudit**: cross-step invariants (schema round-trip end-to-end through `.qbook` → xlsx export → re-import → `.qbook` save → re-load — does the value survive?), workspace-wide grep for any remaining `to_legacy_u32().expect()` or pre-D-1 patterns, fixture coverage gap analysis.
-- **HIGH-1 follow-up from step 7 audit**: deferred adversarial pre-step-4-op-JSON test. Megaudit should grep for any pre-step-4 fixture files OR construct an adversarial test that synthesizes pre-step-4 op JSON via direct LoroList manipulation. If neither yields findings, the documented limitation is the closure.
-- Verify clean-checkout `cargo check` (don't trust pre-commit hook gates alone — the index-padding race struck 3 times in V1 + 1 time in D-1 step 7; recovery via re-stage).
+All 3 HIGH + 6 MEDIUM + 2 LOW closed. 3 LOW deferred to V2 with documented rationale (Opus-B MEDIUM-4 fixture coverage gap, Codex LOW version-coupling enforcement, Opus-B LOW-3 pre-D-1 read_display fallback).
 
-**Estimated total: ~19 hours spent on steps 1-7 + 7 audits (2026-05-19/20); ~1h remaining for step 8 megaudit.** All implementation work (steps 1-7) complete. Only megaudit remains.
+Notable closures:
+- Promoted `debug_assert_ne!` → `assert_ne!` (release-firing) in `CollabSession::new` + `from_snapshot` + `OpLog::set_peer_id`.
+- NEW `crates/ql-oplog/tests/d1_step8_legacy_op_shape.rs` (5 tests): ports Opus-A's adversarial probes for pre-step-4 op JSON shape; pins Codex step-7 HIGH-1 closure as permanent regression.
+- xlsx import/export both now report unresolved-overlay-numfmt + unregistered-overlay-custom (no silent data loss).
+- New `OPLOG_MIN_SUPPORTED_SCHEMA_VERSION` gate (rejects v0); 4 OPLOG_* constants re-exported at `ql_io::*`.
+- 5-site cross-crate doc drift fixes (`CollabSession::export_bytes` + `sweep_presence`, `presence.rs`, `oplog/log.rs`, `crdt-data-model.md`).
+- D-1 exit packet at `docs/phase5/d-1-exit-packet.md`.
+
+Workspace tests: 4284 → 4291 (+7 from megaudit closures). Full transcripts at `docs/audits/2026-05-20-phase-5-2-d-1-step-8-megaudit-{codex,opus-a,opus-b,consolidated}.md`.
+
+**Total D-1: ~20 hours spent on steps 1-7 + 7 audits + megaudit + closures (2026-05-19/20).** All work complete.
 
 ## Pre-flight checklist
 
-Before resuming D-1 at step 8 megaudit, verify:
+D-1 is SHIPPED. This pre-flight is preserved for historical context; a fresh session should consult `docs/phase5/d-1-exit-packet.md` instead.
 
-- [ ] HEAD is at the most recent commit on `feat/quantbook-engine` (`0ad835f6060` as of 2026-05-20 session-end — step 7 audit closures; preceded by `0ccc859958f` step 7 ship + `9c748474c66` step 6 doc refresh).
-- [ ] `cargo test --workspace` reports **4284** passed.
+Final state verification (post-D-1):
+
+- [ ] HEAD is `6e32c269c22` on `feat/quantbook-engine` (D-1 exit packet + 7 surface refreshes).
+- [ ] `cargo test --workspace` reports **4291** passed.
 - [ ] `cargo fmt --all -- --check` clean.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - [ ] No uncommitted source files (`git status --short | grep -v '^??'` empty).

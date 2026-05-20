@@ -542,7 +542,7 @@ The full v1 means all of these crates either ship real behavior or have a docume
 
 ## Phase 5 - Multi-User CRDT Collaboration
 
-**Status (2026-05-19): Phase 5 V1 COMPLETE.** Canonical record: `docs/phase5/v1-exit-packet.md`. Remaining: D-1 (multi-day), 5.3 conflict resolution, 5.5 V2 V2/V3 production transport, 5.7 IDE slice, 5.8 megaudit. D-1 fresh-session entry: `docs/phase5/d-1-starting-checklist.md`.
+**Status (2026-05-20): Phase 5 V1 + D-1 COMPLETE.** Canonical records: `docs/phase5/v1-exit-packet.md` (V1) + `docs/phase5/d-1-exit-packet.md` (D-1 closure). Remaining: 5.3 conflict resolution, 5.5 V2 V2/V3 production transport, 5.7 IDE slice, 5.8 Phase 5 megaudit (separate from D-1 step 8).
 
 **Purpose:** Turn collaboration from a single-writer op log into real multi-user CRDT state for sheets, cells, names, tables, presence, undo/redo, and offline sync.
 
@@ -560,7 +560,7 @@ The full v1 means all of these crates either ship real behavior or have a docume
 **Sub-items**
 
 1. **5.1 Collaboration Data Model Decision** ✅ SHIPPED 2026-05-19 (`918d7efdd91` + `df52cb44ad2`).
-   Loro container shape locked = Option A op-log preservation; 4 audit decisions D-1..D-4 recorded in `docs/architecture/crdt-data-model.md`. D-2/D-3/D-4 implemented; D-1 steps 1-4 of 8 shipped (see 5.2).
+   Loro container shape locked = Option A op-log preservation; 4 audit decisions D-1..D-4 recorded in `docs/architecture/crdt-data-model.md`. D-2/D-3/D-4 implemented; D-1 ✅ SHIPPED 2026-05-20 (see 5.2 + `docs/phase5/d-1-exit-packet.md`).
 
 2. **5.2 `ql-collab` Core Documents** 🟡 IN PROGRESS.
    - ✅ D-2 (`1ca19e2fa37`) AddSheet auto-rename.
