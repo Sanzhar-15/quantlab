@@ -78,27 +78,55 @@
 //! `RepairReport` surfaces these for diagnostics (no silent loss —
 //! per the no-fallback rule).
 //!
-//! ## Known limitations (V1, post-step-3 audit closure)
+//! ## Known limitations (V1, post-step-5 megaudit closure)
 //!
 //! - **Cross-sheet historic-name ambiguity** (when neither historic
 //!   is currently held): two sheets had the same canonical name at
 //!   different chain points, AND neither sheet currently holds that
-//!   name. Rules end up in the vec; rule-iteration order picks the
-//!   winner (sorted by sheet id, so lowest sheet_id's rule fires
-//!   first). Rare; not closed in V1.
+//!   name. Rules from BOTH sheets end up in the vec. The winner is
+//!   determined empirically by **substitution-order consumption**:
+//!   rules are iterated in `sheet_ids.sort_unstable()` order (lowest
+//!   sheet_id first), the first rule's rewrite of the formula text
+//!   removes the historic token, and subsequent rules find nothing to
+//!   match. The DOCS previously said "rule-iteration order picks the
+//!   winner" — the more accurate framing is "first rewrite consumes
+//!   the source token, subsequent rules are no-ops." Step 5 megaudit
+//!   Opus-A Scenario D verified the empirical behavior matches sheet_id
+//!   ordering. Rare; not closed in V1.
 //!
-//! - **Concurrent-rename intermediate names lost**: if peer A's chain
-//!   is S1→S2→S3 with both ops applied in sequence, the intermediate
-//!   name "S2" lives in `old_name` of the second op so it IS captured.
-//!   But if a concurrent rename forced the second op to apply "from"
-//!   a different name (step 2's last-wins policy), the old_name from
-//!   the wire may not reflect what current was at apply-time. Formulas
-//!   referencing that intermediate name may not be repaired. Mitigation
-//!   for future: causality-aware tracking via Loro op-ids (deferred).
+//! - **Concurrent-rename intermediate names** are PRESERVED via the
+//!   `old_name` field of each `RenameSheet` op. The chain walker at
+//!   [`collect_rename_old_names`] accumulates them per sheet_id, so a
+//!   chain S1→S2→S3 (concurrent or sequential) produces
+//!   `historic_canonicals = [S1, S2]` for the relevant sheet_id and
+//!   formulas referencing either intermediate name are rewritten to S3.
+//!   **Step 5 megaudit Opus-A Scenario A empirically validated this**
+//!   for the sequential 3-chain case. The earlier docstring warning
+//!   about "intermediate names lost under last-wins policy" overstated
+//!   the risk; the case where it actually manifests is narrower than
+//!   originally framed. Future V2: causality-aware tracking via Loro
+//!   op-ids (covers edge cases the chain walker can't see).
 //!
-//! - **Step 4 extension**: this V1 only handles sheet renames.
-//!   `Op::RenameTable` + `Op::RenameColumn` need the same treatment;
-//!   step 4 of the Phase 5.3 arc adds them.
+//! - **Whitespace canonicalization side effect** (Step 5 megaudit
+//!   Opus-A Scenario F): formulas touched by the repair pass route
+//!   through `lex → parse → rewrite → print`. The printer normalizes
+//!   whitespace, operator spacing, and function-name case — so a
+//!   formula `"SUM(  t[a] )    +1"` rewritten through the repair pass
+//!   becomes `"SUM(T2[a]) + 1"`. Formulas NOT touched by repair are
+//!   not affected (the rewriter returns `None` when no rule applies,
+//!   leaving the original text in place). This is consistent with the
+//!   producer-side helper at `sheets.rs:42-58`. Future V2: surgical
+//!   diff-only rewrite path that uses source spans rather than parse/
+//!   print round-trip.
+//!
+//! - **Table + column renames** (Step 4 ✅ shipped 2026-05-20 for
+//!   tables; column repair pass deferred to V2):
+//!   `Op::RenameTable` → [`repair_table_rename_chain`] (this module).
+//!   `Op::RenameColumn` repair pass is V2 (Step 5 megaudit Opus-A V1
+//!   LIM #3 + Opus-B MEDIUM-5; tracked in PHASE-4-V2-BACKLOG.md
+//!   Tier H). Until V2, concurrent column renames produce `#NAME?` /
+//!   `#REF?` for concurrent formula edits referencing the old column
+//!   name.
 
 use ql_oplog::{Op, OpLog, OpLogError};
 use ql_storage::Workbook;
@@ -178,6 +206,21 @@ pub fn repair_sheet_rename_chain(
     log: &OpLog,
 ) -> Result<RepairReport, OpLogError> {
     // ===== Phase 1: walk op log; collect historic old_names per sheet.
+    //
+    // **Phase 5.3 step 5 megaudit (Opus-A Probe X HIGH-latent, 2026-05-20):**
+    // a debug-mode caller-contract assert was considered here to catch
+    // "wrong workbook" misuse (calling repair with a stale workbook
+    // produces silent formula corruption). The strict form
+    // (`workbook.sheet(id).name() == log's last RenameSheet new_name`)
+    // tripped on legitimate D-2-style auto-disambiguation paths from
+    // step 2 (where replay legitimately suffixes the target name to
+    // `X(2)` to avoid cross-sheet target collision) — false positive.
+    // The looser forms either gave false negatives for the Probe X case
+    // OR re-implemented replay's policy logic. Closure deferred to the
+    // production wiring fix at `CollabSession::sync_workbook`
+    // (Phase 5.3 step 5b), which enforces the `replay_into → repair_*`
+    // sequence at the API level — caller-contract violations are
+    // impossible from the wrapped path.
     let mut historic_by_sheet: HashMap<SheetId, Vec<String>> = HashMap::new();
     for op_result in log.iter() {
         let op = op_result?;
@@ -321,6 +364,16 @@ fn collect_rename_old_names(op: &Op, historic: &mut HashMap<SheetId, Vec<String>
         _ => {}
     }
 }
+
+// **Phase 5.3 step 5 megaudit closure note (2026-05-20):** a helper
+// `collect_last_rename_new_name` was prototyped here to support a
+// debug-mode caller-contract assert (Opus-A Probe X HIGH-latent). It
+// was reverted because the assert tripped on legitimate D-2-style
+// auto-disambiguation paths (step 2 replay closure) — see the comment
+// at the start of `repair_sheet_rename_chain`. The caller-contract
+// enforcement now lives in `CollabSession::sync_workbook` (Phase 5.3
+// step 5b production-wiring closure) which atomically pairs
+// `replay_into` + `repair_*`.
 
 /// Rewrite `text` (formula source) substituting every reference to
 /// `old_canonical` (a canonical-uppercase sheet name) with `new_name`

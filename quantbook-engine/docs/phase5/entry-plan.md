@@ -183,5 +183,5 @@ Per master plan Phase 5:
 - `docs/phase5/entry-plan.md` ✅ THIS DOC.
 - `docs/phase5/exit-packet.md` — at Phase 5 close.
 - `docs/architecture/crdt-data-model.md` — at 5.1 close.
-- `docs/architecture/conflict-resolution.md` — at 5.3 close.
+- ~~`docs/architecture/conflict-resolution.md` — at 5.3 close.~~ **Superseded**: the conflict-resolution semantics live in `docs/architecture/crdt-data-model.md` § "Conflict resolution semantics" (lines 311+) — a separate file was never created. Phase 5.3 step 5 megaudit Opus-B LOW-2 closure (2026-05-20).
 - Loro upgrade-path notes.

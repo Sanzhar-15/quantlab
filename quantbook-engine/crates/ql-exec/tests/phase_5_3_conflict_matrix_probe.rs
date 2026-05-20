@@ -24,11 +24,12 @@
 //! - Row 4: ClearFormula × PutFormula same address — pinned here
 //! - Row 5: SetName concurrent same name — pinned here
 //! - Row 6: AddSheet × AddSheet same name (D-2 auto-rename) — pinned here
-//! - Row 7: RenameSheet × concurrent edit on sheet — **pinned here as
-//!   PRE-FIX behavior** (#NAME? per D-3 V1 limitation). Phase 5.3
-//!   step 3 ships the rename-repair pass which will MODIFY this test
-//!   to assert the post-fix behavior (formula text rewritten,
-//!   correct value resolves).
+//! - Row 7: RenameSheet × concurrent edit on sheet — pinned here as
+//!   **post-fix behavior** (formula text rewritten + correct value
+//!   resolves) via `ql_collab::repair_sheet_rename_chain` shipped in
+//!   Phase 5.3 step 3 (`e76a9ce5499`). The test invokes the repair pass
+//!   between replay and recompute (caller-driven per audit-locked
+//!   D-5.3-1).
 //! - Row 8: DropTable × concurrent edit referencing T — pinned here
 //!   (D-3 → #NAME?; no repair planned — drop is destructive)
 //!

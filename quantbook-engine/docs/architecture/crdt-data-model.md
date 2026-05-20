@@ -642,7 +642,7 @@ disambiguates.
 
 ### D-3: RenameSheet × concurrent edit — known V1 limitation
 
-**Status:** ✅ SHIPPED at commit `e71312d4bcd` (2026-05-19) — `BindError::UnknownSheet(_)` now maps to `Value::Error(ErrorValue::Name)` in both `recompute_all` and `recompute_dirty`, matching the existing `UnknownTable` / `UnknownTableColumn` treatment. Phase 5.3 will add the causality-aware rename-repair pass; until then `RenameSheet × concurrent-edit` produces `#NAME?` (documented known V1 limitation). Cross-ref `crates/ql-exec/src/workbook_runtime/recompute.rs`.
+**Status:** ✅ SHIPPED at commit `e71312d4bcd` (2026-05-19) — `BindError::UnknownSheet(_)` now maps to `Value::Error(ErrorValue::Name)` in both `recompute_all` and `recompute_dirty`, matching the existing `UnknownTable` / `UnknownTableColumn` treatment. **Phase 5.3 step 3 ✅ shipped 2026-05-20 (`e76a9ce5499`)** adds the causality-aware rename-repair pass via `ql_collab::repair_sheet_rename_chain` — concurrent-rename formulas now RESOLVE post-merge (caller invokes the repair pass between `replay_into` and `recompute_all`; see `ide-consumer-contract.md` § "Post-merge rename-repair"). The `#NAME?` fallback documented above remains in place for cases the repair pass does NOT cover (e.g., concurrent rename + drop, or cross-sheet historic-name ambiguity — see V1 limitations stack). Cross-ref `crates/ql-exec/src/workbook_runtime/recompute.rs` + `crates/ql-collab/src/repair.rs`.
 
 **Source:** Opus H-2 + Codex V5.
 

@@ -8,9 +8,12 @@
 //! merge of concurrent renames — same root cause as the RenameSheet
 //! bug step 2 fixed.
 //!
-//! Post-step-4: replay applies "last-in-causal-order wins" +
-//! D-2-style auto-disambiguation for target collisions (mirroring
-//! step 2).
+//! Post-step-4: replay applies "advisory-skip" on missing source
+//! (concurrent peer renamed it first). Cross-source target collisions
+//! HARD-FAIL via `TableCreateRejected` / `TableColumnRejected`
+//! (audit-locked V1 limitation; step-4 audit Codex+Opus HIGH-1+HIGH-2
+//! closure REVERTED the auto-disambig that would have caused silent
+//! formula corruption — see `docs/audits/2026-05-20-phase-5-3-step-4-consolidated.md`).
 
 use ql_oplog::{replay_into, Op, OpLog};
 use ql_storage::Workbook;

@@ -198,9 +198,15 @@ pub enum ReplayError {
         reason: &'static str,
     },
 
-    /// **W5-118 (Phase 4.8.H):** `DropTable` op references a missing
-    /// table. Surfaces snapshot-vs-replay divergence loudly per
-    /// no-fallbacks doctrine.
+    /// **W5-118 (Phase 4.8.H) + Phase 5.3 step 5 megaudit closure (2026-05-20):**
+    /// originally fired when `DropTable` referenced a missing table. The
+    /// step 5 megaudit (Codex HIGH + Opus-A V1 LIM #4) flagged this as
+    /// producing an order-dependent CRDT-merge failure (drop-then-rename
+    /// works; rename-then-drop hard-failed). The `DropTable` handler now
+    /// advisory-skips on missing source. This variant still fires from
+    /// `apply_rename_table` when the source table doesn't exist AND a
+    /// new-name table doesn't exist either (i.e., not an idempotent
+    /// concurrent-rename case — see `replay.rs:802-820`).
     #[error("replay drop-table at op index {index}: table {name:?} not found")]
     TableNotFound { index: usize, name: String },
 
@@ -344,6 +350,27 @@ impl From<ql_storage::FormatTableError> for FormatRejectedSource {
 /// Returns the total count of ops applied on success. On failure, the
 /// workbook is in a partial state — `ReplayError::At { index, .. }` tells
 /// the caller how far replay got.
+///
+/// # Caller contract on `Err` (Phase 5.3 step 5 megaudit closure)
+///
+/// **`replay_into` is NOT transactional.** On `Err(_)`, the workbook
+/// passed by `&mut` reference is in a HALF-MERGED state: ops 0..index
+/// have been applied; the op at `index` errored; ops at `index+1..` were
+/// not attempted. The mutation is NOT rolled back. The caller MUST
+/// discard the workbook (e.g., re-construct from a clean state then
+/// re-replay up to but not including the failing op) — reusing the
+/// passed-by-mut-ref workbook after `Err` operates on the partial state
+/// and produces incorrect downstream behavior.
+///
+/// This is the audit-locked V1 policy per Phase 5.3 step 5 megaudit
+/// (Opus-A HIGH-1 / V1 LIM #1). The CRDT-merge use case requires
+/// `replay_into` to be safe under concurrent ops; the V1 hard-fails
+/// (e.g., cross-source `RenameTable` target collision) trigger this
+/// partial-state path. Future V2 closure paths considered: workbook
+/// snapshot/restore (memory cost), two-phase replay validate-then-apply
+/// (compute cost), or replay-side soft-fail with synthesized correction
+/// ops (architectural change). For V1, the documentation contract is
+/// the only protection.
 ///
 /// The `registry` parameter is held for API symmetry with `WorkbookRuntime`
 /// and is unused in 2A.3.a (replay persists formula text without
@@ -680,13 +707,23 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             column_names,
         ),
         Op::DropTable { name } => {
+            // **Phase 5.3 step 5 megaudit closure (Codex HIGH + Opus-A
+            // V1 LIM #4, 2026-05-20):** advisory-skip on missing source
+            // under CRDT merge. Pre-closure the handler hard-failed via
+            // `TableNotFound` when the table was already gone, producing
+            // an order-dependent failure:
+            //   drop(T) then rename(T→T2) → OK (rename advisory-skips)
+            //   rename(T→T2) then drop(T) → Err(TableNotFound)
+            // The two orderings are logically equivalent (concurrent
+            // ops on the same table; final state: table absent), so the
+            // hard-fail in one direction is a CRDT-merge regression.
+            //
+            // Post-closure: idempotent skip when the table is gone. This
+            // mirrors the `apply_rename_table` policy at lines 802-820
+            // (advisory-skip on missing source) — same bug class, same
+            // fix shape.
             let canonical = name.to_ascii_uppercase();
-            if workbook.tables_mut().remove(canonical.as_str()).is_none() {
-                return Err(ReplayError::TableNotFound {
-                    index,
-                    name: name.clone(),
-                });
-            }
+            let _ = workbook.tables_mut().remove(canonical.as_str());
             Ok(())
         }
         Op::RenameTable { old_name, new_name } => {

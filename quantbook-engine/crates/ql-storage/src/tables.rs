@@ -198,7 +198,7 @@ impl TableMetadata {
 
     /// Look up a column by case-insensitive name. Returns `(col_idx,
     /// &TableColumn)` on hit. The canonical (lowercase) name lives in
-    /// `TableColumn::name`; this method uppercases the query first so
+    /// `TableColumn::name`; this method lowercases the query first so
     /// callers don't need to pre-canonicalize.
     pub fn lookup_column(&self, name: &str) -> Option<(u32, &TableColumn)> {
         let lower = name.to_ascii_lowercase();
