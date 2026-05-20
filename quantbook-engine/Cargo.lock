@@ -2073,9 +2073,11 @@ name = "ql-collab"
 version = "0.1.0"
 dependencies = [
  "loro",
+ "ql-formula-syntax",
  "ql-functions",
  "ql-oplog",
  "ql-storage",
+ "ql-types",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2094,6 +2096,7 @@ dependencies = [
  "multiversion",
  "proptest",
  "ql-calcgraph",
+ "ql-collab",
  "ql-formula-syntax",
  "ql-functions",
  "ql-io",
