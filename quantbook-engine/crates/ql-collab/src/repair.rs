@@ -54,15 +54,38 @@
 //!
 //! 4. Apply collected updates via `Workbook::put_formula`.
 //!
-//! ## Known limitations (V1)
+//! ## Safety guard: skip rules where `old_canonical` is currently held
 //!
-//! - **Cross-sheet historic-name ambiguity**: if two sheets HAD the
-//!   same canonical name at different points in their respective
-//!   chains (rare — requires a sheet to be renamed away from a name
-//!   that another sheet was THEN renamed to), the rewrite picks the
-//!   "later in iteration" rule. Document but don't resolve. Real
-//!   workflows rarely hit this because D-2 auto-rename prevents
-//!   concurrent identical names.
+//! Step 3 audit closure (Codex HIGH-1 + HIGH-2, 2026-05-20). Two
+//! formula-corruption scenarios drove the guard:
+//!
+//! 1. **Cascade through rewritten names** (Codex HIGH-1): base sheets
+//!    `A` and `B`. Peer renames `B → C`, then `A → B`. Final: sheet 0
+//!    = B, sheet 1 = C. Pre-guard the rules `{A → B, B → C}` would
+//!    apply iteratively: formula `A!A1` → `B!A1` (rule 1) → `C!A1`
+//!    (rule 2). **Wrong** — the cell ends up referencing sheet 1
+//!    when the formula author meant sheet 0 (now named B).
+//!
+//! 2. **Historic names live forever** (Codex HIGH-2): sheet S
+//!    renamed to T. Later, a NEW sheet S is added (after the rename).
+//!    A formula `S!A1` written after the new S is added INTENDS the
+//!    new S. Pre-guard the historic rule `S → T` would rewrite the
+//!    valid current reference to `T!A1`. **Wrong** — corrupts a
+//!    valid formula.
+//!
+//! Closure: **skip rules where `old_canonical` is currently held by
+//! ANY sheet in the workbook**. The `ambiguous_skipped` field of
+//! `RepairReport` surfaces these for diagnostics (no silent loss —
+//! per the no-fallback rule).
+//!
+//! ## Known limitations (V1, post-step-3 audit closure)
+//!
+//! - **Cross-sheet historic-name ambiguity** (when neither historic
+//!   is currently held): two sheets had the same canonical name at
+//!   different chain points, AND neither sheet currently holds that
+//!   name. Rules end up in the vec; rule-iteration order picks the
+//!   winner (sorted by sheet id, so lowest sheet_id's rule fires
+//!   first). Rare; not closed in V1.
 //!
 //! - **Concurrent-rename intermediate names lost**: if peer A's chain
 //!   is S1→S2→S3 with both ops applied in sequence, the intermediate
@@ -95,6 +118,14 @@ pub struct RepairReport {
     /// post-replay, and the historic canonical names whose references
     /// were rewritten. Empty if no sheet had a rename.
     pub sheet_rewrites: Vec<SheetRewriteSummary>,
+
+    /// **Step 3 audit closure (Codex HIGH-1 + HIGH-2, Opus HIGH-1,
+    /// 2026-05-20):** rules that were SKIPPED because their
+    /// `old_canonical` is currently held by another (or the same)
+    /// sheet — applying the rewrite would corrupt formulas that
+    /// legitimately reference the current holder. Surfaced for
+    /// diagnostics per the no-fallback rule.
+    pub ambiguous_rules_skipped: Vec<AmbiguousSkip>,
 }
 
 /// Per-sheet summary line in [`RepairReport`].
@@ -105,6 +136,22 @@ pub struct SheetRewriteSummary {
     /// Historic canonical names from `Op::RenameSheet.old_name`. Sorted
     /// + deduped. Empty iff the sheet had no rename ops in the log.
     pub historic_canonicals: Vec<String>,
+}
+
+/// **Step 3 audit closure entry**: an ambiguous rule the pass refused
+/// to apply because doing so would have corrupted a valid current
+/// reference. See the safety guard in the module docs.
+#[derive(Debug, Clone)]
+pub struct AmbiguousSkip {
+    /// Sheet id whose chain produced this rule.
+    pub origin_sheet: SheetId,
+    /// Historic canonical name (the rule's "old" side).
+    pub historic_canonical: String,
+    /// Sheet id of the current holder of `historic_canonical`. If equal
+    /// to `origin_sheet`, the same sheet was renamed away and then back
+    /// to its starting name (no-op, normally pruned earlier but recorded
+    /// here for completeness).
+    pub current_holder_sheet: SheetId,
 }
 
 /// Walk the op log to build a chain of sheet renames, then rewrite
@@ -137,11 +184,26 @@ pub fn repair_sheet_rename_chain(
         collect_rename_old_names(&op, &mut historic_by_sheet);
     }
 
-    // ===== Phase 2: build (canonical_historic → current_display_name) rules.
-    // Skip pairs where canonical historic matches current canonical (no-op).
-    // For deterministic iteration (and audit reproducibility), sort the rules.
+    // ===== Phase 2: snapshot current canonical names + their owning
+    // sheet ids. Used by the ambiguity guard (step 3 audit closure)
+    // to skip rules whose `old_canonical` is currently held by some
+    // sheet — applying such a rule would corrupt formulas that
+    // legitimately reference the current holder.
+    let sheet_count = workbook.sheet_count() as u16;
+    let mut canonical_to_current_sheet: HashMap<String, SheetId> = HashMap::new();
+    for i in 0..sheet_count {
+        if let Some(s) = workbook.sheet(i) {
+            canonical_to_current_sheet.insert(Workbook::canonical_sheet_name(s.name()), i);
+        }
+    }
+
+    // ===== Phase 3: build (canonical_historic → current_display_name) rules.
+    // Skip pairs where canonical historic matches current canonical (no-op)
+    // OR where `historic_canonical` is currently held by ANY sheet (would
+    // corrupt the current holder's formula refs — Codex+Opus HIGH closure).
     let mut rules: Vec<(String, Arc<str>, SheetId)> = Vec::new();
     let mut sheet_rewrites: Vec<SheetRewriteSummary> = Vec::new();
+    let mut ambiguous_rules_skipped: Vec<AmbiguousSkip> = Vec::new();
     let mut sheet_ids: Vec<SheetId> = historic_by_sheet.keys().copied().collect();
     sheet_ids.sort_unstable();
     for sheet_id in sheet_ids {
@@ -158,7 +220,8 @@ pub fn repair_sheet_rename_chain(
         let current_canonical = Workbook::canonical_sheet_name(&current);
         let current_arc: Arc<str> = Arc::from(current.as_str());
 
-        // Dedupe historic canonicals; skip those matching current canonical.
+        // Dedupe historic canonicals; skip those matching current canonical
+        // (no-op renames).
         let mut historic_canonicals: Vec<String> = historic
             .iter()
             .map(|s| Workbook::canonical_sheet_name(s))
@@ -168,6 +231,27 @@ pub fn repair_sheet_rename_chain(
         historic_canonicals.dedup();
 
         for hc in &historic_canonicals {
+            // **Audit closure (Codex+Opus HIGH-1 + Codex HIGH-2)**: if
+            // `hc` is CURRENTLY held by any sheet, the rule would
+            // corrupt that sheet's legitimate formula references.
+            // E.g., sheet 0 renamed S→T; sheet 1 added as S afterward;
+            // formula `=S!A1` intends sheet 1, not sheet 0. The rule
+            // S→T would mis-rewrite it. Skip and report.
+            //
+            // Symmetric closure of the cascade case (Codex HIGH-1):
+            // sheets 0+1 each renamed; sheet 0's chain `B→C, A→B`
+            // and sheet 1's chain `S→...`. After all renames, sheet 0
+            // is named B. A rule from a DIFFERENT sheet with old=B
+            // would cascade-rewrite formulas that legitimately
+            // reference sheet 0. The guard catches both.
+            if let Some(holder) = canonical_to_current_sheet.get(hc) {
+                ambiguous_rules_skipped.push(AmbiguousSkip {
+                    origin_sheet: sheet_id,
+                    historic_canonical: hc.clone(),
+                    current_holder_sheet: *holder,
+                });
+                continue;
+            }
             rules.push((hc.clone(), Arc::clone(&current_arc), sheet_id));
         }
 
@@ -178,7 +262,18 @@ pub fn repair_sheet_rename_chain(
         });
     }
 
-    // ===== Phase 3: walk formulas, collect updates.
+    // ===== Phase 4: fast-path no-op when no rules survive.
+    // (Audit closure: Opus MEDIUM-2 — empty `rules` should NOT incur
+    // the per-formula iteration cost.)
+    if rules.is_empty() {
+        return Ok(RepairReport {
+            formulas_rewritten: 0,
+            sheet_rewrites,
+            ambiguous_rules_skipped,
+        });
+    }
+
+    // ===== Phase 5: walk formulas, collect updates.
     // Two-phase to avoid mut/immut borrow conflict on workbook.
     let mut to_update: Vec<(SheetId, u32, u32, String)> = Vec::new();
     for (sheet, row, col, text) in workbook.iter_formulas() {
@@ -198,7 +293,7 @@ pub fn repair_sheet_rename_chain(
     }
     let rewrite_count = to_update.len();
 
-    // ===== Phase 4: apply updates.
+    // ===== Phase 6: apply updates.
     for (sheet, row, col, new_text) in to_update {
         workbook.put_formula(sheet, row, col, new_text);
     }
@@ -206,6 +301,7 @@ pub fn repair_sheet_rename_chain(
     Ok(RepairReport {
         formulas_rewritten: rewrite_count,
         sheet_rewrites,
+        ambiguous_rules_skipped,
     })
 }
 

@@ -575,7 +575,233 @@ fn repair_report_carries_diagnostic_information() {
     assert_eq!(summary.historic_canonicals, vec!["SHEET1"]);
 
     // Verify the formula now references "Calculations" (both occurrences).
+    // **Audit closure (Opus LOW-2):** strengthened from "contains" to
+    // pin BOTH occurrences explicitly.
     let f = wb.formula_at(0, 0, 0).unwrap();
-    assert!(f.contains("Calculations"), "got: {f}");
-    assert!(!f.contains("Sheet1"), "got: {f}");
+    assert!(
+        f.contains("Calculations!A1"),
+        "first ref must be rewritten; got: {f}"
+    );
+    assert!(
+        f.contains("Calculations!B2"),
+        "second ref must be rewritten; got: {f}"
+    );
+    assert!(
+        !f.contains("Sheet1!"),
+        "no Sheet1 references should remain; got: {f}"
+    );
+}
+
+// ===== Test 11: Step-3 audit Codex+Opus HIGH-1 (cascade closure) =====
+
+/// **Step 3 audit closure (Codex+Opus HIGH-1):** sheet 0 renamed
+/// `A → B`; sheet 1 (which existed initially as `B`) renamed
+/// `B → C`. Pre-closure both rules would land in the rule vec and
+/// applying them iteratively would cascade `A!X → B!X → C!X` —
+/// silently retargeting a formula meant for sheet 0 (now named B)
+/// to sheet 1. Post-closure: the rule `B → C` is SKIPPED because
+/// `B` is currently held by sheet 0; formula `A!X` rewrites to
+/// `B!X` correctly.
+///
+/// To produce this scenario via the op log: base has sheet 0 (initially
+/// `A`) and sheet 1 (initially `B`). One peer renames sheet 1
+/// `B → C` and sheet 0 `A → B`. (Order matters at producer side; here
+/// we batch them into a single peer's log for simplicity.)
+#[test]
+fn step3_audit_cross_sheet_cascade_does_not_corrupt_formula() {
+    // Base: sheet 0 = "A", sheet 1 = "B".
+    let mut base_log = OpLog::new();
+    base_log
+        .append(Op::AddSheet {
+            name: "A".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+    base_log
+        .append(Op::AddSheet {
+            name: "B".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+    let base = base_log.export_bytes().unwrap();
+
+    // Peer A: rename sheet 1 (B → C) AND sheet 0 (A → B). Both at peer 1.
+    let mut peer_a = fork_with_peer(&base, PEER_A_ID);
+    peer_a
+        .append(Op::RenameSheet {
+            id: 1,
+            old_name: "B".to_owned(),
+            new_name: "C".to_owned(),
+        })
+        .unwrap();
+    peer_a
+        .append(Op::RenameSheet {
+            id: 0,
+            old_name: "A".to_owned(),
+            new_name: "B".to_owned(),
+        })
+        .unwrap();
+
+    // Peer B: concurrent formula referencing original sheet 0 by name "A".
+    let mut peer_b = fork_with_peer(&base, PEER_B_ID);
+    peer_b
+        .append(Op::PutFormula {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            text: "A!A1".to_owned(),
+        })
+        .unwrap();
+
+    peer_a.merge_bytes(&peer_b.export_bytes().unwrap()).unwrap();
+    let mut wb = replay_to_workbook(&peer_a);
+    assert_eq!(wb.sheet(0).unwrap().name(), "B");
+    assert_eq!(wb.sheet(1).unwrap().name(), "C");
+
+    let report = repair_sheet_rename_chain(&mut wb, &peer_a).unwrap();
+
+    // Formula must rewrite to "B!A1" (sheet 0's current name).
+    // Pre-closure the cascade would have produced "C!A1" (sheet 1)
+    // because rule (B → C) would cascade-apply to the just-rewritten
+    // "B!A1".
+    assert_eq!(
+        wb.formula_at(0, 0, 0).map(|s| s.to_string()),
+        Some("B!A1".to_string()),
+        "post-closure: A → B applies, B → C is skipped because B is current. \
+         Pre-closure produced C!A1 (cascade)."
+    );
+
+    // The skipped rule must be recorded in the report for diagnostics.
+    let skipped_b_to_c: Vec<_> = report
+        .ambiguous_rules_skipped
+        .iter()
+        .filter(|s| s.historic_canonical == "B")
+        .collect();
+    assert_eq!(
+        skipped_b_to_c.len(),
+        1,
+        "rule with old='B' must be reported as ambiguous-skipped (current holder = sheet 0)"
+    );
+    assert_eq!(skipped_b_to_c[0].origin_sheet, 1);
+    assert_eq!(skipped_b_to_c[0].current_holder_sheet, 0);
+}
+
+// ===== Test 12: Step-3 audit Codex HIGH-2 (reused name closure) =====
+
+/// **Step 3 audit closure (Codex HIGH-2):** sheet S renamed to T;
+/// later a NEW sheet named S is added. A formula `=S!A1` written
+/// after the new S is added INTENDS the new S. Pre-closure: the
+/// historic rule `S → T` would rewrite the valid current reference
+/// to `T!A1`. Post-closure: the rule is SKIPPED because S is
+/// currently held by sheet 1 (the new S).
+#[test]
+fn step3_audit_historic_name_reused_by_new_sheet_does_not_corrupt() {
+    // Build log: sheet 0 added as "S", renamed to "T", sheet 1 added
+    // as "S" (now a different sheet), formula `=S!A1` on sheet 1.
+    let mut log = OpLog::new();
+    log.append(Op::AddSheet {
+        name: "S".to_owned(),
+        chunk_rows: 16384,
+    })
+    .unwrap();
+    log.append(Op::RenameSheet {
+        id: 0,
+        old_name: "S".to_owned(),
+        new_name: "T".to_owned(),
+    })
+    .unwrap();
+    log.append(Op::AddSheet {
+        name: "S".to_owned(),
+        chunk_rows: 16384,
+    })
+    .unwrap();
+    log.append(Op::PutFormula {
+        sheet: 1,
+        row: 0,
+        col: 0,
+        text: "S!A1".to_owned(),
+    })
+    .unwrap();
+
+    let mut wb = replay_to_workbook(&log);
+    assert_eq!(wb.sheet(0).unwrap().name(), "T");
+    assert_eq!(wb.sheet(1).unwrap().name(), "S");
+
+    let report = repair_sheet_rename_chain(&mut wb, &log).unwrap();
+
+    // Formula `=S!A1` must NOT be rewritten — S is now sheet 1.
+    assert_eq!(
+        wb.formula_at(1, 0, 0).map(|s| s.to_string()),
+        Some("S!A1".to_string()),
+        "post-closure: rule S → T is skipped (S is current sheet 1's name); \
+         formula stays valid. Pre-closure would have rewritten to T!A1."
+    );
+    assert_eq!(
+        report.formulas_rewritten, 0,
+        "no formulas should be rewritten (the only candidate rule was skipped)"
+    );
+
+    // Report MUST surface the skipped rule.
+    let skipped: Vec<_> = report
+        .ambiguous_rules_skipped
+        .iter()
+        .filter(|s| s.historic_canonical == "S")
+        .collect();
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0].origin_sheet, 0);
+    assert_eq!(skipped[0].current_holder_sheet, 1);
+}
+
+// ===== Test 13: cross-sheet formula reference (Opus LOW-1) =====
+
+/// **Step 3 audit closure (Opus LOW-1):** formula lives on sheet T,
+/// references renamed sheet S. The repair must rewrite refs in
+/// formulas regardless of which sheet holds the formula. Most
+/// tests put the formula on the renamed sheet itself; this pins
+/// the cross-sheet rewrite case.
+#[test]
+fn step3_audit_cross_sheet_formula_reference_gets_rewritten() {
+    // Base: sheet 0 = "S", sheet 1 = "T".
+    let mut base_log = OpLog::new();
+    base_log
+        .append(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+    base_log
+        .append(Op::AddSheet {
+            name: "T".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+    let base = base_log.export_bytes().unwrap();
+
+    let log = merged_log_with_concurrent_ops(
+        &base,
+        Op::RenameSheet {
+            id: 0,
+            old_name: "S".to_owned(),
+            new_name: "S2".to_owned(),
+        },
+        // Formula lives on sheet T (id 1), references renamed sheet S (id 0).
+        Op::PutFormula {
+            sheet: 1,
+            row: 5,
+            col: 3,
+            text: "S!A1".to_owned(),
+        },
+    );
+
+    let mut wb = replay_to_workbook(&log);
+    let report = repair_sheet_rename_chain(&mut wb, &log).unwrap();
+
+    assert_eq!(report.formulas_rewritten, 1);
+    // Formula on sheet T was rewritten — `S` (sheet 0's old name)
+    // becomes `S2` (sheet 0's current name).
+    assert_eq!(
+        wb.formula_at(1, 5, 3).map(|s| s.to_string()),
+        Some("S2!A1".to_string()),
+        "cross-sheet ref must be rewritten regardless of holder sheet"
+    );
 }
