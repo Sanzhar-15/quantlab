@@ -332,6 +332,16 @@ fn collect_rename_old_names(op: &Op, historic: &mut HashMap<SheetId, Vec<String>
 /// below ql-exec). Both helpers route through
 /// `ql_formula_syntax::{lex, parse, rewrite_sheet_name_in_expr, print}`.
 ///
+/// **TODO (Opus step 3 audit MEDIUM-1, deferred-to-step-4 follow-up)**:
+/// promote this + `rewrite_formula_with_table_rename` +
+/// `rewrite_formula_with_column_rename` (this module) AND
+/// `rewrite_formula_text_for_sheet_rename` (sheets.rs:37-60) AND
+/// the inlined table/column rewrites (tables.rs:316-336, 471-490)
+/// to a single public helper in `ql-formula-syntax`. All 5+ call
+/// sites would converge on one implementation, preventing drift.
+/// Deferred to a separate refactor commit to keep step 4 scoped to
+/// the audit-locked algorithm + tests.
+///
 /// Returns `None` when:
 /// - The text doesn't lex/parse (formula is malformed — caller should
 ///   not surface this as an error; recompute will surface it).
@@ -355,4 +365,223 @@ fn rewrite_formula_with_rename(
         printed
     };
     Some(with_eq)
+}
+
+/// **Phase 5.3 step 4 (2026-05-20):** table-rename analog of
+/// [`repair_sheet_rename_chain`]. After a CRDT merge with concurrent
+/// table renames, formulas using `T[col]` structured references may
+/// reference table names that no longer exist. This pass rewrites
+/// the formula text to reference the current table name.
+///
+/// Algorithm mirrors the sheet version: chain-based, with the same
+/// safety guard (skip rules where `old_canonical` is currently held
+/// by ANY table — closes the cascade + reused-name corruption cases
+/// surfaced in step 3 audit).
+///
+/// Returns a [`TableRepairReport`] describing what was changed.
+///
+/// **Caller-driven**: invoke between `replay_into` and `recompute_all`
+/// (same call sequence as [`repair_sheet_rename_chain`]).
+pub fn repair_table_rename_chain(
+    workbook: &mut Workbook,
+    log: &OpLog,
+) -> Result<TableRepairReport, OpLogError> {
+    // Phase 1: collect historic table names from RenameTable ops.
+    // Tables are keyed by canonical (uppercase) name, NOT by id —
+    // unlike sheets which carry stable IDs. So our "chain" is keyed
+    // by NEW canonical name (the current key), with old_name as a
+    // value we map back from.
+    let mut historic_by_current: HashMap<String, Vec<String>> = HashMap::new();
+    // Use causal-order replay to know which historic name maps to
+    // which final canonical: replay the chain in op order, tracking
+    // each "current -> next" hop. After all ops, historic_by_current
+    // maps "current canonical (post-merge)" to its chain of old names.
+    let mut canonical_chain: HashMap<String, String> = HashMap::new(); // old -> new
+    for op_result in log.iter() {
+        let op = op_result?;
+        collect_table_renames(&op, &mut canonical_chain, &mut historic_by_current);
+    }
+
+    // Phase 2: snapshot current canonical names.
+    let current_table_canonicals: std::collections::HashSet<String> = workbook
+        .tables()
+        .iter()
+        .map(|(name, _)| name.to_ascii_uppercase())
+        .collect();
+
+    // Phase 3: build (canonical_historic -> current_display_name) rules.
+    // For each current table, walk its historic chain. Skip rules where
+    // the old_canonical is currently held by ANY table (safety guard
+    // mirroring step 3 audit closure).
+    let mut rules: Vec<(String, Arc<str>)> = Vec::new();
+    let mut table_rewrites: Vec<TableRewriteSummary> = Vec::new();
+    let mut ambiguous_rules_skipped: Vec<TableAmbiguousSkip> = Vec::new();
+    for current_canonical in &current_table_canonicals {
+        let Some(historic_set) = historic_by_current.get(current_canonical) else {
+            continue;
+        };
+        // Resolve current display name from the workbook.
+        let Some(meta) = workbook.tables().lookup(current_canonical) else {
+            continue;
+        };
+        let current_display: Arc<str> = Arc::clone(&meta.display_name);
+        let mut historic_canonicals: Vec<String> = historic_set
+            .iter()
+            .map(|s| s.to_ascii_uppercase())
+            .filter(|c| c != current_canonical)
+            .collect();
+        historic_canonicals.sort();
+        historic_canonicals.dedup();
+        for hc in &historic_canonicals {
+            if current_table_canonicals.contains(hc) {
+                // Safety guard: another table currently owns this
+                // historic name. Skip + report.
+                ambiguous_rules_skipped.push(TableAmbiguousSkip {
+                    origin_table_current_canonical: current_canonical.clone(),
+                    historic_canonical: hc.clone(),
+                });
+                continue;
+            }
+            rules.push((hc.clone(), Arc::clone(&current_display)));
+        }
+        table_rewrites.push(TableRewriteSummary {
+            current_canonical: current_canonical.clone(),
+            current_display_name: current_display.to_string(),
+            historic_canonicals,
+        });
+    }
+
+    if rules.is_empty() {
+        return Ok(TableRepairReport {
+            formulas_rewritten: 0,
+            table_rewrites,
+            ambiguous_rules_skipped,
+        });
+    }
+
+    // Phase 4: walk formulas, collect updates.
+    let mut to_update: Vec<(SheetId, u32, u32, String)> = Vec::new();
+    for (sheet, row, col, text) in workbook.iter_formulas() {
+        let mut current_text = text.to_string();
+        let mut changed = false;
+        for (old_canonical, new_display) in &rules {
+            if let Some(rewritten) =
+                rewrite_formula_with_table_rename(&current_text, old_canonical, new_display)
+            {
+                current_text = rewritten;
+                changed = true;
+            }
+        }
+        if changed {
+            to_update.push((sheet, row, col, current_text));
+        }
+    }
+    let rewrite_count = to_update.len();
+
+    // Phase 5: apply updates.
+    for (sheet, row, col, new_text) in to_update {
+        workbook.put_formula(sheet, row, col, new_text);
+    }
+
+    Ok(TableRepairReport {
+        formulas_rewritten: rewrite_count,
+        table_rewrites,
+        ambiguous_rules_skipped,
+    })
+}
+
+/// Walk an `Op` (including BatchCommit-nested) and update the
+/// (old → new) canonical chain + accumulate historic canonicals
+/// per current canonical.
+fn collect_table_renames(
+    op: &Op,
+    canonical_chain: &mut HashMap<String, String>,
+    historic_by_current: &mut HashMap<String, Vec<String>>,
+) {
+    match op {
+        Op::RenameTable { old_name, new_name } => {
+            let old_c = old_name.to_ascii_uppercase();
+            let new_c = new_name.to_ascii_uppercase();
+            // Resolve the ROOT historic for this old name (if it was
+            // itself a renamed intermediate). Walk forward through the
+            // existing chain.
+            let mut chain_root = old_c.clone();
+            while let Some(next) = canonical_chain.get(&chain_root) {
+                if next == &chain_root {
+                    break;
+                }
+                chain_root = next.clone();
+            }
+            // Record old_c → new_c hop.
+            canonical_chain.insert(old_c.clone(), new_c.clone());
+            // historic_by_current[new_c] gets old_c appended (the
+            // most recent old name for this final canonical).
+            historic_by_current
+                .entry(new_c.clone())
+                .or_default()
+                .push(old_c.clone());
+            // Also propagate prior chain: if old_c had its own
+            // historic entries, move them to new_c.
+            if let Some(prior) = historic_by_current.remove(&old_c) {
+                for p in prior {
+                    historic_by_current
+                        .entry(new_c.clone())
+                        .or_default()
+                        .push(p);
+                }
+            }
+        }
+        Op::BatchCommit { ops } => {
+            for inner in ops {
+                collect_table_renames(inner, canonical_chain, historic_by_current);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Table-rename analog of [`rewrite_formula_with_rename`]. Routes
+/// through `ql_formula_syntax::rewrite_table_ref`.
+fn rewrite_formula_with_table_rename(
+    text: &str,
+    old_canonical: &str,
+    new_name: &Arc<str>,
+) -> Option<String> {
+    let stripped = text.strip_prefix('=').unwrap_or(text);
+    let tokens = ql_formula_syntax::lex(stripped).ok()?;
+    let expr = ql_formula_syntax::parse(tokens).ok()?;
+    let rewritten = ql_formula_syntax::rewrite_table_ref(&expr, old_canonical, new_name);
+    if rewritten == expr {
+        return None;
+    }
+    let printed = ql_formula_syntax::print(&rewritten);
+    let with_eq = if text.starts_with('=') {
+        format!("={printed}")
+    } else {
+        printed
+    };
+    Some(with_eq)
+}
+
+/// Report for [`repair_table_rename_chain`].
+#[derive(Debug, Clone, Default)]
+pub struct TableRepairReport {
+    pub formulas_rewritten: usize,
+    pub table_rewrites: Vec<TableRewriteSummary>,
+    pub ambiguous_rules_skipped: Vec<TableAmbiguousSkip>,
+}
+
+/// Per-table summary line in [`TableRepairReport`].
+#[derive(Debug, Clone)]
+pub struct TableRewriteSummary {
+    pub current_canonical: String,
+    pub current_display_name: String,
+    pub historic_canonicals: Vec<String>,
+}
+
+/// Skipped table rule due to current-holder ambiguity.
+#[derive(Debug, Clone)]
+pub struct TableAmbiguousSkip {
+    pub origin_table_current_canonical: String,
+    pub historic_canonical: String,
 }

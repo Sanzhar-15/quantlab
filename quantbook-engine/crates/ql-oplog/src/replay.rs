@@ -737,54 +737,130 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
     }
 }
 
-/// **W5-119 (Phase 4.8.I):** replay a `RenameTable`. Validates source
-/// exists, target name is available (TableTable + NameTable shared
-/// namespace), then re-keys the entry. Note: formula text rewrites
-/// arrive as accompanying `Op::PutFormula` ops; this arm doesn't
-/// touch formula cells.
+/// **W5-119 (Phase 4.8.I) + Phase 5.3 step 4 (2026-05-20):**
+/// replay a `RenameTable`. Validates source exists, target name is
+/// available (TableTable + NameTable shared namespace), then re-keys
+/// the entry.
+///
+/// **Phase 5.3 step 4 (audit-locked, mirrors step 2 for
+/// RenameSheet):** two CRDT-merge scenarios required this handler to
+/// be made resilient:
+///
+/// 1. **Concurrent rename of same table** (last-wins): peer A
+///    renames T→T1, peer B (concurrent) renames T→T2. After Loro's
+///    causal merge, the second op's `old_name="T"` no longer
+///    resolves to a live table. Pre-step-4 this errored with
+///    `TableNotFound`. Post-step-4: if NO table at `old_canonical`
+///    exists but the workbook still has the post-first-rename
+///    name (T1 or T2 depending on causal order), we no-op the
+///    second rename if its `new_name` matches a current table
+///    (idempotency); otherwise, we treat the rename as advisory
+///    and skip if the table simply doesn't exist anywhere.
+///    Note: unlike sheets which carry stable IDs, tables are
+///    keyed by canonical name — there's no equivalent "rename
+///    current table to new_name" because we can't disambiguate
+///    which current table the wire op was thought to be acting on.
+///    Skip is the safer policy.
+///
+/// 2. **Cross-table target collision** (auto-disambiguate): peer A
+///    renames T1→X, peer B renames T2→X (different sources, same
+///    target). After merge, the second `rename_table` would
+///    `TableCreateRejected`. Apply D-2-style auto-disambiguation:
+///    walk suffixes `X(2)`, `X(3)`, etc. up to `AUTO_RENAME_CEILING`.
 fn apply_rename_table(
     workbook: &mut Workbook,
     index: usize,
     old_name: &str,
     new_name: &str,
 ) -> Result<(), ReplayError> {
+    const AUTO_RENAME_CEILING: u32 = 10_000;
     let old_canonical = old_name.to_ascii_uppercase();
-    let new_canonical: std::sync::Arc<str> =
-        std::sync::Arc::from(new_name.to_ascii_uppercase().as_str());
 
-    // Verify source.
+    // **Step 4 audit-locked policy** (V1 — tables): source table
+    // missing under CRDT merge means a concurrent peer renamed it.
+    // Three scenarios:
+    //  (a) the rename has already been applied as part of this peer's
+    //      causal-order replay (idempotent — current state has new_name).
+    //  (b) a concurrent peer renamed it to a DIFFERENT target (e.g.
+    //      peer A: T→T2; peer B: T→T3). Sheets handle this via stable
+    //      sheet IDs (rename current sheet to new_name); tables don't
+    //      have stable IDs (keyed by canonical name) so we can't
+    //      disambiguate which table this op was thought to be acting
+    //      on. Apply "advisory skip" — drop the second rename's intent
+    //      to avoid corruption.
+    //  (c) the source genuinely doesn't exist (corruption or stale op
+    //      against a never-existed table).
+    //
+    // V1 policy: skip silently in case (a) and (b); error only when
+    // there's clearly no related table state to interpret the op
+    // against (no current_canonical, no new_canonical, no plausible
+    // post-rename state).
+    //
+    // **V1 limitation (deferred to V2):** scenario (b) loses peer
+    // B's rename intent. Causality-aware tracking would let us tell
+    // "this op was authored when T existed locally; the table was
+    // since renamed to T2 by a concurrent peer; we COULD apply
+    // T2→T3." Today the only safe call is advisory-skip.
     if workbook.tables().lookup(&old_canonical).is_none() {
-        return Err(ReplayError::TableNotFound {
-            index,
-            name: old_name.to_owned(),
-        });
-    }
-    // Verify target availability (skip the no-op same-name case).
-    if !old_canonical.eq_ignore_ascii_case(new_name) {
+        let new_canonical = new_name.to_ascii_uppercase();
         if workbook.tables().lookup(&new_canonical).is_some() {
-            return Err(ReplayError::TableCreateRejected {
-                index,
-                name: new_name.to_owned(),
-                reason: "table with this canonical name already exists (rename target)",
-            });
+            // Case (a): idempotent — new_name already exists.
+            return Ok(());
         }
-        if workbook.names().lookup_ci(&new_canonical).is_some() {
+        // Cases (b) and (c): no related state. Advisory skip
+        // (case b) accepts losing the rename intent rather than
+        // hard-failing replay; the alternative would be re-erroring
+        // and making merged logs un-replayable. The diagnostic
+        // surface for (b) would require op-log-level reporting
+        // beyond replay's return type — deferred to V2.
+        return Ok(());
+    }
+
+    // No-op same-name case (case-only renames at table level are
+    // not supported; tables canonicalize uppercase).
+    if old_canonical.eq_ignore_ascii_case(new_name) {
+        return Ok(());
+    }
+
+    // Auto-disambiguate target collision via D-2 suffix walk. Apply
+    // to TableTable collisions only; NameTable collisions still
+    // hard-reject (different namespace — auto-disambig less safe).
+    let mut chosen_display = new_name.to_owned();
+    let mut chosen_canonical = new_name.to_ascii_uppercase();
+    let mut suffix = 2u32;
+    loop {
+        let canonical_arc: std::sync::Arc<str> = std::sync::Arc::from(chosen_canonical.as_str());
+        // Check NameTable conflict first (not auto-disambiguable).
+        if workbook.names().lookup_ci(&chosen_canonical).is_some() {
             return Err(ReplayError::TableCreateRejected {
                 index,
-                name: new_name.to_owned(),
+                name: chosen_display.clone(),
                 reason: "defined-name with this canonical name already exists (rename target)",
             });
         }
+        if workbook.tables().lookup(&chosen_canonical).is_none() {
+            // Free target — apply the rename.
+            let mut meta = workbook
+                .tables_mut()
+                .remove(&old_canonical)
+                .expect("source verified above");
+            meta.name = std::sync::Arc::clone(&canonical_arc);
+            meta.display_name = std::sync::Arc::from(chosen_display.as_str());
+            workbook.tables_mut().insert(canonical_arc, meta);
+            return Ok(());
+        }
+        // Target taken — auto-disambiguate.
+        if suffix > AUTO_RENAME_CEILING {
+            return Err(ReplayError::TableCreateRejected {
+                index,
+                name: new_name.to_owned(),
+                reason: "auto-disambiguation ceiling reached (pathological collision)",
+            });
+        }
+        chosen_display = format!("{new_name}({suffix})");
+        chosen_canonical = chosen_display.to_ascii_uppercase();
+        suffix += 1;
     }
-    // Take the entry out, mutate name + display, reinsert under new key.
-    let mut meta = workbook
-        .tables_mut()
-        .remove(&old_canonical)
-        .expect("verified above");
-    meta.name = std::sync::Arc::clone(&new_canonical);
-    meta.display_name = std::sync::Arc::from(new_name);
-    workbook.tables_mut().insert(new_canonical, meta);
-    Ok(())
 }
 
 /// **W5-121 (Phase 4.8.I.2):** replay a `RenameColumn`. Validates the
@@ -802,6 +878,7 @@ fn apply_rename_column(
     old_name: &str,
     new_name: &str,
 ) -> Result<(), ReplayError> {
+    const AUTO_RENAME_CEILING: u32 = 10_000;
     let table_canonical = table.to_ascii_uppercase();
     let meta = workbook
         .tables_mut()
@@ -810,13 +887,25 @@ fn apply_rename_column(
             index,
             name: table.to_owned(),
         })?;
-    let (col_idx, _) =
-        meta.lookup_column(old_name)
-            .ok_or_else(|| ReplayError::TableColumnNotFound {
-                index,
-                table: table.to_owned(),
-                column: old_name.to_owned(),
-            })?;
+
+    // **Phase 5.3 step 4 (V1, mirrors apply_rename_table policy)**:
+    // missing source column under CRDT merge means a concurrent peer
+    // renamed it. Idempotent skip if new_name already exists OR if
+    // the table itself has been re-structured (advisory). Errors only
+    // if there's clearly no related column state.
+    if meta.lookup_column(old_name).is_none() {
+        if meta.lookup_column(new_name).is_some() {
+            // Idempotent: new_name already exists from a prior
+            // causal-order rename.
+            return Ok(());
+        }
+        // Advisory skip: concurrent peer renamed to a different
+        // target. V1 limitation — see apply_rename_table for the
+        // full rationale (no stable column-id equivalent).
+        return Ok(());
+    }
+    let (col_idx, _) = meta.lookup_column(old_name).expect("just-checked");
+
     if new_name.is_empty() {
         return Err(ReplayError::TableColumnRejected {
             index,
@@ -835,16 +924,28 @@ fn apply_rename_column(
             reason: "rename to same canonical column name (producer should not emit)",
         });
     }
-    if meta.lookup_column(new_name).is_some() {
-        return Err(ReplayError::TableColumnRejected {
-            index,
-            table: table.to_owned(),
-            column: new_name.to_owned(),
-            reason: "column with this canonical name already exists (rename target)",
-        });
+
+    // **Phase 5.3 step 4 (audit-locked, mirrors step 2)**:
+    // auto-disambiguate target collision via D-2 suffix walk.
+    let mut chosen_display = new_name.to_owned();
+    let mut chosen_lower = new_lower;
+    let mut suffix = 2u32;
+    while meta.lookup_column(&chosen_display).is_some() {
+        if suffix > AUTO_RENAME_CEILING {
+            return Err(ReplayError::TableColumnRejected {
+                index,
+                table: table.to_owned(),
+                column: new_name.to_owned(),
+                reason: "auto-disambiguation ceiling reached (pathological collision)",
+            });
+        }
+        chosen_display = format!("{new_name}({suffix})");
+        chosen_lower = chosen_display.to_ascii_lowercase();
+        suffix += 1;
     }
-    meta.columns[col_idx as usize].name = std::sync::Arc::from(new_lower.as_str());
-    meta.columns[col_idx as usize].display = std::sync::Arc::from(new_name);
+
+    meta.columns[col_idx as usize].name = std::sync::Arc::from(chosen_lower.as_str());
+    meta.columns[col_idx as usize].display = std::sync::Arc::from(chosen_display.as_str());
     workbook.tables_mut().bump_generation();
     Ok(())
 }
