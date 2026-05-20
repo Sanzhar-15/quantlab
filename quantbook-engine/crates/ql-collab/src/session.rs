@@ -398,8 +398,8 @@ impl CollabSession {
     ///
     /// # Why the workbook is constructed internally
     ///
-    /// **Phase 5.3 step 5b audit closure (Codex MEDIUM-1 + Opus HIGH-2
-    /// + HIGH-3):** the prior `sync_workbook(&self, &mut Workbook,
+    /// **Phase 5.3 step 5b audit closure (Codex MEDIUM-1, Opus HIGH-2,
+    /// Opus HIGH-3):** the prior `sync_workbook(&self, &mut Workbook,
     /// &FunctionRegistry)` shape took the workbook by mut-ref. Both
     /// auditors flagged the same silent-corruption class:
     ///

@@ -13,9 +13,10 @@
 //!
 //! ## Caller contract
 //!
-//! Both repair functions in this module (`repair_sheet_rename_chain`
-//! + `repair_table_rename_chain` shipped in step 4) are
-//! **caller-driven**, NOT hooked into `merge_bytes`. Audit-locked
+//! The three repair functions in this module
+//! (`repair_sheet_rename_chain`, `repair_table_rename_chain` shipped
+//! in step 4, and `repair_column_rename_chain` shipped in step 5c)
+//! are **caller-driven**, NOT hooked into `merge_bytes`. Audit-locked
 //! design decision D-5.3-1 (see `quantbook-engine/.plans/_active.md`).
 //!
 //! **Recommended path (Phase 5.3 step 5b + audit closure):** use the
@@ -146,7 +147,7 @@
 //!   per table (rules keyed by `(table_canonical, col_canonical)`).
 //!   The canonical repair sequence at
 //!   [`crate::CollabSession::rebuild_workbook`] runs:
-//!     `replay_into → sheet repair → table repair → column repair`.
+//!   `replay_into → sheet repair → table repair → column repair`.
 //!   Order matters: column repair runs LAST because column rules need
 //!   the post-table-repair canonical name to bind correctly.
 
@@ -675,14 +676,23 @@ pub struct TableAmbiguousSkip {
 /// table — refs to OTHER tables' columns of the same name are
 /// untouched.
 ///
-/// The chain walker uses the table canonical AS RECORDED in each
-/// `Op::RenameColumn` op. If the table itself was renamed
-/// concurrently and the column rename's table is no longer current,
-/// the rule is silently dropped (V1 limitation — same pattern as the
-/// concurrent-rename intermediate-names case for sheets / tables; see
-/// module docs § Known limitations). Production-side renames always
-/// emit the column op AFTER the table rename in the same chain, so
-/// this affects only adversarial cross-peer interleavings.
+/// The chain walker uses each `Op::RenameColumn` op's wire `table`
+/// field, RESOLVED through the table-rename chain to its current
+/// canonical (Phase 5.3 step 5c audit closure for Codex+Opus
+/// convergent HIGH-1 + Opus M1 silent-rule-drop). Without the
+/// resolve step, formulas referencing the table by its current
+/// post-table-repair canonical wouldn't match the column rule.
+///
+/// **V1 limitation**: in single-writer / linear-history flows the
+/// producer emits the column op AFTER any table rename in the same
+/// chain, so the wire `table` always matches the current canonical
+/// at that point — no resolution needed. Under CRDT-merged
+/// multi-peer flows (e.g., peer A renames table; peer B renames
+/// column with the historic table name), the table-rename chain
+/// resolves correctly when the wire `table` IS in the chain. If
+/// the table was dropped entirely (no chain entry), the column
+/// rule is silently dropped — V2 closure: causality-aware tracking
+/// via Loro op-ids.
 ///
 /// **Order matters when chained with the other repair passes:**
 /// the canonical sequence is `replay_into` → `repair_sheet_rename_chain`
@@ -704,15 +714,54 @@ pub fn repair_column_rename_chain(
     workbook: &mut Workbook,
     log: &OpLog,
 ) -> Result<ColumnRepairReport, OpLogError> {
-    // ===== Phase 1: walk op log; for each Op::RenameColumn, record
-    // (table_canonical, old_col_canonical) → eventual new_col_canonical.
+    // ===== Phase 1a: walk op log to build the TABLE-rename chain.
     //
-    // historic_by_current_per_table[(table_canonical_UPPER, new_col_canonical_LOWER)] =
+    // **Phase 5.3 step 5c audit closure (Codex+Opus convergent HIGH-1
+    // + Opus M1 silent-rule-drop, 2026-05-20):** when a table is
+    // renamed concurrent with one of its column renames, the column
+    // rename op's `table` field carries the HISTORIC table name (the
+    // name peer B knew). After the table-rename repair pass rewrites
+    // formulas to use the CURRENT canonical, this column repair pass
+    // must use that CURRENT canonical too — otherwise the rule
+    // `(historic_table, col) → new_col_display` won't match any
+    // formula text (which now references `current_table[col]`) and
+    // the rule is silently dropped.
+    //
+    // Solution: pre-walk the log to build a table-rename chain map
+    // (historic_canonical → current_canonical), then resolve each
+    // column rename op's `table` through the chain before keying
+    // historic_by_current. Closes Opus M1 silent rule-drop +
+    // backstops H1 closure for the rare ordering where the table
+    // rename happens BEFORE the column op produces an "old" rule.
+    let mut table_chain: HashMap<String, String> = HashMap::new();
+    for op_result in log.iter() {
+        let op = op_result?;
+        collect_table_rename_chain(&op, &mut table_chain);
+    }
+    // Phase 1b: resolve transitive chains (T → A → B → C ⇒ T → C, A → C, B → C).
+    let resolve = |historic: &str| -> String {
+        let mut current = historic.to_string();
+        // Bounded loop guards against pathological cycle in malformed
+        // logs (cycle CAN'T legitimately occur in CRDT-merged Loro logs
+        // — Op::RenameTable always emits old != new — but defensive).
+        for _ in 0..1024 {
+            match table_chain.get(&current) {
+                Some(next) if next != &current => current = next.clone(),
+                _ => break,
+            }
+        }
+        current
+    };
+
+    // ===== Phase 1c: walk op log; for each Op::RenameColumn, record
+    // (resolved_table_canonical, old_col_canonical) → eventual new_col_canonical.
+    //
+    // historic_by_current[(table_canonical_CURRENT_UPPER, new_col_canonical_LOWER)] =
     //   Vec<historic_col_canonicals_LOWER>
     let mut historic_by_current: HashMap<(String, String), Vec<String>> = HashMap::new();
     for op_result in log.iter() {
         let op = op_result?;
-        collect_column_renames(&op, &mut historic_by_current);
+        collect_column_renames_with_resolve(&op, &mut historic_by_current, &resolve);
     }
 
     // ===== Phase 2: snapshot per-table current column canonicals.
@@ -745,7 +794,7 @@ pub fn repair_column_rename_chain(
     let mut ambiguous_rules_skipped: Vec<ColumnAmbiguousSkip> = Vec::new();
     let mut keys: Vec<&(String, String)> = historic_by_current.keys().collect();
     keys.sort();
-    for &(ref table_canonical, ref current_col_canonical) in &keys {
+    for (table_canonical, current_col_canonical) in &keys {
         // Skip if table isn't in current workbook (concurrent table drop
         // or rename — V1 limitation, same pattern as table-rename intermediate-names).
         let Some(cols_in_table) = current_columns_per_table.get(table_canonical) else {
@@ -760,12 +809,15 @@ pub fn repair_column_rename_chain(
 
         // Dedupe historic canonicals; drop ones matching current (no-op renames).
         let historic = historic_by_current
-            .get(&(table_canonical.clone(), current_col_canonical.clone()))
+            .get(&(
+                table_canonical.to_string(),
+                current_col_canonical.to_string(),
+            ))
             .cloned()
             .unwrap_or_default();
         let mut historic_canonicals: Vec<String> = historic
             .into_iter()
-            .filter(|c| c != current_col_canonical)
+            .filter(|c| c != current_col_canonical.as_str())
             .collect();
         historic_canonicals.sort();
         historic_canonicals.dedup();
@@ -778,23 +830,22 @@ pub fn repair_column_rename_chain(
             // `hc`.
             if let Some(holder_display) = cols_in_table.get(hc) {
                 ambiguous_rules_skipped.push(ColumnAmbiguousSkip {
-                    table_canonical: table_canonical.clone(),
+                    table_canonical: table_canonical.to_string(),
                     historic_canonical: hc.clone(),
-                    current_holder_col_canonical: hc.clone(),
                     current_holder_col_display: holder_display.to_string(),
                 });
                 continue;
             }
             rules.push((
-                table_canonical.clone(),
+                table_canonical.to_string(),
                 hc.clone(),
                 Arc::clone(&current_col_display_arc),
             ));
         }
 
         column_rewrites.push(ColumnRewriteSummary {
-            table_canonical: table_canonical.clone(),
-            current_col_canonical: current_col_canonical.clone(),
+            table_canonical: table_canonical.to_string(),
+            current_col_canonical: current_col_canonical.to_string(),
             current_col_display_name: current_col_display_arc.to_string(),
             historic_canonicals,
         });
@@ -843,32 +894,70 @@ pub fn repair_column_rename_chain(
     })
 }
 
+/// **Phase 5.3 step 5c audit closure (Codex+Opus HIGH-1 + Opus M1,
+/// 2026-05-20):** walk an `Op` (including BatchCommit-nested) and
+/// accumulate the TABLE rename chain. Used by
+/// [`repair_column_rename_chain`] to resolve column ops' wire table
+/// names to their current post-merge canonical, so column repair
+/// rules key off the CURRENT table (matching post-table-repair
+/// formula text), not the historic table.
+fn collect_table_rename_chain(op: &Op, chain: &mut HashMap<String, String>) {
+    match op {
+        Op::RenameTable { old_name, new_name } => {
+            let old_c = old_name.to_ascii_uppercase();
+            let new_c = new_name.to_ascii_uppercase();
+            chain.insert(old_c, new_c);
+        }
+        Op::BatchCommit { ops } => {
+            for inner in ops {
+                collect_table_rename_chain(inner, chain);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Walk an `Op` (including BatchCommit-nested) and accumulate column
-/// rename chains keyed by `(table_canonical_UPPER, new_col_canonical_LOWER)`.
-/// Mirrors [`collect_table_renames`].
-fn collect_column_renames(
+/// rename chains keyed by `(resolved_table_canonical_UPPER, new_col_canonical_LOWER)`.
+///
+/// **Phase 5.3 step 5c audit closure**: takes a `resolve_table` closure
+/// that maps historic table canonical → CURRENT canonical via the
+/// table-rename chain walked separately. This ensures column rules
+/// match post-table-repair formula text. See module docs § "Cross-kind
+/// table×column rename interaction (V1 limitation closure)".
+fn collect_column_renames_with_resolve<F>(
     op: &Op,
     historic_by_current: &mut HashMap<(String, String), Vec<String>>,
-) {
+    resolve_table: &F,
+) where
+    F: Fn(&str) -> String,
+{
     match op {
         Op::RenameColumn {
             table,
             old_name,
             new_name,
         } => {
-            let table_canonical = table.to_ascii_uppercase();
+            // Resolve wire table canonical → CURRENT canonical via the
+            // table rename chain. Without this, formulas referencing
+            // the table by its current name (post table-repair) miss
+            // the column rule (Opus M1 silent rule-drop closure).
+            let wire_table_canonical = table.to_ascii_uppercase();
+            let resolved_table_canonical = resolve_table(&wire_table_canonical);
             let old_c = old_name.to_ascii_lowercase();
             let new_c = new_name.to_ascii_lowercase();
             historic_by_current
-                .entry((table_canonical.clone(), new_c.clone()))
+                .entry((resolved_table_canonical.clone(), new_c.clone()))
                 .or_default()
                 .push(old_c.clone());
-            // Propagate prior: if (table, old_c) had historic entries,
-            // move them under (table, new_c).
-            if let Some(prior) = historic_by_current.remove(&(table_canonical.clone(), old_c)) {
+            // Propagate prior: if (resolved_table, old_c) had historic
+            // entries, move them under (resolved_table, new_c).
+            if let Some(prior) =
+                historic_by_current.remove(&(resolved_table_canonical.clone(), old_c))
+            {
                 for p in prior {
                     historic_by_current
-                        .entry((table_canonical.clone(), new_c.clone()))
+                        .entry((resolved_table_canonical.clone(), new_c.clone()))
                         .or_default()
                         .push(p);
                 }
@@ -876,7 +965,7 @@ fn collect_column_renames(
         }
         Op::BatchCommit { ops } => {
             for inner in ops {
-                collect_column_renames(inner, historic_by_current);
+                collect_column_renames_with_resolve(inner, historic_by_current, resolve_table);
             }
         }
         _ => {}
@@ -937,12 +1026,24 @@ pub struct ColumnRewriteSummary {
 
 /// Skipped column rule due to current-holder ambiguity (some other
 /// column in the same table currently holds the historic canonical).
+///
+/// **Phase 5.3 step 5c audit closure (Opus M3, 2026-05-20):** removed
+/// the `current_holder_col_canonical` field — it was definitionally
+/// equal to `historic_canonical` (the current holder of a historic
+/// canonical IS the column whose current canonical matches). Kept the
+/// case-preserved `current_holder_col_display` since that's
+/// information not derivable from the other fields.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ColumnAmbiguousSkip {
+    /// Table canonical (uppercase) that owns this column rule.
     pub table_canonical: String,
+    /// Historic column canonical (lowercase). Equals the current
+    /// holder's canonical by definition — that's why the rule was
+    /// skipped.
     pub historic_canonical: String,
-    /// Current canonical of the column that holds `historic_canonical`.
-    pub current_holder_col_canonical: String,
-    /// Display name of the current holder.
+    /// Case-preserved display name of the column currently holding
+    /// `historic_canonical`. Information not derivable from the other
+    /// fields.
     pub current_holder_col_display: String,
 }

@@ -2,13 +2,13 @@
 //! tests. 2026-05-20.
 //!
 //! Production-wiring closure for Opus-A Scenario E HIGH (step 5
-//! megaudit) + step 5b audit closures (Codex MEDIUM-1 + Opus HIGH-2
-//! + HIGH-3): the repair pass exists since step 3 but had ZERO
-//! non-test callers, so end-users running `merge_bytes` +
-//! `replay_into` + `recompute` would STILL see `#NAME?` for
+//! megaudit) plus step 5b audit closures (Codex MEDIUM-1, Opus HIGH-2,
+//! Opus HIGH-3): the repair pass exists since step 3 but had ZERO
+//! non-test callers, so end-users running `merge_bytes` plus
+//! `replay_into` plus `recompute` would STILL see `#NAME?` for
 //! concurrent-rename formulas. `rebuild_workbook` constructs a fresh
-//! `Workbook::new()` internally + atomically chains `replay_into` +
-//! the two repair passes per audit-locked D-5.3-1 caller contract.
+//! `Workbook::new()` internally and atomically chains `replay_into`
+//! and the two repair passes per audit-locked D-5.3-1 caller contract.
 //!
 //! The API was reshaped from the original `sync_workbook(&mut Workbook, ..)`
 //! signature to eliminate the caller-misuse class (double-invocation,

@@ -925,13 +925,40 @@ fn apply_rename_column(
     new_name: &str,
 ) -> Result<(), ReplayError> {
     let table_canonical = table.to_ascii_uppercase();
+
+    // **Phase 5.3 step 5c audit closure (Codex+Opus convergent HIGH-1,
+    // 2026-05-20):** advisory-skip when the table itself is missing.
+    //
+    // Pre-closure this hard-failed with `TableNotFound { name: table }`
+    // when peer A renamed `Tbl → Sales` concurrent with peer B's
+    // `RenameColumn { table: "Tbl", ... }` — the entire merged log
+    // became un-replayable. Empirical reproducer (Opus probe P1,
+    // Codex first-HIGH probe): replay errored with TableNotFound at
+    // the column rename's op index.
+    //
+    // Root cause: asymmetry with `apply_rename_table` at lines
+    // 802-820, which already advisory-skips on missing source as a
+    // step-4-audit-closure. Step 4 closed the table case but didn't
+    // extend the same fix to the cross-kind column case.
+    //
+    // Post-closure: advisory-skip the column rename. The column
+    // rename intent is lost (V1 limitation — same as the
+    // concurrent-rename intermediate-names case for sheets / tables;
+    // future V2 closure: causality-aware tracking via Loro op-ids
+    // that re-targets the column op to the renamed-to table
+    // canonical). Production-side renames always emit the column op
+    // AFTER any table rename in linear (single-writer) history, so
+    // this affects only adversarial cross-peer interleavings — but
+    // those interleavings ARE common in real collab flows, so V1
+    // closure required.
+    if workbook.tables_mut().get_mut(&table_canonical).is_none() {
+        return Ok(());
+    }
+    // Re-borrow with the now-confirmed-present check.
     let meta = workbook
         .tables_mut()
         .get_mut(&table_canonical)
-        .ok_or_else(|| ReplayError::TableNotFound {
-            index,
-            name: table.to_owned(),
-        })?;
+        .expect("just-checked above");
 
     // **Phase 5.3 step 4 (V1, mirrors apply_rename_table policy)**:
     // missing source column under CRDT merge means a concurrent peer
