@@ -9,7 +9,10 @@
 //! The benefit of registering now (without per-cell application) is
 //! that the workbook's `FormatTable` correctly carries the user's
 //! custom format strings, so when per-cell wiring lands it can just
-//! `FormatId(N)` directly without re-allocating ids.
+//! reference `FormatId::Custom(LEGACY_PEER, n - 164)` (via
+//! `FormatId::legacy_from_u32(n)`) directly without re-allocating ids.
+//! (Pre-D-1 this was `FormatId(N)` directly; post-D-1 the enum carries
+//! a peer-id discriminator — see `crates/ql-storage/src/format.rs`.)
 
 use crate::error::XlsxError;
 use crate::read::styles_xml::StyleIndex;
@@ -49,8 +52,12 @@ pub(crate) fn register_custom_formats(
         // ceiling. Excel's legal numFmtId range tops out at ~32767;
         // anything higher is either malformed or a hostile attempt
         // to trigger the `FormatTable::register_at` arithmetic
-        // overflow at `format.rs:153` (`self.next_custom_id = id.0 + 1`
-        // panics on u32::MAX).
+        // overflow. (Pre-D-1 the overflow site was `next_custom_id =
+        // id.0 + 1` at format.rs; post-D-1 step 5 audit closure the
+        // site is `next_custom_counter = counter.checked_add(1).expect(...)`
+        // — overflow now panics rather than wrapping. The MAX_PLAUSIBLE
+        // guard here is defense-in-depth: even a checked-add panic is
+        // worse user-experience than a clear MalformedOoxml error.)
         const MAX_PLAUSIBLE_NUMFMT_ID: u32 = u16::MAX as u32; // 65535
         if entry.num_fmt_id > MAX_PLAUSIBLE_NUMFMT_ID {
             return Err(XlsxError::MalformedOoxml {

@@ -131,6 +131,20 @@ struct XlsxNumFmtTranslation {
     /// produces `Custom(LEGACY_PEER, _)`, losing the original peer id.
     /// Caller surfaces via `XlsxExportReport.dropped_features`.
     info_lost: Vec<(FormatId, u32)>,
+    /// **Phase 5.2 D-1 step 8 megaudit closure (Codex MEDIUM-2,
+    /// 2026-05-20):** overlay-bound Customs that were NOT registered
+    /// in `workbook.formats()`. Pre-closure these silently allocated
+    /// a unique xlsx numFmtId, but `<numFmt>` was emitted only for
+    /// `workbook.formats()` entries — the result was an `<xf>` slot
+    /// pointing at a non-existent `<numFmt>`. Reimport recovered the
+    /// numFmtId as a Custom(LEGACY_PEER, _) with NO format string
+    /// (silent render fallback to General).
+    ///
+    /// Post-closure: still allocate the numFmtId (preserves xlsx
+    /// structural integrity) but record the unregistered FormatId
+    /// here so the caller surfaces a dropped_features entry. Per
+    /// no-fallback rule: the silent loss becomes explicit reporting.
+    unregistered_overlay_customs: Vec<(FormatId, u32)>,
 }
 
 impl XlsxNumFmtTranslation {
@@ -159,6 +173,7 @@ impl XlsxNumFmtTranslation {
 
         let mut custom_map = std::collections::HashMap::new();
         let mut info_lost = Vec::new();
+        let mut unregistered_overlay_customs = Vec::new();
         // Dedup-by-code map: format string → xlsx numFmtId already
         // assigned. Step 6 audit closure (HIGH-1): two FormatIds with
         // the same format code MUST collapse to one numFmtId on export
@@ -225,13 +240,20 @@ impl XlsxNumFmtTranslation {
                 } else {
                     // Pathological: cellxfs_roster contains a Custom not
                     // registered in wb.formats(). No code to dedup;
-                    // allocate a unique numFmtId. Renderer falls back
-                    // to General on reimport (no numFmt entry will
-                    // exist for this id).
+                    // allocate a unique numFmtId. Renderer would fall
+                    // back to General on reimport (no numFmt entry
+                    // will exist for this id).
+                    //
+                    // Step 8 megaudit closure (Codex MEDIUM-2): record
+                    // the unregistered FormatId so the export caller
+                    // can surface a dropped_features entry. Per the
+                    // no-fallback rule, the silent reimport-side loss
+                    // becomes explicit reporting at export time.
                     let new_id = next_non_legacy;
                     next_non_legacy = next_non_legacy
                         .checked_add(1)
                         .expect("xlsx custom numFmtId allocator exhausted (u32::MAX entries)");
+                    unregistered_overlay_customs.push((*fid, new_id));
                     new_id
                 };
                 custom_map.insert(*fid, xlsx_id);
@@ -246,6 +268,7 @@ impl XlsxNumFmtTranslation {
         Self {
             custom_map,
             info_lost,
+            unregistered_overlay_customs,
         }
     }
 
@@ -340,6 +363,27 @@ pub(crate) fn export_new_workbook(
                 detail: format!(
                     "Custom format id {orig_fid:?} flattened to xlsx numFmtId {flattened_id} \
                      (xlsx single-namespace; reimporting recovers as Custom(LEGACY_PEER, _))"
+                ),
+            });
+    }
+    // Step 8 megaudit closure (Codex MEDIUM-2, 2026-05-20): report
+    // overlay-bound Customs that aren't registered in workbook.formats().
+    // These get an xlsx numFmtId in cellXfs but no <numFmt> declaration
+    // (which only emits for workbook.formats() entries). Reimport
+    // recovers as Custom(LEGACY_PEER, _) with no format string —
+    // renders as General. The silent loss is now an explicit report.
+    for (orig_fid, allocated_id) in &xlsx_numfmt.unregistered_overlay_customs {
+        report
+            .dropped_features
+            .push(crate::report::UnsupportedFeature {
+                kind: crate::error::UnsupportedFeatureKind::Other(
+                    "xlsx-overlay-unregistered-custom",
+                ),
+                part: "xl/styles.xml".to_string(),
+                detail: format!(
+                    "overlay-bound {orig_fid:?} (not registered in workbook.formats()) \
+                     allocated xlsx numFmtId {allocated_id} but no <numFmt> declared; \
+                     reimport renders as General (format string lost)"
                 ),
             });
     }

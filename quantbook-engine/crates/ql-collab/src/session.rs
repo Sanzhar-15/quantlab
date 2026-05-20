@@ -164,10 +164,16 @@ impl CollabSession {
     ///   `PeerId(0)` is reserved as `LEGACY_PEER` — the sentinel used
     ///   by the qbook envelope's pre-5.2 u32 → tagged-tuple FormatId
     ///   migration. Active multi-peer sessions MUST use a non-zero
-    ///   peer id; debug builds assert this here so misuse fails
-    ///   loudly in tests.
+    ///   peer id; **release builds enforce** this here so misuse
+    ///   fails loudly in production too.
+    ///
+    /// **Phase 5.2 D-1 step 8 megaudit closure (Opus-B HIGH-1,
+    /// 2026-05-20):** the prior `debug_assert_ne!` was a no-op in
+    /// `--release` builds. Now uses `assert!` so the guard fires
+    /// regardless of build profile. Centralized in `OpLog::set_peer_id`
+    /// too (see ql-oplog) for the lower-level construction path.
     pub fn new(peer_id: PeerId) -> Result<Self, CollabSessionError> {
-        debug_assert_ne!(
+        assert_ne!(
             peer_id.as_u64(),
             0,
             "PeerId(0) is LEGACY_PEER (reserved for pre-collab single-writer + qbook migration). \
@@ -206,7 +212,9 @@ impl CollabSession {
     ///   `CollabSession::new`. Snapshot-join sessions also count as
     ///   active sessions and must use a non-zero peer id.
     pub fn from_snapshot(peer_id: PeerId, bytes: &[u8]) -> Result<Self, CollabSessionError> {
-        debug_assert_ne!(
+        // Step 8 megaudit closure (Opus-B HIGH-1, 2026-05-20):
+        // assert! (release-firing) replaces debug_assert_ne!.
+        assert_ne!(
             peer_id.as_u64(),
             0,
             "PeerId(0) is LEGACY_PEER (reserved for pre-collab single-writer + qbook migration). \

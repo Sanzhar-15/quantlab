@@ -191,7 +191,23 @@ impl OpLog {
     /// `&mut` prevents accidental peer-id changes through a shared
     /// `&OpLog` (`CollabSession::op_log()`) which would silently
     /// clear an attached `UndoManager`'s stacks per pitfall 5.
+    ///
+    /// **Phase 5.2 D-1 step 8 megaudit closure (Opus-B HIGH-1,
+    /// 2026-05-20):** asserts `peer != 0`. PeerId(0) is `LEGACY_PEER`
+    /// — reserved as the sentinel for pre-collab single-writer +
+    /// qbook envelope migration. An active session whose Loro peer
+    /// id is 0 would silently collide with the LEGACY_PEER semantic
+    /// in `FormatTable::with_peer(LEGACY_PEER)` (the cross-peer
+    /// same-string design assumes LEGACY_PEER is sentinel-only).
+    /// `CollabSession::new` + `from_snapshot` already assert this at
+    /// the higher level; this guard catches direct callers of
+    /// `OpLog::set_peer_id` that bypass the CollabSession constructor.
     pub fn set_peer_id(&mut self, peer: u64) -> Result<(), OpLogError> {
+        assert_ne!(
+            peer, 0,
+            "PeerId(0) is LEGACY_PEER (reserved for pre-collab single-writer + qbook migration). \
+             OpLog::set_peer_id must be called with a non-zero peer; collides with LEGACY_PEER otherwise."
+        );
         self.doc.set_peer_id(peer)?;
         Ok(())
     }

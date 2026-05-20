@@ -2276,3 +2276,152 @@ fn step6_audit_xlsx_qbook_xlsx_double_round_trip_drops_to_zero_multi_peer_flatte
         let _ = std::fs::remove_file(p);
     }
 }
+
+// ===== Phase 5.2 D-1 step 8 megaudit closure regression tests (2026-05-20) =====
+
+#[test]
+fn step8_audit_xlsx_export_unregistered_overlay_custom_reports_dropped_feature() {
+    // **Codex MEDIUM-2 closure:** xlsx export must surface a
+    // dropped_features entry when an overlay binds to a Custom
+    // FormatId not registered in workbook.formats(). Pre-closure
+    // the export silently allocated a numFmtId in cellXfs without
+    // emitting <numFmt>; reimport produced an unresolved overlay
+    // → silent render fallback to General.
+    use ql_storage::{FormatId, Workbook};
+    use ql_types::{PeerId, Value};
+
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("S");
+    wb.put_at(s, 0, 0, Value::Number(1.0));
+    // Overlay-bound Custom that is NOT in formats(). This is the
+    // "pathological" case the translation's pass-2 fallback branch
+    // handles. Direct overlay set bypasses register_at.
+    let unregistered = FormatId::Custom(PeerId::new(777), 0);
+    assert!(wb.formats().lookup(unregistered).is_none());
+    wb.sheet_mut(s)
+        .unwrap()
+        .format_overlay_mut()
+        .set(0, 0, unregistered);
+
+    let tmp = std::env::temp_dir().join("step8-audit-unregistered-overlay.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+    let report = export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+
+    // Must surface as a dropped_features entry — no silent loss.
+    let unregistered_drops: Vec<&ql_io_xlsx::UnsupportedFeature> = report
+        .dropped_features
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.kind,
+                ql_io_xlsx::UnsupportedFeatureKind::Other("xlsx-overlay-unregistered-custom")
+            )
+        })
+        .collect();
+    assert_eq!(
+        unregistered_drops.len(),
+        1,
+        "exactly 1 unregistered-overlay-custom report entry expected; got {unregistered_drops:#?}"
+    );
+    assert!(unregistered_drops[0].detail.contains("PeerId(777)"));
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn step8_audit_xlsx_import_unresolved_overlay_numfmt_reports_unsupported_feature() {
+    // **Codex MEDIUM-1 closure:** xlsx import must surface an
+    // unsupported entry when a cell's xf references a numFmtId
+    // that has no matching <numFmt> declaration. Pre-closure the
+    // import silently set the overlay to an unregistered FormatId;
+    // later save to .qbook then failed at MalformedFormatOverlay —
+    // delayed failure. Post-closure the issue surfaces immediately
+    // at import time + the overlay is skipped (cell renders as General).
+    use std::io::Write;
+
+    // Hand-construct an xlsx where:
+    //   - styles.xml has cellXfs[1] referencing numFmtId=999 (custom)
+    //   - styles.xml has NO <numFmt> for 999
+    //   - sheet1.xml has cell A1 with s="1"
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let styles = r##"<?xml version="1.0"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<cellXfs count="2">
+  <xf numFmtId="0"/>
+  <xf numFmtId="999" applyNumberFormat="1"/>
+</cellXfs>
+</styleSheet>"##;
+        let parts: &[(&str, &str)] = &[
+            (
+                "[Content_Types].xml",
+                r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" s="1"><v>45000</v></c></row></sheetData></worksheet>"#,
+            ),
+            ("xl/styles.xml", styles),
+        ];
+        for (n, c) in parts {
+            zw.start_file(*n, opts).unwrap();
+            zw.write_all(c.as_bytes()).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+    let src = std::env::temp_dir().join("step8-audit-unresolved-numfmt.xlsx");
+    std::fs::write(&src, &buf).unwrap();
+
+    let registry = ql_functions::default_registry();
+    let result = import_xlsx_path(
+        &src,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .expect("xlsx import must succeed (issue reported, not raised)");
+
+    // The unresolved overlay must surface as an unsupported entry.
+    let unsupported: Vec<&ql_io_xlsx::UnsupportedFeature> = result
+        .report
+        .unsupported
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.kind,
+                ql_io_xlsx::UnsupportedFeatureKind::Other("xlsx-overlay-unregistered-numfmt")
+            )
+        })
+        .collect();
+    assert_eq!(
+        unsupported.len(),
+        1,
+        "exactly 1 unresolved-overlay-numfmt report entry expected; got {unsupported:#?}"
+    );
+    assert!(unsupported[0].detail.contains("numFmtId=999"));
+    // Overlay is NOT set (cell renders as General; no delayed failure).
+    let overlay_entry = result.workbook.sheet(0).unwrap().format_overlay().get(0, 0);
+    assert!(
+        overlay_entry.is_none(),
+        "unresolved overlay must NOT be set (pre-closure would have set it + failed later at .qbook save); got {overlay_entry:?}"
+    );
+
+    let _ = std::fs::remove_file(&src);
+}

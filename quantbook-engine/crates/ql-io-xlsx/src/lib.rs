@@ -254,30 +254,65 @@ pub fn import_xlsx_bytes(
         if styled_cells.is_empty() {
             continue;
         }
-        let Some(sheet) = workbook.sheet_mut(sheet_idx as ql_types::SheetId) else {
-            continue;
-        };
+        // Phase 5.2 D-1 step 8 megaudit closure (Codex MEDIUM-1,
+        // 2026-05-20): pre-collect overlay set instructions so we can
+        // partition into "id resolves in FormatTable" vs "unregistered
+        // custom id" without holding two borrows on `workbook`.
+        // Unregistered custom ids skip the overlay set + add an
+        // UnsupportedFeature entry so the caller learns about the
+        // malformed xlsx file IMMEDIATELY at import — not later at
+        // .qbook save (where MalformedFormatOverlay fires).
+        let mut planned_sets: Vec<(u32, u32, ql_storage::FormatId)> = Vec::new();
+        let mut unresolved_drops: Vec<(u32, u32, u32, ql_storage::FormatId)> = Vec::new();
         for (row, col, xf_idx) in styled_cells {
-            // Resolve xf_idx → cellXf → numFmtId.
             let Some(xf) = style_index.cell_xfs.get(xf_idx as usize) else {
                 continue;
             };
             if !xf.apply_number_format {
-                // Cell renders as General — don't populate overlay.
                 continue;
             }
             if xf.num_fmt_id == 0 {
-                // General format — implicit. No overlay entry.
                 continue;
             }
             // Phase 5.2 D-1 step 3: xlsx import uses the legacy
             // u32 → FormatId migration helper. n <= 163 → Builtin(n);
-            // n >= 164 → Custom(LEGACY_PEER, n - 164). Step 6 may
-            // change xlsx import to allocate non-legacy peer ids
-            // (e.g. for collab-aware imports); pre-step-6 all xlsx
-            // ids land under LEGACY_PEER.
+            // n >= 164 → Custom(LEGACY_PEER, n - 164). All imported
+            // custom ids land under LEGACY_PEER (xlsx has no peer
+            // concept).
             let fmt_id = ql_storage::FormatId::legacy_from_u32(xf.num_fmt_id);
-            sheet.format_overlay_mut().set(row, col, fmt_id);
+            // Validate: id must be registered in the format table.
+            // Builtins (0..=163) are always present via FormatTable::default();
+            // Customs (>=164) require a matching `<numFmt>` entry that
+            // styles_import processed earlier.
+            if workbook.formats().lookup(fmt_id).is_some() {
+                planned_sets.push((row, col, fmt_id));
+            } else {
+                unresolved_drops.push((row, col, xf.num_fmt_id, fmt_id));
+            }
+        }
+        // Apply the resolved sets.
+        if !planned_sets.is_empty() {
+            let Some(sheet) = workbook.sheet_mut(sheet_idx as ql_types::SheetId) else {
+                continue;
+            };
+            for (row, col, fmt_id) in planned_sets {
+                sheet.format_overlay_mut().set(row, col, fmt_id);
+            }
+        }
+        // Report the unresolved drops so the caller sees them at
+        // import time. Per the no-fallback rule: silent loss
+        // (cell would render as General on read) is forbidden;
+        // explicit reporting is the closure.
+        for (row, col, raw_id, fmt_id) in unresolved_drops {
+            report.unsupported.push(UnsupportedFeature {
+                kind: UnsupportedFeatureKind::Other("xlsx-overlay-unregistered-numfmt"),
+                part: part_path.to_string(),
+                detail: format!(
+                    "sheet {sheet_idx} cell ({row},{col}) references numFmtId={raw_id} \
+                     (=> {fmt_id:?}) which has no <numFmt> declaration in xl/styles.xml; \
+                     overlay entry skipped (cell renders as General)"
+                ),
+            });
         }
     }
 

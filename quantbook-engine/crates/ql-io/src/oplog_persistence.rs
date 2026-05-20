@@ -57,11 +57,17 @@
 //! doc but `iter()` will fail with `OpLogError::Deserialize` on the
 //! first format op. This is an explicit format-branch (NOT a silent
 //! fallback) and the failure is loud. Tests:
-//! - `legacy_pre_tier_d3_raw_loro_snapshot_still_loads` — pins the
-//!   happy path for current-shape ops.
-//! - `legacy_path_with_pre_step_4_op_shape_fails_loudly_at_iter` —
-//!   pins the limitation: pre-step-4 op shapes surface as
-//!   `OpLogError::Deserialize`, not silent data loss.
+//! - `legacy_pre_tier_d3_raw_loro_snapshot_still_loads` (this file) —
+//!   pins the happy path for current-shape ops.
+//! - `legacy_path_with_corrupt_loro_body_fails_loudly` (this file) —
+//!   pins legacy-path Loro framing rejection.
+//! - `legacy_path_with_pre_step_4_register_format_op_fails_loudly_at_iter`
+//!   plus sibling tests in
+//!   `crates/ql-oplog/tests/d1_step8_legacy_op_shape.rs` (added by
+//!   Phase 5.2 D-1 step 8 megaudit closure, 2026-05-20) pin the
+//!   per-op-deserialize failure mode for pre-step-4 op shapes via
+//!   direct LoroList JSON injection. Pre-step-4 ops surface as
+//!   `OpLogError::Deserialize`, NOT silent data loss.
 //!
 //! **Transport-bytes vs file-bytes contract** (audit-closure clarification):
 //! `OpLog::export_bytes()` and `CollabSession::export_bytes()` produce

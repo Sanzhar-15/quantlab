@@ -68,7 +68,23 @@ impl<'a> WorkbookRuntime<'a> {
         // allocates via `intern`. Debug-assert that prediction
         // matches actual allocation.
         let formats = self.workbook.formats();
-        let id = FormatId::Custom(formats.local_peer(), formats.next_custom_counter());
+        let counter = formats.next_custom_counter();
+        // Phase 5.2 D-1 step 8 megaudit closure (Opus-B LOW-2,
+        // 2026-05-20): pre-check the counter against u32::MAX BEFORE
+        // appending Op::RegisterFormat. Pre-closure: intern() panicked
+        // at `checked_add(1).expect(...)` AFTER the op was already
+        // written to the local log — log got an op that local replay
+        // couldn't reproduce. Now: refuse before write.
+        //
+        // Reachability is implausible in practice (u32::MAX per-peer
+        // intern calls = ~4.3B), but the check matches step-5 audit's
+        // pre-validation discipline at register_at.
+        if counter == u32::MAX {
+            return Err(RuntimeError::FormatCounterExhausted {
+                peer: formats.local_peer(),
+            });
+        }
+        let id = FormatId::Custom(formats.local_peer(), counter);
         if let Some(oplog) = self.oplog.as_deref_mut() {
             oplog.append(Op::RegisterFormat {
                 id: ql_oplog::FormatIdWire::from_storage(id),

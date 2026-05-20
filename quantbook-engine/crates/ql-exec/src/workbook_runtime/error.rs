@@ -130,6 +130,19 @@ pub enum RuntimeError {
     #[error("format id {0:?} is not registered in the workbook FormatTable")]
     UnknownFormatId(ql_storage::FormatId),
 
+    /// **Phase 5.2 D-1 step 8 megaudit closure (Opus-B LOW-2,
+    /// 2026-05-20):** `WorkbookRuntime::intern_format` was called when
+    /// the local peer's custom-format counter is at `u32::MAX`.
+    /// Allocating one more Custom id would overflow. Pre-closure the
+    /// overflow panicked AFTER `Op::RegisterFormat` was already written
+    /// to the local log — log got an op that local replay couldn't
+    /// reproduce. Post-closure: refuse before the op is appended.
+    ///
+    /// Reachability is implausible (~4.3B per-peer custom formats),
+    /// but matches the step-5 audit's pre-validation discipline.
+    #[error("format counter for peer {peer:?} is exhausted (u32::MAX per-peer custom formats)")]
+    FormatCounterExhausted { peer: ql_types::PeerId },
+
     /// **W5-106-AUDIT (Codex MEDIUM closure):** recompute_dirty's
     /// fixed-point loop hit its MAX_ITERATIONS bound with cells still
     /// dirty. Signals a runaway spill shape transition or workbook
