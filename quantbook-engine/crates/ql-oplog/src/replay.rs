@@ -273,6 +273,25 @@ pub enum FormatRejectedSource {
         existing_id: ql_storage::FormatId,
         attempted_id: ql_storage::FormatId,
     },
+    /// **Phase 5.2 D-1 step 5 audit Codex HIGH-1 closure (2026-05-20):**
+    /// replayed `Op::RegisterFormat` with a `Custom(local_peer, u32::MAX)`
+    /// id would have panicked at `FormatTable::register_at`'s counter
+    /// advancement before this guard landed; now surfaces as a recoverable
+    /// replay error.
+    #[error("format counter overflow for peer {peer:?} (counter == u32::MAX)")]
+    CounterOverflow { peer: ql_types::PeerId },
+    /// **Phase 5.2 D-1 step 5 audit Codex HIGH-2 closure (2026-05-20):**
+    /// replayed `Op::RegisterFormat` with `Builtin(n > 163)`. Built-in
+    /// format ids are contractually `0..=FIRST_XLSX_BUILTIN_MAX`;
+    /// `FormatIdWire::Builtin { id: u32 }` carries no range bound at the
+    /// type level so a malformed op can smuggle the bad shape past serde
+    /// validation. Surfaces here as a replay error rather than letting
+    /// the storage table silently accept and later drop the entry.
+    #[error(
+        "builtin format id {id} out of range (max {FIRST_XLSX_BUILTIN_MAX})",
+        FIRST_XLSX_BUILTIN_MAX = 163
+    )]
+    BuiltinOutOfRange { id: u32 },
 }
 
 impl From<ql_storage::FormatTableError> for FormatRejectedSource {
@@ -296,6 +315,12 @@ impl From<ql_storage::FormatTableError> for FormatRejectedSource {
                 existing_id,
                 attempted_id,
             },
+            ql_storage::FormatTableError::CounterOverflow { peer } => {
+                FormatRejectedSource::CounterOverflow { peer }
+            }
+            ql_storage::FormatTableError::BuiltinOutOfRange { id } => {
+                FormatRejectedSource::BuiltinOutOfRange { id }
+            }
             _ => unreachable!(
                 "FormatTableError gained a variant — extend FormatRejectedSource::From"
             ),

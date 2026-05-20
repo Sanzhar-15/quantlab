@@ -414,6 +414,38 @@ impl FormatTable {
     /// formatCode="General"/>` (Custom variant) while "General" also
     /// lives at `Builtin(0)`; both coexist.
     pub fn register_at(&mut self, id: FormatId, s: &str) -> Result<(), FormatTableError> {
+        // Step 0: pre-validate `id` shape BEFORE any state mutation —
+        // Phase 5.2 D-1 step 5 audit Codex HIGH-1 + HIGH-2 closure
+        // (2026-05-20). User-controlled load paths (qbook envelope +
+        // replay) feed potentially-malformed FormatIds into this fn;
+        // panics inside the post-insert counter-advance would leave
+        // partial state. Catching shape errors upfront keeps the table
+        // consistent under bad input.
+        //
+        // HIGH-2: `Builtin(n)` is contractually `0..=163` (Excel-canonical
+        // built-in format ids). `FormatIdWire::Builtin { id: u32 }` carries
+        // no range bound at the type level, so a v8 envelope could smuggle
+        // in `Builtin(200)` which would later get dropped on resave (the
+        // `is_custom()` filter excludes built-in variants from the formats
+        // section). Reject upfront.
+        if let FormatId::Builtin(n) = id {
+            if n > FIRST_XLSX_BUILTIN_MAX {
+                return Err(FormatTableError::BuiltinOutOfRange { id: n });
+            }
+        }
+        // HIGH-1: if this `Custom(local_peer, counter)` would advance the
+        // local counter past `u32::MAX`, refuse before mutating. Without
+        // this guard, the post-insert `counter.checked_add(1).expect(...)`
+        // panicked on `counter == u32::MAX` — directly reachable from a
+        // malformed v8 `.qbook` envelope.
+        if let FormatId::Custom(peer, counter) = id {
+            if peer == self.local_peer
+                && counter >= self.next_custom_counter
+                && counter.checked_add(1).is_none()
+            {
+                return Err(FormatTableError::CounterOverflow { peer });
+            }
+        }
         // Step 1: id-side dedup. If `id` is already present, must map
         // to the same string (else IdCollision — a real corruption).
         if let Some(existing) = self.by_id.get(&id) {
@@ -468,13 +500,14 @@ impl FormatTable {
         // fresh counters past any replayed ones.
         if let FormatId::Custom(peer, counter) = id {
             if peer == self.local_peer && counter >= self.next_custom_counter {
-                // Step-4 audit Codex MEDIUM-1: checked_add to catch
-                // overflow. Replaying a remote op with counter ==
-                // u32::MAX targeting our own peer would otherwise
-                // wrap to 0 in release builds.
-                self.next_custom_counter = counter.checked_add(1).expect(
-                    "FormatTable: custom counter exhausted (u32::MAX per-peer custom formats)",
-                );
+                // Step-4 audit Codex MEDIUM-1 + step-5 audit Codex HIGH-1:
+                // overflow was pre-validated at the top of `register_at`
+                // (Step 0), so this `checked_add(1)` cannot return None.
+                // `expect` documents the invariant rather than introducing
+                // a real panic path.
+                self.next_custom_counter = counter
+                    .checked_add(1)
+                    .expect("counter overflow was pre-validated at register_at entry");
             }
         }
         Ok(())
@@ -527,6 +560,27 @@ pub enum FormatTableError {
         existing_id: FormatId,
         attempted_id: FormatId,
     },
+    /// **Phase 5.2 D-1 step 5 audit Codex HIGH-1 closure (2026-05-20):**
+    /// Attempted to `register_at` a `Custom(local_peer, counter)` where
+    /// the resulting counter advancement would overflow `u32::MAX`.
+    /// Pre-step-5-audit this was a `panic!` inside `register_at` (via
+    /// `checked_add(1).expect(...)`) — user-controlled load paths (qbook
+    /// envelope + replay) could trigger the panic from on-disk input.
+    /// Now surfaces as a recoverable error so loaders can map to
+    /// `QbookError::MalformedFormat` / `ReplayError::FormatRejected`.
+    CounterOverflow { peer: PeerId },
+    /// **Phase 5.2 D-1 step 5 audit Codex HIGH-2 closure (2026-05-20):**
+    /// Attempted to `register_at` a `Builtin(n)` where `n > 163`. The
+    /// `Builtin` variant is contractually `0..=FIRST_XLSX_BUILTIN_MAX`
+    /// (Excel-canonical built-in format ids). `FormatIdWire::Builtin {
+    /// id: u32 }` carries no range bound at the type level, so a
+    /// malformed v8 `.qbook` envelope or replay op could smuggle in
+    /// `Builtin(200)`. Pre-step-5-audit, this loaded successfully but
+    /// the save path's `is_custom()` filter dropped the entry from
+    /// `formats.entries`; reloading then failed at the overlay-id-not-
+    /// registered guard. Validating here makes the load fail loudly at
+    /// the original ingestion point.
+    BuiltinOutOfRange { id: u32 },
 }
 
 #[cfg(test)]
@@ -1011,5 +1065,75 @@ mod tests {
             baseline,
             "register_at(Builtin(_)) must not advance the custom counter"
         );
+    }
+
+    // ===== Step 5 audit closures (2026-05-20) =====
+
+    /// **Codex HIGH-1 closure (step 5 audit):** `register_at` must NOT
+    /// panic on a `Custom(local_peer, u32::MAX)` id — that input is
+    /// user-controlled via the qbook envelope and replay paths. Pre-fix
+    /// the `counter.checked_add(1).expect(...)` at the post-insert
+    /// counter-advance site panicked the process. Post-fix the load
+    /// path surfaces `CounterOverflow` as a recoverable error.
+    #[test]
+    fn register_at_counter_overflow_returns_error_not_panic() {
+        let mut t = FormatTable::with_peer(LEGACY_PEER);
+        let result = t.register_at(FormatId::Custom(LEGACY_PEER, u32::MAX), "MY_FMT");
+        assert!(
+            matches!(
+                result,
+                Err(FormatTableError::CounterOverflow { peer }) if peer == LEGACY_PEER
+            ),
+            "expected CounterOverflow(LEGACY_PEER), got {result:?}"
+        );
+        // State must remain unchanged — no partial insertion.
+        assert_eq!(t.next_custom_counter(), 0);
+        assert!(t.lookup(FormatId::Custom(LEGACY_PEER, u32::MAX)).is_none());
+    }
+
+    /// **Codex HIGH-1 follow-up:** `register_at` with `Custom(remote_peer,
+    /// u32::MAX)` where `remote_peer != local_peer` should NOT trip the
+    /// overflow guard — that path doesn't advance the local counter. It
+    /// can legitimately register the entry (e.g. a remote peer's op log
+    /// happened to allocate counter == u32::MAX).
+    #[test]
+    fn register_at_counter_overflow_check_only_fires_for_local_peer() {
+        let mut t = FormatTable::with_peer(LEGACY_PEER);
+        let remote_peer = PeerId::new(0xb);
+        t.register_at(FormatId::Custom(remote_peer, u32::MAX), "REMOTE_FMT")
+            .expect("remote peer's max-counter id must register cleanly");
+        assert_eq!(
+            t.lookup(FormatId::Custom(remote_peer, u32::MAX)),
+            Some("REMOTE_FMT")
+        );
+        // Local counter unaffected.
+        assert_eq!(t.next_custom_counter(), 0);
+    }
+
+    /// **Codex HIGH-2 closure (step 5 audit):** `register_at` must reject
+    /// `Builtin(n)` for `n > FIRST_XLSX_BUILTIN_MAX` (= 163). Pre-fix
+    /// such ids loaded successfully but the save path's `is_custom()`
+    /// filter dropped them from `formats.entries`; reload then failed
+    /// at the overlay-id-not-registered guard. Post-fix the bad id is
+    /// rejected at first ingestion.
+    #[test]
+    fn register_at_builtin_out_of_range_returns_error() {
+        let mut t = FormatTable::new();
+        // 200 > 163. FormatIdWire::Builtin{id: u32} carries no range
+        // bound, so a malformed v8 envelope could smuggle this in.
+        let result = t.register_at(FormatId::Builtin(200), "bogus-builtin");
+        assert!(
+            matches!(result, Err(FormatTableError::BuiltinOutOfRange { id: 200 })),
+            "expected BuiltinOutOfRange(200), got {result:?}"
+        );
+        // u32::MAX boundary.
+        let result = t.register_at(FormatId::Builtin(u32::MAX), "bogus");
+        assert!(matches!(
+            result,
+            Err(FormatTableError::BuiltinOutOfRange { id: u32::MAX })
+        ));
+        // Boundary value 163 is still accepted.
+        t.register_at(FormatId::Builtin(163), "boundary").unwrap();
+        assert_eq!(t.lookup(FormatId::Builtin(163)), Some("boundary"));
     }
 }

@@ -152,9 +152,22 @@ use thiserror::Error;
 ///     for v8 envelopes, `LegacyU32(u32)` for v1-v7 envelopes). The
 ///     untagged-enum dispatch handles per-field migration without
 ///     version-switched deserialization. v8 envelopes serialize the
-///     tagged tuple shape (e.g. `id = { kind = "builtin", id = 14 }` in
-///     TOML); v<8 envelopes carry `id = 14` and route through
-///     `FormatId::legacy_from_u32`.
+///     tagged-tuple shape via `toml::to_string_pretty`, which emits
+///     section-header form for nested structs:
+///     ```text
+///     [[formats.entries]]
+///     string = "0%"
+///
+///     [formats.entries.id]
+///     kind = "custom"
+///     peer = 0
+///     counter = 0
+///     ```
+///     (Not inline-table form `id = { kind = "custom", peer = 0,
+///     counter = 0 }` — `toml-rs` requires `toml_edit` for inline
+///     emission. Step-5 audit Opus MEDIUM closure documents this.)
+///     v<8 envelopes carry `id = 14` (bare integer) and route through
+///     `FormatId::legacy_from_u32` at load.
 ///   - Save path emits `Wire(FormatIdWire::from_storage(fid))` directly.
 ///     The pre-step-5 `to_legacy_u32().expect("...")` panic sites
 ///     (which would have fired on multi-peer custom ids) are removed —
@@ -1577,6 +1590,43 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                 schema_version,
                 field: "locale",
             });
+        }
+    }
+
+    // **Phase 5.2 D-1 step 5 audit Codex MEDIUM-1 closure (2026-05-20):**
+    // post-deserialize assertion that the v8-only tagged-tuple
+    // `FormatEntryId::Wire` shape isn't present on a v7-or-older envelope.
+    // `#[serde(untagged)]` dispatch on `FormatEntryId` is purely structural
+    // — without this guard, a hand-edited v7 envelope with `id = { kind =
+    // "custom", peer = 42, counter = 7 }` would silently deserialize as
+    // `Wire(_)` and load successfully, violating the v1-v7 contract of
+    // "bare integer ids only."
+    //
+    // Cross-variant tolerance: v8 envelopes with `LegacyU32(_)` entries
+    // ARE accepted (auto-upgrade case for hand-edited migrations). Only
+    // the v<8-with-Wire direction is rejected.
+    if schema_version < 8 {
+        if let Some(ref fs) = envelope.formats {
+            for entry in &fs.entries {
+                if matches!(entry.id, FormatEntryId::Wire(_)) {
+                    return Err(QbookError::ForwardCompatFieldOnOldVersion {
+                        schema_version,
+                        field: "formats.entries[].id (tagged-tuple shape)",
+                    });
+                }
+            }
+        }
+        for sheet in &envelope.sheets {
+            if let Some(ref overlay) = sheet.format_overlay {
+                for entry in overlay {
+                    if matches!(entry.id, FormatEntryId::Wire(_)) {
+                        return Err(QbookError::ForwardCompatFieldOnOldVersion {
+                            schema_version,
+                            field: "sheets[].format_overlay[].id (tagged-tuple shape)",
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -3492,6 +3542,12 @@ string = "0.000%"
     /// **Step 5 round-trip test:** verify v8 envelopes serialize the
     /// tagged-tuple shape on disk (not bare u32). Inspects the saved
     /// workbook.toml directly to confirm the wire format.
+    ///
+    /// Step-5 audit Opus LOW closure: assertions strengthened to pin
+    /// the actual on-disk layout. `toml::to_string_pretty` emits
+    /// section-header form for nested structs, not inline-table form —
+    /// this test pins that specific shape so future serializer changes
+    /// (e.g. switching to `toml_edit` for inline form) trip the test.
     #[test]
     fn v8_envelope_serializes_tagged_tuple_shape_on_disk() {
         let dir = TempDir::new().unwrap();
@@ -3513,17 +3569,41 @@ string = "0.000%"
             toml_bytes.contains(&format!("schema_version = {}", WORKBOOK_SCHEMA_VERSION)),
             "envelope must carry current schema_version, got:\n{toml_bytes}"
         );
-        // The custom format entry serializes the FormatIdWire tagged-tuple
-        // shape: `id = { kind = "custom", peer = ..., counter = ... }`.
+        // formats section emits the section-header tagged-tuple form.
+        // The custom entry tags `kind = "custom"` under a section-header
+        // path. (toml-rs `to_string_pretty` doesn't emit inline tables
+        // for nested structs.)
         assert!(
-            toml_bytes.contains(r#"kind = "custom""#),
-            "v8 envelope must serialize Wire(Custom {{ .. }}) shape, got:\n{toml_bytes}"
+            toml_bytes.contains("[formats.entries.id]")
+                && toml_bytes.contains(r#"kind = "custom""#),
+            "v8 envelope's formats section must use section-header tagged-tuple shape \
+             ('[formats.entries.id]' + 'kind = \"custom\"'); got:\n{toml_bytes}"
         );
-        // Cell overlay entries serialize the same shape.
+        // Overlay section uses the analogous section-header path.
         assert!(
-            toml_bytes.contains("format_overlay") && toml_bytes.contains(r#"kind = "custom""#),
-            "overlay entries must use tagged-tuple shape, got:\n{toml_bytes}"
+            toml_bytes.contains("[sheets.format_overlay.id]"),
+            "v8 envelope's overlay section must use '[sheets.format_overlay.id]' \
+             section-header path; got:\n{toml_bytes}"
         );
+        // Negative pin: no bare-integer `id = N` lines for FormatEntry /
+        // FormatOverlayEntry should appear (would indicate accidental
+        // legacy emission).
+        for line in toml_bytes.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("id = ") && !trimmed.starts_with("id = 0") {
+                // Sheet ids (e.g. `id = 0`) are bare integers — exempt.
+                // FormatEntry / FormatOverlayEntry ids would land here
+                // post-step-5 if the serializer regressed to inline.
+                continue;
+            }
+            // The sheet `id` entries are bare; the FormatEntry id is now
+            // section-headed. Either way, no FormatEntry-shaped inline
+            // serialization should leak through.
+            assert!(
+                !line.contains(r#"id = { kind"#),
+                "v8 envelope must NOT emit inline-table FormatEntryId; got:\n{toml_bytes}"
+            );
+        }
         // Sanity: round-trip still works.
         let loaded = load_workbook(&path).unwrap();
         assert_eq!(loaded.formats().lookup(custom_id), Some("#,##0.00 USD"));
@@ -3602,6 +3682,255 @@ string = "yyyy-mm-dd"
                 "from_storage → to_storage must round-trip {fid:?}"
             );
         }
+    }
+
+    // ===== Step 5 audit closure regression tests (2026-05-20) =====
+
+    /// **Codex HIGH-1 closure:** a v8 envelope with `id = Custom(LEGACY_PEER,
+    /// u32::MAX)` must NOT panic the loader. Pre-fix the loader's
+    /// `register_at` panicked at `counter.checked_add(1).expect(...)`
+    /// because the FormatTable's local_peer defaults to LEGACY_PEER.
+    /// Post-fix the load surfaces `MalformedFormat` carrying the
+    /// `CounterOverflow` cause.
+    #[test]
+    fn v8_envelope_counter_overflow_load_surfaces_malformed_format_not_panic() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("counter_overflow.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        // v8 envelope with the maximum counter value for LEGACY_PEER.
+        // Pre-step-5-audit closure: this panicked register_at.
+        let bad_toml = r#"
+schema_version = 8
+name = "counter_overflow"
+date_system = "1900"
+
+[[sheets]]
+id = 0
+name = "S"
+chunk_rows = 16384
+row_extent = 0
+col_extent = 0
+
+[[formats.entries]]
+string = "MAX_FMT"
+
+[formats.entries.id]
+kind = "custom"
+peer = 0
+counter = 4294967295
+"#;
+        fs::write(path.join("workbook.toml"), bad_toml).unwrap();
+        fs::write(path.join("sheets/0.jsonl"), "").unwrap();
+        fs::write(path.join(ATOMIC_SAVE_MARKER_FILENAME), "").unwrap();
+
+        let result = load_workbook(&path);
+        // The error must be `MalformedFormat` with the offending id;
+        // the `details` field carries the FormatTableError::CounterOverflow
+        // shape (Debug-rendered).
+        match result {
+            Err(QbookError::MalformedFormat { id, details }) => {
+                assert_eq!(
+                    id,
+                    ql_storage::FormatId::Custom(ql_types::LEGACY_PEER, u32::MAX),
+                    "id field must carry the offending FormatId"
+                );
+                assert!(
+                    details.contains("CounterOverflow"),
+                    "details must mention CounterOverflow; got {details:?}"
+                );
+            }
+            other => panic!("expected MalformedFormat(CounterOverflow), got {other:?}"),
+        }
+    }
+
+    /// **Codex HIGH-2 closure:** a v8 envelope with `id = Builtin(200)` must
+    /// be rejected at load (not silently accepted-then-dropped-on-resave).
+    /// `FormatIdWire::Builtin { id: u32 }` accepts any u32 at the wire
+    /// layer; the storage-side invariant `n <= 163` is enforced inside
+    /// `register_at` (step-5-audit closure).
+    #[test]
+    fn v8_envelope_builtin_out_of_range_load_surfaces_malformed_format() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("builtin_oor.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let bad_toml = r#"
+schema_version = 8
+name = "builtin_oor"
+date_system = "1900"
+
+[[sheets]]
+id = 0
+name = "S"
+chunk_rows = 16384
+row_extent = 0
+col_extent = 0
+
+[[formats.entries]]
+string = "bogus-builtin"
+
+[formats.entries.id]
+kind = "builtin"
+id = 200
+"#;
+        fs::write(path.join("workbook.toml"), bad_toml).unwrap();
+        fs::write(path.join("sheets/0.jsonl"), "").unwrap();
+        fs::write(path.join(ATOMIC_SAVE_MARKER_FILENAME), "").unwrap();
+
+        let result = load_workbook(&path);
+        match result {
+            Err(QbookError::MalformedFormat { id, details }) => {
+                assert_eq!(
+                    id,
+                    ql_storage::FormatId::Builtin(200),
+                    "id field must carry the offending Builtin(200)"
+                );
+                assert!(
+                    details.contains("BuiltinOutOfRange"),
+                    "details must mention BuiltinOutOfRange; got {details:?}"
+                );
+            }
+            other => panic!("expected MalformedFormat(BuiltinOutOfRange), got {other:?}"),
+        }
+    }
+
+    /// **Codex MEDIUM-1 closure:** a v7 envelope with `id = { kind = ... }`
+    /// (the v8 tagged-tuple shape) must be rejected. `#[serde(untagged)]`
+    /// dispatch on `FormatEntryId` is purely structural — without the
+    /// post-deserialize version gate, a hand-edited v7 file with Wire-shaped
+    /// ids would silently load. The guard surfaces this as
+    /// `ForwardCompatFieldOnOldVersion`.
+    #[test]
+    fn v7_envelope_with_v8_wire_id_in_formats_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v7_with_v8_id.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let bad_toml = r#"
+schema_version = 7
+name = "v7_with_v8"
+date_system = "1900"
+
+[[sheets]]
+id = 0
+name = "S"
+chunk_rows = 16384
+row_extent = 0
+col_extent = 0
+
+[[formats.entries]]
+string = "smuggled"
+
+[formats.entries.id]
+kind = "custom"
+peer = 42
+counter = 7
+"#;
+        fs::write(path.join("workbook.toml"), bad_toml).unwrap();
+        fs::write(path.join("sheets/0.jsonl"), "").unwrap();
+        fs::write(path.join(ATOMIC_SAVE_MARKER_FILENAME), "").unwrap();
+
+        let result = load_workbook(&path);
+        assert!(
+            matches!(
+                result,
+                Err(QbookError::ForwardCompatFieldOnOldVersion {
+                    schema_version: 7,
+                    field: f,
+                }) if f.contains("formats.entries[].id")
+            ),
+            "expected ForwardCompatFieldOnOldVersion on v7 envelope with Wire id, got {result:?}"
+        );
+    }
+
+    /// **Codex MEDIUM-1 closure (overlay path):** same as above but the
+    /// Wire-shaped id appears in `sheets[].format_overlay[].id` instead
+    /// of `formats.entries[].id`. Both code paths must reject.
+    #[test]
+    fn v7_envelope_with_v8_wire_id_in_overlay_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v7_overlay_v8_id.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        let bad_toml = r#"
+schema_version = 7
+name = "v7_overlay_v8"
+date_system = "1900"
+
+[[sheets]]
+id = 0
+name = "S"
+chunk_rows = 16384
+row_extent = 1
+col_extent = 1
+
+[[sheets.format_overlay]]
+row = 0
+col = 0
+
+[sheets.format_overlay.id]
+kind = "builtin"
+id = 14
+"#;
+        fs::write(path.join("workbook.toml"), bad_toml).unwrap();
+        fs::write(path.join("sheets/0.jsonl"), "").unwrap();
+        fs::write(path.join(ATOMIC_SAVE_MARKER_FILENAME), "").unwrap();
+
+        let result = load_workbook(&path);
+        assert!(
+            matches!(
+                result,
+                Err(QbookError::ForwardCompatFieldOnOldVersion {
+                    schema_version: 7,
+                    field: f,
+                }) if f.contains("sheets[].format_overlay[].id")
+            ),
+            "expected ForwardCompatFieldOnOldVersion on v7 overlay with Wire id, got {result:?}"
+        );
+    }
+
+    /// **Opus LOW closure (round-trip robustness):** a workbook with two
+    /// non-LEGACY peers' custom ids round-trips losslessly through save →
+    /// load. Single-peer round-trip is covered by
+    /// `v8_envelope_preserves_multi_peer_custom_format_ids`; this adds
+    /// the two-peer case + verifies sort determinism (two consecutive
+    /// saves produce byte-identical workbook.toml).
+    #[test]
+    fn v8_envelope_two_peer_round_trip_and_sort_determinism() {
+        let dir = TempDir::new().unwrap();
+        let path_a = dir.path().join("two_peer_a.qbook");
+        let path_b = dir.path().join("two_peer_b.qbook");
+
+        let mut wb = Workbook::new();
+        let _ = wb.add_sheet("S");
+        // Two non-LEGACY peers each allocate the same string + a distinct
+        // string.
+        wb.formats_mut().set_local_peer(ql_types::PeerId::new(10));
+        let id_a_same = wb.formats_mut().intern("$#,##0");
+        let id_a_solo = wb.formats_mut().intern("0.000");
+        wb.formats_mut().set_local_peer(ql_types::PeerId::new(20));
+        let id_b_same = wb.formats_mut().intern("$#,##0"); // same string, different peer
+        let id_b_solo = wb.formats_mut().intern("0.0000");
+
+        assert_ne!(
+            id_a_same, id_b_same,
+            "post-step-4 by_string restructure: cross-peer same-string allocates distinct ids"
+        );
+
+        save_workbook(&wb, "two_peer", &path_a).unwrap();
+        save_workbook(&wb, "two_peer", &path_b).unwrap();
+
+        // Byte-identical: deterministic sort + serialization.
+        let toml_a = fs::read_to_string(path_a.join("workbook.toml")).unwrap();
+        let toml_b = fs::read_to_string(path_b.join("workbook.toml")).unwrap();
+        assert_eq!(
+            toml_a, toml_b,
+            "two consecutive saves of the same workbook must produce byte-identical TOML"
+        );
+
+        // Round-trip preserves all 4 ids.
+        let loaded = load_workbook(&path_a).expect("two-peer round-trip must succeed");
+        assert_eq!(loaded.formats().lookup(id_a_same), Some("$#,##0"));
+        assert_eq!(loaded.formats().lookup(id_a_solo), Some("0.000"));
+        assert_eq!(loaded.formats().lookup(id_b_same), Some("$#,##0"));
+        assert_eq!(loaded.formats().lookup(id_b_solo), Some("0.0000"));
     }
 
     /// Phase 2A.8 audit M11: a formula-bearing cell with Blank value
