@@ -711,7 +711,7 @@ post the 2026-05-19 audit. Status summary:
    a known V1 limitation.
 
 5. **Format id collision** — **DESIGN RESOLVED in 5.1; D-1 STEPS
-   1–6 IMPLEMENTED (2026-05-19 / 2026-05-20); STEPS 7–8 PENDING.**
+   1–7 IMPLEMENTED (2026-05-19 / 2026-05-20); STEP 8 (full-arc megaudit) PENDING.**
    `FormatId` now a tagged tuple `Builtin(u32) | Custom(PeerId, u32)`
    in `ql_storage::format` (step 3 `af803f1a3f2`). `FormatIdWire`
    the wire-side counterpart in `ql_oplog::wire` (step 2
@@ -735,11 +735,17 @@ post the 2026-05-19 audit. Status summary:
    closure (`2ba66ee3710`) added dedup-by-code (prevents reimport
    StringCollision data loss), 2-pass translation (preserves sparse
    LEGACY counters), and Strict-policy file removal on
-   `NewWorkbook`/`UpdateOriginal`. **Pending:** step 7 Tier D3
-   oplog.bin magic bytes + version header, step 8 megaudit. See
+   `NewWorkbook`/`UpdateOriginal`. `.qbook/oplog.bin` files wrapped in
+   Tier D3 magic + version header (step 7 `0ccc859958f`):
+   `OPLOG_MAGIC = b"QLOL"` + BE u32 `OPLOG_SCHEMA_VERSION = 1` prefix
+   the Loro snapshot body. Step-7 audit closure (`0ad835f6060`) added
+   `OPLOG_MIN_SUPPORTED_SCHEMA_VERSION` gate (rejects v0), refined
+   legacy-path scope docs (backward-compat only for current Op enum
+   shape — pre-step-4 op shapes fail at iter() loudly), and corrected
+   doc drift across 5 sites. **Pending:** step 8 full-arc megaudit. See
    `docs/phase5/d-1-starting-checklist.md` for the execution plan +
    per-step audit transcripts at
-   `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..6}-*.md`.
+   `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..7}-*.md`.
 
 ## Cross-references
 

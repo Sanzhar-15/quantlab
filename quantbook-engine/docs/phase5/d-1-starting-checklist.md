@@ -186,29 +186,42 @@ Initial ship:
 
 5 new tests at audit closure (sparse counters, cross-peer dedup, Strict file-removal, Strict positive case, xlsx→qbook→xlsx double round-trip). Workspace tests: 4270 → 4272 (step 6 ship) → 4277 (audit closure). Full transcripts at `docs/audits/2026-05-20-phase-5-2-d-1-step-6-{codex,opus,consolidated}.md`.
 
-### Step 7: Tier D3 — oplog.bin magic bytes + version header (1 hour)
+### Step 7: Tier D3 — oplog.bin magic bytes + version header — ✅ SHIPPED 2026-05-20 (`0ccc859958f` + audit `0ad835f6060`)
 
-- Bundle with D-1 per the entry plan. Add a 4-byte magic header + u32 schema version to `oplog.bin`.
-- This is the discriminator the loader uses to know whether to apply legacy FormatId migration.
-- Commit: `Tier D3 — oplog.bin magic bytes + schema version header`.
+Initial ship:
+- ✅ 8-byte Quantlab header: 4-byte `OPLOG_MAGIC = b"QLOL"` + big-endian u32 `OPLOG_SCHEMA_VERSION` (currently 1) + Loro snapshot bytes.
+- ✅ `save_workbook_with_oplog` prepends the header; `load_workbook_with_oplog` detects MAGIC + parses version + decodes remainder as Loro snapshot.
+- ✅ Backward-compat legacy path: files without the MAGIC prefix decode as raw Loro snapshots (pre-Tier-D3 format).
+- ✅ 2 new error variants: `PersistenceError::OplogUnsupportedVersion` + `OplogTruncatedHeader`.
+- ✅ 5 new tests pin header layout, version rejection, truncated header, legacy load, empty-file boundary.
 
-### Step 8: Full-arc megaudit (mandatory per discipline rule)
+**Step 7 audit (`0ad835f6060`) — 5th consecutive DIVERGENT-HIGH cycle**. Codex caught HIGH-1 (legacy compat is incomplete — pre-step-4 raw Loro files load OK at framing level but fail at op iter() since ops carried bare u32 ids vs current FormatIdWire shape). Opus PASSED structurally, caught 1 unique MEDIUM-3 (module docstring overstates "migration story"). Convergent: doc drift across collab + oplog (Codex M2 = Opus M1); version 0 acceptance (Codex L1 = Opus M2). All 6 findings closed:
+- ✅ HIGH-1 (legacy scope): documented limitation prominently; backward-compat applies only to files whose ops match the CURRENT Op enum shape (post-step-4). Pre-step-4 raw Loro files load via legacy path but iter() surfaces OpLogError::Deserialize — LOUD failure. Adversarial pre-step-4-op-JSON test deferred to step 8.
+- ✅ M1 (doc drift, 5 sites): collab session.rs export_bytes/sweep_presence, presence.rs, oplog log.rs, crdt-data-model.md — all reframed for post-Tier-D3 file-vs-transport contract.
+- ✅ M2 (version 0 accepted): new `OPLOG_MIN_SUPPORTED_SCHEMA_VERSION = 1` constant + gate `version < MIN || version > MAX`. Error variant adds `min` field.
+- ✅ M3 (migration story overstated): reworded module docstring to "Forward-rejection versioning."
+- ✅ L1 (constants not re-exported): added `OPLOG_MAGIC` / `OPLOG_SCHEMA_VERSION` / `OPLOG_MIN_SUPPORTED_SCHEMA_VERSION` / `OPLOG_HEADER_LEN` at `ql_io::*`. Promoted `OPLOG_HEADER_LEN` to pub.
+- ✅ L2 (cosmetic): `starts_with` replaces slice indexing.
 
-**Per-step audits (steps 1-6) already shipped** — 6 cycles, 4 consecutive DIVERGENT-HIGH cycles (steps 3, 4, 5, 6) caught forward-activating bugs that the alternative (defer all audits to step 8) would have shipped. Transcripts at `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..6}-{codex,opus,consolidated}.md`.
+2 new tests at audit closure (version 0 rejection, legacy corrupt-Loro fail-loud). Workspace tests: 4277 → 4282 (step 7 ship) → 4284 (audit closure). Full transcripts at `docs/audits/2026-05-20-phase-5-2-d-1-step-7-{codex,opus,consolidated}.md`.
 
-Step 8 scope (after step 7 ships):
-- Per-step audit for step 7 same as 1-6 pattern.
-- Then a **full-arc megaudit**: cross-step invariants (schema round-trip end-to-end, old `.qbook` → new envelope → xlsx export → re-import — does the value survive?), workspace-wide grep for any remaining `to_legacy_u32().expect()` or pre-D-1 patterns, fixture coverage gap analysis.
-- Verify clean-checkout `cargo check` (don't trust pre-commit hook gates alone — the index-padding race struck 3 times in the V1 session; 0 times in D-1 so far).
+### Step 8: Full-arc megaudit (mandatory per discipline rule) — ⏳ NEXT
 
-**Estimated total: ~17 hours spent on steps 1-6 + 6 audits (2026-05-19/20); ~1-2h remaining for steps 7-8.** All format-id-related schema work is complete (steps 1-6); step 7 is small (oplog.bin header).
+**Per-step audits (steps 1-7) already shipped** — 7 cycles, **5 consecutive DIVERGENT-HIGH cycles** (steps 3, 4, 5, 6, 7) caught forward-activating bugs that the alternative (defer all audits to step 8) would have shipped. Transcripts at `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..7}-{codex,opus,consolidated}.md`.
+
+Step 8 scope:
+- **Full-arc megaudit**: cross-step invariants (schema round-trip end-to-end through `.qbook` → xlsx export → re-import → `.qbook` save → re-load — does the value survive?), workspace-wide grep for any remaining `to_legacy_u32().expect()` or pre-D-1 patterns, fixture coverage gap analysis.
+- **HIGH-1 follow-up from step 7 audit**: deferred adversarial pre-step-4-op-JSON test. Megaudit should grep for any pre-step-4 fixture files OR construct an adversarial test that synthesizes pre-step-4 op JSON via direct LoroList manipulation. If neither yields findings, the documented limitation is the closure.
+- Verify clean-checkout `cargo check` (don't trust pre-commit hook gates alone — the index-padding race struck 3 times in V1 + 1 time in D-1 step 7; recovery via re-stage).
+
+**Estimated total: ~19 hours spent on steps 1-7 + 7 audits (2026-05-19/20); ~1h remaining for step 8 megaudit.** All implementation work (steps 1-7) complete. Only megaudit remains.
 
 ## Pre-flight checklist
 
-Before resuming D-1 at step 7, verify:
+Before resuming D-1 at step 8 megaudit, verify:
 
-- [ ] HEAD is at the most recent commit on `feat/quantbook-engine` (`2ba66ee3710` as of 2026-05-20 session-end — step 6 audit closures; preceded by `19f6aa1b008` step 6 ship + `9a95429b284` step 5 doc refresh).
-- [ ] `cargo test --workspace` reports **4277** passed.
+- [ ] HEAD is at the most recent commit on `feat/quantbook-engine` (`0ad835f6060` as of 2026-05-20 session-end — step 7 audit closures; preceded by `0ccc859958f` step 7 ship + `9c748474c66` step 6 doc refresh).
+- [ ] `cargo test --workspace` reports **4284** passed.
 - [ ] `cargo fmt --all -- --check` clean.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - [ ] No uncommitted source files (`git status --short | grep -v '^??'` empty).
