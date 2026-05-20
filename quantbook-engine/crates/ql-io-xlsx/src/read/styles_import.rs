@@ -206,6 +206,15 @@ mod tests {
             wb.formats().lookup(FormatId::legacy_from_u32(164)),
             Some("General")
         );
+        // Step-4 audit Codex LOW closure: pin the 4th invariant —
+        // `intern("General")` MUST return `Builtin(0)` even after
+        // the Custom(LEGACY_PEER, 0) registration. The intern lookup
+        // checks by_builtin_string FIRST, so the built-in wins.
+        assert_eq!(
+            wb.formats_mut().intern("General"),
+            FormatId::Builtin(0),
+            "intern() must short-circuit to Builtin even when Custom variant exists for same string"
+        );
     }
 
     #[test]

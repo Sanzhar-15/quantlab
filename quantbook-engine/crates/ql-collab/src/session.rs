@@ -201,7 +201,17 @@ impl CollabSession {
     ///   represented in the imported snapshot AND from every other
     ///   concurrent session — see `OpLog::set_peer_id` for details.
     /// - `PeerId(u64::MAX)` is reserved.
+    /// - **Phase 5.2 D-1 step 4 audit Codex MEDIUM-2 closure:**
+    ///   `PeerId(0)` is `LEGACY_PEER` — debug-asserted just like
+    ///   `CollabSession::new`. Snapshot-join sessions also count as
+    ///   active sessions and must use a non-zero peer id.
     pub fn from_snapshot(peer_id: PeerId, bytes: &[u8]) -> Result<Self, CollabSessionError> {
+        debug_assert_ne!(
+            peer_id.as_u64(),
+            0,
+            "PeerId(0) is LEGACY_PEER (reserved for pre-collab single-writer + qbook migration). \
+             Snapshot-join CollabSession peers MUST use a non-zero PeerId, same as `new`."
+        );
         let mut log = OpLog::import_bytes(bytes)?;
         log.set_peer_id(peer_id.as_u64())?;
         let undo = make_undo_manager(&log);

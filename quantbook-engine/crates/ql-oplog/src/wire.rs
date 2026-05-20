@@ -568,4 +568,77 @@ mod format_id_wire_tests {
             "unknown kind tag must be rejected; got {result:?}"
         );
     }
+
+    // ===== Step 4 audit Opus L1 closure =====
+    //
+    // Direct unit tests for `FormatIdWire::from_storage` /
+    // `::to_storage` round-trip across all 4 boundary points. The
+    // mechanical match-arm projection is unlikely to regress, but
+    // these tests document the lossless-projection contract
+    // explicitly so step 5+ callers can rely on it.
+
+    #[test]
+    fn from_storage_to_storage_round_trip_for_builtin() {
+        for n in [0_u32, 1, 14, 163, u32::MAX] {
+            let storage = ql_storage::FormatId::Builtin(n);
+            let wire = FormatIdWire::from_storage(storage);
+            assert_eq!(
+                wire,
+                FormatIdWire::Builtin { id: n },
+                "from_storage mapping for Builtin({n})"
+            );
+            assert_eq!(
+                wire.to_storage(),
+                storage,
+                "round-trip storage→wire→storage for Builtin({n})"
+            );
+        }
+    }
+
+    #[test]
+    fn from_storage_to_storage_round_trip_for_custom() {
+        for (peer_u64, counter) in [
+            (0_u64, 0_u32),
+            (0, u32::MAX),
+            (u64::MAX - 1, 0),
+            (u64::MAX - 1, u32::MAX),
+            (42, 7),
+        ] {
+            let peer = PeerId::new(peer_u64);
+            let storage = ql_storage::FormatId::Custom(peer, counter);
+            let wire = FormatIdWire::from_storage(storage);
+            assert_eq!(
+                wire,
+                FormatIdWire::Custom { peer, counter },
+                "from_storage mapping for Custom(PeerId({peer_u64}), {counter})"
+            );
+            assert_eq!(
+                wire.to_storage(),
+                storage,
+                "round-trip storage→wire→storage for Custom"
+            );
+        }
+    }
+
+    #[test]
+    fn to_storage_from_storage_round_trip() {
+        // Reverse direction: wire→storage→wire.
+        let cases = [
+            FormatIdWire::Builtin { id: 0 },
+            FormatIdWire::Builtin { id: 163 },
+            FormatIdWire::Custom {
+                peer: LEGACY_PEER,
+                counter: 0,
+            },
+            FormatIdWire::Custom {
+                peer: PeerId::new(0xdead_beef_cafe_babe),
+                counter: u32::MAX,
+            },
+        ];
+        for original in cases {
+            let storage = original.to_storage();
+            let back = FormatIdWire::from_storage(storage);
+            assert_eq!(back, original, "wire→storage→wire identity");
+        }
+    }
 }

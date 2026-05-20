@@ -39,11 +39,22 @@ impl<'a> WorkbookRuntime<'a> {
     /// op log silently; that path is documented as low-level and intended
     /// for the qbook loader + tests + engine-internal reconstruction.
     pub fn intern_format(&mut self, s: &str) -> Result<FormatId, RuntimeError> {
-        // Check whether the table already knows this string. If so, no
-        // new id is allocated and we MUST NOT emit `RegisterFormat`
-        // (idempotent path).
-        if let Some(existing) = self.workbook.formats().iter().find(|(_, t)| *t == s) {
-            return Ok(existing.0);
+        // Phase 5.2 D-1 step 4 audit Codex HIGH-1 closure: use
+        // `FormatTable::lookup_string` (peer-scoped) instead of the
+        // pre-audit global `iter().find()`. The old check returned
+        // ANY id with this string (including remote peers' Customs
+        // post-multi-peer-replay), which broke producer/replay
+        // symmetry: producer would short-circuit to a remote peer's
+        // id without emitting `Op::RegisterFormat`, but replay would
+        // allocate a different (local-peer-namespaced) id.
+        //
+        // `lookup_string` mirrors `FormatTable::intern`'s lookup
+        // precedence: built-in strings short-circuit globally; Custom
+        // strings only short-circuit if THIS peer interned them. If
+        // the string isn't in either namespace, return None and fall
+        // through to allocation.
+        if let Some(existing) = self.workbook.formats().lookup_string(s) {
+            return Ok(existing);
         }
         // New string — predict the id the table will allocate so we can
         // emit the op BEFORE mutating (append-before-mutate ordering,

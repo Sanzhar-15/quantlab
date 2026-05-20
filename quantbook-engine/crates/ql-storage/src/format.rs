@@ -307,7 +307,17 @@ impl FormatTable {
                 _ => None,
             })
             .max();
-        self.next_custom_counter = max_existing.map(|c| c + 1).unwrap_or(0);
+        // Step-4 audit Codex MEDIUM-1: use checked_add to catch
+        // u32::MAX counter overflow (which would wrap to 0 in release
+        // and overwrite Custom(peer, 0)). With u32::MAX peer-local
+        // custom formats this fires loudly rather than corrupting.
+        self.next_custom_counter = max_existing
+            .map(|c| {
+                c.checked_add(1).expect(
+                    "FormatTable: custom counter exhausted (u32::MAX per-peer custom formats)",
+                )
+            })
+            .unwrap_or(0);
     }
 
     /// Look up the format string for `id`. Returns `None` if the id has
@@ -315,6 +325,34 @@ impl FormatTable {
     /// weren't pre-populated by V1 — those land via xlsx import).
     pub fn lookup(&self, id: FormatId) -> Option<&str> {
         self.by_id.get(&id).map(|s| s.as_str())
+    }
+
+    /// **Phase 5.2 D-1 step 4 audit Codex HIGH-1 closure:** lookup a
+    /// format-string and return the id this peer's `intern(s)` would
+    /// return WITHOUT allocating. Mirrors `intern`'s lookup order:
+    ///
+    /// 1. `by_builtin_string` (Excel canonical strings short-circuit
+    ///    globally — same answer for every peer).
+    /// 2. `by_custom_string[(local_peer, s)]` (THIS peer's Custom
+    ///    dedup; intentionally does NOT find OTHER peers' Customs
+    ///    with the same string).
+    /// 3. Returns `None` if no existing id — caller `intern_format`
+    ///    knows it must emit `Op::RegisterFormat` for the new allocation.
+    ///
+    /// Used by `WorkbookRuntime::intern_format` to dedupe correctly
+    /// under multi-peer semantics. The pre-step-4 producer used
+    /// `FormatTable::iter().find(|(_, t)| *t == s)` which returned
+    /// ANY id with that string, including remote peers' Customs —
+    /// that broke producer/replay symmetry once multi-peer replay
+    /// populated `by_id` with other peers' entries.
+    pub fn lookup_string(&self, s: &str) -> Option<FormatId> {
+        if let Some(id) = self.by_builtin_string.get(s) {
+            return Some(*id);
+        }
+        if let Some(id) = self.by_custom_string.get(&(self.local_peer, s.to_string())) {
+            return Some(*id);
+        }
+        None
     }
 
     /// Intern `s`. Returns the existing id if `s` is already present;
@@ -344,7 +382,11 @@ impl FormatTable {
             return *id;
         }
         let id = FormatId::Custom(self.local_peer, self.next_custom_counter);
-        self.next_custom_counter += 1;
+        // Step-4 audit Codex MEDIUM-1: checked_add to catch overflow.
+        self.next_custom_counter = self
+            .next_custom_counter
+            .checked_add(1)
+            .expect("FormatTable: custom counter exhausted (u32::MAX per-peer custom formats)");
         self.by_id.insert(id, s.to_string());
         self.by_custom_string
             .insert((self.local_peer, s.to_string()), id);
@@ -426,7 +468,13 @@ impl FormatTable {
         // fresh counters past any replayed ones.
         if let FormatId::Custom(peer, counter) = id {
             if peer == self.local_peer && counter >= self.next_custom_counter {
-                self.next_custom_counter = counter + 1;
+                // Step-4 audit Codex MEDIUM-1: checked_add to catch
+                // overflow. Replaying a remote op with counter ==
+                // u32::MAX targeting our own peer would otherwise
+                // wrap to 0 in release builds.
+                self.next_custom_counter = counter.checked_add(1).expect(
+                    "FormatTable: custom counter exhausted (u32::MAX per-peer custom formats)",
+                );
             }
         }
         Ok(())
@@ -613,6 +661,64 @@ mod tests {
             .register_at(FormatId::Builtin(0), "DIFFERENT")
             .unwrap_err();
         assert!(matches!(err, FormatTableError::IdCollision { .. }));
+    }
+
+    /// Step 4 audit Codex HIGH-1 closure: pin that `lookup_string`
+    /// is peer-scoped — a remote peer's `Custom(other_peer, _)` for
+    /// the same string MUST NOT short-circuit our local lookup.
+    /// Without this discipline, `WorkbookRuntime::intern_format`
+    /// would return remote peer ids without emitting RegisterFormat,
+    /// breaking producer/replay symmetry under multi-peer replay.
+    #[test]
+    fn lookup_string_is_peer_scoped_for_custom_variant() {
+        let mut t = FormatTable::with_peer(PeerId::new(0xa));
+        let remote_peer = PeerId::new(0xb);
+        // Replay scenario: remote peer's Op::RegisterFormat registers
+        // their Custom(B, 0) → "yyyy-mm-dd".
+        t.register_at(FormatId::Custom(remote_peer, 0), "yyyy-mm-dd")
+            .unwrap();
+        // Local peer's lookup MUST return None (the remote peer's
+        // entry doesn't belong to our namespace).
+        assert_eq!(
+            t.lookup_string("yyyy-mm-dd"),
+            None,
+            "lookup_string must NOT find remote peer's Custom"
+        );
+        // After local peer interns the same string, lookup returns
+        // OUR Custom (not the remote peer's).
+        let local_id = t.intern("yyyy-mm-dd");
+        assert_eq!(local_id, FormatId::Custom(PeerId::new(0xa), 0));
+        assert_eq!(t.lookup_string("yyyy-mm-dd"), Some(local_id));
+    }
+
+    /// Step 4 audit Codex HIGH-1: pin that `lookup_string` returns
+    /// the Built-in id for canonical strings, regardless of any
+    /// Custom variant with the same string. Built-in lookup is global.
+    #[test]
+    fn lookup_string_returns_builtin_even_when_custom_variant_exists() {
+        let mut t = FormatTable::new();
+        // Pre-populate Custom(LEGACY_PEER, 0) → "General" via
+        // register_at (mirrors the LibreOffice import quirk).
+        t.register_at(FormatId::Custom(LEGACY_PEER, 0), "General")
+            .unwrap();
+        // intern_format would call lookup_string first; must return
+        // Builtin(0), NOT the Custom variant.
+        assert_eq!(t.lookup_string("General"), Some(FormatId::Builtin(0)));
+    }
+
+    /// Step 4 audit Opus L5 closure: pin that Builtin-vs-Builtin
+    /// same-string-different-id is still rejected as StringCollision.
+    /// The pre-step-4 test exercised this implicitly via the
+    /// "General" cross-variant case; post-step-4 cross-variant is
+    /// allowed, so this case needs its own test.
+    #[test]
+    fn register_at_builtin_vs_builtin_same_string_collision_rejects() {
+        let mut t = FormatTable::new();
+        // "General" is pre-loaded at Builtin(0). Registering it at
+        // Builtin(99) must error with StringCollision (within the
+        // built-in namespace).
+        let err = t.register_at(FormatId::Builtin(99), "General").unwrap_err();
+        assert!(matches!(err, FormatTableError::StringCollision { .. }));
     }
 
     #[test]
