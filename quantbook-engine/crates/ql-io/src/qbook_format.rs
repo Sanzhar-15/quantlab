@@ -73,7 +73,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use ql_oplog::wire::{CellWireValue, NamedTargetWire, WireDecodeError};
+use ql_oplog::wire::{CellWireValue, FormatIdWire, NamedTargetWire, WireDecodeError};
 use ql_storage::{Sheet, Workbook};
 use ql_types::{ColId, RowId, SheetId, Value, MAX_COLUMN, MAX_ROW};
 use serde::{Deserialize, Serialize};
@@ -146,6 +146,24 @@ use thiserror::Error;
 /// file with v7 fields surfaces as `QbookError::ForwardCompatFieldOnOldVersion`
 /// rather than silently dropping the field.
 ///
+/// **Phase 5.2 D-1 step 5 (2026-05-20):** bumped to v8. v8 changes:
+///   - `FormatEntry.id` + `FormatOverlayEntry.id` shape change from
+///     bare `u32` to [`FormatEntryId`] (untagged enum: `Wire(FormatIdWire)`
+///     for v8 envelopes, `LegacyU32(u32)` for v1-v7 envelopes). The
+///     untagged-enum dispatch handles per-field migration without
+///     version-switched deserialization. v8 envelopes serialize the
+///     tagged tuple shape (e.g. `id = { kind = "builtin", id = 14 }` in
+///     TOML); v<8 envelopes carry `id = 14` and route through
+///     `FormatId::legacy_from_u32`.
+///   - Save path emits `Wire(FormatIdWire::from_storage(fid))` directly.
+///     The pre-step-5 `to_legacy_u32().expect("...")` panic sites
+///     (which would have fired on multi-peer custom ids) are removed —
+///     v8 envelopes can express non-LEGACY peer Custom ids losslessly.
+///   - Gates the step-4 wire format: step 4 changed `Op::RegisterFormat`
+///     + `Op::SetCellFormat` to carry `FormatIdWire`. The envelope's
+///       persistence schema needs to match so saved `.qbook` files can
+///       round-trip multi-peer FormatIds (not just LEGACY_PEER ones).
+///
 /// **Compatibility (design § 10.3 + MEDIUM-7 closure):**
 ///   - v6 reader loading v1-v5: tables field absent → empty TableTable.
 ///   - v5 reader loading v6: refused via the existing
@@ -158,7 +176,13 @@ use thiserror::Error;
 ///     → default A1 / EnUs (regression-neutral).
 ///   - v6 reader loading v7: refused via the two-phase probe →
 ///     loud `UnsupportedSchema { found: 7 }`.
-pub const WORKBOOK_SCHEMA_VERSION: u32 = 7;
+///   - v8 reader loading v1-v7: `FormatEntry.id` deserializes as
+///     `LegacyU32(u32)`, migration via `FormatId::legacy_from_u32`
+///     (n ≤ 163 → `Builtin(n)`; n ≥ 164 → `Custom(LEGACY_PEER, n-164)`).
+///   - v7 reader loading v8: refused via the two-phase probe →
+///     loud `UnsupportedSchema { found: 8 }`. A v7 reader cannot
+///     deserialize the tagged-tuple `id` field as bare `u32`.
+pub const WORKBOOK_SCHEMA_VERSION: u32 = 8;
 
 /// The earliest schema version this reader still accepts. v1 fixtures (Phase 1)
 /// continue to load on v2 binaries; older versions would need explicit handling.
@@ -267,8 +291,17 @@ pub enum QbookError {
     /// pre-populated built-in table OR an internal inconsistency
     /// (same string at two ids). The `details` field is the
     /// `FormatTableError`'s `Debug` rendering.
-    #[error("malformed format entry id={id}: {details}")]
-    MalformedFormat { id: u32, details: String },
+    ///
+    /// **Phase 5.2 D-1 step 5 (2026-05-20):** `id` changed from `u32` to
+    /// `ql_storage::FormatId` (tagged tuple) — mirrors the step-4 change
+    /// to `ReplayError::FormatNotRegistered.id`. Error messages now
+    /// distinguish `Builtin(n)` from `Custom(peer, counter)` rather than
+    /// only carrying the legacy u32.
+    #[error("malformed format entry id={id:?}: {details}")]
+    MalformedFormat {
+        id: ql_storage::FormatId,
+        details: String,
+    },
 
     /// **W5-81 (Phase 4.5.D part 5):** per-sheet `format_overlay` carries
     /// coordinates outside the workbook's row/col bounds.
@@ -556,23 +589,83 @@ pub struct FormatsSection {
     pub entries: Vec<FormatEntry>,
 }
 
+/// **Phase 5.2 D-1 step 5 (2026-05-20):** envelope-side `id` field used
+/// by [`FormatEntry`] + [`FormatOverlayEntry`]. Two shapes coexist for
+/// backwards compatibility:
+///
+/// - `Wire(FormatIdWire)` — v8+ shape. Serializes as the tagged tuple
+///   (e.g. `{ "kind": "builtin", "id": 14 }`). Lossless for multi-peer
+///   Custom ids.
+/// - `LegacyU32(u32)` — v1-v7 shape. Serializes as a bare number (e.g.
+///   `14`). Loader migrates via [`FormatId::legacy_from_u32`]:
+///   `n <= 163` → `Builtin(n)`; `n >= 164` → `Custom(LEGACY_PEER, n-164)`.
+///
+/// `#[serde(untagged)]` makes serde dispatch on shape during deserialize:
+/// struct shape → `Wire`; integer shape → `LegacyU32`. Save path always
+/// emits `Wire`. v8 readers loading v<8 envelopes hit `LegacyU32` and
+/// migrate at the `to_storage()` boundary.
+///
+/// Variant order matters for untagged: serde tries variants top-to-bottom.
+/// `Wire` first means a struct-shaped payload always lands as `Wire`; a
+/// numeric payload falls through to `LegacyU32`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum FormatEntryId {
+    /// v8+ wire shape. Always emitted on save post-step-5.
+    Wire(FormatIdWire),
+    /// v1-v7 legacy shape. Only encountered on load when migrating an
+    /// old envelope; never emitted post-step-5.
+    LegacyU32(u32),
+}
+
+impl FormatEntryId {
+    /// Project the envelope-side id into a runtime [`ql_storage::FormatId`].
+    /// Dispatches on variant: `Wire` decodes via [`FormatIdWire::to_storage`];
+    /// `LegacyU32` migrates via [`FormatId::legacy_from_u32`].
+    ///
+    /// **Step 5 migration contract:** this is the ONLY conversion needed
+    /// at the load boundary. Callers shouldn't pattern-match the variant
+    /// themselves — both shapes route to the same `FormatId` after this
+    /// call.
+    pub fn to_storage(&self) -> ql_storage::FormatId {
+        match self {
+            FormatEntryId::Wire(w) => w.to_storage(),
+            FormatEntryId::LegacyU32(n) => ql_storage::FormatId::legacy_from_u32(*n),
+        }
+    }
+
+    /// Construct from a runtime [`ql_storage::FormatId`]. Always returns
+    /// the v8+ `Wire` variant. Use this at the save boundary.
+    pub fn from_storage(id: ql_storage::FormatId) -> Self {
+        FormatEntryId::Wire(FormatIdWire::from_storage(id))
+    }
+}
+
 /// **W5-81 (Phase 4.5.D part 5):** one row in the workbook FormatTable.
+///
+/// **Phase 5.2 D-1 step 5 (2026-05-20):** `id` changed from `u32` to
+/// [`FormatEntryId`] — an untagged enum that accepts both v8 wire shape
+/// and v<8 legacy `u32`. Save path emits the v8 shape; loader handles
+/// both.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FormatEntry {
-    pub id: u32,
+    pub id: FormatEntryId,
     pub string: String,
 }
 
 /// **W5-81 (Phase 4.5.D part 5):** one entry in a sheet's cell-format
 /// overlay — `(row, col)` ↦ FormatId. Sorted by `(row, col)` on save
 /// for deterministic diffs.
+///
+/// **Phase 5.2 D-1 step 5 (2026-05-20):** `id` changed from `u32` to
+/// [`FormatEntryId`] (same shape change as [`FormatEntry`]).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FormatOverlayEntry {
     pub row: u32,
     pub col: u32,
-    pub id: u32,
+    pub id: FormatEntryId,
 }
 
 /// **W5-123 (Phase 4.8.L):** workbook-scoped table metadata. Mirror of
@@ -1108,16 +1201,11 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
                     .map(|((r, c), fid)| FormatOverlayEntry {
                         row: r,
                         col: c,
-                        // Phase 5.2 D-1 step 3: pre-step-5 envelope
-                        // still uses bare-u32 ids. `to_legacy_u32()`
-                        // returns None only for non-LEGACY peer ids,
-                        // which can't exist pre-step-4 (no multi-peer
-                        // producer yet). expect() makes the invariant
-                        // load-bearing — step 5 changes the envelope
-                        // schema to carry FormatIdWire directly.
-                        id: fid
-                            .to_legacy_u32()
-                            .expect("pre-step-5 qbook envelope sees only legacy FormatId"),
+                        // Phase 5.2 D-1 step 5: envelope schema bumped to
+                        // v8 — emit the tagged-tuple wire shape directly.
+                        // Lossless for non-LEGACY peer Custom ids (which
+                        // pre-step-5 hit the to_legacy_u32().expect() panic).
+                        id: FormatEntryId::from_storage(fid),
                     })
                     .collect();
                 entries.sort_by_key(|e| (e.row, e.col));
@@ -1182,7 +1270,13 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
     // `FormatTable::default()` on load and aren't persisted. None if the
     // table has no custom entries (typical for built-in-only workbooks).
     let formats_section = {
-        let mut entries: Vec<FormatEntry> = wb
+        // Collect (FormatId, owned-string) tuples up front so we can sort
+        // by the storage-side `FormatId` (derived Ord since step 3). This
+        // avoids needing Ord on `FormatEntryId` and keeps the on-disk
+        // ordering identical to a Builtin-vs-Custom + counter-monotonic
+        // semantic — the same property `entries.sort_by_key(|e| e.id)`
+        // had pre-step-5 when `id: u32`.
+        let mut pairs: Vec<(ql_storage::FormatId, String)> = wb
             .formats()
             .iter()
             // Phase 5.2 D-1 step 3: `id.is_custom()` replaces the
@@ -1190,18 +1284,24 @@ fn write_workbook_to_dir(wb: &Workbook, name: &str, dir: &Path) -> Result<(), Qb
             // Persist only custom (peer-allocated) entries; built-ins
             // re-seed from `FormatTable::default()` on load.
             .filter(|(id, _)| id.is_custom())
-            .map(|(id, s)| FormatEntry {
-                // Same expect-pattern as the format_overlay save above.
-                id: id
-                    .to_legacy_u32()
-                    .expect("pre-step-5 qbook envelope sees only legacy FormatId"),
-                string: s.to_owned(),
-            })
+            .map(|(id, s)| (id, s.to_owned()))
             .collect();
-        if entries.is_empty() {
+        if pairs.is_empty() {
             None
         } else {
-            entries.sort_by_key(|e| e.id);
+            pairs.sort_by_key(|(id, _)| *id);
+            let entries: Vec<FormatEntry> = pairs
+                .into_iter()
+                .map(|(id, string)| FormatEntry {
+                    // Phase 5.2 D-1 step 5: emit v8 tagged-tuple shape
+                    // directly. Pre-step-5 this site used
+                    // `id.to_legacy_u32().expect(...)` which would have
+                    // panicked on non-LEGACY peer Custom ids; post-step-5
+                    // the envelope expresses them losslessly.
+                    id: FormatEntryId::from_storage(id),
+                    string,
+                })
+                .collect();
             Some(FormatsSection { entries })
         }
     };
@@ -1525,16 +1625,16 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
     // pre-seeded builtins; mismatches surface as `MalformedFormat`.
     if let Some(ref fs) = envelope.formats {
         for entry in &fs.entries {
-            // Phase 5.2 D-1 step 3: pre-step-5 envelopes carry
-            // bare-u32 ids. Convert via the legacy migration helper:
-            // n <= 163 → Builtin(n); n >= 164 → Custom(LEGACY_PEER, n - 164).
+            // Phase 5.2 D-1 step 5: `entry.id` is now `FormatEntryId`
+            // (untagged enum). `to_storage()` dispatches per-variant:
+            // - v8 `Wire(FormatIdWire)` → `FormatIdWire::to_storage()`.
+            // - v<8 `LegacyU32(n)` → `FormatId::legacy_from_u32(n)`
+            //   (n ≤ 163 → Builtin; n ≥ 164 → Custom(LEGACY_PEER, n-164)).
+            let fid = entry.id.to_storage();
             wb.formats_mut()
-                .register_at(
-                    ql_storage::FormatId::legacy_from_u32(entry.id),
-                    entry.string.as_str(),
-                )
+                .register_at(fid, entry.string.as_str())
                 .map_err(|err| QbookError::MalformedFormat {
-                    id: entry.id,
+                    id: fid,
                     details: format!("{err:?}"),
                 })?;
         }
@@ -1580,8 +1680,9 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
             // sheet + immutable on `wb.formats()`).
             //
             // Phase 5.2 D-1 step 3: HashSet keys are now `FormatId`
-            // (the enum) rather than `u32`. Overlay-entry lookup
-            // converts `entry.id` via `legacy_from_u32` before query.
+            // (the enum) rather than `u32`. Phase 5.2 D-1 step 5:
+            // `entry.id` is now `FormatEntryId` (untagged enum) routing
+            // both v8 Wire and v<8 LegacyU32 shapes through `to_storage()`.
             let known_ids: std::collections::HashSet<ql_storage::FormatId> =
                 wb.formats().iter().map(|(id, _)| id).collect();
             let sheet_mut = wb.sheet_mut(sheet_id).expect("just-added sheet must exist");
@@ -1598,7 +1699,7 @@ pub fn load_workbook(path: &Path) -> Result<Workbook, QbookError> {
                         why: "out-of-range row/col",
                     });
                 }
-                let fid = ql_storage::FormatId::legacy_from_u32(entry.id);
+                let fid = entry.id.to_storage();
                 if !known_ids.contains(&fid) {
                     return Err(QbookError::MalformedFormatOverlay {
                         sheet: sheet_id,
@@ -3143,9 +3244,18 @@ string = "NOT_GENERAL"
         fs::write(path.join(ATOMIC_SAVE_MARKER_FILENAME), "").unwrap();
 
         let result = load_workbook(&path);
+        // Phase 5.2 D-1 step 5: MalformedFormat.id changed u32 → FormatId.
+        // The v4 envelope's `id = 0` migrates through `legacy_from_u32(0)`
+        // = `Builtin(0)`.
         assert!(
-            matches!(result, Err(QbookError::MalformedFormat { id: 0, .. })),
-            "expected MalformedFormat(id=0), got {result:?}"
+            matches!(
+                result,
+                Err(QbookError::MalformedFormat {
+                    id: ql_storage::FormatId::Builtin(0),
+                    ..
+                })
+            ),
+            "expected MalformedFormat(Builtin(0)), got {result:?}"
         );
     }
 
@@ -3237,6 +3347,261 @@ id = 999
             ),
             "expected MalformedFormatOverlay(unregistered id), got {result:?}"
         );
+    }
+
+    // ===== Phase 5.2 D-1 step 5 (2026-05-20) — qbook envelope v7 → v8 =====
+
+    /// **Step 5 fixture test:** hand-craft a v7 envelope with bare-u32
+    /// FormatEntry + FormatOverlayEntry ids and verify the v8 loader's
+    /// migration produces correct tagged-tuple FormatIds.
+    ///
+    /// Pre-step-5 this envelope had `id: u32` natively; post-step-5 the
+    /// loader's `FormatEntryId::LegacyU32(n)` variant + `to_storage()`
+    /// handle the migration. The test pins:
+    /// - `n = 14` (built-in range) → `Builtin(14)` after migration.
+    /// - `n = 164` (first custom in legacy encoding) → `Custom(LEGACY_PEER, 0)`.
+    /// - `n = 200` (mid-range custom) → `Custom(LEGACY_PEER, 36)`.
+    /// - Cell overlay binding to `n = 14` (built-in) resolves to `Builtin(14)`.
+    /// - Cell overlay binding to `n = 200` resolves to the migrated Custom.
+    #[test]
+    fn v7_envelope_bare_u32_ids_migrate_to_tagged_tuple() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy_v7.qbook");
+        fs::create_dir_all(path.join("sheets")).unwrap();
+        // v7 envelope: schema_version = 7, FormatEntry.id as bare u32,
+        // FormatOverlayEntry.id as bare u32. Mirrors the on-disk shape
+        // a pre-5.2 binary would have written.
+        let v7_toml = r#"
+schema_version = 7
+name = "legacy"
+date_system = "1900"
+
+[[sheets]]
+id = 0
+name = "S"
+chunk_rows = 16384
+row_extent = 1
+col_extent = 1
+
+[[sheets.format_overlay]]
+row = 0
+col = 0
+id = 14
+
+[[sheets.format_overlay]]
+row = 1
+col = 0
+id = 200
+
+[[formats.entries]]
+id = 164
+string = "yyyy-mm-dd"
+
+[[formats.entries]]
+id = 200
+string = "0.000%"
+"#;
+        fs::write(path.join("workbook.toml"), v7_toml).unwrap();
+        fs::write(path.join("sheets/0.jsonl"), "").unwrap();
+        fs::write(path.join(ATOMIC_SAVE_MARKER_FILENAME), "").unwrap();
+
+        let loaded = load_workbook(&path).expect("v7 envelope must load via legacy migration");
+
+        // FormatTable: custom entries land under LEGACY_PEER with
+        // counter = id - 164 (matches FormatId::legacy_from_u32).
+        assert_eq!(
+            loaded
+                .formats()
+                .lookup(ql_storage::FormatId::Custom(ql_types::LEGACY_PEER, 0)),
+            Some("yyyy-mm-dd"),
+            "id=164 must migrate to Custom(LEGACY_PEER, 0)"
+        );
+        assert_eq!(
+            loaded
+                .formats()
+                .lookup(ql_storage::FormatId::Custom(ql_types::LEGACY_PEER, 36)),
+            Some("0.000%"),
+            "id=200 must migrate to Custom(LEGACY_PEER, 36)"
+        );
+        // Built-ins remain at their canonical ids (re-seeded by
+        // FormatTable::default(), no migration needed for them).
+        assert_eq!(
+            loaded.formats().lookup(ql_storage::FormatId::Builtin(14)),
+            Some("m/d/yyyy")
+        );
+
+        // Cell overlay: bare-u32 ids migrate the same way.
+        let overlay = loaded.sheet(0).unwrap().format_overlay();
+        assert_eq!(
+            overlay.get(0, 0),
+            Some(ql_storage::FormatId::Builtin(14)),
+            "overlay id=14 must migrate to Builtin(14)"
+        );
+        assert_eq!(
+            overlay.get(1, 0),
+            Some(ql_storage::FormatId::Custom(ql_types::LEGACY_PEER, 36)),
+            "overlay id=200 must migrate to Custom(LEGACY_PEER, 36)"
+        );
+    }
+
+    /// **Step 5 round-trip test:** verify v8 envelopes preserve non-LEGACY
+    /// peer Custom FormatIds losslessly through save → load. This is the
+    /// property step 5 enables — pre-step-5 the save path's
+    /// `to_legacy_u32().expect(...)` would have panicked on
+    /// `Custom(PeerId(42), 0)` because legacy u32 can't express
+    /// non-LEGACY peers.
+    #[test]
+    fn v8_envelope_preserves_multi_peer_custom_format_ids() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("multi_peer.qbook");
+
+        let mut wb = Workbook::new();
+        let s = wb.add_sheet("S");
+        // Take over as a non-LEGACY peer and allocate a custom format
+        // under that peer's namespace. Pre-step-5 saving this would
+        // have panicked.
+        wb.formats_mut().set_local_peer(ql_types::PeerId::new(42));
+        let custom_id = wb.formats_mut().intern("\"€\" #,##0.00");
+        assert_eq!(
+            custom_id,
+            ql_storage::FormatId::Custom(ql_types::PeerId::new(42), 0),
+            "intern under PeerId(42) must allocate Custom(42, 0)"
+        );
+        wb.sheet_mut(s)
+            .unwrap()
+            .format_overlay_mut()
+            .set(0, 0, custom_id);
+
+        save_workbook(&wb, "multi_peer", &path).unwrap();
+        let loaded = load_workbook(&path).expect("v8 round-trip must succeed");
+
+        // FormatTable: the non-LEGACY peer custom survives unchanged.
+        assert_eq!(
+            loaded.formats().lookup(custom_id),
+            Some("\"€\" #,##0.00"),
+            "Custom(PeerId(42), 0) must round-trip through v8 envelope"
+        );
+        // Cell overlay: still bound to the same FormatId.
+        assert_eq!(
+            loaded.sheet(0).unwrap().format_overlay().get(0, 0),
+            Some(custom_id),
+            "overlay binding to Custom(PeerId(42), 0) must round-trip"
+        );
+    }
+
+    /// **Step 5 round-trip test:** verify v8 envelopes serialize the
+    /// tagged-tuple shape on disk (not bare u32). Inspects the saved
+    /// workbook.toml directly to confirm the wire format.
+    #[test]
+    fn v8_envelope_serializes_tagged_tuple_shape_on_disk() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v8_shape.qbook");
+
+        let mut wb = Workbook::new();
+        let _ = wb.add_sheet("S");
+        let custom_id = wb.formats_mut().intern("#,##0.00 USD");
+        wb.sheet_mut(0)
+            .unwrap()
+            .format_overlay_mut()
+            .set(0, 0, custom_id);
+
+        save_workbook(&wb, "v8_shape", &path).unwrap();
+
+        let toml_bytes = fs::read_to_string(path.join("workbook.toml")).unwrap();
+        // Schema version on disk is the current ship version (8).
+        assert!(
+            toml_bytes.contains(&format!("schema_version = {}", WORKBOOK_SCHEMA_VERSION)),
+            "envelope must carry current schema_version, got:\n{toml_bytes}"
+        );
+        // The custom format entry serializes the FormatIdWire tagged-tuple
+        // shape: `id = { kind = "custom", peer = ..., counter = ... }`.
+        assert!(
+            toml_bytes.contains(r#"kind = "custom""#),
+            "v8 envelope must serialize Wire(Custom {{ .. }}) shape, got:\n{toml_bytes}"
+        );
+        // Cell overlay entries serialize the same shape.
+        assert!(
+            toml_bytes.contains("format_overlay") && toml_bytes.contains(r#"kind = "custom""#),
+            "overlay entries must use tagged-tuple shape, got:\n{toml_bytes}"
+        );
+        // Sanity: round-trip still works.
+        let loaded = load_workbook(&path).unwrap();
+        assert_eq!(loaded.formats().lookup(custom_id), Some("#,##0.00 USD"));
+    }
+
+    /// **Step 5 ordering test:** verify untagged enum dispatch is
+    /// unambiguous — a v8-shaped TOML envelope (struct `id`) MUST
+    /// deserialize as `Wire(_)`, not `LegacyU32(_)`. A v<8-shaped TOML
+    /// envelope (numeric `id`) MUST deserialize as `LegacyU32(_)`.
+    #[test]
+    fn format_entry_id_untagged_dispatch_is_unambiguous() {
+        // Wire shape (struct).
+        let wire_toml = r#"
+id = { kind = "builtin", id = 14 }
+string = "m/d/yyyy"
+"#;
+        let wire_entry: FormatEntry = toml::from_str(wire_toml).expect("wire shape parses");
+        assert!(
+            matches!(wire_entry.id, FormatEntryId::Wire(_)),
+            "tagged-tuple id must dispatch to Wire variant"
+        );
+        assert_eq!(
+            wire_entry.id.to_storage(),
+            ql_storage::FormatId::Builtin(14)
+        );
+
+        // LegacyU32 shape (bare integer).
+        let legacy_toml = r#"
+id = 14
+string = "m/d/yyyy"
+"#;
+        let legacy_entry: FormatEntry = toml::from_str(legacy_toml).expect("legacy shape parses");
+        assert!(
+            matches!(legacy_entry.id, FormatEntryId::LegacyU32(14)),
+            "bare-u32 id must dispatch to LegacyU32 variant"
+        );
+        // legacy_from_u32(14) = Builtin(14) — same final FormatId.
+        assert_eq!(
+            legacy_entry.id.to_storage(),
+            ql_storage::FormatId::Builtin(14)
+        );
+
+        // Edge case: legacy id=164 migrates to Custom(LEGACY_PEER, 0).
+        let legacy_custom_toml = r#"
+id = 164
+string = "yyyy-mm-dd"
+"#;
+        let legacy_custom: FormatEntry = toml::from_str(legacy_custom_toml).unwrap();
+        assert!(matches!(legacy_custom.id, FormatEntryId::LegacyU32(164)));
+        assert_eq!(
+            legacy_custom.id.to_storage(),
+            ql_storage::FormatId::Custom(ql_types::LEGACY_PEER, 0)
+        );
+    }
+
+    /// **Step 5:** the `FormatEntryId::from_storage(FormatId)` constructor
+    /// is the canonical save-side path. Verify it always emits `Wire`,
+    /// regardless of variant.
+    #[test]
+    fn format_entry_id_from_storage_always_emits_wire_variant() {
+        let cases = [
+            ql_storage::FormatId::Builtin(0),
+            ql_storage::FormatId::Builtin(163),
+            ql_storage::FormatId::Custom(ql_types::LEGACY_PEER, 0),
+            ql_storage::FormatId::Custom(ql_types::PeerId::new(42), 7),
+        ];
+        for fid in cases {
+            let envelope_id = FormatEntryId::from_storage(fid);
+            assert!(
+                matches!(envelope_id, FormatEntryId::Wire(_)),
+                "from_storage({fid:?}) must produce Wire variant"
+            );
+            assert_eq!(
+                envelope_id.to_storage(),
+                fid,
+                "from_storage → to_storage must round-trip {fid:?}"
+            );
+        }
     }
 
     /// Phase 2A.8 audit M11: a formula-bearing cell with Blank value
@@ -3420,13 +3785,15 @@ col_extent = 1
     /// **W5-145 (Phase 4.9.I):** updated from version 7 to version 8
     /// after v7 became the current ship version (adding workbook
     /// `reference_mode` + `locale` for the R1C1/locale preference).
+    /// **Phase 5.2 D-1 step 5 (2026-05-20):** v8 is now current; bumped
+    /// "future" probe to v9.
     #[test]
     fn future_schema_version_rejected() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("future.qbook");
         fs::create_dir_all(path.join("sheets")).unwrap();
         let toml = r#"
-schema_version = 8
+schema_version = 9
 name = "future"
 
 [[sheets]]
@@ -3441,7 +3808,7 @@ col_extent = 0
 
         let result = load_workbook(&path);
         assert!(
-            matches!(result, Err(QbookError::UnsupportedSchema { found: 8 })),
+            matches!(result, Err(QbookError::UnsupportedSchema { found: 9 })),
             "expected UnsupportedSchema, got {result:?}"
         );
     }
@@ -3583,10 +3950,15 @@ col_extent = 0
     // ===== W5-92 (Phase 4.6.D) sheet-scoped names + schema v5 =====
 
     #[test]
-    fn schema_version_constant_is_seven() {
+    fn schema_version_constant_is_eight() {
         // Sanity check so future bumps trip this test until the doc is updated.
         // W5-145 (Phase 4.9.I) bumped from 6 to 7 (workbook reference_mode + locale).
-        assert_eq!(WORKBOOK_SCHEMA_VERSION, 7);
+        // Phase 5.2 D-1 step 5 (2026-05-20) bumped from 7 to 8: FormatEntry.id
+        // + FormatOverlayEntry.id u32 → FormatEntryId untagged enum
+        // (Wire(FormatIdWire) | LegacyU32(u32)). v8 envelopes carry tagged-tuple
+        // FormatIds losslessly (multi-peer); v<8 envelopes route through
+        // FormatId::legacy_from_u32 at load time.
+        assert_eq!(WORKBOOK_SCHEMA_VERSION, 8);
     }
 
     #[test]
