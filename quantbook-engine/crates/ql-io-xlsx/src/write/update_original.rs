@@ -223,13 +223,24 @@ pub(crate) fn export_update_original(
     // could destroy a caller's pre-existing file at `output_path`
     // under `Strict` mode. The contract is "Strict means no-loss";
     // touching the user's destination on a drop violates it.
-    if !dropped.is_empty() {
+    //
+    // **Phase 5.2 D-1 step 6 audit closure (Codex HIGH-3, 2026-05-20):**
+    // pre-closure, the Strict check only inspected the local `dropped`
+    // vector (preserved-parts tracking + inline drops in this module).
+    // The `export_new_workbook` shadow call ALSO populates
+    // `report.dropped_features` (e.g. the multi-peer-format-id-flatten
+    // entries shipped at step 6). Strict UpdateOriginal could succeed
+    // while losing data through those entries. Closure: merge BOTH
+    // sources before the Strict check.
+    let mut all_drops: Vec<UnsupportedFeature> = dropped;
+    all_drops.append(&mut report.dropped_features);
+    if !all_drops.is_empty() {
         match unsupported_policy {
             UnsupportedPolicy::Permissive => {
-                report.dropped_features.extend(dropped);
+                report.dropped_features.extend(all_drops);
             }
             UnsupportedPolicy::Strict => {
-                let first = dropped.into_iter().next().unwrap();
+                let first = all_drops.into_iter().next().unwrap();
                 return Err(XlsxError::UnsupportedFeature {
                     feature: first.kind,
                     part: first.part,

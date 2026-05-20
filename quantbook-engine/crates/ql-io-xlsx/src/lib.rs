@@ -379,12 +379,28 @@ pub fn export_xlsx_path(
             // populated `dropped_features` and never triggered Strict.
             // Now collect drops + enforce policy. The exporter populates
             // `report.dropped_features`; we apply Strict here.
+            //
+            // **Phase 5.2 D-1 step 6 audit closure (Codex HIGH-3,
+            // 2026-05-20):** when Strict fires post-write, the lossy
+            // file is still on disk. The contract is "Strict means no
+            // loss" — a caller who sees `Err` must be able to assume
+            // the destination wasn't touched. Pre-closure this was
+            // false: NewWorkbook Strict would create/overwrite
+            // `out_path` and then return Err, leaving a partial-
+            // semantic file behind. Now: on Strict-fail, delete the
+            // file we just wrote so the no-loss contract holds.
             let mut report =
                 write::umya_export::export_new_workbook(workbook, out_path, options.formula_cache)?;
             report.warnings.shrink_to_fit();
             if !report.dropped_features.is_empty()
                 && options.unsupported_policy == UnsupportedPolicy::Strict
             {
+                // Remove the lossy file before returning Err. Best-
+                // effort: if removal itself fails, we still return the
+                // original UnsupportedFeature error (the dropped-feature
+                // information is more useful than the IO error for the
+                // caller's debugging).
+                let _ = std::fs::remove_file(out_path);
                 let first = report.dropped_features[0].clone();
                 return Err(XlsxError::UnsupportedFeature {
                     feature: first.kind,

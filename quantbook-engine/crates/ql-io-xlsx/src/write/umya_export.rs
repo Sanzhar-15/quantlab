@@ -82,36 +82,48 @@ fn cell_ref_a1(row: u32, col: u32) -> String {
     name
 }
 
-/// **Phase 5.2 D-1 step 6 (2026-05-20):** xlsx single-namespace
-/// numFmtId translation. xlsx's `numFmtId` is a single `u32` namespace
-/// — no peer-id concept. `FormatId::Custom(peer, counter)` variants
-/// from multi-peer `.qbook` workbooks must flatten to a single
-/// contiguous range on export.
+/// **Phase 5.2 D-1 step 6 (2026-05-20, audit-closure rewrite):** xlsx
+/// single-namespace numFmtId translation. xlsx's `numFmtId` is a single
+/// `u32` namespace — no peer-id concept. `FormatId::Custom(peer, counter)`
+/// variants from multi-peer `.qbook` workbooks must flatten to a single
+/// namespace on export.
 ///
-/// **Translation:**
-/// - `Builtin(n)` → `n` (canonical xlsx built-in id; no flattening).
-/// - `Custom(_, _)` → sequential xlsx numFmtId starting at
-///   `FIRST_CUSTOM_FORMAT_ID = 164`. Order is deterministic: sorted
-///   by `FormatId`'s derived `Ord` (Builtin sorts before Custom; within
-///   Custom, by `(peer, counter)`).
+/// **Translation algorithm (step 6 audit Codex+Opus HIGH closure):**
 ///
-/// **Byte-stability:** for the LEGACY_PEER-only case (single-writer
-/// pre-D-1 default), sorted Custom ids are in counter order, so the
-/// allocator produces `Custom(LEGACY_PEER, c) → c + 164` — identical
-/// to the pre-step-6 `to_legacy_u32().expect()` output. Existing xlsx
-/// round-trip tests round-trip byte-identically.
+/// 1. **Builtin(n) → n.** Canonical xlsx built-in id; no flattening.
+/// 2. **Custom(LEGACY_PEER, c) → c + FIRST_CUSTOM_FORMAT_ID.** Preserves
+///    the pre-step-6 `to_legacy_u32()` mapping. Holds for ALL counters
+///    (dense or sparse) so existing xlsx fixtures round-trip
+///    byte-identically. Closes Codex+Opus HIGH on sparse counters
+///    (pre-fix sequential reindexing broke byte-stability for sparse
+///    counters like `{5, 7}` from replay scenarios).
+/// 3. **Custom(non-LEGACY peer, c) → dedup-by-code.** If the format
+///    code is also held by an earlier-registered Custom (a LEGACY_PEER
+///    entry OR an earlier non-LEGACY entry in sorted order), reuse
+///    that numFmtId. Otherwise allocate the next available numFmtId
+///    AFTER the highest LEGACY_PEER counter range.
+///
+///    **Dedup-by-code is LOAD-BEARING (Codex HIGH-1 closure):** two
+///    peers with the same format code MUST map to the same xlsx
+///    numFmtId. Without dedup, the export emits two `<numFmt>` entries
+///    with identical `formatCode`, and import's `register_at` rejects
+///    the second as `StringCollision` (silently skipped per the
+///    styles-import handler). Cells originally bound to the second
+///    peer then map to an unregistered FormatId on reimport — silent
+///    render fallback to General, data loss.
 ///
 /// **Information loss reporting:** non-LEGACY peer ids round-trip
-/// CORRECTLY through xlsx, but reimporting an xlsx export collapses
-/// them to `Custom(LEGACY_PEER, _)` (the legacy_from_u32 path —
-/// xlsx has no peer concept to recover). The flattened ids are
-/// recorded in `info_lost` so the export caller can surface them via
-/// `XlsxExportReport.dropped_features`. Per the no-fallbacks doctrine,
-/// the loss is reported rather than silently absorbed.
+/// CORRECTLY through xlsx, but reimporting collapses them to
+/// `Custom(LEGACY_PEER, _)` (xlsx has no peer concept to recover).
+/// The flattened ids are recorded in `info_lost` so the export caller
+/// can surface them via `XlsxExportReport.dropped_features`. Per the
+/// no-fallbacks doctrine, the loss is reported rather than silently
+/// absorbed.
 struct XlsxNumFmtTranslation {
     /// `Custom(peer, counter) → flattened xlsx numFmtId`. Builtin
     /// variants are NOT in this map — the translator returns `n`
-    /// directly for `Builtin(n)`.
+    /// directly for `Builtin(n)`. Two Customs with the same format
+    /// code may map to the SAME xlsx numFmtId (dedup-by-code).
     custom_map: std::collections::HashMap<FormatId, u32>,
     /// `(original Custom FormatId, flattened xlsx numFmtId)` for any
     /// Custom whose peer ≠ LEGACY_PEER. These are the lossy entries
@@ -144,23 +156,91 @@ impl XlsxNumFmtTranslation {
                 customs.insert(*fid);
             }
         }
+
         let mut custom_map = std::collections::HashMap::new();
         let mut info_lost = Vec::new();
-        let mut next = FIRST_CUSTOM_FORMAT_ID;
-        for fid in customs {
-            let xlsx_id = next;
-            // Step-5 audit Codex M1 lesson: checked_add guards
-            // overflow even on programmer-controlled paths. With
-            // u32::MAX - 164 = ~4.3 billion custom formats this fires
-            // truly never, but the explicit check documents intent.
-            next = next
-                .checked_add(1)
-                .expect("xlsx custom numFmtId allocator exhausted (u32::MAX entries)");
-            custom_map.insert(fid, xlsx_id);
-            if let FormatId::Custom(peer, _) = fid {
-                if peer != LEGACY_PEER {
-                    info_lost.push((fid, xlsx_id));
+        // Dedup-by-code map: format string → xlsx numFmtId already
+        // assigned. Step 6 audit closure (HIGH-1): two FormatIds with
+        // the same format code MUST collapse to one numFmtId on export
+        // — else import StringCollision drops the second binding and
+        // cells lose their format.
+        let mut code_to_numfmt: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+
+        // Pass 1: LEGACY_PEER customs preserve `c + FIRST_CUSTOM_FORMAT_ID`.
+        // Step 6 audit closure (HIGH-2): pre-closure sequential
+        // reallocation broke byte-stability for sparse counters (e.g.
+        // {5, 7} from replay scenarios) — pre-step-6 `to_legacy_u32()`
+        // exported as 169, 171; pre-closure step 6 sequential allocator
+        // emitted 164, 165. Preserving the counter-based mapping fixes
+        // this. `highest_legacy_id` tracks the upper bound of LEGACY-
+        // reserved numFmtIds so pass 2 doesn't collide.
+        let mut highest_legacy_id = FIRST_CUSTOM_FORMAT_ID.saturating_sub(1);
+        for fid in &customs {
+            if let FormatId::Custom(peer, c) = fid {
+                if *peer == LEGACY_PEER {
+                    // Step-5 audit Codex M1 lesson: checked_add. With
+                    // FIRST_CUSTOM_FORMAT_ID=164 + counter approaching
+                    // u32::MAX-164, the add overflows.
+                    let xlsx_id = c
+                        .checked_add(FIRST_CUSTOM_FORMAT_ID)
+                        .expect("xlsx numFmtId overflow: LEGACY_PEER counter near u32::MAX");
+                    custom_map.insert(*fid, xlsx_id);
+                    highest_legacy_id = highest_legacy_id.max(xlsx_id);
+                    if let Some(code) = workbook.formats().lookup(*fid) {
+                        // First LEGACY entry with this code claims the
+                        // dedup slot. (At most one LEGACY entry per
+                        // code exists per by_custom_string structure.)
+                        code_to_numfmt.entry(code.to_string()).or_insert(xlsx_id);
+                    }
                 }
+            }
+        }
+
+        // Pass 2: non-LEGACY peer Customs. Sequential allocation starting
+        // AFTER highest_legacy_id so we don't collide with the LEGACY
+        // counter-derived range. Dedup-by-code: if a non-LEGACY Custom
+        // shares its format string with an earlier-allocated entry
+        // (LEGACY or non-LEGACY), it reuses that numFmtId.
+        let mut next_non_legacy = highest_legacy_id
+            .checked_add(1)
+            .unwrap_or(FIRST_CUSTOM_FORMAT_ID);
+        for fid in &customs {
+            if let FormatId::Custom(peer, _) = fid {
+                if *peer == LEGACY_PEER {
+                    continue;
+                }
+                let xlsx_id = if let Some(code) = workbook.formats().lookup(*fid) {
+                    if let Some(existing) = code_to_numfmt.get(code) {
+                        // Dedupe-by-code: reuse existing numFmtId.
+                        *existing
+                    } else {
+                        let new_id = next_non_legacy;
+                        next_non_legacy = next_non_legacy
+                            .checked_add(1)
+                            .expect("xlsx custom numFmtId allocator exhausted (u32::MAX entries)");
+                        code_to_numfmt.insert(code.to_string(), new_id);
+                        new_id
+                    }
+                } else {
+                    // Pathological: cellxfs_roster contains a Custom not
+                    // registered in wb.formats(). No code to dedup;
+                    // allocate a unique numFmtId. Renderer falls back
+                    // to General on reimport (no numFmt entry will
+                    // exist for this id).
+                    let new_id = next_non_legacy;
+                    next_non_legacy = next_non_legacy
+                        .checked_add(1)
+                        .expect("xlsx custom numFmtId allocator exhausted (u32::MAX entries)");
+                    new_id
+                };
+                custom_map.insert(*fid, xlsx_id);
+                // info_lost: every non-LEGACY peer entry is a flatten
+                // (peer-id is lost on round-trip). Multiple entries
+                // for the same xlsx_id (dedup-by-code case) are
+                // intentional — each lost peer-id is a distinct piece
+                // of round-trip information for the report.
+                info_lost.push((*fid, xlsx_id));
             }
         }
         Self {
@@ -462,22 +542,37 @@ pub(crate) fn export_new_workbook(
     let needs_cell_fixes = sheet_fixes.iter().any(|f| !f.is_empty());
 
     // **W5-D-14.2 (HIGH-5 closure):** collect custom-format codes (≥164).
-    // Phase 5.2 D-1 step 6 (2026-05-20): use the xlsx numFmt translation
-    // (built above over `wb.formats() + cellxfs_roster` Customs). For
-    // LEGACY_PEER-only workbooks the translated numFmtIds match the
-    // pre-step-6 `to_legacy_u32()` output identically. Multi-peer
-    // FormatIds get flattened to the contiguous range with reporting.
-    let custom_formats: Vec<(u32, String)> = workbook
-        .formats()
-        .iter()
-        .filter_map(|(id, code)| {
-            if id.is_custom() {
-                Some((xlsx_numfmt.translate(id), code.to_string()))
-            } else {
-                None
-            }
-        })
-        .collect();
+    // Phase 5.2 D-1 step 6 (2026-05-20) + audit closure: use the xlsx
+    // numFmt translation. Two Customs sharing a format code dedup to
+    // the same numFmtId, so we MUST dedupe the emitted <numFmt> roster
+    // by numFmtId (else duplicate numFmtId entries land in styles.xml).
+    //
+    // Sort by numFmtId for byte-deterministic <numFmts> output
+    // (closes Codex MEDIUM-1 — pre-closure used FormatTable::iter()
+    // which is HashMap-iter-arbitrary-order).
+    let custom_formats: Vec<(u32, String)> = {
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut entries: Vec<(u32, String)> = workbook
+            .formats()
+            .iter()
+            .filter_map(|(id, code)| {
+                if id.is_custom() {
+                    let xlsx_id = xlsx_numfmt.translate(id);
+                    if seen.insert(xlsx_id) {
+                        Some((xlsx_id, code.to_string()))
+                    } else {
+                        // Dedup-by-code case: another FormatId with the
+                        // same code already emitted at this numFmtId.
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+        entries.sort_by_key(|(id, _)| *id);
+        entries
+    };
 
     // **W5-D-14.2 (HIGH-4 closure — export side):** collect workbook-
     // scoped + sheet-scoped names. Each is rendered as the OOXML

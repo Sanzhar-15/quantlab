@@ -1956,3 +1956,323 @@ fn step6_legacy_peer_only_workbook_xlsx_export_byte_unchanged() {
     let _ = std::fs::remove_file(&tmp_a);
     let _ = std::fs::remove_file(&tmp_b);
 }
+
+// ===== Phase 5.2 D-1 step 6 audit closure regression tests (2026-05-20) =====
+
+#[test]
+fn step6_audit_sparse_legacy_counters_preserve_byte_stability() {
+    // **Codex HIGH-2 / Opus HIGH-1 closure:** non-contiguous LEGACY_PEER
+    // counters (e.g. {5, 7}) must export as numFmtIds {169, 171} —
+    // matching pre-step-6 `to_legacy_u32()` output (c + 164). Pre-
+    // closure the sequential allocator emitted {164, 165} for sparse
+    // counters, breaking byte-stability with pre-step-6 fixtures.
+    use ql_storage::{FormatId, Workbook};
+    use ql_types::{Value, LEGACY_PEER};
+
+    let mut wb = Workbook::new();
+    let _ = wb.add_sheet("S");
+    // Register sparse LEGACY counters via register_at (simulates the
+    // replay scenario the audit identified).
+    wb.formats_mut()
+        .register_at(FormatId::Custom(LEGACY_PEER, 5), "yyyy-mm-dd")
+        .unwrap();
+    wb.formats_mut()
+        .register_at(FormatId::Custom(LEGACY_PEER, 7), "0.0000%")
+        .unwrap();
+    wb.put_at(0, 0, 0, Value::Number(45000.0));
+    wb.put_at(0, 1, 0, Value::Number(0.42));
+    wb.sheet_mut(0)
+        .unwrap()
+        .format_overlay_mut()
+        .set(0, 0, FormatId::Custom(LEGACY_PEER, 5));
+    wb.sheet_mut(0)
+        .unwrap()
+        .format_overlay_mut()
+        .set(1, 0, FormatId::Custom(LEGACY_PEER, 7));
+
+    let tmp = std::env::temp_dir().join("step6-audit-sparse-legacy.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+    export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+
+    // Read styles.xml and verify the numFmtIds are 169 and 171 (counter + 164),
+    // NOT 164 and 165 (sequential reindexing).
+    let bytes = std::fs::read(&tmp).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+    let mut styles_xml = String::new();
+    {
+        let mut f = zip.by_name("xl/styles.xml").unwrap();
+        use std::io::Read;
+        f.read_to_string(&mut styles_xml).unwrap();
+    }
+    assert!(
+        styles_xml.contains(r#"numFmtId="169""#),
+        "LEGACY_PEER counter 5 must export as numFmtId 169 (counter + 164), not sequential. \
+         Got: {styles_xml}"
+    );
+    assert!(
+        styles_xml.contains(r#"numFmtId="171""#),
+        "LEGACY_PEER counter 7 must export as numFmtId 171. Got: {styles_xml}"
+    );
+    // Negative pin: sequential reindexing would have produced 165.
+    assert!(
+        !styles_xml.contains(r#"numFmtId="165""#),
+        "sparse counters must NOT collapse to sequential ids. Found unexpected numFmtId=165: {styles_xml}"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn step6_audit_cross_peer_same_string_dedups_to_one_numfmt() {
+    // **Codex HIGH-1 / Opus MEDIUM-1 closure:** two peers with the
+    // same format code must collapse to one xlsx numFmtId on export.
+    // Pre-closure the export emitted two distinct numFmt entries; on
+    // reimport the second hit StringCollision and was silently dropped,
+    // breaking the cell binding for the second peer's cells.
+    use ql_storage::{FormatId, Workbook};
+    use ql_types::{PeerId, Value};
+
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("S");
+
+    // Two peers both intern "yyyy-mm-dd".
+    wb.formats_mut().set_local_peer(PeerId::new(42));
+    let peer42_fmt = wb.formats_mut().intern("yyyy-mm-dd");
+    wb.formats_mut().set_local_peer(PeerId::new(99));
+    let peer99_fmt = wb.formats_mut().intern("yyyy-mm-dd");
+    assert_eq!(peer42_fmt, FormatId::Custom(PeerId::new(42), 0));
+    assert_eq!(peer99_fmt, FormatId::Custom(PeerId::new(99), 0));
+
+    wb.put_at(s, 0, 0, Value::Number(45000.0));
+    wb.put_at(s, 1, 0, Value::Number(45001.0));
+    wb.sheet_mut(s)
+        .unwrap()
+        .format_overlay_mut()
+        .set(0, 0, peer42_fmt);
+    wb.sheet_mut(s)
+        .unwrap()
+        .format_overlay_mut()
+        .set(1, 0, peer99_fmt);
+
+    let tmp = std::env::temp_dir().join("step6-audit-cross-peer-dedup.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+    export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default()).unwrap();
+
+    // Inspect styles.xml: exactly ONE <numFmt> entry for "yyyy-mm-dd"
+    // (dedup-by-code). Pre-closure there were two distinct numFmt
+    // entries with the same formatCode.
+    let bytes = std::fs::read(&tmp).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+    let mut styles_xml = String::new();
+    {
+        let mut f = zip.by_name("xl/styles.xml").unwrap();
+        use std::io::Read;
+        f.read_to_string(&mut styles_xml).unwrap();
+    }
+    let yyyy_count = styles_xml.matches(r#"formatCode="yyyy-mm-dd""#).count();
+    assert_eq!(
+        yyyy_count, 1,
+        "post-closure dedup: exactly one numFmt entry for 'yyyy-mm-dd' (two peers collapse). \
+         Got {yyyy_count} entries in: {styles_xml}"
+    );
+
+    // Re-import succeeds and BOTH cells render with the correct format
+    // code. Pre-closure the second cell silently rendered as General.
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Both overlay entries resolve to a FormatId mapped to "yyyy-mm-dd".
+    let overlay = result.workbook.sheet(0).unwrap().format_overlay();
+    let id_0 = overlay.get(0, 0).expect("cell (0,0) overlay survives");
+    let id_1 = overlay.get(1, 0).expect("cell (1,0) overlay survives");
+    let code_0 = result.workbook.formats().lookup(id_0);
+    let code_1 = result.workbook.formats().lookup(id_1);
+    assert_eq!(
+        code_0,
+        Some("yyyy-mm-dd"),
+        "cell (0,0) FormatId must resolve to 'yyyy-mm-dd' (pre-closure: would have been the same)"
+    );
+    assert_eq!(
+        code_1,
+        Some("yyyy-mm-dd"),
+        "cell (1,0) FormatId must resolve to 'yyyy-mm-dd' (pre-closure: None → General fallback, DATA LOSS)"
+    );
+    // Both cells map to the SAME FormatId post-dedup (xlsx single-namespace).
+    assert_eq!(id_0, id_1);
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn step6_audit_strict_newworkbook_removes_lossy_file_on_error() {
+    // **Codex HIGH-3 closure:** Strict mode with a multi-peer workbook
+    // must NOT leave a lossy file on disk. Pre-closure NewWorkbook
+    // Strict wrote the file THEN returned Err, leaving a partial-
+    // semantic file behind. Post-closure the file is removed before
+    // Err returns.
+    use ql_io_xlsx::UnsupportedPolicy;
+    use ql_storage::Workbook;
+    use ql_types::{PeerId, Value};
+
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("S");
+    wb.formats_mut().set_local_peer(PeerId::new(42));
+    let custom = wb.formats_mut().intern("yyyy-mm-dd");
+    wb.put_at(s, 0, 0, Value::Number(45000.0));
+    wb.sheet_mut(s)
+        .unwrap()
+        .format_overlay_mut()
+        .set(0, 0, custom);
+
+    let tmp = std::env::temp_dir().join("step6-audit-strict-newworkbook.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+
+    let result = export_xlsx_path(
+        &wb,
+        &registry,
+        &tmp,
+        XlsxExportOptions {
+            unsupported_policy: UnsupportedPolicy::Strict,
+            ..Default::default()
+        },
+    );
+    assert!(
+        result.is_err(),
+        "Strict + multi-peer must error (multi-peer-format-id-flatten is a drop). Got: {result:?}"
+    );
+    // The lossy file must NOT exist on disk after Strict failure.
+    assert!(
+        !tmp.exists(),
+        "Strict failure must remove the lossy file from disk; found {tmp:?}"
+    );
+}
+
+#[test]
+fn step6_audit_strict_newworkbook_legacy_only_succeeds_and_writes_file() {
+    // **Codex HIGH-3 closure (positive case):** Strict mode with a
+    // LEGACY_PEER-only workbook must succeed normally — no
+    // multi-peer-flatten entries → no drops → no Strict trigger →
+    // file written.
+    use ql_io_xlsx::UnsupportedPolicy;
+    use ql_storage::Workbook;
+    use ql_types::Value;
+
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("S");
+    let custom = wb.formats_mut().intern("yyyy-mm-dd");
+    wb.put_at(s, 0, 0, Value::Number(45000.0));
+    wb.sheet_mut(s)
+        .unwrap()
+        .format_overlay_mut()
+        .set(0, 0, custom);
+
+    let tmp = std::env::temp_dir().join("step6-audit-strict-legacy-only.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+
+    let result = export_xlsx_path(
+        &wb,
+        &registry,
+        &tmp,
+        XlsxExportOptions {
+            unsupported_policy: UnsupportedPolicy::Strict,
+            ..Default::default()
+        },
+    );
+    assert!(
+        result.is_ok(),
+        "Strict + LEGACY_PEER-only must succeed. Got: {result:?}"
+    );
+    assert!(tmp.exists(), "Strict success must leave the file on disk");
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn step6_audit_xlsx_qbook_xlsx_double_round_trip_drops_to_zero_multi_peer_flattens() {
+    // **Opus LOW-6 / Codex MEDIUM-2 test-gap closure:** an xlsx
+    // exported from a multi-peer workbook becomes single-namespace
+    // (xlsx has no peer concept). Re-importing produces only
+    // LEGACY_PEER customs. A second export of that re-imported
+    // workbook must produce 0 multi-peer-flatten entries — verifying
+    // the asymmetry: information is lost ONCE on the first .qbook→xlsx
+    // export and cannot reappear.
+    use ql_storage::Workbook;
+    use ql_types::{PeerId, Value};
+
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("S");
+    wb.formats_mut().set_local_peer(PeerId::new(42));
+    let fmt = wb.formats_mut().intern("yyyy-mm-dd");
+    wb.put_at(s, 0, 0, Value::Number(45000.0));
+    wb.sheet_mut(s).unwrap().format_overlay_mut().set(0, 0, fmt);
+
+    let tmp1 = std::env::temp_dir().join("step6-audit-double-rt-1.xlsx");
+    let tmp2 = std::env::temp_dir().join("step6-audit-double-rt-2.xlsx");
+    for p in [&tmp1, &tmp2] {
+        let _ = std::fs::remove_file(p);
+    }
+    let registry = ql_functions::default_registry();
+
+    // First export: 1 multi-peer flatten (PeerId(42)).
+    let report1 = export_xlsx_path(&wb, &registry, &tmp1, XlsxExportOptions::default()).unwrap();
+    let flatten_count_1 = report1
+        .dropped_features
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.kind,
+                ql_io_xlsx::UnsupportedFeatureKind::Other("multi-peer-format-id-flatten")
+            )
+        })
+        .count();
+    assert_eq!(flatten_count_1, 1);
+
+    // Re-import the xlsx (xlsx → .qbook collapses peer to LEGACY_PEER).
+    let reimported = import_xlsx_path(
+        &tmp1,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Second export: workbook is now LEGACY_PEER-only → 0 flattens.
+    let report2 = export_xlsx_path(
+        &reimported.workbook,
+        &registry,
+        &tmp2,
+        XlsxExportOptions::default(),
+    )
+    .unwrap();
+    let flatten_count_2 = report2
+        .dropped_features
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.kind,
+                ql_io_xlsx::UnsupportedFeatureKind::Other("multi-peer-format-id-flatten")
+            )
+        })
+        .count();
+    assert_eq!(
+        flatten_count_2, 0,
+        "second export of LEGACY_PEER-only reimported workbook must produce 0 multi-peer flattens"
+    );
+
+    for p in [&tmp1, &tmp2] {
+        let _ = std::fs::remove_file(p);
+    }
+}
