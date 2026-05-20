@@ -140,8 +140,13 @@ pub enum ReplayError {
     /// legitimately match neither. The replay handler now applies
     /// the rename to the current sheet (last-in-causal-order wins
     /// policy). Variant kept for ABI compat — external callers that
-    /// match against it will simply never see it. May be removed in
-    /// a future major version after a deprecation cycle.
+    /// match against it will simply never see it. Marked
+    /// `#[deprecated]` for IDE discoverability (Codex step-2 audit
+    /// LOW closure). May be removed in a future major version.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Phase 5.3 step 2: no longer emitted. Concurrent renames now apply via last-in-causal-order wins policy. See replay.rs RenameSheet handler."
+    )]
     #[error(
         "replay rename-sheet name mismatch at op index {index}: sheet {id} \
          expected current name {expected:?}, found {found:?}"
@@ -494,52 +499,57 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             old_name,
             new_name,
         } => {
-            // **W5-91 (Phase 4.6.C) + Phase 5.3 step 2 (2026-05-20):**
-            // snapshot-vs-replay reconciliation + CRDT concurrent-rename
-            // policy. Three cases the replay handler sees:
+            // **W5-91 (Phase 4.6.C) + Phase 5.3 step 2 + step-2 audit
+            // closure (2026-05-20):** snapshot-vs-replay reconciliation
+            // + CRDT concurrent-rename policy.
             //
-            //   1. Current sheet name == new_name → already-renamed.
-            //      Idempotent path (replay-on-top-of-snapshot OR concurrent
-            //      peers picked the same target). No-op; success.
+            // Two cases (post-step-2-audit-closure):
             //
-            //   2. Current sheet name == old_name → fresh rename. Apply.
+            //   1. Current display name == new_name (EXACT equality, not
+            //      canonical) → idempotent. Replay-on-top-of-snapshot OR
+            //      concurrent peers picked the same target. No-op.
             //
-            //   3. Current sheet name == neither → either:
-            //      (a) Pre-Phase-5.3: divergent state, treated as
-            //          `SheetRenameNameMismatch` (replay hard-failed).
-            //      (b) **Phase 5.3 step 2 policy (audit-locked)**: under
-            //          CRDT merge of concurrent renames, current name may
-            //          legitimately match neither. E.g. peer A renames
-            //          S1→S2 (applied first in causal order); peer B
-            //          concurrently issues `RenameSheet { old: "S1",
-            //          new: "S3" }`. By the time B's op replays, current
-            //          is "S2" — neither "S1" nor "S3".
+            //      **MEDIUM-1 audit closure (Codex):** pre-closure the
+            //      idempotency check used canonical equality, which
+            //      silently dropped case-only renames (e.g. "Sheet1" →
+            //      "SHEET1"). Storage permits case-only renames and
+            //      updates the display field; replay must do the same.
             //
-            //          Policy: **last-in-causal-order wins; apply the
-            //          rename to the current sheet name.** The op's
-            //          `old_name` is interpreted as "what the peer thought
-            //          was current at write time"; if reality has moved on
-            //          (another peer's rename landed first), apply this
-            //          rename to whatever the sheet currently is. Final
-            //          name converges deterministically because Loro's
-            //          causal order is deterministic across peers.
+            //   2. Otherwise → apply the rename. Subsumes:
+            //      - pre-step-2 case 2 (current == old_name; fresh rename).
+            //      - pre-step-2 case 3 (current ∈ neither; **Phase 5.3
+            //        step 2 policy**, audit-locked: last-in-causal-order
+            //        wins under CRDT merge — apply to current sheet name.
+            //        Matches `crdt-data-model.md` § 311-334 last-wins
+            //        rule for SetName + same-cell writes).
+            //      - case-only rename (canonical equal, display differs).
             //
-            //          Matches the "last-in-causal-order wins" semantic
-            //          documented for SetName + same-cell writes in
-            //          `crdt-data-model.md` § 311-334.
+            // **HIGH-1 audit closure (Codex + Opus convergent):** rename
+            // target collision (`new_name` already used by a different
+            // sheet) auto-disambiguates via D-2-style suffix walk
+            // (`<name>(2)`, `<name>(3)`, …). Pre-closure this propagated
+            // `SheetRenameRejected` and hard-failed replay — same blast
+            // radius as the original pre-step-2 bug, just shifted to a
+            // different concurrent scenario (peer A: sheet0 S1→X, peer
+            // B: sheet1 S3→X, both valid locally, second errors on merge).
             //
-            // Cases 2 and 3 share identical code — both apply the rename
-            // via `workbook.rename_sheet(id, new_name)`. The case
-            // distinction is documentation-only after step 2.
+            // D-2 (AddSheet auto-rename) set the precedent at
+            // `replay.rs:458-490`; RenameSheet now follows the same
+            // pattern for consistency. `Empty` + `ReservedCharacter`
+            // still reject — auto-rename only resolves collisions.
             //
-            // Edge cases (post-step-2):
-            //   - Sheet doesn't exist at id → `InvalidSheet` (existing,
-            //     unchanged). Loro's causal order should not produce this
-            //     under normal multi-peer flows; it would indicate a
-            //     genuine corruption.
-            //   - Rename target collision (new_name already used by a
-            //     different sheet) → `SheetRenameRejected` propagated
-            //     from `Workbook::rename_sheet`.
+            // Edge cases:
+            //   - Sheet doesn't exist at id → `InvalidSheet` (unchanged).
+            //   - `new_name` is empty → `SheetRenameRejected { source:
+            //     SheetNameError::Empty }` propagated from storage. The
+            //     wire op format does not enforce non-empty; producer-side
+            //     `WorkbookRuntime::rename_sheet` validates, but a
+            //     malformed log can still bypass that path. HIGH-2 audit
+            //     closure (Opus): documented here.
+            //   - Reserved-character in `new_name` → `SheetRenameRejected
+            //     { source: ReservedCharacter(_) }`. Same caveat as Empty.
+            const AUTO_RENAME_CEILING: u32 = 10_000;
+
             let current = workbook.sheet(*id).map(|s| s.name().to_owned()).ok_or(
                 ReplayError::InvalidSheet {
                     index,
@@ -547,27 +557,42 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
                     sheet_count: workbook.sheet_count(),
                 },
             )?;
-            let canonical = |s: &str| ql_storage::Workbook::canonical_sheet_name(s);
-            let cur_c = canonical(&current);
-            let new_c = canonical(new_name);
-            if cur_c == new_c {
-                // Case 1: idempotent — current already at target. No-op.
-                Ok(())
-            } else {
-                // Case 2 (current == old_name, fresh rename) OR
-                // Case 3 (Phase 5.3 step 2: concurrent-rename last-wins).
-                // Both apply `current → new_name`.
-                let _ = old_name; // kept on the wire for diagnostics; not validated post-step-2
-                workbook
-                    .rename_sheet(*id, new_name.clone())
-                    .map_err(|source| ReplayError::SheetRenameRejected {
-                        index,
-                        id: *id,
-                        old_name: old_name.clone(),
-                        new_name: new_name.clone(),
-                        source,
-                    })?;
-                Ok(())
+            if current == *new_name {
+                // Case 1: already at exact target display. No-op.
+                return Ok(());
+            }
+            // Case 2: apply rename, auto-disambiguating Duplicate via D-2
+            // pattern. Empty + ReservedCharacter still reject.
+            let mut chosen = new_name.clone();
+            let mut suffix = 2u32;
+            loop {
+                match workbook.rename_sheet(*id, chosen.clone()) {
+                    Ok(_) => return Ok(()),
+                    Err(ql_storage::SheetNameError::Duplicate { .. }) => {
+                        chosen = format!("{new_name}({suffix})");
+                        suffix += 1;
+                        if suffix > AUTO_RENAME_CEILING {
+                            return Err(ReplayError::SheetRenameRejected {
+                                index,
+                                id: *id,
+                                old_name: old_name.clone(),
+                                new_name: new_name.clone(),
+                                source: ql_storage::SheetNameError::Duplicate {
+                                    name: new_name.clone(),
+                                },
+                            });
+                        }
+                    }
+                    Err(other) => {
+                        return Err(ReplayError::SheetRenameRejected {
+                            index,
+                            id: *id,
+                            old_name: old_name.clone(),
+                            new_name: new_name.clone(),
+                            source: other,
+                        });
+                    }
+                }
             }
         }
         Op::RegisterFormat { id, string } => {
@@ -1709,10 +1734,18 @@ mod tests {
         assert!(matches!(err, ReplayError::InvalidSheet { .. }));
     }
 
+    /// **Phase 5.3 step 2 audit closure (Codex+Opus HIGH-1, 2026-05-20):**
+    /// test name + assertion inverted by the D-2-compatible auto-rename
+    /// policy. Pre-closure this asserted `SheetRenameRejected` fired when
+    /// the target name collided with another sheet. Post-closure replay
+    /// auto-disambiguates via the suffix walk (`Sheet2(2)`, etc.) —
+    /// mirrors D-2's AddSheet auto-rename. The merged log is no longer
+    /// un-replayable; both peers' rename intents are preserved (with
+    /// suffix on the second).
     #[test]
-    fn replay_rename_sheet_duplicate_target_errors() {
+    fn replay_rename_sheet_duplicate_target_auto_disambiguates() {
         // Two sheets exist; renaming the first to the second's name must
-        // fail through SheetRenameRejected.
+        // succeed via auto-disambiguation (Sheet2 → Sheet2(2)).
         let mut log = OpLog::new();
         log.append(Op::AddSheet {
             name: "Sheet1".to_owned(),
@@ -1733,8 +1766,12 @@ mod tests {
 
         let mut wb = Workbook::new();
         let reg = default_registry();
-        let err = replay_into(&log, &mut wb, &reg).unwrap_err();
-        assert!(matches!(err, ReplayError::SheetRenameRejected { .. }));
+        replay_into(&log, &mut wb, &reg)
+            .expect("replay must auto-disambiguate, not error (post-HIGH-1 closure)");
+        // Sheet 0 was renamed; "Sheet2" was already taken by sheet 1, so
+        // auto-rename suffixes to "Sheet2(2)".
+        assert_eq!(wb.sheet(0).unwrap().name(), "Sheet2(2)");
+        assert_eq!(wb.sheet(1).unwrap().name(), "Sheet2");
     }
 
     #[test]

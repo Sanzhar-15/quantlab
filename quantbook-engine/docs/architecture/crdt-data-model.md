@@ -325,7 +325,10 @@ target. Phase 5.3 formalizes this with these defaults:
 | `ClearFormula { A1 }` × `PutFormula { A1, f }` | Last-in-causal-order wins |
 | `SetName { foo, t_a }` × `SetName { foo, t_b }` | Last-in-causal-order wins |
 | `AddSheet "S"` × `AddSheet "S"` | **Both succeed; second in causal order auto-renames to `S(2)`** (Phase 5.2 D-2 ✅ shipped `1ca19e2fa37`). Escalates to `S(3)`, etc. on cascading collision; `AUTO_RENAME_CEILING = 10_000`. |
-| `RenameSheet { 0, A, B }` × concurrent edit on sheet 0 | Edit's formula text written under old name → after merge, formula references old name → bind fails → `BindError::UnknownSheet` → emit `#NAME?` (Phase 5.2 D-3 ✅ shipped `e71312d4bcd`). Phase 5.3 adds the causality-aware rename-repair pass. |
+| `RenameSheet { 0, A, B }` × concurrent edit on sheet 0 | Edit's formula text written under old name → after merge, formula references old name → bind fails → `BindError::UnknownSheet` → emit `#NAME?` (Phase 5.2 D-3 ✅ shipped `e71312d4bcd`). **Phase 5.3 step 3** adds the causality-aware rename-repair pass that rewrites the formula text post-merge. |
+| `RenameSheet { 0, _, A }` × `RenameSheet { 0, _, B }` (same sheet, different targets) | **Phase 5.3 step 2 ✅ shipped:** last-in-causal-order wins; second rename applies to the current sheet name. `old_name` becomes advisory (replay no longer validates it). Pre-step-2 replay hard-failed via `SheetRenameNameMismatch`. |
+| `RenameSheet { 0, _, X }` × `RenameSheet { 1, _, X }` (different sheets, same target) | **Phase 5.3 step 2 audit closure ✅ shipped:** D-2-style auto-disambiguation — second rename suffixes to `X(2)`, etc. Pre-closure replay hard-failed via `SheetRenameRejected { source: Duplicate }`. |
+| `RenameSheet { 0, "Sheet1", "SHEET1" }` (case-only rename) | **Phase 5.3 step 2 audit closure ✅ shipped:** replay applies the display update. Pre-closure the canonical-equality idempotency check silently dropped case-only renames. |
 | `DropTable "T"` × concurrent edit referencing T | Edit appends with old table-ref → bind fails post-merge → `#NAME?`. |
 
 The 5.3 audit checkpoint validates these defaults against the

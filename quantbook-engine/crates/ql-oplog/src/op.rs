@@ -97,14 +97,33 @@ pub enum Op {
     AddSheet { name: String, chunk_rows: u32 },
 
     /// **W5-91 (Phase 4.6.C):** rename an existing sheet by id. Mirrors
-    /// `Workbook::rename_sheet`. Carries `old_name` for replay-time
-    /// validation (snapshot-vs-replay reconciliation: if the snapshot
-    /// already has the new name, replay no-ops gracefully when current
-    /// canonical matches the new name). Per design doc § 3.1, the
-    /// producer-side runtime rewrites all stored formula text BEFORE
-    /// emitting this op (and emits `Op::PutFormula` ops for each
-    /// rewritten cell in the same BatchCommit), so replay-on-top-of-
-    /// snapshot OR replay-from-empty both produce correct state.
+    /// `Workbook::rename_sheet`. Per design doc § 3.1, the producer-side
+    /// runtime rewrites all stored formula text BEFORE emitting this op
+    /// (and emits `Op::PutFormula` ops for each rewritten cell in the
+    /// same `BatchCommit`), so replay-on-top-of-snapshot OR replay-from-
+    /// empty both produce correct state.
+    ///
+    /// **Phase 5.3 step 2 audit closure (Codex MEDIUM-2, 2026-05-20):**
+    /// `old_name` is now ADVISORY at replay time, not validated. Pre-
+    /// step-2 the replay handler rejected ops whose `old_name` didn't
+    /// match the current sheet name (`SheetRenameNameMismatch`); under
+    /// CRDT merge of concurrent renames the second op's `old_name`
+    /// legitimately fails to match, so the validation was wrong. Post-
+    /// step-2 the replay handler unconditionally renames the sheet at
+    /// `id` to `new_name` (with D-2-style auto-disambiguation on
+    /// duplicate targets). `old_name` is retained on the wire for:
+    ///   - diagnostics in `ReplayError::SheetRenameRejected.old_name`
+    ///   - producer-side single-writer log debuggability (the op records
+    ///     what the producer's local state was at write time)
+    ///   - future re-introduction of strict-mode replay if needed
+    ///
+    /// **Trade-off**: single-writer malformed logs (`old="Wrong",
+    /// new="X"` against current "S") now silently rename "S" → "X"
+    /// rather than erroring. The CRDT use case requires this; we
+    /// accept the single-writer trade-off because the producer-side
+    /// `WorkbookRuntime::rename_sheet` validates locally before
+    /// emitting, so a malformed op indicates corruption or a custom
+    /// op-log producer that bypassed the runtime.
     RenameSheet {
         id: SheetId,
         old_name: String,
