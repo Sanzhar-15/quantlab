@@ -708,7 +708,7 @@ post the 2026-05-19 audit. Status summary:
    a known V1 limitation.
 
 5. **Format id collision** — **DESIGN RESOLVED in 5.1; D-1 STEPS
-   1–5 IMPLEMENTED (2026-05-19 / 2026-05-20); STEPS 6–8 PENDING.**
+   1–6 IMPLEMENTED (2026-05-19 / 2026-05-20); STEPS 7–8 PENDING.**
    `FormatId` now a tagged tuple `Builtin(u32) | Custom(PeerId, u32)`
    in `ql_storage::format` (step 3 `af803f1a3f2`). `FormatIdWire`
    the wire-side counterpart in `ql_oplog::wire` (step 2
@@ -725,11 +725,18 @@ post the 2026-05-19 audit. Status summary:
    panics. Step-5 audit closure (`30ef2637d6f`) added `FormatTableError::
    CounterOverflow` + `BuiltinOutOfRange` variants with `register_at`
    pre-validation, plus a post-deserialize guard rejecting v8-shaped
-   ids in v<8 envelopes. **Pending:** step 6 xlsx FormatId↔numFmtId
-   mapping, step 7 Tier D3 oplog.bin magic bytes + version header,
-   step 8 megaudit. See `docs/phase5/d-1-starting-checklist.md` for
-   the execution plan + per-step audit transcripts at
-   `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..5}-*.md`.
+   ids in v<8 envelopes. xlsx export flattens multi-peer FormatIds via
+   `XlsxNumFmtTranslation` (step 6 `19f6aa1b008`): LEGACY_PEER customs
+   preserve `c + 164` for byte-stability; non-LEGACY peers dedup by
+   format code into a contiguous range past LEGACY. Step-6 audit
+   closure (`2ba66ee3710`) added dedup-by-code (prevents reimport
+   StringCollision data loss), 2-pass translation (preserves sparse
+   LEGACY counters), and Strict-policy file removal on
+   `NewWorkbook`/`UpdateOriginal`. **Pending:** step 7 Tier D3
+   oplog.bin magic bytes + version header, step 8 megaudit. See
+   `docs/phase5/d-1-starting-checklist.md` for the execution plan +
+   per-step audit transcripts at
+   `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..6}-*.md`.
 
 ## Cross-references
 

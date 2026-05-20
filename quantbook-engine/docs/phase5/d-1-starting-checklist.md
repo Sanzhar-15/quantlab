@@ -169,12 +169,22 @@ Step 5 shipped:
 
 8 new tests at audit closure (+3 ql-storage, +5 ql-io qbook_format). Workspace tests: 4257 → 4262 (step 5 ship) → 4270 (audit closure). Full transcripts at `docs/audits/2026-05-20-phase-5-2-d-1-step-5-{codex,opus,consolidated}.md`.
 
-### Step 6: xlsx export / import (1-2 hours) — ⏳ NEXT
+### Step 6: xlsx export / import — ✅ SHIPPED 2026-05-20 (`19f6aa1b008` + audit `2ba66ee3710`)
 
-- Flatten `FormatId` → xlsx `numFmtId` on export.
-- Inflate xlsx `numFmtId` → `FormatId::Builtin(n)` on import.
-- Tests: existing xlsx round-trip tests should pass.
-- Commit: `Phase 5.2 D-1 step 6 — xlsx numFmtId ↔ FormatId mapping`.
+Initial ship:
+- ✅ New `XlsxNumFmtTranslation` helper in `umya_export.rs`. Flattens `FormatId::Custom(peer, counter)` into a single contiguous xlsx numFmtId range starting at 164.
+- ✅ 3 `to_legacy_u32().expect("pre-step-6 ...")` panic sites removed from xlsx export.
+- ✅ `XlsxExportReport.dropped_features` populated for non-LEGACY peer flattens with `UnsupportedFeatureKind::Other("multi-peer-format-id-flatten")`.
+- ✅ 2 new tests: multi-peer xlsx export + byte-stability sanity for LEGACY-only.
+
+**Step 6 audit (`2ba66ee3710`) — 4th consecutive DIVERGENT-HIGH cycle**. Codex caught 3 HIGH (cross-peer reimport loss, sparse counter byte regression, Strict policy inconsistencies). Opus PASSED structurally, converged with Codex on the byte-stability HIGH, downgraded the cross-peer to MEDIUM, added 1 unique MEDIUM (test name overstates). All 6 findings closed:
+- ✅ HIGH-1 (cross-peer reimport loss): translation now dedups by format code. Two FormatIds with the same code map to the same xlsx numFmtId, preventing the StringCollision silent-skip on reimport.
+- ✅ HIGH-2 (sparse counter byte regression): 2-pass translation — LEGACY_PEER preserves `c + 164`; non-LEGACY allocates after. Byte-stable for ALL counter shapes.
+- ✅ HIGH-3 (Strict policy inconsistencies): NewWorkbook removes lossy file on Strict-fail; UpdateOriginal merges shadow `export_new_workbook`'s `dropped_features` into the Strict check.
+- ✅ MEDIUM-1 (HashMap iter order in `<numFmts>`): sort by xlsx_id after dedup.
+- ✅ Opus MEDIUM-2 (test name overstates): new regression tests collectively cover the byte-stability claim properly.
+
+5 new tests at audit closure (sparse counters, cross-peer dedup, Strict file-removal, Strict positive case, xlsx→qbook→xlsx double round-trip). Workspace tests: 4270 → 4272 (step 6 ship) → 4277 (audit closure). Full transcripts at `docs/audits/2026-05-20-phase-5-2-d-1-step-6-{codex,opus,consolidated}.md`.
 
 ### Step 7: Tier D3 — oplog.bin magic bytes + version header (1 hour)
 
@@ -184,21 +194,21 @@ Step 5 shipped:
 
 ### Step 8: Full-arc megaudit (mandatory per discipline rule)
 
-**Per-step audits (steps 1-5) already shipped** — 5 cycles, 3 consecutive DIVERGENT-HIGH cycles (steps 3, 4, 5) caught forward-activating bugs that the alternative (defer all audits to step 8) would have shipped. Transcripts at `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..5}-{codex,opus,consolidated}.md`.
+**Per-step audits (steps 1-6) already shipped** — 6 cycles, 4 consecutive DIVERGENT-HIGH cycles (steps 3, 4, 5, 6) caught forward-activating bugs that the alternative (defer all audits to step 8) would have shipped. Transcripts at `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..6}-{codex,opus,consolidated}.md`.
 
-Step 8 scope (after steps 6-7 ship):
-- Per-step audits for steps 6, 7 same as 1-5 pattern.
-- Then a **full-arc megaudit**: cross-step invariants (schema round-trip end-to-end, old `.qbook` → new envelope → old format export — does the value survive?), workspace-wide grep for any remaining `to_legacy_u32().expect()` or pre-D-1 patterns, fixture coverage gap analysis.
+Step 8 scope (after step 7 ships):
+- Per-step audit for step 7 same as 1-6 pattern.
+- Then a **full-arc megaudit**: cross-step invariants (schema round-trip end-to-end, old `.qbook` → new envelope → xlsx export → re-import — does the value survive?), workspace-wide grep for any remaining `to_legacy_u32().expect()` or pre-D-1 patterns, fixture coverage gap analysis.
 - Verify clean-checkout `cargo check` (don't trust pre-commit hook gates alone — the index-padding race struck 3 times in the V1 session; 0 times in D-1 so far).
 
-**Estimated total: ~14 hours spent on steps 1-5 + 5 audits (2026-05-19/20); ~2-5h remaining for steps 6-8.** All schema-breaking work is complete (steps 1-5); steps 6-7 are surface-level format-id mapping work.
+**Estimated total: ~17 hours spent on steps 1-6 + 6 audits (2026-05-19/20); ~1-2h remaining for steps 7-8.** All format-id-related schema work is complete (steps 1-6); step 7 is small (oplog.bin header).
 
 ## Pre-flight checklist
 
-Before resuming D-1 at step 6, verify:
+Before resuming D-1 at step 7, verify:
 
-- [ ] HEAD is at the most recent commit on `feat/quantbook-engine` (`30ef2637d6f` as of 2026-05-20 session-end — step 5 audit closures; preceded by `2ae5bfcab28` step 5 ship + `d5c6b2ae11c` step 4 doc refresh).
-- [ ] `cargo test --workspace` reports **4270** passed.
+- [ ] HEAD is at the most recent commit on `feat/quantbook-engine` (`2ba66ee3710` as of 2026-05-20 session-end — step 6 audit closures; preceded by `19f6aa1b008` step 6 ship + `9a95429b284` step 5 doc refresh).
+- [ ] `cargo test --workspace` reports **4277** passed.
 - [ ] `cargo fmt --all -- --check` clean.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - [ ] No uncommitted source files (`git status --short | grep -v '^??'` empty).

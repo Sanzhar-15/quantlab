@@ -1,8 +1,8 @@
 ---
 title: Phase 5 V1 exit packet (5.1 → 5.6 V1+V2 + 5.4 V2 V1+V1.1 + 5.5 V2 V1 + D1.a)
-status: ACTIVE — Phase 5 V1 surface complete 2026-05-19. D-1 (FormatId tagged tuple, multi-day) steps 1-5 of 8 shipped + audited 2026-05-19/20; steps 6-8 remain. 5.3, 5.5 V2 V2/V3, 5.7, and 5.8 also remain.
+status: ACTIVE — Phase 5 V1 surface complete 2026-05-19. D-1 (FormatId tagged tuple, multi-day) steps 1-6 of 8 shipped + audited 2026-05-19/20; steps 7-8 remain. 5.3, 5.5 V2 V2/V3, 5.7, and 5.8 also remain.
 date: 2026-05-19
-updated: 2026-05-20 (post-exit-packet additions: 5.6 V2 sweep_presence + D1.a 4-cluster closure + D-1 steps 1-5 + 5 per-step audits)
+updated: 2026-05-20 (post-exit-packet additions: 5.6 V2 sweep_presence + D1.a 4-cluster closure + D-1 steps 1-6 + 6 per-step audits)
 predecessor: docs/phase4/exit-packet.md + docs/phase5/entry-plan.md
 successor: docs/phase5/d-1-starting-checklist.md (fresh-session entry for the multi-day D-1 arc)
 supersedes_pointer: docs/phase5/entry-plan.md (entry-plan stays as historical scope reference; this packet is the closeout)
@@ -151,7 +151,7 @@ Total: **~31 public methods + 5 types** on `ql-collab` (was 30 at exit-packet; +
 
 | ID | Decision | Status |
 |---|---|---|
-| D-1 | `FormatId` → tagged tuple `{ Builtin(u32), Custom(PeerId, u32) }` | 🟡 IN PROGRESS — steps 1-5 of 8 shipped + audited (2026-05-19/20: `1e383dc9eeb`, `135bbb99f75`, `af803f1a3f2`, `6a4b8b0922f`, `2ae5bfcab28` + audits at `9f34eb96a93`, `e97e646270a`, `30ef2637d6f`). Steps 6-8 pending. |
+| D-1 | `FormatId` → tagged tuple `{ Builtin(u32), Custom(PeerId, u32) }` | 🟡 IN PROGRESS — steps 1-6 of 8 shipped + audited (2026-05-19/20: `1e383dc9eeb`, `135bbb99f75`, `af803f1a3f2`, `6a4b8b0922f`, `2ae5bfcab28`, `19f6aa1b008` + audits at `9f34eb96a93`, `e97e646270a`, `30ef2637d6f`, `2ba66ee3710`). Steps 7-8 pending. |
 | D-2 | AddSheet auto-rename on duplicate canonical | ✅ SHIPPED `1ca19e2fa37` |
 | D-3 | `BindError::UnknownSheet → ErrorValue::Name` mapping | ✅ SHIPPED `e71312d4bcd` |
 | D-4 | Spill semantics: replay defers to recompute, not per-op | ✅ SHIPPED `2f217a2067a` |
