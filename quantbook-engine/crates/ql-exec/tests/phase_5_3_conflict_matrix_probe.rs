@@ -112,11 +112,7 @@ fn fork_with_peer(base_bytes: &[u8], peer_id: u64) -> OpLog {
 /// replayed+recomputed workbooks `(wb_after_a_merges_b,
 /// wb_after_b_merges_a)`. The convergence property asserts these
 /// produce identical observable state.
-fn fork_apply_merge_both_directions(
-    base_bytes: &[u8],
-    op_a: Op,
-    op_b: Op,
-) -> (Workbook, Workbook) {
+fn fork_apply_merge_both_directions(base_bytes: &[u8], op_a: Op, op_b: Op) -> (Workbook, Workbook) {
     // Peer A's view: id=1, appends op_a, merges peer B's bytes.
     let mut peer_a = fork_with_peer(base_bytes, PEER_A_ID);
     peer_a.append(op_a.clone()).unwrap();
@@ -395,8 +391,16 @@ fn row6_addsheet_same_name_auto_renames_via_d2() {
     // After merge, both peers have 2 sheets named "Calc" and
     // "Calc(2)" in some order. Sheet count must be 2; both names
     // must be present in the final workbook.
-    assert_eq!(wb_a.sheet_count(), 2, "after merge wb_a should have 2 sheets");
-    assert_eq!(wb_b.sheet_count(), 2, "after merge wb_b should have 2 sheets");
+    assert_eq!(
+        wb_a.sheet_count(),
+        2,
+        "after merge wb_a should have 2 sheets"
+    );
+    assert_eq!(
+        wb_b.sheet_count(),
+        2,
+        "after merge wb_b should have 2 sheets"
+    );
 
     let names_a: Vec<String> = (0..wb_a.sheet_count() as u16)
         .map(|i| wb_a.sheet(i).unwrap().name().to_owned())
@@ -432,7 +436,9 @@ fn row7_droptable_vs_concurrent_table_ref_yields_name_error() {
 
     let (wb_a, wb_b) = fork_apply_merge_both_directions(
         &base,
-        Op::DropTable { name: "T".to_owned() },
+        Op::DropTable {
+            name: "T".to_owned(),
+        },
         Op::PutFormula {
             sheet: 0,
             row: 4,
