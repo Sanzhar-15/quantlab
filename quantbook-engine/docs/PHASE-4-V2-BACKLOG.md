@@ -386,17 +386,10 @@ This is the largest single deferred work item — multi-week scope.
 
 **Added:** 2026-05-20 by Phase 5.3 step 6 exit packet (per step 5 megaudit H-D2 closure — V1 limitations MUST land in durable doc before `.plans/_active.md` archives).
 
-### H1. Helper duplication — 6 call sites of `ql_formula_syntax::{lex, parse, print, rewrite_*}`
+### H1. Helper duplication — 6 call sites of `ql_formula_syntax::{lex, parse, print, rewrite_*}` — ✅ CLOSED 2026-05-20
 
 - **Source:** step 5 megaudit Codex M1 + Opus-B M1 (convergent); step 5c LOW grew to 6 sites.
-- **Sites:**
-  1. `crates/ql-collab/src/repair.rs:430` (`rewrite_formula_with_rename` — sheet)
-  2. `crates/ql-collab/src/repair.rs:623` (`rewrite_formula_with_table_rename`)
-  3. `crates/ql-collab/src/repair.rs:945` (`rewrite_formula_with_column_rename`) — added in step 5c
-  4. `crates/ql-exec/src/workbook_runtime/sheets.rs:43` (`rewrite_formula_text_for_sheet_rename`)
-  5. `crates/ql-exec/src/workbook_runtime/tables.rs:336` (inline `rename_table`)
-  6. `crates/ql-exec/src/workbook_runtime/tables.rs:484` (inline `rename_column`)
-- **Disposition:** promote to a single public `rewrite_formula_text(text: &str, rewrite: NameRewrite<'_>) -> Option<String>` in `ql-formula-syntax` (~50 LOC add, ~52 LOC remove, net -2 LOC; signature in step 5 Opus-B verdict). Single-commit refactor; do BEFORE V2 work that adds a 7th site.
+- **Closure:** post-5.3 single-commit refactor (`8085f42bf5b`). NEW `ql_formula_syntax::rewrite_formula_text(text, NameRewrite<'_>)` + `NameRewrite` enum with Sheet/Table/Column variants. All 6 call sites collapsed to thin wrappers (ql-collab/repair.rs 3 helpers) or direct calls (ql-exec/sheets.rs helper + 2 inline blocks in tables.rs). +6 unit tests for the helper. Workspace tests stayed clean (4361 → 4367; the +6 is from new helper unit tests). fmt + clippy clean. **No remaining work.** Done BEFORE V2 work that would have added a 7th site.
 
 ### H2. Cross-source target collision hard-fails (tables + columns)
 
