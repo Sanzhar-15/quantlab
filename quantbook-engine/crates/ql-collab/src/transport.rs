@@ -9,9 +9,13 @@
 //! `flush_to_transport` / `poll_remote` (+ `poll_remote_with_limit`)).
 //! V2 V1 is "explicit drive" — caller invokes flush + poll on a
 //! tick.
-//! **Phase 5.5 V2 V2 / V3 (pending):** auto-flush on append +
-//! version-vector delta exports + WebSocket impl + reconnect /
-//! offline sync semantics.
+//! **Phase 5.5 V2 V2 (2026-05-21, this ship):** `AutoFlushPolicy`
+//! enum on `CollabSession`. Opt-in `OnAppend` invokes
+//! `flush_to_transport` automatically after every mutator. Default
+//! is `Disabled` (V2 V1 behavior preserved). See
+//! [`crate::AutoFlushPolicy`] + [`crate::CollabSession::set_auto_flush_policy`].
+//! **Phase 5.5 V2 V3 (pending):** version-vector delta exports +
+//! WebSocket impl + reconnect / offline sync semantics.
 //!
 //! Tests can also use [`NoopTransport`] which discards traffic.
 //!

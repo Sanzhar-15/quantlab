@@ -176,6 +176,47 @@ impl std::fmt::Display for SyncReport {
     }
 }
 
+/// **Phase 5.5 V2 V2 (2026-05-21):** auto-flush policy for
+/// [`CollabSession`]. Determines when (if ever) the session pushes
+/// its current snapshot through the attached transport without an
+/// explicit [`CollabSession::flush_to_transport`] call.
+///
+/// V2 V2 (this ship) adds two variants. V2 V3 will add a `Threshold`
+/// variant for byte-budget-based batching.
+///
+/// `#[non_exhaustive]` so adding a `Threshold(usize)` variant later
+/// is non-breaking — callers MUST handle the `_` arm in `match`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum AutoFlushPolicy {
+    /// Default. V2 V1 behavior preserved: caller drives flush + poll
+    /// explicitly via [`CollabSession::flush_to_transport`] +
+    /// [`CollabSession::poll_remote`]. Auto-flush never fires.
+    #[default]
+    Disabled,
+    /// Flush automatically after every public method that mutates the
+    /// underlying `LoroDoc`. Triggers on: `append_op`, `merge_bytes`,
+    /// `update_presence`, `clear_presence`, `sweep_presence`,
+    /// `undo`, `redo`. Does NOT trigger on accessor methods, on
+    /// undo-group boundary methods (`start_undo_group` /
+    /// `end_undo_group` — only their inner appends fire, via
+    /// `append_op`), or on transport-lifecycle methods.
+    ///
+    /// If no transport is attached, this is silently a no-op (the
+    /// flush hook checks `self.transport.is_some()` first).
+    ///
+    /// **Partial-state contract on auto-flush error**: if the auto-
+    /// flush attempt fails (transport closed, I/O error), the
+    /// surrounding mutator (`append_op` etc.) returns
+    /// `Err(CollabSessionError::Transport(_))`. The local mutation
+    /// has ALREADY been committed to `self.log` (mutate-then-flush
+    /// ordering — Loro doesn't support "ungrowing" an op log, V1
+    /// limitation H7). Callers MUST treat their local state as
+    /// authoritative for the local UI and either retry the flush
+    /// (transport recovered) or detach the transport.
+    OnAppend,
+}
+
 /// Per-peer collaboration state holder.
 ///
 /// Owns an `OpLog` + a stable `PeerId`. Tested with `NoopTransport`
@@ -204,10 +245,14 @@ pub struct CollabSession {
     /// Boxed + `Send` so callers can move sessions between
     /// threads with attached transports.
     ///
-    /// V2 V1 scope: caller drives flush + poll explicitly
-    /// (no auto-flush on append). V2 V2 / V3 will add
-    /// auto-flush + version-vector delta exports.
+    /// V2 V1 scope was explicit-drive (caller invokes flush + poll
+    /// on a tick). V2 V2 (2026-05-21) adds `AutoFlushPolicy::OnAppend`
+    /// for IDE callers who want every mutator to propagate.
     transport: Option<Box<dyn Transport + Send>>,
+    /// **Phase 5.5 V2 V2 (2026-05-21):** auto-flush policy. Default
+    /// is `Disabled` so existing V2 V1 callers see no behavior
+    /// change. Set via [`set_auto_flush_policy`].
+    auto_flush_policy: AutoFlushPolicy,
 }
 
 impl CollabSession {
@@ -253,6 +298,7 @@ impl CollabSession {
             log,
             undo,
             transport: None,
+            auto_flush_policy: AutoFlushPolicy::Disabled,
         })
     }
 
@@ -294,6 +340,7 @@ impl CollabSession {
             log,
             undo,
             transport: None,
+            auto_flush_policy: AutoFlushPolicy::Disabled,
         })
     }
 
@@ -302,12 +349,18 @@ impl CollabSession {
         self.peer_id
     }
 
-    /// Append a local op. Delegates to `OpLog::append`. Phase 5.5
-    /// will additionally push the appended bytes through the
-    /// attached `Transport`; 5.2.a leaves transport integration to
-    /// the caller.
+    /// Append a local op. Delegates to `OpLog::append`.
+    ///
+    /// **Phase 5.5 V2 V2 (2026-05-21):** if [`auto_flush_policy`]
+    /// is `OnAppend` AND a transport is attached, fires
+    /// [`flush_to_transport`] internally after the append. Transport
+    /// failures during the auto-flush surface as
+    /// `Err(CollabSessionError::Transport(_))` AFTER the op has been
+    /// committed locally (partial-state contract — see
+    /// [`AutoFlushPolicy::OnAppend`]).
     pub fn append_op(&mut self, op: Op) -> Result<(), CollabSessionError> {
         self.log.append(op)?;
+        self.maybe_auto_flush()?;
         Ok(())
     }
 
@@ -325,8 +378,18 @@ impl CollabSession {
     /// rename-repair pass fires and concurrent-rename formulas resolve
     /// correctly. Without `rebuild_workbook`, those formulas surface
     /// as `#NAME?` at recompute time.
+    ///
+    /// **Phase 5.5 V2 V2 (2026-05-21):** triggers auto-flush per
+    /// [`auto_flush_policy`]. After merging peer ops the local snapshot
+    /// contains the union; auto-flushing it propagates the union to
+    /// any third-party peer attached via the transport (3+ peer fanout
+    /// via this session's transport endpoint). Same partial-state
+    /// contract as `append_op` if the auto-flush fails — the local
+    /// merge is already committed.
     pub fn merge_bytes(&mut self, bytes: &[u8]) -> Result<usize, CollabSessionError> {
-        Ok(self.log.merge_bytes(bytes)?)
+        let new_len = self.log.merge_bytes(bytes)?;
+        self.maybe_auto_flush()?;
+        Ok(new_len)
     }
 
     /// Produce a Loro snapshot blob suitable for **transport to other
@@ -497,9 +560,15 @@ impl CollabSession {
     /// bytes and merges them.
     ///
     /// Returns `Some(previous)` if a transport was already
-    /// attached and got replaced. V2 V1 does NOT auto-flush on
-    /// `append_op` — caller drives flush + poll explicitly. V3
-    /// will add auto-flush + version-vector delta exports.
+    /// attached and got replaced.
+    ///
+    /// **Phase 5.5 V2 V2 (2026-05-21):** V2 V1 was explicit-drive
+    /// (caller invokes `flush_to_transport` per tick). V2 V2 added
+    /// the opt-in [`AutoFlushPolicy::OnAppend`] for IDE callers who
+    /// want every mutator to propagate without scheduling their
+    /// own ticks. Default policy remains
+    /// [`AutoFlushPolicy::Disabled`] so V2 V1 callers see no
+    /// behavior change; switch via [`set_auto_flush_policy`].
     pub fn attach_transport<T: Transport + Send + 'static>(
         &mut self,
         transport: T,
@@ -520,6 +589,59 @@ impl CollabSession {
         self.transport.is_some()
     }
 
+    /// **Phase 5.5 V2 V2 (2026-05-21):** set the auto-flush policy
+    /// for this session. Returns the previous policy.
+    ///
+    /// Default is [`AutoFlushPolicy::Disabled`] (V2 V1 behavior:
+    /// caller drives flush explicitly). Setting
+    /// [`AutoFlushPolicy::OnAppend`] makes every public mutator on
+    /// this session (`append_op`, `merge_bytes`, presence writes,
+    /// `undo`, `redo`) auto-invoke [`flush_to_transport`] internally
+    /// — IDE callers can stop scheduling their own flush ticks.
+    ///
+    /// Orthogonal to [`attach_transport`]: setting `OnAppend` without
+    /// a transport is harmless (auto-flush is silently a no-op until
+    /// a transport is attached). Conversely, the explicit
+    /// `flush_to_transport` API remains available regardless of
+    /// policy — callers can mix-and-match.
+    ///
+    /// **Partial-state contract**: if an auto-flush attempt fails
+    /// (transport closed, I/O error), the surrounding mutator
+    /// returns `Err(CollabSessionError::Transport(_))`. The local
+    /// mutation is ALREADY committed at that point — see
+    /// [`AutoFlushPolicy::OnAppend`] for the full contract.
+    pub fn set_auto_flush_policy(&mut self, policy: AutoFlushPolicy) -> AutoFlushPolicy {
+        std::mem::replace(&mut self.auto_flush_policy, policy)
+    }
+
+    /// **Phase 5.5 V2 V2 (2026-05-21):** read the current auto-flush
+    /// policy. Default is [`AutoFlushPolicy::Disabled`].
+    pub fn auto_flush_policy(&self) -> AutoFlushPolicy {
+        self.auto_flush_policy
+    }
+
+    /// **Phase 5.5 V2 V2 (2026-05-21):** internal hook called by every
+    /// public mutator after a successful state change. Fires
+    /// [`flush_to_transport`] when policy is `OnAppend` AND a transport
+    /// is attached; otherwise no-op.
+    ///
+    /// Errors from `flush_to_transport` propagate to the caller; the
+    /// local mutation is already committed at the point this is called
+    /// (per the partial-state contract documented at
+    /// [`AutoFlushPolicy::OnAppend`]).
+    fn maybe_auto_flush(&mut self) -> Result<(), CollabSessionError> {
+        match self.auto_flush_policy {
+            AutoFlushPolicy::Disabled => Ok(()),
+            AutoFlushPolicy::OnAppend => {
+                if self.transport.is_none() {
+                    return Ok(());
+                }
+                let _sent = self.flush_to_transport()?;
+                Ok(())
+            }
+        }
+    }
+
     /// **Phase 5.5 V2 V1 (2026-05-19):** export the current
     /// session snapshot and push it through the attached
     /// transport. No-op (returns `Ok(false)`) if no transport
@@ -535,9 +657,18 @@ impl CollabSession {
     /// (export runs first, send is the last step). Caller can
     /// retry the flush after addressing the underlying cause.
     ///
-    /// V2 V1 sends the FULL snapshot each call (O(state)). V2 V2
+    /// V2 V1 sends the FULL snapshot each call (O(state)). V2 V3
     /// will track per-transport version vectors and send deltas
     /// only.
+    ///
+    /// **Phase 5.5 V2 V2 (2026-05-21):** this method remains
+    /// available for explicit-drive callers regardless of
+    /// [`auto_flush_policy`]. With `OnAppend`, [`append_op`] etc.
+    /// invoke this internally — calling it directly is harmless
+    /// (just sends an extra idempotent snapshot). Mix-and-match
+    /// is supported: set `OnAppend` for steady-state appends but
+    /// still call `flush_to_transport` after an explicit batch
+    /// operation if you want a deterministic flush point.
     pub fn flush_to_transport(&mut self) -> Result<bool, CollabSessionError> {
         let Some(transport) = self.transport.as_mut() else {
             return Ok(false);
@@ -619,6 +750,7 @@ impl CollabSession {
         let key = presence::peer_key(self.peer_id);
         let json = serde_json::to_string(&state).map_err(PresenceError::Serialize)?;
         self.log.presence_set(&key, &json)?;
+        self.maybe_auto_flush()?;
         Ok(())
     }
 
@@ -647,6 +779,7 @@ impl CollabSession {
     pub fn clear_presence(&mut self) -> Result<(), CollabSessionError> {
         let key = presence::peer_key(self.peer_id);
         self.log.presence_remove(&key)?;
+        self.maybe_auto_flush()?;
         Ok(())
     }
 
@@ -664,14 +797,23 @@ impl CollabSession {
     /// construction (see `CollabSession::new`), so cursor movements
     /// don't consume undo slots.
     pub fn undo(&mut self) -> Result<bool, CollabSessionError> {
-        Ok(self.undo.undo()?)
+        let consumed = self.undo.undo()?;
+        // Auto-flush unconditionally: simplest correct behavior. When
+        // `consumed == false` no inverse op was appended, so the flush
+        // sends the unchanged snapshot — peers see no new ops
+        // (idempotent at the Loro layer). V2 V3 version-vector deltas
+        // will skip this no-op send.
+        self.maybe_auto_flush()?;
+        Ok(consumed)
     }
 
     /// **Phase 5.4 V1 (2026-05-19):** redo the last undone op.
     /// Returns `Ok(true)` if a redo stack item was consumed,
     /// `Ok(false)` if the stack was empty.
     pub fn redo(&mut self) -> Result<bool, CollabSessionError> {
-        Ok(self.undo.redo()?)
+        let consumed = self.undo.redo()?;
+        self.maybe_auto_flush()?;
+        Ok(consumed)
     }
 
     /// **Phase 5.4 V1 (2026-05-19):** true iff the undo stack has
@@ -828,6 +970,10 @@ impl CollabSession {
         for key in keys {
             self.log.presence_remove(&key)?;
         }
+        // Phase 5.5 V2 V2: single auto-flush after the batch removal,
+        // not per-key. Sending N intermediate snapshots would be wasted
+        // bandwidth (peers only need the final post-sweep state).
+        self.maybe_auto_flush()?;
         Ok(count)
     }
 

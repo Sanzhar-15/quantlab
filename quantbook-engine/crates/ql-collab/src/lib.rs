@@ -107,6 +107,6 @@ pub use repair::{
     SheetRepairReport, SheetRewriteSummary, TableAmbiguousSkip, TableRepairReport,
     TableRewriteSummary,
 };
-pub use session::{CollabSession, CollabSessionError, SyncReport, UndoGroupGuard};
+pub use session::{AutoFlushPolicy, CollabSession, CollabSessionError, SyncReport, UndoGroupGuard};
 pub use transport::{LoopbackTransport, NoopTransport, Transport, TransportError};
 pub use undo::UndoManager;
