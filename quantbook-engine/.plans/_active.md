@@ -92,12 +92,17 @@ Edit `crates/ql-oplog/src/replay.rs:486-532`. Change case 3 from error to "apply
 
 **Per-step audit** — highest-impact step; audit thoroughly.
 
-### Step 4 — RenameTable/RenameColumn investigation (~0.5-1 day)
-Survey replay's RenameTable + RenameColumn paths. If they have the same `SheetRenameNameMismatch`-shaped gap, extend step 2's fix. If formula text needs the same repair, extend step 3's module.
+### Step 4 — RenameTable/RenameColumn extension (~0.5 day)
+**Step 1 audit (Opus MEDIUM-2) confirmed**: `apply_rename_table` at `replay.rs:680-723` keys lookups solely by `old_canonical` (line 691); `apply_rename_column` at `replay.rs:733-755` (line 749) same. **Identical bug shape to RenameSheet** — two peers concurrently renaming the same table (T→T1 vs T→T2) produces a merged log where the second op's `old_name="T"` no longer resolves → `ReplayError::TableNotFound`. Same root cause, same architectural fix.
 
-**May be ~0 work or up to 1 day** depending on what replay does.
+Step 4 work:
+- Apply step 2's "last-in-causal-order wins; rename current" policy to `apply_rename_table` (`replay.rs:691`) and `apply_rename_column` (`replay.rs:749`).
+- Extend step 3's `repair_sheet_rename_chain` module with `repair_table_rename_chain` + `repair_column_rename_chain` (or factor out a generic chain-rewrite helper). Rewrite formula text references `T → T1` and `T[X] → T[Y]` via the existing formula-rewrite producer-side machinery.
+- 2-peer probe tests mirroring step 3's coverage.
 
-**Per-step audit if non-trivial.**
+**Effort revised down** from "0-1 day investigation" to "~0.5 day implementation" because the bug shape and fix are now known.
+
+**Per-step audit (Codex + Opus parallel).**
 
 ### Step 5 — 3-way megaudit (~0.5 day)
 Codex (cross-step + grep) + Opus-A (empirical 2-peer + adversarial randomized interleavings) + Opus-B (doc completeness + cross-crate). Per D-1 precedent.

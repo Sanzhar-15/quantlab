@@ -333,6 +333,31 @@ Phase 4.12 megaudit's cycle-detection / spill / drop-table
 invariants — every Phase 4 edge case must survive the CRDT
 merge.
 
+### Peer-id stability is a precondition for CRDT convergence
+
+**Phase 5.3 step 1 audit closure (2026-05-20).** Loro's
+Fugue/origin-based merge uses peer-ids as a tiebreaker. Two peers
+forking from the same snapshot MUST carry STABLE non-zero peer-ids
+across the lifetime of their OpLogs for deterministic convergence
+under bidirectional merge:
+
+- **Production code** (`ql_collab::CollabSession::new` /
+  `from_snapshot`) already enforces this — both constructors call
+  `OpLog::set_peer_id(peer_id.as_u64())` with an `assert_ne!(_, 0)`
+  release-firing guard (D-1 step 8 megaudit closure).
+- **Test scaffolding** for 2-peer probe tests (e.g.
+  `crates/ql-exec/tests/phase_5_3_conflict_matrix_probe.rs`)
+  MUST also call `set_peer_id` with distinct stable ids after
+  `OpLog::import_bytes`. `LoroDoc::new()` assigns a random peer-id
+  per process; without an explicit `set_peer_id` the (peer-id
+  pair) differs across merge directions and bidirectional
+  convergence assertions fail spuriously.
+- The default `OpLog::new()` and `OpLog::import_bytes` paths
+  intentionally retain randomized peer-ids — they're for
+  single-writer (legacy / qbook) workflows where multi-peer
+  semantics don't apply. The peer-id only matters once two ops
+  with distinct peer-ids enter the same merged log.
+
 ## Undo/redo (Phase 5.4 — V1 shipped)
 
 **Phase 5.4 V1 ✅ shipped at `89c02b9d83e` (2026-05-19).**
