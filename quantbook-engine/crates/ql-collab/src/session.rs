@@ -115,24 +115,33 @@ pub enum CollabSessionError {
     Transport(#[from] TransportError),
 
     /// **Phase 5.3 step 5b (2026-05-20) — production wiring closure
-    /// (Opus-A Scenario E HIGH).** `sync_workbook` invoked
+    /// (Opus-A Scenario E HIGH).** `rebuild_workbook` invoked
     /// `replay_into` on the session's `OpLog` and replay failed at
-    /// some op index. Per the `replay_into` caller contract
-    /// (Phase 5.3 step 5 megaudit closure — see
-    /// `ql_oplog::replay_into` docs), the workbook passed by
-    /// mut-ref is now in a HALF-MERGED state and MUST be discarded
-    /// by the caller. The session's `OpLog` is unaffected (replay
-    /// reads only).
+    /// some op index. The fresh workbook constructed internally was
+    /// in a HALF-MERGED state when the error fired and was DROPPED
+    /// before the error was returned (the wrapper owns it). The
+    /// session's `OpLog` is unaffected (replay reads only).
+    ///
+    /// Carries the underlying [`ReplayError`] via `#[source]` so
+    /// callers can `match err.source()` for the original op index +
+    /// diagnostic.
     #[error("replay error: {0}")]
     Replay(#[from] ReplayError),
 }
 
 /// **Phase 5.3 step 5b (2026-05-20) — production wiring closure
 /// (Opus-A Scenario E HIGH):** result of
-/// [`CollabSession::sync_workbook`]. Combines the replay op count
+/// [`CollabSession::rebuild_workbook`]. Combines the replay op count
 /// with the two repair reports so callers can log a single
 /// diagnostic surface.
+///
+/// `#[non_exhaustive]` per Codex step 5b audit LOW closure: column
+/// repair (Phase 5.3 step 5c) is expected to add another field
+/// (`column_repair: ColumnRepairReport`) — external struct literal
+/// construction is forbidden so future field additions are
+/// non-breaking.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct SyncReport {
     /// Total ops applied by `replay_into`. Same as the success
     /// value of `replay_into` itself.
@@ -142,6 +151,23 @@ pub struct SyncReport {
     pub sheet_repair: RepairReport,
     /// Table rename-repair pass diagnostics.
     pub table_repair: TableRepairReport,
+}
+
+/// Phase 5.3 step 5b audit closure (Opus MEDIUM-2): one-line
+/// `Display` impl for log-line diagnostic use. Format:
+/// `"sync: ops=N sheet_rewrites=N(skip=N) table_rewrites=N(skip=N)"`.
+impl std::fmt::Display for SyncReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sync: ops={} sheet_rewrites={}(skip={}) table_rewrites={}(skip={})",
+            self.ops_replayed,
+            self.sheet_repair.formulas_rewritten,
+            self.sheet_repair.ambiguous_rules_skipped.len(),
+            self.table_repair.formulas_rewritten,
+            self.table_repair.ambiguous_rules_skipped.len(),
+        )
+    }
 }
 
 /// Per-peer collaboration state holder.
@@ -283,6 +309,16 @@ impl CollabSession {
     /// CRDT preserves both peers' concurrent appends in deterministic
     /// causal order (Fugue/origin-based with peer-id tiebreaker per
     /// Phase 5.1 audit Codex V1). Returns the new `len()` after merge.
+    ///
+    /// **Phase 5.3 step 5b audit closure (Codex MEDIUM-2):** does NOT
+    /// auto-invoke the repair pass — audit-locked D-5.3-1 keeps repair
+    /// caller-driven so callers can batch multiple `merge_bytes` calls
+    /// before paying the replay+repair cost. Collaborative callers
+    /// rebuilding a workbook from the post-merge log MUST then call
+    /// [`Self::rebuild_workbook`] (NOT raw `replay_into`) so the
+    /// rename-repair pass fires and concurrent-rename formulas resolve
+    /// correctly. Without `rebuild_workbook`, those formulas surface
+    /// as `#NAME?` at recompute time.
     pub fn merge_bytes(&mut self, bytes: &[u8]) -> Result<usize, CollabSessionError> {
         Ok(self.log.merge_bytes(bytes)?)
     }
@@ -305,100 +341,129 @@ impl CollabSession {
         Ok(self.log.export_bytes()?)
     }
 
-    /// Borrow the underlying `OpLog` for replay against a `Workbook`.
+    /// Borrow the underlying `OpLog` for snapshot inspection or tests.
     ///
-    /// **Prefer [`Self::sync_workbook`] over this raw accessor** when
-    /// rebuilding a workbook after a `merge_bytes` — `sync_workbook`
-    /// atomically pairs `replay_into` with the Phase 5.3 rename-repair
-    /// passes (audit-locked D-5.3-1 caller contract). Raw `op_log()`
-    /// is kept for snapshot inspection + tests.
+    /// **Prefer [`Self::rebuild_workbook`] over this raw accessor** for
+    /// production collaboration flows — `rebuild_workbook` atomically
+    /// constructs a fresh `Workbook` + pairs `replay_into` with the
+    /// Phase 5.3 rename-repair passes (audit-locked D-5.3-1 caller
+    /// contract).
     ///
-    /// Typical usage (raw):
+    /// Typical usage (raw, e.g., for diagnostics or non-rebuild flows):
     /// ```ignore
     /// let session = CollabSession::from_snapshot(peer_id, &bytes)?;
-    /// let mut wb = ql_storage::Workbook::new();
-    /// let reg = ql_functions::default_registry();
-    /// ql_oplog::replay_into(session.op_log(), &mut wb, &reg)?;
+    /// let op_count = session.op_log().len();
     /// ```
     ///
     /// Preferred usage for collaboration flows:
     /// ```ignore
     /// let mut session = CollabSession::from_snapshot(peer_id, &bytes)?;
     /// session.merge_bytes(&peer_b_bytes)?;
-    /// let mut wb = ql_storage::Workbook::new();
     /// let reg = ql_functions::default_registry();
-    /// let report = session.sync_workbook(&mut wb, &reg)?;
-    /// // log report.ops_replayed / report.sheet_repair / report.table_repair
+    /// let (wb, report) = session.rebuild_workbook(&reg)?;
+    /// // log via `report.to_string()` (Display impl)
     /// ```
     pub fn op_log(&self) -> &OpLog {
         &self.log
     }
 
-    /// **Phase 5.3 step 5b (2026-05-20) — production wiring closure
-    /// (Opus-A Scenario E HIGH, audit-locked D-5.3-1):**
-    /// atomically rebuild `workbook` from this session's `OpLog`,
-    /// running:
+    /// **Phase 5.3 step 5b + 5b audit closure (2026-05-20) — production
+    /// wiring closure (Opus-A Scenario E HIGH, audit-locked D-5.3-1):**
+    /// atomically rebuild a FRESH `Workbook` from this session's
+    /// `OpLog`, running:
     ///
-    ///   1. `ql_oplog::replay_into(self.op_log(), workbook, registry)`
-    ///   2. `repair_sheet_rename_chain(workbook, self.op_log())`
-    ///   3. `repair_table_rename_chain(workbook, self.op_log())`
+    ///   1. `let mut wb = Workbook::new();`
+    ///   2. `ql_oplog::replay_into(self.op_log(), &mut wb, registry)`
+    ///   3. `repair_sheet_rename_chain(&mut wb, self.op_log())`
+    ///   4. `repair_table_rename_chain(&mut wb, self.op_log())`
     ///
-    /// in that order. This is the **caller-driven repair contract**
-    /// from the Phase 5.3 step 3 audit-locked design decision D-5.3-1:
-    /// repair is NOT auto-invoked by `merge_bytes` (callers may want
-    /// manual control for batch-merge scenarios), but the production
-    /// path through `CollabSession` MUST pair replay + repair to close
-    /// the D-3 V1 limitation (concurrent-rename formulas → `#NAME?`).
-    /// Pre-step-5b no production caller wired this in — the 5.3 ship
-    /// was correct in-principle but not in-practice. This wrapper
-    /// closes that gap.
+    /// in that order. Returns `(wb, SyncReport)` — the caller owns the
+    /// returned workbook and is responsible for downstream evaluation
+    /// (`WorkbookRuntime::recompute_all`).
+    ///
+    /// # Why the workbook is constructed internally
+    ///
+    /// **Phase 5.3 step 5b audit closure (Codex MEDIUM-1 + Opus HIGH-2
+    /// + HIGH-3):** the prior `sync_workbook(&self, &mut Workbook,
+    /// &FunctionRegistry)` shape took the workbook by mut-ref. Both
+    /// auditors flagged the same silent-corruption class:
+    ///
+    /// - Double invocation against the same workbook re-applied all
+    ///   ops; `AddSheet` re-fired and Loro D-2 auto-rename created
+    ///   `S(2)` sheets (empirical probe P1 from Opus audit).
+    /// - Stale workbook from a different log silently double-applied
+    ///   ops + rewrote formula text against the wrong base.
+    /// - Empty-log fast path silently reused prior workbook state
+    ///   (empirical probe P10).
+    ///
+    /// Eliminating the caller-misuse class entirely was the cleanest
+    /// closure: the function now constructs a fresh `Workbook::new()`
+    /// internally and returns it. Double-invocation produces two
+    /// distinct fresh workbooks; empty session produces a fresh empty
+    /// workbook + `SyncReport::default()`. The caller cannot pass a
+    /// stale workbook because the API doesn't accept one.
+    ///
+    /// # Audit-locked D-5.3-1 caller contract
+    ///
+    /// Repair is NOT auto-invoked by `merge_bytes` (callers may want
+    /// manual control for batch-merge scenarios). The production path
+    /// through `CollabSession` MUST pair replay + repair to close the
+    /// D-3 V1 limitation (concurrent-rename formulas → `#NAME?`).
+    /// `rebuild_workbook` is the entry point.
     ///
     /// # Error handling
     ///
-    /// On `Err(_)`, the `workbook` may be in a partial state per the
-    /// `replay_into` caller contract (Phase 5.3 step 5 megaudit
-    /// closure on atomicity — see `ql_oplog::replay_into` docs). The
-    /// caller MUST discard the workbook on error rather than reuse
-    /// the partial state. The session's `OpLog` is unaffected.
-    ///
-    /// The function reads `self` immutably (via `self.op_log()`);
-    /// repair mutates the workbook only.
+    /// On `Err(_)`, the partially-replayed workbook is DROPPED before
+    /// the error is returned (the wrapper owns it; rustc drops at
+    /// scope exit). The session's `OpLog` is unaffected (replay reads
+    /// only). The caller never observes a half-merged workbook.
     ///
     /// # Empty-log fast path
     ///
-    /// When `self.op_count() == 0` the function returns immediately
-    /// with `SyncReport::default()` (no replay, no repair work).
+    /// When `self.op_log().is_empty()` the function returns immediately
+    /// with `(Workbook::new(), SyncReport::default())` — no replay, no
+    /// repair work. The returned workbook is guaranteed fresh (the new
+    /// API contract).
     ///
-    /// # Caller pitfalls
+    /// # Caller pitfalls (V1 known limitations)
     ///
-    /// - The caller must pass a FRESH `Workbook` (e.g.,
-    ///   `Workbook::new()`), not a workbook from a previous replay
-    ///   against a different log — `replay_into` applies ops on top
-    ///   of whatever state the workbook holds, so reusing a stale
-    ///   workbook silently double-applies ops.
     /// - The `registry` parameter is reserved for future replay-side
     ///   recompute integration (today replay persists formula text
     ///   without re-evaluating; callers drive evaluation through
-    ///   `recompute_all` after this returns).
-    pub fn sync_workbook(
+    ///   `WorkbookRuntime::recompute_all` after this returns).
+    /// - HIGH-1 (Opus step 5b audit): `rebuild_workbook` is shipped as
+    ///   the API entry point for Phase 5.7 IDE binding to wire. No
+    ///   production code path calls it yet — the user-visible D-3
+    ///   closure happens at step 7, not 5b.
+    #[must_use = "rebuild_workbook returns a (Workbook, SyncReport) — both \
+                  carry load-bearing post-merge state. Ignoring discards \
+                  the workbook (silent data loss) and the no-fallback \
+                  diagnostic surface from SyncReport (Display impl available)."]
+    pub fn rebuild_workbook(
         &self,
-        workbook: &mut Workbook,
         registry: &FunctionRegistry,
-    ) -> Result<SyncReport, CollabSessionError> {
+    ) -> Result<(Workbook, SyncReport), CollabSessionError> {
+        let mut workbook = Workbook::new();
         if self.log.is_empty() {
-            return Ok(SyncReport::default());
+            return Ok((workbook, SyncReport::default()));
         }
-        let ops_replayed = replay_into(&self.log, workbook, registry)?;
-        let sheet_repair = repair_sheet_rename_chain(workbook, &self.log)?;
-        let table_repair = repair_table_rename_chain(workbook, &self.log)?;
-        Ok(SyncReport {
-            ops_replayed,
-            sheet_repair,
-            table_repair,
-        })
+        let ops_replayed = replay_into(&self.log, &mut workbook, registry)?;
+        let sheet_repair = repair_sheet_rename_chain(&mut workbook, &self.log)?;
+        let table_repair = repair_table_rename_chain(&mut workbook, &self.log)?;
+        Ok((
+            workbook,
+            SyncReport {
+                ops_replayed,
+                sheet_repair,
+                table_repair,
+            },
+        ))
     }
 
-    /// Current number of ops in the log. Cheap (cached).
+    /// Current number of ops in the log. Wraps [`OpLog::len`] — queries
+    /// Loro on each call (Phase 5.4 V1 closure: the previously-cached
+    /// `usize` field was retired because the cache became stale across
+    /// undo/redo). O(1) but not a free local read.
     pub fn op_count(&self) -> usize {
         self.log.len()
     }

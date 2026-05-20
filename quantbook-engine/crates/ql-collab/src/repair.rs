@@ -13,22 +13,39 @@
 //!
 //! ## Caller contract
 //!
-//! `repair_sheet_rename_chain` is **caller-driven**, NOT hooked into
-//! `merge_bytes`. Audit-locked design decision D-5.3-1 (see
-//! `quantbook-engine/.plans/_active.md`). Typical call sequence:
+//! Both repair functions in this module (`repair_sheet_rename_chain`
+//! + `repair_table_rename_chain` shipped in step 4) are
+//! **caller-driven**, NOT hooked into `merge_bytes`. Audit-locked
+//! design decision D-5.3-1 (see `quantbook-engine/.plans/_active.md`).
+//!
+//! **Recommended path (Phase 5.3 step 5b + audit closure):** use the
+//! convenience wrapper [`crate::CollabSession::rebuild_workbook`] which
+//! atomically constructs a fresh workbook + chains replay + both
+//! repair passes:
 //!
 //! ```text
-//! 1. CollabSession::merge_bytes(peer_b_bytes)   // pull peer's ops
-//! 2. replay_into(log, &mut workbook, &registry) // apply ops to workbook
-//! 3. ql_collab::repair_sheet_rename_chain(&mut workbook, &log)?  // <-- THIS module
-//! 4. WorkbookRuntime::recompute_all(...)        // evaluate formulas
+//! 1. CollabSession::merge_bytes(peer_b_bytes)        // pull peer's ops
+//! 2. let (wb, report) = session.rebuild_workbook(&registry)?;
+//!                                                     // replay + repair
+//! 3. WorkbookRuntime::recompute_all(...)              // evaluate formulas
 //! ```
 //!
-//! Step 3 is OPTIONAL (replay + recompute work without it), but skipping
-//! it means concurrent-edit formulas referencing renamed sheets resolve
-//! as `#NAME?`. Production callers in collaborative workflows SHOULD
-//! invoke it before recompute; single-writer / qbook-load workflows
-//! don't need it (no concurrent renames possible).
+//! **Raw / advanced path** (e.g., for diagnostics or partial-replay
+//! flows):
+//!
+//! ```text
+//! 1. CollabSession::merge_bytes(peer_b_bytes)
+//! 2. replay_into(log, &mut workbook, &registry)
+//! 3. repair_sheet_rename_chain(&mut workbook, &log)?
+//! 4. repair_table_rename_chain(&mut workbook, &log)?
+//! 5. WorkbookRuntime::recompute_all(...)
+//! ```
+//!
+//! Skipping the repair steps means concurrent-edit formulas referencing
+//! renamed sheets / tables resolve as `#NAME?`. Production callers in
+//! collaborative workflows SHOULD use `rebuild_workbook`;
+//! single-writer / qbook-load workflows don't need repair (no
+//! concurrent renames possible).
 //!
 //! ## Algorithm (chain-based, NOT causality-aware)
 //!

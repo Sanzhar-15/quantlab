@@ -348,8 +348,9 @@ impl From<ql_storage::FormatTableError> for FormatRejectedSource {
 /// Replay every op in `log` against `workbook` in append order.
 ///
 /// Returns the total count of ops applied on success. On failure, the
-/// workbook is in a partial state — `ReplayError::At { index, .. }` tells
-/// the caller how far replay got.
+/// workbook is in a partial state — the per-op `ReplayError` variants
+/// (e.g., `TableNotFound { index, .. }`, `SheetRenameRejected { index, .. }`)
+/// carry the `index` field telling the caller how far replay got.
 ///
 /// # Caller contract on `Err` (Phase 5.3 step 5 megaudit closure)
 ///
