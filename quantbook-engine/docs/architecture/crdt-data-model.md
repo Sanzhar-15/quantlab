@@ -710,8 +710,9 @@ post the 2026-05-19 audit. Status summary:
    adds the causality-aware rename-repair pass. Documented as
    a known V1 limitation.
 
-5. **Format id collision** — **DESIGN RESOLVED in 5.1; D-1 STEPS
-   1–7 IMPLEMENTED (2026-05-19 / 2026-05-20); STEP 8 (full-arc megaudit) PENDING.**
+5. **Format id collision** — **✅ RESOLVED. D-1 SHIPPED 2026-05-20.**
+   All 8 steps + 7 per-step audits + 1 full-arc megaudit complete. See
+   `docs/phase5/d-1-exit-packet.md` for the closure record.
    `FormatId` now a tagged tuple `Builtin(u32) | Custom(PeerId, u32)`
    in `ql_storage::format` (step 3 `af803f1a3f2`). `FormatIdWire`
    the wire-side counterpart in `ql_oplog::wire` (step 2

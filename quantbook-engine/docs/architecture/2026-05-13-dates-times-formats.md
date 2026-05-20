@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-13 (W5-68)
 **Branch:** `feat/quantbook-engine`
-**Status:** DESIGN (pre-implementation, Codex-reviewed). Implementation in subsequent sessions.
+**Status:** DESIGN (pre-implementation, Codex-reviewed). Implementation shipped Phase 4.5.D (W5-79 / W5-80 / W5-81). **PARTIALLY SUPERSEDED by D-1 (2026-05-19/20):** the § 7 `FormatTable` shape (`next_custom_id: u32`, single `by_string: HashMap<String, FormatId>`, no `local_peer`/`with_peer`/`set_local_peer`) and § 7.3 `Op::RegisterFormat { id: FormatId }` are pre-D-1 designs. Current post-D-1 shape: `FormatId` is a tagged enum `Builtin(u32) | Custom(PeerId, u32)`; `FormatTable` carries `local_peer: PeerId` + split `by_builtin_string` / `by_custom_string` ((peer, string)-keyed); ops carry `FormatIdWire`. See `docs/architecture/crdt-data-model.md` § D-1 and `docs/phase5/d-1-starting-checklist.md` for the current shape + audit-locked decisions.
 **Pattern:** W5-49 architectural-decision pattern. Plan + Codex review BEFORE implementation. Codex review **complete**; this doc incorporates the 4 HIGH + 8 MEDIUM + 5 LOW findings.
 **Codex output:** `docs/audits/2026-05-13-w5-68-codex-dates-review.txt`. Key edits driven by review:
 - Added § 4.A evaluator-context plan (Codex HIGH 1).

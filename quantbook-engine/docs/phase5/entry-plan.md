@@ -1,6 +1,6 @@
 ---
 title: Phase 5 entry plan — Multi-User CRDT Collaboration
-status: SUPERSEDED-BY-EXIT-PACKET — Phase 5 V1 COMPLETE 2026-05-19. D-1 steps 1-7 of 8 shipped + audited 2026-05-19/20; step 8 (megaudit) pending. See `docs/phase5/v1-exit-packet.md` (canonical V1 record) + `docs/phase5/d-1-starting-checklist.md` (D-1 step-by-step + audit transcripts). 5.3, 5.5 V2 V2/V3, 5.7, and 5.8 also remain.
+status: SUPERSEDED-BY-EXIT-PACKET — Phase 5 V1 COMPLETE 2026-05-19. **D-1 SHIPPED 2026-05-20** (all 8 steps + 7 per-step audits + 1 megaudit). See `docs/phase5/d-1-exit-packet.md` (D-1 closure record) + `docs/phase5/v1-exit-packet.md` (canonical V1 record) + `docs/phase5/d-1-starting-checklist.md` (D-1 execution-trace history). 5.3, 5.5 V2 V2/V3, 5.7, and 5.8 also remain.
 date: 2026-05-19
 predecessor: docs/phase4/exit-packet.md
 successor: docs/phase5/v1-exit-packet.md (closeout) + docs/phase5/d-1-starting-checklist.md (D-1 entry)
@@ -57,7 +57,7 @@ Verified against `docs/phase4/exit-packet.md`:
 > - Tier C1 (cycle detection in recompute_all): ✅ shipped this session.
 > - Tier D1 (WorkbookRuntime monolith → 9-submodule split): ✅ shipped this session.
 > - Tier D2 (ql-oplog → ql-io reverse dep cleanup): ✅ shipped this session at `e15e8908742`.
-> - Tier D3 (oplog.bin magic bytes + version header): pending — bundle into D-1 schema work.
+> - Tier D3 (oplog.bin magic bytes + version header): ✅ SHIPPED via D-1 step 7 (`0ccc859958f` + audit `0ad835f6060`).
 > - Tier B (parser/binder gaps): deferred (Phase 6 IDE work).
 > - Tier C2 (BatchCommit depth guard): pending — low priority.
 >
@@ -112,7 +112,7 @@ post-merge.
 | ID | Item | Effort | Notes |
 |---|---|---|---|
 | 5.1 | Collaboration Data Model Decision | 3-5 days | **✅ AUDIT-CLOSED 2026-05-19** (`918d7efdd91` + `df52cb44ad2`). Loro container shape locked = Option A op-log preservation; 4 audit decisions D-1..D-4 recorded in design doc. |
-| 5.2 | `ql-collab` Core Documents | 1-2 weeks | **🟡 IN PROGRESS** — 5.2.a scaffold (`66a571b30af`); D-2/D-3/D-4 (`1ca19e2fa37`/`e71312d4bcd`/`2f217a2067a`); 5.2.b (`ef056f50bee`); D-1 steps 1-7 of 8 shipped + audited 2026-05-19/20 (`1e383dc9eeb`/`135bbb99f75`/`af803f1a3f2`/`6a4b8b0922f`/`2ae5bfcab28`/`19f6aa1b008`/`0ccc859958f` + per-step audits at `11765c5c48e`/`1f83fd5f9a4`/`9f34eb96a93`/`e97e646270a`/`30ef2637d6f`/`2ba66ee3710`/`0ad835f6060`). D-1 step 8 (megaudit) pending. |
+| 5.2 | `ql-collab` Core Documents | 1-2 weeks | **🟡 IN PROGRESS** — 5.2.a scaffold; D-2/D-3/D-4; 5.2.b; **D-1 ✅ SHIPPED 2026-05-20** (all 8 steps + 7 per-step audits + 1 megaudit; see `docs/phase5/d-1-exit-packet.md`). |
 | 5.3 | Conflict Resolution Semantics | 4-7 days | Causality-aware rename-repair pass; multi-value / delete-vs-update. Loro merge is Fugue/origin-based (not Lamport LWW — corrected by Phase 5.1 audit). |
 | 5.4 | Undo/Redo + Operation Grouping | 1 week | **🟢 V1 + V2 V1 + V2 V1.1 SHIPPED 2026-05-19** — V1 `89c02b9d83e`: 7 undo/redo methods, presence-origin excluded. V2 V1 `6138a7203f6` + `e199a5fda5a`: grouping + merge-interval. V2 V1.1: `start_undo_group_scoped` returns `UndoGroupGuard` (RAII, panic/Err-safe). V2 V2 follow-up: push/pop listeners. |
 | 5.5 | Transport Layer + Offline Sync | 1-2 weeks | **🟡 V1 SHIPPED `924750819bc`** + **V2 V1 SHIPPED `ffd8f6e5f05`** — V1: `Transport` trait + `NoopTransport` + `LoopbackTransport`. V2 V1: `CollabSession::{attach,detach,has}_transport` + `flush_to_transport` + `poll_remote` (+ `_with_limit`) typed methods; explicit-drive. V2 V2 / V3 pending: auto-flush on append + version-vector delta exports + WebSocket impl + reconnect/offline sync. |

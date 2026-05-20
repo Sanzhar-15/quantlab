@@ -568,7 +568,7 @@ The full v1 means all of these crates either ship real behavior or have a docume
    - ✅ D-4 (`2f217a2067a`) OpLog::merge_bytes + 2-peer spill probe.
    - ✅ 5.2.a scaffold (`66a571b30af`).
    - ✅ 5.2.b PeerId → LoroDoc wiring (`ef056f50bee`).
-   - 🟡 **D-1 (FormatId tagged tuple, multi-day) — steps 1-7 of 8 shipped + audited 2026-05-19/20.** PeerId in `ql_types::peer` (`1e383dc9eeb`); FormatIdWire in `ql_oplog::wire` (`135bbb99f75`); FormatId enum in `ql_storage::format` + 241-callsite cascade (`af803f1a3f2`); Op::* carries FormatIdWire + by_string peer-scope restructure (`6a4b8b0922f`); .qbook envelope v7→v8 with FormatEntryId untagged enum + legacy loader (`2ae5bfcab28`); xlsx FormatId↔numFmtId mapping with dedup-by-code + LEGACY counter preservation + Strict policy fixes (`19f6aa1b008` + audit `2ba66ee3710`); Tier D3 oplog.bin magic bytes + version header (`0ccc859958f` + audit `0ad835f6060`). Per-step Codex+Opus audits at each ship (7 cycles, **5 consecutive DIVERGENT-HIGH cycles** caught forward-activating bugs). Remaining: step 8 (full-arc megaudit, ~1h). See `docs/phase5/d-1-starting-checklist.md` + audit transcripts.
+   - ✅ **D-1 (FormatId tagged tuple, multi-day) — SHIPPED 2026-05-20.** All 8 steps + 7 per-step audits + 1 full-arc 3-way megaudit complete. **16/16 audit cycles caught real bugs.** Workspace tests: 4222 → 4291 (+69). See `docs/phase5/d-1-exit-packet.md` for the closure record + `docs/phase5/d-1-starting-checklist.md` for execution-trace history.
 
 3. **5.3 Conflict Resolution Semantics** — future. Causality-aware rename-repair pass. 4-7 days. (V1 ships `BindError::UnknownSheet → #NAME?` as the simple case per Phase 5.2 D-3.)
 

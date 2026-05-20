@@ -8,7 +8,7 @@ design_ref: docs/architecture/crdt-data-model.md § "D-1: Format-id wire format 
 
 # Phase 5.2 D-1 — fresh-session starting checklist
 
-D-1 is the **active Phase 5.2 item** — multi-day, schema-breaking. **Steps 1-4 of 8 shipped + audited 2026-05-19/20; steps 5-8 pending.** After D-1, Phase 5 still has 5.3 (conflict resolution), 5.5 V2 V2/V3 (production transport), 5.7 (IDE vertical slice), and 5.8 (megaudit) ahead. This doc is the D-1 execution plan + status — fresh sessions reading this should start at the first unchecked step (currently step 5). Per-step audit transcripts: `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..4}-{codex,opus,consolidated}.md`.
+D-1 is the **active Phase 5.2 item** — multi-day, schema-breaking. **Steps 1-7 of 8 shipped + audited 2026-05-19/20; step 8 (full-arc megaudit) pending.** After D-1, Phase 5 still has 5.3 (conflict resolution), 5.5 V2 V2/V3 (production transport), 5.7 (IDE vertical slice), and 5.8 (Phase 5 megaudit, separate from D-1 step 8) ahead. This doc is the D-1 execution plan + status — fresh sessions reading this should start at the first unchecked step (currently step 8). Per-step audit transcripts: `docs/audits/2026-05-{19,20}-phase-5-2-d-1-step-{1..7}-{codex,opus,consolidated}.md`. **Step 8 megaudit closure shipped 2026-05-20 (`<this commit>`):** 3 HIGH + 6 MEDIUM + 1 LOW closed from the 3-way parallel megaudit (Codex + Opus-A + Opus-B); D-1 then signed off as DONE. Three findings deferred to V2 with documented rationale (Opus-B MEDIUM-4 fixture coverage gap, Codex LOW version-coupling enforcement, Opus-B LOW-3 pre-D-1 read_display fallback).
 
 ## TL;DR
 
