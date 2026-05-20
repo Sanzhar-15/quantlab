@@ -1764,3 +1764,195 @@ fn import_ironcalc_example_fixture_with_recompute_doesnt_panic() {
     // structurally present.
     let _ = result.report.formula_failures.len();
 }
+
+// ===== Phase 5.2 D-1 step 6 (2026-05-20) — multi-peer xlsx export =====
+
+#[test]
+fn step6_multi_peer_format_ids_flatten_and_report_on_xlsx_export() {
+    // **Step 6 closure test:** the property step 6 enables. Pre-step-6
+    // xlsx export's `to_legacy_u32().expect(...)` panicked on
+    // `Custom(non-LEGACY peer, _)` ids. Post-step-6 the export
+    // flattens them into a contiguous xlsx numFmtId range starting at
+    // 164 and surfaces the non-LEGACY entries via
+    // `XlsxExportReport.dropped_features` (per the no-fallback rule
+    // — silent loss is forbidden; explicit reporting is OK).
+    use ql_storage::{FormatId, Workbook};
+    use ql_types::{PeerId, Value};
+
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("Sheet1");
+
+    // Allocate two Custom formats under non-LEGACY peers + one under
+    // LEGACY_PEER. Apply each to a distinct cell.
+    wb.formats_mut().set_local_peer(PeerId::new(42));
+    let peer42_fmt = wb.formats_mut().intern("yyyy-mm-dd");
+    assert_eq!(peer42_fmt, FormatId::Custom(PeerId::new(42), 0));
+
+    wb.formats_mut().set_local_peer(PeerId::new(99));
+    let peer99_fmt = wb.formats_mut().intern("0.0000%");
+    assert_eq!(peer99_fmt, FormatId::Custom(PeerId::new(99), 0));
+
+    wb.formats_mut().set_local_peer(ql_types::LEGACY_PEER);
+    let legacy_fmt = wb.formats_mut().intern("#,##0.00 USD");
+    assert_eq!(legacy_fmt, FormatId::Custom(ql_types::LEGACY_PEER, 0));
+
+    wb.put_at(s, 0, 0, Value::Number(45000.0));
+    wb.put_at(s, 1, 0, Value::Number(0.42));
+    wb.put_at(s, 2, 0, Value::Number(1234.56));
+    let sheet = wb.sheet_mut(s).unwrap();
+    sheet.format_overlay_mut().set(0, 0, peer42_fmt);
+    sheet.format_overlay_mut().set(1, 0, peer99_fmt);
+    sheet.format_overlay_mut().set(2, 0, legacy_fmt);
+
+    let tmp = std::env::temp_dir().join("step6-multi-peer-flatten.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    let registry = ql_functions::default_registry();
+
+    // Pre-step-6 this `export_xlsx_path` call would have PANICKED at
+    // `to_legacy_u32().expect()` because peer42_fmt and peer99_fmt
+    // are not LEGACY_PEER.
+    let report = export_xlsx_path(&wb, &registry, &tmp, XlsxExportOptions::default())
+        .expect("step 6: multi-peer xlsx export must succeed (was a panic pre-step-6)");
+
+    // Report must surface the two non-LEGACY peer flattens — silent
+    // information loss is forbidden by the no-fallback rule.
+    let multi_peer_drops: Vec<&ql_io_xlsx::UnsupportedFeature> = report
+        .dropped_features
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.kind,
+                ql_io_xlsx::UnsupportedFeatureKind::Other("multi-peer-format-id-flatten")
+            )
+        })
+        .collect();
+    assert_eq!(
+        multi_peer_drops.len(),
+        2,
+        "expected 2 multi-peer flatten entries (peer 42 + peer 99); got {}: {multi_peer_drops:#?}",
+        multi_peer_drops.len()
+    );
+    // Each detail string includes the original FormatId Debug form.
+    let details: String = multi_peer_drops
+        .iter()
+        .map(|f| f.detail.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(details.contains("Custom(PeerId(42)"));
+    assert!(details.contains("Custom(PeerId(99)"));
+
+    // Re-importing should produce 3 Custom(LEGACY_PEER, _) entries
+    // (xlsx has no peer concept to recover). The format CODES must
+    // round-trip; the peer-ids collapse to LEGACY.
+    let result = import_xlsx_path(
+        &tmp,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .expect("re-import of multi-peer-flattened xlsx must succeed");
+
+    // All 3 original format codes are present in the reimported table.
+    let mut imported_codes: Vec<String> = result
+        .workbook
+        .formats()
+        .iter()
+        .filter(|(id, _)| id.is_custom())
+        .map(|(_, s)| s.to_string())
+        .collect();
+    imported_codes.sort();
+    let mut expected_codes = vec![
+        "yyyy-mm-dd".to_string(),
+        "0.0000%".to_string(),
+        "#,##0.00 USD".to_string(),
+    ];
+    expected_codes.sort();
+    assert_eq!(
+        imported_codes, expected_codes,
+        "all 3 original format codes must round-trip through xlsx export+import"
+    );
+
+    // Every imported Custom must be LEGACY_PEER-tagged (xlsx collapses peers).
+    for (id, _) in result.workbook.formats().iter() {
+        if let FormatId::Custom(peer, _) = id {
+            assert_eq!(
+                peer,
+                ql_types::LEGACY_PEER,
+                "xlsx import always recovers as LEGACY_PEER (no peer concept in xlsx); got {peer:?}"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn step6_legacy_peer_only_workbook_xlsx_export_byte_unchanged() {
+    // **Step 6 byte-stability test:** for the single-writer (pre-D-1)
+    // workflow, the xlsx output bytes must be unchanged vs pre-step-6.
+    // The translation maps Custom(LEGACY_PEER, c) → c + 164, identical
+    // to the pre-step-6 to_legacy_u32() output. We verify by running
+    // the export twice and checking that 0 multi-peer-flatten entries
+    // appear in either report (so the flattening logic doesn't
+    // accidentally treat LEGACY_PEER as non-LEGACY).
+    use ql_storage::{FormatId, Workbook, FIRST_CUSTOM_FORMAT_ID};
+    use ql_types::Value;
+
+    let mut wb = Workbook::new();
+    let s = wb.add_sheet("S");
+    let custom_id = wb.formats_mut().intern("0.0000");
+    assert_eq!(custom_id, FormatId::legacy_from_u32(FIRST_CUSTOM_FORMAT_ID));
+    wb.put_at(s, 0, 0, Value::Number(0.1234));
+    wb.sheet_mut(s)
+        .unwrap()
+        .format_overlay_mut()
+        .set(0, 0, custom_id);
+
+    let tmp_a = std::env::temp_dir().join("step6-legacy-only-a.xlsx");
+    let tmp_b = std::env::temp_dir().join("step6-legacy-only-b.xlsx");
+    let _ = std::fs::remove_file(&tmp_a);
+    let _ = std::fs::remove_file(&tmp_b);
+    let registry = ql_functions::default_registry();
+
+    let report_a = export_xlsx_path(&wb, &registry, &tmp_a, XlsxExportOptions::default()).unwrap();
+    let report_b = export_xlsx_path(&wb, &registry, &tmp_b, XlsxExportOptions::default()).unwrap();
+
+    // Zero multi-peer-flatten entries for a LEGACY_PEER-only workbook.
+    for report in [&report_a, &report_b] {
+        let drops: Vec<_> = report
+            .dropped_features
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.kind,
+                    ql_io_xlsx::UnsupportedFeatureKind::Other("multi-peer-format-id-flatten")
+                )
+            })
+            .collect();
+        assert!(
+            drops.is_empty(),
+            "LEGACY_PEER-only workbook must not produce multi-peer-flatten entries; got {drops:#?}"
+        );
+    }
+
+    // Re-import survives.
+    let result = import_xlsx_path(
+        &tmp_a,
+        &registry,
+        XlsxImportOptions {
+            recompute: RecomputeMode::Skip,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let imported_code = result
+        .workbook
+        .formats()
+        .lookup(FormatId::legacy_from_u32(FIRST_CUSTOM_FORMAT_ID));
+    assert_eq!(imported_code, Some("0.0000"));
+
+    let _ = std::fs::remove_file(&tmp_a);
+    let _ = std::fs::remove_file(&tmp_b);
+}

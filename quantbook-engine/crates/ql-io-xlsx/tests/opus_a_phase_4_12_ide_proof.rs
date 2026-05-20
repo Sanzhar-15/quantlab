@@ -262,10 +262,15 @@ fn p4_roundtrip_multi_feature_workbook() {
     let mut custom_formats: Vec<(u32, String)> = Vec::new();
     for (id, s) in wb2.formats().iter() {
         // Step 3: `is_custom()` replaces the pre-step-3 `id.0 >= 164` filter.
+        // Step 6 (2026-05-20): xlsx import always produces Builtin or
+        // Custom(LEGACY_PEER, _) via legacy_from_u32(numFmtId) — xlsx
+        // has no peer-id concept to recover. So to_legacy_u32() still
+        // succeeds for every imported FormatId. The expect message was
+        // updated to reflect post-step-6 reality (was pre-step-6 framing).
         if id.is_custom() {
             custom_formats.push((
                 id.to_legacy_u32()
-                    .expect("pre-step-6 xlsx test sees only legacy FormatId"),
+                    .expect("xlsx import always produces LEGACY_PEER customs (legacy_from_u32)"),
                 s.to_owned(),
             ));
         }

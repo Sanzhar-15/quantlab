@@ -19,8 +19,8 @@
 use crate::error::XlsxError;
 use crate::options::FormulaCachePolicy;
 use crate::report::XlsxExportReport;
-use ql_storage::{FormatId, NamedTarget, Workbook};
-use ql_types::Value;
+use ql_storage::{FormatId, NamedTarget, Workbook, FIRST_CUSTOM_FORMAT_ID};
+use ql_types::{Value, LEGACY_PEER};
 
 /// Per-cell fix instruction. **W5-D-14.1 umya-bug workaround:** umya
 /// 2.2.0 has two correctness bugs we patch via post-process on output:
@@ -82,6 +82,116 @@ fn cell_ref_a1(row: u32, col: u32) -> String {
     name
 }
 
+/// **Phase 5.2 D-1 step 6 (2026-05-20):** xlsx single-namespace
+/// numFmtId translation. xlsx's `numFmtId` is a single `u32` namespace
+/// — no peer-id concept. `FormatId::Custom(peer, counter)` variants
+/// from multi-peer `.qbook` workbooks must flatten to a single
+/// contiguous range on export.
+///
+/// **Translation:**
+/// - `Builtin(n)` → `n` (canonical xlsx built-in id; no flattening).
+/// - `Custom(_, _)` → sequential xlsx numFmtId starting at
+///   `FIRST_CUSTOM_FORMAT_ID = 164`. Order is deterministic: sorted
+///   by `FormatId`'s derived `Ord` (Builtin sorts before Custom; within
+///   Custom, by `(peer, counter)`).
+///
+/// **Byte-stability:** for the LEGACY_PEER-only case (single-writer
+/// pre-D-1 default), sorted Custom ids are in counter order, so the
+/// allocator produces `Custom(LEGACY_PEER, c) → c + 164` — identical
+/// to the pre-step-6 `to_legacy_u32().expect()` output. Existing xlsx
+/// round-trip tests round-trip byte-identically.
+///
+/// **Information loss reporting:** non-LEGACY peer ids round-trip
+/// CORRECTLY through xlsx, but reimporting an xlsx export collapses
+/// them to `Custom(LEGACY_PEER, _)` (the legacy_from_u32 path —
+/// xlsx has no peer concept to recover). The flattened ids are
+/// recorded in `info_lost` so the export caller can surface them via
+/// `XlsxExportReport.dropped_features`. Per the no-fallbacks doctrine,
+/// the loss is reported rather than silently absorbed.
+struct XlsxNumFmtTranslation {
+    /// `Custom(peer, counter) → flattened xlsx numFmtId`. Builtin
+    /// variants are NOT in this map — the translator returns `n`
+    /// directly for `Builtin(n)`.
+    custom_map: std::collections::HashMap<FormatId, u32>,
+    /// `(original Custom FormatId, flattened xlsx numFmtId)` for any
+    /// Custom whose peer ≠ LEGACY_PEER. These are the lossy entries
+    /// from the round-trip perspective: xlsx → .qbook recovery
+    /// produces `Custom(LEGACY_PEER, _)`, losing the original peer id.
+    /// Caller surfaces via `XlsxExportReport.dropped_features`.
+    info_lost: Vec<(FormatId, u32)>,
+}
+
+impl XlsxNumFmtTranslation {
+    /// Build the translation over all Custom FormatIds the export will
+    /// reference. The union of:
+    /// - `workbook.formats()` Custom entries (the format-table roster
+    ///   used by the `<numFmts>` injection).
+    /// - `cellxfs_roster` Custom entries (overlay-used FormatIds; these
+    ///   may include Customs not in the format table if the overlay was
+    ///   set without first registering via `intern`, though this is
+    ///   pathological).
+    ///
+    /// Deterministic ordering via `BTreeSet<FormatId>`.
+    fn build(workbook: &Workbook, cellxfs_roster: &[FormatId]) -> Self {
+        let mut customs: std::collections::BTreeSet<FormatId> = std::collections::BTreeSet::new();
+        for (id, _) in workbook.formats().iter() {
+            if id.is_custom() {
+                customs.insert(id);
+            }
+        }
+        for fid in cellxfs_roster {
+            if fid.is_custom() {
+                customs.insert(*fid);
+            }
+        }
+        let mut custom_map = std::collections::HashMap::new();
+        let mut info_lost = Vec::new();
+        let mut next = FIRST_CUSTOM_FORMAT_ID;
+        for fid in customs {
+            let xlsx_id = next;
+            // Step-5 audit Codex M1 lesson: checked_add guards
+            // overflow even on programmer-controlled paths. With
+            // u32::MAX - 164 = ~4.3 billion custom formats this fires
+            // truly never, but the explicit check documents intent.
+            next = next
+                .checked_add(1)
+                .expect("xlsx custom numFmtId allocator exhausted (u32::MAX entries)");
+            custom_map.insert(fid, xlsx_id);
+            if let FormatId::Custom(peer, _) = fid {
+                if peer != LEGACY_PEER {
+                    info_lost.push((fid, xlsx_id));
+                }
+            }
+        }
+        Self {
+            custom_map,
+            info_lost,
+        }
+    }
+
+    /// Translate `FormatId → xlsx numFmtId`. `Builtin(n)` returns `n`
+    /// directly (canonical xlsx id, never needs flattening). `Custom`
+    /// looks up the flattened id from the map.
+    ///
+    /// **Invariant:** the FormatId MUST be in the translation's scope
+    /// — either registered in `workbook.formats()` or present in the
+    /// `cellxfs_roster` the translation was built over. Callers in this
+    /// file query subsets of those two sets, so the lookup never misses
+    /// in practice. The expect documents this invariant rather than
+    /// being a real panic path.
+    fn translate(&self, fid: FormatId) -> u32 {
+        match fid {
+            FormatId::Builtin(n) => n,
+            FormatId::Custom(_, _) => *self.custom_map.get(&fid).unwrap_or_else(|| {
+                panic!(
+                    "xlsx numFmt translation: unmapped Custom FormatId {fid:?}; \
+                     build() must include this id (programmer error in umya_export.rs)"
+                )
+            }),
+        }
+    }
+}
+
 /// Export a Quantbook `Workbook` to an xlsx file via umya-spreadsheet
 /// in `NewWorkbook` mode (generate fresh).
 pub(crate) fn export_new_workbook(
@@ -133,6 +243,26 @@ pub(crate) fn export_new_workbook(
         .enumerate()
         .map(|(i, fid)| (*fid, (i as u32) + 1)) // slot 0 reserved for default
         .collect();
+
+    // **Phase 5.2 D-1 step 6 (2026-05-20):** build the xlsx numFmtId
+    // translation. Maps every Custom FormatId (across both wb.formats()
+    // and overlays) to a flattened sequential numFmtId starting at 164.
+    // Builtins are translated inline by the helper. info_lost surfaces
+    // non-LEGACY peer flattens to XlsxExportReport.dropped_features
+    // below.
+    let xlsx_numfmt = XlsxNumFmtTranslation::build(workbook, &cellxfs_roster);
+    for (orig_fid, flattened_id) in &xlsx_numfmt.info_lost {
+        report
+            .dropped_features
+            .push(crate::report::UnsupportedFeature {
+                kind: crate::error::UnsupportedFeatureKind::Other("multi-peer-format-id-flatten"),
+                part: "xl/styles.xml".to_string(),
+                detail: format!(
+                    "Custom format id {orig_fid:?} flattened to xlsx numFmtId {flattened_id} \
+                     (xlsx single-namespace; reimporting recovers as Custom(LEGACY_PEER, _))"
+                ),
+            });
+    }
 
     let sheet_count = workbook.sheet_count();
     for sheet_id in 0..sheet_count as u16 {
@@ -289,18 +419,15 @@ pub(crate) fn export_new_workbook(
             .ok_or_else(|| XlsxError::Export(format!("sheet {sheet_id} missing during export")))?;
         let mut overlay_entries: Vec<((u32, u32), FormatId)> =
             sheet_view.format_overlay().iter().collect();
-        // Phase 5.2 D-1 step 3: sort key uses `to_legacy_u32` (was the
-        // pre-step-3 `.0` field). Non-LEGACY peer ids can't yet appear
-        // here (step 6 will handle multi-peer xlsx export); expect()
-        // makes the invariant load-bearing for step 6.
-        overlay_entries.sort_by_key(|a| {
-            (
-                a.1.to_legacy_u32()
-                    .expect("pre-step-6 xlsx export sees only legacy FormatId"),
-                a.0 .0,
-                a.0 .1,
-            )
-        });
+        // Phase 5.2 D-1 step 6 (2026-05-20): sort by the xlsx-flattened
+        // numFmtId (via the translation built above) + (row, col). The
+        // pre-step-6 expect() on `to_legacy_u32()` panicked on
+        // non-LEGACY peer Custom ids; the translation handles them
+        // by flattening into a single namespace. For LEGACY_PEER-only
+        // workbooks (single-writer pre-D-1 default) the sort key
+        // values are identical, so byte-stable output is preserved
+        // for existing xlsx fixtures.
+        overlay_entries.sort_by_key(|a| (xlsx_numfmt.translate(a.1), a.0 .0, a.0 .1));
 
         for ((row, col), fid) in overlay_entries {
             let xf_index = match format_to_xf_index.get(&fid) {
@@ -335,21 +462,17 @@ pub(crate) fn export_new_workbook(
     let needs_cell_fixes = sheet_fixes.iter().any(|f| !f.is_empty());
 
     // **W5-D-14.2 (HIGH-5 closure):** collect custom-format codes (≥164).
-    // Phase 5.2 D-1 step 3: `is_custom()` replaces the pre-step-3
-    // `id.0 >= FIRST_CUSTOM_FORMAT_ID` filter. xlsx export sees only
-    // legacy FormatId values pre-step-6, so `to_legacy_u32` always
-    // returns Some; the expect() makes the invariant load-bearing
-    // for step 6 (multi-peer xlsx export).
+    // Phase 5.2 D-1 step 6 (2026-05-20): use the xlsx numFmt translation
+    // (built above over `wb.formats() + cellxfs_roster` Customs). For
+    // LEGACY_PEER-only workbooks the translated numFmtIds match the
+    // pre-step-6 `to_legacy_u32()` output identically. Multi-peer
+    // FormatIds get flattened to the contiguous range with reporting.
     let custom_formats: Vec<(u32, String)> = workbook
         .formats()
         .iter()
         .filter_map(|(id, code)| {
             if id.is_custom() {
-                Some((
-                    id.to_legacy_u32()
-                        .expect("pre-step-6 xlsx export sees only legacy FormatId"),
-                    code.to_string(),
-                ))
+                Some((xlsx_numfmt.translate(id), code.to_string()))
             } else {
                 None
             }
@@ -384,12 +507,23 @@ pub(crate) fn export_new_workbook(
     // sheet rels + worksheet `<tableParts>` + `[Content_Types].xml`.
     let tables = collect_table_exports(workbook);
 
+    // Phase 5.2 D-1 step 6: pre-translate the cellxfs roster into
+    // (FormatId, xlsx_numFmtId) pairs so post-process doesn't need
+    // the translation helper. For each FormatId in the roster, look
+    // up its flattened numFmtId. Pre-step-6 the inject site computed
+    // `fid.to_legacy_u32().expect()` inline; now that translation is
+    // explicit + multi-peer aware.
+    let cellxfs_roster_translated: Vec<(FormatId, u32)> = cellxfs_roster
+        .iter()
+        .map(|&fid| (fid, xlsx_numfmt.translate(fid)))
+        .collect();
+
     let needs_post_process = needs_date1904
         || needs_cell_fixes
         || !custom_formats.is_empty()
         || !defined_names.is_empty()
         || !tables.is_empty()
-        || !cellxfs_roster.is_empty();
+        || !cellxfs_roster_translated.is_empty();
     if needs_post_process {
         post_process_zip(
             output_path,
@@ -398,7 +532,7 @@ pub(crate) fn export_new_workbook(
             &custom_formats,
             &defined_names,
             &tables,
-            &cellxfs_roster,
+            &cellxfs_roster_translated,
         )?;
     }
 
@@ -425,7 +559,11 @@ fn post_process_zip(
     custom_formats: &[(u32, String)],
     defined_names: &[DefinedNameOut],
     tables: &[TableExport],
-    cellxfs_roster: &[FormatId],
+    // Phase 5.2 D-1 step 6: each entry is (FormatId, xlsx numFmtId).
+    // The numFmtId comes from XlsxNumFmtTranslation; the FormatId is
+    // kept alongside for the format_to_xf_index lookup that maps cells
+    // to their roster slot.
+    cellxfs_roster: &[(FormatId, u32)],
 ) -> Result<(), XlsxError> {
     use std::io::{Read, Write};
 
@@ -980,9 +1118,15 @@ fn inject_custom_formats_into_styles_xml(
 /// applyNumberFormat); slots 1..N follow the `cellxfs_roster` order
 /// (which matches the `xf_index` values minted at the cell-fix
 /// collection site so `<c s="N">` round-trips correctly).
+///
+/// **Phase 5.2 D-1 step 6 (2026-05-20):** `cellxfs_roster` now carries
+/// `(FormatId, xlsx_numFmtId)` pairs — the numFmtId is pre-translated
+/// by `XlsxNumFmtTranslation` at the caller. This drops the pre-step-6
+/// `fid.to_legacy_u32().expect()` panic site; non-LEGACY peer ids
+/// flatten correctly through the translation.
 fn inject_cell_xfs_into_styles_xml(
     content: Vec<u8>,
-    cellxfs_roster: &[FormatId],
+    cellxfs_roster: &[(FormatId, u32)],
 ) -> Result<Vec<u8>, XlsxError> {
     let text = String::from_utf8(content)
         .map_err(|e| XlsxError::Export(format!("styles.xml is not valid UTF-8: {e}")))?;
@@ -992,16 +1136,13 @@ fn inject_cell_xfs_into_styles_xml(
     block.push_str(&format!(r#"<cellXfs count="{}">"#, count));
     // Slot 0: default xf.
     block.push_str(r#"<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>"#);
-    for fid in cellxfs_roster {
+    for (_fid, xlsx_num_fmt_id) in cellxfs_roster {
         block.push_str(&format!(
             concat!(
                 r#"<xf numFmtId="{}" fontId="0" fillId="0" borderId="0" xfId="0" "#,
                 r#"applyNumberFormat="1"/>"#,
             ),
-            // Phase 5.2 D-1 step 3: pre-step-6 xlsx export sees only
-            // legacy FormatId; non-LEGACY peer ids can't yet appear.
-            fid.to_legacy_u32()
-                .expect("pre-step-6 xlsx export sees only legacy FormatId"),
+            xlsx_num_fmt_id,
         ));
     }
     block.push_str("</cellXfs>");
