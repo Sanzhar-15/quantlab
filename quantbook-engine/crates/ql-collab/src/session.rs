@@ -197,7 +197,17 @@ pub enum AutoFlushPolicy {
     /// Flush automatically after every public method that mutates the
     /// underlying `LoroDoc`. Triggers on: `append_op`, `merge_bytes`,
     /// `update_presence`, `clear_presence`, `sweep_presence`,
-    /// `undo`, `redo`. Does NOT trigger on:
+    /// `undo`, `redo`.
+    ///
+    /// **Phase 5.5 V2 V3 step 1 (2026-05-21):** auto-flush routes
+    /// through [`flush_delta_to_transport`] (delta path) rather than
+    /// [`flush_to_transport`] (full-snapshot path). Wire payload is
+    /// O(per-op delta) instead of O(full state). The idempotency
+    /// short-circuit means a flush after no state change is a true
+    /// no-op (no transport.send invocation) — this closes the V2 V2
+    /// audit echo-loop class.
+    ///
+    /// Does NOT trigger on:
     /// - Accessor methods (read-only).
     /// - Undo-group boundary methods (`start_undo_group` /
     ///   `end_undo_group`) — only their inner appends fire, via
@@ -233,19 +243,23 @@ pub enum AutoFlushPolicy {
     /// authoritative for the local UI and either retry the flush
     /// (transport recovered) or detach the transport.
     ///
-    /// **Symmetric-OnAppend caveat (Phase 5.5 V2 V2 audit closure,
-    /// 2026-05-21):** in V2 V2, enabling `OnAppend` on BOTH peers of
-    /// a paired transport (e.g. `LoopbackTransport::pair()`) is
-    /// safe today ONLY because `poll_remote` deliberately does not
-    /// auto-flush (see exclusion list above). If a future
-    /// contributor wires `poll_remote` into the auto-flush path
-    /// without also adding a version-vector / "did state advance"
-    /// idempotency guard, a ping-pong echo loop results: A appends
-    /// → A flushes → B polls + merges + auto-flushes (no-op merge,
-    /// but unchanged snapshot back to A) → A polls + merges +
-    /// auto-flushes → etc. Loro deduplicates op-level, but the
-    /// wire payload churns. V2 V3 closes the asymmetry + the
-    /// idempotency guard together.
+    /// **Symmetric-OnAppend (Phase 5.5 V2 V3 step 1 closure,
+    /// 2026-05-21):** enabling `OnAppend` on BOTH peers of a paired
+    /// transport is now safe via the V2 V3 idempotency guard. The
+    /// guard short-circuits `flush_delta_to_transport` when no ops
+    /// have been appended since the last successful flush. A
+    /// merged peer-snapshot that didn't actually advance local
+    /// state (Loro CRDT dedupe) leaves the VV unchanged, so the
+    /// subsequent auto-flush is a no-op send. The original V2 V2
+    /// echo-loop concern (each peer re-flushing the same snapshot)
+    /// is closed at the source. V2 V3 step 2 can then safely wire
+    /// `poll_remote` into auto-flush without re-introducing the
+    /// loop.
+    ///
+    /// Note: the `poll_remote*` exclusion above STILL applies in V2
+    /// V3 step 1 — it's wired in step 2 separately. Until step 2,
+    /// callers fanning a polled batch onward must use explicit
+    /// [`flush_delta_to_transport`] or [`flush_to_transport`].
     OnAppend,
 }
 
@@ -285,6 +299,23 @@ pub struct CollabSession {
     /// is `Disabled` so existing V2 V1 callers see no behavior
     /// change. Set via [`set_auto_flush_policy`].
     auto_flush_policy: AutoFlushPolicy,
+    /// **Phase 5.5 V2 V3 step 1 (2026-05-21):** tracks the
+    /// `loro::VersionVector` at the time of the last successful
+    /// `flush_to_transport` / `flush_delta_to_transport` call.
+    ///
+    /// `None` means "no successful flush yet" — the next delta-flush
+    /// sends from the empty VV (= all ops the doc has ever seen).
+    ///
+    /// Lifecycle:
+    /// - Initialized `None` in `new` + `from_snapshot`.
+    /// - Reset to `None` on `attach_transport` (a new transport-peer
+    ///   needs the full state from scratch) and `detach_transport`
+    ///   (orphaned VV is meaningless).
+    /// - Updated to `Some(current_vv)` after a successful send via
+    ///   either `flush_to_transport` (full snapshot path) or
+    ///   `flush_delta_to_transport` (V2 V3 delta path).
+    /// - NOT updated on flush failure (`Err`) — caller can retry.
+    last_flushed_vv: Option<loro::VersionVector>,
 }
 
 impl CollabSession {
@@ -331,6 +362,7 @@ impl CollabSession {
             undo,
             transport: None,
             auto_flush_policy: AutoFlushPolicy::Disabled,
+            last_flushed_vv: None,
         })
     }
 
@@ -373,6 +405,7 @@ impl CollabSession {
             undo,
             transport: None,
             auto_flush_policy: AutoFlushPolicy::Disabled,
+            last_flushed_vv: None,
         })
     }
 
@@ -605,6 +638,13 @@ impl CollabSession {
         &mut self,
         transport: T,
     ) -> Option<Box<dyn Transport + Send>> {
+        // **Phase 5.5 V2 V3 step 1 (2026-05-21):** reset `last_flushed_vv`
+        // to `None`. A new transport-peer hasn't seen ANY of this
+        // session's ops, so the next `flush_delta_to_transport` must
+        // send from the empty VV (= all ops). If we kept the stale
+        // VV from a prior transport, the new peer would miss ops
+        // 0..stale_vv and end up with a corrupt view.
+        self.last_flushed_vv = None;
         self.transport.replace(Box::new(transport))
     }
 
@@ -612,6 +652,9 @@ impl CollabSession {
     /// transport. Returns it for caller cleanup; returns `None`
     /// if no transport was attached.
     pub fn detach_transport(&mut self) -> Option<Box<dyn Transport + Send>> {
+        // Phase 5.5 V2 V3 step 1: orphaned VV is meaningless. Clear so
+        // a subsequent `attach_transport` lands on a clean baseline.
+        self.last_flushed_vv = None;
         self.transport.take()
     }
 
@@ -657,10 +700,15 @@ impl CollabSession {
     /// [`flush_to_transport`] when policy is `OnAppend` AND a transport
     /// is attached; otherwise no-op.
     ///
-    /// Errors from `flush_to_transport` propagate to the caller; the
-    /// local mutation is already committed at the point this is called
-    /// (per the partial-state contract documented at
-    /// [`AutoFlushPolicy::OnAppend`]).
+    /// Errors propagate to the caller; the local mutation is already
+    /// committed at the point this is called (per the partial-state
+    /// contract documented at [`AutoFlushPolicy::OnAppend`]).
+    ///
+    /// **Phase 5.5 V2 V3 step 1 (2026-05-21):** routes through
+    /// [`flush_delta_to_transport`] (delta path) instead of
+    /// [`flush_to_transport`] (full-snapshot path). Wire payload is
+    /// now O(ops since last flush) instead of O(state); a flush
+    /// after no state change short-circuits to `Ok(false)`.
     fn maybe_auto_flush(&mut self) -> Result<(), CollabSessionError> {
         match self.auto_flush_policy {
             AutoFlushPolicy::Disabled => Ok(()),
@@ -668,7 +716,7 @@ impl CollabSession {
                 if self.transport.is_none() {
                     return Ok(());
                 }
-                let _sent = self.flush_to_transport()?;
+                let _sent = self.flush_delta_to_transport()?;
                 Ok(())
             }
         }
@@ -707,6 +755,90 @@ impl CollabSession {
         };
         let bytes = self.log.export_bytes()?;
         transport.send(&bytes)?;
+        // **Phase 5.5 V2 V3 step 1 (2026-05-21):** advance
+        // `last_flushed_vv` to current. The peer now has everything
+        // up to this VV; subsequent `flush_delta_to_transport` calls
+        // send only ops appended AFTER this point. Without this
+        // update, a mixed-call sequence (`flush_to_transport` then
+        // `flush_delta_to_transport`) would re-send the snapshot's
+        // contents as a delta — wasted bandwidth, no correctness
+        // issue (Loro dedupes on import).
+        self.last_flushed_vv = Some(self.log.oplog_vv());
+        Ok(true)
+    }
+
+    /// **Phase 5.5 V2 V3 step 1 (2026-05-21):** export and send the
+    /// DELTA of ops added since the last successful flush to the
+    /// attached transport. Returns `Ok(true)` if bytes were sent,
+    /// `Ok(false)` if no transport is attached OR if no ops have
+    /// been appended since the last flush (idempotency short-
+    /// circuit — closes V2 V2 audit M2/M3 echo-loop class for
+    /// step 2's `poll_remote` auto-flush wiring).
+    ///
+    /// Wire bytes are `LoroDoc::ExportMode::Updates { from: last_flushed_vv }`.
+    /// The first flush after `attach_transport` (or after `new`)
+    /// sends from the empty VV — equivalent to `all_updates()` —
+    /// delivering the full history to the new transport-peer.
+    /// Subsequent flushes send only the delta since the prior flush.
+    ///
+    /// Loro's `LoroDoc::import` transparently consumes both
+    /// `Snapshot` and `Updates` blobs, so the wire format is opaque
+    /// to peers — switching from snapshots to deltas is a
+    /// SENDER-SIDE optimization with NO PEER-SIDE CHANGES required.
+    ///
+    /// # Mix-and-match with `flush_to_transport`
+    ///
+    /// Both APIs maintain the SHARED `last_flushed_vv` field, so
+    /// callers can interleave full snapshots and deltas freely. A
+    /// typical pattern:
+    /// - Initial handshake: `flush_to_transport` to seed the peer
+    ///   with full state.
+    /// - Steady state under `OnAppend`: `maybe_auto_flush` (via
+    ///   `flush_delta_to_transport`) sends tiny deltas per
+    ///   mutation.
+    /// - On peer reconnect: caller may choose to `flush_to_transport`
+    ///   again as a safety net (Loro deduplicates on import; no
+    ///   harm even if the peer already has those ops).
+    ///
+    /// # Error handling
+    ///
+    /// Same partial-state contract as `flush_to_transport`:
+    /// - `CollabSessionError::OpLog` on `export_delta_bytes` failure.
+    /// - `CollabSessionError::Transport` on `send` failure (Closed, Io).
+    /// - `last_flushed_vv` is NOT updated on `Err` — a retry sends
+    ///   the same delta the failed call would have sent.
+    pub fn flush_delta_to_transport(&mut self) -> Result<bool, CollabSessionError> {
+        if self.transport.is_none() {
+            return Ok(false);
+        }
+        let current_vv = self.log.oplog_vv();
+        // Idempotency short-circuit: no state change since last flush.
+        // Closes V2 V2 audit M2/M3 (echo-loop). NOTE: VersionVector
+        // equality is by value (Loro impls PartialEq via the
+        // underlying op count per peer); a session that hasn't
+        // appended/merged anything since the prior flush returns
+        // Ok(false) without invoking transport.send.
+        if let Some(last_vv) = self.last_flushed_vv.as_ref() {
+            if last_vv == &current_vv {
+                return Ok(false);
+            }
+        }
+        // Encode delta bytes. `from = last_flushed_vv` (or empty if None).
+        let bytes = match self.last_flushed_vv.as_ref() {
+            Some(from) => self.log.export_delta_bytes(from)?,
+            None => self
+                .log
+                .export_delta_bytes(&loro::VersionVector::default())?,
+        };
+        // Now borrow transport mutably for the send. Done in two
+        // phases because we needed self.log (immut) above and need
+        // self.transport (mut) here — borrow-checker dance.
+        let transport = self.transport.as_mut().expect("just-checked is_some above");
+        transport.send(&bytes)?;
+        // Advance the VV checkpoint. Only on success — Err leaves
+        // last_flushed_vv at its prior value so retry sends the
+        // same delta.
+        self.last_flushed_vv = Some(current_vv);
         Ok(true)
     }
 

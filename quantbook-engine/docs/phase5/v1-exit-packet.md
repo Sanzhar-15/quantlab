@@ -1,6 +1,6 @@
 ---
 title: Phase 5 V1 exit packet (5.1 → 5.6 V1+V2 + 5.4 V2 V1+V1.1 + 5.5 V2 V1 + D1.a)
-status: ACTIVE — Phase 5 V1 surface complete 2026-05-19. **D-1 SHIPPED 2026-05-20** (all 8 steps + 7 per-step audits + 1 megaudit). **5.3 SHIPPED 2026-05-20** (all 6 steps + 14 audit cycles). **5.5 V2 V2 (auto-flush) SHIPPED 2026-05-21**. See `docs/phase5/d-1-exit-packet.md` + `docs/phase5/5-3-exit-packet.md`. 5.5 V2 V3 (WebSocket / version-vector deltas), 5.7, and 5.8 remain.
+status: ACTIVE — Phase 5 V1 surface complete 2026-05-19. **D-1 SHIPPED 2026-05-20**. **5.3 SHIPPED 2026-05-20**. **5.5 V2 V2 (auto-flush) SHIPPED 2026-05-21**. **5.5 V2 V3 step 1 (version-vector delta flush) SHIPPED 2026-05-21**. See `docs/phase5/d-1-exit-packet.md` + `docs/phase5/5-3-exit-packet.md`. 5.5 V2 V3 steps 2-6 (poll_remote auto-flush + offline-write queue + WebSocket impl + megaudit + exit packet), 5.7 IDE slice, and 5.8 megaudit remain.
 date: 2026-05-19
 updated: 2026-05-20 (post-exit-packet additions: 5.6 V2 sweep_presence + D1.a 4-cluster closure + D-1 ALL STEPS SHIPPED)
 predecessor: docs/phase4/exit-packet.md + docs/phase5/entry-plan.md
@@ -21,8 +21,10 @@ Phase 5.2 D-1 (FormatId tagged tuple) ✅ SHIPPED 2026-05-20 — see
 `docs/phase5/d-1-exit-packet.md`. Phase 5.3 conflict resolution
 ✅ SHIPPED 2026-05-20 — see `docs/phase5/5-3-exit-packet.md`.
 Phase 5.5 V2 V2 (auto-flush) ✅ SHIPPED 2026-05-21. Phase 5.5 V2 V3
-(WebSocket transport + version-vector deltas + reconnect / offline sync)
-+ Phase 5.7 IDE vertical slice remain ahead of the 5.8 megaudit.
+step 1 (version-vector delta flush) ✅ SHIPPED 2026-05-21. Phase 5.5
+V2 V3 steps 2-6 (poll_remote auto-flush + offline-write queue +
+WebSocket transport + reconnect/offline sync) + Phase 5.7 IDE vertical
+slice remain ahead of the 5.8 megaudit.
 
 ## Acceptance criteria status (Phase 5 V1)
 
@@ -242,15 +244,27 @@ Phase 5 V1 added **91 net tests** to the engine.
 - **Phase 5.5 V2 V2 — auto-flush on append.** ✅ **SHIPPED
   2026-05-21**. `AutoFlushPolicy::{Disabled, OnAppend}` enum on
   `CollabSession` (default `Disabled` preserves V2 V1 behavior).
-  `OnAppend` triggers `flush_to_transport` after every mutator;
-  partial-state contract documented for transport-failure case.
-  14 new integration tests at `crates/ql-collab/tests/auto_flush.rs`.
-  No new external deps; no breaking changes to V2 V1 API.
+  `OnAppend` triggers flush after every mutator (delta path in
+  V2 V3 step 1); partial-state contract documented for transport-
+  failure case. 19 integration tests (14 ship + 5 audit-closure)
+  at `crates/ql-collab/tests/auto_flush.rs`. No new external deps;
+  no breaking changes to V2 V1 API.
 
-- **Phase 5.5 V2 V3 — Production transport.** WebSocket impl
-  + reconnect / offline sync + per-transport version-vector
-  tracking for delta exports (replacing the O(state) full-snapshot
-  flush at the wire level). 4-7 days estimated.
+- **Phase 5.5 V2 V3 step 1 — version-vector delta flush.** ✅
+  **SHIPPED 2026-05-21**. New `CollabSession::flush_delta_to_transport`
+  + `last_flushed_vv: Option<VersionVector>` field. Auto-flush
+  reroutes through delta path. Idempotency short-circuit closes
+  V2 V2 audit echo-loop class. New `OpLog` helpers: `oplog_vv()`
+  + `export_delta_bytes(&VersionVector)`. 9 new integration tests
+  (total 28 at `crates/ql-collab/tests/auto_flush.rs`). No new
+  external deps.
+
+- **Phase 5.5 V2 V3 steps 2-6 — Production transport.** Step 2:
+  wire `poll_remote` into auto-flush (now safe with V2 V3 step 1
+  idempotency guard). Step 3: offline-write queue. Step 4:
+  WebSocket transport impl (+ reconnect / offline sync). Step 5:
+  full-arc megaudit. Step 6: V2 V3 exit packet. 3-6 days
+  estimated.
 
 - **Phase 5.7 — IDE vertical slice.** Two-window editing demo.
   1 week. Depends on D-1 + 5.3 + 5.5 V2 V2 (✅) + V2 V3.

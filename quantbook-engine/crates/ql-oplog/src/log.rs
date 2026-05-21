@@ -326,6 +326,39 @@ impl OpLog {
         Ok(self.doc.export(ExportMode::Snapshot)?)
     }
 
+    /// **Phase 5.5 V2 V3 step 1 (2026-05-21):** export the delta of
+    /// ops added SINCE the given version vector `from`. Uses
+    /// `ExportMode::updates(&from)`.
+    ///
+    /// `from = &VersionVector::default()` (empty VV) is equivalent to
+    /// `ExportMode::all_updates()` — sends every op the doc has ever
+    /// seen. Use for fresh-peer handshakes.
+    ///
+    /// `from = &self.oplog_vv()` (current VV) produces a payload with
+    /// no new ops — typically an empty / near-empty wire blob. Use
+    /// for "did anything happen since last sync" checks.
+    ///
+    /// Returns the encoded bytes. Loro's `import` transparently
+    /// consumes both `Snapshot` and `Updates` blobs on the receiver
+    /// side, so the wire format is opaque to peers.
+    pub fn export_delta_bytes(&self, from: &loro::VersionVector) -> Result<Vec<u8>, OpLogError> {
+        Ok(self.doc.export(ExportMode::updates(from))?)
+    }
+
+    /// **Phase 5.5 V2 V3 step 1 (2026-05-21):** read the doc's
+    /// current op-log version vector. Cheap (clones an internal
+    /// `VersionVector`). Used by [`crate::CollabSession`] to track
+    /// per-transport "last successfully flushed" state for delta
+    /// exports.
+    ///
+    /// Wait — `CollabSession` lives in `ql-collab` and depends on
+    /// `ql-oplog`, not the other way around. The cross-reference
+    /// above is one-way: `CollabSession::flush_delta_to_transport`
+    /// calls this accessor. No reverse dependency.
+    pub fn oplog_vv(&self) -> loro::VersionVector {
+        self.doc.oplog_vv()
+    }
+
     /// Reconstruct an `OpLog` from a previously-exported snapshot.
     /// If the snapshot doesn't carry our `"ops"` container shape,
     /// subsequent `iter` / `len` calls operate on an empty list

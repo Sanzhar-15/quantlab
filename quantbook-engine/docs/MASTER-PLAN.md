@@ -542,7 +542,7 @@ The full v1 means all of these crates either ship real behavior or have a docume
 
 ## Phase 5 - Multi-User CRDT Collaboration
 
-**Status (2026-05-21): Phase 5 V1 + D-1 + 5.3 + 5.5 V2 V2 (auto-flush) COMPLETE.** Canonical records: `docs/phase5/v1-exit-packet.md` (V1) + `docs/phase5/d-1-exit-packet.md` (D-1 closure) + `docs/phase5/5-3-exit-packet.md` (5.3 closure). Remaining: 5.5 V2 V3 (version-vector deltas + WebSocket transport), 5.7 IDE slice, 5.8 Phase 5 megaudit (separate from D-1 step 8 + 5.3 step 5 megaudits).
+**Status (2026-05-21): Phase 5 V1 + D-1 + 5.3 + 5.5 V2 V2 + 5.5 V2 V3 step 1 COMPLETE.** Canonical records: `docs/phase5/v1-exit-packet.md` (V1) + `docs/phase5/d-1-exit-packet.md` (D-1 closure) + `docs/phase5/5-3-exit-packet.md` (5.3 closure). Remaining: 5.5 V2 V3 steps 2-6 (poll_remote auto-flush + offline-write queue + WebSocket impl + megaudit + exit packet), 5.7 IDE slice, 5.8 Phase 5 megaudit (separate).
 
 **Purpose:** Turn collaboration from a single-writer op log into real multi-user CRDT state for sheets, cells, names, tables, presence, undo/redo, and offline sync.
 
@@ -578,11 +578,12 @@ The full v1 means all of these crates either ship real behavior or have a docume
    - V2 V1.1 (`7cbdc689ea9`): RAII `start_undo_group_scoped` returning `UndoGroupGuard` (panic/Err-safe). Codex audit PASS.
    - V2 V2 pending: push/pop listeners (lower priority, speculative).
 
-5. **5.5 Transport Layer And Offline Sync** 🟡 V1 + V2 V1 + V2 V2 (auto-flush) SHIPPED 2026-05-21; V2 V3 pending.
+5. **5.5 Transport Layer And Offline Sync** 🟡 V1 + V2 V1 + V2 V2 (auto-flush) + V2 V3 step 1 (delta flush) SHIPPED 2026-05-21; V2 V3 steps 2-6 pending.
    - V1 (`924750819bc`): `Transport` trait + `NoopTransport` + `LoopbackTransport::pair()`.
    - V2 V1 (`ffd8f6e5f05`): `CollabSession::{attach,detach,has}_transport` + `flush_to_transport` + `poll_remote` (+ `_with_limit`). Explicit-drive.
-   - **V2 V2 ✅ SHIPPED 2026-05-21**: `AutoFlushPolicy::{Disabled, OnAppend}` enum + `set_auto_flush_policy` + `auto_flush_policy` accessors on `CollabSession`. Default `Disabled` (preserves V2 V1 behavior); `OnAppend` triggers `flush_to_transport` after every mutator (`append_op`, `merge_bytes`, `update_presence`, `clear_presence`, `sweep_presence`, `undo`, `redo`). Partial-state contract on flush failure documented per CLAUDE.md No-Fallback rule.
-   - V2 V3 pending: version-vector delta exports + WebSocket impl + reconnect + offline-write queue.
+   - V2 V2 (`51748b02944` ship + `b7aa4cb7bb9` audit-closure): `AutoFlushPolicy::{Disabled, OnAppend}` enum. Default `Disabled` (V2 V1 behavior); `OnAppend` triggers flush after every mutator.
+   - **V2 V3 step 1 ✅ SHIPPED 2026-05-21**: per-transport version-vector tracking + new `CollabSession::flush_delta_to_transport` using `LoroDoc::ExportMode::Updates`. Auto-flush reroutes through the delta path. Idempotency short-circuit closes V2 V2 audit echo-loop class. Wire payload is O(per-op delta) instead of O(full state). New `OpLog` API: `oplog_vv()` + `export_delta_bytes(&VersionVector)`.
+   - V2 V3 steps 2-6 pending: poll_remote auto-flush wiring (step 2) + offline-write queue (step 3) + WebSocket impl (step 4) + full-arc megaudit (step 5) + exit packet (step 6).
 
 6. **5.6 Presence And Awareness** ✅ V1 + V2 SHIPPED 2026-05-19.
    - V1 (`c677e244704`): `"presence"` LoroMap + `PresenceState` + 4 CollabSession methods.
