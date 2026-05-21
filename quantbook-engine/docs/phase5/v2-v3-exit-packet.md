@@ -90,7 +90,7 @@ V1 exit packet at `docs/phase5/v1-exit-packet.md` listed the initial API. V2 V3 
 
 **0 HIGH findings closed unfixed.** Both Opus-A HIGH findings (H1 `last_error()` unreachable, H2 `Err(Closed)` docstring guidance) closed in step 5 cycle via `Transport::last_error` trait method + step 6 consumer doc rewrite respectively.
 
-**Convergent megaudit findings**: queued-vs-acked semantics (Codex M1 + Opus-B M1) — documented in cycle; structural ack-channel fix deferred to V2 V4 Tier K1.
+**Convergent megaudit findings**: queued-vs-acked semantics (Codex M1 + Opus-B M1) — documented in V2 V3 step 5 closure cycle; structural ack-channel fix subsequently shipped as **V2 V4 V1 step 1 (HEAD `3342e21b964`)** via `Transport::flush_pending` + `CollabSession::flush_pending_to_transport()` proxy.
 
 ## V1 limitations carried forward (deferred to V2 V4)
 
@@ -106,7 +106,7 @@ The substrate is production-ready at V2 V3 V1 ship, but the following limitation
 
 ### Architectural (V2 V3 step 5 megaudit surfacing)
 
-6. **Queued-vs-acked semantics** (Codex M1 + Opus-B M1, convergent): `last_flushed_vv` advances when `Transport::send` returns Ok (bytes queued in mpsc), NOT when bytes hit the wire. For `WebSocketTransport`, this leaves a window where `has_pending_flush() == false` is reported while in-flight bytes can still be lost (transport drop, writer task panic). Documented in `Transport::send` + `flush_delta_to_transport` docstrings; V2 V4 Tier K1 will add an explicit ack-channel API for true end-to-end delivery confirmation.
+6. **Queued-vs-acked semantics** (Codex M1 + Opus-B M1, convergent) — **CLOSED by V2 V4 V1 step 1** (HEAD `3342e21b964`, 2026-05-21). `last_flushed_vv` advances when `Transport::send` returns Ok (bytes queued in mpsc), NOT when bytes hit the wire. **Closure**: `Transport::flush_pending(&mut self) -> Result<(), TransportError>` trait method (default `Ok(())` for synchronous impls) + `CollabSession::flush_pending_to_transport()` proxy. Buffered async impls (`WebSocketTransport`) override to block sync caller until the writer task has completed `ws_sink.send` for every queued blob — provides level-1 (local writer) ack. TCP-level (level 2) and peer-application-level (level 3) ack remain out of scope (require lower-layer hooks / bidirectional protocol respectively).
 7. **Symmetric-OnAppend 2× wire bandwidth** (Opus-B M6): in symmetric 2-peer pairings, every appended op pays a round-trip duplicate cost. Each peer's `OnAppend` fires both on append (sending the local op) AND on poll_remote (re-sending the now-merged state). Loro dedupes on import, but the wire bytes were sent. Per-transport baseline refactor (one `last_flushed_vv` per attached transport instead of per-session) is V2 V4 work.
 8. **Drop-during-flush bytes lost** (Opus-B M1): `WebSocketTransport::Drop` aborts the writer task while bytes may still sit in `outbound_tx`. Bytes between the last `ws_sink.send` and abort are silently lost. Recovery: detach + reattach a new transport — V2 V3 step 1 baseline-reset re-sends from empty VV (Loro dedupes anything the prior transport DID deliver). Documented; V2 V4 deferred.
 

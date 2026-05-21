@@ -735,7 +735,16 @@ fn flush_pending_blocks_until_writer_catches_up() {
 fn flush_pending_after_close_returns_closed() {
     // **V2 V4 V1 step 1 (Tier K1):** closed-state fast-path. If the
     // transport is already closed on entry, flush_pending returns
-    // Err(Closed) without blocking.
+    // Err(Closed) immediately — regardless of whether the local
+    // progress counter has caught up.
+    //
+    // **V2 V4 V1 step 1 audit closure (Codex M1, 2026-05-21):** prior
+    // version of this test accepted EITHER Ok OR Err(Closed) because
+    // the impl returned Ok if `counter >= target` on entry, even when
+    // closed. The audit caught the docstring-vs-impl divergence. The
+    // closure inverted the impl to check `closed` BEFORE the
+    // counter-vs-target check, so closed-on-entry now uniformly
+    // returns Err(Closed) per the documented contract.
     let rt = multi_thread_runtime();
     rt.block_on(async {
         let server = EchoServer::start().await;
@@ -753,20 +762,13 @@ fn flush_pending_after_close_returns_closed() {
         let result = ws.flush_pending();
         let elapsed = start.elapsed();
 
-        // After explicit close, flush_pending may either:
-        //   (a) return Err(Closed) immediately (closed-flag check on
-        //       wait_timeout wake-up), OR
-        //   (b) return Ok if the writer task happened to drain both
-        //       sends before we observed the closed flag.
-        // Both are valid per the contract. Pin the "either Ok or
-        // Closed within a bounded time" semantic.
-        match result {
-            Ok(()) | Err(TransportError::Closed) => {}
-            other => panic!("expected Ok or Err(Closed), got {other:?}"),
-        }
         assert!(
-            elapsed < Duration::from_millis(500),
-            "flush_pending after close took too long: {elapsed:?}"
+            matches!(result, Err(TransportError::Closed)),
+            "flush_pending after explicit close MUST return Err(Closed), got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "closed-on-entry flush_pending MUST be near-instant (skip the wait loop), got {elapsed:?}"
         );
     });
 }

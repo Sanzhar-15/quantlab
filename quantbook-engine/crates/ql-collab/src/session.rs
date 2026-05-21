@@ -1025,9 +1025,12 @@ impl CollabSession {
     ///
     /// For IDE consumers building "safe to close window?" workflows,
     /// the `has_pending_flush() == false` signal is insufficient on
-    /// its own — combine with a peer-side ack or wait-for-quiescence
-    /// strategy. V2 V4 will add an explicit ack-channel API for true
-    /// end-to-end delivery confirmation (V2 V4 backlog Tier K1).
+    /// its own. **V2 V4 V1 step 1 (2026-05-21) Tier K1 closure**:
+    /// call [`Self::flush_pending_to_transport`] after this method
+    /// to block until the writer task has completed `ws_sink.send`
+    /// for every queued blob — level-1 (local writer) ack. For
+    /// TCP-level or peer-application-level ack, build a custom ack-op
+    /// layered on `merge_bytes` (out of scope for V2 V4 V1).
     pub fn flush_delta_to_transport(&mut self) -> Result<bool, CollabSessionError> {
         if self.transport.is_none() {
             return Ok(false);

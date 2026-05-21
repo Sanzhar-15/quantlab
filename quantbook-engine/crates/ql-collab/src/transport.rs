@@ -122,16 +122,18 @@ pub trait Transport {
     /// allocator failure during the writer task). The session's
     /// [`crate::CollabSession::flush_delta_to_transport`] advances
     /// `last_flushed_vv` immediately on `send`'s Ok return, so
-    /// `has_pending_flush() == false` means "queued to the currently-
-    /// attached transport," NOT "the peer has received the ops." If
-    /// you need stronger delivery guarantees, the V2 V3 V1 substrate
-    /// recommends: (1) keep the transport attached until you've
-    /// verified peer reception out-of-band (e.g., received a
-    /// peer-side ack); (2) on transport drop or `Err(Closed)`,
-    /// detach + reattach a new transport — the V2 V3 step 1
-    /// baseline-reset contract re-sends from empty VV. V2 V4 will
-    /// add an explicit ack-channel API for true end-to-end delivery
-    /// confirmation.
+    /// `has_pending_flush() == false` alone means "queued to the
+    /// currently-attached transport," NOT "the peer has received the
+    /// ops." **V2 V4 V1 step 1 (2026-05-21) Tier K1 closure**: call
+    /// [`Transport::flush_pending`] after `flush_delta_to_transport`
+    /// to block until the writer task has completed `ws_sink.send`
+    /// for every queued blob — that provides level-1 (local writer)
+    /// ack. For stronger guarantees (peer-application ack, TCP-level
+    /// ack), keep the transport attached until you've verified peer
+    /// reception out-of-band (e.g., via a custom ack-op layered on
+    /// `merge_bytes`). On transport drop or `Err(Closed)`, detach +
+    /// reattach a new transport — the V2 V3 step 1 baseline-reset
+    /// contract re-sends from empty VV.
     ///
     /// On error, the caller should treat the byte blob as unsent
     /// and re-queue (or surface the error to the user). The

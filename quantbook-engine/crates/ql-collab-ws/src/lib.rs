@@ -115,6 +115,11 @@ struct TaskExitGuard {
     task_name: &'static str,
     closed: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<WebSocketError>>>,
+    /// **V2 V4 V1 step 1 audit closure (Codex L1 / Opus M2, 2026-05-21):**
+    /// notify the `flush_pending` Condvar on panic exit so blocked
+    /// callers wake up immediately rather than waiting for the
+    /// `wait_timeout` tick. Same Arc as `WebSocketTransport::progress`.
+    progress: Arc<(Mutex<u64>, Condvar)>,
     clean: bool,
 }
 
@@ -123,11 +128,13 @@ impl TaskExitGuard {
         task_name: &'static str,
         closed: Arc<AtomicBool>,
         last_error: Arc<Mutex<Option<WebSocketError>>>,
+        progress: Arc<(Mutex<u64>, Condvar)>,
     ) -> Self {
         Self {
             task_name,
             closed,
             last_error,
+            progress,
             clean: false,
         }
     }
@@ -152,6 +159,10 @@ impl Drop for TaskExitGuard {
                 format!("ql-collab-ws {} task panicked", self.task_name),
             );
             self.closed.store(true, Ordering::Relaxed);
+            // V2 V4 V1 step 1 audit closure (Opus M2): wake any
+            // flush_pending waiter so they observe the closed flag
+            // without a 100ms timeout delay.
+            self.progress.1.notify_all();
         }
     }
 }
@@ -360,6 +371,7 @@ impl WebSocketTransport {
         let queued_count = Arc::new(AtomicU64::new(0));
         let progress = Arc::new((Mutex::new(0u64), Condvar::new()));
         let progress_writer = Arc::clone(&progress);
+        let progress_reader = Arc::clone(&progress);
 
         // Writer task: drains outbound mpsc, writes Binary frames to
         // the WS sink. Exits on outbound_rx close (caller dropped
@@ -378,6 +390,7 @@ impl WebSocketTransport {
                 "writer",
                 Arc::clone(&closed_writer),
                 Arc::clone(&last_error_writer),
+                Arc::clone(&progress_writer),
             );
             while let Some(bytes) = outbound_rx.recv().await {
                 if let Err(e) = ws_sink.send(Message::Binary(bytes.into())).await {
@@ -395,10 +408,17 @@ impl WebSocketTransport {
                 // V2 V4 V1 step 1 (Tier K1): writer task successfully
                 // wrote one byte blob to the WS sink. Advance the
                 // progress counter + notify any flush_pending waiters.
-                if let Ok(mut counter) = progress_writer.0.lock() {
-                    *counter += 1;
-                    progress_writer.1.notify_all();
-                }
+                // **Step 1 audit closure (Opus L1):** poisoned-mutex
+                // handling — recover via PoisonError::into_inner()
+                // so a prior panic doesn't permanently freeze the
+                // counter at a stale value. Symmetric with
+                // last_error mutex handling.
+                let mut counter = match progress_writer.0.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *counter += 1;
+                progress_writer.1.notify_all();
             }
             // outbound_rx closed (sender dropped) — clean shutdown.
             // Attempt a graceful WS close frame; ignore errors (peer
@@ -416,11 +436,18 @@ impl WebSocketTransport {
 
         // Reader task: polls WS stream; pushes binary payloads into
         // inbound mpsc. Exits on stream end, error, or Close frame.
+        //
+        // **V2 V4 V1 step 1 audit closure (Codex L1 / Opus M1):** every
+        // closed-flag transition from the reader task now also calls
+        // `progress.1.notify_all()` so flush_pending waiters wake up
+        // immediately, not after a 100ms timeout. The TaskExitGuard
+        // also notifies on panic path via its Drop impl.
         let reader_task = tokio::spawn(async move {
             let _guard = TaskExitGuard::new(
                 "reader",
                 Arc::clone(&closed_reader),
                 Arc::clone(&last_error_reader),
+                Arc::clone(&progress_reader),
             );
             while let Some(msg_result) = ws_stream.next().await {
                 match msg_result {
@@ -430,6 +457,7 @@ impl WebSocketTransport {
                             // dropped) — exit cleanly. Set closed
                             // for state-machine symmetry (Opus-B L1).
                             closed_reader.store(true, Ordering::Relaxed);
+                            progress_reader.1.notify_all();
                             _guard.mark_clean_exit();
                             return;
                         }
@@ -455,6 +483,7 @@ impl WebSocketTransport {
                             }
                         }
                         closed_reader.store(true, Ordering::Relaxed);
+                        progress_reader.1.notify_all();
                         _guard.mark_clean_exit();
                         return;
                     }
@@ -470,6 +499,7 @@ impl WebSocketTransport {
                         // distinguish runtime causes via last_error().
                         record_runtime_error(&last_error_reader, e.to_string());
                         closed_reader.store(true, Ordering::Relaxed);
+                        progress_reader.1.notify_all();
                         _guard.mark_clean_exit();
                         return;
                     }
@@ -485,6 +515,7 @@ impl WebSocketTransport {
                 "peer stream ended without close frame".to_string(),
             );
             closed_reader.store(true, Ordering::Relaxed);
+            progress_reader.1.notify_all();
             _guard.mark_clean_exit();
         });
 
@@ -676,6 +707,17 @@ impl Transport for WebSocketTransport {
     ///   busy-loop forever. Surface as Io and let the caller
     ///   recover via reconnect.
     fn flush_pending(&mut self) -> Result<(), TransportError> {
+        // **V2 V4 V1 step 1 audit closure (Codex M1, 2026-05-21):**
+        // honor the documented contract — if the transport is closed
+        // on entry, return Err(Closed) immediately, regardless of
+        // whether the local progress counter has already caught up.
+        // The prior impl returned Ok in this case, contradicting the
+        // docstring + the closed-on-entry test which now accepts
+        // both Ok and Err. After this closure, the contract is "Err
+        // if closed at any point — entry or mid-wait".
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(TransportError::Closed);
+        }
         let target = self.queued_count.load(Ordering::SeqCst);
         let (counter_lock, cv) = &*self.progress;
         let mut counter = counter_lock
