@@ -1,0 +1,31 @@
+[package]
+name = "ql-collab-ws"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# **Phase 5.5 V2 V3 step 4 (2026-05-21) — WebSocket transport.**
+# First production-grade `Transport` impl. Separate crate so
+# `ql-collab` core stays runtime-agnostic (no forced tokio dep on
+# embedders that don't need WebSockets).
+ql-collab         = { path = "../ql-collab" }
+tokio             = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util      = { workspace = true }
+thiserror         = { workspace = true }
+
+[dev-dependencies]
+# Integration tests need an in-process WebSocket echo server.
+# `tokio-tungstenite::accept_async` accepts incoming connections; the
+# test fixture (`tests/common/echo_server.rs`) binds a TcpListener on
+# 127.0.0.1:0 and echoes binary frames. ql-collab dev-dep gives
+# CollabSession + PeerId for the round-trip integration test.
+ql-collab         = { path = "../ql-collab" }
+ql-oplog          = { path = "../ql-oplog" }
+tokio             = { workspace = true, features = ["test-util"] }

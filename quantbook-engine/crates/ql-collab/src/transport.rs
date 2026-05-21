@@ -31,19 +31,35 @@
 //! bytes that Loro dedupes leave the VV unchanged → flush
 //! short-circuits to `Ok(false)`. 3-peer hub-fanout pattern now
 //! works automatically under `OnAppend`.
-//! **Phase 5.5 V2 V3 step 3 (2026-05-21, this ship):** offline-
-//! write story. Investigation showed no explicit queue is needed:
-//! Loro's CRDT op log IS the implicit offline queue. Append while
-//! no transport attached → `maybe_auto_flush` no-ops; op committed
-//! locally. On reattach: `attach_transport` resets
-//! `last_flushed_vv = None`; the next mutator (or explicit
-//! `flush_delta_to_transport`) sends from empty VV — delivers ALL
-//! accumulated ops including offline ones. Adds
-//! `has_pending_flush() -> bool` ergonomic helper (compares
-//! current VV vs last-flushed VV). 7 new integration tests pin
-//! the offline-write contract.
-//! **Phase 5.5 V2 V3 remaining (pending):** WebSocket impl
-//! (step 4) + full-arc megaudit (step 5) + exit packet (step 6).
+//! **Phase 5.5 V2 V3 step 3 (2026-05-21):** offline-write story.
+//! Investigation showed no explicit queue is needed: Loro's CRDT op
+//! log IS the implicit offline queue. Append while no transport
+//! attached → `maybe_auto_flush` no-ops; op committed locally. On
+//! reattach: `attach_transport` resets `last_flushed_vv = None`; the
+//! next mutator (or explicit `flush_delta_to_transport`) sends from
+//! empty VV — delivers ALL accumulated ops including offline ones.
+//! Adds `has_pending_flush() -> bool` ergonomic helper (compares
+//! current VV vs last-flushed VV). 7 new integration tests pin the
+//! offline-write contract.
+//!
+//! **Phase 5.5 V2 V3 step 4 (2026-05-21, this ship):** first
+//! production-grade `Transport` impl ships as a separate crate,
+//! `ql-collab-ws::WebSocketTransport`. Bridges async
+//! tokio-tungstenite to the sync `Transport` trait via
+//! `tokio::sync::mpsc` channels and two spawned background tasks
+//! (reader and writer). Kept in a sibling crate so `ql-collab`
+//! core stays runtime-agnostic; embedders needing only
+//! `LoopbackTransport` or a custom impl don't pay for tokio. MVP
+//! scope: client-only, plain `ws://`, NO TLS, NO auto-reconnect
+//! (caller drives via detach and re-attach; V2 V3 step 1
+//! baseline-reset contract delivers offline ops on reconnect).
+//! 13 integration tests including 3 that verify the V2 V2 and
+//! V2 V3 step 1-3 contracts hold over a real WebSocket. See
+//! `ql-collab-ws` module docs for V1 limitations deferred to V2 V4
+//! (TLS, auto-reconnect, bounded queue, server side).
+//!
+//! **Phase 5.5 V2 V3 remaining (pending):** full-arc megaudit
+//! (step 5) and exit packet (step 6).
 //!
 //! Tests can also use [`NoopTransport`] which discards traffic.
 //!

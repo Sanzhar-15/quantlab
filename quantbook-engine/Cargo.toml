@@ -49,6 +49,15 @@ arrow-cast = "=58.3.0"
 rayon = "=1.12.0"
 tokio = { version = "=1.50.0", default-features = false, features = ["rt-multi-thread", "macros", "fs", "net", "time", "sync"] }
 
+# Phase 5.5 V2 V3 step 4 (2026-05-21) — WebSocket transport in ql-collab-ws.
+# tokio-tungstenite is the de-facto async websocket client for tokio.
+# futures-util provides SplitSink / SplitStream + StreamExt::next /
+# SinkExt::send. MVP scope: no TLS feature flags (plain ws:// only);
+# V2 V4 adds rustls. tokio-tungstenite 0.29.0 depends on tokio ^1.0
+# (compat with our =1.50.0 pin) and futures-util ^0.3.28.
+tokio-tungstenite = "=0.29.0"
+futures-util = { version = "=0.3.32", default-features = false, features = ["std", "sink"] }
+
 # Bench
 criterion = { version = "=0.8.2", default-features = false, features = ["html_reports"] }
 # Property-based testing for invariant checks (ql-storage, ql-calcgraph, ql-exec dev-deps)

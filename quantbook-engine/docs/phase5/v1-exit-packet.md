@@ -281,11 +281,28 @@ Phase 5 V1 added **91 net tests** to the engine.
   status indicators + reconnect handshake. 7 new integration tests
   pin the contract. No code change to the wire path.
 
-- **Phase 5.5 V2 V3 steps 4-6 — Production transport.** Step 4:
-  WebSocket transport impl (+ reconnect / offline sync /
-  multi-transport routing). Step 5: full-arc megaudit (3-way
-  Codex+Opus-A+Opus-B per Phase 5.3 step 5 precedent). Step 6:
-  V2 V3 exit packet. 3-4.5 days estimated.
+- **Phase 5.5 V2 V3 step 4 — WebSocket transport impl.** ✅
+  **SHIPPED 2026-05-21**. New crate `ql-collab-ws` housing
+  `WebSocketTransport`. Bridges async tokio-tungstenite (`=0.29.0`)
+  to the sync `Transport` trait via `tokio::sync::mpsc` channels +
+  2 spawned background tasks (reader + writer). MVP scope locked at
+  plan time: client-only, plain `ws://`, NO TLS, NO auto-reconnect
+  (caller drives via detach + new connect + attach — V2 V3 step 1
+  baseline-reset contract delivers offline ops on reconnect),
+  unbounded outbound mpsc queue. 13 integration tests against an
+  in-process tokio-tungstenite echo server, including 3 that
+  verify the V2 V2 + V2 V3 step 1-3 contracts hold over a real
+  WebSocket (auto-flush round-trip, offline-reattach delivery,
+  partial-state on server close). V1 limitations deferred to V2 V4
+  (TLS via rustls feature, bounded backpressure, `ReconnectingWebSocketTransport`
+  wrapper, server-side `ql-collab-ws-server` sibling crate). Crate
+  NOT added to `default-members` — keeps `cargo build` lean; tests
+  still run via `--workspace`.
+
+- **Phase 5.5 V2 V3 steps 5-6 — Megaudit + exit packet.** Step 5:
+  full-arc 3-way megaudit (Codex + Opus-A + Opus-B per Phase 5.3
+  step 5 precedent) covering V2 V3 steps 1-4 end-to-end. Step 6:
+  V2 V3 exit packet. 1-1.5 days estimated.
 
 - **Phase 5.7 — IDE vertical slice.** Two-window editing demo.
   1 week. Depends on D-1 + 5.3 + 5.5 V2 V2 (✅) + V2 V3.
