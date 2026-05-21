@@ -749,14 +749,37 @@ impl CollabSession {
     /// - Offline-mode UI: caller can warn user before navigating
     ///   away with pending unflushed state.
     ///
-    /// # What it does NOT distinguish
+    /// # What it does NOT distinguish (V2 V3 step 3 audit closure
+    /// — Codex L1 + Opus M1, 2026-05-21)
     ///
-    /// "No transport attached" vs "all ops flushed" — both return
-    /// `false` from this method (the former because the empty
-    /// `current_vv` of a brand-new session equals the empty
-    /// `last_flushed_vv.unwrap_or_default()`; the latter by
-    /// definition). Combine with [`has_transport`] if the
-    /// distinction matters.
+    /// The helper compares VVs; it doesn't know about transports.
+    /// Three scenarios that return `false`:
+    /// 1. Brand-new `CollabSession::new(...)` with no ops + no
+    ///    flushes — `current_vv = default` matches
+    ///    `last_flushed_vv.unwrap_or_default() = default`.
+    /// 2. All ops flushed — `last_flushed_vv = Some(current_vv)`.
+    /// 3. Brand-new session AFTER `detach_transport` AND no further
+    ///    mutations — `current_vv = default` matches `default`.
+    ///
+    /// Three scenarios that return `true` even though no transport
+    /// is attached:
+    /// 1. Brand-new session with offline appends (no transport
+    ///    ever attached) — `current_vv` reflects local ops;
+    ///    `last_flushed_vv = None` → `default`.
+    /// 2. `CollabSession::from_snapshot(peer_id, bytes)` IMMEDIATELY
+    ///    after construction — `current_vv` reflects the IMPORTED
+    ///    ops (typically non-empty); `last_flushed_vv = None`.
+    ///    Callers building IDE "Synced / Unsynced" indicators
+    ///    should either suppress until first user-driven mutation
+    ///    OR wrap with `has_transport() && has_pending_flush()`
+    ///    to gate the indicator on the transport-attached state.
+    /// 3. Post-`detach_transport` non-empty session — the orphaned
+    ///    `last_flushed_vv` was reset to `None`; `current_vv` is
+    ///    still non-empty.
+    ///
+    /// Bottom line: combine with [`has_transport`] when the IDE
+    /// status should reflect "do we have an active sync path"
+    /// rather than just "is there local state."
     ///
     /// # Offline-write story (Phase 5.5 V2 V3 step 3)
     ///

@@ -1561,3 +1561,218 @@ fn has_pending_flush_distinguishes_synced_from_detached_via_state_advance() {
     s.append_op(put_value(0, 0, 0, 99.0)).unwrap();
     assert!(s.has_pending_flush());
 }
+
+// ============================================================
+// V2 V3 step 3 audit closure (Codex + Opus, 2026-05-21)
+// ============================================================
+
+#[test]
+fn offline_merge_bytes_then_reattach_flush_delivers_merged_ops() {
+    // **V2 V3 step 3 audit closure (Opus M3, 2026-05-21):** pin
+    // Scenario C for merge_bytes. The investigation claim "Loro
+    // op log IS the offline queue" relies on EVERY mutator
+    // routing through maybe_auto_flush which no-ops on
+    // transport.is_none(). Add explicit proof for merge_bytes.
+    let mut peer_b = CollabSession::new(PeerId::new(2)).unwrap();
+    peer_b.append_op(add_sheet()).unwrap();
+    let b_bytes = peer_b.export_bytes().unwrap();
+
+    // Peer A: OnAppend + NO transport. merge_bytes(B's snapshot)
+    // should succeed locally without any transport interaction.
+    let mut peer_a = CollabSession::new(PeerId::new(1)).unwrap();
+    peer_a.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+    assert!(!peer_a.has_transport());
+
+    let merged_count = peer_a.merge_bytes(&b_bytes).unwrap();
+    assert!(
+        merged_count >= 1,
+        "merge_bytes succeeded locally with no transport"
+    );
+    assert!(peer_a.has_pending_flush());
+
+    // Reattach + flush delivers the merged op to a fresh transport.
+    let (tx_a, mut tx_b) = LoopbackTransport::pair();
+    peer_a.attach_transport(tx_a);
+    peer_a.flush_delta_to_transport().unwrap();
+    let bytes = tx_b.try_recv().unwrap().expect("post-reattach flush bytes");
+    let peer_log = ql_oplog::OpLog::import_bytes(&bytes).unwrap();
+    assert!(
+        !peer_log.is_empty(),
+        "post-reattach flush MUST deliver the offline-merged op"
+    );
+}
+
+#[test]
+fn offline_update_presence_then_reattach_flush_delivers_presence() {
+    // **V2 V3 step 3 audit closure (Opus M3, 2026-05-21):** pin
+    // Scenario C for update_presence. Same shape as merge_bytes
+    // test above.
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    s.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+    assert!(!s.has_transport());
+
+    s.update_presence(PresenceState::at_cell(0, 7, 9)).unwrap();
+    assert!(s.has_pending_flush());
+
+    let (tx_a, mut tx_b) = LoopbackTransport::pair();
+    s.attach_transport(tx_a);
+    s.flush_delta_to_transport().unwrap();
+    let bytes = tx_b.try_recv().unwrap().expect("post-reattach flush bytes");
+    // Peer reconstruction: import bytes into a fresh session, query
+    // presence. Use direct CollabSession to inspect presence rather
+    // than raw OpLog (presence is a separate LoroMap container).
+    let peer = CollabSession::from_snapshot(PeerId::new(99), &bytes).unwrap();
+    let presence = peer.peer_presence(PeerId::new(1)).unwrap();
+    assert_eq!(
+        presence,
+        Some(PresenceState::at_cell(0, 7, 9)),
+        "post-reattach flush MUST deliver the offline-updated presence"
+    );
+}
+
+#[test]
+fn offline_appends_under_disabled_policy_flushed_via_explicit_flush() {
+    // **V2 V3 step 3 audit closure (Opus L1, 2026-05-21):** pin
+    // the offline-write path under AutoFlushPolicy::Disabled
+    // (default V2 V1 explicit-drive). All other step-3 tests use
+    // OnAppend; the contract is policy-orthogonal but only
+    // OnAppend was test-pinned.
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    // Default policy: Disabled. Don't set OnAppend.
+    assert_eq!(s.auto_flush_policy(), AutoFlushPolicy::Disabled);
+
+    s.append_op(add_sheet()).unwrap();
+    s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+    assert_eq!(s.op_count(), 2);
+    assert!(s.has_pending_flush());
+
+    // Attach transport. Under Disabled, no auto-flush on attach.
+    let (tx_a, mut tx_b) = LoopbackTransport::pair();
+    s.attach_transport(tx_a);
+    assert_eq!(
+        tx_b.pending_recv(),
+        0,
+        "Disabled policy: no auto-flush on attach"
+    );
+
+    // Explicit flush delivers all 2 offline ops.
+    s.flush_delta_to_transport().unwrap();
+    let bytes = tx_b.try_recv().unwrap().expect("explicit flush bytes");
+    let peer_log = ql_oplog::OpLog::import_bytes(&bytes).unwrap();
+    assert_eq!(
+        peer_log.len(),
+        2,
+        "explicit flush under Disabled MUST deliver 2 offline ops"
+    );
+    assert!(!s.has_pending_flush());
+}
+
+#[test]
+fn closed_transport_mid_session_after_successful_flush_preserves_baseline() {
+    // **V2 V3 step 3 audit closure (Codex L2 / Opus L2, 2026-05-21):**
+    // strengthen the closed-transport-recovery test. The prior step-3
+    // `closed_transport_failed_flush_ops_recoverable_via_reattach`
+    // attached an already-closed transport (so `last_flushed_vv` was
+    // never advanced). This test exercises the harder "successful
+    // flush + mid-session close" branch:
+    //   1. Attach working transport; append; auto-flush succeeds;
+    //      last_flushed_vv = X (some non-default value).
+    //   2. Transport breaks (simulated by detach + attach already-
+    //      closed transport — LoopbackTransport doesn't support
+    //      remote-side close → send-side error, so we use Noop here).
+    //   3. Append again → auto-flush fails Err(Closed) → op
+    //      committed locally. Critically: last_flushed_vv would have
+    //      stayed at X if the attach-with-closed hadn't reset it.
+    //      Since `attach_transport` ALWAYS resets to None, we can't
+    //      directly observe "the prior X is preserved" — that
+    //      semantic is what V2 V3 step 1 delta_flush_retry_after_*
+    //      test pinned. This test pins the recovery flow end-to-end.
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+
+    // Phase 1: working transport, successful flush.
+    let (tx_a, mut observer) = LoopbackTransport::pair();
+    s.attach_transport(tx_a);
+    s.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+    s.append_op(add_sheet()).unwrap();
+    assert_eq!(
+        observer.pending_recv(),
+        1,
+        "first append flushed successfully"
+    );
+    let _ = observer.try_recv();
+
+    // At this point last_flushed_vv is Some(X) (the post-add_sheet VV).
+    assert!(!s.has_pending_flush(), "synced after successful flush");
+
+    // Phase 2: simulate transport breakage. detach + attach NoopTransport
+    // that's been closed — subsequent appends auto-flush Err(Closed).
+    let _ = s.detach_transport();
+    let mut bad = NoopTransport::new();
+    bad.close();
+    s.attach_transport(bad);
+
+    let result = s.append_op(put_value(0, 0, 0, 2.0));
+    assert!(matches!(
+        result,
+        Err(CollabSessionError::Transport(TransportError::Closed))
+    ));
+    // Op committed locally. op_count = 2 (add_sheet from phase 1 + this
+    // put_value).
+    assert_eq!(s.op_count(), 2, "failed-flush op committed locally");
+    assert!(s.has_pending_flush(), "has_pending_flush true post-failure");
+
+    // Phase 3: recovery — detach bad + attach working transport.
+    let _bad = s.detach_transport();
+    let (tx_recovery, mut tx_recovery_observer) = LoopbackTransport::pair();
+    s.attach_transport(tx_recovery);
+
+    // Explicit flush delivers ALL 2 ops (the originally-flushed
+    // add_sheet + the failed-flush put_value). Note: since this is
+    // a FRESH transport, the empty-VV first flush DOES include the
+    // previously-flushed add_sheet too.
+    s.flush_delta_to_transport().unwrap();
+    let bytes = tx_recovery_observer
+        .try_recv()
+        .unwrap()
+        .expect("recovery bytes");
+    let peer_log = ql_oplog::OpLog::import_bytes(&bytes).unwrap();
+    assert_eq!(
+        peer_log.len(),
+        2,
+        "recovery flush MUST deliver both ops (new transport-peer needs full state)"
+    );
+}
+
+#[test]
+fn from_snapshot_session_reports_pending_flush_true_before_first_attach() {
+    // **V2 V3 step 3 audit closure (Opus M1, 2026-05-21):** pin the
+    // docstring-corrected edge case. A from_snapshot session imports
+    // ops (non-empty current_vv) but has last_flushed_vv = None →
+    // has_pending_flush() returns true. Callers building IDE
+    // "Synced" indicators should suppress the indicator on initial
+    // load OR wrap with has_transport() && has_pending_flush().
+    let mut origin = CollabSession::new(PeerId::new(1)).unwrap();
+    origin.append_op(add_sheet()).unwrap();
+    origin.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+    let bytes = origin.export_bytes().unwrap();
+
+    let reborn = CollabSession::from_snapshot(PeerId::new(2), &bytes).unwrap();
+    assert!(
+        !reborn.has_transport(),
+        "from_snapshot session starts with no transport"
+    );
+    assert_eq!(reborn.op_count(), 2, "imported 2 ops");
+    assert!(
+        reborn.has_pending_flush(),
+        "has_pending_flush() == true on fresh from_snapshot session \
+         (imported ops, no flushes to any transport yet — see docstring caveat)"
+    );
+
+    // Wrapping with has_transport() gives the "is there an active
+    // sync path" semantic the IDE wants for status indicators.
+    assert!(
+        !(reborn.has_transport() && reborn.has_pending_flush()),
+        "is_unsynced-with-active-transport pattern is the right IDE gate: \
+         from_snapshot session has no transport → indicator suppressed"
+    );
+}

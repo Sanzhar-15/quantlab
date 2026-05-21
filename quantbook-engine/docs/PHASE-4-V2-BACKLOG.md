@@ -511,6 +511,26 @@ verify the fix works empirically.
 
 ---
 
+## Tier I — PHASE 5.5 V2 V3 EXTENSIONS (deferred to V2 V4)
+
+**Source:** Phase 5.5 V2 V3 step 3 audit (Codex + Opus, 2026-05-21). See `docs/audits/2026-05-21-phase-5-5-v2-v3-step-3-opus.md` § M2 for the framing.
+
+**Context:** V2 V3 step 3's investigation finding "Loro op log IS the implicit offline queue" is correct for the "flush all accumulated ops on reattach" use case but silently defers two IDE consumer needs. Documenting here so the next IDE-side iteration knows the gap.
+
+### I1. Bounded offline queue / pending-op inspection API
+
+- **Source:** V2 V3 step 3 audit Opus M2.
+- **Problem:** `has_pending_flush() -> bool` returns boolean only. IDE policies like "if more than N pending ops, switch to read-only mode" or "if offline for >N minutes, warn user" can't be implemented without traversing Loro's op log directly.
+- **V2 V4 closure:** add `CollabSession::pending_op_count() -> usize` (cheap — `self.log.len() - last_flushed_op_count`) and/or `pending_op_summary() -> {count, oldest_timestamp}` if timestamps are tracked. Loro exposes op iteration; the helpers wrap it for the common IDE use cases.
+
+### I2. Offline-write discard API
+
+- **Source:** V2 V3 step 3 audit Opus M2.
+- **Problem:** Loro op log doesn't support "ungrowing." An IDE with a "discard unsynced changes on window close" workflow has no clean API — they'd have to reconstruct a fresh `CollabSession` from a pre-offline snapshot.
+- **V2 V4 closure:** add `CollabSession::discard_pending_ops(&mut self) -> Result<usize>` that builds a fresh session from the last-flushed snapshot (the V2 V3 step 1 `last_flushed_vv` checkpoint gives the boundary). Requires snapshot-at-VV capability from Loro 1.12+ (verify API exists).
+
+---
+
 ## Cycle / discipline note
 
 Phase 4.11 + 4.12 megaudits ran ~15 plan-implement-audit cycles
