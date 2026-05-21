@@ -256,6 +256,28 @@ fn indicator_status(session: &CollabSession) -> SyncStatus {
 
 5. **"Discard unsynced changes" gesture via `discard_pending_ops()` (V2 V4 V1 step 5 SHIPPED 2026-05-21)**: for UX flows where the user wants to ABANDON local edits (window-close-with-discard, "Revert to saved", server-enforced constraint violation), use `session.discard_pending_ops() -> Result<usize>`. Reverts the log to the last successfully-flushed checkpoint (`last_flushed_vv`); if no flush ever happened, reverts to a fresh empty log. Preserves `peer_id`, attached transport, auto-flush policy. Recreates the internal `UndoManager` (active undo groups become invalid — caller MUST end groups before calling). Returns the count of ops actually discarded. **Post-condition**: `pending_op_count() == 0` and `has_pending_flush() == false`. Use carefully — this is a destructive operation; pair with a "are you sure?" UX dialog.
 
+   ```rust
+   // Canonical "Discard local changes?" dialog handler.
+   fn on_discard_clicked(session: &mut CollabSession) -> Result<DiscardSummary, Box<dyn std::error::Error>> {
+       // Pre-conditions the caller controls:
+       // 1. Any active undo group MUST be ended before this point
+       //    (RAII `UndoGroupGuard` ends on drop; ensure it's out of scope).
+       // 2. Detach the transport FIRST if you also want the discard to
+       //    survive a peer's broadcast-back via `merge_bytes`. The
+       //    transport-attached path leaves the discard susceptible to
+       //    CRDT convergence — see local-only caveat.
+       let count = session.discard_pending_ops()?;
+       Ok(DiscardSummary {
+           ops_discarded: count,
+           // Post-condition guarantees:
+           still_pending: session.has_pending_flush(),  // false
+           local_op_count: session.op_count(),
+       })
+   }
+   ```
+
+   **Local-only caveat (V2 V4 V1 step 5 audit closure, Codex L1 / Opus M2)**: discard is a SESSION-LOCAL revert. If a discarded op was previously delivered to a peer (via the attached transport before the user clicked "Discard," or via a prior session that broadcast it), the peer still has the op. When the local session next does `merge_bytes` (directly or via `poll_remote`), the op will RE-APPEAR via CRDT convergence. Mitigations: (a) detach the transport before `discard_pending_ops` to prevent immediate `poll_remote` re-delivery; (b) for protocol-level peer rollback, layer a domain-specific revert op via `append_op` after discard. Discard's contract is "session-local revert," not "protocol revert."
+
 #### 4.1.2 Reconnect handshake on `Err(Closed)`
 
 When a session method returns `Err(CollabSessionError::Transport(TransportError::Closed))`, the IDE drives recovery. Use `CollabSession::transport_last_error()` (new in V2 V3 step 5) to choose the right user-facing message and retry strategy.
@@ -393,6 +415,8 @@ fn user_came_back_online(
 3. **Explicit-flush `Err(Closed)` requires the same recovery as auto-flush `Err(Closed)`** (V2 V3 step 5 megaudit Opus-A L4 symmetry): on `flush_delta_to_transport()` returning `Err(Transport(Closed))`, the local state is committed but `last_flushed_vv` is unchanged. Treat it identically to § 4.1.2's reconnect flow — detach + reconnect with a fresh transport.
 
 4. **Confirm local-writer flush with `flush_pending_to_transport()`** (V2 V4 V1 step 1 closure, 2026-05-21): after the post-attach `flush_delta_to_transport()`, call `session.flush_pending_to_transport()?` to block until the writer task has completed `ws_sink.send` for every queued blob (level-1 ack: flushed to the WebSocket sink). Without it, `Ok(true)` from `flush_delta_to_transport()` only means "bytes are queued in the transport's internal mpsc," not "submitted to the sink." For an offline-recovery UX where the user expects "all my offline edits are flushed to the wire" before the UI shows that confirmation, the additional `flush_pending_to_transport()` call is the load-bearing assertion. Note: this is NOT peer-acknowledgement — TCP reliability handles sink→peer transit, but if you need peer-application-level confirmation (e.g., "did the server actually persist this?"), layer a custom ack-op on top of `merge_bytes`. Blocking-sync; same async-context caveat as § 4.1.1 gotcha #3.
+
+5. **Alternative: discard offline edits instead of recovering** (V2 V4 V1 step 5, 2026-05-21): if the user's choice in the reconnect dialog is "Discard local changes" rather than "Sync them," call `session.discard_pending_ops()` BEFORE the explicit `flush_delta_to_transport()`. The discard reverts the log to the last-flushed checkpoint (or empty if never flushed); subsequent flush is a no-op (`Ok(false)`) until the user makes new edits. See § 4.1.1 gotcha #5 for the API contract + a code snippet. **Local-only caveat**: if a discarded op was previously delivered to a peer (in a prior session), the peer still has it and a future `merge_bytes` will re-deliver — discard is a session-local revert, not a protocol-level peer rollback.
 
 ### 4.1.x Concurrency model — one session per thread
 

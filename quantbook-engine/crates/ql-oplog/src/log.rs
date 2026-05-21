@@ -377,11 +377,31 @@ impl OpLog {
     ///
     /// # Errors
     ///
-    /// - `OpLogError::Loro(_)` if `LoroDoc::fork_at` fails (e.g., the
-    ///   given VV references peers/counters not present in the local
-    ///   history — should not happen if `vv` came from this same
-    ///   doc's `oplog_vv` snapshot).
+    /// - `OpLogError::InvalidVersionVector(_)` if `vv` is ahead of
+    ///   the current `oplog_vv` (per-peer counter exceeds the local)
+    ///   or references peers not in the local history. **V2 V4 V1
+    ///   step 5 audit closure (Codex M1, 2026-05-21):** Loro 1.12's
+    ///   `vv_to_frontiers` internally `.unwrap()`s in these cases
+    ///   and would panic; pre-validate at the OpLog API boundary
+    ///   and surface as a proper Err.
+    /// - `OpLogError::Loro(_)` if `LoroDoc::fork_at` fails post-
+    ///   validation (should not happen if validation passes, but
+    ///   defensive `?` propagation).
     pub fn fork_at_vv(&self, vv: &loro::VersionVector) -> Result<Self, OpLogError> {
+        // V2 V4 V1 step 5 audit closure (Codex M1): pre-validate
+        // the VV against our current oplog_vv. Reject if vv has any
+        // peer with a counter greater than ours (vv is ahead) OR
+        // references a peer we've never seen.
+        let current = self.doc.oplog_vv();
+        for (peer, vv_counter) in vv.iter() {
+            let current_counter = current.get(peer).copied().unwrap_or(0);
+            if *vv_counter > current_counter {
+                return Err(OpLogError::InvalidVersionVector(format!(
+                    "VV references peer {peer:?} with counter {vv_counter} > current {current_counter}; \
+                     cannot fork ahead of local history"
+                )));
+            }
+        }
         let frontiers = self.doc.vv_to_frontiers(vv);
         let forked = self.doc.fork_at(&frontiers)?;
         Ok(Self { doc: forked })
@@ -758,5 +778,44 @@ mod tests {
                 panic!("merge_bytes(&[]) returned an unexpected error variant: {other:?}")
             }
         }
+    }
+
+    // ============================================================
+    // V2 V4 V1 step 5 audit closure (Codex M1) — fork_at_vv validation
+    // ============================================================
+
+    #[test]
+    fn fork_at_vv_rejects_ahead_of_local_history() {
+        // **V2 V4 V1 step 5 audit closure (Codex M1, 2026-05-21):**
+        // pin the new InvalidVersionVector Err path. Without this
+        // validation, Loro 1.12's `vv_to_frontiers` would panic on
+        // a VV referencing peers/counters not in local history.
+        let mut local = OpLog::new();
+        local.set_peer_id(1).unwrap();
+        local.append(put_value(0, 0, 0, 1.0)).unwrap();
+        let local_vv = local.oplog_vv();
+
+        // Construct a separate doc with MORE ops + a different peer.
+        // Its VV is "ahead" of local in the sense that it references
+        // a peer (2) the local has never seen.
+        let mut other = OpLog::new();
+        other.set_peer_id(2).unwrap();
+        other.append(put_value(0, 1, 0, 2.0)).unwrap();
+        other.append(put_value(0, 1, 1, 3.0)).unwrap();
+        let other_vv = other.oplog_vv();
+
+        // Pre-validation should reject — local has no peer 2.
+        let result = local.fork_at_vv(&other_vv);
+        assert!(
+            matches!(result, Err(OpLogError::InvalidVersionVector(_))),
+            "fork_at_vv with VV referencing unknown peer MUST return InvalidVersionVector, got {result:?}"
+        );
+
+        // Same-doc VV (round-trip) should succeed.
+        let same_result = local.fork_at_vv(&local_vv);
+        assert!(
+            same_result.is_ok(),
+            "fork_at_vv with this doc's own oplog_vv MUST succeed, got {same_result:?}"
+        );
     }
 }

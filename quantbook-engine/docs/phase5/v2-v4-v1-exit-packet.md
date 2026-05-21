@@ -2,7 +2,7 @@
 title: Phase 5.5 V2 V4 V1 exit packet
 date: 2026-05-21
 status: ACTIVE — V2 V4 V1 SHIPPED via step 5 close (12/13 Tier items; K4 chunking deferred to V2 V4 V2)
-ship_commit_range: 3342e21b964 (V2 V4 V1 step 1 ship) → [step 5 closure commit]
+ship_commit_range: 3342e21b964 (V2 V4 V1 step 1 ship) → ca0f9de6ece (V2 V4 V1 step 5 ship + V1 exit packet) → [step 5 closure: the closure cycle after this exit packet was committed]
 predecessor_exit_packet: docs/phase5/v2-v3-exit-packet.md (V2 V3 V1)
 audit_cycle_total: 5 ship + 5 closure = 10 transcripts (steps 1-5)
 test_count_at_v4_v1_exit: 4459 / 0 expected (workspace, --test-threads=1)
@@ -24,7 +24,7 @@ V2 V4 V1 closes the high-leverage IDE-consumer-facing gaps + defensive hardening
 | 2 | I1 | `pending_op_count()` (VV-math after audit closure) | `ff76fc99d49` | `0bd592a4aa8` |
 | 3 | J1+J2+J3+K5 | RejectingServer determinism + text-frame test + Send/Sync asserts | `d19fb5ee85d` | `35dc6dcabbd` |
 | 4 | K2+K3+K6+K7+K8 | Drop-loss test + EchoServer Mutex doc + Debug field + empty Binary test + poll_remote docstring | `1924d3ed1e1` | `d75dab17f7f` |
-| 5 | I2 | `discard_pending_ops` + V2 V4 V1 exit packet (this commit) | [step 5 ship] | [step 5 closure] |
+| 5 | I2 | `discard_pending_ops` + V2 V4 V1 exit packet | `ca0f9de6ece` | (closure commit follows this exit packet) |
 
 ## Final API surface (V2 V4 V1 delta from V2 V3 V1)
 
@@ -82,7 +82,7 @@ V2 V4 V1 closes the high-leverage IDE-consumer-facing gaps + defensive hardening
 | 2 | PASS-WITH-FINDINGS 0H+1M+1L | PASS-WITH-FINDINGS 1H+2M+3L | **CONVERGENT HIGH**: `OpLog::len()` undo path bug. Closure rewrote `pending_op_count` to VV math. |
 | 3 | PASS-WITH-FINDINGS 0H+0M+2L | PASS-WITH-FINDINGS 0H+2M+5L+3 procedural | Convergent: stale !Sync doc drift. Discovery: type IS Sync (V2 V3 step 4 docstring was wrong). |
 | 4 | PASS-WITH-FINDINGS 0H+1M+2L | PASS-WITH-FINDINGS 0H+1M+4L+1obs | **Codex M1 unique**: multi-thread Drop race in EchoServer. Opus M1: convergent on TextFrameServer mirror. |
-| 5 | [pending — this commit] | [pending — this commit] | TBD |
+| 5 | PASS-WITH-FINDINGS 0H+1M+4L | PASS-WITH-FINDINGS 0H+2M+4L+1obs | Codex M1: `fork_at_vv` panic on invalid VV from external callers (Loro `vv_to_frontiers` internal unwrap); closed via pre-validation + new `OpLogError::InvalidVersionVector` variant. Convergent (Opus M2 + Codex L1): discard is local-only; docs amended. |
 
 **2 HIGH findings closed across the arc** (Opus-A H1 + Opus-A H2 in step 1 from V2 V3 step 5 megaudit; Opus H1 + Codex M1 in step 2 — convergent). All closed in cycle.
 

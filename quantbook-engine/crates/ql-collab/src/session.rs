@@ -1045,12 +1045,40 @@ impl CollabSession {
     ///   op-count at the checkpoint we forked from; matches the
     ///   `op_count()` value at the last successful flush).
     ///
+    /// # Local-only (V2 V4 V1 step 5 audit closure, Codex L1 / Opus M2)
+    ///
+    /// Discard is LOCAL ONLY — it does NOT instruct peers to
+    /// revert. If a discarded op already reached a peer (via the
+    /// attached transport or a prior session that broadcast it),
+    /// the peer still has the op. When the local session subsequently
+    /// `merge_bytes` from that peer (directly or via `poll_remote`),
+    /// the discarded op will RE-APPEAR in the local log via CRDT
+    /// convergence. The "discard" effect is durable only if (a) the
+    /// caller also detaches the transport, OR (b) the discarded ops
+    /// were never delivered (writer-task abort, never-flushed
+    /// offline edits). For protocol-level peer rollback the IDE
+    /// must layer a domain-specific revert op on top of `append_op`
+    /// — out of `discard_pending_ops` scope.
+    ///
+    /// # Partial-state contract on Err (V2 V4 V1 step 5 audit closure, Opus M1)
+    ///
+    /// `self.log` is replaced UNCONDITIONALLY (before `set_peer_id`).
+    /// If `set_peer_id` errors after the replacement, the session is
+    /// in a half-state: new log + Loro-default peer_id + stale
+    /// `UndoManager` field (not yet recreated). In practice this is
+    /// unreachable — `PeerId::new` rejects the only sentinel Loro
+    /// would reject — but the partial-state shape is real.
+    /// Recovery: drop the session and reconstruct.
+    ///
     /// # Errors
     ///
+    /// - `CollabSessionError::OpLog(OpLogError::InvalidVersionVector(_))`
+    ///   if `fork_at_vv` rejects the baseline (should not happen if
+    ///   `last_flushed_vv` came from this session's own `oplog_vv`
+    ///   — Loro round-trip guaranteed). Added in V2 V4 V1 step 5
+    ///   audit closure (Codex M1) to prevent a Loro internal panic.
     /// - `CollabSessionError::OpLog(_)` if `OpLog::fork_at_vv`
-    ///   fails (should not happen if `last_flushed_vv` came from
-    ///   this session's own `oplog_vv` — Loro guarantees the
-    ///   round-trip).
+    ///   otherwise fails.
     /// - `CollabSessionError::OpLog(_)` if the post-fork
     ///   `set_peer_id` fails (Loro reserves `u64::MAX`; our
     ///   `PeerId::new` enforces non-sentinel at construction, so

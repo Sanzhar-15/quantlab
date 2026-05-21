@@ -44,4 +44,19 @@ pub enum OpLogError {
     /// different container layout (e.g., a future version of this crate).
     #[error("op log schema mismatch: {0}")]
     SchemaMismatch(&'static str),
+
+    /// **Phase 5.5 V2 V4 V1 step 5 audit closure (Codex M1,
+    /// 2026-05-21):** the VersionVector passed to a method like
+    /// `OpLog::fork_at_vv` is ahead of the current log's
+    /// `oplog_vv` (per-peer counter exceeds the local) or
+    /// references peers not in the local history. Loro 1.12's
+    /// `vv_to_frontiers` internally `.unwrap()`s in this case and
+    /// would panic. Pre-validate and surface as this Err variant
+    /// instead.
+    ///
+    /// Reachable only through external callers — internal session
+    /// state (`last_flushed_vv`) always comes from this same log's
+    /// `oplog_vv` and round-trips correctly.
+    #[error("op log invalid version vector: {0}")]
+    InvalidVersionVector(String),
 }
