@@ -531,6 +531,32 @@ verify the fix works empirically.
 
 ---
 
+## Tier J — PHASE 5.5 V2 V3 STEP 4 EXTENSIONS (deferred to V2 V4)
+
+**Source:** Phase 5.5 V2 V3 step 4 audit (Codex + Opus, 2026-05-21). See `docs/audits/2026-05-21-phase-5-5-v2-v3-step-4-opus.md` § M3, L2, L4 and `docs/audits/2026-05-21-phase-5-5-v2-v3-step-4-codex.md` § L3.
+
+**Context:** The WebSocket transport MVP is functional but a few rough edges in the test fixtures + the `Send`/Sync contract assert are deferred to the broader V2 V4 transport rework (TLS, bounded backpressure, reconnect wrapper).
+
+### J1. `RejectingServer` test fixture determinism
+
+- **Source:** V2 V3 step 4 audit Opus M3.
+- **Problem:** `tests/common/mod.rs::RejectingServer` accepts a TCP connection then drops it without writing a response. The corresponding test (`connect_to_non_websocket_tcp_server_returns_handshake_or_connect_failed`) accepts EITHER `HandshakeFailed` OR `ConnectFailed` because timing + platform decides whether the client's HTTP upgrade write completes before the FIN arrives. Works today; flake-prone under future CI environments.
+- **V2 V4 closure:** tighten `RejectingServer` to either (a) hold the stream open for a configured duration before dropping, OR (b) write a deliberately-malformed HTTP response then drop, forcing the `HandshakeFailed` path deterministically. Then rename the test to `connect_to_rejecting_tcp_server_returns_handshake_failed` (V2 V3 step 4 audit Opus L2).
+
+### J2. Inbound text/ping/pong frame test pinning
+
+- **Source:** V2 V3 step 4 audit Codex L3 + Opus L3.
+- **Problem:** The reader task drops `Text`, `Ping`, `Pong`, `Frame` arms silently; this is documented but not test-pinned. A future refactor could change the silent-drop behavior (e.g., add a callback hook) without any test failing.
+- **V2 V4 closure:** add a test that uses a custom server fixture sending a `Text` frame inbound (currently `EchoServer` only echoes binary). Assert `try_recv` returns `Ok(None)` for the text frame and that subsequent binary frames still deliver correctly. Also pins the auto-pong-without-app-traffic edge case once V2 V4 makes that observable.
+
+### J3. `WebSocketTransport: !Sync` compile-time assert
+
+- **Source:** V2 V3 step 4 audit Opus L4.
+- **Problem:** `_ASSERT_WEBSOCKET_TRANSPORT_SEND` pins `Send` but not the documented `!Sync` intent. If a future refactor accidentally adds an `Arc<dyn Sync>` field making the type `Sync`, the assert passes silently — the docstring contract would be violated without a compiler signal.
+- **V2 V4 closure:** add `static_assertions` workspace dep (or implement the idiom inline) and add `assert_not_impl_all!(WebSocketTransport: Sync)` next to the existing Send assert.
+
+---
+
 ## Cycle / discipline note
 
 Phase 4.11 + 4.12 megaudits ran ~15 plan-implement-audit cycles

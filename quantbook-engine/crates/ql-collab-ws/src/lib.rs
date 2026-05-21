@@ -50,17 +50,29 @@
 //!   new `connect` + `attach_transport`. The Phase 5.5 V2 V3 step 1
 //!   `last_flushed_vv = None` reset on attach delivers all accumulated
 //!   ops on reconnect (offline-write story).
-//! - **Unbounded outbound mpsc queue.** Memory grows if peer
-//!   disconnects mid-flow + caller keeps appending. V2 V4 will switch
-//!   to bounded with caller-configurable backpressure policy.
+//! - **Unbounded outbound mpsc queue.** Memory growth is bounded in
+//!   practice for the common disconnect case: when the peer closes
+//!   the TCP socket, the reader task observes EOF / `Err` and sets
+//!   the closed flag; subsequent `send` calls fast-path to
+//!   `Err(Closed)` before reaching the unbounded mpsc. The genuine
+//!   growth window is the **dead-peer-but-not-closed** scenario
+//!   (server stops draining but doesn't tear down the TCP socket):
+//!   `ws_sink.send` stalls on TCP backpressure, `outbound_rx` grows
+//!   unboundedly, and the reader task may still be receiving heartbeat
+//!   frames so `closed` stays false. V2 V4 will switch to bounded
+//!   with caller-configurable backpressure policy (clarified in
+//!   V2 V3 step 4 audit closure, Opus M5).
 //! - **Client-only.** Server-side WebSocket impls use other libraries
 //!   (`axum-tungstenite`, `warp::ws`, etc.).
 //! - **Drops text/ping/pong/close frames as inbound data.** Loro
 //!   payloads are binary blobs; non-binary frames don't carry our
-//!   protocol. Close frames trigger task exit; ping is handled by
-//!   tokio-tungstenite's internal auto-pong; text frames are
-//!   silently dropped (a future protocol extension could add a
-//!   callback hook).
+//!   protocol. Close frames trigger reader task exit. Inbound Ping
+//!   frames: tokio-tungstenite queues a Pong response on the sink
+//!   for the next write — but with no app traffic the Pong is not
+//!   flushed until the next app send (clarified in V2 V3 step 4
+//!   audit closure, Opus L3). Server-side idle-timeout would then
+//!   close the connection. Text frames are silently dropped (a
+//!   future protocol extension could add a callback hook).
 //!
 //! ## Example
 //!
@@ -77,7 +89,7 @@
 //! ```
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures_util::{SinkExt, StreamExt};
 use ql_collab::{Transport, TransportError};
@@ -86,12 +98,29 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
-/// Errors emitted when constructing a [`WebSocketTransport`].
+/// Errors emitted by [`WebSocketTransport`].
 ///
-/// Distinguishes URL-format errors (caller mistake) from connection
-/// errors (network state). Maps tungstenite errors opaquely — we
-/// don't want to leak tungstenite types into the public API.
-#[derive(Debug, Error)]
+/// Distinguishes connect-time errors (`InvalidUrl`, `ConnectFailed`,
+/// `HandshakeFailed`) from runtime errors observed by the background
+/// reader/writer tasks (`RuntimeError`). Connect-time errors surface
+/// as the `Result::Err` from [`WebSocketTransport::connect`]; runtime
+/// errors are stashed on the transport and readable via
+/// [`WebSocketTransport::last_error`] AFTER the trait `send`/`try_recv`
+/// surface `TransportError::Closed`.
+///
+/// Maps tungstenite errors opaquely — we don't want to leak
+/// tungstenite types into the public API.
+///
+/// **V2 V3 step 4 audit closure (Opus M1, 2026-05-21):** the prior
+/// ship discarded background-task errors (`if let Err(_e)`), flattening
+/// 8 distinct tungstenite::Error variants into a uniform `Closed` at
+/// the trait boundary. This violated the CLAUDE.md no-fallbacks rule
+/// (errors must be visible) and made it impossible for IDE consumers
+/// driving reconnect handshakes to distinguish "connection lost" from
+/// "auth failed". Adds `RuntimeError(String)` variant + `last_error()`
+/// accessor; both tasks now populate the shared `last_error` slot on
+/// non-graceful exit.
+#[derive(Debug, Clone, Error)]
 #[non_exhaustive]
 pub enum WebSocketError {
     /// The URL string failed to parse or is missing required parts.
@@ -108,6 +137,14 @@ pub enum WebSocketError {
     /// invalid response, etc.).
     #[error("WebSocket handshake failed: {0}")]
     HandshakeFailed(String),
+
+    /// Background reader/writer task observed a runtime failure
+    /// (peer reset, IO error, protocol violation, capacity exceeded,
+    /// etc.) AFTER a successful connect. Surfaces via
+    /// [`WebSocketTransport::last_error`] once the trait-level
+    /// `Closed` has been observed.
+    #[error("WebSocket runtime error: {0}")]
+    RuntimeError(String),
 }
 
 /// Phase 5.5 V2 V3 step 4 — WebSocket `Transport` impl.
@@ -146,6 +183,14 @@ pub struct WebSocketTransport {
     /// [`close`](Self::close). Both `send` and `try_recv` honor this
     /// flag per the `Transport` trait drain-before-close contract.
     closed: Arc<AtomicBool>,
+    /// **V2 V3 step 4 audit closure (Opus M1, 2026-05-21):** stash
+    /// the most recent task-observed runtime error so callers can
+    /// distinguish "peer reset" from "auth rejected" from "capacity
+    /// exceeded" etc. Populated by the writer task on `ws_sink.send`
+    /// error and the reader task on stream `Err`. Stays `None` for
+    /// clean shutdowns (caller `close()`, Drop, or graceful Close
+    /// frame from peer).
+    last_error: Arc<Mutex<Option<WebSocketError>>>,
     /// Background tokio task that drains `outbound_rx` and writes
     /// `Message::Binary` frames to the WebSocket sink. Aborted on
     /// `Drop`.
@@ -204,6 +249,9 @@ impl WebSocketTransport {
         let closed = Arc::new(AtomicBool::new(false));
         let closed_writer = Arc::clone(&closed);
         let closed_reader = Arc::clone(&closed);
+        let last_error = Arc::new(Mutex::new(None::<WebSocketError>));
+        let last_error_writer = Arc::clone(&last_error);
+        let last_error_reader = Arc::clone(&last_error);
 
         // Writer task: drains outbound mpsc, writes Binary frames to
         // the WS sink. Exits on outbound_rx close (caller dropped
@@ -211,14 +259,24 @@ impl WebSocketTransport {
         // OR on sink error.
         let writer_task = tokio::spawn(async move {
             while let Some(bytes) = outbound_rx.recv().await {
-                if let Err(_e) = ws_sink.send(Message::Binary(bytes.into())).await {
+                if let Err(e) = ws_sink.send(Message::Binary(bytes.into())).await {
+                    // V2 V3 step 4 audit closure (Opus M1): stash the
+                    // tungstenite error string so callers can read it
+                    // via last_error() after seeing TransportError::Closed.
+                    if let Ok(mut slot) = last_error_writer.lock() {
+                        *slot = Some(WebSocketError::RuntimeError(e.to_string()));
+                    }
                     closed_writer.store(true, Ordering::Relaxed);
                     return;
                 }
             }
             // outbound_rx closed (sender dropped) — clean shutdown.
             // Attempt a graceful WS close frame; ignore errors (peer
-            // may already be gone).
+            // may already be gone). NOTE: under Drop, abort() runs
+            // before outbound_tx drops in field-decl order, so this
+            // arm is unreachable from Drop — see M2 closure note on
+            // the Drop impl. Reachable from a future "soft close" API
+            // that detaches outbound_tx explicitly.
             let _ = ws_sink.close().await;
         });
 
@@ -235,6 +293,7 @@ impl WebSocketTransport {
                         }
                     }
                     Ok(Message::Close(_)) => {
+                        // Graceful peer close — leave last_error None.
                         closed_reader.store(true, Ordering::Relaxed);
                         return;
                     }
@@ -244,7 +303,13 @@ impl WebSocketTransport {
                         // Non-binary frames dropped per protocol
                         // contract (see module-level V1 limits).
                     }
-                    Err(_e) => {
+                    Err(e) => {
+                        // V2 V3 step 4 audit closure (Opus M1): stash
+                        // the tungstenite error so callers can
+                        // distinguish runtime causes via last_error().
+                        if let Ok(mut slot) = last_error_reader.lock() {
+                            *slot = Some(WebSocketError::RuntimeError(e.to_string()));
+                        }
                         closed_reader.store(true, Ordering::Relaxed);
                         return;
                     }
@@ -258,6 +323,7 @@ impl WebSocketTransport {
             outbound_tx,
             inbound_rx,
             closed,
+            last_error,
             writer_task,
             reader_task,
         })
@@ -269,6 +335,24 @@ impl WebSocketTransport {
     /// IO error).
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
+    }
+
+    /// **V2 V3 step 4 audit closure (Opus M1, 2026-05-21):** read the
+    /// most recent task-observed runtime error, if any. Returns `None`
+    /// for clean shutdowns (caller [`close`](Self::close), Drop, or
+    /// graceful Close frame from peer); returns `Some(RuntimeError(_))`
+    /// when the writer's `ws_sink.send` or the reader's `ws_stream.next`
+    /// surfaced an error before exiting.
+    ///
+    /// Read AFTER observing [`TransportError::Closed`] from
+    /// [`Transport::send`] or [`Transport::try_recv`] to distinguish
+    /// "peer reset" vs "auth rejected" vs "capacity exceeded" etc.
+    /// IDE consumers driving reconnect handshakes use this to choose
+    /// the right user-facing message and backoff strategy.
+    ///
+    /// Returns a clone (cheap — `WebSocketError` is small + `Clone`).
+    pub fn last_error(&self) -> Option<WebSocketError> {
+        self.last_error.lock().ok().and_then(|guard| guard.clone())
     }
 
     /// Explicitly mark this transport closed. Subsequent
@@ -285,12 +369,20 @@ impl WebSocketTransport {
 
 impl Drop for WebSocketTransport {
     fn drop(&mut self) {
-        // Set closed first so any concurrent send/try_recv observes
-        // it. Then abort tasks. Dropping `outbound_tx` (when self is
-        // dropped) signals the writer task to exit gracefully via
-        // `outbound_rx.recv()` returning None; abort() is a safety
-        // net for the reader task which awaits on the WS stream and
-        // won't otherwise notice the caller is gone.
+        // **V2 V3 step 4 audit closure (Opus M2, 2026-05-21):** the
+        // sole shutdown path under current design is `abort()` on both
+        // task handles. The graceful `outbound_rx.recv() -> None ->
+        // ws_sink.close()` branch in the writer task is UNREACHABLE
+        // FROM DROP because `Drop::drop` runs before the struct's
+        // fields drop (Rust drop order: body first, then fields in
+        // decl order). So `outbound_tx` is still alive when we call
+        // `writer_task.abort()`. The graceful arm only fires if a
+        // future "soft close" API explicitly detaches `outbound_tx`
+        // before drop — not part of the current MVP.
+        //
+        // `closed = true` ordering: set first so any concurrent
+        // sync `send`/`try_recv` observes Closed via the flag check
+        // before the task abort propagates.
         self.closed.store(true, Ordering::Relaxed);
         self.writer_task.abort();
         self.reader_task.abort();
@@ -299,6 +391,15 @@ impl Drop for WebSocketTransport {
 
 impl Transport for WebSocketTransport {
     fn send(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
+        // **LOAD-BEARING** (V2 V3 step 4 audit closure, Opus M4): this
+        // closed-flag check MUST precede `outbound_tx.send`. The
+        // `collab_session_websocket_send_after_close_surfaces_closed`
+        // integration test depends on observing `Closed` here (the
+        // reader task sets `closed = true` on peer disconnect; the
+        // writer task may still be parked on `outbound_rx.recv` and
+        // hasn't yet seen the broken sink). If a future refactor
+        // reorders this check (e.g., to enable an outbox-queuing-
+        // while-closed feature), that test will flake.
         if self.closed.load(Ordering::Relaxed) {
             return Err(TransportError::Closed);
         }
@@ -368,12 +469,22 @@ mod tests {
             WebSocketError::InvalidUrl("x".into()),
             WebSocketError::ConnectFailed("y".into()),
             WebSocketError::HandshakeFailed("z".into()),
+            WebSocketError::RuntimeError("w".into()),
         ] {
             match e {
                 WebSocketError::InvalidUrl(_) => (),
                 WebSocketError::ConnectFailed(_) => (),
                 WebSocketError::HandshakeFailed(_) => (),
+                WebSocketError::RuntimeError(_) => (),
             }
         }
+    }
+
+    #[test]
+    fn runtime_error_display_includes_cause() {
+        // V2 V3 step 4 audit closure (Opus M1, 2026-05-21): pin the
+        // Display impl for the new variant so its surface is stable.
+        let e = WebSocketError::RuntimeError("peer reset".into());
+        assert!(e.to_string().contains("peer reset"));
     }
 }

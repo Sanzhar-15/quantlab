@@ -23,7 +23,7 @@ thiserror         = { workspace = true }
 [dev-dependencies]
 # Integration tests need an in-process WebSocket echo server.
 # `tokio-tungstenite::accept_async` accepts incoming connections; the
-# test fixture (`tests/common/echo_server.rs`) binds a TcpListener on
+# test fixture (`tests/common/mod.rs`) binds a TcpListener on
 # 127.0.0.1:0 and echoes binary frames. ql-collab dev-dep gives
 # CollabSession + PeerId for the round-trip integration test.
 ql-collab         = { path = "../ql-collab" }

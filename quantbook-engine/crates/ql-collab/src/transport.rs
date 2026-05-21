@@ -56,7 +56,8 @@
 //! 13 integration tests including 3 that verify the V2 V2 and
 //! V2 V3 step 1-3 contracts hold over a real WebSocket. See
 //! `ql-collab-ws` module docs for V1 limitations deferred to V2 V4
-//! (TLS, auto-reconnect, bounded queue, server side).
+//! (TLS, auto-reconnect, bounded queue, server side, inbound
+//! text/ping/pong frame dropping).
 //!
 //! **Phase 5.5 V2 V3 remaining (pending):** full-arc megaudit
 //! (step 5) and exit packet (step 6).

@@ -295,9 +295,9 @@ Phase 5 V1 added **91 net tests** to the engine.
   WebSocket (auto-flush round-trip, offline-reattach delivery,
   partial-state on server close). V1 limitations deferred to V2 V4
   (TLS via rustls feature, bounded backpressure, `ReconnectingWebSocketTransport`
-  wrapper, server-side `ql-collab-ws-server` sibling crate). Crate
-  NOT added to `default-members` — keeps `cargo build` lean; tests
-  still run via `--workspace`.
+  wrapper, server-side `ql-collab-ws-server` sibling crate, inbound
+  text/ping/pong frame dropping). Crate NOT added to `default-members`
+  — keeps `cargo build` lean; tests still run via `--workspace`.
 
 - **Phase 5.5 V2 V3 steps 5-6 — Megaudit + exit packet.** Step 5:
   full-arc 3-way megaudit (Codex + Opus-A + Opus-B per Phase 5.3
