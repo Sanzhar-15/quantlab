@@ -259,6 +259,23 @@ pub enum AutoFlushPolicy {
     /// only fan to ONE transport per session. V2 V3 step 4
     /// (WebSocket + multi-transport routing) may add per-transport
     /// fanout.
+    ///
+    /// **V1 bandwidth cost — symmetric-OnAppend 2× wire amplification
+    /// (V2 V3 step 5 megaudit closure, Opus-B M6, 2026-05-21)**: in a
+    /// symmetric 2-peer pairing (A↔B both OnAppend), every appended
+    /// op pays a round-trip duplicate wire cost. Trace: A.append →
+    /// flush sends to B → B.poll_remote drains → B.maybe_auto_flush
+    /// fires (B's VV advanced) → B sends the merged delta (containing
+    /// A's op) BACK to A → A.poll_remote drains → A.merge_bytes
+    /// Loro-dedupes → A's VV unchanged → A.maybe_auto_flush
+    /// idempotency-short-circuits (no further send). The loop
+    /// terminates correctly (no echo loop, the V2 V3 step 1 idempotency
+    /// guard prevents it), but each op costs 2× wire upload on average.
+    /// For multi-peer mesh topologies, the amplification compounds —
+    /// V2 V4 per-transport baselines (one `last_flushed_vv` per
+    /// attached transport instead of per-session) will close this.
+    /// V1-accepted cost; documented in case IDE consumers see "double
+    /// bandwidth in network profiler" and need to know it's by design.
     OnAppend,
 }
 
@@ -674,6 +691,16 @@ impl CollabSession {
     /// **Phase 5.5 V2 V1 (2026-05-19):** detach the current
     /// transport. Returns it for caller cleanup; returns `None`
     /// if no transport was attached.
+    ///
+    /// **V2 V3 step 5 megaudit closure (Opus-A M3, 2026-05-21):**
+    /// the returned `Box` owns the transport's background tasks
+    /// (e.g., `WebSocketTransport`'s reader + writer). Drop the box
+    /// to release them — holding it past the reconnect handshake
+    /// keeps the old TCP socket alive + the old `last_error()`
+    /// reachable. The typical pattern is `let _ = session.detach_transport();`
+    /// before attaching a new one.
+    #[must_use = "drop the returned transport to release its background tasks; \
+                  holding it past detach keeps the old TCP socket alive"]
     pub fn detach_transport(&mut self) -> Option<Box<dyn Transport + Send>> {
         // Phase 5.5 V2 V3 step 1: orphaned VV is meaningless. Clear so
         // a subsequent `attach_transport` lands on a clean baseline.
@@ -685,6 +712,26 @@ impl CollabSession {
     /// currently attached.
     pub fn has_transport(&self) -> bool {
         self.transport.is_some()
+    }
+
+    /// **Phase 5.5 V2 V3 step 5 megaudit closure (Opus-A H1,
+    /// 2026-05-21):** proxy through to the attached transport's
+    /// [`Transport::last_error`]. Returns `None` if no transport is
+    /// attached OR the transport reports no error.
+    ///
+    /// Use for IDE reconnect handshakes: after observing
+    /// `Err(CollabSessionError::Transport(TransportError::Closed))`
+    /// from any mutator or `flush_*_to_transport` call, query this
+    /// to distinguish the underlying cause (e.g., `WebSocketTransport`
+    /// surfaces `"peer reset"` vs `"capacity exceeded"`). Choose the
+    /// retry strategy accordingly — e.g., immediate reconnect for
+    /// transient I/O vs auth-prompt for `HandshakeFailed("401")`.
+    ///
+    /// Returns `Option<String>` (lossy) to keep `Transport` trait-
+    /// dyn-compatible without leaking impl-specific error types
+    /// across the public API.
+    pub fn transport_last_error(&self) -> Option<String> {
+        self.transport.as_ref().and_then(|t| t.last_error())
     }
 
     /// **Phase 5.5 V2 V2 (2026-05-21):** set the auto-flush policy
@@ -910,6 +957,37 @@ impl CollabSession {
     /// - `CollabSessionError::Transport` on `send` failure (Closed, Io).
     /// - `last_flushed_vv` is NOT updated on `Err` — a retry sends
     ///   the same delta the failed call would have sent.
+    ///
+    /// # Delivery semantics — queued vs acked
+    ///
+    /// **V2 V3 step 5 megaudit closure (Codex M1 + Opus-B M1,
+    /// 2026-05-21):** "successful flush" means
+    /// [`Transport::send`] returned `Ok` — which, per the trait
+    /// contract, means bytes are **queued for send** to the currently-
+    /// attached transport. For buffered async impls
+    /// (`WebSocketTransport`), the bytes sit in an internal mpsc
+    /// channel until the background writer task pushes them to the
+    /// WebSocket sink. **`last_flushed_vv` advances at queue-success,
+    /// not at wire-delivery confirmation.**
+    ///
+    /// Concrete consequences:
+    /// - `has_pending_flush() == false` AFTER a successful flush means
+    ///   "queued to the currently-attached transport," NOT "the peer
+    ///   has received the ops."
+    /// - If the transport is dropped between queue and wire (e.g., tab
+    ///   close, app shutdown, transport panic), the in-flight bytes
+    ///   are lost silently and the peer never receives them.
+    /// - Recovery from transport drop is the same as recovery from
+    ///   `Err(Closed)`: detach + reattach a new transport. The V2 V3
+    ///   step 1 baseline-reset re-sends from empty VV — all ops are
+    ///   redelivered, including the previously-"flushed" ones the
+    ///   prior transport never put on the wire.
+    ///
+    /// For IDE consumers building "safe to close window?" workflows,
+    /// the `has_pending_flush() == false` signal is insufficient on
+    /// its own — combine with a peer-side ack or wait-for-quiescence
+    /// strategy. V2 V4 will add an explicit ack-channel API for true
+    /// end-to-end delivery confirmation (V2 V4 backlog Tier K1).
     pub fn flush_delta_to_transport(&mut self) -> Result<bool, CollabSessionError> {
         if self.transport.is_none() {
             return Ok(false);
@@ -2332,7 +2410,7 @@ mod tests {
         assert_eq!(tx_b2.pending_recv(), 1, "second cycle: 1 blob in tx_b2");
         // tx_b1 unaffected by the second cycle.
         assert_eq!(tx_b1.pending_recv(), 1, "tx_b1 isolated from second attach");
-        s.detach_transport();
+        let _ = s.detach_transport();
     }
 
     #[test]

@@ -557,6 +557,71 @@ verify the fix works empirically.
 
 ---
 
+## Tier K — PHASE 5.5 V2 V3 STEP 5 MEGAUDIT EXTENSIONS (deferred to V2 V4)
+
+**Source:** Phase 5.5 V2 V3 step 5 megaudit (Codex + Opus-A + Opus-B, 2026-05-21). See `docs/audits/2026-05-21-phase-5-5-v2-v3-step-5-{codex,opus-a,opus-b}.md`.
+
+**Context:** the 3-way megaudit caught **cumulative-state issues** invisible at per-step level. The convergent finding (Codex M1 + Opus-B M1) — queued-vs-acked semantics — is documented in V2 V3 step 5 closure but the structural fix (an ack channel) is V2 V4 work. Other Tier K items are forward-leaning architecture/observability features the step 5 closure documented or sidelined.
+
+### K1. Ack channel for end-to-end delivery confirmation
+
+- **Source:** V2 V3 step 5 megaudit Codex M1 + Opus-B M1 (convergent).
+- **Problem:** `last_flushed_vv` advances when `Transport::send` returns Ok (= queued to mpsc), not when bytes hit the wire. For buffered async impls (`WebSocketTransport`), this leaves a window where the consumer believes "synced" but the writer task could fail / be aborted / panic before transmission. The V2 V3 step 5 closure documents this in `Transport::send` + `flush_delta_to_transport` docs; the structural fix is deferred here.
+- **V2 V4 closure:** add an explicit ack-channel API. Two shapes considered:
+  1. `Transport::ack_pending(&mut self) -> impl Future<Output = Result<(), TransportError>>` — caller awaits until transport confirms delivery. Requires async-fn-in-trait or a separate trait. Breaking change.
+  2. `Transport::flush_pending(&mut self) -> Result<(), TransportError>` — drains internal buffer synchronously (for WS: drain mpsc + await writer task's progress with a timeout). Backwards-compatible if added with default `Ok(())`.
+- **Consumer pattern after closure:** `session.flush_delta_to_transport()?; if let Some(t) = session.transport_mut() { t.ack_pending().await?; }` — then `has_pending_flush()=false` truly means peer-acked.
+
+### K2. Mid-drop bytes-lost test pinning
+
+- **Source:** V2 V3 step 5 megaudit Opus-B M1.
+- **Problem:** the in-flight-bytes-lost-on-drop behavior is documented but no test pins it as ACCEPTED behavior. A future refactor that accidentally "fixes" this (e.g., switches to a synchronous transport that drains on drop) would silently change observable semantics.
+- **V2 V4 closure:** add a test that explicitly enqueues a send, drops the transport, attaches a fresh transport, and verifies the bytes were retransmitted on reconnect (i.e., V2 V3 step 1 baseline-reset recovers — the documented recovery path).
+
+### K3. EchoServer tokio::sync::Mutex migration risk
+
+- **Source:** V2 V3 step 5 megaudit Opus-B M5.
+- **Problem:** `EchoServer::accept_task` pushes per-conn handles to `Arc<Mutex<Vec<JoinHandle>>>`. Current `std::sync::Mutex` is sync-acquire and benign with `accept_task.abort()`. A future migration to `tokio::sync::Mutex` (idiomatic for async) would introduce an await between spawn and push, opening a genuine race window where conn tasks land in the vec AFTER drop's drain → leaked tokio tasks past test end → runtime hang on drop.
+- **V2 V4 closure:** add a comment at the accept-loop site noting `std::sync::Mutex` is load-bearing; if migrated, introduce a oneshot/Notify barrier to signal accept loop quiescence before drop's drain.
+
+### K4. Large-blob chunking / bounded queue
+
+- **Source:** V2 V3 step 5 megaudit Opus-A M4 (consumer concern) + Opus-B M1 (defensive).
+- **Problem:** `WebSocketTransport`'s outbound mpsc is unbounded. A post-attach explicit flush of a multi-MB Loro delta sits in mpsc memory until the writer task drains it. Memory pressure on small devices; no chunking strategy.
+- **V2 V4 closure:** combined with V2 V3 step 3 Tier I1 (`pending_op_count`) + V2 V4 bounded backpressure. See K1 ack channel for the related delivery-confirmation work.
+
+### K5. WebSocketError Send+Sync compile-time assert
+
+- **Source:** V2 V3 step 5 megaudit Opus-B L4.
+- **Problem:** `_ASSERT_WEBSOCKET_TRANSPORT_SEND` pins the transport. `WebSocketError` is implicitly `Send + Sync` because all fields are `String`. A future refactor adding `Arc<dyn FnOnce>` etc. would silently break cross-thread `last_error()` consumers.
+- **V2 V4 closure:** add `assert_send_sync::<WebSocketError>()` to the existing assert block. One line.
+
+### K6. Debug includes `last_error.is_some()`
+
+- **Source:** V2 V3 step 5 megaudit Opus-B L2.
+- **Problem:** `WebSocketTransport`'s `Debug` impl shows `closed`, `writer_finished`, `reader_finished` but not `last_error.is_some()`. For diagnostics in a closed-state transport, knowing the error slot has a value matters more than the booleans.
+- **V2 V4 closure:** add `.field("last_error_present", &self.last_error().is_some())` to the Debug impl.
+
+### K7. Empty Binary frame test pinning
+
+- **Source:** V2 V3 step 5 megaudit Opus-B L3.
+- **Problem:** `Message::Binary(b"")` is forwarded to `CollabSession::merge_bytes(&[])` → `OpLog::merge_bytes(&[])` → `LoroDoc::import(&[])`. Loro's behavior on empty input is not test-pinned; a future Loro upgrade could change it.
+- **V2 V4 closure:** add a unit test pinning `OpLog::merge_bytes(&[])` returns Ok with no state change.
+
+### K8. `poll_remote_with_limit` auto-flush-on-error semantic
+
+- **Source:** V2 V3 step 5 megaudit Codex L1.
+- **Problem:** if `merge_bytes` on a later blob errors after earlier blobs merged, `current_vv` advanced but the post-loop `maybe_auto_flush` is skipped (early return on `?`). Not a false-synced state (`last_flushed_vv` unchanged → `has_pending_flush()=true`), but a contract caveat for "step 2 auto-flushes after non-empty drain."
+- **V2 V4 closure:** decide whether to (a) document precisely ("after non-empty drain that reaches loop end or Closed-as-EOF break") or (b) refactor to invoke `maybe_auto_flush` in a `Drop` guard on the merged-counter so it fires even on early Err return.
+
+### K9. Documentation of detach_transport reuse pattern
+
+- **Source:** V2 V3 step 5 megaudit Opus-A M3.
+- **Problem:** The `#[must_use]` attribute (added in step 5 closure) nudges consumers to drop the returned Box. But the docstring doesn't show the recommended reconnect-handshake pattern. Belongs in the consumer doc rewrite.
+- **V2 V4 closure:** absorbed by Phase 5.5 V2 V3 step 6 exit packet's consumer doc rewrite.
+
+---
+
 ## Cycle / discipline note
 
 Phase 4.11 + 4.12 megaudits ran ~15 plan-implement-audit cycles

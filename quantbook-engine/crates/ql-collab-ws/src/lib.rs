@@ -98,6 +98,85 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
+/// **V2 V3 step 5 megaudit closure (Opus-B M2, 2026-05-21):**
+/// panic-safe task-exit guard. Held by the writer/reader tasks; its
+/// `Drop` impl runs even on panic-unwinding. If the task exits
+/// without calling [`Self::mark_clean_exit`], the guard treats it as
+/// an unexpected exit (panic) and sets `closed = true` + records a
+/// `RuntimeError` describing the panic.
+///
+/// Without this guard, a panic in `ws_sink.send`, `bytes.into()`, or
+/// any future inner code would leave the transport in `closed=false`
+/// with the task gone — callers would poll `try_recv` forever
+/// returning `Ok(None)` and `send` would queue bytes into an
+/// orphaned mpsc.
+struct TaskExitGuard {
+    task_name: &'static str,
+    closed: Arc<AtomicBool>,
+    last_error: Arc<Mutex<Option<WebSocketError>>>,
+    clean: bool,
+}
+
+impl TaskExitGuard {
+    fn new(
+        task_name: &'static str,
+        closed: Arc<AtomicBool>,
+        last_error: Arc<Mutex<Option<WebSocketError>>>,
+    ) -> Self {
+        Self {
+            task_name,
+            closed,
+            last_error,
+            clean: false,
+        }
+    }
+
+    /// Call before the task body exits via any normal path
+    /// (Err arm, stream-end, clean recv-None). Skipping this
+    /// is the signal that the task panicked.
+    fn mark_clean_exit(mut self) {
+        self.clean = true;
+    }
+}
+
+impl Drop for TaskExitGuard {
+    fn drop(&mut self) {
+        if !self.clean {
+            // Panic path: stash the panic signal in last_error
+            // BEFORE setting closed (so a concurrent reader sees
+            // the error first). Per CLAUDE.md no-fallback rule,
+            // surface the panic loudly rather than swallowing.
+            record_runtime_error(
+                &self.last_error,
+                format!("ql-collab-ws {} task panicked", self.task_name),
+            );
+            self.closed.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// **V2 V3 step 5 megaudit closure (Opus-B M3, 2026-05-21):** surface
+/// poisoned-mutex condition as a `RuntimeError` rather than the
+/// previous `.lock().ok()` swallow. A poisoned mutex means a holder
+/// panicked while populating the slot — the caller deserves to know
+/// the slot's most-recent error was lost.
+fn record_runtime_error(slot: &Arc<Mutex<Option<WebSocketError>>>, message: String) {
+    match slot.lock() {
+        Ok(mut guard) => {
+            *guard = Some(WebSocketError::RuntimeError(message));
+        }
+        Err(poisoned) => {
+            // Recover the inner mutex despite poison; overwrite with
+            // a message that explicitly notes the poisoning so the
+            // caller can detect a prior panic-during-error-stash.
+            let mut guard = poisoned.into_inner();
+            *guard = Some(WebSocketError::RuntimeError(format!(
+                "{message} (note: error slot mutex was poisoned by prior panic)"
+            )));
+        }
+    }
+}
+
 /// Errors emitted by [`WebSocketTransport`].
 ///
 /// Distinguishes connect-time errors (`InvalidUrl`, `ConnectFailed`,
@@ -257,16 +336,28 @@ impl WebSocketTransport {
         // the WS sink. Exits on outbound_rx close (caller dropped
         // outbound_tx, which happens when WebSocketTransport drops)
         // OR on sink error.
+        //
+        // **V2 V3 step 5 megaudit closure (Opus-B M2, 2026-05-21):**
+        // wrap the body in a TaskExitGuard so panic-unwinding
+        // sets `closed = true` + records a Panic error. Without
+        // this, a panic in `ws_sink.send`/`bytes.into()` leaves the
+        // transport in `closed=false` state with the writer task
+        // gone — callers send-loop forever returning Ok-but-discarded
+        // bytes.
         let writer_task = tokio::spawn(async move {
+            let _guard = TaskExitGuard::new(
+                "writer",
+                Arc::clone(&closed_writer),
+                Arc::clone(&last_error_writer),
+            );
             while let Some(bytes) = outbound_rx.recv().await {
                 if let Err(e) = ws_sink.send(Message::Binary(bytes.into())).await {
                     // V2 V3 step 4 audit closure (Opus M1): stash the
                     // tungstenite error string so callers can read it
                     // via last_error() after seeing TransportError::Closed.
-                    if let Ok(mut slot) = last_error_writer.lock() {
-                        *slot = Some(WebSocketError::RuntimeError(e.to_string()));
-                    }
+                    record_runtime_error(&last_error_writer, e.to_string());
                     closed_writer.store(true, Ordering::Relaxed);
+                    _guard.mark_clean_exit();
                     return;
                 }
             }
@@ -278,23 +369,51 @@ impl WebSocketTransport {
             // the Drop impl. Reachable from a future "soft close" API
             // that detaches outbound_tx explicitly.
             let _ = ws_sink.close().await;
+            _guard.mark_clean_exit();
         });
 
         // Reader task: polls WS stream; pushes binary payloads into
         // inbound mpsc. Exits on stream end, error, or Close frame.
         let reader_task = tokio::spawn(async move {
+            let _guard = TaskExitGuard::new(
+                "reader",
+                Arc::clone(&closed_reader),
+                Arc::clone(&last_error_reader),
+            );
             while let Some(msg_result) = ws_stream.next().await {
                 match msg_result {
                     Ok(Message::Binary(bytes)) => {
                         if inbound_tx.send(bytes.to_vec()).is_err() {
                             // Receiver dropped (WebSocketTransport
-                            // dropped) — exit cleanly.
+                            // dropped) — exit cleanly. Set closed
+                            // for state-machine symmetry (Opus-B L1).
+                            closed_reader.store(true, Ordering::Relaxed);
+                            _guard.mark_clean_exit();
                             return;
                         }
                     }
-                    Ok(Message::Close(_)) => {
-                        // Graceful peer close — leave last_error None.
+                    Ok(Message::Close(frame)) => {
+                        // **V2 V3 step 5 megaudit closure (Opus-B M4
+                        // + Codex L2, 2026-05-21):** capture the
+                        // close-frame code+reason if present. Empty
+                        // / missing CloseFrame stays last_error=None
+                        // for graceful close; populated CloseFrame
+                        // surfaces the application-level signal
+                        // (e.g., "session expired, please reauth").
+                        if let Some(cf) = frame {
+                            if !cf.reason.is_empty() || u16::from(cf.code) != 1000 {
+                                record_runtime_error(
+                                    &last_error_reader,
+                                    format!(
+                                        "peer close frame: code={}, reason={}",
+                                        u16::from(cf.code),
+                                        cf.reason
+                                    ),
+                                );
+                            }
+                        }
                         closed_reader.store(true, Ordering::Relaxed);
+                        _guard.mark_clean_exit();
                         return;
                     }
                     Ok(
@@ -307,16 +426,24 @@ impl WebSocketTransport {
                         // V2 V3 step 4 audit closure (Opus M1): stash
                         // the tungstenite error so callers can
                         // distinguish runtime causes via last_error().
-                        if let Ok(mut slot) = last_error_reader.lock() {
-                            *slot = Some(WebSocketError::RuntimeError(e.to_string()));
-                        }
+                        record_runtime_error(&last_error_reader, e.to_string());
                         closed_reader.store(true, Ordering::Relaxed);
+                        _guard.mark_clean_exit();
                         return;
                     }
                 }
             }
-            // Stream ended (peer closed) — mark closed.
+            // **V2 V3 step 5 megaudit closure (Codex L2 + Opus-B M4,
+            // 2026-05-21):** stream ended without a Close frame.
+            // Distinguishable from clean caller-close (last_error
+            // stays None) and from explicit Close frame (last_error
+            // populated above if frame had reason or non-1000 code).
+            record_runtime_error(
+                &last_error_reader,
+                "peer stream ended without close frame".to_string(),
+            );
             closed_reader.store(true, Ordering::Relaxed);
+            _guard.mark_clean_exit();
         });
 
         Ok(Self {
@@ -351,8 +478,16 @@ impl WebSocketTransport {
     /// the right user-facing message and backoff strategy.
     ///
     /// Returns a clone (cheap — `WebSocketError` is small + `Clone`).
+    ///
+    /// **V2 V3 step 5 megaudit closure (Opus-B M3, 2026-05-21):**
+    /// poisoned mutex no longer silently returns `None`. Recovers
+    /// the inner via `PoisonError::into_inner()` so the slot's
+    /// most-recent contents stay readable across the poison boundary.
     pub fn last_error(&self) -> Option<WebSocketError> {
-        self.last_error.lock().ok().and_then(|guard| guard.clone())
+        match self.last_error.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     /// Explicitly mark this transport closed. Subsequent
@@ -434,6 +569,22 @@ impl Transport for WebSocketTransport {
                 Err(TransportError::Closed)
             }
         }
+    }
+
+    /// **V2 V3 step 5 megaudit closure (Opus-A H1, 2026-05-21):**
+    /// override the default `None` to expose the runtime-error cause
+    /// through the trait so [`ql_collab::CollabSession::transport_last_error`]
+    /// can reach it after `attach_transport` consumes the concrete
+    /// type into `Box<dyn Transport + Send>`.
+    ///
+    /// Returns the underlying [`WebSocketError`]'s `Display` string.
+    /// Consumers wanting to discriminate handshake/connect/runtime
+    /// reasons can pattern-match on substrings or use the prefix
+    /// (`"WebSocket runtime error: ..."`) to detect the variant —
+    /// for stronger typing keep a parallel reference to the concrete
+    /// transport before attach.
+    fn last_error(&self) -> Option<String> {
+        Self::last_error(self).map(|e| e.to_string())
     }
 }
 

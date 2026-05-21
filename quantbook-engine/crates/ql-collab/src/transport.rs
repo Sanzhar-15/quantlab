@@ -114,6 +114,25 @@ pub trait Transport {
     /// internally; the call returns when the bytes are
     /// **queued for send**, not when the remote has received them.
     ///
+    /// **V2 V3 step 5 megaudit closure (Codex M1 + Opus-B M1,
+    /// 2026-05-21):** for buffered impls (`WebSocketTransport` and
+    /// future async transports), there is a window between "send
+    /// returned Ok" and "bytes on the wire" where the bytes can be
+    /// silently lost (transport dropped, peer disconnect mid-flush,
+    /// allocator failure during the writer task). The session's
+    /// [`crate::CollabSession::flush_delta_to_transport`] advances
+    /// `last_flushed_vv` immediately on `send`'s Ok return, so
+    /// `has_pending_flush() == false` means "queued to the currently-
+    /// attached transport," NOT "the peer has received the ops." If
+    /// you need stronger delivery guarantees, the V2 V3 V1 substrate
+    /// recommends: (1) keep the transport attached until you've
+    /// verified peer reception out-of-band (e.g., received a
+    /// peer-side ack); (2) on transport drop or `Err(Closed)`,
+    /// detach + reattach a new transport — the V2 V3 step 1
+    /// baseline-reset contract re-sends from empty VV. V2 V4 will
+    /// add an explicit ack-channel API for true end-to-end delivery
+    /// confirmation.
+    ///
     /// On error, the caller should treat the byte blob as unsent
     /// and re-queue (or surface the error to the user). The
     /// transport will not retry automatically — that policy lives
@@ -131,6 +150,35 @@ pub trait Transport {
     /// transient I/O failure during poll surfaces as
     /// `Err(TransportError::Io)`.
     fn try_recv(&mut self) -> Result<Option<Vec<u8>>, TransportError>;
+
+    /// Read the most recent transport-internal error, if any. Default
+    /// returns `None` for impls without a runtime-error concept
+    /// (`NoopTransport`, `LoopbackTransport`). Buffered async impls
+    /// (`WebSocketTransport`) override to expose the underlying cause
+    /// of the most recent task-observed failure.
+    ///
+    /// **V2 V3 step 5 megaudit closure (Opus-A H1, 2026-05-21):** the
+    /// V2 V3 step 4 closure added `WebSocketTransport::last_error()`
+    /// on the concrete type for IDE consumers driving reconnect
+    /// handshakes — but `CollabSession::attach_transport` moves the
+    /// concrete type into `Box<dyn Transport + Send>`, making it
+    /// unreachable. Lifting the accessor to the trait + adding
+    /// [`crate::CollabSession::transport_last_error`] proxy is the
+    /// minimum-viable fix: IDE callers can now distinguish "peer
+    /// reset" from "auth rejected" from "capacity exceeded" without
+    /// downcasting or holding a parallel handle.
+    ///
+    /// Returns `Option<String>` (lossy) rather than a structured
+    /// error type to keep the trait minimal and avoid leaking
+    /// impl-specific types (`WebSocketError`, etc.). Consumers
+    /// pattern-match on substring or just display the message.
+    ///
+    /// Read AFTER observing [`TransportError::Closed`] from `send`
+    /// or `try_recv`. Returns `None` for clean shutdowns (caller
+    /// `close()`, graceful peer Close frame, transport never failed).
+    fn last_error(&self) -> Option<String> {
+        None
+    }
 }
 
 /// No-op `Transport` impl for tests + scaffolding.

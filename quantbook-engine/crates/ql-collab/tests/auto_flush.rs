@@ -939,7 +939,7 @@ fn attach_transport_resets_last_flushed_vv() {
 
     // Now append more ops, detach, and reattach a FRESH transport.
     s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
-    s.detach_transport();
+    let _ = s.detach_transport();
     s.attach_transport(tx_a2);
 
     // The next delta flush MUST send EVERYTHING (both ops) because
@@ -1068,7 +1068,7 @@ fn delta_flush_failure_does_not_advance_vv_so_retry_resends() {
     // last_flushed_vv NOT advanced — but we can't easily inspect it
     // directly (private field). Instead, retry with a fresh
     // (working) transport and assert the bytes sent contain the op.
-    s.detach_transport();
+    let _ = s.detach_transport();
     let (tx_a, mut tx_b) = LoopbackTransport::pair();
     s.attach_transport(tx_a);
     // attach_transport resets last_flushed_vv to None, so this

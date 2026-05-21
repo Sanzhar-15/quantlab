@@ -517,6 +517,114 @@ fn last_error_populated_after_peer_disconnect() {
 }
 
 #[test]
+fn peer_disconnect_always_populates_last_error_step_5_closure() {
+    // **V2 V3 step 5 megaudit closure (Codex L2 + Opus-B M4):** the
+    // prior step-4 behavior left last_error=None for both clean
+    // caller-close AND for stream-end-None (peer dropped TCP without
+    // a Close frame). Closure: stream-end now populates a sentinel
+    // RuntimeError("peer stream ended without close frame") so
+    // callers can distinguish. (Clean caller-close still leaves
+    // last_error=None per the contract.)
+    let rt = runtime();
+    rt.block_on(async {
+        let server = EchoServer::start().await;
+        let mut ws = WebSocketTransport::connect(&server.url())
+            .await
+            .expect("handshake");
+
+        drop(server);
+
+        // Wait for reader to observe disconnect.
+        for _ in 0..50 {
+            match ws.try_recv() {
+                Ok(None) => tokio::time::sleep(Duration::from_millis(20)).await,
+                Ok(Some(_)) => continue,
+                Err(TransportError::Closed) => break,
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+
+        let err = ws.last_error();
+        assert!(
+            err.is_some(),
+            "peer disconnect MUST populate last_error post-step-5 (was previously possibly None)"
+        );
+        let msg = format!("{err:?}");
+        // The message should hint at either an Err arm (tungstenite
+        // string) or the new stream-end sentinel.
+        assert!(
+            msg.contains("RuntimeError"),
+            "last_error must be RuntimeError variant, got {msg}"
+        );
+    });
+}
+
+// =============================================================
+// V2 V3 step 5 megaudit closure — transport_last_error proxy
+// =============================================================
+
+#[test]
+fn collab_session_transport_last_error_proxies_through_websocket() {
+    // **V2 V3 step 5 megaudit closure (Opus-A H1):** pin the
+    // contract that `CollabSession::transport_last_error()` reaches
+    // through to `WebSocketTransport::last_error()` after the
+    // session has consumed the concrete type into Box<dyn>.
+    let rt = runtime();
+    rt.block_on(async {
+        let server = EchoServer::start().await;
+        let ws = WebSocketTransport::connect(&server.url())
+            .await
+            .expect("handshake");
+
+        let mut session = CollabSession::new(PeerId::new(1)).expect("session");
+
+        // Before attach: no transport, proxy returns None.
+        assert_eq!(session.transport_last_error(), None);
+
+        session.attach_transport(ws);
+
+        // After attach but before any error: still None.
+        assert_eq!(session.transport_last_error(), None);
+
+        // Drop server: reader observes disconnect, populates
+        // last_error. Then transport_last_error() through the
+        // session reaches it.
+        drop(server);
+
+        // Wait for reader to populate via a poll cycle.
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = session.poll_remote();
+            if session.transport_last_error().is_some() {
+                break;
+            }
+        }
+
+        let proxied = session.transport_last_error();
+        assert!(
+            proxied.is_some(),
+            "CollabSession::transport_last_error MUST reach the WS's last_error after disconnect"
+        );
+        let msg = proxied.unwrap();
+        assert!(
+            msg.starts_with("WebSocket runtime error:"),
+            "proxied error should be the WebSocketError Display, got: {msg}"
+        );
+    });
+}
+
+#[test]
+fn transport_last_error_returns_none_when_no_transport_attached() {
+    // **V2 V3 step 5 megaudit closure (Opus-A H1):** even with no
+    // transport ever attached, the proxy is callable and returns
+    // None. IDE consumers querying the accessor in the "Offline"
+    // workflow state shouldn't panic.
+    let session = CollabSession::new(PeerId::new(1)).expect("session");
+    assert!(!session.has_transport());
+    assert_eq!(session.transport_last_error(), None);
+}
+
+#[test]
 fn collab_session_websocket_send_after_close_surfaces_closed() {
     // Auto-flush + closed transport partial-state contract: V2 V3
     // step 1+2 behavior must hold for WS. Local op commits; send
