@@ -542,7 +542,7 @@ The full v1 means all of these crates either ship real behavior or have a docume
 
 ## Phase 5 - Multi-User CRDT Collaboration
 
-**Status (2026-05-21): Phase 5 V1 + D-1 + 5.3 + 5.5 V2 V2 + 5.5 V2 V3 steps 1-2 COMPLETE.** Canonical records: `docs/phase5/v1-exit-packet.md` (V1) + `docs/phase5/d-1-exit-packet.md` (D-1 closure) + `docs/phase5/5-3-exit-packet.md` (5.3 closure). Remaining: 5.5 V2 V3 steps 3-6 (offline-write queue + WebSocket impl + megaudit + exit packet), 5.7 IDE slice, 5.8 Phase 5 megaudit (separate).
+**Status (2026-05-21): Phase 5 V1 + D-1 + 5.3 + 5.5 V2 V2 + 5.5 V2 V3 steps 1-3 COMPLETE.** Canonical records: `docs/phase5/v1-exit-packet.md` (V1) + `docs/phase5/d-1-exit-packet.md` (D-1 closure) + `docs/phase5/5-3-exit-packet.md` (5.3 closure). Remaining: 5.5 V2 V3 steps 4-6 (WebSocket impl + megaudit + exit packet), 5.7 IDE slice, 5.8 Phase 5 megaudit (separate).
 
 **Purpose:** Turn collaboration from a single-writer op log into real multi-user CRDT state for sheets, cells, names, tables, presence, undo/redo, and offline sync.
 
@@ -583,8 +583,9 @@ The full v1 means all of these crates either ship real behavior or have a docume
    - V2 V1 (`ffd8f6e5f05`): `CollabSession::{attach,detach,has}_transport` + `flush_to_transport` + `poll_remote` (+ `_with_limit`). Explicit-drive.
    - V2 V2 (`51748b02944` ship + `b7aa4cb7bb9` audit-closure): `AutoFlushPolicy::{Disabled, OnAppend}` enum. Default `Disabled` (V2 V1 behavior); `OnAppend` triggers flush after every mutator.
    - V2 V3 step 1 (`603bdc9aa6c` ship + `e5ff11d549a` audit-closure): per-transport version-vector tracking + `CollabSession::flush_delta_to_transport` using `LoroDoc::ExportMode::Updates`. Auto-flush reroutes through the delta path. Idempotency short-circuit closes V2 V2 audit echo-loop class. New `OpLog` API: `oplog_vv()` + `export_delta_bytes(&VersionVector)`.
-   - **V2 V3 step 2 ✅ SHIPPED 2026-05-21**: wires `poll_remote*` into auto-flush. One flush per drain batch (not per-blob). V2 V3 step 1's idempotency guard prevents echo loops — duplicate (Loro-deduped) merges leave the VV unchanged → flush short-circuits to `Ok(false)`. Reverses the V2 V2 audit-locked "receive-side excluded" exclusion. 3-peer hub fanout now works automatically under `OnAppend`.
-   - V2 V3 steps 3-6 pending: offline-write queue (step 3) + WebSocket impl (step 4) + full-arc megaudit (step 5) + exit packet (step 6).
+   - V2 V3 step 2 (`e4e1ce282b1` ship + `fc3de6f99c7` audit-closure): wires `poll_remote*` into auto-flush. One flush per drain batch. Reverses the V2 V2 audit-locked "receive-side excluded" exclusion. 3-peer hub fanout works automatically under `OnAppend`.
+   - **V2 V3 step 3 ✅ SHIPPED 2026-05-21**: offline-write story. Investigation showed no explicit queue needed — Loro's CRDT op log IS the implicit offline queue. Append while no transport returns Ok + commits locally; reattach + flush sends all accumulated ops (delta from empty VV). Adds `CollabSession::has_pending_flush()` ergonomic helper. 7 new tests pin the contract.
+   - V2 V3 steps 4-6 pending: WebSocket impl (step 4) + full-arc megaudit (step 5) + exit packet (step 6).
 
 6. **5.6 Presence And Awareness** ✅ V1 + V2 SHIPPED 2026-05-19.
    - V1 (`c677e244704`): `"presence"` LoroMap + `PresenceState` + 4 CollabSession methods.

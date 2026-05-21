@@ -1,6 +1,6 @@
 ---
 title: Phase 5 V1 exit packet (5.1 → 5.6 V1+V2 + 5.4 V2 V1+V1.1 + 5.5 V2 V1 + D1.a)
-status: ACTIVE — Phase 5 V1 surface complete 2026-05-19. **D-1 SHIPPED 2026-05-20**. **5.3 SHIPPED 2026-05-20**. **5.5 V2 V2 (auto-flush) SHIPPED 2026-05-21**. **5.5 V2 V3 step 1 (version-vector delta flush) SHIPPED 2026-05-21**. **5.5 V2 V3 step 2 (poll_remote auto-flush) SHIPPED 2026-05-21**. See `docs/phase5/d-1-exit-packet.md` + `docs/phase5/5-3-exit-packet.md`. 5.5 V2 V3 steps 3-6 (offline-write queue + WebSocket impl + megaudit + exit packet), 5.7 IDE slice, and 5.8 megaudit remain.
+status: ACTIVE — Phase 5 V1 surface complete 2026-05-19. **D-1 SHIPPED 2026-05-20**. **5.3 SHIPPED 2026-05-20**. **5.5 V2 V2 (auto-flush) SHIPPED 2026-05-21**. **5.5 V2 V3 steps 1+2+3 SHIPPED 2026-05-21** (version-vector delta flush + poll_remote auto-flush + offline-write contract). See `docs/phase5/d-1-exit-packet.md` + `docs/phase5/5-3-exit-packet.md`. 5.5 V2 V3 steps 4-6 (WebSocket impl + megaudit + exit packet), 5.7 IDE slice, and 5.8 megaudit remain.
 date: 2026-05-19
 updated: 2026-05-20 (post-exit-packet additions: 5.6 V2 sweep_presence + D1.a 4-cluster closure + D-1 ALL STEPS SHIPPED)
 predecessor: docs/phase4/exit-packet.md + docs/phase5/entry-plan.md
@@ -21,11 +21,10 @@ Phase 5.2 D-1 (FormatId tagged tuple) ✅ SHIPPED 2026-05-20 — see
 `docs/phase5/d-1-exit-packet.md`. Phase 5.3 conflict resolution
 ✅ SHIPPED 2026-05-20 — see `docs/phase5/5-3-exit-packet.md`.
 Phase 5.5 V2 V2 (auto-flush) ✅ SHIPPED 2026-05-21. Phase 5.5 V2 V3
-step 1 (version-vector delta flush) ✅ SHIPPED 2026-05-21. Phase 5.5
-V2 V3 step 2 (poll_remote auto-flush) ✅ SHIPPED 2026-05-21. Phase 5.5
-V2 V3 steps 3-6 (offline-write queue + WebSocket transport + megaudit
-+ exit packet) + Phase 5.7 IDE vertical slice remain ahead of the
-5.8 megaudit.
+steps 1+2+3 ✅ SHIPPED 2026-05-21 (version-vector delta flush +
+poll_remote auto-flush + offline-write contract). Phase 5.5 V2 V3
+steps 4-6 (WebSocket transport + megaudit + exit packet) + Phase 5.7
+IDE vertical slice remain ahead of the 5.8 megaudit.
 
 ## Acceptance criteria status (Phase 5 V1)
 
@@ -261,21 +260,32 @@ Phase 5 V1 added **91 net tests** to the engine.
   (9 ship + 3 audit-closure). No new external deps.
 
 - **Phase 5.5 V2 V3 step 2 — poll_remote auto-flush.** ✅
-  **SHIPPED 2026-05-21**. Wires `poll_remote*` into auto-flush
-  (one flush per drain batch, not per-blob — bandwidth-efficient).
-  V2 V3 step 1's idempotency guard prevents echo loops; reverses
-  the V2 V2 audit-locked "receive-side excluded" exclusion. 3-peer
-  hub fanout now works automatically under `OnAppend`. 3 new
-  integration tests + 1 inverted test (replacing the V2 V2
-  exclusion-asserting test that documented the now-defunct contract).
-  Partial-state contract on flush Err: documented.
+  **SHIPPED 2026-05-21** (`e4e1ce282b1` + `fc3de6f99c7`
+  audit-closure). Wires `poll_remote*` into auto-flush (one flush
+  per drain batch). V2 V3 step 1's idempotency guard prevents
+  echo loops; reverses the V2 V2 audit-locked "receive-side
+  excluded" exclusion. 3-peer hub fanout works automatically
+  under `OnAppend`. 4 new integration tests (3 ship + 1 closure
+  for partial-state contract). Partial-state contract on flush
+  Err documented + test-pinned.
 
-- **Phase 5.5 V2 V3 steps 3-6 — Production transport.** Step 3:
-  offline-write queue (queue ops when transport detached; flush
-  on reconnect). Step 4: WebSocket transport impl (+ reconnect /
-  offline sync / multi-transport routing). Step 5: full-arc
-  megaudit (3-way Codex+Opus-A+Opus-B per Phase 5.3 step 5
-  precedent). Step 6: V2 V3 exit packet. 2.5-5 days estimated.
+- **Phase 5.5 V2 V3 step 3 — offline-write story.** ✅
+  **SHIPPED 2026-05-21**. Investigation: NO explicit queue needed.
+  Loro's CRDT op log IS the implicit offline queue. Append while
+  no transport attached → `append_op` returns `Ok(())` and commits
+  locally (`maybe_auto_flush` silently no-ops). On reattach,
+  `attach_transport` resets `last_flushed_vv = None`; next mutator
+  or explicit `flush_delta_to_transport` sends delta from empty VV
+  (= ALL accumulated ops including offline ones). NEW ergonomic
+  helper `CollabSession::has_pending_flush() -> bool` for IDE
+  status indicators + reconnect handshake. 7 new integration tests
+  pin the contract. No code change to the wire path.
+
+- **Phase 5.5 V2 V3 steps 4-6 — Production transport.** Step 4:
+  WebSocket transport impl (+ reconnect / offline sync /
+  multi-transport routing). Step 5: full-arc megaudit (3-way
+  Codex+Opus-A+Opus-B per Phase 5.3 step 5 precedent). Step 6:
+  V2 V3 exit packet. 3-4.5 days estimated.
 
 - **Phase 5.7 — IDE vertical slice.** Two-window editing demo.
   1 week. Depends on D-1 + 5.3 + 5.5 V2 V2 (✅) + V2 V3.

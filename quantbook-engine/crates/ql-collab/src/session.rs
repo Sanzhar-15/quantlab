@@ -633,6 +633,30 @@ impl CollabSession {
     /// own ticks. Default policy remains
     /// [`AutoFlushPolicy::Disabled`] so V2 V1 callers see no
     /// behavior change; switch via [`set_auto_flush_policy`].
+    ///
+    /// **Phase 5.5 V2 V3 step 3 (2026-05-21) — offline-write story
+    /// for reconnect**: this method resets `last_flushed_vv` to
+    /// `None` (V2 V3 step 1 contract). A new transport-peer hasn't
+    /// seen any of this session's ops. The next
+    /// [`flush_delta_to_transport`] (or any auto-flushing mutator)
+    /// sends from the empty VV — i.e., ALL local ops including
+    /// those appended while offline. **Loro's CRDT op log IS the
+    /// offline queue; no separate buffer needed.**
+    ///
+    /// **Idiom for explicit reattach-then-sync** (recommended for
+    /// callers that want the new peer to see all state
+    /// immediately, rather than waiting for the next mutator):
+    /// ```ignore
+    /// let _ = session.attach_transport(new_transport);
+    /// if session.has_pending_flush() {
+    ///     session.flush_delta_to_transport()?;
+    /// }
+    /// ```
+    /// `attach_transport` itself does NOT auto-flush — it's a
+    /// lifecycle event, not a mutation, and the existing API
+    /// returns `Option<previous>` rather than `Result<>` (changing
+    /// that would be a breaking V2 V1 API change). Callers needing
+    /// immediate sync trigger it explicitly.
     pub fn attach_transport<T: Transport + Send + 'static>(
         &mut self,
         transport: T,
@@ -701,6 +725,54 @@ impl CollabSession {
     /// policy. Default is [`AutoFlushPolicy::Disabled`].
     pub fn auto_flush_policy(&self) -> AutoFlushPolicy {
         self.auto_flush_policy
+    }
+
+    /// **Phase 5.5 V2 V3 step 3 (2026-05-21):** true iff there
+    /// are local ops in `self.log` that have NOT yet been
+    /// successfully flushed to the currently-attached transport.
+    ///
+    /// Implementation: compares `self.log.oplog_vv()` to
+    /// `self.last_flushed_vv.clone().unwrap_or_default()`. Returns
+    /// `true` when they differ — i.e., either (a) no successful
+    /// flush has occurred yet AND the log is non-empty, OR (b)
+    /// ops have been appended (or merged) since the last
+    /// successful flush.
+    ///
+    /// O(peer-count) — clones two `VersionVector`s and compares.
+    /// Cheap relative to a full flush.
+    ///
+    /// # Use cases
+    ///
+    /// - IDE status indicator: "Synced" vs "Unsynced changes".
+    /// - Reconnect handshake: caller knows whether to fire a
+    ///   manual [`flush_delta_to_transport`] after attach.
+    /// - Offline-mode UI: caller can warn user before navigating
+    ///   away with pending unflushed state.
+    ///
+    /// # What it does NOT distinguish
+    ///
+    /// "No transport attached" vs "all ops flushed" — both return
+    /// `false` from this method (the former because the empty
+    /// `current_vv` of a brand-new session equals the empty
+    /// `last_flushed_vv.unwrap_or_default()`; the latter by
+    /// definition). Combine with [`has_transport`] if the
+    /// distinction matters.
+    ///
+    /// # Offline-write story (Phase 5.5 V2 V3 step 3)
+    ///
+    /// Append while no transport attached: `append_op` succeeds
+    /// (V2 V2 contract — `maybe_auto_flush` returns `Ok(())`
+    /// silently when no transport). The op is committed locally;
+    /// `has_pending_flush()` returns `true`. On
+    /// [`attach_transport`], `last_flushed_vv` resets to `None`.
+    /// The next mutator (or explicit `flush_delta_to_transport`)
+    /// sends the delta from empty VV — i.e., ALL accumulated ops
+    /// including the offline ones. Loro's CRDT op log IS the
+    /// offline queue.
+    pub fn has_pending_flush(&self) -> bool {
+        let current = self.log.oplog_vv();
+        let last = self.last_flushed_vv.clone().unwrap_or_default();
+        current != last
     }
 
     /// **Phase 5.5 V2 V2 (2026-05-21):** internal hook called by every

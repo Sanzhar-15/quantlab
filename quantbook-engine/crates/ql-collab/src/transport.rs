@@ -24,18 +24,26 @@
 //! echo-loop concern. The checkpoint is
 //! per-session-currently-attached-transport, NOT per-transport-
 //! identity (`attach_transport` resets the baseline).
-//! **Phase 5.5 V2 V3 step 2 (2026-05-21, this ship):** wires
-//! `poll_remote*` into auto-flush. After a successful drain
-//! (`merged > 0`), one auto-flush fires per call (not per-blob —
-//! bandwidth-efficient). The V2 V3 step 1 idempotency guard
-//! prevents echo loops: drained bytes that Loro dedupes leave the
-//! VV unchanged → flush short-circuits to `Ok(false)`. The 3-peer
-//! hub-fanout pattern (peer A drains peer B's blob → auto-flushes
-//! merged state onward) now works automatically under `OnAppend`.
-//! Reverses the V2 V2 audit-locked "receive-side excluded" exclusion.
-//! **Phase 5.5 V2 V3 remaining (pending):** offline-write queue
-//! (step 3) + WebSocket impl (step 4) + full-arc megaudit (step 5)
-//! + exit packet (step 6).
+//! **Phase 5.5 V2 V3 step 2 (2026-05-21):** wires `poll_remote*`
+//! into auto-flush. After a successful drain (`merged > 0`), one
+//! auto-flush fires per call (not per-blob — bandwidth-efficient).
+//! V2 V3 step 1's idempotency guard prevents echo loops: drained
+//! bytes that Loro dedupes leave the VV unchanged → flush
+//! short-circuits to `Ok(false)`. 3-peer hub-fanout pattern now
+//! works automatically under `OnAppend`.
+//! **Phase 5.5 V2 V3 step 3 (2026-05-21, this ship):** offline-
+//! write story. Investigation showed no explicit queue is needed:
+//! Loro's CRDT op log IS the implicit offline queue. Append while
+//! no transport attached → `maybe_auto_flush` no-ops; op committed
+//! locally. On reattach: `attach_transport` resets
+//! `last_flushed_vv = None`; the next mutator (or explicit
+//! `flush_delta_to_transport`) sends from empty VV — delivers ALL
+//! accumulated ops including offline ones. Adds
+//! `has_pending_flush() -> bool` ergonomic helper (compares
+//! current VV vs last-flushed VV). 7 new integration tests pin
+//! the offline-write contract.
+//! **Phase 5.5 V2 V3 remaining (pending):** WebSocket impl
+//! (step 4) + full-arc megaudit (step 5) + exit packet (step 6).
 //!
 //! Tests can also use [`NoopTransport`] which discards traffic.
 //!

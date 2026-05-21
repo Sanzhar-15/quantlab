@@ -1335,3 +1335,229 @@ fn symmetric_on_append_two_peers_converge_with_bounded_wire_bytes() {
         "symmetric-OnAppend peers MUST converge to the same op count"
     );
 }
+
+// ============================================================
+// Phase 5.5 V2 V3 step 3 — offline-write story + has_pending_flush
+// ============================================================
+
+#[test]
+fn offline_append_locally_commits_under_on_append_with_no_transport() {
+    // V2 V3 step 3: pin the V2 V2 contract that append_op while no
+    // transport + OnAppend returns Ok (NOT Err) and commits locally.
+    // maybe_auto_flush silently no-ops when self.transport.is_none()
+    // — this IS the offline-write story (Loro's CRDT op log is the
+    // implicit queue).
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    s.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+    assert!(!s.has_transport(), "no transport attached");
+
+    s.append_op(add_sheet()).unwrap();
+    s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+    s.append_op(put_value(0, 1, 0, 2.0)).unwrap();
+
+    assert_eq!(s.op_count(), 3, "all 3 offline appends MUST commit locally");
+    assert!(
+        s.has_pending_flush(),
+        "3 offline ops + no successful flush → has_pending_flush() == true"
+    );
+}
+
+#[test]
+fn offline_appends_flushed_via_first_post_attach_mutator() {
+    // V2 V3 step 3: append 3 ops while offline, attach transport,
+    // do a 4th append. The 4th's auto-flush sends all 4 ops because
+    // last_flushed_vv was reset to None by attach_transport, and
+    // flush_delta_to_transport's None branch sends from empty VV
+    // (= all ops).
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    s.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    // 3 offline appends.
+    s.append_op(add_sheet()).unwrap();
+    s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+    s.append_op(put_value(0, 1, 0, 2.0)).unwrap();
+    assert!(s.has_pending_flush());
+
+    // Attach transport, then do a 4th append.
+    let (tx_a, mut tx_b) = LoopbackTransport::pair();
+    s.attach_transport(tx_a);
+    s.append_op(put_value(0, 2, 0, 3.0)).unwrap();
+
+    // Peer should receive ONE wire blob containing ALL 4 ops.
+    assert_eq!(
+        tx_b.pending_recv(),
+        1,
+        "single post-attach auto-flush fires once after the 4th append"
+    );
+    let bytes = tx_b.try_recv().unwrap().expect("offline-flush bytes");
+    let peer_log = ql_oplog::OpLog::import_bytes(&bytes).unwrap();
+    assert_eq!(
+        peer_log.len(),
+        4,
+        "post-attach flush MUST deliver ALL 4 ops (3 offline + 1 post-attach); got {}",
+        peer_log.len()
+    );
+
+    // has_pending_flush should now be false (last_flushed_vv == current).
+    assert!(
+        !s.has_pending_flush(),
+        "after successful flush, has_pending_flush() == false"
+    );
+}
+
+#[test]
+fn offline_appends_flushed_via_explicit_flush_after_attach() {
+    // Variant of the previous test: instead of a 4th append, the
+    // caller explicitly invokes flush_delta_to_transport after
+    // attach. Same end state — all 3 offline ops delivered.
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    s.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    s.append_op(add_sheet()).unwrap();
+    s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+    s.append_op(put_value(0, 1, 0, 2.0)).unwrap();
+
+    let (tx_a, mut tx_b) = LoopbackTransport::pair();
+    s.attach_transport(tx_a);
+
+    // No 4th append — explicit flush.
+    let sent = s.flush_delta_to_transport().unwrap();
+    assert!(
+        sent,
+        "post-attach explicit flush sends (state advanced from empty VV)"
+    );
+
+    let bytes = tx_b.try_recv().unwrap().expect("explicit-flush bytes");
+    let peer_log = ql_oplog::OpLog::import_bytes(&bytes).unwrap();
+    assert_eq!(
+        peer_log.len(),
+        3,
+        "explicit post-attach flush MUST deliver 3 offline ops"
+    );
+}
+
+#[test]
+fn closed_transport_failed_flush_ops_recoverable_via_reattach() {
+    // V2 V3 step 3 / Scenario B: append while OnAppend + closed
+    // transport → Err(Transport(Closed)); op committed locally;
+    // last_flushed_vv NOT advanced. Recovery: detach + reattach a
+    // working transport + flush → delivers ALL ops (the failed-
+    // flush op + any subsequent).
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    let mut bad = NoopTransport::new();
+    bad.close();
+    s.attach_transport(bad);
+    s.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    // Failed append #1 — Err but op committed locally.
+    let result = s.append_op(add_sheet());
+    assert!(matches!(
+        result,
+        Err(CollabSessionError::Transport(TransportError::Closed))
+    ));
+    assert_eq!(s.op_count(), 1, "failed-flush op IS committed locally");
+    assert!(s.has_pending_flush());
+
+    // Recovery: detach bad, attach working.
+    let _bad = s.detach_transport();
+    let (tx_a, mut tx_b) = LoopbackTransport::pair();
+    s.attach_transport(tx_a);
+
+    // Explicit flush — delivers the failed-flush op.
+    s.flush_delta_to_transport().unwrap();
+    let bytes = tx_b.try_recv().unwrap().expect("recovery-flush bytes");
+    let peer_log = ql_oplog::OpLog::import_bytes(&bytes).unwrap();
+    assert_eq!(
+        peer_log.len(),
+        1,
+        "post-recovery flush MUST deliver the previously-failed op"
+    );
+    assert!(!s.has_pending_flush());
+}
+
+#[test]
+fn has_pending_flush_returns_true_after_offline_append_false_after_flush() {
+    // V2 V3 step 3: pin the helper's contract.
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    s.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    assert!(
+        !s.has_pending_flush(),
+        "fresh empty session: no pending state"
+    );
+
+    s.append_op(add_sheet()).unwrap();
+    assert!(
+        s.has_pending_flush(),
+        "offline append → has_pending_flush() == true"
+    );
+
+    // Attach + flush.
+    let (tx_a, observer) = LoopbackTransport::pair();
+    s.attach_transport(tx_a);
+    s.flush_delta_to_transport().unwrap();
+    let _ = observer;
+
+    assert!(
+        !s.has_pending_flush(),
+        "after successful flush, has_pending_flush() == false"
+    );
+
+    // Append again under OnAppend + attached transport: maybe_auto_flush
+    // fires during append_op AND advances last_flushed_vv → so
+    // has_pending_flush() is false immediately after. The "append → true"
+    // pattern only shows up when policy is Disabled OR transport is
+    // detached between mutators (see has_pending_flush_distinguishes_*
+    // test for the detached case).
+    s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+    assert!(
+        !s.has_pending_flush(),
+        "under OnAppend + attached transport, has_pending_flush is false post-mutator \
+         (auto-flush already advanced last_flushed_vv)"
+    );
+}
+
+#[test]
+fn has_pending_flush_false_on_fresh_session_with_no_state() {
+    // Boundary: brand-new session with no ops, no transport, no
+    // flushes. current_vv is empty (= default); last_flushed_vv is
+    // None → unwrap_or_default also gives empty. They equal → false.
+    let s = CollabSession::new(PeerId::new(1)).unwrap();
+    assert_eq!(s.op_count(), 0);
+    assert!(
+        !s.has_pending_flush(),
+        "fresh empty session: no pending state to flush"
+    );
+}
+
+#[test]
+fn has_pending_flush_distinguishes_synced_from_detached_via_state_advance() {
+    // After a successful flush + detach + offline append, the
+    // last_flushed_vv was reset to None by detach. has_pending_flush
+    // then compares current_vv (post-append) to default (= empty)
+    // → not equal → true. Confirms the helper tracks the right
+    // "is there unsynced local state" semantics across transport
+    // lifecycle.
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    s.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    let (tx_a, _observer) = LoopbackTransport::pair();
+    s.attach_transport(tx_a);
+    s.append_op(add_sheet()).unwrap(); // auto-flushes
+    assert!(!s.has_pending_flush(), "synced post-mutator");
+
+    // Detach transport — last_flushed_vv resets to None.
+    let _ = s.detach_transport();
+
+    // The current_vv has 1 op (from add_sheet). last_flushed_vv is
+    // None → unwrap_or_default is empty. current_vv != empty → true.
+    assert!(
+        s.has_pending_flush(),
+        "post-detach: current state isn't tracked against any flushed VV → \
+         has_pending_flush() == true (the new transport peer would need everything)"
+    );
+
+    // Append more while offline.
+    s.append_op(put_value(0, 0, 0, 99.0)).unwrap();
+    assert!(s.has_pending_flush());
+}
