@@ -1,6 +1,6 @@
 ---
 title: Phase 5 V1 exit packet (5.1 → 5.6 V1+V2 + 5.4 V2 V1+V1.1 + 5.5 V2 V1 + D1.a)
-status: ACTIVE — Phase 5 V1 surface complete 2026-05-19. **D-1 SHIPPED 2026-05-20**. **5.3 SHIPPED 2026-05-20**. **5.5 V2 V2 (auto-flush) SHIPPED 2026-05-21**. **5.5 V2 V3 steps 1+2+3 SHIPPED 2026-05-21** (version-vector delta flush + poll_remote auto-flush + offline-write contract). See `docs/phase5/d-1-exit-packet.md` + `docs/phase5/5-3-exit-packet.md`. 5.5 V2 V3 steps 4-6 (WebSocket impl + megaudit + exit packet), 5.7 IDE slice, and 5.8 megaudit remain.
+status: ACTIVE — Phase 5 V1 surface complete 2026-05-19. **D-1 SHIPPED 2026-05-20**. **5.3 SHIPPED 2026-05-20**. **5.5 V2 V3 V1 SHIPPED 2026-05-21** (auto-flush + version-vector delta flush + poll_remote auto-flush + offline-write contract + WebSocket transport + 3-way megaudit + exit packet). See `docs/phase5/d-1-exit-packet.md` + `docs/phase5/5-3-exit-packet.md` + `docs/phase5/v2-v3-exit-packet.md` (V2 V3 V1 canonical closure record). 5.7 IDE slice (unblocked, ~1wk) and 5.8 megaudit (~4-6d) remain.
 date: 2026-05-19
 updated: 2026-05-20 (post-exit-packet additions: 5.6 V2 sweep_presence + D1.a 4-cluster closure + D-1 ALL STEPS SHIPPED)
 predecessor: docs/phase4/exit-packet.md + docs/phase5/entry-plan.md
@@ -299,10 +299,18 @@ Phase 5 V1 added **91 net tests** to the engine.
   text/ping/pong frame dropping). Crate NOT added to `default-members`
   — keeps `cargo build` lean; tests still run via `--workspace`.
 
-- **Phase 5.5 V2 V3 steps 5-6 — Megaudit + exit packet.** Step 5:
-  full-arc 3-way megaudit (Codex + Opus-A + Opus-B per Phase 5.3
-  step 5 precedent) covering V2 V3 steps 1-4 end-to-end. Step 6:
-  V2 V3 exit packet. 1-1.5 days estimated.
+- **Phase 5.5 V2 V3 steps 5-6 — Megaudit + exit packet.** ✅
+  **SHIPPED 2026-05-21**. Step 5: 3-way megaudit (Codex + Opus-A +
+  Opus-B) at `bce64a5c1ce` — 2H + 11M + 9L; all closed in cycle
+  (convergent queued-vs-acked semantics documented; Opus-A H1
+  `last_error` unreachable fixed by lifting to `Transport` trait
+  + `CollabSession::transport_last_error()` proxy). Step 6: V2 V3
+  V1 exit packet at `docs/phase5/v2-v3-exit-packet.md` + consumer
+  doc rewrite at `docs/architecture/ide-consumer-contract.md`
+  § 4.1.1-3 (3 worked examples — Synced/Unsynced indicator,
+  reconnect handshake with retry-action table, offline-write
+  recovery with explicit-flush idiom). **V2 V3 V1 SHIPPED;
+  Phase 5.7 unblocked.**
 
 - **Phase 5.7 — IDE vertical slice.** Two-window editing demo.
   1 week. Depends on D-1 + 5.3 + 5.5 V2 V2 (✅) + V2 V3.

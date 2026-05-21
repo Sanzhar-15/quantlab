@@ -542,7 +542,7 @@ The full v1 means all of these crates either ship real behavior or have a docume
 
 ## Phase 5 - Multi-User CRDT Collaboration
 
-**Status (2026-05-21): Phase 5 V1 + D-1 + 5.3 + 5.5 V2 V2 + 5.5 V2 V3 steps 1-3 COMPLETE.** Canonical records: `docs/phase5/v1-exit-packet.md` (V1) + `docs/phase5/d-1-exit-packet.md` (D-1 closure) + `docs/phase5/5-3-exit-packet.md` (5.3 closure). Remaining: 5.5 V2 V3 steps 4-6 (WebSocket impl + megaudit + exit packet), 5.7 IDE slice, 5.8 Phase 5 megaudit (separate).
+**Status (2026-05-21): Phase 5 V1 + D-1 + 5.3 + 5.5 V2 V2 + 5.5 V2 V3 V1 (steps 1-6) COMPLETE.** Canonical records: `docs/phase5/v1-exit-packet.md` (V1) + `docs/phase5/d-1-exit-packet.md` (D-1 closure) + `docs/phase5/5-3-exit-packet.md` (5.3 closure) + `docs/phase5/v2-v3-exit-packet.md` (V2 V3 V1 closure). Remaining: 5.7 IDE slice (unblocked, ~1wk), 5.8 Phase 5 megaudit (separate, ~4-6d).
 
 **Purpose:** Turn collaboration from a single-writer op log into real multi-user CRDT state for sheets, cells, names, tables, presence, undo/redo, and offline sync.
 
@@ -578,7 +578,7 @@ The full v1 means all of these crates either ship real behavior or have a docume
    - V2 V1.1 (`7cbdc689ea9`): RAII `start_undo_group_scoped` returning `UndoGroupGuard` (panic/Err-safe). Codex audit PASS.
    - V2 V2 pending: push/pop listeners (lower priority, speculative).
 
-5. **5.5 Transport Layer And Offline Sync** 🟡 V1 + V2 V1 + V2 V2 (auto-flush) + V2 V3 steps 1-4 (delta flush + poll_remote auto-flush + offline-write story + WebSocket transport) SHIPPED 2026-05-21; V2 V3 steps 5-6 (megaudit + exit packet) pending.
+5. **5.5 Transport Layer And Offline Sync** ✅ **V2 V3 V1 SHIPPED 2026-05-21**. All 6 steps (delta flush + poll_remote auto-flush + offline-write story + WebSocket transport + 3-way megaudit + exit packet) closed. Canonical record: `docs/phase5/v2-v3-exit-packet.md`. V2 V4 (TLS, auto-reconnect, bounded backpressure, server crate, ack channel) is `PHASE-4-V2-BACKLOG.md` Tiers I+J+K.
    - V1 (`924750819bc`): `Transport` trait + `NoopTransport` + `LoopbackTransport::pair()`.
    - V2 V1 (`ffd8f6e5f05`): `CollabSession::{attach,detach,has}_transport` + `flush_to_transport` + `poll_remote` (+ `_with_limit`). Explicit-drive.
    - V2 V2 (`51748b02944` ship + `b7aa4cb7bb9` audit-closure): `AutoFlushPolicy::{Disabled, OnAppend}` enum. Default `Disabled` (V2 V1 behavior); `OnAppend` triggers flush after every mutator.
@@ -586,7 +586,8 @@ The full v1 means all of these crates either ship real behavior or have a docume
    - V2 V3 step 2 (`e4e1ce282b1` ship + `fc3de6f99c7` audit-closure): wires `poll_remote*` into auto-flush. One flush per drain batch. Reverses the V2 V2 audit-locked "receive-side excluded" exclusion. 3-peer hub fanout works automatically under `OnAppend`.
    - V2 V3 step 3 (`c73249d338c` ship + `10f40eb228b` audit-closure): offline-write story. Investigation showed no explicit queue needed — Loro's CRDT op log IS the implicit offline queue. Append while no transport returns Ok + commits locally; reattach + flush sends all accumulated ops (delta from empty VV). Adds `CollabSession::has_pending_flush()` ergonomic helper. 7 ship + 5 closure tests pin the contract.
    - **V2 V3 step 4 ✅ SHIPPED 2026-05-21**: WebSocket transport impl. New crate `ql-collab-ws::WebSocketTransport`. Bridges async tokio-tungstenite (`=0.29.0`) to sync `Transport` trait via `tokio::sync::mpsc` + 2 background tasks. MVP: client-only, plain `ws://`, NO TLS, NO auto-reconnect (caller drives via detach+attach), unbounded outbound queue (bounded in practice — closed-flag fast-paths the common disconnect case; dead-peer scenario is the genuine growth window). 13 integration tests against in-process echo server including 3 that verify V2 V2 + V2 V3 step 1-3 contracts hold over a real WebSocket. V1 limitations deferred to V2 V4 (TLS, bounded backpressure, reconnect wrapper, server-side crate, inbound text/ping/pong frame dropping).
-   - V2 V3 steps 5-6 pending: full-arc megaudit (step 5) + exit packet (step 6).
+   - V2 V3 step 5 megaudit (`bce64a5c1ce` 3-way Codex+Opus-A+Opus-B closure): 2H+11M+9L total. Convergent finding queued-vs-acked semantics documented; ack channel deferred to V2 V4 Tier K1. Opus-A H1 (`last_error()` unreachable through Box<dyn>) closed: lifted `Transport::last_error()` to trait + `CollabSession::transport_last_error()` proxy. Plus `TaskExitGuard` RAII panic detection + Close-frame reason capture + poisoned-mutex no-fallback fix. 9 Tier K V2 V4 backlog entries.
+   - **V2 V3 step 6 ✅ SHIPPED 2026-05-21**: V1 exit packet at `docs/phase5/v2-v3-exit-packet.md` + consumer doc rewrite at `docs/architecture/ide-consumer-contract.md` § 4.1.1-3 (3 worked-example subsections — Synced/Unsynced indicator, reconnect handshake with retry-action table, offline-write recovery with explicit-flush idiom). Phase 5.7 IDE vertical slice UNBLOCKED.
 
 6. **5.6 Presence And Awareness** ✅ V1 + V2 SHIPPED 2026-05-19.
    - V1 (`c677e244704`): `"presence"` LoroMap + `PresenceState` + 4 CollabSession methods.

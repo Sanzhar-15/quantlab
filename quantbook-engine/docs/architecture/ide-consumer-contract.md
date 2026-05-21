@@ -217,6 +217,189 @@ Phase 5 V1 (2026-05-19) added the engine-side multi-user CRDT collaboration subs
 - **Presence:** `update_presence(state)` / `peer_presence(peer)` / `clear_presence` / `peers_with_presence` / `sweep_presence` (V2 — caller-opt-in clean-slate on rejoin).
 - **Post-merge rename-repair (✅ Phase 5.3 SHIPPED 2026-05-20):** after `merge_bytes`, before recompute, call `CollabSession::rebuild_workbook(&FunctionRegistry) -> Result<(Workbook, SyncReport), CollabSessionError>` to atomically chain `replay_into → repair_sheet_rename_chain → repair_table_rename_chain → repair_column_rename_chain`. Returns a FRESH workbook (caller doesn't pass a workbook by mut-ref — eliminates double-call / stale-workbook misuse class per step 5b audit closure). The `SyncReport` has a one-line `Display` impl for `log::info!` consumption: `"sync: ops=N sheet_rewrites=N(skip=N) table_rewrites=N(skip=N) column_rewrites=N(skip=N)"`. Caller-driven by design (audit-locked D-5.3-1: repair is NOT auto-invoked by `merge_bytes` so callers can batch multiple merges before paying replay+repair cost). **Without this call**, concurrent-rename formulas surface as `#NAME?` at recompute. Raw `replay_into` + per-pass repair calls remain available for diagnostic / partial-replay flows; see `crates/ql-collab/src/repair.rs` module docs § "Caller contract" for the manual sequence. Repair report types: `SheetRepairReport` + `TableRepairReport` + `ColumnRepairReport` (post-Tier-H8 rename for API symmetry; pre-H8 was `RepairReport` for sheets) — each with `formulas_rewritten: usize` + per-rename summaries + `ambiguous_rules_skipped` diagnostic surfaces. See `docs/phase5/5-3-exit-packet.md` for the full closure record.
 
+---
+
+### Worked examples — three core IDE workflows (V2 V3 step 6 ship)
+
+**V2 V3 step 6 megaudit closure (2026-05-21) — Opus-A M1**: the API inventory above mentions the new V2 V3 V1 APIs but doesn't show the call sequence for the three workflows an IDE engineer will actually build. The subsections below give canonical implementations with the gotchas called out inline. An IDE engineer should be able to wire each workflow from these subsections alone, without spelunking `session.rs` or `lib.rs`.
+
+#### 4.1.1 Synced / Unsynced / Offline indicator
+
+The IDE shows a status indicator: 🟢 Synced (all local ops on the wire), 🟡 Unsynced (local changes pending), ⚫ Offline (no transport).
+
+```rust
+use ql_collab::CollabSession;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncStatus { Synced, Unsynced, Offline }
+
+fn indicator_status(session: &CollabSession) -> SyncStatus {
+    if !session.has_transport() {
+        SyncStatus::Offline
+    } else if session.has_pending_flush() {
+        SyncStatus::Unsynced
+    } else {
+        SyncStatus::Synced
+    }
+}
+```
+
+**Gotchas**:
+
+1. **`from_snapshot` post-attach reports `Unsynced`.** A session built via `CollabSession::from_snapshot(peer_id, bytes)` has `current_vv ≠ default` (imported ops) and `last_flushed_vv = None`. After `attach_transport`, `has_pending_flush()` returns `true` even though the user did nothing. The `has_transport()` gating above handles this (`Offline` takes priority), but if you ever query `has_pending_flush()` directly for UI, suppress it on first display after `from_snapshot` until the first auto-flush completes.
+
+2. **"Unsynced offline edits" vs "Unsynced retry-pending" are indistinguishable from the substrate.** After `append_op` returns `Err(Transport(Closed))`, the local op committed but `last_flushed_vv` didn't advance — so `has_pending_flush() = true`, same state as an offline append. To differentiate the UI copy ("Saving locally — reconnecting…" vs "Saving locally — offline"), the IDE must track its own `transport_error_pending: bool` flag and clear it on the next successful flush.
+
+3. **Delivery semantics caveat (V2 V3 step 5 megaudit closure)**: `has_pending_flush() == false` means "queued to the currently-attached transport," NOT "the peer has received the ops." For buffered async transports (`WebSocketTransport`), bytes sit in an mpsc channel between queue-success and wire-delivery; transport drop loses them silently. Combine the indicator with a peer-side ack signal if your UX requires "safe to close" semantics. V2 V4 will add an explicit ack-channel API (backlog Tier K1).
+
+#### 4.1.2 Reconnect handshake on `Err(Closed)`
+
+When a session method returns `Err(CollabSessionError::Transport(TransportError::Closed))`, the IDE drives recovery. Use `CollabSession::transport_last_error()` (new in V2 V3 step 5) to choose the right user-facing message and retry strategy.
+
+```rust
+use ql_collab::{CollabSession, CollabSessionError, TransportError};
+use ql_collab_ws::WebSocketTransport;
+
+#[derive(Debug)]
+enum ReconnectAction { RetryWithBackoff, RetryWithAuthPrompt, AbortAndShowError }
+
+fn classify_disconnect(cause: Option<String>) -> ReconnectAction {
+    let Some(msg) = cause else {
+        // No specific cause (e.g., graceful caller close) — treat as
+        // unexpected. Default to retry.
+        return ReconnectAction::RetryWithBackoff;
+    };
+    if msg.contains("401") || msg.contains("auth") {
+        ReconnectAction::RetryWithAuthPrompt
+    } else if msg.contains("close frame: code=1008") {
+        // RFC 6455 1008 = policy violation; server kicked us.
+        ReconnectAction::AbortAndShowError
+    } else if msg.contains("close frame: code=1011") {
+        // RFC 6455 1011 = server error; retryable.
+        ReconnectAction::RetryWithBackoff
+    } else {
+        // Generic runtime error (peer reset, IO, capacity): retry.
+        ReconnectAction::RetryWithBackoff
+    }
+}
+
+fn reconnect(
+    session: &mut CollabSession,
+    url: &str,
+    rt: &tokio::runtime::Handle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cause = session.transport_last_error();
+    let action = classify_disconnect(cause);
+
+    if matches!(action, ReconnectAction::AbortAndShowError) {
+        return Err("server rejected with policy-violation; aborting".into());
+    }
+    if matches!(action, ReconnectAction::RetryWithAuthPrompt) {
+        // Show auth UI; on confirm, fall through to reconnect.
+        // ...IDE-specific auth flow...
+    }
+
+    // Drop the old transport (releases TCP socket + background tasks).
+    let _ = session.detach_transport();
+    let new_ws = rt.block_on(WebSocketTransport::connect(url))?;
+    session.attach_transport(new_ws);
+
+    // Post-attach: drive explicit flush to deliver offline ops
+    // immediately (don't wait for next user action). See § 4.1.3.
+    if session.has_pending_flush() {
+        session.flush_delta_to_transport()?;
+    }
+    Ok(())
+}
+```
+
+**`WebSocketError` variant → recommended IDE action**:
+
+| `transport_last_error()` substring | Likely cause | Recommended IDE action |
+|---|---|---|
+| `"WebSocket runtime error: peer close frame: code=1000"` | Graceful peer close (normal) | Reconnect, transient |
+| `"...code=1008..."` | Policy violation (auth, throttle) | Show error; abort retry |
+| `"...code=1011..."` | Server internal error | Reconnect with backoff |
+| `"...code=4XXX..."` | Application-defined (server-specific) | Inspect reason string |
+| `"WebSocket runtime error: peer stream ended without close frame"` | TCP teardown without graceful close | Reconnect with backoff |
+| `"WebSocket runtime error: <tungstenite IO error>"` | Network / socket / capacity issue | Reconnect with backoff |
+| `"WebSocket handshake failed: 401..."` | Auth rejected at connect time | Show auth prompt |
+| `"WebSocket connection failed: ..."` | TCP refused / DNS / timeout | Reconnect with backoff |
+| `"ql-collab-ws writer task panicked"` | Internal panic (allocator, future bug) | Bug; log + abort |
+| `None` (no error stashed) | Caller-initiated close (`session.detach_transport`) | No reconnect needed |
+
+**Gotchas**:
+
+1. **`#[must_use]` on `detach_transport`** (V2 V3 step 5 closure): the returned `Option<Box<dyn Transport + Send>>` owns the old transport's background tasks. The `let _ = ...` binding above drops it immediately. Holding the Box past reconnect keeps the old TCP socket open + the old `last_error()` reachable separately from the new transport's.
+2. **`transport_last_error()` returns `None` if no transport is attached.** Call it BEFORE `detach_transport()` so you read from the failing transport, not the empty session slot.
+3. **The reconnect itself can fail.** `WebSocketTransport::connect` returns `Err(WebSocketError::ConnectFailed | HandshakeFailed | InvalidUrl)`. Handle separately from the runtime errors above — these are connect-time, not in-flight.
+4. **Backoff is the IDE's responsibility.** The substrate doesn't track retry counts. Build an exponential-backoff loop around `reconnect()` with a max retry budget; show "Cannot connect" after exhausted.
+
+#### 4.1.3 Offline-write recovery
+
+User edits offline (no transport or transport down). They reconnect. All edits flow to peers.
+
+```rust
+use ql_collab::{AutoFlushPolicy, CollabSession, PeerId};
+use ql_collab_ws::WebSocketTransport;
+
+fn setup_session(rt: &tokio::runtime::Handle, url: &str) -> Result<CollabSession, Box<dyn std::error::Error>> {
+    let mut session = CollabSession::new(PeerId::new(1))?;
+    session.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    // Initial connect — may fail; user can edit offline meanwhile.
+    if let Ok(ws) = rt.block_on(WebSocketTransport::connect(url)) {
+        session.attach_transport(ws);
+    }
+    Ok(session)
+}
+
+// User types offline — each append commits locally; no transport,
+// so maybe_auto_flush no-ops. Loro's op log IS the implicit offline
+// queue.
+//   session.append_op(op)?;  // returns Ok even with no transport
+
+// Later: connectivity returns. IDE-initiated reconnect (NOT triggered
+// by a user mutator).
+fn user_came_back_online(
+    session: &mut CollabSession,
+    url: &str,
+    rt: &tokio::runtime::Handle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ws = rt.block_on(WebSocketTransport::connect(url))?;
+    session.attach_transport(ws);
+
+    // CRITICAL: if no user action follows attach, there's no "next
+    // mutator" to trigger auto-flush. Drive an explicit flush so the
+    // peer sees state immediately, not 5 minutes from now when the
+    // user next types. The V2 V3 step 1 baseline-reset on attach
+    // (`last_flushed_vv = None`) makes this flush deliver ALL
+    // accumulated offline ops in one delta blob.
+    if session.has_pending_flush() {
+        session.flush_delta_to_transport()?;
+    }
+    Ok(())
+}
+```
+
+**Gotchas**:
+
+1. **"Next mutator OR explicit flush" — the IDE chooses based on trigger source.** If reconnect is **user-driven** (e.g., user clicks "Reconnect"), their next keystroke will trigger auto-flush — don't drive explicit. If reconnect is **automatic** (e.g., network-recovery detection), there's no upcoming user action — drive explicit flush, otherwise the peer sees nothing until the user types.
+2. **Large-blob memory pressure (V2 V3 step 5 megaudit Opus-A M4)**: post-attach explicit flush sends ALL accumulated offline ops in ONE delta blob. For typical IDE-edit volumes (hundreds of ops, KBs), this is fine. For long offline sessions (hours of edits, MBs), the blob sits in the unbounded outbound mpsc until the writer task drains it — memory pressure on small devices. V2 V4 Tier I + K will add chunking + bounded queue.
+3. **Explicit-flush `Err(Closed)` requires the same recovery as auto-flush `Err(Closed)`** (V2 V3 step 5 megaudit Opus-A L4 symmetry): on `flush_delta_to_transport()` returning `Err(Transport(Closed))`, the local state is committed but `last_flushed_vv` is unchanged. Treat it identically to § 4.1.2's reconnect flow — detach + reconnect with a fresh transport.
+
+### 4.1.x Concurrency model — one session per thread
+
+**V2 V3 step 6 (2026-05-21) — Opus-A cross-workflow**: `CollabSession` is `Send + !Sync`. `WebSocketTransport` is `Send + !Sync`. Both can move across threads but cannot be shared (`&self` borrows are forbidden between threads holding distinct `&mut self`). Recommended IDE pattern:
+
+- **Own the session on one thread** (e.g., the IDE's worker thread for background sync).
+- **Channel-pass mutations** from the UI thread to the worker via `tokio::sync::mpsc` or `crossbeam::channel`. The UI sends `EditCommand::PutValue { ... }` etc.; the worker invokes `session.append_op(...)` and ships results back via `Status::Synced { peer_count }` etc.
+- **Don't wrap the session in `Arc<Mutex<...>>`** for shared concurrent access. Per-method locking pays per-keystroke acquire overhead, defeats the borrow-checker isolation, and adds deadlock risk against the tokio runtime owned by the transport.
+
+The runtime that drives `WebSocketTransport::connect` can be any tokio runtime (current_thread or multi_thread). The session's worker thread and the runtime can be the same thread (current_thread) or separate (multi_thread). The mpsc channels inside `WebSocketTransport` are clone-able tokio handles, so the writer/reader tasks run on the runtime regardless of which thread owns the session.
+
+---
+
 **D-1 (✅ SHIPPED 2026-05-20 — all 8 steps + 7 per-step audits + 1 megaudit):** `FormatId` is now `enum { Builtin(u32), Custom(PeerId, u32) }` in `ql-storage::format`. IDE callers MUST pattern-match the variant rather than reading `.0`. Use `FormatId::is_builtin()` / `is_custom()` / `GENERAL` accessors. For pre-D-1 bare-u32 ids (xlsx import), use `FormatId::legacy_from_u32(n)`. `Op::RegisterFormat` + `Op::SetCellFormat` carry `FormatIdWire` on the wire. `.qbook` envelope v8 carries the tagged-tuple `FormatEntryId` shape losslessly for multi-peer ids; v<8 envelopes auto-migrate. xlsx export flattens multi-peer FormatIds via dedup-by-code; non-LEGACY peer flattens reported via `XlsxExportReport.dropped_features`. xlsx import surfaces unresolved-overlay-numfmt as `report.unsupported` entries. `.qbook/oplog.bin` files wrapped in Tier D3 header (`OPLOG_MAGIC = b"QLOL"` + BE u32 `OPLOG_SCHEMA_VERSION`). `CollabSession::new` + `from_snapshot` + `OpLog::set_peer_id` assert `PeerId != 0` (release-firing). See `docs/phase5/d-1-exit-packet.md` for the full closure record.
 
 ## 5. Acceptance pattern (`crates/ql-exec/tests/ide_simulation.rs`)
