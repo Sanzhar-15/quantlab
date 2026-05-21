@@ -123,8 +123,8 @@ These were Opus-A findings that point to consumer-doc gaps; all closed by the §
 
 Consolidated reference. Full entries at `docs/PHASE-4-V2-BACKLOG.md`.
 
-**Tier I — Phase 5.5 V2 V3 step 3 extensions** (3 items):
-- I1: `pending_op_count()` / `pending_op_summary()` for bounded-queue IDE policies.
+**Tier I — Phase 5.5 V2 V3 step 3 extensions** (3 items; I1 ✅ subsequently SHIPPED as V2 V4 V1 step 2 at `ff76fc99d49` + audit closure):
+- I1: `pending_op_count()` ✅ SHIPPED. `pending_op_summary()` (count + oldest-op timestamp) remains deferred pending Loro per-op-timestamp exposure.
 - I2: `discard_pending_ops()` API for "discard unsynced changes on window close" workflows.
 
 **Tier J — Phase 5.5 V2 V3 step 4 extensions** (3 items):

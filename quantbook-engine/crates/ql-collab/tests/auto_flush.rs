@@ -1911,3 +1911,89 @@ fn pending_op_count_with_merged_peer_ops_includes_them() {
         "merged peer ops contribute to pending_op_count, got {after_merge}"
     );
 }
+
+// ============================================================
+// V2 V4 V1 step 2 audit closure — Codex M1 / Opus H1 (convergent)
+// undo path: visible-list count diverges from VV count.
+// The closure switched to VV math, which is monotonic under undo.
+// ============================================================
+
+#[test]
+fn pending_op_count_grows_under_undo_after_flush() {
+    // **V2 V4 V1 step 2 audit closure (Codex M1 + Opus H1):** the
+    // original ship used `self.log.len()` (visible LoroList length)
+    // which Loro's UndoManager retracts on undo, causing
+    // pending_op_count == 0 while has_pending_flush == true —
+    // divergent observability. The closure switched to VV math
+    // (per-peer counter deltas summed) which is monotonic under undo
+    // because the undo's inverse op IS a new VV entry even though it
+    // retracts a visible LoroList entry.
+    let (tx_a, _tx_b) = LoopbackTransport::pair();
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    s.attach_transport(tx_a);
+
+    // Phase 1: append 2 ops + flush.
+    s.append_op(add_sheet()).unwrap();
+    s.append_op(put_value(0, 0, 0, 42.0)).unwrap();
+    s.flush_delta_to_transport().expect("flush success");
+    let post_flush_count = s.pending_op_count();
+    let post_flush_pending = s.has_pending_flush();
+    assert_eq!(post_flush_count, 0, "post-flush count == 0");
+    assert!(!post_flush_pending, "post-flush has_pending_flush == false");
+
+    // Phase 2: undo. With Disabled policy (no transport mutator
+    // fires), no auto-flush. The undo creates a new VV entry but
+    // retracts a visible op. visible-list len drops; VV total
+    // climbs.
+    let undone = s.undo().expect("undo");
+    assert!(undone, "undo consumed an item");
+
+    // Sibling invariant: pending_op_count > 0 ⟺ has_pending_flush == true.
+    let post_undo_count = s.pending_op_count();
+    let post_undo_pending = s.has_pending_flush();
+    assert!(
+        post_undo_pending,
+        "has_pending_flush MUST be true post-undo (VV advanced)"
+    );
+    assert!(
+        post_undo_count > 0,
+        "VV-based pending_op_count MUST grow under undo (visible-list count would have shrunk; \
+         this is precisely the V2 V4 V1 step 2 audit closure: Codex M1 / Opus H1 convergent finding)"
+    );
+    // Critical invariant: the two MUST agree on the boolean.
+    assert_eq!(
+        post_undo_count > 0,
+        post_undo_pending,
+        "pending_op_count() > 0 MUST be equivalent to has_pending_flush() across all mutators \
+         including undo (the sibling-relationship contract documented in pending_op_count's docstring)"
+    );
+}
+
+#[test]
+fn pending_op_count_on_from_snapshot_returns_imported_count() {
+    // **V2 V4 V1 step 2 audit closure (Opus M1 — coverage gap):** the
+    // pending_op_count docstring pins from_snapshot behavior
+    // ("returns the imported op count immediately, even before
+    // attach_transport"). No test covered this; closure adds one.
+    let mut origin = CollabSession::new(PeerId::new(1)).unwrap();
+    origin.append_op(add_sheet()).unwrap();
+    origin.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+    origin.append_op(put_value(0, 0, 1, 2.0)).unwrap();
+    let bytes = origin.export_bytes().unwrap();
+
+    let reborn = CollabSession::from_snapshot(PeerId::new(2), &bytes).unwrap();
+    assert!(
+        !reborn.has_transport(),
+        "from_snapshot starts with no transport"
+    );
+    assert!(
+        reborn.has_pending_flush(),
+        "from_snapshot reports has_pending_flush == true (no transport, imported ops)"
+    );
+
+    let count = reborn.pending_op_count();
+    assert!(
+        count >= 3,
+        "from_snapshot pending_op_count MUST reflect imported ops, got {count}"
+    );
+}
