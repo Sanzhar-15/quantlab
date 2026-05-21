@@ -2,7 +2,7 @@
 title: Phase 5.5 V2 V4 V1 exit packet
 date: 2026-05-21
 status: ACTIVE — V2 V4 V1 SHIPPED via step 5 close (12/13 Tier items; K4 chunking deferred to V2 V4 V2)
-ship_commit_range: 3342e21b964 (V2 V4 V1 step 1 ship) → ca0f9de6ece (V2 V4 V1 step 5 ship + V1 exit packet) → [step 5 closure: the closure cycle after this exit packet was committed]
+ship_commit_range: 3342e21b964 (V2 V4 V1 step 1 ship) → ca0f9de6ece (V2 V4 V1 step 5 ship + V1 exit packet) → 397676899fb (V2 V4 V1 step 5 audit closure — final V1 commit)
 predecessor_exit_packet: docs/phase5/v2-v3-exit-packet.md (V2 V3 V1)
 audit_cycle_total: 5 ship + 5 closure = 10 transcripts (steps 1-5)
 test_count_at_v4_v1_exit: 4459 / 0 expected (workspace, --test-threads=1)

@@ -616,11 +616,11 @@ verify the fix works empirically.
 - **Problem:** docstring claim "after non-empty drain, one auto-flush fires" is imprecise — if a later blob's `merge_bytes` errors after earlier merges succeeded, the auto-flush is skipped (early `?` return). Not a false-synced state but a contract-precision miss.
 - **Closure decision: option (a) — docstring precision.** Refactor with Drop-guard would add complexity for a niche case where the behavior is already recoverable (`has_pending_flush()=true` after the error; next flush sends accumulated delta). Amended `poll_remote_with_limit` docstring to say "after a non-empty drain that reaches the loop's normal exit (Ok(None) or Closed-as-EOF break)" — explicit early-Err path documentation.
 
-### K9. Documentation of detach_transport reuse pattern
+### K9. Documentation of detach_transport reuse pattern — ✅ ABSORBED V2 V3 step 6 (2026-05-21)
 
 - **Source:** V2 V3 step 5 megaudit Opus-A M3.
 - **Problem:** The `#[must_use]` attribute (added in step 5 closure) nudges consumers to drop the returned Box. But the docstring doesn't show the recommended reconnect-handshake pattern. Belongs in the consumer doc rewrite.
-- **V2 V4 closure:** absorbed by Phase 5.5 V2 V3 step 6 exit packet's consumer doc rewrite.
+- **Closure:** absorbed by V2 V3 step 6 (`8a8236840f2`) exit packet's consumer doc rewrite — `docs/architecture/ide-consumer-contract.md` § 4.1.2 Reconnect handshake includes the `let _ = session.detach_transport();` pattern with the `#[must_use]` rationale. No V2 V4 work needed.
 
 ---
 
