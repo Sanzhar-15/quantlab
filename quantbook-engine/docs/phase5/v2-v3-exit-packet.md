@@ -130,7 +130,7 @@ Consolidated reference. Full entries at `docs/PHASE-4-V2-BACKLOG.md`.
 **Tier J — Phase 5.5 V2 V3 step 4 extensions** (3 items):
 - J1: `RejectingServer` test fixture determinism + corresponding test rename.
 - J2: Inbound text/ping/pong frame test pinning (needs custom server fixture).
-- J3: `WebSocketTransport: !Sync` compile-time assert via `static_assertions`.
+- J3: `WebSocketTransport` Send/Sync compile-time asserts. **Note**: originally framed as "!Sync assert"; V2 V4 V1 step 3 implementation revealed the type is actually Send + Sync (the V2 V3 step 4 docstring was wrong). Subsequently SHIPPED as positive `assert_impl_all!(WebSocketTransport: Sync)` + bundled K5 `assert_impl_all!(WebSocketError: Send, Sync)`. See `docs/PHASE-4-V2-BACKLOG.md` Tier J3 entry for the discovery details.
 
 **Tier K — Phase 5.5 V2 V3 step 5 megaudit extensions** (9 items):
 - K1: Ack channel for end-to-end delivery confirmation (Codex M1 + Opus-B M1 fundamental fix).

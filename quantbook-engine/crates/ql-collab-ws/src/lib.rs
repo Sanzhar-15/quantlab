@@ -257,8 +257,11 @@ pub enum WebSocketError {
 ///
 /// ## Send + Sync
 ///
-/// `WebSocketTransport: Send + Sync` (both asserted via compile-time
-/// `static_assertions` macros — see end of file). Note: the prior
+/// `WebSocketTransport: Send + Sync` (Send pinned by the V2 V3
+/// step 4 manual `const _ASSERT_WEBSOCKET_TRANSPORT_SEND`, Sync
+/// pinned by V2 V4 V1 step 3 `static_assertions::assert_impl_all!` —
+/// both compile-time checks at the end of this file). Note: the
+/// prior
 /// V2 V3 step 4 docstring (and Tier J3 backlog entry) incorrectly
 /// claimed `!Sync` based on the intuition that the single-consumer
 /// mpsc receiver should prevent sharing. In Rust, `Sync` means "`&T`

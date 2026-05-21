@@ -76,6 +76,22 @@ const _ASSERT_COLLAB_SESSION_SEND: fn() = || {
     assert_send::<CollabSession>();
 };
 
+// **V2 V4 V1 step 3 audit closure (Codex L1 + Opus M1, 2026-05-21):**
+// CollabSession is Send but NOT Sync — the
+// `Option<Box<dyn Transport + Send>>` field carries no Sync bound on
+// the trait object, so the field is `?Sync` and the struct inherits
+// `!Sync`. This contrasts with `WebSocketTransport` (the concrete
+// type), which IS Sync since all its concrete fields happen to be
+// Sync. Compile-asserting `!Sync` is awkward in stable Rust;
+// documented here via a probe-then-commented-out pattern so a future
+// reader can verify the bound by un-commenting and watching the
+// build error message naming the !Sync field.
+//
+// fn assert_collab_session_not_sync() {
+//     fn assert_sync<T: Sync>() {}
+//     assert_sync::<CollabSession>();  // EXPECTED COMPILE ERROR
+// }
+
 /// Errors emitted by `CollabSession` operations.
 #[derive(Debug, Error)]
 #[non_exhaustive]

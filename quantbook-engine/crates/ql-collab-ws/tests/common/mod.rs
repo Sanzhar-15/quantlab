@@ -105,7 +105,7 @@ async fn handle_echo_connection(stream: TcpStream) {
 }
 
 /// One-shot client-side TCP server that accepts a single connection,
-/// writes a deliberately-malformed HTTP response, then closes the
+/// writes a complete-but-non-101 HTTP response, then closes the
 /// stream. Used to drive `HandshakeFailed` paths deterministically
 /// without an external dependency.
 ///
@@ -114,12 +114,31 @@ async fn handle_echo_connection(stream: TcpStream) {
 /// was timing/platform-dependent — the client's HTTP upgrade write
 /// could complete-before-FIN (HandshakeFailed) or after-FIN
 /// (ConnectFailed). Tests had to accept either outcome with `_or_`
-/// disjunction. The new version writes 8 bytes of garbage that
-/// cannot be parsed as a valid HTTP/1.1 response status line, then
-/// closes — tokio-tungstenite consistently parses the response and
-/// raises `tungstenite::Error::Http(_)` (or `HttpFormat(_)` on
-/// some platforms), which `WebSocketTransport::connect` maps to
-/// `WebSocketError::HandshakeFailed`. Deterministic.
+/// disjunction.
+///
+/// The new version writes `"HTTP/1.1 999 GARBAGE\r\n\r\n"` — a
+/// **complete, parseable HTTP response with an unclassified 999
+/// status code** (not a malformed status-line failure). Per
+/// V2 V4 V1 step 3 audit (Codex L2, 2026-05-21): tungstenite 0.29.0
+/// parses this via `Response::try_parse`'s `httparse::Response::parse`
+/// which sees `\r\n\r\n` as the message terminator (no EOF needed);
+/// `StatusCode::from_u16(999)` succeeds because `http` 1.4 accepts
+/// 100..=999; `VerifyData::verify_response` then rejects anything
+/// other than `101 Switching Protocols` and returns
+/// `Error::Http(response.into())`. `WebSocketTransport::connect`
+/// maps `Error::Http(_)` to `WebSocketError::HandshakeFailed`.
+///
+/// **Theoretical platform-dependence remaining (per V2 V4 V1 step 3
+/// audit Opus M2, 2026-05-21)**: a FIN/RST race during `shutdown()`
+/// could in principle surface as `tungstenite::Error::Io(_)` if the
+/// kernel sends a RST before the client reads the buffered response
+/// bytes. In that case `connect` maps to `ConnectFailed`, not
+/// `HandshakeFailed`, and the strict test assertion would fail.
+/// Empirically passes on Mac per V2 V4 V1 step 3 gate (4451/0);
+/// Linux/Windows behavior not yet validated. If a future CI
+/// surfaces this flake, tighten by holding the connection open
+/// longer (sleep N ms before shutdown) to ensure the client reads
+/// the response bytes before the FIN arrives.
 pub struct RejectingServer {
     addr: SocketAddr,
     accept_task: JoinHandle<()>,
@@ -141,15 +160,19 @@ impl RejectingServer {
             // mapping to HandshakeFailed deterministically.
             if let Ok((mut stream, _)) = listener.accept().await {
                 use tokio::io::AsyncWriteExt;
-                // Deliberately malformed HTTP response: starts with
-                // the right HTTP version prefix to pass the initial
-                // sniff, but the status code is invalid garbage and
-                // there are no headers / CRLFCRLF terminator. tokio-
-                // tungstenite parses this as a malformed HTTP
-                // response, not as a TCP-level error.
+                // Complete-but-non-101 HTTP response: valid HTTP/1.1
+                // version line + status code 999 (unclassified per
+                // IANA but syntactically accepted by `http` 1.4) +
+                // CRLFCRLF terminator. tungstenite 0.29.0 parses
+                // this as a complete response (no EOF needed), the
+                // status verifier rejects non-101, and the connect
+                // path surfaces `WebSocketError::HandshakeFailed`
+                // (mapped from `tungstenite::Error::Http(_)`).
                 let _ = stream.write_all(b"HTTP/1.1 999 GARBAGE\r\n\r\n").await;
                 // Explicit shutdown signals end-of-response to the
-                // client's parser without races.
+                // client's parser without races (the response is
+                // already complete due to CRLFCRLF; shutdown is
+                // defensive cleanup).
                 let _ = stream.shutdown().await;
                 // _stream drops here.
             }

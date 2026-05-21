@@ -543,7 +543,7 @@ verify the fix works empirically.
 
 - **Source:** V2 V3 step 4 audit Opus M3.
 - **Problem:** `tests/common/mod.rs::RejectingServer` accepted a TCP connection then dropped it. The test accepted EITHER `HandshakeFailed` OR `ConnectFailed` (timing-dependent).
-- **Closure:** rewrote `RejectingServer` to write a deliberately-malformed HTTP response (`"HTTP/1.1 999 GARBAGE\r\n\r\n"`) then shutdown. tokio-tungstenite's handshake parser raises `Http(_)`/`HttpFormat(_)` deterministically → `WebSocketError::HandshakeFailed`. Renamed test to `connect_to_rejecting_tcp_server_returns_handshake_failed` with strict `Err(HandshakeFailed(_))` assertion.
+- **Closure:** rewrote `RejectingServer` to write `"HTTP/1.1 999 GARBAGE\r\n\r\n"` — a complete-but-non-101 HTTP response (NOT a malformed status-line failure; per V2 V4 V1 step 3 audit Codex L2, tungstenite 0.29.0 parses this via httparse, accepts status 999 syntactically, then VerifyData rejects non-101 → `tungstenite::Error::Http(_)` → maps to `WebSocketError::HandshakeFailed`). Renamed test to `connect_to_rejecting_tcp_server_returns_handshake_failed` with strict `Err(HandshakeFailed(_))` assertion. **Theoretical edge case (V2 V4 V1 step 3 audit Opus M2)**: FIN/RST race during `shutdown()` could in principle surface `Io(_)` → `ConnectFailed` on platforms that RST before the client reads the buffered response; empirically passing on Mac (4451/0), Linux/Windows not yet validated. Mitigation if observed: add `sleep_before_shutdown(N ms)`.
 
 ### J2. Inbound text/ping/pong frame test pinning — ✅ SHIPPED V2 V4 V1 step 3 (2026-05-21)
 
