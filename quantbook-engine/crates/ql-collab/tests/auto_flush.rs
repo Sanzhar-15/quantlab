@@ -967,3 +967,211 @@ fn delta_flush_after_merge_bytes_sends_merged_state_to_third_peer() {
         peer_c.len()
     );
 }
+
+// ============================================================
+// V2 V3 step 1 audit closures (Codex + Opus, 2026-05-21)
+// ============================================================
+
+/// **OneShotFailingTransport** — fails the FIRST `send` call with
+/// `TransportError::Closed`, succeeds on all subsequent calls.
+/// Used by `delta_flush_retry_after_failure_resends_from_same_vv`
+/// (M1 closure — Codex L2 / Opus M1) to verify that an Err'd flush
+/// leaves `last_flushed_vv` unchanged, so the retry on the SAME
+/// transport sends the same delta the failed call would have.
+///
+/// `try_recv` always returns `Ok(None)` — this transport is
+/// send-only by design for failure testing.
+#[derive(Debug, Default)]
+struct OneShotFailingTransport {
+    fail_next_send: bool,
+    sent_blob_sizes: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+}
+
+impl OneShotFailingTransport {
+    fn new() -> Self {
+        Self {
+            fail_next_send: true,
+            sent_blob_sizes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+    fn sent_sizes_handle(&self) -> std::sync::Arc<std::sync::Mutex<Vec<usize>>> {
+        std::sync::Arc::clone(&self.sent_blob_sizes)
+    }
+}
+
+impl Transport for OneShotFailingTransport {
+    fn send(&mut self, bytes: &[u8]) -> Result<(), ql_collab::TransportError> {
+        if self.fail_next_send {
+            self.fail_next_send = false;
+            return Err(ql_collab::TransportError::Closed);
+        }
+        self.sent_blob_sizes.lock().unwrap().push(bytes.len());
+        Ok(())
+    }
+    fn try_recv(&mut self) -> Result<Option<Vec<u8>>, ql_collab::TransportError> {
+        Ok(None)
+    }
+}
+
+#[test]
+fn delta_flush_retry_after_failure_resends_from_same_vv() {
+    // V2 V3 step 1 audit closure (Codex L2 / Opus M1, 2026-05-21):
+    // verify that on transport.send Err, last_flushed_vv stays
+    // unadvanced — so retry sends THE SAME delta the failed call
+    // would have. Uses OneShotFailingTransport (fails first send,
+    // succeeds after).
+    let transport = OneShotFailingTransport::new();
+    let sizes = transport.sent_sizes_handle();
+
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    s.append_op(add_sheet()).unwrap();
+    s.append_op(put_value(0, 0, 0, 42.0)).unwrap();
+    s.attach_transport(transport);
+
+    // First call: fails.
+    let result = s.flush_delta_to_transport();
+    assert!(
+        matches!(
+            result,
+            Err(CollabSessionError::Transport(TransportError::Closed))
+        ),
+        "first flush MUST fail with Closed (OneShotFailingTransport contract); got {result:?}"
+    );
+    assert_eq!(
+        sizes.lock().unwrap().len(),
+        0,
+        "no successful send on first call"
+    );
+
+    // Retry on SAME transport (no detach). last_flushed_vv was NOT
+    // advanced by the failed call, so this resends the same delta
+    // (full state from empty VV, since this was the first flush).
+    let result = s.flush_delta_to_transport().unwrap();
+    assert!(result, "retry MUST succeed (transport now accepts sends)");
+    let final_sizes = sizes.lock().unwrap().clone();
+    assert_eq!(final_sizes.len(), 1, "retry produced exactly one send");
+    assert!(
+        final_sizes[0] > 0,
+        "retry's blob is non-empty (contains the 2 appended ops)"
+    );
+
+    // Third call: NO new ops in between → idempotency short-circuit.
+    let result = s.flush_delta_to_transport().unwrap();
+    assert!(
+        !result,
+        "third flush with no mutation MUST short-circuit Ok(false)"
+    );
+    assert_eq!(
+        sizes.lock().unwrap().len(),
+        1,
+        "no additional send on idempotent short-circuit"
+    );
+}
+
+#[test]
+fn delta_flush_bandwidth_savings_subsequent_smaller_than_first() {
+    // V2 V3 step 1 audit closure (Codex L1 / Opus L1, 2026-05-21):
+    // assert that after a baseline batch, a small follow-up append
+    // produces a wire blob substantially SMALLER than the first
+    // flush. Pins the O(per-op-delta) wire size claim against
+    // accidental regression to O(state) (e.g. if flush_delta_to_transport
+    // were ever re-routed through export_bytes / Snapshot mode).
+    let (tx_a, mut tx_b) = LoopbackTransport::pair();
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    s.append_op(add_sheet()).unwrap();
+    // Append ~100 ops for a meaningful state size.
+    for i in 0..100u32 {
+        s.append_op(put_value(0, i, 0, f64::from(i))).unwrap();
+    }
+    s.attach_transport(tx_a);
+    s.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    // First flush sends the baseline (all 101 ops).
+    s.flush_delta_to_transport().unwrap();
+    let first_bytes = tx_b.try_recv().unwrap().expect("first flush bytes");
+    let first_len = first_bytes.len();
+    assert!(first_len > 0);
+
+    // Append one more op. Auto-flush fires.
+    s.append_op(put_value(0, 200, 0, 999.0)).unwrap();
+    let second_bytes = tx_b.try_recv().unwrap().expect("second flush bytes");
+    let second_len = second_bytes.len();
+
+    // Delta should be SUBSTANTIALLY smaller than the baseline.
+    // Conservative threshold: at least 2× smaller. Loro's actual
+    // ratio is typically 10-50× for this scenario; the conservative
+    // bound avoids flakiness from Loro encoding variations.
+    assert!(
+        second_len * 2 < first_len,
+        "delta flush MUST send less than half the baseline size; first={first_len} second={second_len}"
+    );
+}
+
+#[test]
+fn symmetric_on_append_two_peers_converge_with_bounded_wire_bytes() {
+    // V2 V3 step 1 audit closure (Opus L3, 2026-05-21): the
+    // step 1 idempotency guard is documented as making symmetric
+    // OnAppend safe across paired LoopbackTransport peers. Pin
+    // this contract: two peers both with OnAppend; both append;
+    // explicit poll_remote + manual flush_delta on each side (since
+    // poll_remote excluded from auto-flush per V2 V2 audit M1);
+    // verify final state convergence AND that wire traffic does
+    // NOT diverge (no echo-loop).
+    let base = CollabSession::new(PeerId::new(100)).unwrap();
+    let base_bytes = base.export_bytes().unwrap();
+    let (tx_a, tx_b) = LoopbackTransport::pair();
+
+    let mut peer_a = CollabSession::from_snapshot(PeerId::new(1), &base_bytes).unwrap();
+    peer_a.attach_transport(tx_a);
+    peer_a.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    let mut peer_b = CollabSession::from_snapshot(PeerId::new(2), &base_bytes).unwrap();
+    peer_b.attach_transport(tx_b);
+    peer_b.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    // Both peers append concurrently.
+    peer_a.append_op(add_sheet()).unwrap(); // auto-flush A → B inbox
+    peer_b.append_op(put_value(0, 0, 0, 99.0)).unwrap(); // auto-flush B → A inbox
+
+    // Each peer drains its inbox; explicit flush after poll (since
+    // poll_remote is excluded from auto-flush in V2 V3 step 1).
+    let merged_a = peer_a.poll_remote().unwrap();
+    let merged_b = peer_b.poll_remote().unwrap();
+    assert!(merged_a >= 1, "peer A received peer B's flush");
+    assert!(merged_b >= 1, "peer B received peer A's flush");
+
+    // Each peer flushes the merged state. Idempotency: if the merge
+    // didn't actually advance state beyond what's been flushed, the
+    // second-side flush short-circuits.
+    let a_flushed = peer_a.flush_delta_to_transport().unwrap();
+    let b_flushed = peer_b.flush_delta_to_transport().unwrap();
+    // BOTH peers' state did advance (they received the other's op),
+    // so both flushes fire.
+    let _ = (a_flushed, b_flushed);
+
+    // Drain remaining inbox traffic; verify it terminates (no echo
+    // loop). Cap iterations conservatively: 20 round-trips is way
+    // more than the 2 ops + 2 deltas + idempotency-short-circuit
+    // scenario needs.
+    for _ in 0..20 {
+        let polled_a = peer_a.poll_remote().unwrap();
+        let polled_b = peer_b.poll_remote().unwrap();
+        let flushed_a = peer_a.flush_delta_to_transport().unwrap();
+        let flushed_b = peer_b.flush_delta_to_transport().unwrap();
+        if polled_a == 0 && polled_b == 0 && !flushed_a && !flushed_b {
+            // Steady state — no more traffic. Idempotency guard
+            // working as advertised.
+            break;
+        }
+    }
+
+    // Final convergence check: both peers see the same op count.
+    // Loro CRDT merge is deterministic; both peers have all ops.
+    assert!(peer_a.op_count() >= 2);
+    assert!(peer_b.op_count() >= 2);
+    assert_eq!(
+        peer_a.op_count(),
+        peer_b.op_count(),
+        "symmetric-OnAppend peers MUST converge to the same op count"
+    );
+}

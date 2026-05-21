@@ -671,14 +671,23 @@ impl CollabSession {
     /// caller drives flush explicitly). Setting
     /// [`AutoFlushPolicy::OnAppend`] makes every public mutator on
     /// this session (`append_op`, `merge_bytes`, presence writes,
-    /// `undo`, `redo`) auto-invoke [`flush_to_transport`] internally
-    /// — IDE callers can stop scheduling their own flush ticks.
+    /// `undo`, `redo` when consumed, `sweep_presence`) auto-invoke
+    /// [`flush_delta_to_transport`] internally — IDE callers can
+    /// stop scheduling their own flush ticks.
+    ///
+    /// **Phase 5.5 V2 V3 step 1 audit closure (Opus M2, 2026-05-21):**
+    /// auto-flush routes through the delta path
+    /// ([`flush_delta_to_transport`]), not the full-snapshot path
+    /// ([`flush_to_transport`]). Wire payload is O(per-op delta)
+    /// instead of O(state). See [`AutoFlushPolicy::OnAppend`] for
+    /// the full partial-state contract on transport failure.
     ///
     /// Orthogonal to [`attach_transport`]: setting `OnAppend` without
     /// a transport is harmless (auto-flush is silently a no-op until
-    /// a transport is attached). Conversely, the explicit
-    /// `flush_to_transport` API remains available regardless of
-    /// policy — callers can mix-and-match.
+    /// a transport is attached). Conversely, both explicit
+    /// [`flush_to_transport`] (snapshot) and
+    /// [`flush_delta_to_transport`] (delta) remain available
+    /// regardless of policy — callers can mix-and-match.
     ///
     /// **Partial-state contract**: if an auto-flush attempt fails
     /// (transport closed, I/O error), the surrounding mutator

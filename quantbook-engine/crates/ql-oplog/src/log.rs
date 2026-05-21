@@ -346,15 +346,15 @@ impl OpLog {
     }
 
     /// **Phase 5.5 V2 V3 step 1 (2026-05-21):** read the doc's
-    /// current op-log version vector. Cheap (clones an internal
-    /// `VersionVector`). Used by [`crate::CollabSession`] to track
-    /// per-transport "last successfully flushed" state for delta
-    /// exports.
+    /// current op-log version vector. Cheap — clones an internal
+    /// `VersionVector` whose size is O(peer-count), not O(op-count)
+    /// (per Loro 1.12: `LoroDoc::oplog_vv` returns
+    /// `self.oplog.lock().vv().clone()`; size is one `u32` per
+    /// distinct peer that has ever contributed an op).
     ///
-    /// Wait — `CollabSession` lives in `ql-collab` and depends on
-    /// `ql-oplog`, not the other way around. The cross-reference
-    /// above is one-way: `CollabSession::flush_delta_to_transport`
-    /// calls this accessor. No reverse dependency.
+    /// Called by `ql_collab::CollabSession::flush_delta_to_transport`
+    /// (which depends on `ql-oplog`); there is no reverse
+    /// dependency.
     pub fn oplog_vv(&self) -> loro::VersionVector {
         self.doc.oplog_vv()
     }

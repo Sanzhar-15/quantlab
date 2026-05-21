@@ -14,15 +14,22 @@
 //! after every mutator. Default is `Disabled` (V2 V1 behavior
 //! preserved). See [`crate::AutoFlushPolicy`] +
 //! [`crate::CollabSession::set_auto_flush_policy`].
-//! **Phase 5.5 V2 V3 step 1 (2026-05-21, this ship):** per-transport
-//! version-vector tracking + delta flushes. New
-//! `CollabSession::flush_delta_to_transport` sends only the delta
-//! since the last successful flush, using
+//! **Phase 5.5 V2 V3 step 1 (2026-05-21, this ship):** version-vector
+//! tracking for the **currently attached** transport baseline + delta
+//! flushes. New `CollabSession::flush_delta_to_transport` sends only
+//! the delta since the last successful flush, using
 //! `LoroDoc::ExportMode::Updates`. Auto-flush now routes through
 //! this delta path — wire payload is O(per-op delta) instead of
 //! O(full state). Includes an idempotency short-circuit (no
 //! state change → no send), which closes the V2 V2 audit
-//! echo-loop concern.
+//! echo-loop concern. Codex step 1 audit L3 (2026-05-21): the
+//! checkpoint is per-session-currently-attached-transport, NOT
+//! per-transport-identity — `attach_transport` resets the baseline,
+//! so re-attaching a previously-attached transport starts a fresh
+//! delta chain (Loro dedupe on the peer keeps state convergent;
+//! bandwidth-wasted but correct). V2 V3 step 4 (WebSocket
+//! handshake) will optionally expose "peer already has VV X" so
+//! reconnects don't re-send history.
 //! **Phase 5.5 V2 V3 remaining (pending):** poll_remote auto-flush
 //! wiring (step 2) + offline-write queue (step 3) + WebSocket impl
 //! (step 4) + reconnect / offline sync semantics.
