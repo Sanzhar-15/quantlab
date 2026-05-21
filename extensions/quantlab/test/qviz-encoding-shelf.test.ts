@@ -1,8 +1,9 @@
-/// <reference lib="dom" />
 /*---------------------------------------------------------------------------------------------
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+
+/// <reference lib="dom" />
 
 /**
  * Front 2 V2 (2026-05-14): jsdom tests for the encoding-shelf
@@ -107,7 +108,7 @@ suite('encoding-shelf dropped-by-transform badge -- Front 2 V2', () => {
 		assert.ok(badge, 'badge element exists');
 		assert.strictEqual(badge!.hidden, false, 'badge visible');
 		assert.strictEqual(badge!.textContent, 'dropped by #1');
-		assert.strictEqual(badge!.dataset.transformIndex, '1');
+		assert.strictEqual(badge!.dataset.transformTargetIndex, '1');
 		assert.match(badge!.title, /dropped by transform #1 \(aggregate\)/);
 
 		handle.dispose();
@@ -225,7 +226,7 @@ suite('encoding-shelf dropped-by-transform badge -- Front 2 V2', () => {
 
 		const yShelf = root.querySelector<HTMLElement>('.qviz-shelf[data-channel="y"]');
 		const badge = yShelf!.querySelector<HTMLButtonElement>('.qviz-shelf-dropped-badge');
-		assert.strictEqual(badge!.dataset.transformIndex, '2');
+		assert.strictEqual(badge!.dataset.transformTargetIndex, '2');
 		badge!.click();
 
 		// After click: editor should open on transform #2 (the aggregate).
@@ -287,15 +288,14 @@ suite('encoding-shelf dropped-by-transform badge -- Front 2 V2', () => {
 	});
 
 	test('Front 2 V2 audit HIGH (Opus): focusTransformCard selector matches card, not badge', () => {
-		// The badge button carries data-transform-index too (so its
-		// click handler can read it). Pre-fix, document.querySelector
-		// on the bare attribute returned the badge first in document
-		// order (shelves render above the transform list). Post-fix,
-		// the selector is scoped to .qviz-transform-card so only the
-		// card matches.
+		// Originally the badge button also carried data-transform-index,
+		// and document.querySelector on the bare attribute returned the
+		// badge first in document order (shelves render above the
+		// transform list). The scoped `.qviz-transform-card` selector
+		// stays as defense in depth. The badge's attribute was also
+		// renamed to data-transform-target-index (hygiene pass) so the
+		// bare selector would now miss the badge anyway.
 		const root = mkRoot();
-		// Mount a transform card alongside the shelf so both elements
-		// exist in the DOM with data-transform-index="0".
 		const shelfRoot = document.createElement('div');
 		root.appendChild(shelfRoot);
 		const cardListRoot = document.createElement('div');
@@ -326,11 +326,14 @@ suite('encoding-shelf dropped-by-transform badge -- Front 2 V2', () => {
 		);
 		assert.strictEqual(matched, fakeCard,
 			'scoped selector returns the card, not the badge');
-		// Also verify the badge button (which also has data-transform-index)
-		// would have been returned by the unscoped selector — to pin
-		// the regression.
-		const badge = shelfRoot.querySelector('.qviz-shelf-dropped-badge[data-transform-index="0"]');
-		assert.ok(badge, 'badge exists with data-transform-index=0 (this is the regression vector)');
+		// Verify the badge carries the disambiguated attribute name.
+		const badge = shelfRoot.querySelector('.qviz-shelf-dropped-badge[data-transform-target-index="0"]');
+		assert.ok(badge, 'badge exists with data-transform-target-index=0 (renamed from data-transform-index)');
+		// And confirm the bare data-transform-index selector NO LONGER
+		// matches the badge (the rename made the scoped selector
+		// redundant for this particular collision).
+		const badgeOldAttr = shelfRoot.querySelector('.qviz-shelf-dropped-badge[data-transform-index]');
+		assert.strictEqual(badgeOldAttr, null, 'badge no longer carries data-transform-index after rename');
 
 		handle.dispose();
 	});
@@ -383,7 +386,7 @@ suite('encoding-shelf dropped-by-transform badge -- Front 2 V2', () => {
 		const badge = lowRow!.querySelector<HTMLButtonElement>('.qviz-shelf-dropped-badge');
 		assert.ok(badge);
 		assert.strictEqual(badge!.hidden, false, 'badge visible on dropped low slot');
-		assert.strictEqual(badge!.dataset.transformIndex, '1');
+		assert.strictEqual(badge!.dataset.transformTargetIndex, '1');
 
 		// open / high / close survive; no badge.
 		for (const slot of ['open', 'high', 'close']) {

@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * Schema-aware encoding-type inference — Pattern B (post-smoke
+ * Schema-aware encoding-type inference -- Pattern B (post-smoke
  * builder-coherence pass, 2026-05-13).
  *
  * Single source of truth for "given this column from this schema,
@@ -36,7 +36,7 @@ import type { SchemaColumn, SchemaInfo } from './messageProtocol';
 import type { EncodingType } from './spec';
 
 /** Encoding type vocabulary, matched by the Vega-Lite-side renderer.
- *  `ordinal` is intentionally absent today from classification — only
+ *  `ordinal` is intentionally absent today from classification -- only
  *  user-set encodings carry that type. */
 export type ClassifiedColumnType = 'temporal' | 'quantitative' | 'nominal' | 'ordinal';
 
@@ -82,7 +82,7 @@ export function classifyColumn(col: SchemaColumn): ClassifiedColumnType {
  *     we wire cardinality stats into the schema.
  *   - `size` / `shape` channels: same.
  *   - `x` / `y` channels: pass through `classifyColumn` (no
- *     re-interpretation; quantitative→quantitative, temporal→
+ *     re-interpretation; quantitative -> quantitative, temporal ->
  *     temporal).
  *
  * Returns `null` if the column is not in the schema. Caller can
@@ -92,8 +92,14 @@ export function classifyColumn(col: SchemaColumn): ClassifiedColumnType {
 export function inferEncodingTypeForChannel(
 	schema: SchemaInfo,
 	columnName: string,
-	_channel: 'x' | 'y' | 'y2' | 'color' | 'size' | 'shape' | 'facet_row' | 'facet_col',
+	channel: 'x' | 'y' | 'y2' | 'color' | 'size' | 'shape' | 'facet_row' | 'facet_col',
 ): EncodingType | null {
+	// `channel` is currently unused -- classification is channel-agnostic.
+	// The parameter is reserved for future channel-aware heuristics
+	// (e.g., "color channel prefers ordinal for low-cardinality
+	// numeric"). Keep it on the public signature so callers don't have
+	// to refactor when those heuristics ship.
+	void channel;
 	const col = schema.columns.find(c => c.name === columnName);
 	if (col === undefined) { return null; }
 	return classifyColumn(col);

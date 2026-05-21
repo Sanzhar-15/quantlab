@@ -38,12 +38,12 @@
  *      channel, pick a column via Pattern B (schema-dtype-driven)
  *      using the channel's natural type preference:
  *
- *        x         → temporal > quantitative > nominal/ordinal
- *        y, y2     → quantitative > nominal/ordinal
- *        color     → nominal/ordinal > quantitative
- *        size      → quantitative
- *        shape     → nominal/ordinal
- *        facet_*   → nominal/ordinal
+ *        x         : temporal > quantitative > nominal/ordinal
+ *        y, y2     : quantitative > nominal/ordinal
+ *        color     : nominal/ordinal > quantitative
+ *        size      : quantitative
+ *        shape     : nominal/ordinal
+ *        facet_*   : nominal/ordinal
  *
  *      Skip columns already used by an existing encoding so x != y.
  *
@@ -113,14 +113,23 @@ export function fitChartTypeTransition(
 	const allowedChannels = targetType === 'candlestick'
 		? new Set<string>()
 		: new Set<string>(channelsForChartType(targetType));
-	const next: Record<string, unknown> = {};
-	for (const [ch, val] of Object.entries(oldEnc)) {
+	// Mutable mirror of `Encodings` (which has readonly fields). Replaces
+	// the previous `Record<string, unknown>` accumulator; the keys are
+	// constrained to the `Encodings` channels and each channel's value
+	// type is enforced (e.g., `ohlcv` is `OhlcvEncoding`, others are
+	// `Encoding`).
+	const next: { -readonly [K in keyof Encodings]?: Encodings[K] } = {};
+	for (const ch of Object.keys(oldEnc) as (keyof Encodings)[]) {
+		const val = oldEnc[ch];
 		if (val === undefined) { continue; }
 		if (ch === 'ohlcv') {
-			if (targetType === 'candlestick') { next[ch] = val; }
+			if (targetType === 'candlestick') { next.ohlcv = val as OhlcvEncoding; }
 			continue;
 		}
-		if (allowedChannels.has(ch)) { next[ch] = val; }
+		if (allowedChannels.has(ch)) {
+			// `ch` is a non-ohlcv `keyof Encodings`, so its value is `Encoding`.
+			(next as Record<typeof ch, Encoding>)[ch] = val as Encoding;
+		}
 	}
 
 	const filled: FitFilledChannel[] = [];
@@ -159,7 +168,7 @@ export function fitChartTypeTransition(
 	// Non-candlestick targets never have `ohlcv` in `next` (we filtered
 	// it at the top), so every value here is an Encoding.
 	const used = new Set<string>();
-	for (const ch of Object.keys(next)) {
+	for (const ch of Object.keys(next) as (keyof Encodings)[]) {
 		if (ch === 'ohlcv') { continue; }
 		const enc = next[ch] as Encoding | undefined;
 		if (enc !== undefined) {
@@ -190,16 +199,22 @@ export function fitChartTypeTransition(
 // ---------------------------------------------------------------------------
 
 /** Per-channel preference list. The fitter walks this in order and
- *  picks the first matching column not already used. */
+ *  picks the first matching column not already used.
+ *
+ *  Note: `'ordinal'` is intentionally absent. Pattern B's
+ *  `classifyColumn` returns only `'temporal' | 'quantitative' | 'nominal'`,
+ *  so an `'ordinal'` preference entry would never match a real column.
+ *  Ordinal is reachable only when the user explicitly sets it on an
+ *  encoding (not via the fitter). */
 const CHANNEL_TYPE_PREFERENCE: Record<RegularChannel, readonly ClassifiedColumnType[]> = {
-	x: ['temporal', 'quantitative', 'nominal', 'ordinal'],
-	y: ['quantitative', 'nominal', 'ordinal'],
+	x: ['temporal', 'quantitative', 'nominal'],
+	y: ['quantitative', 'nominal'],
 	y2: ['quantitative'],
-	color: ['nominal', 'ordinal', 'quantitative'],
+	color: ['nominal', 'quantitative'],
 	size: ['quantitative'],
-	shape: ['nominal', 'ordinal'],
-	facet_row: ['nominal', 'ordinal'],
-	facet_col: ['nominal', 'ordinal'],
+	shape: ['nominal'],
+	facet_row: ['nominal'],
+	facet_col: ['nominal'],
 };
 
 function pickColumnForChannel(
@@ -219,15 +234,11 @@ function pickColumnForChannel(
 		for (const col of schema.columns) {
 			if (used.has(col.name)) { continue; }
 			if (classifyColumn(col) !== wantType) { continue; }
-			// Pattern B (schema-driven): the persisted encoding type
-			// is the classified type. wantType doubles as the encoding
-			// type since classification and Vega-Lite encoding
-			// vocabularies are the same set ({temporal, quantitative,
-			// nominal, ordinal}).
-			return {
-				field: col.name,
-				type: wantType === 'ordinal' ? 'ordinal' : wantType,
-			};
+			// Pattern B (schema-driven): the classified type IS the
+			// persisted encoding type. CHANNEL_TYPE_PREFERENCE excludes
+			// `'ordinal'` (see its docstring), so wantType is always a
+			// valid `EncodingType` here.
+			return { field: col.name, type: wantType };
 		}
 	}
 	return null;

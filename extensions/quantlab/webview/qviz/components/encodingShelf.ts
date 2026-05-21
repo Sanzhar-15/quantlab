@@ -45,17 +45,22 @@ import { findColumnDrop } from '../util/attribution';
  *  helper dispatches the open-editor action for the responsible
  *  transform AND scrolls its card into view. The card is located by
  *  the `data-transform-index="${N}"` attribute added by transformList.
+ *  The BADGE stores its scroll target as `data-transform-target-index`
+ *  (renamed from `data-transform-index` to disambiguate from the card's
+ *  own identifier attribute).
  *  No-op if the card isn't in the DOM (e.g., transform list hasn't
  *  rendered yet). */
 function focusTransformCard(store: QvizStore, index: number): void {
 	store.dispatch({ type: 'openTransformEditor', index });
 	// Front 2 V2 audit HIGH (Opus, 2026-05-14): scope the selector to
-	// `.qviz-transform-card`. The badge buttons ALSO carry
-	// `data-transform-index` (so the click handler can read it), so a
-	// bare attribute selector picked up the badge first in document
-	// order (shelves render above the transform list). The selector
-	// was scrolling the badge into view (already visible) instead of
-	// the responsible card.
+	// `.qviz-transform-card`. Originally the badge buttons also carried
+	// `data-transform-index`, so a bare attribute selector picked up the
+	// badge first in document order (shelves render above the transform
+	// list) and scrolled the badge into view (already visible) instead
+	// of the responsible card. The badge's attribute was renamed to
+	// `data-transform-target-index` (hygiene pass) so the bare selector
+	// would also work now -- but the scoped selector stays as defense in
+	// depth.
 	const card = document.querySelector<HTMLElement>(
 		`.qviz-transform-card[data-transform-index="${index}"]`,
 	);
@@ -198,7 +203,7 @@ function mountRegularShelves(
 		droppedBadge.hidden = true;
 		droppedBadge.addEventListener('click', (e) => {
 			e.stopPropagation();
-			const idxStr = droppedBadge.dataset.transformIndex;
+			const idxStr = droppedBadge.dataset.transformTargetIndex;
 			if (idxStr !== undefined) {
 				focusTransformCard(store, Number(idxStr));
 			}
@@ -286,11 +291,11 @@ function mountRegularShelves(
 				els.droppedBadge.hidden = false;
 				els.droppedBadge.textContent = `dropped by #${drop.index}`;
 				els.droppedBadge.title = `dropped by transform #${drop.index} (${drop.kind}) -- click to open`;
-				els.droppedBadge.dataset.transformIndex = String(drop.index);
+				els.droppedBadge.dataset.transformTargetIndex = String(drop.index);
 			} else {
 				els.droppedBadge.hidden = true;
 				els.droppedBadge.textContent = '';
-				delete els.droppedBadge.dataset.transformIndex;
+				delete els.droppedBadge.dataset.transformTargetIndex;
 			}
 		}
 	};
@@ -371,7 +376,7 @@ function mountOhlcvShelf(root: HTMLElement, store: QvizStore): () => void {
 		droppedBadge.hidden = true;
 		droppedBadge.addEventListener('click', (e) => {
 			e.stopPropagation();
-			const idxStr = droppedBadge.dataset.transformIndex;
+			const idxStr = droppedBadge.dataset.transformTargetIndex;
 			if (idxStr !== undefined) {
 				focusTransformCard(store, Number(idxStr));
 			}
@@ -425,11 +430,11 @@ function mountOhlcvShelf(root: HTMLElement, store: QvizStore): () => void {
 				els.droppedBadge.hidden = false;
 				els.droppedBadge.textContent = `dropped by #${drop.index}`;
 				els.droppedBadge.title = `dropped by transform #${drop.index} (${drop.kind}) -- click to open`;
-				els.droppedBadge.dataset.transformIndex = String(drop.index);
+				els.droppedBadge.dataset.transformTargetIndex = String(drop.index);
 			} else {
 				els.droppedBadge.hidden = true;
 				els.droppedBadge.textContent = '';
-				delete els.droppedBadge.dataset.transformIndex;
+				delete els.droppedBadge.dataset.transformTargetIndex;
 			}
 		}
 	};
