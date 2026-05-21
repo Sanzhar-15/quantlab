@@ -43,6 +43,23 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("build tokio runtime")
 }
 
+/// **V2 V4 V1 step 1 (Tier K1):** multi-thread runtime for tests that
+/// call sync `flush_pending()`. The single-threaded runtime above
+/// would deadlock because flush_pending blocks the worker thread via
+/// `Condvar::wait_timeout`, preventing the writer/reader tokio tasks
+/// from making progress. Multi-thread runtime gives the tokio tasks
+/// their own workers. This matches the documented async-context
+/// caveat in `Transport::flush_pending` — real IDE consumers either
+/// run on a multi-thread runtime OR wrap the call in
+/// `tokio::task::spawn_blocking`.
+fn multi_thread_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build multi-thread tokio runtime")
+}
+
 /// Poll `try_recv` with short sleeps for up to `max_iters * 10ms`
 /// looking for a binary blob. Async background tasks need a chance
 /// to deliver bytes; tests block on this helper.
@@ -622,6 +639,225 @@ fn transport_last_error_returns_none_when_no_transport_attached() {
     let session = CollabSession::new(PeerId::new(1)).expect("session");
     assert!(!session.has_transport());
     assert_eq!(session.transport_last_error(), None);
+}
+
+// =============================================================
+// V2 V4 V1 step 1 — Tier K1 ack channel (flush_pending)
+// =============================================================
+
+#[test]
+fn flush_pending_with_no_pending_returns_ok_immediately() {
+    // **V2 V4 V1 step 1 (Tier K1):** baseline — flush_pending on a
+    // freshly-connected transport with nothing queued returns Ok
+    // without blocking.
+    //
+    // Uses multi_thread_runtime because flush_pending is a blocking-
+    // sync call that would deadlock on a single-threaded runtime
+    // (writer task can't make progress while the worker is blocked).
+    // See the helper docstring + Transport::flush_pending async-
+    // context caveat.
+    let rt = multi_thread_runtime();
+    rt.block_on(async {
+        let server = EchoServer::start().await;
+        let mut ws = WebSocketTransport::connect(&server.url())
+            .await
+            .expect("handshake");
+
+        let start = std::time::Instant::now();
+        let result = ws.flush_pending();
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "flush_pending with no pending bytes MUST return Ok"
+        );
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "flush_pending with no pending bytes MUST not block (took {elapsed:?})"
+        );
+    });
+}
+
+#[test]
+fn flush_pending_blocks_until_writer_catches_up() {
+    // **V2 V4 V1 step 1 (Tier K1):** pin the blocking-then-Ok semantic.
+    // Send several blobs; immediately call flush_pending. Verify it
+    // returns Ok AFTER the writer task has caught up (i.e., the echo
+    // server has reflected the blobs back).
+    let rt = multi_thread_runtime();
+    rt.block_on(async {
+        let server = EchoServer::start().await;
+        let mut ws = WebSocketTransport::connect(&server.url())
+            .await
+            .expect("handshake");
+
+        for i in 0..5u8 {
+            ws.send(&[i, i + 1, i + 2]).expect("send");
+        }
+
+        // flush_pending should block until all 5 sends are flushed.
+        let start = std::time::Instant::now();
+        let result = ws.flush_pending();
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "flush_pending after 5 sends MUST return Ok once writer drains, got {result:?}"
+        );
+        // Some blocking time is expected (mpsc + ws_sink + tokio
+        // scheduling). Upper bound is generous for slow CI.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "flush_pending blocked unreasonably long: {elapsed:?}"
+        );
+
+        // Echo verification: each blob should have been sent over
+        // the wire (and echoed back).
+        let mut received = 0;
+        for _ in 0..30 {
+            match ws.try_recv() {
+                Ok(Some(_)) => received += 1,
+                Ok(None) => tokio::time::sleep(Duration::from_millis(20)).await,
+                Err(_) => break,
+            }
+            if received >= 5 {
+                break;
+            }
+        }
+        assert_eq!(
+            received, 5,
+            "all 5 blobs MUST have been flushed (and echoed back), got {received}"
+        );
+    });
+}
+
+#[test]
+fn flush_pending_after_close_returns_closed() {
+    // **V2 V4 V1 step 1 (Tier K1):** closed-state fast-path. If the
+    // transport is already closed on entry, flush_pending returns
+    // Err(Closed) without blocking.
+    let rt = multi_thread_runtime();
+    rt.block_on(async {
+        let server = EchoServer::start().await;
+        let mut ws = WebSocketTransport::connect(&server.url())
+            .await
+            .expect("handshake");
+
+        // Queue a few sends, close the transport explicitly, then
+        // flush_pending.
+        ws.send(b"a").expect("send");
+        ws.send(b"b").expect("send");
+        ws.close();
+
+        let start = std::time::Instant::now();
+        let result = ws.flush_pending();
+        let elapsed = start.elapsed();
+
+        // After explicit close, flush_pending may either:
+        //   (a) return Err(Closed) immediately (closed-flag check on
+        //       wait_timeout wake-up), OR
+        //   (b) return Ok if the writer task happened to drain both
+        //       sends before we observed the closed flag.
+        // Both are valid per the contract. Pin the "either Ok or
+        // Closed within a bounded time" semantic.
+        match result {
+            Ok(()) | Err(TransportError::Closed) => {}
+            other => panic!("expected Ok or Err(Closed), got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "flush_pending after close took too long: {elapsed:?}"
+        );
+    });
+}
+
+#[test]
+fn flush_pending_returns_closed_if_server_drops_mid_flush() {
+    // **V2 V4 V1 step 1 (Tier K1):** pin the "writer fails mid-flush"
+    // path. Server is dropped while flush_pending is parked on the
+    // Condvar. Reader task sees disconnect → sets closed → notifies
+    // Condvar (via Drop on EchoServer aborting per-conn tasks → TCP
+    // socket dies → ws_stream errors → reader sets closed). The
+    // writer task notify_all on closed-flag transition wakes up
+    // flush_pending which observes the closed flag and returns
+    // Err(Closed).
+    let rt = multi_thread_runtime();
+    rt.block_on(async {
+        let server = EchoServer::start().await;
+        let mut ws = WebSocketTransport::connect(&server.url())
+            .await
+            .expect("handshake");
+
+        // Queue some sends.
+        ws.send(b"in-flight-1").expect("send");
+        ws.send(b"in-flight-2").expect("send");
+
+        // Drop the server — TCP socket dies on per-conn abort.
+        drop(server);
+
+        // flush_pending should eventually observe the closed state and
+        // return Err. Acceptable: also returns Ok if the writer
+        // happened to send both blobs before the TCP teardown was
+        // observed.
+        let start = std::time::Instant::now();
+        let result = ws.flush_pending();
+        let elapsed = start.elapsed();
+
+        match result {
+            Ok(()) | Err(TransportError::Closed) => {}
+            other => panic!("expected Ok or Err(Closed), got {other:?}"),
+        }
+        // Should not hang. The Condvar wait_timeout is 100ms; the
+        // closed flag should be observed within a few iterations.
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "flush_pending hung post-server-drop: {elapsed:?}"
+        );
+    });
+}
+
+#[test]
+fn collab_session_flush_pending_to_transport_proxies() {
+    // **V2 V4 V1 step 1 (Tier K1):** pin the proxy reaches the WS's
+    // flush_pending through Box<dyn Transport>.
+    let rt = multi_thread_runtime();
+    rt.block_on(async {
+        let server = EchoServer::start().await;
+        let ws = WebSocketTransport::connect(&server.url())
+            .await
+            .expect("handshake");
+
+        let mut session = CollabSession::new(PeerId::new(1)).expect("session");
+        session.attach_transport(ws);
+        session.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+        // Append some ops — each triggers auto-flush.
+        session.append_op(add_sheet()).expect("add_sheet");
+        session.append_op(put_value(0, 0, 0, 1.0)).expect("put");
+        session.append_op(put_value(0, 0, 1, 2.0)).expect("put");
+
+        // Proxy through to the WS's flush_pending. Should return Ok
+        // once the writer task has caught up on all auto-flush sends.
+        let result = session.flush_pending_to_transport();
+        assert!(
+            result.is_ok(),
+            "flush_pending_to_transport MUST return Ok after auto-flushed sends, got {result:?}"
+        );
+    });
+}
+
+#[test]
+fn flush_pending_no_transport_returns_ok() {
+    // **V2 V4 V1 step 1 (Tier K1):** session-level proxy with no
+    // attached transport returns Ok (nothing to flush). Mirror of the
+    // transport_last_error_returns_none_when_no_transport pattern.
+    let mut session = CollabSession::new(PeerId::new(1)).expect("session");
+    assert!(!session.has_transport());
+    let result = session.flush_pending_to_transport();
+    assert!(
+        result.is_ok(),
+        "flush_pending with no transport MUST return Ok, got {result:?}"
+    );
 }
 
 #[test]

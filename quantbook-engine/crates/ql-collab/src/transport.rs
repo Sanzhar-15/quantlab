@@ -179,6 +179,47 @@ pub trait Transport {
     fn last_error(&self) -> Option<String> {
         None
     }
+
+    /// Block until every byte blob previously queued via `send` has
+    /// been written to the underlying transport's wire (e.g. WebSocket
+    /// sink). Default `Ok(())` for synchronous transports
+    /// (`LoopbackTransport`, `NoopTransport`) where `send` is already
+    /// wire-delivery — there is no buffer to drain.
+    ///
+    /// **Phase 5.5 V2 V4 V1 step 1 (2026-05-21) — Tier K1 ack channel.**
+    /// Closes the V2 V3 step 5 megaudit's convergent finding (Codex M1
+    /// and Opus-B M1): buffered async transports
+    /// (`WebSocketTransport`) return `Ok` from `send` once bytes are
+    /// queued in an mpsc channel, NOT when bytes reach the wire.
+    /// Without `flush_pending`, `CollabSession::has_pending_flush()
+    /// == false` would mean "queued to currently-attached transport,"
+    /// not "delivered." For IDE consumers building "safe to close
+    /// window?" workflows, this is a real UX hole. `flush_pending`
+    /// lets callers block until the local writer has caught up,
+    /// providing a level-1 ack (bytes hit `ws_sink.send`
+    /// successfully). TCP-ack (level 2) and peer-application-ack
+    /// (level 3) require lower-layer hooks or custom protocols
+    /// respectively.
+    ///
+    /// # Errors
+    ///
+    /// - `Err(TransportError::Closed)` if the transport is closed
+    ///   (either before `flush_pending` was called OR during the wait
+    ///   — e.g., writer task failed mid-flush and set the closed
+    ///   flag).
+    /// - `Err(TransportError::Io)` for internal synchronization
+    ///   failures (mutex poisoning from a panicked task).
+    ///
+    /// # Async-context caveat
+    ///
+    /// `flush_pending` is blocking-sync (uses `Condvar::wait_timeout`).
+    /// Calling it from within a tokio task body will block the
+    /// runtime worker. Wrap with `tokio::task::block_in_place` (on
+    /// multi-thread runtimes) or `tokio::task::spawn_blocking` (on
+    /// any runtime) to avoid stalling other tasks.
+    fn flush_pending(&mut self) -> Result<(), TransportError> {
+        Ok(())
+    }
 }
 
 /// No-op `Transport` impl for tests + scaffolding.

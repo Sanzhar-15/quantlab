@@ -734,6 +734,46 @@ impl CollabSession {
         self.transport.as_ref().and_then(|t| t.last_error())
     }
 
+    /// **Phase 5.5 V2 V4 V1 step 1 (2026-05-21) — Tier K1 ack channel.**
+    /// Block until every byte blob previously queued via the attached
+    /// transport's `send` has reached the wire. Returns `Ok(())`
+    /// immediately if no transport is attached.
+    ///
+    /// Closes the V2 V3 step 5 megaudit's convergent finding (Codex
+    /// M1 + Opus-B M1): after `flush_delta_to_transport()` returns
+    /// `Ok(true)`, the bytes are queued in the (buffered)
+    /// transport's internal channel, NOT yet on the wire. Without
+    /// this proxy, `has_pending_flush() == false` could be observed
+    /// while bytes have not actually been written. Calling
+    /// `flush_pending_to_transport()` AFTER `flush_delta_to_transport`
+    /// (or any mutator under `OnAppend`) closes that gap — Ok return
+    /// confirms the local writer task has caught up, providing a
+    /// level-1 ack (bytes hit the underlying transport's wire).
+    ///
+    /// # Errors
+    /// - `Err(CollabSessionError::Transport(Closed))` if the transport
+    ///   closed before completing the drain (e.g., writer task failed
+    ///   mid-flush; reconnect via `detach_transport` + new
+    ///   `attach_transport` will redeliver the bytes via the V2 V3
+    ///   step 1 baseline-reset contract).
+    /// - `Err(CollabSessionError::Transport(Io))` for internal
+    ///   synchronization failures (mutex poisoning from a panicked
+    ///   task — recovery requires reconnect).
+    ///
+    /// # Async-context caveat
+    ///
+    /// This is blocking-sync. Calling from inside a tokio task body
+    /// will block a runtime worker. Wrap with
+    /// `tokio::task::block_in_place` (multi-thread runtime) or
+    /// `tokio::task::spawn_blocking` (any runtime).
+    pub fn flush_pending_to_transport(&mut self) -> Result<(), CollabSessionError> {
+        if let Some(t) = self.transport.as_mut() {
+            t.flush_pending().map_err(CollabSessionError::Transport)
+        } else {
+            Ok(())
+        }
+    }
+
     /// **Phase 5.5 V2 V2 (2026-05-21):** set the auto-flush policy
     /// for this session. Returns the previous policy.
     ///

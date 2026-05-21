@@ -88,8 +88,9 @@
 //! // ... appends now propagate via WebSocket automatically ...
 //! ```
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use ql_collab::{Transport, TransportError};
@@ -270,6 +271,21 @@ pub struct WebSocketTransport {
     /// clean shutdowns (caller `close()`, Drop, or graceful Close
     /// frame from peer).
     last_error: Arc<Mutex<Option<WebSocketError>>>,
+    /// **Phase 5.5 V2 V4 V1 step 1 (2026-05-21) — Tier K1 ack channel.**
+    /// Incremented by [`Transport::send`] on Ok return. Total bytes
+    /// queued lifetime (monotonic, never resets). Compared against
+    /// [`Self::progress.0`] in [`Transport::flush_pending`] to detect
+    /// when the writer task has caught up.
+    queued_count: Arc<AtomicU64>,
+    /// **Phase 5.5 V2 V4 V1 step 1 (2026-05-21) — Tier K1 ack channel.**
+    /// `(counter, condvar)` pair. Counter is incremented by the writer
+    /// task AFTER each successful `ws_sink.send`. Condvar is notified
+    /// on each counter increment AND on `closed`-flag transition (so
+    /// `flush_pending` callers waiting on the Condvar wake up and
+    /// observe the closed state). Sync primitives (not tokio) because
+    /// `flush_pending` is called from sync caller code and needs to
+    /// block synchronously without a tokio runtime context.
+    progress: Arc<(Mutex<u64>, Condvar)>,
     /// Background tokio task that drains `outbound_rx` and writes
     /// `Message::Binary` frames to the WebSocket sink. Aborted on
     /// `Drop`.
@@ -332,6 +348,19 @@ impl WebSocketTransport {
         let last_error_writer = Arc::clone(&last_error);
         let last_error_reader = Arc::clone(&last_error);
 
+        // **Phase 5.5 V2 V4 V1 step 1 (2026-05-21) — Tier K1 ack channel.**
+        // Track writer-task progress for `Transport::flush_pending`.
+        // `queued_count` is incremented by `send()` after a successful
+        // mpsc enqueue. `progress.0` is the counter of bytes
+        // successfully flushed to the WebSocket sink, incremented by
+        // the writer task. `progress.1` (Condvar) is notified after
+        // each progress increment AND on closed-flag transitions, so
+        // `flush_pending` blocked in `wait_timeout` can wake and
+        // observe the new state.
+        let queued_count = Arc::new(AtomicU64::new(0));
+        let progress = Arc::new((Mutex::new(0u64), Condvar::new()));
+        let progress_writer = Arc::clone(&progress);
+
         // Writer task: drains outbound mpsc, writes Binary frames to
         // the WS sink. Exits on outbound_rx close (caller dropped
         // outbound_tx, which happens when WebSocketTransport drops)
@@ -357,8 +386,18 @@ impl WebSocketTransport {
                     // via last_error() after seeing TransportError::Closed.
                     record_runtime_error(&last_error_writer, e.to_string());
                     closed_writer.store(true, Ordering::Relaxed);
+                    // V2 V4 V1 step 1: wake any flush_pending waiters
+                    // so they observe the now-set closed flag.
+                    progress_writer.1.notify_all();
                     _guard.mark_clean_exit();
                     return;
+                }
+                // V2 V4 V1 step 1 (Tier K1): writer task successfully
+                // wrote one byte blob to the WS sink. Advance the
+                // progress counter + notify any flush_pending waiters.
+                if let Ok(mut counter) = progress_writer.0.lock() {
+                    *counter += 1;
+                    progress_writer.1.notify_all();
                 }
             }
             // outbound_rx closed (sender dropped) — clean shutdown.
@@ -369,6 +408,9 @@ impl WebSocketTransport {
             // the Drop impl. Reachable from a future "soft close" API
             // that detaches outbound_tx explicitly.
             let _ = ws_sink.close().await;
+            // V2 V4 V1 step 1: wake any flush_pending waiters on
+            // clean exit too (graceful "soft close" path).
+            progress_writer.1.notify_all();
             _guard.mark_clean_exit();
         });
 
@@ -451,6 +493,8 @@ impl WebSocketTransport {
             inbound_rx,
             closed,
             last_error,
+            queued_count,
+            progress,
             writer_task,
             reader_task,
         })
@@ -497,8 +541,13 @@ impl WebSocketTransport {
     ///
     /// Does NOT abort the background tasks — only Drop does that. If
     /// the caller wants the tasks gone, drop the transport.
+    ///
+    /// **V2 V4 V1 step 1 (Tier K1):** also notifies the
+    /// flush_pending Condvar so any concurrent `flush_pending` waiter
+    /// wakes up and observes the new closed state.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
+        self.progress.1.notify_all();
     }
 }
 
@@ -518,7 +567,16 @@ impl Drop for WebSocketTransport {
         // `closed = true` ordering: set first so any concurrent
         // sync `send`/`try_recv` observes Closed via the flag check
         // before the task abort propagates.
+        //
+        // **V2 V4 V1 step 1 (Tier K1):** also notify the
+        // flush_pending Condvar — a caller awaiting a long-running
+        // flush would otherwise wait until the next wait_timeout
+        // tick to observe the closed flag. (Unreachable in practice
+        // because Drop is called on a unique `&mut self` so no
+        // concurrent flush_pending can be in flight, but kept for
+        // safety + future shared-reference APIs.)
         self.closed.store(true, Ordering::Relaxed);
+        self.progress.1.notify_all();
         self.writer_task.abort();
         self.reader_task.abort();
     }
@@ -543,7 +601,13 @@ impl Transport for WebSocketTransport {
         // task exited (panic, abort, or graceful). Treat as Closed.
         self.outbound_tx
             .send(bytes.to_vec())
-            .map_err(|_| TransportError::Closed)
+            .map_err(|_| TransportError::Closed)?;
+        // **V2 V4 V1 step 1 (2026-05-21) — Tier K1 ack channel.**
+        // Bump the queued-count counter AFTER successful mpsc enqueue.
+        // flush_pending() reads this as the target the writer task
+        // must catch up to.
+        self.queued_count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     fn try_recv(&mut self) -> Result<Option<Vec<u8>>, TransportError> {
@@ -585,6 +649,48 @@ impl Transport for WebSocketTransport {
     /// transport before attach.
     fn last_error(&self) -> Option<String> {
         Self::last_error(self).map(|e| e.to_string())
+    }
+
+    /// **V2 V4 V1 step 1 (2026-05-21) — Tier K1 ack channel.**
+    /// Block until every byte blob previously queued via `send` has
+    /// been written to the WebSocket sink. Closes the V2 V3 step 5
+    /// megaudit's convergent finding (queued-vs-acked semantics).
+    ///
+    /// Mechanism: reads `queued_count` as the target; locks the
+    /// `progress.0` counter and uses `Condvar::wait_timeout` to wake
+    /// every 100ms (so closed-flag transitions are observed promptly).
+    /// The writer task increments `progress.0` + `notify_all` after
+    /// each successful `ws_sink.send`, AND `notify_all` on closed-
+    /// flag transitions.
+    ///
+    /// # Errors
+    /// - `TransportError::Closed` if the transport was already closed
+    ///   on entry, OR if the writer task sets closed mid-wait (e.g.,
+    ///   ws_sink.send failed).
+    /// - `TransportError::Io` if the progress mutex is poisoned by a
+    ///   panicked writer task. The poisoned-mutex recovery via
+    ///   `PoisonError::into_inner()` is intentionally NOT used here:
+    ///   if the writer panicked mid-counter-increment, the counter
+    ///   may be in an inconsistent state (e.g., notify_all happened
+    ///   before counter increment); reading + retrying could
+    ///   busy-loop forever. Surface as Io and let the caller
+    ///   recover via reconnect.
+    fn flush_pending(&mut self) -> Result<(), TransportError> {
+        let target = self.queued_count.load(Ordering::SeqCst);
+        let (counter_lock, cv) = &*self.progress;
+        let mut counter = counter_lock
+            .lock()
+            .map_err(|e| TransportError::Io(format!("flush_pending lock poisoned: {e}")))?;
+        while *counter < target {
+            if self.closed.load(Ordering::Relaxed) {
+                return Err(TransportError::Closed);
+            }
+            let (new_counter, _timeout_result) = cv
+                .wait_timeout(counter, Duration::from_millis(100))
+                .map_err(|e| TransportError::Io(format!("flush_pending wait poisoned: {e}")))?;
+            counter = new_counter;
+        }
+        Ok(())
     }
 }
 

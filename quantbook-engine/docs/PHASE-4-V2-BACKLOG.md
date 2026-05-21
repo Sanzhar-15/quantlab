@@ -563,14 +563,13 @@ verify the fix works empirically.
 
 **Context:** the 3-way megaudit caught **cumulative-state issues** invisible at per-step level. The convergent finding (Codex M1 + Opus-B M1) — queued-vs-acked semantics — is documented in V2 V3 step 5 closure but the structural fix (an ack channel) is V2 V4 work. Other Tier K items are forward-leaning architecture/observability features the step 5 closure documented or sidelined.
 
-### K1. Ack channel for end-to-end delivery confirmation
+### K1. Ack channel for end-to-end delivery confirmation — ✅ SHIPPED V2 V4 V1 step 1 (2026-05-21)
 
 - **Source:** V2 V3 step 5 megaudit Codex M1 + Opus-B M1 (convergent).
-- **Problem:** `last_flushed_vv` advances when `Transport::send` returns Ok (= queued to mpsc), not when bytes hit the wire. For buffered async impls (`WebSocketTransport`), this leaves a window where the consumer believes "synced" but the writer task could fail / be aborted / panic before transmission. The V2 V3 step 5 closure documents this in `Transport::send` + `flush_delta_to_transport` docs; the structural fix is deferred here.
-- **V2 V4 closure:** add an explicit ack-channel API. Two shapes considered:
-  1. `Transport::ack_pending(&mut self) -> impl Future<Output = Result<(), TransportError>>` — caller awaits until transport confirms delivery. Requires async-fn-in-trait or a separate trait. Breaking change.
-  2. `Transport::flush_pending(&mut self) -> Result<(), TransportError>` — drains internal buffer synchronously (for WS: drain mpsc + await writer task's progress with a timeout). Backwards-compatible if added with default `Ok(())`.
-- **Consumer pattern after closure:** `session.flush_delta_to_transport()?; if let Some(t) = session.transport_mut() { t.ack_pending().await?; }` — then `has_pending_flush()=false` truly means peer-acked.
+- **Problem:** `last_flushed_vv` advances when `Transport::send` returns Ok (= queued to mpsc), not when bytes hit the wire. For buffered async impls (`WebSocketTransport`), this leaves a window where the consumer believes "synced" but the writer task could fail / be aborted / panic before transmission.
+- **Closure:** shipped at HEAD `[V2 V4 V1 step 1 commit]`. Picked option 2 (sync `flush_pending`). Added `Transport::flush_pending(&mut self) -> Result<(), TransportError>` trait method with default `Ok(())`. `WebSocketTransport` overrides — uses `Arc<(Mutex<u64>, Condvar)>` progress + `AtomicU64 queued_count` to block sync caller until the writer task has caught up on all queued sends. `CollabSession::flush_pending_to_transport()` proxy added. **Level-1 ack only** (bytes hit `ws_sink.send` successfully — not TCP-ack, not peer-application-ack). 6 new integration tests pin the contract. Async-context caveat documented (use `block_in_place` / `spawn_blocking` from tokio task bodies).
+- **Consumer pattern:** `session.flush_delta_to_transport()?; session.flush_pending_to_transport()?;` — then `has_pending_flush() == false` truly means bytes hit the wire (within current process; TCP reliability handles wire→peer transit).
+- **Out of scope (defer to future V2 V4+):** TCP-ack (not exposed by tokio-tungstenite); peer-application-ack (requires protocol change with bidirectional ack messages).
 
 ### K2. Mid-drop bytes-lost test pinning
 
