@@ -525,11 +525,11 @@ verify the fix works empirically.
 - **Initial-ship-then-corrected note:** the ship-commit version used `self.log.len()` (visible LoroList) as the count source. The convergent step 2 audit (Codex M1 + Opus H1) caught that Loro's UndoManager retracts ops from the visible list, breaking monotonicity. Audit closure switched to VV math.
 - **Deferred:** `pending_op_summary() -> { count, oldest_timestamp }` — Loro's op log doesn't expose a wall-clock timestamp per op. If V2 V4+ adds one, the summary wrapper is a 10-line addition. Stays deferred without a separate tier entry.
 
-### I2. Offline-write discard API
+### I2. Offline-write discard API — ✅ SHIPPED V2 V4 V1 step 5 (2026-05-21)
 
 - **Source:** V2 V3 step 3 audit Opus M2.
-- **Problem:** Loro op log doesn't support "ungrowing." An IDE with a "discard unsynced changes on window close" workflow has no clean API — they'd have to reconstruct a fresh `CollabSession` from a pre-offline snapshot.
-- **V2 V4 closure:** add `CollabSession::discard_pending_ops(&mut self) -> Result<usize>` that builds a fresh session from the last-flushed snapshot (the V2 V3 step 1 `last_flushed_vv` checkpoint gives the boundary). Requires snapshot-at-VV capability from Loro 1.12+ (verify API exists).
+- **Problem:** Loro op log doesn't support "ungrowing." An IDE with a "discard unsynced changes on window close" workflow had no clean API.
+- **Closure:** added `CollabSession::discard_pending_ops(&mut self) -> Result<usize>` backed by NEW `OpLog::fork_at_vv(&self, &VersionVector) -> Result<Self>`. The fork uses Loro 1.12's `LoroDoc::vv_to_frontiers` + `LoroDoc::fork_at` composition. If `last_flushed_vv == Some(vv)`: log forks at vv (revert to checkpoint). If `last_flushed_vv == None`: log replaced with fresh `OpLog::new()` (discard everything — covers the from_snapshot-never-flushed case). Preserves peer_id, transport, auto_flush_policy. Recreates UndoManager against the new doc. Returns count of discarded ops (matches pre-call `pending_op_count()`). 6 tests pin the contract.
 
 ---
 

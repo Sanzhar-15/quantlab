@@ -1997,3 +1997,126 @@ fn pending_op_count_on_from_snapshot_returns_imported_count() {
         "from_snapshot pending_op_count MUST reflect imported ops, got {count}"
     );
 }
+
+// ============================================================
+// V2 V4 V1 step 5 — Tier I2: discard_pending_ops
+// ============================================================
+
+#[test]
+fn discard_pending_ops_zero_returns_ok_no_change() {
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    assert_eq!(s.pending_op_count(), 0);
+    let discarded = s.discard_pending_ops().expect("discard");
+    assert_eq!(discarded, 0, "no pending ops → discard returns 0");
+    assert_eq!(s.op_count(), 0, "log still empty");
+}
+
+#[test]
+fn discard_pending_ops_with_offline_appends_reverts_log() {
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    s.append_op(add_sheet()).unwrap();
+    s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+    s.append_op(put_value(0, 0, 1, 2.0)).unwrap();
+    let pre_count = s.pending_op_count();
+    assert!(pre_count >= 3, "offline appends accumulated");
+
+    let discarded = s.discard_pending_ops().expect("discard");
+    assert_eq!(discarded, pre_count, "returns exactly pending_op_count");
+    assert_eq!(s.pending_op_count(), 0);
+    assert!(!s.has_pending_flush());
+    assert_eq!(
+        s.op_count(),
+        0,
+        "log is empty after discard from None baseline"
+    );
+}
+
+#[test]
+fn discard_pending_ops_after_flush_reverts_to_flushed_state() {
+    let (tx_a, _tx_b) = LoopbackTransport::pair();
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    s.attach_transport(tx_a);
+
+    s.append_op(add_sheet()).unwrap();
+    s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+    s.flush_delta_to_transport().expect("flush");
+    let checkpoint_op_count = s.op_count();
+    assert!(checkpoint_op_count >= 2);
+
+    s.append_op(put_value(0, 0, 1, 2.0)).unwrap();
+    s.append_op(put_value(0, 0, 2, 3.0)).unwrap();
+    s.append_op(put_value(0, 0, 3, 4.0)).unwrap();
+    let pre_discard_pending = s.pending_op_count();
+    assert!(pre_discard_pending >= 3);
+
+    let discarded = s.discard_pending_ops().expect("discard");
+    assert_eq!(discarded, pre_discard_pending);
+    assert_eq!(s.pending_op_count(), 0);
+    assert!(!s.has_pending_flush());
+    assert_eq!(
+        s.op_count(),
+        checkpoint_op_count,
+        "log reverted to checkpoint state"
+    );
+}
+
+#[test]
+fn discard_pending_ops_preserves_session_state() {
+    let (tx_a, _tx_b) = LoopbackTransport::pair();
+    let mut s = CollabSession::new(PeerId::new(42)).unwrap();
+    s.attach_transport(tx_a);
+    s.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    s.append_op(add_sheet()).unwrap();
+    let _ = s.detach_transport();
+    s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+    assert!(s.pending_op_count() >= 1);
+
+    let _ = s.discard_pending_ops().expect("discard");
+
+    assert_eq!(s.peer_id(), PeerId::new(42), "peer_id preserved");
+    assert!(
+        !s.has_transport(),
+        "transport state preserved (was detached)"
+    );
+    assert_eq!(
+        s.auto_flush_policy(),
+        AutoFlushPolicy::OnAppend,
+        "policy preserved"
+    );
+}
+
+#[test]
+fn discard_pending_ops_recreates_undo_manager() {
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    s.append_op(add_sheet()).unwrap();
+    s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+
+    let _ = s.discard_pending_ops().expect("discard");
+
+    s.append_op(put_value(0, 0, 5, 99.0)).unwrap();
+    let undid = s.undo().expect("undo");
+    assert!(undid, "the new op is undoable on the recreated UndoManager");
+
+    let undid2 = s.undo().expect("second undo no-op");
+    assert!(!undid2, "no more undo items after the recreation boundary");
+}
+
+#[test]
+fn discard_pending_ops_from_snapshot_with_no_flush_clears_imported_ops() {
+    let mut origin = CollabSession::new(PeerId::new(1)).unwrap();
+    origin.append_op(add_sheet()).unwrap();
+    origin.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+    let bytes = origin.export_bytes().unwrap();
+
+    let mut reborn = CollabSession::from_snapshot(PeerId::new(2), &bytes).unwrap();
+    assert!(reborn.has_pending_flush(), "from_snapshot is pending");
+    let pre_count = reborn.pending_op_count();
+    assert!(pre_count >= 2);
+
+    let discarded = reborn.discard_pending_ops().expect("discard");
+    assert_eq!(discarded, pre_count, "discards the imported ops");
+    assert_eq!(reborn.op_count(), 0, "log fully empty");
+    assert!(!reborn.has_pending_flush());
+    assert_eq!(reborn.peer_id(), PeerId::new(2), "peer_id preserved");
+}

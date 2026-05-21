@@ -992,6 +992,94 @@ impl CollabSession {
         total as usize
     }
 
+    /// **Phase 5.5 V2 V4 V1 step 5 (2026-05-21) — Tier I2.** Discard
+    /// all ops appended to the local log since the last successful
+    /// flush. Returns the count of ops discarded (matches the
+    /// pre-call `pending_op_count()` return).
+    ///
+    /// # When to use
+    ///
+    /// IDE workflows that need a "discard unsynced changes" gesture
+    /// — e.g., a user clicks "Discard" in a window-close dialog, or
+    /// the IDE detects that local edits violate a server-enforced
+    /// constraint and wants to revert.
+    ///
+    /// # What's discarded
+    ///
+    /// - Local appends since `last_flushed_vv` (via `append_op`,
+    ///   `undo`, `redo` when consumed).
+    /// - Merges from peers since `last_flushed_vv` (`merge_bytes`).
+    /// - Presence ops since `last_flushed_vv` (presence is in the
+    ///   same `LoroDoc`).
+    /// - The internal `UndoManager`'s history of those ops.
+    ///
+    /// # What's preserved
+    ///
+    /// - `peer_id` (re-set on the forked doc).
+    /// - The attached transport (still attached; not detached).
+    /// - `auto_flush_policy`.
+    /// - `last_flushed_vv` (the checkpoint we reverted to).
+    /// - The transport's `last_error` (V2 V3 step 5 accessor still
+    ///   reachable via `transport_last_error()`).
+    ///
+    /// # Edge cases
+    ///
+    /// - `pending_op_count() == 0` on entry: returns `Ok(0)`,
+    ///   no-op fast-path. Skips the fork entirely.
+    /// - `last_flushed_vv == None` (never flushed): discards
+    ///   EVERYTHING. The log becomes empty. This covers the
+    ///   `from_snapshot` session that imported state and never
+    ///   flushed — caller's responsibility to know they're
+    ///   discarding the imported snapshot too.
+    /// - **Active undo group**: caller MUST end the group BEFORE
+    ///   calling. If a group is active, this method tears down the
+    ///   underlying `UndoManager` (recreated against the forked
+    ///   doc), leaving the dangling `UndoGroupGuard` in an
+    ///   undefined state. Don't do that.
+    ///
+    /// # Post-condition
+    ///
+    /// - `pending_op_count() == 0`.
+    /// - `has_pending_flush() == false`.
+    /// - `op_count() == last_flushed_op_count_logical` (the
+    ///   op-count at the checkpoint we forked from; matches the
+    ///   `op_count()` value at the last successful flush).
+    ///
+    /// # Errors
+    ///
+    /// - `CollabSessionError::OpLog(_)` if `OpLog::fork_at_vv`
+    ///   fails (should not happen if `last_flushed_vv` came from
+    ///   this session's own `oplog_vv` — Loro guarantees the
+    ///   round-trip).
+    /// - `CollabSessionError::OpLog(_)` if the post-fork
+    ///   `set_peer_id` fails (Loro reserves `u64::MAX`; our
+    ///   `PeerId::new` enforces non-sentinel at construction, so
+    ///   this should not happen in practice).
+    pub fn discard_pending_ops(&mut self) -> Result<usize, CollabSessionError> {
+        let pre_count = self.pending_op_count();
+        if pre_count == 0 {
+            return Ok(0);
+        }
+        let new_log = match self.last_flushed_vv.clone() {
+            Some(vv) => self.log.fork_at_vv(&vv)?,
+            None => {
+                // Never flushed → discard ALL ops → start fresh.
+                // The `from_snapshot` session case ends up here too;
+                // documented as caller's responsibility.
+                ql_oplog::OpLog::new()
+            }
+        };
+        self.log = new_log;
+        // Restore the stable peer_id on the new doc (fork_at gives
+        // a fresh Loro-default peer_id; we want our session's PeerId).
+        self.log.set_peer_id(self.peer_id.as_u64())?;
+        // UndoManager is tied to the prior LoroDoc; recreate against
+        // the new one. Active undo groups become invalid (documented
+        // as caller's responsibility).
+        self.undo = make_undo_manager(&self.log);
+        Ok(pre_count)
+    }
+
     /// **Phase 5.5 V2 V2 (2026-05-21):** internal hook called by every
     /// public mutator after a successful state change. Fires
     /// [`flush_to_transport`] when policy is `OnAppend` AND a transport

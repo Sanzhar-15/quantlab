@@ -359,6 +359,34 @@ impl OpLog {
         self.doc.oplog_vv()
     }
 
+    /// **Phase 5.5 V2 V4 V1 step 5 (2026-05-21) — Tier I2.** Fork
+    /// the underlying `LoroDoc` at the given VersionVector, returning
+    /// a new `OpLog` whose history ends at that VV. Used by
+    /// [`ql_collab::CollabSession::discard_pending_ops`] to revert
+    /// pending ops back to the last-flushed checkpoint.
+    ///
+    /// Composes `LoroDoc::vv_to_frontiers` + `LoroDoc::fork_at`:
+    /// 1. Convert `vv` to the precise causal-history Frontiers marker.
+    /// 2. Fork the doc — the new doc contains ONLY ops with
+    ///    counter ≤ the corresponding entry in `vv`, per peer.
+    ///
+    /// The returned `OpLog`'s `oplog_vv()` matches the input `vv`
+    /// exactly. The peer-id of the new doc is fresh (Loro's default
+    /// at construction time); callers should `set_peer_id` if they
+    /// want to preserve their stable PeerId for subsequent appends.
+    ///
+    /// # Errors
+    ///
+    /// - `OpLogError::Loro(_)` if `LoroDoc::fork_at` fails (e.g., the
+    ///   given VV references peers/counters not present in the local
+    ///   history — should not happen if `vv` came from this same
+    ///   doc's `oplog_vv` snapshot).
+    pub fn fork_at_vv(&self, vv: &loro::VersionVector) -> Result<Self, OpLogError> {
+        let frontiers = self.doc.vv_to_frontiers(vv);
+        let forked = self.doc.fork_at(&frontiers)?;
+        Ok(Self { doc: forked })
+    }
+
     /// Reconstruct an `OpLog` from a previously-exported snapshot.
     /// If the snapshot doesn't carry our `"ops"` container shape,
     /// subsequent `iter` / `len` calls operate on an empty list
