@@ -158,10 +158,18 @@ impl Transport for NoopTransport {
 /// // ... append ops on a, drain via tx_a.send / tx_b.try_recv ...
 /// ```
 ///
-/// CollabSession does NOT auto-flush to its attached Transport
-/// in V1 (Phase 5.5 V2 will wire append → send). For now, tests
-/// drive the flow manually: append, export_bytes, send via the
-/// transport, recv on the other side, merge_bytes.
+/// **Phase 5.5 V2 V2 (2026-05-21):** `CollabSession` supports
+/// opt-in auto-flush via `AutoFlushPolicy::OnAppend` — every
+/// session mutator (`append_op`, `merge_bytes`, presence writes,
+/// `undo` / `redo` when consumed, `sweep_presence`) then sends
+/// through the attached transport automatically. Default policy
+/// remains `Disabled` (V2 V1 explicit-drive behavior). Tests can
+/// still drive the flow manually: append, export_bytes, send via
+/// the transport, recv on the other side, merge_bytes — useful
+/// when the test wants deterministic control over when bytes
+/// land on the wire (e.g. ordering tests). `poll_remote` does
+/// NOT auto-flush by design — see `AutoFlushPolicy::OnAppend` for
+/// the rationale.
 ///
 /// ## Close semantics
 ///

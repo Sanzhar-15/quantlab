@@ -197,10 +197,28 @@ pub enum AutoFlushPolicy {
     /// Flush automatically after every public method that mutates the
     /// underlying `LoroDoc`. Triggers on: `append_op`, `merge_bytes`,
     /// `update_presence`, `clear_presence`, `sweep_presence`,
-    /// `undo`, `redo`. Does NOT trigger on accessor methods, on
-    /// undo-group boundary methods (`start_undo_group` /
-    /// `end_undo_group` — only their inner appends fire, via
-    /// `append_op`), or on transport-lifecycle methods.
+    /// `undo`, `redo`. Does NOT trigger on:
+    /// - Accessor methods (read-only).
+    /// - Undo-group boundary methods (`start_undo_group` /
+    ///   `end_undo_group`) — only their inner appends fire, via
+    ///   `append_op`. Each mid-group append produces ONE auto-flush;
+    ///   the group is a LOCAL undo unit only (peers see each append
+    ///   land independently). Phase 5.5 V2 V2 audit closure (Opus
+    ///   L1) — undo-group atomicity-over-wire deferred to V2 V3.
+    /// - Transport-lifecycle methods (`attach_transport` etc.).
+    /// - `poll_remote` / `poll_remote_with_limit` — **receive-side
+    ///   excluded by design** (audit-locked Phase 5.5 V2 V2, Codex
+    ///   M1 + Opus M1, 2026-05-21). When a remote feeds you their
+    ///   snapshot, your peer-fanout side is responsible for
+    ///   batching its own flushes via explicit
+    ///   [`CollabSession::flush_to_transport`] after the drain. The
+    ///   exclusion exists for two reasons: (1) avoids the echo-loop
+    ///   class with two symmetric-OnAppend peers (see caveat
+    ///   below); (2) callers polling a high-volume inbound stream
+    ///   commonly want to coalesce many merged blobs into one
+    ///   outbound flush. V2 V3 with per-transport version vectors
+    ///   will revisit (idempotent re-flush of unchanged state is
+    ///   safe under deltas).
     ///
     /// If no transport is attached, this is silently a no-op (the
     /// flush hook checks `self.transport.is_some()` first).
@@ -214,6 +232,20 @@ pub enum AutoFlushPolicy {
     /// limitation H7). Callers MUST treat their local state as
     /// authoritative for the local UI and either retry the flush
     /// (transport recovered) or detach the transport.
+    ///
+    /// **Symmetric-OnAppend caveat (Phase 5.5 V2 V2 audit closure,
+    /// 2026-05-21):** in V2 V2, enabling `OnAppend` on BOTH peers of
+    /// a paired transport (e.g. `LoopbackTransport::pair()`) is
+    /// safe today ONLY because `poll_remote` deliberately does not
+    /// auto-flush (see exclusion list above). If a future
+    /// contributor wires `poll_remote` into the auto-flush path
+    /// without also adding a version-vector / "did state advance"
+    /// idempotency guard, a ping-pong echo loop results: A appends
+    /// → A flushes → B polls + merges + auto-flushes (no-op merge,
+    /// but unchanged snapshot back to A) → A polls + merges +
+    /// auto-flushes → etc. Loro deduplicates op-level, but the
+    /// wire payload churns. V2 V3 closes the asymmetry + the
+    /// idempotency guard together.
     OnAppend,
 }
 
@@ -697,6 +729,18 @@ impl CollabSession {
     /// the function returns `Ok(merged)`. `Io` errors propagate
     /// as `CollabSessionError::Transport` — any merges before
     /// the error already persist in the local `OpLog`.
+    ///
+    /// **Phase 5.5 V2 V2 audit closure (Codex M1 + Opus M1,
+    /// 2026-05-21) — does NOT auto-flush.** Drains merge directly
+    /// into `self.log` (low-level `OpLog::merge_bytes`), bypassing
+    /// `CollabSession::merge_bytes` and therefore
+    /// [`AutoFlushPolicy::OnAppend`]'s post-mutator hook. **By
+    /// design** — see [`AutoFlushPolicy::OnAppend`] § "Does NOT
+    /// trigger on" for the rationale (echo-loop avoidance + caller-
+    /// batch coalescing). If you need to fan a polled batch
+    /// onward, call [`flush_to_transport`] explicitly after the
+    /// drain. V2 V3 may revisit once per-transport version vectors
+    /// make unchanged-state re-flush a no-op.
     pub fn poll_remote(&mut self) -> Result<usize, CollabSessionError> {
         self.poll_remote_with_limit(DEFAULT_POLL_REMOTE_LIMIT)
     }
@@ -746,6 +790,12 @@ impl CollabSession {
     /// `Display` form). Subsequent calls overwrite the previous
     /// value (LWW per peer); merges with other peers'
     /// presence writes preserve all distinct peers.
+    ///
+    /// **Phase 5.5 V2 V2 (2026-05-21):** triggers auto-flush per
+    /// [`auto_flush_policy`]. Partial-state contract on flush
+    /// failure: the presence write is already committed to
+    /// `self.log` when the auto-flush attempt runs — same shape
+    /// as `append_op` (see [`AutoFlushPolicy::OnAppend`]).
     pub fn update_presence(&mut self, state: PresenceState) -> Result<(), CollabSessionError> {
         let key = presence::peer_key(self.peer_id);
         let json = serde_json::to_string(&state).map_err(PresenceError::Serialize)?;
@@ -776,6 +826,11 @@ impl CollabSession {
     /// peer leaves the session (window close, disconnect). After
     /// removal, other peers' `peer_presence(self_id)` returns
     /// `Ok(None)`.
+    ///
+    /// **Phase 5.5 V2 V2 (2026-05-21):** triggers auto-flush per
+    /// [`auto_flush_policy`]. Same partial-state contract as
+    /// `update_presence` — the removal is committed locally
+    /// before the auto-flush attempt.
     pub fn clear_presence(&mut self) -> Result<(), CollabSessionError> {
         let key = presence::peer_key(self.peer_id);
         self.log.presence_remove(&key)?;
@@ -796,23 +851,46 @@ impl CollabSession {
     /// Presence updates are excluded from the undo stack by
     /// construction (see `CollabSession::new`), so cursor movements
     /// don't consume undo slots.
+    ///
+    /// **Phase 5.5 V2 V2 + audit closure (2026-05-21):** triggers
+    /// auto-flush per [`auto_flush_policy`], but ONLY when
+    /// `consumed == true` (an inverse op was actually appended).
+    /// `Ok(false)` on an empty stack never attempts the flush, so
+    /// a closed transport cannot turn a "nothing to undo" into a
+    /// spurious `Err(Transport(_))` (Codex M2 closure). Partial-
+    /// state contract on flush failure when `consumed == true`:
+    /// the inverse op is already committed to `self.log` — same
+    /// shape as `append_op`.
     pub fn undo(&mut self) -> Result<bool, CollabSessionError> {
         let consumed = self.undo.undo()?;
-        // Auto-flush unconditionally: simplest correct behavior. When
-        // `consumed == false` no inverse op was appended, so the flush
-        // sends the unchanged snapshot — peers see no new ops
-        // (idempotent at the Loro layer). V2 V3 version-vector deltas
-        // will skip this no-op send.
-        self.maybe_auto_flush()?;
+        // **Phase 5.5 V2 V2 audit closure (Codex M2, 2026-05-21):** only
+        // auto-flush when an undo item was actually consumed. The prior
+        // "flush unconditionally" pattern turned `Ok(false)` into
+        // `Err(Transport(_))` when the transport was closed AND the
+        // undo stack was empty — spurious failure semantics. With the
+        // gate, `undo` on an empty stack stays `Ok(false)` regardless
+        // of transport state (no mutation, no flush attempt).
+        if consumed {
+            self.maybe_auto_flush()?;
+        }
         Ok(consumed)
     }
 
     /// **Phase 5.4 V1 (2026-05-19):** redo the last undone op.
     /// Returns `Ok(true)` if a redo stack item was consumed,
     /// `Ok(false)` if the stack was empty.
+    ///
+    /// **Phase 5.5 V2 V2 + audit closure (2026-05-21):** matches
+    /// [`undo`] — auto-flush fires only when `consumed == true`.
+    /// Partial-state contract on flush failure when consumed:
+    /// the redo's appended op is already in `self.log` (mutate-
+    /// then-flush).
     pub fn redo(&mut self) -> Result<bool, CollabSessionError> {
         let consumed = self.undo.redo()?;
-        self.maybe_auto_flush()?;
+        // Phase 5.5 V2 V2 audit closure (Codex M2): gate matches `undo`.
+        if consumed {
+            self.maybe_auto_flush()?;
+        }
         Ok(consumed)
     }
 
@@ -964,6 +1042,12 @@ impl CollabSession {
     /// Caller-opt-in by design: a session that WANTS to see other
     /// peers' last-known positions (e.g. an IDE rejoining a live
     /// collab session) skips the sweep.
+    ///
+    /// **Phase 5.5 V2 V2 (2026-05-21):** triggers ONE auto-flush
+    /// after the batch removal (not per-key — N intermediate
+    /// snapshots would be wasted bandwidth). Partial-state contract
+    /// on flush failure: all N presence entries are already
+    /// removed locally when the auto-flush attempt runs.
     pub fn sweep_presence(&mut self) -> Result<usize, CollabSessionError> {
         let keys = self.log.presence_peers();
         let count = keys.len();

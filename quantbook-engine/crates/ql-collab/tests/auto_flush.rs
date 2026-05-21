@@ -252,14 +252,221 @@ fn on_append_close_mid_session_recovers_via_detach_and_reattach() {
     // But local op IS committed (partial-state contract).
     assert_eq!(s.op_count(), 2);
 
-    // Recovery: detach bad, attach fresh, resume.
+    // Recovery: detach bad, attach a fresh LoopbackTransport pair so
+    // we can verify the resumed appends actually reach the wire AND
+    // that the previously-"failed-flush" op #2 (committed locally) is
+    // included in the next snapshot. Phase 5.5 V2 V2 audit closure
+    // Opus L2 (2026-05-21): pre-closure this test used NoopTransport
+    // and never asserted that op #2 appears post-reattach.
     let _bad = s.detach_transport();
-    s.attach_transport(NoopTransport::new());
+    let (tx_fresh, mut fresh_observer) = LoopbackTransport::pair();
+    s.attach_transport(tx_fresh);
     s.append_op(put_value(0, 1, 0, 2.0)).unwrap();
     assert_eq!(s.op_count(), 3);
 
+    // Verify the recovered transport's peer sees a snapshot that
+    // contains BOTH op #2 (the "failed flush" op) and op #3. The
+    // V2 V2 full-snapshot semantics mean every flush carries the
+    // full local state from scratch, so the freshly-attached
+    // transport gets the complete log even though it joined late.
+    assert_eq!(
+        fresh_observer.pending_recv(),
+        1,
+        "post-reattach append MUST auto-flush onto the fresh transport"
+    );
+    let snap = fresh_observer.try_recv().unwrap().expect("snapshot bytes");
+    let recovered_log = ql_oplog::OpLog::import_bytes(&snap).unwrap();
+    assert_eq!(
+        recovered_log.len(),
+        3,
+        "full-snapshot flush MUST include op #1 (pre-failure) + op #2 (failed-flush op, committed locally) + op #3 (post-recovery)"
+    );
+
     // Silence the original drop of tx_b detached.
     let _ = detached;
+}
+
+// ===== Codex M2 closure: undo/redo gate auto-flush on `consumed == true` =====
+
+#[test]
+fn undo_on_empty_stack_does_not_auto_flush_even_with_closed_transport() {
+    // Phase 5.5 V2 V2 audit closure (Codex M2, 2026-05-21): undo on
+    // an empty stack must not attempt the auto-flush — otherwise a
+    // closed transport turns "nothing to undo" into a spurious
+    // Err(Transport(_)). Pre-closure the flush ran unconditionally.
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    let mut bad = NoopTransport::new();
+    bad.close();
+    s.attach_transport(bad);
+    s.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    // Empty undo stack — no consumption, no flush attempt, no Err
+    // from the closed transport.
+    let result = s.undo();
+    assert!(
+        matches!(result, Ok(false)),
+        "undo on empty stack with closed transport MUST be Ok(false) (no flush attempt); got {result:?}"
+    );
+
+    // Same for redo.
+    let result = s.redo();
+    assert!(
+        matches!(result, Ok(false)),
+        "redo on empty stack with closed transport MUST be Ok(false); got {result:?}"
+    );
+}
+
+#[test]
+fn undo_with_item_consumed_still_fires_auto_flush() {
+    // Phase 5.5 V2 V2 audit closure (Codex M2 sanity check): the gate
+    // must NOT suppress auto-flush in the consumed-true case.
+    let (tx_a, observer) = LoopbackTransport::pair();
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    s.append_op(add_sheet()).unwrap();
+    s.append_op(put_value(0, 0, 0, 99.0)).unwrap();
+
+    s.attach_transport(tx_a);
+    s.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    assert_eq!(observer.pending_recv(), 0);
+    let consumed = s.undo().unwrap();
+    assert!(consumed, "undo stack has an item from prior append");
+    assert_eq!(
+        observer.pending_recv(),
+        1,
+        "undo with consumed=true MUST still auto-flush"
+    );
+}
+
+// ===== Codex M3 closure: failure coverage on merge_bytes =====
+
+#[test]
+fn merge_bytes_with_closed_transport_surfaces_err_after_local_commit() {
+    // Phase 5.5 V2 V2 audit closure (Codex M3, 2026-05-21): extend
+    // failure coverage beyond append_op. merge_bytes follows the
+    // same partial-state contract — the merge is committed locally
+    // before the auto-flush attempt.
+    let base = CollabSession::new(PeerId::new(100)).unwrap();
+    let base_bytes = base.export_bytes().unwrap();
+    let mut peer_b = CollabSession::from_snapshot(PeerId::new(2), &base_bytes).unwrap();
+    peer_b.append_op(add_sheet()).unwrap();
+    let b_bytes = peer_b.export_bytes().unwrap();
+
+    let mut peer_a = CollabSession::from_snapshot(PeerId::new(1), &base_bytes).unwrap();
+    let mut bad = NoopTransport::new();
+    bad.close();
+    peer_a.attach_transport(bad);
+    peer_a.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    let result = peer_a.merge_bytes(&b_bytes);
+    assert!(
+        matches!(
+            result,
+            Err(CollabSessionError::Transport(TransportError::Closed))
+        ),
+        "merge_bytes with closed transport MUST surface Err; got {result:?}"
+    );
+
+    // Partial-state contract: peer B's op is already merged locally.
+    assert!(
+        peer_a.op_count() >= 1,
+        "merge MUST be committed locally before flush attempt; op_count={}",
+        peer_a.op_count()
+    );
+}
+
+// ===== Opus L1 closure: pin undo-group + OnAppend semantics =====
+
+#[test]
+fn on_append_within_undo_group_fires_per_append_not_per_group() {
+    // Phase 5.5 V2 V2 audit closure (Opus L1, 2026-05-21): pin the
+    // current contract — undo-group is a LOCAL undo unit; on the
+    // wire each mid-group append fires its own auto-flush. If a
+    // future change wants atomic-over-wire group semantics, this
+    // test must be updated deliberately.
+    let (tx_a, observer) = LoopbackTransport::pair();
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    s.attach_transport(tx_a);
+    s.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    s.start_undo_group().unwrap();
+    s.append_op(add_sheet()).unwrap();
+    s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+    s.end_undo_group();
+
+    // V2 V2 contract: 2 auto-flushes (one per mid-group append).
+    // 0 auto-flushes on end_undo_group (boundary-only, no mutation).
+    assert_eq!(
+        observer.pending_recv(),
+        2,
+        "V2 V2 contract: mid-group appends each auto-flush; group is local-only on the wire"
+    );
+}
+
+// ===== Codex M1 + Opus M1 closure: poll_remote is receive-side-excluded by design =====
+
+#[test]
+fn poll_remote_does_not_trigger_auto_flush_by_design() {
+    // Phase 5.5 V2 V2 audit closure (Codex M1 + Opus M1, 2026-05-21):
+    // poll_remote merges directly into self.log (low-level OpLog
+    // method) and does NOT fire maybe_auto_flush. This is audit-
+    // locked behavior — see AutoFlushPolicy::OnAppend docstring §
+    // "Does NOT trigger on" for the rationale (echo-loop avoidance
+    // + caller batches its own flushes).
+    //
+    // Topology: 3 peers. Hub (A) is connected to B via T1 (A holds
+    // tx_ab_a, B's "channel" is tx_ab_b) AND to C via T2 (A holds
+    // tx_ac_a, observer holds tx_ac_c). When B sends ops via T1, A's
+    // poll_remote drains them but does NOT auto-flush onward to C
+    // via T2. The hub pattern requires an explicit flush after the
+    // poll batch.
+    let (tx_ab_a, mut tx_ab_b) = LoopbackTransport::pair();
+    let (tx_ac_a, tx_ac_c) = LoopbackTransport::pair();
+
+    let mut hub = CollabSession::new(PeerId::new(1)).unwrap();
+    hub.attach_transport(tx_ac_a);
+    hub.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    // B pushes a byte blob into A's inbox via tx_ab_b.send.
+    let mut peer_b = CollabSession::new(PeerId::new(2)).unwrap();
+    peer_b.append_op(add_sheet()).unwrap();
+    let b_bytes = peer_b.export_bytes().unwrap();
+    tx_ab_b.send(&b_bytes).unwrap();
+
+    // Hub's poll_remote uses the T2 transport (A's only attached one).
+    // But it CAN'T see T1 bytes — A doesn't have T1 attached. So this
+    // test needs the hub to swap transports temporarily.
+    //
+    // Simpler model: hub has T1 attached, drains T1's inbox via
+    // poll_remote, and we observe that T2's observer endpoint stays
+    // empty (because A doesn't have T2 in this configuration).
+    //
+    // The simplest empirical assertion is just: with poll_remote
+    // bringing in bytes, the SAME-side observer sees nothing.
+    drop(hub);
+    let mut hub = CollabSession::new(PeerId::new(1)).unwrap();
+    hub.attach_transport(tx_ab_a);
+    hub.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    // Drain B's bytes into hub. After poll_remote, hub's log has B's
+    // op. But because poll_remote is excluded from auto-flush, NO
+    // bytes should appear on tx_ab_b's inbox (the hub doesn't fan
+    // its newly-merged state back through the same transport).
+    let merged = hub.poll_remote().unwrap();
+    assert_eq!(merged, 1, "hub drained 1 blob from B");
+    assert!(
+        hub.op_count() >= 1,
+        "hub's log now contains B's op (poll_remote merged it)"
+    );
+    assert_eq!(
+        tx_ab_b.pending_recv(),
+        0,
+        "poll_remote MUST NOT trigger auto-flush — no bytes back to B's inbox"
+    );
+
+    // T2 observer also stays empty because hub doesn't hold T2 in
+    // this configuration; this is just a sanity check.
+    let _ = tx_ac_c;
 }
 
 // ===== Auto-flush fires on every documented mutator =====
