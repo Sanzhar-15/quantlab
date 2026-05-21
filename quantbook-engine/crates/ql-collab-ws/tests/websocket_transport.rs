@@ -981,22 +981,29 @@ fn text_frames_are_dropped_silently_binary_still_delivers() {
 #[test]
 fn mid_drop_bytes_lost_recoverable_via_reattach() {
     // **V2 V4 V1 step 4 (Tier K2, 2026-05-21):** pin the documented
-    // V2 V3 step 5 megaudit Opus-B M1 contract:
-    // `WebSocketTransport::Drop` may discard in-flight mpsc bytes
+    // V2 V3 step 5 megaudit Opus-B M1 RECOVERY contract:
+    // `WebSocketTransport::Drop` MAY discard in-flight mpsc bytes
     // (writer task is aborted before draining the outbound channel),
-    // but the V2 V3 step 1 baseline-reset on `attach_transport`
+    // and the V2 V3 step 1 baseline-reset on `attach_transport`
     // makes the next flush re-send EVERYTHING from empty VV — so a
-    // reattach to a new transport recovers all ops, even ones that
-    // never hit the wire on the dropped transport.
+    // reattach to a new transport recovers all ops regardless of
+    // whether the prior transport DID deliver some, all, or none.
     //
-    // This test exercises that recovery flow end-to-end so a future
-    // refactor "fixing" the drop-loss can't silently change the
-    // observable behavior without us noticing.
+    // **V2 V4 V1 step 4 audit closure (Codex L1 + Opus L1,
+    // 2026-05-21):** this test pins the RECOVERY CONTRACT, not the
+    // drop-loss EVENT itself. On a fast machine, the writer task
+    // may have completed all `ws_sink.send` calls before Drop
+    // aborts it; the test passes either way because the recovery
+    // contract holds regardless (Loro dedupes own ops on echo
+    // merge). Forcing deterministic drop-loss would require a
+    // controllable stalling transport fixture; the V2 V4 V1 scope
+    // is "recovery works," not "drop loss is observable."
     let rt = multi_thread_runtime();
     rt.block_on(async {
         // Phase 1: attach WS#1, send several ops, drop the transport
         // WITHOUT calling flush_pending_to_transport (deliberately —
-        // we're exercising the drop-loss path).
+        // the recovery contract holds regardless of whether the
+        // writer drained before abort).
         let server1 = EchoServer::start().await;
         let ws1 = WebSocketTransport::connect(&server1.url())
             .await

@@ -697,9 +697,17 @@ mod tests {
         let pre_len = log.len();
         let result = log.merge_bytes(&[]);
 
-        // The pinned behavior in Loro 1.12: empty input is treated
-        // as Err (Loro can't decode an empty byte stream as either
-        // Snapshot or Updates). Pin Err but don't panic.
+        // **V2 V4 V1 step 4 audit closure (Opus L2):** the test
+        // PINS: "no panic + no partial-state (log.len() unchanged)."
+        // It does NOT strictly pin Ok-vs-Err. Loro 1.12 currently
+        // returns Err(Loro(_)), but a future Loro version could
+        // accept empty as a no-op (Ok) — both shapes are acceptable
+        // here. The strict pinned invariants are: (1) does not panic,
+        // (2) log.len() remains pre_len, (3) Err variant (if any) is
+        // OpLogError::Loro (the documented passthrough variant), not
+        // some other variant. Treating Ok and Err as equally valid
+        // is a deliberate trade-off — strict Err pinning would catch
+        // intentional Loro behavior shifts as test failures.
         match result {
             Ok(post_len) => {
                 // If a future Loro version accepts empty as a no-op,

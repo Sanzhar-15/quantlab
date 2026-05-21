@@ -23,18 +23,46 @@ use tokio_tungstenite::tungstenite::Message;
 /// reader observes EOF and marks closed. Without per-conn tracking,
 /// `drop(server)` would only stop accepting NEW connections and
 /// existing ones would dangle until the test process exits.
+/// **V2 V4 V1 step 4 audit closure (Codex M1, 2026-05-21):** shared
+/// state for accept loop + Drop, protecting against a multi-thread
+/// race where:
+/// 1. Accept task awaits accept().
+/// 2. Accept resumes; tokio::spawn returns a handle (sync).
+/// 3. **Another thread** runs `Server::drop` — aborts accept,
+///    locks state, drains tasks, unlocks.
+/// 4. Accept task resumes (still in sync code between spawn and
+///    lock). Locks state. Pushes the handle.
+/// 5. Result: the per-conn task is now in `tasks` AFTER Drop's
+///    drain → leaks past test end.
+///
+/// The `closing` flag closes this race: Drop sets `closing = true`
+/// under the lock, and the accept loop checks the flag AFTER taking
+/// the lock and aborts the orphan handle directly if `closing` is
+/// true. Both paths are atomic under the same mutex.
+///
+/// Shared between `EchoServer` and `TextFrameServer` (both use the
+/// same accept→push pattern). Per V2 V4 V1 step 4 audit Opus M1:
+/// any future fixture adding a similar pattern MUST use this state
+/// or risk reintroducing the same race.
+struct ServerState {
+    closing: bool,
+    tasks: Vec<JoinHandle<()>>,
+}
+
 pub struct EchoServer {
     addr: SocketAddr,
     accept_task: JoinHandle<()>,
-    conn_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    state: Arc<Mutex<ServerState>>,
 }
 
 impl EchoServer {
     /// Bind a TcpListener on 127.0.0.1:0 and spawn an accept loop.
     /// Each incoming connection is upgraded to a WebSocket and runs
     /// a per-connection echo loop in its own spawned task. The
-    /// per-conn JoinHandle is recorded on `conn_tasks` so `Drop` can
-    /// abort it.
+    /// per-conn JoinHandle is recorded on `state.tasks` so `Drop`
+    /// can abort it; the `state.closing` flag guards against the
+    /// V2 V4 V1 step 4 audit closure race described on
+    /// `EchoServerState`.
     pub async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -42,32 +70,34 @@ impl EchoServer {
         let addr = listener
             .local_addr()
             .expect("local_addr after successful bind");
-        // **V2 V4 V1 step 4 (Tier K3, 2026-05-21):** `std::sync::Mutex`
-        // is LOAD-BEARING here for Drop race-freedom. The accept loop
-        // does `spawn → lock → push` synchronously — `accept_task.abort()`
-        // schedules cancellation at the next `.await`, which is the
-        // next `listener.accept().await` iteration. So a spawned
-        // per-conn handle is ALWAYS in `conn_tasks` before the next
-        // await point, and Drop's drain catches it.
-        //
-        // **Migration risk to `tokio::sync::Mutex`**: that variant's
-        // `lock()` is `.await`-able. An await between spawn and push
-        // would open a window where a per-conn task is spawned but
-        // not yet in `conn_tasks` when the accept loop is cancelled
-        // — the task would leak past test end → tokio runtime hang
-        // on drop. Per V2 V3 step 5 megaudit Opus-B M5: if migrating
-        // to async Mutex, add a synchronization barrier (e.g., a
-        // `tokio::sync::Notify`) to signal accept-loop quiescence
-        // before Drop's drain.
-        let conn_tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
-        let conn_tasks_in_accept = Arc::clone(&conn_tasks);
+        // **V2 V4 V1 step 4 audit closure (Codex M1, 2026-05-21):**
+        // see `EchoServerState` docstring for the closing-flag
+        // race-protection rationale. The prior version used a bare
+        // `Vec<JoinHandle>` under sync mutex; that closed the
+        // single-thread interleaving (within the accept task itself)
+        // but not the multi-thread interleaving (accept task vs
+        // Drop on another runtime worker). The closing-flag pattern
+        // serializes "is Drop done?" + "is task registered?" under
+        // the same lock.
+        let state = Arc::new(Mutex::new(ServerState {
+            closing: false,
+            tasks: Vec::new(),
+        }));
+        let state_in_accept = Arc::clone(&state);
         let accept_task = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _peer_addr)) => {
                         let handle = tokio::spawn(handle_echo_connection(stream));
-                        if let Ok(mut tasks) = conn_tasks_in_accept.lock() {
-                            tasks.push(handle);
+                        if let Ok(mut guard) = state_in_accept.lock() {
+                            if guard.closing {
+                                // Drop already ran; immediately abort
+                                // this orphan handle instead of
+                                // pushing it past Drop's drain.
+                                handle.abort();
+                            } else {
+                                guard.tasks.push(handle);
+                            }
                         }
                     }
                     Err(_) => return,
@@ -77,7 +107,7 @@ impl EchoServer {
         Self {
             addr,
             accept_task,
-            conn_tasks,
+            state,
         }
     }
 
@@ -89,13 +119,16 @@ impl EchoServer {
 
 impl Drop for EchoServer {
     fn drop(&mut self) {
-        // Abort the accept loop first so no NEW per-conn tasks land
-        // in conn_tasks during teardown. Then abort every per-conn
-        // task — each task owns its TCP stream, so abort drops the
-        // stream and the client observes a TCP RST / EOF.
+        // Abort the accept loop first so any NEW accept() return
+        // observes cancellation at its next .await. Then under the
+        // same lock as the accept-side push, set closing=true and
+        // drain any tasks already registered. The closing flag is
+        // load-bearing for the multi-thread race per V2 V4 V1 step 4
+        // audit closure (Codex M1).
         self.accept_task.abort();
-        if let Ok(mut tasks) = self.conn_tasks.lock() {
-            for h in tasks.drain(..) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.closing = true;
+            for h in guard.tasks.drain(..) {
                 h.abort();
             }
         }
@@ -222,7 +255,7 @@ impl Drop for RejectingServer {
 pub struct TextFrameServer {
     addr: SocketAddr,
     accept_task: JoinHandle<()>,
-    conn_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    state: Arc<Mutex<ServerState>>,
 }
 
 impl TextFrameServer {
@@ -233,15 +266,25 @@ impl TextFrameServer {
         let addr = listener
             .local_addr()
             .expect("local_addr after successful bind");
-        let conn_tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
-        let conn_tasks_in_accept = Arc::clone(&conn_tasks);
+        // V2 V4 V1 step 4 audit closure (Codex M1 + Opus M1): same
+        // closing-flag race protection as EchoServer. See ServerState
+        // docstring.
+        let state = Arc::new(Mutex::new(ServerState {
+            closing: false,
+            tasks: Vec::new(),
+        }));
+        let state_in_accept = Arc::clone(&state);
         let accept_task = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _peer_addr)) => {
                         let handle = tokio::spawn(handle_text_then_binary(stream));
-                        if let Ok(mut tasks) = conn_tasks_in_accept.lock() {
-                            tasks.push(handle);
+                        if let Ok(mut guard) = state_in_accept.lock() {
+                            if guard.closing {
+                                handle.abort();
+                            } else {
+                                guard.tasks.push(handle);
+                            }
                         }
                     }
                     Err(_) => return,
@@ -251,7 +294,7 @@ impl TextFrameServer {
         Self {
             addr,
             accept_task,
-            conn_tasks,
+            state,
         }
     }
 
@@ -263,8 +306,9 @@ impl TextFrameServer {
 impl Drop for TextFrameServer {
     fn drop(&mut self) {
         self.accept_task.abort();
-        if let Ok(mut tasks) = self.conn_tasks.lock() {
-            for h in tasks.drain(..) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.closing = true;
+            for h in guard.tasks.drain(..) {
                 h.abort();
             }
         }
