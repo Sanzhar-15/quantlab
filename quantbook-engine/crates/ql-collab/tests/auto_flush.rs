@@ -545,6 +545,82 @@ fn poll_remote_with_closed_transport_returns_zero_no_flush() {
     );
 }
 
+#[test]
+fn poll_remote_drain_ok_flush_err_surfaces_with_merged_committed() {
+    // **V2 V3 step 2 audit closure (Codex L3 / Opus M3, 2026-05-21):**
+    // pins the partial-state contract documented at
+    // `poll_remote_with_limit` docstring lines ~916-926. When the
+    // drain succeeds (peer delivered bytes via try_recv) but the
+    // post-drain auto-flush fails (transport closed for send, I/O
+    // error, etc.), the method returns Err(Transport(_)) AFTER all
+    // merged blobs have been committed to self.log. Caller never
+    // sees Ok(merged); inspect op_count() to determine local merge
+    // count.
+    //
+    // Setup: DrainOkSendErrTransport — a transport that returns a
+    // pre-loaded blob from try_recv on first call (then None), and
+    // ALWAYS errors on send with TransportError::Closed. This pins
+    // the drain-ok + flush-fail-after-merge interleaving the
+    // partial-state contract is designed around.
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    struct DrainOkSendErrTransport {
+        recv_queue: Arc<Mutex<Option<Vec<u8>>>>,
+    }
+    impl DrainOkSendErrTransport {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                recv_queue: Arc::new(Mutex::new(Some(bytes))),
+            }
+        }
+    }
+    impl Transport for DrainOkSendErrTransport {
+        fn send(&mut self, _bytes: &[u8]) -> Result<(), ql_collab::TransportError> {
+            // ALWAYS fails — this is the failure path under test.
+            Err(ql_collab::TransportError::Closed)
+        }
+        fn try_recv(&mut self) -> Result<Option<Vec<u8>>, ql_collab::TransportError> {
+            // Returns the pre-loaded blob ONCE, then None forever
+            // (graceful end-of-stream per the Transport trait
+            // contract — Closed is for permanent failures only).
+            Ok(self.recv_queue.lock().unwrap().take())
+        }
+    }
+
+    // Build a peer B snapshot with one op (the blob we'll deliver
+    // to peer A via the failing transport).
+    let mut peer_b = CollabSession::new(PeerId::new(2)).unwrap();
+    peer_b.append_op(add_sheet()).unwrap();
+    let b_bytes = peer_b.export_bytes().unwrap();
+
+    // Peer A: OnAppend + failing transport.
+    let mut peer_a = CollabSession::new(PeerId::new(1)).unwrap();
+    let pre_poll_op_count = peer_a.op_count();
+    peer_a.attach_transport(DrainOkSendErrTransport::new(b_bytes));
+    peer_a.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    // Poll: drain succeeds (1 blob, peer B's op merged), but
+    // auto-flush fails (transport.send always errors).
+    let result = peer_a.poll_remote();
+    assert!(
+        matches!(
+            result,
+            Err(CollabSessionError::Transport(TransportError::Closed))
+        ),
+        "drain-ok flush-Err MUST surface as Err(Transport(Closed)); got {result:?}"
+    );
+
+    // Partial-state contract: the merged blob IS committed locally
+    // before the auto-flush attempt. op_count grew by ≥1.
+    assert!(
+        peer_a.op_count() > pre_poll_op_count,
+        "partial-state contract: drained ops MUST be committed locally before flush attempt; \
+         pre_poll={pre_poll_op_count} post_poll={}",
+        peer_a.op_count()
+    );
+}
+
 // ===== Auto-flush fires on every documented mutator =====
 
 #[test]
@@ -1185,14 +1261,20 @@ fn delta_flush_bandwidth_savings_subsequent_smaller_than_first() {
 
 #[test]
 fn symmetric_on_append_two_peers_converge_with_bounded_wire_bytes() {
-    // V2 V3 step 1 audit closure (Opus L3, 2026-05-21): the
-    // step 1 idempotency guard is documented as making symmetric
-    // OnAppend safe across paired LoopbackTransport peers. Pin
-    // this contract: two peers both with OnAppend; both append;
-    // explicit poll_remote + manual flush_delta on each side (since
-    // poll_remote excluded from auto-flush per V2 V2 audit M1);
-    // verify final state convergence AND that wire traffic does
-    // NOT diverge (no echo-loop).
+    // V2 V3 step 1 audit closure (Opus L3, 2026-05-21): the step 1
+    // idempotency guard is documented as making symmetric OnAppend
+    // safe across paired LoopbackTransport peers. Pin this contract:
+    // two peers both with OnAppend; both append; verify final state
+    // convergence AND that wire traffic does NOT diverge (no
+    // echo-loop).
+    //
+    // **V2 V3 step 2 audit closure note (2026-05-21):** under step 2,
+    // `poll_remote*` ALSO auto-flushes after a non-empty drain. The
+    // explicit `flush_delta_to_transport` calls below are kept as
+    // redundant safety nets — they exercise the idempotency guard
+    // (post-poll-auto-flush, last_flushed_vv == current_vv → flush
+    // short-circuits to Ok(false)). Pre-step-2, those explicit calls
+    // were load-bearing.
     let base = CollabSession::new(PeerId::new(100)).unwrap();
     let base_bytes = base.export_bytes().unwrap();
     let (tx_a, tx_b) = LoopbackTransport::pair();
@@ -1209,8 +1291,10 @@ fn symmetric_on_append_two_peers_converge_with_bounded_wire_bytes() {
     peer_a.append_op(add_sheet()).unwrap(); // auto-flush A → B inbox
     peer_b.append_op(put_value(0, 0, 0, 99.0)).unwrap(); // auto-flush B → A inbox
 
-    // Each peer drains its inbox; explicit flush after poll (since
-    // poll_remote is excluded from auto-flush in V2 V3 step 1).
+    // Each peer drains its inbox. Under V2 V3 step 2, poll_remote
+    // ALSO auto-flushes after a non-empty drain. Explicit follow-up
+    // flushes below are kept as belt-and-suspenders (they exercise
+    // the idempotency guard).
     let merged_a = peer_a.poll_remote().unwrap();
     let merged_b = peer_b.poll_remote().unwrap();
     assert!(merged_a >= 1, "peer A received peer B's flush");

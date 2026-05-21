@@ -187,9 +187,11 @@ impl Transport for NoopTransport {
 /// still drive the flow manually: append, export_bytes, send via
 /// the transport, recv on the other side, merge_bytes — useful
 /// when the test wants deterministic control over when bytes
-/// land on the wire (e.g. ordering tests). `poll_remote` does
-/// NOT auto-flush by design — see `AutoFlushPolicy::OnAppend` for
-/// the rationale.
+/// land on the wire (e.g. ordering tests). **Phase 5.5 V2 V3 step 2
+/// (2026-05-21):** `poll_remote*` now also triggers auto-flush after
+/// a non-empty drain (one flush per call, not per-blob). See
+/// [`crate::AutoFlushPolicy::OnAppend`] for the receive-side
+/// contract.
 ///
 /// ## Close semantics
 ///
