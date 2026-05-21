@@ -517,11 +517,12 @@ verify the fix works empirically.
 
 **Context:** V2 V3 step 3's investigation finding "Loro op log IS the implicit offline queue" is correct for the "flush all accumulated ops on reattach" use case but silently defers two IDE consumer needs. Documenting here so the next IDE-side iteration knows the gap.
 
-### I1. Bounded offline queue / pending-op inspection API
+### I1. Bounded offline queue / pending-op inspection API — ✅ SHIPPED V2 V4 V1 step 2 (2026-05-21)
 
 - **Source:** V2 V3 step 3 audit Opus M2.
-- **Problem:** `has_pending_flush() -> bool` returns boolean only. IDE policies like "if more than N pending ops, switch to read-only mode" or "if offline for >N minutes, warn user" can't be implemented without traversing Loro's op log directly.
-- **V2 V4 closure:** add `CollabSession::pending_op_count() -> usize` (cheap — `self.log.len() - last_flushed_op_count`) and/or `pending_op_summary() -> {count, oldest_timestamp}` if timestamps are tracked. Loro exposes op iteration; the helpers wrap it for the common IDE use cases.
+- **Problem:** `has_pending_flush() -> bool` returns boolean only. IDE policies like "if more than N pending ops, switch to read-only mode" can't be implemented without traversing Loro's op log directly.
+- **Closure:** shipped at HEAD `[V2 V4 V1 step 2 commit]`. Added `CollabSession::pending_op_count() -> usize`. NEW field `last_flushed_op_count: Option<usize>` on `CollabSession`, snapshotted at successful flush success paths, reset on attach/detach (symmetric with `last_flushed_vv`). Accessor returns `log.len().saturating_sub(last_flushed_op_count.unwrap_or(0))`. 6 tests pin the contract (fresh boundary, grows with appends, resets after flush, reset on attach, unchanged on failed flush, includes peer-merge ops). Docstring clarifies "log entries currently-attached transport hasn't seen," NOT "user's own unsynced edits" — IDE wanting "my edits only" tracks its own peer-id-filtered counter.
+- **Deferred:** `pending_op_summary() -> { count, oldest_timestamp }` — Loro's op log doesn't expose a wall-clock timestamp per op. If V2 V4+ adds one, the summary wrapper is a 10-line addition. Stays deferred without a separate tier entry.
 
 ### I2. Offline-write discard API
 

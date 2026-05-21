@@ -332,6 +332,27 @@ pub struct CollabSession {
     ///   `flush_delta_to_transport` (V2 V3 delta path).
     /// - NOT updated on flush failure (`Err`) — caller can retry.
     last_flushed_vv: Option<loro::VersionVector>,
+
+    /// **Phase 5.5 V2 V4 V1 step 2 (2026-05-21) — Tier I1.** Snapshot
+    /// of `self.log.len()` at the most recent successful flush.
+    ///
+    /// - `None` initially and after every `attach_transport` /
+    ///   `detach_transport` call (V2 V3 step 1 baseline-reset
+    ///   contract).
+    /// - Updated to `Some(self.log.len())` after a successful send
+    ///   via either `flush_to_transport` or `flush_delta_to_transport`.
+    /// - NOT updated on flush failure (`Err`) — symmetric with
+    ///   `last_flushed_vv`.
+    ///
+    /// Read via [`CollabSession::pending_op_count`] to compute the
+    /// count of ops in the local log not yet flushed to the
+    /// currently-attached transport. Used by IDE consumers for
+    /// bounded-queue policies ("warn user when more than N pending"
+    /// or "switch to read-only mode if backlog exceeds N"). The
+    /// `has_pending_flush() -> bool` accessor remains the cheap
+    /// boolean check; this field powers the finer-grained count
+    /// helper.
+    last_flushed_op_count: Option<usize>,
 }
 
 impl CollabSession {
@@ -379,6 +400,7 @@ impl CollabSession {
             transport: None,
             auto_flush_policy: AutoFlushPolicy::Disabled,
             last_flushed_vv: None,
+            last_flushed_op_count: None,
         })
     }
 
@@ -422,6 +444,7 @@ impl CollabSession {
             transport: None,
             auto_flush_policy: AutoFlushPolicy::Disabled,
             last_flushed_vv: None,
+            last_flushed_op_count: None,
         })
     }
 
@@ -685,6 +708,11 @@ impl CollabSession {
         // VV from a prior transport, the new peer would miss ops
         // 0..stale_vv and end up with a corrupt view.
         self.last_flushed_vv = None;
+        // **Phase 5.5 V2 V4 V1 step 2 (2026-05-21) — Tier I1:** reset
+        // the count baseline alongside the VV so pending_op_count()
+        // reports the full local log as pending against the fresh
+        // transport.
+        self.last_flushed_op_count = None;
         self.transport.replace(Box::new(transport))
     }
 
@@ -705,6 +733,8 @@ impl CollabSession {
         // Phase 5.5 V2 V3 step 1: orphaned VV is meaningless. Clear so
         // a subsequent `attach_transport` lands on a clean baseline.
         self.last_flushed_vv = None;
+        // V2 V4 V1 step 2 (Tier I1): reset count baseline too.
+        self.last_flushed_op_count = None;
         self.transport.take()
     }
 
@@ -885,6 +915,54 @@ impl CollabSession {
         current != last
     }
 
+    /// **Phase 5.5 V2 V4 V1 step 2 (2026-05-21) — Tier I1.** Count of
+    /// ops in the local op log not yet flushed to the currently-
+    /// attached transport. Sibling to [`has_pending_flush`] — same
+    /// underlying invariant, finer-grained observable.
+    ///
+    /// Returns `self.log.len() - last_flushed_op_count.unwrap_or(0)`.
+    /// `saturating_sub` defensively (Loro's op log is append-only, so
+    /// the subtraction never actually underflows today; but
+    /// `unwrap_or(0)` + future "ungrow" paths via V2 V4 Tier I2
+    /// `discard_pending_ops` could theoretically push the count
+    /// backwards).
+    ///
+    /// # IDE consumer use cases
+    ///
+    /// - **Bounded-queue policy**: "if `pending_op_count() > 1000`,
+    ///   switch the editor to read-only mode until reconnect succeeds."
+    /// - **Status indicator gradient**: "show 🟢 Synced if 0, 🟡 N
+    ///   pending if 1..50, 🟠 backlog warning if >50."
+    /// - **Memory pressure estimate**: each Loro op is a small struct;
+    ///   `pending_op_count() * size_of_avg_op` is a rough memory
+    ///   floor for the offline queue.
+    ///
+    /// # Semantic note — count includes peer ops
+    ///
+    /// The returned count includes BOTH local appends AND ops merged
+    /// from peers since the last flush. It's the count of "log
+    /// entries the currently-attached transport hasn't seen," not
+    /// "user's own unsynced edits." For finer-grained "my edits vs
+    /// peer edits" the IDE would track its own peer-id-filtered
+    /// counter — out of scope for V2 V4 V1.
+    ///
+    /// # Edge cases
+    ///
+    /// - Fresh session, no ops, no transport: returns `0`
+    ///   (`log.len() == 0`, baseline `None` → unwrap to 0).
+    /// - `from_snapshot` session: returns the imported op count
+    ///   immediately, even before `attach_transport`. Matches
+    ///   `has_pending_flush() == true` for the same scenario.
+    /// - Post-`attach_transport`: baseline reset to `None`; count
+    ///   includes ALL local ops (matches the V2 V3 step 1 contract
+    ///   that next flush sends from empty VV).
+    /// - Post-successful-flush: baseline at `log.len()`; count `0`.
+    pub fn pending_op_count(&self) -> usize {
+        let total = self.log.len();
+        let last = self.last_flushed_op_count.unwrap_or(0);
+        total.saturating_sub(last)
+    }
+
     /// **Phase 5.5 V2 V2 (2026-05-21):** internal hook called by every
     /// public mutator after a successful state change. Fires
     /// [`flush_to_transport`] when policy is `OnAppend` AND a transport
@@ -954,6 +1032,9 @@ impl CollabSession {
         // contents as a delta — wasted bandwidth, no correctness
         // issue (Loro dedupes on import).
         self.last_flushed_vv = Some(self.log.oplog_vv());
+        // V2 V4 V1 step 2 (Tier I1): snapshot op count for
+        // pending_op_count(). Matches the VV checkpoint exactly.
+        self.last_flushed_op_count = Some(self.log.len());
         Ok(true)
     }
 
@@ -1063,6 +1144,9 @@ impl CollabSession {
         // last_flushed_vv at its prior value so retry sends the
         // same delta.
         self.last_flushed_vv = Some(current_vv);
+        // V2 V4 V1 step 2 (Tier I1): snapshot op count for
+        // pending_op_count(). Matches the VV checkpoint exactly.
+        self.last_flushed_op_count = Some(self.log.len());
         Ok(true)
     }
 

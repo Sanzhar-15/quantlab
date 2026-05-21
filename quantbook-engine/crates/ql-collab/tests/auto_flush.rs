@@ -1776,3 +1776,138 @@ fn from_snapshot_session_reports_pending_flush_true_before_first_attach() {
          from_snapshot session has no transport → indicator suppressed"
     );
 }
+
+// ============================================================
+// V2 V4 V1 step 2 — Tier I1 pending_op_count helper
+// ============================================================
+
+#[test]
+fn pending_op_count_zero_on_fresh_session() {
+    // **V2 V4 V1 step 2 (Tier I1):** boundary — fresh session with no
+    // ops, no transport, no flushes → count == 0.
+    let s = CollabSession::new(PeerId::new(1)).unwrap();
+    assert_eq!(s.pending_op_count(), 0);
+}
+
+#[test]
+fn pending_op_count_grows_with_appends_pre_flush() {
+    // **V2 V4 V1 step 2 (Tier I1):** without a transport (or with
+    // Disabled policy), appends don't auto-flush. pending_op_count
+    // reflects the cumulative local op log.
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    s.append_op(add_sheet()).unwrap();
+    let after_one = s.pending_op_count();
+    assert!(
+        after_one >= 1,
+        "after 1 append pending_op_count MUST be >= 1, got {after_one}"
+    );
+    s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+    s.append_op(put_value(0, 0, 1, 2.0)).unwrap();
+    let after_three = s.pending_op_count();
+    assert!(
+        after_three >= 3,
+        "after 3 appends pending_op_count MUST be >= 3, got {after_three}"
+    );
+    assert!(
+        after_three > after_one,
+        "pending_op_count MUST grow monotonically with appends"
+    );
+}
+
+#[test]
+fn pending_op_count_resets_to_zero_after_successful_flush() {
+    // **V2 V4 V1 step 2 (Tier I1):** flush success path advances
+    // last_flushed_op_count to log.len() — count returns to 0.
+    let (tx_a, _tx_b) = LoopbackTransport::pair();
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    s.attach_transport(tx_a);
+    s.append_op(add_sheet()).unwrap();
+    s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+    assert!(s.pending_op_count() >= 2, "ops accumulated pre-flush");
+
+    s.flush_delta_to_transport().expect("flush success");
+    assert_eq!(
+        s.pending_op_count(),
+        0,
+        "post-flush count MUST be 0 (last_flushed_op_count caught up)"
+    );
+
+    // Another append → count grows again.
+    s.append_op(put_value(0, 0, 1, 2.0)).unwrap();
+    assert!(
+        s.pending_op_count() >= 1,
+        "subsequent append re-grows the count"
+    );
+}
+
+#[test]
+fn pending_op_count_after_attach_includes_all_local_ops() {
+    // **V2 V4 V1 step 2 (Tier I1):** attach_transport resets
+    // last_flushed_op_count to None per V2 V3 step 1 baseline-reset
+    // contract — so count includes ALL local ops, even those flushed
+    // to a prior transport. Matches the "next flush sends from
+    // empty VV" semantic.
+    let (tx_a1, _tx_b1) = LoopbackTransport::pair();
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    s.attach_transport(tx_a1);
+    s.append_op(add_sheet()).unwrap();
+    s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+    s.flush_delta_to_transport().expect("flush success");
+    assert_eq!(s.pending_op_count(), 0, "post-flush against tx_a1");
+
+    // Detach + reattach a NEW transport. Baseline resets.
+    let _ = s.detach_transport();
+    let (tx_a2, _tx_b2) = LoopbackTransport::pair();
+    s.attach_transport(tx_a2);
+
+    let after_reattach = s.pending_op_count();
+    assert!(
+        after_reattach >= 2,
+        "post-reattach: ALL local ops are pending vs the new transport, got {after_reattach}"
+    );
+}
+
+#[test]
+fn pending_op_count_after_failed_flush_unchanged() {
+    // **V2 V4 V1 step 2 (Tier I1):** symmetric with last_flushed_vv —
+    // a failed flush does NOT advance the baseline, so the count
+    // remains pinned to the op that was just committed.
+    let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+    let mut bad = NoopTransport::new();
+    bad.close();
+    s.attach_transport(bad);
+    s.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    let result = s.append_op(add_sheet());
+    assert!(matches!(
+        result,
+        Err(CollabSessionError::Transport(TransportError::Closed))
+    ));
+    // The op committed locally even though auto-flush errored.
+    // last_flushed_op_count was NOT updated (Err preserves it as None).
+    assert!(
+        s.pending_op_count() >= 1,
+        "failed-flush op committed locally; count includes it"
+    );
+}
+
+#[test]
+fn pending_op_count_with_merged_peer_ops_includes_them() {
+    // **V2 V4 V1 step 2 (Tier I1):** semantic note — count includes
+    // BOTH local appends AND peer-merge ops. It's "log entries the
+    // currently-attached transport hasn't seen," not "my edits."
+    let mut peer_a = CollabSession::new(PeerId::new(1)).unwrap();
+    peer_a.append_op(add_sheet()).unwrap();
+    peer_a.append_op(put_value(0, 0, 0, 99.0)).unwrap();
+    let bytes_from_a = peer_a.export_bytes().unwrap();
+
+    let mut peer_b = CollabSession::new(PeerId::new(2)).unwrap();
+    assert_eq!(peer_b.pending_op_count(), 0);
+    peer_b.merge_bytes(&bytes_from_a).expect("merge peer ops");
+
+    let after_merge = peer_b.pending_op_count();
+    assert!(
+        after_merge >= 2,
+        "merged peer ops contribute to pending_op_count, got {after_merge}"
+    );
+}
