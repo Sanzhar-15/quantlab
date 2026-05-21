@@ -539,23 +539,24 @@ verify the fix works empirically.
 
 **Context:** The WebSocket transport MVP is functional but a few rough edges in the test fixtures + the `Send`/Sync contract assert are deferred to the broader V2 V4 transport rework (TLS, bounded backpressure, reconnect wrapper).
 
-### J1. `RejectingServer` test fixture determinism
+### J1. `RejectingServer` test fixture determinism — ✅ SHIPPED V2 V4 V1 step 3 (2026-05-21)
 
 - **Source:** V2 V3 step 4 audit Opus M3.
-- **Problem:** `tests/common/mod.rs::RejectingServer` accepts a TCP connection then drops it without writing a response. The corresponding test (`connect_to_non_websocket_tcp_server_returns_handshake_or_connect_failed`) accepts EITHER `HandshakeFailed` OR `ConnectFailed` because timing + platform decides whether the client's HTTP upgrade write completes before the FIN arrives. Works today; flake-prone under future CI environments.
-- **V2 V4 closure:** tighten `RejectingServer` to either (a) hold the stream open for a configured duration before dropping, OR (b) write a deliberately-malformed HTTP response then drop, forcing the `HandshakeFailed` path deterministically. Then rename the test to `connect_to_rejecting_tcp_server_returns_handshake_failed` (V2 V3 step 4 audit Opus L2).
+- **Problem:** `tests/common/mod.rs::RejectingServer` accepted a TCP connection then dropped it. The test accepted EITHER `HandshakeFailed` OR `ConnectFailed` (timing-dependent).
+- **Closure:** rewrote `RejectingServer` to write a deliberately-malformed HTTP response (`"HTTP/1.1 999 GARBAGE\r\n\r\n"`) then shutdown. tokio-tungstenite's handshake parser raises `Http(_)`/`HttpFormat(_)` deterministically → `WebSocketError::HandshakeFailed`. Renamed test to `connect_to_rejecting_tcp_server_returns_handshake_failed` with strict `Err(HandshakeFailed(_))` assertion.
 
-### J2. Inbound text/ping/pong frame test pinning
+### J2. Inbound text/ping/pong frame test pinning — ✅ SHIPPED V2 V4 V1 step 3 (2026-05-21)
 
 - **Source:** V2 V3 step 4 audit Codex L3 + Opus L3.
-- **Problem:** The reader task drops `Text`, `Ping`, `Pong`, `Frame` arms silently; this is documented but not test-pinned. A future refactor could change the silent-drop behavior (e.g., add a callback hook) without any test failing.
-- **V2 V4 closure:** add a test that uses a custom server fixture sending a `Text` frame inbound (currently `EchoServer` only echoes binary). Assert `try_recv` returns `Ok(None)` for the text frame and that subsequent binary frames still deliver correctly. Also pins the auto-pong-without-app-traffic edge case once V2 V4 makes that observable.
+- **Problem:** Reader task drops `Text`/`Ping`/`Pong`/`Frame` silently; documented but not test-pinned.
+- **Closure:** added `TextFrameServer` test fixture that sends one Text frame then one Binary frame. New test `text_frames_are_dropped_silently_binary_still_delivers` verifies (a) the text frame is silently dropped (no spurious bytes on try_recv); (b) the subsequent binary frame delivers with the exact expected payload. Pin pattern for the "non-binary frames are filtered" contract.
 
-### J3. `WebSocketTransport: !Sync` compile-time assert
+### J3. `WebSocketTransport: Sync` compile-time assert — ✅ SHIPPED V2 V4 V1 step 3 (2026-05-21, with discovery)
 
-- **Source:** V2 V3 step 4 audit Opus L4.
-- **Problem:** `_ASSERT_WEBSOCKET_TRANSPORT_SEND` pins `Send` but not the documented `!Sync` intent. If a future refactor accidentally adds an `Arc<dyn Sync>` field making the type `Sync`, the assert passes silently — the docstring contract would be violated without a compiler signal.
-- **V2 V4 closure:** add `static_assertions` workspace dep (or implement the idiom inline) and add `assert_not_impl_all!(WebSocketTransport: Sync)` next to the existing Send assert.
+- **Source:** V2 V3 step 4 audit Opus L4 (with correction).
+- **Original framing (incorrect):** "pin the `!Sync` intent." The V2 V3 step 4 docstring claimed `Send + !Sync` based on the intuition that the single-consumer mpsc receiver should prevent sharing.
+- **Closure-time discovery:** the type is actually `Send + Sync`. All fields are `Sync` (mpsc handles, Arc<AtomicBool>, Arc<Mutex>, JoinHandle). In Rust, `Sync` means "`&T` can cross threads" — orthogonal to "`&mut self` access is exclusive," which is what the receiver actually requires (enforced by the borrow checker, not by `!Sync`). The V2 V3 step 4 docstring was wrong.
+- **Closure (actual):** added `static_assertions` workspace dep + `assert_impl_all!(WebSocketTransport: Sync)` AND `assert_impl_all!(WebSocketError: Send, Sync)` (also closes K5 from V2 V3 step 5 megaudit Opus L4). Updated the WebSocketTransport docstring to say `Send + Sync` with the corrected rationale. Future refactor adding a `Cell<_>`/`Rc<_>` field would break the build via these positive asserts.
 
 ---
 
@@ -591,11 +592,11 @@ verify the fix works empirically.
 - **Problem:** `WebSocketTransport`'s outbound mpsc is unbounded. A post-attach explicit flush of a multi-MB Loro delta sits in mpsc memory until the writer task drains it. Memory pressure on small devices; no chunking strategy.
 - **V2 V4 closure:** combined with V2 V3 step 3 Tier I1 (`pending_op_count`) + V2 V4 bounded backpressure. See K1 ack channel for the related delivery-confirmation work.
 
-### K5. WebSocketError Send+Sync compile-time assert
+### K5. WebSocketError Send+Sync compile-time assert — ✅ SHIPPED V2 V4 V1 step 3 (2026-05-21, bundled with J3)
 
 - **Source:** V2 V3 step 5 megaudit Opus-B L4.
 - **Problem:** `_ASSERT_WEBSOCKET_TRANSPORT_SEND` pins the transport. `WebSocketError` is implicitly `Send + Sync` because all fields are `String`. A future refactor adding `Arc<dyn FnOnce>` etc. would silently break cross-thread `last_error()` consumers.
-- **V2 V4 closure:** add `assert_send_sync::<WebSocketError>()` to the existing assert block. One line.
+- **Closure:** added `static_assertions::assert_impl_all!(WebSocketError: Send, Sync)` next to the existing Send assert + the new Sync assert from J3. Both bounds pinned at compile time. One-line addition.
 
 ### K6. Debug includes `last_error.is_some()`
 

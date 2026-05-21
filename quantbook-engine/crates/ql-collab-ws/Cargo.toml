@@ -19,6 +19,12 @@ tokio             = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util      = { workspace = true }
 thiserror         = { workspace = true }
+# **Phase 5.5 V2 V4 V1 step 3 (2026-05-21) — Tier J3.** Compile-time
+# assert that `WebSocketTransport: !Sync` (documented but previously
+# only Send-asserted). The `assert_not_impl_all!` macro is zero-cost
+# at runtime; lives in the lib so a future Sync-introducing refactor
+# fails the build, not just the docs.
+static_assertions = { workspace = true }
 
 [dev-dependencies]
 # Integration tests need an in-process WebSocket echo server.

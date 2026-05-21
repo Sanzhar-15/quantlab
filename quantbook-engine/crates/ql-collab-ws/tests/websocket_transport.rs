@@ -16,7 +16,7 @@ use ql_collab::{
 use ql_collab_ws::{WebSocketError, WebSocketTransport};
 use ql_oplog::{CellWireValue, Op};
 
-use crate::common::{EchoServer, RejectingServer};
+use crate::common::{EchoServer, RejectingServer, TextFrameServer};
 
 fn put_value(sheet: u16, row: u32, col: u32, n: f64) -> Op {
     Op::PutValue {
@@ -120,22 +120,22 @@ fn connect_to_nonexistent_server_returns_connect_failed() {
 }
 
 #[test]
-fn connect_to_non_websocket_tcp_server_returns_handshake_or_connect_failed() {
+fn connect_to_rejecting_tcp_server_returns_handshake_failed() {
+    // **V2 V4 V1 step 3 (Tier J1, 2026-05-21):** renamed from
+    // `connect_to_non_websocket_tcp_server_returns_handshake_or_connect_failed`.
+    // The prior version accepted EITHER HandshakeFailed OR
+    // ConnectFailed because the test fixture (accept+drop) was
+    // timing-dependent. The Tier J1 closure rewrote RejectingServer
+    // to write a malformed HTTP response, forcing the client's
+    // handshake parser into the Http/HttpFormat error path
+    // deterministically.
     let rt = runtime();
     rt.block_on(async {
         let bad_server = RejectingServer::start().await;
         let result = WebSocketTransport::connect(&bad_server.url()).await;
-        // RejectingServer accepts the TCP connection then drops it.
-        // tokio-tungstenite sees EOF mid-handshake → reported as Io
-        // (ConnectFailed) on some platforms, HandshakeFailed on
-        // others. Either is acceptable; the important thing is we
-        // got an error, not a successful Self.
         assert!(
-            matches!(
-                result,
-                Err(WebSocketError::HandshakeFailed(_)) | Err(WebSocketError::ConnectFailed(_))
-            ),
-            "expected HandshakeFailed or ConnectFailed, got {:?}",
+            matches!(result, Err(WebSocketError::HandshakeFailed(_))),
+            "expected HandshakeFailed (deterministic post-J1), got {:?}",
             result.err()
         );
     });
@@ -908,6 +908,68 @@ fn collab_session_websocket_send_after_close_surfaces_closed() {
         assert!(
             session.has_pending_flush(),
             "failed-flush leaves has_pending_flush = true (recoverable via reattach)"
+        );
+    });
+}
+
+// =============================================================
+// V2 V4 V1 step 3 — Tier J2 text-frame test pinning
+// =============================================================
+
+#[test]
+fn text_frames_are_dropped_silently_binary_still_delivers() {
+    // **V2 V4 V1 step 3 (Tier J2, 2026-05-21):** the V2 V3 step 4
+    // closure documented that `WebSocketTransport`'s reader task
+    // drops `Text`, `Ping`, `Pong`, `Frame` arms silently — Loro
+    // payloads are binary, non-binary frames don't carry our
+    // protocol. The V2 V3 step 5 megaudit (Codex L3 + Opus L3)
+    // flagged this as documented-but-not-test-pinned. This test
+    // closes that coverage gap.
+    //
+    // Server sends: Text("...") then Binary("..."). Client must:
+    // (a) silently drop the text frame (no error, no spurious bytes
+    //     on try_recv), and
+    // (b) deliver the binary frame via try_recv as Ok(Some(_)).
+    let rt = runtime();
+    rt.block_on(async {
+        let server = TextFrameServer::start().await;
+        let mut ws = WebSocketTransport::connect(&server.url())
+            .await
+            .expect("handshake");
+
+        // Poll until we get the binary frame. The text frame should
+        // be silently dropped — we should NEVER see "this-should-be-
+        // dropped..." appear via try_recv (its body is text, not
+        // binary, so even if a future refactor incorrectly delivered
+        // it, we'd notice because the bytes wouldn't match).
+        let mut received_blob: Option<Vec<u8>> = None;
+        for _ in 0..100 {
+            match ws.try_recv() {
+                Ok(Some(b)) => {
+                    received_blob = Some(b);
+                    break;
+                }
+                Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+
+        let blob = received_blob
+            .expect("binary frame after text frame MUST be delivered (text was dropped silently)");
+        assert_eq!(
+            blob,
+            b"binary-after-text-must-deliver".to_vec(),
+            "delivered blob must match the binary frame the server sent (proves text was \
+             dropped without contaminating the binary delivery)"
+        );
+
+        // No more frames queued — the server idled after sending
+        // the two frames. try_recv should return Ok(None).
+        let next = ws.try_recv();
+        assert!(
+            matches!(next, Ok(None)),
+            "no further inbound frames expected, got {:?}",
+            next
         );
     });
 }

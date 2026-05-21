@@ -255,13 +255,26 @@ pub enum WebSocketError {
 /// session.attach_transport(ws);
 /// ```
 ///
-/// ## Send/Sync
+/// ## Send + Sync
 ///
-/// `WebSocketTransport: Send` (asserted via compile-time const). Not
-/// `Sync` — exclusive ownership is required because `try_recv` takes
-/// `&mut self` (the mpsc receiver is single-consumer). This matches
-/// the `CollabSession::transport: Box<dyn Transport + Send>`
-/// constraint.
+/// `WebSocketTransport: Send + Sync` (both asserted via compile-time
+/// `static_assertions` macros — see end of file). Note: the prior
+/// V2 V3 step 4 docstring (and Tier J3 backlog entry) incorrectly
+/// claimed `!Sync` based on the intuition that the single-consumer
+/// mpsc receiver should prevent sharing. In Rust, `Sync` means "`&T`
+/// can be sent across threads" — orthogonal to "`&mut T` access is
+/// exclusive." `try_recv` takes `&mut self`, so concurrent receives
+/// are already prevented by the borrow checker. All fields
+/// (mpsc handles, `Arc<AtomicBool>`, `Arc<Mutex<_>>`, `JoinHandle`)
+/// are `Send + Sync`, making the composite `Send + Sync`.
+///
+/// **Why this matters**: matches the `CollabSession::transport:
+/// Box<dyn Transport + Send>` constraint (only `Send` is required at
+/// the trait boundary; `Sync` is a bonus that allows future
+/// `Arc<WebSocketTransport>` wrappers if a consumer needs them).
+/// **Tier J3 closure (V2 V4 V1 step 3, 2026-05-21):** corrected the
+/// docstring + the backlog entry; pinned BOTH bounds with positive
+/// compile-time asserts.
 pub struct WebSocketTransport {
     /// Caller-side sender feeding the writer task. Sync write via
     /// `UnboundedSender::send` (which is non-blocking).
@@ -738,11 +751,32 @@ impl Transport for WebSocketTransport {
 
 // Phase 5.5 V2 V3 step 4 — pin the Send invariant. CollabSession
 // stores `Box<dyn Transport + Send>`; if a future refactor adds a
-// non-Send field this stops compiling. Sync is NOT required.
+// non-Send field this stops compiling.
 const _ASSERT_WEBSOCKET_TRANSPORT_SEND: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<WebSocketTransport>();
 };
+
+// **Phase 5.5 V2 V4 V1 step 3 (2026-05-21) — Tier J3.** Pin the
+// Sync invariant too. The V2 V3 step 4 docstring + the Tier J3
+// backlog entry both claimed `!Sync` (based on the intuition that
+// the single-consumer mpsc receiver should prevent sharing), but
+// the type is actually Sync — `try_recv`'s `&mut self` requirement
+// is enforced by the borrow checker, not by `!Sync`. All fields
+// happen to be Sync (mpsc handles, Arc<AtomicBool>, Arc<Mutex>,
+// JoinHandle). This positive assert pins the actual contract; if a
+// future refactor adds a non-Sync field (e.g., a Cell<>), it stops
+// compiling — same protection level as the Send assert above.
+static_assertions::assert_impl_all!(WebSocketTransport: Sync);
+
+// **V2 V4 V1 step 3 (Tier J3) — also pin WebSocketError: Send + Sync.**
+// The error type is small (4 String-carrying variants) so Send +
+// Sync are both expected. Pinning prevents a future variant that
+// adds a non-Send/non-Sync payload (e.g., `Rc<...>`) from silently
+// breaking cross-thread error reporting via `last_error()`. This
+// closes V2 V3 step 4 audit Opus L4 + V2 V3 step 5 megaudit Opus L4
+// (forward-leaning bound assert) as well.
+static_assertions::assert_impl_all!(WebSocketError: Send, Sync);
 
 #[cfg(test)]
 mod tests {

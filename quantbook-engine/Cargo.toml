@@ -58,6 +58,12 @@ tokio = { version = "=1.50.0", default-features = false, features = ["rt-multi-t
 tokio-tungstenite = "=0.29.0"
 futures-util = { version = "=0.3.32", default-features = false, features = ["std", "sink"] }
 
+# Phase 5.5 V2 V4 V1 step 3 (2026-05-21) — Tier J3 compile-time
+# assert that `WebSocketTransport: !Sync`. `static_assertions` is a
+# tiny no-runtime-cost crate exposing `assert_not_impl_all!` and
+# `assert_impl_all!` macros. Used only by ql-collab-ws.
+static_assertions = "=1.1.0"
+
 # Bench
 criterion = { version = "=0.8.2", default-features = false, features = ["html_reports"] }
 # Property-based testing for invariant checks (ql-storage, ql-calcgraph, ql-exec dev-deps)

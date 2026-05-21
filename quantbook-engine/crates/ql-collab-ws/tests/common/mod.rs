@@ -105,8 +105,21 @@ async fn handle_echo_connection(stream: TcpStream) {
 }
 
 /// One-shot client-side TCP server that accepts a single connection,
-/// then closes it without completing the WebSocket handshake. Used
-/// to drive `HandshakeFailed` paths without an external dependency.
+/// writes a deliberately-malformed HTTP response, then closes the
+/// stream. Used to drive `HandshakeFailed` paths deterministically
+/// without an external dependency.
+///
+/// **V2 V4 V1 step 3 (Tier J1, 2026-05-21):** rewritten from the
+/// previous "accept then immediately drop" pattern. That version
+/// was timing/platform-dependent — the client's HTTP upgrade write
+/// could complete-before-FIN (HandshakeFailed) or after-FIN
+/// (ConnectFailed). Tests had to accept either outcome with `_or_`
+/// disjunction. The new version writes 8 bytes of garbage that
+/// cannot be parsed as a valid HTTP/1.1 response status line, then
+/// closes — tokio-tungstenite consistently parses the response and
+/// raises `tungstenite::Error::Http(_)` (or `HttpFormat(_)` on
+/// some platforms), which `WebSocketTransport::connect` maps to
+/// `WebSocketError::HandshakeFailed`. Deterministic.
 pub struct RejectingServer {
     addr: SocketAddr,
     accept_task: JoinHandle<()>,
@@ -121,10 +134,24 @@ impl RejectingServer {
             .local_addr()
             .expect("local_addr after successful bind");
         let accept_task = tokio::spawn(async move {
-            // Accept one TCP connection then drop it — the client's
-            // WS handshake sees EOF and fails.
-            if let Ok((_stream, _)) = listener.accept().await {
-                // _stream drops here; client sees connection reset.
+            // Accept one TCP connection, write a malformed HTTP
+            // response (not a valid 101 Switching Protocols), then
+            // drop. The client's tokio-tungstenite handshake parser
+            // sees the bad status line and surfaces Http/HttpFormat,
+            // mapping to HandshakeFailed deterministically.
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                // Deliberately malformed HTTP response: starts with
+                // the right HTTP version prefix to pass the initial
+                // sniff, but the status code is invalid garbage and
+                // there are no headers / CRLFCRLF terminator. tokio-
+                // tungstenite parses this as a malformed HTTP
+                // response, not as a TCP-level error.
+                let _ = stream.write_all(b"HTTP/1.1 999 GARBAGE\r\n\r\n").await;
+                // Explicit shutdown signals end-of-response to the
+                // client's parser without races.
+                let _ = stream.shutdown().await;
+                // _stream drops here.
             }
         });
         Self { addr, accept_task }
@@ -138,5 +165,106 @@ impl RejectingServer {
 impl Drop for RejectingServer {
     fn drop(&mut self) {
         self.accept_task.abort();
+    }
+}
+
+/// **V2 V4 V1 step 3 (Tier J2, 2026-05-21):** WebSocket test fixture
+/// that completes the handshake, then sends ONE `Message::Text`
+/// frame, then ONE `Message::Binary` frame, then idles (until
+/// dropped). Pins the V2 V3 step 4 contract that
+/// `WebSocketTransport` silently drops text frames from the
+/// inbound stream while continuing to deliver binary frames
+/// normally.
+///
+/// Counterpart to `EchoServer`: where Echo reflects whatever the
+/// client sends, this one is a unidirectional source of specific
+/// frame types for the reader-task-behavior test.
+pub struct TextFrameServer {
+    addr: SocketAddr,
+    accept_task: JoinHandle<()>,
+    conn_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl TextFrameServer {
+    pub async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind 127.0.0.1:0 in test");
+        let addr = listener
+            .local_addr()
+            .expect("local_addr after successful bind");
+        let conn_tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+        let conn_tasks_in_accept = Arc::clone(&conn_tasks);
+        let accept_task = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _peer_addr)) => {
+                        let handle = tokio::spawn(handle_text_then_binary(stream));
+                        if let Ok(mut tasks) = conn_tasks_in_accept.lock() {
+                            tasks.push(handle);
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        Self {
+            addr,
+            accept_task,
+            conn_tasks,
+        }
+    }
+
+    pub fn url(&self) -> String {
+        format!("ws://{}", self.addr)
+    }
+}
+
+impl Drop for TextFrameServer {
+    fn drop(&mut self) {
+        self.accept_task.abort();
+        if let Ok(mut tasks) = self.conn_tasks.lock() {
+            for h in tasks.drain(..) {
+                h.abort();
+            }
+        }
+    }
+}
+
+async fn handle_text_then_binary(stream: TcpStream) {
+    let mut ws = match tokio_tungstenite::accept_async(stream).await {
+        Ok(ws) => ws,
+        Err(_) => return,
+    };
+    // Send one text frame — the client should drop it silently.
+    if ws
+        .send(Message::Text(
+            "this-should-be-dropped-by-the-reader-task"
+                .to_string()
+                .into(),
+        ))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    // Send one binary frame — the client should deliver it via
+    // try_recv as Ok(Some(_)).
+    if ws
+        .send(Message::Binary(
+            b"binary-after-text-must-deliver".to_vec().into(),
+        ))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    // Idle until client drops or test ends.
+    while let Some(msg_result) = ws.next().await {
+        match msg_result {
+            Ok(Message::Close(_)) => return,
+            Err(_) => return,
+            Ok(_) => {}
+        }
     }
 }
