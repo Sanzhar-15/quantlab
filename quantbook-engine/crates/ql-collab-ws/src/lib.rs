@@ -324,10 +324,18 @@ pub struct WebSocketTransport {
 
 impl std::fmt::Debug for WebSocketTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // **V2 V4 V1 step 4 (Tier K6, 2026-05-21):** surface
+        // last_error presence in Debug output. When a transport is
+        // closed and both tasks have exited, knowing whether the
+        // error slot is populated matters more than knowing the
+        // booleans alone — it distinguishes "clean caller-close"
+        // (last_error=None) from "task observed a runtime failure"
+        // (last_error=Some). Per V2 V3 step 5 megaudit Opus-B L2.
         f.debug_struct("WebSocketTransport")
             .field("closed", &self.closed.load(Ordering::Relaxed))
             .field("writer_finished", &self.writer_task.is_finished())
             .field("reader_finished", &self.reader_task.is_finished())
+            .field("last_error_present", &self.last_error().is_some())
             .finish()
     }
 }

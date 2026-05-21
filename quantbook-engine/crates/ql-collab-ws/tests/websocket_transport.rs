@@ -973,3 +973,121 @@ fn text_frames_are_dropped_silently_binary_still_delivers() {
         );
     });
 }
+
+// =============================================================
+// V2 V4 V1 step 4 — Tier K2 mid-drop bytes-lost recovery test
+// =============================================================
+
+#[test]
+fn mid_drop_bytes_lost_recoverable_via_reattach() {
+    // **V2 V4 V1 step 4 (Tier K2, 2026-05-21):** pin the documented
+    // V2 V3 step 5 megaudit Opus-B M1 contract:
+    // `WebSocketTransport::Drop` may discard in-flight mpsc bytes
+    // (writer task is aborted before draining the outbound channel),
+    // but the V2 V3 step 1 baseline-reset on `attach_transport`
+    // makes the next flush re-send EVERYTHING from empty VV — so a
+    // reattach to a new transport recovers all ops, even ones that
+    // never hit the wire on the dropped transport.
+    //
+    // This test exercises that recovery flow end-to-end so a future
+    // refactor "fixing" the drop-loss can't silently change the
+    // observable behavior without us noticing.
+    let rt = multi_thread_runtime();
+    rt.block_on(async {
+        // Phase 1: attach WS#1, send several ops, drop the transport
+        // WITHOUT calling flush_pending_to_transport (deliberately —
+        // we're exercising the drop-loss path).
+        let server1 = EchoServer::start().await;
+        let ws1 = WebSocketTransport::connect(&server1.url())
+            .await
+            .expect("handshake to ws#1");
+
+        let mut session = CollabSession::new(PeerId::new(1)).expect("session");
+        session.attach_transport(ws1);
+        session.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+        // Append 3 ops. Each goes through auto-flush → mpsc enqueue.
+        // Writer task drains and sends; bytes hit the wire (and
+        // echo-bounce back, where we don't care). Some bytes may
+        // still be in mpsc when we drop below.
+        session.append_op(add_sheet()).expect("add_sheet");
+        session.append_op(put_value(0, 0, 0, 1.0)).expect("put");
+        session.append_op(put_value(0, 0, 1, 2.0)).expect("put");
+
+        // Critical: detach WITHOUT calling flush_pending_to_transport.
+        // This is the documented bytes-lost scenario — Drop runs on
+        // the returned Box; writer_task.abort() may run before the
+        // mpsc drained.
+        let _dropped_ws1 = session.detach_transport();
+        // The drop happens at end of statement via `let _`. Force it
+        // here for clarity.
+        drop(_dropped_ws1);
+
+        // Sleep to let any abort-related task cleanup settle.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Phase 2: attach a FRESH WS#2 to a different EchoServer.
+        // V2 V3 step 1 baseline-reset: last_flushed_vv = None.
+        // V2 V3 step 3 contract: next flush sends from empty VV =
+        // ALL accumulated ops, regardless of what WS#1 did or didn't
+        // deliver to its peer.
+        let server2 = EchoServer::start().await;
+        let ws2 = WebSocketTransport::connect(&server2.url())
+            .await
+            .expect("handshake to ws#2");
+        session.attach_transport(ws2);
+
+        // Pre-flush state check: has_pending_flush() should be true
+        // (baseline reset) and pending_op_count() should reflect
+        // all 3 ops.
+        assert!(
+            session.has_pending_flush(),
+            "post-reattach: baseline reset → has_pending_flush true"
+        );
+        let pending_before = session.pending_op_count();
+        assert!(
+            pending_before >= 3,
+            "post-reattach pending_op_count must include all 3 local ops, got {pending_before}"
+        );
+
+        // Drive explicit flush + flush_pending to ensure delivery.
+        session
+            .flush_delta_to_transport()
+            .expect("flush #2 success");
+        session
+            .flush_pending_to_transport()
+            .expect("flush_pending #2 success");
+
+        // After flush_pending returns Ok, the writer for WS#2 has
+        // completed ws_sink.send for all ops. Bytes are on WS#2's
+        // wire; the echo server has reflected them back. Drain to
+        // confirm the round-trip.
+        let mut total_merged = 0usize;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            total_merged += session.poll_remote().expect("poll");
+            if total_merged >= 1 {
+                break;
+            }
+        }
+        assert!(
+            total_merged >= 1,
+            "post-reattach-and-flush: at least one echo blob delivered, got {total_merged}"
+        );
+
+        // Final state: has_pending_flush should be false (Loro
+        // dedupes own ops on echo merge, so VV doesn't advance past
+        // last_flushed_vv).
+        assert!(
+            !session.has_pending_flush(),
+            "post-flush-pending and echo merge: synced (Loro deduped own ops)"
+        );
+        // op_count stays at 3 — Loro's dedup. (The test isn't about
+        // op_count; it's about the recovery flow.)
+        assert_eq!(
+            session.op_count(),
+            3,
+            "all 3 original ops preserved through drop+reattach"
+        );
+    });
+}

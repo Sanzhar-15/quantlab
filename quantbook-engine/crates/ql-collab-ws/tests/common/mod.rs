@@ -42,6 +42,23 @@ impl EchoServer {
         let addr = listener
             .local_addr()
             .expect("local_addr after successful bind");
+        // **V2 V4 V1 step 4 (Tier K3, 2026-05-21):** `std::sync::Mutex`
+        // is LOAD-BEARING here for Drop race-freedom. The accept loop
+        // does `spawn → lock → push` synchronously — `accept_task.abort()`
+        // schedules cancellation at the next `.await`, which is the
+        // next `listener.accept().await` iteration. So a spawned
+        // per-conn handle is ALWAYS in `conn_tasks` before the next
+        // await point, and Drop's drain catches it.
+        //
+        // **Migration risk to `tokio::sync::Mutex`**: that variant's
+        // `lock()` is `.await`-able. An await between spawn and push
+        // would open a window where a per-conn task is spawned but
+        // not yet in `conn_tasks` when the accept loop is cancelled
+        // — the task would leak past test end → tokio runtime hang
+        // on drop. Per V2 V3 step 5 megaudit Opus-B M5: if migrating
+        // to async Mutex, add a synchronization barrier (e.g., a
+        // `tokio::sync::Notify`) to signal accept-loop quiescence
+        // before Drop's drain.
         let conn_tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
         let conn_tasks_in_accept = Arc::clone(&conn_tasks);
         let accept_task = tokio::spawn(async move {

@@ -574,17 +574,17 @@ verify the fix works empirically.
 - **Consumer pattern:** `session.flush_delta_to_transport()?; session.flush_pending_to_transport()?;` — then `has_pending_flush() == false` plus the `Ok(())` from `flush_pending_to_transport()` means the writer task has completed `ws_sink.send` for every queued blob (level-1 ack: flushed to the WebSocket sink). NOT TCP-acknowledged by the peer (level 2 — not exposed by tokio-tungstenite). NOT peer-application-imported (level 3 — would require a custom ack-op).
 - **Out of scope (defer to future V2 V4+):** TCP-ack (not exposed by tokio-tungstenite); peer-application-ack (requires protocol change with bidirectional ack messages).
 
-### K2. Mid-drop bytes-lost test pinning
+### K2. Mid-drop bytes-lost test pinning — ✅ SHIPPED V2 V4 V1 step 4 (2026-05-21)
 
 - **Source:** V2 V3 step 5 megaudit Opus-B M1.
-- **Problem:** the in-flight-bytes-lost-on-drop behavior is documented but no test pins it as ACCEPTED behavior. A future refactor that accidentally "fixes" this (e.g., switches to a synchronous transport that drains on drop) would silently change observable semantics.
-- **V2 V4 closure:** add a test that explicitly enqueues a send, drops the transport, attaches a fresh transport, and verifies the bytes were retransmitted on reconnect (i.e., V2 V3 step 1 baseline-reset recovers — the documented recovery path).
+- **Problem:** the in-flight-bytes-lost-on-drop behavior is documented but no test pins it as ACCEPTED behavior.
+- **Closure:** added `mid_drop_bytes_lost_recoverable_via_reattach` test. Sends 3 ops via WS#1 with OnAppend, detaches WITHOUT `flush_pending_to_transport` (intentional — exercises drop-loss), attaches WS#2, verifies post-reattach pending_op_count includes all 3, drives explicit flush + flush_pending, confirms echo delivery on WS#2. Pins: drop-without-flush-pending is RECOVERABLE via reattach + baseline-reset.
 
-### K3. EchoServer tokio::sync::Mutex migration risk
+### K3. EchoServer tokio::sync::Mutex migration risk — ✅ SHIPPED V2 V4 V1 step 4 (2026-05-21)
 
 - **Source:** V2 V3 step 5 megaudit Opus-B M5.
-- **Problem:** `EchoServer::accept_task` pushes per-conn handles to `Arc<Mutex<Vec<JoinHandle>>>`. Current `std::sync::Mutex` is sync-acquire and benign with `accept_task.abort()`. A future migration to `tokio::sync::Mutex` (idiomatic for async) would introduce an await between spawn and push, opening a genuine race window where conn tasks land in the vec AFTER drop's drain → leaked tokio tasks past test end → runtime hang on drop.
-- **V2 V4 closure:** add a comment at the accept-loop site noting `std::sync::Mutex` is load-bearing; if migrated, introduce a oneshot/Notify barrier to signal accept loop quiescence before drop's drain.
+- **Problem:** `EchoServer::accept_task` pushes per-conn handles to `Arc<Mutex<Vec<JoinHandle>>>`. Current `std::sync::Mutex` is sync-acquire and benign with `accept_task.abort()`. A future migration to `tokio::sync::Mutex` (idiomatic for async) would open a race window.
+- **Closure:** added LOAD-BEARING comment at the accept-loop site explaining the sync-Mutex contract + migration mitigation (use `tokio::sync::Notify` to signal accept-loop quiescence before Drop's drain if switching to async Mutex).
 
 ### K4. Large-blob chunking / bounded queue
 
@@ -598,23 +598,23 @@ verify the fix works empirically.
 - **Problem:** `_ASSERT_WEBSOCKET_TRANSPORT_SEND` pins the transport. `WebSocketError` is implicitly `Send + Sync` because all fields are `String`. A future refactor adding `Arc<dyn FnOnce>` etc. would silently break cross-thread `last_error()` consumers.
 - **Closure:** added `static_assertions::assert_impl_all!(WebSocketError: Send, Sync)` next to the existing Send assert + the new Sync assert from J3. Both bounds pinned at compile time. One-line addition.
 
-### K6. Debug includes `last_error.is_some()`
+### K6. Debug includes `last_error.is_some()` — ✅ SHIPPED V2 V4 V1 step 4 (2026-05-21)
 
 - **Source:** V2 V3 step 5 megaudit Opus-B L2.
-- **Problem:** `WebSocketTransport`'s `Debug` impl shows `closed`, `writer_finished`, `reader_finished` but not `last_error.is_some()`. For diagnostics in a closed-state transport, knowing the error slot has a value matters more than the booleans.
-- **V2 V4 closure:** add `.field("last_error_present", &self.last_error().is_some())` to the Debug impl.
+- **Problem:** Debug impl didn't expose `last_error.is_some()` despite it being the load-bearing diagnostic when both tasks have exited.
+- **Closure:** added `.field("last_error_present", &self.last_error().is_some())` to the Debug impl. One-line change.
 
-### K7. Empty Binary frame test pinning
+### K7. Empty Binary frame test pinning — ✅ SHIPPED V2 V4 V1 step 4 (2026-05-21)
 
 - **Source:** V2 V3 step 5 megaudit Opus-B L3.
-- **Problem:** `Message::Binary(b"")` is forwarded to `CollabSession::merge_bytes(&[])` → `OpLog::merge_bytes(&[])` → `LoroDoc::import(&[])`. Loro's behavior on empty input is not test-pinned; a future Loro upgrade could change it.
-- **V2 V4 closure:** add a unit test pinning `OpLog::merge_bytes(&[])` returns Ok with no state change.
+- **Problem:** `Message::Binary(b"")` reaches `OpLog::merge_bytes(&[])`; Loro behavior on empty input wasn't pinned.
+- **Closure:** added `merge_bytes_with_empty_slice_does_not_panic` test in `ql-oplog`. Loro 1.12 returns `Err(OpLogError::Loro(_))` on empty input; test pins either-Ok-with-unchanged-len-or-Err-with-unchanged-len. Catches future Loro upgrades that change empty-input behavior.
 
-### K8. `poll_remote_with_limit` auto-flush-on-error semantic
+### K8. `poll_remote_with_limit` auto-flush-on-error semantic — ✅ SHIPPED V2 V4 V1 step 4 (2026-05-21)
 
 - **Source:** V2 V3 step 5 megaudit Codex L1.
-- **Problem:** if `merge_bytes` on a later blob errors after earlier blobs merged, `current_vv` advanced but the post-loop `maybe_auto_flush` is skipped (early return on `?`). Not a false-synced state (`last_flushed_vv` unchanged → `has_pending_flush()=true`), but a contract caveat for "step 2 auto-flushes after non-empty drain."
-- **V2 V4 closure:** decide whether to (a) document precisely ("after non-empty drain that reaches loop end or Closed-as-EOF break") or (b) refactor to invoke `maybe_auto_flush` in a `Drop` guard on the merged-counter so it fires even on early Err return.
+- **Problem:** docstring claim "after non-empty drain, one auto-flush fires" is imprecise — if a later blob's `merge_bytes` errors after earlier merges succeeded, the auto-flush is skipped (early `?` return). Not a false-synced state but a contract-precision miss.
+- **Closure decision: option (a) — docstring precision.** Refactor with Drop-guard would add complexity for a niche case where the behavior is already recoverable (`has_pending_flush()=true` after the error; next flush sends accumulated delta). Amended `poll_remote_with_limit` docstring to say "after a non-empty drain that reaches the loop's normal exit (Ok(None) or Closed-as-EOF break)" — explicit early-Err path documentation.
 
 ### K9. Documentation of detach_transport reuse pattern
 

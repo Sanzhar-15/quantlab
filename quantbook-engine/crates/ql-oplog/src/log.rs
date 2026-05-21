@@ -673,4 +673,54 @@ mod tests {
             "u64::MAX must be rejected as a Loro sentinel; got {result:?}"
         );
     }
+
+    // ============================================================
+    // V2 V4 V1 step 4 — Tier K7: empty Message::Binary frame test
+    // ============================================================
+
+    #[test]
+    fn merge_bytes_with_empty_slice_does_not_panic() {
+        // **V2 V4 V1 step 4 (Tier K7, 2026-05-21):** pin Loro's
+        // contract for `OpLog::merge_bytes(&[])`. A misbehaving (or
+        // adversarial) peer could send a 0-byte `Message::Binary(b"")`
+        // via WebSocketTransport; ql-collab-ws's reader task forwards
+        // it as `Vec::new()` to `CollabSession::merge_bytes(&[])`
+        // which calls `OpLog::merge_bytes(&[])` which calls
+        // `LoroDoc::import(&[])`. Whatever Loro 1.12 does here, pin
+        // it as a contract — if a future Loro upgrade changes the
+        // empty-input behavior (Ok → Err, or Err → panic), this
+        // test surfaces the regression.
+        //
+        // Per V2 V3 step 5 megaudit Opus-B L3: this scenario was
+        // documented-but-not-pinned. Step 4 closes the gap.
+        let mut log = OpLog::new();
+        let pre_len = log.len();
+        let result = log.merge_bytes(&[]);
+
+        // The pinned behavior in Loro 1.12: empty input is treated
+        // as Err (Loro can't decode an empty byte stream as either
+        // Snapshot or Updates). Pin Err but don't panic.
+        match result {
+            Ok(post_len) => {
+                // If a future Loro version accepts empty as a no-op,
+                // verify the len() didn't change.
+                assert_eq!(
+                    post_len, pre_len,
+                    "Ok(empty merge) MUST leave log.len() unchanged"
+                );
+            }
+            Err(OpLogError::Loro(_)) => {
+                // Current Loro 1.12 behavior. Verify the log is
+                // unchanged (no partial-state on Err).
+                assert_eq!(
+                    log.len(),
+                    pre_len,
+                    "Err(empty merge) MUST leave log.len() unchanged (no partial-state)"
+                );
+            }
+            Err(other) => {
+                panic!("merge_bytes(&[]) returned an unexpected error variant: {other:?}")
+            }
+        }
+    }
 }

@@ -1236,6 +1236,21 @@ impl CollabSession {
     /// pre-poll `last_flushed_vv` (i.e., the drained blobs only
     /// contained ops already known locally — Loro-deduped merge).
     ///
+    /// **Auto-flush firing precision (V2 V4 V1 step 4 audit closure,
+    /// Codex L1, 2026-05-21)**: the precise rule is "after a
+    /// non-empty drain that reaches the loop's normal exit (Ok(None)
+    /// or Closed-as-EOF break)." If a later blob's `merge_bytes`
+    /// errors (Loro decode failure) or `try_recv` errors with non-
+    /// Closed (`Io`, `Other`) after earlier blobs already merged,
+    /// `current_vv` has advanced (earlier merges committed) but the
+    /// post-loop `maybe_auto_flush` is SKIPPED via the `?` early
+    /// return. This is NOT a false-synced state: `last_flushed_vv`
+    /// is unchanged → `has_pending_flush()` returns `true` → next
+    /// `flush_delta_to_transport` (or next `poll_remote_with_limit`
+    /// that reaches a normal exit) WILL send the accumulated delta.
+    /// Recovery is automatic; just bounded by when the next flush
+    /// path actually fires.
+    ///
     /// **Partial-state contract on auto-flush failure**: if the
     /// post-batch auto-flush fails (closed transport, I/O error
     /// during the send), the method returns
