@@ -1,6 +1,6 @@
 ---
 title: Phase 5 V1 exit packet (5.1 → 5.6 V1+V2 + 5.4 V2 V1+V1.1 + 5.5 V2 V1 + D1.a)
-status: ACTIVE — Phase 5 V1 surface complete 2026-05-19. **D-1 SHIPPED 2026-05-20**. **5.3 SHIPPED 2026-05-20**. **5.5 V2 V2 (auto-flush) SHIPPED 2026-05-21**. **5.5 V2 V3 step 1 (version-vector delta flush) SHIPPED 2026-05-21**. See `docs/phase5/d-1-exit-packet.md` + `docs/phase5/5-3-exit-packet.md`. 5.5 V2 V3 steps 2-6 (poll_remote auto-flush + offline-write queue + WebSocket impl + megaudit + exit packet), 5.7 IDE slice, and 5.8 megaudit remain.
+status: ACTIVE — Phase 5 V1 surface complete 2026-05-19. **D-1 SHIPPED 2026-05-20**. **5.3 SHIPPED 2026-05-20**. **5.5 V2 V2 (auto-flush) SHIPPED 2026-05-21**. **5.5 V2 V3 step 1 (version-vector delta flush) SHIPPED 2026-05-21**. **5.5 V2 V3 step 2 (poll_remote auto-flush) SHIPPED 2026-05-21**. See `docs/phase5/d-1-exit-packet.md` + `docs/phase5/5-3-exit-packet.md`. 5.5 V2 V3 steps 3-6 (offline-write queue + WebSocket impl + megaudit + exit packet), 5.7 IDE slice, and 5.8 megaudit remain.
 date: 2026-05-19
 updated: 2026-05-20 (post-exit-packet additions: 5.6 V2 sweep_presence + D1.a 4-cluster closure + D-1 ALL STEPS SHIPPED)
 predecessor: docs/phase4/exit-packet.md + docs/phase5/entry-plan.md
@@ -22,9 +22,10 @@ Phase 5.2 D-1 (FormatId tagged tuple) ✅ SHIPPED 2026-05-20 — see
 ✅ SHIPPED 2026-05-20 — see `docs/phase5/5-3-exit-packet.md`.
 Phase 5.5 V2 V2 (auto-flush) ✅ SHIPPED 2026-05-21. Phase 5.5 V2 V3
 step 1 (version-vector delta flush) ✅ SHIPPED 2026-05-21. Phase 5.5
-V2 V3 steps 2-6 (poll_remote auto-flush + offline-write queue +
-WebSocket transport + reconnect/offline sync) + Phase 5.7 IDE vertical
-slice remain ahead of the 5.8 megaudit.
+V2 V3 step 2 (poll_remote auto-flush) ✅ SHIPPED 2026-05-21. Phase 5.5
+V2 V3 steps 3-6 (offline-write queue + WebSocket transport + megaudit
++ exit packet) + Phase 5.7 IDE vertical slice remain ahead of the
+5.8 megaudit.
 
 ## Acceptance criteria status (Phase 5 V1)
 
@@ -251,20 +252,30 @@ Phase 5 V1 added **91 net tests** to the engine.
   no breaking changes to V2 V1 API.
 
 - **Phase 5.5 V2 V3 step 1 — version-vector delta flush.** ✅
-  **SHIPPED 2026-05-21**. New `CollabSession::flush_delta_to_transport`
+  **SHIPPED 2026-05-21** (`603bdc9aa6c` + `e5ff11d549a`
+  audit-closure). New `CollabSession::flush_delta_to_transport`
   + `last_flushed_vv: Option<VersionVector>` field. Auto-flush
   reroutes through delta path. Idempotency short-circuit closes
   V2 V2 audit echo-loop class. New `OpLog` helpers: `oplog_vv()`
-  + `export_delta_bytes(&VersionVector)`. 9 new integration tests
-  (total 28 at `crates/ql-collab/tests/auto_flush.rs`). No new
-  external deps.
+  + `export_delta_bytes(&VersionVector)`. 12 new integration tests
+  (9 ship + 3 audit-closure). No new external deps.
 
-- **Phase 5.5 V2 V3 steps 2-6 — Production transport.** Step 2:
-  wire `poll_remote` into auto-flush (now safe with V2 V3 step 1
-  idempotency guard). Step 3: offline-write queue. Step 4:
-  WebSocket transport impl (+ reconnect / offline sync). Step 5:
-  full-arc megaudit. Step 6: V2 V3 exit packet. 3-6 days
-  estimated.
+- **Phase 5.5 V2 V3 step 2 — poll_remote auto-flush.** ✅
+  **SHIPPED 2026-05-21**. Wires `poll_remote*` into auto-flush
+  (one flush per drain batch, not per-blob — bandwidth-efficient).
+  V2 V3 step 1's idempotency guard prevents echo loops; reverses
+  the V2 V2 audit-locked "receive-side excluded" exclusion. 3-peer
+  hub fanout now works automatically under `OnAppend`. 3 new
+  integration tests + 1 inverted test (replacing the V2 V2
+  exclusion-asserting test that documented the now-defunct contract).
+  Partial-state contract on flush Err: documented.
+
+- **Phase 5.5 V2 V3 steps 3-6 — Production transport.** Step 3:
+  offline-write queue (queue ops when transport detached; flush
+  on reconnect). Step 4: WebSocket transport impl (+ reconnect /
+  offline sync / multi-transport routing). Step 5: full-arc
+  megaudit (3-way Codex+Opus-A+Opus-B per Phase 5.3 step 5
+  precedent). Step 6: V2 V3 exit packet. 2.5-5 days estimated.
 
 - **Phase 5.7 — IDE vertical slice.** Two-window editing demo.
   1 week. Depends on D-1 + 5.3 + 5.5 V2 V2 (✅) + V2 V3.

@@ -403,70 +403,146 @@ fn on_append_within_undo_group_fires_per_append_not_per_group() {
     );
 }
 
-// ===== Codex M1 + Opus M1 closure: poll_remote is receive-side-excluded by design =====
+// ===== V2 V3 step 2: poll_remote triggers auto-flush (inverted from V2 V2 exclusion) =====
 
 #[test]
-fn poll_remote_does_not_trigger_auto_flush_by_design() {
-    // Phase 5.5 V2 V2 audit closure (Codex M1 + Opus M1, 2026-05-21):
-    // poll_remote merges directly into self.log (low-level OpLog
-    // method) and does NOT fire maybe_auto_flush. This is audit-
-    // locked behavior — see AutoFlushPolicy::OnAppend docstring §
-    // "Does NOT trigger on" for the rationale (echo-loop avoidance
-    // + caller batches its own flushes).
+fn poll_remote_triggers_auto_flush_under_on_append() {
+    // **Phase 5.5 V2 V3 step 2 (2026-05-21):** reverses the V2 V2
+    // "receive-side excluded by design" exclusion. With V2 V3 step 1's
+    // idempotency guard in place, wiring poll_remote into auto-flush
+    // is safe — duplicate (Loro-deduped) merges leave the VV
+    // unchanged and the auto-flush short-circuits to Ok(false).
     //
-    // Topology: 3 peers. Hub (A) is connected to B via T1 (A holds
-    // tx_ab_a, B's "channel" is tx_ab_b) AND to C via T2 (A holds
-    // tx_ac_a, observer holds tx_ac_c). When B sends ops via T1, A's
-    // poll_remote drains them but does NOT auto-flush onward to C
-    // via T2. The hub pattern requires an explicit flush after the
-    // poll batch.
-    let (tx_ab_a, mut tx_ab_b) = LoopbackTransport::pair();
-    let (tx_ac_a, tx_ac_c) = LoopbackTransport::pair();
+    // Test (replaces V2 V2 audit closure test which asserted the
+    // OPPOSITE — now the contract is inverted): peer A has OnAppend +
+    // transport. Peer B sends a blob with a NEW op into A's inbox.
+    // A's poll_remote drains it AND auto-flushes the merged delta
+    // back onto the same paired transport. tx_b (B's side) sees the
+    // round-trip arrive.
+    let (tx_a, mut tx_b) = LoopbackTransport::pair();
+    let mut peer_a = CollabSession::new(PeerId::new(1)).unwrap();
+    peer_a.attach_transport(tx_a);
+    peer_a.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
 
-    let mut hub = CollabSession::new(PeerId::new(1)).unwrap();
-    hub.attach_transport(tx_ac_a);
-    hub.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
-
-    // B pushes a byte blob into A's inbox via tx_ab_b.send.
+    // Peer B (fresh session, no transport) crafts a snapshot with one
+    // op and pushes the bytes into A's inbox via the paired endpoint.
     let mut peer_b = CollabSession::new(PeerId::new(2)).unwrap();
     peer_b.append_op(add_sheet()).unwrap();
     let b_bytes = peer_b.export_bytes().unwrap();
-    tx_ab_b.send(&b_bytes).unwrap();
+    tx_b.send(&b_bytes).unwrap();
 
-    // Hub's poll_remote uses the T2 transport (A's only attached one).
-    // But it CAN'T see T1 bytes — A doesn't have T1 attached. So this
-    // test needs the hub to swap transports temporarily.
-    //
-    // Simpler model: hub has T1 attached, drains T1's inbox via
-    // poll_remote, and we observe that T2's observer endpoint stays
-    // empty (because A doesn't have T2 in this configuration).
-    //
-    // The simplest empirical assertion is just: with poll_remote
-    // bringing in bytes, the SAME-side observer sees nothing.
-    drop(hub);
-    let mut hub = CollabSession::new(PeerId::new(1)).unwrap();
-    hub.attach_transport(tx_ab_a);
-    hub.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+    assert_eq!(
+        tx_b.pending_recv(),
+        0,
+        "pre-poll: B's inbox is empty (A hasn't flushed anything yet)"
+    );
 
-    // Drain B's bytes into hub. After poll_remote, hub's log has B's
-    // op. But because poll_remote is excluded from auto-flush, NO
-    // bytes should appear on tx_ab_b's inbox (the hub doesn't fan
-    // its newly-merged state back through the same transport).
-    let merged = hub.poll_remote().unwrap();
-    assert_eq!(merged, 1, "hub drained 1 blob from B");
+    // A drains B's blob via poll_remote. With V2 V3 step 2, this
+    // ALSO auto-flushes the post-merge delta back through the same
+    // transport — bytes land in B's inbox.
+    let merged = peer_a.poll_remote().unwrap();
+    assert_eq!(merged, 1, "A drained 1 blob from peer B");
     assert!(
-        hub.op_count() >= 1,
-        "hub's log now contains B's op (poll_remote merged it)"
+        peer_a.op_count() >= 1,
+        "A's log now contains B's op via the merge"
     );
     assert_eq!(
-        tx_ab_b.pending_recv(),
-        0,
-        "poll_remote MUST NOT trigger auto-flush — no bytes back to B's inbox"
+        tx_b.pending_recv(),
+        1,
+        "V2 V3 step 2: poll_remote MUST auto-flush after a successful drain that advanced state"
     );
 
-    // T2 observer also stays empty because hub doesn't hold T2 in
-    // this configuration; this is just a sanity check.
-    let _ = tx_ac_c;
+    // Verify the round-trip blob can be Loro-imported (sanity).
+    let bytes_back = tx_b.try_recv().unwrap().expect("round-trip bytes");
+    let _imported = ql_oplog::OpLog::import_bytes(&bytes_back).unwrap();
+}
+
+#[test]
+fn poll_remote_idempotent_merge_short_circuits_no_wire_send() {
+    // V2 V3 step 2 + step 1 interaction: if the drained blob only
+    // contains ops the local session ALREADY knows (Loro dedupe), the
+    // post-merge VV equals last_flushed_vv, and the auto-flush
+    // short-circuits to Ok(false) without invoking transport.send.
+    //
+    // Setup: peer A appends an op, attaches a transport, flushes once
+    // (last_flushed_vv = current). Peer B sends A its EXACT current
+    // state. A's poll_remote merges (no new ops), auto-flush
+    // short-circuits — tx_b sees no new bytes from the round-trip.
+    let (tx_a, mut tx_b) = LoopbackTransport::pair();
+    let mut peer_a = CollabSession::new(PeerId::new(1)).unwrap();
+    peer_a.append_op(add_sheet()).unwrap();
+    peer_a.attach_transport(tx_a);
+    peer_a.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+    // Explicit first flush to set last_flushed_vv = current.
+    let _ = peer_a.flush_delta_to_transport().unwrap();
+    let baseline_recv = tx_b.try_recv().unwrap();
+    assert!(baseline_recv.is_some(), "first explicit flush delivered");
+    assert_eq!(tx_b.pending_recv(), 0);
+
+    // Send A's OWN state back to itself — simulates B sending a
+    // snapshot containing only ops A already has.
+    let a_state = peer_a.export_bytes().unwrap();
+    tx_b.send(&a_state).unwrap();
+
+    // Poll: drain succeeds, merge is a Loro-dedupe no-op, VV
+    // unchanged, auto-flush short-circuits.
+    let merged = peer_a.poll_remote().unwrap();
+    assert_eq!(merged, 1, "A drained 1 blob");
+    assert_eq!(
+        tx_b.pending_recv(),
+        0,
+        "idempotent merge: auto-flush MUST short-circuit (no wire send)"
+    );
+}
+
+#[test]
+fn poll_remote_empty_drain_does_not_attempt_flush() {
+    // Defensive optimization in V2 V3 step 2: when `merged == 0`,
+    // skip the flush call entirely (no VV-clone + compare). Confirms
+    // 0-blob drain → 0 send attempt.
+    //
+    // Uses NoopTransport (records every send in `sent: Vec<Vec<u8>>`).
+    // But we can't introspect through `Box<dyn Transport>` — use
+    // LoopbackTransport with an empty inbox and assert nothing
+    // appears on the peer's pending_recv.
+    let (tx_a, observer) = LoopbackTransport::pair();
+    let mut peer_a = CollabSession::new(PeerId::new(1)).unwrap();
+    peer_a.append_op(add_sheet()).unwrap();
+    peer_a.attach_transport(tx_a);
+    peer_a.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    // Drain on EMPTY inbox → 0 merged → no flush attempted.
+    let merged = peer_a.poll_remote().unwrap();
+    assert_eq!(merged, 0, "empty inbox → no blobs drained");
+    assert_eq!(
+        observer.pending_recv(),
+        0,
+        "0 blobs drained → no auto-flush attempted (no wire send)"
+    );
+}
+
+#[test]
+fn poll_remote_with_closed_transport_returns_zero_no_flush() {
+    // When the transport is closed AND its inbox is empty, the
+    // existing graceful break in poll_remote_with_limit returns
+    // Ok(0). With V2 V3 step 2, the `merged > 0` guard prevents a
+    // spurious flush attempt (which would error on the closed
+    // transport's send side).
+    let mut bad = NoopTransport::new();
+    bad.close();
+    let mut peer_a = CollabSession::new(PeerId::new(1)).unwrap();
+    peer_a.append_op(add_sheet()).unwrap();
+    peer_a.attach_transport(bad);
+    peer_a.set_auto_flush_policy(AutoFlushPolicy::OnAppend);
+
+    // poll_remote should return Ok(0) (no blobs to drain, closed
+    // gracefully). The merged > 0 guard prevents an auto-flush
+    // attempt that would have errored.
+    let result = peer_a.poll_remote();
+    assert!(
+        matches!(result, Ok(0)),
+        "closed-transport empty-drain MUST return Ok(0) without attempting flush; got {result:?}"
+    );
 }
 
 // ===== Auto-flush fires on every documented mutator =====

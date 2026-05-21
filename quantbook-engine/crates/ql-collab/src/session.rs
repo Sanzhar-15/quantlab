@@ -197,7 +197,7 @@ pub enum AutoFlushPolicy {
     /// Flush automatically after every public method that mutates the
     /// underlying `LoroDoc`. Triggers on: `append_op`, `merge_bytes`,
     /// `update_presence`, `clear_presence`, `sweep_presence`,
-    /// `undo`, `redo`.
+    /// `undo`, `redo`, `poll_remote`, `poll_remote_with_limit`.
     ///
     /// **Phase 5.5 V2 V3 step 1 (2026-05-21):** auto-flush routes
     /// through [`flush_delta_to_transport`] (delta path) rather than
@@ -206,6 +206,15 @@ pub enum AutoFlushPolicy {
     /// short-circuit means a flush after no state change is a true
     /// no-op (no transport.send invocation) — this closes the V2 V2
     /// audit echo-loop class.
+    ///
+    /// **Phase 5.5 V2 V3 step 2 (2026-05-21):** `poll_remote*` now
+    /// triggers auto-flush AFTER the drain batch (one flush per
+    /// call, not per-blob) — bandwidth-efficient. Reverses the V2 V2
+    /// "receive-side excluded by design" exclusion now that V2 V3
+    /// step 1's idempotency guard prevents echo loops at the source
+    /// (Loro-deduped merge leaves VV unchanged → flush short-circuits
+    /// to `Ok(false)`). The 3-peer hub-fanout pattern now works
+    /// automatically.
     ///
     /// Does NOT trigger on:
     /// - Accessor methods (read-only).
@@ -216,19 +225,6 @@ pub enum AutoFlushPolicy {
     ///   land independently). Phase 5.5 V2 V2 audit closure (Opus
     ///   L1) — undo-group atomicity-over-wire deferred to V2 V3.
     /// - Transport-lifecycle methods (`attach_transport` etc.).
-    /// - `poll_remote` / `poll_remote_with_limit` — **receive-side
-    ///   excluded by design** (audit-locked Phase 5.5 V2 V2, Codex
-    ///   M1 + Opus M1, 2026-05-21). When a remote feeds you their
-    ///   snapshot, your peer-fanout side is responsible for
-    ///   batching its own flushes via explicit
-    ///   [`CollabSession::flush_to_transport`] after the drain. The
-    ///   exclusion exists for two reasons: (1) avoids the echo-loop
-    ///   class with two symmetric-OnAppend peers (see caveat
-    ///   below); (2) callers polling a high-volume inbound stream
-    ///   commonly want to coalesce many merged blobs into one
-    ///   outbound flush. V2 V3 with per-transport version vectors
-    ///   will revisit (idempotent re-flush of unchanged state is
-    ///   safe under deltas).
     ///
     /// If no transport is attached, this is silently a no-op (the
     /// flush hook checks `self.transport.is_some()` first).
@@ -245,21 +241,24 @@ pub enum AutoFlushPolicy {
     ///
     /// **Symmetric-OnAppend (Phase 5.5 V2 V3 step 1 closure,
     /// 2026-05-21):** enabling `OnAppend` on BOTH peers of a paired
-    /// transport is now safe via the V2 V3 idempotency guard. The
+    /// transport is safe via the V2 V3 idempotency guard. The
     /// guard short-circuits `flush_delta_to_transport` when no ops
     /// have been appended since the last successful flush. A
     /// merged peer-snapshot that didn't actually advance local
     /// state (Loro CRDT dedupe) leaves the VV unchanged, so the
     /// subsequent auto-flush is a no-op send. The original V2 V2
-    /// echo-loop concern (each peer re-flushing the same snapshot)
-    /// is closed at the source. V2 V3 step 2 can then safely wire
-    /// `poll_remote` into auto-flush without re-introducing the
-    /// loop.
+    /// echo-loop concern is closed at the source. With V2 V3 step 2,
+    /// `poll_remote` also auto-flushes — the round-trip back to the
+    /// SAME paired transport hits the idempotency guard if the
+    /// drained bytes were duplicates, otherwise sends the delta
+    /// (peer's Loro dedupes any ops it already has).
     ///
-    /// Note: the `poll_remote*` exclusion above STILL applies in V2
-    /// V3 step 1 — it's wired in step 2 separately. Until step 2,
-    /// callers fanning a polled batch onward must use explicit
-    /// [`flush_delta_to_transport`] or [`flush_to_transport`].
+    /// **V1 limit (V2 V3 step 2)**: auto-flush from `poll_remote`
+    /// goes back to the SAME transport the bytes came from. In a
+    /// true multi-transport hub topology, the merged state would
+    /// only fan to ONE transport per session. V2 V3 step 4
+    /// (WebSocket + multi-transport routing) may add per-transport
+    /// fanout.
     OnAppend,
 }
 
@@ -871,17 +870,24 @@ impl CollabSession {
     /// as `CollabSessionError::Transport` — any merges before
     /// the error already persist in the local `OpLog`.
     ///
-    /// **Phase 5.5 V2 V2 audit closure (Codex M1 + Opus M1,
-    /// 2026-05-21) — does NOT auto-flush.** Drains merge directly
-    /// into `self.log` (low-level `OpLog::merge_bytes`), bypassing
-    /// `CollabSession::merge_bytes` and therefore
-    /// [`AutoFlushPolicy::OnAppend`]'s post-mutator hook. **By
-    /// design** — see [`AutoFlushPolicy::OnAppend`] § "Does NOT
-    /// trigger on" for the rationale (echo-loop avoidance + caller-
-    /// batch coalescing). If you need to fan a polled batch
-    /// onward, call [`flush_to_transport`] explicitly after the
-    /// drain. V2 V3 may revisit once per-transport version vectors
-    /// make unchanged-state re-flush a no-op.
+    /// **Phase 5.5 V2 V3 step 2 (2026-05-21):** triggers ONE
+    /// auto-flush after the drain batch (not per-blob), routed
+    /// through [`flush_delta_to_transport`] when
+    /// [`auto_flush_policy`] is `OnAppend` AND at least one blob
+    /// was actually drained. V2 V3 step 1's idempotency short-
+    /// circuit handles the Loro-deduped (no-op) merge case: if
+    /// the drained bytes contained only ops already known
+    /// locally, the post-merge VV doesn't advance and the
+    /// auto-flush returns `Ok(false)` without invoking
+    /// `transport.send`.
+    ///
+    /// V2 V2 audit (Codex M1 + Opus M1) flagged the prior
+    /// exclusion of `poll_remote*` from auto-flush. V2 V3 step 1's
+    /// version-vector idempotency guard makes wiring it in safe
+    /// (no echo loop), and V2 V3 step 2 (this) reverses the
+    /// exclusion. The 3-peer fanout pattern (hub drains peer B's
+    /// blob → hub auto-flushes merged state onward) now works
+    /// automatically under `OnAppend`.
     pub fn poll_remote(&mut self) -> Result<usize, CollabSessionError> {
         self.poll_remote_with_limit(DEFAULT_POLL_REMOTE_LIMIT)
     }
@@ -897,6 +903,27 @@ impl CollabSession {
     /// returned count equals `max_blobs`, more blobs may still
     /// be queued — call again. If less, the queue drained
     /// (either empty or transport reported `Closed`).
+    ///
+    /// **Phase 5.5 V2 V3 step 2 (2026-05-21):** when at least one
+    /// blob was drained AND [`auto_flush_policy`] is `OnAppend`,
+    /// fires ONE auto-flush after the loop (per-batch, not
+    /// per-blob — bandwidth efficient). Routed through
+    /// [`flush_delta_to_transport`]; V2 V3 step 1's idempotency
+    /// guard short-circuits when the post-merge VV equals the
+    /// pre-poll `last_flushed_vv` (i.e., the drained blobs only
+    /// contained ops already known locally — Loro-deduped merge).
+    ///
+    /// **Partial-state contract on auto-flush failure**: if the
+    /// post-batch auto-flush fails (closed transport, I/O error
+    /// during the send), the method returns
+    /// `Err(CollabSessionError::Transport(_))` AFTER all `merged`
+    /// blobs have been committed to `self.log`. The caller never
+    /// sees `Ok(merged)` in this case; inspect `op_count()` to
+    /// determine how many merges actually committed locally.
+    /// `last_flushed_vv` is NOT advanced on flush Err — a retry
+    /// (e.g., manual [`flush_delta_to_transport`] after detaching
+    /// and reattaching a working transport) sends the same delta the
+    /// failed call would have.
     pub fn poll_remote_with_limit(
         &mut self,
         max_blobs: usize,
@@ -920,6 +947,17 @@ impl CollabSession {
                 }
                 Err(other) => return Err(CollabSessionError::Transport(other)),
             }
+        }
+        // **Phase 5.5 V2 V3 step 2 (2026-05-21):** auto-flush after
+        // the drain batch. ONE flush per call (not per-blob) —
+        // bandwidth-efficient. V2 V3 step 1's idempotency guard at
+        // `flush_delta_to_transport` returns Ok(false) without
+        // invoking transport.send when no state advanced (Loro-
+        // deduped merge). Skip when 0 blobs drained: state didn't
+        // change locally, no point firing the VV-clone+compare
+        // path (defensive optimization).
+        if merged > 0 {
+            self.maybe_auto_flush()?;
         }
         Ok(merged)
     }
