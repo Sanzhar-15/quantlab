@@ -25,7 +25,12 @@
  */
 
 import { loadQuantbookEngine } from './loader';
-import type { CollabSessionInstance, LoopbackPairInstance, TransportInstance } from './types';
+import type {
+	AutoFlushPolicy,
+	CollabSessionInstance,
+	LoopbackPairInstance,
+	TransportInstance,
+} from './types';
 
 /**
  * Construct a fresh `CollabSession` for the given peer.
@@ -140,4 +145,19 @@ export function loopbackTransportPair(): [TransportInstance, TransportInstance] 
 export function createLoopbackPair(): LoopbackPairInstance {
 	const engine = loadQuantbookEngine();
 	return new engine.LoopbackPair();
+}
+
+// =====================================================================
+// Phase 5.7 V2.2 (2026-05-22) -- AutoFlushPolicy helpers
+// =====================================================================
+
+/**
+ * Type guard for the camelCase string union `AutoFlushPolicy`. Returns
+ * `true` for `'disabled'` or `'onAppend'`. Note: the engine's
+ * `setAutoFlushPolicy` also accepts variant aliases (`'Disabled'`,
+ * `'OnAppend'`, `'on-append'`) -- this guard is the STRICT camelCase
+ * check for IDE-side validation; the engine is the loose parser.
+ */
+export function isAutoFlushPolicy(value: unknown): value is AutoFlushPolicy {
+	return value === 'disabled' || value === 'onAppend';
 }

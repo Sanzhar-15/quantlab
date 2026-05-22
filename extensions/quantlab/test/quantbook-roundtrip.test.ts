@@ -37,6 +37,7 @@ import {
 import {
 	appendPutValueValidated,
 	createSession,
+	isAutoFlushPolicy,
 	loopbackTransportPair,
 	quantbookEngineVersion,
 	sessionFromSnapshot,
@@ -616,6 +617,243 @@ suite('quantbook V2.1 -- Transport binding (LoopbackPair + CollabSession)', func
 			/already been consumed/,
 			'second session sees consumed wrapper',
 		);
+	});
+
+	// =================================================================
+	// Phase 5.7 V2.2 (2026-05-22) -- Full sync Transport surface
+	// =================================================================
+	//
+	// Tests for: flushDeltaToTransport, pollRemoteWithLimit,
+	// transportLastError, setAutoFlushPolicy + autoFlushPolicy.
+
+	test('flushDeltaToTransport second call with no state change short-circuits to false', () => {
+		// V2 V3 step 1 idempotency: the SECOND flushDeltaToTransport
+		// with no state change since the first returns Ok(false)
+		// without invoking transport.send.
+		//
+		// **First flush after attach is NOT a no-op** even on an empty
+		// log: attach resets last_flushed_vv to None, so the first
+		// flush encodes from the empty VV and sends a baseline blob.
+		// Subsequent flushes with no new state hit the idempotency
+		// guard.
+		const sessionA = createSession(1n);
+		const [tA, _tB] = loopbackTransportPair();
+		sessionA.attachTransport(tA);
+
+		// First flush: sends the baseline (encodes from empty VV).
+		const first = sessionA.flushDeltaToTransport();
+		assert.strictEqual(first, true,
+			'first delta flush after attach sends a baseline (VV reset by attach)');
+		// Second flush with no state change: idempotency short-circuit.
+		const second = sessionA.flushDeltaToTransport();
+		assert.strictEqual(second, false,
+			'second flush with no new state -> idempotency short-circuit');
+	});
+
+	test('flushDeltaToTransport sends bytes when state has changed', () => {
+		const sessionA = createSession(1n);
+		const sessionB = createSession(2n);
+		const [tA, tB] = loopbackTransportPair();
+		sessionA.attachTransport(tA);
+		sessionB.attachTransport(tB);
+
+		sessionA.appendPutValue(0, 0, 0, 42);
+		assert.strictEqual(sessionA.flushDeltaToTransport(), true,
+			'state changed -> delta flush sends');
+		assert.strictEqual(sessionA.hasPendingFlush(), false,
+			'no pending after flush');
+		assert.strictEqual(sessionB.pollRemote(), 1, 'B drains 1 blob');
+		assert.strictEqual(sessionB.opCount(), 1, 'B has the op');
+	});
+
+	test('flushDeltaToTransport with no transport returns false (no error)', () => {
+		const session = createSession(1n);
+		assert.strictEqual(session.flushDeltaToTransport(), false);
+	});
+
+	test('flushDeltaToTransport vs flushToTransport: delta is incremental, full is total', () => {
+		// Pin the semantic difference: after first flush of each kind
+		// from a 1-op state, attach a fresh transport and observe.
+		// (Delta will send 0 ops because last_flushed_vv was reset by
+		// attach, then immediately advanced by the flush; full sends
+		// the snapshot — but actual byte-count comparison is engine-
+		// internal. We just pin behavioral correctness here.)
+		const sessionA = createSession(1n);
+		const sessionB = createSession(2n);
+		const [tA, tB] = loopbackTransportPair();
+		sessionA.attachTransport(tA);
+		sessionB.attachTransport(tB);
+
+		sessionA.appendPutValue(0, 0, 0, 1);
+		assert.strictEqual(sessionA.flushDeltaToTransport(), true);
+		// Subsequent flush with no state change is no-op.
+		assert.strictEqual(sessionA.flushDeltaToTransport(), false,
+			'second delta flush with no new state is no-op');
+		// Full flush still sends (no idempotency guard on the
+		// full-snapshot path).
+		assert.strictEqual(sessionA.flushToTransport(), true,
+			'full flush sends regardless of state change');
+		sessionB.pollRemote();
+		sessionB.pollRemote(); // drain both blobs
+		assert.strictEqual(sessionB.opCount(), 1, 'B has the single op (deduped)');
+	});
+
+	test('pollRemoteWithLimit(0) is no-op even when blobs queued', () => {
+		const sessionA = createSession(1n);
+		const sessionB = createSession(2n);
+		const [tA, tB] = loopbackTransportPair();
+		sessionA.attachTransport(tA);
+		sessionB.attachTransport(tB);
+
+		sessionA.appendPutValue(0, 0, 0, 1);
+		sessionA.flushDeltaToTransport();
+		// 1 blob queued.
+		assert.strictEqual(sessionB.pollRemoteWithLimit(0), 0,
+			'limit=0 returns 0 without draining');
+		// The blob is still there.
+		assert.strictEqual(sessionB.pollRemoteWithLimit(10), 1,
+			'subsequent unlimited poll still drains');
+	});
+
+	test('pollRemoteWithLimit drains up to limit blobs per call', () => {
+		const sessionA = createSession(1n);
+		const sessionB = createSession(2n);
+		const [tA, tB] = loopbackTransportPair();
+		sessionA.attachTransport(tA);
+		sessionB.attachTransport(tB);
+
+		// Queue 3 separate blobs by doing 3 flushes (mutation between
+		// each so the idempotency guard doesn't short-circuit).
+		for (let i = 0; i < 3; i += 1) {
+			sessionA.appendPutValue(0, i, 0, i);
+			sessionA.flushDeltaToTransport();
+		}
+
+		// limit=2: drain 2 of the 3.
+		assert.strictEqual(sessionB.pollRemoteWithLimit(2), 2,
+			'limit=2 drains exactly 2 blobs');
+		// limit=10: drain the remaining 1.
+		assert.strictEqual(sessionB.pollRemoteWithLimit(10), 1,
+			'remaining 1 blob drained on next call');
+		assert.strictEqual(sessionB.opCount(), 3, 'all 3 ops delivered');
+	});
+
+	test('pollRemoteWithLimit rejects negative limit', () => {
+		const session = createSession(1n);
+		assert.throws(
+			() => session.pollRemoteWithLimit(-1),
+			/limit must be a non-negative/,
+		);
+	});
+
+	test('pollRemoteWithLimit rejects NaN limit', () => {
+		const session = createSession(1n);
+		assert.throws(
+			() => session.pollRemoteWithLimit(NaN),
+			/limit must be a finite/,
+		);
+	});
+
+	test('pollRemoteWithLimit rejects fractional limit', () => {
+		const session = createSession(1n);
+		assert.throws(
+			() => session.pollRemoteWithLimit(2.5),
+			/limit must be an integer/,
+		);
+	});
+
+	test('pollRemoteWithLimit rejects out-of-u32 limit', () => {
+		const session = createSession(1n);
+		assert.throws(
+			() => session.pollRemoteWithLimit(4294967296),
+			/limit must be in/,
+		);
+	});
+
+	test('transportLastError returns null when no transport attached', () => {
+		const session = createSession(1n);
+		assert.strictEqual(session.transportLastError(), null);
+	});
+
+	test('transportLastError returns null on a clean Loopback transport', () => {
+		const session = createSession(1n);
+		const [tA, _tB] = loopbackTransportPair();
+		session.attachTransport(tA);
+		// LoopbackTransport never reports errors in V2.1 sync usage.
+		assert.strictEqual(session.transportLastError(), null);
+	});
+
+	test('autoFlushPolicy defaults to "disabled"', () => {
+		const session = createSession(1n);
+		assert.strictEqual(session.autoFlushPolicy(), 'disabled');
+	});
+
+	test('setAutoFlushPolicy("onAppend") returns prior "disabled" and switches state', () => {
+		const session = createSession(1n);
+		assert.strictEqual(session.setAutoFlushPolicy('onAppend'), 'disabled');
+		assert.strictEqual(session.autoFlushPolicy(), 'onAppend');
+	});
+
+	test('setAutoFlushPolicy round-trip: onAppend -> disabled -> onAppend', () => {
+		const session = createSession(1n);
+		session.setAutoFlushPolicy('onAppend');
+		assert.strictEqual(session.setAutoFlushPolicy('disabled'), 'onAppend');
+		assert.strictEqual(session.setAutoFlushPolicy('onAppend'), 'disabled');
+	});
+
+	test('setAutoFlushPolicy rejects unknown string', () => {
+		const session = createSession(1n);
+		assert.throws(
+			() => session.setAutoFlushPolicy('always' as 'disabled'),
+			/AutoFlushPolicy must be/,
+		);
+	});
+
+	test('setAutoFlushPolicy accepts aliases (Disabled, OnAppend, on-append)', () => {
+		// The engine-side parser is lenient; the strict camelCase check
+		// is in `isAutoFlushPolicy` (TS guard). Pin both behaviors.
+		const session = createSession(1n);
+		// `as` casts: TS type narrows to the camelCase union; the engine
+		// alias acceptance is engine-side behavior.
+		assert.doesNotThrow(() => session.setAutoFlushPolicy('Disabled' as 'disabled'));
+		assert.doesNotThrow(() => session.setAutoFlushPolicy('OnAppend' as 'onAppend'));
+		assert.doesNotThrow(() => session.setAutoFlushPolicy('on-append' as 'onAppend'));
+		// Return value is always canonical camelCase.
+		const prior = session.setAutoFlushPolicy('disabled');
+		assert.strictEqual(prior, 'onAppend', 'return is canonical camelCase');
+	});
+
+	test('onAppend auto-flushes after every mutator (two-peer convergence)', () => {
+		// Real onAppend integration test: A flips to onAppend, B polls,
+		// A appends, the auto-flush hits the wire, B sees ops without
+		// an explicit A-side flush.
+		const sessionA = createSession(1n);
+		const sessionB = createSession(2n);
+		const [tA, tB] = loopbackTransportPair();
+		sessionA.attachTransport(tA);
+		sessionB.attachTransport(tB);
+		sessionA.setAutoFlushPolicy('onAppend');
+
+		sessionA.appendPutValue(0, 0, 0, 100);
+		// No explicit flushToTransport. The mutation auto-flushed.
+		assert.strictEqual(sessionA.hasPendingFlush(), false,
+			'auto-flush cleared the pending state');
+		assert.strictEqual(sessionB.pollRemote(), 1, 'B drains 1 blob');
+		assert.strictEqual(sessionB.opCount(), 1, 'B has the auto-flushed op');
+	});
+
+	test('isAutoFlushPolicy strict guard rejects engine aliases', () => {
+		// The TS-side guard is camelCase-strict. Engine accepts loose
+		// variants but the TS guard does not. Important: IDE code that
+		// reads a policy string from config/storage MUST validate
+		// via isAutoFlushPolicy before passing to setAutoFlushPolicy.
+		assert.ok(isAutoFlushPolicy('disabled'));
+		assert.ok(isAutoFlushPolicy('onAppend'));
+		assert.ok(!isAutoFlushPolicy('Disabled'));
+		assert.ok(!isAutoFlushPolicy('on-append'));
+		assert.ok(!isAutoFlushPolicy('always'));
+		assert.ok(!isAutoFlushPolicy(undefined));
+		assert.ok(!isAutoFlushPolicy(42));
 	});
 
 	test('detach does NOT drop bytes already queued for peer (Arc-shared LoopbackTransport queue)', () => {

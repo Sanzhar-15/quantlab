@@ -139,7 +139,107 @@ export interface CollabSessionInstance {
 	 *               returns an error.
 	 */
 	pollRemote(): number;
+
+	// =====================================================================
+	// Phase 5.7 V2.2 (2026-05-22) -- full sync Transport surface
+	// =====================================================================
+
+	/**
+	 * Delta flush to the attached transport. Sends ONLY the ops added
+	 * since the last successful flush. Returns `true` if bytes were
+	 * actually sent.
+	 *
+	 * **Production default**. Prefer this over `flushToTransport`
+	 * (full-snapshot) which is O(full state). Delta flushes are
+	 * O(per-op delta).
+	 *
+	 * Idempotency: no state changed since last flush -> returns
+	 * `false` without invoking `transport.send` (closes the V2 V2
+	 * audit echo-loop concern).
+	 *
+	 * Per V2 V3 step 1: `attachTransport` resets the per-transport
+	 * VV baseline, so the next `flushDeltaToTransport` after an attach
+	 * sends from empty -- delivering ALL ops including any appended
+	 * while offline (Loro's op log IS the implicit offline queue).
+	 *
+	 * @throws Error if the transport's `send` returns an error.
+	 */
+	flushDeltaToTransport(): boolean;
+
+	/**
+	 * Like `pollRemote` but with an explicit per-call cap on the
+	 * number of blobs to drain. Returns the blob count, `<= limit`.
+	 *
+	 * Returned-count semantics:
+	 * - `limit === 0` -> always returns 0 (no-op even if blobs queued).
+	 * - Returned count `=== limit` -> more blobs may be queued; call again.
+	 * - Returned count `< limit` -> queue drained.
+	 *
+	 * @param limit Non-negative integer in `[0, u32::MAX]`. NaN /
+	 *              Infinity / fractional / negative throw.
+	 *
+	 * @throws Error if `limit` is invalid OR transport `try_recv` errors.
+	 */
+	pollRemoteWithLimit(limit: number): number;
+
+	/**
+	 * The attached transport's most recent error message, or `null` if
+	 * no transport is attached OR the transport reports no error.
+	 *
+	 * **Use case**: after a mutator throws `Error("transport closed")`
+	 * (or similar), call this to distinguish underlying causes (peer
+	 * reset vs auth rejection vs capacity exceeded for V2.3+
+	 * WebSocketTransport) and pick the reconnect strategy.
+	 *
+	 * **V2.2 audit-deferred caveat (Opus MEDIUM-3)**: error strings are
+	 * lossy `Display` projections of the underlying enum. IDE callers
+	 * today must substring-match to distinguish categories. V2.3+ will
+	 * add structured discrimination via napi `Error.code`.
+	 */
+	transportLastError(): string | null;
+
+	/**
+	 * Set the auto-flush policy. Returns the prior policy as a string.
+	 *
+	 * Accepted: `'disabled'` (default) or `'onAppend'`. Other strings
+	 * throw with a precise error.
+	 *
+	 * `'onAppend'` semantics (V2 V2 + V2 V3 steps 1+2): every public
+	 * mutator auto-fires a delta flush after the mutation. Idempotency
+	 * short-circuits no-op state changes; `pollRemote*` fires once
+	 * after the batch (not per-blob).
+	 *
+	 * @throws Error on unknown policy string.
+	 */
+	setAutoFlushPolicy(policy: AutoFlushPolicy): AutoFlushPolicy;
+
+	/**
+	 * Read the current auto-flush policy. `'disabled'` is the default.
+	 *
+	 * **Forward-compat note**: the engine's `AutoFlushPolicy` is
+	 * `#[non_exhaustive]`. If the engine ships a new variant ahead of
+	 * the JS binding being updated, this method returns `'unknown'` as
+	 * a forward-compat sentinel. JS callers can detect this and warn /
+	 * upgrade.
+	 */
+	autoFlushPolicy(): AutoFlushPolicy | 'unknown';
 }
+
+/**
+ * Auto-flush policy string union. Mirrors `ql_collab::AutoFlushPolicy`
+ * (Rust enum), bound as JS strings via the napi
+ * `setAutoFlushPolicy` / `autoFlushPolicy` methods.
+ *
+ * - `'disabled'`: explicit-drive (V2 V1 behavior). Caller invokes
+ *   `flushDeltaToTransport` + `pollRemote*` on a tick.
+ * - `'onAppend'`: every mutator + `pollRemote*` auto-fires a delta
+ *   flush.
+ *
+ * The engine's underlying enum is `#[non_exhaustive]`; future variants
+ * will need binding updates. `autoFlushPolicy()` returns `'unknown'`
+ * as a forward-compat sentinel.
+ */
+export type AutoFlushPolicy = 'disabled' | 'onAppend';
 
 export interface CollabSessionConstructor {
 	new(peerId: bigint): CollabSessionInstance;
