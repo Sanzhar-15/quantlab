@@ -60,10 +60,12 @@
 //!   (for replay against a workbook).
 //! - `peer_id(&self)` — the session's stable peer id.
 
+use std::collections::HashMap;
+
 use thiserror::Error;
 
 use ql_functions::FunctionRegistry;
-use ql_oplog::{replay_into, Op, OpLog, OpLogError, PeerId, ReplayError, PRESENCE_COMMIT_ORIGIN};
+use ql_oplog::{replay_into, CellWireValue, Op, OpLog, OpLogError, PeerId, ReplayError, PRESENCE_COMMIT_ORIGIN};
 use ql_storage::Workbook;
 
 use crate::presence::{self, PresenceError, PresenceState};
@@ -383,6 +385,68 @@ pub struct CollabSession {
     ///   `flush_delta_to_transport` (V2 V3 delta path).
     /// - NOT updated on flush failure (`Err`) — caller can retry.
     last_flushed_vv: Option<loro::VersionVector>,
+
+    /// **Phase 5.7 V3.3.0.3 (2026-05-22) -- incremental snapshot cache.**
+    ///
+    /// Keyed by `(sheet, row, col)`; value = the latest `Op::PutValue`
+    /// value observed for that cell across all peers in the local op
+    /// log's causal-merge order.  Read by [`Self::snapshot_cells`] +
+    /// the napi `CollabSession::export_snapshot` accessor in
+    /// O(total-cells-in-cache) instead of O(N) in op count.  Closes
+    /// V3.2.d Opus MEDIUM-4 (`exportSnapshot` lock-hold time scales
+    /// linearly with op log size).
+    ///
+    /// **Update paths** (every op-log mutation site):
+    /// - `new`: empty.
+    /// - `from_snapshot`: rebuilt by walking the imported log.
+    /// - `append_op`: O(1) `insert` on PutValue (local append is
+    ///   always at the causal frontier; iteration order does not
+    ///   reorder existing entries).
+    /// - `merge_bytes`: REBUILT (clear + walk).  Loro's CRDT merge
+    ///   can insert remote ops at causally-prior positions, which
+    ///   changes the iteration order of EXISTING entries; the
+    ///   "latest value at (sheet, row, col)" can shift even though
+    ///   the local op log only GROWS.  Full rebuild is correct +
+    ///   bounded at O(N) in op count (matches the pre-V3.3.0.3
+    ///   per-`export_snapshot` cost; amortizes if many
+    ///   `export_snapshot` calls happen between merges).
+    /// - `discard_pending_ops`: REBUILT (the log is replaced via
+    ///   `fork_at_vv`, so prior cache entries may reference ops
+    ///   no longer in the log).
+    ///
+    /// **Read paths**:
+    /// - [`Self::snapshot_cells`] -- O(total cache entries); the
+    ///   napi `export_snapshot` filters by sheet at the read site
+    ///   (acceptable at V3.3 scale of a few sheets).  V3.x may
+    ///   nest by sheet for O(cells-on-sheet) reads if profiling
+    ///   justifies.
+    ///
+    /// **Invalidation discipline**: cache is MONOTONIC-GROW at V3.3
+    /// (no undo at V3.3 per V3.2.e exit packet § "V3.3 deliberately
+    /// did NOT do").  V3.4 undo lands → the undo path MUST call
+    /// `rebuild_snapshot_cache()` (or an undo-aware
+    /// `invalidate_cells(...)` accessor) before exporting.  Tracked
+    /// in `.plans/_active.md` V3.3 risk register R-V3.3-2.
+    ///
+    /// **Rule 4 per-field walk** (per V3.3.0.1 audit discipline +
+    /// V3.3.0.3 closure of V3.2.d Opus M4):
+    /// - `HashMap<K, V>` is `Send + Sync` when both `K` and `V` are
+    ///   `Send + Sync` (std::collections::HashMap is `Send + Sync`
+    ///   in its inherent impl, parameterized over `K: Send + Sync,
+    ///   V: Send + Sync` for the auto-traits to compose).
+    /// - `(u16, u32, u32)`: tuple of `Copy + 'static` integers.
+    ///   Trivially `Send + Sync`.
+    /// - `CellWireValue` (`ql_oplog::CellWireValue`): enum of
+    ///   `Number(f64) | Boolean(bool) | Text(String) | Error(String)
+    ///   | Pending`.  All variants are `Send + Sync` (audited at
+    ///   V1).  Composition: `Send + Sync`.
+    ///
+    /// Therefore `last_snapshot: Send + Sync`.  Inherits external
+    /// synchronization from `Arc<Mutex<CollabSession>>` (V2.4 audit;
+    /// per-field walk in `ql-bindings-node/src/lib.rs::CollabSession`
+    /// docstring).  No new negative-trait claim introduced.  Rule 4
+    /// arc terminus stays at 6.
+    last_snapshot: HashMap<(u16, u32, u32), CellWireValue>,
 }
 
 impl CollabSession {
@@ -430,6 +494,8 @@ impl CollabSession {
             transport: None,
             auto_flush_policy: AutoFlushPolicy::Disabled,
             last_flushed_vv: None,
+            // V3.3.0.3: empty cache; no ops in a fresh session.
+            last_snapshot: HashMap::new(),
         })
     }
 
@@ -466,14 +532,20 @@ impl CollabSession {
         let mut log = OpLog::import_bytes(bytes)?;
         log.set_peer_id(peer_id.as_u64())?;
         let undo = make_undo_manager(&log);
-        Ok(Self {
+        let mut sess = Self {
             peer_id,
             log,
             undo,
             transport: None,
             auto_flush_policy: AutoFlushPolicy::Disabled,
             last_flushed_vv: None,
-        })
+            // V3.3.0.3: populated by `rebuild_snapshot_cache` below
+            // so callers of `snapshot_cells` see the imported state
+            // immediately (without needing a subsequent op-log walk).
+            last_snapshot: HashMap::new(),
+        };
+        sess.rebuild_snapshot_cache()?;
+        Ok(sess)
     }
 
     /// Stable peer id assigned at session creation.
@@ -491,7 +563,27 @@ impl CollabSession {
     /// committed locally (partial-state contract — see
     /// [`AutoFlushPolicy::OnAppend`]).
     pub fn append_op(&mut self, op: Op) -> Result<(), CollabSessionError> {
+        // V3.3.0.3 incremental cache update: local appends are always
+        // at the causal frontier (Loro's normal-flow append puts the
+        // op at the local peer's vector-clock head), so iteration
+        // order does NOT reorder existing entries.  Safe to
+        // incrementally insert WITHOUT a full cache rebuild.
+        //
+        // We must capture the cache-affecting fields BEFORE consuming
+        // `op` via `self.log.append(op)`.  Op derives Clone but
+        // CellWireValue::Text/Error own heap strings; cloning to
+        // avoid the move is more expensive than matching first +
+        // appending after.  Match + extract by value via owned move
+        // is the cheapest path that satisfies the borrow checker.
+        let cache_update = if let Op::PutValue { sheet, row, col, ref value } = op {
+            Some(((sheet, row, col), value.clone()))
+        } else {
+            None
+        };
         self.log.append(op)?;
+        if let Some((key, value)) = cache_update {
+            self.last_snapshot.insert(key, value);
+        }
         self.maybe_auto_flush()?;
         Ok(())
     }
@@ -520,6 +612,14 @@ impl CollabSession {
     /// merge is already committed.
     pub fn merge_bytes(&mut self, bytes: &[u8]) -> Result<usize, CollabSessionError> {
         let new_len = self.log.merge_bytes(bytes)?;
+        // V3.3.0.3: REBUILD the cache from scratch.  Loro's CRDT merge
+        // can insert remote ops at causally-prior positions, which
+        // changes the iteration order of EXISTING entries — the
+        // "latest value at (sheet, row, col)" can shift even when the
+        // local op log only grows.  Cheap incremental update is NOT
+        // correct here; full rebuild is.  See the `last_snapshot`
+        // field docstring for the formal argument.
+        self.rebuild_snapshot_cache()?;
         self.maybe_auto_flush()?;
         Ok(new_len)
     }
@@ -566,6 +666,71 @@ impl CollabSession {
     /// ```
     pub fn op_log(&self) -> &OpLog {
         &self.log
+    }
+
+    /// **Phase 5.7 V3.3.0.3 (2026-05-22) -- snapshot cache accessor
+    /// for cell-grid IDE consumers.**
+    ///
+    /// Returns the cell-snapshot entries for `sheet` as a sorted
+    /// ascending `Vec<((u32, u32), CellWireValue)>` -- one entry per
+    /// distinct `(row, col)` in the requested sheet with the LATEST
+    /// `Op::PutValue` value across all peers' op-log iteration.
+    ///
+    /// O(cells-in-cache) per call (with a sheet-filter pass).  V3.x
+    /// may nest the cache by sheet for O(cells-on-sheet) if profiling
+    /// justifies; out of V3.3.0.3 scope.
+    ///
+    /// Empty if no `PutValue` op has been observed on this sheet.
+    /// Use [`Self::list_sheets`] (added in V3.3.0.2 -- napi-only;
+    /// engine-side enumeration can read this method's keys via a
+    /// dedup) to enumerate sheets that have entries.
+    ///
+    /// Semantics-equivalent to walking `self.op_log().iter()` and
+    /// collecting the latest PutValue per `(row, col)` on the sheet;
+    /// the cache is maintained in sync by the four op-mutation paths
+    /// (see `last_snapshot` field docstring).
+    pub fn snapshot_cells(&self, sheet: u16) -> Vec<((u32, u32), CellWireValue)> {
+        let mut entries: Vec<((u32, u32), CellWireValue)> = self
+            .last_snapshot
+            .iter()
+            .filter_map(|((s, r, c), v)| {
+                if *s == sheet { Some(((*r, *c), v.clone())) } else { None }
+            })
+            .collect();
+        entries.sort_by_key(|((row, col), _)| (*row, *col));
+        entries
+    }
+
+    /// **Phase 5.7 V3.3.0.3 (2026-05-22) -- rebuild the snapshot cache
+    /// from the current op log.**
+    ///
+    /// Internal helper.  Walks `self.log.iter()` and collects the
+    /// latest `Op::PutValue` value per `(sheet, row, col)` into
+    /// `self.last_snapshot`.  Last-write-wins via HashMap insert
+    /// overwrites in iteration order; iteration order = Loro's
+    /// causal-merge order which converges across peers per Phase 5.1
+    /// audit Codex V1.
+    ///
+    /// Called by:
+    /// - `from_snapshot` (after `import_bytes`).
+    /// - `merge_bytes` (Loro can causally-reorder; cache MUST rebuild).
+    /// - `discard_pending_ops` (log was replaced via `fork_at_vv`).
+    ///
+    /// NOT called by `append_op` -- local appends are at the causal
+    /// frontier; an O(1) incremental insert is correct.
+    ///
+    /// Returns `Err(OpLog(_))` if the op-log iterator emits a decode
+    /// error.  Same propagation as `export_snapshot` in the napi
+    /// binding.
+    fn rebuild_snapshot_cache(&mut self) -> Result<(), CollabSessionError> {
+        self.last_snapshot.clear();
+        for op_result in self.log.iter() {
+            let op = op_result.map_err(CollabSessionError::OpLog)?;
+            if let Op::PutValue { sheet, row, col, value } = op {
+                self.last_snapshot.insert((sheet, row, col), value);
+            }
+        }
+        Ok(())
     }
 
     /// **Phase 5.3 step 5b + 5b audit closure + step 5c (2026-05-20) —
@@ -1242,6 +1407,11 @@ impl CollabSession {
         // the new one. Active undo groups become invalid (documented
         // as caller's responsibility).
         self.undo = make_undo_manager(&self.log);
+        // V3.3.0.3: the log was REPLACED via `fork_at_vv`; prior
+        // cache entries may reference ops no longer in the log
+        // (specifically the discarded pending ops past the last
+        // flushed VV).  Rebuild from the new log.
+        self.rebuild_snapshot_cache()?;
         Ok(pre_count)
     }
 
@@ -1556,6 +1726,16 @@ impl CollabSession {
         // change locally, no point firing the VV-clone+compare
         // path (defensive optimization).
         if merged > 0 {
+            // V3.3.0.3: rebuild snapshot cache after drain.  Each
+            // `self.log.merge_bytes` above bypassed the public
+            // `CollabSession::merge_bytes` (to avoid per-blob auto-
+            // flush + Result-error wrapping noise), so the cache
+            // does NOT get invalidated incrementally.  One rebuild
+            // per drain batch matches the `maybe_auto_flush` cadence
+            // below.  Same correctness argument as `merge_bytes`:
+            // Loro's CRDT merge can causally-reorder; full rebuild
+            // is required.
+            self.rebuild_snapshot_cache()?;
             self.maybe_auto_flush()?;
         }
         Ok(merged)

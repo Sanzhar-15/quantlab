@@ -503,21 +503,19 @@ impl CollabSession {
     /// caching if profiling justifies.
     #[napi(js_name = "exportSnapshot")]
     pub fn export_snapshot(&self, sheet: u16) -> Result<String> {
+        // V3.3.0.3 (2026-05-22): reads from the engine's incremental
+        // snapshot cache via `CollabSession::snapshot_cells(sheet)`.
+        // The cache is maintained in sync by every op-mutation path
+        // (`append_op` O(1) insert; `merge_bytes` + `discard_pending_ops`
+        // + `from_snapshot` full rebuild).  Pre-V3.3.0.3 this method
+        // walked the entire op log per call (V2.d Opus M4: O(N) lock-
+        // hold time scales with op log size).  Now O(cells-in-cache)
+        // filtered by sheet at the engine layer.
+        //
+        // `snapshot_cells` returns entries pre-sorted by (row, col)
+        // ascending; the JSON-build pass below is unchanged.
         let inner = self.inner.lock();
-        let mut latest: std::collections::HashMap<(u32, u32), CellWireValue> =
-            std::collections::HashMap::new();
-        for op_result in inner.op_log().iter() {
-            let op = op_result.map_err(|e| {
-                bad_argument_error(format!("exportSnapshot: op log iter error: {e}"))
-            })?;
-            if let Op::PutValue { sheet: s, row, col, value } = op {
-                if s == sheet {
-                    latest.insert((row, col), value);
-                }
-            }
-        }
-        let mut entries_vec: Vec<((u32, u32), CellWireValue)> = latest.into_iter().collect();
-        entries_vec.sort_by_key(|((row, col), _)| (*row, *col));
+        let entries_vec: Vec<((u32, u32), CellWireValue)> = inner.snapshot_cells(sheet);
         let entries_json: Vec<serde_json::Value> = entries_vec
             .into_iter()
             .map(|((row, col), value)| {
