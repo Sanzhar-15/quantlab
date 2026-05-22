@@ -16,8 +16,13 @@
  * pattern; the binary isn't required for THIS extension's tests in
  * isolation (CI may run without the engine repo checked out).
  *
- * Build the binary before running:
- *   cd ../quantlab-quantbook/quantbook-engine
+ * Build the binary before running (path is relative to the IDE
+ * workspace root, NOT this test file's directory):
+ *   cd <ide-workspace-root>/quantlab-quantbook/quantbook-engine
+ *   cargo build -p ql-bindings-node --release
+ *
+ * On macOS that's typically:
+ *   cd ~/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
  *   cargo build -p ql-bindings-node --release
  */
 
@@ -277,6 +282,69 @@ suite('quantbook engine round-trip -- Phase 5.7 V1', () => {
 			() => s.appendPutValue(0, 0, 0, Infinity),
 			/finite/,
 		);
+	});
+
+	// ============================================================
+	// V1 MEGAUDIT closure tests -- Codex HIGH (engine-side row/col)
+	// ============================================================
+
+	test('engine appendPutValue rejects negative row (no ToUint32 silent wrap)', () => {
+		// **V1 megaudit closure (Codex HIGH, 2026-05-22):** the original
+		// V1 closure only added TS-side validation via the optional
+		// `appendPutValueValidated` wrapper. The engine's `#[napi]`
+		// method itself still accepted `row: u32` which silently
+		// ToUint32-coerced `-1` to `u32::MAX`. Direct callers (bypassing
+		// the TS wrapper) corrupted workbook state with no error.
+		// **Closure**: changed `row: u32, col: u32` to `row: f64, col: f64`
+		// at the napi boundary, then validate finite + non-negative +
+		// integer + u32-range inside the method.
+		const s = createSession(1n);
+		assert.throws(
+			() => s.appendPutValue(0, -1, 0, 42),
+			/row must be a non-negative integer/,
+			'direct call with row=-1 must throw (no more silent wrap to u32::MAX)',
+		);
+	});
+
+	test('engine appendPutValue rejects fractional col', () => {
+		const s = createSession(1n);
+		assert.throws(
+			() => s.appendPutValue(0, 0, 2.5, 42),
+			/col must be an integer/,
+		);
+	});
+
+	test('engine appendPutValue rejects NaN row', () => {
+		const s = createSession(1n);
+		assert.throws(
+			() => s.appendPutValue(0, NaN, 0, 42),
+			/row must be a finite/,
+		);
+	});
+
+	test('engine appendPutValue rejects Infinity col', () => {
+		const s = createSession(1n);
+		assert.throws(
+			() => s.appendPutValue(0, 0, Infinity, 42),
+			/col must be a finite/,
+		);
+	});
+
+	test('engine appendPutValue rejects out-of-u32-range row', () => {
+		const s = createSession(1n);
+		// 2^32 = 4294967296 (one past u32::MAX = 4294967295)
+		assert.throws(
+			() => s.appendPutValue(0, 4294967296, 0, 42),
+			/row must be in/,
+		);
+	});
+
+	test('engine appendPutValue accepts boundary u32::MAX row', () => {
+		const s = createSession(1n);
+		const preCount = s.opCount();
+		s.appendPutValue(0, 4294967295, 0xFFFFFFFF, 0);  // u32::MAX both
+		assert.ok(s.opCount() > preCount,
+			'u32::MAX row+col is valid and increments opCount');
 	});
 
 	test('mergeBytes returns post-merge op count, not delta', () => {

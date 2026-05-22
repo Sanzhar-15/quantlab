@@ -59,6 +59,15 @@ let cachedModule: QuantbookNativeModule | undefined;
  * to avoid this collision. Both worktrees have `extensions/quantlab/`
  * with the same source, so we anchor THROUGH the extension to its
  * containing IDE repo root.
+ *
+ * **Phase 5.7 V1 megaudit closure (Codex MEDIUM, 2026-05-22)**: the
+ * prior V1 implementation had a `console.warn`-then-fall-through
+ * "coarse 6-hop path" branch when the extension anchor wasn't found.
+ * Per CLAUDE.md no-fallback rule, this was a silent failure mode (a
+ * stale .dylib in the 6-hop path would load successfully). Replaced
+ * with an explicit `throw` directing the caller to set
+ * `QUANTBOOK_ENGINE_PATH`. The only valid resolution paths are now
+ * (1) explicit env var, (2) successful walk-up anchor discovery.
  */
 export function resolveEnginePath(): string {
 	const env = process.env.QUANTBOOK_ENGINE_PATH;
@@ -68,22 +77,23 @@ export function resolveEnginePath(): string {
 	const ext = nativeLibExt();
 	const extensionDir = findExtensionDir(__dirname);
 	if (extensionDir === undefined) {
-		// **Loud diagnostic** (Opus M2 + Codex M3 closure): instead of
-		// the prior 6-hop "coarse fallback" path (which could silently
-		// point at the wrong directory and produce a confusing
-		// not-found error), surface the inability to anchor as an
-		// explicit error path. The fallback below uses __dirname only
-		// for the error-message context; the missing-file check in
-		// loadQuantbookEngine will fail loudly.
-		console.warn(
-			'[quantbook loader] could not locate extensions/quantlab anchor by walking up from ' +
-			`${__dirname}; set QUANTBOOK_ENGINE_PATH to point at the engine cdylib directly.`,
-		);
-		return path.resolve(
-			__dirname,
-			'..', '..', '..', '..', '..', '..',
-			'quantlab-quantbook', 'quantbook-engine', 'target', 'release',
-			`libql_bindings_node.${ext}`,
+		// **Phase 5.7 V1 megaudit closure (Codex MEDIUM, 2026-05-22):**
+		// the prior V1 closure emitted a `console.warn` then fell
+		// through to a coarse 6-hop relative path. Per CLAUDE.md
+		// no-fallback rule, that's a silent failure mode -- if the
+		// 6-hop path happened to contain a stale .dylib (e.g., from a
+		// different engine checkout), the loader would happily load
+		// it. Throw LOUDLY instead. The only legitimate way to reach
+		// this branch is a non-canonical workspace layout, in which
+		// case `QUANTBOOK_ENGINE_PATH` is the right escape hatch.
+		throw new Error(
+			'[quantbook loader] Could not locate the extensions/quantlab ' +
+			`anchor by walking up from ${__dirname}. ` +
+			'This indicates a non-canonical workspace layout (the engine ' +
+			'expects the extension to be at .../quantlab/extensions/quantlab ' +
+			'sibling to .../quantlab-quantbook/quantbook-engine). ' +
+			'Set QUANTBOOK_ENGINE_PATH=<absolute path to libql_bindings_node.' +
+			`${ext}> to bypass discovery.`,
 		);
 	}
 	// extensionDir is .../{IDE-root}/extensions/quantlab

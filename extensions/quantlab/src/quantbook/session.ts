@@ -19,7 +19,9 @@
  *    (e.g., add async retry wrappers around `mergeBytes`).
  *
  * **Per V1 scope:** no Transport, no presence, no undo, no formula
- * support. See `.plans/_active.md` (engine repo) for V2 deferred list.
+ * support. See engine repo's `docs/phase5/5-7-v1-exit-packet.md`
+ * section "V1 deferred to V2" for the full V1 deferred list
+ * (engine + IDE).
  */
 
 import { loadQuantbookEngine } from './loader';
