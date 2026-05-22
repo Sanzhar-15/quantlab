@@ -210,3 +210,87 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 		});
 	}
 }
+
+// ============================================================================
+// Phase 5.7 V3.3.0.4 (2026-05-22) -- virtualization pure helpers
+// ============================================================================
+
+/**
+ * V3.3.0.4 -- compute the visible-row index range given scroll geometry.
+ *
+ * Per V3.3.0.1 decision D1 (custom-inline virtualization; no library).
+ * Pure function -- no vscode, no `this`, no side effects.  Mocha-
+ * driveable in isolation.
+ *
+ * Returns the half-open range `[startIdx, endIdx)` of snapshot
+ * entries that should be in the DOM.  The caller renders those rows
+ * + sandwiches them between top/bottom spacer rows whose heights
+ * preserve the viewport's scroll geometry.
+ *
+ * @param scrollTop      pixels scrolled from the top of the viewport.
+ *                       Webview reads from `viewport.scrollTop`.
+ * @param rowHeight      pixel height of one rendered row.  V3.3.0.4
+ *                       uses a constant `ROW_HEIGHT = 25` (matches
+ *                       the V3.2.b `<td>` padding `4px 12px` + ~17px
+ *                       text).  V3.x may make this measurement-based.
+ * @param viewportHeight pixel height of the scrolling viewport.
+ *                       Webview reads from `viewport.clientHeight`.
+ * @param totalRows      total snapshot entries (the number of rows
+ *                       the table WOULD have without virtualization).
+ * @param overscan       extra rows rendered above + below the visible
+ *                       window for smooth scrolling.  Default 5.
+ * @returns `{ startIdx, endIdx }` -- half-open; `startIdx == endIdx == 0`
+ *           when `totalRows === 0`.  Both indices are clamped to
+ *           `[0, totalRows]`.
+ */
+export function computeVisibleRange(
+	scrollTop: number,
+	rowHeight: number,
+	viewportHeight: number,
+	totalRows: number,
+	overscan: number = 5,
+): { startIdx: number; endIdx: number } {
+	if (totalRows === 0) {
+		return { startIdx: 0, endIdx: 0 };
+	}
+	if (rowHeight <= 0) {
+		// Defensive: a zero or negative rowHeight would div-by-zero or
+		// produce negative counts.  Render everything; the caller can
+		// still display the table (just without virtualization).
+		return { startIdx: 0, endIdx: totalRows };
+	}
+	const firstVisible = Math.max(0, Math.floor(scrollTop / rowHeight));
+	const visibleCount = Math.max(1, Math.ceil(viewportHeight / rowHeight));
+	const startIdx = Math.max(0, firstVisible - overscan);
+	const endIdx = Math.min(totalRows, firstVisible + visibleCount + overscan);
+	return { startIdx, endIdx };
+}
+
+/**
+ * V3.3.0.4 -- slice a snapshot's entries to the index range
+ * `[startIdx, endIdx)`.
+ *
+ * Pure function over snapshot data.  Mocha tests use this to verify
+ * that virtualization preserves the V3.2.a/b/c data-row + data-col +
+ * data-original-text + data-original-kind invariants on the rendered
+ * subset (which is what `cellGridHtml.ts::buildHtml` consumes).
+ *
+ * Returns the sliced sub-array (NOT mutating the input).  The HTML
+ * builder downstream renders these as `<tr>` rows; top + bottom
+ * spacer rows sandwich them.
+ *
+ * @param entries  the full sorted ascending `snapshot.entries`.
+ * @param startIdx inclusive start index; clamped to `[0, entries.length]`.
+ * @param endIdx   exclusive end index; clamped to `[startIdx, entries.length]`.
+ * @returns the sub-array `entries[startIdx..endIdx)`.
+ */
+export function buildVirtualRows<T>(
+	entries: ReadonlyArray<T>,
+	startIdx: number,
+	endIdx: number,
+): T[] {
+	const len = entries.length;
+	const clampedStart = Math.max(0, Math.min(startIdx, len));
+	const clampedEnd = Math.max(clampedStart, Math.min(endIdx, len));
+	return entries.slice(clampedStart, clampedEnd);
+}

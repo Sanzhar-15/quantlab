@@ -60,11 +60,61 @@ export function buildHtml(
 	options: CellGridHtmlOptions = {},
 ): string {
 	const nonce = options.nonce;
-	const rows = renderRows(snapshot.entries, nonce !== undefined);
-	const meta = `snapshot_format_version=${snapshot.snapshot_format_version}; entries=${snapshot.entries.length}`;
-	const body = snapshot.entries.length === 0
+	// V3.3.0.4: virtualization scaffold.  Render only the first
+	// VIRT_INITIAL_ROWS entries server-side + inline the FULL snapshot
+	// as JSON in a `<script type="application/json">` data block.
+	// The webview's scroll handler reads the JSON + re-renders the
+	// visible subset on scroll.  Non-nonce path (V3.2.a read-only)
+	// still renders ALL rows (no scroll handler exists there).
+	//
+	// VIRT_INITIAL_ROWS is the initial visible-row count baked into
+	// the server-side HTML.  Picked to cover typical viewport
+	// (80vh / 25px ~= 25-30 rows) + overscan (5 rows).  Webview
+	// adjusts immediately on first scroll-event to actual
+	// `viewport.clientHeight`.
+	const VIRT_INITIAL_ROWS = 40;
+	const VIRT_ROW_HEIGHT_PX = 25;
+	const isVirtualized = nonce !== undefined && snapshot.entries.length > VIRT_INITIAL_ROWS;
+	const visibleEntries = isVirtualized
+		? snapshot.entries.slice(0, VIRT_INITIAL_ROWS)
+		: snapshot.entries;
+	const rows = renderRows(visibleEntries, nonce !== undefined);
+	const meta = `snapshot_format_version=${snapshot.snapshot_format_version}; entries=${snapshot.entries.length}${isVirtualized ? ` (virtualized; initial window ${VIRT_INITIAL_ROWS})` : ''}`;
+	// V3.3.0.4: spacer rows preserve scroll geometry of the FULL
+	// table.  Top spacer = startIdx * rowHeight (0 on initial paint
+	// since we start at index 0).  Bottom spacer = (totalRows -
+	// endIdx) * rowHeight.  As the user scrolls, the webview script
+	// updates BOTH spacer heights + replaces the middle row group.
+	const topSpacerHeight = 0;
+	const bottomSpacerHeight = isVirtualized
+		? (snapshot.entries.length - VIRT_INITIAL_ROWS) * VIRT_ROW_HEIGHT_PX
+		: 0;
+	const spacerTopRow = `<tr class="cell-grid-spacer-top" data-spacer-height="${topSpacerHeight}" style="height: ${topSpacerHeight}px;"><td colspan="3" aria-hidden="true"></td></tr>`;
+	const spacerBottomRow = `<tr class="cell-grid-spacer-bottom" data-spacer-height="${bottomSpacerHeight}" style="height: ${bottomSpacerHeight}px;"><td colspan="3" aria-hidden="true"></td></tr>`;
+	const tableBody = snapshot.entries.length === 0
 		? '<div class="empty">(empty -- no PutValue ops on this sheet)</div>'
-		: `<table><thead><tr><th>Row</th><th>Col</th><th>Value</th></tr></thead><tbody>${rows}</tbody></table>`;
+		: `<div class="cell-grid-viewport"><table><thead><tr><th>Row</th><th>Col</th><th>Value</th></tr></thead><tbody data-virt-row-height="${VIRT_ROW_HEIGHT_PX}" data-virt-total-rows="${snapshot.entries.length}">${spacerTopRow}${rows}${spacerBottomRow}</tbody></table></div>`;
+	// V3.3.0.4: inline the full snapshot as JSON so the webview can
+	// re-render rows on scroll without a host round-trip.  Wrapped in
+	// a `<script type="application/json">` block which the browser
+	// does NOT execute (CSP `script-src 'nonce-...'` blocks unnonced
+	// scripts; this one carries no nonce + non-JS type).  The webview
+	// script reads it via `document.getElementById('cell-grid-data').textContent`.
+	//
+	// Only emitted when nonce is provided (V3.2.b/c mode).  V3.2.a
+	// read-only path renders all rows directly + no script accesses
+	// the data block.
+	//
+	// HTML-escapes any "</" sequence in the JSON to avoid premature
+	// script-tag termination if cell text contains literal
+	// `</script>`.  serde_json::to_string already escapes "/" but we
+	// belt-and-suspenders here.
+	const snapshotJsonRaw = JSON.stringify(snapshot);
+	const snapshotJsonSafe = snapshotJsonRaw.replace(/<\/(script)/gi, '<\\/$1');
+	const snapshotDataBlock = nonce !== undefined
+		? `<script id="cell-grid-data" type="application/json">${snapshotJsonSafe}</script>`
+		: '';
+	const body = tableBody;
 	// CSS is built from an array of per-rule strings. Each array entry
 	// is a TS string on a tab-indented source line (hygiene-compliant),
 	// concatenated with `\n` so the rendered HTML has one CSS rule per
@@ -89,6 +139,11 @@ export function buildHtml(
 		'.cell-value { cursor: cell; }',
 		'.cell-value.cell-edit-error { border: 2px solid var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground); }',
 		'.cell-edit-input { width: 8em; font-family: var(--vscode-editor-font-family); font-size: inherit; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-focusBorder); padding: 2px 4px; box-sizing: border-box; }',
+		// V3.3.0.4 virtualization geometry:
+		'.cell-grid-viewport { max-height: 80vh; overflow-y: auto; border: 1px solid var(--vscode-panel-border); }',
+		'.cell-grid-viewport thead th { position: sticky; top: 0; z-index: 1; }',
+		'.cell-grid-spacer-top, .cell-grid-spacer-bottom { padding: 0; border: none; }',
+		'.cell-grid-spacer-top td, .cell-grid-spacer-bottom td { padding: 0; border: none; }',
 	].join('\n');
 	// CSP: narrow by default; widen `script-src` only when a nonce was
 	// passed in (V3.2.b.2). The CSP string never substitutes user-
@@ -114,6 +169,7 @@ export function buildHtml(
 <h2>Quantbook Cell Grid -- Sheet ${escapeHtml(String(snapshot.sheet))}</h2>
 <div class="meta">${escapeHtml(meta)}</div>
 ${body}
+${snapshotDataBlock}
 ${scriptTag}
 </body>
 </html>`;
@@ -316,6 +372,99 @@ function buildClientScript(sheetForClient: number): string {
 		'    }',
 		'    console.warn(\'[cellGrid] unknown inbound message type:\', msg.type);',
 		'  });',
+		'',
+		'  // V3.3.0.4 virtualization: scroll-driven row swap.',
+		'  //',
+		'  // Reads the full snapshot from the inline `<script id="cell-grid-data"',
+		'  // type="application/json">` block, computes the visible-row range on',
+		'  // each scroll event, and repaints the `<tbody>` content between the',
+		'  // top/bottom spacer rows.  No host round-trip per scroll tick.',
+		'  //',
+		'  // Mid-edit safety: if `activeInput` is non-null (user is typing in a',
+		'  // cell), the repaint is SKIPPED for that scroll tick.  Repainting',
+		'  // tbody would clobber the input element + lose unsaved text.  The',
+		'  // user must commit/cancel before scroll-induced repaints resume.',
+		'  var dataBlock = document.getElementById(\'cell-grid-data\');',
+		'  var FULL_SNAPSHOT = null;',
+		'  if (dataBlock !== null) {',
+		'    try {',
+		'      FULL_SNAPSHOT = JSON.parse(dataBlock.textContent || \'{"entries":[]}\');',
+		'    } catch (e) {',
+		'      console.warn(\'[cellGrid] failed to parse snapshot data block:\', e);',
+		'    }',
+		'  }',
+		'',
+		'  var viewport = document.querySelector(\'.cell-grid-viewport\');',
+		'  var tbody = viewport !== null ? viewport.querySelector(\'tbody\') : null;',
+		'  var ROW_HEIGHT = 25;',
+		'  var OVERSCAN = 5;',
+		'',
+		'  function htmlEscape(s) {',
+		'    return String(s).replace(/[&<>"\\u0027]/g, function (c) {',
+		'      if (c === \'&\') return \'&amp;\';',
+		'      if (c === \'<\') return \'&lt;\';',
+		'      if (c === \'>\') return \'&gt;\';',
+		'      if (c === \'"\') return \'&quot;\';',
+		'      return \'&#39;\';',
+		'    });',
+		'  }',
+		'',
+		'  function formatCellValueClient(value) {',
+		'    if (value.kind === \'number\') return String(value.value);',
+		'    if (value.kind === \'boolean\') return value.value ? \'TRUE\' : \'FALSE\';',
+		'    if (value.kind === \'text\') return value.value;',
+		'    if (value.kind === \'error\') return value.value;',
+		'    return \'(pending)\';',
+		'  }',
+		'',
+		'  function renderRowsClient(entries) {',
+		'    var html = \'\';',
+		'    for (var i = 0; i < entries.length; i += 1) {',
+		'      var e = entries[i];',
+		'      var valueStr = formatCellValueClient(e.value);',
+		'      var kind = e.value.kind;',
+		'      html += \'<tr><td>\' + e.row + \'</td><td>\' + e.col +',
+		'        \'</td><td class="cell-value" data-row="\' + e.row +',
+		'        \'" data-col="\' + e.col +',
+		'        \'" data-original-text="\' + htmlEscape(valueStr) +',
+		'        \'" data-original-kind="\' + htmlEscape(kind) + \'">\' +',
+		'        htmlEscape(valueStr) +',
+		'        \'<span class="kind">[\' + htmlEscape(kind) + \']</span></td></tr>\';',
+		'    }',
+		'    return html;',
+		'  }',
+		'',
+		'  function computeRange(scrollTop, viewportHeight, totalRows) {',
+		'    if (totalRows === 0) { return { startIdx: 0, endIdx: 0 }; }',
+		'    if (ROW_HEIGHT <= 0) { return { startIdx: 0, endIdx: totalRows }; }',
+		'    var firstVisible = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT));',
+		'    var visibleCount = Math.max(1, Math.ceil(viewportHeight / ROW_HEIGHT));',
+		'    var startIdx = Math.max(0, firstVisible - OVERSCAN);',
+		'    var endIdx = Math.min(totalRows, firstVisible + visibleCount + OVERSCAN);',
+		'    return { startIdx: startIdx, endIdx: endIdx };',
+		'  }',
+		'',
+		'  function repaintForScroll() {',
+		'    if (activeInput !== null) { return; }', // mid-edit guard
+		'    if (FULL_SNAPSHOT === null || viewport === null || tbody === null) { return; }',
+		'    var entries = FULL_SNAPSHOT.entries || [];',
+		'    var range = computeRange(viewport.scrollTop, viewport.clientHeight, entries.length);',
+		'    var visible = entries.slice(range.startIdx, range.endIdx);',
+		'    var topHeight = range.startIdx * ROW_HEIGHT;',
+		'    var bottomHeight = (entries.length - range.endIdx) * ROW_HEIGHT;',
+		'    var topSpacer = \'<tr class="cell-grid-spacer-top" data-spacer-height="\' + topHeight +',
+		'      \'" style="height: \' + topHeight + \'px;"><td colspan="3" aria-hidden="true"></td></tr>\';',
+		'    var bottomSpacer = \'<tr class="cell-grid-spacer-bottom" data-spacer-height="\' + bottomHeight +',
+		'      \'" style="height: \' + bottomHeight + \'px;"><td colspan="3" aria-hidden="true"></td></tr>\';',
+		'    tbody.innerHTML = topSpacer + renderRowsClient(visible) + bottomSpacer;',
+		'  }',
+		'',
+		'  if (viewport !== null) {',
+		'    viewport.addEventListener(\'scroll\', repaintForScroll);',
+		'    // Initial paint after geometry is known (viewport.clientHeight is',
+		'    // only valid after layout).  rAF defers to after first paint.',
+		'    requestAnimationFrame(repaintForScroll);',
+		'  }',
 		'}());',
 	].join('\n');
 }

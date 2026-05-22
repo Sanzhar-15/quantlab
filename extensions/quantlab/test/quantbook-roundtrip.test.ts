@@ -2149,7 +2149,9 @@ suite('quantbook V3.2.a scaffold -- cell-grid webview HTML rendering', function 
 			],
 		});
 		assert.ok(html.includes('entries=2'));
-		assert.ok(html.includes('<tbody>'));
+		// V3.3.0.4: tbody carries data-virt-row-height + data-virt-total-rows
+		// attrs for the webview scroll handler.  Match the open tag form.
+		assert.ok(/<tbody\b/.test(html), 'tbody tag present (with virtualization attrs)');
 		assert.ok(html.includes('<td>0</td><td>0</td>'));
 		assert.ok(html.includes('42'));
 		assert.ok(html.includes('[number]'));
@@ -2265,7 +2267,7 @@ suite('quantbook V3.2.a -- exportSnapshot cell-snapshot export', function () {
 // Phase 5.7 V3.2.b.5 -- cell-edit flow (HTML + dispatcher)
 // ============================================================================
 
-import { classifyPollTick, dispatchIncomingMessage, parseCellRawInput, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
+import { buildVirtualRows, classifyPollTick, computeVisibleRange, dispatchIncomingMessage, parseCellRawInput, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
 
 suite('quantbook V3.2.b.2 -- cellGridHtml.ts nonce + script + editable cells', function () {
 	test('buildHtml WITHOUT nonce is unchanged from V3.2.a (no script tag; narrow CSP)', () => {
@@ -2872,5 +2874,176 @@ suite('quantbook V3.3.0.3 -- snapshot cache invariants (semantics-preserving)', 
 			'fromSnapshot rebuilds the cache; sheet 0 mirrors source');
 		assert.deepStrictEqual(snapB1.entries, snapA1.entries,
 			'fromSnapshot rebuilds the cache; sheet 1 mirrors source');
+	});
+});
+
+// ============================================================================
+// Phase 5.7 V3.3.0.4 -- IDE virtualization scaffold (pure helpers + HTML)
+// ============================================================================
+
+suite('quantbook V3.3.0.4 -- computeVisibleRange (pure helper)', function () {
+	test('empty (totalRows = 0) returns the empty range', () => {
+		const r = computeVisibleRange(0, 25, 800, 0);
+		assert.deepStrictEqual(r, { startIdx: 0, endIdx: 0 });
+	});
+
+	test('scrollTop = 0 with overscan applies overscan only at the bottom', () => {
+		// firstVisible = 0; visibleCount = ceil(800/25) = 32; with
+		// overscan=5: start = max(0, 0-5) = 0; end = min(100, 0+32+5) = 37.
+		const r = computeVisibleRange(0, 25, 800, 100, 5);
+		assert.strictEqual(r.startIdx, 0);
+		assert.strictEqual(r.endIdx, 37);
+	});
+
+	test('scrollTop mid-viewport applies overscan symmetrically', () => {
+		// scrollTop = 500; rowHeight = 25; firstVisible = 20;
+		// visibleCount = 32; overscan = 5; start = 15; end = 57.
+		const r = computeVisibleRange(500, 25, 800, 100, 5);
+		assert.strictEqual(r.startIdx, 15);
+		assert.strictEqual(r.endIdx, 57);
+	});
+
+	test('endIdx clamped to totalRows near the end', () => {
+		// scrollTop = 2400 (row 96); visibleCount = 32; would-be end =
+		// 96 + 32 + 5 = 133, clamped to totalRows = 100.
+		const r = computeVisibleRange(2400, 25, 800, 100, 5);
+		assert.strictEqual(r.endIdx, 100);
+		assert.ok(r.startIdx >= 91 && r.startIdx <= 96);
+	});
+
+	test('defensive: rowHeight = 0 returns full range (no div-by-zero)', () => {
+		const r = computeVisibleRange(500, 0, 800, 50);
+		assert.deepStrictEqual(r, { startIdx: 0, endIdx: 50 });
+	});
+
+	test('overscan = 0 produces tight range', () => {
+		// scrollTop=0; firstVisible=0; visibleCount=32; overscan=0;
+		// start = 0; end = 32.
+		const r = computeVisibleRange(0, 25, 800, 100, 0);
+		assert.deepStrictEqual(r, { startIdx: 0, endIdx: 32 });
+	});
+
+	test('overscan default = 5 when omitted', () => {
+		const explicit = computeVisibleRange(0, 25, 800, 100, 5);
+		const defaulted = computeVisibleRange(0, 25, 800, 100);
+		assert.deepStrictEqual(defaulted, explicit);
+	});
+});
+
+suite('quantbook V3.3.0.4 -- buildVirtualRows (pure helper)', function () {
+	test('slices entries to [startIdx, endIdx)', () => {
+		const entries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+		assert.deepStrictEqual(buildVirtualRows(entries, 2, 5), [2, 3, 4]);
+	});
+
+	test('startIdx > endIdx returns empty', () => {
+		const entries = [0, 1, 2, 3];
+		assert.deepStrictEqual(buildVirtualRows(entries, 3, 1), []);
+	});
+
+	test('out-of-bounds endIdx clamps to length', () => {
+		const entries = [0, 1, 2];
+		assert.deepStrictEqual(buildVirtualRows(entries, 0, 99), [0, 1, 2]);
+	});
+
+	test('negative startIdx clamps to 0', () => {
+		const entries = [10, 20, 30];
+		assert.deepStrictEqual(buildVirtualRows(entries, -5, 2), [10, 20]);
+	});
+
+	test('empty entries returns empty regardless of indices', () => {
+		assert.deepStrictEqual(buildVirtualRows([], 0, 10), []);
+	});
+
+	test('preserves entry contents (does not mutate input)', () => {
+		const entries = [
+			{ row: 0, col: 0, value: { kind: 'number', value: 42 } },
+			{ row: 1, col: 0, value: { kind: 'text', value: 'hi' } },
+		];
+		const sliced = buildVirtualRows(entries, 0, 1);
+		assert.strictEqual(sliced.length, 1);
+		assert.strictEqual(sliced[0], entries[0]);
+		// Mutate sliced; input unchanged.
+		assert.strictEqual(entries.length, 2);
+	});
+});
+
+suite('quantbook V3.3.0.4 -- buildHtml virtualization wiring', function () {
+	test('non-nonce mode (V3.2.a) does NOT virtualize (no scroll handler)', () => {
+		// Create a snapshot with 100 entries; the V3.2.a path renders ALL
+		// of them (no virtualization gate).
+		const entries: Array<{ row: number; col: number; value: { kind: 'number'; value: number } }> = [];
+		for (let i = 0; i < 100; i += 1) {
+			entries.push({ row: i, col: 0, value: { kind: 'number', value: i } });
+		}
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries });
+		assert.ok(!html.includes('cell-grid-data'),
+			'no snapshot data block in V3.2.a-compat path');
+		assert.ok(!html.includes('virtualized; initial window'),
+			'no virtualization marker in meta');
+	});
+
+	test('nonced mode with >40 entries virtualizes (initial window of 40)', () => {
+		const entries: Array<{ row: number; col: number; value: { kind: 'number'; value: number } }> = [];
+		for (let i = 0; i < 100; i += 1) {
+			entries.push({ row: i, col: 0, value: { kind: 'number', value: i } });
+		}
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries }, { nonce: 'v3304test' });
+		// Server-side renders 40 rows; bottom spacer covers the remaining 60.
+		assert.ok(html.includes('virtualized; initial window 40'),
+			'meta indicates virtualization is active');
+		assert.ok(html.includes('cell-grid-data'),
+			'snapshot data block present for client-side scroll');
+		assert.ok(html.includes('<script id="cell-grid-data" type="application/json">'),
+			'data block uses non-JS script tag (non-nonced; CSP blocks execution)');
+		assert.ok(html.includes('cell-grid-viewport'),
+			'viewport wrapper present');
+		// Bottom spacer = (100 - 40) * 25 = 1500px.
+		assert.ok(html.includes('data-spacer-height="1500"'),
+			'bottom spacer height pre-computed');
+		assert.ok(html.includes('data-virt-row-height="25"'),
+			'tbody carries virtualization metadata');
+		assert.ok(html.includes('data-virt-total-rows="100"'));
+	});
+
+	test('nonced mode with <=40 entries does NOT virtualize', () => {
+		const entries: Array<{ row: number; col: number; value: { kind: 'number'; value: number } }> = [];
+		for (let i = 0; i < 10; i += 1) {
+			entries.push({ row: i, col: 0, value: { kind: 'number', value: i } });
+		}
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries }, { nonce: 'v3304test' });
+		assert.ok(!html.includes('virtualized; initial window'),
+			'small snapshot does not trigger virtualization');
+		assert.ok(html.includes('data-spacer-height="0"'),
+			'top + bottom spacers both 0 when not virtualized');
+		// Data block still emitted (nonce present + script can read it
+		// if user scrolls or other paths need it).
+		assert.ok(html.includes('cell-grid-data'));
+	});
+
+	test('snapshot data block HTML-escapes embedded </script>', () => {
+		const html = buildHtml({
+			snapshot_format_version: 1,
+			sheet: 0,
+			entries: [
+				{ row: 0, col: 0, value: { kind: 'text', value: '</script>alert(1)' } },
+			],
+		}, { nonce: 'v3304test' });
+		// The data block's JSON encoded the close-tag pattern; the
+		// belt-and-suspenders escape replaces `</script` with `<\/script`.
+		assert.ok(!html.match(/<script[^>]*>[^<]*<\/script>alert\(1\)/),
+			'no premature script-tag termination via cell payload');
+	});
+
+	test('webview script body wires the scroll handler + reads data block', () => {
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries: [] }, { nonce: 'v3304test' });
+		// Pin the contract surface: the script reads from cell-grid-data,
+		// listens on scroll, uses ROW_HEIGHT + OVERSCAN.
+		assert.ok(html.includes('getElementById(\'cell-grid-data\')'));
+		assert.ok(html.includes('addEventListener(\'scroll\''));
+		assert.ok(html.includes('ROW_HEIGHT = 25'));
+		assert.ok(html.includes('OVERSCAN = 5'));
+		// Mid-edit guard: activeInput check
+		assert.ok(html.includes('if (activeInput !== null) { return; }'));
 	});
 });
