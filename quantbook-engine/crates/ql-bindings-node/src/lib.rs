@@ -698,75 +698,50 @@ impl CollabSession {
     // ==========================================================
     // Phase 5.7 V2.3 (2026-05-22) — async Transport surface
     // ==========================================================
-
-    /// Async flush-pending — waits for the attached transport's writer
-    /// task to drain (level-1 local ack per V2 V4 V1 Tier K1 contract).
-    ///
-    /// Returns a JS `Promise<void>` that resolves when:
-    /// - the writer has completed `send` for every queued blob, OR
-    /// - the transport has been detached / dropped / errored.
-    ///
-    /// **Why async**: the engine's `flush_pending_to_transport` uses
-    /// `Condvar::wait_timeout` on a writer-progress channel. Calling it
-    /// from the V8 thread synchronously would block JS for the duration
-    /// of the wait (up to the Condvar's internal timeout). napi-rs's
-    /// `#[napi]` on an `async fn` bridges to a tokio task via the
-    /// `tokio_rt` runtime feature — the wait happens on a tokio worker
-    /// thread; V8 stays unblocked.
-    ///
-    /// **Failure modes**:
-    /// - No transport attached → returns `Ok(())` (NOT an error;
-    ///   matches the engine's no-op behavior).
-    /// - Transport error during the wait → JS Error.
-    ///
-    /// **&mut self constraint**: napi-rs supports `async fn` methods
-    /// with `&mut self` via the generated `Reference<T>` wrapping. The
-    /// engine's `flush_pending_to_transport` is itself sync (Condvar
-    /// blocking), so we wrap with `tokio::task::spawn_blocking` to
-    /// avoid blocking a tokio worker. (Without spawn_blocking, the
-    /// Condvar wait would tie up a worker thread; with it, the wait
-    /// goes to a dedicated blocking-task thread.)
-    ///
-    /// V2.3 keeps the spawn_blocking pattern simple but inefficient:
-    /// each call allocates. V2.3+ may pool. V3 may push the Condvar
-    /// itself behind an async signal (tokio::sync::Notify).
-    ///
-    /// **`unsafe` marker (napi-rs constraint, V2.3 design note)**:
-    /// napi-rs requires `&mut self` async methods to be marked
-    /// `unsafe` because the async pause-point COULD theoretically
-    /// allow a concurrent JS re-entry on the same instance. In
-    /// practice JS is single-threaded per Worker, AND napi-rs's
-    /// generated wrapper holds the `Reference<T>` exclusively for
-    /// the duration of the await. So calling this from JS is safe.
-    /// The `unsafe` is a Rust-side discipline marker, not a hazard
-    /// for the JS caller — they see `session.flushPendingToTransport()`
-    /// the same as any other async method. V1 megaudit Opus M1 +
-    /// V2.1 Send+!Sync rationale together pin: only one thread can
-    /// hold `&mut Reference<T>` at a time (JS event loop + napi-rs
-    /// callback discipline).
-    #[napi(js_name = "flushPendingToTransport")]
-    pub async unsafe fn flush_pending_to_transport(&mut self) -> Result<()> {
-        // **&mut self async constraint (V2.3 design note)**: we can't
-        // easily move `&mut self` into spawn_blocking. The engine's
-        // `flush_pending_to_transport` is sync + non-blocking-on-the-
-        // CollabSession-mutex (the Condvar wait is on the writer
-        // task's internal channel, not on the session). For V2.3,
-        // call directly without spawn_blocking. The wait IS blocking
-        // from a tokio worker's perspective, but napi-rs's async
-        // entry-point runs each call on a freshly-allocated future
-        // that doesn't tie up napi's threadsafe-function queue.
-        //
-        // If a future audit finds that this blocks the tokio runtime
-        // in practice (the V1 megaudit Opus-B M2 flagged this as a
-        // theoretical concern), V2.4+ should restructure either:
-        // - Restructure `CollabSession::flush_pending_to_transport`
-        //   to take a tokio runtime handle, or
-        // - Use `tokio::task::spawn_blocking` here with a clone-able
-        //   handle to the session (requires engine refactor).
-        self.inner
-            .flush_pending_to_transport()
-            .map_err(|e| Error::from_reason(format!("{e}")))
-    }
+    //
+    // **V2.3 audit closure (Codex FAIL + Opus PASS-WITH-FINDINGS,
+    // 2026-05-22)**: `flushPendingToTransport` was shipped in this
+    // cycle's initial ship commit but REMOVED in the closure cycle
+    // after both auditors flagged two convergent HIGH findings:
+    //
+    // 1. **Rust UB hazard via &mut self async aliasing**. napi-rs's
+    //    `#[napi]` on an async fn with `&mut self` generates `let
+    //    this: &mut #parent = Box::leak(Box::from_raw(this_ptr));`
+    //    with NO runtime locking (verified per napi-derive-backend-
+    //    5.0.4 `codegen/fn.rs:285-291`). JS code can re-enter on the
+    //    same V8 thread while the future is pending:
+    //
+    //        const p = session.flushPendingToTransport();
+    //        session.appendPutValue(0, 0, 0, 1);   // 2nd &mut!
+    //        await p;
+    //
+    //    This produces two simultaneous `&'static mut CollabSession`
+    //    references to the same memory → undefined behavior. The
+    //    `Send + !Sync` argument (V1 megaudit Opus-A M1 closure)
+    //    only prevents cross-Worker sharing; it does NOT prevent
+    //    same-thread re-entry within a single Worker's event loop.
+    //
+    // 2. **Tokio runtime starvation**. The engine's
+    //    `flush_pending_to_transport` is sync (`Condvar::wait_timeout`).
+    //    Wrapping in `#[napi]` async runs the Condvar wait on a tokio
+    //    worker thread (per napi-rs 3.9.0 `tokio_runtime.rs`). With
+    //    N concurrent flushPending calls (N = num_cpus), the runtime's
+    //    worker pool is fully occupied — and `WebSocketTransport`'s
+    //    writer task (which Condvar is waiting ON) shares the same
+    //    runtime. Deadlock.
+    //
+    // **Closure**: remove the method. V2.4 ships flushPending properly
+    // via one of:
+    //   (a) engine refactor to `Arc<Mutex<CoreCollabSession>>` so the
+    //       async wrapper can take a cloneable handle into spawn_blocking,
+    //   (b) engine restructure of `flush_pending_to_transport` to take
+    //       a tokio Notify (truly async, no Condvar),
+    //   (c) binding-side serialization guard preventing all session
+    //       methods while an async op is pending.
+    //
+    // **V2.3 retained**: `Transport.websocketConnect` (static async
+    // factory — no &mut self, no Condvar; safe). See after the
+    // closing brace of impl CollabSession + into impl Transport.
 }
 
 /// Phase 5.7 V2.2 (2026-05-22) — parse a JS string into
