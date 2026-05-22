@@ -284,9 +284,45 @@ export async function runMultiWindowDemo(
 	log.appendLine('');
 
 	let reconnectInFlight = false;
+	let isDisposed = false;
+
+	// Timer handles live inside a mutable container so `dispose` can
+	// be defined BEFORE the timers are armed (the handler below
+	// closes over `dispose` and may need to invoke it during reconnect
+	// exhaustion). The container avoids `let` vars that eslint's
+	// `prefer-const` flags as "never reassigned" (each handle is
+	// assigned only once even though the binding shape requires
+	// late initialization).
+	const timers: {
+		appendTimer?: NodeJS.Timeout;
+		pollTimer?: NodeJS.Timeout;
+	} = {};
+
+	const dispose = (): void => {
+		if (isDisposed) {
+			return;
+		}
+		isDisposed = true;
+		if (timers.appendTimer !== undefined) {
+			clearInterval(timers.appendTimer);
+		}
+		if (timers.pollTimer !== undefined) {
+			clearInterval(timers.pollTimer);
+		}
+		try {
+			session.detachTransport();
+		} catch { /* best-effort */ }
+		if (spawnedRelay !== undefined && spawnedRelay.exitCode === null) {
+			log.appendLine('[relay] killing spawned child process');
+			try {
+				spawnedRelay.kill();
+			} catch { /* best-effort */ }
+		}
+		log.appendLine('[demo] disposed.');
+	};
 
 	const handleTransportClosed = async (label: string): Promise<void> => {
-		if (reconnectInFlight) {
+		if (reconnectInFlight || isDisposed) {
 			return;
 		}
 		reconnectInFlight = true;
@@ -294,22 +330,40 @@ export async function runMultiWindowDemo(
 		try {
 			session.detachTransport();
 			const fresh = await reconnectWithBackoff(engine, log);
+			if (isDisposed) {
+				// Disposed while reconnect was in flight; drop the
+				// newly-connected transport on the floor (its caller's
+				// `attachTransport` would otherwise re-arm a session
+				// we've already torn down).
+				return;
+			}
 			session.attachTransport(fresh);
 			log.appendLine(`[${label}] reconnect succeeded; demo resumes.`);
 		} catch (err) {
 			const info = parseQuantbookError(err);
-			vscode.window.showErrorMessage(
-				`Quantbook multi-window demo connection lost: ${info.message}. ` +
-				`Restart the command.`,
-			);
 			log.appendLine(`[${label}] reconnect EXHAUSTED: ${info.message}`);
+			// Phase 5.7 V3.1.c (2026-05-22) -- Lane C R2 closure:
+			// stop the demo cleanly on exhaustion BEFORE prompting the
+			// user. Otherwise the timers keep ticking, re-triggering
+			// handleTransportClosed, and the user sees stacked prompts.
+			dispose();
+			const choice = await vscode.window.showWarningMessage(
+				`Quantbook multi-window demo connection lost: ${info.message}.`,
+				'Restart Demo',
+			);
+			if (choice === 'Restart Demo') {
+				// Re-invoke the same command. The fresh invocation will
+				// see the relay process is dead (this window owned it)
+				// and re-spawn via connectOrSpawn's spawn fallback.
+				void vscode.commands.executeCommand('quantlab.quantbookDemoMultiWindow');
+			}
 		} finally {
 			reconnectInFlight = false;
 		}
 	};
 
-	const appendTimer = setInterval(() => {
-		if (reconnectInFlight) {
+	timers.appendTimer = setInterval(() => {
+		if (reconnectInFlight || isDisposed) {
 			return;
 		}
 		try {
@@ -325,8 +379,8 @@ export async function runMultiWindowDemo(
 		}
 	}, APPEND_INTERVAL_MS);
 
-	const pollTimer = setInterval(() => {
-		if (reconnectInFlight) {
+	timers.pollTimer = setInterval(() => {
+		if (reconnectInFlight || isDisposed) {
 			return;
 		}
 		try {
@@ -348,21 +402,6 @@ export async function runMultiWindowDemo(
 			log.appendLine(`[relay] child process exited (code=${code}, signal=${signal})`);
 		});
 	}
-
-	const dispose = (): void => {
-		clearInterval(appendTimer);
-		clearInterval(pollTimer);
-		try {
-			session.detachTransport();
-		} catch { /* best-effort */ }
-		if (spawnedRelay !== undefined && spawnedRelay.exitCode === null) {
-			log.appendLine('[relay] killing spawned child process');
-			try {
-				spawnedRelay.kill();
-			} catch { /* best-effort */ }
-		}
-		log.appendLine('[demo] disposed.');
-	};
 
 	return new vscode.Disposable(dispose);
 }
