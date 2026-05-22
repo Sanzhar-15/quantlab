@@ -114,9 +114,9 @@ pub fn version() -> String {
 }
 
 /// **Phase 5.7 V1 megaudit closure (Codex HIGH, 2026-05-22):**
-/// Validate a JS Number argument that represents a u32-domain index
-/// (row, col). Rejects non-finite, negative, fractional, and out-of-u32
-/// values with a distinct error message naming the parameter.
+/// Validate a JS Number argument that represents a u32-domain value.
+/// Rejects non-finite, negative, fractional, and out-of-u32 values
+/// with a distinct error message naming the calling method + parameter.
 ///
 /// Why this exists: napi-rs's `napi_get_value_uint32` (used for `u32`
 /// params) applies ECMAScript `ToUint32`, silently coercing `-1` to
@@ -124,25 +124,30 @@ pub fn version() -> String {
 /// By taking the param as `f64` (raw `napi_get_value_double`) and
 /// validating here, we surface bad inputs as explicit JS Errors
 /// instead of corrupting workbook state.
-fn validate_u32_index(name: &str, value: f64) -> Result<u32> {
+///
+/// **V2.2 audit closure (Codex LOW-1, 2026-05-22)**: added `method`
+/// context parameter so the error message names the actual calling
+/// method. Prior version hard-coded `"appendPutValue"` which produced
+/// confusing diagnostics when called from `pollRemoteWithLimit`.
+fn validate_u32_index(method: &str, name: &str, value: f64) -> Result<u32> {
     if !value.is_finite() {
         return Err(Error::from_reason(format!(
-            "appendPutValue: {name} must be a finite non-negative integer, got {value}"
+            "{method}: {name} must be a finite non-negative integer, got {value}"
         )));
     }
     if value < 0.0 {
         return Err(Error::from_reason(format!(
-            "appendPutValue: {name} must be a non-negative integer, got {value}"
+            "{method}: {name} must be a non-negative integer, got {value}"
         )));
     }
     if value.fract() != 0.0 {
         return Err(Error::from_reason(format!(
-            "appendPutValue: {name} must be an integer, got {value}"
+            "{method}: {name} must be an integer, got {value}"
         )));
     }
     if value > u32::MAX as f64 {
         return Err(Error::from_reason(format!(
-            "appendPutValue: {name} must be in [0, 4294967295] (u32::MAX), got {value}"
+            "{method}: {name} must be in [0, 4294967295] (u32::MAX), got {value}"
         )));
     }
     Ok(value as u32)
@@ -284,8 +289,8 @@ impl CollabSession {
     #[napi(js_name = "appendPutValue")]
     pub fn append_put_value(&mut self, sheet: u16, row: f64, col: f64, value: f64) -> Result<()> {
         // Validate row + col: finite, non-negative, integer, in u32 range.
-        let row_u32 = validate_u32_index("row", row)?;
-        let col_u32 = validate_u32_index("col", col)?;
+        let row_u32 = validate_u32_index("appendPutValue", "row", row)?;
+        let col_u32 = validate_u32_index("appendPutValue", "col", col)?;
         // Validate value: finite (NaN/Infinity rejected).
         if !value.is_finite() {
             return Err(Error::from_reason(format!(
@@ -534,10 +539,19 @@ impl CollabSession {
     /// `flushToTransport` (full-snapshot) which is O(full state). Delta
     /// flushes are O(per-op delta).
     ///
-    /// **Idempotency short-circuit**: if no state changed since the
-    /// last flush (or since attach, if first flush), this returns
-    /// `Ok(false)` without invoking `transport.send`. Closes the V2 V2
-    /// audit echo-loop concern.
+    /// **Idempotency short-circuit**: if `last_flushed_vv == Some(current)`
+    /// — i.e., a previous flush already advanced the baseline to the
+    /// current state — returns `Ok(false)` without invoking
+    /// `transport.send`. Closes the V2 V2 audit echo-loop concern.
+    ///
+    /// **First flush after attach ALWAYS sends** even on an empty op
+    /// log: attach resets `last_flushed_vv = None`, so the idempotency
+    /// guard (which checks `Some(last_vv) == current_vv`) is bypassed.
+    /// The first call encodes from the empty VV — for an empty op log
+    /// this is a small baseline blob; for a non-empty log it's the
+    /// full state. V2.2 mocha test
+    /// `flushDeltaToTransport second call with no state change
+    /// short-circuits to false` pins this exact contract.
     ///
     /// **Per Phase 5.5 V2 V3 step 1 contract**: attach_transport resets
     /// the per-session-per-transport `last_flushed_vv` to None. The
@@ -579,7 +593,7 @@ impl CollabSession {
     /// - Transport's `try_recv` returns `Err` → JS Error.
     #[napi(js_name = "pollRemoteWithLimit")]
     pub fn poll_remote_with_limit(&mut self, limit: f64) -> Result<u32> {
-        let limit_u32 = validate_u32_index("limit", limit)?;
+        let limit_u32 = validate_u32_index("pollRemoteWithLimit", "limit", limit)?;
         let blobs_drained = self
             .inner
             .poll_remote_with_limit(limit_u32 as usize)
@@ -630,17 +644,53 @@ impl CollabSession {
     /// is `#[non_exhaustive]` so future variants won't break this
     /// binding — they'll just be unparseable by this method until V2.3+
     /// adds string mappings.
+    ///
+    /// **Accepted alias forms (engine-side leniency)**: the engine
+    /// parser also accepts `"Disabled"`, `"OnAppend"`, `"on-append"`
+    /// as aliases for the canonical camelCase. The return value is
+    /// always canonical camelCase. JS callers SHOULD pass the
+    /// canonical forms (`"disabled"` / `"onAppend"`) only; the IDE-side
+    /// `isAutoFlushPolicy` type guard enforces this on the TS side
+    /// (rejects aliases). The lenient parser exists for engine-
+    /// internal callers and config-file backward-compat — not as a
+    /// public IDE contract. V2.2 audit closure (Opus HIGH-2): the
+    /// alias-acceptance is NOT pinned by the IDE mocha tests; engine-
+    /// side tests cover the parser.
+    ///
+    /// **Partial-state error contract (Codex MEDIUM-3 closure)**:
+    /// under `onAppend`, a mutator call sequence is "1. commit local
+    /// op → 2. flush to transport". If step 2 throws
+    /// `Error("transport closed")`, the local op is ALREADY committed
+    /// (step 1 succeeded). IDE retry logic must:
+    /// - NOT retry the original mutation (would duplicate the op).
+    /// - Reconnect the transport + call `flushDeltaToTransport`
+    ///   explicitly to flush the pending op.
+    /// V2.3+ will add structured `Error.code` discrimination so this
+    /// retry-shape is machine-readable; until then, the IDE must
+    /// substring-match `"transport"` in the error message.
     #[napi(js_name = "setAutoFlushPolicy")]
     pub fn set_auto_flush_policy(&mut self, policy: String) -> Result<String> {
         let policy_enum = parse_auto_flush_policy(&policy)?;
         let prior = self.inner.set_auto_flush_policy(policy_enum);
-        Ok(auto_flush_policy_to_string(prior))
+        // V2.2 audit closure (Opus HIGH-1): auto_flush_policy_to_string
+        // now returns Result and throws on unknown variants. Propagate
+        // the Result.
+        auto_flush_policy_to_string(prior)
     }
 
     /// Read the current auto-flush policy. Returns one of
     /// `"disabled"` or `"onAppend"` (see `setAutoFlushPolicy`).
+    ///
+    /// **V2.2 audit closure (Opus HIGH-1, 2026-05-22)**: throws JS Error
+    /// instead of returning a `'unknown'` sentinel when the engine
+    /// reports a variant unknown to this binding (forward-compat skew
+    /// between engine and binding crate versions). Per CLAUDE.md
+    /// no-fallback rule: silent fall-through to `'unknown'` would
+    /// cause JS code `policy === 'onAppend'` to silently take the
+    /// `disabled` branch — corrupting reconnect logic. Throwing
+    /// surfaces the skew loudly and forces a binding upgrade.
     #[napi(js_name = "autoFlushPolicy")]
-    pub fn auto_flush_policy(&self) -> String {
+    pub fn auto_flush_policy(&self) -> Result<String> {
         auto_flush_policy_to_string(self.inner.auto_flush_policy())
     }
 }
@@ -659,20 +709,35 @@ fn parse_auto_flush_policy(s: &str) -> Result<CoreAutoFlushPolicy> {
 }
 
 /// Phase 5.7 V2.2 (2026-05-22) — render [`CoreAutoFlushPolicy`] as a JS
-/// string. Uses canonical camelCase form ("disabled", "onAppend"). The
-/// engine's `AutoFlushPolicy` is `#[non_exhaustive]` — V2.2 handles the
-/// two existing variants explicitly + a catch-all that returns an
-/// "unknown" sentinel so JS callers can detect a forward-compat skew.
-fn auto_flush_policy_to_string(p: CoreAutoFlushPolicy) -> String {
+/// string. Uses canonical camelCase form ("disabled", "onAppend").
+///
+/// **V2.2 audit closure (Opus HIGH-1, 2026-05-22)**: returns `Result`
+/// and throws a JS Error when the engine reports a variant unknown to
+/// this binding (forward-compat skew). The prior version returned a
+/// `'unknown'` sentinel string — a silent fall-through that violated
+/// CLAUDE.md's no-fallback rule. JS code doing `policy === 'onAppend'`
+/// would silently miss the new variant and fall through to the
+/// `disabled` branch, corrupting reconnect / sync logic. Throwing is
+/// the correct fail-loudly path: an engine that ships a new variant
+/// ahead of the binding being upgraded surfaces the skew on first
+/// `autoFlushPolicy()` call.
+///
+/// The engine's `AutoFlushPolicy` is `#[non_exhaustive]` so V2.3+ must
+/// add new variants here when the engine ships them. The compile-time
+/// match-exhaustiveness check helps but doesn't catch new variants
+/// (because `#[non_exhaustive]` forces the catch-all arm).
+fn auto_flush_policy_to_string(p: CoreAutoFlushPolicy) -> Result<String> {
     match p {
-        CoreAutoFlushPolicy::Disabled => "disabled".to_string(),
-        CoreAutoFlushPolicy::OnAppend => "onAppend".to_string(),
-        // `#[non_exhaustive]` requires a catch-all. Return a sentinel
-        // that callers can detect — better than panicking at the FFI
-        // boundary (V1 megaudit Codex H1 closure: no engine panics
-        // through the FFI). V2.3+ should add variant-specific strings
-        // here as new policies ship.
-        _ => "unknown".to_string(),
+        CoreAutoFlushPolicy::Disabled => Ok("disabled".to_string()),
+        CoreAutoFlushPolicy::OnAppend => Ok("onAppend".to_string()),
+        // Throw on unknown variant rather than silently returning a
+        // sentinel. See V2.2 audit closure note above for rationale.
+        other => Err(Error::from_reason(format!(
+            "autoFlushPolicy: engine reported unknown variant {other:?} — \
+             this binding crate ({}) is older than the engine; upgrade \
+             ql-bindings-node to add the new variant's JS string mapping",
+            env!("CARGO_PKG_VERSION"),
+        ))),
     }
 }
 
