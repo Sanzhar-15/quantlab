@@ -178,6 +178,11 @@
         "category": "%command.category%"
       },
       {
+        "command": "quantlab.quantbookDemoMultiWindow",
+        "title": "%command.quantbookDemoMultiWindow.title%",
+        "category": "%command.category%"
+      },
+      {
         "command": "quantlab.openRiskSettings",
         "title": "%command.openRiskSettings.title%",
         "category": "%command.category%"

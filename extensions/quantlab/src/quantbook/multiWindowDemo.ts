@@ -1,0 +1,368 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/**
+ * Phase 5.7 V3.1.b (2026-05-22) -- multi-window IDE demo.
+ *
+ * Two (or more) VS Code windows each run `quantlab.quantbookDemoMultiWindow`.
+ * The FIRST window's invocation spawns the V3.1.a relay binary as a child
+ * process; SUBSEQUENT windows detect the already-running relay and skip
+ * the spawn step. Each window opens its own `CollabSession` + attaches a
+ * `WebSocketTransport` to ws://localhost:<port>; auto-flush + periodic
+ * pollRemote drives cross-window propagation.
+ *
+ * Co-ordination model (chosen at V3.1.b design -- see V3 entry plan
+ * `.plans/_active.md` section R6/R7/R8):
+ * - **No env-var or shared-file role hand-off.** Each window's invocation
+ *   is symmetric: try-connect-first, spawn-relay-only-if-needed. The
+ *   first window to run the command happens to spawn the relay; the
+ *   second window finds it already listening.
+ * - **PeerId = `BigInt(process.pid)`** (Lane C R7). Each VS Code window
+ *   has its own renderer process PID; collision is vanishingly rare.
+ *   (Reserved PeerId 0 is rejected by the engine, but PIDs are positive.)
+ * - **Relay readiness probe** (Lane C R6): after spawn, the parent waits
+ *   for the binary's `[ql-collab-ws relay] listening on ws://...` stdout
+ *   line before attempting to connect. Without this, racy connect-then-
+ *   spawn-then-retry would leave the IDE in an inconsistent state.
+ * - **Reconnect UX** (Lane C R2): catch `'transport_closed'` from
+ *   `parseQuantbookError`; attempt up to 3 reconnects with 500ms /
+ *   1000ms / 2000ms backoff before giving up.
+ *
+ * NOT in V3.1.b scope (deferred to V3.x):
+ * - TLS, auth (localhost-only demo).
+ * - Smarter reconnect policy (e.g., jitter, indefinite retry).
+ * - Programmatic "spawn second window" -- the user opens a second window
+ *   manually via `File > New Window` and runs the command again. A
+ *   sub-command `quantlab.quantbookDemoMultiWindowOpenWindow` could
+ *   automate this later.
+ */
+
+import * as childProcess from 'child_process';
+import * as vscode from 'vscode';
+
+import { resolveRelayBinaryPath } from './loader';
+import { appendPutValueValidated, parseQuantbookError } from './session';
+import type { CollabSessionInstance, QuantbookNativeModule } from './types';
+
+/**
+ * Localhost port the relay binary binds. Matches the binary's
+ * `DEFAULT_PORT` constant (see `crates/ql-collab-ws/examples/relay-server.rs`).
+ * Pinned here so the IDE's connect URL is stable across builds.
+ */
+const RELAY_PORT = 7117;
+
+/** Connect URL the demo session uses. */
+const RELAY_URL = `ws://127.0.0.1:${RELAY_PORT}`;
+
+/** Periodic append cadence -- one PutValue every 2s. */
+const APPEND_INTERVAL_MS = 2000;
+
+/** Periodic poll cadence -- pollRemote every 1s. */
+const POLL_INTERVAL_MS = 1000;
+
+/** Max retries on transient transport_closed; backoff doubles each try. */
+const MAX_RECONNECT_TRIES = 3;
+const INITIAL_RECONNECT_BACKOFF_MS = 500;
+
+/**
+ * Spawn the `relay-server` binary as a child process and await its
+ * "listening on" stdout marker before resolving. The relay's stable
+ * marker line (committed in V3.1.a engine commit `9df01c5a050`) is
+ * `[ql-collab-ws relay] listening on ws://127.0.0.1:<port>`.
+ *
+ * Lane C R6 closure: this readiness probe replaces the naive
+ * connect-then-retry pattern with deterministic synchronization.
+ *
+ * Lifetime: the returned ChildProcess is owned by the caller. On
+ * dispose, caller MUST call `.kill()` to terminate the relay; if the
+ * IDE process exits without disposing, the OS reaps the child via
+ * the spawned-with-detached:false default.
+ */
+async function spawnRelayBinary(
+	log: vscode.OutputChannel,
+	binaryPath: string,
+): Promise<childProcess.ChildProcess> {
+	log.appendLine(`[relay] spawning ${binaryPath} ...`);
+	const child = childProcess.spawn(binaryPath, [], {
+		env: { ...process.env, QL_RELAY_PORT: String(RELAY_PORT) },
+		stdio: ['ignore', 'pipe', 'pipe'],
+	});
+
+	const readyMarker = '[ql-collab-ws relay] listening on';
+	let resolved = false;
+
+	return new Promise((resolve, reject) => {
+		const onSpawnError = (err: Error): void => {
+			if (resolved) {
+				return;
+			}
+			resolved = true;
+			reject(new Error(
+				`[relay] failed to spawn ${binaryPath}: ${err.message}. ` +
+				`Build the relay with: cd .../quantbook-engine && ` +
+				`cargo build -p ql-collab-ws --example relay-server --release. ` +
+				`Or set QUANTBOOK_RELAY_BINARY_PATH=<absolute path> to override.`,
+			));
+		};
+
+		const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+			if (resolved) {
+				return;
+			}
+			resolved = true;
+			reject(new Error(
+				`[relay] binary exited before readiness (code=${code}, signal=${signal}). ` +
+				`Inspect the Output Channel for stderr.`,
+			));
+		};
+
+		child.once('error', onSpawnError);
+		child.once('exit', onExit);
+
+		// Wait for the binary's "listening on" line on stdout.
+		const stdout = child.stdout;
+		if (stdout === null) {
+			resolved = true;
+			reject(new Error('[relay] spawned child has no stdout pipe'));
+			return;
+		}
+		let buffer = '';
+		stdout.setEncoding('utf8');
+		stdout.on('data', (chunk: string) => {
+			buffer += chunk;
+			const lines = buffer.split('\n');
+			buffer = lines.pop() ?? '';
+			for (const line of lines) {
+				log.appendLine(`[relay] ${line}`);
+				if (!resolved && line.startsWith(readyMarker)) {
+					resolved = true;
+					child.off('error', onSpawnError);
+					child.off('exit', onExit);
+					resolve(child);
+					return;
+				}
+			}
+		});
+
+		const stderr = child.stderr;
+		if (stderr !== null) {
+			stderr.setEncoding('utf8');
+			stderr.on('data', (chunk: string) => {
+				const trimmed = chunk.replace(/\n$/, '');
+				if (trimmed.length > 0) {
+					log.appendLine(`[relay stderr] ${trimmed}`);
+				}
+			});
+		}
+
+		// Defensive timeout in case the binary is hung. Generous to
+		// tolerate cold-start cdylib resolution; the V3.1.a binary
+		// itself takes <100ms to bind.
+		setTimeout(() => {
+			if (!resolved) {
+				resolved = true;
+				try {
+					child.kill();
+				} catch { /* best-effort */ }
+				reject(new Error(
+					`[relay] did not emit readiness marker within 5s. ` +
+					`Expected stdout line: "${readyMarker} ws://127.0.0.1:${RELAY_PORT}".`,
+				));
+			}
+		}, 5000);
+	});
+}
+
+/**
+ * Try to connect a WebSocket transport to the relay; if connect fails,
+ * spawn the relay binary and retry.
+ *
+ * Returns the connected Transport AND (if the relay was spawned by this
+ * call) the spawned ChildProcess so the caller can hold its lifetime.
+ */
+async function connectOrSpawn(
+	engine: QuantbookNativeModule,
+	log: vscode.OutputChannel,
+): Promise<{
+	transport: Awaited<ReturnType<typeof engine.Transport.websocketConnect>>;
+	spawnedRelay: childProcess.ChildProcess | undefined;
+}> {
+	// First try: maybe another window is already running the relay.
+	try {
+		const transport = await engine.Transport.websocketConnect(RELAY_URL);
+		log.appendLine(`[connect] joined existing relay at ${RELAY_URL}`);
+		return { transport, spawnedRelay: undefined };
+	} catch (firstErr) {
+		const info = parseQuantbookError(firstErr);
+		log.appendLine(
+			`[connect] initial connect to ${RELAY_URL} failed ` +
+			`(code=${info.code}); spawning relay binary...`,
+		);
+	}
+
+	// Second try: spawn the relay, then connect.
+	const binaryPath = resolveRelayBinaryPath();
+	const spawnedRelay = await spawnRelayBinary(log, binaryPath);
+	const transport = await engine.Transport.websocketConnect(RELAY_URL);
+	log.appendLine(`[connect] spawned relay AND joined at ${RELAY_URL}`);
+	return { transport, spawnedRelay };
+}
+
+/**
+ * Best-effort reconnect path for transient transport_closed (Lane C R2).
+ * Returns a fresh Transport, or throws if all retries are exhausted.
+ *
+ * NOTE: this does NOT respawn the relay binary -- if the relay process
+ * itself died, the caller's spawn ownership remains intact (it'll see
+ * the ChildProcess `exit` event separately) but reconnect attempts to
+ * the same port will fail with `websocket_connect_failed`, which the
+ * caller surfaces as a "Connection lost" notification.
+ */
+async function reconnectWithBackoff(
+	engine: QuantbookNativeModule,
+	log: vscode.OutputChannel,
+): Promise<Awaited<ReturnType<typeof engine.Transport.websocketConnect>>> {
+	let backoff = INITIAL_RECONNECT_BACKOFF_MS;
+	for (let attempt = 1; attempt <= MAX_RECONNECT_TRIES; attempt += 1) {
+		log.appendLine(`[reconnect] attempt ${attempt}/${MAX_RECONNECT_TRIES} after ${backoff}ms`);
+		await new Promise(r => setTimeout(r, backoff));
+		try {
+			const t = await engine.Transport.websocketConnect(RELAY_URL);
+			log.appendLine(`[reconnect] attempt ${attempt} succeeded`);
+			return t;
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			log.appendLine(`[reconnect] attempt ${attempt} failed: code=${info.code}, msg=${info.message}`);
+		}
+		backoff *= 2;
+	}
+	throw new Error(
+		`[reconnect] gave up after ${MAX_RECONNECT_TRIES} tries against ${RELAY_URL}. ` +
+		`Restart the demo command or rebuild the relay binary.`,
+	);
+}
+
+/**
+ * Drive the multi-window demo for a single VS Code window. Returns a
+ * Disposable; calling its `.dispose()` stops the timers + detaches the
+ * transport + (if this window spawned the relay) kills the child
+ * process. The caller (command registration) pushes the disposable to
+ * the extension context's subscriptions so window-close cleans up.
+ */
+export async function runMultiWindowDemo(
+	engine: QuantbookNativeModule,
+	log: vscode.OutputChannel,
+): Promise<vscode.Disposable> {
+	const pid = process.pid;
+	const peerId = BigInt(pid);
+	log.appendLine('');
+	log.appendLine('=== Quantbook Multi-Window Demo ===');
+	log.appendLine(`window PID=${pid}, peerId=${peerId}`);
+	log.appendLine(`relay URL: ${RELAY_URL}`);
+	log.appendLine('');
+
+	const { transport, spawnedRelay } = await connectOrSpawn(engine, log);
+
+	const session: CollabSessionInstance = new engine.CollabSession(peerId);
+	session.attachTransport(transport);
+	session.setAutoFlushPolicy('onAppend');
+	log.appendLine(`[session] created peerId=${peerId}; transport attached; auto-flush=onAppend`);
+
+	// Distinguish multi-window edits by row -- use PID's low 16 bits
+	// so two windows pick different rows reliably (PIDs differ by 1+
+	// on the same OS, so low-16-bit collisions are vanishingly rare).
+	const sheet = 0;
+	const col = 0;
+	const row = pid & 0xffff;
+	log.appendLine(`[session] writing to sheet=${sheet}, row=${row} (= PID & 0xffff), col=${col}`);
+	log.appendLine('');
+	log.appendLine('To see two-window collaboration: open another VS Code window');
+	log.appendLine('(File > New Window) and run "Quantbook: Demo (Multi-Window)" again.');
+	log.appendLine('Both windows will share state via the relay.');
+	log.appendLine('');
+
+	let reconnectInFlight = false;
+
+	const handleTransportClosed = async (label: string): Promise<void> => {
+		if (reconnectInFlight) {
+			return;
+		}
+		reconnectInFlight = true;
+		log.appendLine(`[${label}] transport_closed -- attempting reconnect...`);
+		try {
+			session.detachTransport();
+			const fresh = await reconnectWithBackoff(engine, log);
+			session.attachTransport(fresh);
+			log.appendLine(`[${label}] reconnect succeeded; demo resumes.`);
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			vscode.window.showErrorMessage(
+				`Quantbook multi-window demo connection lost: ${info.message}. ` +
+				`Restart the command.`,
+			);
+			log.appendLine(`[${label}] reconnect EXHAUSTED: ${info.message}`);
+		} finally {
+			reconnectInFlight = false;
+		}
+	};
+
+	const appendTimer = setInterval(() => {
+		if (reconnectInFlight) {
+			return;
+		}
+		try {
+			const value = Date.now() / 1000;
+			appendPutValueValidated(session, sheet, row, col, value);
+			log.appendLine(`[append] PutValue(s=${sheet}, r=${row}, c=${col}, v=${value.toFixed(3)}) -> opCount=${session.opCount()}`);
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			log.appendLine(`[append] ERROR code=${info.code} msg=${info.message}`);
+			if (info.code === 'transport_closed' || info.code === 'transport_io') {
+				void handleTransportClosed('append');
+			}
+		}
+	}, APPEND_INTERVAL_MS);
+
+	const pollTimer = setInterval(() => {
+		if (reconnectInFlight) {
+			return;
+		}
+		try {
+			const merged = session.pollRemote();
+			if (merged > 0) {
+				log.appendLine(`[poll] pollRemote() merged ${merged} blob(s) -> opCount=${session.opCount()}`);
+			}
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			log.appendLine(`[poll] ERROR code=${info.code} msg=${info.message}`);
+			if (info.code === 'transport_closed' || info.code === 'transport_io') {
+				void handleTransportClosed('poll');
+			}
+		}
+	}, POLL_INTERVAL_MS);
+
+	if (spawnedRelay !== undefined) {
+		spawnedRelay.on('exit', (code, signal) => {
+			log.appendLine(`[relay] child process exited (code=${code}, signal=${signal})`);
+		});
+	}
+
+	const dispose = (): void => {
+		clearInterval(appendTimer);
+		clearInterval(pollTimer);
+		try {
+			session.detachTransport();
+		} catch { /* best-effort */ }
+		if (spawnedRelay !== undefined && spawnedRelay.exitCode === null) {
+			log.appendLine('[relay] killing spawned child process');
+			try {
+				spawnedRelay.kill();
+			} catch { /* best-effort */ }
+		}
+		log.appendLine('[demo] disposed.');
+	};
+
+	return new vscode.Disposable(dispose);
+}

@@ -23,7 +23,8 @@
 import * as vscode from 'vscode';
 
 import { appendPutValueValidated, createSession, quantbookEngineVersion, sessionFromSnapshot } from '../quantbook/session';
-import { quantbookHostInfo } from '../quantbook/loader';
+import { loadQuantbookEngine, quantbookHostInfo } from '../quantbook/loader';
+import { runMultiWindowDemo } from '../quantbook/multiWindowDemo';
 import type { CollabSessionInstance } from '../quantbook/types';
 
 let outputChannel: vscode.OutputChannel | undefined;
@@ -146,6 +147,26 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				return;
 			}
 			await runDemoLoop({ peerA, peerB: undefined }, log);
+		}),
+	);
+
+	// Phase 5.7 V3.1.b (2026-05-22) -- multi-window demo command.
+	// Each VS Code window's invocation joins (or spawns) the localhost
+	// relay binary and runs a periodic append + pollRemote loop. See
+	// src/quantbook/multiWindowDemo.ts for the orchestration.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookDemoMultiWindow', async () => {
+			const log = getOutput();
+			log.show(true);
+			try {
+				const engine = loadQuantbookEngine();
+				const disposable = await runMultiWindowDemo(engine, log);
+				context.subscriptions.push(disposable);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL multi-window demo error: ${detail}`);
+				vscode.window.showErrorMessage(`Quantbook multi-window demo failed: ${detail}`);
+			}
 		}),
 	);
 }

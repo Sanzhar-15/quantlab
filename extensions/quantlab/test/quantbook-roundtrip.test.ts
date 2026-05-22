@@ -40,6 +40,7 @@ import * as fs from 'fs';
 import {
 	loadQuantbookEngine,
 	resolveEnginePath,
+	resolveRelayBinaryPath,
 	_resetQuantbookEngineCacheForTests,
 } from '../src/quantbook/loader';
 import {
@@ -1817,5 +1818,123 @@ suite('quantbook V2.7 -- structured error-code end-to-end (engine → napi → p
 		const info = parseQuantbookError(current);
 		assert.strictEqual(info.code, 'unknown',
 			'chain deeper than QUANTBOOK_ERROR_CAUSE_MAX_DEPTH must return unknown');
+	});
+});
+
+// ============================================================================
+// Phase 5.7 V3.1 multi-window demo round-trip
+// ============================================================================
+
+import * as cp from 'child_process';
+
+suite('quantbook V3.1 multi-window relay round-trip', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) {
+			this.skip();
+		}
+		try {
+			const p = resolveRelayBinaryPath();
+			if (!fs.existsSync(p)) {
+				const reason = `relay binary not built at ${p} -- build with: ` +
+					`cargo build -p ql-collab-ws --example relay-server --release`;
+				console.warn(`[v3.1 test skip] ${reason}`);
+				this.skip();
+			}
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			console.warn(`[v3.1 test skip] resolveRelayBinaryPath failed: ${msg}`);
+			this.skip();
+		}
+	});
+
+	test('V3.1 round-trip: two sessions exchange ops through spawned relay binary', async function () {
+		this.timeout(15000);
+		// Use a non-default port so we don't collide with an actually-running
+		// relay (e.g., a real demo in the same workspace). 17117 is unlikely
+		// to clash; if even this fails, the test should report the bind error.
+		const TEST_PORT = 17117;
+		const binaryPath = resolveRelayBinaryPath();
+		const child = cp.spawn(binaryPath, [], {
+			env: { ...process.env, QL_RELAY_PORT: String(TEST_PORT) },
+			stdio: ['ignore', 'pipe', 'pipe'],
+		});
+
+		// Wait for the relay's readiness marker on stdout.
+		const ready = await new Promise<boolean>((resolve, reject) => {
+			let buf = '';
+			const onData = (chunk: Buffer): void => {
+				buf += chunk.toString('utf8');
+				if (buf.includes('[ql-collab-ws relay] listening on')) {
+					resolve(true);
+				}
+			};
+			child.stdout?.on('data', onData);
+			child.stderr?.on('data', (c: Buffer) => {
+				// log stderr only if test fails (mocha captures console)
+				process.stderr.write(`[relay stderr] ${c.toString('utf8')}`);
+			});
+			child.once('exit', (code, sig) => {
+				reject(new Error(`relay exited before ready (code=${code}, sig=${sig})`));
+			});
+			setTimeout(() => reject(new Error('relay readiness timeout after 5s')), 5000);
+		});
+		assert.ok(ready);
+
+		try {
+			const engine = loadQuantbookEngine();
+			const url = `ws://127.0.0.1:${TEST_PORT}`;
+			const transportA = await engine.Transport.websocketConnect(url);
+			const transportB = await engine.Transport.websocketConnect(url);
+			const sessA = new engine.CollabSession(101n);
+			const sessB = new engine.CollabSession(102n);
+			sessA.attachTransport(transportA);
+			sessB.attachTransport(transportB);
+
+			// Append on A, flush delta, give the relay a beat to propagate,
+			// then poll on B.
+			appendPutValueValidated(sessA, 0, 0, 0, 42.5);
+			sessA.flushDeltaToTransport();
+
+			// Poll loop on B with a 3-second budget. The first poll may
+			// return 0 if the relay hasn't broadcast yet; retry until B
+			// observes the op or the budget expires.
+			let merged = 0;
+			const deadline = Date.now() + 3000;
+			while (Date.now() < deadline) {
+				merged = sessB.pollRemote();
+				if (merged > 0) {
+					break;
+				}
+				await new Promise(r => setTimeout(r, 100));
+			}
+			assert.ok(
+				merged > 0,
+				`B should have received at least one blob from A via the relay (got merged=${merged} after 3s)`,
+			);
+			assert.strictEqual(sessB.opCount(), 1, 'B should have exactly the one op A appended');
+
+			// Reverse direction: append on B, observe on A.
+			appendPutValueValidated(sessB, 0, 1, 0, 99.9);
+			sessB.flushDeltaToTransport();
+			merged = 0;
+			const deadline2 = Date.now() + 3000;
+			while (Date.now() < deadline2) {
+				merged = sessA.pollRemote();
+				if (merged > 0) {
+					break;
+				}
+				await new Promise(r => setTimeout(r, 100));
+			}
+			assert.ok(
+				merged > 0,
+				`A should have received B's op via the relay (got merged=${merged} after 3s)`,
+			);
+			assert.strictEqual(sessA.opCount(), 2, 'A now has 2 ops (its own + B\'s)');
+		} finally {
+			if (child.exitCode === null) {
+				child.kill();
+			}
+		}
 	});
 });

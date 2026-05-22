@@ -156,6 +156,49 @@ function nativeLibExt(): string {
 }
 
 /**
+ * Resolve the path to the `relay-server` example binary shipped by
+ * `ql-collab-ws` (V3.1.a). Mirrors {@link resolveEnginePath}'s
+ * extension-anchor walk-up pattern.
+ *
+ * **Phase 5.7 V3.1.b (2026-05-22)**: the multi-window IDE demo spawns
+ * this binary as a child process so two VS Code windows can each
+ * connect via `WebSocketTransport` to a shared localhost ws relay.
+ *
+ * Failure modes:
+ * - `QUANTBOOK_RELAY_BINARY_PATH` set but file doesn't exist -> throws
+ *   directing the user to fix the env var.
+ * - Anchor walk-up fails (non-canonical workspace) -> throws directing
+ *   the user to set `QUANTBOOK_RELAY_BINARY_PATH` as the escape hatch.
+ * - Resolved path does not exist (binary not built) -> the caller's
+ *   `child_process.spawn` will surface ENOENT.
+ */
+export function resolveRelayBinaryPath(): string {
+	const env = process.env.QUANTBOOK_RELAY_BINARY_PATH;
+	if (typeof env === 'string' && env.length > 0) {
+		return path.resolve(env);
+	}
+	const extensionDir = findExtensionDir(__dirname);
+	if (extensionDir === undefined) {
+		throw new Error(
+			'[quantbook loader] Could not locate the extensions/quantlab ' +
+			`anchor by walking up from ${__dirname} to resolve the relay ` +
+			'binary. Set QUANTBOOK_RELAY_BINARY_PATH=<absolute path to ' +
+			'.../target/release/examples/relay-server> to bypass discovery.',
+		);
+	}
+	const binaryName = process.platform === 'win32' ? 'relay-server.exe' : 'relay-server';
+	// extensionDir is .../{IDE-root}/extensions/quantlab; .. thrice
+	// = parent workspace dir; then quantlab-quantbook/quantbook-engine/
+	// target/release/examples/<binary>.
+	return path.resolve(
+		extensionDir,
+		'..', '..', '..',
+		'quantlab-quantbook', 'quantbook-engine', 'target', 'release', 'examples',
+		binaryName,
+	);
+}
+
+/**
  * Load and return the engine native module. Cached after first load.
  *
  * **Failure modes (all surface LOUDLY)**:
