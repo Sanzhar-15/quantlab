@@ -255,16 +255,28 @@ export interface CollabSessionInstance {
 	 * - `spawn_blocking` runs the wait on tokio's blocking pool, NOT
 	 *   the worker pool. No runtime starvation.
 	 *
+	 * **Resolution / rejection contract** (V2.8 megaudit Codex Lane A
+	 * MEDIUM-1 closure, 2026-05-22):
+	 *
 	 * Resolves when:
-	 * - writer has completed `send` for every blob queued at this call, OR
-	 * - transport has been detached / dropped / closed.
+	 * - the writer has completed `send` for every blob queued AT THIS
+	 *   CALL (V2.5 Codex M1: target captured at handle extraction);
+	 * - there is no attached transport, OR the attached transport
+	 *   returns `None` from `ack_handle()` (Loopback, Noop -- no
+	 *   async-drain semantics; flush is synchronous-on-attach).
 	 *
-	 * **No-op on no transport, or transports with no async-flush
-	 * semantics (Loopback, Noop)**: returns resolved Promise (NOT a
-	 * rejection).
+	 * Rejects with:
+	 * - `parseQuantbookError(err).code === 'transport_closed'` if the
+	 *   transport's closed flag is set on entry to the wait OR is
+	 *   tripped while waiting. This is the correct reconnect signal.
+	 * - `'transport_io'` for non-closed transport errors surfaced by
+	 *   the underlying handle.
+	 * - `'unknown'` (with `parseQuantbookError` walking the
+	 *   `Error.cause` chain via V2.8 closure) if the `spawn_blocking`
+	 *   task panics -- the wrapper Error has no bracket prefix, but
+	 *   the cause does.
 	 *
-	 * @throws Error if the transport reports an error, or if the
-	 *               `spawn_blocking` task panics.
+	 * @throws Error -- see the rejection contract above.
 	 */
 	flushPendingToTransport(): Promise<void>;
 }
