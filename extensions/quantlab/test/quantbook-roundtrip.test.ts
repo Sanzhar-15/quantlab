@@ -2589,3 +2589,131 @@ suite('quantbook V3.2.c.5 -- two-session loopback round-trip with auto-flush', f
 		assert.strictEqual(snapB.entries.length, 0);
 	});
 });
+
+// ============================================================================
+// Phase 5.7 V3.2.d closures (audit cross-lane convergence)
+// ============================================================================
+
+suite('quantbook V3.2.d HIGH-2 -- IDE-side validators emit [bad_argument] code', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('appendPutValueValidated: non-integer sheet throws [bad_argument]', () => {
+		const session = createSession(701n);
+		try {
+			appendPutValueValidated(session, 1.5, 0, 0, 42);
+			assert.fail('expected throw');
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			assert.strictEqual(info.code, 'bad_argument',
+				`expected bad_argument, got ${info.code}; msg=${info.message}`);
+			assert.match(info.message, /sheet must be an integer/);
+		}
+	});
+
+	test('appendPutValueValidated: negative row throws [bad_argument]', () => {
+		const session = createSession(702n);
+		try {
+			appendPutValueValidated(session, 0, -1, 0, 42);
+			assert.fail('expected throw');
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			assert.strictEqual(info.code, 'bad_argument');
+			assert.match(info.message, /row must be an integer/);
+		}
+	});
+
+	test('appendPutValueValidated: out-of-range col throws [bad_argument]', () => {
+		const session = createSession(703n);
+		try {
+			appendPutValueValidated(session, 0, 0, 4294967296, 42);
+			assert.fail('expected throw');
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			assert.strictEqual(info.code, 'bad_argument');
+			assert.match(info.message, /col must be an integer/);
+		}
+	});
+
+	test('appendPutValueValidated: NaN value throws [bad_argument]', () => {
+		const session = createSession(704n);
+		try {
+			appendPutValueValidated(session, 0, 0, 0, NaN);
+			assert.fail('expected throw');
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			assert.strictEqual(info.code, 'bad_argument');
+			assert.match(info.message, /value must be a finite number/);
+		}
+	});
+});
+
+suite('quantbook V3.2.d HIGH-2 -- dispatcher rawInput type guard', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	function makeDeps(session: CollabSessionInstance, sheet: number) {
+		const errorReplies: ErrorReplyMessage[] = [];
+		let commitCount = 0;
+		const deps = {
+			session,
+			sheet,
+			onCommit: () => { commitCount += 1; },
+			onError: (reply: ErrorReplyMessage) => { errorReplies.push(reply); },
+		};
+		return { deps, errorReplies, getCommitCount: () => commitCount };
+	}
+
+	test('rawInput = null surfaces bad_argument (NOT unknown)', () => {
+		const session = createSession(705n);
+		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
+		dispatchIncomingMessage(
+			{ type: 'putValue', sheet: 0, row: 0, col: 0, rawInput: null },
+			deps,
+		);
+		assert.strictEqual(getCommitCount(), 0);
+		assert.strictEqual(errorReplies.length, 1);
+		assert.strictEqual(errorReplies[0].code, 'bad_argument',
+			`expected bad_argument code, got ${errorReplies[0].code}`);
+		assert.match(errorReplies[0].message, /rawInput must be a string/);
+	});
+
+	test('rawInput = undefined surfaces bad_argument', () => {
+		const session = createSession(706n);
+		const { deps, errorReplies } = makeDeps(session, 0);
+		dispatchIncomingMessage(
+			{ type: 'putValue', sheet: 0, row: 0, col: 0, rawInput: undefined },
+			deps,
+		);
+		assert.strictEqual(errorReplies.length, 1);
+		assert.strictEqual(errorReplies[0].code, 'bad_argument');
+	});
+
+	test('rawInput = 42 (number) surfaces bad_argument', () => {
+		const session = createSession(707n);
+		const { deps, errorReplies } = makeDeps(session, 0);
+		dispatchIncomingMessage(
+			{ type: 'putValue', sheet: 0, row: 0, col: 0, rawInput: 42 },
+			deps,
+		);
+		assert.strictEqual(errorReplies.length, 1);
+		assert.strictEqual(errorReplies[0].code, 'bad_argument');
+	});
+
+	test('rawInput = string but fractional row surfaces bad_argument via IDE validator', () => {
+		const session = createSession(708n);
+		const { deps, errorReplies } = makeDeps(session, 0);
+		dispatchIncomingMessage(
+			{ type: 'putValue', sheet: 0, row: 1.5, col: 0, rawInput: '42' },
+			deps,
+		);
+		assert.strictEqual(errorReplies.length, 1);
+		assert.strictEqual(errorReplies[0].code, 'bad_argument',
+			`expected bad_argument (IDE validator rejection), got ${errorReplies[0].code}`);
+		assert.match(errorReplies[0].message, /row must be an integer/);
+	});
+});

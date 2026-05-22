@@ -73,17 +73,25 @@ export function appendPutValueValidated(
 	col: number,
 	value: number,
 ): void {
+	// V3.2.d HIGH-2 closure (2026-05-22): all IDE-side validator
+	// throws carry the `[bad_argument]` bracketed prefix so
+	// `parseQuantbookError(err).code` resolves to `'bad_argument'` --
+	// matching the engine-side validator contract from V2.7.
+	// Pre-V3.2.d these threw plain `Error` strings without the prefix,
+	// which `parseQuantbookError` bucketed under `'unknown'`,
+	// breaking webview consumers that switch on the code to
+	// differentiate bad-input from generic errors.
 	if (!Number.isInteger(sheet) || sheet < 0 || sheet > 0xFFFF) {
-		throw new Error(`appendPutValue: sheet must be an integer in [0, 65535], got ${sheet}`);
+		throw new Error(`[bad_argument] appendPutValue: sheet must be an integer in [0, 65535], got ${sheet}`);
 	}
 	if (!Number.isInteger(row) || row < 0 || row > 0xFFFFFFFF) {
-		throw new Error(`appendPutValue: row must be an integer in [0, 4294967295], got ${row}`);
+		throw new Error(`[bad_argument] appendPutValue: row must be an integer in [0, 4294967295], got ${row}`);
 	}
 	if (!Number.isInteger(col) || col < 0 || col > 0xFFFFFFFF) {
-		throw new Error(`appendPutValue: col must be an integer in [0, 4294967295], got ${col}`);
+		throw new Error(`[bad_argument] appendPutValue: col must be an integer in [0, 4294967295], got ${col}`);
 	}
 	if (typeof value !== 'number' || !Number.isFinite(value)) {
-		throw new Error(`appendPutValue: value must be a finite number, got ${value}`);
+		throw new Error(`[bad_argument] appendPutValue: value must be a finite number, got ${value}`);
 	}
 	session.appendPutValue(sheet, row, col, value);
 }

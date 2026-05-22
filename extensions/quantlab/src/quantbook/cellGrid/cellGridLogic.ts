@@ -170,6 +170,26 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 		return;
 	}
 	const req = raw as PutValueRequest;
+	// V3.2.d HIGH-2 closure (2026-05-22, dispatcher-side defense in
+	// depth): runtime-check the inner envelope fields BEFORE calling
+	// parseCellRawInput / appendPutValueValidated.  Pre-V3.2.d the
+	// dispatcher trusted the type assertion + a malformed envelope
+	// like `{type:'putValue', rawInput:null}` produced `parseCellRawInput(null)`
+	// -> `null.trim()` -> TypeError -> errorReply with code `'unknown'`
+	// (TypeError has no bracket prefix).  Now: pre-validate field
+	// types + emit a structured `bad_argument` errorReply so webview
+	// consumers can `switch (info.code)` cleanly.
+	if (typeof req.rawInput !== 'string') {
+		deps.onError({
+			type: 'errorReply',
+			sheet: typeof req.sheet === 'number' ? req.sheet : deps.sheet,
+			row: typeof req.row === 'number' ? req.row : 0,
+			col: typeof req.col === 'number' ? req.col : 0,
+			code: 'bad_argument',
+			message: `rawInput must be a string, got ${typeof req.rawInput}`,
+		});
+		return;
+	}
 	if (req.sheet !== deps.sheet) {
 		console.warn(`[cellGrid] putValue sheet mismatch: req.sheet=${req.sheet} deps.sheet=${deps.sheet}`);
 		return;

@@ -39,19 +39,43 @@ import { classifyPollTick, dispatchIncomingMessage } from './cellGridLogic';
 const VIEW_TYPE = 'quantlab.quantbookCellGrid';
 
 /**
- * Module-level registry of live panels keyed by sheet number.  Lets
+ * Module-level registries of live panels keyed by sheet number.  Lets
  * the `quantlab.quantbookCellGridRefresh` command find the active
  * panel(s) without the user having to remember which window spawned
  * them.  Removed on panel dispose.
  *
- * **V3.2.a.1 enhancement (2026-05-22)** -- pre-enhancement the
- * command surface was "Open Cell Grid" only; closing + re-opening
- * was the only way to refresh the snapshot.  The registry + Refresh
- * command lets users re-render in place.  V3.2.c will replace the
- * Refresh-command workaround with auto-refresh on remote-op observed
- * (poll or push).
+ * **V3.2.a.1 enhancement (2026-05-22)** -- pre-enhancement the command
+ * surface was "Open Cell Grid" only; closing + re-opening was the only
+ * way to refresh the snapshot.  The registry + Refresh command lets
+ * users re-render in place.
+ *
+ * **V3.2.d closure (HIGH-1, 2026-05-22)** -- pre-V3.2.d a SINGLE
+ * `activePanels: Map<number, CellGridPanel>` keyed by sheet held BOTH
+ * local + collab panels.  The V3.2.d audit (Opus Lane B HIGH-1 + Codex
+ * Lane A MEDIUM-2 convergent) flagged three latent correctness gaps:
+ *
+ * 1. **collab-then-local**: user runs the LOCAL command after a collab
+ *    panel exists; the cache check found the collab panel + revealed
+ *    it, silently overriding the user's explicit local-mode intent +
+ *    leaking the sample-data session created at command-invocation.
+ * 2. **collab-then-collab**: pre-V3.2.d this overwrote the cache slot
+ *    with a SECOND collab panel + left the first orphaned from
+ *    refreshAll AND alive with its own session + transport.  Two
+ *    concurrent collab sessions in one window flush under the SAME
+ *    `peerId = BigInt(process.pid)` -- violating the V3.1.b PeerId-
+ *    uniqueness contract (Loro CRDT accepts the merge but the per-peer
+ *    VV math is now ambiguous between two writers).
+ * 3. **local-then-collab**: pre-V3.2.d the local panel was silently
+ *    evicted from refreshAll coverage even though it stayed visible.
+ *
+ * **Fix**: separate `Map`s for the two modes.  Local + collab CAN
+ * coexist for the same sheet (different sessions, different intent).
+ * Refresh iterates BOTH maps.  Collab-then-collab now reveals the
+ * existing collab panel + surfaces an `showInformationMessage` rather
+ * than spawning a duplicate -- preserving PeerId-uniqueness.
  */
-const activePanels: Map<number, CellGridPanel> = new Map();
+const localPanels: Map<number, CellGridPanel> = new Map();
+const collabPanels: Map<number, CellGridPanel> = new Map();
 
 /**
  * V3.2.c.3 (2026-05-22): everything the panel needs to drive the
@@ -86,26 +110,38 @@ export class CellGridPanel {
 		sheet: number,
 		attachment?: CollabAttachment,
 	): CellGridPanel {
-		// V3.2.a.1: single tab per sheet (reveal + refresh on
-		// re-open).  V3.2.b inherits this convention -- the existing
-		// panel keeps its session reference + onDidReceiveMessage
-		// handler intact across reveal.
+		// V3.2.a.1 single-tab-per-sheet + V3.2.d HIGH-1 closure
+		// (2026-05-22): two separate cache maps for local + collab
+		// modes.  A local + a collab panel for the SAME sheet are
+		// LEGITIMATELY distinct surfaces (different sessions,
+		// different intent) and CAN coexist; the cache returns the
+		// existing same-mode panel (reveal + refresh) and NEVER
+		// silently swaps mode under the user.
 		//
-		// V3.2.c.3: collab-attached panels DO NOT reuse a cached
-		// panel.  Two open commands (local + collab) on the same
-		// sheet must produce DIFFERENT panels because they reference
-		// different sessions.  If a panel for this sheet is already
-		// open AND the new call has no attachment, reuse it (legacy
-		// V3.2.a.1 path).  Otherwise force a new panel; the existing
-		// one (if any) gets disposed in `onDidDispose` -> stale
-		// activePanels entry replaced.
-		if (attachment === undefined) {
-			const existing = activePanels.get(sheet);
-			if (existing !== undefined) {
-				existing.panel.reveal(vscode.ViewColumn.Active, false);
-				existing.render();
-				return existing;
+		// Specifically:
+		//   - LOCAL open + LOCAL panel exists: reveal + refresh.
+		//   - LOCAL open + only COLLAB panel exists: create new local.
+		//   - COLLAB open + COLLAB panel exists: reveal existing +
+		//     showInformationMessage (V3.1.b PeerId-uniqueness:
+		//     don't spawn a second concurrent collab session under
+		//     the same PID).
+		//   - COLLAB open + only LOCAL panel exists: create new collab.
+		const mode = attachment === undefined ? 'local' : 'collab';
+		const panels = mode === 'local' ? localPanels : collabPanels;
+		const existing = panels.get(sheet);
+		if (existing !== undefined) {
+			if (mode === 'collab') {
+				// V3.2.d HIGH-1 closure: surface that the collab
+				// panel is already open in this window.  The local
+				// mode silently reuses (it's a fast-start dev
+				// surface; less noise wanted).
+				void vscode.window.showInformationMessage(
+					`Cell Grid (Collab) is already open for sheet ${sheet} in this window.`,
+				);
 			}
+			existing.panel.reveal(vscode.ViewColumn.Active, false);
+			existing.render();
+			return existing;
 		}
 		const panel = vscode.window.createWebviewPanel(
 			VIEW_TYPE,
@@ -154,13 +190,17 @@ export class CellGridPanel {
 			}
 		}
 		instance.render();
-		activePanels.set(sheet, instance);
+		panels.set(sheet, instance);
 		panel.onDidDispose(() => {
+			// V3.2.b.3: set _disposed BEFORE disposeAttachment so any
+			// postMessage racing with disposal early-returns from the
+			// onError guard added at V3.2.d Opus MEDIUM-1 closure.
+			instance._disposed = true;
 			instance.disposeAttachment();
 			// Only clear the cache entry if we still own it (a fresh
-			// open for the same sheet may have replaced us).
-			if (activePanels.get(sheet) === instance) {
-				activePanels.delete(sheet);
+			// open for the same sheet + mode may have replaced us).
+			if (panels.get(sheet) === instance) {
+				panels.delete(sheet);
 			}
 		});
 		context.subscriptions.push(panel);
@@ -168,14 +208,22 @@ export class CellGridPanel {
 	}
 
 	/**
-	 * Refresh ALL currently-open cell-grid panels.  Called by the
-	 * `quantlab.quantbookCellGridRefresh` command.  Returns the
-	 * number of panels refreshed (0 if none open -- the command
-	 * surfaces an information message in that case).
+	 * Refresh ALL currently-open cell-grid panels (both local + collab
+	 * modes).  Called by the `quantlab.quantbookCellGridRefresh`
+	 * command.  Returns the number of panels refreshed (0 if none open).
+	 *
+	 * V3.2.d HIGH-1 closure: iterates BOTH maps so panels of either
+	 * mode are covered.  Pre-V3.2.d this iterated a single
+	 * `activePanels` map that silently lost the previously-evicted
+	 * panel on local-then-collab / collab-then-collab transitions.
 	 */
 	static refreshAll(): number {
 		let count = 0;
-		for (const instance of activePanels.values()) {
+		for (const instance of localPanels.values()) {
+			instance.render();
+			count += 1;
+		}
+		for (const instance of collabPanels.values()) {
 			instance.render();
 			count += 1;
 		}
@@ -201,6 +249,23 @@ export class CellGridPanel {
 		reconnectInFlight: boolean;
 		disposed: boolean;
 	} | undefined;
+
+	/**
+	 * V3.2.d Opus MEDIUM-1 closure (2026-05-22): tracks whether
+	 * `panel.dispose()` has fired.  `webview.postMessage` to a
+	 * disposed panel returns a rejected/no-op Thenable and the
+	 * message is silently lost; the user typed a value + saw no
+	 * error decoration.  The errorReply path checks this flag + falls
+	 * back to `vscode.window.showWarningMessage` so the user gets a
+	 * surface for late-arriving validation errors.
+	 *
+	 * Public-readonly because `show()`'s `onDidDispose` handler sets
+	 * it BEFORE calling `disposeAttachment` (so any in-flight
+	 * postMessage early-returns).  Could be `#private` but TS
+	 * downlevel + the existing JSDoc style use `private`/`readonly`
+	 * conventions.
+	 */
+	_disposed: boolean = false;
 
 	private constructor(
 		private readonly panel: vscode.WebviewPanel,
@@ -240,7 +305,21 @@ export class CellGridPanel {
 			session: this.session,
 			sheet: this.sheet,
 			onCommit: () => this.render(),
-			onError: reply => { void this.panel.webview.postMessage(reply); },
+			onError: reply => {
+				// V3.2.d Opus MEDIUM-1 closure (2026-05-22): if the
+				// panel has been disposed (or is hidden with
+				// retainContextWhenHidden: false, which the V3.2
+				// panel config is), `webview.postMessage` silently
+				// drops the message.  Fall back to
+				// `showWarningMessage` so the user sees the error.
+				if (this._disposed) {
+					void vscode.window.showWarningMessage(
+						`Cell Grid (sheet ${reply.sheet}, row ${reply.row}, col ${reply.col}): [${reply.code}] ${reply.message}`,
+					);
+					return;
+				}
+				void this.panel.webview.postMessage(reply);
+			},
 		});
 	}
 
@@ -295,7 +374,36 @@ export class CellGridPanel {
 				return;
 			case 'merged':
 				state.log.appendLine(`[collab] pollRemote merged ${result.count} remote blob(s); re-rendering`);
-				this.render();
+				// V3.2.d Codex M3 closure (2026-05-22): wrap render()
+				// in try/catch.  exportCellSnapshot can throw at the
+				// engine boundary (op log iteration / JSON decode of
+				// a maliciously-formed merged blob).  Pre-V3.2.d a
+				// throw here bubbled into setInterval which silently
+				// swallowed it AND kept ticking -- the panel
+				// continued to fire merged ticks that did no visible
+				// work.  Now: log the structured code; on a
+				// `bad_argument` / `session_oplog` (semantic engine
+				// failure) tear down the panel cleanly via
+				// handleTransportClosed-style dispose; on transient
+				// errors skip this tick.
+				try {
+					this.render();
+				} catch (err) {
+					const info = parseQuantbookError(err);
+					state.log.appendLine(`[collab] render() failed after merged tick: code=${info.code} msg=${info.message}`);
+					if (info.code === 'bad_argument' || info.code === 'session_oplog') {
+						state.log.appendLine('[collab] render() error is fatal; disposing panel');
+						void vscode.window.showWarningMessage(
+							`Cell Grid (Collab) failed to render after a remote merge: [${info.code}] ${info.message}.`,
+							'Restart Cell Grid (Collab)',
+						).then(choice => {
+							if (choice === 'Restart Cell Grid (Collab)') {
+								void vscode.commands.executeCommand('quantlab.quantbookCellGridCollab');
+							}
+						});
+						this.panel.dispose();
+					}
+				}
 				return;
 			case 'transportClosed':
 				state.log.appendLine(`[collab] pollRemote saw transport_closed; reconnecting`);
@@ -335,6 +443,29 @@ export class CellGridPanel {
 			}
 			this.session.attachTransport(fresh);
 			state.transport = fresh;
+			// V3.2.d Codex M1 closure (2026-05-22): engine contract
+			// is mutate-then-flush -- if a cell commit's OnAppend
+			// auto-flush failed with `transport_closed` BEFORE this
+			// reconnect, the local PutValue op is already in the log
+			// but unflushed.  Just attaching a fresh transport does
+			// NOT flush pending ops (see
+			// `crates/ql-collab/src/session.rs:723-736`).  Check
+			// `hasPendingFlush()` and explicitly flush after attach
+			// so the local commit reaches the peer rather than
+			// staying buffered until the next user mutation.
+			if (this.session.hasPendingFlush()) {
+				try {
+					const flushed = this.session.flushDeltaToTransport();
+					state.log.appendLine(`[collab] post-reconnect flushDeltaToTransport returned ${flushed} (cleared pending op)`);
+				} catch (flushErr) {
+					const flushInfo = parseQuantbookError(flushErr);
+					state.log.appendLine(`[collab] post-reconnect flush failed: code=${flushInfo.code} msg=${flushInfo.message}`);
+					// Don't escalate: the next pollRemote / user
+					// edit cycle has another chance.  If the
+					// transport is closed again, handleTransportClosed
+					// re-fires on the next tick.
+				}
+			}
 			state.log.appendLine(`[collab] reconnect succeeded; resuming pollRemote`);
 		} catch (err) {
 			const info = parseQuantbookError(err);
