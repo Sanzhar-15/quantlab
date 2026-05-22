@@ -96,6 +96,7 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
+use ql_collab::AutoFlushPolicy as CoreAutoFlushPolicy;
 use ql_collab::CollabSession as CoreCollabSession;
 use ql_collab::LoopbackTransport;
 use ql_collab::Transport as CoreTransport;
@@ -518,6 +519,160 @@ impl CollabSession {
             .poll_remote()
             .map_err(|e| Error::from_reason(format!("{e}")))?;
         Ok(u32::try_from(blobs_drained).unwrap_or(u32::MAX))
+    }
+
+    // ==========================================================
+    // Phase 5.7 V2.2 (2026-05-22) — full sync Transport surface
+    // ==========================================================
+
+    /// Delta flush to the attached transport. Sends ONLY the ops added
+    /// since the last successful flush (via Loro's `ExportMode::Updates`
+    /// from this session's `last_flushed_vv`). Returns `true` if bytes
+    /// were actually sent.
+    ///
+    /// **This is the production default**; prefer it over
+    /// `flushToTransport` (full-snapshot) which is O(full state). Delta
+    /// flushes are O(per-op delta).
+    ///
+    /// **Idempotency short-circuit**: if no state changed since the
+    /// last flush (or since attach, if first flush), this returns
+    /// `Ok(false)` without invoking `transport.send`. Closes the V2 V2
+    /// audit echo-loop concern.
+    ///
+    /// **Per Phase 5.5 V2 V3 step 1 contract**: attach_transport resets
+    /// the per-session-per-transport `last_flushed_vv` to None. The
+    /// next call to `flushDeltaToTransport` after an attach sends from
+    /// the empty VV — delivering ALL local ops including any appended
+    /// while offline (Loro's CRDT op log IS the implicit offline queue).
+    ///
+    /// **Failure modes**:
+    /// - No transport attached → returns `Ok(false)` (NOT an error).
+    /// - Transport's `send` returns `Err(TransportError::*)` → JS Error.
+    #[napi(js_name = "flushDeltaToTransport")]
+    pub fn flush_delta_to_transport(&mut self) -> Result<bool> {
+        self.inner
+            .flush_delta_to_transport()
+            .map_err(|e| Error::from_reason(format!("{e}")))
+    }
+
+    /// Like `pollRemote` but with an explicit cap on the number of
+    /// blobs to drain per call. Returns the number of BLOBS drained
+    /// (NOT ops), `<= limit`.
+    ///
+    /// **Limit semantics** (per engine docstring):
+    /// - `limit == 0` → no-op, returns `Ok(0)` even if blobs queued.
+    /// - If the returned count equals `limit`, more blobs may still
+    ///   be queued — call again.
+    /// - If less, the queue drained (either empty or transport
+    ///   reported `Closed`).
+    ///
+    /// **Input validation** (per V1 megaudit closure pattern):
+    /// `limit` takes `f64` to avoid napi-rs's `napi_get_value_uint32`
+    /// ECMAScript ToUint32 silent coercion (`-1 → u32::MAX`, etc.).
+    /// Validated finite + non-negative + integer + in `usize` range
+    /// (on 64-bit systems usize = u64; we cap at u32::MAX for cross-
+    /// platform safety).
+    ///
+    /// **Failure modes**:
+    /// - No transport attached → returns `Ok(0)`.
+    /// - `limit` not a finite non-negative integer in u32 range → JS Error.
+    /// - Transport's `try_recv` returns `Err` → JS Error.
+    #[napi(js_name = "pollRemoteWithLimit")]
+    pub fn poll_remote_with_limit(&mut self, limit: f64) -> Result<u32> {
+        let limit_u32 = validate_u32_index("limit", limit)?;
+        let blobs_drained = self
+            .inner
+            .poll_remote_with_limit(limit_u32 as usize)
+            .map_err(|e| Error::from_reason(format!("{e}")))?;
+        Ok(u32::try_from(blobs_drained).unwrap_or(u32::MAX))
+    }
+
+    /// Returns the attached transport's most recent error message, or
+    /// `null` if either no transport is attached OR the transport
+    /// reports no error.
+    ///
+    /// **Use case**: IDE reconnect handshakes — after a mutator or
+    /// `flush_*_to_transport` returns a JS Error containing
+    /// "transport closed" (or similar), the IDE can call this to
+    /// distinguish underlying causes (`"peer reset"` vs
+    /// `"capacity exceeded"` for `WebSocketTransport`, etc.) and pick
+    /// the right retry strategy.
+    ///
+    /// **V2.2 audit-deferred caveat (Opus MEDIUM-3, 2026-05-22)**:
+    /// the engine surfaces errors as `Display` strings (lossy
+    /// projection of the underlying enum discriminant). IDE callers
+    /// today must substring-match to distinguish error categories.
+    /// V2.3+ will add structured discrimination via napi `Error::with_code`
+    /// (`#[napi(constructor)]` on a `TransportClosedError` etc.).
+    /// For V2.2 the string is the contract.
+    #[napi(js_name = "transportLastError")]
+    pub fn transport_last_error(&self) -> Option<String> {
+        self.inner.transport_last_error()
+    }
+
+    /// Set the auto-flush policy. Returns the prior policy.
+    ///
+    /// **Accepted strings**: `"disabled"` (default) or `"onAppend"`.
+    /// Any other string returns a JS Error listing the accepted values.
+    ///
+    /// **`"onAppend"` semantics** (Phase 5.5 V2 V2 + V2 V3 steps 1+2):
+    /// every public mutator (`append_op`, `merge_bytes`,
+    /// `update_presence`, `clear_presence`, `sweep_presence`, `undo`,
+    /// `redo`, `poll_remote`, `poll_remote_with_limit`) auto-fires a
+    /// delta flush after the mutation. Idempotency short-circuits
+    /// no-op state changes; `poll_remote*` fires the flush once after
+    /// the batch (not per-blob).
+    ///
+    /// **Why string union over enum**: napi-rs binds Rust enums as
+    /// JS objects with a discriminant field, which is verbose for
+    /// 2-variant enums. The string-union approach is JS-idiomatic and
+    /// easy to test. Forward-compat: the engine's `AutoFlushPolicy`
+    /// is `#[non_exhaustive]` so future variants won't break this
+    /// binding — they'll just be unparseable by this method until V2.3+
+    /// adds string mappings.
+    #[napi(js_name = "setAutoFlushPolicy")]
+    pub fn set_auto_flush_policy(&mut self, policy: String) -> Result<String> {
+        let policy_enum = parse_auto_flush_policy(&policy)?;
+        let prior = self.inner.set_auto_flush_policy(policy_enum);
+        Ok(auto_flush_policy_to_string(prior))
+    }
+
+    /// Read the current auto-flush policy. Returns one of
+    /// `"disabled"` or `"onAppend"` (see `setAutoFlushPolicy`).
+    #[napi(js_name = "autoFlushPolicy")]
+    pub fn auto_flush_policy(&self) -> String {
+        auto_flush_policy_to_string(self.inner.auto_flush_policy())
+    }
+}
+
+/// Phase 5.7 V2.2 (2026-05-22) — parse a JS string into
+/// [`CoreAutoFlushPolicy`]. JS-idiomatic camelCase + lowercase aliases
+/// accepted. Rejects unknown strings with a precise error.
+fn parse_auto_flush_policy(s: &str) -> Result<CoreAutoFlushPolicy> {
+    match s {
+        "disabled" | "Disabled" => Ok(CoreAutoFlushPolicy::Disabled),
+        "onAppend" | "on-append" | "OnAppend" => Ok(CoreAutoFlushPolicy::OnAppend),
+        other => Err(Error::from_reason(format!(
+            "AutoFlushPolicy must be 'disabled' or 'onAppend', got {other:?}"
+        ))),
+    }
+}
+
+/// Phase 5.7 V2.2 (2026-05-22) — render [`CoreAutoFlushPolicy`] as a JS
+/// string. Uses canonical camelCase form ("disabled", "onAppend"). The
+/// engine's `AutoFlushPolicy` is `#[non_exhaustive]` — V2.2 handles the
+/// two existing variants explicitly + a catch-all that returns an
+/// "unknown" sentinel so JS callers can detect a forward-compat skew.
+fn auto_flush_policy_to_string(p: CoreAutoFlushPolicy) -> String {
+    match p {
+        CoreAutoFlushPolicy::Disabled => "disabled".to_string(),
+        CoreAutoFlushPolicy::OnAppend => "onAppend".to_string(),
+        // `#[non_exhaustive]` requires a catch-all. Return a sentinel
+        // that callers can detect — better than panicking at the FFI
+        // boundary (V1 megaudit Codex H1 closure: no engine panics
+        // through the FFI). V2.3+ should add variant-specific strings
+        // here as new policies ship.
+        _ => "unknown".to_string(),
     }
 }
 

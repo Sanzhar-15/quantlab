@@ -64,31 +64,46 @@ V1 was `CollabSession` only — no peers could talk to each other from the IDE s
 - **`cargo test` cannot link napi symbols** — Rust unit tests in `ql-bindings-node` must use `CoreCollabSession` directly, NOT the napi wrappers. Already-applied V1 pattern; reaffirmed in V2.1.
 - **`clippy::new_without_default`** fires on `LoopbackPair::new()`. Closure: `impl Default` added.
 
-## V2.2 — Full sync transport surface (Cycle 2, ~half-day)
+## V2.2 — Full sync transport surface (Cycle 2) ✅ SHIPPED 2026-05-22
+
+**Engine commit**: [V2.2 engine ship commit hash]
+**IDE commit**: [V2.2 IDE ship commit hash]
+**Tests**: IDE mocha **60 / 60** (was 41 at V2.1 closure)
 
 **Engine work**:
 
-- [ ] `flushDeltaToTransport(): boolean` — V2 V3 step 1's delta path; the production default.
-- [ ] `pollRemoteWithLimit(limit: f64): u32` — limit takes `f64` for ToUint32 hygiene.
-- [ ] `transportLastError(): string | null` — `None` → `null`.
-- [ ] AutoFlushPolicy enum binding:
-  - Decide JS shape: simplest is string union (`'disabled' | 'onAppend'`) since the enum has no payload.
-  - `setAutoFlushPolicy(policy: string): string` — returns prior policy.
-  - `autoFlushPolicy(): string`.
+- [x] `flushDeltaToTransport(): boolean` — V2 V3 step 1's delta path; the production default. Idempotency short-circuit on no-state-change returns Ok(false).
+- [x] `pollRemoteWithLimit(limit: f64): u32` — limit takes `f64` per V1 megaudit ToUint32-hygiene pattern. Validated finite + non-negative + integer + in u32 range via `validate_u32_index`.
+- [x] `transportLastError(): string | null` — `None` → `null`. Documented Display-loss caveat for V2.3+ structured discrimination.
+- [x] AutoFlushPolicy enum binding:
+  - JS shape: string union `'disabled' | 'onAppend'` (V2 plan locked).
+  - `setAutoFlushPolicy(policy: string): string` — returns prior policy as canonical camelCase.
+  - `autoFlushPolicy(): string` — returns canonical camelCase, `'unknown'` for forward-compat (engine enum is `#[non_exhaustive]`).
+  - Engine-side parser accepts aliases (`Disabled`, `OnAppend`, `on-append`).
 
 **IDE work**:
 
-- [ ] Wrap new methods in `session.ts`.
-- [ ] Tests:
-  - Delta vs full-snapshot flush semantics.
-  - `pollRemoteWithLimit` boundary cases (0 limit, > available).
-  - AutoFlushPolicy round-trip + onAppend integration test (two-peer auto-sync).
-  - `transportLastError` after a detach (expect `null`).
+- [x] Extended `types.ts` with 5 new CollabSession methods + `AutoFlushPolicy` exported type union.
+- [x] Extended `session.ts` with `isAutoFlushPolicy` strict camelCase type guard. (Engine accepts loose aliases; IDE config-validation path uses the strict guard.)
+- [x] Added 19 new mocha tests:
+  - flushDelta idempotency contract (first-after-attach sends; second is no-op).
+  - flushDelta sends bytes when state changed; no-transport returns false.
+  - flushDelta vs flushToTransport semantic difference.
+  - pollRemoteWithLimit 0/2/10/negative/NaN/fractional/out-of-u32 cases.
+  - transportLastError null on no-transport + on clean Loopback.
+  - autoFlushPolicy defaults to 'disabled'.
+  - setAutoFlushPolicy returns prior, round-trip, rejects unknown, accepts engine aliases.
+  - **onAppend two-peer convergence integration test** — proves auto-flush fires without explicit caller.
+  - isAutoFlushPolicy strict guard rejects engine aliases (camelCase only).
+
+**Findings during V2.2 work**:
+
+- **First flushDeltaToTransport after attach ALWAYS sends** even on empty log. Test assumption that "no ops appended → no-op" was wrong: attach sets `last_flushed_vv = None`, idempotency guard short-circuits only when `Some(last_vv) == current_vv`. With None it always proceeds. Closure: rewrote test as "second flush with no state change short-circuits".
+- AutoFlushPolicy engine parser is loose (accepts aliases); IDE-side strict camelCase guard added to compensate. The asymmetry is documented + tested explicitly.
 
 **Audit obligations**:
 
-- [ ] Parallel Codex + Opus audit.
-- [ ] If the audit surfaces a NEW Rule 4 hazard (precedent: V1 had 3 such), close it before commit.
+- [ ] Parallel Codex + Opus audit. (Pending — cycle 2 audit.)
 
 ## V2.3+ — DEFERRED to next session
 
