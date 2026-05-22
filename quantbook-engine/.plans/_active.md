@@ -1,15 +1,15 @@
 ---
 name: 2026-05-22_phase-5-7-v3-2-cell-grid-ui
-status: in-progress (entry plan drafted; V3.2.a scaffolding is the first work item; predecessor V3.1 fully shipped + audited at engine `97ac0b902d1` / IDE `a46abea484a`)
+status: in-progress (V3.2.a snapshot foundation SHIPPED -- exportSnapshot napi + IDE typed wrapper at engine `355a3226f0a` + IDE `831c9f2bf37`; webview + virtualized table + command registration DEFERRED to fresh session; predecessor V3.1 fully shipped at engine `97ac0b902d1` / IDE `a46abea484a`)
 date: 2026-05-22
 predecessor_plan: .plans/_archive/2026-05-22_phase-5-7-v3-1-multi-window-demo.md (V3.1 multi-window demo, all sub-steps + audit closed)
 predecessor_v2_exit_packet: docs/phase5/5-7-v2-exit-packet.md (V2 phase termination -- Transport binding architectural decisions V2.1-V2.8)
 predecessor_v3_1_audits: docs/audits/2026-05-22-phase-5-7-v3-1-{codex,opus}.md (V3.1.e parallel audit; Opus § Section 3 contains the V3.2 ENTRY READINESS analysis this plan is built on)
 parent_phase: 5.7 Collaboration IDE Vertical Slice
 direction: V3.2 -- cell-grid UI. Real grid widget bound to a CollabSession; user-facing cell editing surface. First production-grade IDE consumer of the V2 Transport binding + V3.1 multi-window infrastructure.
-current_engine_head: 97ac0b902d1 (V3.1.e Codex L2 closure -- relay graceful shutdown)
-current_ide_head: a46abea484a (V3.1.e Codex L5 closure -- reconnect-mid-flight test)
-current_mocha_count: 98 / 98
+current_engine_head: 355a3226f0a (V3.2.a engine -- exportSnapshot napi method)
+current_ide_head: 831c9f2bf37 (V3.2.a IDE -- typed wrapper + 5 mocha tests)
+current_mocha_count: 103 / 103
 current_ql_collab_tests: 74 / 74 (with --features test-fixtures)
 current_ql_collab_ws_tests: 42 / 42 (10 lib + 30 websocket_transport + 2 V3.1.a relay)
 current_engine_workspace: 4472 / 0 baseline
@@ -56,13 +56,13 @@ V3.2 = cell-grid UI. Lift the V3.1 demo patterns into a real grid widget that us
 
 ## V3.2 sub-steps
 
-- [ ] **V3.2.a -- Grid scaffolding (~2d)** -- minimum coherent surface.
-   1. New webview component at `extensions/quantlab/src/quantbook/cellGrid/`. Use VS Code's `vscode.WebviewView` API (or `WebviewPanel` if a tab is preferred).
-   2. Read sheet 0's cell range from the engine via a new napi method `CollabSession.exportSnapshot(sheet: number) -> { rows: number, cols: number, cells: Array<{row, col, value}> }`. (Or use existing `exportBytes` + a TS-side Loro doc parser -- TBD, see V3.2.a design decisions below.)
-   3. Render as a virtualized table (e.g., 1000 visible rows max for V3.2.a; full pagination is V3.3).
-   4. NO editing yet -- read-only render.
-   5. Wire to `quantlab.quantbookCellGrid` command that opens the webview.
-   6. Mocha test: programmatically construct a CollabSession, append a few PutValues, render the webview, snapshot-test the HTML output.
+- **V3.2.a -- Grid scaffolding (~2d)** -- minimum coherent surface. PARTIALLY SHIPPED 2026-05-22.
+   1. [ ] New webview component at `extensions/quantlab/src/quantbook/cellGrid/`. Use VS Code's `vscode.WebviewView` API (or `WebviewPanel` if a tab is preferred). DEFERRED to fresh session.
+   2. [x] Read sheet 0's cell range from the engine via a new napi method `CollabSession.exportSnapshot(sheet)`. SHIPPED at engine `355a3226f0a` + IDE `831c9f2bf37`. Returns JSON-serialized `QuantbookCellSnapshot` (snapshot_format_version = 1, entries sorted by (row, col) with last-write-wins per cell). Decision 1 LOCKED to Option A (new napi method). 5 mocha tests pin empty / sort+LWW / sheet-filter / exportBytes round-trip / JSON-decoded return.
+   3. [ ] Render as a virtualized table (e.g., 1000 visible rows max for V3.2.a; full pagination is V3.3). DEFERRED.
+   4. [ ] NO editing yet -- read-only render. DEFERRED to V3.2.a webview ship.
+   5. [ ] Wire to `quantlab.quantbookCellGrid` command that opens the webview. DEFERRED.
+   6. [partial] Mocha tests: 5 unit-level snapshot tests shipped; webview-rendering snapshot tests DEFERRED to V3.2.a webview ship.
 
 - [ ] **V3.2.b -- Cell-edit flow (~3d)** -- write surface.
    1. Click cell -> input element appears -> user types -> Enter or blur commits.
