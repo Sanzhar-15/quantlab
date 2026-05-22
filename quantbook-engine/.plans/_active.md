@@ -1,15 +1,15 @@
 ---
 name: 2026-05-22_phase-5-7-v3-2-cell-grid-ui
-status: in-progress (V3.2.a + V3.2.a.1 SHIPPED + AUDITED docs through `c88ca9d41e4` / IDE `14875aa2330`. V3.2.b.1 DECISION LOCK shipped this commit -- 5 design decisions (envelope, nonce, errorReply, pessimistic-rendering, no-remote-auto-refresh) locked in §3 below. V3.2.b.2-V3.2.b.6 (~3d total) is the implementation sequence; next commit ships V3.2.b.2 nonced-CSP HTML refactor.)
+status: in-progress (V3.2.a + V3.2.a.1 + V3.2.b SHIPPED.  V3.2.b.1 decision lock at engine `ce5d697cb17`; V3.2.b.2-V3.2.b.5 (nonced CSP + cellGridLogic.ts vscode-free split + 18 new mocha tests) at IDE `86b02d22a0b`; V3.2.b.6 ide-consumer-contract § 4.1.z + plan checkboxes ship in THIS commit.  IDE mocha 126/126.  V3.2.b.4 AutoFlushPolicy wiring DEFERRED to V3.2.c (V3.2.b's command surface uses an unattached session -- local-only).  V3.2.c live multi-window propagation (~2d) is the next major work item.)
 date: 2026-05-22
 predecessor_plan: .plans/_archive/2026-05-22_phase-5-7-v3-1-multi-window-demo.md (V3.1 multi-window demo, all sub-steps + audit closed)
 predecessor_v2_exit_packet: docs/phase5/5-7-v2-exit-packet.md (V2 phase termination -- Transport binding architectural decisions V2.1-V2.8)
 predecessor_v3_1_audits: docs/audits/2026-05-22-phase-5-7-v3-1-{codex,opus}.md (V3.1.e parallel audit; Opus § Section 3 contains the V3.2 ENTRY READINESS analysis this plan is built on)
 parent_phase: 5.7 Collaboration IDE Vertical Slice
 direction: V3.2 -- cell-grid UI. Real grid widget bound to a CollabSession; user-facing cell editing surface. First production-grade IDE consumer of the V2 Transport binding + V3.1 multi-window infrastructure.
-current_engine_head: 748c09194d9 (Cargo.lock fix for V3.2.a serde_json dep; session-end audit drift-fix)
-current_ide_head: 130d28000ca (V3.2.a.1 in-place refresh + single-tab-per-sheet)
-current_mocha_count: 108 / 108
+current_engine_head: (this commit) V3.2.b.6 ide-consumer-contract § 4.1.z + plan checkboxes
+current_ide_head: 86b02d22a0b (V3.2.b.2-V3.2.b.5 nonced cell-edit flow + 18 new mocha tests)
+current_mocha_count: 126 / 126
 current_ql_collab_tests: 74 / 74 (with --features test-fixtures)
 current_ql_collab_ws_tests: 42 / 42 (10 lib + 30 websocket_transport + 2 V3.1.a relay)
 current_engine_workspace: 4472 / 0 baseline
@@ -64,14 +64,15 @@ V3.2 = cell-grid UI. Lift the V3.1 demo patterns into a real grid widget that us
    5. [x] `quantlab.quantbookCellGrid` command registered + package.json + package.nls.json (title "Quantbook: Open Cell Grid"). Sample data injected at command invocation so the grid renders non-empty on first open.
    6. [x] Mocha tests: 10 total (5 V3.2.a engine-side snapshot + 5 V3.2.a IDE HTML rendering including XSS escape pin + CSP meta tag pin).
 
-- [ ] **V3.2.b -- Cell-edit flow (~3d)** -- write surface.
-   1. Click cell -> input element appears -> user types -> Enter or blur commits.
-   2. Validate input (number / string / formula stub for V3.2; full formula in V3.3).
-   3. Call `appendPutValueValidated(session, sheet, row, col, value)`.
-   4. AutoFlushPolicy = OnAppend -> auto-sync to transport.
-   5. Re-render the cell from the session's new state.
-   6. Catch errors via parseQuantbookError; show inline decoration with the structured code.
-   7. Mocha tests: simulated key events + assertion on the resulting session state.
+- **V3.2.b -- Cell-edit flow (~3d)** ✅ SHIPPED 2026-05-22.
+   1. [x] Click cell -> input element appears -> user types -> Enter commits / Escape cancels.  Implemented in the V3.2.b.2 nonced inline script (`buildClientScript` in `cellGridHtml.ts`).
+   2. [partial] Number-only validation per `parseCellRawInput`.  Text / boolean / error are READ-ONLY at V3.2.b because the V1 napi `appendPutValue(... value: f64)` is the only write binding; non-numeric input surfaces `bad_argument`.  V3.3 will add text variants when the engine ships the corresponding napi methods.
+   3. [x] Calls `appendPutValueValidated(session, sheet, row, col, parsed)` (engine commit `355a3226f0a` exposes the napi binding; V3.2.a `appendPutValueValidated` is the typed wrapper).
+   4. [deferred] AutoFlushPolicy = OnAppend wiring is NOT enabled at V3.2.b -- the panel is a local-only snapshot view at this stage (V3.2.c will wire AutoFlushPolicy + reconnect-aware multi-window).  The current command surface uses an unattached session.
+   5. [x] Re-render on success via `panel.webview.html = buildHtml(snapshot, { nonce })` (full HTML rebuild; the existing webview script + state get torn down with the document, which is intentional -- decision B4 pessimistic).
+   6. [x] Failure path posts `ErrorReplyMessage` with `parseQuantbookError(err).code`; the inline script adds `.cell-edit-error` class + `title="[code] message"` to the offending cell, keeping the input visible for correction.
+   7. [x] 18 new mocha tests at V3.2.b.5 (108 -> 126 total): 6 HTML/CSP/data-attrs/script-wiring pins; 7 parseCellRawInput pins; 5 dispatchIncomingMessage pins (success commits + onCommit, parse failure + errorReply, empty input, sheet mismatch silent drop, malformed inputs silent drop).
+   - V3.2.b.6 ide-consumer-contract.md § 4.1.z documents the message envelope + nonce + pessimistic rendering + drift hazards (THIS commit).
 
 - [ ] **V3.2.c -- Live multi-window propagation (~2d)** -- read surface from peer.
    1. Decide inbound model: (a) periodic 1s `pollRemote` (V3.1 pattern; demo-OK) vs (b) Transport-push event-driven via `Transport::ack_handle`-style subscription (cleaner; needs engine API).

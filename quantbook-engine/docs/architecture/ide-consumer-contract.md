@@ -453,6 +453,76 @@ The runtime that drives `WebSocketTransport::connect` can be any tokio runtime (
 
 **Out of scope for V3.1**: smarter reconnect policy, programmatic second-window spawn (today the user manually opens window 2 via File > New Window), TLS, auth, multi-session WAN.
 
+### 4.1.z Cell-grid webview message-passing contract (Phase 5.7 V3.2.b, 2026-05-22)
+
+**Status:** V3.2.a scaffold at `extensions/quantlab/src/quantbook/cellGrid/` + V3.2.b nonced cell-edit flow (this commit's IDE counterpart, `86b02d22a0b`).  First webview consumer of the V2 Transport binding's structured-error contract (`parseQuantbookError` + `QuantbookErrorCode`).
+
+**File layout (vscode-free split for testability):**
+
+- `cellGridHtml.ts` -- pure HTML/CSS/inline-script builder.  No `vscode` import.
+- `cellGridLogic.ts` -- pure host-side dispatcher + parser.  No `vscode` import.
+- `cellGridPanel.ts` -- thin `vscode.WebviewPanel` wrapper that wires the above into a lifecycle (`show()` / `render()` / `refreshAll()` / `onDidReceiveMessage` -> `dispatchIncomingMessage`).
+
+**Security posture:**
+
+- `enableScripts: true` (required by the click-to-edit flow).
+- CSP: `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`.
+- Nonce is 32-char alphanumeric (`[A-Za-z0-9]{32}`), regenerated per `render()` call.  Format matches `LoginWebviewPanel._nonce` for cross-extension audit consistency.
+- The SAME nonce appears in BOTH the CSP `script-src` directive AND the inline `<script nonce="...">` attribute.  `buildHtml` reads it from a single local; the browser/webview rejects the script if the values diverge.
+
+**Message envelope (decision lock V3.2.b.1):**
+
+```ts
+// Outgoing (webview -> extension host)
+interface PutValueRequest {
+  type: 'putValue';
+  sheet: number;
+  row: number;
+  col: number;
+  rawInput: string;   // literal user-typed string; host parses
+}
+
+// Incoming (extension host -> webview), failure path
+interface ErrorReplyMessage {
+  type: 'errorReply';
+  sheet: number;
+  row: number;
+  col: number;
+  code: QuantbookErrorCode;   // from parseQuantbookError(err).code
+  message: string;
+}
+```
+
+The success path is NOT a message -- it's a full HTML rebuild via `panel.webview.html = buildHtml(snapshot, { nonce })`.  The new document carries fresh data attributes + a fresh script; the prior input element is gone because the cell's display text now matches the committed value.
+
+Unknown `type` values from EITHER direction are logged + ignored.  No silent fall-through, no exception.  Future schema additions can land without breaking older webviews (the webview WILL ignore a future `pushUpdate` message it doesn't know how to handle; same for the host receiving a future client message).
+
+**Rendering contract (decision B4 -- PESSIMISTIC):**
+
+- User clicks `.cell-value` -> webview replaces `<td>` content with `<input>`.
+- User types + presses Enter -> webview posts `putValue` + LEAVES the input in place.
+- Host parses + commits + re-renders on success (input is destroyed by the HTML rebuild; cell now shows committed value).
+- Host posts `errorReply` on failure; webview script ADDS `.cell-edit-error` class to the cell + sets `title="[code] message"`; the input STAYS so the user can correct + retry.
+- Escape / blur cancels: input is destroyed, cell text restored from `data-original-text`.  No commit.
+
+Localhost IPC latency is sub-millisecond so the "input visible until host confirms" model produces no user-perceptible lag.  Optimistic rendering (mutate `<td>` immediately + roll back on errorReply) is deferred to V3.x where slow-network modes (TLS + WAN) would justify the rollback complexity.
+
+**Number-only constraint:**
+
+V3.2.b commits NUMERIC cells only.  The V1 napi `appendPutValue(sheet, row, col, value: f64)` is the only binding for write today; text / boolean / error variants are READ-ONLY (they can be RECEIVED via `mergeBytes` from a peer that supports them, but the IDE can't CREATE them from JS).  `parseCellRawInput` rejects non-numeric / empty / `Infinity` / `NaN` with `[bad_argument]`.
+
+**V3.2.b limitation -- no remote auto-refresh (decision B5):**
+
+Remote peers' edits do NOT automatically appear in this panel.  The user must run `quantlab.quantbookCellGridRefresh` to see updates from another window.  V3.2.c will add a 1-second `pollRemote` loop (or a push API in V3.x) to close this gap.
+
+**Drift hazards (for V3.x maintainers):**
+
+- The nonce token shape is duplicated across `LoginWebviewPanel._nonce` and `cellGridPanel.buildPanelNonce`.  If you change the alphabet or length, change both for audit consistency.
+- The `[ql-collab-ws relay]` stdout marker (from § 4.1.y) and the cell-grid envelope's `type` field strings (`putValue` / `errorReply`) are load-bearing contract -- a string-level grep is the source of truth, no symbol coupling between webview-side text and host-side text.
+- `data-original-text` and `data-original-kind` attributes on `.cell-value` cells carry the cell's pre-edit text.  The cancel path (Escape / blur) reads them to restore the cell.  If you rename either attribute, update both sides of the script that produces + consumes them.
+
+**Out of scope for V3.2.b:** virtualization (V3.3), live remote-peer propagation (V3.2.c), text / boolean / error cell editing (waits on engine-side `appendPutValueText` / `appendPutValueBool` bindings), multi-cell selection / paste, formula bar.
+
 ---
 
 **D-1 (✅ SHIPPED 2026-05-20 — all 8 steps + 7 per-step audits + 1 megaudit):** `FormatId` is now `enum { Builtin(u32), Custom(PeerId, u32) }` in `ql-storage::format`. IDE callers MUST pattern-match the variant rather than reading `.0`. Use `FormatId::is_builtin()` / `is_custom()` / `GENERAL` accessors. For pre-D-1 bare-u32 ids (xlsx import), use `FormatId::legacy_from_u32(n)`. `Op::RegisterFormat` + `Op::SetCellFormat` carry `FormatIdWire` on the wire. `.qbook` envelope v8 carries the tagged-tuple `FormatEntryId` shape losslessly for multi-peer ids; v<8 envelopes auto-migrate. xlsx export flattens multi-peer FormatIds via dedup-by-code; non-LEGACY peer flattens reported via `XlsxExportReport.dropped_features`. xlsx import surfaces unresolved-overlay-numfmt as `report.unsupported` entries. `.qbook/oplog.bin` files wrapped in Tier D3 header (`OPLOG_MAGIC = b"QLOL"` + BE u32 `OPLOG_SCHEMA_VERSION`). `CollabSession::new` + `from_snapshot` + `OpLog::set_peer_id` assert `PeerId != 0` (release-firing). See `docs/phase5/d-1-exit-packet.md` for the full closure record.
