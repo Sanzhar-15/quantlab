@@ -165,22 +165,22 @@ pub fn version() -> String {
 /// confusing diagnostics when called from `pollRemoteWithLimit`.
 fn validate_u32_index(method: &str, name: &str, value: f64) -> Result<u32> {
     if !value.is_finite() {
-        return Err(Error::from_reason(format!(
+        return Err(bad_argument_error(format!(
             "{method}: {name} must be a finite non-negative integer, got {value}"
         )));
     }
     if value < 0.0 {
-        return Err(Error::from_reason(format!(
+        return Err(bad_argument_error(format!(
             "{method}: {name} must be a non-negative integer, got {value}"
         )));
     }
     if value.fract() != 0.0 {
-        return Err(Error::from_reason(format!(
+        return Err(bad_argument_error(format!(
             "{method}: {name} must be an integer, got {value}"
         )));
     }
     if value > u32::MAX as f64 {
-        return Err(Error::from_reason(format!(
+        return Err(bad_argument_error(format!(
             "{method}: {name} must be in [0, 4294967295] (u32::MAX), got {value}"
         )));
     }
@@ -227,22 +227,22 @@ fn validate_u32_index(method: &str, name: &str, value: f64) -> Result<u32> {
 fn peer_id_from_bigint(peer_id: &BigInt) -> Result<PeerId> {
     let (sign_bit, peer_u64, lossless) = peer_id.get_u64();
     if sign_bit {
-        return Err(Error::from_reason(
+        return Err(bad_argument_error(
             "peerId BigInt must be non-negative (PeerId is u64-domain)".to_string(),
         ));
     }
     if !lossless {
-        return Err(Error::from_reason(
+        return Err(bad_argument_error(
             "peerId BigInt does not fit in u64 (lossy conversion)".to_string(),
         ));
     }
     if peer_u64 == 0 {
-        return Err(Error::from_reason(
+        return Err(bad_argument_error(
             "peerId must be non-zero (PeerId(0) is LEGACY_PEER, reserved for pre-collab single-writer + qbook migration)".to_string(),
         ));
     }
     if peer_u64 == u64::MAX {
-        return Err(Error::from_reason(
+        return Err(bad_argument_error(
             "peerId must not be u64::MAX (Loro reserves PeerID::MAX as an internal sentinel)"
                 .to_string(),
         ));
@@ -307,6 +307,27 @@ fn transport_error_to_napi(e: TransportError) -> Error {
 /// rejection path.
 fn websocket_error_to_napi(e: WebSocketError) -> Error {
     Error::from_reason(format!("[{}] {e}", e.kind()))
+}
+
+/// **V2.7 audit closure (Opus MEDIUM-2, 2026-05-22)**: prefix napi-
+/// layer argument-validation and single-use-violation errors with
+/// `[bad_argument]` so IDE callers can branch on `info.code ===
+/// 'bad_argument'` for "the caller passed bad input" recovery.
+/// Without this prefix, these errors silently bucketed under
+/// `'unknown'` in `parseQuantbookError`, re-opening the V2.1+V2.2+V2.3
+/// MEDIUM-3 carryforward at the binding boundary.
+///
+/// Used by:
+/// - `validate_u32_index` (ToUint32-hygiene checks)
+/// - `peer_id_from_bigint` (BigInt range checks)
+/// - `BlockingTransportFixture::new` (blockMs > 0)
+/// - `LoopbackPair::{takeA, takeB}` (single-use violations)
+/// - `BlockingTransportFixture::takeTransport` (single-use)
+/// - `CollabSession::attachTransport` (consumed wrapper)
+/// - `parse_auto_flush_policy` (unknown policy string)
+/// - `auto_flush_policy_to_string` (engine drift)
+fn bad_argument_error(message: String) -> Error {
+    Error::from_reason(format!("[bad_argument] {message}"))
 }
 
 /// JS-facing wrapper for `ql_collab::CollabSession`.
@@ -408,7 +429,7 @@ impl CollabSession {
         let col_u32 = validate_u32_index("appendPutValue", "col", col)?;
         // Validate value: finite (NaN/Infinity rejected).
         if !value.is_finite() {
-            return Err(Error::from_reason(format!(
+            return Err(bad_argument_error(format!(
                 "appendPutValue value must be finite, got {value}"
             )));
         }
@@ -556,7 +577,7 @@ impl CollabSession {
             // BEFORE producing a Transport — so a consumed Transport
             // wrapper must have come from attachTransport (or a future
             // consumer added in V2.3+).
-            Error::from_reason("Transport has already been consumed by attachTransport".to_string())
+            bad_argument_error("Transport has already been consumed by attachTransport".to_string())
         })?;
         // attach_transport_boxed handles baseline-reset + replacement.
         // The Option<Box> it returns is the PRIOR transport; we drop
@@ -924,7 +945,7 @@ fn parse_auto_flush_policy(s: &str) -> Result<CoreAutoFlushPolicy> {
     match s {
         "disabled" | "Disabled" => Ok(CoreAutoFlushPolicy::Disabled),
         "onAppend" | "on-append" | "OnAppend" => Ok(CoreAutoFlushPolicy::OnAppend),
-        other => Err(Error::from_reason(format!(
+        other => Err(bad_argument_error(format!(
             "AutoFlushPolicy must be 'disabled' or 'onAppend', got {other:?}"
         ))),
     }
@@ -954,7 +975,10 @@ fn auto_flush_policy_to_string(p: CoreAutoFlushPolicy) -> Result<String> {
         CoreAutoFlushPolicy::OnAppend => Ok("onAppend".to_string()),
         // Throw on unknown variant rather than silently returning a
         // sentinel. See V2.2 audit closure note above for rationale.
-        other => Err(Error::from_reason(format!(
+        // V2.7 closure (Opus MEDIUM-2): use bad_argument prefix so
+        // IDE callers can branch on `info.code === 'bad_argument'`
+        // for engine-binding drift handling.
+        other => Err(bad_argument_error(format!(
             "autoFlushPolicy: engine reported unknown variant {other:?} — \
              this binding crate ({}) is older than the engine; upgrade \
              ql-bindings-node to add the new variant's JS string mapping",
@@ -1125,7 +1149,7 @@ impl LoopbackPair {
     #[napi(js_name = "takeA")]
     pub fn take_a(&mut self) -> Result<Transport> {
         let end = self.a.take().ok_or_else(|| {
-            Error::from_reason("LoopbackPair.takeA already called on this pair".to_string())
+            bad_argument_error("LoopbackPair.takeA already called on this pair".to_string())
         })?;
         Ok(Transport {
             inner: Some(Box::new(end)),
@@ -1136,7 +1160,7 @@ impl LoopbackPair {
     #[napi(js_name = "takeB")]
     pub fn take_b(&mut self) -> Result<Transport> {
         let end = self.b.take().ok_or_else(|| {
-            Error::from_reason("LoopbackPair.takeB already called on this pair".to_string())
+            bad_argument_error("LoopbackPair.takeB already called on this pair".to_string())
         })?;
         Ok(Transport {
             inner: Some(Box::new(end)),
@@ -1235,7 +1259,7 @@ impl BlockingTransportFixture {
     pub fn new(block_ms: f64) -> Result<Self> {
         let block_ms_u32 = validate_u32_index("BlockingTransportFixture", "blockMs", block_ms)?;
         if block_ms_u32 == 0 {
-            return Err(Error::from_reason(
+            return Err(bad_argument_error(
                 "BlockingTransportFixture: blockMs must be > 0 (strictly positive). \
                  Zero would allow indefinite blocking from JS — V2.5 audit closure \
                  (Codex MEDIUM-1) rejects this at the napi boundary."
@@ -1269,7 +1293,7 @@ impl BlockingTransportFixture {
     #[napi(js_name = "takeTransport")]
     pub fn take_transport(&mut self) -> Result<Transport> {
         let t = self.inner.take().ok_or_else(|| {
-            Error::from_reason(
+            bad_argument_error(
                 "BlockingTransportFixture.takeTransport already called on this fixture".to_string(),
             )
         })?;
