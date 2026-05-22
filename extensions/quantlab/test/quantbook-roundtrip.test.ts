@@ -966,3 +966,187 @@ suite('quantbook V2.1 -- Transport binding (LoopbackPair + CollabSession)', func
 			'B has the op even though A detached (in-flight bytes delivered)');
 	});
 });
+
+// =====================================================================
+// Phase 5.7 V2.3 (2026-05-22) -- async Transport surface
+// (WebSocketTransport.connect + flushPendingToTransport)
+// =====================================================================
+
+import { WebSocketServer, WebSocket as WsClient } from 'ws';
+import { AddressInfo } from 'net';
+
+interface SpawnedWsServer {
+	url: string;
+	close: () => Promise<void>;
+}
+
+/**
+ * Spawn an in-process WebSocket echo-fanout server on a random port.
+ *
+ * **V2.3 design note**: the engine's tokio-tungstenite client speaks
+ * the standard WebSocket binary-frame protocol. Node's `ws` package
+ * on the same protocol is sufficient for round-trip tests. Each
+ * inbound binary message is fanned out to ALL other connected
+ * clients — that's the minimum semantics for "two peers connected
+ * to a localhost relay can sync via the engine's WebSocketTransport".
+ */
+async function spawnWsRelay(): Promise<SpawnedWsServer> {
+	return new Promise((resolve, reject) => {
+		const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+		const sockets: WsClient[] = [];
+		wss.on('connection', (ws: WsClient) => {
+			sockets.push(ws);
+			ws.on('message', (data: Buffer, isBinary: boolean) => {
+				if (!isBinary) {
+					return; // V2.3 only handles binary frames
+				}
+				for (const peer of sockets) {
+					if (peer !== ws && peer.readyState === peer.OPEN) {
+						peer.send(data, { binary: true });
+					}
+				}
+			});
+			ws.on('close', () => {
+				const i = sockets.indexOf(ws);
+				if (i >= 0) {
+					sockets.splice(i, 1);
+				}
+			});
+		});
+		wss.on('error', reject);
+		wss.on('listening', () => {
+			const addr = wss.address() as AddressInfo;
+			resolve({
+				url: `ws://127.0.0.1:${addr.port}`,
+				close: () => new Promise<void>((res) => {
+					for (const s of sockets) {
+						try { s.terminate(); } catch { /* ignore */ }
+					}
+					wss.close(() => res());
+				}),
+			});
+		});
+	});
+}
+
+suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPending)', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) {
+			this.skip();
+		}
+		_resetQuantbookEngineCacheForTests();
+		this.timeout(60000);
+		loadQuantbookEngine();
+	});
+
+	test('Transport.websocketConnect rejects on invalid URL', async () => {
+		const engine = loadQuantbookEngine();
+		await assert.rejects(
+			engine.Transport.websocketConnect('not-a-ws-url'),
+			/invalid WebSocket URL|WebSocket connection failed|WebSocket handshake failed/,
+			'invalid URL rejects with a WebSocket-flavored error',
+		);
+	});
+
+	test('Transport.websocketConnect rejects on connection refused', async function () {
+		this.timeout(10000);
+		const engine = loadQuantbookEngine();
+		await assert.rejects(
+			// Port 1 is privileged + almost certainly not listening.
+			engine.Transport.websocketConnect('ws://127.0.0.1:1'),
+			/WebSocket connection failed|connection refused|WebSocket handshake failed/i,
+		);
+	});
+
+	test('Transport.websocketConnect succeeds against a localhost relay + returns attachable Transport', async function () {
+		this.timeout(15000);
+		const relay = await spawnWsRelay();
+		try {
+			const engine = loadQuantbookEngine();
+			const t = await engine.Transport.websocketConnect(relay.url);
+			assert.ok(t.isAttachable(),
+				'returned Transport is attachable (single-use, fresh)');
+		} finally {
+			await relay.close();
+		}
+	});
+
+	test('two-peer round-trip via WebSocketTransport relay (V2.3 end-to-end async sync)', async function () {
+		this.timeout(20000);
+		const relay = await spawnWsRelay();
+		try {
+			const engine = loadQuantbookEngine();
+			const tA = await engine.Transport.websocketConnect(relay.url);
+			const tB = await engine.Transport.websocketConnect(relay.url);
+
+			const sessionA = createSession(1n);
+			const sessionB = createSession(2n);
+			sessionA.attachTransport(tA);
+			sessionB.attachTransport(tB);
+
+			sessionA.appendPutValue(0, 0, 0, 42);
+			assert.strictEqual(sessionA.flushDeltaToTransport(), true,
+				'A delta flush queues bytes to its WebSocket writer');
+			// V2.3 closure verification: wait for the writer to actually
+			// send so the relay has the bytes to fan out.
+			await sessionA.flushPendingToTransport();
+
+			// Allow the relay to fan out + B's reader to enqueue bytes.
+			// 50ms is generous for localhost.
+			await new Promise<void>((res) => setTimeout(res, 50));
+
+			const blobsDrained = sessionB.pollRemote();
+			assert.ok(blobsDrained >= 1, `B drained at least 1 blob, got ${blobsDrained}`);
+			assert.strictEqual(sessionB.opCount(), 1,
+				'B has A op after async round-trip');
+
+			sessionA.detachTransport();
+			sessionB.detachTransport();
+		} finally {
+			await relay.close();
+		}
+	});
+
+	test('flushPendingToTransport on no-transport session resolves without error', async () => {
+		// V2.3 contract: no transport -> Ok(()) (matches engine's no-op).
+		// NOT a rejected promise.
+		const session = createSession(1n);
+		await session.flushPendingToTransport();
+	});
+
+	test('flushPendingToTransport on attached-no-pending session resolves quickly', async function () {
+		this.timeout(5000);
+		const session = createSession(1n);
+		const [tA, _tB] = loopbackTransportPair();
+		session.attachTransport(tA);
+		// No ops appended. The first flushDelta would still send a baseline
+		// blob, but flushPending without a prior flush should resolve
+		// quickly (writer has nothing queued).
+		const start = Date.now();
+		await session.flushPendingToTransport();
+		const elapsed = Date.now() - start;
+		assert.ok(elapsed < 1000,
+			`flushPending on idle session resolved in ${elapsed}ms (< 1000)`);
+	});
+
+	test('flushPending after a flushDelta drains the local writer queue', async function () {
+		this.timeout(15000);
+		const relay = await spawnWsRelay();
+		try {
+			const engine = loadQuantbookEngine();
+			const tA = await engine.Transport.websocketConnect(relay.url);
+			const session = createSession(1n);
+			session.attachTransport(tA);
+
+			session.appendPutValue(0, 0, 0, 1);
+			assert.strictEqual(session.flushDeltaToTransport(), true);
+			// V2 V4 V1 Tier K1: after flushPending, the writer task has
+			// completed its send for every queued blob.
+			await session.flushPendingToTransport();
+			session.detachTransport();
+		} finally {
+			await relay.close();
+		}
+	});
+});

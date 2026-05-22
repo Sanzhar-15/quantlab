@@ -228,6 +228,30 @@ export interface CollabSessionInstance {
 	 * @throws Error if the engine variant is unknown to this binding.
 	 */
 	autoFlushPolicy(): AutoFlushPolicy;
+
+	// =====================================================================
+	// Phase 5.7 V2.3 (2026-05-22) -- async Transport surface
+	// =====================================================================
+
+	/**
+	 * Async flush-pending. Waits for the attached transport's writer
+	 * task to drain (level-1 local ack per V2 V4 V1 Tier K1).
+	 *
+	 * Resolves when:
+	 * - writer has completed `send` for every queued blob, OR
+	 * - transport has been detached / dropped / errored.
+	 *
+	 * **Why async**: the engine's `flush_pending_to_transport` is
+	 * sync (Condvar wait). Calling synchronously from V8 would block
+	 * the JS event loop until the wait completes. napi-rs's `async fn`
+	 * bridge runs the body on a tokio worker; V8 stays unblocked.
+	 *
+	 * **No-op on no transport**: returns resolved Promise (NOT a
+	 * rejection).
+	 *
+	 * @throws Error if the transport reports an error during the wait.
+	 */
+	flushPendingToTransport(): Promise<void>;
 }
 
 /**
@@ -335,8 +359,27 @@ export interface QuantbookNativeModule {
 	 * as a parameter type to `CollabSession.attachTransport`.
 	 * The constructor is NOT directly exposed -- obtain instances
 	 * via factories like `LoopbackPair`.
+	 *
+	 * **V2.3 (2026-05-22)**: added `websocketConnect(url)` static
+	 * async factory that resolves with a Transport wrapping a
+	 * `WebSocketTransport`. See `flushPendingToTransport` for the
+	 * matching async drain helper.
 	 */
-	readonly Transport: { prototype: TransportInstance };
+	readonly Transport: {
+		prototype: TransportInstance;
+		/**
+		 * Async factory: connect to a WebSocket peer and return a
+		 * Transport wrapping the live connection.
+		 *
+		 * @param url `ws://host:port` URL. No TLS in V2.3.
+		 * @returns Promise resolving with the Transport (single-use;
+		 *          pass to `attachTransport` once).
+		 * @throws  Error with WebSocket failure category in the
+		 *          message (`WebSocket connection failed`,
+		 *          `WebSocket handshake failed`, `invalid WebSocket URL`).
+		 */
+		websocketConnect(url: string): Promise<TransportInstance>;
+	};
 
 	/**
 	 * V2.1: LoopbackPair class -- factory for paired in-process
