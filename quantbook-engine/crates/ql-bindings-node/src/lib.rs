@@ -97,6 +97,8 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use ql_collab::CollabSession as CoreCollabSession;
+use ql_collab::LoopbackTransport;
+use ql_collab::Transport as CoreTransport;
 use ql_oplog::CellWireValue;
 use ql_oplog::Op;
 use ql_types::PeerId;
@@ -398,7 +400,251 @@ impl CollabSession {
     pub fn peer_id(&self) -> BigInt {
         BigInt::from(self.inner.peer_id().as_u64())
     }
+
+    // ==========================================================
+    // Phase 5.7 V2.1 (2026-05-22) — Transport surface
+    // ==========================================================
+
+    /// Attach a Transport to this session. Moves the inner boxed trait
+    /// object out of the `transport` wrapper (consuming it from JS's
+    /// perspective — subsequent calls fail).
+    ///
+    /// Mirrors `CollabSession::attach_transport_boxed` on the Rust side
+    /// which delegates to the V2 V3 step 1 baseline-reset path: the
+    /// next flush sends from empty VV (i.e., ALL local ops including
+    /// any appended while no transport was attached — Loro's CRDT op
+    /// log IS the implicit offline queue).
+    ///
+    /// V2.1 does NOT return the prior transport (if any) to JS. The
+    /// Rust side drops the returned `Box` immediately. Rationale: the
+    /// IDE has no use for the opaque prior transport, and exposing it
+    /// would require either creating another `Transport` wrapper
+    /// (defeating "this transport is now invalid" semantics) or a
+    /// special-cased "detached prior" type. V2.3+ may revisit if a use
+    /// case emerges.
+    ///
+    /// **Failure modes**:
+    /// - `transport` has already been used (its `inner` is `None`) →
+    ///   JS Error "Transport has already been consumed".
+    #[napi(js_name = "attachTransport")]
+    pub fn attach_transport(&mut self, transport: &mut Transport) -> Result<()> {
+        let boxed = transport.take_inner().ok_or_else(|| {
+            Error::from_reason(
+                "Transport has already been consumed (passed to attachTransport, or obtained from a spent LoopbackPair)".to_string(),
+            )
+        })?;
+        // attach_transport_boxed handles baseline-reset + replacement.
+        // The Option<Box> it returns is the PRIOR transport; we drop
+        // it here intentionally (see method docstring).
+        let _prior = self.inner.attach_transport_boxed(boxed);
+        Ok(())
+    }
+
+    /// Detach the currently-attached transport. Returns `true` if one
+    /// was attached (now released), `false` if there was nothing to
+    /// detach.
+    ///
+    /// **Background-task lifecycle (V2 V3 step 5 closure)**: detaching
+    /// a `WebSocketTransport` (V2.3+) drops its reader + writer tasks.
+    /// V2.1's LoopbackTransport has no background tasks; detach is
+    /// pure memory release.
+    ///
+    /// The returned `Box<dyn Transport>` is dropped Rust-side. JS does
+    /// NOT receive the prior transport — same rationale as
+    /// `attachTransport`.
+    #[napi(js_name = "detachTransport")]
+    pub fn detach_transport(&mut self) -> bool {
+        self.inner.detach_transport().is_some()
+    }
+
+    /// `true` iff a transport is currently attached.
+    #[napi(js_name = "hasTransport")]
+    pub fn has_transport(&self) -> bool {
+        self.inner.has_transport()
+    }
+
+    /// Full-snapshot flush to the attached transport. Sends the entire
+    /// op log as bytes. Returns `true` if bytes were actually sent.
+    ///
+    /// **Use `flushDeltaToTransport` instead in production** —
+    /// full-snapshot flushes get expensive as the op log grows. V2.1
+    /// exposes this method primarily for tests and "initial sync"
+    /// scenarios; V2.2 ships the delta path.
+    ///
+    /// **Failure modes**:
+    /// - No transport attached → returns `Ok(false)` (NOT an error).
+    /// - Transport's `send` returns `Err(TransportError::*)` → JS Error.
+    #[napi(js_name = "flushToTransport")]
+    pub fn flush_to_transport(&mut self) -> Result<bool> {
+        self.inner
+            .flush_to_transport()
+            .map_err(|e| Error::from_reason(format!("{e}")))
+    }
+
+    /// Drain inbound bytes from the attached transport (single-pass).
+    /// Returns the number of ops merged (clamped to `u32::MAX`).
+    ///
+    /// V2.1 ships the un-limited variant. `pollRemoteWithLimit` lands
+    /// in V2.2 (next cycle).
+    ///
+    /// **Auto-flush integration (V2 V3 step 2)**: when AutoFlushPolicy
+    /// is `OnAppend` and `merged > 0`, the underlying call also fires
+    /// one delta flush back through the transport (idempotency guard
+    /// prevents echo loops). V2.1 doesn't bind AutoFlushPolicy yet —
+    /// V2.2 does.
+    ///
+    /// **Failure modes**:
+    /// - No transport attached → returns `Ok(0)` (NOT an error).
+    /// - Transport's `try_recv` returns `Err` → JS Error.
+    /// - Merging the bytes returns Err → JS Error.
+    #[napi(js_name = "pollRemote")]
+    pub fn poll_remote(&mut self) -> Result<u32> {
+        let merged = self
+            .inner
+            .poll_remote()
+            .map_err(|e| Error::from_reason(format!("{e}")))?;
+        Ok(u32::try_from(merged).unwrap_or(u32::MAX))
+    }
 }
+
+// =============================================================
+// Phase 5.7 V2.1 (2026-05-22) — Transport binding
+// =============================================================
+
+/// JS-facing opaque wrapper for a `Box<dyn ql_collab::Transport + Send>`.
+///
+/// **Design rationale (Phase 5.7 V1 megaudit Opus-B HIGH-2 closure,
+/// 2026-05-22)**: napi-rs cannot bind generic functions. The engine's
+/// `CollabSession::attach_transport<T>` accepts any `T: Transport + Send +
+/// 'static`. To make this reachable from JS we:
+///   1. Added `CollabSession::attach_transport_boxed(Box<dyn Transport + Send>)`
+///      on the Rust side as a sibling entry point (V2.1 cycle).
+///   2. Expose this opaque `Transport` class wrapping the boxed trait
+///      object. JS code obtains instances from static factories
+///      (`Transport.loopbackPair()` here; `Transport.websocketConnect(url)`
+///      in V2.3) and passes them to `CollabSession.attachTransport(t)`.
+///
+/// **Single-use semantics**: an instance owns its boxed trait object.
+/// `CollabSession.attachTransport` MOVES the box out of this wrapper,
+/// leaving it consumed. Subsequent attach calls with the same wrapper
+/// return a JS Error ("Transport has already been consumed or detached").
+/// This mirrors Rust ownership semantics within the constraint that JS
+/// doesn't have a move primitive.
+///
+/// **Why opaque (no introspection methods)**: the inner `Box<dyn Transport>`
+/// is a fat pointer to one of several impls (Loopback, WebSocket, ...).
+/// V2.1 doesn't expose impl-specific accessors; future versions can add
+/// `kind() -> string` if a use case emerges.
+#[napi]
+pub struct Transport {
+    // `Option` so we can move the inner Box out at attach time without
+    // dropping the wrapper. napi-rs's class instance has `&mut self`
+    // discipline (per V1 module docs Send+!Sync rationale) — we cannot
+    // consume `self` from a `#[napi]` method, only take from an Option.
+    inner: Option<Box<dyn CoreTransport + Send>>,
+}
+
+#[napi]
+impl Transport {
+    /// `true` while this wrapper still owns its inner transport (not yet
+    /// passed to `attachTransport`). Useful for IDE code that wants to
+    /// branch on whether a Transport instance is still usable without
+    /// catching an exception.
+    #[napi(js_name = "isAttachable")]
+    pub fn is_attachable(&self) -> bool {
+        self.inner.is_some()
+    }
+}
+
+impl Transport {
+    /// **Rust-only** (no `#[napi]`): move the inner Box out for attach.
+    /// Called by `CollabSession::attach_transport` (the napi method, not
+    /// the Rust generic). After this returns `Some`, the wrapper is
+    /// consumed; subsequent `is_attachable` returns `false` and the
+    /// inner box has been handed off.
+    pub(crate) fn take_inner(&mut self) -> Option<Box<dyn CoreTransport + Send>> {
+        self.inner.take()
+    }
+}
+
+/// Two-ended in-process Transport pair (LoopbackTransport).
+///
+/// JS callers use this as a stepping-stone to obtain the two `Transport`
+/// instances that share a Loopback queue:
+///
+/// ```ignore
+/// const pair = new LoopbackPair();
+/// const transportA = pair.takeA();
+/// const transportB = pair.takeB();
+/// sessionA.attachTransport(transportA);
+/// sessionB.attachTransport(transportB);
+/// ```
+///
+/// **Why this intermediate class** (Phase 5.7 V2.1 design note,
+/// 2026-05-22): napi-rs's `#[napi(factory, ...)]` can only return a
+/// single `Self`-typed class instance. Returning a 2-tuple or
+/// `Vec<Transport>` fails the trait bound `ObjectFinalize` napi-rs
+/// imposes on factory returns. The cleanest pattern that keeps each
+/// `Transport` end as a separately-attachable class is to expose the
+/// pair-creation step as its own short-lived class with two takers.
+///
+/// **Single-use takers**: each of `takeA` / `takeB` can be called once
+/// per `LoopbackPair` instance. Calling a second time on the same end
+/// returns a JS Error. (Calling a non-yet-taken end after the other has
+/// been taken still works — the two ends are independent.)
+#[napi]
+pub struct LoopbackPair {
+    // Both ends live here until taken. The pair is constructed eagerly
+    // in `new()` so the shared queue exists before either end is
+    // distributed.
+    a: Option<LoopbackTransport>,
+    b: Option<LoopbackTransport>,
+}
+
+impl Default for LoopbackPair {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[napi]
+impl LoopbackPair {
+    /// Construct a fresh Loopback pair. Both ends start un-taken.
+    #[napi(constructor)]
+    pub fn new() -> Self {
+        let (a, b) = LoopbackTransport::pair();
+        Self {
+            a: Some(a),
+            b: Some(b),
+        }
+    }
+
+    /// Take ownership of end A. Errors if already taken.
+    #[napi(js_name = "takeA")]
+    pub fn take_a(&mut self) -> Result<Transport> {
+        let end = self.a.take().ok_or_else(|| {
+            Error::from_reason("LoopbackPair.takeA already called on this pair".to_string())
+        })?;
+        Ok(Transport {
+            inner: Some(Box::new(end)),
+        })
+    }
+
+    /// Take ownership of end B. Errors if already taken.
+    #[napi(js_name = "takeB")]
+    pub fn take_b(&mut self) -> Result<Transport> {
+        let end = self.b.take().ok_or_else(|| {
+            Error::from_reason("LoopbackPair.takeB already called on this pair".to_string())
+        })?;
+        Ok(Transport {
+            inner: Some(Box::new(end)),
+        })
+    }
+}
+
+// =============================================================
+// Send/Sync compile assertions (Rule 4 application)
+// =============================================================
 
 // **Phase 5.7 V1 megaudit closure (Opus-A MEDIUM-1, 2026-05-22):**
 // Rule 4 application — the module docstring claims this `CollabSession`
@@ -411,6 +657,16 @@ impl CollabSession {
 const _ASSERT_BINDING_COLLAB_SESSION_SEND: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<CollabSession>();
+};
+
+// **Phase 5.7 V2.1 (2026-05-22) Rule 4 application for `Transport`**:
+// The wrapper holds `Option<Box<dyn CoreTransport + Send>>`. The trait
+// object itself is `Send` (we declare it `dyn CoreTransport + Send`), and
+// `Box<_>` of a `Send` trait object is `Send`, and `Option<T>` is `Send`
+// when `T: Send`. So the composition is `Send`. Pin it.
+const _ASSERT_BINDING_TRANSPORT_SEND: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<Transport>();
 };
 
 // `!Sync` follows by composition: `CollabSession { inner: CoreCollabSession }`,
@@ -467,6 +723,56 @@ mod tests {
         let mut session_b = CoreCollabSession::new(pid_b).expect("session B");
         let merged = session_b.merge_bytes(&bytes).expect("merge");
         assert!(merged >= 1, "merged at least 1 op");
+        assert_eq!(session_b.op_count(), session_a.op_count());
+    }
+
+    // ==========================================================
+    // Phase 5.7 V2.1 (2026-05-22) — Transport composition smoke
+    //
+    // **Cannot test napi-wrapping types here.** `cargo test` doesn't
+    // link napi symbols (they're loaded dynamically when Node opens
+    // the .node file), so any code path that touches `napi::Error`
+    // — including `Result<T, napi::Error>` from `LoopbackPair::take_a`
+    // — fails to link with `_napi_delete_reference` undefined.
+    //
+    // V2.1 napi-wrapper composition (LoopbackPair → takeA → Transport
+    // → CollabSession.attachTransport → flushToTransport → pollRemote)
+    // is tested via mocha at
+    // `quantlab/extensions/quantlab/test/quantbook-roundtrip.test.ts`
+    // — same pattern V1 uses (mocha owns the Node host; Rust unit
+    // tests handle core-type plumbing only).
+    //
+    // This smoke validates that the engine-side `attach_transport_boxed`
+    // entry point composes with `LoopbackTransport::pair()` directly
+    // (no napi). Catches engine-side regressions independent of the
+    // napi layer.
+    // ==========================================================
+
+    #[test]
+    fn engine_attach_transport_boxed_round_trip() {
+        use ql_collab::LoopbackTransport;
+        let (a_end, b_end) = LoopbackTransport::pair();
+
+        let mut session_a = CoreCollabSession::new(PeerId::new(1)).expect("session A");
+        let mut session_b = CoreCollabSession::new(PeerId::new(2)).expect("session B");
+
+        // The boxed entry point is what the napi layer calls.
+        let prior_a = session_a.attach_transport_boxed(Box::new(a_end));
+        let prior_b = session_b.attach_transport_boxed(Box::new(b_end));
+        assert!(prior_a.is_none() && prior_b.is_none());
+
+        let op = Op::PutValue {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            value: CellWireValue::Number(42.0),
+        };
+        session_a.append_op(op).expect("append");
+        let sent = session_a.flush_to_transport().expect("flush sends ok");
+        assert!(sent, "flush_to_transport returns true when bytes sent");
+
+        let merged = session_b.poll_remote().expect("poll ok");
+        assert!(merged >= 1, "B merged at least 1 op, got {merged}");
         assert_eq!(session_b.op_count(), session_a.op_count());
     }
 }

@@ -722,8 +722,28 @@ impl CollabSession {
         // send from the empty VV (= all ops). If we kept the stale
         // VV from a prior transport, the new peer would miss ops
         // 0..stale_vv and end up with a corrupt view.
+        self.attach_transport_boxed(Box::new(transport))
+    }
+
+    /// **Phase 5.7 V2.1 (2026-05-22):** Box-taking sibling of
+    /// [`attach_transport`]. Same semantics, takes a pre-boxed
+    /// trait object instead of a generic.
+    ///
+    /// Exists because napi-rs cannot bind generic functions (per
+    /// Phase 5.7 V1 megaudit Opus-B HIGH-2). The IDE binding's
+    /// `Transport` opaque class extracts its inner
+    /// `Box<dyn Transport + Send>` and passes it here. The generic
+    /// `attach_transport<T>` stays as the ergonomic entry point for
+    /// direct Rust callers and now delegates to this method to keep
+    /// the baseline-reset + replacement semantics in one place.
+    pub fn attach_transport_boxed(
+        &mut self,
+        transport: Box<dyn Transport + Send>,
+    ) -> Option<Box<dyn Transport + Send>> {
+        // Mirror attach_transport<T>'s contract: reset the VV
+        // baseline so the next flush sends from empty.
         self.last_flushed_vv = None;
-        self.transport.replace(Box::new(transport))
+        self.transport.replace(transport)
     }
 
     /// **Phase 5.5 V2 V1 (2026-05-19):** detach the current
@@ -2522,6 +2542,59 @@ mod tests {
         s.attach_transport(NoopTransport::new());
         let prior = s.attach_transport(NoopTransport::new());
         assert!(prior.is_some(), "second attach must return the first");
+    }
+
+    #[test]
+    fn attach_transport_boxed_equivalent_to_generic() {
+        // Phase 5.7 V2.1 (2026-05-22): pin that the Box-taking sibling
+        // matches the generic version's semantics. The IDE binding's
+        // napi Transport class extracts its inner Box and calls
+        // attach_transport_boxed; this test pins the contract those
+        // two entry points share.
+        use crate::transport::NoopTransport;
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        assert!(!s.has_transport());
+
+        // First attach via boxed entry point.
+        let prior = s.attach_transport_boxed(Box::new(NoopTransport::new()));
+        assert!(prior.is_none(), "first attach returns no prior");
+        assert!(s.has_transport(), "transport now attached");
+
+        // Replace via boxed entry point.
+        let prior = s.attach_transport_boxed(Box::new(NoopTransport::new()));
+        assert!(prior.is_some(), "replace returns the prior box");
+        assert!(s.has_transport());
+
+        // Replace via generic entry point — must also return prior.
+        let prior = s.attach_transport(NoopTransport::new());
+        assert!(
+            prior.is_some(),
+            "generic attach over boxed must also return prior"
+        );
+        assert!(s.has_transport());
+    }
+
+    #[test]
+    fn attach_transport_boxed_resets_vv_baseline() {
+        // Phase 5.7 V2.1 (2026-05-22): the boxed sibling must inherit
+        // the V2 V3 step 1 contract — every attach (boxed or generic)
+        // resets last_flushed_vv so the next flush sends from empty.
+        use crate::transport::{LoopbackTransport, NoopTransport};
+        let (a, _b) = LoopbackTransport::pair();
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.attach_transport(a);
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        let _ = s.flush_delta_to_transport().unwrap();
+        assert!(!s.has_pending_flush(), "after flush, no pending");
+
+        // Reattach via boxed entry point. Baseline must reset →
+        // has_pending_flush flips back to true (because the new
+        // peer hasn't seen any ops).
+        let _ = s.attach_transport_boxed(Box::new(NoopTransport::new()));
+        assert!(
+            s.has_pending_flush(),
+            "boxed reattach resets VV baseline; flush is pending again"
+        );
     }
 
     #[test]
