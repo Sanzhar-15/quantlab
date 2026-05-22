@@ -231,27 +231,15 @@ export interface CollabSessionInstance {
 
 	// =====================================================================
 	// Phase 5.7 V2.3 (2026-05-22) -- async Transport surface
+	//
+	// **V2.3 audit closure (Codex FAIL + Opus PASS-WITH-FINDINGS)**:
+	// `flushPendingToTransport` was REMOVED from V2.3 ship after
+	// audit found two convergent HIGH hazards (Rust UB via &mut self
+	// async re-entry + tokio runtime starvation). V2.4 will reintroduce
+	// after the engine refactor that makes the binding sound. See
+	// engine crate's lib.rs comment block under V2.3 closure for the
+	// full rationale.
 	// =====================================================================
-
-	/**
-	 * Async flush-pending. Waits for the attached transport's writer
-	 * task to drain (level-1 local ack per V2 V4 V1 Tier K1).
-	 *
-	 * Resolves when:
-	 * - writer has completed `send` for every queued blob, OR
-	 * - transport has been detached / dropped / errored.
-	 *
-	 * **Why async**: the engine's `flush_pending_to_transport` is
-	 * sync (Condvar wait). Calling synchronously from V8 would block
-	 * the JS event loop until the wait completes. napi-rs's `async fn`
-	 * bridge runs the body on a tokio worker; V8 stays unblocked.
-	 *
-	 * **No-op on no transport**: returns resolved Promise (NOT a
-	 * rejection).
-	 *
-	 * @throws Error if the transport reports an error during the wait.
-	 */
-	flushPendingToTransport(): Promise<void>;
 }
 
 /**

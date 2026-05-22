@@ -1019,8 +1019,19 @@ async function spawnWsRelay(): Promise<SpawnedWsServer> {
 			resolve({
 				url: `ws://127.0.0.1:${addr.port}`,
 				close: () => new Promise<void>((res) => {
+					// **V2.3 audit closure (Opus MEDIUM-4, 2026-05-22)**:
+					// the prior version wrapped `s.terminate()` in
+					// `try { ... } catch { /* ignore */ }` which
+					// silently swallowed errors (CLAUDE.md no-fallback
+					// violation, in test code too). `ws.terminate()` is
+					// documented to never throw -- it forcibly closes
+					// the socket without sending a Close frame. The
+					// only way it could "error" is if the socket is
+					// already destroyed, which is fine (idempotent).
+					// Removing the try/catch surfaces any real future
+					// error class loudly.
 					for (const s of sockets) {
-						try { s.terminate(); } catch { /* ignore */ }
+						s.terminate();
 					}
 					wss.close(() => res());
 				}),
@@ -1040,22 +1051,33 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 		loadQuantbookEngine();
 	});
 
-	test('Transport.websocketConnect rejects on invalid URL', async () => {
+	test('Transport.websocketConnect rejects on invalid URL with InvalidUrl category', async () => {
+		// **V2.3 audit closure (Codex LOW-1, 2026-05-22)**: prior version
+		// of this test accepted any of 3 categories. tokio-tungstenite's
+		// URL parser categorizes `not-a-ws-url` as InvalidUrl (the
+		// classifier hits the `tokio_tungstenite::tungstenite::Error::Url(_)`
+		// arm in `ql-collab-ws/src/lib.rs::WebSocketTransport::connect`).
+		// Pin the exact category prefix.
 		const engine = loadQuantbookEngine();
 		await assert.rejects(
 			engine.Transport.websocketConnect('not-a-ws-url'),
-			/invalid WebSocket URL|WebSocket connection failed|WebSocket handshake failed/,
-			'invalid URL rejects with a WebSocket-flavored error',
+			/invalid WebSocket URL/,
+			'rejection must carry InvalidUrl prefix (engine WebSocketError::InvalidUrl)',
 		);
 	});
 
-	test('Transport.websocketConnect rejects on connection refused', async function () {
+	test('Transport.websocketConnect rejects on connection refused with ConnectFailed category', async function () {
+		// **V2.3 audit closure (Codex LOW-1, 2026-05-22)**: the prior
+		// version accepted ConnectFailed OR HandshakeFailed; tokio-
+		// tungstenite categorizes TCP refusals as the `Error::Io(_)`
+		// arm → ConnectFailed at the binding. Pin it.
 		this.timeout(10000);
 		const engine = loadQuantbookEngine();
 		await assert.rejects(
 			// Port 1 is privileged + almost certainly not listening.
 			engine.Transport.websocketConnect('ws://127.0.0.1:1'),
-			/WebSocket connection failed|connection refused|WebSocket handshake failed/i,
+			/WebSocket connection failed/,
+			'TCP refusal must surface as ConnectFailed (engine WebSocketError::ConnectFailed)',
 		);
 	});
 
@@ -1088,15 +1110,23 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 			sessionA.appendPutValue(0, 0, 0, 42);
 			assert.strictEqual(sessionA.flushDeltaToTransport(), true,
 				'A delta flush queues bytes to its WebSocket writer');
-			// V2.3 closure verification: wait for the writer to actually
-			// send so the relay has the bytes to fan out.
-			await sessionA.flushPendingToTransport();
 
-			// Allow the relay to fan out + B's reader to enqueue bytes.
-			// 50ms is generous for localhost.
-			await new Promise<void>((res) => setTimeout(res, 50));
-
-			const blobsDrained = sessionB.pollRemote();
+			// **V2.3 audit closure (Codex FAIL + Opus, 2026-05-22)**:
+			// removed `flushPendingToTransport` (engine pair + IDE).
+			// Without explicit drain-ack, use a bounded poll loop here
+			// to wait for B's reader to enqueue the blob. ~10ms is
+			// typical on localhost; the loop allows up to 2 seconds
+			// before failing (covers slow CI). Replaces the prior
+			// brittle 50ms setTimeout (Codex V2.3 LOW-3 + Opus M3).
+			const deadline = Date.now() + 2000;
+			let blobsDrained = 0;
+			while (Date.now() < deadline) {
+				blobsDrained = sessionB.pollRemote();
+				if (blobsDrained > 0) {
+					break;
+				}
+				await new Promise<void>((res) => setTimeout(res, 10));
+			}
 			assert.ok(blobsDrained >= 1, `B drained at least 1 blob, got ${blobsDrained}`);
 			assert.strictEqual(sessionB.opCount(), 1,
 				'B has A op after async round-trip');
@@ -1108,45 +1138,42 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 		}
 	});
 
-	test('flushPendingToTransport on no-transport session resolves without error', async () => {
-		// V2.3 contract: no transport -> Ok(()) (matches engine's no-op).
-		// NOT a rejected promise.
-		const session = createSession(1n);
-		await session.flushPendingToTransport();
-	});
-
-	test('flushPendingToTransport on attached-no-pending session resolves quickly', async function () {
-		this.timeout(5000);
-		const session = createSession(1n);
-		const [tA, _tB] = loopbackTransportPair();
-		session.attachTransport(tA);
-		// No ops appended. The first flushDelta would still send a baseline
-		// blob, but flushPending without a prior flush should resolve
-		// quickly (writer has nothing queued).
-		const start = Date.now();
-		await session.flushPendingToTransport();
-		const elapsed = Date.now() - start;
-		assert.ok(elapsed < 1000,
-			`flushPending on idle session resolved in ${elapsed}ms (< 1000)`);
-	});
-
-	test('flushPending after a flushDelta drains the local writer queue', async function () {
-		this.timeout(15000);
+	test('websocketConnect-returned Transport is single-use (consumed by attachTransport)', async function () {
+		// **V2.3 audit closure (Codex LOW-2, 2026-05-22)**: V2.1 pinned
+		// single-use semantics for LoopbackPair Transports; this test
+		// pins the same for WebSocket-connected Transports (the
+		// underlying napi class is the same `Transport { inner:
+		// Option<Box<dyn Transport>> }`).
+		this.timeout(10000);
 		const relay = await spawnWsRelay();
 		try {
 			const engine = loadQuantbookEngine();
-			const tA = await engine.Transport.websocketConnect(relay.url);
-			const session = createSession(1n);
-			session.attachTransport(tA);
-
-			session.appendPutValue(0, 0, 0, 1);
-			assert.strictEqual(session.flushDeltaToTransport(), true);
-			// V2 V4 V1 Tier K1: after flushPending, the writer task has
-			// completed its send for every queued blob.
-			await session.flushPendingToTransport();
-			session.detachTransport();
+			const t = await engine.Transport.websocketConnect(relay.url);
+			const sessionA = createSession(1n);
+			const sessionB = createSession(2n);
+			assert.ok(t.isAttachable());
+			sessionA.attachTransport(t);
+			assert.ok(!t.isAttachable(),
+				'consumed by attachTransport (single-use)');
+			assert.throws(
+				() => sessionB.attachTransport(t),
+				/already been consumed/,
+				'second session attach rejects consumed wrapper',
+			);
+			sessionA.detachTransport();
 		} finally {
 			await relay.close();
 		}
 	});
+
+	// **V2.3 audit closure**: `flushPendingToTransport` tests REMOVED.
+	// The binding was unsound (Codex/Opus both flagged Rust UB + tokio
+	// starvation HIGHs). The 3 prior tests
+	// (`flushPendingToTransport on no-transport session resolves
+	// without error`, `... on attached-no-pending session resolves
+	// quickly`, `flushPending after a flushDelta drains the local
+	// writer queue`) tested a binding that no longer exists. They
+	// will be reintroduced in V2.4 alongside a sound binding (engine
+	// refactor to Arc<Mutex> + spawn_blocking, or engine restructure
+	// to async Notify).
 });

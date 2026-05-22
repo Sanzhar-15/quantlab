@@ -264,6 +264,17 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 			}
 		}
 	}
+	if (typeof (loaded as { Transport?: unknown }).Transport === 'function') {
+		// V2.3 (2026-05-22): validate `Transport.websocketConnect`
+		// static async factory. A V2.2-shaped binary lacks this export
+		// and would fail late with `Transport.websocketConnect is not a
+		// function` when V2.3 helpers call it. Closure for Codex MEDIUM
+		// (V2.3 audit, 2026-05-22).
+		const transport = loaded.Transport as unknown as { websocketConnect?: unknown };
+		if (typeof transport.websocketConnect !== 'function') {
+			missing.push('Transport.websocketConnect (V2.3)');
+		}
+	}
 	if (missing.length > 0) {
 		throw new Error(
 			`Quantbook engine at ${enginePath} loaded but is missing expected exports: ` +
