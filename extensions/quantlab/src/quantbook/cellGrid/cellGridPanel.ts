@@ -31,6 +31,20 @@ import { buildHtml } from './cellGridHtml';
 const VIEW_TYPE = 'quantlab.quantbookCellGrid';
 
 /**
+ * Module-level registry of live panels keyed by sheet number. Lets
+ * the `quantlab.quantbookCellGridRefresh` command find the active
+ * panel(s) without the user having to remember which window spawned
+ * them. Removed on panel dispose.
+ *
+ * **V3.2.a.1 enhancement (2026-05-22)** -- pre-enhancement the
+ * command surface was "Open Cell Grid" only; closing + re-opening
+ * was the only way to refresh the snapshot. The registry + Refresh
+ * command lets users re-render in place. V3.2.b will replace this
+ * with auto-refresh on remote-op observed (push or pollRemote).
+ */
+const activePanels: Map<number, CellGridPanel> = new Map();
+
+/**
  * Render-once webview panel that displays the given session's cell
  * snapshot for the given sheet. The panel does NOT subscribe to
  * session updates -- closing + re-opening refreshes; V3.2.b will
@@ -42,6 +56,15 @@ export class CellGridPanel {
 		session: CollabSessionInstance,
 		sheet: number,
 	): CellGridPanel {
+		// If a panel for this sheet is already open, reveal +
+		// refresh it rather than creating a duplicate. Matches VS
+		// Code's "single tab per resource" convention.
+		const existing = activePanels.get(sheet);
+		if (existing !== undefined) {
+			existing.panel.reveal(vscode.ViewColumn.Active, false);
+			existing.render();
+			return existing;
+		}
 		const panel = vscode.window.createWebviewPanel(
 			VIEW_TYPE,
 			`Cell Grid (sheet ${sheet})`,
@@ -56,8 +79,27 @@ export class CellGridPanel {
 		);
 		const instance = new CellGridPanel(panel, session, sheet);
 		instance.render();
+		activePanels.set(sheet, instance);
+		panel.onDidDispose(() => {
+			activePanels.delete(sheet);
+		});
 		context.subscriptions.push(panel);
 		return instance;
+	}
+
+	/**
+	 * Refresh ALL currently-open cell-grid panels. Called by the
+	 * `quantlab.quantbookCellGridRefresh` command. Returns the
+	 * number of panels refreshed (0 if none open -- the command
+	 * surfaces an information message in that case).
+	 */
+	static refreshAll(): number {
+		let count = 0;
+		for (const instance of activePanels.values()) {
+			instance.render();
+			count += 1;
+		}
+		return count;
 	}
 
 	private constructor(

@@ -171,6 +171,24 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 		}),
 	);
 
+	// Phase 5.7 V3.2.a.1 (2026-05-22) -- refresh active cell-grid
+	// panels in place. Replaces the close + re-open cycle for
+	// refreshing the snapshot. V3.2.b will replace this manual
+	// refresh with auto-refresh on remote-op observed.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookCellGridRefresh', () => {
+			const count = CellGridPanel.refreshAll();
+			if (count === 0) {
+				void vscode.window.showInformationMessage(
+					'No Cell Grid panels are open. Run "Quantbook: Open Cell Grid" first.',
+				);
+			} else {
+				const log = getOutput();
+				log.appendLine(`Refreshed ${count} cell-grid panel(s).`);
+			}
+		}),
+	);
+
 	// Phase 5.7 V3.2.a scaffold (2026-05-22) -- read-only cell-grid
 	// webview. Opens a static HTML table showing the current snapshot
 	// of sheet 0. Sample data is appended at command-invocation time
