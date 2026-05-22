@@ -262,6 +262,16 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 					missing.push(`CollabSession.prototype.${method} (V2.2)`);
 				}
 			}
+			// V2.4 (2026-05-22): `flushPendingToTransport` was REMOVED
+			// in V2.3 closure (Codex FAIL + Opus 2H on `&mut self` async
+			// aliasing UB + tokio runtime starvation). V2.4 reintroduced
+			// after the Arc<Mutex> engine-binding refactor. Check it
+			// here so a stale V2.3 binary (lacks flushPendingToTransport)
+			// fails at the boundary instead of producing a cryptic
+			// "session.flushPendingToTransport is not a function" later.
+			if (typeof proto.flushPendingToTransport !== 'function') {
+				missing.push('CollabSession.prototype.flushPendingToTransport (V2.4)');
+			}
 		}
 	}
 	if (typeof (loaded as { Transport?: unknown }).Transport === 'function') {

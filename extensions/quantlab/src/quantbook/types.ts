@@ -230,16 +230,35 @@ export interface CollabSessionInstance {
 	autoFlushPolicy(): AutoFlushPolicy;
 
 	// =====================================================================
-	// Phase 5.7 V2.3 (2026-05-22) -- async Transport surface
-	//
-	// **V2.3 audit closure (Codex FAIL + Opus PASS-WITH-FINDINGS)**:
-	// `flushPendingToTransport` was REMOVED from V2.3 ship after
-	// audit found two convergent HIGH hazards (Rust UB via &mut self
-	// async re-entry + tokio runtime starvation). V2.4 will reintroduce
-	// after the engine refactor that makes the binding sound. See
-	// engine crate's lib.rs comment block under V2.3 closure for the
-	// full rationale.
+	// Phase 5.7 V2.4 (2026-05-22) -- async Transport surface, REINTRODUCED
 	// =====================================================================
+
+	/**
+	 * Async flush-pending. Waits for the attached transport's writer
+	 * task to drain (level-1 local ack per V2 V4 V1 Tier K1).
+	 *
+	 * **V2.4 reintroduction**: V2.3 ship initially included this but
+	 * V2.3 audit (Codex FAIL + Opus 2H) found two convergent HIGH
+	 * hazards (Rust UB via napi `&mut self` async re-entry + tokio
+	 * runtime starvation). V2.4 closure refactored the engine's
+	 * `CollabSession` napi class to hold `Arc<parking_lot::Mutex<...>>`
+	 * (all methods now `&self`; spawn_blocking pattern for async). The
+	 * UB hazard is structurally impossible now (no `&mut self` on the
+	 * binding). The runtime starvation hazard is closed by
+	 * `spawn_blocking` (Condvar wait runs on a dedicated blocking
+	 * thread, not a tokio worker).
+	 *
+	 * Resolves when:
+	 * - writer has completed `send` for every queued blob, OR
+	 * - transport has been detached / dropped / errored.
+	 *
+	 * **No-op on no transport**: returns resolved Promise (NOT
+	 * rejection).
+	 *
+	 * @throws Error if the transport reports an error, or if the
+	 *               spawn_blocking task panics.
+	 */
+	flushPendingToTransport(): Promise<void>;
 }
 
 /**

@@ -1166,14 +1166,79 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 		}
 	});
 
-	// **V2.3 audit closure**: `flushPendingToTransport` tests REMOVED.
-	// The binding was unsound (Codex/Opus both flagged Rust UB + tokio
-	// starvation HIGHs). The 3 prior tests
-	// (`flushPendingToTransport on no-transport session resolves
-	// without error`, `... on attached-no-pending session resolves
-	// quickly`, `flushPending after a flushDelta drains the local
-	// writer queue`) tested a binding that no longer exists. They
-	// will be reintroduced in V2.4 alongside a sound binding (engine
-	// refactor to Arc<Mutex> + spawn_blocking, or engine restructure
-	// to async Notify).
+	// **V2.4 reintroduction (2026-05-22)**: `flushPendingToTransport`
+	// reintroduced after the Arc<Mutex> + spawn_blocking refactor.
+	// Tests below mirror the V2.3 originals + add a concurrent-call
+	// test that pins the V2.4 soundness contract.
+
+	test('flushPendingToTransport on no-transport session resolves without error', async () => {
+		const session = createSession(1n);
+		await session.flushPendingToTransport();
+	});
+
+	test('flushPendingToTransport on attached-no-pending session resolves quickly', async function () {
+		this.timeout(5000);
+		const session = createSession(1n);
+		const [tA, _tB] = loopbackTransportPair();
+		session.attachTransport(tA);
+		const start = Date.now();
+		await session.flushPendingToTransport();
+		const elapsed = Date.now() - start;
+		assert.ok(elapsed < 1000,
+			`flushPending on idle session resolved in ${elapsed}ms (< 1000)`);
+	});
+
+	test('flushPending after a flushDelta drains the local writer queue (WebSocket)', async function () {
+		this.timeout(15000);
+		const relay = await spawnWsRelay();
+		try {
+			const engine = loadQuantbookEngine();
+			const tA = await engine.Transport.websocketConnect(relay.url);
+			const session = createSession(1n);
+			session.attachTransport(tA);
+
+			session.appendPutValue(0, 0, 0, 1);
+			assert.strictEqual(session.flushDeltaToTransport(), true);
+			// V2 V4 V1 Tier K1: after flushPending, the writer task
+			// has completed `send` for every queued blob.
+			await session.flushPendingToTransport();
+			session.detachTransport();
+		} finally {
+			await relay.close();
+		}
+	});
+
+	test('flushPendingToTransport: concurrent JS callers serialize via Arc<Mutex> (V2.4 soundness contract)', async function () {
+		// **V2.4 closure of V2.3 audit Codex+Opus HIGH-1 (Rust UB)**:
+		// Two concurrent flushPending calls must SERIALIZE on the
+		// internal mutex — no UB, no deadlock, both resolve. V2.3's
+		// `&mut self` async binding would have aliased; V2.4's `&self`
+		// + Arc<Mutex> + spawn_blocking does not.
+		this.timeout(10000);
+		const session = createSession(1n);
+		const [tA, _tB] = loopbackTransportPair();
+		session.attachTransport(tA);
+
+		const p1 = session.flushPendingToTransport();
+		const p2 = session.flushPendingToTransport();
+		await Promise.all([p1, p2]);
+	});
+
+	test('flushPendingToTransport: interleaved sync method during pending async is safe (V2.4 soundness)', async function () {
+		// V2.4 soundness: while a flushPending is pending, JS can
+		// safely call other session methods. The Arc<Mutex> serializes
+		// them; the V2.3 UB hazard is structurally impossible.
+		this.timeout(10000);
+		const session = createSession(1n);
+		const [tA, _tB] = loopbackTransportPair();
+		session.attachTransport(tA);
+
+		const p = session.flushPendingToTransport();
+		// Concurrent sync call on the same session. Acquires the
+		// mutex; safe.
+		const count = session.opCount();
+		assert.strictEqual(count, 0, 'opCount visible mid-pending-async');
+		assert.ok(session.hasTransport(), 'hasTransport visible mid-pending-async');
+		await p;
+	});
 });
