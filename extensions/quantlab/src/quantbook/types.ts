@@ -216,13 +216,18 @@ export interface CollabSessionInstance {
 	/**
 	 * Read the current auto-flush policy. `'disabled'` is the default.
 	 *
-	 * **Forward-compat note**: the engine's `AutoFlushPolicy` is
-	 * `#[non_exhaustive]`. If the engine ships a new variant ahead of
-	 * the JS binding being updated, this method returns `'unknown'` as
-	 * a forward-compat sentinel. JS callers can detect this and warn /
-	 * upgrade.
+	 * **V2.2 audit closure (Opus HIGH-1, 2026-05-22)**: throws if the
+	 * engine reports a variant unknown to this binding (forward-compat
+	 * skew -- engine ships a new variant ahead of the binding crate
+	 * being upgraded). Prior version returned `'unknown'` as a silent
+	 * sentinel; per CLAUDE.md no-fallback rule that was wrong (JS
+	 * `policy === 'onAppend'` would silently fall through to the
+	 * `disabled` branch). Throwing surfaces the skew loudly and forces
+	 * a binding upgrade.
+	 *
+	 * @throws Error if the engine variant is unknown to this binding.
 	 */
-	autoFlushPolicy(): AutoFlushPolicy | 'unknown';
+	autoFlushPolicy(): AutoFlushPolicy;
 }
 
 /**
@@ -235,9 +240,12 @@ export interface CollabSessionInstance {
  * - `'onAppend'`: every mutator + `pollRemote*` auto-fires a delta
  *   flush.
  *
- * The engine's underlying enum is `#[non_exhaustive]`; future variants
- * will need binding updates. `autoFlushPolicy()` returns `'unknown'`
- * as a forward-compat sentinel.
+ * The engine's underlying enum is `#[non_exhaustive]`. Future variants
+ * require this union to be widened AND the napi binding's
+ * `parse_auto_flush_policy` + `auto_flush_policy_to_string` helpers to
+ * be updated. Until both layers are upgraded, `autoFlushPolicy()`
+ * throws on the new variant (V2.2 closure of Opus HIGH-1: no
+ * silent-sentinel fall-through).
  */
 export type AutoFlushPolicy = 'disabled' | 'onAppend';
 

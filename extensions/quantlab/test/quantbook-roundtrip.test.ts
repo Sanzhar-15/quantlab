@@ -246,6 +246,43 @@ suite('quantbook engine round-trip -- Phase 5.7 V1', () => {
 		}
 	});
 
+	test('stale V2.1-shaped binary (missing V2.2 CollabSession.prototype methods) is rejected at the boundary', () => {
+		// **V2.2 audit closure (Codex MEDIUM-1, 2026-05-22)**: a V2.1
+		// binary has all V2.1 top-level exports but lacks V2.2's new
+		// CollabSession prototype methods. Without the V2.2 prototype
+		// check the loader passes; a V2.2 helper like
+		// `flushDeltaToTransport` fails later as
+		// "session.flushDeltaToTransport is not a function". Catch it
+		// at the loader boundary.
+		const originalDlopen = process.dlopen;
+		_resetQuantbookEngineCacheForTests();
+		// V2.1-shaped: top-level exports present + CollabSession prototype
+		// has V1 methods but NONE of V2.2's prototype methods.
+		const fakeCollabSession = function () { /* fake constructor */ };
+		// Add only V1 prototype methods (appendPutValue etc) — not V2.2's.
+		fakeCollabSession.prototype.appendPutValue = function () { /* */ };
+		fakeCollabSession.prototype.exportBytes = function () { /* */ };
+		(process as unknown as { dlopen: typeof process.dlopen }).dlopen =
+			(mod: NodeJS.Module): void => {
+				(mod as unknown as { exports: Record<string, unknown> }).exports = {
+					version: () => '0.1.0-pre-v2.2',
+					CollabSession: fakeCollabSession,
+					Transport: function () { /* fake */ },
+					LoopbackPair: function () { /* fake */ },
+				};
+			};
+		try {
+			assert.throws(
+				() => loadQuantbookEngine(),
+				/CollabSession\.prototype\.flushDeltaToTransport \(V2\.2\)/,
+				'stale V2.1 binary must mention missing V2.2 prototype methods',
+			);
+		} finally {
+			process.dlopen = originalDlopen;
+			_resetQuantbookEngineCacheForTests();
+		}
+	});
+
 	test('appendPutValueValidated rejects negative row', () => {
 		const s = createSession(1n);
 		assert.throws(
@@ -671,13 +708,20 @@ suite('quantbook V2.1 -- Transport binding (LoopbackPair + CollabSession)', func
 		assert.strictEqual(session.flushDeltaToTransport(), false);
 	});
 
-	test('flushDeltaToTransport vs flushToTransport: delta is incremental, full is total', () => {
-		// Pin the semantic difference: after first flush of each kind
-		// from a 1-op state, attach a fresh transport and observe.
-		// (Delta will send 0 ops because last_flushed_vv was reset by
-		// attach, then immediately advanced by the flush; full sends
-		// the snapshot — but actual byte-count comparison is engine-
-		// internal. We just pin behavioral correctness here.)
+	test('flushDeltaToTransport vs flushToTransport: delta idempotency vs full unconditional send', () => {
+		// **V2.2 audit closure (Codex LOW-3, 2026-05-22)**: comment
+		// re-grounded. Prior version said "delta will send 0 ops" which
+		// was misleading — the first delta after attach DOES send the
+		// pending op (from empty VV) and advances last_flushed_vv. The
+		// second delta with no state change is the no-op. The
+		// behavioral comparison this test pins:
+		//   - flushDeltaToTransport: idempotency-guarded. Sends pending
+		//     ops on first call after a state change; returns false on
+		//     the second call with no state change.
+		//   - flushToTransport: unconditional. Sends the full snapshot
+		//     every call regardless of state.
+		// Loro dedupe ensures B sees the single op once regardless of
+		// how many times the blob arrives.
 		const sessionA = createSession(1n);
 		const sessionB = createSession(2n);
 		const [tA, tB] = loopbackTransportPair();
@@ -809,18 +853,47 @@ suite('quantbook V2.1 -- Transport binding (LoopbackPair + CollabSession)', func
 		);
 	});
 
-	test('setAutoFlushPolicy accepts aliases (Disabled, OnAppend, on-append)', () => {
-		// The engine-side parser is lenient; the strict camelCase check
-		// is in `isAutoFlushPolicy` (TS guard). Pin both behaviors.
-		const session = createSession(1n);
-		// `as` casts: TS type narrows to the camelCase union; the engine
-		// alias acceptance is engine-side behavior.
-		assert.doesNotThrow(() => session.setAutoFlushPolicy('Disabled' as 'disabled'));
-		assert.doesNotThrow(() => session.setAutoFlushPolicy('OnAppend' as 'onAppend'));
-		assert.doesNotThrow(() => session.setAutoFlushPolicy('on-append' as 'onAppend'));
-		// Return value is always canonical camelCase.
-		const prior = session.setAutoFlushPolicy('disabled');
-		assert.strictEqual(prior, 'onAppend', 'return is canonical camelCase');
+	// **V2.2 audit closure (Opus HIGH-2, 2026-05-22)**: removed test
+	// `setAutoFlushPolicy accepts aliases` which used `as 'disabled'`
+	// casts to bypass TS type narrowing. The pattern would propagate
+	// to V2.3+ tests and contradicts the public TS type contract.
+	//
+	// **Where engine alias-acceptance IS pinned**: engine-side tests in
+	// `ql-collab/src/session.rs` (the parser is engine-internal). The
+	// IDE binding's PUBLIC CONTRACT is the camelCase TS union; IDE
+	// callers should pass `'disabled'` | `'onAppend'` only. If a
+	// future use case needs to accept alias strings from external
+	// config, V2.3+ should add an explicit `setAutoFlushPolicyRaw(s: string)`
+	// method (or a config-side normalization helper that calls
+	// `isAutoFlushPolicy` first).
+
+	test('onAppend on poll_remote: V2 V3 step 2 contract (post-poll auto-flush echoes onward)', () => {
+		// **V2.2 audit closure (Codex MEDIUM-2, 2026-05-22)**: V2 V3 step 2
+		// wires pollRemote into auto-flush. After a successful drain
+		// (merged > 0) under OnAppend, one auto-flush fires per call.
+		// The IDEA: a hub session that polls + auto-flushes routes ops
+		// onward to a third peer. This binding test pins the contract
+		// via 2 peers + an idempotency check that proves the auto-flush
+		// fired without echo-looping.
+		const sessionA = createSession(1n);
+		const sessionB = createSession(2n);
+		const [tA, tB] = loopbackTransportPair();
+		sessionA.attachTransport(tA);
+		sessionB.attachTransport(tB);
+		sessionB.setAutoFlushPolicy('onAppend');
+
+		// A appends + flushes; B drains 1 blob.
+		sessionA.appendPutValue(0, 0, 0, 1);
+		sessionA.flushDeltaToTransport();
+		assert.strictEqual(sessionB.pollRemoteWithLimit(1), 1, 'B drains A blob');
+		assert.strictEqual(sessionB.opCount(), 1);
+		// V2 V3 step 1 idempotency guard: after the post-poll auto-flush
+		// fires, hasPendingFlush on B should be false (the new ops on
+		// B's log are exactly what was just received; sending them back
+		// to A is a no-op via VV equality). The implicit auto-flush
+		// must NOT have created a perpetual echo.
+		assert.strictEqual(sessionB.hasPendingFlush(), false,
+			'B: post-poll auto-flush fired, then idempotency guard short-circuited the echo');
 	});
 
 	test('onAppend auto-flushes after every mutator (two-peer convergence)', () => {

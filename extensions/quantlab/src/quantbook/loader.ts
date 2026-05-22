@@ -219,6 +219,15 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 	// passes loader validation and fails LATER with a cryptic TypeError
 	// when consumer code calls `new engine.LoopbackPair()`. Catch it at
 	// the boundary instead.
+	//
+	// **V2.2 audit closure (Codex MEDIUM-1, 2026-05-22)**: V2.2 also
+	// requires 5 new CollabSession PROTOTYPE methods
+	// (flushDeltaToTransport, pollRemoteWithLimit, transportLastError,
+	// setAutoFlushPolicy, autoFlushPolicy). A V2.1-shaped binary
+	// (Transport + LoopbackPair present) passes the top-level export
+	// check above but fails later when a V2.2 helper calls e.g.
+	// `session.flushDeltaToTransport`. Inspect CollabSession.prototype
+	// to detect this skew at the boundary.
 	const loaded = fakeModule.exports as unknown as QuantbookNativeModule;
 	const missing: string[] = [];
 	if (typeof loaded.version !== 'function') {
@@ -232,6 +241,28 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 	}
 	if (typeof loaded.LoopbackPair !== 'function') {
 		missing.push('LoopbackPair constructor (V2.1)');
+	}
+	if (typeof loaded.CollabSession === 'function') {
+		// V2.2: validate CollabSession.prototype has the V2.2 sync
+		// transport methods. (Skip this branch when the V2.1 constructor
+		// check itself failed, since `prototype` is undefined for non-
+		// function values.)
+		const proto = (loaded.CollabSession as unknown as { prototype?: Record<string, unknown> }).prototype;
+		if (!proto) {
+			missing.push('CollabSession.prototype (V2.2 prototype check)');
+		} else {
+			for (const method of [
+				'flushDeltaToTransport',
+				'pollRemoteWithLimit',
+				'transportLastError',
+				'setAutoFlushPolicy',
+				'autoFlushPolicy',
+			]) {
+				if (typeof proto[method] !== 'function') {
+					missing.push(`CollabSession.prototype.${method} (V2.2)`);
+				}
+			}
+		}
 	}
 	if (missing.length > 0) {
 		throw new Error(
