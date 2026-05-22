@@ -251,6 +251,8 @@ For V2+ work, the engine substrate available through the V1 binding:
 
 ## Cross-repo coordination notes for V2
 
+**Status update (2026-05-22, post-V2.4)**: V2.1 + V2.2 + V2.3 + V2.4 SHIPPED (4-of-8 cycles done). See `.plans/_active.md` for full V2 multi-cycle plan + V2.5+ backlog. The V2 conventions from V1 (below) held through all 4 cycles; V2.3 audit FAIL + V2.4 sound reintroduction validated the "ship → audit → close" discipline. **V2 exit packet pending** — lands at V2.8 with the 3-way megaudit. V2 audit transcripts in `docs/audits/2026-05-22-phase-5-7-v2-{1,2,3,4}-{codex,opus}.md`.
+
 V2 work will continue across both repos. Conventions established at V1:
 
 1. **Ship pairs**: every binding surface change has TWO commits — one per repo. Reference each other in commit messages.
@@ -294,3 +296,5 @@ With Phase 5.7 V1 SHIPPED + audit-closed + megaudited + docs-finalized, the full
 - V2 itself benefits from Phase 5.7 V1 megaudit's findings (8 V2-readiness items already analyzed) — that's the closest thing to a "V2 preview megaudit" and reduces V2 risk.
 
 Phase 5.8 estimated ~4-6 days as a separate cycle.
+
+**Status update (2026-05-22, post-V2.4)**: V2 is 4-of-8 cycles done (V2.1, V2.2, V2.3, V2.4 SHIPPED). Remaining V2.5 (engine refactor for V8-block) → V2.6 (test fixture) → V2.7 (multi-window demo) → V2.8 (megaudit + V2 exit packet). Phase 5.8 still gated on V2 completing.

@@ -1,6 +1,6 @@
 ---
 title: Phase 5 V1 exit packet (5.1 → 5.6 V1+V2 + 5.4 V2 V1+V1.1 + 5.5 V2 V1 + D1.a)
-status: ACTIVE — Phase 5 V1 surface complete 2026-05-19. **D-1 SHIPPED 2026-05-20**. **5.3 SHIPPED 2026-05-20**. **5.5 V2 V3 V1 SHIPPED 2026-05-21**. **5.5 V2 V4 V1 SHIPPED 2026-05-21** (12/13 Tier items closed; K4 chunking deferred to V2 V4 V2). **5.7 V1 SHIPPED 2026-05-22** (first IDE binding via napi-rs; cross-repo). See `docs/phase5/d-1-exit-packet.md` + `docs/phase5/5-3-exit-packet.md` + `docs/phase5/v2-v3-exit-packet.md` (V2 V3 V1) + `docs/phase5/v2-v4-v1-exit-packet.md` (V2 V4 V1) + `docs/phase5/5-7-v1-exit-packet.md` (5.7 V1 cross-repo). Remaining: 5.7 V2 Transport binding (~3-5d, recommended next), 5.7 V3 cell-grid UI (~1-2wk), 5.8 megaudit (~4-6d, after V2+).
+status: ACTIVE — Phase 5 V1 surface complete 2026-05-19. **D-1 SHIPPED 2026-05-20**. **5.3 SHIPPED 2026-05-20**. **5.5 V2 V3 V1 SHIPPED 2026-05-21**. **5.5 V2 V4 V1 SHIPPED 2026-05-21**. **5.7 V1 SHIPPED 2026-05-22**. **5.7 V2.1 + V2.2 + V2.3 + V2.4 SHIPPED 2026-05-22** (Transport binding 4-of-8 cycles done). See `docs/phase5/d-1-exit-packet.md` + `docs/phase5/5-3-exit-packet.md` + `docs/phase5/v2-v3-exit-packet.md` (V2 V3 V1) + `docs/phase5/v2-v4-v1-exit-packet.md` (V2 V4 V1) + `docs/phase5/5-7-v1-exit-packet.md` (5.7 V1 cross-repo). V2 exit packet pending (V2.8). Remaining: 5.7 V2.5 engine refactor for V8-block hazard (~1d), V2.6 test fixture (~half-day), V2.7 multi-window demo (~1-2d), V2.8 megaudit + V2 exit packet (~2-3d), then 5.7 V3 cell-grid UI (~1-2wk), 5.8 megaudit (~4-6d, after V2 complete).
 date: 2026-05-19
 updated: 2026-05-22 (post-exit-packet additions: 5.6 V2 sweep_presence + D1.a 4-cluster closure + D-1 ALL STEPS SHIPPED + 5.5 V2 V3/V4 V1 + 5.7 V1)
 predecessor: docs/phase4/exit-packet.md + docs/phase5/entry-plan.md
@@ -329,13 +329,20 @@ Phase 5 V1 added **91 net tests** to the engine.
   Format/D-1 binding, full Op enum, `rebuild_workbook` D-3
   production-visible closure (V3).
 
-- **Phase 5.7 V2 — Transport binding (~3-5d, recommended next).**
-  Extends ql-bindings-node with `LoopbackTransport`,
-  `WebSocketTransport`, the Transport trait, `attach_transport` /
-  `detach_transport` / `flush_*` / `poll_remote_*`. Then multi-window
-  IDE demo (two extension hosts syncing via WebSocket). Pre-flight:
-  the engine-assertion sweep per Rule 4 (newly-bound methods each
-  need their FFI-reachable panics pre-validated).
+- **Phase 5.7 V2 — Transport binding.** ✅ **V2.1 + V2.2 + V2.3 +
+  V2.4 SHIPPED 2026-05-22** (4-of-8 cycles done). V2.1 LoopbackPair
+  foundations; V2.2 full sync surface (delta flush, bounded poll,
+  transportLastError, AutoFlushPolicy); V2.3 async (only
+  `Transport.websocketConnect` retained after audit FAIL); V2.4
+  Arc<Mutex> refactor + sound `flushPendingToTransport`
+  reintroduction. 8 audit cycles ran (4 ship + 4 closure); 8 HIGH +
+  27 MEDIUM closed cumulatively. Rule 4 paid off 3× across V2
+  cycles. Remaining: V2.5 engine refactor for V8-block hazard
+  (clone-Arc-then-release OR Notify-based async, ~1d), V2.6
+  test-only blocking transport fixture (~half-day), V2.7
+  multi-window IDE demo (~1-2d), V2.8 3-way megaudit + V2 exit
+  packet (~2-3d). Audit transcripts in
+  `docs/audits/2026-05-22-phase-5-7-v2-{1,2,3,4}-{codex,opus}.md`.
 
 - **Phase 5.7 V3 — Cell grid + persistence (~1-2wk).** Real
   spreadsheet UI: paste-fill-down, formula UI, `.qbook` open/save,

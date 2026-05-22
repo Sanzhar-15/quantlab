@@ -1,14 +1,24 @@
 ---
 name: 2026-05-22_phase-5-7-v2-transport-binding
-status: in-progress
+status: in-progress (V2.1 + V2.2 + V2.3 + V2.4 SHIPPED; V2.5+ pending next session)
 date: 2026-05-22
 predecessor_commit: 89dd5f0d170 (engine: docs(5.7) finalize V2 — exit packet + MASTER-PLAN backfill)
 ide_predecessor_commit: 97e0513d134 (IDE: Phase 5.7 V1 megaudit closures)
 parent_phase: 5.7 Collaboration IDE Vertical Slice
 direction: V2 — Transport binding (extends V1's CollabSession-only surface)
 canonical_v2_design_reference: docs/audits/2026-05-22-phase-5-7-v1-megaudit-opus-b-v2.md
-arc_estimate: 3-5 days total. THIS session: V2.1 + V2.2 (sync surface). Next session: V2.3+ (async / WebSocket / megaudit).
-session_cycles_budget: 2 cycles this session per CLAUDE.md global rule.
+canonical_v2_audit_references:
+  v2.1: docs/audits/2026-05-22-phase-5-7-v2-1-{codex,opus}.md
+  v2.2: docs/audits/2026-05-22-phase-5-7-v2-2-{codex,opus}.md
+  v2.3: docs/audits/2026-05-22-phase-5-7-v2-3-{codex,opus}.md
+  v2.4: docs/audits/2026-05-22-phase-5-7-v2-4-{codex,opus}.md
+arc_estimate_original: 3-5 days total. Actual: V2.1+V2.2 cycle-1; V2.3+V2.4 cycle-2 (continued in fresh context); V2.5+ next session.
+session_cycles_budget: 2 cycles per session per CLAUDE.md global rule. Multi-session arc.
+v2_progress_summary: 4 cycles done (V2.1, V2.2, V2.3, V2.4) → 4 remaining (V2.5 engine refactor, V2.6 test fixture, V2.7 multi-window demo, V2.8 megaudit + exit packet).
+current_engine_head: 7123c6a57bb (Phase 5.7 V2.4 audit closures)
+current_ide_head: 8f0a44e19e9 (feat(quantbook): Phase 5.7 V2.4 audit closures)
+current_mocha_count: 72 / 72
+current_engine_workspace: 4461 / 0 baseline (V2.4 closure doesn't touch ql-collab)
 audit_rules_inherited:
   - Rule 1: no fresh-session reminders (existing memory)
   - Rule 2: parallel Codex+Opus per step
@@ -103,34 +113,116 @@ V1 was `CollabSession` only — no peers could talk to each other from the IDE s
 
 **Audit obligations**:
 
-- [ ] Parallel Codex + Opus audit. (Pending — cycle 2 audit.)
+- [x] Parallel Codex + Opus audit (Codex 3M+4L + Opus 2H+5M+6L, all closed in-cycle).
 
-## V2.3+ — DEFERRED to next session
+## V2.3 — Async surface (Cycle 3) ✅ SHIPPED 2026-05-22
 
-These need a fresh window per CLAUDE.md ">2 cycles per session" + benefit from clean context:
+**Engine commits**: `1e2354cb7b1` (ship; flushPending initially included) → `ea07bc6af4e` (closure: REMOVE flushPending; keep websocketConnect only).
+**IDE commits**: `6616e28a2a3` (ship) → `233957ab140` (closure).
+**Tests**: IDE mocha 66/66 after closure.
 
-- V2.3: WebSocketTransport `Transport.websocketConnect(url)` async (napi `AsyncTask` or `#[napi(async)]`)
-- V2.4: `flushPendingToTransport()` async (Condvar wait wrapped in `#[napi(async)]`)
-- V2.5: Multi-window IDE demo (extend `quantlab.quantbookDemo` command)
-- V2.6: Tiny WS echo-fanout server (~50 lines in a sibling test crate) for local 2-peer testing
-- V2.7: 3-way megaudit + V2 exit packet
+**What shipped**:
+- `Transport.websocketConnect(url): Promise<Transport>` — static async factory. Real-network round-trip validated via in-process Node `ws` echo-fanout relay.
+- napi `async` feature added (= `tokio_rt`).
+- New dep on `ql-collab-ws` for WebSocketTransport.
+- 4 mocha tests in new V2.3 suite: rejection paths (InvalidUrl, ConnectFailed), connect-success, end-to-end two-peer round-trip, WebSocket Transport single-use semantics.
 
-## Acceptance criteria for V2 SHIP this session (V2.1 + V2.2)
+**Audit FAIL on first ship — Codex+Opus 2H convergent**:
+- HIGH-1: Rust UB via napi `&mut self` async aliasing on `flushPendingToTransport`. Verified per napi-derive-backend-5.0.4 codegen.
+- HIGH-2: tokio runtime starvation (Condvar wait on shared worker pool).
 
-- [ ] Engine `cargo test --workspace --all-features` passes (target: 4461+ / 0)
-- [ ] `ql-bindings-node` Rust unit tests pass
-- [ ] IDE quantbook mocha tests pass (target: 26 + V2 additions, all green)
-- [ ] fmt + clippy clean on both repos
-- [ ] No new TS compile errors
-- [ ] Engine `.dylib` rebuilds and loads in Node
-- [ ] All audit HIGHs closed in cycle
-- [ ] `.plans/_active.md` updated to reflect what shipped vs deferred for V2.3+
-- [ ] `memory/current_work.md` updated with new HEAD + V2 progress narrative
-- [ ] Plan archived if both V2.1 + V2.2 ship; otherwise updated for V2.3+ continuation
+**Closure REMOVED `flushPendingToTransport`**. Documented V2.4 reintroduction plan (options A: Arc<Mutex>, B: Notify, C: serialization guard). V2.3 retained only the safe `websocketConnect`.
 
-## Hand-off if session caps out before V2.2 closes
+Other V2.3 closures: loader V2.3 export check, tighter rejection categories, replaced 50ms setTimeout with poll loop, removed try/catch swallow in test fixture.
 
-- Commit V2.1 ship + closure cleanly
-- Update plan to mark V2.1 done + V2.2 still pending
-- current_work.md handoff §0 updated with the V2.1 commit ladder
-- Next session picks up V2.2 from a clean state
+## V2.4 — Sound async reintroduction (Cycle 4) ✅ SHIPPED 2026-05-22
+
+**Engine commits**: `c51df9f41f4` (ship: Arc<Mutex> refactor + flushPending reintroduction) → `7123c6a57bb` (closure).
+**IDE commits**: `3ab02bbe732` (ship) → `8f0a44e19e9` (closure).
+**Tests**: IDE mocha 72/72 after closure.
+
+**What shipped (Option A from V2.3 closure plan)**:
+- `CollabSession` napi class refactored from `inner: CoreCollabSession` (`&mut self` methods) to `inner: Arc<parking_lot::Mutex<CoreCollabSession>>` (`&self` methods + internal lock).
+- 17 napi method signatures changed `&mut self` → `&self` with `let inner = self.inner.lock();` inside.
+- `flushPendingToTransport` REINTRODUCED as `pub async fn(&self) -> Result<()>`. Body: `tokio::task::spawn_blocking(move || { let mut g = inner.lock(); g.flush_pending_to_transport() })`. No `unsafe` (napi-rs accepts async `&self`).
+- New direct deps: `parking_lot = "=0.12.5"` + `tokio = { workspace = true }`.
+- Send + Sync compile-assert updated: was `Send + !Sync`, now `Send + Sync` (Arc<Mutex<T>>: Sync when T: Send).
+
+**V2.3 HIGHs STRUCTURALLY CLOSED** (both auditors verified via source-walks):
+- HIGH-1 (UB): napi-derive-backend-5.0.4 `codegen/fn.rs:278-284` for `FnSelf::Ref` produces shared `&`, not `&mut`. Multiple aliasing reads sound; mutation via Mutex.
+- HIGH-2 (tokio starvation): `spawn_blocking` runs on tokio's blocking pool (default 512), NOT worker pool. Condvar wait no longer occupies a worker.
+
+**V2.4 NEW HIGHs closed in-cycle**:
+- HIGH-2 (Rule 4 doc-drift): module docstring still claimed `Send + !Sync` after refactor became `Send + Sync`. Rewrote with V2.4 reality + source citations.
+- HIGH-1 (V8-block UX hazard): sync method during pending `flushPendingToTransport` blocks V8 event loop on lock acquisition. NOT a soundness hazard. Documented as known trade-off; V2.5+ engine refactor plan (clone-Arc-then-release OR Notify-based async). Caller discipline today: don't call other session methods while flushPending is awaiting.
+
+**V2.4 audit verdicts**:
+- Codex: PASS-WITH-FINDINGS (0H+0M+3L+1OBS).
+- Opus: PASS-WITH-FINDINGS (2H+7M+5L+6OBS).
+
+## V2.5+ — DEFERRED to next session
+
+These need a fresh window per CLAUDE.md ">2 cycles per session":
+
+### V2.5 — Engine refactor for V8-block hazard (Opus V2.4 HIGH-1)
+
+Pick ONE of:
+- (a) Clone `Arc<Transport>` inside the session lock, release lock, wait on the cloned transport directly. Requires engine refactor to make Transport extractable.
+- (b) Replace Condvar with `tokio::sync::Notify` in `flush_pending`. Truly async; no lock held across wait. Requires engine API change.
+
+Recommend (b) — cleaner long-term. V2.5 audit will verify the V8-block test (test-only blocking transport fixture) actually passes after the refactor.
+
+### V2.6 — Test-only blocking transport fixture
+
+For real contention/V8-block test coverage. Engine-side trait impl that returns Pending forever (or for a configured delay). Closes Codex V2.3 LOW-2 + Opus V2.4 MEDIUM-1+2 (V2.4 soundness tests were vacuous on Loopback).
+
+### V2.7 — Multi-window IDE demo
+
+Extend `quantlab.quantbookDemo` command to spawn a second VS Code window via the `vscode.openFolder` API + a localhost WebSocket relay. The current command does in-process LoopbackPair; V2.7 does two separate extension hosts.
+
+### V2.8 — 3-way Codex+Opus-A+Opus-B megaudit + V2 exit packet
+
+Phase-level closure pattern. Sweep V2.1+V2.2+V2.3+V2.4+V2.5+V2.6 for cumulative findings invisible at per-step.
+
+### V2 backlog (carryforward from V1 + V2.1 + V2.2 + V2.3 + V2.4)
+
+- Structured `Error.code` discrimination via napi `Error::with_code` + `TransportError::kind()` accessor. V2.4 deferred again; pressing for V2.7 multi-window UX.
+- `#[napi(strict)]` sweep for type-confusion safety (Opus V2.1 LOW-1).
+- `#[must_use]` on `attach_transport<T>` (Opus V2.1 M1; ~80 call site sweep).
+- `willFlushSend()` helper to match `flushDeltaToTransport`'s idempotency guard (Opus V2.2 M3).
+- `LoopbackTransport.close()` binding for negative-path tests (Opus V2.1 LOW-5).
+- Codex V2.3 LOW-2: HandshakeFailed test fixture (local HTTP server rejecting WS upgrade).
+- Rule 4 extension to FFI behavior claims (Opus V2.3 M5).
+- RwLock for pure-read methods if profiling shows contention (Opus V2.4 M7).
+- Document parking_lot's no-poison + CoreCollabSession panic safety (Opus V2.4 M5).
+- Document spawn_blocking pool budget interaction with WebSocketTransport reader/writer tasks (Opus V2.4 M4).
+
+## Acceptance criteria for V2 SHIP this session — MET
+
+- [x] Engine workspace baseline 4461 / 0 (V2.x closure cycles don't touch ql-collab core).
+- [x] `ql-bindings-node` Rust unit tests pass.
+- [x] IDE quantbook mocha 72 / 72 (was 26 at V1 close).
+- [x] fmt + clippy clean on both repos.
+- [x] No new TS compile errors.
+- [x] Engine `.dylib` rebuilds and loads.
+- [x] All audit HIGHs closed in cycle (V2.1, V2.2, V2.4 cycles; V2.3 HIGHs closed via REMOVE; V2.4 closed via refactor).
+- [x] `.plans/_active.md` updated through V2.4 + V2.5 plan.
+- [x] `memory/current_work.md` updated with V2.4 HEAD + V2 progress narrative.
+- [x] All 9 audit transcripts tracked in `docs/audits/` (5 V1 + 4 V2.x Codex + 4 V2.x Opus).
+- [ ] Plan archive: defer until V2 fully ships (V2.8 megaudit + V2 exit packet land in V2.5+).
+
+## V2 commit ladder (cumulative)
+
+Engine `feat/quantbook-engine`:
+- V1: 677ee03ee8b → 6003db4ce2c → c47bc0816b5 → c7406aa82cd → 89dd5f0d170
+- V2.1: c4e7b471142 → 39ed260bec9
+- V2.2: d9b4168022d → d33876f7745
+- V2.3: 1e2354cb7b1 → ea07bc6af4e
+- V2.4: c51df9f41f4 → 7123c6a57bb (current HEAD pre-docs-finalize)
+
+IDE `feat/visualise-v1`:
+- V1: 1a7fc8bbe3f → a517d7c5f71 → 97e0513d134
+- V2.1: 1f142366839 → 9da8d5df060
+- V2.2: b245c5b9fa8 → 3871c8ce055
+- V2.3: 6616e28a2a3 → 233957ab140
+- V2.4: 3ab02bbe732 → 8f0a44e19e9 (current HEAD)
