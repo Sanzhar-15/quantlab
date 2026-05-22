@@ -476,3 +476,73 @@ export interface QuantbookNativeModule {
 	 */
 	readonly BlockingTransportFixture: BlockingTransportFixtureConstructor;
 }
+
+// ============================================================================
+// Phase 5.7 V2.7 (2026-05-22) -- structured error-code discrimination
+// ============================================================================
+
+/**
+ * Stable string identifier for an engine error variant, extracted from
+ * the bracketed prefix that the napi binding prepends to thrown
+ * `Error.message`. IDE reconnect logic can switch on these codes
+ * without substring-matching the human-readable `Display` text.
+ *
+ * **Codes are SemVer-stable.** Engine-side
+ * `crates/ql-collab/src/transport.rs::TransportError::kind`,
+ * `crates/ql-collab-ws/src/lib.rs::WebSocketError::kind`, and
+ * `crates/ql-collab/src/session.rs::CollabSessionError::kind` are
+ * the authoritative sources; this union mirrors them.
+ *
+ * **Closes V2.1+V2.2+V2.3 Opus MEDIUM-3 carryforwards**: prior to
+ * V2.7, IDE callers had to substring-match error messages to
+ * distinguish transport-closed from transport-io etc. This was
+ * lossy and fragile across Display-string edits.
+ */
+export type QuantbookErrorCode =
+	// Transport-layer errors (`TransportError::kind`)
+	| 'transport_io'
+	| 'transport_closed'
+	// WebSocket-layer errors (`WebSocketError::kind`).
+	// Surfaced by `Transport.websocketConnect` on rejection.
+	| 'websocket_invalid_url'
+	| 'websocket_connect_failed'
+	| 'websocket_handshake_failed'
+	| 'websocket_runtime_error'
+	// Session-layer errors (`CollabSessionError::kind`).
+	// Note: `Transport(_)` passes through to the inner transport
+	// kind (e.g. `transport_closed`), not a wrapper string.
+	| 'session_oplog'
+	| 'session_presence'
+	| 'session_undo'
+	| 'session_replay'
+	// Fallback when the message has no recognizable code prefix.
+	// Typically means the error came from non-engine code (napi
+	// task panic, validation guard, JS-side throw).
+	| 'unknown';
+
+/**
+ * Structured view of a Quantbook engine error, extracted from the
+ * `[<code>] <message>` convention that the napi binding uses.
+ *
+ * Use [`parseQuantbookError`] to construct from a caught `unknown`.
+ */
+export interface QuantbookErrorInfo {
+	/**
+	 * Stable code identifier; one of the {@link QuantbookErrorCode}
+	 * values. `'unknown'` if the error message had no recognizable
+	 * code prefix.
+	 */
+	readonly code: QuantbookErrorCode;
+	/**
+	 * Human-readable message; the original `Error.message` with the
+	 * `[<code>] ` prefix stripped. For `'unknown'` errors, the full
+	 * original message.
+	 */
+	readonly message: string;
+	/**
+	 * The original caught value, for callers that need to re-throw
+	 * or inspect non-Error throwables (strings, numbers, custom
+	 * classes, etc.).
+	 */
+	readonly cause: unknown;
+}

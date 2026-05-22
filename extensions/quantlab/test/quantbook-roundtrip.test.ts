@@ -38,7 +38,9 @@ import {
 	appendPutValueValidated,
 	createSession,
 	isAutoFlushPolicy,
+	isQuantbookErrorCode,
 	loopbackTransportPair,
+	parseQuantbookError,
 	quantbookEngineVersion,
 	sessionFromSnapshot,
 } from '../src/quantbook/session';
@@ -1457,6 +1459,149 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 		} finally {
 			process.dlopen = originalDlopen;
 			_resetQuantbookEngineCacheForTests();
+		}
+	});
+});
+
+// =============================================================
+// Phase 5.7 V2.7 (2026-05-22) -- structured error-code discrimination
+// =============================================================
+//
+// Closes V2.1+V2.2+V2.3 Opus MEDIUM-3 carryforwards. Two test
+// groups:
+//
+//   (A) parseQuantbookError unit tests (no engine load needed):
+//       prefix parsing, fallback semantics, type guards.
+//
+//   (B) End-to-end integration: drive a real engine error through
+//       the napi binding + verify the code is recoverable from
+//       JS via parseQuantbookError. Pins the bracket-prefix
+//       convention as a contract, not coincidence.
+
+suite('quantbook V2.7 -- structured error-code discrimination (parseQuantbookError unit)', function () {
+	// These tests do NOT require the engine to load -- they exercise
+	// the pure-TS parser. Run regardless of QUANTBOOK_ENGINE_PATH.
+
+	test('parseQuantbookError extracts known transport_closed code', () => {
+		const err = new Error('[transport_closed] transport closed');
+		const info = parseQuantbookError(err);
+		assert.strictEqual(info.code, 'transport_closed');
+		assert.strictEqual(info.message, 'transport closed');
+		assert.strictEqual(info.cause, err);
+	});
+
+	test('parseQuantbookError extracts websocket_invalid_url code with message body', () => {
+		const err = new Error('[websocket_invalid_url] invalid WebSocket URL: not-a-url');
+		const info = parseQuantbookError(err);
+		assert.strictEqual(info.code, 'websocket_invalid_url');
+		assert.strictEqual(info.message, 'invalid WebSocket URL: not-a-url');
+	});
+
+	test('parseQuantbookError falls back to unknown for missing prefix', () => {
+		const err = new Error('plain old error with no prefix');
+		const info = parseQuantbookError(err);
+		assert.strictEqual(info.code, 'unknown');
+		assert.strictEqual(info.message, 'plain old error with no prefix');
+	});
+
+	test('parseQuantbookError falls back to unknown for unrecognized prefix code', () => {
+		// Unknown code = engine introduces new variant before IDE
+		// updates the union. Treated as 'unknown' + full message preserved.
+		const err = new Error('[future_new_kind] some new error');
+		const info = parseQuantbookError(err);
+		assert.strictEqual(info.code, 'unknown');
+		assert.strictEqual(info.message, '[future_new_kind] some new error',
+			'unknown-code path preserves full message including bracket prefix');
+	});
+
+	test('parseQuantbookError handles non-Error throwables', () => {
+		const info1 = parseQuantbookError('string thrown');
+		assert.strictEqual(info1.code, 'unknown');
+		assert.strictEqual(info1.message, 'string thrown');
+
+		const info2 = parseQuantbookError(42);
+		assert.strictEqual(info2.code, 'unknown');
+		assert.strictEqual(info2.message, '42');
+
+		const info3 = parseQuantbookError(undefined);
+		assert.strictEqual(info3.code, 'unknown');
+	});
+
+	test('parseQuantbookError preserves cause for re-throw / inspection', () => {
+		const err = new Error('[transport_closed] transport closed');
+		const info = parseQuantbookError(err);
+		assert.strictEqual(info.cause, err, 'cause is the original caught value');
+	});
+
+	test('isQuantbookErrorCode accepts known codes', () => {
+		assert.ok(isQuantbookErrorCode('transport_closed'));
+		assert.ok(isQuantbookErrorCode('websocket_invalid_url'));
+		assert.ok(isQuantbookErrorCode('session_oplog'));
+		assert.ok(isQuantbookErrorCode('unknown'));
+	});
+
+	test('isQuantbookErrorCode rejects non-strings and unknown codes', () => {
+		assert.ok(!isQuantbookErrorCode(undefined));
+		assert.ok(!isQuantbookErrorCode(null));
+		assert.ok(!isQuantbookErrorCode(42));
+		assert.ok(!isQuantbookErrorCode('future_new_kind'));
+		assert.ok(!isQuantbookErrorCode('Transport_Closed'),
+			'case-sensitive: TitleCase rejected');
+	});
+});
+
+suite('quantbook V2.7 -- structured error-code end-to-end (engine → napi → parseQuantbookError)', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) {
+			this.skip();
+		}
+		_resetQuantbookEngineCacheForTests();
+		this.timeout(60000);
+		loadQuantbookEngine();
+	});
+
+	test('end-to-end: invalid WebSocket URL surfaces websocket_invalid_url code', async () => {
+		const engine = loadQuantbookEngine();
+		try {
+			await engine.Transport.websocketConnect('not-a-ws-url');
+			assert.fail('expected rejection');
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			assert.strictEqual(info.code, 'websocket_invalid_url',
+				`expected websocket_invalid_url, got code=${info.code}, msg=${info.message}`);
+			// Display string preserved after the code prefix.
+			assert.match(info.message, /invalid WebSocket URL/);
+		}
+	});
+
+	test('end-to-end: connection refused surfaces websocket_connect_failed code', async function () {
+		this.timeout(10000);
+		const engine = loadQuantbookEngine();
+		try {
+			await engine.Transport.websocketConnect('ws://127.0.0.1:1');
+			assert.fail('expected rejection');
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			assert.strictEqual(info.code, 'websocket_connect_failed',
+				`expected websocket_connect_failed, got code=${info.code}, msg=${info.message}`);
+		}
+	});
+
+	test('end-to-end: V2.3 substring tests still pass (Display preserved after [code] prefix)', async () => {
+		// V2.3 mocha asserts /invalid WebSocket URL/ on the raw
+		// Error.message. V2.7 prepends "[websocket_invalid_url] " --
+		// the substring is still present. Pin this explicitly.
+		const engine = loadQuantbookEngine();
+		try {
+			await engine.Transport.websocketConnect('not-a-ws-url');
+			assert.fail('expected rejection');
+		} catch (err) {
+			assert.ok(err instanceof Error);
+			assert.match(err.message, /invalid WebSocket URL/,
+				'V2.3 substring-match assertion preserved post-V2.7');
+			assert.match(err.message, /^\[websocket_invalid_url\]/,
+				'V2.7 prefix is present');
 		}
 	});
 });

@@ -29,6 +29,8 @@ import type {
 	AutoFlushPolicy,
 	CollabSessionInstance,
 	LoopbackPairInstance,
+	QuantbookErrorCode,
+	QuantbookErrorInfo,
 	TransportInstance,
 } from './types';
 
@@ -160,4 +162,96 @@ export function createLoopbackPair(): LoopbackPairInstance {
  */
 export function isAutoFlushPolicy(value: unknown): value is AutoFlushPolicy {
 	return value === 'disabled' || value === 'onAppend';
+}
+
+// =====================================================================
+// Phase 5.7 V2.7 (2026-05-22) -- structured error-code discrimination
+// =====================================================================
+
+/**
+ * Set of `QuantbookErrorCode` values, used by the `parseQuantbookError`
+ * runtime validator to reject unknown codes (which would otherwise
+ * mask an engine-binding drift).
+ *
+ * **Codex M3 closure note**: keeping this set in sync with the
+ * union type {@link QuantbookErrorCode} is a manual discipline.
+ * V2 backlog: codegen this set from the union (or use a const enum)
+ * to eliminate the drift hazard.
+ */
+const KNOWN_QUANTBOOK_ERROR_CODES: ReadonlySet<QuantbookErrorCode> = new Set<QuantbookErrorCode>([
+	'transport_io',
+	'transport_closed',
+	'websocket_invalid_url',
+	'websocket_connect_failed',
+	'websocket_handshake_failed',
+	'websocket_runtime_error',
+	'session_oplog',
+	'session_presence',
+	'session_undo',
+	'session_replay',
+	'unknown',
+]);
+
+/**
+ * Bracket-prefix regex: `[<code>] <message>` where `<code>` is
+ * snake_case alphabetics + underscores. Matches the napi binding's
+ * `[{kind}] {Display}` convention from
+ * `crates/ql-bindings-node/src/lib.rs::{collab_session,transport,websocket}_error_to_napi`.
+ */
+const QUANTBOOK_ERROR_PREFIX_RE = /^\[([a-z][a-z_]*)\]\s*(.*)$/s;
+
+/**
+ * Extract the structured code + message from a caught error.
+ *
+ * **Usage**:
+ * ```ts
+ * try {
+ *   session.flushPendingToTransport();
+ * } catch (err) {
+ *   const info = parseQuantbookError(err);
+ *   if (info.code === 'transport_closed') {
+ *     // reconnect logic
+ *   }
+ * }
+ * ```
+ *
+ * **Returns**: a `QuantbookErrorInfo` with `code = 'unknown'` if:
+ * - the value is not an `Error` instance,
+ * - the `Error.message` has no `[<code>] ` prefix, OR
+ * - the prefix code is not a recognized `QuantbookErrorCode` (which
+ *   means the IDE binding is older than the engine; a build refresh
+ *   is in order).
+ *
+ * Closes V2.1+V2.2+V2.3 Opus MEDIUM-3 carryforwards.
+ */
+export function parseQuantbookError(err: unknown): QuantbookErrorInfo {
+	if (!(err instanceof Error)) {
+		return {
+			code: 'unknown',
+			message: typeof err === 'string' ? err : String(err),
+			cause: err,
+		};
+	}
+	const match = QUANTBOOK_ERROR_PREFIX_RE.exec(err.message);
+	if (!match) {
+		return { code: 'unknown', message: err.message, cause: err };
+	}
+	const rawCode = match[1];
+	const rest = match[2];
+	if (KNOWN_QUANTBOOK_ERROR_CODES.has(rawCode as QuantbookErrorCode)) {
+		return { code: rawCode as QuantbookErrorCode, message: rest, cause: err };
+	}
+	// Unknown code: preserve the full original message (so the
+	// user can see the actual prefix) and return 'unknown'.
+	// Caller can then escalate this as a binding-drift signal.
+	return { code: 'unknown', message: err.message, cause: err };
+}
+
+/**
+ * Type guard for `QuantbookErrorCode`. Mirrors `isAutoFlushPolicy`'s
+ * defensive shape -- use when reading codes from external config or
+ * persisted error logs.
+ */
+export function isQuantbookErrorCode(value: unknown): value is QuantbookErrorCode {
+	return typeof value === 'string' && KNOWN_QUANTBOOK_ERROR_CODES.has(value as QuantbookErrorCode);
 }
