@@ -56,6 +56,7 @@ import {
 } from '../src/quantbook/session';
 import type {
 	BlockingTransportFixtureConstructor,
+	CollabSessionInstance,
 	QuantbookCellSnapshot,
 	QuantbookNativeModule,
 } from '../src/quantbook/types';
@@ -2256,5 +2257,213 @@ suite('quantbook V3.2.a -- exportSnapshot cell-snapshot export', function () {
 		assert.ok(snap !== null);
 		assert.strictEqual(typeof snap.snapshot_format_version, 'number');
 		assert.ok(Array.isArray(snap.entries));
+	});
+});
+
+// ============================================================================
+// Phase 5.7 V3.2.b.5 -- cell-edit flow (HTML + dispatcher)
+// ============================================================================
+
+import { dispatchIncomingMessage, parseCellRawInput, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
+
+suite('quantbook V3.2.b.2 -- cellGridHtml.ts nonce + script + editable cells', function () {
+	test('buildHtml WITHOUT nonce is unchanged from V3.2.a (no script tag; narrow CSP)', () => {
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries: [] });
+		assert.ok(!html.includes('<script'), 'no <script> tag in V3.2.a-compat path');
+		assert.ok(html.includes('default-src \'none\''));
+		assert.ok(!html.includes('script-src'), 'no script-src in CSP without nonce');
+		assert.ok(!html.includes('data-row'), 'no data-row attrs in V3.2.a-compat path');
+	});
+
+	test('buildHtml WITH nonce embeds <script nonce="..."> + widens CSP', () => {
+		const nonce = 'TestNonce123';
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries: [] }, { nonce });
+		assert.ok(html.includes(`<script nonce="${nonce}">`), 'script tag carries the nonce');
+		assert.ok(html.includes(`script-src 'nonce-${nonce}'`), 'CSP includes nonce-scoped script-src');
+		// Sanity: the SAME nonce in BOTH places (per cellGridHtml.ts docstring).
+		const scriptNonceMatches = html.match(/<script nonce="([A-Za-z0-9]+)">/g);
+		const cspNonceMatches = html.match(/'nonce-([A-Za-z0-9]+)'/g);
+		assert.ok(scriptNonceMatches && scriptNonceMatches.length === 1);
+		assert.ok(cspNonceMatches && cspNonceMatches.length === 1);
+	});
+
+	test('buildHtml WITH nonce gives cells data-row + data-col + cell-value class', () => {
+		const html = buildHtml({
+			snapshot_format_version: 1,
+			sheet: 0,
+			entries: [
+				{ row: 3, col: 7, value: { kind: 'number', value: 42 } },
+			],
+		}, { nonce: 'n0' });
+		assert.ok(html.includes('data-row="3"'), 'cell has data-row');
+		assert.ok(html.includes('data-col="7"'), 'cell has data-col');
+		assert.ok(html.includes('class="cell-value"'), 'cell has cell-value class');
+		assert.ok(html.includes('data-original-text="42"'), 'cell has data-original-text');
+		assert.ok(html.includes('data-original-kind="number"'), 'cell has data-original-kind');
+	});
+
+	test('buildHtml CSS includes .cell-edit-error + .cell-edit-input + .cell-value', () => {
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries: [] }, { nonce: 'x' });
+		assert.ok(html.includes('.cell-value'));
+		assert.ok(html.includes('.cell-edit-error'));
+		assert.ok(html.includes('.cell-edit-input'));
+	});
+
+	test('buildHtml WITH nonce: script body wires acquireVsCodeApi + click + message listener', () => {
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 42, entries: [] }, { nonce: 'y' });
+		// Pin the contract surface; if any of these strings move, the
+		// webview script lost its wiring.
+		assert.ok(html.includes('acquireVsCodeApi'));
+		assert.ok(html.includes('var SHEET = 42'), 'SHEET constant baked from snapshot.sheet');
+		assert.ok(html.includes('vscode.postMessage'));
+		assert.ok(html.includes('addEventListener(\'click\''));
+		assert.ok(html.includes('addEventListener(\'message\''));
+		assert.ok(html.includes('errorReply'));
+		assert.ok(html.includes('refresh'));
+	});
+
+	test('buildHtml: HTML-escaping still applies to text values when editable', () => {
+		const html = buildHtml({
+			snapshot_format_version: 1,
+			sheet: 0,
+			entries: [
+				{ row: 0, col: 0, value: { kind: 'text', value: '<script>alert(1)</script>' } },
+			],
+		}, { nonce: 'z' });
+		assert.ok(!html.includes('<script>alert(1)</script>'), 'no raw script payload');
+		assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'));
+		assert.ok(html.includes('data-original-text="&lt;script&gt;alert(1)&lt;/script&gt;"'),
+			'data-original-text is HTML-escaped too');
+	});
+});
+
+suite('quantbook V3.2.b.5 -- parseCellRawInput', function () {
+	test('accepts plain integer', () => {
+		assert.strictEqual(parseCellRawInput('42'), 42);
+	});
+
+	test('accepts decimal', () => {
+		assert.strictEqual(parseCellRawInput('3.14'), 3.14);
+	});
+
+	test('accepts scientific notation', () => {
+		assert.strictEqual(parseCellRawInput('1e3'), 1000);
+	});
+
+	test('accepts negative + leading/trailing whitespace', () => {
+		assert.strictEqual(parseCellRawInput('  -7.5  '), -7.5);
+	});
+
+	test('rejects empty / whitespace-only with bad_argument prefix', () => {
+		assert.throws(() => parseCellRawInput(''), /\[bad_argument\]/);
+		assert.throws(() => parseCellRawInput('   '), /\[bad_argument\]/);
+	});
+
+	test('rejects non-numeric with bad_argument prefix', () => {
+		assert.throws(() => parseCellRawInput('hello'), /\[bad_argument\]/);
+		assert.throws(() => parseCellRawInput('42abc'), /\[bad_argument\]/);
+	});
+
+	test('rejects Infinity / -Infinity / NaN with bad_argument prefix', () => {
+		assert.throws(() => parseCellRawInput('Infinity'), /\[bad_argument\]/);
+		assert.throws(() => parseCellRawInput('-Infinity'), /\[bad_argument\]/);
+		assert.throws(() => parseCellRawInput('NaN'), /\[bad_argument\]/);
+	});
+});
+
+suite('quantbook V3.2.b.5 -- dispatchIncomingMessage (host-side commit path)', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	function makeDeps(session: CollabSessionInstance, sheet: number) {
+		const errorReplies: ErrorReplyMessage[] = [];
+		let commitCount = 0;
+		const deps = {
+			session,
+			sheet,
+			onCommit: () => { commitCount += 1; },
+			onError: (reply: ErrorReplyMessage) => { errorReplies.push(reply); },
+		};
+		return { deps, errorReplies, getCommitCount: () => commitCount };
+	}
+
+	test('putValue success: commits the value + invokes onCommit', () => {
+		const session = createSession(401n);
+		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
+		dispatchIncomingMessage(
+			{ type: 'putValue', sheet: 0, row: 1, col: 2, rawInput: '99.5' },
+			deps,
+		);
+		assert.strictEqual(getCommitCount(), 1, 'onCommit fired once');
+		assert.strictEqual(errorReplies.length, 0, 'no error reply on success');
+		assert.strictEqual(session.opCount(), 1, 'op log has the new PutValue');
+		const snap = exportCellSnapshot(session, 0);
+		assert.strictEqual(snap.entries.length, 1);
+		assert.deepStrictEqual(snap.entries[0], {
+			row: 1, col: 2, value: { kind: 'number', value: 99.5 },
+		});
+	});
+
+	test('putValue with non-numeric rawInput: posts errorReply with bad_argument code', () => {
+		const session = createSession(402n);
+		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
+		dispatchIncomingMessage(
+			{ type: 'putValue', sheet: 0, row: 1, col: 2, rawInput: 'hello world' },
+			deps,
+		);
+		assert.strictEqual(getCommitCount(), 0, 'no commit on parse failure');
+		assert.strictEqual(session.opCount(), 0, 'op log unchanged');
+		assert.strictEqual(errorReplies.length, 1);
+		const reply = errorReplies[0];
+		assert.strictEqual(reply.type, 'errorReply');
+		assert.strictEqual(reply.sheet, 0);
+		assert.strictEqual(reply.row, 1);
+		assert.strictEqual(reply.col, 2);
+		assert.strictEqual(reply.code, 'bad_argument');
+		assert.match(reply.message, /finite number/);
+	});
+
+	test('putValue with empty rawInput: posts bad_argument errorReply', () => {
+		const session = createSession(403n);
+		const { deps, errorReplies } = makeDeps(session, 0);
+		dispatchIncomingMessage(
+			{ type: 'putValue', sheet: 0, row: 0, col: 0, rawInput: '' },
+			deps,
+		);
+		assert.strictEqual(errorReplies.length, 1);
+		assert.strictEqual(errorReplies[0].code, 'bad_argument');
+	});
+
+	test('putValue with sheet mismatch: dropped (no commit, no errorReply)', () => {
+		const session = createSession(404n);
+		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
+		dispatchIncomingMessage(
+			{ type: 'putValue', sheet: 99, row: 0, col: 0, rawInput: '1.0' },
+			deps,
+		);
+		assert.strictEqual(getCommitCount(), 0);
+		assert.strictEqual(errorReplies.length, 0);
+		assert.strictEqual(session.opCount(), 0);
+	});
+
+	test('unknown message type: dropped silently (no commit, no errorReply)', () => {
+		const session = createSession(405n);
+		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
+		dispatchIncomingMessage(
+			{ type: 'futureFeature', payload: 42 },
+			deps,
+		);
+		assert.strictEqual(getCommitCount(), 0);
+		assert.strictEqual(errorReplies.length, 0);
+		// Same for missing type field.
+		dispatchIncomingMessage({ noType: true }, deps);
+		assert.strictEqual(errorReplies.length, 0);
+		// Same for non-object input.
+		dispatchIncomingMessage('not an object', deps);
+		assert.strictEqual(errorReplies.length, 0);
+		dispatchIncomingMessage(null, deps);
+		assert.strictEqual(errorReplies.length, 0);
 	});
 });
