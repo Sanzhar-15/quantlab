@@ -1,14 +1,14 @@
 ---
 name: 2026-05-22_phase-5-7-v3-2-cell-grid-ui
-status: in-progress (V3.2.a + V3.2.a.1 + V3.2.b + V3.2.c + V3.2.d ALL SHIPPED.  V3.2.d audit complete: Codex 0H+3M+2L + Opus 2H+4M+7L; 5 closures shipped at IDE `ff73f2c9f1b` (140/140 mocha); V3.2.d.6 docs + plan close + audit transcripts commit in THIS commit.  Rule 4 arc terminus stays at 6 (0 new triggers).  V3.2.e V3.2 exit packet (~1d) is the only remaining V3.2 work; after that, V3.3+ scope begins.)
+status: done (V3.2 FULLY SHIPPED -- V3.2.a + V3.2.a.1 + V3.2.b + V3.2.c + V3.2.d + V3.2.e exit packet all complete.  Engine HEAD bumps + IDE HEAD `ff73f2c9f1b` (140/140 mocha).  Rule 4 arc terminus stays at 6.  Phase 5.7 V3.2 SURFACE COMPLETE.  Plan ready for archive to `.plans/_archive/`; V3.3.0 entry plan or Phase 5.8 megaudit is the next session entry.)
 date: 2026-05-22
 predecessor_plan: .plans/_archive/2026-05-22_phase-5-7-v3-1-multi-window-demo.md (V3.1 multi-window demo, all sub-steps + audit closed)
 predecessor_v2_exit_packet: docs/phase5/5-7-v2-exit-packet.md (V2 phase termination -- Transport binding architectural decisions V2.1-V2.8)
 predecessor_v3_1_audits: docs/audits/2026-05-22-phase-5-7-v3-1-{codex,opus}.md (V3.1.e parallel audit; Opus § Section 3 contains the V3.2 ENTRY READINESS analysis this plan is built on)
 parent_phase: 5.7 Collaboration IDE Vertical Slice
 direction: V3.2 -- cell-grid UI. Real grid widget bound to a CollabSession; user-facing cell editing surface. First production-grade IDE consumer of the V2 Transport binding + V3.1 multi-window infrastructure.
-current_engine_head: (this commit) V3.2.d.6 ide-consumer-contract V3.2.d closures + V3.2.d plan close + audit transcripts
-current_ide_head: ff73f2c9f1b (V3.2.d code closures: HIGH-1 cache split + HIGH-2 bad_argument symmetry + Codex M1 post-reconnect flush + Codex M3 render try/catch + Opus M1 postMessage guard; +8 mocha tests)
+current_engine_head: (this commit) V3.2.e -- V3.2 exit packet at docs/phase5/5-7-v3-2-exit-packet.md
+current_ide_head: ff73f2c9f1b (V3.2.d code closures: HIGH-1 cache split + HIGH-2 bad_argument symmetry + Codex M1 post-reconnect flush + Codex M3 render try/catch + Opus M1 postMessage guard; +8 mocha tests; V3.2 final IDE HEAD)
 current_mocha_count: 140 / 140
 current_ql_collab_tests: 74 / 74 (with --features test-fixtures)
 current_ql_collab_ws_tests: 42 / 42 (10 lib + 30 websocket_transport + 2 V3.1.a relay)
@@ -116,8 +116,8 @@ V3.2 = cell-grid UI. Lift the V3.1 demo patterns into a real grid widget that us
    - **Deferred to V3.x** (with rationale in audit transcripts + this plan): Opus MEDIUM-2 (reconnect-disposal leak; V8 GC eventually cleans up); Opus MEDIUM-3 (NaN cell display; unreachable through V1+ API); Opus MEDIUM-4 (`exportSnapshot` lock-hold scaling; V3.3 problem -- addressed by V3.3 incremental-cache decision); all 9 LOW items.
    - V3.2.d.6 docs: this commit ships `ide-consumer-contract.md § 4.1.z2` V3.2.d closures subsection + V3.2 plan close + commits both audit transcripts.
 
-- [ ] **V3.2.e -- V3.2 exit packet (~1d)** at `docs/phase5/5-7-v3-2-exit-packet.md`.
-   - Mirrors the V2 exit packet structure: commit ladder, surface contract, decisions locked (multiplex vs per-session, push vs poll), Rule 4 arc state, V3.3+ backlog, audit transcripts inventory.
+- **V3.2.e -- V3.2 exit packet** ✅ SHIPPED 2026-05-22 at `docs/phase5/5-7-v3-2-exit-packet.md` (this commit).
+   - Mirrors V2 exit packet structure: 12 sections covering commit ladder (8 engine + 7 IDE commits), surface contract (3 commands + exportSnapshot napi + new IDE types + new module files + message envelope + 2 IDE wrappers), V3.2.b + V3.2.c decision locks (B1-B5 + C1-C7), V3.2.d audit findings + closure-vs-defer rationale for all 21 items, Rule 4 arc state (terminus 6 unchanged), V3.3+ backlog consolidated from across the arc + inherited from V3.1.e + V2, V3.3 ENTRY READINESS packet (Opus § verbatim), 25-transcript audit inventory, test counts breakdown (V2 95 -> V3.2 140), honest gaps (live UI smoke pending), next-phase recommendation (V3.3.0 OR Phase 5.8 megaudit).
 
 ## V3.2 design decisions to lock at V3.2.a entry
 
