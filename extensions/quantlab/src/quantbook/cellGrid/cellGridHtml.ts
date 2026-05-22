@@ -255,6 +255,24 @@ export function formatCellValue(value: QuantbookCellValue): string {
  *
  * **DO NOT** use ES6 template literals inside this string -- the outer
  * template literal will swallow them. ASCII string concatenation only.
+ *
+ * **V3.3.0.4 + V3.3.0.X drift hazard (2026-05-22)**: the client script
+ * includes `formatCellValueClient` + `renderRowsClient`, which are
+ * MIRRORS of the server-side `formatCellValue` (line 212) +
+ * `renderRows` (line 152) helpers.  The mirrors exist because the
+ * inline webview script cannot import modules.  Any future change to
+ * the server-side formatter MUST also update the client mirror:
+ *   - V3.x backlog (V3.2.d Opus MEDIUM-3) routes non-finite numbers
+ *     to `'#NUM!'`; the client mirror must match.
+ *   - V3.x text/boolean/error append paths must mirror the
+ *     server-side display string.
+ *   - V3.x escaping changes (e.g., RTL-override stripping) must mirror.
+ * The drift surface is silent: client + server disagreement produces
+ * cells that LOOK right on initial paint but change on scroll, or vice
+ * versa.  V3.x can close this by code-generating the client mirror
+ * from the server formatter via a build step OR by passing the
+ * pre-formatted value through the snapshot data block instead of
+ * re-formatting client-side.
  */
 function buildClientScript(sheetForClient: number): string {
 	// `sheetForClient` is interpolated via `String()` to coerce to its

@@ -151,6 +151,14 @@ export class CellGridPanel {
 		// sheet, this panel's title stays "of M" until the panel is
 		// re-rendered (V3.x can wire a dynamic title update if the
 		// stale display becomes a real ergonomic issue).
+		//
+		// **V3.3.0.X audit-closure note on cost**: this `listSheets()`
+		// call is ONE napi roundtrip per `show()` invocation, which is
+		// bounded (a `show()` only fires on user-initiated open or
+		// reveal).  Pre-V3.3.0.3 this would have been O(N) in op count;
+		// post-V3.3.0.3 the engine reads from the incremental snapshot
+		// cache so the cost is O(distinct-sheets).  No additional
+		// caching needed at the IDE layer.
 		let titleSuffix = '';
 		try {
 			const totalSheets = session.listSheets().length;

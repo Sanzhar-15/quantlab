@@ -269,6 +269,19 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 	// switching UX needs different design).  If no LOCAL panel is
 	// open or the session has only one sheet, surface an info
 	// message + return.
+	//
+	// **Multi-panel selection semantic (V3.3.0.5 audit closure)**:
+	// when >1 local panel is open with different sessions, this
+	// command operates on `panels[0]` (the FIRST entry in
+	// activeLocalPanels()).  Map iteration order in V8 is
+	// chronological-insertion-order, so `panels[0]` = the OLDEST
+	// open local panel, NOT the currently-focused one.  This may
+	// surprise users who expect "switch the sheet of the panel I
+	// just clicked".  V3.x can add either: (a) a panel-picker step
+	// before the sheet picker, or (b) a `vscode.window.activeTextEditor`-
+	// style "active panel" accessor.  V3.3.0.5 ships with the
+	// oldest-panel semantic for simplicity; the multi-panel-local
+	// usage is rare today.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookCellGridSwitchSheet', async () => {
 			const panels = CellGridPanel.activeLocalPanels();
