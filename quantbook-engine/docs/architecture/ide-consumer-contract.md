@@ -521,7 +521,73 @@ Remote peers' edits do NOT automatically appear in this panel.  The user must ru
 - The `[ql-collab-ws relay]` stdout marker (from § 4.1.y) and the cell-grid envelope's `type` field strings (`putValue` / `errorReply`) are load-bearing contract -- a string-level grep is the source of truth, no symbol coupling between webview-side text and host-side text.
 - `data-original-text` and `data-original-kind` attributes on `.cell-value` cells carry the cell's pre-edit text.  The cancel path (Escape / blur) reads them to restore the cell.  If you rename either attribute, update both sides of the script that produces + consumes them.
 
-**Out of scope for V3.2.b:** virtualization (V3.3), live remote-peer propagation (V3.2.c), text / boolean / error cell editing (waits on engine-side `appendPutValueText` / `appendPutValueBool` bindings), multi-cell selection / paste, formula bar.
+**Out of scope for V3.2.b:** virtualization (V3.3), live remote-peer propagation (V3.2.c -- see below), text / boolean / error cell editing (waits on engine-side `appendPutValueText` / `appendPutValueBool` bindings), multi-cell selection / paste, formula bar.
+
+### 4.1.z2 Cell-grid live multi-window propagation (Phase 5.7 V3.2.c, 2026-05-22)
+
+**Status:** V3.2.c.2-V3.2.c.5 at IDE commit `a165141eb68`; V3.2.c.6 docs in THIS commit.  Closes the "no remote auto-refresh" V3.2.b limitation by attaching a Transport + running a 1-second `pollRemote` loop.
+
+**New command:** `quantlab.quantbookCellGridCollab` ("Quantbook: Open Cell Grid (Collab)").  The V3.2.a `quantlab.quantbookCellGrid` command stays local-only for fast-start dev / smoke; the collab command is the multi-window surface.
+
+**Attach orchestration (decision C1 + C7):** REUSES `connectOrSpawn` from `extensions/quantlab/src/quantbook/multiWindowDemo.ts` (now exported per V3.2.c.2):
+
+1. Try `engine.Transport.websocketConnect('ws://127.0.0.1:7117')` first.  If a peer window is already running the V3.1.a relay, this succeeds.
+2. On failure: spawn the `relay-server` binary (resolved via `resolveRelayBinaryPath`), wait for the stable stdout marker `[ql-collab-ws relay] listening on ws://...`, then reconnect.
+3. On spawn-loss race (two windows invoking concurrently both fail step 1, both spawn; OS gives the bind to one; the loser's binary exits): retry step 1.  Lose-the-race window becomes a passive joiner.  V3.1.e Opus M2 / Codex L1 convergent closure preserved.
+
+**Panel lifecycle:** `CellGridPanel.show(context, session, sheet, attachment)`.
+
+- `attachment` is `CollabAttachment { engine, transport, spawnedRelay, log }`.  The panel OWNS every field's lifetime.
+- `wireAttachment` runs BEFORE the first render: `session.setAutoFlushPolicy('onAppend')` (decision B4 in `runMultiWindowDemo` -- matches here) + `session.attachTransport(transport)` + `setInterval(tickPollRemote, 1000)`.
+- Each cell commit (the V3.2.b `appendPutValueValidated` path) now auto-flushes to the attached transport; peer windows pick it up on their next pollRemote tick.
+
+**Pollloop (decisions C2 + C3 + C5):**
+
+The 1-second interval calls `tickPollRemote()`, which delegates to vscode-free `classifyPollTick(session)`:
+
+```ts
+type PollTickResult =
+  | { kind: 'idle' }                            // pollRemote()=0; no change
+  | { kind: 'merged'; count: number }           // pollRemote()=n>0; render
+  | { kind: 'transportClosed' }                 // reconnect via V3.1.c
+  | { kind: 'error'; code; message };           // log + skip the tick
+```
+
+On `merged`: full `this.render()` rebuild.  Per-cell diffing is deferred to V3.3 virtualization; at V3.2 scale (hundreds of cells, human-typing cadence) a full re-render every second is imperceptible.
+
+**Reconnect (decision C6):** REUSES V3.1.c's `reconnectWithBackoff` (now exported per V3.2.c.2).  3 tries at 500/1000/2000 ms.  On exhaustion: dispose the panel + kill spawned relay (signal-aware predicate per V3.1.e Codex L4) + `showWarningMessage(..., 'Restart Cell Grid (Collab)')`.  Restart re-invokes the command; the fresh invocation re-runs `connectOrSpawn` (no relay running -> spawn).
+
+**Single-tab-per-sheet (V3.2.a.1 + V3.2.c.3):**
+
+- LOCAL panels obey the V3.2.a.1 cache (one panel per sheet; re-open reveals + refreshes).
+- COLLAB panels BYPASS the cache (`attachment !== undefined` -> always create a new panel).  Rationale: local + collab on the same sheet target DIFFERENT sessions; reusing the local panel would silently swap its session, breaking the V3.2.b dispatcher's `this.session` closure.
+
+**Status indicator (decision C4):**
+
+OutputChannel-only at V3.2.c.  Each state transition emits a tagged log line:
+
+- `[collab] starting cell-grid collab (sheet 0)...`
+- `[collab] joined existing relay at ws://127.0.0.1:7117`  OR  `[collab] spawned relay AND joined at ...`
+- `[collab] attached transport (sheet 0); pollRemote every 1000ms`
+- `[collab] pollRemote merged N remote blob(s); re-rendering`
+- `[collab] pollRemote saw transport_closed; reconnecting`
+- `[collab] reconnect succeeded; resuming pollRemote`  OR  `[collab] reconnect EXHAUSTED: ...`
+- `[collab] disposed (sheet 0).`
+
+Persistent `vscode.window.createStatusBarItem` is V3.x backlog.
+
+**Deferred to V3.x (still):**
+
+- Per-cell "incoming" tint animation on merged-remote ops (decision C5 deferred).
+- Push API from engine (`Transport::on_inbound_blob` callback) replacing 1s polling -- needs new napi surface + Rule 4 audit (decision C2 Option B).
+- Multi-sheet grid (V3.3).
+- Optimistic rendering (still N/A at localhost latency; V3.x WAN may revisit).
+
+**Drift hazards (V3.x maintainers):**
+
+- `POLL_REMOTE_INTERVAL_MS = 1000` (`cellGridPanel.ts`) and the multiWindowDemo's `POLL_REMOTE_INTERVAL_MS` are separate constants of the same value.  Keep in sync OR extract to a shared config module when adding a second tunable surface.
+- `connectOrSpawn` + `reconnectWithBackoff` are exported from `multiWindowDemo.ts` for V3.2.c.  V3.2.d audit may decide to extract to a `transportLifecycle.ts` module; in that case update BOTH the multiWindowDemo command path AND the cell-grid collab path.
+- `CollabAttachment.spawnedRelay` -- the panel disposes it on close.  If you add a SECOND panel for the same sheet (e.g., a future preview surface), make sure only ONE owns the relay; the other should pass `spawnedRelay: undefined` as a joiner.
 
 ---
 

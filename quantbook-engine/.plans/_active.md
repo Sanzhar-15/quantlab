@@ -1,15 +1,15 @@
 ---
 name: 2026-05-22_phase-5-7-v3-2-cell-grid-ui
-status: in-progress (V3.2.a + V3.2.a.1 + V3.2.b SHIPPED.  V3.2.b.1 decision lock at engine `ce5d697cb17`; V3.2.b.2-V3.2.b.5 at IDE `86b02d22a0b`; V3.2.b.6 docs + plan at engine `9cd9fd6f5b9`.  V3.2.c.1 7-decision lock ships in THIS commit (attach via connectOrSpawn reuse, 1s pollRemote, full re-render granularity, OutputChannel status, deferred per-cell tint, V3.1.c reconnect reuse, helper export from multiWindowDemo).  IDE mocha 126/126.  V3.2.c.2-V3.2.c.6 (~2d) is the implementation sequence.)
+status: in-progress (V3.2.a + V3.2.a.1 + V3.2.b + V3.2.c SHIPPED.  V3.2.c.1 decision lock at engine `14b6ad1e932`; V3.2.c.2-V3.2.c.5 code at IDE `a165141eb68` (+ 6 mocha tests, 126 -> 132); V3.2.c.6 docs + plan close ship in THIS commit.  IDE mocha 132/132.  V3.2.d parallel Codex+Opus audit is the next major work item per the V3.2 plan -- it sweeps V3.2.a + V3.2.b + V3.2.c together for cumulative findings invisible at per-step level.)
 date: 2026-05-22
 predecessor_plan: .plans/_archive/2026-05-22_phase-5-7-v3-1-multi-window-demo.md (V3.1 multi-window demo, all sub-steps + audit closed)
 predecessor_v2_exit_packet: docs/phase5/5-7-v2-exit-packet.md (V2 phase termination -- Transport binding architectural decisions V2.1-V2.8)
 predecessor_v3_1_audits: docs/audits/2026-05-22-phase-5-7-v3-1-{codex,opus}.md (V3.1.e parallel audit; Opus § Section 3 contains the V3.2 ENTRY READINESS analysis this plan is built on)
 parent_phase: 5.7 Collaboration IDE Vertical Slice
 direction: V3.2 -- cell-grid UI. Real grid widget bound to a CollabSession; user-facing cell editing surface. First production-grade IDE consumer of the V2 Transport binding + V3.1 multi-window infrastructure.
-current_engine_head: (this commit) V3.2.b.6 ide-consumer-contract § 4.1.z + plan checkboxes
-current_ide_head: 86b02d22a0b (V3.2.b.2-V3.2.b.5 nonced cell-edit flow + 18 new mocha tests)
-current_mocha_count: 126 / 126
+current_engine_head: (this commit) V3.2.c.6 ide-consumer-contract § 4.1.z2 + V3.2.c plan close
+current_ide_head: a165141eb68 (V3.2.c.2-V3.2.c.5 live multi-window cell grid + 6 new mocha tests)
+current_mocha_count: 132 / 132
 current_ql_collab_tests: 74 / 74 (with --features test-fixtures)
 current_ql_collab_ws_tests: 42 / 42 (10 lib + 30 websocket_transport + 2 V3.1.a relay)
 current_engine_workspace: 4472 / 0 baseline
@@ -94,12 +94,12 @@ V3.2 = cell-grid UI. Lift the V3.1 demo patterns into a real grid widget that us
 
    ### V3.2.c sub-steps
 
-   1. [ ] V3.2.c.1 -- THIS plan commit (decision lock).
-   2. [ ] V3.2.c.2 -- Export `connectOrSpawn` + `reconnectWithBackoff` from `multiWindowDemo.ts`.  No behaviour change; only widens visibility.
-   3. [ ] V3.2.c.3 -- Extend `CellGridPanel` to accept an OPTIONAL `transport: TransportInstance` constructor param; if attached, `setAutoFlushPolicy('onAppend')` + `attachTransport(transport)` + start 1s pollRemote timer that calls `this.render()` on `n > 0`.  Dispose path clears the timer + detaches.
-   4. [ ] V3.2.c.4 -- Add `quantlab.quantbookCellGridCollab` command: runs `connectOrSpawn`, opens `CellGridPanel` with the attached transport, hooks reconnect on `transport_closed` via `reconnectWithBackoff`, surfaces failure via `showWarningMessage('Restart Cell Grid')`.
-   5. [ ] V3.2.c.5 -- Mocha tests: two-session integration (mirrors V3.1.b's spawn-relay-then-A-appends-B-polls round-trip) but driving CellGridPanel-equivalent attach logic; pollRemote-loop unit test (use Sinon-style fake timers if available, else assert manual mergeBytes path triggers `render()`).
-   6. [ ] V3.2.c.6 -- Docs: extend ide-consumer-contract.md § 4.1.z with the V3.2.c attach + poll contract; update plan checkboxes + HEADs.
+   1. [x] V3.2.c.1 -- decision lock (engine `14b6ad1e932`).
+   2. [x] V3.2.c.2 -- Export `connectOrSpawn` + `reconnectWithBackoff` from `multiWindowDemo.ts` (IDE `a165141eb68`, bundled).
+   3. [x] V3.2.c.3 -- Extend `CellGridPanel` with optional `CollabAttachment`; `wireAttachment` calls `setAutoFlushPolicy('onAppend')` + `attachTransport` + starts 1s `pollRemote` timer.  Classifier extracted to vscode-free `classifyPollTick` in `cellGridLogic.ts`.  `disposeAttachment` idempotent (clearInterval + detach + kill spawned relay via signal-aware predicate per V3.1.e Codex L4).
+   4. [x] V3.2.c.4 -- `quantlab.quantbookCellGridCollab` command: `connectOrSpawn` + `CellGridPanel.show(..., attachment)`.  Reconnect on `transport_closed` via `reconnectWithBackoff`; failure surfaces `showWarningMessage('Restart Cell Grid (Collab)')`.  Single-tab-per-sheet rule: collab panels bypass the cache (so local + collab on the same sheet don't clobber each other).
+   5. [x] V3.2.c.5 -- Mocha tests (+6, 126 -> 132): 4 `classifyPollTick` pins (idle / mergeBytes-not-drain / merged-after-loopback / drain-then-idle); 2 two-session loopback round-trip pins (auto-flush + pollRemote + snapshot mirror; detach + idle).
+   6. [x] V3.2.c.6 -- Docs: `ide-consumer-contract.md § 4.1.z2` (V3.2.c attach + poll + reconnect + drift hazards) ships in THIS commit.
 
 - [ ] **V3.2.d -- Parallel Codex + Opus audit + closures (~1-2d)** -- per Rule 2.
    - Codex lane: protocol/correctness sweep over the new napi surface + grid rendering correctness + edit-commit semantics.
