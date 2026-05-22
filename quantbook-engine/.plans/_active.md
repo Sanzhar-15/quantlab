@@ -1,6 +1,6 @@
 ---
 name: 2026-05-22_phase-5-7-v3-2-cell-grid-ui
-status: in-progress (V3.2.a snapshot foundation SHIPPED -- exportSnapshot napi + IDE typed wrapper at engine `355a3226f0a` + IDE `831c9f2bf37`; webview + virtualized table + command registration DEFERRED to fresh session; predecessor V3.1 fully shipped at engine `97ac0b902d1` / IDE `a46abea484a`)
+status: in-progress (V3.2.a SCAFFOLD COMPLETE -- exportSnapshot napi (engine `355a3226f0a`) + IDE typed wrapper (`831c9f2bf37`) + webview scaffold + quantbookCellGrid command (`fcfe9e91188`); virtualized renderer deferred to V3.3; V3.2.b cell-edit flow is the next entry; predecessor V3.1 fully shipped at engine `97ac0b902d1` / IDE `a46abea484a`)
 date: 2026-05-22
 predecessor_plan: .plans/_archive/2026-05-22_phase-5-7-v3-1-multi-window-demo.md (V3.1 multi-window demo, all sub-steps + audit closed)
 predecessor_v2_exit_packet: docs/phase5/5-7-v2-exit-packet.md (V2 phase termination -- Transport binding architectural decisions V2.1-V2.8)
@@ -8,8 +8,8 @@ predecessor_v3_1_audits: docs/audits/2026-05-22-phase-5-7-v3-1-{codex,opus}.md (
 parent_phase: 5.7 Collaboration IDE Vertical Slice
 direction: V3.2 -- cell-grid UI. Real grid widget bound to a CollabSession; user-facing cell editing surface. First production-grade IDE consumer of the V2 Transport binding + V3.1 multi-window infrastructure.
 current_engine_head: 355a3226f0a (V3.2.a engine -- exportSnapshot napi method)
-current_ide_head: 831c9f2bf37 (V3.2.a IDE -- typed wrapper + 5 mocha tests)
-current_mocha_count: 103 / 103
+current_ide_head: fcfe9e91188 (V3.2.a IDE scaffold -- cellGrid webview + command + 5 HTML tests)
+current_mocha_count: 108 / 108
 current_ql_collab_tests: 74 / 74 (with --features test-fixtures)
 current_ql_collab_ws_tests: 42 / 42 (10 lib + 30 websocket_transport + 2 V3.1.a relay)
 current_engine_workspace: 4472 / 0 baseline
@@ -56,13 +56,13 @@ V3.2 = cell-grid UI. Lift the V3.1 demo patterns into a real grid widget that us
 
 ## V3.2 sub-steps
 
-- **V3.2.a -- Grid scaffolding (~2d)** -- minimum coherent surface. PARTIALLY SHIPPED 2026-05-22.
-   1. [ ] New webview component at `extensions/quantlab/src/quantbook/cellGrid/`. Use VS Code's `vscode.WebviewView` API (or `WebviewPanel` if a tab is preferred). DEFERRED to fresh session.
-   2. [x] Read sheet 0's cell range from the engine via a new napi method `CollabSession.exportSnapshot(sheet)`. SHIPPED at engine `355a3226f0a` + IDE `831c9f2bf37`. Returns JSON-serialized `QuantbookCellSnapshot` (snapshot_format_version = 1, entries sorted by (row, col) with last-write-wins per cell). Decision 1 LOCKED to Option A (new napi method). 5 mocha tests pin empty / sort+LWW / sheet-filter / exportBytes round-trip / JSON-decoded return.
-   3. [ ] Render as a virtualized table (e.g., 1000 visible rows max for V3.2.a; full pagination is V3.3). DEFERRED.
-   4. [ ] NO editing yet -- read-only render. DEFERRED to V3.2.a webview ship.
-   5. [ ] Wire to `quantlab.quantbookCellGrid` command that opens the webview. DEFERRED.
-   6. [partial] Mocha tests: 5 unit-level snapshot tests shipped; webview-rendering snapshot tests DEFERRED to V3.2.a webview ship.
+- **V3.2.a -- Grid scaffolding (~2d)** ✅ SHIPPED 2026-05-22.
+   1. [x] New webview component at `extensions/quantlab/src/quantbook/cellGrid/`. `cellGridHtml.ts` (pure HTML functions, no vscode import -- enables host-free testing) + `cellGridPanel.ts` (vscode `WebviewPanel` wrapper). IDE commit `fcfe9e91188`.
+   2. [x] Read sheet 0's cell range from the engine via `CollabSession.exportSnapshot(sheet)`. SHIPPED at engine `355a3226f0a` + IDE `831c9f2bf37`. Returns JSON-serialized `QuantbookCellSnapshot` (snapshot_format_version = 1, entries sorted by (row, col) with last-write-wins per cell). Decision 1 LOCKED to Option A.
+   3. [partial] Table render: static HTML table shipped. Virtualization deferred to V3.3 (out of V3.2.a scope per plan).
+   4. [x] Read-only render -- `enableScripts: false` + CSP `default-src 'none'`. V3.2.b will flip scripts on for message-passing.
+   5. [x] `quantlab.quantbookCellGrid` command registered + package.json + package.nls.json (title "Quantbook: Open Cell Grid"). Sample data injected at command invocation so the grid renders non-empty on first open.
+   6. [x] Mocha tests: 10 total (5 V3.2.a engine-side snapshot + 5 V3.2.a IDE HTML rendering including XSS escape pin + CSP meta tag pin).
 
 - [ ] **V3.2.b -- Cell-edit flow (~3d)** -- write surface.
    1. Click cell -> input element appears -> user types -> Enter or blur commits.
