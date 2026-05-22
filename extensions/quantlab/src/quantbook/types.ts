@@ -121,9 +121,19 @@ export interface CollabSessionInstance {
 	flushToTransport(): boolean;
 
 	/**
-	 * Drain inbound bytes from the attached transport (single-pass).
-	 * Returns the count of ops merged. `0` if no transport is attached
-	 * or no bytes were queued.
+	 * Drain inbound BLOBS from the attached transport (single-pass).
+	 * Returns the count of BLOBS drained (NOT the count of ops),
+	 * capped by the engine's default poll limit (`DEFAULT_POLL_REMOTE_LIMIT
+	 * = 64`). Each blob is one snapshot/delta that may contain many ops;
+	 * to count ops, compare `opCount()` before vs after.
+	 *
+	 * `0` if no transport is attached or no bytes were queued.
+	 *
+	 * **V2.1 audit closure (Codex MEDIUM-1, 2026-05-22)**: the prior
+	 * docstring said "count of ops merged" which contradicted the
+	 * engine's semantics (`poll_remote_with_limit` returns `merged <=
+	 * max_blobs`). Mocha test "three-mutation chain across LoopbackPair"
+	 * empirically discovered this and now pins the blob-count contract.
 	 *
 	 * @throws Error if the transport's `try_recv` or the merge step
 	 *               returns an error.

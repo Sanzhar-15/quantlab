@@ -218,6 +218,33 @@ suite('quantbook engine round-trip -- Phase 5.7 V1', () => {
 		}
 	});
 
+	test('stale V1-shaped binary (missing V2.1 Transport + LoopbackPair) is rejected at the boundary', () => {
+		// **V2.1 audit closure (Codex MEDIUM-2, 2026-05-22)**: catch a
+		// stale V1 binary at loader time instead of producing a cryptic
+		// "LoopbackPair is not a constructor" TypeError at the V2.1
+		// helper call site.
+		const originalDlopen = process.dlopen;
+		_resetQuantbookEngineCacheForTests();
+		// V1-shaped exports: version() + CollabSession but no Transport + no LoopbackPair.
+		(process as unknown as { dlopen: typeof process.dlopen }).dlopen =
+			(mod: NodeJS.Module): void => {
+				(mod as unknown as { exports: Record<string, unknown> }).exports = {
+					version: () => '0.0.1-pre-v2.1',
+					CollabSession: function () { /* fake constructor */ },
+				};
+			};
+		try {
+			assert.throws(
+				() => loadQuantbookEngine(),
+				/Transport constructor \(V2\.1\).*LoopbackPair constructor \(V2\.1\)/,
+				'stale V1 binary must mention BOTH missing V2.1 exports',
+			);
+		} finally {
+			process.dlopen = originalDlopen;
+			_resetQuantbookEngineCacheForTests();
+		}
+	});
+
 	test('appendPutValueValidated rejects negative row', () => {
 		const s = createSession(1n);
 		assert.throws(
@@ -505,14 +532,16 @@ suite('quantbook V2.1 -- Transport binding (LoopbackPair + CollabSession)', func
 			'B opCount matches A after sync');
 	});
 
-	test('three-mutation chain across LoopbackPair: all ops sync via single flush', () => {
-		// **Note on pollRemote return semantics**: it returns the number
-		// of BLOBS drained, NOT the number of ops. A single flush
-		// produces one blob that may contain N ops; pollRemote returns
-		// 1 regardless of N. The actual op delivery is verified via
-		// sessionB.opCount() matching sessionA.opCount() after sync.
-		// (Engine docstring: poll_remote_with_limit returns "merged
-		// <= max_blobs".)
+	test('three-mutation chain across LoopbackPair: single flush -> 1 blob (blob-count contract)', () => {
+		// **V2.1 audit closure (Codex MEDIUM-1, 2026-05-22)**: pin the
+		// blob-count vs op-count semantic. pollRemote returns the
+		// number of BLOBS drained, NOT ops. A single flush produces
+		// ONE blob containing N ops, so pollRemote returns 1.
+		//
+		// Prior assertion `>= 1` would have silently passed if the
+		// engine ever flipped to op-count semantics (>=1 is true for
+		// both 1 and 3). Tightened to strictEqual(1) so any semantic
+		// regression is caught.
 		const sessionA = createSession(1n);
 		const sessionB = createSession(2n);
 		const [tA, tB] = loopbackTransportPair();
@@ -524,10 +553,11 @@ suite('quantbook V2.1 -- Transport binding (LoopbackPair + CollabSession)', func
 		}
 		assert.strictEqual(sessionA.opCount(), 3, 'A has 3 ops');
 		sessionA.flushToTransport();
-		const blobsMerged = sessionB.pollRemote();
-		assert.ok(blobsMerged >= 1, `expected >=1 blob drained, got ${blobsMerged}`);
+		const blobsDrained = sessionB.pollRemote();
+		assert.strictEqual(blobsDrained, 1,
+			'single flush -> 1 blob queued -> pollRemote returns 1, NOT 3 (op count)');
 		assert.strictEqual(sessionB.opCount(), 3,
-			'B has all 3 ops after a single flush+poll');
+			'B has all 3 ops after unpacking the single blob');
 	});
 
 	test('bidirectional sync: A->B and B->A via the same pair', () => {
@@ -588,15 +618,24 @@ suite('quantbook V2.1 -- Transport binding (LoopbackPair + CollabSession)', func
 		);
 	});
 
-	test('detach drops in-flight bytes on the loopback queue', () => {
-		// Behavioral spec: detaching session A's transport drops the
-		// bytes it just sent. Peer B's poll then returns 0 (the bytes
-		// went into the Loopback queue which was tied to the now-dropped
-		// transport end on A's side).
+	test('detach does NOT drop bytes already queued for peer (Arc-shared LoopbackTransport queue)', () => {
+		// **V2.1 audit closure (Opus HIGH-1, 2026-05-22)**: pin the
+		// correct in-flight delivery behavior. The prior version of
+		// this test pinned the OPPOSITE spec ("detach drops in-flight
+		// bytes") with a tautological assertion `merged >= 0` — wrong
+		// AND undiscriminating.
 		//
-		// NOTE: this pins current Loopback semantics. If the engine
-		// later guarantees in-flight delivery (e.g., via a sticky
-		// queue), this test should be updated to reflect that.
+		// **Actual contract** verified at
+		// `crates/ql-collab/src/transport.rs::LoopbackTransport::pair()`:
+		// the two endpoints share their queues via Arc<Mutex<VecDeque>>.
+		// A's outbox IS b.inbox; when A is dropped, its Arc clones
+		// decrement but B's Arc keeps the queue ALIVE with bytes intact.
+		// So B's pollRemote still drains A's queued bytes after A
+		// detaches.
+		//
+		// This is load-bearing for the V2 V3 step 3 offline-write
+		// contract: a sender that goes offline mid-flush has its bytes
+		// preserved until the peer polls them.
 		const sessionA = createSession(1n);
 		const sessionB = createSession(2n);
 		const [tA, tB] = loopbackTransportPair();
@@ -605,14 +644,14 @@ suite('quantbook V2.1 -- Transport binding (LoopbackPair + CollabSession)', func
 
 		sessionA.appendPutValue(0, 0, 0, 1);
 		sessionA.flushToTransport();
-		// Don't poll yet. Detach A's transport.
+		// A's bytes are now on the shared queue. Detach A's transport.
 		sessionA.detachTransport();
-		// B's queue MAY still have the bytes (the queue is shared
-		// between the two ends; A's end dropping doesn't necessarily
-		// drain B's receive buffer). The behavioral spec we pin: B
-		// can poll without error, and the result is either 0 or
-		// >=1; we assert no panic and a valid u32.
-		const merged = sessionB.pollRemote();
-		assert.ok(merged >= 0, `pollRemote returned valid u32: ${merged}`);
+		// B's Arc on the shared queue is unaffected; the queued bytes
+		// remain. Poll drains them.
+		const blobsDrained = sessionB.pollRemote();
+		assert.strictEqual(blobsDrained, 1,
+			'B drained the 1 queued blob after A detached (Arc-shared queue keeps bytes alive)');
+		assert.strictEqual(sessionB.opCount(), 1,
+			'B has the op even though A detached (in-flight bytes delivered)');
 	});
 });

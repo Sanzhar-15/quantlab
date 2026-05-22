@@ -211,12 +211,35 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 	// to consumers. The actionable "missing expected exports" error was
 	// lost on call #2; consumers saw a cryptic `TypeError: ...
 	// CollabSession is not a constructor` at the use site instead.
+	//
+	// **V2.1 audit closure (Codex MEDIUM-2, 2026-05-22)**: extended the
+	// shape-check to include V2.1's new `Transport` (constructor function)
+	// and `LoopbackPair` (constructor function) exports. Without this
+	// check, a stale V1 binary (built before V2.1 added LoopbackPair)
+	// passes loader validation and fails LATER with a cryptic TypeError
+	// when consumer code calls `new engine.LoopbackPair()`. Catch it at
+	// the boundary instead.
 	const loaded = fakeModule.exports as unknown as QuantbookNativeModule;
-	if (typeof loaded.version !== 'function' || typeof loaded.CollabSession !== 'function') {
+	const missing: string[] = [];
+	if (typeof loaded.version !== 'function') {
+		missing.push('version()');
+	}
+	if (typeof loaded.CollabSession !== 'function') {
+		missing.push('CollabSession constructor');
+	}
+	if (typeof (loaded as { Transport?: unknown }).Transport !== 'function') {
+		missing.push('Transport constructor (V2.1)');
+	}
+	if (typeof loaded.LoopbackPair !== 'function') {
+		missing.push('LoopbackPair constructor (V2.1)');
+	}
+	if (missing.length > 0) {
 		throw new Error(
-			`Quantbook engine at ${enginePath} loaded but is missing expected exports. ` +
+			`Quantbook engine at ${enginePath} loaded but is missing expected exports: ` +
+			`[${missing.join(', ')}]. ` +
 			`Got: ${JSON.stringify(Object.keys(fakeModule.exports))}. ` +
-			`Expected at least: version(), CollabSession constructor.`,
+			`This indicates a stale binary -- rebuild with: ` +
+			`cargo build -p ql-bindings-node --release`,
 		);
 	}
 	cachedModule = loaded;
