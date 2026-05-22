@@ -269,7 +269,7 @@ Highlights:
 | HIGH-1: `BlockingTransportFixture` ships in every production cdylib (DoS surface: u32::MAX ms blocking-pool park) | Closed V2.8 -- cfg-gate behind binding-side `test-fixtures` feature |
 | MEDIUM-1: `WebSocketError::InvalidUrl` Display leaks URL-embedded credentials | Closed V2.8 -- `scrub_url_credentials_in` helper |
 | MEDIUM-2: Rule 4 silence on `Transport` napi wrapper + `LoopbackPair` Send-only asserts | Closed V2.8 -- positive Sync compile asserts for `LoopbackPair` + `BlockingTransportFixture`; explicit comment documents why `Transport` stays Send-only |
-| MEDIUM-3: `KNOWN_QUANTBOOK_ERROR_CODES` not codegen'd from `QuantbookErrorCode` union | DEFERRED to V3 backlog (infra-level work) |
+| MEDIUM-3: `KNOWN_QUANTBOOK_ERROR_CODES` not codegen'd from `QuantbookErrorCode` union | Closed V2.9 (post-V2-phase hardening) -- IDE `58f607fe1d0`. `Record<Exclude<QuantbookErrorCode, 'unknown'>, true>` compile-time enforcement: adding a code to the union without adding it to the record fails TS compile. Runtime Set derived via `Object.keys`. |
 | MEDIUM-4: `parseQuantbookError` doesn't walk `Error.cause` chain | Closed V2.8 -- depth-8 walker with self-cycle guard |
 
 ## Rule 4 arc log (audit-discipline rule 4)
@@ -296,13 +296,21 @@ These were identified in V2 audit transcripts but deferred to V3 product scope:
 1. **Multi-window IDE demo** (`quantlab.quantbookDemo` spawning a second VS Code window via `vscode.openFolder` + localhost ws relay). V2.7+ design ready; defer to V3 as a product surface.
 2. **Production-cdylib hardening of `BlockingTransport` symbols** (Lane C HIGH-1 *partial closure*). V2.8 cfg-gates `BlockingTransportFixture`; the underlying `ql_collab::BlockingTransport` symbols are also `#[cfg(feature = "test-fixtures")]`-gated already. Production builds are now clean.
 3. **Structured `transportLastErrorInfo()` accessor** (V2.7 closure + Lane A LOW-3). Today `transportLastError()` returns a raw `Option<String>` with no kind prefix; the engine has the kind but the napi accessor maps `WebSocketError -> e.to_string()`. Adding a structured accessor would make `websocket_runtime_error` reachable via `parseQuantbookError`. Defer until a V3 caller needs it.
-4. **`KNOWN_QUANTBOOK_ERROR_CODES` codegen** (Lane C MEDIUM-3). Today manually maintained in TS; V3 should codegen from the `QuantbookErrorCode` union (or use a const enum) to eliminate the manual drift hazard.
+4. **`KNOWN_QUANTBOOK_ERROR_CODES` codegen** (Lane C MEDIUM-3). **CLOSED at V2.9** (IDE `58f607fe1d0`) via `Record<Exclude<QuantbookErrorCode, 'unknown'>, true>` compile-time enforcement -- adding a code to the union without adding a key to the Record fails TS compile, and the runtime Set is derived from `Object.keys`. No longer in V3 backlog.
 5. **`willFlushSend` helper** (V2 backlog from prior cycle).
 6. **`LoopbackTransport.close`** (V2 backlog from prior cycle).
 7. **`HandshakeFailed` fixture** (V2 backlog from prior cycle).
 8. **`CollabSessionError::Transport(_)` origin tracking** (V2.7 Opus M3). Today documented as intentional passthrough; V3 may want explicit origin if multi-window WS reconnect needs richer context.
 9. **`@napi-rs/cli` publish pipeline** (V1 backlog still open).
 10. **Production-build error-paths sweep** (V2 backlog from prior cycle): every code path that emits a raw `Error::from_reason(...)` should route through a kind-stamped helper. V2.7 closed 14 of these via `bad_argument_error`; sweep the remainder in V3.
+
+## V2.9 post-phase-termination hardening (2026-05-22)
+
+Between V2.8 phase termination + V3 entry, one Lane C finding turned out to need lighter remediation than the megaudit suggested:
+
+**Lane C MEDIUM-3 (KNOWN_QUANTBOOK_ERROR_CODES manual-sync drift)**. The audit framed this as "codegen" -- file-generation infra. The actual remediation was a TS type trick: `Record<Exclude<QuantbookErrorCode, 'unknown'>, true>` enforces at COMPILE TIME that the runtime Set matches the union (every key required by the type system, runtime Set derived via `Object.keys`). No codegen tool, no file generator -- just structural typing. IDE commit `58f607fe1d0` ships it + a round-trip mocha test that exercises all 11 emittable codes.
+
+V2.9 is the only post-V2.8 V2-scoped commit; the rest of the post-V2.8 work is V3-phase. V2.9 is conceptually "V2 polish" that landed during V3 entry because Opus V3.1.e Lane C re-flagged it as required-pre-V3.
 
 ## V2 backlog item RETIRED at V2.8
 
