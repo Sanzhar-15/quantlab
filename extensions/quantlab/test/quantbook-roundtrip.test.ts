@@ -1604,4 +1604,55 @@ suite('quantbook V2.7 -- structured error-code end-to-end (engine → napi → p
 				'V2.7 prefix is present');
 		}
 	});
+
+	test('V2.7 closure: napi argument validation surfaces bad_argument code (Opus M2)', () => {
+		// V2.7 closure (Opus MEDIUM-2): validation errors from napi
+		// layer (NOT engine error types) now carry the bad_argument
+		// prefix. Without this, they silently bucketed under
+		// `'unknown'` in parseQuantbookError, re-opening V2.1+V2.2+V2.3
+		// MEDIUM-3 at the binding boundary.
+		const engine = loadQuantbookEngine();
+		try {
+			// blockMs = 0 rejected at napi boundary per V2.5 closure
+			// (Codex M1). V2.7 closure (Opus M2) adds bad_argument prefix.
+			new engine.BlockingTransportFixture(0);
+			assert.fail('expected throw');
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			assert.strictEqual(info.code, 'bad_argument',
+				`expected bad_argument code, got ${info.code}; msg=${info.message}`);
+			assert.match(info.message, /blockMs must be > 0/,
+				'V2.5 closure assertion text preserved');
+		}
+	});
+
+	test('V2.7 closure: peerId validation surfaces bad_argument code (Opus M2)', () => {
+		const engine = loadQuantbookEngine();
+		try {
+			// peerId = 0 is reserved LEGACY_PEER per V1 closure.
+			// Surfaced via bad_argument since V2.7 closure (Opus M2).
+			new engine.CollabSession(0n);
+			assert.fail('expected throw');
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			assert.strictEqual(info.code, 'bad_argument',
+				`expected bad_argument code, got ${info.code}; msg=${info.message}`);
+			assert.match(info.message, /peerId must be non-zero/);
+		}
+	});
+
+	test('V2.7 closure: LoopbackPair single-use violation surfaces bad_argument code (Opus M2)', () => {
+		const engine = loadQuantbookEngine();
+		const pair = new engine.LoopbackPair();
+		pair.takeA();
+		try {
+			pair.takeA(); // second take violates single-use contract
+			assert.fail('expected throw');
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			assert.strictEqual(info.code, 'bad_argument',
+				`expected bad_argument code, got ${info.code}; msg=${info.message}`);
+			assert.match(info.message, /takeA already called/);
+		}
+	});
 });

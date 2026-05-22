@@ -169,14 +169,22 @@ export function isAutoFlushPolicy(value: unknown): value is AutoFlushPolicy {
 // =====================================================================
 
 /**
- * Set of `QuantbookErrorCode` values, used by the `parseQuantbookError`
- * runtime validator to reject unknown codes (which would otherwise
- * mask an engine-binding drift).
+ * Set of `QuantbookErrorCode` values **emitted by the engine binding**.
+ *
+ * **V2.7 audit closure (Opus MEDIUM-1, 2026-05-22)**: `'unknown'` is
+ * INTENTIONALLY OMITTED from this set. It is the parser's fallback
+ * sentinel, NOT a code the engine ever emits. If a future engine
+ * variant accidentally returned `"unknown"` as its kind, treating
+ * the resulting `"[unknown] foo"` prefix as a recognized code would
+ * strip the prefix (turning `message` into `"foo"`) while a less
+ * misleading `"[future_kind] foo"` would preserve `message` intact.
+ * Removing `'unknown'` from the set keeps `parseQuantbookError`'s
+ * fallback behavior symmetric across both cases.
  *
  * **Codex M3 closure note**: keeping this set in sync with the
- * union type {@link QuantbookErrorCode} is a manual discipline.
- * V2 backlog: codegen this set from the union (or use a const enum)
- * to eliminate the drift hazard.
+ * union type {@link QuantbookErrorCode} (minus `'unknown'`) is a
+ * manual discipline. V2 backlog: codegen this set from the union
+ * (or use a const enum) to eliminate the drift hazard.
  */
 const KNOWN_QUANTBOOK_ERROR_CODES: ReadonlySet<QuantbookErrorCode> = new Set<QuantbookErrorCode>([
 	'transport_io',
@@ -189,16 +197,27 @@ const KNOWN_QUANTBOOK_ERROR_CODES: ReadonlySet<QuantbookErrorCode> = new Set<Qua
 	'session_presence',
 	'session_undo',
 	'session_replay',
-	'unknown',
+	'bad_argument',
+	// 'unknown' is the parser fallback sentinel; NOT in the set per
+	// Opus V2.7 MEDIUM-1. If the engine ever returns a literal
+	// `"unknown"` kind, the bracket prefix is preserved in `message`
+	// alongside `code='unknown'`, signaling binding drift.
 ]);
 
 /**
- * Bracket-prefix regex: `[<code>] <message>` where `<code>` is
- * snake_case alphabetics + underscores. Matches the napi binding's
+ * Bracket-prefix regex: `[<code>] <message>` where `<code>` starts
+ * with a lowercase letter and is composed of lowercase alphabetics,
+ * digits, and underscores. Matches the napi binding's
  * `[{kind}] {Display}` convention from
  * `crates/ql-bindings-node/src/lib.rs::{collab_session,transport,websocket}_error_to_napi`.
+ *
+ * **V2.7 audit closure (Opus LOW-1, 2026-05-22)**: extended
+ * character class to `[a-z0-9_]*` (was `[a-z_]*`) for future-proofing.
+ * Today's kinds use only letters + underscores, but a future variant
+ * like `transport_io_v2` would have parsed already (alpha + _); the
+ * extension future-proofs digit-bearing variants like `http2_failed`.
  */
-const QUANTBOOK_ERROR_PREFIX_RE = /^\[([a-z][a-z_]*)\]\s*(.*)$/s;
+const QUANTBOOK_ERROR_PREFIX_RE = /^\[([a-z][a-z0-9_]*)\]\s*(.*)$/s;
 
 /**
  * Extract the structured code + message from a caught error.
@@ -216,13 +235,21 @@ const QUANTBOOK_ERROR_PREFIX_RE = /^\[([a-z][a-z_]*)\]\s*(.*)$/s;
  * ```
  *
  * **Returns**: a `QuantbookErrorInfo` with `code = 'unknown'` if:
- * - the value is not an `Error` instance,
+ * - the value is not an `Error` instance (e.g., a `throw 'string'`
+ *   from non-engine code; **the structured discriminant is lost**
+ *   in this case -- callers handling external code paths should
+ *   wrap their throws in an `Error` to preserve the discriminant),
  * - the `Error.message` has no `[<code>] ` prefix, OR
  * - the prefix code is not a recognized `QuantbookErrorCode` (which
  *   means the IDE binding is older than the engine; a build refresh
  *   is in order).
  *
- * Closes V2.1+V2.2+V2.3 Opus MEDIUM-3 carryforwards.
+ * For the unrecognized-prefix case (binding drift), the `message`
+ * field preserves the FULL original `Error.message` including the
+ * bracket prefix, so callers can log it for diagnosis.
+ *
+ * Closes V2.1+V2.2+V2.3 Opus MEDIUM-3 carryforwards + V2.7 Opus
+ * LOW-4 (non-Error throwable JSDoc clarity).
  */
 export function parseQuantbookError(err: unknown): QuantbookErrorInfo {
 	if (!(err instanceof Error)) {
@@ -248,10 +275,28 @@ export function parseQuantbookError(err: unknown): QuantbookErrorInfo {
 }
 
 /**
+ * Set including the `'unknown'` fallback sentinel; used by the
+ * `isQuantbookErrorCode` type guard. Distinct from
+ * `KNOWN_QUANTBOOK_ERROR_CODES` (parser-only, no `'unknown'`)
+ * per the V2.7 audit closure (Opus MEDIUM-1): the parser must
+ * NOT treat literal `[unknown]` prefixes as recognized codes,
+ * but the type guard SHOULD accept `'unknown'` because the parser
+ * returns it on fallback.
+ */
+const ALL_QUANTBOOK_ERROR_CODES: ReadonlySet<QuantbookErrorCode> = new Set<QuantbookErrorCode>([
+	...KNOWN_QUANTBOOK_ERROR_CODES,
+	'unknown',
+]);
+
+/**
  * Type guard for `QuantbookErrorCode`. Mirrors `isAutoFlushPolicy`'s
  * defensive shape -- use when reading codes from external config or
  * persisted error logs.
+ *
+ * Accepts ALL `QuantbookErrorCode` values including `'unknown'`
+ * (the parser fallback). See `ALL_QUANTBOOK_ERROR_CODES` vs
+ * `KNOWN_QUANTBOOK_ERROR_CODES` for the role split.
  */
 export function isQuantbookErrorCode(value: unknown): value is QuantbookErrorCode {
-	return typeof value === 'string' && KNOWN_QUANTBOOK_ERROR_CODES.has(value as QuantbookErrorCode);
+	return typeof value === 'string' && ALL_QUANTBOOK_ERROR_CODES.has(value as QuantbookErrorCode);
 }

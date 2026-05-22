@@ -504,20 +504,50 @@ export type QuantbookErrorCode =
 	| 'transport_closed'
 	// WebSocket-layer errors (`WebSocketError::kind`).
 	// Surfaced by `Transport.websocketConnect` on rejection.
+	//
+	// **V2.7 audit note (Codex LOW-1 + Opus LOW-3)**: today's only
+	// reachable websocket codes via napi rejection paths are
+	// invalid_url, connect_failed, handshake_failed. The
+	// `websocket_runtime_error` code is structurally defined for
+	// when V2 backlog adds a structured `transportLastError()`
+	// accessor that produces the prefix; today, runtime task
+	// failures surface as raw strings via the unstructured
+	// `transportLastError()` method (no prefix). Reachability
+	// boundary documented at engine `WebSocketTransport::last_error`.
 	| 'websocket_invalid_url'
 	| 'websocket_connect_failed'
 	| 'websocket_handshake_failed'
 	| 'websocket_runtime_error'
 	// Session-layer errors (`CollabSessionError::kind`).
 	// Note: `Transport(_)` passes through to the inner transport
-	// kind (e.g. `transport_closed`), not a wrapper string.
+	// kind (e.g. `transport_closed`), not a wrapper string. IDE
+	// callers branching on transport state get the same code
+	// whether the path was direct Transport call or wrapped via
+	// session method (see Opus V2.7 MEDIUM-3 for the contractual
+	// trade-off + documented passthrough rationale).
 	| 'session_oplog'
 	| 'session_presence'
 	| 'session_undo'
 	| 'session_replay'
+	// **V2.7 audit closure (Opus MEDIUM-2, 2026-05-22)**: napi-layer
+	// argument validation + single-use violation errors that are
+	// NOT engine error types (peerId range check, blockMs > 0,
+	// LoopbackPair takeA/B exhaustion, Transport wrapper consumed,
+	// AutoFlushPolicy parse, validate_u32_index for direct callers).
+	// V2.7 ship surfaced these as raw `Error::from_reason("...")`
+	// strings (no prefix), silently bucketing under `'unknown'` and
+	// re-opening V2.1+V2.2+V2.3 MEDIUM-3 at the binding boundary.
+	// Closure: all such errors now carry the `[bad_argument]` prefix
+	// per the napi binding's `bad_argument_error_to_napi` helper.
+	| 'bad_argument'
 	// Fallback when the message has no recognizable code prefix.
-	// Typically means the error came from non-engine code (napi
-	// task panic, validation guard, JS-side throw).
+	// Typically means the error came from non-engine, non-binding
+	// code (napi task panic, JS-side throw, runtime task error
+	// surfaced via the prefix-less `transportLastError()` path).
+	// **NOTE**: `'unknown'` is the parser fallback sentinel; the
+	// engine binding NEVER emits a literal `[unknown]` prefix per
+	// the V2.7 audit closure (Opus MEDIUM-1). See
+	// `KNOWN_QUANTBOOK_ERROR_CODES` set comment in session.ts.
 	| 'unknown';
 
 /**
