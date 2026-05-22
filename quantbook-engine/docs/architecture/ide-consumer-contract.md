@@ -598,6 +598,226 @@ Persistent `vscode.window.createStatusBarItem` is V3.x backlog.
 - **`tickPollRemote` merged-path try/catch (V3.2.d Codex M3).** Pre-V3.2.d `this.render()` was called without try/catch; a throw bubbled into `setInterval` which silently swallowed it AND kept ticking.  Now: wrap render; on `bad_argument` or `session_oplog` (fatal codes), dispose the panel + show Restart warning; on transient codes, skip the tick.
 - **postMessage-after-dispose guard (V3.2.d Opus MEDIUM-1).** Added `CellGridPanel._disposed: boolean` set BEFORE `disposeAttachment` in the `onDidDispose` handler.  `handleIncoming.onError` checks this flag; if disposed, falls back to `vscode.window.showWarningMessage` so late-arriving errorReplies still surface to the user instead of being silently dropped to a dead webview.
 
+### 4.1.z3 Cell-grid multi-sheet + virtualization (Phase 5.7 V3.3.0, 2026-05-22 to 2026-05-23)
+
+**Status:** V3.3.0.1 decision lock + V3.3.0.2 `listSheets` napi + V3.3.0.3 `exportSnapshot` incremental cache + V3.3.0.4 IDE custom-inline virtualization scaffold + V3.3.0.5 multi-sheet UX command + V3.3.0.6 audit-gap closures shipped.  V3.3.0.7 (this section's commit) + V3.3.0.X (parallel Codex+Opus audit) pending.  See V3.3 entry plan at `quantbook-engine/.plans/_active.md` for the in-flight checklist.
+
+#### New engine napi surface (V3.3.0.2)
+
+```ts
+class CollabSession {
+  // V3.3.0.2: enumerate distinct u16 sheets present in the local op log.
+  // Returns sorted ascending Vec<u16>; empty if no PutValue ops yet.
+  // Errors via [bad_argument] per V2.7 contract.
+  listSheets(): number[];
+}
+```
+
+IDE-side typed wrapper at `extensions/quantlab/src/quantbook/session.ts`:
+
+```ts
+function listSheets(session: CollabSessionInstance): number[];
+```
+
+**Semantics**: walks the local op log (post-V3.3.0.3 reads from the incremental snapshot cache; pre-cache fallback would walk via op_log().iter()).  Sheets only appear if a `PutValue` op references them; "empty sheets" created via a future `SheetMetadata` Op variant (V3.4+) are NOT enumerated here.  CRDT-consistent: pollRemote-merged blobs from peers are in the log before listSheets walks; cross-peer sheet sets converge.
+
+**V3.4+ migration path**: add `listSheetsMetadata(): Vec<SheetMetadata>` for { id, display_name, color, hidden } when the engine ships a `SheetMetadata` Op variant.  Additive; does not break the V3.3.0.2 `listSheets() -> Vec<u16>` contract.
+
+#### New engine state (V3.3.0.3 -- incremental snapshot cache)
+
+```rust
+pub struct CollabSession {
+    // ... existing fields ...
+    last_snapshot: HashMap<(u16, u32, u32), CellWireValue>,
+}
+```
+
+**Rule 4 per-field walk** documented inline in `ql-collab/src/session.rs::last_snapshot` doc comment:
+- `HashMap<K, V>` is `Send + Sync` when both `K` and `V` are.
+- `(u16, u32, u32)` is trivially `Send + Sync` (Copy + 'static).
+- `CellWireValue` is `Send + Sync` per V1 audit.
+- Composition: `Send + Sync`.  Inherits V2.4 `Arc<Mutex<CollabSession>>` external sync pinning.
+- **0 new Rule 4 triggers; arc terminus stays at 6.**
+
+**5 op-mutation paths maintain the cache:**
+
+| Path | Cache update |
+|---|---|
+| `new` | initialized empty |
+| `from_snapshot` | full rebuild via `rebuild_snapshot_cache()` after `OpLog::import_bytes` |
+| `append_op` | O(1) incremental insert on `Op::PutValue` (local append is at causal frontier; iteration order does not reorder existing entries) |
+| `merge_bytes` | full rebuild (Loro CRDT merge can causally-reorder; iteration order of EXISTING entries can shift even when the log only grows; incremental update would be INCORRECT) |
+| `discard_pending_ops` | full rebuild (`self.log = fork_at_vv(...)` replaces the log) |
+| `poll_remote_with_limit` | full rebuild after the drain batch (calls `self.log.merge_bytes` directly to avoid per-blob auto-flush; cache invalidation matches the batched cadence) |
+
+**Read path**: new public accessor `CollabSession::snapshot_cells(&self, sheet: u16) -> Vec<((u32, u32), CellWireValue)>`.  Returns sorted ascending by `(row, col)`.  O(cells-in-cache) with a sheet filter (V3.x may nest by sheet for O(cells-on-sheet) if profiling justifies).
+
+**napi `export_snapshot` refactored** to read from the cache via `snapshot_cells`.  Pre-V3.3.0.3 the lock-hold time was O(N) in op count per call (V3.2.d Opus M4); post-V3.3.0.3 it's O(cells-on-sheet).
+
+**Cache invalidation discipline at V3.4 undo:**
+
+- Cache is MONOTONIC-GROW at V3.3 (no undo at V3.3 per V3.2.e exit packet "What V3.2 deliberately did NOT do" + V3.3.0.1 decision D4 defer-persistence-and-undo-to-V3.4).
+- V3.4 undo lands → the undo path MUST call `rebuild_snapshot_cache()` (or an undo-aware `invalidate_cells(...)` accessor) before any subsequent `snapshot_cells` / `export_snapshot` read.  Tracked in `.plans/_active.md` V3.3 risk register R-V3.3-2.
+
+#### Custom-inline virtualization (V3.3.0.4)
+
+Per V3.3.0.1 decision D1 (custom inline; no library; no bundler).  Pure helpers live in `cellGridLogic.ts` (vscode-free; mocha-driveable):
+
+```ts
+function computeVisibleRange(
+  scrollTop: number,
+  rowHeight: number,
+  viewportHeight: number,
+  totalRows: number,
+  overscan?: number = 5,
+): { startIdx: number; endIdx: number };
+
+function buildVirtualRows<T>(
+  entries: ReadonlyArray<T>,
+  startIdx: number,
+  endIdx: number,
+): T[];
+```
+
+`computeVisibleRange` is defensive against `rowHeight === 0` (returns full range; no div-by-zero); clamps `endIdx` to `totalRows`; default overscan = 5 rows above + below visible window for smooth scrolling.
+
+**HTML structure** (`cellGridHtml.ts::buildHtml` with `options.nonce` set):
+
+```
+<div class="cell-grid-viewport">   <!-- max-height: 80vh; overflow-y: auto -->
+  <table>
+    <thead><tr><th>Row</th><th>Col</th><th>Value</th></tr></thead>  <!-- sticky -->
+    <tbody data-virt-row-height="25" data-virt-total-rows="{N}">
+      <tr class="cell-grid-spacer-top" data-spacer-height="{px}" style="height: {px}px;">...</tr>
+      <!-- visible rows here (initial server window = 40 rows) -->
+      <tr class="cell-grid-spacer-bottom" data-spacer-height="{px}" style="height: {px}px;">...</tr>
+    </tbody>
+  </table>
+</div>
+<script id="cell-grid-data" type="application/json">{...snapshot json...}</script>
+```
+
+**Virtualization gate**: only triggers when `nonce` is provided (V3.2.b/c modes) AND `entries.length > 40`.  V3.2.a read-only mode + small snapshots render all rows directly.
+
+**Snapshot data block** is `<script type="application/json">` (non-executable; CSP `script-src 'nonce-...'` blocks unnonced scripts; defense-in-depth: `</script>` substrings in cell text are html-escaped to `<\/script` to prevent premature tag termination).
+
+**Webview script** (inside the nonced `<script>` tag) attaches a scroll listener to `.cell-grid-viewport`; on each scroll tick it recomputes the visible range via inline `computeRange` (client-side mirror of the server `computeVisibleRange`), slices the snapshot via inline `renderRowsClient`, and replaces the `<tbody>` innerHTML with `[topSpacer + visibleRows + bottomSpacer]`.
+
+**Mid-edit safety**: the scroll handler checks `activeInput !== null` (the V3.2.b click-to-edit `<input>` reference); if set, the repaint is SKIPPED for that tick.  Clobbering would lose unsaved text.  User commits / cancels before repaints resume.
+
+**Drift hazard (V3.3.0.6 audit closure)**: `formatCellValueClient` + `renderRowsClient` in the webview script are MIRRORS of `formatCellValue` + `renderRows` in `cellGridHtml.ts`.  Any future change to one MUST also update the other.  V3.x can close via codegen of the client mirror OR by pre-formatting values into the snapshot data block server-side.
+
+#### Multi-sheet UX (V3.3.0.5)
+
+Per V3.3.0.1 decision D2 (panel-per-sheet, NOT sheet-tabs-in-panel):
+
+- New command `quantlab.quantbookCellGridSwitchSheet`.  Calls `CellGridPanel.activeLocalPanels()` → finds the FIRST open local panel (`panels[0]` = oldest by Map-insertion order).  Calls `listSheets(session)` → builds `vscode.window.showQuickPick` items via the new pure helper `buildSheetQuickPickItems(sheets, currentSheet): SheetQuickPickItem[]` (current sheet marked `(current)` in `description`).  On selection: `CellGridPanel.show(context, session, selectedSheet)` opens a NEW panel for that sheet.
+- Empty / single-sheet sessions surface `showInformationMessage`; no QuickPick.
+- Collab panels NOT eligible (per V3.2.d HIGH-1 mode-split rationale; collab per-sheet switching deferred to V3.x because of peerId + transport-lifetime considerations).
+
+**Panel title** updated in `CellGridPanel.show()`:
+- Multi-sheet sessions: `Cell Grid (Sheet N of M)` / `Cell Grid -- Collab (Sheet N of M)`.
+- Single-sheet sessions: `Cell Grid (Sheet N)` (no "of 1" noise).
+- **Point-in-time semantic**: title is computed at `show()` time via `session.listSheets().length`; later appends that create new sheets do NOT update existing panel titles.  Documented as the V3.3.0.5 ship-time tradeoff (V3.x can wire reactive updates if ergonomic feedback demands).
+
+**Multi-panel selection caveat** (V3.3.0.5 + V3.3.0.6 audit doc):
+- When >1 local panel is open, switch-sheet operates on `panels[0]` = OLDEST (Map insertion-order).  This may surprise users who expect "switch the panel I just clicked".
+- V3.x can add a panel-picker step or an active-panel accessor.  V3.3 ships oldest-panel semantic for simplicity.
+
+#### V3.2.a sample-data change (V3.3.0.5)
+
+The V3.2.a `quantlab.quantbookCellGrid` command was extended to seed sample data on sheets 0/1/2 (was sheet 0 only).  This makes the V3.3.0.5 switch-sheet command demonstrable without requiring users to first manually seed multiple sheets.
+
+Sample shape:
+- Sheet 0: 5 cells (the original V3.2.a sample)
+- Sheet 1: 3 cells (cols 0+1 row 0; col 0 row 1)
+- Sheet 2: 1 cell (0, 0, 99)
+
+#### Drift hazards (V3.x maintainers)
+
+- `VIRT_ROW_HEIGHT_PX = 25` + `VIRT_INITIAL_ROWS = 40` are duplicated as `ROW_HEIGHT = 25` + `OVERSCAN = 5` in the inline webview script.  If you change the server-side constant, change the client mirror too (the same drift class as the `formatCellValueClient` hazard above).
+- `last_snapshot` cache invariants assume LWW semantics inside `(sheet, row, col)`.  V3.4 undo MUST call `rebuild_snapshot_cache()` to invalidate; documented in the cache field's doc comment.
+- The `cell-grid-data` data block is HTML-escaped for `</script>` only.  If a V3.x adds OTHER content types (e.g., inline SVG) that have early-termination edge cases, audit the JSON-escape logic at that time.
+- `CellGridPanel.activeLocalPanels()` returns a snapshot — callers must NOT cache the array across event-loop ticks (panels can dispose at any time).
+- The webview script's mid-edit guard depends on `activeInput !== null`; if a V3.x adds OTHER user-interaction state (e.g., drag-selecting cells), the scroll handler may need additional guards.
+
+#### V3.3 risks (carryforward from V3.2.d Opus § V3.3 readiness + V3.3-specific)
+
+- **R-V3.3-1 Virtualization integration risk** -- MITIGATED at V3.3.0.4 by custom-inline design (no library/bundler).
+- **R-V3.3-2 exportSnapshot incremental cache invariants under undo** -- OPEN; V3.4 undo MUST audit cache invalidation before shipping.
+- **R-V3.3-3 listSheets enumeration consistency** -- LOW; op log has the data; engine-side cache keeps it consistent across local appends + remote merges.
+- **R-V3.3-4 Persistence schema versioning** -- OPEN (V3.4 problem); D-1 ship established the Tier D3 envelope.
+- **R-V3.3-5 PeerId reuse under restart** -- MEDIUM; carryforward from V3.1.e Codex M1; V3.2.d HIGH-1 closure handles same-window collab-then-collab but NOT cross-restart.  Defensive UUID-derived peerId fix is V3.x backlog.
+- **R-V3.3-6 Virtualization + reconnect race** -- MITIGATED at V3.3.0.4 by the `activeInput !== null` mid-edit guard + the V3.2.b panel.dispose teardown that destroys the scroll listener with the document.
+
+#### Out of scope for V3.3.0
+
+- `.qbook` persistence (V3.4 scope per V3.3.0.1 decision D4).
+- Undo/redo + UndoGroupGuard RAII translation (V3.4 scope).
+- Presence (PresenceState + sweep_presence integration with the grid widget; V3.4 scope per Phase 5.6 V2 integration).
+- `rebuild_workbook` routing (V3.5 scope; V3.3 reads from the incremental cache which is decoupled from full workbook reconstruction).
+- Push API for inbound observation (V3.x backlog; V3.3.0.1 D6 keeps 1s pollRemote).
+- Per-cell incoming-tint animation (V3.x backlog; V3.2.c.1 C5 deferred + V3.3 inherits).
+- Persistent `vscode.window.createStatusBarItem` (V3.x backlog; V3.2.c.1 C4 deferred + V3.3 inherits).
+- Text / boolean / error cell creation from JS (waits on engine-side `appendPutValueText` / `appendPutValueBool` napi bindings; V3.3 keeps the V3.2.b number-only edit surface).
+- jsdom-based DOM integration test for virtualization (V3.3.0.6 deferral; mocha cannot natively execute the webview script without jsdom or vscode-test).
+- Live VS Code two-window smoke test for V3.3 (out of mocha scope; V3.3.0.X audit may revisit via vscode-test or manual procedure).
+
+#### Live smoke procedure (V3.3.0.6 user-action gap closure)
+
+Mocha pins the V3.3 surface 176/176 but the actual VS Code webview lifecycle + virtualized scrolling + multi-sheet UX has not been verified at the OS level.  User-facing smoke test procedure:
+
+```sh
+# 1. Build engine cdylib with test-fixtures enabled (mocha needs it
+#    too; this also makes the IDE extension able to load the fixture
+#    class if needed).
+cd /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+cargo build -p ql-bindings-node --release --features test-fixtures
+
+# 2. Open the IDE in development mode (Extension Development Host).
+#    From quantlab repo root:
+#      open -a "Visual Studio Code" .
+#    Then F5 -> Run Extension.
+
+# 3. In the Extension Development Host window:
+#    Cmd-Shift-P -> "Quantbook: Open Cell Grid"
+#    Expected:
+#      - panel opens with title "Cell Grid (Sheet 0 of 3)"
+#      - 5 sample rows visible (sheet 0 sample data from V3.3.0.5)
+#      - clicking a cell -> input box appears with the value
+#      - typing + Enter -> input stays in place; cell value updates
+#        on the host re-render (V3.2.b PESSIMISTIC flow)
+#      - Escape on input -> cell restored
+
+# 4. Cmd-Shift-P -> "Quantbook: Switch Cell Grid Sheet"
+#    Expected:
+#      - QuickPick with 3 items: Sheet 0 (current), Sheet 1, Sheet 2
+#      - selecting Sheet 1 -> new panel opens with title
+#        "Cell Grid (Sheet 1 of 3)" + sheet-1 sample data (3 cells)
+
+# 5. Scroll smoke (requires a large snapshot):
+#    Add enough sample data to exceed 40 rows (modify V3.2.a command
+#    to seed 100 rows, OR use the V3.2.b cell-edit flow to manually
+#    add rows).
+#    Expected:
+#      - scrolling the viewport reveals additional rows
+#      - tbody re-renders dynamically (visible in webview devtools
+#        Network -> none; Elements -> tbody innerHTML changes on scroll)
+#      - scrolling while a cell is in edit mode does NOT clobber the
+#        input (mid-edit guard works)
+
+# 6. Multi-window collab smoke (V3.2.c surface; V3.3 inherits):
+#    File -> New Window
+#    In window 1: run "Quantbook: Open Cell Grid (Collab)"
+#    In window 2: run the same command
+#    Expected:
+#      - both windows spawn the relay (race-retry handles spawn loss)
+#      - edits in window 1 appear in window 2 within ~1s (pollRemote
+#        cadence) and vice versa
+```
+
+If smoke surfaces issues, file findings against V3.3.0.X audit (parallel Codex+Opus megaudit) which is the next planned audit cycle.
+
 ---
 
 **D-1 (✅ SHIPPED 2026-05-20 — all 8 steps + 7 per-step audits + 1 megaudit):** `FormatId` is now `enum { Builtin(u32), Custom(PeerId, u32) }` in `ql-storage::format`. IDE callers MUST pattern-match the variant rather than reading `.0`. Use `FormatId::is_builtin()` / `is_custom()` / `GENERAL` accessors. For pre-D-1 bare-u32 ids (xlsx import), use `FormatId::legacy_from_u32(n)`. `Op::RegisterFormat` + `Op::SetCellFormat` carry `FormatIdWire` on the wire. `.qbook` envelope v8 carries the tagged-tuple `FormatEntryId` shape losslessly for multi-peer ids; v<8 envelopes auto-migrate. xlsx export flattens multi-peer FormatIds via dedup-by-code; non-LEGACY peer flattens reported via `XlsxExportReport.dropped_features`. xlsx import surfaces unresolved-overlay-numfmt as `report.unsupported` entries. `.qbook/oplog.bin` files wrapped in Tier D3 header (`OPLOG_MAGIC = b"QLOL"` + BE u32 `OPLOG_SCHEMA_VERSION`). `CollabSession::new` + `from_snapshot` + `OpLog::set_peer_id` assert `PeerId != 0` (release-firing). See `docs/phase5/d-1-exit-packet.md` for the full closure record.
