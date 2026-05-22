@@ -1,15 +1,15 @@
 ---
 name: 2026-05-22_phase-5-7-v3-2-cell-grid-ui
-status: in-progress (V3.2.a + V3.2.a.1 + V3.2.b + V3.2.c SHIPPED.  V3.2.c.1 decision lock at engine `14b6ad1e932`; V3.2.c.2-V3.2.c.5 code at IDE `a165141eb68` (+ 6 mocha tests, 126 -> 132); V3.2.c.6 docs + plan close ship in THIS commit.  IDE mocha 132/132.  V3.2.d parallel Codex+Opus audit is the next major work item per the V3.2 plan -- it sweeps V3.2.a + V3.2.b + V3.2.c together for cumulative findings invisible at per-step level.)
+status: in-progress (V3.2.a + V3.2.a.1 + V3.2.b + V3.2.c + V3.2.d ALL SHIPPED.  V3.2.d audit complete: Codex 0H+3M+2L + Opus 2H+4M+7L; 5 closures shipped at IDE `ff73f2c9f1b` (140/140 mocha); V3.2.d.6 docs + plan close + audit transcripts commit in THIS commit.  Rule 4 arc terminus stays at 6 (0 new triggers).  V3.2.e V3.2 exit packet (~1d) is the only remaining V3.2 work; after that, V3.3+ scope begins.)
 date: 2026-05-22
 predecessor_plan: .plans/_archive/2026-05-22_phase-5-7-v3-1-multi-window-demo.md (V3.1 multi-window demo, all sub-steps + audit closed)
 predecessor_v2_exit_packet: docs/phase5/5-7-v2-exit-packet.md (V2 phase termination -- Transport binding architectural decisions V2.1-V2.8)
 predecessor_v3_1_audits: docs/audits/2026-05-22-phase-5-7-v3-1-{codex,opus}.md (V3.1.e parallel audit; Opus § Section 3 contains the V3.2 ENTRY READINESS analysis this plan is built on)
 parent_phase: 5.7 Collaboration IDE Vertical Slice
 direction: V3.2 -- cell-grid UI. Real grid widget bound to a CollabSession; user-facing cell editing surface. First production-grade IDE consumer of the V2 Transport binding + V3.1 multi-window infrastructure.
-current_engine_head: (this commit) V3.2.c.6 ide-consumer-contract § 4.1.z2 + V3.2.c plan close
-current_ide_head: a165141eb68 (V3.2.c.2-V3.2.c.5 live multi-window cell grid + 6 new mocha tests)
-current_mocha_count: 132 / 132
+current_engine_head: (this commit) V3.2.d.6 ide-consumer-contract V3.2.d closures + V3.2.d plan close + audit transcripts
+current_ide_head: ff73f2c9f1b (V3.2.d code closures: HIGH-1 cache split + HIGH-2 bad_argument symmetry + Codex M1 post-reconnect flush + Codex M3 render try/catch + Opus M1 postMessage guard; +8 mocha tests)
+current_mocha_count: 140 / 140
 current_ql_collab_tests: 74 / 74 (with --features test-fixtures)
 current_ql_collab_ws_tests: 42 / 42 (10 lib + 30 websocket_transport + 2 V3.1.a relay)
 current_engine_workspace: 4472 / 0 baseline
@@ -101,10 +101,20 @@ V3.2 = cell-grid UI. Lift the V3.1 demo patterns into a real grid widget that us
    5. [x] V3.2.c.5 -- Mocha tests (+6, 126 -> 132): 4 `classifyPollTick` pins (idle / mergeBytes-not-drain / merged-after-loopback / drain-then-idle); 2 two-session loopback round-trip pins (auto-flush + pollRemote + snapshot mirror; detach + idle).
    6. [x] V3.2.c.6 -- Docs: `ide-consumer-contract.md § 4.1.z2` (V3.2.c attach + poll + reconnect + drift hazards) ships in THIS commit.
 
-- [ ] **V3.2.d -- Parallel Codex + Opus audit + closures (~1-2d)** -- per Rule 2.
-   - Codex lane: protocol/correctness sweep over the new napi surface + grid rendering correctness + edit-commit semantics.
-   - Opus lane: adversarial per-field walks on every new binding class (Rule 4), webview security (CSP, message-channel validation), V3.3-readiness analysis.
-   - Cross-lane convergent HIGHs MUST close in-cycle.
+- **V3.2.d -- Parallel Codex + Opus audit + closures** ✅ SHIPPED 2026-05-22.
+   - Codex Lane A audit: PASS-WITH-FINDINGS, 0 HIGH + 3 MEDIUM + 2 LOW + 4 deferred.  Transcript at `docs/audits/2026-05-22-phase-5-7-v3-2-codex.md`.
+   - Opus Lane B audit: PASS-WITH-FINDINGS, 2 HIGH + 4 MEDIUM + 7 LOW + V3.3 entry-readiness packet.  Transcript at `docs/audits/2026-05-22-phase-5-7-v3-2-opus.md`.
+   - Rule 4 sweep: **0 new triggers**.  Arc terminus stays at 6 (V3.2 is all-TS except for `exportSnapshot` napi which inherits the V2.4 `Arc<Mutex<>>` Send+Sync pinning).
+   - Cross-lane convergence: Codex M2 + Opus HIGH-1 (`activePanels` cache mode-conflation; adjudicated HIGH per Opus -- PeerId-uniqueness violation in collab-then-collab); Codex L1 + Opus HIGH-2 (IDE-side validator code symmetry; adjudicated MEDIUM).
+   - **5 closures shipped in-cycle at IDE `ff73f2c9f1b`:**
+     1. HIGH-1: split `activePanels` into `localPanels` + `collabPanels` Maps; collab-then-collab reveals existing + `showInformationMessage`; `refreshAll` iterates both.
+     2. HIGH-2: prefix all IDE-side validator throws with `[bad_argument]` + add dispatcher `typeof req.rawInput !== 'string'` guard.
+     3. Codex M1: `handleTransportClosed` calls `flushDeltaToTransport()` after `attachTransport(fresh)` if `hasPendingFlush()` is true.
+     4. Codex M3: `tickPollRemote` merged branch wraps `render()` in try/catch; fatal codes dispose the panel + show Restart.
+     5. Opus MEDIUM-1: `_disposed` flag set in `onDidDispose` before `disposeAttachment`; `onError` falls back to `showWarningMessage` if disposed.
+   - **8 new mocha tests** (132 -> 140): 4 `[bad_argument]` code pins on `appendPutValueValidated`; 4 dispatcher rawInput type-guard pins.
+   - **Deferred to V3.x** (with rationale in audit transcripts + this plan): Opus MEDIUM-2 (reconnect-disposal leak; V8 GC eventually cleans up); Opus MEDIUM-3 (NaN cell display; unreachable through V1+ API); Opus MEDIUM-4 (`exportSnapshot` lock-hold scaling; V3.3 problem -- addressed by V3.3 incremental-cache decision); all 9 LOW items.
+   - V3.2.d.6 docs: this commit ships `ide-consumer-contract.md § 4.1.z2` V3.2.d closures subsection + V3.2 plan close + commits both audit transcripts.
 
 - [ ] **V3.2.e -- V3.2 exit packet (~1d)** at `docs/phase5/5-7-v3-2-exit-packet.md`.
    - Mirrors the V2 exit packet structure: commit ladder, surface contract, decisions locked (multiplex vs per-session, push vs poll), Rule 4 arc state, V3.3+ backlog, audit transcripts inventory.

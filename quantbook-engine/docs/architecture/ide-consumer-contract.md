@@ -578,6 +578,7 @@ Persistent `vscode.window.createStatusBarItem` is V3.x backlog.
 
 **Deferred to V3.x (still):**
 
+- **Undo/redo** (V3.4 scope per V3.2 plan): the cell-grid panel will need a way to surface UndoGroup boundaries + drive `undo` / `redo` napi calls.  Not modeled in V3.2 message envelope.  Likely additions: `{type:'undo'}` / `{type:'redo'}` outgoing messages + a `refresh` push after the engine applies the inverse.
 - Per-cell "incoming" tint animation on merged-remote ops (decision C5 deferred).
 - Push API from engine (`Transport::on_inbound_blob` callback) replacing 1s polling -- needs new napi surface + Rule 4 audit (decision C2 Option B).
 - Multi-sheet grid (V3.3).
@@ -586,8 +587,16 @@ Persistent `vscode.window.createStatusBarItem` is V3.x backlog.
 **Drift hazards (V3.x maintainers):**
 
 - `POLL_REMOTE_INTERVAL_MS = 1000` (`cellGridPanel.ts`) and the multiWindowDemo's `POLL_REMOTE_INTERVAL_MS` are separate constants of the same value.  Keep in sync OR extract to a shared config module when adding a second tunable surface.
-- `connectOrSpawn` + `reconnectWithBackoff` are exported from `multiWindowDemo.ts` for V3.2.c.  V3.2.d audit may decide to extract to a `transportLifecycle.ts` module; in that case update BOTH the multiWindowDemo command path AND the cell-grid collab path.
+- `connectOrSpawn` + `reconnectWithBackoff` are exported from `multiWindowDemo.ts` for V3.2.c.  V3.2.d audit decided NOT to extract to a separate module (would widen the diff for a one-call-site reuse); revisit if a third consumer arrives.
 - `CollabAttachment.spawnedRelay` -- the panel disposes it on close.  If you add a SECOND panel for the same sheet (e.g., a future preview surface), make sure only ONE owns the relay; the other should pass `spawnedRelay: undefined` as a joiner.
+
+**V3.2.d audit closures (2026-05-22):**
+
+- **localPanels + collabPanels separate Maps (V3.2.d HIGH-1).** Pre-V3.2.d a single `activePanels` Map keyed by sheet held BOTH local + collab panels, with three latent gaps (collab-then-local revealed collab on local-open; collab-then-collab spawned 2 sessions under same `BigInt(process.pid)` violating V3.1.b PeerId uniqueness; local-then-collab orphaned the local panel from `refreshAll`).  Now: two separate `Map`s; local + collab CAN coexist on the same sheet; collab-then-collab reveals existing + `showInformationMessage` rather than spawning a duplicate.  `refreshAll` iterates both maps.
+- **IDE-side validators emit `[bad_argument]` (V3.2.d HIGH-2).** Pre-V3.2.d `appendPutValueValidated` threw plain `Error` strings without the bracket prefix; `parseQuantbookError` bucketed under `'unknown'`.  Now: all four throws prefixed with `[bad_argument]` matching the engine-side V2.7 contract.  Dispatcher (`cellGridLogic.ts`) added `typeof req.rawInput !== 'string'` runtime guard so null / undefined / number `rawInput` surfaces structured `bad_argument` instead of a TypeError -> `'unknown'`.
+- **Post-reconnect pending-op flush (V3.2.d Codex M1).** Engine contract is mutate-then-flush; a `transport_closed` during a cell edit's `OnAppend` auto-flush leaves the local PutValue committed but unflushed.  `handleTransportClosed` now checks `session.hasPendingFlush()` after `attachTransport(fresh)` and calls `flushDeltaToTransport()` if true.  Best-effort: if the flush itself fails, the next tick or user edit re-tries.
+- **`tickPollRemote` merged-path try/catch (V3.2.d Codex M3).** Pre-V3.2.d `this.render()` was called without try/catch; a throw bubbled into `setInterval` which silently swallowed it AND kept ticking.  Now: wrap render; on `bad_argument` or `session_oplog` (fatal codes), dispose the panel + show Restart warning; on transient codes, skip the tick.
+- **postMessage-after-dispose guard (V3.2.d Opus MEDIUM-1).** Added `CellGridPanel._disposed: boolean` set BEFORE `disposeAttachment` in the `onDidDispose` handler.  `handleIncoming.onError` checks this flag; if disposed, falls back to `vscode.window.showWarningMessage` so late-arriving errorReplies still surface to the user instead of being silently dropped to a dead webview.
 
 ---
 
