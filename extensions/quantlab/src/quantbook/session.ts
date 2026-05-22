@@ -37,6 +37,48 @@ export function createSession(peerId: bigint): CollabSessionInstance {
 }
 
 /**
+ * Append a `PutValue` op with JS-side input validation that the napi
+ * layer cannot perform (due to ECMAScript ToUint32 coercion happening
+ * BEFORE the Rust code sees the value).
+ *
+ * **V1 audit closure (Opus H2 + Codex H3, 2026-05-22)**: napi-rs's
+ * `napi_get_value_uint32` applies ECMAScript ToUint32 to JS Number
+ * arguments. That converts:
+ *   - `-1` to `0xFFFFFFFF` (silent wrap)
+ *   - `NaN` to `0` (silent coercion)
+ *   - `Infinity` to `0` (silent coercion)
+ *   - `2.5` to `2` (silent floor-toward-zero)
+ *
+ * The Rust binding sees the post-ToUint32 value and has no way to
+ * detect the original JS-side intent. Validate at the TS layer
+ * BEFORE the call so each failure surfaces a precise error.
+ *
+ * @throws Error if sheet/row/col aren't non-negative integers in range,
+ *               or if value isn't a finite number.
+ */
+export function appendPutValueValidated(
+	session: CollabSessionInstance,
+	sheet: number,
+	row: number,
+	col: number,
+	value: number,
+): void {
+	if (!Number.isInteger(sheet) || sheet < 0 || sheet > 0xFFFF) {
+		throw new Error(`appendPutValue: sheet must be an integer in [0, 65535], got ${sheet}`);
+	}
+	if (!Number.isInteger(row) || row < 0 || row > 0xFFFFFFFF) {
+		throw new Error(`appendPutValue: row must be an integer in [0, 4294967295], got ${row}`);
+	}
+	if (!Number.isInteger(col) || col < 0 || col > 0xFFFFFFFF) {
+		throw new Error(`appendPutValue: col must be an integer in [0, 4294967295], got ${col}`);
+	}
+	if (typeof value !== 'number' || !Number.isFinite(value)) {
+		throw new Error(`appendPutValue: value must be a finite number, got ${value}`);
+	}
+	session.appendPutValue(sheet, row, col, value);
+}
+
+/**
  * Reconstruct a `CollabSession` from a previously-exported snapshot.
  *
  * @param peerId Non-zero u64-domain peer identifier for THIS session

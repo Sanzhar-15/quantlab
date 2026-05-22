@@ -42,13 +42,23 @@ let cachedModule: QuantbookNativeModule | undefined;
  * Resolution order:
  * 1. `QUANTBOOK_ENGINE_PATH` env var, if set + non-empty.
  * 2. V1 dev-path discovery: walk UP from `__dirname` until we find
- *    the IDE repo root (identified by `package.json` with
- *    `name: "code-oss-dev"`), then `..` to the parent workspace dir,
- *    then descend to `quantlab-quantbook/quantbook-engine/target/release`.
+ *    the extensions/quantlab/package.json anchor (identified by
+ *    `name: "quantlab"`), then `..` twice to the IDE repo root, then
+ *    `..` to the parent workspace dir, then descend to
+ *    `quantlab-quantbook/quantbook-engine/target/release`.
  *
- * The IDE-repo-root anchor is independent of whether `__dirname` is
- * the un-compiled `src/quantbook` or the compiled `out/src/quantbook`
- * (differs by one segment, broke the original hard-coded `..` count).
+ * **V1 audit closure (Opus M2 + Codex M3, 2026-05-22)**: the prior
+ * anchor was the IDE-root `package.json` with `name: "code-oss-dev"`.
+ * Verified that the engine worktree (`quantlab-quantbook/`) is itself
+ * a worktree of the IDE repo and SHARES the same `code-oss-dev`
+ * package.json. That meant a user `cd`'d into the engine worktree
+ * would walk up to the WRONG IDE-root (the engine worktree's own) and
+ * resolve to `quantlab-quantbook/quantlab-quantbook/quantbook-engine/...`
+ * which doesn't exist. The extensions/quantlab/package.json is
+ * unique enough (named `"quantlab"` vs the root's `"code-oss-dev"`)
+ * to avoid this collision. Both worktrees have `extensions/quantlab/`
+ * with the same source, so we anchor THROUGH the extension to its
+ * containing IDE repo root.
  */
 export function resolveEnginePath(): string {
 	const env = process.env.QUANTBOOK_ENGINE_PATH;
@@ -56,11 +66,19 @@ export function resolveEnginePath(): string {
 		return path.resolve(env);
 	}
 	const ext = nativeLibExt();
-	const ideRepoRoot = findIdeRepoRoot(__dirname);
-	if (ideRepoRoot === undefined) {
-		// Fall through to a coarse path with __dirname so the existence
-		// check in loadQuantbookEngine surfaces a useful diagnostic
-		// (the error message will include this path).
+	const extensionDir = findExtensionDir(__dirname);
+	if (extensionDir === undefined) {
+		// **Loud diagnostic** (Opus M2 + Codex M3 closure): instead of
+		// the prior 6-hop "coarse fallback" path (which could silently
+		// point at the wrong directory and produce a confusing
+		// not-found error), surface the inability to anchor as an
+		// explicit error path. The fallback below uses __dirname only
+		// for the error-message context; the missing-file check in
+		// loadQuantbookEngine will fail loudly.
+		console.warn(
+			'[quantbook loader] could not locate extensions/quantlab anchor by walking up from ' +
+			`${__dirname}; set QUANTBOOK_ENGINE_PATH to point at the engine cdylib directly.`,
+		);
 		return path.resolve(
 			__dirname,
 			'..', '..', '..', '..', '..', '..',
@@ -68,20 +86,28 @@ export function resolveEnginePath(): string {
 			`libql_bindings_node.${ext}`,
 		);
 	}
+	// extensionDir is .../{IDE-root}/extensions/quantlab
+	// .. twice = IDE-root
+	// .. thrice = parent workspace (sibling-of-IDE)
+	// + quantlab-quantbook/quantbook-engine/target/release/lib...
 	return path.resolve(
-		ideRepoRoot,
-		'..', 'quantlab-quantbook', 'quantbook-engine', 'target', 'release',
+		extensionDir,
+		'..', '..', '..',
+		'quantlab-quantbook', 'quantbook-engine', 'target', 'release',
 		`libql_bindings_node.${ext}`,
 	);
 }
 
 /**
- * Walk UP from `start` looking for the IDE repo's `package.json`
- * (identified by `name: "code-oss-dev"`). Returns the absolute path
- * to the directory containing that package.json, or `undefined` if
- * not found within the filesystem-root traversal limit.
+ * Walk UP from `start` looking for the extension's `package.json`
+ * (identified by `name: "quantlab"` AND ending in `extensions/quantlab`
+ * to disambiguate from any other "quantlab"-named packages). Returns
+ * the absolute path to that directory, or `undefined` if not found.
+ *
+ * Anchoring to the extension instead of the IDE root avoids the
+ * worktree-collision issue documented above the caller.
  */
-function findIdeRepoRoot(start: string): string | undefined {
+function findExtensionDir(start: string): string | undefined {
 	let cur = path.resolve(start);
 	for (let depth = 0; depth < 16; depth += 1) {
 		const pkgPath = path.join(cur, 'package.json');
@@ -89,7 +115,7 @@ function findIdeRepoRoot(start: string): string | undefined {
 			try {
 				const raw = fs.readFileSync(pkgPath, 'utf8');
 				const pkg = JSON.parse(raw) as { name?: string };
-				if (pkg.name === 'code-oss-dev') {
+				if (pkg.name === 'quantlab' && cur.endsWith(path.join('extensions', 'quantlab'))) {
 					return cur;
 				}
 			} catch {
@@ -166,16 +192,24 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 			`and Node ABI (got Node ${process.version}).`,
 		);
 	}
-	cachedModule = fakeModule.exports as unknown as QuantbookNativeModule;
-	// Smoke-check the expected surface is present. Don't silently
-	// accept a load that returned an empty / partial export set.
-	if (typeof cachedModule.version !== 'function' || typeof cachedModule.CollabSession !== 'function') {
+	// **Phase 5.7 V1 audit closure (Opus H1 / Codex M1, 2026-05-22):**
+	// Validate the loaded module shape BEFORE caching. The prior version
+	// assigned `cachedModule` first then validated -- if the validate
+	// threw, the BAD module stayed cached and subsequent calls
+	// short-circuited via the early `if (cachedModule !== undefined)
+	// return` at the top of this function, returning the poisoned module
+	// to consumers. The actionable "missing expected exports" error was
+	// lost on call #2; consumers saw a cryptic `TypeError: ...
+	// CollabSession is not a constructor` at the use site instead.
+	const loaded = fakeModule.exports as unknown as QuantbookNativeModule;
+	if (typeof loaded.version !== 'function' || typeof loaded.CollabSession !== 'function') {
 		throw new Error(
 			`Quantbook engine at ${enginePath} loaded but is missing expected exports. ` +
-			`Got: ${JSON.stringify(Object.keys(cachedModule))}. ` +
+			`Got: ${JSON.stringify(Object.keys(fakeModule.exports))}. ` +
 			`Expected at least: version(), CollabSession constructor.`,
 		);
 	}
+	cachedModule = loaded;
 	return cachedModule;
 }
 

@@ -43,8 +43,18 @@ export interface CollabSessionInstance {
 	exportBytes(): Uint8Array;
 
 	/**
-	 * Merge a snapshot (or delta) from another peer. Returns the count
-	 * of ops actually merged (Loro dedupes by causal history).
+	 * Merge a snapshot (or delta) from another peer. Returns the
+	 * session's `opCount` AFTER the merge (NOT the number of newly
+	 * merged ops -- duplicates are deduped by Loro but the return
+	 * value is the post-merge total).
+	 *
+	 * **V1 audit closure (Codex M2, 2026-05-22)**: the original
+	 * docstring claimed "count of ops actually merged" implying a
+	 * delta. Verified empirically by calling `mergeBytes` twice with
+	 * the same snapshot: both calls return the same `opCount` value.
+	 * V2 may add a `mergeBytesDelta` companion that returns just the
+	 * newly merged count, once the use case (e.g., "warn if peer
+	 * sent us X new ops") materializes.
 	 */
 	mergeBytes(bytes: Uint8Array): number;
 

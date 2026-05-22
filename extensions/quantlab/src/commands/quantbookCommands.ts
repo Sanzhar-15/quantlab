@@ -22,7 +22,7 @@
 
 import * as vscode from 'vscode';
 
-import { createSession, quantbookEngineVersion, sessionFromSnapshot } from '../quantbook/session';
+import { appendPutValueValidated, createSession, quantbookEngineVersion, sessionFromSnapshot } from '../quantbook/session';
 import { quantbookHostInfo } from '../quantbook/loader';
 import type { CollabSessionInstance } from '../quantbook/types';
 
@@ -74,7 +74,11 @@ async function runDemoLoop(state: DemoState, log: vscode.OutputChannel): Promise
 				const row = Math.floor(Math.random() * 100);
 				const col = Math.floor(Math.random() * 10);
 				const value = Math.round(Math.random() * 10000) / 100;
-				state.peerA.appendPutValue(sheet, row, col, value);
+				// V1 audit closure (Opus H2 + Codex H3): route through
+				// the validating wrapper so any future demo with
+				// out-of-range / non-finite inputs surfaces a precise
+				// error instead of silently corrupting workbook state.
+				appendPutValueValidated(state.peerA, sheet, row, col, value);
 				log.appendLine(`peer A appendPutValue(${sheet}, ${row}, ${col}, ${value}) -> opCount=${state.peerA.opCount()}`);
 			} else if (choice === 'Sync A -> B') {
 				const bytes = state.peerA.exportBytes();
@@ -104,7 +108,7 @@ async function runDemoLoop(state: DemoState, log: vscode.OutputChannel): Promise
 				const row = Math.floor(Math.random() * 100);
 				const col = Math.floor(Math.random() * 10);
 				const value = Math.round(Math.random() * 10000) / 100;
-				state.peerB.appendPutValue(sheet, row, col, value);
+				appendPutValueValidated(state.peerB, sheet, row, col, value);
 				log.appendLine(`peer B appendPutValue(${sheet}, ${row}, ${col}, ${value}) -> opCount=${state.peerB.opCount()}`);
 			}
 		} catch (err) {

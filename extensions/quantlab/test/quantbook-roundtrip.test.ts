@@ -30,6 +30,7 @@ import {
 	_resetQuantbookEngineCacheForTests,
 } from '../src/quantbook/loader';
 import {
+	appendPutValueValidated,
 	createSession,
 	quantbookEngineVersion,
 	sessionFromSnapshot,
@@ -148,11 +149,24 @@ suite('quantbook engine round-trip -- Phase 5.7 V1', () => {
 			'fromSnapshot reconstructs the imported op count');
 	});
 
-	test('mergeBytes of empty array is rejected (engine error surfaces)', () => {
+	test('mergeBytes of empty array preserves op_count without panic', () => {
+		// **V1 audit closure (Opus M6, 2026-05-22):** loosen the
+		// assertion to match the engine-side pinned contract at
+		// `ql-oplog/src/log.rs` `merge_bytes_with_empty_slice_does_not_panic`.
+		// The engine pins "no panic + no partial state" -- it
+		// accepts either Ok-with-unchanged-len OR Err-with-unchanged-len.
+		// Loro 1.12 currently returns Err, but a future Loro version
+		// may accept empty as a no-op. Either is valid; the strict
+		// "must throw" assertion would silently break on Loro upgrade.
 		const s = createSession(1n);
-		// Loro returns Err on empty input (pinned by V2 V4 V1 step 4 K7
-		// test on the Rust side). napi-rs surfaces this as a JS Error.
-		assert.throws(() => s.mergeBytes(new Uint8Array(0)));
+		const preCount = s.opCount();
+		try {
+			s.mergeBytes(new Uint8Array(0));
+		} catch {
+			// Err arm is acceptable.
+		}
+		assert.strictEqual(s.opCount(), preCount,
+			'op_count unchanged after empty merge regardless of Ok/Err outcome');
 	});
 
 	test('loadQuantbookEngine caches across calls', () => {
@@ -161,5 +175,148 @@ suite('quantbook engine round-trip -- Phase 5.7 V1', () => {
 		const m1 = loadQuantbookEngine();
 		const m2 = loadQuantbookEngine();
 		assert.strictEqual(m1, m2, 'engine module is cached');
+	});
+
+	// ===========================================================
+	// V1 audit closure tests -- Phase 5.7 V1 audit (2026-05-22)
+	// ===========================================================
+
+	test('cache poisoning regression -- partial exports fail on every call', () => {
+		// **V1 audit closure (Opus H1 + Codex M1):** if dlopen returns
+		// a module missing expected exports, the loader must throw
+		// on EVERY call, not just the first. The original implementation
+		// set `cachedModule` BEFORE validation, so the second call
+		// short-circuited via the cache and returned the bad module.
+		// Closure: cache only AFTER validation passes.
+		const originalDlopen = process.dlopen;
+		_resetQuantbookEngineCacheForTests();
+		// Inject a partial module via monkey-patched dlopen.
+		(process as unknown as { dlopen: typeof process.dlopen }).dlopen =
+			(mod: NodeJS.Module): void => {
+				(mod as unknown as { exports: Record<string, unknown> }).exports = { foo: 1 };
+			};
+		try {
+			assert.throws(
+				() => loadQuantbookEngine(),
+				/missing expected exports/,
+				'first call must throw on partial exports',
+			);
+			assert.throws(
+				() => loadQuantbookEngine(),
+				/missing expected exports/,
+				'second call must also throw (cache must NOT poison)',
+			);
+		} finally {
+			process.dlopen = originalDlopen;
+			_resetQuantbookEngineCacheForTests();
+		}
+	});
+
+	test('appendPutValueValidated rejects negative row', () => {
+		const s = createSession(1n);
+		assert.throws(
+			() => appendPutValueValidated(s, 0, -1, 0, 42),
+			/row must be an integer/,
+		);
+	});
+
+	test('appendPutValueValidated rejects fractional col', () => {
+		const s = createSession(1n);
+		assert.throws(
+			() => appendPutValueValidated(s, 0, 0, 2.5, 42),
+			/col must be an integer/,
+		);
+	});
+
+	test('appendPutValueValidated rejects NaN value', () => {
+		const s = createSession(1n);
+		assert.throws(
+			() => appendPutValueValidated(s, 0, 0, 0, NaN),
+			/finite/,
+		);
+	});
+
+	test('appendPutValueValidated rejects Infinity value', () => {
+		const s = createSession(1n);
+		assert.throws(
+			() => appendPutValueValidated(s, 0, 0, 0, Infinity),
+			/finite/,
+		);
+	});
+
+	test('appendPutValueValidated rejects sheet > u16::MAX', () => {
+		const s = createSession(1n);
+		assert.throws(
+			() => appendPutValueValidated(s, 65536, 0, 0, 42),
+			/sheet must be/,
+		);
+	});
+
+	test('appendPutValueValidated accepts valid inputs', () => {
+		const s = createSession(1n);
+		const preCount = s.opCount();
+		appendPutValueValidated(s, 0, 0, 0, 42);
+		appendPutValueValidated(s, 65535, 0xFFFFFFFF, 0xFFFFFFFF, -1.5);
+		assert.ok(s.opCount() > preCount, 'valid inputs increment opCount');
+	});
+
+	test('engine appendPutValue rejects NaN at FFI boundary', () => {
+		// V1 audit closure (Opus M4 / Codex H3): the engine binding's
+		// `append_put_value` now rejects non-finite values BEFORE
+		// constructing the Op. This is defense-in-depth on top of the
+		// TS-side `appendPutValueValidated` wrapper -- a caller that
+		// bypasses the wrapper (calls `s.appendPutValue` directly)
+		// still gets a clean error instead of corrupting workbook
+		// state with NaN.
+		const s = createSession(1n);
+		assert.throws(
+			() => s.appendPutValue(0, 0, 0, NaN),
+			/finite/,
+		);
+		assert.throws(
+			() => s.appendPutValue(0, 0, 0, Infinity),
+			/finite/,
+		);
+	});
+
+	test('mergeBytes returns post-merge op count, not delta', () => {
+		// V1 audit closure (Codex M2): mergeBytes returns
+		// session.op_count() AFTER merging, NOT the number of newly
+		// merged ops. Verify by calling twice with the same snapshot
+		// (Loro dedupes -- delta would be 0 on second call, but the
+		// return is the same as the first call's).
+		const peerA = createSession(1n);
+		peerA.appendPutValue(0, 0, 0, 1);
+		peerA.appendPutValue(0, 0, 1, 2);
+		const bytes = peerA.exportBytes();
+		const peerB = createSession(2n);
+		const firstReturn = peerB.mergeBytes(bytes);
+		const secondReturn = peerB.mergeBytes(bytes);
+		assert.strictEqual(firstReturn, secondReturn,
+			'mergeBytes return value is post-merge op_count (stable across duplicate merges), not delta');
+	});
+
+	test('BigInt boundary -- u64::MAX rejected (PeerID::MAX sentinel), 2^64 rejected (lossy)', () => {
+		// **V1 audit closure (Rule 4 / Opus boundary test, 2026-05-22)**:
+		// the original boundary test expected u64::MAX to be ACCEPTED.
+		// Discovered during closure-cycle test run that Loro reserves
+		// `PeerID::MAX` as an internal sentinel (verified at
+		// `loro-internal-1.12.0/src/loro.rs:184` --
+		// `if peer == PeerID::MAX { return Err(...) }`). Loro returned
+		// a clean Err so no panic-abort hazard, but added FFI-side
+		// pre-rejection for symmetry with the peer_id==0 rejection
+		// and to give a consistent error message.
+		const uMax = (1n << 64n) - 1n; // u64::MAX
+		const oneUnderUMax = uMax - 1n;
+		const oneOverUMax = 1n << 64n;
+		// u64::MAX is rejected (PeerID::MAX sentinel).
+		assert.throws(() => createSession(uMax), /u64::MAX|sentinel/i,
+			'u64::MAX rejected with sentinel-mention message');
+		// u64::MAX - 1 IS valid -- the LARGEST acceptable peer id.
+		const sNearMax = createSession(oneUnderUMax);
+		assert.strictEqual(sNearMax.peerId(), oneUnderUMax,
+			'peerId BigInt round-trips losslessly at u64::MAX - 1');
+		// 2^64 is out of u64 range.
+		assert.throws(() => createSession(oneOverUMax), /lossy|fit/i);
 	});
 });
