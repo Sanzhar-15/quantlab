@@ -1208,12 +1208,20 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 		}
 	});
 
-	test('flushPendingToTransport: concurrent JS callers serialize via Arc<Mutex> (V2.4 soundness contract)', async function () {
-		// **V2.4 closure of V2.3 audit Codex+Opus HIGH-1 (Rust UB)**:
-		// Two concurrent flushPending calls must SERIALIZE on the
-		// internal mutex — no UB, no deadlock, both resolve. V2.3's
-		// `&mut self` async binding would have aliased; V2.4's `&self`
-		// + Arc<Mutex> + spawn_blocking does not.
+	test('flushPendingToTransport: smoke test of concurrent JS callers (V2.4 SAFETY note: see audit)', async function () {
+		// **V2.4 audit closure (Codex LOW-2 + Opus MEDIUM-1+2,
+		// 2026-05-22)**: this test was originally framed as proving V2.3's
+		// UB hazard is structurally closed. Both auditors flagged it as
+		// vacuous on Loopback (LoopbackTransport's `flush_pending` is
+		// the trait default `Ok(())` — returns immediately; no mutex
+		// contention is forced). The STRUCTURAL proof lives in the
+		// Rust compile-asserts (Send + Sync) + the napi-rs codegen
+		// source-walk (V2.4 audit verified `&self` + Arc<Mutex> produces
+		// shared `&` refs, no `&mut` aliasing). This test is now framed
+		// as a smoke test: passing means the binding doesn't crash
+		// under concurrent calls. Real contention testing requires a
+		// test-only blocking transport (V2.5+ backlog — needs engine
+		// fixture).
 		this.timeout(10000);
 		const session = createSession(1n);
 		const [tA, _tB] = loopbackTransportPair();
@@ -1224,21 +1232,62 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 		await Promise.all([p1, p2]);
 	});
 
-	test('flushPendingToTransport: interleaved sync method during pending async is safe (V2.4 soundness)', async function () {
-		// V2.4 soundness: while a flushPending is pending, JS can
-		// safely call other session methods. The Arc<Mutex> serializes
-		// them; the V2.3 UB hazard is structurally impossible.
+	test('flushPendingToTransport: smoke test of interleaved sync during pending async', async function () {
+		// **V2.4 audit closure (same as above)**: vacuous on Loopback.
+		// Real V8-block hazard testing (Opus V2.4 HIGH-1) needs a
+		// blocking transport fixture (V2.5+).
 		this.timeout(10000);
 		const session = createSession(1n);
 		const [tA, _tB] = loopbackTransportPair();
 		session.attachTransport(tA);
 
 		const p = session.flushPendingToTransport();
-		// Concurrent sync call on the same session. Acquires the
-		// mutex; safe.
 		const count = session.opCount();
 		assert.strictEqual(count, 0, 'opCount visible mid-pending-async');
 		assert.ok(session.hasTransport(), 'hasTransport visible mid-pending-async');
 		await p;
+	});
+
+	test('stale V2.3-shaped binary (missing V2.4 flushPendingToTransport) is rejected at the boundary', () => {
+		// **V2.4 audit closure (Codex LOW-3, 2026-05-22)**: pin the
+		// V2.4 loader skew detection. A V2.3 binary has all V2.2 +
+		// websocketConnect exports but lacks `flushPendingToTransport`
+		// on the CollabSession prototype. Without this test, a
+		// regression to the loader check would silently pass.
+		const originalDlopen = process.dlopen;
+		_resetQuantbookEngineCacheForTests();
+		const fakeCollabSession = function () { /* fake */ };
+		// All V1+V2.2 prototype methods, BUT no flushPendingToTransport.
+		for (const m of [
+			'appendPutValue', 'exportBytes', 'mergeBytes', 'opCount',
+			'pendingOpCount', 'hasPendingFlush', 'peerId',
+			'attachTransport', 'detachTransport', 'hasTransport',
+			'flushToTransport', 'pollRemote',
+			'flushDeltaToTransport', 'pollRemoteWithLimit',
+			'transportLastError', 'setAutoFlushPolicy', 'autoFlushPolicy',
+		]) {
+			(fakeCollabSession.prototype as Record<string, unknown>)[m] = function () { /* */ };
+		}
+		const fakeTransport = function () { /* fake */ } as unknown as { websocketConnect?: unknown };
+		fakeTransport.websocketConnect = function () { /* fake */ };
+		(process as unknown as { dlopen: typeof process.dlopen }).dlopen =
+			(mod: NodeJS.Module): void => {
+				(mod as unknown as { exports: Record<string, unknown> }).exports = {
+					version: () => '0.1.0-pre-v2.4',
+					CollabSession: fakeCollabSession,
+					Transport: fakeTransport,
+					LoopbackPair: function () { /* fake */ },
+				};
+			};
+		try {
+			assert.throws(
+				() => loadQuantbookEngine(),
+				/CollabSession\.prototype\.flushPendingToTransport \(V2\.4\)/,
+				'stale V2.3 binary must mention the missing V2.4 export',
+			);
+		} finally {
+			process.dlopen = originalDlopen;
+			_resetQuantbookEngineCacheForTests();
+		}
 	});
 });
