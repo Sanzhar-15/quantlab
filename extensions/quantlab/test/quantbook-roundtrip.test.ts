@@ -1223,22 +1223,29 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 		// **THE V2.5 PIN.** Closes Opus V2.4 HIGH-1 (V8-block UX hazard).
 		//
 		// Pattern:
-		//   1. Construct a BlockingTransportFixture with blockMs = 1000.
+		//   1. Construct a BlockingTransportFixture with blockMs = 2000.
+		//      (V2.5 audit closure Opus LOW-1, 2026-05-22: bumped from
+		//      1000ms to 2000ms to widen the absolute gap between V2.4
+		//      "broken" behavior (~2000ms block) and V2.5 "fixed"
+		//      behavior (~50ms). Threshold stays at 500ms.)
 		//   2. Attach the fixture's transport to a session.
 		//   3. Start flushPendingToTransport (the spawn_blocking task
 		//      starts; engine-side wait enters Condvar).
-		//   4. Await fixture.waitUntilBlocked() — deterministic
+		//   4. Await fixture.waitUntilBlocked() -- deterministic
 		//      synchronization point (Codex M3 fix): we are NOW sure
 		//      the spawn_blocking task has acquired its handle and is
 		//      blocked in wait_for_drain.
 		//   5. Call session.opCount(). Under V2.5: returns ~immediately
 		//      because the session lock was released in step 3. Under
-		//      V2.4 (the bug): would block ~1000ms because the session
+		//      V2.4 (the bug): would block ~2000ms because the session
 		//      lock was held during the wait.
-		//   6. Assert elapsed < blockMs / 2.
+		//   6. Assert elapsed < 500ms (= blockMs/4 with the V2.5
+		//      audit closure margin). Discrimination signal: V2.4 ~2000ms
+		//      vs V2.5 ~50ms is 40x; 500ms threshold catches any
+		//      regression while tolerating 10x slowdown for slow CI.
 		this.timeout(10000);
 		const engine = loadQuantbookEngine();
-		const fixture = new engine.BlockingTransportFixture(1000);
+		const fixture = new engine.BlockingTransportFixture(2000);
 		const t = fixture.takeTransport();
 		const session = createSession(1n);
 		session.attachTransport(t);
@@ -1252,19 +1259,28 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 		assert.strictEqual(count, 0, 'opCount returns correct value mid-pending-flush');
 		assert.ok(
 			elapsed < 500,
-			`V2.5 contract: opCount during pending flushPending took ${elapsed}ms; expected < blockMs/2 = 500. ` +
-			`Under V2.4 binding pattern this would block ~1000ms.`,
+			`V2.5 contract: opCount during pending flushPending took ${elapsed}ms; expected < 500. ` +
+			`Under V2.4 binding pattern this would block ~2000ms (blockMs).`,
 		);
 
 		fixture.release();
 		await flushP;
 	});
 
-	test('V2.5 contract: concurrent flushPendingToTransport calls serialize through ack handle (BlockingTransportFixture)', async function () {
-		// Two concurrent flushPending calls. Each spawns its own
-		// spawn_blocking task; both extract independent ack handles
-		// pointing at the same underlying transport's release Condvar.
-		// release() unblocks BOTH. Both promises resolve.
+	test('V2.5 contract: concurrent flushPendingToTransport calls both resolve after single release() (BlockingTransportFixture)', async function () {
+		// **V2.5 audit closure (Codex LOW-2, 2026-05-22)**: prior test
+		// name claimed "serialize through ack handle" which overclaimed
+		// what's tested. Each call spawns its own spawn_blocking task +
+		// extracts an independent ack handle; both handles wait on the
+		// SAME shared release Condvar; release() wakes both
+		// simultaneously. The test verifies BOTH promises resolve --
+		// it does NOT assert serialization (and they don't serialize:
+		// they coalesce on the shared release).
+		//
+		// True serialization (e.g., one wait must complete before the
+		// other begins) would require ack-handle-internal locking, which
+		// V2.5 deliberately avoids -- the V8-block closure works because
+		// the handles are non-locking Arc clones.
 		this.timeout(10000);
 		const engine = loadQuantbookEngine();
 		const fixture = new engine.BlockingTransportFixture(2000);
@@ -1277,7 +1293,7 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 		// Give both spawn_blocking tasks time to enter their waits.
 		await fixture.waitUntilBlocked();
 
-		// release() unblocks both.
+		// release() wakes both (shared release Condvar).
 		fixture.release();
 		await Promise.all([p1, p2]);
 	});
@@ -1334,7 +1350,10 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 		assert.ok(elapsed < 500, `pre-released wait exits quickly; took ${elapsed}ms`);
 	});
 
-	test('V2.6 BlockingTransportFixture: constructor rejects non-finite blockMs', async function () {
+	test('V2.6 BlockingTransportFixture: constructor rejects invalid blockMs (non-finite / negative / fractional / zero)', async function () {
+		// V2.5 audit closure (Codex MEDIUM-1, 2026-05-22): zero is now
+		// rejected at the napi boundary as an availability DoS guard.
+		// See engine `BlockingTransportFixture::new` docstring.
 		const engine = loadQuantbookEngine();
 		assert.throws(
 			() => new engine.BlockingTransportFixture(NaN),
@@ -1347,6 +1366,12 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 		assert.throws(
 			() => new engine.BlockingTransportFixture(2.5),
 			/blockMs must be an integer/,
+		);
+		// V2.5 closure (Codex M1): zero rejected to prevent indefinite
+		// blocking from JS callers.
+		assert.throws(
+			() => new engine.BlockingTransportFixture(0),
+			/blockMs must be > 0/,
 		);
 	});
 
