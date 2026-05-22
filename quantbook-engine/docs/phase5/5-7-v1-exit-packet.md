@@ -251,7 +251,7 @@ For V2+ work, the engine substrate available through the V1 binding:
 
 ## Cross-repo coordination notes for V2
 
-**Status update (2026-05-22, post-V2.4)**: V2.1 + V2.2 + V2.3 + V2.4 SHIPPED (4-of-8 cycles done). See `.plans/_active.md` for full V2 multi-cycle plan + V2.5+ backlog. The V2 conventions from V1 (below) held through all 4 cycles; V2.3 audit FAIL + V2.4 sound reintroduction validated the "ship → audit → close" discipline. **V2 exit packet pending** — lands at V2.8 with the 3-way megaudit. V2 audit transcripts in `docs/audits/2026-05-22-phase-5-7-v2-{1,2,3,4}-{codex,opus}.md`.
+**Status update (2026-05-22, post-V2.7)**: V2.1 + V2.2 + V2.3 + V2.4 + V2.5 + V2.6 + V2.7 SHIPPED + AUDITED (7-of-8 cycles done). See `.plans/_active.md` for full V2 multi-cycle plan + V2.8 next step. The V2 conventions from V1 (below) held through all 7 cycles; V2.3 audit FAIL + V2.4 sound reintroduction + V2.5 V8-block closure + V2.7 structured Error.code all validated the "ship → audit → close" discipline. **V2 exit packet pending** — lands at V2.8 with the 3-way megaudit. V2 audit transcripts in `docs/audits/2026-05-22-phase-5-7-v2-{1,2,3,4}-{codex,opus}.md` + `v2-5-opus.md` + `v2-7-opus.md` (V2.5 + V2.7 Codex transcripts pending docs-finalize at V2.8).
 
 V2 work will continue across both repos. Conventions established at V1:
 
@@ -297,4 +297,4 @@ With Phase 5.7 V1 SHIPPED + audit-closed + megaudited + docs-finalized, the full
 
 Phase 5.8 estimated ~4-6 days as a separate cycle.
 
-**Status update (2026-05-22, post-V2.4)**: V2 is 4-of-8 cycles done (V2.1, V2.2, V2.3, V2.4 SHIPPED). Remaining V2.5 (engine refactor for V8-block) → V2.6 (test fixture) → V2.7 (multi-window demo) → V2.8 (megaudit + V2 exit packet). Phase 5.8 still gated on V2 completing.
+**Status update (2026-05-22, post-V2.7)**: V2 is **7-of-8 cycles done** (V2.1-V2.4 + V2.5+V2.6 V8-block closure + V2.7 structured Error.code SHIPPED + AUDITED). V8-block VERIFIED CLOSED by both audit lanes. Remaining: V2.8 (3-way megaudit + V2 exit packet) = phase termination. Optional V2.7+ multi-window IDE demo may defer to V3 product work. Phase 5.8 still gated on V2 completing.

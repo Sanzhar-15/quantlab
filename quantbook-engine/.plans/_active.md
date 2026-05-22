@@ -1,6 +1,6 @@
 ---
 name: 2026-05-22_phase-5-7-v2-transport-binding
-status: in-progress (V2.1 + V2.2 + V2.3 + V2.4 SHIPPED; V2.5 + V2.6 PLANNED for this session as cycle 5 combined)
+status: in-progress (V2.1 + V2.2 + V2.3 + V2.4 + V2.5 + V2.6 + V2.7 ALL SHIPPED + AUDITED; V2.8 megaudit + V2 exit packet pending = phase termination)
 date: 2026-05-22
 predecessor_commit: 89dd5f0d170 (engine: docs(5.7) finalize V2 — exit packet + MASTER-PLAN backfill)
 ide_predecessor_commit: 97e0513d134 (IDE: Phase 5.7 V1 megaudit closures)
@@ -12,17 +12,21 @@ canonical_v2_audit_references:
   v2.2: docs/audits/2026-05-22-phase-5-7-v2-2-{codex,opus}.md
   v2.3: docs/audits/2026-05-22-phase-5-7-v2-3-{codex,opus}.md
   v2.4: docs/audits/2026-05-22-phase-5-7-v2-4-{codex,opus}.md
-arc_estimate_original: 3-5 days total. Actual: V2.1+V2.2 cycle-1; V2.3+V2.4 cycle-2 (continued in fresh context); V2.5+ next session.
+  v2.5: docs/audits/2026-05-22-phase-5-7-v2-5-opus.md (Codex transcript pending docs-finalize)
+  v2.7: docs/audits/2026-05-22-phase-5-7-v2-7-opus.md (Codex transcript pending docs-finalize)
+arc_estimate_original: 3-5 days total. Actual: V2.1+V2.2 cycle-1; V2.3+V2.4 cycle-2; V2.5+V2.6 cycle-3 + V2.7 cycle-4 (this session); V2.8 next session.
 session_cycles_budget: 2 cycles per session per CLAUDE.md global rule. Multi-session arc.
-v2_progress_summary: 4 cycles done (V2.1, V2.2, V2.3, V2.4) → 4 remaining (V2.5 engine refactor, V2.6 test fixture, V2.7 multi-window demo, V2.8 megaudit + exit packet).
-current_engine_head: 7123c6a57bb (Phase 5.7 V2.4 audit closures)
-current_ide_head: 8f0a44e19e9 (feat(quantbook): Phase 5.7 V2.4 audit closures)
-current_mocha_count: 72 / 72
-current_engine_workspace: 4461 / 0 baseline (V2.4 closure doesn't touch ql-collab)
+v2_progress_summary: 7 cycles done (V2.1, V2.2, V2.3, V2.4, V2.5+V2.6 combined, V2.7) → 1 remaining (V2.8 megaudit + V2 exit packet = phase termination). Multi-window IDE demo deferred to V3 product work.
+current_engine_head: 8f5b2e02ab7 (Phase 5.7 V2.7 audit closures)
+current_ide_head: f9f98194958 (feat(quantbook): Phase 5.7 V2.7 audit closures)
+current_mocha_count: 91 / 91
+current_ql_collab_tests: 74 / 74 (with --features test-fixtures)
+current_ql_collab_ws_tests: 4 / 4
+current_engine_workspace: 4472 / 0 baseline (V2.5 ship gate verified; V2.7 doesn't touch ql-collab core)
 audit_rules_inherited:
   - Rule 1: no fresh-session reminders (existing memory)
   - Rule 2: parallel Codex+Opus per step
-  - Rule 4: negative trait claims need positive compile proof OR per-field walk (caught 3 violations in V1)
+  - Rule 4: negative trait claims need positive compile proof OR per-field walk (caught 6 violations cumulative: 3 in V1, V2.3 napi-rs Reference exclusivity, V2.4 docstring drift, V2.5 false `FlushAck: !Sync`; V2.7 had 0)
 ---
 
 # Phase 5.7 V2 — Transport binding (Plan)
@@ -160,7 +164,25 @@ Other V2.3 closures: loader V2.3 export check, tighter rejection categories, rep
 - Codex: PASS-WITH-FINDINGS (0H+0M+3L+1OBS).
 - Opus: PASS-WITH-FINDINGS (2H+7M+5L+6OBS).
 
-## V2.5 + V2.6 — Combined cycle (Cycle 5) — PLANNED 2026-05-22 (Codex-verified PASS-WITH-FINDINGS)
+## V2.5 + V2.6 — Combined cycle (Cycle 5) ✅ SHIPPED 2026-05-22
+
+**Engine commits**: `1b233af6150` (ship) → `81c66d02f9f` (audit closure).
+**IDE commits**: `c5997998741` (ship) → `8798349be6d` (audit closure).
+**Tests**: ql-collab 71/71 (test-fixtures); IDE mocha 77/77 after closure.
+
+**What shipped**: Closed Opus V2.4 HIGH-1 (V8-block UX hazard) via Option A — `Transport::ack_handle` trait extension + `WebSocketProgressAckHandle` (with Codex M1 target snapshot) + `CollabSession::flush_pending_handle(&self)` proxy + napi binding refactor (extract handle under lock → drop lock → spawn_blocking wait). V2.6 added `BlockingTransport` test fixture behind `test-fixtures` feature + `BlockingTransportFixture` napi class.
+
+**V8-block CLOSURE VERIFIED** by both audit lanes via independent source-walks. V2.5 contract test empirically passes: `opCount()` during a 2000ms-blocked flushPending returns ~50ms.
+
+**V2.5 audit verdicts**:
+- Codex: PASS-WITH-FINDINGS (0H+1M+3L+1OBS). M1 = `blockMs == 0` rejection at napi boundary. L1 = top-level binding docstring stale. L2 = overclaiming tests. L3 = stale-binary UX.
+- Opus: PASS-WITH-FINDINGS (0H+1M+4L+5OBS). **M1 = Rule 4 #6 trigger**: false `FlushAck: Send + !Sync` while impls Send + Sync. L1 = CI margin defensiveness. L4 = vestigial `let _ = *released;`.
+
+All closed in cycle. Audit transcripts: `docs/audits/2026-05-22-phase-5-7-v2-5-opus.md` committed; Codex transcript pending docs-finalize.
+
+---
+
+### Original V2.5 + V2.6 plan (Codex-verified PASS-WITH-FINDINGS, retained for historical context)
 
 **Codex review verdict** (`/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/.codex-v2-5-plan-review.out`, 2026-05-22):
 > PASS-WITH-FINDINGS. The core V8-block fix direction is sound; ship after applying the 4 MEDIUM + 1 LOW recommendations below. Q1 lock-release pattern VERIFIED. Q2 Box<dyn FlushAck + Send> design ACCEPTABLE.
@@ -601,17 +623,31 @@ Each new method MUST be pre-checked for FFI-reachable panics:
 - napi binding `flush_pending_to_transport` refactor: same `spawn_blocking` + `lock()` pattern as V2.4; new `flush_pending_handle()` proxy method is `&self` (parking_lot's `lock()` never panics on uncontended path; contended path can deadlock but never panic).
 - Per Rule 4: pin `_ASSERT_FLUSH_ACK_SEND` + `_ASSERT_BLOCKING_TRANSPORT_SEND_SYNC` + `_ASSERT_WEBSOCKET_ACK_HANDLE_SEND_SYNC` const-fn asserts.
 
-### V2.7 — Multi-window IDE demo
+## V2.7 — Structured Error.code discrimination (Cycle 7) ✅ SHIPPED 2026-05-22
 
-Extend `quantlab.quantbookDemo` command to spawn a second VS Code window via the `vscode.openFolder` API + a localhost WebSocket relay. The current command does in-process LoopbackPair; V2.7 does two separate extension hosts.
+**Engine commits**: `2a3e2ebcbfe` (ship) → `8f5b2e02ab7` (audit closure).
+**IDE commits**: `2a5619f9162` (ship) → `f9f98194958` (audit closure).
+**Tests**: ql-collab 74/74 (test-fixtures, +3 kind tests); ql-collab-ws 4/4 (+1 kind test); IDE mocha 91/91 (+11 V2.7 ship + 3 V2.7 closure).
 
-### V2.8 — 3-way Codex+Opus-A+Opus-B megaudit + V2 exit packet
+**What shipped**: Closed V2.1+V2.2+V2.3 Opus MEDIUM-3 carryforwards via `kind() -> &'static str` accessors on every engine error enum + `[<kind>]` prefix napi helpers + IDE-side `parseQuantbookError` + `QuantbookErrorCode` union of 12 codes.
 
-Phase-level closure pattern. Sweep V2.1+V2.2+V2.3+V2.4+V2.5+V2.6 for cumulative findings invisible at per-step.
+**V2.7 audit verdicts**:
+- Codex: PASS-WITH-FINDINGS (0H+0M+1L). All Q1-Q4 match-coverage VERIFIED.
+- Opus: PASS-WITH-FINDINGS (0H+3M+4L). **0 Rule 4 triggers** (arc count stays at 6). M1 = `'unknown'` set-membership asymmetry. **M2 (the big one) = napi validation errors silently bucketed under `'unknown'`** — closed via new `bad_argument` code + `bad_argument_error(msg)` helper + 14 call-site retrofits (`validate_u32_index`, `peer_id_from_bigint`, `appendPutValue`, `attachTransport`, `LoopbackPair.{takeA, takeB}`, `BlockingTransportFixture.{new, takeTransport}`, `parse_auto_flush_policy`, `auto_flush_policy_to_string`). M3 = Transport-passthrough origin tracking (documented as intentional; deferred). L1 = digit-regex extension. L3+L4 = doc clarity.
 
-### V2 backlog (carryforward from V1 + V2.1 + V2.2 + V2.3 + V2.4 + V2.5)
+All closed in cycle. Opus transcript committed at `docs/audits/2026-05-22-phase-5-7-v2-7-opus.md`; Codex transcript pending docs-finalize.
 
-- Structured `Error.code` discrimination via napi `Error::with_code` + `TransportError::kind()` accessor. V2.4 deferred again; pressing for V2.7 multi-window UX.
+## V2.8 — DEFERRED to next session — 3-way Codex+Opus-A+Opus-B megaudit + V2 exit packet
+
+Phase-level closure pattern. Sweep V2.1+V2.2+V2.3+V2.4+V2.5+V2.6+V2.7 for cumulative findings invisible at per-step. Estimated ~2-3d. Recommended FIRST next session (closes V2 phase formally; produces V2 exit packet at `docs/phase5/5-7-v2-exit-packet.md`).
+
+## V2.7+ — DEFERRED — Multi-window IDE demo
+
+Extend `quantlab.quantbookDemo` command to spawn a second VS Code window via the `vscode.openFolder` API + a localhost WebSocket relay. Currently the command does in-process LoopbackPair; multi-window version does two separate extension hosts. ~1-2d. Could be deferred to V3 product work after V2.8 exit packet.
+
+### V2 backlog (carryforward from V1 + V2.1 + V2.2 + V2.3 + V2.4 + V2.5 + V2.7)
+
+- ~~Structured `Error.code` discrimination~~ ✓ V2.7 SHIPPED via `[<kind>]` prefix convention.
 - `#[napi(strict)]` sweep for type-confusion safety (Opus V2.1 LOW-1).
 - `#[must_use]` on `attach_transport<T>` (Opus V2.1 M1; ~80 call site sweep).
 - `willFlushSend()` helper to match `flushDeltaToTransport`'s idempotency guard (Opus V2.2 M3).
@@ -621,22 +657,26 @@ Phase-level closure pattern. Sweep V2.1+V2.2+V2.3+V2.4+V2.5+V2.6 for cumulative 
 - RwLock for pure-read methods if profiling shows contention (Opus V2.4 M7).
 - Document parking_lot's no-poison + CoreCollabSession panic safety (Opus V2.4 M5).
 - Document spawn_blocking pool budget interaction with WebSocketTransport reader/writer tasks (Opus V2.4 M4).
-- **Gate `BlockingTransportFixture` napi class behind a `ql-bindings-node`-side feature** (V2.5 Codex M1 + Opus L2 convergent). Today the engine-side `test-fixtures` feature gates the underlying `BlockingTransport` + `BlockingAckHandle`, but the binding crate enables it unconditionally so the napi wrapper ships in every cdylib. V2.5 closure rejected `blockMs == 0` at the napi boundary as defense-in-depth, but the fixture's mere presence is still a per-session bounded DoS surface. Future production-cdylib hardening: feature-gate the entire `BlockingTransportFixture` napi class + update CI to build with `--features test-fixtures` for mocha, plain build for production.
-- **Rename test for honesty** (V2.5 Codex L2 / Opus L2): `ack_handle_survives_transport_drop_terminates` (renamed from `..._returns_closed` in V2.5 closure) accepts both Ok and Err; if precision is needed, build a fixture that times Drop relative to wait entry (probably belongs in the new V2.6-era `BlockingTransport` family of fixtures).
+- **Gate `BlockingTransportFixture` napi class behind a `ql-bindings-node`-side feature** (V2.5 Codex M1 + Opus L2 convergent). Today the engine-side `test-fixtures` feature gates the underlying `BlockingTransport` + `BlockingAckHandle`, but the binding crate enables it unconditionally so the napi wrapper ships in every cdylib. Future production-cdylib hardening: feature-gate the entire `BlockingTransportFixture` napi class + update CI to build with `--features test-fixtures` for mocha, plain build for production.
+- **Rename test for honesty** (V2.5 Codex L2 / Opus L2): `ack_handle_survives_transport_drop_terminates` accepts both Ok and Err; if precision is needed, build a fixture that times Drop relative to wait entry.
+- **V2.7 Opus L2**: compile-time guard for SemVer-stable error kind strings (today the discipline is doc-only). Could codegen `KNOWN_QUANTBOOK_ERROR_CODES` from the union type via TS const-enum or similar.
+- **V2.7 Opus M3 (deferred)**: `CollabSessionError::Transport(_)` origin tracking. Today the passthrough is documented + intentional (IDE consumers branch on actual transport state, not wrapper). If a use case emerges for "did this come from a session method or direct transport call", add `QuantbookErrorInfo.wrappedIn: QuantbookErrorCode | undefined` field.
+- **V2.7 closure-deferred**: structured `transportLastError()` accessor on engine `WebSocketTransport` that produces a `[websocket_runtime_error]` prefixed string. Currently `transportLastError()` returns raw `e.to_string()`. The `websocket_runtime_error` code is structurally defined in the IDE-side union but not reachable via any napi rejection path today.
 
-## Acceptance criteria for V2 SHIP this session — MET
+## Acceptance criteria for V2 SHIP cycles 5+6+7 (this session) — MET
 
-- [x] Engine workspace baseline 4461 / 0 (V2.x closure cycles don't touch ql-collab core).
-- [x] `ql-bindings-node` Rust unit tests pass.
-- [x] IDE quantbook mocha 72 / 72 (was 26 at V1 close).
+- [x] Engine workspace baseline 4472 / 0 (V2.5 ship gate verified; V2.7 doesn't touch ql-collab core).
+- [x] `ql-collab` tests 74/74 (`--features test-fixtures`; +5 V2.6 BlockingTransport + +3 V2.7 kind() tests vs V2.4 baseline 66/66).
+- [x] `ql-collab-ws` tests pass (+3 V2.5 ack_handle integration + +1 V2.7 kind test vs V2.4).
+- [x] IDE quantbook mocha **91/91** (was 72 at V2.4 close; +5 V2.5 contract + +6 V2.6 fixture + +8 V2.7 parser unit + +3 V2.7 end-to-end + +3 V2.7 closure = +19 net, with -2 V2.4 vacuous removed).
 - [x] fmt + clippy clean on both repos.
 - [x] No new TS compile errors.
-- [x] Engine `.dylib` rebuilds and loads.
-- [x] All audit HIGHs closed in cycle (V2.1, V2.2, V2.4 cycles; V2.3 HIGHs closed via REMOVE; V2.4 closed via refactor).
-- [x] `.plans/_active.md` updated through V2.4 + V2.5 plan.
-- [x] `memory/current_work.md` updated with V2.4 HEAD + V2 progress narrative.
-- [x] All 9 audit transcripts tracked in `docs/audits/` (5 V1 + 4 V2.x Codex + 4 V2.x Opus).
-- [ ] Plan archive: defer until V2 fully ships (V2.8 megaudit + V2 exit packet land in V2.5+).
+- [x] Engine `.dylib` rebuilds and loads (4.5MB; rebuilt at V2.7 closure).
+- [x] All audit HIGHs closed in cycle. V2.5 had 1H total (Rule 4 #6); V2.7 had 0H.
+- [x] `.plans/_active.md` updated through V2.7 + V2.8 deferred.
+- [x] `memory/current_work.md` updated with V2.7 HEAD + 6-of-8 progress narrative.
+- [x] 13 of 16 audit transcripts tracked in `docs/audits/` (5 V1 + 4 V2.1-V2.4 Codex + 4 V2.1-V2.4 Opus + V2.5 Opus + V2.7 Opus). **Pending**: V2.5 plan-time Codex review, V2.5 Codex audit, V2.7 Codex audit (in parent worktree; V2.8 docs-finalize will commit).
+- [ ] Plan archive: defer until V2 fully ships (V2.8 megaudit + V2 exit packet are the V2 phase termination).
 
 ## V2 commit ladder (cumulative)
 
@@ -645,11 +685,16 @@ Engine `feat/quantbook-engine`:
 - V2.1: c4e7b471142 → 39ed260bec9
 - V2.2: d9b4168022d → d33876f7745
 - V2.3: 1e2354cb7b1 → ea07bc6af4e
-- V2.4: c51df9f41f4 → 7123c6a57bb (current HEAD pre-docs-finalize)
+- V2.4: c51df9f41f4 → 7123c6a57bb
+- docs finalize V2: 9eece27cf77
+- V2.5+V2.6: 1b233af6150 → 81c66d02f9f
+- V2.7: 2a3e2ebcbfe → **8f5b2e02ab7** (current HEAD; ready for V2.8)
 
 IDE `feat/visualise-v1`:
 - V1: 1a7fc8bbe3f → a517d7c5f71 → 97e0513d134
 - V2.1: 1f142366839 → 9da8d5df060
 - V2.2: b245c5b9fa8 → 3871c8ce055
 - V2.3: 6616e28a2a3 → 233957ab140
-- V2.4: 3ab02bbe732 → 8f0a44e19e9 (current HEAD)
+- V2.4: 3ab02bbe732 → 8f0a44e19e9
+- V2.5+V2.6: c5997998741 → 8798349be6d
+- V2.7: 2a5619f9162 → **f9f98194958** (current HEAD; ready for V2.8)
