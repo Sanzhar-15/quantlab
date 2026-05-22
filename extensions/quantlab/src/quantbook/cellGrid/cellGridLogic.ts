@@ -31,6 +31,47 @@ import type { CollabSessionInstance, QuantbookErrorCode } from '../types';
 import { appendPutValueValidated, parseQuantbookError } from '../session';
 
 /**
+ * V3.2.c.3 / V3.2.c.5 (2026-05-22) -- classification of a single
+ * `session.pollRemote()` call's outcome.  Exported so the panel's
+ * `tickPollRemote` (vscode-side) can delegate the decision tree to
+ * this vscode-free helper, AND so mocha can exercise the four
+ * branches without instantiating a real CellGridPanel.
+ */
+export type PollTickResult =
+	| { kind: 'idle' }
+	| { kind: 'merged'; count: number }
+	| { kind: 'transportClosed' }
+	| { kind: 'error'; code: QuantbookErrorCode; message: string };
+
+/**
+ * Call `session.pollRemote()` once and classify the result.  No side
+ * effects beyond the pollRemote itself; the caller decides what to do
+ * with the verdict (render / reconnect / log + skip).
+ *
+ * Branches:
+ * - `pollRemote()` returns 0 -> `{kind:'idle'}`.
+ * - `pollRemote()` returns > 0 -> `{kind:'merged', count: n}`.
+ * - `pollRemote()` throws + `parseQuantbookError(err).code === 'transport_closed'`
+ *   -> `{kind:'transportClosed'}` (V3.1.c reconnect cue).
+ * - Any other throw -> `{kind:'error', code, message}` (log + skip).
+ */
+export function classifyPollTick(session: CollabSessionInstance): PollTickResult {
+	try {
+		const n = session.pollRemote();
+		if (n > 0) {
+			return { kind: 'merged', count: n };
+		}
+		return { kind: 'idle' };
+	} catch (err) {
+		const info = parseQuantbookError(err);
+		if (info.code === 'transport_closed') {
+			return { kind: 'transportClosed' };
+		}
+		return { kind: 'error', code: info.code, message: info.message };
+	}
+}
+
+/**
  * V3.2.b.1 decision B1 envelope: outgoing (webview -> extension host).
  *
  * `rawInput` is the literal user-typed string; the host's

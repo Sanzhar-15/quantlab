@@ -209,7 +209,14 @@ async function spawnRelayBinary(
  * Returns the connected Transport AND (if the relay was spawned by this
  * call) the spawned ChildProcess so the caller can hold its lifetime.
  */
-async function connectOrSpawn(
+/**
+ * V3.2.c.2 (2026-05-22): exported so the cell-grid collab command
+ * (`quantlab.quantbookCellGridCollab`) can reuse the V3.1.b attach
+ * orchestration verbatim per V3.2.c.1 decision C1 + C7.  Pre-V3.2.c
+ * this function was private to multiWindowDemo.ts; visibility is now
+ * widened but behaviour is byte-for-byte unchanged.
+ */
+export async function connectOrSpawn(
 	engine: QuantbookNativeModule,
 	log: vscode.OutputChannel,
 ): Promise<{
@@ -276,7 +283,15 @@ async function connectOrSpawn(
  * the same port will fail with `websocket_connect_failed`, which the
  * caller surfaces as a "Connection lost" notification.
  */
-async function reconnectWithBackoff(
+/**
+ * V3.2.c.2 (2026-05-22): exported so the cell-grid collab command can
+ * reuse the V3.1.c reconnect contract verbatim per V3.2.c.1 decision
+ * C6.  Pre-V3.2.c this was private; visibility widened, behaviour
+ * unchanged.  Future audit (V3.2.d) may decide to extract this +
+ * connectOrSpawn into a dedicated `transportLifecycle.ts` module --
+ * deferred per decision C7 to keep the V3.2.c diff small.
+ */
+export async function reconnectWithBackoff(
 	engine: QuantbookNativeModule,
 	log: vscode.OutputChannel,
 ): Promise<Awaited<ReturnType<typeof engine.Transport.websocketConnect>>> {

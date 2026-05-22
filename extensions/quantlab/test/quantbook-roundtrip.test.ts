@@ -2264,7 +2264,7 @@ suite('quantbook V3.2.a -- exportSnapshot cell-snapshot export', function () {
 // Phase 5.7 V3.2.b.5 -- cell-edit flow (HTML + dispatcher)
 // ============================================================================
 
-import { dispatchIncomingMessage, parseCellRawInput, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
+import { classifyPollTick, dispatchIncomingMessage, parseCellRawInput, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
 
 suite('quantbook V3.2.b.2 -- cellGridHtml.ts nonce + script + editable cells', function () {
 	test('buildHtml WITHOUT nonce is unchanged from V3.2.a (no script tag; narrow CSP)', () => {
@@ -2465,5 +2465,127 @@ suite('quantbook V3.2.b.5 -- dispatchIncomingMessage (host-side commit path)', f
 		assert.strictEqual(errorReplies.length, 0);
 		dispatchIncomingMessage(null, deps);
 		assert.strictEqual(errorReplies.length, 0);
+	});
+});
+
+// ============================================================================
+// Phase 5.7 V3.2.c.5 -- live multi-window propagation (pollloop + attach)
+// ============================================================================
+
+
+suite('quantbook V3.2.c.3 -- classifyPollTick', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('idle when pollRemote returns 0 (no remote ops)', () => {
+		const session = createSession(501n);
+		const result = classifyPollTick(session);
+		assert.strictEqual(result.kind, 'idle');
+	});
+
+	test('merged with count when pollRemote returns > 0', () => {
+		// Build a snapshot from another session, merge into this one
+		// via mergeBytes (which pollRemote also funnels into); then
+		// confirm classifyPollTick reports idle (no transport
+		// attached, nothing to drain).  This pins the "remote-merged
+		// ops are NOT what classifyPollTick reports -- it reports
+		// what pollRemote drained from the attached transport's
+		// inbox" contract.
+		const sessA = createSession(502n);
+		appendPutValueValidated(sessA, 0, 0, 0, 42);
+		const bytes = sessA.exportBytes();
+		const sessB = createSession(503n);
+		sessB.mergeBytes(bytes);
+		// No transport attached, so pollRemote drains nothing.
+		const result = classifyPollTick(sessB);
+		assert.strictEqual(result.kind, 'idle',
+			'classifyPollTick reports transport drain, NOT merge-bytes side effects');
+	});
+
+	test('merged path: with attached transport, returns merged + count', () => {
+		const [tA, tB] = loopbackTransportPair();
+		const sessA = createSession(504n);
+		const sessB = createSession(505n);
+		sessA.attachTransport(tA);
+		sessB.attachTransport(tB);
+		sessA.setAutoFlushPolicy('onAppend');
+		appendPutValueValidated(sessA, 0, 1, 1, 7.5);
+		// Now sessB's loopback inbox has at least one frame from
+		// sessA's flush; classifyPollTick should see merged.
+		const result = classifyPollTick(sessB);
+		assert.strictEqual(result.kind, 'merged',
+			`expected merged, got ${JSON.stringify(result)}`);
+		if (result.kind === 'merged') {
+			assert.ok(result.count > 0, `count > 0, got ${result.count}`);
+		}
+	});
+
+	test('idle on subsequent tick after a successful merge (drain semantics)', () => {
+		const [tA, tB] = loopbackTransportPair();
+		const sessA = createSession(506n);
+		const sessB = createSession(507n);
+		sessA.attachTransport(tA);
+		sessB.attachTransport(tB);
+		sessA.setAutoFlushPolicy('onAppend');
+		appendPutValueValidated(sessA, 0, 0, 0, 1.0);
+		const first = classifyPollTick(sessB);
+		assert.strictEqual(first.kind, 'merged');
+		// Second tick: transport inbox is empty now.
+		const second = classifyPollTick(sessB);
+		assert.strictEqual(second.kind, 'idle');
+	});
+});
+
+suite('quantbook V3.2.c.5 -- two-session loopback round-trip with auto-flush', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('A appends with auto-flush; B pollRemote merges; B snapshot mirrors A', () => {
+		const [tA, tB] = loopbackTransportPair();
+		const sessA = createSession(601n);
+		const sessB = createSession(602n);
+		sessA.attachTransport(tA);
+		sessB.attachTransport(tB);
+		sessA.setAutoFlushPolicy('onAppend');
+		sessB.setAutoFlushPolicy('onAppend');
+
+		// A appends three cells; auto-flush sends each blob.
+		appendPutValueValidated(sessA, 0, 0, 0, 11);
+		appendPutValueValidated(sessA, 0, 0, 1, 22);
+		appendPutValueValidated(sessA, 0, 1, 0, 33);
+
+		// B drains the inbox.
+		const result = classifyPollTick(sessB);
+		assert.strictEqual(result.kind, 'merged');
+
+		// B's snapshot now mirrors A's three cells.
+		const snapA = exportCellSnapshot(sessA, 0);
+		const snapB = exportCellSnapshot(sessB, 0);
+		assert.deepStrictEqual(snapB.entries, snapA.entries,
+			'B snapshot must match A snapshot after pollRemote drain');
+		assert.strictEqual(snapB.entries.length, 3);
+	});
+
+	test('detach then pollRemote returns idle (no remote drain without a transport)', () => {
+		const [tA, tB] = loopbackTransportPair();
+		const sessA = createSession(603n);
+		const sessB = createSession(604n);
+		sessA.attachTransport(tA);
+		sessB.attachTransport(tB);
+		sessA.setAutoFlushPolicy('onAppend');
+
+		appendPutValueValidated(sessA, 0, 0, 0, 5);
+		sessB.detachTransport();
+		// pollRemote on a detached session is a no-op (returns 0).
+		const result = classifyPollTick(sessB);
+		assert.strictEqual(result.kind, 'idle');
+		// B's snapshot does NOT include A's edit because the
+		// transport was detached before drain.
+		const snapB = exportCellSnapshot(sessB, 0);
+		assert.strictEqual(snapB.entries.length, 0);
 	});
 });

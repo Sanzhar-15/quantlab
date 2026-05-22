@@ -27,12 +27,14 @@
  *   envelope types in `cellGridLogic.ts`.
  */
 
+import * as childProcess from 'child_process';
 import * as vscode from 'vscode';
 
-import { exportCellSnapshot } from '../session';
-import type { CollabSessionInstance } from '../types';
+import { exportCellSnapshot, parseQuantbookError } from '../session';
+import type { CollabSessionInstance, QuantbookNativeModule, TransportInstance } from '../types';
+import { reconnectWithBackoff } from '../multiWindowDemo';
 import { buildHtml } from './cellGridHtml';
-import { dispatchIncomingMessage } from './cellGridLogic';
+import { classifyPollTick, dispatchIncomingMessage } from './cellGridLogic';
 
 const VIEW_TYPE = 'quantlab.quantbookCellGrid';
 
@@ -52,6 +54,26 @@ const VIEW_TYPE = 'quantlab.quantbookCellGrid';
 const activePanels: Map<number, CellGridPanel> = new Map();
 
 /**
+ * V3.2.c.3 (2026-05-22): everything the panel needs to drive the
+ * collab lifecycle.  The collab command (`quantlab.quantbookCellGrid
+ * Collab`) constructs this via {@link multiWindowDemo.connectOrSpawn}
+ * and hands it to {@link CellGridPanel.show}.  The panel OWNS the
+ * lifetime of all fields here:
+ * - `transport` -> attached on open, detached on dispose
+ * - `spawnedRelay` -> killed on dispose if this window spawned it
+ * - `engine` -> retained for reconnect (`websocketConnect` calls)
+ * - `log` -> for state-transition log lines (decision C4)
+ */
+export interface CollabAttachment {
+	readonly engine: QuantbookNativeModule;
+	readonly transport: TransportInstance;
+	readonly spawnedRelay: childProcess.ChildProcess | undefined;
+	readonly log: vscode.OutputChannel;
+}
+
+const POLL_REMOTE_INTERVAL_MS = 1000;
+
+/**
  * Render-then-edit webview panel that displays the given session's
  * cell snapshot for the given sheet.  The panel binds the session for
  * its lifetime -- the dispatcher commits via this session, `render()`
@@ -62,20 +84,34 @@ export class CellGridPanel {
 		context: vscode.ExtensionContext,
 		session: CollabSessionInstance,
 		sheet: number,
+		attachment?: CollabAttachment,
 	): CellGridPanel {
 		// V3.2.a.1: single tab per sheet (reveal + refresh on
 		// re-open).  V3.2.b inherits this convention -- the existing
 		// panel keeps its session reference + onDidReceiveMessage
 		// handler intact across reveal.
-		const existing = activePanels.get(sheet);
-		if (existing !== undefined) {
-			existing.panel.reveal(vscode.ViewColumn.Active, false);
-			existing.render();
-			return existing;
+		//
+		// V3.2.c.3: collab-attached panels DO NOT reuse a cached
+		// panel.  Two open commands (local + collab) on the same
+		// sheet must produce DIFFERENT panels because they reference
+		// different sessions.  If a panel for this sheet is already
+		// open AND the new call has no attachment, reuse it (legacy
+		// V3.2.a.1 path).  Otherwise force a new panel; the existing
+		// one (if any) gets disposed in `onDidDispose` -> stale
+		// activePanels entry replaced.
+		if (attachment === undefined) {
+			const existing = activePanels.get(sheet);
+			if (existing !== undefined) {
+				existing.panel.reveal(vscode.ViewColumn.Active, false);
+				existing.render();
+				return existing;
+			}
 		}
 		const panel = vscode.window.createWebviewPanel(
 			VIEW_TYPE,
-			`Cell Grid (sheet ${sheet})`,
+			attachment !== undefined
+				? `Cell Grid -- Collab (sheet ${sheet})`
+				: `Cell Grid (sheet ${sheet})`,
 			vscode.ViewColumn.Active,
 			{
 				// V3.2.b.3: scripts ON for click-to-edit flow.  CSP +
@@ -89,7 +125,7 @@ export class CellGridPanel {
 				localResourceRoots: [context.extensionUri],
 			},
 		);
-		const instance = new CellGridPanel(panel, session, sheet);
+		const instance = new CellGridPanel(panel, session, sheet, attachment);
 		// Attach the message handler BEFORE the first render() -- if
 		// the webview script were ever to postMessage during initial
 		// load (it doesn't today, but defensive), we don't want to
@@ -101,10 +137,31 @@ export class CellGridPanel {
 			undefined,
 			context.subscriptions,
 		);
+		// V3.2.c.3: wire transport (if collab-attached) BEFORE first
+		// render so the panel starts in a fully-attached state.
+		// `wireAttachment` calls setAutoFlushPolicy + attachTransport
+		// + starts the pollRemote timer.  Any error here is fatal --
+		// surface via showErrorMessage + dispose the panel.
+		if (attachment !== undefined) {
+			try {
+				instance.wireAttachment(attachment);
+			} catch (err) {
+				const info = parseQuantbookError(err);
+				attachment.log.appendLine(`[collab] FATAL wireAttachment: code=${info.code} msg=${info.message}`);
+				void vscode.window.showErrorMessage(`Cell Grid collab attach failed: ${info.message}`);
+				panel.dispose();
+				throw err;
+			}
+		}
 		instance.render();
 		activePanels.set(sheet, instance);
 		panel.onDidDispose(() => {
-			activePanels.delete(sheet);
+			instance.disposeAttachment();
+			// Only clear the cache entry if we still own it (a fresh
+			// open for the same sheet may have replaced us).
+			if (activePanels.get(sheet) === instance) {
+				activePanels.delete(sheet);
+			}
 		});
 		context.subscriptions.push(panel);
 		return instance;
@@ -125,11 +182,37 @@ export class CellGridPanel {
 		return count;
 	}
 
+	/**
+	 * V3.2.c.3: when the panel is collab-attached, this holds the
+	 * current Transport + the pollRemote timer + spawned-relay
+	 * handle + engine ref for reconnect.  Mutable across reconnects:
+	 * `attachment.transport` changes (via {@link reconnectWithBackoff})
+	 * but `attachment.engine` + `attachment.log` + `attachment.spawnedRelay`
+	 * stay constant for the panel's lifetime.
+	 *
+	 * `undefined` for local-mode (V3.2.a / V3.2.b unattached) panels.
+	 */
+	private attachmentState: {
+		engine: QuantbookNativeModule;
+		transport: TransportInstance;
+		spawnedRelay: childProcess.ChildProcess | undefined;
+		log: vscode.OutputChannel;
+		pollTimer: NodeJS.Timeout;
+		reconnectInFlight: boolean;
+		disposed: boolean;
+	} | undefined;
+
 	private constructor(
 		private readonly panel: vscode.WebviewPanel,
 		private readonly session: CollabSessionInstance,
 		private readonly sheet: number,
-	) { }
+		_attachment: CollabAttachment | undefined,
+	) {
+		// attachment wiring happens in show() after construction so
+		// dispose() flow can call disposeAttachment() consistently
+		// even if wireAttachment throws.
+		this.attachmentState = undefined;
+	}
 
 	/**
 	 * Compute the snapshot, generate a fresh nonce, AND set the
@@ -159,6 +242,154 @@ export class CellGridPanel {
 			onCommit: () => this.render(),
 			onError: reply => { void this.panel.webview.postMessage(reply); },
 		});
+	}
+
+	/**
+	 * V3.2.c.3: set auto-flush + attach transport + start the 1s
+	 * pollRemote timer.  Called by `show()` AFTER the panel +
+	 * message handler are constructed so the dispose flow can run
+	 * cleanly even on partial wireup.
+	 *
+	 * Throws only on the engine-side calls (`setAutoFlushPolicy` /
+	 * `attachTransport`); the timer setup itself is infallible.
+	 * `show()` translates a throw here into showErrorMessage + panel
+	 * dispose.
+	 */
+	private wireAttachment(attachment: CollabAttachment): void {
+		this.session.setAutoFlushPolicy('onAppend');
+		this.session.attachTransport(attachment.transport);
+		attachment.log.appendLine(`[collab] attached transport (sheet ${this.sheet}); pollRemote every ${POLL_REMOTE_INTERVAL_MS}ms`);
+		const pollTimer = setInterval(() => this.tickPollRemote(), POLL_REMOTE_INTERVAL_MS);
+		this.attachmentState = {
+			engine: attachment.engine,
+			transport: attachment.transport,
+			spawnedRelay: attachment.spawnedRelay,
+			log: attachment.log,
+			pollTimer,
+			reconnectInFlight: false,
+			disposed: false,
+		};
+	}
+
+	/**
+	 * V3.2.c.3: tick of the pollRemote loop.  Called every
+	 * POLL_REMOTE_INTERVAL_MS by the setInterval timer.
+	 *
+	 * - If a reconnect is in flight: skip (cheap idempotency).
+	 * - Try `session.pollRemote()`; if `n > 0`, re-render the panel
+	 *   so freshly-merged remote ops surface in the grid.
+	 * - On `transport_closed` from pollRemote or its observation
+	 *   path: trigger {@link handleTransportClosed} (reconnect with
+	 *   backoff per decision C6).
+	 * - On any other error: log + skip the tick.  Pollloop survives
+	 *   one bad tick.
+	 */
+	private tickPollRemote(): void {
+		const state = this.attachmentState;
+		if (state === undefined || state.disposed || state.reconnectInFlight) {
+			return;
+		}
+		const result = classifyPollTick(this.session);
+		switch (result.kind) {
+			case 'idle':
+				return;
+			case 'merged':
+				state.log.appendLine(`[collab] pollRemote merged ${result.count} remote blob(s); re-rendering`);
+				this.render();
+				return;
+			case 'transportClosed':
+				state.log.appendLine(`[collab] pollRemote saw transport_closed; reconnecting`);
+				void this.handleTransportClosed();
+				return;
+			case 'error':
+				state.log.appendLine(`[collab] pollRemote error (skipping tick): code=${result.code} msg=${result.message}`);
+				return;
+		}
+	}
+
+	/**
+	 * V3.2.c.3 + decision C6: reconnect on transport_closed via the
+	 * V3.1.c {@link reconnectWithBackoff} contract.  Reuses the
+	 * multiWindowDemo.ts implementation verbatim (exported via
+	 * V3.2.c.2).
+	 *
+	 * - Detach the dead transport from the session.
+	 * - Run reconnectWithBackoff (3 tries at 500/1000/2000ms).
+	 * - On success: attach the fresh transport, log, resume polling.
+	 * - On exhaustion: log, dispose the panel + spawned relay,
+	 *   surface `showWarningMessage('Restart Cell Grid (Collab)')`.
+	 */
+	private async handleTransportClosed(): Promise<void> {
+		const state = this.attachmentState;
+		if (state === undefined || state.disposed || state.reconnectInFlight) {
+			return;
+		}
+		state.reconnectInFlight = true;
+		try {
+			this.session.detachTransport();
+		} catch { /* best-effort */ }
+		try {
+			const fresh = await reconnectWithBackoff(state.engine, state.log);
+			if (state.disposed) {
+				return;
+			}
+			this.session.attachTransport(fresh);
+			state.transport = fresh;
+			state.log.appendLine(`[collab] reconnect succeeded; resuming pollRemote`);
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			state.log.appendLine(`[collab] reconnect EXHAUSTED: ${info.message}`);
+			// Dispose BEFORE prompting so the panel stops ticking
+			// before the user makes a choice (same pattern as
+			// multiWindowDemo's V3.1.c handler).
+			this.panel.dispose();
+			const choice = await vscode.window.showWarningMessage(
+				`Cell Grid collab lost connection: ${info.message}.`,
+				'Restart Cell Grid (Collab)',
+			);
+			if (choice === 'Restart Cell Grid (Collab)') {
+				void vscode.commands.executeCommand('quantlab.quantbookCellGridCollab');
+			}
+		} finally {
+			state.reconnectInFlight = false;
+		}
+	}
+
+	/**
+	 * V3.2.c.3: tear down the collab lifecycle.  Idempotent.
+	 *
+	 * - Clear the pollRemote timer.
+	 * - Detach transport (best-effort -- session may already have a
+	 *   dead transport).
+	 * - Kill the spawned relay child process IF this window spawned
+	 *   it (mirrors multiWindowDemo's V3.1.e signal-aware predicate).
+	 *
+	 * Called from `panel.onDidDispose`.  Safe to call on a panel
+	 * that was never wired (no-op via `attachmentState === undefined`
+	 * guard).
+	 */
+	private disposeAttachment(): void {
+		const state = this.attachmentState;
+		if (state === undefined || state.disposed) {
+			return;
+		}
+		state.disposed = true;
+		clearInterval(state.pollTimer);
+		try {
+			this.session.detachTransport();
+		} catch { /* best-effort */ }
+		if (
+			state.spawnedRelay !== undefined &&
+			state.spawnedRelay.exitCode === null &&
+			state.spawnedRelay.signalCode === null &&
+			!state.spawnedRelay.killed
+		) {
+			state.log.appendLine('[collab] killing spawned relay child process');
+			try {
+				state.spawnedRelay.kill();
+			} catch { /* best-effort */ }
+		}
+		state.log.appendLine(`[collab] disposed (sheet ${this.sheet}).`);
 	}
 }
 

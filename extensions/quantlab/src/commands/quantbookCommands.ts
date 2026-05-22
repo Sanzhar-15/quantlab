@@ -24,7 +24,7 @@ import * as vscode from 'vscode';
 
 import { appendPutValueValidated, createSession, quantbookEngineVersion, sessionFromSnapshot } from '../quantbook/session';
 import { loadQuantbookEngine, quantbookHostInfo } from '../quantbook/loader';
-import { runMultiWindowDemo } from '../quantbook/multiWindowDemo';
+import { connectOrSpawn, runMultiWindowDemo } from '../quantbook/multiWindowDemo';
 import { CellGridPanel } from '../quantbook/cellGrid/cellGridPanel';
 import type { CollabSessionInstance } from '../quantbook/types';
 
@@ -216,6 +216,33 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				const detail = err instanceof Error ? err.message : String(err);
 				log.appendLine(`FATAL cell-grid error: ${detail}`);
 				vscode.window.showErrorMessage(`Quantbook cell grid failed: ${detail}`);
+			}
+		}),
+	);
+
+	// Phase 5.7 V3.2.c.4 (2026-05-22) -- live multi-window cell-grid.
+	// Mirrors quantbookDemoMultiWindow's connectOrSpawn flow but opens
+	// a CellGridPanel with the attached transport instead of running
+	// the periodic-append demo loop.  Each window invocation tries to
+	// connect to ws://127.0.0.1:7117 first; spawns the V3.1.a
+	// relay binary on failure; race-retry on spawn loss.  AutoFlush =
+	// OnAppend so every cell commit auto-syncs; 1s pollRemote loop
+	// merges peer ops and re-renders.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookCellGridCollab', async () => {
+			const log = getOutput();
+			log.show(true);
+			try {
+				const engine = loadQuantbookEngine();
+				log.appendLine('[collab] starting cell-grid collab (sheet 0)...');
+				const { transport, spawnedRelay } = await connectOrSpawn(engine, log);
+				const session = createSession(BigInt(process.pid));
+				CellGridPanel.show(context, session, 0, { engine, transport, spawnedRelay, log });
+				log.appendLine('[collab] cell grid open + attached.');
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL cell-grid collab error: ${detail}`);
+				vscode.window.showErrorMessage(`Quantbook cell grid collab failed: ${detail}`);
 			}
 		}),
 	);
