@@ -76,7 +76,7 @@ static_assertions = "=1.1.0"
 # directives. cdylib output naming differs per platform (.dylib / .so /
 # .dll); the @napi-rs/cli npm tool typically renames to `.node`, but
 # for V1 we load the raw cdylib via an explicit path in TS code.
-napi = { version = "=3.9.0", default-features = false, features = ["napi8"] }
+napi = { version = "=3.9.0", default-features = false, features = ["napi8", "async"] }
 napi-derive = "=3.5.6"
 napi-build = "=2.3.2"
 

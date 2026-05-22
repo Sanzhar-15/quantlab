@@ -1810,6 +1810,7 @@ dependencies = [
  "napi-sys",
  "nohash-hasher",
  "rustc-hash",
+ "tokio",
 ]
 
 [[package]]
@@ -2242,6 +2243,7 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "ql-collab",
+ "ql-collab-ws",
  "ql-oplog",
  "ql-types",
 ]

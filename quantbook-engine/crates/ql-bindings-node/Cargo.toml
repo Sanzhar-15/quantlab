@@ -33,12 +33,16 @@ crate-type = ["cdylib", "rlib"]
 napi = { workspace = true }
 napi-derive = { workspace = true }
 
-# **V1 scope (per `.plans/_active.md`):** bind `CollabSession` only.
-# No transport, no presence, no undo, no formula support. Single Op
-# variant exposed (PutValue) via a convenience method `appendPutValue`.
-ql-collab = { path = "../ql-collab" }
-ql-oplog  = { path = "../ql-oplog" }
-ql-types  = { path = "../ql-types" }
+# **V1 scope (per `.plans/_active.md`):** `CollabSession` only.
+# **V2.1 + V2.2 (2026-05-22):** added sync Transport surface
+# (LoopbackPair + attach/detach/flush*/poll* + AutoFlushPolicy).
+# **V2.3 (2026-05-22):** added `ql-collab-ws` for the
+# `WebSocketTransport.connect` async binding (this dep stays optional
+# for V2.3+ work; ql-collab core stays runtime-agnostic).
+ql-collab    = { path = "../ql-collab" }
+ql-collab-ws = { path = "../ql-collab-ws" }
+ql-oplog     = { path = "../ql-oplog" }
+ql-types     = { path = "../ql-types" }
 
 [build-dependencies]
 napi-build = { workspace = true }
