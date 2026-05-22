@@ -1,6 +1,6 @@
 ---
 name: 2026-05-22_phase-5-7-v3-multi-window-demo
-status: in-progress (V3.1.a engine relay SHIPPED at `9df01c5a050`; V3.1.b IDE multi-window command SHIPPED at `b314ead754d`; V3.1.c reconnect UX SHIPPED at IDE `81846a502d3` + engine docs in this commit; V3.1.e parallel Codex+Opus audit DISPATCHED this session)
+status: in-progress (V3.1 FULLY SHIPPED: V3.1.a engine relay `9df01c5a050` + V3.1.b IDE multi-window `b314ead754d` + V3.1.c reconnect UX IDE `81846a502d3` + engine `b794d4de380` + V3.1.e parallel Codex+Opus audit + actionable closures IDE `2ec61e5333f`. Codex 0H+1M+5L; Opus 0H+2M+9L; Rule 4 arc terminus stays at 6. Next: V3.2 cell-grid UI OR V3.x backlog.)
 date: 2026-05-22
 predecessor_plan: .plans/_archive/2026-05-22_phase-5-7-v2-transport-binding.md (V2 phase — Transport binding through V2.8 megaudit)
 predecessor_v2_exit_packet: docs/phase5/5-7-v2-exit-packet.md (V2 phase termination — architectural decisions V2.1-V2.8, V3 backlog, V3-entry readiness reference)
@@ -93,11 +93,12 @@ Two VS Code IDE windows on localhost, each running a `CollabSession`, connected 
    2. ✅ V3.1.b IDE mocha `V3.1 round-trip: two sessions exchange ops through spawned relay binary` (port 17117 to avoid 7117 demo collision; spawns binary, awaits readiness, two sessions, A→B + B→A propagation pins). 97/97 mocha after V3.1.b.
    3. [ ] V3.1.d remainder (deferred to V3.1.c follow-up): mocha test for the reconnect path -- kill relay mid-flight, assert `transportLastError()` populates + reconnect succeeds when relay restarts. Requires more elaborate process lifecycle (kill+respawn within one test). Reuse the V2.5 BlockingTransportFixture pattern is NOT needed -- the relay binary itself provides deterministic timing.
 
-- [ ] **V3.1.e — Audit obligations** per audit-discipline rules:
-   - Parallel Codex + Opus per step (Rule 2).
-   - Drop-order walk if any new binding class is added (Lane C R4).
-   - Rule 4 (no negative-trait claims without proof) — expect 0 if no new !Send/!Sync claims; V3.1 likely just composes existing types.
-   - V2 backlog item: cap napi `block_ms` at sane upper bound (Lane C R5 — 60_000ms ceiling). NOT a V3.1 requirement, defer to V3.x.
+- [x] **V3.1.e — Audit obligations** ✅ SHIPPED 2026-05-22:
+   - Codex lane: PASS-WITH-FINDINGS at `docs/audits/2026-05-22-phase-5-7-v3-1-codex.md`. 0H + 1M + 5L. M1 = PID-only PeerId restart collision (deferred to V3.x). L1-L5 minor hardening (race retry shipped at IDE `2ec61e5333f`; rest deferred).
+   - Opus lane: PASS-WITH-FINDINGS at `docs/audits/2026-05-22-phase-5-7-v3-1-opus.md`. 0H + 2M + 9L. M1 spawn timeout bump shipped at IDE `2ec61e5333f`; M2 spawn race retry shipped at IDE `2ec61e5333f` (cross-lane convergent with Codex L1). 8 of 9 LOWs deferred.
+   - Rule 4: 0 new triggers in Lane F sweep. Arc terminus = 6.
+   - Convergent finding (Codex L1 + Opus M2): spawn race retry on EADDRINUSE -- shipped.
+   - Drop-order walk (Lane C R4 inherited): N/A for V3.1 (no new binding classes; all composition).
 
 ### V3.1 acceptance criteria
 
