@@ -251,7 +251,7 @@ For V2+ work, the engine substrate available through the V1 binding:
 
 ## Cross-repo coordination notes for V2
 
-**Status update (2026-05-22, post-V2.7)**: V2.1 + V2.2 + V2.3 + V2.4 + V2.5 + V2.6 + V2.7 SHIPPED + AUDITED (7-of-8 cycles done). See `.plans/_active.md` for full V2 multi-cycle plan + V2.8 next step. The V2 conventions from V1 (below) held through all 7 cycles; V2.3 audit FAIL + V2.4 sound reintroduction + V2.5 V8-block closure + V2.7 structured Error.code all validated the "ship → audit → close" discipline. **V2 exit packet pending** — lands at V2.8 with the 3-way megaudit. V2 audit transcripts in `docs/audits/2026-05-22-phase-5-7-v2-{1,2,3,4}-{codex,opus}.md` + `v2-5-opus.md` + `v2-7-opus.md` (V2.5 + V2.7 Codex transcripts pending docs-finalize at V2.8).
+**Status update (2026-05-22, post-V2 phase termination)**: V2 (V2.1 through V2.7 + V2.8 megaudit + code closures) SHIPPED + AUDITED + EXIT-PACKETED. The full V2 surface (Transport binding) is canonical in `docs/phase5/5-7-v2-exit-packet.md`. The V2 conventions from V1 (below) held through all 8 cycles; V2.3 audit FAIL + V2.4 sound reintroduction + V2.5 V8-block closure + V2.7 structured Error.code + V2.8 production-cdylib gate all validated the "ship → audit → close" discipline. **V2 audit transcripts** in `docs/audits/2026-05-22-phase-5-7-v2-{1,2,3,4}-{codex,opus}.md` + `v2-5-{plan-review-codex,codex,opus}.md` + `v2-7-{codex,opus}.md` + `v2-megaudit-{codex,opus-a-docs,opus-b-v3}.md` (21 transcripts total: 5 V1 + 13 V2.1-V2.7 per-step + 3 V2.8 megaudit).
 
 V2 work will continue across both repos. Conventions established at V1:
 

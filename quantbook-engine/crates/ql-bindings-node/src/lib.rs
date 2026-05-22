@@ -872,11 +872,26 @@ impl CollabSession {
     /// Async flush-pending — waits for the attached transport's writer
     /// task to drain (level-1 local ack per V2 V4 V1 Tier K1 contract).
     ///
-    /// Returns a JS `Promise<void>` that resolves when:
-    /// - the writer has completed `send` for every blob queued AT THIS
-    ///   CALL (Codex M1: target captured at handle extraction, NOT at
-    ///   wait-start), OR
-    /// - the transport has been detached / dropped / closed.
+    /// **Resolution / rejection contract** (V2.8 megaudit Codex Lane A
+    /// MEDIUM-1 closure, 2026-05-22):
+    ///
+    /// Returns a JS `Promise<void>` that:
+    /// - **resolves** when the writer has completed `send` for every
+    ///   blob queued AT THIS CALL (Codex V2.5 M1: target captured at
+    ///   handle extraction, NOT at wait-start).
+    /// - **resolves** when there is no attached transport, OR when the
+    ///   attached transport implementation returns `None` from
+    ///   `ack_handle()` (e.g., `LoopbackTransport`, `NoopTransport` --
+    ///   no async-drain semantics; flush is synchronous-on-attach).
+    /// - **rejects** with `[transport_closed] transport closed` (V2.7
+    ///   structured code) if the transport's `wait_for_drain` reports
+    ///   the closed flag was set on entry to the wait OR was tripped
+    ///   while waiting. This is equivalent to the pre-V2.5 sync
+    ///   `flush_pending_to_transport()` rejection path and is the
+    ///   correct reconnect signal for callers.
+    /// - **rejects** with `[transport_io]` or other transport-error
+    ///   variants if the handle's wait surfaces a non-closed transport
+    ///   error.
     ///
     /// **V2.5 V8-block CLOSURE** (Opus V2.4 HIGH-1, 2026-05-22):
     ///

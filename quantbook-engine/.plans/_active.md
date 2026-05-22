@@ -1,32 +1,34 @@
 ---
 name: 2026-05-22_phase-5-7-v2-transport-binding
-status: in-progress (V2.1 + V2.2 + V2.3 + V2.4 + V2.5 + V2.6 + V2.7 ALL SHIPPED + AUDITED; V2.8 megaudit + V2 exit packet pending = phase termination)
+status: done (V2.1 + V2.2 + V2.3 + V2.4 + V2.5 + V2.6 + V2.7 + V2.8 ALL SHIPPED + AUDITED; V2 phase TERMINATED via V2.8 megaudit + code closures + V2 exit packet)
 date: 2026-05-22
 predecessor_commit: 89dd5f0d170 (engine: docs(5.7) finalize V2 — exit packet + MASTER-PLAN backfill)
 ide_predecessor_commit: 97e0513d134 (IDE: Phase 5.7 V1 megaudit closures)
 parent_phase: 5.7 Collaboration IDE Vertical Slice
 direction: V2 — Transport binding (extends V1's CollabSession-only surface)
 canonical_v2_design_reference: docs/audits/2026-05-22-phase-5-7-v1-megaudit-opus-b-v2.md
+canonical_v2_exit_packet: docs/phase5/5-7-v2-exit-packet.md
 canonical_v2_audit_references:
   v2.1: docs/audits/2026-05-22-phase-5-7-v2-1-{codex,opus}.md
   v2.2: docs/audits/2026-05-22-phase-5-7-v2-2-{codex,opus}.md
   v2.3: docs/audits/2026-05-22-phase-5-7-v2-3-{codex,opus}.md
   v2.4: docs/audits/2026-05-22-phase-5-7-v2-4-{codex,opus}.md
-  v2.5: docs/audits/2026-05-22-phase-5-7-v2-5-opus.md (Codex transcript pending docs-finalize)
-  v2.7: docs/audits/2026-05-22-phase-5-7-v2-7-opus.md (Codex transcript pending docs-finalize)
-arc_estimate_original: 3-5 days total. Actual: V2.1+V2.2 cycle-1; V2.3+V2.4 cycle-2; V2.5+V2.6 cycle-3 + V2.7 cycle-4 (this session); V2.8 next session.
+  v2.5: docs/audits/2026-05-22-phase-5-7-v2-5-{codex,opus}.md (+ v2-5-plan-review-codex.md)
+  v2.7: docs/audits/2026-05-22-phase-5-7-v2-7-{codex,opus}.md
+  v2.8: docs/audits/2026-05-22-phase-5-7-v2-megaudit-{codex,opus-a-docs,opus-b-v3}.md
+arc_actual: V2.1+V2.2 session-1; V2.3+V2.4 session-2; V2.5+V2.6+V2.7 session-3; V2.8 session-4 (this session). Total 4 working sessions across one calendar day.
 session_cycles_budget: 2 cycles per session per CLAUDE.md global rule. Multi-session arc.
-v2_progress_summary: 7 cycles done (V2.1, V2.2, V2.3, V2.4, V2.5+V2.6 combined, V2.7) → 1 remaining (V2.8 megaudit + V2 exit packet = phase termination). Multi-window IDE demo deferred to V3 product work.
-current_engine_head: 8f5b2e02ab7 (Phase 5.7 V2.7 audit closures)
-current_ide_head: f9f98194958 (feat(quantbook): Phase 5.7 V2.7 audit closures)
-current_mocha_count: 91 / 91
+v2_progress_summary: 8 cycles complete (V2.1, V2.2, V2.3, V2.4, V2.5+V2.6 combined, V2.7, V2.8 megaudit + code closures). V2 PHASE TERMINATED. Multi-window IDE demo deferred to V3 product work.
+current_engine_head: 6917e36d846 (Phase 5.7 V2.8 megaudit code closures)
+current_ide_head: 07bb0043dc4 (feat(quantbook): Phase 5.7 V2.8 megaudit code closures)
+current_mocha_count: 95 / 95
 current_ql_collab_tests: 74 / 74 (with --features test-fixtures)
-current_ql_collab_ws_tests: 4 / 4
-current_engine_workspace: 4472 / 0 baseline (V2.5 ship gate verified; V2.7 doesn't touch ql-collab core)
+current_ql_collab_ws_tests: 10 / 10 (was 4 at V2.7 close; +6 V2.8 scrub_url_credentials_in unit tests)
+current_engine_workspace: 4472 / 0 baseline (V2.5 ship gate verified; V2.7 + V2.8 do not touch ql-collab core)
 audit_rules_inherited:
   - Rule 1: no fresh-session reminders (existing memory)
   - Rule 2: parallel Codex+Opus per step
-  - Rule 4: negative trait claims need positive compile proof OR per-field walk (caught 6 violations cumulative: 3 in V1, V2.3 napi-rs Reference exclusivity, V2.4 docstring drift, V2.5 false `FlushAck: !Sync`; V2.7 had 0)
+  - Rule 4: negative trait claims need positive compile proof OR per-field walk. Phase 5.7 arc CLOSES at 6 cumulative triggers (3 in V1, V2.3 napi-rs Reference exclusivity, V2.4 docstring drift, V2.5 false `FlushAck: !Sync`; V2.7 zero; V2.8 megaudit per-field walks across Transport/FlushAck/BlockingTransport/LoopbackPair/error enums caught 0 new triggers)
 ---
 
 # Phase 5.7 V2 — Transport binding (Plan)
@@ -92,8 +94,8 @@ V1 was `CollabSession` only — no peers could talk to each other from the IDE s
 - [x] AutoFlushPolicy enum binding:
   - JS shape: string union `'disabled' | 'onAppend'` (V2 plan locked).
   - `setAutoFlushPolicy(policy: string): string` — returns prior policy as canonical camelCase.
-  - `autoFlushPolicy(): string` — returns canonical camelCase, `'unknown'` for forward-compat (engine enum is `#[non_exhaustive]`).
-  - Engine-side parser accepts aliases (`Disabled`, `OnAppend`, `on-append`).
+  - `autoFlushPolicy(): string` — returns canonical camelCase. **V2.2 Opus HIGH-1 closure (2026-05-22)**: unknown engine variants are NOT returned as a `'unknown'` sentinel; the binding fails loud via `bad_argument_error("autoFlushPolicy: engine reported unknown variant ...")` per CLAUDE.md no-fallback rule. Engine enum is `#[non_exhaustive]`; a future variant added without updating the napi mapping will fail loudly until both layers are upgraded together. (V2.8 megaudit Codex Lane A MEDIUM-2 closed the drift between this section and the source.)
+  - Engine-side parser accepts aliases (`Disabled`, `OnAppend`, `on-append`); invalid input emits `[bad_argument]` (V2.7 closure).
 
 **IDE work**:
 
@@ -672,11 +674,12 @@ Extend `quantlab.quantbookDemo` command to spawn a second VS Code window via the
 - [x] fmt + clippy clean on both repos.
 - [x] No new TS compile errors.
 - [x] Engine `.dylib` rebuilds and loads (4.5MB; rebuilt at V2.7 closure).
-- [x] All audit HIGHs closed in cycle. V2.5 had 1H total (Rule 4 #6); V2.7 had 0H.
-- [x] `.plans/_active.md` updated through V2.7 + V2.8 deferred.
-- [x] `memory/current_work.md` updated with V2.7 HEAD + 6-of-8 progress narrative.
-- [x] 13 of 16 audit transcripts tracked in `docs/audits/` (5 V1 + 4 V2.1-V2.4 Codex + 4 V2.1-V2.4 Opus + V2.5 Opus + V2.7 Opus). **Pending**: V2.5 plan-time Codex review, V2.5 Codex audit, V2.7 Codex audit (in parent worktree; V2.8 docs-finalize will commit).
-- [ ] Plan archive: defer until V2 fully ships (V2.8 megaudit + V2 exit packet are the V2 phase termination).
+- [x] All audit HIGHs closed in cycle. **V2.5 finding counts** (V2.8 Lane B HIGH-2 correction): Codex 0H + 1M + 3L (Codex M1 = production-cdylib DoS footgun, closed at binding via `block_ms > 0`); Opus 0H + 1M + 4L (Rule 4 #6 trigger: false `FlushAck: Send + !Sync` while impls Send + Sync; closed via positive Sync asserts). **V2.7**: Codex 0H + 1L; Opus 0H + 3M + 4L (all required-walk VERIFIED). **V2.8 megaudit**: Codex 0H + 2M + 3L; Opus-A 5H + 8M + 10L (all doc fixes, closed in docs-finalize-v4); Opus-B 1H + 4M + 4L (HIGH = production-cdylib fixture leak, closed via cfg-gate).
+- [x] `.plans/_active.md` updated through V2.8 (this file).
+- [x] `memory/current_work.md` updated with V2.8 HEAD + 8-of-8 progress narrative + V2 phase termination.
+- [x] 21 of 21 audit transcripts tracked in `docs/audits/` (5 V1 + 4 V2.1-V2.4 Codex + 4 V2.1-V2.4 Opus + V2.5 plan-review-Codex + V2.5 Codex + V2.5 Opus + V2.7 Codex + V2.7 Opus + V2.8 megaudit Codex + V2.8 megaudit Opus-A + V2.8 megaudit Opus-B).
+- [x] V2 exit packet shipped at `docs/phase5/5-7-v2-exit-packet.md` (V2.8 megaudit code closures commit + this docs-finalize-v4 commit).
+- [ ] Plan archive: ready to move to `.plans/_archive/` once memory/current_work.md is updated for the next session.
 
 ## V2 commit ladder (cumulative)
 
@@ -688,7 +691,9 @@ Engine `feat/quantbook-engine`:
 - V2.4: c51df9f41f4 → 7123c6a57bb
 - docs finalize V2: 9eece27cf77
 - V2.5+V2.6: 1b233af6150 → 81c66d02f9f
-- V2.7: 2a3e2ebcbfe → **8f5b2e02ab7** (current HEAD; ready for V2.8)
+- V2.7: 2a3e2ebcbfe → 8f5b2e02ab7
+- docs finalize v3: 4ea690ce246
+- **V2.8 megaudit code closures: 6917e36d846 (current HEAD)**
 
 IDE `feat/visualise-v1`:
 - V1: 1a7fc8bbe3f → a517d7c5f71 → 97e0513d134
@@ -697,4 +702,5 @@ IDE `feat/visualise-v1`:
 - V2.3: 6616e28a2a3 → 233957ab140
 - V2.4: 3ab02bbe732 → 8f0a44e19e9
 - V2.5+V2.6: c5997998741 → 8798349be6d
-- V2.7: 2a5619f9162 → **f9f98194958** (current HEAD; ready for V2.8)
+- V2.7: 2a5619f9162 → f9f98194958
+- **V2.8 megaudit code closures: 07bb0043dc4 (current HEAD)**
