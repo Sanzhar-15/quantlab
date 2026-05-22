@@ -1,15 +1,15 @@
 ---
 name: 2026-05-22_phase-5-7-v3-3-multi-sheet-virtualization
-status: in-progress (V3.3 entry plan drafted; V3.3.0.1 decision lock ships in THIS commit -- 6 design decisions locked per the V3.2.e exit packet "V3.3 ENTRY READINESS" packet from Opus.  V3.3.0.2-V3.3.0.X is the implementation sequence; multi-week arc.)
+status: in-progress (V3.3.0.1 decision lock shipped at engine `5fd7ff73648`; V3.3.0.2 engine listSheets() napi + IDE typed wrapper + 5 mocha tests shipped at engine `739611ac3b3` / IDE `33cc3f506a5` (140 -> 145 mocha); V3.3.0.3 engine exportSnapshot incremental cache is the next sub-step.)
 date: 2026-05-22
 predecessor_plan: .plans/_archive/2026-05-22_phase-5-7-v3-2-cell-grid-ui.md (V3.2 phase termination, all sub-steps shipped + exit-packeted)
 predecessor_exit_packet: docs/phase5/5-7-v3-2-exit-packet.md (V3.2 closure -- cell-grid UI vertical slice; FIRST product-user-visible surface)
 predecessor_v3_2_d_audits: docs/audits/2026-05-22-phase-5-7-v3-2-{codex,opus}.md (V3.2.d audit; Opus § Section 3 V3.3 ENTRY READINESS is the basis for THIS entry plan)
 parent_phase: 5.7 Collaboration IDE Vertical Slice
 direction: V3.3 -- multi-sheet + virtualized rendering. Scales the V3.2 grid widget from "hundreds of cells, one sheet" to "10K+ cells, multiple sheets per workbook" without losing the V3.2 audit discipline. Adds new engine napi surface (listSheets + exportSnapshot incremental cache) + IDE-side virtualization renderer + multi-sheet UX.
-current_engine_head: (this commit) V3.3.0.1 decision lock -- 6 design decisions for multi-sheet + virtualization
-current_ide_head: ff73f2c9f1b (V3.2.d code closures, final V3.2 IDE HEAD; no V3.3 IDE work yet)
-current_mocha_count: 140 / 140 (V3.2 exit baseline)
+current_engine_head: 739611ac3b3 (V3.3.0.2 engine listSheets() napi method)
+current_ide_head: 33cc3f506a5 (V3.3.0.2 IDE listSheets typed wrapper + 5 mocha tests)
+current_mocha_count: 145 / 145 (V3.2 exit baseline 140 + V3.3.0.2 +5)
 current_ql_collab_tests: 74 / 74 (with --features test-fixtures)
 current_ql_collab_ws_tests: 42 / 42 (10 lib + 30 ws + 2 V3.1.a relay)
 current_engine_workspace: 4472 / 0 baseline (V3.2 does not touch ql-collab core; V3.3 will add tests for listSheets + incremental cache)
@@ -145,8 +145,8 @@ Per V3.2.e exit packet § "V3.3 ENTRY READINESS" + the V3.2.d Opus Lane B § Sec
 
 ## V3.3.0 sub-steps
 
-- [x] **V3.3.0.1 -- decision lock** (THIS commit, docs-only).  Decisions D1-D6 above.
-- [ ] **V3.3.0.2 -- engine `CollabSession.listSheets() -> Vec<u16>` napi method.**  Walk op log; dedup sheets; sort; return `Vec<u16>`.  Add Rust unit tests at `crates/ql-bindings-node` + IDE-side typed wrapper `listSheets(session): number[]` in `session.ts` + mocha tests.  Errors via `bad_argument_error` (V2.7 contract; V3.2.d HIGH-2 symmetry).
+- [x] **V3.3.0.1 -- decision lock** (engine `5fd7ff73648`).  Decisions D1-D6 above.
+- [x] **V3.3.0.2 -- engine `CollabSession.listSheets() -> Vec<u16>` napi method.**  Shipped at engine `739611ac3b3` + IDE `33cc3f506a5`.  Engine: walk op log; collect distinct sheets into `BTreeSet<u16>`; return as `Vec<u16>` (BTreeSet iteration is sorted ascending).  Errors via `bad_argument_error` per V2.7 contract.  IDE: typed wrapper `listSheets(session): number[]` in `session.ts` + 5 mocha tests (empty / single-sheet / multi-sheet sorted dedup / u16 boundary / exportBytes round-trip).  Mocha 140 -> 145.
 - [ ] **V3.3.0.3 -- engine `exportSnapshot` incremental cache.**  Add per-session `last_snapshot: HashMap<(u16, u32, u32), CellWireValue>` field updated on `append_op` + `merge_bytes` (per-sheet-keyed for V3.3 multi-sheet).  `exportSnapshot` reads from cache O(1) instead of full op-log scan.  Per V3.2.d Opus MEDIUM-4 closure (V3.3 incremental-cache decision).  Rule 4 walk REQUIRED for new field: thread-safety (inherits Arc<Mutex<>>); per-sheet iteration consistency; cache invalidation on undo (V3.4-blocker; V3.3 does no-undo so safe).
 - [ ] **V3.3.0.4 -- IDE virtualization scaffold.**  Custom inline JS virtualization (decision D1.C).  Render only visible rows (typically ~50 at 16px row-height, 800px viewport); on scroll, swap.  Extract pure virtualization functions into `cellGridLogic.ts` (`computeVisibleRange(scrollTop, rowHeight, viewportHeight, totalRows): { startIdx, endIdx }` + `buildVirtualRows(snapshot, startIdx, endIdx): string`) for mocha-driveable testing.  CSS adds `.cell-grid-viewport`, `.cell-grid-spacer`, `.cell-grid-window` classes.
 - [ ] **V3.3.0.5 -- IDE multi-sheet UX.**  `CellGridPanel.show(context, session, sheet, attachment?)` API unchanged (decision D2.A panel-per-sheet).  New command `quantlab.quantbookCellGridSwitchSheet` opens a `vscode.window.createQuickPick` with `listSheets(session)` results; on selection, calls `CellGridPanel.show(context, session, selectedSheet)`.  Panel title shows "Cell Grid -- Sheet N" + sheet count from `listSheets`.
