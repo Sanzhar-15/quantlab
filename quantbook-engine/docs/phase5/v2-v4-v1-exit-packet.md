@@ -119,15 +119,19 @@ All 3 main IDE workflows (Synced indicator, reconnect handshake, offline-write r
 
 ## Forward direction
 
-**Next options** (per `memory/current_work.md` handoff):
+**Status update (post-V2 V4 V1, 2026-05-22):** Phase 5.7 V1 SHIPPED 2026-05-22 (engine `677ee03ee8b` → `6003db4ce2c` + IDE `1a7fc8bbe3f` → `a517d7c5f71`). First IDE binding via napi-rs cdylib. See `docs/phase5/5-7-v1-exit-packet.md` for the V1 closure record + V2/V3 deferred list. The forward direction below is now post-5.7-V1.
 
-1. **Phase 5.7 IDE vertical slice** (~1 week, different repo). Build the actual IDE binding in the VS Code fork. Real product progress.
+**Next options:**
 
-2. **Phase 5.5 V2 V4 V2** (~2-3 days). K4 chunking + bounded mpsc + backpressure policy. Architectural cleanup.
+1. **Phase 5.7 V2 — Transport binding** (~3-5d, recommended). Bind the Transport trait + LoopbackTransport + WebSocketTransport + `attach_transport` / `detach_transport` / `flush_*` / `poll_remote_*` + multi-window demo. See Phase 5.7 V1 megaudit Opus-B for V2 design hazards (async-connect binding shape, sync `flush_pending` blocking V8, full Op enum binding, UndoGroupGuard RAII vs JS Drop, etc.).
 
-3. **Phase 5.8 megaudit** (~4-6 days). Randomized peer-merge tests + transport failure modes. Depends on 5.7 first to validate the IDE side.
+2. **Phase 5.5 V2 V4 V2** (~2-3 days). K4 chunking + bounded mpsc + backpressure policy. Architectural cleanup; can run in parallel with 5.7 V2.
 
-**Recommendation**: Phase 5.7. The substrate is production-ready; V2 V4 V2 is a cleanup that can run in parallel with or after Phase 5.7.
+3. **Phase 5.7 V3 — Cell grid + persistence** (~1-2wk). Real spreadsheet UI: paste-fill-down, formula UI, `.qbook` open/save, full Op enum binding, undo/redo UI, `rebuild_workbook` wiring (D-3 production-visible). Depends on V2 for collaboration UX.
+
+4. **Phase 5.8 megaudit** (~4-6 days). Now best done after 5.7 V2+ binding so IDE-side state is in scope. Depends on 5.7 V2+ complete.
+
+**Recommendation**: Phase 5.7 V2 (engineering throughput on the user-visible collaboration story; V2 V4 V2 K4 chunking can run in parallel as cleanup).
 
 ## Multi-day session totals (post-5.3 → V2 V4 V1)
 

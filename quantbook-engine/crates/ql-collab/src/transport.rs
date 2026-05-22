@@ -59,8 +59,24 @@
 //! (TLS, auto-reconnect, bounded queue, server side, inbound
 //! text/ping/pong frame dropping).
 //!
-//! **Phase 5.5 V2 V3 remaining (pending):** full-arc megaudit
-//! (step 5) and exit packet (step 6).
+//! **Phase 5.5 V2 V3 step 5 megaudit (2026-05-21, `bce64a5c1ce`):**
+//! 3-way Codex+Opus-A+Opus-B. Lifted `last_error()` to the trait
+//! (see method below), added `TaskExitGuard` RAII panic detection +
+//! Close-frame reason capture + poisoned-mutex no-fallback fix.
+//!
+//! **Phase 5.5 V2 V3 step 6 exit packet (2026-05-21, `8a8236840f2`):**
+//! V1 exit packet at `docs/phase5/v2-v3-exit-packet.md` + consumer
+//! doc rewrite at `docs/architecture/ide-consumer-contract.md`
+//! § 4.1.1-3 (3 worked-example subsections).
+//!
+//! **Phase 5.5 V2 V4 V1 (2026-05-21):** 12/13 Tier items shipped —
+//! ack channel (`flush_pending`), `pending_op_count`,
+//! `discard_pending_ops`, defensive hardening. K4 chunking deferred
+//! to V2 V4 V2. See `docs/phase5/v2-v4-v1-exit-packet.md`.
+//!
+//! **Phase 5.7 V1 (2026-05-22):** FIRST IDE binding via napi-rs.
+//! `crates/ql-bindings-node/` exposes `CollabSession` (no Transport
+//! yet — V2). See `docs/phase5/5-7-v1-exit-packet.md`.
 //!
 //! Tests can also use [`NoopTransport`] which discards traffic.
 //!

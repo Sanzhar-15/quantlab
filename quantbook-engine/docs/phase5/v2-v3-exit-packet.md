@@ -145,6 +145,8 @@ Consolidated reference. Full entries at `docs/PHASE-4-V2-BACKLOG.md`.
 
 ## Phase 5.7 readiness assessment
 
+**Status update (Phase 5.7 V1 SHIPPED 2026-05-22):** V1 binds the minimum `CollabSession` surface via napi-rs (no Transport yet — V2 binds Transport, V3 binds cell-grid UI + persistence + `rebuild_workbook`). V2 + V3 still build on the substrate described below. See `docs/phase5/5-7-v1-exit-packet.md`.
+
 **UNBLOCKED.** The Phase 5.7 IDE vertical slice can be built today against the V2 V3 V1 substrate without spelunking engine internals. Specifically:
 
 | Phase 5.7 deliverable | Substrate support | Notes |
@@ -180,8 +182,12 @@ Consolidated reference. Full entries at `docs/PHASE-4-V2-BACKLOG.md`.
 
 ## Forward direction
 
-**Next**: Phase 5.7 IDE vertical slice. Two-window editing demo. ~1 week.
+**Status update (2026-05-22)**: Phase 5.5 V2 V4 V1 SHIPPED (closing 12/13 Tier items; K4 chunking deferred to V2 V4 V2). Phase 5.7 V1 SHIPPED (first IDE binding via napi-rs). See `docs/phase5/v2-v4-v1-exit-packet.md` + `docs/phase5/5-7-v1-exit-packet.md`. The forecast below is HISTORICAL — see those exit packets for live forward direction.
 
-**Phase 5.5 V2 V4 (when scheduled)**: Tier I + J + K (~15 items across 3 tiers). Estimated 2-4 weeks depending on TLS feature complexity and reconnect-helper scope.
+**Historical forecast (frozen at V2 V3 V1 exit, 2026-05-21):**
+
+**Next**: Phase 5.7 IDE vertical slice. Two-window editing demo. ~1 week. *(Actually shipped V1 in 1 day with reduced scope — minimum CollabSession surface only; Transport binding deferred to V2.)*
+
+**Phase 5.5 V2 V4 (when scheduled)**: Tier I + J + K (~15 items across 3 tiers). Estimated 2-4 weeks depending on TLS feature complexity and reconnect-helper scope. *(Actually shipped V1 in 1 day closing 12/13 items; K4 chunking deferred to V2 V4 V2.)*
 
 **Phase 5.8 megaudit**: randomized peer-merge tests + transport failure modes. ~4-6 days. Depends on 5.7 complete.

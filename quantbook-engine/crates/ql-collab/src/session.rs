@@ -10,20 +10,33 @@
 //!   `set_undo_merge_interval`. V2 V1.1: `start_undo_group_scoped`
 //!   returns RAII `UndoGroupGuard` for panic/Err-safe grouping.
 //!   Presence-origin commits auto-excluded.
-//! - **Phase 5.5** — transport layer. V1 shipped at
-//!   `924750819bc` (LoopbackTransport for in-process 2-peer
-//!   tests). V2 V1 shipped at `ffd8f6e5f05` —
-//!   `CollabSession::{attach,detach,has}_transport` +
-//!   `flush_to_transport` + `poll_remote` (+ `_with_limit`)
-//!   typed methods; explicit-drive (caller invokes flush + poll
-//!   on a tick). V2 V2 / V3 pending — auto-flush + version-
-//!   vector deltas + WebSocket impl.
+//! - ~~**Phase 5.5**~~ ✅ V1 + V2 V1 + V2 V2 + V2 V3 V1 + V2 V4 V1 SHIPPED
+//!   2026-05-21. V1 (`924750819bc`) -- `Transport` trait, `LoopbackTransport`,
+//!   `NoopTransport`. V2 V1 (`ffd8f6e5f05`) -- attach/detach/has,
+//!   `flush_to_transport`, `poll_remote*` typed methods. V2 V2
+//!   (`51748b02944`, `b7aa4cb7bb9`) -- `AutoFlushPolicy::OnAppend`.
+//!   V2 V3 steps 1-6 (`603bdc9aa6c` to `8a8236840f2`) -- delta flush,
+//!   poll-side auto-flush, offline-write contract, WebSocket impl
+//!   (`ql-collab-ws`), 3-way megaudit, exit packet. V2 V4 V1
+//!   (`3342e21b964` to `397676899fb`) -- ack channel
+//!   (`flush_pending_to_transport`), `pending_op_count`,
+//!   `discard_pending_ops`, defensive hardening. V2 V4 V2 (K4 chunking)
+//!   deferred. See `docs/phase5/v2-v3-exit-packet.md` and
+//!   `docs/phase5/v2-v4-v1-exit-packet.md`.
 //! - ~~**Phase 5.6**~~ ✅ V1 + V2 shipped — V1 `c677e244704`:
 //!   `presence` module + 4 typed methods. V2: `sweep_presence`
 //!   (caller-opt-in clean-slate on rejoin; closes V1 known
 //!   persistence limitation).
-//! - **Phase 5.7** — IDE binding: `CollabSession` becomes the engine
-//!   handle that the IDE attaches to each open workbook.
+//! - **Phase 5.7** ✅ V1 SHIPPED 2026-05-22 (cross-repo at engine
+//!   `677ee03ee8b` → `6003db4ce2c` + IDE `1a7fc8bbe3f` → `a517d7c5f71`).
+//!   New `crates/ql-bindings-node/` (napi-rs cdylib) binds
+//!   `CollabSession` for the quantlab VS Code fork's extension
+//!   host. V1 surface = constructor / `fromSnapshot` /
+//!   `appendPutValue` / `exportBytes` / `mergeBytes` / observability
+//!   accessors. V2 will bind Transport (3-5d, recommended next).
+//!   V3 will bind `rebuild_workbook` + full Op enum + undo/redo +
+//!   presence + persistence (cell-grid UI; 1-2wk). See
+//!   `docs/phase5/5-7-v1-exit-packet.md`.
 //!
 //! What ships in 5.2.a (5.2.b update 2026-05-19):
 //!
@@ -607,9 +620,18 @@ impl CollabSession {
     ///   without re-evaluating; callers drive evaluation through
     ///   `WorkbookRuntime::recompute_all` after this returns).
     /// - HIGH-1 (Opus step 5b audit): `rebuild_workbook` is shipped as
-    ///   the API entry point for Phase 5.7 IDE binding to wire. No
-    ///   production code path calls it yet — the user-visible D-3
-    ///   closure happens at step 7, not 5b.
+    ///   the API entry point but is NOT yet wired by any production
+    ///   binding. **Phase 5.7 V1 SHIPPED 2026-05-22 WITHOUT wiring
+    ///   `rebuild_workbook`** — V1 binds only the minimum
+    ///   `CollabSession` surface (constructor / `fromSnapshot` /
+    ///   `appendPutValue` / `exportBytes` / `mergeBytes` /
+    ///   observability accessors; see `crates/ql-bindings-node/src/lib.rs`
+    ///   module docs for full V1 scope). Wiring `rebuild_workbook` from
+    ///   JS requires binding `FunctionRegistry` first, which is deferred
+    ///   to **Phase 5.7 V3** (cell-grid UI + persistence) where the
+    ///   merge-then-recompute path becomes user-visible. V2 (Transport
+    ///   binding) does not need `rebuild_workbook` either. Tracked at
+    ///   `docs/PHASE-4-V2-BACKLOG.md` H9.
     #[must_use = "rebuild_workbook returns a (Workbook, SyncReport) — both \
                   carry load-bearing post-merge state. Ignoring discards \
                   the workbook (silent data loss) and the no-fallback \
@@ -1066,9 +1088,28 @@ impl CollabSession {
     /// If `set_peer_id` errors after the replacement, the session is
     /// in a half-state: new log + Loro-default peer_id + stale
     /// `UndoManager` field (not yet recreated). In practice this is
-    /// unreachable — `PeerId::new` rejects the only sentinel Loro
-    /// would reject — but the partial-state shape is real.
-    /// Recovery: drop the session and reconstruct.
+    /// unreachable when the session was constructed via a path that
+    /// pre-rejects sentinel PeerIds (`CollabSession::new` /
+    /// `from_snapshot` both `assert_ne!(peer_id.as_u64(), 0)`, and
+    /// the `ql-bindings-node` FFI's `peer_id_from_bigint` pre-rejects
+    /// both 0 and `u64::MAX`). The stored `self.peer_id` is therefore
+    /// non-sentinel by construction along the V1 paths.
+    ///
+    /// **Phase 5.7 V1 megaudit closure (Opus-B HIGH-1, 2026-05-22):**
+    /// the prior docstring claimed "`PeerId::new` rejects the only
+    /// sentinel Loro would reject" — that was FALSE. `PeerId::new`
+    /// (`ql-types/src/peer.rs::PeerId::new`) is a `const fn` accepting
+    /// any u64 unchecked. The actual rejection lives at the layers
+    /// ABOVE (FFI + CollabSession constructors). Rule 4: negative
+    /// reject claims need positive proof at the layer making the
+    /// claim. V2+ caveat: if a new path constructs `CollabSession`
+    /// from a `PeerId` not vetted by `peer_id_from_bigint` (e.g.,
+    /// via `presence::parse_peer_key`'s `PeerId::new(raw)`), this
+    /// docstring becomes load-bearing — at that point either pin
+    /// `PeerId::new` to reject sentinels itself OR pre-validate at
+    /// the new construction site.
+    ///
+    /// Recovery from partial state: drop the session and reconstruct.
     ///
     /// # Errors
     ///
@@ -1080,9 +1121,10 @@ impl CollabSession {
     /// - `CollabSessionError::OpLog(_)` if `OpLog::fork_at_vv`
     ///   otherwise fails.
     /// - `CollabSessionError::OpLog(_)` if the post-fork
-    ///   `set_peer_id` fails (Loro reserves `u64::MAX`; our
-    ///   `PeerId::new` enforces non-sentinel at construction, so
-    ///   this should not happen in practice).
+    ///   `set_peer_id` fails (Loro reserves `u64::MAX`; pre-validation
+    ///   along V1 paths prevents the sentinel from reaching this
+    ///   point, so this Err arm is unreachable in V1 — see the
+    ///   "half-state" note above for the V2+ caveat).
     pub fn discard_pending_ops(&mut self) -> Result<usize, CollabSessionError> {
         let pre_count = self.pending_op_count();
         if pre_count == 0 {

@@ -139,3 +139,16 @@ After D-1, Phase 5 still has 4 sub-items. **Recommended priority order** (closur
 4. **5.8** Phase 5 megaudit (separate from D-1 step 8 megaudit). 4-6 days; randomized peer-merge tests + transport failure modes. Run AFTER 5.3 + 5.5 stabilize.
 
 **Recommended trade-off framing:** D-1 + D-2/D-3/D-4 + 5.4 + 5.6 already give the V1 + a multi-peer-aware FormatId architecture. 5.3 closes the most user-visible correctness gap (concurrent rename + merge); 5.5 V2 V2/V3 closes the transport gap; 5.7 closes the demo gap. 5.8 is the final megaudit before Phase 5 graduation. Going in order (5.3 → 5.5 → 5.7 → 5.8) is the default; the user may reorder if they have transport pressure or demo deadlines.
+
+## Status update (2026-05-22 post-Phase-5.7-V1)
+
+The forecast above DID hold: 5.3 → 5.5 → 5.7 was the actual ship order. As of 2026-05-22:
+
+- **D-1** ✅ SHIPPED 2026-05-20 (this doc).
+- **5.3** ✅ SHIPPED 2026-05-20 (`docs/phase5/5-3-exit-packet.md`).
+- **5.5 V2 V2 + V2 V3 V1** ✅ SHIPPED 2026-05-21 (`docs/phase5/v2-v3-exit-packet.md`).
+- **5.5 V2 V4 V1** ✅ SHIPPED 2026-05-21 (`docs/phase5/v2-v4-v1-exit-packet.md`; 12/13 Tier items closed, K4 deferred).
+- **5.7 V1** ✅ SHIPPED 2026-05-22 (`docs/phase5/5-7-v1-exit-packet.md`; first IDE binding via napi-rs; V2 Transport binding + V3 cell-grid UI deferred).
+- **5.8 megaudit** still future; depends on 5.7 V2+ being in scope.
+
+The forward-options list above is HISTORICAL — check `memory/current_work.md` for live forward direction.

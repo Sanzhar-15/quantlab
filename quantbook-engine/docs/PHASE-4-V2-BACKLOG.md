@@ -438,11 +438,11 @@ This is the largest single deferred work item — multi-week scope.
 - **Source:** step 5b LOW-3 + step 5c LOW deferred.
 - **Closure:** post-5.3 single-commit mechanical refactor. Renamed `RepairReport` → `SheetRepairReport` + `AmbiguousSkip` → `SheetAmbiguousSkip` across `ql_collab` source + 2 test files + 2 docs. Workspace tests stayed at 4361 / 0; fmt + clippy clean. Closed BEFORE Phase 5.7 IDE binding consumes the API. **No remaining work.**
 
-### H9. Production wiring delivery to IDE (Phase 5.7 work)
+### H9. Production wiring delivery to IDE (Phase 5.7 V3 work — NOT in V1)
 
 - **Source:** step 5b Opus HIGH-1 (rhetoric / framing).
-- **Behavior:** `CollabSession::rebuild_workbook` is shipped as the API entry point but has ZERO non-test callers in the engine. The user-visible D-3 closure only happens when 5.7 IDE binding actually wires `rebuild_workbook` into the IDE's merge-then-recompute path.
-- **Disposition:** Phase 5.7 work. NOT a 5.3 follow-up.
+- **Behavior:** `CollabSession::rebuild_workbook` is shipped as the API entry point but has ZERO non-test callers in the engine. The user-visible D-3 closure only happens when the IDE binding actually wires `rebuild_workbook` into the merge-then-recompute path.
+- **Disposition update 2026-05-22:** Phase 5.7 V1 SHIPPED but did NOT bind `rebuild_workbook` (V1 was intentionally minimum-surface — `CollabSession::new`/`fromSnapshot`/`appendPutValue`/`exportBytes`/`mergeBytes`/observability only). `rebuild_workbook` requires binding `FunctionRegistry` first, which is a bigger surface than V1's scope. Deferred to Phase 5.7 V3 (cell-grid UI + persistence) where the merge-then-recompute path becomes user-visible. V2 (Transport binding) does not need `rebuild_workbook` either — it ships multi-window sync, not recompute UX.
 
 ### H10. Whitespace canonicalization side effect on repair-touched formulas
 

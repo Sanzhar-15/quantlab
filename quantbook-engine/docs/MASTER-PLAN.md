@@ -542,7 +542,7 @@ The full v1 means all of these crates either ship real behavior or have a docume
 
 ## Phase 5 - Multi-User CRDT Collaboration
 
-**Status (2026-05-21): Phase 5 V1 + D-1 + 5.3 + 5.5 V2 V2 + 5.5 V2 V3 V1 (steps 1-6) COMPLETE.** Canonical records: `docs/phase5/v1-exit-packet.md` (V1) + `docs/phase5/d-1-exit-packet.md` (D-1 closure) + `docs/phase5/5-3-exit-packet.md` (5.3 closure) + `docs/phase5/v2-v3-exit-packet.md` (V2 V3 V1 closure). Remaining: 5.7 IDE slice (unblocked, ~1wk), 5.8 Phase 5 megaudit (separate, ~4-6d).
+**Status (2026-05-22): Phase 5 V1 + D-1 + 5.3 + 5.5 V2 V2 + 5.5 V2 V3 V1 (steps 1-6) + 5.5 V2 V4 V1 (12/13 Tier items; K4 chunking deferred to V2 V4 V2) + 5.7 V1 (first IDE binding via napi-rs) COMPLETE.** Canonical records: `docs/phase5/v1-exit-packet.md` (V1) + `docs/phase5/d-1-exit-packet.md` (D-1 closure) + `docs/phase5/5-3-exit-packet.md` (5.3 closure) + `docs/phase5/v2-v3-exit-packet.md` (V2 V3 V1 closure) + `docs/phase5/v2-v4-v1-exit-packet.md` (V2 V4 V1 closure) + `docs/phase5/5-7-v1-exit-packet.md` (5.7 V1 closure). Remaining: 5.7 V2 Transport binding (~3-5d, recommended next), 5.7 V3 cell-grid UI + persistence (~1-2wk), 5.8 Phase 5 megaudit (separate, ~4-6d, depends on 5.7 V2+), V2 V4 V2 K4 chunking (~2-3d).
 
 **Purpose:** Turn collaboration from a single-writer op log into real multi-user CRDT state for sheets, cells, names, tables, presence, undo/redo, and offline sync.
 
@@ -593,9 +593,9 @@ The full v1 means all of these crates either ship real behavior or have a docume
    - V1 (`c677e244704`): `"presence"` LoroMap + `PresenceState` + 4 CollabSession methods.
    - V2 (`d4b3cdb2dc2`): `sweep_presence` caller-opt-in clean-slate.
 
-7. **5.7 Collaboration IDE Vertical Slice** — future. Depends on D-1 + 5.3 + 5.5 V2 V2/V3.
+7. **5.7 Collaboration IDE Vertical Slice** ✅ **V1 SHIPPED 2026-05-22**. First IDE binding to the quantbook engine since the engine has existed. Cross-repo: new `crates/ql-bindings-node/` (napi-rs 3.x cdylib) in the engine + new `extensions/quantlab/src/quantbook/` (loader + types + session wrapper) + `quantlab.quantbookDemo` command + 20 mocha tests in the quantlab VS Code fork. V1 binds the minimum coherent round-trip surface: `CollabSession` class with constructor / `fromSnapshot` / `appendPutValue` / `exportBytes` / `mergeBytes` / `opCount` / `pendingOpCount` / `hasPendingFlush` / `peerId`. Engine commit `677ee03ee8b` (V1 ship) → `6003db4ce2c` (V1 closure); IDE commit `1a7fc8bbe3f` (V1 ship) → `a517d7c5f71` (V1 closure). Per-step audit caught 3 HIGH + 8 MEDIUM (all closed in cycle) including: `catch_unwind` docstring claim was false (verified via napi-derive-backend source); u32 ToUint32 silent coercion of `-1` to `u32::MAX`; cache poisoning in loader; mergeBytes return-semantics doc lie; loader worktree-namespace collision; Send/Sync rationale was wrong. Bonus closure-test finding: Loro reserves `PeerID::MAX` as a second sentinel (in addition to `PeerID(0)`); pre-rejected at FFI for symmetry. Canonical record: `docs/phase5/5-7-v1-exit-packet.md`. **V2 work (Transport binding + multi-window) is the recommended next step**; V3 (cell-grid UI + persistence) is the product-visible milestone.
 
-8. **5.8 Phase 5 Megaudit** — future. Depends on 5.1-5.7 complete.
+8. **5.8 Phase 5 Megaudit** — future. Depends on 5.1-5.7 V2+ complete (V1 binding is too thin; megaudit value comes once V2 Transport surface is in scope).
 
 **Audit Checkpoints**
 

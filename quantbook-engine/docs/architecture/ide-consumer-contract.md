@@ -195,7 +195,9 @@ The IDE will need these eventually; they're not blocking the Phase 2B.6 vertical
 - **Cross-sheet diagnostics on rename.** ✅ Phase 5.2 D-3 shipped the `BindError::UnknownSheet → #NAME?` mapping. ✅ **Phase 5.3 SHIPPED 2026-05-20** — causality-aware rename-repair pass via `ql_collab::repair_{sheet,table,column}_rename_chain` + `CollabSession::rebuild_workbook` wrapper. See § 4.1 below for the IDE-facing API.
 - **Long-running cancellation.** No `Cancel-token` on long operations. Engine Phase 6.1 work.
 
-### 4.1 Phase 5 collaboration surface (preview — for Phase 5.7 IDE vertical slice)
+### 4.1 Phase 5 collaboration surface (Phase 5.7 V1 binds this; V2 + V3 will extend)
+
+**Status update (Phase 5.7 V1 SHIPPED 2026-05-22)**: a Node binding now consumes part of this surface via the engine repo's `crates/ql-bindings-node/` (napi-rs cdylib). V1 binds the minimum `CollabSession` round-trip: constructor / `fromSnapshot` / `appendPutValue` / `exportBytes` / `mergeBytes` / observability (`opCount` / `pendingOpCount` / `hasPendingFlush` / `peerId`). The Transport surface (§§ below: `attach_transport`, `flush_*`, `poll_remote*`, auto-flush, delta flush, offline-write, WebSocket impl) is documented here but NOT yet bound to JS — Phase 5.7 V2 binds Transport. Phase 5.7 V3 binds `rebuild_workbook` + full Op enum + undo/redo + presence + persistence. See `docs/phase5/5-7-v1-exit-packet.md` for the V1 closure record + V2/V3 deferred list.
 
 Phase 5 V1 (2026-05-19) added the engine-side multi-user CRDT collaboration substrate as the `ql-collab` crate. Full API inventory at `docs/phase5/v1-exit-packet.md` § "Final API surface (ql-collab)". IDE callers will use:
 

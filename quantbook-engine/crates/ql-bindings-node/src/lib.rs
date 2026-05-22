@@ -46,12 +46,26 @@
 //!   - `hasPendingFlush() -> boolean` (V2 V3 step 3 helper)
 //!   - `peerId() -> bigint`
 //!
-//! ## V1 deferred (see `.plans/_active.md`)
+//! ## V1 deferred (see `docs/phase5/5-7-v1-exit-packet.md`)
 //!
-//! Transport binding (LoopbackTransport, WebSocketTransport),
-//! undo/redo, presence, full Op enum, format IDs, `rebuild_workbook`
-//! (D-3 production-visible closure), all flush_* methods. V2 picks
-//! these up.
+//! Full V1-deferred-to-V2/V3 list lives in the V1 exit packet's
+//! "V1 deferred to V2" table. Summary: Transport binding
+//! (LoopbackTransport, WebSocketTransport, `attach_transport` /
+//! `detach_transport` / `has_transport` / `flush_to_transport` /
+//! `flush_delta_to_transport` / `flush_pending_to_transport` /
+//! `poll_remote` / `poll_remote_with_limit` /
+//! `transport_last_error` / `set_auto_flush_policy`), multi-window
+//! demo, undo/redo (UndoGroupGuard RAII translation), presence
+//! (PresenceState shape), full Op enum (beyond PutValue),
+//! Format/D-1 (FormatId enum), `rebuild_workbook` (D-3
+//! production-visible closure — Phase 5.7 V3), `discard_pending_ops`,
+//! `.qbook` persistence import/export, `#[napi(catch_unwind)]` opt-in
+//! for defense in depth, SharedArrayBuffer defensive copy, BigInt
+//! return for `opCount`/`pendingOpCount`/`mergeBytes`,
+//! `mergeBytesDelta` companion, `@napi-rs/cli` publish pipeline,
+//! Windows-specific `.dll` naming, CI `QUANTBOOK_REQUIRE_ENGINE=1`
+//! enforcement. V2 picks up Transport; V3 picks up cell-grid UI +
+//! persistence + `rebuild_workbook` wiring.
 //!
 //! ## Send + Sync
 //!
@@ -94,6 +108,41 @@ use ql_types::PeerId;
 #[napi]
 pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// **Phase 5.7 V1 megaudit closure (Codex HIGH, 2026-05-22):**
+/// Validate a JS Number argument that represents a u32-domain index
+/// (row, col). Rejects non-finite, negative, fractional, and out-of-u32
+/// values with a distinct error message naming the parameter.
+///
+/// Why this exists: napi-rs's `napi_get_value_uint32` (used for `u32`
+/// params) applies ECMAScript `ToUint32`, silently coercing `-1` to
+/// `u32::MAX`, `NaN`/`Infinity` to `0`, fractions to floor-toward-zero.
+/// By taking the param as `f64` (raw `napi_get_value_double`) and
+/// validating here, we surface bad inputs as explicit JS Errors
+/// instead of corrupting workbook state.
+fn validate_u32_index(name: &str, value: f64) -> Result<u32> {
+    if !value.is_finite() {
+        return Err(Error::from_reason(format!(
+            "appendPutValue: {name} must be a finite non-negative integer, got {value}"
+        )));
+    }
+    if value < 0.0 {
+        return Err(Error::from_reason(format!(
+            "appendPutValue: {name} must be a non-negative integer, got {value}"
+        )));
+    }
+    if value.fract() != 0.0 {
+        return Err(Error::from_reason(format!(
+            "appendPutValue: {name} must be an integer, got {value}"
+        )));
+    }
+    if value > u32::MAX as f64 {
+        return Err(Error::from_reason(format!(
+            "appendPutValue: {name} must be in [0, 4294967295] (u32::MAX), got {value}"
+        )));
+    }
+    Ok(value as u32)
 }
 
 /// Helper: convert a JS `BigInt` to `PeerId` with explicit rejection of
@@ -196,33 +245,45 @@ impl CollabSession {
     /// single variant because it's the minimum that demonstrates
     /// the round-trip.
     ///
-    /// # Input validation (Phase 5.7 V1 audit closure, 2026-05-22)
+    /// # Input validation (Phase 5.7 V1 megaudit closure, 2026-05-22)
     ///
-    /// JS numbers cross the FFI boundary through napi-rs's
-    /// `napi_get_value_uint32` for `u32` args, which applies the
-    /// ECMAScript `ToUint32` algorithm: `-1 → 0xFFFFFFFF`,
-    /// `NaN → 0`, `Infinity → 0`, `2.5 → 2` (floor-toward-zero).
-    /// All four cases silently coerce instead of erroring — a future
-    /// IDE cell-grid UI passing negative or fractional coordinates
-    /// would silently corrupt workbook state at `row = u32::MAX` or
-    /// `row = 0`. Per Codex H3 + Opus H2 (convergent HIGH).
+    /// The original V1 closure tried to push validation into the TS
+    /// wrapper (`session.ts::appendPutValueValidated`), but that left
+    /// this `#[napi]` method as a public unchecked surface that direct
+    /// callers could bypass. The Phase 5.7 V1 megaudit (Codex HIGH,
+    /// 2026-05-22) flagged this as a real hazard: any consumer skipping
+    /// the wrapper hit ECMAScript `ToUint32` for `u32` row/col args:
+    ///   - `-1` → `0xFFFFFFFF` (silent wrap to u32::MAX)
+    ///   - `NaN` → `0` (silent coercion)
+    ///   - `Infinity` → `0` (silent coercion)
+    ///   - `2.5` → `2` (silent floor-toward-zero)
     ///
-    /// Mitigation: the TS-side wrapper (`session.ts::appendPutValue`)
-    /// pre-validates row/col/value via `Number.isInteger` +
-    /// `Number.isFinite` before calling here. Callers reaching this
-    /// `#[napi]` method directly (skipping the wrapper) are still
-    /// subject to ToUint32. V2 will push the validation into the napi
-    /// boundary directly when napi-rs exposes a `JsNumber` raw type
-    /// that hasn't been ToUint32-coerced yet.
+    /// **Closure**: the `row` and `col` parameters are now `f64`
+    /// (raw JS Number, NOT ToUint32-coerced via napi-rs's
+    /// `napi_get_value_double`). Inside the method we validate:
+    ///   - finite (not NaN / Infinity)
+    ///   - non-negative
+    ///   - integer (`fract() == 0.0`)
+    ///   - in u32 range (≤ `u32::MAX`)
+    /// then cast to `u32`. Any failure surfaces a precise JS Error.
     ///
-    /// The `value` parameter is `f64` (Number, not ToUint32'd) so we
-    /// CAN validate finiteness here — and we do. This catches
-    /// `NaN`/`Infinity` values immediately. Per Opus M4 + Codex H3.
+    /// `sheet: u16` stays as-is — u16's `try_into::<u16>()` correctly
+    /// rejects out-of-range values from ToUint32, so the asymmetric
+    /// safety (Opus audit H2 finding) doesn't apply at u16.
+    ///
+    /// `value: f64` is already raw (Number → double, no coercion);
+    /// validate finiteness here too (NaN/Infinity rejection).
+    ///
+    /// The TS-side `appendPutValueValidated` wrapper becomes
+    /// defense-in-depth — it fails earlier with friendlier messages
+    /// but the engine-side validation is the load-bearing contract
+    /// for direct callers.
     #[napi(js_name = "appendPutValue")]
-    pub fn append_put_value(&mut self, sheet: u16, row: u32, col: u32, value: f64) -> Result<()> {
-        // **Phase 5.7 V1 audit closure (Opus M4 / Codex H3, 2026-05-22):**
-        // reject non-finite values at the FFI boundary so they can't enter
-        // the workbook state.
+    pub fn append_put_value(&mut self, sheet: u16, row: f64, col: f64, value: f64) -> Result<()> {
+        // Validate row + col: finite, non-negative, integer, in u32 range.
+        let row_u32 = validate_u32_index("row", row)?;
+        let col_u32 = validate_u32_index("col", col)?;
+        // Validate value: finite (NaN/Infinity rejected).
         if !value.is_finite() {
             return Err(Error::from_reason(format!(
                 "appendPutValue value must be finite, got {value}"
@@ -230,8 +291,8 @@ impl CollabSession {
         }
         let op = Op::PutValue {
             sheet,
-            row,
-            col,
+            row: row_u32,
+            col: col_u32,
             value: CellWireValue::Number(value),
         };
         self.inner
@@ -338,6 +399,37 @@ impl CollabSession {
         BigInt::from(self.inner.peer_id().as_u64())
     }
 }
+
+// **Phase 5.7 V1 megaudit closure (Opus-A MEDIUM-1, 2026-05-22):**
+// Rule 4 application — the module docstring claims this `CollabSession`
+// wrapper is `Send + !Sync`. Per audit-discipline Rule 4 (added 2026-05-21
+// after a wrong `!Sync` claim survived 3 audits + a megaudit), negative
+// trait claims need positive compile proof OR per-field walk.
+//
+// POSITIVE PROOF: `Send` is asserted at compile time below. The function
+// only compiles if `CollabSession: Send`.
+const _ASSERT_BINDING_COLLAB_SESSION_SEND: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<CollabSession>();
+};
+
+// `!Sync` follows by composition: `CollabSession { inner: CoreCollabSession }`,
+// and `CoreCollabSession` is documented `!Sync` (per `ql-collab/src/session.rs:79-93`
+// — the `Option<Box<dyn Transport + Send>>` field is `?Sync`, so the struct
+// inherits `!Sync`; that crate also documents the probe-then-commented-out
+// proof). The wrapper inherits via the single field. To verify locally,
+// un-comment the probe below and run `cargo check -p ql-bindings-node` —
+// the build MUST fail with "the trait bound `Sync` is not satisfied" naming
+// `CoreCollabSession` (or its Transport field):
+//
+// fn assert_binding_collab_session_not_sync() {
+//     fn assert_sync<T: Sync>() {}
+//     assert_sync::<CollabSession>(); // EXPECTED COMPILE ERROR
+// }
+//
+// `static_assertions::assert_not_impl_all!` would fire spuriously on
+// "AmbiguousIfImpl" for `!Sync` checks; the probe-then-commented-out
+// pattern is the canonical Rule 4 application per audit-discipline memory.
 
 #[cfg(test)]
 mod tests {

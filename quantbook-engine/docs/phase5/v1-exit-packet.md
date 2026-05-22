@@ -1,8 +1,8 @@
 ---
 title: Phase 5 V1 exit packet (5.1 → 5.6 V1+V2 + 5.4 V2 V1+V1.1 + 5.5 V2 V1 + D1.a)
-status: ACTIVE — Phase 5 V1 surface complete 2026-05-19. **D-1 SHIPPED 2026-05-20**. **5.3 SHIPPED 2026-05-20**. **5.5 V2 V3 V1 SHIPPED 2026-05-21** (auto-flush + version-vector delta flush + poll_remote auto-flush + offline-write contract + WebSocket transport + 3-way megaudit + exit packet). See `docs/phase5/d-1-exit-packet.md` + `docs/phase5/5-3-exit-packet.md` + `docs/phase5/v2-v3-exit-packet.md` (V2 V3 V1 canonical closure record). 5.7 IDE slice (unblocked, ~1wk) and 5.8 megaudit (~4-6d) remain.
+status: ACTIVE — Phase 5 V1 surface complete 2026-05-19. **D-1 SHIPPED 2026-05-20**. **5.3 SHIPPED 2026-05-20**. **5.5 V2 V3 V1 SHIPPED 2026-05-21**. **5.5 V2 V4 V1 SHIPPED 2026-05-21** (12/13 Tier items closed; K4 chunking deferred to V2 V4 V2). **5.7 V1 SHIPPED 2026-05-22** (first IDE binding via napi-rs; cross-repo). See `docs/phase5/d-1-exit-packet.md` + `docs/phase5/5-3-exit-packet.md` + `docs/phase5/v2-v3-exit-packet.md` (V2 V3 V1) + `docs/phase5/v2-v4-v1-exit-packet.md` (V2 V4 V1) + `docs/phase5/5-7-v1-exit-packet.md` (5.7 V1 cross-repo). Remaining: 5.7 V2 Transport binding (~3-5d, recommended next), 5.7 V3 cell-grid UI (~1-2wk), 5.8 megaudit (~4-6d, after V2+).
 date: 2026-05-19
-updated: 2026-05-20 (post-exit-packet additions: 5.6 V2 sweep_presence + D1.a 4-cluster closure + D-1 ALL STEPS SHIPPED)
+updated: 2026-05-22 (post-exit-packet additions: 5.6 V2 sweep_presence + D1.a 4-cluster closure + D-1 ALL STEPS SHIPPED + 5.5 V2 V3/V4 V1 + 5.7 V1)
 predecessor: docs/phase4/exit-packet.md + docs/phase5/entry-plan.md
 successor: docs/phase5/d-1-starting-checklist.md (fresh-session entry for the multi-day D-1 arc)
 supersedes_pointer: docs/phase5/entry-plan.md (entry-plan stays as historical scope reference; this packet is the closeout)
@@ -312,11 +312,34 @@ Phase 5 V1 added **91 net tests** to the engine.
   recovery with explicit-flush idiom). **V2 V3 V1 SHIPPED;
   Phase 5.7 unblocked.**
 
-- **Phase 5.7 — IDE vertical slice.** Two-window editing demo.
-  1 week. Depends on D-1 + 5.3 + 5.5 V2 V2 (✅) + V2 V3.
+- **Phase 5.7 V1 — IDE vertical slice (FIRST IDE BINDING).** ✅
+  **SHIPPED 2026-05-22**. Engine `677ee03ee8b` (ship) + `6003db4ce2c`
+  (closure); IDE `1a7fc8bbe3f` (ship) + `a517d7c5f71` (closure).
+  New `crates/ql-bindings-node/` (napi-rs 3.x cdylib) binding
+  `CollabSession` for the quantlab VS Code fork's extension host.
+  20 mocha tests in `extensions/quantlab/test/quantbook-roundtrip.test.ts`.
+  Canonical record: `docs/phase5/5-7-v1-exit-packet.md`. **V1 deferred**
+  Transport binding (V2), multi-window demo (V2), cell-grid UI (V3),
+  `.qbook` persistence (V3), undo/redo binding, presence binding,
+  Format/D-1 binding, full Op enum, `rebuild_workbook` D-3
+  production-visible closure (V3).
+
+- **Phase 5.7 V2 — Transport binding (~3-5d, recommended next).**
+  Extends ql-bindings-node with `LoopbackTransport`,
+  `WebSocketTransport`, the Transport trait, `attach_transport` /
+  `detach_transport` / `flush_*` / `poll_remote_*`. Then multi-window
+  IDE demo (two extension hosts syncing via WebSocket). Pre-flight:
+  the engine-assertion sweep per Rule 4 (newly-bound methods each
+  need their FFI-reachable panics pre-validated).
+
+- **Phase 5.7 V3 — Cell grid + persistence (~1-2wk).** Real
+  spreadsheet UI: paste-fill-down, formula UI, `.qbook` open/save,
+  full Op enum binding, undo/redo UI, `rebuild_workbook` wiring
+  (D-3 production-visible). Depends on V2 for collaboration UX.
 
 - **Phase 5.8 — Megaudit.** Randomized peer-merge tests +
-  transport failure modes. 4-6 days.
+  transport failure modes. 4-6 days. Depends on Phase 5.7 V2+ being
+  in scope (V1 binding is too thin for megaudit value).
 
 ### Minor (V2 V2 polish)
 

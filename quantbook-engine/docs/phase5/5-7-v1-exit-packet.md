@@ -2,8 +2,8 @@
 title: Phase 5.7 V1 exit packet
 date: 2026-05-22
 status: ACTIVE — Phase 5.7 V1 SHIPPED via cross-repo ship + closure cycle
-ship_commit_range_engine: 677ee03ee8b (V1 ship) → [closure commit] (V1 audit closure)
-ship_commit_range_ide: 1a7fc8bbe3f (V1 ship) → [closure commit] (V1 audit closure)
+ship_commit_range_engine: 677ee03ee8b (V1 ship) → 6003db4ce2c (V1 audit closure)
+ship_commit_range_ide: 1a7fc8bbe3f (V1 ship) → a517d7c5f71 (V1 audit closure)
 predecessor_exit_packet: docs/phase5/v2-v4-v1-exit-packet.md (V2 V4 V1)
 audit_cycle_total: 1 ship + 1 closure = 2 cycles, 2 audit transcripts (Codex + Opus)
 test_count_at_v1_exit: workspace 4461+ / 0; ql-bindings-node 2 unit tests; IDE quantbook 20 mocha tests (up from 10 at V1 ship after closure additions)
