@@ -2116,6 +2116,65 @@ suite('quantbook V3.1 multi-window relay round-trip', function () {
 // Phase 5.7 V3.2.a -- cell-snapshot export for the IDE grid widget
 // ============================================================================
 
+import { buildHtml, formatCellValue } from '../src/quantbook/cellGrid/cellGridHtml';
+
+suite('quantbook V3.2.a scaffold -- cell-grid webview HTML rendering', function () {
+	test('formatCellValue handles all 5 CellWireValue variants', () => {
+		assert.strictEqual(formatCellValue({ kind: 'number', value: 42.5 }), '42.5');
+		assert.strictEqual(formatCellValue({ kind: 'boolean', value: true }), 'TRUE');
+		assert.strictEqual(formatCellValue({ kind: 'boolean', value: false }), 'FALSE');
+		assert.strictEqual(formatCellValue({ kind: 'text', value: 'hello' }), 'hello');
+		assert.strictEqual(formatCellValue({ kind: 'error', value: '#REF!' }), '#REF!');
+		assert.strictEqual(formatCellValue({ kind: 'pending' }), '(pending)');
+	});
+
+	test('buildHtml on empty snapshot includes empty-state hint + meta', () => {
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries: [] });
+		assert.ok(html.includes('snapshot_format_version=1'));
+		assert.ok(html.includes('entries=0'));
+		assert.ok(html.includes('(empty -- no PutValue ops'));
+		// No table for empty case.
+		assert.ok(!html.includes('<tbody>'));
+	});
+
+	test('buildHtml on populated snapshot renders rows + kind annotations', () => {
+		const html = buildHtml({
+			snapshot_format_version: 1,
+			sheet: 0,
+			entries: [
+				{ row: 0, col: 0, value: { kind: 'number', value: 42 } },
+				{ row: 1, col: 1, value: { kind: 'text', value: 'hi' } },
+			],
+		});
+		assert.ok(html.includes('entries=2'));
+		assert.ok(html.includes('<tbody>'));
+		assert.ok(html.includes('<td>0</td><td>0</td>'));
+		assert.ok(html.includes('42'));
+		assert.ok(html.includes('[number]'));
+		assert.ok(html.includes('hi'));
+		assert.ok(html.includes('[text]'));
+	});
+
+	test('buildHtml escapes HTML in cell text values (XSS hygiene)', () => {
+		const html = buildHtml({
+			snapshot_format_version: 1,
+			sheet: 0,
+			entries: [
+				{ row: 0, col: 0, value: { kind: 'text', value: '<script>alert(1)</script>' } },
+			],
+		});
+		// Raw `<script>` MUST NOT appear; entity-encoded form MUST.
+		assert.ok(!html.includes('<script>alert(1)</script>'));
+		assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'));
+	});
+
+	test('buildHtml has a CSP meta tag with default-src none', () => {
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries: [] });
+		assert.ok(html.includes('Content-Security-Policy'));
+		assert.ok(html.includes('default-src \'none\''));
+	});
+});
+
 suite('quantbook V3.2.a -- exportSnapshot cell-snapshot export', function () {
 	suiteSetup(function () {
 		const r = shouldSkip();

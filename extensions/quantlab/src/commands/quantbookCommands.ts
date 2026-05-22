@@ -25,6 +25,7 @@ import * as vscode from 'vscode';
 import { appendPutValueValidated, createSession, quantbookEngineVersion, sessionFromSnapshot } from '../quantbook/session';
 import { loadQuantbookEngine, quantbookHostInfo } from '../quantbook/loader';
 import { runMultiWindowDemo } from '../quantbook/multiWindowDemo';
+import { CellGridPanel } from '../quantbook/cellGrid/cellGridPanel';
 import type { CollabSessionInstance } from '../quantbook/types';
 
 let outputChannel: vscode.OutputChannel | undefined;
@@ -166,6 +167,37 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				const detail = err instanceof Error ? err.message : String(err);
 				log.appendLine(`FATAL multi-window demo error: ${detail}`);
 				vscode.window.showErrorMessage(`Quantbook multi-window demo failed: ${detail}`);
+			}
+		}),
+	);
+
+	// Phase 5.7 V3.2.a scaffold (2026-05-22) -- read-only cell-grid
+	// webview. Opens a static HTML table showing the current snapshot
+	// of sheet 0. Sample data is appended at command-invocation time
+	// so the empty-session case doesn't show a blank table on first
+	// use. V3.2.b will add live editing + auto-refresh.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookCellGrid', () => {
+			const log = getOutput();
+			try {
+				// Use process.pid as peerId so multiple opens in the
+				// same window distinguish themselves. Engine rejects 0
+				// at the napi boundary; pid is always positive.
+				const session = createSession(BigInt(process.pid));
+				// Sample data so the scaffold actually shows something
+				// at V3.2.a. V3.2.b will source data from a live
+				// session attached to a real workbook.
+				appendPutValueValidated(session, 0, 0, 0, 42);
+				appendPutValueValidated(session, 0, 0, 1, 100);
+				appendPutValueValidated(session, 0, 1, 0, 3.14);
+				appendPutValueValidated(session, 0, 1, 1, 2.718);
+				appendPutValueValidated(session, 0, 2, 0, 0);
+				CellGridPanel.show(context, session, 0);
+				log.appendLine('Cell Grid (sheet 0) opened with sample data.');
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL cell-grid error: ${detail}`);
+				vscode.window.showErrorMessage(`Quantbook cell grid failed: ${detail}`);
 			}
 		}),
 	);

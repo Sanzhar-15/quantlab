@@ -183,6 +183,11 @@
         "category": "%command.category%"
       },
       {
+        "command": "quantlab.quantbookCellGrid",
+        "title": "%command.quantbookCellGrid.title%",
+        "category": "%command.category%"
+      },
+      {
         "command": "quantlab.openRiskSettings",
         "title": "%command.openRiskSettings.title%",
         "category": "%command.category%"

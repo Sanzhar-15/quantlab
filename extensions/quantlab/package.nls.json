@@ -29,6 +29,7 @@
 	"command.killSwitch.title": "Execute Kill Switch",
 	"command.quantbookDemo.title": "Quantbook: Demo Round-Trip",
 	"command.quantbookDemoMultiWindow.title": "Quantbook: Demo (Multi-Window)",
+	"command.quantbookCellGrid.title": "Quantbook: Open Cell Grid",
 	"command.openRiskSettings.title": "Open Risk Settings",
 	"command.openBrokerSettings.title": "Open Broker Settings",
 	"command.selectDataSource.title": "Select Data Source",
