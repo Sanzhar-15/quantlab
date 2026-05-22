@@ -6,7 +6,39 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# **Phase 5.7 V1 (2026-05-22) — VS Code extension binding.**
+# Previously a Phase 6+ reserved placeholder (see `ql-bindings-c` for
+# the parallel C-FFI placeholder, still reserved). Filled at Phase 5.7
+# V1 to bind `CollabSession` for the quantlab VS Code fork's extension
+# host (Node.js).
+#
+# cdylib output for Node.js to load. The build artifact lives at
+# `target/{debug,release}/libql_bindings_node.{dylib,so,dll}` per Cargo
+# convention. The IDE extension's loader.ts is responsible for finding
+# this path (env var `QUANTBOOK_ENGINE_PATH` defaulting to a workspace-
+# relative dev location). V2+ will publish via `@napi-rs/cli` or a
+# custom artifact pipeline.
+#
+# Why napi-rs (not wasm or subprocess): see `.plans/_active.md` table.
+# tl;dr: only option that preserves the engine's tokio runtime AND
+# gives direct memory access for hot paths.
 [lib]
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+# napi8 feature + default-features = false set at workspace level
+# (see workspace Cargo.toml). napi8 targets Node.js 12+ — VS Code's
+# electron / Node.js bundle is well past that floor.
+napi = { workspace = true }
+napi-derive = { workspace = true }
+
+# **V1 scope (per `.plans/_active.md`):** bind `CollabSession` only.
+# No transport, no presence, no undo, no formula support. Single Op
+# variant exposed (PutValue) via a convenience method `appendPutValue`.
+ql-collab = { path = "../ql-collab" }
+ql-oplog  = { path = "../ql-oplog" }
+ql-types  = { path = "../ql-types" }
+
+[build-dependencies]
+napi-build = { workspace = true }

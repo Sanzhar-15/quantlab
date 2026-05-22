@@ -68,6 +68,18 @@ futures-util = { version = "=0.3.32", default-features = false, features = ["std
 # `assert_impl_all!` macro. Used only by ql-collab-ws.
 static_assertions = "=1.1.0"
 
+# Phase 5.7 V1 (2026-05-22) — VS Code extension binding via napi-rs.
+# `ql-bindings-node` builds a `.node` cdylib loaded by the quantlab
+# VS Code fork's extension host (Node.js). napi-rs 3.x is the current
+# major; napi-derive provides the `#[napi]` proc-macro; napi-build is
+# the build.rs helper that locates Node headers + emits cargo:rustc-cfg
+# directives. cdylib output naming differs per platform (.dylib / .so /
+# .dll); the @napi-rs/cli npm tool typically renames to `.node`, but
+# for V1 we load the raw cdylib via an explicit path in TS code.
+napi = { version = "=3.9.0", default-features = false, features = ["napi8"] }
+napi-derive = "=3.5.6"
+napi-build = "=2.3.2"
+
 # Bench
 criterion = { version = "=0.8.2", default-features = false, features = ["html_reports"] }
 # Property-based testing for invariant checks (ql-storage, ql-calcgraph, ql-exec dev-deps)
