@@ -69,26 +69,38 @@
 //!
 //! ## Send + Sync
 //!
-//! `CollabSession` is `Send + !Sync` (verified per V2 V4 V1 step 3 +
-//! audit-discipline Rule 4). napi-rs's generated class instance lives
-//! in a `Box<CollabSession>` stored in JS object slot via `napi_wrap`
-//! (verified by reading napi-rs 3.9.0
-//! `src/bindgen_runtime/callback_info.rs:90-126`: NO `Send`/`Sync`
-//! bound on the wrapped type). napi-rs does NOT lock the instance.
-//! Safety against concurrent `&mut self` rests on (Phase 5.7 V1 audit
-//! Opus M1 closure, 2026-05-22):
-//!   1. JS event loop is single-threaded per Worker / main thread.
-//!   2. `napi::Reference<T>` is NOT Send (intentional, per napi-rs
-//!      docs: "drop must run on the same thread as creation"). This
-//!      compile-time prevents passing the class reference to a
-//!      different Worker thread.
-//!   3. `napi::Reference<T>: Sync` only when `T: Sync`. `CollabSession:
-//!      !Sync` blocks even read-only cross-thread sharing.
+//! **V2.4 (2026-05-22) UPDATE**: `CollabSession` is now `Send + Sync`
+//! (was `Send + !Sync` in V1+V2.1+V2.2+V2.3). The shape changed in V2.4
+//! from `inner: CoreCollabSession` to `inner: Arc<parking_lot::Mutex<CoreCollabSession>>`
+//! as the closure for V2.3 audit's HIGH-1 (Rust UB via napi `&mut self`
+//! async re-entry). The Arc<Mutex> composition adds Sync via interior
+//! mutability — multiple shared `&CollabSession` references are sound;
+//! mutation flows through the Mutex.
 //!
-//! Conclusion: `Send + !Sync` is the correct bound; the IDE cannot use
-//! this class concurrently from multiple Workers even if it wanted to.
-//! The prior docstring claimed "napi internal locking" -- that was
-//! wrong (no such lock exists); the actual safety is via 1+2+3 above.
+//! **Compile-asserted proof** (lib.rs near end of file): both Send AND
+//! Sync are pinned via `assert_send + assert_sync` const-fn pattern.
+//! Per Rule 4: positive proof is required (this is the V2.4
+//! re-pinning of what was V1's `!Sync` claim).
+//!
+//! **Underlying composition** (Send + Sync verified by source-walks):
+//!   - `CoreCollabSession: Send + !Sync` (engine claim at
+//!     `ql-collab/src/session.rs:87`, unchanged).
+//!   - `parking_lot::Mutex<T>: Send + Sync` when `T: Send`
+//!     (verified per `lock_api-0.4.14/src/mutex.rs:144`'s
+//!     `impl<R: RawMutex + Sync, T: Send> Sync for Mutex<R, T>`).
+//!   - `Arc<T>: Send + Sync` when `T: Send + Sync`.
+//!   - Therefore the V2.4 binding wrapper composition is `Send + Sync`.
+//!
+//! **V2.4 V8-block hazard (Opus V2.4 HIGH-1, NOT runtime-unsound)**:
+//! all napi methods on `CollabSession` acquire `self.inner.lock()`.
+//! While `flushPendingToTransport`'s spawn_blocking task holds the
+//! mutex during a Condvar wait (potentially seconds), JS sync method
+//! calls on the SAME session block the V8 event loop waiting for the
+//! lock. The IDE UI freezes for the wait duration. This is a UX
+//! hazard, not a soundness hazard. V2.5+ work plan documented at the
+//! `flushPendingToTransport` method below. The TS-side caller
+//! discipline today is: don't call other session methods while
+//! `flushPendingToTransport` is awaiting.
 
 #![deny(clippy::all)]
 #![allow(clippy::missing_safety_doc)] // napi-rs generated wrappers
@@ -791,6 +803,31 @@ impl CollabSession {
     /// - No transport attached → returns `Ok(())` (NOT a rejection).
     /// - Transport error during the wait → JS Error.
     /// - The `spawn_blocking` task panics → JS Error.
+    ///
+    /// **V2.4 V8-block hazard (Opus V2.4 HIGH-1, 2026-05-22)** — known
+    /// trade-off, documented for caller discipline:
+    ///
+    /// While this method's `spawn_blocking` task holds `self.inner.lock()`
+    /// during a Condvar wait (the engine's `flush_pending_to_transport`
+    /// blocks on writer-progress; can be seconds for slow WS peers),
+    /// concurrent JS sync method calls on the SAME session block the
+    /// V8 event loop on lock acquisition. IDE UI freezes for the wait
+    /// duration.
+    ///
+    /// This is a UX hazard, NOT a soundness hazard (V2.3 audit's UB
+    /// hazard remains closed; V2.4 just trades it for a contention
+    /// hazard).
+    ///
+    /// **Caller discipline (today)**: don't call other `CollabSession`
+    /// methods on the same session while a `flushPendingToTransport`
+    /// promise is pending. Queue the calls behind the await.
+    ///
+    /// **V2.5+ engine refactor plan**: move the Condvar wait out of
+    /// `&mut self` exclusive access — either (a) clone an
+    /// `Arc<Transport>` inside the lock and release before waiting, or
+    /// (b) replace Condvar with `tokio::sync::Notify` so the wait
+    /// becomes truly async (no lock held). V2.5 will pick based on
+    /// the engine's writer-task lifecycle constraints.
     #[napi(js_name = "flushPendingToTransport")]
     pub async fn flush_pending_to_transport(&self) -> Result<()> {
         let inner = Arc::clone(&self.inner);
@@ -1088,23 +1125,23 @@ const _ASSERT_BINDING_LOOPBACK_PAIR_SEND: fn() = || {
     assert_send::<LoopbackPair>();
 };
 
-// `!Sync` follows by composition: `CollabSession { inner: CoreCollabSession }`,
-// and `CoreCollabSession` is documented `!Sync` (per `ql-collab/src/session.rs:79-93`
-// — the `Option<Box<dyn Transport + Send>>` field is `?Sync`, so the struct
-// inherits `!Sync`; that crate also documents the probe-then-commented-out
-// proof). The wrapper inherits via the single field. To verify locally,
-// un-comment the probe below and run `cargo check -p ql-bindings-node` —
-// the build MUST fail with "the trait bound `Sync` is not satisfied" naming
-// `CoreCollabSession` (or its Transport field):
+// **V2.4 (2026-05-22) update**: this block previously documented the
+// `!Sync` claim for V1 + V2.1-V2.3's `inner: CoreCollabSession` shape.
+// V2.4 refactored to `inner: Arc<Mutex<CoreCollabSession>>` which is
+// `Send + Sync`; the V2.4 compile assert above pins BOTH. The historical
+// `!Sync` probe pattern is no longer applicable to the binding crate
+// itself.
 //
-// fn assert_binding_collab_session_not_sync() {
-//     fn assert_sync<T: Sync>() {}
-//     assert_sync::<CollabSession>(); // EXPECTED COMPILE ERROR
-// }
+// The probe-then-commented-out pattern is still the canonical Rule 4
+// application pattern for `!Sync` claims elsewhere in the codebase
+// (see `ql-collab/src/session.rs` for the engine's `CoreCollabSession:
+// !Sync` claim, which V2.4's wrapper composition still relies on).
 //
-// `static_assertions::assert_not_impl_all!` would fire spuriously on
-// "AmbiguousIfImpl" for `!Sync` checks; the probe-then-commented-out
-// pattern is the canonical Rule 4 application per audit-discipline memory.
+// Historical context for future code archaeologists: V1+V2.x audit
+// closures documented "Send + !Sync" with this commented probe. V2.4
+// changed the composition; documentation now matches the runtime
+// reality (Send + Sync, verified by source-walking parking_lot's
+// `lock_api-0.4.14/src/mutex.rs:144`).
 
 #[cfg(test)]
 mod tests {
