@@ -198,6 +198,11 @@
         "category": "%command.category%"
       },
       {
+        "command": "quantlab.quantbookCellGridSwitchSheet",
+        "title": "%command.quantbookCellGridSwitchSheet.title%",
+        "category": "%command.category%"
+      },
+      {
         "command": "quantlab.openRiskSettings",
         "title": "%command.openRiskSettings.title%",
         "category": "%command.category%"

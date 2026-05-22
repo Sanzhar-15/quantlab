@@ -2267,7 +2267,7 @@ suite('quantbook V3.2.a -- exportSnapshot cell-snapshot export', function () {
 // Phase 5.7 V3.2.b.5 -- cell-edit flow (HTML + dispatcher)
 // ============================================================================
 
-import { buildVirtualRows, classifyPollTick, computeVisibleRange, dispatchIncomingMessage, parseCellRawInput, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
+import { buildSheetQuickPickItems, buildVirtualRows, classifyPollTick, computeVisibleRange, dispatchIncomingMessage, parseCellRawInput, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
 
 suite('quantbook V3.2.b.2 -- cellGridHtml.ts nonce + script + editable cells', function () {
 	test('buildHtml WITHOUT nonce is unchanged from V3.2.a (no script tag; narrow CSP)', () => {
@@ -3045,5 +3045,51 @@ suite('quantbook V3.3.0.4 -- buildHtml virtualization wiring', function () {
 		assert.ok(html.includes('OVERSCAN = 5'));
 		// Mid-edit guard: activeInput check
 		assert.ok(html.includes('if (activeInput !== null) { return; }'));
+	});
+});
+
+// ============================================================================
+// Phase 5.7 V3.3.0.5 -- multi-sheet UX (buildSheetQuickPickItems helper)
+// ============================================================================
+
+suite('quantbook V3.3.0.5 -- buildSheetQuickPickItems', function () {
+	test('empty sheets returns empty items', () => {
+		assert.deepStrictEqual(buildSheetQuickPickItems([], 0), []);
+	});
+
+	test('single sheet matching current is labelled (current)', () => {
+		const items = buildSheetQuickPickItems([0], 0);
+		assert.deepStrictEqual(items, [
+			{ label: 'Sheet 0', description: '(current)', sheet: 0 },
+		]);
+	});
+
+	test('multi-sheet annotates only the current', () => {
+		const items = buildSheetQuickPickItems([0, 2, 5], 2);
+		assert.deepStrictEqual(items, [
+			{ label: 'Sheet 0', description: '', sheet: 0 },
+			{ label: 'Sheet 2', description: '(current)', sheet: 2 },
+			{ label: 'Sheet 5', description: '', sheet: 5 },
+		]);
+	});
+
+	test('current sheet not in the list (panel + session out-of-sync) -- none annotated', () => {
+		// Edge case: panel.sheet was last set to 99 but session no longer
+		// has sheet 99 (e.g., a future undo path could remove it).  The
+		// helper still produces items; the user sees no "(current)"
+		// marker.  This is the safe degraded behavior; the command-site
+		// caller still gets a usable list.
+		const items = buildSheetQuickPickItems([0, 1, 2], 99);
+		assert.strictEqual(items.length, 3);
+		assert.ok(items.every(i => i.description === ''));
+	});
+
+	test('input order is preserved (caller already sorts via listSheets)', () => {
+		// Pin that the helper does NOT re-sort.  `listSheets` already
+		// returns sorted ascending; the helper trusts that contract.
+		// Passing a non-sorted input verifies the helper does NOT mutate
+		// the order.
+		const items = buildSheetQuickPickItems([5, 1, 3], 1);
+		assert.deepStrictEqual(items.map(i => i.sheet), [5, 1, 3]);
 	});
 });

@@ -22,10 +22,11 @@
 
 import * as vscode from 'vscode';
 
-import { appendPutValueValidated, createSession, quantbookEngineVersion, sessionFromSnapshot } from '../quantbook/session';
+import { appendPutValueValidated, createSession, listSheets, quantbookEngineVersion, sessionFromSnapshot } from '../quantbook/session';
 import { loadQuantbookEngine, quantbookHostInfo } from '../quantbook/loader';
 import { connectOrSpawn, runMultiWindowDemo } from '../quantbook/multiWindowDemo';
 import { CellGridPanel } from '../quantbook/cellGrid/cellGridPanel';
+import { buildSheetQuickPickItems } from '../quantbook/cellGrid/cellGridLogic';
 import type { CollabSessionInstance } from '../quantbook/types';
 
 let outputChannel: vscode.OutputChannel | undefined;
@@ -205,13 +206,25 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				// Sample data so the scaffold actually shows something
 				// at V3.2.a. V3.2.b will source data from a live
 				// session attached to a real workbook.
+				//
+				// V3.3.0.5 (2026-05-22): seed sample data on THREE
+				// sheets (0, 1, 2) so the
+				// `quantlab.quantbookCellGridSwitchSheet` command has
+				// something to switch between.  Sheet 0 keeps the
+				// original V3.2.a sample; sheets 1 + 2 carry small
+				// distinct samples so the user sees that switching
+				// sheets actually changes the displayed values.
 				appendPutValueValidated(session, 0, 0, 0, 42);
 				appendPutValueValidated(session, 0, 0, 1, 100);
 				appendPutValueValidated(session, 0, 1, 0, 3.14);
 				appendPutValueValidated(session, 0, 1, 1, 2.718);
 				appendPutValueValidated(session, 0, 2, 0, 0);
+				appendPutValueValidated(session, 1, 0, 0, 11);
+				appendPutValueValidated(session, 1, 0, 1, 12);
+				appendPutValueValidated(session, 1, 1, 0, 13);
+				appendPutValueValidated(session, 2, 0, 0, 99);
 				CellGridPanel.show(context, session, 0);
-				log.appendLine('Cell Grid (sheet 0) opened with sample data.');
+				log.appendLine('Cell Grid (sheet 0) opened with sample data on sheets 0/1/2.');
 			} catch (err) {
 				const detail = err instanceof Error ? err.message : String(err);
 				log.appendLine(`FATAL cell-grid error: ${detail}`);
@@ -243,6 +256,62 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				const detail = err instanceof Error ? err.message : String(err);
 				log.appendLine(`FATAL cell-grid collab error: ${detail}`);
 				vscode.window.showErrorMessage(`Quantbook cell grid collab failed: ${detail}`);
+			}
+		}),
+	);
+
+	// Phase 5.7 V3.3.0.5 (2026-05-22) -- multi-sheet UX command.
+	// Pops a QuickPick of sheets currently present in a local
+	// CellGridPanel's session (per V3.3.0.1 decision D2 panel-per-
+	// sheet model); on selection, opens a new panel for that sheet.
+	// COLLAB panels are not eligible (V3.x scope; collab sessions
+	// have their own peerId/transport state + the per-sheet
+	// switching UX needs different design).  If no LOCAL panel is
+	// open or the session has only one sheet, surface an info
+	// message + return.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookCellGridSwitchSheet', async () => {
+			const panels = CellGridPanel.activeLocalPanels();
+			if (panels.length === 0) {
+				void vscode.window.showInformationMessage(
+					'No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.',
+				);
+				return;
+			}
+			// V3.3.0.5 multi-panel handling: with multiple local
+			// panels open, the switch operates on the FIRST one
+			// (presumed most-recently focused / least surprising).
+			// V3.x can add a panel-picker step if multi-panel use
+			// becomes common.
+			const target = panels[0];
+			const sheets = listSheets(target.session);
+			if (sheets.length === 0) {
+				void vscode.window.showInformationMessage(
+					'This session has no sheets yet.  Append a value first to create one.',
+				);
+				return;
+			}
+			if (sheets.length === 1) {
+				void vscode.window.showInformationMessage(
+					`Only sheet ${sheets[0]} has data in this session; nothing to switch to.`,
+				);
+				return;
+			}
+			const items = buildSheetQuickPickItems(sheets, target.sheet);
+			const selection = await vscode.window.showQuickPick(items, {
+				title: 'Switch Cell Grid Sheet',
+				placeHolder: `Currently on Sheet ${target.sheet} (${sheets.length} sheets total)`,
+			});
+			if (selection === undefined) {
+				return; // user cancelled
+			}
+			try {
+				CellGridPanel.show(context, target.session, selection.sheet);
+				getOutput().appendLine(`Switched Cell Grid view to sheet ${selection.sheet}.`);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				getOutput().appendLine(`FATAL switch-sheet error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook cell grid switch failed: ${detail}`);
 			}
 		}),
 	);

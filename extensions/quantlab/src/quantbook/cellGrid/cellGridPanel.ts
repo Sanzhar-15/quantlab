@@ -143,11 +143,24 @@ export class CellGridPanel {
 			existing.render();
 			return existing;
 		}
+		// V3.3.0.5 (2026-05-22): include sheet count in the title when
+		// the session has multiple sheets ("Sheet N of M" reads as
+		// "you're on sheet N, M total in this session").  Single-sheet
+		// sessions show just "Sheet N" (avoids "of 1" noise).
+		// Title is point-in-time; if the user later appends to a new
+		// sheet, this panel's title stays "of M" until the panel is
+		// re-rendered (V3.x can wire a dynamic title update if the
+		// stale display becomes a real ergonomic issue).
+		let titleSuffix = '';
+		try {
+			const totalSheets = session.listSheets().length;
+			titleSuffix = totalSheets > 1 ? ` of ${totalSheets}` : '';
+		} catch { /* best-effort: silent fall-through to no suffix */ }
 		const panel = vscode.window.createWebviewPanel(
 			VIEW_TYPE,
 			attachment !== undefined
-				? `Cell Grid -- Collab (sheet ${sheet})`
-				: `Cell Grid (sheet ${sheet})`,
+				? `Cell Grid -- Collab (Sheet ${sheet}${titleSuffix})`
+				: `Cell Grid (Sheet ${sheet}${titleSuffix})`,
 			vscode.ViewColumn.Active,
 			{
 				// V3.2.b.3: scripts ON for click-to-edit flow.  CSP +
@@ -228,6 +241,32 @@ export class CellGridPanel {
 			count += 1;
 		}
 		return count;
+	}
+
+	/**
+	 * V3.3.0.5 (2026-05-22) -- enumerate active LOCAL panels for the
+	 * switch-sheet command.
+	 *
+	 * Returns a snapshot of `{ session, sheet }` for every currently-
+	 * open LOCAL panel.  Collab panels are NOT included (per V3.2.d
+	 * HIGH-1 mode-split rationale: collab sessions have their own
+	 * peerId + transport state; switching sheets within a collab
+	 * session needs different UX considerations and is deferred to
+	 * V3.x).
+	 *
+	 * The returned array's `session` references are live -- mutations
+	 * on the session via the original panel are visible through these
+	 * references.  Callers should NOT cache the array across event
+	 * loop ticks (panels can dispose at any time).
+	 *
+	 * Empty array if no local panels are open.
+	 */
+	static activeLocalPanels(): Array<{ session: CollabSessionInstance; sheet: number }> {
+		const result: Array<{ session: CollabSessionInstance; sheet: number }> = [];
+		for (const instance of localPanels.values()) {
+			result.push({ session: instance.session, sheet: instance.sheet });
+		}
+		return result;
 	}
 
 	/**

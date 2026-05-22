@@ -294,3 +294,49 @@ export function buildVirtualRows<T>(
 	const clampedEnd = Math.max(clampedStart, Math.min(endIdx, len));
 	return entries.slice(clampedStart, clampedEnd);
 }
+
+// ============================================================================
+// Phase 5.7 V3.3.0.5 (2026-05-22) -- multi-sheet UX helpers
+// ============================================================================
+
+/**
+ * V3.3.0.5 -- shape of one row in the switch-sheet QuickPick.
+ *
+ * Stays vscode-agnostic: just `label` + `description` + `sheet` so
+ * mocha can pin the structure without pulling in `vscode.QuickPickItem`.
+ * The command site wraps these in real `vscode.QuickPickItem`s.
+ */
+export interface SheetQuickPickItem {
+	readonly label: string;
+	readonly description: string;
+	readonly sheet: number;
+}
+
+/**
+ * V3.3.0.5 -- build the QuickPick items for the switch-sheet command.
+ *
+ * Pure function over sheet IDs.  Mocha-testable without vscode.
+ *
+ * - The `description` field labels the CURRENT sheet so the user can
+ *   see which one they're switching FROM.  Other entries get empty
+ *   description (avoids visual noise).
+ * - Sheets are presented in the input order (caller is expected to
+ *   pass them sorted ascending; `listSheets` already returns sorted).
+ *
+ * @param sheets       sheet IDs to offer.  Caller-sorted (typically
+ *                     the result of `listSheets(session)`).
+ * @param currentSheet sheet ID of the panel from which the user
+ *                     invoked the switch command.  Annotated as
+ *                     "(current)" in its description.
+ * @returns one item per input sheet.  Empty if `sheets` is empty.
+ */
+export function buildSheetQuickPickItems(
+	sheets: ReadonlyArray<number>,
+	currentSheet: number,
+): SheetQuickPickItem[] {
+	return sheets.map(s => ({
+		label: `Sheet ${s}`,
+		description: s === currentSheet ? '(current)' : '',
+		sheet: s,
+	}));
+}
