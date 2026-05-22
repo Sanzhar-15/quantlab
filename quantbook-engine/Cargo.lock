@@ -2242,10 +2242,12 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
+ "parking_lot",
  "ql-collab",
  "ql-collab-ws",
  "ql-oplog",
  "ql-types",
+ "tokio",
 ]
 
 [[package]]

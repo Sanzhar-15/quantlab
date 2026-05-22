@@ -93,8 +93,11 @@
 #![deny(clippy::all)]
 #![allow(clippy::missing_safety_doc)] // napi-rs generated wrappers
 
+use std::sync::Arc;
+
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use parking_lot::Mutex;
 
 use ql_collab::AutoFlushPolicy as CoreAutoFlushPolicy;
 use ql_collab::CollabSession as CoreCollabSession;
@@ -217,11 +220,30 @@ fn peer_id_from_bigint(peer_id: &BigInt) -> Result<PeerId> {
     Ok(PeerId::new(peer_u64))
 }
 
-/// JS-facing wrapper for `ql_collab::CollabSession`. See module docs
-/// for V1 surface rationale + V2 deferred list.
+/// JS-facing wrapper for `ql_collab::CollabSession`.
+///
+/// **V2.4 refactor (2026-05-22)**: holds `Arc<Mutex<CoreCollabSession>>`
+/// instead of `CoreCollabSession` directly. Closes V2.3 audit Codex+Opus
+/// HIGH-1 (Rust UB via napi `&mut self` async re-entry) by:
+///   - All napi methods take `&self` (not `&mut self`). napi-rs's
+///     generated wrappers never produce two `&'static mut` to the same
+///     CollabSession; the Arc + Mutex absorbs the mutation.
+///   - Sync methods: `self.inner.lock()` acquires + holds the mutex
+///     within the method body. parking_lot's Mutex is uncontended-fast
+///     and never poisons.
+///   - Async methods: `Arc::clone(&self.inner)` + `tokio::task::spawn_blocking`.
+///     The clone-and-move pattern means the spawned task owns its own
+///     `Arc` reference; the blocking lock acquisition happens off the
+///     tokio runtime's worker pool (closes V2.3 HIGH-2 tokio starvation).
+///
+/// **Send + Sync (V2.4 update)**: the new shape is `Send + Sync` (was
+/// `Send + !Sync` in V1+V2.1+V2.2). Sync now holds because
+/// `Arc<Mutex<T>>: Sync` when `T: Send`, regardless of T: Sync. JS
+/// single-threadedness still holds in practice; the Send + Sync bound
+/// is a strict improvement (Rule 4 pin updated below).
 #[napi]
 pub struct CollabSession {
-    inner: CoreCollabSession,
+    inner: Arc<Mutex<CoreCollabSession>>,
 }
 
 #[napi]
@@ -236,7 +258,9 @@ impl CollabSession {
         let pid = peer_id_from_bigint(&peer_id)?;
         let session =
             CoreCollabSession::new(pid).map_err(|e| Error::from_reason(format!("{e}")))?;
-        Ok(Self { inner: session })
+        Ok(Self {
+            inner: Arc::new(Mutex::new(session)),
+        })
     }
 
     /// Reconstruct a session from a previously-exported snapshot.
@@ -246,7 +270,9 @@ impl CollabSession {
         let pid = peer_id_from_bigint(&peer_id)?;
         let session = CoreCollabSession::from_snapshot(pid, bytes.as_ref())
             .map_err(|e| Error::from_reason(format!("{e}")))?;
-        Ok(Self { inner: session })
+        Ok(Self {
+            inner: Arc::new(Mutex::new(session)),
+        })
     }
 
     /// V1 convenience: append a `PutValue` op with a number value.
@@ -288,7 +314,7 @@ impl CollabSession {
     /// but the engine-side validation is the load-bearing contract
     /// for direct callers.
     #[napi(js_name = "appendPutValue")]
-    pub fn append_put_value(&mut self, sheet: u16, row: f64, col: f64, value: f64) -> Result<()> {
+    pub fn append_put_value(&self, sheet: u16, row: f64, col: f64, value: f64) -> Result<()> {
         // Validate row + col: finite, non-negative, integer, in u32 range.
         let row_u32 = validate_u32_index("appendPutValue", "row", row)?;
         let col_u32 = validate_u32_index("appendPutValue", "col", col)?;
@@ -304,7 +330,8 @@ impl CollabSession {
             col: col_u32,
             value: CellWireValue::Number(value),
         };
-        self.inner
+        let mut inner = self.inner.lock();
+        inner
             .append_op(op)
             .map_err(|e| Error::from_reason(format!("{e}")))?;
         Ok(())
@@ -314,8 +341,8 @@ impl CollabSession {
     /// Mirrors `CollabSession::export_bytes`.
     #[napi(js_name = "exportBytes")]
     pub fn export_bytes(&self) -> Result<Uint8Array> {
-        let bytes = self
-            .inner
+        let inner = self.inner.lock();
+        let bytes = inner
             .export_bytes()
             .map_err(|e| Error::from_reason(format!("{e}")))?;
         Ok(Uint8Array::from(bytes))
@@ -355,9 +382,9 @@ impl CollabSession {
     /// "verify before claiming". V2 will switch to `BigInt` return
     /// type for unbounded sessions, matching `peerId()`'s precedent.
     #[napi(js_name = "mergeBytes")]
-    pub fn merge_bytes(&mut self, bytes: Uint8Array) -> Result<u32> {
-        let count = self
-            .inner
+    pub fn merge_bytes(&self, bytes: Uint8Array) -> Result<u32> {
+        let mut inner = self.inner.lock();
+        let count = inner
             .merge_bytes(bytes.as_ref())
             .map_err(|e| Error::from_reason(format!("{e}")))?;
         Ok(u32::try_from(count).unwrap_or(u32::MAX))
@@ -374,7 +401,8 @@ impl CollabSession {
     /// return; V2 will switch to BigInt.
     #[napi(js_name = "opCount")]
     pub fn op_count(&self) -> u32 {
-        u32::try_from(self.inner.op_count()).unwrap_or(u32::MAX)
+        let inner = self.inner.lock();
+        u32::try_from(inner.op_count()).unwrap_or(u32::MAX)
     }
 
     /// V2 V4 V1 step 2 helper: count of ops added since the last
@@ -392,20 +420,23 @@ impl CollabSession {
     /// switch to BigInt.
     #[napi(js_name = "pendingOpCount")]
     pub fn pending_op_count(&self) -> u32 {
-        u32::try_from(self.inner.pending_op_count()).unwrap_or(u32::MAX)
+        let inner = self.inner.lock();
+        u32::try_from(inner.pending_op_count()).unwrap_or(u32::MAX)
     }
 
     /// V2 V3 step 3 helper: `true` when the local op log has ops
     /// that haven't been flushed to the currently-attached transport.
     #[napi(js_name = "hasPendingFlush")]
     pub fn has_pending_flush(&self) -> bool {
-        self.inner.has_pending_flush()
+        let inner = self.inner.lock();
+        inner.has_pending_flush()
     }
 
     /// Peer ID of this session, as a `BigInt` (u64-domain).
     #[napi(js_name = "peerId")]
     pub fn peer_id(&self) -> BigInt {
-        BigInt::from(self.inner.peer_id().as_u64())
+        let inner = self.inner.lock();
+        BigInt::from(inner.peer_id().as_u64())
     }
 
     // ==========================================================
@@ -434,7 +465,7 @@ impl CollabSession {
     /// - `transport` has already been used (its `inner` is `None`) →
     ///   JS Error "Transport has already been consumed".
     #[napi(js_name = "attachTransport")]
-    pub fn attach_transport(&mut self, transport: &mut Transport) -> Result<()> {
+    pub fn attach_transport(&self, transport: &mut Transport) -> Result<()> {
         let boxed = transport.take_inner().ok_or_else(|| {
             // V2.1 audit closure (Codex LOW-1, 2026-05-22): error wording
             // standardized. A "spent LoopbackPair" throws at takeA/takeB
@@ -446,7 +477,8 @@ impl CollabSession {
         // attach_transport_boxed handles baseline-reset + replacement.
         // The Option<Box> it returns is the PRIOR transport; we drop
         // it here intentionally (see method docstring).
-        let _prior = self.inner.attach_transport_boxed(boxed);
+        let mut inner = self.inner.lock();
+        let _prior = inner.attach_transport_boxed(boxed);
         Ok(())
     }
 
@@ -463,14 +495,16 @@ impl CollabSession {
     /// NOT receive the prior transport — same rationale as
     /// `attachTransport`.
     #[napi(js_name = "detachTransport")]
-    pub fn detach_transport(&mut self) -> bool {
-        self.inner.detach_transport().is_some()
+    pub fn detach_transport(&self) -> bool {
+        let mut inner = self.inner.lock();
+        inner.detach_transport().is_some()
     }
 
     /// `true` iff a transport is currently attached.
     #[napi(js_name = "hasTransport")]
     pub fn has_transport(&self) -> bool {
-        self.inner.has_transport()
+        let inner = self.inner.lock();
+        inner.has_transport()
     }
 
     /// Full-snapshot flush to the attached transport. Sends the entire
@@ -485,8 +519,9 @@ impl CollabSession {
     /// - No transport attached → returns `Ok(false)` (NOT an error).
     /// - Transport's `send` returns `Err(TransportError::*)` → JS Error.
     #[napi(js_name = "flushToTransport")]
-    pub fn flush_to_transport(&mut self) -> Result<bool> {
-        self.inner
+    pub fn flush_to_transport(&self) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        inner
             .flush_to_transport()
             .map_err(|e| Error::from_reason(format!("{e}")))
     }
@@ -519,9 +554,9 @@ impl CollabSession {
     /// - Transport's `try_recv` returns `Err` → JS Error.
     /// - Merging the bytes returns Err → JS Error.
     #[napi(js_name = "pollRemote")]
-    pub fn poll_remote(&mut self) -> Result<u32> {
-        let blobs_drained = self
-            .inner
+    pub fn poll_remote(&self) -> Result<u32> {
+        let mut inner = self.inner.lock();
+        let blobs_drained = inner
             .poll_remote()
             .map_err(|e| Error::from_reason(format!("{e}")))?;
         Ok(u32::try_from(blobs_drained).unwrap_or(u32::MAX))
@@ -564,8 +599,9 @@ impl CollabSession {
     /// - No transport attached → returns `Ok(false)` (NOT an error).
     /// - Transport's `send` returns `Err(TransportError::*)` → JS Error.
     #[napi(js_name = "flushDeltaToTransport")]
-    pub fn flush_delta_to_transport(&mut self) -> Result<bool> {
-        self.inner
+    pub fn flush_delta_to_transport(&self) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        inner
             .flush_delta_to_transport()
             .map_err(|e| Error::from_reason(format!("{e}")))
     }
@@ -593,10 +629,10 @@ impl CollabSession {
     /// - `limit` not a finite non-negative integer in u32 range → JS Error.
     /// - Transport's `try_recv` returns `Err` → JS Error.
     #[napi(js_name = "pollRemoteWithLimit")]
-    pub fn poll_remote_with_limit(&mut self, limit: f64) -> Result<u32> {
+    pub fn poll_remote_with_limit(&self, limit: f64) -> Result<u32> {
         let limit_u32 = validate_u32_index("pollRemoteWithLimit", "limit", limit)?;
-        let blobs_drained = self
-            .inner
+        let mut inner = self.inner.lock();
+        let blobs_drained = inner
             .poll_remote_with_limit(limit_u32 as usize)
             .map_err(|e| Error::from_reason(format!("{e}")))?;
         Ok(u32::try_from(blobs_drained).unwrap_or(u32::MAX))
@@ -622,7 +658,8 @@ impl CollabSession {
     /// For V2.2 the string is the contract.
     #[napi(js_name = "transportLastError")]
     pub fn transport_last_error(&self) -> Option<String> {
-        self.inner.transport_last_error()
+        let inner = self.inner.lock();
+        inner.transport_last_error()
     }
 
     /// Set the auto-flush policy. Returns the prior policy.
@@ -670,9 +707,10 @@ impl CollabSession {
     /// retry-shape is machine-readable; until then, the IDE must
     /// substring-match `"transport"` in the error message.
     #[napi(js_name = "setAutoFlushPolicy")]
-    pub fn set_auto_flush_policy(&mut self, policy: String) -> Result<String> {
+    pub fn set_auto_flush_policy(&self, policy: String) -> Result<String> {
         let policy_enum = parse_auto_flush_policy(&policy)?;
-        let prior = self.inner.set_auto_flush_policy(policy_enum);
+        let mut inner = self.inner.lock();
+        let prior = inner.set_auto_flush_policy(policy_enum);
         // V2.2 audit closure (Opus HIGH-1): auto_flush_policy_to_string
         // now returns Result and throws on unknown variants. Propagate
         // the Result.
@@ -692,56 +730,78 @@ impl CollabSession {
     /// surfaces the skew loudly and forces a binding upgrade.
     #[napi(js_name = "autoFlushPolicy")]
     pub fn auto_flush_policy(&self) -> Result<String> {
-        auto_flush_policy_to_string(self.inner.auto_flush_policy())
+        let inner = self.inner.lock();
+        auto_flush_policy_to_string(inner.auto_flush_policy())
     }
 
     // ==========================================================
-    // Phase 5.7 V2.3 (2026-05-22) — async Transport surface
+    // Phase 5.7 V2.4 (2026-05-22) — async Transport surface, REINTRODUCED
     // ==========================================================
     //
-    // **V2.3 audit closure (Codex FAIL + Opus PASS-WITH-FINDINGS,
-    // 2026-05-22)**: `flushPendingToTransport` was shipped in this
-    // cycle's initial ship commit but REMOVED in the closure cycle
-    // after both auditors flagged two convergent HIGH findings:
+    // **V2.4 closure of V2.3 audit (2026-05-22)**: V2.3 shipped
+    // `flushPendingToTransport` as `pub async unsafe fn(&mut self)`,
+    // then REMOVED it in the V2.3 closure after Codex FAIL + Opus
+    // PASS-WITH-FINDINGS converged on 2 HIGH (Rust UB via napi
+    // `&mut self` async re-entry + tokio runtime starvation).
     //
-    // 1. **Rust UB hazard via &mut self async aliasing**. napi-rs's
-    //    `#[napi]` on an async fn with `&mut self` generates `let
-    //    this: &mut #parent = Box::leak(Box::from_raw(this_ptr));`
-    //    with NO runtime locking (verified per napi-derive-backend-
-    //    5.0.4 `codegen/fn.rs:285-291`). JS code can re-enter on the
-    //    same V8 thread while the future is pending:
+    // V2.4 reintroduces via **Option (a) from V2.3's closure plan**:
+    // engine refactor to `Arc<parking_lot::Mutex<CoreCollabSession>>`.
+    // This refactor (above) converted ALL CollabSession napi methods
+    // from `&mut self` to `&self` with internal `inner.lock()`. The
+    // napi-rs codegen now produces `&'static CollabSession` (immutable
+    // shared) instead of `&'static mut CollabSession` — no aliasing
+    // hazard at all, since multiple `&` to the same instance are
+    // sound by Rust's rules.
     //
-    //        const p = session.flushPendingToTransport();
-    //        session.appendPutValue(0, 0, 0, 1);   // 2nd &mut!
-    //        await p;
-    //
-    //    This produces two simultaneous `&'static mut CollabSession`
-    //    references to the same memory → undefined behavior. The
-    //    `Send + !Sync` argument (V1 megaudit Opus-A M1 closure)
-    //    only prevents cross-Worker sharing; it does NOT prevent
-    //    same-thread re-entry within a single Worker's event loop.
-    //
-    // 2. **Tokio runtime starvation**. The engine's
-    //    `flush_pending_to_transport` is sync (`Condvar::wait_timeout`).
-    //    Wrapping in `#[napi]` async runs the Condvar wait on a tokio
-    //    worker thread (per napi-rs 3.9.0 `tokio_runtime.rs`). With
-    //    N concurrent flushPending calls (N = num_cpus), the runtime's
-    //    worker pool is fully occupied — and `WebSocketTransport`'s
-    //    writer task (which Condvar is waiting ON) shares the same
-    //    runtime. Deadlock.
-    //
-    // **Closure**: remove the method. V2.4 ships flushPending properly
-    // via one of:
-    //   (a) engine refactor to `Arc<Mutex<CoreCollabSession>>` so the
-    //       async wrapper can take a cloneable handle into spawn_blocking,
-    //   (b) engine restructure of `flush_pending_to_transport` to take
-    //       a tokio Notify (truly async, no Condvar),
-    //   (c) binding-side serialization guard preventing all session
-    //       methods while an async op is pending.
-    //
-    // **V2.3 retained**: `Transport.websocketConnect` (static async
-    // factory — no &mut self, no Condvar; safe). See after the
-    // closing brace of impl CollabSession + into impl Transport.
+    // For the async method specifically:
+    //   - `&self` (not `&mut self`) → napi-rs no longer requires
+    //     `unsafe`, AND no aliasing UB possible.
+    //   - `Arc::clone(&self.inner)` → spawn_blocking → `lock()` inside
+    //     the blocking task. The Condvar wait runs on a dedicated
+    //     blocking thread (NOT a tokio worker), closing V2.3 HIGH-2.
+    //   - The `Arc + Mutex` composition is `Send + Sync` (Mutex<T>:
+    //     Send + Sync when T: Send), so the clone-and-move into
+    //     spawn_blocking is sound.
+
+    /// Async flush-pending — waits for the attached transport's writer
+    /// task to drain (level-1 local ack per V2 V4 V1 Tier K1 contract).
+    ///
+    /// Returns a JS `Promise<void>` that resolves when:
+    /// - the writer has completed `send` for every queued blob, OR
+    /// - the transport has been detached / dropped / errored.
+    ///
+    /// **V2.4 soundness** (closes V2.3 audit Codex+Opus HIGH-1+HIGH-2):
+    ///
+    /// - Takes `&self` (not `&mut self`). napi-rs codegen produces
+    ///   `&'static CollabSession` → multiple aliasing reads are sound
+    ///   by Rust's rules. No UB even under JS re-entry.
+    /// - `Arc::clone(&self.inner)` extracts a cloned reference to the
+    ///   inner `Arc<Mutex<CoreCollabSession>>`. The clone is moved into
+    ///   `tokio::task::spawn_blocking`, which runs on a dedicated
+    ///   blocking thread (NOT a tokio worker). The Condvar wait
+    ///   doesn't occupy the napi-rs runtime's worker pool — closes
+    ///   V2.3 HIGH-2 (runtime starvation).
+    /// - Inside the blocking task, `inner.lock()` acquires the mutex.
+    ///   If a concurrent JS call holds the lock (e.g., another
+    ///   mid-flight method), this call blocks until the lock is
+    ///   available. No deadlock because mutex order is consistent
+    ///   (all session methods acquire the SAME mutex).
+    ///
+    /// **Failure modes**:
+    /// - No transport attached → returns `Ok(())` (NOT a rejection).
+    /// - Transport error during the wait → JS Error.
+    /// - The `spawn_blocking` task panics → JS Error.
+    #[napi(js_name = "flushPendingToTransport")]
+    pub async fn flush_pending_to_transport(&self) -> Result<()> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock();
+            guard.flush_pending_to_transport()
+        })
+        .await
+        .map_err(|e| Error::from_reason(format!("flushPendingToTransport task: {e}")))?
+        .map_err(|e| Error::from_reason(format!("{e}")))
+    }
 }
 
 /// Phase 5.7 V2.2 (2026-05-22) — parse a JS string into
@@ -975,17 +1035,32 @@ impl LoopbackPair {
 // Send/Sync compile assertions (Rule 4 application)
 // =============================================================
 
-// **Phase 5.7 V1 megaudit closure (Opus-A MEDIUM-1, 2026-05-22):**
-// Rule 4 application — the module docstring claims this `CollabSession`
-// wrapper is `Send + !Sync`. Per audit-discipline Rule 4 (added 2026-05-21
-// after a wrong `!Sync` claim survived 3 audits + a megaudit), negative
-// trait claims need positive compile proof OR per-field walk.
+// **Phase 5.7 V2.4 (2026-05-22) — Send + Sync UPDATE.**
 //
-// POSITIVE PROOF: `Send` is asserted at compile time below. The function
-// only compiles if `CollabSession: Send`.
+// V1 + V2.1 + V2.2 + V2.3 claimed `Send + !Sync` (per V1 megaudit
+// Opus-A MEDIUM-1 closure). V2.4 changes the underlying shape from
+// `inner: CoreCollabSession` to `inner: Arc<Mutex<CoreCollabSession>>`
+// to close V2.3 audit's `&mut self` async aliasing UB hazard.
+//
+// **New Send + Sync result** (positive compile proof below):
+// - `CoreCollabSession: Send + !Sync` (engine's claim, unchanged).
+// - `Mutex<T>: Send + Sync` when `T: Send`. parking_lot's Mutex is
+//   `Send + Sync` (no poison; pure atomic-CAS path uncontended).
+// - `Arc<T>: Send + Sync` when `T: Send + Sync`.
+// - Therefore `CollabSession { inner: Arc<Mutex<CoreCollabSession>> }`
+//   is `Send + Sync`.
+//
+// This is a strict improvement over V1's `Send + !Sync`: V2.4 can
+// be shared across tokio tasks (load-bearing for V2.4's
+// `flushPendingToTransport` spawn_blocking pattern).
+//
+// Per audit-discipline Rule 4: positive Send + Sync proof below.
 const _ASSERT_BINDING_COLLAB_SESSION_SEND: fn() = || {
     fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
     assert_send::<CollabSession>();
+    // V2.4: CollabSession is now Sync (was !Sync pre-V2.4).
+    assert_sync::<CollabSession>();
 };
 
 // **Phase 5.7 V2.1 (2026-05-22) Rule 4 application for `Transport`**:

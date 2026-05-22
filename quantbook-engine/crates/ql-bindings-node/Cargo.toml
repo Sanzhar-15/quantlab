@@ -44,5 +44,19 @@ ql-collab-ws = { path = "../ql-collab-ws" }
 ql-oplog     = { path = "../ql-oplog" }
 ql-types     = { path = "../ql-types" }
 
+# **V2.4 (2026-05-22):** `parking_lot::Mutex` for the `Arc<Mutex<CoreCollabSession>>`
+# refactor that closes V2.3's `&mut self` async aliasing UB hazard. Faster
+# than `std::sync::Mutex` (no poison flag, no syscall on uncontended path).
+# Already in the dep graph transitively via Loro; declaring directly so
+# the binding crate doesn't break if Loro's transitive removes it.
+parking_lot = "=0.12.5"
+
+# **V2.4 (2026-05-22):** direct `tokio` dep for the `spawn_blocking`
+# pattern used by the V2.4 `flushPendingToTransport` async binding.
+# napi-rs's `async` feature pulls tokio transitively, but we use
+# `tokio::task::spawn_blocking` directly so a direct dep is cleaner
+# (matches CLAUDE.md's "explicit > implicit" pattern).
+tokio = { workspace = true }
+
 [build-dependencies]
 napi-build = { workspace = true }
