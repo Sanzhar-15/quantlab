@@ -65,6 +65,28 @@ export interface CollabSessionInstance {
 	exportSnapshot(sheet: number): string;
 
 	/**
+	 * **Phase 5.7 V3.3.0.2 (2026-05-22) -- enumerate distinct sheets
+	 * present in the local op log.**
+	 *
+	 * Returns a sorted ascending array of u16 sheet IDs that have at
+	 * least one `PutValue` op in the local op log.  Use the typed
+	 * wrapper {@link listSheets} from `./session` rather than calling
+	 * this method directly -- the wrapper returns `number[]` with
+	 * proper TS typing on the array contents.
+	 *
+	 * V3.3.0 design decision D3 (LOCKED): u16-only return.  Display
+	 * name + color + hidden flags wait for V3.4+'s `SheetMetadata` Op
+	 * variant + a separate `listSheetsMetadata()` accessor.
+	 *
+	 * @returns sorted ascending Vec<u16> of distinct sheets referenced
+	 *          by `PutValue` ops; empty array if no `PutValue` ops have
+	 *          been appended.
+	 * @throws Error with `parseQuantbookError(err).code === 'bad_argument'`
+	 *         if the op log iterator fails.
+	 */
+	listSheets(): number[];
+
+	/**
 	 * Merge a snapshot (or delta) from another peer. Returns the
 	 * session's `opCount` AFTER the merge (NOT the number of newly
 	 * merged ops -- duplicates are deduped by Loro but the return

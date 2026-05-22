@@ -49,6 +49,7 @@ import {
 	exportCellSnapshot,
 	isAutoFlushPolicy,
 	isQuantbookErrorCode,
+	listSheets,
 	loopbackTransportPair,
 	parseQuantbookError,
 	quantbookEngineVersion,
@@ -2715,5 +2716,71 @@ suite('quantbook V3.2.d HIGH-2 -- dispatcher rawInput type guard', function () {
 		assert.strictEqual(errorReplies[0].code, 'bad_argument',
 			`expected bad_argument (IDE validator rejection), got ${errorReplies[0].code}`);
 		assert.match(errorReplies[0].message, /row must be an integer/);
+	});
+});
+
+// ============================================================================
+// Phase 5.7 V3.3.0.2 -- listSheets() napi method + IDE typed wrapper
+// ============================================================================
+
+suite('quantbook V3.3.0.2 -- listSheets() enumeration', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('empty session returns empty array', () => {
+		const session = createSession(801n);
+		const sheets = listSheets(session);
+		assert.ok(Array.isArray(sheets), 'returns an array');
+		assert.strictEqual(sheets.length, 0, 'empty session has no sheets');
+	});
+
+	test('single sheet returns one-element array', () => {
+		const session = createSession(802n);
+		appendPutValueValidated(session, 0, 0, 0, 1);
+		appendPutValueValidated(session, 0, 0, 1, 2);
+		appendPutValueValidated(session, 0, 5, 10, 3);
+		const sheets = listSheets(session);
+		assert.deepStrictEqual(sheets, [0]);
+	});
+
+	test('multi-sheet returns sorted ascending dedup', () => {
+		const session = createSession(803n);
+		// Append in unsorted order to verify the engine sorts the
+		// result (not relying on append order).
+		appendPutValueValidated(session, 5, 0, 0, 1);
+		appendPutValueValidated(session, 2, 0, 0, 2);
+		appendPutValueValidated(session, 5, 1, 0, 3); // dup sheet=5
+		appendPutValueValidated(session, 0, 0, 0, 4);
+		appendPutValueValidated(session, 2, 1, 0, 5); // dup sheet=2
+		const sheets = listSheets(session);
+		assert.deepStrictEqual(sheets, [0, 2, 5],
+			'sheets are sorted ascending + deduplicated');
+	});
+
+	test('high-sheet-id boundary (u16 max region)', () => {
+		const session = createSession(804n);
+		appendPutValueValidated(session, 0xFFFF, 0, 0, 1);
+		appendPutValueValidated(session, 0, 0, 0, 2);
+		appendPutValueValidated(session, 0xFFFE, 0, 0, 3);
+		const sheets = listSheets(session);
+		assert.deepStrictEqual(sheets, [0, 0xFFFE, 0xFFFF]);
+	});
+
+	test('listSheets survives exportBytes/mergeBytes round-trip', () => {
+		// Pin that the engine reconstructs the sheet set correctly
+		// across snapshot import: peer that loads a snapshot sees
+		// the same sheets as the original peer.
+		const sessA = createSession(805n);
+		appendPutValueValidated(sessA, 0, 0, 0, 1);
+		appendPutValueValidated(sessA, 3, 0, 0, 2);
+		appendPutValueValidated(sessA, 7, 0, 0, 3);
+		const bytes = sessA.exportBytes();
+		const sessB = sessionFromSnapshot(806n, bytes);
+		const sheetsA = listSheets(sessA);
+		const sheetsB = listSheets(sessB);
+		assert.deepStrictEqual(sheetsB, sheetsA);
+		assert.deepStrictEqual(sheetsB, [0, 3, 7]);
 	});
 });

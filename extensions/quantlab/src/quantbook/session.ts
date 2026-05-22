@@ -152,6 +152,35 @@ export function exportCellSnapshot(
 	return parsed as QuantbookCellSnapshot;
 }
 
+/**
+ * **Phase 5.7 V3.3.0.2 (2026-05-22) -- typed wrapper for
+ * `CollabSession.listSheets`.**
+ *
+ * Enumerates distinct u16 sheets present in the local op log.  The
+ * underlying napi method returns `Vec<u16>` which surfaces as a
+ * `number[]` in JS; this wrapper exists as a single-line indirection
+ * so callers can hold a stable IDE-side API surface even if the
+ * engine method's signature changes (e.g., V3.4+ adds an optional
+ * filter param, or migrates to an incremental-cache-backed read).
+ *
+ * V3.3.0 design decision D3 (LOCKED): u16-only return.  V3.4+ will
+ * add a separate `listSheetsMetadata(): SheetMetadata[]` accessor
+ * once the engine ships a `SheetMetadata` Op variant.
+ *
+ * Returned array is **sorted ascending** by the engine + does not
+ * mutate across calls within the same op-log generation; callers can
+ * rely on stable iteration order.
+ *
+ * @param session A live {@link CollabSessionInstance}.
+ * @returns sorted ascending list of sheet IDs (0-based); empty array
+ *          if no `PutValue` ops have been appended yet.
+ * @throws Error with `parseQuantbookError(err).code === 'bad_argument'`
+ *         if the engine's op log iterator emits a decode error.
+ */
+export function listSheets(session: CollabSessionInstance): number[] {
+	return session.listSheets();
+}
+
 // =====================================================================
 // Phase 5.7 V2.1 (2026-05-22) -- Transport binding wrappers
 // =====================================================================
