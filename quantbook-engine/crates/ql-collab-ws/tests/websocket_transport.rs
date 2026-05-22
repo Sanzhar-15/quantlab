@@ -1193,11 +1193,25 @@ fn ack_handle_target_captured_at_call_not_at_wait() {
 }
 
 #[test]
-fn ack_handle_survives_transport_drop_returns_closed() {
+fn ack_handle_survives_transport_drop_terminates() {
     // V2.5 contract: after the underlying WebSocketTransport
-    // drops, the writer task is aborted (TaskExitGuard sets
-    // closed=true + notify_all). The handle's wait_for_drain
-    // observes closed and returns Err(Closed) within ~100ms.
+    // drops, the handle's wait_for_drain TERMINATES (does not
+    // hang). The exit can be either:
+    //   - `Ok(())` if the writer task drained all queued bytes
+    //     before Drop aborted it; OR
+    //   - `Err(Closed)` if Drop's notify_all + closed-flag-set
+    //     wakes a still-waiting handle.
+    //
+    // **V2.5 audit closure (Codex LOW-2, 2026-05-22)**: prior test
+    // name (`..._returns_closed`) overclaimed — the test accepts
+    // both Ok and Err. The test pins "no-hang" termination, NOT
+    // specifically Closed. Renamed for honesty.
+    //
+    // Mid-wait detach returning Closed within ~100ms IS the
+    // contract per `WebSocketTransport::Drop` (`crates/ql-collab-ws/src/lib.rs`
+    // sets closed before aborting tasks); pinning that specific
+    // path requires a test fixture that times Drop relative to the
+    // wait's entry, which is V2.6 backlog work.
     use ql_collab::Transport as _;
     let rt = multi_thread_runtime();
     rt.block_on(async {

@@ -317,12 +317,23 @@ pub trait Transport {
 /// `tokio::task::spawn_blocking` boundary and perform the wait
 /// without holding any outer lock guarding the transport.
 ///
-/// **Send + !Sync** is sufficient: the handle is moved into one
-/// blocking task and never shared. `Sync` is not required by any
-/// V2.5 caller — adding it would defensively allow handle-cloning
-/// patterns, but the current single-use pattern is preferable
-/// (matches `Box`-not-`Arc` ownership and avoids mistaken
-/// concurrent waits on the same captured target).
+/// **Send is required; Sync is not.** The trait requires only
+/// `Send` so a future implementor wrapping a `!Sync` field (e.g.,
+/// `Cell` for an internal cache) remains a valid `FlushAck`. The
+/// shipped implementors ([`crate::WebSocketProgressAckHandle`] +
+/// [`crate::BlockingAckHandle`] when the `test-fixtures` feature
+/// is enabled) happen to be `Send + Sync` because every field is
+/// Sync — pinned by positive compile-asserts at each impl site per
+/// Rule 4. **V2.5 audit closure (Opus MEDIUM-1, 2026-05-22)**:
+/// rewrote the prior `Send + !Sync` claim. Per-field walk of the
+/// shipped impls (`Arc<(Mutex<u64>, Condvar)> + Arc<AtomicBool> +
+/// u64` for `WebSocketProgressAckHandle`; `u64 + Arc<(Mutex<bool>,
+/// Condvar)> + Arc<(Mutex<bool>, Condvar)>` for
+/// `BlockingAckHandle`) shows both are `Sync`. The prior docstring
+/// asserted a negative trait property (`!Sync`) that was
+/// materially false — same Rule 4 anti-pattern as V2 V3 step 4's
+/// false `WebSocketTransport: !Sync` claim. Caller code MUST NOT
+/// rely on `!Sync` for safety; only on `Send`.
 pub trait FlushAck: Send {
     /// Wait until the drain target captured at handle creation is
     /// reached, OR the underlying transport is closed.
@@ -671,15 +682,20 @@ impl BlockingTransport {
             let deadline = Duration::from_millis(block_ms);
             // Single bounded wait; if not released by deadline we
             // exit normally (defensive timeout — Ok, not Err).
-            let (new_released, _timeout) = cv
+            // V2.5 audit closure (Opus LOW-4, 2026-05-22): the
+            // `_timeout` binding documents the "we don't care if it
+            // timed out vs released" semantic adequately; the prior
+            // `let _ = *released;` vestigial read was cruft. The
+            // `released` guard naturally drops at the closing brace
+            // of this else block, releasing the mutex.
+            let (_released, _timeout) = cv
                 .wait_timeout_while(released, deadline, |r| !*r)
                 .map_err(|e| {
                     TransportError::Io(format!("BlockingTransport release wait poisoned: {e}"))
                 })?;
-            released = new_released;
-            // (We don't care if it timed out vs released — both
-            // are acceptable wait-exit conditions for the fixture.)
-            let _ = *released;
+            // `_released` is bound explicitly (not `_`) so clippy
+            // doesn't fire `let_underscore_lock` — the guard lives
+            // for the rest of this scope and drops naturally.
         }
 
         Ok(())
@@ -736,14 +752,20 @@ impl FlushAck for BlockingAckHandle {
     }
 }
 
-// Rule 4 (audit-discipline): pin Send + (no Sync — handle is moved
-// once into spawn_blocking, never shared). If a future refactor
-// adds a non-Send field this stops compiling.
+// Rule 4 (audit-discipline): pin Send + Sync for both fixture
+// types. The handle is moved once into spawn_blocking (never
+// shared after the move), so `Send` is the load-bearing bound.
+// **V2.5 audit closure (Opus MEDIUM-1, 2026-05-22)**: per-field
+// walk shows both `BlockingTransport` and `BlockingAckHandle` are
+// `Send + Sync` (all fields are `Arc<...>` or `u64`, all Sync).
+// Pin both via positive assert per the V2 V4 V1 step 3 precedent
+// for `WebSocketTransport`. Closes the false `!Sync` claim in the
+// `FlushAck` trait docstring at the same time.
 #[cfg(feature = "test-fixtures")]
-const _ASSERT_BLOCKING_TRANSPORT_SEND: fn() = || {
-    fn assert_send<T: Send>() {}
-    assert_send::<BlockingTransport>();
-    assert_send::<BlockingAckHandle>();
+const _ASSERT_BLOCKING_TRANSPORT_SEND_SYNC: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<BlockingTransport>();
+    assert_send_sync::<BlockingAckHandle>();
 };
 
 #[cfg(test)]

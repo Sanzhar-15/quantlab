@@ -91,16 +91,31 @@
 //!   - `Arc<T>: Send + Sync` when `T: Send + Sync`.
 //!   - Therefore the V2.4 binding wrapper composition is `Send + Sync`.
 //!
-//! **V2.4 V8-block hazard (Opus V2.4 HIGH-1, NOT runtime-unsound)**:
-//! all napi methods on `CollabSession` acquire `self.inner.lock()`.
-//! While `flushPendingToTransport`'s spawn_blocking task holds the
-//! mutex during a Condvar wait (potentially seconds), JS sync method
-//! calls on the SAME session block the V8 event loop waiting for the
-//! lock. The IDE UI freezes for the wait duration. This is a UX
-//! hazard, not a soundness hazard. V2.5+ work plan documented at the
-//! `flushPendingToTransport` method below. The TS-side caller
-//! discipline today is: don't call other session methods while
-//! `flushPendingToTransport` is awaiting.
+//! **V2.5 (2026-05-22): V8-block hazard CLOSED** (Opus V2.4 HIGH-1).
+//!
+//! The V2.4 binding pattern held `self.inner.lock()` across the
+//! `spawn_blocking` Condvar wait — concurrent JS sync method calls
+//! blocked the V8 event loop on lock acquisition. V2.5 refactored
+//! `flushPendingToTransport` to extract a detached `FlushAck`
+//! handle (via `ql_collab::CollabSession::flush_pending_handle`)
+//! under a brief lock acquisition, drop the lock, then wait on the
+//! handle's Arc-cloned progress state inside `spawn_blocking`. The
+//! handle owns no reference to the session mutex; concurrent JS
+//! sync methods acquire the lock immediately while the wait runs.
+//!
+//! See `flushPendingToTransport`'s docstring below + the V2.5 audit
+//! transcripts at `docs/audits/2026-05-22-phase-5-7-v2-5-{codex,opus}.md`
+//! for the full closure rationale + post-implementation
+//! source-walked verification (V8-block VERIFIED CLOSED in both
+//! lanes via the `let inner = self.inner.lock(); … }` scope drop +
+//! Arc-only handle-handoff to `spawn_blocking`).
+//!
+//! V2.5 caller note: there is NO V8-block-related caller discipline
+//! required today. Concurrent session method calls during a pending
+//! `flushPendingToTransport` are sound + non-blocking. The V2.6
+//! contract test (`flushPendingToTransport does NOT block sync
+//! methods on the same session`) empirically pins this — opCount
+//! during a 1000ms-blocked flush returned in <50ms on local dev.
 
 #![deny(clippy::all)]
 #![allow(clippy::missing_safety_doc)] // napi-rs generated wrappers
@@ -1135,18 +1150,43 @@ pub struct BlockingTransportFixture {
 impl BlockingTransportFixture {
     /// JS: `new BlockingTransportFixture(blockMs: number)`.
     ///
-    /// `blockMs` is the upper-bound wait duration. `0` means
-    /// "wait indefinitely until released" (intended only for
-    /// tests with explicit `release()` calls; do not pass 0 in
-    /// scenarios where a hang would block the test runner).
+    /// `blockMs` is the upper-bound wait duration. Must be in the
+    /// range `[1, u32::MAX]` — a strictly positive finite integer.
+    ///
+    /// **V2.5 audit closure (Codex MEDIUM-1, 2026-05-22)**: `0` is
+    /// REJECTED at the napi boundary even though the engine's
+    /// `BlockingTransport` accepts `0` as "wait indefinitely" for
+    /// Rust unit tests. Rationale: this napi class ships in every
+    /// production cdylib (gated only by the `test-fixtures` Cargo
+    /// feature on `ql-collab`, enabled unconditionally by
+    /// `ql-bindings-node`). Allowing JS callers to construct an
+    /// indefinite-block fixture would let in-process IDE code park
+    /// `flushPendingToTransport` blocking-pool tasks until process
+    /// termination — bounded self-DoS but unnecessary footgun. The
+    /// engine `BlockingTransport::new(0, ..., ...)` constructor
+    /// remains for Rust tests that explicitly want the `0` path.
     ///
     /// `blockMs` is taken as `f64` (per the V1 megaudit Codex H1
     /// ToUint32-hygiene pattern) and validated via
     /// `validate_u32_index` to reject non-finite, negative,
-    /// fractional, or out-of-u32 values.
+    /// fractional, or out-of-u32 values; then additionally checked
+    /// `> 0` per the V2.5 closure above.
+    ///
+    /// V2 backlog (Opus V2.5 LOW-2): future production hardening
+    /// will gate this entire napi class behind a `ql-bindings-node`-side
+    /// feature, stripping it from production cdylib builds. The
+    /// `block_ms > 0` check here is a defense-in-depth complement.
     #[napi(constructor)]
     pub fn new(block_ms: f64) -> Result<Self> {
         let block_ms_u32 = validate_u32_index("BlockingTransportFixture", "blockMs", block_ms)?;
+        if block_ms_u32 == 0 {
+            return Err(Error::from_reason(
+                "BlockingTransportFixture: blockMs must be > 0 (strictly positive). \
+                 Zero would allow indefinite blocking from JS — V2.5 audit closure \
+                 (Codex MEDIUM-1) rejects this at the napi boundary."
+                    .to_string(),
+            ));
+        }
         let release =
             std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let blocked =

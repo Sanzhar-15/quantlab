@@ -840,13 +840,19 @@ const _ASSERT_WEBSOCKET_TRANSPORT_SEND: fn() = || {
     assert_send::<WebSocketTransport>();
 };
 
-// Phase 5.7 V2.5 (2026-05-22) — pin Send for the ack handle. It is
-// moved into spawn_blocking; `Send` is sufficient (no shared
-// references after the move). Rule 4 compile assert per
-// audit-discipline.
-const _ASSERT_WEBSOCKET_PROGRESS_ACK_HANDLE_SEND: fn() = || {
-    fn assert_send<T: Send>() {}
-    assert_send::<WebSocketProgressAckHandle>();
+// Phase 5.7 V2.5 (2026-05-22) — pin Send + Sync for the ack handle.
+// `Send` is the load-bearing bound (the handle is moved into
+// spawn_blocking). Sync is also true via per-field walk and is
+// added here per V2.5 audit closure (Opus MEDIUM-1, 2026-05-22):
+// the `FlushAck` trait docstring previously claimed `!Sync` which
+// the implementor contradicts. The positive Sync assert pins the
+// actual contract — `Arc<(Mutex<u64>, Condvar)>: Send + Sync`,
+// `Arc<AtomicBool>: Send + Sync`, `u64: Send + Sync` → composition
+// is `Send + Sync`. Mirrors the V2 V4 V1 step 3 precedent of
+// `static_assertions::assert_impl_all!(WebSocketTransport: Sync)`.
+const _ASSERT_WEBSOCKET_PROGRESS_ACK_HANDLE_SEND_SYNC: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<WebSocketProgressAckHandle>();
 };
 
 // **Phase 5.5 V2 V4 V1 step 3 (2026-05-21) — Tier J3.** Pin the

@@ -609,7 +609,7 @@ Extend `quantlab.quantbookDemo` command to spawn a second VS Code window via the
 
 Phase-level closure pattern. Sweep V2.1+V2.2+V2.3+V2.4+V2.5+V2.6 for cumulative findings invisible at per-step.
 
-### V2 backlog (carryforward from V1 + V2.1 + V2.2 + V2.3 + V2.4)
+### V2 backlog (carryforward from V1 + V2.1 + V2.2 + V2.3 + V2.4 + V2.5)
 
 - Structured `Error.code` discrimination via napi `Error::with_code` + `TransportError::kind()` accessor. V2.4 deferred again; pressing for V2.7 multi-window UX.
 - `#[napi(strict)]` sweep for type-confusion safety (Opus V2.1 LOW-1).
@@ -621,6 +621,8 @@ Phase-level closure pattern. Sweep V2.1+V2.2+V2.3+V2.4+V2.5+V2.6 for cumulative 
 - RwLock for pure-read methods if profiling shows contention (Opus V2.4 M7).
 - Document parking_lot's no-poison + CoreCollabSession panic safety (Opus V2.4 M5).
 - Document spawn_blocking pool budget interaction with WebSocketTransport reader/writer tasks (Opus V2.4 M4).
+- **Gate `BlockingTransportFixture` napi class behind a `ql-bindings-node`-side feature** (V2.5 Codex M1 + Opus L2 convergent). Today the engine-side `test-fixtures` feature gates the underlying `BlockingTransport` + `BlockingAckHandle`, but the binding crate enables it unconditionally so the napi wrapper ships in every cdylib. V2.5 closure rejected `blockMs == 0` at the napi boundary as defense-in-depth, but the fixture's mere presence is still a per-session bounded DoS surface. Future production-cdylib hardening: feature-gate the entire `BlockingTransportFixture` napi class + update CI to build with `--features test-fixtures` for mocha, plain build for production.
+- **Rename test for honesty** (V2.5 Codex L2 / Opus L2): `ack_handle_survives_transport_drop_terminates` (renamed from `..._returns_closed` in V2.5 closure) accepts both Ok and Err; if precision is needed, build a fixture that times Drop relative to wait entry (probably belongs in the new V2.6-era `BlockingTransport` family of fixtures).
 
 ## Acceptance criteria for V2 SHIP this session — MET
 
