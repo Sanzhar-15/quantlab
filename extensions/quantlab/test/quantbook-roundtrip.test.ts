@@ -46,6 +46,7 @@ import {
 import {
 	appendPutValueValidated,
 	createSession,
+	exportCellSnapshot,
 	isAutoFlushPolicy,
 	isQuantbookErrorCode,
 	loopbackTransportPair,
@@ -55,6 +56,7 @@ import {
 } from '../src/quantbook/session';
 import type {
 	BlockingTransportFixtureConstructor,
+	QuantbookCellSnapshot,
 	QuantbookNativeModule,
 } from '../src/quantbook/types';
 
@@ -2107,5 +2109,93 @@ suite('quantbook V3.1 multi-window relay round-trip', function () {
 				relay.child.kill();
 			}
 		}
+	});
+});
+
+// ============================================================================
+// Phase 5.7 V3.2.a -- cell-snapshot export for the IDE grid widget
+// ============================================================================
+
+suite('quantbook V3.2.a -- exportSnapshot cell-snapshot export', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) {
+			this.skip();
+		}
+	});
+
+	test('V3.2.a: empty session yields empty entries', () => {
+		const sess = createSession(301n);
+		const snap = exportCellSnapshot(sess, 0);
+		assert.strictEqual(snap.snapshot_format_version, 1);
+		assert.strictEqual(snap.sheet, 0);
+		assert.deepStrictEqual(snap.entries, []);
+	});
+
+	test('V3.2.a: entries sorted by (row, col); last-write-wins per cell', () => {
+		const sess = createSession(302n);
+		appendPutValueValidated(sess, 0, 1, 1, 1.0);
+		appendPutValueValidated(sess, 0, 0, 0, 0.5);
+		appendPutValueValidated(sess, 0, 0, 5, 5.5);
+		appendPutValueValidated(sess, 0, 1, 1, 2.0); // overwrite (1,1)
+		const snap = exportCellSnapshot(sess, 0);
+		assert.strictEqual(snap.entries.length, 3);
+		// Sorted by (row, col): (0,0) < (0,5) < (1,1).
+		assert.deepStrictEqual(
+			snap.entries[0],
+			{ row: 0, col: 0, value: { kind: 'number', value: 0.5 } },
+		);
+		assert.deepStrictEqual(
+			snap.entries[1],
+			{ row: 0, col: 5, value: { kind: 'number', value: 5.5 } },
+		);
+		assert.deepStrictEqual(
+			snap.entries[2],
+			{ row: 1, col: 1, value: { kind: 'number', value: 2.0 } },
+		);
+	});
+
+	test('V3.2.a: filters by sheet (entries from other sheets excluded)', () => {
+		const sess = createSession(303n);
+		appendPutValueValidated(sess, 0, 0, 0, 1.0);
+		appendPutValueValidated(sess, 1, 0, 0, 2.0);
+		appendPutValueValidated(sess, 0, 0, 1, 3.0);
+		const snap0 = exportCellSnapshot(sess, 0);
+		const snap1 = exportCellSnapshot(sess, 1);
+		assert.strictEqual(snap0.entries.length, 2);
+		assert.strictEqual(snap0.sheet, 0);
+		assert.strictEqual(snap1.entries.length, 1);
+		assert.strictEqual(snap1.sheet, 1);
+		const snap1Value = snap1.entries[0].value;
+		assert.strictEqual(snap1Value.kind, 'number');
+		if (snap1Value.kind === 'number') {
+			assert.strictEqual(snap1Value.value, 2.0);
+		}
+	});
+
+	test('V3.2.a: snapshot survives round-trip via exportBytes/fromSnapshot', () => {
+		// Pin that exportSnapshot routes through the engine's local
+		// op log, which is preserved across export/import. Sessions
+		// reconstructed via fromSnapshot must report the same
+		// snapshot (after replaying the op log on the receiving end).
+		const sessA = createSession(304n);
+		appendPutValueValidated(sessA, 0, 0, 0, 1.0);
+		appendPutValueValidated(sessA, 0, 0, 1, 2.0);
+		const bytes = sessA.exportBytes();
+		const sessB = sessionFromSnapshot(305n, bytes);
+		const snapA = exportCellSnapshot(sessA, 0);
+		const snapB = exportCellSnapshot(sessB, 0);
+		assert.deepStrictEqual(snapA.entries, snapB.entries);
+	});
+
+	test('V3.2.a: snapshot return type is JSON-decoded shape', () => {
+		// Defensive guard against the helper accidentally returning
+		// the raw JSON string instead of the parsed object.
+		const sess = createSession(306n);
+		const snap: QuantbookCellSnapshot = exportCellSnapshot(sess, 0);
+		assert.strictEqual(typeof snap, 'object');
+		assert.ok(snap !== null);
+		assert.strictEqual(typeof snap.snapshot_format_version, 'number');
+		assert.ok(Array.isArray(snap.entries));
 	});
 });

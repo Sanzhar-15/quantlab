@@ -29,6 +29,7 @@ import type {
 	AutoFlushPolicy,
 	CollabSessionInstance,
 	LoopbackPairInstance,
+	QuantbookCellSnapshot,
 	QuantbookErrorCode,
 	QuantbookErrorInfo,
 	TransportInstance,
@@ -106,6 +107,41 @@ export function sessionFromSnapshot(peerId: bigint, bytes: Uint8Array): CollabSe
  */
 export function quantbookEngineVersion(): string {
 	return loadQuantbookEngine().version();
+}
+
+/**
+ * **Phase 5.7 V3.2.a (2026-05-22) -- typed wrapper for
+ * `CollabSession.exportSnapshot`.**
+ *
+ * Parses the engine's JSON return value into the
+ * {@link QuantbookCellSnapshot} shape. Validates the
+ * `snapshot_format_version` field; throws a `bad_argument`-coded
+ * error if the engine emits a future format the IDE binding
+ * doesn't recognize (binding-drift signal).
+ *
+ * @param session A live {@link CollabSessionInstance}.
+ * @param sheet   u16 sheet ID (0-based). The engine validates the
+ *                range; an out-of-range value throws.
+ * @returns the decoded snapshot.
+ * @throws Error if the engine throws (passed through unchanged so
+ *               `parseQuantbookError` can route on `code`) OR if
+ *               the snapshot's `snapshot_format_version` is not 1.
+ */
+export function exportCellSnapshot(
+	session: CollabSessionInstance,
+	sheet: number,
+): QuantbookCellSnapshot {
+	const raw = session.exportSnapshot(sheet);
+	const parsed = JSON.parse(raw) as { snapshot_format_version?: number };
+	if (parsed.snapshot_format_version !== 1) {
+		throw new Error(
+			`[bad_argument] exportCellSnapshot: unrecognized snapshot_format_version ` +
+			`${parsed.snapshot_format_version} (IDE binding supports v1 only). ` +
+			`Engine + IDE binding may be out of sync -- rebuild the engine cdylib ` +
+			`and the IDE extension together.`,
+		);
+	}
+	return parsed as QuantbookCellSnapshot;
 }
 
 // =====================================================================

@@ -43,6 +43,28 @@ export interface CollabSessionInstance {
 	exportBytes(): Uint8Array;
 
 	/**
+	 * **Phase 5.7 V3.2.a (2026-05-22) -- cell-snapshot export for the
+	 * IDE grid widget.**
+	 *
+	 * Returns a JSON-serialized snapshot of the latest `PutValue` per
+	 * `(row, col)` on the requested sheet. Use `exportCellSnapshot()`
+	 * from `./session` to parse the return value into the typed
+	 * {@link QuantbookCellSnapshot} shape.
+	 *
+	 * V3.2.a scope: PutValue ops only (the only Op variant V1 binding
+	 * exposes). V3.2.b+ may upgrade to route through
+	 * `rebuild_workbook` when the full Op enum lands.
+	 *
+	 * Entries are sorted by `(row, col)` for deterministic output.
+	 *
+	 * @param sheet u16 sheet ID (0-based).
+	 * @returns JSON string conforming to {@link QuantbookCellSnapshot}.
+	 * @throws Error with `parseQuantbookError(err).code === 'bad_argument'`
+	 *         if the op log iterator or JSON serializer fails.
+	 */
+	exportSnapshot(sheet: number): string;
+
+	/**
 	 * Merge a snapshot (or delta) from another peer. Returns the
 	 * session's `opCount` AFTER the merge (NOT the number of newly
 	 * merged ops -- duplicates are deduped by Loro but the return
@@ -279,6 +301,54 @@ export interface CollabSessionInstance {
 	 * @throws Error -- see the rejection contract above.
 	 */
 	flushPendingToTransport(): Promise<void>;
+}
+
+// ============================================================================
+// Phase 5.7 V3.2.a (2026-05-22) -- cell-snapshot types for IDE grid widget
+// ============================================================================
+
+/**
+ * Tagged-union mirror of the engine's `ql_oplog::CellWireValue`.
+ *
+ * Used inside {@link QuantbookCellSnapshot.entries[].value}. The
+ * `kind` discriminator + `value` payload pattern matches the engine's
+ * `serde_json` serialization at
+ * `crates/ql-bindings-node/src/lib.rs::CollabSession::export_snapshot`.
+ *
+ * **Pending**: cell has a formula but no evaluated value yet
+ * (recompute pending). V3.2.a binding does not emit formulas (V1
+ * binding's only Op variant is `PutValue`), so `pending` is
+ * structurally defined but not currently produced; V3.2.b+ will
+ * surface it once formula support is added.
+ */
+export type QuantbookCellValue =
+	| { kind: 'number'; value: number }
+	| { kind: 'boolean'; value: boolean }
+	| { kind: 'text'; value: string }
+	| { kind: 'error'; value: string }
+	| { kind: 'pending' };
+
+/**
+ * Decoded shape of `CollabSession.exportSnapshot(sheet)` (V3.2.a).
+ *
+ * Use {@link exportCellSnapshot} in `./session` rather than parsing
+ * by hand -- the helper handles JSON parsing + type narrowing.
+ *
+ * **snapshot_format_version = 1**: the engine pins this; future
+ * changes must bump the version and the IDE must check it. Treat
+ * any non-1 version as a binding-drift error.
+ *
+ * Entries are sorted by `(row, col)` ascending; virtualized grid
+ * renderers can rely on this ordering for stable row-based slicing.
+ */
+export interface QuantbookCellSnapshot {
+	readonly snapshot_format_version: 1;
+	readonly sheet: number;
+	readonly entries: ReadonlyArray<{
+		readonly row: number;
+		readonly col: number;
+		readonly value: QuantbookCellValue;
+	}>;
 }
 
 // ============================================================================
