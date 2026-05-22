@@ -32,32 +32,37 @@ V1 was `CollabSession` only — no peers could talk to each other from the IDE s
 5. **Multi-window topology**: same-machine two-window via WebSocket localhost. Deferred to V2.3+ (next session).
 6. **Engine assertion sweep (Rule 4)**: each newly-bound method MUST be checked for FFI-reachable `assert_*!` / `panic!` / `unwrap` / `expect`. Per-step audits enforce this.
 
-## V2.1 — Loopback foundations + core attach/flush/poll (Cycle 1, ~half-day)
+## V2.1 — Loopback foundations + core attach/flush/poll (Cycle 1) ✅ SHIPPED 2026-05-22
+
+**Engine commit**: `c4e7b471142` Phase 5.7 V2.1 engine — Transport binding foundations
+**IDE commit**: `1f142366839` feat(quantbook): Phase 5.7 V2.1 — Transport binding wrappers
+**Tests**: engine 4461 / 0 (gate run); ql-collab lib 66 / 0; ql-bindings-node 3 / 0; IDE mocha 40 / 40 (was 26 at V1 megaudit closure)
 
 **Engine work**:
 
-- [ ] **`ql-collab` Rust**: add `CollabSession::attach_transport_boxed(&mut self, Box<dyn Transport + Send>) -> Option<Box<dyn Transport + Send>>` sibling to the generic `attach_transport<T>`. Same semantics, takes a boxed trait object instead. Rust-side test verifying equivalence.
-- [ ] **`ql-bindings-node`**: add napi `Transport` opaque class wrapping `Option<Box<dyn CoreTransport + Send>>`.
-  - Static factory `Transport.loopbackPair() -> [Transport, Transport]` (returns a 2-element JS array)
-  - Internal method `take_inner()` (Rust-only, not napi) for extraction during attach.
-- [ ] **`ql-bindings-node`**: extend `CollabSession` napi class with:
-  - `attachTransport(transport: Transport): void` — moves Box out of the Transport wrapper, calls `attach_transport_boxed`. Subsequent calls on the same wrapper error.
-  - `detachTransport(): boolean` — drops the returned `Option<Box<dyn Transport>>` Rust-side (no JS round-trip for the box). Returns true if a transport was attached.
-  - `hasTransport(): boolean`
-  - `flushToTransport(): boolean` — sync; returns `true` if bytes were sent.
-  - `pollRemote(): u32` — sync; returns merged-op count clamped to u32::MAX.
+- [x] **`ql-collab` Rust**: added `CollabSession::attach_transport_boxed(&mut self, Box<dyn Transport + Send>)` sibling — closes V1 megaudit Opus-B HIGH-2. Generic `attach_transport<T>` delegates to it. 2 new Rust unit tests pin equivalence + VV-reset.
+- [x] **`ql-bindings-node`**: new napi `Transport` opaque class (Send compile-assert added per Rule 4). `take_inner()` Rust-only extractor.
+- [x] **`ql-bindings-node`**: new `LoopbackPair` napi class with `takeA` / `takeB` single-use semantics + `impl Default`. Replaces the ambitious `Transport.loopbackPair()` plan that failed the `ObjectFinalize` factory constraint — see ship-commit message rationale.
+- [x] **`ql-bindings-node`**: 5 new `CollabSession` napi methods (`attachTransport`, `detachTransport`, `hasTransport`, `flushToTransport`, `pollRemote`). All sync, error-mapped via `format!("{e}")` to JS Error.
 
 **IDE work**:
 
-- [ ] Extend `types.ts` with napi Transport class shape + new CollabSession methods.
-- [ ] Extend `session.ts` with `loopbackTransportPair()` helper + transport-aware wrappers.
-- [ ] Add 8-10 mocha tests covering two-peer Loopback round-trip via `flushToTransport` / `pollRemote`.
+- [x] Extended `types.ts` with `TransportInstance`, `LoopbackPairInstance`, `LoopbackPairConstructor` interfaces + 5 new CollabSession methods.
+- [x] Extended `session.ts` with `loopbackTransportPair()` + `createLoopbackPair()` helpers.
+- [x] Added 14 mocha tests (target was 8-10 — exceeded). Coverage includes happy-path, consumption errors, no-transport branches, three-mutation chain, bidirectional sync, baseline reset, cross-session consumption, mid-flight detach.
 
 **Audit obligations**:
 
-- [ ] Rust unit tests for `attach_transport_boxed` (equivalence + transport replacement).
-- [ ] Engine-side: sweep `attach_transport_boxed` + each new napi method for FFI-reachable panics.
-- [ ] Parallel Codex + Opus audit before closure.
+- [x] Rust unit tests for `attach_transport_boxed` (equivalence + VV reset).
+- [x] Engine-side panic sweep applied (taking f64 row/col in V1 closure mitigated direct-call ToUint32; V2.1 transport methods take no untrusted JS-number params).
+- [x] Parallel Codex + Opus audits dispatched (Codex at `.codex-phase-5-7-v2-1-audit.out`; Opus to `docs/audits/2026-05-22-phase-5-7-v2-1-opus.md`).
+
+**Findings emerged during V2.1 work**:
+
+- **pollRemote returns BLOB count, NOT op count** — engine docstring clear; the V2 binding inherits this semantic. Test discovered this by asserting >=3 (got 1). Documented in types.ts + ship commit + an explicit test that pins the contract. V2 may add `pollRemoteOps()` companion later if a use case materializes.
+- **napi-rs `#[napi(factory, ...)]` requires single-Self return** — `Vec<Transport>` doesn't satisfy `ObjectFinalize`. Discovered during initial build. Closure: intermediate `LoopbackPair` class with single-use takers (also cleaner UX for the rare "delayed take" case).
+- **`cargo test` cannot link napi symbols** — Rust unit tests in `ql-bindings-node` must use `CoreCollabSession` directly, NOT the napi wrappers. Already-applied V1 pattern; reaffirmed in V2.1.
+- **`clippy::new_without_default`** fires on `LoopbackPair::new()`. Closure: `impl Default` added.
 
 ## V2.2 — Full sync transport surface (Cycle 2, ~half-day)
 

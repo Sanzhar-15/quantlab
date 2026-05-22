@@ -429,9 +429,12 @@ impl CollabSession {
     #[napi(js_name = "attachTransport")]
     pub fn attach_transport(&mut self, transport: &mut Transport) -> Result<()> {
         let boxed = transport.take_inner().ok_or_else(|| {
-            Error::from_reason(
-                "Transport has already been consumed (passed to attachTransport, or obtained from a spent LoopbackPair)".to_string(),
-            )
+            // V2.1 audit closure (Codex LOW-1, 2026-05-22): error wording
+            // standardized. A "spent LoopbackPair" throws at takeA/takeB
+            // BEFORE producing a Transport — so a consumed Transport
+            // wrapper must have come from attachTransport (or a future
+            // consumer added in V2.3+).
+            Error::from_reason("Transport has already been consumed by attachTransport".to_string())
         })?;
         // attach_transport_boxed handles baseline-reset + replacement.
         // The Option<Box> it returns is the PRIOR transport; we drop
@@ -481,17 +484,28 @@ impl CollabSession {
             .map_err(|e| Error::from_reason(format!("{e}")))
     }
 
-    /// Drain inbound bytes from the attached transport (single-pass).
-    /// Returns the number of ops merged (clamped to `u32::MAX`).
+    /// Drain inbound BLOBS from the attached transport (single-pass).
+    /// Returns the number of BLOBS drained (NOT the number of ops),
+    /// capped by the engine's default poll limit (`DEFAULT_POLL_REMOTE_LIMIT
+    /// = 64`). Each blob is one snapshot/delta that may contain many ops;
+    /// to count ops, compare `opCount()` before vs after.
     ///
-    /// V2.1 ships the un-limited variant. `pollRemoteWithLimit` lands
-    /// in V2.2 (next cycle).
+    /// **V2.1 audit closure (Codex MEDIUM-1, 2026-05-22)**: the prior
+    /// docstring claimed "number of ops merged" which was wrong — the
+    /// engine's `poll_remote_with_limit` returns blob count (`merged <=
+    /// max_blobs` per its own doc). Mocha test "three-mutation chain
+    /// across LoopbackPair" found this empirically (asserting `>= 3`
+    /// failed against the actual blob-count semantics). The variable
+    /// names + JSDoc here now use "blobs" consistently.
+    ///
+    /// V2.1 ships the un-limited variant (engine default cap = 64).
+    /// `pollRemoteWithLimit(limit)` lands in V2.2.
     ///
     /// **Auto-flush integration (V2 V3 step 2)**: when AutoFlushPolicy
-    /// is `OnAppend` and `merged > 0`, the underlying call also fires
-    /// one delta flush back through the transport (idempotency guard
-    /// prevents echo loops). V2.1 doesn't bind AutoFlushPolicy yet —
-    /// V2.2 does.
+    /// is `OnAppend` and `blobs_drained > 0`, the underlying call also
+    /// fires one delta flush back through the transport (idempotency
+    /// guard prevents echo loops). V2.1 doesn't bind AutoFlushPolicy yet
+    /// — V2.2 does.
     ///
     /// **Failure modes**:
     /// - No transport attached → returns `Ok(0)` (NOT an error).
@@ -499,11 +513,11 @@ impl CollabSession {
     /// - Merging the bytes returns Err → JS Error.
     #[napi(js_name = "pollRemote")]
     pub fn poll_remote(&mut self) -> Result<u32> {
-        let merged = self
+        let blobs_drained = self
             .inner
             .poll_remote()
             .map_err(|e| Error::from_reason(format!("{e}")))?;
-        Ok(u32::try_from(merged).unwrap_or(u32::MAX))
+        Ok(u32::try_from(blobs_drained).unwrap_or(u32::MAX))
     }
 }
 
@@ -527,7 +541,7 @@ impl CollabSession {
 /// **Single-use semantics**: an instance owns its boxed trait object.
 /// `CollabSession.attachTransport` MOVES the box out of this wrapper,
 /// leaving it consumed. Subsequent attach calls with the same wrapper
-/// return a JS Error ("Transport has already been consumed or detached").
+/// return a JS Error ("Transport has already been consumed by attachTransport").
 /// This mirrors Rust ownership semantics within the constraint that JS
 /// doesn't have a move primitive.
 ///
@@ -557,11 +571,20 @@ impl Transport {
 }
 
 impl Transport {
-    /// **Rust-only** (no `#[napi]`): move the inner Box out for attach.
-    /// Called by `CollabSession::attach_transport` (the napi method, not
-    /// the Rust generic). After this returns `Some`, the wrapper is
-    /// consumed; subsequent `is_attachable` returns `false` and the
-    /// inner box has been handed off.
+    /// **`pub(crate)` — only the napi `CollabSession::attach_transport`
+    /// method should call this.** Move the inner Box out for attach.
+    /// Called by the napi method, NOT the Rust generic
+    /// `ql_collab::CollabSession::attach_transport`. After this returns
+    /// `Some`, the wrapper is consumed; subsequent `is_attachable`
+    /// returns `false` and the inner box has been handed off.
+    ///
+    /// **V2.1 audit closure (Opus LOW-4, 2026-05-22)**: the prior
+    /// docstring said "Rust-only" which could be misread as private to
+    /// this `impl` block. `pub(crate)` IS the visibility — but calling
+    /// from any site other than `CollabSession::attach_transport`
+    /// silently consumes the wrapper without an `attach`-paired side
+    /// effect. Future contributors: do NOT call this from anywhere
+    /// else.
     pub(crate) fn take_inner(&mut self) -> Option<Box<dyn CoreTransport + Send>> {
         self.inner.take()
     }
@@ -667,6 +690,21 @@ const _ASSERT_BINDING_COLLAB_SESSION_SEND: fn() = || {
 const _ASSERT_BINDING_TRANSPORT_SEND: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<Transport>();
+};
+
+// **V2.1 audit closure (Opus MEDIUM-2, 2026-05-22)** — quality gap close
+// for `LoopbackPair`. Wrapper holds `a: Option<LoopbackTransport>, b:
+// Option<LoopbackTransport>`. The engine pins
+// `_ASSERT_LOOPBACK_TRANSPORT_SEND_SYNC` in `ql-collab/src/transport.rs`,
+// so by composition `LoopbackPair: Send`. Pin it here so a future
+// refactor making LoopbackTransport `!Send` would fail this build (the
+// napi class hands wrapped instances across the JS/Rust boundary on the
+// same thread, so `Send` isn't strictly required for V2.1 — but losing
+// it would break the V2.3+ Transport.websocketConnect async pattern
+// which DOES require Send to move across the tokio runtime).
+const _ASSERT_BINDING_LOOPBACK_PAIR_SEND: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<LoopbackPair>();
 };
 
 // `!Sync` follows by composition: `CollabSession { inner: CoreCollabSession }`,
