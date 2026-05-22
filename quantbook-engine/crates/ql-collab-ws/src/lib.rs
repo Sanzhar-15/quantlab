@@ -238,6 +238,27 @@ pub enum WebSocketError {
     RuntimeError(String),
 }
 
+impl WebSocketError {
+    /// **Phase 5.7 V2.7 (2026-05-22) — error-code discrimination.**
+    ///
+    /// Returns a stable `&'static str` identifier for this variant.
+    /// Mirrors [`ql_collab::TransportError::kind`]'s contract;
+    /// closes V2.3 Opus MEDIUM-3 (lossy `Display` projection of
+    /// `WebSocketError` variants on the napi `Transport.websocketConnect`
+    /// rejection path).
+    ///
+    /// **Stability**: kinds are SemVer-stable. IDE reconnect logic
+    /// can branch on these strings after `parseQuantbookError`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            WebSocketError::InvalidUrl(_) => "websocket_invalid_url",
+            WebSocketError::ConnectFailed(_) => "websocket_connect_failed",
+            WebSocketError::HandshakeFailed(_) => "websocket_handshake_failed",
+            WebSocketError::RuntimeError(_) => "websocket_runtime_error",
+        }
+    }
+}
+
 /// Phase 5.5 V2 V3 step 4 — WebSocket `Transport` impl.
 ///
 /// Bridges async tokio-tungstenite to the sync `Transport` trait via
@@ -917,5 +938,29 @@ mod tests {
         // Display impl for the new variant so its surface is stable.
         let e = WebSocketError::RuntimeError("peer reset".into());
         assert!(e.to_string().contains("peer reset"));
+    }
+
+    // ============================================================
+    // Phase 5.7 V2.7 (2026-05-22) — error-code discrimination
+    // ============================================================
+
+    #[test]
+    fn websocket_error_kind_all_variants() {
+        assert_eq!(
+            WebSocketError::InvalidUrl("x".into()).kind(),
+            "websocket_invalid_url"
+        );
+        assert_eq!(
+            WebSocketError::ConnectFailed("x".into()).kind(),
+            "websocket_connect_failed"
+        );
+        assert_eq!(
+            WebSocketError::HandshakeFailed("x".into()).kind(),
+            "websocket_handshake_failed"
+        );
+        assert_eq!(
+            WebSocketError::RuntimeError("x".into()).kind(),
+            "websocket_runtime_error"
+        );
     }
 }

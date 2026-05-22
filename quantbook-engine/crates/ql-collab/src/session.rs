@@ -159,6 +159,28 @@ pub enum CollabSessionError {
     Replay(#[from] ReplayError),
 }
 
+impl CollabSessionError {
+    /// **Phase 5.7 V2.7 (2026-05-22) — error-code discrimination.**
+    ///
+    /// Returns a stable `&'static str` identifier for this variant.
+    /// For `Transport(inner)`, returns the inner `TransportError`'s
+    /// kind (e.g. `"transport_closed"`) so JS callers can branch on
+    /// the underlying transport state without unwrapping a wrapper
+    /// kind. For all other variants, returns the wrapper kind
+    /// directly (e.g. `"session_undo"`).
+    ///
+    /// **Stability**: see [`crate::TransportError::kind`].
+    pub fn kind(&self) -> &'static str {
+        match self {
+            CollabSessionError::OpLog(_) => "session_oplog",
+            CollabSessionError::Presence(_) => "session_presence",
+            CollabSessionError::Undo(_) => "session_undo",
+            CollabSessionError::Transport(inner) => inner.kind(),
+            CollabSessionError::Replay(_) => "session_replay",
+        }
+    }
+}
+
 /// **Phase 5.3 step 5b (2026-05-20) — production wiring closure
 /// (Opus-A Scenario E HIGH):** result of
 /// [`CollabSession::rebuild_workbook`]. Combines the replay op count
@@ -3050,5 +3072,22 @@ mod tests {
             matches!(result, Err(CollabSessionError::OpLog(_))),
             "from_snapshot(u64::MAX) must fail; got {result:?}"
         );
+    }
+
+    // ============================================================
+    // Phase 5.7 V2.7 (2026-05-22) — error-code discrimination
+    // ============================================================
+
+    #[test]
+    fn collab_session_error_kind_transport_inner_passthrough() {
+        // Transport(inner) should return the inner's kind, NOT a
+        // generic "session_transport" wrapper string. This is the
+        // contract IDE callers depend on for reconnect logic.
+        use crate::transport::TransportError;
+        let e = super::CollabSessionError::Transport(TransportError::Closed);
+        assert_eq!(e.kind(), "transport_closed");
+
+        let e = super::CollabSessionError::Transport(TransportError::Io("dead".into()));
+        assert_eq!(e.kind(), "transport_io");
     }
 }

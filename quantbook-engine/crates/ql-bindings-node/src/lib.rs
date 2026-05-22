@@ -128,8 +128,11 @@ use parking_lot::Mutex;
 
 use ql_collab::AutoFlushPolicy as CoreAutoFlushPolicy;
 use ql_collab::CollabSession as CoreCollabSession;
+use ql_collab::CollabSessionError;
 use ql_collab::LoopbackTransport;
 use ql_collab::Transport as CoreTransport;
+use ql_collab::TransportError;
+use ql_collab_ws::WebSocketError;
 use ql_collab_ws::WebSocketTransport;
 use ql_oplog::CellWireValue;
 use ql_oplog::Op;
@@ -247,6 +250,65 @@ fn peer_id_from_bigint(peer_id: &BigInt) -> Result<PeerId> {
     Ok(PeerId::new(peer_u64))
 }
 
+// ============================================================
+// Phase 5.7 V2.7 (2026-05-22) — error-code discrimination helpers
+// ============================================================
+//
+// Closes V2.1+V2.2+V2.3 Opus MEDIUM-3 carryforwards: every engine
+// error type's variant discriminant is lost on the napi boundary
+// because `Error::from_reason(format!("{e}"))` only carries the
+// Display string.
+//
+// V2.7 design (Codex M3 + Opus V2.1/V2.2/V2.3 M3 convergent):
+//
+//   1. Engine: each error enum gets a `kind() -> &'static str`
+//      accessor (`crates/ql-collab/src/transport.rs::TransportError`,
+//      `crates/ql-collab-ws/src/lib.rs::WebSocketError`,
+//      `crates/ql-collab/src/session.rs::CollabSessionError`).
+//
+//   2. Binding: the helpers below prepend `[<kind>]` to the napi
+//      error message, producing strings like
+//      `"[transport_closed] transport closed"`.
+//
+//   3. IDE: `parseQuantbookError(err)` in
+//      `extensions/quantlab/src/quantbook/session.ts` extracts the
+//      bracketed code into a typed `QuantbookErrorCode` so reconnect
+//      logic can branch on `err.code === 'transport_closed'` etc.
+//
+// **V2.3 mocha test compatibility**: the existing Display strings
+// remain intact AFTER the prefix, so substring-match tests like
+// `/invalid WebSocket URL/` still match `"[websocket_invalid_url]
+// invalid WebSocket URL: ..."`. No test breakage expected.
+//
+// **Why not napi-rs `Error::with_code`?**: napi-rs 3.9.0's `Error`
+// uses `Status: enum` (no `Status::Custom(String)`). The standard
+// status codes don't map to our error variants. Prefix-encoding
+// in the message is the canonical workaround documented across the
+// napi-rs ecosystem until a future custom-code API lands.
+
+/// Map a [`CollabSessionError`] to a napi [`Error`] with a kind-
+/// prefixed message. The kind comes from
+/// [`CollabSessionError::kind`]; for `Transport(inner)` it
+/// transparently passes through the inner kind (e.g.
+/// `"transport_closed"` instead of `"session_transport"`).
+fn collab_session_error_to_napi(e: CollabSessionError) -> Error {
+    Error::from_reason(format!("[{}] {e}", e.kind()))
+}
+
+/// Map a [`TransportError`] to a napi [`Error`] with a kind-
+/// prefixed message. Used by `flushPendingToTransport`'s async
+/// `wait_for_drain` path.
+fn transport_error_to_napi(e: TransportError) -> Error {
+    Error::from_reason(format!("[{}] {e}", e.kind()))
+}
+
+/// Map a [`WebSocketError`] to a napi [`Error`] with a kind-
+/// prefixed message. Used by `Transport.websocketConnect`'s
+/// rejection path.
+fn websocket_error_to_napi(e: WebSocketError) -> Error {
+    Error::from_reason(format!("[{}] {e}", e.kind()))
+}
+
 /// JS-facing wrapper for `ql_collab::CollabSession`.
 ///
 /// **V2.4 refactor (2026-05-22)**: holds `Arc<Mutex<CoreCollabSession>>`
@@ -283,8 +345,7 @@ impl CollabSession {
     #[napi(constructor)]
     pub fn new(peer_id: BigInt) -> Result<Self> {
         let pid = peer_id_from_bigint(&peer_id)?;
-        let session =
-            CoreCollabSession::new(pid).map_err(|e| Error::from_reason(format!("{e}")))?;
+        let session = CoreCollabSession::new(pid).map_err(collab_session_error_to_napi)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(session)),
         })
@@ -296,7 +357,7 @@ impl CollabSession {
     pub fn from_snapshot(peer_id: BigInt, bytes: Uint8Array) -> Result<Self> {
         let pid = peer_id_from_bigint(&peer_id)?;
         let session = CoreCollabSession::from_snapshot(pid, bytes.as_ref())
-            .map_err(|e| Error::from_reason(format!("{e}")))?;
+            .map_err(collab_session_error_to_napi)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(session)),
         })
@@ -358,9 +419,7 @@ impl CollabSession {
             value: CellWireValue::Number(value),
         };
         let mut inner = self.inner.lock();
-        inner
-            .append_op(op)
-            .map_err(|e| Error::from_reason(format!("{e}")))?;
+        inner.append_op(op).map_err(collab_session_error_to_napi)?;
         Ok(())
     }
 
@@ -369,9 +428,7 @@ impl CollabSession {
     #[napi(js_name = "exportBytes")]
     pub fn export_bytes(&self) -> Result<Uint8Array> {
         let inner = self.inner.lock();
-        let bytes = inner
-            .export_bytes()
-            .map_err(|e| Error::from_reason(format!("{e}")))?;
+        let bytes = inner.export_bytes().map_err(collab_session_error_to_napi)?;
         Ok(Uint8Array::from(bytes))
     }
 
@@ -413,7 +470,7 @@ impl CollabSession {
         let mut inner = self.inner.lock();
         let count = inner
             .merge_bytes(bytes.as_ref())
-            .map_err(|e| Error::from_reason(format!("{e}")))?;
+            .map_err(collab_session_error_to_napi)?;
         Ok(u32::try_from(count).unwrap_or(u32::MAX))
     }
 
@@ -550,7 +607,7 @@ impl CollabSession {
         let mut inner = self.inner.lock();
         inner
             .flush_to_transport()
-            .map_err(|e| Error::from_reason(format!("{e}")))
+            .map_err(collab_session_error_to_napi)
     }
 
     /// Drain inbound BLOBS from the attached transport (single-pass).
@@ -583,9 +640,7 @@ impl CollabSession {
     #[napi(js_name = "pollRemote")]
     pub fn poll_remote(&self) -> Result<u32> {
         let mut inner = self.inner.lock();
-        let blobs_drained = inner
-            .poll_remote()
-            .map_err(|e| Error::from_reason(format!("{e}")))?;
+        let blobs_drained = inner.poll_remote().map_err(collab_session_error_to_napi)?;
         Ok(u32::try_from(blobs_drained).unwrap_or(u32::MAX))
     }
 
@@ -630,7 +685,7 @@ impl CollabSession {
         let mut inner = self.inner.lock();
         inner
             .flush_delta_to_transport()
-            .map_err(|e| Error::from_reason(format!("{e}")))
+            .map_err(collab_session_error_to_napi)
     }
 
     /// Like `pollRemote` but with an explicit cap on the number of
@@ -661,7 +716,7 @@ impl CollabSession {
         let mut inner = self.inner.lock();
         let blobs_drained = inner
             .poll_remote_with_limit(limit_u32 as usize)
-            .map_err(|e| Error::from_reason(format!("{e}")))?;
+            .map_err(collab_session_error_to_napi)?;
         Ok(u32::try_from(blobs_drained).unwrap_or(u32::MAX))
     }
 
@@ -858,7 +913,7 @@ impl CollabSession {
         tokio::task::spawn_blocking(move || handle.wait_for_drain())
             .await
             .map_err(|e| Error::from_reason(format!("flushPendingToTransport task: {e}")))?
-            .map_err(|e| Error::from_reason(format!("{e}")))
+            .map_err(transport_error_to_napi)
     }
 }
 
@@ -987,7 +1042,7 @@ impl Transport {
     pub async fn websocket_connect(url: String) -> Result<Transport> {
         let ws = WebSocketTransport::connect(&url)
             .await
-            .map_err(|e| Error::from_reason(format!("{e}")))?;
+            .map_err(websocket_error_to_napi)?;
         Ok(Transport {
             inner: Some(Box::new(ws)),
         })

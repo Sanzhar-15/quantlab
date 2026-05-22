@@ -119,6 +119,30 @@ pub enum TransportError {
     Closed,
 }
 
+impl TransportError {
+    /// **Phase 5.7 V2.7 (2026-05-22) — error-code discrimination.**
+    ///
+    /// Returns a stable `&'static str` identifier for this variant.
+    /// Intended for the napi binding to prepend `[<kind>]` to JS
+    /// error messages so IDE-side reconnect logic can branch on
+    /// `error.code` (after parsing via `parseQuantbookError`)
+    /// without substring-matching the human-readable `Display`
+    /// text.
+    ///
+    /// **Stability**: variant kinds are SemVer-stable strings.
+    /// Adding a new variant requires adding its kind here. Removing
+    /// or renaming a kind is a breaking change for IDE consumers
+    /// (their `code === 'transport_closed'` branches stop matching).
+    /// Closes V2.1+V2.2+V2.3 Opus MEDIUM-3 carryforwards (lossy
+    /// `Display` projection of the underlying enum discriminant).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            TransportError::Io(_) => "transport_io",
+            TransportError::Closed => "transport_closed",
+        }
+    }
+}
+
 /// Wire-byte channel for Phase 5 collaboration.
 ///
 /// Implementations push and pull opaque byte blobs. The blobs ARE
@@ -1073,5 +1097,21 @@ mod tests {
             start.elapsed() < std::time::Duration::from_millis(500),
             "handle wait should unblock independently of transport"
         );
+    }
+
+    // ============================================================
+    // Phase 5.7 V2.7 (2026-05-22) — error-code discrimination
+    // ============================================================
+
+    #[test]
+    fn transport_error_kind_io() {
+        let e = super::TransportError::Io("socket dead".into());
+        assert_eq!(e.kind(), "transport_io");
+    }
+
+    #[test]
+    fn transport_error_kind_closed() {
+        let e = super::TransportError::Closed;
+        assert_eq!(e.kind(), "transport_closed");
     }
 }
