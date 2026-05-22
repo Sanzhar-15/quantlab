@@ -59,10 +59,17 @@ Two VS Code IDE windows on localhost, each running a `CollabSession`, connected 
 
 ### V3.1 sub-steps
 
-- [ ] **V3.1.a — Localhost ws server (engine side OR test binary)** — pick one of:
-   - (A) Extend `ql-collab-ws` with a `WebSocketServer` type using `tokio-tungstenite::accept_async`. Reuses the existing crate's tokio infrastructure. Adds a new top-level type but stays inside `ql-collab-ws`'s scope.
-   - (B) New test-only binary at `crates/ql-collab-ws/examples/relay-server.rs` (or `crates/ql-bindings-node/examples/relay-server.rs`). Smaller scope (no public API addition). Demo-only.
-   - **Recommendation: B for V3.1** (smaller scope, clearer demo-only signal). Revisit A if V3.2+ needs reusable server in tests.
+- [x] **V3.1.a — Localhost ws server** ✅ SHIPPED 2026-05-22
+   - Chose path B (test-only binary at `crates/ql-collab-ws/examples/relay-server.rs`). Smaller scope, demo-only signal. Revisit path A only if V3.2+ tests need a reusable server type.
+   - Implementation: stateless broadcast relay. `tokio::sync::broadcast::Sender<(usize, Vec<u8>)>` carries `(sender_conn_id, bytes)`; each per-connection task subscribes and filters out frames where `sender_id == self.conn_id` (sender-side self-filter). 256-frame broadcast ring; older frames dropped if a client lags (CRDT is idempotent on re-merge — acceptable for demo).
+   - Stdout line on bind: `[ql-collab-ws relay] listening on ws://127.0.0.1:<port>` -- stable contract for V3.1.b to pattern-match for readiness.
+   - Port: `QL_RELAY_PORT` env or default 7117.
+   - Build: `cargo build -p ql-collab-ws --example relay-server --release`.
+   - Run: `cargo run -p ql-collab-ws --example relay-server --release` (or invoke the built binary directly).
+   - Tests at `crates/ql-collab-ws/tests/relay.rs` (2 integration tests; inline twin of `handle_connection` to test without subprocess):
+     - `two_clients_cross_broadcast`: A→B propagation + A-self-filter pin.
+     - `third_client_receives_both_streams`: 3-way fan-out pin.
+   - Trade-off accepted: the inline twin in `tests/relay.rs` duplicates ~40 lines of `handle_connection` logic from the example binary. Keeping both in sync is a manual discipline; V3.2+ can promote to `pub mod relay` in the lib if reuse demands grow.
 
 - [ ] **V3.1.b — IDE `quantlab.quantbookDemo` command rewrite** — currently a single-window demo (per V1). Rewrite to:
    1. Check whether already-running-as-window-2 (env var `QUANTLAB_QUANTBOOK_DEMO_PEER=2`).
