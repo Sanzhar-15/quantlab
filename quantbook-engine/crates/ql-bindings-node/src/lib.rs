@@ -551,6 +551,59 @@ impl CollabSession {
         })
     }
 
+    /// **Phase 5.7 V3.3.0.2 (2026-05-22) -- enumerate distinct sheets
+    /// present in the local op log.**
+    ///
+    /// Walks the local op log, collects every distinct `sheet` u16
+    /// referenced by a `PutValue` op, returns them as a sorted ascending
+    /// `Vec<u16>`.  Empty if no `PutValue` ops have been appended.
+    ///
+    /// V3.3.0 design decision D3 (LOCKED at engine `5fd7ff73648`):
+    /// u16-only return for this method.  Display name + color + hidden
+    /// flags wait for a future `SheetMetadata` Op variant (V3.4+) and
+    /// a separate `listSheetsMetadata()` accessor.
+    ///
+    /// # Semantics
+    ///
+    /// V3.3.0 scope: scans the entire op log per call (O(N) in op
+    /// count).  Sheets only appear in the result if a `PutValue` op
+    /// references them; an "empty" sheet that was created via a future
+    /// `SheetMetadata` Op but received no values is NOT enumerated
+    /// here (V3.4+ surface).
+    ///
+    /// CRDT-consistent: pollRemote-merged blobs from peers are
+    /// already in the local op log before this method walks; cross-
+    /// peer sheet sets converge.
+    ///
+    /// # Errors
+    ///
+    /// - `[bad_argument]` if the op log iterator emits a decode error.
+    ///
+    /// # Performance
+    ///
+    /// Iterates the entire op log per call (O(N) in op count).  For
+    /// V3.3 scale (couple thousand ops, few sheets), this is fast
+    /// (<1ms on local dev).  V3.4+ may add an incremental cache if
+    /// profiling justifies (mirrors the V3.2.d Opus M4 -> V3.3.0.3
+    /// `exportSnapshot` incremental-cache decision).
+    #[napi(js_name = "listSheets")]
+    pub fn list_sheets(&self) -> Result<Vec<u16>> {
+        let inner = self.inner.lock();
+        let mut sheets: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+        for op_result in inner.op_log().iter() {
+            let op = op_result.map_err(|e| {
+                bad_argument_error(format!("listSheets: op log iter error: {e}"))
+            })?;
+            if let Op::PutValue { sheet, .. } = op {
+                sheets.insert(sheet);
+            }
+        }
+        // BTreeSet's iter is sorted ascending; collect to Vec preserves
+        // that ordering so the IDE consumer can rely on a deterministic,
+        // pre-sorted enumeration without an additional sort step.
+        Ok(sheets.into_iter().collect())
+    }
+
     /// Export a full snapshot of this session's op log.
     /// Mirrors `CollabSession::export_bytes`.
     #[napi(js_name = "exportBytes")]
