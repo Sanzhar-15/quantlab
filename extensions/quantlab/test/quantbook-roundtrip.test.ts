@@ -1208,56 +1208,199 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 		}
 	});
 
-	test('flushPendingToTransport: smoke test of concurrent JS callers (V2.4 SAFETY note: see audit)', async function () {
-		// **V2.4 audit closure (Codex LOW-2 + Opus MEDIUM-1+2,
-		// 2026-05-22)**: this test was originally framed as proving V2.3's
-		// UB hazard is structurally closed. Both auditors flagged it as
-		// vacuous on Loopback (LoopbackTransport's `flush_pending` is
-		// the trait default `Ok(())` — returns immediately; no mutex
-		// contention is forced). The STRUCTURAL proof lives in the
-		// Rust compile-asserts (Send + Sync) + the napi-rs codegen
-		// source-walk (V2.4 audit verified `&self` + Arc<Mutex> produces
-		// shared `&` refs, no `&mut` aliasing). This test is now framed
-		// as a smoke test: passing means the binding doesn't crash
-		// under concurrent calls. Real contention testing requires a
-		// test-only blocking transport (V2.5+ backlog — needs engine
-		// fixture).
+	// ===============================================================
+	// Phase 5.7 V2.5 (2026-05-22) — V8-block CLOSURE contract tests
+	// ===============================================================
+	//
+	// V2.4's two "smoke tests" using LoopbackPair (vacuous per Opus
+	// V2.4 MEDIUM-2) are REPLACED with V2.5 contract tests using
+	// `BlockingTransportFixture`. The fixture forces deterministic
+	// `flush_pending` contention so a concurrent JS sync call's
+	// elapsed time becomes a measurable signal of whether the V2.5
+	// lock-release pattern is in effect.
+
+	test('V2.5 contract: flushPendingToTransport does NOT block sync methods on the same session (BlockingTransportFixture)', async function () {
+		// **THE V2.5 PIN.** Closes Opus V2.4 HIGH-1 (V8-block UX hazard).
+		//
+		// Pattern:
+		//   1. Construct a BlockingTransportFixture with blockMs = 1000.
+		//   2. Attach the fixture's transport to a session.
+		//   3. Start flushPendingToTransport (the spawn_blocking task
+		//      starts; engine-side wait enters Condvar).
+		//   4. Await fixture.waitUntilBlocked() — deterministic
+		//      synchronization point (Codex M3 fix): we are NOW sure
+		//      the spawn_blocking task has acquired its handle and is
+		//      blocked in wait_for_drain.
+		//   5. Call session.opCount(). Under V2.5: returns ~immediately
+		//      because the session lock was released in step 3. Under
+		//      V2.4 (the bug): would block ~1000ms because the session
+		//      lock was held during the wait.
+		//   6. Assert elapsed < blockMs / 2.
 		this.timeout(10000);
+		const engine = loadQuantbookEngine();
+		const fixture = new engine.BlockingTransportFixture(1000);
+		const t = fixture.takeTransport();
 		const session = createSession(1n);
-		const [tA, _tB] = loopbackTransportPair();
-		session.attachTransport(tA);
+		session.attachTransport(t);
+
+		const flushP = session.flushPendingToTransport();
+		await fixture.waitUntilBlocked();
+
+		const start = Date.now();
+		const count = session.opCount();
+		const elapsed = Date.now() - start;
+		assert.strictEqual(count, 0, 'opCount returns correct value mid-pending-flush');
+		assert.ok(
+			elapsed < 500,
+			`V2.5 contract: opCount during pending flushPending took ${elapsed}ms; expected < blockMs/2 = 500. ` +
+			`Under V2.4 binding pattern this would block ~1000ms.`,
+		);
+
+		fixture.release();
+		await flushP;
+	});
+
+	test('V2.5 contract: concurrent flushPendingToTransport calls serialize through ack handle (BlockingTransportFixture)', async function () {
+		// Two concurrent flushPending calls. Each spawns its own
+		// spawn_blocking task; both extract independent ack handles
+		// pointing at the same underlying transport's release Condvar.
+		// release() unblocks BOTH. Both promises resolve.
+		this.timeout(10000);
+		const engine = loadQuantbookEngine();
+		const fixture = new engine.BlockingTransportFixture(2000);
+		const t = fixture.takeTransport();
+		const session = createSession(1n);
+		session.attachTransport(t);
 
 		const p1 = session.flushPendingToTransport();
 		const p2 = session.flushPendingToTransport();
+		// Give both spawn_blocking tasks time to enter their waits.
+		await fixture.waitUntilBlocked();
+
+		// release() unblocks both.
+		fixture.release();
 		await Promise.all([p1, p2]);
 	});
 
-	test('flushPendingToTransport: smoke test of interleaved sync during pending async', async function () {
-		// **V2.4 audit closure (same as above)**: vacuous on Loopback.
-		// Real V8-block hazard testing (Opus V2.4 HIGH-1) needs a
-		// blocking transport fixture (V2.5+).
-		this.timeout(10000);
-		const session = createSession(1n);
-		const [tA, _tB] = loopbackTransportPair();
-		session.attachTransport(tA);
-
-		const p = session.flushPendingToTransport();
-		const count = session.opCount();
-		assert.strictEqual(count, 0, 'opCount visible mid-pending-async');
-		assert.ok(session.hasTransport(), 'hasTransport visible mid-pending-async');
-		await p;
+	test('V2.6 BlockingTransportFixture: takeTransport is single-use', async function () {
+		this.timeout(5000);
+		const engine = loadQuantbookEngine();
+		const fixture = new engine.BlockingTransportFixture(100);
+		// First take succeeds.
+		const t = fixture.takeTransport();
+		assert.ok(t.isAttachable(), 'first takeTransport returns attachable Transport');
+		// Second take errors.
+		assert.throws(
+			() => fixture.takeTransport(),
+			/takeTransport already called/,
+		);
 	});
 
-	test('stale V2.3-shaped binary (missing V2.4 flushPendingToTransport) is rejected at the boundary', () => {
-		// **V2.4 audit closure (Codex LOW-3, 2026-05-22)**: pin the
-		// V2.4 loader skew detection. A V2.3 binary has all V2.2 +
-		// websocketConnect exports but lacks `flushPendingToTransport`
-		// on the CollabSession prototype. Without this test, a
-		// regression to the loader check would silently pass.
+	test('V2.6 BlockingTransportFixture: blockMs upper bound prevents indefinite hang', async function () {
+		// Construct with blockMs = 100; never release. The flush
+		// should still resolve via the upper-bound timeout, not hang
+		// the test.
+		this.timeout(5000);
+		const engine = loadQuantbookEngine();
+		const fixture = new engine.BlockingTransportFixture(100);
+		const t = fixture.takeTransport();
+		const session = createSession(1n);
+		session.attachTransport(t);
+
+		const start = Date.now();
+		await session.flushPendingToTransport();
+		const elapsed = Date.now() - start;
+		// Should exit around 100ms. Bound generously for slow CI.
+		assert.ok(
+			elapsed >= 80 && elapsed < 1500,
+			`upper-bound exit landed at ${elapsed}ms; expected ~100ms`,
+		);
+	});
+
+	test('V2.6 BlockingTransportFixture: release() is idempotent', async function () {
+		this.timeout(5000);
+		const engine = loadQuantbookEngine();
+		const fixture = new engine.BlockingTransportFixture(2000);
+		fixture.release();
+		fixture.release(); // second call must not throw or deadlock
+		// Now take + attach + flush. Since release is already set,
+		// the wait short-circuits on entry.
+		const t = fixture.takeTransport();
+		const session = createSession(1n);
+		session.attachTransport(t);
+		const start = Date.now();
+		await session.flushPendingToTransport();
+		const elapsed = Date.now() - start;
+		assert.ok(elapsed < 500, `pre-released wait exits quickly; took ${elapsed}ms`);
+	});
+
+	test('V2.6 BlockingTransportFixture: constructor rejects non-finite blockMs', async function () {
+		const engine = loadQuantbookEngine();
+		assert.throws(
+			() => new engine.BlockingTransportFixture(NaN),
+			/blockMs must be a finite/,
+		);
+		assert.throws(
+			() => new engine.BlockingTransportFixture(-1),
+			/blockMs must be a non-negative integer/,
+		);
+		assert.throws(
+			() => new engine.BlockingTransportFixture(2.5),
+			/blockMs must be an integer/,
+		);
+	});
+
+	test('stale V2.4-shaped binary (missing V2.6 BlockingTransportFixture) is rejected at the boundary', () => {
+		// **V2.6 loader skew detection (2026-05-22)**: a binary
+		// built without the `test-fixtures` feature on ql-collab
+		// lacks `BlockingTransportFixture`. Without this check, the
+		// V2.5 contract tests would fail late with cryptic
+		// `engine.BlockingTransportFixture is not a constructor`.
 		const originalDlopen = process.dlopen;
 		_resetQuantbookEngineCacheForTests();
 		const fakeCollabSession = function () { /* fake */ };
-		// All V1+V2.2 prototype methods, BUT no flushPendingToTransport.
+		for (const m of [
+			'appendPutValue', 'exportBytes', 'mergeBytes', 'opCount',
+			'pendingOpCount', 'hasPendingFlush', 'peerId',
+			'attachTransport', 'detachTransport', 'hasTransport',
+			'flushToTransport', 'pollRemote',
+			'flushDeltaToTransport', 'pollRemoteWithLimit',
+			'transportLastError', 'setAutoFlushPolicy', 'autoFlushPolicy',
+			'flushPendingToTransport', // V2.4 method present
+		]) {
+			(fakeCollabSession.prototype as Record<string, unknown>)[m] = function () { /* */ };
+		}
+		const fakeTransport = function () { /* fake */ } as unknown as { websocketConnect?: unknown };
+		fakeTransport.websocketConnect = function () { /* fake */ };
+		(process as unknown as { dlopen: typeof process.dlopen }).dlopen =
+			(mod: NodeJS.Module): void => {
+				(mod as unknown as { exports: Record<string, unknown> }).exports = {
+					version: () => '0.1.0-pre-v2.6',
+					CollabSession: fakeCollabSession,
+					Transport: fakeTransport,
+					LoopbackPair: function () { /* fake */ },
+					// V2.6 BlockingTransportFixture intentionally omitted.
+				};
+			};
+		try {
+			assert.throws(
+				() => loadQuantbookEngine(),
+				/BlockingTransportFixture \(V2\.6 test-fixtures\)/,
+				'stale V2.4 binary must mention the missing V2.6 export',
+			);
+		} finally {
+			process.dlopen = originalDlopen;
+			_resetQuantbookEngineCacheForTests();
+		}
+	});
+
+	test('stale V2.3-shaped binary (missing V2.4 flushPendingToTransport) is rejected at the boundary', () => {
+		// V2.4 closure test (Codex LOW-3, 2026-05-22) — kept from
+		// V2.4 cycle. Validates that the loader's V2.4 prototype
+		// check still fires for a V2.3-shaped binary.
+		const originalDlopen = process.dlopen;
+		_resetQuantbookEngineCacheForTests();
+		const fakeCollabSession = function () { /* fake */ };
 		for (const m of [
 			'appendPutValue', 'exportBytes', 'mergeBytes', 'opCount',
 			'pendingOpCount', 'hasPendingFlush', 'peerId',
@@ -1277,6 +1420,7 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 					CollabSession: fakeCollabSession,
 					Transport: fakeTransport,
 					LoopbackPair: function () { /* fake */ },
+					BlockingTransportFixture: function () { /* fake V2.6 */ },
 				};
 			};
 		try {

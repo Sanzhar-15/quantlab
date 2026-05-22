@@ -230,35 +230,107 @@ export interface CollabSessionInstance {
 	autoFlushPolicy(): AutoFlushPolicy;
 
 	// =====================================================================
-	// Phase 5.7 V2.4 (2026-05-22) -- async Transport surface, REINTRODUCED
+	// Phase 5.7 V2.5 (2026-05-22) -- async Transport surface, V8-BLOCK CLOSED
 	// =====================================================================
 
 	/**
 	 * Async flush-pending. Waits for the attached transport's writer
-	 * task to drain (level-1 local ack per V2 V4 V1 Tier K1).
+	 * task to drain blobs queued AT THIS CALL (Codex M1 contract:
+	 * target captured at handle extraction, NOT at wait-start).
 	 *
-	 * **V2.4 reintroduction**: V2.3 ship initially included this but
-	 * V2.3 audit (Codex FAIL + Opus 2H) found two convergent HIGH
-	 * hazards (Rust UB via napi `&mut self` async re-entry + tokio
-	 * runtime starvation). V2.4 closure refactored the engine's
-	 * `CollabSession` napi class to hold `Arc<parking_lot::Mutex<...>>`
-	 * (all methods now `&self`; spawn_blocking pattern for async). The
-	 * UB hazard is structurally impossible now (no `&mut self` on the
-	 * binding). The runtime starvation hazard is closed by
-	 * `spawn_blocking` (Condvar wait runs on a dedicated blocking
-	 * thread, not a tokio worker).
+	 * **V2.5 V8-block closure (2026-05-22)**: V2.4 reintroduced this
+	 * soundly (closed V2.3 UB + tokio-starvation HIGHs via the
+	 * `Arc<parking_lot::Mutex<...>>` refactor) BUT held the session
+	 * lock during the Condvar wait -- Opus V2.4 HIGH-1 flagged the
+	 * resulting V8-block UX hazard. V2.5 closes it: the binding now
+	 * extracts a detached `FlushAck` handle while holding the session
+	 * lock, drops the lock, then performs the Condvar wait without
+	 * the session lock held. Concurrent JS sync method calls on the
+	 * same session acquire the lock immediately -- the V8 event loop
+	 * stays responsive.
+	 *
+	 * **V2.3 + V2.4 soundness retained**:
+	 * - `&self`, not `&mut self`. napi-rs codegen produces shared `&`;
+	 *   no aliasing UB possible.
+	 * - `spawn_blocking` runs the wait on tokio's blocking pool, NOT
+	 *   the worker pool. No runtime starvation.
 	 *
 	 * Resolves when:
-	 * - writer has completed `send` for every queued blob, OR
-	 * - transport has been detached / dropped / errored.
+	 * - writer has completed `send` for every blob queued at this call, OR
+	 * - transport has been detached / dropped / closed.
 	 *
-	 * **No-op on no transport**: returns resolved Promise (NOT
+	 * **No-op on no transport, or transports with no async-flush
+	 * semantics (Loopback, Noop)**: returns resolved Promise (NOT a
 	 * rejection).
 	 *
 	 * @throws Error if the transport reports an error, or if the
-	 *               spawn_blocking task panics.
+	 *               `spawn_blocking` task panics.
 	 */
 	flushPendingToTransport(): Promise<void>;
+}
+
+// ============================================================================
+// Phase 5.7 V2.6 (2026-05-22) -- BlockingTransportFixture (test fixture)
+// ============================================================================
+
+/**
+ * V2.6 test fixture for V2.5 contract testing. Wraps the engine-side
+ * `BlockingTransport` (feature-gated behind `test-fixtures` on ql-collab).
+ *
+ * **NOT for production use** -- the underlying transport blocks
+ * `flush_pending` indefinitely until `release()` is called (or the
+ * constructor's `blockMs` upper bound elapses). Production callers
+ * would deadlock.
+ *
+ * Mirrors V2.1 `LoopbackPair`'s single-use take pattern: construct
+ * the fixture, call `takeTransport()` once to obtain a `Transport`
+ * for `attachTransport(t)`, then drive `release()` + `waitUntilBlocked()`
+ * from test code.
+ */
+export interface BlockingTransportFixtureInstance {
+	/**
+	 * Take ownership of the inner `BlockingTransport`, wrapped in a
+	 * `Transport` instance attachable to a `CollabSession`.
+	 *
+	 * Single-use: errors on the second call. The fixture controller
+	 * retains its `release` + `blocked` Condvars after the take so
+	 * `release()` + `waitUntilBlocked()` can drive the transport
+	 * that now lives inside a `CollabSession`.
+	 *
+	 * @throws Error on the second call.
+	 */
+	takeTransport(): TransportInstance;
+
+	/**
+	 * Flip the release Condvar so any in-progress `flush_pending`
+	 * or `wait_for_drain` exits. Idempotent (calling twice is safe).
+	 */
+	release(): void;
+
+	/**
+	 * Async wait until the fixture's wait routine has actually
+	 * entered the Condvar wait (engine-side `wait_blocked` set the
+	 * `blocked` flag + notified).
+	 *
+	 * **Codex M3 fix (2026-05-22)**: deterministic synchronization
+	 * point for V2.5 contract tests. Without it, an `opCount()` call
+	 * during a pending `flushPendingToTransport` could race ahead of
+	 * the `spawn_blocking` task and pass vacuously.
+	 */
+	waitUntilBlocked(): Promise<void>;
+}
+
+export interface BlockingTransportFixtureConstructor {
+	/**
+	 * Construct a fresh `BlockingTransportFixture`.
+	 *
+	 * @param blockMs Upper-bound wait duration in milliseconds. `0`
+	 *                means "wait indefinitely until released" (use
+	 *                only when an explicit `release()` is guaranteed).
+	 *                Must be a finite non-negative integer in [0, u32::MAX].
+	 * @throws Error if `blockMs` is non-finite / negative / fractional / out-of-u32.
+	 */
+	new(blockMs: number): BlockingTransportFixtureInstance;
 }
 
 /**
@@ -393,4 +465,14 @@ export interface QuantbookNativeModule {
 	 * Transport ends.
 	 */
 	readonly LoopbackPair: LoopbackPairConstructor;
+
+	/**
+	 * V2.6 (2026-05-22): BlockingTransportFixture class -- test
+	 * fixture for V2.5 V8-block contract testing. See
+	 * {@link BlockingTransportFixtureInstance}.
+	 *
+	 * **NOT for production code** -- the underlying transport blocks
+	 * `flush_pending` indefinitely until released.
+	 */
+	readonly BlockingTransportFixture: BlockingTransportFixtureConstructor;
 }

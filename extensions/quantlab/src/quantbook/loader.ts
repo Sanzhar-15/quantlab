@@ -285,6 +285,16 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 			missing.push('Transport.websocketConnect (V2.3)');
 		}
 	}
+	// V2.6 (2026-05-22): validate `BlockingTransportFixture` test
+	// fixture export. ql-bindings-node enables the `test-fixtures`
+	// feature on ql-collab unconditionally, so any current cdylib
+	// MUST carry this. A binary built without the feature (e.g., a
+	// future production-build flow that strips it) would fail late
+	// with `engine.BlockingTransportFixture is not a constructor`
+	// when V2.5 contract tests instantiate it.
+	if (typeof (loaded as { BlockingTransportFixture?: unknown }).BlockingTransportFixture !== 'function') {
+		missing.push('BlockingTransportFixture (V2.6 test-fixtures)');
+	}
 	if (missing.length > 0) {
 		throw new Error(
 			`Quantbook engine at ${enginePath} loaded but is missing expected exports: ` +
