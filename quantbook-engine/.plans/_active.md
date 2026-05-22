@@ -1,6 +1,6 @@
 ---
 name: 2026-05-22_phase-5-7-v3-2-cell-grid-ui
-status: in-progress (V3.2.a + V3.2.a.1 + V3.2.b SHIPPED.  V3.2.b.1 decision lock at engine `ce5d697cb17`; V3.2.b.2-V3.2.b.5 (nonced CSP + cellGridLogic.ts vscode-free split + 18 new mocha tests) at IDE `86b02d22a0b`; V3.2.b.6 ide-consumer-contract § 4.1.z + plan checkboxes ship in THIS commit.  IDE mocha 126/126.  V3.2.b.4 AutoFlushPolicy wiring DEFERRED to V3.2.c (V3.2.b's command surface uses an unattached session -- local-only).  V3.2.c live multi-window propagation (~2d) is the next major work item.)
+status: in-progress (V3.2.a + V3.2.a.1 + V3.2.b SHIPPED.  V3.2.b.1 decision lock at engine `ce5d697cb17`; V3.2.b.2-V3.2.b.5 at IDE `86b02d22a0b`; V3.2.b.6 docs + plan at engine `9cd9fd6f5b9`.  V3.2.c.1 7-decision lock ships in THIS commit (attach via connectOrSpawn reuse, 1s pollRemote, full re-render granularity, OutputChannel status, deferred per-cell tint, V3.1.c reconnect reuse, helper export from multiWindowDemo).  IDE mocha 126/126.  V3.2.c.2-V3.2.c.6 (~2d) is the implementation sequence.)
 date: 2026-05-22
 predecessor_plan: .plans/_archive/2026-05-22_phase-5-7-v3-1-multi-window-demo.md (V3.1 multi-window demo, all sub-steps + audit closed)
 predecessor_v2_exit_packet: docs/phase5/5-7-v2-exit-packet.md (V2 phase termination -- Transport binding architectural decisions V2.1-V2.8)
@@ -74,13 +74,32 @@ V3.2 = cell-grid UI. Lift the V3.1 demo patterns into a real grid widget that us
    7. [x] 18 new mocha tests at V3.2.b.5 (108 -> 126 total): 6 HTML/CSP/data-attrs/script-wiring pins; 7 parseCellRawInput pins; 5 dispatchIncomingMessage pins (success commits + onCommit, parse failure + errorReply, empty input, sheet mismatch silent drop, malformed inputs silent drop).
    - V3.2.b.6 ide-consumer-contract.md § 4.1.z documents the message envelope + nonce + pessimistic rendering + drift hazards (THIS commit).
 
-- [ ] **V3.2.c -- Live multi-window propagation (~2d)** -- read surface from peer.
-   1. Decide inbound model: (a) periodic 1s `pollRemote` (V3.1 pattern; demo-OK) vs (b) Transport-push event-driven via `Transport::ack_handle`-style subscription (cleaner; needs engine API).
-   2. On inbound op observed: re-render affected cells.
-   3. Status-bar indicator hooked to transport state (Connected / Reconnecting / Disconnected).
-   4. Per-cell "incoming" flash animation (200ms tint) for visual feedback when a remote op lands.
-   5. Mocha test: two sessions in one process, A appends, B observes the cell change.
-   6. Manual smoke: two VS Code windows, edit in one, observe in the other.
+- **V3.2.c -- Live multi-window propagation (~2d)** -- read surface from peer.
+
+   ### V3.2.c.1 decision lock (2026-05-22, mirrors V3.2.b.1 pattern)
+
+   **C1 attach model.** REUSE V3.1.b's `connectOrSpawn` orchestration verbatim: try-connect-to-`ws://127.0.0.1:7117`-first; on failure spawn `relay-server` binary; on spawn race lose, retry-connect-once (V3.1.e Opus M2 / Codex L1 convergent closure preserved).  Add a NEW command `quantlab.quantbookCellGridCollab` that runs this attach flow + opens a CellGridPanel with the resulting Transport; keep the V3.2.a `quantlab.quantbookCellGrid` command as LOCAL-ONLY (unattached session) for fast-start dev / smoke.
+
+   **C2 inbound model.** Option A (1s `pollRemote()` polling).  Rationale: matches V3.1.b cadence; engine push API would need new napi surface + Rule 4 audit, both out-of-scope for V3.2.  Cadence is 1000ms (deferred upgrade to push tracked in V3.x backlog).
+
+   **C3 re-render granularity.** Coarse: when `pollRemote()` returns `n > 0`, call `this.render()` (full HTML rebuild).  Per-cell diffing is a V3.3 virtualization concern -- at V3.2.c scale (hundreds of cells, human-typing cadence) a full re-render every second is imperceptible.
+
+   **C4 status indicator.** OutputChannel-only at V3.2.c.  No persistent `vscode.window.createStatusBarItem` (V3.x backlog).  Each state transition (Connected / Reconnecting / Reconnect-Failed) emits a log line; reconnect-exhaustion surfaces `vscode.window.showWarningMessage(..., 'Restart')` mirroring V3.1.c's pattern.
+
+   **C5 per-cell incoming tint.** DEFERRED to V3.x polish.  Adds CSS animation complexity + requires diffing old vs new snapshot at the script layer -- not load-bearing for the V3.2.c contract (cross-window edits are observable via the regular re-render).
+
+   **C6 reconnect handling.** REUSE V3.1.c `reconnectWithBackoff` (3 tries at 500/1000/2000ms) on `parseQuantbookError(err).code === 'transport_closed'` from the pollRemote loop's `transportLastError()` observation OR an exception in `appendPutValueValidated`.  On reconnect exhaustion: dispose the collab panel + show the Restart action.
+
+   **C7 helper sharing.** EXPORT `connectOrSpawn` + `reconnectWithBackoff` from `multiWindowDemo.ts` (single-file home rather than extracting to a third file).  V3.2.d audit may revisit; V3.2.c keeps the diff small.
+
+   ### V3.2.c sub-steps
+
+   1. [ ] V3.2.c.1 -- THIS plan commit (decision lock).
+   2. [ ] V3.2.c.2 -- Export `connectOrSpawn` + `reconnectWithBackoff` from `multiWindowDemo.ts`.  No behaviour change; only widens visibility.
+   3. [ ] V3.2.c.3 -- Extend `CellGridPanel` to accept an OPTIONAL `transport: TransportInstance` constructor param; if attached, `setAutoFlushPolicy('onAppend')` + `attachTransport(transport)` + start 1s pollRemote timer that calls `this.render()` on `n > 0`.  Dispose path clears the timer + detaches.
+   4. [ ] V3.2.c.4 -- Add `quantlab.quantbookCellGridCollab` command: runs `connectOrSpawn`, opens `CellGridPanel` with the attached transport, hooks reconnect on `transport_closed` via `reconnectWithBackoff`, surfaces failure via `showWarningMessage('Restart Cell Grid')`.
+   5. [ ] V3.2.c.5 -- Mocha tests: two-session integration (mirrors V3.1.b's spawn-relay-then-A-appends-B-polls round-trip) but driving CellGridPanel-equivalent attach logic; pollRemote-loop unit test (use Sinon-style fake timers if available, else assert manual mergeBytes path triggers `render()`).
+   6. [ ] V3.2.c.6 -- Docs: extend ide-consumer-contract.md § 4.1.z with the V3.2.c attach + poll contract; update plan checkboxes + HEADs.
 
 - [ ] **V3.2.d -- Parallel Codex + Opus audit + closures (~1-2d)** -- per Rule 2.
    - Codex lane: protocol/correctness sweep over the new napi surface + grid rendering correctness + edit-commit semantics.
