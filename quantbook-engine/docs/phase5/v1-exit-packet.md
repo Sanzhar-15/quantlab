@@ -313,12 +313,17 @@ Phase 5 V1 added **91 net tests** to the engine.
   Phase 5.7 unblocked.**
 
 - **Phase 5.7 V1 — IDE vertical slice (FIRST IDE BINDING).** ✅
-  **SHIPPED 2026-05-22**. Engine `677ee03ee8b` (ship) + `6003db4ce2c`
-  (closure); IDE `1a7fc8bbe3f` (ship) + `a517d7c5f71` (closure).
+  **SHIPPED + MEGAUDITED + DOCS-FINALIZED 2026-05-22**. Engine
+  `677ee03ee8b` (ship) → `6003db4ce2c` (per-step closure) →
+  `c47bc0816b5` (3-way megaudit closure) → `c7406aa82cd` (docs finalize);
+  IDE `1a7fc8bbe3f` (ship) → `a517d7c5f71` (per-step closure) →
+  `97e0513d134` (megaudit closure).
   New `crates/ql-bindings-node/` (napi-rs 3.x cdylib) binding
   `CollabSession` for the quantlab VS Code fork's extension host.
-  20 mocha tests in `extensions/quantlab/test/quantbook-roundtrip.test.ts`.
-  Canonical record: `docs/phase5/5-7-v1-exit-packet.md`. **V1 deferred**
+  **26 mocha tests** (10 ship + 10 per-step closure + 6 megaudit closure)
+  in `extensions/quantlab/test/quantbook-roundtrip.test.ts`.
+  Canonical record: `docs/phase5/5-7-v1-exit-packet.md`. 5 audit
+  transcripts in `docs/audits/2026-05-22-phase-5-7-v1-*`. **V1 deferred**
   Transport binding (V2), multi-window demo (V2), cell-grid UI (V3),
   `.qbook` persistence (V3), undo/redo binding, presence binding,
   Format/D-1 binding, full Op enum, `rebuild_workbook` D-3
