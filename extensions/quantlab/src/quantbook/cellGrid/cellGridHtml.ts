@@ -32,22 +32,24 @@ export function buildHtml(snapshot: QuantbookCellSnapshot): string {
 	const body = snapshot.entries.length === 0
 		? '<div class="empty">(empty -- no PutValue ops on this sheet)</div>'
 		: `<table><thead><tr><th>Row</th><th>Col</th><th>Value</th></tr></thead><tbody>${rows}</tbody></table>`;
-	// CSS is concatenated as a single-line string to avoid the
-	// "Bad whitespace indentation" hygiene rule firing on the CSS
-	// rules' inner indentation. The rendered HTML is identical;
-	// the readability cost is small for a static stylesheet this
-	// short. V3.2.b may move the CSS to an asWebviewUri-loaded
-	// `.css` file when message-passing lands.
+	// CSS is built from an array of per-rule strings. Each array entry
+	// is a TS string on a tab-indented source line (hygiene-compliant),
+	// concatenated with `\n` so the rendered HTML has one CSS rule per
+	// line for readability. V3.2.b may move the CSS to an
+	// asWebviewUri-loaded `.css` file when message-passing lands +
+	// `localResourceRoots` already exposes the extension URI; until
+	// then this inline structure keeps the stylesheet next to the
+	// HTML it styles.
 	const css = [
-		'body{font-family:var(--vscode-font-family);color:var(--vscode-foreground);background:var(--vscode-editor-background);margin:0;padding:16px;}',
-		'h2{margin-top:0;}',
-		'table{border-collapse:collapse;width:auto;}',
-		'th,td{padding:4px 12px;border:1px solid var(--vscode-panel-border);text-align:left;}',
-		'th{background:var(--vscode-toolbar-hoverBackground);font-weight:600;}',
-		'.meta{color:var(--vscode-descriptionForeground);font-size:12px;margin-bottom:12px;}',
-		'.empty{color:var(--vscode-descriptionForeground);font-style:italic;}',
-		'.kind{color:var(--vscode-descriptionForeground);font-size:11px;margin-left:8px;}',
-	].join('');
+		'body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); background: var(--vscode-editor-background); margin: 0; padding: 16px; }',
+		'h2 { margin-top: 0; }',
+		'table { border-collapse: collapse; width: auto; }',
+		'th, td { padding: 4px 12px; border: 1px solid var(--vscode-panel-border); text-align: left; }',
+		'th { background: var(--vscode-toolbar-hoverBackground); font-weight: 600; }',
+		'.meta { color: var(--vscode-descriptionForeground); font-size: 12px; margin-bottom: 12px; }',
+		'.empty { color: var(--vscode-descriptionForeground); font-style: italic; }',
+		'.kind { color: var(--vscode-descriptionForeground); font-size: 11px; margin-left: 8px; }',
+	].join('\n');
 	return `<!DOCTYPE html>
 <html>
 <head>
