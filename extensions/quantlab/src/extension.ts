@@ -5,6 +5,7 @@
 
 import * as vscode from 'vscode';
 import { registerDataCommands } from './commands/dataCommands';
+import { registerQuantbookCommands } from './commands/quantbookCommands';
 import { registerGlobalStateCommands } from './commands/globalStateCommands';
 import { registerHistoryCommands } from './commands/historyCommands';
 import { registerPanelCommands } from './commands/panelCommands';
@@ -102,14 +103,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
 	// Sign-in / sign-out commands.
 	// quantlab.signIn bypasses vscode.authentication.getSession() and opens the login
-	// panel directly — no intermediate quick-pick step for the user.
+	// panel directly -- no intermediate quick-pick step for the user.
 	// If the welcome panel is already open it just reveals it rather than opening a second modal.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.signIn', async () => {
 			try {
 				await authProvider.createSession(['read']);
 			} catch (err) {
-				// ERR_CANCELLED = user closed the panel — no notification needed.
+				// ERR_CANCELLED = user closed the panel -- no notification needed.
 				if (err instanceof Error && (err as NodeJS.ErrnoException).code !== 'ERR_CANCELLED') {
 					void vscode.window.showErrorMessage(`Sign-in failed: ${err.message}`);
 				}
@@ -132,7 +133,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		})
 	);
 
-	// Status bar account item — one-click access to sign in / sign out.
+	// Status bar account item -- one-click access to sign in / sign out.
 	// Kept hidden until the startup auth check resolves to avoid a "Sign In" flash
 	// on every launch for users who are already signed in.
 	const accountStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 1000);
@@ -161,7 +162,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	};
 
 	// Show QuantLab Home dashboard after each active sign-in.
-	// Not shown during startup session restore — only when the user actively signs in.
+	// Not shown during startup session restore -- only when the user actively signs in.
 	let _homeShownThisSession = false;
 	let _isStartupRestore = true;
 	context.subscriptions.push(
@@ -276,6 +277,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	registerTradeCommands(context);
 	registerViewCommands(context);
 	registerDashboardCommands(context);
+	// Phase 5.7 V1 (2026-05-22): Quantbook engine demo round-trip.
+	registerQuantbookCommands(context);
 
 	new DataPanelProvider(context, globalState, watchlistManager);
 	const catalogService = ResourcesCatalogService.initialize(context);
@@ -286,7 +289,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
 	// Non-blocking catalog pre-fetch
 	void catalogService.getCatalog().catch(() => {
-		// Server unavailable — cached data or null will be used on first panel open
+		// Server unavailable -- cached data or null will be used on first panel open
 	});
 	new HistoryPanelProvider(context, historyState);
 	new TradePanelProvider(context, badgeManager);
@@ -474,7 +477,7 @@ async function checkOrphanedSessions(
 					aliveSessions.push(sessionId);
 				}
 			} catch {
-				// Socket file doesn't exist or inaccessible — stale, clean up
+				// Socket file doesn't exist or inaccessible -- stale, clean up
 				try {
 					await fs.promises.unlink(sockPath);
 				} catch { /* ignore */ }
@@ -491,7 +494,7 @@ async function checkOrphanedSessions(
 		);
 
 		if (action === 'Reconnect') {
-			// Reconnection is not yet implemented — inform the user
+			// Reconnection is not yet implemented -- inform the user
 			void vscode.window.showInformationMessage(
 				`Reconnection to orphaned sessions is not yet supported. Found: ${aliveSessions.join(', ')}`
 			);
@@ -503,9 +506,9 @@ async function checkOrphanedSessions(
 				} catch { /* best effort */ }
 			}
 		}
-		// 'Ignore' — do nothing
+		// 'Ignore' -- do nothing
 	} catch {
-		// Sessions directory doesn't exist — no orphans
+		// Sessions directory doesn't exist -- no orphans
 	}
 }
 
@@ -568,17 +571,17 @@ async function initializeServerConnection(
 					await client.refreshAccessToken();
 					output.appendLine(`[${new Date().toISOString()}] Delta Plus: Session refreshed on startup`);
 				} catch {
-					output.appendLine(`[${new Date().toISOString()}] Delta Plus: Session expired — sign in again via the account menu`);
+					output.appendLine(`[${new Date().toISOString()}] Delta Plus: Session expired -- sign in again via the account menu`);
 				}
 			} else {
-				output.appendLine(`[${new Date().toISOString()}] Delta Plus: Session restored — user signed in`);
+				output.appendLine(`[${new Date().toISOString()}] Delta Plus: Session restored -- user signed in`);
 			}
 		} else {
-			output.appendLine(`[${new Date().toISOString()}] Delta Plus: No saved session — sign in via the account menu`);
+			output.appendLine(`[${new Date().toISOString()}] Delta Plus: No saved session -- sign in via the account menu`);
 		}
 	} catch (err) {
 		output.appendLine(
-			`[${new Date().toISOString()}] Delta Plus: Auth init error — ${err instanceof Error ? err.message : String(err)}`
+			`[${new Date().toISOString()}] Delta Plus: Auth init error -- ${err instanceof Error ? err.message : String(err)}`
 		);
 	} finally {
 		// Signal ensureAuthenticated() that startup is done so pending API calls
@@ -601,7 +604,7 @@ async function initializeServerConnection(
  * Module-level reference so `deactivate()` can await final disposal.
  * `context.subscriptions.push` would call `dispose()` synchronously
  * and not wait for the daemon child processes to exit (Step B AF6 + Step
- * C megaudit C1 regression — fixed by awaiting in deactivate).
+ * C megaudit C1 regression -- fixed by awaiting in deactivate).
  */
 let qvizLifecycleManager: LifecycleManager | null = null;
 
@@ -611,7 +614,7 @@ let qvizLifecycleManager: LifecycleManager | null = null;
  * multi-folder workspace gets per-folder daemons (Step C megaudit C12).
  *
  * Returns a manager whose `getLifecycleForDocument` may itself return
- * null if Python isn't available — the spec editor still opens in that
+ * null if Python isn't available -- the spec editor still opens in that
  * case but save will REFUSE (Step C megaudit C5 enforcement).
  */
 function createQvizLifecycleManager(
@@ -646,7 +649,7 @@ function createQvizLifecycleManager(
 				return null;
 			}
 			// Megaudit MAJOR-42: verify the resolved binary is actually
-			// Python ≥ 3.10 BEFORE spawning the daemon. The previous
+			// Python >= 3.10 BEFORE spawning the daemon. The previous
 			// code spawned blindly; if the user's
 			// `python.defaultInterpreterPath` pointed at a non-Python
 			// binary or Python 2.7, the daemon would crash at first
@@ -657,7 +660,7 @@ function createQvizLifecycleManager(
 				console.warn(
 					`Quantlab: Python at ${resolved.pythonPath} (source: ${resolved.source}) `
 					+ `failed version check: ${versionCheck.error}. `
-					+ 'Save will refuse for files in this workspace until a Python ≥3.10 is configured.',
+					+ 'Save will refuse for files in this workspace until a Python >=3.10 is configured.',
 				);
 				void vscode.window.showErrorMessage(
 					`Quantlab: configured Python (${resolved.pythonPath}) is not usable: ${versionCheck.error}`,

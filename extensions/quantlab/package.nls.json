@@ -27,6 +27,7 @@
 	"command.viewSession.title": "View Trading Session",
 	"command.trade.viewInChart.title": "View Session in Chart",
 	"command.killSwitch.title": "Execute Kill Switch",
+	"command.quantbookDemo.title": "Quantbook: Demo Round-Trip",
 	"command.openRiskSettings.title": "Open Risk Settings",
 	"command.openBrokerSettings.title": "Open Broker Settings",
 	"command.selectDataSource.title": "Select Data Source",
