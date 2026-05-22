@@ -1,14 +1,14 @@
 ---
 name: 2026-05-22_phase-5-7-v3-2-cell-grid-ui
-status: in-progress (V3.2.a SCAFFOLD COMPLETE -- exportSnapshot napi (engine `355a3226f0a`) + IDE typed wrapper (`831c9f2bf37`) + webview scaffold + quantbookCellGrid command (`fcfe9e91188`); virtualized renderer deferred to V3.3; V3.2.b cell-edit flow is the next entry; predecessor V3.1 fully shipped at engine `97ac0b902d1` / IDE `a46abea484a`)
+status: in-progress (V3.2.a SCAFFOLD COMPLETE + V3.2.a.1 ergonomic enhancement -- exportSnapshot napi (engine `355a3226f0a`) + IDE typed wrapper (`831c9f2bf37`) + webview scaffold + `quantlab.quantbookCellGrid` command (`fcfe9e91188`) + V3.2.a.1 in-place refresh + single-tab-per-sheet (`130d28000ca`); engine Cargo.lock fix for V3.2.a serde_json (`748c09194d9`); virtualized renderer deferred to V3.3; V3.2.b cell-edit flow is the next entry; predecessor V3.1 fully shipped at engine `97ac0b902d1` / IDE `a46abea484a`)
 date: 2026-05-22
 predecessor_plan: .plans/_archive/2026-05-22_phase-5-7-v3-1-multi-window-demo.md (V3.1 multi-window demo, all sub-steps + audit closed)
 predecessor_v2_exit_packet: docs/phase5/5-7-v2-exit-packet.md (V2 phase termination -- Transport binding architectural decisions V2.1-V2.8)
 predecessor_v3_1_audits: docs/audits/2026-05-22-phase-5-7-v3-1-{codex,opus}.md (V3.1.e parallel audit; Opus § Section 3 contains the V3.2 ENTRY READINESS analysis this plan is built on)
 parent_phase: 5.7 Collaboration IDE Vertical Slice
 direction: V3.2 -- cell-grid UI. Real grid widget bound to a CollabSession; user-facing cell editing surface. First production-grade IDE consumer of the V2 Transport binding + V3.1 multi-window infrastructure.
-current_engine_head: 355a3226f0a (V3.2.a engine -- exportSnapshot napi method)
-current_ide_head: fcfe9e91188 (V3.2.a IDE scaffold -- cellGrid webview + command + 5 HTML tests)
+current_engine_head: 748c09194d9 (Cargo.lock fix for V3.2.a serde_json dep; session-end audit drift-fix)
+current_ide_head: 130d28000ca (V3.2.a.1 in-place refresh + single-tab-per-sheet)
 current_mocha_count: 108 / 108
 current_ql_collab_tests: 74 / 74 (with --features test-fixtures)
 current_ql_collab_ws_tests: 42 / 42 (10 lib + 30 websocket_transport + 2 V3.1.a relay)
@@ -183,43 +183,55 @@ From V2 exit packet + V3.1.e audit:
 - AtomicUsize conn_id wrap (V3.1.e Codex L3).
 - 8 of 9 V3.1.e Opus LOWs.
 
-## §1 First-five-minutes verification (V3.2 session entry)
+## §1 First-five-minutes verification (V3.2.b session entry)
 
 ```sh
 # Engine
 cd /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
 git status --short | grep -v '^??'    # expect empty
-git log --oneline -3
+git log --oneline -5
 # Expect newest at top:
-#   <v3.2-archive-commit> docs(5.7): V3.1 plan archive + V3.2 entry plan drafted
-#   97ac0b902d1 Phase 5.7 V3.1.e Codex L2 closure -- relay graceful shutdown
-#   35ae20e9729 docs(5.7): V3.1.e audit transcripts + V3.1 fully-shipped status
+#   748c09194d9 build(quantbook): commit Cargo.lock for V3.2.a serde_json dep addition
+#   a8c9b939c03 docs(5.7): V3.2.a scaffold complete -- plan status update
+#   93277be4d7f docs(5.7): V3.2.a snapshot foundation status update
+#   355a3226f0a feat(quantbook): V3.2.a (engine) -- exportSnapshot napi method
+#   55a689a0797 docs(5.7): V3.1 plan archive + V3.2 entry plan drafted
 
 # IDE
 cd /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab
 git status --short | grep -v '^??'   # expect empty
-git log --oneline -3
+git log --oneline -5
 # Expect newest first:
-#   a46abea484a feat(quantbook): Phase 5.7 V3.1.e closure (Codex LOW-5) -- reconnect-mid-flight engine contract test
-#   2ec61e5333f feat(quantbook): Phase 5.7 V3.1.e closures (IDE) -- spawn race retry + Windows-cold-spawn timeout + signal-aware liveness predicate
-#   81846a502d3 feat(quantbook): Phase 5.7 V3.1.c (IDE) -- Restart Demo action + dispose-from-handler
+#   130d28000ca V3.2.a.1 (IDE) -- in-place panel refresh + single-tab-per-sheet
+#   fcfe9e91188 V3.2.a scaffold (IDE) -- webview + quantbookCellGrid command
+#   831c9f2bf37 V3.2.a (IDE) -- typed wrapper for exportSnapshot + 5 mocha tests
+#   58f607fe1d0 V2.9 Lane C M3 closure
+#   a46abea484a V3.1.e closure (Codex LOW-5) -- reconnect-mid-flight test
 
 # Tests baseline:
-#   ql-collab 74/74; ql-collab-ws 42/42; IDE mocha 98/98
+#   ql-collab 74/74; ql-collab-ws 42/42; IDE mocha 108/108
 ```
 
-## §2 Reading order for V3.2 (next session)
+## §2 Reading order for V3.2.b (next session)
 
 1. **`memory/current_work.md`** -- session handoff (entry point).
-2. **This V3.2 plan** -- current step inventory + design decisions.
-3. **`docs/audits/2026-05-22-phase-5-7-v3-1-opus.md` § Section 3** -- V3.2 entry readiness analysis (Opus). Required reading for V3.2.a kickoff.
-4. **`docs/architecture/ide-consumer-contract.md` § 4.1.y** -- reconnect contract (V3.2 grid is the first production consumer).
-5. **`docs/phase5/5-7-v2-exit-packet.md`** -- V2 Transport binding decisions (V3.2 grid is the first non-demo consumer).
-6. **`extensions/quantlab/src/quantbook/multiWindowDemo.ts`** -- V3.1 patterns to carry / discard for the grid widget.
-7. **VS Code Webview API docs** -- `vscode.WebviewView` vs `vscode.WebviewPanel` choice.
+2. **This V3.2 plan** -- V3.2.a checkboxes [x]; V3.2.b sub-step checklist drives the next session.
+3. **`docs/audits/2026-05-22-phase-5-7-v3-1-opus.md` § Section 3** -- V3.2 entry readiness (Opus). The R3 Send+Sync drift hazard applies to ANY new V3.2.b binding class (CellRange / CellEdit / etc.) -- parallel Codex+Opus Rule 4 review required per class.
+4. **`docs/architecture/ide-consumer-contract.md` § 4.1.y** -- reconnect contract (V3.2.b grid widget hooks this for inline error UX).
+5. **`extensions/quantlab/src/quantbook/cellGrid/cellGridHtml.ts`** + **`cellGridPanel.ts`** -- V3.2.a scaffold. V3.2.b adds message-passing on top; flip `enableScripts: true` + nonced CSP.
+6. **`extensions/quantlab/src/auth/LoginWebviewPanel.ts`** -- existing extension webview with message-passing + CSP pattern; use as a reference (V3.2.b can copy the nonce + onDidReceiveMessage skeleton).
+7. **VS Code Webview docs** on message-passing + CSP nonce.
 
-## §3 V3.2 entry recommendation
+## §3 V3.2.b entry recommendation
 
-Start at V3.2.a (scaffolding). The 4 design decisions above should be locked at V3.2.a entry (in a brief design-review cycle before coding); each decision has a recommended default. Disagreements with the defaults are valid -- they're recommendations, not mandates.
+Start V3.2.b by FIRST locking the message-passing protocol shape in this plan (extend §V3.2.b section below). Decision items:
+
+1. Message envelope: `{type: 'putValue' | 'refresh' | 'errorReply', ...}` discriminator + payload schema.
+2. Nonce derivation: per-panel-instance crypto.randomUUID() OR per-page-load random hex.
+3. Error reply schema: `{type: 'errorReply', sheet, row, col, code: QuantbookErrorCode, message}` for inline cell decoration.
+4. Optimistic vs pessimistic cell rendering: pre-V3.2.b assume PESSIMISTIC (commit only after engine accepts) -- matches CRDT semantics + avoids stale-rollback complexity.
+5. Re-render strategy on remote ops: V3.2.b does NOT include live remote propagation (V3.2.c). The V3.2.a.1 Refresh command is the workaround.
+
+LOCK these decisions BEFORE coding. Then implement V3.2.b sub-steps 1-7 per the V3.2.b checklist below.
 
 V3.2 is the first PRODUCT-USER-VISIBLE surface of the entire Phase 5.7 arc. The audit discipline that paid off 6 Rule 4 triggers across V1+V2 must continue.
