@@ -430,6 +430,29 @@ fn user_came_back_online(
 
 The runtime that drives `WebSocketTransport::connect` can be any tokio runtime (current_thread or multi_thread). The session's worker thread and the runtime can be the same thread (current_thread) or separate (multi_thread). The mpsc channels inside `WebSocketTransport` are clone-able tokio handles, so the writer/reader tasks run on the runtime regardless of which thread owns the session.
 
+### 4.1.y Multi-window IDE reconnect contract (Phase 5.7 V3.1.b + V3.1.c, 2026-05-22)
+
+**Status:** V3.1.a engine relay binary at `crates/ql-collab-ws/examples/relay-server.rs` + V3.1.b IDE command `quantlab.quantbookDemoMultiWindow` (file `extensions/quantlab/src/quantbook/multiWindowDemo.ts`). The multi-window demo is the first user-visible V3 surface; V3.2+ will lift these patterns into the production cell-grid UI.
+
+**Co-ordination model: symmetric try-connect-first.** Each VS Code window runs the same command. The first window to invoke spawns the relay binary as a child process (via `child_process.spawn`); subsequent windows detect the relay is already listening and skip the spawn step. PeerId = `BigInt(process.pid)` -- each renderer process has a unique PID; the BigInt comfortably fits within u64. Row = `pid & 0xffff` so multi-window appends land in distinct rows for visual convergence.
+
+**Reconnect-with-backoff contract** (closes V2.8 Lane C R2):
+
+1. Every catch on `appendPutValue` / `pollRemote` / `flushDeltaToTransport` etc. routes through `parseQuantbookError(err)`. If `info.code === 'transport_closed'` or `'transport_io'`, the demo calls `handleTransportClosed(label)`.
+2. `handleTransportClosed` is debounced via a `reconnectInFlight` flag -- concurrent timer ticks during a reconnect get a `return` early.
+3. The handler `session.detachTransport()` + calls `reconnectWithBackoff(engine, log)` which retries `engine.Transport.websocketConnect(...)` up to 3 times at 500 / 1000 / 2000 ms backoff.
+4. On success: `session.attachTransport(fresh)` + log "reconnect succeeded; demo resumes". Reconnect-in-flight gate releases; next timer tick resumes normal cadence.
+5. On exhaustion: stop the demo (clear timers, detach transport, kill spawned relay if this window owned it) BEFORE prompting the user. Then surface a `vscode.window.showWarningMessage(msg, 'Restart Demo')`. If the user clicks "Restart Demo", `vscode.commands.executeCommand('quantlab.quantbookDemoMultiWindow')` re-invokes the command -- the fresh invocation sees no running relay and re-spawns it via `connectOrSpawn`'s spawn fallback.
+
+**Dispose-from-handler safety**: the disposable's `dispose()` is idempotent (guarded by `isDisposed`). The reconnect-exhaustion path calls `dispose()` itself, AND `context.subscriptions` still holds a reference to the disposable. When the user later closes the window OR re-invokes the command, the eventual second `dispose()` call is a no-op.
+
+**Drift hazards** (for V3.x maintainers):
+- The relay binary's stdout marker `[ql-collab-ws relay] listening on ws://...` is the load-bearing readiness signal (Lane C R6). If you rename the marker, update both the binary AND `spawnRelayBinary`'s `readyMarker` constant.
+- The relay's default port `7117` is duplicated as a constant in the binary (`DEFAULT_PORT`) AND the IDE (`RELAY_PORT`). Keep them in sync. Mocha test uses `17117` to avoid collisions with a real running demo.
+- `MAX_RECONNECT_TRIES = 3` + `INITIAL_RECONNECT_BACKOFF_MS = 500` (doubling) are tuned for localhost; production over WAN will need a different policy (V3.x backlog: configurable + smarter -- jitter, indefinite retry on user request, etc.).
+
+**Out of scope for V3.1**: smarter reconnect policy, programmatic second-window spawn (today the user manually opens window 2 via File > New Window), TLS, auth, multi-session WAN.
+
 ---
 
 **D-1 (✅ SHIPPED 2026-05-20 — all 8 steps + 7 per-step audits + 1 megaudit):** `FormatId` is now `enum { Builtin(u32), Custom(PeerId, u32) }` in `ql-storage::format`. IDE callers MUST pattern-match the variant rather than reading `.0`. Use `FormatId::is_builtin()` / `is_custom()` / `GENERAL` accessors. For pre-D-1 bare-u32 ids (xlsx import), use `FormatId::legacy_from_u32(n)`. `Op::RegisterFormat` + `Op::SetCellFormat` carry `FormatIdWire` on the wire. `.qbook` envelope v8 carries the tagged-tuple `FormatEntryId` shape losslessly for multi-peer ids; v<8 envelopes auto-migrate. xlsx export flattens multi-peer FormatIds via dedup-by-code; non-LEGACY peer flattens reported via `XlsxExportReport.dropped_features`. xlsx import surfaces unresolved-overlay-numfmt as `report.unsupported` entries. `.qbook/oplog.bin` files wrapped in Tier D3 header (`OPLOG_MAGIC = b"QLOL"` + BE u32 `OPLOG_SCHEMA_VERSION`). `CollabSession::new` + `from_snapshot` + `OpLog::set_peer_id` assert `PeerId != 0` (release-firing). See `docs/phase5/d-1-exit-packet.md` for the full closure record.

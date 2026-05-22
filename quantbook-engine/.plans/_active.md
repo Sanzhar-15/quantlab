@@ -1,6 +1,6 @@
 ---
 name: 2026-05-22_phase-5-7-v3-multi-window-demo
-status: in-progress (V3.1.a engine relay SHIPPED at `9df01c5a050`; V3.1.b IDE multi-window command SHIPPED at `b314ead754d`; V3.1.c reconnect UX partially shipped, restart-on-failure action + ide-consumer-contract update remain; V3.1.e audit obligations pending = parallel Codex+Opus next session)
+status: in-progress (V3.1.a engine relay SHIPPED at `9df01c5a050`; V3.1.b IDE multi-window command SHIPPED at `b314ead754d`; V3.1.c reconnect UX SHIPPED at IDE `81846a502d3` + engine docs in this commit; V3.1.e parallel Codex+Opus audit DISPATCHED this session)
 date: 2026-05-22
 predecessor_plan: .plans/_archive/2026-05-22_phase-5-7-v2-transport-binding.md (V2 phase — Transport binding through V2.8 megaudit)
 predecessor_v2_exit_packet: docs/phase5/5-7-v2-exit-packet.md (V2 phase termination — architectural decisions V2.1-V2.8, V3 backlog, V3-entry readiness reference)
@@ -83,10 +83,10 @@ Two VS Code IDE windows on localhost, each running a `CollabSession`, connected 
    - package.json + package.nls.json updated with the new command + title.
    - User instructions surfaced in OutputChannel: "Open another VS Code window via File > New Window and run this command again."
 
-- [~] **V3.1.c — Multi-window error UX** — PARTIALLY shipped in V3.1.b (`b314ead754d`):
-   1. ✅ `transport_closed` → automatic detach + reconnect with 500/1000/2000ms backoff, 3 tries max, "Connection lost" `vscode.window.showErrorMessage` on exhaustion. Implemented in `multiWindowDemo.ts::reconnectWithBackoff` + `handleTransportClosed`.
-   2. [ ] Server-side crash UX: today the reconnect-exhausted notification IS the "Demo server stopped" surface, but there is no "offer to restart" action. V3.1.c remainder: add a `vscode.window.showWarningMessage(message, 'Restart Demo')` action that re-invokes the command on user click.
-   3. [ ] Document reconnect contract in `docs/architecture/ide-consumer-contract.md`.
+- [x] **V3.1.c — Multi-window error UX** ✅ SHIPPED 2026-05-22:
+   1. ✅ `transport_closed` → automatic detach + reconnect with 500/1000/2000ms backoff, 3 tries max (V3.1.b at `b314ead754d`).
+   2. ✅ Reconnect exhaustion: `dispose()` runs BEFORE prompting (clears timers, detaches transport, kills spawned relay), then `vscode.window.showWarningMessage(message, 'Restart Demo')`; on click re-invokes the command for a clean restart. Disposed-mid-reconnect guard prevents `attachTransport(fresh)` on a torn-down session. IDE commit `81846a502d3`.
+   3. ✅ Reconnect contract documented at `docs/architecture/ide-consumer-contract.md` § 4.1.y (this commit's engine doc update).
 
 - [x] **V3.1.d — Tests** ✅ PARTIALLY done in V3.1.a + V3.1.b commits:
    1. ✅ V3.1.a integration tests in `crates/ql-collab-ws/tests/relay.rs` (2 tests): cross-broadcast A→B + self-filter pin; 3-way fan-out pin.
