@@ -2247,6 +2247,7 @@ dependencies = [
  "ql-collab-ws",
  "ql-oplog",
  "ql-types",
+ "serde_json",
  "tokio",
 ]
 
