@@ -1,6 +1,6 @@
 ---
 name: 2026-05-22_phase-5-7-v3-2-cell-grid-ui
-status: in-progress (V3.2.a SCAFFOLD COMPLETE + V3.2.a.1 ergonomic enhancement -- exportSnapshot napi (engine `355a3226f0a`) + IDE typed wrapper (`831c9f2bf37`) + webview scaffold + `quantlab.quantbookCellGrid` command (`fcfe9e91188`) + V3.2.a.1 in-place refresh + single-tab-per-sheet (`130d28000ca`); engine Cargo.lock fix for V3.2.a serde_json (`748c09194d9`); virtualized renderer deferred to V3.3; V3.2.b cell-edit flow is the next entry; predecessor V3.1 fully shipped at engine `97ac0b902d1` / IDE `a46abea484a`)
+status: in-progress (V3.2.a + V3.2.a.1 SHIPPED + AUDITED docs through `c88ca9d41e4` / IDE `14875aa2330`. V3.2.b.1 DECISION LOCK shipped this commit -- 5 design decisions (envelope, nonce, errorReply, pessimistic-rendering, no-remote-auto-refresh) locked in §3 below. V3.2.b.2-V3.2.b.6 (~3d total) is the implementation sequence; next commit ships V3.2.b.2 nonced-CSP HTML refactor.)
 date: 2026-05-22
 predecessor_plan: .plans/_archive/2026-05-22_phase-5-7-v3-1-multi-window-demo.md (V3.1 multi-window demo, all sub-steps + audit closed)
 predecessor_v2_exit_packet: docs/phase5/5-7-v2-exit-packet.md (V2 phase termination -- Transport binding architectural decisions V2.1-V2.8)
@@ -222,16 +222,87 @@ git log --oneline -5
 6. **`extensions/quantlab/src/auth/LoginWebviewPanel.ts`** -- existing extension webview with message-passing + CSP pattern; use as a reference (V3.2.b can copy the nonce + onDidReceiveMessage skeleton).
 7. **VS Code Webview docs** on message-passing + CSP nonce.
 
-## §3 V3.2.b entry recommendation
+## §3 V3.2.b design decisions (LOCKED 2026-05-22)
 
-Start V3.2.b by FIRST locking the message-passing protocol shape in this plan (extend §V3.2.b section below). Decision items:
+### Decision B1: Message envelope schema
 
-1. Message envelope: `{type: 'putValue' | 'refresh' | 'errorReply', ...}` discriminator + payload schema.
-2. Nonce derivation: per-panel-instance crypto.randomUUID() OR per-page-load random hex.
-3. Error reply schema: `{type: 'errorReply', sheet, row, col, code: QuantbookErrorCode, message}` for inline cell decoration.
-4. Optimistic vs pessimistic cell rendering: pre-V3.2.b assume PESSIMISTIC (commit only after engine accepts) -- matches CRDT semantics + avoids stale-rollback complexity.
-5. Re-render strategy on remote ops: V3.2.b does NOT include live remote propagation (V3.2.c). The V3.2.a.1 Refresh command is the workaround.
+**Outgoing (webview -> extension host):**
 
-LOCK these decisions BEFORE coding. Then implement V3.2.b sub-steps 1-7 per the V3.2.b checklist below.
+```ts
+{ type: 'putValue', sheet: number, row: number, col: number, rawInput: string }
+```
+
+`rawInput` is the literal user-typed string. The extension host (NOT the webview) does
+`Number(rawInput.trim())` parsing + finite-number validation -- this keeps all engine-
+adjacent validation in TS code that can be unit-tested via mocha, and the webview
+script stays minimal + auditable. Text/boolean/error cell variants are READ-ONLY at
+V3.2.b because the V1 napi `appendPutValue(sheet, row, col, value: f64)` only takes a
+number; non-numeric input surfaces a `bad_argument` errorReply.
+
+**Incoming (extension host -> webview):**
+
+```ts
+{ type: 'refresh', snapshot: QuantbookCellSnapshot }            // success path
+{ type: 'errorReply', sheet: number, row: number, col: number,
+  code: QuantbookErrorCode, message: string }                    // failure path
+```
+
+`refresh` triggers full re-render. `errorReply` triggers a per-cell decoration without
+a re-render (because the engine's snapshot is unchanged in the failure case).
+
+Unknown `type` values from EITHER direction are logged + ignored (defense against a
+future schema bump that the other side doesn't recognize). No silent fall-through.
+
+### Decision B2: Nonce derivation
+
+Per-`render()`-call 32-char alphanumeric random string (matching the
+`LoginWebviewPanel._nonce()` pattern at `extensions/quantlab/src/auth/LoginWebviewPanel.ts:301-308`).
+NOT `crypto.randomUUID()` -- dashes in UUIDs require escaping in CSP `script-src`
+directives and the alphanumeric format is the in-repo convention.
+
+Re-generated each `render()` so subsequent refreshes get fresh nonces -- defence in
+depth against any leaked-nonce scenario across panel rebuilds.
+
+### Decision B3: Error reply schema + UX
+
+Schema as in B1. UX: a per-cell red border + a `title=`-attribute tooltip showing
+`[code] message`. The decoration is added by the WEBVIEW SCRIPT on `errorReply`,
+NOT by re-rendering -- because re-rendering would clobber the user's input element
+and the failure case is supposed to keep the user's typed text visible for correction.
+
+Auto-dismissed on the next successful commit to the same cell (a `refresh` message
+re-renders without the error class, so the dismissal is implicit).
+
+### Decision B4: Optimistic vs pessimistic cell rendering
+
+PESSIMISTIC. The cell shows the user's input element until the extension host
+confirms via `refresh` (engine accepted; full re-render) or `errorReply` (engine
+rejected; keep input + decorate). No client-side mutation of `<td>` text until the
+extension confirms.
+
+Rationale: matches CRDT semantics (engine is source of truth); avoids stale-rollback
+complexity; localhost IPC latency is sub-millisecond so the user perceives no lag.
+If V3.x adds a slow-network mode (TLS + WAN), an optimistic path may be worth
+revisiting -- not for V3.2.
+
+### Decision B5: Re-render strategy on remote ops
+
+V3.2.b does NOT subscribe to remote-op observation. Remote-peer ops require V3.2.c
+(live multi-window propagation). V3.2.b users who need to see remote state use the
+V3.2.a.1 `quantlab.quantbookCellGridRefresh` command as the workaround.
+
+This means: if window A edits cell (0,0) and window B's panel is open, window B's
+panel does NOT auto-update at V3.2.b. The user must run Refresh manually. This is a
+known V3.2.b-scope limitation surfaced via plan + (V3.2.b ship time) ide-consumer-
+contract docs.
+
+### Sub-step rollout (V3.2.b implementation order)
+
+1. **V3.2.b.1** -- This decision lock + plan commit (single commit, docs-only).
+2. **V3.2.b.2** -- `cellGridHtml.ts` accepts nonce; HTML embeds nonced `<script>`; CSP widens `script-src` to `'nonce-...'`; cells gain `data-row` / `data-col` attributes; CSS adds `.cell-edit-error` decoration class.
+3. **V3.2.b.3** -- `cellGridPanel.ts` flips `enableScripts: true`; generates nonce per render; sets up `onDidReceiveMessage` switch on `putValue`; commits via `appendPutValueValidated`; on success re-renders; on error posts `errorReply` with `parseQuantbookError(err).code`.
+4. **V3.2.b.4** -- Webview script: click-to-edit (replace `<td>` content with `<input>`); Enter/blur commits; Escape cancels; listens for `refresh` (no-op -- handled by host re-render) + `errorReply` (decorate cell, surface tooltip).
+5. **V3.2.b.5** -- Tests: pure HTML test (nonce embedded + cells have data-attrs + script tag present + CSP includes `script-src 'nonce-'`); host-side test (simulated `onDidReceiveMessage` callback parses + commits via real engine).
+6. **V3.2.b.6** -- Doc update in `ide-consumer-contract.md` § 4.1.z (new section) documenting the webview message-passing contract + the V3.2.b "no remote auto-refresh" limitation.
 
 V3.2 is the first PRODUCT-USER-VISIBLE surface of the entire Phase 5.7 arc. The audit discipline that paid off 6 Rule 4 triggers across V1+V2 must continue.
