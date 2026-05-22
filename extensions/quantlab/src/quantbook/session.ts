@@ -169,40 +169,58 @@ export function isAutoFlushPolicy(value: unknown): value is AutoFlushPolicy {
 // =====================================================================
 
 /**
- * Set of `QuantbookErrorCode` values **emitted by the engine binding**.
+ * Compile-time-enforced map of every `QuantbookErrorCode` the engine
+ * binding emits (the union minus the `'unknown'` parser fallback).
  *
- * **V2.7 audit closure (Opus MEDIUM-1, 2026-05-22)**: `'unknown'` is
- * INTENTIONALLY OMITTED from this set. It is the parser's fallback
- * sentinel, NOT a code the engine ever emits. If a future engine
- * variant accidentally returned `"unknown"` as its kind, treating
- * the resulting `"[unknown] foo"` prefix as a recognized code would
- * strip the prefix (turning `message` into `"foo"`) while a less
- * misleading `"[future_kind] foo"` would preserve `message` intact.
- * Removing `'unknown'` from the set keeps `parseQuantbookError`'s
- * fallback behavior symmetric across both cases.
+ * **V2.9 hardening (Opus-B Lane C MEDIUM-3 closure, 2026-05-22)**:
+ * pre-V2.9 the `KNOWN_QUANTBOOK_ERROR_CODES` Set below was a manually-
+ * maintained string list. Adding a new code to {@link QuantbookErrorCode}
+ * without also adding it to the Set silently bucketed engine emissions
+ * of the new code under `'unknown'` in {@link parseQuantbookError} --
+ * defeating the V2.7 structured-discrimination contract for that code
+ * until the IDE binding was patched. The Lane C megaudit flagged this
+ * as required-pre-V3 because V3 will add more kinds (presence, undo
+ * groups, FormatId binding) and the drift surface widens.
  *
- * **Codex M3 closure note**: keeping this set in sync with the
- * union type {@link QuantbookErrorCode} (minus `'unknown'`) is a
- * manual discipline. V2 backlog: codegen this set from the union
- * (or use a const enum) to eliminate the drift hazard.
+ * The `Record<Exclude<QuantbookErrorCode, 'unknown'>, true>` shape
+ * below enforces the invariant at TypeScript compile time:
+ * - adding a code to {@link QuantbookErrorCode} without adding a key
+ *   here fails compile with "Property 'new_code' is missing in type ...";
+ * - adding a key here that isn't in {@link QuantbookErrorCode} fails
+ *   compile with "Object literal may only specify known properties".
+ *
+ * `'unknown'` is INTENTIONALLY excluded via the `Exclude<>` -- it is
+ * the parser's fallback sentinel, NOT a code the engine ever emits.
+ * If a future engine variant accidentally returned `"unknown"` as its
+ * kind, treating `"[unknown] foo"` as a recognized prefix would strip
+ * it (turning `message` into `"foo"`) while a less misleading
+ * `"[future_kind] foo"` would preserve `message` intact. Excluding
+ * `'unknown'` from this record keeps `parseQuantbookError`'s fallback
+ * behavior symmetric across both cases (V2.7 Opus MEDIUM-1 invariant).
  */
-const KNOWN_QUANTBOOK_ERROR_CODES: ReadonlySet<QuantbookErrorCode> = new Set<QuantbookErrorCode>([
-	'transport_io',
-	'transport_closed',
-	'websocket_invalid_url',
-	'websocket_connect_failed',
-	'websocket_handshake_failed',
-	'websocket_runtime_error',
-	'session_oplog',
-	'session_presence',
-	'session_undo',
-	'session_replay',
-	'bad_argument',
-	// 'unknown' is the parser fallback sentinel; NOT in the set per
-	// Opus V2.7 MEDIUM-1. If the engine ever returns a literal
-	// `"unknown"` kind, the bracket prefix is preserved in `message`
-	// alongside `code='unknown'`, signaling binding drift.
-]);
+const KNOWN_QUANTBOOK_ERROR_CODE_RECORD: Record<Exclude<QuantbookErrorCode, 'unknown'>, true> = {
+	transport_io: true,
+	transport_closed: true,
+	websocket_invalid_url: true,
+	websocket_connect_failed: true,
+	websocket_handshake_failed: true,
+	websocket_runtime_error: true,
+	session_oplog: true,
+	session_presence: true,
+	session_undo: true,
+	session_replay: true,
+	bad_argument: true,
+};
+
+/**
+ * Runtime view of {@link KNOWN_QUANTBOOK_ERROR_CODE_RECORD}, derived
+ * via `Object.keys`. Used by {@link parseQuantbookError} to validate
+ * bracket-prefix codes. The Set is structurally guaranteed to match
+ * the record's keys -- no manual sync required.
+ */
+const KNOWN_QUANTBOOK_ERROR_CODES: ReadonlySet<QuantbookErrorCode> = new Set(
+	Object.keys(KNOWN_QUANTBOOK_ERROR_CODE_RECORD) as Array<Exclude<QuantbookErrorCode, 'unknown'>>,
+);
 
 /**
  * Bracket-prefix regex: `[<code>] <message>` where `<code>` starts

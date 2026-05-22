@@ -1610,6 +1610,48 @@ suite('quantbook V2.7 -- structured error-code discrimination (parseQuantbookErr
 		assert.ok(!isQuantbookErrorCode('Transport_Closed'),
 			'case-sensitive: TitleCase rejected');
 	});
+
+	test('V2.9 closure: every QuantbookErrorCode (except `unknown`) round-trips through parseQuantbookError', () => {
+		// **V2.9 hardening (Opus-B Lane C MEDIUM-3 closure, 2026-05-22)**:
+		// pre-V2.9, KNOWN_QUANTBOOK_ERROR_CODES was a manually-maintained
+		// string Set alongside the QuantbookErrorCode union -- a fresh
+		// engine kind added to the union but forgotten in the Set would
+		// silently bucket under 'unknown'. V2.9 closure derives the Set
+		// from a Record<Exclude<QuantbookErrorCode, 'unknown'>, true> so
+		// adding/removing a code without updating BOTH is a TS compile
+		// error. This test pins the runtime view: every code in the
+		// QuantbookErrorCode union (except 'unknown') round-trips
+		// through a synthetic bracket-prefixed error and recovers its
+		// own code -- if a future code is added to the union but the
+		// V2.9 record is left manually un-updated (i.e., the Record is
+		// torn down to a hand-list again), this test fails first.
+		const codes = [
+			'transport_io',
+			'transport_closed',
+			'websocket_invalid_url',
+			'websocket_connect_failed',
+			'websocket_handshake_failed',
+			'websocket_runtime_error',
+			'session_oplog',
+			'session_presence',
+			'session_undo',
+			'session_replay',
+			'bad_argument',
+		] as const;
+		for (const code of codes) {
+			const err = new Error(`[${code}] synthetic test message`);
+			const info = parseQuantbookError(err);
+			assert.strictEqual(info.code, code,
+				`code ${code} must round-trip; got ${info.code} (KNOWN_QUANTBOOK_ERROR_CODE_RECORD may be out of sync with the union)`);
+			assert.strictEqual(info.message, 'synthetic test message',
+				`message stripping must be correct for code ${code}`);
+		}
+		// And the unknown sentinel routes correctly too.
+		const unknownErr = new Error('[future_unbound] should fall through');
+		const unknownInfo = parseQuantbookError(unknownErr);
+		assert.strictEqual(unknownInfo.code, 'unknown',
+			'unrecognized prefix falls back to unknown');
+	});
 });
 
 suite('quantbook V2.7 -- structured error-code end-to-end (engine → napi → parseQuantbookError)', function () {
