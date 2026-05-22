@@ -1,17 +1,17 @@
 ---
 name: 2026-05-22_phase-5-7-v3-multi-window-demo
-status: in-progress (V2 phase TERMINATED via V2.8 megaudit + V2 exit packet; V2.9 Lane C M3 closure landing this commit; V3 entry plan drafted; V3.1 multi-window IDE demo is the first work item)
+status: in-progress (V3.1.a engine relay SHIPPED at `9df01c5a050`; V3.1.b IDE multi-window command SHIPPED at `b314ead754d`; V3.1.c reconnect UX partially shipped, restart-on-failure action + ide-consumer-contract update remain; V3.1.e audit obligations pending = parallel Codex+Opus next session)
 date: 2026-05-22
 predecessor_plan: .plans/_archive/2026-05-22_phase-5-7-v2-transport-binding.md (V2 phase — Transport binding through V2.8 megaudit)
 predecessor_v2_exit_packet: docs/phase5/5-7-v2-exit-packet.md (V2 phase termination — architectural decisions V2.1-V2.8, V3 backlog, V3-entry readiness reference)
 predecessor_lane_c_v3_readiness: docs/audits/2026-05-22-phase-5-7-v2-megaudit-opus-b-v3.md (§ Section 3 — V3 ENTRY READINESS — Lane C's Part 2)
 parent_phase: 5.7 Collaboration IDE Vertical Slice
 direction: V3 — product-visible vertical slice. Multi-window IDE demo first; cell-grid UI + persistence + rebuild_workbook wiring + full Op enum + undo/redo + presence follow.
-current_engine_head: 18d498fcffb (docs(5.7) V2 docs finalize v4 — V2 phase termination)
-current_ide_head: 5af03456785 (V2 docs finalize v4 IDE — V2 phase termination)
-current_mocha_count: 96 / 96 (V2.8 baseline 95 + V2.9 Lane C M3 round-trip test)
+current_engine_head: 9df01c5a050 (Phase 5.7 V3.1.a engine -- relay binary + integration tests; docs sweep for V3.1.b status pending)
+current_ide_head: b314ead754d (Phase 5.7 V3.1.b IDE -- multi-window demo command + V3.1 mocha round-trip)
+current_mocha_count: 97 / 97 (V2.9 baseline 96 + V3.1.b multi-window round-trip test)
 current_ql_collab_tests: 74 / 74 (with --features test-fixtures)
-current_ql_collab_ws_tests: 10 / 10
+current_ql_collab_ws_tests: 42 / 42 (10 lib + 30 websocket_transport + 2 V3.1.a relay integration tests)
 current_engine_workspace: 4472 / 0 baseline (last verified at V2.5 ship gate; V3 will re-verify at each step)
 audit_rules_inherited:
   - Rule 1: no fresh-session reminders (existing memory)
@@ -71,22 +71,27 @@ Two VS Code IDE windows on localhost, each running a `CollabSession`, connected 
      - `third_client_receives_both_streams`: 3-way fan-out pin.
    - Trade-off accepted: the inline twin in `tests/relay.rs` duplicates ~40 lines of `handle_connection` logic from the example binary. Keeping both in sync is a manual discipline; V3.2+ can promote to `pub mod relay` in the lib if reuse demands grow.
 
-- [ ] **V3.1.b — IDE `quantlab.quantbookDemo` command rewrite** — currently a single-window demo (per V1). Rewrite to:
-   1. Check whether already-running-as-window-2 (env var `QUANTLAB_QUANTBOOK_DEMO_PEER=2`).
-   2. If not (i.e., this is window 1): spawn relay server (child process via `child_process.spawn` of the V3.1.a binary, OR same-process via napi if A path chosen). Spawn window 2 via `vscode.commands.executeCommand('vscode.openFolder', uri, { forceNewWindow: true })` with env override so window 2 knows its peer role.
-   3. Both windows: load engine, create `CollabSession(peerId = 1n or 2n)`, `Transport.websocketConnect('ws://localhost:<port>')`, `attachTransport(t)`, set `AutoFlushPolicy::OnAppend`.
-   4. Surface progress in the OutputChannel with peer ID + connection state + op count.
-   5. Demo command in window 1 appends `PutValue(sheet=0, row=peerId, col=0, value=$timestamp)` every 2s; window 2 polls `pollRemote()` every 1s; both windows log `opCount()` to their OutputChannel. Edit propagation visible in the OutputChannel.
+- [x] **V3.1.b — IDE `quantlab.quantbookDemoMultiWindow` command** ✅ SHIPPED 2026-05-22 at IDE commit `b314ead754d`.
+   Design pivot from the original V3 plan: instead of env-var role hand-off + programmatic `vscode.openFolder` for window 2, V3.1.b uses **symmetric try-connect-first** -- each window runs the same command; the first window to invoke spawns the relay, subsequent windows detect it already listening and skip spawn. PeerId = `BigInt(process.pid)` (Lane C R7); row = `pid & 0xffff` so multi-window edits land in distinct rows for visual convergence.
+   - New `resolveRelayBinaryPath()` in `extensions/quantlab/src/quantbook/loader.ts` (mirror of `resolveEnginePath` walk-up pattern; escape hatch `QUANTBOOK_RELAY_BINARY_PATH`).
+   - New `extensions/quantlab/src/quantbook/multiWindowDemo.ts`:
+     - `spawnRelayBinary(log, binaryPath)` waits for the V3.1.a stdout marker `[ql-collab-ws relay] listening on ws://...` before resolving (Lane C R6 closure).
+     - `connectOrSpawn(engine, log)` symmetric across windows.
+     - `reconnectWithBackoff(engine, log)` 3 retries at 500/1000/2000ms (Lane C R2 closure).
+     - `runMultiWindowDemo(engine, log) -> Disposable` orchestrates: session per window, auto-flush onAppend, periodic 2s append + 1s poll, transport_closed -> reconnect path.
+   - New command `quantlab.quantbookDemoMultiWindow` registered alongside V1 `quantlab.quantbookDemo`. Both share the OutputChannel.
+   - package.json + package.nls.json updated with the new command + title.
+   - User instructions surfaced in OutputChannel: "Open another VS Code window via File > New Window and run this command again."
 
-- [ ] **V3.1.c — Multi-window error UX** — Lane C R2: today's `parseQuantbookError` handles single-session failure modes. Multi-window adds: peer disconnect from the other window, server crash, rapid reconnect storms. V3.1 ships:
-   1. `transport_closed` -> automatic detach + reconnect with exponential backoff (3 tries max, then "Connection lost" notification).
-   2. Server-side crash: both windows surface "Demo server stopped" + offer to restart.
-   3. Document the reconnect contract in IDE consumer notes.
+- [~] **V3.1.c — Multi-window error UX** — PARTIALLY shipped in V3.1.b (`b314ead754d`):
+   1. ✅ `transport_closed` → automatic detach + reconnect with 500/1000/2000ms backoff, 3 tries max, "Connection lost" `vscode.window.showErrorMessage` on exhaustion. Implemented in `multiWindowDemo.ts::reconnectWithBackoff` + `handleTransportClosed`.
+   2. [ ] Server-side crash UX: today the reconnect-exhausted notification IS the "Demo server stopped" surface, but there is no "offer to restart" action. V3.1.c remainder: add a `vscode.window.showWarningMessage(message, 'Restart Demo')` action that re-invokes the command on user click.
+   3. [ ] Document reconnect contract in `docs/architecture/ide-consumer-contract.md`.
 
-- [ ] **V3.1.d — Tests** — at least:
-   1. Mocha test that spawns the relay binary in a fixture, opens two CollabSessions in the SAME process (cross-Worker is unsupported per V2 — multi-window is cross-PROCESS), attaches both as separate ws clients to localhost, appends on session A, asserts session B sees the op via `pollRemote` within 500ms.
-   2. Mocha test for the reconnect path: kill the relay mid-flight, assert `transportLastError() === 'WebSocket runtime error: ...'` + `parseQuantbookError(err).code === 'transport_closed'` on next send.
-   3. Reuse the V2.5+V2.6 BlockingTransportFixture pattern for deterministic timing if needed.
+- [x] **V3.1.d — Tests** ✅ PARTIALLY done in V3.1.a + V3.1.b commits:
+   1. ✅ V3.1.a integration tests in `crates/ql-collab-ws/tests/relay.rs` (2 tests): cross-broadcast A→B + self-filter pin; 3-way fan-out pin.
+   2. ✅ V3.1.b IDE mocha `V3.1 round-trip: two sessions exchange ops through spawned relay binary` (port 17117 to avoid 7117 demo collision; spawns binary, awaits readiness, two sessions, A→B + B→A propagation pins). 97/97 mocha after V3.1.b.
+   3. [ ] V3.1.d remainder (deferred to V3.1.c follow-up): mocha test for the reconnect path -- kill relay mid-flight, assert `transportLastError()` populates + reconnect succeeds when relay restarts. Requires more elaborate process lifecycle (kill+respawn within one test). Reuse the V2.5 BlockingTransportFixture pattern is NOT needed -- the relay binary itself provides deterministic timing.
 
 - [ ] **V3.1.e — Audit obligations** per audit-discipline rules:
    - Parallel Codex + Opus per step (Rule 2).
