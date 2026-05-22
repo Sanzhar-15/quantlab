@@ -47,7 +47,7 @@ arrow-cast = "=58.3.0"
 
 # Concurrency
 rayon = "=1.12.0"
-tokio = { version = "=1.50.0", default-features = false, features = ["rt-multi-thread", "macros", "fs", "net", "time", "sync"] }
+tokio = { version = "=1.50.0", default-features = false, features = ["rt-multi-thread", "macros", "fs", "net", "time", "sync", "signal"] }
 
 # Phase 5.5 V2 V3 step 4 (2026-05-21) — WebSocket transport in ql-collab-ws.
 # tokio-tungstenite is the de-facto async websocket client for tokio.

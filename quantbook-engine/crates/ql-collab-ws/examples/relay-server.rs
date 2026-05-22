@@ -35,7 +35,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::signal;
 use tokio::sync::broadcast;
+use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::Message;
 
 /// Default port if `QL_RELAY_PORT` is unset. Picked to avoid common
@@ -68,23 +70,102 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (broadcast_tx, _initial_rx) = broadcast::channel::<(usize, Vec<u8>)>(BROADCAST_BUFFER);
     let next_conn_id = Arc::new(AtomicUsize::new(0));
 
+    // V3.1.e closure (Codex LOW-2, 2026-05-22) -- graceful shutdown
+    // via tokio::signal + JoinSet. Pre-V3.1.e the accept loop was
+    // unbounded and SIGTERM relied on OS socket reclaim. Now SIGINT
+    // (Ctrl-C) or SIGTERM cleanly stops accepting, drains active
+    // connection tasks, and returns from main so the runtime shuts
+    // down without leaking tasks.
+    let mut conn_set: JoinSet<()> = JoinSet::new();
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
     loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(t) => t,
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (stream, peer) = match accept_result {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("[ql-collab-ws relay] accept failed: {e}");
+                        continue;
+                    }
+                };
+                let conn_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
+                let broadcast_tx = broadcast_tx.clone();
+                eprintln!("[ql-collab-ws relay] conn {conn_id} accepted from {peer}");
+                conn_set.spawn(async move {
+                    match handle_connection(stream, conn_id, broadcast_tx).await {
+                        Ok(()) => eprintln!("[ql-collab-ws relay] conn {conn_id} closed cleanly"),
+                        Err(e) => eprintln!("[ql-collab-ws relay] conn {conn_id} ended with: {e}"),
+                    }
+                });
+            }
+            _ = &mut shutdown => {
+                eprintln!(
+                    "[ql-collab-ws relay] shutdown signal received; aborting {} active connection(s)",
+                    conn_set.len(),
+                );
+                break;
+            }
+        }
+    }
+
+    // Abort all in-flight per-connection tasks. We deliberately do
+    // NOT wait for graceful WebSocket close handshakes -- the
+    // shutdown semantics are "shutdown RIGHT NOW; clients observe a
+    // TCP close and reconnect on their own".
+    //
+    // Why not a soft drain? Each per-conn task holds a
+    // `broadcast::Sender` clone (the read half's `read_tx`), so
+    // dropping the main `broadcast_tx` is NOT enough to wake the
+    // write halves -- the receivers see "Closed" only when ALL
+    // senders drop. A soft drain would block until every WebSocket
+    // peer happened to close its end, which is unbounded.
+    //
+    // For a future production relay (NOT this demo scope), use
+    // `tokio::time::timeout` around `join_next` to give peers a
+    // short grace period before aborting -- typically 100-500ms.
+    drop(broadcast_tx);
+    conn_set.abort_all();
+    while let Some(res) = conn_set.join_next().await {
+        // Aborted tasks return JoinError::is_cancelled() == true,
+        // which is the expected path. Only log non-cancellation
+        // errors (panicked tasks).
+        if let Err(e) = res {
+            if !e.is_cancelled() {
+                eprintln!("[ql-collab-ws relay] task ended with join error: {e}");
+            }
+        }
+    }
+    eprintln!("[ql-collab-ws relay] shutdown complete");
+    Ok(())
+}
+
+/// Wait for SIGINT (Ctrl-C) on all platforms or SIGTERM on Unix.
+/// Returns when EITHER signal arrives. On Windows the SIGTERM branch
+/// is never armed (kill -TERM doesn't exist there); Ctrl-C is the
+/// only graceful path.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm = match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(s) => s,
             Err(e) => {
-                eprintln!("[ql-collab-ws relay] accept failed: {e}");
-                continue;
+                eprintln!("[ql-collab-ws relay] failed to install SIGTERM handler: {e}");
+                // Fall back to ctrl_c only -- the daemon still
+                // shuts down on SIGINT, just not SIGTERM.
+                let _ = signal::ctrl_c().await;
+                return;
             }
         };
-        let conn_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
-        let broadcast_tx = broadcast_tx.clone();
-        eprintln!("[ql-collab-ws relay] conn {conn_id} accepted from {peer}");
-        tokio::spawn(async move {
-            match handle_connection(stream, conn_id, broadcast_tx).await {
-                Ok(()) => eprintln!("[ql-collab-ws relay] conn {conn_id} closed cleanly"),
-                Err(e) => eprintln!("[ql-collab-ws relay] conn {conn_id} ended with: {e}"),
-            }
-        });
+        tokio::select! {
+            _ = signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal::ctrl_c().await;
     }
 }
 
