@@ -19,11 +19,19 @@
  * Build the binary before running (path is relative to the IDE
  * workspace root, NOT this test file's directory):
  *   cd <ide-workspace-root>/quantlab-quantbook/quantbook-engine
- *   cargo build -p ql-bindings-node --release
+ *   cargo build -p ql-bindings-node --release --features test-fixtures
+ *
+ * **V2.8 megaudit closure (Opus-B Lane C HIGH-1, 2026-05-22)**:
+ * `--features test-fixtures` is now REQUIRED for the V2.5+V2.6+V2.7
+ * contention contract tests because `BlockingTransportFixture` is now
+ * gated behind the binding-side `test-fixtures` Cargo feature.
+ * Production cdylib builds (without the feature) load fine but lack
+ * the fixture; tests use `requireBlockingTransportFixture(engine)`
+ * below to throw a clear "rebuild" message if the fixture is absent.
  *
  * On macOS that's typically:
  *   cd ~/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
- *   cargo build -p ql-bindings-node --release
+ *   cargo build -p ql-bindings-node --release --features test-fixtures
  */
 
 import * as assert from 'assert';
@@ -44,6 +52,37 @@ import {
 	quantbookEngineVersion,
 	sessionFromSnapshot,
 } from '../src/quantbook/session';
+import type {
+	BlockingTransportFixtureConstructor,
+	QuantbookNativeModule,
+} from '../src/quantbook/types';
+
+/**
+ * **V2.8 megaudit closure (Opus-B Lane C HIGH-1, 2026-05-22)** — test
+ * helper for accessing the now-optional `BlockingTransportFixture`
+ * constructor on the loaded native module.
+ *
+ * Pre-V2.8 the fixture was always present (the binding crate enabled
+ * `ql-collab/test-fixtures` unconditionally). V2.8 gates it behind the
+ * binding-side `test-fixtures` Cargo feature. Mocha contention tests
+ * that use the fixture call this helper to surface a clear, actionable
+ * error if the loaded cdylib was built without the feature.
+ *
+ * Throws an Error explaining the required rebuild command.
+ */
+function requireBlockingTransportFixture(
+	engine: QuantbookNativeModule,
+): BlockingTransportFixtureConstructor {
+	if (typeof engine.BlockingTransportFixture !== 'function') {
+		throw new Error(
+			'engine.BlockingTransportFixture is missing from the loaded cdylib. ' +
+			'V2.8 megaudit closure: the fixture is now feature-gated. ' +
+			'Rebuild the engine with: cd .../quantbook-engine && ' +
+			'cargo build -p ql-bindings-node --release --features test-fixtures',
+		);
+	}
+	return engine.BlockingTransportFixture;
+}
 
 function engineAvailable(): { ok: true } | { ok: false; reason: string } {
 	const enginePath = resolveEnginePath();
@@ -1247,7 +1286,7 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 		//      regression while tolerating 10x slowdown for slow CI.
 		this.timeout(10000);
 		const engine = loadQuantbookEngine();
-		const fixture = new engine.BlockingTransportFixture(2000);
+		const fixture = new (requireBlockingTransportFixture(engine))(2000);
 		const t = fixture.takeTransport();
 		const session = createSession(1n);
 		session.attachTransport(t);
@@ -1285,7 +1324,7 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 		// the handles are non-locking Arc clones.
 		this.timeout(10000);
 		const engine = loadQuantbookEngine();
-		const fixture = new engine.BlockingTransportFixture(2000);
+		const fixture = new (requireBlockingTransportFixture(engine))(2000);
 		const t = fixture.takeTransport();
 		const session = createSession(1n);
 		session.attachTransport(t);
@@ -1303,7 +1342,7 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 	test('V2.6 BlockingTransportFixture: takeTransport is single-use', async function () {
 		this.timeout(5000);
 		const engine = loadQuantbookEngine();
-		const fixture = new engine.BlockingTransportFixture(100);
+		const fixture = new (requireBlockingTransportFixture(engine))(100);
 		// First take succeeds.
 		const t = fixture.takeTransport();
 		assert.ok(t.isAttachable(), 'first takeTransport returns attachable Transport');
@@ -1320,7 +1359,7 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 		// the test.
 		this.timeout(5000);
 		const engine = loadQuantbookEngine();
-		const fixture = new engine.BlockingTransportFixture(100);
+		const fixture = new (requireBlockingTransportFixture(engine))(100);
 		const t = fixture.takeTransport();
 		const session = createSession(1n);
 		session.attachTransport(t);
@@ -1338,7 +1377,7 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 	test('V2.6 BlockingTransportFixture: release() is idempotent', async function () {
 		this.timeout(5000);
 		const engine = loadQuantbookEngine();
-		const fixture = new engine.BlockingTransportFixture(2000);
+		const fixture = new (requireBlockingTransportFixture(engine))(2000);
 		fixture.release();
 		fixture.release(); // second call must not throw or deadlock
 		// Now take + attach + flush. Since release is already set,
@@ -1358,31 +1397,43 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 		// See engine `BlockingTransportFixture::new` docstring.
 		const engine = loadQuantbookEngine();
 		assert.throws(
-			() => new engine.BlockingTransportFixture(NaN),
+			() => new (requireBlockingTransportFixture(engine))(NaN),
 			/blockMs must be a finite/,
 		);
 		assert.throws(
-			() => new engine.BlockingTransportFixture(-1),
+			() => new (requireBlockingTransportFixture(engine))(-1),
 			/blockMs must be a non-negative integer/,
 		);
 		assert.throws(
-			() => new engine.BlockingTransportFixture(2.5),
+			() => new (requireBlockingTransportFixture(engine))(2.5),
 			/blockMs must be an integer/,
 		);
 		// V2.5 closure (Codex M1): zero rejected to prevent indefinite
 		// blocking from JS callers.
 		assert.throws(
-			() => new engine.BlockingTransportFixture(0),
+			() => new (requireBlockingTransportFixture(engine))(0),
 			/blockMs must be > 0/,
 		);
 	});
 
-	test('stale V2.4-shaped binary (missing V2.6 BlockingTransportFixture) is rejected at the boundary', () => {
-		// **V2.6 loader skew detection (2026-05-22)**: a binary
-		// built without the `test-fixtures` feature on ql-collab
-		// lacks `BlockingTransportFixture`. Without this check, the
-		// V2.5 contract tests would fail late with cryptic
-		// `engine.BlockingTransportFixture is not a constructor`.
+	test('V2.8 closure: production cdylib without BlockingTransportFixture loads OK; requireBlockingTransportFixture surfaces clear message', () => {
+		// **V2.8 megaudit closure (Opus-B Lane C HIGH-1 + Lane A LOW-1
+		// convergent, 2026-05-22)**: pre-V2.8 a binary built without
+		// `ql-collab/test-fixtures` was rejected at the boundary (the
+		// fixture was always required because `ql-bindings-node`
+		// enabled the feature unconditionally). V2.8 escalated the
+		// production-cdylib leak from V2.5-LOW-2 to HIGH (self-DoS
+		// surface: any in-process JS could park tokio blocking-pool
+		// threads for u32::MAX ms) and closed it by gating the
+		// fixture behind a binding-side `test-fixtures` Cargo
+		// feature. Production builds (default) load fine WITHOUT the
+		// fixture; only mocha + contention contract tests need the
+		// feature enabled.
+		//
+		// This test pins both halves of the new contract:
+		//   - loader does NOT throw on a fixture-less binary;
+		//   - requireBlockingTransportFixture(engine) DOES throw with
+		//     an actionable rebuild message if a test tries to use it.
 		const originalDlopen = process.dlopen;
 		_resetQuantbookEngineCacheForTests();
 		const fakeCollabSession = function () { /* fake */ };
@@ -1393,7 +1444,7 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 			'flushToTransport', 'pollRemote',
 			'flushDeltaToTransport', 'pollRemoteWithLimit',
 			'transportLastError', 'setAutoFlushPolicy', 'autoFlushPolicy',
-			'flushPendingToTransport', // V2.4 method present
+			'flushPendingToTransport',
 		]) {
 			(fakeCollabSession.prototype as Record<string, unknown>)[m] = function () { /* */ };
 		}
@@ -1402,18 +1453,29 @@ suite('quantbook V2.3 -- async Transport surface (WebSocketTransport + flushPend
 		(process as unknown as { dlopen: typeof process.dlopen }).dlopen =
 			(mod: NodeJS.Module): void => {
 				(mod as unknown as { exports: Record<string, unknown> }).exports = {
-					version: () => '0.1.0-pre-v2.6',
+					version: () => '0.1.0-prod-no-fixture',
 					CollabSession: fakeCollabSession,
 					Transport: fakeTransport,
 					LoopbackPair: function () { /* fake */ },
-					// V2.6 BlockingTransportFixture intentionally omitted.
+					// BlockingTransportFixture intentionally omitted —
+					// simulates a production build (no `--features
+					// test-fixtures`).
 				};
 			};
 		try {
+			// Half 1: loader accepts the fixture-less binary.
+			const engine = loadQuantbookEngine();
+			assert.strictEqual(
+				engine.BlockingTransportFixture,
+				undefined,
+				'production cdylib does not export BlockingTransportFixture',
+			);
+			// Half 2: tests that try to use the fixture get a clear
+			// rebuild message.
 			assert.throws(
-				() => loadQuantbookEngine(),
-				/BlockingTransportFixture \(V2\.6 test-fixtures\)/,
-				'stale V2.4 binary must mention the missing V2.6 export',
+				() => requireBlockingTransportFixture(engine),
+				/cargo build .* --features test-fixtures/,
+				'requireBlockingTransportFixture must point users at the rebuild command',
 			);
 		} finally {
 			process.dlopen = originalDlopen;
@@ -1615,7 +1677,7 @@ suite('quantbook V2.7 -- structured error-code end-to-end (engine → napi → p
 		try {
 			// blockMs = 0 rejected at napi boundary per V2.5 closure
 			// (Codex M1). V2.7 closure (Opus M2) adds bad_argument prefix.
-			new engine.BlockingTransportFixture(0);
+			new (requireBlockingTransportFixture(engine))(0);
 			assert.fail('expected throw');
 		} catch (err) {
 			const info = parseQuantbookError(err);
@@ -1654,5 +1716,64 @@ suite('quantbook V2.7 -- structured error-code end-to-end (engine → napi → p
 				`expected bad_argument code, got ${info.code}; msg=${info.message}`);
 			assert.match(info.message, /takeA already called/);
 		}
+	});
+
+	// ===============================================================
+	// Phase 5.7 V2.8 megaudit closure (2026-05-22) — Opus-B Lane C
+	// MEDIUM-4: parseQuantbookError walks Error.cause chain.
+	// ===============================================================
+
+	test('V2.8 closure: parseQuantbookError unwraps Error.cause to find bracket-prefixed engine code', () => {
+		// Simulates the napi `spawn_blocking` task-panic path: a
+		// generic Node Error wraps the engine's structured error;
+		// the engine's `[transport_closed] transport closed` lives
+		// on .cause, not on the top-level .message.
+		const inner = new Error('[transport_closed] transport closed');
+		const wrapper = new Error('spawn_blocking task panicked', { cause: inner });
+		const info = parseQuantbookError(wrapper);
+		assert.strictEqual(info.code, 'transport_closed',
+			`expected transport_closed code via cause walk, got ${info.code}`);
+		assert.strictEqual(info.message, 'transport closed');
+		assert.strictEqual(info.cause, wrapper,
+			'cause field must point at the original top-level throwable');
+	});
+
+	test('V2.8 closure: parseQuantbookError unwraps multi-level Error.cause chain', () => {
+		// Three-level nesting (outer wrapper → mid wrapper → engine).
+		// Realistic for napi + Promise rejection plumbing.
+		const engineErr = new Error('[websocket_invalid_url] invalid WebSocket URL: ws://host:9001/');
+		const midWrapper = new Error('async task failed', { cause: engineErr });
+		const outerWrapper = new Error('promise rejection bubble', { cause: midWrapper });
+		const info = parseQuantbookError(outerWrapper);
+		assert.strictEqual(info.code, 'websocket_invalid_url');
+		assert.match(info.message, /invalid WebSocket URL/);
+	});
+
+	test('V2.8 closure: parseQuantbookError cause walk has a self-cycle guard', () => {
+		// Hand-built cyclic cause (rare but possible if a logger or
+		// retry layer accidentally re-assigns .cause). The walker
+		// MUST terminate and return 'unknown'.
+		const a = new Error('outer');
+		const b = new Error('mid', { cause: a });
+		// Mutate a.cause to point at b → cycle a→b→a.
+		(a as { cause?: unknown }).cause = b;
+		const info = parseQuantbookError(a);
+		assert.strictEqual(info.code, 'unknown',
+			'cyclic cause chain must resolve to unknown, not hang');
+		assert.strictEqual(info.cause, a);
+	});
+
+	test('V2.8 closure: parseQuantbookError respects depth cap on deep cause chains', () => {
+		// Construct a 12-deep chain of bracket-less wrappers ending
+		// in a bracket-prefixed engine error. The walker's depth cap
+		// of 8 means it gives up before reaching the engine layer
+		// and returns 'unknown'. Pins the cap as a contract.
+		let current: Error = new Error('[session_oplog] oplog corrupted');
+		for (let i = 0; i < 12; i++) {
+			current = new Error(`wrapper depth=${i + 1}`, { cause: current });
+		}
+		const info = parseQuantbookError(current);
+		assert.strictEqual(info.code, 'unknown',
+			'chain deeper than QUANTBOOK_ERROR_CAUSE_MAX_DEPTH must return unknown');
 	});
 });

@@ -220,6 +220,14 @@ const KNOWN_QUANTBOOK_ERROR_CODES: ReadonlySet<QuantbookErrorCode> = new Set<Qua
 const QUANTBOOK_ERROR_PREFIX_RE = /^\[([a-z][a-z0-9_]*)\]\s*(.*)$/s;
 
 /**
+ * Maximum depth for walking `Error.cause` chains in
+ * {@link parseQuantbookError}. Defends against pathological
+ * self-referencing caches or accidental cycles while still allowing
+ * realistic napi wrapper chains (typically 1-3 levels).
+ */
+const QUANTBOOK_ERROR_CAUSE_MAX_DEPTH = 8;
+
+/**
  * Extract the structured code + message from a caught error.
  *
  * **Usage**:
@@ -234,22 +242,37 @@ const QUANTBOOK_ERROR_PREFIX_RE = /^\[([a-z][a-z0-9_]*)\]\s*(.*)$/s;
  * }
  * ```
  *
+ * **Cause-chain walking (V2.8 megaudit closure -- Opus-B Lane C
+ * MEDIUM-4, 2026-05-22)**: when no `[<code>]` prefix is found on
+ * the top-level `Error.message`, this function walks the
+ * `Error.cause` chain (max depth {@link QUANTBOOK_ERROR_CAUSE_MAX_DEPTH},
+ * self-cycle guard) looking for a bracket-prefixed engine error.
+ * Required because napi `spawn_blocking` task-panic paths wrap the
+ * engine's structured error in a generic Node `Error` whose
+ * `.message` has no bracket -- without the cause walk these were
+ * silently bucketed under `'unknown'`, defeating the V2.7 closure.
+ * The returned `code` reflects the deepest matched engine prefix;
+ * `cause` always points at the original top-level throwable so
+ * callers can still log the full wrapper context.
+ *
  * **Returns**: a `QuantbookErrorInfo` with `code = 'unknown'` if:
  * - the value is not an `Error` instance (e.g., a `throw 'string'`
  *   from non-engine code; **the structured discriminant is lost**
  *   in this case -- callers handling external code paths should
  *   wrap their throws in an `Error` to preserve the discriminant),
- * - the `Error.message` has no `[<code>] ` prefix, OR
- * - the prefix code is not a recognized `QuantbookErrorCode` (which
- *   means the IDE binding is older than the engine; a build refresh
- *   is in order).
+ * - no `Error` in the cause chain has a `[<code>] ` prefix, OR
+ * - a prefix is found but its code is not a recognized
+ *   `QuantbookErrorCode` (which means the IDE binding is older than
+ *   the engine; a build refresh is in order).
  *
  * For the unrecognized-prefix case (binding drift), the `message`
- * field preserves the FULL original `Error.message` including the
- * bracket prefix, so callers can log it for diagnosis.
+ * field preserves the FULL original top-level `Error.message`
+ * including the bracket prefix, so callers can log it for diagnosis.
  *
- * Closes V2.1+V2.2+V2.3 Opus MEDIUM-3 carryforwards + V2.7 Opus
- * LOW-4 (non-Error throwable JSDoc clarity).
+ * Closes V2.1 Opus MEDIUM-3 carryforward (lossy Display projection,
+ * carried as V2.2 Opus MEDIUM-4 and re-flagged in V2.3), V2.7 Opus
+ * LOW-4 (non-Error throwable JSDoc clarity), and V2.8 Opus-B Lane C
+ * MEDIUM-4 (Error.cause chain walking for napi wrapper paths).
  */
 export function parseQuantbookError(err: unknown): QuantbookErrorInfo {
 	if (!(err instanceof Error)) {
@@ -259,18 +282,33 @@ export function parseQuantbookError(err: unknown): QuantbookErrorInfo {
 			cause: err,
 		};
 	}
-	const match = QUANTBOOK_ERROR_PREFIX_RE.exec(err.message);
-	if (!match) {
-		return { code: 'unknown', message: err.message, cause: err };
+	// Walk Error.cause looking for the first bracket-prefixed engine
+	// error message. Self-cycle guard via Set of visited Errors.
+	const visited = new Set<Error>();
+	let current: unknown = err;
+	let depth = 0;
+	while (current instanceof Error && depth < QUANTBOOK_ERROR_CAUSE_MAX_DEPTH) {
+		if (visited.has(current)) {
+			break;
+		}
+		visited.add(current);
+		const match = QUANTBOOK_ERROR_PREFIX_RE.exec(current.message);
+		if (match) {
+			const rawCode = match[1];
+			const rest = match[2];
+			if (KNOWN_QUANTBOOK_ERROR_CODES.has(rawCode as QuantbookErrorCode)) {
+				return { code: rawCode as QuantbookErrorCode, message: rest, cause: err };
+			}
+			// Unknown code prefix: preserve the original top-level
+			// message (so the user sees the literal prefix) and
+			// signal 'unknown'. Caller can escalate this as a
+			// binding-drift signal.
+			return { code: 'unknown', message: err.message, cause: err };
+		}
+		current = (current as { cause?: unknown }).cause;
+		depth += 1;
 	}
-	const rawCode = match[1];
-	const rest = match[2];
-	if (KNOWN_QUANTBOOK_ERROR_CODES.has(rawCode as QuantbookErrorCode)) {
-		return { code: rawCode as QuantbookErrorCode, message: rest, cause: err };
-	}
-	// Unknown code: preserve the full original message (so the
-	// user can see the actual prefix) and return 'unknown'.
-	// Caller can then escalate this as a binding-drift signal.
+	// No bracket prefix anywhere in the chain → genuinely unknown.
 	return { code: 'unknown', message: err.message, cause: err };
 }
 

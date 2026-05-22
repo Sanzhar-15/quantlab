@@ -285,41 +285,29 @@ export function loadQuantbookEngine(): QuantbookNativeModule {
 			missing.push('Transport.websocketConnect (V2.3)');
 		}
 	}
-	// V2.6 (2026-05-22): validate `BlockingTransportFixture` test
-	// fixture export. ql-bindings-node enables the `test-fixtures`
-	// feature on ql-collab unconditionally, so any current cdylib
-	// MUST carry this. A binary built without the feature (e.g., a
-	// future production-build flow that strips it) would fail late
-	// with `engine.BlockingTransportFixture is not a constructor`
-	// when V2.5 contract tests instantiate it.
-	if (typeof (loaded as { BlockingTransportFixture?: unknown }).BlockingTransportFixture !== 'function') {
-		missing.push('BlockingTransportFixture (V2.6 test-fixtures)');
-	}
+	// V2.6 (2026-05-22): `BlockingTransportFixture` is the V2.5
+	// contract-test fixture for the V8-block closure. Pre-V2.8 it was
+	// required (`ql-bindings-node` enabled `ql-collab/test-fixtures`
+	// unconditionally, so every cdylib carried it).
+	//
+	// **V2.8 megaudit closure (Opus-B Lane C HIGH-1 + Lane A LOW-1
+	// convergent, 2026-05-22)**: the fixture is now feature-gated on
+	// `ql-bindings-node`'s `test-fixtures` Cargo feature. Production
+	// builds compile WITHOUT it; mocha + contention contract test
+	// builds compile WITH it. Therefore the loader treats the fixture
+	// as OPTIONAL -- its absence is no longer a binary-staleness
+	// signal, just a production build.
+	//
+	// Callers that need the fixture (mocha contract tests) check
+	// `engine.BlockingTransportFixture` explicitly and throw a clear
+	// "rebuild with --features test-fixtures" message if absent.
 	if (missing.length > 0) {
-		// **V2.5 audit closure (Codex LOW-3 + Opus LOW-3 convergent,
-		// 2026-05-22)**: stale-binary error UX. When the missing
-		// export is specifically a fixture (V2.6's
-		// BlockingTransportFixture), the rebuild command alone isn't
-		// enough -- the test-fixtures feature on ql-collab must be
-		// enabled. Today `ql-bindings-node`'s Cargo.toml enables it
-		// unconditionally, so the plain rebuild command works. But a
-		// future hardening step (Opus LOW-2 backlog: production-cdylib
-		// gating of the fixture) would change that. Surface the hint
-		// proactively so the error stays actionable across builds.
-		const fixtureMissing = missing.some(m => m.includes('BlockingTransportFixture'));
-		const featureHint = fixtureMissing ?
-			` Note: BlockingTransportFixture requires the 'test-fixtures' feature on the ql-collab dep ` +
-			`(see crates/ql-bindings-node/Cargo.toml). If a custom build flow has disabled it, ` +
-			`re-enable via 'cargo build -p ql-bindings-node --release --features ql-collab/test-fixtures' ` +
-			`or restore the feature in Cargo.toml.` :
-			'';
 		throw new Error(
 			`Quantbook engine at ${enginePath} loaded but is missing expected exports: ` +
 			`[${missing.join(', ')}]. ` +
 			`Got: ${JSON.stringify(Object.keys(fakeModule.exports))}. ` +
 			`This indicates a stale binary -- rebuild with: ` +
-			`cargo build -p ql-bindings-node --release.` +
-			featureHint,
+			`cargo build -p ql-bindings-node --release.`,
 		);
 	}
 	cachedModule = loaded;

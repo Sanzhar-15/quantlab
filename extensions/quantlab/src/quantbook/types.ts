@@ -324,11 +324,18 @@ export interface BlockingTransportFixtureConstructor {
 	/**
 	 * Construct a fresh `BlockingTransportFixture`.
 	 *
-	 * @param blockMs Upper-bound wait duration in milliseconds. `0`
-	 *                means "wait indefinitely until released" (use
-	 *                only when an explicit `release()` is guaranteed).
-	 *                Must be a finite non-negative integer in [0, u32::MAX].
-	 * @throws Error if `blockMs` is non-finite / negative / fractional / out-of-u32.
+	 * @param blockMs Upper-bound wait duration in milliseconds. Must be
+	 *                a finite integer in `[1, u32::MAX]` (strictly
+	 *                positive). `0` is REJECTED at the napi boundary
+	 *                with a `[bad_argument]` error (V2.5 audit closure
+	 *                Codex MEDIUM-1: zero would allow indefinite
+	 *                blocking from JS -- bounded self-DoS footgun).
+	 *                The engine-side `BlockingTransport::new(0, ...)`
+	 *                remains for Rust unit tests that explicitly want
+	 *                the indefinite-wait path; the napi fixture caps
+	 *                the surface to `[1, u32::MAX]`.
+	 * @throws Error with code `'bad_argument'` if `blockMs` is `0`,
+	 *               non-finite, negative, fractional, or out-of-u32.
 	 */
 	new(blockMs: number): BlockingTransportFixtureInstance;
 }
@@ -473,8 +480,20 @@ export interface QuantbookNativeModule {
 	 *
 	 * **NOT for production code** -- the underlying transport blocks
 	 * `flush_pending` indefinitely until released.
+	 *
+	 * **V2.8 megaudit closure (Opus-B Lane C HIGH-1 + Lane A LOW-1
+	 * convergent, 2026-05-22)**: this constructor is now OPTIONAL on
+	 * the loaded module. Production cdylib builds (built without
+	 * `--features test-fixtures` on `ql-bindings-node`) do NOT carry
+	 * `BlockingTransportFixture` -- eliminating the self-DoS surface
+	 * where in-process JS could park tokio blocking-pool threads for
+	 * u32::MAX milliseconds via `attachTransport(fixture.takeTransport())`.
+	 * Mocha + contention contract tests MUST rebuild the cdylib with
+	 * `cargo build -p ql-bindings-node --release --features test-fixtures`
+	 * and check `if (engine.BlockingTransportFixture) { ... }` before
+	 * use. Production runtime code MUST NOT touch this constructor.
 	 */
-	readonly BlockingTransportFixture: BlockingTransportFixtureConstructor;
+	readonly BlockingTransportFixture?: BlockingTransportFixtureConstructor;
 }
 
 // ============================================================================
