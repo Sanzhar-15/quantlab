@@ -67,6 +67,27 @@ const MAX_RECONNECT_TRIES = 3;
 const INITIAL_RECONNECT_BACKOFF_MS = 500;
 
 /**
+ * Defensive timeout for `spawnRelayBinary` readiness. V3.1.e audit
+ * closure (Opus MEDIUM-1, 2026-05-22): bumped from 5s -> 10s to
+ * tolerate Windows Defender real-time-scanning cold-spawn latency on
+ * the first invocation after a fresh `cargo build`. macOS Gatekeeper
+ * signing checks on a freshly-built binary can introduce similar
+ * latency. The relay binary itself binds in <100ms under normal
+ * conditions; the headroom is for first-spawn AV/notary overhead only.
+ * Override via `QUANTBOOK_RELAY_SPAWN_TIMEOUT_MS` env var.
+ */
+const RELAY_SPAWN_TIMEOUT_MS = (() => {
+	const env = process.env.QUANTBOOK_RELAY_SPAWN_TIMEOUT_MS;
+	if (typeof env === 'string') {
+		const n = Number.parseInt(env, 10);
+		if (Number.isFinite(n) && n > 0) {
+			return n;
+		}
+	}
+	return 10000;
+})();
+
+/**
  * Spawn the `relay-server` binary as a child process and await its
  * "listening on" stdout marker before resolving. The relay's stable
  * marker line (committed in V3.1.a engine commit `9df01c5a050`) is
@@ -157,9 +178,13 @@ async function spawnRelayBinary(
 			});
 		}
 
-		// Defensive timeout in case the binary is hung. Generous to
-		// tolerate cold-start cdylib resolution; the V3.1.a binary
-		// itself takes <100ms to bind.
+		// Defensive timeout in case the binary is hung. Bumped from 5s
+		// to RELAY_SPAWN_TIMEOUT_MS (10s default) at V3.1.e Opus
+		// MEDIUM-1 closure -- Windows Defender + macOS Gatekeeper on
+		// first-spawn-of-freshly-built-binary can take multiple
+		// seconds. Override via QUANTBOOK_RELAY_SPAWN_TIMEOUT_MS env
+		// var. The V3.1.a binary itself binds in <100ms; the headroom
+		// is for AV/notary overhead only.
 		setTimeout(() => {
 			if (!resolved) {
 				resolved = true;
@@ -167,11 +192,13 @@ async function spawnRelayBinary(
 					child.kill();
 				} catch { /* best-effort */ }
 				reject(new Error(
-					`[relay] did not emit readiness marker within 5s. ` +
-					`Expected stdout line: "${readyMarker} ws://127.0.0.1:${RELAY_PORT}".`,
+					`[relay] did not emit readiness marker within ${RELAY_SPAWN_TIMEOUT_MS}ms. ` +
+					`Expected stdout line: "${readyMarker} ws://127.0.0.1:${RELAY_PORT}". ` +
+					`Bump via QUANTBOOK_RELAY_SPAWN_TIMEOUT_MS if Windows Defender or ` +
+					`macOS Gatekeeper is causing slow first-spawn on a freshly-built binary.`,
 				));
 			}
-		}, 5000);
+		}, RELAY_SPAWN_TIMEOUT_MS);
 	});
 }
 
@@ -203,11 +230,40 @@ async function connectOrSpawn(
 	}
 
 	// Second try: spawn the relay, then connect.
+	//
+	// **V3.1.e audit closure (Opus MEDIUM-2 + Codex LOW-1 convergent,
+	// 2026-05-22)**: two VS Code windows invoking the demo
+	// concurrently both fail the initial connect (no relay up), both
+	// call `spawnRelayBinary`. The OS gives the bind to one process;
+	// the loser's binary exits with non-zero. Pre-V3.1.e the losing
+	// window surfaced `[relay] binary exited before readiness` as a
+	// FATAL, instead of joining the winning window's relay. Closure:
+	// on `spawnRelayBinary` failure, retry the initial connect ONCE;
+	// if it succeeds, treat this window as a joiner (spawnedRelay =
+	// undefined -> dispose() will NOT try to kill another window's
+	// relay).
 	const binaryPath = resolveRelayBinaryPath();
-	const spawnedRelay = await spawnRelayBinary(log, binaryPath);
-	const transport = await engine.Transport.websocketConnect(RELAY_URL);
-	log.appendLine(`[connect] spawned relay AND joined at ${RELAY_URL}`);
-	return { transport, spawnedRelay };
+	try {
+		const spawnedRelay = await spawnRelayBinary(log, binaryPath);
+		const transport = await engine.Transport.websocketConnect(RELAY_URL);
+		log.appendLine(`[connect] spawned relay AND joined at ${RELAY_URL}`);
+		return { transport, spawnedRelay };
+	} catch (spawnErr) {
+		const spawnDetail = spawnErr instanceof Error ? spawnErr.message : String(spawnErr);
+		log.appendLine(`[connect] spawn failed (${spawnDetail}); race-retry initial connect...`);
+		try {
+			const transport = await engine.Transport.websocketConnect(RELAY_URL);
+			log.appendLine(`[connect] joined relay spawned by another window (race-retry succeeded)`);
+			return { transport, spawnedRelay: undefined };
+		} catch (retryErr) {
+			const retryInfo = parseQuantbookError(retryErr);
+			log.appendLine(`[connect] race-retry connect also failed: code=${retryInfo.code} msg=${retryInfo.message}`);
+			// Fall through to the original spawn error -- it's more
+			// actionable than the connect error here (e.g., "build the
+			// binary" vs. "connection refused").
+			throw spawnErr;
+		}
+	}
 }
 
 /**
@@ -312,7 +368,17 @@ export async function runMultiWindowDemo(
 		try {
 			session.detachTransport();
 		} catch { /* best-effort */ }
-		if (spawnedRelay !== undefined && spawnedRelay.exitCode === null) {
+		// V3.1.e audit closure (Codex LOW-4, 2026-05-22): a child that
+		// exited from a signal has `exitCode === null` AND
+		// `signalCode !== null`. Checking only `exitCode` would attempt
+		// to kill an already-signaled (dead) child. Also honour
+		// `child.killed` for cleaner logging.
+		if (
+			spawnedRelay !== undefined &&
+			spawnedRelay.exitCode === null &&
+			spawnedRelay.signalCode === null &&
+			!spawnedRelay.killed
+		) {
 			log.appendLine('[relay] killing spawned child process');
 			try {
 				spawnedRelay.kill();
