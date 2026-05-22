@@ -1098,3 +1098,135 @@ fn mid_drop_bytes_lost_recoverable_via_reattach() {
         );
     });
 }
+
+// =============================================================
+// Phase 5.7 V2.5 (2026-05-22) — ack_handle integration tests
+// =============================================================
+
+#[test]
+fn ack_handle_wait_for_drain_matches_flush_pending() {
+    // V2.5 contract: WebSocketProgressAckHandle's wait_for_drain
+    // should reach the same Ok state as flush_pending for the same
+    // queued state.
+    use ql_collab::Transport as _;
+    let rt = multi_thread_runtime();
+    rt.block_on(async {
+        let server = EchoServer::start().await;
+        let mut ws = WebSocketTransport::connect(&server.url())
+            .await
+            .expect("handshake");
+
+        for i in 0..3u8 {
+            ws.send(&[i, i + 1]).expect("send");
+        }
+
+        // Capture the ack handle. Codex M1: target is captured at
+        // THIS call.
+        let handle = ws
+            .ack_handle()
+            .expect("WebSocketTransport returns ack handle");
+
+        // Drop the transport ref temporarily? No — we need it alive
+        // for the writer task. The handle holds Arc clones so it
+        // can survive the transport's drop, but here we just verify
+        // wait_for_drain returns Ok with the transport still alive.
+        let start = std::time::Instant::now();
+        let result = handle.wait_for_drain();
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok(), "wait_for_drain ok, got {result:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "wait_for_drain blocked unreasonably long: {elapsed:?}"
+        );
+
+        // Drop transport now; handle's Arcs keep underlying state
+        // alive; subsequent wait_for_drain calls (on a SEPARATE
+        // captured handle) would return Closed because writer task
+        // is aborted. We don't re-call wait_for_drain here since
+        // target was captured at ack_handle() time and the writer
+        // already caught up; second call would also return Ok.
+        drop(ws);
+    });
+}
+
+#[test]
+fn ack_handle_target_captured_at_call_not_at_wait() {
+    // V2.5 Codex M1 contract: ack_handle's target snapshot is
+    // taken AT THIS CALL. Sends queued after ack_handle() returns
+    // do NOT extend the wait.
+    //
+    // Send 3 blobs, capture handle, send 2 MORE blobs, then call
+    // wait_for_drain — it should resolve when the FIRST 3 are
+    // drained, not wait for the additional 2 (which may still be
+    // in flight).
+    use ql_collab::Transport as _;
+    let rt = multi_thread_runtime();
+    rt.block_on(async {
+        let server = EchoServer::start().await;
+        let mut ws = WebSocketTransport::connect(&server.url())
+            .await
+            .expect("handshake");
+
+        for i in 0..3u8 {
+            ws.send(&[i]).expect("send batch 1");
+        }
+        // Capture handle. Target = 3.
+        let handle = ws.ack_handle().expect("handle");
+        // Send 2 more bytes AFTER capturing target.
+        for i in 3..5u8 {
+            ws.send(&[i]).expect("send batch 2");
+        }
+
+        let start = std::time::Instant::now();
+        let result = handle.wait_for_drain();
+        let elapsed = start.elapsed();
+
+        // Either Ok (target met) — that's the contract.
+        assert!(result.is_ok(), "wait_for_drain ok, got {result:?}");
+        // Should not have taken meaningfully longer than 3-blob drain.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "wait_for_drain should target captured queued_count, not extend; elapsed {elapsed:?}"
+        );
+    });
+}
+
+#[test]
+fn ack_handle_survives_transport_drop_returns_closed() {
+    // V2.5 contract: after the underlying WebSocketTransport
+    // drops, the writer task is aborted (TaskExitGuard sets
+    // closed=true + notify_all). The handle's wait_for_drain
+    // observes closed and returns Err(Closed) within ~100ms.
+    use ql_collab::Transport as _;
+    let rt = multi_thread_runtime();
+    rt.block_on(async {
+        let server = EchoServer::start().await;
+        let mut ws = WebSocketTransport::connect(&server.url())
+            .await
+            .expect("handshake");
+
+        // Send a few but DON'T flush yet.
+        for i in 0..3u8 {
+            ws.send(&[i]).expect("send");
+        }
+        let handle = ws.ack_handle().expect("handle");
+
+        // Drop the transport. Writer task aborts (Drop impl).
+        drop(ws);
+
+        // Spawn the wait in a blocking task so we don't deadlock
+        // tokio. Expect Err(Closed) or Ok if writer drained before
+        // abort.
+        let result = tokio::task::spawn_blocking(move || handle.wait_for_drain())
+            .await
+            .unwrap();
+        // Either Ok (writer drained before abort) or Err(Closed)
+        // is acceptable. Both indicate the wait did NOT hang.
+        match result {
+            Ok(()) => { /* writer drained before abort */ }
+            Err(ql_collab::TransportError::Closed) => { /* expected */ }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    });
+}

@@ -238,6 +238,100 @@ pub trait Transport {
     fn flush_pending(&mut self) -> Result<(), TransportError> {
         Ok(())
     }
+
+    /// **Phase 5.7 V2.5 (2026-05-22) — async-flush ack handle.**
+    ///
+    /// Return a [`Box<dyn FlushAck + Send>`] that can wait for the
+    /// drain target captured AT THIS CALL, from a context that has
+    /// already released any outer locks guarding the [`Transport`].
+    ///
+    /// Default impl returns `None` (transports without async-flush
+    /// semantics — Loopback, Noop — keep [`flush_pending`] as the
+    /// canonical drain). Production transports with progress state
+    /// shared across tasks ([`crate::WebSocketTransport`]'s writer)
+    /// override and return a handle cloning their internal
+    /// progress `Arc`s.
+    ///
+    /// # Target-snapshot contract (Codex M1 fix, 2026-05-22)
+    ///
+    /// Implementors MUST capture the drain target — i.e. the
+    /// equivalent of `queued_count.load(...)` for transports with a
+    /// writer counter — at this call site, BEFORE returning. The
+    /// returned handle's [`FlushAck::wait_for_drain`] then waits
+    /// until the writer progress reaches this captured target, NOT
+    /// whatever `queued_count` is at wait-start time.
+    ///
+    /// Rationale: the napi binding pattern is
+    ///
+    /// 1. acquire session lock
+    /// 2. call `transport.ack_handle()` → get handle (target captured here)
+    /// 3. release session lock
+    /// 4. `spawn_blocking(move || handle.wait_for_drain())`
+    ///
+    /// Between steps 3 and 4 the JS event loop is free to enqueue
+    /// more sends via other session calls. Those sends MUST NOT
+    /// extend the wait — the wait is "for sends queued BEFORE this
+    /// call", same as [`flush_pending`]'s documented contract.
+    ///
+    /// # Async-context caveat
+    ///
+    /// [`FlushAck::wait_for_drain`] is blocking-sync (mirrors
+    /// `flush_pending`). The intended caller pattern is to invoke
+    /// it inside [`tokio::task::spawn_blocking`] (or equivalent) so
+    /// the wait doesn't occupy a tokio worker thread.
+    ///
+    /// # Why a separate handle (vs `flush_pending(&self)`)
+    ///
+    /// The `&mut self` on `flush_pending` is enforced because the
+    /// engine stores transports as `Box<dyn Transport + Send>` and
+    /// proxies via `transport.as_mut()` — the trait object's
+    /// dispatch interface requires `&mut self` for any mutator.
+    /// Even if `flush_pending` itself doesn't logically mutate
+    /// the transport's user-visible state, the call site needs a
+    /// `&mut Box<dyn Transport>` and therefore an exclusive
+    /// reference to the enclosing session.
+    ///
+    /// `ack_handle(&self) -> Box<...>` takes only a shared
+    /// reference (no mutation; just cloning internal `Arc`s) so the
+    /// napi binding can call it while holding only a brief
+    /// `Mutex` guard, drop the guard, then run the wait without
+    /// any outer lock held. Closes Opus V2.4 HIGH-1 (V8-block UX
+    /// hazard) per
+    /// `docs/audits/2026-05-22-phase-5-7-v2-4-opus.md:215-248`.
+    fn ack_handle(&self) -> Option<Box<dyn FlushAck + Send>> {
+        None
+    }
+}
+
+/// **Phase 5.7 V2.5 (2026-05-22) — async-flush ack handle.**
+///
+/// Detached drain-wait abstraction for [`Transport`] impls with
+/// progress state shared across tasks (e.g.
+/// [`crate::WebSocketTransport`]'s writer counter + Condvar).
+///
+/// Constructed by [`Transport::ack_handle`]; the implementor
+/// captures the drain target at construction time (see
+/// [`Transport::ack_handle`] doc for the contract). The handle is
+/// `Send` so a caller (typically the napi binding's
+/// `flushPendingToTransport`) can move it across a
+/// `tokio::task::spawn_blocking` boundary and perform the wait
+/// without holding any outer lock guarding the transport.
+///
+/// **Send + !Sync** is sufficient: the handle is moved into one
+/// blocking task and never shared. `Sync` is not required by any
+/// V2.5 caller — adding it would defensively allow handle-cloning
+/// patterns, but the current single-use pattern is preferable
+/// (matches `Box`-not-`Arc` ownership and avoids mistaken
+/// concurrent waits on the same captured target).
+pub trait FlushAck: Send {
+    /// Wait until the drain target captured at handle creation is
+    /// reached, OR the underlying transport is closed.
+    ///
+    /// Mirrors [`Transport::flush_pending`]'s error semantics:
+    /// `Err(TransportError::Closed)` if the transport was closed on
+    /// entry or mid-wait; `Err(TransportError::Io(...))` for
+    /// poisoned-mutex / channel-failure conditions.
+    fn wait_for_drain(&self) -> Result<(), TransportError>;
 }
 
 /// No-op `Transport` impl for tests + scaffolding.
@@ -459,6 +553,199 @@ const _ASSERT_LOOPBACK_TRANSPORT_SEND_SYNC: fn() = || {
     assert_send_sync::<LoopbackTransport>();
 };
 
+// ================================================================
+// Phase 5.7 V2.6 (2026-05-22) — BlockingTransport test fixture
+// ================================================================
+//
+// Gated behind `feature = "test-fixtures"` per V2.5+V2.6 plan
+// (Codex Q4 fix, 2026-05-22). Exists solely to force deterministic
+// `flush_pending` contention so the V2.5 binding pattern (extract
+// ack handle under lock, drop lock, then wait) can be regression-
+// tested from IDE-side mocha.
+//
+// **Not a production type**: `flush_pending` blocks indefinitely
+// until externally released via the paired `BlockingAckHandle`'s
+// `release()` mechanism. Production callers would deadlock.
+
+#[cfg(feature = "test-fixtures")]
+use std::sync::Condvar;
+#[cfg(feature = "test-fixtures")]
+use std::time::Duration;
+
+/// **Phase 5.7 V2.6 (2026-05-22) — test fixture.**
+///
+/// `Transport` impl that BLOCKS in `flush_pending` (and the
+/// V2.5 `ack_handle().wait_for_drain()`) until externally
+/// released, OR until the configured `block_ms` upper bound
+/// elapses (defensive — tests never hang if `release()` is
+/// forgotten).
+///
+/// `send` and `try_recv` are no-ops; the fixture tests flush
+/// behavior in isolation, not the full send/recv cycle. For
+/// 2-peer round-trip tests, use [`LoopbackTransport::pair`].
+///
+/// Use via the napi-binding-side `BlockingTransportFixture`
+/// controller class, which owns the `release` + `blocked` Condvars
+/// and exposes `takeTransport()` + `release()` + `waitUntilBlocked()`
+/// to JS.
+#[cfg(feature = "test-fixtures")]
+pub struct BlockingTransport {
+    /// Upper-bound wait duration in milliseconds. The wait exits
+    /// at the earlier of (a) the `release` flag flipping to `true`
+    /// or (b) `block_ms` elapsing. Prevents test hangs.
+    block_ms: u64,
+    /// Externally-controlled release signal. The
+    /// `BlockingTransportFixture` napi class holds the same `Arc`
+    /// and flips `*lock = true; cv.notify_all()` on `release()`.
+    release: Arc<(Mutex<bool>, Condvar)>,
+    /// Externally-observable "wait has been entered" signal. The
+    /// `BlockingTransportFixture` napi class's
+    /// `waitUntilBlocked()` JS method blocks on this until the
+    /// flush task signals it has entered the wait. Makes V2.5
+    /// contract tests deterministic (Codex M3 fix, 2026-05-22).
+    blocked: Arc<(Mutex<bool>, Condvar)>,
+}
+
+#[cfg(feature = "test-fixtures")]
+impl BlockingTransport {
+    /// Construct a new `BlockingTransport` with the given upper-
+    /// bound block duration. Caller-supplied `release` + `blocked`
+    /// Arcs are shared with the binding-side fixture controller.
+    ///
+    /// `block_ms = 0` means "block indefinitely until released"
+    /// (the upper bound is bypassed). Callers should always pass
+    /// a defensive non-zero value for hang-protected tests.
+    pub fn new(
+        block_ms: u64,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        blocked: Arc<(Mutex<bool>, Condvar)>,
+    ) -> Self {
+        Self {
+            block_ms,
+            release,
+            blocked,
+        }
+    }
+
+    /// Internal wait routine shared by `flush_pending` and
+    /// `BlockingAckHandle::wait_for_drain`. Signals the `blocked`
+    /// flag + notifies, then enters the wait loop on `release`.
+    fn wait_blocked(
+        block_ms: u64,
+        release: &Arc<(Mutex<bool>, Condvar)>,
+        blocked: &Arc<(Mutex<bool>, Condvar)>,
+    ) -> Result<(), TransportError> {
+        // Step 1: signal "wait entered" so external observers
+        // (waitUntilBlocked from JS) can proceed.
+        //
+        // Use poisoned-mutex recovery via `PoisonError::into_inner`:
+        // if a prior wait panicked, the blocked-flag mutex may be
+        // poisoned. Recovering is safe because the flag is a
+        // monotonic latch (once true, stays true; resetting on the
+        // BlockingTransport's next attach is not supported in V2.6
+        // — fixtures are single-use, mirroring LoopbackPair).
+        {
+            let mut flag = blocked.0.lock().map_err(|e| {
+                TransportError::Io(format!("BlockingTransport blocked lock poisoned: {e}"))
+            })?;
+            *flag = true;
+            blocked.1.notify_all();
+        }
+
+        // Step 2: wait until release flag flips OR block_ms elapses.
+        let (lock, cv) = &**release;
+        let mut released = lock.lock().map_err(|e| {
+            TransportError::Io(format!("BlockingTransport release lock poisoned: {e}"))
+        })?;
+        // If block_ms == 0, treat as "wait indefinitely" (no
+        // timeout). This is for tests that explicitly want to
+        // verify the wait behavior; production usage of this
+        // fixture would set a defensive non-zero upper bound.
+        if block_ms == 0 {
+            while !*released {
+                released = cv.wait(released).map_err(|e| {
+                    TransportError::Io(format!("BlockingTransport release wait poisoned: {e}"))
+                })?;
+            }
+        } else {
+            let deadline = Duration::from_millis(block_ms);
+            // Single bounded wait; if not released by deadline we
+            // exit normally (defensive timeout — Ok, not Err).
+            let (new_released, _timeout) = cv
+                .wait_timeout_while(released, deadline, |r| !*r)
+                .map_err(|e| {
+                    TransportError::Io(format!("BlockingTransport release wait poisoned: {e}"))
+                })?;
+            released = new_released;
+            // (We don't care if it timed out vs released — both
+            // are acceptable wait-exit conditions for the fixture.)
+            let _ = *released;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+impl Transport for BlockingTransport {
+    fn send(&mut self, _bytes: &[u8]) -> Result<(), TransportError> {
+        // No-op: fixture isolates flush_pending behavior.
+        Ok(())
+    }
+
+    fn try_recv(&mut self) -> Result<Option<Vec<u8>>, TransportError> {
+        Ok(None)
+    }
+
+    fn flush_pending(&mut self) -> Result<(), TransportError> {
+        Self::wait_blocked(self.block_ms, &self.release, &self.blocked)
+    }
+
+    fn ack_handle(&self) -> Option<Box<dyn FlushAck + Send>> {
+        // Codex M1 contract: the ack handle captures all relevant
+        // state at THIS call. For BlockingTransport, the "drain
+        // target" is conceptual — the handle simply waits on the
+        // shared release Condvar, same as flush_pending. Caller's
+        // expectation: the wait completes when release() is called
+        // OR block_ms elapses, regardless of when the wait actually
+        // starts.
+        Some(Box::new(BlockingAckHandle {
+            block_ms: self.block_ms,
+            release: Arc::clone(&self.release),
+            blocked: Arc::clone(&self.blocked),
+        }))
+    }
+}
+
+/// **Phase 5.7 V2.6 (2026-05-22) — test fixture's ack handle.**
+///
+/// Detached drain-wait handle for [`BlockingTransport`]. Mirrors
+/// `BlockingTransport::flush_pending` semantics on cloned `Arc`s.
+/// Constructed by `BlockingTransport::ack_handle()`.
+#[cfg(feature = "test-fixtures")]
+pub struct BlockingAckHandle {
+    block_ms: u64,
+    release: Arc<(Mutex<bool>, Condvar)>,
+    blocked: Arc<(Mutex<bool>, Condvar)>,
+}
+
+#[cfg(feature = "test-fixtures")]
+impl FlushAck for BlockingAckHandle {
+    fn wait_for_drain(&self) -> Result<(), TransportError> {
+        BlockingTransport::wait_blocked(self.block_ms, &self.release, &self.blocked)
+    }
+}
+
+// Rule 4 (audit-discipline): pin Send + (no Sync — handle is moved
+// once into spawn_blocking, never shared). If a future refactor
+// adds a non-Send field this stops compiling.
+#[cfg(feature = "test-fixtures")]
+const _ASSERT_BLOCKING_TRANSPORT_SEND: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<BlockingTransport>();
+    assert_send::<BlockingAckHandle>();
+};
+
 #[cfg(test)]
 mod tests {
     use super::{LoopbackTransport, NoopTransport, Transport, TransportError};
@@ -602,6 +889,167 @@ mod tests {
         assert!(
             d.contains("closed: true"),
             "Debug must include closed state: {d}"
+        );
+    }
+
+    // ============================================================
+    // Phase 5.7 V2.6 (2026-05-22) — BlockingTransport tests
+    // ============================================================
+    //
+    // Gated to the `test-fixtures` feature. `cargo test -p ql-collab`
+    // alone runs without the feature; these tests skip. The CI gate
+    // runs with `--all-features` per the V2.5+V2.6 acceptance
+    // criteria so they execute there.
+
+    #[cfg(feature = "test-fixtures")]
+    #[test]
+    fn blocking_transport_send_and_recv_are_noops() {
+        use super::BlockingTransport;
+        use std::sync::Condvar;
+        let release = std::sync::Arc::new((std::sync::Mutex::new(false), Condvar::new()));
+        let blocked = std::sync::Arc::new((std::sync::Mutex::new(false), Condvar::new()));
+        let mut t = BlockingTransport::new(0, release, blocked);
+        // send returns Ok, doesn't queue anything observable.
+        t.send(b"ignored").unwrap();
+        // try_recv returns None forever.
+        assert!(t.try_recv().unwrap().is_none());
+    }
+
+    #[cfg(feature = "test-fixtures")]
+    #[test]
+    fn blocking_transport_flush_pending_blocks_then_release_unblocks() {
+        use super::BlockingTransport;
+        use std::sync::Condvar;
+        use std::time::Instant;
+        let release = std::sync::Arc::new((std::sync::Mutex::new(false), Condvar::new()));
+        let blocked = std::sync::Arc::new((std::sync::Mutex::new(false), Condvar::new()));
+        let mut t = BlockingTransport::new(
+            5000,
+            std::sync::Arc::clone(&release),
+            std::sync::Arc::clone(&blocked),
+        );
+
+        // Spawn a thread that releases after 50ms. The wait should
+        // complete well before the 5000ms upper bound.
+        let release_clone = std::sync::Arc::clone(&release);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            *release_clone.0.lock().unwrap() = true;
+            release_clone.1.notify_all();
+        });
+
+        let start = Instant::now();
+        t.flush_pending().expect("flush_pending unblocked");
+        let elapsed = start.elapsed();
+        // Should complete within ~250ms (50ms target + scheduler
+        // jitter). Way below the 5000ms upper bound.
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "flush_pending should unblock promptly after release; took {elapsed:?}"
+        );
+    }
+
+    #[cfg(feature = "test-fixtures")]
+    #[test]
+    fn blocking_transport_flush_pending_signals_blocked_flag() {
+        // Pins the V2.6 deterministic-signal contract: the
+        // `blocked` Condvar fires BEFORE the wait on `release`
+        // starts. JS `waitUntilBlocked()` relies on this.
+        use super::BlockingTransport;
+        use std::sync::Condvar;
+        let release = std::sync::Arc::new((std::sync::Mutex::new(false), Condvar::new()));
+        let blocked = std::sync::Arc::new((std::sync::Mutex::new(false), Condvar::new()));
+        let mut t = BlockingTransport::new(
+            1000,
+            std::sync::Arc::clone(&release),
+            std::sync::Arc::clone(&blocked),
+        );
+
+        // Spawn the flush in a thread.
+        let handle = std::thread::spawn(move || t.flush_pending());
+
+        // Wait for `blocked` flag.
+        {
+            let (lock, cv) = &*blocked;
+            let mut flag = lock.lock().unwrap();
+            while !*flag {
+                let (new_flag, timeout) = cv
+                    .wait_timeout(flag, std::time::Duration::from_secs(2))
+                    .unwrap();
+                flag = new_flag;
+                if timeout.timed_out() {
+                    panic!("blocked flag never set within 2s");
+                }
+            }
+        }
+
+        // Release the flush.
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+
+        // Flush thread completes.
+        handle.join().unwrap().expect("flush_pending ok");
+    }
+
+    #[cfg(feature = "test-fixtures")]
+    #[test]
+    fn blocking_transport_block_ms_upper_bound_prevents_hang() {
+        // Block with 100ms upper bound; never release. Wait should
+        // still exit (defensive timeout).
+        use super::BlockingTransport;
+        use std::sync::Condvar;
+        use std::time::Instant;
+        let release = std::sync::Arc::new((std::sync::Mutex::new(false), Condvar::new()));
+        let blocked = std::sync::Arc::new((std::sync::Mutex::new(false), Condvar::new()));
+        let mut t = BlockingTransport::new(100, release, blocked);
+        let start = Instant::now();
+        t.flush_pending()
+            .expect("flush_pending exits on upper bound");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(80)
+                && elapsed < std::time::Duration::from_millis(500),
+            "upper-bound exit should land near 100ms; took {elapsed:?}"
+        );
+    }
+
+    #[cfg(feature = "test-fixtures")]
+    #[test]
+    fn blocking_ack_handle_wait_for_drain_matches_flush_pending() {
+        // The detached `BlockingAckHandle` (from ack_handle()) must
+        // unblock on the SAME release signal as the transport's
+        // flush_pending. This is the V2.5 contract (handle works
+        // without holding the transport).
+        use super::{BlockingTransport, Transport};
+        use std::sync::Condvar;
+        use std::time::Instant;
+        let release = std::sync::Arc::new((std::sync::Mutex::new(false), Condvar::new()));
+        let blocked = std::sync::Arc::new((std::sync::Mutex::new(false), Condvar::new()));
+        let t = BlockingTransport::new(
+            5000,
+            std::sync::Arc::clone(&release),
+            std::sync::Arc::clone(&blocked),
+        );
+
+        // Take the handle (Codex M1 snapshot semantic — captured here).
+        let handle = t
+            .ack_handle()
+            .expect("BlockingTransport returns an ack handle");
+        // Drop the transport so the handle is genuinely detached.
+        drop(t);
+
+        let release_clone = std::sync::Arc::clone(&release);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            *release_clone.0.lock().unwrap() = true;
+            release_clone.1.notify_all();
+        });
+
+        let start = Instant::now();
+        handle.wait_for_drain().expect("wait_for_drain ok");
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "handle wait should unblock independently of transport"
         );
     }
 }

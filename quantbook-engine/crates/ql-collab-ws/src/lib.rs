@@ -93,7 +93,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use ql_collab::{Transport, TransportError};
+use ql_collab::{FlushAck, Transport, TransportError};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -758,6 +758,78 @@ impl Transport for WebSocketTransport {
         }
         Ok(())
     }
+
+    /// **Phase 5.7 V2.5 (2026-05-22) — async-flush ack handle.**
+    ///
+    /// Returns a [`WebSocketProgressAckHandle`] capturing the
+    /// current drain target (`queued_count.load(SeqCst)`), so the
+    /// caller can await drainage WITHOUT holding any outer lock
+    /// guarding the [`WebSocketTransport`]. Closes Opus V2.4 HIGH-1
+    /// (V8-block UX hazard) by enabling the napi binding's
+    /// `flushPendingToTransport` to drop the session Mutex before
+    /// the Condvar wait.
+    ///
+    /// **Codex M1 fix (2026-05-22)**: the drain target is captured
+    /// at THIS call site (under whatever outer lock the caller
+    /// holds), NOT inside `wait_for_drain()`. Sends queued after
+    /// this call returns do NOT extend the wait — matches
+    /// `flush_pending`'s documented "previously queued" contract at
+    /// `crates/ql-collab/src/transport.rs:201`.
+    fn ack_handle(&self) -> Option<Box<dyn FlushAck + Send>> {
+        Some(Box::new(WebSocketProgressAckHandle {
+            target: self.queued_count.load(Ordering::SeqCst),
+            progress: Arc::clone(&self.progress),
+            closed: Arc::clone(&self.closed),
+        }))
+    }
+}
+
+/// **Phase 5.7 V2.5 (2026-05-22) — async-flush ack handle for
+/// [`WebSocketTransport`].**
+///
+/// Holds [`Arc`] clones of the transport's writer-progress fields
+/// plus a captured drain target. Constructed by
+/// [`Transport::ack_handle`] (see that method's docstring for the
+/// target-snapshot contract).
+///
+/// `wait_for_drain` mirrors [`WebSocketTransport::flush_pending`]'s
+/// loop on a per-call captured target, with the same `closed`-flag
+/// and `Condvar::wait_timeout(100ms)` shape. Returns
+/// `Err(TransportError::Closed)` if the transport closes mid-wait;
+/// `Err(TransportError::Io)` on poisoned mutex (writer task
+/// panicked — caller should reconnect).
+pub struct WebSocketProgressAckHandle {
+    /// **Codex M1 fix**: target captured at `ack_handle()` call.
+    /// Wait until `progress.0` (writer counter) reaches THIS value.
+    target: u64,
+    progress: Arc<(Mutex<u64>, Condvar)>,
+    closed: Arc<AtomicBool>,
+}
+
+impl FlushAck for WebSocketProgressAckHandle {
+    fn wait_for_drain(&self) -> Result<(), TransportError> {
+        // Mirror WebSocketTransport::flush_pending body, on a
+        // CAPTURED target (self.target) not a fresh load. Same
+        // Closed-on-entry + closed-during-wait + poisoned-mutex
+        // contract.
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(TransportError::Closed);
+        }
+        let (counter_lock, cv) = &*self.progress;
+        let mut counter = counter_lock
+            .lock()
+            .map_err(|e| TransportError::Io(format!("wait_for_drain lock poisoned: {e}")))?;
+        while *counter < self.target {
+            if self.closed.load(Ordering::Relaxed) {
+                return Err(TransportError::Closed);
+            }
+            let (new_counter, _timeout_result) = cv
+                .wait_timeout(counter, Duration::from_millis(100))
+                .map_err(|e| TransportError::Io(format!("wait_for_drain wait poisoned: {e}")))?;
+            counter = new_counter;
+        }
+        Ok(())
+    }
 }
 
 // Phase 5.5 V2 V3 step 4 — pin the Send invariant. CollabSession
@@ -766,6 +838,15 @@ impl Transport for WebSocketTransport {
 const _ASSERT_WEBSOCKET_TRANSPORT_SEND: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<WebSocketTransport>();
+};
+
+// Phase 5.7 V2.5 (2026-05-22) — pin Send for the ack handle. It is
+// moved into spawn_blocking; `Send` is sufficient (no shared
+// references after the move). Rule 4 compile assert per
+// audit-discipline.
+const _ASSERT_WEBSOCKET_PROGRESS_ACK_HANDLE_SEND: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<WebSocketProgressAckHandle>();
 };
 
 // **Phase 5.5 V2 V4 V1 step 3 (2026-05-21) — Tier J3.** Pin the

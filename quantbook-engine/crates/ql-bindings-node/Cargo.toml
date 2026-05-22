@@ -39,7 +39,16 @@ napi-derive = { workspace = true }
 # **V2.3 (2026-05-22):** added `ql-collab-ws` for the
 # `WebSocketTransport.connect` async binding (this dep stays optional
 # for V2.3+ work; ql-collab core stays runtime-agnostic).
-ql-collab    = { path = "../ql-collab" }
+# **V2.6 (2026-05-22):** enable `test-fixtures` feature unconditionally
+# on the ql-collab dep. This exposes `BlockingTransport` /
+# `BlockingAckHandle` in the engine crate, which the cdylib then wraps
+# via `BlockingTransportFixture` napi class for IDE mocha contention
+# tests (closes the V2.4 vacuous-on-Loopback Opus MEDIUM-2 finding).
+# Keeping the feature flag (rather than removing the gate) makes the
+# fixture's "not for production" status explicit in the cargo manifest
+# + auditable in source greps. V2 backlog: "harden test-fixture
+# exposure for production cdylib builds" (post-V2 product hardening).
+ql-collab    = { path = "../ql-collab", features = ["test-fixtures"] }
 ql-collab-ws = { path = "../ql-collab-ws" }
 ql-oplog     = { path = "../ql-oplog" }
 ql-types     = { path = "../ql-types" }

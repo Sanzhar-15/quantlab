@@ -860,6 +860,31 @@ impl CollabSession {
         }
     }
 
+    /// **Phase 5.7 V2.5 (2026-05-22) — async-flush ack handle proxy.**
+    ///
+    /// Returns a detached [`FlushAck`] handle for the attached
+    /// transport's drain wait, captured at THIS call's instant
+    /// (Codex M1 contract). `None` if no transport is attached or
+    /// the attached transport's [`Transport::ack_handle`] returns
+    /// `None` (e.g., [`LoopbackTransport`], [`NoopTransport`]).
+    ///
+    /// Takes [`&self`] (no `&mut`) so napi-binding callers wrapping
+    /// the session in `Arc<Mutex<CollabSession>>` can extract the
+    /// handle under a brief lock acquisition, drop the lock, then
+    /// perform the wait on a `tokio::task::spawn_blocking` thread
+    /// without holding the session lock. Closes Opus V2.4 HIGH-1
+    /// (V8-block UX hazard) per
+    /// `docs/audits/2026-05-22-phase-5-7-v2-4-opus.md:215-248`.
+    ///
+    /// The returned [`Box<dyn FlushAck + Send>`] is single-use: its
+    /// [`FlushAck::wait_for_drain`] waits for the drain target
+    /// captured AT THIS CALL, not later. See
+    /// [`Transport::ack_handle`] documentation for the
+    /// target-snapshot contract.
+    pub fn flush_pending_handle(&self) -> Option<Box<dyn crate::FlushAck + Send>> {
+        self.transport.as_ref().and_then(|t| t.ack_handle())
+    }
+
     /// **Phase 5.5 V2 V2 (2026-05-21):** set the auto-flush policy
     /// for this session. Returns the previous policy.
     ///

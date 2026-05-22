@@ -108,5 +108,16 @@ pub use repair::{
     TableRewriteSummary,
 };
 pub use session::{AutoFlushPolicy, CollabSession, CollabSessionError, SyncReport, UndoGroupGuard};
-pub use transport::{LoopbackTransport, NoopTransport, Transport, TransportError};
+// Phase 5.7 V2.5 (2026-05-22): re-export `FlushAck` alongside
+// `Transport` (Codex L1 fix). The IDE binding (ql-bindings-node)
+// uses `Box<dyn FlushAck + Send>` as the drain-handle type returned
+// by `CollabSession::flush_pending_handle`.
+pub use transport::{FlushAck, LoopbackTransport, NoopTransport, Transport, TransportError};
+// Phase 5.7 V2.6 (2026-05-22): re-export `BlockingTransport` behind
+// the `test-fixtures` feature so binding crates (ql-bindings-node)
+// that enable the feature can construct it for IDE mocha contention
+// tests. NOT a production API — see `Cargo.toml` feature definition.
+// (Added in the next task; see `transport.rs::BlockingTransport`.)
+#[cfg(feature = "test-fixtures")]
+pub use transport::{BlockingAckHandle, BlockingTransport};
 pub use undo::UndoManager;

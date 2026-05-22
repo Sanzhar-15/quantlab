@@ -37,3 +37,17 @@ ql-formula-syntax = { path = "../ql-formula-syntax" }
 # dep via ql-storage but pulled in explicitly for the repair module's
 # return-type construction.
 ql-types     = { path = "../ql-types" }
+
+[features]
+# **Phase 5.7 V2.6 (2026-05-22) — test-fixtures feature.**
+# Gates `BlockingTransport` + `BlockingAckHandle` (defined in
+# `src/transport.rs`). These types exist solely to force deterministic
+# `flush_pending` contention from JS-side mocha tests so V2.5's
+# Arc<Mutex> + lock-release pattern can be regression-tested.
+#
+# The fixture has no production use — its `flush_pending` blocks
+# indefinitely until externally released, which would deadlock any
+# production caller. Gated so plain `cargo build -p ql-collab` does
+# not carry it; `ql-bindings-node` enables it unconditionally so the
+# IDE-loaded cdylib always has it.
+test-fixtures = []

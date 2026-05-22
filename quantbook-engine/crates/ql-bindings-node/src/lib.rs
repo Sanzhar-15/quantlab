@@ -747,97 +747,103 @@ impl CollabSession {
     }
 
     // ==========================================================
-    // Phase 5.7 V2.4 (2026-05-22) — async Transport surface, REINTRODUCED
+    // Phase 5.7 V2.5 (2026-05-22) — async Transport surface, V8-BLOCK CLOSED
     // ==========================================================
     //
-    // **V2.4 closure of V2.3 audit (2026-05-22)**: V2.3 shipped
-    // `flushPendingToTransport` as `pub async unsafe fn(&mut self)`,
-    // then REMOVED it in the V2.3 closure after Codex FAIL + Opus
-    // PASS-WITH-FINDINGS converged on 2 HIGH (Rust UB via napi
-    // `&mut self` async re-entry + tokio runtime starvation).
+    // **V2.5 closure of Opus V2.4 HIGH-1 (V8-block UX hazard)**:
     //
-    // V2.4 reintroduces via **Option (a) from V2.3's closure plan**:
-    // engine refactor to `Arc<parking_lot::Mutex<CoreCollabSession>>`.
-    // This refactor (above) converted ALL CollabSession napi methods
-    // from `&mut self` to `&self` with internal `inner.lock()`. The
-    // napi-rs codegen now produces `&'static CollabSession` (immutable
-    // shared) instead of `&'static mut CollabSession` — no aliasing
-    // hazard at all, since multiple `&` to the same instance are
-    // sound by Rust's rules.
+    // V2.4 reintroduced `flushPendingToTransport` soundly (closed
+    // V2.3's UB + tokio-starvation HIGHs via the `Arc<Mutex<...>>`
+    // refactor + `spawn_blocking`). BUT it held `self.inner.lock()`
+    // during the Condvar wait — concurrent JS sync method calls on
+    // the SAME session blocked the V8 event loop on lock acquisition.
+    // Opus V2.4 HIGH-1 (`docs/audits/2026-05-22-phase-5-7-v2-4-opus.md:112-302`)
+    // documented this as a UX hazard (not a soundness hazard) and
+    // recommended Option A: split the lock acquisition from the
+    // Condvar wait via a detached ack handle.
     //
-    // For the async method specifically:
-    //   - `&self` (not `&mut self`) → napi-rs no longer requires
-    //     `unsafe`, AND no aliasing UB possible.
-    //   - `Arc::clone(&self.inner)` → spawn_blocking → `lock()` inside
-    //     the blocking task. The Condvar wait runs on a dedicated
-    //     blocking thread (NOT a tokio worker), closing V2.3 HIGH-2.
-    //   - The `Arc + Mutex` composition is `Send + Sync` (Mutex<T>:
-    //     Send + Sync when T: Send), so the clone-and-move into
-    //     spawn_blocking is sound.
+    // V2.5 implements Option A via:
+    //   1. Engine: `Transport::ack_handle(&self) -> Option<Box<dyn FlushAck + Send>>`
+    //      default-None trait method (`crates/ql-collab/src/transport.rs`).
+    //   2. Engine: `WebSocketTransport::ack_handle` override returning
+    //      a `WebSocketProgressAckHandle` cloning the transport's
+    //      Arc<(Mutex, Condvar)> progress state + capturing the
+    //      drain target at THIS call (Codex M1 contract).
+    //   3. Engine: `CollabSession::flush_pending_handle(&self)` proxy
+    //      (`crates/ql-collab/src/session.rs`).
+    //   4. Binding (this method): extract the handle under the session
+    //      lock, DROP the lock, then perform the wait without it held.
+    //
+    // Concurrent JS sync methods now acquire `self.inner.lock()`
+    // immediately — the V8 event loop stays responsive while the
+    // Condvar wait runs in the spawn_blocking task on cloned Arcs.
 
     /// Async flush-pending — waits for the attached transport's writer
     /// task to drain (level-1 local ack per V2 V4 V1 Tier K1 contract).
     ///
     /// Returns a JS `Promise<void>` that resolves when:
-    /// - the writer has completed `send` for every queued blob, OR
-    /// - the transport has been detached / dropped / errored.
+    /// - the writer has completed `send` for every blob queued AT THIS
+    ///   CALL (Codex M1: target captured at handle extraction, NOT at
+    ///   wait-start), OR
+    /// - the transport has been detached / dropped / closed.
     ///
-    /// **V2.4 soundness** (closes V2.3 audit Codex+Opus HIGH-1+HIGH-2):
+    /// **V2.5 V8-block CLOSURE** (Opus V2.4 HIGH-1, 2026-05-22):
     ///
-    /// - Takes `&self` (not `&mut self`). napi-rs codegen produces
-    ///   `&'static CollabSession` → multiple aliasing reads are sound
-    ///   by Rust's rules. No UB even under JS re-entry.
-    /// - `Arc::clone(&self.inner)` extracts a cloned reference to the
-    ///   inner `Arc<Mutex<CoreCollabSession>>`. The clone is moved into
-    ///   `tokio::task::spawn_blocking`, which runs on a dedicated
-    ///   blocking thread (NOT a tokio worker). The Condvar wait
-    ///   doesn't occupy the napi-rs runtime's worker pool — closes
-    ///   V2.3 HIGH-2 (runtime starvation).
-    /// - Inside the blocking task, `inner.lock()` acquires the mutex.
-    ///   If a concurrent JS call holds the lock (e.g., another
-    ///   mid-flight method), this call blocks until the lock is
-    ///   available. No deadlock because mutex order is consistent
-    ///   (all session methods acquire the SAME mutex).
+    /// - Step 1: acquire session lock briefly, call
+    ///   `inner.flush_pending_handle()` which proxies to
+    ///   `Transport::ack_handle(&self)`. For `WebSocketTransport`,
+    ///   this captures `queued_count` as the drain target + clones
+    ///   the progress + closed Arcs.
+    /// - Step 2: DROP the session lock (`parking_lot::MutexGuard::drop`).
+    /// - Step 3: `tokio::task::spawn_blocking(move || handle.wait_for_drain())`.
+    ///   The wait runs on a tokio blocking thread, holding ONLY the
+    ///   handle's internal Arcs (NOT the session lock).
+    ///
+    /// Concurrent JS sync method calls on the same session (e.g.,
+    /// `opCount`, `appendPutValue`, `pollRemote`) acquire
+    /// `self.inner.lock()` immediately while this method's wait
+    /// runs — the V8 event loop stays responsive.
+    ///
+    /// **V2.3+V2.4 soundness retained** (UB + tokio-starvation HIGHs
+    /// remain closed):
+    /// - `&self`, not `&mut self`. napi-rs codegen produces shared
+    ///   `&'static CollabSession`; no aliasing UB possible.
+    /// - `spawn_blocking` runs on tokio's blocking pool (default
+    ///   512 threads), NOT the worker pool. Condvar wait doesn't
+    ///   occupy a worker.
     ///
     /// **Failure modes**:
-    /// - No transport attached → returns `Ok(())` (NOT a rejection).
-    /// - Transport error during the wait → JS Error.
+    /// - No transport attached, OR transport's `ack_handle` returns
+    ///   `None` (e.g., Loopback/Noop) → returns `Ok(())` immediately.
+    /// - Transport error during the wait → JS Error with the
+    ///   `TransportError` `Display` string.
     /// - The `spawn_blocking` task panics → JS Error.
-    ///
-    /// **V2.4 V8-block hazard (Opus V2.4 HIGH-1, 2026-05-22)** — known
-    /// trade-off, documented for caller discipline:
-    ///
-    /// While this method's `spawn_blocking` task holds `self.inner.lock()`
-    /// during a Condvar wait (the engine's `flush_pending_to_transport`
-    /// blocks on writer-progress; can be seconds for slow WS peers),
-    /// concurrent JS sync method calls on the SAME session block the
-    /// V8 event loop on lock acquisition. IDE UI freezes for the wait
-    /// duration.
-    ///
-    /// This is a UX hazard, NOT a soundness hazard (V2.3 audit's UB
-    /// hazard remains closed; V2.4 just trades it for a contention
-    /// hazard).
-    ///
-    /// **Caller discipline (today)**: don't call other `CollabSession`
-    /// methods on the same session while a `flushPendingToTransport`
-    /// promise is pending. Queue the calls behind the await.
-    ///
-    /// **V2.5+ engine refactor plan**: move the Condvar wait out of
-    /// `&mut self` exclusive access — either (a) clone an
-    /// `Arc<Transport>` inside the lock and release before waiting, or
-    /// (b) replace Condvar with `tokio::sync::Notify` so the wait
-    /// becomes truly async (no lock held). V2.5 will pick based on
-    /// the engine's writer-task lifecycle constraints.
     #[napi(js_name = "flushPendingToTransport")]
     pub async fn flush_pending_to_transport(&self) -> Result<()> {
-        let inner = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || {
-            let mut guard = inner.lock();
-            guard.flush_pending_to_transport()
-        })
-        .await
-        .map_err(|e| Error::from_reason(format!("flushPendingToTransport task: {e}")))?
-        .map_err(|e| Error::from_reason(format!("{e}")))
+        // **V2.5 lock-release pattern (Opus V2.4 HIGH-1 closure)**:
+        // extract the ack handle while holding the session lock,
+        // then RELEASE the lock before awaiting the wait. The
+        // scoped lock guard drops on the closing brace per
+        // parking_lot's standard MutexGuard semantics
+        // (`lock_api-0.4.14/src/mutex.rs::MutexGuard::drop`).
+        let handle_opt: Option<Box<dyn ql_collab::FlushAck + Send>> = {
+            let inner = self.inner.lock();
+            inner.flush_pending_handle()
+        };
+
+        // No transport attached (or transport has no ack semantics —
+        // Loopback/Noop default impl returns None). The contract
+        // matches the V2.4 method: `Ok(())`, NOT a rejection.
+        let Some(handle) = handle_opt else {
+            return Ok(());
+        };
+
+        // Wait on the detached handle. The Condvar wait runs on
+        // tokio's blocking pool; the session lock is NOT held.
+        tokio::task::spawn_blocking(move || handle.wait_for_drain())
+            .await
+            .map_err(|e| Error::from_reason(format!("flushPendingToTransport task: {e}")))?
+            .map_err(|e| Error::from_reason(format!("{e}")))
     }
 }
 
@@ -1069,6 +1075,168 @@ impl LoopbackPair {
 }
 
 // =============================================================
+// Phase 5.7 V2.6 (2026-05-22) — BlockingTransportFixture
+// =============================================================
+//
+// Test fixture for V2.5 contract testing (Opus V2.4 MEDIUM-2
+// closure). JS-side helper that constructs a `BlockingTransport`
+// (engine-side, feature-gated) and exposes:
+//   - `takeTransport(): Transport` — moves the fixture's inner
+//     BlockingTransport into a Transport wrapper that can be passed
+//     to `attachTransport(t)`. Mirrors V2.1 `LoopbackPair`'s
+//     `takeA`/`takeB` single-use pattern.
+//   - `release(): void` — flips the engine-side release Condvar
+//     so any in-progress `flush_pending` / `wait_for_drain` exits.
+//   - `waitUntilBlocked(): Promise<void>` — async wait until the
+//     fixture's wait routine has actually entered the Condvar
+//     wait. Closes Codex M3 (deterministic synchronization for the
+//     V2.5 contract test — without this, the test's `opCount()`
+//     call could race ahead of the spawn_blocking task and pass
+//     vacuously).
+//
+// Codex M2 fix: this is NOT exposed as `new BlockingTransport(...)`.
+// The napi `attachTransport(t: &mut Transport)` only accepts the
+// opaque `Transport` wrapper class; a separately-constructed
+// `BlockingTransport` napi class would not be attachable. The
+// fixture-controller pattern is the closest analog to V2.1's
+// `LoopbackPair`.
+
+/// **Phase 5.7 V2.6 (2026-05-22) — V2.5 contract-test fixture.**
+///
+/// JS class for constructing a `BlockingTransport` (engine-side
+/// `ql_collab::BlockingTransport`, gated behind the `test-fixtures`
+/// feature) and controlling its `release` + `blocked` Condvars from
+/// JS. Used by IDE mocha contention tests to verify the V2.5
+/// V8-block closure: a sync session method called concurrently with
+/// a pending `flushPendingToTransport` MUST return immediately
+/// (does NOT block on the session lock).
+///
+/// **Not for production use** — the underlying `BlockingTransport`
+/// blocks `flush_pending` indefinitely until `release()` is called
+/// (or the constructor's `block_ms` upper bound elapses).
+#[napi]
+pub struct BlockingTransportFixture {
+    /// The fixture's inner `BlockingTransport`, taken once via
+    /// `takeTransport()`. After taking, the fixture controller
+    /// still owns the `release` + `blocked` Arcs so it can drive
+    /// JS-side `release()` + `waitUntilBlocked()` against the
+    /// transport that now lives inside a `CollabSession`.
+    inner: Option<ql_collab::BlockingTransport>,
+    /// Shared with the inner `BlockingTransport`. Flipped to `true`
+    /// + notified by `release()`.
+    release: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    /// Shared with the inner `BlockingTransport`. Set + notified by
+    /// the transport when it enters the wait. `waitUntilBlocked()`
+    /// awaits this signal.
+    blocked: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+#[napi]
+impl BlockingTransportFixture {
+    /// JS: `new BlockingTransportFixture(blockMs: number)`.
+    ///
+    /// `blockMs` is the upper-bound wait duration. `0` means
+    /// "wait indefinitely until released" (intended only for
+    /// tests with explicit `release()` calls; do not pass 0 in
+    /// scenarios where a hang would block the test runner).
+    ///
+    /// `blockMs` is taken as `f64` (per the V1 megaudit Codex H1
+    /// ToUint32-hygiene pattern) and validated via
+    /// `validate_u32_index` to reject non-finite, negative,
+    /// fractional, or out-of-u32 values.
+    #[napi(constructor)]
+    pub fn new(block_ms: f64) -> Result<Self> {
+        let block_ms_u32 = validate_u32_index("BlockingTransportFixture", "blockMs", block_ms)?;
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let blocked =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let transport = ql_collab::BlockingTransport::new(
+            block_ms_u32 as u64,
+            std::sync::Arc::clone(&release),
+            std::sync::Arc::clone(&blocked),
+        );
+        Ok(Self {
+            inner: Some(transport),
+            release,
+            blocked,
+        })
+    }
+
+    /// Take ownership of the inner `BlockingTransport`, wrapped in
+    /// a `Transport` for attaching to a session. Single-use:
+    /// errors on the second call.
+    ///
+    /// After taking, the fixture controller retains its Arc clones
+    /// of `release` + `blocked`, so JS-side `release()` +
+    /// `waitUntilBlocked()` still drive the transport that now
+    /// lives inside the session.
+    #[napi(js_name = "takeTransport")]
+    pub fn take_transport(&mut self) -> Result<Transport> {
+        let t = self.inner.take().ok_or_else(|| {
+            Error::from_reason(
+                "BlockingTransportFixture.takeTransport already called on this fixture".to_string(),
+            )
+        })?;
+        Ok(Transport {
+            inner: Some(Box::new(t)),
+        })
+    }
+
+    /// Flip the release Condvar so any in-progress `flush_pending`
+    /// or `wait_for_drain` exits. Idempotent (calling twice is
+    /// safe; the flag is monotonic).
+    #[napi]
+    pub fn release(&self) {
+        let (lock, cv) = &*self.release;
+        // The std::sync::Mutex API; recover from poison via
+        // PoisonError::into_inner so a panicked test thread doesn't
+        // leave the fixture permanently broken.
+        let mut released = match lock.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *released = true;
+        cv.notify_all();
+    }
+
+    /// Async wait until the fixture's wait routine has actually
+    /// entered the Condvar wait. Resolves when the engine-side
+    /// transport's `wait_blocked` has set the `blocked` flag +
+    /// notified.
+    ///
+    /// **Codex M3 fix (2026-05-22)**: this is the deterministic
+    /// synchronization point that V2.5 contract tests need. Without
+    /// it, an `opCount()` call could race ahead of the
+    /// `flushPendingToTransport` task and pass vacuously
+    /// (returning before the spawn_blocking task has even acquired
+    /// the session lock + extracted the ack handle).
+    ///
+    /// Uses `spawn_blocking` because the inner wait is a sync
+    /// `Condvar::wait` on `std::sync` primitives. Tokio-friendly:
+    /// the wait runs on a blocking-pool thread, not a worker.
+    #[napi(js_name = "waitUntilBlocked")]
+    pub async fn wait_until_blocked(&self) -> Result<()> {
+        let blocked = std::sync::Arc::clone(&self.blocked);
+        tokio::task::spawn_blocking(move || -> std::result::Result<(), String> {
+            let (lock, cv) = &*blocked;
+            let mut flag = lock
+                .lock()
+                .map_err(|e| format!("blocked lock poisoned: {e}"))?;
+            while !*flag {
+                flag = cv
+                    .wait(flag)
+                    .map_err(|e| format!("blocked wait poisoned: {e}"))?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::from_reason(format!("waitUntilBlocked task: {e}")))?
+        .map_err(Error::from_reason)
+    }
+}
+
+// =============================================================
 // Send/Sync compile assertions (Rule 4 application)
 // =============================================================
 
@@ -1123,6 +1291,18 @@ const _ASSERT_BINDING_TRANSPORT_SEND: fn() = || {
 const _ASSERT_BINDING_LOOPBACK_PAIR_SEND: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<LoopbackPair>();
+};
+
+// **Phase 5.7 V2.6 (2026-05-22) Rule 4 application for `BlockingTransportFixture`**:
+// the fixture wraps `Option<BlockingTransport>` + two `Arc<(Mutex, Condvar)>`
+// fields. `BlockingTransport: Send` is pinned in ql-collab; `Arc<T>: Send` when
+// `T: Send + Sync`; `Mutex<T>` + `Condvar` are both `Send + Sync`. So the
+// composition is `Send`. Pin it — napi holds instances per-Worker so cross-Worker
+// Send isn't strictly required, but losing Send would break the `waitUntilBlocked`
+// async method's `spawn_blocking` move-into pattern.
+const _ASSERT_BINDING_BLOCKING_TRANSPORT_FIXTURE_SEND: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<BlockingTransportFixture>();
 };
 
 // **V2.4 (2026-05-22) update**: this block previously documented the
