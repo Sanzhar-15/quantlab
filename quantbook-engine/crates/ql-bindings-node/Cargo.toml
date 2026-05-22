@@ -76,6 +76,14 @@ parking_lot = "=0.12.5"
 # (matches CLAUDE.md's "explicit > implicit" pattern).
 tokio = { workspace = true }
 
+# **Phase 5.7 V3.2.a (2026-05-22):** the `exportSnapshot` napi method
+# returns JSON-serialized cell data so the IDE-side cell-grid widget
+# (V3.2.b onward) can render without leaking Loro internals across
+# the FFI boundary. `serde` is already in the dep graph transitively
+# via ql-oplog's derived `Serialize`/`Deserialize` on `Op` +
+# `CellWireValue`; `serde_json` is the explicit JSON writer.
+serde_json = { workspace = true }
+
 [build-dependencies]
 napi-build = { workspace = true }
 
