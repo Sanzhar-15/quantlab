@@ -361,6 +361,57 @@ impl std::fmt::Debug for WebSocketTransport {
     }
 }
 
+/// Scrub `scheme://userinfo@` patterns in `text` so credentials carried
+/// in WebSocket URLs (e.g. `ws://user:pass@host`) do not leak through
+/// error messages or `Display` output.
+///
+/// **V2.8 megaudit closure (Opus-B Lane C MEDIUM-1, 2026-05-22)**: the
+/// per-step V2.3 audit accepted echoing the raw URL in
+/// `WebSocketError::InvalidUrl` because tungstenite's parse-error
+/// string was the diagnostic. The cumulative megaudit caught that
+/// users wiring `ws://user:pass@host` URLs (or any URL with userinfo)
+/// would have credentials surface in IDE error toasts, logs, and the
+/// napi `transportLastError()` accessor.
+///
+/// Conservative state machine: only `scheme://userinfo@` (where
+/// userinfo is bounded by `/`, `?`, `#`, whitespace, or end-of-string)
+/// is rewritten. Strings without that pattern pass through unchanged.
+/// Handles multiple URL occurrences in a single string (tungstenite
+/// sometimes echoes the URL more than once in nested error chains).
+fn scrub_url_credentials_in(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let Some(rel) = text[i..].find("://") else {
+            out.push_str(&text[i..]);
+            break;
+        };
+        let scheme_end = i + rel + 3;
+        out.push_str(&text[i..scheme_end]);
+        let mut j = scheme_end;
+        let mut at_pos = None;
+        while j < bytes.len() {
+            let c = bytes[j];
+            if c == b'@' {
+                at_pos = Some(j);
+                break;
+            }
+            if matches!(c, b'/' | b'?' | b'#' | b' ' | b'\t' | b'\n' | b'\r') {
+                break;
+            }
+            j += 1;
+        }
+        if let Some(at) = at_pos {
+            out.push_str("[REDACTED]@");
+            i = at + 1;
+        } else {
+            i = scheme_end;
+        }
+    }
+    out
+}
+
 impl WebSocketTransport {
     /// Connect to a WebSocket server at `url` (e.g. `ws://host:port/path`).
     ///
@@ -371,13 +422,21 @@ impl WebSocketTransport {
     /// On success, returns a fully-wired transport: send/recv channels
     /// connected, background tasks running. On failure, returns one
     /// of the [`WebSocketError`] variants with the underlying cause.
+    ///
+    /// **Credential scrubbing (V2.8 megaudit Opus-B Lane C MEDIUM-1)**:
+    /// any `scheme://userinfo@host` patterns in the URL or
+    /// tungstenite's error string are redacted via
+    /// [`scrub_url_credentials_in`] before being threaded into the
+    /// returned `WebSocketError` variant.
     pub async fn connect(url: &str) -> Result<Self, WebSocketError> {
         // tokio-tungstenite::connect_async handles URL parse + TCP
         // connect + WS handshake in one call. Distinguish the failure
         // modes via the returned error string match — opaque to keep
         // tungstenite types out of our public API.
         let (ws_stream, _response) = tokio_tungstenite::connect_async(url).await.map_err(|e| {
-            let msg = e.to_string();
+            let scrubbed_inner = scrub_url_credentials_in(&e.to_string());
+            let scrubbed_url = scrub_url_credentials_in(url);
+            let msg = format!("{scrubbed_inner} (url: {scrubbed_url})");
             // Coarse classification — tungstenite::Error doesn't have a
             // clean discriminant for "URL parse" vs "TCP connect" vs
             // "handshake". Use the error type to route.
@@ -962,5 +1021,84 @@ mod tests {
             WebSocketError::RuntimeError("x".into()).kind(),
             "websocket_runtime_error"
         );
+    }
+
+    // ============================================================
+    // Phase 5.7 V2.8 megaudit (2026-05-22) — Opus-B Lane C MEDIUM-1
+    // credential-scrubbing helper for WebSocket URL errors.
+    // ============================================================
+
+    #[test]
+    fn scrub_url_credentials_strips_userinfo_basic() {
+        assert_eq!(
+            scrub_url_credentials_in("ws://user:pass@host:8080/path"),
+            "ws://[REDACTED]@host:8080/path"
+        );
+        assert_eq!(
+            scrub_url_credentials_in("wss://alice@example.com/socket"),
+            "wss://[REDACTED]@example.com/socket"
+        );
+    }
+
+    #[test]
+    fn scrub_url_credentials_preserves_clean_url() {
+        assert_eq!(
+            scrub_url_credentials_in("ws://host:8080/path"),
+            "ws://host:8080/path"
+        );
+        assert_eq!(
+            scrub_url_credentials_in("https://example.com/"),
+            "https://example.com/"
+        );
+    }
+
+    #[test]
+    fn scrub_url_credentials_preserves_non_url_text() {
+        assert_eq!(
+            scrub_url_credentials_in("no url here"),
+            "no url here"
+        );
+        assert_eq!(scrub_url_credentials_in(""), "");
+    }
+
+    #[test]
+    fn scrub_url_credentials_handles_multiple_urls() {
+        // tungstenite occasionally echoes a URL more than once in
+        // nested error chains (parse error wrapping the input URL,
+        // plus the URL in a context note). Each occurrence must be
+        // scrubbed.
+        let input = "parse failed for ws://u1:p1@host1 (saw ws://u2:p2@host2)";
+        let out = scrub_url_credentials_in(input);
+        assert!(out.contains("ws://[REDACTED]@host1"));
+        assert!(out.contains("ws://[REDACTED]@host2"));
+        assert!(!out.contains("u1:p1"));
+        assert!(!out.contains("u2:p2"));
+    }
+
+    #[test]
+    fn scrub_url_credentials_stops_at_path_or_query() {
+        // No `@` before the path separator → not scrubbed.
+        assert_eq!(
+            scrub_url_credentials_in("ws://host/has@in/path"),
+            "ws://host/has@in/path"
+        );
+        assert_eq!(
+            scrub_url_credentials_in("ws://host?token=a@b"),
+            "ws://host?token=a@b"
+        );
+    }
+
+    #[test]
+    fn invalid_url_display_does_not_leak_userinfo_when_scrubbed() {
+        // The scrub helper is the load-bearing layer. This test
+        // pins that a scrubbed message wrapped in InvalidUrl produces
+        // a Display string with NO trace of the credentials.
+        let scrubbed = scrub_url_credentials_in("ws://alice:secret@host:9001");
+        let e = WebSocketError::InvalidUrl(scrubbed.clone());
+        let display = e.to_string();
+        assert!(!display.contains("alice"));
+        assert!(!display.contains("secret"));
+        assert!(display.contains("[REDACTED]"));
+        assert!(display.contains("host:9001"));
     }
 }

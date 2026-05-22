@@ -39,16 +39,25 @@ napi-derive = { workspace = true }
 # **V2.3 (2026-05-22):** added `ql-collab-ws` for the
 # `WebSocketTransport.connect` async binding (this dep stays optional
 # for V2.3+ work; ql-collab core stays runtime-agnostic).
-# **V2.6 (2026-05-22):** enable `test-fixtures` feature unconditionally
-# on the ql-collab dep. This exposes `BlockingTransport` /
-# `BlockingAckHandle` in the engine crate, which the cdylib then wraps
-# via `BlockingTransportFixture` napi class for IDE mocha contention
-# tests (closes the V2.4 vacuous-on-Loopback Opus MEDIUM-2 finding).
-# Keeping the feature flag (rather than removing the gate) makes the
-# fixture's "not for production" status explicit in the cargo manifest
-# + auditable in source greps. V2 backlog: "harden test-fixture
-# exposure for production cdylib builds" (post-V2 product hardening).
-ql-collab    = { path = "../ql-collab", features = ["test-fixtures"] }
+# **V2.6 (2026-05-22):** added `BlockingTransport` / `BlockingAckHandle`
+# in the engine crate via the `ql-collab/test-fixtures` feature; this
+# crate wraps them via the `BlockingTransportFixture` napi class for
+# IDE mocha contention tests (closes the V2.4 vacuous-on-Loopback Opus
+# MEDIUM-2 finding).
+# **V2.8 megaudit closure (Opus-B Lane C HIGH-1, 2026-05-22):** the
+# fixture used to ship in every production cdylib because this crate
+# enabled `ql-collab/test-fixtures` unconditionally. Lane C escalated
+# the previously LOW-rated leak to HIGH because any in-process JS in
+# the IDE worker could construct a `BlockingTransportFixture` and park
+# tokio blocking-pool threads for up to `u32::MAX` ms — a self-DoS
+# surface bypassing the V3 multi-window demo's intended trust boundary.
+# Fixed by gating both the `ql-collab` feature dep AND the
+# `BlockingTransportFixture` napi class behind a binding-side
+# `test-fixtures` feature (see `[features]` below). Production builds
+# do NOT enable the feature; mocha/contract builds (dev + CI test
+# lane) DO. The `cargo build` invocation that produces a mocha-ready
+# cdylib is `cargo build -p ql-bindings-node --release --features test-fixtures`.
+ql-collab    = { path = "../ql-collab" }
 ql-collab-ws = { path = "../ql-collab-ws" }
 ql-oplog     = { path = "../ql-oplog" }
 ql-types     = { path = "../ql-types" }
@@ -69,3 +78,19 @@ tokio = { workspace = true }
 
 [build-dependencies]
 napi-build = { workspace = true }
+
+# **Phase 5.7 V2.8 megaudit closure (Opus-B Lane C HIGH-1, 2026-05-22).**
+#
+# `test-fixtures`: gates the `BlockingTransportFixture` napi class +
+# its Send/Sync compile asserts + the `ql-collab/test-fixtures` feature
+# dependency. Off by default → production cdylib does NOT carry the
+# fixture. Enable for mocha + contention contract tests:
+#
+#     cargo build -p ql-bindings-node --release --features test-fixtures
+#
+# Pre-V2.8 builds enabled `ql-collab/test-fixtures` unconditionally; the
+# fixture leaked into every production binary. See V2 exit packet at
+# `docs/phase5/5-7-v2-exit-packet.md` for the closure rationale.
+[features]
+default = []
+test-fixtures = ["ql-collab/test-fixtures"]

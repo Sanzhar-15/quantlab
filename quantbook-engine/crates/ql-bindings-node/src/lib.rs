@@ -1194,6 +1194,17 @@ impl LoopbackPair {
 // `BlockingTransport` napi class would not be attachable. The
 // fixture-controller pattern is the closest analog to V2.1's
 // `LoopbackPair`.
+//
+// **V2.8 megaudit closure (Opus-B Lane C HIGH-1, 2026-05-22)**: the
+// entire fixture surface is now gated behind the binding-side
+// `test-fixtures` feature. Pre-V2.8 builds shipped the fixture in
+// every production cdylib (because `ql-collab/test-fixtures` was
+// enabled unconditionally in `Cargo.toml`); Lane C flagged this as a
+// self-DoS surface (any in-process JS could park tokio blocking-pool
+// threads for u32::MAX ms). Mocha + contention tests must rebuild
+// with `--features test-fixtures`; production builds explicitly omit
+// the flag. See `Cargo.toml`'s `[features]` block + V2 exit packet at
+// `docs/phase5/5-7-v2-exit-packet.md`.
 
 /// **Phase 5.7 V2.6 (2026-05-22) — V2.5 contract-test fixture.**
 ///
@@ -1205,9 +1216,14 @@ impl LoopbackPair {
 /// a pending `flushPendingToTransport` MUST return immediately
 /// (does NOT block on the session lock).
 ///
-/// **Not for production use** — the underlying `BlockingTransport`
+/// **NOT for production use** — the underlying `BlockingTransport`
 /// blocks `flush_pending` indefinitely until `release()` is called
-/// (or the constructor's `block_ms` upper bound elapses).
+/// (or the constructor's `block_ms` upper bound elapses). V2.8
+/// megaudit closure (Opus-B Lane C HIGH-1) gates the entire type
+/// behind the `test-fixtures` Cargo feature; production cdylib
+/// builds (built without `--features test-fixtures`) do NOT carry
+/// this class.
+#[cfg(feature = "test-fixtures")]
 #[napi]
 pub struct BlockingTransportFixture {
     /// The fixture's inner `BlockingTransport`, taken once via
@@ -1225,6 +1241,7 @@ pub struct BlockingTransportFixture {
     blocked: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 
+#[cfg(feature = "test-fixtures")]
 #[napi]
 impl BlockingTransportFixture {
     /// JS: `new BlockingTransportFixture(blockMs: number)`.
@@ -1392,6 +1409,20 @@ const _ASSERT_BINDING_COLLAB_SESSION_SEND: fn() = || {
 // object itself is `Send` (we declare it `dyn CoreTransport + Send`), and
 // `Box<_>` of a `Send` trait object is `Send`, and `Option<T>` is `Send`
 // when `T: Send`. So the composition is `Send`. Pin it.
+//
+// **V2.8 megaudit (Opus-B Lane C MEDIUM-2, 2026-05-22) — Sync NOT
+// asserted; rationale documented here.** The `dyn ql_collab::Transport
+// + Send` trait object does NOT carry a `Sync` bound (the trait itself
+// has no `Sync` supertrait — V1 design accepted this because the
+// engine boxes transports per-session, not for shared use). Therefore
+// `Box<dyn Transport + Send>: Send + !Sync`, and `Transport: !Sync`
+// by composition. This is asymmetric vs `CollabSession` (Send + Sync
+// since V2.4) and `LoopbackPair` / `BlockingTransportFixture` (Send +
+// Sync — see asserts below) — by design: napi-rs holds Transport
+// wrappers per-Worker and does not require cross-thread aliasing of a
+// single Transport. If a future V3 multi-window flow needs to clone
+// a Transport handle across Workers, the `Sync` bound would need to
+// be added to `ql_collab::Transport` first.
 const _ASSERT_BINDING_TRANSPORT_SEND: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<Transport>();
@@ -1401,27 +1432,48 @@ const _ASSERT_BINDING_TRANSPORT_SEND: fn() = || {
 // for `LoopbackPair`. Wrapper holds `a: Option<LoopbackTransport>, b:
 // Option<LoopbackTransport>`. The engine pins
 // `_ASSERT_LOOPBACK_TRANSPORT_SEND_SYNC` in `ql-collab/src/transport.rs`,
-// so by composition `LoopbackPair: Send`. Pin it here so a future
-// refactor making LoopbackTransport `!Send` would fail this build (the
-// napi class hands wrapped instances across the JS/Rust boundary on the
-// same thread, so `Send` isn't strictly required for V2.1 — but losing
-// it would break the V2.3+ Transport.websocketConnect async pattern
-// which DOES require Send to move across the tokio runtime).
-const _ASSERT_BINDING_LOOPBACK_PAIR_SEND: fn() = || {
+// so by composition `LoopbackPair: Send + Sync`. Pin BOTH bounds so a
+// future refactor making LoopbackTransport `!Send` or `!Sync` fails this
+// build (the napi class hands wrapped instances across the JS/Rust
+// boundary on the same thread, so neither is strictly required for V2.1
+// — but losing Send would break the V2.3+ Transport.websocketConnect
+// async pattern which DOES require Send to move across the tokio
+// runtime).
+//
+// **V2.8 megaudit closure (Opus-B Lane C MEDIUM-2, 2026-05-22)**: V2.1
+// only asserted Send. Lane C flagged the missing Sync assertion as Rule
+// 4 silence (no negative claim, but the symmetry hole vs CollabSession
+// was a latent SemVer gap). Adding the positive Sync proof closes it.
+const _ASSERT_BINDING_LOOPBACK_PAIR_SEND_SYNC: fn() = || {
     fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
     assert_send::<LoopbackPair>();
+    assert_sync::<LoopbackPair>();
 };
 
 // **Phase 5.7 V2.6 (2026-05-22) Rule 4 application for `BlockingTransportFixture`**:
 // the fixture wraps `Option<BlockingTransport>` + two `Arc<(Mutex, Condvar)>`
-// fields. `BlockingTransport: Send` is pinned in ql-collab; `Arc<T>: Send` when
-// `T: Send + Sync`; `Mutex<T>` + `Condvar` are both `Send + Sync`. So the
-// composition is `Send`. Pin it — napi holds instances per-Worker so cross-Worker
-// Send isn't strictly required, but losing Send would break the `waitUntilBlocked`
-// async method's `spawn_blocking` move-into pattern.
-const _ASSERT_BINDING_BLOCKING_TRANSPORT_FIXTURE_SEND: fn() = || {
+// fields. `BlockingTransport: Send + Sync` is pinned in ql-collab;
+// `Arc<T>: Send + Sync` when `T: Send + Sync`; `Mutex<T>` + `Condvar`
+// are both `Send + Sync`. So the composition is `Send + Sync`. Pin both
+// — napi holds instances per-Worker so cross-Worker bounds aren't
+// strictly required, but losing Send would break `waitUntilBlocked`'s
+// `spawn_blocking` move-into pattern.
+//
+// **V2.8 megaudit closure (Opus-B Lane C MEDIUM-2, 2026-05-22)**: V2.6
+// only asserted Send. Lane C flagged the missing Sync assertion. Adding
+// positive Sync proof closes it.
+//
+// **V2.8 megaudit closure (Opus-B Lane C HIGH-1, 2026-05-22)**: this
+// assert is now `#[cfg(feature = "test-fixtures")]`-gated because the
+// `BlockingTransportFixture` type itself only exists under that
+// feature. Production cdylib builds compile without either.
+#[cfg(feature = "test-fixtures")]
+const _ASSERT_BINDING_BLOCKING_TRANSPORT_FIXTURE_SEND_SYNC: fn() = || {
     fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
     assert_send::<BlockingTransportFixture>();
+    assert_sync::<BlockingTransportFixture>();
 };
 
 // **V2.4 (2026-05-22) update**: this block previously documented the
