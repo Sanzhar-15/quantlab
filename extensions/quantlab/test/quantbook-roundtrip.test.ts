@@ -2784,3 +2784,93 @@ suite('quantbook V3.3.0.2 -- listSheets() enumeration', function () {
 		assert.deepStrictEqual(sheetsB, [0, 3, 7]);
 	});
 });
+
+// ============================================================================
+// Phase 5.7 V3.3.0.3 -- engine exportSnapshot incremental cache
+// ============================================================================
+
+suite('quantbook V3.3.0.3 -- snapshot cache invariants (semantics-preserving)', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('cache reflects last-write-wins on local appends to the same cell', () => {
+		// Validates V3.3.0.3 append_op incremental insert: subsequent
+		// appends to the same (sheet, row, col) overwrite the cached
+		// value in iteration order.
+		const session = createSession(901n);
+		appendPutValueValidated(session, 0, 5, 7, 1.0);
+		appendPutValueValidated(session, 0, 5, 7, 2.0);
+		appendPutValueValidated(session, 0, 5, 7, 99.5); // final write
+		const snap = exportCellSnapshot(session, 0);
+		assert.strictEqual(snap.entries.length, 1);
+		assert.deepStrictEqual(snap.entries[0], {
+			row: 5, col: 7, value: { kind: 'number', value: 99.5 },
+		});
+	});
+
+	test('cache survives mergeBytes (causal-reorder safe rebuild)', () => {
+		// A and B both append disjoint cells; B merges A's snapshot.
+		// B's exportCellSnapshot must reflect BOTH peers' cells.  This
+		// pins that merge_bytes rebuilds the cache (not just appends
+		// from len_before, which would miss causal reordering).
+		const sessA = createSession(902n);
+		appendPutValueValidated(sessA, 0, 0, 0, 10);
+		appendPutValueValidated(sessA, 0, 1, 0, 11);
+		const sessB = createSession(903n);
+		appendPutValueValidated(sessB, 0, 2, 0, 20);
+		appendPutValueValidated(sessB, 0, 3, 0, 21);
+		// Merge A into B.
+		sessB.mergeBytes(sessA.exportBytes());
+		const snapB = exportCellSnapshot(sessB, 0);
+		// B should now show 4 cells from both peers.
+		const cells = snapB.entries.map(e => `${e.row},${e.col}`).sort();
+		assert.deepStrictEqual(cells, ['0,0', '1,0', '2,0', '3,0']);
+	});
+
+	test('cache survives pollRemote drain through Loopback transport (V3.2.c regression)', () => {
+		// This is the regression test that flushed out the V3.3.0.3
+		// pre-fix bug where `poll_remote_with_limit` bypassed the
+		// public `merge_bytes` path + left the cache stale.
+		//
+		// A appends with auto-flush; B polls + drains; B's snapshot
+		// must reflect A's cells.  Pre-V3.3.0.3-with-fix, B's cache
+		// would be stale + the snapshot empty.
+		const [tA, tB] = loopbackTransportPair();
+		const sessA = createSession(904n);
+		const sessB = createSession(905n);
+		sessA.attachTransport(tA);
+		sessB.attachTransport(tB);
+		sessA.setAutoFlushPolicy('onAppend');
+		appendPutValueValidated(sessA, 0, 0, 0, 1.0);
+		appendPutValueValidated(sessA, 0, 0, 1, 2.0);
+		const n = sessB.pollRemote();
+		assert.ok(n > 0, 'pollRemote returns merged > 0');
+		const snapB = exportCellSnapshot(sessB, 0);
+		assert.strictEqual(snapB.entries.length, 2,
+			'B snapshot reflects A\'s 2 cells after pollRemote-driven merge');
+	});
+
+	test('cache state matches op-log walk semantics across export/import round-trip', () => {
+		// Validates from_snapshot path: importing bytes rebuilds the
+		// cache from the imported log.  B (loaded via fromSnapshot)
+		// must produce the same snapshot as A (which created the
+		// op log via direct appends).
+		const sessA = createSession(906n);
+		appendPutValueValidated(sessA, 0, 5, 5, 50);
+		appendPutValueValidated(sessA, 0, 5, 6, 60);
+		appendPutValueValidated(sessA, 1, 0, 0, 100); // different sheet
+		const snapA0 = exportCellSnapshot(sessA, 0);
+		const snapA1 = exportCellSnapshot(sessA, 1);
+
+		const sessB = sessionFromSnapshot(907n, sessA.exportBytes());
+		const snapB0 = exportCellSnapshot(sessB, 0);
+		const snapB1 = exportCellSnapshot(sessB, 1);
+
+		assert.deepStrictEqual(snapB0.entries, snapA0.entries,
+			'fromSnapshot rebuilds the cache; sheet 0 mirrors source');
+		assert.deepStrictEqual(snapB1.entries, snapA1.entries,
+			'fromSnapshot rebuilds the cache; sheet 1 mirrors source');
+	});
+});
