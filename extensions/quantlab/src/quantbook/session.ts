@@ -25,7 +25,7 @@
  */
 
 import { loadQuantbookEngine } from './loader';
-import type { CollabSessionInstance } from './types';
+import type { CollabSessionInstance, LoopbackPairInstance, TransportInstance } from './types';
 
 /**
  * Construct a fresh `CollabSession` for the given peer.
@@ -99,4 +99,45 @@ export function sessionFromSnapshot(peerId: bigint, bytes: Uint8Array): CollabSe
  */
 export function quantbookEngineVersion(): string {
 	return loadQuantbookEngine().version();
+}
+
+// =====================================================================
+// Phase 5.7 V2.1 (2026-05-22) -- Transport binding wrappers
+// =====================================================================
+
+/**
+ * Construct a fresh `LoopbackPair` and immediately take both ends.
+ * Returns the two Transport instances ready to attach to a session
+ * each.
+ *
+ * Combines `new LoopbackPair()` + `takeA()` + `takeB()` into a single
+ * call because the typical use case wants both ends. For cases where
+ * one end is created independently (e.g., delayed peer connection),
+ * use `createLoopbackPair()` instead and call `takeA` / `takeB`
+ * separately.
+ *
+ * @returns `[transportA, transportB]` where bytes sent on A arrive
+ *           at B's `pollRemote` and vice versa.
+ *
+ * @example
+ * ```ts
+ * const [tA, tB] = loopbackTransportPair();
+ * sessionA.attachTransport(tA);
+ * sessionB.attachTransport(tB);
+ * // mutate sessionA, flushToTransport, pollRemote on sessionB
+ * ```
+ */
+export function loopbackTransportPair(): [TransportInstance, TransportInstance] {
+	const engine = loadQuantbookEngine();
+	const pair = new engine.LoopbackPair();
+	return [pair.takeA(), pair.takeB()];
+}
+
+/**
+ * Construct an empty `LoopbackPair` without taking either end. Use
+ * when the two takes need to happen at different times.
+ */
+export function createLoopbackPair(): LoopbackPairInstance {
+	const engine = loadQuantbookEngine();
+	return new engine.LoopbackPair();
 }

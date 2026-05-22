@@ -77,6 +77,58 @@ export interface CollabSessionInstance {
 
 	/** Peer ID of this session, as a BigInt (u64-domain). */
 	peerId(): bigint;
+
+	// =====================================================================
+	// Phase 5.7 V2.1 (2026-05-22) -- Transport surface (sync portion)
+	// =====================================================================
+
+	/**
+	 * Attach a Transport to this session. The `transport` instance is
+	 * CONSUMED -- subsequent calls with the same wrapper throw.
+	 *
+	 * Resets the session's per-transport VV baseline (Phase 5.5 V2 V3
+	 * step 1 contract): the next flush sends from empty VV, delivering
+	 * all local ops including any appended while no transport was
+	 * attached. Loro's CRDT op log IS the implicit offline queue.
+	 *
+	 * @throws Error if `transport` has already been consumed.
+	 */
+	attachTransport(transport: TransportInstance): void;
+
+	/**
+	 * Detach the currently-attached transport. Returns `true` if one
+	 * was attached (now released, its background tasks dropped),
+	 * `false` if there was nothing to detach.
+	 *
+	 * V2.1 drops the returned `Box<dyn Transport>` Rust-side -- JS
+	 * does not receive the prior transport.
+	 */
+	detachTransport(): boolean;
+
+	/** `true` iff a transport is currently attached. */
+	hasTransport(): boolean;
+
+	/**
+	 * Full-snapshot flush to the attached transport. Returns `true` if
+	 * bytes were sent, `false` if no transport is attached.
+	 *
+	 * **Use the upcoming `flushDeltaToTransport` instead in production**
+	 * once V2.2 ships -- delta flushes are O(per-op delta) vs O(full
+	 * state).
+	 *
+	 * @throws Error if the transport's `send` returns an error.
+	 */
+	flushToTransport(): boolean;
+
+	/**
+	 * Drain inbound bytes from the attached transport (single-pass).
+	 * Returns the count of ops merged. `0` if no transport is attached
+	 * or no bytes were queued.
+	 *
+	 * @throws Error if the transport's `try_recv` or the merge step
+	 *               returns an error.
+	 */
+	pollRemote(): number;
 }
 
 export interface CollabSessionConstructor {
@@ -84,6 +136,69 @@ export interface CollabSessionConstructor {
 
 	/** Reconstruct a session from a previously-exported snapshot. */
 	fromSnapshot(peerId: bigint, bytes: Uint8Array): CollabSessionInstance;
+}
+
+// =====================================================================
+// Phase 5.7 V2.1 (2026-05-22) -- Transport binding type declarations
+// =====================================================================
+
+/**
+ * Opaque wrapper for a `Box<dyn ql_collab::Transport + Send>`.
+ *
+ * **Single-use semantics**: an instance owns its boxed trait object.
+ * `CollabSession.attachTransport(t)` MOVES the box out, leaving the
+ * wrapper consumed. After consumption, `isAttachable()` returns
+ * `false` and subsequent `attachTransport` calls with the same
+ * wrapper throw.
+ *
+ * Instances are obtained from factory classes (V2.1: `LoopbackPair`;
+ * V2.3+: `Transport.websocketConnect(url)`).
+ */
+export interface TransportInstance {
+	/**
+	 * `true` while this wrapper still owns its inner transport.
+	 * `false` after passing to `attachTransport` (or any other
+	 * future API that consumes the wrapper).
+	 *
+	 * Useful for branching without exception handling:
+	 * ```ts
+	 * if (transport.isAttachable()) {
+	 *   session.attachTransport(transport);
+	 * }
+	 * ```
+	 */
+	isAttachable(): boolean;
+}
+
+/**
+ * Two-ended in-process Transport pair (`LoopbackTransport`).
+ *
+ * **V2.1 entry point** for obtaining paired Transport instances. The
+ * pair's two ends share an in-process queue: bytes sent on end A
+ * arrive at end B's `try_recv` and vice versa.
+ *
+ * Each end can be `take`-n once. Calling `takeA` (or `takeB`) a
+ * second time on the same pair throws. The two takes are
+ * independent (taking A doesn't affect taking B).
+ */
+export interface LoopbackPairInstance {
+	/**
+	 * Take ownership of end A. Each `LoopbackPair` instance can have
+	 * `takeA` called once.
+	 * @throws Error on the second call.
+	 */
+	takeA(): TransportInstance;
+
+	/**
+	 * Take ownership of end B. Each `LoopbackPair` instance can have
+	 * `takeB` called once.
+	 * @throws Error on the second call.
+	 */
+	takeB(): TransportInstance;
+}
+
+export interface LoopbackPairConstructor {
+	new(): LoopbackPairInstance;
 }
 
 /**
@@ -96,4 +211,18 @@ export interface QuantbookNativeModule {
 
 	/** Session class -- see {@link CollabSessionInstance}. */
 	readonly CollabSession: CollabSessionConstructor;
+
+	/**
+	 * V2.1: opaque Transport wrapper. JS-side this is mostly used
+	 * as a parameter type to `CollabSession.attachTransport`.
+	 * The constructor is NOT directly exposed -- obtain instances
+	 * via factories like `LoopbackPair`.
+	 */
+	readonly Transport: { prototype: TransportInstance };
+
+	/**
+	 * V2.1: LoopbackPair class -- factory for paired in-process
+	 * Transport ends.
+	 */
+	readonly LoopbackPair: LoopbackPairConstructor;
 }
