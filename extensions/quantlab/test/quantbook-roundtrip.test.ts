@@ -1937,4 +1937,175 @@ suite('quantbook V3.1 multi-window relay round-trip', function () {
 			}
 		}
 	});
+
+	test('V3.1.e closure (Codex L5): reconnect-mid-flight surfaces transport_closed + recovers on relay respawn', async function () {
+		// **V3.1.e Codex LOW-5 closure (2026-05-22)**: the V3.1.d
+		// initial test only covered the happy-path round-trip. This
+		// test covers the deferred reconnect-mid-flight contract:
+		//   1. Spawn relay, attach two sessions, confirm A->B sync.
+		//   2. Kill the relay mid-flight.
+		//   3. Verify A's next flushDeltaToTransport surfaces an
+		//      engine-side `transport_closed` (via
+		//      parseQuantbookError on the thrown Error OR via
+		//      transportLastError observation -- depends on the
+		//      Transport impl's failure-surfacing timing).
+		//   4. Respawn the relay on the SAME port.
+		//   5. Drop the dead transport, websocketConnect a fresh one,
+		//      reattach, confirm A->B propagation resumes.
+		//
+		// Note: this test bypasses the IDE-side multiWindowDemo
+		// orchestration (reconnectWithBackoff, dispose-from-handler,
+		// Restart Demo action) -- those live in VS Code's command
+		// context which the mocha shim does not provide. This test
+		// pins the LOWER-LAYER engine contract that the IDE
+		// orchestration depends on: transport_closed IS surfaced and
+		// a fresh Transport.websocketConnect succeeds against a
+		// respawned relay.
+		this.timeout(20000);
+		const TEST_PORT = 17118; // distinct from the 17117 happy-path test
+		const binaryPath = resolveRelayBinaryPath();
+
+		const spawnRelayProc = (): { child: cp.ChildProcess; ready: Promise<void> } => {
+			const child = cp.spawn(binaryPath, [], {
+				env: { ...process.env, QL_RELAY_PORT: String(TEST_PORT) },
+				stdio: ['ignore', 'pipe', 'pipe'],
+			});
+			const ready = new Promise<void>((resolve, reject) => {
+				let buf = '';
+				child.stdout?.on('data', (chunk: Buffer) => {
+					buf += chunk.toString('utf8');
+					if (buf.includes('[ql-collab-ws relay] listening on')) {
+						resolve();
+					}
+				});
+				child.stderr?.on('data', (c: Buffer) => {
+					process.stderr.write(`[relay stderr] ${c.toString('utf8')}`);
+				});
+				child.once('exit', (code, sig) => {
+					reject(new Error(`relay exited before ready (code=${code}, sig=${sig})`));
+				});
+				setTimeout(() => reject(new Error('relay readiness timeout 5s')), 5000);
+			});
+			return { child, ready };
+		};
+
+		let relay = spawnRelayProc();
+		await relay.ready;
+
+		const engine = loadQuantbookEngine();
+		const url = `ws://127.0.0.1:${TEST_PORT}`;
+
+		const sessA = new engine.CollabSession(201n);
+		const sessB = new engine.CollabSession(202n);
+		sessA.attachTransport(await engine.Transport.websocketConnect(url));
+		sessB.attachTransport(await engine.Transport.websocketConnect(url));
+
+		try {
+			// Sanity round-trip: A appends, B observes within 3s.
+			appendPutValueValidated(sessA, 0, 0, 0, 1.0);
+			sessA.flushDeltaToTransport();
+			let merged = 0;
+			let deadline = Date.now() + 3000;
+			while (Date.now() < deadline) {
+				merged = sessB.pollRemote();
+				if (merged > 0) {
+					break;
+				}
+				await new Promise(r => setTimeout(r, 100));
+			}
+			assert.ok(merged > 0, 'pre-kill sanity: B observed A\'s op');
+
+			// Kill the relay mid-flight.
+			relay.child.kill('SIGTERM');
+			await new Promise<void>(resolve => {
+				if (relay.child.exitCode !== null || relay.child.signalCode !== null) {
+					resolve();
+					return;
+				}
+				relay.child.once('exit', () => resolve());
+			});
+
+			// Give the engine reader/writer tasks a beat to observe
+			// the TCP close (peer-closed propagates via tungstenite's
+			// stream end). Until they observe it, transportLastError
+			// may still be None and a send may not yet surface
+			// transport_closed.
+			await new Promise(r => setTimeout(r, 300));
+
+			// Surface check: after the relay is dead, either:
+			//   (a) transportLastError() is populated (the reader
+			//       task observed Closed first), OR
+			//   (b) the next flushDeltaToTransport throws with
+			//       `[transport_closed]` (the writer task's send
+			//       observed it first).
+			// Either path is acceptable -- the engine routes through
+			// the same error variant.
+			let observedClosed = false;
+			const lastErr = sessA.transportLastError();
+			if (lastErr !== null) {
+				observedClosed = true;
+			} else {
+				// Try a flush to provoke the writer-side observation.
+				appendPutValueValidated(sessA, 0, 0, 1, 2.0);
+				try {
+					sessA.flushDeltaToTransport();
+					// Some Transport impls return Ok(true) even when
+					// the peer is dead because the local mpsc accepts
+					// the buffer. Re-check transportLastError after a
+					// brief wait for the writer task to discover the
+					// close.
+					await new Promise(r => setTimeout(r, 300));
+					if (sessA.transportLastError() !== null) {
+						observedClosed = true;
+					}
+				} catch (err) {
+					const info = parseQuantbookError(err);
+					assert.ok(
+						info.code === 'transport_closed' || info.code === 'transport_io',
+						`expected transport_closed or transport_io, got ${info.code} (msg: ${info.message})`,
+					);
+					observedClosed = true;
+				}
+			}
+			assert.ok(
+				observedClosed,
+				'V3.1.e contract: relay kill must eventually surface transport_closed (via transportLastError or thrown Error)',
+			);
+
+			// Respawn the relay on the same port. Drop the dead
+			// transports + websocketConnect fresh; reattach.
+			relay = spawnRelayProc();
+			await relay.ready;
+			sessA.detachTransport();
+			sessB.detachTransport();
+			sessA.attachTransport(await engine.Transport.websocketConnect(url));
+			sessB.attachTransport(await engine.Transport.websocketConnect(url));
+
+			// Verify recovery: append on A, observe on B.
+			const sessB_baseline_opCount = sessB.opCount();
+			appendPutValueValidated(sessA, 0, 1, 0, 3.0);
+			sessA.flushDeltaToTransport();
+			merged = 0;
+			deadline = Date.now() + 3000;
+			while (Date.now() < deadline) {
+				merged = sessB.pollRemote();
+				if (merged > 0) {
+					break;
+				}
+				await new Promise(r => setTimeout(r, 100));
+			}
+			assert.ok(
+				merged > 0,
+				`post-respawn recovery: B should have received A's new op (merged=${merged} after 3s)`,
+			);
+			assert.ok(
+				sessB.opCount() > sessB_baseline_opCount,
+				'B\'s opCount must increase after the post-respawn op',
+			);
+		} finally {
+			if (relay.child.exitCode === null && relay.child.signalCode === null) {
+				relay.child.kill();
+			}
+		}
+	});
 });
