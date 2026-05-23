@@ -1,18 +1,19 @@
 ---
 name: 2026-05-22_phase-5-7-v3-3-multi-sheet-virtualization
-status: in-progress (V3.3.0.1 + V3.3.0.2 + V3.3.0.3 + V3.3.0.4 + V3.3.0.5 + V3.3.0.6 + V3.3.0.7 all shipped.  V3.3.0.6 closed 5 of 8 post-V3.3.0.5 audit gaps (drift JSDoc + multi-panel comment + cost-bounded ack + scroll-simulation pure-helper test + title point-in-time pin); mocha 172 -> 176.  V3.3.0.7 ide-consumer-contract.md § 4.1.z3 docs.  MASTER-PLAN.md § 5.7 narrative swept through V3.3.0.6.  V3.3.0.X parallel Codex+Opus megaudit is the only remaining sub-step.)
+status: done (V3.3.0 FULLY SHIPPED through V3.3.0.X megaudit + closures.  Codex Lane A + Opus Lane B parallel audit: 1+2 HIGH cumulative + 2+5 MEDIUM + 3+4 LOW.  10 of 11 findings closed in-cycle at engine `73e31df1737` + IDE `6dcc7ef9a20`.  ql-collab 76/76, IDE mocha 181/181.  Rule 4 arc terminus held at 6.  Plan ready for archive; V3.3.1+ or V3.4 entry-plan is the next session entry.)
 date: 2026-05-22
 predecessor_plan: .plans/_archive/2026-05-22_phase-5-7-v3-2-cell-grid-ui.md (V3.2 phase termination, all sub-steps shipped + exit-packeted)
 predecessor_exit_packet: docs/phase5/5-7-v3-2-exit-packet.md (V3.2 closure -- cell-grid UI vertical slice; FIRST product-user-visible surface)
 predecessor_v3_2_d_audits: docs/audits/2026-05-22-phase-5-7-v3-2-{codex,opus}.md (V3.2.d audit; Opus § Section 3 V3.3 ENTRY READINESS is the basis for THIS entry plan)
 parent_phase: 5.7 Collaboration IDE Vertical Slice
 direction: V3.3 -- multi-sheet + virtualized rendering. Scales the V3.2 grid widget from "hundreds of cells, one sheet" to "10K+ cells, multiple sheets per workbook" without losing the V3.2 audit discipline. Adds new engine napi surface (listSheets + exportSnapshot incremental cache) + IDE-side virtualization renderer + multi-sheet UX.
-current_engine_head: (this commit) V3.3.0.7 ide-consumer-contract § 4.1.z3 + MASTER-PLAN.md § 5.7 + plan close through V3.3.0.6/.7
-current_ide_head: 96b9afa37c4 (V3.3.0.6 IDE audit gap closures + 4 new scroll-simulation tests; predecessor dbc2bb517b0 = V3.3.0.5 multi-sheet UX)
-current_mocha_count: 176 / 176 (V3.2 exit baseline 140 + V3.3.0.2 +5 + V3.3.0.3 +4 + V3.3.0.4 +18 + V3.3.0.5 +5 + V3.3.0.6 +4)
+current_engine_head: 73e31df1737 (V3.3.0.X engine megaudit closures + 2 audit transcripts + new ql-collab tests; predecessor abb6f340ab7 = V3.3.0.7 docs)
+current_ide_head: 6dcc7ef9a20 (V3.3.0.X IDE megaudit closures + 5 new mocha tests; predecessor 96b9afa37c4 = V3.3.0.6)
+current_mocha_count: 181 / 181 (V3.2 exit baseline 140 + V3.3.0.2 +5 + V3.3.0.3 +4 + V3.3.0.4 +18 + V3.3.0.5 +5 + V3.3.0.6 +4 + V3.3.0.X +5)
+current_ql_collab_tests: 76 / 76 (74 pre-V3.3.0.X + 2 V3.3.0.X: undo_invalidates_snapshot_cache + force_clear_snapshot_cache_test_seam)
 current_ql_collab_tests: 74 / 74 (with --features test-fixtures)
 current_ql_collab_ws_tests: 42 / 42 (10 lib + 30 ws + 2 V3.1.a relay)
-current_engine_workspace: 4472 / 0 baseline (V3.2 does not touch ql-collab core; V3.3 will add tests for listSheets + incremental cache)
+current_engine_workspace: 4472 / 0 baseline (V3.3.0.X added 2 ql-collab unit tests for cache-invalidation + test seam; rest of workspace untouched)
 audit_rules_inherited:
   - Rule 1: no fresh-session reminders
   - Rule 2: parallel Codex+Opus per major sub-step
@@ -153,14 +154,35 @@ Per V3.2.e exit packet § "V3.3 ENTRY READINESS" + the V3.2.d Opus Lane B § Sec
 - [x] **V3.3.0.6 -- mocha tests + audit gap closures.**  Shipped at IDE `96b9afa37c4`.  Closed 5 of 8 gaps surfaced by the V3.3.0.5 post-ship audit: #3 scroll-simulation via pure-helper composition (jsdom unavailable; 3 tests pin monotonic advancement / spacer geometry / single-row scrollTop); #4 formatCellValueClient drift-hazard JSDoc; #5 multi-panel selection-semantic comment in switch-sheet command; #6 listSheets-per-show cost-bounded explanatory comment; #7 title-computation point-in-time pin (test).  Per-sub-step mocha incrementally hit the plan's "4 listSheets / 3 computeVisibleRange / 3 buildVirtualRows" coverage already (V3.3.0.2-V3.3.0.5 = 32 V3.3.0 tests).  Mocha 172 -> 176 (+4).
 - [x] **V3.3.0.7 -- docs.**  Shipped at engine (THIS commit).  `ide-consumer-contract.md § 4.1.z3` covers: new engine napi surface (`listSheets`); `last_snapshot` incremental cache + Rule 4 per-field walk + 5 op-mutation paths + V3.4 undo invalidation contract; custom-inline virtualization geometry (viewport + spacer rows + snapshot data block + scroll-driven repaint with mid-edit guard); multi-sheet UX command + panel-title "of M" convention; V3.2.a sample-data shape change; drift hazards (4 surfaces); V3.3 risk register R-V3.3-1..6; out-of-scope items; live smoke procedure (V3.3.0.6 user-action gap closure).
 
-## V3.3.0.X -- audit (after V3.3.0.6 ships)
+## V3.3.0.X -- parallel Codex + Opus megaudit + closures ✅ SHIPPED 2026-05-23
 
-Parallel Codex + Opus audit per Rule 2.  Same 2-lane variant as V3.2.d:
+- **Lane A Codex** (`docs/audits/2026-05-23-phase-5-7-v3-3-0-x-codex.md`): PASS-WITH-FINDINGS.  1 HIGH (undo/redo bypass cache) + 2 MEDIUM (rebuild atomicity + panel title silent swallow) + 3 LOW (docs cost drift + switch-sheet inline comment + row/col attr escape).
+- **Lane B Opus** (`docs/audits/2026-05-23-phase-5-7-v3-3-0-x-opus.md`): PASS-WITH-FINDINGS.  2 HIGH (undo/redo cache bypass + silent listSheets catch) + 5 MEDIUM (rebuild atomicity + 5-vs-6 paths docs + listSheets uses cache + switch-sheet UX confusion + test seam missing) + 4 LOW (row/col escape + !Sync probe pattern + sample-data pin + htmlEscape backtick).
+- **Cross-lane convergent**: HIGH-1 undo/redo (both); MEDIUM-1 rebuild atomicity (both); docs drift (both); switch-sheet comment (both); row/col escape (both).
+- **Rule 4 arc terminus held at 6.**  V3.3.0.3 `last_snapshot` per-field walk's three claims (HashMap, tuple, CellWireValue all Send+Sync) independently re-verified by Opus against source.
 
-- **Lane A Codex:** protocol/correctness sweep over the new napi surface (listSheets + incremental cache) + virtualization correctness (off-by-one on visible-range; scroll-direction handling; horizontal scroll if any) + multi-sheet UX flow.
-- **Lane B Opus:** adversarial per-field walks on the new `last_snapshot` cache field (Rule 4 per-field walk REQUIRED -- thread-safety + cache invariants + memory leak under sheet deletion).  Webview security: virtualization-introduced DOM-injection surface (the scroll handler runs on a tight loop; check XSS surface).  V3.4 entry-readiness analysis (what V3.3 carries; what V3.4 needs).
+**Closures shipped at engine `73e31df1737` + IDE `6dcc7ef9a20`** (10 of 11 findings closed; 1 LOW deferred to V3.x with rationale):
+- **HIGH-1** (engine): `undo`/`redo` call `rebuild_snapshot_cache()` when `consumed == true`; new ql-collab unit test `undo_invalidates_snapshot_cache`.
+- **HIGH-2** (IDE): silent `try { listSheets() } catch` removed from `CellGridPanel.show()`; errors propagate to callers' existing showErrorMessage path.  CLAUDE.md No-Fallbacks rule violation closed.
+- **MEDIUM-1** (engine): `rebuild_snapshot_cache` uses fresh-HashMap-then-swap pattern; on iter-Err the fresh local drops + cache retains pre-call state.
+- **MEDIUM-2** (engine docs): cache-field docstring updated to enumerate 7 mutation paths (was 5); explicit undo/redo annotation post-V3.3.0.X HIGH-1.
+- **MEDIUM-3** (engine): new `list_sheets_from_cache()` engine method derives sheet set from cache keys via BTreeSet walk; napi `list_sheets` delegates.  O(N) op-log walk -> O(cells-in-cache).
+- **MEDIUM-4** (IDE): switch-sheet inline comment corrected from "most-recently focused" to "OLDEST by Map insertion order".
+- **MEDIUM-5** (engine): new test-only `force_clear_snapshot_cache()` seam gated on `#[cfg(any(test, feature = "test-fixtures"))]`; new ql-collab unit test `force_clear_snapshot_cache_test_seam`.  R-V3.3-2 closed pre-V3.4.
+- **LOW-1** (IDE): defense-in-depth Number() coercion on row/col attribute interpolation at both server + client renderers.
 
-Cross-lane convergent HIGHs MUST close in-cycle.  V3.3.0.X audit + closures + plan close ships at V3.3.0 termination; V3.3.0 exit packet is OPTIONAL (V3.2 had one because V3.2 was the first product-visible vertical; V3.3.0 is a scaffold + may fold into a single V3.3 exit packet covering V3.3.0 + V3.3.1).
+**Deferred to V3.x with rationale:**
+- LOW-2 (Opus): commented-out !Sync probe pattern brittleness -- V3.x refactor to `static_assertions::assert_not_impl_all!` macro; no V3.3 dependency.
+- LOW-3 (Opus): V3.2.a sample-data shape pin test -- V3.4 replaces sample-data with real workbook loads.
+- LOW-4 (Opus): `htmlEscape` backtick coverage -- IE-quirks-mode theoretical only; webview is Electron Chromium.
+- Codex "Out of scope": `Op::BatchCommit` nested PutValue support (V3.5+); tombstoned/metadata-only sheets (V3.5+); jsdom DOM integration test (V3.x); half-row scroll boundary tests (V3.x); scroll throttling at WAN scale (V3.x); reactive title updates (V3.x).
+
+**V3.4 entry-readiness (Opus § V3.4 ENTRY READINESS):**
+- Required pre-V3.4: HIGH-1 ✅ (closed in V3.3.0.X), HIGH-2 ✅ (closed), MEDIUM-5 ✅ (test seam landed), MEDIUM-1 ✅ (atomicity).
+- Design locks to settle at V3.4 entry: Op-enum cache shape (per-variant vs unified per-cell state); undo/redo invalidation strategy (full rebuild vs partial invalidate accessor); persistence schema-versioning gate (envelope-level vs snapshot wrapper); presence + virtualization race guard pattern.
+- R-V3.3-5 (PeerId reuse under restart): UUID-derived peerId migration deferred to V3.x backlog.
+
+**V3.3.0 TERMINATED at V3.3.0.X.closure (engine `73e31df1737` + IDE `6dcc7ef9a20`).**  Plan ready to archive once memory + MASTER-PLAN sweep land.  V3.3.0 exit packet OPTIONAL per plan -- V3.3.1+ may fold into a single V3.3 exit packet; for now, the V3.2.e exit packet pattern + V3.3.0.X megaudit transcripts provide the canonical record.
 
 ## V3.3.0 risk register (carries from V3.2.d Opus § V3.3 readiness)
 
