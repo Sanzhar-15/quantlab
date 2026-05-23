@@ -1331,9 +1331,23 @@ class CollabSession {
 }
 
 // V3.5.0.5 EXTENDED: per-cell format passthrough added to CellSnapshotJson.
+// V3.6.0.3 D2 SHIPPED (2026-05-23): formats: FormatDefJson[] (engine
+// ffa598a1c15 + IDE b159c899359). V3.6.0.X audit-of-D2 closure
+// (2026-05-23) sorts formats by FormatId (Builtin first per enum
+// order, then Custom by (peer, counter)) for stable shape across
+// snapshots; cache walker uses first-write-wins (mirrors
+// FormatTable::register_at IdCollision rejection) per V3.6.0.1 § D2
+// locked decision. Full § 4.1.z6 V3.6 surface spec deferred to
+// V3.6.0.5 D4 ship (format-aware buildHtml rendering).
 interface WorkbookSnapshotJson {
   sheets: SheetSnapshotJson[];
-  // V3.6+: names: NamedRangeJson[]; formats: FormatDefJson[]
+  formats: FormatDefJson[];  // V3.6.0.3 D2 SHIPPED; sorted by FormatId
+  // V3.7+: names: NamedRangeJson[]
+}
+
+interface FormatDefJson {
+  id: FormatIdJson;   // V3.5.0.5 wire shape (kind: 'builtin' | 'custom')
+  string: string;     // format string (e.g., '0.00%', 'yyyy-mm-dd')
 }
 
 interface SheetSnapshotJson {
@@ -1451,7 +1465,7 @@ All 4 follow V3.4.0.4b Save As pattern: `panels[0]` arbitrary-pick from `CellGri
 
 #### V3.5.0.5 -- CellState format extension (D1)
 
-`CellState` extended with `format: Option<FormatId>` field.  Per-cell `Op::SetCellFormat` cache integration ships; **session-wide RegisterFormat FormatTable cache + format-aware buildHtml rendering DEFERRED to V3.6+** (per-cell format is the minimum surface to unblock format-aware rendering; session-wide registry is a larger design that would surface in `WorkbookSnapshotJson.formats: Vec<FormatDefJson>`).
+`CellState` extended with `format: Option<FormatId>` field.  Per-cell `Op::SetCellFormat` cache integration ships at V3.5.0.5; **session-wide RegisterFormat FormatTable cache SHIPPED at V3.6.0.3 D2** (engine `ffa598a1c15` + IDE `b159c899359`) with `WorkbookSnapshotJson.formats: Vec<FormatDefJson>` additive field; **format-aware buildHtml rendering still DEFERRED to V3.6.0.5 D4** (per V3.6.0.1 plan body § D4).  The V3.6.0.X audit-of-D2 closure (CONVERGENT-MED-1) sorts the formats field by FormatId for stable shape across snapshots; CONVERGENT-HIGH-1 closure mirrors `FormatTable::register_at` rejection at the cache walker (first-write-wins).
 
 **Per-field LWW semantics** (extends V3.4.0.2):
 - `Op::PutValue` writes `state.value`, preserves `formula` + `format`
@@ -1514,7 +1528,7 @@ Closes R-V3.4-3 (DEFERRED at V3.4.0.5b -> KNOWN-GAP at V3.4.0.X via Opus M2 -> C
 
 - **CellState shape evolution beyond V3.5.0.5**: future Op variants that carry per-cell state (e.g., per-cell validation rule, per-cell comment) MUST: (1) add a new field to `CellState` with Rule 4 per-field walk in the docstring; (2) extend the `CacheEffect` enum with the corresponding new variant; (3) extend `collect_cache_effects` to recurse on the new Op; (4) extend `apply_cache_effect` to handle the new variant; (5) **EXTEND the all-fields-None ghost-entry-avoidance check** in `ClearFormula` + `SetCellFormat { id: None }` branches (currently `value.is_none() && formula.is_none() && format.is_none()`); (6) extend `affected_cells_for_partial_invalidate` to recognize the new cell-keyed variant.
 - **Adding new Op cell-keyed variants** REQUIRES the same 6-step extension above; missing any step causes partial-invalidate to fall back to full-rebuild silently (correctness preserved but performance degrades) OR ghost cache entries (functional bug).
-- **WorkbookSnapshotJson shape additions** (V3.6+ may add `names: NamedRangeJson[]` + `formats: FormatDefJson[]`): keep ADDITIVE (no field removal / rename); V3.5 IDE consumers that destructure `.sheets` only continue working through the addition.  Rule 4 per-field walk REQUIRED on each new struct.
+- **WorkbookSnapshotJson shape additions** (V3.6.0.3 D2 SHIPPED `formats: FormatDefJson[]`; V3.7+ may add `names: NamedRangeJson[]`): keep ADDITIVE (no field removal / rename); V3.5 IDE consumers that destructure `.sheets` only continue working through the addition.  Exact-key / `Object.keys` / hash-stability consumers see the new field; sort by `FormatId` derived `Ord` (Builtin first per enum order, then Custom by `(peer, counter)`) gives stable shape across snapshots per V3.6.0.X audit-of-D2 CONVERGENT-MED-1 closure.  Rule 4 per-field walk REQUIRED on each new struct.
 - **Per-cell op-index for true O(ops-for-this-cell) invalidate_cell** (V3.6+ deferral): maintaining a `HashMap<(sheet, row, col), Vec<usize>>` mapping cell coord -> op-log indices that touch it.  Updated incrementally in `append_op` per emitted CacheEffect.  Rebuilt during `from_snapshot` + `merge_bytes`.  invalidate_cell looks up the index instead of walking the full log -> O(ops-for-this-cell).  Memory cost: ~24 bytes per indexed op-cell pair; manageable at typical session sizes.
 - **Loro UndoManager `on_pop` callback wiring** (V3.6+ deferral): would surface the retracted op shape directly via the UndoManager API, eliminating the V3.5.0.6 peek-most-recent-visible-op + shrink-by-1 heuristic.  Cleaner + handles the mixed-remote-ops case correctly without conservative fallback.
 - **Mid-edit-render guard watchdog tuning**: `PRESENCE_TYPING_WATCHDOG_MS = 30_000` is tunable.  If formula entry (multi-second edits with intermittent typing) surfaces stuck-true reports in production, increase to 60s OR add typing-stroke-based refresh (any typing keystroke resets the watchdog).  Currently the watchdog fires 30s after the initial `typing: true`, NOT 30s of inactivity.
@@ -1526,7 +1540,7 @@ Closes R-V3.4-3 (DEFERRED at V3.4.0.5b -> KNOWN-GAP at V3.4.0.X via Opus M2 -> C
 - **R-V3.5-2 Partial-invalidate per-cell-op-index deferral** -- DOCUMENTED.  V3.5.0.6 ships the architectural shape but `invalidate_cell` still walks the full log (O(N)).  V3.6+ scope: per-cell op-index would make invalidate_cell O(ops-for-this-cell).
 - **R-V3.5-3 Sheet-tabs UX gap (V3.5.0.4c not shipped)** -- ACCEPTED.  Multi-sheet UX adequately covered by V3.5.0.4a Command Palette commands (Add/Rename/Delete/Move Sheet) + V3.5.0.4b reactive panel title; sheet-tabs strip would be polish (faster switching) but NOT a correctness gap.  V3.5.1+ if user signal surfaces; otherwise folds into V3.6+ multi-tab redesign.
 - **R-V3.5-4 Format-aware rendering deferral** -- DOCUMENTED.  V3.5.0.5 ships per-cell format passthrough but `buildHtml` does NOT render format-aware cells (no number format / date / currency interpretation).  V3.6+ scope.
-- **R-V3.5-5 Session-wide format registry deferral** -- DOCUMENTED.  `Op::RegisterFormat` is NOT integrated with the V3.4.0.2 cache (would need a separate session-wide FormatTable cache + new `WorkbookSnapshotJson.formats: Vec<FormatDefJson>` field).  V3.6+ scope when format-UI write-path (`appendSetCellFormat` napi + commands) lands.
+- **R-V3.5-5 Session-wide format registry deferral** -- CLOSED at V3.6.0.3 D2 (engine `ffa598a1c15` + IDE `b159c899359`).  New `format_table_cache: HashMap<FormatId, Arc<str>>` field on `CollabSession` + new `CacheEffect::RegisterFormat` walker variant + new `FormatDefJson` napi struct + additive `WorkbookSnapshotJson.formats: Vec<FormatDefJson>` field populated from `Workbook.formats().iter()` (authoritative; merges Builtin + Custom).  V3.6.0.X audit-of-D2 closure: sorted by FormatId for shape stability; cache walker first-write-wins + drops Builtin variants.  Format-aware buildHtml rendering still deferred to V3.6.0.5 D4.
 - **R-V3.5-6 Cross-restart PeerId reuse (R-V3.3-5 carryforward)** -- CLOSED at V3.4.0.4b via fresh-UUID-per-session (D5 deviation; documented in § 4.1.z4).
 - **R-V3.5-7 Mid-edit-render guard watchdog correctness** -- DOCUMENTED.  30s `PRESENCE_TYPING_WATCHDOG_MS` is the V3.5.0.7 ship default.  Stuck-true conditions (panel-hung / window-closed-mid-edit / webview-crash) auto-clear after 30s with logged warning.  Tunable if user feedback surfaces.
 
@@ -1534,10 +1548,10 @@ Closes R-V3.4-3 (DEFERRED at V3.4.0.5b -> KNOWN-GAP at V3.4.0.X via Opus M2 -> C
 
 - **Sheet-tabs UI scaffold** (V3.5.0.4c -- may defer to V3.5.1+; folds into V3.6+ multi-tab redesign if not shipped standalone)
 - **Format-aware buildHtml rendering** (V3.6+; number / date / currency / etc. format interpretation)
-- **Session-wide RegisterFormat FormatTable cache** (V3.6+; would surface in `WorkbookSnapshotJson.formats: Vec<FormatDefJson>`)
+- **Session-wide RegisterFormat FormatTable cache** SHIPPED at V3.6.0.3 D2 (surfaces in `WorkbookSnapshotJson.formats: Vec<FormatDefJson>`, sorted by FormatId per V3.6.0.X audit-of-D2 CONVERGENT-MED-1 closure)
 - **Format-UI write-path** (V3.6+; napi `appendSetCellFormat` + commands like `quantbookSetCellFormat`)
-- **Per-cell op-index for O(ops-for-this-cell) invalidate_cell** (V3.6+; requires `HashMap<(sheet, row, col), Vec<usize>>` maintained in append_op + rebuilt on from_snapshot/merge_bytes)
-- **Loro UndoManager `on_pop` callback wiring** (V3.6+; would surface retracted-op shape directly; cleaner than V3.5.0.6 peek-most-recent heuristic)
+- **Per-cell op-index for O(ops-for-this-cell) invalidate_cell** (V3.6.0.4 D3 planned; requires `HashMap<(sheet, row, col), Vec<usize>>` maintained in append_op + rebuilt on from_snapshot/merge_bytes)
+- **Loro UndoManager `on_pop` callback wiring** SHIPPED at V3.6.0.2 D1 via `set_on_push` (encodes affected cells as `LoroValue::List<List<I64>>` into `UndoItemMeta::value`; undo/redo use `top_undo_meta`/`top_redo_meta` to pre-read cells; eliminates V3.5.0.X conservative `pure_local_frontier` gate)
 - **#REF! formula substitution for cross-sheet refs to deleted sheets** (V3.6+; extends repair_sheet_rename_chain)
 - **Op::RestoreSheet un-delete** (V3.6+ if user-facing flow justified; cell storage preserved internally but no surface)
 - **Reclamation pass for orphaned sheet storage** (V3.6+; compact tombstoned-sheet storage once op log purged of references)

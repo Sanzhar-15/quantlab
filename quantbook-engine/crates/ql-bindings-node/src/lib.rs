@@ -594,12 +594,14 @@ pub struct SheetSnapshotJson {
 ///
 /// **V3.5.0.2 ship**: `sheets` only.  **V3.5.0.5 (2026-05-24) adds
 /// per-cell format passthrough** via `SheetSnapshotJson.cells[i].format`;
-/// the top-level WorkbookSnapshotJson shape is UNCHANGED.  V3.6+ may
-/// add `names: Vec<NamedRangeJson>` + a session-wide `formats:
-/// Vec<FormatDefJson>` registry (deferred: requires a session-wide
-/// FormatTable cache + RegisterFormat op-walker; per-cell format is
-/// the minimum surface to unblock V3.6+ format-aware rendering).
-/// Additive; no shape break.
+/// the top-level WorkbookSnapshotJson shape was UNCHANGED at V3.5.
+/// **V3.6.0.3 D2 (2026-05-24) adds the session-wide `formats:
+/// Vec<FormatDefJson>` registry** (additive top-level field +
+/// dedicated `FormatDefJson` napi struct).  Future surfaces: `names:
+/// Vec<NamedRangeJson>` deferred to V3.6+/V3.7.
+/// Additive; no shape break for `.sheets`-destructuring consumers
+/// (exact-key / `Object.keys` / hash-stability consumers see the
+/// new `.formats` field per V3.6.0.X audit-of-D2 LOW-1 carry).
 ///
 /// **Performance note (R-V3.5-1)**: large workbooks (100k+ cells)
 /// produce large JSON payloads.  V3.5.0.2 ships the full snapshot per
@@ -614,17 +616,32 @@ pub struct WorkbookSnapshotJson {
     pub sheets: Vec<SheetSnapshotJson>,
     /// **Phase 5.7 V3.6.0.3 D2 (2026-05-24)**: session-wide format
     /// registry, populated from the rebuilt-and-repaired Workbook's
-    /// `FormatTable` (authoritative source -- merges Builtin ids
-    /// 0..=163 with Custom ids registered via `Op::RegisterFormat`).
+    /// `FormatTable` (authoritative source -- merges Excel-canonical
+    /// Builtin ids in the 0..=163 reserved range with Custom ids
+    /// registered via `Op::RegisterFormat`).  Note: only ~20 of the
+    /// 0..=163 Builtin ids are actually preloaded at
+    /// `FormatTable::default()`; the remainder are reserved per
+    /// Excel spec but not in the table until a producer emits an
+    /// `Op::RegisterFormat` for them (Phase 4.6 D-1 semantic; the
+    /// V3.6.0.X audit-of-D2 closure dropped Builtin RegisterFormat
+    /// at the cache walker but the Workbook side still accepts
+    /// them).
     ///
     /// Used by V3.6+ format-aware buildHtml rendering (D4): IDE looks
     /// up each cell's `format: FormatIdJson` against this list to find
     /// the format string (e.g., `"0.00%"`, `"yyyy-mm-dd"`) for
     /// number/date/currency rendering.
     ///
-    /// **Sort order**: iteration order of `FormatTable::iter()` (stable
-    /// for a given version + workbook state; not sorted by id).
-    /// Callers wanting deterministic order should sort client-side.
+    /// **Sort order**: **V3.6.0.X audit-of-D2 closure
+    /// (CONVERGENT-MED-1, 2026-05-23)**: sorted by `FormatId` via the
+    /// derived `Ord` (Builtin variants first per enum order, then
+    /// Custom lexicographically by `(peer, counter)`).  Pre-closure
+    /// this field was raw HashMap-iter order which varied
+    /// across consecutive `workbook_snapshot` calls (per-instance
+    /// random hasher; `workbook_snapshot` rebuilds a fresh
+    /// `Workbook::new()` each call so the hasher state differs).
+    /// Sorted output gives consumers a stable shape across
+    /// snapshots (hashable, diffable, JSON-stringify-equal).
     ///
     /// **Additive field** (V3.5.0.2 WorkbookSnapshotJson shape break-
     /// free extension): V3.5 IDE consumers that destructure
@@ -1545,19 +1562,21 @@ impl CollabSession {
     ///
     /// **JSON shape stability**: the V3.5.0.2 ship returns
     /// `WorkbookSnapshotJson { sheets: Vec<SheetSnapshotJson> }`.
-    /// V3.5.0.5 will add `names: Vec<NamedRangeJson>` + `formats:
-    /// Vec<FormatDefJson>` once the session-wide caches land; the
-    /// addition is ADDITIVE (no field removal / rename), so V3.5.0.2
-    /// IDE consumers keep working through V3.5.0.5 if they destructure
-    /// `.sheets` only.  Per `#[napi(object)]` Rust contract: fields are
-    /// `pub`; future field additions are TS interface extensions.
+    /// **V3.6.0.3 D2 SHIPPED**: `formats: Vec<FormatDefJson>` is
+    /// populated from the rebuilt Workbook's FormatTable (sorted by
+    /// FormatId per V3.6.0.X audit-of-D2 CONVERGENT-MED-1 closure).
+    /// V3.7+ may add `names: Vec<NamedRangeJson>` once that
+    /// session-wide cache lands; the addition is ADDITIVE (no field
+    /// removal / rename), so V3.5.0.2 IDE consumers that destructure
+    /// `.sheets` keep working.  Per `#[napi(object)]` Rust contract:
+    /// fields are `pub`; future field additions are TS interface
+    /// extensions.
     ///
-    /// **V3.5.0.2 known limitation**: this method does NOT surface
-    /// session-wide format definitions, named ranges, tables, spill
-    /// anchors, etc.  V3.5.0.5+ extends the snapshot as those caches
-    /// land; V3.6+ may promote to a richer `CacheState { cells, formats,
-    /// names, tables }` engine-side shape (per V3.5.0.1 D1 option (b)
-    /// if profiling justifies).
+    /// **Remaining known limitation** (post-V3.6.0.3 D2): this
+    /// method does NOT surface named ranges, tables, spill
+    /// anchors, etc.  V3.7+ may promote to a richer `CacheState
+    /// { cells, formats, names, tables }` engine-side shape (per
+    /// V3.5.0.1 D1 option (b) if profiling justifies).
     ///
     /// # Errors
     ///
@@ -1672,24 +1691,33 @@ impl CollabSession {
         // **V3.6.0.3 D2 (2026-05-24)**: populate the `formats` field
         // from the rebuilt+repaired Workbook's FormatTable.  The
         // FormatTable is the AUTHORITATIVE source (merges Builtin ids
-        // 0..=163 with Custom ids registered via Op::RegisterFormat;
+        // 0..=163 range with Custom ids registered via Op::RegisterFormat;
         // applies the same-id-different-string rejection via
         // register_at).  The session-side `format_table_cache` exists
         // for V3.7+ incremental-snapshot-delta + cross-peer-convergence
         // discipline but is NOT consulted here -- under cross-peer
         // concurrent RegisterFormat the cache could diverge from the
-        // workbook (cache LWW vs workbook reject) and we'd surface
-        // the WRONG string to the IDE.  Workbook iteration is the
-        // safe choice.
+        // workbook (cache first-write-wins post V3.6.0.X closure
+        // vs workbook reject) and we'd surface the WRONG string to the
+        // IDE.  Workbook iteration is the safe choice.
         //
-        // Iteration order is FormatTable's internal HashMap iteration
-        // (NOT sorted by id).  Callers wanting deterministic order
-        // should sort client-side.  Iteration cost is O(N_formats)
-        // where typical workbooks have < 100 custom formats; negligible
-        // vs the rebuild_workbook + snapshot_cells cost.
-        let formats: Vec<FormatDefJson> = workbook
-            .formats()
-            .iter()
+        // **V3.6.0.X audit-of-D2 closure (2026-05-23,
+        // CONVERGENT-MED-1 -- Codex Lane A MED-1 + Opus Lane B
+        // MED-2)**: SORT the formats by `FormatId` (Builtin variants
+        // first per enum order, then Custom lexicographically by
+        // (peer, counter)) BEFORE returning.  Pre-closure the field
+        // was HashMap-iter order (per-instance random hasher; fresh
+        // `Workbook::new()` per `workbook_snapshot` call ->
+        // different orderings across consecutive calls; Codex Probe
+        // 4 confirmed empirically over 8 iterations).  Sorted output
+        // gives consumers a stable shape across snapshots (hashable,
+        // diffable, JSON-stringify-equal).  Iteration + sort cost is
+        // O(N_formats * log N_formats) where N_formats is typically
+        // < 100; negligible vs rebuild_workbook + snapshot_cells.
+        let mut format_pairs: Vec<(ql_storage::FormatId, &str)> = workbook.formats().iter().collect();
+        format_pairs.sort_by_key(|(id, _)| *id);
+        let formats: Vec<FormatDefJson> = format_pairs
+            .into_iter()
             .map(|(id, s)| FormatDefJson {
                 id: FormatIdJson::from(id),
                 string: s.to_string(),

@@ -185,20 +185,28 @@ enum CacheEffect {
     RemoveSheet { id: u16 },
     /// **V3.6.0.3 D2 (2026-05-24)**: session-wide format-table cache
     /// update from `Op::RegisterFormat`.  Apply: insert `(id, string)`
-    /// into `format_table_cache`.
+    /// into `format_table_cache` IF the id is not already present
+    /// (first-write-wins).
     ///
-    /// **LWW caveat**: the engine `Workbook::FormatTable::register_at`
-    /// REJECTS same-id-different-string registrations (returns
-    /// `FormatTableError::AlreadyRegistered`).  The cache walker is
-    /// downstream of replay and accepts all RegisterFormat effects
-    /// blindly (LWW per iteration order); a cross-peer concurrent
-    /// `Op::RegisterFormat { id: SAME, string: DIFFERENT }` would
-    /// produce a cache that ends with the LAST iterated string but a
-    /// Workbook that has the FIRST.  Acceptable because the napi
-    /// `workbook_snapshot.formats` reads from the Workbook (authoritative
-    /// source); the cache is internal-only discipline + future-use
-    /// (V3.7+ incremental snapshot deltas).  V3.7+ could close the
-    /// divergence by mirroring the rejection logic in the walker.
+    /// **V3.6.0.X audit-of-D2 closure (2026-05-23,
+    /// CONVERGENT-HIGH-1)**: the cache walker uses `entry().or_insert`
+    /// (first-write-wins) to mirror `FormatTable::register_at`'s
+    /// `IdCollision` rejection semantic at the cache layer.  Pre-
+    /// closure the walker used `.insert(id, string)` (LWW-by-iteration)
+    /// which CONTRADICTED the V3.6.0.1 plan body § D2 line 133 locked
+    /// decision: "cache walker treats the second registration as a
+    /// no-op".  Post-closure: cache and Workbook agree on the
+    /// first-iterated string for any concurrent same-id-different-
+    /// string scenario.  See `format_table_cache` field docstring
+    /// for cross-peer convergence properties.
+    ///
+    /// **V3.6.0.X audit-of-D2 closure (CONVERGENT-MED-2)**: only
+    /// `FormatId::Custom` effects reach this variant -- `Builtin`
+    /// payloads are dropped at `collect_cache_effects` (the cache
+    /// holds "ONLY Custom format registrations" per the field
+    /// docstring; Workbook-side replay still accepts in-range
+    /// Builtin Op::RegisterFormat as Phase 4.6 D-1 semantic, deferred
+    /// to V3.7+).
     ///
     /// `string` uses `Arc<str>` for cheap clones across the walker
     /// (collect_cache_effects -> apply_cache_effect).
@@ -763,18 +771,33 @@ pub struct CollabSession {
     /// field without re-iterating Workbook.formats.
     ///
     /// **Note on Builtin formats**: this cache holds ONLY Custom format
-    /// registrations (the only ones that come from `Op::RegisterFormat`).
-    /// Builtin formats (ids 0..=163 per Phase 5.2 D-1) are defined at
-    /// `FormatTable` construction and never appear in an op log.  The
-    /// napi `workbook_snapshot.formats` field iterates `Workbook.formats`
-    /// (authoritative; merges Builtin + Custom) -- NOT this cache --
-    /// so the IDE sees BOTH variants.
+    /// registrations.  Excel's reserved Builtin namespace (ids
+    /// 0..=163 -- ~20 actually preloaded at `FormatTable::default()`,
+    /// remainder reserved per Excel spec) is static at FormatTable
+    /// construction.  **V3.6.0.X audit-of-D2 closure
+    /// (CONVERGENT-MED-2)**: `collect_cache_effects` actively drops
+    /// `Op::RegisterFormat { id: FormatIdWire::Builtin, ... }`
+    /// payloads at the cache walker, matching this docstring's
+    /// "ONLY Custom" claim.  The Workbook side
+    /// (`FormatTable::register_at`) still accepts in-range Builtin
+    /// registrations (Phase 4.6 D-1 backward-compat for .xlsx
+    /// import); that's deferred to V3.7+.  The napi
+    /// `workbook_snapshot.formats` field iterates
+    /// `Workbook.formats` (authoritative; merges Builtin + Custom)
+    /// NOT this cache -- so the IDE sees BOTH variants.
     ///
-    /// **Cross-peer divergence**: see `CacheEffect::RegisterFormat`
-    /// docstring.  Conservative LWW-by-iteration semantic in the cache;
-    /// Workbook side rejects same-id-different-string.  Cache and
-    /// Workbook diverge on cross-peer collision; tolerated because
-    /// napi reads from Workbook.
+    /// **Cross-peer convergence**: post-V3.6.0.X CONVERGENT-HIGH-1
+    /// closure, the cache walker is first-write-wins (mirrors
+    /// `FormatTable::register_at`'s `IdCollision` rejection at the
+    /// cache layer).  For any concurrent same-id-different-string
+    /// `Op::RegisterFormat`, both cache and Workbook converge to
+    /// the first-iterated string in Loro's deterministic causal
+    /// order.  Cross-peer iter is deterministic (Codex Lane A
+    /// INFO-2 of V3.6.0.X audit confirmed via `OpLog::iter` over
+    /// Loro list view), so cache content is peer-identical
+    /// post-merge.  Pre-closure the cache used LWW-by-iteration
+    /// and could diverge from Workbook on cross-peer collisions;
+    /// post-closure cache and Workbook agree.
     ///
     /// **Rule 4 per-field walk**: `HashMap<FormatId, Arc<str>>` is
     /// `Send + Sync` -- `HashMap<K, V>: Send + Sync` iff `K: Send + Sync
@@ -1092,12 +1115,34 @@ impl CollabSession {
             // cache update.  Op::RegisterFormat carries `id: FormatIdWire`
             // (the wire shape) + `string: String`; convert id to storage
             // shape via `to_storage()` (lossless) and wrap the string in
-            // Arc<str> for cheap clones across the walker.  See
-            // CacheEffect::RegisterFormat docstring for the LWW caveat.
-            Op::RegisterFormat { id, string } => out.push(CacheEffect::RegisterFormat {
-                id: id.to_storage(),
-                string: Arc::<str>::from(string.as_str()),
-            }),
+            // Arc<str> for cheap clones across the walker.
+            //
+            // **V3.6.0.X audit-of-D2 closure (2026-05-23,
+            // CONVERGENT-MED-2 -- Codex Lane A MED-2 + Opus Lane B
+            // MED-1)**: drop `FormatIdWire::Builtin` variants at the
+            // cache walker.  Rationale: the cache docstring claims
+            // "ONLY Custom format registrations" but the wire path
+            // did not enforce -- a peer could emit
+            // `Op::RegisterFormat { id: Builtin(99), string: "evil" }`
+            // and pollute the cache + Workbook namespace (Codex
+            // probe 2 confirmed both ended up storing the bogus
+            // string).  V3.6.0.X closes the CACHE side; the
+            // Workbook-side `FormatTable::register_at` still
+            // accepts in-range Builtin registrations (Phase 4.6 D-1
+            // semantic) and is deferred to V3.7+ as Phase 4.6 D-1
+            // follow-up.
+            Op::RegisterFormat { id, string } => {
+                let fid = id.to_storage();
+                if matches!(fid, FormatId::Builtin(_)) {
+                    // V3.6.0.X audit-of-D2 closure: drop Builtin
+                    // RegisterFormat at the cache walker.
+                    return;
+                }
+                out.push(CacheEffect::RegisterFormat {
+                    id: fid,
+                    string: Arc::<str>::from(string.as_str()),
+                });
+            },
             _ => {}
         }
     }
@@ -1203,13 +1248,24 @@ impl CollabSession {
                 snapshot.retain(|(sheet, _, _), _| *sheet != id);
             }
             // V3.6.0.3 D2 (2026-05-24): session-wide format-table cache
-            // mirror.  LWW-by-iteration (later RegisterFormat with same
-            // id overwrites earlier).  Cross-peer divergence with
-            // Workbook side is documented + tolerated (see field docstring
-            // + CacheEffect::RegisterFormat docstring).  No tombstone
-            // check needed (RegisterFormat is sheet-independent).
+            // mirror.  V3.6.0.X audit-of-D2 closure (2026-05-23,
+            // CONVERGENT-HIGH-1 -- Opus Lane B HIGH-1 + Codex Lane A
+            // MED-3): use `entry().or_insert(...)` (first-write-wins)
+            // to mirror `FormatTable::register_at`'s `IdCollision`
+            // rejection semantic.  Pre-closure the walker used
+            // `.insert(id, string)` (LWW-by-iteration), which
+            // contradicted the V3.6.0.1 plan body § D2 line 133
+            // locked decision that explicitly REJECTED LWW-overwrite
+            // and specified "cache walker treats the second
+            // registration as a no-op".  Post-closure: the FIRST
+            // `Op::RegisterFormat` for a given id wins; subsequent
+            // same-id ops are no-ops at the cache walker level (no
+            // Arc<str> clone, no overwrite).  Mirrors the Workbook
+            // side's rejection semantic at the cache layer.  No
+            // tombstone check needed (RegisterFormat is sheet-
+            // independent).
             CacheEffect::RegisterFormat { id, string } => {
-                format_cache.insert(id, string);
+                format_cache.entry(id).or_insert(string);
             }
         }
     }
@@ -1337,21 +1393,34 @@ impl CollabSession {
     /// **Phase 5.7 V3.6.0.3 D2 (2026-05-24)** -- iterate the session-
     /// wide format-table cache (`(FormatId, format_string)` pairs).
     ///
-    /// Contains entries from `Op::RegisterFormat` applications in the
-    /// op log.  Does NOT include Builtin formats (those are static at
-    /// `FormatTable` construction; not emitted via any Op).  Iteration
-    /// order is HashMap iteration (NOT deterministic across runs);
-    /// callers wanting stable order should sort.
+    /// Contains Custom-variant entries from `Op::RegisterFormat`
+    /// applications in the op log.  Does NOT include Builtin formats:
+    /// (a) the preloaded Excel-canonical Builtin numfmts (ids 0..=163
+    /// range; ~20 actually preloaded at `FormatTable::default()`,
+    /// remainder reserved per Excel spec) are static at FormatTable
+    /// construction and never emitted via an Op; (b) **V3.6.0.X
+    /// audit-of-D2 closure (CONVERGENT-MED-2)**: `collect_cache_effects`
+    /// actively drops `Op::RegisterFormat { id: FormatIdWire::Builtin,
+    /// ... }` payloads at the cache walker (the Workbook-side
+    /// `register_at` still accepts them as Phase 4.6 D-1 backward-
+    /// compat; deferred V3.7+).  Iteration order is HashMap iteration
+    /// (NOT deterministic across runs); callers wanting stable order
+    /// should sort by `FormatId` (`Ord` derived; Builtin variants
+    /// first per enum order, then Custom by `(peer, counter)`).
     ///
-    /// **Authoritative source caveat**: the engine `Workbook::FormatTable`
-    /// is the authoritative source (it merges Builtin + Custom + applies
-    /// the same-id-different-string rejection).  The session cache is
-    /// a downstream mirror; under cross-peer concurrent
-    /// `Op::RegisterFormat { id: SAME, string: DIFFERENT }`, the cache
-    /// + Workbook may diverge.  napi `workbook_snapshot.formats` reads
-    /// from the Workbook (NOT this cache) to avoid surfacing divergence.
-    /// This accessor is for V3.7+ incremental-snapshot-delta use cases
-    /// + cross-peer-convergence regression tests.
+    /// **Authoritative source caveat**: the engine
+    /// `Workbook::FormatTable` is the authoritative source (it merges
+    /// Builtin + Custom + applies the same-id-different-string
+    /// rejection at `register_at`).  The session cache is a
+    /// downstream mirror.  Post-V3.6.0.X CONVERGENT-HIGH-1 closure
+    /// the cache walker is first-write-wins (mirrors `register_at`'s
+    /// `IdCollision` rejection at the cache layer), so cache and
+    /// Workbook agree on the first-iterated string for any
+    /// concurrent same-id-different-string scenario.  napi
+    /// `workbook_snapshot.formats` reads from the Workbook (NOT this
+    /// cache) so end-users see the authoritative shape regardless;
+    /// the cache exists for V3.7+ incremental-snapshot-delta use
+    /// cases + cross-peer-convergence regression tests.
     pub fn format_table_cache_iter(&self) -> impl Iterator<Item = (&FormatId, &Arc<str>)> {
         self.format_table_cache.iter()
     }
@@ -4004,6 +4073,223 @@ mod tests {
                 string
             );
         }
+    }
+
+    #[test]
+    fn v3_6_0_x_audit_of_d2_cache_first_write_wins_on_same_id_diff_string() {
+        // **V3.6.0.X audit-of-D2 CONVERGENT-HIGH-1 regression**
+        // (2026-05-23): closes Opus Lane B HIGH-1 + Codex Lane A
+        // MED-3.  Pre-closure the cache walker used
+        // `format_cache.insert(id, string)` (LWW-by-iteration --
+        // last iterated overwrote earlier).  Post-closure the
+        // walker uses `entry(id).or_insert(string)` (first-write-
+        // wins -- mirrors `FormatTable::register_at`'s
+        // `IdCollision` rejection at the cache layer).  This pins
+        // the locked V3.6.0.1 plan body § D2 line 133 decision
+        // that explicitly REJECTED LWW-overwrite.
+        let peer = PeerId::new(7);
+        let mut s = CollabSession::new(peer).unwrap();
+        // Append two RegisterFormat ops with the SAME id but
+        // DIFFERENT strings.  Pre-closure: cache ends up holding
+        // the SECOND string ("second").  Post-closure: cache
+        // holds the FIRST string ("first").
+        s.append_op(register_custom_format(peer, 0, "first")).unwrap();
+        s.append_op(register_custom_format(peer, 0, "second")).unwrap();
+        let entries: Vec<(FormatId, String)> = s
+            .format_table_cache_iter()
+            .map(|(id, st)| (*id, st.as_ref().to_string()))
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one cache entry per FormatId (first-write-wins)"
+        );
+        let (id, surviving_string) = &entries[0];
+        assert_eq!(*id, FormatId::Custom(peer, 0));
+        assert_eq!(
+            surviving_string, "first",
+            "post-V3.6.0.X closure: FIRST RegisterFormat wins; \
+             SECOND same-id RegisterFormat is a no-op at the cache walker"
+        );
+    }
+
+    #[test]
+    fn v3_6_0_x_audit_of_d2_cross_peer_concurrent_same_id_diff_string_converges() {
+        // **V3.6.0.X audit-of-D2 regression (Opus H.2)**:
+        // cross-peer concurrent `Op::RegisterFormat` with same id
+        // + different string.  Verifies (1) cache converges across
+        // peers (Loro's deterministic causal iter), (2) cache
+        // holds exactly one entry per id (first-write-wins), and
+        // (3) the surviving string is one of the two registered
+        // values.  Codex Lane A Probe 3 demonstrated the
+        // convergence property under the pre-closure LWW
+        // semantic; this test pins the post-closure first-write-
+        // wins variant.
+        let peer_a = PeerId::new(0xa);
+        let peer_b = PeerId::new(0xb);
+        let same_id_owner = PeerId::new(0x42);
+        let mut a = CollabSession::new(peer_a).unwrap();
+        let mut b = CollabSession::new(peer_b).unwrap();
+        // Both peers register the SAME FormatId with DIFFERENT
+        // strings before any merge.
+        a.append_op(register_custom_format(same_id_owner, 1, "A_FMT")).unwrap();
+        b.append_op(register_custom_format(same_id_owner, 1, "B_FMT")).unwrap();
+        let a_bytes = a.export_bytes().unwrap();
+        let b_bytes = b.export_bytes().unwrap();
+        a.merge_bytes(&b_bytes).unwrap();
+        b.merge_bytes(&a_bytes).unwrap();
+        let a_cache: Vec<(FormatId, String)> = a
+            .format_table_cache_iter()
+            .map(|(id, s)| (*id, s.to_string()))
+            .collect();
+        let b_cache: Vec<(FormatId, String)> = b
+            .format_table_cache_iter()
+            .map(|(id, s)| (*id, s.to_string()))
+            .collect();
+        assert_eq!(
+            a_cache, b_cache,
+            "post-merge caches must converge across peers"
+        );
+        assert_eq!(
+            a_cache.len(),
+            1,
+            "exactly one cache entry per id (first-write-wins; second iterated is no-op)"
+        );
+        let surviving_string = &a_cache[0].1;
+        assert!(
+            surviving_string == "A_FMT" || surviving_string == "B_FMT",
+            "surviving string must be one of the two registered values, got: {:?}",
+            surviving_string
+        );
+    }
+
+    #[test]
+    fn v3_6_0_x_audit_of_d2_builtin_register_format_dropped_at_cache_walker() {
+        // **V3.6.0.X audit-of-D2 CONVERGENT-MED-2 regression**
+        // (2026-05-23): closes Opus Lane B MED-1 + Codex Lane A
+        // MED-2.  Pre-closure the cache walker accepted any
+        // `Op::RegisterFormat` payload via `to_storage()`,
+        // including `FormatIdWire::Builtin { id }` (Codex Probe 2
+        // confirmed: `Builtin(99) -> "evil-builtin"` landed in
+        // both cache and Workbook).  Post-closure
+        // `collect_cache_effects` drops Builtin variants at the
+        // cache walker per the docstring "cache holds ONLY
+        // Custom format registrations".  Workbook-side replay
+        // acceptance is deferred to V3.7+ (Phase 4.6 D-1
+        // semantic, outside V3.6.0.3 D2 scope).
+        let peer = PeerId::new(7);
+        let mut s = CollabSession::new(peer).unwrap();
+        s.append_op(Op::RegisterFormat {
+            id: ql_oplog::wire::FormatIdWire::Builtin { id: 99 },
+            string: "evil-builtin".to_string(),
+        }).unwrap();
+        // Cache walker dropped the Builtin variant; cache is
+        // empty.
+        let has_builtin = s
+            .format_table_cache_iter()
+            .any(|(id, _)| matches!(id, FormatId::Builtin(_)));
+        assert!(
+            !has_builtin,
+            "post-V3.6.0.X closure: Builtin Op::RegisterFormat dropped at cache walker"
+        );
+        // Same applies to in-range Builtins (e.g., 0) that
+        // shouldn't override the preloaded "General" format.
+        s.append_op(Op::RegisterFormat {
+            id: ql_oplog::wire::FormatIdWire::Builtin { id: 0 },
+            string: "evil-zero".to_string(),
+        }).unwrap();
+        let still_no_builtin = s
+            .format_table_cache_iter()
+            .any(|(id, _)| matches!(id, FormatId::Builtin(_)));
+        assert!(
+            !still_no_builtin,
+            "post-V3.6.0.X closure: Builtin(0) Op::RegisterFormat also dropped"
+        );
+    }
+
+    #[test]
+    fn v3_6_0_x_audit_of_d2_merge_bytes_rebuilds_format_table_cache() {
+        // **V3.6.0.X audit-of-D2 regression (Opus H.5)**: the
+        // `merge_bytes` path correctly repopulates the
+        // `format_table_cache` via `rebuild_snapshot_cache`
+        // (merge_bytes -> log.merge_bytes -> session
+        // rebuild_snapshot_cache).  Pre-closure no test exercised
+        // this specific path for RegisterFormat ops; only the
+        // direct rebuild_snapshot_cache call was tested.
+        let peer_a = PeerId::new(0xa);
+        let peer_b = PeerId::new(0xb);
+        let mut a = CollabSession::new(peer_a).unwrap();
+        let mut b = CollabSession::new(peer_b).unwrap();
+        // Peer A registers two formats locally.
+        a.append_op(register_custom_format(peer_a, 0, "0.00%")).unwrap();
+        a.append_op(register_custom_format(peer_a, 1, "yyyy-mm-dd")).unwrap();
+        // Pre-condition: peer A has both; peer B has neither.
+        assert_eq!(a.format_table_cache_iter().count(), 2);
+        assert_eq!(b.format_table_cache_iter().count(), 0);
+        // Peer B merges peer A's bytes.
+        let a_bytes = a.export_bytes().unwrap();
+        b.merge_bytes(&a_bytes).unwrap();
+        // Post-condition: peer B's cache repopulated from the
+        // merged op log via rebuild_snapshot_cache.
+        let b_entries: Vec<(FormatId, String)> = b
+            .format_table_cache_iter()
+            .map(|(id, s)| (*id, s.to_string()))
+            .collect();
+        assert_eq!(
+            b_entries.len(),
+            2,
+            "peer B's cache repopulated from merge_bytes via rebuild_snapshot_cache"
+        );
+        for (counter, expected_string) in [(0u32, "0.00%"), (1, "yyyy-mm-dd")] {
+            let expected_id = FormatId::Custom(peer_a, counter);
+            assert!(
+                b_entries.iter().any(|(id, s)| *id == expected_id && s == expected_string),
+                "post-merge cache contains ({:?}, {:?})",
+                expected_id,
+                expected_string
+            );
+        }
+    }
+
+    #[test]
+    fn v3_6_0_x_audit_of_d2_batch_commit_inner_register_format_recurses_to_cache() {
+        // **V3.6.0.X audit-of-D2 regression (Opus H.7)**:
+        // `Op::BatchCommit { ops }` recurses through
+        // `collect_cache_effects` and propagates inner-op cache
+        // effects.  Pre-closure no test exercised BatchCommit
+        // with an inner RegisterFormat; the recursion at
+        // session.rs:1076 was inferred safe but not pinned.
+        let peer = PeerId::new(7);
+        let mut s = CollabSession::new(peer).unwrap();
+        let inner_register = Op::RegisterFormat {
+            id: ql_oplog::wire::FormatIdWire::Custom { peer, counter: 0 },
+            string: "0.00%".to_string(),
+        };
+        let inner_put = Op::PutValue {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            value: ql_oplog::CellWireValue::Number(1.0),
+        };
+        s.append_op(Op::BatchCommit {
+            ops: vec![inner_register, inner_put],
+        }).unwrap();
+        // Both inner ops should propagate to their respective
+        // caches via BatchCommit recursion.
+        assert_eq!(
+            s.format_table_cache_iter().count(),
+            1,
+            "BatchCommit inner Op::RegisterFormat updates format_table_cache via recursion"
+        );
+        let cache_entry = s
+            .format_table_cache_iter()
+            .find(|(id, _)| matches!(id, FormatId::Custom(p, 0) if *p == peer));
+        assert!(
+            cache_entry.is_some(),
+            "BatchCommit inner RegisterFormat lands in cache as Custom(peer, 0)"
+        );
+        let (_, cache_string) = cache_entry.unwrap();
+        assert_eq!(cache_string.as_ref(), "0.00%");
     }
 
     #[test]
