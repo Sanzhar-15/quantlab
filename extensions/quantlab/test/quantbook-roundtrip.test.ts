@@ -45,6 +45,7 @@ import {
 } from '../src/quantbook/loader';
 import {
 	appendPutValueValidated,
+	buildPresenceSnapshotJson,
 	clearPresence,
 	createSession,
 	exportCellSnapshot,
@@ -3686,5 +3687,211 @@ suite('quantbook V3.4.0.5 -- presence napi round-trips', function () {
 		// Caller-opt-in sweep restores clean slate.
 		sweepPresence(sessB);
 		assert.strictEqual(peerPresence(sessB, 3511n), null);
+	});
+});
+
+// ============================================================================
+// Phase 5.7 V3.4.0.5b -- IDE cell-grid presence integration
+// ============================================================================
+
+suite('quantbook V3.4.0.5b -- buildPresenceSnapshotJson (host-side helper)', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('empty session: peers list is empty, selfPeerId is 16-hex lowercase', () => {
+		const session = createSession(0x1234n);
+		const snap = buildPresenceSnapshotJson(session, 0);
+		assert.deepStrictEqual(snap.peers, []);
+		assert.strictEqual(snap.selfPeerId, '0000000000001234',
+			'16-hex padded lowercase; matches engine presence::peer_key convention');
+	});
+
+	test('self-only presence: peers list is empty (skip-self filter)', () => {
+		const session = createSession(3601n);
+		updatePresence(session, { sheet: 0, row: 1, col: 2, selectionEndRow: 1, selectionEndCol: 2, typing: false });
+		const snap = buildPresenceSnapshotJson(session, 0);
+		assert.strictEqual(snap.peers.length, 0,
+			'self presence is filtered (own cursor doesn\'t need decoration)');
+	});
+
+	test('cross-peer presence after mergeBytes: remote peers surface in snapshot', () => {
+		const sessA = createSession(3602n);
+		const sessB = createSession(3603n);
+		updatePresence(sessB, { sheet: 0, row: 5, col: 7, selectionEndRow: 5, selectionEndCol: 7, typing: true });
+		sessA.mergeBytes(sessB.exportBytes());
+
+		const snap = buildPresenceSnapshotJson(sessA, 0);
+		assert.strictEqual(snap.peers.length, 1, 'one remote peer (B); self (A) filtered');
+		assert.strictEqual(snap.peers[0].peerId, '0000000000000e13',
+			'remote peer id is 16-hex of 3603 (0xE13)');
+		assert.strictEqual(snap.peers[0].row, 5);
+		assert.strictEqual(snap.peers[0].col, 7);
+		assert.strictEqual(snap.peers[0].typing, true);
+	});
+});
+
+suite('quantbook V3.4.0.5b -- buildHtml emits cell-grid-presence data block', function () {
+	test('nonced mode with explicit presence: data block embeds the snapshot', () => {
+		const html = buildHtml(
+			{ snapshot_format_version: 1, sheet: 0, entries: [] },
+			{
+				nonce: 'v3405b',
+				presence: { selfPeerId: 'aaaa000000000001', peers: [{ peerId: 'aaaa000000000002', sheet: 0, row: 3, col: 4, selectionEndRow: 3, selectionEndCol: 4, typing: false }] },
+			},
+		);
+		assert.ok(html.includes('<script id="cell-grid-presence" type="application/json">'),
+			'presence data block tag present');
+		assert.ok(html.includes('aaaa000000000002'),
+			'remote peer id embedded in data block');
+		assert.ok(html.includes('"row":3'), 'remote peer row embedded');
+	});
+
+	test('nonced mode without presence: data block embeds empty fallback', () => {
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries: [] }, { nonce: 'v3405b' });
+		assert.ok(html.includes('<script id="cell-grid-presence" type="application/json">'),
+			'data block always emitted in nonced mode (avoids null-check in webview)');
+		assert.ok(html.includes('"peers":[]'),
+			'empty fallback has empty peers array');
+	});
+
+	test('V3.2.a read-only mode (no nonce) does NOT emit presence data block', () => {
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries: [] });
+		assert.ok(!html.includes('cell-grid-presence'),
+			'presence data block gated on nonced mode (no script -> no consumer)');
+	});
+
+	test('CSS includes .cell-peer-presence outline rule', () => {
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries: [] }, { nonce: 'v3405b' });
+		assert.ok(html.includes('.cell-peer-presence'),
+			'presence-decoration CSS rule present');
+		assert.ok(html.includes('outline:'),
+			'uses outline (not border) so layout doesn\'t shift on peer arrival/departure');
+	});
+
+	test('presence data block defense-in-depth escapes embedded </script', () => {
+		const html = buildHtml(
+			{ snapshot_format_version: 1, sheet: 0, entries: [] },
+			{
+				nonce: 'v3405b',
+				// Defensive: caller passes hostile data in the snapshot;
+				// JSON.stringify escapes most things, but the
+				// belt-and-suspenders regex defangs </script too.
+				presence: { selfPeerId: '0000000000000001', peers: [{ peerId: '</script><script>alert(1)</script>', sheet: 0, row: 0, col: 0, selectionEndRow: 0, selectionEndCol: 0, typing: false }] },
+			},
+		);
+		// Pin: NO raw </script>alert pattern slips through.
+		assert.ok(!html.match(/<script id="cell-grid-presence"[^>]*>[^<]*<\/script>alert/),
+			'no premature script-tag termination via hostile peerId');
+	});
+});
+
+suite('quantbook V3.4.0.5b -- webview script body wires presence init + edit-mode broadcast', function () {
+	test('script body parses cell-grid-presence data block on init', () => {
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries: [] }, { nonce: 'v3405b' });
+		assert.ok(html.includes('getElementById(\'cell-grid-presence\')'),
+			'webview reads presence data block by id');
+		assert.ok(html.includes('PRESENCE.peers'), 'iterates the peers array');
+		assert.ok(html.includes('cell-peer-presence'), 'adds the decoration class');
+	});
+
+	test('script body filters presence by SHEET (single-sheet panel)', () => {
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries: [] }, { nonce: 'v3405b' });
+		assert.ok(html.includes('p.sheet !== SHEET'),
+			'sheet filter present (decoration only fires for this panel\'s sheet)');
+	});
+
+	test('beginEdit posts presenceUpdate with typing=true', () => {
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries: [] }, { nonce: 'v3405b' });
+		// beginEdit's presence envelope must come AFTER input creation
+		// + activeInput assignment, BEFORE the keydown listener (so a
+		// fast-typing user's first keystroke sees typing=true).
+		assert.ok(html.includes('type: \'presenceUpdate\''),
+			'presenceUpdate envelope type present in script');
+		assert.ok(html.includes('typing: true'),
+			'beginEdit broadcasts typing=true');
+	});
+
+	test('endEdit posts presenceUpdate with typing=false on commit OR cancel', () => {
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries: [] }, { nonce: 'v3405b' });
+		assert.ok(html.includes('typing: false'),
+			'endEdit broadcasts typing=false');
+	});
+});
+
+suite('quantbook V3.4.0.5b -- dispatchIncomingMessage presenceUpdate arm', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	function makeDeps(session: CollabSessionInstance, sheet: number) {
+		const errorReplies: ErrorReplyMessage[] = [];
+		let commitCount = 0;
+		const deps = {
+			session,
+			sheet,
+			onCommit: () => { commitCount += 1; },
+			onError: (reply: ErrorReplyMessage) => { errorReplies.push(reply); },
+		};
+		return { deps, errorReplies, getCommitCount: () => commitCount };
+	}
+
+	const validState = { sheet: 0, row: 3, col: 4, selectionEndRow: 3, selectionEndCol: 4, typing: false };
+
+	test('presenceUpdate envelope: success -> session updated, NO onCommit', () => {
+		const session = createSession(3611n);
+		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
+
+		dispatchIncomingMessage({ type: 'presenceUpdate', state: validState }, deps);
+
+		assert.strictEqual(getCommitCount(), 0,
+			'presenceUpdate does NOT trigger onCommit (re-render thrash avoidance)');
+		assert.strictEqual(errorReplies.length, 0);
+		// Engine state confirmation: own presence stored.
+		const stored = peerPresence(session, session.peerId());
+		assert.ok(stored !== null);
+		assert.strictEqual(stored?.row, 3);
+		assert.strictEqual(stored?.col, 4);
+	});
+
+	test('presenceUpdate with missing state field -> bad_argument errorReply', () => {
+		const session = createSession(3612n);
+		const { deps, errorReplies } = makeDeps(session, 0);
+
+		dispatchIncomingMessage({ type: 'presenceUpdate' }, deps);
+
+		assert.strictEqual(errorReplies.length, 1);
+		assert.strictEqual(errorReplies[0].code, 'bad_argument');
+		assert.match(errorReplies[0].message, /\[presenceUpdate\]/);
+	});
+
+	test('presenceUpdate with malformed state (wrong field type) -> bad_argument', () => {
+		const session = createSession(3613n);
+		const { deps, errorReplies } = makeDeps(session, 0);
+
+		// row is a string, not a number.
+		dispatchIncomingMessage({
+			type: 'presenceUpdate',
+			state: { ...validState, row: 'not-a-number' },
+		}, deps);
+
+		assert.strictEqual(errorReplies.length, 1);
+		assert.strictEqual(errorReplies[0].code, 'bad_argument');
+	});
+
+	test('presenceUpdate with missing typing field -> bad_argument (all 6 fields required)', () => {
+		const session = createSession(3614n);
+		const { deps, errorReplies } = makeDeps(session, 0);
+
+		// Note: `typing` field intentionally omitted.
+		dispatchIncomingMessage({
+			type: 'presenceUpdate',
+			state: { sheet: 0, row: 0, col: 0, selectionEndRow: 0, selectionEndCol: 0 },
+		}, deps);
+
+		assert.strictEqual(errorReplies.length, 1);
+		assert.strictEqual(errorReplies[0].code, 'bad_argument');
 	});
 });

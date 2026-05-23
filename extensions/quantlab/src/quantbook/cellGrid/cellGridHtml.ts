@@ -38,6 +38,20 @@ import type { QuantbookCellSnapshot, QuantbookCellValue } from '../types';
  */
 export interface CellGridHtmlOptions {
 	readonly nonce?: string;
+	/**
+	 * **Phase 5.7 V3.4.0.5b (2026-05-23)**: optional presence snapshot
+	 * embedded as a `cell-grid-presence` JSON data block parallel to
+	 * V3.3.0.4's `cell-grid-data`.  The webview script reads the block
+	 * on init + decorates each peer's `<td>` cell with `.cell-peer-
+	 * presence` outline.
+	 *
+	 * Only emitted when `nonce` is also set (the data block is only
+	 * useful when the webview script is also present; V3.2.a read-only
+	 * mode has no script + no decoration).  Type is `unknown` here to
+	 * avoid circular imports with `session.ts`; callers pass the
+	 * `PresencePanelSnapshot` value built by `buildPresenceSnapshotJson`.
+	 */
+	readonly presence?: unknown;
 }
 
 /**
@@ -114,6 +128,19 @@ export function buildHtml(
 	const snapshotDataBlock = nonce !== undefined
 		? `<script id="cell-grid-data" type="application/json">${snapshotJsonSafe}</script>`
 		: '';
+	// V3.4.0.5b: presence data block parallel to cell-grid-data.  Same
+	// non-executable `<script type="application/json">` shape +
+	// </script-prefix belt-and-suspenders escape.  Only emitted in
+	// nonced mode (V3.2.a read-only has no script to consume it).  If
+	// caller omitted `options.presence`, embed an empty snapshot so the
+	// webview script's data-block lookup never returns null (avoids a
+	// branch in the inline script).
+	const presenceValue = options.presence ?? { selfPeerId: '0000000000000000', peers: [] };
+	const presenceJsonRaw = JSON.stringify(presenceValue);
+	const presenceJsonSafe = presenceJsonRaw.replace(/<\/(script)/gi, '<\\/$1');
+	const presenceDataBlock = nonce !== undefined
+		? `<script id="cell-grid-presence" type="application/json">${presenceJsonSafe}</script>`
+		: '';
 	const body = tableBody;
 	// CSS is built from an array of per-rule strings. Each array entry
 	// is a TS string on a tab-indented source line (hygiene-compliant),
@@ -144,6 +171,14 @@ export function buildHtml(
 		'.cell-grid-viewport thead th { position: sticky; top: 0; z-index: 1; }',
 		'.cell-grid-spacer-top, .cell-grid-spacer-bottom { padding: 0; border: none; }',
 		'.cell-grid-spacer-top td, .cell-grid-spacer-bottom td { padding: 0; border: none; }',
+		// V3.4.0.5b presence decoration: `outline` (not `border`)
+		// so the existing td border + padding stays stable -- layout
+		// doesn't shift when a peer arrives/leaves.  outline-offset
+		// pulls the outline inward to the cell edge for visual clarity
+		// (default outline is outside the box).  All peers get the
+		// same color in V3.4.0.5b; per-peer color hashing is
+		// V3.4.0.5c polish.
+		'.cell-peer-presence { outline: 2px solid var(--vscode-editorCursor-foreground); outline-offset: -2px; }',
 	].join('\n');
 	// CSP: narrow by default; widen `script-src` only when a nonce was
 	// passed in (V3.2.b.2). The CSP string never substitutes user-
@@ -170,6 +205,7 @@ export function buildHtml(
 <div class="meta">${escapeHtml(meta)}</div>
 ${body}
 ${snapshotDataBlock}
+${presenceDataBlock}
 ${scriptTag}
 </body>
 </html>`;
@@ -332,6 +368,20 @@ function buildClientScript(sheetForClient: number): string {
 		'    cell.appendChild(kindSpan);',
 		'    cell.classList.remove(\'cell-edit-error\');',
 		'    cell.removeAttribute(\'title\');',
+		'    // V3.4.0.5b: edit-mode exit -> typing=false (cursor stays on',
+		'    // the cell, just not actively editing).  Sends regardless of',
+		'    // commit/cancel because both transition out of typing state.',
+		'    vscode.postMessage({',
+		'      type: \'presenceUpdate\',',
+		'      state: {',
+		'        sheet: SHEET,',
+		'        row: Number(cell.getAttribute(\'data-row\')),',
+		'        col: Number(cell.getAttribute(\'data-col\')),',
+		'        selectionEndRow: Number(cell.getAttribute(\'data-row\')),',
+		'        selectionEndCol: Number(cell.getAttribute(\'data-col\')),',
+		'        typing: false',
+		'      }',
+		'    });',
 		'  }',
 		'',
 		'  function beginEdit(cell) {',
@@ -348,6 +398,22 @@ function buildClientScript(sheetForClient: number): string {
 		'    cell.removeAttribute(\'title\');',
 		'    activeInput = input;',
 		'    activeCell = cell;',
+		'    // V3.4.0.5b: broadcast cursor + typing=true on edit-mode',
+		'    // entry.  Remote peers see this peer\'s cell highlighted',
+		'    // on their next pollRemote tick.  Best-effort; failure',
+		'    // (e.g., transport_closed mid-edit) surfaces via the',
+		'    // dispatcher\'s standard errorReply path.',
+		'    vscode.postMessage({',
+		'      type: \'presenceUpdate\',',
+		'      state: {',
+		'        sheet: SHEET,',
+		'        row: Number(cell.getAttribute(\'data-row\')),',
+		'        col: Number(cell.getAttribute(\'data-col\')),',
+		'        selectionEndRow: Number(cell.getAttribute(\'data-row\')),',
+		'        selectionEndCol: Number(cell.getAttribute(\'data-col\')),',
+		'        typing: true',
+		'      }',
+		'    });',
 		'    input.addEventListener(\'keydown\', function (ev) {',
 		'      if (ev.key === \'Enter\') {',
 		'        ev.preventDefault();',
@@ -444,6 +510,47 @@ function buildClientScript(sheetForClient: number): string {
 		'      return;',
 		'    }',
 		'  });',
+		'',
+		'  // V3.4.0.5b (2026-05-23) -- presence decoration.',
+		'  //',
+		'  // Read the inline `<script id="cell-grid-presence" type="application/json">`',
+		'  // data block on script init.  For each remote peer (self is',
+		'  // already filtered out at the host side), find the matching',
+		'  // `.cell-value[data-row][data-col]` td IN THIS PANEL\'S SHEET',
+		'  // + add the `.cell-peer-presence` class.',
+		'  //',
+		'  // Best-effort: silent if no matching td (peer is on a row',
+		'  // outside the virtualized window per V3.3.0.4, or on a',
+		'  // different sheet, or in a cell that hasn\'t been PutValue\'d',
+		'  // yet -- a cursor in a literally-blank cell has no `<td>`',
+		'  // surface to decorate).',
+		'  //',
+		'  // Decoration is re-applied on every render() (host rebuilds',
+		'  // webview.html in full on pollRemote merged ticks per V3.2.c).',
+		'  // So no incremental delta logic needed at V3.4.0.5b -- the',
+		'  // V3.3.0.3 cache + V3.2.c pollRemote integration already',
+		'  // produces fresh presence on every relevant tick.',
+		'  var presenceBlock = document.getElementById(\'cell-grid-presence\');',
+		'  if (presenceBlock !== null) {',
+		'    try {',
+		'      var PRESENCE = JSON.parse(presenceBlock.textContent || \'{"peers":[]}\');',
+		'      var peers = PRESENCE.peers || [];',
+		'      for (var pi = 0; pi < peers.length; pi += 1) {',
+		'        var p = peers[pi];',
+		'        if (p.sheet !== SHEET) { continue; }',
+		'        var sel = \'.cell-value[data-row="\' + Number(p.row) + \'"][data-col="\' + Number(p.col) + \'"]\';',
+		'        var pCell = document.querySelector(sel);',
+		'        if (pCell !== null) {',
+		'          pCell.classList.add(\'cell-peer-presence\');',
+		'          // Pin peer-id on the cell for V3.4.0.5c per-peer',
+		'          // color hashing + tooltips ("PeerId X is editing").',
+		'          pCell.setAttribute(\'data-peer\', String(p.peerId));',
+		'        }',
+		'      }',
+		'    } catch (e) {',
+		'      console.warn(\'[cellGrid] failed to parse presence data block:\', e);',
+		'    }',
+		'  }',
 		'',
 		'  // V3.3.0.4 virtualization: scroll-driven row swap.',
 		'  //',

@@ -30,7 +30,7 @@
 import * as childProcess from 'child_process';
 import * as vscode from 'vscode';
 
-import { exportCellSnapshot, parseQuantbookError } from '../session';
+import { buildPresenceSnapshotJson, exportCellSnapshot, parseQuantbookError } from '../session';
 import type { CollabSessionInstance, QuantbookNativeModule, TransportInstance } from '../types';
 import { reconnectWithBackoff } from '../multiWindowDemo';
 import { buildHtml } from './cellGridHtml';
@@ -222,6 +222,26 @@ export class CellGridPanel {
 			// postMessage racing with disposal early-returns from the
 			// onError guard added at V3.2.d Opus MEDIUM-1 closure.
 			instance._disposed = true;
+			// V3.4.0.5b (2026-05-23): clear this peer's presence on
+			// panel dispose so remote peers see this peer's cursor
+			// disappear when the window closes.  Runs BEFORE
+			// disposeAttachment so the auto-flush has a transport to
+			// flush through.
+			//
+			// **No-Fallbacks compliance**: dispose-handler cleanup is a
+			// system-boundary fire-and-forget surface (no caller to
+			// throw to; panel is being torn down regardless), but the
+			// error MUST be visible per CLAUDE.md "No Fallbacks --
+			// Errors Must Be Visible".  Log via console.warn so the
+			// extension host's debug console shows it; remote presence
+			// entry will eventually be swept by a future
+			// fromSnapshot+sweepPresence cycle (V1 known limitation
+			// per engine docstring).
+			try {
+				instance.session.clearPresence();
+			} catch (err) {
+				console.warn('[cellGrid] clearPresence on dispose failed:', err);
+			}
 			instance.disposeAttachment();
 			// Only clear the cache entry if we still own it (a fresh
 			// open for the same sheet + mode may have replaced us).
@@ -343,7 +363,21 @@ export class CellGridPanel {
 	render(): void {
 		const snapshot = exportCellSnapshot(this.session, this.sheet);
 		const nonce = buildPanelNonce();
-		this.panel.webview.html = buildHtml(snapshot, { nonce });
+		// V3.4.0.5b (2026-05-23): build presence snapshot at render time.
+		// Presence is non-critical decoration; if the engine throws,
+		// render the cell grid WITHOUT presence rather than failing the
+		// whole render.  Per CLAUDE.md No-Fallbacks rule the error MUST
+		// be visible -- console.warn the exception so the extension
+		// host's debug console catches it.  The user sees: cells render
+		// correctly, peer presence borders absent.
+		let presence;
+		try {
+			presence = buildPresenceSnapshotJson(this.session, this.sheet);
+		} catch (err) {
+			console.warn('[cellGrid] buildPresenceSnapshotJson failed; rendering without presence:', err);
+			presence = undefined;
+		}
+		this.panel.webview.html = buildHtml(snapshot, { nonce, presence });
 	}
 
 	/**

@@ -283,6 +283,107 @@ export function peersWithPresence(session: CollabSessionInstance): bigint[] {
 	return session.peersWithPresence();
 }
 
+// ============================================================================
+// Phase 5.7 V3.4.0.5b (2026-05-23) -- IDE cell-grid presence-snapshot helper
+// ============================================================================
+
+/**
+ * One peer's entry in the panel-render presence snapshot.  Carries the
+ * peer-id as a STRING (16-hex per engine `presence::peer_key` convention)
+ * because:
+ *  - The snapshot is JSON-serialized into the HTML data block; BigInt is
+ *    not JSON-native (would need `BigInt.toString()` anyway).
+ *  - DOM attribute values must be strings; this matches the
+ *    `data-peer-${peerId}` attribute encoding the webview script sets.
+ *  - 16-hex is the same encoding the engine uses internally in the
+ *    "presence" LoroMap key namespace, so cross-peer references stay
+ *    bit-identical.
+ */
+export interface PresenceSnapshotPeer {
+	peerId: string;
+	sheet: number;
+	row: number;
+	col: number;
+	selectionEndRow: number;
+	selectionEndCol: number;
+	typing: boolean;
+}
+
+/**
+ * Panel-render presence snapshot embedded by V3.4.0.5b in the
+ * `cell-grid-presence` data block.  `selfPeerId` is the panel's own
+ * session peer id (also 16-hex string); the webview script EXCLUDES
+ * self from decoration (the cursor IS the cell edit input, no extra
+ * border needed).
+ */
+export interface PresencePanelSnapshot {
+	selfPeerId: string;
+	peers: PresenceSnapshotPeer[];
+}
+
+/**
+ * **Phase 5.7 V3.4.0.5b (2026-05-23) -- build the IDE presence
+ * snapshot for the cell-grid data block.**
+ *
+ * Enumerates peers via {@link peersWithPresence}, fetches each peer's
+ * state via {@link peerPresence}, builds the JSON-ready
+ * {@link PresencePanelSnapshot}.  Filters:
+ *
+ *  - **Skip self**: self-peer's own cursor doesn't need decoration; the
+ *    cell input IS the cursor.  Removing self also avoids the cell
+ *    flashing during active edit (V3.4.0.1 D4 race-guard category).
+ *  - **Skip None / null**: peers in `peersWithPresence` but whose
+ *    `peerPresence` returns null (race window: peer cleared between the
+ *    enumeration and the per-peer fetch) are silently dropped.
+ *  - **Sheet filter**: peers whose `sheet` differs from `panelSheet`
+ *    are still included (a future multi-sheet UI may want to surface
+ *    "this peer is on sheet 3 cell A1"); decoration filtering happens
+ *    webview-side per V3.4.0.5b D2-panel-per-sheet decision.  Today's
+ *    webview script ignores peers on other sheets.
+ *
+ * O(peers-with-presence) per render.  At V3.4 scale (small-team collab,
+ * single-digit-to-low-double-digit peers), this is sub-millisecond.
+ */
+export function buildPresenceSnapshotJson(
+	session: CollabSessionInstance,
+	_panelSheet: number,
+): PresencePanelSnapshot {
+	const selfPeerId = formatPeerIdHex(session.peerId());
+	const peers: PresenceSnapshotPeer[] = [];
+	const allPeers = peersWithPresence(session);
+	for (const peerBig of allPeers) {
+		const peerHex = formatPeerIdHex(peerBig);
+		if (peerHex === selfPeerId) {
+			continue; // skip self
+		}
+		const state = peerPresence(session, peerBig);
+		if (state === null) {
+			continue; // race window: enumerated but cleared between calls
+		}
+		peers.push({
+			peerId: peerHex,
+			sheet: state.sheet,
+			row: state.row,
+			col: state.col,
+			selectionEndRow: state.selectionEndRow,
+			selectionEndCol: state.selectionEndCol,
+			typing: state.typing,
+		});
+	}
+	return { selfPeerId, peers };
+}
+
+/**
+ * **Phase 5.7 V3.4.0.5b helper** -- format a BigInt peer-id as 16-hex
+ * lowercase (matches engine `presence::peer_key` convention).  Used to
+ * build the `data-peer-${peerId}` attribute encoding on `<td>` cells
+ * + the `selfPeerId` field of {@link PresencePanelSnapshot}.
+ */
+function formatPeerIdHex(peer: bigint): string {
+	// BigInt.toString(16) drops leading zeros; pad to 16 hex chars.
+	return peer.toString(16).padStart(16, '0');
+}
+
 // =====================================================================
 // Phase 5.7 V2.1 (2026-05-22) -- Transport binding wrappers
 // =====================================================================

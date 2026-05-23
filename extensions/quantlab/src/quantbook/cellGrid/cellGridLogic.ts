@@ -198,6 +198,69 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			return;
 		}
 	}
+	// V3.4.0.5b (2026-05-23): presenceUpdate envelope.  Webview posts on
+	// every beginEdit/endEdit; payload carries the full PresenceStateJson
+	// (sheet, row, col, selectionEnd*, typing).  Route to
+	// session.updatePresence (auto-flush per policy if attached).
+	//
+	// **No onCommit on success**: presence updates don't affect the cell
+	// snapshot, so re-rendering the panel on every cursor move would
+	// thrash.  Remote peers see this peer's presence on their next
+	// pollRemote tick + V3.2.c-integrated render (cache invalidation
+	// fires render via the dispatcher's existing onCommit path for the
+	// REMOTE side's cell ops, not this side's presence write).
+	//
+	// **Defensive runtime validation** (V3.2.d HIGH-2 + V3.4.0.3
+	// pattern): trust the webview script's payload but check the shape
+	// before calling the engine.  Missing/malformed state -> bad_argument
+	// errorReply.
+	if (msg.type === 'presenceUpdate') {
+		const presenceReq = raw as { type: 'presenceUpdate'; state?: unknown };
+		const state = presenceReq.state;
+		if (
+			typeof state !== 'object'
+			|| state === null
+			|| typeof (state as { sheet?: unknown }).sheet !== 'number'
+			|| typeof (state as { row?: unknown }).row !== 'number'
+			|| typeof (state as { col?: unknown }).col !== 'number'
+			|| typeof (state as { selectionEndRow?: unknown }).selectionEndRow !== 'number'
+			|| typeof (state as { selectionEndCol?: unknown }).selectionEndCol !== 'number'
+			|| typeof (state as { typing?: unknown }).typing !== 'boolean'
+		) {
+			deps.onError({
+				type: 'errorReply',
+				sheet: deps.sheet,
+				row: 0,
+				col: 0,
+				code: 'bad_argument',
+				message: '[presenceUpdate] state must be a PresenceStateJson object with all 6 fields',
+			});
+			return;
+		}
+		try {
+			deps.session.updatePresence(state as {
+				sheet: number;
+				row: number;
+				col: number;
+				selectionEndRow: number;
+				selectionEndCol: number;
+				typing: boolean;
+			});
+			// Intentional: no onCommit().  See block comment above.
+			return;
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			deps.onError({
+				type: 'errorReply',
+				sheet: deps.sheet,
+				row: 0,
+				col: 0,
+				code: info.code,
+				message: `[presenceUpdate] ${info.message}`,
+			});
+			return;
+		}
+	}
 	if (msg.type !== 'putValue') {
 		console.warn(`[cellGrid] unknown outbound message type: ${msg.type}`);
 		return;
