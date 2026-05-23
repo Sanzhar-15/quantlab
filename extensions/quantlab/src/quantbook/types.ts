@@ -185,16 +185,28 @@ export interface WorkbookSnapshotJson {
 	/**
 	 * **V3.6.0.3 D2 (2026-05-24)**: session-wide format registry.
 	 * Populated from the rebuilt+repaired engine `Workbook.FormatTable`
-	 * (authoritative source merging Builtin ids 0..=163 with Custom
-	 * ids registered via `Op::RegisterFormat`).
+	 * (authoritative source merging Excel-canonical Builtin ids in the
+	 * 0..=163 reserved range with Custom ids registered via
+	 * `Op::RegisterFormat`).  Note that ~20 of the 0..=163 Builtin ids
+	 * are actually preloaded at engine startup; the remainder are
+	 * reserved per Excel spec but absent from the table until a
+	 * producer emits an `Op::RegisterFormat` for them.
 	 *
-	 * **Iteration order**: stable for a given workbook state but NOT
-	 * sorted by id (engine HashMap iteration).  Callers wanting sorted
-	 * order should `.sort()` client-side using a deterministic key.
+	 * **Sort order** (V3.6.0.X audit-of-D2 closure, 2026-05-23,
+	 * CONVERGENT-MED-1): sorted by `FormatId` via the engine's derived
+	 * `Ord` -- Builtin variants first (by id), then Custom variants
+	 * lexicographically by `(peer, counter)`.  Pre-closure this was
+	 * raw HashMap iteration order which varied across consecutive
+	 * `workbookSnapshot()` calls (per-instance random hasher).  Post-
+	 * closure: deterministic + stable shape across snapshots (hashable,
+	 * diffable, JSON-stringify-equal).
 	 *
-	 * **V3.6+ format-aware buildHtml rendering (D4)** will look up each
-	 * cell's `format: FormatIdJson` against this list to find the
-	 * matching format string (e.g., `"0.00%"`, `"yyyy-mm-dd"`).
+	 * **V3.6.0.5 D4 format-aware buildHtml rendering** will look up
+	 * each cell's `format: FormatIdJson` against this list to find the
+	 * matching format string (e.g., `"0.00%"`, `"yyyy-mm-dd"`).  D4
+	 * renderers should build a `Map<string, string>` indexed by
+	 * stringified `FormatIdJson` (e.g., `"builtin:0"` /
+	 * `"custom:peer_hex:counter"`) rather than indexing by position.
 	 */
 	formats: FormatDefJson[];
 }
