@@ -112,11 +112,39 @@ export interface CellSnapshotJson {
 	 *
 	 * `undefined` = no explicit format (cell renders with FormatId::GENERAL
 	 * default per the engine).  Set via `Op::SetCellFormat { id: Some(_) }`;
-	 * cleared via `Op::SetCellFormat { id: None }`.  V3.5.0.5 ships
-	 * passthrough only -- the IDE webview (buildHtml) does NOT consume
-	 * format yet; the field round-trips for V3.6+ format-aware rendering.
+	 * cleared via `Op::SetCellFormat { id: None }`.  Round-trips through
+	 * V3.6+ format-aware rendering.
 	 */
 	format?: FormatIdJson;
+	/**
+	 * **Phase 5.7 V3.6.0.5 D4 (2026-05-23)** -- engine-pre-rendered
+	 * formatted string for this cell value.
+	 *
+	 * Populated by the engine via `ql_functions::format::render(value,
+	 * parsed_format, eval_context)` where `eval_context.date_system`
+	 * comes from the workbook (see {@link WorkbookSnapshotJson.date_system})
+	 * and `eval_context.locale = EnUs` (V3.6.0.5 ships EN-US only;
+	 * locale-aware deferred to V3.6.1+).
+	 *
+	 * **`undefined` cases** (silent fallback per Phase 5.6 conservative
+	 * discipline; IDE consumer falls back to value-based default
+	 * rendering when `rendered` is absent):
+	 * - cell has no `format` (no format registered)
+	 * - cell has no `value` (formula-only cell awaiting evaluation)
+	 * - cell's `format` id is missing from `WorkbookSnapshotJson.formats`
+	 * - the registered format string fails to parse (V2 token,
+	 *   malformed grammar)
+	 * - cell value carries an unknown error sigil
+	 *
+	 * **CSP-safe consumer contract**: IDE renderers MUST `escapeHtml`
+	 * the rendered string before inserting into innerHTML (per the V3.2.a
+	 * webview discipline).
+	 *
+	 * **Per-call cost**: format::parse runs PER cell PER snapshot call
+	 * (no engine-side cache at V3.6.0.5).  V3.7+ may cache parsed
+	 * FormatString keyed by format id on CollabSession.
+	 */
+	rendered?: string;
 }
 
 /**
@@ -209,6 +237,22 @@ export interface WorkbookSnapshotJson {
 	 * `"custom:peer_hex:counter"`) rather than indexing by position.
 	 */
 	formats: FormatDefJson[];
+	/**
+	 * **Phase 5.7 V3.6.0.5 D4 (2026-05-23)**: workbook-level date system.
+	 *
+	 * Mapped from the engine's `ql_types::DateSystem`:
+	 * - `"Excel1900"`: 1900 epoch (1899-12-30 = serial 0); Windows
+	 *   Excel default; includes the phantom 1900-02-29 = serial 60.
+	 * - `"Excel1904"`: 1904 epoch (1904-01-01 = serial 0); legacy
+	 *   macOS Excel default.
+	 *
+	 * Used by the engine's `format::render` EvalContext when
+	 * pre-rendering date/time formats via {@link CellSnapshotJson.rendered}.
+	 * IDE consumers needing to render dates directly (e.g., date
+	 * pickers) should consult this field; cells with a date format
+	 * are already pre-rendered.
+	 */
+	dateSystem: 'Excel1900' | 'Excel1904';
 }
 
 /**
@@ -813,6 +857,15 @@ export interface QuantbookCellSnapshot {
 		readonly row: number;
 		readonly col: number;
 		readonly value: QuantbookCellValue;
+		/**
+		 * **Phase 5.7 V3.6.0.5 D4 (2026-05-23)**: engine-pre-rendered
+		 * formatted string (mirrors {@link CellSnapshotJson.rendered}).
+		 * `undefined` = no format-aware rendering available (see
+		 * CellSnapshotJson.rendered docstring for the fallback cases).
+		 * `buildHtml` consumers use this if present, fall back to
+		 * `formatCellValue(value)` otherwise.
+		 */
+		readonly rendered?: string;
 	}>;
 }
 

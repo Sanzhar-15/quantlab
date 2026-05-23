@@ -4396,12 +4396,12 @@ suite('quantbook V3.5.0.2 -- workbookSnapshot napi contract', function () {
 		const snap = workbookSnapshot(session);
 		// V3.5.0.2 ship shape: { sheets }.  V3.6.0.3 D2 ADDS `formats`
 		// (additive; V3.5 consumers that destructure .sheets keep
-		// working).  Future V3.7+ may add `names` etc., still
-		// additively.  Pin the V3.6.0.3 shape so a future shape-break
-		// gets caught.
+		// working).  V3.6.0.5 D4 ADDS `dateSystem` (additive).
+		// Future V3.7+ may add `names` etc., still additively.  Pin
+		// the V3.6.0.5 shape so a future shape-break gets caught.
 		const keys = Object.keys(snap).sort();
-		assert.deepStrictEqual(keys, ['formats', 'sheets'],
-			`V3.6.0.3 ship shape is {sheets, formats}; if V3.7+ adds more fields, update this test`);
+		assert.deepStrictEqual(keys, ['dateSystem', 'formats', 'sheets'],
+			`V3.6.0.5 ship shape is {sheets, formats, dateSystem}; if V3.7+ adds more fields, update this test`);
 	});
 
 	test('SheetSnapshotJson shape: id + name + cells fields', () => {
@@ -5211,14 +5211,14 @@ suite('quantbook V3.5.0.4a -- buildSheetMovePositionItems', function () {
 
 suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 	test('empty workbook -> null for any sheetId', () => {
-		const snap: WorkbookSnapshotJson = { sheets: [], formats: [] };
+		const snap: WorkbookSnapshotJson = { sheets: [], formats: [], dateSystem: 'Excel1900' };
 		assert.strictEqual(extractSheetSnapshot(snap, 0), null,
 			'no sheets -> null lookup');
 		assert.strictEqual(extractSheetSnapshot(snap, 5), null);
 	});
 
 	test('sheet found, no cells -> empty entries with version + sheet preserved', () => {
-		const snap: WorkbookSnapshotJson = { sheets: [{ id: 0, name: 'S', cells: [] }], formats: [] };
+		const snap: WorkbookSnapshotJson = { sheets: [{ id: 0, name: 'S', cells: [] }], formats: [], dateSystem: 'Excel1900' };
 		const result = extractSheetSnapshot(snap, 0);
 		assert.ok(result !== null);
 		assert.strictEqual(result!.snapshot_format_version, 1);
@@ -5233,6 +5233,7 @@ suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 				{ id: 2, name: 'C', cells: [] },
 			],
 			formats: [],
+			dateSystem: 'Excel1900',
 		};
 		// sheet 1 is missing (tombstoned).
 		assert.strictEqual(extractSheetSnapshot(snap, 1), null);
@@ -5246,6 +5247,7 @@ suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 				],
 			}],
 			formats: [],
+			dateSystem: 'Excel1900',
 		};
 		const result = extractSheetSnapshot(snap, 0);
 		assert.strictEqual(result!.entries.length, 1);
@@ -5263,6 +5265,7 @@ suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 				],
 			}],
 			formats: [],
+			dateSystem: 'Excel1900',
 		};
 		const r = extractSheetSnapshot(snap, 0)!;
 		assert.deepStrictEqual(r.entries[0].value, { kind: 'boolean', value: true });
@@ -5278,6 +5281,7 @@ suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 				],
 			}],
 			formats: [],
+			dateSystem: 'Excel1900',
 		};
 		const r = extractSheetSnapshot(snap, 0)!;
 		assert.deepStrictEqual(r.entries[0].value, { kind: 'pending' });
@@ -5293,6 +5297,7 @@ suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 				],
 			}],
 			formats: [],
+			dateSystem: 'Excel1900',
 		};
 		const r = extractSheetSnapshot(snap, 0)!;
 		assert.strictEqual(r.entries.length, 2,
@@ -5324,6 +5329,7 @@ suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 				],
 			}],
 			formats: [],
+			dateSystem: 'Excel1900',
 		};
 		assert.throws(() => extractSheetSnapshot(snap, 0),
 			/number payload missing/);
@@ -5337,6 +5343,7 @@ suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 				{ id: 2, name: 'C', cells: [{ row: 0, col: 0, value: { kind: 'number', number: 3 } }] },
 			],
 			formats: [],
+			dateSystem: 'Excel1900',
 		};
 		const r1 = extractSheetSnapshot(snap, 1)!;
 		assert.strictEqual(r1.sheet, 1);
@@ -5360,6 +5367,7 @@ suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 				],
 			}],
 			formats: [],
+			dateSystem: 'Excel1900',
 		};
 		const r = extractSheetSnapshot(snap, 0)!;
 		assert.deepStrictEqual(r.entries.map(e => [e.row, e.col]),
@@ -5533,6 +5541,7 @@ suite('quantbook V3.5.0.5 -- extractSheetSnapshot drops format (V3.5.0.5 scope)'
 				],
 			}],
 			formats: [],
+			dateSystem: 'Excel1900',
 		};
 		const result = extractSheetSnapshot(snap, 0);
 		assert.ok(result !== null);
@@ -5560,6 +5569,7 @@ suite('quantbook V3.5.0.5 -- extractSheetSnapshot drops format (V3.5.0.5 scope)'
 				],
 			}],
 			formats: [],
+			dateSystem: 'Excel1900',
 		};
 		const result = extractSheetSnapshot(snap, 0);
 		assert.strictEqual(result!.entries.length, 1,
@@ -5666,14 +5676,100 @@ suite('quantbook V3.6.0.3 -- WorkbookSnapshotJson.formats field', function () {
 			`id.kind is 'builtin' or 'custom'; got ${entry.id.kind}`);
 	});
 
-	test('WorkbookSnapshotJson top-level shape includes formats', () => {
-		// Pin the additive nature of V3.6.0.3 against the V3.5.0.2
-		// `sheets`-only shape.
+	test('WorkbookSnapshotJson top-level shape includes formats + dateSystem', () => {
+		// Pin the additive shape evolution:
+		// - V3.5.0.2 baseline: { sheets }
+		// - V3.6.0.3 D2 added: + formats
+		// - V3.6.0.5 D4 added: + dateSystem
 		const session = createSession(8304n);
 		const snap = workbookSnapshot(session);
 		const topLevelKeys = Object.keys(snap).sort();
-		assert.deepStrictEqual(topLevelKeys, ['formats', 'sheets'],
-			`V3.6.0.3 WorkbookSnapshotJson has exactly { sheets, formats }; got ${JSON.stringify(topLevelKeys)}`);
+		assert.deepStrictEqual(topLevelKeys, ['dateSystem', 'formats', 'sheets'],
+			`V3.6.0.5 WorkbookSnapshotJson has exactly { sheets, formats, dateSystem }; got ${JSON.stringify(topLevelKeys)}`);
+	});
+});
+
+// ============================================================================
+// Phase 5.7 V3.6.0.5 D4 (2026-05-23) -- format-aware buildHtml rendering
+//   (CellSnapshotJson.rendered + WorkbookSnapshotJson.dateSystem)
+// ============================================================================
+// V3.6.0.5 D4 ships engine-side format-aware pre-rendering via
+// `ql_functions::format::render(value, parsed_format, eval_context)`
+// where eval_context.date_system comes from the workbook (Phase 4.6 D-1)
+// and eval_context.locale = EnUs (V3.6.0.5 ships EN-US only).
+//
+// **mocha-test scope limitation**: the IDE napi has no
+// `appendSetCellFormat` or `appendRegisterFormat` method at V3.6.0.5
+// D4 ship (those are separate sub-steps; V3.6.0.6 D5 adds
+// `appendPutFormula` but not the format ops).  So mocha tests can only
+// pin the SHAPE: `dateSystem` field present + valid; `rendered` field
+// absent when no format ops have run; existing extractSheetSnapshot
+// tests verify `rendered` passthrough is non-intrusive.  Full format-
+// render integration tests (Op::RegisterFormat + Op::SetCellFormat +
+// Op::PutValue -> render via FormatTable + EvalContext) live engine-
+// side in ql-collab + ql-bindings-node integration tests (V3.6.0.X
+// audit-of-D4 scope adds end-to-end mocha tests once
+// appendSetCellFormat napi lands).
+
+suite('quantbook V3.6.0.5 D4 -- format-aware rendering shape', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('dateSystem defaults to "Excel1900"', () => {
+		// V3.6.0.5 D4: fresh workbook defaults to Excel1900 epoch
+		// (ql_types::DateSystem::Excel1900 default).
+		const session = createSession(8501n);
+		const snap = workbookSnapshot(session);
+		assert.strictEqual(snap.dateSystem, 'Excel1900',
+			`fresh workbook defaults to Excel1900; got ${snap.dateSystem}`);
+	});
+
+	test('dateSystem is one of "Excel1900" | "Excel1904"', () => {
+		// V3.6.0.5 D4: pin the discriminated-union shape.  Two
+		// valid values per ql_types::DateSystem enum.
+		const session = createSession(8502n);
+		const snap = workbookSnapshot(session);
+		const valid = (snap.dateSystem === 'Excel1900' || snap.dateSystem === 'Excel1904');
+		assert.ok(valid,
+			`dateSystem must be "Excel1900" or "Excel1904"; got ${JSON.stringify(snap.dateSystem)}`);
+	});
+
+	test('CellSnapshotJson.rendered absent for cells without format', () => {
+		// V3.6.0.5 D4: cells without Op::SetCellFormat have no
+		// format id, so the engine skips format::render and
+		// rendered = None -> absent JS property (napi-rs Option::None
+		// convention).  Default test cells (PutValue only) fall in
+		// this category since the IDE napi has no SetCellFormat
+		// method at V3.6.0.5 D4 ship.
+		const session = createSession(8503n);
+		addSheet(session, 'S');
+		session.appendPutValue(0, 0, 0, 42);
+		const snap = workbookSnapshot(session);
+		const cell = snap.sheets[0]?.cells.find(c => c.row === 0 && c.col === 0);
+		assert.ok(cell !== undefined, 'cell (0,0) present in snapshot');
+		assert.strictEqual(cell!.rendered, undefined,
+			`cell without format has rendered === undefined; got ${JSON.stringify(cell!.rendered)}`);
+	});
+
+	test('CellSnapshotJson shape: rendered is optional (V3.6.0.5 D4 additive extension)', () => {
+		// V3.6.0.5 D4: rendered is an OPTIONAL string field on
+		// CellSnapshotJson.  When absent, IDE buildHtml falls back to
+		// formatCellValue(value).  Pin the field presence (when set)
+		// via TypeScript -- runtime check below verifies the absence
+		// convention via Object.keys().
+		const session = createSession(8504n);
+		addSheet(session, 'S');
+		session.appendPutValue(0, 0, 0, 1.5);
+		const snap = workbookSnapshot(session);
+		const cell = snap.sheets[0]?.cells.find(c => c.row === 0 && c.col === 0);
+		assert.ok(cell !== undefined, 'cell present');
+		// Without format, rendered should NOT be in Object.keys
+		// (napi-rs Option::None -> absent property, not null).
+		const keys = Object.keys(cell!).sort();
+		assert.ok(!keys.includes('rendered'),
+			`napi-rs Option::None convention: rendered absent from Object.keys; got ${JSON.stringify(keys)}`);
 	});
 });
 

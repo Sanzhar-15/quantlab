@@ -217,7 +217,16 @@ function renderRows(
 ): string {
 	return entries
 		.map(e => {
-			const valueStr = formatCellValue(e.value);
+			// **Phase 5.7 V3.6.0.5 D4 (2026-05-23)**: use engine-
+			// pre-rendered formatted string when present; fall back to
+			// `formatCellValue(e.value)` (the V3.2.a value-default
+			// renderer) when `rendered` is undefined.  See
+			// QuantbookCellSnapshot.entries[*].rendered docstring +
+			// CellSnapshotJson.rendered docstring for the fallback cases.
+			// The escapeHtml below covers BOTH paths (engine-rendered
+			// strings + value-default strings) -- the IDE consumer never
+			// trusts either as pre-escaped HTML.
+			const valueStr = e.rendered ?? formatCellValue(e.value);
 			// V3.2.b.2: cells gain `data-row` / `data-col` attributes when
 			// editable so the client script can identify which cell was
 			// clicked. The `.cell-value` class is the hit-test target.
@@ -607,7 +616,10 @@ function buildClientScript(sheetForClient: number): string {
 		'    var html = \'\';',
 		'    for (var i = 0; i < entries.length; i += 1) {',
 		'      var e = entries[i];',
-		'      var valueStr = formatCellValueClient(e.value);',
+		'      // V3.6.0.5 D4 (2026-05-23): mirror the server renderRows',
+		'      // -- use engine-pre-rendered string when present, fall',
+		'      // back to value-default.  htmlEscape covers both paths.',
+		'      var valueStr = (typeof e.rendered === \'string\') ? e.rendered : formatCellValueClient(e.value);',
 		'      var kind = e.value.kind;',
 		'      // V3.3.0.X audit closure (LOW-1): defense-in-depth Number()',
 		'      // coercion mirrors the server renderer (cellGridHtml.ts).',

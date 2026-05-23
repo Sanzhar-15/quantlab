@@ -712,7 +712,7 @@ export function extractSheetSnapshot(
 	if (sheet === undefined) {
 		return null;
 	}
-	const entries: { row: number; col: number; value: QuantbookCellValue }[] = [];
+	const entries: { row: number; col: number; value: QuantbookCellValue; rendered?: string }[] = [];
 	for (const cell of sheet.cells) {
 		if (cell.value === undefined) {
 			// Formula-only cell.  Matches V3.4.0.2 export_snapshot's
@@ -769,7 +769,24 @@ export function extractSheetSnapshot(
 					`Engine + IDE binding may be out of sync -- rebuild together.`,
 				);
 		}
-		entries.push({ row: cell.row, col: cell.col, value: typed });
+		// **Phase 5.7 V3.6.0.5 D4 (2026-05-23)**: pass through engine-
+		// pre-rendered formatted string when present.  When the
+		// engine omits `rendered` (no format / no value / parse
+		// error / etc.), DO NOT add a `rendered: undefined` key on
+		// the entry -- existing V3.5.0.4b shape-stability tests
+		// assert exact key sets via deepStrictEqual.  buildHtml's
+		// renderRows uses `entry.rendered ?? formatCellValue(entry.value)`
+		// either way (absent property is treated the same as
+		// undefined by `??`).
+		const entry: { row: number; col: number; value: QuantbookCellValue; rendered?: string } = {
+			row: cell.row,
+			col: cell.col,
+			value: typed,
+		};
+		if (cell.rendered !== undefined) {
+			entry.rendered = cell.rendered;
+		}
+		entries.push(entry);
 	}
 	return {
 		snapshot_format_version: 1,
