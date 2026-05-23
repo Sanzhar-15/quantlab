@@ -1297,6 +1297,338 @@ If smoke surfaces issues, file findings against the V3.4.0.X audit closures (see
 
 **R-V3.4-3 RECLASSIFIED + CLOSED**: was DEFERRED at V3.4.0.5b; promoted to KNOWN-GAP at V3.4.0.X via Opus M2; **CLOSED at V3.5.0.7** via host-level `_presenceRepaintInFlight` boolean + 30s watchdog + tickPollRemote merged-branch skip.  The race surface (two-window collab: window 1 mid-edit + window 2 commit -> window 1's `webview.html` rebuild destroys mid-edit `<input>`) is now guarded at the host layer.  Dispatcher's `onLocalTyping` callback fires AFTER `updatePresence` succeeds so the host flag stays in sync with engine state.  9 mocha tests pin the dispatcher contract; live two-window smoke verification is part of V3.5.0.9 § 4.1.z5 procedure.
 
+### 4.1.z5 WorkbookSnapshot + sheet ops + format extension + partial-invalidate undo + mid-edit-render guard (Phase 5.7 V3.5, 2026-05-24)
+
+**Status:** V3.5.0.1 decision lock + V3.5.0.2 WorkbookSnapshot napi (D3) + V3.5.0.3 D4 sheet-ops suite (a renameSheet + b deleteSheet/Op::RemoveSheet + c moveSheet/Op::MoveSheet) + V3.5.0.4a IDE sheet management commands + V3.5.0.4b cell-grid render migration to workbookSnapshot + V3.5.0.5 CellState.format extension (D1) + V3.5.0.6 partial-invalidate undo (D2) + V3.5.0.7 IDE mid-edit-render guard (D5 / R-V3.4-3 KNOWN-GAP CLOSED) + V3.5.0.9 (this section's commit) all shipped.  V3.5.0.4c sheet-tabs UI scaffold REMAINS PENDING (may defer to V3.5.1+ -- multi-sheet UX adequately covered by Command Palette commands + reactive title).  V3.5.0.X parallel Codex+Opus megaudit (phase termination) pending.
+
+**Engine HEAD trail**: `48be1878db5` (0.1 lock) -> `bbd129ed629` (0.2 WorkbookSnapshot napi) -> `74aa5039e04` (0.3a renameSheet) -> `9be3672ca01` (0.3b deleteSheet + Op::RemoveSheet tombstone) -> `7ec7877a018` (0.3c moveSheet + Op::MoveSheet display-order overlay) -> `fa7541f1e8d` (V3.5 deep-audit closures) -> `1be56176fd2` (0.4a IDE-only plan) -> `75963628c54` (0.4b IDE-only plan) -> `175258f4dd0` (0.5 CellState format extension) -> `1bd21296f31` (0.6 partial-invalidate undo) -> `bf443957d3b` (0.7 plan + R-V3.4-3 closure update).  **IDE HEAD trail**: `299fed5eda9` (0.2 types + wrapper) -> `5ad934d087f` (0.3a) -> `91a6b3870bd` (0.3b) -> `e3642ef3458` (0.3c -- closes D4) -> `8fecc25c03f` (0.4a sheet management commands) -> `0d4659e62d6` (0.4b render migration + reactive title) -> `0b6a6481a14` (0.5 FormatIdJson + format passthrough) -> `650e7ea6c3e` (0.7 mid-edit-render guard).
+
+#### V3.5.0.1 -- decision lock (5 D-decisions)
+
+Per V3.4.0.X Opus § F V3.5 ENTRY READINESS analysis:
+
+| Decision | Choice | Sub-step |
+|---|---|---|
+| **D1** CellState format extension | Per-cell `format: Option<FormatId>` on existing `CellState`; defer session-wide RegisterFormat FormatTable cache + format-aware buildHtml rendering to V3.6+ | V3.5.0.5 |
+| **D2** Partial-invalidate undo | New `invalidate_cell(sheet, row, col)` + classifier-driven dispatch; full-rebuild fallback for non-cell-keyed retracts; architectural shape ships V3.5.0.6 (per-cell op-index for true O(ops-for-this-cell) deferred to V3.6+) | V3.5.0.6 |
+| **D3** WorkbookSnapshot napi shape | Flattened `WorkbookSnapshotJson { sheets: Vec<SheetSnapshotJson> }` (chosen over mirroring full `ql-storage::Workbook` across FFI -- pre-shaped for IDE renderer; matches V3.4.0.5a PresenceStateJson pattern) | V3.5.0.2 |
+| **D4** Sheet ops (rename/delete/move) | Split into 0.3a (renameSheet -- existing `Op::RenameSheet`) + 0.3b (deleteSheet + new `Op::RemoveSheet` tombstone semantic) + 0.3c (moveSheet + new `Op::MoveSheet` display-order overlay) | V3.5.0.3a/b/c |
+| **D5** Mid-edit-render guard | Host-level `_presenceRepaintInFlight: boolean` on CellGridPanel + 30s watchdog + tickPollRemote merged-branch skip + DispatchDeps.onLocalTyping callback fires AFTER updatePresence succeeds; closes R-V3.4-3 KNOWN-GAP | V3.5.0.7 |
+
+#### V3.5.0.2 -- WorkbookSnapshot napi (D3)
+
+New engine napi method `CollabSession::workbook_snapshot() -> Result<WorkbookSnapshotJson>`:
+
+```ts
+class CollabSession {
+  // V3.5.0.2 -- flattened JSON-serializable view of the full workbook.
+  // Routes through inner.rebuild_workbook(&default_registry()) for
+  // sheet metadata + uses V3.3.0.3/V3.4.0.2 incremental cache via
+  // snapshot_cells(sheet_id) for cell content.  The rebuilt Workbook
+  // is DISCARDED after sheet count + names extraction -- IDE-side
+  // Workbook consumption stays V3.6+ scope.
+  workbookSnapshot(): WorkbookSnapshotJson;
+}
+
+// V3.5.0.5 EXTENDED: per-cell format passthrough added to CellSnapshotJson.
+interface WorkbookSnapshotJson {
+  sheets: SheetSnapshotJson[];
+  // V3.6+: names: NamedRangeJson[]; formats: FormatDefJson[]
+}
+
+interface SheetSnapshotJson {
+  id: number;     // u16 SheetId widened (0..65535 fits in JS number)
+  name: string;   // display name (carries latest RenameSheet effect)
+  cells: CellSnapshotJson[];  // sorted (row, col) ascending
+}
+
+interface CellSnapshotJson {
+  row: number;
+  col: number;
+  // napi-rs Option::None -> ABSENT JS property (undefined, NOT null)
+  value?: CellValueJson;
+  formula?: string;
+  format?: FormatIdJson;  // V3.5.0.5 addition
+}
+
+interface CellValueJson {
+  kind: 'number' | 'boolean' | 'text' | 'error' | 'pending';
+  // Discriminate on `kind`; non-active payload fields are ABSENT
+  number?: number;
+  boolean?: boolean;
+  text?: string;
+  error?: string;
+}
+
+// V3.5.0.5 NEW
+interface FormatIdJson {
+  kind: 'builtin' | 'custom';
+  builtin?: number;          // u32 when kind='builtin'
+  customPeer?: bigint;       // u64 widened when kind='custom'
+  customCounter?: number;    // u32 when kind='custom'
+}
+```
+
+**Per-call cost (R-V3.5-1)**: `workbookSnapshot` is O(N) in op count (rebuild_workbook replay).  IDE callers MUST batch (do NOT call per-keystroke).  V3.5.0.4b cell-grid render() fires per onCommit (cell edit) + per pollRemote tick (~1s) -- accepted at V3.4-scale; V3.6+ may add incremental snapshot deltas.
+
+**Empty addSheet'd sheets DO appear** in `sheets[]` with `cells: []` (V3.5.0.2 enumerates via `Workbook::sheet_count()` post-rebuild, NOT via `list_sheets_from_cache`).  Differs from `listSheets()` which is cache-based and only surfaces sheets with PutValue ops.
+
+**Tombstone filter** (V3.5.0.3b carry): tombstoned sheets are SKIPPED in the returned snapshot (the IDE renderer doesn't see deleted sheets).  Filter applied AFTER display-order resolution (V3.5.0.3c carry) so a tombstoned-then-moved sheet is correctly omitted.
+
+**Rule 4 per-field walk**: `sheets: Vec<SheetSnapshotJson>` Send+Sync via Vec composition over SheetSnapshotJson (id: u32 primitive + name: String + cells: Vec<CellSnapshotJson>); CellSnapshotJson over u32 + Option<CellValueJson> + Option<String> + Option<FormatIdJson>; CellValueJson kind: String + 4 Option payloads (all Send+Sync trivially); FormatIdJson kind: String + Option<u32> + Option<BigInt(=Vec<u64>+sign)> + Option<u32>.  **0 new Rule 4 triggers; arc terminus stays at 6.**
+
+#### V3.5.0.3 D4 -- sheet operations suite (renameSheet + deleteSheet + moveSheet)
+
+SPLIT into 3 sub-sub-steps per scope discovery: only `Op::RenameSheet` exists pre-V3.5 (Phase 4.6.C / 5.3 prior art); `Op::RemoveSheet` + `Op::MoveSheet` are new and require CRDT semantic locks.
+
+**V3.5.0.3a renameSheet**:
+
+```ts
+class CollabSession {
+  renameSheet(id: number, newName: string): void;
+}
+```
+
+Thin napi wrapper appending existing `Op::RenameSheet { id, old_name, new_name }`.  Pre-rebuilds workbook to capture current sheet name as advisory `old_name` (per Phase 5.3 step 2 Codex M2; recorded for debuggability + future strict-mode replay).  **Contract divergence from `WorkbookRuntime::rename_sheet`**: napi does NOT rewrite formula text -- formula references to the old sheet name stay stale in the cache until next `workbookSnapshot` / `exportToQbook` call triggers `rebuild_workbook` -> `repair_sheet_rename_chain` (Phase 5.3 step 3).  Acceptable for V3.5.0.3a scope because IDE flow always reads through workbookSnapshot.
+
+**V3.5.0.3b deleteSheet + Op::RemoveSheet (CRDT semantic = tombstone preserving id slot)**:
+
+```ts
+class CollabSession {
+  deleteSheet(id: number): void;
+}
+```
+
+New wire variant `Op::RemoveSheet { id: SheetId }` (serde-tagged additive; no `OPLOG_SCHEMA_VERSION` bump).  CRDT semantic chosen: **tombstone preserving id slot** (rejected hard-delete because it would shift subsequent sheet ids + break post-delete `Op::PutValue { sheet: N, .. }` references; rejected `#REF!` formula substitution -- V3.6+ if user-feedback requires).  New `Workbook.removed_sheets: HashSet<SheetId>` field + `remove_sheet(id)` + `is_sheet_removed(id)` accessors.
+
+**Idempotent under concurrent delete**: HashSet semantics; re-delete is replay no-op.  **Writes to tombstoned sheet silently dropped**: cell-keyed apply_op handlers (PutValue/PutFormula/ClearFormula) extended with `if workbook.is_sheet_removed(*sheet) { return Ok(()) }` short-circuit AFTER `validate_cell`.  Concurrent {PutValue, RemoveSheet} ordering: PutValue first -> writes then tombstones (cell unreachable via snapshot); RemoveSheet first -> PutValue silently dropped.  Deterministic Loro causal-merge order converges peers.
+
+**Already-tombstoned NOT bad_argument**: CRDT idempotency contract -- second delete is replay no-op.
+
+**Forward-compat caveat** (V3.5 deep-audit closure): pre-V3.5.0.3b binaries reading V3.5.0.3b+ saved .qbook files with `Op::RemoveSheet` instances WILL fail deserialization with `OpLogError::Deserialize` (serde `tag = "kind"` rejects unknown variant tags; no `#[serde(other)]` catch-all on this enum).  Same forward-compat property as every historical Op variant addition -- if forward-compat for older readers becomes a product concern, ship a schema-version bump + migrator AS A SEPARATE PHASE; do NOT retrofit individual Op additions.
+
+**V3.5.0.3c moveSheet + Op::MoveSheet (CRDT semantic = display-order overlay)**:
+
+```ts
+class CollabSession {
+  // newIndex out-of-range clamps to end (CRDT idempotency).
+  moveSheet(id: number, newIndex: number): void;
+}
+```
+
+New wire variant `Op::MoveSheet { id: SheetId, new_index: u32 }`.  CRDT semantic: **display-order overlay** (mirrors V3.5.0.3b tombstone's id-stability strategy).  New `Workbook.sheet_display_order: Vec<SheetId>` field (defaults to `[0, 1, ..., sheet_count() - 1]` in append order via `try_add_sheet_with_chunk_rows` hook).  Sheet ids in `Workbook.sheets` stay STABLE; only display order mutates -- subsequent ops referencing the moved sheet by id keep landing on the correct sheet.
+
+**`workbook_snapshot` iterates display order** (V3.5.0.3c carry): replaces `0..sheet_count()` with `sheet_display_order().to_vec()`; defensive fallback enumerates missing ids at end (resilient against future engine-internal bugs that bypass `try_add_sheet_with_chunk_rows`).
+
+**Move-tombstoned-sheet silently applies**: display order remembers user's reorder intent even for deleted sheets (snapshot filter applied separately).  **Move-non-existent-sheet silently no-ops**: cross-peer causal-merge friendly (peer might see MoveSheet for an id whose AddSheet hasn't replayed locally; eventual causal order rectifies).
+
+**D4 SHEET-OPS SUITE COMPLETE** at V3.5.0.3c.  +32 cumulative mocha tests across 0.3a (+8) / 0.3b (+11) / 0.3c (+13).  Rule 4 arc terminus held at 6 throughout: HashSet<SheetId> + Vec<SheetId> primitive composition; 0 new triggers.
+
+#### V3.5.0.4 -- IDE WorkbookSnapshot consumption + sheet management UI
+
+SPLIT into 3 sub-sub-steps; 0.4a + 0.4b shipped; 0.4c (sheet-tabs UI scaffold) pending (may defer to V3.5.1+).
+
+**V3.5.0.4a sheet management commands**: 4 new vscode commands wrapping V3.5.0.3 sheet ops:
+
+| Command | UI flow | Calls |
+|---|---|---|
+| `quantlab.quantbookSheetAdd` | showInputBox (non-empty validation) | `addSheet(session, name, 1000)` |
+| `quantlab.quantbookSheetRename` | showQuickPick (over `workbookSnapshot.sheets`) + showInputBox (non-empty + different-from-current validation) | `renameSheet(session, id, newName)` |
+| `quantlab.quantbookSheetDelete` | showQuickPick + `showWarningMessage { modal: true }` confirm with destructive-warning copy | `deleteSheet(session, id)` |
+| `quantlab.quantbookSheetMove` | 2-step picker: showQuickPick source + showQuickPick target position with adjacency labels (`(first)` / `(last)` / `(between Sheet X and Sheet Y)`) | `moveSheet(session, id, newIndex)` |
+
+All 4 follow V3.4.0.4b Save As pattern: `panels[0]` arbitrary-pick from `CellGridPanel.activeLocalPanels()`; try/catch with `showErrorMessage` + output channel logging.  2 new pure helpers in `cellGridLogic.ts`: `buildSheetManagementQuickPickItems(sheets, currentSheet)` + `buildSheetMovePositionItems(sheets, sourceSheetId)`.
+
+**V3.5.0.4b cell-grid render migration**: `cellGridPanel.ts::render()` now calls `workbookSnapshot(this.session)` instead of `exportSnapshot(this.sheet)`.  New pure helper `extractSheetSnapshot(snapshot, sheetId): QuantbookCellSnapshot | null` in `cellGridLogic.ts` bridges V3.5.0.2 `WorkbookSnapshotJson` -> V3.2.a `QuantbookCellSnapshot` (preserves `buildHtml` contract).  Option (i) minimal-change scope (preserves panel-per-sheet V3.3.0.1 D2 semantic).
+
+**Key behaviors enabled**:
+- V3.5.0.4a sheet ops (rename/delete/move) reflect IMMEDIATELY in render (no pollRemote tick wait)
+- **Reactive panel title** (clears V3.3.0.X reactive-panel-title backlog): render() sets `this.panel.title` each call using `wbSnapshot.sheets.length` -- counts addSheet'd-but-empty sheets + includes the active sheet's name
+- **Sheet-not-found tombstone-race fallback**: if user runs Delete Sheet on `this.sheet` while panel is open, `extractSheetSnapshot` returns null; render() falls back to empty entries + `console.warn` (No-Fallbacks tension acknowledged in docstring -- the alternative is a permanent red error banner; empty + warn is the lesser evil)
+- **extractSheetSnapshot skips formula-only cells** (V3.4.0.X MEDIUM-1 carry: matches `export_snapshot`'s `filter_map(state.value)` behavior); throws `[bad_argument]` on unknown CellValueJson kind (binding-drift signal)
+
+**V3.5.0.4c sheet-tabs UI scaffold deferral**: V3.5.0.4a+b cover multi-sheet UX via Command Palette + reactive title; sheet-tabs strip would be polish (faster sheet switching) but NOT a correctness gap.  Defer to V3.5.1+ if user signal surfaces; otherwise folds into V3.6+ multi-tab redesign.
+
+#### V3.5.0.5 -- CellState format extension (D1)
+
+`CellState` extended with `format: Option<FormatId>` field.  Per-cell `Op::SetCellFormat` cache integration ships; **session-wide RegisterFormat FormatTable cache + format-aware buildHtml rendering DEFERRED to V3.6+** (per-cell format is the minimum surface to unblock format-aware rendering; session-wide registry is a larger design that would surface in `WorkbookSnapshotJson.formats: Vec<FormatDefJson>`).
+
+**Per-field LWW semantics** (extends V3.4.0.2):
+- `Op::PutValue` writes `state.value`, preserves `formula` + `format`
+- `Op::PutFormula` writes `state.formula`, preserves `value` + `format`
+- `Op::ClearFormula` clears `state.formula`, preserves `value` + `format`
+- **`Op::SetCellFormat { id: Some(_) }` writes `state.format`**, preserves `value` + `formula` (V3.5.0.5 new)
+- **`Op::SetCellFormat { id: None }` clears `state.format`**, preserves `value` + `formula` (W5-80 "clear overlay" semantic)
+
+A cell can carry ANY combination of (value, formula, format).
+
+**Ghost-entry-avoidance extended** (V3.4.0.X MEDIUM-1 carry): the all-fields-None check now includes format -- `(value && formula && format).is_none()` triggers cache key removal.  Without this extension, a `SetCellFormat { id: None }` on a never-written cell would leave a phantom cache entry that surfaces in `list_sheets_from_cache`.
+
+**Engine implementation**: new `CacheEffect::SetCellFormat { key, format: Option<FormatId> }` variant.  `collect_cache_effects` emits the new variant on `Op::SetCellFormat` (converts wire `FormatIdWire` -> storage `FormatId` via lossless `to_storage()`); BatchCommit recursion carries.  `apply_cache_effect` for SetCellFormat: `Some(_)` -> `entry().or_default().format = Some(id)`; `None` -> `get_mut + skip-if-absent` (mirrors ClearFormula's ghost-entry-avoidance).
+
+**napi surface**: new `#[napi(object)] FormatIdJson` struct (tagged-union mirror: kind String + optional builtin u32 + optional custom_peer BigInt + optional custom_counter u32); `impl From<FormatId> for FormatIdJson` handles both variants losslessly (PeerId.0 widened to BigInt via `BigInt::from`).  `CellSnapshotJson` extended with `format: Option<FormatIdJson>` field.  `workbook_snapshot` threads `state.format.map(FormatIdJson::from)` through.
+
+**IDE side V3.5.0.5 scope is PASSTHROUGH ONLY**: `extractSheetSnapshot` deliberately DROPS format (V3.2.a `QuantbookCellSnapshot` has no format field; `buildHtml` not format-aware until V3.6+).  The field round-trips through `workbookSnapshot` for V3.6+ format-aware rendering.
+
+**Rule 4 per-field walk on extended CellState**: `format: Option<FormatId>` where `FormatId = Builtin(u32) | Custom(PeerId, u32)`; `PeerId(pub u64)` -- all primitives + Copy + Send + Sync trivially.  Composition: `FormatId: Send + Sync + Copy` (enum of all-Copy variants).  `Option<FormatId>`: Send + Sync.  `CellState` with format field: composition stays Send+Sync.  **No new Rule 4 trigger**; arc terminus stays at 6.  FormatIdJson napi struct also positive walk.
+
+#### V3.5.0.6 -- partial-invalidate undo (D2)
+
+New `invalidate_cell(&mut self, sheet, row, col) -> Result<(), CollabSessionError>` pub(crate) method on CollabSession.  Drops the cell entry, walks the op log applying ONLY effects targeting `(sheet, row, col)` via existing `collect_cache_effects` + `apply_cache_effect` helpers (BatchCommit recursion + ghost-entry-avoidance carry; V3.5.0.5 SetCellFormat variant integrated).
+
+New `affected_cells_for_partial_invalidate(op) -> Option<Vec<(u16,u32,u32)>>` classifier:
+- Returns `Some(deduped+sorted cells)` for cell-keyed ops (PutValue / PutFormula / ClearFormula / SetCellFormat) OR BatchCommit of only-cell-keyed inner ops
+- Returns `None` for non-cell-keyed (AddSheet / RenameSheet / RemoveSheet / MoveSheet / RegisterFormat / table ops / mixed BatchCommit) -- conservative fallback signal
+
+**undo/redo dispatch refactored**: captures most-recent visible op BEFORE retract (undo) / AFTER append (redo); if log size changed by exactly 1 AND captured op is cell-keyed, calls `invalidate_cell` per affected cell; otherwise falls back to `rebuild_snapshot_cache` (preserves V3.3.0.X HIGH-1 closure guarantee).  Loro `UndoManager` retracts the most-recent local op + visible log shrinks by exactly 1 (pinned by existing `undo_retracts_visible_op_from_op_log_len`); when no remote op landed after the local op, the most-recent visible op IS the to-be-retracted op.  Shrinkage-by-exactly-1 check defensively falls back to full rebuild in the mixed-remote-ops case.
+
+**Cost story (V3.5.0.6 ship)**: `invalidate_cell` walks the full log (O(N)) but writes ONE HashMap entry vs full rebuild's O(N) walk + O(cells) writes.  **Real performance win** (avoiding the full walk) needs a per-cell op-index that V3.5.0.6 does NOT add -- V3.6+ scope.  V3.5.0.6 ships the **architectural shape**:
+1. Cleaner semantics: undo touches specific cells, not the whole cache
+2. Foundation for V3.6+ per-cell op-index + incremental snapshot deltas
+3. Cells unaffected by the undo retain their existing CellState entries (byte-identical preserved -- pinned by mocha)
+
+**Side-by-side equality pin** (correctness invariant): for every supported op shape, partial-invalidate post-undo cache EQUALS the forced-full-rebuild post-undo cache.  Mocha covers PutValue / PutFormula / ClearFormula / SetCellFormat / BatchCommit cell-keyed / AddSheet fallback / redo dispatch / multi-cell BatchCommit.
+
+#### V3.5.0.7 -- IDE mid-edit-render guard (D5 / R-V3.4-3 KNOWN-GAP CLOSED)
+
+Closes R-V3.4-3 (DEFERRED at V3.4.0.5b -> KNOWN-GAP at V3.4.0.X via Opus M2 -> CLOSED at V3.5.0.7).  The race: a host-driven `webview.html = ...` rebuild during the user's mid-edit `<input>` lifetime destroys the in-progress input element.  Reproducible in two-window collab smoke: window 1 mid-edit + window 2 commit -> window 1's pollRemote-merged tick fires render() -> webview.html reassign destroys the `<input>`.
+
+**Engine-side**: no changes -- closure is fully IDE-side.
+
+**IDE-side `cellGridPanel.ts` changes**:
+- New `_presenceRepaintInFlight: boolean` field (init false; reset to false on dispose via `setPresenceTyping(false)`)
+- New `PRESENCE_TYPING_WATCHDOG_MS = 30_000` constant (tunable; lower bound = longest legitimate cell edit; consider 60s if formula entry surfaces in user feedback)
+- New private `presenceTypingWatchdog: ReturnType<typeof setTimeout>` handle
+- New public `setPresenceTyping(typing: boolean)` method -- atomic flag set + watchdog arm/cancel.  **Stuck-true mitigation**: `setTimeout` auto-clears flag after 30s + logs via attachment's output channel (covers panel-hung / window-closed-mid-edit / webview-crash edge cases)
+- `tickPollRemote` `'merged'` branch checks `_presenceRepaintInFlight` BEFORE `this.render()`; when true, logs `SKIPPING render (presenceRepaintInFlight; local user mid-edit). Will retry on next tick.` + returns.  Deferred render fires on next 1s pollRemote tick once typing:false arrives; merged op stays in engine cache so no data loss
+- `handleIncoming` wires `onLocalTyping -> setPresenceTyping` with `_disposed` short-circuit
+- `onDidDispose` calls `setPresenceTyping(false)` to cancel any pending watchdog
+
+**IDE-side `cellGridLogic.ts` changes**:
+- `DispatchDeps` gains optional `onLocalTyping?(typing: boolean): void` callback (optional for backward compat with V3.4.0.X + V3.5.0.5 tests)
+- `presenceUpdate` dispatcher arm fires `deps.onLocalTyping?(s.typing)` **AFTER** `session.updatePresence` succeeds.  Shape-validation + numeric-validation failures + engine throws DON'T fire -- host flag stays in sync with engine state
+
+**Why "after updatePresence succeeds"**: if updatePresence throws (engine-level failure), we DON'T toggle the host flag -- the engine never received the state; the webview would see the stale prior presence; the host should match.  Only the LOCAL peer's presenceUpdate (typing field) maps to the host flag -- remote peers' typing state is observed via the per-cell `data-peer` decoration in the webview (V3.4.0.5b), which does NOT block this panel's merged-tick render.
+
+#### Drift hazards (V3.6+ maintainers)
+
+- **CellState shape evolution beyond V3.5.0.5**: future Op variants that carry per-cell state (e.g., per-cell validation rule, per-cell comment) MUST: (1) add a new field to `CellState` with Rule 4 per-field walk in the docstring; (2) extend the `CacheEffect` enum with the corresponding new variant; (3) extend `collect_cache_effects` to recurse on the new Op; (4) extend `apply_cache_effect` to handle the new variant; (5) **EXTEND the all-fields-None ghost-entry-avoidance check** in `ClearFormula` + `SetCellFormat { id: None }` branches (currently `value.is_none() && formula.is_none() && format.is_none()`); (6) extend `affected_cells_for_partial_invalidate` to recognize the new cell-keyed variant.
+- **Adding new Op cell-keyed variants** REQUIRES the same 6-step extension above; missing any step causes partial-invalidate to fall back to full-rebuild silently (correctness preserved but performance degrades) OR ghost cache entries (functional bug).
+- **WorkbookSnapshotJson shape additions** (V3.6+ may add `names: NamedRangeJson[]` + `formats: FormatDefJson[]`): keep ADDITIVE (no field removal / rename); V3.5 IDE consumers that destructure `.sheets` only continue working through the addition.  Rule 4 per-field walk REQUIRED on each new struct.
+- **Per-cell op-index for true O(ops-for-this-cell) invalidate_cell** (V3.6+ deferral): maintaining a `HashMap<(sheet, row, col), Vec<usize>>` mapping cell coord -> op-log indices that touch it.  Updated incrementally in `append_op` per emitted CacheEffect.  Rebuilt during `from_snapshot` + `merge_bytes`.  invalidate_cell looks up the index instead of walking the full log -> O(ops-for-this-cell).  Memory cost: ~24 bytes per indexed op-cell pair; manageable at typical session sizes.
+- **Loro UndoManager `on_pop` callback wiring** (V3.6+ deferral): would surface the retracted op shape directly via the UndoManager API, eliminating the V3.5.0.6 peek-most-recent-visible-op + shrink-by-1 heuristic.  Cleaner + handles the mixed-remote-ops case correctly without conservative fallback.
+- **Mid-edit-render guard watchdog tuning**: `PRESENCE_TYPING_WATCHDOG_MS = 30_000` is tunable.  If formula entry (multi-second edits with intermittent typing) surfaces stuck-true reports in production, increase to 60s OR add typing-stroke-based refresh (any typing keystroke resets the watchdog).  Currently the watchdog fires 30s after the initial `typing: true`, NOT 30s of inactivity.
+- **DispatchDeps.onLocalTyping is optional**: V3.4.0.X + V3.5.0.5 mocha tests don't pass it.  Future tests that DO want to exercise the guard MUST pass `onLocalTyping`; tests that DON'T care can omit.
+
+#### V3.5 risk register (post-implementation reality)
+
+- **R-V3.5-1 WorkbookSnapshot O(N) per-call cost** -- DOCUMENTED.  `workbookSnapshot` routes through `rebuild_workbook` (O(N) replay); fires per onCommit + per pollRemote tick (~1s).  V3.4-scale accepted; V3.6+ may add incremental snapshot deltas if profiling justifies.  IDE callers MUST batch (do NOT call per-keystroke).
+- **R-V3.5-2 Partial-invalidate per-cell-op-index deferral** -- DOCUMENTED.  V3.5.0.6 ships the architectural shape but `invalidate_cell` still walks the full log (O(N)).  V3.6+ scope: per-cell op-index would make invalidate_cell O(ops-for-this-cell).
+- **R-V3.5-3 Sheet-tabs UX gap (V3.5.0.4c not shipped)** -- ACCEPTED.  Multi-sheet UX adequately covered by V3.5.0.4a Command Palette commands (Add/Rename/Delete/Move Sheet) + V3.5.0.4b reactive panel title; sheet-tabs strip would be polish (faster switching) but NOT a correctness gap.  V3.5.1+ if user signal surfaces; otherwise folds into V3.6+ multi-tab redesign.
+- **R-V3.5-4 Format-aware rendering deferral** -- DOCUMENTED.  V3.5.0.5 ships per-cell format passthrough but `buildHtml` does NOT render format-aware cells (no number format / date / currency interpretation).  V3.6+ scope.
+- **R-V3.5-5 Session-wide format registry deferral** -- DOCUMENTED.  `Op::RegisterFormat` is NOT integrated with the V3.4.0.2 cache (would need a separate session-wide FormatTable cache + new `WorkbookSnapshotJson.formats: Vec<FormatDefJson>` field).  V3.6+ scope when format-UI write-path (`appendSetCellFormat` napi + commands) lands.
+- **R-V3.5-6 Cross-restart PeerId reuse (R-V3.3-5 carryforward)** -- CLOSED at V3.4.0.4b via fresh-UUID-per-session (D5 deviation; documented in § 4.1.z4).
+- **R-V3.5-7 Mid-edit-render guard watchdog correctness** -- DOCUMENTED.  30s `PRESENCE_TYPING_WATCHDOG_MS` is the V3.5.0.7 ship default.  Stuck-true conditions (panel-hung / window-closed-mid-edit / webview-crash) auto-clear after 30s with logged warning.  Tunable if user feedback surfaces.
+
+#### Out of scope for V3.5
+
+- **Sheet-tabs UI scaffold** (V3.5.0.4c -- may defer to V3.5.1+; folds into V3.6+ multi-tab redesign if not shipped standalone)
+- **Format-aware buildHtml rendering** (V3.6+; number / date / currency / etc. format interpretation)
+- **Session-wide RegisterFormat FormatTable cache** (V3.6+; would surface in `WorkbookSnapshotJson.formats: Vec<FormatDefJson>`)
+- **Format-UI write-path** (V3.6+; napi `appendSetCellFormat` + commands like `quantbookSetCellFormat`)
+- **Per-cell op-index for O(ops-for-this-cell) invalidate_cell** (V3.6+; requires `HashMap<(sheet, row, col), Vec<usize>>` maintained in append_op + rebuilt on from_snapshot/merge_bytes)
+- **Loro UndoManager `on_pop` callback wiring** (V3.6+; would surface retracted-op shape directly; cleaner than V3.5.0.6 peek-most-recent heuristic)
+- **#REF! formula substitution for cross-sheet refs to deleted sheets** (V3.6+; extends repair_sheet_rename_chain)
+- **Op::RestoreSheet un-delete** (V3.6+ if user-facing flow justified; cell storage preserved internally but no surface)
+- **Reclamation pass for orphaned sheet storage** (V3.6+; compact tombstoned-sheet storage once op log purged of references)
+- **Per-peer display-order overlay** (V3.6+ if peer-specific reorder preferences become concern; today display order is shared canonical)
+- **Display-order undo** (V3.5.0.6 partial-invalidate doesn't handle Op::MoveSheet -- non-cell-keyed; falls back to full rebuild which correctly inverts display order; specific testing TBD)
+- **vscode-test command-flow integration tests** (V3.5.1+; today's mocha covers pure helpers + napi contract; command-level wiring needs vscode-host)
+
+#### Live smoke procedure (V3.5.0.9 user-action gap closure)
+
+Mocha pins the V3.5 surface at 346/346 IDE tests + 106/106 ql-collab.  Extends V3.4.0.7 § 4.1.z4 steps 7-11 with V3.5-specific verification:
+
+```sh
+# Prerequisites: same as V3.4.0.7 § 4.1.z4 steps 1-2 (build engine
+# cdylib; open IDE in Extension Development Host).
+
+# 12. Sheet management commands smoke (V3.5.0.4a).
+#     In the Cell Grid panel:
+#     - Cmd-Shift-P -> "Quantbook: Add Sheet..." -> enter "Q4Returns"
+#       -> Enter.  Toast: 'Sheet "Q4Returns" added.'
+#     - Cmd-Shift-P -> "Quantbook: Rename Sheet..." -> select an
+#       existing sheet -> enter a different name -> Enter.  Toast +
+#       (V3.5.0.4b reactive title) panel title updates within ms.
+#     - Cmd-Shift-P -> "Quantbook: Move Sheet..." -> 2-step picker:
+#       select source sheet, then select target position with adjacency
+#       labels.  Snapshot reordering reflects in title's sheet-count
+#       sequence.
+#     - Cmd-Shift-P -> "Quantbook: Delete Sheet..." -> select a
+#       sheet to delete -> showWarningMessage modal "Delete sheet N
+#       (Name)?  This cannot be undone..." -> click "Delete".  Sheet
+#       count in title decrements; if the deleted sheet was the active
+#       panel's sheet, panel shows empty cells + console.warn
+#       (sheet-not-found tombstone-race fallback per V3.5.0.4b).
+
+# 13. Cell-grid render migration smoke (V3.5.0.4b reactive title).
+#     - Quantbook: Add Sheet... (3 times) -> "S1", "S2", "S3"
+#     - Verify panel title now reads "Cell Grid (Sheet 0 of 4)" (the
+#       initial sheet + 3 newly added; reactive count includes empty
+#       sheets unlike pre-V3.5.0.4b listSheets-based count).
+#     - Click in a cell + type "100" -> Enter.  Title stays "Sheet N
+#       of M" -- the count is reactive on each render() but cells
+#       within a sheet don't change the count.
+#     - Quantbook: Rename Sheet... -> rename Sheet 0 to "Active".
+#       Panel title updates within ms: 'Cell Grid (Sheet 0 "Active" of 4)'.
+
+# 14. Mid-edit-render guard smoke (V3.5.0.7 / R-V3.4-3 CLOSED).
+#     The two-window collab race verification:
+#     - File -> New Window (or duplicate the EDH).
+#     - In window 1: "Quantbook: Open Cell Grid (Collab)" -> panel opens.
+#     - In window 2: "Quantbook: Open Cell Grid (Collab)" -> panel opens.
+#     - Both windows connect via the relay (V3.2.c).
+#     - In window 1: click cell A1 -> begin editing (input appears).
+#       Output channel shows: presenceUpdate typing:true broadcast.
+#     - In window 2 (while window 1's input is OPEN):
+#       click cell B1 -> type "999" -> Enter (commit).
+#     - In window 1: within ~1s the pollRemote tick fires -- the
+#       output channel should now log:
+#         [collab] pollRemote merged 1 remote blob(s); SKIPPING render
+#         (presenceRepaintInFlight; local user mid-edit). Will retry
+#         on next tick.
+#     - Verify window 1's <input> element is STILL OPEN (not destroyed
+#       by the merged-tick render -- the V3.5.0.7 closure).
+#     - In window 1: type a value + Enter.  presenceUpdate typing:false
+#       broadcasts; flag clears.  Next pollRemote tick (~1s) -- the
+#       deferred render fires and cell B1 now shows "999" (window 2's
+#       commit propagated correctly; no data loss).
+#     - **Watchdog smoke** (optional): in window 1, click cell A1 ->
+#       begin editing.  WAIT 30+ seconds without committing or
+#       canceling (simulate hung typing).  Output channel logs:
+#         [collab] presenceRepaintInFlight watchdog fired after 30000ms;
+#         auto-cleared (typing:false never arrived; merged-tick
+#         renders will resume).
+#       Subsequent merged ticks render normally.
+
+# 15. Format passthrough smoke (V3.5.0.5 -- devtools inspection).
+#     V3.5 has no IDE write-path for SetCellFormat (V3.6+ scope), but
+#     the WorkbookSnapshot's per-cell format field round-trips.  Verify
+#     via webview devtools:
+#     - Open the webview's devtools (Cmd-Shift-P -> "Developer:
+#       Open Webview Developer Tools" -> select the cell-grid panel's
+#       webview).
+#     - In the devtools console:
+#         document.getElementById('cell-grid-data').textContent
+#       Parse the JSON.  Verify the entries[] structure has
+#       row + col + value but NO format key (V3.5.0.4b
+#       extractSheetSnapshot deliberately drops format; V3.2.a shape
+#       preserved for buildHtml).  V3.6+ format-aware rendering will
+#       extend this.
+```
+
+If smoke surfaces issues, file findings against the V3.5.0.X audit (parallel Codex+Opus megaudit) which is the next planned audit cycle.
+
 ---
 
 **D-1 (✅ SHIPPED 2026-05-20 — all 8 steps + 7 per-step audits + 1 megaudit):** `FormatId` is now `enum { Builtin(u32), Custom(PeerId, u32) }` in `ql-storage::format`. IDE callers MUST pattern-match the variant rather than reading `.0`. Use `FormatId::is_builtin()` / `is_custom()` / `GENERAL` accessors. For pre-D-1 bare-u32 ids (xlsx import), use `FormatId::legacy_from_u32(n)`. `Op::RegisterFormat` + `Op::SetCellFormat` carry `FormatIdWire` on the wire. `.qbook` envelope v8 carries the tagged-tuple `FormatEntryId` shape losslessly for multi-peer ids; v<8 envelopes auto-migrate. xlsx export flattens multi-peer FormatIds via dedup-by-code; non-LEGACY peer flattens reported via `XlsxExportReport.dropped_features`. xlsx import surfaces unresolved-overlay-numfmt as `report.unsupported` entries. `.qbook/oplog.bin` files wrapped in Tier D3 header (`OPLOG_MAGIC = b"QLOL"` + BE u32 `OPLOG_SCHEMA_VERSION`). `CollabSession::new` + `from_snapshot` + `OpLog::set_peer_id` assert `PeerId != 0` (release-firing). See `docs/phase5/d-1-exit-packet.md` for the full closure record.
