@@ -380,6 +380,161 @@ fn bad_argument_error(message: String) -> Error {
 /// corner of selection rectangle (equals cursor coords when no range
 /// selected); `typing` = true while peer is mid-edit (soft hint for IDE
 /// cursor styling).
+///
+/// (The `#[napi(object)]` attribute for `PresenceStateJson` lives at the
+/// struct definition further down, after the V3.5.0.2 snapshot-related
+/// structs are defined.)
+
+/// **Phase 5.7 V3.5.0.2 (2026-05-24) -- JS-facing cell value mirror.**
+///
+/// Discriminated-union shape matching the V3.4.0.2 `CellValueJson`
+/// discriminator used by `exportSnapshot`'s JSON output (kind tag +
+/// per-variant optional payload).  Pre-V3.5.0.2 the discriminator lived
+/// only in the serde_json::Value built inside `export_snapshot`; V3.5.0.2
+/// promotes it to a `#[napi(object)]` struct so the `WorkbookSnapshot`
+/// surface (nested `Vec<SheetSnapshotJson>` of `Vec<CellSnapshotJson>`)
+/// has a typed value field instead of opaque `serde_json::Value`.
+///
+/// **Optional-fields-by-kind invariant**: exactly ONE of
+/// `number / boolean / text / error` is `Some` per (kind != "pending");
+/// `pending` has all four `None`.  IDE consumers MUST read the field
+/// indicated by `kind`; cross-reading is undefined behavior at the
+/// contract level.
+///
+/// **Rule 4 per-field walk** (V3.5.0.1 D3 trigger; V3.5.0.2 ship):
+/// - `kind: String`: Send + Sync trivially.
+/// - `number: Option<f64>`, `boolean: Option<bool>`, `text: Option<String>`,
+///   `error: Option<String>`: Option<T> is Send + Sync when T is;
+///   `f64`/`bool` are Copy + 'static + Send + Sync; `String` is
+///   Send + Sync trivially.
+/// - Composition: `CellValueJson: Send + Sync`.
+/// - **0 new Rule 4 triggers**; arc terminus stays at 6.
+#[napi(object)]
+pub struct CellValueJson {
+    pub kind: String,
+    pub number: Option<f64>,
+    pub boolean: Option<bool>,
+    pub text: Option<String>,
+    pub error: Option<String>,
+}
+
+impl From<CellWireValue> for CellValueJson {
+    fn from(value: CellWireValue) -> Self {
+        match value {
+            CellWireValue::Number(n) => Self {
+                kind: "number".to_string(),
+                number: Some(n),
+                boolean: None,
+                text: None,
+                error: None,
+            },
+            CellWireValue::Boolean(b) => Self {
+                kind: "boolean".to_string(),
+                number: None,
+                boolean: Some(b),
+                text: None,
+                error: None,
+            },
+            CellWireValue::Text(s) => Self {
+                kind: "text".to_string(),
+                number: None,
+                boolean: None,
+                text: Some(s),
+                error: None,
+            },
+            CellWireValue::Error(s) => Self {
+                kind: "error".to_string(),
+                number: None,
+                boolean: None,
+                text: None,
+                error: Some(s),
+            },
+            CellWireValue::Pending => Self {
+                kind: "pending".to_string(),
+                number: None,
+                boolean: None,
+                text: None,
+                error: None,
+            },
+        }
+    }
+}
+
+/// **Phase 5.7 V3.5.0.2 (2026-05-24) -- JS-facing cell snapshot.**
+///
+/// One cell entry in a sheet's snapshot.  `value: None` means the cell has
+/// a formula but no cached literal value yet (formula-only cell, e.g.,
+/// `=A1+1` with no computed value pinned to the cache).  `formula: None`
+/// means the cell has a literal value but no formula text (pure
+/// `PutValue`).  Both `Some` means the cell carries both (formula
+/// evaluated to a numeric literal).  Both `None` cannot occur in the
+/// snapshot (V3.4.0.X MEDIUM-1 closure: such entries are removed from
+/// the cache via `apply_cache_effect`'s formula-only-key removal).
+///
+/// **Rule 4 per-field walk**: `row/col: u32` primitives; `value:
+/// Option<CellValueJson>` composition over CellValueJson (Send + Sync
+/// per its own walk above); `formula: Option<String>` (Send + Sync per
+/// Option<String> auto-trait).  Composition: `CellSnapshotJson: Send +
+/// Sync`.  **0 new Rule 4 triggers.**
+#[napi(object)]
+pub struct CellSnapshotJson {
+    pub row: u32,
+    pub col: u32,
+    pub value: Option<CellValueJson>,
+    pub formula: Option<String>,
+}
+
+/// **Phase 5.7 V3.5.0.2 (2026-05-24) -- JS-facing sheet snapshot.**
+///
+/// One sheet entry in the workbook snapshot.  `id` is the sheet's u16
+/// `SheetId` widened to u32 for napi JS-number compatibility (BigInt
+/// would be overkill for the 0..65535 range; the widening is lossless).
+/// `name` is the sheet's display name (from `Op::AddSheet { name, .. }`).
+/// `cells` is the cell-keyed cache for this sheet, sorted (row, col)
+/// ascending per `snapshot_cells` contract.
+///
+/// **V3.5.0.2 ship limitation**: empty sheets (created via `addSheet`
+/// but no `PutValue` / `PutFormula` yet) DO appear with `cells: []`
+/// because V3.5.0.2 enumerates sheets via `Workbook::sheet_count()`
+/// after `rebuild_workbook` -- this catches all `AddSheet` ops, not
+/// just those with cells.  Differs from `list_sheets_from_cache` which
+/// only returns sheets with cache entries.
+///
+/// **Rule 4 per-field walk**: `id: u32` primitive; `name: String` Send +
+/// Sync; `cells: Vec<CellSnapshotJson>` -- Vec<T> is Send + Sync when T
+/// is.  Composition: `SheetSnapshotJson: Send + Sync`.  **0 new triggers.**
+#[napi(object)]
+pub struct SheetSnapshotJson {
+    pub id: u32,
+    pub name: String,
+    pub cells: Vec<CellSnapshotJson>,
+}
+
+/// **Phase 5.7 V3.5.0.2 (2026-05-24) -- JS-facing workbook snapshot.**
+///
+/// Flattened JSON-serializable view of the full workbook for IDE-side
+/// consumption.  Per V3.5.0.1 D3: chosen over the alternative (mirror
+/// full `ql-storage::Workbook` API across FFI) because the flattened
+/// view is pre-shaped for the IDE renderer + matches the V3.4.0.5a
+/// `PresenceStateJson` pattern at a higher level.
+///
+/// **V3.5.0.2 ship**: `sheets` only.  V3.5.0.5 will add `names:
+/// Vec<NamedRangeJson>` + `formats: Vec<FormatDefJson>` once the
+/// session-wide format / name caches land.  Additive; no shape break.
+///
+/// **Performance note (R-V3.5-1)**: large workbooks (100k+ cells)
+/// produce large JSON payloads.  V3.5.0.2 ships the full snapshot per
+/// call; V3.6+ may add incremental deltas.  IDE callers MUST batch
+/// snapshot calls (do NOT call per-keystroke).
+///
+/// **Rule 4 per-field walk**: `sheets: Vec<SheetSnapshotJson>` Send +
+/// Sync via Vec composition.  **0 new Rule 4 triggers; arc terminus
+/// stays at 6.**
+#[napi(object)]
+pub struct WorkbookSnapshotJson {
+    pub sheets: Vec<SheetSnapshotJson>,
+}
+
 #[napi(object)]
 pub struct PresenceStateJson {
     pub sheet: u16,
@@ -994,6 +1149,93 @@ impl CollabSession {
         )
         .map_err(persistence_error_to_napi)?;
         Ok(())
+    }
+
+    /// **Phase 5.7 V3.5.0.2 (2026-05-24) -- export a full workbook
+    /// snapshot for IDE rendering.**
+    ///
+    /// Returns the flattened `WorkbookSnapshotJson` view of the full
+    /// workbook -- all sheets (including empty sheets created via
+    /// `addSheet` but never written to), with each sheet's cells listed
+    /// in `(row, col)` ascending order.
+    ///
+    /// **Implementation**: routes through `inner.rebuild_workbook(&
+    /// default_registry())` to enumerate sheets + their names; cell
+    /// state is read from the V3.3.0.3 / V3.4.0.2 `last_snapshot`
+    /// incremental cache via `snapshot_cells(sheet_id)` (per-sheet
+    /// O(cells-in-cache) sheet-filtered).  The rebuilt Workbook is
+    /// DISCARDED after sheet metadata extraction -- only sheet count
+    /// and per-sheet names cross the FFI boundary.  IDE-side Workbook
+    /// consumption is deferred to V3.6+ (V3.5 ships read-only snapshot
+    /// only, NOT a live-Workbook surface).
+    ///
+    /// **Per-call cost** (R-V3.5-1): rebuild_workbook is O(N) in op
+    /// count + each `snapshot_cells` walk is O(cells-in-cache).  For
+    /// V3.5.0.2 scale (workbook-open / Save-As / sheet-switch granularity
+    /// IDE calls; ~1/sec maximum) this is acceptable.  IDE callers MUST
+    /// batch (do NOT call per-keystroke).  V3.6+ may add incremental
+    /// snapshot deltas if profiling shows the full-snapshot cost is too
+    /// high.
+    ///
+    /// **JSON shape stability**: the V3.5.0.2 ship returns
+    /// `WorkbookSnapshotJson { sheets: Vec<SheetSnapshotJson> }`.
+    /// V3.5.0.5 will add `names: Vec<NamedRangeJson>` + `formats:
+    /// Vec<FormatDefJson>` once the session-wide caches land; the
+    /// addition is ADDITIVE (no field removal / rename), so V3.5.0.2
+    /// IDE consumers keep working through V3.5.0.5 if they destructure
+    /// `.sheets` only.  Per `#[napi(object)]` Rust contract: fields are
+    /// `pub`; future field additions are TS interface extensions.
+    ///
+    /// **V3.5.0.2 known limitation**: this method does NOT surface
+    /// session-wide format definitions, named ranges, tables, spill
+    /// anchors, etc.  V3.5.0.5+ extends the snapshot as those caches
+    /// land; V3.6+ may promote to a richer `CacheState { cells, formats,
+    /// names, tables }` engine-side shape (per V3.5.0.1 D1 option (b)
+    /// if profiling justifies).
+    ///
+    /// # Errors
+    ///
+    /// - `[session_oplog]` if `rebuild_workbook` fails (replay error,
+    ///   rename-repair failure, etc.) -- same propagation as `to_qbook`.
+    #[napi(js_name = "workbookSnapshot")]
+    pub fn workbook_snapshot(&self) -> Result<WorkbookSnapshotJson> {
+        let inner = self.inner.lock();
+        let registry = default_registry();
+        let (workbook, _report) = inner
+            .rebuild_workbook(&registry)
+            .map_err(collab_session_error_to_napi)?;
+        let sheet_count = workbook.sheet_count();
+        let mut sheets: Vec<SheetSnapshotJson> = Vec::with_capacity(sheet_count);
+        for sheet_id in 0u16..(sheet_count as u16) {
+            // Sheet name from the materialized workbook (carries the
+            // last RenameSheet effect; pre-rename names are NOT
+            // surfaced).
+            let name = workbook
+                .sheet(sheet_id)
+                .map(|s| s.name().to_string())
+                .unwrap_or_default();
+            // Cells from the V3.3.0.3 / V3.4.0.2 incremental cache.
+            // snapshot_cells returns sorted (row, col) ascending per
+            // its docstring contract; the V3.4.0.X HIGH-1 closure
+            // ensures BatchCommit-nested cell ops are recursed into the
+            // cache via collect_cache_effects.
+            let cells: Vec<CellSnapshotJson> = inner
+                .snapshot_cells(sheet_id)
+                .into_iter()
+                .map(|((row, col), state)| CellSnapshotJson {
+                    row,
+                    col,
+                    value: state.value.map(CellValueJson::from),
+                    formula: state.formula,
+                })
+                .collect();
+            sheets.push(SheetSnapshotJson {
+                id: sheet_id as u32,
+                name,
+                cells,
+            });
+        }
+        Ok(WorkbookSnapshotJson { sheets })
     }
 
     /// **Phase 5.7 V3.4.0.4a (2026-05-23) -- load a session from a
