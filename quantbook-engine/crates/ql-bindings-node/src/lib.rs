@@ -130,6 +130,7 @@ use ql_collab::AutoFlushPolicy as CoreAutoFlushPolicy;
 use ql_collab::CollabSession as CoreCollabSession;
 use ql_collab::CollabSessionError;
 use ql_collab::LoopbackTransport;
+use ql_collab::PresenceState as CorePresenceState;
 use ql_collab::Transport as CoreTransport;
 use ql_collab::TransportError;
 use ql_collab_ws::WebSocketError;
@@ -328,6 +329,62 @@ fn websocket_error_to_napi(e: WebSocketError) -> Error {
 /// - `auto_flush_policy_to_string` (engine drift)
 fn bad_argument_error(message: String) -> Error {
     Error::from_reason(format!("[bad_argument] {message}"))
+}
+
+/// **Phase 5.7 V3.4.0.5 (2026-05-23) -- JS-facing PresenceState.**
+///
+/// Mirrors `ql_collab::presence::PresenceState` for the napi boundary.
+/// Plain data struct (no methods) marked `#[napi(object)]` so napi-rs
+/// generates a TypeScript interface with structural typing.  Field
+/// names use camelCase to follow JS conventions (engine uses snake_case);
+/// napi-rs maps Rust `snake_case` field names to JS `camelCase` by
+/// default but the explicit conversion below makes the contract obvious
+/// to readers.
+///
+/// All fields are required (no `Option`); the engine's `PresenceState`
+/// is a `#[derive(Default)]`-able struct so callers can build minimal
+/// state by setting cursor coords + `selectionEnd*` to match (collapsed
+/// selection) + `typing: false`.
+///
+/// **Coordinate semantics** (carries from engine): `(sheet, row, col)`
+/// = cursor cell; `(selectionEndRow, selectionEndCol)` = opposite
+/// corner of selection rectangle (equals cursor coords when no range
+/// selected); `typing` = true while peer is mid-edit (soft hint for IDE
+/// cursor styling).
+#[napi(object)]
+pub struct PresenceStateJson {
+    pub sheet: u16,
+    pub row: u32,
+    pub col: u32,
+    pub selection_end_row: u32,
+    pub selection_end_col: u32,
+    pub typing: bool,
+}
+
+impl From<CorePresenceState> for PresenceStateJson {
+    fn from(s: CorePresenceState) -> Self {
+        Self {
+            sheet: s.sheet,
+            row: s.row,
+            col: s.col,
+            selection_end_row: s.selection_end_row,
+            selection_end_col: s.selection_end_col,
+            typing: s.typing,
+        }
+    }
+}
+
+impl From<PresenceStateJson> for CorePresenceState {
+    fn from(s: PresenceStateJson) -> Self {
+        Self {
+            sheet: s.sheet,
+            row: s.row,
+            col: s.col,
+            selection_end_row: s.selection_end_row,
+            selection_end_col: s.selection_end_col,
+            typing: s.typing,
+        }
+    }
 }
 
 /// JS-facing wrapper for `ql_collab::CollabSession`.
@@ -662,6 +719,140 @@ impl CollabSession {
     pub fn redo(&self) -> Result<bool> {
         let mut inner = self.inner.lock();
         inner.redo().map_err(collab_session_error_to_napi)
+    }
+
+    /// **Phase 5.7 V3.4.0.5 (2026-05-23) -- write this session's own
+    /// presence state into the shared `"presence"` LoroMap.**
+    ///
+    /// Thin wrapper over [`CoreCollabSession::update_presence`].  Uses
+    /// the session's `PeerId` as the map key.  Subsequent calls
+    /// overwrite the prior value (LWW per peer); merges with other
+    /// peers' presence writes preserve all distinct peers (LoroMap
+    /// is per-key LWW).
+    ///
+    /// **Auto-flush** (V3.5 V2 V2): fires per `setAutoFlushPolicy`.
+    /// Partial-state contract on flush failure: the presence write
+    /// is already committed locally when the auto-flush attempt
+    /// runs (same shape as `appendPutValue`).
+    ///
+    /// # Errors
+    ///
+    /// - `[bad_argument]` if `state` fields are malformed (defensive;
+    ///   the napi(object) conversion validates required fields at the
+    ///   FFI boundary).
+    /// - Engine kind-prefixed (e.g., `[transport_closed]` for
+    ///   auto-flush failure after a consumed update).
+    #[napi(js_name = "updatePresence")]
+    pub fn update_presence(&self, state: PresenceStateJson) -> Result<()> {
+        let mut inner = self.inner.lock();
+        inner
+            .update_presence(state.into())
+            .map_err(collab_session_error_to_napi)
+    }
+
+    /// **Phase 5.7 V3.4.0.5 (2026-05-23) -- read a peer's most recent
+    /// presence state.**
+    ///
+    /// Thin wrapper over [`CoreCollabSession::peer_presence`].  Returns
+    /// `Some(state)` if the peer has updated presence in this session,
+    /// `None` if the peer has never updated (or was removed via
+    /// `clearPresence` / `sweepPresence`).
+    ///
+    /// Callers enumerating ALL peers should use [`peers_with_presence`]
+    /// to get the peer-id list, then call this per peer.  V3.4.1+ may
+    /// add a bulk `allPeerPresence(): Map<BigInt, PresenceStateJson>`
+    /// accessor if profiling justifies.
+    ///
+    /// # Errors
+    ///
+    /// - Engine kind-prefixed for op-log decode failures + presence
+    ///   deserialization errors (`PresenceError::Deserialize` if a
+    ///   peer wrote a malformed PresenceState blob).
+    #[napi(js_name = "peerPresence")]
+    pub fn peer_presence(&self, peer: BigInt) -> Result<Option<PresenceStateJson>> {
+        let pid = peer_id_from_bigint(&peer)?;
+        let inner = self.inner.lock();
+        Ok(inner
+            .peer_presence(pid)
+            .map_err(collab_session_error_to_napi)?
+            .map(PresenceStateJson::from))
+    }
+
+    /// **Phase 5.7 V3.4.0.5 (2026-05-23) -- remove this session's own
+    /// presence entry from the shared map.**
+    ///
+    /// Thin wrapper over [`CoreCollabSession::clear_presence`].  Use
+    /// when the peer leaves the session (window close, disconnect).
+    /// After removal, other peers' `peerPresence(selfId)` returns
+    /// `None`.
+    ///
+    /// **Auto-flush** semantics match [`updatePresence`].
+    #[napi(js_name = "clearPresence")]
+    pub fn clear_presence(&self) -> Result<()> {
+        let mut inner = self.inner.lock();
+        inner
+            .clear_presence()
+            .map_err(collab_session_error_to_napi)
+    }
+
+    /// **Phase 5.7 V3.4.0.5 (2026-05-23) -- remove ALL presence
+    /// entries from the shared map.**
+    ///
+    /// Thin wrapper over [`CoreCollabSession::sweep_presence`].
+    /// Returns the count of peers removed.  V1 contract: sweeps every
+    /// presence entry unconditionally (no threshold).  V3.4.1+ may add
+    /// a threshold-based variant when per-peer staleness tracking
+    /// (last-update timestamp) lands engine-side.
+    ///
+    /// **Use after `fromSnapshot`** for "rejoin with clean presence"
+    /// pattern -- presence persists in the LoroDoc snapshot (V1 known
+    /// limitation; documented in engine `presence.rs`).
+    ///
+    /// **Auto-flush**: triggers ONE auto-flush after the batch removal
+    /// (not per-key -- N intermediate snapshots would be wasted
+    /// bandwidth).  Partial-state contract: all N entries are removed
+    /// locally before the auto-flush attempt.
+    ///
+    /// Returns count as `u32` for napi (engine returns `usize`; we
+    /// cast).  In practice presence-peer counts are tiny (single-digit
+    /// to low-double-digit); the cast is safe + the unit is "peers
+    /// removed".
+    #[napi(js_name = "sweepPresence")]
+    pub fn sweep_presence(&self) -> Result<u32> {
+        let mut inner = self.inner.lock();
+        let removed = inner
+            .sweep_presence()
+            .map_err(collab_session_error_to_napi)?;
+        Ok(removed as u32)
+    }
+
+    /// **Phase 5.7 V3.4.0.5 (2026-05-23) -- enumerate peers with
+    /// presence entries.**
+    ///
+    /// Thin wrapper over [`CoreCollabSession::peers_with_presence`].
+    /// Returns the peer-id list in Loro's iteration order (NOT
+    /// guaranteed sorted; callers needing determinism should sort).
+    ///
+    /// Use as the V3.4.0.5 enumeration primitive for IDE consumers
+    /// rendering "who's here" panels: first call
+    /// `peersWithPresence()`, then call `peerPresence(peerId)` per
+    /// returned id to fetch each peer's state.
+    ///
+    /// # Errors
+    ///
+    /// - Engine kind-prefixed (e.g., `[presence_peer_key_parse]` if a
+    ///   map key can't be parsed as a PeerId -- only reachable if a
+    ///   future writer uses an incompatible encoding).
+    #[napi(js_name = "peersWithPresence")]
+    pub fn peers_with_presence(&self) -> Result<Vec<BigInt>> {
+        let inner = self.inner.lock();
+        let peers = inner
+            .peers_with_presence()
+            .map_err(collab_session_error_to_napi)?;
+        Ok(peers
+            .into_iter()
+            .map(|p| BigInt::from(p.as_u64()))
+            .collect())
     }
 
     /// Export a full snapshot of this session's op log.
