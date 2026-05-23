@@ -2281,7 +2281,7 @@ suite('quantbook V3.2.a -- exportSnapshot cell-snapshot export', function () {
 // Phase 5.7 V3.2.b.5 -- cell-edit flow (HTML + dispatcher)
 // ============================================================================
 
-import { buildSheetQuickPickItems, buildVirtualRows, classifyPollTick, computeVisibleRange, dispatchIncomingMessage, parseCellRawInput, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
+import { buildSheetQuickPickItems, buildVirtualRows, classifyPollTick, computeVisibleRange, dispatchIncomingMessage, parseCellRawInput, validatePresenceNumeric, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
 
 suite('quantbook V3.2.b.2 -- cellGridHtml.ts nonce + script + editable cells', function () {
 	test('buildHtml WITHOUT nonce is unchanged from V3.2.a (no script tag; narrow CSP)', () => {
@@ -4076,3 +4076,226 @@ suite('quantbook V3.4.0.4b -- generateUuidPeerId', function () {
 			'engine round-trips the UUID-derived PeerId via session.peerId()');
 	});
 });
+
+// ============================================================================
+// Phase 5.7 V3.4.0.X closures (2026-05-24) -- cross-lane Codex+Opus megaudit
+// ============================================================================
+
+suite('quantbook V3.4.0.X -- validatePresenceNumeric (MEDIUM-3 closure)', function () {
+	function baseValid() {
+		return { sheet: 0, row: 0, col: 0, selectionEndRow: 0, selectionEndCol: 0 };
+	}
+
+	test('all-zero is valid (returns null)', () => {
+		assert.strictEqual(validatePresenceNumeric(baseValid()), null);
+	});
+
+	test('mid-range values are valid', () => {
+		assert.strictEqual(validatePresenceNumeric({
+			sheet: 7, row: 42, col: 1000, selectionEndRow: 42, selectionEndCol: 1005,
+		}), null);
+	});
+
+	test('NaN is rejected with finite check', () => {
+		const r = validatePresenceNumeric({ ...baseValid(), row: NaN });
+		assert.ok(r !== null && r.includes('finite') && r.includes('row'),
+			`expected finite-message about row, got: ${r}`);
+	});
+
+	test('Infinity is rejected with finite check', () => {
+		const r = validatePresenceNumeric({ ...baseValid(), col: Infinity });
+		assert.ok(r !== null && r.includes('finite') && r.includes('col'));
+	});
+
+	test('negative row is rejected', () => {
+		const r = validatePresenceNumeric({ ...baseValid(), row: -1 });
+		assert.ok(r !== null && r.includes('non-negative') && r.includes('row'));
+	});
+
+	test('fractional col is rejected', () => {
+		const r = validatePresenceNumeric({ ...baseValid(), col: 1.5 });
+		assert.ok(r !== null && r.includes('integer') && r.includes('col'));
+	});
+
+	test('sheet > u16::MAX is rejected', () => {
+		const r = validatePresenceNumeric({ ...baseValid(), sheet: 65536 });
+		assert.ok(r !== null && r.includes('65535') && r.includes('sheet'));
+	});
+
+	test('sheet at u16::MAX (65535) is valid (boundary)', () => {
+		assert.strictEqual(validatePresenceNumeric({ ...baseValid(), sheet: 65535 }), null);
+	});
+
+	test('row > u32::MAX is rejected', () => {
+		const r = validatePresenceNumeric({ ...baseValid(), row: 4294967296 });
+		assert.ok(r !== null && r.includes('4294967295') && r.includes('row'));
+	});
+
+	test('row at u32::MAX (4294967295) is valid (boundary)', () => {
+		assert.strictEqual(validatePresenceNumeric({ ...baseValid(), row: 4294967295 }), null);
+	});
+});
+
+suite('quantbook V3.4.0.X -- dispatchIncomingMessage presenceUpdate numeric rejection (MEDIUM-3)', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	function makeDeps(session: CollabSessionInstance, sheet: number) {
+		const errorReplies: ErrorReplyMessage[] = [];
+		let commitCount = 0;
+		const deps = {
+			session,
+			sheet,
+			onCommit: () => { commitCount += 1; },
+			onError: (reply: ErrorReplyMessage) => { errorReplies.push(reply); },
+		};
+		return { deps, errorReplies, getCommitCount: () => commitCount };
+	}
+
+	const cases: Array<{ label: string; state: Record<string, unknown>; substr: string }> = [
+		{ label: 'NaN row', state: { sheet: 0, row: NaN, col: 0, selectionEndRow: 0, selectionEndCol: 0, typing: false }, substr: 'finite' },
+		{ label: 'Infinity col', state: { sheet: 0, row: 0, col: Infinity, selectionEndRow: 0, selectionEndCol: 0, typing: false }, substr: 'finite' },
+		{ label: 'negative row', state: { sheet: 0, row: -1, col: 0, selectionEndRow: 0, selectionEndCol: 0, typing: false }, substr: 'non-negative' },
+		{ label: 'fractional col', state: { sheet: 0, row: 0, col: 1.5, selectionEndRow: 0, selectionEndCol: 0, typing: false }, substr: 'integer' },
+		{ label: 'sheet > u16::MAX', state: { sheet: 70000, row: 0, col: 0, selectionEndRow: 0, selectionEndCol: 0, typing: false }, substr: '65535' },
+		{ label: 'row > u32::MAX', state: { sheet: 0, row: 4294967296, col: 0, selectionEndRow: 0, selectionEndCol: 0, typing: false }, substr: '4294967295' },
+	];
+
+	for (const c of cases) {
+		test(`malformed presenceUpdate: ${c.label} -> bad_argument errorReply`, () => {
+			const session = createSession(7401n);
+			const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
+			dispatchIncomingMessage({ type: 'presenceUpdate', state: c.state }, deps);
+			assert.strictEqual(errorReplies.length, 1, `expected 1 errorReply for ${c.label}`);
+			assert.strictEqual(errorReplies[0].code, 'bad_argument');
+			assert.ok(errorReplies[0].message.includes('[presenceUpdate]'),
+				`expected [presenceUpdate] prefix, got: ${errorReplies[0].message}`);
+			assert.ok(errorReplies[0].message.includes(c.substr),
+				`expected message to mention ${c.substr}, got: ${errorReplies[0].message}`);
+			assert.strictEqual(getCommitCount(), 0, 'no onCommit on rejected presenceUpdate');
+		});
+	}
+});
+
+suite('quantbook V3.4.0.X -- endEdit commit broadcasts typing:false (MEDIUM-2 webview wiring pin)', function () {
+	test('script body emits typing:false ABOVE the if(commit) branch', () => {
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries: [] }, { nonce: 'v340X' });
+		// The fix: typing:false broadcast moved to BEFORE the commit branch,
+		// so both commit and cancel paths execute it.  Pin the structural
+		// invariant: the typing:false postMessage appears BEFORE the
+		// `if (commit) {` branch in the inline script body.
+		const typingFalseIdx = html.indexOf('typing: false');
+		const ifCommitIdx = html.indexOf('if (commit) {');
+		assert.notStrictEqual(typingFalseIdx, -1, 'typing:false broadcast must exist');
+		assert.notStrictEqual(ifCommitIdx, -1, 'if(commit) branch must exist');
+		assert.ok(typingFalseIdx < ifCommitIdx,
+			`typing:false must broadcast BEFORE the commit branch (got typingFalseIdx=${typingFalseIdx}, ifCommitIdx=${ifCommitIdx})`);
+	});
+
+	test('script body cancel-path branch does NOT post a second typing:false', () => {
+		// The cancel-path block (cell.innerHTML = '' restore) used to host
+		// the typing:false broadcast.  After MEDIUM-2 fix, the broadcast
+		// happens once above the if(commit) branch; the cancel path no
+		// longer has its own typing:false postMessage.  Pin via counting.
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries: [] }, { nonce: 'v340X' });
+		const occurrences = html.match(/typing:\s*false/g);
+		assert.ok(occurrences !== null, 'typing:false must appear at least once');
+		assert.strictEqual(occurrences.length, 1,
+			`expected exactly ONE typing:false broadcast in script body (the unified pre-branch one), found ${occurrences.length}`);
+	});
+});
+
+suite('quantbook V3.4.0.X -- BatchCommit recursion through .qbook round-trip (HIGH-1 IDE-side pin)', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	// Per-test scratch dir under os.tmpdir for clean isolation.
+	let scratchRoot: string;
+	setup(() => {
+		scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'qbook-v340X-'));
+	});
+	teardown(() => {
+		try { fs.rmSync(scratchRoot, { recursive: true, force: true }); } catch { /* test cleanup */ }
+	});
+
+	test('Save As on sample-data session (with addSheet seeding fix) succeeds', () => {
+		// HIGH-3 (cross-lane convergent Codex+Opus) end-to-end IDE-side pin:
+		// the V3.4.0.X command fix calls addSheet 3x before sample
+		// appendPutValueValidated calls.  Pin the equivalent at the IDE
+		// session.ts level: a session built like the command does must
+		// save successfully via exportToQbook.
+		const session = createSession(7301n);
+		addSheet(session, 'S0');
+		addSheet(session, 'S1');
+		addSheet(session, 'S2');
+		appendPutValueValidated(session, 0, 0, 0, 42);
+		appendPutValueValidated(session, 1, 0, 0, 11);
+		appendPutValueValidated(session, 2, 0, 0, 99);
+
+		const target = path.join(scratchRoot, 'sample.qbook');
+		// Must not throw.  Pre-V3.4.0.X (without addSheet calls), this
+		// would throw with session_replay -- invalid sheet at op index 0.
+		exportToQbook(session, target);
+		assert.ok(fs.existsSync(target), '.qbook directory created');
+		assert.ok(fs.existsSync(path.join(target, 'workbook.toml')), 'workbook.toml present');
+		assert.ok(fs.existsSync(path.join(target, 'oplog.bin')), 'oplog.bin present');
+
+		// Sanity: re-open + verify cells round-trip.
+		const reloaded = sessionFromQbook(target, 8888n);
+		const sheet0 = exportCellSnapshot(reloaded, 0).entries;
+		const sheet1 = exportCellSnapshot(reloaded, 1).entries;
+		const sheet2 = exportCellSnapshot(reloaded, 2).entries;
+		assert.strictEqual(sheet0.length, 1);
+		assert.strictEqual(sheet1.length, 1);
+		assert.strictEqual(sheet2.length, 1);
+	});
+});
+
+suite('quantbook V3.4.0.X -- addSheet napi validates chunkRows (HIGH-2)', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	const badCases: Array<{ label: string; chunkRows: number; substr: string }> = [
+		{ label: 'zero', chunkRows: 0, substr: '>= 1' },
+		{ label: 'negative', chunkRows: -1, substr: 'non-negative' },
+		{ label: 'NaN', chunkRows: NaN, substr: 'finite' },
+		{ label: 'Infinity', chunkRows: Infinity, substr: 'finite' },
+		{ label: 'fractional', chunkRows: 1.5, substr: 'integer' },
+	];
+
+	for (const c of badCases) {
+		test(`addSheet rejects ${c.label} chunkRows with bad_argument`, () => {
+			const session = createSession(7501n);
+			try {
+				addSheet(session, 'S', c.chunkRows);
+				assert.fail(`expected throw for chunkRows=${c.chunkRows}`);
+			} catch (err) {
+				const info = parseQuantbookError(err);
+				assert.strictEqual(info.code, 'bad_argument',
+					`expected bad_argument code for ${c.label}, got ${info.code} (msg: ${info.message})`);
+				assert.ok(info.message.includes(c.substr) || info.message.includes('chunkRows'),
+					`expected message about chunkRows or ${c.substr}, got: ${info.message}`);
+			}
+		});
+	}
+
+	test('addSheet accepts default chunkRows=1000', () => {
+		const session = createSession(7502n);
+		// Must not throw.
+		addSheet(session, 'S');
+		assert.strictEqual(listSheets(session).length, 0,
+			'addSheet alone does not surface sheets in cache (cache derives from PutValue keys)');
+	});
+
+	test('addSheet accepts chunkRows=1 (minimum valid)', () => {
+		const session = createSession(7503n);
+		addSheet(session, 'S', 1);
+	});
+});
+

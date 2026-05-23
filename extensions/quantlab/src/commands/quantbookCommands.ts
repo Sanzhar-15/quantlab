@@ -22,7 +22,7 @@
 
 import * as vscode from 'vscode';
 
-import { appendPutValueValidated, createSession, exportToQbook, generateUuidPeerId, listSheets, quantbookEngineVersion, sessionFromQbook, sessionFromSnapshot } from '../quantbook/session';
+import { addSheet, appendPutValueValidated, createSession, exportToQbook, generateUuidPeerId, listSheets, quantbookEngineVersion, sessionFromQbook, sessionFromSnapshot } from '../quantbook/session';
 import { loadQuantbookEngine, quantbookHostInfo } from '../quantbook/loader';
 import { connectOrSpawn, runMultiWindowDemo } from '../quantbook/multiWindowDemo';
 import { CellGridPanel } from '../quantbook/cellGrid/cellGridPanel';
@@ -141,6 +141,10 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			let peerA: CollabSessionInstance;
 			try {
 				peerA = createSession(1n);
+				// V3.4.0.X HIGH-3 carry: seed sheet 0 so demo PutValue
+				// ops have a sheet to land on at replay time (the demo
+				// loop writes via appendPutValueValidated).
+				addSheet(peerA, 'S0');
 				log.appendLine(`peer A created: peerId=${peerA.peerId()}`);
 			} catch (err) {
 				const detail = err instanceof Error ? err.message : String(err);
@@ -214,6 +218,23 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				// original V3.2.a sample; sheets 1 + 2 carry small
 				// distinct samples so the user sees that switching
 				// sheets actually changes the displayed values.
+				//
+				// V3.4.0.X HIGH-3 closure (2026-05-24, cross-lane
+				// convergent Codex+Opus): `addSheet` MUST be called
+				// before any `appendPutValueValidated` on a sheet,
+				// because `quantlab.quantbookSaveAs` routes through
+				// `to_qbook` -> `rebuild_workbook` -> `replay_into`,
+				// which rejects `Op::PutValue { sheet, .. }` if the
+				// sheet doesn't exist in the workbook yet (returns
+				// `session_replay -- invalid sheet at op index 0
+				// (workbook has 0 sheets)`).  Without these `addSheet`
+				// calls, the default Save As path on the sample
+				// workbook FAILS visibly to the user.  Sheet ids are
+				// assigned deterministically in append order: first
+				// `addSheet` -> sheet 0, second -> 1, third -> 2.
+				addSheet(session, 'S0');
+				addSheet(session, 'S1');
+				addSheet(session, 'S2');
 				appendPutValueValidated(session, 0, 0, 0, 42);
 				appendPutValueValidated(session, 0, 0, 1, 100);
 				appendPutValueValidated(session, 0, 1, 0, 3.14);
@@ -250,6 +271,14 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				log.appendLine('[collab] starting cell-grid collab (sheet 0)...');
 				const { transport, spawnedRelay } = await connectOrSpawn(engine, log);
 				const session = createSession(BigInt(process.pid));
+				// V3.4.0.X HIGH-3 carry: seed sheet 0 so user edits via
+				// the V3.2.b PESSIMISTIC dispatcher (which calls
+				// appendPutValue directly) can later be saved via
+				// quantlab.quantbookSaveAs.  Without this, the user's
+				// first edit on the collab panel produces a PutValue op
+				// on a sheet the workbook doesn't have, and Save As
+				// fails replay with session_replay -- invalid sheet.
+				addSheet(session, 'S0');
 				CellGridPanel.show(context, session, 0, { engine, transport, spawnedRelay, log });
 				log.appendLine('[collab] cell grid open + attached.');
 			} catch (err) {

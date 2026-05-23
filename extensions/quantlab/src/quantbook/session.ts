@@ -131,11 +131,16 @@ export function exportToQbook(session: CollabSessionInstance, path: string): voi
  * **Phase 5.7 V3.4.0.4a (2026-05-23) -- typed wrapper for
  * `CollabSession.fromQbook`.**
  *
- * Load a session from a `.qbook` directory at `path`.  Caller MUST
- * pass `peerIdOverride` -- a fresh BigInt (e.g., UUID-derived per
- * V3.4.0.1 D5) for "first open" or a stored-previously BigInt for
- * "rejoin with same identity".  V3.4.0.4b IDE commands handle the
- * UUID generation + per-workbook stash.
+ * Load a session from a `.qbook` directory at `path`.  Caller MUST pass
+ * `peerIdOverride` -- always a FRESH BigInt generated via
+ * {@link generateUuidPeerId} per V3.4.0.4b D5 DEVIATION (the V3.4.0.1
+ * lock originally specified persisted-per-workbook PeerId, but
+ * implementation discovery surfaced an unsolvable two-windows-same-
+ * workspace collision; resolution = fresh-UUID-per-session, NOT a stash).
+ * V3.4.0.X LOW-1 closure (cross-lane Codex L1 + Opus M1 doc-accuracy:
+ * pre-closure this docstring + the napi `fromQbook` docstring both
+ * mentioned a "stored-previously" / per-workbook stash path that the
+ * implementation intentionally rejected).
  */
 export function sessionFromQbook(path: string, peerIdOverride: bigint): CollabSessionInstance {
 	const engine = loadQuantbookEngine();
@@ -166,16 +171,26 @@ export function addSheet(session: CollabSessionInstance, name: string, chunkRows
  * + the caller is responsible for ensuring uniqueness).
  *
  * **Source**: `crypto.randomUUID()` (Node 14.17+; Electron/VS Code well
- * past that floor).  UUIDv4 has 122 bits of randomness; truncating to
- * 64 bits keeps ~64 bits of entropy.  Birthday-paradox collision
- * probability is ~2^32 sessions before first collision -- effectively
- * zero for real workbook usage (a user spawning 4 billion sessions in
- * one workbook is not the threat model).
+ * past that floor).  UUIDv4 has 122 bits of randomness across 16 bytes
+ * with 6 deterministic bits (4 bits for version `0100` at hex-char
+ * position 12 + 2 bits for variant `10` at hex-char position 16).
+ * Truncating to the first 16 hex chars (the first 64 bits) keeps ~60
+ * bits of entropy after extracting the version nibble at position 12
+ * (which is ALWAYS the literal hex `4`).  Birthday-paradox collision
+ * probability is therefore ~2^30 sessions before first collision --
+ * still effectively zero for real workbook usage (a user spawning ~1
+ * billion sessions in one workbook is not the threat model).  V3.4.0.X
+ * LOW-2 closure (cross-lane Codex L2 + Opus M3 doc-accuracy: the
+ * docstring previously claimed ~64 bits / ~2^32 collision).
  *
  * **Non-zero guarantee**: `PeerId(0)` is the engine's `LEGACY_PEER`
- * sentinel + would assert-fail `CollabSession::new`.  A truncated UUID
- * could theoretically be all-zero (probability ~2^-64); we retry in
- * that case.
+ * sentinel + would assert-fail `CollabSession::new`.  Under spec-
+ * compliant UUIDv4, the first 16 hex chars CANNOT be all-zero (the
+ * version nibble at position 12 is the literal `4`, not `0`), so the
+ * all-zero outcome is IMPOSSIBLE.  The retry loop + 8-attempt cap is
+ * defense against a NON-SPEC `crypto.randomUUID` (entropy broken /
+ * unexpected impl); per CLAUDE.md No-Fallbacks, 8 consecutive non-spec
+ * UUIDs surface loudly via thrown error.
  *
  * **D5 deviation (V3.4.0.4b plan note)**: V3.4.0.1 D5 originally
  * specified UUID-derived PeerId PERSISTED per workbook (via envelope

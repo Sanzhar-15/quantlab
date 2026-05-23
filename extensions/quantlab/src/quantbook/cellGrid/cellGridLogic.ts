@@ -111,6 +111,55 @@ export interface ErrorReplyMessage {
  * @returns the parsed finite number on success.
  * @throws Error with `[bad_argument]` prefix on rejection.
  */
+/**
+ * **Phase 5.7 V3.4.0.X MEDIUM-3 closure (2026-05-24, single-lane Codex)** --
+ * presence numeric-field validator.
+ *
+ * Returns `null` when the state's numeric fields all fit their engine-side
+ * domains: `sheet` in `[0, 65535]` (u16), `row/col/selectionEndRow/
+ * selectionEndCol` in `[0, 4294967295]` (u32), all finite + integer.  Returns
+ * a non-null error-message string otherwise (caller wraps in errorReply with
+ * `code: 'bad_argument'`).
+ *
+ * Mirrors the `appendPutValueValidated` numeric discipline established at
+ * V3.2.d HIGH-2 closure.  Pre-V3.4.0.X this dispatcher arm shipped with
+ * typeof-only checks; NaN/Infinity/negative/fractional/out-of-range values
+ * passed through to napi's ToUint32 coercion which would either silently
+ * coerce (negative -> very-large u32) or panic on the engine side.
+ *
+ * Exported for direct mocha coverage.
+ */
+export function validatePresenceNumeric(s: {
+	sheet: number;
+	row: number;
+	col: number;
+	selectionEndRow: number;
+	selectionEndCol: number;
+}): string | null {
+	const fields: Array<{ name: string; value: number; max: number }> = [
+		{ name: 'sheet', value: s.sheet, max: 65535 },
+		{ name: 'row', value: s.row, max: 4294967295 },
+		{ name: 'col', value: s.col, max: 4294967295 },
+		{ name: 'selectionEndRow', value: s.selectionEndRow, max: 4294967295 },
+		{ name: 'selectionEndCol', value: s.selectionEndCol, max: 4294967295 },
+	];
+	for (const f of fields) {
+		if (!Number.isFinite(f.value)) {
+			return `${f.name} must be a finite non-negative integer, got ${f.value}`;
+		}
+		if (f.value < 0) {
+			return `${f.name} must be a non-negative integer, got ${f.value}`;
+		}
+		if (!Number.isInteger(f.value)) {
+			return `${f.name} must be an integer, got ${f.value}`;
+		}
+		if (f.value > f.max) {
+			return `${f.name} must be in [0, ${f.max}], got ${f.value}`;
+		}
+	}
+	return null;
+}
+
 export function parseCellRawInput(raw: string): number {
 	const trimmed = raw.trim();
 	if (trimmed === '') {
@@ -217,6 +266,13 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 	if (msg.type === 'presenceUpdate') {
 		const presenceReq = raw as { type: 'presenceUpdate'; state?: unknown };
 		const state = presenceReq.state;
+		// V3.4.0.X MEDIUM-3 closure (2026-05-24, single-lane Codex):
+		// runtime type-shape check (was here pre-closure) + numeric-range
+		// validation (added in this closure).  V3.4.0.5b shipped with
+		// typeof-only checks, which let NaN/Infinity/negative/fractional/
+		// out-of-u16-or-u32-range values through to napi's ToUint32
+		// coercion path.  This is the same boundary class V3.2.d closed
+		// for cell writes (HIGH-2); extending it here for symmetry.
 		if (
 			typeof state !== 'object'
 			|| state === null
@@ -237,15 +293,31 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			});
 			return;
 		}
-		try {
-			deps.session.updatePresence(state as {
-				sheet: number;
-				row: number;
-				col: number;
-				selectionEndRow: number;
-				selectionEndCol: number;
-				typing: boolean;
+		const s = state as {
+			sheet: number;
+			row: number;
+			col: number;
+			selectionEndRow: number;
+			selectionEndCol: number;
+			typing: boolean;
+		};
+		// V3.4.0.X MEDIUM-3 numeric validators -- mirror appendPutValueValidated:
+		// sheet must fit in u16 [0, 65535]; row/col/selectionEnd* must fit
+		// in u32 [0, 4294967295]; all integers + finite.
+		const numericInvalid = validatePresenceNumeric(s);
+		if (numericInvalid !== null) {
+			deps.onError({
+				type: 'errorReply',
+				sheet: deps.sheet,
+				row: 0,
+				col: 0,
+				code: 'bad_argument',
+				message: `[presenceUpdate] ${numericInvalid}`,
 			});
+			return;
+		}
+		try {
+			deps.session.updatePresence(s);
 			// Intentional: no onCommit().  See block comment above.
 			return;
 		} catch (err) {
