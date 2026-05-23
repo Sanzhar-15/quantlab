@@ -78,6 +78,7 @@ import type {
 	CollabSessionInstance,
 	QuantbookCellSnapshot,
 	QuantbookNativeModule,
+	WorkbookSnapshotJson,
 } from '../src/quantbook/types';
 
 /**
@@ -2285,7 +2286,7 @@ suite('quantbook V3.2.a -- exportSnapshot cell-snapshot export', function () {
 // Phase 5.7 V3.2.b.5 -- cell-edit flow (HTML + dispatcher)
 // ============================================================================
 
-import { buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, buildVirtualRows, classifyPollTick, computeVisibleRange, dispatchIncomingMessage, parseCellRawInput, validatePresenceNumeric, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
+import { buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, buildVirtualRows, classifyPollTick, computeVisibleRange, dispatchIncomingMessage, extractSheetSnapshot, parseCellRawInput, validatePresenceNumeric, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
 
 suite('quantbook V3.2.b.2 -- cellGridHtml.ts nonce + script + editable cells', function () {
 	test('buildHtml WITHOUT nonce is unchanged from V3.2.a (no script tag; narrow CSP)', () => {
@@ -5196,6 +5197,264 @@ suite('quantbook V3.5.0.4a -- buildSheetMovePositionItems', function () {
 		// Position 1: between X and Z (per display order, NOT id order).
 		assert.strictEqual(items[1].label, 'Position 1 (between Sheet 5 and Sheet 9)',
 			'adjacency labels use display order, not id order');
+	});
+});
+
+// ============================================================================
+// Phase 5.7 V3.5.0.4b (2026-05-24) -- extractSheetSnapshot transformer
+// ============================================================================
+// Tests the pure helper that bridges V3.5.0.2 WorkbookSnapshotJson into the
+// V3.2.a QuantbookCellSnapshot shape that buildHtml consumes.  Lives in
+// cellGridLogic.ts; mocha-testable without vscode.
+
+suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
+	test('empty workbook -> null for any sheetId', () => {
+		const snap: WorkbookSnapshotJson = { sheets: [] };
+		assert.strictEqual(extractSheetSnapshot(snap, 0), null,
+			'no sheets -> null lookup');
+		assert.strictEqual(extractSheetSnapshot(snap, 5), null);
+	});
+
+	test('sheet found, no cells -> empty entries with version + sheet preserved', () => {
+		const snap: WorkbookSnapshotJson = { sheets: [{ id: 0, name: 'S', cells: [] }] };
+		const result = extractSheetSnapshot(snap, 0);
+		assert.ok(result !== null);
+		assert.strictEqual(result!.snapshot_format_version, 1);
+		assert.strictEqual(result!.sheet, 0);
+		assert.deepStrictEqual(result!.entries, []);
+	});
+
+	test('sheet not in snapshot -> null (tombstone race)', () => {
+		const snap: WorkbookSnapshotJson = {
+			sheets: [
+				{ id: 0, name: 'A', cells: [] },
+				{ id: 2, name: 'C', cells: [] },
+			],
+		};
+		// sheet 1 is missing (tombstoned).
+		assert.strictEqual(extractSheetSnapshot(snap, 1), null);
+	});
+
+	test('number cell -> QuantbookCellValue { kind: number, value }', () => {
+		const snap: WorkbookSnapshotJson = {
+			sheets: [{
+				id: 0, name: 'S', cells: [
+					{ row: 1, col: 2, value: { kind: 'number', number: 42.5 } },
+				],
+			}],
+		};
+		const result = extractSheetSnapshot(snap, 0);
+		assert.strictEqual(result!.entries.length, 1);
+		assert.deepStrictEqual(result!.entries[0],
+			{ row: 1, col: 2, value: { kind: 'number', value: 42.5 } });
+	});
+
+	test('boolean / text / error cells -> typed QuantbookCellValue', () => {
+		const snap: WorkbookSnapshotJson = {
+			sheets: [{
+				id: 0, name: 'S', cells: [
+					{ row: 0, col: 0, value: { kind: 'boolean', boolean: true } },
+					{ row: 0, col: 1, value: { kind: 'text', text: 'hello' } },
+					{ row: 0, col: 2, value: { kind: 'error', error: '#REF!' } },
+				],
+			}],
+		};
+		const r = extractSheetSnapshot(snap, 0)!;
+		assert.deepStrictEqual(r.entries[0].value, { kind: 'boolean', value: true });
+		assert.deepStrictEqual(r.entries[1].value, { kind: 'text', value: 'hello' });
+		assert.deepStrictEqual(r.entries[2].value, { kind: 'error', value: '#REF!' });
+	});
+
+	test('pending cell -> QuantbookCellValue { kind: pending }', () => {
+		const snap: WorkbookSnapshotJson = {
+			sheets: [{
+				id: 0, name: 'S', cells: [
+					{ row: 0, col: 0, value: { kind: 'pending' } },
+				],
+			}],
+		};
+		const r = extractSheetSnapshot(snap, 0)!;
+		assert.deepStrictEqual(r.entries[0].value, { kind: 'pending' });
+	});
+
+	test('formula-only cell (value=undefined) -> SKIPPED (V3.4.0.X MEDIUM-1 carry)', () => {
+		const snap: WorkbookSnapshotJson = {
+			sheets: [{
+				id: 0, name: 'S', cells: [
+					{ row: 0, col: 0, value: { kind: 'number', number: 1 } },
+					{ row: 0, col: 1, formula: '=A1+1' }, // no value -> formula-only
+					{ row: 0, col: 2, value: { kind: 'number', number: 3 } },
+				],
+			}],
+		};
+		const r = extractSheetSnapshot(snap, 0)!;
+		assert.strictEqual(r.entries.length, 2,
+			'formula-only cells dropped (mirrors V3.4.0.2 export_snapshot filter_map)');
+		assert.deepStrictEqual(r.entries.map(e => e.col), [0, 2]);
+	});
+
+	test('unknown kind -> throws bad_argument (binding-drift signal)', () => {
+		// Negative test: simulate a future engine variant the IDE binding
+		// doesn't recognize.  Cast through unknown to bypass the V3.5.0.2
+		// TS interface's literal-union -- the runtime check is what we're
+		// pinning.
+		const snap = {
+			sheets: [{
+				id: 0, name: 'S', cells: [
+					{ row: 0, col: 0, value: { kind: 'future_variant' } },
+				],
+			}],
+		} as unknown as WorkbookSnapshotJson;
+		assert.throws(() => extractSheetSnapshot(snap, 0),
+			/\[bad_argument\] extractSheetSnapshot: unknown CellValueJson kind/);
+	});
+
+	test('kind=number with missing number payload -> throws bad_argument', () => {
+		const snap: WorkbookSnapshotJson = {
+			sheets: [{
+				id: 0, name: 'S', cells: [
+					{ row: 0, col: 0, value: { kind: 'number' } },  // no number payload
+				],
+			}],
+		};
+		assert.throws(() => extractSheetSnapshot(snap, 0),
+			/number payload missing/);
+	});
+
+	test('multi-sheet snapshot, extract by id -> only requested sheet returned', () => {
+		const snap: WorkbookSnapshotJson = {
+			sheets: [
+				{ id: 0, name: 'A', cells: [{ row: 0, col: 0, value: { kind: 'number', number: 1 } }] },
+				{ id: 1, name: 'B', cells: [{ row: 0, col: 0, value: { kind: 'number', number: 2 } }] },
+				{ id: 2, name: 'C', cells: [{ row: 0, col: 0, value: { kind: 'number', number: 3 } }] },
+			],
+		};
+		const r1 = extractSheetSnapshot(snap, 1)!;
+		assert.strictEqual(r1.sheet, 1);
+		assert.strictEqual(r1.entries.length, 1);
+		assert.deepStrictEqual(r1.entries[0].value, { kind: 'number', value: 2 });
+		// Sanity: extracting another sheet is independent.
+		const r2 = extractSheetSnapshot(snap, 2)!;
+		assert.deepStrictEqual(r2.entries[0].value, { kind: 'number', value: 3 });
+	});
+
+	test('cells preserve row + col ordering from snapshot', () => {
+		// snapshot_cells is sorted (row, col) ascending per V3.5.0.2 contract;
+		// transformer preserves the order.
+		const snap: WorkbookSnapshotJson = {
+			sheets: [{
+				id: 0, name: 'S', cells: [
+					{ row: 0, col: 0, value: { kind: 'number', number: 1 } },
+					{ row: 0, col: 5, value: { kind: 'number', number: 2 } },
+					{ row: 3, col: 2, value: { kind: 'number', number: 3 } },
+					{ row: 5, col: 0, value: { kind: 'number', number: 4 } },
+				],
+			}],
+		};
+		const r = extractSheetSnapshot(snap, 0)!;
+		assert.deepStrictEqual(r.entries.map(e => [e.row, e.col]),
+			[[0, 0], [0, 5], [3, 2], [5, 0]]);
+	});
+});
+
+// V3.5.0.4b integration: round-trip via a real session -- sheet rename
+// reflects immediately in extractSheetSnapshot output (no pollRemote wait),
+// sheet delete (tombstone) makes the sheet unreachable, sheet move keeps
+// cells reachable by id.
+suite('quantbook V3.5.0.4b -- extractSheetSnapshot via real workbookSnapshot()', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('rename reflects immediately in render-derived snapshot (no pollRemote wait)', () => {
+		const session = createSession(8001n);
+		addSheet(session, 'Original');
+		appendPutValueValidated(session, 0, 0, 0, 42);
+		const before = extractSheetSnapshot(workbookSnapshot(session), 0);
+		assert.ok(before !== null);
+		assert.strictEqual(before!.entries.length, 1);
+		renameSheet(session, 0, 'Renamed');
+		// V3.5.0.4b key behavior: workbookSnapshot routes through
+		// rebuild_workbook which carries the rename; extractSheetSnapshot
+		// sees the same cells (rename doesn't touch cells).
+		const after = extractSheetSnapshot(workbookSnapshot(session), 0);
+		assert.ok(after !== null);
+		assert.deepStrictEqual(after!.entries, before!.entries,
+			'rename preserves cells; extractor sees identical entries');
+		// Verify rename also affects the sheet's name in the snapshot
+		// (panel title source).
+		const sheet = workbookSnapshot(session).sheets.find(s => s.id === 0);
+		assert.strictEqual(sheet!.name, 'Renamed');
+	});
+
+	test('delete (tombstone) -> extractor returns null for the tombstoned id', () => {
+		const session = createSession(8002n);
+		addSheet(session, 'TBR');
+		appendPutValueValidated(session, 0, 0, 0, 100);
+		assert.ok(extractSheetSnapshot(workbookSnapshot(session), 0) !== null);
+		deleteSheet(session, 0);
+		assert.strictEqual(extractSheetSnapshot(workbookSnapshot(session), 0), null,
+			'tombstoned sheet -> extractor returns null (render() shows empty + warns)');
+	});
+
+	test('move keeps cells reachable by ID (id-stability)', () => {
+		const session = createSession(8003n);
+		addSheet(session, 'A');
+		addSheet(session, 'B');
+		appendPutValueValidated(session, 1, 0, 0, 77);
+		// Move sheet 1 to display position 0.
+		moveSheet(session, 1, 0);
+		// V3.5.0.3c id stability: sheet 1's cells still reachable by id.
+		const r = extractSheetSnapshot(workbookSnapshot(session), 1);
+		assert.ok(r !== null);
+		assert.strictEqual(r!.entries.length, 1);
+		assert.deepStrictEqual(r!.entries[0].value, { kind: 'number', value: 77 });
+	});
+
+	test('empty addSheet\'d sheet -> extractor returns empty entries (not null)', () => {
+		// Pre-V3.5.0.2 listSheets() would not surface addSheet-only sheets
+		// (cache-based).  V3.5.0.4b uses workbookSnapshot which enumerates
+		// via sheet_count, so empty sheets DO appear.
+		const session = createSession(8004n);
+		addSheet(session, 'Empty');
+		const r = extractSheetSnapshot(workbookSnapshot(session), 0);
+		assert.ok(r !== null, 'addSheet-only sheets are reachable (not null)');
+		assert.deepStrictEqual(r!.entries, []);
+	});
+
+	test('round-trip equality: workbookSnapshot-derived matches exportSnapshot-derived (V3.5.0.4b backward-compat pin)', () => {
+		// Sanity: the V3.5.0.4b migration must not change the per-cell
+		// rendered shape.  Compare the V3.5.0.2 path output against the
+		// V3.4.0.X path output (exportCellSnapshot) for the same session.
+		const session = createSession(8005n);
+		addSheet(session, 'S');
+		appendPutValueValidated(session, 0, 0, 0, 1);
+		appendPutValueValidated(session, 0, 0, 1, 2);
+		appendPutValueValidated(session, 0, 1, 0, 3);
+		const v3_5_path = extractSheetSnapshot(workbookSnapshot(session), 0)!;
+		const v3_4_path = exportCellSnapshot(session, 0);
+		assert.strictEqual(v3_5_path.snapshot_format_version, v3_4_path.snapshot_format_version);
+		assert.strictEqual(v3_5_path.sheet, v3_4_path.sheet);
+		assert.deepStrictEqual(v3_5_path.entries, v3_4_path.entries,
+			'V3.5.0.4b path produces same entries as V3.4.0.X path (per-cell shape preserved)');
+	});
+
+	test('panel title sheet-count comes from workbookSnapshot (includes empty sheets)', () => {
+		// V3.5.0.4b reactive-title key behavior: the count is
+		// workbookSnapshot.sheets.length, NOT listSheets().length.  Empty
+		// sheets (addSheet without PutValue) count.
+		const session = createSession(8006n);
+		addSheet(session, 'A');
+		addSheet(session, 'B');
+		addSheet(session, 'EmptyC');
+		appendPutValueValidated(session, 0, 0, 0, 1);
+		// listSheets is cache-based + only surfaces sheets with PutValue:
+		assert.strictEqual(listSheets(session).length, 1,
+			'listSheets misses addSheet-only sheets (V3.3.0.X cache-based contract)');
+		// workbookSnapshot enumerates all sheets:
+		assert.strictEqual(workbookSnapshot(session).sheets.length, 3,
+			'workbookSnapshot counts all sheets (V3.5.0.4b reactive-title source)');
 	});
 });
 

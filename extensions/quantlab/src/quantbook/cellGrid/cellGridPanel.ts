@@ -30,11 +30,11 @@
 import * as childProcess from 'child_process';
 import * as vscode from 'vscode';
 
-import { buildPresenceSnapshotJson, exportCellSnapshot, parseQuantbookError } from '../session';
-import type { CollabSessionInstance, QuantbookNativeModule, TransportInstance } from '../types';
+import { buildPresenceSnapshotJson, parseQuantbookError, workbookSnapshot } from '../session';
+import type { CollabSessionInstance, QuantbookCellSnapshot, QuantbookNativeModule, TransportInstance } from '../types';
 import { reconnectWithBackoff } from '../multiWindowDemo';
 import { buildHtml } from './cellGridHtml';
-import { classifyPollTick, dispatchIncomingMessage } from './cellGridLogic';
+import { classifyPollTick, dispatchIncomingMessage, extractSheetSnapshot } from './cellGridLogic';
 
 const VIEW_TYPE = 'quantlab.quantbookCellGrid';
 
@@ -147,10 +147,17 @@ export class CellGridPanel {
 		// the session has multiple sheets ("Sheet N of M" reads as
 		// "you're on sheet N, M total in this session").  Single-sheet
 		// sessions show just "Sheet N" (avoids "of 1" noise).
-		// Title is point-in-time; if the user later appends to a new
-		// sheet, this panel's title stays "of M" until the panel is
-		// re-rendered (V3.x can wire a dynamic title update if the
-		// stale display becomes a real ergonomic issue).
+		//
+		// **V3.5.0.4b (2026-05-24)**: title here is the INITIAL value
+		// shown while the panel is being created; `render()` (called
+		// below at line ~218) immediately updates the title via
+		// `this.panel.title = ...` using `workbookSnapshot()` data,
+		// so subsequent sheet ops + cell edits keep the title
+		// reactive.  Clears the V3.3.0.X reactive-panel-title backlog
+		// item.  This initial value uses `listSheets()` (V3.3.0.X
+		// cache-based; misses addSheet'd-but-empty sheets); render()
+		// will correct the count within milliseconds via
+		// `workbookSnapshot.sheets.length` (counts all sheets).
 		//
 		// **V3.3.0.X audit closure (HIGH-2, 2026-05-23, Opus
 		// adversarial lane)**: pre-closure this call was wrapped in
@@ -359,9 +366,65 @@ export class CellGridPanel {
 	 *
 	 * V3.2.b.2: nonce is regenerated each call so refreshes get a
 	 * fresh script-src CSP token.
+	 *
+	 * **V3.5.0.4b (2026-05-24)**: migrated from `exportSnapshot(sheet)`
+	 * to `workbookSnapshot()`.  Routes through engine `rebuild_workbook`
+	 * which reflects V3.5.0.3 sheet ops (rename/delete/move) IMMEDIATELY
+	 * -- no pollRemote tick wait.  Bonus: panel title sheet-count is
+	 * now reactive (was point-in-time at `show()` per V3.3.0.X reactive-
+	 * panel-title backlog item; backlog cleared here).
+	 *
+	 * **Per-render cost**: workbookSnapshot is O(N) in op count
+	 * (rebuild_workbook replay).  Render is called per onCommit (cell
+	 * edit -- could be 10+/sec under typing) + per pollRemote tick (1s).
+	 * V3.5.0.2 docstring warns callers to batch; for V3.5.0.4b we
+	 * accept the cost (V3.4-scale sessions have small op counts; the
+	 * O(N) is small).  V3.6+ may add incremental snapshot deltas if
+	 * profiling shows the cost matters.
+	 *
+	 * **Sheet-not-found (tombstone race)**: if the active sheet was
+	 * deleted via V3.5.0.4a `quantlab.quantbookSheetDelete` while the
+	 * panel is open, `extractSheetSnapshot` returns null.  We render
+	 * an empty cell-grid + log a warning -- the user sees the panel
+	 * is now showing a deleted sheet (cells empty), and can close it.
+	 * V3.6+ may auto-dispose the panel on its sheet's tombstoning.
 	 */
 	render(): void {
-		const snapshot = exportCellSnapshot(this.session, this.sheet);
+		const wbSnapshot = workbookSnapshot(this.session);
+		const sheetSnapshot: QuantbookCellSnapshot | null = extractSheetSnapshot(wbSnapshot, this.sheet);
+		const snapshot: QuantbookCellSnapshot = sheetSnapshot ?? {
+			// Tombstoned-mid-lifetime fallback: render empty.  CLAUDE.md
+			// No-Fallbacks tension: we deliberately render an empty
+			// frame rather than throw, BUT the warning below makes the
+			// state visible.  Without this branch, a stale panel that
+			// outlived its sheet's deletion would throw on every render
+			// -- worse UX (red error banner forever) than the empty
+			// frame + warning here.
+			snapshot_format_version: 1,
+			sheet: this.sheet,
+			entries: [],
+		};
+		if (sheetSnapshot === null) {
+			console.warn(
+				`[cellGrid] active sheet ${this.sheet} not found in workbookSnapshot ` +
+				`(likely tombstoned by quantbookSheetDelete).  Rendering empty cell grid; close the panel.`,
+			);
+		}
+		// V3.5.0.4b: reactive panel title -- reflects current sheet
+		// count from workbookSnapshot (includes empty addSheet'd sheets,
+		// unlike the show()-time listSheets() call which was cache-
+		// based per V3.3.0.X MEDIUM-3).  Clears the V3.3.0.X reactive-
+		// panel-title backlog item.
+		const totalSheets = wbSnapshot.sheets.length;
+		const titleSuffix = totalSheets > 1 ? ` of ${totalSheets}` : '';
+		const sheetName = sheetSnapshot !== null
+			? wbSnapshot.sheets.find(s => s.id === this.sheet)?.name
+			: undefined;
+		const baseTitle = this.attachmentState !== undefined ? 'Cell Grid -- Collab' : 'Cell Grid';
+		const sheetLabel = sheetName !== undefined
+			? `Sheet ${this.sheet} "${sheetName}"`
+			: `Sheet ${this.sheet}`;
+		this.panel.title = `${baseTitle} (${sheetLabel}${titleSuffix})`;
 		const nonce = buildPanelNonce();
 		// V3.4.0.5b (2026-05-23): build presence snapshot at render time.
 		// Presence is non-critical decoration; if the engine throws,

@@ -27,7 +27,7 @@
  * - `panel.webview.postMessage` -> wired as `DispatchDeps.onError`.
  */
 
-import type { CollabSessionInstance, QuantbookErrorCode } from '../types';
+import type { CollabSessionInstance, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, SheetSnapshotJson, WorkbookSnapshotJson } from '../types';
 import { appendPutValueValidated, parseQuantbookError } from '../session';
 
 /**
@@ -622,4 +622,130 @@ export function buildSheetMovePositionItems(
 		});
 	}
 	return items;
+}
+
+// ============================================================================
+// Phase 5.7 V3.5.0.4b (2026-05-24) -- WorkbookSnapshot -> single-sheet
+// QuantbookCellSnapshot transformer
+// ============================================================================
+
+/**
+ * **Phase 5.7 V3.5.0.4b (2026-05-24) -- extract one sheet's
+ * QuantbookCellSnapshot from a WorkbookSnapshotJson.**
+ *
+ * Bridges the V3.5.0.2 `WorkbookSnapshotJson` shape (multi-sheet, with
+ * optional value/formula per cell) into the V3.2.a `QuantbookCellSnapshot`
+ * shape (single-sheet, required-value entries) that {@link buildHtml}
+ * has consumed since V3.2.a.  Lets `cellGridPanel.ts::render()` switch
+ * from `exportSnapshot(sheet)` to `workbookSnapshot()` WITHOUT changing
+ * the html-building layer (which is a much larger surface).
+ *
+ * **Sheet-not-found**: returns `null` when `sheetId` is absent from
+ * `snapshot.sheets` -- happens if the active sheet was tombstoned
+ * (V3.5.0.3b) via `quantlab.quantbookSheetDelete` while the panel
+ * was open.  Callers should render an empty / warning view for null.
+ *
+ * **Formula-only cells**: V3.5.0.2 CellSnapshotJson can have
+ * `value: undefined` (formula-only cells per the V3.4.0.X MEDIUM-1
+ * closure -- formula text but no cached literal).  This transformer
+ * SKIPS such cells, matching the V3.4.0.2 engine `export_snapshot`'s
+ * `filter_map` over `state.value` -- preserves exact behavior for
+ * `buildHtml` consumers.  Once V3.6+ adds formula rendering in the
+ * cell-grid, this filter can be relaxed.
+ *
+ * **CellValueJson -> QuantbookCellValue conversion**: V3.5.0.2's
+ * CellValueJson has optional payload fields (napi-rs Option::None ->
+ * absent JS property); QuantbookCellValue uses a strict discriminated
+ * union with the payload always present.  The transformer maps:
+ * - kind='number'  -> `{ kind: 'number',  value: cell.value.number }`
+ * - kind='boolean' -> `{ kind: 'boolean', value: cell.value.boolean }`
+ * - kind='text'    -> `{ kind: 'text',    value: cell.value.text }`
+ * - kind='error'   -> `{ kind: 'error',   value: cell.value.error }`
+ * - kind='pending' -> `{ kind: 'pending' }`
+ * - unknown kind   -> throw (binding-drift signal; matches the
+ *                     `snapshot_format_version !== 1` throw pattern
+ *                     in {@link exportCellSnapshot}).
+ *
+ * Pure function: no vscode + no session dependency.  Mocha-testable.
+ *
+ * @param snapshot full workbook snapshot from {@link workbookSnapshot}.
+ *                 Already display-order-sorted + tombstone-filtered by
+ *                 the napi layer (V3.5.0.3b + V3.5.0.3c).
+ * @param sheetId  the sheet to extract.  Looked up by id; absent ids
+ *                 (deleted/never-added/out-of-range) return null.
+ * @returns the single-sheet snapshot for `buildHtml` consumption,
+ *          or `null` if `sheetId` is not in `snapshot.sheets`.
+ */
+export function extractSheetSnapshot(
+	snapshot: WorkbookSnapshotJson,
+	sheetId: number,
+): QuantbookCellSnapshot | null {
+	const sheet: SheetSnapshotJson | undefined = snapshot.sheets.find(s => s.id === sheetId);
+	if (sheet === undefined) {
+		return null;
+	}
+	const entries: { row: number; col: number; value: QuantbookCellValue }[] = [];
+	for (const cell of sheet.cells) {
+		if (cell.value === undefined) {
+			// Formula-only cell.  Matches V3.4.0.2 export_snapshot's
+			// filter_map(state.value) behavior -- skip cells with no
+			// cached literal value.  V3.6+ can surface formulas here.
+			continue;
+		}
+		const v = cell.value;
+		let typed: QuantbookCellValue;
+		switch (v.kind) {
+			case 'number':
+				if (typeof v.number !== 'number') {
+					throw new Error(
+						`[bad_argument] extractSheetSnapshot: kind='number' but number payload missing/non-numeric for cell ` +
+						`(sheet=${sheetId}, row=${cell.row}, col=${cell.col}).  Engine + IDE binding may be out of sync.`,
+					);
+				}
+				typed = { kind: 'number', value: v.number };
+				break;
+			case 'boolean':
+				if (typeof v.boolean !== 'boolean') {
+					throw new Error(
+						`[bad_argument] extractSheetSnapshot: kind='boolean' but boolean payload missing for cell ` +
+						`(sheet=${sheetId}, row=${cell.row}, col=${cell.col}).`,
+					);
+				}
+				typed = { kind: 'boolean', value: v.boolean };
+				break;
+			case 'text':
+				if (typeof v.text !== 'string') {
+					throw new Error(
+						`[bad_argument] extractSheetSnapshot: kind='text' but text payload missing for cell ` +
+						`(sheet=${sheetId}, row=${cell.row}, col=${cell.col}).`,
+					);
+				}
+				typed = { kind: 'text', value: v.text };
+				break;
+			case 'error':
+				if (typeof v.error !== 'string') {
+					throw new Error(
+						`[bad_argument] extractSheetSnapshot: kind='error' but error payload missing for cell ` +
+						`(sheet=${sheetId}, row=${cell.row}, col=${cell.col}).`,
+					);
+				}
+				typed = { kind: 'error', value: v.error };
+				break;
+			case 'pending':
+				typed = { kind: 'pending' };
+				break;
+			default:
+				throw new Error(
+					`[bad_argument] extractSheetSnapshot: unknown CellValueJson kind ` +
+					`"${(v as { kind: string }).kind}" for cell (sheet=${sheetId}, row=${cell.row}, col=${cell.col}). ` +
+					`Engine + IDE binding may be out of sync -- rebuild together.`,
+				);
+		}
+		entries.push({ row: cell.row, col: cell.col, value: typed });
+	}
+	return {
+		snapshot_format_version: 1,
+		sheet: sheetId,
+		entries,
+	};
 }
