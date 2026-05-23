@@ -812,6 +812,81 @@ impl CollabSession {
         Ok(())
     }
 
+    /// **Phase 5.7 V3.5.0.3b (2026-05-24) -- append an `Op::RemoveSheet`
+    /// to this session (tombstone the sheet at `id`).**
+    ///
+    /// Per V3.5.0.1 D4 (second of three sheet-ops sub-steps; 0.3b ships
+    /// after 0.3a renameSheet) + V3.5.0.3b CRDT semantic decision lock:
+    /// tombstone preserving the id slot (NOT hard delete; see
+    /// `Op::RemoveSheet` docstring in `ql-oplog/src/op.rs` for the full
+    /// rationale).
+    ///
+    /// **Pre-delete existence check**: validates `id <= u16::MAX` +
+    /// pre-rebuilds the workbook to confirm `id < sheet_count`.  Already-
+    /// tombstoned sheets ARE accepted at the napi layer (returns Ok; the
+    /// resulting Op::RemoveSheet replay is an idempotent no-op).  This
+    /// mirrors the CRDT-friendly idempotency contract: a peer that
+    /// re-deletes is silently OK.
+    ///
+    /// **Behavior on tombstoned sheet at rebuild time**:
+    /// - `workbookSnapshot` skips the sheet (filtered at the napi layer
+    ///   per V3.5.0.3b's filter addition).
+    /// - Cell-keyed ops (`PutValue` / `PutFormula` / `ClearFormula`)
+    ///   targeting the tombstoned sheet are silently dropped at replay
+    ///   per the new `is_sheet_removed` check in `apply_op`.
+    /// - `renameSheet` on a tombstoned sheet currently SUCCEEDS at the
+    ///   replay layer (renames the underlying Sheet; user-visible if the
+    ///   tombstone is later cleared -- which V3.5.0.3b does NOT support).
+    ///   V3.6+ may add explicit rejection if tombstone-rename ambiguity
+    ///   surfaces as a user-facing concern.
+    ///
+    /// **Formula references to deleted sheets**: V3.5.0.3b leaves
+    /// formula text intact (`=SheetN!A1` keeps pointing at the tombstoned
+    /// sheet).  V3.6+ may extend `repair_sheet_rename_chain` to rewrite
+    /// these as `#REF!` per xlsx/Sheets convention.  Today the deleted
+    /// sheet's cells are unreachable via snapshot but the formula text
+    /// referencing them stays as a string in cells that survive on
+    /// other sheets.
+    ///
+    /// **Restore**: NOT supported at V3.5.0.3b.  Cell storage is
+    /// preserved internally but no `restoreSheet` napi exists.  V3.6+
+    /// may add this if user-facing undo-delete is needed.
+    ///
+    /// # Errors
+    ///
+    /// - `[bad_argument]` if `id` exceeds u16 range OR refers to a
+    ///   sheet id that does NOT exist in the current workbook.
+    /// - `[session_oplog]` for op-log append failure.
+    /// - `[session_replay]` if the pre-delete rebuild_workbook fails.
+    #[napi(js_name = "deleteSheet")]
+    pub fn delete_sheet(&self, id: u32) -> Result<()> {
+        if id > u16::MAX as u32 {
+            return Err(bad_argument_error(format!(
+                "deleteSheet: id must be in [0, 65535] (u16::MAX), got {id}"
+            )));
+        }
+        let sheet_id = id as u16;
+        let mut inner = self.inner.lock();
+        // Pre-delete existence check via rebuild_workbook.  O(N) replay;
+        // matches the renameSheet cost pattern (V3.5.0.6+ may eliminate
+        // via a session-level cache of sheet id existence).
+        let registry = default_registry();
+        let (workbook, _report) = inner
+            .rebuild_workbook(&registry)
+            .map_err(collab_session_error_to_napi)?;
+        if (sheet_id as usize) >= workbook.sheet_count() {
+            return Err(bad_argument_error(format!(
+                "deleteSheet: id {id} does not exist (workbook has {} sheets)",
+                workbook.sheet_count()
+            )));
+        }
+        // Note: already-tombstoned sheet is NOT a bad_argument (CRDT
+        // idempotency; the resulting Op::RemoveSheet replay is a no-op).
+        let op = Op::RemoveSheet { id: sheet_id };
+        inner.append_op(op).map_err(collab_session_error_to_napi)?;
+        Ok(())
+    }
+
     #[napi(js_name = "appendPutValue")]
     pub fn append_put_value(&self, sheet: u16, row: f64, col: f64, value: f64) -> Result<()> {
         // Validate row + col: finite, non-negative, integer, in u32 range.
@@ -1296,6 +1371,15 @@ impl CollabSession {
         let sheet_count = workbook.sheet_count();
         let mut sheets: Vec<SheetSnapshotJson> = Vec::with_capacity(sheet_count);
         for sheet_id in 0u16..(sheet_count as u16) {
+            // **V3.5.0.3b (2026-05-24)**: filter tombstoned sheets per
+            // the CRDT semantic decision lock.  Op::RemoveSheet marks
+            // the sheet id as tombstoned (preserves id slot for id-
+            // stability of subsequent ops); workbookSnapshot must skip
+            // tombstoned slots so the IDE renderer doesn't surface
+            // deleted sheets.
+            if workbook.is_sheet_removed(sheet_id) {
+                continue;
+            }
             // Sheet name from the materialized workbook (carries the
             // last RenameSheet effect; pre-rename names are NOT
             // surfaced).

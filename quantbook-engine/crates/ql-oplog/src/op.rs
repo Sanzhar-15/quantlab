@@ -130,6 +130,45 @@ pub enum Op {
         new_name: String,
     },
 
+    /// **Phase 5.7 V3.5.0.3b (2026-05-24):** mark an existing sheet as
+    /// REMOVED (tombstone) without shifting subsequent sheet ids.  CRDT
+    /// semantic per V3.5.0.3b decision lock:
+    ///
+    /// - **Why tombstone, not hard delete**: hard-deleting (removing
+    ///   from `Workbook.sheets` and shifting subsequent ids) would
+    ///   break every post-delete `Op::PutValue { sheet: 5, ... }` that
+    ///   references the sheet by id.  Tombstone preserves id stability
+    ///   so all subsequent ops keep their referent.
+    ///
+    /// - **Idempotent under concurrent delete**: two peers concurrently
+    ///   removing the same sheet is a no-op for the second op (the
+    ///   sheet is already in `removed_sheets`).  Apply_op silently
+    ///   succeeds; cross-peer convergence preserved.
+    ///
+    /// - **Write to tombstoned sheet -> silent no-op**: `Op::PutValue`
+    ///   / `Op::PutFormula` / `Op::ClearFormula` apply_op handlers check
+    ///   `workbook.is_sheet_removed(sheet)` after `validate_cell` and
+    ///   return `Ok(())` without writing.  Concurrent {PutValue, RemoveSheet}
+    ///   with PutValue replaying FIRST writes the cell then tombstones
+    ///   the sheet (cell unreachable via snapshot); with RemoveSheet
+    ///   FIRST silently drops the PutValue.  Deterministic causal-merge
+    ///   order resolves; all peers converge to the same final state.
+    ///
+    /// - **Formula references to tombstoned sheets**: V3.5.0.3b ship
+    ///   leaves formula text intact (no `#REF!` substitution).  V3.6+
+    ///   may extend `repair_sheet_rename_chain` to rewrite cross-sheet
+    ///   formula references as `#REF!` per xlsx/Sheets convention.
+    ///
+    /// - **Restore / un-delete**: not supported at V3.5.0.3b.  Cell
+    ///   data for tombstoned sheets remains in storage but is not
+    ///   user-accessible.  V3.6+ may add `Op::RestoreSheet` if a
+    ///   user-facing undo-delete flow is justified.
+    ///
+    /// Wire format is additive (new variant on the serde-tagged enum);
+    /// no `OPLOG_SCHEMA_VERSION` bump needed.  Pre-V3.5.0.3b saved
+    /// .qbook files load cleanly + replay without seeing this variant.
+    RemoveSheet { id: SheetId },
+
     /// Register a format string at a specific id. Mirrors
     /// `FormatTable::register_at`. Emitted when
     /// `WorkbookRuntime::intern_format` allocates a NEW id; idempotent

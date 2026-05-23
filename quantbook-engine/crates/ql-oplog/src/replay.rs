@@ -402,6 +402,19 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             value,
         } => {
             validate_cell(workbook, *sheet, *row, *col, index)?;
+            // **Phase 5.7 V3.5.0.3b (2026-05-24)**: silent no-op on
+            // tombstoned sheets per the CRDT semantic decision lock.
+            // Concurrent {PutValue, RemoveSheet} ordering:
+            //   - PutValue first -> writes cell, then RemoveSheet
+            //     tombstones (cell stays in storage; unreachable via
+            //     snapshot which filters tombstones).
+            //   - RemoveSheet first -> PutValue silently dropped (this
+            //     branch).
+            // All peers converge to the same final state by Loro's
+            // deterministic causal-merge order.
+            if workbook.is_sheet_removed(*sheet) {
+                return Ok(());
+            }
             let v: Value = value
                 .to_value()
                 .map_err(|source| ReplayError::ValueDecode { index, source })?;
@@ -415,6 +428,10 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             text,
         } => {
             validate_cell(workbook, *sheet, *row, *col, index)?;
+            // V3.5.0.3b: silent no-op on tombstoned sheet (see Op::PutValue).
+            if workbook.is_sheet_removed(*sheet) {
+                return Ok(());
+            }
             workbook.put_formula(*sheet, *row, *col, text.as_str());
             Ok(())
         }
@@ -422,6 +439,10 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             // clear_formula is idempotent on missing entries; we still
             // validate bounds so a corrupted op-log can't sneak past.
             validate_cell(workbook, *sheet, *row, *col, index)?;
+            // V3.5.0.3b: silent no-op on tombstoned sheet (see Op::PutValue).
+            if workbook.is_sheet_removed(*sheet) {
+                return Ok(());
+            }
             workbook.clear_formula(*sheet, *row, *col);
             Ok(())
         }
@@ -622,6 +643,34 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
                     }
                 }
             }
+        }
+        Op::RemoveSheet { id } => {
+            // **Phase 5.7 V3.5.0.3b (2026-05-24)**: tombstone the sheet
+            // at `*id`.  Per the V3.5.0.3b CRDT semantic decision lock
+            // (documented at op.rs Op::RemoveSheet docstring):
+            //
+            // - Idempotent: re-removing an already-tombstoned sheet is
+            //   a no-op (HashSet semantics in workbook.remove_sheet).
+            //
+            // - Out-of-range ids: silently ignored.  A peer that hasn't
+            //   seen the corresponding `Op::AddSheet` might still see
+            //   another peer's `Op::RemoveSheet` for the (not-yet-
+            //   created) id; deterministic causal-merge order will
+            //   eventually replay AddSheet before RemoveSheet, but the
+            //   strict-error-on-missing approach would break the merge.
+            //   `Workbook::remove_sheet` enforces the no-op behavior
+            //   internally.
+            //
+            // - Storage retained: tombstoning does NOT free the
+            //   underlying `Sheet` storage.  Sheet stays at sheets[id]
+            //   for id-stability of subsequent cell-keyed ops.
+            //
+            // No CRDT auto-disambiguate dance is needed here (unlike
+            // AddSheet's D-2 collision resolver and RenameSheet's
+            // HIGH-1 disambiguation), because remove has no "target
+            // name" to collide on.
+            workbook.remove_sheet(*id);
+            Ok(())
         }
         Op::RegisterFormat { id, string } => {
             // **W5-80:** route through `FormatTable::register_at` so

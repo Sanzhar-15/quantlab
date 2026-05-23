@@ -7,7 +7,7 @@
 //!   binder in `ql-exec` resolves names against this table at bind time.
 //!   Sheet-scope names land Phase 3+ with `ql-formula-semantics`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ql_types::{Address, ColId, ErrorValue, Range, RowId, SheetId, Value};
@@ -339,6 +339,29 @@ pub struct Workbook {
     /// eval layer only) — the persistent home is now the workbook.
     /// See Phase 4.9 design doc § 1 + § 3.2.
     locale: ql_types::Locale,
+    /// **Phase 5.7 V3.5.0.3b (2026-05-24):** tombstoned sheet ids per
+    /// the V3.5.0.3b CRDT semantic decision lock.  `Op::RemoveSheet { id }`
+    /// inserts `id` into this set instead of mutating `sheets`; this
+    /// preserves the id-stability invariant that all post-RemoveSheet
+    /// ops (PutValue/PutFormula/ClearFormula/RenameSheet) depend on
+    /// (they reference sheets by id, not by position).
+    ///
+    /// **Idempotent**: re-removing an already-tombstoned sheet is a
+    /// no-op (HashSet semantics).  Cross-peer concurrent
+    /// `Op::RemoveSheet` on the same id converges deterministically.
+    ///
+    /// **Snapshot filter**: callers iterating sheets MUST check
+    /// `is_sheet_removed(id)` to skip tombstoned slots.  The napi
+    /// `workbookSnapshot` method does this at V3.5.0.3b ship.
+    ///
+    /// **Storage retained**: tombstoning does NOT free the underlying
+    /// `Sheet` storage at `sheets[id]`.  The Sheet stays in place
+    /// (preserving id stability for subsequent ops); cell data is
+    /// reachable via `sheet(id)` even when tombstoned (caller's
+    /// responsibility to honor the tombstone).  V3.6+ may add a
+    /// reclamation pass that compacts truly-orphaned sheet storage
+    /// once the op log is also purged of references.
+    removed_sheets: HashSet<SheetId>,
 }
 
 impl Workbook {
@@ -678,6 +701,32 @@ impl Workbook {
 
     pub fn sheet_mut(&mut self, id: SheetId) -> Option<&mut Sheet> {
         self.sheets.get_mut(id as usize)
+    }
+
+    /// **Phase 5.7 V3.5.0.3b (2026-05-24):** mark `id` as tombstoned.
+    /// Idempotent (re-removing is a no-op).  Does NOT free the
+    /// underlying `Sheet` storage -- the sheet stays at `sheets[id]`
+    /// to preserve id stability for subsequent ops that reference it
+    /// by id.
+    ///
+    /// **Out-of-range ids**: `id >= sheet_count()` is silently ignored
+    /// (no error).  This matches CRDT idempotency: a peer that hasn't
+    /// seen an `Op::AddSheet` might still see a peer's `Op::RemoveSheet`
+    /// for that id; the local replay drops it.  Strict callers can
+    /// pre-check via `id < sheet_count()`.
+    ///
+    /// Use [`Self::is_sheet_removed`] to check tombstone status.
+    pub fn remove_sheet(&mut self, id: SheetId) {
+        if (id as usize) < self.sheets.len() {
+            self.removed_sheets.insert(id);
+        }
+    }
+
+    /// **Phase 5.7 V3.5.0.3b (2026-05-24):** check if `id` is tombstoned.
+    /// Returns `false` for ids that don't exist in `sheets` (out-of-range
+    /// or never-created).
+    pub fn is_sheet_removed(&self, id: SheetId) -> bool {
+        self.removed_sheets.contains(&id)
     }
 
     // ===== W5-101 (Phase 4.7.H) spill-anchor API =====
