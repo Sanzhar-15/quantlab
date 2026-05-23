@@ -219,6 +219,38 @@ export interface CollabSessionInstance {
 	 */
 	deleteSheet(id: number): void;
 
+	/**
+	 * **Phase 5.7 V3.5.0.3c (2026-05-24)** -- append an `Op::MoveSheet`
+	 * to this session (reorder sheet's display position; id stays
+	 * stable).
+	 *
+	 * **CRDT semantic (V3.5.0.3c decision lock)**: display-order
+	 * overlay -- the underlying `Workbook.sheets` vec is UNCHANGED;
+	 * only a separate `sheet_display_order: Vec<SheetId>` is mutated.
+	 * Subsequent ops referencing the moved sheet by id keep landing
+	 * on the correct sheet (id stability preserved like V3.5.0.3b
+	 * tombstone).
+	 *
+	 * **`newIndex` semantics**: 0-based position in the post-move
+	 * display order.  Out-of-range values clamp to end (CRDT
+	 * idempotency).
+	 *
+	 * **Move-tombstoned-sheet**: silently applies (display order
+	 * remembers the user's intent even for deleted sheets; snapshot
+	 * filters tombstones after display-order resolution).
+	 *
+	 * **workbookSnapshot**: iterates `sheet_display_order` so the
+	 * IDE renderer sees sheets in the user's reorder order.
+	 *
+	 * Use the typed wrapper {@link moveSheet} from `./session`.
+	 *
+	 * @throws `[bad_argument]` if `id` exceeds u16 range OR refers to
+	 *         a non-existent sheet.  `newIndex >= sheet_count` is OK
+	 *         (clamped at replay time).  Tombstoned sheets are OK.
+	 * @throws `[session_oplog]` / `[session_replay]` per engine errors.
+	 */
+	moveSheet(id: number, newIndex: number): void;
+
 	/** Full snapshot export. Use for initial sync / handshake. */
 	exportBytes(): Uint8Array;
 

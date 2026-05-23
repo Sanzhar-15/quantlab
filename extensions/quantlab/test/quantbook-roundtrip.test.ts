@@ -59,6 +59,7 @@ import {
 	isQuantbookErrorCode,
 	listSheets,
 	loopbackTransportPair,
+	moveSheet,
 	parseQuantbookError,
 	peerPresence,
 	peersWithPresence,
@@ -4800,4 +4801,213 @@ suite('quantbook V3.5.0.3b -- deleteSheet napi contract', function () {
 		assert.strictEqual(snap.sheets[0].name, 'B-renamed');
 	});
 });
+
+// ============================================================================
+// Phase 5.7 V3.5.0.3c (2026-05-24) -- moveSheet napi + Op::MoveSheet
+// ============================================================================
+// V3.5.0.3c CRDT semantic decision lock: display-order overlay (id
+// stays stable; only Workbook.sheet_display_order is mutated).  Closes
+// V3.5.0.3 D4 (a/b/c all shipped).
+
+suite('quantbook V3.5.0.3c -- moveSheet napi contract', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('move emits Op::MoveSheet (op count grows by 1)', () => {
+		const session = createSession(7901n);
+		addSheet(session, 'A');
+		addSheet(session, 'B');
+		const before = session.opCount();
+		moveSheet(session, 1, 0);
+		assert.strictEqual(session.opCount(), before + 1,
+			'one moveSheet call appends exactly one op');
+	});
+
+	test('snapshot reflects display-order reordering', () => {
+		const session = createSession(7902n);
+		addSheet(session, 'A');  // id 0
+		addSheet(session, 'B');  // id 1
+		addSheet(session, 'C');  // id 2
+		// Default display order: [0, 1, 2] -> names [A, B, C].
+		assert.deepStrictEqual(workbookSnapshot(session).sheets.map(s => s.name),
+			['A', 'B', 'C']);
+		// Move id 2 to index 0 -> display order [2, 0, 1].
+		moveSheet(session, 2, 0);
+		assert.deepStrictEqual(workbookSnapshot(session).sheets.map(s => s.id),
+			[2, 0, 1], 'sheet 2 now first in display order');
+		assert.deepStrictEqual(workbookSnapshot(session).sheets.map(s => s.name),
+			['C', 'A', 'B']);
+	});
+
+	test('id stability: cells reachable by id after move', () => {
+		const session = createSession(7903n);
+		addSheet(session, 'A');
+		addSheet(session, 'B');
+		appendPutValueValidated(session, 1, 0, 0, 42);  // write to sheet 1
+		// Move sheet 1 to position 0.
+		moveSheet(session, 1, 0);
+		// Subsequent PutValue on sheet 1 still reaches the same sheet
+		// (id stability preserved).
+		appendPutValueValidated(session, 1, 1, 0, 99);
+		const snap = workbookSnapshot(session);
+		// Find sheet by id (display position is 0 now).
+		const sheet1 = snap.sheets.find(s => s.id === 1);
+		assert.ok(sheet1 !== undefined);
+		assert.strictEqual(sheet1!.name, 'B');
+		assert.strictEqual(sheet1!.cells.length, 2,
+			'pre- and post-move writes to sheet 1 land on the same sheet');
+	});
+
+	test('multi-move sequence: each apply_op moves from CURRENT position', () => {
+		const session = createSession(7904n);
+		addSheet(session, 'A');  // id 0
+		addSheet(session, 'B');  // id 1
+		addSheet(session, 'C');  // id 2
+		addSheet(session, 'D');  // id 3
+		// Start: [0, 1, 2, 3]
+		moveSheet(session, 3, 0);  // [3, 0, 1, 2]
+		moveSheet(session, 1, 0);  // [1, 3, 0, 2]
+		moveSheet(session, 0, 3);  // [1, 3, 2, 0]
+		const snap = workbookSnapshot(session);
+		assert.deepStrictEqual(snap.sheets.map(s => s.id), [1, 3, 2, 0]);
+		assert.deepStrictEqual(snap.sheets.map(s => s.name), ['B', 'D', 'C', 'A']);
+	});
+
+	test('new_index out of range clamps to end (CRDT idempotency)', () => {
+		const session = createSession(7905n);
+		addSheet(session, 'A');  // id 0
+		addSheet(session, 'B');  // id 1
+		addSheet(session, 'C');  // id 2
+		// Move id 0 to absurd index 999 -> clamps to len (which after
+		// remove is 2, so insert at 2 = end).  Result: [1, 2, 0].
+		moveSheet(session, 0, 999);
+		const snap = workbookSnapshot(session);
+		assert.deepStrictEqual(snap.sheets.map(s => s.id), [1, 2, 0],
+			'out-of-range new_index clamps to end');
+	});
+
+	test('move-to-same-position is a no-op for display order', () => {
+		const session = createSession(7906n);
+		addSheet(session, 'A');
+		addSheet(session, 'B');
+		// Move id 1 to its current position 1 -> display order unchanged [0, 1].
+		moveSheet(session, 1, 1);
+		const snap = workbookSnapshot(session);
+		assert.deepStrictEqual(snap.sheets.map(s => s.id), [0, 1]);
+	});
+
+	test('move with id > u16::MAX -> bad_argument', () => {
+		const session = createSession(7907n);
+		addSheet(session, 'S');
+		try {
+			moveSheet(session, 70000, 0);
+			assert.fail('expected throw for id > u16::MAX');
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			assert.strictEqual(info.code, 'bad_argument');
+			assert.ok(info.message.includes('65535'),
+				`expected u16 range message, got: ${info.message}`);
+		}
+	});
+
+	test('move non-existent sheet id -> bad_argument', () => {
+		const session = createSession(7908n);
+		addSheet(session, 'OnlyOne');
+		try {
+			moveSheet(session, 5, 0);
+			assert.fail('expected throw for non-existent sheet');
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			assert.strictEqual(info.code, 'bad_argument');
+			assert.ok(info.message.includes('does not exist'),
+				`expected existence-check message, got: ${info.message}`);
+		}
+	});
+
+	test('cross-peer move via mergeBytes converges (deterministic last-write-wins)', () => {
+		// Peer A creates sheets + moves sheet 2 to position 0; peer B
+		// merges A's snapshot; peer B sees A's reorder.
+		const sessA = createSession(7909n);
+		addSheet(sessA, 'A0');
+		addSheet(sessA, 'A1');
+		addSheet(sessA, 'A2');
+		moveSheet(sessA, 2, 0);  // A's display: [2, 0, 1]
+
+		const sessB = createSession(7910n);
+		sessB.mergeBytes(sessA.exportBytes());
+
+		const snapB = workbookSnapshot(sessB);
+		assert.deepStrictEqual(snapB.sheets.map(s => s.id), [2, 0, 1],
+			'peer B sees A\'s reorder after merge');
+	});
+
+	test('move + delete interaction: tombstoned sheet does not surface even if moved', () => {
+		const session = createSession(7911n);
+		addSheet(session, 'A');  // id 0
+		addSheet(session, 'B');  // id 1
+		addSheet(session, 'C');  // id 2
+		// Move sheet 0 to position 2: [1, 2, 0].
+		moveSheet(session, 0, 2);
+		// Delete sheet 0 (which is at display position 2).
+		deleteSheet(session, 0);
+		const snap = workbookSnapshot(session);
+		assert.strictEqual(snap.sheets.length, 2,
+			'tombstoned sheet filtered out of moved-display-order');
+		assert.deepStrictEqual(snap.sheets.map(s => s.id), [1, 2],
+			'remaining sheets keep their post-move relative order');
+		assert.deepStrictEqual(snap.sheets.map(s => s.name), ['B', 'C']);
+	});
+
+	test('move-tombstoned-sheet silently applies (display order remembers intent)', () => {
+		const session = createSession(7912n);
+		addSheet(session, 'A');
+		addSheet(session, 'B');
+		deleteSheet(session, 0);  // tombstone sheet 0
+		// Move tombstoned sheet 0 to position 1 -- silent apply at replay
+		// time; napi succeeds (id is valid -- the tombstone-check is NOT
+		// in the napi validation per the V3.5.0.3c CRDT contract).
+		moveSheet(session, 0, 1);
+		// workbookSnapshot still filters tombstones; only sheet 1 visible.
+		const snap = workbookSnapshot(session);
+		assert.strictEqual(snap.sheets.length, 1);
+		assert.strictEqual(snap.sheets[0].id, 1);
+	});
+
+	test('round-trip via .qbook preserves display order', () => {
+		const session = createSession(7913n);
+		addSheet(session, 'X');  // id 0
+		addSheet(session, 'Y');  // id 1
+		addSheet(session, 'Z');  // id 2
+		moveSheet(session, 0, 2);  // [1, 2, 0]
+		appendPutValueValidated(session, 0, 0, 0, 1);
+
+		const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qbook-v3503c-'));
+		const target = path.join(scratchDir, 'reorder.qbook');
+		try {
+			exportToQbook(session, target);
+			const reloaded = sessionFromQbook(target, 9999n);
+			const snap = workbookSnapshot(reloaded);
+			assert.deepStrictEqual(snap.sheets.map(s => s.id), [1, 2, 0],
+				'.qbook round-trip preserves display order through replay');
+			assert.deepStrictEqual(snap.sheets.map(s => s.name), ['Y', 'Z', 'X']);
+		} finally {
+			try { fs.rmSync(scratchDir, { recursive: true, force: true }); } catch { /* test cleanup */ }
+		}
+	});
+
+	test('default display order (no moves) matches addSheet order', () => {
+		// Regression pin for V3.5.0.3b compat: sessions that never call
+		// moveSheet see display order = [0, 1, ..., N-1] in append order.
+		const session = createSession(7914n);
+		addSheet(session, 'First');
+		addSheet(session, 'Second');
+		addSheet(session, 'Third');
+		const snap = workbookSnapshot(session);
+		assert.deepStrictEqual(snap.sheets.map(s => s.id), [0, 1, 2],
+			'default display order is identical to V3.5.0.3b iteration order');
+	});
+});
+
 

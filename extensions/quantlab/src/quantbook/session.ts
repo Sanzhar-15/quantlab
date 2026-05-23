@@ -199,6 +199,23 @@ export function deleteSheet(session: CollabSessionInstance, id: number): void {
 }
 
 /**
+ * **Phase 5.7 V3.5.0.3c (2026-05-24) -- typed wrapper for
+ * `CollabSession.moveSheet`.**
+ *
+ * Reorder sheet's display position via a display-order overlay (id
+ * stays stable; underlying Sheet storage unchanged).  See engine napi
+ * docstring (mirrored in {@link CollabSessionInstance.moveSheet}) for
+ * the CRDT semantic (display overlay; out-of-range new_index clamps;
+ * move-on-tombstoned-sheet silently applies).
+ *
+ * Single-line indirection mirrors addSheet / renameSheet / deleteSheet /
+ * workbookSnapshot for API surface stability.
+ */
+export function moveSheet(session: CollabSessionInstance, id: number, newIndex: number): void {
+	session.moveSheet(id, newIndex);
+}
+
+/**
  * **Phase 5.7 V3.5.0.2 (2026-05-24) -- typed wrapper for
  * `CollabSession.workbookSnapshot`.**
  *
