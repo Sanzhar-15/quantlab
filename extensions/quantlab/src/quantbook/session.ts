@@ -29,6 +29,7 @@ import type {
 	AutoFlushPolicy,
 	CollabSessionInstance,
 	LoopbackPairInstance,
+	PresenceStateJson,
 	QuantbookCellSnapshot,
 	QuantbookErrorCode,
 	QuantbookErrorInfo,
@@ -213,6 +214,73 @@ export function undo(session: CollabSessionInstance): boolean {
  */
 export function redo(session: CollabSessionInstance): boolean {
 	return session.redo();
+}
+
+// ============================================================================
+// Phase 5.7 V3.4.0.5 (2026-05-23) -- presence typed wrappers (engine napi only)
+// ============================================================================
+
+/**
+ * **Phase 5.7 V3.4.0.5 (2026-05-23) -- typed wrapper for
+ * `CollabSession.updatePresence`.**
+ *
+ * Writes this session's own presence state into the shared LoroMap.
+ * Subsequent calls overwrite per-peer (LWW).  Auto-flush per
+ * `setAutoFlushPolicy` if a transport is attached.
+ */
+export function updatePresence(session: CollabSessionInstance, state: PresenceStateJson): void {
+	session.updatePresence(state);
+}
+
+/**
+ * **Phase 5.7 V3.4.0.5 (2026-05-23) -- typed wrapper for
+ * `CollabSession.peerPresence`.**
+ *
+ * Returns the peer's most recent presence state, or `null` if the
+ * peer has never updated (or was removed via {@link clearPresence}
+ * / {@link sweepPresence}).
+ */
+export function peerPresence(session: CollabSessionInstance, peer: bigint): PresenceStateJson | null {
+	return session.peerPresence(peer);
+}
+
+/**
+ * **Phase 5.7 V3.4.0.5 (2026-05-23) -- typed wrapper for
+ * `CollabSession.clearPresence`.**
+ *
+ * Removes THIS session's own presence entry.  Other peers'
+ * `peerPresence(selfId)` returns `null` after.
+ */
+export function clearPresence(session: CollabSessionInstance): void {
+	session.clearPresence();
+}
+
+/**
+ * **Phase 5.7 V3.4.0.5 (2026-05-23) -- typed wrapper for
+ * `CollabSession.sweepPresence`.**
+ *
+ * Removes ALL presence entries.  Returns the count of peers removed.
+ * Use after {@link sessionFromSnapshot} for "rejoin with clean
+ * presence" (presence persists in the LoroDoc snapshot per V1
+ * limitation).
+ */
+export function sweepPresence(session: CollabSessionInstance): number {
+	return session.sweepPresence();
+}
+
+/**
+ * **Phase 5.7 V3.4.0.5 (2026-05-23) -- typed wrapper for
+ * `CollabSession.peersWithPresence`.**
+ *
+ * Returns the peer-id list (Loro iteration order; NOT sorted).
+ * Callers needing determinism should sort the returned array (BigInt
+ * comparison: `(a, b) => a < b ? -1 : a > b ? 1 : 0`).
+ *
+ * Use as the enumeration primitive: first call this, then call
+ * {@link peerPresence} per returned id.
+ */
+export function peersWithPresence(session: CollabSessionInstance): bigint[] {
+	return session.peersWithPresence();
 }
 
 // =====================================================================

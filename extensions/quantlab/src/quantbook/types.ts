@@ -31,6 +31,32 @@
  * bytes) surface as JS `Error` exceptions with the engine's error
  * message string.
  */
+
+/**
+ * **Phase 5.7 V3.4.0.5 (2026-05-23) -- JS-side mirror of the engine
+ * `PresenceState` struct.**
+ *
+ * All fields are required.  Cursor coords are `(sheet, row, col)`;
+ * selection-rectangle opposite corner is `(selectionEndRow,
+ * selectionEndCol)`.  When no range is selected, set `selectionEnd*`
+ * to match the cursor coords (collapsed selection).
+ *
+ * `typing` is a soft hint for IDE cursor styling (true while peer is
+ * mid-edit, e.g., formula bar focused or in-cell edit mode).
+ *
+ * Engine pairs this type with napi conversion at the FFI boundary
+ * (`crates/ql-bindings-node/src/lib.rs` `PresenceStateJson` struct +
+ * `From<CorePresenceState>` impls).
+ */
+export interface PresenceStateJson {
+	sheet: number;
+	row: number;
+	col: number;
+	selectionEndRow: number;
+	selectionEndCol: number;
+	typing: boolean;
+}
+
 export interface CollabSessionInstance {
 	/**
 	 * V1 convenience: append a `PutValue` op with a numeric value.
@@ -160,6 +186,64 @@ export interface CollabSessionInstance {
 	 * Use the typed wrapper {@link redo} from `./session`.
 	 */
 	redo(): boolean;
+
+	// =====================================================================
+	// Phase 5.7 V3.4.0.5 (2026-05-23) -- presence surface (engine napi only)
+	// IDE wiring (cell-grid decoration, sweep cadence, race guard) lands in
+	// V3.4.0.5 IDE follow-up.
+	// =====================================================================
+
+	/**
+	 * Write this session's own presence state into the shared LoroMap.
+	 *
+	 * Uses the session's PeerId as the map key (16-hex Display form).
+	 * Subsequent calls overwrite the prior value (LWW per peer); merges
+	 * with other peers' presence writes preserve all distinct peers.
+	 *
+	 * Use the typed wrapper {@link updatePresence} from `./session`.
+	 */
+	updatePresence(state: PresenceStateJson): void;
+
+	/**
+	 * Read a peer's most recent presence state.
+	 *
+	 * Returns `null` if the peer has never updated presence in this
+	 * session (or was removed via {@link clearPresence} /
+	 * {@link sweepPresence}).
+	 */
+	peerPresence(peer: bigint): PresenceStateJson | null;
+
+	/**
+	 * Remove this session's own presence entry from the shared map.
+	 *
+	 * Use when the peer leaves the session (window close, disconnect).
+	 * After removal, other peers' `peerPresence(selfId)` returns `null`.
+	 */
+	clearPresence(): void;
+
+	/**
+	 * Remove ALL presence entries from the shared map.  Returns the
+	 * count of peers removed.
+	 *
+	 * V1 contract: sweeps every entry unconditionally (no threshold).
+	 * Use after {@link fromSnapshot} for "rejoin with clean presence":
+	 * presence persists in the LoroDoc snapshot (V1 known limitation).
+	 *
+	 * Auto-flush triggers ONCE after the batch removal (not per-key).
+	 */
+	sweepPresence(): number;
+
+	/**
+	 * Enumerate peer-ids that have presence entries.
+	 *
+	 * Iteration order is Loro-internal (NOT guaranteed sorted).
+	 * Callers needing determinism should `.sort((a, b) => a < b ? -1 :
+	 * a > b ? 1 : 0)` (BigInt comparison).
+	 *
+	 * Use as the enumeration primitive for "who's here" panels: first
+	 * call this, then call {@link peerPresence} per returned id.
+	 */
+	peersWithPresence(): bigint[];
 
 	// =====================================================================
 	// Phase 5.7 V2.1 (2026-05-22) -- Transport surface (sync portion)

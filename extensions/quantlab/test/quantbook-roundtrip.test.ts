@@ -45,6 +45,7 @@ import {
 } from '../src/quantbook/loader';
 import {
 	appendPutValueValidated,
+	clearPresence,
 	createSession,
 	exportCellSnapshot,
 	isAutoFlushPolicy,
@@ -52,10 +53,14 @@ import {
 	listSheets,
 	loopbackTransportPair,
 	parseQuantbookError,
+	peerPresence,
+	peersWithPresence,
 	quantbookEngineVersion,
 	redo,
 	sessionFromSnapshot,
+	sweepPresence,
 	undo,
+	updatePresence,
 } from '../src/quantbook/session';
 import type {
 	BlockingTransportFixtureConstructor,
@@ -3542,5 +3547,144 @@ suite('quantbook V3.4.0.3 -- buildHtml inline script wiring for undo/redo keybin
 			'undo wiring absent in V3.2.a-compat read-only mode');
 		assert.ok(!html.includes('vscode.postMessage({ type: \'redo\' })'),
 			'redo wiring absent in V3.2.a-compat read-only mode');
+	});
+});
+
+// ============================================================================
+// Phase 5.7 V3.4.0.5 -- presence napi wrappers (engine-side only)
+// ============================================================================
+//
+// V3.4.0.5 engine-only ship: napi wrappers over Phase 5.6 V1+V2 presence
+// methods on CollabSession.  IDE wiring (cell-grid decoration, sweep cadence,
+// presenceRepaintInFlight race guard per V3.4.0.1 D4) deferred to V3.4.0.5
+// IDE follow-up.  These tests pin the napi contract.
+
+suite('quantbook V3.4.0.5 -- presence napi round-trips', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	function sampleState(sheet = 0, row = 3, col = 4) {
+		return {
+			sheet,
+			row,
+			col,
+			selectionEndRow: row,
+			selectionEndCol: col,
+			typing: false,
+		};
+	}
+
+	test('updatePresence + peerPresence round-trip preserves all fields', () => {
+		const session = createSession(3501n);
+		const state = { sheet: 2, row: 7, col: 11, selectionEndRow: 9, selectionEndCol: 15, typing: true };
+		updatePresence(session, state);
+
+		const fetched = peerPresence(session, session.peerId());
+		assert.ok(fetched !== null, 'peerPresence returns the just-updated state');
+		assert.deepStrictEqual(fetched, state, 'all 6 fields round-trip lossless');
+	});
+
+	test('peerPresence on never-updated peer returns null', () => {
+		const session = createSession(3502n);
+		// Different peer id than session's own; never updated.
+		const result = peerPresence(session, 999n);
+		assert.strictEqual(result, null);
+	});
+
+	test('updatePresence overwrites prior state (LWW per peer)', () => {
+		const session = createSession(3503n);
+		updatePresence(session, sampleState(0, 1, 1));
+		updatePresence(session, sampleState(5, 50, 50));
+
+		const fetched = peerPresence(session, session.peerId());
+		assert.strictEqual(fetched?.sheet, 5);
+		assert.strictEqual(fetched?.row, 50);
+		assert.strictEqual(fetched?.col, 50);
+	});
+
+	test('clearPresence removes this session\'s entry; peerPresence returns null after', () => {
+		const session = createSession(3504n);
+		updatePresence(session, sampleState());
+		assert.ok(peerPresence(session, session.peerId()) !== null);
+
+		clearPresence(session);
+		assert.strictEqual(peerPresence(session, session.peerId()), null,
+			'after clearPresence, own entry is gone');
+	});
+
+	test('peersWithPresence enumerates updated peers (self after first update)', () => {
+		const session = createSession(3505n);
+		assert.deepStrictEqual(peersWithPresence(session), [],
+			'no peers before any update');
+
+		updatePresence(session, sampleState());
+		const peers = peersWithPresence(session);
+		assert.strictEqual(peers.length, 1);
+		assert.strictEqual(peers[0], session.peerId());
+	});
+
+	test('peersWithPresence reflects cross-peer merges (round-trip via exportBytes)', () => {
+		// Two sessions, each updates own presence; A merges B's snapshot;
+		// A's peersWithPresence enumerates both peers.
+		const sessA = createSession(3506n);
+		const sessB = createSession(3507n);
+		updatePresence(sessA, sampleState(0, 1, 1));
+		updatePresence(sessB, sampleState(0, 9, 9));
+
+		// A learns about B by merging B's snapshot bytes.
+		sessA.mergeBytes(sessB.exportBytes());
+
+		const peers = peersWithPresence(sessA).slice().sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+		assert.deepStrictEqual(peers, [3506n, 3507n], 'both peers visible after merge');
+
+		// Cross-fetch: A can read B's presence state.
+		const bState = peerPresence(sessA, 3507n);
+		assert.ok(bState !== null);
+		assert.strictEqual(bState?.row, 9);
+		assert.strictEqual(bState?.col, 9);
+	});
+
+	test('sweepPresence on empty session returns 0', () => {
+		const session = createSession(3508n);
+		assert.strictEqual(sweepPresence(session), 0,
+			'no entries to sweep');
+	});
+
+	test('sweepPresence after multi-peer merge returns count + clears all entries', () => {
+		const sessA = createSession(3509n);
+		const sessB = createSession(3510n);
+		updatePresence(sessA, sampleState());
+		updatePresence(sessB, sampleState());
+		sessA.mergeBytes(sessB.exportBytes());
+		// Sanity: 2 peers present pre-sweep.
+		assert.strictEqual(peersWithPresence(sessA).length, 2);
+
+		const removed = sweepPresence(sessA);
+		assert.strictEqual(removed, 2, 'sweepPresence returns count of removed entries');
+		assert.deepStrictEqual(peersWithPresence(sessA), [],
+			'all peers gone after sweep');
+	});
+
+	test('presence persists across exportBytes/fromSnapshot (engine V1 known limitation)', () => {
+		// Engine docstring: presence lives in the same LoroDoc whose
+		// snapshot is wrapped into oplog.bin; cold restart restores
+		// stale presence entries.  Pin this behavior so future engine
+		// changes that fix this (V3.4.1+) will fail the test + force
+		// an explicit migration update.
+		const sessA = createSession(3511n);
+		updatePresence(sessA, sampleState(0, 42, 42));
+		const bytes = sessA.exportBytes();
+
+		const sessB = sessionFromSnapshot(3512n, bytes);
+		const preserved = peerPresence(sessB, 3511n);
+		assert.ok(preserved !== null,
+			'presence persists across snapshot round-trip (V1 limitation)');
+		assert.strictEqual(preserved?.row, 42);
+
+		// Caller-opt-in sweep restores clean slate.
+		sweepPresence(sessB);
+		assert.strictEqual(peerPresence(sessB, 3511n), null);
 	});
 });
