@@ -96,26 +96,56 @@ use ql_oplog::{replay_into, CellWireValue, Op, OpLog, OpLogError, PeerId, Replay
 ///   per V1 audit (enum of f64 / bool / String / String / unit; all
 ///   variants Send + Sync).
 /// - `formula: Option<String>`: `String` is `Send + Sync` trivially.
+/// - **`format: Option<FormatId>` (V3.5.0.5 addition, 2026-05-24)**:
+///   `FormatId` is `Builtin(u32) | Custom(PeerId, u32)` per D-1
+///   (Phase 5.2 step 4) -- `u32` is Send + Sync + Copy trivially;
+///   `PeerId(pub u64)` is Send + Sync + Copy trivially (newtype
+///   around u64).  Composition: `FormatId: Send + Sync + Copy`
+///   (enum of all-Copy variants).  `Option<FormatId>` is Send + Sync.
+///   **No new Rule 4 trigger**; arc terminus stays at 6.
 /// - Composition: `CellState: Send + Sync`.  Inherits external
 ///   synchronization from `Arc<Mutex<CollabSession>>` (V2.4 audit;
 ///   per-field walk in `ql-bindings-node/src/lib.rs::CollabSession`
 ///   docstring).
 ///
 /// **No new negative-trait claim introduced.**  Rule 4 arc terminus
-/// stays at 6.  V3.5+ may add `format: Option<FormatId>` -- the
-/// per-field walk will need re-running at that point because `FormatId`
-/// is a tagged enum (`Builtin(u32) | Custom(PeerId, u32)`) whose
-/// trait obligations were audited at D-1 (also Send + Sync per the
-/// step 8 megaudit).
+/// stays at 6 (V3.5.0.5 format field is a positive Send+Sync walk
+/// over D-1's tagged FormatId enum).
 ///
 /// **PartialEq** but NOT `Eq` because `CellWireValue` contains `f64`
 /// which doesn't implement `Eq` (NaN != NaN).  Tests can still use
 /// `assert_eq!`; that calls `PartialEq::eq` which is fine for non-NaN
-/// numeric comparisons.
+/// numeric comparisons.  `FormatId` is `Eq` so doesn't change the
+/// CellState's PartialEq-only property.
+///
+/// ## V3.5.0.5 per-field LWW semantics (extends V3.4.0.2)
+///
+/// - `Op::PutValue` writes `state.value`, preserves `formula` + `format`.
+/// - `Op::PutFormula` writes `state.formula`, preserves `value` + `format`.
+/// - `Op::ClearFormula` clears `state.formula`, preserves `value` + `format`.
+/// - **`Op::SetCellFormat { id: Some(_) }` writes `state.format`, preserves
+///   `value` + `formula`** (V3.5.0.5 new).
+/// - **`Op::SetCellFormat { id: None }` clears `state.format`, preserves
+///   `value` + `formula`** (V3.5.0.5 new; the W5-80 "clear overlay" semantic).
+///
+/// A cell can carry ANY combination of (value, formula, format).  E.g.,
+/// `state.value = Some(42.0); state.formula = Some("=A1+1"); state.format =
+/// Some(FormatId::Builtin(2))` is a formula-evaluated-to-42-rendered-as-
+/// number-with-2-decimals cell.
+///
+/// ## Ghost-entry avoidance (V3.5.0.5 extends V3.4.0.X MEDIUM-1)
+///
+/// When ALL THREE fields are `None` after an op, the cache key is
+/// REMOVED entirely (not left as an empty `CellState`).  Pre-V3.5.0.5
+/// this rule covered (value, formula); V3.5.0.5 extends it to include
+/// format -- otherwise a `SetCellFormat { id: None }` on a never-written
+/// cell would leave a phantom cache entry that surfaces in
+/// `list_sheets_from_cache`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CellState {
     pub value: Option<CellWireValue>,
     pub formula: Option<String>,
+    pub format: Option<FormatId>,
 }
 
 /// **Phase 5.7 V3.4.0.X HIGH-1 + MEDIUM-1 closure (2026-05-24)**: internal
@@ -132,8 +162,17 @@ enum CacheEffect {
     PutValue { key: (u16, u32, u32), value: CellWireValue },
     PutFormula { key: (u16, u32, u32), text: String },
     ClearFormula { key: (u16, u32, u32) },
+    /// **V3.5.0.5 (2026-05-24)**: cell-keyed format set/clear.
+    /// `format: Some(_)` writes `state.format`; `format: None` clears
+    /// it (per `Op::SetCellFormat`'s `Option<FormatIdWire>` contract).
+    /// Apply uses `get_mut` + skip-if-absent (ghost-entry avoidance,
+    /// analogous to ClearFormula); clearing on a never-written cell
+    /// is a no-op for the cache.  Formula-only-key removal extended:
+    /// if both `value` and `formula` AND `format` are None after the
+    /// apply, the entry is removed entirely.
+    SetCellFormat { key: (u16, u32, u32), format: Option<FormatId> },
 }
-use ql_storage::Workbook;
+use ql_storage::{FormatId, Workbook};
 
 use crate::presence::{self, PresenceError, PresenceState};
 use crate::repair::{
@@ -679,9 +718,16 @@ impl CollabSession {
         // `BatchCommit { PutValue, ClearFormula }` for atomicity) update
         // the cache.  V3.4.0.X MEDIUM-1 closure (single-lane Codex): after
         // ClearFormula clears `formula`, REMOVE the cache key entirely if
-        // both `value` and `formula` are `None` -- otherwise a formula-only
-        // cell clearing its formula leaves an empty CellState that surfaces
-        // in `list_sheets_from_cache`.
+        // ALL fields are `None` -- otherwise a formula-only cell clearing
+        // its formula leaves an empty CellState that surfaces in
+        // `list_sheets_from_cache`.
+        //
+        // **V3.5.0.5 (2026-05-24)**: adds a 4th cell-keyed variant
+        // `SetCellFormat { id: Option<FormatIdWire> }` to the cache
+        // walker.  `id: Some(_)` writes `state.format`; `id: None`
+        // clears it (mirroring ClearFormula's get_mut + skip-if-absent
+        // + extended all-three-fields-None ghost-entry removal).  See
+        // CacheEffect::SetCellFormat docstring for full semantics.
         //
         // We capture the cache-affecting fields BEFORE consuming `op` via
         // `self.log.append(op)` to avoid an unnecessary full-op clone
@@ -720,6 +766,14 @@ impl CollabSession {
             Op::ClearFormula { sheet, row, col } => out.push(CacheEffect::ClearFormula {
                 key: (*sheet, *row, *col),
             }),
+            // **V3.5.0.5 (2026-05-24)**: cell-keyed `SetCellFormat`
+            // joins the cache walker.  `id: Some(_)` -> set state.format;
+            // `id: None` -> clear state.format.  FormatIdWire is mapped
+            // to storage `FormatId` via `to_storage()` (lossless).
+            Op::SetCellFormat { sheet, row, col, id } => out.push(CacheEffect::SetCellFormat {
+                key: (*sheet, *row, *col),
+                format: id.map(|wire| wire.to_storage()),
+            }),
             Op::BatchCommit { ops } => {
                 for inner in ops {
                     Self::collect_cache_effects(inner, out);
@@ -749,15 +803,41 @@ impl CollabSession {
                 // clear).  Avoids ghost-sheet entries in
                 // `list_sheets_from_cache`.
                 //
-                // V3.4.0.X MEDIUM-1 closure: if BOTH value and formula
-                // are None after the clear (the cell was formula-only +
-                // we just removed its formula), DELETE the key so the
-                // empty CellState doesn't surface in
+                // V3.4.0.X MEDIUM-1 closure: if ALL fields (value,
+                // formula, format -- V3.5.0.5 adds format) are None
+                // after the clear, DELETE the key so the empty
+                // CellState doesn't surface in
                 // `list_sheets_from_cache` either.
                 if let Some(state) = snapshot.get_mut(&key) {
                     state.formula = None;
-                    if state.value.is_none() && state.formula.is_none() {
+                    if state.value.is_none() && state.formula.is_none() && state.format.is_none() {
                         snapshot.remove(&key);
+                    }
+                }
+            }
+            // **V3.5.0.5 (2026-05-24)**: cell-keyed format set/clear.
+            // Mirrors ClearFormula's ghost-entry-avoidance discipline:
+            // - `format: Some(_)` -> entry().or_default().format = Some(id)
+            //   (analogous to PutValue / PutFormula).
+            // - `format: None` -> get_mut + skip-if-absent (analogous
+            //   to ClearFormula).  If all three fields are None after,
+            //   remove the entry.
+            //
+            // CRDT per-cell LWW: concurrent `SetCellFormat` from two
+            // peers on the same cell converges via Loro's causal-merge
+            // iteration order (same invariant as PutValue / PutFormula).
+            CacheEffect::SetCellFormat { key, format } => {
+                match format {
+                    Some(id) => {
+                        snapshot.entry(key).or_default().format = Some(id);
+                    }
+                    None => {
+                        if let Some(state) = snapshot.get_mut(&key) {
+                            state.format = None;
+                            if state.value.is_none() && state.formula.is_none() && state.format.is_none() {
+                                snapshot.remove(&key);
+                            }
+                        }
                     }
                 }
             }
@@ -2441,6 +2521,31 @@ mod tests {
         Op::ClearFormula { sheet, row, col }
     }
 
+    /// **V3.5.0.5 test helper (2026-05-24)** -- mirrors `put_value` for
+    /// `Op::SetCellFormat` ops with a `Builtin(_)` format.  Use this
+    /// for the common case of setting a built-in Excel format id.
+    /// `id: None` -> clear (separate `clear_cell_format` helper).
+    fn set_cell_format_builtin(sheet: u16, row: u32, col: u32, builtin: u32) -> Op {
+        Op::SetCellFormat {
+            sheet,
+            row,
+            col,
+            id: Some(ql_oplog::wire::FormatIdWire::Builtin { id: builtin }),
+        }
+    }
+
+    /// **V3.5.0.5 test helper (2026-05-24)** -- emit a `Op::SetCellFormat`
+    /// with `id: None` (clears the cell's format).  Matches the W5-80
+    /// "clear overlay" semantic.
+    fn clear_cell_format(sheet: u16, row: u32, col: u32) -> Op {
+        Op::SetCellFormat {
+            sheet,
+            row,
+            col,
+            id: None,
+        }
+    }
+
     #[test]
     fn new_session_is_empty() {
         let s = CollabSession::new(PeerId::new(1)).unwrap();
@@ -3274,6 +3379,201 @@ mod tests {
             "undo of PutValue must not clobber prior PutFormula");
         assert_eq!(post.value, None,
             "undo of PutValue removes the value");
+    }
+
+    // ========================================================================
+    // V3.5.0.5 (2026-05-24) -- CellState.format extension + Op::SetCellFormat
+    // cache integration
+    // ========================================================================
+
+    #[test]
+    fn set_cell_format_writes_state_format() {
+        // V3.5.0.5 D1: cell-keyed Op::SetCellFormat updates state.format
+        // via the live append_op path.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(set_cell_format_builtin(0, 0, 0, 2)).unwrap();
+        let cells = s.snapshot_cells(0);
+        assert_eq!(cells.len(), 1, "SetCellFormat creates a cache entry");
+        let state = &cells[0].1;
+        assert_eq!(state.format, Some(FormatId::Builtin(2)));
+        assert_eq!(state.value, None, "no value set");
+        assert_eq!(state.formula, None, "no formula set");
+    }
+
+    #[test]
+    fn set_cell_format_preserves_value_and_formula_per_field_lww() {
+        // V3.5.0.5 per-field LWW: SetCellFormat must NOT clobber
+        // existing value or formula on the same cell.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 5, 5, 42.0)).unwrap();
+        s.append_op(put_formula(0, 5, 5, "=A1+1")).unwrap();
+        s.append_op(set_cell_format_builtin(0, 5, 5, 7)).unwrap();
+        let state = &s.snapshot_cells(0)[0].1;
+        assert_eq!(state.value, Some(CellWireValue::Number(42.0)),
+            "PutValue preserved across SetCellFormat");
+        assert_eq!(state.formula, Some("=A1+1".to_string()),
+            "PutFormula preserved across SetCellFormat");
+        assert_eq!(state.format, Some(FormatId::Builtin(7)));
+    }
+
+    #[test]
+    fn put_value_after_set_cell_format_preserves_format() {
+        // Reverse direction: SetCellFormat first, then PutValue must
+        // preserve the format.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(set_cell_format_builtin(0, 0, 0, 3)).unwrap();
+        s.append_op(put_value(0, 0, 0, 99.0)).unwrap();
+        let state = &s.snapshot_cells(0)[0].1;
+        assert_eq!(state.format, Some(FormatId::Builtin(3)),
+            "PutValue must not clobber SetCellFormat");
+        assert_eq!(state.value, Some(CellWireValue::Number(99.0)));
+    }
+
+    #[test]
+    fn set_cell_format_lww_overwrites_previous_format() {
+        // Per-cell LWW: two SetCellFormat ops on the same cell -- the
+        // second wins (Loro causal-merge order; local appends are at
+        // the frontier per the cache's local-append invariant).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(set_cell_format_builtin(0, 0, 0, 2)).unwrap();
+        s.append_op(set_cell_format_builtin(0, 0, 0, 7)).unwrap();
+        let state = &s.snapshot_cells(0)[0].1;
+        assert_eq!(state.format, Some(FormatId::Builtin(7)),
+            "second SetCellFormat wins for the cell");
+    }
+
+    #[test]
+    fn clear_cell_format_clears_state_format() {
+        // V3.5.0.5: SetCellFormat { id: None } clears the format
+        // (W5-80 "clear overlay" semantic).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s.append_op(set_cell_format_builtin(0, 0, 0, 5)).unwrap();
+        assert_eq!(s.snapshot_cells(0)[0].1.format, Some(FormatId::Builtin(5)));
+        s.append_op(clear_cell_format(0, 0, 0)).unwrap();
+        let state = &s.snapshot_cells(0)[0].1;
+        assert_eq!(state.format, None, "clear-format wipes state.format");
+        assert_eq!(state.value, Some(CellWireValue::Number(1.0)),
+            "clear-format preserves value");
+    }
+
+    #[test]
+    fn format_only_clear_removes_cache_key() {
+        // V3.5.0.5 ghost-entry-avoidance (extends V3.4.0.X MEDIUM-1
+        // to format): SetCellFormat { id: Some(_) } -> clear leaves
+        // (value, formula, format) all None -> entry removed.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(set_cell_format_builtin(7, 0, 0, 2)).unwrap();
+        assert_eq!(s.list_sheets_from_cache(), vec![7]);
+        s.append_op(clear_cell_format(7, 0, 0)).unwrap();
+        assert_eq!(s.list_sheets_from_cache(), Vec::<u16>::new(),
+            "format-only clear removes the cache key + does not surface sheet 7");
+        assert_eq!(s.snapshot_cells(7).len(), 0);
+    }
+
+    #[test]
+    fn clear_format_on_never_set_cell_is_noop() {
+        // Mirrors the V3.4.0.X ClearFormula skip-if-absent behavior:
+        // SetCellFormat { id: None } on a never-set cell must NOT
+        // create a phantom cache entry.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(clear_cell_format(5, 0, 0)).unwrap();
+        assert_eq!(s.list_sheets_from_cache(), Vec::<u16>::new(),
+            "clear-format on never-set cell does not create a cache entry");
+        assert_eq!(s.snapshot_cells(5).len(), 0);
+    }
+
+    #[test]
+    fn cross_peer_set_cell_format_converges_via_merge_bytes() {
+        // CRDT convergence: peer A sets format, peer B merges peer A's
+        // snapshot and sees the format via rebuild_snapshot_cache.
+        let mut s_a = CollabSession::new(PeerId::new(1)).unwrap();
+        s_a.append_op(set_cell_format_builtin(0, 3, 4, 9)).unwrap();
+        let bytes = s_a.export_bytes().unwrap();
+        let s_b = CollabSession::from_snapshot(PeerId::new(2), &bytes).unwrap();
+        let state_b = &s_b.snapshot_cells(0)[0].1;
+        assert_eq!(state_b.format, Some(FormatId::Builtin(9)),
+            "peer B sees the format via rebuild_snapshot_cache");
+    }
+
+    #[test]
+    fn rebuild_snapshot_cache_round_trip_preserves_format() {
+        // Round-trip via export_bytes + from_snapshot rebuilds the
+        // cache from scratch; format must survive.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(2, 1, 1, 11.0)).unwrap();
+        s.append_op(set_cell_format_builtin(2, 1, 1, 4)).unwrap();
+        s.append_op(put_formula(2, 1, 1, "=B2")).unwrap();
+        let bytes = s.export_bytes().unwrap();
+        let s2 = CollabSession::from_snapshot(PeerId::new(2), &bytes).unwrap();
+        let state = &s2.snapshot_cells(2)[0].1;
+        assert_eq!(state.value, Some(CellWireValue::Number(11.0)));
+        assert_eq!(state.formula, Some("=B2".to_string()));
+        assert_eq!(state.format, Some(FormatId::Builtin(4)),
+            "format round-trips through rebuild_snapshot_cache");
+    }
+
+    #[test]
+    fn batch_commit_with_set_cell_format_recurses_into_cache() {
+        // V3.4.0.X HIGH-1 carry: BatchCommit nesting works for the new
+        // SetCellFormat variant via collect_cache_effects recursion.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::BatchCommit {
+            ops: vec![
+                put_value(0, 0, 0, 5.0),
+                set_cell_format_builtin(0, 0, 0, 2),
+            ],
+        }).unwrap();
+        let state = &s.snapshot_cells(0)[0].1;
+        assert_eq!(state.value, Some(CellWireValue::Number(5.0)),
+            "BatchCommit nested PutValue surfaces");
+        assert_eq!(state.format, Some(FormatId::Builtin(2)),
+            "BatchCommit nested SetCellFormat surfaces (recursion works for new variant)");
+    }
+
+    #[test]
+    fn set_cell_format_custom_variant_via_cache() {
+        // FormatId::Custom(PeerId, u32) round-trip: the wire form
+        // FormatIdWire::Custom { peer, counter } converts losslessly
+        // via to_storage().
+        let custom_wire = ql_oplog::wire::FormatIdWire::Custom {
+            peer: PeerId::new(42),
+            counter: 100,
+        };
+        let op = Op::SetCellFormat {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            id: Some(custom_wire),
+        };
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(op).unwrap();
+        let state = &s.snapshot_cells(0)[0].1;
+        assert_eq!(state.format, Some(FormatId::Custom(PeerId::new(42), 100)),
+            "Custom(PeerId, u32) round-trips through cache via to_storage");
+    }
+
+    #[test]
+    fn undo_preserves_format_lww_after_full_rebuild() {
+        // V3.4.0.X HIGH-1 carry: undo triggers a full rebuild_snapshot_cache.
+        // For V3.5.0.5, this also exercises the new SetCellFormat handler
+        // in the rebuild path (not just append_op).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s.append_op(set_cell_format_builtin(0, 0, 0, 2)).unwrap();
+        s.append_op(put_value(0, 0, 0, 99.0)).unwrap();
+        let state_pre = &s.snapshot_cells(0)[0].1;
+        assert_eq!(state_pre.value, Some(CellWireValue::Number(99.0)));
+        assert_eq!(state_pre.format, Some(FormatId::Builtin(2)));
+
+        // Undo last PutValue.  Rebuild walks the post-undo log:
+        // PutValue(1.0) + SetCellFormat(2).  Cache must reflect both.
+        assert!(s.undo().unwrap());
+        let state_post = &s.snapshot_cells(0)[0].1;
+        assert_eq!(state_post.value, Some(CellWireValue::Number(1.0)),
+            "undo of last PutValue reveals the prior PutValue");
+        assert_eq!(state_post.format, Some(FormatId::Builtin(2)),
+            "format survives the rebuild via SetCellFormat replay");
     }
 
     #[test]

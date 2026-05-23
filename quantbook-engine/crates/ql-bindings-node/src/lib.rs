@@ -460,6 +460,66 @@ impl From<CellWireValue> for CellValueJson {
     }
 }
 
+/// **Phase 5.7 V3.5.0.5 (2026-05-24) -- JS-facing FormatId mirror.**
+///
+/// Tagged-union mirror of the engine's `ql_storage::FormatId` enum
+/// (V5-D-1 / Phase 5.2 step 4 tagged shape: `Builtin(u32) | Custom(PeerId,
+/// u32)`).  napi-rs `Option::None` -> absent JS property, so callers
+/// MUST discriminate on `kind` and read the correct payload field.
+///
+/// **Variant -> field mapping**:
+/// - `Builtin(id)` -> `{ kind: "builtin", builtin: id }` (other fields absent)
+/// - `Custom(peer, counter)` -> `{ kind: "custom", customPeer: <peer as bigint>,
+///                                  customCounter: counter }` (builtin absent)
+///
+/// `customPeer` is `u64` widened to JS BigInt (matches the PresenceState +
+/// peerId conventions throughout V3.x).  `customCounter` is `u32`
+/// (JS-number-safe).
+///
+/// **Rule 4 per-field walk**: `kind: String` Send + Sync;
+/// `builtin: Option<u32>` Send + Sync; `custom_peer: Option<BigInt>`
+/// (napi::bindgen_prelude::BigInt is a u128-sized struct wrapping
+/// Vec<u64> + sign; Vec<u64> is Send + Sync; trivially Send + Sync);
+/// `custom_counter: Option<u32>` Send + Sync.  Composition:
+/// `FormatIdJson: Send + Sync`.  **0 new Rule 4 triggers**; arc
+/// terminus stays at 6.
+///
+/// **V3.5.0.5 ship**: format passthrough only.  The IDE webview does
+/// NOT consume format yet (buildHtml renders without format awareness);
+/// the field round-trips through workbookSnapshot for V3.6+ format-
+/// aware rendering.
+#[napi(object)]
+pub struct FormatIdJson {
+    pub kind: String,
+    /// Set when `kind == "builtin"`; absent otherwise.
+    pub builtin: Option<u32>,
+    /// Set when `kind == "custom"`; absent otherwise.  PeerId widened
+    /// to BigInt (matches V3.4.0.4b generateUuidPeerId + V3.4.0.5a
+    /// PresenceStateJson conventions).
+    pub custom_peer: Option<BigInt>,
+    /// Set when `kind == "custom"`; absent otherwise.
+    pub custom_counter: Option<u32>,
+}
+
+impl From<ql_storage::FormatId> for FormatIdJson {
+    fn from(id: ql_storage::FormatId) -> Self {
+        match id {
+            ql_storage::FormatId::Builtin(n) => Self {
+                kind: "builtin".to_string(),
+                builtin: Some(n),
+                custom_peer: None,
+                custom_counter: None,
+            },
+            ql_storage::FormatId::Custom(peer, counter) => Self {
+                kind: "custom".to_string(),
+                builtin: None,
+                custom_peer: Some(BigInt::from(peer.0)),
+                custom_counter: Some(counter),
+            },
+        }
+    }
+}
+
 /// **Phase 5.7 V3.5.0.2 (2026-05-24) -- JS-facing cell snapshot.**
 ///
 /// One cell entry in a sheet's snapshot.  `value: None` means the cell has
@@ -467,21 +527,35 @@ impl From<CellWireValue> for CellValueJson {
 /// `=A1+1` with no computed value pinned to the cache).  `formula: None`
 /// means the cell has a literal value but no formula text (pure
 /// `PutValue`).  Both `Some` means the cell carries both (formula
-/// evaluated to a numeric literal).  Both `None` cannot occur in the
-/// snapshot (V3.4.0.X MEDIUM-1 closure: such entries are removed from
-/// the cache via `apply_cache_effect`'s formula-only-key removal).
+/// evaluated to a numeric literal).  All three `None` cannot occur in
+/// the snapshot (V3.4.0.X MEDIUM-1 closure extended at V3.5.0.5: such
+/// entries are removed from the cache via `apply_cache_effect`'s
+/// formula-only-key removal -- now extended to format).
+///
+/// **V3.5.0.5 (2026-05-24) -- adds `format: Option<FormatIdJson>`**:
+/// passthrough for cell-keyed `Op::SetCellFormat`.  `format: None`
+/// means the cell has no explicit format (renders with General per
+/// the engine's FormatId::GENERAL default).  IDE webview does NOT
+/// render format yet at V3.5.0.5 ship; the field round-trips for
+/// V3.6+ format-aware rendering.
 ///
 /// **Rule 4 per-field walk**: `row/col: u32` primitives; `value:
 /// Option<CellValueJson>` composition over CellValueJson (Send + Sync
 /// per its own walk above); `formula: Option<String>` (Send + Sync per
-/// Option<String> auto-trait).  Composition: `CellSnapshotJson: Send +
-/// Sync`.  **0 new Rule 4 triggers.**
+/// Option<String> auto-trait); **`format: Option<FormatIdJson>`** Send +
+/// Sync per FormatIdJson's walk above (V3.5.0.5 addition).  Composition:
+/// `CellSnapshotJson: Send + Sync`.  **0 new Rule 4 triggers; arc
+/// terminus stays at 6** (FormatIdJson is positive Send+Sync via its
+/// own per-field walk).
 #[napi(object)]
 pub struct CellSnapshotJson {
     pub row: u32,
     pub col: u32,
     pub value: Option<CellValueJson>,
     pub formula: Option<String>,
+    /// **V3.5.0.5 (2026-05-24)**: format passthrough.  `None` = no
+    /// explicit format (cell renders with FormatId::GENERAL default).
+    pub format: Option<FormatIdJson>,
 }
 
 /// **Phase 5.7 V3.5.0.2 (2026-05-24) -- JS-facing sheet snapshot.**
@@ -518,9 +592,14 @@ pub struct SheetSnapshotJson {
 /// view is pre-shaped for the IDE renderer + matches the V3.4.0.5a
 /// `PresenceStateJson` pattern at a higher level.
 ///
-/// **V3.5.0.2 ship**: `sheets` only.  V3.5.0.5 will add `names:
-/// Vec<NamedRangeJson>` + `formats: Vec<FormatDefJson>` once the
-/// session-wide format / name caches land.  Additive; no shape break.
+/// **V3.5.0.2 ship**: `sheets` only.  **V3.5.0.5 (2026-05-24) adds
+/// per-cell format passthrough** via `SheetSnapshotJson.cells[i].format`;
+/// the top-level WorkbookSnapshotJson shape is UNCHANGED.  V3.6+ may
+/// add `names: Vec<NamedRangeJson>` + a session-wide `formats:
+/// Vec<FormatDefJson>` registry (deferred: requires a session-wide
+/// FormatTable cache + RegisterFormat op-walker; per-cell format is
+/// the minimum surface to unblock V3.6+ format-aware rendering).
+/// Additive; no shape break.
 ///
 /// **Performance note (R-V3.5-1)**: large workbooks (100k+ cells)
 /// produce large JSON payloads.  V3.5.0.2 ships the full snapshot per
@@ -1506,6 +1585,12 @@ impl CollabSession {
                     col,
                     value: state.value.map(CellValueJson::from),
                     formula: state.formula,
+                    // **V3.5.0.5 (2026-05-24)**: format passthrough
+                    // from the V3.4.0.2 hybrid CellState extended with
+                    // a `format: Option<FormatId>` field.  None ->
+                    // absent JS property (napi-rs Option::None
+                    // serialization).
+                    format: state.format.map(FormatIdJson::from),
                 })
                 .collect();
             sheets.push(SheetSnapshotJson {
