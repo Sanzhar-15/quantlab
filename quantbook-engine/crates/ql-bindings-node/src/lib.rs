@@ -1644,18 +1644,40 @@ impl CollabSession {
             .map_err(collab_session_error_to_napi)?;
         // **Phase 5.7 V3.6.0.5 D4 (2026-05-23)**: build the
         // EvalContext used by format::render.  date_system comes
-        // from the workbook (Phase 4.6 D-1); locale ships EN-US
-        // only at V3.6.0.5 (locale-aware deferred to V3.6.1+);
-        // now_provider stays at System default (date/time format
-        // strings that reference NOW() / TODAY() in the format
-        // grammar -- not common -- get the system clock; tests
-        // that need determinism can use `for_test`).
+        // from the workbook (Phase 4.6 D-1; post V3.6.0.X audit-
+        // of-D4 CONVERGENT-HIGH-1 closure: `Op::SetDateSystem`
+        // ensures replay applies the loaded `.qbook` envelope's
+        // value).  Locale comes from the workbook (post V3.6.0.X
+        // audit-of-D4 CONVERGENT-MED-1 closure: was hardcoded to
+        // `Locale::EnUs`; render.rs ignores locale today but will
+        // grow conditionals at V3.6.1+ -- threading through now
+        // prevents silent forward-compat regression).  now_provider
+        // stays at System default (date/time format strings that
+        // reference NOW() / TODAY() in the format grammar get the
+        // system clock; tests that need determinism can use
+        // `for_test`).
         let workbook_date_system = workbook.date_system();
         let eval_ctx = ql_types::EvalContext {
             date_system: workbook_date_system,
-            locale: ql_types::Locale::EnUs,
+            locale: workbook.locale(),
             now_provider: ql_types::NowProvider::System,
         };
+        // **Phase 5.7 V3.6.0.X audit-of-D4 CONVERGENT-MED-2 closure
+        // (2026-05-24)**: per-snapshot parsed-format cache.  Pre-
+        // closure `format::parse` ran PER cell PER snapshot call
+        // (Opus MED-2 + Codex LOW-2).  For a workbook with 100k
+        // formatted cells sharing the same format, the parser
+        // produced 100k identical FormatString instances per
+        // workbook_snapshot.  Post-closure: a session-local
+        // HashMap<FormatId, FormatString> caches the first parse
+        // result per id; subsequent cells with the same format
+        // reuse the cached parsed grammar.  V3.7+ could promote
+        // the cache to `CollabSession` (cross-call) if profiling
+        // justifies; bounded scope here.
+        let mut parsed_format_cache: std::collections::HashMap<
+            ql_storage::FormatId,
+            ql_functions::format::FormatString,
+        > = std::collections::HashMap::new();
         let sheet_count = workbook.sheet_count();
         // **V3.5.0.3c (2026-05-24)**: iterate the display-order overlay
         // instead of 0..sheet_count() so user-initiated `Op::MoveSheet`
@@ -1738,34 +1760,59 @@ impl CollabSession {
                     // **Phase 5.7 V3.6.0.5 D4 (2026-05-23)**:
                     // pre-render the cell value via
                     // `ql_functions::format::render` when the cell
-                    // has a format AND a value.  Silent fallback
-                    // to `None` on any of: no format / no value /
+                    // has a format AND a value (and the value isn't
+                    // Pending).  Silent fallback to `None` on any
+                    // of: no format / no value / Pending value /
                     // format-id lookup miss / format-string parse
-                    // error / wire-decode error on the value.
-                    // IDE consumer falls back to value-based
-                    // default rendering when `rendered` is None.
-                    let rendered: Option<String> =
-                        match (state.format.as_ref(), state.value.as_ref()) {
-                            (Some(fmt_id), Some(wire_value)) => {
-                                // Step 1: convert wire value -> ql_types::Value.
-                                wire_value
-                                    .to_value()
-                                    .ok()
-                                    .and_then(|value| {
-                                        // Step 2: look up format string by id.
-                                        workbook.formats().lookup(*fmt_id).map(|fmt_str| (value, fmt_str.to_string()))
-                                    })
-                                    .and_then(|(value, fmt_string)| {
-                                        // Step 3: parse the format string.
-                                        ql_functions::format::parse(&fmt_string).ok().map(|fmt| (value, fmt))
-                                    })
-                                    .map(|(value, fmt)| {
-                                        // Step 4: render with EvalContext.
-                                        ql_functions::format::render(&value, &fmt, &eval_ctx)
-                                    })
-                            }
-                            _ => None,
-                        };
+                    // error / wire-decode error.  IDE consumer
+                    // falls back to value-based default rendering
+                    // when `rendered` is None.
+                    //
+                    // **V3.6.0.X audit-of-D4 CONVERGENT-HIGH-3
+                    // closure**: skip pre-render for
+                    // `CellWireValue::Pending` -- otherwise
+                    // `to_value()` returns `Value::Blank` and
+                    // route_section treats Blank as 0.0 for number
+                    // formats, producing misleading "0.00"-like
+                    // output for not-yet-evaluated formulas.  Pre-
+                    // closure pending+format displayed as a
+                    // formatted zero; post-closure rendered=None
+                    // and the IDE falls back to its explicit
+                    // "(pending)" display.
+                    //
+                    // **V3.6.0.X audit-of-D4 CONVERGENT-MED-2
+                    // closure**: per-snapshot parse cache reuses
+                    // the FormatString for repeated FormatIds.
+                    //
+                    // **V3.6.0.X audit-of-D4 Opus LOW-2 closure**:
+                    // drop `.to_string()` on the lookup result;
+                    // `format::parse` takes `&str`.
+                    let rendered: Option<String> = match (
+                        state.format.as_ref(),
+                        state.value.as_ref(),
+                    ) {
+                        (Some(fmt_id), Some(wire_value)) if !wire_value.is_pending() => {
+                            let fmt_id_copy = *fmt_id;
+                            wire_value.to_value().ok().and_then(|value| {
+                                // CONVERGENT-MED-2 parse cache: reuse
+                                // FormatString across cells sharing a
+                                // FormatId within a single snapshot.
+                                if let Some(fmt) = parsed_format_cache.get(&fmt_id_copy) {
+                                    return Some(ql_functions::format::render(
+                                        &value, fmt, &eval_ctx,
+                                    ));
+                                }
+                                // Cache miss: lookup + parse + insert.
+                                let fmt_str = workbook.formats().lookup(fmt_id_copy)?;
+                                let fmt = ql_functions::format::parse(fmt_str).ok()?;
+                                let rendered_str =
+                                    ql_functions::format::render(&value, &fmt, &eval_ctx);
+                                parsed_format_cache.insert(fmt_id_copy, fmt);
+                                Some(rendered_str)
+                            })
+                        }
+                        _ => None,
+                    };
                     CellSnapshotJson {
                         row,
                         col,
@@ -1894,7 +1941,7 @@ impl CollabSession {
     #[napi(factory, js_name = "fromQbook")]
     pub fn from_qbook(path: String, peer_id_override: BigInt) -> Result<Self> {
         let pid = peer_id_from_bigint(&peer_id_override)?;
-        let (_workbook, oplog) = load_workbook_with_oplog(std::path::Path::new(&path))
+        let (loaded_workbook, oplog) = load_workbook_with_oplog(std::path::Path::new(&path))
             .map_err(persistence_error_to_napi)?;
         // Round-trip via export_bytes -> from_snapshot.  This pays a
         // double-Loro-serialization cost (load decodes; export re-
@@ -1908,8 +1955,42 @@ impl CollabSession {
         let bytes = oplog
             .export_bytes()
             .map_err(|e| persistence_error_to_napi(PersistenceError::OpLog(e)))?;
-        let session = CoreCollabSession::from_snapshot(pid, &bytes)
+        let mut session = CoreCollabSession::from_snapshot(pid, &bytes)
             .map_err(collab_session_error_to_napi)?;
+        // **Phase 5.7 V3.6.0.X audit-of-D4 CONVERGENT-HIGH-1 closure
+        // (2026-05-24)**: seed `Op::SetDateSystem` when the loaded
+        // workbook's date_system differs from the runtime default
+        // (`ql_types::DateSystem::default()` = `Excel1900`).  Pre-
+        // closure the `loaded_workbook` was discarded entirely; the
+        // session was reconstructed from `oplog` alone via
+        // `from_snapshot`, replay yielded `Workbook::default()`, and
+        // `workbook.date_system()` reverted to `Excel1900` regardless
+        // of the file's envelope.  Excel1904 workbooks then rendered
+        // date-format cells off by 1462 days (Codex Lane A HIGH-1 +
+        // Opus Lane B HIGH-1 both empirically demonstrated).  Post-
+        // closure: append `Op::SetDateSystem` so subsequent
+        // `rebuild_workbook` replays apply the loaded workbook's
+        // actual date_system.
+        //
+        // Conditional emission (only when non-default) keeps the op
+        // count idempotent for Excel1900 .qbook files (the common
+        // case) -- existing IDE mocha tests that assert
+        // `session.op_count() == oplog.count_before_fromQbook` keep
+        // passing for default workbooks.  Excel1904 .qbook files
+        // grow op_count by 1.
+        //
+        // V3.6.0.6+ may add `set_date_system` napi method (mirroring
+        // `set_locale`) so the IDE can change date_system from the
+        // user's perspective; that would also append `Op::SetDateSystem`
+        // to the log.
+        let loaded_date_system = loaded_workbook.date_system();
+        if loaded_date_system != ql_types::DateSystem::default() {
+            session
+                .append_op(ql_oplog::Op::SetDateSystem {
+                    date_system: ql_oplog::DateSystemWire::from_runtime(loaded_date_system),
+                })
+                .map_err(collab_session_error_to_napi)?;
+        }
         Ok(Self {
             inner: Arc::new(Mutex::new(session)),
         })

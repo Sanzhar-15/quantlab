@@ -5167,6 +5167,65 @@ mod tests {
     }
 
     #[test]
+    fn v3_6_0_x_audit_of_d4_set_date_system_replay_updates_workbook() {
+        // **V3.6.0.X audit-of-D4 CONVERGENT-HIGH-1 regression**
+        // (Codex Lane A HIGH-1 + Opus Lane B HIGH-1): the new
+        // `Op::SetDateSystem` variant must update
+        // `Workbook::date_system` during replay.  Pre-closure
+        // (V3.6.0.5 D4 ship) there was no op-log representation
+        // for date_system; `from_qbook` discarded the loaded
+        // workbook + reconstructed via op-log replay; the napi
+        // `workbook_snapshot.dateSystem` always returned
+        // "Excel1900" regardless of the .qbook envelope.  Codex
+        // Probe 4 + Opus probe both demonstrated.
+        //
+        // This regression pins the replay arm: append
+        // `Op::SetDateSystem(Excel1904)`, rebuild_workbook,
+        // assert workbook.date_system() == Excel1904.
+        let mut s = CollabSession::new(PeerId::new(7)).unwrap();
+        s.append_op(Op::SetDateSystem {
+            date_system: ql_oplog::DateSystemWire::Excel1904,
+        })
+        .unwrap();
+        let reg = ql_functions::default_registry();
+        let (workbook, _) = s.rebuild_workbook(&reg).unwrap();
+        assert_eq!(
+            workbook.date_system(),
+            ql_types::DateSystem::Excel1904,
+            "Op::SetDateSystem(Excel1904) -> workbook.date_system() = Excel1904 after replay"
+        );
+    }
+
+    #[test]
+    fn v3_6_0_x_audit_of_d4_set_date_system_unknown_wire_errors() {
+        // **V3.6.0.X audit-of-D4 CONVERGENT-HIGH-1 regression**:
+        // unknown DateSystemWire strings surface
+        // `ReplayError::UnknownDateSystem` (mirrors LocaleWire +
+        // ReferenceModeWire pattern).  Forward-compat: future
+        // engines may emit `Op::SetDateSystem { date_system:
+        // "JulianCalendar" }`; current engine rejects with a
+        // distinct error rather than silently no-op'ing.
+        let mut s = CollabSession::new(PeerId::new(7)).unwrap();
+        s.append_op(Op::SetDateSystem {
+            date_system: ql_oplog::DateSystemWire::Unknown("JulianCalendar".to_string()),
+        })
+        .unwrap();
+        let reg = ql_functions::default_registry();
+        let err = s.rebuild_workbook(&reg).unwrap_err();
+        match err {
+            CollabSessionError::Replay(ql_oplog::ReplayError::UnknownDateSystem {
+                found, ..
+            }) => {
+                assert_eq!(found, "JulianCalendar");
+            }
+            other => panic!(
+                "expected ReplayError::UnknownDateSystem, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
     fn nested_start_undo_group_returns_already_started_error() {
         // Codex+Opus 5.4 V2 V1 audit MEDIUM-1 closure: Loro's
         // group_start returns `Err(LoroError::UndoGroupAlreadyStarted)`

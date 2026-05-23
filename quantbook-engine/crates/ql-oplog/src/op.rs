@@ -411,6 +411,32 @@ pub enum Op {
     /// wire values surface `ReplayError::UnknownLocale` per design
     /// § 4.9.J + Sonnet L-10 closure.
     SetLocale { locale: LocaleWire },
+
+    /// **Phase 5.7 V3.6.0.X audit-of-D4 CONVERGENT-HIGH-1 closure
+    /// (2026-05-24):** workbook-scope date-system change.  Serialized
+    /// as a short string `"Excel1900"` / `"Excel1904"`.  Mirrors the
+    /// qbook envelope's `date_system` field.
+    ///
+    /// **Why it exists**: V3.6.0.5 D4 surfaces `workbook.date_system()`
+    /// via napi `WorkbookSnapshotJson.dateSystem` for format-aware
+    /// date rendering.  But pre-closure, op-log replay never touched
+    /// `Workbook::date_system` -- replay always produced
+    /// `DateSystem::Excel1900` (the `Workbook::default()` value),
+    /// regardless of the loaded `.qbook` envelope.  Excel1904
+    /// workbooks rendered date-formatted cells off by 1462 days.
+    /// Codex Lane A HIGH-1 + Opus Lane B HIGH-1 both empirically
+    /// demonstrated.
+    ///
+    /// **Closure**: `from_qbook` now emits `Op::SetDateSystem` as the
+    /// first op (prefix) when the loaded workbook's date_system
+    /// differs from `Workbook::default()`'s.  Replay calls
+    /// `workbook.set_date_system(_)`.  napi
+    /// `WorkbookSnapshotJson.dateSystem` then surfaces the correct
+    /// value.
+    ///
+    /// Unknown wire values surface `ReplayError::UnknownDateSystem`
+    /// per the LocaleWire / ReferenceModeWire pattern.
+    SetDateSystem { date_system: DateSystemWire },
 }
 
 /// **W5-146 (Phase 4.9.J):** op-log wire form of `ReferenceMode`.
@@ -528,6 +554,61 @@ impl<'de> serde::Deserialize<'de> for LocaleWire {
             "en" => Self::En,
             "de" => Self::De,
             "fr" => Self::Fr,
+            _ => Self::Unknown(s),
+        })
+    }
+}
+
+/// **Phase 5.7 V3.6.0.X audit-of-D4 CONVERGENT-HIGH-1 closure
+/// (2026-05-24):** op-log wire form of `ql_types::DateSystem`.
+/// Unknown strings deserialize to `DateSystemWire::Unknown(String)`
+/// so the replay path can surface `ReplayError::UnknownDateSystem`
+/// with the captured value (mirrors LocaleWire / ReferenceModeWire
+/// pattern).
+///
+/// Save-side `from_runtime` only emits canonical variants; the
+/// `Unknown` form is read-side only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DateSystemWire {
+    Excel1900,
+    Excel1904,
+    Unknown(String),
+}
+
+impl DateSystemWire {
+    pub fn from_runtime(date_system: ql_types::DateSystem) -> Self {
+        match date_system {
+            ql_types::DateSystem::Excel1900 => Self::Excel1900,
+            ql_types::DateSystem::Excel1904 => Self::Excel1904,
+        }
+    }
+
+    pub fn to_runtime(self) -> Result<ql_types::DateSystem, String> {
+        match self {
+            Self::Excel1900 => Ok(ql_types::DateSystem::Excel1900),
+            Self::Excel1904 => Ok(ql_types::DateSystem::Excel1904),
+            Self::Unknown(s) => Err(s),
+        }
+    }
+}
+
+impl serde::Serialize for DateSystemWire {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        let s = match self {
+            Self::Excel1900 => "Excel1900",
+            Self::Excel1904 => "Excel1904",
+            Self::Unknown(s) => s.as_str(),
+        };
+        ser.serialize_str(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DateSystemWire {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        Ok(match s.as_str() {
+            "Excel1900" => Self::Excel1900,
+            "Excel1904" => Self::Excel1904,
             _ => Self::Unknown(s),
         })
     }

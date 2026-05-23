@@ -263,6 +263,15 @@ pub enum ReplayError {
     /// Parallels `UnknownLocale` above.
     #[error("replay unknown reference mode at op index {index}: {found:?}")]
     UnknownReferenceMode { index: usize, found: String },
+
+    /// **Phase 5.7 V3.6.0.X audit-of-D4 CONVERGENT-HIGH-1 closure
+    /// (2026-05-24):** `Op::SetDateSystem` wire value didn't match
+    /// `Excel1900` or `Excel1904`.  Forward-compat path captures
+    /// unknown strings into `DateSystemWire::Unknown(_)` and replay
+    /// surfaces this distinct error.  Parallels `UnknownLocale` +
+    /// `UnknownReferenceMode`.
+    #[error("replay unknown date system at op index {index}: {found:?}")]
+    UnknownDateSystem { index: usize, found: String },
 }
 
 /// Wrapper around `ql_storage::FormatTableError` that owns its strings,
@@ -864,6 +873,21 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
                 Ok(())
             }
             Err(found) => Err(ReplayError::UnknownLocale { index, found }),
+        },
+        // **Phase 5.7 V3.6.0.X audit-of-D4 CONVERGENT-HIGH-1 closure
+        // (2026-05-24):** workbook-scope date-system change.  Mirrors
+        // the SetLocale handler.  Without this replay arm,
+        // `workbook.date_system()` would always default to `Excel1900`
+        // regardless of the op-log content (and `from_qbook` would
+        // silently drop the loaded workbook's date_system).  Codex
+        // Lane A HIGH-1 + Opus Lane B HIGH-1 both empirically
+        // demonstrated.
+        Op::SetDateSystem { date_system } => match date_system.clone().to_runtime() {
+            Ok(ds) => {
+                workbook.set_date_system(ds);
+                Ok(())
+            }
+            Err(found) => Err(ReplayError::UnknownDateSystem { index, found }),
         },
     }
 }

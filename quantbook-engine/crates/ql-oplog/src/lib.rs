@@ -43,7 +43,7 @@ pub mod wire;
 
 pub use error::OpLogError;
 pub use log::{OpLog, PRESENCE_COMMIT_ORIGIN};
-pub use op::{LocaleWire, Op, ReferenceModeWire};
+pub use op::{DateSystemWire, LocaleWire, Op, ReferenceModeWire};
 pub use replay::{replay_into, ReplayError};
 pub use wire::{CellWireValue, FormatIdWire, NamedTargetWire, WireDecodeError};
 
