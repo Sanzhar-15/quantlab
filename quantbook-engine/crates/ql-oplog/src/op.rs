@@ -169,6 +169,67 @@ pub enum Op {
     /// .qbook files load cleanly + replay without seeing this variant.
     RemoveSheet { id: SheetId },
 
+    /// **Phase 5.7 V3.5.0.3c (2026-05-24):** reorder sheets in the
+    /// workbook's display order without shifting underlying sheet ids.
+    /// CRDT semantic per V3.5.0.3c decision lock (display-order overlay
+    /// recommended approach, mirroring V3.5.0.3b tombstone's id-stability
+    /// strategy):
+    ///
+    /// - **id stays stable**: subsequent ops referencing the moved
+    ///   sheet by id (`Op::PutValue { sheet: id, .. }` etc.) keep
+    ///   landing on the correct sheet.  The "move" only affects
+    ///   `Workbook.sheet_display_order` -- a separate
+    ///   `Vec<SheetId>` that records the user's preferred
+    ///   rendering order.
+    ///
+    /// - **new_index semantics**: 0-based position in the post-move
+    ///   `sheet_display_order` vec.  The handler:
+    ///     1. Finds the current display position of `id` (linear
+    ///        search; sheet counts are small per CRDT contract).
+    ///     2. Removes `id` from its current position.
+    ///     3. Inserts `id` at `new_index` (clamped to
+    ///        `[0, display_order.len()]` -- out-of-range silently
+    ///        clamps to the end for CRDT idempotency under racing
+    ///        ops).
+    ///
+    /// - **Idempotent under concurrent move-same-sheet**: two peers
+    ///   concurrently moving sheet 5 to different positions resolve
+    ///   via deterministic Loro causal-merge order: whichever replays
+    ///   second wins on display position.  Cross-peer convergence
+    ///   preserved.
+    ///
+    /// - **Move-tombstoned-sheet**: silently applies (display order
+    ///   updates even though the sheet is tombstoned + filtered from
+    ///   `workbookSnapshot`).  Reasoning: display order is metadata,
+    ///   not content; the user's "intent to reorder" is preserved
+    ///   even if the sheet is later un-deleted (V3.6+).  Snapshot
+    ///   skip-filter on `is_sheet_removed` happens at the
+    ///   `workbookSnapshot` napi layer, NOT the display-order layer.
+    ///
+    /// - **Move-non-existent-sheet** (id not in `display_order`):
+    ///   silently no-op.  Mirrors `Op::RemoveSheet`'s out-of-range
+    ///   tolerance + matches CRDT cross-peer causal-merge friendliness
+    ///   (a peer might see a Move before the corresponding AddSheet
+    ///   has replayed locally; eventual causal order rectifies, but
+    ///   the strict-error path would break the merge).
+    ///
+    /// - **Backward compat**: `Workbook` initializes
+    ///   `sheet_display_order` to `[]`; each `add_sheet` appends the
+    ///   new id.  Sessions that never call `Op::MoveSheet` see
+    ///   identical iteration order to V3.5.0.3b (`0..sheet_count()`).
+    ///
+    /// Wire format is additive (new variant on the serde-tagged enum);
+    /// no `OPLOG_SCHEMA_VERSION` bump needed.  Pre-V3.5.0.3c saved
+    /// .qbook files load cleanly + replay without seeing this variant
+    /// (their `sheet_display_order` is rebuilt fresh in append order
+    /// during `replay_into` -> `add_sheet` calls).
+    MoveSheet {
+        id: SheetId,
+        /// 0-based target position in the post-move display order
+        /// (clamped to `[0, display_order.len()]` at apply_op time).
+        new_index: u32,
+    },
+
     /// Register a format string at a specific id. Mirrors
     /// `FormatTable::register_at`. Emitted when
     /// `WorkbookRuntime::intern_format` allocates a NEW id; idempotent

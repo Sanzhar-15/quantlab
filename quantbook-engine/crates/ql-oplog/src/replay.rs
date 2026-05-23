@@ -644,6 +644,38 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
                 }
             }
         }
+        Op::MoveSheet { id, new_index } => {
+            // **Phase 5.7 V3.5.0.3c (2026-05-24)**: reorder `id` to
+            // `new_index` in the workbook's display-order overlay.
+            // Per the V3.5.0.3c CRDT semantic decision lock (documented
+            // at op.rs Op::MoveSheet docstring):
+            //
+            // - id stability preserved: sheet ids in `Workbook.sheets`
+            //   are UNCHANGED.  Only `Workbook.sheet_display_order` is
+            //   mutated.  Subsequent ops referencing the moved sheet by
+            //   id keep landing on the correct sheet.
+            //
+            // - Idempotent if id is not in display_order: silently
+            //   no-ops.  Cross-peer case: peer sees Op::MoveSheet for
+            //   an id whose Op::AddSheet hasn't replayed locally;
+            //   Loro causal-merge will eventually rectify but the
+            //   strict-error path would break the merge.
+            //
+            // - Idempotent if new_index >= display_order.len():
+            //   clamped to len (append-to-end semantics).
+            //
+            // - Move-tombstoned-sheet silently applies: display order
+            //   records user's intent even for deleted sheets (V3.6+
+            //   un-delete preserves the move).  workbook_snapshot
+            //   napi layer applies the tombstone filter; here in
+            //   replay we just update the overlay.
+            //
+            // No CRDT auto-disambiguate dance needed (unlike AddSheet's
+            // D-2 collision resolver or RenameSheet's HIGH-1 collision
+            // resolver) -- move has no name conflict surface.
+            workbook.move_sheet(*id, *new_index);
+            Ok(())
+        }
         Op::RemoveSheet { id } => {
             // **Phase 5.7 V3.5.0.3b (2026-05-24)**: tombstone the sheet
             // at `*id`.  Per the V3.5.0.3b CRDT semantic decision lock

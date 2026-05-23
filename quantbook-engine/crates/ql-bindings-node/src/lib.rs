@@ -887,6 +887,85 @@ impl CollabSession {
         Ok(())
     }
 
+    /// **Phase 5.7 V3.5.0.3c (2026-05-24) -- append an `Op::MoveSheet`
+    /// to this session (reorder display position; id stays stable).**
+    ///
+    /// Per V3.5.0.1 D4 (third of three sheet-ops sub-steps; 0.3a
+    /// renameSheet shipped at `74aa5039e04`; 0.3b deleteSheet shipped at
+    /// `9be3672ca01`; 0.3c moveSheet closes D4) + V3.5.0.3c CRDT
+    /// semantic decision lock: **display-order overlay** (NOT id shift
+    /// or replay-time remapping).  See `Op::MoveSheet` docstring in
+    /// `ql-oplog/src/op.rs` for the full rationale.
+    ///
+    /// **id stability preserved**: the underlying `Workbook.sheets`
+    /// vec is UNCHANGED.  Only `Workbook.sheet_display_order` (a
+    /// separate `Vec<SheetId>` overlay) is mutated.  Subsequent ops
+    /// referencing the moved sheet by id (`Op::PutValue { sheet: id,
+    /// .. }` etc.) keep landing on the correct sheet.
+    ///
+    /// **`new_index` semantics**: 0-based position in the post-move
+    /// display-order vec.  The replay handler:
+    /// 1. Finds the current display position of `id`.
+    /// 2. Removes `id` from its current position.
+    /// 3. Inserts `id` at `new_index` (clamped to `[0,
+    ///    display_order.len()]` -- out-of-range silently clamps to end
+    ///    for CRDT idempotency).
+    ///
+    /// **Pre-move existence check** mirrors renameSheet + deleteSheet:
+    /// validates `id <= u16::MAX` + pre-rebuilds the workbook to
+    /// confirm `id < sheet_count`.  Already-at-position `new_index`
+    /// (no-op move) is NOT a bad_argument (CRDT idempotency).
+    ///
+    /// **Move-tombstoned-sheet**: silently applies (display order
+    /// remembers the user's reorder intent even for deleted sheets;
+    /// `workbookSnapshot` filters tombstones AFTER display-order
+    /// resolution).
+    ///
+    /// **Cross-peer convergence**: concurrent moves on the same sheet
+    /// resolve via deterministic Loro causal-merge order; whichever
+    /// replays second wins on display position.
+    ///
+    /// **Per-call cost**: O(N) replay for the pre-existence rebuild
+    /// (matches renameSheet + deleteSheet pattern).  V3.5.0.6+ may
+    /// eliminate via a session-level sheet-id cache.
+    ///
+    /// # Errors
+    ///
+    /// - `[bad_argument]` if `id` exceeds u16 range OR refers to a
+    ///   non-existent sheet.  Tombstoned sheets are OK -- move on
+    ///   tombstone is intentional.  `new_index >= sheet_count` is OK
+    ///   (clamped at replay time).
+    /// - `[session_oplog]` / `[session_replay]` per engine errors.
+    #[napi(js_name = "moveSheet")]
+    pub fn move_sheet(&self, id: u32, new_index: u32) -> Result<()> {
+        if id > u16::MAX as u32 {
+            return Err(bad_argument_error(format!(
+                "moveSheet: id must be in [0, 65535] (u16::MAX), got {id}"
+            )));
+        }
+        let sheet_id = id as u16;
+        let mut inner = self.inner.lock();
+        let registry = default_registry();
+        let (workbook, _report) = inner
+            .rebuild_workbook(&registry)
+            .map_err(collab_session_error_to_napi)?;
+        if (sheet_id as usize) >= workbook.sheet_count() {
+            return Err(bad_argument_error(format!(
+                "moveSheet: id {id} does not exist (workbook has {} sheets)",
+                workbook.sheet_count()
+            )));
+        }
+        // Note: new_index out-of-range is OK (clamped at replay time).
+        // Tombstoned sheets are OK (display order updates per CRDT
+        // semantic; snapshot filter applies separately).
+        let op = Op::MoveSheet {
+            id: sheet_id,
+            new_index,
+        };
+        inner.append_op(op).map_err(collab_session_error_to_napi)?;
+        Ok(())
+    }
+
     #[napi(js_name = "appendPutValue")]
     pub fn append_put_value(&self, sheet: u16, row: f64, col: f64, value: f64) -> Result<()> {
         // Validate row + col: finite, non-negative, integer, in u32 range.
@@ -1369,14 +1448,41 @@ impl CollabSession {
             .rebuild_workbook(&registry)
             .map_err(collab_session_error_to_napi)?;
         let sheet_count = workbook.sheet_count();
-        let mut sheets: Vec<SheetSnapshotJson> = Vec::with_capacity(sheet_count);
+        // **V3.5.0.3c (2026-05-24)**: iterate the display-order overlay
+        // instead of 0..sheet_count() so user-initiated `Op::MoveSheet`
+        // reorderings surface in the snapshot.  Default order (no
+        // moveSheet ops applied) is `[0, 1, ..., sheet_count() - 1]`,
+        // matching the V3.5.0.3b iteration behavior for backward
+        // compat.
+        //
+        // Defensive fallback: if `sheet_display_order` is somehow
+        // shorter than `sheet_count` (impossible under normal
+        // try_add_sheet_with_chunk_rows flow, but conceivable if a
+        // future direct workbook mutation forgets to update the
+        // overlay), enumerate the missing ids at the end.  This keeps
+        // workbookSnapshot resilient against engine-internal bugs
+        // without silently dropping sheets.
+        let display = workbook.sheet_display_order().to_vec();
+        let mut all_ids: Vec<u16> = display.clone();
         for sheet_id in 0u16..(sheet_count as u16) {
+            if !display.contains(&sheet_id) {
+                all_ids.push(sheet_id);
+            }
+        }
+        let mut sheets: Vec<SheetSnapshotJson> = Vec::with_capacity(sheet_count);
+        for sheet_id in all_ids {
             // **V3.5.0.3b (2026-05-24)**: filter tombstoned sheets per
             // the CRDT semantic decision lock.  Op::RemoveSheet marks
             // the sheet id as tombstoned (preserves id slot for id-
             // stability of subsequent ops); workbookSnapshot must skip
             // tombstoned slots so the IDE renderer doesn't surface
             // deleted sheets.
+            //
+            // **V3.5.0.3c (2026-05-24)**: tombstone filter is applied
+            // AFTER display-order resolution so a tombstoned sheet
+            // that was moved is still filtered (display order can
+            // legitimately reference tombstoned ids per the V3.5.0.3c
+            // move-on-tombstoned-sheet silent-apply contract).
             if workbook.is_sheet_removed(sheet_id) {
                 continue;
             }

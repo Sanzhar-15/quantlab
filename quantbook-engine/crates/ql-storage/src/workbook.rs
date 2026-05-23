@@ -362,6 +362,31 @@ pub struct Workbook {
     /// reclamation pass that compacts truly-orphaned sheet storage
     /// once the op log is also purged of references.
     removed_sheets: HashSet<SheetId>,
+    /// **Phase 5.7 V3.5.0.3c (2026-05-24):** display-order overlay per
+    /// V3.5.0.3c CRDT semantic decision lock.  `Op::MoveSheet { id,
+    /// new_index }` reorders entries in this vec WITHOUT mutating the
+    /// underlying `sheets: Vec<Sheet>` -- sheet ids stay stable so
+    /// subsequent ops keep their referent.
+    ///
+    /// **Default**: `[0, 1, ..., sheet_count() - 1]` in append order.
+    /// Each `try_add_sheet_with_chunk_rows` appends the newly-assigned
+    /// id to the end.  Sessions that never call `Op::MoveSheet` see
+    /// `display_order` identical to `0..sheet_count()` -- preserving
+    /// the V3.5.0.3b iteration-order contract for backward compat.
+    ///
+    /// **Tombstone interaction**: `removed_sheets` and
+    /// `sheet_display_order` are ORTHOGONAL.  A tombstoned sheet
+    /// CAN have a display-order entry (move-on-tombstoned-sheet is
+    /// silently applied per the V3.5.0.3c semantic; display order
+    /// remembers the user's intent even for deleted sheets).
+    /// `workbookSnapshot` napi-layer applies BOTH filters: iterates
+    /// `display_order` AND skips tombstoned ids.
+    ///
+    /// **`Op::RemoveSheet` does NOT remove from display_order**:
+    /// preserving the entry allows V3.6+ un-delete to restore display
+    /// position correctly.  Today the entry stays but is filtered out
+    /// of snapshot via `is_sheet_removed` check.
+    sheet_display_order: Vec<SheetId>,
 }
 
 impl Workbook {
@@ -692,6 +717,11 @@ impl Workbook {
             SheetId::MAX as usize
         );
         self.sheets.push(Sheet::with_chunk_rows(name, chunk_rows));
+        // **Phase 5.7 V3.5.0.3c (2026-05-24):** append the newly-assigned
+        // id to the display-order overlay.  Sessions that never call
+        // `Op::MoveSheet` see `sheet_display_order` == `0..sheet_count()`
+        // -- preserving the V3.5.0.3b iteration-order contract.
+        self.sheet_display_order.push(id as SheetId);
         Ok(id as SheetId)
     }
 
@@ -727,6 +757,51 @@ impl Workbook {
     /// or never-created).
     pub fn is_sheet_removed(&self, id: SheetId) -> bool {
         self.removed_sheets.contains(&id)
+    }
+
+    /// **Phase 5.7 V3.5.0.3c (2026-05-24):** reorder `id` to `new_index`
+    /// in the display-order overlay.  Sheet ids themselves stay stable
+    /// (preserving the V3.5.0.3b id-stability invariant); only the
+    /// display order changes.
+    ///
+    /// **`new_index` clamping**: out-of-range values are clamped to
+    /// `[0, display_order.len()]` (inclusive upper bound after the
+    /// remove, equivalent to "append to end").  This matches the CRDT
+    /// idempotency contract -- a peer racing two moves shouldn't get
+    /// a hard error.
+    ///
+    /// **Idempotent if `id` not in display_order**: silently no-ops.
+    /// Covers the rare cross-peer case where a peer sees `Op::MoveSheet`
+    /// for an `id` whose `Op::AddSheet` hasn't replayed locally yet
+    /// (Loro causal-merge eventually rectifies, but the strict-error
+    /// path would break the merge).
+    ///
+    /// **Idempotent if `id` already at `new_index`**: silently no-ops
+    /// (current_pos == new_index_clamped after the remove-then-insert
+    /// dance; the data structure is unchanged).
+    ///
+    /// Use [`Self::sheet_display_order`] to inspect the current order.
+    pub fn move_sheet(&mut self, id: SheetId, new_index: u32) {
+        let current_pos = match self.sheet_display_order.iter().position(|&i| i == id) {
+            Some(p) => p,
+            None => return, // id not in display_order; silent no-op
+        };
+        self.sheet_display_order.remove(current_pos);
+        // Clamp new_index to the new (post-remove) length.
+        let clamped = (new_index as usize).min(self.sheet_display_order.len());
+        self.sheet_display_order.insert(clamped, id);
+    }
+
+    /// **Phase 5.7 V3.5.0.3c (2026-05-24):** current display order.
+    /// Default (no `Op::MoveSheet` applied): `[0, 1, ..., sheet_count()
+    /// - 1]` in `Op::AddSheet` append order.  After `move_sheet` calls
+    /// the order can be any permutation of the sheet ids.
+    ///
+    /// **May contain tombstoned ids**: callers iterating for display
+    /// MUST filter via `is_sheet_removed(id)` (the napi `workbook_snapshot`
+    /// does this at V3.5.0.3c ship; direct Rust callers must too).
+    pub fn sheet_display_order(&self) -> &[SheetId] {
+        &self.sheet_display_order
     }
 
     // ===== W5-101 (Phase 4.7.H) spill-anchor API =====
