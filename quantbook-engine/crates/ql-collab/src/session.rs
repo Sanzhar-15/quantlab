@@ -183,6 +183,26 @@ enum CacheEffect {
     /// LACKED -- the leak surfaced as phantom entries in
     /// `list_sheets_from_cache`).
     RemoveSheet { id: u16 },
+    /// **V3.6.0.3 D2 (2026-05-24)**: session-wide format-table cache
+    /// update from `Op::RegisterFormat`.  Apply: insert `(id, string)`
+    /// into `format_table_cache`.
+    ///
+    /// **LWW caveat**: the engine `Workbook::FormatTable::register_at`
+    /// REJECTS same-id-different-string registrations (returns
+    /// `FormatTableError::AlreadyRegistered`).  The cache walker is
+    /// downstream of replay and accepts all RegisterFormat effects
+    /// blindly (LWW per iteration order); a cross-peer concurrent
+    /// `Op::RegisterFormat { id: SAME, string: DIFFERENT }` would
+    /// produce a cache that ends with the LAST iterated string but a
+    /// Workbook that has the FIRST.  Acceptable because the napi
+    /// `workbook_snapshot.formats` reads from the Workbook (authoritative
+    /// source); the cache is internal-only discipline + future-use
+    /// (V3.7+ incremental snapshot deltas).  V3.7+ could close the
+    /// divergence by mirroring the rejection logic in the walker.
+    ///
+    /// `string` uses `Arc<str>` for cheap clones across the walker
+    /// (collect_cache_effects -> apply_cache_effect).
+    RegisterFormat { id: FormatId, string: Arc<str> },
 }
 use ql_storage::{FormatId, Workbook};
 
@@ -726,6 +746,43 @@ pub struct CollabSession {
     ///
     /// **Rule 4**: `i64` is `Copy + Send + Sync` trivially.
     undo_merge_interval_ms: i64,
+
+    /// **Phase 5.7 V3.6.0.3 D2 (2026-05-24)** -- session-wide
+    /// FormatTable cache mirror.
+    ///
+    /// Tracks `(FormatId -> format_string)` entries registered via
+    /// `Op::RegisterFormat`.  Maintained incrementally in `append_op`
+    /// (via `CacheEffect::RegisterFormat`); rebuilt during
+    /// `from_snapshot` + `merge_bytes` + `discard_pending_ops` (same
+    /// 6-mutation-site discipline as `last_snapshot`).
+    ///
+    /// **Purpose**: discipline (every Op-emitted cache effect must
+    /// update the session-side cache; without this, the walker would
+    /// leave a gap for RegisterFormat).  Future use: V3.7+ incremental
+    /// snapshot deltas may emit format-cache deltas directly from this
+    /// field without re-iterating Workbook.formats.
+    ///
+    /// **Note on Builtin formats**: this cache holds ONLY Custom format
+    /// registrations (the only ones that come from `Op::RegisterFormat`).
+    /// Builtin formats (ids 0..=163 per Phase 5.2 D-1) are defined at
+    /// `FormatTable` construction and never appear in an op log.  The
+    /// napi `workbook_snapshot.formats` field iterates `Workbook.formats`
+    /// (authoritative; merges Builtin + Custom) -- NOT this cache --
+    /// so the IDE sees BOTH variants.
+    ///
+    /// **Cross-peer divergence**: see `CacheEffect::RegisterFormat`
+    /// docstring.  Conservative LWW-by-iteration semantic in the cache;
+    /// Workbook side rejects same-id-different-string.  Cache and
+    /// Workbook diverge on cross-peer collision; tolerated because
+    /// napi reads from Workbook.
+    ///
+    /// **Rule 4 per-field walk**: `HashMap<FormatId, Arc<str>>` is
+    /// `Send + Sync` -- `HashMap<K, V>: Send + Sync` iff `K: Send + Sync
+    /// && V: Send + Sync`.  `FormatId` (Phase 5.2 D-1) is enum of
+    /// `Builtin(u32)` + `Custom(PeerId, u32)`; PeerId wraps u64; all
+    /// primitive; Send + Sync trivially.  `Arc<str>: Send + Sync`
+    /// (std inherent impl).  0 new triggers; arc terminus stays at 6.
+    format_table_cache: HashMap<FormatId, Arc<str>>,
 }
 
 impl CollabSession {
@@ -787,6 +844,8 @@ impl CollabSession {
             inside_group: false,
             // V3.6.0.2 audit-closure: Loro default (no time-merge).
             undo_merge_interval_ms: 0,
+            // V3.6.0.3 D2: empty cache; no RegisterFormat ops yet.
+            format_table_cache: HashMap::new(),
         })
     }
 
@@ -858,6 +917,11 @@ impl CollabSession {
             // User-set interval doesn't persist across snapshots
             // (it's UndoManager-state, not workbook-state).
             undo_merge_interval_ms: 0,
+            // V3.6.0.3 D2: populated by `rebuild_snapshot_cache` below
+            // alongside `last_snapshot` -- the walker emits
+            // `CacheEffect::RegisterFormat` for each `Op::RegisterFormat`
+            // it sees, which apply_cache_effect inserts here.
+            format_table_cache: HashMap::new(),
         };
         sess.rebuild_snapshot_cache()?;
         Ok(sess)
@@ -966,7 +1030,12 @@ impl CollabSession {
             // + cell-keyed effects on tombstoned sheets are silently
             // dropped (Opus-H1 closure widened to all 4 cell-keyed
             // variants).
-            Self::apply_cache_effect(&mut self.last_snapshot, &mut self.removed_sheets, effect);
+            Self::apply_cache_effect(
+                &mut self.last_snapshot,
+                &mut self.removed_sheets,
+                &mut self.format_table_cache,
+                effect,
+            );
         }
         self.maybe_auto_flush()?;
         Ok(())
@@ -1019,6 +1088,16 @@ impl CollabSession {
             // and (b) record the tombstone so subsequent cell-keyed
             // effects on the same sheet are silently skipped.
             Op::RemoveSheet { id } => out.push(CacheEffect::RemoveSheet { id: *id }),
+            // **V3.6.0.3 D2 (2026-05-24)**: session-wide format-table
+            // cache update.  Op::RegisterFormat carries `id: FormatIdWire`
+            // (the wire shape) + `string: String`; convert id to storage
+            // shape via `to_storage()` (lossless) and wrap the string in
+            // Arc<str> for cheap clones across the walker.  See
+            // CacheEffect::RegisterFormat docstring for the LWW caveat.
+            Op::RegisterFormat { id, string } => out.push(CacheEffect::RegisterFormat {
+                id: id.to_storage(),
+                string: Arc::<str>::from(string.as_str()),
+            }),
             _ => {}
         }
     }
@@ -1042,17 +1121,19 @@ impl CollabSession {
     fn apply_cache_effect(
         snapshot: &mut HashMap<(u16, u32, u32), CellState>,
         tombstones: &mut HashSet<u16>,
+        format_cache: &mut HashMap<FormatId, Arc<str>>,
         effect: CacheEffect,
     ) {
         // V3.5.0.X audit-closure: cell-keyed effects on tombstoned sheets
-        // are silently dropped.  RemoveSheet handled below; this branch
-        // covers the four cell-keyed variants.
+        // are silently dropped.  RemoveSheet + RegisterFormat handled
+        // below; this branch covers the four cell-keyed variants.
         let target_sheet = match &effect {
             CacheEffect::PutValue { key, .. } => Some(key.0),
             CacheEffect::PutFormula { key, .. } => Some(key.0),
             CacheEffect::ClearFormula { key } => Some(key.0),
             CacheEffect::SetCellFormat { key, .. } => Some(key.0),
             CacheEffect::RemoveSheet { .. } => None,
+            CacheEffect::RegisterFormat { .. } => None,
         };
         if let Some(sheet) = target_sheet {
             if tombstones.contains(&sheet) {
@@ -1120,6 +1201,15 @@ impl CollabSession {
             CacheEffect::RemoveSheet { id } => {
                 tombstones.insert(id);
                 snapshot.retain(|(sheet, _, _), _| *sheet != id);
+            }
+            // V3.6.0.3 D2 (2026-05-24): session-wide format-table cache
+            // mirror.  LWW-by-iteration (later RegisterFormat with same
+            // id overwrites earlier).  Cross-peer divergence with
+            // Workbook side is documented + tolerated (see field docstring
+            // + CacheEffect::RegisterFormat docstring).  No tombstone
+            // check needed (RegisterFormat is sheet-independent).
+            CacheEffect::RegisterFormat { id, string } => {
+                format_cache.insert(id, string);
             }
         }
     }
@@ -1244,6 +1334,28 @@ impl CollabSession {
         sheets.into_iter().collect()
     }
 
+    /// **Phase 5.7 V3.6.0.3 D2 (2026-05-24)** -- iterate the session-
+    /// wide format-table cache (`(FormatId, format_string)` pairs).
+    ///
+    /// Contains entries from `Op::RegisterFormat` applications in the
+    /// op log.  Does NOT include Builtin formats (those are static at
+    /// `FormatTable` construction; not emitted via any Op).  Iteration
+    /// order is HashMap iteration (NOT deterministic across runs);
+    /// callers wanting stable order should sort.
+    ///
+    /// **Authoritative source caveat**: the engine `Workbook::FormatTable`
+    /// is the authoritative source (it merges Builtin + Custom + applies
+    /// the same-id-different-string rejection).  The session cache is
+    /// a downstream mirror; under cross-peer concurrent
+    /// `Op::RegisterFormat { id: SAME, string: DIFFERENT }`, the cache
+    /// + Workbook may diverge.  napi `workbook_snapshot.formats` reads
+    /// from the Workbook (NOT this cache) to avoid surfacing divergence.
+    /// This accessor is for V3.7+ incremental-snapshot-delta use cases
+    /// + cross-peer-convergence regression tests.
+    pub fn format_table_cache_iter(&self) -> impl Iterator<Item = (&FormatId, &Arc<str>)> {
+        self.format_table_cache.iter()
+    }
+
     /// **Phase 5.7 V3.3.0.X audit closure (MEDIUM-5, 2026-05-23) --
     /// test-only snapshot cache invalidation seam.**
     ///
@@ -1278,6 +1390,13 @@ impl CollabSession {
     pub fn force_clear_snapshot_cache(&mut self) {
         self.last_snapshot.clear();
         self.removed_sheets.clear();
+        // V3.6.0.3 D2: also clear the format-table cache.  Same
+        // rationale as removed_sheets above: the test seam is "force
+        // cache to a clean state" + all cache-walker state should
+        // reset together.  rebuild_snapshot_cache overwrites both
+        // atomically in the canonical pattern; defensive reset for
+        // tests using force_clear in isolation.
+        self.format_table_cache.clear();
     }
 
     /// **Phase 5.7 V3.3.0.3 + V3.4.0.2 -- snapshot cache accessor
@@ -1397,17 +1516,27 @@ impl CollabSession {
         // Atomic-swap with `self.removed_sheets` only after the rebuild
         // succeeds (mirrors the `fresh -> self.last_snapshot` swap).
         let mut fresh_tombstones: HashSet<u16> = HashSet::new();
+        // V3.6.0.3 D2: rebuild the format-table cache alongside the
+        // cell cache.  Atomic-swap with `self.format_table_cache` after
+        // rebuild succeeds.  Same pattern as `fresh_tombstones`.
+        let mut fresh_format_cache: HashMap<FormatId, Arc<str>> = HashMap::new();
         let mut effects: Vec<CacheEffect> = Vec::new();
         for op_result in self.log.iter() {
             let op = op_result.map_err(CollabSessionError::OpLog)?;
             effects.clear();
             Self::collect_cache_effects(&op, &mut effects);
             for effect in effects.drain(..) {
-                Self::apply_cache_effect(&mut fresh, &mut fresh_tombstones, effect);
+                Self::apply_cache_effect(
+                    &mut fresh,
+                    &mut fresh_tombstones,
+                    &mut fresh_format_cache,
+                    effect,
+                );
             }
         }
         self.last_snapshot = fresh;
         self.removed_sheets = fresh_tombstones;
+        self.format_table_cache = fresh_format_cache;
         Ok(())
     }
 
@@ -1469,6 +1598,11 @@ impl CollabSession {
         // any subsequent cell-keyed effect on that cell.  This local
         // tracker mirrors the rebuild_snapshot_cache pattern.
         let mut local_tombstones: HashSet<u16> = HashSet::new();
+        // V3.6.0.3 D2: invalidate_cell does NOT mutate the format-table
+        // cache (it's session-wide, not per-cell).  Use a throwaway
+        // local cache for apply_cache_effect's signature; the cache's
+        // session-level value stays untouched by this method.
+        let mut local_format_cache: HashMap<FormatId, Arc<str>> = HashMap::new();
         for op_result in self.log.iter() {
             let op = op_result.map_err(CollabSessionError::OpLog)?;
             effects.clear();
@@ -1477,7 +1611,9 @@ impl CollabSession {
                 // Only apply effects targeting the requested cell OR the
                 // RemoveSheet effect (which we always apply locally so
                 // subsequent cell-keyed effects on the tombstoned sheet
-                // are filtered).
+                // are filtered).  RegisterFormat is SKIPPED here -- the
+                // session-level format_table_cache is not invalidated
+                // per-cell; only rebuild_snapshot_cache reconstructs it.
                 let apply = match &effect {
                     CacheEffect::PutValue { key, .. } => *key == target_key,
                     CacheEffect::PutFormula { key, .. } => *key == target_key,
@@ -1488,9 +1624,17 @@ impl CollabSession {
                     // operation is O(local_snapshot size) which is at
                     // most 1 entry during invalidate_cell.
                     CacheEffect::RemoveSheet { .. } => true,
+                    // V3.6.0.3 D2: RegisterFormat effects are session-wide;
+                    // invalidate_cell never touches them.
+                    CacheEffect::RegisterFormat { .. } => false,
                 };
                 if apply {
-                    Self::apply_cache_effect(&mut local_snapshot, &mut local_tombstones, effect);
+                    Self::apply_cache_effect(
+                        &mut local_snapshot,
+                        &mut local_tombstones,
+                        &mut local_format_cache,
+                        effect,
+                    );
                 }
             }
         }
@@ -2272,6 +2416,9 @@ impl CollabSession {
         if self.undo_merge_interval_ms != 0 {
             self.undo.set_merge_interval(self.undo_merge_interval_ms);
         }
+        // V3.6.0.3 D2: format_table_cache was rebuilt by
+        // `rebuild_snapshot_cache` above (alongside last_snapshot +
+        // removed_sheets); no extra reset needed here.
         Ok(pre_count)
     }
 
@@ -3271,6 +3418,16 @@ mod tests {
         }
     }
 
+    /// **V3.6.0.3 D2 test helper (2026-05-24)** -- emit a custom
+    /// `Op::RegisterFormat` for the local peer.  `counter` is the
+    /// per-peer FormatId counter (caller's responsibility to advance).
+    fn register_custom_format(peer: PeerId, counter: u32, s: &str) -> Op {
+        Op::RegisterFormat {
+            id: ql_oplog::wire::FormatIdWire::Custom { peer, counter },
+            string: s.to_string(),
+        }
+    }
+
     #[test]
     fn new_session_is_empty() {
         let s = CollabSession::new(PeerId::new(1)).unwrap();
@@ -3756,6 +3913,97 @@ mod tests {
              (V3.6.0.2 audit-closure: `undo_merge_interval_ms > 0` \
              gates empty-cells staging in append_op)"
         );
+    }
+
+    #[test]
+    fn register_format_op_populates_session_format_table_cache() {
+        // **V3.6.0.3 D2 (2026-05-24)** -- regression test: an
+        // `Op::RegisterFormat` append updates the session-side
+        // `format_table_cache` via `CacheEffect::RegisterFormat`.
+        //
+        // Verifies the cache walker discipline: every Op that emits
+        // cache effects has them propagated to the session-side
+        // cache via append_op's per-effect apply loop.
+        let peer = PeerId::new(7);
+        let mut s = CollabSession::new(peer).unwrap();
+
+        // Pre-condition: empty cache.
+        assert_eq!(
+            s.format_table_cache_iter().count(),
+            0,
+            "fresh session has empty format_table_cache"
+        );
+
+        // Append three RegisterFormat ops with distinct ids + strings.
+        s.append_op(register_custom_format(peer, 0, "0.00%")).unwrap();
+        s.append_op(register_custom_format(peer, 1, "yyyy-mm-dd")).unwrap();
+        s.append_op(register_custom_format(peer, 2, "$#,##0.00")).unwrap();
+
+        // Post-condition: cache has all three entries.
+        let entries: Vec<(FormatId, String)> = s
+            .format_table_cache_iter()
+            .map(|(id, s)| (*id, s.as_ref().to_string()))
+            .collect();
+        assert_eq!(entries.len(), 3, "three RegisterFormat ops -> three cache entries");
+
+        // Verify each entry is present.
+        for (expected_counter, expected_string) in [
+            (0u32, "0.00%"),
+            (1, "yyyy-mm-dd"),
+            (2, "$#,##0.00"),
+        ] {
+            let expected_id = FormatId::Custom(peer, expected_counter);
+            let found = entries.iter().any(|(id, s)| *id == expected_id && s == expected_string);
+            assert!(
+                found,
+                "cache must contain ({:?}, {:?})",
+                expected_id, expected_string
+            );
+        }
+    }
+
+    #[test]
+    fn register_format_cache_rebuilds_from_log_via_rebuild_snapshot_cache() {
+        // **V3.6.0.3 D2** -- verify that `rebuild_snapshot_cache` (the
+        // path used by merge_bytes / from_snapshot / discard_pending_ops)
+        // correctly rebuilds the format_table_cache alongside
+        // last_snapshot + removed_sheets.
+        let peer = PeerId::new(7);
+        let mut s = CollabSession::new(peer).unwrap();
+        s.append_op(register_custom_format(peer, 0, "0.00%")).unwrap();
+        s.append_op(register_custom_format(peer, 1, "yyyy-mm-dd")).unwrap();
+
+        // Pre-condition: incremental cache populated.
+        assert_eq!(s.format_table_cache_iter().count(), 2);
+
+        // Force a full rebuild via the test seam.
+        s.force_clear_snapshot_cache();
+        assert_eq!(
+            s.format_table_cache_iter().count(),
+            0,
+            "force_clear_snapshot_cache also clears format_table_cache (V3.6.0.3 \
+             extended the test seam alongside last_snapshot + removed_sheets clears)"
+        );
+        // Rebuild from the log; format_table_cache should repopulate.
+        s.rebuild_snapshot_cache().unwrap();
+        let entries: Vec<(FormatId, String)> = s
+            .format_table_cache_iter()
+            .map(|(id, s)| (*id, s.as_ref().to_string()))
+            .collect();
+        assert_eq!(
+            entries.len(),
+            2,
+            "rebuild_snapshot_cache repopulates the format_table_cache from the op log"
+        );
+        for (counter, string) in [(0u32, "0.00%"), (1, "yyyy-mm-dd")] {
+            let expected = FormatId::Custom(peer, counter);
+            assert!(
+                entries.iter().any(|(id, s)| *id == expected && s == string),
+                "post-rebuild: cache contains ({:?}, {:?})",
+                expected,
+                string
+            );
+        }
     }
 
     #[test]

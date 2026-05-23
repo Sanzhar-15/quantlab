@@ -612,6 +612,50 @@ pub struct SheetSnapshotJson {
 #[napi(object)]
 pub struct WorkbookSnapshotJson {
     pub sheets: Vec<SheetSnapshotJson>,
+    /// **Phase 5.7 V3.6.0.3 D2 (2026-05-24)**: session-wide format
+    /// registry, populated from the rebuilt-and-repaired Workbook's
+    /// `FormatTable` (authoritative source -- merges Builtin ids
+    /// 0..=163 with Custom ids registered via `Op::RegisterFormat`).
+    ///
+    /// Used by V3.6+ format-aware buildHtml rendering (D4): IDE looks
+    /// up each cell's `format: FormatIdJson` against this list to find
+    /// the format string (e.g., `"0.00%"`, `"yyyy-mm-dd"`) for
+    /// number/date/currency rendering.
+    ///
+    /// **Sort order**: iteration order of `FormatTable::iter()` (stable
+    /// for a given version + workbook state; not sorted by id).
+    /// Callers wanting deterministic order should sort client-side.
+    ///
+    /// **Additive field** (V3.5.0.2 WorkbookSnapshotJson shape break-
+    /// free extension): V3.5 IDE consumers that destructure
+    /// `.sheets` continue to work; consumers wanting formats opt in
+    /// via `.formats`.  Mirrors the V3.5.0.5 per-cell format additive
+    /// extension on CellSnapshotJson.
+    pub formats: Vec<FormatDefJson>,
+}
+
+/// **Phase 5.7 V3.6.0.3 D2 (2026-05-24)** -- one format registration
+/// in the WorkbookSnapshot's `formats` array.  Pairs a `FormatIdJson`
+/// (V3.5.0.5 wire shape) with its format string.
+///
+/// For V3.6+ format-aware buildHtml rendering (D4): IDE looks up
+/// `CellSnapshotJson.format: Option<FormatIdJson>` against this list
+/// to find the matching format string.
+///
+/// **Rule 4 per-field walk**: `id: FormatIdJson` Send + Sync via the
+/// V3.5.0.5 walk (positive composition of primitives + Option<u32> +
+/// Option<BigInt>); `string: String` Send + Sync trivially.
+/// Composition: `FormatDefJson: Send + Sync`.  **0 new Rule 4
+/// triggers**; arc terminus stays at 6.
+#[napi(object)]
+pub struct FormatDefJson {
+    /// The FormatId in V3.5.0.5 wire shape (kind = "builtin" |
+    /// "custom"; payload fields per kind).
+    pub id: FormatIdJson,
+    /// The format string (e.g., `"0.00%"`, `"yyyy-mm-dd"`).  Used by
+    /// V3.6+ engine-side `FormatTable::render_value` for number / date
+    /// / currency display.
+    pub string: String,
 }
 
 #[napi(object)]
@@ -1625,7 +1669,33 @@ impl CollabSession {
                 cells,
             });
         }
-        Ok(WorkbookSnapshotJson { sheets })
+        // **V3.6.0.3 D2 (2026-05-24)**: populate the `formats` field
+        // from the rebuilt+repaired Workbook's FormatTable.  The
+        // FormatTable is the AUTHORITATIVE source (merges Builtin ids
+        // 0..=163 with Custom ids registered via Op::RegisterFormat;
+        // applies the same-id-different-string rejection via
+        // register_at).  The session-side `format_table_cache` exists
+        // for V3.7+ incremental-snapshot-delta + cross-peer-convergence
+        // discipline but is NOT consulted here -- under cross-peer
+        // concurrent RegisterFormat the cache could diverge from the
+        // workbook (cache LWW vs workbook reject) and we'd surface
+        // the WRONG string to the IDE.  Workbook iteration is the
+        // safe choice.
+        //
+        // Iteration order is FormatTable's internal HashMap iteration
+        // (NOT sorted by id).  Callers wanting deterministic order
+        // should sort client-side.  Iteration cost is O(N_formats)
+        // where typical workbooks have < 100 custom formats; negligible
+        // vs the rebuild_workbook + snapshot_cells cost.
+        let formats: Vec<FormatDefJson> = workbook
+            .formats()
+            .iter()
+            .map(|(id, s)| FormatDefJson {
+                id: FormatIdJson::from(id),
+                string: s.to_string(),
+            })
+            .collect();
+        Ok(WorkbookSnapshotJson { sheets, formats })
     }
 
     /// **Phase 5.7 V3.4.0.4a (2026-05-23) -- load a session from a
