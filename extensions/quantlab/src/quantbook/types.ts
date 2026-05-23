@@ -65,6 +65,23 @@ export interface CollabSessionInstance {
 	 */
 	appendPutValue(sheet: number, row: number, col: number, value: number): void;
 
+	/**
+	 * **Phase 5.7 V3.4.0.4a (2026-05-23)** -- append an `Op::AddSheet`
+	 * to the session.  Sheet ids are deterministic + assigned by the
+	 * engine on replay in op-log append order (first `addSheet` call
+	 * creates sheet 0, second creates sheet 1, ...).
+	 *
+	 * Surfaced at V3.4.0.4a because `to_qbook` -> `rebuild_workbook`
+	 * replay requires sheets to exist before any `PutValue` on them.
+	 * Callers building sessions for .qbook persistence MUST `addSheet`
+	 * before `appendPutValue` for that sheet.
+	 *
+	 * `chunkRows`: per-sheet row partition size for the Workbook's
+	 * internal storage (Phase 2A optimization).  Pass 1000 for typical
+	 * V3.4 scale.
+	 */
+	addSheet(name: string, chunkRows: number): void;
+
 	/** Full snapshot export. Use for initial sync / handshake. */
 	exportBytes(): Uint8Array;
 
@@ -244,6 +261,27 @@ export interface CollabSessionInstance {
 	 * call this, then call {@link peerPresence} per returned id.
 	 */
 	peersWithPresence(): bigint[];
+
+	// =====================================================================
+	// Phase 5.7 V3.4.0.4a (2026-05-23) -- .qbook persistence (save side)
+	// (load side is the {@link CollabSessionConstructor.fromQbook} factory).
+	// =====================================================================
+
+	/**
+	 * Save this session to a `.qbook` directory at `path`.
+	 *
+	 * Atomic two-file write (workbook.toml + oplog.bin) via the Tier
+	 * D3 envelope format.  The persistence helper requires a fully-
+	 * rebuilt Workbook; the napi impl calls `rebuild_workbook` +
+	 * `default_registry` internally (V3.4.0.4 plan note: engine-side
+	 * Workbook materialization at save IS allowed even though
+	 * IDE-side Workbook consumption stays V3.5+ scope).
+	 *
+	 * Throws engine errors with structured codes via parseQuantbookError:
+	 * - `[session_oplog]` rebuild_workbook failure (replay or repair)
+	 * - `[qbook_error]` persistence layer failure (I/O, schema)
+	 */
+	toQbook(path: string): void;
 
 	// =====================================================================
 	// Phase 5.7 V2.1 (2026-05-22) -- Transport surface (sync portion)
@@ -591,6 +629,25 @@ export interface CollabSessionConstructor {
 
 	/** Reconstruct a session from a previously-exported snapshot. */
 	fromSnapshot(peerId: bigint, bytes: Uint8Array): CollabSessionInstance;
+
+	/**
+	 * **Phase 5.7 V3.4.0.4a (2026-05-23) -- load a session from a
+	 * `.qbook` directory at `path`.**
+	 *
+	 * `peerIdOverride` MUST be a fresh / stored-previously BigInt
+	 * peer-id.  V3.4.0.4a engine layer is peer-id-agnostic;
+	 * V3.4.0.4b IDE commands generate UUID-derived BigInts via
+	 * `crypto.randomUUID()` for cross-restart collision-resistance
+	 * (closes R-V3.3-5 / V3.4.0.1 D5).
+	 *
+	 * Throws engine errors with structured codes via parseQuantbookError:
+	 * - `[bad_argument]` peerIdOverride zero / negative / exceeds u64
+	 * - `[qbook_error]` workbook.toml missing/malformed/schema mismatch
+	 * - `[qbook_unsupported_version]` / `[qbook_truncated_header]`
+	 *    oplog.bin Tier D3 header issues
+	 * - `[session_oplog]` Loro snapshot decode failure
+	 */
+	fromQbook(path: string, peerIdOverride: bigint): CollabSessionInstance;
 }
 
 // =====================================================================
@@ -775,6 +832,15 @@ export type QuantbookErrorCode =
 	| 'session_presence'
 	| 'session_undo'
 	| 'session_replay'
+	// **V3.4.0.4a (2026-05-23)**: persistence-layer errors emitted by
+	// the napi `toQbook` / `fromQbook` wrappers via
+	// `persistence_error_to_napi`.  The PersistenceError enum is
+	// `#[non_exhaustive]` so a `qbook_unknown` sentinel covers future
+	// variants until this list is extended.
+	| 'qbook_error'
+	| 'qbook_unsupported_version'
+	| 'qbook_truncated_header'
+	| 'qbook_unknown'
 	// **V2.7 audit closure (Opus MEDIUM-2, 2026-05-22)**: napi-layer
 	// argument validation + single-use violation errors that are
 	// NOT engine error types (peerId range check, blockMs > 0,

@@ -111,6 +111,54 @@ export function sessionFromSnapshot(peerId: bigint, bytes: Uint8Array): CollabSe
 }
 
 /**
+ * **Phase 5.7 V3.4.0.4a (2026-05-23) -- typed wrapper for
+ * `CollabSession.toQbook`.**
+ *
+ * Save the session to a `.qbook` directory at `path`.  Atomic two-file
+ * write (workbook.toml + oplog.bin); readers cannot observe a partial
+ * workbook.  Internally calls `rebuild_workbook` + `default_registry`
+ * inside the engine layer (V3.4.0.4 plan note on the engine-side
+ * Workbook materialization at save).
+ *
+ * Single-line indirection mirrors `sessionFromSnapshot` pattern for
+ * API surface stability across future engine signature changes.
+ */
+export function exportToQbook(session: CollabSessionInstance, path: string): void {
+	session.toQbook(path);
+}
+
+/**
+ * **Phase 5.7 V3.4.0.4a (2026-05-23) -- typed wrapper for
+ * `CollabSession.fromQbook`.**
+ *
+ * Load a session from a `.qbook` directory at `path`.  Caller MUST
+ * pass `peerIdOverride` -- a fresh BigInt (e.g., UUID-derived per
+ * V3.4.0.1 D5) for "first open" or a stored-previously BigInt for
+ * "rejoin with same identity".  V3.4.0.4b IDE commands handle the
+ * UUID generation + per-workbook stash.
+ */
+export function sessionFromQbook(path: string, peerIdOverride: bigint): CollabSessionInstance {
+	const engine = loadQuantbookEngine();
+	return engine.CollabSession.fromQbook(path, peerIdOverride);
+}
+
+/**
+ * **Phase 5.7 V3.4.0.4a (2026-05-23) -- typed wrapper for
+ * `CollabSession.addSheet`.**
+ *
+ * Append an `Op::AddSheet` so subsequent `appendPutValue` ops can
+ * replay successfully via `rebuild_workbook` (which `to_qbook` calls
+ * internally).
+ *
+ * Sheet ids assigned in append order: first call -> sheet 0, second
+ * -> 1, etc.  `chunkRows` is the per-sheet row partition size for
+ * Workbook storage; 1000 is a sane default at V3.4 scale.
+ */
+export function addSheet(session: CollabSessionInstance, name: string, chunkRows = 1000): void {
+	session.addSheet(name, chunkRows);
+}
+
+/**
  * Return the engine binding crate's version string. For diagnostics
  * + the V2 version-mismatch error path.
  */
@@ -486,6 +534,12 @@ const KNOWN_QUANTBOOK_ERROR_CODE_RECORD: Record<Exclude<QuantbookErrorCode, 'unk
 	session_undo: true,
 	session_replay: true,
 	bad_argument: true,
+	// V3.4.0.4a persistence codes (matching `persistence_error_to_napi`
+	// in `crates/ql-bindings-node/src/lib.rs`).
+	qbook_error: true,
+	qbook_unsupported_version: true,
+	qbook_truncated_header: true,
+	qbook_unknown: true,
 };
 
 /**

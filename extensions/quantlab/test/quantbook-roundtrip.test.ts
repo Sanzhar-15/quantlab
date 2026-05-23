@@ -36,6 +36,8 @@
 
 import * as assert from 'assert';
 import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 
 import {
 	loadQuantbookEngine,
@@ -44,11 +46,13 @@ import {
 	_resetQuantbookEngineCacheForTests,
 } from '../src/quantbook/loader';
 import {
+	addSheet,
 	appendPutValueValidated,
 	buildPresenceSnapshotJson,
 	clearPresence,
 	createSession,
 	exportCellSnapshot,
+	exportToQbook,
 	isAutoFlushPolicy,
 	isQuantbookErrorCode,
 	listSheets,
@@ -58,6 +62,7 @@ import {
 	peersWithPresence,
 	quantbookEngineVersion,
 	redo,
+	sessionFromQbook,
 	sessionFromSnapshot,
 	sweepPresence,
 	undo,
@@ -3893,5 +3898,134 @@ suite('quantbook V3.4.0.5b -- dispatchIncomingMessage presenceUpdate arm', funct
 
 		assert.strictEqual(errorReplies.length, 1);
 		assert.strictEqual(errorReplies[0].code, 'bad_argument');
+	});
+});
+
+// ============================================================================
+// Phase 5.7 V3.4.0.4a -- .qbook persistence (engine napi round-trip)
+// ============================================================================
+//
+// V3.4.0.4a engine ship: napi `toQbook` + `fromQbook` over
+// `ql_io::save_workbook_with_oplog` + `load_workbook_with_oplog`.
+// V3.4.0.4b IDE commands (showSaveDialog/showOpenDialog +
+// UUID-derived PeerId generation) defer to a separate sub-step.
+
+suite('quantbook V3.4.0.4a -- .qbook persistence napi round-trip', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	// Per-test scratch dir under os.tmpdir to keep CI clean.
+	let scratchRoot: string;
+	setup(() => {
+		scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'qbook-v3404a-'));
+	});
+	teardown(() => {
+		try { fs.rmSync(scratchRoot, { recursive: true, force: true }); } catch { /* test cleanup */ }
+	});
+
+	function qbookPath(name: string): string {
+		return path.join(scratchRoot, `${name}.qbook`);
+	}
+
+	test('empty session round-trip preserves emptiness + uses peerIdOverride on load', () => {
+		const sessA = createSession(3701n);
+		const target = qbookPath('empty');
+		exportToQbook(sessA, target);
+
+		// Sanity: directory exists with the two-file shape.
+		assert.ok(fs.existsSync(target), '.qbook dir created');
+		assert.ok(fs.existsSync(path.join(target, 'workbook.toml')), 'envelope present');
+		assert.ok(fs.existsSync(path.join(target, 'oplog.bin')), 'op log present');
+
+		const sessB = sessionFromQbook(target, 9999n);
+		assert.strictEqual(sessB.peerId(), 9999n,
+			'peerIdOverride wins over the original session\'s peer-id');
+		assert.strictEqual(sessB.opCount(), 0,
+			'empty round-trip preserves empty op log');
+	});
+
+	test('session with cells: round-trip preserves all cells via cache rebuild', () => {
+		const sessA = createSession(3702n);
+		// V3.4.0.4a: addSheet before PutValue so rebuild_workbook
+		// replay (called inside to_qbook) doesn't fail with
+		// session_replay -- invalid sheet.  Append order assigns
+		// ids deterministically: first call -> sheet 0, second ->
+		// sheet 1, third -> sheet 2.
+		addSheet(sessA, 'S0');
+		addSheet(sessA, 'S1');
+		addSheet(sessA, 'S2');
+		appendPutValueValidated(sessA, 0, 0, 0, 42);
+		appendPutValueValidated(sessA, 0, 1, 0, 100);
+		appendPutValueValidated(sessA, 2, 5, 5, 3.14);
+		const snapA0 = exportCellSnapshot(sessA, 0);
+		const snapA2 = exportCellSnapshot(sessA, 2);
+
+		const target = qbookPath('with-cells');
+		exportToQbook(sessA, target);
+		const sessB = sessionFromQbook(target, 8888n);
+
+		// from_snapshot rebuilds last_snapshot cache; exportCellSnapshot
+		// reads from the cache.  Pin parity with the source session.
+		const snapB0 = exportCellSnapshot(sessB, 0);
+		const snapB2 = exportCellSnapshot(sessB, 2);
+		assert.deepStrictEqual(snapB0.entries, snapA0.entries, 'sheet 0 cells preserved');
+		assert.deepStrictEqual(snapB2.entries, snapA2.entries, 'sheet 2 cells preserved');
+	});
+
+	test('listSheets survives round-trip (V3.3.0.X cache derives sheet set from CellState keys)', () => {
+		const sessA = createSession(3703n);
+		// addSheet x6 to create sheets 0..5 (PutValue can then target
+		// sheets 1, 3, 5 deterministically).  Append order ->
+		// sheet-id assignment: 0..5.
+		for (let i = 0; i < 6; i += 1) {
+			addSheet(sessA, `S${i}`);
+		}
+		appendPutValueValidated(sessA, 5, 0, 0, 1);
+		appendPutValueValidated(sessA, 1, 0, 0, 1);
+		appendPutValueValidated(sessA, 3, 0, 0, 1);
+		// listSheets in sessA returns sorted [1, 3, 5].
+		assert.deepStrictEqual(listSheets(sessA), [1, 3, 5]);
+
+		const target = qbookPath('multi-sheet');
+		exportToQbook(sessA, target);
+		const sessB = sessionFromQbook(target, 7777n);
+		assert.deepStrictEqual(listSheets(sessB), [1, 3, 5],
+			'sheets enumeration matches source after round-trip');
+	});
+
+	test('fromQbook with non-existent path throws structured error', () => {
+		const bogus = path.join(scratchRoot, 'does-not-exist.qbook');
+		try {
+			sessionFromQbook(bogus, 1n);
+			assert.fail('expected throw for missing .qbook directory');
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			// Could be either qbook_error (envelope missing) or
+			// qbook_unknown if some new wildcard variant surfaces.
+			assert.ok(
+				info.code === 'qbook_error' || info.code === 'qbook_unknown',
+				`expected qbook-prefixed code, got ${info.code}`,
+			);
+		}
+	});
+
+	test('fromQbook with peerIdOverride = 0 throws bad_argument (LEGACY_PEER sentinel)', () => {
+		// Save anything so the path is valid; the load path's peer-id
+		// validation should fire BEFORE the file is touched (validation
+		// at the napi argument-parsing layer).
+		const sessA = createSession(3704n);
+		const target = qbookPath('peer-validation');
+		exportToQbook(sessA, target);
+
+		try {
+			sessionFromQbook(target, 0n);
+			assert.fail('expected throw for peerId=0 (LEGACY_PEER sentinel)');
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			assert.strictEqual(info.code, 'bad_argument',
+				`peer_id_from_bigint rejects zero with bad_argument; got ${info.code}`);
+		}
 	});
 });
