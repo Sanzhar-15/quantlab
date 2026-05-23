@@ -681,6 +681,51 @@ pub struct CollabSession {
     /// bool` field (which is REMOVED at V3.6.0.2); arc terminus stays
     /// at 6 (no new triggers; one field swapped for another).
     pending_undo_cells: Arc<Mutex<Option<Vec<(u16, u32, u32)>>>>,
+
+    /// **Phase 5.7 V3.6.0.2 audit-closure (2026-05-24)** -- grouped-undo
+    /// flag for the partial-invalidate fallback.
+    ///
+    /// `true` between `start_undo_group()` and `end_undo_group()`; `false`
+    /// otherwise.  Used by `append_op` to gate the
+    /// `pending_undo_cells` staging: when inside a group, stage EMPTY
+    /// cells -> meta encodes empty list -> `undo()` decodes empty ->
+    /// falls back to full `rebuild_snapshot_cache`.
+    ///
+    /// **Why**: Loro's `push_with_merge` (loro-internal-1.12.0/src/undo.rs:
+    /// 389-396) DISCARDS the new meta when merging spans inside a
+    /// group -- only the FIRST push contributes its meta.  V3.6.0.2's
+    /// on_push handoff alone would invalidate only the first op's cells
+    /// (Codex Lane A probe demonstrated the regression).  The clean
+    /// fix (union cells via `set_top_undo_meta`) requires Loro's
+    /// internal API which isn't exposed on the public `loro::UndoManager`;
+    /// V3.6.0.2 audit-closure ships the conservative fallback instead
+    /// (matches V3.5.0.6 semantics for grouped undo).  V3.6+ could
+    /// optimize via an upstream patch to expose `set_top_undo_meta`.
+    ///
+    /// **Rule 4 per-field walk**: `bool` is `Copy + Send + Sync`
+    /// trivially.  0 new triggers; arc terminus stays at 6.
+    inside_group: bool,
+
+    /// **Phase 5.7 V3.6.0.2 audit-closure (2026-05-24)** -- session-
+    /// side mirror of Loro's UndoManager merge-interval setting.
+    ///
+    /// Loro's auto-merge (`set_change_merge_interval` / `set_merge_interval`)
+    /// fires `push_with_merge` for consecutive appends within
+    /// `merge_interval_in_ms` of each other (loro-internal-1.12.0/src/
+    /// undo.rs:484-549).  Same meta-discard pathology as grouped undo:
+    /// only the FIRST push's meta survives the merge.
+    ///
+    /// When `undo_merge_interval_ms > 0`, `append_op` stages EMPTY
+    /// cells (same conservative fallback as `inside_group`).  Default
+    /// 0 (no time-based merging) keeps partial-invalidate active.
+    ///
+    /// **Reapplied across `discard_pending_ops`**: the recreated
+    /// UndoManager has Loro's default 0; we reapply the session-tracked
+    /// value via `set_merge_interval` so user-set intervals persist
+    /// across the discard pivot.
+    ///
+    /// **Rule 4**: `i64` is `Copy + Send + Sync` trivially.
+    undo_merge_interval_ms: i64,
 }
 
 impl CollabSession {
@@ -738,6 +783,10 @@ impl CollabSession {
             // V3.5.0.X: empty tombstone set; no RemoveSheet ops yet.
             removed_sheets: HashSet::new(),
             pending_undo_cells,
+            // V3.6.0.2 audit-closure: fresh session, no group active.
+            inside_group: false,
+            // V3.6.0.2 audit-closure: Loro default (no time-merge).
+            undo_merge_interval_ms: 0,
         })
     }
 
@@ -799,6 +848,16 @@ impl CollabSession {
             // inserts here.
             removed_sheets: HashSet::new(),
             pending_undo_cells,
+            // V3.6.0.2 audit-closure: from_snapshot constructs a fresh
+            // UndoManager via `make_undo_manager` (Loro's UndoManager
+            // state is in-memory, not part of the snapshot).  The new
+            // session starts with no active group regardless of the
+            // source session's state.
+            inside_group: false,
+            // V3.6.0.2 audit-closure: Loro default (no time-merge).
+            // User-set interval doesn't persist across snapshots
+            // (it's UndoManager-state, not workbook-state).
+            undo_merge_interval_ms: 0,
         };
         sess.rebuild_snapshot_cache()?;
         Ok(sess)
@@ -863,8 +922,41 @@ impl CollabSession {
         // to full `rebuild_snapshot_cache` (correct conservative
         // path; same as pre-V3.6.0.2 V3.5.0.6 dispatch for these
         // shapes).
-        let staged_cells = Self::affected_cells_for_partial_invalidate(&op)
-            .unwrap_or_default();
+        // **Phase 5.7 V3.6.0.2 audit-closure (2026-05-24) -- grouped-undo
+        // fallback**: Loro's `push_with_merge` (loro-internal-1.12.0/src/
+        // undo.rs:389-396) DISCARDS the new meta when merging spans
+        // during a grouped push -- only the FIRST push in the merge
+        // group contributes meta to the stack item.  Pre-fix, this
+        // caused `undo()` of a 5-op group to invalidate only the FIRST
+        // op's cells (the other 4 cache entries stayed stale).  Codex
+        // Lane A probe `codex_tmp_grouped_undo_cache_probe` demonstrated
+        // the regression.
+        //
+        // The clean fix (union cells into top_undo_meta via
+        // `set_top_undo_meta`) is BLOCKED: that API exists on
+        // `loro_internal::undo::UndoManager` but is NOT exposed on the
+        // public `loro::UndoManager`.  Pulling in loro-internal as a
+        // direct dependency would reach into Loro's private API surface.
+        //
+        // Conservative closure (matches V3.5.0.6 semantics): when
+        // `inside_group == true`, stage EMPTY cells -> meta encodes
+        // empty list -> `undo()` decodes empty -> falls back to full
+        // `rebuild_snapshot_cache` (correct + safe).  Partial-invalidate
+        // optimization for grouped ops deferred to V3.6+ as a perf
+        // polish IF profiling justifies (likely needs an upstream
+        // contribution to expose `set_top_undo_meta`).
+        // V3.6.0.2 audit-closure gate: fall back to full-rebuild on
+        // undo whenever Loro might merge the next push.  Two cases:
+        // - `inside_group`: explicit user-grouped op (start/end_undo_group).
+        // - `undo_merge_interval_ms > 0`: user-set time-merge window
+        //   active.  Even if THIS append doesn't actually merge (e.g.,
+        //   long pause since last edit), we don't know without timing
+        //   data we don't have.  Conservative.
+        let staged_cells = if self.inside_group || self.undo_merge_interval_ms > 0 {
+            Vec::new()
+        } else {
+            Self::affected_cells_for_partial_invalidate(&op).unwrap_or_default()
+        };
         *self.pending_undo_cells.lock().expect("pending_undo_cells mutex poisoned") =
             Some(staged_cells);
         self.log.append(op)?;
@@ -2169,6 +2261,17 @@ impl CollabSession {
         // staged value (if any) referred to an op that was just
         // discarded along with the rest of the pending-op tail.
         *self.pending_undo_cells.lock().expect("pending_undo_cells mutex poisoned") = None;
+        // V3.6.0.2 audit-closure: the UndoManager was recreated via
+        // `make_undo_manager` so any open group is gone (group state
+        // was part of the discarded UndoManager).  Clear the flag.
+        self.inside_group = false;
+        // V3.6.0.2 audit-closure: reapply the merge-interval to the
+        // recreated UndoManager.  Loro defaults to 0; if the user had
+        // set a non-default interval, we preserve that semantic across
+        // the discard pivot.
+        if self.undo_merge_interval_ms != 0 {
+            self.undo.set_merge_interval(self.undo_merge_interval_ms);
+        }
         Ok(pre_count)
     }
 
@@ -2779,7 +2882,18 @@ impl CollabSession {
     /// auto-grouping is the complement — see
     /// [`set_undo_merge_interval`].
     pub fn start_undo_group(&mut self) -> Result<(), CollabSessionError> {
-        Ok(self.undo.group_start()?)
+        self.undo.group_start()?;
+        // V3.6.0.2 audit-closure (2026-05-24) -- grouped-undo flag.
+        // Tracks "we're inside a Loro undo group" so `append_op` knows
+        // to stage EMPTY cells (forcing full-rebuild fallback on undo).
+        // Reason: Loro's `push_with_merge` discards subsequent meta when
+        // merging spans inside a group; only the FIRST push's meta
+        // survives.  Pre-fix, this caused undo of a grouped op to
+        // invalidate only the first op's cells (stale cache).  Set
+        // AFTER `group_start()` succeeds so a failing start (e.g.,
+        // already-in-group error) doesn't toggle the flag.
+        self.inside_group = true;
+        Ok(())
     }
 
     /// **Phase 5.4 V2 V1 (2026-05-19):** close the current undo
@@ -2792,6 +2906,11 @@ impl CollabSession {
     /// guards.
     pub fn end_undo_group(&mut self) {
         self.undo.group_end();
+        // V3.6.0.2 audit-closure: clear the grouped-undo flag.
+        // Idempotent: calling end_undo_group without a matching
+        // start (Loro's no-op semantic) safely clears an already-false
+        // flag.  Safe to call from Drop guards (UndoGroupGuard).
+        self.inside_group = false;
     }
 
     /// **Phase 5.4 V2 V1 (2026-05-19):** set the auto-merge
@@ -2811,6 +2930,11 @@ impl CollabSession {
     /// explicit groups take precedence over the interval.
     pub fn set_undo_merge_interval(&mut self, interval_ms: i64) {
         self.undo.set_merge_interval(interval_ms);
+        // V3.6.0.2 audit-closure: mirror onto the session-side field so
+        // `append_op` gates partial-invalidate correctly + so
+        // `discard_pending_ops` can reapply the interval to the
+        // recreated UndoManager.
+        self.undo_merge_interval_ms = interval_ms;
     }
 
     /// **Phase 5.4 V2 V1.1 (2026-05-19):** RAII variant of
@@ -3511,6 +3635,127 @@ mod tests {
         assert_eq!(s.op_log().iter().count(), 5);
         assert_eq!(s.undo_count(), 1);
         assert_eq!(s.redo_count(), 0, "redo consumed the only redo item");
+    }
+
+    #[test]
+    fn grouped_undo_clears_cache_for_all_cells_in_the_group() {
+        // **V3.6.0.2 audit-closure (2026-05-24)** -- regression test
+        // for the V3.6.0.2 grouped-undo bug that Codex Lane A's probe
+        // discovered.
+        //
+        // Pre-fix scenario:
+        // 1. start_undo_group; append 5 PutValue ops at (0,0,0)..(0,0,4);
+        //    end_undo_group.
+        // 2. Loro's `push_with_merge` (loro-internal-1.12.0/src/undo.rs:
+        //    389-396) merges all 5 spans into ONE stack item; the meta
+        //    of the FIRST push survives (cells = [(0,0,0)]); the other
+        //    4 metas are DISCARDED.
+        // 3. undo() reads top_undo_meta = [(0,0,0)] -> partial-invalidate
+        //    drops cache entry for (0,0,0) -> the other 4 entries STAY
+        //    STALE in `last_snapshot`.
+        //
+        // V3.6.0.2 audit-closure fix: `inside_group: bool` field on
+        // CollabSession.  start_undo_group sets true; end_undo_group
+        // clears.  When inside_group, `append_op` stages EMPTY cells
+        // (not the op's actual cells) -> meta encodes empty -> undo
+        // decodes empty -> falls back to full `rebuild_snapshot_cache`.
+        // Matches V3.5.0.6 semantics for grouped undo.
+        //
+        // This test pins the post-fix behavior: ALL 5 cells must be
+        // gone from the cache after undo of the group.  Pre-fix it
+        // would fail with len = 4 (cells (0,0,1)..(0,0,4) stale).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.start_undo_group().unwrap();
+        for col in 0..5 {
+            s.append_op(put_value(0, 0, col, col as f64)).unwrap();
+        }
+        s.end_undo_group();
+
+        // Pre-undo: all 5 cells present in cache.
+        assert_eq!(
+            s.snapshot_cells(0).len(),
+            5,
+            "pre-undo: all 5 grouped PutValues populate the cache"
+        );
+
+        // Undo the group.
+        assert!(s.undo().unwrap());
+        assert_eq!(s.op_log().iter().count(), 0, "all 5 ops retracted");
+        assert_eq!(
+            s.snapshot_cells(0).len(),
+            0,
+            "post-undo: ALL 5 cells must be gone from the cache \
+             (V3.6.0.2 audit-closure: full-rebuild fallback for grouped \
+             undo; matches V3.5.0.6 semantics; the on_push meta-only \
+             path cannot accumulate cells across Loro's push_with_merge)"
+        );
+
+        // Redo restores all 5; cache repopulates.
+        assert!(s.redo().unwrap());
+        assert_eq!(s.op_log().iter().count(), 5);
+        assert_eq!(
+            s.snapshot_cells(0).len(),
+            5,
+            "post-redo: all 5 cells back in the cache (full-rebuild path \
+             also handles redo correctly)"
+        );
+
+        // Verify the cells are at the expected coords with expected values.
+        let entries: Vec<_> = s.snapshot_cells(0).into_iter().collect();
+        for col in 0..5 {
+            assert!(
+                entries.iter().any(|((r, c), st)| *r == 0
+                    && *c == col
+                    && matches!(&st.value, Some(CellWireValue::Number(n)) if *n == col as f64)),
+                "post-redo: cell (0, 0, {}) with value {} expected",
+                col,
+                col
+            );
+        }
+    }
+
+    #[test]
+    fn merge_interval_undo_clears_cache_for_all_cells_in_window() {
+        // **V3.6.0.2 audit-closure (2026-05-24)** -- regression test
+        // for the time-merge variant of the same Loro `push_with_merge`
+        // pathology that grouped undo exposed.
+        //
+        // Setting `set_undo_merge_interval(large_value)` makes Loro
+        // merge consecutive appends within the time window.  The
+        // meta-discard issue is identical: only the FIRST push's meta
+        // survives the merge.
+        //
+        // V3.6.0.2 audit-closure fix: `undo_merge_interval_ms > 0`
+        // forces empty-cells staging in `append_op` (full-rebuild
+        // fallback on undo).  This test verifies the cache is cleared
+        // correctly when undoing a time-merged sequence.
+        //
+        // i64::MAX as the interval makes EVERY append merge into the
+        // prior stack item -- deterministic (no timing flakiness).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.set_undo_merge_interval(i64::MAX);
+        for col in 0..5 {
+            s.append_op(put_value(0, 0, col, col as f64)).unwrap();
+        }
+
+        // All 5 appends merged into one undo stack item.
+        assert_eq!(
+            s.undo_count(),
+            1,
+            "i64::MAX merge interval collapses all 5 to one undo unit"
+        );
+        assert_eq!(s.snapshot_cells(0).len(), 5, "all 5 cells in cache");
+
+        // Undo the merged group.
+        assert!(s.undo().unwrap());
+        assert_eq!(s.op_log().iter().count(), 0, "all 5 ops retracted");
+        assert_eq!(
+            s.snapshot_cells(0).len(),
+            0,
+            "post-undo: cache fully cleared via full-rebuild fallback \
+             (V3.6.0.2 audit-closure: `undo_merge_interval_ms > 0` \
+             gates empty-cells staging in append_op)"
+        );
     }
 
     #[test]
