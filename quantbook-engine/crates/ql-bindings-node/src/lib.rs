@@ -723,6 +723,95 @@ impl CollabSession {
         Ok(())
     }
 
+    /// **Phase 5.7 V3.5.0.3a (2026-05-24) -- append an `Op::RenameSheet`
+    /// to this session.**
+    ///
+    /// Per V3.5.0.1 D4 (the first of three sheet-ops sub-steps; D4 split
+    /// into 0.3a renameSheet / 0.3b deleteSheet / 0.3c moveSheet per
+    /// V3.5.0.3a scope-discovery: Op::RemoveSheet + Op::MoveSheet do
+    /// NOT exist on the wire yet and require fresh CRDT semantic locks).
+    ///
+    /// **Sheet id is the sheet's current u16 id**; the rename applies to
+    /// whichever sheet currently lives at that id at replay time.  The
+    /// `old_name` field is ADVISORY per Phase 5.3 step 2 Codex M2
+    /// closure (replay does not validate old_name == current name;
+    /// CRDT merge of concurrent renames legitimately produces
+    /// old-name-mismatch).
+    ///
+    /// **Contract divergence from `WorkbookRuntime::rename_sheet`** (per
+    /// `crates/ql-exec/src/workbook_runtime/sheets.rs:138-200`): the
+    /// runtime path REWRITES all formula text referencing the old sheet
+    /// name + emits the rewrites as `Op::PutFormula` ops bundled with
+    /// `Op::RenameSheet` in a single `BatchCommit`.  This napi method
+    /// is a THIN WRAPPER that appends ONLY `Op::RenameSheet` -- formula
+    /// text in the cache stays stale until the next `workbookSnapshot`
+    /// / `toQbook` call, which triggers `rebuild_workbook` ->
+    /// `repair_sheet_rename_chain` (Phase 5.3 step 3) to resolve cross-
+    /// sheet formula references at materialization time.  Acceptable
+    /// for V3.5.0.3a scope (IDE consumer flow always reads via
+    /// workbookSnapshot which routes through rebuild_workbook); V3.6+
+    /// may add a runtime-equivalent napi method if profiling shows
+    /// repair-at-materialization cost is too high.
+    ///
+    /// **Pre-V3.5.0.3a engine state lookup**: the napi reads the
+    /// current sheet name from `inner.rebuild_workbook(&default_registry())`
+    /// to populate the `old_name` field at append time (matches the
+    /// producer-side debuggability contract; `old_name` records what
+    /// the producer's local state was at write time).  This pays an
+    /// O(N) replay cost per rename; acceptable at V3.5.0.3a scale
+    /// (rename is a user-initiated UI action, ~1/min max).  V3.5.0.6+
+    /// partial-invalidate undo work may eliminate this cost via a
+    /// `current_sheet_name(id)` accessor on CollabSession.
+    ///
+    /// **CRDT convergence**: cross-peer renames converge via Phase 5.3
+    /// step 3 `repair_sheet_rename_chain`; two peers concurrently
+    /// renaming sheet 5 to different names produce a deterministic
+    /// chain that resolves at rebuild_workbook time.  Pin in mocha via
+    /// mergeBytes round-trip.
+    ///
+    /// # Errors
+    ///
+    /// - `[bad_argument]` if `id` exceeds u16 range OR refers to a
+    ///   sheet id that does NOT exist in the current workbook (sheet_count
+    ///   check happens at the rebuild_workbook step above).
+    /// - `[session_oplog]` for op-log append failure.
+    /// - `[session_replay]` if rebuild_workbook fails at the pre-append
+    ///   lookup step (e.g., op-log corruption).
+    #[napi(js_name = "renameSheet")]
+    pub fn rename_sheet(&self, id: u32, new_name: String) -> Result<()> {
+        // Validate `id` fits in SheetId (u16).
+        if id > u16::MAX as u32 {
+            return Err(bad_argument_error(format!(
+                "renameSheet: id must be in [0, 65535] (u16::MAX), got {id}"
+            )));
+        }
+        let sheet_id = id as u16;
+        let mut inner = self.inner.lock();
+        // Look up the current sheet name (advisory per Phase 5.3 Codex M2;
+        // but recorded for debuggability + future strict-mode replay).
+        // O(N) replay; see docstring on the per-call cost discussion.
+        let registry = default_registry();
+        let (workbook, _report) = inner
+            .rebuild_workbook(&registry)
+            .map_err(collab_session_error_to_napi)?;
+        let old_name = workbook
+            .sheet(sheet_id)
+            .map(|s| s.name().to_string())
+            .ok_or_else(|| {
+                bad_argument_error(format!(
+                    "renameSheet: id {id} does not exist (workbook has {} sheets)",
+                    workbook.sheet_count()
+                ))
+            })?;
+        let op = Op::RenameSheet {
+            id: sheet_id,
+            old_name,
+            new_name,
+        };
+        inner.append_op(op).map_err(collab_session_error_to_napi)?;
+        Ok(())
+    }
+
     #[napi(js_name = "appendPutValue")]
     pub fn append_put_value(&self, sheet: u16, row: f64, col: f64, value: f64) -> Result<()> {
         // Validate row + col: finite, non-negative, integer, in u32 range.
