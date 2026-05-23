@@ -167,18 +167,58 @@ export interface SheetSnapshotJson {
  * Workbook API across FFI) because the flattened view is pre-shaped
  * for the IDE renderer.
  *
- * **V3.5.0.2 ship**: `sheets` only.  V3.5.0.5 will add `names: NamedRangeJson[]`
- * + `formats: FormatDefJson[]` once the session-wide caches land;
- * additive (no shape break for V3.5.0.2 consumers that destructure
- * `.sheets` only).
+ * **V3.5.0.2 ship**: `sheets` only.  **V3.6.0.3 D2 (2026-05-24) adds
+ * `formats: FormatDefJson[]`** -- session-wide format registry merging
+ * Builtin (ids 0..=163) + Custom (`Op::RegisterFormat`-registered)
+ * entries.  Additive (V3.5 consumers that destructure `.sheets` only
+ * keep working).  V3.6+ format-aware buildHtml rendering will use
+ * this list to interpret `CellSnapshotJson.format`.
  *
  * **Performance note (R-V3.5-1)**: large workbooks produce large JSON.
  * Callers MUST batch (do NOT call per-keystroke); the napi method's
- * per-call cost is O(N) in op count from rebuild_workbook.  V3.6+ may
- * add incremental deltas.
+ * per-call cost is O(N) in op count from rebuild_workbook + O(N_formats)
+ * for the formats array (typically < 100).  V3.7+ may add incremental
+ * deltas.
  */
 export interface WorkbookSnapshotJson {
 	sheets: SheetSnapshotJson[];
+	/**
+	 * **V3.6.0.3 D2 (2026-05-24)**: session-wide format registry.
+	 * Populated from the rebuilt+repaired engine `Workbook.FormatTable`
+	 * (authoritative source merging Builtin ids 0..=163 with Custom
+	 * ids registered via `Op::RegisterFormat`).
+	 *
+	 * **Iteration order**: stable for a given workbook state but NOT
+	 * sorted by id (engine HashMap iteration).  Callers wanting sorted
+	 * order should `.sort()` client-side using a deterministic key.
+	 *
+	 * **V3.6+ format-aware buildHtml rendering (D4)** will look up each
+	 * cell's `format: FormatIdJson` against this list to find the
+	 * matching format string (e.g., `"0.00%"`, `"yyyy-mm-dd"`).
+	 */
+	formats: FormatDefJson[];
+}
+
+/**
+ * **Phase 5.7 V3.6.0.3 D2 (2026-05-24) -- one format registration in
+ * the WorkbookSnapshot's `formats` array.**
+ *
+ * Pairs a {@link FormatIdJson} (V3.5.0.5 wire shape) with its format
+ * string.  V3.6+ buildHtml rendering uses this for number / date /
+ * currency display.
+ */
+export interface FormatDefJson {
+	/**
+	 * The FormatId in V3.5.0.5 wire shape (kind = "builtin" |
+	 * "custom"; payload fields per kind).
+	 */
+	id: FormatIdJson;
+	/**
+	 * The format string (e.g., `"0.00%"`, `"yyyy-mm-dd"`).  Used by
+	 * V3.6+ engine-side `FormatTable::render_value` for number / date
+	 * / currency display.
+	 */
+	string: string;
 }
 
 export interface CollabSessionInstance {

@@ -4390,17 +4390,18 @@ suite('quantbook V3.5.0.2 -- workbookSnapshot napi contract', function () {
 			'cells sorted by (row, col) ascending per snapshot_cells contract');
 	});
 
-	test('JSON shape stability: top-level has only sheets field (V3.5.0.5 will add names + formats)', () => {
+	test('JSON shape stability: top-level has sheets + formats (V3.6.0.3 additive extension)', () => {
 		const session = createSession(7606n);
 		addSheet(session, 'S');
 		const snap = workbookSnapshot(session);
-		// V3.5.0.2 ship shape: { sheets }.  Future V3.5.0.5 may add
-		// `names` + `formats` ADDITIVELY (existing destructure of
-		// .sheets keeps working).  Pin the V3.5.0.2 shape so a future
-		// shape-break gets caught.
+		// V3.5.0.2 ship shape: { sheets }.  V3.6.0.3 D2 ADDS `formats`
+		// (additive; V3.5 consumers that destructure .sheets keep
+		// working).  Future V3.7+ may add `names` etc., still
+		// additively.  Pin the V3.6.0.3 shape so a future shape-break
+		// gets caught.
 		const keys = Object.keys(snap).sort();
-		assert.deepStrictEqual(keys, ['sheets'],
-			`V3.5.0.2 ship shape is {sheets} only; if V3.5.0.5+ extends, update this test to .includes('sheets')`);
+		assert.deepStrictEqual(keys, ['formats', 'sheets'],
+			`V3.6.0.3 ship shape is {sheets, formats}; if V3.7+ adds more fields, update this test`);
 	});
 
 	test('SheetSnapshotJson shape: id + name + cells fields', () => {
@@ -5210,14 +5211,14 @@ suite('quantbook V3.5.0.4a -- buildSheetMovePositionItems', function () {
 
 suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 	test('empty workbook -> null for any sheetId', () => {
-		const snap: WorkbookSnapshotJson = { sheets: [] };
+		const snap: WorkbookSnapshotJson = { sheets: [], formats: [] };
 		assert.strictEqual(extractSheetSnapshot(snap, 0), null,
 			'no sheets -> null lookup');
 		assert.strictEqual(extractSheetSnapshot(snap, 5), null);
 	});
 
 	test('sheet found, no cells -> empty entries with version + sheet preserved', () => {
-		const snap: WorkbookSnapshotJson = { sheets: [{ id: 0, name: 'S', cells: [] }] };
+		const snap: WorkbookSnapshotJson = { sheets: [{ id: 0, name: 'S', cells: [] }], formats: [] };
 		const result = extractSheetSnapshot(snap, 0);
 		assert.ok(result !== null);
 		assert.strictEqual(result!.snapshot_format_version, 1);
@@ -5231,6 +5232,7 @@ suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 				{ id: 0, name: 'A', cells: [] },
 				{ id: 2, name: 'C', cells: [] },
 			],
+			formats: [],
 		};
 		// sheet 1 is missing (tombstoned).
 		assert.strictEqual(extractSheetSnapshot(snap, 1), null);
@@ -5243,6 +5245,7 @@ suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 					{ row: 1, col: 2, value: { kind: 'number', number: 42.5 } },
 				],
 			}],
+			formats: [],
 		};
 		const result = extractSheetSnapshot(snap, 0);
 		assert.strictEqual(result!.entries.length, 1);
@@ -5259,6 +5262,7 @@ suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 					{ row: 0, col: 2, value: { kind: 'error', error: '#REF!' } },
 				],
 			}],
+			formats: [],
 		};
 		const r = extractSheetSnapshot(snap, 0)!;
 		assert.deepStrictEqual(r.entries[0].value, { kind: 'boolean', value: true });
@@ -5273,6 +5277,7 @@ suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 					{ row: 0, col: 0, value: { kind: 'pending' } },
 				],
 			}],
+			formats: [],
 		};
 		const r = extractSheetSnapshot(snap, 0)!;
 		assert.deepStrictEqual(r.entries[0].value, { kind: 'pending' });
@@ -5287,6 +5292,7 @@ suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 					{ row: 0, col: 2, value: { kind: 'number', number: 3 } },
 				],
 			}],
+			formats: [],
 		};
 		const r = extractSheetSnapshot(snap, 0)!;
 		assert.strictEqual(r.entries.length, 2,
@@ -5317,6 +5323,7 @@ suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 					{ row: 0, col: 0, value: { kind: 'number' } },  // no number payload
 				],
 			}],
+			formats: [],
 		};
 		assert.throws(() => extractSheetSnapshot(snap, 0),
 			/number payload missing/);
@@ -5329,6 +5336,7 @@ suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 				{ id: 1, name: 'B', cells: [{ row: 0, col: 0, value: { kind: 'number', number: 2 } }] },
 				{ id: 2, name: 'C', cells: [{ row: 0, col: 0, value: { kind: 'number', number: 3 } }] },
 			],
+			formats: [],
 		};
 		const r1 = extractSheetSnapshot(snap, 1)!;
 		assert.strictEqual(r1.sheet, 1);
@@ -5351,6 +5359,7 @@ suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 					{ row: 5, col: 0, value: { kind: 'number', number: 4 } },
 				],
 			}],
+			formats: [],
 		};
 		const r = extractSheetSnapshot(snap, 0)!;
 		assert.deepStrictEqual(r.entries.map(e => [e.row, e.col]),
@@ -5523,6 +5532,7 @@ suite('quantbook V3.5.0.5 -- extractSheetSnapshot drops format (V3.5.0.5 scope)'
 					},
 				],
 			}],
+			formats: [],
 		};
 		const result = extractSheetSnapshot(snap, 0);
 		assert.ok(result !== null);
@@ -5549,6 +5559,7 @@ suite('quantbook V3.5.0.5 -- extractSheetSnapshot drops format (V3.5.0.5 scope)'
 					{ row: 1, col: 0, value: { kind: 'number', number: 7 } },
 				],
 			}],
+			formats: [],
 		};
 		const result = extractSheetSnapshot(snap, 0);
 		assert.strictEqual(result!.entries.length, 1,
@@ -5586,6 +5597,83 @@ suite('quantbook V3.5.0.5 -- workbookSnapshot format passthrough (no write-path 
 		const keys = Object.keys(cell).sort();
 		assert.ok(!keys.includes('format'),
 			`format key absent when undefined (napi-rs Option::None convention); got keys: ${JSON.stringify(keys)}`);
+	});
+});
+
+// ============================================================================
+// Phase 5.7 V3.6.0.3 D2 (2026-05-24) -- WorkbookSnapshotJson.formats array
+// ============================================================================
+// Tests the additive `formats: FormatDefJson[]` field on WorkbookSnapshotJson.
+// Populated from the rebuilt+repaired engine `Workbook.FormatTable` (which
+// merges Builtin ids 0..=163 with Custom ids registered via Op::RegisterFormat).
+// V3.6+ format-aware buildHtml rendering (D4) will consume this list.
+
+suite('quantbook V3.6.0.3 -- WorkbookSnapshotJson.formats field', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('fresh session has the formats field as an Array', () => {
+		// V3.6.0.3 D2: the `formats` field is REQUIRED (always present,
+		// possibly empty).  Distinct from V3.5.0.5 optional cell-level
+		// `format?: FormatIdJson` (which uses napi-rs Option::None ->
+		// absent property convention).
+		const session = createSession(8301n);
+		const snap = workbookSnapshot(session);
+		assert.ok(Array.isArray(snap.formats),
+			'V3.6.0.3 contract: workbookSnapshot.formats is always an Array (even if empty)');
+	});
+
+	test('fresh session has Builtin format ids surfacing in formats', () => {
+		// A fresh CollabSession + Workbook has the Builtin format ids
+		// (0..=163 per Phase 5.2 D-1) already in the FormatTable.
+		// V3.6.0.3 D2 surfaces them via formats[].  Custom formats only
+		// appear after Op::RegisterFormat applications (no IDE write
+		// path yet -- V3.6+ scope; D5 will add appendPutFormula but
+		// RegisterFormat napi is a separate future surface).
+		const session = createSession(8302n);
+		const snap = workbookSnapshot(session);
+		// Builtin ids 0..=163 should all be present.  Smoke-check a
+		// sample (id 0 = "General", id 9 = "0%", etc., per Excel
+		// canonical numfmts).
+		const builtinIds = snap.formats
+			.filter(f => f.id.kind === 'builtin')
+			.map(f => f.id.builtin)
+			.sort((a, b) => (a ?? 0) - (b ?? 0));
+		assert.ok(builtinIds.length >= 10,
+			`fresh workbook has Builtin format ids; got ${builtinIds.length} (expected >= 10 for Excel-canonical 0..=163)`);
+		assert.strictEqual(builtinIds[0], 0,
+			'first Builtin id is 0 (General format)');
+	});
+
+	test('formats field type shape -- FormatDefJson { id, string }', () => {
+		// Pin the V3.6.0.3 napi shape.  Each entry has:
+		// - id: FormatIdJson (kind = "builtin" | "custom")
+		// - string: string
+		const session = createSession(8303n);
+		const snap = workbookSnapshot(session);
+		assert.ok(snap.formats.length > 0, 'Builtins should populate the array');
+		const entry = snap.formats[0];
+		const keys = Object.keys(entry).sort();
+		assert.deepStrictEqual(keys, ['id', 'string'],
+			`FormatDefJson shape: ['id', 'string']; got ${JSON.stringify(keys)}`);
+		assert.ok(typeof entry.id === 'object' && entry.id !== null,
+			'id is a FormatIdJson object');
+		assert.ok(typeof entry.string === 'string',
+			'string is a string');
+		assert.ok(['builtin', 'custom'].includes(entry.id.kind),
+			`id.kind is 'builtin' or 'custom'; got ${entry.id.kind}`);
+	});
+
+	test('WorkbookSnapshotJson top-level shape includes formats', () => {
+		// Pin the additive nature of V3.6.0.3 against the V3.5.0.2
+		// `sheets`-only shape.
+		const session = createSession(8304n);
+		const snap = workbookSnapshot(session);
+		const topLevelKeys = Object.keys(snap).sort();
+		assert.deepStrictEqual(topLevelKeys, ['formats', 'sheets'],
+			`V3.6.0.3 WorkbookSnapshotJson has exactly { sheets, formats }; got ${JSON.stringify(topLevelKeys)}`);
 	});
 });
 
