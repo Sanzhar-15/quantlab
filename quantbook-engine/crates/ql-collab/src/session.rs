@@ -61,7 +61,9 @@
 //! - `peer_id(&self)` — the session's stable peer id.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
+use loro::LoroValue;
 use thiserror::Error;
 
 use ql_functions::FunctionRegistry;
@@ -636,50 +638,49 @@ pub struct CollabSession {
     /// this field; positive walk.
     removed_sheets: HashSet<u16>,
 
-    /// **Phase 5.7 V3.5.0.X audit-closure A-HIGH-1 / Opus-H2 (2026-05-24) --
-    /// pure-local-frontier gate for partial-invalidate undo/redo.**
+    /// **Phase 5.7 V3.6.0.2 (2026-05-24) D1 -- Loro UndoManager on_push
+    /// callback handoff for partial-invalidate cells.**
     ///
-    /// `true` iff the most-recent visible op in the log is the most-recent
-    /// LOCAL-APPENDED op (no remote merge has interleaved since).
-    /// V3.5.0.6 partial-invalidate captures `self.log.iter().last()`
-    /// BEFORE undo as a proxy for the to-be-retracted op; that proxy
-    /// is correct only when this field is true.  Pre-closure, the
-    /// dispatch fell through to partial-invalidate whenever the
-    /// visible log shrank by exactly 1 -- but if a remote op landed
-    /// AFTER the local op being undone, the captured most-recent
-    /// visible op was the REMOTE op, so partial-invalidate targeted
-    /// the WRONG cell.  Codex A-HIGH-1 has a native-binding repro;
-    /// Opus H2 found it independently (B.4.b).
+    /// Replaces the V3.5.0.X conservative `pure_local_frontier` gate
+    /// (which fell back to full `rebuild_snapshot_cache` whenever any
+    /// remote op interleaved between local appends).  V3.6.0.2 wires
+    /// Loro's `UndoManager::set_on_push` callback to capture the
+    /// affected cells of every pushed op directly into `UndoItemMeta::
+    /// value` as a `LoroValue::List<List<I64>>` triple.  `undo()` and
+    /// `redo()` read `top_undo_meta()` / `top_redo_meta()` BEFORE
+    /// calling the underlying Loro undo/redo, decode the cells, and
+    /// fire `invalidate_cell` for each.  Partial-invalidate now fires
+    /// correctly regardless of Loro's CRDT iteration order, closing
+    /// the V3.5.0.X A-HIGH-1 / Opus-H2 convergent HIGH.
     ///
-    /// **Lifecycle**:
-    /// - `new()` / `from_snapshot()`: `true` (clean start; partial path
-    ///   is enabled).  For from_snapshot the imported log may already
-    ///   contain remote ops at the top, but an immediate `undo()` will
-    ///   either find nothing on the undo stack OR will rely on the
-    ///   shrink-by-1 + cell-keyed shape guards to short-circuit.
-    /// - `append_op()`: `true` after success (the appended op IS the
-    ///   new local frontier).
-    /// - `merge_bytes()`: `false` (remote ops just merged; the visible
-    ///   tail may now be remote).
-    /// - `poll_remote()` / `poll_remote_with_limit()`: `false` IF any
-    ///   blob actually merged; otherwise unchanged.
-    /// - `discard_pending_ops()`: `false` (the log was replaced via
-    ///   `fork_at_vv`; any prior frontier-state assumption is
-    ///   invalidated).
-    /// - `undo()` / `redo()` after success: `true` (the just-appended
-    ///   inverse op IS the new local frontier).
+    /// **Handoff pattern**: `append_op()` pre-stages affected cells
+    /// here via `Some(cells)` BEFORE calling `self.log.append(op)`
+    /// (which fires `LoroDoc::commit()` -> triggers Loro's on_push
+    /// callback synchronously).  The on_push closure reads the Mutex
+    /// via `.take()` (drains to None) + encodes as `LoroValue`.
+    /// `undo()` / `redo()` also pre-stage cells before their Loro
+    /// call so the synthetic inverse op pushed onto the opposite
+    /// stack gets the SAME meta (Loro does NOT preserve meta across
+    /// stack transitions; see `loro-internal-1.12.0/src/undo.rs:858-872`
+    /// which calls `on_push` with `DiffEvent = None` for the inverse).
     ///
-    /// **Dispatch gate**: in `undo()` / `redo()`, if `!pure_local_frontier`
-    /// the partial-invalidate path is BYPASSED and `rebuild_snapshot_cache`
-    /// is called regardless of op shape.  This is the conservative
-    /// closure path Codex recommended; the V3.6+ alternative is to
-    /// wire Loro UndoManager's `on_pop` callback which surfaces the
-    /// actual retracted op shape directly (no proxy needed).
+    /// **Re-entrancy** (R-V3.6-1 mitigation): on_push runs synchronously
+    /// inside `LoroDoc::commit()` which is inside `OpLog::append`.
+    /// The Mutex is owned by the closure's Arc clone, NOT by `&mut self`,
+    /// so there's no double-borrow.  The closure holds the lock only
+    /// long enough to call `.take()` (microseconds).  No async drain
+    /// pattern needed.
     ///
-    /// **Rule 4 per-field walk**: `bool` is `Copy + Send + Sync`
-    /// trivially.  0 new triggers; arc terminus stays at 6.  V3.5.0.X
-    /// audit-closure added this field; positive walk.
-    pure_local_frontier: bool,
+    /// **Rule 4 per-field walk**: `Arc<Mutex<Option<Vec<(u16, u32, u32)>>>>`
+    /// is `Send + Sync` -- `Arc<T>` is `Send + Sync` iff `T: Send + Sync`;
+    /// `Mutex<T>` is `Send + Sync` iff `T: Send`; `Option<T>` is `Send +
+    /// Sync` iff `T: Send + Sync`; `Vec<T>` is `Send + Sync` iff `T: Send +
+    /// Sync`; `(u16, u32, u32)` is `Copy + Send + Sync` trivially.  Net:
+    /// the whole composition is `Send + Sync`.  Required for `OnPush`'s
+    /// `Send + Sync` bounds.  Replaces the V3.5.0.X `pure_local_frontier:
+    /// bool` field (which is REMOVED at V3.6.0.2); arc terminus stays
+    /// at 6 (no new triggers; one field swapped for another).
+    pending_undo_cells: Arc<Mutex<Option<Vec<(u16, u32, u32)>>>>,
 }
 
 impl CollabSession {
@@ -719,7 +720,12 @@ impl CollabSession {
         );
         let mut log = OpLog::new();
         log.set_peer_id(peer_id.as_u64())?;
-        let undo = make_undo_manager(&log);
+        // V3.6.0.2 D1: Arc<Mutex<>> for the on_push handoff -- see
+        // `pending_undo_cells` field docstring.  Constructed BEFORE
+        // make_undo_manager so the closure can capture an Arc clone.
+        let pending_undo_cells: Arc<Mutex<Option<Vec<(u16, u32, u32)>>>> =
+            Arc::new(Mutex::new(None));
+        let undo = make_undo_manager(&log, pending_undo_cells.clone());
         Ok(Self {
             peer_id,
             log,
@@ -731,9 +737,7 @@ impl CollabSession {
             last_snapshot: HashMap::new(),
             // V3.5.0.X: empty tombstone set; no RemoveSheet ops yet.
             removed_sheets: HashSet::new(),
-            // V3.5.0.X audit-closure A-HIGH-1 / Opus-H2: fresh session
-            // has no remote interleaving; partial-invalidate enabled.
-            pure_local_frontier: true,
+            pending_undo_cells,
         })
     }
 
@@ -769,7 +773,15 @@ impl CollabSession {
         );
         let mut log = OpLog::import_bytes(bytes)?;
         log.set_peer_id(peer_id.as_u64())?;
-        let undo = make_undo_manager(&log);
+        // V3.6.0.2 D1: same Arc<Mutex<>> handoff as `new`.  The
+        // imported log already has ops in it but Loro's undo stack
+        // is empty (undo only tracks LOCAL appends post-construction;
+        // imported ops are treated as remote/historical).  So the
+        // first append_op on this session will be the first on_push
+        // event, with the Mutex correctly staged by then.
+        let pending_undo_cells: Arc<Mutex<Option<Vec<(u16, u32, u32)>>>> =
+            Arc::new(Mutex::new(None));
+        let undo = make_undo_manager(&log, pending_undo_cells.clone());
         let mut sess = Self {
             peer_id,
             log,
@@ -786,18 +798,7 @@ impl CollabSession {
             // for each `Op::RemoveSheet` it sees, which apply_cache_effect
             // inserts here.
             removed_sheets: HashSet::new(),
-            // V3.5.0.X audit-closure A-HIGH-1 / Opus-H2: from_snapshot
-            // imports an existing log; the latest visible op may be
-            // remote (or from this peer's prior session).  Starting
-            // `true` is acceptable because: (a) immediate undo() will
-            // find nothing on the local UndoManager stack -- the
-            // imported log was loaded fresh, so undo is a no-op -- and
-            // the field doesn't matter; (b) the shrink-by-1 + cell-keyed
-            // shape guards in undo()/redo() provide additional safety
-            // even if the frontier assumption is wrong.  Future
-            // append_op()/merge_bytes() will reset the field to its
-            // correct semantics.
-            pure_local_frontier: true,
+            pending_undo_cells,
         };
         sess.rebuild_snapshot_cache()?;
         Ok(sess)
@@ -848,6 +849,24 @@ impl CollabSession {
         // (CellWireValue::Text/Error + PutFormula::text own heap strings).
         let mut effects: Vec<CacheEffect> = Vec::new();
         Self::collect_cache_effects(&op, &mut effects);
+        // **Phase 5.7 V3.6.0.2 D1 (2026-05-24) -- Loro on_push handoff**:
+        // pre-stage the affected cells for this op BEFORE
+        // `self.log.append(op)` triggers `LoroDoc::commit()` which
+        // fires Loro's `on_push` callback synchronously.  The
+        // closure (set up in `make_undo_manager`) reads via
+        // `.take()` so the Mutex drains back to `None` after
+        // the commit.  For non-cell-keyed ops (AddSheet /
+        // RemoveSheet / RenameSheet / MoveSheet / RegisterFormat
+        // / batched mixed) `affected_cells_for_partial_invalidate`
+        // returns `None` -> we stage `Some(empty Vec)` -> meta
+        // encodes empty list -> undo() decodes empty -> falls back
+        // to full `rebuild_snapshot_cache` (correct conservative
+        // path; same as pre-V3.6.0.2 V3.5.0.6 dispatch for these
+        // shapes).
+        let staged_cells = Self::affected_cells_for_partial_invalidate(&op)
+            .unwrap_or_default();
+        *self.pending_undo_cells.lock().expect("pending_undo_cells mutex poisoned") =
+            Some(staged_cells);
         self.log.append(op)?;
         for effect in effects {
             // V3.5.0.X audit-closure: thread `removed_sheets` through so
@@ -857,12 +876,6 @@ impl CollabSession {
             // variants).
             Self::apply_cache_effect(&mut self.last_snapshot, &mut self.removed_sheets, effect);
         }
-        // V3.5.0.X audit-closure A-HIGH-1 / Opus-H2 (2026-05-24): mark
-        // the frontier as pure-local.  The appended op is the new latest
-        // visible op in the log; partial-invalidate undo dispatch can
-        // trust `self.log.iter().last()` as the to-be-retracted op.
-        // Resets any prior false-state from merge_bytes/poll_remote.
-        self.pure_local_frontier = true;
         self.maybe_auto_flush()?;
         Ok(())
     }
@@ -1051,14 +1064,13 @@ impl CollabSession {
         // correct here; full rebuild is.  See the `last_snapshot`
         // field docstring for the formal argument.
         self.rebuild_snapshot_cache()?;
-        // V3.5.0.X audit-closure A-HIGH-1 / Opus-H2 (2026-05-24):
-        // remote ops may now trail the prior local frontier in the
-        // visible iteration order.  Mark the frontier as NOT
-        // pure-local so a subsequent undo() falls back to full
-        // rebuild_snapshot_cache (the partial-invalidate proxy
-        // `self.log.iter().last()` would otherwise target the wrong
-        // cell -- A-HIGH-1 native-binding repro).
-        self.pure_local_frontier = false;
+        // V3.6.0.2 D1 (2026-05-24): the V3.5.0.X `pure_local_frontier`
+        // field was REMOVED.  Partial-invalidate undo/redo now uses
+        // Loro's `top_undo_meta()` / `top_redo_meta()` to retrieve the
+        // EXACT cells the to-be-popped op affected -- regardless of
+        // iteration order.  No frontier-state mutation needed here;
+        // the meta on the local undo stack is unaffected by remote
+        // merges (it's stack-local to this peer's UndoManager).
         self.maybe_auto_flush()?;
         Ok(new_len)
     }
@@ -2141,17 +2153,22 @@ impl CollabSession {
         // UndoManager is tied to the prior LoroDoc; recreate against
         // the new one. Active undo groups become invalid (documented
         // as caller's responsibility).
-        self.undo = make_undo_manager(&self.log);
+        // V3.6.0.2 D1: thread the same `pending_undo_cells` Arc into
+        // the recreated UndoManager.  The Arc is owned by the
+        // CollabSession; cloning it preserves the closure-side handle.
+        // The OLD UndoManager's on_push closure goes away with the old
+        // UndoManager (its Arc clone is dropped); the NEW closure
+        // captures a fresh Arc clone but points at the SAME Mutex.
+        self.undo = make_undo_manager(&self.log, self.pending_undo_cells.clone());
         // V3.3.0.3: the log was REPLACED via `fork_at_vv`; prior
         // cache entries may reference ops no longer in the log
         // (specifically the discarded pending ops past the last
         // flushed VV).  Rebuild from the new log.
         self.rebuild_snapshot_cache()?;
-        // V3.5.0.X audit-closure A-HIGH-1 / Opus-H2 (2026-05-24): the
-        // log was REPLACED via fork_at_vv; any prior frontier assumption
-        // is invalidated.  Conservatively mark as not pure-local; next
-        // append_op() will reset.
-        self.pure_local_frontier = false;
+        // V3.6.0.2 D1: also reset the pending cells stash -- the prior
+        // staged value (if any) referred to an op that was just
+        // discarded along with the rest of the pending-op tail.
+        *self.pending_undo_cells.lock().expect("pending_undo_cells mutex poisoned") = None;
         Ok(pre_count)
     }
 
@@ -2476,13 +2493,9 @@ impl CollabSession {
             // Loro's CRDT merge can causally-reorder; full rebuild
             // is required.
             self.rebuild_snapshot_cache()?;
-            // V3.5.0.X audit-closure A-HIGH-1 / Opus-H2 (2026-05-24):
-            // remote ops just merged into the log; the latest
-            // visible op may now be remote.  Reset the
-            // pure-local-frontier so a subsequent undo() falls back
-            // to full rebuild.  Mirrors merge_bytes (same closure
-            // path; this is the batched analog).
-            self.pure_local_frontier = false;
+            // V3.6.0.2 D1: no frontier-state mutation needed -- the
+            // Loro UndoManager's stack carries per-item meta with the
+            // exact cells, which is preserved across remote merges.
             self.maybe_auto_flush()?;
         }
         Ok(merged)
@@ -2567,32 +2580,51 @@ impl CollabSession {
     /// the inverse op is already committed to `self.log` — same
     /// shape as `append_op`.
     pub fn undo(&mut self) -> Result<bool, CollabSessionError> {
-        // **Phase 5.7 V3.5.0.6 (2026-05-24) D2 partial-invalidate**:
-        // capture the most-recent visible op + pre-undo log length
-        // BEFORE the retract.  Loro `UndoManager::undo()` retracts the
-        // most-recent LOCAL op (and Loro shrinks the visible LoroList
-        // by 1 -- pinned by `undo_retracts_visible_op_from_op_log_len`
-        // test); when no remote op has landed AFTER that local op,
-        // the most-recent VISIBLE op equals the to-be-retracted op.
+        // **Phase 5.7 V3.6.0.2 (2026-05-24) D1 -- Loro on_pop / top_undo_meta
+        // partial-invalidate**:
         //
-        // Conservative dispatch: partial-invalidate ONLY when (a) the
-        // log shrank by exactly 1, AND (b) the captured op is cell-keyed
-        // (or a BatchCommit of only-cell-keyed inner ops per
-        // `affected_cells_for_partial_invalidate`).  Otherwise fall
-        // back to the V3.3.0.X HIGH-1 full `rebuild_snapshot_cache`.
+        // V3.5.0.6 partial-invalidate captured `self.log.iter().last()`
+        // as a PROXY for the to-be-retracted op.  Wrong under causal
+        // iteration order when a remote op trails the local op (Codex
+        // A-HIGH-1 / Opus H2).  V3.5.0.X added a conservative
+        // `pure_local_frontier` gate that fell back to full rebuild
+        // whenever a remote op had interleaved.  V3.6.0.2 REMOVES the
+        // proxy + gate entirely by reading `top_undo_meta()` BEFORE
+        // calling Loro's undo.  The meta was set by the on_push
+        // callback (configured in `make_undo_manager`) at the moment
+        // the user pushed the op, with the EXACT cells encoded as
+        // `LoroValue::List<List<I64>>` via `encode_cells_to_loro_value`.
+        //
+        // Pre-staging into `pending_undo_cells`: Loro's undo()
+        // INTERNALLY pushes a synthetic inverse op onto the redo stack
+        // (see loro-internal-1.12.0/src/undo.rs:858-872).  That push
+        // fires `on_push` with `DiffEvent = None` and a fresh
+        // CounterSpan.  Loro does NOT preserve the original meta
+        // across stack transitions; our on_push closure must read
+        // from `pending_undo_cells` to know what to encode.  We stage
+        // the SAME cells we just decoded, so the redo-stack item gets
+        // the matching meta -- preserving partial-invalidate
+        // correctness across undo->redo->undo chains.
         //
         // Falls back to full rebuild on:
-        // - Non-cell-keyed retracted op (AddSheet / RenameSheet /
-        //   RemoveSheet / MoveSheet / RegisterFormat / table ops / ...)
-        // - BatchCommit mixing cell-keyed + non-cell-keyed inner ops
-        // - len shrinkage != 1 (defensive against future Loro semantics)
-        // - Captured-op decode error (`OpLog(_)` propagates)
-        let pre_undo_last_op: Option<Op> = self.log
-            .iter()
-            .last()
-            .transpose()
-            .map_err(CollabSessionError::OpLog)?;
-        let pre_undo_len = self.log.len();
+        // - Empty undo stack (no top_undo_meta).
+        // - Decode failure (meta value isn't the expected LoroValue::List
+        //   shape -- legacy session-snapshot import, malformed binding).
+        // - Empty cells vector (non-cell-keyed op was originally
+        //   pushed with `Some(empty Vec)` staged; see `append_op`).
+        let captured_cells: Option<Vec<(u16, u32, u32)>> = self
+            .undo
+            .top_undo_meta()
+            .and_then(|meta| decode_cells_from_loro_value(&meta.value));
+        // Pre-stage these cells for the synthetic inverse op's on_push
+        // (see docstring above).  We clone instead of moving so the
+        // captured value stays available for the post-undo invalidate
+        // loop below.  Empty Vec for the "no captured cells / full
+        // rebuild" path is also pre-staged so the redo-stack item's
+        // meta encodes empty.
+        let pending_value = captured_cells.clone().unwrap_or_default();
+        *self.pending_undo_cells.lock().expect("pending_undo_cells mutex poisoned") =
+            Some(pending_value);
         let consumed = self.undo.undo()?;
         // **Phase 5.5 V2 V2 audit closure (Codex M2, 2026-05-21):** only
         // auto-flush when an undo item was actually consumed. The prior
@@ -2602,57 +2634,29 @@ impl CollabSession {
         // gate, `undo` on an empty stack stays `Ok(false)` regardless
         // of transport state (no mutation, no flush attempt).
         if consumed {
-            // **V3.5.0.6 D2 partial-invalidate dispatch (extends V3.3.0.X
-            // HIGH-1)**: prefer partial-invalidate when the retracted op
-            // shape supports it; fall back to full rebuild otherwise.
-            //
-            // The cache invariant "every op-log mutation site updates
-            // the cache" stays satisfied by either path:
-            // - Partial: invalidate_cell drops + re-derives the affected
-            //   cells from the post-undo log walks.
-            // - Full: rebuild_snapshot_cache drops + re-derives ALL cells.
-            //
-            // Either path runs BEFORE auto-flush so callers observing
-            // the post-undo state (subsequent snapshot read OR
-            // auto-flushed delta to a peer) see the canonical view.
-            //
-            // **V3.5.0.X audit-closure A-HIGH-1 / Opus-H2 (2026-05-24)
-            // -- pure-local-frontier gate**: partial-invalidate uses
-            // `pre_undo_last_op` (captured above) as a proxy for the
-            // to-be-retracted op.  That proxy is correct ONLY when no
-            // remote op has interleaved since the local op being
-            // undone.  If `pure_local_frontier == false`, a remote op
-            // may have landed AFTER our local op (in causal iteration
-            // order), making `pre_undo_last_op` the REMOTE op and the
-            // partial-invalidate target wrong (Codex A-HIGH-1 has a
-            // native-binding repro of this exact scenario; Opus B.4.b
-            // found it independently).  In that case fall back to
-            // full rebuild_snapshot_cache regardless of op shape.
-            let post_undo_len = self.log.len();
-            let partial_cells = if self.pure_local_frontier && pre_undo_len == post_undo_len + 1 {
-                pre_undo_last_op
-                    .as_ref()
-                    .and_then(Self::affected_cells_for_partial_invalidate)
-            } else {
-                None
-            };
-            match partial_cells {
-                Some(cells) => {
+            match captured_cells {
+                Some(cells) if !cells.is_empty() => {
                     for (sheet, row, col) in cells {
                         self.invalidate_cell(sheet, row, col)?;
                     }
                 }
-                None => {
+                _ => {
+                    // Empty cells OR decode failed -- non-cell-keyed op
+                    // OR legacy/malformed meta.  Conservative full
+                    // rebuild (matches the V3.5.0.6 fallback semantic).
                     self.rebuild_snapshot_cache()?;
                 }
             }
-            // V3.5.0.X audit-closure A-HIGH-1 / Opus-H2: after a
-            // successful undo, the inverse op appended by UndoManager
-            // IS the new latest visible op (it's a fresh local
-            // append).  Reset the frontier flag to `true` so a
-            // subsequent partial-invalidate can fire correctly.
-            self.pure_local_frontier = true;
             self.maybe_auto_flush()?;
+        } else {
+            // Loro's undo() was a no-op (empty stack OR processing_undo
+            // re-entrance guard).  Pending cells stash NOT drained by
+            // on_push (which never fired).  Clear it so a subsequent
+            // append_op doesn't see stale staged data.  Defensive --
+            // the staged value would have been overwritten anyway, but
+            // keeping the invariant "pending is None between calls"
+            // simplifies reasoning.
+            *self.pending_undo_cells.lock().expect("pending_undo_cells mutex poisoned") = None;
         }
         Ok(consumed)
     }
@@ -2667,60 +2671,51 @@ impl CollabSession {
     /// the redo's appended op is already in `self.log` (mutate-
     /// then-flush).
     pub fn redo(&mut self) -> Result<bool, CollabSessionError> {
-        // **Phase 5.7 V3.5.0.6 (2026-05-24) D2 partial-invalidate**:
-        // mirrors `undo` dispatch.  Loro `UndoManager::redo()` appends
-        // the previously-retracted op back to the visible log (grows
-        // by 1).  Capture the post-redo last op AFTER the redo runs
-        // and check its shape: cell-keyed -> partial; else full rebuild.
+        // **Phase 5.7 V3.6.0.2 (2026-05-24) D1 -- Loro top_redo_meta
+        // partial-invalidate**: mirrors `undo` dispatch.  Read
+        // `top_redo_meta()` BEFORE calling Loro's redo so we know
+        // the EXACT cells the to-be-pushed op affects (encoded via
+        // the on_push callback at the original local append AND
+        // re-encoded by on_push during the prior undo when this
+        // item was moved to the redo stack).
         //
-        // Unlike undo (where we capture BEFORE so we know what gets
-        // retracted), redo's appended op IS the post-redo last op,
-        // so we capture AFTER.  Same conservative shrinkage check
-        // applies (post_len == pre_len + 1).
-        let pre_redo_len = self.log.len();
+        // Pre-staging into `pending_undo_cells`: Loro's redo()
+        // pushes the original op back onto the undo stack via the
+        // synthetic on_push call (DiffEvent = None).  We stage the
+        // same cells so the undo-stack item gets the correct meta,
+        // preserving partial-invalidate across redo->undo->redo
+        // chains.
+        //
+        // Falls back to full rebuild on:
+        // - Empty redo stack (no top_redo_meta).
+        // - Decode failure.
+        // - Empty cells (non-cell-keyed op originally pushed with
+        //   `Some(empty Vec)` staged via `append_op`).
+        let captured_cells: Option<Vec<(u16, u32, u32)>> = self
+            .undo
+            .top_redo_meta()
+            .and_then(|meta| decode_cells_from_loro_value(&meta.value));
+        let pending_value = captured_cells.clone().unwrap_or_default();
+        *self.pending_undo_cells.lock().expect("pending_undo_cells mutex poisoned") =
+            Some(pending_value);
         let consumed = self.undo.redo()?;
         // Phase 5.5 V2 V2 audit closure (Codex M2): gate matches `undo`.
         if consumed {
-            // V3.5.0.6 D2 partial-invalidate dispatch (extends V3.3.0.X
-            // HIGH-1): prefer partial-invalidate; fall back to full rebuild.
-            //
-            // **V3.5.0.X audit-closure A-HIGH-1 / Opus-H2 (2026-05-24)
-            // -- pure-local-frontier gate**: same rationale as undo
-            // (see undo() docstring above).  Redo's appended op
-            // appears as the latest visible op only when no remote
-            // merge intervened; otherwise the captured `post_redo_last_op`
-            // is the REMOTE op and partial-invalidate targets the
-            // wrong cell.  Gate on `pure_local_frontier` before the
-            // captured-op shape check.
-            let post_redo_len = self.log.len();
-            let post_redo_last_op: Option<Op> = if self.pure_local_frontier && pre_redo_len + 1 == post_redo_len {
-                self.log
-                    .iter()
-                    .last()
-                    .transpose()
-                    .map_err(CollabSessionError::OpLog)?
-            } else {
-                None
-            };
-            let partial_cells = post_redo_last_op
-                .as_ref()
-                .and_then(Self::affected_cells_for_partial_invalidate);
-            match partial_cells {
-                Some(cells) => {
+            match captured_cells {
+                Some(cells) if !cells.is_empty() => {
                     for (sheet, row, col) in cells {
                         self.invalidate_cell(sheet, row, col)?;
                     }
                 }
-                None => {
+                _ => {
                     self.rebuild_snapshot_cache()?;
                 }
             }
-            // V3.5.0.X audit-closure A-HIGH-1 / Opus-H2: after a
-            // successful redo, the appended op is the new latest
-            // visible op (fresh local append).  Reset the frontier
-            // flag.  Same rationale as undo() above.
-            self.pure_local_frontier = true;
             self.maybe_auto_flush()?;
+        } else {
+            // Mirrors `undo()` -- clear stale staged data when redo()
+            // was a no-op (on_push never fired).
+            *self.pending_undo_cells.lock().expect("pending_undo_cells mutex poisoned") = None;
         }
         Ok(consumed)
     }
@@ -2976,10 +2971,126 @@ impl Drop for UndoGroupGuard<'_> {
 /// exclude prefix so cursor-movement commits don't fill the
 /// undo stack. (Phase 5.6 V1 tags presence writes with that
 /// origin via `OpLog::presence_set` / `presence_remove`.)
-fn make_undo_manager(log: &OpLog) -> loro::UndoManager {
+///
+/// **Phase 5.7 V3.6.0.2 (2026-05-24) D1**: also wires Loro's
+/// `set_on_push` callback to capture affected cells of every
+/// pushed op into `UndoItemMeta::value` (encoded as
+/// `LoroValue::List<List<I64>>` per `encode_cells_to_loro_value`).
+/// The cells come from `pending_undo_cells` (set by `append_op`
+/// before its `self.log.append(op)` call OR by `undo()` /
+/// `redo()` before their Loro call -- the latter for the
+/// synthetic inverse op that Loro pushes onto the opposite
+/// stack).  `undo()` / `redo()` read back via `top_undo_meta()`
+/// / `top_redo_meta()` to know which cells to invalidate.  See
+/// `pending_undo_cells` field docstring for the full handoff
+/// pattern + re-entrancy analysis.
+///
+/// The Arc is cloned into the closure (`on_push` requires
+/// `Send + Sync`); the original Arc stays on `CollabSession`.
+/// Re-creating the UndoManager (in `discard_pending_ops`) drops
+/// the OLD closure (and its Arc clone) and creates a fresh
+/// closure with a NEW Arc clone -- both clones point at the
+/// SAME Mutex, so the handoff pattern keeps working.
+fn make_undo_manager(
+    log: &OpLog,
+    pending_undo_cells: Arc<Mutex<Option<Vec<(u16, u32, u32)>>>>,
+) -> loro::UndoManager {
     let mut undo = log.new_undo_manager();
     undo.add_exclude_origin_prefix(PRESENCE_COMMIT_ORIGIN);
+    undo.set_on_push(Some(Box::new(move |_source, _span, _diff| {
+        // Drain the pre-staged cells (set by append_op /
+        // undo / redo before the Loro op that triggered this
+        // push).  Take() leaves the Mutex at None so a
+        // subsequent (unstaged) push encodes empty cells ->
+        // full rebuild fallback.
+        let cells = pending_undo_cells
+            .lock()
+            .expect("pending_undo_cells mutex poisoned in on_push")
+            .take()
+            .unwrap_or_default();
+        loro::UndoItemMeta {
+            value: encode_cells_to_loro_value(&cells),
+            cursors: Default::default(),
+        }
+    })));
     undo
+}
+
+/// **Phase 5.7 V3.6.0.2 D1 (2026-05-24)** -- encode a Vec of
+/// (sheet, row, col) cell coordinates into a `LoroValue` for
+/// storage in `UndoItemMeta::value`.
+///
+/// Shape: `LoroValue::List` of `LoroValue::List` of three
+/// `LoroValue::I64`s `[sheet, row, col]`.  Chosen over
+/// `LoroValue::Map { "cells": List, ... }` for compactness +
+/// straightforward decoder (no key lookup; pure index access).
+///
+/// **Encoding cost**: O(N) where N = cells.len().  Typical N
+/// per op = 1 (PutValue / PutFormula / ClearFormula /
+/// SetCellFormat each affect one cell); BatchCommit with all-
+/// cell-keyed inner ops bumps N to inner-op count.  Encoded
+/// LoroValue is wrapped in `Arc<Vec<LoroValue>>` so the
+/// `UndoItemMeta::value` clone (one of which happens on every
+/// `top_undo_meta()` read) is O(1) -- Loro Arc-clones the
+/// outer container.
+///
+/// **Negative cases**: `cells.is_empty()` returns
+/// `LoroValue::List(empty)` which decodes back to
+/// `Some(Vec::new())`.  The undo/redo dispatch treats empty
+/// cells as a "fall back to full rebuild" signal (semantically
+/// equivalent to the V3.5.0.6 non-cell-keyed-op path).
+fn encode_cells_to_loro_value(cells: &[(u16, u32, u32)]) -> LoroValue {
+    let inner: Vec<LoroValue> = cells
+        .iter()
+        .map(|(sheet, row, col)| {
+            LoroValue::List(
+                vec![
+                    LoroValue::I64(*sheet as i64),
+                    LoroValue::I64(*row as i64),
+                    LoroValue::I64(*col as i64),
+                ]
+                .into(),
+            )
+        })
+        .collect();
+    LoroValue::List(inner.into())
+}
+
+/// **Phase 5.7 V3.6.0.2 D1 (2026-05-24)** -- decode the
+/// inverse of `encode_cells_to_loro_value`.  Returns `Some(Vec)`
+/// on success (including `Some(Vec::new())` for the empty
+/// case), `None` on any structural mismatch (legacy / corrupt
+/// / future-version meta).
+///
+/// **Defensive over-restrictive decoding**: any inner element
+/// that isn't a 3-element list of I64s causes the whole decode
+/// to return None.  Callers fall back to full rebuild in that
+/// case -- safe but conservative.  V3.6+ schema additions
+/// would be additive (longer inner lists with new trailing
+/// fields) and could backward-compat extend this decoder.
+///
+/// **Range checks**: i64 -> u16/u32 conversion via `try_into`
+/// fails if the value is negative or out of range.  Returns
+/// None on failure.  Realistic encoder always emits non-negative
+/// values within range (CellWireValue's sheet/row/col are
+/// u16/u32 by construction).
+fn decode_cells_from_loro_value(value: &LoroValue) -> Option<Vec<(u16, u32, u32)>> {
+    let outer = value.as_list()?;
+    let mut cells = Vec::with_capacity(outer.len());
+    for inner_value in outer.iter() {
+        let inner = inner_value.as_list()?;
+        if inner.len() != 3 {
+            return None;
+        }
+        let sheet_i64 = *inner[0].as_i64()?;
+        let row_i64 = *inner[1].as_i64()?;
+        let col_i64 = *inner[2].as_i64()?;
+        let sheet: u16 = sheet_i64.try_into().ok()?;
+        let row: u32 = row_i64.try_into().ok()?;
+        let col: u32 = col_i64.try_into().ok()?;
+        cells.push((sheet, row, col));
+    }
+    Some(cells)
 }
 
 #[cfg(test)]
@@ -4198,12 +4309,24 @@ mod tests {
     }
 
     #[test]
-    fn redo_after_remote_interleave_falls_back_to_full_rebuild() {
-        // V3.5.0.X follow-up audit CLOSURE-CODEX-LOW-3: symmetric
-        // counterpart to `undo_after_remote_interleave_falls_back_
-        // to_full_rebuild`.  Verifies the convergent HIGH closure's
-        // pure_local_frontier gate also protects the redo dispatch
-        // when a remote op interleaves between undo and redo.
+    fn redo_after_remote_interleave_uses_partial_invalidate_correctly() {
+        // **V3.6.0.2 D1 (2026-05-24)** -- REWRITE of V3.5.0.X
+        // `redo_after_remote_interleave_falls_back_to_full_rebuild`.
+        //
+        // V3.5.0.X conservative gate: when a remote op interleaved
+        // between undo and redo, `pure_local_frontier = false` forced
+        // a full `rebuild_snapshot_cache` on redo.  V3.6.0.2 replaces
+        // that with Loro's `top_redo_meta()` API which returns the
+        // EXACT cells of the to-be-pushed op (set via on_push at the
+        // original local append, preserved on the redo stack across
+        // the remote merge).  Partial-invalidate now FIRES correctly.
+        //
+        // This rewritten test verifies the post-V3.6.0.2 behavior:
+        // (1) the post-redo cache matches a forced full rebuild
+        //     (correctness pin -- both paths must converge);
+        // (2) the dispatch ran the PARTIAL path, not the full
+        //     rebuild path (verified indirectly via the captured
+        //     cells from top_redo_meta).
         let mut s_a = CollabSession::new(PeerId::new(1)).unwrap();
         s_a.append_op(Op::AddSheet {
             name: "S".to_string(),
@@ -4221,25 +4344,42 @@ mod tests {
         s_b.append_op(put_value(0, 1, 0, 20.0)).unwrap();
         let b_bytes = s_b.export_bytes().unwrap();
 
-        // Peer A: merges B's bytes.  pure_local_frontier resets to false.
+        // Peer A: merges B's bytes.  Post-V3.6.0.2 the redo stack's
+        // meta is UNAFFECTED by the merge (the meta is stack-local
+        // to Peer A's UndoManager; remote merges only touch the
+        // Loro doc state, not the undo/redo stacks' UndoItemMeta).
         s_a.merge_bytes(&b_bytes).unwrap();
-        assert!(!s_a.pure_local_frontier);
 
-        // Peer A: redo the undone PutValue.  Pre-closure (without the
-        // pure_local_frontier gate) partial-invalidate would target the
-        // wrong cell.  Post-closure the gate falls back to full rebuild.
+        // V3.6.0.2 invariant pin: top_redo_meta() returns the cells
+        // of the to-be-redone op (Peer A's PutValue at (0, 0, 0)),
+        // NOT Peer B's remote op.  This is the property that lets
+        // partial-invalidate fire correctly.
+        let top_meta = s_a.undo.top_redo_meta()
+            .expect("redo stack has one item (Peer A's undone PutValue)");
+        let cells = decode_cells_from_loro_value(&top_meta.value)
+            .expect("redo-stack meta encodes the cells correctly");
+        assert_eq!(cells, vec![(0u16, 0u32, 0u32)],
+            "V3.6.0.2 invariant: top_redo_meta returns the exact cells \
+             of the to-be-redone op (A's PutValue at (0,0,0)), regardless \
+             of remote-interleave -- this is what lets partial-invalidate \
+             fire correctly post-V3.6.0.2");
+
+        // Peer A: redo the undone PutValue.  Partial-invalidate
+        // path fires (NOT full rebuild).
         let consumed = s_a.redo().unwrap();
         assert!(consumed, "redo must consume A's undone PutValue");
 
         // Compare the post-redo cache to a forced full rebuild on the
-        // same log (the convergent HIGH equality pin).
+        // same log (the correctness equivalence pin -- partial path
+        // must converge to the same cache as full rebuild).
         let cache_dispatch = capture_full_cache(&s_a);
         s_a.force_clear_snapshot_cache();
         s_a.rebuild_snapshot_cache().unwrap();
         let cache_full_rebuild = capture_full_cache(&s_a);
         assert_eq!(cache_dispatch, cache_full_rebuild,
-            "post-closure: redo dispatch after remote interleave must \
-             produce the same cache as a forced full rebuild");
+            "V3.6.0.2 correctness: partial-invalidate redo after remote \
+             interleave produces the same cache as a forced full rebuild \
+             (proving that on_push meta captured the right cells)");
     }
 
     #[test]
@@ -4302,30 +4442,37 @@ mod tests {
     }
 
     #[test]
-    fn undo_after_remote_interleave_falls_back_to_full_rebuild() {
-        // V3.5.0.X audit-closure A-HIGH-1 / Opus-H2 (2026-05-24)
-        // CONVERGENT HIGH regression test.  Mirrors the Codex section
-        // 7 native-binding repro.
+    fn undo_after_remote_interleave_uses_partial_invalidate_correctly() {
+        // **V3.6.0.2 D1 (2026-05-24)** -- REWRITE of V3.5.0.X
+        // `undo_after_remote_interleave_falls_back_to_full_rebuild`.
         //
-        // Pre-closure scenario (Codex A-HIGH-1):
-        //   1. Peer A appends `PutValue(0, 0, 0, 10.0)` (local op).
-        //   2. Peer B appends `PutValue(0, 1, 0, 20.0)` (remote op).
-        //   3. Peer A `merge_bytes(B's snapshot)` -- B's op now trails
-        //      A's in causal iteration order.
-        //   4. Peer A `undo()` -- UndoManager retracts A's local op
-        //      (PutValue at (0,0,0)).  But the pre_undo_last_op
-        //      captured by V3.5.0.6 dispatch is B's REMOTE op
-        //      (PutValue at (0,1,0)).
-        //   5. Partial-invalidate targets cell (0,1,0) -- WRONG.
-        //      Cache: (0,0,0)=10.0 stays; (0,1,0)=20.0 is dropped
-        //      then re-derived from the post-undo log (which still
-        //      has B's PutValue so re-derives to 20.0; net zero).
-        //      Cell (0,0,0) is stale -- should have been dropped.
+        // V3.5.0.X CONVERGENT HIGH (Codex A-HIGH-1 / Opus H2): the
+        // V3.5.0.6 dispatch used `self.log.iter().last()` as a proxy
+        // for the to-be-retracted op; that proxy returns the REMOTE
+        // op (PutValue at (0,1,0)) when remote ops trail the local
+        // op in causal iteration order.  Partial-invalidate would
+        // target the WRONG cell, leaving (0,0,0) stale.  V3.5.0.X
+        // shipped a conservative `pure_local_frontier` gate that
+        // FORCED full rebuild after any remote merge -- correct but
+        // partial-invalidate was bypassed in the collab case.
         //
-        // Post-closure expectation:
-        //   pure_local_frontier is false after the merge_bytes call,
-        //   so undo()'s dispatch falls back to full rebuild_snapshot_cache.
-        //   The post-undo cache matches a fresh full rebuild.
+        // V3.6.0.2 D1: replaces the proxy + the gate with Loro's
+        // `top_undo_meta()` API.  The undo stack's top item carries
+        // a `UndoItemMeta::value` set by `on_push` at the original
+        // local append, with the EXACT cells of A's op encoded.
+        // Remote merges DO NOT touch the undo stack's per-item meta
+        // (the stack is local to each peer's UndoManager).  So
+        // top_undo_meta() returns A's cell, partial-invalidate
+        // fires correctly, no full rebuild needed.
+        //
+        // This rewritten test verifies that:
+        // (1) The top_undo_meta() returns A's cell (NOT B's),
+        //     proving the proxy is gone.
+        // (2) The post-undo cache matches a forced full rebuild,
+        //     proving partial-invalidate converges to the correct
+        //     state (same correctness equivalence pin as V3.5.0.X).
+        // (3) (0,0,0) is correctly absent (A's op was undone);
+        //     (0,1,0) is present (B's op is still in the log).
         let mut s_a = CollabSession::new(PeerId::new(1)).unwrap();
         // Both peers need the same base sheet to write into.
         s_a.append_op(Op::AddSheet {
@@ -4342,39 +4489,42 @@ mod tests {
         s_b.append_op(put_value(0, 1, 0, 20.0)).unwrap();
         let b_bytes = s_b.export_bytes().unwrap();
 
-        // Peer A merges B's bytes.  After this merge:
-        // - Both ops are in A's log.
-        // - In causal iteration order, B's op may come AFTER A's
-        //   (Loro's CRDT iteration is deterministic but depends on
-        //   the LWW/causal ordering; either way, A's last visible
-        //   local op is no longer guaranteed to be the actual tail).
-        // - pure_local_frontier MUST be false after this point.
+        // Peer A merges B's bytes.  Post-V3.6.0.2: this does NOT
+        // affect the undo-stack meta (which still has A's cell
+        // encoded from the original on_push at append).
         s_a.merge_bytes(&b_bytes).unwrap();
-        assert!(
-            !s_a.pure_local_frontier,
-            "merge_bytes must reset pure_local_frontier to false (the \
-             closure-gate invariant)"
-        );
 
-        // Now peer A undoes its local op.  Pre-closure, partial-invalidate
-        // would target the wrong cell.  Post-closure, the dispatch falls
-        // back to full rebuild_snapshot_cache because pure_local_frontier
-        // is false.
+        // V3.6.0.2 invariant pin: top_undo_meta returns A's cell
+        // (0, 0, 0), NOT B's (0, 1, 0).  This is the property that
+        // makes partial-invalidate correct under remote-interleave.
+        let top_meta = s_a.undo.top_undo_meta()
+            .expect("undo stack has one item (A's PutValue)");
+        let cells = decode_cells_from_loro_value(&top_meta.value)
+            .expect("undo-stack meta encodes cells correctly");
+        assert_eq!(cells, vec![(0u16, 0u32, 0u32)],
+            "V3.6.0.2 invariant: top_undo_meta returns A's PutValue cell \
+             (0,0,0), NOT B's remote op cell (0,1,0).  This is the \
+             property that lets partial-invalidate fire correctly post-\
+             V3.6.0.2 (the proxy `self.log.iter().last()` returned B's \
+             cell pre-closure -- the Codex A-HIGH-1 native-binding repro).");
+
+        // Peer A undoes its local op.  Partial-invalidate runs (NOT
+        // full rebuild) -- the on_pop / top_undo_meta path gives the
+        // exact cells.
         let consumed = s_a.undo().unwrap();
         assert!(consumed, "undo must consume A's PutValue");
 
-        // The post-undo cache must equal what a forced full rebuild would
-        // produce on the SAME post-undo log.  Force a fresh full rebuild
-        // (via the V3.5.0.6 force_clear_snapshot_cache + rebuild_snapshot_cache
-        // test seam) and compare.
+        // The post-undo cache must equal what a forced full rebuild
+        // would produce on the SAME post-undo log -- proving that
+        // partial-invalidate converges to the correct state.
         let cache_dispatch = capture_full_cache(&s_a);
         s_a.force_clear_snapshot_cache();
         s_a.rebuild_snapshot_cache().unwrap();
         let cache_full_rebuild = capture_full_cache(&s_a);
         assert_eq!(cache_dispatch, cache_full_rebuild,
-            "post-closure: undo dispatch after remote interleave must \
-             produce the same cache as a forced full rebuild on the same \
-             post-undo log (Codex A-HIGH-1 + Opus H2 convergent closure)");
+            "V3.6.0.2 correctness: partial-invalidate undo after remote \
+             interleave produces the same cache as a forced full rebuild \
+             (proving that on_push meta captured the right cells)");
 
         // Sanity: (0,1,0) (B's cell) is present; (0,0,0) (A's cell, undone)
         // is absent.  This is what the full-rebuild path produces; if the
