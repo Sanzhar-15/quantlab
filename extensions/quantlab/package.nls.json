@@ -33,6 +33,8 @@
 	"command.quantbookCellGridRefresh.title": "Quantbook: Refresh Cell Grid",
 	"command.quantbookCellGridCollab.title": "Quantbook: Open Cell Grid (Collab)",
 	"command.quantbookCellGridSwitchSheet.title": "Quantbook: Switch Cell Grid Sheet",
+	"command.quantbookSaveAs.title": "Quantbook: Save As...",
+	"command.quantbookOpen.title": "Quantbook: Open...",
 	"command.openRiskSettings.title": "Open Risk Settings",
 	"command.openBrokerSettings.title": "Open Broker Settings",
 	"command.selectDataSource.title": "Select Data Source",

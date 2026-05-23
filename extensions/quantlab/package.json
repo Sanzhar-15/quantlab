@@ -203,6 +203,16 @@
         "category": "%command.category%"
       },
       {
+        "command": "quantlab.quantbookSaveAs",
+        "title": "%command.quantbookSaveAs.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.quantbookOpen",
+        "title": "%command.quantbookOpen.title%",
+        "category": "%command.category%"
+      },
+      {
         "command": "quantlab.openRiskSettings",
         "title": "%command.openRiskSettings.title%",
         "category": "%command.category%"

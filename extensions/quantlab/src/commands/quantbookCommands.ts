@@ -22,7 +22,7 @@
 
 import * as vscode from 'vscode';
 
-import { appendPutValueValidated, createSession, listSheets, quantbookEngineVersion, sessionFromSnapshot } from '../quantbook/session';
+import { appendPutValueValidated, createSession, exportToQbook, generateUuidPeerId, listSheets, quantbookEngineVersion, sessionFromQbook, sessionFromSnapshot } from '../quantbook/session';
 import { loadQuantbookEngine, quantbookHostInfo } from '../quantbook/loader';
 import { connectOrSpawn, runMultiWindowDemo } from '../quantbook/multiWindowDemo';
 import { CellGridPanel } from '../quantbook/cellGrid/cellGridPanel';
@@ -330,6 +330,91 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				const detail = err instanceof Error ? err.message : String(err);
 				getOutput().appendLine(`FATAL switch-sheet error: ${detail}`);
 				void vscode.window.showErrorMessage(`Quantbook cell grid switch failed: ${detail}`);
+			}
+		}),
+	);
+
+	// Phase 5.7 V3.4.0.4b (2026-05-23) -- .qbook persistence commands.
+	//
+	// Save As: requires an open local CellGridPanel as the source
+	// session.  showSaveDialog filters .qbook extension.  Engine's
+	// to_qbook calls rebuild_workbook internally so the saved file is
+	// a standard Tier D3 envelope (workbook.toml + oplog.bin) readable
+	// by any future Quantbook tool.
+	//
+	// Open: showOpenDialog filters .qbook directories.  Generates a
+	// fresh UUID PeerId via generateUuidPeerId (V3.4.0.4b D5 deviation
+	// from V3.4.0.1: fresh-UUID-per-session is CRDT-correct + closes
+	// R-V3.3-5 without the two-windows-same-workspace collision risk
+	// that persisted-PeerId had).  Opens the loaded session in a new
+	// CellGridPanel on sheet 0.
+	//
+	// **V3.4.0.4b limitation**: NO save-on-edit auto-save; user must
+	// invoke Save As after edits.  V3.4.1+ may add auto-save +
+	// last-saved-time indicator.  NO multi-sheet support in the Open
+	// UX -- always lands on sheet 0; user runs "Switch Cell Grid
+	// Sheet" if they want a different sheet.
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookSaveAs', async () => {
+			const panels = CellGridPanel.activeLocalPanels();
+			if (panels.length === 0) {
+				void vscode.window.showInformationMessage(
+					'No Cell Grid panel is open.  Run "Quantbook: Open Cell Grid" first.',
+				);
+				return;
+			}
+			// V3.4.0.4b: same panels[0]-arbitrary-pick semantic as
+			// switch-sheet (V3.3.0.5 + V3.3.0.6 docs).  OLDEST open
+			// local panel; V3.x can add a picker step if multi-panel
+			// usage becomes common.
+			const target = panels[0];
+			const uri = await vscode.window.showSaveDialog({
+				title: 'Save Quantbook As',
+				filters: { 'Quantbook': ['qbook'] },
+				saveLabel: 'Save',
+			});
+			if (uri === undefined) {
+				return; // user cancelled
+			}
+			const log = getOutput();
+			try {
+				exportToQbook(target.session, uri.fsPath);
+				log.appendLine(`Saved Cell Grid (sheet ${target.sheet}) to ${uri.fsPath}.`);
+				void vscode.window.showInformationMessage(`Quantbook saved to ${uri.fsPath}`);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL Save As error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook save failed: ${detail}`);
+			}
+		}),
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('quantlab.quantbookOpen', async () => {
+			const uris = await vscode.window.showOpenDialog({
+				title: 'Open Quantbook',
+				filters: { 'Quantbook': ['qbook'] },
+				canSelectFiles: false,
+				canSelectFolders: true, // .qbook is a directory
+				canSelectMany: false,
+				openLabel: 'Open',
+			});
+			if (uris === undefined || uris.length === 0) {
+				return; // user cancelled
+			}
+			const path = uris[0].fsPath;
+			const log = getOutput();
+			try {
+				// Fresh UUID PeerId per open: V3.4.0.4b D5 simplified
+				// (per generateUuidPeerId docstring).
+				const peerId = generateUuidPeerId();
+				const session = sessionFromQbook(path, peerId);
+				log.appendLine(`Opened Quantbook from ${path} (peerId=0x${peerId.toString(16)}).`);
+				CellGridPanel.show(context, session, 0);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				log.appendLine(`FATAL Open error: ${detail}`);
+				void vscode.window.showErrorMessage(`Quantbook open failed: ${detail}`);
 			}
 		}),
 	);

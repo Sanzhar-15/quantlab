@@ -159,6 +159,56 @@ export function addSheet(session: CollabSessionInstance, name: string, chunkRows
 }
 
 /**
+ * **Phase 5.7 V3.4.0.4b (2026-05-23) -- UUID-derived 64-bit PeerId.**
+ *
+ * Generates a fresh `bigint` PeerId for {@link createSession} or
+ * {@link sessionFromQbook} (where the engine layer is peer-id-agnostic
+ * + the caller is responsible for ensuring uniqueness).
+ *
+ * **Source**: `crypto.randomUUID()` (Node 14.17+; Electron/VS Code well
+ * past that floor).  UUIDv4 has 122 bits of randomness; truncating to
+ * 64 bits keeps ~64 bits of entropy.  Birthday-paradox collision
+ * probability is ~2^32 sessions before first collision -- effectively
+ * zero for real workbook usage (a user spawning 4 billion sessions in
+ * one workbook is not the threat model).
+ *
+ * **Non-zero guarantee**: `PeerId(0)` is the engine's `LEGACY_PEER`
+ * sentinel + would assert-fail `CollabSession::new`.  A truncated UUID
+ * could theoretically be all-zero (probability ~2^-64); we retry in
+ * that case.
+ *
+ * **D5 deviation (V3.4.0.4b plan note)**: V3.4.0.1 D5 originally
+ * specified UUID-derived PeerId PERSISTED per workbook (via envelope
+ * v3 OR per-machine config file).  Implementation discovery: persisted
+ * PeerId per workbook has unsolvable problems -- two windows of the
+ * SAME vscode workspace opening the SAME workbook would both read the
+ * same persisted PeerId + collide.  Fresh-UUID-per-session is
+ * CRDT-correct (each session is a distinct Loro peer; future ops get
+ * unique attribution) + closes R-V3.3-5 cross-restart PID collision
+ * fully.  Trade-off: loses "this peer is User A across sessions"
+ * attribution.  V3.4.1+ may add per-workbook stash IF a user-facing
+ * feature (e.g., "show my contributions") surfaces; for V3.4.0.4b
+ * scope it's deferred.
+ */
+export function generateUuidPeerId(): bigint {
+	// Loop on the (astronomically rare) all-zero result.
+	for (let attempt = 0; attempt < 8; attempt += 1) {
+		const uuid = crypto.randomUUID();
+		// UUID format: 8-4-4-4-12 hex digits with dashes.  Strip
+		// dashes; take first 16 hex chars (= 64 bits).
+		const hex16 = uuid.replace(/-/g, '').slice(0, 16);
+		const value = BigInt('0x' + hex16);
+		if (value !== 0n) {
+			return value;
+		}
+	}
+	// 8 consecutive all-zero UUIDs is so improbable (~2^-512) that
+	// reaching here means the crypto.randomUUID source is broken;
+	// surface loudly per No-Fallbacks.
+	throw new Error('[bad_argument] generateUuidPeerId: 8 consecutive zero-truncated UUIDs from crypto.randomUUID -- entropy source broken');
+}
+
+/**
  * Return the engine binding crate's version string. For diagnostics
  * + the V2 version-mismatch error path.
  */

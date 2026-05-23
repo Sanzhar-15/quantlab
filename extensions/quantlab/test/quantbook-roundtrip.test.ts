@@ -53,6 +53,7 @@ import {
 	createSession,
 	exportCellSnapshot,
 	exportToQbook,
+	generateUuidPeerId,
 	isAutoFlushPolicy,
 	isQuantbookErrorCode,
 	listSheets,
@@ -4027,5 +4028,51 @@ suite('quantbook V3.4.0.4a -- .qbook persistence napi round-trip', function () {
 			assert.strictEqual(info.code, 'bad_argument',
 				`peer_id_from_bigint rejects zero with bad_argument; got ${info.code}`);
 		}
+	});
+});
+
+// ============================================================================
+// Phase 5.7 V3.4.0.4b -- UUID-derived PeerId helper (IDE-side D5 closure)
+// ============================================================================
+
+suite('quantbook V3.4.0.4b -- generateUuidPeerId', function () {
+	test('returns non-zero BigInt (rejects LEGACY_PEER sentinel)', () => {
+		const peerId = generateUuidPeerId();
+		assert.ok(peerId !== 0n, 'PeerId must be non-zero');
+		assert.strictEqual(typeof peerId, 'bigint');
+	});
+
+	test('fits in u64 range (0 < x <= 2^64-1)', () => {
+		const U64_MAX = (1n << 64n) - 1n;
+		for (let i = 0; i < 100; i += 1) {
+			const peerId = generateUuidPeerId();
+			assert.ok(peerId > 0n, `iter ${i}: > 0`);
+			assert.ok(peerId <= U64_MAX, `iter ${i}: <= u64::MAX`);
+		}
+	});
+
+	test('uniqueness across 1000 calls (birthday-paradox sanity)', () => {
+		// UUIDv4 truncated to 64 bits has ~64 bits of entropy.
+		// Birthday-paradox collision probability is ~2^32 sessions
+		// before first collision.  1000 calls is well-below that
+		// threshold; zero collisions expected.
+		const seen = new Set<bigint>();
+		for (let i = 0; i < 1000; i += 1) {
+			const peerId = generateUuidPeerId();
+			assert.ok(!seen.has(peerId), `collision at iter ${i}: ${peerId.toString(16)}`);
+			seen.add(peerId);
+		}
+		assert.strictEqual(seen.size, 1000);
+	});
+
+	test('engine accepts UUID-derived PeerId for createSession', function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+		// End-to-end: helper output is a valid engine PeerId per
+		// peer_id_from_bigint validation (non-zero + u64-range).
+		const peerId = generateUuidPeerId();
+		const session = createSession(peerId);
+		assert.strictEqual(session.peerId(), peerId,
+			'engine round-trips the UUID-derived PeerId via session.peerId()');
 	});
 });
