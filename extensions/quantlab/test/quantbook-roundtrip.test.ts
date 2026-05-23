@@ -2285,7 +2285,7 @@ suite('quantbook V3.2.a -- exportSnapshot cell-snapshot export', function () {
 // Phase 5.7 V3.2.b.5 -- cell-edit flow (HTML + dispatcher)
 // ============================================================================
 
-import { buildSheetQuickPickItems, buildVirtualRows, classifyPollTick, computeVisibleRange, dispatchIncomingMessage, parseCellRawInput, validatePresenceNumeric, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
+import { buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, buildVirtualRows, classifyPollTick, computeVisibleRange, dispatchIncomingMessage, parseCellRawInput, validatePresenceNumeric, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
 
 suite('quantbook V3.2.b.2 -- cellGridHtml.ts nonce + script + editable cells', function () {
 	test('buildHtml WITHOUT nonce is unchanged from V3.2.a (no script tag; narrow CSP)', () => {
@@ -5007,6 +5007,195 @@ suite('quantbook V3.5.0.3c -- moveSheet napi contract', function () {
 		const snap = workbookSnapshot(session);
 		assert.deepStrictEqual(snap.sheets.map(s => s.id), [0, 1, 2],
 			'default display order is identical to V3.5.0.3b iteration order');
+	});
+});
+
+// ============================================================================
+// Phase 5.7 V3.5.0.4a (2026-05-24) -- sheet management QuickPick helpers
+// ============================================================================
+// Tests the pure helpers that back the V3.5.0.4a sheet management commands:
+// buildSheetManagementQuickPickItems (rename/delete/move source picker) +
+// buildSheetMovePositionItems (move target-position picker).  Command-layer
+// wiring (vscode commands themselves) needs vscode-host integration which
+// is V3.5.1+ scope per the V3.4.0.X Opus § F V3.5 ENTRY READINESS guidance.
+
+suite('quantbook V3.5.0.4a -- buildSheetManagementQuickPickItems', function () {
+	test('empty sheets -> empty items', () => {
+		const items = buildSheetManagementQuickPickItems([], 0);
+		assert.deepStrictEqual(items, []);
+	});
+
+	test('single sheet -> one item with id+name label', () => {
+		const items = buildSheetManagementQuickPickItems([{ id: 0, name: 'Solo' }], 0);
+		assert.strictEqual(items.length, 1);
+		assert.strictEqual(items[0].label, 'Sheet 0 -- Solo');
+		assert.strictEqual(items[0].sheet, 0);
+		assert.strictEqual(items[0].name, 'Solo');
+		assert.strictEqual(items[0].description, '(current)', 'single sheet matching currentSheet gets current marker');
+	});
+
+	test('multi-sheet -> id+name labels in input order', () => {
+		const sheets = [
+			{ id: 0, name: 'A' },
+			{ id: 1, name: 'B' },
+			{ id: 2, name: 'C' },
+		];
+		const items = buildSheetManagementQuickPickItems(sheets, 1);
+		assert.strictEqual(items.length, 3);
+		assert.deepStrictEqual(items.map(i => i.label),
+			['Sheet 0 -- A', 'Sheet 1 -- B', 'Sheet 2 -- C']);
+		assert.deepStrictEqual(items.map(i => i.sheet), [0, 1, 2]);
+		assert.deepStrictEqual(items.map(i => i.name), ['A', 'B', 'C']);
+	});
+
+	test('current-sheet annotation: only matching id gets "(current)"', () => {
+		const sheets = [
+			{ id: 0, name: 'A' },
+			{ id: 5, name: 'B' },
+			{ id: 2, name: 'C' },
+		];
+		const items = buildSheetManagementQuickPickItems(sheets, 5);
+		assert.deepStrictEqual(items.map(i => i.description),
+			['', '(current)', '']);
+	});
+
+	test('non-existent currentSheet -> all descriptions empty (Add flow pattern)', () => {
+		// Pattern: caller passes -1 to suppress current-marker entirely
+		// (no current-sheet concept for the Add flow).
+		const sheets = [
+			{ id: 0, name: 'A' },
+			{ id: 1, name: 'B' },
+		];
+		const items = buildSheetManagementQuickPickItems(sheets, -1);
+		assert.deepStrictEqual(items.map(i => i.description), ['', '']);
+	});
+
+	test('display-order respects input order (not id order)', () => {
+		// V3.5.0.3c display-order overlay can permute ids; helper must
+		// preserve input order (= snapshot's display order).
+		const sheets = [
+			{ id: 2, name: 'C' },
+			{ id: 0, name: 'A' },
+			{ id: 1, name: 'B' },
+		];
+		const items = buildSheetManagementQuickPickItems(sheets, 0);
+		assert.deepStrictEqual(items.map(i => i.sheet), [2, 0, 1],
+			'helper preserves input order (caller-supplied display order)');
+	});
+
+	test('items expose sheet name for command-layer use', () => {
+		const sheets = [{ id: 7, name: 'Q4 Returns' }];
+		const items = buildSheetManagementQuickPickItems(sheets, 7);
+		assert.strictEqual(items[0].name, 'Q4 Returns',
+			'name field is exposed so the command can prompt "Rename Q4 Returns..." etc.');
+	});
+
+	test('sheet names with special characters are preserved in label', () => {
+		const sheets = [{ id: 0, name: 'Sheet & "Test" -- 2026/Q4' }];
+		const items = buildSheetManagementQuickPickItems(sheets, 0);
+		assert.strictEqual(items[0].label, 'Sheet 0 -- Sheet & "Test" -- 2026/Q4',
+			'special characters in sheet name pass through verbatim (vscode QuickPick handles rendering)');
+	});
+});
+
+suite('quantbook V3.5.0.4a -- buildSheetMovePositionItems', function () {
+	test('empty sheets -> empty items', () => {
+		const items = buildSheetMovePositionItems([], 0);
+		assert.deepStrictEqual(items, []);
+	});
+
+	test('two sheets -> 2 positions (first, last)', () => {
+		const sheets = [
+			{ id: 0, name: 'A' },
+			{ id: 1, name: 'B' },
+		];
+		const items = buildSheetMovePositionItems(sheets, 0);
+		assert.strictEqual(items.length, 2);
+		assert.strictEqual(items[0].label, 'Position 0 (first)');
+		assert.strictEqual(items[1].label, 'Position 1 (last)');
+		// items[].sheet carries the TARGET position (re-used field name).
+		assert.deepStrictEqual(items.map(i => i.sheet), [0, 1]);
+	});
+
+	test('three sheets, middle source -> 3 positions with adjacency labels', () => {
+		const sheets = [
+			{ id: 0, name: 'A' },
+			{ id: 1, name: 'B' },
+			{ id: 2, name: 'C' },
+		];
+		const items = buildSheetMovePositionItems(sheets, 1);  // source = B
+		assert.strictEqual(items.length, 3);
+		assert.strictEqual(items[0].label, 'Position 0 (first)');
+		// Position 1: between A and C (since B was removed from "remaining")
+		assert.strictEqual(items[1].label, 'Position 1 (between Sheet 0 and Sheet 2)');
+		assert.strictEqual(items[2].label, 'Position 2 (last)');
+	});
+
+	test('current source position gets "(current)" description', () => {
+		const sheets = [
+			{ id: 0, name: 'A' },
+			{ id: 1, name: 'B' },
+			{ id: 2, name: 'C' },
+		];
+		// source = sheet 2, currently at position 2.
+		const items = buildSheetMovePositionItems(sheets, 2);
+		assert.deepStrictEqual(items.map(i => i.description),
+			['', '', '(current)']);
+	});
+
+	test('source at first position -> position 0 marked current', () => {
+		const sheets = [
+			{ id: 0, name: 'A' },
+			{ id: 1, name: 'B' },
+		];
+		const items = buildSheetMovePositionItems(sheets, 0);
+		assert.deepStrictEqual(items.map(i => i.description),
+			['(current)', '']);
+	});
+
+	test('source not found in sheets -> no "(current)" marker', () => {
+		// Defensive: caller's source id might not be in the snapshot
+		// (race or stale UI state).  Helper should not crash + no
+		// position gets the current marker.
+		const sheets = [
+			{ id: 0, name: 'A' },
+			{ id: 1, name: 'B' },
+		];
+		const items = buildSheetMovePositionItems(sheets, 99);
+		assert.deepStrictEqual(items.map(i => i.description), ['', '']);
+		assert.strictEqual(items.length, 2);
+	});
+
+	test('four sheets, source at end -> middle adjacency labels reflect remaining order', () => {
+		// Setup: [A, B, C, D], source = D.  After removing D,
+		// remaining = [A, B, C].  Position 1 = between A and B;
+		// position 2 = between B and C.
+		const sheets = [
+			{ id: 0, name: 'A' },
+			{ id: 1, name: 'B' },
+			{ id: 2, name: 'C' },
+			{ id: 3, name: 'D' },
+		];
+		const items = buildSheetMovePositionItems(sheets, 3);
+		assert.strictEqual(items[0].label, 'Position 0 (first)');
+		assert.strictEqual(items[1].label, 'Position 1 (between Sheet 0 and Sheet 1)');
+		assert.strictEqual(items[2].label, 'Position 2 (between Sheet 1 and Sheet 2)');
+		assert.strictEqual(items[3].label, 'Position 3 (last)');
+	});
+
+	test('display-order permutation preserved (V3.5.0.3c integration)', () => {
+		// V3.5.0.3c can permute sheets in the snapshot; helper should
+		// use the input display order for adjacency labels (NOT id order).
+		const sheets = [
+			{ id: 5, name: 'X' },
+			{ id: 2, name: 'Y' },
+			{ id: 9, name: 'Z' },
+		];
+		const items = buildSheetMovePositionItems(sheets, 2);  // source = Y (display pos 1)
+		// After removing Y: remaining = [X(5), Z(9)].
+		// Position 1: between X and Z (per display order, NOT id order).
+		assert.strictEqual(items[1].label, 'Position 1 (between Sheet 5 and Sheet 9)',
+			'adjacency labels use display order, not id order');
 	});
 });
 

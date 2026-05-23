@@ -508,3 +508,118 @@ export function buildSheetQuickPickItems(
 		sheet: s,
 	}));
 }
+
+/**
+ * **Phase 5.7 V3.5.0.4a (2026-05-24) -- shape of one row in the
+ * sheet-management QuickPick** (rename / delete / move source selectors).
+ *
+ * Like {@link SheetQuickPickItem} but carries the sheet's NAME alongside
+ * the id, since V3.5.0.3 sheet ops are name-relevant to the user (the
+ * user wants to know "rename WHICH sheet") and the ids alone aren't
+ * meaningful for the user.
+ *
+ * Stays vscode-agnostic for direct mocha coverage; command site wraps
+ * in real `vscode.QuickPickItem`s.
+ */
+export interface SheetManagementQuickPickItem {
+	readonly label: string;
+	readonly description: string;
+	readonly sheet: number;
+	readonly name: string;
+}
+
+/**
+ * **Phase 5.7 V3.5.0.4a (2026-05-24) -- build QuickPick items for the
+ * sheet-management commands (rename / delete / move source pickers).**
+ *
+ * Reads sheets from a {@link WorkbookSnapshotJson} so we get display-
+ * order ordering (V3.5.0.3c) + tombstone filtering (V3.5.0.3b) for
+ * free -- the engine napi already applies both at the snapshot layer,
+ * so we just iterate `snapshot.sheets` in order.
+ *
+ * - `label` = `"Sheet N -- Name"` (id + name combined; the id is shown
+ *   so the user can verify which underlying sheet they're acting on,
+ *   the name is shown so they recognize it).
+ * - `description` carries `(current)` for the panel's current sheet so
+ *   the user knows which sheet they were viewing when they invoked
+ *   the command.  Other entries get empty description (visual quiet).
+ *
+ * Pure function: no vscode dependency.  Mocha-testable in isolation.
+ *
+ * @param sheets       snapshot.sheets array from {@link workbookSnapshot}.
+ *                     Iteration order is the engine's display-order
+ *                     overlay (V3.5.0.3c) post-tombstone-filter (V3.5.0.3b).
+ * @param currentSheet sheet ID of the panel from which the user invoked
+ *                     the command.  Annotated as "(current)".  Pass any
+ *                     non-existent id (e.g., `-1`) to suppress the
+ *                     current-marker (e.g., for `add` flow which has no
+ *                     source-sheet concept).
+ * @returns one item per input sheet.  Empty if `sheets` is empty.
+ */
+export function buildSheetManagementQuickPickItems(
+	sheets: ReadonlyArray<{ id: number; name: string }>,
+	currentSheet: number,
+): SheetManagementQuickPickItem[] {
+	return sheets.map(s => ({
+		label: `Sheet ${s.id} -- ${s.name}`,
+		description: s.id === currentSheet ? '(current)' : '',
+		sheet: s.id,
+		name: s.name,
+	}));
+}
+
+/**
+ * **Phase 5.7 V3.5.0.4a (2026-05-24) -- build QuickPick items for the
+ * sheet-MOVE target-position picker.**
+ *
+ * For `quantlab.quantbookSheetMove`, after the user picks the source
+ * sheet via {@link buildSheetManagementQuickPickItems}, they then pick
+ * the target display-order position.  Positions are 0-based; the picker
+ * shows `"Position 0 (first)"` / `"Position 1 (between Sheet X and Sheet Y)"` /
+ * etc. so users can see what's adjacent.
+ *
+ * Pure function.  Mocha-testable.
+ *
+ * @param sheets        post-move-source display-order list (i.e., the
+ *                      snapshot.sheets BEFORE the move).  Each entry's
+ *                      `id` + `name` is used for adjacency labels.
+ * @param sourceSheetId the sheet being moved -- excluded from the
+ *                      adjacency labels (since after the move it would
+ *                      be at the target position itself).
+ * @returns one item per valid target position `[0, sheets.length - 1]`
+ *          (after removing the source sheet, the new max position is
+ *          `len - 1`).  The source sheet's CURRENT position gets a
+ *          `"(current)"` description.
+ */
+export function buildSheetMovePositionItems(
+	sheets: ReadonlyArray<{ id: number; name: string }>,
+	sourceSheetId: number,
+): SheetManagementQuickPickItem[] {
+	const currentSourcePos = sheets.findIndex(s => s.id === sourceSheetId);
+	// After removing the source, the remaining display has length-1 entries;
+	// valid target positions are [0, length-1] inclusive (insert anywhere).
+	const remaining = sheets.filter(s => s.id !== sourceSheetId);
+	const items: SheetManagementQuickPickItem[] = [];
+	for (let pos = 0; pos < sheets.length; pos += 1) {
+		let label = `Position ${pos}`;
+		if (pos === 0) {
+			label += ' (first)';
+		} else if (pos === sheets.length - 1) {
+			label += ' (last)';
+		} else {
+			// pos is between remaining[pos - 1] and remaining[pos].
+			const before = remaining[pos - 1];
+			const after = remaining[pos];
+			if (before !== undefined && after !== undefined) {
+				label += ` (between Sheet ${before.id} and Sheet ${after.id})`;
+			}
+		}
+		items.push({
+			label,
+			description: pos === currentSourcePos ? '(current)' : '',
+			sheet: pos,  // re-using sheet field as target position; semantically the "pick value"
+			name: '',
+		});
+	}
+	return items;
+}

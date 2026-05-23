@@ -213,6 +213,26 @@
         "category": "%command.category%"
       },
       {
+        "command": "quantlab.quantbookSheetAdd",
+        "title": "%command.quantbookSheetAdd.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.quantbookSheetRename",
+        "title": "%command.quantbookSheetRename.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.quantbookSheetDelete",
+        "title": "%command.quantbookSheetDelete.title%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "quantlab.quantbookSheetMove",
+        "title": "%command.quantbookSheetMove.title%",
+        "category": "%command.category%"
+      },
+      {
         "command": "quantlab.openRiskSettings",
         "title": "%command.openRiskSettings.title%",
         "category": "%command.category%"
