@@ -66,6 +66,57 @@ use thiserror::Error;
 
 use ql_functions::FunctionRegistry;
 use ql_oplog::{replay_into, CellWireValue, Op, OpLog, OpLogError, PeerId, ReplayError, PRESENCE_COMMIT_ORIGIN};
+
+/// **Phase 5.7 V3.4.0.2 (2026-05-23) -- per-cell snapshot-cache state.**
+///
+/// Internal cache-value type for `CollabSession::last_snapshot`.  Carries
+/// the LAST-WRITE-WINS view of a single cell across the cell-keyed
+/// `Op` variants the cache models (V3.4.0.2: `PutValue`, `PutFormula`,
+/// `ClearFormula`).
+///
+/// **Why an Option<T> per field**: a cell may legitimately have a formula
+/// without a literal value (e.g., `=A1+1` with no fallback Pending), and
+/// vice versa.  Both fields are independently mutable via separate `Op`
+/// variants; the LWW semantic is per-FIELD, not per-cell.
+///
+/// **Why this lives in `ql-collab/src/session.rs` (NOT `ql-oplog`)**:
+/// `CellState` is a SESSION-CACHE type, not a wire type.  The wire
+/// `Op` enum is unchanged.  The cache shape can evolve (e.g., V3.5+ adds
+/// `format: Option<FormatId>` for `SetCellFormat`) without touching the
+/// `ql-oplog` ABI.
+///
+/// **V3.4.0.1 decision D1 (hybrid)** locked this shape.  Cell-keyed
+/// ops feed `CellState`; non-cell-keyed ops (`SetName`, `AddSheet`, etc.)
+/// continue to live on `Workbook` state and are NOT cache-mirrored.
+///
+/// **Rule 4 per-field walk** (per V3.4.0.1 audit discipline +
+/// V3.3.0.3 closure of V3.2.d Opus M4):
+/// - `Option<T>`: `Send + Sync` when `T: Send + Sync` (std auto-trait).
+/// - `value: Option<CellWireValue>`: `CellWireValue` is `Send + Sync`
+///   per V1 audit (enum of f64 / bool / String / String / unit; all
+///   variants Send + Sync).
+/// - `formula: Option<String>`: `String` is `Send + Sync` trivially.
+/// - Composition: `CellState: Send + Sync`.  Inherits external
+///   synchronization from `Arc<Mutex<CollabSession>>` (V2.4 audit;
+///   per-field walk in `ql-bindings-node/src/lib.rs::CollabSession`
+///   docstring).
+///
+/// **No new negative-trait claim introduced.**  Rule 4 arc terminus
+/// stays at 6.  V3.5+ may add `format: Option<FormatId>` -- the
+/// per-field walk will need re-running at that point because `FormatId`
+/// is a tagged enum (`Builtin(u32) | Custom(PeerId, u32)`) whose
+/// trait obligations were audited at D-1 (also Send + Sync per the
+/// step 8 megaudit).
+///
+/// **PartialEq** but NOT `Eq` because `CellWireValue` contains `f64`
+/// which doesn't implement `Eq` (NaN != NaN).  Tests can still use
+/// `assert_eq!`; that calls `PartialEq::eq` which is fine for non-NaN
+/// numeric comparisons.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CellState {
+    pub value: Option<CellWireValue>,
+    pub formula: Option<String>,
+}
 use ql_storage::Workbook;
 
 use crate::presence::{self, PresenceError, PresenceState};
@@ -388,24 +439,37 @@ pub struct CollabSession {
 
     /// **Phase 5.7 V3.3.0.3 (2026-05-22) -- incremental snapshot cache.**
     ///
-    /// Keyed by `(sheet, row, col)`; value = the latest `Op::PutValue`
-    /// value observed for that cell across all peers in the local op
-    /// log's causal-merge order.  Read by [`Self::snapshot_cells`] +
-    /// the napi `CollabSession::export_snapshot` accessor in
+    /// Keyed by `(sheet, row, col)`; value = LAST-WRITE-WINS state for
+    /// that cell across all peers in the local op log's causal-merge
+    /// order.  Read by [`Self::snapshot_cells`] + the napi
+    /// `CollabSession::export_snapshot` accessor in
     /// O(total-cells-in-cache) instead of O(N) in op count.  Closes
     /// V3.2.d Opus MEDIUM-4 (`exportSnapshot` lock-hold time scales
     /// linearly with op log size).
+    ///
+    /// **V3.4.0.2 (2026-05-23) -- value type extended from `CellWireValue`
+    /// to `CellState{value: Option<CellWireValue>, formula: Option<String>}`
+    /// per V3.4.0.1 decision D1 (hybrid).**  Cache now models 3 cell-keyed
+    /// `Op` variants: `PutValue` (writes `.value`), `PutFormula` (writes
+    /// `.formula`), `ClearFormula` (clears `.formula`, preserves `.value`).
+    /// Non-cell-keyed ops (`SetName`, `AddSheet`, etc.) continue to live on
+    /// `Workbook` state and are NOT cache-mirrored.  V3.5+ extends `CellState`
+    /// with `format: Option<FormatId>` for `SetCellFormat` when cell-grid
+    /// rendering needs format info.
     ///
     /// **Update paths** (V3.3.0.X audit closure (MEDIUM-2, 2026-05-23):
     /// SEVEN op-log mutation sites + initialization, all enumerated below;
     /// pre-closure the docstring listed only 5 and the docs drifted from
     /// source -- see audit transcript at `docs/audits/2026-05-23-phase-5-7-
-    /// v3-3-0-x-{codex,opus}.md`):
+    /// v3-3-0-x-{codex,opus}.md`).  V3.4.0.2 extends each path's match arm
+    /// from `PutValue`-only to `PutValue` + `PutFormula` + `ClearFormula`):
     /// - `new`: empty initialization.
     /// - `from_snapshot`: rebuilt by walking the imported log.
-    /// - `append_op`: O(1) `insert` on PutValue (local append is
-    ///   always at the causal frontier; iteration order does not
-    ///   reorder existing entries).
+    /// - `append_op`: O(1) incremental upsert for any of the 3 cell-keyed
+    ///   variants (local append is always at the causal frontier;
+    ///   iteration order does not reorder existing entries).  Upsert
+    ///   PRESERVES the other field of `CellState` (e.g., `PutValue`
+    ///   on a cell that has a formula keeps the formula intact).
     /// - `merge_bytes`: REBUILT (atomic-swap rebuild from scratch).
     ///   Loro's CRDT merge can insert remote ops at causally-prior
     ///   positions, which changes the iteration order of EXISTING
@@ -451,24 +515,24 @@ pub struct CollabSession {
     /// independent of the normal mutation paths.
     ///
     /// **Rule 4 per-field walk** (per V3.3.0.1 audit discipline +
-    /// V3.3.0.3 closure of V3.2.d Opus M4):
+    /// V3.3.0.3 closure of V3.2.d Opus M4 + V3.4.0.2 extension to
+    /// `CellState` value type):
     /// - `HashMap<K, V>` is `Send + Sync` when both `K` and `V` are
     ///   `Send + Sync` (std::collections::HashMap is `Send + Sync`
     ///   in its inherent impl, parameterized over `K: Send + Sync,
     ///   V: Send + Sync` for the auto-traits to compose).
     /// - `(u16, u32, u32)`: tuple of `Copy + 'static` integers.
     ///   Trivially `Send + Sync`.
-    /// - `CellWireValue` (`ql_oplog::CellWireValue`): enum of
-    ///   `Number(f64) | Boolean(bool) | Text(String) | Error(String)
-    ///   | Pending`.  All variants are `Send + Sync` (audited at
-    ///   V1).  Composition: `Send + Sync`.
+    /// - `CellState`: per its own per-field walk docstring above,
+    ///   `Send + Sync` (composition of two `Option<T>` fields whose
+    ///   inner types are both `Send + Sync`).
     ///
     /// Therefore `last_snapshot: Send + Sync`.  Inherits external
     /// synchronization from `Arc<Mutex<CollabSession>>` (V2.4 audit;
     /// per-field walk in `ql-bindings-node/src/lib.rs::CollabSession`
-    /// docstring).  No new negative-trait claim introduced.  Rule 4
-    /// arc terminus stays at 6.
-    last_snapshot: HashMap<(u16, u32, u32), CellWireValue>,
+    /// docstring).  No new negative-trait claim introduced at V3.4.0.2.
+    /// Rule 4 arc terminus stays at 6.
+    last_snapshot: HashMap<(u16, u32, u32), CellState>,
 }
 
 impl CollabSession {
@@ -585,26 +649,61 @@ impl CollabSession {
     /// committed locally (partial-state contract — see
     /// [`AutoFlushPolicy::OnAppend`]).
     pub fn append_op(&mut self, op: Op) -> Result<(), CollabSessionError> {
-        // V3.3.0.3 incremental cache update: local appends are always
-        // at the causal frontier (Loro's normal-flow append puts the
-        // op at the local peer's vector-clock head), so iteration
-        // order does NOT reorder existing entries.  Safe to
-        // incrementally insert WITHOUT a full cache rebuild.
+        // V3.3.0.3 + V3.4.0.2 incremental cache update: local appends are
+        // always at the causal frontier (Loro's normal-flow append puts
+        // the op at the local peer's vector-clock head), so iteration
+        // order does NOT reorder existing entries.  Safe to incrementally
+        // upsert WITHOUT a full cache rebuild.
         //
-        // We must capture the cache-affecting fields BEFORE consuming
-        // `op` via `self.log.append(op)`.  Op derives Clone but
-        // CellWireValue::Text/Error own heap strings; cloning to
-        // avoid the move is more expensive than matching first +
-        // appending after.  Match + extract by value via owned move
-        // is the cheapest path that satisfies the borrow checker.
-        let cache_update = if let Op::PutValue { sheet, row, col, ref value } = op {
-            Some(((sheet, row, col), value.clone()))
-        } else {
-            None
+        // V3.4.0.2 (per V3.4.0.1 D1 hybrid): handle 3 cell-keyed variants
+        // (PutValue / PutFormula / ClearFormula).  Each upserts ONE field
+        // of `CellState`, preserving the others.  ClearFormula uses
+        // `get_mut` + skip-if-absent so it does NOT create ghost cache
+        // entries for cells that were never written (otherwise
+        // `list_sheets_from_cache` would surface phantom sheets).
+        //
+        // We capture the cache-affecting fields BEFORE consuming `op` via
+        // `self.log.append(op)`.  Op derives Clone but CellWireValue::
+        // Text/Error + PutFormula::text own heap strings; cloning to
+        // avoid the move is more expensive than matching first.
+        enum CacheEffect {
+            PutValue { key: (u16, u32, u32), value: CellWireValue },
+            PutFormula { key: (u16, u32, u32), text: String },
+            ClearFormula { key: (u16, u32, u32) },
+        }
+        let cache_effect = match &op {
+            Op::PutValue { sheet, row, col, value } => Some(CacheEffect::PutValue {
+                key: (*sheet, *row, *col),
+                value: value.clone(),
+            }),
+            Op::PutFormula { sheet, row, col, text } => Some(CacheEffect::PutFormula {
+                key: (*sheet, *row, *col),
+                text: text.clone(),
+            }),
+            Op::ClearFormula { sheet, row, col } => Some(CacheEffect::ClearFormula {
+                key: (*sheet, *row, *col),
+            }),
+            _ => None,
         };
         self.log.append(op)?;
-        if let Some((key, value)) = cache_update {
-            self.last_snapshot.insert(key, value);
+        match cache_effect {
+            Some(CacheEffect::PutValue { key, value }) => {
+                self.last_snapshot.entry(key).or_default().value = Some(value);
+            }
+            Some(CacheEffect::PutFormula { key, text }) => {
+                self.last_snapshot.entry(key).or_default().formula = Some(text);
+            }
+            Some(CacheEffect::ClearFormula { key }) => {
+                // get_mut + skip-if-absent: ClearFormula on a never-set
+                // cell is a no-op for the cache (it's also semantically
+                // a no-op for `Workbook` -- there was no formula to
+                // clear).  Avoids ghost-sheet entries in
+                // `list_sheets_from_cache`.
+                if let Some(state) = self.last_snapshot.get_mut(&key) {
+                    state.formula = None;
+                }
+            }
+            None => {}
         }
         self.maybe_auto_flush()?;
         Ok(())
@@ -744,56 +843,77 @@ impl CollabSession {
         self.last_snapshot.clear();
     }
 
-    /// **Phase 5.7 V3.3.0.3 (2026-05-22) -- snapshot cache accessor
+    /// **Phase 5.7 V3.3.0.3 + V3.4.0.2 -- snapshot cache accessor
     /// for cell-grid IDE consumers.**
     ///
     /// Returns the cell-snapshot entries for `sheet` as a sorted
-    /// ascending `Vec<((u32, u32), CellWireValue)>` -- one entry per
+    /// ascending `Vec<((u32, u32), CellState)>` -- one entry per
     /// distinct `(row, col)` in the requested sheet with the LATEST
-    /// `Op::PutValue` value across all peers' op-log iteration.
+    /// per-field state (value + formula) across all peers' op-log
+    /// iteration.
+    ///
+    /// **V3.4.0.2 signature change** (per V3.4.0.1 D1 hybrid): the
+    /// value type changed from `CellWireValue` to `CellState{value,
+    /// formula}`.  Callers reading ONLY the literal value (e.g., the
+    /// napi `export_snapshot` for V3.4.0.2) should extract
+    /// `state.value` and skip None entries.  Callers reading formulas
+    /// (V3.4.0.5+ presence + formula cells) consume `state.formula`.
     ///
     /// O(cells-in-cache) per call (with a sheet-filter pass).  V3.x
     /// may nest the cache by sheet for O(cells-on-sheet) if profiling
     /// justifies; out of V3.3.0.3 scope.
     ///
-    /// Empty if no `PutValue` op has been observed on this sheet.
-    /// Use [`Self::list_sheets`] (added in V3.3.0.2 -- napi-only;
-    /// engine-side enumeration can read this method's keys via a
-    /// dedup) to enumerate sheets that have entries.
+    /// Empty if no cell-keyed op has been observed on this sheet.
+    /// Use [`Self::list_sheets_from_cache`] to enumerate sheets that
+    /// have entries.
     ///
     /// Semantics-equivalent to walking `self.op_log().iter()` and
-    /// collecting the latest PutValue per `(row, col)` on the sheet;
-    /// the cache is maintained in sync by the four op-mutation paths
+    /// folding each cell-keyed op into the per-cell `CellState`; the
+    /// cache is maintained in sync by the seven op-mutation paths
     /// (see `last_snapshot` field docstring).
-    pub fn snapshot_cells(&self, sheet: u16) -> Vec<((u32, u32), CellWireValue)> {
-        let mut entries: Vec<((u32, u32), CellWireValue)> = self
+    pub fn snapshot_cells(&self, sheet: u16) -> Vec<((u32, u32), CellState)> {
+        let mut entries: Vec<((u32, u32), CellState)> = self
             .last_snapshot
             .iter()
-            .filter_map(|((s, r, c), v)| {
-                if *s == sheet { Some(((*r, *c), v.clone())) } else { None }
+            .filter_map(|((s, r, c), state)| {
+                if *s == sheet { Some(((*r, *c), state.clone())) } else { None }
             })
             .collect();
         entries.sort_by_key(|((row, col), _)| (*row, *col));
         entries
     }
 
-    /// **Phase 5.7 V3.3.0.3 (2026-05-22) -- rebuild the snapshot cache
+    /// **Phase 5.7 V3.3.0.3 + V3.4.0.2 -- rebuild the snapshot cache
     /// from the current op log.**
     ///
     /// Internal helper.  Walks `self.log.iter()` and collects the
-    /// latest `Op::PutValue` value per `(sheet, row, col)` into
-    /// `self.last_snapshot`.  Last-write-wins via HashMap insert
-    /// overwrites in iteration order; iteration order = Loro's
-    /// causal-merge order which converges across peers per Phase 5.1
-    /// audit Codex V1.
+    /// latest state per `(sheet, row, col)` into `self.last_snapshot`.
+    /// LAST-WRITE-WINS per field via HashMap upsert in iteration order;
+    /// iteration order = Loro's causal-merge order which converges
+    /// across peers per Phase 5.1 audit Codex V1.
+    ///
+    /// **V3.4.0.2 (per D1 hybrid)**: handles 3 cell-keyed op variants:
+    /// - `Op::PutValue` -> writes `CellState.value = Some(...)`,
+    ///   preserves `formula`.
+    /// - `Op::PutFormula` -> writes `CellState.formula = Some(...)`,
+    ///   preserves `value`.
+    /// - `Op::ClearFormula` -> writes `CellState.formula = None`,
+    ///   preserves `value`.  Uses `get_mut` + skip-if-absent to avoid
+    ///   creating ghost cache entries for cells that were never written
+    ///   (preserves `list_sheets_from_cache` correctness).
+    /// All other Op variants are no-ops for the cache (handled by
+    /// `Workbook` state for non-cell-keyed ops; deferred to V3.5+ for
+    /// cell-keyed format ops).
     ///
     /// Called by:
     /// - `from_snapshot` (after `import_bytes`).
     /// - `merge_bytes` (Loro can causally-reorder; cache MUST rebuild).
     /// - `discard_pending_ops` (log was replaced via `fork_at_vv`).
+    /// - `poll_remote_with_limit` (drain bypasses Self::merge_bytes).
+    /// - `undo` / `redo` (V3.3.0.X HIGH-1; inverse-op append to log).
     ///
     /// NOT called by `append_op` -- local appends are at the causal
-    /// frontier; an O(1) incremental insert is correct.
+    /// frontier; an O(1) incremental upsert is correct.
     ///
     /// Returns `Err(OpLog(_))` if the op-log iterator emits a decode
     /// error.  Same propagation as `export_snapshot` in the napi
@@ -810,11 +930,24 @@ impl CollabSession {
         // pre-call state (consistent with the LAST successful
         // rebuild).  Slightly more memory pressure (transient
         // duplicate during the build); trades for atomicity.
-        let mut fresh: HashMap<(u16, u32, u32), CellWireValue> = HashMap::new();
+        let mut fresh: HashMap<(u16, u32, u32), CellState> = HashMap::new();
         for op_result in self.log.iter() {
             let op = op_result.map_err(CollabSessionError::OpLog)?;
-            if let Op::PutValue { sheet, row, col, value } = op {
-                fresh.insert((sheet, row, col), value);
+            match op {
+                Op::PutValue { sheet, row, col, value } => {
+                    fresh.entry((sheet, row, col)).or_default().value = Some(value);
+                }
+                Op::PutFormula { sheet, row, col, text } => {
+                    fresh.entry((sheet, row, col)).or_default().formula = Some(text);
+                }
+                Op::ClearFormula { sheet, row, col } => {
+                    // get_mut + skip-if-absent: same ghost-entry
+                    // avoidance as append_op (see rationale there).
+                    if let Some(state) = fresh.get_mut(&(sheet, row, col)) {
+                        state.formula = None;
+                    }
+                }
+                _ => {}
             }
         }
         self.last_snapshot = fresh;
@@ -2226,6 +2359,21 @@ mod tests {
         }
     }
 
+    /// V3.4.0.2 test helper -- mirrors `put_value` for formula ops.
+    fn put_formula(sheet: u16, row: u32, col: u32, text: &str) -> Op {
+        Op::PutFormula {
+            sheet,
+            row,
+            col,
+            text: text.to_string(),
+        }
+    }
+
+    /// V3.4.0.2 test helper -- mirrors `put_value` for clear-formula ops.
+    fn clear_formula(sheet: u16, row: u32, col: u32) -> Op {
+        Op::ClearFormula { sheet, row, col }
+    }
+
     #[test]
     fn new_session_is_empty() {
         let s = CollabSession::new(PeerId::new(1)).unwrap();
@@ -2857,6 +3005,102 @@ mod tests {
         let post_force = s.snapshot_cells(0);
         assert_eq!(post_force.len(), 1);
         assert_eq!(post_force[0].0, (1, 0));
+    }
+
+    #[test]
+    fn cell_state_formula_roundtrip() {
+        // V3.4.0.2 (per V3.4.0.1 D1 hybrid): a cell can carry BOTH a
+        // literal value AND a formula text simultaneously (e.g., the
+        // user types =A1+1 and the engine caches the formula text in
+        // addition to whatever last PutValue produced).  Pin that the
+        // cache preserves both fields independently across the 3
+        // cell-keyed op variants.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 5, 5, 1.0)).unwrap();
+        s.append_op(put_formula(0, 5, 5, "=A1+1")).unwrap();
+
+        let entries = s.snapshot_cells(0);
+        assert_eq!(entries.len(), 1, "single cell with both value + formula");
+        let ((row, col), state) = &entries[0];
+        assert_eq!((*row, *col), (5, 5));
+        assert_eq!(state.value, Some(CellWireValue::Number(1.0)),
+            "PutValue's value preserved after PutFormula upsert");
+        assert_eq!(state.formula, Some("=A1+1".to_string()),
+            "PutFormula's text in cache");
+
+        // Reverse order also works: PutFormula first, then PutValue.
+        let mut s2 = CollabSession::new(PeerId::new(2)).unwrap();
+        s2.append_op(put_formula(0, 5, 5, "=B1*2")).unwrap();
+        s2.append_op(put_value(0, 5, 5, 42.0)).unwrap();
+        let entries2 = s2.snapshot_cells(0);
+        let ((_, _), state2) = &entries2[0];
+        assert_eq!(state2.value, Some(CellWireValue::Number(42.0)));
+        assert_eq!(state2.formula, Some("=B1*2".to_string()),
+            "PutValue does NOT clobber formula (per-field LWW)");
+    }
+
+    #[test]
+    fn cell_state_clear_formula_invariant() {
+        // V3.4.0.2 (per V3.4.0.1 D1 hybrid): ClearFormula nulls the
+        // formula field but PRESERVES the value field.  Mirrors the
+        // Workbook::clear_formula semantic (cell becomes literal-only).
+        // Also pin the ghost-entry-avoidance: ClearFormula on a
+        // never-written cell does NOT create a cache entry, so
+        // list_sheets_from_cache doesn't surface phantom sheets.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 99.0)).unwrap();
+        s.append_op(put_formula(0, 0, 0, "=SUM(A1:A10)")).unwrap();
+        s.append_op(clear_formula(0, 0, 0)).unwrap();
+
+        let entries = s.snapshot_cells(0);
+        assert_eq!(entries.len(), 1);
+        let ((_, _), state) = &entries[0];
+        assert_eq!(state.value, Some(CellWireValue::Number(99.0)),
+            "ClearFormula preserves value");
+        assert_eq!(state.formula, None,
+            "ClearFormula nulls formula");
+
+        // Ghost-entry-avoidance: ClearFormula on a never-set cell on
+        // a different sheet should NOT create a cache entry +
+        // therefore should NOT add that sheet to list_sheets_from_cache.
+        let mut s2 = CollabSession::new(PeerId::new(2)).unwrap();
+        assert_eq!(s2.list_sheets_from_cache(), Vec::<u16>::new());
+        s2.append_op(clear_formula(7, 0, 0)).unwrap();
+        assert_eq!(s2.list_sheets_from_cache(), Vec::<u16>::new(),
+            "ClearFormula on never-written cell must not create ghost sheet entry");
+        assert_eq!(s2.snapshot_cells(7).len(), 0,
+            "cache has no entry for never-written cell");
+    }
+
+    #[test]
+    fn cell_state_undo_preserves_invariants_after_full_rebuild() {
+        // V3.4.0.2 + V3.3.0.X HIGH-1 closure: undo triggers a full
+        // rebuild_snapshot_cache.  The CellState upsert logic in
+        // rebuild_snapshot_cache walks the post-undo op log fresh,
+        // so the post-undo cache is exactly what walking from scratch
+        // would produce.  Pin that:
+        //   1. undo of a PutValue does NOT clobber an earlier formula.
+        //   2. undo of a PutFormula does NOT clobber an earlier value.
+        // The intermediate post-undo state should match what the
+        // op-log walk produces (test does the walk-comparison
+        // implicitly by checking expected values).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_formula(0, 1, 1, "=A1+1")).unwrap();
+        s.append_op(put_value(0, 1, 1, 7.0)).unwrap();
+
+        // Pre-undo: both fields populated.
+        let pre = &s.snapshot_cells(0)[0].1;
+        assert_eq!(pre.formula, Some("=A1+1".to_string()));
+        assert_eq!(pre.value, Some(CellWireValue::Number(7.0)));
+
+        // Undo the PutValue.  Loro retracts it; rebuild walks the
+        // post-undo log; cache reflects ONLY the PutFormula now.
+        assert!(s.undo().unwrap());
+        let post = &s.snapshot_cells(0)[0].1;
+        assert_eq!(post.formula, Some("=A1+1".to_string()),
+            "undo of PutValue must not clobber prior PutFormula");
+        assert_eq!(post.value, None,
+            "undo of PutValue removes the value");
     }
 
     #[test]

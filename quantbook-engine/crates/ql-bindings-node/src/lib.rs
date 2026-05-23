@@ -512,13 +512,25 @@ impl CollabSession {
         // hold time scales with op log size).  Now O(cells-in-cache)
         // filtered by sheet at the engine layer.
         //
+        // V3.4.0.2 (2026-05-23): `snapshot_cells` now returns `CellState`
+        // (per V3.4.0.1 D1 hybrid; carries both `value: Option<CellWire
+        // Value>` and `formula: Option<String>`).  The V3.4.0.2 napi
+        // JSON shape is UNCHANGED from V3.3.0.3 -- we extract `.value`
+        // and SKIP entries where it's None (cells with a formula but no
+        // literal value).  V3.4.0.5+ will introduce a separate napi
+        // method or extend the JSON shape (with a `formula` field) to
+        // surface formula-only cells; that's IDE-rendering work, not
+        // V3.4.0.2's contract-preservation work.
+        //
         // `snapshot_cells` returns entries pre-sorted by (row, col)
-        // ascending; the JSON-build pass below is unchanged.
+        // ascending; the filter_map + JSON-build preserves that order.
         let inner = self.inner.lock();
-        let entries_vec: Vec<((u32, u32), CellWireValue)> = inner.snapshot_cells(sheet);
+        let entries_vec = inner.snapshot_cells(sheet);
         let entries_json: Vec<serde_json::Value> = entries_vec
             .into_iter()
-            .map(|((row, col), value)| {
+            .filter_map(|((row, col), state)| {
+                // V3.4.0.2: extract literal value; skip formula-only cells.
+                let value = state.value?;
                 let value_json = match value {
                     CellWireValue::Number(n) => {
                         serde_json::json!({"kind": "number", "value": n})
@@ -536,7 +548,7 @@ impl CollabSession {
                         serde_json::json!({"kind": "pending"})
                     }
                 };
-                serde_json::json!({"row": row, "col": col, "value": value_json})
+                Some(serde_json::json!({"row": row, "col": col, "value": value_json}))
             })
             .collect();
         let payload = serde_json::json!({
