@@ -1,15 +1,327 @@
 ---
-name: empty
-status: empty
+name: 2026-05-24_phase-5-7-v3-6-on-pop-format-registry-rendering
+status: in-progress (V3.6.0.1 decision lock; sub-steps V3.6.0.2+ pending fresh session per CLAUDE.md "Never run >2 plan-implement-audit cycles in one session")
 date: 2026-05-24
+predecessor_plan: .plans/_archive/2026-05-24_phase-5-7-v3-5-workbook-snapshot-sheet-ops-undo-format.md (V3.5 phase termination -- WorkbookSnapshot + sheet ops + format extension + partial-invalidate undo + mid-edit-render guard; ALL 11 sub-steps SHIPPED + AUDITED + FOLLOW-UP-AUDITED including V3.5.0.X cumulative megaudit + 5 HIGH + 1 valid MED + 1 LOW closed in-cycle + follow-up audit shipping 3 MED + 2 partial LOW closures)
+opus_v3_5_packet: docs/audits/2026-05-24-phase-5-7-v3-5-0-x-opus.md § F (V3.6 ENTRY READINESS PACKET; F.1 - F.9 + § G sheet-tabs deferral analysis + § H.5 recommended sequencing)
+parent_phase: 5.7 Collaboration IDE Vertical Slice
+direction: V3.6 -- Loro UndoManager on_pop callback wiring (closes V3.5.0.X conservative pure_local_frontier gate properly via the upstream API) + session-wide RegisterFormat FormatTable cache (unblocks format-aware buildHtml rendering) + per-cell op-index (closes V3.5.0.6 R-V3.5-2 perf gap) + format-aware buildHtml rendering (number/date/currency display per V3.5.0.5 format passthrough) + IDE-facing appendPutFormula napi (unblocks end-to-end repaired-formula integration tests + format-UI write-path). The first Phase 5.7 sub-phase that ELIMINATES a V3.5 conservative-correctness gate (the pure_local_frontier proxy is replaced by Loro's actual undo-pop callback). All V3.5 work shipped + audited; V3.5.1+ polish backlog parked.
+current_engine_head: 398470eeaf5 (V3.5.0.X follow-up audit Codex Lane A closures: CODEX-MED-2 refresh isolated from engine-op try{} + CODEX-MED-3 new safeRender helper respects A-HIGH-4 mid-edit guard + CODEX-MED-4 workbook_snapshot drops .or(state.formula) fallback + CODEX-LOW-3 +4 ql-collab tests + CODEX-LOW-4 removed_sheets docstring drift + section-sign characters)
+current_ide_head: 3563459262e (V3.5.0.X follow-up audit Codex Lane A closures: MED-2 + MED-3)
+current_mocha_count: 346 / 346 (V3.5 cumulative +92 over V3.4.0.X 254 baseline; V3.5.0.X follow-up added 0 since panel-level behavior verified via live smoke per § 4.1.z5 steps 12+14; vscode-test integration is V3.5.1+ scope)
+current_ql_collab_tests: 115 / 115 (V3.5 cumulative +34 over V3.4.0.X 81 baseline: V3.5.0.5 +12 + V3.5.0.6 +13 + V3.5.0.X main +5 + V3.5.0.X follow-up +4)
+current_ql_collab_ws_tests: 42 / 42 (10 lib + 30 ws + 2 V3.1.a relay)
+current_engine_workspace: all 30 test suites pass (V3.5 baseline)
+audit_rules_inherited:
+  - Rule 1: Stop fresh-session reminders (2026-05-17)
+  - Rule 2: Parallel Codex+Opus per phase/wave/step (2026-05-17)
+  - Rule 3: Range-aware fn ships need lex+parse+bind+eval coverage (2026-05-21; not V3.6-relevant; pre-V3.5)
+  - Rule 4: Negative trait claims need positive compile proof OR per-field walk (2026-05-21; arc terminus 6 at V3.5 end; V3.6 expects to add new fields on CollabSession + new napi structs)
+loro_version: =1.12.0 (verified V3.6.0.1 entry; UndoManager API exists per `loro_internal::undo::OnPop = Box<dyn Fn(UndoOrRedo, CounterSpan, UndoItemMeta) + Send + Sync>` and `loro::UndoManager::set_on_pop(Option<OnPop>)` at lib.rs:3790)
+type: project
 ---
 
-No active plan.  V3.5 phase COMPLETE + AUDITED + ARCHIVED at `_archive/2026-05-24_phase-5-7-v3-5-workbook-snapshot-sheet-ops-undo-format.md`.
+# V3.6 -- UndoManager on_pop + format registry + format-aware rendering + per-cell op-index + IDE PutFormula (Phase 5.7, 2026-05-24)
 
-Next phase entry candidates (V3.6+ scope per V3.5.0.9 § 4.1.z5 deferrals + Opus § F V3.6 entry-readiness packet):
+> **NEW SESSION? START HERE.**
 
-- **V3.6.0.1 decision lock** -- 8-9 D-decisions per Opus § F: session-wide RegisterFormat FormatTable cache (would add `WorkbookSnapshotJson.formats: Vec<FormatDefJson>` top-level field); format-aware buildHtml rendering (number/date/currency); per-cell op-index for O(ops-for-this-cell) `invalidate_cell`; Loro UndoManager `on_pop` callback wiring (cleaner partial-invalidate without the `pure_local_frontier` proxy); incremental WorkbookSnapshot deltas; `#REF!` substitution for cross-sheet refs to deleted sheets; `Op::RestoreSheet` un-delete; sheet-tabs multi-tab UI redesign; IDE-facing `appendPutFormula` napi (unblocks end-to-end repaired-formula integration tests + format-UI write-path).
-- **V3.5.0.4c sheet-tabs UI scaffold** -- defer to V3.5.1+ unless user signal surfaces.  Multi-sheet UX adequately covered by V3.5.0.4a Command Palette + V3.5.0.4b reactive title; V3.6+ multi-tab redesign may consolidate.
-- **V3.5.1+ polish** -- Opus-L1 dead-code arc in `affected_cells_for_partial_invalidate` simplification; Opus-L2 `buildSheetMovePositionItems` source-at-current UX nit; Opus-L3 V3.5.0.4b reactive title race; Opus-I1 `Workbook::move_sheet` linear-search; Opus-M3 `quantbookCellGridSwitchSheet` + `quantbookCellGridRefresh` consolidation.
+Sister-section to `docs/architecture/ide-consumer-contract.md § 4.1.z6` (V3.6.0.X docs will land it; mirrors V3.5.0.9 § 4.1.z5 template). This plan is the engine-side scoping document.
 
-Open this file as `_active.md` when starting the next plan.
+## Predecessor closure
+
+V3.5 SHIPPED + AUDITED + FOLLOW-UP-AUDITED + ARCHIVED end-to-end across 2 sessions; all 11 sub-steps complete; 31 audit transcripts cumulative across Phase 5.7 (+2 V3.5.0.X Codex/Opus + 1 V3.5.0.X follow-up Codex). See `.plans/_archive/2026-05-24_phase-5-7-v3-5-workbook-snapshot-sheet-ops-undo-format.md` for the V3.5 plan archive; `docs/audits/2026-05-24-phase-5-7-v3-5-0-x-{codex,opus}.md` for the V3.5.0.X cumulative megaudit transcripts; `docs/audits/2026-05-24-phase-5-7-v3-5-0-x-closure-codex.md` for the V3.5.0.X follow-up audit transcript; `docs/architecture/ide-consumer-contract.md § 4.1.z5` for the V3.5 surface spec + audit closures sub-section.
+
+V3.5 cumulative test deltas: ql-collab 81 -> **115** (+34); IDE mocha 254 -> **346** (+92).
+
+V3.5 closure highlights (rationale for V3.6 priorities):
+- V3.5.0.X conservative `pure_local_frontier` gate on undo/redo dispatch falls back to full `rebuild_snapshot_cache` whenever a remote op interleaves between local appends. CORRECT but CONSERVATIVE; partial-invalidate is BYPASSED in the remote-interleave case. The proper fix uses Loro's `UndoManager::set_on_pop` API to surface the actual retracted op shape directly -- this is V3.6 D1.
+- V3.5.0.6 partial-invalidate `invalidate_cell` walks the full op log per call (O(N) where N = op log size). Acceptable at V3.5 scale; closes R-V3.5-2 via V3.6 D3 per-cell op-index.
+- V3.5.0.5 per-cell `format: Option<FormatId>` passthrough lands the wire format but NO IDE consumer renders format-aware (number/date/currency display). V3.6 D2 + D4 close this.
+- V3.5.0.X A-HIGH-2 closure landed `workbookSnapshot` reading from `rebuild_workbook` `formula_at` (repaired formulas surface). Verified only by Rust ql-collab test today because IDE has no PutFormula write path. V3.6 D5 closes this.
+
+## V3.6 scope (per V3.5.0.X Opus § F V3.6 ENTRY READINESS)
+
+V3.6 closes 4 V3.5 architectural deferrals + 1 V3.5 conservative-correctness gate via 5 priority sub-steps, plus 4 conditional sub-steps:
+
+1. **Loro UndoManager on_pop callback wiring** (D1, F.4): replaces V3.5.0.6's peek-most-recent-visible-op heuristic + V3.5.0.X conservative `pure_local_frontier` gate. Captures the actual retracted op's CounterSpan + affected cells via Loro's `set_on_push` (encodes cells into `UndoItemMeta::value`) + `set_on_pop` (reads them back). Fires per-cell invalidation regardless of iteration order. **HIGH PRIORITY** -- closes a current correctness debt.
+
+2. **Session-wide RegisterFormat FormatTable cache** (D2, F.1): new `format_table_cache: HashMap<FormatId, String>` on `CollabSession`. New `CacheEffect::RegisterFormat { id, string }` variant. `WorkbookSnapshotJson` gains `formats: Vec<FormatDefJson>` top-level field (additive). Required for D4 format-aware rendering.
+
+3. **Per-cell op-index for invalidate_cell** (D3, F.3): new `cell_op_index: HashMap<(SheetId, RowId, ColId), Vec<usize>>` on `CollabSession`. Maintained incrementally in `append_op` per emitted CacheEffect's key; rebuilt in `from_snapshot` + `merge_bytes`. Makes V3.5.0.6 `invalidate_cell` O(ops-for-this-cell) instead of O(N).
+
+4. **Format-aware buildHtml rendering** (D4, F.2): engine-side `format_value(value, format_string) -> String` API (already exists at `ql-storage::format::FormatTable::render_value`). `CellSnapshotJson` gains `rendered: Option<String>` additive field. IDE `buildHtml` uses `rendered` if present, falls back to value-based default.
+
+5. **IDE-facing appendPutFormula napi** (D5, NEW): wraps existing `Op::PutFormula` for IDE consumption. Unblocks end-to-end repaired-formula integration tests (V3.5.0.X A-HIGH-2 has Rust regression test only) + format-UI write-path. Mirrors V3.4.0.2 `appendPutValue` pattern.
+
+Conditional sub-steps (ship if surfaced):
+
+6. **Incremental WorkbookSnapshot deltas** (D6, F.5): new `workbookSnapshotDelta(last_seen_version)` napi. Closes R-V3.5-1 per-call O(N) cost. DEFER if profiling doesn't justify at V3.6-scale.
+
+7. **#REF! substitution for cross-sheet refs to deleted sheets** (D7, F.7): extends `repair_sheet_rename_chain` into `repair_sheet_chain` handling rename + delete. USER-VISIBLE; ship early IF user signals "deleted sheet but formulas didn't update".
+
+8. **Op::RestoreSheet un-delete** (D8, F.8): conditional on user-facing flow. Skip if no user signal.
+
+9. **Sheet-tabs UI strategy + mid-edit-render guard typing-stroke watchdog** (D9, F.6 / G + F.9): per § G recommendation, DEFER standalone V3.5.0.4c strip TO V3.6+ multi-tab redesign (avoid teaching one UX then changing it). Mid-edit-render guard typing-stroke watchdog refresh (any keystroke from webview resets the 30s deadline) is 0.5 session if surfaced.
+
+## V3.6 design decisions (locked at V3.6.0.1)
+
+### D1 Loro UndoManager on_pop callback wiring (F.4) -- V3.6.0.2 (HIGH PRIORITY)
+
+**Question:** how does V3.6 close the V3.5.0.X conservative `pure_local_frontier` gate so partial-invalidate fires correctly in the remote-interleave case?
+
+**V3.5.0.X conservative gate (the debt being repaid):** when `merge_bytes` / `poll_remote_with_limit` reset `pure_local_frontier = false`, the V3.5.0.6 undo/redo dispatch falls back to full `rebuild_snapshot_cache` regardless of op shape. The reason: V3.5.0.6 partial-invalidate captures `self.log.iter().last()` as a PROXY for the to-be-retracted op; that proxy is the REMOTE op (not the local op being undone) in the remote-trails-local iteration order case (Codex A-HIGH-1's native-binding repro). The conservative gate works but BYPASSES partial-invalidate in the common collab scenario.
+
+**Loro 1.12.0 API (verified at V3.6.0.1 entry):**
+- `loro_internal::undo::OnPop = Box<dyn Fn(UndoOrRedo, CounterSpan, UndoItemMeta) + Send + Sync>` (registry/loro-internal-1.12.0/src/undo.rs:199)
+- `loro_internal::undo::OnPush = Box<dyn for<'a> Fn(UndoOrRedo, CounterSpan, Option<DiffEvent<'a>>) -> UndoItemMeta + Send + Sync>` (registry/loro-internal-1.12.0/src/undo.rs:196-198)
+- `loro::UndoManager::set_on_pop(&mut self, on_pop: Option<OnPop>)` (registry/loro-1.12.0/src/lib.rs:3790)
+- `loro::UndoManager::set_on_push(&mut self, on_push: Option<OnPush>)` (registry/loro-1.12.0/src/lib.rs:3778)
+- `loro_internal::undo::UndoItemMeta { value: LoroValue, cursors: Vec<CursorWithPos> }` (registry/loro-internal-1.12.0/src/undo.rs:264-267)
+
+**Options:**
+- (a) **on_push + on_pop pair**: at push time, inspect the `DiffEvent` to extract affected cell coordinates from the just-pushed op; encode them as a `LoroValue` map into `UndoItemMeta::value`. At pop time, read `meta.value` back, decode the cells, fire per-cell `invalidate_cell` for each.
+- (b) **on_pop only with CounterSpan range walk**: at pop time, use the `CounterSpan` to walk the session's op log subset in that range. Use `collect_cache_effects` to extract affected cells. Requires mapping Loro counter -> session.log index (Loro counters are per-peer; session.log is per-session).
+- (c) **Keep V3.5.0.X conservative gate + add on_pop as defense-in-depth**: layered approach. on_pop fires partial-invalidate when possible; if it errors, falls back to full rebuild.
+
+**Tradeoffs:**
+- (a) is the CLEAN architectural fix. Cells captured at push time = most accurate state. on_pop is a simple lookup. The `LoroValue::Map` encoding cost is bounded (typically 1-4 cells per cell-keyed op).
+- (b) avoids the on_push intercept cost but requires Loro counter->log-index mapping which isn't a public API. Risky.
+- (c) keeps the conservative fallback as safety net. Slightly more code; trades architectural purity for defense-in-depth.
+
+**Decision: A.** Use BOTH `set_on_push` + `set_on_pop`. on_push extracts affected cells from `DiffEvent` and encodes them as `LoroValue::Map { keys: ["cells"], values: [Container::List([Map { keys: ["sheet", "row", "col"], values: [u16, u32, u32] }, ...])] }` into `UndoItemMeta::value`. on_pop decodes the LoroValue back to `Vec<(u16, u32, u32)>` and fires `invalidate_cell` for each. The V3.5.0.X `pure_local_frontier` field + dispatch gate are REMOVED in V3.6.0.2 (no longer needed; on_pop gives accurate cells regardless of iteration order).
+
+**Rule 4 trigger:** YES. Loro callback closures wrap `&mut self` access via interior mutability (likely `Arc<Mutex<_>>` or `Arc<RwLock<_>>` since OnPop is `Send + Sync`). The closure design must use a thread-safe handle (e.g., `Arc<Mutex<Vec<(u16, u32, u32)>>>` for pending invalidations) since Loro internals may invoke the callback from any thread. Per-field walk at V3.6.0.2 entry must positively prove the chosen container is Send + Sync. The `pure_local_frontier: bool` field is REMOVED in V3.6.0.2 (negative trait change, but eliminating a field; arc terminus stays at 6).
+
+**Risk:** Loro's callback may fire DURING an `undo()` call (re-entrant lock concern). The closure CANNOT lock the same Mutex the outer `undo()` holds. Solution: use a `Mutex<Vec<Cells>>` separate from any session-wide lock; on_pop pushes to it; the outer `undo()` drains it after Loro's undo completes. Verify at V3.6.0.2 implementation. (Note: V3.5.0.6 `invalidate_cell` is itself called outside any Loro lock, so the drain-then-invalidate pattern is sound.)
+
+**Test coverage:** mocha + ql-collab regression for the V3.5.0.X conservative-gate scenarios -- post-V3.6.0.2, these tests verify partial-invalidate FIRES correctly (not full-rebuild) after remote-interleave undo. The V3.5.0.X regression tests `undo_after_remote_interleave_falls_back_to_full_rebuild` + `redo_after_remote_interleave_falls_back_to_full_rebuild` MUST be REWRITTEN to verify partial-invalidate fires + produces the correct cache.
+
+**V3.6.0.X sub-step suggestion:** V3.6.0.2.
+
+### D2 Session-wide RegisterFormat FormatTable cache (F.1) -- V3.6.0.3
+
+**Question:** how does V3.6 surface registered format strings to the IDE so D4 format-aware rendering can interpret them?
+
+**Options:**
+- (a) **Session-wide cache** `format_table_cache: HashMap<FormatId, String>` on `CollabSession`. New `CacheEffect::RegisterFormat { id, string }` variant. `collect_cache_effects` emits the effect on `Op::RegisterFormat`. `apply_cache_effect` inserts into the cache. `WorkbookSnapshotJson` gains `formats: Vec<FormatDefJson>` top-level field (additive). napi method `workbook_snapshot` iterates the cache + emits the list.
+- (b) **Read from Workbook on-demand**: skip the cache; `workbook_snapshot` reads `Workbook::formats` (Phase 4.6 / D-1 FormatTable) at every call. Simpler but pays the O(N) FormatTable iteration cost per snapshot.
+- (c) **Hybrid**: cache the dense format ids (Builtin variants) on the session; iterate Workbook for Custom variants per snapshot.
+
+**Tradeoffs:**
+- (a) matches V3.4.0.2's session-wide cache pattern. O(1) per snapshot. Adds 1 mutation site (Op::RegisterFormat in collect_cache_effects).
+- (b) is the minimal-change approach. Works at V3.6 scale; O(N_formats) per snapshot where N_formats typically < 100. Negligible cost.
+- (c) is over-engineering.
+
+**Decision: A.** Session-wide cache. Mirrors V3.4.0.2 + V3.5.0.5 cache discipline. Concrete shape:
+```rust
+// CollabSession
+format_table_cache: HashMap<FormatId, Arc<str>>,
+
+// CacheEffect (new variant)
+RegisterFormat { id: FormatId, string: Arc<str> },
+
+// WorkbookSnapshotJson (new field, additive -- preserves V3.5 IDE consumers)
+formats: Vec<FormatDefJson>,
+
+// FormatDefJson (new #[napi(object)])
+pub struct FormatDefJson {
+    pub id: FormatIdJson,  // existing V3.5.0.5 wire shape
+    pub string: String,    // format string (e.g., "0.00%", "yyyy-mm-dd")
+}
+```
+
+**Cross-peer convergence:** concurrent `Op::RegisterFormat { id: SAME, string: DIFFERENT }` on the same id is the cross-peer collision case. Per Loro CRDT semantic + Phase 4.6 D-1 `register_at` impl: the engine rejects same-id-different-string registrations with a `FormatRejected` replay error. V3.6 ADOPTS this contract (engine rejects; cache walker treats the second registration as a no-op). Alternative LWW-overwrite was REJECTED because the engine already has the rejection semantic from D-1.
+
+**Rule 4 trigger:** YES. New `format_table_cache: HashMap<FormatId, Arc<str>>` field + new `CacheEffect::RegisterFormat` variant + new `FormatDefJson` napi struct. All three: positive Send+Sync per-field walks at V3.6.0.3 implementation. `HashMap<FormatId, Arc<str>>` is Send + Sync (FormatId composition of primitives + Arc<str> is Send + Sync). `CacheEffect::RegisterFormat` variant fields: FormatId + Arc<str>; both Send + Sync. `FormatDefJson` composition of FormatIdJson (V3.5.0.5 walk) + String; both Send + Sync. **+0 new triggers; arc terminus stays at 6.**
+
+**V3.6.0.X sub-step suggestion:** V3.6.0.3 (after D1 ships).
+
+### D3 Per-cell op-index for invalidate_cell (F.3) -- V3.6.0.4
+
+**Question:** how does V3.6 close R-V3.5-2 (V3.5.0.6 invalidate_cell walks the full op log O(N) per call)?
+
+**Decision: NEW `cell_op_index: HashMap<(SheetId, RowId, ColId), Vec<usize>>` on `CollabSession`.** Maps cell coordinate to a list of op-log indices that emit a CacheEffect on that cell. Maintained incrementally in `append_op` per emitted CacheEffect's key (extracted via `Self::affected_cells_for_partial_invalidate`-style classifier extended to all CacheEffect variants). Rebuilt during `from_snapshot` + `merge_bytes` + `discard_pending_ops` (full walk -- O(N) but only once per merge; mirrors the cache full-rebuild cost).
+
+**invalidate_cell signature** after V3.6.0.4: walks `self.cell_op_index.get(&(s, r, c)).unwrap_or(&Vec::new()).iter().map(|idx| self.log.get(*idx))` instead of `self.log.iter().filter(|op| affects(op, s, r, c))`. O(ops-for-this-cell) typical = 1-3.
+
+**Invariant:** every op-log mutation site MUST update `cell_op_index` in sync with `last_snapshot`. The 6 mutation sites (per V3.4.0.2 docstring discipline): `append_op`, `from_snapshot` (rebuild), `merge_bytes` (rebuild), `discard_pending_ops` (rebuild), `undo` (V3.6.0.2 on_pop drives invalidate_cell which reads but doesn't mutate the index), `redo` (same as undo).
+
+**Debug-assert** at the end of each mutation site checking that `cell_op_index.values().flatten().count() == sum of per-cell-keyed-op cells` (a coarse sync check). Stress-tested at V3.6.0.4 implementation.
+
+**Rule 4 trigger:** YES. New `cell_op_index: HashMap<(SheetId, RowId, ColId), Vec<usize>>` field. Positive Send+Sync per-field walk: HashMap is Send + Sync (std inherent impl); (u16, u32, u32) is Copy + Send + Sync; Vec<usize> is Send + Sync. **+0 new triggers; arc terminus stays at 6.**
+
+**Risk:** sync invariant violation. Any new op-log mutation site that forgets the cell_op_index update silently produces stale invalidate_cell behavior. Mitigate via the "5-6 mutation sites" docstring discipline + the debug-assert in each site.
+
+**V3.6.0.X sub-step suggestion:** V3.6.0.4 (after D1 + D2; D1 needs invalidate_cell which D3 makes O(k) instead of O(N)).
+
+### D4 Format-aware buildHtml rendering (F.2) -- V3.6.0.5
+
+**Question:** how does V3.6 render formatted cell values in the IDE (number/date/currency/scientific per CellState.format)?
+
+**Decision:** Engine-side `format_value(value: &CellWireValue, format_string: &str, date_system: DateSystem) -> Option<String>` reuses `ql-storage::format::FormatTable::render_value` (Phase 4.6 D-1; existing for xlsx export). Wired into napi `workbook_snapshot` via a new `rendered: Option<String>` field on `CellSnapshotJson` (additive). IDE `buildHtml` uses `rendered` if present, falls back to existing value-based default (V3.2.a).
+
+**Locale:** V3.6 ships LOCALE-AGNOSTIC ("en-US" defaults: `.` decimal separator, `$` currency symbol). Locale-aware rendering DEFERRED to V3.6.1+.
+
+**Date system:** `Workbook::date_system` (Excel1900 vs Excel1904) affects serial-to-date conversion. Pass via `WorkbookSnapshotJson::date_system: DateSystemJson` top-level field (new; additive).
+
+**Pre-render at engine vs JS-side:** ENGINE side. CSP-safe (no JS eval); reuses existing Rust format machinery; avoids duplicate logic.
+
+**Rule 4 trigger:** YES. New `DateSystemJson` (likely an enum `#[napi(string_enum)]` -- verify napi-rs supports), new `rendered: Option<String>` field on existing `CellSnapshotJson`. Both: positive Send+Sync walks at V3.6.0.5 implementation. **+0 new triggers; arc terminus stays at 6.**
+
+**V3.6.0.X sub-step suggestion:** V3.6.0.5 (after D2 ships).
+
+### D5 IDE-facing appendPutFormula napi (NEW V3.6 candidate) -- V3.6.0.6
+
+**Question:** how does V3.6 unblock end-to-end repaired-formula integration tests + format-UI write-path?
+
+**Background:** V3.5.0.X A-HIGH-2 closure landed `workbookSnapshot` reading from `rebuild_workbook` `formula_at` (so renamed sheets surface repaired formula text). The closure is verified ONLY by a ql-collab Rust regression test (`rebuilt_workbook_carries_repaired_formula_but_cache_does_not`) because the IDE has NO PutFormula write-path -- there's no way to write a formula from the IDE and verify the IDE-level snapshot surfaces the repaired text. V3.5.0.X documented this as deferred to V3.6+.
+
+**Decision:** wrap existing `Op::PutFormula` (engine: shipping since Phase 4.6.x) with a thin napi wrapper. Mirrors V3.4.0.2 `appendPutValue` pattern:
+```rust
+#[napi]
+impl CollabSession {
+    pub fn append_put_formula(
+        &mut self,
+        sheet: u32,
+        row: u32,
+        col: u32,
+        text: String,
+    ) -> Result<()> {
+        // validate sheet <= u16::MAX, append Op::PutFormula{sheet, row, col, text}
+    }
+}
+```
+
+IDE typed wrapper:
+```ts
+export function putFormula(session: CollabSessionInstance, sheet: number, row: number, col: number, text: string): void {
+    session.appendPutFormula(sheet, row, col, text);
+}
+```
+
+**Scope:** PURELY an FFI/IDE wrapper. No new Op variant. No CRDT semantic locks. No new wire format.
+
+**Test coverage:** new IDE mocha suite for the A-HIGH-2 end-to-end scenario: open .qbook with sheet "S"; PutFormula referencing S; rename S to "Renamed"; verify workbookSnapshot's formula text is "Renamed!A1" (repaired). +6-8 mocha tests.
+
+**Rule 4 trigger:** NONE. No new structs/fields/variants on the engine side; the napi wrapper is a method.
+
+**V3.6.0.X sub-step suggestion:** V3.6.0.6 (independent of D1-D4; can ship in parallel if priorities shift).
+
+### D6 Incremental WorkbookSnapshot deltas (F.5) -- V3.6.0.7 OR DEFER
+
+**Question:** does V3.6 ship incremental snapshot deltas, or defer per "profiling at V3.6 scale doesn't justify"?
+
+**Per Opus § F.5:** R-V3.5-1 cost is per-call O(N); incremental deltas would be O(delta). Loro has version-vector machinery to derive deltas natively.
+
+**Decision: DEFER pending V3.6 mid-cycle profiling.** V3.6.0.7 is a TIME-BOXED 1-session profiling spike at V3.6 mid-cycle:
+- Profile workbookSnapshot cost at 100k-cell workbooks under realistic edit load.
+- If cost > 50ms/call, ship D6 in remaining V3.6 sessions.
+- If cost < 50ms/call, defer to V3.7+.
+
+**Caveat:** even if deferred, V3.6 D2 (RegisterFormat cache) + D4 (format-aware rendering) add per-snapshot iteration cost on top of V3.5's per-cell formula reads. The profiling spike MUST measure post-D2 + post-D4 cost, not the pre-V3.6 baseline.
+
+**V3.6.0.X sub-step suggestion:** V3.6.0.7 profiling spike at V3.6 mid-cycle; D6 ship (3 sessions) only if justified.
+
+### D7 #REF! substitution for cross-sheet refs to deleted sheets (F.7) -- V3.6.0.8 IF SURFACED
+
+**Question:** does V3.6 extend repair_sheet_rename_chain to repair_sheet_chain handling rename + delete?
+
+**Decision: DEFER to user feedback signal.** Ship V3.6.0.8 IF V3.5 user feedback surfaces "I deleted sheet X but formulas referencing X didn't update" reports. Per Opus § F.7 USER-VISIBLE; 1-2 sessions. Engine-side implementation: extend `repair_sheet_rename_chain` (Phase 5.3 step 3) at `rebuild_workbook` time. For each `Op::RemoveSheet { id }` in the log, walk all formula text in `Workbook` and rewrite cross-sheet refs to the tombstoned sheet's name with `#REF!`.
+
+**Wire format:** UNCHANGED. Formula text mutation is rebuild-time only; the original `=Sheet3!A1` text stays in the cells unless rebuild materializes the replacement.
+
+**Test coverage:** +3-5 ql-collab regression tests (cross-sheet ref before/after delete; cross-peer convergence; round-trip via .qbook).
+
+**Rule 4 trigger:** NONE.
+
+**V3.6.0.X sub-step suggestion:** V3.6.0.8 IF surfaced.
+
+### D8 Op::RestoreSheet un-delete (F.8) -- V3.6.0.9 IF SURFACED
+
+**Question:** does V3.6 ship `Op::RestoreSheet { id }` to un-delete a tombstoned sheet?
+
+**Decision: DEFER to user feedback signal.** Per Opus § F.8 CONDITIONAL on user-facing flow. If V3.5 surfaces "I deleted by accident; how do I restore?" reports beyond what undo covers, ship V3.6.0.9.
+
+**Implementation if shipped:** new wire variant `Op::RestoreSheet { id: SheetId }` -> `removed_sheets.remove(&id)`. Cross-peer idempotent (HashSet remove on absent is no-op). Cell storage already preserved by V3.5.0.3b tombstone semantic so restore is feasible (no recovery needed).
+
+**Forward-compat:** pre-V3.6 binaries reading post-V3.6 .qbook files with Op::RestoreSheet fail to deserialize (same as Op::RemoveSheet / MoveSheet at V3.5). Documented per the V3.5 forward-compat caveat pattern.
+
+**Rule 4 trigger:** NONE.
+
+**V3.6.0.X sub-step suggestion:** V3.6.0.9 IF surfaced.
+
+### D9 Sheet-tabs UX strategy + mid-edit-render guard typing-stroke watchdog (F.6 / G + F.9)
+
+**Question:** does V3.6 ship the V3.5.0.4c sheet-tabs UI scaffold (deferred at V3.5) OR multi-tab redesign OR mid-edit-render guard typing-stroke watchdog?
+
+**Per Opus § G analysis:** DEFER standalone V3.5.0.4c sheet-tabs strip TO V3.6+ multi-tab redesign. Don't ship standalone + then re-teach UX in multi-tab redesign. Caveat: if V3.5 user feedback surfaces "Command Palette too slow for sheet switching", V3.5.1 can ship the standalone strip as a transitional polish.
+
+**Per Opus § F.9:** mid-edit-render guard typing-stroke watchdog (any keystroke from webview resets the 30s deadline) is 0.5 session if surfaced.
+
+**Decision:**
+- **Sheet-tabs UI:** DEFER. V3.6+ multi-tab redesign considered IF user signal surfaces. V3.5.0.4a Command Palette + V3.5.0.4b reactive title are sufficient for V3.6 scope.
+- **Mid-edit-render guard typing-stroke watchdog:** SHIP V3.6.0.10 IF surfaced. New postMessage type `typing_stroke` from webview + setTimeout reset in `setPresenceTyping`. Closes R-V3.5-7 "long formula entry hits 30s" case.
+
+**Rule 4 trigger:** NONE for the typing-stroke watchdog (TS-only). NONE for sheet-tabs deferral.
+
+**V3.6.0.X sub-step suggestion:** V3.6.0.10 IF surfaced (typing-stroke watchdog only).
+
+## V3.6 sub-step rollout (planned -- order may shift based on V3.6.0.2 implementation discoveries)
+
+1. **V3.6.0.1 -- decision lock** (THIS commit; docs-only). Decisions D1-D9 above. ~1 session.
+2. **V3.6.0.2 -- Loro UndoManager on_pop callback wiring (D1)**. Engine code + ql-collab regression tests. REMOVE V3.5.0.X `pure_local_frontier` field + dispatch gate. REWRITE V3.5.0.X regression tests to verify partial-invalidate FIRES correctly post-V3.6.0.2 (not full-rebuild). Estimated 2 sessions.
+3. **V3.6.0.3 -- Session-wide RegisterFormat FormatTable cache (D2)**. New `format_table_cache` field + new `CacheEffect::RegisterFormat` variant + new `FormatDefJson` napi struct + `WorkbookSnapshotJson.formats` field. ql-collab + mocha tests. Estimated 2 sessions.
+4. **V3.6.0.4 -- Per-cell op-index for invalidate_cell (D3)**. New `cell_op_index` field + 6-mutation-site sync invariant + debug-asserts. ql-collab regression tests + perf comparison vs V3.5.0.6 invalidate_cell. Estimated 3 sessions.
+5. **V3.6.0.5 -- Format-aware buildHtml rendering (D4)**. Engine `format_value` napi extension + IDE `buildHtml` integration + locale/date_system caveats. ql-collab + mocha tests. Estimated 2 sessions.
+6. **V3.6.0.6 -- IDE-facing appendPutFormula napi (D5)**. Thin napi wrapper + IDE typed wrapper + end-to-end repaired-formula mocha test (closes V3.5.0.X A-HIGH-2 IDE-level verification gap). Estimated 1 session.
+7. **V3.6.0.7 -- profiling spike for incremental snapshot deltas (D6)**. Time-boxed; ship D6 only if profiling justifies. Estimated 1 session for the spike; +3 if D6 ships.
+8. **V3.6.0.8 -- #REF! substitution (D7)** IF surfaced. Estimated 1-2 sessions.
+9. **V3.6.0.9 -- Op::RestoreSheet (D8)** IF surfaced. Estimated 1 session.
+10. **V3.6.0.10 -- mid-edit-render guard typing-stroke watchdog (D9 F.9)** IF surfaced. Estimated 0.5 session.
+11. **V3.6.0.X -- parallel Codex+Opus megaudit + closures.** Phase-level termination audit at V3.6.0.10 ship. ~6-8 sessions across audit cycle.
+
+**Estimated V3.6 wall time:** 14-20 sessions (vs Opus § H.5 estimate of 8-12). Higher because Opus didn't separately estimate the V3.6.0.X audit cycle.
+
+## V3.6 risk register (R-V3.6-*)
+
+- **R-V3.6-1 Loro on_pop callback re-entrancy.** The callback fires during Loro's `undo()` / `redo()` execution. If the closure attempts to lock a Mutex held by the outer `undo()` call, deadlock. Mitigation: closure pushes pending invalidations to a separate `Arc<Mutex<Vec<(u16, u32, u32)>>>`; outer `undo()` drains it after Loro's undo completes. Verify at V3.6.0.2 implementation with a stress test (10k undo/redo cycles).
+- **R-V3.6-2 FormatTable cache invariant maintenance.** RegisterFormat cache must stay in sync with `Workbook::formats` (Phase 4.6 D-1 FormatTable). If a `merge_bytes` brings in a peer's RegisterFormat that the local cache walker misses (because it's not in collect_cache_effects), the cache + workbook diverge. Mitigation: rebuild path (rebuild_snapshot_cache style) for format_table_cache. Debug-assert at end of merge_bytes that cache.len() == workbook.formats.len() (modulo Builtins which aren't cached).
+- **R-V3.6-3 cell_op_index sync invariant.** 6 mutation sites must update both `last_snapshot` AND `cell_op_index`. Sync drift produces stale `invalidate_cell` (visible cells with stale data after undo). Mitigation: debug-assert at end of each mutation site checking `cell_op_index.values().flatten().count() == sum of cell-keyed effects emitted`. Adopt the V3.5.0.X "cell-keyed effects walker" pattern.
+- **R-V3.6-4 Format-aware rendering locale/date_system propagation.** `Workbook::date_system` (Excel1900 vs Excel1904) affects serial-to-date conversion. If `workbook_snapshot` forgets to pass date_system, IDE renders dates with wrong epoch. Mitigation: add `date_system` to `WorkbookSnapshotJson` top-level + assert in tests.
+- **R-V3.6-5 Incremental snapshot delta freshness.** If V3.6.0.7 profiling justifies D6, the delta API must handle the "IDE's last-rendered version is older than Loro's history limit" edge case (Loro may GC old history). Mitigation: fall back to full snapshot when version-vector predecessor is unreachable. Document at D6 ship.
+- **R-V3.6-6 OnPush callback DiffEvent inspection cost.** The on_push callback fires for EVERY Loro change (not just our cell-keyed ops). Filtering to extract cell coordinates from DiffEvent on every push has a cost. Mitigation: early-return for non-cell-keyed origins; benchmark at V3.6.0.2 implementation. If cost > 1% of typical session time, fall back to option (b) CounterSpan range walk.
+- **R-V3.6-7 pure_local_frontier removal regression.** Removing the V3.5.0.X conservative gate could expose a subtle correctness bug if on_pop isn't wired correctly. Mitigation: keep the V3.5.0.X regression tests passing post-V3.6.0.2 with REWRITTEN expectations (partial-invalidate fires + matches full-rebuild result, instead of "falls back to full-rebuild").
+- **R-V3.6-8 napi struct evolution.** V3.6 adds new fields to existing napi structs (`formats` on WorkbookSnapshotJson, `rendered` on CellSnapshotJson, `date_system` on WorkbookSnapshotJson). All additive; preserves V3.5 IDE consumers that destructure the JSON. Document the "extend never reshape" contract per V3.5 R-V3.5-7. Verify with mocha tests that pin the V3.5 shape stability.
+- **R-V3.6-9 #REF! substitution + Op::RestoreSheet interaction.** If both D7 + D8 ship, restoring a sheet should un-#REF!-substitute formula refs. Cleanest: D7 substitution lives in `repair_sheet_chain` at `rebuild_workbook` time, and Op::RestoreSheet removes the tombstone BEFORE the repair pass -- so the formulas naturally un-#REF! on the next rebuild. Verify at D7+D8 co-ship.
+
+## V3.6 out of scope
+
+- IDE-side live formula re-evaluation (requires `rebuild_workbook` round-trip + WorkbookRuntime FFI exposure). V3.7+ explicit decision; V3.6 IDE renders formula TEXT but does NOT re-evaluate.
+- Per-peer color hashing for presence decoration. V3.4.1+ polish; still parked.
+- Envelope v3 schema bump for UserIdentity. V3.4.1+ if attribution feature surfaces.
+- Locale-aware format rendering (currency symbols, decimal separators per locale). V3.6 ships en-US-only; V3.6.1+ if surfaced.
+- vscode-test command-flow tests infrastructure. V3.5.1+ test-infrastructure investment; still parked.
+- Chart / pivot table napi surfaces (Phase 4 product features now exposable via WorkbookSnapshot). V3.7+ scope.
+- `CacheState { cells, formats, names, tables }` promotion (V3.5 D1 option (b)). V3.7+ if profiling justifies; V3.6 D2 + D3 land per-cache extensions instead.
+- Cross-restart per-peer color hashing OR per-peer display-order overlay (V3.5.0.3c V3.6+ deferral). V3.7+ if user-facing concern surfaces.
+
+## V3.6.0.X audit transcript pre-allocation
+
+- Codex Lane A: `docs/audits/<YYYY-MM-DD>-phase-5-7-v3-6-0-x-codex.md`
+- Opus Lane B: `docs/audits/<YYYY-MM-DD>-phase-5-7-v3-6-0-x-opus.md`
+
+Expected ~14-20 sessions of total wall time across 8-11 sub-steps + follow-up audits for the full V3.6 arc.
+
+## V3.7+ entry-readiness preview (deferred from V3.6)
+
+Items above plus:
+- Live formula re-evaluation in IDE-side rendering.
+- WorkbookSnapshot incremental deltas (V3.6.0.7 deferred outcome).
+- Locale-aware format rendering.
+- vscode-test command-flow tests infrastructure.
+- Chart / pivot table napi surfaces.
+- `CacheState` cache promotion.
+- Multi-tab sheet UI redesign (V3.5.0.4c + V3.6 D9 deferred).
+- Per-peer color hashing OR per-peer display-order overlay.
+
+These are explicitly NOT V3.6 work; deferred to V3.7 entry-readiness analysis at V3.6.0.X Opus § F.
