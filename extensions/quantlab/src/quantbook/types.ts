@@ -122,6 +122,45 @@ export interface CollabSessionInstance {
 	/** Peer ID of this session, as a BigInt (u64-domain). */
 	peerId(): bigint;
 
+	/**
+	 * **Phase 5.7 V3.4.0.3 (2026-05-23) -- undo the session's last
+	 * local op.**
+	 *
+	 * Returns `true` if the Loro `UndoManager` stack item was consumed
+	 * (an inverse op got appended to the visible log) and `false` if
+	 * the stack was empty (caller's "Cmd-Z when nothing to undo"
+	 * no-op).  LOCAL-ONLY: remote ops merged via `mergeBytes` /
+	 * `pollRemote` are NOT affected.
+	 *
+	 * **Post-consumed invariant**: the V3.3.0.X HIGH-1 closure ensures
+	 * the engine rebuilds `last_snapshot` (V3.4.0.2 `CellState` shape)
+	 * BEFORE returning, so a subsequent `exportSnapshot` reads the
+	 * post-undo view atomically.
+	 *
+	 * **Auto-flush**: if a transport is attached via `attachTransport`
+	 * + `setAutoFlushPolicy('onAppend')`, a consumed undo triggers
+	 * auto-flush (peers receive the inverse op).  Empty-stack undo
+	 * never attempts the flush -- closed transport cannot turn
+	 * "nothing to undo" into a spurious error.
+	 *
+	 * Use the typed wrapper {@link undo} from `./session`.
+	 *
+	 * @throws Error with `parseQuantbookError(err).code` per the
+	 *         engine's CollabSessionError kind (e.g., `transport_closed`
+	 *         during auto-flush after a consumed undo).
+	 */
+	undo(): boolean;
+
+	/**
+	 * **Phase 5.7 V3.4.0.3 (2026-05-23) -- redo the last undone op.**
+	 *
+	 * Mirrors {@link undo} for the redo direction; same consumed-bool
+	 * return + cache + auto-flush + error semantics.
+	 *
+	 * Use the typed wrapper {@link redo} from `./session`.
+	 */
+	redo(): boolean;
+
 	// =====================================================================
 	// Phase 5.7 V2.1 (2026-05-22) -- Transport surface (sync portion)
 	// =====================================================================

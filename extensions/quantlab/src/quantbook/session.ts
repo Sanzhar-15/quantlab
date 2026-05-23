@@ -181,6 +181,40 @@ export function listSheets(session: CollabSessionInstance): number[] {
 	return session.listSheets();
 }
 
+/**
+ * **Phase 5.7 V3.4.0.3 (2026-05-23) -- typed wrapper for
+ * `CollabSession.undo`.**
+ *
+ * Returns `true` if the Loro UndoManager stack item was consumed
+ * (inverse op appended to the visible log) and `false` if the stack
+ * was empty (Cmd-Z no-op).  LOCAL-ONLY: remote ops merged via
+ * `mergeBytes` / `pollRemote` are NOT affected.
+ *
+ * Single-line indirection mirrors the {@link listSheets} pattern so
+ * callers hold a stable IDE-side API surface across future engine
+ * signature changes (e.g., V3.4.1+ may add an optional group-id
+ * parameter for multi-cell undo groups).
+ *
+ * @param session A live {@link CollabSessionInstance}.
+ * @returns `true` on consumed undo; `false` on empty stack.
+ * @throws Error with `parseQuantbookError(err).code` per the engine's
+ *         CollabSessionError kind (e.g., `transport_closed` during
+ *         auto-flush after a consumed undo).
+ */
+export function undo(session: CollabSessionInstance): boolean {
+	return session.undo();
+}
+
+/**
+ * **Phase 5.7 V3.4.0.3 (2026-05-23) -- typed wrapper for
+ * `CollabSession.redo`.**
+ *
+ * Mirrors {@link undo} for the redo direction.
+ */
+export function redo(session: CollabSessionInstance): boolean {
+	return session.redo();
+}
+
 // =====================================================================
 // Phase 5.7 V2.1 (2026-05-22) -- Transport binding wrappers
 // =====================================================================

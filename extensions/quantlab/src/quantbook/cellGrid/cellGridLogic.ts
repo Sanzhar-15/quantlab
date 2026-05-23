@@ -165,6 +165,39 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 		console.warn('[cellGrid] dropped incoming message with no string type field:', msg);
 		return;
 	}
+	// V3.4.0.3 (2026-05-23): handle undo / redo before the putValue
+	// branch.  Both envelopes have no payload (the engine action is
+	// session-wide, not cell-specific).  On consumed=true call
+	// deps.onCommit() to trigger panel re-render via the V3.3.0.3
+	// cache.  On consumed=false (empty undo/redo stack) silent no-op
+	// -- the user pressed Cmd-Z with nothing to undo, no UX feedback
+	// needed.  On engine throw route through deps.onError with
+	// structured code; sheet=deps.sheet/row=0/col=0 sentinels because
+	// undo/redo is session-wide and the errorReply schema requires
+	// cell coordinates (V3.2.b.1 B1 envelope contract).  Message
+	// prefixed with [undo]/[redo] so the user sees which action
+	// failed.
+	if (msg.type === 'undo' || msg.type === 'redo') {
+		try {
+			const consumed = msg.type === 'undo' ? deps.session.undo() : deps.session.redo();
+			if (consumed) {
+				deps.onCommit();
+			}
+			// consumed === false: silent no-op (empty stack).
+			return;
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			deps.onError({
+				type: 'errorReply',
+				sheet: deps.sheet,
+				row: 0,
+				col: 0,
+				code: info.code,
+				message: `[${msg.type}] ${info.message}`,
+			});
+			return;
+		}
+	}
 	if (msg.type !== 'putValue') {
 		console.warn(`[cellGrid] unknown outbound message type: ${msg.type}`);
 		return;

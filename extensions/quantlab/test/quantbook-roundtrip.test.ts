@@ -53,7 +53,9 @@ import {
 	loopbackTransportPair,
 	parseQuantbookError,
 	quantbookEngineVersion,
+	redo,
 	sessionFromSnapshot,
+	undo,
 } from '../src/quantbook/session';
 import type {
 	BlockingTransportFixtureConstructor,
@@ -3339,5 +3341,206 @@ suite('quantbook V3.3.0.X LOW-1 -- row/col Number() coercion in HTML', function 
 			'client mirror coerces row via Number()');
 		assert.ok(html.includes('var colSafe = Number(e.col)'),
 			'client mirror coerces col via Number()');
+	});
+});
+
+// ============================================================================
+// Phase 5.7 V3.4.0.3 -- engine + IDE undo/redo napi bindings + Cmd-Z wiring
+// ============================================================================
+
+suite('quantbook V3.4.0.3 -- engine undo/redo napi bindings (round-trip via cache)', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('undo on empty session returns false (no-op)', () => {
+		const session = createSession(3401n);
+		assert.strictEqual(undo(session), false,
+			'empty undo stack yields false; no engine throw');
+		assert.strictEqual(redo(session), false,
+			'empty redo stack yields false; no engine throw');
+	});
+
+	test('undo of single append retracts cell from exportCellSnapshot (cache reflects)', () => {
+		// V3.3.0.X HIGH-1 closure + V3.4.0.2 CellState shape: undo()
+		// rebuilds last_snapshot via rebuild_snapshot_cache, so the
+		// post-undo exportSnapshot reflects the retraction.  Pre-V3.3.0.X
+		// this would have returned a stale cell.
+		const session = createSession(3402n);
+		appendPutValueValidated(session, 0, 5, 5, 42);
+		assert.strictEqual(exportCellSnapshot(session, 0).entries.length, 1);
+
+		const consumed = undo(session);
+		assert.strictEqual(consumed, true, 'append was undoable');
+		assert.strictEqual(exportCellSnapshot(session, 0).entries.length, 0,
+			'post-undo snapshot reflects retraction via V3.3.0.X cache rebuild');
+	});
+
+	test('undo-then-redo round-trip restores cell via cache', () => {
+		const session = createSession(3403n);
+		appendPutValueValidated(session, 0, 0, 0, 100);
+		appendPutValueValidated(session, 0, 0, 1, 200);
+
+		assert.strictEqual(undo(session), true);
+		assert.strictEqual(exportCellSnapshot(session, 0).entries.length, 1,
+			'after undo: only first cell remains');
+
+		assert.strictEqual(redo(session), true);
+		const post = exportCellSnapshot(session, 0).entries;
+		assert.strictEqual(post.length, 2, 'after redo: both cells back');
+		// Pin VALUES too (not just count) -- V3.4.0.2 CellState extracts .value.
+		const values = post.map(e => e.value).filter((v): v is { kind: 'number'; value: number } => v.kind === 'number').map(v => v.value).sort();
+		assert.deepStrictEqual(values, [100, 200]);
+	});
+
+	test('undo across multi-cell append: each undo retracts one cell at a time', () => {
+		const session = createSession(3404n);
+		for (let i = 0; i < 5; i += 1) {
+			appendPutValueValidated(session, 0, i, 0, i * 10);
+		}
+		assert.strictEqual(exportCellSnapshot(session, 0).entries.length, 5);
+		// Undo all 5; expect monotonic shrinkage.
+		for (let n = 4; n >= 0; n -= 1) {
+			assert.strictEqual(undo(session), true);
+			assert.strictEqual(exportCellSnapshot(session, 0).entries.length, n,
+				`after undo #${5 - n}: snapshot has ${n} entries`);
+		}
+		// Final undo on empty stack: false.
+		assert.strictEqual(undo(session), false);
+	});
+});
+
+suite('quantbook V3.4.0.3 -- dispatchIncomingMessage undo/redo arms', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	function makeDeps(session: CollabSessionInstance, sheet: number) {
+		const errorReplies: ErrorReplyMessage[] = [];
+		let commitCount = 0;
+		const deps = {
+			session,
+			sheet,
+			onCommit: () => { commitCount += 1; },
+			onError: (reply: ErrorReplyMessage) => { errorReplies.push(reply); },
+		};
+		return { deps, errorReplies, getCommitCount: () => commitCount };
+	}
+
+	test('undo envelope on consumed undo: triggers onCommit, no errorReply', () => {
+		const session = createSession(3411n);
+		appendPutValueValidated(session, 0, 0, 0, 1);
+		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
+
+		dispatchIncomingMessage({ type: 'undo' }, deps);
+
+		assert.strictEqual(getCommitCount(), 1, 'consumed undo triggers onCommit');
+		assert.strictEqual(errorReplies.length, 0);
+		// Engine state confirmation: cell retracted.
+		assert.strictEqual(exportCellSnapshot(session, 0).entries.length, 0);
+	});
+
+	test('undo envelope on empty stack: silent no-op (no onCommit, no errorReply)', () => {
+		const session = createSession(3412n);
+		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
+
+		dispatchIncomingMessage({ type: 'undo' }, deps);
+
+		assert.strictEqual(getCommitCount(), 0, 'empty undo stack does NOT trigger onCommit');
+		assert.strictEqual(errorReplies.length, 0,
+			'empty undo stack does NOT generate errorReply (per V3.4.0.3 dispatcher contract)');
+	});
+
+	test('redo envelope on consumed redo: triggers onCommit', () => {
+		const session = createSession(3413n);
+		appendPutValueValidated(session, 0, 0, 0, 99);
+		undo(session); // populate redo stack
+		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
+
+		dispatchIncomingMessage({ type: 'redo' }, deps);
+
+		assert.strictEqual(getCommitCount(), 1);
+		assert.strictEqual(errorReplies.length, 0);
+		assert.strictEqual(exportCellSnapshot(session, 0).entries.length, 1,
+			'redo restored the cell');
+	});
+
+	test('redo envelope on empty stack: silent no-op', () => {
+		const session = createSession(3414n);
+		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
+
+		dispatchIncomingMessage({ type: 'redo' }, deps);
+
+		assert.strictEqual(getCommitCount(), 0);
+		assert.strictEqual(errorReplies.length, 0);
+	});
+
+	test('undo envelope ignored payload fields (session-wide, not cell-keyed)', () => {
+		// Defensive: even if the webview script accidentally posts
+		// {type:'undo', sheet: 99, row: 5} the dispatcher should ignore
+		// the extra fields + operate on the engine's session-wide
+		// undo stack.
+		const session = createSession(3415n);
+		appendPutValueValidated(session, 0, 0, 0, 1);
+		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
+
+		dispatchIncomingMessage({ type: 'undo', sheet: 99, row: 5, col: 5 }, deps);
+
+		assert.strictEqual(getCommitCount(), 1, 'undo proceeded regardless of payload');
+		assert.strictEqual(errorReplies.length, 0);
+	});
+});
+
+suite('quantbook V3.4.0.3 -- buildHtml inline script wiring for undo/redo keybindings', function () {
+	test('script body binds document-level keydown listener', () => {
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries: [] }, { nonce: 'v3403' });
+		// Document-level listener (NOT input-scoped) so Cmd-Z works
+		// outside of mid-edit.
+		assert.ok(html.includes('document.addEventListener(\'keydown\''),
+			'document-level keydown listener present');
+	});
+
+	test('script body has activeInput-null mid-edit guard before posting undo', () => {
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries: [] }, { nonce: 'v3403' });
+		// Critical: when activeInput !== null, the keydown handler
+		// returns BEFORE preventDefault + postMessage.  This lets the
+		// browser's text-undo work inside <input> elements (Cmd-Z in
+		// the cell input undoes typed characters, NOT the workbook).
+		assert.ok(html.includes('if (activeInput !== null)'),
+			'mid-edit guard present');
+		// Pin that the guard appears INSIDE the keydown handler (not
+		// only in the scroll handler).  Look for the guard's comment
+		// "let the browser handle text-undo" we wrote in V3.4.0.3.
+		assert.ok(html.includes('let the browser handle text-undo'),
+			'mid-edit guard comment confirms keydown-scope intent');
+	});
+
+	test('script body emits undo + redo postMessage envelopes for Cmd/Ctrl + key combos', () => {
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries: [] }, { nonce: 'v3403' });
+		// Modifier check: metaKey (Mac Cmd) OR ctrlKey (Win/Linux).
+		assert.ok(html.includes('ev.metaKey || ev.ctrlKey'),
+			'both Cmd (Mac) and Ctrl (Win/Linux) modifiers honored');
+		// Undo: Cmd/Ctrl-Z without Shift.
+		assert.ok(html.includes('vscode.postMessage({ type: \'undo\' })'),
+			'undo envelope post present');
+		// Redo: Cmd/Ctrl-Shift-Z OR Ctrl-Y.
+		assert.ok(html.includes('vscode.postMessage({ type: \'redo\' })'),
+			'redo envelope post present');
+		// Key dispatch shape: case-insensitive on 'z' / 'y'.
+		assert.ok(html.includes('ev.key.toLowerCase()'),
+			'key matching is case-insensitive');
+	});
+
+	test('non-nonced V3.2.a path does NOT include undo/redo wiring', () => {
+		// V3.2.a (read-only) builds with no nonce; the inline script is
+		// not emitted; therefore no undo/redo handlers either.  Pin
+		// that the V3.4.0.3 wiring is gated behind nonced mode.
+		const html = buildHtml({ snapshot_format_version: 1, sheet: 0, entries: [] });
+		assert.ok(!html.includes('vscode.postMessage({ type: \'undo\' })'),
+			'undo wiring absent in V3.2.a-compat read-only mode');
+		assert.ok(!html.includes('vscode.postMessage({ type: \'redo\' })'),
+			'redo wiring absent in V3.2.a-compat read-only mode');
 	});
 });
