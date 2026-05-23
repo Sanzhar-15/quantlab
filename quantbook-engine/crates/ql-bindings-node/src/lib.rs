@@ -1577,20 +1577,41 @@ impl CollabSession {
             // its docstring contract; the V3.4.0.X HIGH-1 closure
             // ensures BatchCommit-nested cell ops are recursed into the
             // cache via collect_cache_effects.
+            //
+            // **V3.5.0.X audit-closure A-HIGH-2 (2026-05-24)**: formula
+            // TEXT is read from the REPAIRED Workbook (via `formula_at`)
+            // rather than from the unrepaired `last_snapshot` cache.
+            // Phase 5.3 step 3 `repair_sheet_rename_chain` rewrites
+            // formula references when a sheet is renamed; pre-closure
+            // this napi method discarded the rebuilt+repaired Workbook
+            // and serialized stale formula text from the cache, so the
+            // § 4.1.z5 contract (formulas surface with rename-repair)
+            // was violated.  Now: the cache's `state.formula` is the
+            // FALLBACK when the repaired Workbook has no formula for
+            // the cell (e.g., the cell's formula was cleared in the
+            // op log but the cache still has the post-clear ghost-
+            // entry None -- shouldn't happen post-V3.4.0.X MEDIUM-1
+            // closure, but defensive).  The repaired form wins when
+            // both are present.
             let cells: Vec<CellSnapshotJson> = inner
                 .snapshot_cells(sheet_id)
                 .into_iter()
-                .map(|((row, col), state)| CellSnapshotJson {
-                    row,
-                    col,
-                    value: state.value.map(CellValueJson::from),
-                    formula: state.formula,
-                    // **V3.5.0.5 (2026-05-24)**: format passthrough
-                    // from the V3.4.0.2 hybrid CellState extended with
-                    // a `format: Option<FormatId>` field.  None ->
-                    // absent JS property (napi-rs Option::None
-                    // serialization).
-                    format: state.format.map(FormatIdJson::from),
+                .map(|((row, col), state)| {
+                    let repaired_formula = workbook
+                        .formula_at(sheet_id, row, col)
+                        .map(|s| s.as_ref().to_string());
+                    CellSnapshotJson {
+                        row,
+                        col,
+                        value: state.value.map(CellValueJson::from),
+                        formula: repaired_formula.or(state.formula),
+                        // **V3.5.0.5 (2026-05-24)**: format passthrough
+                        // from the V3.4.0.2 hybrid CellState extended with
+                        // a `format: Option<FormatId>` field.  None ->
+                        // absent JS property (napi-rs Option::None
+                        // serialization).
+                        format: state.format.map(FormatIdJson::from),
+                    }
                 })
                 .collect();
             sheets.push(SheetSnapshotJson {

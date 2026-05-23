@@ -1553,23 +1553,32 @@ Mocha pins the V3.5 surface at 346/346 IDE tests + 106/106 ql-collab.  Extends V
 # Prerequisites: same as V3.4.0.7 § 4.1.z4 steps 1-2 (build engine
 # cdylib; open IDE in Extension Development Host).
 
-# 12. Sheet management commands smoke (V3.5.0.4a).
+# 12. Sheet management commands smoke (V3.5.0.4a + V3.5.0.X A-HIGH-3 closure).
+#     **V3.5.0.X audit-closure A-HIGH-3 (2026-05-24)**: all 4 commands
+#     now call CellGridPanel.refreshAll() after success; pre-closure
+#     the panels did NOT update until a subsequent user action.
+#     Output channel log lines should include "refreshed N panel(s)".
 #     In the Cell Grid panel:
 #     - Cmd-Shift-P -> "Quantbook: Add Sheet..." -> enter "Q4Returns"
-#       -> Enter.  Toast: 'Sheet "Q4Returns" added.'
+#       -> Enter.  Toast: 'Sheet "Q4Returns" added.'  Output:
+#       'Added sheet "Q4Returns" to session; refreshed 1 panel(s).'
 #     - Cmd-Shift-P -> "Quantbook: Rename Sheet..." -> select an
 #       existing sheet -> enter a different name -> Enter.  Toast +
-#       (V3.5.0.4b reactive title) panel title updates within ms.
+#       (V3.5.0.4b reactive title) panel title updates IMMEDIATELY
+#       (the refreshAll() call triggers render() which re-reads
+#       workbookSnapshot + the V3.5.0.X A-HIGH-2 closure surfaces
+#       the renamed sheet's repaired formulas; see step 15).
 #     - Cmd-Shift-P -> "Quantbook: Move Sheet..." -> 2-step picker:
 #       select source sheet, then select target position with adjacency
 #       labels.  Snapshot reordering reflects in title's sheet-count
-#       sequence.
+#       sequence (visible immediately via refreshAll).
 #     - Cmd-Shift-P -> "Quantbook: Delete Sheet..." -> select a
 #       sheet to delete -> showWarningMessage modal "Delete sheet N
 #       (Name)?  This cannot be undone..." -> click "Delete".  Sheet
-#       count in title decrements; if the deleted sheet was the active
-#       panel's sheet, panel shows empty cells + console.warn
-#       (sheet-not-found tombstone-race fallback per V3.5.0.4b).
+#       count in title decrements immediately; if the deleted sheet
+#       was the active panel's sheet, panel shows empty cells +
+#       console.warn (sheet-not-found tombstone-race fallback per
+#       V3.5.0.4b).
 
 # 13. Cell-grid render migration smoke (V3.5.0.4b reactive title).
 #     - Quantbook: Add Sheet... (3 times) -> "S1", "S2", "S3"
@@ -1600,18 +1609,31 @@ Mocha pins the V3.5 surface at 346/346 IDE tests + 106/106 ql-collab.  Extends V
 #     - Verify window 1's <input> element is STILL OPEN (not destroyed
 #       by the merged-tick render -- the V3.5.0.7 closure).
 #     - In window 1: type a value + Enter.  presenceUpdate typing:false
-#       broadcasts; flag clears.  Next pollRemote tick (~1s) -- the
-#       deferred render fires and cell B1 now shows "999" (window 2's
-#       commit propagated correctly; no data loss).
+#       broadcasts; flag clears.  **V3.5.0.X audit-closure A-HIGH-4
+#       (2026-05-24)**: the deferred render fires IMMEDIATELY on
+#       typing:false (not at the next pollRemote tick) -- cell B1
+#       now shows "999".  Pre-closure the deferred render was LOST
+#       (subsequent ticks classified as 'idle' and never rendered);
+#       window 1 would have stayed showing cell B1 empty indefinitely
+#       until some unrelated render triggered.  Output channel logs:
+#         [collab] pollRemote idle tick: firing deferred render
+#         (presence guard cleared since last merged-skip).
+#       (only when the typing:false fires AFTER the next pollRemote
+#        tick; otherwise the render fires inside setPresenceTyping
+#        without a log line)
 #     - **Watchdog smoke** (optional): in window 1, click cell A1 ->
 #       begin editing.  WAIT 30+ seconds without committing or
 #       canceling (simulate hung typing).  Output channel logs:
 #         [collab] presenceRepaintInFlight watchdog fired after 30000ms;
 #         auto-cleared (typing:false never arrived; merged-tick
 #         renders will resume).
-#       Subsequent merged ticks render normally.
+#       Subsequent merged ticks render normally.  V3.5.0.X audit-closure
+#       A-HIGH-4: the watchdog auto-clear ALSO fires the deferred render
+#       if one is pending (verify window 1 now shows window 2's commit
+#       even though typing:false never broadcast).
 
-# 15. Format passthrough smoke (V3.5.0.5 -- devtools inspection).
+# 15. Format passthrough + repaired-formula smoke (V3.5.0.5 +
+#     V3.5.0.X A-HIGH-2 -- devtools inspection).
 #     V3.5 has no IDE write-path for SetCellFormat (V3.6+ scope), but
 #     the WorkbookSnapshot's per-cell format field round-trips.  Verify
 #     via webview devtools:
@@ -1625,13 +1647,98 @@ Mocha pins the V3.5 surface at 346/346 IDE tests + 106/106 ql-collab.  Extends V
 #       extractSheetSnapshot deliberately drops format; V3.2.a shape
 #       preserved for buildHtml).  V3.6+ format-aware rendering will
 #       extend this.
+#
+#     **V3.5.0.X audit-closure A-HIGH-2 (2026-05-24) -- repaired-formula
+#     verification** (requires .qbook with a formula referencing a
+#     to-be-renamed sheet; the IDE has no PutFormula write path so
+#     this needs a pre-built .qbook from an integration test or from
+#     a future V3.6 formula-write surface):
+#     - Open a .qbook that has sheet "A" with another sheet's cell
+#       containing formula "=A!B1".
+#     - Cmd-Shift-P -> "Quantbook: Rename Sheet..." -> rename A to
+#       "Renamed".  Panel refreshes (per A-HIGH-3 closure).
+#     - In webview devtools console, invoke the napi workbookSnapshot
+#       handle and inspect the formula text on the cell that referenced
+#       sheet A.  Pre-V3.5.0.X closure: the formula text was stale
+#       ("=A!B1").  Post-closure: the formula text is repaired
+#       ("=Renamed!B1") -- napi reads from rebuild_workbook +
+#       repair_sheet_rename_chain via workbook.formula_at instead of
+#       the unrepaired last_snapshot cache.
+#     - Note: until V3.6+ adds an IDE-facing PutFormula API, this
+#       step is "construct a .qbook externally then smoke" rather
+#       than a fully IDE-driven flow.  The ql-collab Rust test
+#       `rebuilt_workbook_carries_repaired_formula_but_cache_does_not`
+#       pins the underlying mechanism.
 ```
 
 If smoke surfaces issues, file findings against the V3.5.0.X audit (parallel Codex+Opus megaudit) which is the next planned audit cycle.
 
+#### V3.5.0.X audit-closures (Phase 5.7 V3.5 phase-termination audit, 2026-05-24)
+
+**Status:** Parallel Codex+Opus megaudit ran 2026-05-24 against V3.5.0.1 through V3.5.0.9.  Both transcripts shipped: `docs/audits/2026-05-24-phase-5-7-v3-5-0-x-codex.md` (Codex Lane A; **FAIL** verdict; 4 HIGH + 1 LOW) + `docs/audits/2026-05-24-phase-5-7-v3-5-0-x-opus.md` (Opus Lane B; PASS-WITH-FINDINGS; 2 HIGH + 4 MED + 3 LOW + 1 INFO).  **5 distinct HIGHs + 1 valid MEDIUM closed in-cycle**; 1 LOW closed in-cycle; remaining LOWs deferred to V3.5.1+ backlog.
+
+**Cross-lane convergence table:**
+
+| Finding | Codex | Opus | Disposition |
+|---|---|---|---|
+| Partial-invalidate undo wrong-cell after remote interleave | A-HIGH-1 (native-binding repro) | H2 (B.4.b analysis) | **CONVERGENT HIGH; one fix closes both** |
+| SetCellFormat tombstone gap | (Codex missed) | H1 (B.6) | Opus-only HIGH; closed in-cycle |
+| workbookSnapshot bypasses repaired formulas | A-HIGH-2 | (Opus didn't flag) | Codex-only HIGH; closed in-cycle |
+| Sheet management commands don't repaint | A-HIGH-3 | (Opus didn't flag) | Codex-only HIGH; closed in-cycle |
+| Mid-edit render skip loses deferred repaint | A-HIGH-4 | (Opus didn't flag) | Codex-only HIGH; closed in-cycle |
+| _presenceRepaintInFlight docstring drift | (Codex didn't flag) | M2 | Opus-only MED; closed in-cycle |
+| TS comments mention `null` for napi optional fields | A-LOW-1 | (Opus didn't flag) | Codex-only LOW; closed in-cycle |
+
+**Closures (in sequencing order; trivial -> invasive):**
+
+1. **Opus-H1 -- SetCellFormat tombstone guard.**  Engine `crates/ql-oplog/src/replay.rs:728-757` extended with `if workbook.is_sheet_removed(*sheet) { return Ok(()) }` after `validate_cell`, mirroring the V3.5.0.3b pattern that V3.5.0.5's new SetCellFormat handler missed.  **Scope widening discovered during closure**: the live-cache walker (`crates/ql-collab/src/session.rs::apply_cache_effect`) was ALSO tombstone-blind for ALL four cell-keyed ops (PutValue + PutFormula + ClearFormula + SetCellFormat) -- the V3.5.0.3b engine guard only fired during replay paths, not during `append_op`'s live cache update.  Closure widened to:
+   - New `CacheEffect::RemoveSheet { id }` variant emitted by `collect_cache_effects` for `Op::RemoveSheet`.
+   - New `removed_sheets: HashSet<u16>` field on `CollabSession` tracking the tombstone state for the cache walker.  Rule 4 per-field walk in the field docstring; 0 new triggers; arc terminus stays at 6.
+   - `apply_cache_effect` signature gains `&mut HashSet<u16>` parameter; on `CacheEffect::RemoveSheet`, inserts the id into the tracker AND drops all snapshot entries for that sheet via `HashMap::retain`.  All cell-keyed effects early-return when their target sheet is tombstoned.
+   - Three callers updated: `append_op`, `rebuild_snapshot_cache` (atomic-swap with fresh local tombstone set), `invalidate_cell` (V3.5.0.6 partial path).
+   - **+3 ql-collab regression tests**: `set_cell_format_on_tombstoned_sheet_is_silently_dropped` + `set_cell_format_clear_on_tombstoned_sheet_is_silently_dropped` + `put_value_on_tombstoned_sheet_is_silently_dropped` (the last test is the broader-scope discovery pin).
+
+2. **Opus-M2 -- _presenceRepaintInFlight reset in show().**  IDE `extensions/quantlab/src/quantbook/cellGrid/cellGridPanel.ts::show()` extended with `instance.setPresenceTyping(false)` immediately before the first `instance.render()` call.  Pre-closure the field-level docstring claimed this reset happened in show(); the reset only existed in the constructor (init false) + on dispose (setPresenceTyping(false)).  Matches V3.4.0.X-established "reinit on show + attachTransport" pattern.  No regression test (no-op on fresh instance; defensive against future refactor that reuses instances).
+
+3. **A-HIGH-2 -- workbookSnapshot bypasses repaired formulas.**  napi `crates/ql-bindings-node/src/lib.rs::workbook_snapshot` now reads formula text from the rebuilt+repaired `Workbook` (via `workbook.formula_at(sheet, row, col)`) instead of from the unrepaired `last_snapshot` cache (`state.formula`).  Pre-closure the napi method DISCARDED the repaired Workbook (only used it for sheet count + names) and serialized stale formula text -- the § 4.1.z5 contract that "formulas surface with rename-repair" (formerly line ~1392) was violated.  The cache's `state.formula` is now the FALLBACK when the repaired Workbook has no formula for the cell (defensive; shouldn't happen post-V3.4.0.X MEDIUM-1 closure).  **+1 ql-collab regression test**: `rebuilt_workbook_carries_repaired_formula_but_cache_does_not` pins the cache-vs-workbook divergence (proves the napi's choice of source matters; the 3-line napi edit is verified by code review on top).  IDE-level integration test deferred to V3.5.1+ scope (would require new napi `appendPutFormula` since formula write isn't IDE-facing today).
+
+4. **A-HIGH-3 -- sheet management commands don't repaint panels.**  IDE `extensions/quantlab/src/commands/quantbookCommands.ts` all 4 sheet management commands (Add/Rename/Delete/Move) now call `CellGridPanel.refreshAll()` after each successful sheet op.  `refreshAll()` was already shipped at V3.2.a.1 (iterates both `localPanels` + `collabPanels` maps and calls `instance.render()` on each).  Output channel log line updated to include `refreshed N panel(s)`.  Pre-closure the live smoke claim "panel title updates within ms" was FALSE because local panels have no poll loop.  No new regression test (vscode-test integration is V3.5.1+ scope per V3.4.0.X Opus § F V3.5 ENTRY READINESS).  Live smoke step 12 now genuinely verifies the behavior.  Note: when the active sheet of a panel is deleted, the panel renders the V3.5.0.4b tombstone-race fallback (empty cells + `console.warn`) -- this is the documented contract; no separate work needed.
+
+5. **A-HIGH-4 -- mid-edit render skip loses deferred repaint.**  IDE `cellGridPanel.ts` gains a new `_pendingRenderAfterTyping: boolean` field.  `tickPollRemote`'s `'merged'` branch sets the flag when skipping; `setPresenceTyping(false)` clears + renders if the flag is set; the presence-typing watchdog auto-clear also fires the deferred render; defense-in-depth in the `'idle'` branch fires the render if the guard has since cleared.  Pre-closure the merged-skip set no pending flag, so subsequent ticks classifying as `'idle'` never rendered; remote changes stayed invisible indefinitely.  R-V3.4-3 closure (V3.5.0.7) was INCOMPLETE without this flag; this V3.5.0.X closure restores the § 4.1.z5 D5 guarantee that "deferred render fires on next 1s tick" (V3.5.0.X actually fires IMMEDIATELY on typing:false, which is BETTER than waiting for the next tick).  No mocha test (panel-level behavior; verification via live smoke step 14 -- two-window mid-edit + commit + verify deferred render fires when typing:false).
+
+6. **A-HIGH-1 + Opus-H2 (CONVERGENT) -- partial-invalidate undo wrong-cell after remote interleaving.**  New `pure_local_frontier: bool` field on `CollabSession`.  Initialized `true` in both constructors.  Set `true` after successful `append_op`, `undo`, `redo` (the appended/inverse op is the new local frontier).  Set `false` after `merge_bytes`, `poll_remote_with_limit` (when blobs drained), `discard_pending_ops` -- any path where remote ops join the log OR the log structure changes.  `undo()` / `redo()` dispatch gates partial-invalidate on this field: if `!pure_local_frontier` the dispatch falls back to full `rebuild_snapshot_cache` regardless of op shape.  Codex A-HIGH-1's native-binding repro: peer A writes (0,0,0); peer B writes (0,1,0); A merges B; A undoes -- pre-closure partial-invalidate read the captured `pre_undo_last_op` as B's REMOTE op and targeted (0,1,0) (WRONG), leaving A's undone cell stale.  Post-closure: the merge resets `pure_local_frontier = false`; undo dispatches to full rebuild.  **+1 ql-collab regression test**: `undo_after_remote_interleave_falls_back_to_full_rebuild` mirrors the Codex § 7 repro + verifies via side-by-side equality with a forced full rebuild on the same post-undo log.  Rule 4: `bool` is Copy+Send+Sync; 0 new triggers; arc terminus stays at 6.  V3.6+ alternative (Loro UndoManager `on_pop` callback) preserved as deferred per § 4.1.z5 drift hazards.
+
+7. **A-LOW-1 -- TS comment hygiene.**  IDE `extensions/quantlab/src/quantbook/types.ts` CellValueJson + CellSnapshotJson docstrings updated: `null`/`undefined` wording replaced with "absent" + explicit "napi-rs serializes Rust `Option::None` as ABSENT properties (the field is `undefined`, NOT `null`)" + "Use TypeScript's optional `?:` syntax to model this contract".  Doc hygiene; interfaces and tests were already correct.
+
+**Backlog (V3.5.1+):**
+
+| ID | Description | Severity | Reason |
+|---|---|---|---|
+| Opus-M1 (REJECTED as false positive) | Mocha count mismatch (Opus claimed 335; actual = 346) | n/a | Opus over-counted via grep; missed mocha's dynamic for-loop test discovery.  Verified directly via mocha runner |
+| Opus-M3 | `quantbookCellGridSwitchSheet` + `quantbookCellGridRefresh` duplication risk | DESIGN OPINION | V3.6+ multi-tab redesign may consolidate; defer with "review during V3.6 sheet-tabs scoping" note |
+| Opus-M4 (DOWNGRADED to LOW by Opus on re-read) | `move_sheet` impl correctness | LOW | Opus self-downgraded; no action |
+| Opus-L1 | Dead-code arc in `affected_cells_for_partial_invalidate` (classifier never returns `Some(empty Vec)`) | LOW | Minor; could simplify the helper but no behavior change |
+| Opus-L2 | `buildSheetMovePositionItems` lists source's current position with `(current)` annotation (semantically a no-op move) | LOW | UX polish; engine accepts via idempotency |
+| Opus-L3 | V3.5.0.4b reactive title race between construction + wireAttachment (brief wrong mode-tag window) | LOW | Edge case; defer |
+| Opus-I1 | `Workbook::move_sheet` linear-search O(N) | INFO | Acceptable at typical sheet counts; V3.6+ polish |
+
+**Rule 4 arc terminus confirmation:** HELD at 6 throughout the V3.5.0.X closures.  Three new types added in-closure all have positive Send+Sync per-field walks documented in their docstrings:
+- `CacheEffect::RemoveSheet { id: u16 }` (enum variant; primitive composition).
+- `CollabSession.removed_sheets: HashSet<u16>` (positive Send+Sync via std inherent impl over u16).
+- `CollabSession.pure_local_frontier: bool` (Copy+Send+Sync trivially).
+
+**R-V3.5-* reclassifications:** none required.  All V3.5 risks documented at V3.5.0.9 remain accurate.  R-V3.5-2 (partial-invalidate undo correctness under causal reorder) was the conceptual basis for the convergent-HIGH closure and is now operationalized via the `pure_local_frontier` gate + regression test.
+
+**Cumulative V3.5 test deltas post-closure:**
+- ql-collab: 81 (V3.4.0.X baseline) -> 111 (+30 V3.5-specific cumulative): V3.5.0.5 +12 + V3.5.0.6 +13 + V3.5.0.X +5 (3 tombstone + 1 repaired-formula + 1 partial-invalidate remote-interleave).
+- IDE mocha: 254 (V3.4.0.X baseline) -> 346 (+92 V3.5-specific cumulative; V3.5.0.X added 0 since panel-level behavior is live-smoke-verified).
+- ql-collab-ws: 42 (V3.4.0.X baseline) -> 42 (unchanged).
+
+**V3.5 ALL SHIPPED + AUDITED.**  V3.5.0.X megaudit closure complete; V3.5 plan archived; MASTER-PLAN swept.
+
 ---
 
-**D-1 (✅ SHIPPED 2026-05-20 — all 8 steps + 7 per-step audits + 1 megaudit):** `FormatId` is now `enum { Builtin(u32), Custom(PeerId, u32) }` in `ql-storage::format`. IDE callers MUST pattern-match the variant rather than reading `.0`. Use `FormatId::is_builtin()` / `is_custom()` / `GENERAL` accessors. For pre-D-1 bare-u32 ids (xlsx import), use `FormatId::legacy_from_u32(n)`. `Op::RegisterFormat` + `Op::SetCellFormat` carry `FormatIdWire` on the wire. `.qbook` envelope v8 carries the tagged-tuple `FormatEntryId` shape losslessly for multi-peer ids; v<8 envelopes auto-migrate. xlsx export flattens multi-peer FormatIds via dedup-by-code; non-LEGACY peer flattens reported via `XlsxExportReport.dropped_features`. xlsx import surfaces unresolved-overlay-numfmt as `report.unsupported` entries. `.qbook/oplog.bin` files wrapped in Tier D3 header (`OPLOG_MAGIC = b"QLOL"` + BE u32 `OPLOG_SCHEMA_VERSION`). `CollabSession::new` + `from_snapshot` + `OpLog::set_peer_id` assert `PeerId != 0` (release-firing). See `docs/phase5/d-1-exit-packet.md` for the full closure record.
+ `FormatId` is now `enum { Builtin(u32), Custom(PeerId, u32) }` in `ql-storage::format`. IDE callers MUST pattern-match the variant rather than reading `.0`. Use `FormatId::is_builtin()` / `is_custom()` / `GENERAL` accessors. For pre-D-1 bare-u32 ids (xlsx import), use `FormatId::legacy_from_u32(n)`. `Op::RegisterFormat` + `Op::SetCellFormat` carry `FormatIdWire` on the wire. `.qbook` envelope v8 carries the tagged-tuple `FormatEntryId` shape losslessly for multi-peer ids; v<8 envelopes auto-migrate. xlsx export flattens multi-peer FormatIds via dedup-by-code; non-LEGACY peer flattens reported via `XlsxExportReport.dropped_features`. xlsx import surfaces unresolved-overlay-numfmt as `report.unsupported` entries. `.qbook/oplog.bin` files wrapped in Tier D3 header (`OPLOG_MAGIC = b"QLOL"` + BE u32 `OPLOG_SCHEMA_VERSION`). `CollabSession::new` + `from_snapshot` + `OpLog::set_peer_id` assert `PeerId != 0` (release-firing). See `docs/phase5/d-1-exit-packet.md` for the full closure record.
 
 ## 5. Acceptance pattern (`crates/ql-exec/tests/ide_simulation.rs`)
 

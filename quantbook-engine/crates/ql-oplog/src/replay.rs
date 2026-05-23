@@ -732,6 +732,18 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             id,
         } => {
             validate_cell(workbook, *sheet, *row, *col, index)?;
+            // V3.5.0.X audit-closure Opus-H1 (2026-05-24): silent no-op
+            // on tombstoned sheet (see Op::PutValue).  V3.5.0.5 added the
+            // SetCellFormat handler AFTER V3.5.0.3b shipped the tombstone
+            // guards on PutValue/PutFormula/ClearFormula; the cell-keyed
+            // sweep was not re-run.  Without this guard, SetCellFormat on
+            // a tombstoned sheet would write to format_overlay (invisible
+            // via workbook_snapshot but surfaces in list_sheets_from_cache
+            // as a phantom entry, and a future Op::RestoreSheet would
+            // surface unexpected format mutations).
+            if workbook.is_sheet_removed(*sheet) {
+                return Ok(());
+            }
             // **W5-80:** require the id to be registered. Catches
             // producer bugs where `SetCellFormat` was emitted without
             // a preceding `RegisterFormat`. `None` means clear.

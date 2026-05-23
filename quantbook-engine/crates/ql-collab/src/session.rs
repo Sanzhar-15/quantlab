@@ -60,7 +60,7 @@
 //!   (for replay against a workbook).
 //! - `peer_id(&self)` — the session's stable peer id.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use thiserror::Error;
 
@@ -171,6 +171,16 @@ enum CacheEffect {
     /// if both `value` and `formula` AND `format` are None after the
     /// apply, the entry is removed entirely.
     SetCellFormat { key: (u16, u32, u32), format: Option<FormatId> },
+    /// **V3.5.0.X audit-closure Opus-H1 extension (2026-05-24)**:
+    /// sheet tombstoned via `Op::RemoveSheet`.  Apply: insert the id
+    /// into the tombstone tracker AND drop all existing snapshot
+    /// entries for that sheet from `last_snapshot`.  All subsequent
+    /// cell-keyed effects targeting the same sheet are silently
+    /// dropped (matching the V3.5.0.3b engine-replay tombstone
+    /// guard semantic, which the live cache walker previously
+    /// LACKED -- the leak surfaced as phantom entries in
+    /// `list_sheets_from_cache`).
+    RemoveSheet { id: u16 },
 }
 use ql_storage::{FormatId, Workbook};
 
@@ -588,6 +598,84 @@ pub struct CollabSession {
     /// docstring).  No new negative-trait claim introduced at V3.4.0.2.
     /// Rule 4 arc terminus stays at 6.
     last_snapshot: HashMap<(u16, u32, u32), CellState>,
+
+    /// **Phase 5.7 V3.5.0.X audit-closure Opus-H1 (2026-05-24) -- cache-walker
+    /// tombstone state.**
+    ///
+    /// Mirrors `Workbook.removed_sheets` (storage-layer tombstone set introduced
+    /// at V3.5.0.3b) but lives on the cache walker so the live `append_op`
+    /// path + `rebuild_snapshot_cache` can silently drop cell-keyed effects
+    /// targeting tombstoned sheets.  Pre-closure, the cache walker was
+    /// tombstone-blind: V3.5.0.3b's `Op::RemoveSheet` only updated the
+    /// workbook (via engine `apply_op`); subsequent `Op::PutValue` /
+    /// `Op::PutFormula` / `Op::ClearFormula` / `Op::SetCellFormat`
+    /// (V3.5.0.5) on the tombstoned sheet wrote phantom entries into
+    /// `last_snapshot` (workbook_snapshot napi filtered them out at the
+    /// top level, but `list_sheets_from_cache` + `snapshot_cells` saw
+    /// them; the V3.5.0.X audit caught this as Opus-H1 for SetCellFormat
+    /// and the closure widened scope to cover all 4 cell-keyed variants).
+    ///
+    /// **Update paths** (kept in sync with `last_snapshot` via the cache
+    /// walker; same set of mutation sites as `last_snapshot`):
+    /// - `new` / `from_snapshot`: rebuilt fresh from the log via
+    ///   `rebuild_snapshot_cache` (which iterates ops + tracks
+    ///   `CacheEffect::RemoveSheet`).
+    /// - `append_op`: incremental update on `Op::RemoveSheet`.
+    /// - `merge_bytes` / `discard_pending_ops` / `poll_remote_with_limit` /
+    ///   `undo` / `redo`: rebuilt via `rebuild_snapshot_cache`.
+    /// - `invalidate_cell` (V3.5.0.6 partial): consults this set; tombstoned
+    ///   cells are excluded from the rebuilt-from-log entry.
+    ///
+    /// **Rule 4 per-field walk**: `HashSet<u16>` is `Send + Sync` (std
+    /// inherent impl); `u16` is `Copy + Send + Sync` trivially.  0 new
+    /// triggers; arc terminus stays at 6.  V3.5.0.X audit-closure added
+    /// this field; positive walk.
+    removed_sheets: HashSet<u16>,
+
+    /// **Phase 5.7 V3.5.0.X audit-closure A-HIGH-1 / Opus-H2 (2026-05-24) --
+    /// pure-local-frontier gate for partial-invalidate undo/redo.**
+    ///
+    /// `true` iff the most-recent visible op in the log is the most-recent
+    /// LOCAL-APPENDED op (no remote merge has interleaved since).
+    /// V3.5.0.6 partial-invalidate captures `self.log.iter().last()`
+    /// BEFORE undo as a proxy for the to-be-retracted op; that proxy
+    /// is correct only when this field is true.  Pre-closure, the
+    /// dispatch fell through to partial-invalidate whenever the
+    /// visible log shrank by exactly 1 -- but if a remote op landed
+    /// AFTER the local op being undone, the captured most-recent
+    /// visible op was the REMOTE op, so partial-invalidate targeted
+    /// the WRONG cell.  Codex A-HIGH-1 has a native-binding repro;
+    /// Opus H2 found it independently (B.4.b).
+    ///
+    /// **Lifecycle**:
+    /// - `new()` / `from_snapshot()`: `true` (clean start; partial path
+    ///   is enabled).  For from_snapshot the imported log may already
+    ///   contain remote ops at the top, but an immediate `undo()` will
+    ///   either find nothing on the undo stack OR will rely on the
+    ///   shrink-by-1 + cell-keyed shape guards to short-circuit.
+    /// - `append_op()`: `true` after success (the appended op IS the
+    ///   new local frontier).
+    /// - `merge_bytes()`: `false` (remote ops just merged; the visible
+    ///   tail may now be remote).
+    /// - `poll_remote()` / `poll_remote_with_limit()`: `false` IF any
+    ///   blob actually merged; otherwise unchanged.
+    /// - `discard_pending_ops()`: `false` (the log was replaced via
+    ///   `fork_at_vv`; any prior frontier-state assumption is
+    ///   invalidated).
+    /// - `undo()` / `redo()` after success: `true` (the just-appended
+    ///   inverse op IS the new local frontier).
+    ///
+    /// **Dispatch gate**: in `undo()` / `redo()`, if `!pure_local_frontier`
+    /// the partial-invalidate path is BYPASSED and `rebuild_snapshot_cache`
+    /// is called regardless of op shape.  This is the conservative
+    /// closure path Codex recommended; the V3.6+ alternative is to
+    /// wire Loro UndoManager's `on_pop` callback which surfaces the
+    /// actual retracted op shape directly (no proxy needed).
+    ///
+    /// **Rule 4 per-field walk**: `bool` is `Copy + Send + Sync`
+    /// trivially.  0 new triggers; arc terminus stays at 6.  V3.5.0.X
+    /// audit-closure added this field; positive walk.
+    pure_local_frontier: bool,
 }
 
 impl CollabSession {
@@ -637,6 +725,11 @@ impl CollabSession {
             last_flushed_vv: None,
             // V3.3.0.3: empty cache; no ops in a fresh session.
             last_snapshot: HashMap::new(),
+            // V3.5.0.X: empty tombstone set; no RemoveSheet ops yet.
+            removed_sheets: HashSet::new(),
+            // V3.5.0.X audit-closure A-HIGH-1 / Opus-H2: fresh session
+            // has no remote interleaving; partial-invalidate enabled.
+            pure_local_frontier: true,
         })
     }
 
@@ -684,6 +777,23 @@ impl CollabSession {
             // so callers of `snapshot_cells` see the imported state
             // immediately (without needing a subsequent op-log walk).
             last_snapshot: HashMap::new(),
+            // V3.5.0.X: populated by `rebuild_snapshot_cache` alongside
+            // `last_snapshot` -- the walker emits `CacheEffect::RemoveSheet`
+            // for each `Op::RemoveSheet` it sees, which apply_cache_effect
+            // inserts here.
+            removed_sheets: HashSet::new(),
+            // V3.5.0.X audit-closure A-HIGH-1 / Opus-H2: from_snapshot
+            // imports an existing log; the latest visible op may be
+            // remote (or from this peer's prior session).  Starting
+            // `true` is acceptable because: (a) immediate undo() will
+            // find nothing on the local UndoManager stack -- the
+            // imported log was loaded fresh, so undo is a no-op -- and
+            // the field doesn't matter; (b) the shrink-by-1 + cell-keyed
+            // shape guards in undo()/redo() provide additional safety
+            // even if the frontier assumption is wrong.  Future
+            // append_op()/merge_bytes() will reset the field to its
+            // correct semantics.
+            pure_local_frontier: true,
         };
         sess.rebuild_snapshot_cache()?;
         Ok(sess)
@@ -736,8 +846,19 @@ impl CollabSession {
         Self::collect_cache_effects(&op, &mut effects);
         self.log.append(op)?;
         for effect in effects {
-            Self::apply_cache_effect(&mut self.last_snapshot, effect);
+            // V3.5.0.X audit-closure: thread `removed_sheets` through so
+            // RemoveSheet effects update the session-level tombstone set
+            // + cell-keyed effects on tombstoned sheets are silently
+            // dropped (Opus-H1 closure widened to all 4 cell-keyed
+            // variants).
+            Self::apply_cache_effect(&mut self.last_snapshot, &mut self.removed_sheets, effect);
         }
+        // V3.5.0.X audit-closure A-HIGH-1 / Opus-H2 (2026-05-24): mark
+        // the frontier as pure-local.  The appended op is the new latest
+        // visible op in the log; partial-invalidate undo dispatch can
+        // trust `self.log.iter().last()` as the to-be-retracted op.
+        // Resets any prior false-state from merge_bytes/poll_remote.
+        self.pure_local_frontier = true;
         self.maybe_auto_flush()?;
         Ok(())
     }
@@ -779,6 +900,16 @@ impl CollabSession {
                     Self::collect_cache_effects(inner, out);
                 }
             }
+            // **V3.5.0.X audit-closure Opus-H1 extension (2026-05-24)**:
+            // sheet tombstone effect.  Pre-closure, Op::RemoveSheet was
+            // a no-op for the cache walker (fell through `_ => {}`);
+            // the engine workbook side was tombstoned via apply_op but
+            // the cache walker had no way to know.  Now the walker
+            // emits a `CacheEffect::RemoveSheet`, which apply_cache_effect
+            // uses to (a) drop existing snapshot entries for the sheet
+            // and (b) record the tombstone so subsequent cell-keyed
+            // effects on the same sheet are silently skipped.
+            Op::RemoveSheet { id } => out.push(CacheEffect::RemoveSheet { id: *id }),
             _ => {}
         }
     }
@@ -788,7 +919,37 @@ impl CollabSession {
     /// `append_op` (live cache) and `rebuild_snapshot_cache` (fresh
     /// build), keeping the per-field LWW + ghost-entry-avoidance +
     /// formula-only-key-removal invariants in ONE place.
-    fn apply_cache_effect(snapshot: &mut HashMap<(u16, u32, u32), CellState>, effect: CacheEffect) {
+    ///
+    /// **V3.5.0.X audit-closure Opus-H1 extension (2026-05-24)**: now
+    /// also threads a `tombstones: &mut HashSet<u16>` parameter.  On
+    /// `CacheEffect::RemoveSheet { id }`, inserts the id into
+    /// `tombstones` AND drops all existing snapshot entries for that
+    /// sheet.  All subsequent cell-keyed effects targeting a tombstoned
+    /// sheet are silently dropped (matching the engine `apply_op` guard
+    /// that V3.5.0.3b added to PutValue/PutFormula/ClearFormula + that
+    /// the V3.5.0.X closure added to SetCellFormat).  Pre-closure, the
+    /// cache walker was tombstone-blind: cell-keyed effects on a
+    /// tombstoned sheet wrote phantom entries.
+    fn apply_cache_effect(
+        snapshot: &mut HashMap<(u16, u32, u32), CellState>,
+        tombstones: &mut HashSet<u16>,
+        effect: CacheEffect,
+    ) {
+        // V3.5.0.X audit-closure: cell-keyed effects on tombstoned sheets
+        // are silently dropped.  RemoveSheet handled below; this branch
+        // covers the four cell-keyed variants.
+        let target_sheet = match &effect {
+            CacheEffect::PutValue { key, .. } => Some(key.0),
+            CacheEffect::PutFormula { key, .. } => Some(key.0),
+            CacheEffect::ClearFormula { key } => Some(key.0),
+            CacheEffect::SetCellFormat { key, .. } => Some(key.0),
+            CacheEffect::RemoveSheet { .. } => None,
+        };
+        if let Some(sheet) = target_sheet {
+            if tombstones.contains(&sheet) {
+                return;
+            }
+        }
         match effect {
             CacheEffect::PutValue { key, value } => {
                 snapshot.entry(key).or_default().value = Some(value);
@@ -841,6 +1002,16 @@ impl CollabSession {
                     }
                 }
             }
+            // V3.5.0.X audit-closure Opus-H1 extension (2026-05-24):
+            // tombstone the sheet + drop all existing snapshot entries
+            // for it.  Subsequent cell-keyed effects targeting this
+            // sheet are silently dropped via the early-return above.
+            // Idempotent: a second RemoveSheet for the same id leaves
+            // the tombstone set + snapshot unchanged.
+            CacheEffect::RemoveSheet { id } => {
+                tombstones.insert(id);
+                snapshot.retain(|(sheet, _, _), _| *sheet != id);
+            }
         }
     }
 
@@ -876,6 +1047,14 @@ impl CollabSession {
         // correct here; full rebuild is.  See the `last_snapshot`
         // field docstring for the formal argument.
         self.rebuild_snapshot_cache()?;
+        // V3.5.0.X audit-closure A-HIGH-1 / Opus-H2 (2026-05-24):
+        // remote ops may now trail the prior local frontier in the
+        // visible iteration order.  Mark the frontier as NOT
+        // pure-local so a subsequent undo() falls back to full
+        // rebuild_snapshot_cache (the partial-invalidate proxy
+        // `self.log.iter().last()` would otherwise target the wrong
+        // cell -- A-HIGH-1 native-binding repro).
+        self.pure_local_frontier = false;
         self.maybe_auto_flush()?;
         Ok(new_len)
     }
@@ -1088,16 +1267,24 @@ impl CollabSession {
         // rebuild + the V3.4.0.2 per-field LWW semantics BREAK.  Pin
         // the invariant in any future Loro upgrade audit.
         let mut fresh: HashMap<(u16, u32, u32), CellState> = HashMap::new();
+        // V3.5.0.X audit-closure Opus-H1: rebuild the tombstone tracker
+        // alongside the cache.  CacheEffect::RemoveSheet emitted by
+        // `collect_cache_effects` is applied here; subsequent cell-keyed
+        // effects in iteration order are filtered against `fresh_tombstones`.
+        // Atomic-swap with `self.removed_sheets` only after the rebuild
+        // succeeds (mirrors the `fresh -> self.last_snapshot` swap).
+        let mut fresh_tombstones: HashSet<u16> = HashSet::new();
         let mut effects: Vec<CacheEffect> = Vec::new();
         for op_result in self.log.iter() {
             let op = op_result.map_err(CollabSessionError::OpLog)?;
             effects.clear();
             Self::collect_cache_effects(&op, &mut effects);
             for effect in effects.drain(..) {
-                Self::apply_cache_effect(&mut fresh, effect);
+                Self::apply_cache_effect(&mut fresh, &mut fresh_tombstones, effect);
             }
         }
         self.last_snapshot = fresh;
+        self.removed_sheets = fresh_tombstones;
         Ok(())
     }
 
@@ -1154,20 +1341,33 @@ impl CollabSession {
         // ones for other cells).
         let mut effects: Vec<CacheEffect> = Vec::new();
         let mut local_snapshot: HashMap<(u16, u32, u32), CellState> = HashMap::new();
+        // V3.5.0.X audit-closure Opus-H1: track tombstones during the
+        // per-cell walk so `RemoveSheet` for `target_key.0` suppresses
+        // any subsequent cell-keyed effect on that cell.  This local
+        // tracker mirrors the rebuild_snapshot_cache pattern.
+        let mut local_tombstones: HashSet<u16> = HashSet::new();
         for op_result in self.log.iter() {
             let op = op_result.map_err(CollabSessionError::OpLog)?;
             effects.clear();
             Self::collect_cache_effects(&op, &mut effects);
             for effect in effects.drain(..) {
-                // Only apply effects targeting the requested cell.
-                let key = match &effect {
-                    CacheEffect::PutValue { key, .. } => *key,
-                    CacheEffect::PutFormula { key, .. } => *key,
-                    CacheEffect::ClearFormula { key } => *key,
-                    CacheEffect::SetCellFormat { key, .. } => *key,
+                // Only apply effects targeting the requested cell OR the
+                // RemoveSheet effect (which we always apply locally so
+                // subsequent cell-keyed effects on the tombstoned sheet
+                // are filtered).
+                let apply = match &effect {
+                    CacheEffect::PutValue { key, .. } => *key == target_key,
+                    CacheEffect::PutFormula { key, .. } => *key == target_key,
+                    CacheEffect::ClearFormula { key } => *key == target_key,
+                    CacheEffect::SetCellFormat { key, .. } => *key == target_key,
+                    // Always apply RemoveSheet so the local tombstone
+                    // tracker stays current; apply_cache_effect's retain
+                    // operation is O(local_snapshot size) which is at
+                    // most 1 entry during invalidate_cell.
+                    CacheEffect::RemoveSheet { .. } => true,
                 };
-                if key == target_key {
-                    Self::apply_cache_effect(&mut local_snapshot, effect);
+                if apply {
+                    Self::apply_cache_effect(&mut local_snapshot, &mut local_tombstones, effect);
                 }
             }
         }
@@ -1928,6 +2128,11 @@ impl CollabSession {
         // (specifically the discarded pending ops past the last
         // flushed VV).  Rebuild from the new log.
         self.rebuild_snapshot_cache()?;
+        // V3.5.0.X audit-closure A-HIGH-1 / Opus-H2 (2026-05-24): the
+        // log was REPLACED via fork_at_vv; any prior frontier assumption
+        // is invalidated.  Conservatively mark as not pure-local; next
+        // append_op() will reset.
+        self.pure_local_frontier = false;
         Ok(pre_count)
     }
 
@@ -2252,6 +2457,13 @@ impl CollabSession {
             // Loro's CRDT merge can causally-reorder; full rebuild
             // is required.
             self.rebuild_snapshot_cache()?;
+            // V3.5.0.X audit-closure A-HIGH-1 / Opus-H2 (2026-05-24):
+            // remote ops just merged into the log; the latest
+            // visible op may now be remote.  Reset the
+            // pure-local-frontier so a subsequent undo() falls back
+            // to full rebuild.  Mirrors merge_bytes (same closure
+            // path; this is the batched analog).
+            self.pure_local_frontier = false;
             self.maybe_auto_flush()?;
         }
         Ok(merged)
@@ -2384,8 +2596,21 @@ impl CollabSession {
             // Either path runs BEFORE auto-flush so callers observing
             // the post-undo state (subsequent snapshot read OR
             // auto-flushed delta to a peer) see the canonical view.
+            //
+            // **V3.5.0.X audit-closure A-HIGH-1 / Opus-H2 (2026-05-24)
+            // -- pure-local-frontier gate**: partial-invalidate uses
+            // `pre_undo_last_op` (captured above) as a proxy for the
+            // to-be-retracted op.  That proxy is correct ONLY when no
+            // remote op has interleaved since the local op being
+            // undone.  If `pure_local_frontier == false`, a remote op
+            // may have landed AFTER our local op (in causal iteration
+            // order), making `pre_undo_last_op` the REMOTE op and the
+            // partial-invalidate target wrong (Codex A-HIGH-1 has a
+            // native-binding repro of this exact scenario; Opus B.4.b
+            // found it independently).  In that case fall back to
+            // full rebuild_snapshot_cache regardless of op shape.
             let post_undo_len = self.log.len();
-            let partial_cells = if pre_undo_len == post_undo_len + 1 {
+            let partial_cells = if self.pure_local_frontier && pre_undo_len == post_undo_len + 1 {
                 pre_undo_last_op
                     .as_ref()
                     .and_then(Self::affected_cells_for_partial_invalidate)
@@ -2402,6 +2627,12 @@ impl CollabSession {
                     self.rebuild_snapshot_cache()?;
                 }
             }
+            // V3.5.0.X audit-closure A-HIGH-1 / Opus-H2: after a
+            // successful undo, the inverse op appended by UndoManager
+            // IS the new latest visible op (it's a fresh local
+            // append).  Reset the frontier flag to `true` so a
+            // subsequent partial-invalidate can fire correctly.
+            self.pure_local_frontier = true;
             self.maybe_auto_flush()?;
         }
         Ok(consumed)
@@ -2433,8 +2664,17 @@ impl CollabSession {
         if consumed {
             // V3.5.0.6 D2 partial-invalidate dispatch (extends V3.3.0.X
             // HIGH-1): prefer partial-invalidate; fall back to full rebuild.
+            //
+            // **V3.5.0.X audit-closure A-HIGH-1 / Opus-H2 (2026-05-24)
+            // -- pure-local-frontier gate**: same rationale as undo
+            // (see undo() docstring above).  Redo's appended op
+            // appears as the latest visible op only when no remote
+            // merge intervened; otherwise the captured `post_redo_last_op`
+            // is the REMOTE op and partial-invalidate targets the
+            // wrong cell.  Gate on `pure_local_frontier` before the
+            // captured-op shape check.
             let post_redo_len = self.log.len();
-            let post_redo_last_op: Option<Op> = if pre_redo_len + 1 == post_redo_len {
+            let post_redo_last_op: Option<Op> = if self.pure_local_frontier && pre_redo_len + 1 == post_redo_len {
                 self.log
                     .iter()
                     .last()
@@ -2456,6 +2696,11 @@ impl CollabSession {
                     self.rebuild_snapshot_cache()?;
                 }
             }
+            // V3.5.0.X audit-closure A-HIGH-1 / Opus-H2: after a
+            // successful redo, the appended op is the new latest
+            // visible op (fresh local append).  Reset the frontier
+            // flag.  Same rationale as undo() above.
+            self.pure_local_frontier = true;
             self.maybe_auto_flush()?;
         }
         Ok(consumed)
@@ -3800,6 +4045,211 @@ mod tests {
             "undo of last PutValue reveals the prior PutValue");
         assert_eq!(state_post.format, Some(FormatId::Builtin(2)),
             "format survives the rebuild via SetCellFormat replay");
+    }
+
+    #[test]
+    fn put_value_on_tombstoned_sheet_is_silently_dropped() {
+        // V3.5.0.X audit-closure discovery (2026-05-24): the V3.5.0.3b
+        // engine tombstone guard (replay.rs:415-417) silent-drops writes
+        // at REPLAY time but the live cache walker (apply_cache_effect)
+        // has no tombstone awareness.  Without a fix, PutValue to a
+        // tombstoned sheet writes a phantom entry into last_snapshot.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
+        let r = s.append_op(put_value(0, 0, 0, 1.0));
+        assert!(r.is_ok(),
+            "PutValue on tombstoned sheet must NOT error (silent drop)");
+        assert_eq!(s.snapshot_cells(0).len(), 0,
+            "tombstoned sheet must not surface any cached cells after PutValue");
+        assert!(!s.list_sheets_from_cache().contains(&0),
+            "list_sheets_from_cache must NOT include the tombstoned sheet");
+    }
+
+    #[test]
+    fn set_cell_format_on_tombstoned_sheet_is_silently_dropped() {
+        // V3.5.0.X audit-closure Opus-H1 (2026-05-24): SetCellFormat to
+        // a tombstoned sheet must be a silent no-op, mirroring the
+        // V3.5.0.3b tombstone guards on PutValue/PutFormula/ClearFormula.
+        // Pre-closure, the SetCellFormat handler wrote to format_overlay
+        // unconditionally -> phantom cache entry surfacing in
+        // list_sheets_from_cache for the tombstoned sheet.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        // Need a format registered for the SetCellFormat to be considered
+        // valid (otherwise replay errors before reaching the tombstone
+        // guard).  Built-in id 2 is registered by default.
+        // Tombstone sheet 0 first.
+        s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
+        // Now SetCellFormat on the tombstoned sheet: must be silent no-op.
+        let r = s.append_op(set_cell_format_builtin(0, 0, 0, 2));
+        assert!(r.is_ok(),
+            "SetCellFormat on tombstoned sheet must NOT error (silent drop)");
+        // The cache must not contain a phantom entry for the tombstoned sheet.
+        assert_eq!(s.snapshot_cells(0).len(), 0,
+            "tombstoned sheet must not surface any cached cells after SetCellFormat");
+        assert!(!s.list_sheets_from_cache().contains(&0),
+            "list_sheets_from_cache must NOT include the tombstoned sheet \
+             (no phantom entry from format_overlay)");
+    }
+
+    #[test]
+    fn set_cell_format_clear_on_tombstoned_sheet_is_silently_dropped() {
+        // Same as above but for the `id: None` (clear-overlay) variant.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
+        let r = s.append_op(clear_cell_format(0, 0, 0));
+        assert!(r.is_ok(),
+            "SetCellFormat(None) on tombstoned sheet must NOT error");
+        assert_eq!(s.snapshot_cells(0).len(), 0);
+        assert!(!s.list_sheets_from_cache().contains(&0));
+    }
+
+    #[test]
+    fn rebuilt_workbook_carries_repaired_formula_but_cache_does_not() {
+        // V3.5.0.X audit-closure A-HIGH-2 (2026-05-24): workbook_snapshot
+        // napi PRE-CLOSURE serialized formula text from `last_snapshot`
+        // (the cache), which does NOT carry the rename-repair effect.
+        // The rebuilt+repaired Workbook DOES.  Post-closure the napi
+        // reads from the Workbook (via formula_at) so the repaired text
+        // surfaces to IDE consumers.  This Rust test pins the divergence:
+        // it proves that pre-closure the napi was reading from the wrong
+        // source.  The actual napi binding edit is a 3-line change at
+        // lib.rs:1580 (`repaired_formula.or(state.formula)`); code-review
+        // verifies that side; this test proves the underlying mechanism
+        // (rebuild_workbook produces the repaired form, cache does not).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S".to_string(),
+            chunk_rows: 100,
+        }).unwrap();
+        // Write a formula referencing sheet "S".
+        s.append_op(Op::PutFormula {
+            sheet: 0,
+            row: 1,
+            col: 0,
+            text: "S!A1".to_string(),
+        }).unwrap();
+        // Rename sheet 0 from "S" to "Renamed".  Phase 5.3 repair pass
+        // rewrites the formula at (0, 1, 0) to "Renamed!A1".
+        s.append_op(Op::RenameSheet {
+            id: 0,
+            old_name: "S".to_string(),
+            new_name: "Renamed".to_string(),
+        }).unwrap();
+
+        // Cache surfaces the STALE formula text (no repair).
+        let stale = s.snapshot_cells(0)
+            .into_iter()
+            .find(|((r, c), _)| *r == 1 && *c == 0)
+            .map(|(_, st)| st.formula);
+        assert_eq!(stale, Some(Some("S!A1".to_string())),
+            "pre-closure: cache carries the UNREPAIRED formula text");
+
+        // Rebuilt workbook carries the REPAIRED formula text.
+        let reg = ql_functions::default_registry();
+        let (wb, report) = s.rebuild_workbook(&reg).unwrap();
+        assert_eq!(report.sheet_repair.formulas_rewritten, 1,
+            "repair pass rewrites the formula referencing the renamed sheet");
+        let repaired = wb.formula_at(0, 1, 0).map(|s| s.to_string());
+        assert_eq!(repaired, Some("Renamed!A1".to_string()),
+            "post-closure: workbook_snapshot reads from this (via formula_at) \
+             so IDE consumers see the repaired text");
+
+        // Sanity: the cache and the workbook DIVERGE.  This is the
+        // motivation for the A-HIGH-2 closure -- workbook_snapshot must
+        // read from the workbook side, not the cache side.
+        assert_ne!(stale.flatten(), repaired,
+            "cache and workbook formula text diverge after rename; \
+             workbook_snapshot must prefer the workbook form");
+    }
+
+    #[test]
+    fn undo_after_remote_interleave_falls_back_to_full_rebuild() {
+        // V3.5.0.X audit-closure A-HIGH-1 / Opus-H2 (2026-05-24)
+        // CONVERGENT HIGH regression test.  Mirrors the Codex § 7
+        // native-binding repro.
+        //
+        // Pre-closure scenario (Codex A-HIGH-1):
+        //   1. Peer A appends `PutValue(0, 0, 0, 10.0)` (local op).
+        //   2. Peer B appends `PutValue(0, 1, 0, 20.0)` (remote op).
+        //   3. Peer A `merge_bytes(B's snapshot)` -- B's op now trails
+        //      A's in causal iteration order.
+        //   4. Peer A `undo()` -- UndoManager retracts A's local op
+        //      (PutValue at (0,0,0)).  But the pre_undo_last_op
+        //      captured by V3.5.0.6 dispatch is B's REMOTE op
+        //      (PutValue at (0,1,0)).
+        //   5. Partial-invalidate targets cell (0,1,0) -- WRONG.
+        //      Cache: (0,0,0)=10.0 stays; (0,1,0)=20.0 is dropped
+        //      then re-derived from the post-undo log (which still
+        //      has B's PutValue so re-derives to 20.0; net zero).
+        //      Cell (0,0,0) is stale -- should have been dropped.
+        //
+        // Post-closure expectation:
+        //   pure_local_frontier is false after the merge_bytes call,
+        //   so undo()'s dispatch falls back to full rebuild_snapshot_cache.
+        //   The post-undo cache matches a fresh full rebuild.
+        let mut s_a = CollabSession::new(PeerId::new(1)).unwrap();
+        // Both peers need the same base sheet to write into.
+        s_a.append_op(Op::AddSheet {
+            name: "S".to_string(),
+            chunk_rows: 100,
+        }).unwrap();
+        let base_bytes = s_a.export_bytes().unwrap();
+
+        // Peer A appends a local PutValue at (0,0,0).
+        s_a.append_op(put_value(0, 0, 0, 10.0)).unwrap();
+
+        // Peer B (constructed from the shared base) appends PutValue at (0,1,0).
+        let mut s_b = CollabSession::from_snapshot(PeerId::new(2), &base_bytes).unwrap();
+        s_b.append_op(put_value(0, 1, 0, 20.0)).unwrap();
+        let b_bytes = s_b.export_bytes().unwrap();
+
+        // Peer A merges B's bytes.  After this merge:
+        // - Both ops are in A's log.
+        // - In causal iteration order, B's op may come AFTER A's
+        //   (Loro's CRDT iteration is deterministic but depends on
+        //   the LWW/causal ordering; either way, A's last visible
+        //   local op is no longer guaranteed to be the actual tail).
+        // - pure_local_frontier MUST be false after this point.
+        s_a.merge_bytes(&b_bytes).unwrap();
+        assert!(
+            !s_a.pure_local_frontier,
+            "merge_bytes must reset pure_local_frontier to false (the \
+             closure-gate invariant)"
+        );
+
+        // Now peer A undoes its local op.  Pre-closure, partial-invalidate
+        // would target the wrong cell.  Post-closure, the dispatch falls
+        // back to full rebuild_snapshot_cache because pure_local_frontier
+        // is false.
+        let consumed = s_a.undo().unwrap();
+        assert!(consumed, "undo must consume A's PutValue");
+
+        // The post-undo cache must equal what a forced full rebuild would
+        // produce on the SAME post-undo log.  Force a fresh full rebuild
+        // (via the V3.5.0.6 force_clear_snapshot_cache + rebuild_snapshot_cache
+        // test seam) and compare.
+        let cache_dispatch = capture_full_cache(&s_a);
+        s_a.force_clear_snapshot_cache();
+        s_a.rebuild_snapshot_cache().unwrap();
+        let cache_full_rebuild = capture_full_cache(&s_a);
+        assert_eq!(cache_dispatch, cache_full_rebuild,
+            "post-closure: undo dispatch after remote interleave must \
+             produce the same cache as a forced full rebuild on the same \
+             post-undo log (Codex A-HIGH-1 + Opus H2 convergent closure)");
+
+        // Sanity: (0,1,0) (B's cell) is present; (0,0,0) (A's cell, undone)
+        // is absent.  This is what the full-rebuild path produces; if the
+        // partial-invalidate path had run (pre-closure), (0,0,0) would
+        // be incorrectly present.
+        let entries: Vec<_> = s_a.snapshot_cells(0).into_iter().collect();
+        assert!(
+            entries.iter().any(|((r, c), _)| *r == 1 && *c == 0),
+            "B's cell (0,1,0) must be present"
+        );
+        assert!(
+            entries.iter().all(|((r, c), _)| !(*r == 0 && *c == 0)),
+            "A's undone cell (0,0,0) must be absent"
+        );
     }
 
     // ========================================================================
