@@ -623,8 +623,12 @@ pub struct CollabSession {
     /// - `append_op`: incremental update on `Op::RemoveSheet`.
     /// - `merge_bytes` / `discard_pending_ops` / `poll_remote_with_limit` /
     ///   `undo` / `redo`: rebuilt via `rebuild_snapshot_cache`.
-    /// - `invalidate_cell` (V3.5.0.6 partial): consults this set; tombstoned
-    ///   cells are excluded from the rebuilt-from-log entry.
+    /// - `invalidate_cell` (V3.5.0.6 partial): uses a LOCAL `local_tombstones`
+    ///   tracker independent of this session-level set; the per-cell walk
+    ///   computes its own tombstone state from the op log.  The session-
+    ///   level field is NOT mutated by invalidate_cell.  (Doc previously
+    ///   said "consults this set" -- corrected by V3.5.0.X follow-up audit
+    ///   CLOSURE-CODEX-LOW-4 docstring drift fix.)
     ///
     /// **Rule 4 per-field walk**: `HashSet<u16>` is `Send + Sync` (std
     /// inherent impl); `u16` is `Copy + Send + Sync` trivially.  0 new
@@ -4119,6 +4123,126 @@ mod tests {
     }
 
     #[test]
+    fn put_formula_on_tombstoned_sheet_is_silently_dropped() {
+        // V3.5.0.X follow-up audit CLOSURE-CODEX-LOW-3: extend
+        // tombstone-guard coverage to PutFormula.  Pre-Opus-H1-widening
+        // a PutFormula op on a tombstoned sheet would have written a
+        // phantom entry to the cache.  Post-widening the cache walker
+        // tombstone tracker silent-drops cell-keyed effects on
+        // tombstoned sheets for ALL four cell-keyed variants.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
+        let r = s.append_op(put_formula(0, 0, 0, "=A1+1"));
+        assert!(r.is_ok(),
+            "PutFormula on tombstoned sheet must NOT error (silent drop)");
+        assert_eq!(s.snapshot_cells(0).len(), 0,
+            "tombstoned sheet must not surface any cached cells after PutFormula");
+        assert!(!s.list_sheets_from_cache().contains(&0),
+            "list_sheets_from_cache must NOT include the tombstoned sheet");
+    }
+
+    #[test]
+    fn clear_formula_on_tombstoned_sheet_is_silently_dropped() {
+        // V3.5.0.X follow-up audit CLOSURE-CODEX-LOW-3: extend
+        // tombstone-guard coverage to ClearFormula.  Even though
+        // ClearFormula is itself a no-op-if-absent, the cache walker
+        // should still treat it as silent-dropped on a tombstoned
+        // sheet (don't create a phantom entry just to clear it).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
+        let r = s.append_op(clear_formula(0, 0, 0));
+        assert!(r.is_ok(),
+            "ClearFormula on tombstoned sheet must NOT error (silent drop)");
+        assert_eq!(s.snapshot_cells(0).len(), 0,
+            "tombstoned sheet must not surface any cached cells after ClearFormula");
+        assert!(!s.list_sheets_from_cache().contains(&0));
+    }
+
+    #[test]
+    fn valid_add_remove_sheet_then_cell_op_silent_dropped() {
+        // V3.5.0.X follow-up audit CLOSURE-CODEX-LOW-3: cover the
+        // VALID sequence (the prior three tests use out-of-range
+        // RemoveSheet which is the contrived scenario flagged by
+        // CLOSURE-CODEX-MED-1 -- known divergence).  This test uses
+        // the canonical sequence: AddSheet creates the sheet at id 0,
+        // RemoveSheet tombstones it, then a cell-keyed op on the
+        // tombstoned sheet is silent-dropped by both engine apply_op
+        // AND the cache walker.  Validates parity for the production
+        // path that V3.5.0.4a's deleteSheet napi exercises.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "ToDelete".to_string(),
+            chunk_rows: 100,
+        }).unwrap();
+        // Pre-tombstone PutValue surfaces normally.
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        assert_eq!(s.snapshot_cells(0).len(), 1);
+        // RemoveSheet tombstones the sheet.  Existing cache entries
+        // for sheet 0 are DROPPED via apply_cache_effect's retain.
+        s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
+        assert_eq!(s.snapshot_cells(0).len(), 0,
+            "post-RemoveSheet: existing entries dropped from cache");
+        assert!(!s.list_sheets_from_cache().contains(&0));
+        // Post-tombstone cell-keyed ops are silent-dropped.
+        for op in [
+            put_value(0, 1, 0, 2.0),
+            put_formula(0, 2, 0, "=A1+B1"),
+            clear_formula(0, 3, 0),
+            set_cell_format_builtin(0, 4, 0, 2),
+        ] {
+            assert!(s.append_op(op).is_ok());
+        }
+        assert_eq!(s.snapshot_cells(0).len(), 0,
+            "all 4 cell-keyed ops post-tombstone silent-dropped");
+        assert!(!s.list_sheets_from_cache().contains(&0));
+    }
+
+    #[test]
+    fn redo_after_remote_interleave_falls_back_to_full_rebuild() {
+        // V3.5.0.X follow-up audit CLOSURE-CODEX-LOW-3: symmetric
+        // counterpart to `undo_after_remote_interleave_falls_back_
+        // to_full_rebuild`.  Verifies the convergent HIGH closure's
+        // pure_local_frontier gate also protects the redo dispatch
+        // when a remote op interleaves between undo and redo.
+        let mut s_a = CollabSession::new(PeerId::new(1)).unwrap();
+        s_a.append_op(Op::AddSheet {
+            name: "S".to_string(),
+            chunk_rows: 100,
+        }).unwrap();
+        let base_bytes = s_a.export_bytes().unwrap();
+
+        // Peer A: append local PutValue.
+        s_a.append_op(put_value(0, 0, 0, 10.0)).unwrap();
+        // Peer A: undo the PutValue (fully local; partial-invalidate fires).
+        assert!(s_a.undo().unwrap());
+
+        // Peer B: appends a remote PutValue.
+        let mut s_b = CollabSession::from_snapshot(PeerId::new(2), &base_bytes).unwrap();
+        s_b.append_op(put_value(0, 1, 0, 20.0)).unwrap();
+        let b_bytes = s_b.export_bytes().unwrap();
+
+        // Peer A: merges B's bytes.  pure_local_frontier resets to false.
+        s_a.merge_bytes(&b_bytes).unwrap();
+        assert!(!s_a.pure_local_frontier);
+
+        // Peer A: redo the undone PutValue.  Pre-closure (without the
+        // pure_local_frontier gate) partial-invalidate would target the
+        // wrong cell.  Post-closure the gate falls back to full rebuild.
+        let consumed = s_a.redo().unwrap();
+        assert!(consumed, "redo must consume A's undone PutValue");
+
+        // Compare the post-redo cache to a forced full rebuild on the
+        // same log (the convergent HIGH equality pin).
+        let cache_dispatch = capture_full_cache(&s_a);
+        s_a.force_clear_snapshot_cache();
+        s_a.rebuild_snapshot_cache().unwrap();
+        let cache_full_rebuild = capture_full_cache(&s_a);
+        assert_eq!(cache_dispatch, cache_full_rebuild,
+            "post-closure: redo dispatch after remote interleave must \
+             produce the same cache as a forced full rebuild");
+    }
+
+    #[test]
     fn rebuilt_workbook_carries_repaired_formula_but_cache_does_not() {
         // V3.5.0.X audit-closure A-HIGH-2 (2026-05-24): workbook_snapshot
         // napi PRE-CLOSURE serialized formula text from `last_snapshot`
@@ -4180,8 +4304,8 @@ mod tests {
     #[test]
     fn undo_after_remote_interleave_falls_back_to_full_rebuild() {
         // V3.5.0.X audit-closure A-HIGH-1 / Opus-H2 (2026-05-24)
-        // CONVERGENT HIGH regression test.  Mirrors the Codex § 7
-        // native-binding repro.
+        // CONVERGENT HIGH regression test.  Mirrors the Codex section
+        // 7 native-binding repro.
         //
         // Pre-closure scenario (Codex A-HIGH-1):
         //   1. Peer A appends `PutValue(0, 0, 0, 10.0)` (local op).

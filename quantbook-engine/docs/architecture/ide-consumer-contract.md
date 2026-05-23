@@ -1750,7 +1750,36 @@ Three additional minor findings noted but not fixed in-cycle:
 
 - **B-FINDING-5 (INFO): A-HIGH-2 per-cell performance cost.**  Adds 1 HashMap lookup + 1 `Arc<str>::to_string` per cell with a formula.  Negligible at V3.5 scale (100k cells = ~1ms total); documented for V3.6+ incremental snapshot deltas.
 
-**V3.5 ALL SHIPPED + AUDITED.**  V3.5.0.X megaudit closure complete + follow-up audit shipped 3 in-cycle defensive corrections.  V3.5 plan archived; MASTER-PLAN swept.
+**V3.5.0.X follow-up audit Codex Lane A (2026-05-24):** A separate Codex transcript ran a deep audit of the closures themselves and produced `docs/audits/2026-05-24-phase-5-7-v3-5-0-x-closure-codex.md` (PASS-WITH-FINDINGS; 4 MED + 4 LOW).  Three MED findings were closed in-cycle (the fourth deferred); plus the LOW-1/LOW-2 findings that were already addressed by my parallel Lane B fixes (B-FINDING-3 + B-FINDING-1):
+
+- **CLOSURE-CODEX-MED-2 (FIXED): refreshAll inside engine-op try{} mis-reports errors.**  All 4 sheet management commands (Add/Rename/Delete/Move) now separate the engine op (inner try/catch) from the refresh (outer try/catch).  A render() throw from refreshAll no longer masquerades as "Quantbook <op> failed" -- the sheet op's success toast fires + a separate "refreshAll after <op> failed (non-fatal)" log line records the render failure.
+
+- **CLOSURE-CODEX-MED-3 (FIXED): refreshAll bypasses A-HIGH-4 mid-edit guard for collab panels.**  This was a cross-finding regression -- the A-HIGH-3 closure (refreshAll after sheet ops) re-opened R-V3.4-3 in a new code path: a user running a LOCAL sheet command would force a render on any open COLLAB panel, even if the collab panel was mid-edit.  Fix: new `safeRender()` private method on CellGridPanel that checks `_presenceRepaintInFlight` per panel and defers via `_pendingRenderAfterTyping` when the guard fires.  `refreshAll()` iterates through `safeRender()` instead of calling `render()` directly.  Mirrors the V3.5.0.7 + V3.5.0.X A-HIGH-4 + B-FINDING-3 deferred-render policy (try/catch + log on failure + dirty flag set if mid-edit).
+
+- **CLOSURE-CODEX-MED-4 (FIXED): workbook_snapshot formula fallback masked invariant violation.**  Pre-fix: `formula: repaired_formula.or(state.formula)`.  Post-fix: `formula: repaired_formula`.  The cache vs. workbook formula text should agree in normal operation (both derived from the same op log); a divergence is a bug to surface, not a silent fallback to mask.  Codex's recommendation accepted; the fallback was dead code anyway.  The `rebuilt_workbook_carries_repaired_formula_but_cache_does_not` regression test still passes (it asserts the divergence + that repaired wins; doesn't care about the fallback semantic).
+
+- **CLOSURE-CODEX-MED-1 (DEFERRED to V3.5.1+ backlog): out-of-range RemoveSheet cache-vs-replay parity.**  The cache walker tombstones unconditionally on `Op::RemoveSheet { id }`; engine `Workbook::remove_sheet(id)` silently no-ops when `id >= sheets.len()`.  For the contrived `RemoveSheet(out-of-range), AddSheet, PutValue(...)` sequence the cache + workbook diverge.  Production producers (V3.5.0.4a napi `deleteSheet`) pre-validate sheet existence so they don't emit out-of-range RemoveSheet; the divergence is only reachable via malformed/manually-constructed logs.  Closure path for V3.5.1+: track sheet_count in the cache walker (incremented on `Op::AddSheet`) + gate `RemoveSheet` tombstoning on `id < sheet_count`.
+
+- **CLOSURE-CODEX-LOW-1 + LOW-2 (already fixed in parallel B-findings, 2026-05-24)**: my Lane B audit independently found the same issues (B-FINDING-3 + B-FINDING-1); both already shipped in engine `2691248c3aa` + IDE `3dbb4cfe05d` before Codex's transcript landed.  Codex's transcript acknowledges this in the cross-lane convergence notes.
+
+- **CLOSURE-CODEX-LOW-3 (PARTIAL CLOSE): regression coverage gaps.**  Added 4 more ql-collab tests (115/115; +4 over the 111 baseline): `put_formula_on_tombstoned_sheet_is_silently_dropped` + `clear_formula_on_tombstoned_sheet_is_silently_dropped` (extends tombstone-guard coverage to PutFormula + ClearFormula) + `valid_add_remove_sheet_then_cell_op_silent_dropped` (covers the canonical AddSheet -> RemoveSheet -> cell-op sequence that V3.5.0.4a deleteSheet napi exercises) + `redo_after_remote_interleave_falls_back_to_full_rebuild` (symmetric counterpart to the convergent-HIGH undo test).  Panel-level mocha for A-HIGH-3/4 still deferred to V3.5.1+ scope (vscode-test integration per V3.4.0.X Opus § F).
+
+- **CLOSURE-CODEX-LOW-4 (PARTIAL CLOSE): doc/hygiene drift.**  Fixed: removed_sheets docstring drift (claimed `invalidate_cell` consults the session set; actually uses a local set per the V3.5.0.X widened-closure design); command-layer comment that claimed "NO automatic panel re-render" was historically accurate but obsolete post-A-HIGH-3 (now reflects the refreshAll call); section-sign unicode in my-just-added source comments (lib.rs `// § 4.1.z5 contract` + session.rs `// Codex § 7` -- both replaced with ASCII).  NOT fixed: archive frontmatter `current_*` lines describe pre-closure state; pre-existing § characters in unrelated source comments (V3.x-era code).  These are deferred to V3.5.1+ backlog.
+
+**Backlog adds (V3.5.1+):**
+
+| ID | Description | Severity | Reason |
+|---|---|---|---|
+| CLOSURE-CODEX-MED-1 | Out-of-range RemoveSheet cache-vs-replay parity | MEDIUM | Contrived; production producers don't emit; V3.5.1+ adds sheet_count tracker in cache walker |
+| CLOSURE-CODEX-LOW-3 panel tests | vscode-test integration for A-HIGH-3/4 panel-level behavior | LOW | Verified via live smoke today; V3.5.1+ test-infrastructure investment |
+| CLOSURE-CODEX-LOW-4 docs | Archive frontmatter `current_*` lines + pre-existing § characters in unrelated source | LOW | Cosmetic doc hygiene |
+
+**Cumulative V3.5 test deltas post follow-up closure:**
+- ql-collab: 81 (V3.4.0.X baseline) -> 115 (+34 V3.5-specific cumulative): V3.5.0.5 +12 + V3.5.0.6 +13 + V3.5.0.X main +5 + V3.5.0.X follow-up +4.
+- IDE mocha: 254 (V3.4.0.X baseline) -> 346 (+92 V3.5-specific cumulative; V3.5.0.X follow-up added 0 since panel-level behavior is live-smoke-verified).
+- ql-collab-ws: 42 (V3.4.0.X baseline) -> 42 (unchanged).
+
+**V3.5 ALL SHIPPED + AUDITED.**  V3.5.0.X megaudit closure complete + Lane B follow-up shipped 3 in-cycle defensive corrections (B-1/B-3/B-6) + Codex Lane A follow-up shipped 3 in-cycle MED + 2 partial LOW closures (CODEX-MED-2/3/4 + LOW-3/4 partial).  V3.5 plan archived; MASTER-PLAN swept.
 
 ---
 

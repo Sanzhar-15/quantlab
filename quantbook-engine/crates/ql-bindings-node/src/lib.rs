@@ -1579,20 +1579,25 @@ impl CollabSession {
             // cache via collect_cache_effects.
             //
             // **V3.5.0.X audit-closure A-HIGH-2 (2026-05-24)**: formula
-            // TEXT is read from the REPAIRED Workbook (via `formula_at`)
-            // rather than from the unrepaired `last_snapshot` cache.
-            // Phase 5.3 step 3 `repair_sheet_rename_chain` rewrites
-            // formula references when a sheet is renamed; pre-closure
-            // this napi method discarded the rebuilt+repaired Workbook
-            // and serialized stale formula text from the cache, so the
-            // § 4.1.z5 contract (formulas surface with rename-repair)
-            // was violated.  Now: the cache's `state.formula` is the
-            // FALLBACK when the repaired Workbook has no formula for
-            // the cell (e.g., the cell's formula was cleared in the
-            // op log but the cache still has the post-clear ghost-
-            // entry None -- shouldn't happen post-V3.4.0.X MEDIUM-1
-            // closure, but defensive).  The repaired form wins when
-            // both are present.
+            // TEXT is read EXCLUSIVELY from the REPAIRED Workbook (via
+            // `formula_at`).  Phase 5.3 step 3 `repair_sheet_rename_chain`
+            // (+ table + column repair) rewrites formula references when
+            // a sheet/table/column is renamed; pre-closure this napi
+            // method discarded the rebuilt+repaired Workbook and
+            // serialized stale formula text from the cache, so the
+            // ide-consumer-contract.md 4.1.z5 contract (formulas surface
+            // with rename-repair) was violated.
+            //
+            // **V3.5.0.X follow-up audit CLOSURE-CODEX-MED-4 (2026-05-24)**:
+            // the prior closure version of this code used
+            // `repaired_formula.or(state.formula)` as a defensive
+            // fallback -- but that fallback could MASK a cache-vs-workbook
+            // divergence (in the normal case, both should agree post-
+            // V3.4.0.X MEDIUM-1 closure; a divergence indicates a bug
+            // somewhere).  Codex flagged the fallback as invariant-
+            // masking.  Now: use ONLY `repaired_formula` so any
+            // divergence surfaces as missing formula text in the IDE
+            // (rather than silently using the stale cache value).
             let cells: Vec<CellSnapshotJson> = inner
                 .snapshot_cells(sheet_id)
                 .into_iter()
@@ -1604,7 +1609,7 @@ impl CollabSession {
                         row,
                         col,
                         value: state.value.map(CellValueJson::from),
-                        formula: repaired_formula.or(state.formula),
+                        formula: repaired_formula,
                         // **V3.5.0.5 (2026-05-24)**: format passthrough
                         // from the V3.4.0.2 hybrid CellState extended with
                         // a `format: Option<FormatId>` field.  None ->
