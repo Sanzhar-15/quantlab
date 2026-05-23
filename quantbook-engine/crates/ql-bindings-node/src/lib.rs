@@ -613,6 +613,57 @@ impl CollabSession {
         Ok(inner.list_sheets_from_cache())
     }
 
+    /// **Phase 5.7 V3.4.0.3 (2026-05-23) -- undo the session's last
+    /// local op.**
+    ///
+    /// Thin wrapper over [`CoreCollabSession::undo`].  Returns `true`
+    /// if a Loro `UndoManager` stack item was consumed (inverse op
+    /// appended to the visible log) and `false` if the stack was
+    /// empty (caller's "Cmd-Z when nothing to undo" no-op).
+    ///
+    /// **Local-only** per the engine method's Loro `UndoManager`
+    /// contract: remote ops merged via `mergeBytes` / `pollRemote` are
+    /// NOT affected.  Presence updates are excluded from the undo
+    /// stack by construction (see `CollabSession::new`).
+    ///
+    /// **Cache invariant** (V3.3.0.X HIGH-1 closure carried + V3.4.0.2
+    /// CellState shape): on `consumed == true` the engine method
+    /// calls `rebuild_snapshot_cache` BEFORE auto-flush, so a
+    /// subsequent `exportSnapshot` reads the post-undo `CellState`
+    /// view atomically.  IDE consumers can follow `undo() == true`
+    /// with `exportSnapshot` without re-locking.
+    ///
+    /// **Auto-flush** (V3.5 V2 V2 + Codex M2 audit closure): triggers
+    /// per `setAutoFlushPolicy` ONLY when `consumed == true`.  An
+    /// empty-stack undo never attempts the flush -- a closed transport
+    /// cannot turn "nothing to undo" into a spurious
+    /// `[transport_closed]` error.
+    ///
+    /// # Errors
+    ///
+    /// - Whatever `CollabSessionError::kind()` returns from the engine
+    ///   layer (transport errors during the auto-flush after a
+    ///   consumed undo, op-log decode failures during rebuild, etc.).
+    ///   Mapped via `collab_session_error_to_napi`.
+    #[napi(js_name = "undo")]
+    pub fn undo(&self) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        inner.undo().map_err(collab_session_error_to_napi)
+    }
+
+    /// **Phase 5.7 V3.4.0.3 (2026-05-23) -- redo the last undone op.**
+    ///
+    /// Thin wrapper over [`CoreCollabSession::redo`].  Returns `true`
+    /// if a redo-stack item was consumed, `false` otherwise.
+    ///
+    /// **Cache + auto-flush + error semantics** mirror [`undo`] above;
+    /// the engine method's docstring is the canonical reference.
+    #[napi(js_name = "redo")]
+    pub fn redo(&self) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        inner.redo().map_err(collab_session_error_to_napi)
+    }
+
     /// Export a full snapshot of this session's op log.
     /// Mirrors `CollabSession::export_bytes`.
     #[napi(js_name = "exportBytes")]
