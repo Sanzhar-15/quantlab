@@ -98,6 +98,21 @@ export interface CollabAttachment {
 const POLL_REMOTE_INTERVAL_MS = 1000;
 
 /**
+ * **Phase 5.7 V3.5.0.7 (2026-05-24)** -- watchdog timeout for the
+ * mid-edit-render guard.  If a `presenceUpdate { typing: true }` is
+ * received but no matching `typing: false` arrives within this window,
+ * the `_presenceRepaintInFlight` flag auto-clears (covering the
+ * "user closed window mid-edit / panel hung / webview crashed without
+ * firing endEdit" edge cases).  30 seconds is generous for typical
+ * cell edits (Excel-class users finish a cell entry in <5s on average)
+ * but short enough that a stuck flag doesn't block merged-tick renders
+ * indefinitely.  Tunable; lower bound is whatever the longest
+ * legitimate edit might be (consider 60s if formula entry surfaces in
+ * user feedback).
+ */
+const PRESENCE_TYPING_WATCHDOG_MS = 30_000;
+
+/**
  * Render-then-edit webview panel that displays the given session's
  * cell snapshot for the given sheet.  The panel binds the session for
  * its lifetime -- the dispatcher commits via this session, `render()`
@@ -229,6 +244,12 @@ export class CellGridPanel {
 			// postMessage racing with disposal early-returns from the
 			// onError guard added at V3.2.d Opus MEDIUM-1 closure.
 			instance._disposed = true;
+			// **Phase 5.7 V3.5.0.7 (2026-05-24)** -- D5 / R-V3.4-3
+			// closure: cancel any pending presence-typing watchdog so
+			// the timer can't fire on a disposed panel.
+			// `setPresenceTyping(false)` handles both the flag-clear
+			// + the watchdog-cancel atomically.
+			instance.setPresenceTyping(false);
 			// V3.4.0.5b (2026-05-23): clear this peer's presence on
 			// panel dispose so remote peers see this peer's cursor
 			// disappear when the window closes.  Runs BEFORE
@@ -346,6 +367,57 @@ export class CellGridPanel {
 	 */
 	_disposed: boolean = false;
 
+	/**
+	 * **Phase 5.7 V3.5.0.7 (2026-05-24) -- D5 / R-V3.4-3 KNOWN-GAP closure.**
+	 *
+	 * Mid-edit-render guard.  Set to `true` when the LOCAL user is
+	 * mid-typing in a cell (per `presenceUpdate { typing: true }` from
+	 * the webview script's `beginEdit`); cleared on `typing: false`
+	 * (from `endEdit`, regardless of commit/cancel).
+	 *
+	 * Checked by {@link tickPollRemote} BEFORE calling `this.render()`
+	 * on a merged tick.  When `true`, the merged-tick render is SKIPPED
+	 * (logged but not executed); the next pollRemote tick (~1s later)
+	 * re-evaluates.  The merged op stays in the engine cache, so the
+	 * deferred render still surfaces the peer's change once the user
+	 * exits edit mode.
+	 *
+	 * **Why this exists**: V3.4.0.X Opus M2 reclassified R-V3.4-3 from
+	 * DEFERRED to KNOWN-GAP -- a host-driven `webview.html = ...`
+	 * rebuild during the user's mid-edit destroys the in-progress
+	 * `<input>` element (the cell editor).  Reproducible in two-window
+	 * collab smoke: window 1 mid-edit + window 2 commit -> window 1's
+	 * pollRemote-merged tick fires render() -> webview.html reassign
+	 * destroys the input.  V3.5.0.7 closes this gap host-side
+	 * (V3.3.0.4's `activeInput` guard was webview-side and only
+	 * protected the scroll handler).
+	 *
+	 * **Stuck-true mitigation**: the V3.5.0.7 ship relies on
+	 * dispose-time clearPresence + a defensive watchdog -- if a
+	 * `typing: true` is set but no matching `typing: false` arrives
+	 * within {@link PRESENCE_TYPING_WATCHDOG_MS} (30s), the flag
+	 * auto-clears.  Covers the "panel hung mid-edit; user closed window
+	 * with no commit/cancel" edge case.  Watchdog clears + re-firings
+	 * are observable via the output log.
+	 *
+	 * **Initialization**: `false` in the constructor; reset to `false`
+	 * in {@link show} (defensive, before render).  Cleared on dispose
+	 * via the `_disposed` short-circuit in `tickPollRemote`.
+	 *
+	 * pub-readonly so tests via test-fixture seams can inspect.
+	 */
+	_presenceRepaintInFlight: boolean = false;
+
+	/**
+	 * **Phase 5.7 V3.5.0.7 (2026-05-24)** -- watchdog handle for the
+	 * stuck-true mitigation.  Created when `_presenceRepaintInFlight`
+	 * transitions false -> true; cleared on the matching true -> false
+	 * transition OR on dispose.  Fires {@link PRESENCE_TYPING_WATCHDOG_MS}
+	 * after the flag goes true to auto-clear the flag (defensive
+	 * against missing `typing: false`).
+	 */
+	private presenceTypingWatchdog: ReturnType<typeof setTimeout> | undefined = undefined;
+
 	private constructor(
 		private readonly panel: vscode.WebviewPanel,
 		private readonly session: CollabSessionInstance,
@@ -356,6 +428,55 @@ export class CellGridPanel {
 		// dispose() flow can call disposeAttachment() consistently
 		// even if wireAttachment throws.
 		this.attachmentState = undefined;
+	}
+
+	/**
+	 * **Phase 5.7 V3.5.0.7 (2026-05-24)** -- atomic typing-flag setter.
+	 *
+	 * Wires the {@link _presenceRepaintInFlight} flag + the watchdog
+	 * timer together.  Called by the dispatcher's `presenceUpdate` arm
+	 * via {@link DispatchDeps.onLocalTyping}.
+	 *
+	 * - `typing: true`: set flag; arm a one-shot setTimeout that
+	 *   auto-clears the flag after {@link PRESENCE_TYPING_WATCHDOG_MS}.
+	 *   If a prior watchdog is pending, clear it first (the new
+	 *   true-write resets the deadline).  Stuck-true edge case
+	 *   (typing:true with no matching typing:false): the watchdog
+	 *   eventually auto-clears + logs a warning.
+	 * - `typing: false`: clear flag + cancel any pending watchdog.
+	 *
+	 * Idempotent: setting the same value twice is a no-op (the
+	 * watchdog deadline is reset on each true-write, which is harmless
+	 * if the value was already true).
+	 */
+	setPresenceTyping(typing: boolean): void {
+		// Always clear any pending watchdog first -- both transitions
+		// (true->true reset; true->false; false->false) want the prior
+		// timer cancelled before evaluating the new state.
+		if (this.presenceTypingWatchdog !== undefined) {
+			clearTimeout(this.presenceTypingWatchdog);
+			this.presenceTypingWatchdog = undefined;
+		}
+		this._presenceRepaintInFlight = typing;
+		if (typing) {
+			this.presenceTypingWatchdog = setTimeout(() => {
+				// Watchdog fired: typing:false never arrived.  Auto-
+				// clear + log via the attachment state's output channel
+				// if available (collab-attached panels only have the
+				// log channel; local panels just clear silently).
+				if (this._presenceRepaintInFlight) {
+					this._presenceRepaintInFlight = false;
+					this.presenceTypingWatchdog = undefined;
+					const state = this.attachmentState;
+					if (state !== undefined && !state.disposed) {
+						state.log.appendLine(
+							`[collab] presenceRepaintInFlight watchdog fired after ${PRESENCE_TYPING_WATCHDOG_MS}ms; ` +
+							`auto-cleared (typing:false never arrived; merged-tick renders will resume).`,
+						);
+					}
+				}
+			}, PRESENCE_TYPING_WATCHDOG_MS);
+		}
 	}
 
 	/**
@@ -469,6 +590,19 @@ export class CellGridPanel {
 				}
 				void this.panel.webview.postMessage(reply);
 			},
+			// **Phase 5.7 V3.5.0.7 (2026-05-24)** -- D5 / R-V3.4-3
+			// closure: dispatch's presenceUpdate arm fires this
+			// callback on the LOCAL peer's typing transitions.  Routed
+			// to setPresenceTyping which wires the flag + watchdog.
+			// Dispose check: skip if the panel is disposed (a
+			// late-arriving presenceUpdate after dispose shouldn't
+			// arm a watchdog on a dead panel).
+			onLocalTyping: typing => {
+				if (this._disposed) {
+					return;
+				}
+				this.setPresenceTyping(typing);
+			},
 		});
 	}
 
@@ -522,6 +656,29 @@ export class CellGridPanel {
 			case 'idle':
 				return;
 			case 'merged':
+				// **Phase 5.7 V3.5.0.7 (2026-05-24)** -- D5 / R-V3.4-3
+				// closure: skip the merged-tick render when the local
+				// user is mid-editing a cell.  Without this skip, the
+				// `this.render()` call below would reassign
+				// `this.panel.webview.html`, destroying the in-progress
+				// `<input>` element (the cell editor).  The merged op
+				// stays in the engine's last_snapshot cache (it was
+				// merged via mergeBytes/pollRemote into the LoroDoc
+				// before classifyPollTick returned 'merged'), so the
+				// next pollRemote tick (~1s after typing:false) picks
+				// up the deferred render.
+				//
+				// Watchdog mitigates the stuck-true edge case (panel
+				// hung mid-edit / window closed without endEdit);
+				// PRESENCE_TYPING_WATCHDOG_MS auto-clears after 30s.
+				if (this._presenceRepaintInFlight) {
+					state.log.appendLine(
+						`[collab] pollRemote merged ${result.count} remote blob(s); ` +
+						`SKIPPING render (presenceRepaintInFlight; local user mid-edit). ` +
+						`Will retry on next tick.`,
+					);
+					return;
+				}
 				state.log.appendLine(`[collab] pollRemote merged ${result.count} remote blob(s); re-rendering`);
 				// V3.2.d Codex M3 closure (2026-05-22): wrap render()
 				// in try/catch.  exportCellSnapshot can throw at the

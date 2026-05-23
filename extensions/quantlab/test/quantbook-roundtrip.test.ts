@@ -5589,4 +5589,163 @@ suite('quantbook V3.5.0.5 -- workbookSnapshot format passthrough (no write-path 
 	});
 });
 
+// ============================================================================
+// Phase 5.7 V3.5.0.7 (2026-05-24) -- mid-edit-render guard
+//   (D5 / R-V3.4-3 KNOWN-GAP closure)
+// ============================================================================
+// Tests the dispatcher-level `onLocalTyping` callback firing behavior.
+// The host-level `_presenceRepaintInFlight` flag + watchdog timer + tickPoll
+// skip live on CellGridPanel (which depends on vscode); those are covered
+// by the live smoke procedure in § 4.1.z5.  This suite pins the
+// vscode-free contract: dispatcher fires onLocalTyping with the right
+// boolean at the right time, and DOESN'T fire on validation/engine
+// failures.
+
+suite('quantbook V3.5.0.7 -- presenceUpdate fires onLocalTyping (mid-edit-render guard contract)', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	function makeDeps(session: CollabSessionInstance, sheet: number) {
+		const typingHistory: boolean[] = [];
+		const errorReplies: ErrorReplyMessage[] = [];
+		let commitCount = 0;
+		const deps = {
+			session,
+			sheet,
+			onCommit: () => { commitCount += 1; },
+			onError: (reply: ErrorReplyMessage) => { errorReplies.push(reply); },
+			onLocalTyping: (typing: boolean) => { typingHistory.push(typing); },
+		};
+		return { deps, typingHistory, errorReplies, getCommitCount: () => commitCount };
+	}
+
+	function validPresenceState(typing: boolean) {
+		return {
+			sheet: 0,
+			row: 0,
+			col: 0,
+			selectionEndRow: 0,
+			selectionEndCol: 0,
+			typing,
+		};
+	}
+
+	test('presenceUpdate typing:true -> onLocalTyping(true) fires once', () => {
+		const session = createSession(8201n);
+		const { deps, typingHistory } = makeDeps(session, 0);
+		dispatchIncomingMessage({ type: 'presenceUpdate', state: validPresenceState(true) }, deps);
+		assert.deepStrictEqual(typingHistory, [true],
+			'onLocalTyping fires once with true on successful typing:true presenceUpdate');
+	});
+
+	test('presenceUpdate typing:false -> onLocalTyping(false) fires once', () => {
+		const session = createSession(8202n);
+		const { deps, typingHistory } = makeDeps(session, 0);
+		dispatchIncomingMessage({ type: 'presenceUpdate', state: validPresenceState(false) }, deps);
+		assert.deepStrictEqual(typingHistory, [false],
+			'onLocalTyping fires once with false on successful typing:false presenceUpdate');
+	});
+
+	test('sequence true -> false -> true -> false reflects in history', () => {
+		const session = createSession(8203n);
+		const { deps, typingHistory } = makeDeps(session, 0);
+		dispatchIncomingMessage({ type: 'presenceUpdate', state: validPresenceState(true) }, deps);
+		dispatchIncomingMessage({ type: 'presenceUpdate', state: validPresenceState(false) }, deps);
+		dispatchIncomingMessage({ type: 'presenceUpdate', state: validPresenceState(true) }, deps);
+		dispatchIncomingMessage({ type: 'presenceUpdate', state: validPresenceState(false) }, deps);
+		assert.deepStrictEqual(typingHistory, [true, false, true, false]);
+	});
+
+	test('shape-validation failure (missing state) -> NO onLocalTyping fire', () => {
+		const session = createSession(8204n);
+		const { deps, typingHistory, errorReplies } = makeDeps(session, 0);
+		dispatchIncomingMessage({ type: 'presenceUpdate' }, deps);  // no state
+		assert.strictEqual(typingHistory.length, 0,
+			'onLocalTyping must NOT fire when shape validation rejects (engine never saw the state)');
+		assert.strictEqual(errorReplies.length, 1);
+		assert.strictEqual(errorReplies[0].code, 'bad_argument');
+	});
+
+	test('shape-validation failure (typing missing) -> NO onLocalTyping fire', () => {
+		const session = createSession(8205n);
+		const { deps, typingHistory, errorReplies } = makeDeps(session, 0);
+		dispatchIncomingMessage({
+			type: 'presenceUpdate',
+			state: { sheet: 0, row: 0, col: 0, selectionEndRow: 0, selectionEndCol: 0 },  // no typing
+		}, deps);
+		assert.strictEqual(typingHistory.length, 0,
+			'onLocalTyping must NOT fire when typing field is missing from envelope');
+		assert.strictEqual(errorReplies.length, 1);
+	});
+
+	test('numeric-validation failure (NaN row) -> NO onLocalTyping fire', () => {
+		const session = createSession(8206n);
+		const { deps, typingHistory, errorReplies } = makeDeps(session, 0);
+		dispatchIncomingMessage({
+			type: 'presenceUpdate',
+			state: { sheet: 0, row: NaN, col: 0, selectionEndRow: 0, selectionEndCol: 0, typing: true },
+		}, deps);
+		assert.strictEqual(typingHistory.length, 0,
+			'onLocalTyping must NOT fire when numeric validation rejects');
+		assert.strictEqual(errorReplies.length, 1);
+		assert.strictEqual(errorReplies[0].code, 'bad_argument');
+	});
+
+	test('onLocalTyping optional -- omitting it does NOT crash the dispatcher', () => {
+		// Backward-compat: V3.4.0.X + V3.5.0.5 tests don't pass onLocalTyping.
+		const session = createSession(8207n);
+		const errorReplies: ErrorReplyMessage[] = [];
+		const deps = {
+			session,
+			sheet: 0,
+			onCommit: () => {},
+			onError: (reply: ErrorReplyMessage) => { errorReplies.push(reply); },
+			// no onLocalTyping
+		};
+		// Should not throw.
+		dispatchIncomingMessage({ type: 'presenceUpdate', state: validPresenceState(true) }, deps);
+		assert.strictEqual(errorReplies.length, 0, 'success path: no error reply');
+	});
+
+	test('engine-throw path -- NO onLocalTyping fire (state never reached engine successfully)', () => {
+		// Hard to trigger a real engine throw on updatePresence from the
+		// IDE side without a corrupt session.  Use a synthetic session
+		// proxy that throws on updatePresence.  This pins the contract:
+		// onLocalTyping fires ONLY when updatePresence succeeds.
+		const realSession = createSession(8208n);
+		const throwingSession = new Proxy(realSession, {
+			get(target, prop, receiver) {
+				if (prop === 'updatePresence') {
+					return () => {
+						throw new Error('[session_oplog] simulated engine failure');
+					};
+				}
+				return Reflect.get(target, prop, receiver);
+			},
+		}) as CollabSessionInstance;
+		const { deps, typingHistory, errorReplies } = makeDeps(throwingSession, 0);
+		dispatchIncomingMessage({ type: 'presenceUpdate', state: validPresenceState(true) }, deps);
+		assert.strictEqual(typingHistory.length, 0,
+			'onLocalTyping must NOT fire when updatePresence throws (host flag stays in sync with engine state)');
+		assert.strictEqual(errorReplies.length, 1);
+		assert.strictEqual(errorReplies[0].code, 'session_oplog');
+		assert.ok(errorReplies[0].message.includes('[presenceUpdate]'),
+			'error prefix includes [presenceUpdate]');
+	});
+
+	test('non-presenceUpdate message types do NOT fire onLocalTyping', () => {
+		// Sanity: putValue / unknown types must not accidentally trigger
+		// the typing callback.
+		const session = createSession(8209n);
+		const { deps, typingHistory } = makeDeps(session, 0);
+		addSheet(session, 'S');
+		dispatchIncomingMessage({ type: 'putValue', sheet: 0, row: 0, col: 0, raw: '42' }, deps);
+		dispatchIncomingMessage({ type: 'unknown' }, deps);
+		assert.strictEqual(typingHistory.length, 0,
+			'only presenceUpdate (after both validations) fires onLocalTyping');
+	});
+});
+
 

@@ -187,6 +187,19 @@ export interface DispatchDeps {
 	readonly sheet: number;
 	readonly onCommit: () => void;
 	readonly onError: (reply: ErrorReplyMessage) => void;
+	/**
+	 * **Phase 5.7 V3.5.0.7 (2026-05-24)** -- mid-edit-render guard
+	 * callback.  Fired on `presenceUpdate` arm IFF the envelope passes
+	 * runtime validation (shape + numeric) AND the engine's
+	 * `updatePresence` succeeds.  `typing: true` -> host sets the
+	 * `_presenceRepaintInFlight` flag (skips merged-tick renders
+	 * until typing:false); `typing: false` -> host clears the flag
+	 * (renders resume).  Optional for backward compat with tests that
+	 * don't care about the guard (V3.4.0.X tests + V3.5.0.5 tests
+	 * predate the field); when omitted, the dispatcher just doesn't
+	 * fire it.
+	 */
+	readonly onLocalTyping?: (typing: boolean) => void;
 }
 
 /**
@@ -318,6 +331,21 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 		}
 		try {
 			deps.session.updatePresence(s);
+			// **Phase 5.7 V3.5.0.7 (2026-05-24)** -- D5 / R-V3.4-3
+			// closure: fire onLocalTyping AFTER updatePresence succeeds
+			// so the host-side `_presenceRepaintInFlight` flag stays in
+			// sync with the engine's presence state.  If updatePresence
+			// throws (engine-level failure), we DON'T toggle the host
+			// flag (the engine never received the state; the webview
+			// would see the stale prior presence; the host should
+			// match).  Validation failures above ALSO bypass this fire.
+			//
+			// Only the LOCAL peer's presenceUpdate (typing field) maps
+			// to the host flag.  Remote peers' typing state is observed
+			// via the per-cell `data-peer` decoration in the webview
+			// (V3.4.0.5b) -- their typing does NOT block this panel's
+			// merged-tick render.
+			deps.onLocalTyping?.(s.typing);
 			// Intentional: no onCommit().  See block comment above.
 			return;
 		} catch (err) {
