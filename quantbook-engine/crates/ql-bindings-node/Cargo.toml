@@ -61,6 +61,21 @@ ql-collab    = { path = "../ql-collab" }
 ql-collab-ws = { path = "../ql-collab-ws" }
 ql-oplog     = { path = "../ql-oplog" }
 ql-types     = { path = "../ql-types" }
+# **Phase 5.7 V3.4.0.4a (2026-05-23):** .qbook persistence napi
+# wrappers (`toQbook` / `fromQbook`) delegate to ql-io's
+# `save_workbook_with_oplog` + `load_workbook_with_oplog` (Phase 2A.8
+# v2 envelope format).  The save path requires a fully-rebuilt
+# `Workbook`, so the napi `to_qbook` impl calls
+# `inner.rebuild_workbook(&default_registry())` internally -- adding
+# `ql-functions` (for `default_registry`) + `ql-storage` (for the
+# `Workbook` type) alongside `ql-io` (for the serializer).  Engine-side
+# `rebuild_workbook` usage at the napi layer is permitted at V3.4 per
+# V3.4.0.1 scope-discovery (V3.4.0.4 plan note); IDE-side `Workbook`
+# consumption stays V3.5+ -- the rebuilt Workbook never crosses the
+# FFI boundary, it's only used as the save serializer's input.
+ql-io        = { path = "../ql-io" }
+ql-functions = { path = "../ql-functions" }
+ql-storage   = { path = "../ql-storage" }
 
 # **V2.4 (2026-05-22):** `parking_lot::Mutex` for the `Arc<Mutex<CoreCollabSession>>`
 # refactor that closes V2.3's `&mut self` async aliasing UB hazard. Faster

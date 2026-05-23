@@ -1,4 +1,4 @@
-//! `ql-bindings-node` — VS Code extension binding (Phase 5.7 V1).
+//! `ql-bindings-node` -- VS Code extension binding (Phase 5.7 V1).
 //!
 //! **Phase 5.7 V1 (2026-05-22, this ship):** binds `CollabSession` for the
 //! quantlab VS Code fork's extension host. Replaces the Phase-6+ reserved
@@ -18,13 +18,13 @@
 //!     than copying.
 //!   - panic safety: **napi-rs 3.x does NOT wrap entry points in
 //!     `catch_unwind` by default** (Phase 5.7 V1 audit Codex H1 +
-//!     Opus H3, 2026-05-22 — verified by reading napi-derive-backend
+//!     Opus H3, 2026-05-22 -- verified by reading napi-derive-backend
 //!     5.0.4 `src/codegen/fn.rs:217-240`: the wrap is gated on
 //!     `#[napi(catch_unwind)]` opt-in). The V1 binding does NOT use
-//!     `catch_unwind` — instead, every `#[napi]` method
+//!     `catch_unwind` -- instead, every `#[napi]` method
 //!     pre-validates inputs that could trigger engine-side `assert_*!`,
 //!     `panic!`, `unwrap`, or `expect`. Smoke caught one such hazard
-//!     (PeerId(0) → `CollabSession::new`'s `assert_ne!(peer, 0)` →
+//!     (PeerId(0) -> `CollabSession::new`'s `assert_ne!(peer, 0)` ->
 //!     Node abort "failed to initiate panic, error 5"); the
 //!     `peer_id_from_bigint` helper now pre-rejects 0. V2+ each new
 //!     `#[napi]` method MUST sweep the engine for FFI-reachable
@@ -58,7 +58,7 @@
 //! demo, undo/redo (UndoGroupGuard RAII translation), presence
 //! (PresenceState shape), full Op enum (beyond PutValue),
 //! Format/D-1 (FormatId enum), `rebuild_workbook` (D-3
-//! production-visible closure — Phase 5.7 V3), `discard_pending_ops`,
+//! production-visible closure -- Phase 5.7 V3), `discard_pending_ops`,
 //! `.qbook` persistence import/export, `#[napi(catch_unwind)]` opt-in
 //! for defense in depth, SharedArrayBuffer defensive copy, BigInt
 //! return for `opCount`/`pendingOpCount`/`mergeBytes`,
@@ -74,7 +74,7 @@
 //! from `inner: CoreCollabSession` to `inner: Arc<parking_lot::Mutex<CoreCollabSession>>`
 //! as the closure for V2.3 audit's HIGH-1 (Rust UB via napi `&mut self`
 //! async re-entry). The Arc<Mutex> composition adds Sync via interior
-//! mutability — multiple shared `&CollabSession` references are sound;
+//! mutability -- multiple shared `&CollabSession` references are sound;
 //! mutation flows through the Mutex.
 //!
 //! **Compile-asserted proof** (lib.rs near end of file): both Send AND
@@ -94,7 +94,7 @@
 //! **V2.5 (2026-05-22): V8-block hazard CLOSED** (Opus V2.4 HIGH-1).
 //!
 //! The V2.4 binding pattern held `self.inner.lock()` across the
-//! `spawn_blocking` Condvar wait — concurrent JS sync method calls
+//! `spawn_blocking` Condvar wait -- concurrent JS sync method calls
 //! blocked the V8 event loop on lock acquisition. V2.5 refactored
 //! `flushPendingToTransport` to extract a detached `FlushAck`
 //! handle (via `ql_collab::CollabSession::flush_pending_handle`)
@@ -114,7 +114,7 @@
 //! required today. Concurrent session method calls during a pending
 //! `flushPendingToTransport` are sound + non-blocking. The V2.6
 //! contract test (`flushPendingToTransport does NOT block sync
-//! methods on the same session`) empirically pins this — opCount
+//! methods on the same session`) empirically pins this -- opCount
 //! during a 1000ms-blocked flush returned in <50ms on local dev.
 
 #![deny(clippy::all)]
@@ -133,6 +133,8 @@ use ql_collab::LoopbackTransport;
 use ql_collab::PresenceState as CorePresenceState;
 use ql_collab::Transport as CoreTransport;
 use ql_collab::TransportError;
+use ql_functions::default_registry;
+use ql_io::oplog_persistence::{load_workbook_with_oplog, save_workbook_with_oplog, PersistenceError};
 use ql_collab_ws::WebSocketError;
 use ql_collab_ws::WebSocketTransport;
 use ql_oplog::CellWireValue;
@@ -190,19 +192,19 @@ fn validate_u32_index(method: &str, name: &str, value: f64) -> Result<u32> {
 
 /// Helper: convert a JS `BigInt` to `PeerId` with explicit rejection of
 /// FIVE failure modes:
-///   - negative BigInt (signed bit set) — PeerId is u64-domain
+///   - negative BigInt (signed bit set) -- PeerId is u64-domain
 ///   - BigInt doesn't fit in u64 (lossless = false)
-///   - `peer_id == 0` — Loro's LEGACY_PEER sentinel; rejected with a
+///   - `peer_id == 0` -- Loro's LEGACY_PEER sentinel; rejected with a
 ///     PROACTIVE check here (the engine's `CollabSession::new` would
 ///     hit `assert_ne!` and panic, which napi-rs 3.x doesn't reliably
-///     catch into a JS exception — observed during V1 smoke test:
+///     catch into a JS exception -- observed during V1 smoke test:
 ///     "failed to initiate panic, error 5, aborting"). Pre-validate
 ///     in the FFI boundary to keep Node alive.
-///   - `peer_id == u64::MAX` — Loro's `PeerID::MAX` sentinel (verified
+///   - `peer_id == u64::MAX` -- Loro's `PeerID::MAX` sentinel (verified
 ///     via Loro 1.12 `loro-internal-1.12.0/src/loro.rs:184`:
 ///     `if peer == PeerID::MAX { return Err(...) }`). Loro returns a
 ///     CLEAN `Err` here (not a panic), so the FFI boundary is intact
-///     either way — but pre-rejecting at the binding gives a faster
+///     either way -- but pre-rejecting at the binding gives a faster
 ///     failure and a consistent error message paired with the
 ///     `peer_id == 0` case.
 ///
@@ -252,7 +254,7 @@ fn peer_id_from_bigint(peer_id: &BigInt) -> Result<PeerId> {
 }
 
 // ============================================================
-// Phase 5.7 V2.7 (2026-05-22) — error-code discrimination helpers
+// Phase 5.7 V2.7 (2026-05-22) -- error-code discrimination helpers
 // ============================================================
 //
 // Closes V2.1+V2.2+V2.3 Opus MEDIUM-3 carryforwards: every engine
@@ -308,6 +310,33 @@ fn transport_error_to_napi(e: TransportError) -> Error {
 /// rejection path.
 fn websocket_error_to_napi(e: WebSocketError) -> Error {
     Error::from_reason(format!("[{}] {e}", e.kind()))
+}
+
+/// **Phase 5.7 V3.4.0.4a (2026-05-23)**: map a [`PersistenceError`] to
+/// a napi [`Error`] with a kind-prefixed message.  The
+/// [`PersistenceError`] variants don't have a `kind()` accessor like
+/// [`CollabSessionError`] does; this mapper picks a stable code per
+/// variant that the IDE-side `parseQuantbookError` can switch on.
+///
+/// Codes:
+/// - `qbook_error`           -- workbook persistence layer (I/O, schema, malformed cell)
+/// - `session_oplog`         -- op-log Loro snapshot decode (matches existing
+///                              `CollabSessionError::OpLog` code for symmetry)
+/// - `qbook_unsupported_version` -- `oplog.bin` schema version out of band
+/// - `qbook_truncated_header`    -- `oplog.bin` magic-prefix present but header < 8 bytes
+fn persistence_error_to_napi(e: PersistenceError) -> Error {
+    // `PersistenceError` is `#[non_exhaustive]`; the wildcard arm is
+    // required to keep the match exhaustive across future ql-io
+    // schema additions.  Future variants surface as `qbook_unknown`
+    // until this mapper is updated.
+    let code = match &e {
+        PersistenceError::Qbook(_) => "qbook_error",
+        PersistenceError::OpLog(_) => "session_oplog",
+        PersistenceError::OplogUnsupportedVersion { .. } => "qbook_unsupported_version",
+        PersistenceError::OplogTruncatedHeader { .. } => "qbook_truncated_header",
+        _ => "qbook_unknown",
+    };
+    Error::from_reason(format!("[{code}] {e}"))
 }
 
 /// **V2.7 audit closure (Opus MEDIUM-2, 2026-05-22)**: prefix napi-
@@ -418,7 +447,7 @@ impl CollabSession {
     /// Construct a fresh session for the given peer.
     ///
     /// **Failure modes**: `peerId == 0` is rejected by the underlying
-    /// engine (PeerId sentinel — Loro reserves the 0 value). napi-rs
+    /// engine (PeerId sentinel -- Loro reserves the 0 value). napi-rs
     /// surfaces engine errors as JS `Error` exceptions.
     #[napi(constructor)]
     pub fn new(peer_id: BigInt) -> Result<Self> {
@@ -454,10 +483,10 @@ impl CollabSession {
     /// callers could bypass. The Phase 5.7 V1 megaudit (Codex HIGH,
     /// 2026-05-22) flagged this as a real hazard: any consumer skipping
     /// the wrapper hit ECMAScript `ToUint32` for `u32` row/col args:
-    ///   - `-1` → `0xFFFFFFFF` (silent wrap to u32::MAX)
-    ///   - `NaN` → `0` (silent coercion)
-    ///   - `Infinity` → `0` (silent coercion)
-    ///   - `2.5` → `2` (silent floor-toward-zero)
+    ///   - `-1` -> `0xFFFFFFFF` (silent wrap to u32::MAX)
+    ///   - `NaN` -> `0` (silent coercion)
+    ///   - `Infinity` -> `0` (silent coercion)
+    ///   - `2.5` -> `2` (silent floor-toward-zero)
     ///
     /// **Closure**: the `row` and `col` parameters are now `f64`
     /// (raw JS Number, NOT ToUint32-coerced via napi-rs's
@@ -468,17 +497,53 @@ impl CollabSession {
     ///   - in u32 range (≤ `u32::MAX`)
     /// then cast to `u32`. Any failure surfaces a precise JS Error.
     ///
-    /// `sheet: u16` stays as-is — u16's `try_into::<u16>()` correctly
+    /// `sheet: u16` stays as-is -- u16's `try_into::<u16>()` correctly
     /// rejects out-of-range values from ToUint32, so the asymmetric
     /// safety (Opus audit H2 finding) doesn't apply at u16.
     ///
-    /// `value: f64` is already raw (Number → double, no coercion);
+    /// `value: f64` is already raw (Number -> double, no coercion);
     /// validate finiteness here too (NaN/Infinity rejection).
     ///
     /// The TS-side `appendPutValueValidated` wrapper becomes
-    /// defense-in-depth — it fails earlier with friendlier messages
+    /// defense-in-depth -- it fails earlier with friendlier messages
     /// but the engine-side validation is the load-bearing contract
     /// for direct callers.
+    /// **Phase 5.7 V3.4.0.4a (2026-05-23) -- append an `Op::AddSheet`
+    /// to this session.**
+    ///
+    /// Sheet ids are deterministic + assigned by the engine on replay
+    /// in op-log append order (the producer does NOT pin the id in the
+    /// op).  Append order = id-assignment order: first `addSheet` call
+    /// creates sheet 0, second creates sheet 1, etc.
+    ///
+    /// **Why surfaced at V3.4.0.4a (engine napi for .qbook persistence)**:
+    /// `CollabSession.rebuild_workbook` (called internally by
+    /// `to_qbook`) replays the op log into a fresh `Workbook`, and
+    /// `Op::PutValue { sheet, ... }` replay REQUIRES the sheet to
+    /// already exist.  Without an `addSheet` napi, sessions built
+    /// purely via `appendPutValue` could not be saved (rebuild_workbook
+    /// would fail with `session_replay -- invalid sheet`).  This
+    /// minimal wrapper closes the gap; V3.5+ may expose a richer Op
+    /// surface (RenameSheet, DeleteSheet, etc.).
+    ///
+    /// `chunkRows` is the per-sheet row partition size for the
+    /// Workbook's internal storage (Phase 2A optimization for
+    /// multi-million-cell scaling).  Pass a sane default (e.g., 1000)
+    /// at V3.4.0.4a scale; V3.5+ may surface this as a configurable.
+    ///
+    /// # Errors
+    ///
+    /// - Engine kind-prefixed (`session_oplog` for op-log append
+    ///   failure; `session_replay` would NOT fire here -- replay
+    ///   happens at rebuild_workbook time, not append time).
+    #[napi(js_name = "addSheet")]
+    pub fn add_sheet(&self, name: String, chunk_rows: u32) -> Result<()> {
+        let op = Op::AddSheet { name, chunk_rows };
+        let mut inner = self.inner.lock();
+        inner.append_op(op).map_err(collab_session_error_to_napi)?;
+        Ok(())
+    }
+
     #[napi(js_name = "appendPutValue")]
     pub fn append_put_value(&self, sheet: u16, row: f64, col: f64, value: f64) -> Result<()> {
         // Validate row + col: finite, non-negative, integer, in u32 range.
@@ -501,7 +566,7 @@ impl CollabSession {
         Ok(())
     }
 
-    /// **Phase 5.7 V3.2.a (2026-05-22) — cell-snapshot export for the IDE grid widget.**
+    /// **Phase 5.7 V3.2.a (2026-05-22) -- cell-snapshot export for the IDE grid widget.**
     ///
     /// Returns a JSON-serialized snapshot of the latest `PutValue`
     /// per `(row, col)` on the requested sheet. The IDE-side cell-
@@ -855,6 +920,125 @@ impl CollabSession {
             .collect())
     }
 
+    /// **Phase 5.7 V3.4.0.4a (2026-05-23) -- save this session to a
+    /// `.qbook` directory at `path`.**
+    ///
+    /// Atomic two-file write (workbook.toml + oplog.bin) via
+    /// [`ql_io::oplog_persistence::save_workbook_with_oplog`].  The
+    /// .qbook directory uses the Tier D3 envelope format (workbook
+    /// envelope at v2 per Phase 2A.8; oplog.bin wrapped in the
+    /// Quantlab magic-prefix + schema-version header per D-1 step 7).
+    ///
+    /// **Internal `rebuild_workbook` routing** (V3.4.0.4 plan scope):
+    /// the persistence helper requires a fully-rebuilt `Workbook`,
+    /// so this method calls `inner.rebuild_workbook(&default_registry())`
+    /// internally.  The Workbook NEVER crosses the FFI boundary --
+    /// it's a write-only serializer input.  IDE-side Workbook
+    /// consumption stays V3.5+ scope.
+    ///
+    /// **Workbook name**: hardcoded as `"quantbook"` at V3.4.0.4a.
+    /// V3.4.0.4b IDE commands may pass a user-chosen name (e.g.,
+    /// derived from the filename).
+    ///
+    /// # Atomicity
+    ///
+    /// `save_workbook_with_oplog` writes to a temp directory + renames
+    /// atomically; readers cannot observe a partial workbook.  See
+    /// `ql_io::qbook_format::save_workbook_extending` docstring for
+    /// the full atomic-rename protocol.
+    ///
+    /// # Errors
+    ///
+    /// - `[session_oplog]` if `rebuild_workbook` fails (replay error,
+    ///   rename-repair failure, etc.).
+    /// - `[qbook_error]` if the persistence layer fails (I/O, schema
+    ///   violation, malformed cell).
+    /// - `[session_oplog]` if the Loro snapshot encode fails inside
+    ///   `save_workbook_with_oplog`.
+    #[napi(js_name = "toQbook")]
+    pub fn to_qbook(&self, path: String) -> Result<()> {
+        let inner = self.inner.lock();
+        let registry = default_registry();
+        let (workbook, _report) = inner
+            .rebuild_workbook(&registry)
+            .map_err(collab_session_error_to_napi)?;
+        save_workbook_with_oplog(
+            &workbook,
+            inner.op_log(),
+            "quantbook",
+            std::path::Path::new(&path),
+        )
+        .map_err(persistence_error_to_napi)?;
+        Ok(())
+    }
+
+    /// **Phase 5.7 V3.4.0.4a (2026-05-23) -- load a session from a
+    /// `.qbook` directory at `path`.**
+    ///
+    /// Reads workbook.toml + oplog.bin via
+    /// [`ql_io::oplog_persistence::load_workbook_with_oplog`].
+    /// Reconstructs a `CollabSession` rooted at the loaded op log via
+    /// [`CoreCollabSession::from_snapshot`] (which rebuilds the
+    /// V3.3.0.3 incremental snapshot cache from the imported log per
+    /// the field-docstring contract).
+    ///
+    /// **PeerId derivation (V3.4.0.1 D5 scope)**: caller MUST pass
+    /// `peer_id_override` -- a fresh BigInt for "first open of this
+    /// workbook by this user", OR a stored-previously BigInt for
+    /// "rejoin with same identity".  V3.4.0.4a engine layer is
+    /// peer-id-agnostic; V3.4.0.4b IDE commands generate UUID-derived
+    /// BigInts via `crypto.randomUUID()` and stash them per-workbook
+    /// (location TBD; vscode workspaceState OR `.qbook`-sibling
+    /// sidecar file).  This avoids the D5 envelope v3 bump while
+    /// still achieving cross-restart collision-resistance.
+    ///
+    /// **`peer_id_override` MUST be non-zero** (LEGACY_PEER sentinel
+    /// per `CollabSession::from_snapshot` precondition).  Per
+    /// `peer_id_from_bigint`, zero/negative/over-u64 inputs surface
+    /// as `[bad_argument]` errors.
+    ///
+    /// **Loaded Workbook discarded**: the napi factory doesn't
+    /// expose the `Workbook` (V3.5+ scope).  Only the op log
+    /// reconstruction matters for V3.4.0.4a -- the rebuilt cache
+    /// answers all V3.3+ IDE consumer queries (exportSnapshot,
+    /// listSheets, etc.) without needing the Workbook.
+    ///
+    /// # Errors
+    ///
+    /// - `[bad_argument]` if `peer_id_override` is zero / negative /
+    ///   exceeds u64.
+    /// - `[qbook_error]` if workbook.toml is missing / malformed /
+    ///   schema mismatch.
+    /// - `[qbook_error]` with `MissingFile` payload if `oplog.bin` is
+    ///   absent (this method requires both files per V3.4.0.4a
+    ///   contract; the no-fallbacks rule surfaces the absence).
+    /// - `[qbook_unsupported_version]` / `[qbook_truncated_header]`
+    ///   for `oplog.bin` Tier D3 header issues.
+    /// - `[session_oplog]` if Loro can't decode the snapshot bytes.
+    #[napi(factory, js_name = "fromQbook")]
+    pub fn from_qbook(path: String, peer_id_override: BigInt) -> Result<Self> {
+        let pid = peer_id_from_bigint(&peer_id_override)?;
+        let (_workbook, oplog) = load_workbook_with_oplog(std::path::Path::new(&path))
+            .map_err(persistence_error_to_napi)?;
+        // Round-trip via export_bytes -> from_snapshot.  This pays a
+        // double-Loro-serialization cost (load decodes; export re-
+        // encodes; from_snapshot re-decodes).  At V3.4.0.4a scale
+        // (workbook open is a user-initiated op, ~1/minute max),
+        // the cost is irrelevant.  V3.4.1+ could add a
+        // `CollabSession::from_oplog(peer_id, oplog: OpLog)` factory
+        // that bypasses the round-trip if profiling justifies, but
+        // it would require lifting the LoroDoc-set-peer-id concern
+        // through a new API surface -- avoided here for simplicity.
+        let bytes = oplog
+            .export_bytes()
+            .map_err(|e| persistence_error_to_napi(PersistenceError::OpLog(e)))?;
+        let session = CoreCollabSession::from_snapshot(pid, &bytes)
+            .map_err(collab_session_error_to_napi)?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(session)),
+        })
+    }
+
     /// Export a full snapshot of this session's op log.
     /// Mirrors `CollabSession::export_bytes`.
     #[napi(js_name = "exportBytes")]
@@ -883,7 +1067,7 @@ impl CollabSession {
     /// If the underlying buffer is a `SharedArrayBuffer`, another
     /// Worker thread could mutate the bytes WHILE Loro's deserializer
     /// is reading them. V1 assumption: callers pass non-SAB
-    /// `Uint8Array`s (which the V1 IDE demo does — `exportBytes`
+    /// `Uint8Array`s (which the V1 IDE demo does -- `exportBytes`
     /// returns a plain `Vec<u8>`-backed Uint8Array). V2 will add a
     /// defensive `to_vec()` copy at the FFI boundary OR a SAB-detect
     /// path via `napi_get_arraybuffer_info` (Codex H2 + Opus M3
@@ -892,7 +1076,7 @@ impl CollabSession {
     /// # u32 clamp on overflow
     ///
     /// Return type is `u32`. If the post-merge `op_count` exceeds
-    /// `u32::MAX` (≈4 billion ops), the value is silently CLAMPED to
+    /// `u32::MAX` (~=4 billion ops), the value is silently CLAMPED to
     /// `u32::MAX`. Practically unreachable in V1 (4 billion ops would
     /// consume terabytes of Loro storage) but flagged here per Opus M5
     /// "verify before claiming". V2 will switch to `BigInt` return
@@ -956,17 +1140,17 @@ impl CollabSession {
     }
 
     // ==========================================================
-    // Phase 5.7 V2.1 (2026-05-22) — Transport surface
+    // Phase 5.7 V2.1 (2026-05-22) -- Transport surface
     // ==========================================================
 
     /// Attach a Transport to this session. Moves the inner boxed trait
     /// object out of the `transport` wrapper (consuming it from JS's
-    /// perspective — subsequent calls fail).
+    /// perspective -- subsequent calls fail).
     ///
     /// Mirrors `CollabSession::attach_transport_boxed` on the Rust side
     /// which delegates to the V2 V3 step 1 baseline-reset path: the
     /// next flush sends from empty VV (i.e., ALL local ops including
-    /// any appended while no transport was attached — Loro's CRDT op
+    /// any appended while no transport was attached -- Loro's CRDT op
     /// log IS the implicit offline queue).
     ///
     /// V2.1 does NOT return the prior transport (if any) to JS. The
@@ -978,14 +1162,14 @@ impl CollabSession {
     /// case emerges.
     ///
     /// **Failure modes**:
-    /// - `transport` has already been used (its `inner` is `None`) →
+    /// - `transport` has already been used (its `inner` is `None`) ->
     ///   JS Error "Transport has already been consumed".
     #[napi(js_name = "attachTransport")]
     pub fn attach_transport(&self, transport: &mut Transport) -> Result<()> {
         let boxed = transport.take_inner().ok_or_else(|| {
             // V2.1 audit closure (Codex LOW-1, 2026-05-22): error wording
             // standardized. A "spent LoopbackPair" throws at takeA/takeB
-            // BEFORE producing a Transport — so a consumed Transport
+            // BEFORE producing a Transport -- so a consumed Transport
             // wrapper must have come from attachTransport (or a future
             // consumer added in V2.3+).
             bad_argument_error("Transport has already been consumed by attachTransport".to_string())
@@ -1008,7 +1192,7 @@ impl CollabSession {
     /// pure memory release.
     ///
     /// The returned `Box<dyn Transport>` is dropped Rust-side. JS does
-    /// NOT receive the prior transport — same rationale as
+    /// NOT receive the prior transport -- same rationale as
     /// `attachTransport`.
     #[napi(js_name = "detachTransport")]
     pub fn detach_transport(&self) -> bool {
@@ -1026,14 +1210,14 @@ impl CollabSession {
     /// Full-snapshot flush to the attached transport. Sends the entire
     /// op log as bytes. Returns `true` if bytes were actually sent.
     ///
-    /// **Use `flushDeltaToTransport` instead in production** —
+    /// **Use `flushDeltaToTransport` instead in production** --
     /// full-snapshot flushes get expensive as the op log grows. V2.1
     /// exposes this method primarily for tests and "initial sync"
     /// scenarios; V2.2 ships the delta path.
     ///
     /// **Failure modes**:
-    /// - No transport attached → returns `Ok(false)` (NOT an error).
-    /// - Transport's `send` returns `Err(TransportError::*)` → JS Error.
+    /// - No transport attached -> returns `Ok(false)` (NOT an error).
+    /// - Transport's `send` returns `Err(TransportError::*)` -> JS Error.
     #[napi(js_name = "flushToTransport")]
     pub fn flush_to_transport(&self) -> Result<bool> {
         let mut inner = self.inner.lock();
@@ -1049,7 +1233,7 @@ impl CollabSession {
     /// to count ops, compare `opCount()` before vs after.
     ///
     /// **V2.1 audit closure (Codex MEDIUM-1, 2026-05-22)**: the prior
-    /// docstring claimed "number of ops merged" which was wrong — the
+    /// docstring claimed "number of ops merged" which was wrong -- the
     /// engine's `poll_remote_with_limit` returns blob count (`merged <=
     /// max_blobs` per its own doc). Mocha test "three-mutation chain
     /// across LoopbackPair" found this empirically (asserting `>= 3`
@@ -1063,12 +1247,12 @@ impl CollabSession {
     /// is `OnAppend` and `blobs_drained > 0`, the underlying call also
     /// fires one delta flush back through the transport (idempotency
     /// guard prevents echo loops). V2.1 doesn't bind AutoFlushPolicy yet
-    /// — V2.2 does.
+    /// -- V2.2 does.
     ///
     /// **Failure modes**:
-    /// - No transport attached → returns `Ok(0)` (NOT an error).
-    /// - Transport's `try_recv` returns `Err` → JS Error.
-    /// - Merging the bytes returns Err → JS Error.
+    /// - No transport attached -> returns `Ok(0)` (NOT an error).
+    /// - Transport's `try_recv` returns `Err` -> JS Error.
+    /// - Merging the bytes returns Err -> JS Error.
     #[napi(js_name = "pollRemote")]
     pub fn poll_remote(&self) -> Result<u32> {
         let mut inner = self.inner.lock();
@@ -1077,7 +1261,7 @@ impl CollabSession {
     }
 
     // ==========================================================
-    // Phase 5.7 V2.2 (2026-05-22) — full sync Transport surface
+    // Phase 5.7 V2.2 (2026-05-22) -- full sync Transport surface
     // ==========================================================
 
     /// Delta flush to the attached transport. Sends ONLY the ops added
@@ -1090,14 +1274,14 @@ impl CollabSession {
     /// flushes are O(per-op delta).
     ///
     /// **Idempotency short-circuit**: if `last_flushed_vv == Some(current)`
-    /// — i.e., a previous flush already advanced the baseline to the
-    /// current state — returns `Ok(false)` without invoking
+    /// -- i.e., a previous flush already advanced the baseline to the
+    /// current state -- returns `Ok(false)` without invoking
     /// `transport.send`. Closes the V2 V2 audit echo-loop concern.
     ///
     /// **First flush after attach ALWAYS sends** even on an empty op
     /// log: attach resets `last_flushed_vv = None`, so the idempotency
     /// guard (which checks `Some(last_vv) == current_vv`) is bypassed.
-    /// The first call encodes from the empty VV — for an empty op log
+    /// The first call encodes from the empty VV -- for an empty op log
     /// this is a small baseline blob; for a non-empty log it's the
     /// full state. V2.2 mocha test
     /// `flushDeltaToTransport second call with no state change
@@ -1106,12 +1290,12 @@ impl CollabSession {
     /// **Per Phase 5.5 V2 V3 step 1 contract**: attach_transport resets
     /// the per-session-per-transport `last_flushed_vv` to None. The
     /// next call to `flushDeltaToTransport` after an attach sends from
-    /// the empty VV — delivering ALL local ops including any appended
+    /// the empty VV -- delivering ALL local ops including any appended
     /// while offline (Loro's CRDT op log IS the implicit offline queue).
     ///
     /// **Failure modes**:
-    /// - No transport attached → returns `Ok(false)` (NOT an error).
-    /// - Transport's `send` returns `Err(TransportError::*)` → JS Error.
+    /// - No transport attached -> returns `Ok(false)` (NOT an error).
+    /// - Transport's `send` returns `Err(TransportError::*)` -> JS Error.
     #[napi(js_name = "flushDeltaToTransport")]
     pub fn flush_delta_to_transport(&self) -> Result<bool> {
         let mut inner = self.inner.lock();
@@ -1125,23 +1309,23 @@ impl CollabSession {
     /// (NOT ops), `<= limit`.
     ///
     /// **Limit semantics** (per engine docstring):
-    /// - `limit == 0` → no-op, returns `Ok(0)` even if blobs queued.
+    /// - `limit == 0` -> no-op, returns `Ok(0)` even if blobs queued.
     /// - If the returned count equals `limit`, more blobs may still
-    ///   be queued — call again.
+    ///   be queued -- call again.
     /// - If less, the queue drained (either empty or transport
     ///   reported `Closed`).
     ///
     /// **Input validation** (per V1 megaudit closure pattern):
     /// `limit` takes `f64` to avoid napi-rs's `napi_get_value_uint32`
-    /// ECMAScript ToUint32 silent coercion (`-1 → u32::MAX`, etc.).
+    /// ECMAScript ToUint32 silent coercion (`-1 -> u32::MAX`, etc.).
     /// Validated finite + non-negative + integer + in `usize` range
     /// (on 64-bit systems usize = u64; we cap at u32::MAX for cross-
     /// platform safety).
     ///
     /// **Failure modes**:
-    /// - No transport attached → returns `Ok(0)`.
-    /// - `limit` not a finite non-negative integer in u32 range → JS Error.
-    /// - Transport's `try_recv` returns `Err` → JS Error.
+    /// - No transport attached -> returns `Ok(0)`.
+    /// - `limit` not a finite non-negative integer in u32 range -> JS Error.
+    /// - Transport's `try_recv` returns `Err` -> JS Error.
     #[napi(js_name = "pollRemoteWithLimit")]
     pub fn poll_remote_with_limit(&self, limit: f64) -> Result<u32> {
         let limit_u32 = validate_u32_index("pollRemoteWithLimit", "limit", limit)?;
@@ -1156,7 +1340,7 @@ impl CollabSession {
     /// `null` if either no transport is attached OR the transport
     /// reports no error.
     ///
-    /// **Use case**: IDE reconnect handshakes — after a mutator or
+    /// **Use case**: IDE reconnect handshakes -- after a mutator or
     /// `flush_*_to_transport` returns a JS Error containing
     /// "transport closed" (or similar), the IDE can call this to
     /// distinguish underlying causes (`"peer reset"` vs
@@ -1194,7 +1378,7 @@ impl CollabSession {
     /// 2-variant enums. The string-union approach is JS-idiomatic and
     /// easy to test. Forward-compat: the engine's `AutoFlushPolicy`
     /// is `#[non_exhaustive]` so future variants won't break this
-    /// binding — they'll just be unparseable by this method until V2.3+
+    /// binding -- they'll just be unparseable by this method until V2.3+
     /// adds string mappings.
     ///
     /// **Accepted alias forms (engine-side leniency)**: the engine
@@ -1204,14 +1388,14 @@ impl CollabSession {
     /// canonical forms (`"disabled"` / `"onAppend"`) only; the IDE-side
     /// `isAutoFlushPolicy` type guard enforces this on the TS side
     /// (rejects aliases). The lenient parser exists for engine-
-    /// internal callers and config-file backward-compat — not as a
+    /// internal callers and config-file backward-compat -- not as a
     /// public IDE contract. V2.2 audit closure (Opus HIGH-2): the
     /// alias-acceptance is NOT pinned by the IDE mocha tests; engine-
     /// side tests cover the parser.
     ///
     /// **Partial-state error contract (Codex MEDIUM-3 closure)**:
     /// under `onAppend`, a mutator call sequence is "1. commit local
-    /// op → 2. flush to transport". If step 2 throws
+    /// op -> 2. flush to transport". If step 2 throws
     /// `Error("transport closed")`, the local op is ALREADY committed
     /// (step 1 succeeded). IDE retry logic must:
     /// - NOT retry the original mutation (would duplicate the op).
@@ -1240,7 +1424,7 @@ impl CollabSession {
     /// between engine and binding crate versions). Per CLAUDE.md
     /// no-fallback rule: silent fall-through to `'unknown'` would
     /// cause JS code `policy === 'onAppend'` to silently take the
-    /// `disabled` branch — corrupting reconnect logic. Throwing
+    /// `disabled` branch -- corrupting reconnect logic. Throwing
     /// surfaces the skew loudly and forces a binding upgrade.
     #[napi(js_name = "autoFlushPolicy")]
     pub fn auto_flush_policy(&self) -> Result<String> {
@@ -1249,7 +1433,7 @@ impl CollabSession {
     }
 
     // ==========================================================
-    // Phase 5.7 V2.5 (2026-05-22) — async Transport surface, V8-BLOCK CLOSED
+    // Phase 5.7 V2.5 (2026-05-22) -- async Transport surface, V8-BLOCK CLOSED
     // ==========================================================
     //
     // **V2.5 closure of Opus V2.4 HIGH-1 (V8-block UX hazard)**:
@@ -1257,7 +1441,7 @@ impl CollabSession {
     // V2.4 reintroduced `flushPendingToTransport` soundly (closed
     // V2.3's UB + tokio-starvation HIGHs via the `Arc<Mutex<...>>`
     // refactor + `spawn_blocking`). BUT it held `self.inner.lock()`
-    // during the Condvar wait — concurrent JS sync method calls on
+    // during the Condvar wait -- concurrent JS sync method calls on
     // the SAME session blocked the V8 event loop on lock acquisition.
     // Opus V2.4 HIGH-1 (`docs/audits/2026-05-22-phase-5-7-v2-4-opus.md:112-302`)
     // documented this as a UX hazard (not a soundness hazard) and
@@ -1277,10 +1461,10 @@ impl CollabSession {
     //      lock, DROP the lock, then perform the wait without it held.
     //
     // Concurrent JS sync methods now acquire `self.inner.lock()`
-    // immediately — the V8 event loop stays responsive while the
+    // immediately -- the V8 event loop stays responsive while the
     // Condvar wait runs in the spawn_blocking task on cloned Arcs.
 
-    /// Async flush-pending — waits for the attached transport's writer
+    /// Async flush-pending -- waits for the attached transport's writer
     /// task to drain (level-1 local ack per V2 V4 V1 Tier K1 contract).
     ///
     /// **Resolution / rejection contract** (V2.8 megaudit Codex Lane A
@@ -1319,7 +1503,7 @@ impl CollabSession {
     /// Concurrent JS sync method calls on the same session (e.g.,
     /// `opCount`, `appendPutValue`, `pollRemote`) acquire
     /// `self.inner.lock()` immediately while this method's wait
-    /// runs — the V8 event loop stays responsive.
+    /// runs -- the V8 event loop stays responsive.
     ///
     /// **V2.3+V2.4 soundness retained** (UB + tokio-starvation HIGHs
     /// remain closed):
@@ -1331,10 +1515,10 @@ impl CollabSession {
     ///
     /// **Failure modes**:
     /// - No transport attached, OR transport's `ack_handle` returns
-    ///   `None` (e.g., Loopback/Noop) → returns `Ok(())` immediately.
-    /// - Transport error during the wait → JS Error with the
+    ///   `None` (e.g., Loopback/Noop) -> returns `Ok(())` immediately.
+    /// - Transport error during the wait -> JS Error with the
     ///   `TransportError` `Display` string.
-    /// - The `spawn_blocking` task panics → JS Error.
+    /// - The `spawn_blocking` task panics -> JS Error.
     #[napi(js_name = "flushPendingToTransport")]
     pub async fn flush_pending_to_transport(&self) -> Result<()> {
         // **V2.5 lock-release pattern (Opus V2.4 HIGH-1 closure)**:
@@ -1348,7 +1532,7 @@ impl CollabSession {
             inner.flush_pending_handle()
         };
 
-        // No transport attached (or transport has no ack semantics —
+        // No transport attached (or transport has no ack semantics --
         // Loopback/Noop default impl returns None). The contract
         // matches the V2.4 method: `Ok(())`, NOT a rejection.
         let Some(handle) = handle_opt else {
@@ -1364,7 +1548,7 @@ impl CollabSession {
     }
 }
 
-/// Phase 5.7 V2.2 (2026-05-22) — parse a JS string into
+/// Phase 5.7 V2.2 (2026-05-22) -- parse a JS string into
 /// [`CoreAutoFlushPolicy`]. JS-idiomatic camelCase + lowercase aliases
 /// accepted. Rejects unknown strings with a precise error.
 fn parse_auto_flush_policy(s: &str) -> Result<CoreAutoFlushPolicy> {
@@ -1377,13 +1561,13 @@ fn parse_auto_flush_policy(s: &str) -> Result<CoreAutoFlushPolicy> {
     }
 }
 
-/// Phase 5.7 V2.2 (2026-05-22) — render [`CoreAutoFlushPolicy`] as a JS
+/// Phase 5.7 V2.2 (2026-05-22) -- render [`CoreAutoFlushPolicy`] as a JS
 /// string. Uses canonical camelCase form ("disabled", "onAppend").
 ///
 /// **V2.2 audit closure (Opus HIGH-1, 2026-05-22)**: returns `Result`
 /// and throws a JS Error when the engine reports a variant unknown to
 /// this binding (forward-compat skew). The prior version returned a
-/// `'unknown'` sentinel string — a silent fall-through that violated
+/// `'unknown'` sentinel string -- a silent fall-through that violated
 /// CLAUDE.md's no-fallback rule. JS code doing `policy === 'onAppend'`
 /// would silently miss the new variant and fall through to the
 /// `disabled` branch, corrupting reconnect / sync logic. Throwing is
@@ -1405,7 +1589,7 @@ fn auto_flush_policy_to_string(p: CoreAutoFlushPolicy) -> Result<String> {
         // IDE callers can branch on `info.code === 'bad_argument'`
         // for engine-binding drift handling.
         other => Err(bad_argument_error(format!(
-            "autoFlushPolicy: engine reported unknown variant {other:?} — \
+            "autoFlushPolicy: engine reported unknown variant {other:?} -- \
              this binding crate ({}) is older than the engine; upgrade \
              ql-bindings-node to add the new variant's JS string mapping",
             env!("CARGO_PKG_VERSION"),
@@ -1414,7 +1598,7 @@ fn auto_flush_policy_to_string(p: CoreAutoFlushPolicy) -> Result<String> {
 }
 
 // =============================================================
-// Phase 5.7 V2.1 (2026-05-22) — Transport binding
+// Phase 5.7 V2.1 (2026-05-22) -- Transport binding
 // =============================================================
 
 /// JS-facing opaque wrapper for a `Box<dyn ql_collab::Transport + Send>`.
@@ -1445,7 +1629,7 @@ fn auto_flush_policy_to_string(p: CoreAutoFlushPolicy) -> Result<String> {
 pub struct Transport {
     // `Option` so we can move the inner Box out at attach time without
     // dropping the wrapper. napi-rs's class instance has `&mut self`
-    // discipline (per V1 module docs Send+!Sync rationale) — we cannot
+    // discipline (per V1 module docs Send+!Sync rationale) -- we cannot
     // consume `self` from a `#[napi]` method, only take from an Option.
     inner: Option<Box<dyn CoreTransport + Send>>,
 }
@@ -1462,19 +1646,19 @@ impl Transport {
     }
 
     // ==========================================================
-    // Phase 5.7 V2.3 (2026-05-22) — async WebSocket factory
+    // Phase 5.7 V2.3 (2026-05-22) -- async WebSocket factory
     // ==========================================================
 
     /// Connect to a WebSocket peer and return a Transport wrapping the
     /// resulting `WebSocketTransport`. Returns a JS `Promise<Transport>`.
     ///
-    /// **URL format**: standard `ws://host:port` (no TLS in V2.3 — V2.4+
+    /// **URL format**: standard `ws://host:port` (no TLS in V2.3 -- V2.4+
     /// will add `wss://` once the engine's `ql-collab-ws` exposes TLS).
     ///
     /// **Failure modes** (all surface as JS Promise rejections):
-    /// - `WebSocketError::InvalidUrl` — URL parse failed.
-    /// - `WebSocketError::ConnectFailed` — TCP/DNS error.
-    /// - `WebSocketError::HandshakeFailed` — WS upgrade rejected
+    /// - `WebSocketError::InvalidUrl` -- URL parse failed.
+    /// - `WebSocketError::ConnectFailed` -- TCP/DNS error.
+    /// - `WebSocketError::HandshakeFailed` -- WS upgrade rejected
     ///   (e.g., HTTP 401, protocol mismatch).
     ///
     /// **Lifecycle**: the returned Transport instance owns a
@@ -1487,7 +1671,7 @@ impl Transport {
     /// body on a tokio task spawned from napi-rs's built-in runtime
     /// (gated by the `async` feature in the workspace `Cargo.toml`).
     /// The Promise resolves on the V8 thread once the async fn
-    /// completes — no manual ThreadsafeFunction plumbing needed.
+    /// completes -- no manual ThreadsafeFunction plumbing needed.
     #[napi(js_name = "websocketConnect")]
     pub async fn websocket_connect(url: String) -> Result<Transport> {
         let ws = WebSocketTransport::connect(&url)
@@ -1500,7 +1684,7 @@ impl Transport {
 }
 
 impl Transport {
-    /// **`pub(crate)` — only the napi `CollabSession::attach_transport`
+    /// **`pub(crate)` -- only the napi `CollabSession::attach_transport`
     /// method should call this.** Move the inner Box out for attach.
     /// Called by the napi method, NOT the Rust generic
     /// `ql_collab::CollabSession::attach_transport`. After this returns
@@ -1509,7 +1693,7 @@ impl Transport {
     ///
     /// **V2.1 audit closure (Opus LOW-4, 2026-05-22)**: the prior
     /// docstring said "Rust-only" which could be misread as private to
-    /// this `impl` block. `pub(crate)` IS the visibility — but calling
+    /// this `impl` block. `pub(crate)` IS the visibility -- but calling
     /// from any site other than `CollabSession::attach_transport`
     /// silently consumes the wrapper without an `attach`-paired side
     /// effect. Future contributors: do NOT call this from anywhere
@@ -1543,7 +1727,7 @@ impl Transport {
 /// **Single-use takers**: each of `takeA` / `takeB` can be called once
 /// per `LoopbackPair` instance. Calling a second time on the same end
 /// returns a JS Error. (Calling a non-yet-taken end after the other has
-/// been taken still works — the two ends are independent.)
+/// been taken still works -- the two ends are independent.)
 #[napi]
 pub struct LoopbackPair {
     // Both ends live here until taken. The pair is constructed eagerly
@@ -1595,22 +1779,22 @@ impl LoopbackPair {
 }
 
 // =============================================================
-// Phase 5.7 V2.6 (2026-05-22) — BlockingTransportFixture
+// Phase 5.7 V2.6 (2026-05-22) -- BlockingTransportFixture
 // =============================================================
 //
 // Test fixture for V2.5 contract testing (Opus V2.4 MEDIUM-2
 // closure). JS-side helper that constructs a `BlockingTransport`
 // (engine-side, feature-gated) and exposes:
-//   - `takeTransport(): Transport` — moves the fixture's inner
+//   - `takeTransport(): Transport` -- moves the fixture's inner
 //     BlockingTransport into a Transport wrapper that can be passed
 //     to `attachTransport(t)`. Mirrors V2.1 `LoopbackPair`'s
 //     `takeA`/`takeB` single-use pattern.
-//   - `release(): void` — flips the engine-side release Condvar
+//   - `release(): void` -- flips the engine-side release Condvar
 //     so any in-progress `flush_pending` / `wait_for_drain` exits.
-//   - `waitUntilBlocked(): Promise<void>` — async wait until the
+//   - `waitUntilBlocked(): Promise<void>` -- async wait until the
 //     fixture's wait routine has actually entered the Condvar
 //     wait. Closes Codex M3 (deterministic synchronization for the
-//     V2.5 contract test — without this, the test's `opCount()`
+//     V2.5 contract test -- without this, the test's `opCount()`
 //     call could race ahead of the spawn_blocking task and pass
 //     vacuously).
 //
@@ -1632,7 +1816,7 @@ impl LoopbackPair {
 // the flag. See `Cargo.toml`'s `[features]` block + V2 exit packet at
 // `docs/phase5/5-7-v2-exit-packet.md`.
 
-/// **Phase 5.7 V2.6 (2026-05-22) — V2.5 contract-test fixture.**
+/// **Phase 5.7 V2.6 (2026-05-22) -- V2.5 contract-test fixture.**
 ///
 /// JS class for constructing a `BlockingTransport` (engine-side
 /// `ql_collab::BlockingTransport`, gated behind the `test-fixtures`
@@ -1642,7 +1826,7 @@ impl LoopbackPair {
 /// a pending `flushPendingToTransport` MUST return immediately
 /// (does NOT block on the session lock).
 ///
-/// **NOT for production use** — the underlying `BlockingTransport`
+/// **NOT for production use** -- the underlying `BlockingTransport`
 /// blocks `flush_pending` indefinitely until `release()` is called
 /// (or the constructor's `block_ms` upper bound elapses). V2.8
 /// megaudit closure (Opus-B Lane C HIGH-1) gates the entire type
@@ -1673,7 +1857,7 @@ impl BlockingTransportFixture {
     /// JS: `new BlockingTransportFixture(blockMs: number)`.
     ///
     /// `blockMs` is the upper-bound wait duration. Must be in the
-    /// range `[1, u32::MAX]` — a strictly positive finite integer.
+    /// range `[1, u32::MAX]` -- a strictly positive finite integer.
     ///
     /// **V2.5 audit closure (Codex MEDIUM-1, 2026-05-22)**: `0` is
     /// REJECTED at the napi boundary even though the engine's
@@ -1684,7 +1868,7 @@ impl BlockingTransportFixture {
     /// `ql-bindings-node`). Allowing JS callers to construct an
     /// indefinite-block fixture would let in-process IDE code park
     /// `flushPendingToTransport` blocking-pool tasks until process
-    /// termination — bounded self-DoS but unnecessary footgun. The
+    /// termination -- bounded self-DoS but unnecessary footgun. The
     /// engine `BlockingTransport::new(0, ..., ...)` constructor
     /// remains for Rust tests that explicitly want the `0` path.
     ///
@@ -1704,7 +1888,7 @@ impl BlockingTransportFixture {
         if block_ms_u32 == 0 {
             return Err(bad_argument_error(
                 "BlockingTransportFixture: blockMs must be > 0 (strictly positive). \
-                 Zero would allow indefinite blocking from JS — V2.5 audit closure \
+                 Zero would allow indefinite blocking from JS -- V2.5 audit closure \
                  (Codex MEDIUM-1) rejects this at the napi boundary."
                     .to_string(),
             ));
@@ -1802,7 +1986,7 @@ impl BlockingTransportFixture {
 // Send/Sync compile assertions (Rule 4 application)
 // =============================================================
 
-// **Phase 5.7 V2.4 (2026-05-22) — Send + Sync UPDATE.**
+// **Phase 5.7 V2.4 (2026-05-22) -- Send + Sync UPDATE.**
 //
 // V1 + V2.1 + V2.2 + V2.3 claimed `Send + !Sync` (per V1 megaudit
 // Opus-A MEDIUM-1 closure). V2.4 changes the underlying shape from
@@ -1836,15 +2020,15 @@ const _ASSERT_BINDING_COLLAB_SESSION_SEND: fn() = || {
 // `Box<_>` of a `Send` trait object is `Send`, and `Option<T>` is `Send`
 // when `T: Send`. So the composition is `Send`. Pin it.
 //
-// **V2.8 megaudit (Opus-B Lane C MEDIUM-2, 2026-05-22) — Sync NOT
+// **V2.8 megaudit (Opus-B Lane C MEDIUM-2, 2026-05-22) -- Sync NOT
 // asserted; rationale documented here.** The `dyn ql_collab::Transport
 // + Send` trait object does NOT carry a `Sync` bound (the trait itself
-// has no `Sync` supertrait — V1 design accepted this because the
+// has no `Sync` supertrait -- V1 design accepted this because the
 // engine boxes transports per-session, not for shared use). Therefore
 // `Box<dyn Transport + Send>: Send + !Sync`, and `Transport: !Sync`
 // by composition. This is asymmetric vs `CollabSession` (Send + Sync
 // since V2.4) and `LoopbackPair` / `BlockingTransportFixture` (Send +
-// Sync — see asserts below) — by design: napi-rs holds Transport
+// Sync -- see asserts below) -- by design: napi-rs holds Transport
 // wrappers per-Worker and does not require cross-thread aliasing of a
 // single Transport. If a future V3 multi-window flow needs to clone
 // a Transport handle across Workers, the `Sync` bound would need to
@@ -1854,7 +2038,7 @@ const _ASSERT_BINDING_TRANSPORT_SEND: fn() = || {
     assert_send::<Transport>();
 };
 
-// **V2.1 audit closure (Opus MEDIUM-2, 2026-05-22)** — quality gap close
+// **V2.1 audit closure (Opus MEDIUM-2, 2026-05-22)** -- quality gap close
 // for `LoopbackPair`. Wrapper holds `a: Option<LoopbackTransport>, b:
 // Option<LoopbackTransport>`. The engine pins
 // `_ASSERT_LOOPBACK_TRANSPORT_SEND_SYNC` in `ql-collab/src/transport.rs`,
@@ -1862,7 +2046,7 @@ const _ASSERT_BINDING_TRANSPORT_SEND: fn() = || {
 // future refactor making LoopbackTransport `!Send` or `!Sync` fails this
 // build (the napi class hands wrapped instances across the JS/Rust
 // boundary on the same thread, so neither is strictly required for V2.1
-// — but losing Send would break the V2.3+ Transport.websocketConnect
+// -- but losing Send would break the V2.3+ Transport.websocketConnect
 // async pattern which DOES require Send to move across the tokio
 // runtime).
 //
@@ -1882,7 +2066,7 @@ const _ASSERT_BINDING_LOOPBACK_PAIR_SEND_SYNC: fn() = || {
 // fields. `BlockingTransport: Send + Sync` is pinned in ql-collab;
 // `Arc<T>: Send + Sync` when `T: Send + Sync`; `Mutex<T>` + `Condvar`
 // are both `Send + Sync`. So the composition is `Send + Sync`. Pin both
-// — napi holds instances per-Worker so cross-Worker bounds aren't
+// -- napi holds instances per-Worker so cross-Worker bounds aren't
 // strictly required, but losing Send would break `waitUntilBlocked`'s
 // `spawn_blocking` move-into pattern.
 //
@@ -1933,7 +2117,7 @@ mod tests {
 
     #[test]
     fn collab_session_roundtrip_via_rust() {
-        // Test the Rust side directly (no napi runtime here — that
+        // Test the Rust side directly (no napi runtime here -- that
         // requires a Node host). Validates the wrapper plumbing
         // composes correctly without panics. The full Node-side
         // round-trip lives in the IDE extension's
@@ -1960,19 +2144,19 @@ mod tests {
     }
 
     // ==========================================================
-    // Phase 5.7 V2.1 (2026-05-22) — Transport composition smoke
+    // Phase 5.7 V2.1 (2026-05-22) -- Transport composition smoke
     //
     // **Cannot test napi-wrapping types here.** `cargo test` doesn't
     // link napi symbols (they're loaded dynamically when Node opens
     // the .node file), so any code path that touches `napi::Error`
-    // — including `Result<T, napi::Error>` from `LoopbackPair::take_a`
-    // — fails to link with `_napi_delete_reference` undefined.
+    // -- including `Result<T, napi::Error>` from `LoopbackPair::take_a`
+    // -- fails to link with `_napi_delete_reference` undefined.
     //
-    // V2.1 napi-wrapper composition (LoopbackPair → takeA → Transport
-    // → CollabSession.attachTransport → flushToTransport → pollRemote)
+    // V2.1 napi-wrapper composition (LoopbackPair -> takeA -> Transport
+    // -> CollabSession.attachTransport -> flushToTransport -> pollRemote)
     // is tested via mocha at
     // `quantlab/extensions/quantlab/test/quantbook-roundtrip.test.ts`
-    // — same pattern V1 uses (mocha owns the Node host; Rust unit
+    // -- same pattern V1 uses (mocha owns the Node host; Rust unit
     // tests handle core-type plumbing only).
     //
     // This smoke validates that the engine-side `attach_transport_boxed`
