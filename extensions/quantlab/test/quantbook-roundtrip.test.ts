@@ -75,6 +75,7 @@ import {
 } from '../src/quantbook/session';
 import type {
 	BlockingTransportFixtureConstructor,
+	CellSnapshotJson,
 	CollabSessionInstance,
 	QuantbookCellSnapshot,
 	QuantbookNativeModule,
@@ -5455,6 +5456,136 @@ suite('quantbook V3.5.0.4b -- extractSheetSnapshot via real workbookSnapshot()',
 		// workbookSnapshot enumerates all sheets:
 		assert.strictEqual(workbookSnapshot(session).sheets.length, 3,
 			'workbookSnapshot counts all sheets (V3.5.0.4b reactive-title source)');
+	});
+});
+
+// ============================================================================
+// Phase 5.7 V3.5.0.5 (2026-05-24) -- CellState.format passthrough + FormatIdJson
+// ============================================================================
+// V3.5.0.5 ships per-cell format passthrough in WorkbookSnapshotJson.  No
+// IDE write-path yet (engine napi for SetCellFormat is not exposed; format
+// editing is V3.6+ scope).  These tests pin the TS interface shape +
+// extractSheetSnapshot's drop-format behavior (V3.5.0.5 buildHtml is not
+// format-aware; the transformer silently drops format from its output).
+
+suite('quantbook V3.5.0.5 -- CellSnapshotJson.format type shape', function () {
+	test('CellSnapshotJson has optional format field', () => {
+		// Type-shape pin: the new format field is OPTIONAL per the
+		// napi-rs Option::None -> absent JS property convention.
+		const cell: CellSnapshotJson = {
+			row: 0,
+			col: 0,
+			value: { kind: 'number', number: 1 },
+			// formula + format absent
+		};
+		assert.strictEqual(cell.format, undefined,
+			'format defaults to undefined (absent JS property)');
+	});
+
+	test('CellSnapshotJson accepts builtin FormatIdJson', () => {
+		const cell: CellSnapshotJson = {
+			row: 0,
+			col: 0,
+			format: { kind: 'builtin', builtin: 2 },
+		};
+		assert.strictEqual(cell.format?.kind, 'builtin');
+		assert.strictEqual(cell.format?.builtin, 2);
+		assert.strictEqual(cell.format?.customPeer, undefined);
+		assert.strictEqual(cell.format?.customCounter, undefined);
+	});
+
+	test('CellSnapshotJson accepts custom FormatIdJson with PeerId bigint', () => {
+		const cell: CellSnapshotJson = {
+			row: 0,
+			col: 0,
+			format: { kind: 'custom', customPeer: 42n, customCounter: 100 },
+		};
+		assert.strictEqual(cell.format?.kind, 'custom');
+		assert.strictEqual(cell.format?.builtin, undefined);
+		assert.strictEqual(cell.format?.customPeer, 42n);
+		assert.strictEqual(cell.format?.customCounter, 100);
+	});
+});
+
+suite('quantbook V3.5.0.5 -- extractSheetSnapshot drops format (V3.5.0.5 scope)', function () {
+	test('extractSheetSnapshot output has no format field (V3.2.a QuantbookCellSnapshot shape)', () => {
+		// V3.5.0.5 deliberate: buildHtml is not format-aware yet, so
+		// the transformer produces the V3.2.a shape (no format).  The
+		// per-cell format flows through workbookSnapshot for V3.6+
+		// format-aware rendering; for now extractSheetSnapshot drops it.
+		const snap: WorkbookSnapshotJson = {
+			sheets: [{
+				id: 0, name: 'S', cells: [
+					{
+						row: 0, col: 0,
+						value: { kind: 'number', number: 5 },
+						format: { kind: 'builtin', builtin: 2 },
+					},
+				],
+			}],
+		};
+		const result = extractSheetSnapshot(snap, 0);
+		assert.ok(result !== null);
+		assert.strictEqual(result!.entries.length, 1);
+		// V3.2.a entry shape: { row, col, value } -- no format key.
+		const entry = result!.entries[0];
+		assert.deepStrictEqual(Object.keys(entry).sort(), ['col', 'row', 'value'],
+			'entry has V3.2.a shape: row + col + value; format silently dropped');
+	});
+
+	test('extractSheetSnapshot skips format-only cells (no value)', () => {
+		// V3.4.0.X MEDIUM-1 carry: cells with value=undefined are
+		// skipped by extractSheetSnapshot (formula-only behavior
+		// extends to format-only).  Pre-V3.5.0.5 the cell would have
+		// been ghost-removed by the engine cache; V3.5.0.5 engine
+		// extends ghost-removal to (value && formula && format) all-None.
+		// A format-only cell legitimately exists in the cache (format
+		// is set), but extractSheetSnapshot skips it because value is
+		// undefined.
+		const snap: WorkbookSnapshotJson = {
+			sheets: [{
+				id: 0, name: 'S', cells: [
+					{ row: 0, col: 0, format: { kind: 'builtin', builtin: 2 } },
+					{ row: 1, col: 0, value: { kind: 'number', number: 7 } },
+				],
+			}],
+		};
+		const result = extractSheetSnapshot(snap, 0);
+		assert.strictEqual(result!.entries.length, 1,
+			'format-only cell skipped by extractor; only value-bearing cell surfaces');
+		assert.strictEqual(result!.entries[0].row, 1);
+	});
+});
+
+suite('quantbook V3.5.0.5 -- workbookSnapshot format passthrough (no write-path yet)', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('no SetCellFormat ops -> cells have format undefined', () => {
+		// Without an IDE-facing write path for SetCellFormat (V3.6+
+		// scope), real sessions never produce formatted cells.  Pin
+		// that the passthrough emits `undefined` for unformatted cells.
+		const session = createSession(8101n);
+		addSheet(session, 'S');
+		appendPutValueValidated(session, 0, 0, 0, 42);
+		const snap = workbookSnapshot(session);
+		const cell = snap.sheets[0].cells[0];
+		assert.strictEqual(cell.format, undefined,
+			'no SetCellFormat ops -> format absent (napi-rs Option::None)');
+	});
+
+	test('workbookSnapshot.sheets[].cells[].format key absent when undefined', () => {
+		// napi-rs Option::None -> ABSENT property (not null, not undefined-
+		// explicit-set).  Pin via Object.keys.
+		const session = createSession(8102n);
+		addSheet(session, 'S');
+		appendPutValueValidated(session, 0, 0, 0, 1);
+		const cell = workbookSnapshot(session).sheets[0].cells[0];
+		const keys = Object.keys(cell).sort();
+		assert.ok(!keys.includes('format'),
+			`format key absent when undefined (napi-rs Option::None convention); got keys: ${JSON.stringify(keys)}`);
 	});
 });
 

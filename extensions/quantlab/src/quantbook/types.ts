@@ -93,10 +93,43 @@ export interface CellSnapshotJson {
 	col: number;
 	// napi-rs Option<T>::None -> absent (undefined) at the JS layer.  Declared
 	// as optional (?:) to reflect this.  `value: undefined` = formula-only
-	// cell; `formula: undefined` = pure literal cell; both `undefined` cannot
-	// occur (V3.4.0.X MEDIUM-1 closure removes such empty entries).
+	// cell; `formula: undefined` = pure literal cell; ALL THREE undefined
+	// cannot occur (V3.4.0.X MEDIUM-1 closure extended at V3.5.0.5 -- such
+	// empty CellState entries are removed from the cache).
 	value?: CellValueJson;
 	formula?: string;
+	/**
+	 * **Phase 5.7 V3.5.0.5 (2026-05-24)** -- per-cell format passthrough.
+	 *
+	 * `undefined` = no explicit format (cell renders with FormatId::GENERAL
+	 * default per the engine).  Set via `Op::SetCellFormat { id: Some(_) }`;
+	 * cleared via `Op::SetCellFormat { id: None }`.  V3.5.0.5 ships
+	 * passthrough only -- the IDE webview (buildHtml) does NOT consume
+	 * format yet; the field round-trips for V3.6+ format-aware rendering.
+	 */
+	format?: FormatIdJson;
+}
+
+/**
+ * **Phase 5.7 V3.5.0.5 (2026-05-24)** -- JS-side mirror of the engine
+ * `FormatIdJson` napi struct (which mirrors `ql_storage::FormatId`).
+ *
+ * Discriminated-union shape: `kind` is `"builtin"` or `"custom"`; for
+ * builtin the `builtin` field is set (other fields absent); for custom
+ * the `customPeer` (bigint -- u64 widened) and `customCounter` (u32)
+ * fields are set.
+ *
+ * napi-rs Option<T>::None -> absent JS property; the alternative-variant
+ * fields are `undefined` (not null).  Discriminate via `kind`.
+ */
+export interface FormatIdJson {
+	kind: 'builtin' | 'custom';
+	/** Set when `kind === 'builtin'`; undefined otherwise. */
+	builtin?: number;
+	/** Set when `kind === 'custom'`; undefined otherwise.  u64 widened to bigint. */
+	customPeer?: bigint;
+	/** Set when `kind === 'custom'`; undefined otherwise. */
+	customCounter?: number;
 }
 
 /**
