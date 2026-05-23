@@ -68,6 +68,7 @@ import {
 	sweepPresence,
 	undo,
 	updatePresence,
+	workbookSnapshot,
 } from '../src/quantbook/session';
 import type {
 	BlockingTransportFixtureConstructor,
@@ -4298,4 +4299,191 @@ suite('quantbook V3.4.0.X -- addSheet napi validates chunkRows (HIGH-2)', functi
 		addSheet(session, 'S', 1);
 	});
 });
+
+// ============================================================================
+// Phase 5.7 V3.5.0.2 (2026-05-24) -- WorkbookSnapshot napi contract
+// ============================================================================
+// Tests the new CollabSession.workbookSnapshot() napi method shipped at
+// V3.5.0.2 per V3.5.0.1 D3.  Pins the flattened JSON-serializable shape +
+// sheet enumeration + cell-keyed cache integration + value/formula
+// preservation through the round-trip + JSON shape stability for
+// V3.5.0.5 forward-extend (which adds names + formats fields additively).
+
+suite('quantbook V3.5.0.2 -- workbookSnapshot napi contract', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('empty session: snapshot has zero sheets', () => {
+		const session = createSession(7601n);
+		const snap = workbookSnapshot(session);
+		assert.deepStrictEqual(snap.sheets, [],
+			'a fresh session with no addSheet ops has zero sheets in snapshot');
+	});
+
+	test('single addSheet: snapshot has one sheet, id=0, empty cells', () => {
+		const session = createSession(7602n);
+		addSheet(session, 'Sheet0');
+		const snap = workbookSnapshot(session);
+		assert.strictEqual(snap.sheets.length, 1);
+		assert.strictEqual(snap.sheets[0].id, 0, 'first addSheet -> sheet id 0');
+		assert.strictEqual(snap.sheets[0].name, 'Sheet0');
+		assert.deepStrictEqual(snap.sheets[0].cells, [],
+			'addSheet without PutValue -> empty cells (V3.5.0.2 enumerates via sheet_count, not list_sheets_from_cache)');
+	});
+
+	test('addSheet + PutValue: cell appears with value+kind, formula=undefined', () => {
+		const session = createSession(7603n);
+		addSheet(session, 'A');
+		appendPutValueValidated(session, 0, 3, 5, 42.5);
+		const snap = workbookSnapshot(session);
+		assert.strictEqual(snap.sheets.length, 1);
+		assert.strictEqual(snap.sheets[0].cells.length, 1);
+		const cell = snap.sheets[0].cells[0];
+		assert.strictEqual(cell.row, 3);
+		assert.strictEqual(cell.col, 5);
+		assert.strictEqual(cell.formula, undefined, 'pure PutValue -> formula absent (napi Option::None -> undefined)');
+		assert.ok(cell.value !== undefined, 'PutValue -> value populated');
+		assert.strictEqual(cell.value!.kind, 'number');
+		assert.strictEqual(cell.value!.number, 42.5);
+		assert.strictEqual(cell.value!.boolean, undefined, 'non-active payload fields absent');
+		assert.strictEqual(cell.value!.text, undefined);
+		assert.strictEqual(cell.value!.error, undefined);
+	});
+
+	test('multi-sheet: snapshot sheets are id-ordered 0..N-1', () => {
+		const session = createSession(7604n);
+		addSheet(session, 'First');
+		addSheet(session, 'Second');
+		addSheet(session, 'Third');
+		appendPutValueValidated(session, 0, 0, 0, 1);
+		appendPutValueValidated(session, 2, 5, 5, 99);
+		// Sheet 1 deliberately empty -- pins the "enumerate via sheet_count" contract.
+		const snap = workbookSnapshot(session);
+		assert.strictEqual(snap.sheets.length, 3);
+		assert.deepStrictEqual(snap.sheets.map(s => s.id), [0, 1, 2],
+			'sheets emitted in id order 0..N-1');
+		assert.deepStrictEqual(snap.sheets.map(s => s.name), ['First', 'Second', 'Third']);
+		assert.strictEqual(snap.sheets[0].cells.length, 1, 'sheet 0 has 1 cell');
+		assert.strictEqual(snap.sheets[1].cells.length, 0, 'sheet 1 is empty but present');
+		assert.strictEqual(snap.sheets[2].cells.length, 1, 'sheet 2 has 1 cell');
+		assert.strictEqual(snap.sheets[2].cells[0].value!.number, 99);
+	});
+
+	test('cells within a sheet are sorted (row, col) ascending', () => {
+		const session = createSession(7605n);
+		addSheet(session, 'S');
+		// Append out-of-order to verify the sort.
+		appendPutValueValidated(session, 0, 5, 0, 1);
+		appendPutValueValidated(session, 0, 0, 5, 2);
+		appendPutValueValidated(session, 0, 0, 0, 3);
+		appendPutValueValidated(session, 0, 3, 2, 4);
+		const cells = workbookSnapshot(session).sheets[0].cells;
+		const keys = cells.map(c => [c.row, c.col]);
+		assert.deepStrictEqual(keys, [[0, 0], [0, 5], [3, 2], [5, 0]],
+			'cells sorted by (row, col) ascending per snapshot_cells contract');
+	});
+
+	test('JSON shape stability: top-level has only sheets field (V3.5.0.5 will add names + formats)', () => {
+		const session = createSession(7606n);
+		addSheet(session, 'S');
+		const snap = workbookSnapshot(session);
+		// V3.5.0.2 ship shape: { sheets }.  Future V3.5.0.5 may add
+		// `names` + `formats` ADDITIVELY (existing destructure of
+		// .sheets keeps working).  Pin the V3.5.0.2 shape so a future
+		// shape-break gets caught.
+		const keys = Object.keys(snap).sort();
+		assert.deepStrictEqual(keys, ['sheets'],
+			`V3.5.0.2 ship shape is {sheets} only; if V3.5.0.5+ extends, update this test to .includes('sheets')`);
+	});
+
+	test('SheetSnapshotJson shape: id + name + cells fields', () => {
+		const session = createSession(7607n);
+		addSheet(session, 'S');
+		const sheet = workbookSnapshot(session).sheets[0];
+		const keys = Object.keys(sheet).sort();
+		assert.deepStrictEqual(keys, ['cells', 'id', 'name']);
+		assert.strictEqual(typeof sheet.id, 'number');
+		assert.strictEqual(typeof sheet.name, 'string');
+		assert.ok(Array.isArray(sheet.cells));
+	});
+
+	test('CellSnapshotJson shape: row + col + value fields present; formula absent for pure PutValue', () => {
+		const session = createSession(7608n);
+		addSheet(session, 'S');
+		appendPutValueValidated(session, 0, 0, 0, 1);
+		const cell = workbookSnapshot(session).sheets[0].cells[0];
+		const keys = Object.keys(cell).sort();
+		// napi-rs Option::None -> absent JS property; pure PutValue has
+		// no formula, so the formula key is OMITTED entirely.
+		assert.deepStrictEqual(keys, ['col', 'row', 'value']);
+		assert.strictEqual(cell.formula, undefined, 'formula property is absent for pure PutValue');
+		assert.ok(cell.value !== undefined);
+	});
+
+	test('CellValueJson discriminator: number cell has kind + number; non-active payloads absent', () => {
+		const session = createSession(7609n);
+		addSheet(session, 'S');
+		appendPutValueValidated(session, 0, 0, 0, 7);
+		const v = workbookSnapshot(session).sheets[0].cells[0].value!;
+		assert.strictEqual(v.kind, 'number');
+		assert.strictEqual(v.number, 7);
+		// All non-active payload fields absent (napi Option::None -> undefined).
+		assert.strictEqual(v.boolean, undefined);
+		assert.strictEqual(v.text, undefined);
+		assert.strictEqual(v.error, undefined);
+		// Pin that only kind + number keys are present.
+		const keys = Object.keys(v).sort();
+		assert.deepStrictEqual(keys, ['kind', 'number'],
+			'CellValueJson omits non-active payload fields entirely');
+	});
+
+	test('rebuild_workbook semantic: empty sheet (addSheet only) appears in snapshot', () => {
+		// Critical V3.5.0.2 contract: snapshot enumerates via
+		// Workbook::sheet_count() (post rebuild_workbook), NOT via
+		// list_sheets_from_cache().  Empty sheets (addSheet but no
+		// PutValue) MUST appear with cells: [].
+		const session = createSession(7610n);
+		addSheet(session, 'OnlyAdded');
+		// No PutValue.  list_sheets_from_cache() returns [] (no cache
+		// entries).  workbookSnapshot() should return 1 sheet.
+		const snap = workbookSnapshot(session);
+		assert.strictEqual(snap.sheets.length, 1);
+		assert.strictEqual(snap.sheets[0].name, 'OnlyAdded');
+		assert.strictEqual(snap.sheets[0].cells.length, 0);
+		// Compare with listSheets behavior (cache-based, empty here).
+		assert.deepStrictEqual(listSheets(session), [],
+			'sanity: listSheets() is cache-based + returns [] for addSheet-only sessions');
+	});
+
+	test('round-trip via to_qbook/from_qbook preserves snapshot equality', () => {
+		const session = createSession(7611n);
+		addSheet(session, 'S0');
+		addSheet(session, 'S1');
+		appendPutValueValidated(session, 0, 0, 0, 100);
+		appendPutValueValidated(session, 1, 5, 5, 200);
+		const before = workbookSnapshot(session);
+
+		const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qbook-v3502-'));
+		const target = path.join(scratchDir, 'snap.qbook');
+		try {
+			exportToQbook(session, target);
+			const reloaded = sessionFromQbook(target, 9999n);
+			const after = workbookSnapshot(reloaded);
+			// Sheet count + names must match.
+			assert.deepStrictEqual(after.sheets.map(s => [s.id, s.name]),
+				before.sheets.map(s => [s.id, s.name]),
+				'sheet id+name preserved across .qbook round-trip');
+			// Cell content must match per-sheet.
+			for (let i = 0; i < before.sheets.length; i++) {
+				assert.deepStrictEqual(after.sheets[i].cells, before.sheets[i].cells,
+					`sheet ${i} cells preserved`);
+			}
+		} finally {
+			try { fs.rmSync(scratchDir, { recursive: true, force: true }); } catch { /* test cleanup */ }
+		}
+	});
+});
+
 

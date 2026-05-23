@@ -57,6 +57,88 @@ export interface PresenceStateJson {
 	typing: boolean;
 }
 
+/**
+ * **Phase 5.7 V3.5.0.2 (2026-05-24) -- JS-side mirror of the engine
+ * `CellValueJson` napi struct.**
+ *
+ * Discriminated-union shape: `kind` is one of `"number" | "boolean" |
+ * "text" | "error" | "pending"`; exactly one of the optional payload
+ * fields is set per non-pending variant; `pending` has all four
+ * payloads `null`/`undefined`.  Mirrors the V3.4.0.2 `exportSnapshot`
+ * JSON output's per-cell value discriminator, promoted to a typed
+ * napi(object) at V3.5.0.2 for the `WorkbookSnapshotJson` surface.
+ */
+export interface CellValueJson {
+	kind: 'number' | 'boolean' | 'text' | 'error' | 'pending';
+	// napi-rs serializes Rust Option<T>::None as ABSENT (undefined) at the JS
+	// layer, NOT null.  Declared as optional (?:) to reflect this.  IDE
+	// consumers MUST switch on `kind` to know which payload field is set.
+	number?: number;
+	boolean?: boolean;
+	text?: string;
+	error?: string;
+}
+
+/**
+ * **Phase 5.7 V3.5.0.2 (2026-05-24) -- one cell entry in a sheet snapshot.**
+ *
+ * `value: null` = formula-only cell (formula text, no cached literal).
+ * `formula: null` = pure literal cell (PutValue, no formula text).
+ * Both `non-null` = formula evaluated to a literal (formula text +
+ * cached value coexist).  Both `null` cannot occur (V3.4.0.X MEDIUM-1
+ * closure removes such empty CellState entries from the cache).
+ */
+export interface CellSnapshotJson {
+	row: number;
+	col: number;
+	// napi-rs Option<T>::None -> absent (undefined) at the JS layer.  Declared
+	// as optional (?:) to reflect this.  `value: undefined` = formula-only
+	// cell; `formula: undefined` = pure literal cell; both `undefined` cannot
+	// occur (V3.4.0.X MEDIUM-1 closure removes such empty entries).
+	value?: CellValueJson;
+	formula?: string;
+}
+
+/**
+ * **Phase 5.7 V3.5.0.2 (2026-05-24) -- one sheet entry in the workbook snapshot.**
+ *
+ * `id` is the sheet's u16 SheetId widened to JS number (lossless;
+ * 0..65535 range fits in JS number safely).  `name` is the sheet's
+ * display name (carries the latest RenameSheet effect).  `cells` is
+ * sorted (row, col) ascending per snapshot_cells contract.  Empty
+ * sheets (created via addSheet but no PutValue/PutFormula) DO appear
+ * with `cells: []` (V3.5.0.2 enumerates via Workbook::sheet_count(),
+ * not list_sheets_from_cache).
+ */
+export interface SheetSnapshotJson {
+	id: number;
+	name: string;
+	cells: CellSnapshotJson[];
+}
+
+/**
+ * **Phase 5.7 V3.5.0.2 (2026-05-24) -- flattened workbook snapshot for
+ * IDE-side rendering.**
+ *
+ * Returned by {@link CollabSessionInstance.workbookSnapshot}.  Per
+ * V3.5.0.1 D3: chosen over the alternative (mirror full ql-storage
+ * Workbook API across FFI) because the flattened view is pre-shaped
+ * for the IDE renderer.
+ *
+ * **V3.5.0.2 ship**: `sheets` only.  V3.5.0.5 will add `names: NamedRangeJson[]`
+ * + `formats: FormatDefJson[]` once the session-wide caches land;
+ * additive (no shape break for V3.5.0.2 consumers that destructure
+ * `.sheets` only).
+ *
+ * **Performance note (R-V3.5-1)**: large workbooks produce large JSON.
+ * Callers MUST batch (do NOT call per-keystroke); the napi method's
+ * per-call cost is O(N) in op count from rebuild_workbook.  V3.6+ may
+ * add incremental deltas.
+ */
+export interface WorkbookSnapshotJson {
+	sheets: SheetSnapshotJson[];
+}
+
 export interface CollabSessionInstance {
 	/**
 	 * V1 convenience: append a `PutValue` op with a numeric value.
@@ -261,6 +343,25 @@ export interface CollabSessionInstance {
 	 * call this, then call {@link peerPresence} per returned id.
 	 */
 	peersWithPresence(): bigint[];
+
+	// =====================================================================
+	// Phase 5.7 V3.5.0.2 (2026-05-24) -- workbook snapshot napi (D3)
+	// =====================================================================
+
+	/**
+	 * Return the full workbook flattened to a JSON-serializable
+	 * snapshot for IDE rendering.  See {@link WorkbookSnapshotJson}.
+	 *
+	 * Per-call cost is O(N) in op count (rebuild_workbook materializes
+	 * a fresh Workbook to enumerate sheet names + count); per-sheet
+	 * cells come from the V3.3.0.3 incremental cache.
+	 *
+	 * Use the typed wrapper {@link workbookSnapshot} from `./session`.
+	 *
+	 * @throws Error with `parseQuantbookError(err).code === 'session_oplog'`
+	 *         if rebuild_workbook fails (replay error / rename-repair).
+	 */
+	workbookSnapshot(): WorkbookSnapshotJson;
 
 	// =====================================================================
 	// Phase 5.7 V3.4.0.4a (2026-05-23) -- .qbook persistence (save side)

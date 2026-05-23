@@ -34,6 +34,7 @@ import type {
 	QuantbookErrorCode,
 	QuantbookErrorInfo,
 	TransportInstance,
+	WorkbookSnapshotJson,
 } from './types';
 
 /**
@@ -161,6 +162,24 @@ export function sessionFromQbook(path: string, peerIdOverride: bigint): CollabSe
  */
 export function addSheet(session: CollabSessionInstance, name: string, chunkRows = 1000): void {
 	session.addSheet(name, chunkRows);
+}
+
+/**
+ * **Phase 5.7 V3.5.0.2 (2026-05-24) -- typed wrapper for
+ * `CollabSession.workbookSnapshot`.**
+ *
+ * Return the full workbook flattened to a {@link WorkbookSnapshotJson}
+ * for IDE-side rendering.  Per-call cost is O(N) in op count
+ * (rebuild_workbook materializes a fresh Workbook); IDE callers MUST
+ * batch (do NOT call per-keystroke).  See {@link WorkbookSnapshotJson}
+ * docstring for the shape contract + V3.5.0.5 forward-extend note.
+ *
+ * Single-line indirection mirrors `exportToQbook` / `sessionFromQbook`
+ * pattern for API surface stability across future engine signature
+ * changes.
+ */
+export function workbookSnapshot(session: CollabSessionInstance): WorkbookSnapshotJson {
+	return session.workbookSnapshot();
 }
 
 /**
