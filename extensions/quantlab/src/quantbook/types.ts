@@ -164,6 +164,30 @@ export interface CollabSessionInstance {
 	 */
 	addSheet(name: string, chunkRows: number): void;
 
+	/**
+	 * **Phase 5.7 V3.5.0.3a (2026-05-24)** -- append an `Op::RenameSheet`
+	 * to this session.  The sheet at `id` is renamed to `newName` at
+	 * replay time.  `id` is the current u16 sheet id (the index assigned
+	 * by `addSheet` in append order).
+	 *
+	 * **Contract divergence from engine `WorkbookRuntime::rename_sheet`**:
+	 * this napi is a THIN wrapper that appends ONLY `Op::RenameSheet` --
+	 * formula text referencing the old sheet name stays stale in the
+	 * cache until the next `workbookSnapshot` / `exportToQbook` call,
+	 * which triggers Phase 5.3 `repair_sheet_rename_chain` at
+	 * rebuild_workbook time.  For V3.5.0.3a scope this is acceptable
+	 * (IDE flow always reads through workbookSnapshot).
+	 *
+	 * **CRDT convergence**: cross-peer renames converge via Phase 5.3
+	 * step 3 chain repair; concurrent renames to different names
+	 * produce deterministic post-merge state.
+	 *
+	 * @throws `[bad_argument]` if `id` exceeds u16 range OR refers to
+	 *         a non-existent sheet.
+	 * @throws `[session_oplog]` / `[session_replay]` per engine errors.
+	 */
+	renameSheet(id: number, newName: string): void;
+
 	/** Full snapshot export. Use for initial sync / handshake. */
 	exportBytes(): Uint8Array;
 

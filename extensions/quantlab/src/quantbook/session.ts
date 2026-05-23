@@ -165,6 +165,23 @@ export function addSheet(session: CollabSessionInstance, name: string, chunkRows
 }
 
 /**
+ * **Phase 5.7 V3.5.0.3a (2026-05-24) -- typed wrapper for
+ * `CollabSession.renameSheet`.**
+ *
+ * Append an `Op::RenameSheet` to the session.  See the engine napi
+ * docstring (mirrored in {@link CollabSessionInstance.renameSheet}) for
+ * the contract divergence vs `WorkbookRuntime::rename_sheet` (formula
+ * text rewriting deferred to `repair_sheet_rename_chain` at next
+ * rebuild_workbook).
+ *
+ * Single-line indirection mirrors `addSheet` / `workbookSnapshot` for
+ * API surface stability.
+ */
+export function renameSheet(session: CollabSessionInstance, id: number, newName: string): void {
+	session.renameSheet(id, newName);
+}
+
+/**
  * **Phase 5.7 V3.5.0.2 (2026-05-24) -- typed wrapper for
  * `CollabSession.workbookSnapshot`.**
  *

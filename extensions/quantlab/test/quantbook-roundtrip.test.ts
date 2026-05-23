@@ -63,6 +63,7 @@ import {
 	peersWithPresence,
 	quantbookEngineVersion,
 	redo,
+	renameSheet,
 	sessionFromQbook,
 	sessionFromSnapshot,
 	sweepPresence,
@@ -4486,4 +4487,130 @@ suite('quantbook V3.5.0.2 -- workbookSnapshot napi contract', function () {
 	});
 });
 
+// ============================================================================
+// Phase 5.7 V3.5.0.3a (2026-05-24) -- renameSheet napi contract
+// ============================================================================
+
+suite('quantbook V3.5.0.3a -- renameSheet napi contract', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('rename emits Op::RenameSheet (op count grows by 1)', () => {
+		const session = createSession(7701n);
+		addSheet(session, 'Original');
+		const before = session.opCount();
+		renameSheet(session, 0, 'Renamed');
+		assert.strictEqual(session.opCount(), before + 1,
+			'one renameSheet call appends exactly one op');
+	});
+
+	test('workbookSnapshot reflects the new name after rename', () => {
+		const session = createSession(7702n);
+		addSheet(session, 'Before');
+		renameSheet(session, 0, 'After');
+		const snap = workbookSnapshot(session);
+		assert.strictEqual(snap.sheets.length, 1);
+		assert.strictEqual(snap.sheets[0].name, 'After',
+			'snapshot reads the post-rename name via rebuild_workbook');
+		assert.strictEqual(snap.sheets[0].id, 0, 'sheet id unchanged by rename');
+	});
+
+	test('rename preserves cells on the renamed sheet', () => {
+		const session = createSession(7703n);
+		addSheet(session, 'A');
+		appendPutValueValidated(session, 0, 0, 0, 42);
+		appendPutValueValidated(session, 0, 1, 0, 99);
+		renameSheet(session, 0, 'B');
+		const snap = workbookSnapshot(session);
+		assert.strictEqual(snap.sheets[0].name, 'B');
+		assert.strictEqual(snap.sheets[0].cells.length, 2,
+			'rename does not touch cell content');
+		assert.strictEqual(snap.sheets[0].cells[0].value!.number, 42);
+		assert.strictEqual(snap.sheets[0].cells[1].value!.number, 99);
+	});
+
+	test('rename with id > u16::MAX -> bad_argument', () => {
+		const session = createSession(7704n);
+		addSheet(session, 'S');
+		try {
+			renameSheet(session, 70000, 'X');
+			assert.fail('expected throw for id > u16::MAX');
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			assert.strictEqual(info.code, 'bad_argument');
+			assert.ok(info.message.includes('65535'),
+				`expected u16 range message, got: ${info.message}`);
+		}
+	});
+
+	test('rename non-existent sheet id -> bad_argument', () => {
+		const session = createSession(7705n);
+		addSheet(session, 'OnlyOne');
+		// Sheet 0 exists; sheet 5 does NOT.
+		try {
+			renameSheet(session, 5, 'Nope');
+			assert.fail('expected throw for non-existent sheet');
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			assert.strictEqual(info.code, 'bad_argument');
+			assert.ok(info.message.includes('does not exist'),
+				`expected existence-check message, got: ${info.message}`);
+		}
+	});
+
+	test('multiple renames of the same sheet: last-write-wins via snapshot', () => {
+		const session = createSession(7706n);
+		addSheet(session, 'V1');
+		renameSheet(session, 0, 'V2');
+		renameSheet(session, 0, 'V3');
+		renameSheet(session, 0, 'Final');
+		const snap = workbookSnapshot(session);
+		assert.strictEqual(snap.sheets[0].name, 'Final',
+			'last rename wins after rebuild_workbook walks the op log in order');
+		assert.strictEqual(session.opCount() >= 4, true,
+			'all 4 ops (1 add + 3 rename) appended');
+	});
+
+	test('cross-peer rename via mergeBytes converges (per Phase 5.3 repair chain)', () => {
+		// Setup: peer A creates a sheet + renames it; peer B merges A's
+		// snapshot then sees the renamed sheet.  Phase 5.3 step 3
+		// repair_sheet_rename_chain fires at workbookSnapshot's
+		// rebuild_workbook call.
+		const sessA = createSession(7707n);
+		addSheet(sessA, 'A-Original');
+		renameSheet(sessA, 0, 'A-Renamed');
+
+		const sessB = createSession(7708n);
+		sessB.mergeBytes(sessA.exportBytes());
+
+		const snapB = workbookSnapshot(sessB);
+		assert.strictEqual(snapB.sheets.length, 1,
+			'peer B sees peer A\'s sheet after merge');
+		assert.strictEqual(snapB.sheets[0].name, 'A-Renamed',
+			'peer B sees the rename via repair_sheet_rename_chain at rebuild_workbook');
+	});
+
+	test('round-trip via .qbook preserves rename', () => {
+		const session = createSession(7709n);
+		addSheet(session, 'BeforeSave');
+		appendPutValueValidated(session, 0, 0, 0, 7);
+		renameSheet(session, 0, 'AfterSave');
+
+		const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qbook-v3503a-'));
+		const target = path.join(scratchDir, 'rename.qbook');
+		try {
+			exportToQbook(session, target);
+			const reloaded = sessionFromQbook(target, 9999n);
+			const snap = workbookSnapshot(reloaded);
+			assert.strictEqual(snap.sheets[0].name, 'AfterSave',
+				'.qbook round-trip preserves the rename');
+			assert.strictEqual(snap.sheets[0].cells.length, 1,
+				'cells preserved through rename + round-trip');
+		} finally {
+			try { fs.rmSync(scratchDir, { recursive: true, force: true }); } catch { /* test cleanup */ }
+		}
+	});
+});
 
