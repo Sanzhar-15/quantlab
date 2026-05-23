@@ -1101,6 +1101,154 @@ impl CollabSession {
         Ok(())
     }
 
+    /// **Phase 5.7 V3.5.0.6 (2026-05-24) -- partial cache invalidation
+    /// for a single cell (D2 from V3.5.0.1 decision lock).**
+    ///
+    /// Drops the `(sheet, row, col)` entry from `last_snapshot`, then
+    /// walks the op log replaying ONLY ops that touch this cell, then
+    /// re-emits the resulting `CellState` if any ops surfaced.
+    ///
+    /// Used by `undo` / `redo` when the retracted op was cell-keyed
+    /// (PutValue / PutFormula / ClearFormula / SetCellFormat).  Avoids
+    /// touching unrelated cells: their existing `CellState` entries in
+    /// `last_snapshot` stay byte-identical across the call.  Cells that
+    /// AREN'T `(sheet, row, col)` are NEVER walked through their op
+    /// histories.
+    ///
+    /// **Cost**: O(N) op-log walk (same big-O as `rebuild_snapshot_cache`)
+    /// BUT only O(1) HashMap writes (the one cell), versus full rebuild's
+    /// O(cells) writes.  The real performance win comes V3.6+ if a
+    /// per-cell op-index lands; for V3.5.0.6 the architectural shape
+    /// ships now (foundation for incremental optimizations).
+    ///
+    /// **Correctness equivalence**: a call to `invalidate_cell(s, r, c)`
+    /// followed by reading `last_snapshot[(s, r, c)]` MUST produce the
+    /// same value as a full `rebuild_snapshot_cache()` followed by the
+    /// same read.  Pinned by the V3.5.0.6 side-by-side regression tests.
+    ///
+    /// **Ghost-entry-avoidance**: if the walk produces no effects on the
+    /// cell (the cell has no surviving cell-keyed ops, e.g., after undo
+    /// of the only op that touched it), the entry is REMOVED entirely
+    /// from `last_snapshot` (not left as an empty `CellState`).  Mirrors
+    /// `apply_cache_effect`'s extended all-fields-None removal contract.
+    ///
+    /// Returns `Err(OpLog(_))` if the op-log iterator emits a decode
+    /// error during the walk.
+    pub(crate) fn invalidate_cell(
+        &mut self,
+        sheet: u16,
+        row: u32,
+        col: u32,
+    ) -> Result<(), CollabSessionError> {
+        let target_key = (sheet, row, col);
+        // Drop the existing entry FIRST so the per-cell rebuild starts
+        // from a clean slate (mirrors rebuild_snapshot_cache's
+        // build-into-fresh pattern at the per-cell granularity).
+        self.last_snapshot.remove(&target_key);
+        // Walk the log, applying ONLY effects targeting `target_key`.
+        // Using the same `collect_cache_effects` + `apply_cache_effect`
+        // helpers as rebuild_snapshot_cache guarantees parity with the
+        // full-rebuild path (any op shape supported there is supported
+        // here).  The filter on key happens at apply time so BatchCommit
+        // recursion still surfaces its inner ops (we just discard the
+        // ones for other cells).
+        let mut effects: Vec<CacheEffect> = Vec::new();
+        let mut local_snapshot: HashMap<(u16, u32, u32), CellState> = HashMap::new();
+        for op_result in self.log.iter() {
+            let op = op_result.map_err(CollabSessionError::OpLog)?;
+            effects.clear();
+            Self::collect_cache_effects(&op, &mut effects);
+            for effect in effects.drain(..) {
+                // Only apply effects targeting the requested cell.
+                let key = match &effect {
+                    CacheEffect::PutValue { key, .. } => *key,
+                    CacheEffect::PutFormula { key, .. } => *key,
+                    CacheEffect::ClearFormula { key } => *key,
+                    CacheEffect::SetCellFormat { key, .. } => *key,
+                };
+                if key == target_key {
+                    Self::apply_cache_effect(&mut local_snapshot, effect);
+                }
+            }
+        }
+        // Move the (single) resulting entry (if any) into the main
+        // snapshot.  apply_cache_effect's ghost-entry-avoidance may
+        // have removed the entry entirely (e.g., if the only effect
+        // was a ClearFormula on a never-set cell); in that case
+        // local_snapshot is empty and we leave last_snapshot's removed
+        // state intact.
+        if let Some(state) = local_snapshot.remove(&target_key) {
+            self.last_snapshot.insert(target_key, state);
+        }
+        Ok(())
+    }
+
+    /// **Phase 5.7 V3.5.0.6 (2026-05-24) -- extract affected cell coords
+    /// from a cell-keyed Op (or BatchCommit of all-cell-keyed inner ops).**
+    ///
+    /// Returns `Some(cells)` if the op (and all inner ops for BatchCommit)
+    /// are cell-keyed.  `None` signals "non-cell-keyed op present -- caller
+    /// MUST fall back to full `rebuild_snapshot_cache`".  Used by the
+    /// undo/redo dispatch to decide between partial-invalidate + full-
+    /// rebuild paths.
+    ///
+    /// **Conservative**: BatchCommit with ANY non-cell-keyed inner op
+    /// returns None.  Mixed cell-keyed + session-wide BatchCommit shapes
+    /// don't currently exist in production (V3.5.0.6 ship; `WorkbookRuntime`
+    /// emits only homogeneous BatchCommit groups), but the conservative
+    /// behavior keeps the dispatch correct even if a future producer
+    /// emits mixed shapes.
+    ///
+    /// **Deduplication**: a BatchCommit { PutValue(s, r, c), ClearFormula(s, r, c) }
+    /// returns `Some(vec![(s, r, c)])` (one entry per unique cell, not
+    /// per op).  Caller calls `invalidate_cell` once per coord.
+    fn affected_cells_for_partial_invalidate(op: &Op) -> Option<Vec<(u16, u32, u32)>> {
+        let mut cells: Vec<(u16, u32, u32)> = Vec::new();
+        if !Self::collect_affected_cells_recursive(op, &mut cells) {
+            return None;
+        }
+        // Dedup (BatchCommit can touch the same cell from multiple inner ops).
+        cells.sort_unstable();
+        cells.dedup();
+        Some(cells)
+    }
+
+    /// Helper: recurse into BatchCommit; return false if any inner op
+    /// is non-cell-keyed.
+    fn collect_affected_cells_recursive(op: &Op, out: &mut Vec<(u16, u32, u32)>) -> bool {
+        match op {
+            Op::PutValue { sheet, row, col, .. } => {
+                out.push((*sheet, *row, *col));
+                true
+            }
+            Op::PutFormula { sheet, row, col, .. } => {
+                out.push((*sheet, *row, *col));
+                true
+            }
+            Op::ClearFormula { sheet, row, col } => {
+                out.push((*sheet, *row, *col));
+                true
+            }
+            Op::SetCellFormat { sheet, row, col, .. } => {
+                out.push((*sheet, *row, *col));
+                true
+            }
+            Op::BatchCommit { ops } => {
+                for inner in ops {
+                    if !Self::collect_affected_cells_recursive(inner, out) {
+                        return false;
+                    }
+                }
+                true
+            }
+            // All other variants are session-wide (AddSheet, RenameSheet,
+            // RemoveSheet, MoveSheet, RegisterFormat, table ops, etc.)
+            // OR not currently supported by collect_cache_effects's
+            // cell-keyed walker.  Conservative fallback.
+            _ => false,
+        }
+    }
+
     /// **Phase 5.3 step 5b + 5b audit closure + step 5c (2026-05-20) —
     /// production wiring closure (Opus-A Scenario E HIGH + V1 LIM #3,
     /// audit-locked D-5.3-1):** atomically rebuild a FRESH `Workbook`
@@ -2188,6 +2336,32 @@ impl CollabSession {
     /// the inverse op is already committed to `self.log` — same
     /// shape as `append_op`.
     pub fn undo(&mut self) -> Result<bool, CollabSessionError> {
+        // **Phase 5.7 V3.5.0.6 (2026-05-24) D2 partial-invalidate**:
+        // capture the most-recent visible op + pre-undo log length
+        // BEFORE the retract.  Loro `UndoManager::undo()` retracts the
+        // most-recent LOCAL op (and Loro shrinks the visible LoroList
+        // by 1 -- pinned by `undo_retracts_visible_op_from_op_log_len`
+        // test); when no remote op has landed AFTER that local op,
+        // the most-recent VISIBLE op equals the to-be-retracted op.
+        //
+        // Conservative dispatch: partial-invalidate ONLY when (a) the
+        // log shrank by exactly 1, AND (b) the captured op is cell-keyed
+        // (or a BatchCommit of only-cell-keyed inner ops per
+        // `affected_cells_for_partial_invalidate`).  Otherwise fall
+        // back to the V3.3.0.X HIGH-1 full `rebuild_snapshot_cache`.
+        //
+        // Falls back to full rebuild on:
+        // - Non-cell-keyed retracted op (AddSheet / RenameSheet /
+        //   RemoveSheet / MoveSheet / RegisterFormat / table ops / ...)
+        // - BatchCommit mixing cell-keyed + non-cell-keyed inner ops
+        // - len shrinkage != 1 (defensive against future Loro semantics)
+        // - Captured-op decode error (`OpLog(_)` propagates)
+        let pre_undo_last_op: Option<Op> = self.log
+            .iter()
+            .last()
+            .transpose()
+            .map_err(CollabSessionError::OpLog)?;
+        let pre_undo_len = self.log.len();
         let consumed = self.undo.undo()?;
         // **Phase 5.5 V2 V2 audit closure (Codex M2, 2026-05-21):** only
         // auto-flush when an undo item was actually consumed. The prior
@@ -2197,16 +2371,37 @@ impl CollabSession {
         // gate, `undo` on an empty stack stays `Ok(false)` regardless
         // of transport state (no mutation, no flush attempt).
         if consumed {
-            // **V3.3.0.X audit closure (HIGH-1, 2026-05-23, convergent
-            // Codex + Opus)**: undo MUST rebuild the `last_snapshot`
-            // cache because `UndoManager::undo` appends an inverse op
-            // to the visible op log -- the cache invariant "every
-            // op-log mutation site updates the cache" was FALSE for
-            // undo/redo prior to this closure.  Rebuild before the
-            // auto-flush so any caller observing the post-undo state
-            // (either via subsequent snapshot read OR via the auto-
-            // flushed delta to a peer) sees the canonical view.
-            self.rebuild_snapshot_cache()?;
+            // **V3.5.0.6 D2 partial-invalidate dispatch (extends V3.3.0.X
+            // HIGH-1)**: prefer partial-invalidate when the retracted op
+            // shape supports it; fall back to full rebuild otherwise.
+            //
+            // The cache invariant "every op-log mutation site updates
+            // the cache" stays satisfied by either path:
+            // - Partial: invalidate_cell drops + re-derives the affected
+            //   cells from the post-undo log walks.
+            // - Full: rebuild_snapshot_cache drops + re-derives ALL cells.
+            //
+            // Either path runs BEFORE auto-flush so callers observing
+            // the post-undo state (subsequent snapshot read OR
+            // auto-flushed delta to a peer) see the canonical view.
+            let post_undo_len = self.log.len();
+            let partial_cells = if pre_undo_len == post_undo_len + 1 {
+                pre_undo_last_op
+                    .as_ref()
+                    .and_then(Self::affected_cells_for_partial_invalidate)
+            } else {
+                None
+            };
+            match partial_cells {
+                Some(cells) => {
+                    for (sheet, row, col) in cells {
+                        self.invalidate_cell(sheet, row, col)?;
+                    }
+                }
+                None => {
+                    self.rebuild_snapshot_cache()?;
+                }
+            }
             self.maybe_auto_flush()?;
         }
         Ok(consumed)
@@ -2222,14 +2417,45 @@ impl CollabSession {
     /// the redo's appended op is already in `self.log` (mutate-
     /// then-flush).
     pub fn redo(&mut self) -> Result<bool, CollabSessionError> {
+        // **Phase 5.7 V3.5.0.6 (2026-05-24) D2 partial-invalidate**:
+        // mirrors `undo` dispatch.  Loro `UndoManager::redo()` appends
+        // the previously-retracted op back to the visible log (grows
+        // by 1).  Capture the post-redo last op AFTER the redo runs
+        // and check its shape: cell-keyed -> partial; else full rebuild.
+        //
+        // Unlike undo (where we capture BEFORE so we know what gets
+        // retracted), redo's appended op IS the post-redo last op,
+        // so we capture AFTER.  Same conservative shrinkage check
+        // applies (post_len == pre_len + 1).
+        let pre_redo_len = self.log.len();
         let consumed = self.undo.redo()?;
         // Phase 5.5 V2 V2 audit closure (Codex M2): gate matches `undo`.
         if consumed {
-            // V3.3.0.X audit closure (HIGH-1, 2026-05-23): matches `undo`.
-            // redo appends an inverse-of-inverse op (effectively restoring
-            // the original PutValue); the cache MUST be rebuilt so
-            // snapshot_cells reflects the restored cells.
-            self.rebuild_snapshot_cache()?;
+            // V3.5.0.6 D2 partial-invalidate dispatch (extends V3.3.0.X
+            // HIGH-1): prefer partial-invalidate; fall back to full rebuild.
+            let post_redo_len = self.log.len();
+            let post_redo_last_op: Option<Op> = if pre_redo_len + 1 == post_redo_len {
+                self.log
+                    .iter()
+                    .last()
+                    .transpose()
+                    .map_err(CollabSessionError::OpLog)?
+            } else {
+                None
+            };
+            let partial_cells = post_redo_last_op
+                .as_ref()
+                .and_then(Self::affected_cells_for_partial_invalidate);
+            match partial_cells {
+                Some(cells) => {
+                    for (sheet, row, col) in cells {
+                        self.invalidate_cell(sheet, row, col)?;
+                    }
+                }
+                None => {
+                    self.rebuild_snapshot_cache()?;
+                }
+            }
             self.maybe_auto_flush()?;
         }
         Ok(consumed)
@@ -3574,6 +3800,329 @@ mod tests {
             "undo of last PutValue reveals the prior PutValue");
         assert_eq!(state_post.format, Some(FormatId::Builtin(2)),
             "format survives the rebuild via SetCellFormat replay");
+    }
+
+    // ========================================================================
+    // V3.5.0.6 (2026-05-24) -- partial-invalidate undo (D2)
+    // ========================================================================
+
+    /// V3.5.0.6 test helper: capture the current `last_snapshot` cache
+    /// via `snapshot_cells` for every sheet that surfaces.  Returns a
+    /// HashMap mirroring the cache contents so tests can compare two
+    /// post-undo states for equality (partial vs full-rebuild).
+    fn capture_full_cache(s: &CollabSession) -> HashMap<(u16, u32, u32), CellState> {
+        let mut out: HashMap<(u16, u32, u32), CellState> = HashMap::new();
+        for sheet in s.list_sheets_from_cache() {
+            for ((row, col), state) in s.snapshot_cells(sheet) {
+                out.insert((sheet, row, col), state);
+            }
+        }
+        out
+    }
+
+    /// V3.5.0.6 helper: run undo with the current dispatch (partial-or-
+    /// full per the production logic), capture the resulting cache.
+    fn undo_and_capture(s: &mut CollabSession) -> HashMap<(u16, u32, u32), CellState> {
+        assert!(s.undo().unwrap(), "undo must consume a stack item");
+        capture_full_cache(s)
+    }
+
+    /// V3.5.0.6 helper: undo via the production dispatch, then FORCE a
+    /// full cache rebuild via the test-fixture seam
+    /// (`force_clear_snapshot_cache` + `rebuild_snapshot_cache`), then
+    /// capture.  Used by side-by-side tests to compare the dispatch's
+    /// post-undo cache against the full-rebuild ground truth on the
+    /// IDENTICAL post-undo op log.
+    ///
+    /// The full-rebuild call AFTER the undo guarantees that whatever
+    /// the dispatch chose (partial or full path), the capture reflects
+    /// what `rebuild_snapshot_cache` would produce.  Equality between
+    /// this and `undo_and_capture` on a mirror session proves the
+    /// dispatch's partial path matches the full-rebuild ground truth.
+    fn undo_then_force_full_rebuild_and_capture(s: &mut CollabSession) -> HashMap<(u16, u32, u32), CellState> {
+        assert!(s.undo().unwrap(), "undo must consume a stack item");
+        s.force_clear_snapshot_cache();
+        s.rebuild_snapshot_cache().unwrap();
+        capture_full_cache(s)
+    }
+
+    #[test]
+    fn invalidate_cell_matches_full_rebuild_for_single_put_value() {
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 42.0)).unwrap();
+        s.append_op(put_value(0, 1, 0, 7.0)).unwrap();
+        // Sanity: both cells present.
+        assert_eq!(s.snapshot_cells(0).len(), 2);
+        // Capture full-rebuild baseline.
+        let baseline = capture_full_cache(&s);
+        // Drop cell (0, 0, 0) from cache + re-derive via invalidate_cell.
+        s.invalidate_cell(0, 0, 0).unwrap();
+        let partial = capture_full_cache(&s);
+        assert_eq!(partial, baseline,
+            "invalidate_cell re-derives the exact CellState the full rebuild produces");
+    }
+
+    #[test]
+    fn invalidate_cell_preserves_unrelated_cells_byte_identical() {
+        // V3.5.0.6 key property: invalidate_cell touches ONLY the named
+        // (sheet, row, col) entry; other entries in last_snapshot stay
+        // structurally identical (HashMap entry not replaced).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s.append_op(put_value(0, 1, 0, 2.0)).unwrap();
+        s.append_op(put_value(0, 2, 0, 3.0)).unwrap();
+        // Read out the unrelated cells' states.
+        let unrelated_before: Vec<((u32, u32), CellState)> = s.snapshot_cells(0)
+            .into_iter()
+            .filter(|((row, col), _)| !(*row == 0 && *col == 0))
+            .collect();
+        s.invalidate_cell(0, 0, 0).unwrap();
+        let unrelated_after: Vec<((u32, u32), CellState)> = s.snapshot_cells(0)
+            .into_iter()
+            .filter(|((row, col), _)| !(*row == 0 && *col == 0))
+            .collect();
+        assert_eq!(unrelated_after, unrelated_before,
+            "invalidate_cell on (0,0,0) must not touch other cells");
+    }
+
+    #[test]
+    fn invalidate_cell_ghost_entry_removal_after_full_clear() {
+        // V3.5.0.6 ghost-entry-avoidance: a cell with all fields None
+        // after the walk must be REMOVED from cache (not left as empty
+        // CellState).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        // Setup: append a PutFormula then a ClearFormula on the same cell.
+        // After the walk, value=None, formula=None, format=None.
+        // V3.4.0.X MEDIUM-1 ghost-entry-avoidance applies via the cache
+        // walker, so the cell should be removed at apply time.
+        s.append_op(put_formula(0, 0, 0, "=A1+1")).unwrap();
+        s.append_op(clear_formula(0, 0, 0)).unwrap();
+        // The live append_op path already removed the entry; verify.
+        assert_eq!(s.snapshot_cells(0).len(), 0);
+        // Now exercise invalidate_cell on the same coord -- should also
+        // result in no entry.
+        s.invalidate_cell(0, 0, 0).unwrap();
+        assert_eq!(s.snapshot_cells(0).len(), 0,
+            "invalidate_cell of formula-only-then-clear leaves no ghost entry");
+    }
+
+    #[test]
+    fn undo_partial_invalidate_matches_full_rebuild_put_value() {
+        // V3.5.0.6 side-by-side ground-truth pin: undo via partial-
+        // invalidate dispatch + undo via forced full-rebuild produce
+        // IDENTICAL caches for cell-keyed retraction.
+        let mut s_partial = CollabSession::new(PeerId::new(1)).unwrap();
+        s_partial.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s_partial.append_op(put_value(0, 1, 0, 2.0)).unwrap();
+        s_partial.append_op(put_value(0, 0, 1, 99.0)).unwrap();
+        // Mirror session for the full-rebuild comparison.
+        let mut s_full = CollabSession::new(PeerId::new(1)).unwrap();
+        s_full.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s_full.append_op(put_value(0, 1, 0, 2.0)).unwrap();
+        s_full.append_op(put_value(0, 0, 1, 99.0)).unwrap();
+
+        let cache_partial = undo_and_capture(&mut s_partial);
+        let cache_full = undo_then_force_full_rebuild_and_capture(&mut s_full);
+        assert_eq!(cache_partial, cache_full,
+            "undo via partial-invalidate dispatch produces same cache as full rebuild");
+    }
+
+    #[test]
+    fn undo_partial_invalidate_matches_full_rebuild_put_formula() {
+        let mut s_partial = CollabSession::new(PeerId::new(1)).unwrap();
+        s_partial.append_op(put_value(0, 0, 0, 10.0)).unwrap();
+        s_partial.append_op(put_formula(0, 0, 0, "=B1")).unwrap();
+        let mut s_full = CollabSession::new(PeerId::new(1)).unwrap();
+        s_full.append_op(put_value(0, 0, 0, 10.0)).unwrap();
+        s_full.append_op(put_formula(0, 0, 0, "=B1")).unwrap();
+
+        let cache_partial = undo_and_capture(&mut s_partial);
+        let cache_full = undo_then_force_full_rebuild_and_capture(&mut s_full);
+        assert_eq!(cache_partial, cache_full,
+            "undo of PutFormula: partial == full");
+    }
+
+    #[test]
+    fn undo_partial_invalidate_matches_full_rebuild_clear_formula() {
+        let mut s_partial = CollabSession::new(PeerId::new(1)).unwrap();
+        s_partial.append_op(put_value(0, 0, 0, 10.0)).unwrap();
+        s_partial.append_op(put_formula(0, 0, 0, "=B1")).unwrap();
+        s_partial.append_op(clear_formula(0, 0, 0)).unwrap();
+        let mut s_full = CollabSession::new(PeerId::new(1)).unwrap();
+        s_full.append_op(put_value(0, 0, 0, 10.0)).unwrap();
+        s_full.append_op(put_formula(0, 0, 0, "=B1")).unwrap();
+        s_full.append_op(clear_formula(0, 0, 0)).unwrap();
+
+        let cache_partial = undo_and_capture(&mut s_partial);
+        let cache_full = undo_then_force_full_rebuild_and_capture(&mut s_full);
+        assert_eq!(cache_partial, cache_full,
+            "undo of ClearFormula: partial == full");
+    }
+
+    #[test]
+    fn undo_partial_invalidate_matches_full_rebuild_set_cell_format() {
+        // V3.5.0.5 new variant integrated with V3.5.0.6 partial-invalidate.
+        let mut s_partial = CollabSession::new(PeerId::new(1)).unwrap();
+        s_partial.append_op(put_value(0, 0, 0, 5.0)).unwrap();
+        s_partial.append_op(set_cell_format_builtin(0, 0, 0, 2)).unwrap();
+        let mut s_full = CollabSession::new(PeerId::new(1)).unwrap();
+        s_full.append_op(put_value(0, 0, 0, 5.0)).unwrap();
+        s_full.append_op(set_cell_format_builtin(0, 0, 0, 2)).unwrap();
+
+        let cache_partial = undo_and_capture(&mut s_partial);
+        let cache_full = undo_then_force_full_rebuild_and_capture(&mut s_full);
+        assert_eq!(cache_partial, cache_full,
+            "undo of SetCellFormat: partial == full (V3.5.0.5 + V3.5.0.6 integration)");
+    }
+
+    #[test]
+    fn undo_falls_back_to_full_rebuild_for_non_cell_keyed_op() {
+        // V3.5.0.6 fallback path: undo retracting a non-cell-keyed op
+        // (here Op::AddSheet) takes the full rebuild branch, NOT
+        // partial.  We can't directly observe "which branch ran" but
+        // we can verify the cache is correct + the side-by-side equality
+        // still holds (defensive).
+        let mut s_partial = CollabSession::new(PeerId::new(1)).unwrap();
+        s_partial.append_op(Op::AddSheet { name: "S1".to_string(), chunk_rows: 100 }).unwrap();
+        s_partial.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s_partial.append_op(Op::AddSheet { name: "S2".to_string(), chunk_rows: 100 }).unwrap();
+        let mut s_full = CollabSession::new(PeerId::new(1)).unwrap();
+        s_full.append_op(Op::AddSheet { name: "S1".to_string(), chunk_rows: 100 }).unwrap();
+        s_full.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s_full.append_op(Op::AddSheet { name: "S2".to_string(), chunk_rows: 100 }).unwrap();
+
+        // Undo retracts the last AddSheet (non-cell-keyed -> full rebuild path).
+        let cache_partial = undo_and_capture(&mut s_partial);
+        let cache_full = undo_then_force_full_rebuild_and_capture(&mut s_full);
+        assert_eq!(cache_partial, cache_full,
+            "undo of AddSheet: full-rebuild dispatch produces same cache");
+        // Sanity: the put_value cell still exists.
+        let entries = s_partial.snapshot_cells(0);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.value, Some(CellWireValue::Number(1.0)));
+    }
+
+    #[test]
+    fn undo_batch_commit_cell_keyed_uses_partial_invalidate() {
+        // V3.5.0.6: BatchCommit of only-cell-keyed inner ops -> partial path.
+        let mut s_partial = CollabSession::new(PeerId::new(1)).unwrap();
+        s_partial.append_op(put_value(0, 5, 5, 10.0)).unwrap();
+        s_partial.append_op(Op::BatchCommit {
+            ops: vec![
+                put_value(0, 5, 5, 20.0),
+                set_cell_format_builtin(0, 5, 5, 3),
+            ],
+        }).unwrap();
+        let mut s_full = CollabSession::new(PeerId::new(1)).unwrap();
+        s_full.append_op(put_value(0, 5, 5, 10.0)).unwrap();
+        s_full.append_op(Op::BatchCommit {
+            ops: vec![
+                put_value(0, 5, 5, 20.0),
+                set_cell_format_builtin(0, 5, 5, 3),
+            ],
+        }).unwrap();
+
+        let cache_partial = undo_and_capture(&mut s_partial);
+        let cache_full = undo_then_force_full_rebuild_and_capture(&mut s_full);
+        assert_eq!(cache_partial, cache_full,
+            "undo of BatchCommit (all cell-keyed): partial == full");
+        // Sanity: the prior PutValue(10.0) is now what cell (5,5) shows
+        // after the batch was undone.
+        let state = &s_partial.snapshot_cells(0)[0].1;
+        assert_eq!(state.value, Some(CellWireValue::Number(10.0)));
+        assert_eq!(state.format, None, "format from batch is gone");
+    }
+
+    #[test]
+    fn redo_partial_invalidate_matches_full_rebuild() {
+        // V3.5.0.6: redo dispatch mirrors undo.
+        let mut s_partial = CollabSession::new(PeerId::new(1)).unwrap();
+        s_partial.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s_partial.append_op(put_value(0, 1, 0, 2.0)).unwrap();
+        s_partial.undo().unwrap();
+        // Now redo:
+        assert!(s_partial.redo().unwrap());
+        let cache_partial = capture_full_cache(&s_partial);
+
+        let mut s_full = CollabSession::new(PeerId::new(1)).unwrap();
+        s_full.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s_full.append_op(put_value(0, 1, 0, 2.0)).unwrap();
+        s_full.undo().unwrap();
+        assert!(s_full.redo().unwrap());
+        // Force a full rebuild AFTER the redo (NOT another undo) so the
+        // capture reflects rebuild_snapshot_cache's ground truth.
+        s_full.force_clear_snapshot_cache();
+        s_full.rebuild_snapshot_cache().unwrap();
+        let cache_full = capture_full_cache(&s_full);
+        assert_eq!(cache_partial, cache_full,
+            "redo via partial-invalidate dispatch produces same cache as full rebuild");
+    }
+
+    #[test]
+    fn undo_partial_invalidate_via_multiple_cells_in_batch() {
+        // V3.5.0.6: BatchCommit touching MULTIPLE distinct cells.  Each
+        // unique cell coord gets one invalidate_cell call.
+        let mut s_partial = CollabSession::new(PeerId::new(1)).unwrap();
+        s_partial.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s_partial.append_op(put_value(0, 1, 0, 2.0)).unwrap();
+        s_partial.append_op(Op::BatchCommit {
+            ops: vec![
+                put_value(0, 0, 0, 100.0),
+                put_value(0, 1, 0, 200.0),
+                put_value(0, 2, 0, 300.0),
+            ],
+        }).unwrap();
+        let mut s_full = CollabSession::new(PeerId::new(1)).unwrap();
+        s_full.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s_full.append_op(put_value(0, 1, 0, 2.0)).unwrap();
+        s_full.append_op(Op::BatchCommit {
+            ops: vec![
+                put_value(0, 0, 0, 100.0),
+                put_value(0, 1, 0, 200.0),
+                put_value(0, 2, 0, 300.0),
+            ],
+        }).unwrap();
+
+        let cache_partial = undo_and_capture(&mut s_partial);
+        let cache_full = undo_then_force_full_rebuild_and_capture(&mut s_full);
+        assert_eq!(cache_partial, cache_full,
+            "undo of multi-cell BatchCommit: partial == full");
+    }
+
+    #[test]
+    fn affected_cells_helper_returns_none_for_non_cell_keyed() {
+        // Direct unit test for the dispatcher's classification helper.
+        let add_sheet = Op::AddSheet { name: "S".to_string(), chunk_rows: 100 };
+        assert!(CollabSession::affected_cells_for_partial_invalidate(&add_sheet).is_none(),
+            "AddSheet -> None (forces full rebuild)");
+        let rename_sheet = Op::RenameSheet {
+            id: 0, old_name: "A".to_string(), new_name: "B".to_string(),
+        };
+        assert!(CollabSession::affected_cells_for_partial_invalidate(&rename_sheet).is_none(),
+            "RenameSheet -> None");
+        let mixed_batch = Op::BatchCommit {
+            ops: vec![
+                put_value(0, 0, 0, 1.0),
+                Op::AddSheet { name: "S".to_string(), chunk_rows: 100 },
+            ],
+        };
+        assert!(CollabSession::affected_cells_for_partial_invalidate(&mixed_batch).is_none(),
+            "BatchCommit with non-cell-keyed inner -> None (conservative)");
+    }
+
+    #[test]
+    fn affected_cells_helper_returns_dedup_sorted_for_cell_keyed() {
+        let batch = Op::BatchCommit {
+            ops: vec![
+                put_value(0, 5, 5, 1.0),
+                put_value(0, 1, 1, 2.0),
+                put_formula(0, 5, 5, "=A1"),  // duplicate cell coord
+                set_cell_format_builtin(0, 5, 5, 2),  // duplicate again
+            ],
+        };
+        let cells = CollabSession::affected_cells_for_partial_invalidate(&batch).unwrap();
+        assert_eq!(cells, vec![(0, 1, 1), (0, 5, 5)],
+            "deduplicated + sorted");
     }
 
     #[test]
