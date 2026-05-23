@@ -164,9 +164,21 @@ pub enum Op {
     ///   user-accessible.  V3.6+ may add `Op::RestoreSheet` if a
     ///   user-facing undo-delete flow is justified.
     ///
-    /// Wire format is additive (new variant on the serde-tagged enum);
-    /// no `OPLOG_SCHEMA_VERSION` bump needed.  Pre-V3.5.0.3b saved
-    /// .qbook files load cleanly + replay without seeing this variant.
+    /// **Wire format compatibility**: additive new variant on the serde-
+    /// tagged enum; **`OPLOG_SCHEMA_VERSION` NOT bumped** (consistent
+    /// with W5-91 Op::RenameSheet addition + every prior variant
+    /// addition's convention).  **Backward-compat**: V3.5.0.3b+ binaries
+    /// read pre-V3.5.0.3b .qbook files cleanly (no Op::RemoveSheet
+    /// instances; nothing to deserialize).
+    /// **Forward-compat caveat**: pre-V3.5.0.3b binaries reading a
+    /// V3.5.0.3b+ saved .qbook with `Op::RemoveSheet` instances WILL
+    /// fail deserialization with `OpLogError::Deserialize` (serde
+    /// `tag = "kind"` rejects unknown variant tags; no `#[serde(other)]`
+    /// catch-all on this enum).  Same forward-compat property as every
+    /// historical Op variant addition.  V3.x maintainers: if forward-
+    /// compat for older readers becomes a product concern, ship a
+    /// schema-version bump + migrator AS A SEPARATE PHASE; do NOT
+    /// retrofit individual Op additions.
     RemoveSheet { id: SheetId },
 
     /// **Phase 5.7 V3.5.0.3c (2026-05-24):** reorder sheets in the
@@ -218,11 +230,19 @@ pub enum Op {
     ///   new id.  Sessions that never call `Op::MoveSheet` see
     ///   identical iteration order to V3.5.0.3b (`0..sheet_count()`).
     ///
-    /// Wire format is additive (new variant on the serde-tagged enum);
-    /// no `OPLOG_SCHEMA_VERSION` bump needed.  Pre-V3.5.0.3c saved
-    /// .qbook files load cleanly + replay without seeing this variant
-    /// (their `sheet_display_order` is rebuilt fresh in append order
-    /// during `replay_into` -> `add_sheet` calls).
+    /// **Wire format compatibility**: additive new variant on the serde-
+    /// tagged enum; **`OPLOG_SCHEMA_VERSION` NOT bumped** (consistent
+    /// with W5-91 Op::RenameSheet addition + V3.5.0.3b Op::RemoveSheet
+    /// addition).  **Backward-compat**: V3.5.0.3c+ binaries read
+    /// pre-V3.5.0.3c .qbook files cleanly -- no `Op::MoveSheet`
+    /// instances exist + `sheet_display_order` rebuilds fresh in
+    /// append order during `replay_into` -> `add_sheet` calls.
+    /// **Forward-compat caveat**: pre-V3.5.0.3c binaries reading a
+    /// V3.5.0.3c+ saved .qbook with `Op::MoveSheet` instances WILL
+    /// fail deserialization with `OpLogError::Deserialize` (same
+    /// serde `tag = "kind"` reject-unknown-variant behavior as
+    /// `Op::RemoveSheet` -- see that variant's docstring for the V3.x
+    /// maintainer guidance on schema bumps).
     MoveSheet {
         id: SheetId,
         /// 0-based target position in the post-move display order
