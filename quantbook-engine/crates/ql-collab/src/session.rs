@@ -1421,9 +1421,23 @@ impl CollabSession {
             // sheet are silently dropped via the early-return above.
             // Idempotent: a second RemoveSheet for the same id leaves
             // the tombstone set + snapshot unchanged.
+            //
+            // **V3.6.0.X audit-of-D3 closure (2026-05-23,
+            // CONVERGENT-MED-2 -- Codex Lane A LOW-4 / Opus Lane B
+            // MED-1)**: also drop `cell_op_index` entries for cells on
+            // the tombstoned sheet (mirrors `snapshot.retain`).  Pre-
+            // closure these ghost index entries persisted post-
+            // RemoveSheet -- bounded memory growth + a sync-invariant
+            // violation against the field's own "6-mutation-site
+            // discipline" docstring.  Functional correctness was
+            // preserved (the tombstone-aware early-return at the top
+            // of apply_cache_effect drops cell-keyed effects on
+            // tombstoned sheets before they reach the index push), but
+            // the index hygiene is improved by pruning.
             CacheEffect::RemoveSheet { id } => {
                 buckets.tombstones.insert(id);
                 buckets.snapshot.retain(|(sheet, _, _), _| *sheet != id);
+                buckets.cell_op_index.retain(|(sheet, _, _), _| *sheet != id);
             }
             // V3.6.0.3 D2 (2026-05-24): session-wide format-table cache
             // mirror.  V3.6.0.X audit-of-D2 closure (2026-05-23,
@@ -1882,6 +1896,36 @@ impl CollabSession {
     /// remaining buckets to per-cell consistency.  Callers OUTSIDE
     /// undo/redo MUST use `rebuild_snapshot_cache` instead.
     fn rebuild_op_indices_only(&mut self) -> Result<(), CollabSessionError> {
+        // **V3.6.0.X audit-of-D3 closure (2026-05-23, CONVERGENT-MED-2
+        // -- Codex Lane A MED-2)**: rebuild via the canonical
+        // `apply_cache_effect` walker with throwaway local snapshot +
+        // format_cache buckets + a local tombstones tracker.  Pre-
+        // closure this method duplicated only the raw index-push
+        // logic + skipped the tombstone filter that
+        // `apply_cache_effect` applies in `rebuild_snapshot_cache`,
+        // producing different index contents under tombstoned-sheet
+        // histories (Codex Probe 1: post-tombstone cell-keyed ops
+        // surfaced in `cell_op_index` here but were filtered out by
+        // `rebuild_snapshot_cache`).  Post-closure: the two paths
+        // produce identical index contents because they share the
+        // same effect-application code path.
+        //
+        // Buckets:
+        // - `local_snapshot` / `local_format_cache`: throwaway --
+        //   apply_cache_effect's snapshot/format mutations are
+        //   discarded; only the index side-effects matter.
+        // - `local_tombstones`: walker-local; we do NOT mutate
+        //   `self.removed_sheets` (the method's contract leaves it
+        //   untouched -- only undo/redo's full-rebuild fallback or
+        //   `rebuild_snapshot_cache` may swap it).
+        // - `fresh_cell_op_index` / `fresh_sheet_op_index`: the
+        //   actual output -- atomic-swapped into `self.cell_op_index`
+        //   / `self.sheet_op_index` only after the full walk
+        //   succeeds (mirrors `rebuild_snapshot_cache`'s atomic-swap
+        //   pattern; iter-Err mid-walk leaves session state intact).
+        let mut local_snapshot: HashMap<(u16, u32, u32), CellState> = HashMap::new();
+        let mut local_format_cache: HashMap<FormatId, Arc<str>> = HashMap::new();
+        let mut local_tombstones: HashSet<u16> = HashSet::new();
         let mut fresh_cell_op_index: HashMap<(u16, u32, u32), Vec<usize>> = HashMap::new();
         let mut fresh_sheet_op_index: HashMap<u16, Vec<usize>> = HashMap::new();
         let mut effects: Vec<CacheEffect> = Vec::new();
@@ -1889,30 +1933,15 @@ impl CollabSession {
             let op = op_result.map_err(CollabSessionError::OpLog)?;
             effects.clear();
             Self::collect_cache_effects(&op, &mut effects);
-            // V3.6.0.4 D3: extract cell + sheet keys per effect with
-            // dedup against the same op_log_index (mirrors
-            // `apply_cache_effect`'s index-maintenance logic).
+            let mut buckets = CacheBuckets {
+                snapshot: &mut local_snapshot,
+                tombstones: &mut local_tombstones,
+                format_cache: &mut local_format_cache,
+                cell_op_index: &mut fresh_cell_op_index,
+                sheet_op_index: &mut fresh_sheet_op_index,
+            };
             for effect in effects.drain(..) {
-                let cell_key = match &effect {
-                    CacheEffect::PutValue { key, .. } => Some(*key),
-                    CacheEffect::PutFormula { key, .. } => Some(*key),
-                    CacheEffect::ClearFormula { key } => Some(*key),
-                    CacheEffect::SetCellFormat { key, .. } => Some(*key),
-                    CacheEffect::RemoveSheet { .. } => None,
-                    CacheEffect::RegisterFormat { .. } => None,
-                };
-                if let Some(key) = cell_key {
-                    let v = fresh_cell_op_index.entry(key).or_default();
-                    if v.last().copied() != Some(op_log_index) {
-                        v.push(op_log_index);
-                    }
-                }
-                if let CacheEffect::RemoveSheet { id } = &effect {
-                    let v = fresh_sheet_op_index.entry(*id).or_default();
-                    if v.last().copied() != Some(op_log_index) {
-                        v.push(op_log_index);
-                    }
-                }
+                Self::apply_cache_effect(&mut buckets, effect, op_log_index);
             }
         }
         self.cell_op_index = fresh_cell_op_index;
@@ -1934,15 +1963,20 @@ impl CollabSession {
     /// AREN'T `(sheet, row, col)` are NEVER walked through their op
     /// histories.
     ///
-    /// **Cost**: **V3.6.0.4 D3 (2026-05-23) -- O(ops-for-this-cell)
-    /// + O(removes-for-this-sheet) via `cell_op_index` +
-    /// `sheet_op_index`**.  Pre-D3 this was an O(N) full log walk.
-    /// Post-D3: look up the union of `cell_op_index[(s, r, c)]` (cell-
-    /// keyed effects targeting the cell; typically 1-3 entries) +
-    /// `sheet_op_index[s]` (RemoveSheet effects on the cell's sheet;
-    /// typically 0 or 1) and fetch each via `OpLog::get(index)` (O(1)
-    /// per index per Loro 1.12.0 LoroList::get).  Closes V3.5.0.6
-    /// R-V3.5-2 perf gap.
+    /// **Cost**: **V3.6.0.4 D3 (2026-05-23) -- indexed lookup**
+    /// via `cell_op_index` + `sheet_op_index`.  Pre-D3 this was an
+    /// O(N) full log walk.  Post-D3: look up the union of
+    /// `cell_op_index[(s, r, c)]` (cell-keyed effects targeting
+    /// the cell; typically 1-3 entries) + `sheet_op_index[s]`
+    /// (RemoveSheet effects on the cell's sheet; typically 0 or
+    /// 1) and fetch each via `OpLog::get(index)`.  Per-op cost is
+    /// the Loro `LoroList::get` BTree lookup (O(log N) per Loro
+    /// 1.12.0; see `OpLog::get` docstring -- corrected from the
+    /// earlier "O(1)" claim per V3.6.0.X audit-of-D3 Codex Lane A
+    /// LOW-1).  Total invalidate_cell cost: O(ops-for-this-cell *
+    /// log N + removes-for-this-sheet * log N).  Still strictly
+    /// better than the O(N) full-log scan it replaces.  Closes
+    /// V3.5.0.6 R-V3.5-2 perf gap.
     ///
     /// **Correctness equivalence**: a call to `invalidate_cell(s, r, c)`
     /// followed by reading `last_snapshot[(s, r, c)]` MUST produce the
@@ -1964,10 +1998,21 @@ impl CollabSession {
         col: u32,
     ) -> Result<(), CollabSessionError> {
         let target_key = (sheet, row, col);
-        // Drop the existing entry FIRST so the per-cell rebuild starts
-        // from a clean slate (mirrors rebuild_snapshot_cache's
-        // build-into-fresh pattern at the per-cell granularity).
-        self.last_snapshot.remove(&target_key);
+        // **V3.6.0.X audit-of-D3 closure (2026-05-23, CONVERGENT-HIGH-1
+        // -- Opus Lane B HIGH-1 + Codex Lane A LOW-2)**: do NOT mutate
+        // `self.last_snapshot` until ALL fallible `OpLog::get` lookups
+        // succeed.  Pre-closure this method did
+        // `self.last_snapshot.remove(&target_key)` UNCONDITIONALLY at
+        // entry; if a stale `cell_op_index` / `sheet_op_index` entry
+        // pointed past log end OR a malformed JSON entry caused an
+        // `OpLog::get` Err mid-walk, the function returned Err WITH
+        // the cell already deleted and no replacement value -- a
+        // torn-write hazard.  Post-closure: build a local snapshot
+        // first via the full index-driven walk; only after the walk
+        // succeeds do we remove + reinsert in `self.last_snapshot`.
+        // Mirrors `rebuild_snapshot_cache`'s atomic-swap pattern at
+        // the per-cell granularity.
+
         // **V3.6.0.4 D3 (2026-05-23) -- index-driven walk**: collect
         // the union of cell-keyed indices (from cell_op_index) +
         // sheet-tombstone indices (from sheet_op_index for the
@@ -1976,7 +2021,8 @@ impl CollabSession {
         // op_log_index per the dedup check); the merged list needs a
         // single sort.  Pre-D3 this walked the full log (O(N)); post-
         // D3 it walks |cell_op_index[(s,r,c)]| + |sheet_op_index[s]|
-        // (typically 1-4 entries total).
+        // (typically 1-4 entries total) via indexed `OpLog::get`
+        // lookups (avoids the full-log scan).
         let cell_indices = self
             .cell_op_index
             .get(&target_key)
@@ -2010,14 +2056,13 @@ impl CollabSession {
         let mut local_sheet_op_index: HashMap<u16, Vec<usize>> = HashMap::new();
 
         for op_log_index in merged_indices {
-            // V3.6.0.4 D3: random-access lookup via OpLog::get.  None
-            // signals an out-of-range index which is unreachable
-            // post-V3.6.0.X audit-of-D2 (the indices in cell_op_index /
-            // sheet_op_index are maintained in sync with the visible
-            // log via the 6-mutation-site discipline + force-clear-
-            // then-rebuild on undo/redo fallback).  Treat as an
-            // unrecoverable invariant violation -- surface a clear
-            // error rather than a silent skip.
+            // V3.6.0.4 D3: indexed lookup via `OpLog::get` (avoids the
+            // full-log scan).  None signals an out-of-range index;
+            // post-V3.6.0.X audit-of-D3 closure (CONVERGENT-HIGH-1)
+            // the surrounding atomic-swap pattern leaves
+            // `self.last_snapshot` untouched on this error path.
+            // Some(Err) surfaces a malformed JSON entry from Loro;
+            // same propagation.
             let op = match self.log.get(op_log_index) {
                 Some(Ok(op)) => op,
                 Some(Err(e)) => return Err(CollabSessionError::OpLog(e)),
@@ -2058,12 +2103,17 @@ impl CollabSession {
                 }
             }
         }
-        // Move the (single) resulting entry (if any) into the main
-        // snapshot.  apply_cache_effect's ghost-entry-avoidance may
-        // have removed the entry entirely (e.g., if the only effect
-        // was a ClearFormula on a never-set cell); in that case
-        // local_snapshot is empty and we leave last_snapshot's removed
-        // state intact.
+        // **V3.6.0.X audit-of-D3 closure (CONVERGENT-HIGH-1)**: NOW
+        // (after the full fallible walk has succeeded) atomic-swap
+        // the target cell.  Drop the pre-call entry; insert the
+        // newly-rebuilt entry from local_snapshot if any
+        // (apply_cache_effect's ghost-entry-avoidance may have
+        // removed it entirely when the only effect was a no-op
+        // ClearFormula).  Pre-closure these two steps happened with
+        // the remove() at the top + the insert() here, leaving a
+        // window where an Err return between them produced a torn
+        // write (cell deleted but not reinstated).
+        self.last_snapshot.remove(&target_key);
         if let Some(state) = local_snapshot.remove(&target_key) {
             self.last_snapshot.insert(target_key, state);
         }
@@ -3128,10 +3178,40 @@ impl CollabSession {
             return Ok(0);
         };
         let mut merged = 0usize;
+        // **V3.6.0.X audit-of-D3 closure (2026-05-23, Codex Lane A
+        // MED-1)**: track the first drain error (if any) so we can
+        // (a) rebuild the snapshot cache + indices for already-
+        // committed blobs BEFORE returning the error, and (b)
+        // propagate the original failure to the caller.
+        //
+        // Pre-closure: the drain loop's `?` propagated errors
+        // immediately, bypassing the `if merged > 0 { rebuild
+        // ...}` block below.  Result: `self.log` was advanced (one
+        // or more blobs merged), but `last_snapshot`,
+        // `removed_sheets`, `format_table_cache`, `cell_op_index`,
+        // and `sheet_op_index` stayed at the pre-poll state.  A
+        // caller that surfaced the error and kept the session alive
+        // would read stale cells via `snapshot_cells` until a later
+        // rebuild path happened to fire.  Codex Lane A Probe 3
+        // empirically demonstrated this (one valid blob + one
+        // malformed -> session.op_count() == 1 but snapshot_cells
+        // empty).
+        //
+        // Post-closure: on any drain error after at least one
+        // successful merge, the rebuild fires before the error
+        // propagates -- the caches reflect the committed log
+        // state.  Auto-flush is still skipped on error path (the
+        // partial-state contract on auto-flush failure stays:
+        // `last_flushed_vv` not advanced -> next flush sends the
+        // accumulated delta).
+        let mut first_drain_error: Option<CollabSessionError> = None;
         while merged < max_blobs {
             match transport.try_recv() {
                 Ok(Some(bytes)) => {
-                    self.log.merge_bytes(&bytes)?;
+                    if let Err(e) = self.log.merge_bytes(&bytes) {
+                        first_drain_error = Some(CollabSessionError::OpLog(e));
+                        break;
+                    }
                     merged += 1;
                 }
                 Ok(None) => break,
@@ -3141,7 +3221,10 @@ impl CollabSession {
                     // Treat as graceful end-of-stream.
                     break;
                 }
-                Err(other) => return Err(CollabSessionError::Transport(other)),
+                Err(other) => {
+                    first_drain_error = Some(CollabSessionError::Transport(other));
+                    break;
+                }
             }
         }
         // **Phase 5.5 V2 V3 step 2 (2026-05-21):** auto-flush after
@@ -3162,11 +3245,35 @@ impl CollabSession {
             // below.  Same correctness argument as `merge_bytes`:
             // Loro's CRDT merge can causally-reorder; full rebuild
             // is required.
+            //
+            // **V3.6.0.X audit-of-D3 closure (Codex MED-1)**: rebuild
+            // unconditionally when merged > 0, EVEN IF a later drain
+            // errored.  This keeps the cache consistent with the
+            // committed log state regardless of whether the error
+            // path or the normal exit path drains us out of the
+            // while loop.
             self.rebuild_snapshot_cache()?;
             // V3.6.0.2 D1: no frontier-state mutation needed -- the
             // Loro UndoManager's stack carries per-item meta with the
             // exact cells, which is preserved across remote merges.
-            self.maybe_auto_flush()?;
+            //
+            // **V3.6.0.X audit-of-D3 closure (Codex MED-1)**: skip
+            // auto-flush when a drain error occurred -- the partial-
+            // state contract on auto-flush failure stays
+            // (`last_flushed_vv` unchanged; next flush sends the
+            // accumulated delta).  Only the cache rebuild runs in
+            // the error path.
+            if first_drain_error.is_none() {
+                self.maybe_auto_flush()?;
+            }
+        }
+        // **V3.6.0.X audit-of-D3 closure (Codex MED-1)**: propagate
+        // the original drain error AFTER the cache rebuild.  Caller
+        // sees the same Err they would have seen pre-closure, but
+        // the session caches are now consistent with the committed
+        // log state.
+        if let Some(e) = first_drain_error {
+            return Err(e);
         }
         Ok(merged)
     }
@@ -4857,6 +4964,206 @@ mod tests {
             Some(CellWireValue::Number(n)) => assert!((*n - 2.0).abs() < 1e-9),
             other => panic!("expected A1 = 2.0 post-undo, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn v3_6_0_x_audit_of_d3_cell_op_index_pruned_on_remove_sheet() {
+        // **V3.6.0.X audit-of-D3 CONVERGENT-MED-2 regression**
+        // (Opus Lane B MED-1 + Codex Lane A LOW-4): after
+        // Op::RemoveSheet the cell_op_index MUST NOT retain
+        // entries for cells on the tombstoned sheet.  Pre-closure
+        // these ghost entries persisted indefinitely (bounded
+        // memory growth + sync invariant violation against the
+        // field's own "6-mutation-site discipline" docstring).
+        let peer = PeerId::new(7);
+        let mut s = CollabSession::new(peer).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S1".to_string(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        s.append_op(put_value(1, 0, 0, 1.0)).unwrap();
+        s.append_op(put_value(1, 0, 1, 2.0)).unwrap();
+        // Pre-RemoveSheet: cell_op_index has entries for sheet 1.
+        let sheet_1_entries_pre = s
+            .cell_op_index_iter()
+            .filter(|((sheet, _, _), _)| *sheet == 1)
+            .count();
+        assert_eq!(sheet_1_entries_pre, 2);
+
+        s.append_op(Op::RemoveSheet { id: 1 }).unwrap();
+
+        // Post-RemoveSheet: cell_op_index entries for sheet 1 are
+        // pruned (mirrors snapshot.retain in the RemoveSheet
+        // handler).
+        let sheet_1_entries_post = s
+            .cell_op_index_iter()
+            .filter(|((sheet, _, _), _)| *sheet == 1)
+            .count();
+        assert_eq!(
+            sheet_1_entries_post,
+            0,
+            "post-V3.6.0.X audit-of-D3 closure: cell_op_index entries for tombstoned sheet 1 are pruned"
+        );
+    }
+
+    #[test]
+    fn v3_6_0_x_audit_of_d3_rebuild_op_indices_only_matches_full_rebuild_under_tombstones() {
+        // **V3.6.0.X audit-of-D3 CONVERGENT-MED-2 regression**
+        // (Codex Lane A MED-2): `rebuild_op_indices_only` MUST
+        // produce the same cell_op_index + sheet_op_index contents
+        // as `rebuild_snapshot_cache` (the canonical full rebuild
+        // path) under tombstoned-sheet histories.  Pre-closure the
+        // partial helper duplicated only the raw push logic +
+        // skipped the tombstone filter that apply_cache_effect
+        // applies, producing extra ghost entries for post-tombstone
+        // cell-keyed ops (Codex Probe 1 demonstrated).
+        let peer = PeerId::new(7);
+        let mut s = CollabSession::new(peer).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "ToDelete".to_string(),
+            chunk_rows: 100,
+        })
+        .unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
+        // Post-tombstone cell-keyed ops on the deleted sheet (these
+        // are silently dropped by apply_cache_effect's tombstone
+        // filter in the rebuild path).
+        s.append_op(put_value(0, 0, 0, 2.0)).unwrap();
+        s.append_op(put_value(0, 1, 0, 3.0)).unwrap();
+
+        // Capture index state after rebuild_snapshot_cache (canonical).
+        s.rebuild_snapshot_cache().unwrap();
+        let full_rebuild_cell: std::collections::HashMap<(u16, u32, u32), Vec<usize>> = s
+            .cell_op_index_iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let full_rebuild_sheet: std::collections::HashMap<u16, Vec<usize>> = s
+            .sheet_op_index_iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+
+        // Force_clear + rebuild_op_indices_only ONLY.
+        s.force_clear_snapshot_cache();
+        s.rebuild_op_indices_only().unwrap();
+        let partial_rebuild_cell: std::collections::HashMap<(u16, u32, u32), Vec<usize>> = s
+            .cell_op_index_iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let partial_rebuild_sheet: std::collections::HashMap<u16, Vec<usize>> = s
+            .sheet_op_index_iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+
+        // Both paths produce identical index contents (post-closure
+        // they share apply_cache_effect's tombstone-aware
+        // discipline).
+        assert_eq!(
+            partial_rebuild_cell, full_rebuild_cell,
+            "rebuild_op_indices_only cell_op_index matches rebuild_snapshot_cache"
+        );
+        assert_eq!(
+            partial_rebuild_sheet, full_rebuild_sheet,
+            "rebuild_op_indices_only sheet_op_index matches rebuild_snapshot_cache"
+        );
+    }
+
+    #[test]
+    fn v3_6_0_x_audit_of_d3_invalidate_cell_atomic_swap_on_normal_path() {
+        // **V3.6.0.X audit-of-D3 CONVERGENT-HIGH-1 regression**
+        // (Opus Lane B HIGH-1 / Codex Lane A LOW-2): invalidate_cell
+        // uses build-into-fresh + atomic-swap; the final
+        // last_snapshot.remove(target_key) + insert(target_key,
+        // state) happens AFTER all fallible OpLog::get calls
+        // succeed.  Pre-closure the remove() happened
+        // UNCONDITIONALLY at entry; a fallible OpLog::get Err
+        // mid-walk produced a torn-write (cell deleted, no
+        // replacement, error returned).
+        //
+        // This regression test covers the normal (success) path
+        // and asserts the final cell state is correct.  The error
+        // path is unreachable in production via the
+        // rebuild_op_indices_only refresh in undo/redo + the
+        // 6-mutation-site discipline; testing it would require
+        // mocking OpLog::get failures.
+        let peer = PeerId::new(7);
+        let mut s = CollabSession::new(peer).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s.append_op(put_value(0, 0, 0, 2.0)).unwrap();
+        s.append_op(put_value(0, 0, 0, 3.0)).unwrap();
+        // Invalidate cell A1; should produce the LWW value 3.0
+        // post-atomic-swap.
+        s.invalidate_cell(0, 0, 0).unwrap();
+        let snap = s.snapshot_cells(0);
+        let a1 = snap.iter().find(|((r, c), _)| *r == 0 && *c == 0);
+        assert!(a1.is_some(), "A1 present post-invalidate (atomic-swap success)");
+        let (_, state) = a1.unwrap();
+        match &state.value {
+            Some(CellWireValue::Number(n)) => assert!((*n - 3.0).abs() < 1e-9),
+            other => panic!("expected A1 = 3.0 post-invalidate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn v3_6_0_x_audit_of_d3_poll_remote_partial_error_rebuilds_cache() {
+        // **V3.6.0.X audit-of-D3 Codex Lane A MED-1 regression**:
+        // `poll_remote_with_limit` MUST rebuild the snapshot cache
+        // (and indices) even when a later drain blob errors after
+        // earlier blobs successfully merged.  Pre-closure the
+        // drain-loop `?` propagated errors immediately, bypassing
+        // the post-loop rebuild -- `self.log` advanced but
+        // `last_snapshot` / `cell_op_index` / `sheet_op_index`
+        // stayed at the pre-poll state.  Codex Probe 3
+        // demonstrated empirically.
+        use crate::transport::{LoopbackTransport, Transport};
+        let peer_a = PeerId::new(0xa);
+        let peer_b = PeerId::new(0xb);
+        let mut sender = CollabSession::new(peer_a).unwrap();
+        let mut receiver = CollabSession::new(peer_b).unwrap();
+
+        // Loopback pair: tx_a.send(...) enqueues to tx_b.try_recv()
+        // (and vice versa).  We use tx_a to inject blobs into
+        // receiver's inbox; receiver consumes via try_recv from
+        // tx_b (after attach_transport(tx_b)).
+        let (mut tx_a, tx_b) = LoopbackTransport::pair();
+        receiver.attach_transport(tx_b);
+
+        // Stage a valid blob (sender's snapshot after one
+        // PutValue) + an invalid blob (random bytes that won't
+        // deserialize as a Loro doc).
+        sender.append_op(put_value(0, 5, 5, 42.0)).unwrap();
+        let valid_bytes = sender.export_bytes().unwrap();
+        tx_a.send(&valid_bytes).unwrap();
+        tx_a.send(b"not a loro document").unwrap();
+
+        // Drain both: the second blob should error.
+        let result = receiver.poll_remote_with_limit(2);
+        assert!(result.is_err(), "poll_remote_with_limit Err on malformed blob");
+
+        // Post-closure: even on Err, the snapshot cache reflects
+        // the successfully-merged first blob (the committed log
+        // state).  Pre-closure snapshot_cells would have been
+        // empty.
+        assert!(
+            receiver.op_count() >= 1,
+            "first blob committed to op log; op_count={}",
+            receiver.op_count()
+        );
+        let snap = receiver.snapshot_cells(0);
+        let cell_5_5 = snap.iter().find(|((r, c), _)| *r == 5 && *c == 5);
+        assert!(
+            cell_5_5.is_some(),
+            "post-closure: cache rebuilt despite mid-drain error; cell (5,5) present in snapshot"
+        );
+        // cell_op_index also rebuilt.
+        let has_index_entry = receiver
+            .cell_op_index_iter()
+            .any(|(key, _)| *key == (0, 5, 5));
+        assert!(
+            has_index_entry,
+            "post-closure: cell_op_index rebuilt despite mid-drain error"
+        );
     }
 
     #[test]

@@ -158,9 +158,12 @@ impl OpLog {
     /// the index is out of range.
     ///
     /// Mirrors a single iteration of [`OpLog::iter`] at the given index.
-    /// Internally uses `LoroList::get(index)` (O(1) for Loro's internal
-    /// list representation; verified for visible-counter indexing per
-    /// Loro 1.12.0 semantics).
+    /// Internally uses `LoroList::get(index)` (an indexed BTree lookup
+    /// over Loro's internal list representation -- O(log N) per Loro
+    /// 1.12.0 per `loro::LoroList::get` -> `LengthFinder` query over
+    /// `generic_btree::BTree` at `state/list_state.rs:317`; not pure
+    /// O(1) as earlier comments claimed, but still avoids the
+    /// full-log scan that `iter()` would impose on the caller).
     ///
     /// **Use case**: V3.6.0.4 D3 `invalidate_cell` consults the session
     /// `cell_op_index: HashMap<(SheetId, RowId, ColId), Vec<usize>>` to
