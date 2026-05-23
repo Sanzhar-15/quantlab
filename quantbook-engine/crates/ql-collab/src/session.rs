@@ -117,6 +117,22 @@ pub struct CellState {
     pub value: Option<CellWireValue>,
     pub formula: Option<String>,
 }
+
+/// **Phase 5.7 V3.4.0.X HIGH-1 + MEDIUM-1 closure (2026-05-24)**: internal
+/// representation of a single cache mutation extracted from an `Op`.
+///
+/// Lives at module scope (NOT inside `append_op`) so that both `append_op`
+/// (O(1) live update) and `rebuild_snapshot_cache` (full walk) can use the
+/// same `collect_cache_effects` + `apply_cache_effect` helpers.
+/// Pre-V3.4.0.X this enum was local to `append_op` and the rebuild path
+/// duplicated the match logic; the two paths drifted (rebuild ignored
+/// `BatchCommit`, append did not handle ghost-cell formula-only delete).
+/// Hoisting to module scope eliminates the drift surface.
+enum CacheEffect {
+    PutValue { key: (u16, u32, u32), value: CellWireValue },
+    PutFormula { key: (u16, u32, u32), text: String },
+    ClearFormula { key: (u16, u32, u32) },
+}
 use ql_storage::Workbook;
 
 use crate::presence::{self, PresenceError, PresenceState};
@@ -656,57 +672,96 @@ impl CollabSession {
         // upsert WITHOUT a full cache rebuild.
         //
         // V3.4.0.2 (per V3.4.0.1 D1 hybrid): handle 3 cell-keyed variants
-        // (PutValue / PutFormula / ClearFormula).  Each upserts ONE field
-        // of `CellState`, preserving the others.  ClearFormula uses
-        // `get_mut` + skip-if-absent so it does NOT create ghost cache
-        // entries for cells that were never written (otherwise
-        // `list_sheets_from_cache` would surface phantom sheets).
+        // (PutValue / PutFormula / ClearFormula).  V3.4.0.X HIGH-1 closure
+        // (cross-lane convergent Codex+Opus, 2026-05-24): also recurse into
+        // `Op::BatchCommit { ops }` so production op-log shapes from
+        // `WorkbookRuntime::set_value`-over-formula (which emits
+        // `BatchCommit { PutValue, ClearFormula }` for atomicity) update
+        // the cache.  V3.4.0.X MEDIUM-1 closure (single-lane Codex): after
+        // ClearFormula clears `formula`, REMOVE the cache key entirely if
+        // both `value` and `formula` are `None` -- otherwise a formula-only
+        // cell clearing its formula leaves an empty CellState that surfaces
+        // in `list_sheets_from_cache`.
         //
         // We capture the cache-affecting fields BEFORE consuming `op` via
-        // `self.log.append(op)`.  Op derives Clone but CellWireValue::
-        // Text/Error + PutFormula::text own heap strings; cloning to
-        // avoid the move is more expensive than matching first.
-        enum CacheEffect {
-            PutValue { key: (u16, u32, u32), value: CellWireValue },
-            PutFormula { key: (u16, u32, u32), text: String },
-            ClearFormula { key: (u16, u32, u32) },
+        // `self.log.append(op)` to avoid an unnecessary full-op clone
+        // (CellWireValue::Text/Error + PutFormula::text own heap strings).
+        let mut effects: Vec<CacheEffect> = Vec::new();
+        Self::collect_cache_effects(&op, &mut effects);
+        self.log.append(op)?;
+        for effect in effects {
+            Self::apply_cache_effect(&mut self.last_snapshot, effect);
         }
-        let cache_effect = match &op {
-            Op::PutValue { sheet, row, col, value } => Some(CacheEffect::PutValue {
+        self.maybe_auto_flush()?;
+        Ok(())
+    }
+
+    /// **Phase 5.7 V3.4.0.X HIGH-1 closure (2026-05-24)**: collect cache
+    /// effects from an op, recursing into `Op::BatchCommit` for nested
+    /// cell-keyed ops.  Used by both `append_op` (O(1) incremental path)
+    /// and `rebuild_snapshot_cache` (full walk) so the two paths cannot
+    /// drift on supported op shapes.
+    ///
+    /// Recursion is bounded by the op-log producer side; nested
+    /// `BatchCommit { BatchCommit { ... } }` is schema-permitted but the
+    /// producers in `ql-exec/src/workbook_runtime/` do not emit nested
+    /// commits today.  Per `op.rs:174-175`, "Nested BatchCommits are
+    /// permitted by the schema but produced one level deep".
+    fn collect_cache_effects(op: &Op, out: &mut Vec<CacheEffect>) {
+        match op {
+            Op::PutValue { sheet, row, col, value } => out.push(CacheEffect::PutValue {
                 key: (*sheet, *row, *col),
                 value: value.clone(),
             }),
-            Op::PutFormula { sheet, row, col, text } => Some(CacheEffect::PutFormula {
+            Op::PutFormula { sheet, row, col, text } => out.push(CacheEffect::PutFormula {
                 key: (*sheet, *row, *col),
                 text: text.clone(),
             }),
-            Op::ClearFormula { sheet, row, col } => Some(CacheEffect::ClearFormula {
+            Op::ClearFormula { sheet, row, col } => out.push(CacheEffect::ClearFormula {
                 key: (*sheet, *row, *col),
             }),
-            _ => None,
-        };
-        self.log.append(op)?;
-        match cache_effect {
-            Some(CacheEffect::PutValue { key, value }) => {
-                self.last_snapshot.entry(key).or_default().value = Some(value);
+            Op::BatchCommit { ops } => {
+                for inner in ops {
+                    Self::collect_cache_effects(inner, out);
+                }
             }
-            Some(CacheEffect::PutFormula { key, text }) => {
-                self.last_snapshot.entry(key).or_default().formula = Some(text);
+            _ => {}
+        }
+    }
+
+    /// **Phase 5.7 V3.4.0.X helper (2026-05-24)**: apply one collected
+    /// cache effect to a mutable snapshot map.  Shared between
+    /// `append_op` (live cache) and `rebuild_snapshot_cache` (fresh
+    /// build), keeping the per-field LWW + ghost-entry-avoidance +
+    /// formula-only-key-removal invariants in ONE place.
+    fn apply_cache_effect(snapshot: &mut HashMap<(u16, u32, u32), CellState>, effect: CacheEffect) {
+        match effect {
+            CacheEffect::PutValue { key, value } => {
+                snapshot.entry(key).or_default().value = Some(value);
             }
-            Some(CacheEffect::ClearFormula { key }) => {
+            CacheEffect::PutFormula { key, text } => {
+                snapshot.entry(key).or_default().formula = Some(text);
+            }
+            CacheEffect::ClearFormula { key } => {
                 // get_mut + skip-if-absent: ClearFormula on a never-set
                 // cell is a no-op for the cache (it's also semantically
                 // a no-op for `Workbook` -- there was no formula to
                 // clear).  Avoids ghost-sheet entries in
                 // `list_sheets_from_cache`.
-                if let Some(state) = self.last_snapshot.get_mut(&key) {
+                //
+                // V3.4.0.X MEDIUM-1 closure: if BOTH value and formula
+                // are None after the clear (the cell was formula-only +
+                // we just removed its formula), DELETE the key so the
+                // empty CellState doesn't surface in
+                // `list_sheets_from_cache` either.
+                if let Some(state) = snapshot.get_mut(&key) {
                     state.formula = None;
+                    if state.value.is_none() && state.formula.is_none() {
+                        snapshot.remove(&key);
+                    }
                 }
             }
-            None => {}
         }
-        self.maybe_auto_flush()?;
-        Ok(())
     }
 
     /// Merge a remote peer's snapshot into this session's log. Loro's
@@ -930,24 +985,36 @@ impl CollabSession {
         // pre-call state (consistent with the LAST successful
         // rebuild).  Slightly more memory pressure (transient
         // duplicate during the build); trades for atomicity.
+        //
+        // **V3.4.0.X HIGH-1 closure (2026-05-24, single-lane Codex)**:
+        // walks via `collect_cache_effects` + `apply_cache_effect` so
+        // `Op::BatchCommit { ops }` (e.g., production
+        // `WorkbookRuntime::set_value`-over-formula atomic pair) is
+        // recursed.  Pre-closure this match arm omitted BatchCommit
+        // entirely; cells written via the runtime's atomic-replace path
+        // were ABSENT from the cache after `from_snapshot` /
+        // `merge_bytes` rebuild, even though `rebuild_workbook` saw
+        // them via `replay_into`'s recursion.
+        //
+        // **LWW iteration-order invariant (Opus M5 closure)**: per-cell
+        // last-write-wins is computed from Loro's `iter()` order. Loro
+        // guarantees this is the deterministic causal-merge order
+        // (Fugue/origin-based with peer-id tiebreaker, audited at Phase
+        // 5.1 Codex V1).  Across peers, the same op-log content +
+        // version-vector produces the same iteration order, so all
+        // peers converge to the same cache.  If a future Loro bump
+        // changes the iteration-order semantics (e.g., switches to
+        // insertion-order-by-peer instead of causal merge), THIS cache
+        // rebuild + the V3.4.0.2 per-field LWW semantics BREAK.  Pin
+        // the invariant in any future Loro upgrade audit.
         let mut fresh: HashMap<(u16, u32, u32), CellState> = HashMap::new();
+        let mut effects: Vec<CacheEffect> = Vec::new();
         for op_result in self.log.iter() {
             let op = op_result.map_err(CollabSessionError::OpLog)?;
-            match op {
-                Op::PutValue { sheet, row, col, value } => {
-                    fresh.entry((sheet, row, col)).or_default().value = Some(value);
-                }
-                Op::PutFormula { sheet, row, col, text } => {
-                    fresh.entry((sheet, row, col)).or_default().formula = Some(text);
-                }
-                Op::ClearFormula { sheet, row, col } => {
-                    // get_mut + skip-if-absent: same ghost-entry
-                    // avoidance as append_op (see rationale there).
-                    if let Some(state) = fresh.get_mut(&(sheet, row, col)) {
-                        state.formula = None;
-                    }
-                }
-                _ => {}
+            effects.clear();
+            Self::collect_cache_effects(&op, &mut effects);
+            for effect in effects.drain(..) {
+                Self::apply_cache_effect(&mut fresh, effect);
             }
         }
         self.last_snapshot = fresh;
@@ -3070,6 +3137,112 @@ mod tests {
             "ClearFormula on never-written cell must not create ghost sheet entry");
         assert_eq!(s2.snapshot_cells(7).len(), 0,
             "cache has no entry for never-written cell");
+    }
+
+    #[test]
+    fn cell_state_formula_only_clear_removes_cache_key() {
+        // V3.4.0.X MEDIUM-1 closure (single-lane Codex, 2026-05-24):
+        // ClearFormula on a formula-only cell (no PutValue) must REMOVE
+        // the cache key entirely, NOT leave an empty CellState that
+        // surfaces in list_sheets_from_cache.  Pre-closure the cache
+        // retained `CellState { value: None, formula: None }` after
+        // PutFormula -> ClearFormula on the same cell; the empty state
+        // surfaced sheet 7 via list_sheets_from_cache even though replay
+        // leaves no cell on sheet 7.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_formula(7, 0, 0, "=A1+1")).unwrap();
+        // Sanity: pre-clear, sheet 7 surfaces.
+        assert_eq!(s.list_sheets_from_cache(), vec![7]);
+        assert_eq!(s.snapshot_cells(7).len(), 1);
+        let pre = &s.snapshot_cells(7)[0].1;
+        assert_eq!(pre.value, None);
+        assert_eq!(pre.formula, Some("=A1+1".to_string()));
+
+        // Clear the formula.  Post-clear, both fields are None ->
+        // the cache key must be removed.
+        s.append_op(clear_formula(7, 0, 0)).unwrap();
+        assert_eq!(s.list_sheets_from_cache(), Vec::<u16>::new(),
+            "formula-only clear removes the cache key + does not surface sheet 7");
+        assert_eq!(s.snapshot_cells(7).len(), 0,
+            "no cache entry for formula-only cleared cell");
+
+        // Symmetric check on the rebuild_snapshot_cache path: an
+        // import/merge-then-rebuild of the same op sequence must produce
+        // the same empty cache.
+        let bytes = s.export_bytes().unwrap();
+        let s2 = CollabSession::from_snapshot(PeerId::new(2), &bytes).unwrap();
+        assert_eq!(s2.list_sheets_from_cache(), Vec::<u16>::new(),
+            "from_snapshot rebuild also removes formula-only cleared key");
+        assert_eq!(s2.snapshot_cells(7).len(), 0);
+
+        // Edge case: PutValue + PutFormula + ClearFormula should NOT
+        // remove the key because value is still set (existing test
+        // pins this; re-asserting here for completeness against the new
+        // remove-when-both-None branch).
+        let mut s3 = CollabSession::new(PeerId::new(3)).unwrap();
+        s3.append_op(put_value(7, 0, 0, 1.0)).unwrap();
+        s3.append_op(put_formula(7, 0, 0, "=B1")).unwrap();
+        s3.append_op(clear_formula(7, 0, 0)).unwrap();
+        let state = &s3.snapshot_cells(7)[0].1;
+        assert_eq!(state.value, Some(CellWireValue::Number(1.0)));
+        assert_eq!(state.formula, None);
+        assert!(!s3.snapshot_cells(7).is_empty(),
+            "value-bearing cell survives formula clear");
+    }
+
+    #[test]
+    fn cell_state_batch_commit_recurses_into_cache() {
+        // V3.4.0.X HIGH-1 closure (single-lane Codex, 2026-05-24):
+        // Op::BatchCommit { ops: [PutValue, ClearFormula] } is the
+        // production op shape from WorkbookRuntime::set_value-over-formula
+        // (atomic literal-replace).  Pre-closure the cache rebuild
+        // skipped BatchCommit entirely; cells written via the runtime's
+        // atomic path were ABSENT from the cache after from_snapshot,
+        // even though rebuild_workbook saw them via replay_into's
+        // recursion.
+        //
+        // Pin: a BatchCommit appended directly via append_op (live path)
+        // AND walked via rebuild_snapshot_cache (full-walk path) both
+        // surface the nested cell ops.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        // First populate the cell with a formula.
+        s.append_op(put_formula(0, 5, 5, "=A1+1")).unwrap();
+        // Then atomic BatchCommit: replace formula with literal.
+        s.append_op(Op::BatchCommit {
+            ops: vec![
+                Op::PutValue {
+                    sheet: 0,
+                    row: 5,
+                    col: 5,
+                    value: CellWireValue::Number(42.0),
+                },
+                Op::ClearFormula {
+                    sheet: 0,
+                    row: 5,
+                    col: 5,
+                },
+            ],
+        }).unwrap();
+
+        // Live append_op path: cache must reflect both inner ops.
+        let entries_live = s.snapshot_cells(0);
+        assert_eq!(entries_live.len(), 1, "single cell in cache");
+        let state_live = &entries_live[0].1;
+        assert_eq!(state_live.value, Some(CellWireValue::Number(42.0)),
+            "BatchCommit's nested PutValue surfaces in live cache");
+        assert_eq!(state_live.formula, None,
+            "BatchCommit's nested ClearFormula clears formula in live cache");
+
+        // Round-trip via from_snapshot to exercise rebuild_snapshot_cache.
+        let bytes = s.export_bytes().unwrap();
+        let s2 = CollabSession::from_snapshot(PeerId::new(2), &bytes).unwrap();
+        let entries_rebuilt = s2.snapshot_cells(0);
+        assert_eq!(entries_rebuilt.len(), 1);
+        let state_rebuilt = &entries_rebuilt[0].1;
+        assert_eq!(state_rebuilt.value, Some(CellWireValue::Number(42.0)),
+            "BatchCommit's nested PutValue surfaces in rebuilt cache");
+        assert_eq!(state_rebuilt.formula, None,
+            "BatchCommit's nested ClearFormula clears formula in rebuilt cache");
     }
 
     #[test]

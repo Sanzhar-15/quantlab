@@ -531,14 +531,38 @@ impl CollabSession {
     /// multi-million-cell scaling).  Pass a sane default (e.g., 1000)
     /// at V3.4.0.4a scale; V3.5+ may surface this as a configurable.
     ///
+    /// **V3.4.0.X HIGH-2 closure (2026-05-24, single-lane Codex)**:
+    /// argument typed `f64` + validated to `[1, u32::MAX]` integer range
+    /// to match `appendPutValue`'s `ToUint32`-boundary discipline.
+    /// Pre-closure the binding accepted `u32` directly + napi-rs's
+    /// `ToUint32` would coerce `NaN/Infinity/negative/fractional` to
+    /// integer-domain values (e.g., JS `-1` -> `4294967295`) -- a
+    /// `chunk_rows = 0` AddSheet would replay successfully but then
+    /// later `ColumnStore::with_chunk_rows(0)` would assert.  Engine-side
+    /// `WorkbookRuntime::add_sheet` rejects `chunk_rows == 0` before
+    /// appending the op; the napi-side validation gives the IDE caller
+    /// a structured `[bad_argument]` error at the FFI boundary instead
+    /// of a deep panic + a phantom op that fails replay later.
+    ///
     /// # Errors
     ///
+    /// - `[bad_argument]` if `chunkRows` is NaN / Infinity / negative /
+    ///   fractional / zero / above `u32::MAX`.
     /// - Engine kind-prefixed (`session_oplog` for op-log append
     ///   failure; `session_replay` would NOT fire here -- replay
     ///   happens at rebuild_workbook time, not append time).
     #[napi(js_name = "addSheet")]
-    pub fn add_sheet(&self, name: String, chunk_rows: u32) -> Result<()> {
-        let op = Op::AddSheet { name, chunk_rows };
+    pub fn add_sheet(&self, name: String, chunk_rows: f64) -> Result<()> {
+        let chunk_rows_u32 = validate_u32_index("addSheet", "chunkRows", chunk_rows)?;
+        if chunk_rows_u32 == 0 {
+            return Err(bad_argument_error(format!(
+                "addSheet: chunkRows must be >= 1 (engine rejects chunk_rows == 0 to prevent ColumnStore panic), got {chunk_rows}"
+            )));
+        }
+        let op = Op::AddSheet {
+            name,
+            chunk_rows: chunk_rows_u32,
+        };
         let mut inner = self.inner.lock();
         inner.append_op(op).map_err(collab_session_error_to_napi)?;
         Ok(())
@@ -982,15 +1006,21 @@ impl CollabSession {
     /// V3.3.0.3 incremental snapshot cache from the imported log per
     /// the field-docstring contract).
     ///
-    /// **PeerId derivation (V3.4.0.1 D5 scope)**: caller MUST pass
-    /// `peer_id_override` -- a fresh BigInt for "first open of this
-    /// workbook by this user", OR a stored-previously BigInt for
-    /// "rejoin with same identity".  V3.4.0.4a engine layer is
-    /// peer-id-agnostic; V3.4.0.4b IDE commands generate UUID-derived
-    /// BigInts via `crypto.randomUUID()` and stash them per-workbook
-    /// (location TBD; vscode workspaceState OR `.qbook`-sibling
-    /// sidecar file).  This avoids the D5 envelope v3 bump while
-    /// still achieving cross-restart collision-resistance.
+    /// **PeerId derivation (V3.4.0.1 D5 scope -- DEVIATED at V3.4.0.4b)**:
+    /// caller MUST pass `peer_id_override`.  The V3.4.0.4b IDE commands
+    /// always generate a FRESH UUID-derived BigInt via `crypto.randomUUID()`
+    /// per open (NOT a per-workbook stash, as originally locked).
+    /// Implementation discovery: persisted-per-workbook PeerId would have
+    /// an unsolvable two-windows-same-workspace collision (both windows
+    /// would read the same stashed PeerId + violate Loro's PeerId-
+    /// uniqueness contract).  Fresh-UUID-per-session is CRDT-correct +
+    /// closes R-V3.3-5 fully + obviates the envelope v3 bump (no PeerId
+    /// stash exists to persist).  Trade-off: no cross-restart
+    /// op-attribution continuity for "this peer is User A" features;
+    /// V3.4.1+ may revisit if a user-facing attribution feature surfaces.
+    /// See `docs/architecture/ide-consumer-contract.md § 4.1.z4` for the
+    /// full D5 DEVIATION rationale.  V3.4.0.X LOW-1 closure (cross-lane
+    /// Codex L1 + Opus M1 doc-accuracy).
     ///
     /// **`peer_id_override` MUST be non-zero** (LEGACY_PEER sentinel
     /// per `CollabSession::from_snapshot` precondition).  Per
