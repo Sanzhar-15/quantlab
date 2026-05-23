@@ -122,7 +122,7 @@ export interface CellSnapshotJson {
 	 *
 	 * Populated by the engine via `ql_functions::format::render(value,
 	 * parsed_format, eval_context)` where `eval_context.date_system`
-	 * comes from the workbook (see {@link WorkbookSnapshotJson.date_system})
+	 * comes from the workbook (see {@link WorkbookSnapshotJson.dateSystem})
 	 * and `eval_context.locale = EnUs` (V3.6.0.5 ships EN-US only;
 	 * locale-aware deferred to V3.6.1+).
 	 *

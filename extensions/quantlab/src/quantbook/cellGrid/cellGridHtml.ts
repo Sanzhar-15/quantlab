@@ -226,7 +226,21 @@ function renderRows(
 			// The escapeHtml below covers BOTH paths (engine-rendered
 			// strings + value-default strings) -- the IDE consumer never
 			// trusts either as pre-escaped HTML.
-			const valueStr = e.rendered ?? formatCellValue(e.value);
+			const displayStr = e.rendered ?? formatCellValue(e.value);
+			// **Phase 5.7 V3.6.0.X audit-of-D4 OPUS-HIGH-2 closure
+			// (2026-05-24)**: the RAW value for editing (always the
+			// V3.2.a value-default representation, regardless of
+			// whether the engine produced a `rendered` string).  Pre-
+			// closure `data-original-text` carried the engine-
+			// rendered display string and `beginEdit` fed it into
+			// the `<input>` -- `parseCellRawInput` then NaN'd on
+			// `"$1,234.56"` / `"50.00%"` / `"1,234"` / dates / etc.,
+			// breaking editing for every common Excel format.
+			// Post-closure: `data-raw-value` carries the parseable
+			// raw representation; `beginEdit` reads it for the
+			// input.value.  `data-original-text` stays for Escape-
+			// cancel restore (the displayed text the user sees).
+			const rawValueStr = formatCellValue(e.value);
 			// V3.2.b.2: cells gain `data-row` / `data-col` attributes when
 			// editable so the client script can identify which cell was
 			// clicked. The `.cell-value` class is the hit-test target.
@@ -251,10 +265,10 @@ function renderRows(
 			const rowSafe = Number(e.row);
 			const colSafe = Number(e.col);
 			const dataAttrs = editable
-				? ` data-row="${rowSafe}" data-col="${colSafe}" data-original-text="${escapeHtml(valueStr)}" data-original-kind="${escapeHtml(e.value.kind)}"`
+				? ` data-row="${rowSafe}" data-col="${colSafe}" data-original-text="${escapeHtml(displayStr)}" data-raw-value="${escapeHtml(rawValueStr)}" data-original-kind="${escapeHtml(e.value.kind)}"`
 				: '';
 			const cellClass = editable ? 'cell-value' : '';
-			return `<tr><td>${rowSafe}</td><td>${colSafe}</td><td class="${cellClass}"${dataAttrs}>${escapeHtml(valueStr)}<span class="kind">[${escapeHtml(e.value.kind)}]</span></td></tr>`;
+			return `<tr><td>${rowSafe}</td><td>${colSafe}</td><td class="${cellClass}"${dataAttrs}>${escapeHtml(displayStr)}<span class="kind">[${escapeHtml(e.value.kind)}]</span></td></tr>`;
 		})
 		.join('');
 }
@@ -402,11 +416,26 @@ function buildClientScript(sheetForClient: number): string {
 		'',
 		'  function beginEdit(cell) {',
 		'    if (activeInput !== null) { endEdit(false); }',
-		'    var originalText = cell.getAttribute(\'data-original-text\') || \'\';',
+		'    // V3.6.0.X audit-of-D4 OPUS-HIGH-2 closure (2026-05-24):',
+		'    // prefer data-raw-value (parseable raw representation) over',
+		'    // data-original-text (engine-rendered display string).  Pre-',
+		'    // closure data-original-text was the engine-rendered string',
+		'    // (e.g., "$1,234.56"), fed into the input on click-to-edit;',
+		'    // parseCellRawInput then NaN\'d on Enter for currency /',
+		'    // percent / thousands / date formats.  Post-closure: edit',
+		'    // mode shows the raw value the user can actually edit.  The',
+		'    // fallback to data-original-text preserves backward compat',
+		'    // for any pre-D4 panel HTML that lacks the new attribute',
+		'    // (e.g., during in-flight upgrade where the server emits',
+		'    // pre-D4 HTML but the client script is post-D4).',
+		'    var rawValue = cell.getAttribute(\'data-raw-value\');',
+		'    if (rawValue === null) {',
+		'      rawValue = cell.getAttribute(\'data-original-text\') || \'\';',
+		'    }',
 		'    var input = document.createElement(\'input\');',
 		'    input.type = \'text\';',
 		'    input.className = \'cell-edit-input\';',
-		'    input.value = originalText;',
+		'    input.value = rawValue;',
 		'    input.setAttribute(\'aria-label\', \'Edit cell value\');',
 		'    cell.innerHTML = \'\';',
 		'    cell.appendChild(input);',
@@ -619,7 +648,13 @@ function buildClientScript(sheetForClient: number): string {
 		'      // V3.6.0.5 D4 (2026-05-23): mirror the server renderRows',
 		'      // -- use engine-pre-rendered string when present, fall',
 		'      // back to value-default.  htmlEscape covers both paths.',
-		'      var valueStr = (typeof e.rendered === \'string\') ? e.rendered : formatCellValueClient(e.value);',
+		'      var displayStr = (typeof e.rendered === \'string\') ? e.rendered : formatCellValueClient(e.value);',
+		'      // V3.6.0.X audit-of-D4 OPUS-HIGH-2 closure (2026-05-24):',
+		'      // data-raw-value carries the parseable raw representation',
+		'      // for click-to-edit; pre-closure data-original-text held',
+		'      // the engine-rendered string which broke parseCellRawInput',
+		'      // on currency / percent / thousands / date formats.',
+		'      var rawValueStr = formatCellValueClient(e.value);',
 		'      var kind = e.value.kind;',
 		'      // V3.3.0.X audit closure (LOW-1): defense-in-depth Number()',
 		'      // coercion mirrors the server renderer (cellGridHtml.ts).',
@@ -631,9 +666,10 @@ function buildClientScript(sheetForClient: number): string {
 		'      html += \'<tr><td>\' + rowSafe + \'</td><td>\' + colSafe +',
 		'        \'</td><td class="cell-value" data-row="\' + rowSafe +',
 		'        \'" data-col="\' + colSafe +',
-		'        \'" data-original-text="\' + htmlEscape(valueStr) +',
+		'        \'" data-original-text="\' + htmlEscape(displayStr) +',
+		'        \'" data-raw-value="\' + htmlEscape(rawValueStr) +',
 		'        \'" data-original-kind="\' + htmlEscape(kind) + \'">\' +',
-		'        htmlEscape(valueStr) +',
+		'        htmlEscape(displayStr) +',
 		'        \'<span class="kind">[\' + htmlEscape(kind) + \']</span></td></tr>\';',
 		'    }',
 		'    return html;',
