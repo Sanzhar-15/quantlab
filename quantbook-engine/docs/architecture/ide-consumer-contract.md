@@ -818,6 +818,449 @@ cargo build -p ql-bindings-node --release --features test-fixtures
 
 If smoke surfaces issues, file findings against V3.3.0.X audit (parallel Codex+Opus megaudit) which is the next planned audit cycle.
 
+### 4.1.z4 Undo/redo + `.qbook` persistence + presence integration (Phase 5.7 V3.4, 2026-05-23)
+
+**Status:** V3.4.0.1 decision lock + V3.4.0.2 hybrid `CellState` cache + V3.4.0.3 undo/redo napi + Cmd-Z webview wiring + V3.4.0.4a engine `.qbook` napi + V3.4.0.4b IDE Save As/Open commands + UUID PeerId + V3.4.0.5a presence napi + V3.4.0.5b IDE cell-grid presence integration + V3.4.0.6 mocha (effectively complete via incremental +47 V3.4-specific tests) + V3.4.0.7 (this section's commit) shipped.  V3.4.0.X (parallel Codex+Opus megaudit) pending.  See V3.4 entry plan at `quantbook-engine/.plans/_active.md` for the in-flight checklist.
+
+**Engine HEAD trail**: `a87c31eed4f` (0.1 lock) -> `1ae59a1a1aa` (0.2 cache) -> `7d63ff53132` (0.3 undo/redo) -> `5ce55f65739` (0.5a presence) -> `cd26a37b513` (0.5b plan-only) -> `bef220d7d3c` (0.4a engine napi) -> `a1e2c673381` (0.4b plan + D5 deviation) -> `6f7eb20cf44` (Cargo.lock) -> `b2b3775fcc8` + `30ae2d30b44` + `6cfaaffb01c` (deep-audit drift fixes).  **IDE HEAD trail**: `673792af05f` (0.3) -> `8ff2d81f1e4` (0.5a) -> `1744cee11af` (0.5b) -> `ec9b59db8a5` (0.4a) -> `fa7ec198cee` (0.4b).
+
+#### New engine napi surface (V3.4.0.3 + V3.4.0.4a + V3.4.0.5a)
+
+```ts
+class CollabSession {
+  // V3.4.0.3 -- undo/redo over Loro UndoManager.  Returns true if a stack
+  // item was consumed (inverse op appended to visible log), false if the
+  // stack was empty.  LOCAL-ONLY: remote ops merged via mergeBytes /
+  // pollRemote are NOT affected.  On consumed=true, rebuild_snapshot_cache
+  // is called BEFORE auto-flush (V3.3.0.X HIGH-1 closure) so a subsequent
+  // exportSnapshot reads the post-undo CellState view atomically.
+  undo(): boolean;
+  redo(): boolean;
+
+  // V3.4.0.4a -- minimal Op::AddSheet wrapper.  Sheet ids are assigned
+  // deterministically by the engine on replay in op-log append order
+  // (first addSheet call -> sheet 0; second -> sheet 1; ...).  Required
+  // before any appendPutValue on a sheet (rebuild_workbook replay
+  // requires sheets to exist before PutValue).
+  addSheet(name: string, chunkRows: number): void;
+
+  // V3.4.0.4a -- save to a .qbook directory at `path`.  Calls
+  // rebuild_workbook(&default_registry()) internally + save_workbook_with_oplog.
+  // Atomic two-file write (workbook.toml at envelope v2 + oplog.bin in
+  // Tier D3 header).  Workbook name hardcoded as "quantbook".
+  toQbook(path: string): void;
+
+  // V3.4.0.5a -- presence 5-pack.  See PresenceStateJson struct + #4.1.z4
+  // presence section for full semantics.
+  updatePresence(state: PresenceStateJson): void;
+  peerPresence(peer: bigint): PresenceStateJson | null;
+  clearPresence(): void;
+  sweepPresence(): number;
+  peersWithPresence(): bigint[];
+}
+
+class CollabSession {
+  // V3.4.0.4a -- load a session from a .qbook directory at `path`.
+  // peerIdOverride is REQUIRED (not Option) -- V3.4.0.4b IDE caller
+  // always passes a fresh UUID-derived BigInt via generateUuidPeerId
+  // (per D5 DEVIATION; see § D5 below).
+  static fromQbook(path: string, peerIdOverride: bigint): CollabSession;
+}
+
+// V3.4.0.5a -- JS-facing PresenceState mirror via #[napi(object)].
+// All 6 fields required.  Cursor coords = (sheet, row, col); selection-
+// rectangle opposite corner = (selectionEndRow, selectionEndCol); typing
+// is a soft hint for IDE cursor styling.  Engine-side bidirectional From
+// impls (CorePresenceState <-> PresenceStateJson) at FFI boundary.
+interface PresenceStateJson {
+  sheet: number;
+  row: number;
+  col: number;
+  selectionEndRow: number;
+  selectionEndCol: number;
+  typing: boolean;
+}
+```
+
+IDE-side typed wrappers at `extensions/quantlab/src/quantbook/session.ts`:
+
+```ts
+function undo(session: CollabSessionInstance): boolean;
+function redo(session: CollabSessionInstance): boolean;
+function addSheet(session: CollabSessionInstance, name: string, chunkRows?: number): void;  // default chunkRows=1000
+function exportToQbook(session: CollabSessionInstance, path: string): void;
+function sessionFromQbook(path: string, peerIdOverride: bigint): CollabSessionInstance;
+function generateUuidPeerId(): bigint;  // V3.4.0.4b; see § D5
+function updatePresence(session: CollabSessionInstance, state: PresenceStateJson): void;
+function peerPresence(session: CollabSessionInstance, peer: bigint): PresenceStateJson | null;
+function clearPresence(session: CollabSessionInstance): void;
+function sweepPresence(session: CollabSessionInstance): number;
+function peersWithPresence(session: CollabSessionInstance): bigint[];
+function buildPresenceSnapshotJson(session: CollabSessionInstance, panelSheet: number): PresencePanelSnapshot;  // host-side helper for V3.4.0.5b
+```
+
+**Error code surface** (extends V2.7 `QuantbookErrorCode` discriminated-union):
+
+| Code | Source | Meaning |
+|---|---|---|
+| `qbook_error` | `PersistenceError::Qbook(_)` | workbook persistence layer (I/O, schema, malformed cell) |
+| `qbook_unsupported_version` | `PersistenceError::OplogUnsupportedVersion { .. }` | `oplog.bin` schema version out of band |
+| `qbook_truncated_header` | `PersistenceError::OplogTruncatedHeader { .. }` | `oplog.bin` magic-prefix present but header < 8 bytes |
+| `qbook_unknown` | `PersistenceError::_` wildcard | `#[non_exhaustive]` future variants until this mapper is updated |
+| `session_oplog` | `CollabSessionError::OpLog(_)` | op-log Loro snapshot encode/decode (also fires from V3.4.0.4a `rebuild_workbook` and `oplog.export_bytes` inside `fromQbook`) |
+| `bad_argument` | napi argument validation | peerIdOverride zero / negative / > u64::MAX; `presenceUpdate` envelope malformed |
+
+`KNOWN_QUANTBOOK_ERROR_CODE_RECORD` in `session.ts` extends accordingly so V2.9 Lane C M3's record-driven `isQuantbookErrorCode` typeguard auto-recognizes the new codes.
+
+#### New engine state (V3.4.0.2 -- hybrid `CellState` cache)
+
+```rust
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CellState {
+    pub value: Option<CellWireValue>,
+    pub formula: Option<String>,
+}
+
+pub struct CollabSession {
+    // ... existing fields ...
+    last_snapshot: HashMap<(u16, u32, u32), CellState>,  // <-- type changed from CellWireValue
+}
+```
+
+**Rule 4 per-field walk** (V3.4.0.2 doc-comment; independently re-verified at V3.3.0.X by Opus + carried forward through V3.4):
+
+- `Option<T>: Send + Sync` when `T: Send + Sync` (std auto-trait).
+- `value: Option<CellWireValue>`: `CellWireValue` is `Send + Sync` per V1 audit.
+- `formula: Option<String>`: `String` is `Send + Sync` trivially.
+- Composition: `CellState: Send + Sync`.
+- `HashMap<(u16,u32,u32), CellState>: Send + Sync` (HashMap composition over auto-traits).
+- **0 new Rule 4 triggers at V3.4.0.2; arc terminus stays at 6.**  V3.4.0.5a adds one new napi-boundary struct `PresenceStateJson` -- composition of three `u16/u32` + one `bool` primitives, trivially Send+Sync; **also 0 new triggers**.
+
+**Per-field LWW semantics** (NOT per-cell):
+
+- `Op::PutValue` writes `state.value`, **preserves** `state.formula`.
+- `Op::PutFormula` writes `state.formula`, **preserves** `state.value`.
+- `Op::ClearFormula` clears `state.formula` via `get_mut + skip-if-absent`, preserves `state.value`.
+- A cell can carry BOTH a value AND a formula (e.g., `=A1+1` evaluated to `42` -- formula text + cached numeric coexist).
+
+**Ghost-entry avoidance**: `ClearFormula` uses `get_mut` (NOT `entry().or_default()`) so a ClearFormula on a never-written cell does NOT create a phantom cache entry.  Preserves `list_sheets_from_cache` correctness -- sheets only surface if a cell-keyed op materialized an entry.
+
+**7 op-mutation paths maintain the cache** (extends V3.3.0.3's 5):
+
+| Path | Cache update |
+|---|---|
+| `new` | initialized empty |
+| `from_snapshot` | full rebuild via `rebuild_snapshot_cache()` after `OpLog::import_bytes` |
+| `append_op` | O(1) incremental upsert on `Op::PutValue` / `Op::PutFormula` / `Op::ClearFormula` (3 cell-keyed variants; local append is at causal frontier; iteration order does not reorder existing entries) |
+| `merge_bytes` | full rebuild (Loro CRDT merge can causally-reorder; iteration order of EXISTING entries can shift) |
+| `discard_pending_ops` | full rebuild (`self.log = fork_at_vv(...)` replaces the log) |
+| `poll_remote_with_limit` | full rebuild after the drain batch (`merge_bytes` direct call) |
+| `undo` / `redo` | full rebuild BEFORE auto-flush (V3.3.0.X HIGH-1 closure; carries through V3.4.0.3) |
+
+**napi `export_snapshot` shape preservation** (V3.4.0.2 contract): the JSON shape returned to the IDE is UNCHANGED from V3.3.0.3 -- the FFI layer extracts `state.value` via `filter_map` and SKIPS entries where `value` is `None` (formula-only cells with no literal value).  V3.4.1+ may extend the JSON with a `formula?: string` field once IDE rendering needs formula display; for V3.4 the snapshot remains literal-value-only.
+
+**Read path**: `CollabSession::snapshot_cells(&self, sheet: u16) -> Vec<((u32, u32), CellState)>` -- signature CHANGED from `CellWireValue` to `CellState` at V3.4.0.2.  Direct Rust consumers must `.value.as_ref()` to access the literal.
+
+#### Undo/redo invalidation contract + Cmd-Z webview wiring (V3.4.0.3)
+
+**Cache invalidation contract** (closes V3.3 R-V3.3-2):
+
+- On `undo() == true` (and symmetrically `redo() == true`), the engine method calls `rebuild_snapshot_cache()` BEFORE returning + BEFORE auto-flush.  IDE callers can chain `undo() === true` immediately with `exportSnapshot` without re-locking.
+- On `undo() == false` (empty stack), NO cache rebuild + NO auto-flush is triggered -- a closed transport cannot turn "nothing to undo" into a spurious `[transport_closed]` error (V3.5 V2 V2 + Codex M2 contract carried).
+
+**Cmd-Z webview wiring** (V3.4.0.3 IDE; lives in `cellGridHtml.ts::buildClientScript`):
+
+```text
+document.addEventListener('keydown', function (ev) {
+  if (activeInput !== null) {
+    // Mid-edit: let the browser handle text-undo inside the cell <input>.
+    // Do NOT preventDefault; do NOT post the workbook undo envelope.
+    return;
+  }
+  const isMeta = ev.metaKey || ev.ctrlKey;
+  if (!isMeta) return;
+  const key = ev.key.toLowerCase();
+  if (key === 'z' && !ev.shiftKey) {
+    ev.preventDefault();
+    vscode.postMessage({ type: 'undo' });
+  } else if ((key === 'z' && ev.shiftKey) || key === 'y') {
+    ev.preventDefault();
+    vscode.postMessage({ type: 'redo' });
+  }
+});
+```
+
+Key mapping: `(Cmd|Ctrl)+Z` (no Shift) -> `{type:'undo'}` post; `(Cmd|Ctrl)+Shift+Z` OR `Ctrl+Y` (Win/Linux convention) -> `{type:'redo'}` post; case-insensitive on `'z'` / `'y'`.
+
+**Mid-edit guard** (V3.4.0.1 D4 boolean-flag race-guard pattern; extends V3.3.0.4 `activeInput` scroll-handler guard): when `activeInput !== null`, the keydown handler returns BEFORE `preventDefault + postMessage`, so the browser's native text-undo handles undo inside the `<input>` rather than escaping into the workbook undo path.
+
+**Dispatcher envelope arms** (`cellGridLogic.ts::dispatchIncomingMessage`):
+
+```text
+undo / redo:
+  - consumed=true  -> deps.onCommit() triggers panel re-render via V3.3.0.3 cache
+  - consumed=false -> silent no-op (empty stack; user pressed Cmd-Z with nothing to undo)
+  - engine throw   -> deps.onError({ code: info.code, message: '[undo|redo] ${info.message}',
+                                     sheet: deps.sheet, row: 0, col: 0 })
+```
+
+`row/col` sentinels = 0 because undo/redo is session-wide, not cell-keyed; the errorReply schema requires coords (V3.2.b.1 B1 envelope contract).
+
+#### `.qbook` persistence (V3.4.0.4a) + `addSheet` real semantic gap closure
+
+**Envelope format**: stays at v2 per V3.4.0.1 D3 -- the existing `workbook.toml.schema_version` from Phase 2A.8 is sufficient; no v3 bump needed because the D5 deviation (V3.4.0.4b) means PeerId is NOT persisted in the envelope.  Tier D3 oplog wrapper from D-1 step 7 carries unchanged.
+
+**`toQbook(path)` semantics** (V3.4.0.4a):
+
+1. Lock the session.
+2. Call `inner.rebuild_workbook(&default_registry())` -- materializes a `Workbook` from the op log via `replay_into`.  The `Workbook` NEVER crosses the FFI boundary; it's a write-only serializer input.
+3. Call `save_workbook_with_oplog(&wb, op_log, "quantbook", path)` -- atomic two-file write (workbook.toml + oplog.bin) via temp-dir + rename.
+4. Workbook name hardcoded as `"quantbook"` at V3.4.0.4a; V3.4.1+ may accept a name argument derived from filename.
+
+**`fromQbook(path, peerIdOverride)` semantics**:
+
+1. Validate `peerIdOverride` via `peer_id_from_bigint` -- non-zero (LEGACY_PEER sentinel rejected) + within u64 range.
+2. `load_workbook_with_oplog(path)` -> `(Workbook, OpLog)`.
+3. The loaded `Workbook` is DISCARDED -- only the `OpLog` matters for V3.4.0.4a.  IDE-side Workbook consumption stays V3.5+ scope; the V3.3.0.3 incremental cache (rebuilt during `from_snapshot`) answers all V3.3+ consumer queries.
+4. `oplog.export_bytes()` -> snapshot bytes.
+5. `CollabSession::from_snapshot(peer_id_override, &bytes)` -> fresh session at the loaded state.  `from_snapshot` rebuilds the V3.3.0.3 / V3.4.0.2 cache from the imported log per its field-docstring contract.
+
+**Double-Loro-serialization cost**: `load_workbook_with_oplog` decodes -> `export_bytes` re-encodes -> `from_snapshot` re-decodes.  At V3.4 scale (workbook open is user-initiated, ~1/min max), this is irrelevant.  V3.4.1+ could add `CollabSession::from_oplog(peer_id, OpLog)` factory bypassing the round-trip if profiling justifies, but it requires lifting the LoroDoc-set-peer-id concern through a new API surface.
+
+**`addSheet(name, chunkRows)` -- REAL SEMANTIC GAP closure** (V3.4.0.4a discovery):
+
+`CollabSession::rebuild_workbook` (called internally by `toQbook`) replays the op log into a fresh `Workbook` via `replay_into`, and `Op::PutValue { sheet, ... }` replay REQUIRES the sheet to already exist (else `session_replay -- invalid sheet at op N`).  Without an `addSheet` napi, sessions built purely via `appendPutValue` could NOT be saved.  The minimal wrapper closes the gap:
+
+- Sheet ids are assigned deterministically by the engine on replay in op-log append order: first `addSheet` -> sheet 0; second -> 1; ...
+- `chunkRows` = per-sheet row partition size for `Workbook` internal storage (Phase 2A multi-million-cell optimization).  Pass `1000` for typical V3.4 scale.
+- Callers building sessions intended for `.qbook` persistence MUST `addSheet` BEFORE `appendPutValue` for that sheet.
+
+**Save-during-pending-flush** (R-V3.4-6 CLOSED at V3.4.0.4a): `toQbook` saves `inner.op_log()` directly, which contains ALL local ops.  Transport "flush" is the cross-peer sync, ORTHOGONAL to disk persistence.  The session's local op log IS the canonical state from this peer's perspective regardless of whether peers have observed it.  No pending-flush hazard at V3.4 scope.
+
+**IDE commands** (V3.4.0.4b):
+
+- `quantlab.quantbookSaveAs`: requires an open local `CellGridPanel` (`CellGridPanel.activeLocalPanels()`); uses oldest-panel semantic per V3.3.0.5/.6 (`panels[0]`).  `vscode.window.showSaveDialog` with `filters: { 'Quantbook': ['qbook'] }` -> `exportToQbook(panel.session, uri.fsPath)`.  Success / failure toasts via `vscode.window.showInformationMessage` / `showErrorMessage` + log to extension output channel.
+- `quantlab.quantbookOpen`: `vscode.window.showOpenDialog` with `canSelectFolders: true` + `canSelectFiles: false` (a `.qbook` is a directory) + filter -> generates fresh PeerId via `generateUuidPeerId()` (per D5 DEVIATION) -> `sessionFromQbook(path, peerId)` -> `CellGridPanel.show(context, session, 0)` (always opens on sheet 0; user runs Switch Cell Grid Sheet for other sheets).
+
+#### D5 DEVIATION -- fresh-UUID-per-session (V3.4.0.4b)
+
+**Original V3.4.0.1 D5 lock**: persisted-per-workbook PeerId via envelope v3 (`peer_id_for_this_session: u64` field) OR `~/.config/quantlab/peer_ids.json` keyed by workbook UUID; on subsequent open the same workbook gets the same PeerId -> "this peer is User A across sessions" continuity.
+
+**Implementation discovery at V3.4.0.4b**: persisted-per-workbook PeerId has an unsolvable two-windows-same-workspace collision -- if a user opens the SAME workbook in TWO vscode windows of the SAME workspace simultaneously, both windows would read the SAME stashed PeerId + assert-fail or, worse, silently corrupt CRDT causality (Loro requires unique PeerIds per concurrent participant).
+
+**Resolution (shipped at V3.4.0.4b)**: **fresh-UUID-per-session**.  IDE-side `generateUuidPeerId()` helper in `session.ts`:
+
+```ts
+function generateUuidPeerId(): bigint {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const uuid = crypto.randomUUID();
+    const hex16 = uuid.replace(/-/g, '').slice(0, 16);  // first 16 hex = 64 bits
+    const value = BigInt('0x' + hex16);
+    if (value !== 0n) return value;  // reject the astronomically-rare all-zero
+  }
+  throw new Error('[bad_argument] generateUuidPeerId: 8 consecutive zero-truncated UUIDs from crypto.randomUUID -- entropy source broken');
+}
+```
+
+- **Source**: Node 14.17+ `crypto.randomUUID()`; Electron / VS Code well past floor.
+- **Entropy**: UUIDv4 has 122 random bits; truncating to 64 keeps ~64 bits.  Birthday-paradox collision probability is ~2^32 sessions before first collision -- effectively zero for real workbook usage.
+- **Non-zero guarantee**: `PeerId(0)` is the engine's `LEGACY_PEER` sentinel + would assert-fail `CollabSession::new`.  All-zero truncation has ~2^-64 probability; we retry up to 8 times.
+- **8-attempt cap throws per CLAUDE.md No-Fallbacks**: 8 consecutive all-zero UUIDs is ~2^-512 probability -- reaching there means the entropy source is broken; surfaces loudly rather than silently.
+
+**Trade-off accepted**:
+
+- ✅ **CRDT-correct**: each session = distinct Loro peer; future ops get unique attribution.
+- ✅ **Closes R-V3.3-5 fully**: UUID 2^64 keyspace vs PID's ~2^15 effective range.
+- ✅ **No back-compat issue**: V3.4 is the first `.qbook` ship; persisted-peerId contract never existed in production.
+- ❌ **No cross-restart op-attribution continuity**: "this peer is User A across sessions" feature is NOT available.  Past ops keep their original PeerId attribution; future ops use the new session UUID.
+
+**V3.4.1+ may revisit IF** a user-facing feature ("show my contributions", per-user color in presence, audit log of who-changed-what) surfaces and justifies the per-workbook stash complexity.  For V3.4.0.4b scope the trade-off is accepted.
+
+#### Presence integration with cell-grid (V3.4.0.5a/b)
+
+**Engine napi (V3.4.0.5a)** wraps the existing Phase 5.6 V1+V2 `CollabSession` presence surface.  `PresenceStateJson` is a `#[napi(object)]` struct at the FFI boundary; bidirectional `From` impls convert between `CorePresenceState` and `PresenceStateJson` losslessly.
+
+**Sweep contract (V1 limitation pinned at V3.4.0.5a tests)**: `sweepPresence()` removes ALL entries unconditionally and returns the removed count.  There is NO threshold parameter at V1; V3.4.1+ may add `sweep_presence_with_threshold(secs)` when engine ships it.  Presence persists across `exportBytes` / `fromSnapshot` (LoroDoc snapshot contains the presence LoroMap; V1 known limitation per engine `presence.rs` docstring); callers wanting "rejoin with clean presence" should call `sweepPresence()` after `fromSnapshot`.
+
+**IDE host-side helper (V3.4.0.5b)**:
+
+```ts
+interface PresenceSnapshotPeer {
+  peerId: string;       // 16-hex lowercase (matches engine presence::peer_key + DOM data-peer attribute encoding)
+  sheet: number;
+  row: number;
+  col: number;
+  selectionEndRow: number;
+  selectionEndCol: number;
+  typing: boolean;
+}
+interface PresencePanelSnapshot {
+  selfPeerId: string;
+  peers: PresenceSnapshotPeer[];
+}
+
+function buildPresenceSnapshotJson(session, panelSheet): PresencePanelSnapshot;
+// - Skip-self filter: own cursor IS the cell input; no decoration needed.
+// - Race-aware null-skip: peer enumerated in peersWithPresence but cleared
+//   between calls returns null from peerPresence; silently dropped.
+// - Sheet filter happens WEBVIEW-SIDE (today's webview ignores peers on
+//   other sheets); host returns ALL peers in case a future multi-sheet UI
+//   wants the full set.
+```
+
+**HTML embedding** (mirrors V3.3.0.4 `cell-grid-data` data block structure):
+
+```
+<script id="cell-grid-presence" type="application/json">{"selfPeerId": "...", "peers": [...]}</script>
+```
+
+- Non-executable; CSP `script-src 'nonce-...'` blocks unnonced scripts.
+- Defense-in-depth: `</script>` substrings escaped to `<\/script` to prevent premature tag termination.
+- Empty fallback `{"selfPeerId": "0000000000000000", "peers": []}` is emitted when caller omits `options.presence` -- the webview script's data-block lookup never returns null (avoids a branch in the inline script).
+- Gated on nonced mode: V3.2.a read-only mode has no script + no decoration; the data block is suppressed entirely.
+
+**CSS rule**:
+
+```css
+.cell-peer-presence {
+  outline: 2px solid var(--vscode-editorCursor-foreground);
+  outline-offset: -2px;
+}
+```
+
+Uses `outline` (NOT `border`) so the existing td border + padding stays stable -- layout doesn't shift when peers arrive / depart.  `outline-offset: -2px` pulls the outline inward to the cell edge.  All peers get the same color at V3.4.0.5b; per-peer color hashing is V3.4.1+ polish.
+
+**Webview decoration script**: parses `cell-grid-presence` on init -> for each peer, filters by `p.sheet === SHEET` -> finds matching `.cell-value[data-row][data-col]` td -> adds `.cell-peer-presence` class + `data-peer="${peerId}"` attribute.  Best-effort: silent if no matching td (peer is on a row outside the virtualized window per V3.3.0.4, OR on a different sheet, OR in a never-PutValue'd cell with no `<td>` to decorate).
+
+**Edit-mode broadcast**: `beginEdit` posts `{type:'presenceUpdate', state:{...typing:true}}`; `endEdit` posts the same with `typing:false`.  Sent regardless of commit/cancel because both transition out of typing state.
+
+**Dispatcher envelope arm** (`cellGridLogic.ts`):
+
+```text
+presenceUpdate:
+  - runtime validation: state must be object with 6 fields
+    (sheet/row/col/selectionEndRow/selectionEndCol all numbers; typing boolean)
+  - malformed -> errorReply { code: 'bad_argument', message: '[presenceUpdate] state must be ...' }
+  - success   -> session.updatePresence(state); NO onCommit
+                 (presence doesn't affect cell snapshot; re-render every cursor
+                  move would thrash)
+  - engine throw -> errorReply { code: info.code, message: '[presenceUpdate] ${info.message}' }
+```
+
+**Panel lifecycle**:
+
+- `render()` builds presence snapshot via `buildPresenceSnapshotJson`; try/catch with `console.warn` fallback per CLAUDE.md No-Fallbacks (presence is non-critical decoration; cells render without it if engine throws).
+- `panel.onDidDispose` calls `session.clearPresence()` so this peer's cursor disappears for remote peers when the window closes.  `console.warn` on engine failure (CLAUDE.md compliance -- dispose handlers are fire-and-forget but errors MUST be visible).  Runs BEFORE `disposeAttachment` so the auto-flush has a transport to flush through.
+
+#### Drift hazards (V3.x maintainers)
+
+- **CellState shape evolution**: V3.5+ may add `format: Option<FormatId>` to `CellState` for `Op::SetCellFormat`.  The Rule 4 per-field walk MUST be re-run at that point because `FormatId` is a tagged enum (`Builtin(u32) | Custom(PeerId, u32)`) whose trait obligations were audited at D-1.  The walk MUST cover every new field.
+- **`addSheet` pre-`appendPutValue` requirement**: sessions built via `appendPutValue` alone (without prior `addSheet`) CANNOT be saved via `toQbook` -- `rebuild_workbook` replay fails with `session_replay -- invalid sheet`.  Document this in any future test scaffolding helper that builds sessions for persistence round-trip.
+- **`rebuild_workbook` engine-side-only constraint**: napi-side `toQbook` uses `rebuild_workbook` internally at V3.4 scope.  IDE-side Workbook materialization stays V3.5+ scope.  Do NOT expose the rebuilt Workbook through FFI without a V3.5 entry-readiness review.
+- **D5 deviation pitfall for V3.4.1+**: if a user-facing "show my contributions" feature surfaces and motivates per-workbook PeerId stashing, the V3.4.0.4b two-windows-same-workspace collision MUST be re-solved.  Candidate approaches: (a) per-session UUID + stash-on-first-save with prompt on second-window-open ("rejoin as same user or fork as new user?"); (b) per-machine PeerId in `~/.config` keyed by `(workbook_uuid, machine_id)` so two machines get distinct ids but same-machine same-workbook gets the same.  Both add complexity; defer until justified.
+- **Presence data block parallel to `cell-grid-data`**: the V3.4.0.5b webview script reads `cell-grid-presence` separately.  Any V3.x that adds OTHER data blocks (e.g., format snapshot, validation rules) MUST follow the same `<script id="cell-grid-X" type="application/json">` + `</script>`-escape + empty-fallback pattern + nonced-mode gate.
+- **UUID retry cap**: `generateUuidPeerId` throws after 8 zero-truncated UUIDs.  This is a defensive No-Fallbacks closure; if the throw ever fires in practice, the entropy source is broken (Electron / V8 randomness pool exhausted, OS-level `/dev/urandom` failure).  Investigate as a runtime corruption signal, NOT a routine retry.
+- **`updatePresence` envelope does NOT trigger onCommit**: deliberate at V3.4.0.5b dispatcher arm.  V3.x maintainers extending presence to MORE state (e.g., "selected range" persistence in the snapshot) MUST decide whether the new state changes warrant re-render; the V3.4 default is "no thrash".
+
+#### V3.4 risk register (post-implementation reality)
+
+- **R-V3.4-1 Hybrid cache shape migration breaks consumers** -- MITIGATED at V3.4.0.2 by keeping `snapshot_cells(sheet)` SIGNATURE-extending (return type changed `CellWireValue -> CellState` for Rust consumers; napi `export_snapshot` JSON shape unchanged for IDE).  Internal field shape change only on the Rust side.
+- **R-V3.4-2 Undo/redo across persistence load** -- DOCUMENTED.  Loading a `.qbook` gives the session a fresh state; Loro `UndoManager` history is RESET on `from_snapshot` (matches existing behavior).  Load -> no undo of pre-load state available.  This is correct CRDT behavior; document any future "preserve undo across load" feature request as out-of-scope for V3.4.
+- **R-V3.4-3 Presence + 2-window collab race** -- DEFERRED at V3.4.0.5b implementation.  Discovery: `render()` rebuilds the full HTML on every `pollRemote` merged tick (V3.2.c pollRemote integration + V3.3.0.3 cache invalidation), so presence decoration regenerates naturally with the rest of the panel.  The V3.3.0.4 `activeInput` mid-edit guard already prevents tbody clobber from the scroll handler.  No separate `presenceRepaintInFlight` flag was needed at V3.4.0.5b scope.  V3.4.0.5c (optional polish) may revisit IF live smoke surfaces races (e.g., presence-update repaint mid-scroll causing flicker).
+- **R-V3.4-4 PeerId reuse across .qbook save/load** -- CLOSED at V3.4.0.4b via D5 DEVIATION (see § D5 above).  Fresh-UUID-per-session via `crypto.randomUUID` truncated to 64-bit BigInt.  R-V3.3-5 cross-restart PID collision carryforward also CLOSED (UUID 2^64 keyspace vs PID ~2^15 effective range).
+- **R-V3.4-5 Undo across remote-op merge** -- DOCUMENTED.  Loro `UndoManager` only undoes LOCAL ops; remote ops merged via `pollRemote` are NOT undone.  This is correct CRDT behavior; undoing a remote op would mean "delete the peer's edit" which violates causality.  IDE smoke procedure (§ live smoke below) includes an explicit two-window check: "Cmd-Z after a remote edit lands undoes YOUR last edit, not the remote one."
+- **R-V3.4-6 .qbook save during pending-flush** -- CLOSED at V3.4.0.4a (see `.qbook persistence` section above).  `toQbook` saves `op_log()` directly; transport flush is orthogonal to disk persistence.
+- **~~R-V3.4-7 Presence sweep frequency~~** -- **VOIDED at V3.4.0.5b**.  Pre-implementation premise (Phase 5.6 V2 `sweep_presence(threshold_secs)`) was WRONG: the engine `sweepPresence()` actually shipped without a threshold parameter and sweeps ALL entries unconditionally.  Periodic auto-sweep on a tick cadence would clobber live remote peers' cursor decorations.  Correct behavior at V3.4.0.5b: sweep ONLY on lifecycle events (`panel.onDidDispose` calls `clearPresence` for the local peer).  Threshold-based variant deferred to V3.4.1+ when engine ships `sweep_presence_with_threshold(secs)`.
+
+#### Out of scope for V3.4
+
+- Save-on-edit auto-save (V3.4.1+; user must explicitly run `Quantbook: Save As` after edits).
+- Last-saved-time indicator in panel title (V3.4.1+).
+- Multi-sheet picker in `Quantbook: Open` UX (always lands on sheet 0; user runs `Quantbook: Switch Cell Grid Sheet` for other sheets; V3.4.1+).
+- Per-peer color hashing for presence decoration (V3.4.1+ polish; today all peers get `--vscode-editorCursor-foreground`).
+- Tooltips on presence-decorated cells ("PeerId X is editing"; V3.4.1+ polish; the `data-peer` attribute is already pinned for the future hook).
+- Threshold-based `sweepPresence` variant (waits on engine `sweep_presence_with_threshold(secs)`; V3.4.1+).
+- Per-workbook PeerId stash for cross-restart op-attribution continuity (D5 deviation deferral; V3.4.1+ IF user-facing feature surfaces).
+- IDE-side `rebuild_workbook` consumption (V3.5+ scope; today engine-side-only at the napi layer for `toQbook` serialization).
+- Partial-invalidate undo strategy (V3.5+; V3.4 uses full-rebuild per V3.3.0.X HIGH-1 closure).
+- Full `Op` enum cache coverage (V3.5+; V3.4 covers 3 cell-keyed variants -- PutValue + PutFormula + ClearFormula; SetCellFormat / RegisterFormat / RenameSheet / DeleteSheet etc. deferred).
+- Live VS Code smoke test as mocha automation (out of mocha scope without `vscode-test`; user-action gap closed by § live smoke procedure below).
+- Multi-window collab via `.qbook` (needs live VS Code; V3.4.0.6 deferral; § live smoke procedure includes the check).
+- Presence + scroll race-guard mocha (R-V3.4-3 DEFERRED -- existing `activeInput` guard + full render cover the surface; no race-guard test to write at V3.4 scope).
+
+#### Live smoke procedure (V3.4.0.7 user-action gap closure)
+
+Mocha pins the V3.4 surface 228/228 but the actual VS Code webview lifecycle for undo/redo + Save As / Open + cross-window presence has not been verified at the OS level.  Extends V3.3.0.6 § 4.1.z3 procedure:
+
+```sh
+# Prerequisites: same as V3.3.0.6 § 4.1.z3 steps 1-2 (build engine cdylib;
+# open IDE in Extension Development Host).
+
+# 7. Undo/redo smoke (V3.4.0.3).
+#    In the Cell Grid panel from V3.3.0.6 step 3:
+#    - Edit cell A1 -> 100 -> Enter -> cell shows 100.
+#    - Cmd-Z (Mac) / Ctrl-Z (Win/Linux) -> cell A1 reverts.
+#    - Cmd-Shift-Z (Mac) / Ctrl-Y (Win/Linux) -> cell A1 re-applies to 100.
+#    - Edit cell A1 -> start typing "200" but DON'T Enter yet.
+#    - Cmd-Z WHILE mid-edit -> the typed text "200" undoes character-by-character
+#      (browser text-undo); the workbook value is NOT undone.  Mid-edit guard works.
+#    - Escape to cancel; Cmd-Z again -> NOW the workbook undo fires (cell A1
+#      reverts from 100 to its pre-V3.4.0.3-step-7 state).
+
+# 8. .qbook Save As smoke (V3.4.0.4a + V3.4.0.4b).
+#    Cmd-Shift-P -> "Quantbook: Save As..."
+#    - showSaveDialog appears with .qbook filter.
+#    - Choose a path like ~/Desktop/smoke.qbook -> Save.
+#    - Toast: "Quantbook saved to /Users/.../smoke.qbook".
+#    - In a terminal: `ls ~/Desktop/smoke.qbook` -> directory with
+#      `workbook.toml` + `oplog.bin`.
+
+# 9. .qbook Open smoke.
+#    Cmd-Shift-P -> "Quantbook: Open..."
+#    - showOpenDialog appears with canSelectFolders + .qbook filter.
+#    - Choose ~/Desktop/smoke.qbook -> Open.
+#    - New Cell Grid panel opens on sheet 0 with the saved state restored.
+#    - Output channel shows: `Opened Quantbook from /Users/.../smoke.qbook
+#      (peerId=0xXXXXXXXXXXXXXXXX)` where XXXXXXXXXXXXXXXX is a fresh
+#      UUID-derived 16-hex BigInt (D5 deviation -- NOT the same as the
+#      saver's PeerId).
+
+# 10. Two-window collab + presence smoke (V3.4.0.5a/b + R-V3.4-5).
+#     File -> New Window (or duplicate the EDH).
+#     In window 1: "Quantbook: Open Cell Grid (Collab)" -> panel opens.
+#     In window 2: "Quantbook: Open Cell Grid (Collab)" -> panel opens.
+#     - Both windows should connect via the relay (V3.2.c).
+#     - In window 1, click cell A1 -> enter edit mode.
+#       In window 2, within ~1s (pollRemote cadence), cell A1 in window
+#       2's panel should gain a `.cell-peer-presence` outline (V3.4.0.5b
+#       decoration).
+#     - In window 1, Enter to commit "42" + click off.
+#       In window 2: cell A1 outline DISAPPEARS (typing=false; clear on
+#       click-off) within ~1s.  Cell A1 also updates to 42 (V3.2.c
+#       propagation).
+#     - In window 1, Cmd-Z to undo the "42" write.
+#       Cell A1 in window 1 reverts; window 2 also sees the revert within
+#       ~1s.
+#     - R-V3.4-5 check: in window 1, edit cell B1 -> "999" -> Enter.
+#       Then in window 1, edit cell A1 -> "100" -> Enter.
+#       Cmd-Z in window 1 -> A1 reverts to its pre-100 value (NOT B1's
+#       999 -- undo only retracts the local peer's last op, NOT the
+#       remote op).
+#     - Close window 1.  In window 2: cell A1's presence outline (if any
+#       remained) should disappear within ~1s (dispose-time clearPresence).
+
+# 11. Multi-window persistence smoke (R-V3.4-2 + D5 DEVIATION pin).
+#     In a single window: "Quantbook: Open..." the smoke.qbook from step 9.
+#     In the SAME window: "Quantbook: Open..." the SAME smoke.qbook
+#     AGAIN.  Two panels open with the SAME data but DIFFERENT PeerIds
+#     (D5 deviation -- fresh UUID per open).  Both panels can be edited
+#     independently; merges happen via the engine's CRDT layer.  Cmd-Z
+#     in panel A reverts panel A's last op only; the same applies to
+#     panel B (R-V3.4-5 LOCAL-ONLY undo carries).
+```
+
+If smoke surfaces issues, file findings against V3.4.0.X audit (parallel Codex+Opus megaudit) which is the next planned audit cycle.
+
 ---
 
 **D-1 (✅ SHIPPED 2026-05-20 — all 8 steps + 7 per-step audits + 1 megaudit):** `FormatId` is now `enum { Builtin(u32), Custom(PeerId, u32) }` in `ql-storage::format`. IDE callers MUST pattern-match the variant rather than reading `.0`. Use `FormatId::is_builtin()` / `is_custom()` / `GENERAL` accessors. For pre-D-1 bare-u32 ids (xlsx import), use `FormatId::legacy_from_u32(n)`. `Op::RegisterFormat` + `Op::SetCellFormat` carry `FormatIdWire` on the wire. `.qbook` envelope v8 carries the tagged-tuple `FormatEntryId` shape losslessly for multi-peer ids; v<8 envelopes auto-migrate. xlsx export flattens multi-peer FormatIds via dedup-by-code; non-LEGACY peer flattens reported via `XlsxExportReport.dropped_features`. xlsx import surfaces unresolved-overlay-numfmt as `report.unsupported` entries. `.qbook/oplog.bin` files wrapped in Tier D3 header (`OPLOG_MAGIC = b"QLOL"` + BE u32 `OPLOG_SCHEMA_VERSION`). `CollabSession::new` + `from_snapshot` + `OpLog::set_peer_id` assert `PeerId != 0` (release-firing). See `docs/phase5/d-1-exit-packet.md` for the full closure record.
