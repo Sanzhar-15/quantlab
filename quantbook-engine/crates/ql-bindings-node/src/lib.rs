@@ -586,20 +586,19 @@ impl CollabSession {
     /// `exportSnapshot` incremental-cache decision).
     #[napi(js_name = "listSheets")]
     pub fn list_sheets(&self) -> Result<Vec<u16>> {
+        // **V3.3.0.X audit closure (MEDIUM-3, 2026-05-23, Opus
+        // adversarial lane)**: read sheets from the V3.3.0.3
+        // incremental snapshot cache instead of walking the op log
+        // per call.  Pre-closure this method was O(N) in op count
+        // per invocation (V3.2.d Opus M4 ANALOG for listSheets);
+        // post-closure it's O(cells-in-cache).  The cache is
+        // maintained by 7 op-mutation paths (new / from_snapshot /
+        // append_op / merge_bytes / discard_pending_ops / poll_remote_
+        // with_limit + V3.3.0.X-added undo/redo); the sheet set
+        // derived from cache keys is canonical for the same reason
+        // `snapshot_cells` is canonical.
         let inner = self.inner.lock();
-        let mut sheets: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
-        for op_result in inner.op_log().iter() {
-            let op = op_result.map_err(|e| {
-                bad_argument_error(format!("listSheets: op log iter error: {e}"))
-            })?;
-            if let Op::PutValue { sheet, .. } = op {
-                sheets.insert(sheet);
-            }
-        }
-        // BTreeSet's iter is sorted ascending; collect to Vec preserves
-        // that ordering so the IDE consumer can rely on a deterministic,
-        // pre-sorted enumeration without an additional sort step.
-        Ok(sheets.into_iter().collect())
+        Ok(inner.list_sheets_from_cache())
     }
 
     /// Export a full snapshot of this session's op log.

@@ -396,23 +396,38 @@ pub struct CollabSession {
     /// V3.2.d Opus MEDIUM-4 (`exportSnapshot` lock-hold time scales
     /// linearly with op log size).
     ///
-    /// **Update paths** (every op-log mutation site):
-    /// - `new`: empty.
+    /// **Update paths** (V3.3.0.X audit closure (MEDIUM-2, 2026-05-23):
+    /// SEVEN op-log mutation sites + initialization, all enumerated below;
+    /// pre-closure the docstring listed only 5 and the docs drifted from
+    /// source -- see audit transcript at `docs/audits/2026-05-23-phase-5-7-
+    /// v3-3-0-x-{codex,opus}.md`):
+    /// - `new`: empty initialization.
     /// - `from_snapshot`: rebuilt by walking the imported log.
     /// - `append_op`: O(1) `insert` on PutValue (local append is
     ///   always at the causal frontier; iteration order does not
     ///   reorder existing entries).
-    /// - `merge_bytes`: REBUILT (clear + walk).  Loro's CRDT merge
-    ///   can insert remote ops at causally-prior positions, which
-    ///   changes the iteration order of EXISTING entries; the
-    ///   "latest value at (sheet, row, col)" can shift even though
-    ///   the local op log only GROWS.  Full rebuild is correct +
-    ///   bounded at O(N) in op count (matches the pre-V3.3.0.3
-    ///   per-`export_snapshot` cost; amortizes if many
+    /// - `merge_bytes`: REBUILT (atomic-swap rebuild from scratch).
+    ///   Loro's CRDT merge can insert remote ops at causally-prior
+    ///   positions, which changes the iteration order of EXISTING
+    ///   entries; the "latest value at (sheet, row, col)" can shift
+    ///   even though the local op log only GROWS.  Full rebuild is
+    ///   correct + bounded at O(N) in op count (matches the
+    ///   pre-V3.3.0.3 per-`export_snapshot` cost; amortizes if many
     ///   `export_snapshot` calls happen between merges).
     /// - `discard_pending_ops`: REBUILT (the log is replaced via
     ///   `fork_at_vv`, so prior cache entries may reference ops
     ///   no longer in the log).
+    /// - `poll_remote_with_limit`: REBUILT after the drain batch
+    ///   (the loop calls `self.log.merge_bytes` per blob, bypassing
+    ///   the public `Self::merge_bytes` cache invalidation; one
+    ///   rebuild at the END of the batch matches the auto-flush
+    ///   cadence).
+    /// - `undo` / `redo` (V3.3.0.X audit closure -- HIGH-1): both
+    ///   methods call `UndoManager::undo`/`::redo` which append an
+    ///   inverse op to the visible op log.  Pre-V3.3.0.X audit the
+    ///   docstring claimed "every op-log mutation site" was covered
+    ///   but undo/redo were NOT.  Now: both methods call
+    ///   `rebuild_snapshot_cache()` when `consumed == true`.
     ///
     /// **Read paths**:
     /// - [`Self::snapshot_cells`] -- O(total cache entries); the
@@ -420,13 +435,20 @@ pub struct CollabSession {
     ///   (acceptable at V3.3 scale of a few sheets).  V3.x may
     ///   nest by sheet for O(cells-on-sheet) reads if profiling
     ///   justifies.
+    /// - [`Self::list_sheets_from_cache`] -- O(cells-in-cache) via
+    ///   `BTreeSet` walk over the cache keys.  Closes V3.3.0.X
+    ///   Opus M3 (pre-closure `napi list_sheets` walked the entire
+    ///   op log per call; now derives from cache).
     ///
-    /// **Invalidation discipline**: cache is MONOTONIC-GROW at V3.3
-    /// (no undo at V3.3 per V3.2.e exit packet § "V3.3 deliberately
-    /// did NOT do").  V3.4 undo lands → the undo path MUST call
-    /// `rebuild_snapshot_cache()` (or an undo-aware
-    /// `invalidate_cells(...)` accessor) before exporting.  Tracked
-    /// in `.plans/_active.md` V3.3 risk register R-V3.3-2.
+    /// **Invalidation discipline**: with undo/redo now covered at
+    /// V3.3.0.X, the cache stays canonical across every visible
+    /// op-log mutation.  V3.4 binds undo/redo via napi + adds new
+    /// IDE-side surfaces; the cache invariant holds for that work
+    /// without further changes.  R-V3.3-2 closure pre-V3.4 entry.
+    /// Test seam `force_clear_snapshot_cache()` (gated on `test-
+    /// fixtures` feature) is available for V3.4+ undo-invalidation
+    /// regression tests that need to force a cache rebuild
+    /// independent of the normal mutation paths.
     ///
     /// **Rule 4 per-field walk** (per V3.3.0.1 audit discipline +
     /// V3.3.0.3 closure of V3.2.d Opus M4):
@@ -668,6 +690,60 @@ impl CollabSession {
         &self.log
     }
 
+    /// **Phase 5.7 V3.3.0.X audit closure (MEDIUM-3, 2026-05-23) --
+    /// listSheets reads from the incremental snapshot cache.**
+    ///
+    /// Returns the distinct u16 sheets referenced by `Op::PutValue`
+    /// entries currently in the cache.  Output is sorted ascending
+    /// via `BTreeSet` collection.
+    ///
+    /// Pre-V3.3.0.X audit, the napi `list_sheets` walked the entire
+    /// op log per call (O(N) in op count).  The V3.3.0.3 incremental
+    /// cache already keyed entries by `(sheet, row, col)` so deriving
+    /// the sheet set from cache keys is O(cells-in-cache) -- the
+    /// same complexity as `snapshot_cells` but typically much
+    /// smaller than the op log (cells <= ops; one op per cell
+    /// in the LWW-only case).
+    ///
+    /// Empty if no `PutValue` ops have been observed.  Cross-peer
+    /// convergence is identical to the cache's: post-mergeBytes,
+    /// two peers' cache keys converge.
+    ///
+    /// V3.4+ migration path (per V3.2.d Opus M4 + V3.3.0.X Opus M3):
+    /// when the `Op` enum extends beyond `PutValue` (RegisterFormat,
+    /// SetCellFormat etc. at V3.5+), the cache shape will need to
+    /// extend too -- decision deferred to V3.4 entry.  Until then,
+    /// this method returns the PutValue-sheet set, which matches
+    /// the current cell-grid IDE consumer contract.
+    pub fn list_sheets_from_cache(&self) -> Vec<u16> {
+        let mut sheets: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+        for (sheet, _row, _col) in self.last_snapshot.keys() {
+            sheets.insert(*sheet);
+        }
+        sheets.into_iter().collect()
+    }
+
+    /// **Phase 5.7 V3.3.0.X audit closure (MEDIUM-5, 2026-05-23) --
+    /// test-only snapshot cache invalidation seam.**
+    ///
+    /// Gated behind the `test-fixtures` feature so production cdylib
+    /// builds (built without `--features test-fixtures`) do NOT
+    /// expose this method.  Used by V3.4 undo-invalidation tests
+    /// (and any future test that needs to force a cache rebuild
+    /// independent of the normal mutation paths).
+    ///
+    /// **Not for production use.**  Production callers should never
+    /// need to force cache invalidation -- the 6 op-mutation paths
+    /// (new / from_snapshot / append_op / merge_bytes / discard_pending_ops /
+    /// poll_remote_with_limit + V3.3.0.X-added undo/redo) cover every
+    /// state transition that should affect the cache.
+    ///
+    /// Required by V3.3 risk register R-V3.3-2 (`.plans/_active.md`).
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn force_clear_snapshot_cache(&mut self) {
+        self.last_snapshot.clear();
+    }
+
     /// **Phase 5.7 V3.3.0.3 (2026-05-22) -- snapshot cache accessor
     /// for cell-grid IDE consumers.**
     ///
@@ -723,13 +799,25 @@ impl CollabSession {
     /// error.  Same propagation as `export_snapshot` in the napi
     /// binding.
     fn rebuild_snapshot_cache(&mut self) -> Result<(), CollabSessionError> {
-        self.last_snapshot.clear();
+        // **V3.3.0.X audit closure (MEDIUM-1, 2026-05-23, convergent
+        // Codex + Opus)**: build into a FRESH local HashMap, then swap
+        // on success.  Pre-closure this method cleared `last_snapshot`
+        // FIRST and then walked the iterator; an iter-error mid-walk
+        // returned Err with the cache PARTIALLY rebuilt (subset of the
+        // correct state), which subsequent `snapshot_cells` callers
+        // would see as if it were complete.  Now: on iter-Err, the
+        // `fresh` local drops + `self.last_snapshot` retains its
+        // pre-call state (consistent with the LAST successful
+        // rebuild).  Slightly more memory pressure (transient
+        // duplicate during the build); trades for atomicity.
+        let mut fresh: HashMap<(u16, u32, u32), CellWireValue> = HashMap::new();
         for op_result in self.log.iter() {
             let op = op_result.map_err(CollabSessionError::OpLog)?;
             if let Op::PutValue { sheet, row, col, value } = op {
-                self.last_snapshot.insert((sheet, row, col), value);
+                fresh.insert((sheet, row, col), value);
             }
         }
+        self.last_snapshot = fresh;
         Ok(())
     }
 
@@ -1829,6 +1917,16 @@ impl CollabSession {
         // gate, `undo` on an empty stack stays `Ok(false)` regardless
         // of transport state (no mutation, no flush attempt).
         if consumed {
+            // **V3.3.0.X audit closure (HIGH-1, 2026-05-23, convergent
+            // Codex + Opus)**: undo MUST rebuild the `last_snapshot`
+            // cache because `UndoManager::undo` appends an inverse op
+            // to the visible op log -- the cache invariant "every
+            // op-log mutation site updates the cache" was FALSE for
+            // undo/redo prior to this closure.  Rebuild before the
+            // auto-flush so any caller observing the post-undo state
+            // (either via subsequent snapshot read OR via the auto-
+            // flushed delta to a peer) sees the canonical view.
+            self.rebuild_snapshot_cache()?;
             self.maybe_auto_flush()?;
         }
         Ok(consumed)
@@ -1847,6 +1945,11 @@ impl CollabSession {
         let consumed = self.undo.redo()?;
         // Phase 5.5 V2 V2 audit closure (Codex M2): gate matches `undo`.
         if consumed {
+            // V3.3.0.X audit closure (HIGH-1, 2026-05-23): matches `undo`.
+            // redo appends an inverse-of-inverse op (effectively restoring
+            // the original PutValue); the cache MUST be rebuilt so
+            // snapshot_cells reflects the restored cells.
+            self.rebuild_snapshot_cache()?;
             self.maybe_auto_flush()?;
         }
         Ok(consumed)
@@ -2690,6 +2793,70 @@ mod tests {
         assert_eq!(s.redo_count(), 0);
         assert!(!s.can_undo());
         assert!(!s.can_redo());
+    }
+
+    #[test]
+    fn undo_invalidates_snapshot_cache() {
+        // V3.3.0.X audit closure (HIGH-1, 2026-05-23, convergent
+        // Codex + Opus): pre-closure `undo()` bypassed
+        // `rebuild_snapshot_cache`, so `snapshot_cells` returned
+        // the undone cell as if undo never fired.  Post-closure
+        // both `undo` + `redo` rebuild the cache when consumed.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s.append_op(put_value(0, 0, 1, 2.0)).unwrap();
+        assert_eq!(s.snapshot_cells(0).len(), 2,
+            "pre-undo: cache has both cells");
+
+        assert!(s.undo().unwrap());
+        // V3.3.0.X HIGH-1 pin: cache MUST reflect the undo (the
+        // most-recently-appended cell at (0, 1) is gone).
+        let post_undo = s.snapshot_cells(0);
+        assert_eq!(post_undo.len(), 1,
+            "post-undo: cache reflects retraction; pre-closure this FAILED");
+        // The remaining cell is the first one we appended.
+        assert_eq!(post_undo[0].0, (0, 0));
+
+        // Redo restores: cache rebuild on redo also.
+        assert!(s.redo().unwrap());
+        assert_eq!(s.snapshot_cells(0).len(), 2,
+            "post-redo: cache reflects restoration");
+    }
+
+    #[test]
+    fn force_clear_snapshot_cache_test_seam() {
+        // V3.3.0.X audit closure (MEDIUM-5, 2026-05-23, Opus M5):
+        // verify the `force_clear_snapshot_cache` test-only seam is
+        // available + functionally clears the cache without
+        // touching the op log.  Gated on `test-fixtures` feature
+        // (this test runs under cargo test so cfg(test) gate
+        // applies regardless of feature flag).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s.append_op(put_value(0, 0, 1, 2.0)).unwrap();
+        assert_eq!(s.snapshot_cells(0).len(), 2);
+        assert_eq!(s.op_log().iter().count(), 2);
+
+        // Force the cache to empty without mutating the op log.
+        s.force_clear_snapshot_cache();
+
+        // Cache is now empty; op log is unchanged.
+        assert_eq!(s.snapshot_cells(0).len(), 0);
+        assert_eq!(s.op_log().iter().count(), 2,
+            "op log untouched by force_clear_snapshot_cache");
+
+        // Subsequent op mutation triggers rebuild + restores cache.
+        s.append_op(put_value(0, 1, 0, 3.0)).unwrap();
+        // append_op rebuilt nothing; it's the O(1) incremental path.
+        // The cache now has ONLY the new cell (the prior cells are
+        // gone because force_clear nuked them + append_op only
+        // inserts the new one, not a full rebuild).  Subsequent
+        // merge_bytes / discard_pending_ops / poll_remote_with_limit
+        // would do a full rebuild; tests can leverage this seam to
+        // verify undo-invalidation paths at V3.4.
+        let post_force = s.snapshot_cells(0);
+        assert_eq!(post_force.len(), 1);
+        assert_eq!(post_force[0].0, (1, 0));
     }
 
     #[test]
