@@ -1152,9 +1152,24 @@ impl CollabSession {
     /// state transition that should affect the cache.
     ///
     /// Required by V3.3 risk register R-V3.3-2 (`.plans/_active.md`).
+    ///
+    /// **V3.5.0.X audit-closure follow-up B-FINDING-1 (2026-05-24)**: also
+    /// clears `self.removed_sheets` (the cache-walker tombstone tracker
+    /// added by the Opus-H1 scope-widened closure).  The seam contract
+    /// is "force cache to a clean state independent of normal mutation
+    /// paths"; both `last_snapshot` and `removed_sheets` are part of
+    /// the cache walker state, so both should reset.  In the canonical
+    /// test pattern (force_clear -> rebuild_snapshot_cache) the rebuild
+    /// would overwrite both fields atomically, so leaving `removed_sheets`
+    /// stale between the two calls was benign in practice -- but a
+    /// future test using `force_clear` WITHOUT a subsequent rebuild and
+    /// then appending an op on a previously-tombstoned sheet would see
+    /// the tombstone gate suppress the new append (confusing test
+    /// behavior).  Defensive reset.
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn force_clear_snapshot_cache(&mut self) {
         self.last_snapshot.clear();
+        self.removed_sheets.clear();
     }
 
     /// **Phase 5.7 V3.3.0.3 + V3.4.0.2 -- snapshot cache accessor

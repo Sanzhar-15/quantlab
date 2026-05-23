@@ -1734,11 +1734,27 @@ If smoke surfaces issues, file findings against the V3.5.0.X audit (parallel Cod
 - IDE mocha: 254 (V3.4.0.X baseline) -> 346 (+92 V3.5-specific cumulative; V3.5.0.X added 0 since panel-level behavior is live-smoke-verified).
 - ql-collab-ws: 42 (V3.4.0.X baseline) -> 42 (unchanged).
 
-**V3.5 ALL SHIPPED + AUDITED.**  V3.5.0.X megaudit closure complete; V3.5 plan archived; MASTER-PLAN swept.
+**Follow-up audit (V3.5.0.X closure-of-the-closure, 2026-05-24):** A deep megaudit was run on the closures themselves (Codex Lane A + Opus Lane B) to verify the closures are correct + complete.  Findings shipped in-cycle:
+
+- **B-FINDING-1 (MED): `force_clear_snapshot_cache` test seam did not reset `removed_sheets`.**  Pre-fix the test seam cleared `last_snapshot` but left `removed_sheets` populated.  Benign in the canonical usage pattern (force_clear immediately followed by `rebuild_snapshot_cache`, which atomically rebuilds both), but a future test using force_clear WITHOUT a rebuild and then appending an op on a previously-tombstoned sheet would observe surprising silent-drop behavior.  Closure: extend `force_clear_snapshot_cache` to also clear `removed_sheets` (1-line code + docstring update).
+
+- **B-FINDING-3 (LOW): `render()` calls in `setPresenceTyping(false)` and the watchdog timer were NOT wrapped in try/catch.**  Pre-fix a render() throw from these two sites would propagate to the dispatcher's `onLocalTyping` callback / setTimeout handler (unhandled); the deferred render would be lost silently.  The tickPollRemote 'idle' branch's deferred-render call (added in the original A-HIGH-4 closure) WAS wrapped in try/catch with a log-on-failure pattern; the two new render() call sites in setPresenceTyping(false) + watchdog auto-clear are now consistent.  Closure: try/catch + log on failure + clear flag (next genuine merge re-triggers).
+
+- **B-FINDING-6 (MED): The audit-closures sub-section insertion accidentally dropped the `**D-1 (✅ SHIPPED 2026-05-20 ...)**` heading from the FormatId paragraph below.**  Doc-only regression introduced by my edit's old_string anchor.  Closure: restore the heading.
+
+Three additional minor findings noted but not fixed in-cycle:
+
+- **B-FINDING-2 (LOW): No symmetric redo regression test for the convergent HIGH closure.**  `undo_after_remote_interleave_falls_back_to_full_rebuild` covers undo; redo dispatch uses the same gate but isn't independently tested.  V3.5.1+ backlog.
+
+- **B-FINDING-4 (LOW): A-HIGH-2's `repaired_formula.or(state.formula)` fallback could mask cache-vs-workbook divergence.**  In the normal case cache + workbook agree (both derived from the same op log) so the fallback is dead code.  A future bug that diverges them would silently use the cache instead of surfacing the divergence.  Acceptable per CLAUDE.md "No Fallbacks" (the rule is about hiding errors; this is choosing between two valid sources).  V3.5.1+ scope: add a debug-assert that flags divergence in test fixtures.
+
+- **B-FINDING-5 (INFO): A-HIGH-2 per-cell performance cost.**  Adds 1 HashMap lookup + 1 `Arc<str>::to_string` per cell with a formula.  Negligible at V3.5 scale (100k cells = ~1ms total); documented for V3.6+ incremental snapshot deltas.
+
+**V3.5 ALL SHIPPED + AUDITED.**  V3.5.0.X megaudit closure complete + follow-up audit shipped 3 in-cycle defensive corrections.  V3.5 plan archived; MASTER-PLAN swept.
 
 ---
 
- `FormatId` is now `enum { Builtin(u32), Custom(PeerId, u32) }` in `ql-storage::format`. IDE callers MUST pattern-match the variant rather than reading `.0`. Use `FormatId::is_builtin()` / `is_custom()` / `GENERAL` accessors. For pre-D-1 bare-u32 ids (xlsx import), use `FormatId::legacy_from_u32(n)`. `Op::RegisterFormat` + `Op::SetCellFormat` carry `FormatIdWire` on the wire. `.qbook` envelope v8 carries the tagged-tuple `FormatEntryId` shape losslessly for multi-peer ids; v<8 envelopes auto-migrate. xlsx export flattens multi-peer FormatIds via dedup-by-code; non-LEGACY peer flattens reported via `XlsxExportReport.dropped_features`. xlsx import surfaces unresolved-overlay-numfmt as `report.unsupported` entries. `.qbook/oplog.bin` files wrapped in Tier D3 header (`OPLOG_MAGIC = b"QLOL"` + BE u32 `OPLOG_SCHEMA_VERSION`). `CollabSession::new` + `from_snapshot` + `OpLog::set_peer_id` assert `PeerId != 0` (release-firing). See `docs/phase5/d-1-exit-packet.md` for the full closure record.
+**D-1 (✅ SHIPPED 2026-05-20 — all 8 steps + 7 per-step audits + 1 megaudit):** `FormatId` is now `enum { Builtin(u32), Custom(PeerId, u32) }` in `ql-storage::format`. IDE callers MUST pattern-match the variant rather than reading `.0`. Use `FormatId::is_builtin()` / `is_custom()` / `GENERAL` accessors. For pre-D-1 bare-u32 ids (xlsx import), use `FormatId::legacy_from_u32(n)`. `Op::RegisterFormat` + `Op::SetCellFormat` carry `FormatIdWire` on the wire. `.qbook` envelope v8 carries the tagged-tuple `FormatEntryId` shape losslessly for multi-peer ids; v<8 envelopes auto-migrate. xlsx export flattens multi-peer FormatIds via dedup-by-code; non-LEGACY peer flattens reported via `XlsxExportReport.dropped_features`. xlsx import surfaces unresolved-overlay-numfmt as `report.unsupported` entries. `.qbook/oplog.bin` files wrapped in Tier D3 header (`OPLOG_MAGIC = b"QLOL"` + BE u32 `OPLOG_SCHEMA_VERSION`). `CollabSession::new` + `from_snapshot` + `OpLog::set_peer_id` assert `PeerId != 0` (release-firing). See `docs/phase5/d-1-exit-packet.md` for the full closure record.
 
 ## 5. Acceptance pattern (`crates/ql-exec/tests/ide_simulation.rs`)
 
