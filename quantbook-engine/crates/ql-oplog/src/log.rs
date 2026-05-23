@@ -149,6 +149,69 @@ impl OpLog {
         self.doc.get_list(OPS_CONTAINER).len()
     }
 
+    /// **Phase 5.7 V3.6.0.4 D3 (2026-05-23) -- random-access op lookup.**
+    ///
+    /// Returns `Some(Ok(op))` if `index < len()` and the entry deserializes
+    /// successfully, `Some(Err(OpLogError::Deserialize { .. }))` if the
+    /// JSON at that index is malformed, `Some(Err(OpLogError::Schema-
+    /// Mismatch))` if the Loro list shape is unexpected, or `None` if
+    /// the index is out of range.
+    ///
+    /// Mirrors a single iteration of [`OpLog::iter`] at the given index.
+    /// Internally uses `LoroList::get(index)` (O(1) for Loro's internal
+    /// list representation; verified for visible-counter indexing per
+    /// Loro 1.12.0 semantics).
+    ///
+    /// **Use case**: V3.6.0.4 D3 `invalidate_cell` consults the session
+    /// `cell_op_index: HashMap<(SheetId, RowId, ColId), Vec<usize>>` to
+    /// get the (small) set of log indices touching the target cell,
+    /// then fetches each via this method.  Without random-access lookup
+    /// `invalidate_cell` would still walk the full log (O(N)) and only
+    /// filter at the apply step (which defeats the index's purpose).
+    ///
+    /// **Visible-counter caveat**: `index` indexes Loro's CURRENTLY-VISIBLE
+    /// list (post any UndoManager retracts).  Indexes captured before a
+    /// retract may resolve to a different op (or out-of-range) after.
+    /// V3.6.0.X audit-of-D2 closure for V3.6.0.2 D1 documents the
+    /// `pending_undo_cells` Mutex pattern that re-establishes consistency
+    /// on undo/redo via on_push staging; the cell_op_index is rebuilt
+    /// during the post-undo full-rebuild fallback path so stale indices
+    /// don't survive retracts.
+    pub fn get(&self, index: usize) -> Option<Result<Op, OpLogError>> {
+        let list: LoroList = self.doc.get_list(OPS_CONTAINER);
+        if index >= list.len() {
+            return None;
+        }
+        let entry = match list.get(index) {
+            Some(e) => e,
+            None => {
+                return Some(Err(OpLogError::SchemaMismatch(
+                    "ops LoroList lost an entry between len() and get()",
+                )));
+            }
+        };
+        let value = match entry {
+            ValueOrContainer::Value(v) => v,
+            ValueOrContainer::Container(_) => {
+                return Some(Err(OpLogError::SchemaMismatch(
+                    "ops LoroList holds a container; expected JSON-string values",
+                )));
+            }
+        };
+        let s = match value {
+            LoroValue::String(s) => s,
+            _ => {
+                return Some(Err(OpLogError::SchemaMismatch(
+                    "ops LoroList holds a non-string LoroValue; expected JSON-string",
+                )));
+            }
+        };
+        Some(
+            serde_json::from_str::<Op>(&s)
+                .map_err(|source| OpLogError::Deserialize { index, source }),
+        )
+    }
+
     /// True iff `len() == 0`.
     pub fn is_empty(&self) -> bool {
         self.len() == 0

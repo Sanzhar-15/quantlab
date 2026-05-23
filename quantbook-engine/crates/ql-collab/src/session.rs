@@ -212,6 +212,52 @@ enum CacheEffect {
     /// (collect_cache_effects -> apply_cache_effect).
     RegisterFormat { id: FormatId, string: Arc<str> },
 }
+
+/// **Phase 5.7 V3.6.0.4 D3 (2026-05-23) -- bundle the 5 cache-walker
+/// buckets into one struct.**
+///
+/// Pre-D3 the 3 buckets (`snapshot`, `tombstones`, `format_cache`)
+/// were individual `&mut HashMap<...>` parameters threaded through
+/// `apply_cache_effect`'s signature.  V3.6.0.X audit-of-D2 Opus
+/// Lane B LOW-1 flagged the linear signature growth as a refactor
+/// risk: every new cache bucket added a parameter at the helper +
+/// every caller; forgetting one silently produced state-divergence
+/// bugs the type system didn't catch.  V3.6.0.4 D3 adds 2 more
+/// buckets (`cell_op_index` + `sheet_op_index` for
+/// O(ops-for-this-cell) `invalidate_cell`), which would have made
+/// the helper a 6-param call.  This struct bundles them via mutable
+/// references at the call site.
+///
+/// **Buckets** (in walker-mutation order):
+/// - `snapshot`: per-cell `CellState` (value / formula / format).
+/// - `tombstones`: u16 sheet ids that have been `Op::RemoveSheet`'d.
+/// - `format_cache`: session-wide `FormatId -> Arc<str>` registry
+///   (Custom registrations from `Op::RegisterFormat`).
+/// - `cell_op_index` **V3.6.0.4 D3**: cell coord -> sorted op-log
+///   indices that touch this cell.  Maintained per cell-keyed
+///   effect's key in `apply_cache_effect`.  Drives
+///   `invalidate_cell`'s O(k) walk where k = entries for the target
+///   cell (typically 1-3 for the LWW happy path).
+/// - `sheet_op_index` **V3.6.0.4 D3**: sheet id -> sorted op-log
+///   indices where `Op::RemoveSheet` targeted this sheet.
+///   `invalidate_cell` consults both `cell_op_index[(s,r,c)]` AND
+///   `sheet_op_index[s]` (the latter is typically 0 or 1 entry per
+///   sheet) to find every effect relevant to the target cell.
+///
+/// **Rule 4 trigger**: composition of 5 `&mut HashMap<K, V>`
+/// references.  Each `HashMap<K, V>` (with K, V Send+Sync) is itself
+/// Send+Sync; `&mut T` inherits Send+Sync when T does.  All 5
+/// keys/values are primitives or Send+Sync types covered by prior
+/// per-field walks (`FormatId`, `(u16, u32, u32)`, `u16`,
+/// `CellState`, `Arc<str>`, `Vec<usize>`).  **0 new triggers;
+/// arc terminus stays at 6.**
+struct CacheBuckets<'a> {
+    snapshot: &'a mut HashMap<(u16, u32, u32), CellState>,
+    tombstones: &'a mut HashSet<u16>,
+    format_cache: &'a mut HashMap<FormatId, Arc<str>>,
+    cell_op_index: &'a mut HashMap<(u16, u32, u32), Vec<usize>>,
+    sheet_op_index: &'a mut HashMap<u16, Vec<usize>>,
+}
 use ql_storage::{FormatId, Workbook};
 
 use crate::presence::{self, PresenceError, PresenceState};
@@ -806,6 +852,79 @@ pub struct CollabSession {
     /// primitive; Send + Sync trivially.  `Arc<str>: Send + Sync`
     /// (std inherent impl).  0 new triggers; arc terminus stays at 6.
     format_table_cache: HashMap<FormatId, Arc<str>>,
+
+    /// **Phase 5.7 V3.6.0.4 D3 (2026-05-23)** -- per-cell op-log index
+    /// for O(ops-for-this-cell) `invalidate_cell` walks.
+    ///
+    /// Maps `(sheet, row, col)` to the sorted op-log indices whose
+    /// emitted `CacheEffect`s target this cell (4 cell-keyed variants:
+    /// `PutValue`, `PutFormula`, `ClearFormula`, `SetCellFormat`).
+    /// Maintained incrementally in `apply_cache_effect` per emitted
+    /// effect (BatchCommit inner ops all share the same op_log_index;
+    /// the helper dedups via the `last() != Some(idx)` check).
+    /// Rebuilt from scratch in `rebuild_snapshot_cache` (alongside
+    /// `last_snapshot` + `removed_sheets` + `format_table_cache`);
+    /// reset by `force_clear_snapshot_cache` test seam.
+    ///
+    /// **Purpose**: closes V3.5.0.6 R-V3.5-2 perf gap.  Pre-D3
+    /// `invalidate_cell` walked the full op log per call (O(N)).
+    /// Post-D3 it consults `cell_op_index.get(&(s, r, c))` to fetch
+    /// the small set of relevant indices (typically 1-3 entries for
+    /// LWW happy path), then walks ONLY those indices via the new
+    /// `OpLog::get(index)` random-access accessor.
+    ///
+    /// **Sheet-keyed effects** (`RemoveSheet` for the cell's sheet):
+    /// `cell_op_index` does NOT track these (they're sheet-keyed not
+    /// cell-keyed).  `invalidate_cell` consults the separate
+    /// `sheet_op_index` for RemoveSheet ops on the target cell's
+    /// sheet; the unioned indices are walked in sorted order.
+    ///
+    /// **Invariant** (6 mutation sites per V3.5.0.X discipline):
+    /// `cell_op_index` MUST be kept in sync with `last_snapshot`
+    /// across the 6 paths: `new` (empty) + `from_snapshot` (rebuild
+    /// via `rebuild_snapshot_cache`) + `append_op` (apply_cache_effect
+    /// pushes per emitted effect) + `merge_bytes` (rebuild) +
+    /// `discard_pending_ops` (rebuild) + `undo` / `redo` (on the
+    /// fallback path: rebuild; on the partial-invalidate path: read-
+    /// only access via `cell_op_index.get`).  `force_clear_snapshot_cache`
+    /// test seam also clears.
+    ///
+    /// **Rule 4 per-field walk**: `HashMap<K, V>: Send + Sync` iff
+    /// `K, V: Send + Sync`.  Key `(u16, u32, u32)` is Copy + Send +
+    /// Sync (primitive tuple).  Value `Vec<usize>` is Send + Sync
+    /// (std inherent impl + primitive element).  Composition:
+    /// `HashMap<(u16, u32, u32), Vec<usize>>: Send + Sync`.
+    /// **0 new triggers; arc terminus stays at 6.**
+    cell_op_index: HashMap<(u16, u32, u32), Vec<usize>>,
+
+    /// **Phase 5.7 V3.6.0.4 D3 (2026-05-23)** -- per-sheet op-log
+    /// index for `Op::RemoveSheet` (the sole sheet-keyed but non-cell-
+    /// keyed cache effect).
+    ///
+    /// Maps sheet id `u16` to sorted op-log indices where
+    /// `Op::RemoveSheet { id }` targets this sheet.  Typically 0 or 1
+    /// entries per sheet (RemoveSheet is idempotent at the workbook
+    /// level + repeated tombstones don't add new state); the small
+    /// list is concatenated with the cell's `cell_op_index` entries
+    /// during `invalidate_cell`'s per-cell walk.
+    ///
+    /// Maintained at the same 6 mutation sites as `cell_op_index`.
+    /// Reset by `force_clear_snapshot_cache`.
+    ///
+    /// **Why a separate index vs folding into `cell_op_index`**:
+    /// `Op::RemoveSheet` doesn't carry (row, col); folding would
+    /// require expanding it to "every cell coord in the sheet's
+    /// current snapshot", which is unbounded and would inflate
+    /// `cell_op_index` by O(cells-in-sheet) per RemoveSheet.  Keeping
+    /// the sheet dimension in its own index is O(1) per RemoveSheet
+    /// + O(1) lookup at `invalidate_cell`.
+    ///
+    /// **Rule 4 per-field walk**: `HashMap<K, V>: Send + Sync` iff
+    /// `K, V: Send + Sync`.  Key `u16` is Copy + Send + Sync.
+    /// Value `Vec<usize>` is Send + Sync.  Composition:
+    /// `HashMap<u16, Vec<usize>>: Send + Sync`.
+    /// **0 new triggers; arc terminus stays at 6.**
+    sheet_op_index: HashMap<u16, Vec<usize>>,
 }
 
 impl CollabSession {
@@ -869,6 +988,10 @@ impl CollabSession {
             undo_merge_interval_ms: 0,
             // V3.6.0.3 D2: empty cache; no RegisterFormat ops yet.
             format_table_cache: HashMap::new(),
+            // V3.6.0.4 D3: empty indices; no ops -> no cells / sheets
+            // touched.
+            cell_op_index: HashMap::new(),
+            sheet_op_index: HashMap::new(),
         })
     }
 
@@ -945,6 +1068,12 @@ impl CollabSession {
             // `CacheEffect::RegisterFormat` for each `Op::RegisterFormat`
             // it sees, which apply_cache_effect inserts here.
             format_table_cache: HashMap::new(),
+            // V3.6.0.4 D3: populated by `rebuild_snapshot_cache` below
+            // alongside `last_snapshot` -- the walker pushes the op-log
+            // index per emitted cell-keyed effect (cell_op_index) and
+            // per RemoveSheet effect (sheet_op_index).
+            cell_op_index: HashMap::new(),
+            sheet_op_index: HashMap::new(),
         };
         sess.rebuild_snapshot_cache()?;
         Ok(sess)
@@ -1047,18 +1176,27 @@ impl CollabSession {
         *self.pending_undo_cells.lock().expect("pending_undo_cells mutex poisoned") =
             Some(staged_cells);
         self.log.append(op)?;
+        // V3.6.0.4 D3: capture the op_log_index AFTER the append so
+        // it points at the just-appended op's position in the visible
+        // list.  All cell-keyed CacheEffects emitted by this op share
+        // this index (BatchCommit recursion in `collect_cache_effects`
+        // flattens nested ops but they all live at the same op_log
+        // entry; `apply_cache_effect` dedups via `last() != Some(idx)`
+        // check).
+        let op_log_index = self.log.len().saturating_sub(1);
+        // V3.6.0.4 D3: bundle the 5 cache buckets into a single
+        // CacheBuckets struct (closes Opus Lane B LOW-1 from
+        // V3.6.0.X audit-of-D2; replaces the 3-individual-`&mut`-param
+        // pattern that grew linearly with each new bucket).
+        let mut buckets = CacheBuckets {
+            snapshot: &mut self.last_snapshot,
+            tombstones: &mut self.removed_sheets,
+            format_cache: &mut self.format_table_cache,
+            cell_op_index: &mut self.cell_op_index,
+            sheet_op_index: &mut self.sheet_op_index,
+        };
         for effect in effects {
-            // V3.5.0.X audit-closure: thread `removed_sheets` through so
-            // RemoveSheet effects update the session-level tombstone set
-            // + cell-keyed effects on tombstoned sheets are silently
-            // dropped (Opus-H1 closure widened to all 4 cell-keyed
-            // variants).
-            Self::apply_cache_effect(
-                &mut self.last_snapshot,
-                &mut self.removed_sheets,
-                &mut self.format_table_cache,
-                effect,
-            );
+            Self::apply_cache_effect(&mut buckets, effect, op_log_index);
         }
         self.maybe_auto_flush()?;
         Ok(())
@@ -1163,11 +1301,21 @@ impl CollabSession {
     /// the V3.5.0.X closure added to SetCellFormat).  Pre-closure, the
     /// cache walker was tombstone-blind: cell-keyed effects on a
     /// tombstoned sheet wrote phantom entries.
+    ///
+    /// **V3.6.0.4 D3 (2026-05-23) -- CacheBuckets refactor + index
+    /// maintenance**: signature changed from 4 individual `&mut` params
+    /// to a single `&mut CacheBuckets<'_>` (closes Opus Lane B LOW-1
+    /// from V3.6.0.X audit-of-D2) + a new `op_log_index: usize`
+    /// parameter so the helper can populate `cell_op_index` /
+    /// `sheet_op_index` per-effect.  Caller passes the current op's
+    /// log index (typically `self.log.len() - 1` post-append or the
+    /// enumerate index during rebuild).  `invalidate_cell` passes the
+    /// actual `idx` it's iterating since the per-cell walk uses real
+    /// log indices read from `cell_op_index` / `sheet_op_index`.
     fn apply_cache_effect(
-        snapshot: &mut HashMap<(u16, u32, u32), CellState>,
-        tombstones: &mut HashSet<u16>,
-        format_cache: &mut HashMap<FormatId, Arc<str>>,
+        buckets: &mut CacheBuckets<'_>,
         effect: CacheEffect,
+        op_log_index: usize,
     ) {
         // V3.5.0.X audit-closure: cell-keyed effects on tombstoned sheets
         // are silently dropped.  RemoveSheet + RegisterFormat handled
@@ -1181,16 +1329,46 @@ impl CollabSession {
             CacheEffect::RegisterFormat { .. } => None,
         };
         if let Some(sheet) = target_sheet {
-            if tombstones.contains(&sheet) {
+            if buckets.tombstones.contains(&sheet) {
                 return;
+            }
+        }
+        // **V3.6.0.4 D3 (2026-05-23) -- index maintenance**: extract
+        // the (sheet, row, col) key for cell-keyed effects + the
+        // sheet id for `RemoveSheet`.  Push the current
+        // `op_log_index` into the relevant bucket vec WITH dedup:
+        // multiple effects from one `Op::BatchCommit { ops }`
+        // (recursed by `collect_cache_effects`) all share the same
+        // op_log_index -- `last().copied() != Some(idx)` keeps the
+        // vec strictly-increasing without scanning the full vec.
+        // RegisterFormat is session-wide (NOT per-cell / per-sheet);
+        // no index update.
+        let cell_key_for_index = match &effect {
+            CacheEffect::PutValue { key, .. } => Some(*key),
+            CacheEffect::PutFormula { key, .. } => Some(*key),
+            CacheEffect::ClearFormula { key } => Some(*key),
+            CacheEffect::SetCellFormat { key, .. } => Some(*key),
+            CacheEffect::RemoveSheet { .. } => None,
+            CacheEffect::RegisterFormat { .. } => None,
+        };
+        if let Some(key) = cell_key_for_index {
+            let v = buckets.cell_op_index.entry(key).or_default();
+            if v.last().copied() != Some(op_log_index) {
+                v.push(op_log_index);
+            }
+        }
+        if let CacheEffect::RemoveSheet { id } = &effect {
+            let v = buckets.sheet_op_index.entry(*id).or_default();
+            if v.last().copied() != Some(op_log_index) {
+                v.push(op_log_index);
             }
         }
         match effect {
             CacheEffect::PutValue { key, value } => {
-                snapshot.entry(key).or_default().value = Some(value);
+                buckets.snapshot.entry(key).or_default().value = Some(value);
             }
             CacheEffect::PutFormula { key, text } => {
-                snapshot.entry(key).or_default().formula = Some(text);
+                buckets.snapshot.entry(key).or_default().formula = Some(text);
             }
             CacheEffect::ClearFormula { key } => {
                 // get_mut + skip-if-absent: ClearFormula on a never-set
@@ -1204,10 +1382,10 @@ impl CollabSession {
                 // after the clear, DELETE the key so the empty
                 // CellState doesn't surface in
                 // `list_sheets_from_cache` either.
-                if let Some(state) = snapshot.get_mut(&key) {
+                if let Some(state) = buckets.snapshot.get_mut(&key) {
                     state.formula = None;
                     if state.value.is_none() && state.formula.is_none() && state.format.is_none() {
-                        snapshot.remove(&key);
+                        buckets.snapshot.remove(&key);
                     }
                 }
             }
@@ -1225,13 +1403,13 @@ impl CollabSession {
             CacheEffect::SetCellFormat { key, format } => {
                 match format {
                     Some(id) => {
-                        snapshot.entry(key).or_default().format = Some(id);
+                        buckets.snapshot.entry(key).or_default().format = Some(id);
                     }
                     None => {
-                        if let Some(state) = snapshot.get_mut(&key) {
+                        if let Some(state) = buckets.snapshot.get_mut(&key) {
                             state.format = None;
                             if state.value.is_none() && state.formula.is_none() && state.format.is_none() {
-                                snapshot.remove(&key);
+                                buckets.snapshot.remove(&key);
                             }
                         }
                     }
@@ -1244,8 +1422,8 @@ impl CollabSession {
             // Idempotent: a second RemoveSheet for the same id leaves
             // the tombstone set + snapshot unchanged.
             CacheEffect::RemoveSheet { id } => {
-                tombstones.insert(id);
-                snapshot.retain(|(sheet, _, _), _| *sheet != id);
+                buckets.tombstones.insert(id);
+                buckets.snapshot.retain(|(sheet, _, _), _| *sheet != id);
             }
             // V3.6.0.3 D2 (2026-05-24): session-wide format-table cache
             // mirror.  V3.6.0.X audit-of-D2 closure (2026-05-23,
@@ -1265,7 +1443,7 @@ impl CollabSession {
             // tombstone check needed (RegisterFormat is sheet-
             // independent).
             CacheEffect::RegisterFormat { id, string } => {
-                format_cache.entry(id).or_insert(string);
+                buckets.format_cache.entry(id).or_insert(string);
             }
         }
     }
@@ -1425,6 +1603,42 @@ impl CollabSession {
         self.format_table_cache.iter()
     }
 
+    /// **Phase 5.7 V3.6.0.4 D3 (2026-05-23)** -- iterate the per-cell
+    /// op-log index (`(SheetId, RowId, ColId), Vec<usize>` pairs).
+    ///
+    /// Each entry maps a cell coord to the sorted op-log indices
+    /// whose `CacheEffect`s target that cell (the 4 cell-keyed
+    /// variants: PutValue, PutFormula, ClearFormula, SetCellFormat).
+    /// Maintained incrementally in `append_op` via `apply_cache_effect`
+    /// + rebuilt from scratch in `rebuild_snapshot_cache` /
+    /// `rebuild_op_indices_only`.
+    ///
+    /// Iteration order is HashMap iteration (NOT deterministic across
+    /// runs).  Each Vec<usize> is monotonically increasing per the
+    /// `apply_cache_effect` dedup-on-equality check.
+    ///
+    /// **Use case**: regression tests pin the index discipline; V3.7+
+    /// incremental snapshot deltas may consume the index to derive
+    /// per-cell change sets without walking the full log.
+    pub fn cell_op_index_iter(
+        &self,
+    ) -> impl Iterator<Item = (&(u16, u32, u32), &Vec<usize>)> {
+        self.cell_op_index.iter()
+    }
+
+    /// **Phase 5.7 V3.6.0.4 D3 (2026-05-23)** -- iterate the per-sheet
+    /// `Op::RemoveSheet` op-log index (`SheetId, Vec<usize>` pairs).
+    ///
+    /// Each entry maps a sheet id to the sorted op-log indices where
+    /// `Op::RemoveSheet { id }` retracted that sheet.  Typically 0 or
+    /// 1 entries per sheet (RemoveSheet is idempotent at the workbook
+    /// level).  Used in `invalidate_cell` to find RemoveSheet effects
+    /// for the target cell's sheet in O(removes-for-this-sheet)
+    /// instead of walking the full log.
+    pub fn sheet_op_index_iter(&self) -> impl Iterator<Item = (&u16, &Vec<usize>)> {
+        self.sheet_op_index.iter()
+    }
+
     /// **Phase 5.7 V3.3.0.X audit closure (MEDIUM-5, 2026-05-23) --
     /// test-only snapshot cache invalidation seam.**
     ///
@@ -1466,6 +1680,15 @@ impl CollabSession {
         // atomically in the canonical pattern; defensive reset for
         // tests using force_clear in isolation.
         self.format_table_cache.clear();
+        // V3.6.0.4 D3: also clear the cell + sheet op-log indices.
+        // Without this, a test that calls force_clear and then
+        // appends new ops would see stale indices from the pre-
+        // force-clear log + new indices from the post-force-clear
+        // appends, both pointing into a log whose indexing is now
+        // ambiguous.  rebuild_snapshot_cache repopulates both
+        // indices atomically.
+        self.cell_op_index.clear();
+        self.sheet_op_index.clear();
     }
 
     /// **Phase 5.7 V3.3.0.3 + V3.4.0.2 -- snapshot cache accessor
@@ -1589,23 +1812,111 @@ impl CollabSession {
         // cell cache.  Atomic-swap with `self.format_table_cache` after
         // rebuild succeeds.  Same pattern as `fresh_tombstones`.
         let mut fresh_format_cache: HashMap<FormatId, Arc<str>> = HashMap::new();
+        // V3.6.0.4 D3: rebuild the cell + sheet op-log indices
+        // alongside the cell cache.  Atomic-swap with the session
+        // fields after rebuild succeeds.
+        let mut fresh_cell_op_index: HashMap<(u16, u32, u32), Vec<usize>> = HashMap::new();
+        let mut fresh_sheet_op_index: HashMap<u16, Vec<usize>> = HashMap::new();
         let mut effects: Vec<CacheEffect> = Vec::new();
-        for op_result in self.log.iter() {
+        // V3.6.0.4 D3: enumerate to capture the op_log_index per op
+        // (CacheBuckets index maintenance pushes this into the cell /
+        // sheet vec on each emitted effect).
+        for (op_log_index, op_result) in self.log.iter().enumerate() {
             let op = op_result.map_err(CollabSessionError::OpLog)?;
             effects.clear();
             Self::collect_cache_effects(&op, &mut effects);
+            let mut buckets = CacheBuckets {
+                snapshot: &mut fresh,
+                tombstones: &mut fresh_tombstones,
+                format_cache: &mut fresh_format_cache,
+                cell_op_index: &mut fresh_cell_op_index,
+                sheet_op_index: &mut fresh_sheet_op_index,
+            };
             for effect in effects.drain(..) {
-                Self::apply_cache_effect(
-                    &mut fresh,
-                    &mut fresh_tombstones,
-                    &mut fresh_format_cache,
-                    effect,
-                );
+                Self::apply_cache_effect(&mut buckets, effect, op_log_index);
             }
         }
         self.last_snapshot = fresh;
         self.removed_sheets = fresh_tombstones;
         self.format_table_cache = fresh_format_cache;
+        self.cell_op_index = fresh_cell_op_index;
+        self.sheet_op_index = fresh_sheet_op_index;
+        Ok(())
+    }
+
+    /// **Phase 5.7 V3.6.0.4 D3 (2026-05-23) -- rebuild ONLY the op-log
+    /// indices (cell_op_index + sheet_op_index) from the current
+    /// visible log; LEAVE `last_snapshot`, `removed_sheets`,
+    /// `format_table_cache` untouched.**
+    ///
+    /// Used by `undo` + `redo` AFTER Loro's UndoManager retracts an op
+    /// from the visible list.  Retraction COMPACTS the visible list
+    /// (positional indices shift), so any pre-undo entry in
+    /// `cell_op_index` / `sheet_op_index` pointing at index >= the
+    /// retracted op's index is now stale (refers to a different op
+    /// or out of range).  Full `rebuild_snapshot_cache` would also
+    /// rebuild snapshot/tombstones/format_cache -- defeating the
+    /// V3.6.0.2 partial-invalidate optimization.  This helper
+    /// refreshes ONLY the index buckets so the subsequent
+    /// `invalidate_cell` per-cell calls see correct indices, while
+    /// cells the undo didn't touch keep their pre-undo
+    /// `last_snapshot` entries.
+    ///
+    /// **Cost**: O(N) op-log walk (same as `rebuild_snapshot_cache`)
+    /// but ZERO snapshot writes -- just two HashMap rebuilds with
+    /// monotonic Vec<usize> appends.  For a typical undo of a
+    /// BatchCommit retract with K affected cells, the total cost
+    /// is O(N) + K * O(ops-for-this-cell) vs pre-D3 K * O(N).  For
+    /// K > 1 the index-driven path wins.
+    ///
+    /// **Atomic-swap**: same pattern as `rebuild_snapshot_cache`.
+    /// On iter-Err, fresh locals drop and session indices retain
+    /// their pre-call state.
+    ///
+    /// **6-mutation-site discipline reminder**: `last_snapshot` +
+    /// `removed_sheets` + `format_table_cache` + `cell_op_index` +
+    /// `sheet_op_index` should ALL be kept in sync.  This helper
+    /// breaks that invariant on purpose: the undo/redo path mutates
+    /// the indices to match post-retract Loro state while
+    /// `invalidate_cell` (called immediately after) restores the
+    /// remaining buckets to per-cell consistency.  Callers OUTSIDE
+    /// undo/redo MUST use `rebuild_snapshot_cache` instead.
+    fn rebuild_op_indices_only(&mut self) -> Result<(), CollabSessionError> {
+        let mut fresh_cell_op_index: HashMap<(u16, u32, u32), Vec<usize>> = HashMap::new();
+        let mut fresh_sheet_op_index: HashMap<u16, Vec<usize>> = HashMap::new();
+        let mut effects: Vec<CacheEffect> = Vec::new();
+        for (op_log_index, op_result) in self.log.iter().enumerate() {
+            let op = op_result.map_err(CollabSessionError::OpLog)?;
+            effects.clear();
+            Self::collect_cache_effects(&op, &mut effects);
+            // V3.6.0.4 D3: extract cell + sheet keys per effect with
+            // dedup against the same op_log_index (mirrors
+            // `apply_cache_effect`'s index-maintenance logic).
+            for effect in effects.drain(..) {
+                let cell_key = match &effect {
+                    CacheEffect::PutValue { key, .. } => Some(*key),
+                    CacheEffect::PutFormula { key, .. } => Some(*key),
+                    CacheEffect::ClearFormula { key } => Some(*key),
+                    CacheEffect::SetCellFormat { key, .. } => Some(*key),
+                    CacheEffect::RemoveSheet { .. } => None,
+                    CacheEffect::RegisterFormat { .. } => None,
+                };
+                if let Some(key) = cell_key {
+                    let v = fresh_cell_op_index.entry(key).or_default();
+                    if v.last().copied() != Some(op_log_index) {
+                        v.push(op_log_index);
+                    }
+                }
+                if let CacheEffect::RemoveSheet { id } = &effect {
+                    let v = fresh_sheet_op_index.entry(*id).or_default();
+                    if v.last().copied() != Some(op_log_index) {
+                        v.push(op_log_index);
+                    }
+                }
+            }
+        }
+        self.cell_op_index = fresh_cell_op_index;
+        self.sheet_op_index = fresh_sheet_op_index;
         Ok(())
     }
 
@@ -1623,11 +1934,15 @@ impl CollabSession {
     /// AREN'T `(sheet, row, col)` are NEVER walked through their op
     /// histories.
     ///
-    /// **Cost**: O(N) op-log walk (same big-O as `rebuild_snapshot_cache`)
-    /// BUT only O(1) HashMap writes (the one cell), versus full rebuild's
-    /// O(cells) writes.  The real performance win comes V3.6+ if a
-    /// per-cell op-index lands; for V3.5.0.6 the architectural shape
-    /// ships now (foundation for incremental optimizations).
+    /// **Cost**: **V3.6.0.4 D3 (2026-05-23) -- O(ops-for-this-cell)
+    /// + O(removes-for-this-sheet) via `cell_op_index` +
+    /// `sheet_op_index`**.  Pre-D3 this was an O(N) full log walk.
+    /// Post-D3: look up the union of `cell_op_index[(s, r, c)]` (cell-
+    /// keyed effects targeting the cell; typically 1-3 entries) +
+    /// `sheet_op_index[s]` (RemoveSheet effects on the cell's sheet;
+    /// typically 0 or 1) and fetch each via `OpLog::get(index)` (O(1)
+    /// per index per Loro 1.12.0 LoroList::get).  Closes V3.5.0.6
+    /// R-V3.5-2 perf gap.
     ///
     /// **Correctness equivalence**: a call to `invalidate_cell(s, r, c)`
     /// followed by reading `last_snapshot[(s, r, c)]` MUST produce the
@@ -1640,8 +1955,8 @@ impl CollabSession {
     /// from `last_snapshot` (not left as an empty `CellState`).  Mirrors
     /// `apply_cache_effect`'s extended all-fields-None removal contract.
     ///
-    /// Returns `Err(OpLog(_))` if the op-log iterator emits a decode
-    /// error during the walk.
+    /// Returns `Err(OpLog(_))` if the indexed op-log lookup fails to
+    /// deserialize.  Same propagation as `rebuild_snapshot_cache`.
     pub(crate) fn invalidate_cell(
         &mut self,
         sheet: u16,
@@ -1653,13 +1968,32 @@ impl CollabSession {
         // from a clean slate (mirrors rebuild_snapshot_cache's
         // build-into-fresh pattern at the per-cell granularity).
         self.last_snapshot.remove(&target_key);
-        // Walk the log, applying ONLY effects targeting `target_key`.
-        // Using the same `collect_cache_effects` + `apply_cache_effect`
-        // helpers as rebuild_snapshot_cache guarantees parity with the
-        // full-rebuild path (any op shape supported there is supported
-        // here).  The filter on key happens at apply time so BatchCommit
-        // recursion still surfaces its inner ops (we just discard the
-        // ones for other cells).
+        // **V3.6.0.4 D3 (2026-05-23) -- index-driven walk**: collect
+        // the union of cell-keyed indices (from cell_op_index) +
+        // sheet-tombstone indices (from sheet_op_index for the
+        // target cell's sheet).  Both lists are individually sorted
+        // ascending (apply_cache_effect appends with monotonic
+        // op_log_index per the dedup check); the merged list needs a
+        // single sort.  Pre-D3 this walked the full log (O(N)); post-
+        // D3 it walks |cell_op_index[(s,r,c)]| + |sheet_op_index[s]|
+        // (typically 1-4 entries total).
+        let cell_indices = self
+            .cell_op_index
+            .get(&target_key)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let sheet_indices = self
+            .sheet_op_index
+            .get(&sheet)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let mut merged_indices: Vec<usize> =
+            Vec::with_capacity(cell_indices.len() + sheet_indices.len());
+        merged_indices.extend_from_slice(cell_indices);
+        merged_indices.extend_from_slice(sheet_indices);
+        merged_indices.sort_unstable();
+        merged_indices.dedup();
+
         let mut effects: Vec<CacheEffect> = Vec::new();
         let mut local_snapshot: HashMap<(u16, u32, u32), CellState> = HashMap::new();
         // V3.5.0.X audit-closure Opus-H1: track tombstones during the
@@ -1667,43 +2001,60 @@ impl CollabSession {
         // any subsequent cell-keyed effect on that cell.  This local
         // tracker mirrors the rebuild_snapshot_cache pattern.
         let mut local_tombstones: HashSet<u16> = HashSet::new();
-        // V3.6.0.3 D2: invalidate_cell does NOT mutate the format-table
-        // cache (it's session-wide, not per-cell).  Use a throwaway
-        // local cache for apply_cache_effect's signature; the cache's
-        // session-level value stays untouched by this method.
+        // V3.6.0.3 D2: invalidate_cell does NOT mutate the session
+        // format_table_cache.  Use throwaway local maps for the
+        // CacheBuckets struct's fields the per-cell walk doesn't own;
+        // they accumulate harmlessly and drop when this method returns.
         let mut local_format_cache: HashMap<FormatId, Arc<str>> = HashMap::new();
-        for op_result in self.log.iter() {
-            let op = op_result.map_err(CollabSessionError::OpLog)?;
+        let mut local_cell_op_index: HashMap<(u16, u32, u32), Vec<usize>> = HashMap::new();
+        let mut local_sheet_op_index: HashMap<u16, Vec<usize>> = HashMap::new();
+
+        for op_log_index in merged_indices {
+            // V3.6.0.4 D3: random-access lookup via OpLog::get.  None
+            // signals an out-of-range index which is unreachable
+            // post-V3.6.0.X audit-of-D2 (the indices in cell_op_index /
+            // sheet_op_index are maintained in sync with the visible
+            // log via the 6-mutation-site discipline + force-clear-
+            // then-rebuild on undo/redo fallback).  Treat as an
+            // unrecoverable invariant violation -- surface a clear
+            // error rather than a silent skip.
+            let op = match self.log.get(op_log_index) {
+                Some(Ok(op)) => op,
+                Some(Err(e)) => return Err(CollabSessionError::OpLog(e)),
+                None => {
+                    return Err(CollabSessionError::OpLog(OpLogError::SchemaMismatch(
+                        "cell_op_index / sheet_op_index pointed past end of log",
+                    )));
+                }
+            };
             effects.clear();
             Self::collect_cache_effects(&op, &mut effects);
+            let mut local_buckets = CacheBuckets {
+                snapshot: &mut local_snapshot,
+                tombstones: &mut local_tombstones,
+                format_cache: &mut local_format_cache,
+                cell_op_index: &mut local_cell_op_index,
+                sheet_op_index: &mut local_sheet_op_index,
+            };
             for effect in effects.drain(..) {
-                // Only apply effects targeting the requested cell OR the
-                // RemoveSheet effect (which we always apply locally so
-                // subsequent cell-keyed effects on the tombstoned sheet
-                // are filtered).  RegisterFormat is SKIPPED here -- the
+                // Only apply effects targeting the requested cell OR
+                // the RemoveSheet effect (which we always apply locally
+                // so subsequent cell-keyed effects on the tombstoned
+                // sheet are filtered).  RegisterFormat is SKIPPED -- the
                 // session-level format_table_cache is not invalidated
-                // per-cell; only rebuild_snapshot_cache reconstructs it.
+                // per-cell.  BatchCommit may carry mixed inner effects
+                // (e.g., PutValue(target) + PutValue(unrelated)); the
+                // filter discards the unrelated inner ops.
                 let apply = match &effect {
                     CacheEffect::PutValue { key, .. } => *key == target_key,
                     CacheEffect::PutFormula { key, .. } => *key == target_key,
                     CacheEffect::ClearFormula { key } => *key == target_key,
                     CacheEffect::SetCellFormat { key, .. } => *key == target_key,
-                    // Always apply RemoveSheet so the local tombstone
-                    // tracker stays current; apply_cache_effect's retain
-                    // operation is O(local_snapshot size) which is at
-                    // most 1 entry during invalidate_cell.
                     CacheEffect::RemoveSheet { .. } => true,
-                    // V3.6.0.3 D2: RegisterFormat effects are session-wide;
-                    // invalidate_cell never touches them.
                     CacheEffect::RegisterFormat { .. } => false,
                 };
                 if apply {
-                    Self::apply_cache_effect(
-                        &mut local_snapshot,
-                        &mut local_tombstones,
-                        &mut local_format_cache,
-                        effect,
-                    );
+                    Self::apply_cache_effect(&mut local_buckets, effect, op_log_index);
                 }
             }
         }
@@ -2955,6 +3306,16 @@ impl CollabSession {
         if consumed {
             match captured_cells {
                 Some(cells) if !cells.is_empty() => {
+                    // **V3.6.0.4 D3 (2026-05-23)**: Loro's UndoManager
+                    // retract COMPACTS the visible list (positional
+                    // indices shift down).  Refresh `cell_op_index` +
+                    // `sheet_op_index` from the post-retract log
+                    // BEFORE the per-cell invalidate loop -- otherwise
+                    // stale indices would point past the new end of
+                    // log OR at the wrong op.  This is the per-undo
+                    // O(N) cost the V3.6.0.4 design trades for the
+                    // K * O(k) cell invalidation that follows.
+                    self.rebuild_op_indices_only()?;
                     for (sheet, row, col) in cells {
                         self.invalidate_cell(sheet, row, col)?;
                     }
@@ -2963,6 +3324,8 @@ impl CollabSession {
                     // Empty cells OR decode failed -- non-cell-keyed op
                     // OR legacy/malformed meta.  Conservative full
                     // rebuild (matches the V3.5.0.6 fallback semantic).
+                    // `rebuild_snapshot_cache` also rebuilds the
+                    // V3.6.0.4 D3 cell + sheet indices.
                     self.rebuild_snapshot_cache()?;
                 }
             }
@@ -3022,6 +3385,14 @@ impl CollabSession {
         if consumed {
             match captured_cells {
                 Some(cells) if !cells.is_empty() => {
+                    // **V3.6.0.4 D3 (2026-05-23)**: mirror `undo()`'s
+                    // post-retract index refresh.  Loro's redo also
+                    // mutates the visible list (pushes the previously-
+                    // undone op back).  Positional indices in
+                    // `cell_op_index` / `sheet_op_index` reflect a
+                    // shorter pre-redo log; refresh them BEFORE the
+                    // per-cell invalidate loop.
+                    self.rebuild_op_indices_only()?;
                     for (sheet, row, col) in cells {
                         self.invalidate_cell(sheet, row, col)?;
                     }
@@ -4290,6 +4661,202 @@ mod tests {
         );
         let (_, cache_string) = cache_entry.unwrap();
         assert_eq!(cache_string.as_ref(), "0.00%");
+    }
+
+    #[test]
+    fn v3_6_0_4_d3_cell_op_index_populates_per_op_via_append() {
+        // **V3.6.0.4 D3 (2026-05-23) regression**: each `append_op`
+        // pushes its op-log index into `cell_op_index` under the
+        // cell key(s) of the emitted CacheEffects.  Pins the
+        // incremental maintenance discipline + the monotonic-vec
+        // invariant.
+        let peer = PeerId::new(7);
+        let mut s = CollabSession::new(peer).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s.append_op(put_value(0, 0, 0, 2.0)).unwrap();
+        s.append_op(put_value(0, 1, 0, 3.0)).unwrap();
+
+        let idx_for_a1: Vec<usize> = s
+            .cell_op_index_iter()
+            .find(|(key, _)| **key == (0, 0, 0))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        let idx_for_a2: Vec<usize> = s
+            .cell_op_index_iter()
+            .find(|(key, _)| **key == (0, 1, 0))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+
+        assert_eq!(idx_for_a1, vec![0, 1], "A1 op-log indices");
+        assert_eq!(idx_for_a2, vec![2], "A2 op-log index");
+    }
+
+    #[test]
+    fn v3_6_0_4_d3_cell_op_index_dedups_within_one_batch_commit_op() {
+        // **V3.6.0.4 D3 regression**: a single `Op::BatchCommit` whose
+        // inner ops touch the same cell multiple times produces ONE
+        // entry in `cell_op_index[(s,r,c)]` (the dedup-on-equality
+        // check in `apply_cache_effect`).
+        let peer = PeerId::new(7);
+        let mut s = CollabSession::new(peer).unwrap();
+        s.append_op(Op::BatchCommit {
+            ops: vec![
+                put_value(0, 5, 5, 1.0),
+                Op::PutFormula { sheet: 0, row: 5, col: 5, text: "=1+1".to_string() },
+                Op::ClearFormula { sheet: 0, row: 5, col: 5 },
+            ],
+        }).unwrap();
+        let idx_for_cell: Vec<usize> = s
+            .cell_op_index_iter()
+            .find(|(key, _)| **key == (0, 5, 5))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            idx_for_cell,
+            vec![0],
+            "3 inner ops on same cell at op_log_index=0 produce 1 dedupped index entry"
+        );
+    }
+
+    #[test]
+    fn v3_6_0_4_d3_sheet_op_index_populates_for_remove_sheet() {
+        // **V3.6.0.4 D3 regression**: `Op::RemoveSheet` lands in
+        // `sheet_op_index[id]` not `cell_op_index`.
+        let peer = PeerId::new(7);
+        let mut s = CollabSession::new(peer).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S1".to_string(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        s.append_op(put_value(1, 0, 0, 1.0)).unwrap();
+        s.append_op(Op::RemoveSheet { id: 1 }).unwrap();
+        let idx_for_sheet_1: Vec<usize> = s
+            .sheet_op_index_iter()
+            .find(|(id, _)| **id == 1)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        assert_eq!(idx_for_sheet_1, vec![2], "Op::RemoveSheet at op_log_index=2");
+    }
+
+    #[test]
+    fn v3_6_0_4_d3_force_clear_snapshot_cache_clears_cell_and_sheet_indices() {
+        // **V3.6.0.4 D3 regression**: the V3.3.0.X test seam clears the
+        // new indices too (consistent with the existing snapshot +
+        // tombstones + format_cache reset).
+        let peer = PeerId::new(7);
+        let mut s = CollabSession::new(peer).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S1".to_string(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        s.append_op(Op::RemoveSheet { id: 1 }).unwrap();
+        assert!(s.cell_op_index_iter().count() > 0);
+        assert!(s.sheet_op_index_iter().count() > 0);
+        s.force_clear_snapshot_cache();
+        assert_eq!(
+            s.cell_op_index_iter().count(),
+            0,
+            "force_clear_snapshot_cache also clears cell_op_index (V3.6.0.4 \
+             extended the test seam alongside snapshot + tombstones + format_cache)"
+        );
+        assert_eq!(
+            s.sheet_op_index_iter().count(),
+            0,
+            "force_clear_snapshot_cache also clears sheet_op_index"
+        );
+    }
+
+    #[test]
+    fn v3_6_0_4_d3_rebuild_snapshot_cache_repopulates_both_indices() {
+        // **V3.6.0.4 D3 regression**: `rebuild_snapshot_cache` (used by
+        // merge_bytes + from_snapshot + discard_pending_ops) repopulates
+        // both indices from the visible log.
+        let peer = PeerId::new(7);
+        let mut s = CollabSession::new(peer).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S1".to_string(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        s.append_op(Op::RemoveSheet { id: 1 }).unwrap();
+        let pre_cell_count = s.cell_op_index_iter().count();
+        let pre_sheet_count = s.sheet_op_index_iter().count();
+        s.force_clear_snapshot_cache();
+        assert_eq!(s.cell_op_index_iter().count(), 0);
+        assert_eq!(s.sheet_op_index_iter().count(), 0);
+        s.rebuild_snapshot_cache().unwrap();
+        assert_eq!(
+            s.cell_op_index_iter().count(),
+            pre_cell_count,
+            "rebuild_snapshot_cache repopulates cell_op_index from the op log"
+        );
+        assert_eq!(
+            s.sheet_op_index_iter().count(),
+            pre_sheet_count,
+            "rebuild_snapshot_cache repopulates sheet_op_index from the op log"
+        );
+    }
+
+    #[test]
+    fn v3_6_0_4_d3_undo_refreshes_indices_after_loro_retract() {
+        // **V3.6.0.4 D3 regression**: Loro's UndoManager retract
+        // COMPACTS the visible op log (positional indices shift).
+        // `undo()` MUST call `rebuild_op_indices_only` BEFORE the
+        // per-cell invalidate loop so the indices map to the post-
+        // retract log -- otherwise `OpLog::get(stale_idx)` would
+        // either point at the wrong op (shifted-down) or fail
+        // (out of range).
+        //
+        // Pre-D3-fix this test panicked with "cell_op_index /
+        // sheet_op_index pointed past end of log".  Post-fix:
+        // undo() invokes rebuild_op_indices_only + invalidate_cell
+        // produces correct cell state.
+        let peer = PeerId::new(7);
+        let mut s = CollabSession::new(peer).unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s.append_op(put_value(0, 0, 0, 2.0)).unwrap();
+        s.append_op(put_value(0, 0, 0, 3.0)).unwrap();
+
+        // Pre-undo: cell_op_index has 3 entries for A1.
+        let idx_pre: Vec<usize> = s
+            .cell_op_index_iter()
+            .find(|(key, _)| **key == (0, 0, 0))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        assert_eq!(idx_pre, vec![0, 1, 2]);
+
+        // Undo retracts the last op (value=3.0 -> reverts to 2.0).
+        assert!(s.undo().unwrap());
+
+        // Post-undo: cell_op_index reflects the post-retract log
+        // (2 entries; both within the new log length).
+        let idx_post: Vec<usize> = s
+            .cell_op_index_iter()
+            .find(|(key, _)| **key == (0, 0, 0))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        assert_eq!(idx_post.len(), 2);
+        for &idx in &idx_post {
+            assert!(
+                idx < s.op_count(),
+                "post-undo cell_op_index entry {} must point within log length {}",
+                idx, s.op_count()
+            );
+        }
+
+        // Snapshot state: A1 = 2.0 (the post-undo LWW value).
+        let snap = s.snapshot_cells(0);
+        let a1 = snap.iter().find(|((r, c), _)| *r == 0 && *c == 0);
+        assert!(a1.is_some(), "A1 still present post-undo");
+        let (_, state) = a1.unwrap();
+        match &state.value {
+            Some(CellWireValue::Number(n)) => assert!((*n - 2.0).abs() < 1e-9),
+            other => panic!("expected A1 = 2.0 post-undo, got {:?}", other),
+        }
     }
 
     #[test]
