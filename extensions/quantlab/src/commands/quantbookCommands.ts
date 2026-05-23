@@ -292,10 +292,15 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				return;
 			}
 			// V3.3.0.5 multi-panel handling: with multiple local
-			// panels open, the switch operates on the FIRST one
-			// (presumed most-recently focused / least surprising).
-			// V3.x can add a panel-picker step if multi-panel use
-			// becomes common.
+			// panels open, the switch operates on the FIRST entry
+			// in `activeLocalPanels()` iteration order, which is
+			// `localPanels.values()` -- V8 `Map.values()` is
+			// INSERTION ORDER, so `panels[0]` = the OLDEST open
+			// local panel, NOT the most-recently-focused.  V3.x
+			// can add a panel-picker step or active-panel tracking
+			// (V3.3.0.X audit closure MEDIUM-4, 2026-05-23 -- the
+			// prior inline comment incorrectly described this as
+			// "most-recently focused").
 			const target = panels[0];
 			const sheets = listSheets(target.session);
 			if (sheets.length === 0) {

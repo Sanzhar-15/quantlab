@@ -194,11 +194,22 @@ function renderRows(
 			// `data-original-text` captures the rendered display text so
 			// the Escape-cancel path can restore it without consulting
 			// the snapshot (which the client doesn't hold a copy of).
+			// V3.3.0.X audit closure (LOW-1, 2026-05-23, convergent
+			// Codex L3 + Opus L1): defense-in-depth coerce row/col
+			// to Number().  Engine-typed `e.row` / `e.col` are
+			// already u32 integers per the V3.2.a JSON shape, but
+			// the literal claim in the V3.3.0.X audit was "all
+			// attribute values are escaped" -- making that claim
+			// true.  `Number(non-numeric)` returns NaN, which
+			// interpolates as `"NaN"` (a valid CSS-selector +
+			// HTML-attribute value with no XSS surface).
+			const rowSafe = Number(e.row);
+			const colSafe = Number(e.col);
 			const dataAttrs = editable
-				? ` data-row="${e.row}" data-col="${e.col}" data-original-text="${escapeHtml(valueStr)}" data-original-kind="${escapeHtml(e.value.kind)}"`
+				? ` data-row="${rowSafe}" data-col="${colSafe}" data-original-text="${escapeHtml(valueStr)}" data-original-kind="${escapeHtml(e.value.kind)}"`
 				: '';
 			const cellClass = editable ? 'cell-value' : '';
-			return `<tr><td>${e.row}</td><td>${e.col}</td><td class="${cellClass}"${dataAttrs}>${escapeHtml(valueStr)}<span class="kind">[${escapeHtml(e.value.kind)}]</span></td></tr>`;
+			return `<tr><td>${rowSafe}</td><td>${colSafe}</td><td class="${cellClass}"${dataAttrs}>${escapeHtml(valueStr)}<span class="kind">[${escapeHtml(e.value.kind)}]</span></td></tr>`;
 		})
 		.join('');
 }
@@ -441,9 +452,16 @@ function buildClientScript(sheetForClient: number): string {
 		'      var e = entries[i];',
 		'      var valueStr = formatCellValueClient(e.value);',
 		'      var kind = e.value.kind;',
-		'      html += \'<tr><td>\' + e.row + \'</td><td>\' + e.col +',
-		'        \'</td><td class="cell-value" data-row="\' + e.row +',
-		'        \'" data-col="\' + e.col +',
+		'      // V3.3.0.X audit closure (LOW-1): defense-in-depth Number()',
+		'      // coercion mirrors the server renderer (cellGridHtml.ts).',
+		'      // Number(non-numeric) -> NaN -> "NaN" literal in the',
+		'      // attribute; no XSS surface even if a tampered data block',
+		'      // injects non-numeric row/col.',
+		'      var rowSafe = Number(e.row);',
+		'      var colSafe = Number(e.col);',
+		'      html += \'<tr><td>\' + rowSafe + \'</td><td>\' + colSafe +',
+		'        \'</td><td class="cell-value" data-row="\' + rowSafe +',
+		'        \'" data-col="\' + colSafe +',
 		'        \'" data-original-text="\' + htmlEscape(valueStr) +',
 		'        \'" data-original-kind="\' + htmlEscape(kind) + \'">\' +',
 		'        htmlEscape(valueStr) +',
