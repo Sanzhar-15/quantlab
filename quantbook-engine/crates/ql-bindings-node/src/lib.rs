@@ -556,6 +556,38 @@ pub struct CellSnapshotJson {
     /// **V3.5.0.5 (2026-05-24)**: format passthrough.  `None` = no
     /// explicit format (cell renders with FormatId::GENERAL default).
     pub format: Option<FormatIdJson>,
+    /// **Phase 5.7 V3.6.0.5 D4 (2026-05-23)**: pre-rendered formatted
+    /// string for the cell value, produced by the engine via
+    /// `ql_functions::format::render(value, parsed_format,
+    /// eval_context)` where `eval_context.date_system =
+    /// WorkbookSnapshotJson.date_system` and `eval_context.locale =
+    /// EnUs` (V3.6.0.5 ships EN-US only; locale-aware deferred to
+    /// V3.6.1+).
+    ///
+    /// `None` when any of the following hold:
+    /// - `format` is `None` (no format registered for this cell) ->
+    ///   IDE falls back to value-based default rendering.
+    /// - `value` is `None` (cell has formula but no evaluated value
+    ///   yet) -> defer rendering until the formula evaluates.
+    /// - `format` references a `FormatId` not in
+    ///   `Workbook.formats()` (lookup miss; should not happen for
+    ///   well-formed snapshots).
+    /// - The registered format string fails to parse via
+    ///   `ql_functions::format::parse` (V2 token, malformed grammar,
+    ///   etc.) -> IDE falls back to value-default (silent fallback
+    ///   per Phase 5.6 conservative discipline; no error surfaced).
+    /// - The cell value carries an unknown error sigil
+    ///   (`CellWireValue::Error("#WHATEVER!")` where the sigil
+    ///   isn't in `parse_canonical_error_text`'s set) -> wire decode
+    ///   errors out; IDE falls back.
+    ///
+    /// **CSP-safe**: the IDE renderer must `escapeHtml` the rendered
+    /// string before inserting into `innerHTML` (V3.2.a discipline).
+    ///
+    /// **Per-call cost**: format::parse runs PER cell PER snapshot
+    /// call (no cache; V3.6 scale).  V3.7+ may cache parsed
+    /// `FormatString` keyed by format id on `CollabSession`.
+    pub rendered: Option<String>,
 }
 
 /// **Phase 5.7 V3.5.0.2 (2026-05-24) -- JS-facing sheet snapshot.**
@@ -649,6 +681,27 @@ pub struct WorkbookSnapshotJson {
     /// via `.formats`.  Mirrors the V3.5.0.5 per-cell format additive
     /// extension on CellSnapshotJson.
     pub formats: Vec<FormatDefJson>,
+
+    /// **Phase 5.7 V3.6.0.5 D4 (2026-05-23)**: workbook-level date
+    /// system, propagated to the engine `EvalContext` used by
+    /// `format::render` for date/time format strings.  Two valid
+    /// values:
+    /// - `"Excel1900"`: 1900 epoch (1899-12-30 = serial 0); Windows
+    ///   Excel default; includes the phantom 1900-02-29 = serial 60
+    ///   for legacy Lotus 1-2-3 compatibility.
+    /// - `"Excel1904"`: 1904 epoch (1904-01-01 = serial 0); legacy
+    ///   macOS Excel default; no leap-year bug.
+    ///
+    /// Mapped from `ql_types::DateSystem` (see Phase 4.6 D-1).  IDE
+    /// consumers needing to render dates directly (e.g., date
+    /// pickers) should consult this field; cells with a date format
+    /// are already pre-rendered via `CellSnapshotJson.rendered`.
+    ///
+    /// String enum vs napi enum struct: V3.6.0.5 ships String for
+    /// simplicity (matches the FormatIdJson + CellValueJson `kind:
+    /// String` pattern; no per-value wrapper struct).  IDE types.ts
+    /// pins via a union type `"Excel1900" | "Excel1904"`.
+    pub date_system: String,
 }
 
 /// **Phase 5.7 V3.6.0.3 D2 (2026-05-24)** -- one format registration
@@ -1589,6 +1642,20 @@ impl CollabSession {
         let (workbook, _report) = inner
             .rebuild_workbook(&registry)
             .map_err(collab_session_error_to_napi)?;
+        // **Phase 5.7 V3.6.0.5 D4 (2026-05-23)**: build the
+        // EvalContext used by format::render.  date_system comes
+        // from the workbook (Phase 4.6 D-1); locale ships EN-US
+        // only at V3.6.0.5 (locale-aware deferred to V3.6.1+);
+        // now_provider stays at System default (date/time format
+        // strings that reference NOW() / TODAY() in the format
+        // grammar -- not common -- get the system clock; tests
+        // that need determinism can use `for_test`).
+        let workbook_date_system = workbook.date_system();
+        let eval_ctx = ql_types::EvalContext {
+            date_system: workbook_date_system,
+            locale: ql_types::Locale::EnUs,
+            now_provider: ql_types::NowProvider::System,
+        };
         let sheet_count = workbook.sheet_count();
         // **V3.5.0.3c (2026-05-24)**: iterate the display-order overlay
         // instead of 0..sheet_count() so user-initiated `Op::MoveSheet`
@@ -1668,6 +1735,37 @@ impl CollabSession {
                     let repaired_formula = workbook
                         .formula_at(sheet_id, row, col)
                         .map(|s| s.as_ref().to_string());
+                    // **Phase 5.7 V3.6.0.5 D4 (2026-05-23)**:
+                    // pre-render the cell value via
+                    // `ql_functions::format::render` when the cell
+                    // has a format AND a value.  Silent fallback
+                    // to `None` on any of: no format / no value /
+                    // format-id lookup miss / format-string parse
+                    // error / wire-decode error on the value.
+                    // IDE consumer falls back to value-based
+                    // default rendering when `rendered` is None.
+                    let rendered: Option<String> =
+                        match (state.format.as_ref(), state.value.as_ref()) {
+                            (Some(fmt_id), Some(wire_value)) => {
+                                // Step 1: convert wire value -> ql_types::Value.
+                                wire_value
+                                    .to_value()
+                                    .ok()
+                                    .and_then(|value| {
+                                        // Step 2: look up format string by id.
+                                        workbook.formats().lookup(*fmt_id).map(|fmt_str| (value, fmt_str.to_string()))
+                                    })
+                                    .and_then(|(value, fmt_string)| {
+                                        // Step 3: parse the format string.
+                                        ql_functions::format::parse(&fmt_string).ok().map(|fmt| (value, fmt))
+                                    })
+                                    .map(|(value, fmt)| {
+                                        // Step 4: render with EvalContext.
+                                        ql_functions::format::render(&value, &fmt, &eval_ctx)
+                                    })
+                            }
+                            _ => None,
+                        };
                     CellSnapshotJson {
                         row,
                         col,
@@ -1679,6 +1777,11 @@ impl CollabSession {
                         // absent JS property (napi-rs Option::None
                         // serialization).
                         format: state.format.map(FormatIdJson::from),
+                        // **V3.6.0.5 D4 (2026-05-23)**: pre-rendered
+                        // formatted value (see field docstring +
+                        // CellSnapshotJson.rendered docstring for the
+                        // None-fallback contract).
+                        rendered,
                     }
                 })
                 .collect();
@@ -1723,7 +1826,20 @@ impl CollabSession {
                 string: s.to_string(),
             })
             .collect();
-        Ok(WorkbookSnapshotJson { sheets, formats })
+        // **V3.6.0.5 D4 (2026-05-23)**: map ql_types::DateSystem
+        // to the napi String discriminator (matches the
+        // FormatIdJson / CellValueJson `kind: String` pattern).
+        // Two valid values; IDE consumers pin via a union type
+        // `"Excel1900" | "Excel1904"`.
+        let date_system = match workbook_date_system {
+            ql_types::DateSystem::Excel1900 => "Excel1900".to_string(),
+            ql_types::DateSystem::Excel1904 => "Excel1904".to_string(),
+        };
+        Ok(WorkbookSnapshotJson {
+            sheets,
+            formats,
+            date_system,
+        })
     }
 
     /// **Phase 5.7 V3.4.0.4a (2026-05-23) -- load a session from a
