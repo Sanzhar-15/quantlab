@@ -306,14 +306,75 @@ export class CellGridPanel {
 	static refreshAll(): number {
 		let count = 0;
 		for (const instance of localPanels.values()) {
-			instance.render();
+			instance.safeRender();
 			count += 1;
 		}
 		for (const instance of collabPanels.values()) {
-			instance.render();
+			instance.safeRender();
 			count += 1;
 		}
 		return count;
+	}
+
+	/**
+	 * **Phase 5.7 V3.5.0.X follow-up audit CLOSURE-CODEX-MED-3 (2026-05-24)**
+	 * -- guard-aware render wrapper.
+	 *
+	 * Invoked by {@link refreshAll} (and any future caller that needs to
+	 * trigger a render via the same policy).  Respects the V3.5.0.7
+	 * mid-edit-render guard: if `_presenceRepaintInFlight` is set
+	 * (some peer's local typing is in flight on THIS panel), defer
+	 * the render via the V3.5.0.X `_pendingRenderAfterTyping` dirty
+	 * flag instead of destroying the in-progress `<input>` element.
+	 *
+	 * **Why this matters**: pre-fix `refreshAll()` called `render()`
+	 * unconditionally, which BYPASSED the A-HIGH-4 guard for collab
+	 * panels.  A user running a LOCAL sheet command (e.g., "Add Sheet")
+	 * would trigger refreshAll, which would iterate BOTH local and
+	 * collab panel maps and force a render on a collab panel that
+	 * happens to be mid-edit.  This re-opened R-V3.4-3 in a new code
+	 * path (cross-finding regression between A-HIGH-3 and A-HIGH-4
+	 * closures).  Codex found this in the follow-up audit
+	 * (`docs/audits/2026-05-24-phase-5-7-v3-5-0-x-closure-codex.md`,
+	 * CLOSURE-CODEX-MED-3).
+	 *
+	 * Local panels never set `_presenceRepaintInFlight` (no transport
+	 * presence; the field stays at its constructor-init `false`), so
+	 * for them this is equivalent to a direct `render()`.
+	 *
+	 * Try/catch around the render mirrors `tickPollRemote` 'idle'
+	 * branch + the V3.5.0.X follow-up B-FINDING-3 closures (try/catch
+	 * + log on failure).
+	 *
+	 * Returns nothing (callers' counts include the call even if it
+	 * deferred; the deferred render eventually fires).
+	 */
+	private safeRender(): void {
+		if (this._disposed) {
+			return;
+		}
+		if (this._presenceRepaintInFlight) {
+			this._pendingRenderAfterTyping = true;
+			const state = this.attachmentState;
+			if (state !== undefined && !state.disposed) {
+				state.log.appendLine(
+					`[collab] safeRender: skipping render (presenceRepaintInFlight; local user mid-edit). ` +
+					`Deferred render flagged; will fire on typing:false / watchdog / next idle tick.`,
+				);
+			}
+			return;
+		}
+		try {
+			this.render();
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			const state = this.attachmentState;
+			if (state !== undefined && !state.disposed) {
+				state.log.appendLine(`[collab] safeRender render() failed: ${detail}`);
+			} else {
+				console.warn(`[quantbook] safeRender render() failed on local panel: ${detail}`);
+			}
+		}
 	}
 
 	/**

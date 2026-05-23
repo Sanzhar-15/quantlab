@@ -465,12 +465,22 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 	//      for bad_argument / session_oplog cases per V3.5.0.3a/b/c).
 	//   4. Log success or surface error via showErrorMessage.
 	//
-	// **NO automatic panel re-render after sheet op**: this is
-	// intentional for V3.5.0.4a scope.  The cell-grid panel's
-	// pollRemote tick (V3.2.c, 1s cadence) picks up the new sheet
-	// state at next render via the existing snapshot path.  V3.5.0.4b
-	// will migrate the render path to workbookSnapshot()-driven
-	// rendering, which will naturally reflect sheet ops immediately.
+	// **V3.5.0.X audit-closure A-HIGH-3 (2026-05-24)**: each command
+	// now calls `CellGridPanel.refreshAll()` after the engine op
+	// succeeds (outside the engine-op try{} per CLOSURE-CODEX-MED-2;
+	// inside a separate try/catch so render failures don't masquerade
+	// as engine-op failures).  refreshAll iterates both local +
+	// collab panels via `safeRender()`, which respects the V3.5.0.7
+	// mid-edit-render guard (collab panels mid-edit defer via
+	// `_pendingRenderAfterTyping` instead of destroying the in-progress
+	// `<input>` element -- per CLOSURE-CODEX-MED-3).
+	//
+	// **Historical note** (V3.5.0.4a scope, now obsolete): pre-A-HIGH-3
+	// closure these commands intentionally did NOT re-render; the
+	// pollRemote tick (V3.2.c, 1s) was the only repaint path.  That
+	// was a UX gap (panel title appeared stale until the next tick).
+	// V3.5.0.4b migrated the render path to workbookSnapshot()-driven
+	// rendering, and V3.5.0.X A-HIGH-3 now wires the refreshAll call.
 	context.subscriptions.push(
 		vscode.commands.registerCommand('quantlab.quantbookSheetAdd', async () => {
 			const panels = CellGridPanel.activeLocalPanels();
@@ -496,25 +506,40 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				return; // user cancelled
 			}
 			const log = getOutput();
+			// **V3.5.0.X follow-up audit CLOSURE-CODEX-MED-2 (2026-05-24)**:
+			// the engine-op try and the refreshAll() are NOW separated so
+			// a render failure isn't misreported as a sheet-op failure.
+			// Pre-fix: both were inside the same try{}, so any render
+			// throw would surface as "Quantbook add sheet failed" even
+			// though the engine mutation already succeeded.
+			let opSucceeded = false;
 			try {
 				// chunkRows=1000 matches the V3.4.0.X sample-data
 				// command's seed pattern; appropriate for typical
 				// workbook sizes per Phase 2A column-store doc.
 				addSheet(target.session, name.trim(), 1000);
-				// V3.5.0.X audit-closure A-HIGH-3 (2026-05-24): repaint
-				// all open Cell Grid panels so the new sheet surfaces
-				// immediately (reactive title + workbookSnapshot read).
-				// Pre-closure the panels did NOT poll local sessions, so
-				// the new sheet was invisible until the next user action
-				// triggered a render -- the ide-consumer-contract.md 4.1.z5 live smoke promise
-				// that "panel title updates within ms" was FALSE.
-				const refreshed = CellGridPanel.refreshAll();
-				log.appendLine(`Added sheet "${name.trim()}" to session; refreshed ${refreshed} panel(s).`);
+				opSucceeded = true;
+				log.appendLine(`Added sheet "${name.trim()}" to session.`);
 				void vscode.window.showInformationMessage(`Sheet "${name.trim()}" added.`);
 			} catch (err) {
 				const detail = err instanceof Error ? err.message : String(err);
 				log.appendLine(`FATAL addSheet error: ${detail}`);
 				void vscode.window.showErrorMessage(`Quantbook add sheet failed: ${detail}`);
+			}
+			// V3.5.0.X audit-closure A-HIGH-3: repaint panels AFTER the
+			// engine op succeeds.  V3.5.0.X follow-up audit CLOSURE-
+			// CODEX-MED-3: refreshAll() now respects the A-HIGH-4 mid-
+			// edit guard via the new safeRender helper (collab panels
+			// mid-edit defer via _pendingRenderAfterTyping instead of
+			// destroying the in-progress <input>).
+			if (opSucceeded) {
+				try {
+					const refreshed = CellGridPanel.refreshAll();
+					log.appendLine(`Refreshed ${refreshed} panel(s).`);
+				} catch (err) {
+					const detail = err instanceof Error ? err.message : String(err);
+					log.appendLine(`refreshAll after addSheet failed (non-fatal): ${detail}`);
+				}
 			}
 		}),
 	);
@@ -570,11 +595,12 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			if (newName === undefined) {
 				return; // user cancelled
 			}
+			// V3.5.0.X follow-up audit CLOSURE-CODEX-MED-2: refresh isolated.
+			let opSucceeded = false;
 			try {
 				renameSheet(target.session, pick.sheet, newName.trim());
-				// V3.5.0.X audit-closure A-HIGH-3: repaint panels.
-				const refreshed = CellGridPanel.refreshAll();
-				log.appendLine(`Renamed sheet ${pick.sheet} from "${pick.name}" to "${newName.trim()}"; refreshed ${refreshed} panel(s).`);
+				opSucceeded = true;
+				log.appendLine(`Renamed sheet ${pick.sheet} from "${pick.name}" to "${newName.trim()}".`);
 				void vscode.window.showInformationMessage(
 					`Sheet ${pick.sheet} renamed to "${newName.trim()}".`,
 				);
@@ -582,6 +608,15 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				const detail = err instanceof Error ? err.message : String(err);
 				log.appendLine(`FATAL renameSheet error: ${detail}`);
 				void vscode.window.showErrorMessage(`Quantbook rename sheet failed: ${detail}`);
+			}
+			if (opSucceeded) {
+				try {
+					const refreshed = CellGridPanel.refreshAll();
+					log.appendLine(`Refreshed ${refreshed} panel(s).`);
+				} catch (err) {
+					const detail = err instanceof Error ? err.message : String(err);
+					log.appendLine(`refreshAll after renameSheet failed (non-fatal): ${detail}`);
+				}
 			}
 		}),
 	);
@@ -633,15 +668,12 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			if (confirm !== 'Delete') {
 				return; // user cancelled
 			}
+			// V3.5.0.X follow-up audit CLOSURE-CODEX-MED-2: refresh isolated.
+			let opSucceeded = false;
 			try {
 				deleteSheet(target.session, pick.sheet);
-				// V3.5.0.X audit-closure A-HIGH-3: repaint panels.  If the
-				// deleted sheet was the active sheet of any panel, that
-				// panel will render the tombstone-race fallback (empty
-				// cells + console.warn per V3.5.0.4b docstring at
-				// cellGridPanel.ts:render()).
-				const refreshed = CellGridPanel.refreshAll();
-				log.appendLine(`Deleted sheet ${pick.sheet} ("${pick.name}"); refreshed ${refreshed} panel(s).`);
+				opSucceeded = true;
+				log.appendLine(`Deleted sheet ${pick.sheet} ("${pick.name}").`);
 				void vscode.window.showInformationMessage(
 					`Sheet ${pick.sheet} ("${pick.name}") deleted.`,
 				);
@@ -649,6 +681,19 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				const detail = err instanceof Error ? err.message : String(err);
 				log.appendLine(`FATAL deleteSheet error: ${detail}`);
 				void vscode.window.showErrorMessage(`Quantbook delete sheet failed: ${detail}`);
+			}
+			// If the deleted sheet was the active sheet of any panel, that
+			// panel will render the tombstone-race fallback (empty cells +
+			// console.warn per V3.5.0.4b docstring at
+			// cellGridPanel.ts:render()).
+			if (opSucceeded) {
+				try {
+					const refreshed = CellGridPanel.refreshAll();
+					log.appendLine(`Refreshed ${refreshed} panel(s).`);
+				} catch (err) {
+					const detail = err instanceof Error ? err.message : String(err);
+					log.appendLine(`refreshAll after deleteSheet failed (non-fatal): ${detail}`);
+				}
 			}
 		}),
 	);
@@ -695,12 +740,13 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			if (positionPick === undefined) {
 				return; // user cancelled
 			}
+			// V3.5.0.X follow-up audit CLOSURE-CODEX-MED-2: refresh isolated.
+			let opSucceeded = false;
 			try {
 				moveSheet(target.session, sourcePick.sheet, positionPick.sheet);
-				// V3.5.0.X audit-closure A-HIGH-3: repaint panels.
-				const refreshed = CellGridPanel.refreshAll();
+				opSucceeded = true;
 				log.appendLine(
-					`Moved sheet ${sourcePick.sheet} ("${sourcePick.name}") to display position ${positionPick.sheet}; refreshed ${refreshed} panel(s).`,
+					`Moved sheet ${sourcePick.sheet} ("${sourcePick.name}") to display position ${positionPick.sheet}.`,
 				);
 				void vscode.window.showInformationMessage(
 					`Sheet "${sourcePick.name}" moved to position ${positionPick.sheet}.`,
@@ -709,6 +755,15 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				const detail = err instanceof Error ? err.message : String(err);
 				log.appendLine(`FATAL moveSheet error: ${detail}`);
 				void vscode.window.showErrorMessage(`Quantbook move sheet failed: ${detail}`);
+			}
+			if (opSucceeded) {
+				try {
+					const refreshed = CellGridPanel.refreshAll();
+					log.appendLine(`Refreshed ${refreshed} panel(s).`);
+				} catch (err) {
+					const detail = err instanceof Error ? err.message : String(err);
+					log.appendLine(`refreshAll after moveSheet failed (non-fatal): ${detail}`);
+				}
 			}
 		}),
 	);
