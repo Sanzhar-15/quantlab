@@ -237,6 +237,18 @@ export class CellGridPanel {
 				throw err;
 			}
 		}
+		// **Phase 5.7 V3.5.0.X audit-closure Opus-M2 (2026-05-24)** -- defensive
+		// reinit of the mid-edit-render guard before the first render.  The
+		// `_presenceRepaintInFlight` field-level docstring claims this reset
+		// happens in show(); pre-closure the reset existed ONLY in the
+		// constructor (init false) + on dispose (setPresenceTyping(false))
+		// so the docstring drifted from the code.  This call closes the
+		// gap and matches the V3.4.0.X-established "reinit on show +
+		// attachTransport" pattern.  No-op on a freshly constructed
+		// instance (flag already false), but defensive against future
+		// refactors that might reuse instances or pass a non-default
+		// initial state.
+		instance.setPresenceTyping(false);
 		instance.render();
 		panels.set(sheet, instance);
 		panel.onDidDispose(() => {
@@ -418,6 +430,42 @@ export class CellGridPanel {
 	 */
 	private presenceTypingWatchdog: ReturnType<typeof setTimeout> | undefined = undefined;
 
+	/**
+	 * **Phase 5.7 V3.5.0.X audit-closure A-HIGH-4 (2026-05-24)** --
+	 * deferred-render dirty flag.
+	 *
+	 * Set to `true` by {@link tickPollRemote}'s `'merged'` branch
+	 * whenever a remote-merge render is SKIPPED because
+	 * {@link _presenceRepaintInFlight} is true.  The merged blob was
+	 * ALREADY drained into the engine cache by `pollRemote()` (the
+	 * skip only suppresses the `this.render()` repaint).  Without
+	 * this dirty flag, subsequent pollRemote ticks classify as
+	 * `'idle'` (no NEW blobs arrived) and the idle branch never
+	 * renders -- so the deferred remote change stays invisible
+	 * indefinitely until some other code path triggers a render.
+	 *
+	 * Cleared + a render fires when ANY of:
+	 * 1. `setPresenceTyping(false)` is called (typing transitioned
+	 *    false; safe to render now).
+	 * 2. The presence-typing watchdog fires (auto-clear after 30s);
+	 *    typing:false never arrived but we MUST eventually render
+	 *    the deferred change.
+	 * 3. Defense-in-depth: a subsequent pollRemote tick classifies
+	 *    as `'idle'` AND the guard is no longer in-flight.  This
+	 *    catches edge cases where setPresenceTyping(false) didn't
+	 *    fire (e.g., webview crashed without sending endEdit).
+	 *
+	 * R-V3.4-3 closure (V3.5.0.7) was INCOMPLETE without this flag:
+	 * the merged-tick skip prevented `<input>` destruction during
+	 * mid-edit, but did NOT preserve the requirement that the
+	 * remote change become visible "on the next tick" per the
+	 * ide-consumer-contract.md 4.1.z5 D5 guarantee.  V3.5.0.X audit-closure A-HIGH-4
+	 * caught this and added the dirty flag for true closure.
+	 *
+	 * pub-readonly so tests via test-fixture seams can inspect.
+	 */
+	_pendingRenderAfterTyping: boolean = false;
+
 	private constructor(
 		private readonly panel: vscode.WebviewPanel,
 		private readonly session: CollabSessionInstance,
@@ -457,6 +505,10 @@ export class CellGridPanel {
 			clearTimeout(this.presenceTypingWatchdog);
 			this.presenceTypingWatchdog = undefined;
 		}
+		// **Phase 5.7 V3.5.0.X audit-closure A-HIGH-4 (2026-05-24)**:
+		// capture whether we were guarding BEFORE updating the flag,
+		// so the false-transition arm can fire the deferred render.
+		const wasInFlight = this._presenceRepaintInFlight;
 		this._presenceRepaintInFlight = typing;
 		if (typing) {
 			this.presenceTypingWatchdog = setTimeout(() => {
@@ -474,8 +526,31 @@ export class CellGridPanel {
 							`auto-cleared (typing:false never arrived; merged-tick renders will resume).`,
 						);
 					}
+					// V3.5.0.X audit-closure A-HIGH-4: even on watchdog
+					// auto-clear we MUST flush any deferred merged-tick
+					// render that was skipped during the typing-true
+					// window.  Without this, the remote change stays
+					// invisible until the user takes another action.
+					if (this._pendingRenderAfterTyping && !this._disposed) {
+						this._pendingRenderAfterTyping = false;
+						this.render();
+					}
 				}
 			}, PRESENCE_TYPING_WATCHDOG_MS);
+		} else if (wasInFlight) {
+			// V3.5.0.X audit-closure A-HIGH-4 (2026-05-24): typing
+			// transitioned true -> false.  If a merged-tick render was
+			// deferred during the typing window, fire it now so the
+			// remote change becomes visible.  This restores the ide-consumer-contract.md
+			// 4.1.z5 D5 guarantee that "deferred render fires on next
+			// 1s tick" (we choose to fire IMMEDIATELY on typing:false
+			// rather than wait for the next pollRemote tick -- the
+			// user just exited edit mode and is most likely to look
+			// at remote changes RIGHT NOW).
+			if (this._pendingRenderAfterTyping && !this._disposed) {
+				this._pendingRenderAfterTyping = false;
+				this.render();
+			}
 		}
 	}
 
@@ -654,6 +729,31 @@ export class CellGridPanel {
 		const result = classifyPollTick(this.session);
 		switch (result.kind) {
 			case 'idle':
+				// **Phase 5.7 V3.5.0.X audit-closure A-HIGH-4 (2026-05-24)**:
+				// defense-in-depth.  classifyPollTick returns 'idle' when
+				// no NEW remote blobs arrived since the last tick.  If a
+				// previous merged-tick render was SKIPPED (deferred via
+				// `_pendingRenderAfterTyping`) AND the guard has since
+				// cleared, fire the deferred render NOW.  This covers
+				// edge cases where setPresenceTyping(false) never fired
+				// (e.g., webview crashed mid-edit) and the watchdog
+				// hasn't fired yet either.
+				if (this._pendingRenderAfterTyping && !this._presenceRepaintInFlight && !this._disposed) {
+					this._pendingRenderAfterTyping = false;
+					state.log.appendLine(
+						`[collab] pollRemote idle tick: firing deferred render (presence guard cleared since last merged-skip).`,
+					);
+					try {
+						this.render();
+					} catch (err) {
+						const info = parseQuantbookError(err);
+						state.log.appendLine(`[collab] deferred render() failed: code=${info.code} msg=${info.message}`);
+						// Match the merged-branch policy: fatal codes ->
+						// caller surfaces; transient -> swallow + log.
+						// (Don't re-set the dirty flag on failure -- the
+						// next genuine merge will re-trigger.)
+					}
+				}
 				return;
 			case 'merged':
 				// **Phase 5.7 V3.5.0.7 (2026-05-24)** -- D5 / R-V3.4-3
@@ -664,21 +764,33 @@ export class CellGridPanel {
 				// `<input>` element (the cell editor).  The merged op
 				// stays in the engine's last_snapshot cache (it was
 				// merged via mergeBytes/pollRemote into the LoroDoc
-				// before classifyPollTick returned 'merged'), so the
-				// next pollRemote tick (~1s after typing:false) picks
-				// up the deferred render.
+				// before classifyPollTick returned 'merged').
+				//
+				// **V3.5.0.X audit-closure A-HIGH-4 (2026-05-24)**:
+				// pre-closure the merged-skip set NO dirty flag, so
+				// the deferred render was lost (subsequent ticks would
+				// classify as 'idle' and never fire).  Now: set the
+				// `_pendingRenderAfterTyping` dirty flag so the render
+				// fires when ANY of (a) setPresenceTyping(false) is
+				// called, (b) the watchdog auto-clears, (c) defense-
+				// in-depth in the idle branch above.
 				//
 				// Watchdog mitigates the stuck-true edge case (panel
 				// hung mid-edit / window closed without endEdit);
 				// PRESENCE_TYPING_WATCHDOG_MS auto-clears after 30s.
 				if (this._presenceRepaintInFlight) {
+					this._pendingRenderAfterTyping = true;
 					state.log.appendLine(
 						`[collab] pollRemote merged ${result.count} remote blob(s); ` +
 						`SKIPPING render (presenceRepaintInFlight; local user mid-edit). ` +
-						`Will retry on next tick.`,
+						`Deferred render flagged; will fire on typing:false / watchdog / next idle tick.`,
 					);
 					return;
 				}
+				// V3.5.0.X audit-closure A-HIGH-4: a new merged tick
+				// supersedes any prior deferred render (we're about to
+				// render NOW with fresher data), so clear the flag.
+				this._pendingRenderAfterTyping = false;
 				state.log.appendLine(`[collab] pollRemote merged ${result.count} remote blob(s); re-rendering`);
 				// V3.2.d Codex M3 closure (2026-05-22): wrap render()
 				// in try/catch.  exportCellSnapshot can throw at the

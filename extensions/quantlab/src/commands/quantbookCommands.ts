@@ -501,7 +501,15 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 				// command's seed pattern; appropriate for typical
 				// workbook sizes per Phase 2A column-store doc.
 				addSheet(target.session, name.trim(), 1000);
-				log.appendLine(`Added sheet "${name.trim()}" to session.`);
+				// V3.5.0.X audit-closure A-HIGH-3 (2026-05-24): repaint
+				// all open Cell Grid panels so the new sheet surfaces
+				// immediately (reactive title + workbookSnapshot read).
+				// Pre-closure the panels did NOT poll local sessions, so
+				// the new sheet was invisible until the next user action
+				// triggered a render -- the ide-consumer-contract.md 4.1.z5 live smoke promise
+				// that "panel title updates within ms" was FALSE.
+				const refreshed = CellGridPanel.refreshAll();
+				log.appendLine(`Added sheet "${name.trim()}" to session; refreshed ${refreshed} panel(s).`);
 				void vscode.window.showInformationMessage(`Sheet "${name.trim()}" added.`);
 			} catch (err) {
 				const detail = err instanceof Error ? err.message : String(err);
@@ -564,7 +572,9 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			}
 			try {
 				renameSheet(target.session, pick.sheet, newName.trim());
-				log.appendLine(`Renamed sheet ${pick.sheet} from "${pick.name}" to "${newName.trim()}".`);
+				// V3.5.0.X audit-closure A-HIGH-3: repaint panels.
+				const refreshed = CellGridPanel.refreshAll();
+				log.appendLine(`Renamed sheet ${pick.sheet} from "${pick.name}" to "${newName.trim()}"; refreshed ${refreshed} panel(s).`);
 				void vscode.window.showInformationMessage(
 					`Sheet ${pick.sheet} renamed to "${newName.trim()}".`,
 				);
@@ -625,7 +635,13 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			}
 			try {
 				deleteSheet(target.session, pick.sheet);
-				log.appendLine(`Deleted sheet ${pick.sheet} ("${pick.name}").`);
+				// V3.5.0.X audit-closure A-HIGH-3: repaint panels.  If the
+				// deleted sheet was the active sheet of any panel, that
+				// panel will render the tombstone-race fallback (empty
+				// cells + console.warn per V3.5.0.4b docstring at
+				// cellGridPanel.ts:render()).
+				const refreshed = CellGridPanel.refreshAll();
+				log.appendLine(`Deleted sheet ${pick.sheet} ("${pick.name}"); refreshed ${refreshed} panel(s).`);
 				void vscode.window.showInformationMessage(
 					`Sheet ${pick.sheet} ("${pick.name}") deleted.`,
 				);
@@ -681,8 +697,10 @@ export function registerQuantbookCommands(context: vscode.ExtensionContext): voi
 			}
 			try {
 				moveSheet(target.session, sourcePick.sheet, positionPick.sheet);
+				// V3.5.0.X audit-closure A-HIGH-3: repaint panels.
+				const refreshed = CellGridPanel.refreshAll();
 				log.appendLine(
-					`Moved sheet ${sourcePick.sheet} ("${sourcePick.name}") to display position ${positionPick.sheet}.`,
+					`Moved sheet ${sourcePick.sheet} ("${sourcePick.name}") to display position ${positionPick.sheet}; refreshed ${refreshed} panel(s).`,
 				);
 				void vscode.window.showInformationMessage(
 					`Sheet "${sourcePick.name}" moved to position ${positionPick.sheet}.`,

@@ -64,9 +64,11 @@ export interface PresenceStateJson {
  * Discriminated-union shape: `kind` is one of `"number" | "boolean" |
  * "text" | "error" | "pending"`; exactly one of the optional payload
  * fields is set per non-pending variant; `pending` has all four
- * payloads `null`/`undefined`.  Mirrors the V3.4.0.2 `exportSnapshot`
- * JSON output's per-cell value discriminator, promoted to a typed
- * napi(object) at V3.5.0.2 for the `WorkbookSnapshotJson` surface.
+ * payloads absent (napi-rs serializes Rust `Option::None` as ABSENT
+ * properties; the fields are `undefined`, NOT `null`).  Mirrors the
+ * V3.4.0.2 `exportSnapshot` JSON output's per-cell value discriminator,
+ * promoted to a typed napi(object) at V3.5.0.2 for the
+ * `WorkbookSnapshotJson` surface.
  */
 export interface CellValueJson {
 	kind: 'number' | 'boolean' | 'text' | 'error' | 'pending';
@@ -82,11 +84,18 @@ export interface CellValueJson {
 /**
  * **Phase 5.7 V3.5.0.2 (2026-05-24) -- one cell entry in a sheet snapshot.**
  *
- * `value: null` = formula-only cell (formula text, no cached literal).
- * `formula: null` = pure literal cell (PutValue, no formula text).
- * Both `non-null` = formula evaluated to a literal (formula text +
- * cached value coexist).  Both `null` cannot occur (V3.4.0.X MEDIUM-1
- * closure removes such empty CellState entries from the cache).
+ * `value` absent = formula-only cell (formula text, no cached literal).
+ * `formula` absent = pure literal cell (PutValue, no formula text).
+ * Both present = formula evaluated to a literal (formula text + cached
+ * value coexist).  All three (value + formula + format) absent cannot
+ * occur (V3.4.0.X MEDIUM-1 closure extended at V3.5.0.5 to format --
+ * such empty CellState entries are removed from the cache).
+ *
+ * **napi-rs absence convention** (V3.5.0.X audit-closure A-LOW-1 doc
+ * hygiene, 2026-05-24): Rust `Option<T>::None` serializes to ABSENT
+ * JS properties (the field is `undefined`, NOT `null`).  Tests assert
+ * `=== undefined`.  Use TypeScript's optional `?:` syntax to model
+ * this contract.
  */
 export interface CellSnapshotJson {
 	row: number;
