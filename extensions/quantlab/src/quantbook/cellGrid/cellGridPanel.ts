@@ -531,9 +531,26 @@ export class CellGridPanel {
 					// render that was skipped during the typing-true
 					// window.  Without this, the remote change stays
 					// invisible until the user takes another action.
+					//
+					// **B-FINDING-3 (V3.5.0.X follow-up audit)**: wrap
+					// in try/catch to mirror the tickPollRemote 'idle'
+					// branch's policy.  Pre-fix a render() throw here
+					// would propagate up to vscode's setTimeout handler
+					// (unhandled); the deferred render would be lost
+					// silently.  Post-fix: log via the attachment's
+					// output channel + clear the flag (next genuine
+					// merge will re-trigger if needed).
 					if (this._pendingRenderAfterTyping && !this._disposed) {
 						this._pendingRenderAfterTyping = false;
-						this.render();
+						try {
+							this.render();
+						} catch (err) {
+							const detail = err instanceof Error ? err.message : String(err);
+							const inner = this.attachmentState;
+							if (inner !== undefined && !inner.disposed) {
+								inner.log.appendLine(`[collab] watchdog deferred render() failed: ${detail}`);
+							}
+						}
 					}
 				}
 			}, PRESENCE_TYPING_WATCHDOG_MS);
@@ -547,9 +564,25 @@ export class CellGridPanel {
 			// rather than wait for the next pollRemote tick -- the
 			// user just exited edit mode and is most likely to look
 			// at remote changes RIGHT NOW).
+			//
+			// **B-FINDING-3 (V3.5.0.X follow-up audit)**: try/catch around
+			// the render call mirrors the tickPollRemote 'idle' branch's
+			// policy.  Pre-fix a render() throw here would propagate up
+			// through the dispatcher's onLocalTyping callback to vscode's
+			// onDidReceiveMessage handler (unhandled); the deferred render
+			// would be lost silently.  Post-fix: log + flag stays cleared
+			// (next genuine merge re-triggers if needed).
 			if (this._pendingRenderAfterTyping && !this._disposed) {
 				this._pendingRenderAfterTyping = false;
-				this.render();
+				try {
+					this.render();
+				} catch (err) {
+					const detail = err instanceof Error ? err.message : String(err);
+					const inner = this.attachmentState;
+					if (inner !== undefined && !inner.disposed) {
+						inner.log.appendLine(`[collab] typing:false deferred render() failed: ${detail}`);
+					}
+				}
 			}
 		}
 	}
