@@ -51,6 +51,7 @@ import {
 	buildPresenceSnapshotJson,
 	clearPresence,
 	createSession,
+	deleteSheet,
 	exportCellSnapshot,
 	exportToQbook,
 	generateUuidPeerId,
@@ -4611,6 +4612,192 @@ suite('quantbook V3.5.0.3a -- renameSheet napi contract', function () {
 		} finally {
 			try { fs.rmSync(scratchDir, { recursive: true, force: true }); } catch { /* test cleanup */ }
 		}
+	});
+});
+
+// ============================================================================
+// Phase 5.7 V3.5.0.3b (2026-05-24) -- deleteSheet napi + Op::RemoveSheet
+// ============================================================================
+// V3.5.0.3b CRDT semantic decision lock: tombstone preserves id slot;
+// cell writes to tombstoned sheet silently dropped; workbookSnapshot
+// filters tombstoned sheets; concurrent re-delete is idempotent.
+
+suite('quantbook V3.5.0.3b -- deleteSheet napi contract', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('delete emits Op::RemoveSheet (op count grows by 1)', () => {
+		const session = createSession(7801n);
+		addSheet(session, 'Doomed');
+		const before = session.opCount();
+		deleteSheet(session, 0);
+		assert.strictEqual(session.opCount(), before + 1,
+			'one deleteSheet call appends exactly one op');
+	});
+
+	test('workbookSnapshot filters out tombstoned sheets', () => {
+		const session = createSession(7802n);
+		addSheet(session, 'Keep0');
+		addSheet(session, 'Delete1');
+		addSheet(session, 'Keep2');
+		deleteSheet(session, 1);
+		const snap = workbookSnapshot(session);
+		// Sheet 1 tombstoned; snapshot has 2 sheets (ids 0 and 2).
+		assert.strictEqual(snap.sheets.length, 2,
+			'tombstoned sheet absent from snapshot');
+		assert.deepStrictEqual(snap.sheets.map(s => s.id), [0, 2],
+			'tombstoned id-1 slot is SKIPPED; ids 0 + 2 remain');
+		assert.deepStrictEqual(snap.sheets.map(s => s.name), ['Keep0', 'Keep2']);
+	});
+
+	test('cells on tombstoned sheet are unreachable via snapshot', () => {
+		const session = createSession(7803n);
+		addSheet(session, 'A');
+		appendPutValueValidated(session, 0, 0, 0, 42);
+		appendPutValueValidated(session, 0, 1, 0, 99);
+		// Verify cells are visible BEFORE delete.
+		assert.strictEqual(workbookSnapshot(session).sheets[0].cells.length, 2);
+		deleteSheet(session, 0);
+		// After delete, the sheet is filtered out of the snapshot entirely.
+		assert.strictEqual(workbookSnapshot(session).sheets.length, 0,
+			'tombstoned sheet -> snapshot is empty (no sheets surface)');
+	});
+
+	test('writes to tombstoned sheet are silently dropped (CRDT idempotency)', () => {
+		const session = createSession(7804n);
+		addSheet(session, 'TBR');
+		deleteSheet(session, 0);
+		// Write to the tombstoned sheet -- the napi succeeds (validation
+		// is bound to opcount; tombstone state is checked at REPLAY time).
+		// The PutValue op gets appended, but its apply_op silent-no-ops
+		// because the sheet is tombstoned.
+		appendPutValueValidated(session, 0, 5, 5, 100);
+		const snap = workbookSnapshot(session);
+		// Snapshot doesn't see the cell (because it doesn't see the
+		// tombstoned sheet at all).
+		assert.strictEqual(snap.sheets.length, 0,
+			'write to tombstoned sheet does NOT resurrect the sheet in snapshot');
+	});
+
+	test('double-delete is idempotent (CRDT no-op for re-delete)', () => {
+		const session = createSession(7805n);
+		addSheet(session, 'S');
+		deleteSheet(session, 0);
+		// Re-delete the same sheet -- napi succeeds; replay applies the
+		// second Op::RemoveSheet as a no-op (HashSet.insert idempotent).
+		deleteSheet(session, 0);
+		const snap = workbookSnapshot(session);
+		assert.strictEqual(snap.sheets.length, 0);
+		assert.ok(session.opCount() >= 3,
+			'all 3 ops (1 add + 2 delete) appended to the log');
+	});
+
+	test('delete with id > u16::MAX -> bad_argument', () => {
+		const session = createSession(7806n);
+		addSheet(session, 'S');
+		try {
+			deleteSheet(session, 70000);
+			assert.fail('expected throw for id > u16::MAX');
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			assert.strictEqual(info.code, 'bad_argument');
+			assert.ok(info.message.includes('65535'),
+				`expected u16 range message, got: ${info.message}`);
+		}
+	});
+
+	test('delete non-existent sheet id -> bad_argument', () => {
+		const session = createSession(7807n);
+		addSheet(session, 'OnlyOne');
+		try {
+			deleteSheet(session, 5);
+			assert.fail('expected throw for non-existent sheet');
+		} catch (err) {
+			const info = parseQuantbookError(err);
+			assert.strictEqual(info.code, 'bad_argument');
+			assert.ok(info.message.includes('does not exist'),
+				`expected existence-check message, got: ${info.message}`);
+		}
+	});
+
+	test('cross-peer delete via mergeBytes converges (idempotent)', () => {
+		// Peer A creates sheets + deletes sheet 1; peer B merges A's
+		// snapshot; peer B's workbookSnapshot omits sheet 1.
+		const sessA = createSession(7808n);
+		addSheet(sessA, 'S0');
+		addSheet(sessA, 'S1');
+		addSheet(sessA, 'S2');
+		deleteSheet(sessA, 1);
+
+		const sessB = createSession(7809n);
+		sessB.mergeBytes(sessA.exportBytes());
+
+		const snapB = workbookSnapshot(sessB);
+		assert.strictEqual(snapB.sheets.length, 2,
+			'peer B sees the tombstone after merge');
+		assert.deepStrictEqual(snapB.sheets.map(s => s.id), [0, 2]);
+	});
+
+	test('rename + delete preserve id stability for other sheets', () => {
+		// Verify id stability after delete: deleting sheet 1 leaves
+		// sheet 0 and sheet 2 with their original ids (NOT renumbered
+		// to 0 and 1).  Subsequent ops can still reference sheet 2 by
+		// its original id.
+		const session = createSession(7810n);
+		addSheet(session, 'A');
+		addSheet(session, 'B');
+		addSheet(session, 'C');
+		appendPutValueValidated(session, 2, 0, 0, 99);  // write to sheet 2
+		deleteSheet(session, 1);  // delete middle sheet
+		// Append another write to sheet 2 AFTER the delete -- if id
+		// stability was broken, this would land on the wrong sheet.
+		appendPutValueValidated(session, 2, 1, 0, 100);
+		const snap = workbookSnapshot(session);
+		// Find sheet 2 by id.
+		const sheet2 = snap.sheets.find(s => s.id === 2);
+		assert.ok(sheet2 !== undefined, 'sheet 2 survives delete-of-sheet-1');
+		assert.strictEqual(sheet2!.name, 'C');
+		assert.strictEqual(sheet2!.cells.length, 2,
+			'both writes to sheet 2 (pre- and post-delete) reach the same sheet');
+	});
+
+	test('round-trip via .qbook preserves tombstone', () => {
+		const session = createSession(7811n);
+		addSheet(session, 'Keep');
+		addSheet(session, 'Delete');
+		appendPutValueValidated(session, 0, 0, 0, 1);
+		deleteSheet(session, 1);
+
+		const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qbook-v3503b-'));
+		const target = path.join(scratchDir, 'tombstone.qbook');
+		try {
+			exportToQbook(session, target);
+			const reloaded = sessionFromQbook(target, 9999n);
+			const snap = workbookSnapshot(reloaded);
+			assert.strictEqual(snap.sheets.length, 1,
+				'.qbook round-trip preserves the tombstone (deleted sheet stays filtered)');
+			assert.strictEqual(snap.sheets[0].id, 0);
+			assert.strictEqual(snap.sheets[0].name, 'Keep');
+			assert.strictEqual(snap.sheets[0].cells.length, 1);
+		} finally {
+			try { fs.rmSync(scratchDir, { recursive: true, force: true }); } catch { /* test cleanup */ }
+		}
+	});
+
+	test('rename works on a not-yet-tombstoned sheet alongside a deleted one', () => {
+		// Defense-in-depth: ensure rename + delete cooperate; the
+		// rename should NOT accidentally affect the tombstoned sheet.
+		const session = createSession(7812n);
+		addSheet(session, 'A');
+		addSheet(session, 'B');
+		deleteSheet(session, 0);  // delete A
+		renameSheet(session, 1, 'B-renamed');  // rename B
+		const snap = workbookSnapshot(session);
+		assert.strictEqual(snap.sheets.length, 1);
+		assert.strictEqual(snap.sheets[0].id, 1);
+		assert.strictEqual(snap.sheets[0].name, 'B-renamed');
 	});
 });
 

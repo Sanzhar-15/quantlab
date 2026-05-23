@@ -182,6 +182,23 @@ export function renameSheet(session: CollabSessionInstance, id: number, newName:
 }
 
 /**
+ * **Phase 5.7 V3.5.0.3b (2026-05-24) -- typed wrapper for
+ * `CollabSession.deleteSheet`.**
+ *
+ * Append an `Op::RemoveSheet` to the session (tombstone the sheet at `id`).
+ * See the engine napi docstring (mirrored in
+ * {@link CollabSessionInstance.deleteSheet}) for the CRDT semantic
+ * (tombstone preserves id slot; cell writes to tombstoned sheet
+ * silently dropped; workbookSnapshot filters tombstones).
+ *
+ * Single-line indirection mirrors the addSheet / renameSheet /
+ * workbookSnapshot pattern for API surface stability.
+ */
+export function deleteSheet(session: CollabSessionInstance, id: number): void {
+	session.deleteSheet(id);
+}
+
+/**
  * **Phase 5.7 V3.5.0.2 (2026-05-24) -- typed wrapper for
  * `CollabSession.workbookSnapshot`.**
  *

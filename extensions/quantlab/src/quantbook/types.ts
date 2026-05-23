@@ -188,6 +188,37 @@ export interface CollabSessionInstance {
 	 */
 	renameSheet(id: number, newName: string): void;
 
+	/**
+	 * **Phase 5.7 V3.5.0.3b (2026-05-24)** -- append an `Op::RemoveSheet`
+	 * to this session (tombstone the sheet at `id`).
+	 *
+	 * **CRDT semantic (V3.5.0.3b decision lock)**: tombstone preserves
+	 * the sheet's id slot (subsequent ops can still reference it by id;
+	 * the cell-keyed apply_op handlers silently no-op writes to
+	 * tombstoned sheets).  Concurrent re-delete is idempotent.
+	 *
+	 * **workbookSnapshot filter**: tombstoned sheets are SKIPPED in
+	 * the returned snapshot (the IDE renderer doesn't see deleted
+	 * sheets).
+	 *
+	 * **Formula references**: V3.5.0.3b leaves cross-sheet formula
+	 * text intact (no `#REF!` substitution).  V3.6+ may extend
+	 * repair_sheet_rename_chain to rewrite references to deleted
+	 * sheets.
+	 *
+	 * **No restore**: V3.5.0.3b does not support undo-delete.  Cell
+	 * storage is preserved internally but no `restoreSheet` napi
+	 * exists.  V3.6+ may add this if a user-facing flow is justified.
+	 *
+	 * Use the typed wrapper {@link deleteSheet} from `./session`.
+	 *
+	 * @throws `[bad_argument]` if `id` exceeds u16 range OR refers to
+	 *         a non-existent sheet (already-tombstoned is OK -- the
+	 *         second delete is an idempotent no-op).
+	 * @throws `[session_oplog]` / `[session_replay]` per engine errors.
+	 */
+	deleteSheet(id: number): void;
+
 	/** Full snapshot export. Use for initial sync / handshake. */
 	exportBytes(): Uint8Array;
 
