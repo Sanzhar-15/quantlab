@@ -28,7 +28,7 @@
  */
 
 import type { CollabSessionInstance, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, SheetSnapshotJson, WorkbookSnapshotJson } from '../types';
-import { appendPutValueValidated, parseQuantbookError } from '../session';
+import { appendPutFormulaValidated, appendPutValueValidated, parseQuantbookError } from '../session';
 
 /**
  * V3.2.c.3 / V3.2.c.5 (2026-05-22) -- classification of a single
@@ -391,9 +391,35 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 		return;
 	}
 	try {
-		const parsed = parseCellRawInput(req.rawInput);
-		appendPutValueValidated(deps.session, req.sheet, req.row, req.col, parsed);
-		deps.onCommit();
+		// **Phase 5.7 V3.6.0.X audit-of-D5 OPUS-HIGH-1 closure (2026-05-24)**:
+		// route inputs starting with `=` to appendPutFormulaValidated.
+		// Mirrors Excel convention -- `=...` is a formula; anything else
+		// is a literal value.  Pre-closure ALL inputs (including
+		// `=SUM(A1:B10)` or `=A1+B1`) went through parseCellRawInput,
+		// which did Number("=A1+B1".trim()) -> NaN -> [bad_argument]
+		// errorReply.  The user could not enter formulas from the IDE
+		// even though the V3.6.0.6 D5 napi `appendPutFormula` existed.
+		// Post-closure: server-side prefix detection routes formula
+		// entry to the formula napi.  The webview-side endEdit envelope
+		// is UNCHANGED (still `{type:'putValue', rawInput}`); the host
+		// dispatcher does the classification.
+		//
+		// Trim before checking -- whitespace-then-`=` is still a formula
+		// per Excel.  But pass the ORIGINAL (un-trimmed-prefix) text to
+		// the engine so the formula source the user typed survives
+		// verbatim (the engine stores the text as-is and only trims at
+		// evaluation time).  Empty `=` alone is a malformed formula;
+		// the engine surfaces it via `#NAME?` evaluation, not a JS
+		// throw -- matches the appendPutFormulaValidated docstring's
+		// "any string is a valid formula at the wire level" semantic.
+		if (req.rawInput.trimStart().startsWith('=')) {
+			appendPutFormulaValidated(deps.session, req.sheet, req.row, req.col, req.rawInput);
+			deps.onCommit();
+		} else {
+			const parsed = parseCellRawInput(req.rawInput);
+			appendPutValueValidated(deps.session, req.sheet, req.row, req.col, parsed);
+			deps.onCommit();
+		}
 	} catch (err) {
 		const info = parseQuantbookError(err);
 		deps.onError({
@@ -715,9 +741,39 @@ export function extractSheetSnapshot(
 	const entries: { row: number; col: number; value: QuantbookCellValue; rendered?: string; formula?: string }[] = [];
 	for (const cell of sheet.cells) {
 		if (cell.value === undefined) {
-			// Formula-only cell.  Matches V3.4.0.2 export_snapshot's
-			// filter_map(state.value) behavior -- skip cells with no
-			// cached literal value.  V3.6+ can surface formulas here.
+			// **Phase 5.7 V3.6.0.X audit-of-D5 OPUS-HIGH-2 closure (2026-05-24)**:
+			// formula-only cell (Op::PutFormula without a coexisting
+			// Op::PutValue at the same coord -- the most natural shape
+			// produced by the V3.6.0.6 D5 appendPutFormula napi).  Pre-
+			// closure this branch `continue`d, silently DROPPING the
+			// cell from the entries array; the V3.6.0.6 D5
+			// data-raw-formula attribute therefore never emitted for
+			// such cells (the renderer never saw them).  Post-closure:
+			// pass through with value = { kind: 'pending' } so
+			// formatCellValue's existing pending case renders "(pending)"
+			// AND the formula text surfaces via data-raw-formula on
+			// click-to-edit (when present).  Mirrors the V3.6.0.X
+			// audit-of-D4 CONVERGENT-HIGH-3 pending-render strategy
+			// (engine-side pending values short-circuit pre-render so
+			// the IDE fallback fires).
+			//
+			// Cells with value=undefined AND formula=undefined would be
+			// fully-empty CellState entries; V3.4.0.X MEDIUM-1 closure
+			// removes those at the engine layer (extended V3.5.0.5 to
+			// format), so this branch only fires when formula is set.
+			if (cell.formula === undefined) {
+				continue;
+			}
+			const entry: { row: number; col: number; value: QuantbookCellValue; rendered?: string; formula?: string } = {
+				row: cell.row,
+				col: cell.col,
+				value: { kind: 'pending' },
+				formula: cell.formula,
+			};
+			if (cell.rendered !== undefined) {
+				entry.rendered = cell.rendered;
+			}
+			entries.push(entry);
 			continue;
 		}
 		const v = cell.value;

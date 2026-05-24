@@ -5288,12 +5288,19 @@ suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 		assert.deepStrictEqual(r.entries[0].value, { kind: 'pending' });
 	});
 
-	test('formula-only cell (value=undefined) -> SKIPPED (V3.4.0.X MEDIUM-1 carry)', () => {
+	test('formula-only cell (value=undefined, formula present) -> passes through with value=pending (V3.6.0.X audit-of-D5 OPUS-HIGH-2 closure)', () => {
+		// Pre-V3.6.0.X audit-of-D5 closure: formula-only cells were SKIPPED
+		// (V3.4.0.X MEDIUM-1 carry).  Post-closure: passed through with
+		// `value: { kind: 'pending' }` so the IDE renderer surfaces the
+		// cell and `data-raw-formula` attribute emits for click-to-edit.
+		// Cells where BOTH value AND formula are absent are still skipped
+		// (V3.4.0.X MEDIUM-1 closure removes such cells engine-side; the
+		// IDE skip is defensive).
 		const snap: WorkbookSnapshotJson = {
 			sheets: [{
 				id: 0, name: 'S', cells: [
 					{ row: 0, col: 0, value: { kind: 'number', number: 1 } },
-					{ row: 0, col: 1, formula: '=A1+1' }, // no value -> formula-only
+					{ row: 0, col: 1, formula: '=A1+1' }, // no value -> formula-only; passes through post-closure
 					{ row: 0, col: 2, value: { kind: 'number', number: 3 } },
 				],
 			}],
@@ -5301,9 +5308,13 @@ suite('quantbook V3.5.0.4b -- extractSheetSnapshot transformer', function () {
 			dateSystem: 'Excel1900',
 		};
 		const r = extractSheetSnapshot(snap, 0)!;
-		assert.strictEqual(r.entries.length, 2,
-			'formula-only cells dropped (mirrors V3.4.0.2 export_snapshot filter_map)');
-		assert.deepStrictEqual(r.entries.map(e => e.col), [0, 2]);
+		assert.strictEqual(r.entries.length, 3,
+			'formula-only cell passes through post HIGH-2 closure (was 2 pre-closure)');
+		assert.deepStrictEqual(r.entries.map(e => e.col), [0, 1, 2]);
+		assert.deepStrictEqual(r.entries[1].value, { kind: 'pending' },
+			'formula-only cell value defaults to pending');
+		assert.strictEqual(r.entries[1].formula, '=A1+1',
+			'formula text preserved on the passed-through entry');
 	});
 
 	test('unknown kind -> throws bad_argument (binding-drift signal)', () => {
@@ -5941,6 +5952,19 @@ suite('quantbook V3.5.0.7 -- presenceUpdate fires onLocalTyping (mid-edit-render
 // V3.4.0.X appendPutValue + V3.5.0.3a renameSheet napi contract tests.
 
 suite('quantbook V3.6.0.6 D5 -- appendPutFormulaValidated input validation', function () {
+	// V3.6.0.X audit-of-D5 OPUS-LOW-2 closure (2026-05-24): even though
+	// these tests exercise pure-TS validation logic in
+	// appendPutFormulaValidated, they currently couple to the engine
+	// binary via createSession.  shouldSkip() gates the suite so CI
+	// hosts without the engine binary still pass the test run instead
+	// of failing 6 validator tests they shouldn't.  Long-term refactor
+	// (V3.7+): wrap validators behind a mock session so the tests
+	// don't need the engine at all.
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
 	test('rejects negative sheet', () => {
 		const session = createSession(8601n);
 		assert.throws(
@@ -6239,6 +6263,203 @@ suite('quantbook V3.6.0.6 D5 -- buildHtml emits data-raw-formula', function () {
 			`data-raw-formula must precede data-raw-value in beginEdit body (got ${rawFormulaIdx} < ${rawValueIdx})`);
 		assert.ok(rawValueIdx < origTextIdx,
 			`data-raw-value must precede data-original-text in beginEdit body (got ${rawValueIdx} < ${origTextIdx})`);
+	});
+});
+
+// ============================================================================
+// Phase 5.7 V3.6.0.X audit-of-D5 closures (2026-05-24) -- OPUS HIGH-1 + HIGH-2 + HIGH-3
+// ============================================================================
+// Closes Opus Lane B audit findings on the V3.6.0.6 D5 ship surface.
+// Codex Lane A blocked by OrbStack Mac bridge outage; deferred to V3.7+
+// retrospective if user signal surfaces.
+
+suite('quantbook V3.6.0.X audit-of-D5 OPUS-HIGH-1 -- dispatcher routes = prefix to appendPutFormula', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	function makeDeps(session: CollabSessionInstance, sheet: number) {
+		const errorReplies: ErrorReplyMessage[] = [];
+		let commitCount = 0;
+		const deps = {
+			session,
+			sheet,
+			onCommit: () => { commitCount += 1; },
+			onError: (reply: ErrorReplyMessage) => { errorReplies.push(reply); },
+		};
+		return { deps, errorReplies, getCommitCount: () => commitCount };
+	}
+
+	test('rawInput starting with = routes to appendPutFormula; workbookSnapshot surfaces formula text', () => {
+		const session = createSession(9001n);
+		addSheet(session, 'S');
+		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
+		dispatchIncomingMessage(
+			{ type: 'putValue', sheet: 0, row: 0, col: 0, rawInput: '=A2+1' },
+			deps,
+		);
+		assert.strictEqual(getCommitCount(), 1, 'formula commit fired onCommit');
+		assert.strictEqual(errorReplies.length, 0,
+			`no errorReply on formula commit; got: ${JSON.stringify(errorReplies)}`);
+		const snap = workbookSnapshot(session);
+		const cell = snap.sheets[0].cells.find(c => c.row === 0 && c.col === 0);
+		assert.ok(cell !== undefined, 'PutFormula cell present in snapshot');
+		assert.strictEqual(cell!.formula, '=A2+1',
+			'rawInput=A2+1 routed to PutFormula not PutValue; formula text surfaces verbatim');
+	});
+
+	test('rawInput with leading whitespace + = still detected as formula (trimStart)', () => {
+		const session = createSession(9002n);
+		addSheet(session, 'S');
+		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
+		dispatchIncomingMessage(
+			{ type: 'putValue', sheet: 0, row: 0, col: 0, rawInput: '   =SUM(A1:B10)' },
+			deps,
+		);
+		assert.strictEqual(getCommitCount(), 1);
+		assert.strictEqual(errorReplies.length, 0);
+		const snap = workbookSnapshot(session);
+		const cell = snap.sheets[0].cells[0];
+		assert.strictEqual(cell.formula, '   =SUM(A1:B10)',
+			'engine stores formula text verbatim including the leading whitespace');
+	});
+
+	test('rawInput without = stays on putValue path (existing behavior preserved)', () => {
+		const session = createSession(9003n);
+		addSheet(session, 'S');
+		const { deps, errorReplies, getCommitCount } = makeDeps(session, 0);
+		dispatchIncomingMessage(
+			{ type: 'putValue', sheet: 0, row: 0, col: 0, rawInput: '42.5' },
+			deps,
+		);
+		assert.strictEqual(getCommitCount(), 1);
+		assert.strictEqual(errorReplies.length, 0);
+		const snap = workbookSnapshot(session);
+		const cell = snap.sheets[0].cells[0];
+		assert.strictEqual(cell.formula, undefined,
+			'non-formula input routes to PutValue; formula absent');
+		assert.ok(cell.value !== undefined, 'value populated');
+		assert.strictEqual(cell.value!.kind, 'number');
+		assert.strictEqual(cell.value!.number, 42.5);
+	});
+});
+
+suite('quantbook V3.6.0.X audit-of-D5 OPUS-HIGH-2 -- extractSheetSnapshot passes through formula-only cells as pending', function () {
+	test('formula-only cell -> entries[i].value = pending + formula text preserved', () => {
+		const snap: WorkbookSnapshotJson = {
+			sheets: [{
+				id: 0, name: 'S', cells: [
+					// formula-only cell (no value).
+					{ row: 0, col: 0, formula: '=A2+1' },
+					// pure-literal cell (no formula).
+					{ row: 0, col: 1, value: { kind: 'number', number: 7 } },
+				],
+			}],
+			formats: [],
+			dateSystem: 'Excel1900',
+		};
+		const result = extractSheetSnapshot(snap, 0);
+		assert.ok(result !== null);
+		assert.strictEqual(result!.entries.length, 2,
+			'formula-only cell NOT dropped post-closure (pre-closure was dropped via continue)');
+		const formulaCell = result!.entries[0];
+		assert.deepStrictEqual(formulaCell.value, { kind: 'pending' },
+			'formula-only cell surfaces with pending value (matches V3.6.0.X audit-of-D4 CONVERGENT-HIGH-3 pending strategy)');
+		assert.strictEqual(formulaCell.formula, '=A2+1',
+			'formula text passed through');
+		const literalCell = result!.entries[1];
+		assert.deepStrictEqual(literalCell.value, { kind: 'number', value: 7 });
+		assert.strictEqual(literalCell.formula, undefined);
+	});
+
+	test('formula-only cell renders via buildHtml with data-raw-formula attribute + (pending) display', () => {
+		const html = buildHtml({
+			snapshot_format_version: 1,
+			sheet: 0,
+			entries: [
+				{ row: 0, col: 0, value: { kind: 'pending' }, formula: '=A2+1' },
+			],
+		}, { nonce: 'nfp' });
+		// Display string for pending = "(pending)" (per formatCellValue's pending case).
+		assert.ok(html.includes('(pending)'),
+			'pending cell renders with "(pending)" display string');
+		// data-raw-formula attribute MUST emit for click-to-edit.
+		assert.ok(html.includes('data-raw-formula="=A2+1"'),
+			'data-raw-formula attribute emits even for formula-only cells post-HIGH-2 closure');
+		// data-raw-value carries the (pending) display string (used as the value-default raw rep).
+		assert.ok(html.includes('data-raw-value="(pending)"'),
+			'data-raw-value fallback also present');
+	});
+});
+
+suite('quantbook V3.6.0.X audit-of-D5 OPUS-HIGH-3 -- validate_u16_index on appendPutFormula + appendPutValue sheet param', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('engine appendPutFormula rejects NaN sheet (no silent ToUint32 coerce to 0)', () => {
+		const session = createSession(9011n);
+		addSheet(session, 'S');
+		assert.throws(
+			() => session.appendPutFormula(NaN, 0, 0, '=A1'),
+			/appendPutFormula: sheet/,
+			'NaN sheet must throw (pre-closure napi-rs u16 ToUint32 silently coerced NaN -> 0)',
+		);
+	});
+
+	test('engine appendPutFormula rejects Infinity sheet (no silent ToUint32 coerce to 0)', () => {
+		const session = createSession(9012n);
+		addSheet(session, 'S');
+		assert.throws(
+			() => session.appendPutFormula(Infinity, 0, 0, '=A1'),
+			/appendPutFormula: sheet/,
+		);
+	});
+
+	test('engine appendPutFormula rejects fractional sheet (no silent truncate)', () => {
+		const session = createSession(9013n);
+		addSheet(session, 'S');
+		assert.throws(
+			() => session.appendPutFormula(2.7, 0, 0, '=A1'),
+			/appendPutFormula: sheet must be an integer/,
+		);
+	});
+
+	test('engine appendPutFormula rejects sheet > u16::MAX with precise [bad_argument] error', () => {
+		const session = createSession(9014n);
+		addSheet(session, 'S');
+		assert.throws(
+			() => session.appendPutFormula(65536, 0, 0, '=A1'),
+			/u16::MAX/,
+			'65536 (just over u16::MAX) is rejected (pre-closure was rejected by napi-rs try_into too, but now via explicit validator with clearer message)',
+		);
+	});
+
+	test('engine appendPutValue gains symmetric sheet validation (NaN rejected; HIGH-3 closure extended to appendPutValue)', () => {
+		const session = createSession(9015n);
+		addSheet(session, 'S');
+		// V3.6.0.X audit-of-D5 OPUS-HIGH-3 closure also extends to appendPutValue
+		// for symmetry; pre-closure appendPutValue.sheet: u16 had the same silent
+		// coercion hazard.  Post-closure: validate_u16_index on both.
+		assert.throws(
+			() => session.appendPutValue(NaN, 0, 0, 42),
+			/appendPutValue: sheet/,
+			'symmetric closure: appendPutValue also gets validate_u16_index',
+		);
+	});
+
+	test('engine appendPutValue rejects 2^32 sheet (silent ECMAScript ToUint32 wrap closed)', () => {
+		const session = createSession(9016n);
+		addSheet(session, 'S');
+		// 2^32 = 4294967296; ECMAScript ToUint32 wraps to 0; pre-closure
+		// napi-rs u16 saw 0 (post-ToUint32 then try_into success).  Post-closure:
+		// f64 raw + validate_u16_index sees the literal 2^32 and rejects.
+		assert.throws(
+			() => session.appendPutValue(4294967296, 0, 0, 42),
+			/u16::MAX/,
+		);
 	});
 });
 
