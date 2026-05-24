@@ -559,16 +559,35 @@ pub struct CellSnapshotJson {
     /// **Phase 5.7 V3.6.0.5 D4 (2026-05-23)**: pre-rendered formatted
     /// string for the cell value, produced by the engine via
     /// `ql_functions::format::render(value, parsed_format,
-    /// eval_context)` where `eval_context.date_system =
-    /// WorkbookSnapshotJson.date_system` and `eval_context.locale =
-    /// EnUs` (V3.6.0.5 ships EN-US only; locale-aware deferred to
-    /// V3.6.1+).
+    /// eval_context)` where
+    /// `eval_context.date_system = workbook.date_system()`,
+    /// `eval_context.locale = workbook.locale()`, and
+    /// `eval_context.now_provider = NowProvider::System`.
+    ///
+    /// **V3.6.0.X audit-of-D4 closures**:
+    /// - CONVERGENT-MED-1: locale now flows from the workbook
+    ///   (post-closure; pre-closure was hardcoded `Locale::EnUs`).
+    ///   `format::render` ignores locale today (English month names
+    ///   hardcoded in `render.rs`) but the passthrough prevents
+    ///   silent forward-compat regression when locale-aware rendering
+    ///   lands at V3.6.1+.
+    /// - CONVERGENT-MED-2: per-snapshot parsed-format cache.
+    ///   `format::parse` runs ONCE per unique `FormatId` per
+    ///   `workbook_snapshot` call (was per-cell pre-closure).  V3.7+
+    ///   may promote the cache to `CollabSession` (cross-call) if
+    ///   profiling justifies.
+    /// - CONVERGENT-HIGH-3: short-circuits `is_pending()` values
+    ///   (pre-closure they rendered as `"0.00"` for number formats;
+    ///   post-closure rendered=None so the IDE's `"(pending)"`
+    ///   fallback fires).
     ///
     /// `None` when any of the following hold:
     /// - `format` is `None` (no format registered for this cell) ->
     ///   IDE falls back to value-based default rendering.
     /// - `value` is `None` (cell has formula but no evaluated value
     ///   yet) -> defer rendering until the formula evaluates.
+    /// - `value` `is_pending()` -> post-audit-of-D4 HIGH-3 closure;
+    ///   IDE shows `"(pending)"` via fallback.
     /// - `format` references a `FormatId` not in
     ///   `Workbook.formats()` (lookup miss; should not happen for
     ///   well-formed snapshots).
@@ -583,10 +602,19 @@ pub struct CellSnapshotJson {
     ///
     /// **CSP-safe**: the IDE renderer must `escapeHtml` the rendered
     /// string before inserting into `innerHTML` (V3.2.a discipline).
+    /// Both server-side `cellGridHtml::renderRows` + injected
+    /// client-side `renderRowsClient` apply `escapeHtml` to BOTH
+    /// the rendered path AND the value-default fallback path; CSP
+    /// invariant holds regardless of which branch fires.
     ///
-    /// **Per-call cost**: format::parse runs PER cell PER snapshot
-    /// call (no cache; V3.6 scale).  V3.7+ may cache parsed
-    /// `FormatString` keyed by format id on `CollabSession`.
+    /// **Edit-flow note (V3.6.0.X audit-of-D4 OPUS-HIGH-2)**: the
+    /// IDE consumer MUST emit a `data-raw-value` attribute carrying
+    /// the parseable raw representation (not the rendered display
+    /// string) for click-to-edit flows.  `parseCellRawInput` on
+    /// commit does `Number(trimmed)` which NaN's on engine-rendered
+    /// currency / percent / thousands / date strings.  See
+    /// `extensions/quantlab/src/quantbook/cellGrid/cellGridHtml.ts`
+    /// `renderRows` + `beginEdit` client function for the pattern.
     pub rendered: Option<String>,
 }
 

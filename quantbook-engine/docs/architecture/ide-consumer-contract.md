@@ -1540,14 +1540,14 @@ Closes R-V3.4-3 (DEFERRED at V3.4.0.5b -> KNOWN-GAP at V3.4.0.X via Opus M2 -> C
 - **R-V3.5-2 Partial-invalidate per-cell-op-index deferral** -- CLOSED at V3.6.0.4 D3 (engine `119df9b3826`).  New `cell_op_index` + `sheet_op_index` fields on `CollabSession` + new `OpLog::get(index)` random-access accessor + new `rebuild_op_indices_only` helper.  `invalidate_cell` now walks the union of cell-keyed + sheet-keyed indices (O(ops-for-this-cell * log N) via Loro `LoroList::get`) instead of the full op log (O(N)).  Design discovery (R-V3.6-10): positional indices shift under Loro UndoManager retracts; undo/redo refresh indices via `rebuild_op_indices_only` before the per-cell invalidate loop.  V3.6.0.X audit-of-D3 closures (Codex Lane A + Opus Lane B) closed 1 HIGH (invalidate_cell torn-write on Err mid-walk) + 2 MED (rebuild_op_indices_only tombstone parity; poll_remote_with_limit partial-error rebuild) + 1 LOW (OpLog::get O(1) -> O(log N) docstring correction).
 - **R-V3.5-3 Sheet-tabs UX gap (V3.5.0.4c not shipped)** -- ACCEPTED.  Multi-sheet UX adequately covered by V3.5.0.4a Command Palette commands (Add/Rename/Delete/Move Sheet) + V3.5.0.4b reactive panel title; sheet-tabs strip would be polish (faster switching) but NOT a correctness gap.  V3.5.1+ if user signal surfaces; otherwise folds into V3.6+ multi-tab redesign.
 - **R-V3.5-4 Format-aware rendering deferral** -- CLOSED at V3.6.0.5 D4 (engine `5b3017c70d2` + IDE `d7cb01557d4`) + V3.6.0.X audit-of-D4 closures (engine THIS commit).  Engine napi `workbook_snapshot` now populates `CellSnapshotJson.rendered` via `ql_functions::format::render(value, parsed_format, eval_context)` for cells with both a format AND a non-pending value.  EvalContext is built from the workbook (`workbook.date_system()` + `workbook.locale()` + `NowProvider::System`).  Per-snapshot parsed-format cache reuses the FormatString across cells sharing a FormatId.  IDE `cellGridHtml::renderRows` uses `e.rendered ?? formatCellValue(e.value)` with CSP-safe escapeHtml on both paths; new `data-raw-value` attribute carries the parseable raw representation for click-to-edit (post V3.6.0.X audit-of-D4 OPUS-HIGH-2 closure -- pre-closure `data-original-text` carried the engine-rendered string, breaking `parseCellRawInput` on currency/percent/thousands/date formats).  Pending cells skip pre-render (CONVERGENT-HIGH-3 closure -- avoids displaying not-yet-evaluated formulas as formatted zeros).  Workbook-level `Op::SetDateSystem` variant + replay handler closes V3.6.0.X audit-of-D4 CONVERGENT-HIGH-1 (Excel1904 .qbook envelopes were previously rendered with Excel1900 epoch).
-- **R-V3.5-5 Session-wide format registry deferral** -- CLOSED at V3.6.0.3 D2 (engine `ffa598a1c15` + IDE `b159c899359`).  New `format_table_cache: HashMap<FormatId, Arc<str>>` field on `CollabSession` + new `CacheEffect::RegisterFormat` walker variant + new `FormatDefJson` napi struct + additive `WorkbookSnapshotJson.formats: Vec<FormatDefJson>` field populated from `Workbook.formats().iter()` (authoritative; merges Builtin + Custom).  V3.6.0.X audit-of-D2 closure: sorted by FormatId for shape stability; cache walker first-write-wins + drops Builtin variants.  Format-aware buildHtml rendering still deferred to V3.6.0.5 D4.
+- **R-V3.5-5 Session-wide format registry deferral** -- CLOSED at V3.6.0.3 D2 (engine `ffa598a1c15` + IDE `b159c899359`).  New `format_table_cache: HashMap<FormatId, Arc<str>>` field on `CollabSession` + new `CacheEffect::RegisterFormat` walker variant + new `FormatDefJson` napi struct + additive `WorkbookSnapshotJson.formats: Vec<FormatDefJson>` field populated from `Workbook.formats().iter()` (authoritative; merges Builtin + Custom).  V3.6.0.X audit-of-D2 closure: sorted by FormatId for shape stability; cache walker first-write-wins + drops Builtin variants.  **Format-aware buildHtml rendering CLOSED at V3.6.0.5 D4 + V3.6.0.X audit-of-D4 closures** (see R-V3.5-4 above + § 4.1.z6 for full details).
 - **R-V3.5-6 Cross-restart PeerId reuse (R-V3.3-5 carryforward)** -- CLOSED at V3.4.0.4b via fresh-UUID-per-session (D5 deviation; documented in § 4.1.z4).
 - **R-V3.5-7 Mid-edit-render guard watchdog correctness** -- DOCUMENTED.  30s `PRESENCE_TYPING_WATCHDOG_MS` is the V3.5.0.7 ship default.  Stuck-true conditions (panel-hung / window-closed-mid-edit / webview-crash) auto-clear after 30s with logged warning.  Tunable if user feedback surfaces.
 
 #### Out of scope for V3.5
 
 - **Sheet-tabs UI scaffold** (V3.5.0.4c -- may defer to V3.5.1+; folds into V3.6+ multi-tab redesign if not shipped standalone)
-- **Format-aware buildHtml rendering** (V3.6+; number / date / currency / etc. format interpretation)
+- **Format-aware buildHtml rendering** SHIPPED at V3.6.0.5 D4 + V3.6.0.X audit-of-D4 closures (engine `e7931a74d0d` + IDE `b76b8266beb`; see § 4.1.z6).
 - **Session-wide RegisterFormat FormatTable cache** SHIPPED at V3.6.0.3 D2 (surfaces in `WorkbookSnapshotJson.formats: Vec<FormatDefJson>`, sorted by FormatId per V3.6.0.X audit-of-D2 CONVERGENT-MED-1 closure)
 - **Format-UI write-path** (V3.6+; napi `appendSetCellFormat` + commands like `quantbookSetCellFormat`)
 - **Per-cell op-index for indexed-lookup invalidate_cell** SHIPPED at V3.6.0.4 D3 (engine `119df9b3826`).  Per the above + V3.6.0.X audit-of-D3 closures.
@@ -1794,6 +1794,124 @@ Three additional minor findings noted but not fixed in-cycle:
 - ql-collab-ws: 42 (V3.4.0.X baseline) -> 42 (unchanged).
 
 **V3.5 ALL SHIPPED + AUDITED.**  V3.5.0.X megaudit closure complete + Lane B follow-up shipped 3 in-cycle defensive corrections (B-1/B-3/B-6) + Codex Lane A follow-up shipped 3 in-cycle MED + 2 partial LOW closures (CODEX-MED-2/3/4 + LOW-3/4 partial).  V3.5 plan archived; MASTER-PLAN swept.
+
+---
+
+### 4.1.z6 Loro UndoManager on_push + format registry + per-cell op-index + format-aware buildHtml rendering (Phase 5.7 V3.6, 2026-05-24)
+
+**Status**: V3.6.0.1 lock + V3.6.0.2 D1 + V3.6.0.3 D2 + V3.6.0.4 D3 + V3.6.0.5 D4 ALL SHIPPED + AUDITED.  V3.6.0.6 D5 (IDE `appendPutFormula` napi) is the next recommended sub-step.
+
+**Engine HEAD at this section's commit**: `e7931a74d0d` (V3.6.0.X audit-of-D4 closures).
+**IDE HEAD at this section's commit**: `b76b8266beb` (V3.6.0.X audit-of-D4 IDE).
+
+**Tests baseline**: ql-collab **136/136** + ql-oplog **67/67** + IDE mocha **354/354** + ql-collab-ws **42/42** (10 lib + 30 transport + 2 V3.1.a relay; +2 doctests separate) + engine workspace 99 test-result lines pass.
+
+#### V3.6.0.1 -- decision lock (9 D-decisions)
+
+Per V3.5.0.X Opus § F V3.6 ENTRY READINESS:
+
+| Decision | Choice | Sub-step |
+|---|---|---|
+| **D1** Loro UndoManager on_push wiring | Replace V3.5.0.X conservative `pure_local_frontier` gate with Loro 1.12.0 `set_on_push` callback; encode affected cells as `LoroValue::List<List<I64>>` into `UndoItemMeta::value`; undo/redo use `top_undo_meta`/`top_redo_meta` to pre-read cells | V3.6.0.2 |
+| **D2** Session-wide RegisterFormat FormatTable cache | New `format_table_cache: HashMap<FormatId, Arc<str>>` + new `CacheEffect::RegisterFormat` variant + new `FormatDefJson` napi struct + `WorkbookSnapshotJson.formats: Vec<FormatDefJson>` additive field | V3.6.0.3 |
+| **D3** Per-cell op-index for invalidate_cell | New `cell_op_index: HashMap<(u16,u32,u32), Vec<usize>>` + new `sheet_op_index: HashMap<u16, Vec<usize>>` + `CacheBuckets<'a>` struct + new `OpLog::get(idx)` accessor + `rebuild_op_indices_only` helper for post-undo refresh | V3.6.0.4 |
+| **D4** Format-aware buildHtml rendering | Engine-side `format::render` integration in `workbook_snapshot`; new `CellSnapshotJson.rendered: Option<String>` + `WorkbookSnapshotJson.dateSystem: String` additive fields; IDE `cellGridHtml::renderRows` uses `e.rendered ?? formatCellValue(e.value)` | V3.6.0.5 |
+| **D5** IDE-facing `appendPutFormula` napi | Thin wrapper over existing `Op::PutFormula`; unblocks end-to-end repaired-formula integration tests | V3.6.0.6 PENDING |
+| **D6** Incremental WorkbookSnapshot deltas | Time-boxed profiling spike; ship D6 only if profiling justifies | V3.6.0.7 PENDING |
+| **D7** `#REF!` substitution for cross-sheet refs to deleted sheets | DEFER until user signal | V3.6.0.8 PENDING |
+| **D8** `Op::RestoreSheet` un-delete | DEFER until user signal | V3.6.0.9 PENDING |
+| **D9** Sheet-tabs UX + typing-stroke watchdog | DEFER sheet-tabs to V3.6+ multi-tab redesign; typing-stroke watchdog ship-on-signal | V3.6.0.10 CONDITIONAL |
+
+#### V3.6.0.2 D1 -- Loro UndoManager on_push callback wiring (engine `89f5a5f9e0b`)
+
+REMOVES V3.5.0.X `pure_local_frontier` field + dispatch gate.  Adds `pending_undo_cells: Arc<Mutex<Option<Vec<(u16, u32, u32)>>>>` field + on_push closure encoding cells as `LoroValue::List<List<I64>>` into `UndoItemMeta::value`.  `undo()` / `redo()` read `top_undo_meta()` / `top_redo_meta()` BEFORE Loro's call + pre-stage cells for the synthetic inverse op's on_push.  V3.5.0.X regression tests REWRITTEN to verify partial-invalidate FIRES correctly (not full-rebuild fallback) under remote-interleave.
+
+**V3.6.0.X audit-closure** (engine `08964962cf8`; transcript at `docs/audits/2026-05-24-phase-5-7-v3-6-0-2-codex.md`, Opus Lane B inline in commit): CONVERGENT-HIGH closed in-cycle.  Loro's `push_with_merge` (loro-internal-1.12.0/src/undo.rs:389-396) DISCARDS subsequent meta when merging spans during a grouped push — only the FIRST push's meta survives.  Closure: new `inside_group: bool` + `undo_merge_interval_ms: i64` fields; conservative full-rebuild fallback when merge-prone.  Clean fix (`set_top_undo_meta`) blocked because the API isn't exposed on public `loro::UndoManager`; deferred to V3.6+ pending upstream contribution.
+
+#### V3.6.0.3 D2 -- Session-wide RegisterFormat FormatTable cache (engine `ffa598a1c15` + IDE `b159c899359`)
+
+New `format_table_cache: HashMap<FormatId, Arc<str>>` field on `CollabSession`.  New `CacheEffect::RegisterFormat { id, string }` variant + walker integration.  New `FormatDefJson { id: FormatIdJson, string: String }` napi struct + `WorkbookSnapshotJson.formats: Vec<FormatDefJson>` additive field populated from `Workbook.formats().iter()` (authoritative; merges Builtin 0..=163 range + Custom).  IDE typed wrapper + +4 mocha (350/350) + +2 ql-collab regression (119/119).
+
+**V3.6.0.X audit-of-D2** (transcripts at `docs/audits/2026-05-23-phase-5-7-v3-6-0-3-{codex,opus}.md`; both PASS-WITH-FINDINGS; engine `8480f247aea` + IDE `21fe6a73ec6`): 3 convergent findings closed in-cycle.
+- **CONVERGENT-HIGH-1** (Opus HIGH-1 / Codex MED-3): cache walker LWW (`insert`) -> first-write-wins (`entry().or_insert`); mirrors `FormatTable::register_at`'s `IdCollision` rejection at the cache layer.  Closes V3.6.0.1 plan body § D2 locked decision violation.
+- **CONVERGENT-MED-1** (Codex MED-1 / Opus MED-2): `workbook_snapshot.formats` sorted by FormatId (Builtin variants first, then Custom by `(peer, counter)`) before returning.  Pre-closure was non-deterministic HashMap iter order.
+- **CONVERGENT-MED-2** (Codex MED-2 / Opus MED-1+MED-3): `collect_cache_effects` drops Builtin variant `Op::RegisterFormat` payloads at the cache walker.  Workbook-side `register_at` still accepts in-range Builtins (Phase 4.6 D-1 semantic; deferred V3.7+).
+
+#### V3.6.0.4 D3 -- Per-cell op-index + CacheBuckets refactor (engine `119df9b3826`)
+
+Closes V3.5.0.6 R-V3.5-2 perf gap.  New `cell_op_index: HashMap<(u16,u32,u32), Vec<usize>>` + `sheet_op_index: HashMap<u16, Vec<usize>>` fields on `CollabSession`.  New `CacheBuckets<'a>` struct bundling 5 mutable refs (closes Opus LOW-1 from V3.6.0.X audit-of-D2).  New `OpLog::get(index) -> Option<Result<Op, OpLogError>>` accessor on ql-oplog.  New `rebuild_op_indices_only()` helper called by `undo()` + `redo()` BEFORE the per-cell `invalidate_cell` loop (necessary because Loro's UndoManager retract COMPACTS the visible op list, shifting positional indices -- design discovery documented as R-V3.6-10).  `invalidate_cell` rewritten to walk `cell_op_index[(s,r,c)] ∪ sheet_op_index[s]` instead of full log walk.  +6 ql-collab regression tests (130/130).
+
+**V3.6.0.X audit-of-D3** (transcripts at `docs/audits/2026-05-23-phase-5-7-v3-6-0-4-{codex,opus}.md`; engine `f6ef41ad732`): 4 in-cycle closures.
+- **CONVERGENT-HIGH-1** (Opus HIGH-1 / Codex LOW-2): `invalidate_cell` atomic-swap.  Pre-closure `last_snapshot.remove(target_key)` ran unconditionally at entry; fallible `OpLog::get` mid-walk produced a torn-write hazard.  Post-closure: defer the remove until after all fallible lookups succeed; build into local snapshot + atomic-swap.
+- **CONVERGENT-MED-2** (Codex MED-2 / Opus MED-1): `rebuild_op_indices_only` rewritten to use `apply_cache_effect` (canonical walker) for tombstone parity with `rebuild_snapshot_cache`.  Also added `cell_op_index.retain(|(sheet,_,_),_| *sheet != id)` to RemoveSheet handler (prunes ghost index entries for cells on tombstoned sheets).
+- **Codex MED-1**: `poll_remote_with_limit` partial-error rebuild.  Track first drain error; if `merged > 0`, run `rebuild_snapshot_cache` before propagating; skip auto-flush on error path.
+- **Codex LOW-1**: `OpLog::get` docstring corrected from "O(1)" to "O(log N) BTree lookup" per Loro 1.12.0's actual `LengthFinder`-over-`generic_btree::BTree` impl.
+
+#### V3.6.0.5 D4 -- Format-aware buildHtml rendering (engine `5b3017c70d2` + IDE `d7cb01557d4`)
+
+New `CellSnapshotJson.rendered: Option<String>` additive field populated via `ql_functions::format::render(value, parsed_format, eval_context)` for cells with both a format AND a non-pending value (post audit-of-D4 closures).  EvalContext is built from the workbook: `date_system` (post-audit Op::SetDateSystem-aware) + `locale` + `now_provider = NowProvider::System`.  New `WorkbookSnapshotJson.dateSystem: String` additive field (`"Excel1900"` | `"Excel1904"`).  IDE: `types.ts` extended (`CellSnapshotJson.rendered?: string` + `WorkbookSnapshotJson.dateSystem: 'Excel1900' | 'Excel1904'`).  `cellGridHtml::renderRows` + `renderRowsClient` use `e.rendered ?? formatCellValue(e.value)` with CSP-safe `escapeHtml` on both paths.  +4 mocha shape tests (354/354).
+
+**V3.6.0.X audit-of-D4** (transcripts at `docs/audits/2026-05-24-phase-5-7-v3-6-0-5-{codex,opus}.md`; both FAIL verdict; engine `e7931a74d0d` + IDE `b76b8266beb`): the most serious audit verdict in V3.6 cycle.  6 in-cycle closures.
+- **CONVERGENT-HIGH-1** (both lanes empirically probed): new `Op::SetDateSystem` wire variant + `DateSystemWire` enum (Excel1900 | Excel1904 | Unknown(String)) + replay handler + `from_qbook` seeds the op when loaded workbook's date_system != default.  Mirrors `Op::SetLocale` + `LocaleWire` pattern (W5-146).  Pre-closure Excel1904 workbooks rendered with Excel1900 epoch (1462-day off-by-one); `from_qbook` discarded the loaded workbook entirely.  R-V3.6-11 documented.
+- **OPUS-HIGH-2** (Codex missed): new IDE `data-raw-value` attribute carries the parseable raw representation for click-to-edit.  `beginEdit` reads it first; falls back to `data-original-text` for backward compat.  Pre-closure `data-original-text` was the engine-rendered display string; `parseCellRawInput` then `Number(trimmed)` -> NaN -> error on Enter for currency/percent/thousands/date formats.  R-V3.6-12 documented.
+- **CONVERGENT-HIGH-3** (Opus HIGH-3 / Codex MED-1): short-circuit pre-render when `wire_value.is_pending()`.  IDE "(pending)" fallback preserved.  Pre-closure pending+format cells displayed as formatted zero.  R-V3.6-13 documented.
+- **CONVERGENT-MED-1**: thread `workbook.locale()` through EvalContext (prevents silent forward-compat regression at V3.6.1+ when locale-aware rendering lands).
+- **CONVERGENT-MED-2**: per-snapshot parsed-format cache (`HashMap<FormatId, FormatString>` populated lazily; reuses across cells sharing FormatId).
+- **CONVERGENT-MED-3**: ide-consumer-contract sweep (R-V3.5-4 marked CLOSED; D4 "deferred" updated to SHIPPED).  Plus Opus LOW-2 dropped `.to_string()` + Opus LOW-3 fixed TS docstring `date_system` -> `dateSystem` (napi-rs camelCase).
+
+#### V3.6 risk register (R-V3.6-1..13)
+
+The plan body at `.plans/_active.md` lines 286-314 is the authoritative source.  Summary:
+
+- **R-V3.6-1** Loro on_pop callback re-entrancy.  CLOSED at V3.6.0.2 via Mutex-drain-then-invalidate pattern.
+- **R-V3.6-2** FormatTable cache invariant maintenance.  CLOSED at V3.6.0.3 via 6-mutation-site discipline + atomic-swap.
+- **R-V3.6-3** cell_op_index sync invariant.  CLOSED at V3.6.0.4 via per-effect index push + dedup-on-equality.
+- **R-V3.6-4** Format-aware rendering locale/date_system propagation.  CLOSED at V3.6.0.5 D4 + V3.6.0.X audit-of-D4 closures (CONVERGENT-HIGH-1 Op::SetDateSystem + CONVERGENT-MED-1 locale passthrough).
+- **R-V3.6-5** Incremental snapshot delta freshness.  V3.6.0.7 D6 spike open.
+- **R-V3.6-6** OnPush callback DiffEvent inspection cost.  Profiled OK at V3.6.0.2; no regression.
+- **R-V3.6-7** pure_local_frontier removal regression.  CLOSED at V3.6.0.2 via rewritten V3.5.0.X regression tests.
+- **R-V3.6-8** napi struct evolution.  CLOSED across V3.6.0.3 + V3.6.0.5 via additive-only fields (formats, dateSystem, rendered all additive).
+- **R-V3.6-9** #REF! substitution + Op::RestoreSheet interaction.  Conditional D7+D8; not yet shipped.
+- **R-V3.6-10** cell_op_index positional-index fragility under Loro retract.  DISCOVERED at V3.6.0.4 D3; CLOSED via `rebuild_op_indices_only` helper called by undo/redo before invalidate.
+- **R-V3.6-11** dateSystem propagation requires Op::SetDateSystem.  DISCOVERED at V3.6.0.X audit-of-D4; CLOSED via Op::SetDateSystem variant + replay handler + from_qbook seed.
+- **R-V3.6-12** IDE click-to-edit broken for engine-rendered display strings.  DISCOVERED at V3.6.0.X audit-of-D4 (Opus); CLOSED via `data-raw-value` attribute.
+- **R-V3.6-13** Pending values + format render as formatted zero.  DISCOVERED at V3.6.0.X audit-of-D4 (Codex+Opus); CLOSED via short-circuit on `is_pending()`.
+
+#### V3.6 audit transcripts
+
+| Sub-step | Codex | Opus |
+|---|---|---|
+| V3.6.0.2 D1 | `2026-05-24-phase-5-7-v3-6-0-2-codex.md` | inline in commit `08964962cf8` / plan body |
+| V3.6.0.3 D2 | `2026-05-23-phase-5-7-v3-6-0-3-codex.md` | `2026-05-23-phase-5-7-v3-6-0-3-opus.md` |
+| V3.6.0.4 D3 | `2026-05-23-phase-5-7-v3-6-0-4-codex.md` | `2026-05-23-phase-5-7-v3-6-0-4-opus.md` |
+| V3.6.0.5 D4 | `2026-05-24-phase-5-7-v3-6-0-5-codex.md` | `2026-05-24-phase-5-7-v3-6-0-5-opus.md` |
+| Docs audit | `2026-05-24-phase-5-7-docs-audit-codex.md` | `2026-05-24-phase-5-7-docs-audit-opus.md` |
+
+Date inconsistency note: V3.6.0.3 + V3.6.0.4 transcripts dated 2026-05-23 (per work-start session date); V3.6.0.2 + V3.6.0.5 + docs-audit dated 2026-05-24.  This is a known low-severity drift; convention going forward: filename date = audit execution date (post-midnight transitions retain the original session's date in the header).
+
+#### Out of scope for V3.6
+
+- **V3.6.0.6 D5 IDE-facing `appendPutFormula` napi** (next recommended sub-step; ~1 session per Opus § F.5).
+- **V3.6.0.7 D6 incremental snapshot deltas** (profiling spike pending; ship D6 only if cost > 50ms/call at V3.6 scale).
+- **V3.6.0.8 D7 `#REF!` substitution** (conditional on user signal; engine-side extends `repair_sheet_chain` at `rebuild_workbook` time).
+- **V3.6.0.9 D8 `Op::RestoreSheet`** (conditional on user signal; cell storage preserved internally).
+- **V3.6.0.10 D9 sheet-tabs UI / typing-stroke watchdog** (sheet-tabs deferred to V3.6+ multi-tab redesign; typing-stroke watchdog ship-on-signal).
+- **V3.6.0.X phase-termination audit** at V3.6.0.10 ship (broad scope; parallel Codex + Opus).
+- **V3.6.1+** locale-aware format rendering (`format::render` grows locale conditionals).
+- **V3.7+** stable-op-ID OpLog API (closes R-V3.6-10 long-term fix; would let cell_op_index survive Loro UndoManager retracts without rebuild).
+- **V3.7+** `appendSetCellFormat` + `appendRegisterFormat` napi (unblocks mocha end-to-end format::render integration tests).
+
+#### Live smoke procedure (V3.6.0.X audit-of-D4 user-action gap closure)
+
+Mirrors V3.5.0.9 § 4.1.z5 procedure with V3.6 additions:
+
+1. Open `.qbook` file containing Excel1904 envelope (test fixture: any V3.6.0.X regression test with `wb.set_date_system(DateSystem::Excel1904)`).  Verify cell-grid panel shows `WorkbookSnapshotJson.dateSystem === "Excel1904"` via debug overlay.
+2. Add `Op::RegisterFormat { id: Custom, string: "$#,##0.00" }` + `Op::SetCellFormat` + `Op::PutValue(1234.56)`.  Verify cell displays `"$1,234.56"`.
+3. Click the cell.  Verify the edit-mode `<input>` shows `"1234.56"` (raw value, not the rendered display string).  Type `2345.67` + Enter.  Verify the cell re-renders as `"$2,345.67"`.
+4. Set up two windows on the same `.qbook`.  Window A: register Custom format id `0` with string `"FromA"`.  Window B: independently register the same Custom id `0` with string `"FromB"`.  Sync.  Verify both peers' `format_table_cache` end up with `"FromA"` (first-write-wins post V3.6.0.X audit-of-D2 closure).
+5. Append a formula cell with no evaluated value (`CellWireValue::Pending`) AND a number format.  Verify cell displays `"(pending)"` not `"0.00"` (post V3.6.0.X audit-of-D4 CONVERGENT-HIGH-3 closure).
+6. Undo a multi-cell BatchCommit.  Verify all cells in the batch invalidate correctly (post V3.6.0.X audit-of-D2 grouped-undo closure).
+7. (V3.6.0.6 D5 future): emit `Op::PutFormula` via `appendPutFormula` napi.  Rename source sheet.  Verify the cell's formula text surfaces with the repaired reference (closes V3.5.0.X A-HIGH-2 IDE-level verification gap).
 
 ---
 

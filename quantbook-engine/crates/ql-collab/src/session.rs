@@ -665,8 +665,10 @@ pub struct CollabSession {
     /// - `(u16, u32, u32)`: tuple of `Copy + 'static` integers.
     ///   Trivially `Send + Sync`.
     /// - `CellState`: per its own per-field walk docstring above,
-    ///   `Send + Sync` (composition of two `Option<T>` fields whose
-    ///   inner types are both `Send + Sync`).
+    ///   `Send + Sync` (composition of THREE `Option<T>` fields --
+    ///   `value: Option<CellWireValue>` + `formula: Option<String>` +
+    ///   `format: Option<FormatId>` added at V3.5.0.5 D1 -- whose
+    ///   inner types are all `Send + Sync`).
     ///
     /// Therefore `last_snapshot: Send + Sync`.  Inherits external
     /// synchronization from `Arc<Mutex<CollabSession>>` (V2.4 audit;

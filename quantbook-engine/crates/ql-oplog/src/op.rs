@@ -7,16 +7,22 @@
 //!
 //! Each variant mirrors a `Workbook` mutation method one-to-one:
 //!
-//! | `Op` variant       | Replays to                                       |
-//! |--------------------|--------------------------------------------------|
-//! | `PutValue`         | `Workbook::put_at`                               |
-//! | `PutFormula`       | `Workbook::put_formula`                          |
-//! | `ClearFormula`     | `Workbook::clear_formula`                        |
-//! | `SetName`          | `Workbook::set_name`                             |
-//! | `AddSheet`         | `Workbook::add_sheet_with_chunk_rows`            |
-//! | `RegisterFormat`   | `FormatTable::register_at` (W5-80)               |
-//! | `SetCellFormat`    | `CellFormatOverlay::set` / `::clear` (W5-80)     |
-//! | `BatchCommit`      | (recursive — applies each inner op in order)     |
+//! | `Op` variant         | Replays to                                       |
+//! |----------------------|--------------------------------------------------|
+//! | `PutValue`           | `Workbook::put_at`                               |
+//! | `PutFormula`         | `Workbook::put_formula`                          |
+//! | `ClearFormula`       | `Workbook::clear_formula`                        |
+//! | `SetName`            | `Workbook::set_name`                             |
+//! | `AddSheet`           | `Workbook::add_sheet_with_chunk_rows`            |
+//! | `RegisterFormat`     | `FormatTable::register_at` (W5-80)               |
+//! | `SetCellFormat`      | `CellFormatOverlay::set` / `::clear` (W5-80)     |
+//! | `BatchCommit`        | (recursive — applies each inner op in order)     |
+//! | `RenameSheet`        | `Workbook::rename_sheet` (Phase 4.6.C / 5.3 step 3) |
+//! | `RemoveSheet`        | `Workbook::remove_sheet` (V3.5.0.3b tombstone)   |
+//! | `MoveSheet`          | `Workbook::move_sheet` (V3.5.0.3c display-order overlay) |
+//! | `SetReferenceMode`   | `Workbook::set_reference_mode` (W5-146 Phase 4.9.J) |
+//! | `SetLocale`          | `Workbook::set_locale` (W5-146 Phase 4.9.J)      |
+//! | `SetDateSystem`      | `Workbook::set_date_system` (V3.6.0.X audit-of-D4 CONVERGENT-HIGH-1 closure) |
 //!
 //! ## Wire format choices
 //!
@@ -568,6 +574,13 @@ impl<'de> serde::Deserialize<'de> for LocaleWire {
 ///
 /// Save-side `from_runtime` only emits canonical variants; the
 /// `Unknown` form is read-side only.
+///
+/// **Rule 4 per-field walk** (per V2 V4 V1 step 3 audit-discipline
+/// + V3.6.0.X audit-of-D4 doc-audit MED-5 closure): variants are
+/// `Excel1900` + `Excel1904` (unit variants; trivially Send + Sync)
+/// + `Unknown(String)` (composition over `String`, which is
+/// `Send + Sync` per stdlib).  All three variants positive
+/// Send + Sync.  Arc terminus stays at 6; 0 new triggers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DateSystemWire {
     Excel1900,
