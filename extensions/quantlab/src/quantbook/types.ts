@@ -121,28 +121,50 @@ export interface CellSnapshotJson {
 	 * formatted string for this cell value.
 	 *
 	 * Populated by the engine via `ql_functions::format::render(value,
-	 * parsed_format, eval_context)` where `eval_context.date_system`
-	 * comes from the workbook (see {@link WorkbookSnapshotJson.dateSystem})
-	 * and `eval_context.locale = EnUs` (V3.6.0.5 ships EN-US only;
-	 * locale-aware deferred to V3.6.1+).
+	 * parsed_format, eval_context)` where:
+	 * - `eval_context.date_system` comes from the workbook (see
+	 *   {@link WorkbookSnapshotJson.dateSystem}).
+	 * - `eval_context.locale` comes from the workbook (post
+	 *   V3.6.0.X audit-of-D4 CONVERGENT-MED-1 closure; pre-closure
+	 *   was hardcoded `EnUs`).  Render layer ignores locale today
+	 *   (English month names hardcoded) but the passthrough prevents
+	 *   silent forward-compat regression when locale-aware rendering
+	 *   lands at V3.6.1+.
+	 * - `eval_context.now_provider = System` (NOW()/TODAY() in
+	 *   format strings get system clock).
 	 *
-	 * **`undefined` cases** (silent fallback per Phase 5.6 conservative
-	 * discipline; IDE consumer falls back to value-based default
-	 * rendering when `rendered` is absent):
+	 * **Per-call cost** (post V3.6.0.X audit-of-D4 CONVERGENT-MED-2
+	 * closure): `format::parse` runs ONCE per unique `FormatId` per
+	 * `workbookSnapshot()` call via per-snapshot parsed-format cache.
+	 * Pre-closure: per-cell parse.  V3.7+ may promote the cache to
+	 * `CollabSession` for cross-call reuse if profiling justifies.
+	 *
+	 * **`undefined` cases** (silent fallback per Phase 5.6
+	 * conservative discipline; IDE consumer falls back to
+	 * value-based default rendering when `rendered` is absent):
 	 * - cell has no `format` (no format registered)
 	 * - cell has no `value` (formula-only cell awaiting evaluation)
-	 * - cell's `format` id is missing from `WorkbookSnapshotJson.formats`
+	 * - cell value `is_pending()` (post V3.6.0.X audit-of-D4
+	 *   CONVERGENT-HIGH-3 closure: pending cells skip pre-render so
+	 *   the IDE's `"(pending)"` fallback fires; pre-closure pending
+	 *   cells with number formats rendered as `"0.00"`)
+	 * - cell's `format` id is missing from
+	 *   {@link WorkbookSnapshotJson.formats}
 	 * - the registered format string fails to parse (V2 token,
 	 *   malformed grammar)
 	 * - cell value carries an unknown error sigil
 	 *
 	 * **CSP-safe consumer contract**: IDE renderers MUST `escapeHtml`
-	 * the rendered string before inserting into innerHTML (per the V3.2.a
-	 * webview discipline).
+	 * the rendered string before inserting into innerHTML (per the
+	 * V3.2.a webview discipline).
 	 *
-	 * **Per-call cost**: format::parse runs PER cell PER snapshot call
-	 * (no engine-side cache at V3.6.0.5).  V3.7+ may cache parsed
-	 * FormatString keyed by format id on CollabSession.
+	 * **Edit-flow note** (V3.6.0.X audit-of-D4 OPUS-HIGH-2 closure):
+	 * IDE consumers presenting click-to-edit MUST source the input
+	 * value from `data-raw-value` (the parseable raw representation),
+	 * NOT from the rendered display string -- `parseCellRawInput` does
+	 * `Number(trimmed)` which NaN's on `"$1,234.56"` / `"50.00%"` /
+	 * `"1,234"` / date strings.  See `cellGridHtml.ts` `renderRows`
+	 * + `beginEdit` client function for the pattern.
 	 */
 	rendered?: string;
 }
@@ -229,12 +251,18 @@ export interface WorkbookSnapshotJson {
 	 * closure: deterministic + stable shape across snapshots (hashable,
 	 * diffable, JSON-stringify-equal).
 	 *
-	 * **V3.6.0.5 D4 format-aware buildHtml rendering** will look up
-	 * each cell's `format: FormatIdJson` against this list to find the
-	 * matching format string (e.g., `"0.00%"`, `"yyyy-mm-dd"`).  D4
-	 * renderers should build a `Map<string, string>` indexed by
-	 * stringified `FormatIdJson` (e.g., `"builtin:0"` /
-	 * `"custom:peer_hex:counter"`) rather than indexing by position.
+	 * **V3.6.0.5 D4 format-aware buildHtml rendering SHIPPED**: the
+	 * engine pre-renders cells with format + value via
+	 * `ql_functions::format::render` (post-D4 audit-of-D4 closures:
+	 * locale passthrough + per-snapshot parse cache + Pending skip).
+	 * IDE consumers should PREFER {@link CellSnapshotJson.rendered}
+	 * (engine-pre-rendered display string) over walking
+	 * `formats[]` themselves.  The `formats[]` array stays for:
+	 * (a) registry / debug / fixture-introspection use cases,
+	 * (b) V3.7+ direct-rendering scenarios (e.g., format-picker
+	 *     UI showing format strings to the user),
+	 * (c) consumers needing the format string for their own
+	 *     external rendering pipelines.
 	 */
 	formats: FormatDefJson[];
 	/**
