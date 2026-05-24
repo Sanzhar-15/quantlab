@@ -190,6 +190,56 @@ fn validate_u32_index(method: &str, name: &str, value: f64) -> Result<u32> {
     Ok(value as u32)
 }
 
+/// **Phase 5.7 V3.6.0.X audit-of-D5 OPUS-HIGH-3 closure (2026-05-24)**:
+/// u16 equivalent of [`validate_u32_index`].  Used by `appendPutValue` +
+/// `appendPutFormula` for the `sheet: f64` parameter.
+///
+/// The V1 audit Opus H2 finding identified a class of silent coercions
+/// at the FFI boundary when napi-rs auto-converts JS Numbers to a
+/// typed unsigned integer.  The V1 closure addressed `u32` (row/col)
+/// via [`validate_u32_index`] but a docstring at
+/// `crates/ql-bindings-node/src/lib.rs::CollabSession::append_put_value`
+/// (pre V3.6.0.X audit-of-D5) incorrectly claimed the class didn't
+/// apply at `u16`.  Opus Lane B verified by reading napi-rs 3.9.0's
+/// `FromNapiValue for u16`: it routes through `napi_get_value_uint32`
+/// (ECMAScript ToUint32) THEN `try_into::<u16>()`.  ToUint32 itself
+/// silently coerces NaN/Infinity to 0, negatives to two's-complement
+/// wrap, fractions to truncate-toward-zero, and values >= 2^32 modulo
+/// 2^32.  `try_into::<u16>()` then only rejects post-ToUint32 values
+/// in [65536, 2^32) -- so the [0, 65535] in-range silent corruptions
+/// (NaN -> 0; 0.5 -> 0; 2.7 -> 2; 2^32 -> 0; 65535.9 -> 65535) are
+/// NOT rejected.  Same hazard class as the V1 finding, surfacing on
+/// `appendPutValue.sheet` + `appendPutFormula.sheet`.
+///
+/// Closure: take `sheet` as `f64` (raw `napi_get_value_double` -- no
+/// coercion) and validate finite + non-negative + integer + <= 65535
+/// here, before casting to `u16`.  Direct callers that bypass the
+/// IDE TS wrapper see precise `[bad_argument]` JS Errors instead of
+/// silently corrupted writes to the wrong sheet.
+fn validate_u16_index(method: &str, name: &str, value: f64) -> Result<u16> {
+    if !value.is_finite() {
+        return Err(bad_argument_error(format!(
+            "{method}: {name} must be a finite non-negative integer, got {value}"
+        )));
+    }
+    if value < 0.0 {
+        return Err(bad_argument_error(format!(
+            "{method}: {name} must be a non-negative integer, got {value}"
+        )));
+    }
+    if value.fract() != 0.0 {
+        return Err(bad_argument_error(format!(
+            "{method}: {name} must be an integer, got {value}"
+        )));
+    }
+    if value > u16::MAX as f64 {
+        return Err(bad_argument_error(format!(
+            "{method}: {name} must be in [0, 65535] (u16::MAX), got {value}"
+        )));
+    }
+    Ok(value as u16)
+}
+
 /// Helper: convert a JS `BigInt` to `PeerId` with explicit rejection of
 /// FIVE failure modes:
 ///   - negative BigInt (signed bit set) -- PeerId is u64-domain
@@ -873,9 +923,17 @@ impl CollabSession {
     ///   - in u32 range (≤ `u32::MAX`)
     /// then cast to `u32`. Any failure surfaces a precise JS Error.
     ///
-    /// `sheet: u16` stays as-is -- u16's `try_into::<u16>()` correctly
-    /// rejects out-of-range values from ToUint32, so the asymmetric
-    /// safety (Opus audit H2 finding) doesn't apply at u16.
+    /// **Phase 5.7 V3.6.0.X audit-of-D5 OPUS-HIGH-3 closure (2026-05-24)**:
+    /// `sheet: f64` (was `sheet: u16`).  Pre-closure this docstring
+    /// incorrectly claimed the V1 H2 silent-wrap class didn't apply at
+    /// u16 -- Opus Lane B audit verified by reading napi-rs 3.9.0
+    /// `FromNapiValue for u16` that ToUint32 + `try_into::<u16>()` only
+    /// rejects post-ToUint32 values in [65536, 2^32); the [0, 65535]
+    /// in-range silent corruptions (NaN -> 0, fractional -> truncate,
+    /// 2^32 -> 0, etc.) survive uncaught.  Same hazard class as the
+    /// V1 row/col closure.  Now `sheet` goes through
+    /// [`validate_u16_index`] -- same f64-raw + manual validation
+    /// pattern.
     ///
     /// `value: f64` is already raw (Number -> double, no coercion);
     /// validate finiteness here too (NaN/Infinity rejection).
@@ -1188,7 +1246,13 @@ impl CollabSession {
     }
 
     #[napi(js_name = "appendPutValue")]
-    pub fn append_put_value(&self, sheet: u16, row: f64, col: f64, value: f64) -> Result<()> {
+    pub fn append_put_value(&self, sheet: f64, row: f64, col: f64, value: f64) -> Result<()> {
+        // Validate sheet: finite, non-negative, integer, in u16 range.
+        // V3.6.0.X audit-of-D5 OPUS-HIGH-3 closure (2026-05-24): pre-closure
+        // sheet was napi-rs u16, which silently coerces NaN/Infinity/fractional/
+        // 2^32+ to in-range u16 values via ToUint32 + try_into::<u16>().  Now
+        // f64 + manual validation; precise [bad_argument] errors instead.
+        let sheet_u16 = validate_u16_index("appendPutValue", "sheet", sheet)?;
         // Validate row + col: finite, non-negative, integer, in u32 range.
         let row_u32 = validate_u32_index("appendPutValue", "row", row)?;
         let col_u32 = validate_u32_index("appendPutValue", "col", col)?;
@@ -1199,7 +1263,7 @@ impl CollabSession {
             )));
         }
         let op = Op::PutValue {
-            sheet,
+            sheet: sheet_u16,
             row: row_u32,
             col: col_u32,
             value: CellWireValue::Number(value),
@@ -1255,11 +1319,22 @@ impl CollabSession {
     /// - `[session_oplog]` if the underlying `append_op` fails (e.g.,
     ///   codec encode error; the cell-keyed CacheEffect path).
     #[napi(js_name = "appendPutFormula")]
-    pub fn append_put_formula(&self, sheet: u16, row: f64, col: f64, text: String) -> Result<()> {
+    pub fn append_put_formula(
+        &self,
+        sheet: f64,
+        row: f64,
+        col: f64,
+        text: String,
+    ) -> Result<()> {
+        // V3.6.0.X audit-of-D5 OPUS-HIGH-3 closure (2026-05-24): sheet
+        // is now f64 + validate_u16_index for the same reason as
+        // appendPutValue's symmetric closure.  See validate_u16_index
+        // docstring + the AUDIT transcript section C.3.
+        let sheet_u16 = validate_u16_index("appendPutFormula", "sheet", sheet)?;
         let row_u32 = validate_u32_index("appendPutFormula", "row", row)?;
         let col_u32 = validate_u32_index("appendPutFormula", "col", col)?;
         let op = Op::PutFormula {
-            sheet,
+            sheet: sheet_u16,
             row: row_u32,
             col: col_u32,
             text,

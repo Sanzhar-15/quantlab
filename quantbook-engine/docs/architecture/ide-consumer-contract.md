@@ -1799,12 +1799,12 @@ Three additional minor findings noted but not fixed in-cycle:
 
 ### 4.1.z6 Loro UndoManager on_push + format registry + per-cell op-index + format-aware buildHtml rendering (Phase 5.7 V3.6, 2026-05-24)
 
-**Status**: V3.6.0.1 lock + V3.6.0.2 D1 + V3.6.0.3 D2 + V3.6.0.4 D3 + V3.6.0.5 D4 ALL SHIPPED + AUDITED.  V3.6.0.6 D5 (IDE `appendPutFormula` napi) is the next recommended sub-step.
+**Status**: V3.6.0.1 lock + V3.6.0.2 D1 + V3.6.0.3 D2 + V3.6.0.4 D3 + V3.6.0.5 D4 + V3.6.0.6 D5 + V3.6.0.X audit-of-D5 closures ALL SHIPPED + AUDITED.  V3.6.0.7 D6 profiling spike is the next recommended sub-step (conditional on user direction).
 
-**Engine HEAD at this section's commit**: `e7931a74d0d` (V3.6.0.X audit-of-D4 closures).
-**IDE HEAD at this section's commit**: `b76b8266beb` (V3.6.0.X audit-of-D4 IDE).
+**Engine HEAD at this section's commit**: (next; V3.6.0.X audit-of-D5 closure commit, V3.6.0.X HIGH-1 + HIGH-2 + HIGH-3 + MED-2) <- `7f9a08ccd5e` (V3.6.0.6 D5 engine).
+**IDE HEAD at this section's commit**: (next; V3.6.0.X audit-of-D5 closure commit) <- `7608ae7633f` (V3.6.0.6 D5 IDE).
 
-**Tests baseline**: ql-collab **136/136** + ql-oplog **67/67** + IDE mocha **354/354** + ql-collab-ws **42/42** (10 lib + 30 transport + 2 V3.1.a relay; +2 doctests separate) + engine workspace 99 test-result lines pass.
+**Tests baseline**: ql-collab **136/136** + ql-oplog **67/67** + IDE mocha **(381/381 after V3.6.0.X audit-of-D5 closures; +8 over V3.6.0.6 D5 373 baseline)** + ql-collab-ws **42/42** (10 lib + 30 transport + 2 V3.1.a relay; +2 doctests separate) + engine workspace 99 test-result lines pass.
 
 #### V3.6.0.1 -- decision lock (9 D-decisions)
 
@@ -1816,7 +1816,7 @@ Per V3.5.0.X Opus § F V3.6 ENTRY READINESS:
 | **D2** Session-wide RegisterFormat FormatTable cache | New `format_table_cache: HashMap<FormatId, Arc<str>>` + new `CacheEffect::RegisterFormat` variant + new `FormatDefJson` napi struct + `WorkbookSnapshotJson.formats: Vec<FormatDefJson>` additive field | V3.6.0.3 |
 | **D3** Per-cell op-index for invalidate_cell | New `cell_op_index: HashMap<(u16,u32,u32), Vec<usize>>` + new `sheet_op_index: HashMap<u16, Vec<usize>>` + `CacheBuckets<'a>` struct + new `OpLog::get(idx)` accessor + `rebuild_op_indices_only` helper for post-undo refresh | V3.6.0.4 |
 | **D4** Format-aware buildHtml rendering | Engine-side `format::render` integration in `workbook_snapshot`; new `CellSnapshotJson.rendered: Option<String>` + `WorkbookSnapshotJson.dateSystem: String` additive fields; IDE `cellGridHtml::renderRows` uses `e.rendered ?? formatCellValue(e.value)` | V3.6.0.5 |
-| **D5** IDE-facing `appendPutFormula` napi | Thin wrapper over existing `Op::PutFormula`; unblocks end-to-end repaired-formula integration tests | V3.6.0.6 PENDING |
+| **D5** IDE-facing `appendPutFormula` napi | Thin wrapper over existing `Op::PutFormula`; unblocks end-to-end repaired-formula integration tests; V3.6.0.X audit-of-D5 closures add user-driven write-path (formula-prefix-detect dispatcher arm) + formula-only-cell pending passthrough + `validate_u16_index` symmetry closure | V3.6.0.6 **SHIPPED** + V3.6.0.X audit-of-D5 closures SHIPPED |
 | **D6** Incremental WorkbookSnapshot deltas | Time-boxed profiling spike; ship D6 only if profiling justifies | V3.6.0.7 PENDING |
 | **D7** `#REF!` substitution for cross-sheet refs to deleted sheets | DEFER until user signal | V3.6.0.8 PENDING |
 | **D8** `Op::RestoreSheet` un-delete | DEFER until user signal | V3.6.0.9 PENDING |
@@ -1859,6 +1859,24 @@ New `CellSnapshotJson.rendered: Option<String>` additive field populated via `ql
 - **CONVERGENT-MED-2**: per-snapshot parsed-format cache (`HashMap<FormatId, FormatString>` populated lazily; reuses across cells sharing FormatId).
 - **CONVERGENT-MED-3**: ide-consumer-contract sweep (R-V3.5-4 marked CLOSED; D4 "deferred" updated to SHIPPED).  Plus Opus LOW-2 dropped `.to_string()` + Opus LOW-3 fixed TS docstring `date_system` -> `dateSystem` (napi-rs camelCase).
 
+#### V3.6.0.6 D5 -- IDE-facing `appendPutFormula` napi (engine `7f9a08ccd5e` + IDE `7608ae7633f`)
+
+New `CollabSession::appendPutFormula(sheet, row, col, text) -> Result<()>` napi method.  Mirrors `appendPutValue` validation discipline (`validate_u32_index` on row/col).  Wraps existing `Op::PutFormula { sheet, row, col, text }` (shipping since Phase 4.6.x); no new wire variant; no new CacheEffect.  IDE adds `appendPutFormulaValidated` typed wrapper, `QuantbookCellSnapshot.entries[*].formula?: string` mirror, `extractSheetSnapshot` passes through `cell.formula` additively, `cellGridHtml::renderRows` emits `data-raw-formula="${escapeHtml(e.formula)}"` server + client, **`beginEdit` precedence chain `data-raw-formula > data-raw-value > data-original-text`** (extends V3.6.0.X audit-of-D4 OPUS-HIGH-2).  +19 mocha tests (354 -> 373).
+
+**V3.6.0.X audit-of-D5** (Opus Lane B transcript: `docs/audits/2026-05-24-phase-5-7-v3-6-0-6-opus.md`; Codex Lane A: BLOCKED by OrbStack Mac bridge outage, deferred to V3.7+ retrospective if user signal surfaces; verdict: FAIL with 3 HIGH + 3 MED + 4 LOW + 4 INFO Opus-only).  4 in-cycle closures:
+
+- **OPUS-HIGH-1** (IDE write-path for formulas didn't exist): user typing `=A1+B1` was routed through `parseCellRawInput -> Number(trimmed) -> NaN -> errorReply`; the V3.6.0.6 D5 napi was reachable only from test code.  **Closure**: `dispatchIncomingMessage`'s `'putValue'` arm gains a `req.rawInput.trimStart().startsWith('=')` prefix detection; if formula, route to `appendPutFormulaValidated` instead of `parseCellRawInput + appendPutValueValidated`.  Webview-side envelope UNCHANGED (still `{type:'putValue', rawInput}`); host dispatcher does the classification.  V3.5.0.X A-HIGH-2 closure framing is now true at the user-driven flow level, not just the napi-call level.
+
+- **OPUS-HIGH-2** (`extractSheetSnapshot` silently dropped formula-only cells): the `cell.value === undefined` branch `continue`d, dropping the most natural V3.6.0.6 D5 PutFormula shape (formula text, no cached literal) from the entries array; `data-raw-formula` never emitted for such cells.  **Closure**: pass-through formula-only cells (`cell.formula !== undefined && cell.value === undefined`) with `value: { kind: 'pending' }` so `formatCellValue`'s existing pending case renders `(pending)` AND the formula text surfaces via `data-raw-formula`.  Mirrors V3.6.0.X audit-of-D4 CONVERGENT-HIGH-3 pending-render strategy.
+
+- **OPUS-HIGH-3** (`appendPutFormula(sheet: u16, ...)` silent coercion): napi-rs 3.9.0's `FromNapiValue for u16` routes through `napi_get_value_uint32` (ECMAScript ToUint32) then `try_into::<u16>()`; the post-ToUint32 in-range silent corruptions (NaN -> 0; 0.5 -> 0; 2.7 -> 2; 2^32 -> 0; 65535.9 -> 65535) survive uncaught.  Same hazard class as the V1 audit Opus H2 closure for u32 (closed via `validate_u32_index` + `row/col: f64`).  Pre-closure `lib.rs:876-878` docstring incorrectly claimed this class didn't apply at u16.  **Closure**: new `validate_u16_index(method, name, value)` helper mirroring `validate_u32_index`; both `appendPutValue` + `appendPutFormula` change `sheet: u16` -> `sheet: f64` + call `validate_u16_index`.  Misleading docstring corrected.
+
+- **OPUS-MED-2** (this section's `4.1.z6` sweep was missing for V3.6.0.6 D5): pre-closure status said "V3.6.0.6 D5 PENDING" + listed D5 in "Out of scope" despite the ship.  **Closure**: status block + HEAD trail + Tests baseline + D5 table row + this V3.6.0.6 D5 sub-section + V3.6.0.X audit-of-D5 sub-section + Out-of-scope removal.
+
+Deferred to V3.6.0.7+ backlog: Opus MED-1 (client/server `data-raw-formula` guard asymmetry; today safe because client only emits in editable mode); LOW-1 (`text` accepts-any-string contract documentation); LOW-2 (validator suite couples to engine binary unnecessarily); LOW-3 (engine napi test regex too weak); LOW-4 (no multi-peer / undo CRDT regression test for appendPutFormula at IDE level); INFO-1..4.  Codex Lane A retrospective deferred to V3.7+ pending bridge availability.
+
++8 mocha tests over V3.6.0.6 D5 373 baseline (-> **381/381**): 3 dispatcher routing (formula prefix detected; leading-whitespace formula detected; non-formula stays on value path); 2 formula-only-cell pass-through (renders pending; data-raw-formula attribute emits); 3 u16 sheet validator (NaN/Infinity rejected; fractional rejected; 2^32 rejected; covers both appendPutValue and appendPutFormula).  ql-collab unchanged at 136/136 (engine changes are validator + signature; no new collab-side surface).
+
 #### V3.6 risk register (R-V3.6-1..13)
 
 The plan body at `.plans/_active.md` lines 286-314 is the authoritative source.  Summary:
@@ -1886,12 +1904,12 @@ The plan body at `.plans/_active.md` lines 286-314 is the authoritative source. 
 | V3.6.0.4 D3 | `2026-05-23-phase-5-7-v3-6-0-4-codex.md` | `2026-05-23-phase-5-7-v3-6-0-4-opus.md` |
 | V3.6.0.5 D4 | `2026-05-24-phase-5-7-v3-6-0-5-codex.md` | `2026-05-24-phase-5-7-v3-6-0-5-opus.md` |
 | Docs audit | `2026-05-24-phase-5-7-docs-audit-codex.md` | `2026-05-24-phase-5-7-docs-audit-opus.md` |
+| V3.6.0.6 D5 | BLOCKED (OrbStack Mac bridge outage; V3.7+ retrospective if signal surfaces) | `2026-05-24-phase-5-7-v3-6-0-6-opus.md` |
 
 Date inconsistency note: V3.6.0.3 + V3.6.0.4 transcripts dated 2026-05-23 (per work-start session date); V3.6.0.2 + V3.6.0.5 + docs-audit dated 2026-05-24.  This is a known low-severity drift; convention going forward: filename date = audit execution date (post-midnight transitions retain the original session's date in the header).
 
 #### Out of scope for V3.6
 
-- **V3.6.0.6 D5 IDE-facing `appendPutFormula` napi** (next recommended sub-step; ~1 session per Opus § F.5).
 - **V3.6.0.7 D6 incremental snapshot deltas** (profiling spike pending; ship D6 only if cost > 50ms/call at V3.6 scale).
 - **V3.6.0.8 D7 `#REF!` substitution** (conditional on user signal; engine-side extends `repair_sheet_chain` at `rebuild_workbook` time).
 - **V3.6.0.9 D8 `Op::RestoreSheet`** (conditional on user signal; cell storage preserved internally).
