@@ -47,6 +47,7 @@ import {
 } from '../src/quantbook/loader';
 import {
 	addSheet,
+	appendPutFormulaValidated,
 	appendPutValueValidated,
 	buildPresenceSnapshotJson,
 	clearPresence,
@@ -5932,4 +5933,312 @@ suite('quantbook V3.5.0.7 -- presenceUpdate fires onLocalTyping (mid-edit-render
 	});
 });
 
+// ============================================================================
+// Phase 5.7 V3.6.0.6 D5 (2026-05-24) -- IDE-facing appendPutFormula napi
+// ============================================================================
+// Closes V3.5.0.X A-HIGH-2 IDE-level verification gap (engine repair
+// surfaces in workbookSnapshot, driven end-to-end from the IDE).  Mirrors
+// V3.4.0.X appendPutValue + V3.5.0.3a renameSheet napi contract tests.
+
+suite('quantbook V3.6.0.6 D5 -- appendPutFormulaValidated input validation', function () {
+	test('rejects negative sheet', () => {
+		const session = createSession(8601n);
+		assert.throws(
+			() => appendPutFormulaValidated(session, -1, 0, 0, '=A1'),
+			/\[bad_argument\] appendPutFormula: sheet/,
+		);
+	});
+
+	test('rejects sheet > u16::MAX', () => {
+		const session = createSession(8602n);
+		assert.throws(
+			() => appendPutFormulaValidated(session, 65536, 0, 0, '=A1'),
+			/\[bad_argument\] appendPutFormula: sheet/,
+		);
+	});
+
+	test('rejects fractional row', () => {
+		const session = createSession(8603n);
+		assert.throws(
+			() => appendPutFormulaValidated(session, 0, 1.5, 0, '=A1'),
+			/\[bad_argument\] appendPutFormula: row/,
+		);
+	});
+
+	test('rejects out-of-u32-range col', () => {
+		const session = createSession(8604n);
+		assert.throws(
+			() => appendPutFormulaValidated(session, 0, 0, 0x100000000, '=A1'),
+			/\[bad_argument\] appendPutFormula: col/,
+		);
+	});
+
+	test('rejects non-string text', () => {
+		const session = createSession(8605n);
+		assert.throws(
+			() => appendPutFormulaValidated(session, 0, 0, 0, 42 as unknown as string),
+			/\[bad_argument\] appendPutFormula: text/,
+		);
+	});
+
+	test('accepts valid inputs (empty string, boundary u16/u32, ASCII formula)', () => {
+		const session = createSession(8606n);
+		addSheet(session, 'S');
+		appendPutFormulaValidated(session, 0, 0, 0, '=A1');
+		appendPutFormulaValidated(session, 0, 0xFFFFFFFF, 0xFFFFFFFF, '');
+		assert.strictEqual(session.opCount(), 3,
+			'addSheet + 2 appendPutFormula -> opCount=3');
+	});
+});
+
+suite('quantbook V3.6.0.6 D5 -- engine appendPutFormula napi contract', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('appendPutFormula increments opCount', () => {
+		const session = createSession(8611n);
+		addSheet(session, 'S');
+		const before = session.opCount();
+		session.appendPutFormula(0, 0, 0, '=A1+1');
+		assert.strictEqual(session.opCount(), before + 1,
+			'one appendPutFormula appends exactly one op');
+	});
+
+	test('engine rejects fractional row (no ToUint32 silent wrap)', () => {
+		const session = createSession(8612n);
+		addSheet(session, 'S');
+		assert.throws(
+			() => session.appendPutFormula(0, 0.5, 0, '=A1'),
+			/appendPutFormula/,
+		);
+	});
+
+	test('engine rejects negative row', () => {
+		const session = createSession(8613n);
+		addSheet(session, 'S');
+		assert.throws(
+			() => session.appendPutFormula(0, -1, 0, '=A1'),
+			/appendPutFormula/,
+		);
+	});
+
+	test('engine rejects out-of-u32-range row', () => {
+		const session = createSession(8614n);
+		addSheet(session, 'S');
+		assert.throws(
+			() => session.appendPutFormula(0, 0x100000000, 0, '=A1'),
+			/appendPutFormula/,
+		);
+	});
+});
+
+suite('quantbook V3.6.0.6 D5 -- workbookSnapshot surfaces formula text', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('formula-only cell -> CellSnapshotJson has formula property, value absent', () => {
+		// PutFormula without prior PutValue at the same cell -> the cell has
+		// formula text but no cached literal (no evaluation runs at the
+		// session layer; evaluation lives in the runtime layer engine-side).
+		const session = createSession(8621n);
+		addSheet(session, 'S');
+		session.appendPutFormula(0, 0, 0, '=A2+1');
+		const snap = workbookSnapshot(session);
+		assert.strictEqual(snap.sheets[0].cells.length, 1,
+			'one cell with formula appears in snapshot');
+		const cell = snap.sheets[0].cells[0];
+		assert.strictEqual(cell.formula, '=A2+1',
+			'PutFormula text surfaces in CellSnapshotJson.formula');
+		assert.strictEqual(cell.value, undefined,
+			'no prior PutValue -> value absent (napi-rs Option::None convention)');
+	});
+
+	test('formula text repaired through Phase 5.3 rename chain (V3.5.0.X A-HIGH-2 end-to-end)', () => {
+		// V3.5.0.X audit-closure A-HIGH-2 closure landed `workbookSnapshot`
+		// reading from rebuild_workbook formula_at (so renamed sheets
+		// surface REPAIRED formula text).  Pre-V3.6.0.6 this was verified
+		// only by a Rust ql-collab test because the IDE had no PutFormula
+		// write-path.  Post-V3.6.0.6 D5 the IDE can drive the end-to-end
+		// repair scenario.
+		const session = createSession(8622n);
+		addSheet(session, 'Source');
+		addSheet(session, 'Target');
+		// Formula in sheet 1 (Target) referencing sheet 0 (Source).
+		session.appendPutFormula(1, 0, 0, '=Source!A1');
+		// Rename Source -> Renamed.
+		renameSheet(session, 0, 'Renamed');
+		const snap = workbookSnapshot(session);
+		const targetCell = snap.sheets.find(s => s.id === 1)?.cells.find(c => c.row === 0 && c.col === 0);
+		assert.ok(targetCell !== undefined, 'cell exists after rename');
+		assert.strictEqual(targetCell!.formula, '=Renamed!A1',
+			`Phase 5.3 repair_sheet_rename_chain rewrites cross-sheet ref; expected "=Renamed!A1", got ${JSON.stringify(targetCell!.formula)}`);
+	});
+
+	test('round-trip via to_qbook/from_qbook preserves formula text', () => {
+		const session = createSession(8623n);
+		addSheet(session, 'S0');
+		addSheet(session, 'S1');
+		session.appendPutFormula(0, 1, 1, '=S1!B2*2');
+		const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qbook-v3606d5-'));
+		const target = path.join(scratchDir, 'snap.qbook');
+		try {
+			exportToQbook(session, target);
+			const reloaded = sessionFromQbook(target, 9999n);
+			const after = workbookSnapshot(reloaded);
+			const cell = after.sheets.find(s => s.id === 0)?.cells.find(c => c.row === 1 && c.col === 1);
+			assert.ok(cell !== undefined, 'formula cell preserved across .qbook round-trip');
+			assert.strictEqual(cell!.formula, '=S1!B2*2',
+				'formula text preserved verbatim through to_qbook + from_qbook');
+		} finally {
+			try { fs.rmSync(scratchDir, { recursive: true, force: true }); } catch { /* test cleanup */ }
+		}
+	});
+});
+
+suite('quantbook V3.6.0.6 D5 -- extractSheetSnapshot passes through formula', function () {
+	test('cell with both value AND formula -> entry carries formula property', () => {
+		// Synthetic snapshot mirroring what workbookSnapshot would emit
+		// for a cell that has both a cached literal AND formula text
+		// (formula evaluated to a number).
+		const snap: WorkbookSnapshotJson = {
+			sheets: [{
+				id: 0, name: 'S', cells: [
+					{ row: 0, col: 0, value: { kind: 'number', number: 42 }, formula: '=21*2' },
+				],
+			}],
+			formats: [],
+			dateSystem: 'Excel1900',
+		};
+		const result = extractSheetSnapshot(snap, 0);
+		assert.ok(result !== null);
+		assert.strictEqual(result!.entries.length, 1);
+		assert.strictEqual(result!.entries[0].formula, '=21*2',
+			'formula text passes through extractSheetSnapshot when set');
+		assert.deepStrictEqual(result!.entries[0].value, { kind: 'number', value: 42 },
+			'value still passes through alongside formula');
+	});
+
+	test('cell with value only -> formula property absent (shape stability)', () => {
+		const snap: WorkbookSnapshotJson = {
+			sheets: [{
+				id: 0, name: 'S', cells: [
+					{ row: 0, col: 0, value: { kind: 'number', number: 7 } },
+				],
+			}],
+			formats: [],
+			dateSystem: 'Excel1900',
+		};
+		const result = extractSheetSnapshot(snap, 0);
+		const entry = result!.entries[0];
+		const keys = Object.keys(entry).sort();
+		assert.deepStrictEqual(keys, ['col', 'row', 'value'],
+			'no formula key on pure-literal entries (Object.keys shape stability)');
+	});
+});
+
+suite('quantbook V3.6.0.6 D5 -- buildHtml emits data-raw-formula', function () {
+	test('cell with formula -> data-raw-formula attribute in rendered HTML', () => {
+		// Pin the V3.6.0.X audit-of-D4 OPUS-HIGH-2 § G.2 contract:
+		// beginEdit precedence chain is data-raw-formula >
+		// data-raw-value > data-original-text.  Cells with formula
+		// MUST emit the attribute so click-to-edit shows formula
+		// source not the evaluated value.
+		const html = buildHtml({
+			snapshot_format_version: 1,
+			sheet: 0,
+			entries: [
+				{ row: 0, col: 0, value: { kind: 'number', value: 42 }, formula: '=21*2' },
+			],
+		}, { nonce: 'n6' });
+		assert.ok(html.includes('data-raw-formula="=21*2"'),
+			`cell with formula should emit data-raw-formula attribute; html: ${html.slice(0, 2000)}`);
+		// data-raw-value still emits (preserves backward compat with
+		// V3.6.0.X audit-of-D4 OPUS-HIGH-2 closure for non-formula
+		// edit case).
+		assert.ok(html.includes('data-raw-value="42"'),
+			'data-raw-value still present alongside data-raw-formula');
+	});
+
+	test('cell WITHOUT formula -> data-raw-formula attribute absent on the cell <td> (script body still references the attribute name)', () => {
+		const html = buildHtml({
+			snapshot_format_version: 1,
+			sheet: 0,
+			entries: [
+				{ row: 0, col: 0, value: { kind: 'number', value: 7 } },
+			],
+		}, { nonce: 'n7' });
+		// The literal string `data-raw-formula="` DOES appear in the
+		// inline renderRowsClient script (the format-string contains
+		// `'" data-raw-formula="' + htmlEscape(e.formula) + '"'`).
+		// What MUST be absent is the SERVER-rendered attribute on
+		// the actual cell <td>.  Scope the check to the <td class="cell-value"...>
+		// element.
+		const tdStart = html.indexOf('<td class="cell-value"');
+		assert.ok(tdStart > -1, 'editable cell <td> present in HTML');
+		const tdEnd = html.indexOf('</td>', tdStart);
+		const tdMarkup = html.slice(tdStart, tdEnd);
+		assert.ok(!tdMarkup.includes('data-raw-formula'),
+			`pure-literal cell <td> should NOT have data-raw-formula; tdMarkup: ${tdMarkup}`);
+	});
+
+	test('formula text is HTML-escaped in data-raw-formula attribute (XSS hygiene)', () => {
+		const html = buildHtml({
+			snapshot_format_version: 1,
+			sheet: 0,
+			entries: [
+				{ row: 0, col: 0, value: { kind: 'number', value: 1 }, formula: '=A1&"<x>"' },
+			],
+		}, { nonce: 'nx' });
+		// The "&" and "<x>" must be HTML-escaped inside the attribute
+		// value (CSP-safe injection-proof).  Using `<x>` instead of
+		// `<script>` so the assertion can target the literal substring
+		// without colliding with the inline `<script nonce="...">`
+		// tag that buildHtml emits for the webview client script.
+		assert.ok(html.includes('data-raw-formula="=A1&amp;&quot;&lt;x&gt;&quot;"'),
+			`formula attribute HTML-escapes & " < >; html sample: ${html.slice(html.indexOf('data-raw-formula'), html.indexOf('data-raw-formula') + 200)}`);
+		// And the raw unescaped sequence MUST NOT appear in the
+		// attribute value (the <x> tag would be HTML-parsed otherwise).
+		const attrIdx = html.indexOf('data-raw-formula="');
+		const attrTail = html.slice(attrIdx, attrIdx + 200);
+		assert.ok(!attrTail.includes('<x>'),
+			`raw <x> must NOT appear inside data-raw-formula attribute; got: ${attrTail}`);
+	});
+
+	test('beginEdit client script precedence: data-raw-formula > data-raw-value > data-original-text', () => {
+		// Pin that within the `function beginEdit(...)` body, the
+		// reads happen in the right order.  We scope to the substring
+		// between `function beginEdit(` and the next `function ` (the
+		// next function definition) so reads in `endEdit` (which uses
+		// `data-original-text` to restore on Escape) don't pollute
+		// the comparison.
+		const html = buildHtml({
+			snapshot_format_version: 1,
+			sheet: 0,
+			entries: [
+				{ row: 0, col: 0, value: { kind: 'number', value: 1 } },
+			],
+		}, { nonce: 'np' });
+		const beginIdx = html.indexOf('function beginEdit(');
+		assert.ok(beginIdx > -1, 'beginEdit function present in script');
+		// Find the NEXT `function ` after beginEdit starts (i.e., the
+		// end of beginEdit's body).
+		const afterBeginIdx = html.indexOf('function ', beginIdx + 'function beginEdit('.length);
+		const slice = afterBeginIdx > -1 ? html.slice(beginIdx, afterBeginIdx) : html.slice(beginIdx);
+		const rawFormulaIdx = slice.indexOf('getAttribute(\'data-raw-formula\')');
+		const rawValueIdx = slice.indexOf('getAttribute(\'data-raw-value\')');
+		const origTextIdx = slice.indexOf('getAttribute(\'data-original-text\')');
+		assert.ok(rawFormulaIdx > -1, 'beginEdit body reads data-raw-formula');
+		assert.ok(rawValueIdx > -1, 'beginEdit body reads data-raw-value');
+		assert.ok(origTextIdx > -1, 'beginEdit body reads data-original-text fallback');
+		// Precedence: formula MUST be checked before value, value before text.
+		assert.ok(rawFormulaIdx < rawValueIdx,
+			`data-raw-formula must precede data-raw-value in beginEdit body (got ${rawFormulaIdx} < ${rawValueIdx})`);
+		assert.ok(rawValueIdx < origTextIdx,
+			`data-raw-value must precede data-original-text in beginEdit body (got ${rawValueIdx} < ${origTextIdx})`);
+	});
+});
 

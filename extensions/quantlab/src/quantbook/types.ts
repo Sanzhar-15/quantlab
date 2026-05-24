@@ -314,6 +314,40 @@ export interface CollabSessionInstance {
 	appendPutValue(sheet: number, row: number, col: number, value: number): void;
 
 	/**
+	 * **Phase 5.7 V3.6.0.6 D5 (2026-05-24)** -- append an `Op::PutFormula`
+	 * to this session.  The cell at `(sheet, row, col)` receives the
+	 * formula text `text` (e.g., `"=SUM(A1:B10)"`); the engine stores
+	 * it verbatim and `rebuild_workbook` materializes the formula via
+	 * Phase 5.3 `repair_sheet_rename_chain` at snapshot time so
+	 * cross-sheet refs to renamed sheets surface repaired text in
+	 * {@link WorkbookSnapshotJson.sheets}`[].cells[].formula`.
+	 *
+	 * Use the typed wrapper {@link putFormula} from `./session` for
+	 * JS-side validation BEFORE the napi boundary (napi-rs's ToUint32
+	 * coercion silently wraps negative/non-integer sheet/row/col args,
+	 * so pre-validation surfaces precise `[bad_argument]` errors).
+	 *
+	 * **No wire change**: `Op::PutFormula` is unchanged since
+	 * Phase 4.6.x.  Cross-peer convergence handled by the existing
+	 * cell-keyed CacheEffect path.
+	 *
+	 * **V3.5.0.X A-HIGH-2 closure**: this method unblocks end-to-end
+	 * repaired-formula verification from the IDE.  Pre-D5 the repair
+	 * was tested only by Rust ql-collab regressions because the IDE
+	 * had no PutFormula write-path.
+	 *
+	 * **Edit-flow companion** (V3.6.0.X audit-of-D4 OPUS-HIGH-2 section G.2):
+	 * IDE renderers MUST emit `data-raw-formula` for cells with
+	 * formula text so `beginEdit` shows formula source on click-to-
+	 * edit, NOT the cached literal value.
+	 *
+	 * @throws `[bad_argument]` if `row` or `col` is non-integer / out
+	 *         of u32 range / NaN / Infinity.
+	 * @throws `[session_oplog]` if the underlying `append_op` fails.
+	 */
+	appendPutFormula(sheet: number, row: number, col: number, text: string): void;
+
+	/**
 	 * **Phase 5.7 V3.4.0.4a (2026-05-23)** -- append an `Op::AddSheet`
 	 * to the session.  Sheet ids are deterministic + assigned by the
 	 * engine on replay in op-log append order (first `addSheet` call
@@ -894,6 +928,29 @@ export interface QuantbookCellSnapshot {
 		 * `formatCellValue(value)` otherwise.
 		 */
 		readonly rendered?: string;
+		/**
+		 * **Phase 5.7 V3.6.0.6 D5 (2026-05-24)**: formula source text
+		 * (mirrors {@link CellSnapshotJson.formula}).
+		 *
+		 * `undefined` = pure literal cell (no `Op::PutFormula` ever
+		 * appended for this cell, or cleared via `Op::ClearFormula`).
+		 *
+		 * Present = the cell has formula text from `appendPutFormula`.
+		 * Carries the engine's POST-REPAIR text (post Phase 5.3
+		 * `repair_sheet_rename_chain` -- references to renamed sheets
+		 * surface as the new sheet name).
+		 *
+		 * **Edit-flow contract** (V3.6.0.X audit-of-D4 OPUS-HIGH-2
+		 * section G.2): `buildHtml` consumers MUST emit `data-raw-formula`
+		 * when this field is set so click-to-edit's `beginEdit` shows
+		 * formula source, NOT the cached literal value.
+		 *
+		 * `extractSheetSnapshot` (which produces this shape) only
+		 * sets the property when the engine populates it; absent
+		 * properties stay absent (deepStrictEqual shape-stability
+		 * tests pin this).
+		 */
+		readonly formula?: string;
 	}>;
 }
 

@@ -99,6 +99,49 @@ export function appendPutValueValidated(
 }
 
 /**
+ * **Phase 5.7 V3.6.0.6 D5 (2026-05-24)** -- typed wrapper for
+ * `CollabSession.appendPutFormula` with JS-side validation.
+ *
+ * Mirrors {@link appendPutValueValidated}'s discipline (validate
+ * sheet/row/col BEFORE the napi boundary so `parseQuantbookError(err)
+ * .code` surfaces `bad_argument` consistently; ToUint32 coercion at
+ * the FFI layer would silently wrap negative/non-integer values
+ * otherwise).
+ *
+ * **No `text` validation here**: any string is a valid formula at
+ * the wire level.  Engine-side evaluation surfaces parse errors via
+ * `Workbook::formula_at` / `recompute_all` -- the IDE renders those
+ * as `#NAME?` / `#REF!` / etc. in cell snapshots, NOT as
+ * `[bad_argument]` throws on append.  This matches `appendPutValue`'s
+ * "value-must-be-finite" pattern: the wire accepts any finite
+ * number; the IDE pre-rejects only what the wire layer can't.
+ *
+ * @throws Error with `parseQuantbookError(err).code === 'bad_argument'`
+ *         if sheet/row/col are out of range or non-integer.
+ */
+export function appendPutFormulaValidated(
+	session: CollabSessionInstance,
+	sheet: number,
+	row: number,
+	col: number,
+	text: string,
+): void {
+	if (!Number.isInteger(sheet) || sheet < 0 || sheet > 0xFFFF) {
+		throw new Error(`[bad_argument] appendPutFormula: sheet must be an integer in [0, 65535], got ${sheet}`);
+	}
+	if (!Number.isInteger(row) || row < 0 || row > 0xFFFFFFFF) {
+		throw new Error(`[bad_argument] appendPutFormula: row must be an integer in [0, 4294967295], got ${row}`);
+	}
+	if (!Number.isInteger(col) || col < 0 || col > 0xFFFFFFFF) {
+		throw new Error(`[bad_argument] appendPutFormula: col must be an integer in [0, 4294967295], got ${col}`);
+	}
+	if (typeof text !== 'string') {
+		throw new Error(`[bad_argument] appendPutFormula: text must be a string, got ${typeof text}`);
+	}
+	session.appendPutFormula(sheet, row, col, text);
+}
+
+/**
  * Reconstruct a `CollabSession` from a previously-exported snapshot.
  *
  * @param peerId Non-zero u64-domain peer identifier for THIS session

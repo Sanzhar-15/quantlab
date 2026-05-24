@@ -712,7 +712,7 @@ export function extractSheetSnapshot(
 	if (sheet === undefined) {
 		return null;
 	}
-	const entries: { row: number; col: number; value: QuantbookCellValue; rendered?: string }[] = [];
+	const entries: { row: number; col: number; value: QuantbookCellValue; rendered?: string; formula?: string }[] = [];
 	for (const cell of sheet.cells) {
 		if (cell.value === undefined) {
 			// Formula-only cell.  Matches V3.4.0.2 export_snapshot's
@@ -778,13 +778,24 @@ export function extractSheetSnapshot(
 		// renderRows uses `entry.rendered ?? formatCellValue(entry.value)`
 		// either way (absent property is treated the same as
 		// undefined by `??`).
-		const entry: { row: number; col: number; value: QuantbookCellValue; rendered?: string } = {
+		//
+		// **Phase 5.7 V3.6.0.6 D5 (2026-05-24)**: pass through engine-
+		// repaired formula text when present (post Phase 5.3
+		// repair_sheet_rename_chain).  Same conditional-key
+		// discipline as `rendered` -- absent property when the
+		// engine omits, set otherwise.  buildHtml emits
+		// `data-raw-formula` from this field so click-to-edit
+		// surfaces formula source instead of the cached literal.
+		const entry: { row: number; col: number; value: QuantbookCellValue; rendered?: string; formula?: string } = {
 			row: cell.row,
 			col: cell.col,
 			value: typed,
 		};
 		if (cell.rendered !== undefined) {
 			entry.rendered = cell.rendered;
+		}
+		if (cell.formula !== undefined) {
+			entry.formula = cell.formula;
 		}
 		entries.push(entry);
 	}

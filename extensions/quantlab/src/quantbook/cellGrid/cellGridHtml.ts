@@ -241,6 +241,21 @@ function renderRows(
 			// input.value.  `data-original-text` stays for Escape-
 			// cancel restore (the displayed text the user sees).
 			const rawValueStr = formatCellValue(e.value);
+			// **Phase 5.7 V3.6.0.6 D5 (2026-05-24)**: when the cell
+			// carries formula text (post Phase 5.3 repair_sheet_rename_chain),
+			// emit `data-raw-formula` so beginEdit shows formula source
+			// on click-to-edit, NOT the cached literal value.  Per
+			// V3.6.0.X audit-of-D4 Opus section G.2: a cell with both a
+			// formula AND a value has two raw representations; the
+			// formula is the more-authoritative source for editing
+			// (it's what the user typed; the value is computed from
+			// it).  beginEdit precedence: data-raw-formula >
+			// data-raw-value > data-original-text.  Absent attribute
+			// (the typical pure-literal case) lets beginEdit fall
+			// back to data-raw-value as before.
+			const formulaAttr = (editable && typeof e.formula === 'string')
+				? ` data-raw-formula="${escapeHtml(e.formula)}"`
+				: '';
 			// V3.2.b.2: cells gain `data-row` / `data-col` attributes when
 			// editable so the client script can identify which cell was
 			// clicked. The `.cell-value` class is the hit-test target.
@@ -265,7 +280,7 @@ function renderRows(
 			const rowSafe = Number(e.row);
 			const colSafe = Number(e.col);
 			const dataAttrs = editable
-				? ` data-row="${rowSafe}" data-col="${colSafe}" data-original-text="${escapeHtml(displayStr)}" data-raw-value="${escapeHtml(rawValueStr)}" data-original-kind="${escapeHtml(e.value.kind)}"`
+				? ` data-row="${rowSafe}" data-col="${colSafe}" data-original-text="${escapeHtml(displayStr)}" data-raw-value="${escapeHtml(rawValueStr)}"${formulaAttr} data-original-kind="${escapeHtml(e.value.kind)}"`
 				: '';
 			const cellClass = editable ? 'cell-value' : '';
 			return `<tr><td>${rowSafe}</td><td>${colSafe}</td><td class="${cellClass}"${dataAttrs}>${escapeHtml(displayStr)}<span class="kind">[${escapeHtml(e.value.kind)}]</span></td></tr>`;
@@ -428,7 +443,19 @@ function buildClientScript(sheetForClient: number): string {
 		'    // for any pre-D4 panel HTML that lacks the new attribute',
 		'    // (e.g., during in-flight upgrade where the server emits',
 		'    // pre-D4 HTML but the client script is post-D4).',
-		'    var rawValue = cell.getAttribute(\'data-raw-value\');',
+		'    //',
+		'    // V3.6.0.6 D5 (2026-05-24): data-raw-formula takes',
+		'    // precedence over data-raw-value when present.  A cell',
+		'    // with both formula AND value (formula evaluated to a',
+		'    // literal) has two raw representations; the formula is',
+		'    // the more-authoritative source for editing (it\\\'s what',
+		'    // the user typed; the value is computed from it).  Pure-',
+		'    // literal cells (no formula) skip this branch and fall',
+		'    // through to data-raw-value as before.',
+		'    var rawValue = cell.getAttribute(\'data-raw-formula\');',
+		'    if (rawValue === null) {',
+		'      rawValue = cell.getAttribute(\'data-raw-value\');',
+		'    }',
 		'    if (rawValue === null) {',
 		'      rawValue = cell.getAttribute(\'data-original-text\') || \'\';',
 		'    }',
@@ -656,6 +683,13 @@ function buildClientScript(sheetForClient: number): string {
 		'      // on currency / percent / thousands / date formats.',
 		'      var rawValueStr = formatCellValueClient(e.value);',
 		'      var kind = e.value.kind;',
+		'      // V3.6.0.6 D5 (2026-05-24): mirror server renderRows -- when',
+		'      // the entry has formula text, emit data-raw-formula so',
+		'      // beginEdit shows formula source on click-to-edit (precedence',
+		'      // chain: data-raw-formula > data-raw-value > data-original-text).',
+		'      var formulaAttr = (typeof e.formula === \'string\')',
+		'        ? \' data-raw-formula="\' + htmlEscape(e.formula) + \'"\'',
+		'        : \'\';',
 		'      // V3.3.0.X audit closure (LOW-1): defense-in-depth Number()',
 		'      // coercion mirrors the server renderer (cellGridHtml.ts).',
 		'      // Number(non-numeric) -> NaN -> "NaN" literal in the',
@@ -667,8 +701,9 @@ function buildClientScript(sheetForClient: number): string {
 		'        \'</td><td class="cell-value" data-row="\' + rowSafe +',
 		'        \'" data-col="\' + colSafe +',
 		'        \'" data-original-text="\' + htmlEscape(displayStr) +',
-		'        \'" data-raw-value="\' + htmlEscape(rawValueStr) +',
-		'        \'" data-original-kind="\' + htmlEscape(kind) + \'">\' +',
+		'        \'" data-raw-value="\' + htmlEscape(rawValueStr) + \'"\' +',
+		'        formulaAttr +',
+		'        \' data-original-kind="\' + htmlEscape(kind) + \'">\' +',
 		'        htmlEscape(displayStr) +',
 		'        \'<span class="kind">[\' + htmlEscape(kind) + \']</span></td></tr>\';',
 		'    }',
