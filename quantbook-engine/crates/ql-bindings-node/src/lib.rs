@@ -1209,6 +1209,66 @@ impl CollabSession {
         Ok(())
     }
 
+    /// **Phase 5.7 V3.6.0.6 D5 (2026-05-24) -- IDE-facing PutFormula napi.**
+    ///
+    /// Thin wrapper over `Op::PutFormula { sheet, row, col, text }`
+    /// (shipping engine-side since Phase 4.6.x).  Mirrors
+    /// `appendPutValue`'s validation discipline -- validates row/col as
+    /// finite, non-negative, integer, in u32 range BEFORE the Rust
+    /// boundary (so the V1 audit ToUint32-coercion silent-wrap class
+    /// stays closed for formulas too).  `sheet` is `u16` (napi-rs
+    /// rejects out-of-range integers at the FFI boundary; matches
+    /// `appendPutValue` shape).  `text` is the raw formula source the
+    /// user typed (typically `"=SUM(A1:B10)"`); the engine stores it
+    /// verbatim and `rebuild_workbook` materializes it via
+    /// `repair_sheet_rename_chain` at snapshot time so cross-sheet
+    /// refs to renamed sheets surface repaired text in
+    /// `workbookSnapshot.sheets[].cells[].formula`.
+    ///
+    /// **No wire change**: `Op::PutFormula` is unchanged.  No new
+    /// CacheEffect needed (the cell-keyed cache walker already handles
+    /// PutFormula via `CacheEffect::Cell`).
+    ///
+    /// **V3.5.0.X A-HIGH-2 IDE-level verification gap closure**:
+    /// V3.5.0.X landed `workbookSnapshot` reading from `rebuild_workbook`
+    /// `formula_at` so renamed sheets surface repaired formula text.
+    /// That was verified only by a Rust ql-collab test pre-D5 because
+    /// the IDE had no PutFormula write-path.  Post-D5: the IDE can
+    /// drive the end-to-end repaired-formula scenario via mocha
+    /// (open .qbook, appendPutFormula referencing S, rename S, assert
+    /// `workbookSnapshot()` surfaces the repaired text).
+    ///
+    /// **Edit-flow companion** (V3.6.0.X audit-of-D4 OPUS-HIGH-2 § G.2):
+    /// IDE renderers that emit `data-raw-value` for click-to-edit
+    /// SHOULD also emit `data-raw-formula` when a cell has formula
+    /// text -- `beginEdit` should source the input value from
+    /// `data-raw-formula` (formula source) when present, then
+    /// `data-raw-value` (literal), then `data-original-text` (rendered
+    /// display).  Otherwise a cell with both a formula AND a cached
+    /// literal value would open editing on the literal (not the
+    /// formula the user typed).
+    ///
+    /// # Errors
+    ///
+    /// - `[bad_argument]` if `row` or `col` is NaN/Infinity/negative/
+    ///   non-integer/out-of-u32-range.
+    /// - `[session_oplog]` if the underlying `append_op` fails (e.g.,
+    ///   codec encode error; the cell-keyed CacheEffect path).
+    #[napi(js_name = "appendPutFormula")]
+    pub fn append_put_formula(&self, sheet: u16, row: f64, col: f64, text: String) -> Result<()> {
+        let row_u32 = validate_u32_index("appendPutFormula", "row", row)?;
+        let col_u32 = validate_u32_index("appendPutFormula", "col", col)?;
+        let op = Op::PutFormula {
+            sheet,
+            row: row_u32,
+            col: col_u32,
+            text,
+        };
+        let mut inner = self.inner.lock();
+        inner.append_op(op).map_err(collab_session_error_to_napi)?;
+        Ok(())
+    }
+
     /// **Phase 5.7 V3.2.a (2026-05-22) -- cell-snapshot export for the IDE grid widget.**
     ///
     /// Returns a JSON-serialized snapshot of the latest `PutValue`
