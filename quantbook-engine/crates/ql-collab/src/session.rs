@@ -986,6 +986,38 @@ pub struct CollabSession {
     /// Sync` iff `K, V: Send + Sync`.  `Option<X>: Send + Sync` iff `X:
     /// Send + Sync`.  **0 new triggers; arc terminus stays at 6.**
     last_snapshot_oplog_vv: Option<loro::VersionVector>,
+
+    /// **Phase 5.7 V3.6.0.8.3 D6 (2026-05-25) -- op-log length pinning
+    /// alongside the VV.**
+    ///
+    /// Records `self.log.len()` at the moment
+    /// [`Self::last_snapshot_workbook`] was populated.  V3.6.0.8.3 needs
+    /// this for the cell-only fast-path: ops appended since the cache
+    /// live at positional indices `[op_count, self.log.len())` (the
+    /// V3.6.0.8.2 invalidation discipline guarantees no
+    /// merge_bytes/discard/undo/redo has run between cache populate +
+    /// delta read, so `append_op` is the ONLY way the log grew --
+    /// positional indices since the cache are stable + monotone).
+    ///
+    /// `None` iff the workbook cache is `None`; the three fields
+    /// (`last_snapshot_workbook`, `last_snapshot_oplog_vv`,
+    /// `last_snapshot_op_count`) are reset + populated together as an
+    /// invariant.
+    ///
+    /// **Why both VV and op_count**: VV is the consumer-facing token
+    /// (opaque + Loro-stable across peers); op_count is the
+    /// implementation-facing handle for the delta replay range.  VV
+    /// drives the staleness check (compare to caller's
+    /// `lastSeenVersion`); op_count drives the replay slice
+    /// (`apply_ops_in_range(log, &mut wb_clone, cached_op_count,
+    /// log.len(), registry)`).  Both are derivable from the log state
+    /// at the populate moment; storing them together is the cheapest
+    /// way to avoid VV->op_count walks at delta time.
+    ///
+    /// **Rule 4 per-field walk**: `usize: Copy + Send + Sync`;
+    /// `Option<X>: Send + Sync` iff `X: Send + Sync`.  **0 new
+    /// triggers; arc terminus stays at 6.**
+    last_snapshot_op_count: Option<usize>,
 }
 
 impl CollabSession {
@@ -1059,6 +1091,7 @@ impl CollabSession {
             // until then.
             last_snapshot_workbook: None,
             last_snapshot_oplog_vv: None,
+            last_snapshot_op_count: None,
         })
     }
 
@@ -1149,6 +1182,7 @@ impl CollabSession {
             // repair walks) which we avoid until a consumer needs it.
             last_snapshot_workbook: None,
             last_snapshot_oplog_vv: None,
+            last_snapshot_op_count: None,
         };
         sess.rebuild_snapshot_cache()?;
         Ok(sess)
@@ -1780,6 +1814,46 @@ impl CollabSession {
     pub fn set_workbook_cache(&mut self, workbook: Arc<Workbook>, vv: loro::VersionVector) {
         self.last_snapshot_workbook = Some(workbook);
         self.last_snapshot_oplog_vv = Some(vv);
+        // V3.6.0.8.3 D6: pin op_count alongside VV so the delta path
+        // can derive the replay slice [op_count, self.log.len()) without
+        // a VV->op_count walk.  See `last_snapshot_op_count` field
+        // docstring for rationale.
+        self.last_snapshot_op_count = Some(self.log.len());
+    }
+
+    /// **Phase 5.7 V3.6.0.8.3 D6 (2026-05-25)** -- read accessor for
+    /// the op-count pinned alongside the workbook cache.
+    ///
+    /// Returns `Some(n)` iff [`Self::last_snapshot_workbook`] returns
+    /// `Some`.  The three cache fields are populated + cleared
+    /// together as an invariant; this accessor is used by the
+    /// V3.6.0.8.3 delta napi to compute the `apply_ops_in_range` slice.
+    pub fn last_snapshot_op_count(&self) -> Option<usize> {
+        self.last_snapshot_op_count
+    }
+
+    /// **Phase 5.7 V3.6.0.8 D6 (2026-05-25)** -- read accessor for
+    /// the current Loro oplog VV.
+    ///
+    /// Returns `self.log.oplog_vv()`.  Public surface so the V3.6.0.8.3
+    /// napi `workbook_snapshot` body can pair the freshly-rebuilt
+    /// workbook with the corresponding VV when calling
+    /// [`Self::set_workbook_cache`], AND so the napi
+    /// `workbook_snapshot_delta` can probe the live VV for the same-VV
+    /// fast-path comparison against `last_snapshot_oplog_vv`.
+    pub fn oplog_vv(&self) -> loro::VersionVector {
+        self.log.oplog_vv()
+    }
+
+    /// **Phase 5.7 V3.6.0.8 D6 (2026-05-25)** -- read accessor for the
+    /// underlying op log (read-only).
+    ///
+    /// V3.6.0.8.3 needs to enumerate ops since a cached VV to classify
+    /// the delta (cell-only vs rename-containing).  Exposes the log
+    /// for that walk; the caller is responsible for not mutating
+    /// through this borrow.
+    pub fn log(&self) -> &OpLog {
+        &self.log
     }
 
     /// **Phase 5.7 V3.6.0.8 D6 (2026-05-25)** -- invalidate the
@@ -1804,6 +1878,9 @@ impl CollabSession {
     pub fn force_clear_workbook_cache(&mut self) {
         self.last_snapshot_workbook = None;
         self.last_snapshot_oplog_vv = None;
+        // V3.6.0.8.3 D6: also clear op_count to maintain the "all
+        // three fields Some-together / None-together" invariant.
+        self.last_snapshot_op_count = None;
     }
 
     /// **Phase 5.7 V3.3.0.X audit closure (MEDIUM-5, 2026-05-23) --
@@ -1859,9 +1936,11 @@ impl CollabSession {
         // V3.6.0.8 D6: also reset the workbook cache test-seam
         // discipline -- callers using `force_clear_snapshot_cache`
         // for "clean cache state" tests should see ALL cache state
-        // reset, not just `last_snapshot`.
+        // reset, not just `last_snapshot`.  V3.6.0.8.3 adds op_count
+        // to the three-field-together invariant.
         self.last_snapshot_workbook = None;
         self.last_snapshot_oplog_vv = None;
+        self.last_snapshot_op_count = None;
     }
 
     /// **Phase 5.7 V3.3.0.3 + V3.4.0.2 -- snapshot cache accessor

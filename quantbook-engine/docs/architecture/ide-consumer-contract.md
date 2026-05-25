@@ -1799,12 +1799,12 @@ Three additional minor findings noted but not fixed in-cycle:
 
 ### 4.1.z6 Loro UndoManager on_push + format registry + per-cell op-index + format-aware buildHtml rendering (Phase 5.7 V3.6, 2026-05-24)
 
-**Status**: V3.6.0.1 lock + V3.6.0.2 D1 + V3.6.0.3 D2 + V3.6.0.4 D3 + V3.6.0.5 D4 + V3.6.0.6 D5 + V3.6.0.X audit-of-D5 closures + V3.6.0.7 D6 profiling spike + V3.6.0.8.1 D6 DESIGN LOCK + **V3.6.0.8.2 D6 ENGINE PART 1** ALL SHIPPED + AUDITED.  V3.6.0.8.3 (napi method + cell-only fast-path + bench) is the next sub-step; V3.6.0.8.4 = audit-of-D6.  Spike verdict (V3.6.0.7): 251 ms median at 100k cells / 50 % format / 1 sheet (5× the 50 ms threshold).  Lock verdict (V3.6.0.8.1): option (a) cache rebuilt+repaired Workbook + clone-and-apply-delta CHOSEN.  Engine foundation (V3.6.0.8.2): 2 new fields + 4 invalidation callsites + new public `apply_ops_in_range` helper on ql-oplog.
+**Status**: V3.6.0.1 lock + V3.6.0.2 D1 + V3.6.0.3 D2 + V3.6.0.4 D3 + V3.6.0.5 D4 + V3.6.0.6 D5 + V3.6.0.X audit-of-D5 closures + V3.6.0.7 D6 profiling spike + V3.6.0.8.1 D6 DESIGN LOCK + V3.6.0.8.2 D6 ENGINE PART 1 + **V3.6.0.8.3 D6 ENGINE PART 2 napi** ALL SHIPPED + AUDITED.  V3.6.0.8.4 = audit-of-D6 + bench delta-vs-full at 100k cells + R-V3.6-15 full debug-assert + R-V3.6-17 clone-cost profile is the next sub-step.  Spike verdict (V3.6.0.7): 251 ms median at 100k cells / 50 % format / 1 sheet (5× the 50 ms threshold).  Lock verdict (V3.6.0.8.1): option (a) cache rebuilt+repaired Workbook + clone-and-apply-delta CHOSEN.  Engine foundation (V3.6.0.8.2): 2 new fields + 4 invalidation callsites + new public `apply_ops_in_range` helper on ql-oplog.
 
-**Engine HEAD at this section's commit**: (next; V3.6.0.8.2 D6 ENGINE PART 1 commit -- 2 new fields + force_clear_workbook_cache + 4-callsite invalidation + apply_ops_in_range public helper + 13 regression tests + plan/MASTER-PLAN/this file sweep) <- `ebe7c946429` (V3.6.0.8.1 D6 DESIGN LOCK docs-only) <- `3e1e4deff50` (V3.6.0.7 D6 spike) <- `1e1e5464da9` (V3.6.0.X audit-of-D5 closures).
-**IDE HEAD at this section's commit**: `d9731633ac4` (V3.6.0.X audit-of-D5 closures; V3.6.0.7 + V3.6.0.8.1 + V3.6.0.8.2 are engine-only, no IDE touch).
+**Engine HEAD at this section's commit**: (next; V3.6.0.8.3 D6 ENGINE PART 2 napi commit -- workbookSnapshotDelta napi + WorkbookSnapshotDeltaJson struct + helpers + last_snapshot_op_count 3rd cache field + cache populate in workbookSnapshot + oplog_vv/log accessors + VersionVector re-export + types.ts + 6 mocha shape tests + plan/MASTER-PLAN/this file sweep) <- `dc74d48b97e` (V3.6.0.8.2 D6 ENGINE PART 1) <- `ebe7c946429` (V3.6.0.8.1 D6 DESIGN LOCK) <- `3e1e4deff50` (V3.6.0.7 D6 spike).
+**IDE HEAD at this section's commit**: (next; V3.6.0.8.3 D6 IDE commit -- types.ts WorkbookSnapshotDeltaJson + workbookSnapshotDelta method + 6 mocha shape tests) <- `d9731633ac4` (V3.6.0.X audit-of-D5 closures IDE; V3.6.0.7 + V3.6.0.8.1 + V3.6.0.8.2 are engine-only) <- prior chain.
 
-**Tests baseline**: ql-collab **149/149** (V3.6.0.8.2 +13 over V3.6.0.X audit-of-D5 136 baseline: 8 workbook cache invariants + 4 apply_ops_in_range correctness + 1 cache discipline) + ql-oplog **67/67** + IDE mocha **384/384** unchanged + ql-collab-ws **42/42** (10 lib + 30 transport + 2 V3.1.a relay; +2 doctests separate) + engine workspace release build clean.  V3.6.0.7 adds 1 criterion bench (`cargo bench -p ql-bindings-node --bench workbook_snapshot`).
+**Tests baseline**: ql-collab **149/149** unchanged (V3.6.0.8.2's +13 over 136; V3.6.0.8.3 added the 3rd cache field but no new ql-collab tests -- the V3.6.0.8.2 9-tests-on-workbook-cache suite naturally exercises the extended setter via existing `set_workbook_cache` calls) + ql-oplog **67/67** unchanged + IDE mocha **390/390** (V3.6.0.8.3 +6 over the V3.6.0.X audit-of-D5 live 384 baseline) + ql-collab-ws **42/42** + engine workspace release build clean.  V3.6.0.7 adds 1 criterion bench (`cargo bench -p ql-bindings-node --bench workbook_snapshot`); V3.6.0.8.4 will add a delta-vs-full bench.
 
 #### V3.6.0.1 -- decision lock (9 D-decisions)
 
@@ -2021,9 +2021,9 @@ fn workbook_snapshot_delta(&self, last_seen: Vec<u8>) -> Result<WorkbookSnapshot
 | Sub-step | Description | Cycles | Status |
 |---|---|---|---|
 | V3.6.0.8.1 | DESIGN LOCK (docs-only) | 1 | ✅ SHIPPED |
-| **V3.6.0.8.2** | ENGINE PART 1: new fields + `force_clear_workbook_cache` + invalidation wiring at 4 callsites + new public `apply_ops_in_range(from, to)` helper on `OpLog` + ql-collab regression tests | 1 | ✅ SHIPPED |
-| V3.6.0.8.3 | ENGINE PART 2: `workbook_snapshot_delta` napi + cell-only fast-path + rename-full-rebuild branch + staleness check + bench delta vs full snapshot at 100k cells + napi shape tests | 1 | PENDING |
-| V3.6.0.8.4 | V3.6.0.X audit-of-D6 (parallel Codex Lane A + Opus Lane B + closures) | 1 | PENDING |
+| V3.6.0.8.2 | ENGINE PART 1: new fields + `force_clear_workbook_cache` + invalidation wiring at 4 callsites + new public `apply_ops_in_range(from, to)` helper on `OpLog` + ql-collab regression tests | 1 | ✅ SHIPPED |
+| **V3.6.0.8.3** | ENGINE PART 2 napi: `workbookSnapshotDelta` napi + `WorkbookSnapshotDeltaJson` struct + helper structs + cell-only fast-path + rename-full-rebuild branch + staleness check + cache populate in `workbookSnapshot` + napi shape tests in mocha.  Bench delta-vs-full deferred to V3.6.0.8.4. | 1 | ✅ SHIPPED (user-directed cycle-3 override) |
+| V3.6.0.8.4 | V3.6.0.X audit-of-D6 (parallel Codex Lane A + Opus Lane B + closures) + bench delta-vs-full at 100k cells + R-V3.6-15 full debug-assert + R-V3.6-17 Workbook clone-cost profile | 1 | PENDING |
 
 Total D6 arc: **4 cycles across ≥2 sessions** (CLAUDE.md ≤2-cycles-per-session ceiling).
 
@@ -2067,6 +2067,7 @@ The plan body at `.plans/_active.md` lines 286-314 is the authoritative source. 
 | V3.6.0.7 D6 spike | (measurement, no audit-of-spike) | `2026-05-25-phase-5-7-v3-6-0-7-spike.md` (spike transcript; not an audit) |
 | V3.6.0.8.1 D6 lock | (design lock, no audit-of-lock) | inline at `.plans/_active.md` + this section + docs/MASTER-PLAN.md (docs-only ship) |
 | V3.6.0.8.2 D6 engine PART 1 | (engine foundation, audit-of-D6 at V3.6.0.8.4) | inline at `.plans/_active.md` + this section + docs/MASTER-PLAN.md |
+| V3.6.0.8.3 D6 engine PART 2 napi | (napi surface; audit-of-D6 at V3.6.0.8.4) | inline at `.plans/_active.md` + this section + docs/MASTER-PLAN.md |
 
 Date inconsistency note: V3.6.0.3 + V3.6.0.4 transcripts dated 2026-05-23 (per work-start session date); V3.6.0.2 + V3.6.0.5 + docs-audit dated 2026-05-24.  This is a known low-severity drift; convention going forward: filename date = audit execution date (post-midnight transitions retain the original session's date in the header).
 

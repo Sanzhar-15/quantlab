@@ -348,6 +348,87 @@ fn collab_session_error_to_napi(e: CollabSessionError) -> Error {
     Error::from_reason(format!("[{}] {e}", e.kind()))
 }
 
+/// **Phase 5.7 V3.6.0.8.3 D6 (2026-05-25)** -- helper for the
+/// [`CollabSession::workbook_snapshot_delta`] fullRebuildRequired
+/// / empty-delta paths.  Single source of truth for the "empty
+/// arrays, just version + bool" shape; keeps the algorithm body
+/// reading sequentially.
+fn empty_delta(version: Buffer, full_rebuild_required: bool) -> WorkbookSnapshotDeltaJson {
+    WorkbookSnapshotDeltaJson {
+        changed_cells: Vec::new(),
+        removed_cells: Vec::new(),
+        sheets_changed: Vec::new(),
+        sheets_removed: Vec::new(),
+        formats_added: Vec::new(),
+        version,
+        full_rebuild_required,
+    }
+}
+
+/// **Phase 5.7 V3.6.0.8.3 D6 (2026-05-25)** -- classify a single op
+/// for [`CollabSession::workbook_snapshot_delta`]'s delta walk.
+///
+/// Sets `has_rename = true` on any `Op::RenameSheet | RenameTable |
+/// RenameColumn`; the caller's break-on-rename short-circuit takes
+/// effect after this returns.  Otherwise extracts the cell coord,
+/// sheet removal, or format registration into the appropriate
+/// output collection.
+///
+/// Recurses into `Op::BatchCommit` to handle nested cell ops (mirrors
+/// the V3.4.0.X HIGH-1 closure on `collect_cache_effects`).
+///
+/// Non-cell-keyed, non-rename, non-format ops (e.g., `SetName`,
+/// `AddSheet`, `MoveSheet`, `CreateTable`, `DropTable`, etc.) are
+/// silently skipped here.  V3.6.0.8.3 scope: their effects don't
+/// emit in this delta surface (would require sheets_changed or new
+/// surface fields; deferred to V3.6.0.8.4+).
+fn classify_delta_op(
+    op: &Op,
+    has_rename: &mut bool,
+    changed_cells: &mut std::collections::HashSet<(u16, u32, u32)>,
+    removed_sheets: &mut Vec<u16>,
+    new_formats: &mut Vec<ql_storage::FormatId>,
+) {
+    match op {
+        Op::PutValue { sheet, row, col, .. }
+        | Op::PutFormula { sheet, row, col, .. }
+        | Op::ClearFormula { sheet, row, col }
+        | Op::SetCellFormat { sheet, row, col, .. } => {
+            changed_cells.insert((*sheet, *row, *col));
+        }
+        Op::RenameSheet { .. } | Op::RenameTable { .. } | Op::RenameColumn { .. } => {
+            *has_rename = true;
+        }
+        Op::RemoveSheet { id } => {
+            removed_sheets.push(*id);
+        }
+        Op::RegisterFormat { id, .. } => {
+            new_formats.push(id.clone().to_storage());
+        }
+        Op::BatchCommit { ops } => {
+            for inner in ops {
+                classify_delta_op(
+                    inner,
+                    has_rename,
+                    changed_cells,
+                    removed_sheets,
+                    new_formats,
+                );
+                if *has_rename {
+                    return;
+                }
+            }
+        }
+        // Other ops (SetName / AddSheet / MoveSheet / CreateTable /
+        // DropTable / SetDateSystem / SetLocale / SetReferenceMode)
+        // are silently skipped: they don't emit in V3.6.0.8.3's
+        // delta surface (their effects are workbook-metadata-level,
+        // not per-cell).  V3.6.0.8.4+ may grow `sheets_changed` or
+        // workbook-metadata fields to cover them.
+        _ => {}
+    }
+}
+
 /// Map a [`TransportError`] to a napi [`Error`] with a kind-
 /// prefixed message. Used by `flushPendingToTransport`'s async
 /// `wait_for_drain` path.
@@ -804,6 +885,124 @@ pub struct FormatDefJson {
     /// V3.6+ engine-side `FormatTable::render_value` for number / date
     /// / currency display.
     pub string: String,
+}
+
+/// **Phase 5.7 V3.6.0.8.3 D6 (2026-05-25)** -- one cell entry in a
+/// `WorkbookSnapshotDeltaJson.changedCells` payload.  Pairs a sheet
+/// id with the per-cell snapshot data (same `CellSnapshotJson` shape
+/// used by the full `workbookSnapshot()` reply).
+///
+/// **Rule 4 per-field walk**: `sheet: u32` primitive; `cell:
+/// CellSnapshotJson` Send + Sync via the V3.5.0.5 / V3.6.0.5 walks.
+/// Composition: `ChangedCellJson: Send + Sync`.  **0 new triggers.**
+#[napi(object)]
+pub struct ChangedCellJson {
+    pub sheet: u32,
+    pub cell: CellSnapshotJson,
+}
+
+/// **Phase 5.7 V3.6.0.8.3 D6 (2026-05-25)** -- one removed-cell entry
+/// in `WorkbookSnapshotDeltaJson.removedCells`.  The IDE clears its
+/// cached cell at this coordinate (typical source: undo of a PutValue
+/// op or remote tombstone via SetCellFormat-with-None).
+///
+/// **Rule 4 per-field walk**: three primitive `u32`s.  Composition:
+/// `RemovedCellJson: Send + Sync`.  **0 new triggers.**
+#[napi(object)]
+pub struct RemovedCellJson {
+    pub sheet: u32,
+    pub row: u32,
+    pub col: u32,
+}
+
+/// **Phase 5.7 V3.6.0.8.3 D6 (2026-05-25) -- incremental WorkbookSnapshot
+/// delta reply.**
+///
+/// Returned by [`CollabSession::workbook_snapshot_delta`].  Locked at
+/// V3.6.0.8.1 design lock (see `docs/architecture/ide-consumer-contract.md
+/// § 4.1.z6` V3.6.0.8.1 sub-section for the full design).
+///
+/// **Two-call IDE protocol**:
+/// 1. First call: IDE passes `Buffer.alloc(0)`.  Engine returns
+///    `fullRebuildRequired=true` + empty arrays + current `version`.
+/// 2. IDE calls `workbookSnapshot()` for the full state, records the
+///    returned `version` token alongside.
+/// 3. Subsequent calls: IDE passes the stored `version`.  Engine returns
+///    either a delta (merge into prior render) OR
+///    `fullRebuildRequired=true` (discard local state, call
+///    `workbookSnapshot()` again).
+///
+/// **Additive over WorkbookSnapshotJson** -- no shape break for
+/// V3.5/V3.6 IDE consumers; they call `workbookSnapshot()` as before
+/// and ignore this delta surface entirely.
+///
+/// **Rule 4 per-field walk**: `changed_cells: Vec<ChangedCellJson>`,
+/// `removed_cells: Vec<RemovedCellJson>`, `sheets_changed:
+/// Vec<SheetSnapshotJson>`, `formats_added: Vec<FormatDefJson>` -- all
+/// `Vec<T>: Send + Sync` iff `T: Send + Sync`; all four element types
+/// pass.  `sheets_removed: Vec<u32>` primitive.  `version: Buffer`
+/// Send + Sync via napi-rs (the underlying `Vec<u8>` is).
+/// `full_rebuild_required: bool` Send + Sync trivially.  Composition:
+/// `WorkbookSnapshotDeltaJson: Send + Sync`.  **0 new triggers; arc
+/// terminus stays at 6.**
+#[napi(object)]
+pub struct WorkbookSnapshotDeltaJson {
+    /// Cells that newly exist OR whose value / formula / format /
+    /// rendered changed since `lastSeenVersion`.  Same `CellSnapshotJson`
+    /// shape as a full `workbookSnapshot()` cell entry; the IDE merges
+    /// each into its prior render keyed by `(sheet, row, col)`.
+    pub changed_cells: Vec<ChangedCellJson>,
+
+    /// Cells that no longer exist at their `(sheet, row, col)` (typical
+    /// source: undo of a `PutValue`).  IDE clears its cached cell at
+    /// each coordinate.  Empty at V3.6.0.8.3 baseline -- the cell-only
+    /// fast-path emits removed_cells only when a delta op explicitly
+    /// drops a cell (V3.6.0.8.3 conservative scope deferred -- see
+    /// docstring on `workbook_snapshot_delta` below).
+    pub removed_cells: Vec<RemovedCellJson>,
+
+    /// Sheets whose metadata changed since `lastSeenVersion` (rename,
+    /// move, name change).  The IDE replaces its sheet-level entry for
+    /// each.  Includes the full `cells: Vec<CellSnapshotJson>` payload
+    /// for sheets in the delta (V3.6.0.8.3 baseline: when a rename op
+    /// is present, the full-rebuild branch fires and ALL sheets are
+    /// surfaced; the cell-only fast-path doesn't emit `sheets_changed`
+    /// because cell ops don't change sheet metadata).
+    pub sheets_changed: Vec<SheetSnapshotJson>,
+
+    /// Sheet ids tombstoned since `lastSeenVersion` (`Op::RemoveSheet`).
+    /// The IDE removes its sheet entry for each.
+    pub sheets_removed: Vec<u32>,
+
+    /// Formats registered since `lastSeenVersion` (`Op::RegisterFormat`
+    /// for Custom ids; Builtin ids are not emitted here per the
+    /// V3.6.0.X audit-of-D2 closure).  The IDE merges each into its
+    /// `formats` table by `FormatId`.
+    pub formats_added: Vec<FormatDefJson>,
+
+    /// Opaque version-vector token.  IDE stores it and passes back on
+    /// the next call as `lastSeenVersion`.  Encoded via
+    /// `loro::VersionVector::encode()` (Loro 1.12.0 stable wire format
+    /// -- see registry/loro-internal-1.12.0/src/version.rs:843); the
+    /// IDE does NOT decode it -- it's an opaque blob round-tripped
+    /// through napi `Buffer` ⇄ `Vec<u8>`.
+    pub version: Buffer,
+
+    /// `true` when the engine could not produce a delta and the IDE
+    /// MUST call `workbookSnapshot()` instead.  Sources:
+    /// - First call (empty `lastSeenVersion`).
+    /// - Cache miss (no prior `workbookSnapshot()` call to populate the
+    ///   workbook cache).
+    /// - Staleness (`lastSeenVersion` doesn't match the cached VV --
+    ///   typically because an invalidation site fired between calls).
+    /// - Malformed `lastSeenVersion` (Loro VV decode error).
+    ///
+    /// When `true`, `changedCells` / `removedCells` / `sheetsChanged`
+    /// / `sheetsRemoved` / `formatsAdded` are all empty; `version`
+    /// carries the engine's CURRENT VV so the IDE can immediately
+    /// retry the delta call right after its `workbookSnapshot()`
+    /// fetch + cache populate (no race window).
+    pub full_rebuild_required: bool,
 }
 
 #[napi(object)]
@@ -1800,11 +1999,28 @@ impl CollabSession {
     ///   rename-repair failure, etc.) -- same propagation as `to_qbook`.
     #[napi(js_name = "workbookSnapshot")]
     pub fn workbook_snapshot(&self) -> Result<WorkbookSnapshotJson> {
-        let inner = self.inner.lock();
+        // **Phase 5.7 V3.6.0.8.3 D6 (2026-05-25)**: hold the lock as
+        // `&mut` so we can populate the workbook cache via
+        // `set_workbook_cache` at the end.  The cache enables the
+        // V3.6.0.8.3 `workbookSnapshotDelta` cell-only fast-path on
+        // subsequent calls (no `rebuild_workbook` + repair walks for
+        // ops appended since this call).
+        let mut inner = self.inner.lock();
         let registry = default_registry();
         let (workbook, _report) = inner
             .rebuild_workbook(&registry)
             .map_err(collab_session_error_to_napi)?;
+        // **V3.6.0.8.3 D6**: pin the VV at the moment of rebuild so
+        // delta-staleness check downstream is exact.  `oplog_vv()` is
+        // a cheap clone of Loro's internal BTreeMap<PeerID, Counter>
+        // (O(peer-count), not O(op-count) -- verified
+        // `crates/ql-oplog/src/log.rs:424`).
+        let cache_vv = inner.oplog_vv();
+        // **V3.6.0.8.3 D6**: wrap the rebuilt+repaired workbook in
+        // `Arc` BEFORE rendering so we can populate the cache without
+        // a second clone.  Rendering reads through `Arc::deref` (cost
+        // identical to `&Workbook`).
+        let workbook = std::sync::Arc::new(workbook);
         // **Phase 5.7 V3.6.0.5 D4 (2026-05-23)**: build the
         // EvalContext used by format::render.  date_system comes
         // from the workbook (Phase 4.6 D-1; post V3.6.0.X audit-
@@ -2045,10 +2261,339 @@ impl CollabSession {
             ql_types::DateSystem::Excel1900 => "Excel1900".to_string(),
             ql_types::DateSystem::Excel1904 => "Excel1904".to_string(),
         };
+        // **Phase 5.7 V3.6.0.8.3 D6 (2026-05-25)**: populate the
+        // workbook cache.  Subsequent `workbookSnapshotDelta` calls
+        // pin against `cache_vv` for staleness + use the cached
+        // `Arc<Workbook>` as the clone source for the cell-only fast-
+        // path.  `Arc::clone` is O(1) (atomic refcount bump); no
+        // Workbook clone here.  V3.6.0.8.2 `set_workbook_cache`
+        // overwrites any prior cache atomically.
+        inner.set_workbook_cache(std::sync::Arc::clone(&workbook), cache_vv);
         Ok(WorkbookSnapshotJson {
             sheets,
             formats,
             date_system,
+        })
+    }
+
+    /// **Phase 5.7 V3.6.0.8.3 D6 (2026-05-25) -- incremental WorkbookSnapshot
+    /// delta.**
+    ///
+    /// Returns the cells / sheets / formats that changed since the
+    /// caller's `lastSeenVersion`, or `fullRebuildRequired=true` when
+    /// the engine can't produce a delta and the IDE should call
+    /// `workbookSnapshot()` instead.
+    ///
+    /// See [`WorkbookSnapshotDeltaJson`] for the consumer protocol +
+    /// shape contract, and `docs/architecture/ide-consumer-contract.md
+    /// § 4.1.z6 V3.6.0.8.1 sub-section` for the locked design.
+    ///
+    /// # Algorithm (V3.6.0.8.1 lock)
+    ///
+    /// 1. Empty `last_seen_version` Buffer OR no prior workbook cache
+    ///    → return `fullRebuildRequired=true` + current VV.
+    /// 2. Decode caller's VV via `loro::VersionVector::decode`.
+    /// 3. Staleness: caller_vv != cached_vv → return
+    ///    `fullRebuildRequired=true`.
+    /// 4. Same-VV fast-path: current_vv == cached_vv (no ops since
+    ///    last cache) → return empty delta.
+    /// 5. Enumerate ops since cached `op_count` (positional range
+    ///    `[cached_op_count, log.len())`).  V3.6.0.8.2 invalidation
+    ///    discipline guarantees `append_op` is the ONLY way the log
+    ///    grew between cache populate + delta call (merge_bytes /
+    ///    discard_pending_ops / undo / redo all invalidated the
+    ///    cache); positional indices since the cache are stable +
+    ///    monotone.
+    /// 6. Classify delta: detect any `Op::RenameSheet | RenameTable |
+    ///    RenameColumn` in the range.
+    /// 7. If rename: return `fullRebuildRequired=true` (V3.6.0.8.3
+    ///    conservative scope; full delta JSON for rename ops deferred
+    ///    to V3.6.0.8.4+ -- rename ops touch all formula cells via
+    ///    `repair_*_chain` so the delta would degenerate to "all cells
+    ///    with formulas"; calling `workbookSnapshot()` is simpler +
+    ///    cheaper than building the equivalent delta).
+    /// 8. Otherwise (cell-only): clone cached `Arc<Workbook>` via
+    ///    `Arc::make_mut`, replay `[cached_op_count, log.len())` via
+    ///    `apply_ops_in_range` (skips repair walks per the cell-only
+    ///    contract; new ops contain no renames), update cache,
+    ///    emit per-cell delta entries + new formats + tombstoned
+    ///    sheets.
+    ///
+    /// # V3.6.0.8.3 scope limitations
+    ///
+    /// - `removed_cells` is always empty (V3.7+ feature).  A clean-
+    ///   formula or value-set-to-empty would surface as a
+    ///   `changedCells` entry with the new state.  True removals
+    ///   (undo of a `PutValue`) invalidate the cache via
+    ///   `force_clear_workbook_cache` → next delta call returns
+    ///   `fullRebuildRequired=true`.
+    /// - Rename ops trigger full rebuild fallback rather than
+    ///   incremental rename delta.
+    /// - `sheets_changed` is always empty in the cell-only path (cell
+    ///   ops don't change sheet metadata); full rebuild paths surface
+    ///   sheets via `fullRebuildRequired=true` + the IDE's full
+    ///   `workbookSnapshot()` re-fetch.
+    ///
+    /// # Errors
+    ///
+    /// - `[session_replay]` if `apply_ops_in_range` fails partway
+    ///   through the cell-only fast-path.  The cache is cleared in
+    ///   this case (cached Workbook is half-mutated) so the next
+    ///   delta call falls back to `fullRebuildRequired=true`.
+    /// - `[bad_argument]` on malformed `last_seen_version` Buffer
+    ///   (Loro decode error).
+    #[napi(js_name = "workbookSnapshotDelta")]
+    pub fn workbook_snapshot_delta(
+        &self,
+        last_seen_version: Buffer,
+    ) -> Result<WorkbookSnapshotDeltaJson> {
+        let mut inner = self.inner.lock();
+        let current_vv = inner.oplog_vv();
+        let current_op_count = inner.log().len();
+        let current_version_bytes: Buffer = current_vv.encode().into();
+
+        // Step 1a: empty buffer → full rebuild required.
+        if last_seen_version.is_empty() {
+            return Ok(empty_delta(current_version_bytes, true));
+        }
+
+        // Step 1b: no prior cache → full rebuild required.
+        let (cached_arc, cached_vv, cached_op_count) = match (
+            inner.last_snapshot_workbook(),
+            inner.last_snapshot_oplog_vv(),
+            inner.last_snapshot_op_count(),
+        ) {
+            (Some(arc), Some(vv), Some(n)) => {
+                (std::sync::Arc::clone(arc), vv.clone(), n)
+            }
+            _ => {
+                return Ok(empty_delta(current_version_bytes, true));
+            }
+        };
+
+        // Step 2: decode caller VV.
+        let caller_vv = match ql_oplog::VersionVector::decode(last_seen_version.as_ref()) {
+            Ok(vv) => vv,
+            Err(_) => {
+                // Malformed token → conservative: full rebuild.  We
+                // don't `bad_argument` because the IDE consumer
+                // protocol treats `fullRebuildRequired=true` as the
+                // recovery path; returning Err here would force the
+                // IDE into exception-handling for a recoverable case.
+                return Ok(empty_delta(current_version_bytes, true));
+            }
+        };
+
+        // Step 3: staleness check.
+        if caller_vv != cached_vv {
+            return Ok(empty_delta(current_version_bytes, true));
+        }
+
+        // Step 4: same-VV fast-path.
+        if current_vv == cached_vv {
+            return Ok(empty_delta(current_version_bytes, false));
+        }
+
+        // Step 5-6: enumerate ops since cached_op_count + classify.
+        // V3.6.0.8.2 invalidation discipline guarantees positional
+        // indices [cached_op_count, current_op_count) are stable
+        // (append_op is the only growth path between cache populate
+        // and now).
+        if cached_op_count > current_op_count {
+            // Invariant violation: cache says we had more ops than
+            // we do now.  Should be impossible (invalidation triggers
+            // on undo/discard/merge), but guard defensively.
+            inner.force_clear_workbook_cache();
+            return Ok(empty_delta(current_version_bytes, true));
+        }
+        let new_ops_range = cached_op_count..current_op_count;
+        // Collect classification + the bodies we'll need for the
+        // delta JSON.  Walk via OpLog::iter() with skip/take; mirrors
+        // the apply_ops_in_range pattern but bounded by the slice we
+        // already verified.
+        let mut has_rename = false;
+        let mut changed_cell_coords: std::collections::HashSet<(u16, u32, u32)> =
+            std::collections::HashSet::new();
+        let mut removed_sheet_ids: Vec<u16> = Vec::new();
+        let mut new_format_ids: Vec<ql_storage::FormatId> = Vec::new();
+        // Collect the slice of ops into an owned Vec so the borrow on
+        // `inner.log()` ends before any potential mutable callback
+        // (force_clear_workbook_cache).  Bounded by N_new_ops which is
+        // small in steady-state editing (the cell-only fast-path
+        // target); allocation cost is negligible vs the per-cell
+        // rendering pipeline downstream.
+        let new_ops: Vec<std::result::Result<Op, ql_oplog::OpLogError>> = inner
+            .log()
+            .iter()
+            .enumerate()
+            .skip(new_ops_range.start)
+            .take(new_ops_range.end - new_ops_range.start)
+            .map(|(_idx, op_result)| op_result)
+            .collect();
+        for op_result in new_ops {
+            let op = match op_result {
+                Ok(op) => op,
+                Err(_) => {
+                    // Op decode failure mid-walk: conservative full
+                    // rebuild.  Invalidate cache too since we can't
+                    // trust the ops range.
+                    inner.force_clear_workbook_cache();
+                    return Ok(empty_delta(current_version_bytes, true));
+                }
+            };
+            classify_delta_op(
+                &op,
+                &mut has_rename,
+                &mut changed_cell_coords,
+                &mut removed_sheet_ids,
+                &mut new_format_ids,
+            );
+            if has_rename {
+                break;
+            }
+        }
+
+        // Step 7: rename detected → full rebuild fallback.
+        if has_rename {
+            return Ok(empty_delta(current_version_bytes, true));
+        }
+
+        // Step 8: cell-only fast-path.  Clone the cached Workbook via
+        // `Arc::make_mut` (forks on write; if the IDE is holding
+        // another Arc clone, this returns a fresh clone, otherwise
+        // mutates in place -- both safe).  Apply [cached_op_count,
+        // current_op_count) forward via apply_ops_in_range -- no
+        // repair walks needed because we confirmed no rename ops in
+        // the range.
+        let registry = default_registry();
+        let mut next_workbook = (*cached_arc).clone();
+        if let Err(e) = ql_oplog::apply_ops_in_range(
+            inner.log(),
+            &mut next_workbook,
+            cached_op_count,
+            current_op_count,
+            &registry,
+        ) {
+            // Partial replay error: half-merged workbook.  Drop the
+            // cache + tell IDE to full-rebuild.
+            inner.force_clear_workbook_cache();
+            return Err(napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("[session_replay] apply_ops_in_range failed: {e}"),
+            ));
+        }
+        let next_workbook = std::sync::Arc::new(next_workbook);
+        // Build the per-cell delta entries from the updated workbook.
+        // Reuses the rendering pipeline from `workbook_snapshot`.
+        let eval_ctx = ql_types::EvalContext {
+            date_system: next_workbook.date_system(),
+            locale: next_workbook.locale(),
+            now_provider: ql_types::NowProvider::System,
+        };
+        let mut parsed_format_cache: std::collections::HashMap<
+            ql_storage::FormatId,
+            ql_functions::format::FormatString,
+        > = std::collections::HashMap::new();
+        let mut changed_cells: Vec<ChangedCellJson> =
+            Vec::with_capacity(changed_cell_coords.len());
+        for (sheet, row, col) in changed_cell_coords {
+            // Pull live CellState from the session's incremental
+            // snapshot cache (already maintained by V3.4.0.2 / V3.6.0.4
+            // append_op walker).  Skip cells with no live state (the
+            // op was a ClearFormula or PutValue that the cache
+            // walker dropped).
+            let cell = match inner
+                .snapshot_cells(sheet)
+                .into_iter()
+                .find(|((r, c), _)| *r == row && *c == col)
+            {
+                Some(((r, c), state)) => {
+                    let _ = (r, c);
+                    let repaired_formula = next_workbook
+                        .formula_at(sheet, row, col)
+                        .map(|s| s.as_ref().to_string());
+                    let rendered: Option<String> = match (
+                        state.format.as_ref(),
+                        state.value.as_ref(),
+                    ) {
+                        (Some(fmt_id), Some(wire_value))
+                            if !wire_value.is_pending() =>
+                        {
+                            let fmt_id_copy = *fmt_id;
+                            wire_value.to_value().ok().and_then(|value| {
+                                if let Some(fmt) =
+                                    parsed_format_cache.get(&fmt_id_copy)
+                                {
+                                    return Some(ql_functions::format::render(
+                                        &value, fmt, &eval_ctx,
+                                    ));
+                                }
+                                let fmt_str =
+                                    next_workbook.formats().lookup(fmt_id_copy)?;
+                                let fmt =
+                                    ql_functions::format::parse(fmt_str).ok()?;
+                                let rendered_str = ql_functions::format::render(
+                                    &value, &fmt, &eval_ctx,
+                                );
+                                parsed_format_cache.insert(fmt_id_copy, fmt);
+                                Some(rendered_str)
+                            })
+                        }
+                        _ => None,
+                    };
+                    CellSnapshotJson {
+                        row,
+                        col,
+                        value: state.value.map(CellValueJson::from),
+                        formula: repaired_formula,
+                        format: state.format.map(FormatIdJson::from),
+                        rendered,
+                    }
+                }
+                None => continue,
+            };
+            changed_cells.push(ChangedCellJson {
+                sheet: sheet as u32,
+                cell,
+            });
+        }
+        // Sort for deterministic shape (mirrors V3.6.0.X audit-of-D2
+        // CONVERGENT-MED-1 discipline on `formats`).
+        changed_cells.sort_by_key(|c| (c.sheet, c.cell.row, c.cell.col));
+
+        // Build formats_added.
+        let mut formats_added: Vec<FormatDefJson> = Vec::new();
+        for fmt_id in new_format_ids {
+            // Look up the registered string in the freshly-built
+            // next_workbook (authoritative source).
+            if let Some(s) = next_workbook.formats().lookup(fmt_id) {
+                formats_added.push(FormatDefJson {
+                    id: FormatIdJson::from(fmt_id),
+                    string: s.to_string(),
+                });
+            }
+        }
+        formats_added.sort_by_key(|f| f.id.kind.clone());
+
+        // Build sheets_removed (already collected; just widen u16->u32
+        // for napi).
+        let mut sheets_removed: Vec<u32> =
+            removed_sheet_ids.into_iter().map(|id| id as u32).collect();
+        sheets_removed.sort();
+        sheets_removed.dedup();
+
+        // Update the cache: the next delta call's same-VV fast-path
+        // will see the new VV.
+        inner.set_workbook_cache(std::sync::Arc::clone(&next_workbook), current_vv);
+
+        Ok(WorkbookSnapshotDeltaJson {
+            changed_cells,
+            removed_cells: Vec::new(),
+            sheets_changed: Vec::new(),
+            sheets_removed,
+            formats_added,
+            version: current_version_bytes,
+            full_rebuild_required: false,
         })
     }
 

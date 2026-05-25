@@ -45,6 +45,13 @@ pub use error::OpLogError;
 pub use log::{OpLog, PRESENCE_COMMIT_ORIGIN};
 pub use op::{DateSystemWire, LocaleWire, Op, ReferenceModeWire};
 pub use replay::{apply_ops_in_range, replay_into, ReplayError};
+
+// **Phase 5.7 V3.6.0.8.3 D6 (2026-05-25)** -- re-export Loro
+// `VersionVector` so downstream crates (`ql-bindings-node`,
+// `ql-collab`) can refer to it without a direct `loro` dep.  The type
+// flows through napi as opaque bytes (encode/decode) so the
+// re-export is purely an ergonomics + dep-graph hygiene choice.
+pub use loro::VersionVector;
 pub use wire::{CellWireValue, FormatIdWire, NamedTargetWire, WireDecodeError};
 
 // Phase 5.2 D-1 step 1.1 (2026-05-19) — re-export `ql_types::PeerId`
