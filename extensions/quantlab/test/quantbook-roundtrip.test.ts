@@ -6463,3 +6463,154 @@ suite('quantbook V3.6.0.X audit-of-D5 OPUS-HIGH-3 -- validate_u16_index on appen
 	});
 });
 
+// =====================================================================
+// Phase 5.7 V3.6.0.8.3 D6 (2026-05-25) -- workbookSnapshotDelta napi
+// =====================================================================
+//
+// Pins the napi shape contract + the basic two-call IDE protocol
+// (empty Buffer -> fullRebuildRequired=true; populate cache via
+// workbookSnapshot() -> subsequent delta call returns a real delta
+// or fullRebuildRequired=true for stale tokens).  V3.6.0.8.4
+// audit-of-D6 will add multi-peer + undo regression tests.
+
+suite('quantbook V3.6.0.8.3 D6 -- workbookSnapshotDelta empty buffer', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+	test('empty Buffer returns fullRebuildRequired=true + current version', function () {
+		const session = createSession(1n);
+		const delta = session.workbookSnapshotDelta(Buffer.alloc(0));
+		assert.strictEqual(delta.fullRebuildRequired, true);
+		assert.deepStrictEqual(delta.changedCells, []);
+		assert.deepStrictEqual(delta.removedCells, []);
+		assert.deepStrictEqual(delta.sheetsChanged, []);
+		assert.deepStrictEqual(delta.sheetsRemoved, []);
+		assert.deepStrictEqual(delta.formatsAdded, []);
+		assert.ok(Buffer.isBuffer(delta.version), 'version is Buffer');
+	});
+});
+
+suite('quantbook V3.6.0.8.3 D6 -- workbookSnapshotDelta no cache populated', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+	test('non-empty Buffer + no prior workbookSnapshot call returns fullRebuildRequired=true', function () {
+		const session = createSession(1n);
+		// Garbage bytes -- but no cache exists either way so we expect
+		// the cache-miss branch to fire BEFORE the decode branch.
+		const delta = session.workbookSnapshotDelta(Buffer.from([0x01, 0x02]));
+		assert.strictEqual(delta.fullRebuildRequired, true);
+	});
+});
+
+suite('quantbook V3.6.0.8.3 D6 -- workbookSnapshotDelta same-VV fast-path', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+	test('after workbookSnapshot populates cache, same-VV delta is empty + not full-rebuild', function () {
+		const session = createSession(1n);
+		session.addSheet('S', 16384);
+		session.appendPutValue(0, 0, 0, 42);
+		// Populate the cache.  workbookSnapshot() does NOT change the
+		// log VV (read-only); it just caches the rebuilt+repaired
+		// workbook keyed to the current VV.
+		session.workbookSnapshot();
+		// Probe with empty Buffer to capture the engine's current VV
+		// (V3.6.0.8.3 has no dedicated currentVersion() accessor).
+		const probe1 = session.workbookSnapshotDelta(Buffer.alloc(0));
+		assert.strictEqual(probe1.fullRebuildRequired, true, 'empty buffer always fullRebuild');
+		// probe1.version IS the engine's current VV.  Because no ops
+		// happened between workbookSnapshot() and probe1, probe1.version
+		// equals the cached VV.  So passing it back hits the same-VV
+		// fast-path (NOT stale).
+		const probe2 = session.workbookSnapshotDelta(probe1.version);
+		assert.strictEqual(probe2.fullRebuildRequired, false, 'same-VV fast-path');
+		assert.deepStrictEqual(probe2.changedCells, []);
+		assert.deepStrictEqual(probe2.formatsAdded, []);
+		assert.deepStrictEqual(probe2.sheetsRemoved, []);
+		assert.deepStrictEqual(probe2.removedCells, []);
+		assert.deepStrictEqual(probe2.sheetsChanged, []);
+	});
+});
+
+suite('quantbook V3.6.0.8.3 D6 -- workbookSnapshotDelta cell-only fast-path emits changed cells', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+	test('after workbookSnapshot, appending PutValue ops surfaces them in the next delta', function () {
+		const session = createSession(1n);
+		session.addSheet('S', 16384);
+		session.appendPutValue(0, 0, 0, 1);
+		session.workbookSnapshot(); // populates cache
+		// Capture current version via empty-probe then real-probe
+		// pattern (V3.6.0.8.3 scope -- no currentVersion accessor).
+		const probe1 = session.workbookSnapshotDelta(Buffer.alloc(0));
+		// probe1.version IS the engine's current VV (same as the
+		// cache's VV after the workbookSnapshot above).
+		const baselineVersion = probe1.version;
+		// Append more cells.
+		session.appendPutValue(0, 1, 0, 2);
+		session.appendPutValue(0, 2, 0, 3);
+		const delta = session.workbookSnapshotDelta(baselineVersion);
+		assert.strictEqual(delta.fullRebuildRequired, false, 'cell-only fast-path');
+		assert.strictEqual(delta.changedCells.length, 2, 'two new cells in delta');
+		// changedCells is sorted by (sheet, row, col).
+		assert.strictEqual(delta.changedCells[0].sheet, 0);
+		assert.strictEqual(delta.changedCells[0].cell.row, 1);
+		assert.strictEqual(delta.changedCells[0].cell.col, 0);
+		assert.strictEqual(delta.changedCells[1].sheet, 0);
+		assert.strictEqual(delta.changedCells[1].cell.row, 2);
+		assert.strictEqual(delta.changedCells[1].cell.col, 0);
+	});
+});
+
+suite('quantbook V3.6.0.8.3 D6 -- workbookSnapshotDelta rename triggers full rebuild', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+	test('renameSheet between cache populate and delta call returns fullRebuildRequired=true', function () {
+		const session = createSession(1n);
+		session.addSheet('S', 16384);
+		session.appendPutValue(0, 0, 0, 1);
+		session.workbookSnapshot(); // populates cache
+		const probe = session.workbookSnapshotDelta(Buffer.alloc(0));
+		const baselineVersion = probe.version;
+		// Now do a rename op.
+		session.renameSheet(0, 'Renamed');
+		const delta = session.workbookSnapshotDelta(baselineVersion);
+		assert.strictEqual(
+			delta.fullRebuildRequired,
+			true,
+			'rename op in delta triggers fullRebuild fallback',
+		);
+	});
+});
+
+suite('quantbook V3.6.0.8.3 D6 -- workbookSnapshotDelta invalidation by undo', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+	test('undo() between cache populate and delta call returns fullRebuildRequired=true', function () {
+		const session = createSession(1n);
+		session.addSheet('S', 16384);
+		session.appendPutValue(0, 0, 0, 1);
+		session.workbookSnapshot();
+		const probe = session.workbookSnapshotDelta(Buffer.alloc(0));
+		const baselineVersion = probe.version;
+		// Undo invalidates the workbook cache (R-V3.6-14 closure).
+		session.undo();
+		const delta = session.workbookSnapshotDelta(baselineVersion);
+		assert.strictEqual(
+			delta.fullRebuildRequired,
+			true,
+			'undo invalidates workbook cache; next delta returns fullRebuild',
+		);
+	});
+});
+

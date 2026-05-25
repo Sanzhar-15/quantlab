@@ -305,6 +305,94 @@ export interface FormatDefJson {
 	string: string;
 }
 
+/**
+ * **Phase 5.7 V3.6.0.8.3 D6 (2026-05-25) -- one cell entry in a
+ * delta payload.**
+ *
+ * Pairs a sheet id with the per-cell snapshot data.  The IDE merges
+ * each into its prior render keyed by `(sheet, row, col)`.
+ */
+export interface ChangedCellJson {
+	sheet: number;
+	cell: CellSnapshotJson;
+}
+
+/**
+ * **Phase 5.7 V3.6.0.8.3 D6 (2026-05-25) -- one removed-cell entry.**
+ *
+ * IDE clears its cached cell at `(sheet, row, col)`.  Always empty
+ * at V3.6.0.8.3 (V3.7+ feature).
+ */
+export interface RemovedCellJson {
+	sheet: number;
+	row: number;
+	col: number;
+}
+
+/**
+ * **Phase 5.7 V3.6.0.8.3 D6 (2026-05-25) -- incremental WorkbookSnapshot
+ * delta reply.**
+ *
+ * Returned by {@link CollabSessionInstance.workbookSnapshotDelta}.
+ * See the napi method's docstring for the two-call IDE consumer
+ * protocol + V3.6.0.8.3 scope limitations.
+ *
+ * **Additive over V3.5/V3.6 WorkbookSnapshotJson** -- no shape break;
+ * older consumers continue to call `workbookSnapshot()` and ignore
+ * this delta surface entirely.
+ */
+export interface WorkbookSnapshotDeltaJson {
+	/**
+	 * Cells that newly exist OR whose value / formula / format /
+	 * rendered changed since `lastSeenVersion`.
+	 */
+	changedCells: ChangedCellJson[];
+	/**
+	 * Cells that no longer exist at their `(sheet, row, col)`.
+	 * Always empty at V3.6.0.8.3 (V3.7+ feature -- true removals
+	 * invalidate the cache via `force_clear_workbook_cache` so the
+	 * next delta call returns `fullRebuildRequired=true`).
+	 */
+	removedCells: RemovedCellJson[];
+	/**
+	 * Sheets whose metadata changed since `lastSeenVersion`.  Always
+	 * empty in the V3.6.0.8.3 cell-only path (cell ops don't change
+	 * sheet metadata); full-rebuild paths surface sheets via
+	 * `fullRebuildRequired=true` + the IDE's full `workbookSnapshot()`
+	 * re-fetch.
+	 */
+	sheetsChanged: SheetSnapshotJson[];
+	/**
+	 * Sheet ids tombstoned since `lastSeenVersion` (Op::RemoveSheet).
+	 * The IDE removes its sheet entry for each.
+	 */
+	sheetsRemoved: number[];
+	/**
+	 * Formats registered since `lastSeenVersion` (Op::RegisterFormat
+	 * for Custom ids; Builtin ids are not emitted per the V3.6.0.X
+	 * audit-of-D2 closure).  IDE merges each into its `formats`
+	 * table by FormatId.
+	 */
+	formatsAdded: FormatDefJson[];
+	/**
+	 * Opaque version-vector token.  IDE stores + passes back as
+	 * `lastSeenVersion` on the next call.  Encoded via Loro's
+	 * `VersionVector::encode()` (stable wire format).
+	 */
+	version: Buffer;
+	/**
+	 * `true` when the engine could not produce a delta and the IDE
+	 * MUST call `workbookSnapshot()` instead.  Sources: first call
+	 * (empty `lastSeenVersion`), cache miss, staleness (version
+	 * mismatch), malformed `lastSeenVersion`, rename op in delta.
+	 *
+	 * When `true`, all other arrays are empty; `version` carries the
+	 * engine's CURRENT VV so the IDE can retry the delta call right
+	 * after the `workbookSnapshot()` re-fetch (no race window).
+	 */
+	fullRebuildRequired: boolean;
+}
+
 export interface CollabSessionInstance {
 	/**
 	 * V1 convenience: append a `PutValue` op with a numeric value.
@@ -649,6 +737,53 @@ export interface CollabSessionInstance {
 	 *         if rebuild_workbook fails (replay error / rename-repair).
 	 */
 	workbookSnapshot(): WorkbookSnapshotJson;
+
+	/**
+	 * **Phase 5.7 V3.6.0.8.3 D6 (2026-05-25) -- incremental workbook snapshot
+	 * delta.**
+	 *
+	 * Returns the cells / sheets / formats that changed since the
+	 * caller's `lastSeenVersion`, or `fullRebuildRequired=true` when
+	 * the engine can't produce a delta (cache miss, staleness,
+	 * rename op in delta).  See {@link WorkbookSnapshotDeltaJson} for
+	 * the consumer protocol.
+	 *
+	 * **Two-call IDE discipline**:
+	 * 1. First call: pass `Buffer.alloc(0)`.  Returns
+	 *    `fullRebuildRequired=true`.
+	 * 2. IDE calls `workbookSnapshot()` (which populates the engine
+	 *    cache + returns full state); IDE stores the `version` token
+	 *    returned alongside (NB: V3.6.0.8.3 surfaces the version via
+	 *    a follow-up delta call's `version` field; a dedicated
+	 *    `currentVersion()` accessor is V3.6.0.8.4+ scope -- for
+	 *    V3.6.0.8.3 IDEs probe by passing empty Buffer and reading
+	 *    the returned `version`).
+	 * 3. Subsequent calls: pass the stored `version`.  Returns either
+	 *    a real delta (merge into prior render keyed by sheet/row/col)
+	 *    OR `fullRebuildRequired=true` (discard local state, call
+	 *    `workbookSnapshot()` again).
+	 *
+	 * **V3.6.0.8.3 cell-only fast-path**: when ops since cache are all
+	 * cell-keyed (PutValue / PutFormula / ClearFormula / SetCellFormat
+	 * / RegisterFormat / RemoveSheet, NOT rename ops), this is O(N_new_ops)
+	 * + per-changed-cell rendering instead of full O(N_total_ops)
+	 * rebuild_workbook + repair walks.  Any rename op in the delta
+	 * triggers `fullRebuildRequired=true` (the IDE then falls back to
+	 * `workbookSnapshot()`).
+	 *
+	 * **V3.6.0.8.3 scope limitations**:
+	 * - `removedCells` is always empty (V3.7+ feature).
+	 * - `sheetsChanged` is always empty in the cell-only path (cell
+	 *   ops don't change sheet metadata).
+	 *
+	 * Use the typed wrapper `workbookSnapshotDelta` from `./session` once it lands.
+	 *
+	 * @throws Error with `parseQuantbookError(err).code === 'session_replay'`
+	 *         if the cell-only fast-path's `apply_ops_in_range` fails
+	 *         partway.  The engine clears its cache in this case so
+	 *         the next call returns `fullRebuildRequired=true`.
+	 */
+	workbookSnapshotDelta(lastSeenVersion: Buffer): WorkbookSnapshotDeltaJson;
 
 	// =====================================================================
 	// Phase 5.7 V3.4.0.4a (2026-05-23) -- .qbook persistence (save side)
