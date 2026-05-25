@@ -973,9 +973,13 @@ pub struct CollabSession {
     ///
     /// `Arc<Workbook>` (not bare `Workbook`) so the napi reader can hand
     /// out a shared reference without forcing a clone.  Delta-apply path
-    /// uses `Arc::make_mut` to fork-on-write.  V3.6.0.8.3 will profile
-    /// `Workbook::clone()` cost at 100k cells; if > 20 ms, switch the
-    /// delta-apply pattern to a COW variant (R-V3.6-17).
+    /// uses `(*cached_arc).clone()` always-clone (V3.6.0.8.4 OPUS-MED-3
+    /// closure: V3.6.0.8.1 lock said `Arc::make_mut` but V3.6.0.8.3 ships
+    /// always-clone because the `cached_arc = Arc::clone(arc)` capture has
+    /// strong_count >= 2 by construction, so `make_mut` would clone anyway).
+    /// V3.6.0.8.4 bench measured `Workbook::clone()` at 692 μs for 100k
+    /// cells -- well under the 20 ms threshold; always-clone IS the right
+    /// pattern (R-V3.6-17 CLOSED-AT-V3.6.0.8.4).
     ///
     /// **Rule 4 per-field walk**: `Workbook` auto-derives Send + Sync
     /// via field composition (`crates/ql-storage/src/workbook.rs:295-299`:

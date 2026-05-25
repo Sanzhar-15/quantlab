@@ -1799,12 +1799,12 @@ Three additional minor findings noted but not fixed in-cycle:
 
 ### 4.1.z6 Loro UndoManager on_push + format registry + per-cell op-index + format-aware buildHtml rendering (Phase 5.7 V3.6, 2026-05-24)
 
-**Status**: V3.6.0.8.4 D6 ENGINE COMPLETE (audit + 5 HIGH + 4 MED closures + bench) + V3.6.0.8.5 mocha coverage closure (+10 regression tests for Opus-MED-5 backlog).  **V3.6.0.8 D6 arc COMPLETE.**  D6 perf contract delivered: 100 new cells delta = 1.08 ms vs 246 ms full snapshot (228× faster; 46× under the 50 ms threshold).  R-V3.6-15 + R-V3.6-17 CLOSED.  Opus-MED-5 (comprehensive mocha) CLOSED.  Spike verdict (V3.6.0.7): 251 ms median at 100k cells / 50 % format / 1 sheet (5× the 50 ms threshold).  Lock verdict (V3.6.0.8.1): option (a) cache rebuilt+repaired Workbook + clone-and-apply-delta CHOSEN.  Engine foundation (V3.6.0.8.2): 2 new fields + 4 invalidation callsites + new public `apply_ops_in_range` helper on ql-oplog.
+**Status**: V3.6.0.8 D6 ARC COMPLETE + V3.6.0.10 D8 Op::RestoreSheet SHIPPED.  D6 perf contract delivered: 100 new cells delta = 1.08 ms vs 246 ms full snapshot (228× faster than full; 46× under the 50 ms threshold).  R-V3.6-15 + R-V3.6-17 CLOSED.  Opus-MED-5 (comprehensive mocha) CLOSED at V3.6.0.8.5.  D8 ships `Op::RestoreSheet { id }` un-tombstone (V3.6.0.10).  D7 (#REF! substitution) + D9 (typing-stroke watchdog) still conditional pending user signal.  Spike verdict (V3.6.0.7): 251 ms median at 100k cells / 50 % format / 1 sheet (5× the 50 ms threshold).  Lock verdict (V3.6.0.8.1): option (a) cache rebuilt+repaired Workbook + clone-and-apply-delta CHOSEN.  Engine foundation (V3.6.0.8.2): 2 new fields + 4 invalidation callsites + new public `apply_ops_in_range` helper on ql-oplog.  Napi surface (V3.6.0.8.3): `workbookSnapshotDelta` + `WorkbookSnapshotDeltaJson` + `version: Buffer` field on `WorkbookSnapshotJson`.
 
-**Engine HEAD at this section's commit**: (next; V3.6.0.8.3 D6 ENGINE PART 2 napi commit -- workbookSnapshotDelta napi + WorkbookSnapshotDeltaJson struct + helpers + last_snapshot_op_count 3rd cache field + cache populate in workbookSnapshot + oplog_vv/log accessors + VersionVector re-export + types.ts + 6 mocha shape tests + plan/MASTER-PLAN/this file sweep) <- `dc74d48b97e` (V3.6.0.8.2 D6 ENGINE PART 1) <- `ebe7c946429` (V3.6.0.8.1 D6 DESIGN LOCK) <- `3e1e4deff50` (V3.6.0.7 D6 spike).
-**IDE HEAD at this section's commit**: (next; V3.6.0.8.3 D6 IDE commit -- types.ts WorkbookSnapshotDeltaJson + workbookSnapshotDelta method + 6 mocha shape tests) <- `d9731633ac4` (V3.6.0.X audit-of-D5 closures IDE; V3.6.0.7 + V3.6.0.8.1 + V3.6.0.8.2 are engine-only) <- prior chain.
+**Engine HEAD at this section's commit**: `19a35b68cac` (V3.6.0.10 D8 Op::RestoreSheet) ← `0521d6902b9` (V3.6.0.8.5 docs sweep) ← `82ed0d37d85` (V3.6.0.8.4 audit-of-D6 + 5 HIGH closures + bench) ← `2dbce5ee2a5` (V3.6.0.8.3 D6 napi) ← `dc74d48b97e` (V3.6.0.8.2 engine PART 1) ← `ebe7c946429` (V3.6.0.8.1 docs lock) ← `3e1e4deff50` (V3.6.0.7 spike) ← prior chain.
+**IDE HEAD at this section's commit**: `4c48f8809bc` (V3.6.0.10 D8 IDE wrapper + 6 mocha tests) ← `07fd6bb8988` (V3.6.0.8.5 +10 mocha) ← `8b3f608b2c8` (V3.6.0.8.4 IDE: version field on WorkbookSnapshotJson + 2 shape-pin updates) ← `9b7ac290917` (V3.6.0.8.3 IDE: types.ts + 6 mocha) ← `d9731633ac4` (V3.6.0.X audit-of-D5 IDE) ← prior chain.
 
-**Tests baseline**: ql-collab **149/149** unchanged (V3.6.0.8.2's +13 over 136; V3.6.0.8.3 added the 3rd cache field but no new ql-collab tests -- the V3.6.0.8.2 9-tests-on-workbook-cache suite naturally exercises the extended setter via existing `set_workbook_cache` calls) + ql-oplog **67/67** unchanged + IDE mocha **390/390** (V3.6.0.8.3 +6 over the V3.6.0.X audit-of-D5 live 384 baseline) + ql-collab-ws **42/42** + engine workspace release build clean.  V3.6.0.7 adds 1 criterion bench (`cargo bench -p ql-bindings-node --bench workbook_snapshot`); V3.6.0.8.4 will add a delta-vs-full bench.
+**Tests baseline**: ql-collab **154/154** (V3.6.0.10 +5 over V3.6.0.8.4 149: untombstone + idempotent + out-of-range no-op + cache drops tombstone + remote-merge convergence) + ql-oplog **67/67** + ql-collab-ws **42/42** (40 lib+transport + 2 ignored doctests) + IDE mocha **406/406** (V3.6.0.10 +6 over V3.6.0.8.5 400: 5 restoreSheet napi contract + 1 restoreSheet-in-delta fullRebuild) + engine workspace release build clean.  V3.6.0.7 + V3.6.0.8.4 add criterion benches (`cargo bench -p ql-bindings-node --bench workbook_snapshot`).
 
 #### V3.6.0.1 -- decision lock (9 D-decisions)
 
@@ -1817,10 +1817,10 @@ Per V3.5.0.X Opus § F V3.6 ENTRY READINESS:
 | **D3** Per-cell op-index for invalidate_cell | New `cell_op_index: HashMap<(u16,u32,u32), Vec<usize>>` + new `sheet_op_index: HashMap<u16, Vec<usize>>` + `CacheBuckets<'a>` struct + new `OpLog::get(idx)` accessor + `rebuild_op_indices_only` helper for post-undo refresh | V3.6.0.4 |
 | **D4** Format-aware buildHtml rendering | Engine-side `format::render` integration in `workbook_snapshot`; new `CellSnapshotJson.rendered: Option<String>` + `WorkbookSnapshotJson.dateSystem: String` additive fields; IDE `cellGridHtml::renderRows` uses `e.rendered ?? formatCellValue(e.value)` | V3.6.0.5 |
 | **D5** IDE-facing `appendPutFormula` napi | Thin wrapper over existing `Op::PutFormula`; unblocks end-to-end repaired-formula integration tests; V3.6.0.X audit-of-D5 closures add user-driven write-path (formula-prefix-detect dispatcher arm) + formula-only-cell pending passthrough + `validate_u16_index` symmetry closure | V3.6.0.6 **SHIPPED** + V3.6.0.X audit-of-D5 closures SHIPPED |
-| **D6** Incremental WorkbookSnapshot deltas | Cache rebuilt+repaired Workbook + clone-and-apply-delta; new `workbookSnapshotDelta(lastSeenVersion: Buffer)` napi + `WorkbookSnapshotDeltaJson`; cell-only fast-path skips repair; rename ops trigger full rebuild | V3.6.0.7 SPIKE **SHIPPED** + V3.6.0.8.1 LOCK **SHIPPED** (V3.6.0.8.2 engine PART 1 PENDING + V3.6.0.8.3 napi + V3.6.0.8.4 audit-of-D6) |
-| **D7** `#REF!` substitution for cross-sheet refs to deleted sheets | DEFER until user signal | V3.6.0.8 PENDING |
-| **D8** `Op::RestoreSheet` un-delete | DEFER until user signal | V3.6.0.9 PENDING |
-| **D9** Sheet-tabs UX + typing-stroke watchdog | DEFER sheet-tabs to V3.6+ multi-tab redesign; typing-stroke watchdog ship-on-signal | V3.6.0.10 CONDITIONAL |
+| **D6** Incremental WorkbookSnapshot deltas | Cache rebuilt+repaired Workbook + clone-and-apply-delta; new `workbookSnapshotDelta(lastSeenVersion: Buffer)` napi + `WorkbookSnapshotDeltaJson` + `version: Buffer` field on `WorkbookSnapshotJson`; cell-only fast-path skips repair; rename + metadata ops trigger fullRebuild | V3.6.0.7 spike + V3.6.0.8.1 lock + V3.6.0.8.2 engine PART 1 + V3.6.0.8.3 napi + V3.6.0.8.4 audit-of-D6 + 5 HIGH closures + bench + V3.6.0.8.5 mocha coverage — ALL **SHIPPED** |
+| **D7** `#REF!` substitution for cross-sheet refs to deleted sheets | DEFER until user signal | V3.6.0.9 PENDING (conditional) |
+| **D8** `Op::RestoreSheet` un-delete | New wire variant + `Workbook::restore_sheet(id)` + replay arm + `CacheEffect::RestoreSheet` + classify_delta_op fullRebuild allowlist + `restoreSheet(id)` napi + IDE wrapper | V3.6.0.10 **SHIPPED** |
+| **D9** Sheet-tabs UX + typing-stroke watchdog | DEFER sheet-tabs to V3.6+ multi-tab redesign; typing-stroke watchdog ship-on-signal | V3.6.0.11 PENDING (conditional) |
 
 #### V3.6.0.2 D1 -- Loro UndoManager on_push callback wiring (engine `89f5a5f9e0b`)
 
@@ -1877,7 +1877,7 @@ Deferred to V3.6.0.7+ backlog: Opus MED-1 (client/server `data-raw-formula` guar
 
 +8 mocha tests over V3.6.0.6 D5 373 baseline (-> **381/381**): 3 dispatcher routing (formula prefix detected; leading-whitespace formula detected; non-formula stays on value path); 2 formula-only-cell pass-through (renders pending; data-raw-formula attribute emits); 3 u16 sheet validator (NaN/Infinity rejected; fractional rejected; 2^32 rejected; covers both appendPutValue and appendPutFormula).  ql-collab unchanged at 136/136 (engine changes are validator + signature; no new collab-side surface).
 
-#### V3.6.0.7 D6 -- profiling spike for incremental snapshot deltas (engine this-commit)
+#### V3.6.0.7 D6 -- profiling spike for incremental snapshot deltas (engine `3e1e4deff50`)
 
 Time-boxed criterion bench at `crates/ql-bindings-node/benches/workbook_snapshot.rs` measuring post-D2 + post-D4 `workbookSnapshot` cost.  The bench replicates the body of `crates/ql-bindings-node/src/lib.rs:1802 workbook_snapshot` in pure Rust (napi methods can't be invoked from a Cargo bench harness); a setup-time assertion checks the replicated body's cell count against the workload generator to guard against silent drift.
 
@@ -1929,7 +1929,7 @@ Spike transcript: `docs/audits/2026-05-25-phase-5-7-v3-6-0-7-spike.md`.  Raw cri
 
 **Rule 4 arc terminus HELD at 6** (no new fields/variants/structs; bench harness is dev-deps + benches/ only).
 
-#### V3.6.0.8.1 D6 -- DESIGN LOCK for incremental snapshot deltas (engine this-commit)
+#### V3.6.0.8.1 D6 -- DESIGN LOCK for incremental snapshot deltas (engine `ebe7c946429`)
 
 Docs-only lock; no engine source modified.  Mirrors the V3.6.0.1 pattern (the V3.6 phase-entry lock that landed all 9 D-decisions before V3.6.0.2 implementation).  Resolves the V3.6.0.7 R-V3.6-NEW open question via three-option evaluation:
 
@@ -1963,19 +1963,22 @@ interface WorkbookSnapshotDeltaJson {
 **Locked IDE consumer protocol**:
 
 1. First call: IDE passes `Buffer.alloc(0)` (or any unknown VV).  Engine returns `fullRebuildRequired=true` + empty arrays.
-2. IDE calls `workbookSnapshot()` for the full surface AND records its `version` token (from a side accessor TBD at V3.6.0.8.3 -- likely a new `currentVersion(): Buffer` napi method or `version` field on `WorkbookSnapshotJson`).
+2. IDE calls `workbookSnapshot()` for the full surface AND records the `version: Buffer` field on the returned `WorkbookSnapshotJson` (V3.6.0.8.4 OPUS-HIGH-2 closure: populated from `cache_vv.encode()`; populate-and-capture is atomic against the engine's lock-held cache populate, so no race window).
 3. Subsequent calls: IDE passes the stored `version`.  Engine returns either a delta (merge into prior UI state) or `fullRebuildRequired=true` (discard prior state + call `workbookSnapshot()` again).
 
 **Locked internal state on `CollabSession`** (lands at V3.6.0.8.2):
 
 ```rust
-last_snapshot_workbook: Option<Arc<Workbook>>,    // post-repair; clone-on-delta via Arc::make_mut
+last_snapshot_workbook: Option<Arc<Workbook>>,    // post-repair; clone-on-delta via (*cached_arc).clone() always-clone
 last_snapshot_oplog_vv: Option<VersionVector>,    // Loro VV at time of cache
+last_snapshot_op_count: Option<usize>,            // log.len() at populate time (V3.6.0.8.3 3rd cache field)
 ```
 
 - `Workbook: Send + Sync` (auto-derive via field composition per `crates/ql-storage/src/workbook.rs:295-299`).
 - `Arc<T>: Send + Sync` iff `T: Send + Sync` -- passes.
-- `VersionVector` is Loro's; re-exported via `loro::VersionVector`; underlying `FxHashMap<PeerID, Counter>` is Send+Sync via primitive composition (V3.6.0.8.4 OPUS-MED-1 closure: pre-closure docs said BTreeMap; actual loro-internal-1.12.0/src/version.rs:29 is FxHashMap).
+- `VersionVector` is Loro's; re-exported via `loro::VersionVector` (also `ql_oplog::VersionVector`); underlying `FxHashMap<PeerID, Counter>` is Send+Sync via primitive composition.
+
+**Implementation discovery (V3.6.0.8.3 + V3.6.0.8.4 OPUS-MED-3 closure)**: pre-closure docstrings claimed `Arc::make_mut` per the V3.6.0.8.1 lock; V3.6.0.8.3 shipped `(*cached_arc).clone()` always-clone instead because the `cached_arc = Arc::clone(arc)` capture has strong_count >= 2 by construction, so `make_mut` would clone anyway.  Always-clone IS the correct pattern.
 
 **Rule 4 arc terminus stays at 6** -- no Rule 4 trigger (all positive Send+Sync composition).
 
@@ -2008,7 +2011,7 @@ fn workbook_snapshot_delta(&self, last_seen: Vec<u8>) -> Result<WorkbookSnapshot
     self.refresh_workbook_cache();  // full rebuild_workbook + repair walks
     emit delta vs prior cached_workbook
   else:
-    let mut next = (*self.last_snapshot_workbook.unwrap()).clone();  // Arc::make_mut
+    let mut next = (*self.last_snapshot_workbook.unwrap()).clone();  // always-clone (V3.6.0.8.3 ship; V3.6.0.8.4 OPUS-MED-3 closure: 692 μs at 100k cells; well under 20 ms threshold)
     for op in ops: apply_op(&op, &mut next, log_index);  // via new apply_ops_in_range
     self.last_snapshot_workbook = Some(Arc::new(next));
     self.last_snapshot_oplog_vv = Some(current_vv.clone());
@@ -2022,14 +2025,153 @@ fn workbook_snapshot_delta(&self, last_seen: Vec<u8>) -> Result<WorkbookSnapshot
 |---|---|---|---|
 | V3.6.0.8.1 | DESIGN LOCK (docs-only) | 1 | ✅ SHIPPED |
 | V3.6.0.8.2 | ENGINE PART 1: new fields + `force_clear_workbook_cache` + invalidation wiring at 4 callsites + new public `apply_ops_in_range(from, to)` helper on `OpLog` + ql-collab regression tests | 1 | ✅ SHIPPED |
-| **V3.6.0.8.3** | ENGINE PART 2 napi: `workbookSnapshotDelta` napi + `WorkbookSnapshotDeltaJson` struct + helper structs + cell-only fast-path + rename-full-rebuild branch + staleness check + cache populate in `workbookSnapshot` + napi shape tests in mocha.  Bench delta-vs-full deferred to V3.6.0.8.4. | 1 | ✅ SHIPPED (user-directed cycle-3 override) |
-| V3.6.0.8.4 | V3.6.0.X audit-of-D6 (parallel Codex Lane A + Opus Lane B + closures) + bench delta-vs-full at 100k cells + R-V3.6-15 full debug-assert + R-V3.6-17 Workbook clone-cost profile | 1 | PENDING |
+| V3.6.0.8.3 | ENGINE PART 2 napi: `workbookSnapshotDelta` napi + `WorkbookSnapshotDeltaJson` struct + helper structs + cell-only fast-path + rename-full-rebuild branch + staleness check + cache populate in `workbookSnapshot` + napi shape tests in mocha.  Bench delta-vs-full deferred to V3.6.0.8.4. | 1 | ✅ SHIPPED (user-directed cycle-3 override) |
+| V3.6.0.8.4 | V3.6.0.X audit-of-D6 (parallel Codex Lane A + Opus Lane B + closures) + bench delta-vs-full at 100k cells + R-V3.6-15 full debug-assert + R-V3.6-17 Workbook clone-cost profile.  5 HIGH + 4 of 5 MED closed in-cycle; D6 perf contract delivered (1.08 ms at 100 new cells; 228× faster than full; 46× under threshold). | 1 | ✅ SHIPPED (user-directed cycle-4 override) |
+| V3.6.0.8.5 | Opus-MED-5 mocha coverage closure: +10 regression tests (merge_bytes invalidation / malformed Buffer / AddSheet+MoveSheet-in-delta fullRebuild / RemoveSheet-in-delta sheetsRemoved / chained delta / redo invalidation / appendPutFormula-in-delta / renameSheet cross-sheet / workbookSnapshot.version round-trip). | 1 | ✅ SHIPPED (user-directed cycle-5 override) |
 
-Total D6 arc: **4 cycles across ≥2 sessions** (CLAUDE.md ≤2-cycles-per-session ceiling).
+**D6 arc COMPLETE.** Total D6 arc: 5 cycles in 1 session (user-directed via AskUserQuestion at cycle 3, 4, 5 entry; 3 over CLAUDE.md ≤2 ceiling).
 
 **5 new risks** R-V3.6-14..18 added to plan body risk register; summary at the "V3.6 risk register" section below.
 
 **Rule 4 arc terminus HELD at 6** -- no new fields/variants/structs land at V3.6.0.8.1 (those arrive at V3.6.0.8.2).
+
+#### V3.6.0.8.2 D6 -- engine PART 1 (engine `dc74d48b97e`)
+
+Lands the engine-side foundation; no new napi surface.  Two new fields on `CollabSession` (initialized `None` in both `new` + `from_snapshot`):
+
+- `last_snapshot_workbook: Option<Arc<Workbook>>` (post-repair).
+- `last_snapshot_oplog_vv: Option<loro::VersionVector>`.
+
+New `pub fn` accessors (`last_snapshot_workbook` / `last_snapshot_oplog_vv`) + setter (`set_workbook_cache(Arc<Workbook>, VersionVector)`; V3.6.0.8.3 extends to pin op_count) + invalidator (`force_clear_workbook_cache()` — production, not test-gated).  Invalidation wired at 4 production callsites:
+
+| Site | Reason |
+|---|---|
+| `merge_bytes` (after `rebuild_snapshot_cache`) | Remote ops may shift LWW winners |
+| `discard_pending_ops` (after `rebuild_snapshot_cache`) | `fork_at_vv` dropped ops |
+| `undo` (AT TOP, BEFORE Loro's undo per R-V3.6-14) | Retract may have included rename op |
+| `redo` (AT TOP, mirror of undo) | Loro's redo also mutates visible log |
+
+`append_op` does NOT invalidate (cell-only fast-path target; verified by `v3_6_0_8_2_append_op_does_NOT_invalidate_workbook_cache` regression test).
+
+New public free function in `ql-oplog`: `pub fn apply_ops_in_range(log: &OpLog, workbook: &mut Workbook, from_index: usize, to_index: usize, registry: &FunctionRegistry) -> Result<usize, ReplayError>` (re-exported via `ql_oplog::apply_ops_in_range`).  Preserves `replay_into`'s from-empty contract; out-of-range to_index silently stops at log end; empty/inverted range = O(1) no-op returning 0.  V3.6.0.8.4 OPUS-HIGH-3 switched the body to `log.get(i)` random-access (closes the iter().skip(N) perf bug).
+
++13 ql-collab regression tests (136 → 149): 8 workbook cache invariants (fresh / from_snapshot empty; set populates atomic; force_clear resets atomic; merge_bytes / discard / undo / redo invalidate; append_op preserves) + 4 apply_ops_in_range correctness (empty noop; full-range matches replay_into; forward-from-partial composes correctly; oversized to_index saturates) + 1 Arc identity preservation.
+
+Rule 4 arc terminus HELD at 6 (positive Send+Sync composition; 0 new triggers).  No new napi surface; no IDE / mocha changes.
+
+#### V3.6.0.8.3 D6 -- engine PART 2 napi (engine `2dbce5ee2a5` + IDE `9b7ac290917`)
+
+napi surface for incremental WorkbookSnapshot deltas.  New `#[napi] CollabSession::workbookSnapshotDelta(lastSeenVersion: Buffer)` method implementing the V3.6.0.8.1 8-step algorithm (cache-miss + decode-VV + staleness + same-VV fast-path + op-enumeration + rename-detection + cell-only-fast-path + JSON-delta-build).  New napi structs: `WorkbookSnapshotDeltaJson { changedCells, removedCells, sheetsChanged, sheetsRemoved, formatsAdded, version: Buffer, fullRebuildRequired: bool }` + `ChangedCellJson { sheet, cell: CellSnapshotJson }` + `RemovedCellJson { sheet, row, col }`.
+
+Existing `workbookSnapshot` napi now populates the cache via `set_workbook_cache(Arc::clone(&workbook), oplog_vv())` after `rebuild_workbook`; `workbook` wrapped in `Arc` BEFORE rendering so no double-clone.
+
+3rd cache field added (revision to V3.6.0.8.2): `last_snapshot_op_count: Option<usize>` so the delta path derives the replay slice `[op_count, log.len())` without a VV→op_count walk.  The three-field "all Some / all None" invariant preserves.  New accessor `pub fn last_snapshot_op_count() -> Option<usize>`; extended `set_workbook_cache` (pins op_count alongside VV); extended `force_clear_workbook_cache` (clears all 3 fields).
+
+New `pub fn oplog_vv(&self) -> VersionVector` + `pub fn log(&self) -> &OpLog` accessors on `CollabSession` so the napi (outside ql-collab) can grab the VV at populate time + enumerate ops at delta time.  `loro::VersionVector` re-exported as `ql_oplog::VersionVector` for downstream-crate ergonomics.
+
+V3.6.0.8.3 scope limitations: `removedCells` always empty (V3.7+); `sheetsChanged` always empty in cell-only path; rename ops trigger fullRebuild fallback (rename-arm of `classify_delta_op` at file-scope helper).  Rename arm extended at V3.6.0.8.4 to allowlist metadata ops.
+
+IDE: `types.ts` extends `CollabSessionInstance` with `workbookSnapshotDelta` + new `WorkbookSnapshotDeltaJson` + `ChangedCellJson` + `RemovedCellJson` interfaces.  +6 mocha shape tests (384 → 390): empty Buffer + no-cache + same-VV fast-path + cell-only emits changes + rename triggers fullRebuild + undo invalidates cache.
+
+Rule 4 arc terminus HELD at 6 (all new napi struct fields + 1 new cache field positive Send+Sync; 0 new triggers).
+
+#### V3.6.0.8.4 D6 -- audit-of-D6 + closures + bench (engine `82ed0d37d85` + IDE `8b3f608b2c8`)
+
+2-lane megaudit at D6 ship: Codex Lane A (FAIL; 3 HIGH + 1 LOW + 1 INFO) + Opus Lane B (PASS-WITH-FINDINGS; 3 HIGH + 5 MED + 3 LOW + 1 INFO).  Transcripts: `docs/audits/2026-05-25-phase-5-7-v3-6-0-8-codex.md` + `docs/audits/2026-05-25-phase-5-7-v3-6-0-8-opus.md`.  In-cycle closure summary: `docs/audits/2026-05-25-phase-5-7-v3-6-0-8-closures.md`.
+
+**5 HIGH closed in-cycle**:
+
+1. **CONVERGENT-HIGH-1** (Codex-HIGH-2 ≡ Opus-HIGH-1) — `classify_delta_op` allowlist for metadata ops.  Pre-closure: `_=>{}` catch-all silently dropped `AddSheet / MoveSheet / CreateTable / DropTable / ResizeTable / SetName / SetLocale / SetReferenceMode / SetDateSystem` AND advanced the cache token, so IDE got empty delta + new version while engine had new sheets.  Post-closure: explicit per-variant match arms force `has_rename=true` (fullRebuild) for any metadata op.  Compiler enforces exhaustiveness for future Op variants.
+2. **Codex-HIGH-1** — `poll_remote_with_limit` 5th invalidation callsite.  `force_clear_workbook_cache` after `rebuild_snapshot_cache` in the `merged > 0` block; mirrors the V3.6.0.8.2 `merge_bytes` discipline.
+3. **Codex-HIGH-3** — new `pub fn snapshot_cell(sheet, row, col) -> Option<CellState>` O(1) HashMap.get accessor.  Replaces O(cells_in_sheet) `snapshot_cells.find()` per delta cell.  Combined with Opus-HIGH-3 below, delivered the 230× delta perf improvement.
+4. **Opus-HIGH-2** — new `version: Buffer` field on `WorkbookSnapshotJson` napi struct (populated from `cache_vv.encode()`).  IDE consumer protocol no longer needs the empty-Buffer probe workaround; populate-and-capture is atomic against the engine's lock-held cache populate.  TS-optional in `WorkbookSnapshotJson` interface so fixture-literal unit tests aren't forced to include opaque placeholders.
+5. **Opus-HIGH-3** — **the primary perf bug**: `OpLog::iter().skip(N).take(M)` deserialized ALL N skipped ops on every delta call (at 100k log + 10 new ops, ~100k unnecessary `serde_json::from_str<Op>` calls).  Fix: `for i in start..end { log.get(i)? }` (K * O(log N) Loro BTree random-access).  Applied to both `apply_ops_in_range` (`crates/ql-oplog/src/replay.rs`) + napi delta enumeration (`crates/ql-bindings-node/src/lib.rs`).
+
+**4 of 5 MED closed in-cycle**: MED-1 BTreeMap → FxHashMap docstring drift (3 sites); MED-2 `formats_added` sort by full `FormatId` (not just kind); MED-3 `Arc::make_mut` → always-clone docstring drift (4 sites); MED-4 `Workbook::clone()` cost profile via new `bench_workbook_clone` micro-bench (1k=7 μs / 10k=69 μs / 100k=692 μs; well under 20 ms threshold; R-V3.6-17 CLOSED).  Deferred to V3.6.0.8.5: Opus-MED-5 comprehensive mocha coverage.
+
+**R-V3.6-15 CLOSED** (monotonicity `debug_assert_eq!(new_ops.len(), current_op_count - cached_op_count, ...)` in `workbook_snapshot_delta` at `crates/ql-bindings-node/src/lib.rs:2604-2613`).  **R-V3.6-17 CLOSED** (clone cost measured well under threshold).
+
+Bench `crates/ql-bindings-node/benches/workbook_snapshot.rs` extended with `bench_workbook_snapshot_delta` (1/10/100 new cells × 100k initial workload) + `bench_workbook_clone` (1k/10k/100k cells).
+
+**D6 perf contract delivered with 46× headroom**:
+
+| Configuration | Pre-closure | Post-closure | Threshold | Verdict |
+|---|---|---|---|---|
+| 1 new cell delta | n/a | 1.01 ms | < 50 ms | ✅ |
+| 10 new cells delta | n/a | 1.00 ms | < 50 ms | ✅ |
+| 100 new cells delta | 741 ms (FAIL) | **1.08 ms** | < 50 ms | ✅ |
+| Full snapshot baseline | 251 ms | 246 ms | n/a | (ref) |
+| Workbook clone at 100k | n/a | 692 μs | < 20 ms | ✅ |
+
+228× faster than full snapshot; 46× under the 50 ms threshold.
+
+#### V3.6.0.8.5 D6 -- Opus-MED-5 mocha coverage closure (IDE `07fd6bb8988` + engine docs `0521d6902b9`)
+
+Closes the V3.6.0.8.4 deferred Opus-MED-5 (comprehensive mocha coverage gap).  +10 mocha regression tests (390 → 400):
+
+1. merge_bytes invalidation (multi-peer: A populates cache, B's bytes merge into A → cache invalidated).
+2. malformed Buffer for `lastSeenVersion` returns `fullRebuildRequired=true` (not throws).
+3. AddSheet in delta triggers fullRebuild (CONVERGENT-HIGH-1 end-to-end).
+4. MoveSheet in delta triggers fullRebuild.
+5. RemoveSheet in delta emits in `sheetsRemoved` (cell-only-deltable, NOT fullRebuild).
+6. Chained delta calls: first consumes new ops, second with returned version is empty + same-VV.
+7. Redo invalidates cache (symmetric with V3.6.0.8.3 undo; R-V3.6-14 mirror).
+8. appendPutFormula in delta surfaces formula text in changedCells.
+9. renameSheet with cross-sheet formulas triggers fullRebuild (rename-arm of `classify_delta_op`).
+10. `workbookSnapshot().version` round-trips via `workbookSnapshotDelta` same-VV fast-path (OPUS-HIGH-2 end-to-end).
+
+Pure-mocha cycle; no engine source modified.  Engine docs sweep separate at `0521d6902b9`.
+
+#### V3.6.0.10 D8 -- Op::RestoreSheet un-tombstone (engine `19a35b68cac` + IDE `4c48f8809bc`)
+
+Reverses the V3.5.0.3b tombstone effect.  Closes the V3.6.0.1 D8 conditional ("DEFER until user signal"; user directed via AskUserQuestion at cycle 6 entry).
+
+**Wire format**: new `Op::RestoreSheet { id: SheetId }` variant in ql-oplog (additive serde-tagged enum; no schema bump per V3.5.0.3b precedent).  Forward-compat caveat: pre-V3.6.0.10 binaries reading post-V3.6.0.10 .qbook files with `Op::RestoreSheet` instances fail deserialization (same as `Op::RemoveSheet` / `Op::MoveSheet` at V3.5).
+
+**Storage layer**: new `Workbook::restore_sheet(id)` method (HashSet::remove on `removed_sheets`; out-of-range silently dropped; idempotent).  Reverses the V3.5.0.3b tombstone: cells written BEFORE the original `Op::RemoveSheet` are preserved by the V3.5.0.3b storage discipline and reappear; cells silently-no-op'd while tombstoned do NOT reappear (they never reached storage).
+
+**Cache layer**: new `CacheEffect::RestoreSheet { id }` variant on CollabSession's cache walker + `collect_cache_effects` arm + `apply_cache_effect` arm.  Removes id from `tombstones` HashSet; does NOT re-add pre-tombstone cell entries to `last_snapshot` — cache rebuild paths handle that.
+
+**Delta interaction**: V3.6.0.8.4 `classify_delta_op` allowlist extended to force `fullRebuildRequired=true` on `Op::RestoreSheet`.  Cache dropped pre-tombstone cells at `CacheEffect::RemoveSheet` apply; Workbook preserved them; fullRebuild is the cheapest path to get them back into the snapshot reply.
+
+**napi**: new `#[napi(js_name = "restoreSheet")] fn restore_sheet(id: u32)` method on `CollabSession` (mirrors `deleteSheet` validation: id ≤ u16::MAX + pre-rebuild existence check; idempotent on already-restored).
+
+**IDE**: `types.ts` adds `restoreSheet(id: number): void` method on `CollabSessionInstance`; `session.ts` adds typed wrapper `restoreSheet(session, id)`.
+
+**Cross-peer convergence**: `HashSet::remove` on absent is no-op; concurrent {RemoveSheet, RestoreSheet} resolved by Loro's causal-merge order (last-replayed wins).
+
++5 ql-collab regression tests (149 → 154): untombstone in workbook + idempotent (double-restore + restore-on-never-removed) + out-of-range no-op + cache drops tombstone (post-restore cell writes land in cache) + remote-merge convergence (peer A removes + peer B restores + merge → both peers converge to restored).
+
++6 IDE mocha tests (400 → 406): napi contract (1 op, out-of-range bad_arg, u16 overflow bad_arg, restored sheet visible in `workbookSnapshot.sheets` with name preserved, idempotent) + workbookSnapshotDelta fullRebuild on RestoreSheet.
+
+Rule 4 arc terminus HELD at 6 (new wire variant + new CacheEffect variant; both positive Send+Sync via primitive composition; 0 new triggers).
+
+R-V3.6-9 status: D7 (#REF! substitution) NOT shipped at V3.6.0.10 so the D7+D8 interaction is moot.  If D7 ships V3.6.0.9 later, RestoreSheet must precede the rename-repair pass on `rebuild_workbook` (existing replay order verified).
+
+#### V3.6.0.10 docs megaudit -- 3-lane cross-validation + sweep
+
+3-lane megaudit at V3.6.0.10 ship verifying documentation coherence + handover quality before any phase-termination work.  Transcripts:
+
+- **Codex Lane A** (`docs/audits/2026-05-25-phase-5-7-v3-6-0-10-megaudit-docs-codex.md`): PASS-WITH-FINDINGS; 2 HIGH + 4 MED + 1 LOW + 1 INFO.
+- **Opus Lane B** (`docs/audits/2026-05-25-phase-5-7-v3-6-0-10-megaudit-docs-opus.md`): PASS-WITH-FINDINGS; 3 HIGH + 9 MED + 7 LOW + 5 INFO.
+- **Lane C (claude-self)**: convergent + adds risk-register status-normalization findings (R-V3.6-14/16/18 not marked CLOSED despite shipped closures).
+
+Convergent findings closed via doc sweep this commit:
+
+- § 4.1.z6 status / HEAD / tests / decision table / risk register / transcripts / out-of-scope all stale (Codex HIGH-2 + Opus HIGH-2 + Lane C C2-C7).
+- `.plans/_active.md` frontmatter (status / current_engine_head / current_ide_head / current_engine_workspace / direction) stale (Codex HIGH-1 + Lane C C1).
+- No V3.6.0.10 D8 sub-section in § 4.1.z6 (Codex HIGH-2 + Opus HIGH-1 + Lane C C8) — added above.
+- `MEMORY.md` line 2 compounded-handoff drift (Opus HIGH-3).
+- Multiple risk-register entries (R-V3.6-9/14/15/16/17/18) not status-normalized post-ship — closed.
+- Audit transcripts table missing V3.6.0.8.4 + 8.5 + 10 rows — added.
+- MASTER-PLAN line 547 top-line summary stale.
+- `.plans/_active.md` D7/D8/D9 design subsections stale + V3.6.0.8.4/8.5 chronological reversal.
+- Phase-termination + D9 sub-step assignment internal contradictions (V3.6.0.10 vs V3.6.0.11) — normalized to V3.6.0.11.
+- BTreeMap → FxHashMap drift in 2 source-file docstrings.
+- `Arc::make_mut` drift in 5+ historical narrative sites.
+- R-V3.6-15 debug_assert citation off (`lib.rs:2454` → actual `lib.rs:2604-2613`).
+
+Deferred to V3.6.1+: condense `.plans/_active.md` frontmatter status field wall-of-text (~5000 words; not load-bearing for correctness, just readability).
 
 #### V3.6 risk register (R-V3.6-1..18)
 
@@ -2039,20 +2181,20 @@ The plan body at `.plans/_active.md` lines 286-314 is the authoritative source. 
 - **R-V3.6-2** FormatTable cache invariant maintenance.  CLOSED at V3.6.0.3 via 6-mutation-site discipline + atomic-swap.
 - **R-V3.6-3** cell_op_index sync invariant.  CLOSED at V3.6.0.4 via per-effect index push + dedup-on-equality.
 - **R-V3.6-4** Format-aware rendering locale/date_system propagation.  CLOSED at V3.6.0.5 D4 + V3.6.0.X audit-of-D4 closures (CONVERGENT-HIGH-1 Op::SetDateSystem + CONVERGENT-MED-1 locale passthrough).
-- **R-V3.6-5** Incremental snapshot delta freshness.  V3.6.0.7 D6 spike SHIPPED + V3.6.0.8.1 LOCK SHIPPED; D6 implementation begins V3.6.0.8.2.  Closure design (locked at V3.6.0.8.1): when caller's `lastSeenVersion` ≠ `last_snapshot_oplog_vv`, the engine returns `fullRebuildRequired=true` (staleness fallback step 3 of the algorithm above) -- IDE then calls `workbookSnapshot()` and re-syncs.
+- **R-V3.6-5** Incremental snapshot delta freshness.  CLOSED at V3.6.0.8.3 via staleness fallback: when caller's `lastSeenVersion` ≠ `last_snapshot_oplog_vv`, engine returns `fullRebuildRequired=true` (algorithm step 3); IDE then calls `workbookSnapshot()` and re-syncs.  Multi-peer regression at V3.6.0.8.5.
 - **R-V3.6-6** OnPush callback DiffEvent inspection cost.  Profiled OK at V3.6.0.2; no regression.
 - **R-V3.6-7** pure_local_frontier removal regression.  CLOSED at V3.6.0.2 via rewritten V3.5.0.X regression tests.
-- **R-V3.6-8** napi struct evolution.  CLOSED across V3.6.0.3 + V3.6.0.5 via additive-only fields (formats, dateSystem, rendered all additive).
-- **R-V3.6-9** #REF! substitution + Op::RestoreSheet interaction.  Conditional D7+D8; not yet shipped.
+- **R-V3.6-8** napi struct evolution.  CLOSED across V3.6.0.3 + V3.6.0.5 + V3.6.0.8.4 via additive-only fields (formats, dateSystem, rendered, version all additive).
+- **R-V3.6-9** #REF! substitution + Op::RestoreSheet interaction.  PARTIAL-CLOSED at V3.6.0.10: D8 RestoreSheet ships standalone; the interaction is moot today because D7 (#REF! substitution) is still conditional.  IF D7 ships V3.6.0.9, RestoreSheet must precede the rename-repair pass on rebuild_workbook (existing replay order; verified).
 - **R-V3.6-10** cell_op_index positional-index fragility under Loro retract.  DISCOVERED at V3.6.0.4 D3; CLOSED via `rebuild_op_indices_only` helper called by undo/redo before invalidate.
 - **R-V3.6-11** dateSystem propagation requires Op::SetDateSystem.  DISCOVERED at V3.6.0.X audit-of-D4; CLOSED via Op::SetDateSystem variant + replay handler + from_qbook seed.
 - **R-V3.6-12** IDE click-to-edit broken for engine-rendered display strings.  DISCOVERED at V3.6.0.X audit-of-D4 (Opus); CLOSED via `data-raw-value` attribute.
 - **R-V3.6-13** Pending values + format render as formatted zero.  DISCOVERED at V3.6.0.X audit-of-D4 (Codex+Opus); CLOSED via short-circuit on `is_pending()`.
-- **R-V3.6-14** Cached Workbook stale after Loro UndoManager retract.  DISCOVERED at V3.6.0.8.1 design lock; CLOSED at V3.6.0.8.2 -- `undo()` + `redo()` call `force_clear_workbook_cache()` BEFORE Loro's undo/redo (verified by `v3_6_0_8_2_undo_invalidates_workbook_cache` + `..._redo_invalidates_workbook_cache` regression tests).
-- **R-V3.6-15** VersionVector vs op_count drift.  Loro's `oplog_vv()` returns `BTreeMap<PeerID, Counter>`; cached `(VV, op_count)` pair COULD drift if `merge_bytes` advances VV without local op_count increase.  PARTIAL closure at V3.6.0.8.2: the invariant at this layer is "set together / clear together" (verified by tests), not "monotonic drift".  Full debug-assert + monotonicity check deferred to V3.6.0.8.3 where the napi delta path enforces the contract.
-- **R-V3.6-16** Multi-peer concurrent rename + cell edits.  Locked closure: `merge_bytes` invalidates cache (verified by `v3_6_0_8_2_merge_bytes_invalidates_workbook_cache`); V3.6.0.8.3 napi staleness check returns `fullRebuildRequired=true` to the IDE.  Multi-peer end-to-end regression test added at V3.6.0.8.3.
-- **R-V3.6-17** Workbook clone cost may itself exceed delta budget.  Profile at V3.6.0.8.3; if `clone()` > 20 ms at 100k cells, switch from `Arc::make_mut` to a different COW pattern.
-- **R-V3.6-18** `apply_op` is private to `ql-oplog`.  CLOSED at V3.6.0.8.2 -- new `pub fn apply_ops_in_range(log: &OpLog, workbook: &mut Workbook, from_index: usize, to_index: usize, registry: &FunctionRegistry) -> Result<usize, ReplayError>` free function in `ql-oplog::replay` (re-exported via `ql_oplog::apply_ops_in_range`).  Preserves `replay_into`'s from-empty contract; out-of-range to_index silently stops at log end; empty/inverted range = O(1) no-op returning 0.  +4 ql-oplog-driven correctness tests in the ql-collab suite (`apply_ops_in_range_empty_is_noop` / `..._full_matches_replay_into` / `..._forward_from_partial` / `..._oversized_to_index_silently_stops_at_log_end`).
+- **R-V3.6-14** Cached Workbook stale after Loro UndoManager retract.  DISCOVERED at V3.6.0.8.1 design lock; CLOSED at V3.6.0.8.2 -- `undo()` + `redo()` call `force_clear_workbook_cache()` BEFORE Loro's undo/redo (verified by `v3_6_0_8_2_undo_invalidates_workbook_cache` + `..._redo_invalidates_workbook_cache` regression tests).  Mirror in `poll_remote_with_limit` added at V3.6.0.8.4 (5th invalidation callsite; Codex-HIGH-1 closure).
+- **R-V3.6-15** VersionVector vs op_count drift.  Loro's `oplog_vv()` returns `FxHashMap<PeerID, Counter>` (V3.6.0.8.4 OPUS-MED-1: pre-closure docstring said BTreeMap; actual `loro-internal-1.12.0/src/version.rs:29` is FxHashMap).  CLOSED at V3.6.0.8.4 via monotonicity `debug_assert_eq!(new_ops.len(), current_op_count - cached_op_count, ...)` in `workbook_snapshot_delta` (`crates/ql-bindings-node/src/lib.rs:2604-2613`).  V3.6.0.8.2 invalidation discipline + this assert together guarantee the cached `(VV, op_count)` pair never drifts.
+- **R-V3.6-16** Multi-peer concurrent rename + cell edits.  CLOSED at V3.6.0.8.5: `merge_bytes` invalidates cache (V3.6.0.8.2; verified by `v3_6_0_8_2_merge_bytes_invalidates_workbook_cache`); V3.6.0.8.3 napi staleness check returns `fullRebuildRequired=true`; multi-peer end-to-end IDE regression added at V3.6.0.8.5 mocha (`merge_bytes invalidation` suite).
+- **R-V3.6-17** Workbook clone cost may itself exceed delta budget.  CLOSED at V3.6.0.8.4 via new `bench_workbook_clone` micro-bench: 1k cells = 7 μs / 10k cells = 69 μs / 100k cells = **692 μs** — well under the V3.6.0.8.1 lock's 20 ms threshold.  `(*cached_arc).clone()` always-clone IS the right pattern; no Arc-make_mut COW refactor needed.
+- **R-V3.6-18** `apply_op` is private to `ql-oplog`.  CLOSED at V3.6.0.8.2 -- new `pub fn apply_ops_in_range(log: &OpLog, workbook: &mut Workbook, from_index: usize, to_index: usize, registry: &FunctionRegistry) -> Result<usize, ReplayError>` free function in `ql-oplog::replay` (re-exported via `ql_oplog::apply_ops_in_range`).  Preserves `replay_into`'s from-empty contract; out-of-range to_index silently stops at log end; empty/inverted range = O(1) no-op returning 0.  V3.6.0.8.4 OPUS-HIGH-3 closure switched the body from `iter().skip(N).take(M)` (deserialized all skipped ops) to `for i in start..end { log.get(i)? }` (K * O(log N) BTree random-access) -- delivered the 230× delta perf improvement at 100 new cells.  +4 ql-oplog-driven correctness tests in the ql-collab suite (`apply_ops_in_range_empty_is_noop` / `..._full_matches_replay_into` / `..._forward_from_partial` / `..._oversized_to_index_silently_stops_at_log_end`).
 
 #### V3.6 audit transcripts
 
@@ -2066,19 +2208,23 @@ The plan body at `.plans/_active.md` lines 286-314 is the authoritative source. 
 | V3.6.0.6 D5 | BLOCKED (OrbStack Mac bridge outage; V3.7+ retrospective if signal surfaces) | `2026-05-24-phase-5-7-v3-6-0-6-opus.md` |
 | V3.6.0.7 D6 spike | (measurement, no audit-of-spike) | `2026-05-25-phase-5-7-v3-6-0-7-spike.md` (spike transcript; not an audit) |
 | V3.6.0.8.1 D6 lock | (design lock, no audit-of-lock) | inline at `.plans/_active.md` + this section + docs/MASTER-PLAN.md (docs-only ship) |
-| V3.6.0.8.2 D6 engine PART 1 | (engine foundation, audit-of-D6 at V3.6.0.8.4) | inline at `.plans/_active.md` + this section + docs/MASTER-PLAN.md |
-| V3.6.0.8.3 D6 engine PART 2 napi | (napi surface; audit-of-D6 at V3.6.0.8.4) | inline at `.plans/_active.md` + this section + docs/MASTER-PLAN.md |
+| V3.6.0.8.2 D6 engine PART 1 | (engine foundation, audit-of-D6 ran at V3.6.0.8.4) | inline at `.plans/_active.md` + this section + docs/MASTER-PLAN.md |
+| V3.6.0.8.3 D6 engine PART 2 napi | (napi surface; audit-of-D6 ran at V3.6.0.8.4) | inline at `.plans/_active.md` + this section + docs/MASTER-PLAN.md |
+| **V3.6.0.8.4 D6 audit-of-D6 + closures + bench** | `2026-05-25-phase-5-7-v3-6-0-8-codex.md` (FAIL; 3 HIGH + 1 LOW + 1 INFO) | `2026-05-25-phase-5-7-v3-6-0-8-opus.md` (PASS-WITH-FINDINGS; 3 HIGH + 5 MED + 3 LOW + 1 INFO).  In-cycle closure summary: `docs/audits/2026-05-25-phase-5-7-v3-6-0-8-closures.md`.  5 HIGH closed + 4 of 5 MED closed; bench `bench_workbook_snapshot_delta` + `bench_workbook_clone` added. |
+| V3.6.0.8.5 D6 Opus-MED-5 mocha coverage | (mocha-only sub-step; no audit) | inline at `.plans/_active.md` + this section + docs/MASTER-PLAN.md |
+| V3.6.0.10 D8 Op::RestoreSheet | (ship-only sub-step; no per-step audit — coverage by V3.6.0.X phase-termination audit at V3.6.0.11 ship) | inline at `.plans/_active.md` + this section + docs/MASTER-PLAN.md |
+| **V3.6.0.10 docs megaudit** | `2026-05-25-phase-5-7-v3-6-0-10-megaudit-docs-codex.md` (PASS-WITH-FINDINGS; 2 HIGH + 4 MED + 1 LOW + 1 INFO) | `2026-05-25-phase-5-7-v3-6-0-10-megaudit-docs-opus.md` (PASS-WITH-FINDINGS; 3 HIGH + 9 MED + 7 LOW + 5 INFO).  3-lane megaudit (Codex + Opus + claude-self); convergent findings closed in this commit via doc sweep. |
 
 Date inconsistency note: V3.6.0.3 + V3.6.0.4 transcripts dated 2026-05-23 (per work-start session date); V3.6.0.2 + V3.6.0.5 + docs-audit dated 2026-05-24.  This is a known low-severity drift; convention going forward: filename date = audit execution date (post-midnight transitions retain the original session's date in the header).
 
 #### Out of scope for V3.6
 
-- ~~**V3.6.0.7 D6 incremental snapshot deltas** (profiling spike pending; ship D6 only if cost > 50ms/call at V3.6 scale)~~ — V3.6.0.7 spike SHIPPED; D6 SHIPS V3.6.0.8 per spike verdict.
-- **V3.6.0.8 D6 incremental WorkbookSnapshot deltas** — IN-PROGRESS.  V3.6.0.8.1 docs lock ✅ SHIPPED (this commit); V3.6.0.8.2/8.3/8.4 PENDING (~3 more cycles across ≥2 sessions).
+- ~~**V3.6.0.7 D6 incremental snapshot deltas** (profiling spike pending)~~ — V3.6.0.7 spike SHIPPED; D6 SHIPPED V3.6.0.8.1-8.5.
+- ~~**V3.6.0.8 D6 incremental WorkbookSnapshot deltas**~~ — V3.6.0.8.1-8.5 ALL SHIPPED.  D6 arc COMPLETE.
+- ~~**V3.6.0.10 D8 `Op::RestoreSheet`**~~ — SHIPPED V3.6.0.10 (re-numbered from V3.6.0.9 in the original V3.6.0.1 lock; user directed the conditional ship via AskUserQuestion at cycle 6 entry).
 - **V3.6.0.9 D7 `#REF!` substitution** (conditional on user signal; engine-side extends `repair_sheet_chain` at `rebuild_workbook` time).
-- **V3.6.0.10 D8 `Op::RestoreSheet`** (conditional on user signal; cell storage preserved internally).
 - **V3.6.0.11 D9 sheet-tabs UI / typing-stroke watchdog** (sheet-tabs deferred to V3.6+ multi-tab redesign; typing-stroke watchdog ship-on-signal).
-- **V3.6.0.X phase-termination audit** at V3.6.0.10 ship (broad scope; parallel Codex + Opus).
+- **V3.6.0.X phase-termination audit** at V3.6.0.11 ship (broad scope; parallel Codex + Opus).
 - **V3.6.1+** locale-aware format rendering (`format::render` grows locale conditionals).
 - **V3.7+** stable-op-ID OpLog API (closes R-V3.6-10 long-term fix; would let cell_op_index survive Loro UndoManager retracts without rebuild).
 - **V3.7+** `appendSetCellFormat` + `appendRegisterFormat` napi (unblocks mocha end-to-end format::render integration tests).

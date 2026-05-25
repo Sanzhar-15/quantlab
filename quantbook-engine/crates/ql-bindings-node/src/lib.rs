@@ -2450,7 +2450,12 @@ impl CollabSession {
     ///    with formulas"; calling `workbookSnapshot()` is simpler +
     ///    cheaper than building the equivalent delta).
     /// 8. Otherwise (cell-only): clone cached `Arc<Workbook>` via
-    ///    `Arc::make_mut`, replay `[cached_op_count, log.len())` via
+    ///    `(*cached_arc).clone()` always-clone (V3.6.0.8.4 OPUS-MED-3
+    ///    closure: V3.6.0.8.1 lock said `Arc::make_mut` but implementation
+    ///    discovered `cached_arc = Arc::clone(arc)` capture has strong_count
+    ///    >= 2 so `make_mut` would clone anyway; always-clone IS the right
+    ///    pattern; R-V3.6-17 measurement: 692 μs at 100k cells, well under
+    ///    20 ms threshold), replay `[cached_op_count, log.len())` via
     ///    `apply_ops_in_range` (skips repair walks per the cell-only
     ///    contract; new ops contain no renames), update cache,
     ///    emit per-cell delta entries + new formats + tombstoned
