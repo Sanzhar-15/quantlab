@@ -792,6 +792,37 @@ fn apply_op(op: &Op, workbook: &mut Workbook, index: usize) -> Result<(), Replay
             workbook.remove_sheet(*id);
             Ok(())
         }
+        Op::RestoreSheet { id } => {
+            // **Phase 5.7 V3.6.0.10 D8 (2026-05-25)**: un-tombstone
+            // the sheet at `*id`.  Reverses the V3.5.0.3b tombstone
+            // effect from `Op::RemoveSheet`.  Per the V3.6.0.10 D8
+            // CRDT semantic (documented at op.rs Op::RestoreSheet
+            // docstring):
+            //
+            // - Idempotent: restoring a non-tombstoned sheet is a
+            //   no-op (HashSet::remove on absent).
+            //
+            // - Out-of-range ids: silently dropped.  Matches the
+            //   Op::RemoveSheet permissive contract; a peer might
+            //   see Op::RestoreSheet for an id whose Op::AddSheet
+            //   hasn't replayed locally yet; Loro's causal-merge
+            //   order will eventually rectify but the strict-error
+            //   path would break the merge.  Workbook::restore_sheet
+            //   enforces the no-op behavior internally.
+            //
+            // - Cell preservation: cells written BEFORE the original
+            //   Op::RemoveSheet are still in `sheets[id]` (the
+            //   V3.5.0.3b tombstone preserves storage); they reappear.
+            //   Cells silently dropped while tombstoned do NOT
+            //   reappear -- they never reached storage.
+            //
+            // - Cross-peer convergence: concurrent {RemoveSheet,
+            //   RestoreSheet} resolved by Loro's causal-merge order
+            //   (last-replayed wins).  Both peers converge to the
+            //   same final tombstone state.
+            workbook.restore_sheet(*id);
+            Ok(())
+        }
         Op::RegisterFormat { id, string } => {
             // **W5-80:** route through `FormatTable::register_at` so
             // collisions surface as `FormatRejected` (rather than the

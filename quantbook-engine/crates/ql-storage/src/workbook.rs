@@ -759,6 +759,31 @@ impl Workbook {
         self.removed_sheets.contains(&id)
     }
 
+    /// **Phase 5.7 V3.6.0.10 D8 (2026-05-25):** un-tombstone `id`,
+    /// reversing [`Self::remove_sheet`].  Idempotent: removing the id
+    /// from `removed_sheets` when it wasn't tombstoned is a no-op.
+    /// Out-of-range ids are silently dropped (matches the
+    /// `remove_sheet` permissive semantic).
+    ///
+    /// **Cell preservation**: the V3.5.0.3b tombstone semantic
+    /// preserves the underlying `Sheet` storage at `sheets[id]` --
+    /// cells written before the tombstone are still there.  Restoring
+    /// the sheet simply un-flags it; the cells reappear.  Cells
+    /// written WHILE the sheet was tombstoned (via the silent-no-op
+    /// guard in `Op::PutValue` etc. apply_op) DO NOT reappear --
+    /// they were never written.  Documented as the V3.6.0.10 D8
+    /// semantic contract.
+    ///
+    /// **Cross-peer convergence**: HashSet::remove on absent is a
+    /// no-op; concurrent {RemoveSheet, RestoreSheet} produces the
+    /// last-writer-wins outcome via Loro's causal-merge iteration
+    /// order (matches the V3.5.0.3b idempotent-remove pattern).
+    pub fn restore_sheet(&mut self, id: SheetId) {
+        if (id as usize) < self.sheets.len() {
+            self.removed_sheets.remove(&id);
+        }
+    }
+
     /// **Phase 5.7 V3.5.0.3c (2026-05-24):** reorder `id` to `new_index`
     /// in the display-order overlay.  Sheet ids themselves stay stable
     /// (preserving the V3.5.0.3b id-stability invariant); only the

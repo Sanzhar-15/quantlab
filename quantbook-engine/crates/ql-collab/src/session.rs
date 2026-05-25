@@ -183,6 +183,20 @@ enum CacheEffect {
     /// LACKED -- the leak surfaced as phantom entries in
     /// `list_sheets_from_cache`).
     RemoveSheet { id: u16 },
+    /// **V3.6.0.10 D8 (2026-05-25)**: sheet un-tombstoned via
+    /// `Op::RestoreSheet`.  Apply: remove the id from the tombstone
+    /// tracker (cache's `removed_sheets`) so subsequent cell-keyed
+    /// effects on the sheet are processed normally.  Cells in
+    /// `last_snapshot` for the restored sheet were dropped at the
+    /// original `Op::RemoveSheet` apply -- they do NOT reappear in
+    /// the cache via this effect.  Cells in the underlying Workbook
+    /// storage (which the V3.5.0.3b tombstone preserved) DO reappear
+    /// in subsequent `workbookSnapshot` calls because the napi-level
+    /// rebuild_workbook reads from Workbook + the tombstone filter
+    /// now passes the un-tombstoned sheet through.  This asymmetry
+    /// (cache drops cells; Workbook preserves them) is documented in
+    /// the V3.6.0.10 D8 op.rs docstring as the deterministic semantic.
+    RestoreSheet { id: u16 },
     /// **V3.6.0.3 D2 (2026-05-24)**: session-wide format-table cache
     /// update from `Op::RegisterFormat`.  Apply: insert `(id, string)`
     /// into `format_table_cache` IF the id is not already present
@@ -1368,6 +1382,12 @@ impl CollabSession {
             // and (b) record the tombstone so subsequent cell-keyed
             // effects on the same sheet are silently skipped.
             Op::RemoveSheet { id } => out.push(CacheEffect::RemoveSheet { id: *id }),
+            // **V3.6.0.10 D8 (2026-05-25)**: sheet un-tombstone.
+            // Mirrors Op::RemoveSheet's cache walker; apply_cache_effect
+            // removes the id from the cache's `removed_sheets` tracker
+            // so subsequent cell-keyed effects on this sheet are
+            // processed normally.
+            Op::RestoreSheet { id } => out.push(CacheEffect::RestoreSheet { id: *id }),
             // **V3.6.0.3 D2 (2026-05-24)**: session-wide format-table
             // cache update.  Op::RegisterFormat carries `id: FormatIdWire`
             // (the wire shape) + `string: String`; convert id to storage
@@ -1445,6 +1465,7 @@ impl CollabSession {
             CacheEffect::ClearFormula { key } => Some(key.0),
             CacheEffect::SetCellFormat { key, .. } => Some(key.0),
             CacheEffect::RemoveSheet { .. } => None,
+            CacheEffect::RestoreSheet { .. } => None,
             CacheEffect::RegisterFormat { .. } => None,
         };
         if let Some(sheet) = target_sheet {
@@ -1468,6 +1489,7 @@ impl CollabSession {
             CacheEffect::ClearFormula { key } => Some(*key),
             CacheEffect::SetCellFormat { key, .. } => Some(*key),
             CacheEffect::RemoveSheet { .. } => None,
+            CacheEffect::RestoreSheet { .. } => None,
             CacheEffect::RegisterFormat { .. } => None,
         };
         if let Some(key) = cell_key_for_index {
@@ -1557,6 +1579,32 @@ impl CollabSession {
                 buckets.tombstones.insert(id);
                 buckets.snapshot.retain(|(sheet, _, _), _| *sheet != id);
                 buckets.cell_op_index.retain(|(sheet, _, _), _| *sheet != id);
+            }
+            // **V3.6.0.10 D8 (2026-05-25)**: un-tombstone the sheet at
+            // the cache layer.  Mirrors the Workbook::restore_sheet
+            // call in apply_op (ql-oplog/src/replay.rs).  Cache cells
+            // for the previously-tombstoned sheet were dropped at
+            // CacheEffect::RemoveSheet apply -- they do NOT reappear
+            // here.  Subsequent cell-keyed effects on the un-
+            // tombstoned sheet are processed normally because the
+            // `tombstones.contains(&sheet)` early-return at the top of
+            // this method now returns false.  Idempotent: removing an
+            // already-absent id from HashSet is a no-op.
+            CacheEffect::RestoreSheet { id } => {
+                buckets.tombstones.remove(&id);
+                // NOTE: we do NOT walk `cell_op_index` to re-add
+                // entries for the restored sheet.  The index is
+                // rebuilt from scratch on full-rebuild paths
+                // (`rebuild_op_indices_only` + `rebuild_snapshot_cache`);
+                // ad-hoc restore here would require walking the full
+                // log to find pre-tombstone cell-keyed ops, which is
+                // expensive + duplicates rebuild logic.  The classify_
+                // delta_op allowlist forces a full rebuild on
+                // Op::RestoreSheet (see lib.rs); the napi
+                // workbook_snapshot reads from rebuild_workbook
+                // (which sees the un-tombstoned cells in storage).
+                // So the cache's missing pre-tombstone cell entries
+                // are not consumer-visible.
             }
             // V3.6.0.3 D2 (2026-05-24): session-wide format-table cache
             // mirror.  V3.6.0.X audit-of-D2 closure (2026-05-23,
@@ -2374,6 +2422,11 @@ impl CollabSession {
                     CacheEffect::ClearFormula { key } => *key == target_key,
                     CacheEffect::SetCellFormat { key, .. } => *key == target_key,
                     CacheEffect::RemoveSheet { .. } => true,
+                    // V3.6.0.10 D8: RestoreSheet is sheet-keyed (not
+                    // cell-keyed) but always-apply locally so the
+                    // cache's tombstone tracker reflects the un-
+                    // tombstone effect; mirrors RemoveSheet.
+                    CacheEffect::RestoreSheet { .. } => true,
                     CacheEffect::RegisterFormat { .. } => false,
                 };
                 if apply {
@@ -7784,5 +7837,135 @@ mod tests {
         let n =
             ql_oplog::apply_ops_in_range(&s.log, &mut wb, 0, 1000, &registry).unwrap();
         assert_eq!(n, 1, "applied only the 1 op actually in the log");
+    }
+
+    // ============================================================
+    // Phase 5.7 V3.6.0.10 D8 (2026-05-25) -- Op::RestoreSheet
+    // ============================================================
+
+    #[test]
+    fn v3_6_0_10_restore_sheet_untombstones_in_workbook() {
+        // RemoveSheet then RestoreSheet -> sheet visible again in
+        // rebuilt workbook (is_sheet_removed returns false).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        s.append_op(put_value(0, 0, 0, 42.0)).unwrap();
+        s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
+        s.append_op(Op::RestoreSheet { id: 0 }).unwrap();
+        let registry = ql_functions::default_registry();
+        let (workbook, _report) = s.rebuild_workbook(&registry).unwrap();
+        assert!(
+            !workbook.is_sheet_removed(0),
+            "RestoreSheet must un-tombstone the sheet"
+        );
+        // Pre-tombstone cell preserved in storage (V3.5.0.3b tombstone
+        // semantic): rebuild_workbook produces a workbook with sheet 0
+        // visible + the original sheet name + cells in storage.
+        assert_eq!(workbook.sheet_count(), 1);
+        assert_eq!(
+            workbook.sheet(0).map(|sh| sh.name().to_string()),
+            Some("S".to_owned()),
+        );
+    }
+
+    #[test]
+    fn v3_6_0_10_restore_sheet_idempotent() {
+        // Double-restore + restore-on-never-removed are both no-ops.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        // Restore-on-never-removed.
+        s.append_op(Op::RestoreSheet { id: 0 }).unwrap();
+        s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
+        s.append_op(Op::RestoreSheet { id: 0 }).unwrap();
+        // Double-restore: second is a no-op.
+        s.append_op(Op::RestoreSheet { id: 0 }).unwrap();
+        let registry = ql_functions::default_registry();
+        let (workbook, _report) = s.rebuild_workbook(&registry).unwrap();
+        assert!(
+            !workbook.is_sheet_removed(0),
+            "after RestoreSheet, sheet is not tombstoned (idempotent)"
+        );
+    }
+
+    #[test]
+    fn v3_6_0_10_restore_sheet_out_of_range_is_noop() {
+        // RestoreSheet for a never-created id is silently dropped.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        // id=99 doesn't exist; should not error.
+        s.append_op(Op::RestoreSheet { id: 99 }).unwrap();
+        let registry = ql_functions::default_registry();
+        let (workbook, _report) = s.rebuild_workbook(&registry).unwrap();
+        assert_eq!(workbook.sheet_count(), 1);
+    }
+
+    #[test]
+    fn v3_6_0_10_restore_sheet_cache_drops_tombstone() {
+        // After RestoreSheet, CollabSession.removed_sheets no longer
+        // contains the id; subsequent cell-keyed ops on the un-
+        // tombstoned sheet are NOT dropped at the cache layer.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
+        s.append_op(Op::RestoreSheet { id: 0 }).unwrap();
+        // Post-restore: cell write must reach the cache.
+        s.append_op(put_value(0, 5, 5, 999.0)).unwrap();
+        let cells = s.snapshot_cells(0);
+        assert!(
+            cells.iter().any(|((r, c), _)| *r == 5 && *c == 5),
+            "cell written post-restore lands in cache"
+        );
+    }
+
+    #[test]
+    fn v3_6_0_10_restore_sheet_remote_merge_converges() {
+        // Two peers: A removes; B restores; A merges B's bytes.
+        // After merge both peers converge to "restored" (causally B
+        // restored after A removed).
+        let mut peer_a = CollabSession::new(PeerId::new(1)).unwrap();
+        peer_a
+            .append_op(Op::AddSheet {
+                name: "S".to_owned(),
+                chunk_rows: 16384,
+            })
+            .unwrap();
+        let base_bytes = peer_a.export_bytes().unwrap();
+        let mut peer_b = CollabSession::from_snapshot(PeerId::new(2), &base_bytes).unwrap();
+
+        // A removes.
+        peer_a.append_op(Op::RemoveSheet { id: 0 }).unwrap();
+        let a_bytes = peer_a.export_bytes().unwrap();
+
+        // B merges A's remove, then restores.
+        peer_b.merge_bytes(&a_bytes).unwrap();
+        peer_b.append_op(Op::RestoreSheet { id: 0 }).unwrap();
+        let b_bytes = peer_b.export_bytes().unwrap();
+
+        // A merges B's restore.
+        peer_a.merge_bytes(&b_bytes).unwrap();
+
+        let registry = ql_functions::default_registry();
+        let (workbook_a, _) = peer_a.rebuild_workbook(&registry).unwrap();
+        let (workbook_b, _) = peer_b.rebuild_workbook(&registry).unwrap();
+        assert!(!workbook_a.is_sheet_removed(0));
+        assert!(!workbook_b.is_sheet_removed(0));
+        assert_eq!(workbook_a.is_sheet_removed(0), workbook_b.is_sheet_removed(0));
     }
 }

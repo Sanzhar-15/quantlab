@@ -187,6 +187,54 @@ pub enum Op {
     /// retrofit individual Op additions.
     RemoveSheet { id: SheetId },
 
+    /// **Phase 5.7 V3.6.0.10 D8 (2026-05-25):** un-tombstone a sheet
+    /// previously marked via `Op::RemoveSheet`.  Reverses the
+    /// V3.5.0.3b tombstone effect.  CRDT semantic:
+    ///
+    /// - **Cell preservation**: the V3.5.0.3b tombstone semantic
+    ///   preserves the underlying `Sheet` storage at `sheets[id]`,
+    ///   so cells written BEFORE the tombstone reappear when
+    ///   restored.  Cells that callers attempted to write WHILE
+    ///   tombstoned were silent-no-op'd at the apply_op layer and
+    ///   never reached the underlying storage -- those do NOT
+    ///   reappear on restore.  This is the consistent semantic for
+    ///   the V3.5.0.3b silent-no-op contract.
+    ///
+    /// - **Idempotent under concurrent restore**: two peers
+    ///   concurrently restoring the same sheet is a no-op for the
+    ///   second op (the sheet is already absent from
+    ///   `removed_sheets`).  `HashSet::remove` on absent is a no-op;
+    ///   cross-peer convergence preserved.
+    ///
+    /// - **Cross-peer {RemoveSheet, RestoreSheet} ordering**: Loro's
+    ///   causal-merge iteration order resolves; whichever op replays
+    ///   second wins.  Restore-then-remove leaves the sheet
+    ///   tombstoned; Remove-then-restore leaves it visible.
+    ///
+    /// - **Out-of-range ids**: silently dropped (matches
+    ///   `Op::RemoveSheet`'s permissive contract).
+    ///
+    /// - **Formula refs to (previously-tombstoned, now-restored)
+    ///   sheets**: V3.6.0.10 ships leaves formula text intact.
+    ///   Pre-tombstone formula text is preserved across the
+    ///   tombstone-restore round-trip because the V3.5.0.3b
+    ///   tombstone is a flag, not a destructive op.  V3.6+ #REF!
+    ///   substitution (D7, conditional) would interact with this
+    ///   variant if shipped.
+    ///
+    /// **Wire format compatibility**: additive new variant on the
+    /// serde-tagged enum; **`OPLOG_SCHEMA_VERSION` NOT bumped**
+    /// (consistent with every prior V3.5.x / V3.6.x variant addition).
+    /// **Backward-compat**: V3.6.0.10+ binaries read pre-V3.6.0.10
+    /// .qbook files cleanly (no Op::RestoreSheet instances).
+    /// **Forward-compat caveat**: pre-V3.6.0.10 binaries reading
+    /// a V3.6.0.10+ saved .qbook with `Op::RestoreSheet` instances
+    /// WILL fail deserialization with `OpLogError::Deserialize`
+    /// (same serde `tag = "kind"` reject-unknown-variant behavior
+    /// as Op::RemoveSheet / Op::MoveSheet; see V3.5.0.3b docstring
+    /// for the V3.x maintainer schema-bump guidance).
+    RestoreSheet { id: SheetId },
+
     /// **Phase 5.7 V3.5.0.3c (2026-05-24):** reorder sheets in the
     /// workbook's display order without shifting underlying sheet ids.
     /// CRDT semantic per V3.5.0.3c decision lock (display-order overlay

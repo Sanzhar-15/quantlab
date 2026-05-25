@@ -448,7 +448,16 @@ fn classify_delta_op(
         | Op::SetName { .. }
         | Op::SetLocale { .. }
         | Op::SetReferenceMode { .. }
-        | Op::SetDateSystem { .. } => {
+        | Op::SetDateSystem { .. }
+        // **V3.6.0.10 D8 closure**: Op::RestoreSheet forces fullRebuild.
+        // Reasoning: restoring an un-tombstones a sheet whose cells are
+        // preserved in Workbook storage but absent from the
+        // CollabSession last_snapshot cache (the cache dropped them at
+        // CacheEffect::RemoveSheet apply).  Walking the full op log to
+        // re-emit pre-tombstone cell-keyed effects would duplicate
+        // rebuild_snapshot_cache logic; fullRebuild is simpler + the
+        // op is rare (user-initiated undo-of-delete).
+        | Op::RestoreSheet { .. } => {
             *has_rename = true;
         }
         _ => {
@@ -1421,6 +1430,67 @@ impl CollabSession {
         // Note: already-tombstoned sheet is NOT a bad_argument (CRDT
         // idempotency; the resulting Op::RemoveSheet replay is a no-op).
         let op = Op::RemoveSheet { id: sheet_id };
+        inner.append_op(op).map_err(collab_session_error_to_napi)?;
+        Ok(())
+    }
+
+    /// **Phase 5.7 V3.6.0.10 D8 (2026-05-25) -- append an
+    /// `Op::RestoreSheet` to this session (un-tombstone a sheet
+    /// previously deleted via `deleteSheet`).**
+    ///
+    /// Per V3.6.0.1 D8 lock: new wire variant `Op::RestoreSheet { id }`
+    /// reverses the V3.5.0.3b tombstone effect.  Cells written
+    /// BEFORE the original `deleteSheet` are preserved by the tombstone
+    /// semantic and reappear on restore.  Cells silently-no-op'd
+    /// while tombstoned do NOT reappear -- they never reached storage.
+    ///
+    /// **id validation**: `id <= u16::MAX` + pre-rebuild existence
+    /// check (mirrors `deleteSheet`).  Already-restored or never-
+    /// tombstoned ids are NOT a bad_argument (CRDT idempotency; the
+    /// resulting `Op::RestoreSheet` replay is a no-op).
+    ///
+    /// **Cross-peer**: HashSet::remove on absent is a no-op.
+    /// Concurrent {RemoveSheet, RestoreSheet} resolved by Loro's
+    /// causal-merge order; both peers converge to the same final
+    /// tombstone state (whichever op replays second wins).
+    ///
+    /// **Cache + delta interaction (V3.6.0.10 D8 classify_delta_op
+    /// closure)**: `Op::RestoreSheet` is in the metadata-ops
+    /// allowlist that forces `fullRebuildRequired=true` on the next
+    /// `workbookSnapshotDelta` call.  The cell cache walker dropped
+    /// pre-tombstone cells at `CacheEffect::RemoveSheet` apply; full
+    /// rebuild is the cheapest way to get them back into the
+    /// snapshot reply.  The underlying Workbook storage retained the
+    /// cells (V3.5.0.3b preservation invariant), so the full rebuild
+    /// has them available.
+    ///
+    /// # Errors
+    /// - `[bad_argument]` if `id > 65535`.
+    /// - `[bad_argument]` if `id >= sheet_count()` (sheet has never
+    ///   been created in this workbook).
+    /// - `[session_oplog]` if `rebuild_workbook` fails (replay error).
+    #[napi(js_name = "restoreSheet")]
+    pub fn restore_sheet(&self, id: u32) -> Result<()> {
+        if id > u16::MAX as u32 {
+            return Err(bad_argument_error(format!(
+                "restoreSheet: id must be in [0, 65535] (u16::MAX), got {id}"
+            )));
+        }
+        let sheet_id = id as u16;
+        let mut inner = self.inner.lock();
+        let registry = default_registry();
+        let (workbook, _report) = inner
+            .rebuild_workbook(&registry)
+            .map_err(collab_session_error_to_napi)?;
+        if (sheet_id as usize) >= workbook.sheet_count() {
+            return Err(bad_argument_error(format!(
+                "restoreSheet: id {id} does not exist (workbook has {} sheets)",
+                workbook.sheet_count()
+            )));
+        }
+        // Note: already-untombstoned sheet is NOT a bad_argument (CRDT
+        // idempotency; the resulting Op::RestoreSheet replay is a no-op).
+        let op = Op::RestoreSheet { id: sheet_id };
         inner.append_op(op).map_err(collab_session_error_to_napi)?;
         Ok(())
     }
