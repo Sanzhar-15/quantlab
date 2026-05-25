@@ -6617,3 +6617,269 @@ suite('quantbook V3.6.0.8.3 D6 -- workbookSnapshotDelta invalidation by undo', f
 	});
 });
 
+// =====================================================================
+// Phase 5.7 V3.6.0.8.5 (2026-05-25) -- V3.6.0.8.4 Opus-MED-5 closure
+// =====================================================================
+//
+// Comprehensive mocha regression suite covering the gaps the
+// V3.6.0.8.4 audit-of-D6 cycle deferred.  Each test pins a specific
+// invariant from the V3.6.0.8.1 lock + the V3.6.0.8.4 audit closures.
+
+suite('quantbook V3.6.0.8.5 -- workbookSnapshotDelta merge_bytes invalidates cache', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+	test('merge_bytes between cache populate and delta call returns fullRebuildRequired=true', function () {
+		// Multi-peer scenario: peer A populates cache, peer B sends
+		// remote ops via mergeBytes, A's next delta MUST return
+		// fullRebuildRequired=true (V3.6.0.8.2 invalidation discipline).
+		const peerA = createSession(1n);
+		addSheet(peerA, 'S');
+		appendPutValueValidated(peerA, 0, 0, 0, 42);
+		workbookSnapshot(peerA); // populates A's cache
+		const probe = peerA.workbookSnapshotDelta(Buffer.alloc(0));
+		const baselineVersion = probe.version;
+
+		// Peer B branches from A's bytes, makes its own edit.
+		const aBytes = peerA.exportBytes();
+		const peerB = sessionFromSnapshot(2n, aBytes);
+		appendPutValueValidated(peerB, 0, 1, 0, 99);
+		const bBytes = peerB.exportBytes();
+
+		// A merges B's bytes -- cache MUST be invalidated.
+		peerA.mergeBytes(bBytes);
+		const delta = peerA.workbookSnapshotDelta(baselineVersion);
+		assert.strictEqual(
+			delta.fullRebuildRequired,
+			true,
+			'merge_bytes between populate + delta MUST invalidate workbook cache',
+		);
+	});
+});
+
+suite('quantbook V3.6.0.8.5 -- workbookSnapshotDelta malformed Buffer', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+	test('garbage bytes for lastSeenVersion returns fullRebuildRequired=true (not throws)', function () {
+		const session = createSession(1n);
+		addSheet(session, 'S');
+		appendPutValueValidated(session, 0, 0, 0, 1);
+		workbookSnapshot(session);
+		// Pass random non-VV bytes.  Loro's decode should fail; engine
+		// returns fullRebuildRequired=true rather than throwing.
+		const garbage = Buffer.from([0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8]);
+		const delta = session.workbookSnapshotDelta(garbage);
+		assert.strictEqual(delta.fullRebuildRequired, true);
+		assert.deepStrictEqual(delta.changedCells, []);
+	});
+});
+
+suite('quantbook V3.6.0.8.5 -- workbookSnapshotDelta AddSheet triggers fullRebuild', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+	test('addSheet between cache populate and delta call returns fullRebuildRequired=true (V3.6.0.8.4 CONVERGENT-HIGH-1 allowlist closure)', function () {
+		const session = createSession(1n);
+		addSheet(session, 'S');
+		appendPutValueValidated(session, 0, 0, 0, 1);
+		workbookSnapshot(session);
+		const probe = session.workbookSnapshotDelta(Buffer.alloc(0));
+		const baselineVersion = probe.version;
+		// Append AddSheet -- pre-V3.6.0.8.4 closure this was silently
+		// classified as delta-safe + IDE got empty delta + advanced
+		// version while engine had new sheets.  Post-closure: must
+		// fullRebuild.
+		addSheet(session, 'NewSheet');
+		const delta = session.workbookSnapshotDelta(baselineVersion);
+		assert.strictEqual(
+			delta.fullRebuildRequired,
+			true,
+			'AddSheet in delta MUST trigger fullRebuild (allowlist closure)',
+		);
+	});
+});
+
+suite('quantbook V3.6.0.8.5 -- workbookSnapshotDelta MoveSheet triggers fullRebuild', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+	test('moveSheet between cache populate and delta call returns fullRebuildRequired=true', function () {
+		const session = createSession(1n);
+		addSheet(session, 'A');
+		addSheet(session, 'B');
+		appendPutValueValidated(session, 0, 0, 0, 1);
+		workbookSnapshot(session);
+		const probe = session.workbookSnapshotDelta(Buffer.alloc(0));
+		const baselineVersion = probe.version;
+		moveSheet(session, 1, 0); // swap display order
+		const delta = session.workbookSnapshotDelta(baselineVersion);
+		assert.strictEqual(
+			delta.fullRebuildRequired,
+			true,
+			'MoveSheet in delta MUST trigger fullRebuild (allowlist closure)',
+		);
+	});
+});
+
+suite('quantbook V3.6.0.8.5 -- workbookSnapshotDelta RemoveSheet emits sheetsRemoved', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+	test('deleteSheet between cache populate and delta call emits in sheetsRemoved', function () {
+		const session = createSession(1n);
+		addSheet(session, 'A');
+		addSheet(session, 'B');
+		appendPutValueValidated(session, 0, 0, 0, 1);
+		workbookSnapshot(session);
+		const probe = session.workbookSnapshotDelta(Buffer.alloc(0));
+		const baselineVersion = probe.version;
+		deleteSheet(session, 1); // tombstone sheet B (id=1)
+		const delta = session.workbookSnapshotDelta(baselineVersion);
+		// RemoveSheet is in the cell-only-deltable allowlist (not the
+		// rename-fullRebuild arm) -- the delta should NOT fullRebuild;
+		// sheetsRemoved should include the tombstoned id.
+		assert.strictEqual(
+			delta.fullRebuildRequired,
+			false,
+			'RemoveSheet is cell-only-deltable; sheetsRemoved populated',
+		);
+		assert.deepStrictEqual(delta.sheetsRemoved.sort(), [1]);
+	});
+});
+
+suite('quantbook V3.6.0.8.5 -- workbookSnapshotDelta chained delta calls', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+	test('after first delta consumes new ops, second delta with returned version returns empty', function () {
+		const session = createSession(1n);
+		addSheet(session, 'S');
+		appendPutValueValidated(session, 0, 0, 0, 1);
+		workbookSnapshot(session); // populates cache at VV1
+		const probe = session.workbookSnapshotDelta(Buffer.alloc(0));
+		const v1 = probe.version;
+		appendPutValueValidated(session, 0, 1, 0, 2);
+		appendPutValueValidated(session, 0, 2, 0, 3);
+		const delta1 = session.workbookSnapshotDelta(v1);
+		assert.strictEqual(delta1.fullRebuildRequired, false);
+		assert.strictEqual(delta1.changedCells.length, 2);
+		// delta1 advanced the cache to VV2.  Calling again with delta1.version
+		// should hit same-VV fast-path -> empty delta + same version.
+		const delta2 = session.workbookSnapshotDelta(delta1.version);
+		assert.strictEqual(delta2.fullRebuildRequired, false);
+		assert.strictEqual(delta2.changedCells.length, 0, 'chained delta with same version = empty');
+	});
+});
+
+suite('quantbook V3.6.0.8.5 -- workbookSnapshotDelta redo invalidates cache', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+	test('redo() between cache populate and delta call returns fullRebuildRequired=true', function () {
+		const session = createSession(1n);
+		addSheet(session, 'S');
+		appendPutValueValidated(session, 0, 0, 0, 1);
+		undo(session); // creates a redo stack item
+		workbookSnapshot(session);
+		const probe = session.workbookSnapshotDelta(Buffer.alloc(0));
+		const baselineVersion = probe.version;
+		const consumed = redo(session);
+		assert.strictEqual(consumed, true);
+		const delta = session.workbookSnapshotDelta(baselineVersion);
+		assert.strictEqual(
+			delta.fullRebuildRequired,
+			true,
+			'redo MUST invalidate workbook cache (R-V3.6-14 closure; symmetric with undo)',
+		);
+	});
+});
+
+suite('quantbook V3.6.0.8.5 -- workbookSnapshotDelta appendPutFormula in delta', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+	test('appendPutFormula between cache populate and delta surfaces formula in changedCells', function () {
+		const session = createSession(1n);
+		addSheet(session, 'S');
+		appendPutValueValidated(session, 0, 0, 0, 1);
+		workbookSnapshot(session);
+		const probe = session.workbookSnapshotDelta(Buffer.alloc(0));
+		const baselineVersion = probe.version;
+		appendPutFormulaValidated(session, 0, 1, 0, '=A1*2');
+		const delta = session.workbookSnapshotDelta(baselineVersion);
+		assert.strictEqual(delta.fullRebuildRequired, false);
+		assert.strictEqual(delta.changedCells.length, 1);
+		assert.strictEqual(delta.changedCells[0].cell.row, 1);
+		assert.strictEqual(delta.changedCells[0].cell.col, 0);
+		assert.strictEqual(delta.changedCells[0].cell.formula, '=A1*2');
+	});
+});
+
+suite('quantbook V3.6.0.8.5 -- workbookSnapshotDelta renameSheet via different path (allowlist coverage)', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+	test('renameSheet of a sheet referenced by cross-sheet formulas returns fullRebuildRequired=true', function () {
+		const session = createSession(1n);
+		addSheet(session, 'Source');
+		addSheet(session, 'Ref');
+		appendPutValueValidated(session, 0, 0, 0, 42);
+		appendPutFormulaValidated(session, 1, 0, 0, '=Source!A1');
+		workbookSnapshot(session);
+		const probe = session.workbookSnapshotDelta(Buffer.alloc(0));
+		const baselineVersion = probe.version;
+		renameSheet(session, 0, 'Renamed');
+		const delta = session.workbookSnapshotDelta(baselineVersion);
+		assert.strictEqual(
+			delta.fullRebuildRequired,
+			true,
+			'renameSheet triggers rename-fullRebuild branch even with cross-sheet formula impact (rename arm of classify_delta_op)',
+		);
+	});
+});
+
+suite('quantbook V3.6.0.8.5 -- workbookSnapshotJson exposes version (OPUS-HIGH-2 closure)', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+	test('workbookSnapshot() returns a populated version Buffer matching workbookSnapshotDelta probe', function () {
+		const session = createSession(1n);
+		addSheet(session, 'S');
+		appendPutValueValidated(session, 0, 0, 0, 42);
+		const snap = workbookSnapshot(session);
+		// V3.6.0.8.4 OPUS-HIGH-2 closure: snap.version is populated
+		// + matches the engine's current VV (verified by feeding it
+		// to workbookSnapshotDelta and getting same-VV fast-path).
+		assert.ok(snap.version, 'snap.version is populated');
+		assert.ok(Buffer.isBuffer(snap.version));
+		assert.ok(snap.version.length > 0, 'version is non-empty (engine has at least one peer counter)');
+		// Pass it back to workbookSnapshotDelta -- should hit same-VV
+		// fast-path (no ops since populate) -> empty delta + same version.
+		const delta = session.workbookSnapshotDelta(snap.version);
+		assert.strictEqual(
+			delta.fullRebuildRequired,
+			false,
+			'snap.version is recognized by workbookSnapshotDelta (closes IDE consumer protocol step 2 race window)',
+		);
+		assert.strictEqual(delta.changedCells.length, 0);
+		// Round-trip: delta.version should equal snap.version (same
+		// engine VV; no ops between).
+		assert.deepStrictEqual(
+			Buffer.from(delta.version).toString('hex'),
+			Buffer.from(snap.version).toString('hex'),
+			'round-trip version token bytes match',
+		);
+	});
+});
+
