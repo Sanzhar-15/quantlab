@@ -281,6 +281,34 @@ export interface WorkbookSnapshotJson {
 	 * are already pre-rendered.
 	 */
 	dateSystem: 'Excel1900' | 'Excel1904';
+	/**
+	 * **Phase 5.7 V3.6.0.8.4 OPUS-HIGH-2 closure (2026-05-25)**:
+	 * opaque Loro version-vector token captured at the moment of this
+	 * snapshot.  Pass back as `lastSeenVersion` on the next
+	 * {@link CollabSessionInstance.workbookSnapshotDelta} call.  The
+	 * IDE should NOT decode this -- it's a raw `Buffer` of Loro's
+	 * `VersionVector::encode()` output.
+	 *
+	 * **Why on the snapshot reply**: V3.6.0.8.3 shipped without a
+	 * `currentVersion()` accessor; the mocha tests probed via empty-
+	 * Buffer delta calls.  V3.6.0.8.4 Opus audit flagged that probe
+	 * as a race-window risk in multi-window collab (engine could
+	 * receive a remote op between snapshot + probe).  Bundling
+	 * `version` here makes populate-and-capture atomic against the
+	 * engine's lock-held cache populate.
+	 *
+	 * **TypeScript-side optional** (napi-side always populated):
+	 * marked optional so fixture-literal unit tests that construct
+	 * `WorkbookSnapshotJson` by hand don't need an opaque
+	 * `Buffer.alloc(0)` placeholder.  Real napi calls ALWAYS populate
+	 * `version`; the shape-pinning tests at the napi boundary (suites
+	 * `quantbook V3.5.0.2 -- workbookSnapshot napi contract` +
+	 * `quantbook V3.6.0.5 -- WorkbookSnapshotJson shape`) verify
+	 * presence via `Object.keys(snap)`.  Consumers reading `version`
+	 * for delta calls should treat it as required when the snapshot
+	 * came from a real `workbookSnapshot()` invocation.
+	 */
+	version?: Buffer;
 }
 
 /**
