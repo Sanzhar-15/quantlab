@@ -67,6 +67,7 @@ import {
 	quantbookEngineVersion,
 	redo,
 	renameSheet,
+	restoreSheet,
 	sessionFromQbook,
 	sessionFromSnapshot,
 	sweepPresence,
@@ -6879,6 +6880,102 @@ suite('quantbook V3.6.0.8.5 -- workbookSnapshotJson exposes version (OPUS-HIGH-2
 			Buffer.from(delta.version).toString('hex'),
 			Buffer.from(snap.version).toString('hex'),
 			'round-trip version token bytes match',
+		);
+	});
+});
+
+// =====================================================================
+// Phase 5.7 V3.6.0.10 D8 (2026-05-25) -- restoreSheet napi + delta interaction
+// =====================================================================
+
+suite('quantbook V3.6.0.10 D8 -- restoreSheet napi contract', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('restoreSheet appends one op', () => {
+		const session = createSession(1n);
+		addSheet(session, 'S');
+		deleteSheet(session, 0);
+		const opCountBefore = session.opCount();
+		restoreSheet(session, 0);
+		assert.strictEqual(
+			session.opCount(),
+			opCountBefore + 1,
+			'one restoreSheet call appends exactly one op',
+		);
+	});
+
+	test('restoreSheet of out-of-range id throws bad_argument', () => {
+		const session = createSession(1n);
+		addSheet(session, 'S');
+		assert.throws(
+			() => restoreSheet(session, 99),
+			/bad_argument.*does not exist/i,
+		);
+	});
+
+	test('restoreSheet of id > u16::MAX throws bad_argument', () => {
+		const session = createSession(1n);
+		addSheet(session, 'S');
+		assert.throws(
+			() => restoreSheet(session, 65536),
+			/bad_argument.*u16/i,
+		);
+	});
+
+	test('restoreSheet brings sheet back into workbookSnapshot.sheets', () => {
+		const session = createSession(1n);
+		addSheet(session, 'S');
+		appendPutValueValidated(session, 0, 0, 0, 42);
+		deleteSheet(session, 0);
+		// Pre-restore: workbookSnapshot filters out the tombstoned sheet.
+		assert.strictEqual(workbookSnapshot(session).sheets.length, 0);
+		restoreSheet(session, 0);
+		// Post-restore: sheet visible again with its original name.
+		const snap = workbookSnapshot(session);
+		assert.strictEqual(snap.sheets.length, 1);
+		assert.strictEqual(snap.sheets[0].name, 'S');
+	});
+
+	test('restoreSheet is idempotent (already-restored is no-op)', () => {
+		const session = createSession(1n);
+		addSheet(session, 'S');
+		deleteSheet(session, 0);
+		restoreSheet(session, 0);
+		// Second restore: no error, just a no-op op.
+		restoreSheet(session, 0);
+		assert.strictEqual(workbookSnapshot(session).sheets.length, 1);
+	});
+});
+
+suite('quantbook V3.6.0.10 D8 -- restoreSheet in workbookSnapshotDelta triggers fullRebuild', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	test('restoreSheet between cache populate and delta call returns fullRebuildRequired=true', () => {
+		// V3.6.0.10 D8 classify_delta_op closure: Op::RestoreSheet is
+		// in the metadata-ops fullRebuild allowlist (per the
+		// V3.6.0.10 D8 ship comment) because the cell cache dropped
+		// pre-tombstone cells at CacheEffect::RemoveSheet; the Workbook
+		// preserved them, so fullRebuild is the cheapest way to get
+		// them back into the snapshot reply.
+		const session = createSession(1n);
+		addSheet(session, 'S');
+		appendPutValueValidated(session, 0, 0, 0, 42);
+		deleteSheet(session, 0);
+		workbookSnapshot(session); // populates cache (sheet is tombstoned)
+		const probe = session.workbookSnapshotDelta(Buffer.alloc(0));
+		const baselineVersion = probe.version;
+		restoreSheet(session, 0);
+		const delta = session.workbookSnapshotDelta(baselineVersion);
+		assert.strictEqual(
+			delta.fullRebuildRequired,
+			true,
+			'RestoreSheet in delta MUST trigger fullRebuild (V3.6.0.10 D8 classify_delta_op closure)',
 		);
 	});
 });

@@ -536,6 +536,39 @@ export interface CollabSessionInstance {
 	deleteSheet(id: number): void;
 
 	/**
+	 * **Phase 5.7 V3.6.0.10 D8 (2026-05-25)** -- append an
+	 * `Op::RestoreSheet` to this session (un-tombstone a sheet
+	 * previously deleted via `deleteSheet`).
+	 *
+	 * **CRDT semantic (V3.6.0.10 D8 decision lock)**: reverses the
+	 * V3.5.0.3b tombstone effect.  Cells written BEFORE the original
+	 * `deleteSheet` are preserved by the tombstone semantic and
+	 * reappear on restore.  Cells silently-no-op'd while tombstoned do
+	 * NOT reappear -- they never reached storage.
+	 *
+	 * **Cross-peer**: concurrent {`deleteSheet`, `restoreSheet`}
+	 * resolved by Loro's causal-merge order; whichever op replays
+	 * second wins.  Both peers converge to the same final tombstone
+	 * state.  Already-restored or never-tombstoned ids are NOT a
+	 * bad_argument (CRDT idempotency).
+	 *
+	 * **Cache + delta interaction**: `Op::RestoreSheet` is in the
+	 * `workbookSnapshotDelta` fullRebuild allowlist (V3.6.0.10 D8
+	 * `classify_delta_op` closure).  The next `workbookSnapshotDelta`
+	 * call after a `restoreSheet` returns `fullRebuildRequired=true`;
+	 * the IDE should call `workbookSnapshot()` to get the un-
+	 * tombstoned sheet's cells back.
+	 *
+	 * Use the typed wrapper `restoreSheet` from `./session`.
+	 *
+	 * @throws `[bad_argument]` if `id` exceeds u16 range OR refers to
+	 *         a never-created sheet (already-restored / never-deleted
+	 *         is OK -- the resulting op is an idempotent no-op).
+	 * @throws `[session_oplog]` / `[session_replay]` per engine errors.
+	 */
+	restoreSheet(id: number): void;
+
+	/**
 	 * **Phase 5.7 V3.5.0.3c (2026-05-24)** -- append an `Op::MoveSheet`
 	 * to this session (reorder sheet's display position; id stays
 	 * stable).

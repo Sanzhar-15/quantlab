@@ -242,6 +242,25 @@ export function deleteSheet(session: CollabSessionInstance, id: number): void {
 }
 
 /**
+ * **Phase 5.7 V3.6.0.10 D8 (2026-05-25) -- typed wrapper for
+ * `CollabSession.restoreSheet`.**
+ *
+ * Un-tombstone a sheet previously tombstoned via `deleteSheet`.
+ * Pre-tombstone cells reappear (V3.5.0.3b tombstone storage
+ * preservation); cells silently-no-op'd while tombstoned do not.
+ *
+ * **Delta cache interaction**: next `workbookSnapshotDelta` call after
+ * `restoreSheet` returns `fullRebuildRequired=true`; IDE should call
+ * `workbookSnapshot()` to fetch the restored cells.
+ *
+ * Single-line indirection mirrors addSheet / renameSheet / deleteSheet /
+ * workbookSnapshot for API surface stability.
+ */
+export function restoreSheet(session: CollabSessionInstance, id: number): void {
+	session.restoreSheet(id);
+}
+
+/**
  * **Phase 5.7 V3.5.0.3c (2026-05-24) -- typed wrapper for
  * `CollabSession.moveSheet`.**
  *
