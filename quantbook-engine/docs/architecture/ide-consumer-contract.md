@@ -1799,7 +1799,7 @@ Three additional minor findings noted but not fixed in-cycle:
 
 ### 4.1.z6 Loro UndoManager on_push + format registry + per-cell op-index + format-aware buildHtml rendering (Phase 5.7 V3.6, 2026-05-24)
 
-**Status**: V3.6.0.1 lock + V3.6.0.2 D1 + V3.6.0.3 D2 + V3.6.0.4 D3 + V3.6.0.5 D4 + V3.6.0.6 D5 + V3.6.0.X audit-of-D5 closures + V3.6.0.7 D6 profiling spike + V3.6.0.8.1 D6 DESIGN LOCK + V3.6.0.8.2 D6 ENGINE PART 1 + **V3.6.0.8.3 D6 ENGINE PART 2 napi** ALL SHIPPED + AUDITED.  V3.6.0.8.4 = audit-of-D6 + bench delta-vs-full at 100k cells + R-V3.6-15 full debug-assert + R-V3.6-17 clone-cost profile is the next sub-step.  Spike verdict (V3.6.0.7): 251 ms median at 100k cells / 50 % format / 1 sheet (5× the 50 ms threshold).  Lock verdict (V3.6.0.8.1): option (a) cache rebuilt+repaired Workbook + clone-and-apply-delta CHOSEN.  Engine foundation (V3.6.0.8.2): 2 new fields + 4 invalidation callsites + new public `apply_ops_in_range` helper on ql-oplog.
+**Status**: V3.6.0.8.4 D6 ENGINE COMPLETE (audit + 5 HIGH + 4 MED closures + bench).  **V3.6.0.8 D6 arc COMPLETE.**  D6 perf contract delivered: 100 new cells delta = 1.08 ms vs 246 ms full snapshot (228× faster; 46× under the 50 ms threshold).  R-V3.6-15 + R-V3.6-17 CLOSED.  Spike verdict (V3.6.0.7): 251 ms median at 100k cells / 50 % format / 1 sheet (5× the 50 ms threshold).  Lock verdict (V3.6.0.8.1): option (a) cache rebuilt+repaired Workbook + clone-and-apply-delta CHOSEN.  Engine foundation (V3.6.0.8.2): 2 new fields + 4 invalidation callsites + new public `apply_ops_in_range` helper on ql-oplog.
 
 **Engine HEAD at this section's commit**: (next; V3.6.0.8.3 D6 ENGINE PART 2 napi commit -- workbookSnapshotDelta napi + WorkbookSnapshotDeltaJson struct + helpers + last_snapshot_op_count 3rd cache field + cache populate in workbookSnapshot + oplog_vv/log accessors + VersionVector re-export + types.ts + 6 mocha shape tests + plan/MASTER-PLAN/this file sweep) <- `dc74d48b97e` (V3.6.0.8.2 D6 ENGINE PART 1) <- `ebe7c946429` (V3.6.0.8.1 D6 DESIGN LOCK) <- `3e1e4deff50` (V3.6.0.7 D6 spike).
 **IDE HEAD at this section's commit**: (next; V3.6.0.8.3 D6 IDE commit -- types.ts WorkbookSnapshotDeltaJson + workbookSnapshotDelta method + 6 mocha shape tests) <- `d9731633ac4` (V3.6.0.X audit-of-D5 closures IDE; V3.6.0.7 + V3.6.0.8.1 + V3.6.0.8.2 are engine-only) <- prior chain.
@@ -1975,7 +1975,7 @@ last_snapshot_oplog_vv: Option<VersionVector>,    // Loro VV at time of cache
 
 - `Workbook: Send + Sync` (auto-derive via field composition per `crates/ql-storage/src/workbook.rs:295-299`).
 - `Arc<T>: Send + Sync` iff `T: Send + Sync` -- passes.
-- `VersionVector` is Loro's; re-exported via `loro::VersionVector`; underlying `BTreeMap<PeerID, Counter>` is Send+Sync via primitive composition.
+- `VersionVector` is Loro's; re-exported via `loro::VersionVector`; underlying `FxHashMap<PeerID, Counter>` is Send+Sync via primitive composition (V3.6.0.8.4 OPUS-MED-1 closure: pre-closure docs said BTreeMap; actual loro-internal-1.12.0/src/version.rs:29 is FxHashMap).
 
 **Rule 4 arc terminus stays at 6** -- no Rule 4 trigger (all positive Send+Sync composition).
 

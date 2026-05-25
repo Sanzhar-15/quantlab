@@ -1,0 +1,201 @@
+# V3.6.0.8 D6 audit (Codex Lane A)
+
+You are auditing the 3-commit V3.6.0.8 D6 ship -- incremental WorkbookSnapshot deltas.  This is Lane A of a parallel 2-lane audit (Lane B = Opus, runs in parallel; independent verification — do NOT coordinate with Lane B during the audit).
+
+## Baseline state at audit entry
+
+- Engine commits to audit (chain):
+  - `ebe7c946429` V3.6.0.8.1 D6 DESIGN LOCK (docs-only).
+  - `dc74d48b97e` V3.6.0.8.2 D6 ENGINE PART 1 (workbook cache foundation + apply_ops_in_range).
+  - `2dbce5ee2a5` V3.6.0.8.3 D6 ENGINE PART 2 napi (workbookSnapshotDelta + algorithm + cache populate + accessors).
+- IDE commits to audit:
+  - `9b7ac290917` V3.6.0.8.3 D6 IDE (types.ts + 6 mocha shape tests).
+- Engine HEAD: `2dbce5ee2a5` on branch `feat/quantbook-engine`.
+- IDE HEAD: `9b7ac290917` on branch `feat/visualise-v1`.
+- Tests baseline: ql-collab **149/149** (V3.6.0.8.2 +13 over 136) + ql-oplog **67/67** + ql-collab-ws **42/42** + engine workspace release build clean; IDE mocha **390/390** (V3.6.0.8.3 +6 over V3.6.0.X audit-of-D5 384 live baseline).
+- Engine repo: `/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine` (your cwd).
+- IDE repo: `/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab` (extensions/quantlab/src/quantbook/* + test/quantbook-roundtrip.test.ts).
+
+## Context: V3.6.0.7 spike that motivated D6
+
+V3.6.0.7 D6 profiling spike (`3e1e4deff50` + `docs/audits/2026-05-25-phase-5-7-v3-6-0-7-spike.md`) measured `workbookSnapshot` median cost at 100k cells / 50% format = **251.38 ms** (5× the 50 ms threshold).  rebuild_workbook + sheet/table/column rename-repair walks dominate; D4 format::render adds ~99 ms on top.  V3.6.0.8 D6 ships incremental deltas to skip these costs in steady-state IDE editing.
+
+## What V3.6.0.8 ships across the 3-commit chain
+
+### V3.6.0.8.1 (`ebe7c946429`, docs-only)
+
+Locked the design.  Three-option evaluation:
+- (a) Cache rebuilt+repaired Workbook + clone-and-apply-delta -- **CHOSEN**.
+- (b) Read from `last_snapshot` cache + skip `rebuild_workbook` -- **REJECTED** because `last_snapshot.formula` carries pre-rename-repair text (would silently regress V3.5.0.X A-HIGH-2 contract: workbookSnapshot surfaces REPAIRED formula text post `repair_sheet_rename_chain` + `repair_table_rename_chain` + `repair_column_rename_chain`).
+- (c) Hybrid revalidate-changed-cells -- **DEFERRED to V3.7+**.
+
+8-step algorithm + 4 invalidation triggers + 5 new risks R-V3.6-14..18 documented in `.plans/_active.md` + `docs/architecture/ide-consumer-contract.md § 4.1.z6`.
+
+### V3.6.0.8.2 (`dc74d48b97e`, engine foundation)
+
+Engine code:
+- `crates/ql-collab/src/session.rs`:
+  - New fields on `CollabSession`: `last_snapshot_workbook: Option<Arc<Workbook>>` + `last_snapshot_oplog_vv: Option<loro::VersionVector>` (both `None` in `new` + `from_snapshot`).
+  - New `pub fn last_snapshot_workbook() -> Option<&Arc<Workbook>>` + `pub fn last_snapshot_oplog_vv() -> Option<&loro::VersionVector>` read accessors.
+  - New `pub fn set_workbook_cache(Arc<Workbook>, loro::VersionVector)` setter.
+  - New `pub fn force_clear_workbook_cache(&mut self)` invalidator.
+  - Invalidation wired at 4 production callsites: `merge_bytes` (after rebuild_snapshot_cache), `discard_pending_ops` (after rebuild_snapshot_cache), `undo` (at TOP, BEFORE Loro's undo per R-V3.6-14), `redo` (at TOP, mirror of undo).
+  - `append_op` does NOT invalidate (cell-only fast-path target).
+  - `force_clear_snapshot_cache` test seam also clears the workbook cache.
+- `crates/ql-oplog/src/replay.rs`: new `pub fn apply_ops_in_range(log, workbook, from_index, to_index, registry) -> Result<usize, ReplayError>` free function (iterates `log.iter().skip(from).take(to-from)` invoking the existing private `apply_op`).
+- `crates/ql-oplog/src/lib.rs`: re-exports `apply_ops_in_range`.
+- +13 ql-collab regression tests.
+
+### V3.6.0.8.3 (`2dbce5ee2a5` engine + `9b7ac290917` IDE, napi surface)
+
+Engine code:
+- `crates/ql-collab/src/session.rs`:
+  - **Added 3rd cache field** `last_snapshot_op_count: Option<usize>` (revision to V3.6.0.8.2's 2-field cache).  Three-field "all Some / all None" invariant; preserved by extended `set_workbook_cache` (pins `self.log.len()` alongside VV) + extended `force_clear_workbook_cache` (clears all 3).
+  - New `pub fn last_snapshot_op_count() -> Option<usize>` read accessor.
+  - New `pub fn oplog_vv(&self) -> loro::VersionVector` + `pub fn log(&self) -> &OpLog` accessors.
+- `crates/ql-oplog/src/lib.rs`: re-exports `loro::VersionVector` as `ql_oplog::VersionVector`.
+- `crates/ql-bindings-node/src/lib.rs`:
+  - New napi struct `WorkbookSnapshotDeltaJson` { changedCells: Vec<ChangedCellJson>, removedCells: Vec<RemovedCellJson>, sheetsChanged: Vec<SheetSnapshotJson>, sheetsRemoved: Vec<u32>, formatsAdded: Vec<FormatDefJson>, version: Buffer, fullRebuildRequired: bool }.
+  - New helper structs `ChangedCellJson { sheet: u32, cell: CellSnapshotJson }` + `RemovedCellJson { sheet: u32, row: u32, col: u32 }`.
+  - New `#[napi(js_name = "workbookSnapshotDelta")] fn workbook_snapshot_delta(&self, last_seen_version: Buffer) -> Result<WorkbookSnapshotDeltaJson>`.
+  - `workbookSnapshot` modified: takes `&mut inner.lock()`; wraps workbook in `Arc` BEFORE rendering; calls `inner.set_workbook_cache(Arc::clone(&workbook), cache_vv)` after rendering (rendering reads through Arc::deref).
+  - New free fns `empty_delta(version, full_rebuild_required) -> WorkbookSnapshotDeltaJson` + `classify_delta_op(op, has_rename, changed_cells, removed_sheets, new_formats)` (recurses into `Op::BatchCommit`).
+
+IDE code:
+- `extensions/quantlab/src/quantbook/types.ts`: adds 3 interfaces (`WorkbookSnapshotDeltaJson` + `ChangedCellJson` + `RemovedCellJson`) + `workbookSnapshotDelta(lastSeenVersion: Buffer): WorkbookSnapshotDeltaJson` method on `CollabSessionInstance`.
+- `extensions/quantlab/test/quantbook-roundtrip.test.ts`: +6 mocha shape tests (empty Buffer; no-cache; same-VV fast-path; cell-only emits changes; rename triggers fullRebuild; undo invalidates cache).
+
+### Algorithm (V3.6.0.8.1 8-step, implemented at V3.6.0.8.3)
+
+1. Empty `last_seen_version` Buffer → return `fullRebuildRequired=true` + current VV.
+2. No prior workbook cache → return `fullRebuildRequired=true`.
+3. Decode caller VV via `loro::VersionVector::decode`; malformed → `fullRebuildRequired=true` (conservative — does NOT throw `bad_argument`).
+4. Staleness check (caller_vv != cached_vv) → `fullRebuildRequired=true`.
+5. Same-VV fast-path (current_vv == cached_vv) → empty delta with current version.
+6. Enumerate ops `[cached_op_count, log.len())` via `inner.log().iter().skip(start).take(end-start)`; collect into owned Vec to release the borrow before any potential force_clear; classify via `classify_delta_op` walker.
+7. If any rename op → `fullRebuildRequired=true` (V3.6.0.8.3 conservative scope).
+8. Cell-only fast-path: clone cached Arc via `(*cached_arc).clone()` (forks Workbook), apply `[cached_op_count, current_op_count)` via `apply_ops_in_range`, skip repair walks (no rename ops by construction), Arc-wrap + replace cache, build JSON delta via the workbook_snapshot rendering pipeline (format::render with parsed_format_cache).
+
+### V3.6.0.8.3 documented scope limitations
+
+- `removedCells` always empty (V3.7+ feature).
+- `sheetsChanged` always empty in cell-only path (cell ops don't change sheet metadata).
+- Rename ops trigger fullRebuild fallback rather than incremental rename delta.
+- Bench delta-vs-full at 100k cells deferred to V3.6.0.8.4 (i.e., THIS audit cycle — see below).
+
+## Audit scope
+
+Verify correctness, robustness, and discipline across the chain.  Focus on:
+
+### 1. 3-field cache invariant ("all Some / all None")
+
+The V3.6.0.8.2 design was 2 fields; V3.6.0.8.3 added `last_snapshot_op_count` as the 3rd.  Verify:
+- `set_workbook_cache` populates all 3 atomically (no intermediate "Some-Some-None" state).
+- `force_clear_workbook_cache` clears all 3 atomically.
+- All 4 invalidation callsites correctly call `force_clear_workbook_cache` (not just `force_clear_snapshot_cache`).
+- `force_clear_snapshot_cache` test seam clears the workbook cache too.
+- No code path observes a "2 Some, 1 None" state.
+
+### 2. Algorithm correctness
+
+Walk the 8 steps in code:
+
+- Step 1 (empty Buffer): `last_seen_version.is_empty()` check.  Does napi-rs `Buffer::is_empty` correctly return true for `Buffer.alloc(0)` from JS?  Verify the napi-rs 3.9.0 Buffer ↔ Vec<u8> contract.
+- Step 2 (no cache): tuple match with `Some(arc), Some(vv), Some(n)` extracts; any None routes to fullRebuild.  Verify the destructure handles all 3 None-cases.
+- Step 3 (decode): `loro::VersionVector::decode(bytes)` -- what does Loro do with garbage bytes?  Does it ever panic instead of returning Err?  Check the Loro 1.12.0 decode contract.
+- Step 4 (staleness): `caller_vv != cached_vv` -- VersionVector equality semantics in Loro 1.12.0.  Is BTreeMap equality the correct semantic (key-set match + counter match)?  Or does Loro use a custom Eq impl?
+- Step 5 (same-VV): trivial early-return.
+- Step 6 (enumeration): `inner.log().iter().enumerate().skip(start).take(end-start).map(|(_idx, op_result)| op_result).collect()` -- the Vec collection is intentional to release the immutable borrow on `inner.log()` so `inner.force_clear_workbook_cache()` calls below can take `&mut`.  Verify no Op data is lost via the collect.
+- Step 7 (rename detect): `classify_delta_op` matches `Op::RenameSheet | RenameTable | RenameColumn` + BatchCommit recursion.  Are there other ops that effectively rename (e.g., do tables have a separate rename path)?  Check `Op::CreateTable` vs `Op::RenameTable`.  Does `Op::MoveSheet` count as a rename for the purpose of the cell-only fast-path?  (Probably no — MoveSheet changes display order, not formula references; but verify.)
+- Step 8 (cell-only apply): `(*cached_arc).clone()` makes a fresh `Workbook`.  Then `apply_ops_in_range(inner.log(), &mut next_workbook, cached_op_count, current_op_count, &registry)`.  Verify the `inner.log()` borrow on step 8 doesn't conflict with the later `inner.set_workbook_cache(...)` `&mut` borrow.
+- Cache replacement: `Arc::new(next_workbook)` + `inner.set_workbook_cache(Arc::clone, current_vv)`.  Verify the prior cache's Arc is correctly dropped (no leak via dangling clones).
+
+### 3. Cache populate in workbook_snapshot
+
+The `workbookSnapshot` napi now:
+- Takes `&mut inner.lock()`.
+- Wraps workbook in `Arc` BEFORE rendering.
+- Rendering reads through `Arc::deref` (claims identical cost to `&Workbook`).
+- Calls `inner.set_workbook_cache(Arc::clone(&workbook), cache_vv)` AFTER rendering.
+
+Verify:
+- The Arc wrap doesn't introduce reference-count contention.
+- `cache_vv` is captured BEFORE any mutation (currently captured right after `rebuild_workbook` succeeds; verify no mutation between capture + populate).
+- `set_workbook_cache` pins `self.log.len()` -- this MUST match the moment of `cache_vv` capture.  Is there any way `self.log.len()` could change between `oplog_vv()` and `set_workbook_cache(_, cache_vv)`?  (Probably no — `&mut inner` is held throughout — but verify.)
+
+### 4. Multi-peer + concurrent edits
+
+- Two peers both call `workbookSnapshot` → both populate their local caches with their local VVs.  They mutate independently (each calls `appendPutValue` etc.).  Both call `workbookSnapshotDelta(localCachedVersion)`.  Each gets a cell-only delta of their own local changes.
+- Peer A calls `merge_bytes(B's bytes)` → A's cache is invalidated (V3.6.0.8.2 closure).  A's next `workbookSnapshotDelta` returns `fullRebuildRequired=true` because the cache is empty.  Verify this matches the expected staleness recovery flow.
+- Peer A merges B's bytes containing a rename op.  Verify the cache invalidation fires correctly (and Peer A's IDE is told to fullRebuild).
+
+### 5. BatchCommit recursion
+
+`classify_delta_op` recurses into `Op::BatchCommit { ops }`.  Verify:
+- The recursion handles nested BatchCommits (V3.4.0.X HIGH-1 walker discipline).
+- An empty BatchCommit (ops: vec![]) is a no-op.
+- A BatchCommit containing a RenameSheet correctly propagates `has_rename = true` to the outer call.
+- A BatchCommit containing PutValue + PutFormula + SetCellFormat for the same cell coord registers ONE entry in `changed_cells` (HashSet dedup).
+
+### 6. R-V3.6-14 (cached Workbook stale after Loro retract) closure
+
+V3.6.0.8.2 wired undo/redo to call `force_clear_workbook_cache` AT TOP (before Loro's undo).  V3.6.0.8.3 added a mocha test (`v3_6_0_8_3 D6 -- workbookSnapshotDelta invalidation by undo`).  Verify:
+- The clear is genuinely BEFORE Loro's undo (the `self.undo.undo()` call comes after the `force_clear_workbook_cache` call).
+- The clear fires even when Loro's undo is a no-op (empty undo stack).  Currently the V3.6.0.8.2 wiring clears unconditionally at top; verify this is correct or whether it should be conditional on `consumed=true` (defensive — extra clears are cheap; missed clears are correctness violations).
+
+### 7. R-V3.6-15 (VV vs op_count drift) -- THIS AUDIT CYCLE adds the full debug-assert
+
+V3.6.0.8.3 documented PARTIAL closure: the three-field invariant is enforced by the existing tests.  THIS AUDIT CYCLE should add a debug-assert at `workbook_snapshot_delta` that `log.len() == cached_op_count + new_ops_collected.len()` after the enumeration.  Verify the placement of this assert in the algorithm body is correct (after step 6, before step 7).
+
+### 8. R-V3.6-17 (Workbook clone cost) -- THIS AUDIT CYCLE profiles
+
+`(*cached_arc).clone()` makes a fresh Workbook.  At 100k cells, this might cost > 20 ms per the V3.6.0.8.1 threshold.  THIS AUDIT CYCLE adds a micro-bench (`Workbook::clone()` at 1k/10k/100k cells).  If > 20 ms at 100k, recommend switching to Arc-make_mut COW.
+
+### 9. Bench delta-vs-full at 100k -- THIS AUDIT CYCLE adds
+
+Extend `crates/ql-bindings-node/benches/workbook_snapshot.rs` with delta-vs-full measurement.  Two scenarios:
+- "1 new cell after 100k initial" — cell-only fast-path; should be < 5 ms.
+- "100 new cells after 100k initial" — same shape, larger delta; should still be < 50 ms (the threshold).
+- Decision rule: cell-only fast-path should be ≥ 10× cheaper than the V3.6.0.7 baseline (251 ms at 100k / 50%).  Anything less is a regression.
+
+### 10. IDE consumer protocol soundness
+
+The two-call protocol in the mocha tests:
+1. First `workbookSnapshotDelta(Buffer.alloc(0))` → fullRebuildRequired=true.
+2. Caller calls `workbookSnapshot()` to populate cache + read full state.
+3. To capture version: the mocha test pattern probes via `workbookSnapshotDelta(Buffer.alloc(0))` AFTER the workbookSnapshot to read `version` (because there's no dedicated `currentVersion()` accessor in V3.6.0.8.3).
+4. Subsequent calls pass the captured version.
+
+Verify:
+- The "probe to read version" pattern is sound or has a race window.
+- A `currentVersion()` accessor would be cleaner; defer to V3.7+ if not adding now.
+
+### 11. Rule 4 per-field walk
+
+Verify:
+- `last_snapshot_workbook: Option<Arc<Workbook>>`: Workbook auto-derives Send+Sync via field composition (`crates/ql-storage/src/workbook.rs:295-299`); Arc<T>: Send+Sync iff T; Option<X>: Send+Sync iff X.  Per-field walk: Vec<Sheet> + NameTable + HashMap<keys, Arc<str>> + DateSystem enum + FormatTable + HashMap<keys, _>.  Confirm every member.
+- `last_snapshot_oplog_vv: Option<loro::VersionVector>`: VersionVector via BTreeMap<PeerID, Counter>; both primitives Send+Sync; BTreeMap<K,V>: Send+Sync iff K,V; Option<X>: Send+Sync iff X.  Confirm.
+- `last_snapshot_op_count: Option<usize>`: trivial.
+- napi structs (WorkbookSnapshotDeltaJson + ChangedCellJson + RemovedCellJson): Vec<T> + primitives + Buffer (Vec<u8> at heart).  Confirm all positive.
+- Rule 4 arc terminus stays at 6 (no new negative-trait triggers).
+
+### 12. Docstring + drift checks
+
+- Are docstrings on new fns / fields / structs accurate?  Cross-check claims to code.
+- Are mocha test claims semantically equivalent to what they actually test?  (Run `cargo test -p ql-collab --release --features test-fixtures --lib` + the IDE mocha suite to confirm; baselines: ql-collab 149/149, IDE mocha 390/390.)
+- Are the documented "scope limitations" (removedCells empty, sheetsChanged empty, rename triggers fullRebuild) genuinely respected by the code?  Check for surprises.
+- Any commented-out paths or stale TODO markers introduced?
+- Plan + MASTER-PLAN + ide-consumer-contract sweeps complete and accurate?  Cross-check status block + HEAD trail + sub-step table + R-V3.6-14..18 status + Out-of-scope removal/update.
+
+## Verdict format
+
+End your transcript with:
+1. **Verdict**: PASS / PASS-WITH-FINDINGS / FAIL.
+2. **Findings table**: Severity (HIGH / MED / LOW / INFO), ID (CODEX-V3-6-0-8-...), title, file:line, suggested fix.
+3. **Recommended closures (in-cycle)**: which findings MUST close before V3.6.0.8.4 ships; which can defer to V3.6.0.8.5+ backlog or V3.7+.
+
+Be specific about file:line references.  No filler.
+
+## Output location
+
+Write the transcript to `docs/audits/2026-05-25-phase-5-7-v3-6-0-8-codex.md`.

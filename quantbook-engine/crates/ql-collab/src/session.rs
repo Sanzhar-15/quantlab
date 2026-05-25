@@ -937,7 +937,13 @@ pub struct CollabSession {
     /// time the cache was populated.  The cache enables the V3.6.0.8 D6
     /// `workbook_snapshot_delta` cell-only fast-path: when the caller
     /// passes a `lastSeenVersion` matching `last_snapshot_oplog_vv`, the
-    /// delta walker can clone this Workbook (via `Arc::make_mut`), apply
+    /// delta walker can clone this Workbook (via `(*cached_arc).clone()`
+    /// always-clone -- V3.6.0.8.4 OPUS-MED-3 closure: pre-closure
+    /// docstrings claimed `Arc::make_mut` per the V3.6.0.8.1 lock,
+    /// but V3.6.0.8.3 implementation uses always-clone because the
+    /// `cached_arc = Arc::clone(arc)` capture has strong_count >= 2
+    /// by construction so make_mut would clone anyway; always-clone
+    /// IS correct + simpler), apply
     /// only the ops since the cached VV (via the new
     /// [`ql_oplog::apply_ops_in_range`] helper), and skip the
     /// rename-repair walks entirely IF no `Op::RenameSheet | RenameTable
@@ -980,11 +986,15 @@ pub struct CollabSession {
     /// back to a full `workbook_snapshot()` call.
     ///
     /// **Rule 4 per-field walk**: Loro's `VersionVector` is
-    /// `BTreeMap<PeerID, Counter>` (verified at
-    /// loro-internal-1.12.0/src/version.rs); `PeerID: Copy + Send +
-    /// Sync` and `Counter: Copy + Send + Sync`; `BTreeMap<K, V>: Send +
-    /// Sync` iff `K, V: Send + Sync`.  `Option<X>: Send + Sync` iff `X:
-    /// Send + Sync`.  **0 new triggers; arc terminus stays at 6.**
+    /// `FxHashMap<PeerID, Counter>` (V3.6.0.8.4 OPUS-MED-1 closure:
+    /// verified at loro-internal-1.12.0/src/version.rs:29 -- pre-
+    /// closure the docstring said BTreeMap, drift from V3.6.0.8.2
+    /// docs lock).  `PeerID: Copy + Send + Sync` and `Counter: Copy
+    /// + Send + Sync`; `HashMap<K, V, S>: Send + Sync` iff `K, V, S:
+    /// Send + Sync` -- `FxBuildHasher` is Send + Sync, so the full
+    /// `FxHashMap<PeerID, Counter>: Send + Sync`.  `Option<X>: Send +
+    /// Sync` iff `X: Send + Sync`.  **0 new triggers; arc terminus
+    /// stays at 6.**
     last_snapshot_oplog_vv: Option<loro::VersionVector>,
 
     /// **Phase 5.7 V3.6.0.8.3 D6 (2026-05-25) -- op-log length pinning
@@ -1981,6 +1991,36 @@ impl CollabSession {
             .collect();
         entries.sort_by_key(|((row, col), _)| (*row, *col));
         entries
+    }
+
+    /// **Phase 5.7 V3.6.0.8.4 CODEX-HIGH-3 closure (2026-05-25)** --
+    /// O(1) per-cell lookup against the snapshot cache.
+    ///
+    /// Returns the cached [`CellState`] for `(sheet, row, col)` if
+    /// the cache has an entry; `None` if the cell has never been
+    /// touched OR was tombstoned via `apply_cache_effect`'s removal
+    /// path.
+    ///
+    /// **Why**: V3.6.0.8.4 audit-of-D6 found that the
+    /// `workbook_snapshot_delta` napi was calling
+    /// `snapshot_cells(sheet).into_iter().find(|((r,c),_)| ...)` per
+    /// changed cell coordinate, which is O(cells-in-sheet) per
+    /// delta-cell.  At 100k cells × 100 new cells the delta path was
+    /// 746 ms -- 3× SLOWER than the full snapshot baseline (~250 ms).
+    /// This accessor reads directly from the underlying
+    /// `HashMap<(SheetId, RowId, ColId), CellState>` -- O(1) amortized
+    /// per call.  Closes the V3.6.0.7-spike-justified D6 performance
+    /// contract.
+    ///
+    /// Returns `CellState` by value (clone) so the caller doesn't
+    /// hold a borrow into `self.last_snapshot` -- callers typically
+    /// follow up with mutating session ops (apply_ops_in_range +
+    /// set_workbook_cache), so a borrow would block them.  Clone cost
+    /// is bounded: `CellState` is a 3-field struct of Option<small
+    /// types> + Option<Arc<str>> -- the Arc clone is the only non-
+    /// trivial allocation, refcount-only at runtime.
+    pub fn snapshot_cell(&self, sheet: u16, row: u32, col: u32) -> Option<CellState> {
+        self.last_snapshot.get(&(sheet, row, col)).cloned()
     }
 
     /// **Phase 5.7 V3.3.0.3 + V3.4.0.2 -- rebuild the snapshot cache
@@ -3497,6 +3537,19 @@ impl CollabSession {
             // path or the normal exit path drains us out of the
             // while loop.
             self.rebuild_snapshot_cache()?;
+            // **V3.6.0.8.4 CODEX-HIGH-1 closure (2026-05-25)**: also
+            // invalidate the V3.6.0.8 workbook cache.  poll_remote_with_limit
+            // is a 5th log-mutation site (alongside merge_bytes /
+            // discard_pending_ops / undo / redo) that the V3.6.0.8.2
+            // invalidation discipline MISSED: remote ops drained via
+            // poll can re-order LWW winners or bring rename ops
+            // exactly like merge_bytes, but the V3.6.0.8.3 audit-of-D6
+            // discovered that the workbook cache is left stale after a
+            // poll_remote drain.  Calling `force_clear_workbook_cache`
+            // here mirrors the merge_bytes wiring + closes the gap.
+            // Mocha test coverage at V3.6.0.8.4 will add a poll-remote
+            // + delta regression to pin this.
+            self.force_clear_workbook_cache();
             // V3.6.0.2 D1: no frontier-state mutation needed -- the
             // Loro UndoManager's stack carries per-item meta with the
             // exact cells, which is preserved across remote merges.

@@ -456,13 +456,21 @@ pub fn apply_ops_in_range(
     if from_index >= to_index {
         return Ok(0);
     }
+    // **Phase 5.7 V3.6.0.8.4 OPUS-HIGH-3 closure (2026-05-25)**: walk
+    // via [`OpLog::get`] random-access instead of `iter().skip(N)`.
+    // Pre-closure: `iter().skip(N)` deserializes ALL N skipped ops via
+    // std `Iterator::skip` (which calls `next()` N times + discards).
+    // For a 100k-op log with a 10-op delta, skip(100000-10) cost ~100k
+    // unnecessary `serde_json::from_str<Op>` calls -- enough to defeat
+    // the V3.6.0.7 spike's D6 perf contract.  Post-closure: K *
+    // O(log N) via Loro's BTree random-access (per V3.6.0.X audit-of-
+    // D3 closure on `OpLog::get` complexity docstring).
     let mut count = 0;
-    for (index, op_result) in log
-        .iter()
-        .enumerate()
-        .skip(from_index)
-        .take(to_index - from_index)
-    {
+    for index in from_index..to_index {
+        let op_result = match log.get(index) {
+            Some(r) => r,
+            None => break,
+        };
         let op = op_result.map_err(|e| ReplayError::Deserialize(index, e))?;
         apply_op(&op, workbook, index)?;
         count += 1;

@@ -419,13 +419,41 @@ fn classify_delta_op(
                 }
             }
         }
-        // Other ops (SetName / AddSheet / MoveSheet / CreateTable /
-        // DropTable / SetDateSystem / SetLocale / SetReferenceMode)
-        // are silently skipped: they don't emit in V3.6.0.8.3's
-        // delta surface (their effects are workbook-metadata-level,
-        // not per-cell).  V3.6.0.8.4+ may grow `sheets_changed` or
-        // workbook-metadata fields to cover them.
-        _ => {}
+        // **V3.6.0.8.4 CODEX-HIGH-2 closure (2026-05-25)**: allowlist
+        // discipline.  Pre-closure the catch-all `_ => {}` arm silently
+        // ignored metadata ops (AddSheet / MoveSheet / CreateTable /
+        // DropTable / RenameTable / RenameColumn / ResizeTable /
+        // SetName / SetLocale / SetReferenceMode / SetDateSystem) AND
+        // ALSO advanced the cache token through them.  Result: IDE
+        // calling workbookSnapshotDelta after an addSheet would see
+        // empty delta + advanced version, missing the new sheet
+        // entirely.  Post-closure: any op the cell-only fast-path
+        // cannot represent in WorkbookSnapshotDeltaJson forces the
+        // fullRebuild fallback by setting `has_rename = true` (which
+        // breaks the enclosing scan loop + returns
+        // `fullRebuildRequired=true` from `workbook_snapshot_delta`).
+        // The `has_rename` flag name is overloaded for "force full
+        // rebuild" semantically; a future cleanup at V3.6.0.8.5+ may
+        // rename to `force_full_rebuild` for clarity.
+        //
+        // Known metadata ops are listed explicitly for reviewer
+        // visibility.  `Op` is `#[non_exhaustive]` from another crate,
+        // so Rust still requires a wildcard; future variants therefore
+        // conservatively force a full rebuild until classified.
+        Op::AddSheet { .. }
+        | Op::MoveSheet { .. }
+        | Op::CreateTable { .. }
+        | Op::DropTable { .. }
+        | Op::ResizeTable { .. }
+        | Op::SetName { .. }
+        | Op::SetLocale { .. }
+        | Op::SetReferenceMode { .. }
+        | Op::SetDateSystem { .. } => {
+            *has_rename = true;
+        }
+        _ => {
+            *has_rename = true;
+        }
     }
 }
 
@@ -861,6 +889,38 @@ pub struct WorkbookSnapshotJson {
     /// String` pattern; no per-value wrapper struct).  IDE types.ts
     /// pins via a union type `"Excel1900" | "Excel1904"`.
     pub date_system: String,
+
+    /// **Phase 5.7 V3.6.0.8.4 OPUS-HIGH-2 closure (2026-05-25)**:
+    /// opaque Loro version-vector token captured at the moment of
+    /// this snapshot.  IDE consumers store this alongside their
+    /// rendered state + pass it back as `lastSeenVersion` on the
+    /// next `workbookSnapshotDelta` call.  Encoded via
+    /// `loro::VersionVector::encode()` (stable Loro 1.12.0 wire
+    /// format; opaque to JS -- the IDE round-trips it through napi
+    /// `Buffer` ⇄ `Vec<u8>` without decoding).
+    ///
+    /// **Why on `WorkbookSnapshotJson` and not a separate accessor**:
+    /// V3.6.0.8.1 lock TBD'd a `currentVersion()` accessor.
+    /// V3.6.0.8.3 shipped without it; the mocha tests worked around
+    /// it by probing via empty-Buffer `workbookSnapshotDelta` calls.
+    /// Opus Lane B audit at V3.6.0.8.4 flagged the workaround as a
+    /// race-window risk in multi-window collab (the engine could
+    /// receive a remote op between the IDE's `workbookSnapshot()`
+    /// call + the IDE's subsequent probe, leaving the IDE pinned to
+    /// a VV one step behind reality).  Bundling `version` into
+    /// `WorkbookSnapshotJson` makes the populate-and-capture atomic
+    /// (the napi method holds the `&mut inner.lock()` throughout, so
+    /// the VV captured here matches the VV stamped into the
+    /// workbook cache via `set_workbook_cache`).
+    ///
+    /// **Additive field**: V3.5/V3.6 IDE consumers that destructure
+    /// the snapshot continue to work (extra field is ignored unless
+    /// referenced); opt-in consumers consult `.version`.
+    ///
+    /// **Rule 4 walk**: `Buffer` is napi-rs 3.9.0's safe wrapper
+    /// around `Vec<u8>` (Send + Sync via Vec composition); the
+    /// underlying encoded bytes are owned + cloneable.
+    pub version: Buffer,
 }
 
 /// **Phase 5.7 V3.6.0.3 D2 (2026-05-24)** -- one format registration
@@ -2012,7 +2072,7 @@ impl CollabSession {
             .map_err(collab_session_error_to_napi)?;
         // **V3.6.0.8.3 D6**: pin the VV at the moment of rebuild so
         // delta-staleness check downstream is exact.  `oplog_vv()` is
-        // a cheap clone of Loro's internal BTreeMap<PeerID, Counter>
+        // a cheap clone of Loro's internal FxHashMap<PeerID, Counter>
         // (O(peer-count), not O(op-count) -- verified
         // `crates/ql-oplog/src/log.rs:424`).
         let cache_vv = inner.oplog_vv();
@@ -2268,11 +2328,18 @@ impl CollabSession {
         // path.  `Arc::clone` is O(1) (atomic refcount bump); no
         // Workbook clone here.  V3.6.0.8.2 `set_workbook_cache`
         // overwrites any prior cache atomically.
+        // V3.6.0.8.4 OPUS-HIGH-2 closure (2026-05-25): capture the
+        // encoded VV BEFORE set_workbook_cache moves cache_vv.  Both
+        // the cache + the returned snapshot pin the SAME VV; the
+        // caller stores `version` + passes it back as
+        // `lastSeenVersion` for the next workbookSnapshotDelta call.
+        let version_bytes: Buffer = cache_vv.encode().into();
         inner.set_workbook_cache(std::sync::Arc::clone(&workbook), cache_vv);
         Ok(WorkbookSnapshotJson {
             sheets,
             formats,
             date_system,
+            version: version_bytes,
         })
     }
 
@@ -2422,14 +2489,57 @@ impl CollabSession {
         // small in steady-state editing (the cell-only fast-path
         // target); allocation cost is negligible vs the per-cell
         // rendering pipeline downstream.
-        let new_ops: Vec<std::result::Result<Op, ql_oplog::OpLogError>> = inner
-            .log()
-            .iter()
-            .enumerate()
-            .skip(new_ops_range.start)
-            .take(new_ops_range.end - new_ops_range.start)
-            .map(|(_idx, op_result)| op_result)
-            .collect();
+        // **V3.6.0.8.4 OPUS-HIGH-3 closure (2026-05-25)**: random-
+        // access via `OpLog::get(i)` for each index in the slice
+        // instead of `iter().skip(N).take(M)` (which deserializes
+        // ALL N skipped ops; see apply_ops_in_range for the full
+        // closure rationale).  At 100k log + 10 new ops the pre-
+        // closure pattern cost ~100k unnecessary `Op` deserializations
+        // per delta call -- explains why the V3.6.0.8.3 bench showed
+        // 100ms+ even for tiny deltas (Codex + Opus convergent
+        // HIGH-3 surfaced this; the K * O(log N) random-access
+        // pattern hits the V3.6.0.7 D6 perf contract).
+        let new_ops: Vec<std::result::Result<Op, ql_oplog::OpLogError>> = {
+            let log = inner.log();
+            (new_ops_range.start..new_ops_range.end)
+                .map(|i| {
+                    log.get(i).unwrap_or_else(|| {
+                        // Past-end indices: treat as decode error so
+                        // the downstream Err arm handles them as
+                        // "trust the cache + clear it" rather than
+                        // silently dropping ops.  Defensive --
+                        // `cached_op_count > current_op_count` is
+                        // guarded earlier so we shouldn't reach here
+                        // in practice.
+                        Err(ql_oplog::OpLogError::SchemaMismatch(
+                            "log shrunk between len() probe and get() walk",
+                        ))
+                    })
+                })
+                .collect()
+        };
+        // **V3.6.0.8.4 R-V3.6-15 closure (2026-05-25)**: monotonicity
+        // debug-assert.  The three-field cache invariant ("all Some /
+        // all None") + the V3.6.0.8.2 invalidation discipline
+        // (merge_bytes / discard_pending_ops / undo / redo all clear
+        // the cache) MUST ensure that between cache populate + this
+        // delta call, the only log mutation is append_op.  append_op
+        // grows the log monotonically; positional indices since the
+        // cache are stable.  So `log.len() - cached_op_count` must
+        // equal the number of ops we just enumerated.  If this
+        // assertion ever fires, the invalidation discipline has been
+        // broken silently and the delta is wrong.  Debug-only so
+        // release builds don't pay the bounds check; production
+        // safeguarding is via the invariant + tests.
+        debug_assert_eq!(
+            new_ops.len(),
+            current_op_count - cached_op_count,
+            "V3.6.0.8.4 R-V3.6-15 monotonicity invariant violated: enumerated {} ops but log range was {}..{}={} ops (cache invalidation discipline broken between populate + delta call)",
+            new_ops.len(),
+            cached_op_count,
+            current_op_count,
+            current_op_count - cached_op_count,
+        );
         for op_result in new_ops {
             let op = match op_result {
                 Ok(op) => op,
@@ -2497,60 +2607,54 @@ impl CollabSession {
         let mut changed_cells: Vec<ChangedCellJson> =
             Vec::with_capacity(changed_cell_coords.len());
         for (sheet, row, col) in changed_cell_coords {
-            // Pull live CellState from the session's incremental
-            // snapshot cache (already maintained by V3.4.0.2 / V3.6.0.4
-            // append_op walker).  Skip cells with no live state (the
-            // op was a ClearFormula or PutValue that the cache
-            // walker dropped).
-            let cell = match inner
-                .snapshot_cells(sheet)
-                .into_iter()
-                .find(|((r, c), _)| *r == row && *c == col)
-            {
-                Some(((r, c), state)) => {
-                    let _ = (r, c);
-                    let repaired_formula = next_workbook
-                        .formula_at(sheet, row, col)
-                        .map(|s| s.as_ref().to_string());
-                    let rendered: Option<String> = match (
-                        state.format.as_ref(),
-                        state.value.as_ref(),
-                    ) {
-                        (Some(fmt_id), Some(wire_value))
-                            if !wire_value.is_pending() =>
-                        {
-                            let fmt_id_copy = *fmt_id;
-                            wire_value.to_value().ok().and_then(|value| {
-                                if let Some(fmt) =
-                                    parsed_format_cache.get(&fmt_id_copy)
-                                {
-                                    return Some(ql_functions::format::render(
-                                        &value, fmt, &eval_ctx,
-                                    ));
-                                }
-                                let fmt_str =
-                                    next_workbook.formats().lookup(fmt_id_copy)?;
-                                let fmt =
-                                    ql_functions::format::parse(fmt_str).ok()?;
-                                let rendered_str = ql_functions::format::render(
-                                    &value, &fmt, &eval_ctx,
-                                );
-                                parsed_format_cache.insert(fmt_id_copy, fmt);
-                                Some(rendered_str)
-                            })
-                        }
-                        _ => None,
-                    };
-                    CellSnapshotJson {
-                        row,
-                        col,
-                        value: state.value.map(CellValueJson::from),
-                        formula: repaired_formula,
-                        format: state.format.map(FormatIdJson::from),
-                        rendered,
-                    }
-                }
+            // **V3.6.0.8.4 CODEX-HIGH-3 closure (2026-05-25)**: O(1)
+            // direct lookup via `snapshot_cell` instead of the pre-
+            // closure `snapshot_cells(sheet).into_iter().find(...)`
+            // which was O(cells_in_sheet) per delta-cell and caused
+            // the 746 ms-at-100k delta regression.  `snapshot_cell`
+            // hashes into the underlying HashMap.
+            //
+            // `None` here means the cell has no live state -- the op
+            // was a ClearFormula or a removal that the cache walker
+            // dropped.  Skip emitting an entry (consumer sees the cell
+            // missing in next workbookSnapshot rather than as a
+            // changedCells entry with all-None fields).
+            let state = match inner.snapshot_cell(sheet, row, col) {
+                Some(state) => state,
                 None => continue,
+            };
+            let repaired_formula = next_workbook
+                .formula_at(sheet, row, col)
+                .map(|s| s.as_ref().to_string());
+            let rendered: Option<String> = match (
+                state.format.as_ref(),
+                state.value.as_ref(),
+            ) {
+                (Some(fmt_id), Some(wire_value)) if !wire_value.is_pending() => {
+                    let fmt_id_copy = *fmt_id;
+                    wire_value.to_value().ok().and_then(|value| {
+                        if let Some(fmt) = parsed_format_cache.get(&fmt_id_copy) {
+                            return Some(ql_functions::format::render(
+                                &value, fmt, &eval_ctx,
+                            ));
+                        }
+                        let fmt_str = next_workbook.formats().lookup(fmt_id_copy)?;
+                        let fmt = ql_functions::format::parse(fmt_str).ok()?;
+                        let rendered_str =
+                            ql_functions::format::render(&value, &fmt, &eval_ctx);
+                        parsed_format_cache.insert(fmt_id_copy, fmt);
+                        Some(rendered_str)
+                    })
+                }
+                _ => None,
+            };
+            let cell = CellSnapshotJson {
+                row,
+                col,
+                value: state.value.map(CellValueJson::from),
+                formula: repaired_formula,
+                format: state.format.map(FormatIdJson::from),
+                rendered,
             };
             changed_cells.push(ChangedCellJson {
                 sheet: sheet as u32,
@@ -2561,7 +2665,20 @@ impl CollabSession {
         // CONVERGENT-MED-1 discipline on `formats`).
         changed_cells.sort_by_key(|c| (c.sheet, c.cell.row, c.cell.col));
 
-        // Build formats_added.
+        // **V3.6.0.8.4 OPUS-MED-2 closure (2026-05-25)**: sort by
+        // FULL `FormatId` (engine-side derived Ord: Builtin variants
+        // first, then Custom by (peer, counter)) BEFORE mapping to
+        // the napi FormatIdJson.  Pre-closure was
+        // `sort_by_key(|f| f.id.kind.clone())` which only sorted by
+        // the `"builtin"` / `"custom"` string -- two Custom formats
+        // with different (peer, counter) ended up in op-log order
+        // within the same kind, non-deterministic across runs.
+        // Mirrors `workbook_snapshot.formats`'s
+        // `sort_by_key(|(id, _)| *id)` discipline (V3.6.0.X audit-of-
+        // D2 CONVERGENT-MED-1 closure).
+        let mut new_format_ids = new_format_ids;
+        new_format_ids.sort();
+        new_format_ids.dedup();
         let mut formats_added: Vec<FormatDefJson> = Vec::new();
         for fmt_id in new_format_ids {
             // Look up the registered string in the freshly-built
@@ -2573,7 +2690,6 @@ impl CollabSession {
                 });
             }
         }
-        formats_added.sort_by_key(|f| f.id.kind.clone());
 
         // Build sheets_removed (already collected; just widen u16->u32
         // for napi).

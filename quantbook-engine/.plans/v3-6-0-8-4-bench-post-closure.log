@@ -1,0 +1,51 @@
+   Compiling ql-bindings-node v0.1.0 (/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-bindings-node)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 21.57s
+     Running benches/workbook_snapshot.rs (target/release/deps/workbook_snapshot-9ddff64c8b4fe550)
+Benchmarking workbook_snapshot_delta/100k initial + 1 new cells (delta)
+Benchmarking workbook_snapshot_delta/100k initial + 1 new cells (delta): Warming up for 2.0000 s
+
+Warning: Unable to complete 10 samples in 15.0s. You may wish to increase target time to 19.6s or enable flat sampling.
+Benchmarking workbook_snapshot_delta/100k initial + 1 new cells (delta): Collecting 10 samples in estimated 19.607 s (55 iterations)
+Benchmarking workbook_snapshot_delta/100k initial + 1 new cells (delta): Analyzing
+workbook_snapshot_delta/100k initial + 1 new cells (delta)
+                        time:   [989.39 µs 1.0101 ms 1.0320 ms]
+                        change: [−1.0854% +1.1517% +3.3003%] (p = 0.34 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking workbook_snapshot_delta/100k initial + 10 new cells (delta)
+Benchmarking workbook_snapshot_delta/100k initial + 10 new cells (delta): Warming up for 2.0000 s
+
+Warning: Unable to complete 10 samples in 15.0s. You may wish to increase target time to 19.6s or enable flat sampling.
+Benchmarking workbook_snapshot_delta/100k initial + 10 new cells (delta): Collecting 10 samples in estimated 19.603 s (55 iterations)
+Benchmarking workbook_snapshot_delta/100k initial + 10 new cells (delta): Analyzing
+workbook_snapshot_delta/100k initial + 10 new cells (delta)
+                        time:   [992.84 µs 1.0021 ms 1.0171 ms]
+                        change: [−1.4201% −0.1020% +1.5224%] (p = 0.90 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) low severe
+  1 (10.00%) high severe
+Benchmarking workbook_snapshot_delta/100k initial + 100 new cells (delta)
+Benchmarking workbook_snapshot_delta/100k initial + 100 new cells (delta): Warming up for 2.0000 s
+
+Warning: Unable to complete 10 samples in 15.0s. You may wish to increase target time to 19.3s or enable flat sampling.
+Benchmarking workbook_snapshot_delta/100k initial + 100 new cells (delta): Collecting 10 samples in estimated 19.346 s (55 iterations)
+Benchmarking workbook_snapshot_delta/100k initial + 100 new cells (delta): Analyzing
+workbook_snapshot_delta/100k initial + 100 new cells (delta)
+                        time:   [1.0619 ms 1.0774 ms 1.0917 ms]
+                        change: [−0.1984% +1.0891% +2.5013%] (p = 0.13 > 0.05)
+                        No change in performance detected.
+Benchmarking workbook_snapshot_delta/100k initial + 100 new cells (FULL snapshot baseline)
+Benchmarking workbook_snapshot_delta/100k initial + 100 new cells (FULL snapshot baseline): Warming up for 2.0000 s
+
+Warning: Unable to complete 10 samples in 15.0s. You may wish to increase target time to 19.7s or enable flat sampling.
+Benchmarking workbook_snapshot_delta/100k initial + 100 new cells (FULL snapshot baseline): Collecting 10 samples in estimated 19.674 s (55 iterations)
+Benchmarking workbook_snapshot_delta/100k initial + 100 new cells (FULL snapshot baseline): Analyzing
+workbook_snapshot_delta/100k initial + 100 new cells (FULL snapshot baseline)
+                        time:   [245.85 ms 246.46 ms 247.15 ms]
+                        change: [+1.4389% +2.1647% +2.7704%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low severe
+
