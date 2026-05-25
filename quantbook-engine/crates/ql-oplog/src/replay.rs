@@ -399,6 +399,77 @@ pub fn replay_into(
     Ok(count)
 }
 
+/// **Phase 5.7 V3.6.0.8 D6 (2026-05-25)** -- apply a half-open range
+/// of ops `[from_index, to_index)` from `log` onto a pre-existing
+/// `workbook`.
+///
+/// Contract differs from [`replay_into`]: this helper accepts a
+/// workbook that ALREADY reflects ops at indices `0..from_index` and
+/// applies the slice `from_index..to_index` forward.  Used by
+/// `ql_collab::CollabSession::workbook_snapshot_delta` (V3.6.0.8.3) to
+/// apply ops appended since the cached `workbook_snapshot_workbook`
+/// without paying full `replay_into` cost.  Each op is applied via the
+/// shared private `apply_op` helper so wire semantics match
+/// `replay_into` exactly.
+///
+/// Skipping the rename-repair walks (`repair_sheet_rename_chain` /
+/// `repair_table_rename_chain` / `repair_column_rename_chain`) is the
+/// CALLER's responsibility.  V3.6.0.8.3's cell-only fast-path
+/// guarantees `from_index..to_index` contains NO
+/// `Op::Rename{Sheet,Table,Column}` op (checked at the napi layer
+/// before invoking this helper); rename ops trigger the full-rebuild
+/// branch via `replay_into` + repair walks.
+///
+/// # Cost
+///
+/// O(to_index - from_index) ops applied.  Iteration uses `log.iter()`
+/// internally (Loro's BTree iterator); skip-take incurs O(log N) per
+/// seek but the slice length dominates for typical small deltas.
+///
+/// # Errors
+///
+/// - [`ReplayError::Deserialize`] if any op in the range fails to
+///   decode from its wire bytes (same propagation as [`replay_into`]).
+/// - Per-op apply errors (`InvalidCell`, `UnknownSheet`,
+///   `FormatNotRegistered`, etc.) propagate with the op's absolute
+///   index in `log` (matches `replay_into`'s index semantic; debugging
+///   stays grep-able against op log dumps).
+///
+/// # Panics
+///
+/// Returns the number of ops applied (always `to_index - from_index`
+/// on success).  Out-of-range `to_index` (i.e., `to_index > log.len()`)
+/// silently stops at log end -- caller is responsible for bounding.
+/// `from_index >= to_index` is a no-op returning `Ok(0)`.
+///
+/// **NOT TRANSACTIONAL** -- mirrors [`replay_into`]'s warning.  On
+/// `Err(_)`, `workbook` is in a HALF-MERGED state; the partial
+/// application is NOT rolled back.  V3.6.0.8.3 napi recovers by
+/// clearing the cache + returning `fullRebuildRequired=true`.
+pub fn apply_ops_in_range(
+    log: &OpLog,
+    workbook: &mut Workbook,
+    from_index: usize,
+    to_index: usize,
+    _registry: &FunctionRegistry,
+) -> Result<usize, ReplayError> {
+    if from_index >= to_index {
+        return Ok(0);
+    }
+    let mut count = 0;
+    for (index, op_result) in log
+        .iter()
+        .enumerate()
+        .skip(from_index)
+        .take(to_index - from_index)
+    {
+        let op = op_result.map_err(|e| ReplayError::Deserialize(index, e))?;
+        apply_op(&op, workbook, index)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 /// Recursive helper. `index` is the op's position in the outer log (or
 /// the synthetic position of the enclosing BatchCommit for nested ops —
 /// 2A.3.a flattens by reporting the parent's index for nested failures).

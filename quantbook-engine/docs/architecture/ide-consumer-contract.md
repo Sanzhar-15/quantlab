@@ -1799,12 +1799,12 @@ Three additional minor findings noted but not fixed in-cycle:
 
 ### 4.1.z6 Loro UndoManager on_push + format registry + per-cell op-index + format-aware buildHtml rendering (Phase 5.7 V3.6, 2026-05-24)
 
-**Status**: V3.6.0.1 lock + V3.6.0.2 D1 + V3.6.0.3 D2 + V3.6.0.4 D3 + V3.6.0.5 D4 + V3.6.0.6 D5 + V3.6.0.X audit-of-D5 closures + V3.6.0.7 D6 profiling spike + **V3.6.0.8.1 D6 DESIGN LOCK** ALL SHIPPED + AUDITED.  D6 implementation begins at V3.6.0.8.2 (engine PART 1: invalidation wiring + new public `apply_ops_in_range` on `OpLog`).  Spike verdict: 251 ms median at 100k cells / 50 % format / 1 sheet (5× the 50 ms threshold).  Lock verdict: option (a) cache rebuilt+repaired Workbook + clone-and-apply-delta CHOSEN; option (b) [read-from-`last_snapshot`-and-skip-`rebuild_workbook`] REJECTED because the cache carries pre-rename-repair formula text.
+**Status**: V3.6.0.1 lock + V3.6.0.2 D1 + V3.6.0.3 D2 + V3.6.0.4 D3 + V3.6.0.5 D4 + V3.6.0.6 D5 + V3.6.0.X audit-of-D5 closures + V3.6.0.7 D6 profiling spike + V3.6.0.8.1 D6 DESIGN LOCK + **V3.6.0.8.2 D6 ENGINE PART 1** ALL SHIPPED + AUDITED.  V3.6.0.8.3 (napi method + cell-only fast-path + bench) is the next sub-step; V3.6.0.8.4 = audit-of-D6.  Spike verdict (V3.6.0.7): 251 ms median at 100k cells / 50 % format / 1 sheet (5× the 50 ms threshold).  Lock verdict (V3.6.0.8.1): option (a) cache rebuilt+repaired Workbook + clone-and-apply-delta CHOSEN.  Engine foundation (V3.6.0.8.2): 2 new fields + 4 invalidation callsites + new public `apply_ops_in_range` helper on ql-oplog.
 
-**Engine HEAD at this section's commit**: (next; V3.6.0.8.1 D6 DESIGN LOCK commit -- docs-only plan + MASTER-PLAN + this file sweep) <- `3e1e4deff50` (V3.6.0.7 D6 spike: criterion bench + spike transcript) <- `1e1e5464da9` (V3.6.0.X audit-of-D5 closures) <- `7f9a08ccd5e` (V3.6.0.6 D5 engine).
-**IDE HEAD at this section's commit**: `d9731633ac4` (V3.6.0.X audit-of-D5 closures; V3.6.0.7 + V3.6.0.8.1 are engine-only, no IDE touch).
+**Engine HEAD at this section's commit**: (next; V3.6.0.8.2 D6 ENGINE PART 1 commit -- 2 new fields + force_clear_workbook_cache + 4-callsite invalidation + apply_ops_in_range public helper + 13 regression tests + plan/MASTER-PLAN/this file sweep) <- `ebe7c946429` (V3.6.0.8.1 D6 DESIGN LOCK docs-only) <- `3e1e4deff50` (V3.6.0.7 D6 spike) <- `1e1e5464da9` (V3.6.0.X audit-of-D5 closures).
+**IDE HEAD at this section's commit**: `d9731633ac4` (V3.6.0.X audit-of-D5 closures; V3.6.0.7 + V3.6.0.8.1 + V3.6.0.8.2 are engine-only, no IDE touch).
 
-**Tests baseline**: ql-collab **136/136** + ql-oplog **67/67** + IDE mocha **384/384** (3 over the V3.6.0.X audit-of-D5 handoff's documented 381; same HEAD, the 8-delta over the D5 373 baseline appears to have been an undercount) + ql-collab-ws **42/42** (10 lib + 30 transport + 2 V3.1.a relay; +2 doctests separate) + engine workspace 99 test-result lines pass.  V3.6.0.7 adds 1 new criterion bench (not in the cargo test tally; bench reproduces on `cargo bench -p ql-bindings-node --bench workbook_snapshot`).
+**Tests baseline**: ql-collab **149/149** (V3.6.0.8.2 +13 over V3.6.0.X audit-of-D5 136 baseline: 8 workbook cache invariants + 4 apply_ops_in_range correctness + 1 cache discipline) + ql-oplog **67/67** + IDE mocha **384/384** unchanged + ql-collab-ws **42/42** (10 lib + 30 transport + 2 V3.1.a relay; +2 doctests separate) + engine workspace release build clean.  V3.6.0.7 adds 1 criterion bench (`cargo bench -p ql-bindings-node --bench workbook_snapshot`).
 
 #### V3.6.0.1 -- decision lock (9 D-decisions)
 
@@ -2020,8 +2020,8 @@ fn workbook_snapshot_delta(&self, last_seen: Vec<u8>) -> Result<WorkbookSnapshot
 
 | Sub-step | Description | Cycles | Status |
 |---|---|---|---|
-| **V3.6.0.8.1** | DESIGN LOCK (this commit) | 1 | ✅ SHIPPED |
-| V3.6.0.8.2 | ENGINE PART 1: new fields + `force_clear_workbook_cache` + invalidation wiring at 4 callsites + new public `apply_ops_in_range(from, to)` helper on `OpLog` + ql-collab regression tests | 1 | PENDING |
+| V3.6.0.8.1 | DESIGN LOCK (docs-only) | 1 | ✅ SHIPPED |
+| **V3.6.0.8.2** | ENGINE PART 1: new fields + `force_clear_workbook_cache` + invalidation wiring at 4 callsites + new public `apply_ops_in_range(from, to)` helper on `OpLog` + ql-collab regression tests | 1 | ✅ SHIPPED |
 | V3.6.0.8.3 | ENGINE PART 2: `workbook_snapshot_delta` napi + cell-only fast-path + rename-full-rebuild branch + staleness check + bench delta vs full snapshot at 100k cells + napi shape tests | 1 | PENDING |
 | V3.6.0.8.4 | V3.6.0.X audit-of-D6 (parallel Codex Lane A + Opus Lane B + closures) | 1 | PENDING |
 
@@ -2048,11 +2048,11 @@ The plan body at `.plans/_active.md` lines 286-314 is the authoritative source. 
 - **R-V3.6-11** dateSystem propagation requires Op::SetDateSystem.  DISCOVERED at V3.6.0.X audit-of-D4; CLOSED via Op::SetDateSystem variant + replay handler + from_qbook seed.
 - **R-V3.6-12** IDE click-to-edit broken for engine-rendered display strings.  DISCOVERED at V3.6.0.X audit-of-D4 (Opus); CLOSED via `data-raw-value` attribute.
 - **R-V3.6-13** Pending values + format render as formatted zero.  DISCOVERED at V3.6.0.X audit-of-D4 (Codex+Opus); CLOSED via short-circuit on `is_pending()`.
-- **R-V3.6-14** Cached Workbook stale after Loro UndoManager retract.  DISCOVERED at V3.6.0.8.1 design lock; CLOSURE LOCKED at V3.6.0.8.2 (`undo()` + `redo()` call `force_clear_workbook_cache()` BEFORE Loro's undo, mirroring `force_clear_snapshot_cache` discipline).
-- **R-V3.6-15** VersionVector vs op_count drift.  Loro's `oplog_vv()` returns `BTreeMap<PeerID, Counter>`; cached `(VV, op_count)` pair COULD drift if `merge_bytes` advances VV without local op_count increase.  Mitigation locked: V3.6.0.8.2 adds a debug-assert.
-- **R-V3.6-16** Multi-peer concurrent rename + cell edits.  Locked closure: `merge_bytes` invalidates cache; IDE's older `version` token triggers `fullRebuildRequired=true` via staleness check.  Multi-peer regression test added at V3.6.0.8.3.
-- **R-V3.6-17** Workbook clone cost may itself exceed delta budget.  Profile at V3.6.0.8.3; if `clone()` > 20 ms at 100k cells, switch from `Arc::make_mut` to `Arc<Workbook>` + COW pattern.
-- **R-V3.6-18** `apply_op` is private to `ql-oplog`.  Closure locked: V3.6.0.8.2 adds a new `pub fn apply_ops_in_range(&self, workbook: &mut Workbook, from_index: usize, to_index: usize, registry: &FunctionRegistry) -> Result<usize, ReplayError>` on `OpLog` (preserves `replay_into`'s from-empty contract).
+- **R-V3.6-14** Cached Workbook stale after Loro UndoManager retract.  DISCOVERED at V3.6.0.8.1 design lock; CLOSED at V3.6.0.8.2 -- `undo()` + `redo()` call `force_clear_workbook_cache()` BEFORE Loro's undo/redo (verified by `v3_6_0_8_2_undo_invalidates_workbook_cache` + `..._redo_invalidates_workbook_cache` regression tests).
+- **R-V3.6-15** VersionVector vs op_count drift.  Loro's `oplog_vv()` returns `BTreeMap<PeerID, Counter>`; cached `(VV, op_count)` pair COULD drift if `merge_bytes` advances VV without local op_count increase.  PARTIAL closure at V3.6.0.8.2: the invariant at this layer is "set together / clear together" (verified by tests), not "monotonic drift".  Full debug-assert + monotonicity check deferred to V3.6.0.8.3 where the napi delta path enforces the contract.
+- **R-V3.6-16** Multi-peer concurrent rename + cell edits.  Locked closure: `merge_bytes` invalidates cache (verified by `v3_6_0_8_2_merge_bytes_invalidates_workbook_cache`); V3.6.0.8.3 napi staleness check returns `fullRebuildRequired=true` to the IDE.  Multi-peer end-to-end regression test added at V3.6.0.8.3.
+- **R-V3.6-17** Workbook clone cost may itself exceed delta budget.  Profile at V3.6.0.8.3; if `clone()` > 20 ms at 100k cells, switch from `Arc::make_mut` to a different COW pattern.
+- **R-V3.6-18** `apply_op` is private to `ql-oplog`.  CLOSED at V3.6.0.8.2 -- new `pub fn apply_ops_in_range(log: &OpLog, workbook: &mut Workbook, from_index: usize, to_index: usize, registry: &FunctionRegistry) -> Result<usize, ReplayError>` free function in `ql-oplog::replay` (re-exported via `ql_oplog::apply_ops_in_range`).  Preserves `replay_into`'s from-empty contract; out-of-range to_index silently stops at log end; empty/inverted range = O(1) no-op returning 0.  +4 ql-oplog-driven correctness tests in the ql-collab suite (`apply_ops_in_range_empty_is_noop` / `..._full_matches_replay_into` / `..._forward_from_partial` / `..._oversized_to_index_silently_stops_at_log_end`).
 
 #### V3.6 audit transcripts
 
@@ -2066,6 +2066,7 @@ The plan body at `.plans/_active.md` lines 286-314 is the authoritative source. 
 | V3.6.0.6 D5 | BLOCKED (OrbStack Mac bridge outage; V3.7+ retrospective if signal surfaces) | `2026-05-24-phase-5-7-v3-6-0-6-opus.md` |
 | V3.6.0.7 D6 spike | (measurement, no audit-of-spike) | `2026-05-25-phase-5-7-v3-6-0-7-spike.md` (spike transcript; not an audit) |
 | V3.6.0.8.1 D6 lock | (design lock, no audit-of-lock) | inline at `.plans/_active.md` + this section + docs/MASTER-PLAN.md (docs-only ship) |
+| V3.6.0.8.2 D6 engine PART 1 | (engine foundation, audit-of-D6 at V3.6.0.8.4) | inline at `.plans/_active.md` + this section + docs/MASTER-PLAN.md |
 
 Date inconsistency note: V3.6.0.3 + V3.6.0.4 transcripts dated 2026-05-23 (per work-start session date); V3.6.0.2 + V3.6.0.5 + docs-audit dated 2026-05-24.  This is a known low-severity drift; convention going forward: filename date = audit execution date (post-midnight transitions retain the original session's date in the header).
 

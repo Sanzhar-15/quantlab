@@ -44,7 +44,7 @@ pub mod wire;
 pub use error::OpLogError;
 pub use log::{OpLog, PRESENCE_COMMIT_ORIGIN};
 pub use op::{DateSystemWire, LocaleWire, Op, ReferenceModeWire};
-pub use replay::{replay_into, ReplayError};
+pub use replay::{apply_ops_in_range, replay_into, ReplayError};
 pub use wire::{CellWireValue, FormatIdWire, NamedTargetWire, WireDecodeError};
 
 // Phase 5.2 D-1 step 1.1 (2026-05-19) — re-export `ql_types::PeerId`

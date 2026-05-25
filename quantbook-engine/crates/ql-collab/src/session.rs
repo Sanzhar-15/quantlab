@@ -927,6 +927,65 @@ pub struct CollabSession {
     /// `HashMap<u16, Vec<usize>>: Send + Sync`.
     /// **0 new triggers; arc terminus stays at 6.**
     sheet_op_index: HashMap<u16, Vec<usize>>,
+
+    /// **Phase 5.7 V3.6.0.8 D6 (2026-05-25) -- incremental WorkbookSnapshot
+    /// delta cache.**
+    ///
+    /// Caches the most recent post-`rebuild_workbook` `Workbook` produced
+    /// by a `workbook_snapshot` napi call.  Paired with
+    /// [`Self::last_snapshot_oplog_vv`] which records the Loro VV at the
+    /// time the cache was populated.  The cache enables the V3.6.0.8 D6
+    /// `workbook_snapshot_delta` cell-only fast-path: when the caller
+    /// passes a `lastSeenVersion` matching `last_snapshot_oplog_vv`, the
+    /// delta walker can clone this Workbook (via `Arc::make_mut`), apply
+    /// only the ops since the cached VV (via the new
+    /// [`ql_oplog::apply_ops_in_range`] helper), and skip the
+    /// rename-repair walks entirely IF no `Op::RenameSheet | RenameTable
+    /// | RenameColumn` is in the delta.  Profiling at V3.6.0.7 spike
+    /// showed full `workbook_snapshot` at 100k cells = 251 ms; D6 cell-
+    /// only fast-path expects O(ops_since_last_call) instead.
+    ///
+    /// `None` until first `workbook_snapshot` call populates it.  Cleared
+    /// to `None` on any log invariant change: `merge_bytes`,
+    /// `discard_pending_ops`, `undo`, `redo` (via
+    /// [`Self::force_clear_workbook_cache`]).  `append_op` does NOT
+    /// invalidate -- it's the cell-only fast-path target.
+    ///
+    /// `Arc<Workbook>` (not bare `Workbook`) so the napi reader can hand
+    /// out a shared reference without forcing a clone.  Delta-apply path
+    /// uses `Arc::make_mut` to fork-on-write.  V3.6.0.8.3 will profile
+    /// `Workbook::clone()` cost at 100k cells; if > 20 ms, switch the
+    /// delta-apply pattern to a COW variant (R-V3.6-17).
+    ///
+    /// **Rule 4 per-field walk**: `Workbook` auto-derives Send + Sync
+    /// via field composition (`crates/ql-storage/src/workbook.rs:295-299`:
+    /// `Vec<Sheet>`, `NameTable`, `HashMap` of primitives + Arc<str>,
+    /// `DateSystem` enum, `FormatTable`, `HashMap` of spill primitives;
+    /// every member is Send + Sync, so auto-derive applies).  `Arc<T>:
+    /// Send + Sync` iff `T: Send + Sync` -- passes.  `Option<X>: Send +
+    /// Sync` iff `X: Send + Sync` -- trivial.  **0 new triggers; arc
+    /// terminus stays at 6.**
+    last_snapshot_workbook: Option<Arc<Workbook>>,
+
+    /// **Phase 5.7 V3.6.0.8 D6 (2026-05-25) -- VV pinning for the
+    /// workbook cache.**
+    ///
+    /// Records `self.log.oplog_vv()` at the moment
+    /// [`Self::last_snapshot_workbook`] was populated.  `None` iff the
+    /// workbook cache is `None`; the two fields are reset + populated
+    /// together as an invariant.  Used by the V3.6.0.8.3 napi
+    /// `workbook_snapshot_delta` staleness check: when the caller's
+    /// `lastSeenVersion` (decoded to VersionVector) does NOT equal this,
+    /// the engine returns `fullRebuildRequired=true` so the IDE falls
+    /// back to a full `workbook_snapshot()` call.
+    ///
+    /// **Rule 4 per-field walk**: Loro's `VersionVector` is
+    /// `BTreeMap<PeerID, Counter>` (verified at
+    /// loro-internal-1.12.0/src/version.rs); `PeerID: Copy + Send +
+    /// Sync` and `Counter: Copy + Send + Sync`; `BTreeMap<K, V>: Send +
+    /// Sync` iff `K, V: Send + Sync`.  `Option<X>: Send + Sync` iff `X:
+    /// Send + Sync`.  **0 new triggers; arc terminus stays at 6.**
+    last_snapshot_oplog_vv: Option<loro::VersionVector>,
 }
 
 impl CollabSession {
@@ -994,6 +1053,12 @@ impl CollabSession {
             // touched.
             cell_op_index: HashMap::new(),
             sheet_op_index: HashMap::new(),
+            // V3.6.0.8 D6: cache populated lazily by the first
+            // `workbook_snapshot` napi call; `None` here means the
+            // V3.6.0.8.3 delta path will return `fullRebuildRequired=true`
+            // until then.
+            last_snapshot_workbook: None,
+            last_snapshot_oplog_vv: None,
         })
     }
 
@@ -1076,6 +1141,14 @@ impl CollabSession {
             // per RemoveSheet effect (sheet_op_index).
             cell_op_index: HashMap::new(),
             sheet_op_index: HashMap::new(),
+            // V3.6.0.8 D6: cache populated lazily by the first post-
+            // import `workbook_snapshot` napi call.  `from_snapshot`
+            // imports historical ops but does NOT pre-populate the
+            // workbook cache -- the imported state's repaired-workbook
+            // would still cost a full rebuild_workbook (with rename-
+            // repair walks) which we avoid until a consumer needs it.
+            last_snapshot_workbook: None,
+            last_snapshot_oplog_vv: None,
         };
         sess.rebuild_snapshot_cache()?;
         Ok(sess)
@@ -1496,6 +1569,15 @@ impl CollabSession {
         // correct here; full rebuild is.  See the `last_snapshot`
         // field docstring for the formal argument.
         self.rebuild_snapshot_cache()?;
+        // V3.6.0.8 D6 (2026-05-25): invalidate the workbook cache.
+        // The cached `last_snapshot_workbook` reflects the rebuilt
+        // workbook at the pre-merge VV; after merge, remote ops may
+        // have shifted LWW winners (same hazard the snapshot_cache
+        // rebuild handles) AND may include rename ops that would
+        // require a fresh rename-repair walk to produce a correct
+        // workbook.  Clear; the next `workbook_snapshot_delta` call
+        // returns `fullRebuildRequired=true` and the IDE refetches.
+        self.force_clear_workbook_cache();
         // V3.6.0.2 D1 (2026-05-24): the V3.5.0.X `pure_local_frontier`
         // field was REMOVED.  Partial-invalidate undo/redo now uses
         // Loro's `top_undo_meta()` / `top_redo_meta()` to retrieve the
@@ -1655,6 +1737,75 @@ impl CollabSession {
         self.sheet_op_index.iter()
     }
 
+    /// **Phase 5.7 V3.6.0.8 D6 (2026-05-25)** -- read accessor for the
+    /// V3.6.0.8.2 workbook cache.
+    ///
+    /// Returns `Some(arc)` if a prior `workbook_snapshot` call
+    /// populated the cache AND no log-invariant mutation has cleared
+    /// it since (see [`Self::force_clear_workbook_cache`]).  Returns
+    /// `None` otherwise -- the V3.6.0.8.3 delta napi treats `None` as
+    /// the trigger to return `fullRebuildRequired=true`.
+    pub fn last_snapshot_workbook(&self) -> Option<&Arc<Workbook>> {
+        self.last_snapshot_workbook.as_ref()
+    }
+
+    /// **Phase 5.7 V3.6.0.8 D6 (2026-05-25)** -- read accessor for the
+    /// VV pinned alongside the workbook cache.
+    ///
+    /// Returns `Some(&vv)` iff [`Self::last_snapshot_workbook`] also
+    /// returns `Some` (they are populated + cleared together as an
+    /// invariant).
+    pub fn last_snapshot_oplog_vv(&self) -> Option<&loro::VersionVector> {
+        self.last_snapshot_oplog_vv.as_ref()
+    }
+
+    /// **Phase 5.7 V3.6.0.8 D6 (2026-05-25)** -- populate the workbook
+    /// cache from a freshly-rebuilt+repaired `Workbook` + the current
+    /// `oplog_vv()`.
+    ///
+    /// Called by the V3.6.0.8.3 napi `workbook_snapshot` after each
+    /// successful `rebuild_workbook` (the canonical "we just paid the
+    /// full rebuild cost; cache the result for the next delta call").
+    /// The `Workbook` is wrapped in `Arc` for share-on-read; the VV is
+    /// cloned in case the caller mutates the log between this call and
+    /// reading via [`Self::last_snapshot_oplog_vv`].
+    ///
+    /// **Invariant**: the workbook MUST already have rename-repair
+    /// applied (i.e., be the post-`rebuild_workbook` output, not the
+    /// pre-repair `replay_into` output).  V3.6.0.8.3 callsite is
+    /// `crates/ql-bindings-node/src/lib.rs::workbook_snapshot` AFTER
+    /// the `rebuild_workbook` call.  Cache bypass of repair was
+    /// considered + REJECTED at V3.6.0.8.1 lock (option (b)) because
+    /// `last_snapshot.formula` carries pre-repair text.
+    pub fn set_workbook_cache(&mut self, workbook: Arc<Workbook>, vv: loro::VersionVector) {
+        self.last_snapshot_workbook = Some(workbook);
+        self.last_snapshot_oplog_vv = Some(vv);
+    }
+
+    /// **Phase 5.7 V3.6.0.8 D6 (2026-05-25)** -- invalidate the
+    /// workbook cache.
+    ///
+    /// Called from every mutation site that changes log invariants
+    /// such that the cached `Workbook` would be stale for the next
+    /// `workbook_snapshot_delta` call.  The four production callsites
+    /// are: [`Self::merge_bytes`] (remote ops may re-order LWW winners),
+    /// [`Self::discard_pending_ops`] (log replaced via `fork_at_vv`),
+    /// [`Self::undo`] (Loro UndoManager retract compacts the visible
+    /// log -- R-V3.6-10 / R-V3.6-14), [`Self::redo`] (mirror of undo).
+    ///
+    /// `append_op` does NOT call this -- a cell-keyed append is exactly
+    /// the case the V3.6.0.8.3 cell-only fast-path handles by cloning
+    /// the cached `Workbook` and applying the new op forward, skipping
+    /// the rename-repair walks entirely.
+    ///
+    /// Both fields are reset together to preserve the
+    /// "[`Self::last_snapshot_workbook`] is `Some` iff
+    /// [`Self::last_snapshot_oplog_vv`] is `Some`" invariant.
+    pub fn force_clear_workbook_cache(&mut self) {
+        self.last_snapshot_workbook = None;
+        self.last_snapshot_oplog_vv = None;
+    }
+
     /// **Phase 5.7 V3.3.0.X audit closure (MEDIUM-5, 2026-05-23) --
     /// test-only snapshot cache invalidation seam.**
     ///
@@ -1705,6 +1856,12 @@ impl CollabSession {
         // indices atomically.
         self.cell_op_index.clear();
         self.sheet_op_index.clear();
+        // V3.6.0.8 D6: also reset the workbook cache test-seam
+        // discipline -- callers using `force_clear_snapshot_cache`
+        // for "clean cache state" tests should see ALL cache state
+        // reset, not just `last_snapshot`.
+        self.last_snapshot_workbook = None;
+        self.last_snapshot_oplog_vv = None;
     }
 
     /// **Phase 5.7 V3.3.0.3 + V3.4.0.2 -- snapshot cache accessor
@@ -2873,6 +3030,12 @@ impl CollabSession {
         // (specifically the discarded pending ops past the last
         // flushed VV).  Rebuild from the new log.
         self.rebuild_snapshot_cache()?;
+        // V3.6.0.8 D6 (2026-05-25): invalidate the workbook cache.
+        // The forked log dropped the pending ops; the cached
+        // `last_snapshot_workbook` may include effects of those
+        // discarded ops.  Clear; next delta call returns
+        // `fullRebuildRequired=true`.
+        self.force_clear_workbook_cache();
         // V3.6.0.2 D1: also reset the pending cells stash -- the prior
         // staged value (if any) referred to an op that was just
         // discarded along with the rest of the pending-op tail.
@@ -3404,6 +3567,21 @@ impl CollabSession {
         let pending_value = captured_cells.clone().unwrap_or_default();
         *self.pending_undo_cells.lock().expect("pending_undo_cells mutex poisoned") =
             Some(pending_value);
+        // V3.6.0.8 D6 (2026-05-25; R-V3.6-14): invalidate the workbook
+        // cache BEFORE Loro's undo call.  Loro's UndoManager retract
+        // compacts the visible log (R-V3.6-10 carry); the cached
+        // `last_snapshot_workbook` still reflects pre-retract state
+        // including any retracted rename op whose effect would now
+        // need to be un-repaired.  Clear; the next
+        // `workbook_snapshot_delta` call returns
+        // `fullRebuildRequired=true` and the IDE refetches.  Matches
+        // the `force_clear_snapshot_cache` discipline (the V3.6.0.4 D3
+        // partial-invalidate path rebuilds last_snapshot incrementally;
+        // for the workbook cache we choose clear-then-lazy-repopulate
+        // because workbook rebuild is far more expensive per
+        // R-V3.6-NEW and most undo calls won't be immediately followed
+        // by a `workbook_snapshot_delta`).
+        self.force_clear_workbook_cache();
         let consumed = self.undo.undo()?;
         // **Phase 5.5 V2 V2 audit closure (Codex M2, 2026-05-21):** only
         // auto-flush when an undo item was actually consumed. The prior
@@ -3489,6 +3667,15 @@ impl CollabSession {
         let pending_value = captured_cells.clone().unwrap_or_default();
         *self.pending_undo_cells.lock().expect("pending_undo_cells mutex poisoned") =
             Some(pending_value);
+        // V3.6.0.8 D6 (2026-05-25; R-V3.6-14): mirror `undo()` -- invalidate
+        // the workbook cache BEFORE Loro's redo call.  Loro's redo also
+        // mutates the visible log (pushes the previously-undone op back);
+        // the cached workbook reflects the pre-redo log state.  Clear
+        // unconditionally (matches `undo` discipline; tolerates the
+        // empty-redo-stack case where `consumed=false` because the cache
+        // would just remain unpopulated until the next workbook_snapshot
+        // call repopulates it).
+        self.force_clear_workbook_cache();
         let consumed = self.undo.redo()?;
         // Phase 5.5 V2 V2 audit closure (Codex M2): gate matches `undo`.
         if consumed {
@@ -7155,5 +7342,315 @@ mod tests {
 
         let e = super::CollabSessionError::Transport(TransportError::Io("dead".into()));
         assert_eq!(e.kind(), "transport_io");
+    }
+
+    // ============================================================
+    // Phase 5.7 V3.6.0.8.2 D6 (2026-05-25) -- workbook cache invariants
+    // ============================================================
+    //
+    // These tests pin the V3.6.0.8.2 invariants without depending on
+    // the V3.6.0.8.3 napi `workbook_snapshot_delta` consumer (which
+    // doesn't exist yet at this commit).  They verify:
+    //   1. Fresh session: cache is `None`.
+    //   2. set_workbook_cache populates both fields atomically.
+    //   3. force_clear_workbook_cache clears both fields atomically.
+    //   4. The 4 production callsites (merge_bytes / discard_pending_ops
+    //      / undo / redo) all invalidate the cache.
+    //   5. append_op does NOT invalidate (cell-only fast-path target).
+
+    /// Populate the workbook cache with a Default Workbook + the
+    /// session's current oplog_vv.  Used by V3.6.0.8.2 invalidation
+    /// tests as the "cache is populated" pre-condition.  Cheap: the
+    /// Default Workbook has zero sheets / cells, so this is a no-op
+    /// semantically; only the cache field state matters for these
+    /// tests.
+    fn populate_workbook_cache_for_test(s: &mut CollabSession) {
+        let wb = std::sync::Arc::new(ql_storage::Workbook::default());
+        let vv = s.log.oplog_vv();
+        s.set_workbook_cache(wb, vv);
+        assert!(
+            s.last_snapshot_workbook().is_some(),
+            "test pre-condition: workbook cache is populated"
+        );
+        assert!(
+            s.last_snapshot_oplog_vv().is_some(),
+            "test pre-condition: oplog_vv is populated alongside workbook"
+        );
+    }
+
+    #[test]
+    fn v3_6_0_8_2_fresh_session_has_empty_workbook_cache() {
+        let s = CollabSession::new(PeerId::new(1)).unwrap();
+        assert!(s.last_snapshot_workbook().is_none());
+        assert!(s.last_snapshot_oplog_vv().is_none());
+    }
+
+    #[test]
+    fn v3_6_0_8_2_from_snapshot_has_empty_workbook_cache() {
+        // Build an origin session with some ops, export, re-import.
+        let mut origin = CollabSession::new(PeerId::new(1)).unwrap();
+        origin
+            .append_op(Op::AddSheet {
+                name: "S".to_owned(),
+                chunk_rows: 16384,
+            })
+            .unwrap();
+        origin.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        let bytes = origin.export_bytes().unwrap();
+        let reborn = CollabSession::from_snapshot(PeerId::new(2), &bytes).unwrap();
+        assert!(
+            reborn.last_snapshot_workbook().is_none(),
+            "from_snapshot does NOT pre-populate the workbook cache"
+        );
+        assert!(reborn.last_snapshot_oplog_vv().is_none());
+    }
+
+    #[test]
+    fn v3_6_0_8_2_set_workbook_cache_populates_both_fields() {
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        assert!(s.last_snapshot_workbook().is_none());
+        let wb = std::sync::Arc::new(ql_storage::Workbook::default());
+        let vv = s.log.oplog_vv();
+        s.set_workbook_cache(wb.clone(), vv.clone());
+        assert!(s.last_snapshot_workbook().is_some());
+        assert!(s.last_snapshot_oplog_vv().is_some());
+        // Arc identity is preserved (no clone of the inner Workbook
+        // happens in set_workbook_cache).
+        assert!(std::sync::Arc::ptr_eq(
+            s.last_snapshot_workbook().unwrap(),
+            &wb
+        ));
+    }
+
+    #[test]
+    fn v3_6_0_8_2_force_clear_workbook_cache_resets_both_fields() {
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        populate_workbook_cache_for_test(&mut s);
+        s.force_clear_workbook_cache();
+        assert!(s.last_snapshot_workbook().is_none());
+        assert!(s.last_snapshot_oplog_vv().is_none());
+    }
+
+    #[test]
+    fn v3_6_0_8_2_merge_bytes_invalidates_workbook_cache() {
+        // Two sessions sharing a base.  Populate session A's workbook
+        // cache, then merge session B's bytes.  Cache should clear.
+        let mut origin = CollabSession::new(PeerId::new(100)).unwrap();
+        origin
+            .append_op(Op::AddSheet {
+                name: "S".to_owned(),
+                chunk_rows: 16384,
+            })
+            .unwrap();
+        let base_bytes = origin.export_bytes().unwrap();
+
+        let mut s_a = CollabSession::from_snapshot(PeerId::new(1), &base_bytes).unwrap();
+        let mut s_b = CollabSession::from_snapshot(PeerId::new(2), &base_bytes).unwrap();
+        s_b.append_op(put_value(0, 0, 0, 42.0)).unwrap();
+        let b_bytes = s_b.export_bytes().unwrap();
+
+        populate_workbook_cache_for_test(&mut s_a);
+        s_a.merge_bytes(&b_bytes).unwrap();
+        assert!(
+            s_a.last_snapshot_workbook().is_none(),
+            "merge_bytes MUST clear last_snapshot_workbook (remote ops may shift LWW \
+             winners; cached workbook would be stale)"
+        );
+        assert!(s_a.last_snapshot_oplog_vv().is_none());
+    }
+
+    #[test]
+    fn v3_6_0_8_2_discard_pending_ops_invalidates_workbook_cache() {
+        // Append ops without flushing, populate cache, then discard.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        populate_workbook_cache_for_test(&mut s);
+        let discarded = s.discard_pending_ops().unwrap();
+        assert!(discarded >= 2, "discarded both pending ops");
+        assert!(
+            s.last_snapshot_workbook().is_none(),
+            "discard_pending_ops MUST clear last_snapshot_workbook (forked log dropped \
+             ops the cached workbook had applied)"
+        );
+        assert!(s.last_snapshot_oplog_vv().is_none());
+    }
+
+    #[test]
+    fn v3_6_0_8_2_undo_invalidates_workbook_cache() {
+        // Append a cell-keyed op so undo has something to consume,
+        // populate cache, then undo.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        populate_workbook_cache_for_test(&mut s);
+        let consumed = s.undo().unwrap();
+        assert!(consumed, "undo consumed a real op");
+        assert!(
+            s.last_snapshot_workbook().is_none(),
+            "undo MUST clear last_snapshot_workbook BEFORE Loro's undo (R-V3.6-14: \
+             retracted ops may include rename effects requiring fresh repair)"
+        );
+        assert!(s.last_snapshot_oplog_vv().is_none());
+    }
+
+    #[test]
+    fn v3_6_0_8_2_redo_invalidates_workbook_cache() {
+        // Append + undo + populate cache + redo.  Cache should clear.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s.undo().unwrap();
+        populate_workbook_cache_for_test(&mut s);
+        let consumed = s.redo().unwrap();
+        assert!(consumed, "redo consumed a real op");
+        assert!(
+            s.last_snapshot_workbook().is_none(),
+            "redo MUST clear last_snapshot_workbook (mirrors undo discipline)"
+        );
+        assert!(s.last_snapshot_oplog_vv().is_none());
+    }
+
+    #[test]
+    fn v3_6_0_8_2_append_op_does_NOT_invalidate_workbook_cache() {
+        // append_op is the cell-only fast-path target -- the cache
+        // stays valid (V3.6.0.8.3's delta path will clone + apply
+        // forward without rebuild).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        populate_workbook_cache_for_test(&mut s);
+        let cached_vv_before = s.last_snapshot_oplog_vv().cloned();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        assert!(
+            s.last_snapshot_workbook().is_some(),
+            "append_op MUST NOT clear last_snapshot_workbook (cell-only fast-path \
+             target; cached workbook is correct for what it represents = state at \
+             cached VV)"
+        );
+        assert!(s.last_snapshot_oplog_vv().is_some());
+        // Cached VV is unchanged by append_op (cache reflects the VV
+        // at the time of the most recent set_workbook_cache call, not
+        // the live log's VV).
+        assert_eq!(s.last_snapshot_oplog_vv().cloned(), cached_vv_before);
+    }
+
+    // ============================================================
+    // Phase 5.7 V3.6.0.8.2 D6 (2026-05-25) -- apply_ops_in_range
+    // correctness via the re-exported helper.
+    // ============================================================
+
+    #[test]
+    fn v3_6_0_8_2_apply_ops_in_range_empty_is_noop() {
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        let registry = ql_functions::default_registry();
+        let mut wb = ql_storage::Workbook::default();
+        // Empty range (from >= to).
+        let n = ql_oplog::apply_ops_in_range(&s.log, &mut wb, 2, 2, &registry).unwrap();
+        assert_eq!(n, 0);
+        let n = ql_oplog::apply_ops_in_range(&s.log, &mut wb, 5, 1, &registry).unwrap();
+        assert_eq!(n, 0, "from > to is also a no-op (saturates at 0)");
+    }
+
+    #[test]
+    fn v3_6_0_8_2_apply_ops_in_range_full_matches_replay_into() {
+        // Range [0, log_len) is equivalent to replay_into.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s.append_op(put_value(0, 1, 0, 2.0)).unwrap();
+        let registry = ql_functions::default_registry();
+        let log_len = s.log.len();
+
+        let mut wb_replay = ql_storage::Workbook::default();
+        let n_replay = ql_oplog::replay_into(&s.log, &mut wb_replay, &registry).unwrap();
+
+        let mut wb_range = ql_storage::Workbook::default();
+        let n_range =
+            ql_oplog::apply_ops_in_range(&s.log, &mut wb_range, 0, log_len, &registry).unwrap();
+
+        assert_eq!(n_replay, n_range, "same op count");
+        assert_eq!(
+            wb_replay.sheet_count(),
+            wb_range.sheet_count(),
+            "same sheet count"
+        );
+    }
+
+    #[test]
+    fn v3_6_0_8_2_apply_ops_in_range_forward_from_partial() {
+        // Apply ops [0, 1) (just AddSheet) to one workbook, then
+        // apply [1, log_len) to it; result equals full replay_into.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
+        s.append_op(put_value(0, 1, 0, 2.0)).unwrap();
+        let registry = ql_functions::default_registry();
+        let log_len = s.log.len();
+
+        let mut wb_split = ql_storage::Workbook::default();
+        let n_first =
+            ql_oplog::apply_ops_in_range(&s.log, &mut wb_split, 0, 1, &registry).unwrap();
+        let n_second =
+            ql_oplog::apply_ops_in_range(&s.log, &mut wb_split, 1, log_len, &registry).unwrap();
+        assert_eq!(n_first + n_second, log_len);
+
+        let mut wb_full = ql_storage::Workbook::default();
+        let n_full = ql_oplog::replay_into(&s.log, &mut wb_full, &registry).unwrap();
+        assert_eq!(n_full, n_first + n_second);
+
+        // Both workbooks have the same sheet count + same value at
+        // the two cells we wrote.
+        assert_eq!(wb_split.sheet_count(), wb_full.sheet_count());
+    }
+
+    #[test]
+    fn v3_6_0_8_2_apply_ops_in_range_oversized_to_index_silently_stops_at_log_end() {
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        let registry = ql_functions::default_registry();
+        let mut wb = ql_storage::Workbook::default();
+        // to_index = 1000 vs log_len = 1.  iterator's take() saturates.
+        let n =
+            ql_oplog::apply_ops_in_range(&s.log, &mut wb, 0, 1000, &registry).unwrap();
+        assert_eq!(n, 1, "applied only the 1 op actually in the log");
     }
 }
