@@ -1799,12 +1799,12 @@ Three additional minor findings noted but not fixed in-cycle:
 
 ### 4.1.z6 Loro UndoManager on_push + format registry + per-cell op-index + format-aware buildHtml rendering (Phase 5.7 V3.6, 2026-05-24)
 
-**Status**: V3.6.0.1 lock + V3.6.0.2 D1 + V3.6.0.3 D2 + V3.6.0.4 D3 + V3.6.0.5 D4 + V3.6.0.6 D5 + V3.6.0.X audit-of-D5 closures ALL SHIPPED + AUDITED.  V3.6.0.7 D6 profiling spike is the next recommended sub-step (conditional on user direction).
+**Status**: V3.6.0.1 lock + V3.6.0.2 D1 + V3.6.0.3 D2 + V3.6.0.4 D3 + V3.6.0.5 D4 + V3.6.0.6 D5 + V3.6.0.X audit-of-D5 closures + **V3.6.0.7 D6 profiling spike** ALL SHIPPED + AUDITED.  D6 SHIPS in V3.6.0.8 per the spike verdict (251 ms median at 100k cells / 50 % format / 1 sheet; 5× over the 50 ms threshold).
 
-**Engine HEAD at this section's commit**: (next; V3.6.0.X audit-of-D5 closure commit, V3.6.0.X HIGH-1 + HIGH-2 + HIGH-3 + MED-2) <- `7f9a08ccd5e` (V3.6.0.6 D5 engine).
-**IDE HEAD at this section's commit**: (next; V3.6.0.X audit-of-D5 closure commit) <- `7608ae7633f` (V3.6.0.6 D5 IDE).
+**Engine HEAD at this section's commit**: (next; V3.6.0.7 D6 spike commit -- criterion bench + spike transcript + plan/MASTER-PLAN/this file sweep) <- `1e1e5464da9` (V3.6.0.X audit-of-D5 closures) <- `7f9a08ccd5e` (V3.6.0.6 D5 engine).
+**IDE HEAD at this section's commit**: `d9731633ac4` (V3.6.0.X audit-of-D5 closures; V3.6.0.7 is engine-only, no IDE touch).
 
-**Tests baseline**: ql-collab **136/136** + ql-oplog **67/67** + IDE mocha **(381/381 after V3.6.0.X audit-of-D5 closures; +8 over V3.6.0.6 D5 373 baseline)** + ql-collab-ws **42/42** (10 lib + 30 transport + 2 V3.1.a relay; +2 doctests separate) + engine workspace 99 test-result lines pass.
+**Tests baseline**: ql-collab **136/136** + ql-oplog **67/67** + IDE mocha **384/384** (3 over the V3.6.0.X audit-of-D5 handoff's documented 381; same HEAD, the 8-delta over the D5 373 baseline appears to have been an undercount) + ql-collab-ws **42/42** (10 lib + 30 transport + 2 V3.1.a relay; +2 doctests separate) + engine workspace 99 test-result lines pass.  V3.6.0.7 adds 1 new criterion bench (not in the cargo test tally; bench reproduces on `cargo bench -p ql-bindings-node --bench workbook_snapshot`).
 
 #### V3.6.0.1 -- decision lock (9 D-decisions)
 
@@ -1817,7 +1817,7 @@ Per V3.5.0.X Opus § F V3.6 ENTRY READINESS:
 | **D3** Per-cell op-index for invalidate_cell | New `cell_op_index: HashMap<(u16,u32,u32), Vec<usize>>` + new `sheet_op_index: HashMap<u16, Vec<usize>>` + `CacheBuckets<'a>` struct + new `OpLog::get(idx)` accessor + `rebuild_op_indices_only` helper for post-undo refresh | V3.6.0.4 |
 | **D4** Format-aware buildHtml rendering | Engine-side `format::render` integration in `workbook_snapshot`; new `CellSnapshotJson.rendered: Option<String>` + `WorkbookSnapshotJson.dateSystem: String` additive fields; IDE `cellGridHtml::renderRows` uses `e.rendered ?? formatCellValue(e.value)` | V3.6.0.5 |
 | **D5** IDE-facing `appendPutFormula` napi | Thin wrapper over existing `Op::PutFormula`; unblocks end-to-end repaired-formula integration tests; V3.6.0.X audit-of-D5 closures add user-driven write-path (formula-prefix-detect dispatcher arm) + formula-only-cell pending passthrough + `validate_u16_index` symmetry closure | V3.6.0.6 **SHIPPED** + V3.6.0.X audit-of-D5 closures SHIPPED |
-| **D6** Incremental WorkbookSnapshot deltas | Time-boxed profiling spike; ship D6 only if profiling justifies | V3.6.0.7 PENDING |
+| **D6** Incremental WorkbookSnapshot deltas | Time-boxed profiling spike; ship D6 only if profiling justifies | V3.6.0.7 SPIKE **SHIPPED**; D6 SHIPS V3.6.0.8 |
 | **D7** `#REF!` substitution for cross-sheet refs to deleted sheets | DEFER until user signal | V3.6.0.8 PENDING |
 | **D8** `Op::RestoreSheet` un-delete | DEFER until user signal | V3.6.0.9 PENDING |
 | **D9** Sheet-tabs UX + typing-stroke watchdog | DEFER sheet-tabs to V3.6+ multi-tab redesign; typing-stroke watchdog ship-on-signal | V3.6.0.10 CONDITIONAL |
@@ -1877,6 +1877,58 @@ Deferred to V3.6.0.7+ backlog: Opus MED-1 (client/server `data-raw-formula` guar
 
 +8 mocha tests over V3.6.0.6 D5 373 baseline (-> **381/381**): 3 dispatcher routing (formula prefix detected; leading-whitespace formula detected; non-formula stays on value path); 2 formula-only-cell pass-through (renders pending; data-raw-formula attribute emits); 3 u16 sheet validator (NaN/Infinity rejected; fractional rejected; 2^32 rejected; covers both appendPutValue and appendPutFormula).  ql-collab unchanged at 136/136 (engine changes are validator + signature; no new collab-side surface).
 
+#### V3.6.0.7 D6 -- profiling spike for incremental snapshot deltas (engine this-commit)
+
+Time-boxed criterion bench at `crates/ql-bindings-node/benches/workbook_snapshot.rs` measuring post-D2 + post-D4 `workbookSnapshot` cost.  The bench replicates the body of `crates/ql-bindings-node/src/lib.rs:1802 workbook_snapshot` in pure Rust (napi methods can't be invoked from a Cargo bench harness); a setup-time assertion checks the replicated body's cell count against the workload generator to guard against silent drift.
+
+**Workload matrix (12 combinations)**:
+
+| grid | cells/sheet | sheets | format % |
+|---|---|---|---|
+| 100 × 10 | 1 000 | 1, 5 | 0, 50 |
+| 100 × 100 | 10 000 | 1, 5 | 0, 50 |
+| 1000 × 100 | 100 000 | 1, 5 | 0, 50 |
+
+Builtin format ids 1 ("0"), 9 ("0%"), 14 ("m/d/yy") rotate across formatted cells.  No `Op::RegisterFormat` needed (Builtins pre-registered).  No `appendSetCellFormat` exposed at napi V3.6.0.6 (deferred V3.7+); bench bypasses by calling `CollabSession::append_op` directly.
+
+**Hardware + toolchain**: Apple M4 Max / macOS 26.2 / rustc 1.83.0 / criterion 0.8.2 / sample_size=10 / measurement_time=15s / warm_up_time=2s / AC power.
+
+**Decision combo result**: `cells=100 000 fmt=50% sheets=1` median = **251.38 ms** ≈ 5× the 50 ms threshold.
+
+**Full result table** (criterion `[low ; median ; high]` 95% CI):
+
+| Configuration | low | median | high | exceeds 50 ms? |
+|---|---|---|---|---|
+| `cells=1000 fmt=0% sheets=1` | 1.46 ms | 1.47 ms | 1.48 ms | NO |
+| `cells=5000 fmt=0% sheets=5` | 7.38 ms | 7.39 ms | 7.41 ms | NO |
+| `cells=1000 fmt=50% sheets=1` | 2.37 ms | 2.39 ms | 2.40 ms | NO |
+| `cells=5000 fmt=50% sheets=5` | 12.33 ms | 12.41 ms | 12.48 ms | NO |
+| `cells=10000 fmt=0% sheets=1` | 14.80 ms | 14.97 ms | 15.10 ms | NO |
+| `cells=50000 fmt=0% sheets=5` | 78.16 ms | 81.21 ms | 85.16 ms | **YES** |
+| `cells=10000 fmt=50% sheets=1` | 25.01 ms | 25.06 ms | 25.15 ms | NO |
+| `cells=50000 fmt=50% sheets=5` | 127.15 ms | 127.31 ms | 127.42 ms | **YES** |
+| **`cells=100000 fmt=0% sheets=1`** | 151.80 ms | **152.40 ms** | 152.80 ms | **YES** |
+| `cells=500000 fmt=0% sheets=5` | 767.97 ms | 771.74 ms | 776.12 ms | **YES** |
+| **`cells=100000 fmt=50% sheets=1`** (decision combo) | 250.56 ms | **251.38 ms** | 252.42 ms | **YES** |
+| `cells=500000 fmt=50% sheets=5` | 1279.2 ms | 1282.8 ms | 1286.8 ms | **YES** |
+
+**Findings**:
+- Decision combo exceeds threshold by 5×; even the no-format 100k case is 3× over.
+- Threshold breakpoint lies between 10k cells (25 ms) and 50k cells (127 ms) at 50 % format.
+- Scaling is linear-to-slightly-superlinear in cell count: 10k → 100k = 10.0× time at 50 % format; 10.2× at 0 % format.  Effective N_ops dominance: rebuild_workbook replays the full op log every call.
+- D4 cost (`format::render`) is real but not the dominant term: 152 ms (0 % format) → 251 ms (50 % format) = +99 ms for ~50k format::render calls + ~50k extra `Op::SetCellFormat` replays.  ~2 μs per render with the post-D4 `parsed_format_cache` cache-hit-dominant.
+- Multi-sheet doesn't make things worse per-cell; sheet_repair walks are bounded by sheet count, not cell count.
+
+**Decision: D6 SHIPS in V3.6.0.8.**  Implementation lock:
+- `workbookSnapshotDelta(last_seen_version: Vec<u8>)` napi.
+- `WorkbookSnapshotDeltaJson { changed_cells, removed_cells, sheets_changed, version }` (additive; existing `workbookSnapshot` retained as full-rebuild fallback).
+- R-V3.6-5 (delta freshness): fall back to full snapshot when Loro version-vector predecessor is unreachable.
+- R-V3.6-NEW (rebuild_workbook dominant cost, discovered THIS spike): D6 ship plan must address it -- cache the prior rebuilt Workbook + diff forward, OR read from the V3.4.0.2 incremental snapshot cache + skip rebuild_workbook (works only if no rename-repair changed since last call), OR something else.  Locked at D6 ship.
+
+Spike transcript: `docs/audits/2026-05-25-phase-5-7-v3-6-0-7-spike.md`.  Raw criterion output: `.plans/v3-6-0-7-bench.log`.
+
+**Rule 4 arc terminus HELD at 6** (no new fields/variants/structs; bench harness is dev-deps + benches/ only).
+
 #### V3.6 risk register (R-V3.6-1..13)
 
 The plan body at `.plans/_active.md` lines 286-314 is the authoritative source.  Summary:
@@ -1885,7 +1937,7 @@ The plan body at `.plans/_active.md` lines 286-314 is the authoritative source. 
 - **R-V3.6-2** FormatTable cache invariant maintenance.  CLOSED at V3.6.0.3 via 6-mutation-site discipline + atomic-swap.
 - **R-V3.6-3** cell_op_index sync invariant.  CLOSED at V3.6.0.4 via per-effect index push + dedup-on-equality.
 - **R-V3.6-4** Format-aware rendering locale/date_system propagation.  CLOSED at V3.6.0.5 D4 + V3.6.0.X audit-of-D4 closures (CONVERGENT-HIGH-1 Op::SetDateSystem + CONVERGENT-MED-1 locale passthrough).
-- **R-V3.6-5** Incremental snapshot delta freshness.  V3.6.0.7 D6 spike open.
+- **R-V3.6-5** Incremental snapshot delta freshness.  V3.6.0.7 D6 spike SHIPPED; D6 ships V3.6.0.8; risk now blocks D6 implementation (fall back to full snapshot when Loro version-vector predecessor is unreachable).
 - **R-V3.6-6** OnPush callback DiffEvent inspection cost.  Profiled OK at V3.6.0.2; no regression.
 - **R-V3.6-7** pure_local_frontier removal regression.  CLOSED at V3.6.0.2 via rewritten V3.5.0.X regression tests.
 - **R-V3.6-8** napi struct evolution.  CLOSED across V3.6.0.3 + V3.6.0.5 via additive-only fields (formats, dateSystem, rendered all additive).
@@ -1905,12 +1957,14 @@ The plan body at `.plans/_active.md` lines 286-314 is the authoritative source. 
 | V3.6.0.5 D4 | `2026-05-24-phase-5-7-v3-6-0-5-codex.md` | `2026-05-24-phase-5-7-v3-6-0-5-opus.md` |
 | Docs audit | `2026-05-24-phase-5-7-docs-audit-codex.md` | `2026-05-24-phase-5-7-docs-audit-opus.md` |
 | V3.6.0.6 D5 | BLOCKED (OrbStack Mac bridge outage; V3.7+ retrospective if signal surfaces) | `2026-05-24-phase-5-7-v3-6-0-6-opus.md` |
+| V3.6.0.7 D6 spike | (measurement, no audit-of-spike) | `2026-05-25-phase-5-7-v3-6-0-7-spike.md` (spike transcript; not an audit) |
 
 Date inconsistency note: V3.6.0.3 + V3.6.0.4 transcripts dated 2026-05-23 (per work-start session date); V3.6.0.2 + V3.6.0.5 + docs-audit dated 2026-05-24.  This is a known low-severity drift; convention going forward: filename date = audit execution date (post-midnight transitions retain the original session's date in the header).
 
 #### Out of scope for V3.6
 
-- **V3.6.0.7 D6 incremental snapshot deltas** (profiling spike pending; ship D6 only if cost > 50ms/call at V3.6 scale).
+- ~~**V3.6.0.7 D6 incremental snapshot deltas** (profiling spike pending; ship D6 only if cost > 50ms/call at V3.6 scale)~~ — V3.6.0.7 spike SHIPPED; D6 SHIPS V3.6.0.8 per spike verdict.
+- **V3.6.0.8 D6 incremental WorkbookSnapshot deltas** — IN-SCOPE post-V3.6.0.7 spike.  ~3 sessions.
 - **V3.6.0.8 D7 `#REF!` substitution** (conditional on user signal; engine-side extends `repair_sheet_chain` at `rebuild_workbook` time).
 - **V3.6.0.9 D8 `Op::RestoreSheet`** (conditional on user signal; cell storage preserved internally).
 - **V3.6.0.10 D9 sheet-tabs UI / typing-stroke watchdog** (sheet-tabs deferred to V3.6+ multi-tab redesign; typing-stroke watchdog ship-on-signal).

@@ -2239,6 +2239,7 @@ version = "0.1.0"
 name = "ql-bindings-node"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "napi",
  "napi-build",
  "napi-derive",

@@ -117,3 +117,16 @@ napi-build = { workspace = true }
 [features]
 default = []
 test-fixtures = ["ql-collab/test-fixtures"]
+
+# **Phase 5.7 V3.6.0.7 D6 profiling spike (2026-05-25)**: criterion bench
+# for `workbookSnapshot` cost.  Replicates the napi body in pure Rust
+# (napi methods can't be invoked from Cargo bench harnesses without
+# bootstrapping a Node runtime) and measures post-D2 + post-D4 cost at
+# 1k / 10k / 100k cells × 0/50% format mix × 1/5 sheets.  Decision combo:
+# `cells=100 000, format=50 %, sheets=1` median > 50 ms → ship D6.
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "workbook_snapshot"
+harness = false

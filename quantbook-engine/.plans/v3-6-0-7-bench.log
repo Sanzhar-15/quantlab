@@ -1,0 +1,89 @@
+   Compiling ql-bindings-node v0.1.0 (/Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine/crates/ql-bindings-node)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 17.70s
+     Running benches/workbook_snapshot.rs (target/release/deps/workbook_snapshot-9ddff64c8b4fe550)
+Benchmarking workbook_snapshot/cells=1000 fmt=0% sheets=1
+Benchmarking workbook_snapshot/cells=1000 fmt=0% sheets=1: Warming up for 2.0000 s
+Benchmarking workbook_snapshot/cells=1000 fmt=0% sheets=1: Collecting 10 samples in estimated 15.010 s (10k iterations)
+Benchmarking workbook_snapshot/cells=1000 fmt=0% sheets=1: Analyzing
+workbook_snapshot/cells=1000 fmt=0% sheets=1
+                        time:   [1.4575 ms 1.4650 ms 1.4764 ms]
+Benchmarking workbook_snapshot/cells=5000 fmt=0% sheets=5
+Benchmarking workbook_snapshot/cells=5000 fmt=0% sheets=5: Warming up for 2.0000 s
+Benchmarking workbook_snapshot/cells=5000 fmt=0% sheets=5: Collecting 10 samples in estimated 15.127 s (2035 iterations)
+Benchmarking workbook_snapshot/cells=5000 fmt=0% sheets=5: Analyzing
+workbook_snapshot/cells=5000 fmt=0% sheets=5
+                        time:   [7.3800 ms 7.3930 ms 7.4056 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+Benchmarking workbook_snapshot/cells=1000 fmt=50% sheets=1
+Benchmarking workbook_snapshot/cells=1000 fmt=50% sheets=1: Warming up for 2.0000 s
+Benchmarking workbook_snapshot/cells=1000 fmt=50% sheets=1: Collecting 10 samples in estimated 15.107 s (6380 iterations)
+Benchmarking workbook_snapshot/cells=1000 fmt=50% sheets=1: Analyzing
+workbook_snapshot/cells=1000 fmt=50% sheets=1
+                        time:   [2.3732 ms 2.3867 ms 2.4041 ms]
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high mild
+Benchmarking workbook_snapshot/cells=5000 fmt=50% sheets=5
+Benchmarking workbook_snapshot/cells=5000 fmt=50% sheets=5: Warming up for 2.0000 s
+Benchmarking workbook_snapshot/cells=5000 fmt=50% sheets=5: Collecting 10 samples in estimated 15.431 s (1265 iterations)
+Benchmarking workbook_snapshot/cells=5000 fmt=50% sheets=5: Analyzing
+workbook_snapshot/cells=5000 fmt=50% sheets=5
+                        time:   [12.326 ms 12.410 ms 12.477 ms]
+Benchmarking workbook_snapshot/cells=10000 fmt=0% sheets=1
+Benchmarking workbook_snapshot/cells=10000 fmt=0% sheets=1: Warming up for 2.0000 s
+Benchmarking workbook_snapshot/cells=10000 fmt=0% sheets=1: Collecting 10 samples in estimated 15.744 s (1045 iterations)
+Benchmarking workbook_snapshot/cells=10000 fmt=0% sheets=1: Analyzing
+workbook_snapshot/cells=10000 fmt=0% sheets=1
+                        time:   [14.801 ms 14.969 ms 15.100 ms]
+Benchmarking workbook_snapshot/cells=50000 fmt=0% sheets=5
+Benchmarking workbook_snapshot/cells=50000 fmt=0% sheets=5: Warming up for 2.0000 s
+Benchmarking workbook_snapshot/cells=50000 fmt=0% sheets=5: Collecting 10 samples in estimated 17.140 s (220 iterations)
+Benchmarking workbook_snapshot/cells=50000 fmt=0% sheets=5: Analyzing
+workbook_snapshot/cells=50000 fmt=0% sheets=5
+                        time:   [78.159 ms 81.214 ms 85.158 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+Benchmarking workbook_snapshot/cells=10000 fmt=50% sheets=1
+Benchmarking workbook_snapshot/cells=10000 fmt=50% sheets=1: Warming up for 2.0000 s
+Benchmarking workbook_snapshot/cells=10000 fmt=50% sheets=1: Collecting 10 samples in estimated 15.388 s (605 iterations)
+Benchmarking workbook_snapshot/cells=10000 fmt=50% sheets=1: Analyzing
+workbook_snapshot/cells=10000 fmt=50% sheets=1
+                        time:   [25.006 ms 25.063 ms 25.153 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking workbook_snapshot/cells=50000 fmt=50% sheets=5
+Benchmarking workbook_snapshot/cells=50000 fmt=50% sheets=5: Warming up for 2.0000 s
+Benchmarking workbook_snapshot/cells=50000 fmt=50% sheets=5: Collecting 10 samples in estimated 20.981 s (165 iterations)
+Benchmarking workbook_snapshot/cells=50000 fmt=50% sheets=5: Analyzing
+workbook_snapshot/cells=50000 fmt=50% sheets=5
+                        time:   [127.15 ms 127.31 ms 127.42 ms]
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) low severe
+  1 (10.00%) high severe
+Benchmarking workbook_snapshot/cells=100000 fmt=0% sheets=1
+Benchmarking workbook_snapshot/cells=100000 fmt=0% sheets=1: Warming up for 2.0000 s
+Benchmarking workbook_snapshot/cells=100000 fmt=0% sheets=1: Collecting 10 samples in estimated 16.640 s (110 iterations)
+Benchmarking workbook_snapshot/cells=100000 fmt=0% sheets=1: Analyzing
+workbook_snapshot/cells=100000 fmt=0% sheets=1
+                        time:   [151.80 ms 152.40 ms 152.80 ms]
+Benchmarking workbook_snapshot/cells=500000 fmt=0% sheets=5
+Benchmarking workbook_snapshot/cells=500000 fmt=0% sheets=5: Warming up for 2.0000 s
+Benchmarking workbook_snapshot/cells=500000 fmt=0% sheets=5: Collecting 10 samples in estimated 15.560 s (20 iterations)
+Benchmarking workbook_snapshot/cells=500000 fmt=0% sheets=5: Analyzing
+workbook_snapshot/cells=500000 fmt=0% sheets=5
+                        time:   [767.97 ms 771.74 ms 776.12 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking workbook_snapshot/cells=100000 fmt=50% sheets=1
+Benchmarking workbook_snapshot/cells=100000 fmt=50% sheets=1: Warming up for 2.0000 s
+Benchmarking workbook_snapshot/cells=100000 fmt=50% sheets=1: Collecting 10 samples in estimated 27.781 s (110 iterations)
+Benchmarking workbook_snapshot/cells=100000 fmt=50% sheets=1: Analyzing
+workbook_snapshot/cells=100000 fmt=50% sheets=1
+                        time:   [250.56 ms 251.38 ms 252.42 ms]
+Benchmarking workbook_snapshot/cells=500000 fmt=50% sheets=5
+Benchmarking workbook_snapshot/cells=500000 fmt=50% sheets=5: Warming up for 2.0000 s
+Benchmarking workbook_snapshot/cells=500000 fmt=50% sheets=5: Collecting 10 samples in estimated 25.777 s (20 iterations)
+Benchmarking workbook_snapshot/cells=500000 fmt=50% sheets=5: Analyzing
+workbook_snapshot/cells=500000 fmt=50% sheets=5
+                        time:   [1.2792 s 1.2828 s 1.2868 s]
+
