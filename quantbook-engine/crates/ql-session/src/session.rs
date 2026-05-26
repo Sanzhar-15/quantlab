@@ -288,4 +288,5 @@ pub trait EngineSession {
         query_id: &str,
         target: CellRange,
         data: serde_json::Value,
-    ) -> Eng
+    ) -> EngineResult<PublishedRef>;
+}

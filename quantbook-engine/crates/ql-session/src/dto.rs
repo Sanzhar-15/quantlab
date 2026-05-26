@@ -376,4 +376,6 @@ pub struct Diagnostic {
     pub severity: Severity,
     /// Stable diagnostic code.
     pub code: String,
-    /// Human-
+    /// Human-readable message.
+    pub message: String,
+}
