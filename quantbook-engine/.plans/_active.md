@@ -22,7 +22,7 @@ status: |
   fullRebuild allowlist + 5 invalidation sites); shape-equivalence mocha meta-test
   pins fast-path === full-path.
 
-  Cycle accounting: cycle 1 of 2 this fresh session (within CLAUDE.md ≤2 ceiling).
+  Cycle accounting: cycles 1-2 of 2 this fresh session (V3.6.1.1 B10 + V3.6.1.2 shared cache; AT the CLAUDE.md ≤2 ceiling — next increment needs a fresh session).
 date: 2026-05-26
 predecessor_plan: .plans/_archive/2026-05-24_phase-5-7-v3-6-on-pop-format-registry-rendering.md (V3.6 PHASE TERMINATION CLEAN at engine 1465b1db4c4 + IDE 64d95a5d52c; 9-decision arc D1-D6+D8+D9 SHIPPED + audited; V3.6.0.X phase-termination 3-lane megaudit + CONVERGENT-HIGH-1 closure; only D7 #REF! conditional)
 parent_phase: 5.7 Collaboration IDE Vertical Slice
@@ -48,12 +48,18 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; range-aware fn s
    - +15 mocha tests (`quantbook V3.6.1 -- *`).  No engine source change; Rule 4 arc terminus N/A (IDE-only).
    - No-Fallbacks: `fullRebuildRequired` is an explicit designed protocol signal (re-fetch), NOT a swallowed error; deliberately NO hidden periodic resync (would mask divergence).
 
+2. **V3.6.1.2 — share the delta cache per session** ✅ SHIPPED 2026-05-26 (cycle 2; IDE `d028568b53b`).
+   - V3.6.1.1's per-panel `_deltaCache` mismatched the engine's per-session snapshot cache (only the first panel per change hit the fast path; siblings full-rebuilt on staleness).  Fixed by sharing one cache per session, mirroring the engine model.
+   - `cellGridLogic.ts`: `SESSION_DELTA_CACHES` `WeakMap<CollabSession, DeltaSnapshotCache>` + `getSharedDeltaCache(session)` lazy accessor (auto-GCs with the session; safe shared mutable state — extension-host JS is single-threaded + `render()` reads the snapshot synchronously).
+   - `cellGridPanel.ts`: dropped the per-panel `_deltaCache` field; `acquireWorkbookSnapshot()` uses `getSharedDeltaCache(this.session)`.  All panels on a session ride the delta fast path; a panel opened later piggybacks on the already-seeded shared snapshot.
+   - Tests: reframed the separate-cache test (per-cache function correctness) + added a SHARED-cache test (sibling render takes a same-VV empty delta, no full rebuild).  1424 passing / 0 failing.  Engine UNCHANGED.
+
 ## Remaining V3.6.1 backlog (next cycles / sessions)
 
 - **OPUS-PT-B9** — `WorkbookSnapshotDeltaJson.removedCells` always empty at this engine version (V3.7+ feature).  The IDE merge already handles it forward-compat (fixture-tested).  Engine-side population is V3.7+.
 - **OPUS-PT-B8** — producer/replay asymmetry on `restoreSheet`/`deleteSheet` napi (out-of-range rejected producer-side, permissive on replay).  Doc-only design observation; no behavior change.
 - **CellValueJson type/runtime drift cleanup** — flagged in the V3.6 phase-termination recommended-next list.
-- **V-next (perf)** — hoist a shared per-session snapshot cache so multi-panel-same-session panels all get the delta fast path (today only the first panel per change does).
+- ~~**V-next (perf)** — shared per-session snapshot cache~~ ✅ SHIPPED V3.6.1.2 (2026-05-26).
 - **V3.6.2+ (perf)** — incremental DOM patching in the webview (postMessage cell-level updates) to also save the buildHtml + `webview.html` reassign cost.
 - **V3.6.0.9 D7** — `#REF!` substitution for cross-sheet refs to deleted sheets (conditional pending user signal; not blocking).
 
