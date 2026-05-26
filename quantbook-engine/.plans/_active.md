@@ -5,13 +5,21 @@ status: |
   (5.8 megaudit PASS-WITH-FINDINGS); Phase 6 DECISION-LOCKED (docs/phase6/decision-lock.md,
   Codex gpt-5.5 xhigh validated). Sequence = wedge-first, STAGED.
 
-  ✅ 6.1A SHIPPED 2026-05-26 (this session, docs-only): wrote docs/api/session-api.md —
-  the stable engine session contract (command surface, versioned DTOs, EngineError taxonomy,
-  operation-lifecycle + cancellation, sync/async + panic/validation boundary, event stream,
-  function-metadata + graph-invalidation contract, per-binding obligations, golden-flow matrix).
-  Grounded bottom-up in the proven napi CollabSession surface + WorkbookRuntime; verified
-  anchors (calcgraph_session.rs:69-71 owning-session anticipation; :149-164/:201-203 hardcoded
-  whitelists = the 6.4-0 gap; lib.rs:306-349 the [kind] error pattern).
+  ✅ 6.1A SHIPPED + CODEX-VALIDATED 2026-05-26 (this session, docs-only): wrote docs/api/session-api.md
+  (v2) — the stable engine session contract. Codex (gpt-5.5 xhigh) reviewed it, verdict REVISE
+  (5 HIGH/5 MED/2 LOW/1 INFO, all code-grounded), all verified at source + resolved in v2.
+  Key locks the review forced: single-writer OpLog MANDATORY → its Loro VV is the version token
+  (resolves the deferred-collab token gap); cancellation scoped honestly (in-engine recalc =
+  pre-start-cancel-only in v1 — recompute_* are synchronous commit-as-you-go loops + CalcgraphSession
+  isn't Clone; hard no-late-commit only for out-of-process UDF/SQL/AI; new Busy lifecycle state);
+  batch(ops,options)+opaque txn handle (no RAII borrow across FFI; BatchCommit replay is fail-loud
+  NOT rollback-atomic); reserved bulk cmds (write_range/publish_dataset/bind_range/refresh_source/
+  materialize_query) for 6.4/6.5; functions_used reverse index + registration invalidation; malformed
+  version token = fail-loud invalid_version_token (closes a real silent-resync fallback — No-Fallbacks);
+  error variant→code Appendix A. Review: docs/api/codex-6-1a-review.md. Verified anchors:
+  calcgraph_session.rs:69-71 (owning-session); :149-164/:201-203 (whitelists = 6.4-0 gap);
+  lib.rs:306-349 ([kind] error); recompute.rs:61/252 (synchronous recalc); replay.rs:889-895
+  (BatchCommit non-rollback); FormulaDeps has no functions_used.
 
   ⭐ NEXT = 6.1B: implement the owning WorkbookSession around WorkbookRuntime + OpLog +
   CalcgraphSession + PlanCache + FunctionRegistry. Bottom-up-extract the EngineSession trait
@@ -29,14 +37,14 @@ direction: |
   foundation; 6.4 (Python UDFs) is the strategic wedge; everything else (full bindings,
   service, SQL, AI) follows. Collab is v1.5-deferred and must NOT pre-empt Phase 6.
 
-current_engine_head: 5886ff32101 (doc-handoff fixes) — SOURCE unchanged at 7e536fc07b2 (S2-01); 6.1A adds docs/api/session-api.md (docs-only). pre-B#1 baseline 1465b1db4c4.
+current_engine_head: ff6cd4c147c (6.1A v2 Codex-validated) ← 85966ece7b4 (6.1A session-api.md) ← 5886ff32101 (doc-handoff fixes). SOURCE unchanged at 7e536fc07b2 (S2-01); all 6.1A work is docs-only. pre-B#1 baseline 1465b1db4c4.
 current_ide_head: d028568b53b (V3.6.1.2 shared delta cache) — unchanged
 audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait claims need positive compile proof; phase-level closures use 3-5-way megaudits; range-aware fn ships need lex+parse+bind+eval coverage.
 
 ## Locked Phase 6 sequence (decision-lock §2)
 
 1. ✅ **Decision lock** — docs/phase6/decision-lock.md.
-2. ✅ **6.1A — Session API contract** — docs/api/session-api.md (SHIPPED 2026-05-26).
+2. ✅ **6.1A — Session API contract** — docs/api/session-api.md v2 (SHIPPED + Codex-validated 2026-05-26).
 3. ⭐ **6.1B — Owning WorkbookSession** — single-engine owning session around WorkbookRuntime +
    OpLog + CalcgraphSession + PlanCache + FunctionRegistry (calcgraph_session.rs:69-71 anticipates
    it). Define the EngineSession trait + binding-neutral DTO module (schema_version). Implement
