@@ -1567,48 +1567,71 @@ impl CollabSession {
             // Idempotent: a second RemoveSheet for the same id leaves
             // the tombstone set + snapshot unchanged.
             //
-            // **V3.6.0.X audit-of-D3 closure (2026-05-23,
-            // CONVERGENT-MED-2 -- Codex Lane A LOW-4 / Opus Lane B
-            // MED-1)**: also drop `cell_op_index` entries for cells on
-            // the tombstoned sheet (mirrors `snapshot.retain`).  Pre-
-            // closure these ghost index entries persisted post-
-            // RemoveSheet -- bounded memory growth + a sync-invariant
-            // violation against the field's own "6-mutation-site
-            // discipline" docstring.  Functional correctness was
-            // preserved (the tombstone-aware early-return at the top
-            // of apply_cache_effect drops cell-keyed effects on
-            // tombstoned sheets before they reach the index push), but
-            // the index hygiene is improved by pruning.
+            // **V3.6.0.X phase-termination closure (2026-05-26,
+            // CONVERGENT-HIGH-1 -- Codex Lane A CODEX-PT-A1 / Opus
+            // Lane B OPUS-PT-B1)**: do NOT prune cells or cell_op_index
+            // on RemoveSheet.  The cache MUST mirror the V3.5.0.3b
+            // Workbook storage-preservation discipline so that D8
+            // RestoreSheet (V3.6.0.10) can resurface preserved cells
+            // through `workbookSnapshot` + `snapshot_cells`.  Pre-
+            // closure (V3.6.0.X audit-of-D3 CONVERGENT-MED-2) the
+            // walker pruned cells + index on tombstone for "index
+            // hygiene"; that ghost-entry concern is OBSOLETE post-D8
+            // because the entries are NOT ghosts -- they're real
+            // pointers to ops the rebuild path must respect to satisfy
+            // the documented "cells reappear on restore" contract at
+            // 6 sites (op.rs Op::RestoreSheet, lib.rs restore_sheet
+            // napi x2 blocks, types.ts restoreSheet, ide-consumer-
+            // contract.md § 4.1.z6 V3.6.0.10).
+            //
+            // Memory cost: linear in pre-tombstone cell count of all
+            // ever-removed sheets -- the SAME cost the V3.5.0.3b
+            // tombstone semantic already pays in Workbook column
+            // storage.  No new memory pressure beyond what Workbook
+            // already retains.
+            //
+            // Tombstone-visibility filter at `workbook_snapshot` line
+            // ~2226 (`if workbook.is_sheet_removed(sheet_id) { continue; }`)
+            // ensures cells on currently-tombstoned sheets do NOT
+            // surface to the IDE even though they remain in the cache.
+            // The napi delta builder (`workbook_snapshot_delta`) also
+            // filters changedCells against removed_sheet_ids
+            // explicitly (see lib.rs CODEX-PT-A1 closure) so a cell
+            // write + later RemoveSheet in the same delta window does
+            // not emit a changedCells entry for the tombstoned sheet.
+            //
+            // Effect on cell-keyed apply path during tombstone window:
+            // NEW cell writes are still gated at the top of this
+            // method (`buckets.tombstones.contains(&sheet)` early
+            // return); cache state remains at the pre-tombstone
+            // snapshot.  Post-restore (tombstones.remove), NEW writes
+            // resume normally + accumulate on top of the preserved
+            // pre-tombstone state.  Matches Workbook's column-store
+            // semantic precisely.
             CacheEffect::RemoveSheet { id } => {
                 buckets.tombstones.insert(id);
-                buckets.snapshot.retain(|(sheet, _, _), _| *sheet != id);
-                buckets.cell_op_index.retain(|(sheet, _, _), _| *sheet != id);
+                // Pre-V3.6.0.X-phase-termination closure (V3.6.0.X
+                // audit-of-D3 CONVERGENT-MED-2) pruned cells + index
+                // here.  Post-closure: preserved.  See the block
+                // comment above for the full rationale.
             }
-            // **V3.6.0.10 D8 (2026-05-25)**: un-tombstone the sheet at
+            // **V3.6.0.10 D8 (2026-05-25; refined V3.6.0.X phase-
+            // termination 2026-05-26)**: un-tombstone the sheet at
             // the cache layer.  Mirrors the Workbook::restore_sheet
             // call in apply_op (ql-oplog/src/replay.rs).  Cache cells
-            // for the previously-tombstoned sheet were dropped at
-            // CacheEffect::RemoveSheet apply -- they do NOT reappear
-            // here.  Subsequent cell-keyed effects on the un-
-            // tombstoned sheet are processed normally because the
-            // `tombstones.contains(&sheet)` early-return at the top of
-            // this method now returns false.  Idempotent: removing an
-            // already-absent id from HashSet is a no-op.
+            // for the previously-tombstoned sheet ARE preserved across
+            // the tombstone window (post-V3.6.0.X-phase-termination
+            // closure -- the `RemoveSheet` arm no longer prunes).
+            // Post-restore the gate at the top of this method
+            // (`tombstones.contains(&sheet)`) returns false; new
+            // cell writes proceed normally + stack atop the preserved
+            // pre-tombstone state.  The full set of pre-tombstone +
+            // post-restore cells then surfaces through
+            // `workbookSnapshot` + `snapshot_cells`, matching the
+            // 6-site contract docstrings + the V3.5.0.3b Workbook
+            // storage-preservation discipline.
             CacheEffect::RestoreSheet { id } => {
                 buckets.tombstones.remove(&id);
-                // NOTE: we do NOT walk `cell_op_index` to re-add
-                // entries for the restored sheet.  The index is
-                // rebuilt from scratch on full-rebuild paths
-                // (`rebuild_op_indices_only` + `rebuild_snapshot_cache`);
-                // ad-hoc restore here would require walking the full
-                // log to find pre-tombstone cell-keyed ops, which is
-                // expensive + duplicates rebuild logic.  The classify_
-                // delta_op allowlist forces a full rebuild on
-                // Op::RestoreSheet (see lib.rs); the napi
-                // workbook_snapshot reads from rebuild_workbook
-                // (which sees the un-tombstoned cells in storage).
-                // So the cache's missing pre-tombstone cell entries
-                // are not consumer-visible.
             }
             // V3.6.0.3 D2 (2026-05-24): session-wide format-table cache
             // mirror.  V3.6.0.X audit-of-D2 closure (2026-05-23,
@@ -1755,8 +1778,20 @@ impl CollabSession {
     /// this method returns the PutValue-sheet set, which matches
     /// the current cell-grid IDE consumer contract.
     pub fn list_sheets_from_cache(&self) -> Vec<u16> {
+        // **V3.6.0.X phase-termination closure (2026-05-26)**: filter
+        // against `removed_sheets` since the cache now PRESERVES cells
+        // on tombstoned sheets (mirrors V3.5.0.3b Workbook storage
+        // discipline; required by D8 RestoreSheet to resurface
+        // preserved cells).  Pre-closure the cache pruned at
+        // RemoveSheet so this enumerate-from-cache approach happened
+        // to hide tombstoned sheets via emptiness; post-closure we
+        // must filter explicitly.  Mirrors the `workbook_snapshot`
+        // `is_sheet_removed` filter at lib.rs ~2226.
         let mut sheets: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
         for (sheet, _row, _col) in self.last_snapshot.keys() {
+            if self.removed_sheets.contains(sheet) {
+                continue;
+            }
             sheets.insert(*sheet);
         }
         sheets.into_iter().collect()
@@ -5371,17 +5406,28 @@ mod tests {
 
         s.append_op(Op::RemoveSheet { id: 1 }).unwrap();
 
-        // Post-RemoveSheet: cell_op_index entries for sheet 1 are
-        // pruned (mirrors snapshot.retain in the RemoveSheet
-        // handler).
+        // **V3.6.0.X phase-termination closure (2026-05-26,
+        // CONVERGENT-HIGH-1)**: cell_op_index entries for tombstoned
+        // sheet 1 are NOW PRESERVED (not pruned).  Pre-V3.6.0.X-phase-
+        // termination (V3.6.0.X audit-of-D3 CONVERGENT-MED-2) the
+        // walker pruned them as "ghost hygiene"; that concern was
+        // OBSOLETED by V3.6.0.10 D8 RestoreSheet, which requires the
+        // cache to mirror Workbook's V3.5.0.3b storage-preservation
+        // discipline so that restored sheets resurface their pre-
+        // tombstone cells.
+        //
+        // The visibility invariant (cells on currently-tombstoned
+        // sheets MUST NOT surface to consumers) holds via the
+        // `workbookSnapshot` `is_sheet_removed` filter + the napi
+        // delta builder's `removed_sheet_ids` filter, NOT via
+        // walker-level pruning.
         let sheet_1_entries_post = s
             .cell_op_index_iter()
             .filter(|((sheet, _, _), _)| *sheet == 1)
             .count();
         assert_eq!(
-            sheet_1_entries_post,
-            0,
-            "post-V3.6.0.X audit-of-D3 closure: cell_op_index entries for tombstoned sheet 1 are pruned"
+            sheet_1_entries_post, 2,
+            "post-V3.6.0.X phase-termination closure: cell_op_index entries for tombstoned sheet 1 are PRESERVED (mirrors Workbook V3.5.0.3b storage-preservation; required by D8 RestoreSheet)"
         );
     }
 
@@ -6362,14 +6408,27 @@ mod tests {
     #[test]
     fn valid_add_remove_sheet_then_cell_op_silent_dropped() {
         // V3.5.0.X follow-up audit CLOSURE-CODEX-LOW-3: cover the
-        // VALID sequence (the prior three tests use out-of-range
-        // RemoveSheet which is the contrived scenario flagged by
-        // CLOSURE-CODEX-MED-1 -- known divergence).  This test uses
-        // the canonical sequence: AddSheet creates the sheet at id 0,
-        // RemoveSheet tombstones it, then a cell-keyed op on the
-        // tombstoned sheet is silent-dropped by both engine apply_op
-        // AND the cache walker.  Validates parity for the production
-        // path that V3.5.0.4a's deleteSheet napi exercises.
+        // VALID sequence.  Canonical: AddSheet creates the sheet at
+        // id 0, RemoveSheet tombstones it, then a cell-keyed op on
+        // the tombstoned sheet is silent-dropped by both engine
+        // apply_op AND the cache walker's tombstone-gate.  Validates
+        // the production path that V3.5.0.4a's deleteSheet napi
+        // exercises.
+        //
+        // **V3.6.0.X phase-termination closure (2026-05-26,
+        // CONVERGENT-HIGH-1)**: pre-closure this test asserted that
+        // pre-tombstone cache entries were ALSO dropped (`assert_eq!
+        // (snapshot_cells(0).len(), 0)` immediately after RemoveSheet).
+        // Post-closure: the cache PRESERVES pre-tombstone cells to
+        // mirror V3.5.0.3b Workbook storage discipline + satisfy D8
+        // RestoreSheet's "cells reappear" contract.  Visibility is
+        // handled by the `is_sheet_removed` filter at
+        // `workbook_snapshot` time + `list_sheets_from_cache`'s
+        // tombstone filter -- consumers do NOT see tombstoned-sheet
+        // cells until restore.  This test was REWRITTEN to assert
+        // the new invariants while preserving the "silent-drop of
+        // NEW cell writes during tombstone window" contract that the
+        // V3.5.0.X CLOSURE-CODEX-LOW-3 closure pinned.
         let mut s = CollabSession::new(PeerId::new(1)).unwrap();
         s.append_op(Op::AddSheet {
             name: "ToDelete".to_string(),
@@ -6378,13 +6437,25 @@ mod tests {
         // Pre-tombstone PutValue surfaces normally.
         s.append_op(put_value(0, 0, 0, 1.0)).unwrap();
         assert_eq!(s.snapshot_cells(0).len(), 1);
-        // RemoveSheet tombstones the sheet.  Existing cache entries
-        // for sheet 0 are DROPPED via apply_cache_effect's retain.
+        // RemoveSheet tombstones the sheet.  Pre-tombstone cells
+        // are PRESERVED in the cache (post-V3.6.0.X phase-
+        // termination closure); only the tombstone flag is set.
         s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
-        assert_eq!(s.snapshot_cells(0).len(), 0,
-            "post-RemoveSheet: existing entries dropped from cache");
-        assert!(!s.list_sheets_from_cache().contains(&0));
-        // Post-tombstone cell-keyed ops are silent-dropped.
+        assert_eq!(
+            s.snapshot_cells(0).len(),
+            1,
+            "post-V3.6.0.X phase-termination: pre-tombstone cells preserved in cache (mirrors V3.5.0.3b Workbook storage; required by D8 RestoreSheet)"
+        );
+        // Consumer-side visibility: list_sheets_from_cache still
+        // hides tombstoned sheets via its tombstone filter.
+        assert!(
+            !s.list_sheets_from_cache().contains(&0),
+            "list_sheets_from_cache hides tombstoned sheets"
+        );
+        // Post-tombstone cell-keyed ops are silent-dropped at the
+        // apply_cache_effect tombstone-gate (top of the method).
+        // Cache state remains at the pre-tombstone snapshot.
+        let pre_count = s.snapshot_cells(0).len();
         for op in [
             put_value(0, 1, 0, 2.0),
             put_formula(0, 2, 0, "=A1+B1"),
@@ -6393,9 +6464,15 @@ mod tests {
         ] {
             assert!(s.append_op(op).is_ok());
         }
-        assert_eq!(s.snapshot_cells(0).len(), 0,
-            "all 4 cell-keyed ops post-tombstone silent-dropped");
-        assert!(!s.list_sheets_from_cache().contains(&0));
+        assert_eq!(
+            s.snapshot_cells(0).len(),
+            pre_count,
+            "post-tombstone cell-keyed ops silent-dropped at the apply_cache_effect tombstone-gate; cache stays at the pre-tombstone snapshot"
+        );
+        assert!(
+            !s.list_sheets_from_cache().contains(&0),
+            "tombstoned sheet still hidden from list_sheets_from_cache"
+        );
     }
 
     #[test]
@@ -7971,5 +8048,163 @@ mod tests {
         assert!(!workbook_a.is_sheet_removed(0));
         assert!(!workbook_b.is_sheet_removed(0));
         assert_eq!(workbook_a.is_sheet_removed(0), workbook_b.is_sheet_removed(0));
+    }
+
+    // =====================================================
+    // Phase 5.7 V3.6.0.X phase-termination closure (2026-05-26)
+    // -- CONVERGENT-HIGH-1 (Codex-PT-A1 + Opus-PT-B1)
+    // =====================================================
+    //
+    // Pre-closure: PutValue → RemoveSheet → RestoreSheet → the cells
+    // resurrected in Workbook storage (V3.5.0.3b preservation +
+    // V3.6.0.10 D8 restore_sheet) but were ABSENT from
+    // `snapshot_cells` because `CacheEffect::RemoveSheet` pruned the
+    // session cache and `CacheEffect::RestoreSheet` did not rehydrate.
+    // The IDE-facing `workbookSnapshot` therefore returned restored
+    // sheets with empty `cells: []` even though the rebuilt Workbook
+    // held the data.
+    //
+    // Post-closure (this commit): the cache walker no longer prunes
+    // on RemoveSheet -- preserved cells stay in the cache through
+    // the tombstone window + reappear automatically after restore.
+    // The walker's tombstone-gate at the top of `apply_cache_effect`
+    // continues to drop NEW cell writes during the tombstone window;
+    // `workbookSnapshot`'s `is_sheet_removed` filter continues to
+    // suppress tombstoned-sheet cells from the snapshot reply.
+    //
+    // Tests below verify all three legs of the contract that the
+    // 6-site documentation promises (op.rs Op::RestoreSheet, napi
+    // restore_sheet x2 docstrings, IDE types.ts restoreSheet,
+    // ide-consumer-contract.md § 4.1.z6 V3.6.0.10).
+
+    #[test]
+    fn v3_6_0_x_phase_termination_codex_pt_a1_restore_sheet_resurfaces_preserved_cells_in_snapshot_cache() {
+        // The flagship regression: matches the audit's Probe 1.
+        // Pre-closure: snapshot_cells(0) returned [] post-restore.
+        // Post-closure: it returns the preserved cell.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        s.append_op(put_value(0, 0, 0, 42.0)).unwrap();
+        s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
+        s.append_op(Op::RestoreSheet { id: 0 }).unwrap();
+
+        // Cells side: cache has the preserved cell.
+        let cells = s.snapshot_cells(0);
+        assert_eq!(
+            cells.len(),
+            1,
+            "post-V3.6.0.X-phase-termination: PutValue → RemoveSheet → RestoreSheet must resurface the preserved cell in snapshot_cells"
+        );
+        assert_eq!(cells[0].0, (0, 0));
+        // Sanity: the Workbook side also has the cell (V3.5.0.3b
+        // tombstone preserves storage; D8 RestoreSheet un-tombstones).
+        let registry = ql_functions::default_registry();
+        let (workbook, _) = s.rebuild_workbook(&registry).unwrap();
+        assert!(!workbook.is_sheet_removed(0));
+        assert!(
+            matches!(workbook.sheet(0).unwrap().read(0, 0), ql_types::Value::Number(_)),
+            "Workbook side resurrects the cell (V3.5.0.3b storage preservation)"
+        );
+    }
+
+    #[test]
+    fn v3_6_0_x_phase_termination_rebuild_snapshot_cache_after_remove_then_restore_includes_cells() {
+        // Verifies that the rebuild path (called by from_snapshot +
+        // merge_bytes + discard_pending_ops + invalidate_cell etc.)
+        // produces the correct cache state across the
+        // RemoveSheet→RestoreSheet sequence.  Matches Opus Probe 5
+        // (rebuild path; reborn session).
+        let mut origin = CollabSession::new(PeerId::new(1)).unwrap();
+        origin
+            .append_op(Op::AddSheet {
+                name: "S".to_owned(),
+                chunk_rows: 16384,
+            })
+            .unwrap();
+        origin.append_op(put_value(0, 0, 0, 7.0)).unwrap();
+        origin.append_op(Op::RemoveSheet { id: 0 }).unwrap();
+        origin.append_op(Op::RestoreSheet { id: 0 }).unwrap();
+        let bytes = origin.export_bytes().unwrap();
+
+        // Reborn session triggers from_snapshot → rebuild_snapshot_cache.
+        let reborn = CollabSession::from_snapshot(PeerId::new(2), &bytes).unwrap();
+        assert_eq!(
+            reborn.snapshot_cells(0).len(),
+            1,
+            "rebuild path must walk Op::RestoreSheet and preserve the pre-tombstone cell in the rebuilt cache"
+        );
+    }
+
+    #[test]
+    fn v3_6_0_x_phase_termination_tombstoned_sheet_cells_remain_hidden_until_restore() {
+        // Visibility invariant: cells on a CURRENTLY tombstoned sheet
+        // are preserved in the cache (per the V3.6.0.X phase-
+        // termination closure) but MUST NOT be visible to consumers
+        // until restore.  The `is_sheet_removed` filter in
+        // `workbook_snapshot` (lib.rs ~2226) handles this; the cache
+        // walker's tombstone-gate at the top of `apply_cache_effect`
+        // continues to drop NEW cell writes during the window.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        s.append_op(put_value(0, 0, 0, 99.0)).unwrap();
+        s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
+
+        // Cache: cell PRESERVED (mirrors Workbook V3.5.0.3b discipline).
+        assert_eq!(s.snapshot_cells(0).len(), 1, "tombstoned-sheet cells preserved in cache");
+        // Workbook: sheet IS tombstoned.
+        let registry = ql_functions::default_registry();
+        let (workbook, _) = s.rebuild_workbook(&registry).unwrap();
+        assert!(
+            workbook.is_sheet_removed(0),
+            "Workbook tombstone flag still set; consumer-side `workbookSnapshot` `is_sheet_removed` filter handles visibility"
+        );
+        // NEW cell writes during tombstone window are still gated.
+        s.append_op(put_value(0, 1, 1, 999.0)).unwrap();
+        let cells_during_tombstone = s.snapshot_cells(0);
+        assert_eq!(
+            cells_during_tombstone.len(),
+            1,
+            "NEW cell writes during tombstone window are silently dropped at apply_cache_effect's tombstone gate; cache still has only the pre-tombstone cell"
+        );
+        assert_eq!(
+            cells_during_tombstone[0].0,
+            (0, 0),
+            "the preserved cell is the pre-tombstone (0,0)=99, not the dropped (1,1)=999"
+        );
+    }
+
+    #[test]
+    fn v3_6_0_x_phase_termination_post_restore_writes_stack_atop_preserved_cells() {
+        // After RestoreSheet, NEW cell writes stack atop the
+        // preserved pre-tombstone cells.  Mirrors Workbook column
+        // store semantic exactly.
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(Op::AddSheet {
+            name: "S".to_owned(),
+            chunk_rows: 16384,
+        })
+        .unwrap();
+        s.append_op(put_value(0, 0, 0, 11.0)).unwrap();
+        s.append_op(Op::RemoveSheet { id: 0 }).unwrap();
+        s.append_op(Op::RestoreSheet { id: 0 }).unwrap();
+        s.append_op(put_value(0, 5, 5, 22.0)).unwrap();
+
+        let cells = s.snapshot_cells(0);
+        assert_eq!(
+            cells.len(),
+            2,
+            "post-restore writes stack atop preserved pre-tombstone cells"
+        );
+        // Sorted (row, col) per snapshot_cells docstring contract.
+        assert_eq!(cells[0].0, (0, 0));
+        assert_eq!(cells[1].0, (5, 5));
     }
 }

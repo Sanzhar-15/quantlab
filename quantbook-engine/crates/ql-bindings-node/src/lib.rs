@@ -2644,12 +2644,16 @@ impl CollabSession {
         }
 
         // Step 8: cell-only fast-path.  Clone the cached Workbook via
-        // `Arc::make_mut` (forks on write; if the IDE is holding
-        // another Arc clone, this returns a fresh clone, otherwise
-        // mutates in place -- both safe).  Apply [cached_op_count,
-        // current_op_count) forward via apply_ops_in_range -- no
-        // repair walks needed because we confirmed no rename ops in
-        // the range.
+        // `(*cached_arc).clone()` always-clone (V3.6.0.8.4 OPUS-MED-3 +
+        // V3.6.0.X phase-termination OPUS-PT-B2-MED closures: V3.6.0.8.1
+        // lock said `Arc::make_mut` but implementation discovered
+        // `cached_arc = Arc::clone(arc)` capture has strong_count >= 2
+        // by construction so `make_mut` would clone anyway; always-clone
+        // IS the right pattern.  V3.6.0.8.4 R-V3.6-17 measurement:
+        // 692 μs at 100k cells, well under the 20 ms threshold).
+        // Apply [cached_op_count, current_op_count) forward via
+        // apply_ops_in_range -- no repair walks needed because we
+        // confirmed no rename ops in the range.
         let registry = default_registry();
         let mut next_workbook = (*cached_arc).clone();
         if let Err(e) = ql_oplog::apply_ops_in_range(
@@ -2679,9 +2683,27 @@ impl CollabSession {
             ql_storage::FormatId,
             ql_functions::format::FormatString,
         > = std::collections::HashMap::new();
+        // **V3.6.0.X phase-termination closure (2026-05-26, CONVERGENT-
+        // HIGH-1)**: the session cache no longer prunes cells on
+        // RemoveSheet (cache mirrors V3.5.0.3b Workbook storage-
+        // preservation discipline -- required for D8 RestoreSheet to
+        // resurface preserved cells via the napi snapshot path).
+        // Pre-closure the cache prune incidentally suppressed
+        // changedCells for a cell-write + later RemoveSheet in the
+        // same delta window; post-closure we must filter explicitly
+        // against `removed_sheet_ids` so the IDE doesn't see a
+        // changedCells entry for a sheet it just learned was removed.
+        // Build the lookup set once (Vec→HashSet) for O(1) per-cell
+        // check.
+        let removed_sheet_set: std::collections::HashSet<u16> =
+            removed_sheet_ids.iter().copied().collect();
         let mut changed_cells: Vec<ChangedCellJson> =
             Vec::with_capacity(changed_cell_coords.len());
         for (sheet, row, col) in changed_cell_coords {
+            // V3.6.0.X phase-termination filter (see comment above).
+            if removed_sheet_set.contains(&sheet) {
+                continue;
+            }
             // **V3.6.0.8.4 CODEX-HIGH-3 closure (2026-05-25)**: O(1)
             // direct lookup via `snapshot_cell` instead of the pre-
             // closure `snapshot_cells(sheet).into_iter().find(...)`
