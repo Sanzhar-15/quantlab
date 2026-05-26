@@ -6939,6 +6939,101 @@ suite('quantbook V3.6.0.10 D8 -- restoreSheet napi contract', function () {
 		assert.strictEqual(snap.sheets[0].name, 'S');
 	});
 
+	test('restoreSheet resurfaces preserved pre-tombstone cells (V3.6.0.X phase-termination CONVERGENT-HIGH-1 closure)', () => {
+		// Closes OPUS-PT-B5-MED + CODEX-PT-A1-HIGH at the IDE layer.
+		// Pre-closure: workbookSnapshot returned restored sheet with
+		// cells: [] because CacheEffect::RemoveSheet pruned the cache
+		// + CacheEffect::RestoreSheet did NOT rehydrate.
+		// Post-closure: cache mirrors V3.5.0.3b Workbook storage-
+		// preservation discipline; cells reappear through napi
+		// workbookSnapshot.
+		//
+		// Note on value-field shape: the napi runtime emits
+		// CellValueJson with a `number: number` field (per
+		// crates/ql-bindings-node/src/lib.rs CellValueJson struct);
+		// the TS interface in `types.ts` currently declares the union
+		// variant as `{ kind: 'number'; value: number }`. This is a
+		// pre-existing type/runtime drift not in scope for this
+		// closure (filed as a V3.6.1+ followup); assertions below use
+		// `unknown` cast to read the runtime field.
+		const session = createSession(1n);
+		addSheet(session, 'S');
+		appendPutValueValidated(session, 0, 0, 0, 42);
+		appendPutValueValidated(session, 0, 1, 0, 99);
+		// Pre-RemoveSheet: 2 cells visible.
+		assert.strictEqual(
+			workbookSnapshot(session).sheets[0].cells.length,
+			2,
+			'pre-tombstone sheet has 2 cells',
+		);
+		deleteSheet(session, 0);
+		// Tombstoned: sheet filtered out by is_sheet_removed.
+		assert.strictEqual(workbookSnapshot(session).sheets.length, 0);
+		restoreSheet(session, 0);
+		// Post-restore: preserved cells reappear in workbookSnapshot.
+		const snap = workbookSnapshot(session);
+		assert.strictEqual(snap.sheets.length, 1);
+		assert.strictEqual(
+			snap.sheets[0].cells.length,
+			2,
+			'post-V3.6.0.X-phase-termination: pre-tombstone cells reappear via workbookSnapshot (contract-vs-implementation drift closed)',
+		);
+		// Verify the cells are the same ones we wrote (value preserved).
+		const cellByCoord = (row: number, col: number) =>
+			snap.sheets[0].cells.find((c) => c.row === row && c.col === col);
+		const cell00 = cellByCoord(0, 0);
+		const cell10 = cellByCoord(1, 0);
+		assert.ok(cell00, 'cell (0,0) preserved across remove+restore');
+		assert.ok(cell10, 'cell (1,0) preserved across remove+restore');
+		assert.strictEqual(cell00?.value?.kind, 'number');
+		assert.strictEqual(cell10?.value?.kind, 'number');
+		assert.strictEqual(
+			(cell00?.value as unknown as { number: number })?.number,
+			42,
+			'preserved cell (0,0) value matches pre-tombstone (42)',
+		);
+		assert.strictEqual(
+			(cell10?.value as unknown as { number: number })?.number,
+			99,
+			'preserved cell (1,0) value matches pre-tombstone (99)',
+		);
+	});
+
+	test('restoreSheet + new write: preserved cells AND new writes coexist (post-V3.6.0.X-phase-termination)', () => {
+		// Verifies that post-restore, NEW cell writes stack atop the
+		// preserved pre-tombstone cells (mirrors Workbook column-
+		// store semantic).
+		const session = createSession(2n);
+		addSheet(session, 'S');
+		appendPutValueValidated(session, 0, 0, 0, 11);
+		deleteSheet(session, 0);
+		restoreSheet(session, 0);
+		appendPutValueValidated(session, 0, 5, 5, 22);
+		const snap = workbookSnapshot(session);
+		assert.strictEqual(snap.sheets.length, 1);
+		assert.strictEqual(
+			snap.sheets[0].cells.length,
+			2,
+			'preserved pre-tombstone cell + post-restore write both visible',
+		);
+		const findCell = (row: number, col: number) =>
+			snap.sheets[0].cells.find((c) => c.row === row && c.col === col);
+		const cell00 = findCell(0, 0);
+		const cell55 = findCell(5, 5);
+		assert.ok(cell00, 'preserved pre-tombstone cell (0,0) visible');
+		assert.ok(cell55, 'post-restore cell (5,5) visible');
+		assert.strictEqual(
+			(cell00?.value as unknown as { number: number })?.number,
+			11,
+			'preserved pre-tombstone cell value (11)',
+		);
+		assert.strictEqual(
+			(cell55?.value as unknown as { number: number })?.number,
+			22,
+			'post-restore cell value (22)',
+		);
+	});
+
 	test('restoreSheet is idempotent (already-restored is no-op)', () => {
 		const session = createSession(1n);
 		addSheet(session, 'S');
