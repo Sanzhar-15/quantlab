@@ -2317,8 +2317,10 @@ dependencies = [
  "ql-io",
  "ql-oplog",
  "ql-profile",
+ "ql-session",
  "ql-storage",
  "ql-types",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
 ]

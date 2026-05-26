@@ -10,10 +10,17 @@ use ql_types::{ColId, RowId, SheetId};
 use serde::{Deserialize, Serialize};
 
 /// Opaque session/version token (contract §4.0). In v1 this is an engine-owned
-/// `{session_epoch, op_count}` encoded as bytes — the single-writer
-/// `ql-oplog::OpLog` has NO version vector (the Loro `VersionVector` is the v1.5
-/// `CollabSession` token). Callers round-trip it verbatim and MUST NOT interpret
-/// the bytes; the engine is the sole producer/validator.
+/// `{session_epoch, op_count}` encoded as bytes. `op_count` is `OpLog::len()`
+/// (the simplest monotonic single-writer counter); `session_epoch` is minted at
+/// new/open/import and re-minted on cache-clear/undo — which is what keeps
+/// tokens sound, because `OpLog::len()` is NOT monotonic under undo-retraction
+/// (it reads the live Loro list). (`ql-oplog::OpLog` *does* expose a Loro
+/// `VersionVector` via `oplog_vv()` — an earlier doc claim that it had none was
+/// wrong — but that VV is reserved for the v1.5 `CollabSession` delta-sync path,
+/// not the single-writer token; `{epoch, op_count}` is chosen deliberately
+/// because index-walking ops for a semantic delta is simpler than decoding a VV
+/// delta blob.) Callers round-trip the bytes verbatim and MUST NOT interpret
+/// them; the engine is the sole producer/validator.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionVersion(pub Vec<u8>);
 

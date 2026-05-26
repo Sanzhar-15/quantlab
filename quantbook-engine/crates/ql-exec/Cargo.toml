@@ -24,6 +24,15 @@ ql-io             = { path = "../ql-io" }
 # WorkbookTransaction. CellWireValue conversion happens via ql-io (already
 # present); Op + OpLog types come from ql-oplog.
 ql-oplog          = { path = "../ql-oplog" }
+# Phase 6.1B inc.2 (2026-05-26): the binding-neutral EngineSession contract
+# (trait + DTOs + EngineError). ql-session depends only on ql-types, so
+# ql-exec -> ql-session is acyclic. WorkbookSession (src/session.rs) implements
+# the contract here, where Workbook + OpLog + CalcgraphSession + PlanCache +
+# FunctionRegistry are already composed (GAP-PS-09 / session-api.md §2.1).
+ql-session        = { path = "../ql-session" }
+# serde_json::Value appears in two EngineSession signatures (publish_dataset /
+# materialize_query opaque payloads). Workspace dep, already linked transitively.
+serde_json        = { workspace = true }
 arrow-array       = { workspace = true }
 multiversion      = { workspace = true }
 thiserror         = { workspace = true }

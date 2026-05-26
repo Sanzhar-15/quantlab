@@ -115,6 +115,7 @@ pub mod lower;
 pub mod plan;
 pub mod plan_cache;
 pub mod scalar;
+pub mod session;
 pub mod simd;
 pub mod transaction;
 pub mod workbook_runtime;
@@ -148,6 +149,7 @@ pub use simd::{
     sub_array,
     sub_scalar,
 };
+pub use session::WorkbookSession;
 pub use transaction::WorkbookTransaction;
 pub use workbook_runtime::{RecomputeFailure, RecomputeResult, RuntimeError, WorkbookRuntime};
 
