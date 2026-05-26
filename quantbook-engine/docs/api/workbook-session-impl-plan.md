@@ -1,9 +1,9 @@
 # 6.1B Increment 2 — `WorkbookSession` Implementation Plan
 
-**Status:** ⏳ IN PROGRESS — **sub-increment 2b (the core path) SHIPPED 2026-05-26** (`7335a5a1bfa`,
-preceded by the PlanCache refactor `83b1b33bac2`). The owning `WorkbookSession` exists in
-`crates/ql-exec/src/session.rs` and `impl EngineSession`; 8 session tests + 644 ql-exec lib tests green,
-clippy clean.
+**Status:** ⏳ IN PROGRESS — **2b (core path) + 2c-1 (read-path completion) SHIPPED 2026-05-26**
+(`83b1b33bac2` PlanCache → `7335a5a1bfa` WorkbookSession core → `993492b6f9b` validate_formula +
+query_range + `CellValue::Blank`). The owning `WorkbookSession` exists in `crates/ql-exec/src/session.rs`
+and `impl EngineSession`; 11 session tests + 647 ql-exec lib tests green, clippy clean.
 
 ### What 2b shipped (REAL)
 - **2a — PlanCache session-ownership** (§3): `WorkbookRuntime::with_session_state(.., PlanCache)` +
@@ -20,13 +20,13 @@ clippy clean.
   `cancel`/`operation_status`/`poll_events`.
 
 ### NEXT sub-increments (surfaced-not-yet today as `Capability/not_implemented_in_v1_core`)
-1. **`validate_formula`** — `&self`, so it can't build a `&mut` runtime; implement the read-only
-   lex→parse→bind directly against `&self.workbook` (all the bind fns take `&Workbook`). Cheap.
-2. **`query_range`** — ⚠️ **needs a contract decision first**: a columnar `RangeResult`
-   (`Vec<CellValue>` per column) must represent **empty** cells, but `CellValue` has **no Blank
-   variant**. Decide: add `CellValue::Blank` (cleanest; mirrors `ql_types::Value::Blank`; also lets
-   `snapshot` carry explicit blanks) vs make `RangeColumn.values: Vec<Option<CellValue>>`. This is a
-   deliberate DTO change to the Codex-validated contract — make it consciously, then implement.
+1. ✅ **`validate_formula`** (SHIPPED inc.2c-1, `993492b6f9b`) — read-only lex→parse→bind against
+   `&self.workbook`; failure → one error `Diagnostic`, clean bind → empty vec. Eval skipped.
+2. ✅ **`query_range`** (SHIPPED inc.2c-1) — **DECISION TAKEN: added `CellValue::Blank`** (mirrors
+   `ql_types::Value::Blank`; uniform fixed-size columnar; backward-compatible additive variant) rather
+   than `Vec<Option<CellValue>>`. Columnar dense read; empties → `CellValue::Blank`; inverted range →
+   `BadArgument`; >1M-cell request → `BadArgument` (fail-loud OOM guard). `include_*` options reserved
+   (v1 `RangeColumn` is values-only). Snapshot still omits blanks (`CellSnapshot.value: None`).
 3. **`snapshot_delta`** (step 6) — the op-walk + §4.3 rules (epoch_mismatch / invalid_version_token).
 4. **`delete_sheet`/`restore_sheet`/`move_sheet`** (MED-3) — NOT on `WorkbookRuntime`; need a fail-loud
    wrapper (validate first → `NotFound`/`BadArgument`) + **manual `Op::{RemoveSheet,RestoreSheet,

@@ -272,8 +272,10 @@ never silent coercion (generalizes `.qbook snapshot_format_version` + the op wir
 
 ### 4.2 Core DTOs (extracted from the proven `#[napi(object)]` structs; `+` = added/clarified)
 - **`CellValue`** (← `CellValueJson`, `lib.rs:580`): a **discriminated union** on `kind`
-  (`number`/`boolean`/`text`/`error`/`pending`), exactly one payload. Bindings narrow on `kind`. *(TS
-  mirror retype scoped: closures.md §5 item 2.)*
+  (`number`/`boolean`/`text`/`error`/`blank`/`pending`), exactly one payload. Bindings narrow on `kind`.
+  `blank` (added 6.1B inc.2c) maps from `ql_types::Value::Blank` — needed so a columnar `query_range`
+  read can represent empty cells in a fixed-size column; snapshots still omit blanks
+  (`CellSnapshot.value: None`). *(TS mirror retype scoped: closures.md §5 item 2 — must add `blank`.)*
 - **`CellAddress`** `{sheet,row,col}`, **`Range`** `{sheet,start_row,start_col,end_row,end_col}`.
 - **`FormatId`** (← `FormatIdJson`): `builtin(u32)` | `custom(peer,counter)`. **`FormatDef`** `{id,string}`.
 - **`CellSnapshot`** (← `CellSnapshotJson`): `{row,col,value?,formula?,format?,rendered?}`.
