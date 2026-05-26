@@ -255,6 +255,13 @@ v1 token source. **Resolution (locked):**
     `CollabSession` delta-sync path; its adapter maps the VV into this same opaque-token slot.
   - Bindings round-trip the bytes verbatim and MUST NOT interpret them; the engine is the sole
     producer/validator.
+- **⚠️ `op_count` does NOT advance on recompute (6.1B inc.2c grounding — load-bearing for delta
+  design):** `recompute_dirty`/`recompute_all` write recomputed dependent values via
+  `Workbook::put_computed_at` and append **no** ops, so the token is unchanged across a recalc even
+  though cell values changed. This is fine for `snapshot()` (it returns full current state regardless),
+  but it means `snapshot_delta` **cannot** be a pure op-walk — see §4.3 and the deferred-implementation
+  note (`WorkbookSession::snapshot_delta`): a correct delta needs a session-maintained change-log that
+  also records recompute-affected cells (or a `&mut`-cached last-snapshot diff).
 - **Validity rules (locked):**
   - A token is valid only within the **same live session + epoch**. Single-writer sessions advance
     `op_count` purely by local appends; undo/redo bumps the epoch (so the non-monotonic `len()` after a
@@ -331,7 +338,13 @@ explicitly (Appendix A); an unmapped variant is an `Internal` bug to fix, not a 
 ### 5.4 Variant→code mapping is mandatory (MED-1)
 Bindings MUST NOT infer codes from classes. **Appendix A** maps every current public error variant
 (`RuntimeError`, `RecomputeFailure`, `ReplayError`, `OpLogError`, `PersistenceError`, `TransportError`,
-`CollabSessionError`) to `{class, code, retryable}`. 6.1B fills it exhaustively from the real enums.
+`CollabSessionError`) to `{class, code, retryable}`. **Implementation note (6.1B inc.2):** this mapping
+is a set of **free conversion functions** in the owning layer (`ql-exec::session::map_runtime_err` /
+`map_oplog_err`), **NOT** `impl From<…> for EngineError` — Rust orphan rules forbid `impl From<Local>
+for Foreign` when the foreign type (`EngineError`, from `ql-session`) is `Self`. The `RuntimeError` match
+is in-crate + **exhaustive (no wildcard)**, so a newly-added variant is a *compile* error — stronger
+than a runtime catch-all. (`RuntimeError` + `OpLogError` are mapped as of inc.2; `ReplayError` /
+`PersistenceError` land with snapshot_delta-replay / persistence in a later increment.)
 
 ### 5.5 Formula errors: value vs error
 A formula that *evaluates to* an error (`#REF!`, `#DIV/0!`) is a **`CellValue{kind:"error"}`**, not an

@@ -50,7 +50,10 @@ status: |
   ✅ 6.1B inc.2c-2 SHIPPED 2026-05-26 (`2b5e7a13f5b`) — structure + table ops: delete/restore/move_sheet
   (fail-loud MED-3: unknown id → NotFound, OOR move index → BadArgument; manual `Op::{RemoveSheet,
   RestoreSheet,MoveSheet}` emission, append-before-mutate) + create/rename/rename_column/resize/drop_table
-  (WorkbookRuntime delegations). 14 session tests + 650 ql-exec lib green; clippy clean.
+  (WorkbookRuntime delegations). ✅ AUDIT-FIX 2026-05-26 (`9f7a1645dbd`, from the "optimal/complete"
+  review): tombstone-read consistency — `require_live_sheet` gates cell/query_range/validate_formula +
+  cell edits so a deleted sheet is uniformly NotFound (snapshot/list_sheets already hid it); +documented
+  ops/events unbounded growth. 17 session tests + 653 ql-exec lib green; clippy clean.
 
   ⭐ NEXT = 6.1B inc.2c-3 (continue the impl) — **follow `docs/api/workbook-session-impl-plan.md` §0**.
   Remaining, surfaced today as `Capability/not_implemented_in_v1_core` (honest, No-Fallbacks):
@@ -76,7 +79,7 @@ direction: |
   foundation; 6.4 (Python UDFs) is the strategic wedge; everything else (full bindings,
   service, SQL, AI) follows. Collab is v1.5-deferred and must NOT pre-empt Phase 6.
 
-current_engine_head: 2b5e7a13f5b (6.1B inc.2c-2 — structure + table ops; LAST CODE COMMIT) ← 993492b6f9b (6.1B inc.2c-1 — validate_formula + query_range + CellValue::Blank) ← 7335a5a1bfa (6.1B inc.2b — WorkbookSession core path) ← 83b1b33bac2 (6.1B inc.2a — session-owned PlanCache ctor; first PRE-EXISTING-code change since S2-01, additive) ← 884b7e365e8 (6.1B inc.2 impl-plan doc) ← 38108a5c8ef (6.1B inc.1b — trait w/ table ops) ← af15dcf3a5d (race-fix) ← 20d11072a0a (6.1B inc.1 — ql-session crate) ← ff6cd4c147c (6.1A v2). PRE-EXISTING-code changes since baseline: B#1 + S2-01 + inc.2a (additive PlanCache ctor). inc.2b/2c-1/2c-2 add NEW ql-exec/src/session.rs + ql-session dep + CellValue::Blank variant (no pre-existing-code behavior change). After current_engine_head, doc-sync commits advance HEAD further. pre-B#1 baseline 1465b1db4c4.
+current_engine_head: 9f7a1645dbd (6.1B inc.2c-2 audit-fix — tombstone-read consistency; LAST CODE COMMIT) ← 2b5e7a13f5b (6.1B inc.2c-2 — structure + table ops) ← 993492b6f9b (6.1B inc.2c-1 — validate_formula + query_range + CellValue::Blank) ← 7335a5a1bfa (6.1B inc.2b — WorkbookSession core path) ← 83b1b33bac2 (6.1B inc.2a — session-owned PlanCache ctor; first PRE-EXISTING-code change since S2-01, additive) ← 884b7e365e8 (6.1B inc.2 impl-plan doc) ← 38108a5c8ef (6.1B inc.1b — trait w/ table ops) ← af15dcf3a5d (race-fix) ← 20d11072a0a (6.1B inc.1 — ql-session crate) ← ff6cd4c147c (6.1A v2). PRE-EXISTING-code changes since baseline: B#1 + S2-01 + inc.2a (additive PlanCache ctor). inc.2b/2c-1/2c-2 add NEW ql-exec/src/session.rs + ql-session dep + CellValue::Blank variant (no pre-existing-code behavior change). After current_engine_head, doc-sync commits advance HEAD further. pre-B#1 baseline 1465b1db4c4.
 current_ide_head: d028568b53b (V3.6.1.2 shared delta cache) — unchanged
 audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait claims need positive compile proof; phase-level closures use 3-5-way megaudits; range-aware fn ships need lex+parse+bind+eval coverage.
 

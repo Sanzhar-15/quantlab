@@ -1,12 +1,36 @@
 # 6.1B Increment 2 — `WorkbookSession` Implementation Plan
 
-**Status:** ⏳ IN PROGRESS — **2b (core) + 2c-1 (read path) + 2c-2 (structure + table ops) SHIPPED
-2026-05-26** (`83b1b33bac2` PlanCache → `7335a5a1bfa` core → `993492b6f9b` validate_formula/query_range/
-`CellValue::Blank` → `2b5e7a13f5b` delete/restore/move sheet + tables). The owning `WorkbookSession`
-exists in `crates/ql-exec/src/session.rs` and `impl EngineSession`; 14 session tests + 650 ql-exec lib
-tests green, clippy clean. **Remaining (NEXT, surfaced `not_implemented_in_v1_core`): snapshot_delta
-(needs the §3 design decision) → batch/txn → undo/redo → persistence → functions → reserved bulk →
-Node smoke migration → 6.1C audit.**
+**Status:** ⏳ IN PROGRESS — **2b (core) + 2c-1 (read path) + 2c-2 (structure + table ops) + audit-fix
+SHIPPED 2026-05-26** (`83b1b33bac2` PlanCache → `7335a5a1bfa` core → `993492b6f9b` validate_formula/
+query_range/`CellValue::Blank` → `2b5e7a13f5b` delete/restore/move sheet + tables → `9f7a1645dbd`
+tombstone-read consistency audit fix). The owning `WorkbookSession` lives in
+`crates/ql-exec/src/session.rs` and `impl EngineSession`; **17 session tests + 653 ql-exec lib tests
+green, clippy clean.**
+
+### Method status — what the next window inherits (REAL vs surfaced-not-yet)
+**REAL (implemented + tested):** `lifecycle_state`, `close`; `set_value`, `set_formula`, `clear`,
+`set_format`, `register_format`, `validate_formula`; `add_sheet`, `rename_sheet`, `delete_sheet`,
+`restore_sheet`, `move_sheet`, `set_name`; `create_table`/`rename_table`/`rename_column`/`resize_table`/
+`drop_table`; `recalc_dirty`, `recalc_all`, `mark_volatiles_dirty`; `query_range`, `snapshot`, `cell`,
+`list_sheets`; `cancel`, `operation_status`, `poll_events`. (Construction: `new`/`from_workbook`.)
+**DEFERRED — return `EngineError{class:Capability, code:"not_implemented_in_v1_core"}` (honest, never a
+fallback):** `open`/`import`/`save`/`export` (persistence); `snapshot_delta` (⚠️ design decision, §0 item
+3); `batch`/`begin_transaction`/`txn_add`/`commit_transaction`/`rollback_transaction`; `undo`/`redo`
+(`can_undo`/`can_redo` return `false`); `register_function`/`unregister_function`/`list_functions` (6.4);
+`write_range`/`publish_dataset`/`bind_range`/`refresh_source`/`materialize_query` (6.4/6.5).
+
+### Known v1 limitations (documented, not bugs — revisit when relevant)
+- **`snapshot_delta` design decision (BLOCKS that method — see §0 item 3 + the in-code note).**
+- A tombstoned sheet is uniformly `NotFound` for reads + cell edits (`require_live_sheet`); restore
+  brings it (and its preserved cells) back. delete/restore/move use `require_sheet_exists`
+  (tombstone-agnostic) for idempotency.
+- `ops` HashMap + `events` Vec grow **unbounded** (no retention horizon yet).
+- `delete_sheet` does **not** proactively dirty cross-sheet dependents (matches the engine's current
+  cross-sheet-ref handling); a zero-dim `create_table` → `Conflict` (not `BadArgument`).
+- `recalc` does not advance the version token (recompute appends no ops) — see session-api.md §4.0.
+
+**Remaining sequence (NEXT):** snapshot_delta (decide first) → batch/txn → undo/redo → persistence →
+functions → reserved bulk → Node smoke migration → 6.1C audit.
 
 ### What 2b shipped (REAL)
 - **2a — PlanCache session-ownership** (§3): `WorkbookRuntime::with_session_state(.., PlanCache)` +
