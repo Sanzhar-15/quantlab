@@ -6980,3 +6980,115 @@ suite('quantbook V3.6.0.10 D8 -- restoreSheet in workbookSnapshotDelta triggers 
 	});
 });
 
+// =====================================================================
+// Phase 5.7 V3.6.0.11 D9 (2026-05-26) -- typing_stroke watchdog reset
+// =====================================================================
+//
+// Tests the dispatcher-level `onTypingStroke` callback firing behavior +
+// the typing_stroke envelope arm.  Closes R-V3.5-7 "long formula entry
+// hits 30s" false-negative case per V3.6.0.1 D9 design lock.  Panel-
+// level watchdog re-arm (resetTypingWatchdog method on CellGridPanel) is
+// behavior-tested separately; this suite covers the dispatcher contract.
+
+suite('quantbook V3.6.0.11 D9 -- dispatcher fires onTypingStroke (typing-stroke watchdog reset contract)', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	function makeDeps(session: CollabSessionInstance, sheet: number) {
+		const strokeCount = { n: 0 };
+		const errorReplies: ErrorReplyMessage[] = [];
+		const deps = {
+			session,
+			sheet,
+			onCommit: () => {},
+			onError: (reply: ErrorReplyMessage) => { errorReplies.push(reply); },
+			onTypingStroke: () => { strokeCount.n += 1; },
+		};
+		return { deps, strokeCount, errorReplies };
+	}
+
+	test('typing_stroke envelope fires onTypingStroke exactly once', () => {
+		const session = createSession(9001n);
+		const { deps, strokeCount } = makeDeps(session, 0);
+		dispatchIncomingMessage({ type: 'typing_stroke' }, deps);
+		assert.strictEqual(strokeCount.n, 1,
+			'one typing_stroke envelope -> one onTypingStroke call');
+	});
+
+	test('sequence of 5 typing_stroke envelopes fires onTypingStroke 5 times', () => {
+		const session = createSession(9002n);
+		const { deps, strokeCount } = makeDeps(session, 0);
+		for (let i = 0; i < 5; i++) {
+			dispatchIncomingMessage({ type: 'typing_stroke' }, deps);
+		}
+		assert.strictEqual(strokeCount.n, 5);
+	});
+
+	test('typing_stroke does NOT emit errorReply (fire-and-forget)', () => {
+		const session = createSession(9003n);
+		const { deps, errorReplies } = makeDeps(session, 0);
+		dispatchIncomingMessage({ type: 'typing_stroke' }, deps);
+		assert.strictEqual(errorReplies.length, 0,
+			'typing_stroke is fire-and-forget; no errorReply path');
+	});
+
+	test('typing_stroke with extra payload fields is still accepted (the type is the signal)', () => {
+		const session = createSession(9004n);
+		const { deps, strokeCount, errorReplies } = makeDeps(session, 0);
+		dispatchIncomingMessage({ type: 'typing_stroke', extraField: 'ignored' }, deps);
+		assert.strictEqual(strokeCount.n, 1);
+		assert.strictEqual(errorReplies.length, 0);
+	});
+
+	test('onTypingStroke optional -- omitting it does NOT crash the dispatcher', () => {
+		// Backward-compat: pre-V3.6.0.11 test suites + production wirings
+		// without the field MUST keep working.
+		const session = createSession(9005n);
+		const deps = {
+			session,
+			sheet: 0,
+			onCommit: () => {},
+			onError: (_reply: ErrorReplyMessage) => {},
+			// no onTypingStroke
+		};
+		assert.doesNotThrow(() => {
+			dispatchIncomingMessage({ type: 'typing_stroke' }, deps);
+		}, 'dispatcher must no-op silently when onTypingStroke is omitted');
+	});
+
+	test('unknown type still warns + drops (typing_stroke does not become a catch-all)', () => {
+		// Sanity: the typing_stroke arm must NOT swallow unrelated envelopes.
+		const session = createSession(9006n);
+		const { deps, strokeCount, errorReplies } = makeDeps(session, 0);
+		dispatchIncomingMessage({ type: 'completely_unknown_type' }, deps);
+		assert.strictEqual(strokeCount.n, 0,
+			'unknown type must not fire onTypingStroke');
+		assert.strictEqual(errorReplies.length, 0,
+			'unknown type is logged + dropped, not an errorReply (per V3.2.b.1 B1)');
+	});
+
+	test('typing_stroke does NOT fire onLocalTyping (different envelope, different callback)', () => {
+		// Defensive: typing_stroke must not promote false -> true; it
+		// only resets the deadline IFF flag is already set (panel-level
+		// check in resetTypingWatchdog).  At the dispatcher layer, this
+		// means typing_stroke does NOT call onLocalTyping.
+		const session = createSession(9007n);
+		const typingHistory: boolean[] = [];
+		const strokeCount = { n: 0 };
+		const deps = {
+			session,
+			sheet: 0,
+			onCommit: () => {},
+			onError: (_reply: ErrorReplyMessage) => {},
+			onLocalTyping: (typing: boolean) => { typingHistory.push(typing); },
+			onTypingStroke: () => { strokeCount.n += 1; },
+		};
+		dispatchIncomingMessage({ type: 'typing_stroke' }, deps);
+		assert.strictEqual(strokeCount.n, 1);
+		assert.strictEqual(typingHistory.length, 0,
+			'typing_stroke must NOT fire onLocalTyping (separate concerns)');
+	});
+});
+

@@ -649,6 +649,75 @@ export class CellGridPanel {
 	}
 
 	/**
+	 * **Phase 5.7 V3.6.0.11 D9 (2026-05-26)** -- typing-stroke watchdog
+	 * reset.  Called from the dispatcher's `typing_stroke` arm via
+	 * {@link DispatchDeps.onTypingStroke}.
+	 *
+	 * The webview emits one `typing_stroke` per text-change input event
+	 * while the active edit `<input>` is open (see cellGridHtml.ts
+	 * `beginEdit` 'input' event listener).  This method re-arms the
+	 * {@link PRESENCE_TYPING_WATCHDOG_MS} timer IFF
+	 * {@link _presenceRepaintInFlight} is true (we are actively typing
+	 * per the engine view).  If the flag is false, this is a no-op
+	 * (defensive: webview may emit stray typing_stroke after endEdit; we
+	 * MUST NOT promote false → true without a proper presenceUpdate).
+	 *
+	 * Closes R-V3.5-7 "long formula entry hits 30s" false-negative: pre-
+	 * V3.6.0.11 the watchdog fired after 30s of "elapsed real time since
+	 * presenceUpdate(typing:true)" even if the user was still actively
+	 * typing.  Post-V3.6.0.11 the watchdog deadline is 30s of "elapsed
+	 * real time since the LAST keystroke" -- the user can type a 5-minute
+	 * formula and the watchdog never fires unless they pause for 30s.
+	 *
+	 * pub for the dispatcher wire-up + test-fixture seam.
+	 */
+	resetTypingWatchdog(): void {
+		// Only re-arm if we believe we ARE typing.  Otherwise a stray
+		// typing_stroke (e.g., race between endEdit + 'input' event) would
+		// silently flip the cache from "rendering allowed" to "rendering
+		// blocked for 30s" -- worst kind of latent bug.
+		if (!this._presenceRepaintInFlight) {
+			return;
+		}
+		// Clear + re-arm the watchdog.  Cancellation of a pending timer
+		// is safe (no-op if undefined).  Same setTimeout body as
+		// setPresenceTyping's typing=true branch -- we deliberately
+		// duplicate the closure rather than refactor (the setTimeout
+		// capture closure references `this` + the attachment state,
+		// and the duplication keeps the deadline-reset path independent
+		// of the flag-set path).
+		if (this.presenceTypingWatchdog !== undefined) {
+			clearTimeout(this.presenceTypingWatchdog);
+			this.presenceTypingWatchdog = undefined;
+		}
+		this.presenceTypingWatchdog = setTimeout(() => {
+			if (this._presenceRepaintInFlight) {
+				this._presenceRepaintInFlight = false;
+				this.presenceTypingWatchdog = undefined;
+				const state = this.attachmentState;
+				if (state !== undefined && !state.disposed) {
+					state.log.appendLine(
+						`[collab] presenceRepaintInFlight watchdog fired after ${PRESENCE_TYPING_WATCHDOG_MS}ms ` +
+						`since last typing_stroke; auto-cleared (user paused for 30s+; merged-tick renders resume).`,
+					);
+				}
+				if (this._pendingRenderAfterTyping && !this._disposed) {
+					this._pendingRenderAfterTyping = false;
+					try {
+						this.render();
+					} catch (err) {
+						const detail = err instanceof Error ? err.message : String(err);
+						const inner = this.attachmentState;
+						if (inner !== undefined && !inner.disposed) {
+							inner.log.appendLine(`[collab] watchdog deferred render() failed: ${detail}`);
+						}
+					}
+				}
+			}
+		}, PRESENCE_TYPING_WATCHDOG_MS);
+	}
+
+	/**
 	 * Compute the snapshot, generate a fresh nonce, AND set the
 	 * webview's HTML.  Re-rendering blows away any prior webview
 	 * script + state; the host's `onDidReceiveMessage` handler
@@ -771,6 +840,21 @@ export class CellGridPanel {
 					return;
 				}
 				this.setPresenceTyping(typing);
+			},
+			// **Phase 5.7 V3.6.0.11 D9 (2026-05-26)** -- dispatch's
+			// typing_stroke arm fires this callback on each text-change
+			// input event from the webview's active edit `<input>`.
+			// Routed to resetTypingWatchdog which re-arms the 30s timer
+			// IFF the flag is set.  Dispose check: skip if the panel is
+			// disposed (a late-arriving typing_stroke after dispose
+			// shouldn't arm a watchdog on a dead panel; the dispose path
+			// already cleared `presenceTypingWatchdog` via
+			// setPresenceTyping(false)).
+			onTypingStroke: () => {
+				if (this._disposed) {
+					return;
+				}
+				this.resetTypingWatchdog();
 			},
 		});
 	}

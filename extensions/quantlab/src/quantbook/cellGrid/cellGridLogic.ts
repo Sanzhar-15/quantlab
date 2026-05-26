@@ -200,6 +200,21 @@ export interface DispatchDeps {
 	 * fire it.
 	 */
 	readonly onLocalTyping?: (typing: boolean) => void;
+	/**
+	 * **Phase 5.7 V3.6.0.11 D9 (2026-05-26)** -- mid-edit-render guard
+	 * typing-stroke watchdog reset.  Fired on the `'typing_stroke'`
+	 * envelope arm (no payload).  The webview emits one `typing_stroke`
+	 * per text-change input event while the active edit input is open;
+	 * the host resets the {@link CellGridPanel.PRESENCE_TYPING_WATCHDOG_MS}
+	 * timer IFF `_presenceRepaintInFlight === true` (no-op otherwise).
+	 * Closes R-V3.5-7 "long formula entry hits 30s" false-negative case
+	 * documented in the V3.6.0.1 D9 design lock.
+	 *
+	 * Optional for backward compat with tests that don't care about the
+	 * watchdog (the pre-V3.6.0.11 mocha suite predates this field); when
+	 * omitted, the dispatcher just doesn't fire it.
+	 */
+	readonly onTypingStroke?: () => void;
 }
 
 /**
@@ -360,6 +375,19 @@ export function dispatchIncomingMessage(raw: unknown, deps: DispatchDeps): void 
 			});
 			return;
 		}
+	}
+	// **Phase 5.7 V3.6.0.11 D9 (2026-05-26)** -- typing-stroke watchdog
+	// reset envelope.  Webview emits one `typing_stroke` per text-change
+	// input event while the active edit `<input>` is open (see
+	// cellGridHtml.ts beginEdit 'input' event listener).  Host resets
+	// the 30s presence-typing watchdog IFF the host-side flag is set.
+	// No payload (typing-stroke is fire-and-forget; the envelope itself
+	// is the signal).  No errorReply path: a malformed extra field would
+	// just be ignored downstream.  Closes R-V3.5-7 "long formula entry
+	// hits 30s" false-negative case documented in V3.6.0.1 D9 lock.
+	if (msg.type === 'typing_stroke') {
+		deps.onTypingStroke?.();
+		return;
 	}
 	if (msg.type !== 'putValue') {
 		console.warn(`[cellGrid] unknown outbound message type: ${msg.type}`);
