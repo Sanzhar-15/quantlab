@@ -240,17 +240,25 @@ v1 token source. **Resolution (locked):**
 - The single-writer **`OpLog` is MANDATORY** for a v1 `WorkbookSession` (it already underpins undo +
   save/load). What is v1.5-deferred is the *collaborative* layer on top (transport, CRDT *merge*,
   presence) — **not** the op-log itself.
-- **The token is an engine-owned `{session_epoch, op_count}`, encoded as bytes** — NOT a Loro
-  `VersionVector`. (Correction from grounding: `ql-oplog::OpLog` is a plain append-only log with **no
-  version vector** — `len()`/`append()`/`iter()`/`get()` only; the Loro VV is the *`CollabSession`*
-  token, i.e. the v1.5 collab path.) `session_epoch` is a fresh id minted at `new`/`open`/`import` (and
-  on any cache-clearing event); `op_count` is `OpLog::len()` at snapshot time — monotonic under
-  single-writer appends. This gives every binding **one** producer/validator. The v1.5 `CollabSession`
-  adapter maps its Loro VV into this same opaque-token slot. Bindings round-trip the bytes verbatim and
-  MUST NOT interpret them.
+- **The token is an engine-owned `{session_epoch, op_count}`, encoded as bytes** (24 bytes: 16-byte
+  big-endian epoch + 8-byte big-endian op_count). `op_count` is `OpLog::len()` at snapshot time;
+  `session_epoch` is a fresh id minted at `new`/`open`/`import` (and on any cache-clearing / undo event).
+  - **Correction (6.1B inc.2 grounding — supersedes the earlier "no VV" claim):** `ql-oplog::OpLog` is
+    **Loro-backed and DOES expose a version vector** via `oplog_vv()` (`crates/ql-oplog/src/log.rs:424`),
+    plus `new_undo_manager()`, `export_delta_bytes(from: &VV)`, `fork_at_vv`. The prior revision wrongly
+    asserted it had none. We still choose `{epoch, op_count}` **deliberately**, for two real reasons:
+    (1) `op_count = OpLog::len()` is the simplest monotonic single-writer counter and index-walking ops
+    `[last.op_count .. current)` for a *semantic* delta (changed cells) is far simpler than decoding a
+    Loro VV delta blob; (2) `OpLog::len()` is **NOT monotonic** — it reads the live Loro list, which
+    *shrinks* when an `UndoManager` retracts ops (`log.rs:142-150`), so the `epoch` (bumped on
+    undo/reload/cache-clear) is what makes tokens sound. The Loro VV is reserved for the v1.5
+    `CollabSession` delta-sync path; its adapter maps the VV into this same opaque-token slot.
+  - Bindings round-trip the bytes verbatim and MUST NOT interpret them; the engine is the sole
+    producer/validator.
 - **Validity rules (locked):**
   - A token is valid only within the **same live session + epoch**. Single-writer sessions advance
-    `op_count` purely by local appends.
+    `op_count` purely by local appends; undo/redo bumps the epoch (so the non-monotonic `len()` after a
+    retract can never produce a stale-but-accepted token).
   - `new`/`open`/`import` (and any cache-clearing event) mint a **new `session_epoch`**; an old token
     whose epoch ≠ current is `full_rebuild_required` reason `epoch_mismatch` (§4.3), not silently accepted.
   - `snapshot_delta` MUST attempt an incremental delta for a well-formed, same-epoch, non-stale token;

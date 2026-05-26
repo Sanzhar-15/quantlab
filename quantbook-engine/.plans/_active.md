@@ -8,8 +8,9 @@ status: |
   ✅ 6.1A SHIPPED + CODEX-VALIDATED 2026-05-26 (this session, docs-only): wrote docs/api/session-api.md
   (v2) — the stable engine session contract. Codex (gpt-5.5 xhigh) reviewed it, verdict REVISE
   (5 HIGH/5 MED/2 LOW/1 INFO, all code-grounded), all verified at source + resolved in v2.
-  Key locks the review forced: single-writer OpLog MANDATORY → its Loro VV is the version token
-  (resolves the deferred-collab token gap); cancellation scoped honestly (in-engine recalc =
+  Key locks the review forced: single-writer OpLog MANDATORY → the version token is `{epoch,op_count}`
+  (NOTE: 6.1A said "Loro VV"; inc.2 grounding corrected this — OpLog DOES expose a Loro VV via oplog_vv,
+  but `{epoch,op_count}` is the deliberate v1 token, see session-api.md §4.0); cancellation scoped honestly (in-engine recalc =
   pre-start-cancel-only in v1 — recompute_* are synchronous commit-as-you-go loops + CalcgraphSession
   isn't Clone; hard no-late-commit only for out-of-process UDF/SQL/AI; new Busy lifecycle state);
   batch(ops,options)+opaque txn handle (no RAII borrow across FFI; BatchCommit replay is fail-loud
@@ -30,17 +31,31 @@ status: |
   (create/rename/rename_column/resize/drop_table) + TableSpec DTO (5 tests). ⚠️ a git-index padding
   race truncated the inc.1 commit's dto.rs/session.rs blobs — caught + fixed at `af15dcf3a5d`.
 
-  ⭐ NEXT = 6.1B increment 2 — **follow `docs/api/workbook-session-impl-plan.md`** (concrete grounded
-  build plan: placement = `ql-exec`/new `session.rs`; struct fields; PlanCache refactor FIRST; `{epoch,
-  op_count}` version token — NOT Loro VV; method-by-method map; sub-task ordering; tests; Node smoke
-  migration). IMPLEMENT the owning `WorkbookSession` struct (`impl EngineSession`),
-  wrapping WorkbookRuntime + OpLog + CalcgraphSession + PlanCache + FunctionRegistry. Required
-  sub-work: (a) refactor WorkbookRuntime to borrow a SESSION-OWNED PlanCache (today mod.rs:140/162/225
-  allocate a fresh cache per runtime — LOW-1); (b) single-writer OpLog mandatory + its Loro VV is the
-  version token (HIGH-2); (c) cancellation registry + Busy state + pre-start-cancel for recalc (HIGH-1);
-  (d) fail-loud delete/restore/move sheet wrappers (MED-3); (e) fill EngineError Appendix A from the
-  real enums; (f) migrate the Node smoke path onto WorkbookSession. Do NOT freeze the CollabSession
-  CRDT façade (collab = v1.5, feature-gated). CODE phase → fresh session, full budget.
+  ✅ 6.1B inc.2a + 2b SHIPPED 2026-05-26 (this session, CODE) — the owning `WorkbookSession` core path.
+  - 2a (`83b1b33bac2`): session-owned PlanCache — `WorkbookRuntime::with_session_state(.., PlanCache)` +
+    `into_plan_cache(self)`. Ownership-transfer instead of the doc's `&mut PlanCache` sketch → ZERO
+    existing-call-site change. ql-exec suite green.
+  - 2b (`7335a5a1bfa`): `crates/ql-exec/src/session.rs` — `WorkbookSession impl EngineSession`. REAL:
+    lifecycle (new/from_workbook/close, Ready/Busy/Closed) + `{epoch,op_count}` 24-byte token; mutations
+    (set_value/set_formula/clear/set_format/register_format, add_sheet/rename_sheet, set_name); recalc
+    (recalc_dirty/all/mark_volatiles_dirty under Busy+op-registry, CellDiagnostic events); read
+    (snapshot live-overlay enum / cell / list_sheets); ops/events (cancel/operation_status/poll_events).
+    8 session tests + 644 ql-exec lib green; clippy clean. Error mapping = free fns map_runtime_err/
+    map_oplog_err (orphan rules forbid `From<RuntimeError> for EngineError`; in-crate exhaustive match).
+    CORRECTED a doc error: ql-oplog::OpLog DOES expose a Loro VV (oplog_vv) — earlier "no VV" claim was
+    wrong; `{epoch,op_count}` is still the v1 token by deliberate choice (see session-api.md §4.0).
+
+  ⭐ NEXT = 6.1B inc.2c (continue the impl) — **follow `docs/api/workbook-session-impl-plan.md` §0**
+  (now lists the exact remaining sub-steps). Surfaced today as `Capability/not_implemented_in_v1_core`
+  (honest, No-Fallbacks): (1) `validate_formula` (read-only lex/parse/bind vs `&self.workbook`);
+  (2) `query_range` — ⚠️ NEEDS A CONTRACT DECISION FIRST: `CellValue` has no Blank variant but a
+  columnar range read must represent empties (add `CellValue::Blank` vs `Vec<Option<CellValue>>`);
+  (3) `snapshot_delta` (op-walk + §4.3); (4) delete/restore/move_sheet (MED-3 fail-loud + manual op
+  emission — NOT on WorkbookRuntime); (5) table ops (delegations); (6) batch/txn + undo/redo
+  (OpLog::new_undo_manager) + persistence (open/import/save/export via ql_io → adds PersistenceError to
+  Appendix A); (7) functions (6.4) + reserved bulk (6.4/6.5). Then 6.1C audit. Do NOT freeze the
+  CollabSession CRDT façade (collab = v1.5, feature-gated). Also pending from inc.1: the napi `.node`
+  rebuild + B#1/S2-01 mocha tests.
 date: 2026-05-26
 predecessor_plan: .plans/_archive/2026-05-26_phase-5-7-v3-6-1-delta-consumer-backlog.md (V3.6.1 backlog mini-phase, SUPERSEDED by Phase 5 COMPLETE)
 parent_phase: 6 Product Surfaces
@@ -54,7 +69,7 @@ direction: |
   foundation; 6.4 (Python UDFs) is the strategic wedge; everything else (full bindings,
   service, SQL, AI) follows. Collab is v1.5-deferred and must NOT pre-empt Phase 6.
 
-current_engine_head: 38108a5c8ef (6.1B inc.1b — EngineSession trait completed w/ table ops) ← af15dcf3a5d (ql-session race-fix: 20d11072a0a captured TRUNCATED dto.rs/session.rs via the git-index padding race; fixed, crate compiles) ← 014aa41ab4c (plan sync) ← 20d11072a0a (6.1B inc.1 — ql-session crate, type skeleton) ← ff6cd4c147c (6.1A v2 Codex-validated) ← 85966ece7b4 (6.1A session-api.md). The ql-session crate is type-only (no impl, no reverse-deps) so it touches no existing behavior; the S2-01 fix at 7e536fc07b2 is still the last change to PRE-EXISTING engine code. pre-B#1 baseline 1465b1db4c4.
+current_engine_head: 7335a5a1bfa (6.1B inc.2b — WorkbookSession core path, impl EngineSession in ql-exec/src/session.rs) ← 83b1b33bac2 (6.1B inc.2a — session-owned PlanCache constructor; **first change to PRE-EXISTING engine code since S2-01** — additive, ql-exec suite green) ← 884b7e365e8 (6.1B inc.2 impl-plan + version-token doc) ← 38108a5c8ef (6.1B inc.1b — EngineSession trait w/ table ops) ← af15dcf3a5d (ql-session race-fix) ← 20d11072a0a (6.1B inc.1 — ql-session crate) ← ff6cd4c147c (6.1A v2 Codex-validated). inc.2a touches workbook_runtime/mod.rs (additive: 2 new ctors, 0 existing-call-site change); inc.2b adds new session.rs + ql-session dep + a dto.rs comment fix. pre-B#1 baseline 1465b1db4c4.
 current_ide_head: d028568b53b (V3.6.1.2 shared delta cache) — unchanged
 audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait claims need positive compile proof; phase-level closures use 3-5-way megaudits; range-aware fn ships need lex+parse+bind+eval coverage.
 
@@ -68,10 +83,15 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      EngineSession trait + binding-neutral DTO module (schema_version) + EngineError taxonomy +
      operation/lifecycle types + FunctionMetadata skeleton + v1 table ops + TableSpec. Type-level only;
      compiles + 5 tests + clippy clean. (Trait surface now complete for inc.2 to implement.)
-   - ⭐ **inc.2 (NEXT)**: implement `WorkbookSession` (`impl EngineSession`) — PlanCache refactor (LOW-1),
-     mandatory single-writer OpLog + VV token (HIGH-2), cancellation registry + Busy state (HIGH-1),
-     fail-loud sheet wrappers (MED-3), EngineError Appendix A, event queue. Migrate the Node smoke path.
-     Leave collab/transport/presence feature-gated.
+   - ✅ **inc.2a (`83b1b33bac2`) + inc.2b (`7335a5a1bfa`)**: session-owned PlanCache + the owning
+     `WorkbookSession` (`impl EngineSession` in `ql-exec/src/session.rs`) CORE PATH — lifecycle +
+     `{epoch,op_count}` token + mutations + recalc (Busy/op-registry) + read (snapshot/cell/list_sheets)
+     + ops/events + Appendix-A error mapping (free fns). 8 session tests + 644 ql-exec lib green, clippy
+     clean. Remaining trait methods surfaced as `not_implemented_in_v1_core` (honest, No-Fallbacks).
+   - ⭐ **inc.2c (NEXT)**: validate_formula → query_range (needs CellValue::Blank decision) →
+     snapshot_delta → delete/restore/move_sheet (MED-3) → table ops → batch/txn + undo/redo +
+     persistence → functions/bulk. See `workbook-session-impl-plan.md` §0. Then migrate the Node smoke
+     path. Leave collab/transport/presence feature-gated.
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).
 5. **6.4-0 — Function-metadata substrate** — replace the hardcoded volatility whitelist
    (calcgraph_session.rs:149-164) + the address-only-reference whitelist (:201-203) +

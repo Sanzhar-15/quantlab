@@ -1,7 +1,46 @@
 # 6.1B Increment 2 — `WorkbookSession` Implementation Plan
 
-**Status:** READY TO IMPLEMENT (next session). This is the concrete, grounded build plan for the
-*implementation* of the `EngineSession` contract. Read this together with:
+**Status:** ⏳ IN PROGRESS — **sub-increment 2b (the core path) SHIPPED 2026-05-26** (`7335a5a1bfa`,
+preceded by the PlanCache refactor `83b1b33bac2`). The owning `WorkbookSession` exists in
+`crates/ql-exec/src/session.rs` and `impl EngineSession`; 8 session tests + 644 ql-exec lib tests green,
+clippy clean.
+
+### What 2b shipped (REAL)
+- **2a — PlanCache session-ownership** (§3): `WorkbookRuntime::with_session_state(.., PlanCache)` +
+  `into_plan_cache(self)` (ownership-transfer, not a `&mut` field — zero existing-call-site change).
+- Struct + lifecycle (`new`/`from_workbook`/`close`, Ready/Busy/Closed gating) + `{epoch,op_count}`
+  version token (§2, §4).
+- `map_runtime_err` + `map_oplog_err` (§6 / Appendix A) — **free fns, NOT `From` impls** (orphan rules
+  forbid `impl From<RuntimeError> for EngineError`; the in-crate `RuntimeError` match is exhaustive →
+  a new variant is a compile error, stronger than a runtime catch-all).
+- Mutations: `set_value`/`set_formula`/`clear`/`set_format`/`register_format`, `add_sheet`/`rename_sheet`,
+  `set_name`. Recalc: `recalc_dirty`/`recalc_all`/`mark_volatiles_dirty` (Busy + op-registry; synchronous
+  to completion in v1; `CellDiagnostic` events on structural failures).
+- Read: `snapshot` (live-overlay enumeration) / `cell` / `list_sheets`. Ops/events:
+  `cancel`/`operation_status`/`poll_events`.
+
+### NEXT sub-increments (surfaced-not-yet today as `Capability/not_implemented_in_v1_core`)
+1. **`validate_formula`** — `&self`, so it can't build a `&mut` runtime; implement the read-only
+   lex→parse→bind directly against `&self.workbook` (all the bind fns take `&Workbook`). Cheap.
+2. **`query_range`** — ⚠️ **needs a contract decision first**: a columnar `RangeResult`
+   (`Vec<CellValue>` per column) must represent **empty** cells, but `CellValue` has **no Blank
+   variant**. Decide: add `CellValue::Blank` (cleanest; mirrors `ql_types::Value::Blank`; also lets
+   `snapshot` carry explicit blanks) vs make `RangeColumn.values: Vec<Option<CellValue>>`. This is a
+   deliberate DTO change to the Codex-validated contract — make it consciously, then implement.
+3. **`snapshot_delta`** (step 6) — the op-walk + §4.3 rules (epoch_mismatch / invalid_version_token).
+4. **`delete_sheet`/`restore_sheet`/`move_sheet`** (MED-3) — NOT on `WorkbookRuntime`; need a fail-loud
+   wrapper (validate first → `NotFound`/`BadArgument`) + **manual `Op::{RemoveSheet,RestoreSheet,
+   MoveSheet}` emission** into the oplog (mirror the napi layer), since `Workbook::{remove,restore,move}_sheet`
+   are silent no-op/clamp.
+5. **table ops** (5) — straight `WorkbookRuntime` delegations (`tables.rs`).
+6. **`batch`/transactions** + **`undo`/`redo`** (needs `OpLog::new_undo_manager`) + **persistence**
+   (`open`/`import`/`save`/`export` via `ql_io` — adds `PersistenceError` mapping to Appendix A).
+7. **functions** (6.4) + **reserved bulk** (6.4/6.5).
+
+---
+
+This is the concrete, grounded build plan for the *implementation* of the `EngineSession` contract.
+Read this together with:
 - `docs/api/session-api.md` (the contract — what to build; v2, Codex-validated) — **authoritative**.
 - `docs/api/codex-6-1a-review.md` (the 13 findings the contract resolves — the *why* behind the hard parts).
 - `crates/ql-session/src/*` (the trait + DTOs that already exist and compile — increment 1/1b).
@@ -88,16 +127,22 @@ the existing ~4135 ql-exec tests stay green after the refactor.
 
 ---
 
-## 4. Version token (HIGH-2 — `{epoch, op_count}`, NOT Loro VV)
+## 4. Version token (HIGH-2 — `{epoch, op_count}`, chosen over the Loro VV)
 
-**Grounded correction:** `ql-oplog::OpLog` is a plain append-only log — `append`/`len`/`iter`/`get`/
-`is_empty` (verified `ql-oplog/src/log.rs`). It has **no** version vector. (The Loro `VersionVector` in
-the napi layer belongs to `CollabSession`, the v1.5 collab path.) So:
+**Grounded correction (revised 6.1B inc.2 — the earlier "no VV" claim was WRONG):** `ql-oplog::OpLog`
+is **Loro-backed and DOES expose a version vector** (`oplog_vv()` at `crates/ql-oplog/src/log.rs:424`),
+plus `new_undo_manager` / `export_delta_bytes` / `fork_at_vv`. We still use `{epoch, op_count}`
+**deliberately**: (1) `op_count = OpLog::len()` is the simplest monotonic single-writer counter and
+index-walking ops gives a semantic (changed-cell) delta directly, vs decoding a Loro VV delta blob;
+(2) `OpLog::len()` is **NOT monotonic** under undo-retraction (it reads the live Loro list), so the
+`epoch` — bumped on undo/reload/cache-clear — is what keeps tokens sound. The Loro VV is reserved for
+the v1.5 collab delta-sync path. (`SessionVersion` doc in `dto.rs` + `session-api.md` §4.0 now reflect
+this corrected rationale.) So:
 
-- `SessionVersion` bytes = encode of `{ epoch: u128, op_count: u64 }` (e.g. 24 bytes, fixed-endian, or
-  `serde`/`bincode`). `epoch` minted at `new`/`open`/`import` and on any cache-clearing event; `op_count`
-  = `self.oplog.len()` at snapshot time (monotonic under single-writer appends).
-- `snapshot()` stamps the current `{epoch, op_count}`. `snapshot_delta(last)` decodes `last`:
+- **SHIPPED inc.2b:** `current_version()` encodes `{ epoch: u128, op_count: u64 }` as 24 bytes
+  (16-byte BE epoch + 8-byte BE op_count). `epoch` minted via a process `AtomicU64` at construction;
+  `op_count = self.oplog.len()`. `snapshot()` stamps it.
+- **NEXT (step 6, deferred):** `snapshot_delta(last)` decodes `last`:
   - decode failure / unknown schema → **`EngineError::invalid_version_token`** (fail-loud; MED-2).
   - `last.epoch != self.epoch` → `full_rebuild_required` reason `EpochMismatch`.
   - `last.op_count > self.op_count` → also `invalid_version_token` (a token from the future is malformed).
