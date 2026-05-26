@@ -2407,6 +2407,15 @@ name = "ql-service"
 version = "0.1.0"
 
 [[package]]
+name = "ql-session"
+version = "0.1.0"
+dependencies = [
+ "ql-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ql-sql"
 version = "0.1.0"
 
