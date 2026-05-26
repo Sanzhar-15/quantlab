@@ -1542,7 +1542,7 @@ Closes R-V3.4-3 (DEFERRED at V3.4.0.5b -> KNOWN-GAP at V3.4.0.X via Opus M2 -> C
 - **R-V3.5-4 Format-aware rendering deferral** -- CLOSED at V3.6.0.5 D4 (engine `5b3017c70d2` + IDE `d7cb01557d4`) + V3.6.0.X audit-of-D4 closures (engine THIS commit).  Engine napi `workbook_snapshot` now populates `CellSnapshotJson.rendered` via `ql_functions::format::render(value, parsed_format, eval_context)` for cells with both a format AND a non-pending value.  EvalContext is built from the workbook (`workbook.date_system()` + `workbook.locale()` + `NowProvider::System`).  Per-snapshot parsed-format cache reuses the FormatString across cells sharing a FormatId.  IDE `cellGridHtml::renderRows` uses `e.rendered ?? formatCellValue(e.value)` with CSP-safe escapeHtml on both paths; new `data-raw-value` attribute carries the parseable raw representation for click-to-edit (post V3.6.0.X audit-of-D4 OPUS-HIGH-2 closure -- pre-closure `data-original-text` carried the engine-rendered string, breaking `parseCellRawInput` on currency/percent/thousands/date formats).  Pending cells skip pre-render (CONVERGENT-HIGH-3 closure -- avoids displaying not-yet-evaluated formulas as formatted zeros).  Workbook-level `Op::SetDateSystem` variant + replay handler closes V3.6.0.X audit-of-D4 CONVERGENT-HIGH-1 (Excel1904 .qbook envelopes were previously rendered with Excel1900 epoch).
 - **R-V3.5-5 Session-wide format registry deferral** -- CLOSED at V3.6.0.3 D2 (engine `ffa598a1c15` + IDE `b159c899359`).  New `format_table_cache: HashMap<FormatId, Arc<str>>` field on `CollabSession` + new `CacheEffect::RegisterFormat` walker variant + new `FormatDefJson` napi struct + additive `WorkbookSnapshotJson.formats: Vec<FormatDefJson>` field populated from `Workbook.formats().iter()` (authoritative; merges Builtin + Custom).  V3.6.0.X audit-of-D2 closure: sorted by FormatId for shape stability; cache walker first-write-wins + drops Builtin variants.  **Format-aware buildHtml rendering CLOSED at V3.6.0.5 D4 + V3.6.0.X audit-of-D4 closures** (see R-V3.5-4 above + § 4.1.z6 for full details).
 - **R-V3.5-6 Cross-restart PeerId reuse (R-V3.3-5 carryforward)** -- CLOSED at V3.4.0.4b via fresh-UUID-per-session (D5 deviation; documented in § 4.1.z4).
-- **R-V3.5-7 Mid-edit-render guard watchdog correctness** -- DOCUMENTED.  30s `PRESENCE_TYPING_WATCHDOG_MS` is the V3.5.0.7 ship default.  Stuck-true conditions (panel-hung / window-closed-mid-edit / webview-crash) auto-clear after 30s with logged warning.  Tunable if user feedback surfaces.
+- **R-V3.5-7 Mid-edit-render guard watchdog correctness** -- **CLOSED-AT-V3.6.0.11**.  30s `PRESENCE_TYPING_WATCHDOG_MS` is the V3.5.0.7 ship default.  Pre-V3.6.0.11 the watchdog fired 30s after `setPresenceTyping(true)` regardless of actual user activity (false-negative on long formula entry).  V3.6.0.11 D9 closure: webview emits `typing_stroke` on every text-change `'input'` event; host re-arms the watchdog deadline IFF the flag is set.  Watchdog now fires only after 30s of *idle* time within an active edit.  Stuck-true conditions (panel-hung / window-closed-mid-edit / webview-crash) still auto-clear after 30s with logged warning.  See V3.6.0.11 D9 sub-section below.
 
 #### Out of scope for V3.5
 
@@ -1799,12 +1799,12 @@ Three additional minor findings noted but not fixed in-cycle:
 
 ### 4.1.z6 Loro UndoManager on_push + format registry + per-cell op-index + format-aware buildHtml rendering (Phase 5.7 V3.6, 2026-05-24)
 
-**Status**: V3.6.0.8 D6 ARC COMPLETE + V3.6.0.10 D8 Op::RestoreSheet SHIPPED.  D6 perf contract delivered: 100 new cells delta = 1.08 ms vs 246 ms full snapshot (228× faster than full; 46× under the 50 ms threshold).  R-V3.6-15 + R-V3.6-17 CLOSED.  Opus-MED-5 (comprehensive mocha) CLOSED at V3.6.0.8.5.  D8 ships `Op::RestoreSheet { id }` un-tombstone (V3.6.0.10).  D7 (#REF! substitution) + D9 (typing-stroke watchdog) still conditional pending user signal.  Spike verdict (V3.6.0.7): 251 ms median at 100k cells / 50 % format / 1 sheet (5× the 50 ms threshold).  Lock verdict (V3.6.0.8.1): option (a) cache rebuilt+repaired Workbook + clone-and-apply-delta CHOSEN.  Engine foundation (V3.6.0.8.2): 2 new fields + 4 invalidation callsites + new public `apply_ops_in_range` helper on ql-oplog.  Napi surface (V3.6.0.8.3): `workbookSnapshotDelta` + `WorkbookSnapshotDeltaJson` + `version: Buffer` field on `WorkbookSnapshotJson`.
+**Status**: V3.6.0.8 D6 ARC COMPLETE + V3.6.0.10 D8 Op::RestoreSheet SHIPPED + V3.6.0.11 D9 typing-stroke watchdog SHIPPED.  D6 perf contract delivered: 100 new cells delta = 1.08 ms vs 246 ms full snapshot (228× faster than full; 46× under the 50 ms threshold).  R-V3.5-7 + R-V3.6-15 + R-V3.6-17 CLOSED.  Opus-MED-5 (comprehensive mocha) CLOSED at V3.6.0.8.5.  D8 ships `Op::RestoreSheet { id }` un-tombstone (V3.6.0.10).  D9 ships `typing_stroke` envelope arm + `resetTypingWatchdog` panel method + webview `'input'` listener (V3.6.0.11).  Only D7 (#REF! substitution at V3.6.0.9) remains conditional pending user signal.  V3.6 phase-termination megaudit unblocked.  Spike verdict (V3.6.0.7): 251 ms median at 100k cells / 50 % format / 1 sheet (5× the 50 ms threshold).  Lock verdict (V3.6.0.8.1): option (a) cache rebuilt+repaired Workbook + clone-and-apply-delta CHOSEN.  Engine foundation (V3.6.0.8.2): 2 new fields + 4 invalidation callsites + new public `apply_ops_in_range` helper on ql-oplog.  Napi surface (V3.6.0.8.3): `workbookSnapshotDelta` + `WorkbookSnapshotDeltaJson` + `version: Buffer` field on `WorkbookSnapshotJson`.
 
-**Engine HEAD at this section's commit**: `19a35b68cac` (V3.6.0.10 D8 Op::RestoreSheet) ← `0521d6902b9` (V3.6.0.8.5 docs sweep) ← `82ed0d37d85` (V3.6.0.8.4 audit-of-D6 + 5 HIGH closures + bench) ← `2dbce5ee2a5` (V3.6.0.8.3 D6 napi) ← `dc74d48b97e` (V3.6.0.8.2 engine PART 1) ← `ebe7c946429` (V3.6.0.8.1 docs lock) ← `3e1e4deff50` (V3.6.0.7 spike) ← prior chain.
-**IDE HEAD at this section's commit**: `4c48f8809bc` (V3.6.0.10 D8 IDE wrapper + 6 mocha tests) ← `07fd6bb8988` (V3.6.0.8.5 +10 mocha) ← `8b3f608b2c8` (V3.6.0.8.4 IDE: version field on WorkbookSnapshotJson + 2 shape-pin updates) ← `9b7ac290917` (V3.6.0.8.3 IDE: types.ts + 6 mocha) ← `d9731633ac4` (V3.6.0.X audit-of-D5 IDE) ← prior chain.
+**Engine HEAD at this section's commit**: `503832303e9` (V3.6.0.10 docs megaudit sweep) ← `19a35b68cac` (V3.6.0.10 D8 Op::RestoreSheet) ← `0521d6902b9` (V3.6.0.8.5 docs) ← `82ed0d37d85` (V3.6.0.8.4 audit-of-D6 + 5 HIGH closures + bench) ← `2dbce5ee2a5` (V3.6.0.8.3 D6 napi) ← `dc74d48b97e` (V3.6.0.8.2 engine PART 1) ← `ebe7c946429` (V3.6.0.8.1 docs lock) ← `3e1e4deff50` (V3.6.0.7 spike) ← prior chain.  **Engine unchanged at V3.6.0.11 D9** (IDE-only TS work; see V3.6.0.11 sub-section).
+**IDE HEAD at this section's commit**: `aa9d0448bb1` (V3.6.0.11 D9 typing-stroke watchdog) ← `4c48f8809bc` (V3.6.0.10 D8 IDE wrapper + 6 mocha tests) ← `07fd6bb8988` (V3.6.0.8.5 +10 mocha) ← `8b3f608b2c8` (V3.6.0.8.4 IDE) ← `9b7ac290917` (V3.6.0.8.3 IDE) ← `d9731633ac4` (V3.6.0.X audit-of-D5 IDE) ← prior chain.
 
-**Tests baseline**: ql-collab **154/154** (V3.6.0.10 +5 over V3.6.0.8.4 149: untombstone + idempotent + out-of-range no-op + cache drops tombstone + remote-merge convergence) + ql-oplog **67/67** + ql-collab-ws **42/42** (40 lib+transport + 2 ignored doctests) + IDE mocha **406/406** (V3.6.0.10 +6 over V3.6.0.8.5 400: 5 restoreSheet napi contract + 1 restoreSheet-in-delta fullRebuild) + engine workspace release build clean.  V3.6.0.7 + V3.6.0.8.4 add criterion benches (`cargo bench -p ql-bindings-node --bench workbook_snapshot`).
+**Tests baseline**: ql-collab **154/154** + ql-oplog **67/67** + ql-collab-ws **42/42** (40 lib+transport + 2 ignored doctests) + IDE mocha **413/413** (V3.6.0.11 +7 over V3.6.0.10 406: dispatcher contract for typing_stroke envelope -- single fires + sequence + no errorReply + extra payload accepted + optional callback + unknown type warns + typing_stroke != onLocalTyping) + engine workspace release build clean.  V3.6.0.7 + V3.6.0.8.4 add criterion benches (`cargo bench -p ql-bindings-node --bench workbook_snapshot`).
 
 #### V3.6.0.1 -- decision lock (9 D-decisions)
 
@@ -1820,7 +1820,7 @@ Per V3.5.0.X Opus § F V3.6 ENTRY READINESS:
 | **D6** Incremental WorkbookSnapshot deltas | Cache rebuilt+repaired Workbook + clone-and-apply-delta; new `workbookSnapshotDelta(lastSeenVersion: Buffer)` napi + `WorkbookSnapshotDeltaJson` + `version: Buffer` field on `WorkbookSnapshotJson`; cell-only fast-path skips repair; rename + metadata ops trigger fullRebuild | V3.6.0.7 spike + V3.6.0.8.1 lock + V3.6.0.8.2 engine PART 1 + V3.6.0.8.3 napi + V3.6.0.8.4 audit-of-D6 + 5 HIGH closures + bench + V3.6.0.8.5 mocha coverage — ALL **SHIPPED** |
 | **D7** `#REF!` substitution for cross-sheet refs to deleted sheets | DEFER until user signal | V3.6.0.9 PENDING (conditional) |
 | **D8** `Op::RestoreSheet` un-delete | New wire variant + `Workbook::restore_sheet(id)` + replay arm + `CacheEffect::RestoreSheet` + classify_delta_op fullRebuild allowlist + `restoreSheet(id)` napi + IDE wrapper | V3.6.0.10 **SHIPPED** |
-| **D9** Sheet-tabs UX + typing-stroke watchdog | DEFER sheet-tabs to V3.6+ multi-tab redesign; typing-stroke watchdog ship-on-signal | V3.6.0.11 PENDING (conditional) |
+| **D9** Sheet-tabs UX + typing-stroke watchdog | Sheet-tabs DEFERRED to V3.6+ multi-tab redesign; typing-stroke watchdog new `typing_stroke` envelope arm + `resetTypingWatchdog` panel method + webview `'input'` listener emits stroke per text-change | V3.6.0.11 **SHIPPED** (typing-stroke watchdog only; sheet-tabs deferred) |
 
 #### V3.6.0.2 D1 -- Loro UndoManager on_push callback wiring (engine `89f5a5f9e0b`)
 
@@ -2173,6 +2173,28 @@ Convergent findings closed via doc sweep this commit:
 
 Deferred to V3.6.1+: condense `.plans/_active.md` frontmatter status field wall-of-text (~5000 words; not load-bearing for correctness, just readability).
 
+#### V3.6.0.11 D9 -- typing-stroke watchdog (IDE `aa9d0448bb1`)
+
+Pure IDE/TypeScript work; no engine changes.  Closes R-V3.5-7 "long formula entry hits 30s" false-negative case from V3.5.0.X audit closures: pre-V3.6.0.11 the `_presenceRepaintInFlight` watchdog fired 30s after `setPresenceTyping(true)` regardless of actual user activity.  Post-V3.6.0.11 the 30s deadline resets on every keystroke; the watchdog fires only after 30s of *idle* time within an active edit.
+
+**Wire-level surface**:
+
+- New `'typing_stroke'` envelope arm in `dispatchIncomingMessage` (`extensions/quantlab/src/quantbook/cellGrid/cellGridLogic.ts`).  No payload (the envelope type is the signal).  No `errorReply` path (fire-and-forget).
+- New optional `onTypingStroke?: () => void` field on `DispatchDeps`.  Backward-compat for pre-V3.6.0.11 tests + wirings that omit it.
+- New `pub resetTypingWatchdog()` method on `CellGridPanel` (`cellGridPanel.ts`).  Re-arms `presenceTypingWatchdog` setTimeout for `PRESENCE_TYPING_WATCHDOG_MS` (30_000ms) IFF `_presenceRepaintInFlight === true`.  No-op otherwise -- defensive: a stray typing_stroke from a webview-endEdit race must NOT promote false → true (that requires a proper `presenceUpdate` envelope with `typing: true`).
+- Panel's `handleIncoming` wires `onTypingStroke: () => this.resetTypingWatchdog()` with the standard `_disposed` guard (mirrors `onLocalTyping`).
+- Webview client `beginEdit` adds `input.addEventListener('input', ...)` that calls `vscode.postMessage({type:'typing_stroke'})` on every text-change.  The `'input'` event fires on typing / paste / deletion but NOT on focus or programmatic value sets, so the initial focus does not emit a stroke (the prior `presenceUpdate(typing:true)` already armed the watchdog).  Guards with `activeInput !== input` so stale closures from prior edits no-op.  Cleanup is implicit: `endEdit` removes the input from DOM + the closure is GC'd.
+
+**No throttle**: each keystroke triggers `clearTimeout + setTimeout` (both cheap).  A fast typist sending 10 strokes/s produces 10 vscode.postMessage round-trips/s -- negligible cost on the host side.
+
+**Cross-peer**: typing_stroke is local-only.  Remote peers see this peer's presence via the per-cell `data-peer` decoration in the webview (V3.4.0.5b), updated on pollRemote ticks.  Their watchdog is independent.
+
+**Test coverage** (+7 mocha tests, 406 → 413): dispatcher contract.  Panel-level watchdog re-arm behavior (real `setTimeout` interaction) NOT covered by mocha here -- would require vscode mocking + fake timers; deferred to V3.6.0.X phase-termination megaudit.
+
+**Risk register update**: R-V3.5-7 CLOSED-AT-V3.6.0.11.  No new risks documented (the typing_stroke envelope is additive, the panel method is single-purpose with explicit guards, and the watchdog timer was already in production at V3.5.0.7).
+
+**Rule 4 arc terminus**: HELD at 6 (no new struct fields with negative-trait concerns; new method on CellGridPanel, new interface field on DispatchDeps, both TypeScript-only).
+
 #### V3.6 risk register (R-V3.6-1..18)
 
 The plan body at `.plans/_active.md` lines 286-314 is the authoritative source.  Summary:
@@ -2214,6 +2236,7 @@ The plan body at `.plans/_active.md` lines 286-314 is the authoritative source. 
 | V3.6.0.8.5 D6 Opus-MED-5 mocha coverage | (mocha-only sub-step; no audit) | inline at `.plans/_active.md` + this section + docs/MASTER-PLAN.md |
 | V3.6.0.10 D8 Op::RestoreSheet | (ship-only sub-step; no per-step audit — coverage by V3.6.0.X phase-termination audit at V3.6.0.11 ship) | inline at `.plans/_active.md` + this section + docs/MASTER-PLAN.md |
 | **V3.6.0.10 docs megaudit** | `2026-05-25-phase-5-7-v3-6-0-10-megaudit-docs-codex.md` (PASS-WITH-FINDINGS; 2 HIGH + 4 MED + 1 LOW + 1 INFO) | `2026-05-25-phase-5-7-v3-6-0-10-megaudit-docs-opus.md` (PASS-WITH-FINDINGS; 3 HIGH + 9 MED + 7 LOW + 5 INFO).  3-lane megaudit (Codex + Opus + claude-self); convergent findings closed in this commit via doc sweep. |
+| V3.6.0.11 D9 typing-stroke watchdog | (ship-only sub-step; no per-step audit — coverage by V3.6.0.X phase-termination audit at V3.6.0.11 ship which is now unblocked) | inline at `.plans/_active.md` + this section + docs/MASTER-PLAN.md |
 
 Date inconsistency note: V3.6.0.3 + V3.6.0.4 transcripts dated 2026-05-23 (per work-start session date); V3.6.0.2 + V3.6.0.5 + docs-audit dated 2026-05-24.  This is a known low-severity drift; convention going forward: filename date = audit execution date (post-midnight transitions retain the original session's date in the header).
 
@@ -2223,7 +2246,7 @@ Date inconsistency note: V3.6.0.3 + V3.6.0.4 transcripts dated 2026-05-23 (per w
 - ~~**V3.6.0.8 D6 incremental WorkbookSnapshot deltas**~~ — V3.6.0.8.1-8.5 ALL SHIPPED.  D6 arc COMPLETE.
 - ~~**V3.6.0.10 D8 `Op::RestoreSheet`**~~ — SHIPPED V3.6.0.10 (re-numbered from V3.6.0.9 in the original V3.6.0.1 lock; user directed the conditional ship via AskUserQuestion at cycle 6 entry).
 - **V3.6.0.9 D7 `#REF!` substitution** (conditional on user signal; engine-side extends `repair_sheet_chain` at `rebuild_workbook` time).
-- **V3.6.0.11 D9 sheet-tabs UI / typing-stroke watchdog** (sheet-tabs deferred to V3.6+ multi-tab redesign; typing-stroke watchdog ship-on-signal).
+- ~~**V3.6.0.11 D9 sheet-tabs UI / typing-stroke watchdog**~~ — typing-stroke watchdog SHIPPED V3.6.0.11 (closes R-V3.5-7); sheet-tabs UI still DEFERRED to V3.6+ multi-tab redesign.
 - **V3.6.0.X phase-termination audit** at V3.6.0.11 ship (broad scope; parallel Codex + Opus).
 - **V3.6.1+** locale-aware format rendering (`format::render` grows locale conditionals).
 - **V3.7+** stable-op-ID OpLog API (closes R-V3.6-10 long-term fix; would let cell_op_index survive Loro UndoManager retracts without rebuild).
