@@ -1,6 +1,6 @@
 # 5.8 Phase 5 Megaudit — Synthesis (Lane E) + Closures
 
-**Status:** SYNTHESIS COMPLETE. Verdict carries ONE pending disposition decision (table Exit-Criterion #2) — see §6.
+**Status:** SYNTHESIS COMPLETE. **VERDICT: PASS-WITH-FINDINGS → PHASE 5 COMPLETE.** Dispositions decided 2026-05-26 (user, §6): tables EC#2 = **DEFER + amend criterion**; Op::Unknown = **amend contract**. Phase 6 entry gate (`entry-plan.md` §3) CLOSED. Confirmed code closures (§5) are post-exit polish, next session.
 **Synthesized:** 2026-05-26 by the orchestrating assistant (Lane E per PLAN.md §3/§4).
 **Audited at:** engine source `1465b1db4c4` (V3.6 PHASE CLEAN); the 4 lanes ran against working-tree `dfa3d113c90` (3 docs-only commits atop the source — confirmed no engine-source delta, so the audited source is correct). IDE `d028568b53b`.
 **Inputs:** `lane-a.md` (Codex), `lane-b.md` (Opus), `lane-c.md` (Opus), `lane-d.md` (Opus). Raw Codex console log: `lane-a.out` (≈54k lines, local only — not committed). Codex final message: `lane-a-last.md`.
@@ -107,7 +107,7 @@ Two findings amend a **stated Phase 5 exit criterion**, so they are not unilater
 - **AMEND (recommended):** document that top-level unknown ops intentionally reject at decode; forward-compat is via wire sub-enums + `.qbook` `snapshot_format_version`. (Cross-version op-log forward-compat is a V3.7+ stable-op-ID concern per existing INFO items.)
 - **BUILD:** add an opaque catch-all `Op::Unknown` arm preserved through export/import now.
 
-**Verdict pending (a):** with DEFER+AMEND → **PASS-WITH-FINDINGS** (Phase 5 COMPLETE; closures §5 are post-exit polish). With BLOCK → **FAIL until table conflict resolution ships.**
+**DECIDED 2026-05-26 (user):** (a) = **DEFER + amend criterion** (option A); (b) = **AMEND the contract** (option A). → **FINAL VERDICT: PASS-WITH-FINDINGS → PHASE 5 COMPLETE.** MASTER-PLAN EC#2 amended + Phase 5 marked COMPLETE + 5.8 marked EXECUTED; `entry-plan.md` §3 Phase 6 gate CLOSED; contract amended for Op::Unknown (top-level unknown ops intentionally reject at decode; forward-compat via wire sub-enums + `.qbook` `snapshot_format_version`). Closures §5 are post-exit polish (next session); the latent-producer cluster (tables/format-id/ClearFormula conflict-resolution + `removedCells` emission) is logged to land with the future collaborative producer.
 
 ---
 

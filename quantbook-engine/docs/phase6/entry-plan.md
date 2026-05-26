@@ -31,20 +31,22 @@ Phase 6's stated entry gate (`MASTER-PLAN.md` §710): *"Phase 4 compatibility an
 | Engine 2B (Correct Runtime Contract) | ✅ done | Prereq for Phase 3; Phase 3+4 proceeded on top |
 | Engine 3 (One Engine — graph/runtime unified) | ✅ SHIPPED | "3.10 Phase 3 Megaudit ✅ SHIPPED 2026-05-12 (W5-43)"; "Phase 3 graph runtime is shipped" (§381); GAP-G-01/G-03 W5-50. The early "fast engine + runtime engine are not one engine" problem is **resolved** — important because Phase 6 UDFs/SQL/AI must not bypass graph invalidation. |
 | Engine 4 (Excel Coverage) | ✅ SHIPPED | A4-01 (4135 workspace tests) + A4-02 (311-row compat matrix, 83%) + A4-03 (177/177 corpus) all ✅; exit packet at `docs/phase4/exit-packet.md` |
-| Engine 5 (Collaboration) | ⚠️ **gate not formally closed** | V3.6 PHASE TERMINATION CLEAN, but the **5.8 Phase 5 Megaudit has not run** — see §3. This is the one open gate. |
+| Engine 5 (Collaboration) | ✅ **gate CLOSED 2026-05-26** | 5.8 Phase 5 Megaudit ran (PASS-WITH-FINDINGS; 0 reachable HIGH; risk register 38/38 confirmed). Phase 5 COMPLETE — see §3 + `docs/phase5/phase-5-exit-packet.md`. |
 | Core runtime API stability | ✅ (compute) / ⚠️ (collab surface) | The compute runtime stabilized at Phase 3/4. The **collab/IDE napi surface is still evolving** (V3.6.1 B10 just added `workbookSnapshotDelta` consumer wiring). This is expected — **Phase 6.1 is the step that consolidates a single stable session API across all bindings**, so residual collab-surface churn is *resolved by* 6.1, not a hard blocker to entering. |
 
 ---
 
-## 3. THE GATE: 5.8 Phase 5 Megaudit (run this before Phase 6)
+## 3. THE GATE: 5.8 Phase 5 Megaudit — ✅ CLOSED 2026-05-26 (PASS-WITH-FINDINGS)
 
-**The single load-bearing finding of this analysis.** The casual prior-session note "Phase 6 is gated on V3.6 exit, which is achieved" is **incomplete**: **V3.6 exit ≠ Phase 5 exit.**
+**✅ DONE 2026-05-26.** The 5.8 Phase 5 Megaudit RAN and returned **PASS-WITH-FINDINGS → PHASE 5 COMPLETE**: ZERO reachable HIGH across 4 lanes, risk register 38/38 confirmed (0 falsely-closed), all 4 exit criteria met for the reachable surface. Exit Criterion #2 was amended (collaborative table-merge deferred — Lane A's table aborts are real but UNREACHABLE: no collaborative table producer; tables are single-writer `WorkbookRuntime`-only). Op::Unknown contract amended (top-level unknown ops intentionally reject at decode). **This gate is CLOSED; Phase 6 entry is unblocked.** Canonical: `docs/phase5/megaudit-5-8/closures.md` (synthesis) + `docs/phase5/phase-5-exit-packet.md`. The original pre-run analysis is preserved below for provenance.
+
+**[Pre-run analysis — provenance]** The casual prior-session note "Phase 6 is gated on V3.6 exit, which is achieved" was **incomplete**: **V3.6 exit ≠ Phase 5 exit.**
 
 - V3.6 is sub-phase **5.7 V3.6**. Its V3.6.0.X phase-termination megaudit covered *only the V3.6 D-decision surface* (D1–D9).
 - The engine plan defines a distinct **`5.8 Phase 5 Megaudit`** (`MASTER-PLAN.md` §679) and an explicit **Audit Checkpoint: "Megaudit after 5.7"** (§684). Its dependency ("5.1–5.7 V2+ complete") is now **met** (5.7 V3.6 phase-clean), so 5.8 is **UNBLOCKED and outstanding**.
 - Scope of 5.8 = the **entire Phase 5 collaboration surface**, not just V3.6: V1 + D-1 + 5.3 + 5.5 (V2 V2 / V2 V3 steps 1–6 / V2 V4 V1) + 5.7 (V1 + V2.1–V2.9 + V3.1 + V3.2 + V3.3 + V3.4 + V3.5 + V3.6). Cross-sub-phase interactions (transport × snapshot × undo × format × sheet-ops × delta) are exactly what per-sub-phase audits cannot see — the same reason the V3.6.0.X 3-lane megaudit caught CONVERGENT-HIGH-1 (RestoreSheet preserved-cells) that the per-step D8 audit missed.
 
-**Recommendation:** run the **5.8 Phase 5 Megaudit** as the FIRST Phase-6-entry action. **It is fully set out + execution-ready at `docs/phase5/megaudit-5-8/`** (PLAN.md + 4 lane prompts + synthesis template; 5-way: Codex Lane A + Opus Lanes B/C/D + claude-self synthesis; ~4–6 days). The next window dispatches per `docs/phase5/megaudit-5-8/PLAN.md` §6. It is the formal Phase 5 exit and satisfies Phase 6's "Phase 5 stable enough to expose" gate. Phase 5 Exit Criteria to verify (§690): `ql-collab` real ✅; cells/formulas/names/sheets/**tables** merge deterministically (verify tables + names explicitly — recent work centered on cells/sheets/format); offline sync + conflict diagnostics ✅; single-writer op log not confused with collaboration ✅.
+**[Pre-run recommendation — provenance, now DONE]** run the **5.8 Phase 5 Megaudit** as the FIRST Phase-6-entry action. **It is fully set out + execution-ready at `docs/phase5/megaudit-5-8/`** (PLAN.md + 4 lane prompts + synthesis template; 5-way: Codex Lane A + Opus Lanes B/C/D + claude-self synthesis; ~4–6 days). The next window dispatches per `docs/phase5/megaudit-5-8/PLAN.md` §6. It is the formal Phase 5 exit and satisfies Phase 6's "Phase 5 stable enough to expose" gate. Phase 5 Exit Criteria to verify (§690): `ql-collab` real ✅; cells/formulas/names/sheets/**tables** merge deterministically (verify tables + names explicitly — recent work centered on cells/sheets/format); offline sync + conflict diagnostics ✅; single-writer op log not confused with collaboration ✅.
 
 ---
 
@@ -76,7 +78,7 @@ Phase 6's stated entry gate (`MASTER-PLAN.md` §710): *"Phase 4 compatibility an
 
 ## 6. Risks / open questions for Phase 6 entry
 
-- **R-P6-1 — Phase 5 exit not yet signed off.** Mitigation: 5.8 megaudit (§3). Until then, "Phase 5 stable enough to expose" is asserted, not audited.
+- ~~**R-P6-1 — Phase 5 exit not yet signed off.**~~ ✅ **RESOLVED 2026-05-26** — the 5.8 megaudit ran (PASS-WITH-FINDINGS; Phase 5 COMPLETE). "Phase 5 stable enough to expose" is now audited, not asserted.
 - **R-P6-2 — collab-surface API churn vs 6.1 lock.** The IDE collab napi is still evolving (V3.6.1 backlog: B9 `removedCells`, CellValueJson union, incremental DOM). 6.1 must lock a session API that the IDE can migrate to without a third rewrite. Decide which collab-surface items freeze pre-6.1.
 - **R-P6-3 — PyO3 + GIL + free-threaded Python.** Canonical risk #12: free-threaded 3.13t blocked (Polars #21889); v1 ships GIL-only Python. 6.4 must assume GIL-only; re-evaluate at Month-6. Sandbox/timeout/cancellation semantics (UDF-6-02) are the hard part, not the call path.
 - **R-P6-4 — UDF/SQL/AI must not bypass graph invalidation** (Phase 6 Exit Criteria). Phase 3's unified graph makes this *possible*; 6.4/6.5/6.6 must each wire explicit dependency invalidation (volatile/lazy semantics for UDFs; refresh-dirties-dependents for SQL).
@@ -87,6 +89,6 @@ Phase 6's stated entry gate (`MASTER-PLAN.md` §710): *"Phase 4 compatibility an
 
 ## 7. Verdict
 
-**Phase 6 is foundation-ready (Phases 2B/3/4 shipped, Phase 5 V3.6 clean) but NOT formally entry-ready until the 5.8 Phase 5 Megaudit runs and closes.** That megaudit is the correct next action; Phase 6 proper (starting with the decision-lock + 6.1) follows it. The highest-value path through Phase 6 is **6.1 → 6.4 (Python UDFs / the wedge)**, which is also on the canonical Month-6 kill gate.
+**Phase 6 is ENTRY-READY (2026-05-26): Phases 2B/3/4 shipped, Phase 5 COMPLETE** — the 5.8 Phase 5 Megaudit ran and closed (PASS-WITH-FINDINGS; 0 reachable HIGH; risk register 38/38). The correct next action is the **Phase 6 decision-lock** (§5 step 2), then **6.1 Stable Session API → 6.4 Python UDFs (the wedge)**, which is on the canonical Month-6 kill gate. (Post-exit Phase 5 polish — `export_snapshot` tombstone filter, `CellValueJson` retype, coverage gaps — is non-blocking; tracked in `docs/phase5/phase-5-exit-packet.md` §5.)
 
 **Deliverables when Phase 6 is locked** (per `MASTER-PLAN.md` §780): this `entry-plan.md` (lock it), `exit-packet.md`, `docs/api/session-api.md`, `docs/security/udf-ai-connectors.md`.

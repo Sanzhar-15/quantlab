@@ -1,6 +1,6 @@
 # 5.8 Phase 5 Megaudit — Execution-Ready Plan
 
-**Status:** READY TO EXECUTE (not yet run). Authored 2026-05-26. The NEXT window picks this up and runs it.
+**Status:** ✅ EXECUTED 2026-05-26 — **PASS-WITH-FINDINGS → PHASE 5 COMPLETE** (0 reachable HIGH; risk register 38/38). Synthesis + verdict: `closures.md`. Exit packet: `../phase-5-exit-packet.md`. (This PLAN is preserved as the dispatch record.)
 
 **This is the formal Phase 5 exit gate** ("Megaudit after 5.7" checkpoint, `MASTER-PLAN §679/§684`) and the entry gate for Phase 6 (`docs/phase6/entry-plan.md` §3). **V3.6 exit ≠ Phase 5 exit** — the V3.6.0.X phase-termination megaudit covered only the V3.6 D-decision surface; THIS megaudit covers the **entire Phase 5 collaboration surface**.
 
@@ -39,7 +39,7 @@ PASS = all 4 verified + zero open HIGH findings + every closed risk confirmed-cl
 - IDE consumer: `extensions/quantlab/src/quantbook/**` (TS; session.ts, cellGrid/*, types.ts).
 
 ### 2.3 Wire surface (`ql-oplog/src/op.rs`) — ~20 `Op` variants + 3 wire enums
-PutValue, PutFormula, ClearFormula, SetName, AddSheet, RenameSheet, RemoveSheet, RestoreSheet, MoveSheet, RegisterFormat, SetCellFormat, BatchCommit, CreateTable, DropTable, RenameTable, RenameColumn, ResizeTable, SetReferenceMode, SetLocale, SetDateSystem, **Unknown(String)** (forward-compat). Wire enums: LocaleWire (En/De/Fr/Unknown), ReferenceModeWire, DateSystemWire. **Every variant needs encode→decode→replay round-trip + multi-peer convergence coverage.**
+PutValue, PutFormula, ClearFormula, SetName, AddSheet, RenameSheet, RemoveSheet, RestoreSheet, MoveSheet, RegisterFormat, SetCellFormat, BatchCommit, CreateTable, DropTable, RenameTable, RenameColumn, ResizeTable, SetReferenceMode, SetLocale, SetDateSystem. **[CORRECTED by the 5.8 megaudit — A#5/B#4/D5-1: there is NO top-level `Op::Unknown(String)`. `Op` uses `#[serde(deny_unknown_fields, tag="kind")]`, so unknown op kinds REJECT at decode. Forward-compat is via the wire SUB-enums' Unknown arms + `.qbook` `snapshot_format_version` — NOT a catch-all op variant. (Decision 2026-05-26: amend the spec, do not build a catch-all arm; cross-version op-log compat is a V3.7+ stable-op-ID concern.)]** Wire enums: LocaleWire (En/De/Fr/Unknown), ReferenceModeWire, DateSystemWire. **Every variant needs encode→decode→replay round-trip + multi-peer convergence coverage.**
 
 ### 2.4 Cache surface (`ql-collab/src/session.rs`) — 7 `CacheEffect` variants
 PutValue, PutFormula, ClearFormula, RegisterFormat, SetCellFormat, RemoveSheet, RestoreSheet. Plus cache fields: `last_snapshot`, `format_table_cache`, `cell_op_index`, `sheet_op_index`, `tombstones`, `last_snapshot_workbook`/`_oplog_vv`/`_op_count`, undo-group state. **Walker correctness + tombstone preservation + index sync are the bug-dense areas (CONVERGENT-HIGH-1 lived here).**
