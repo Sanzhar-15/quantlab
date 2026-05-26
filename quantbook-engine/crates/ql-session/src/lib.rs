@@ -107,6 +107,24 @@ mod tests {
     }
 
     #[test]
+    fn table_spec_round_trips() {
+        use crate::dto::TableSpec;
+        let spec = TableSpec {
+            name: "SALES".into(),
+            sheet: 0,
+            top_row: 1,
+            top_col: 2,
+            rows: 10,
+            cols: 3,
+            has_header: true,
+            has_totals: false,
+            column_names: vec!["Region".into(), "Q1".into(), "Q2".into()],
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        assert_eq!(serde_json::from_str::<TableSpec>(&json).unwrap(), spec);
+    }
+
+    #[test]
     fn schema_version_is_one() {
         assert_eq!(SCHEMA_VERSION, 1);
     }

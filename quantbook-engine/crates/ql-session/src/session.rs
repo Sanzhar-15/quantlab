@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::dto::{
     BatchOptions, BatchResult, BoundRange, CellAddr, CellRange, CellSnapshot, CellValue,
     Diagnostic, DirtyResult, FormatId, PublishedRef, RangeQueryOptions, RangeResult,
-    SessionVersion, SheetInfo, UndoRedoResult, WorkbookSnapshot, WorkbookSnapshotDelta,
+    SessionVersion, SheetInfo, TableSpec, UndoRedoResult, WorkbookSnapshot, WorkbookSnapshotDelta,
     WriteRangeResult,
 };
 use crate::error::EngineResult;
@@ -178,9 +178,33 @@ pub trait EngineSession {
     fn move_sheet(&mut self, id: SheetId, index: u32) -> EngineResult<()>;
     /// Define a name bound to a range.
     fn set_name(&mut self, name: &str, target: CellRange) -> EngineResult<()>;
-    // NOTE: table ops (create/rename/rename_column/resize/drop) are v1
-    // single-writer but elided from this skeleton increment; added with their
-    // DTOs in a later trait increment.
+
+    // Table ops — v1 single-writer (contract §3.3). Name-keyed (canonical
+    // uppercase), matching `WorkbookRuntime` tables. Collaborative table-merge
+    // is deferred (Phase 5 EC#2): a future collaborative table producer MUST
+    // land conflict-resolution + `removed_cells` before these merge across peers.
+
+    /// Create a table from `spec`. Duplicate name → `Conflict`; unknown anchor
+    /// sheet → `NotFound`; zero rows/cols → `BadArgument`.
+    fn create_table(&mut self, spec: TableSpec) -> EngineResult<()>;
+    /// Rename a table. Unknown `old_name` → `NotFound`; `new_name` collision →
+    /// `Conflict`.
+    fn rename_table(&mut self, old_name: &str, new_name: &str) -> EngineResult<()>;
+    /// Rename a column within a table. Unknown table/column → `NotFound`;
+    /// `new_col` collision → `Conflict`.
+    fn rename_column(&mut self, table: &str, old_col: &str, new_col: &str) -> EngineResult<()>;
+    /// Resize a table (add/remove rows/columns). Unknown table → `NotFound`;
+    /// invalid dims → `BadArgument`.
+    fn resize_table(
+        &mut self,
+        name: &str,
+        new_rows: u32,
+        new_cols: u32,
+        added_columns: Vec<String>,
+        removed_columns: Vec<String>,
+    ) -> EngineResult<()>;
+    /// Drop a table. Unknown name → `NotFound`.
+    fn drop_table(&mut self, name: &str) -> EngineResult<()>;
 
     // --- Batch / transaction (§3.4; transport-neutral) ---
 

@@ -173,6 +173,33 @@ pub struct SheetInfo {
     pub name: String,
 }
 
+/// Specification for `create_table` (contract §3.3). Tables are **name-keyed**
+/// (canonical uppercase), anchored at a sheet cell, matching
+/// `WorkbookRuntime::create_table`. Single-writer v1 — collaborative table-merge
+/// is deferred (Phase 5 EC#2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableSpec {
+    /// Table name (canonicalized uppercase by the engine).
+    pub name: String,
+    /// Anchor sheet.
+    pub sheet: SheetId,
+    /// Anchor top-left row.
+    pub top_row: RowId,
+    /// Anchor top-left column.
+    pub top_col: ColId,
+    /// Row count (incl. header/totals if present); must be > 0.
+    pub rows: u32,
+    /// Column count; must be > 0.
+    pub cols: u32,
+    /// Whether the first row is a header.
+    pub has_header: bool,
+    /// Whether the last row is a totals row.
+    pub has_totals: bool,
+    /// Column display names (length should match `cols`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub column_names: Vec<String>,
+}
+
 /// The workbook's date epoch system.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
