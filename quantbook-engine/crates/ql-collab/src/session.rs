@@ -1797,6 +1797,22 @@ impl CollabSession {
         sheets.into_iter().collect()
     }
 
+    /// **Phase 5.8 post-megaudit closure (2026-05-26, finding B#1)** --
+    /// cheap cache-layer tombstone check, WITHOUT a `rebuild_workbook`.
+    /// Returns true iff `sheet` is currently `Op::RemoveSheet`'d (present
+    /// in the cache's `removed_sheets` tracker).
+    ///
+    /// Since the R-V3.6-19 closure made the cache PRESERVE cells on a
+    /// tombstoned sheet (no prune at `RemoveSheet`), low-level accessors
+    /// like `snapshot_cells` are intentionally tombstone-AGNOSTIC, so every
+    /// VISIBILITY consumer must filter explicitly.  `list_sheets_from_cache`
+    /// (above) and `workbook_snapshot` (napi `is_sheet_removed` skip) already
+    /// do; the `export_snapshot` napi did NOT (5.8 megaudit Lane B#1) and now
+    /// uses this accessor to mirror them.
+    pub fn is_sheet_removed_in_cache(&self, sheet: u16) -> bool {
+        self.removed_sheets.contains(&sheet)
+    }
+
     /// **Phase 5.7 V3.6.0.3 D2 (2026-05-24)** -- iterate the session-
     /// wide format-table cache (`(FormatId, format_string)` pairs).
     ///
@@ -6030,6 +6046,44 @@ mod tests {
         assert_eq!(state.formula, None);
         assert!(!s3.snapshot_cells(7).is_empty(),
             "value-bearing cell survives formula clear");
+    }
+
+    #[test]
+    fn is_sheet_removed_in_cache_tracks_tombstone_while_snapshot_cells_preserves() {
+        // 5.8 megaudit Lane B#1 (2026-05-26): the cache-layer tombstone
+        // accessor that the `export_snapshot` napi now uses to avoid
+        // leaking a removed sheet's PRESERVED cells.  Invariant:
+        // `snapshot_cells` stays tombstone-AGNOSTIC (R-V3.6-19 no-prune
+        // preserves cells); `is_sheet_removed_in_cache` reports tombstone
+        // state so VISIBILITY consumers filter explicitly (mirrors
+        // list_sheets_from_cache + the workbook_snapshot is_sheet_removed
+        // skip).
+        let mut s = CollabSession::new(PeerId::new(1)).unwrap();
+        s.append_op(put_value(7, 0, 0, 42.0)).unwrap();
+        assert!(!s.is_sheet_removed_in_cache(7));
+        assert_eq!(s.snapshot_cells(7).len(), 1);
+
+        // Tombstone sheet 7: accessor flips true; snapshot_cells PRESERVES.
+        s.append_op(Op::RemoveSheet { id: 7 }).unwrap();
+        assert!(s.is_sheet_removed_in_cache(7), "tombstone tracked in cache");
+        assert_eq!(
+            s.snapshot_cells(7).len(),
+            1,
+            "snapshot_cells stays tombstone-agnostic (R-V3.6-19 preserve)"
+        );
+        // The fix's effect: a visibility consumer that filters on the
+        // accessor (export_snapshot) hides the cell while it's tombstoned.
+        assert!(s.list_sheets_from_cache().is_empty(), "tombstoned sheet hidden from cache enum");
+
+        // Restore: accessor flips false; cells resurface.
+        s.append_op(Op::RestoreSheet { id: 7 }).unwrap();
+        assert!(!s.is_sheet_removed_in_cache(7), "tombstone cleared on restore");
+        assert_eq!(
+            s.snapshot_cells(7).len(),
+            1,
+            "cells resurface post-restore"
+        );
+        assert_eq!(s.list_sheets_from_cache(), vec![7], "restored sheet re-surfaces");
     }
 
     #[test]

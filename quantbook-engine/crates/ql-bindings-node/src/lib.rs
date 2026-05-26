@@ -1754,7 +1754,17 @@ impl CollabSession {
         // `snapshot_cells` returns entries pre-sorted by (row, col)
         // ascending; the filter_map + JSON-build preserves that order.
         let inner = self.inner.lock();
-        let entries_vec = inner.snapshot_cells(sheet);
+        // 5.8 megaudit Lane B#1 (2026-05-26): the cache PRESERVES cells on a
+        // tombstoned sheet (R-V3.6-19 no-prune), and `snapshot_cells` is
+        // tombstone-AGNOSTIC.  Filter here -- mirroring the `workbook_snapshot`
+        // `is_sheet_removed` skip (~lib.rs:2226) + `list_sheets_from_cache` --
+        // so a removed sheet does NOT leak its pre-tombstone cells.  An empty
+        // entries list (cells hidden) is the correct shape, not an error.
+        let entries_vec = if inner.is_sheet_removed_in_cache(sheet) {
+            Vec::new()
+        } else {
+            inner.snapshot_cells(sheet)
+        };
         let entries_json: Vec<serde_json::Value> = entries_vec
             .into_iter()
             .filter_map(|((row, col), state)| {
