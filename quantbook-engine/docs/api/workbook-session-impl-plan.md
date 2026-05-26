@@ -1,9 +1,12 @@
 # 6.1B Increment 2 — `WorkbookSession` Implementation Plan
 
-**Status:** ⏳ IN PROGRESS — **2b (core path) + 2c-1 (read-path completion) SHIPPED 2026-05-26**
-(`83b1b33bac2` PlanCache → `7335a5a1bfa` WorkbookSession core → `993492b6f9b` validate_formula +
-query_range + `CellValue::Blank`). The owning `WorkbookSession` exists in `crates/ql-exec/src/session.rs`
-and `impl EngineSession`; 11 session tests + 647 ql-exec lib tests green, clippy clean.
+**Status:** ⏳ IN PROGRESS — **2b (core) + 2c-1 (read path) + 2c-2 (structure + table ops) SHIPPED
+2026-05-26** (`83b1b33bac2` PlanCache → `7335a5a1bfa` core → `993492b6f9b` validate_formula/query_range/
+`CellValue::Blank` → `2b5e7a13f5b` delete/restore/move sheet + tables). The owning `WorkbookSession`
+exists in `crates/ql-exec/src/session.rs` and `impl EngineSession`; 14 session tests + 650 ql-exec lib
+tests green, clippy clean. **Remaining (NEXT, surfaced `not_implemented_in_v1_core`): snapshot_delta
+(needs the §3 design decision) → batch/txn → undo/redo → persistence → functions → reserved bulk →
+Node smoke migration → 6.1C audit.**
 
 ### What 2b shipped (REAL)
 - **2a — PlanCache session-ownership** (§3): `WorkbookRuntime::with_session_state(.., PlanCache)` +
@@ -27,12 +30,25 @@ and `impl EngineSession`; 11 session tests + 647 ql-exec lib tests green, clippy
    than `Vec<Option<CellValue>>`. Columnar dense read; empties → `CellValue::Blank`; inverted range →
    `BadArgument`; >1M-cell request → `BadArgument` (fail-loud OOM guard). `include_*` options reserved
    (v1 `RangeColumn` is values-only). Snapshot still omits blanks (`CellSnapshot.value: None`).
-3. **`snapshot_delta`** (step 6) — the op-walk + §4.3 rules (epoch_mismatch / invalid_version_token).
-4. **`delete_sheet`/`restore_sheet`/`move_sheet`** (MED-3) — NOT on `WorkbookRuntime`; need a fail-loud
-   wrapper (validate first → `NotFound`/`BadArgument`) + **manual `Op::{RemoveSheet,RestoreSheet,
-   MoveSheet}` emission** into the oplog (mirror the napi layer), since `Workbook::{remove,restore,move}_sheet`
-   are silent no-op/clamp.
-5. **table ops** (5) — straight `WorkbookRuntime` delegations (`tables.rs`).
+3. ⚠️ **`snapshot_delta`** (DEFERRED — design decision needed; **resolve in the audit/next window**).
+   The obvious stateless op-walk (`ops[last_op_count..current)`) is **insufficient**: `recompute_dirty`/
+   `recompute_all` write recomputed dependents via `Workbook::put_computed_at` and **do NOT append ops**,
+   so an op-walk captures the user-edited cell (A1) but MISSES its recomputed dependents (B1=A1*2) — a
+   silently-incomplete delta (No-Fallbacks violation). And `snapshot_delta` is `&self`, so it can't
+   diff-against-a-cached-snapshot. Resolution options: **(a)** a session change-log keyed by version,
+   built during mutations + recompute — needs recompute to report changed coords (extend
+   `RecomputeResult`, or read the graph dirty set pre-recompute); **(b)** make it `&mut self` + a
+   last-snapshot diff cache (mirrors the proven collab path) — a contract change; **(c)** recompute
+   appends computed-value ops (heavy; pollutes the log). (a) is the likely choice. Full note in
+   `crates/ql-exec/src/session.rs` `snapshot_delta`.
+4. ✅ **`delete_sheet`/`restore_sheet`/`move_sheet`** (SHIPPED inc.2c-2, `2b5e7a13f5b`) — fail-loud
+   (unknown id → `NotFound`; out-of-range move index → `BadArgument`); validate against the live
+   workbook, append `Op::{RemoveSheet,RestoreSheet,MoveSheet}` (append-before-mutate), then mutate.
+   Known-but-tombstoned id = idempotent no-op. (Cross-sheet dependents not proactively dirtied — v1.)
+5. ✅ **table ops** (SHIPPED inc.2c-2) — `create/rename/rename_column/resize/drop_table` as
+   `WorkbookRuntime` delegations (emit ops + graph table-hooks). drop/rename unknown → `NotFound`.
+   (Zero-dim create → `Conflict` via `TableCreateRejected` — surfaced, classified one tier over
+   `BadArgument`; minor.)
 6. **`batch`/transactions** + **`undo`/`redo`** (needs `OpLog::new_undo_manager`) + **persistence**
    (`open`/`import`/`save`/`export` via `ql_io` — adds `PersistenceError` mapping to Appendix A).
 7. **functions** (6.4) + **reserved bulk** (6.4/6.5).
