@@ -36,7 +36,7 @@ The PLAN/checklist named a top-level `Op::Unknown(String)` forward-compat mechan
 
 ## 5. Post-exit polish (confirmed-but-latent; next session; NOT Phase-6-blocking)
 
-1. **`export_snapshot` tombstone filter** (Lane B#1, MED) — the R-V3.6-19 closure missed `export_snapshot` napi + the raw `snapshot_cells` accessor; both return pre-tombstone cells for a removed sheet. Latent (live path uses `workbook_snapshot`). Fix: push `is_sheet_removed` into `snapshot_cells` + regression test.
+1. ✅ **DONE 2026-05-26 (`ff09a5e17a7`)** — **`export_snapshot` tombstone filter** (Lane B#1, MED). Added `CollabSession::is_sheet_removed_in_cache`; `export_snapshot` now returns empty entries for a tombstoned sheet (mirrors `workbook_snapshot`'s `is_sheet_removed` skip). `snapshot_cells` deliberately kept tombstone-agnostic (its R-V3.6-19 invariant tests depend on it — pushing the filter there would break them). +1 ql-collab regression test (255 pass / 0 fail; napi lib `cargo check` clean). Latent → the `.node` rebuild that makes it live happens with the next IDE build.
 2. **`CellValueJson` discriminated-union retype** (Lane D2-1, LOW) — TS-only; keep defensive runtime guards.
 3. **Coverage gaps** (D5-1/2/3) — collab `merge_bytes` multi-peer convergence tests for uncovered ops; promote Codex's CODEX-MED-1 probe.
 4. **Doc-drift sweep** (B#2 debug_assert cite, B#3 on_pop title, C#2 render-error misattribution UX).

@@ -87,7 +87,7 @@ Same logic applies to **A#6** (no `appendRegisterFormat`) and **C#1** (no `appen
 
 | # | Item | Severity | Fix | Cost |
 |---|---|---|---|---|
-| 1 | B#1 export_snapshot tombstone leak | MED | Push `is_sheet_removed` filter into `snapshot_cells` (covers both `export_snapshot` + the raw accessor) OR filter in `export_snapshot`; + regression test. Completes the R-V3.6-19 closure. | small (engine) |
+| 1 | ✅ **DONE `ff09a5e17a7`** B#1 export_snapshot tombstone leak | MED | FIXED: added `CollabSession::is_sheet_removed_in_cache` (cheap cache-layer tombstone check); `export_snapshot` returns empty entries for a tombstoned sheet (mirrors `workbook_snapshot`). `snapshot_cells` kept tombstone-agnostic (its R-V3.6-19 invariant tests depend on it). +1 ql-collab test (255 pass). Latent → .node rebuild makes it live with next IDE build. | small (engine) ✅ |
 | 2 | D2-1 CellValueJson union | LOW | Retype as a real TS discriminated union (+ Rust mirror if cheap); keep the IDE defensive runtime guards. | small (TS) |
 | 3 | D5-1 / D5-2 / D5-3 coverage | MED/LOW | Add: `Op::Unknown`-equivalent wire round-trip (or remove from spec, §6); collab `merge_bytes` multi-peer convergence tests for the uncovered ops; promote Codex's CODEX-MED-1 probe. | small (tests) |
 | 4 | B#2/B#3/C#3/A#1 doc drift | INFO | Sweep cite/title drift in the contract + PLAN. | trivial (docs) |
