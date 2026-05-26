@@ -2292,7 +2292,7 @@ suite('quantbook V3.2.a -- exportSnapshot cell-snapshot export', function () {
 // Phase 5.7 V3.2.b.5 -- cell-edit flow (HTML + dispatcher)
 // ============================================================================
 
-import { acquireWorkbookSnapshotViaDelta, buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, buildVirtualRows, classifyPollTick, computeVisibleRange, dispatchIncomingMessage, extractSheetSnapshot, mergeWorkbookDelta, parseCellRawInput, validatePresenceNumeric, type DeltaSnapshotCache, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
+import { acquireWorkbookSnapshotViaDelta, buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, buildVirtualRows, classifyPollTick, computeVisibleRange, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache, mergeWorkbookDelta, parseCellRawInput, validatePresenceNumeric, type DeltaSnapshotCache, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
 
 suite('quantbook V3.2.b.2 -- cellGridHtml.ts nonce + script + editable cells', function () {
 	test('buildHtml WITHOUT nonce is unchanged from V3.2.a (no script tag; narrow CSP)', () => {
@@ -7432,7 +7432,12 @@ suite('quantbook V3.6.1 -- acquireWorkbookSnapshotViaDelta protocol (engine)', f
 		assert.strictEqual(b10FindCell(merged, 0, 1, 0)!.value!.number, 2, 'peer op reflected after merge');
 	});
 
-	test('multi-panel-same-session: first panel fast, second observes staleness, both converge (BUG-1 pin)', () => {
+	test('SEPARATE caches: first fast, second sees staleness, both converge (per-cache correctness)', () => {
+		// This pins the orchestrator's staleness-correctness when two
+		// callers hold SEPARATE caches.  NOTE: production no longer does
+		// this -- panels share one per-session cache (see getSharedDeltaCache
+		// + the shared-cache test below), so both panels actually ride the
+		// fast path.  Separate caches remain a supported function input.
 		const s = createSession(1n);
 		s.addSheet('S', 16384);
 		s.appendPutValue(0, 0, 0, 1);
@@ -7445,15 +7450,37 @@ suite('quantbook V3.6.1 -- acquireWorkbookSnapshotViaDelta protocol (engine)', f
 		s.appendPutValue(0, 1, 0, 2); // one change advances the single per-session VV
 		const mergedA = acquireWorkbookSnapshotViaDelta(ca.session, cacheA);
 		const mergedB = acquireWorkbookSnapshotViaDelta(cb.session, cacheB);
-		// A polled first -> fast delta (advances the shared per-session
-		// cache VV); B then sees staleness -> full re-fetch.
-		assert.strictEqual(ca.snaps(), 1, 'panel A took the fast path (no re-fetch)');
+		// A polled first -> fast delta (advances the engine cache VV); B's
+		// separate cache then sees staleness -> full re-fetch.
+		assert.strictEqual(ca.snaps(), 1, 'cache A took the fast path (no re-fetch)');
 		assert.strictEqual(ca.deltas(), 1);
-		assert.ok(cb.snaps() >= 2, 'panel B observed staleness -> full re-fetch (documented degradation)');
+		assert.ok(cb.snaps() >= 2, 'separate cache B observed staleness -> full re-fetch');
 		// Correctness despite the perf split: both converge.
-		assert.deepStrictEqual(mergedA.sheets, mergedB.sheets, 'both panels converge to identical sheet data');
+		assert.deepStrictEqual(mergedA.sheets, mergedB.sheets, 'both converge to identical sheet data');
 		assert.strictEqual(b10FindCell(mergedA, 0, 1, 0)!.value!.number, 2);
 		assert.strictEqual(b10FindCell(mergedB, 0, 1, 0)!.value!.number, 2);
+	});
+
+	test('SHARED per-session cache: both panels ride the fast path (no full rebuild for the sibling)', () => {
+		// Production behavior: getSharedDeltaCache returns ONE cache per
+		// session, so a sibling panel's render sees a same-VV empty delta
+		// instead of a staleness-driven full rebuild.
+		const s = createSession(1n);
+		s.addSheet('S', 16384);
+		s.appendPutValue(0, 0, 0, 1);
+		// getSharedDeltaCache returns the SAME object for the same session.
+		assert.strictEqual(getSharedDeltaCache(s), getSharedDeltaCache(s), 'one cache per session');
+		const shared = getSharedDeltaCache(s);
+		const c = counting(s);
+		acquireWorkbookSnapshotViaDelta(c.session, shared); // panel A render: seed (snaps=1)
+		s.appendPutValue(0, 1, 0, 2);
+		const mergedA = acquireWorkbookSnapshotViaDelta(c.session, shared); // panel A: fast delta -> advances shared cache
+		const mergedB = acquireWorkbookSnapshotViaDelta(c.session, shared); // panel B: same-VV empty delta (NOT a rebuild)
+		assert.strictEqual(c.snaps(), 1, 'no full re-fetch beyond the seed -- both panels fast');
+		assert.ok(c.deltas() >= 2, 'both sibling renders went through the delta path');
+		assert.strictEqual(b10FindCell(mergedA, 0, 1, 0)!.value!.number, 2);
+		assert.strictEqual(b10FindCell(mergedB, 0, 1, 0)!.value!.number, 2, 'sibling sees the merged state');
+		assert.deepStrictEqual(mergedA.sheets, mergedB.sheets, 'identical (same shared snapshot object)');
 	});
 
 	test('shape equivalence: delta-merged data === fresh workbookSnapshot across an op sequence (divergence guard)', () => {

@@ -34,7 +34,7 @@ import { buildPresenceSnapshotJson, parseQuantbookError } from '../session';
 import type { CollabSessionInstance, QuantbookCellSnapshot, QuantbookNativeModule, TransportInstance, WorkbookSnapshotJson } from '../types';
 import { reconnectWithBackoff } from '../multiWindowDemo';
 import { buildHtml } from './cellGridHtml';
-import { acquireWorkbookSnapshotViaDelta, classifyPollTick, dispatchIncomingMessage, extractSheetSnapshot, type DeltaSnapshotCache } from './cellGridLogic';
+import { acquireWorkbookSnapshotViaDelta, classifyPollTick, dispatchIncomingMessage, extractSheetSnapshot, getSharedDeltaCache } from './cellGridLogic';
 
 const VIEW_TYPE = 'quantlab.quantbookCellGrid';
 
@@ -527,20 +527,6 @@ export class CellGridPanel {
 	 */
 	_pendingRenderAfterTyping: boolean = false;
 
-	/**
-	 * **Phase 5.7 V3.6.1 (2026-05-26) -- incremental snapshot delta cache
-	 * (OPUS-PT-B10).**
-	 *
-	 * Per-panel client-side state for {@link acquireWorkbookSnapshot}'s
-	 * two-call delta protocol: the accumulated FULL workbook snapshot (all
-	 * sheets -- `render()` needs `sheets.length` + the active-sheet name
-	 * for the title, and a sibling panel for another sheet may share this
-	 * session) + the last captured version token.  Both `undefined` until
-	 * the first acquisition (forces a full `workbookSnapshot()` seed).
-	 * Mutated in place by {@link acquireWorkbookSnapshotViaDelta}.
-	 */
-	private readonly _deltaCache: DeltaSnapshotCache = { snapshot: undefined, version: undefined };
-
 	private constructor(
 		private readonly panel: vscode.WebviewPanel,
 		private readonly session: CollabSessionInstance,
@@ -765,17 +751,19 @@ export class CellGridPanel {
 	 * - COLLAB merged-tick repaint: `pollRemote` force-clears the engine
 	 *   cache on a merge, so the next delta returns `fullRebuildRequired`
 	 *   -> full fetch.  Same cost as pre-V3.6.1 (no regression).
-	 * - MULTIPLE panels on ONE session: `workbookSnapshotDelta` advances
-	 *   the single per-session engine cache VV, so after any change only
-	 *   the first panel to poll gets the fast path; siblings observe
-	 *   staleness -> full fetch.  Correct (never diverges), not optimal;
-	 *   a shared per-session snapshot cache (V-next) would fix it.
+	 * - MULTIPLE panels on ONE session: all ride the fast path.  The client
+	 *   cache is shared per session (see {@link getSharedDeltaCache}) to
+	 *   mirror the engine's per-session cache, so the first panel's delta
+	 *   advances the shared snapshot + version and siblings then observe a
+	 *   same-VV empty delta (not a full rebuild).  A panel opened later
+	 *   piggybacks on the already-seeded shared snapshot.
 	 */
 	private acquireWorkbookSnapshot(): WorkbookSnapshotJson {
 		// Delegates to the pure, vscode-free orchestrator so the two-call
-		// protocol is mocha-testable without a panel.  `_deltaCache` is
-		// mutated in place (snapshot + version advance).
-		return acquireWorkbookSnapshotViaDelta(this.session, this._deltaCache);
+		// protocol is mocha-testable without a panel.  The cache is shared
+		// per session (mutated in place: snapshot + version advance) so all
+		// panels bound to this session ride the delta fast path.
+		return acquireWorkbookSnapshotViaDelta(this.session, getSharedDeltaCache(this.session));
 	}
 
 	/**

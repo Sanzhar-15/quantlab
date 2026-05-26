@@ -1116,3 +1116,39 @@ export function acquireWorkbookSnapshotViaDelta(
 	cache.version = delta.version;
 	return merged;
 }
+
+/**
+ * **Phase 5.7 V3.6.1 (2026-05-26) -- per-session shared delta cache
+ * registry (OPUS-PT-B10 multi-panel completion).**
+ *
+ * One {@link DeltaSnapshotCache} per `CollabSession`, shared across every
+ * `CellGridPanel` bound to that session.  The engine's snapshot cache is
+ * itself per-session (one `last_snapshot_*` triple on the napi
+ * `CollabSession`, advanced by every `workbookSnapshotDelta` call), so a
+ * PER-PANEL client cache mismatches the engine model: after any change
+ * only the first panel to poll hits the same-VV fast path and siblings
+ * observe staleness -> full rebuild.  Sharing ONE client cache per session
+ * mirrors the engine model so all panels ride the delta fast path.
+ *
+ * Safe as shared mutable state: VS Code extension-host JS is
+ * single-threaded, and `CellGridPanel.render()` reads the returned
+ * snapshot synchronously (never retains it across renders), so panel
+ * renders that share a cache are strictly sequential -- no races.  The
+ * `WeakMap` auto-GCs the cache when the session is collected; no explicit
+ * teardown.  A panel created later piggybacks on the already-seeded shared
+ * snapshot (skips its own full seed).
+ */
+const SESSION_DELTA_CACHES = new WeakMap<CollabSessionInstance, DeltaSnapshotCache>();
+
+/**
+ * Get (or lazily create) the shared {@link DeltaSnapshotCache} for
+ * `session`.  See {@link SESSION_DELTA_CACHES}.
+ */
+export function getSharedDeltaCache(session: CollabSessionInstance): DeltaSnapshotCache {
+	let cache = SESSION_DELTA_CACHES.get(session);
+	if (cache === undefined) {
+		cache = { snapshot: undefined, version: undefined };
+		SESSION_DELTA_CACHES.set(session, cache);
+	}
+	return cache;
+}
