@@ -1,6 +1,6 @@
 # Phase 6 (Product Surfaces) — Entry-Readiness Analysis
 
-**Status:** ANALYSIS / NOT-YET-LOCKED. Authored 2026-05-26 as an entry-readiness assessment, not the locked Phase 6 entry plan. The locked plan + decision-lock happen at Phase 6 kickoff (a fresh session), informed by this document and the 5.8 megaudit verdict (see §3).
+**Status:** ✅ LOCKED 2026-05-26 — the Phase 6 decision-lock is complete (Codex-validated, gpt-5.5 xhigh). **The authoritative locked decisions + sequence live in `docs/phase6/decision-lock.md`** (this document remains the entry-readiness analysis that informed it). The §5 sequencing below is SUPERSEDED by `decision-lock.md` §2 (which stages 6.4 into 6.4A/6.4B + inserts a `6.4-0` function-metadata substrate).
 
 **Authored at:** engine `741b9530b3d` (V3.6.1.2 + B8/CellValueJson doc closes; engine SOURCE unchanged at `1465b1db4c4` = V3.6 PHASE TERMINATION CLEAN) + IDE `d028568b53b` (V3.6.1.2).
 
@@ -67,6 +67,8 @@ Phase 6's stated entry gate (`MASTER-PLAN.md` §710): *"Phase 4 compatibility an
 ---
 
 ## 5. Recommended sequencing
+
+> ⚠️ **SUPERSEDED by `docs/phase6/decision-lock.md` §2** (LOCKED 2026-05-26). The locked sequence stages the wedge as **6.1A → 6.1B → 6.1C(audit) → 6.4-0(fn-metadata) → 6.4A(MVP UDF + minimal Python slice) → 6.4B(harden) → 6.3 → 6.2 → 6.5 → 6.6 → 6.7**. The pre-lock recommendation below is retained for provenance.
 
 1. **5.8 Phase 5 Megaudit** (gate; 3-lane; ~4–6 d) → formal Phase 5 exit. *Do not enter Phase 6 before this passes / closes.*
 2. **Phase 6 decision-lock** (docs-only, mirrors V3.6.0.1 lock): pick HTTP-vs-gRPC for 6.2; confirm binding priority order; confirm `AI()` provider policy or defer 6.6; confirm whether to pull **6.4 (Python UDFs) earlier** given its strategic/kill-gate weight.

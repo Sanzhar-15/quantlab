@@ -707,6 +707,8 @@ This session counted **2 plan-implement-audit cycles** (V3.6.0.6 D5 ship + V3.6.
 
 ## Phase 6 - Product Surfaces
 
+**✅ DECISION-LOCKED 2026-05-26** (Codex-validated): authoritative locked decisions + sequence at `docs/phase6/decision-lock.md`. Lock = **wedge-first, staged**: 6.1A session-API contract → 6.1B owning `WorkbookSession` → 6.1C security audit → 6.4-0 function-metadata substrate → 6.4A MVP Python UDF + minimal `quantbook-py` authoring slice (proves the Month-6 kill gate) → 6.4B UDF hardening → 6.3 full bindings → 6.2 service (defer HTTP-vs-gRPC) → 6.5 SQL/connectors → 6.6 AI (sentinel; `=AI()` cell fn is v2-aligned) → 6.7 audit. Entry-readiness analysis: `docs/phase6/entry-plan.md`.
+
 **Purpose:** Expose the same engine through service mode, WASM, Node, C, Python, SQL, connectors, Python UDFs, and AI().
 
 **Entry State Required**
