@@ -26,6 +26,9 @@ status: |
   taxonomy + operation/lifecycle types + FunctionMetadata skeleton. TYPE-LEVEL ONLY (no impl);
   compiles + 4 unit tests pass + clippy clean. Reuses ql-types. Self-tests pin the CellValue
   wire shape, the structured-error contract, and the malformed-token-is-fail-loud (No-Fallbacks) rule.
+  ✅ inc.1b (`38108a5c8ef`, CODE cycle 2/2) completed the EngineSession trait with the v1 table ops
+  (create/rename/rename_column/resize/drop_table) + TableSpec DTO (5 tests). ⚠️ a git-index padding
+  race truncated the inc.1 commit's dto.rs/session.rs blobs — caught + fixed at `af15dcf3a5d`.
 
   ⭐ NEXT = 6.1B increment 2: IMPLEMENT the owning `WorkbookSession` struct (`impl EngineSession`),
   wrapping WorkbookRuntime + OpLog + CalcgraphSession + PlanCache + FunctionRegistry. Required
@@ -46,7 +49,7 @@ direction: |
   foundation; 6.4 (Python UDFs) is the strategic wedge; everything else (full bindings,
   service, SQL, AI) follows. Collab is v1.5-deferred and must NOT pre-empt Phase 6.
 
-current_engine_head: 20d11072a0a (6.1B inc.1 — ql-session crate, type skeleton; first NEW non-docs code since the S2-01 fix) ← ff6cd4c147c (6.1A v2 Codex-validated) ← 85966ece7b4 (6.1A session-api.md) ← 5886ff32101 (doc-handoff fixes). The ql-session crate is type-only (no impl, no reverse-deps yet) so it touches no existing behavior; the S2-01 source fix at 7e536fc07b2 is still the last change to PRE-EXISTING engine code. pre-B#1 baseline 1465b1db4c4.
+current_engine_head: 38108a5c8ef (6.1B inc.1b — EngineSession trait completed w/ table ops) ← af15dcf3a5d (ql-session race-fix: 20d11072a0a captured TRUNCATED dto.rs/session.rs via the git-index padding race; fixed, crate compiles) ← 014aa41ab4c (plan sync) ← 20d11072a0a (6.1B inc.1 — ql-session crate, type skeleton) ← ff6cd4c147c (6.1A v2 Codex-validated) ← 85966ece7b4 (6.1A session-api.md). The ql-session crate is type-only (no impl, no reverse-deps) so it touches no existing behavior; the S2-01 fix at 7e536fc07b2 is still the last change to PRE-EXISTING engine code. pre-B#1 baseline 1465b1db4c4.
 current_ide_head: d028568b53b (V3.6.1.2 shared delta cache) — unchanged
 audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait claims need positive compile proof; phase-level closures use 3-5-way megaudits; range-aware fn ships need lex+parse+bind+eval coverage.
 
@@ -56,9 +59,10 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
 2. ✅ **6.1A — Session API contract** — docs/api/session-api.md v2 (SHIPPED + Codex-validated 2026-05-26).
 3. **6.1B — Owning WorkbookSession** — single-engine owning session around WorkbookRuntime +
    OpLog + CalcgraphSession + PlanCache + FunctionRegistry (calcgraph_session.rs:69-71 anticipates it).
-   - ✅ **inc.1 (`20d11072a0a`)**: `ql-session` crate — EngineSession trait + binding-neutral DTO module
-     (schema_version) + EngineError taxonomy + operation/lifecycle types + FunctionMetadata skeleton.
-     Type-level only; compiles + tests + clippy clean.
+   - ✅ **inc.1 (`20d11072a0a`, +race-fix `af15dcf3a5d`) + inc.1b (`38108a5c8ef`)**: `ql-session` crate —
+     EngineSession trait + binding-neutral DTO module (schema_version) + EngineError taxonomy +
+     operation/lifecycle types + FunctionMetadata skeleton + v1 table ops + TableSpec. Type-level only;
+     compiles + 5 tests + clippy clean. (Trait surface now complete for inc.2 to implement.)
    - ⭐ **inc.2 (NEXT)**: implement `WorkbookSession` (`impl EngineSession`) — PlanCache refactor (LOW-1),
      mandatory single-writer OpLog + VV token (HIGH-2), cancellation registry + Busy state (HIGH-1),
      fail-loud sheet wrappers (MED-3), EngineError Appendix A, event queue. Migrate the Node smoke path.
