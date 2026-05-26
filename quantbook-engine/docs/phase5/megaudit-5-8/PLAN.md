@@ -1,6 +1,6 @@
 # 5.8 Phase 5 Megaudit — Execution-Ready Plan
 
-**Status:** ✅ EXECUTED 2026-05-26 — **PASS-WITH-FINDINGS → PHASE 5 COMPLETE** (0 reachable HIGH; risk register 38/38). Synthesis + verdict: `closures.md`. Exit packet: `../phase-5-exit-packet.md`. (This PLAN is preserved as the dispatch record.)
+**Status:** ✅ EXECUTED 2026-05-26 — **PASS-WITH-FINDINGS → PHASE 5 COMPLETE** (0 reachable HIGH; risk register 39/39 confirmed). Synthesis + verdict: `closures.md`. Exit packet: `../phase-5-exit-packet.md`. (This PLAN is preserved as the dispatch record.)
 
 **This is the formal Phase 5 exit gate** ("Megaudit after 5.7" checkpoint, `MASTER-PLAN §679/§684`) and the entry gate for Phase 6 (`docs/phase6/entry-plan.md` §3). **V3.6 exit ≠ Phase 5 exit** — the V3.6.0.X phase-termination megaudit covered only the V3.6 D-decision surface; THIS megaudit covers the **entire Phase 5 collaboration surface**.
 

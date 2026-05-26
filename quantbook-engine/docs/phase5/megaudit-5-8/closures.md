@@ -20,7 +20,7 @@
 
 Lane A is the sole FAIL, and its FAIL rests **entirely** on the three table-convergence HIGHs (A#2/#3/#4). Those are **proven** replay-layer aborts but are **not reachable through the Phase 5 collaborative surface** (verified independently — see §3). The other three lanes — the ones that assessed reachability and scope — returned PASS / PASS-WITH-FINDINGS with 0 HIGH.
 
-**Risk register: 38/38 entries confirmed in their claimed state (Lane B), 0 falsely-closed.**
+**Risk register: 39/39 entries confirmed in their claimed state (Lane B), 0 falsely-closed.** (R-V3.3-1..6 + R-V3.4-1..7 + R-V3.5-1..7 + R-V3.6-1..19 = 39; the earlier "38" was a count error, corrected by the session mega-audit Lane S4.)
 
 ---
 
@@ -39,7 +39,7 @@ Lane A is the sole FAIL, and its FAIL rests **entirely** on the three table-conv
 - **B#2 — INFO** — R-V3.6-15 `debug_assert` cited at `lib.rs:2604`; actual `2609-2617`. Doc cite drift.
 - **B#3 — INFO** — R-V3.6-1 title says "on_pop" but code uses `set_on_push` + `top_undo_meta`. Doc drift.
 - **B#4 — INFO (CONVERGENT)** — PLAN §2.3 lists a top-level `Op::Unknown(String)` that doesn't exist. Converges with A#5, D5-1.
-- Risk register: **all 38 walked, 0 falsely-closed**; every CLOSED risk's closure code + named regression test located. 4 exit criteria verified engine-side. All engine suites pass (ql-collab 158+101, ql-oplog 67, ql-storage 199; napi clean compile ⇒ Send+Sync proven).
+- Risk register: **all 39 walked, 0 falsely-closed**; every CLOSED risk's closure code + named regression test located. 4 exit criteria verified engine-side. All engine suites pass (ql-collab 154 lib + 101 integration = 255, ql-oplog 67, ql-storage 199; napi clean compile ⇒ Send+Sync proven). [counts corrected by session mega-audit: lib is 154 not 158, register is 39 not 38.]
 
 ### Lane C (Opus) — cross-sub-phase interaction matrix (C1–C11 all traced)
 - **C#1 — MED (LATENT, CONVERGENT)** — Standalone local `Op::ClearFormula`/`Op::SetCellFormat{None}` that empties a cache entry emits an **empty delta** (changedCells skips the now-`None` cell; `removed_cells` hardcoded `[]` at `lib.rs:2804`), so the IDE shared cache keeps the **stale cell**. Repro in lane-c.md. → §3: no `appendClearFormula`/`appendSetCellFormat` producer ⇒ unreachable today; **becomes a live HIGH** when V3.7+ adds a local clear/set-format write-path. Converges with D's B9 (`removedCells` always `[]`) — same code location; B9's engine-side population is the closure for C#1.
@@ -76,7 +76,7 @@ Same logic applies to **A#6** (no `appendRegisterFormat`) and **C#1** (no `appen
 
 ## 4. Phase 5 Exit Criteria (§1 of PLAN) — evidence
 
-1. **`ql-collab` is real (not a stub).** ✅ 10.7k LOC, 158+101 passing tests, real Loro CRDT merge. (Lane B.)
+1. **`ql-collab` is real (not a stub).** ✅ 10.7k LOC, 154 lib + 101 integration = 255 passing tests, real Loro CRDT merge. (Lane B.)
 2. **Cells, formulas, names, sheets, AND tables merge deterministically under concurrency.** ⚠️ **Cells/formulas/sheets: ✅** (Lane C traced; existing convergence tests; CONVERGENT-HIGH-1 closed). **Names: ✅ at the WorkbookRuntime layer** (Lane D — one layer removed from collab; no collab `SetName` producer conflict path). **Tables: ✗ at replay (documented V1 hard-fail), but UNREACHABLE (no collaborative producer).** ← the one criterion not literally met; see §6.
 3. **Offline sync + conflict diagnostics work.** ✅ 8 offline tests pass (Lane A A3); error taxonomy surfaces diagnostics (Lane D D6).
 4. **Single-writer op log not confused with collaboration.** ✅ The single-writer `WorkbookRuntime` (ql-exec) is architecturally separate from the collaborative `CollabSession` (ql-collab); the megaudit's central finding (§3) literally turns on this separation holding.
@@ -116,5 +116,5 @@ Two findings amend a **stated Phase 5 exit criterion**, so they are not unilater
 - **Crates (§2.2):** ql-collab (B/C), ql-oplog (A/B), ql-collab-ws (A offline/transport), ql-bindings-node (B/D), ql-storage (B), IDE TS (C/D). ✅ all touched.
 - **Op variants (§2.3):** all ~20 + 3 wire enums covered by A's wire round-trip; table/format/clear conflict variants probed by A; `Op::Unknown` non-existence confirmed by A/B/D. ✅
 - **CacheEffect (§2.4):** all 7 arms by B (cache-walker invariants) + C (interaction). ✅
-- **Risk register (§2.6):** 38/38 by B. ✅
+- **Risk register (§2.6):** 39/39 by B. ✅
 - **Deferred items (§2.7):** all dispositioned by D. ✅

@@ -53,7 +53,7 @@
 
 ## 4. UDF graph-invalidation model (R-P6-4 — exit-blocking for 6.4)
 
-The engine spine is correct (WorkbookRuntime graph hooks `mod.rs:145-151`; CalcgraphSession deps/dirty `calcgraph_session.rs:453-498`; `on_set_formula:980-1025`; `mark_dirty_from_cell_write:1370-1395`; volatile entry `:1470-1493`). The gap is function metadata (6.4-0). Model:
+The engine spine is correct (WorkbookRuntime graph hooks `mod.rs:145-151`; CalcgraphSession deps/dirty `calcgraph_session.rs:453-498`; `on_set_formula:980-1025`; `mark_dirty_from_cell_write:1384-1432` (the BFS fanout is 1396-1431; corrected from a mis-cited 1370-1395 by session mega-audit Lane S3); volatile entry `:1470-1493`). The gap is function metadata (6.4-0). Model:
 - A UDF formula is a **normal graph node**; its formula args are walked + registered as deps like built-ins.
 - Default Python UDFs are **volatile/dynamic** unless registered with explicit purity metadata (`register_formula_function(..., deterministic=True, volatile=False, deps=[...])`).
 - `qb.publish()` / `qb.bind()` is the authoritative Python reactivity contract (explicit publish stays clean; post-run fingerprinting is secondary).

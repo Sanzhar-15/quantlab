@@ -12,14 +12,14 @@
 **PASS-WITH-FINDINGS.** The 5.8 megaudit ran 5-way (Codex Lane A empirical/convergence + Opus Lanes B/C/D invariants/interaction/contract + claude-self synthesis). Result:
 
 - **ZERO reachable HIGH findings** across all four lanes.
-- **Risk register 38/38 confirmed** in its claimed state (Lane B), 0 falsely-closed.
+- **Risk register 39/39 confirmed** in its claimed state (Lane B), 0 falsely-closed. (39 = R-V3.3-1..6 + R-V3.4-1..7 + R-V3.5-1..7 + R-V3.6-1..19; "38" was a count error.)
 - The only FAIL vote (Lane A, Codex) rested entirely on **table-convergence aborts proven UNREACHABLE** — there is no collaborative table producer (tables are single-writer `WorkbookRuntime`-only, not composed into `CollabSession`).
 
 ## 2. Exit criteria (`MASTER-PLAN §690`) — disposition
 
 | # | Criterion | Status |
 |---|---|---|
-| 1 | `ql-collab` is real | ✅ 10.7k LOC, real Loro CRDT, 158+101 tests |
+| 1 | `ql-collab` is real | ✅ 10.7k LOC, real Loro CRDT, 154 lib + 101 integration = 255 tests |
 | 2 | Cells, formulas, names, sheets **+ tables** merge deterministically | ✅ cells/formulas/sheets (CONVERGENT-HIGH-1 closed); names at WorkbookRuntime layer. **Tables: collaborative merge DEFERRED** (amended — see §3) |
 | 3 | Offline sync + conflict diagnostics work | ✅ 8 offline tests; structured `errorReply` diagnostics |
 | 4 | Single-writer op log not confused with collaboration | ✅ `WorkbookRuntime` (ql-exec) architecturally separate from `CollabSession` (ql-collab) |
