@@ -118,11 +118,15 @@ pub struct WorkbookSession {
     /// undo when those land).
     epoch: u128,
     /// Operation registry: op-id → terminal-or-running state (§6).
+    /// **v1 limitation:** grows unbounded (one entry per recalc, never pruned).
+    /// Bounded retention (drop terminal entries past a horizon) is a later
+    /// increment — acceptable for v1 session lifetimes.
     ops: HashMap<OperationId, OperationState>,
     /// Monotonic op-id source.
     next_op_id: u64,
     /// Append-only event ring; the cursor is an index into this vec (§9).
-    /// v1: unbounded, `dropped` always false (no retention horizon yet).
+    /// **v1 limitation:** unbounded, `dropped` always false (no retention horizon
+    /// yet); the §9 ring-with-drop semantics land with `subscribe_events`.
     events: Vec<Event>,
 }
 
@@ -214,8 +218,11 @@ impl WorkbookSession {
     }
 
     /// Fail-loud sheet-existence check (MED-3): an unknown id → `NotFound`,
-    /// never a silent storage no-op/clamp. (A *known* but tombstoned id still
-    /// "exists" for delete/restore idempotency.)
+    /// never a silent storage no-op/clamp. A *known* but tombstoned id still
+    /// "exists" here (used by delete/restore/move for idempotency); reads +
+    /// edits use [`require_live_sheet`] instead.
+    ///
+    /// [`require_live_sheet`]: WorkbookSession::require_live_sheet
     fn require_sheet_exists(&self, id: SheetId, op: &str) -> EngineResult<()> {
         if (id as usize) >= self.workbook.sheet_count() {
             return Err(EngineError::new(
@@ -225,6 +232,34 @@ impl WorkbookSession {
                     "{op}: sheet {id} does not exist (workbook has {} sheets)",
                     self.workbook.sheet_count()
                 ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// A sheet is "live" (visible/editable) iff it exists AND is not tombstoned.
+    /// Reads (`cell`/`query_range`/`validate_formula`) and cell edits gate on
+    /// this so a deleted sheet behaves consistently across the whole surface:
+    /// `snapshot`/`list_sheets` already hide tombstoned sheets, so reading or
+    /// writing one must also report `NotFound` (restore it first). Both the
+    /// missing and tombstoned cases use code `sheet_not_found` (the message
+    /// distinguishes them).
+    fn require_live_sheet(&self, id: SheetId, op: &str) -> EngineResult<()> {
+        if (id as usize) >= self.workbook.sheet_count() {
+            return Err(EngineError::new(
+                ErrorClass::NotFound,
+                "sheet_not_found",
+                format!(
+                    "{op}: sheet {id} does not exist (workbook has {} sheets)",
+                    self.workbook.sheet_count()
+                ),
+            ));
+        }
+        if self.workbook.is_sheet_removed(id) {
+            return Err(EngineError::new(
+                ErrorClass::NotFound,
+                "sheet_not_found",
+                format!("{op}: sheet {id} is deleted (tombstoned); restore it first"),
             ));
         }
         Ok(())
@@ -383,6 +418,7 @@ impl EngineSession for WorkbookSession {
 
     fn set_value(&mut self, addr: CellAddr, value: CellValue) -> EngineResult<()> {
         self.ensure_ready()?;
+        self.require_live_sheet(addr.sheet, "set_value")?;
         let v = cell_value_to_value(value)?;
         self.with_runtime(|rt| rt.set_value(addr.sheet, addr.row, addr.col, v))
             .map_err(map_runtime_err)
@@ -390,6 +426,7 @@ impl EngineSession for WorkbookSession {
 
     fn set_formula(&mut self, addr: CellAddr, text: &str) -> EngineResult<()> {
         self.ensure_ready()?;
+        self.require_live_sheet(addr.sheet, "set_formula")?;
         self.with_runtime(|rt| rt.set_formula(addr.sheet, addr.row, addr.col, text))
             .map(|_value| ())
             .map_err(map_runtime_err)
@@ -397,12 +434,14 @@ impl EngineSession for WorkbookSession {
 
     fn clear(&mut self, addr: CellAddr) -> EngineResult<()> {
         self.ensure_ready()?;
+        self.require_live_sheet(addr.sheet, "clear")?;
         self.with_runtime(|rt| rt.clear_formula(addr.sheet, addr.row, addr.col))
             .map_err(map_runtime_err)
     }
 
     fn set_format(&mut self, addr: CellAddr, format: FormatId) -> EngineResult<()> {
         self.ensure_ready()?;
+        self.require_live_sheet(addr.sheet, "set_format")?;
         let id = dto_format_id_to_storage(format);
         self.with_runtime(|rt| rt.set_cell_format(addr.sheet, addr.row, addr.col, Some(id)))
             .map_err(map_runtime_err)
@@ -418,13 +457,7 @@ impl EngineSession for WorkbookSession {
 
     fn validate_formula(&self, addr: CellAddr, text: &str) -> EngineResult<Vec<Diagnostic>> {
         self.ensure_readable()?;
-        if self.workbook.sheet(addr.sheet).is_none() {
-            return Err(EngineError::new(
-                ErrorClass::NotFound,
-                "sheet_not_found",
-                format!("sheet {} does not exist", addr.sheet),
-            ));
-        }
+        self.require_live_sheet(addr.sheet, "validate_formula")?;
         // Read-only lex → parse → bind against the live workbook (no mutation, so
         // no `WorkbookRuntime` `&mut` needed). A failure at any stage becomes one
         // error `Diagnostic`; a clean bind yields an empty vec (valid). Evaluation
@@ -629,13 +662,11 @@ impl EngineSession for WorkbookSession {
         // `RangeColumn` carries values only. Empty cells are `CellValue::Blank`
         // (added inc.2c) so the columnar shape stays fixed-size.
         self.ensure_readable()?;
-        let sheet = self.workbook.sheet(range.sheet).ok_or_else(|| {
-            EngineError::new(
-                ErrorClass::NotFound,
-                "sheet_not_found",
-                format!("sheet {} does not exist", range.sheet),
-            )
-        })?;
+        self.require_live_sheet(range.sheet, "query_range")?;
+        let sheet = self
+            .workbook
+            .sheet(range.sheet)
+            .expect("require_live_sheet verified the sheet exists");
         if range.end_row < range.start_row || range.end_col < range.start_col {
             return Err(EngineError::bad_argument(
                 "range end coordinate is before its start",
@@ -741,13 +772,7 @@ impl EngineSession for WorkbookSession {
 
     fn cell(&self, addr: CellAddr) -> EngineResult<Option<CellSnapshot>> {
         self.ensure_readable()?;
-        if self.workbook.sheet(addr.sheet).is_none() {
-            return Err(EngineError::new(
-                ErrorClass::NotFound,
-                "sheet_not_found",
-                format!("sheet {} does not exist", addr.sheet),
-            ));
-        }
+        self.require_live_sheet(addr.sheet, "cell")?;
         Ok(self.build_cell_snapshot(addr.sheet, addr.row, addr.col))
     }
 
@@ -1336,5 +1361,75 @@ mod tests {
         assert_eq!(s.drop_table("NOPE").unwrap_err().class, ErrorClass::NotFound);
         // Drop the real one succeeds.
         s.drop_table("T").unwrap();
+    }
+
+    /// A tombstoned sheet must behave consistently everywhere: `snapshot`/
+    /// `list_sheets` hide it, so reads + edits must also report it gone.
+    #[test]
+    fn tombstoned_sheet_is_not_found_for_reads_and_edits() {
+        let mut s = WorkbookSession::new();
+        let sid = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sid, 0, 0), CellValue::Number { number: 1.0 })
+            .unwrap();
+        s.delete_sheet(sid).unwrap();
+        // Reads + edits on the tombstoned sheet all → NotFound (not stale data).
+        assert_eq!(s.cell(addr(sid, 0, 0)).unwrap_err().code, "sheet_not_found");
+        assert_eq!(
+            s.set_value(addr(sid, 0, 0), CellValue::Number { number: 2.0 })
+                .unwrap_err()
+                .code,
+            "sheet_not_found"
+        );
+        assert_eq!(
+            s.validate_formula(addr(sid, 0, 0), "1+1").unwrap_err().code,
+            "sheet_not_found"
+        );
+        assert_eq!(
+            s.query_range(
+                CellRange { sheet: sid, start_row: 0, start_col: 0, end_row: 0, end_col: 0 },
+                RangeQueryOptions::default(),
+            )
+            .unwrap_err()
+            .code,
+            "sheet_not_found"
+        );
+        // Restore makes it live again — and the preserved value reappears.
+        s.restore_sheet(sid).unwrap();
+        assert_eq!(
+            s.cell(addr(sid, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 1.0 })
+        );
+    }
+
+    #[test]
+    fn set_format_round_trips_through_cell() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let fmt = s.register_format("0.00%").unwrap();
+        s.set_format(addr(sheet, 0, 0), fmt).unwrap();
+        // A format-only cell is still "populated" (format present).
+        let c = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(c.format, Some(fmt));
+        // Setting a format referencing an unregistered id → BadArgument.
+        let bogus = FormatId::Custom { peer: 424242, counter: 999 };
+        assert_eq!(
+            s.set_format(addr(sheet, 0, 0), bogus).unwrap_err().class,
+            ErrorClass::BadArgument
+        );
+    }
+
+    #[test]
+    fn clear_removes_the_formula_keeps_the_value() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_formula(addr(sheet, 0, 0), "1 + 2").unwrap();
+        let before = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(before.formula.as_deref(), Some("1 + 2"));
+        assert_eq!(before.value, Some(CellValue::Number { number: 3.0 }));
+        s.clear(addr(sheet, 0, 0)).unwrap();
+        let after = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        // clear_formula strips the formula but preserves the scalar value.
+        assert_eq!(after.formula, None);
+        assert_eq!(after.value, Some(CellValue::Number { number: 3.0 }));
     }
 }
