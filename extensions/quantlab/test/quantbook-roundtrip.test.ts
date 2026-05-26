@@ -79,8 +79,11 @@ import type {
 	BlockingTransportFixtureConstructor,
 	CellSnapshotJson,
 	CollabSessionInstance,
+	FormatDefJson,
 	QuantbookCellSnapshot,
 	QuantbookNativeModule,
+	SheetSnapshotJson,
+	WorkbookSnapshotDeltaJson,
 	WorkbookSnapshotJson,
 } from '../src/quantbook/types';
 
@@ -2289,7 +2292,7 @@ suite('quantbook V3.2.a -- exportSnapshot cell-snapshot export', function () {
 // Phase 5.7 V3.2.b.5 -- cell-edit flow (HTML + dispatcher)
 // ============================================================================
 
-import { buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, buildVirtualRows, classifyPollTick, computeVisibleRange, dispatchIncomingMessage, extractSheetSnapshot, parseCellRawInput, validatePresenceNumeric, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
+import { acquireWorkbookSnapshotViaDelta, buildSheetManagementQuickPickItems, buildSheetMovePositionItems, buildSheetQuickPickItems, buildVirtualRows, classifyPollTick, computeVisibleRange, dispatchIncomingMessage, extractSheetSnapshot, mergeWorkbookDelta, parseCellRawInput, validatePresenceNumeric, type DeltaSnapshotCache, type ErrorReplyMessage } from '../src/quantbook/cellGrid/cellGridLogic';
 
 suite('quantbook V3.2.b.2 -- cellGridHtml.ts nonce + script + editable cells', function () {
 	test('buildHtml WITHOUT nonce is unchanged from V3.2.a (no script tag; narrow CSP)', () => {
@@ -7184,6 +7187,305 @@ suite('quantbook V3.6.0.11 D9 -- dispatcher fires onTypingStroke (typing-stroke 
 		assert.strictEqual(strokeCount.n, 1);
 		assert.strictEqual(typingHistory.length, 0,
 			'typing_stroke must NOT fire onLocalTyping (separate concerns)');
+	});
+});
+
+// =====================================================================
+// Phase 5.7 V3.6.1 (2026-05-26) -- workbookSnapshotDelta IDE consumer
+// (OPUS-PT-B10).  Realizes the V3.6.0.8 D6 engine delta win in the
+// CellGridPanel render path.  `mergeWorkbookDelta` +
+// `acquireWorkbookSnapshotViaDelta` are PURE (in cellGridLogic); the
+// panel delegates so the two-call protocol is testable without vscode.
+// =====================================================================
+
+/** A minimal number-valued CellSnapshotJson fixture. */
+function b10NumCell(row: number, col: number, n: number): CellSnapshotJson {
+	return { row, col, value: { kind: 'number', number: n } };
+}
+
+/** A hand-built WorkbookSnapshotJson fixture (no engine). */
+function b10MkWb(sheets: SheetSnapshotJson[], formats: FormatDefJson[] = [], version?: Buffer): WorkbookSnapshotJson {
+	const snap: WorkbookSnapshotJson = { sheets, formats, dateSystem: 'Excel1900' };
+	if (version !== undefined) {
+		snap.version = version;
+	}
+	return snap;
+}
+
+/** A non-fullRebuild WorkbookSnapshotDeltaJson fixture from partials. */
+function b10MkDelta(partial: Partial<WorkbookSnapshotDeltaJson>): WorkbookSnapshotDeltaJson {
+	return {
+		changedCells: partial.changedCells ?? [],
+		removedCells: partial.removedCells ?? [],
+		sheetsChanged: partial.sheetsChanged ?? [],
+		sheetsRemoved: partial.sheetsRemoved ?? [],
+		formatsAdded: partial.formatsAdded ?? [],
+		version: partial.version ?? Buffer.from([0xAA]),
+		fullRebuildRequired: partial.fullRebuildRequired ?? false,
+	};
+}
+
+/** Find a cell by (sheet, row, col); undefined if absent. */
+function b10FindCell(snap: WorkbookSnapshotJson, sheet: number, row: number, col: number): CellSnapshotJson | undefined {
+	return snap.sheets.find(s => s.id === sheet)?.cells.find(c => c.row === row && c.col === col);
+}
+
+suite('quantbook V3.6.1 -- mergeWorkbookDelta (pure, OPUS-PT-B10)', function () {
+	test('upsert replaces an existing cell value in place + advances version', () => {
+		const cached = b10MkWb([{ id: 0, name: 'A', cells: [b10NumCell(1, 1, 5)] }]);
+		const merged = mergeWorkbookDelta(cached, b10MkDelta({
+			changedCells: [{ sheet: 0, cell: b10NumCell(1, 1, 9) }],
+			version: Buffer.from([0x01]),
+		}));
+		assert.strictEqual(merged.sheets[0].cells.length, 1, 'no duplicate cell');
+		assert.deepStrictEqual(b10FindCell(merged, 0, 1, 1)!.value, { kind: 'number', number: 9 });
+		assert.deepStrictEqual(merged.version, Buffer.from([0x01]), 'version advanced to delta version');
+	});
+
+	test('upsert inserts a NEW cell in sorted (row, col) position (not appended)', () => {
+		const cached = b10MkWb([{ id: 0, name: 'A', cells: [b10NumCell(0, 0, 1), b10NumCell(2, 0, 3)] }]);
+		const merged = mergeWorkbookDelta(cached, b10MkDelta({
+			changedCells: [{ sheet: 0, cell: b10NumCell(1, 0, 2) }],
+		}));
+		assert.deepStrictEqual(
+			merged.sheets[0].cells.map(c => [c.row, c.col]),
+			[[0, 0], [1, 0], [2, 0]],
+			'sorted insert preserves (row,col) order -> shape matches a fresh snapshot',
+		);
+	});
+
+	test('upserts land in the right sheet (no cross-sheet contamination)', () => {
+		const cached = b10MkWb([
+			{ id: 0, name: 'A', cells: [b10NumCell(0, 0, 1)] },
+			{ id: 1, name: 'B', cells: [b10NumCell(0, 0, 10)] },
+		]);
+		const merged = mergeWorkbookDelta(cached, b10MkDelta({
+			changedCells: [
+				{ sheet: 0, cell: b10NumCell(0, 1, 2) },
+				{ sheet: 1, cell: b10NumCell(0, 1, 20) },
+			],
+		}));
+		assert.strictEqual(b10FindCell(merged, 0, 0, 1)!.value!.number, 2);
+		assert.strictEqual(b10FindCell(merged, 1, 0, 1)!.value!.number, 20);
+		assert.strictEqual(merged.sheets[0].cells.length, 2);
+		assert.strictEqual(merged.sheets[1].cells.length, 2);
+	});
+
+	test('sheetsRemoved drops the sheet entry (LIVE deleteSheet delta path)', () => {
+		const cached = b10MkWb([
+			{ id: 0, name: 'A', cells: [b10NumCell(0, 0, 1)] },
+			{ id: 1, name: 'B', cells: [b10NumCell(0, 0, 2)] },
+		]);
+		const merged = mergeWorkbookDelta(cached, b10MkDelta({ sheetsRemoved: [1] }));
+		assert.deepStrictEqual(merged.sheets.map(s => s.id), [0], 'sheet 1 dropped');
+	});
+
+	test('a changedCell for a same-delta-removed sheet does NOT resurrect it', () => {
+		const cached = b10MkWb([
+			{ id: 0, name: 'A', cells: [] },
+			{ id: 1, name: 'B', cells: [] },
+		]);
+		const merged = mergeWorkbookDelta(cached, b10MkDelta({
+			changedCells: [{ sheet: 1, cell: b10NumCell(0, 0, 99) }],
+			sheetsRemoved: [1],
+		}));
+		assert.deepStrictEqual(merged.sheets.map(s => s.id), [0], 'removed sheet stays gone (apply-removed-last)');
+	});
+
+	test('formatsAdded merges by FULL FormatId (builtin vs custom; replace not duplicate)', () => {
+		const builtin0: FormatDefJson = { id: { kind: 'builtin', builtin: 0 }, string: 'General' };
+		const cached = b10MkWb([{ id: 0, name: 'A', cells: [] }], [builtin0]);
+		const custom71: FormatDefJson = { id: { kind: 'custom', customPeer: 7n, customCounter: 1 }, string: '0.00' };
+		const custom72: FormatDefJson = { id: { kind: 'custom', customPeer: 7n, customCounter: 2 }, string: '0.0%' };
+		const merged = mergeWorkbookDelta(cached, b10MkDelta({ formatsAdded: [custom71, custom72] }));
+		assert.strictEqual(merged.formats.length, 3, 'builtin0 + 2 distinct customs (no kind-collision)');
+		// Re-add custom{7,1} with a NEW string -> replace, not duplicate.
+		const merged2 = mergeWorkbookDelta(merged, b10MkDelta({
+			formatsAdded: [{ id: { kind: 'custom', customPeer: 7n, customCounter: 1 }, string: '#,##0' }],
+		}));
+		assert.strictEqual(merged2.formats.length, 3, 'replaced, not duplicated');
+		const replaced = merged2.formats.find(
+			f => f.id.kind === 'custom' && f.id.customPeer === 7n && f.id.customCounter === 1,
+		);
+		assert.strictEqual(replaced!.string, '#,##0');
+	});
+
+	test('removedCells drops the cell (forward-compat; engine emits [] today)', () => {
+		const cached = b10MkWb([{ id: 0, name: 'A', cells: [b10NumCell(0, 0, 1), b10NumCell(1, 0, 2)] }]);
+		const merged = mergeWorkbookDelta(cached, b10MkDelta({ removedCells: [{ sheet: 0, row: 0, col: 0 }] }));
+		assert.strictEqual(b10FindCell(merged, 0, 0, 0), undefined, 'cell removed');
+		assert.strictEqual(merged.sheets[0].cells.length, 1);
+	});
+
+	test('after sheetsRemoved of the active sheet, extractSheetSnapshot returns null (tombstone composition)', () => {
+		const cached = b10MkWb([
+			{ id: 0, name: 'A', cells: [b10NumCell(0, 0, 1)] },
+			{ id: 1, name: 'B', cells: [b10NumCell(0, 0, 2)] },
+		]);
+		const merged = mergeWorkbookDelta(cached, b10MkDelta({ sheetsRemoved: [1] }));
+		assert.strictEqual(extractSheetSnapshot(merged, 1), null, 'active sheet gone -> render empty-frame branch fires');
+		assert.notStrictEqual(extractSheetSnapshot(merged, 0), null, 'surviving sheet still extractable');
+	});
+});
+
+suite('quantbook V3.6.1 -- acquireWorkbookSnapshotViaDelta protocol (pure mock; no engine)', function () {
+	test('missing version on the seed snapshot forces re-seed (never threads undefined into the delta wrapper)', () => {
+		let snapshotCalls = 0;
+		const mock = {
+			workbookSnapshot() {
+				snapshotCalls++;
+				// No `version` field (TS-optional) -- exercise the GAP-4 guard.
+				return { sheets: [], formats: [], dateSystem: 'Excel1900' as const };
+			},
+			workbookSnapshotDelta() {
+				throw new Error('workbookSnapshotDelta must NOT be called when no version captured');
+			},
+		} as unknown as CollabSessionInstance;
+		const cache: DeltaSnapshotCache = { snapshot: undefined, version: undefined };
+		acquireWorkbookSnapshotViaDelta(mock, cache);
+		assert.strictEqual(cache.version, undefined, 'no version captured -> stays undefined');
+		acquireWorkbookSnapshotViaDelta(mock, cache); // must re-seed, NOT call delta
+		assert.strictEqual(snapshotCalls, 2, 're-seeds rather than threading undefined');
+	});
+});
+
+suite('quantbook V3.6.1 -- acquireWorkbookSnapshotViaDelta protocol (engine)', function () {
+	suiteSetup(function () {
+		const r = shouldSkip();
+		if (r.skip) { this.skip(); }
+	});
+
+	// `acquireWorkbookSnapshotViaDelta` only ever calls workbookSnapshot +
+	// workbookSnapshotDelta, so a thin counting delegate distinguishes the
+	// fast (delta) path from the full-fetch path without a Proxy.
+	function counting(real: CollabSessionInstance) {
+		let snap = 0;
+		let deltaN = 0;
+		const session = {
+			workbookSnapshot() { snap++; return real.workbookSnapshot(); },
+			workbookSnapshotDelta(v: Buffer) { deltaN++; return real.workbookSnapshotDelta(v); },
+		} as unknown as CollabSessionInstance;
+		return { session, snaps: () => snap, deltas: () => deltaN };
+	}
+
+	test('first acquisition full-fetches + captures a version', () => {
+		const s = createSession(1n);
+		s.addSheet('S', 16384);
+		s.appendPutValue(0, 0, 0, 42);
+		const c = counting(s);
+		const cache: DeltaSnapshotCache = { snapshot: undefined, version: undefined };
+		const snap = acquireWorkbookSnapshotViaDelta(c.session, cache);
+		assert.strictEqual(c.snaps(), 1, 'seed via workbookSnapshot');
+		assert.strictEqual(c.deltas(), 0, 'no delta call on the seed');
+		assert.ok(Buffer.isBuffer(cache.version), 'version captured');
+		assert.strictEqual(b10FindCell(snap, 0, 0, 0)!.value!.number, 42);
+	});
+
+	test('a local PutValue after seed takes the fast delta path (no full re-fetch)', () => {
+		const s = createSession(1n);
+		s.addSheet('S', 16384);
+		s.appendPutValue(0, 0, 0, 1);
+		const c = counting(s);
+		const cache: DeltaSnapshotCache = { snapshot: undefined, version: undefined };
+		acquireWorkbookSnapshotViaDelta(c.session, cache); // seed
+		s.appendPutValue(0, 1, 0, 2); // local edit -- append_op does NOT invalidate the cache
+		const merged = acquireWorkbookSnapshotViaDelta(c.session, cache);
+		assert.strictEqual(c.snaps(), 1, 'fast path -> NO full re-fetch');
+		assert.strictEqual(c.deltas(), 1, 'took the delta path');
+		assert.strictEqual(b10FindCell(merged, 0, 1, 0)!.value!.number, 2, 'new cell merged');
+		assert.strictEqual(b10FindCell(merged, 0, 0, 0)!.value!.number, 1, 'prior cell retained');
+	});
+
+	test('undo invalidates the cache -> next acquisition full-rebuilds + matches engine truth', () => {
+		const s = createSession(1n);
+		s.addSheet('S', 16384);
+		s.appendPutValue(0, 0, 0, 1);
+		const c = counting(s);
+		const cache: DeltaSnapshotCache = { snapshot: undefined, version: undefined };
+		acquireWorkbookSnapshotViaDelta(c.session, cache); // seed (snaps=1)
+		s.appendPutValue(0, 1, 0, 2);
+		acquireWorkbookSnapshotViaDelta(c.session, cache); // fast delta
+		s.undo(); // force_clear_workbook_cache (R-V3.6-14)
+		const afterUndo = acquireWorkbookSnapshotViaDelta(c.session, cache);
+		assert.ok(c.snaps() >= 2, 'undo -> fullRebuildRequired -> full re-fetch');
+		assert.deepStrictEqual(afterUndo, s.workbookSnapshot(), 'matches a fresh engine snapshot');
+	});
+
+	test('collab pollRemote merge force-clears the cache -> next acquisition full-rebuilds + reflects the peer op', () => {
+		const a = createSession(1n);
+		const b = createSession(2n);
+		const [ta, tb] = loopbackTransportPair();
+		a.attachTransport(ta);
+		b.attachTransport(tb);
+		a.addSheet('S', 16384);
+		a.appendPutValue(0, 0, 0, 1);
+		a.flushDeltaToTransport();
+		assert.strictEqual(b.pollRemote(), 1, 'B drains A baseline');
+		const c = counting(b);
+		const cache: DeltaSnapshotCache = { snapshot: undefined, version: undefined };
+		acquireWorkbookSnapshotViaDelta(c.session, cache); // B seeds (snaps=1)
+		a.appendPutValue(0, 1, 0, 2);
+		a.flushDeltaToTransport();
+		b.pollRemote(); // drain -> force_clear B's engine cache
+		const merged = acquireWorkbookSnapshotViaDelta(c.session, cache);
+		assert.ok(c.snaps() >= 2, 'pollRemote merge -> fullRebuildRequired -> full re-fetch');
+		assert.strictEqual(b10FindCell(merged, 0, 1, 0)!.value!.number, 2, 'peer op reflected after merge');
+	});
+
+	test('multi-panel-same-session: first panel fast, second observes staleness, both converge (BUG-1 pin)', () => {
+		const s = createSession(1n);
+		s.addSheet('S', 16384);
+		s.appendPutValue(0, 0, 0, 1);
+		const ca = counting(s);
+		const cb = counting(s);
+		const cacheA: DeltaSnapshotCache = { snapshot: undefined, version: undefined };
+		const cacheB: DeltaSnapshotCache = { snapshot: undefined, version: undefined };
+		acquireWorkbookSnapshotViaDelta(ca.session, cacheA); // A seed
+		acquireWorkbookSnapshotViaDelta(cb.session, cacheB); // B seed
+		s.appendPutValue(0, 1, 0, 2); // one change advances the single per-session VV
+		const mergedA = acquireWorkbookSnapshotViaDelta(ca.session, cacheA);
+		const mergedB = acquireWorkbookSnapshotViaDelta(cb.session, cacheB);
+		// A polled first -> fast delta (advances the shared per-session
+		// cache VV); B then sees staleness -> full re-fetch.
+		assert.strictEqual(ca.snaps(), 1, 'panel A took the fast path (no re-fetch)');
+		assert.strictEqual(ca.deltas(), 1);
+		assert.ok(cb.snaps() >= 2, 'panel B observed staleness -> full re-fetch (documented degradation)');
+		// Correctness despite the perf split: both converge.
+		assert.deepStrictEqual(mergedA.sheets, mergedB.sheets, 'both panels converge to identical sheet data');
+		assert.strictEqual(b10FindCell(mergedA, 0, 1, 0)!.value!.number, 2);
+		assert.strictEqual(b10FindCell(mergedB, 0, 1, 0)!.value!.number, 2);
+	});
+
+	test('shape equivalence: delta-merged data === fresh workbookSnapshot across an op sequence (divergence guard)', () => {
+		const s = createSession(1n);
+		s.addSheet('A', 16384);
+		s.addSheet('B', 16384);
+		const cache: DeltaSnapshotCache = { snapshot: undefined, version: undefined };
+		// Compare the consumer-visible DATA (sheets/formats/dateSystem).
+		// The opaque `version` Buffer is intentionally excluded: the
+		// orchestrator threads the exact engine-returned token forward, so
+		// it never depends on two independent encode() calls producing
+		// byte-identical output (an engine concern covered elsewhere).
+		const step = (label: string) => {
+			const merged = acquireWorkbookSnapshotViaDelta(s, cache);
+			const fresh = s.workbookSnapshot();
+			assert.deepStrictEqual(
+				{ sheets: merged.sheets, formats: merged.formats, dateSystem: merged.dateSystem },
+				{ sheets: fresh.sheets, formats: fresh.formats, dateSystem: fresh.dateSystem },
+				`delta-merged data matches fresh snapshot after: ${label}`,
+			);
+			assert.ok(Buffer.isBuffer(merged.version), `merged carries a version after: ${label}`);
+		};
+		step('seed (no ops)');
+		s.appendPutValue(0, 0, 0, 1); step('put A!(0,0)=1 (delta)');
+		s.appendPutValue(0, 1, 1, 2); step('put A!(1,1)=2 (delta)');
+		s.appendPutValue(1, 0, 0, 10); step('put B!(0,0)=10 (delta)');
+		s.deleteSheet(1); step('deleteSheet B (sheetsRemoved delta)');
+		s.appendPutValue(0, 2, 2, 3); step('put A!(2,2)=3 (delta)');
+		s.renameSheet(0, 'A2'); step('renameSheet A (fullRebuild)');
+		s.appendPutValue(0, 0, 1, 4); step('put A!(0,1)=4 (delta after rebuild)');
+		s.undo(); step('undo (fullRebuild)');
+		s.appendPutValue(0, 3, 3, 5); step('put A!(3,3)=5 (delta after rebuild)');
 	});
 });
 

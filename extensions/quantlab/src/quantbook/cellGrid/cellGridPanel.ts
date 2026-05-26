@@ -30,11 +30,11 @@
 import * as childProcess from 'child_process';
 import * as vscode from 'vscode';
 
-import { buildPresenceSnapshotJson, parseQuantbookError, workbookSnapshot } from '../session';
-import type { CollabSessionInstance, QuantbookCellSnapshot, QuantbookNativeModule, TransportInstance } from '../types';
+import { buildPresenceSnapshotJson, parseQuantbookError } from '../session';
+import type { CollabSessionInstance, QuantbookCellSnapshot, QuantbookNativeModule, TransportInstance, WorkbookSnapshotJson } from '../types';
 import { reconnectWithBackoff } from '../multiWindowDemo';
 import { buildHtml } from './cellGridHtml';
-import { classifyPollTick, dispatchIncomingMessage, extractSheetSnapshot } from './cellGridLogic';
+import { acquireWorkbookSnapshotViaDelta, classifyPollTick, dispatchIncomingMessage, extractSheetSnapshot, type DeltaSnapshotCache } from './cellGridLogic';
 
 const VIEW_TYPE = 'quantlab.quantbookCellGrid';
 
@@ -527,6 +527,20 @@ export class CellGridPanel {
 	 */
 	_pendingRenderAfterTyping: boolean = false;
 
+	/**
+	 * **Phase 5.7 V3.6.1 (2026-05-26) -- incremental snapshot delta cache
+	 * (OPUS-PT-B10).**
+	 *
+	 * Per-panel client-side state for {@link acquireWorkbookSnapshot}'s
+	 * two-call delta protocol: the accumulated FULL workbook snapshot (all
+	 * sheets -- `render()` needs `sheets.length` + the active-sheet name
+	 * for the title, and a sibling panel for another sheet may share this
+	 * session) + the last captured version token.  Both `undefined` until
+	 * the first acquisition (forces a full `workbookSnapshot()` seed).
+	 * Mutated in place by {@link acquireWorkbookSnapshotViaDelta}.
+	 */
+	private readonly _deltaCache: DeltaSnapshotCache = { snapshot: undefined, version: undefined };
+
 	private constructor(
 		private readonly panel: vscode.WebviewPanel,
 		private readonly session: CollabSessionInstance,
@@ -718,6 +732,53 @@ export class CellGridPanel {
 	}
 
 	/**
+	 * **Phase 5.7 V3.6.1 (2026-05-26) -- acquire the workbook snapshot via
+	 * the incremental delta protocol (OPUS-PT-B10).**
+	 *
+	 * Realizes the V3.6.0.8 D6 engine win: instead of a full O(N)
+	 * `workbookSnapshot()` (rebuild_workbook over the whole op log --
+	 * ~246 ms at 100k cells) on every repaint, this seeds once via a full
+	 * snapshot, then fetches incremental deltas (~1 ms at 100 new cells;
+	 * 228x faster) and merges them into {@link _cachedWorkbookSnapshot}
+	 * via {@link mergeWorkbookDelta}.
+	 *
+	 * **Two-call protocol** (engine contract; see {@link workbookSnapshotDelta}):
+	 * - No cached version -> full `workbookSnapshot()` (seed); capture its
+	 *   `version`.
+	 * - Else -> `workbookSnapshotDelta(version)`.  If `fullRebuildRequired`
+	 *   (cache miss / staleness / rename / metadata op / malformed token)
+	 *   -> full `workbookSnapshot()` re-fetch.  Else -> merge the delta.
+	 *
+	 * `fullRebuildRequired` is an EXPLICIT designed protocol signal, not a
+	 * swallowed error.  There is deliberately NO hidden periodic full
+	 * resync: per CLAUDE.md No-Fallbacks a merge divergence (if one could
+	 * occur) must surface loudly, not be silently papered over.  The
+	 * engine's conservative fullRebuild allowlist + 5 cache-invalidation
+	 * sites form a complete divergence safety net (every structural change
+	 * trips fullRebuild); the `quantbook V3.6.1 -- delta-merge shape
+	 * equivalence` mocha suite pins fast-path === full-path.
+	 *
+	 * **Where the win actually lands** (so future readers don't chase the
+	 * expected full rebuilds as a regression):
+	 * - LOCAL-edit `onCommit` repaint: fast delta (`append_op` does not
+	 *   invalidate the engine cache).  This is the typing-latency path.
+	 * - COLLAB merged-tick repaint: `pollRemote` force-clears the engine
+	 *   cache on a merge, so the next delta returns `fullRebuildRequired`
+	 *   -> full fetch.  Same cost as pre-V3.6.1 (no regression).
+	 * - MULTIPLE panels on ONE session: `workbookSnapshotDelta` advances
+	 *   the single per-session engine cache VV, so after any change only
+	 *   the first panel to poll gets the fast path; siblings observe
+	 *   staleness -> full fetch.  Correct (never diverges), not optimal;
+	 *   a shared per-session snapshot cache (V-next) would fix it.
+	 */
+	private acquireWorkbookSnapshot(): WorkbookSnapshotJson {
+		// Delegates to the pure, vscode-free orchestrator so the two-call
+		// protocol is mocha-testable without a panel.  `_deltaCache` is
+		// mutated in place (snapshot + version advance).
+		return acquireWorkbookSnapshotViaDelta(this.session, this._deltaCache);
+	}
+
+	/**
 	 * Compute the snapshot, generate a fresh nonce, AND set the
 	 * webview's HTML.  Re-rendering blows away any prior webview
 	 * script + state; the host's `onDidReceiveMessage` handler
@@ -733,13 +794,13 @@ export class CellGridPanel {
 	 * now reactive (was point-in-time at `show()` per V3.3.0.X reactive-
 	 * panel-title backlog item; backlog cleared here).
 	 *
-	 * **Per-render cost**: workbookSnapshot is O(N) in op count
-	 * (rebuild_workbook replay).  Render is called per onCommit (cell
-	 * edit -- could be 10+/sec under typing) + per pollRemote tick (1s).
-	 * V3.5.0.2 docstring warns callers to batch; for V3.5.0.4b we
-	 * accept the cost (V3.4-scale sessions have small op counts; the
-	 * O(N) is small).  V3.6+ may add incremental snapshot deltas if
-	 * profiling shows the cost matters.
+	 * **V3.6.1 (2026-05-26)**: the snapshot is now acquired via
+	 * {@link acquireWorkbookSnapshot} (incremental delta protocol;
+	 * OPUS-PT-B10) instead of an unconditional full `workbookSnapshot()`.
+	 * The local-edit repaint path drops from O(N) op-log replay to an
+	 * O(changed-cells) delta + merge.  Everything downstream of the
+	 * snapshot (active-sheet extract, title, presence, buildHtml) is
+	 * unchanged -- it consumes the same {@link WorkbookSnapshotJson} shape.
 	 *
 	 * **Sheet-not-found (tombstone race)**: if the active sheet was
 	 * deleted via V3.5.0.4a `quantlab.quantbookSheetDelete` while the
@@ -747,9 +808,11 @@ export class CellGridPanel {
 	 * an empty cell-grid + log a warning -- the user sees the panel
 	 * is now showing a deleted sheet (cells empty), and can close it.
 	 * V3.6+ may auto-dispose the panel on its sheet's tombstoning.
+	 * (The delta path reaches the same state: `deleteSheet` arrives as a
+	 * `sheetsRemoved` delta that drops the sheet from the merged cache.)
 	 */
 	render(): void {
-		const wbSnapshot = workbookSnapshot(this.session);
+		const wbSnapshot = this.acquireWorkbookSnapshot();
 		const sheetSnapshot: QuantbookCellSnapshot | null = extractSheetSnapshot(wbSnapshot, this.sheet);
 		const snapshot: QuantbookCellSnapshot = sheetSnapshot ?? {
 			// Tombstoned-mid-lifetime fallback: render empty.  CLAUDE.md

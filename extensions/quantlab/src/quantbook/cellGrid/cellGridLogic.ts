@@ -27,8 +27,8 @@
  * - `panel.webview.postMessage` -> wired as `DispatchDeps.onError`.
  */
 
-import type { CollabSessionInstance, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, SheetSnapshotJson, WorkbookSnapshotJson } from '../types';
-import { appendPutFormulaValidated, appendPutValueValidated, parseQuantbookError } from '../session';
+import type { CellSnapshotJson, CollabSessionInstance, FormatIdJson, QuantbookCellSnapshot, QuantbookCellValue, QuantbookErrorCode, SheetSnapshotJson, WorkbookSnapshotDeltaJson, WorkbookSnapshotJson } from '../types';
+import { appendPutFormulaValidated, appendPutValueValidated, parseQuantbookError, workbookSnapshot, workbookSnapshotDelta } from '../session';
 
 /**
  * V3.2.c.3 / V3.2.c.5 (2026-05-22) -- classification of a single
@@ -888,4 +888,231 @@ export function extractSheetSnapshot(
 		sheet: sheetId,
 		entries,
 	};
+}
+
+// ---------------------------------------------------------------------
+// Phase 5.7 V3.6.1 (2026-05-26) -- incremental snapshot delta merge
+// (OPUS-PT-B10).  Realizes the V3.6.0.8 D6 engine win (228x faster than
+// a full snapshot at 100 new cells) by letting CellGridPanel acquire its
+// snapshot via the two-call delta protocol instead of a full O(N)
+// workbookSnapshot() on every repaint.  The orchestration (full-fetch vs
+// delta, version-token threading, fullRebuildRequired re-fetch) lives in
+// CellGridPanel.acquireWorkbookSnapshot; the PURE merge below is split
+// out here so its invariants are mocha-testable with hand-built fixtures.
+// ---------------------------------------------------------------------
+
+/**
+ * Stable key for a {@link FormatIdJson}, covering BOTH discriminants.
+ *
+ * Custom ids carry a `customPeer` bigint -- merging by `kind` alone (or
+ * even `kind`+`builtin`) would collide all customs.  The full key is
+ * `kind:builtin:customPeer:customCounter` (absent fields collapse to "").
+ */
+function formatIdKey(id: FormatIdJson): string {
+	return `${id.kind}:${id.builtin ?? ''}:${id.customPeer?.toString() ?? ''}:${id.customCounter ?? ''}`;
+}
+
+/**
+ * Insert `cell` into `cells` (sorted (row, col) ascending per the engine
+ * `snapshot_cells` contract) at its sorted position, OR replace the
+ * existing entry at the same (row, col).  Keeping the array sorted is
+ * what makes a delta-merged snapshot structurally identical to a fresh
+ * `workbookSnapshot()` -- see the shape-equivalence invariant on
+ * {@link mergeWorkbookDelta}.  Binary search: O(log n) locate + O(n)
+ * splice.
+ */
+function upsertCellSorted(cells: CellSnapshotJson[], cell: CellSnapshotJson): void {
+	let lo = 0;
+	let hi = cells.length;
+	while (lo < hi) {
+		const mid = (lo + hi) >>> 1;
+		const probe = cells[mid];
+		const cmp = probe.row !== cell.row ? probe.row - cell.row : probe.col - cell.col;
+		if (cmp === 0) {
+			cells[mid] = cell; // replace existing cell at (row, col)
+			return;
+		}
+		if (cmp < 0) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	cells.splice(lo, 0, cell); // insert in sorted position
+}
+
+/**
+ * **Phase 5.7 V3.6.1 (2026-05-26) -- merge a `workbookSnapshotDelta`
+ * reply into an accumulated {@link WorkbookSnapshotJson} (OPUS-PT-B10).**
+ *
+ * Pure (no vscode, no engine calls) so the merge invariants are
+ * mocha-testable with hand-built fixtures.  The caller
+ * (`CellGridPanel.acquireWorkbookSnapshot`) decides full-fetch-vs-delta,
+ * caches the result, and threads the version token.
+ *
+ * **Precondition**: the caller MUST have checked
+ * `delta.fullRebuildRequired === false`.  On a fullRebuild the caller
+ * re-fetches via `workbookSnapshot()` and never calls this.
+ *
+ * **Shape-equivalence invariant**: the merged snapshot is structurally
+ * identical to a fresh `workbookSnapshot()` at the delta's version --
+ * cells stay sorted (row, col) ascending (so changed/new cells are
+ * inserted in sorted position, not appended), and `version` is advanced
+ * to `delta.version` (which encodes the same current VV a fresh
+ * `workbookSnapshot()` would capture).  The
+ * `quantbook V3.6.1 -- delta-merge shape equivalence` mocha suite pins
+ * `deepStrictEqual(merged, fresh)` across IDE-reachable op sequences
+ * (puts / deleteSheet / renameSheet / undo).
+ *
+ * **Delta surface handled** (see {@link WorkbookSnapshotDeltaJson}):
+ * - `changedCells`: upsert by (sheet, row, col).
+ * - `sheetsRemoved`: drop the sheet entry.  **LIVE path today** --
+ *   `deleteSheet` (`Op::RemoveSheet`) arrives as a delta, not a
+ *   fullRebuild (`classify_delta_op` treats it as cell-compatible).
+ * - `formatsAdded`: merge into `formats` by the FULL FormatId.  Appended
+ *   (not sorted-inserted): the engine emits only CUSTOM ids here, and no
+ *   IDE API can emit `Op::RegisterFormat` today (appendRegisterFormat is
+ *   V3.7+), so this path is exercised only by the pure-helper fixture
+ *   test, never by the real-session shape-equivalence test.  If V3.7+
+ *   adds an IDE register-format write-path, switch this to a sorted
+ *   insert matching the engine's FormatId `Ord`.
+ * - `removedCells`: drop the cell.  **Forward-compat only** -- the engine
+ *   emits `[]` at this version (true cell removals trip
+ *   `fullRebuildRequired` instead).  Implemented + fixture-tested so a
+ *   future engine that starts emitting removedCells cannot silently
+ *   diverge the cache.
+ * - `sheetsChanged`: replace/insert the sheet entry by id.
+ *   **Forward-compat only** -- always `[]` in the cell-only path
+ *   (sheet-metadata changes trip `fullRebuildRequired`).
+ *
+ * Mutates + returns `cached` in place.  The napi reply is a fresh JS
+ * object graph each call (no aliasing with engine memory), so in-place
+ * mutation is safe and avoids a deep clone.
+ */
+export function mergeWorkbookDelta(
+	cached: WorkbookSnapshotJson,
+	delta: WorkbookSnapshotDeltaJson,
+): WorkbookSnapshotJson {
+	// sheetsChanged (forward-compat; engine emits [] today): replace the
+	// sheet entry by id, or append.
+	for (const sheet of delta.sheetsChanged) {
+		const idx = cached.sheets.findIndex(s => s.id === sheet.id);
+		if (idx >= 0) {
+			cached.sheets[idx] = sheet;
+		} else {
+			cached.sheets.push(sheet);
+		}
+	}
+
+	// changedCells: upsert by (sheet, row, col) in sorted position.
+	for (const changed of delta.changedCells) {
+		const sheet = cached.sheets.find(s => s.id === changed.sheet);
+		// A changedCell for an unknown sheet should not occur: AddSheet
+		// trips fullRebuildRequired, so any sheet a delta references is
+		// already in the cache.  Skip defensively rather than synthesize a
+		// nameless sheet (which would diverge from a fresh snapshot).
+		if (sheet === undefined) {
+			continue;
+		}
+		upsertCellSorted(sheet.cells, changed.cell);
+	}
+
+	// removedCells (forward-compat; engine emits [] today): drop the cell.
+	for (const removed of delta.removedCells) {
+		const sheet = cached.sheets.find(s => s.id === removed.sheet);
+		if (sheet === undefined) {
+			continue;
+		}
+		const idx = sheet.cells.findIndex(c => c.row === removed.row && c.col === removed.col);
+		if (idx >= 0) {
+			sheet.cells.splice(idx, 1);
+		}
+	}
+
+	// formatsAdded: merge by FULL FormatId (replace-or-append).
+	for (const fmt of delta.formatsAdded) {
+		const key = formatIdKey(fmt.id);
+		const idx = cached.formats.findIndex(f => formatIdKey(f.id) === key);
+		if (idx >= 0) {
+			cached.formats[idx] = fmt;
+		} else {
+			cached.formats.push(fmt);
+		}
+	}
+
+	// sheetsRemoved: drop sheet entries.  Applied LAST so a changedCell in
+	// the same delta window cannot resurrect a removed sheet (the engine
+	// already pre-filters changedCells for removed sheets; this is
+	// defense-in-depth).
+	if (delta.sheetsRemoved.length > 0) {
+		const removedSet = new Set(delta.sheetsRemoved);
+		cached.sheets = cached.sheets.filter(s => !removedSet.has(s.id));
+	}
+
+	// Advance the snapshot's version to the delta's: the merged snapshot
+	// now represents the state at `delta.version` (the current VV), so a
+	// fresh workbookSnapshot() at this point would carry the same token.
+	cached.version = delta.version;
+
+	return cached;
+}
+
+/**
+ * **Phase 5.7 V3.6.1 (2026-05-26)** -- mutable client-side delta cache
+ * for one snapshot consumer (one {@link CellGridPanel}).
+ *
+ * Held by the consumer across repaints + threaded into
+ * {@link acquireWorkbookSnapshotViaDelta}.  `snapshot`/`version` are
+ * both `undefined` before the first acquisition (forces a full seed);
+ * `version === undefined` ALWAYS forces the full-fetch branch (never
+ * thread an absent token into the delta wrapper).
+ */
+export interface DeltaSnapshotCache {
+	snapshot: WorkbookSnapshotJson | undefined;
+	version: Buffer | undefined;
+}
+
+/**
+ * **Phase 5.7 V3.6.1 (2026-05-26) -- acquire a workbook snapshot via the
+ * incremental delta protocol, mutating `cache` (OPUS-PT-B10).**
+ *
+ * Pure (no vscode) so the two-call protocol is mocha-testable with a
+ * real session but no panel.  {@link CellGridPanel.acquireWorkbookSnapshot}
+ * delegates here with its per-panel {@link DeltaSnapshotCache}.
+ *
+ * Protocol (see {@link workbookSnapshotDelta} + the panel docstring for
+ * where the win lands + the multi-consumer caveat):
+ * 1. No cached version -> full `workbookSnapshot()` (seed); capture
+ *    `version` (left undefined if the reply lacks one, so the next call
+ *    re-seeds rather than threading undefined into the delta wrapper).
+ * 2. Else -> `workbookSnapshotDelta(version)`.  `fullRebuildRequired`
+ *    (an explicit designed signal, NOT a swallowed error) -> full
+ *    `workbookSnapshot()` re-fetch.  Otherwise -> {@link mergeWorkbookDelta}.
+ *
+ * Returns the snapshot to render (always a structurally-complete
+ * {@link WorkbookSnapshotJson}, identical in shape to a full fetch).
+ */
+export function acquireWorkbookSnapshotViaDelta(
+	session: CollabSessionInstance,
+	cache: DeltaSnapshotCache,
+): WorkbookSnapshotJson {
+	const cachedSnapshot = cache.snapshot;
+	const cachedVersion = cache.version;
+	if (cachedVersion === undefined || cachedSnapshot === undefined) {
+		const seed = workbookSnapshot(session);
+		cache.snapshot = seed;
+		cache.version = seed.version;
+		return seed;
+	}
+	const delta = workbookSnapshotDelta(session, cachedVersion);
+	if (delta.fullRebuildRequired) {
+		const full = workbookSnapshot(session);
+		cache.snapshot = full;
+		cache.version = full.version;
+		return full;
+	}
+	const merged = mergeWorkbookDelta(cachedSnapshot, delta);
+	cache.snapshot = merged;
+	cache.version = delta.version;
+	return merged;
 }

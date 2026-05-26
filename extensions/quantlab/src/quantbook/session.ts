@@ -34,6 +34,7 @@ import type {
 	QuantbookErrorCode,
 	QuantbookErrorInfo,
 	TransportInstance,
+	WorkbookSnapshotDeltaJson,
 	WorkbookSnapshotJson,
 } from './types';
 
@@ -293,6 +294,42 @@ export function moveSheet(session: CollabSessionInstance, id: number, newIndex: 
  */
 export function workbookSnapshot(session: CollabSessionInstance): WorkbookSnapshotJson {
 	return session.workbookSnapshot();
+}
+
+/**
+ * **Phase 5.7 V3.6.1 (2026-05-26) -- typed wrapper for
+ * `CollabSession.workbookSnapshotDelta` (OPUS-PT-B10).**
+ *
+ * Incremental counterpart to {@link workbookSnapshot}.  Given the
+ * `lastSeenVersion` token the caller captured from a prior reply's
+ * `version` field (either a {@link WorkbookSnapshotJson.version} or a
+ * previous {@link WorkbookSnapshotDeltaJson.version}), the engine
+ * returns ONLY the cells / sheets / formats that changed since then --
+ * 228x faster than a full snapshot at 100 new cells (V3.6.0.8.4 bench).
+ *
+ * **Two-call protocol** (see the napi docstring on
+ * {@link CollabSessionInstance.workbookSnapshotDelta} for the full
+ * contract): the FIRST acquisition for a session must come from
+ * `workbookSnapshot()` (to seed the engine cache + capture a version);
+ * subsequent acquisitions call this.  When the engine cannot produce a
+ * delta it returns `fullRebuildRequired=true` (cache miss / staleness /
+ * rename / malformed version) and the caller MUST re-fetch via
+ * `workbookSnapshot()`.  `fullRebuildRequired` is an explicit, designed
+ * protocol signal -- NOT an error to swallow.
+ *
+ * **`lastSeenVersion` MUST be a real captured `Buffer`** (never
+ * `undefined`): the seed path uses `workbookSnapshot()` instead of
+ * passing an empty/absent token here.  See
+ * `CellGridPanel.acquireWorkbookSnapshot` for the orchestration.
+ *
+ * Single-line indirection mirrors `workbookSnapshot` for API surface
+ * stability across future engine signature changes.
+ */
+export function workbookSnapshotDelta(
+	session: CollabSessionInstance,
+	lastSeenVersion: Buffer,
+): WorkbookSnapshotDeltaJson {
+	return session.workbookSnapshotDelta(lastSeenVersion);
 }
 
 /**
