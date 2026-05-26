@@ -57,7 +57,7 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; range-aware fn s
 ## Remaining V3.6.1 backlog (next cycles / sessions)
 
 - **OPUS-PT-B9** — `WorkbookSnapshotDeltaJson.removedCells` always empty at this engine version (V3.7+ feature).  The IDE merge already handles it forward-compat (fixture-tested).  Engine-side population is V3.7+.
-- **OPUS-PT-B8** — producer/replay asymmetry on `restoreSheet`/`deleteSheet` napi (out-of-range rejected producer-side, permissive on replay).  Doc-only design observation; no behavior change.
+- ~~**OPUS-PT-B8** — producer/replay asymmetry on `restoreSheet`/`deleteSheet` napi~~ ✅ DOCUMENTED 2026-05-26 (doc-only; not a code cycle).  Verified against source (`lib.rs` strict producer guard vs `ql-storage/src/workbook.rs:781` permissive replay) + documented in `ide-consumer-contract.md § 4.1.z6 V3.6.0.10`.  No behavior change.
 - **CellValueJson type/runtime drift cleanup** — flagged in the V3.6 phase-termination recommended-next list.
 - ~~**V-next (perf)** — shared per-session snapshot cache~~ ✅ SHIPPED V3.6.1.2 (2026-05-26).
 - **V3.6.2+ (perf)** — incremental DOM patching in the webview (postMessage cell-level updates) to also save the buildHtml + `webview.html` reassign cost.
