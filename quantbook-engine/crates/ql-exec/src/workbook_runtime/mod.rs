@@ -238,6 +238,57 @@ impl<'a> WorkbookRuntime<'a> {
         }
     }
 
+    /// **Phase 6.1B inc.2 (2026-05-26) — session-owned plan cache.**
+    /// Construct a runtime that takes ownership of a caller-supplied
+    /// `PlanCache` (instead of allocating a fresh one) AND attaches both
+    /// an op-log and a calcgraph session. The owning `WorkbookSession`
+    /// (`crate::session::WorkbookSession`) holds the long-lived
+    /// `PlanCache` and threads it through a per-edit runtime via this
+    /// constructor + [`into_plan_cache`], so the cache (and its
+    /// hit/miss stats) survive across edits even though the runtime
+    /// borrow window is reconstructed per command.
+    ///
+    /// This is the bottom-up realization of GAP-PS-09 / `docs/api/
+    /// session-api.md` §2.1 LOW-1: WorkbookSession owns
+    /// `Workbook + OpLog + CalcgraphSession + PlanCache + FunctionRegistry`
+    /// and constructs the per-edit `WorkbookRuntime` internally so no
+    /// borrow crosses an FFI boundary.
+    ///
+    /// Ownership-transfer (vs the borrow-a-`&mut PlanCache` shape the
+    /// design doc sketched) keeps every existing `self.plan_cache` call
+    /// site and the field type unchanged — `PlanCache: Default`, so the
+    /// session `mem::take`s its cache in, runs the edit, and recovers the
+    /// warmed cache via [`into_plan_cache`]. The `format_cache` is still
+    /// fresh per edit (a re-parse cost only; correctness unaffected) —
+    /// session-owning it is a later refinement.
+    ///
+    /// [`into_plan_cache`]: WorkbookRuntime::into_plan_cache
+    pub fn with_session_state(
+        workbook: &'a mut Workbook,
+        registry: &'a FunctionRegistry,
+        oplog: &'a mut OpLog,
+        graph: &'a mut crate::CalcgraphSession,
+        plan_cache: PlanCache,
+    ) -> Self {
+        Self {
+            workbook,
+            registry,
+            oplog: Some(oplog),
+            plan_cache,
+            format_cache: std::collections::HashMap::new(),
+            graph: Some(graph),
+        }
+    }
+
+    /// **Phase 6.1B inc.2 (2026-05-26).** Consume the runtime and return
+    /// its (now warmed) `PlanCache` so the owning session can retain it
+    /// for the next edit. Pairs with [`with_session_state`].
+    ///
+    /// [`with_session_state`]: WorkbookRuntime::with_session_state
+    pub fn into_plan_cache(self) -> PlanCache {
+        self.plan_cache
+    }
+
     /// Phase 2B.3: snapshot of cumulative bind-plan-cache observability
     /// since this runtime was constructed. Includes hit count, miss
     /// count, entry count, and convenience hit-rate.
