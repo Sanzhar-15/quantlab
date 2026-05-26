@@ -47,7 +47,7 @@ PutValue, PutFormula, ClearFormula, RegisterFormat, SetCellFormat, RemoveSheet, 
 ### 2.5 API surface
 - 57 `pub fn` on CollabSession + 81 `#[napi]` methods + the `types.ts` TS mirror. **napi↔TS parity + producer/replay validation symmetry are audit targets.**
 
-### 2.6 Risk register — verify EACH is in its claimed state (≈38 entries)
+### 2.6 Risk register — verify EACH is in its claimed state (39 entries: R-V3.3-1..6 + R-V3.4-1..7 + R-V3.5-1..7 + R-V3.6-1..19)
 - **R-V3.3-1..6**, **R-V3.4-1..7**, **R-V3.5-1..7**, **R-V3.6-1..19**.
 - For each CLOSED risk: confirm the closure code exists at current HEAD + a regression test pins it. For each OPEN/conditional risk (e.g., R-V3.6-9 D7): confirm it's appropriately deferred, not silently broken.
 
