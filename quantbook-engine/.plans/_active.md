@@ -21,11 +21,20 @@ status: |
   lib.rs:306-349 ([kind] error); recompute.rs:61/252 (synchronous recalc); replay.rs:889-895
   (BatchCommit non-rollback); FormulaDeps has no functions_used.
 
-  ⭐ NEXT = 6.1B: implement the owning WorkbookSession around WorkbookRuntime + OpLog +
-  CalcgraphSession + PlanCache + FunctionRegistry. Bottom-up-extract the EngineSession trait
-  from the proven napi workflows; migrate the Node smoke path onto it; do NOT freeze the
-  CollabSession CRDT façade (collab = v1.5 / Product Phase 9, feature-gated). This is a CODE
-  phase → fresh session, full cycle budget.
+  ✅ 6.1B increment 1 SHIPPED 2026-05-26 (`20d11072a0a`, CODE cycle 1/2): stood up the
+  `ql-session` crate — the binding-neutral EngineSession trait + versioned DTOs + EngineError
+  taxonomy + operation/lifecycle types + FunctionMetadata skeleton. TYPE-LEVEL ONLY (no impl);
+  compiles + 4 unit tests pass + clippy clean. Reuses ql-types. Self-tests pin the CellValue
+  wire shape, the structured-error contract, and the malformed-token-is-fail-loud (No-Fallbacks) rule.
+
+  ⭐ NEXT = 6.1B increment 2: IMPLEMENT the owning `WorkbookSession` struct (`impl EngineSession`),
+  wrapping WorkbookRuntime + OpLog + CalcgraphSession + PlanCache + FunctionRegistry. Required
+  sub-work: (a) refactor WorkbookRuntime to borrow a SESSION-OWNED PlanCache (today mod.rs:140/162/225
+  allocate a fresh cache per runtime — LOW-1); (b) single-writer OpLog mandatory + its Loro VV is the
+  version token (HIGH-2); (c) cancellation registry + Busy state + pre-start-cancel for recalc (HIGH-1);
+  (d) fail-loud delete/restore/move sheet wrappers (MED-3); (e) fill EngineError Appendix A from the
+  real enums; (f) migrate the Node smoke path onto WorkbookSession. Do NOT freeze the CollabSession
+  CRDT façade (collab = v1.5, feature-gated). CODE phase → fresh session, full budget.
 date: 2026-05-26
 predecessor_plan: .plans/_archive/2026-05-26_phase-5-7-v3-6-1-delta-consumer-backlog.md (V3.6.1 backlog mini-phase, SUPERSEDED by Phase 5 COMPLETE)
 parent_phase: 6 Product Surfaces
@@ -37,7 +46,7 @@ direction: |
   foundation; 6.4 (Python UDFs) is the strategic wedge; everything else (full bindings,
   service, SQL, AI) follows. Collab is v1.5-deferred and must NOT pre-empt Phase 6.
 
-current_engine_head: ff6cd4c147c (6.1A v2 Codex-validated) ← 85966ece7b4 (6.1A session-api.md) ← 5886ff32101 (doc-handoff fixes). SOURCE unchanged at 7e536fc07b2 (S2-01); all 6.1A work is docs-only. pre-B#1 baseline 1465b1db4c4.
+current_engine_head: 20d11072a0a (6.1B inc.1 — ql-session crate, type skeleton; first NEW non-docs code since the S2-01 fix) ← ff6cd4c147c (6.1A v2 Codex-validated) ← 85966ece7b4 (6.1A session-api.md) ← 5886ff32101 (doc-handoff fixes). The ql-session crate is type-only (no impl, no reverse-deps yet) so it touches no existing behavior; the S2-01 source fix at 7e536fc07b2 is still the last change to PRE-EXISTING engine code. pre-B#1 baseline 1465b1db4c4.
 current_ide_head: d028568b53b (V3.6.1.2 shared delta cache) — unchanged
 audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait claims need positive compile proof; phase-level closures use 3-5-way megaudits; range-aware fn ships need lex+parse+bind+eval coverage.
 
@@ -45,11 +54,15 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
 
 1. ✅ **Decision lock** — docs/phase6/decision-lock.md.
 2. ✅ **6.1A — Session API contract** — docs/api/session-api.md v2 (SHIPPED + Codex-validated 2026-05-26).
-3. ⭐ **6.1B — Owning WorkbookSession** — single-engine owning session around WorkbookRuntime +
-   OpLog + CalcgraphSession + PlanCache + FunctionRegistry (calcgraph_session.rs:69-71 anticipates
-   it). Define the EngineSession trait + binding-neutral DTO module (schema_version). Implement
-   EngineError taxonomy, cancellation registry + op lifecycle, panic/validation boundary, event
-   queue. Migrate the Node smoke path. Leave collab/transport/presence feature-gated.
+3. **6.1B — Owning WorkbookSession** — single-engine owning session around WorkbookRuntime +
+   OpLog + CalcgraphSession + PlanCache + FunctionRegistry (calcgraph_session.rs:69-71 anticipates it).
+   - ✅ **inc.1 (`20d11072a0a`)**: `ql-session` crate — EngineSession trait + binding-neutral DTO module
+     (schema_version) + EngineError taxonomy + operation/lifecycle types + FunctionMetadata skeleton.
+     Type-level only; compiles + tests + clippy clean.
+   - ⭐ **inc.2 (NEXT)**: implement `WorkbookSession` (`impl EngineSession`) — PlanCache refactor (LOW-1),
+     mandatory single-writer OpLog + VV token (HIGH-2), cancellation registry + Busy state (HIGH-1),
+     fail-loud sheet wrappers (MED-3), EngineError Appendix A, event queue. Migrate the Node smoke path.
+     Leave collab/transport/presence feature-gated.
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).
 5. **6.4-0 — Function-metadata substrate** — replace the hardcoded volatility whitelist
    (calcgraph_session.rs:149-164) + the address-only-reference whitelist (:201-203) +
