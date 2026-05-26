@@ -66,10 +66,11 @@ use ql_storage::{NamedTarget, Workbook};
 use ql_types::{ColId, RowId, SheetId, Value};
 
 use ql_formula_syntax::{lex, parse};
+use ql_oplog::Op;
 use ql_session::dto::{
     BatchOptions, BatchResult, BoundRange, CellAddr, CellRange, CellSnapshot, CellValue, DateSystem,
     Diagnostic, DirtyResult, FormatDef, FormatId, PublishedRef, RangeColumn, RangeQueryOptions,
-    RangeResult, Severity, SessionVersion, SheetInfo, SheetSnapshot, UndoRedoResult,
+    RangeResult, Severity, SessionVersion, SheetInfo, SheetSnapshot, TableSpec, UndoRedoResult,
     WorkbookSnapshot, WorkbookSnapshotDelta, WriteRangeResult,
 };
 use ql_session::error::{EngineError, EngineResult, ErrorClass};
@@ -210,6 +211,23 @@ impl WorkbookSession {
         let id = OperationId(self.next_op_id);
         self.next_op_id += 1;
         id
+    }
+
+    /// Fail-loud sheet-existence check (MED-3): an unknown id → `NotFound`,
+    /// never a silent storage no-op/clamp. (A *known* but tombstoned id still
+    /// "exists" for delete/restore idempotency.)
+    fn require_sheet_exists(&self, id: SheetId, op: &str) -> EngineResult<()> {
+        if (id as usize) >= self.workbook.sheet_count() {
+            return Err(EngineError::new(
+                ErrorClass::NotFound,
+                "sheet_not_found",
+                format!(
+                    "{op}: sheet {id} does not exist (workbook has {} sheets)",
+                    self.workbook.sheet_count()
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Encode the current `{epoch, op_count}` version token (§4.0). 16-byte
@@ -454,18 +472,44 @@ impl EngineSession for WorkbookSession {
             .map_err(map_runtime_err)
     }
 
-    fn delete_sheet(&mut self, _id: SheetId) -> EngineResult<()> {
-        // Needs a fail-loud wrapper + manual Op::RemoveSheet emission (MED-3);
-        // Workbook::remove_sheet is a silent no-op and isn't on WorkbookRuntime.
-        Err(not_implemented("delete_sheet"))
+    fn delete_sheet(&mut self, id: SheetId) -> EngineResult<()> {
+        self.ensure_ready()?;
+        // Fail-loud (MED-3): unknown id → NotFound (NOT the silent storage no-op).
+        // An already-tombstoned (but known) id is an idempotent no-op, not an error.
+        self.require_sheet_exists(id, "delete_sheet")?;
+        // Producer order: append-before-mutate, so a failed append leaves the
+        // workbook unchanged. (`Workbook::remove_sheet` tombstones — preserving
+        // cells for restore; cross-sheet dependents are NOT proactively dirtied
+        // here, matching the engine's current cross-sheet-ref handling.)
+        self.oplog.append(Op::RemoveSheet { id }).map_err(oplog_append_err)?;
+        self.workbook.remove_sheet(id);
+        Ok(())
     }
 
-    fn restore_sheet(&mut self, _id: SheetId) -> EngineResult<()> {
-        Err(not_implemented("restore_sheet"))
+    fn restore_sheet(&mut self, id: SheetId) -> EngineResult<()> {
+        self.ensure_ready()?;
+        self.require_sheet_exists(id, "restore_sheet")?;
+        self.oplog.append(Op::RestoreSheet { id }).map_err(oplog_append_err)?;
+        self.workbook.restore_sheet(id);
+        Ok(())
     }
 
-    fn move_sheet(&mut self, _id: SheetId, _index: u32) -> EngineResult<()> {
-        Err(not_implemented("move_sheet"))
+    fn move_sheet(&mut self, id: SheetId, index: u32) -> EngineResult<()> {
+        self.ensure_ready()?;
+        self.require_sheet_exists(id, "move_sheet")?;
+        // Fail-loud (MED-3): out-of-range index → BadArgument (NOT the silent
+        // storage clamp). Valid display positions are [0, sheet_count).
+        let count = self.workbook.sheet_count() as u32;
+        if index >= count {
+            return Err(EngineError::bad_argument(format!(
+                "move_sheet: index {index} out of range (workbook has {count} sheets)"
+            )));
+        }
+        self.oplog
+            .append(Op::MoveSheet { id, new_index: index })
+            .map_err(oplog_append_err)?;
+        self.workbook.move_sheet(id, index);
+        Ok(())
     }
 
     fn set_name(&mut self, name: &str, target: CellRange) -> EngineResult<()> {
@@ -475,31 +519,60 @@ impl EngineSession for WorkbookSession {
             .map_err(map_runtime_err)
     }
 
-    fn create_table(&mut self, _spec: ql_session::dto::TableSpec) -> EngineResult<()> {
-        Err(not_implemented("create_table"))
+    fn create_table(&mut self, spec: TableSpec) -> EngineResult<()> {
+        self.ensure_ready()?;
+        let TableSpec {
+            name,
+            sheet,
+            top_row,
+            top_col,
+            rows,
+            cols,
+            has_header,
+            has_totals,
+            column_names,
+        } = spec;
+        self.with_runtime(|rt| {
+            rt.create_table(
+                &name, sheet, top_row, top_col, rows, cols, has_header, has_totals, column_names,
+            )
+        })
+        .map_err(map_runtime_err)
     }
 
-    fn rename_table(&mut self, _old_name: &str, _new_name: &str) -> EngineResult<()> {
-        Err(not_implemented("rename_table"))
+    fn rename_table(&mut self, old_name: &str, new_name: &str) -> EngineResult<()> {
+        self.ensure_ready()?;
+        self.with_runtime(|rt| rt.rename_table(old_name, new_name))
+            .map(|_affected| ())
+            .map_err(map_runtime_err)
     }
 
-    fn rename_column(&mut self, _table: &str, _old_col: &str, _new_col: &str) -> EngineResult<()> {
-        Err(not_implemented("rename_column"))
+    fn rename_column(&mut self, table: &str, old_col: &str, new_col: &str) -> EngineResult<()> {
+        self.ensure_ready()?;
+        self.with_runtime(|rt| rt.rename_column(table, old_col, new_col))
+            .map(|_affected| ())
+            .map_err(map_runtime_err)
     }
 
     fn resize_table(
         &mut self,
-        _name: &str,
-        _new_rows: u32,
-        _new_cols: u32,
-        _added_columns: Vec<String>,
-        _removed_columns: Vec<String>,
+        name: &str,
+        new_rows: u32,
+        new_cols: u32,
+        added_columns: Vec<String>,
+        removed_columns: Vec<String>,
     ) -> EngineResult<()> {
-        Err(not_implemented("resize_table"))
+        self.ensure_ready()?;
+        self.with_runtime(|rt| {
+            rt.resize_table(name, new_rows, new_cols, added_columns, removed_columns)
+        })
+        .map_err(map_runtime_err)
     }
 
-    fn drop_table(&mut self, _name: &str) -> EngineResult<()> {
-        Err(not_implemented("drop_table"))
+    fn drop_table(&mut self, name: &str) -> EngineResult<()> {
+        self.ensure_ready()?;
+        self.with_runtime(|rt| rt.drop_table(name))
+            .map_err(map_runtime_err)
     }
 
     // --- Batch / transaction (§3.4) ---
@@ -639,10 +712,30 @@ impl EngineSession for WorkbookSession {
     }
 
     fn snapshot_delta(&self, _last_version: &SessionVersion) -> EngineResult<WorkbookSnapshotDelta> {
-        // Step 6 of the impl plan: the op-walk delta + the §4.3 full-rebuild /
-        // invalid_version_token rules. Returning full_rebuild_required here
-        // would be a silent-resync fallback (forbidden), so this is an honest
-        // not-yet until the delta walk lands.
+        // DEFERRED (inc.2c-2) with a known DESIGN PROBLEM to resolve deliberately
+        // — surfaced honestly rather than shipped incomplete:
+        //
+        // The obvious stateless implementation — decode the `{epoch, op_count}`
+        // token and walk ops `[last_op_count .. current)` from the op-log — is
+        // INSUFFICIENT, because `recompute_dirty`/`recompute_all` write recomputed
+        // dependent values via `Workbook::put_computed_at` and DO NOT append ops.
+        // So an op-walk captures the *user-edited* cell (e.g. A1) but MISSES its
+        // recomputed dependents (e.g. B1=A1*2) — a silently incomplete delta
+        // (No-Fallbacks violation).
+        //
+        // A correct delta needs the set of cells whose value/formula/format
+        // changed since `last_version`, INCLUDING recompute-affected ones. But
+        // `snapshot_delta` is `&self` (can't cache a prior snapshot to diff), and
+        // `RecomputeResult` does not return the changed coords. Resolution
+        // options (decide in the audit / next window):
+        //   (a) maintain a session change-log keyed by version (built during
+        //       mutations + recompute; snapshot_delta reads it with &self) —
+        //       requires recompute to report changed coords (extend
+        //       RecomputeResult or read the graph dirty set pre-recompute);
+        //   (b) make snapshot_delta `&mut self` + a diff-against-last-snapshot
+        //       cache (mirrors the proven collab path) — a contract change;
+        //   (c) have recompute append computed-value ops (heavy; pollutes the log).
+        // (a) is the likely choice. See workbook-session-impl-plan.md §0 item 3.
         Err(not_implemented("snapshot_delta"))
     }
 
@@ -968,6 +1061,14 @@ fn map_runtime_err(e: RuntimeError) -> EngineError {
     }
 }
 
+/// Map a direct `OpLog::append` failure (the structure-op emission path —
+/// delete/restore/move sheet append ops outside a `WorkbookRuntime`) to an
+/// `EngineError`.
+fn oplog_append_err(e: ql_oplog::OpLogError) -> EngineError {
+    let msg = format!("op log append failed: {e}");
+    map_oplog_err(e, msg)
+}
+
 /// Map a `ql_oplog::OpLogError` (surfaced via `RuntimeError::OpLog`) to an
 /// `EngineError`. `display` is the outer RuntimeError's message (preserves the
 /// "op log error: …" prefix).
@@ -1180,5 +1281,60 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(inverted.class, ErrorClass::BadArgument);
+    }
+
+    #[test]
+    fn delete_sheet_tombstones_and_unknown_is_not_found() {
+        let mut s = WorkbookSession::new();
+        s.add_sheet("Keep", 16384).unwrap();
+        let drop_id = s.add_sheet("Drop", 16384).unwrap();
+        // Unknown id → NotFound (NOT a silent no-op).
+        let err = s.delete_sheet(9999).unwrap_err();
+        assert_eq!(err.class, ErrorClass::NotFound);
+        assert_eq!(err.code, "sheet_not_found");
+        // Valid delete tombstones the sheet (list_sheets drops it) + advances version.
+        let v0 = s.snapshot().unwrap().version;
+        s.delete_sheet(drop_id).unwrap();
+        let names: Vec<String> =
+            s.list_sheets().unwrap().into_iter().map(|x| x.name).collect();
+        assert!(names.contains(&"Keep".to_string()));
+        assert!(!names.contains(&"Drop".to_string()));
+        assert_ne!(v0, s.snapshot().unwrap().version);
+        // Restore brings it back.
+        s.restore_sheet(drop_id).unwrap();
+        let names2: Vec<String> =
+            s.list_sheets().unwrap().into_iter().map(|x| x.name).collect();
+        assert!(names2.contains(&"Drop".to_string()));
+    }
+
+    #[test]
+    fn move_sheet_out_of_range_is_bad_argument_unknown_is_not_found() {
+        let mut s = WorkbookSession::new();
+        let sid = s.add_sheet("S", 16384).unwrap();
+        assert_eq!(s.move_sheet(sid, 9999).unwrap_err().class, ErrorClass::BadArgument);
+        assert_eq!(s.move_sheet(9999, 0).unwrap_err().class, ErrorClass::NotFound);
+        assert_eq!(s.restore_sheet(9999).unwrap_err().code, "sheet_not_found");
+    }
+
+    #[test]
+    fn create_then_drop_table() {
+        let mut s = WorkbookSession::new();
+        let sid = s.add_sheet("S", 16384).unwrap();
+        let spec = TableSpec {
+            name: "T".into(),
+            sheet: sid,
+            top_row: 0,
+            top_col: 0,
+            rows: 3,
+            cols: 2,
+            has_header: true,
+            has_totals: false,
+            column_names: vec!["A".into(), "B".into()],
+        };
+        s.create_table(spec).unwrap();
+        // Drop unknown → NotFound.
+        assert_eq!(s.drop_table("NOPE").unwrap_err().class, ErrorClass::NotFound);
+        // Drop the real one succeeds.
+        s.drop_table("T").unwrap();
     }
 }
