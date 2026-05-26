@@ -1,0 +1,31 @@
+ROLE: Adversarial design reviewer for a foundational API contract. Audit-only — read code + docs, produce a reasoned verdict; do NOT change source. Be specific (file:line) and rank findings HIGH/MED/LOW/INFO. Write your full review to `docs/api/codex-6-1a-review.md` and a short verdict to stdout.
+
+REPO: /Users/sanzhar/Documents/Sanzhar/Sanzhar/quantlab/quantlab-quantbook/quantbook-engine
+TOOLING: `rg` is NOT installed (exit 127) — use `grep -rn`. `cargo` is at $HOME/.cargo/bin/cargo (you likely don't need it for a read-only review).
+
+CONTEXT
+A Rust spreadsheet/quant engine just finished Phase 5 (collaboration) and is entering Phase 6 (Product Surfaces) — the v1-critical path. Phase 6 is decision-locked (`docs/phase6/decision-lock.md`, itself Codex-validated). The FIRST step, 6.1A, just produced the stable engine session API contract: **`docs/api/session-api.md`** (THE document under review). The next step, 6.1B, will IMPLEMENT a `WorkbookSession` against this contract, and 6.3 will build Node/WASM/C/Python bindings + 6.2 a service against it. The decision-lock's #1 risk is "wrong 6.1 API lock → binding forks." Your job: find anything in this contract that would cause a binding fork, an unimplementable promise, a hidden fallback, or a divergence from the real engine code — BEFORE code is built against it.
+
+WHAT TO READ
+1. `docs/api/session-api.md` — the contract under review (primary).
+2. `docs/phase6/decision-lock.md` — §3 (7 things 6.1 must lock), §4 (UDF graph-invalidation model + exit tests), §5 (top risks). The contract must faithfully carry these.
+3. `docs/MASTER-PLAN.md` §707-790 — Phase 6 sub-items + exit criteria (API6-01/02/03, BND-6-*, exit criteria).
+4. The REAL engine code the contract claims to be extracted from:
+   - `crates/ql-bindings-node/src/lib.rs` — the napi `CollabSession` surface + `#[napi(object)]` DTOs + the error helpers around lines 306-349 + the `flushPendingToTransport` detach pattern (~3418-3445).
+   - `crates/ql-exec/src/calcgraph_session.rs` — the owning-session anticipation (69-71), the hardcoded volatility whitelist (149-164), the address-only-reference whitelist (201-203), the dirty-fanout (`mark_dirty_from_cell_write`, ~1384-1432).
+   - `crates/ql-exec/src/workbook_runtime/mod.rs` — `WorkbookRuntime` constructors + mutators (set_value/set_formula/clear_formula/recompute_all/recompute_dirty/validate_formula).
+   - `crates/ql-functions/src/registry.rs` — `FunctionRegistry` + the `RegisteredFn` enum (dispatch-only; no metadata today).
+   - `crates/ql-collab/src/session.rs` — the core CollabSession (op-append, cache accessors, undo/redo, transport, presence).
+
+REVIEW AXES (be thorough on each)
+A. **Implementability over the real engine.** The contract promises a cancellation model (operation IDs, deadlines, cancel tokens, terminal states; sync poll/wait + async await; "canceled op MUST NOT commit a late result"). But `WorkbookRuntime::recompute_all`/`recompute_dirty` are synchronous. Is the cancellation model implementable in 6.1B without a rewrite of the compute core? Is cooperative cancel at SCC/chunk boundaries actually feasible given the current recompute structure? Flag any promise the engine cannot honor as written.
+B. **Command-surface completeness + correct tiering.** Is anything missing that 6.4 (Python UDFs) / 6.5 (SQL) / 6.6 (AI) / 6.2 (service) will need but can't add without breaking the lock? Is the v1 vs v1.5 (collab) split correct — is anything marked v1 that actually requires the collab/op-log layer, or vice versa? Is `batch`/`transaction` atomicity well-defined against `BatchCommit` + undo-group reality?
+C. **EngineError taxonomy.** Is the `ErrorClass` set complete + non-overlapping vs the real error enums (`CollabSessionError::kind`, `PersistenceError`, transport errors, eval errors)? Does mapping the existing `[kind]` codes into `code` lose or duplicate anything? Is the "code stability across releases" claim realistic?
+D. **Ownership/FFI model.** "No borrowed Rust ref crosses FFI; opaque handles; owned results." Does this match how the napi binding actually works (Arc<Mutex<..>>, Buffer version tokens)? Is the opaque-version-token contract sound (the version is a Loro VersionVector today — does the single-writer WorkbookSession even have a Loro VV if op-log/collab is feature-gated off)? THIS IS A POSSIBLE CONTRADICTION — investigate: if collab is v1.5-deferred and feature-gated, what produces the snapshot `version` token in the single-writer v1 path?
+E. **Function-metadata + graph-invalidation (6.4-0).** Is the `FunctionMetadata` shape sufficient for the §10.4 exit tests? Does deriving the volatility whitelist from metadata actually work given the parser canonicalizes function names? Any gap that would let a UDF bypass the graph?
+F. **Sync/async + panic/validation boundary.** Is "locks guard state transitions, not waiting" actually achievable for long ops over the current synchronous runtime? Is the `catch_unwind` + Faulted-state design sound, and does it match napi-rs reality?
+G. **Versioning + No-Fallbacks.** Is the `schema_version` + fail-loud-on-unknown approach consistent with the existing `deny_unknown_fields` + `.qbook snapshot_format_version`? Is the `full_rebuild_required` "designed state not a fallback" framing honest, or is it a disguised silent-resync? Any hidden fallback / error-swallowing in the contract?
+H. **Internal consistency + drift.** Does the contract contradict itself, the decision-lock, the MASTER-PLAN, or the real code anywhere? Are the cited line numbers accurate? Is the "single-writer WorkbookSession is v1, collab is v1.5" stance coherent given the ENTIRE existing napi surface is CollabSession (i.e., is there a real, buildable single-writer path today, or does 6.1B have more work than the contract implies)?
+
+DELIVERABLE
+Write `docs/api/codex-6-1a-review.md`: verdict (APPROVE / APPROVE-WITH-CHANGES / REVISE), then findings ranked HIGH/MED/LOW/INFO with file:line + concrete recommended change for each. Call out explicitly the single most dangerous binding-fork risk and whether axis D (the version-token contradiction) is real. End stdout with a one-line verdict.
