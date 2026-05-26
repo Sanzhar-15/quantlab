@@ -66,6 +66,11 @@ mod tests {
 
         let p = CellValue::Pending;
         assert_eq!(serde_json::to_string(&p).unwrap(), r#"{"kind":"pending"}"#);
+
+        // Blank (6.1B inc.2c) — empty cell; distinct from Pending.
+        let b = CellValue::Blank;
+        assert_eq!(serde_json::to_string(&b).unwrap(), r#"{"kind":"blank"}"#);
+        assert_eq!(serde_json::from_str::<CellValue>(r#"{"kind":"blank"}"#).unwrap(), b);
     }
 
     #[test]

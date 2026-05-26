@@ -65,11 +65,12 @@ use ql_oplog::OpLog;
 use ql_storage::{NamedTarget, Workbook};
 use ql_types::{ColId, RowId, SheetId, Value};
 
+use ql_formula_syntax::{lex, parse};
 use ql_session::dto::{
     BatchOptions, BatchResult, BoundRange, CellAddr, CellRange, CellSnapshot, CellValue, DateSystem,
-    Diagnostic, DirtyResult, FormatDef, FormatId, PublishedRef, RangeQueryOptions, RangeResult,
-    Severity, SessionVersion, SheetInfo, SheetSnapshot, UndoRedoResult, WorkbookSnapshot,
-    WorkbookSnapshotDelta, WriteRangeResult,
+    Diagnostic, DirtyResult, FormatDef, FormatId, PublishedRef, RangeColumn, RangeQueryOptions,
+    RangeResult, Severity, SessionVersion, SheetInfo, SheetSnapshot, UndoRedoResult,
+    WorkbookSnapshot, WorkbookSnapshotDelta, WriteRangeResult,
 };
 use ql_session::error::{EngineError, EngineResult, ErrorClass};
 use ql_session::function_meta::FunctionMetadata;
@@ -79,7 +80,7 @@ use ql_session::session::{
 };
 use ql_session::SCHEMA_VERSION;
 
-use crate::{CalcgraphSession, PlanCache, RuntimeError, WorkbookRuntime};
+use crate::{bind_with_site, BindSite, CalcgraphSession, PlanCache, RuntimeError, WorkbookRuntime};
 
 /// Process-global epoch source. A fresh epoch is minted per session
 /// construction (and would be re-minted on reload / cache-clear / undo when
@@ -397,11 +398,46 @@ impl EngineSession for WorkbookSession {
         Ok(storage_format_id_to_dto(id))
     }
 
-    fn validate_formula(&self, _addr: CellAddr, _text: &str) -> EngineResult<Vec<Diagnostic>> {
-        // Deferred: validate_formula is `&self` but WorkbookRuntime construction
-        // needs `&mut`. The read-only lex+parse+bind path is implementable
-        // directly against `&self.workbook`; it lands in the next inc.2 sub-step.
-        Err(not_implemented("validate_formula"))
+    fn validate_formula(&self, addr: CellAddr, text: &str) -> EngineResult<Vec<Diagnostic>> {
+        self.ensure_readable()?;
+        if self.workbook.sheet(addr.sheet).is_none() {
+            return Err(EngineError::new(
+                ErrorClass::NotFound,
+                "sheet_not_found",
+                format!("sheet {} does not exist", addr.sheet),
+            ));
+        }
+        // Read-only lex → parse → bind against the live workbook (no mutation, so
+        // no `WorkbookRuntime` `&mut` needed). A failure at any stage becomes one
+        // error `Diagnostic`; a clean bind yields an empty vec (valid). Evaluation
+        // is intentionally skipped — a formula that *binds* is structurally valid;
+        // an eval-time `#REF!`/`#DIV/0!` is a cell value, not a validation error.
+        let diag = |code: &str, message: String| -> Vec<Diagnostic> {
+            vec![Diagnostic {
+                addr: Some(addr),
+                severity: Severity::Error,
+                code: code.to_string(),
+                message,
+            }]
+        };
+        let tokens = match lex(text) {
+            Ok(t) => t,
+            Err(e) => return Ok(diag("formula_lex", e.to_string())),
+        };
+        let expr = match parse(tokens) {
+            Ok(x) => x,
+            Err(e) => return Ok(diag("formula_parse", e.to_string())),
+        };
+        match bind_with_site(
+            &expr,
+            BindSite::at_cell(addr.into()),
+            &self.workbook,
+            &self.workbook,
+            &self.workbook,
+        ) {
+            Ok(_plan) => Ok(Vec::new()),
+            Err(e) => Ok(diag("formula_bind", e.to_string())),
+        }
     }
 
     // --- Mutation — structure (§3.3) ---
@@ -513,15 +549,51 @@ impl EngineSession for WorkbookSession {
 
     fn query_range(
         &self,
-        _range: CellRange,
+        range: CellRange,
         _options: RangeQueryOptions,
     ) -> EngineResult<RangeResult> {
-        // Deferred pending a CellValue blank-representation decision: a columnar
-        // RangeResult must represent empty cells, but `CellValue` has no Blank
-        // variant. Resolving this (add `CellValue::Blank` vs `Vec<Option<..>>`)
-        // is a deliberate contract change tracked for the next inc.2 sub-step;
-        // snapshot/cell handle blanks via `Option`/skip and prove the read path.
-        Err(not_implemented("query_range"))
+        // `_options` (include_formulas/formats/rendered) is reserved: the v1
+        // `RangeColumn` carries values only. Empty cells are `CellValue::Blank`
+        // (added inc.2c) so the columnar shape stays fixed-size.
+        self.ensure_readable()?;
+        let sheet = self.workbook.sheet(range.sheet).ok_or_else(|| {
+            EngineError::new(
+                ErrorClass::NotFound,
+                "sheet_not_found",
+                format!("sheet {} does not exist", range.sheet),
+            )
+        })?;
+        if range.end_row < range.start_row || range.end_col < range.start_col {
+            return Err(EngineError::bad_argument(
+                "range end coordinate is before its start",
+            ));
+        }
+        let n_rows = range.end_row - range.start_row + 1;
+        let n_cols = range.end_col - range.start_col + 1;
+        // Guard against an OOM on a pathological whole-sheet request (the read is
+        // a deliberate caller request, but a fixed cap fails loud rather than
+        // allocating gigabytes of Blanks).
+        const MAX_CELLS: u64 = 1 << 20; // ~1M cells
+        if (n_rows as u64) * (n_cols as u64) > MAX_CELLS {
+            return Err(EngineError::bad_argument(format!(
+                "range too large: {n_rows}x{n_cols} exceeds the {MAX_CELLS}-cell query cap"
+            )));
+        }
+        let mut columns = Vec::with_capacity(n_cols as usize);
+        for col in range.start_col..=range.end_col {
+            let mut values = Vec::with_capacity(n_rows as usize);
+            for row in range.start_row..=range.end_row {
+                values.push(value_to_cell_value_dense(&sheet.read(row, col)));
+            }
+            columns.push(RangeColumn { values });
+        }
+        Ok(RangeResult {
+            schema_version: SCHEMA_VERSION,
+            range,
+            n_rows,
+            n_cols,
+            columns,
+        })
     }
 
     fn snapshot(&self) -> EngineResult<WorkbookSnapshot> {
@@ -777,9 +849,29 @@ fn cell_value_to_value(cv: CellValue) -> EngineResult<Value> {
         CellValue::Error { error } => Err(EngineError::bad_argument(format!(
             "cannot set a cell to a literal error value ({error}); error values are formula outputs"
         ))),
+        // Blank as an input means "clear the cell's value".
+        CellValue::Blank => Ok(Value::Blank),
         CellValue::Pending => Err(EngineError::bad_argument(
             "Pending is a computed-state marker, not a valid input value",
         )),
+    }
+}
+
+/// Dense `ql_types::Value` → `CellValue` for `query_range` (a fixed-size columnar
+/// read must represent empties, so `Blank` maps to `CellValue::Blank` here —
+/// unlike [`value_to_cell_value`], which returns `None` for snapshot's sparse,
+/// blank-omitting cell list).
+fn value_to_cell_value_dense(v: &Value) -> CellValue {
+    match v {
+        Value::Blank => CellValue::Blank,
+        Value::Number(n) => CellValue::Number { number: *n },
+        Value::Boolean(b) => CellValue::Boolean { boolean: *b },
+        Value::Text(s) => CellValue::Text {
+            text: s.to_string(),
+        },
+        Value::Error(e) => CellValue::Error {
+            error: e.sigil().to_string(),
+        },
     }
 }
 
@@ -1032,5 +1124,61 @@ mod tests {
             Event::OperationCompleted { op: o, .. } if *o == op
         )));
         assert!(!page.dropped);
+    }
+
+    #[test]
+    fn validate_formula_valid_vs_invalid() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // A well-formed formula → no diagnostics. (Range-free: a *literal* range
+        // like SUM(A2:A5) nested under an operator bind-fails in v1 scope by
+        // design — see reference_fns_step4_e2e::formulatext_of_sum_literal_range_
+        // bind_fails_v1_scope — and validate_formula correctly surfaces that.)
+        let v = s.validate_formula(addr(sheet, 0, 0), "1 + 2 * 3").unwrap();
+        assert!(v.is_empty(), "expected valid, got: {v:?}");
+        let v2 = s.validate_formula(addr(sheet, 0, 0), "A1 * 2 + 5").unwrap();
+        assert!(v2.is_empty(), "expected valid, got: {v2:?}");
+        // A malformed formula → exactly one error diagnostic at the cell.
+        let diags = s.validate_formula(addr(sheet, 0, 0), "1 +* 2").unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert_eq!(diags[0].addr, Some(addr(sheet, 0, 0)));
+    }
+
+    #[test]
+    fn query_range_is_columnar_with_blanks() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 1.0 }).unwrap();
+        s.set_value(addr(sheet, 1, 0), CellValue::Number { number: 2.0 }).unwrap();
+        // B-column left empty.
+        let r = s
+            .query_range(
+                CellRange { sheet, start_row: 0, start_col: 0, end_row: 1, end_col: 1 },
+                RangeQueryOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(r.n_rows, 2);
+        assert_eq!(r.n_cols, 2);
+        assert_eq!(r.columns.len(), 2);
+        // Column A: [1, 2]; column B: [Blank, Blank].
+        assert_eq!(r.columns[0].values, vec![
+            CellValue::Number { number: 1.0 },
+            CellValue::Number { number: 2.0 },
+        ]);
+        assert_eq!(r.columns[1].values, vec![CellValue::Blank, CellValue::Blank]);
+    }
+
+    #[test]
+    fn query_range_rejects_inverted_and_oversize() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let inverted = s
+            .query_range(
+                CellRange { sheet, start_row: 5, start_col: 0, end_row: 0, end_col: 0 },
+                RangeQueryOptions::default(),
+            )
+            .unwrap_err();
+        assert_eq!(inverted.class, ErrorClass::BadArgument);
     }
 }

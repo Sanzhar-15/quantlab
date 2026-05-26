@@ -84,8 +84,9 @@ impl From<CellRange> for ql_types::Range {
 
 /// A cell value — a **discriminated union** on `kind` (contract §4.2). Bindings
 /// narrow on `kind`; exactly one payload is present. Maps from
-/// [`ql_types::Value`] (`Pending` is a binding-layer "being computed" state with
-/// no `ql_types::Value` analog).
+/// [`ql_types::Value`]: `Number`/`Boolean`/`Text`/`Error`/`Blank` correspond 1:1;
+/// `Pending` is the extra binding-layer "being computed" state with no
+/// `ql_types::Value` analog.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum CellValue {
@@ -110,6 +111,13 @@ pub enum CellValue {
         /// The rendered error code.
         error: String,
     },
+    /// An empty cell — no committed value (maps from [`ql_types::Value::Blank`]).
+    /// Added in 6.1B inc.2c so a columnar `query_range` read can represent
+    /// empties in a fixed-size `Vec<CellValue>` (a deliberate, backward-compatible
+    /// contract addition; see `docs/api/workbook-session-impl-plan.md` §0). As a
+    /// `set_value` input it means "clear the cell's value". Snapshots omit blank
+    /// cells entirely (`CellSnapshot.value: None`) rather than emitting `Blank`.
+    Blank,
     /// The cell is queued for recompute and has no committed value yet.
     Pending,
 }
