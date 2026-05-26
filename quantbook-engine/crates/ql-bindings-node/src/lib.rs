@@ -2710,8 +2710,18 @@ impl CollabSession {
         let mut changed_cells: Vec<ChangedCellJson> =
             Vec::with_capacity(changed_cell_coords.len());
         for (sheet, row, col) in changed_cell_coords {
-            // V3.6.0.X phase-termination filter (see comment above).
-            if removed_sheet_set.contains(&sheet) {
+            // V3.6.0.X phase-termination filter + 5.8 megaudit S2-01 closure
+            // (2026-05-26): skip a changedCells entry for a TOMBSTONED sheet.
+            // `removed_sheet_set` only covers RemoveSheet ops IN THIS delta
+            // window; a sheet tombstoned in a PRIOR window and then written
+            // via a later PutValue would otherwise leak a changedCells entry
+            // for an already-removed sheet (cross-window leak -- the live-path
+            // counterpart of the B#1 export_snapshot gap, converged by Codex +
+            // Sonnet audit lanes).  `is_sheet_removed_in_cache` reflects ALL
+            // tombstones (the cache's removed_sheets tracker), so it covers
+            // both the current and prior windows; the `removed_sheet_set`
+            // check is retained for explicitness.
+            if removed_sheet_set.contains(&sheet) || inner.is_sheet_removed_in_cache(sheet) {
                 continue;
             }
             // **V3.6.0.8.4 CODEX-HIGH-3 closure (2026-05-25)**: O(1)
