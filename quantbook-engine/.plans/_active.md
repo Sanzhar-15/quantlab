@@ -30,7 +30,10 @@ status: |
   (create/rename/rename_column/resize/drop_table) + TableSpec DTO (5 tests). ⚠️ a git-index padding
   race truncated the inc.1 commit's dto.rs/session.rs blobs — caught + fixed at `af15dcf3a5d`.
 
-  ⭐ NEXT = 6.1B increment 2: IMPLEMENT the owning `WorkbookSession` struct (`impl EngineSession`),
+  ⭐ NEXT = 6.1B increment 2 — **follow `docs/api/workbook-session-impl-plan.md`** (concrete grounded
+  build plan: placement = `ql-exec`/new `session.rs`; struct fields; PlanCache refactor FIRST; `{epoch,
+  op_count}` version token — NOT Loro VV; method-by-method map; sub-task ordering; tests; Node smoke
+  migration). IMPLEMENT the owning `WorkbookSession` struct (`impl EngineSession`),
   wrapping WorkbookRuntime + OpLog + CalcgraphSession + PlanCache + FunctionRegistry. Required
   sub-work: (a) refactor WorkbookRuntime to borrow a SESSION-OWNED PlanCache (today mod.rs:140/162/225
   allocate a fresh cache per runtime — LOW-1); (b) single-writer OpLog mandatory + its Loro VV is the
@@ -42,7 +45,9 @@ date: 2026-05-26
 predecessor_plan: .plans/_archive/2026-05-26_phase-5-7-v3-6-1-delta-consumer-backlog.md (V3.6.1 backlog mini-phase, SUPERSEDED by Phase 5 COMPLETE)
 parent_phase: 6 Product Surfaces
 canonical_decision_lock: docs/phase6/decision-lock.md (authoritative locked decisions + sequence)
-canonical_contract: docs/api/session-api.md (6.1A — what 6.1B builds against)
+canonical_contract: docs/api/session-api.md (6.1A v2, Codex-validated — what 6.1B builds against)
+canonical_impl_plan: docs/api/workbook-session-impl-plan.md (6.1B inc.2 concrete build plan — READ FIRST before implementing WorkbookSession)
+codex_review: docs/api/codex-6-1a-review.md (the 13 findings the contract resolves)
 direction: |
   Wedge-first: get the engine to the Month-6 Python kill gate (debug-from-cell, BoundFrame,
   qb.show(df)) on the shortest sound path. 6.1 (stable session API) is the non-negotiable

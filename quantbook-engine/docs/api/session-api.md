@@ -240,16 +240,22 @@ v1 token source. **Resolution (locked):**
 - The single-writer **`OpLog` is MANDATORY** for a v1 `WorkbookSession` (it already underpins undo +
   save/load). What is v1.5-deferred is the *collaborative* layer on top (transport, CRDT *merge*,
   presence) — **not** the op-log itself.
-- The opaque `version` token **IS the op-log's Loro `VersionVector`, encoded as bytes** — exactly
-  today's producer. This keeps Node's existing token working and gives every binding **one** producer/
-  validator. Bindings round-trip it verbatim; the contract forbids interpreting it.
+- **The token is an engine-owned `{session_epoch, op_count}`, encoded as bytes** — NOT a Loro
+  `VersionVector`. (Correction from grounding: `ql-oplog::OpLog` is a plain append-only log with **no
+  version vector** — `len()`/`append()`/`iter()`/`get()` only; the Loro VV is the *`CollabSession`*
+  token, i.e. the v1.5 collab path.) `session_epoch` is a fresh id minted at `new`/`open`/`import` (and
+  on any cache-clearing event); `op_count` is `OpLog::len()` at snapshot time — monotonic under
+  single-writer appends. This gives every binding **one** producer/validator. The v1.5 `CollabSession`
+  adapter maps its Loro VV into this same opaque-token slot. Bindings round-trip the bytes verbatim and
+  MUST NOT interpret them.
 - **Validity rules (locked):**
-  - A token is valid only within the **same live session + cache epoch**. `merge`-free single-writer
-    sessions advance the VV purely by local appends.
-  - After `save`→`open` (reload), tokens are **reissued**; an old token from a prior process is treated
-    as "different epoch" → `full_rebuild_required` (§4.3), not silently accepted.
+  - A token is valid only within the **same live session + epoch**. Single-writer sessions advance
+    `op_count` purely by local appends.
+  - `new`/`open`/`import` (and any cache-clearing event) mint a **new `session_epoch`**; an old token
+    whose epoch ≠ current is `full_rebuild_required` reason `epoch_mismatch` (§4.3), not silently accepted.
   - `snapshot_delta` MUST attempt an incremental delta for a well-formed, same-epoch, non-stale token;
-    it MAY return `full_rebuild_required` **only** for the enumerated reasons in §4.3.
+    it MAY return `full_rebuild_required` **only** for the enumerated reasons in §4.3. A malformed /
+    unsupported-schema token is the fail-loud `invalid_version_token` error (§4.3 / MED-2).
 
 ### 4.1 Versioning rule
 Every DTO crossing the contract carries `schema_version` (or the envelope's `protocol_version`).

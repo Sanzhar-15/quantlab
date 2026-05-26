@@ -9,9 +9,11 @@
 use ql_types::{ColId, RowId, SheetId};
 use serde::{Deserialize, Serialize};
 
-/// Opaque session/version token (contract §4.0). In v1 this is the single-writer
-/// op-log's encoded Loro `VersionVector`. Callers round-trip it verbatim and MUST
-/// NOT interpret the bytes; the engine is the sole producer/validator.
+/// Opaque session/version token (contract §4.0). In v1 this is an engine-owned
+/// `{session_epoch, op_count}` encoded as bytes — the single-writer
+/// `ql-oplog::OpLog` has NO version vector (the Loro `VersionVector` is the v1.5
+/// `CollabSession` token). Callers round-trip it verbatim and MUST NOT interpret
+/// the bytes; the engine is the sole producer/validator.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionVersion(pub Vec<u8>);
 
