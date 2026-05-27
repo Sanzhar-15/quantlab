@@ -2001,6 +2001,11 @@ mod tests {
                 recompute: crate::RecomputeMode::Skip,
                 ..Default::default()
             },
+            // NOTE: `None` (not `ql_exec::EngineXlsxRecomputer`) — the lib-test
+            // compiles against a distinct crate instance from the one
+            // `ql-exec`'s impl targets, so the trait bound would not match here.
+            // `RecomputeMode::Skip` means the recomputer is never invoked.
+            None,
         )
         .unwrap();
 

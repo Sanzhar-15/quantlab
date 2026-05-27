@@ -27,6 +27,7 @@ fn import_skip(path: &std::path::Path) -> Option<XlsxImportResult> {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .ok()
 }
@@ -852,6 +853,7 @@ fn deep_update_original_strict_policy() {
             preserve_package: true,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .expect("import");
     let preservation = result.preservation.expect("preservation");
@@ -902,6 +904,7 @@ fn deep_update_original_strict_policy() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     ) {
         println!(
             "perm re-import: sheets={} fml={} ovrl={} names={} tables={}",
@@ -997,6 +1000,7 @@ fn deep_strict_with_vba() {
             preserve_package: true,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .expect("import-vba");
     let preservation = result.preservation.unwrap();

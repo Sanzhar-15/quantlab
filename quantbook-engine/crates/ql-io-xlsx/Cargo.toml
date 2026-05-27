@@ -30,12 +30,18 @@ umya-spreadsheet = "=2.2.0"
 
 # Workspace shared.
 ql-storage = { path = "../ql-storage" }
-ql-exec = { path = "../ql-exec" }
 ql-functions = { path = "../ql-functions" }
 ql-types = { path = "../ql-types" }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+# **inc.2c-10 (2026-05-27):** `ql-exec` moved from `[dependencies]` to here to
+# break the `ql-exec → ql-io-xlsx → ql-exec` cycle. ql-io-xlsx is now pure I/O
+# (formula recompute is injected via the `XlsxRecomputer` trait, implemented by
+# `ql-exec`). Tests still recompute through the real engine via this dev-dep,
+# using `ql_exec::EngineXlsxRecomputer`. Dev-dependency cycles are permitted by
+# Cargo (only normal-dependency cycles are forbidden).
+ql-exec = { path = "../ql-exec" }
 # Test fixtures live in this crate; tests load .xlsx via ql_io_xlsx itself.
 # Phase 4.12 megaudit Opus-A: `opus_a_phase_4_12_ide_proof.rs` exercises the
 # IDE proof point (xlsx → .qbook → xlsx) which requires ql-oplog persistence.

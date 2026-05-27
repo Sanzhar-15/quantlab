@@ -66,6 +66,7 @@ fn two_custom_ids_with_same_format_code() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     );
     match r {
         Ok(res) => {
@@ -143,6 +144,7 @@ fn libreoffice_general_at_custom_id_round_trip() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let sheet = r.workbook.sheet(0).unwrap();

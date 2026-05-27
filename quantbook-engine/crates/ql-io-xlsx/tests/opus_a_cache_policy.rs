@@ -56,6 +56,7 @@ fn skip_cache_round_trip_behavior() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let sheet = r.workbook.sheet(s).unwrap();
@@ -87,6 +88,7 @@ fn recompute_strict_on_unknown_function() {
             recompute: RecomputeMode::Strict,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     );
     println!(
         "strict-recompute outcome: {:?}",
@@ -101,6 +103,7 @@ fn recompute_strict_on_unknown_function() {
             recompute: RecomputeMode::BestEffort,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     );
     match r2 {
         Ok(rr) => {

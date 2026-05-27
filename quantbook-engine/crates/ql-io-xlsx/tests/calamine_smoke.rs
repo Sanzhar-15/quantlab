@@ -28,8 +28,13 @@ fn import_ironcalc_basic_text_fixture_succeeds() {
         recompute: RecomputeMode::Skip,
         ..Default::default()
     };
-    let result = import_xlsx_path(BASIC_TEXT_FIXTURE, &registry, opts)
-        .expect("basic_text.xlsx should import successfully");
+    let result = import_xlsx_path(
+        BASIC_TEXT_FIXTURE,
+        &registry,
+        opts,
+        Some(&ql_exec::EngineXlsxRecomputer),
+    )
+    .expect("basic_text.xlsx should import successfully");
 
     // The fixture has at least 1 sheet.
     assert!(
@@ -53,8 +58,13 @@ fn import_ironcalc_basic_text_with_preservation_carries_bytes() {
         preserve_package: true,
         ..Default::default()
     };
-    let result = import_xlsx_path(BASIC_TEXT_FIXTURE, &registry, opts)
-        .expect("basic_text.xlsx import with preserve_package should succeed");
+    let result = import_xlsx_path(
+        BASIC_TEXT_FIXTURE,
+        &registry,
+        opts,
+        Some(&ql_exec::EngineXlsxRecomputer),
+    )
+    .expect("basic_text.xlsx import with preserve_package should succeed");
     let preservation = result
         .preservation
         .expect("preservation handle should be Some");
@@ -79,8 +89,13 @@ fn import_ironcalc_basic_text_records_date_system() {
         recompute: RecomputeMode::Skip,
         ..Default::default()
     };
-    let result = import_xlsx_path(BASIC_TEXT_FIXTURE, &registry, opts)
-        .expect("basic_text.xlsx import succeeds");
+    let result = import_xlsx_path(
+        BASIC_TEXT_FIXTURE,
+        &registry,
+        opts,
+        Some(&ql_exec::EngineXlsxRecomputer),
+    )
+    .expect("basic_text.xlsx import succeeds");
     assert_eq!(
         result.workbook.date_system(),
         ql_types::DateSystem::Excel1900,
@@ -98,7 +113,13 @@ fn import_ironcalc_basic_text_inventory_is_clean() {
         recompute: RecomputeMode::Skip,
         ..Default::default()
     };
-    let result = import_xlsx_path(BASIC_TEXT_FIXTURE, &registry, opts).unwrap();
+    let result = import_xlsx_path(
+        BASIC_TEXT_FIXTURE,
+        &registry,
+        opts,
+        Some(&ql_exec::EngineXlsxRecomputer),
+    )
+    .unwrap();
     assert!(
         result.report.feature_inventory.is_clean(),
         "basic_text.xlsx should have clean inventory, got {:?}",
@@ -116,7 +137,13 @@ fn round_trip_ironcalc_basic_text_preserves_sheet_count() {
         recompute: RecomputeMode::Skip,
         ..Default::default()
     };
-    let first = import_xlsx_path(BASIC_TEXT_FIXTURE, &registry, opts.clone()).unwrap();
+    let first = import_xlsx_path(
+        BASIC_TEXT_FIXTURE,
+        &registry,
+        opts.clone(),
+        Some(&ql_exec::EngineXlsxRecomputer),
+    )
+    .unwrap();
     let original_sheet_count = first.workbook.sheet_count();
 
     let tmp = std::env::temp_dir().join("ql-io-xlsx-rt-sheet-count.xlsx");
@@ -128,7 +155,8 @@ fn round_trip_ironcalc_basic_text_preserves_sheet_count() {
     };
     export_xlsx_path(&first.workbook, &registry, &tmp, export_opts).unwrap();
 
-    let second = import_xlsx_path(&tmp, &registry, opts).unwrap();
+    let second =
+        import_xlsx_path(&tmp, &registry, opts, Some(&ql_exec::EngineXlsxRecomputer)).unwrap();
     assert_eq!(second.workbook.sheet_count(), original_sheet_count);
     let _ = std::fs::remove_file(&tmp);
 }
@@ -171,6 +199,7 @@ fn w5_d_14_1_round_trip_preserves_formula_with_cached_value() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
 
@@ -214,6 +243,7 @@ fn w5_d_14_1_round_trip_preserves_date1904() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     assert_eq!(
@@ -260,6 +290,7 @@ fn w5_d_14_1_round_trip_preserves_error_values() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     for (i, err) in cases.iter().enumerate() {
@@ -293,6 +324,7 @@ fn w5_d_14_1_libreoffice_general_at_custom_id_does_not_error() {
         "../../.references/ironcalc/xlsx/tests/libreoffice_888_example.xlsx",
         &registry,
         opts,
+        Some(&ql_exec::EngineXlsxRecomputer),
     );
     assert!(
         result.is_ok(),
@@ -324,6 +356,7 @@ fn w5_d_14_2_round_trip_preserves_custom_format_codes() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
 
@@ -366,6 +399,7 @@ fn w5_d_14_2_round_trip_preserves_workbook_scoped_name_cell() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
 
@@ -409,6 +443,7 @@ fn w5_d_14_2_round_trip_preserves_workbook_scoped_name_range() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
 
@@ -457,6 +492,7 @@ fn w5_d_14_2_round_trip_preserves_sheet_scoped_name() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
 
@@ -533,6 +569,7 @@ fn w5_d_14_2_round_trip_preserves_table() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
 
@@ -566,7 +603,13 @@ fn w5_d_14_2_update_original_round_trip_preserves_opaque_theme() {
         preserve_package: true,
         ..Default::default()
     };
-    let result = import_xlsx_path(BASIC_TEXT_FIXTURE, &registry, import_opts).unwrap();
+    let result = import_xlsx_path(
+        BASIC_TEXT_FIXTURE,
+        &registry,
+        import_opts,
+        Some(&ql_exec::EngineXlsxRecomputer),
+    )
+    .unwrap();
     let preservation = result.preservation.expect("preservation requested");
 
     let tmp = std::env::temp_dir().join("w5-d-14-2-update-original-theme.xlsx");
@@ -607,7 +650,13 @@ fn w5_d_14_2_update_original_round_trip_preserves_cell_edits() {
         preserve_package: true,
         ..Default::default()
     };
-    let result = import_xlsx_path(BASIC_TEXT_FIXTURE, &registry, import_opts).unwrap();
+    let result = import_xlsx_path(
+        BASIC_TEXT_FIXTURE,
+        &registry,
+        import_opts,
+        Some(&ql_exec::EngineXlsxRecomputer),
+    )
+    .unwrap();
     let preservation = result.preservation.expect("preservation requested");
 
     let mut wb = result.workbook;
@@ -633,6 +682,7 @@ fn w5_d_14_2_update_original_round_trip_preserves_cell_edits() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let sheet0 = reimport.workbook.sheet(0).unwrap();
@@ -658,7 +708,13 @@ fn w5_d_14_2_3_update_original_preserves_original_theme_bytes() {
         preserve_package: true,
         ..Default::default()
     };
-    let result = import_xlsx_path(BASIC_TEXT_FIXTURE, &registry, import_opts).unwrap();
+    let result = import_xlsx_path(
+        BASIC_TEXT_FIXTURE,
+        &registry,
+        import_opts,
+        Some(&ql_exec::EngineXlsxRecomputer),
+    )
+    .unwrap();
     let preservation = result.preservation.expect("preservation requested");
 
     // Capture the original theme bytes for comparison.
@@ -852,6 +908,7 @@ fn w5_d_15_round_trip_per_cell_custom_format_application() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
 
@@ -901,6 +958,7 @@ fn w5_d_15_round_trip_per_cell_builtin_format_application() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
 
@@ -950,6 +1008,7 @@ fn w5_d_15_round_trip_dedup_shared_format_id() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
 
@@ -993,6 +1052,7 @@ fn w5_d_15_2_formula_with_blank_cache_format_overlay_round_trips() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let overlay = result.workbook.sheet(0).unwrap().format_overlay();
@@ -1056,6 +1116,7 @@ fn w5_d_15_2_cross_sheet_roster_byte_deterministic() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
 
@@ -1135,6 +1196,7 @@ fn w5_d_pm_1_formula_with_error_cache_round_trips_as_error() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let sheet = result.workbook.sheet(0).unwrap();
@@ -1171,6 +1233,7 @@ fn w5_d_pm_1_formula_with_boolean_cache_round_trips_as_boolean() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let sheet = result.workbook.sheet(0).unwrap();
@@ -1232,6 +1295,7 @@ fn w5_d_pm_1_blank_overlay_below_existing_row_keeps_sorted() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     assert_eq!(
@@ -1274,7 +1338,12 @@ fn w5_d_pm_2_numfmt_id_overflow_rejected() {
     }
     let registry = ql_functions::default_registry();
     let opts = XlsxImportOptions::default();
-    let result = ql_io_xlsx::import_xlsx_bytes(&bytes, &registry, opts);
+    let result = ql_io_xlsx::import_xlsx_bytes(
+        &bytes,
+        &registry,
+        opts,
+        Some(&ql_exec::EngineXlsxRecomputer),
+    );
     assert!(
         matches!(result, Err(ql_io_xlsx::XlsxError::MalformedOoxml { .. })),
         "expected MalformedOoxml for u32::MAX numFmtId, got {result:?}"
@@ -1316,6 +1385,7 @@ fn w5_d_pm_2_oob_cell_ref_skipped_silently() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     // OOB refs are silently skipped — overlay should be empty.
@@ -1353,7 +1423,12 @@ fn w5_d_pm_2_path_traversal_rels_rejected() {
     // Should NOT panic; should NOT crash. The unknown-r:id-resolves-
     // to-empty-path is now safe behavior (the sheet's part path is
     // empty, downstream loops skip it).
-    let _ = import_xlsx_bytes(&bytes, &registry, XlsxImportOptions::default());
+    let _ = import_xlsx_bytes(
+        &bytes,
+        &registry,
+        XlsxImportOptions::default(),
+        Some(&ql_exec::EngineXlsxRecomputer),
+    );
 }
 
 #[test]
@@ -1381,7 +1456,12 @@ fn w5_d_pm_2_sheet_name_with_control_char_rejected() {
         zw.finish().unwrap();
     }
     let registry = ql_functions::default_registry();
-    let result = ql_io_xlsx::import_xlsx_bytes(&bytes, &registry, XlsxImportOptions::default());
+    let result = ql_io_xlsx::import_xlsx_bytes(
+        &bytes,
+        &registry,
+        XlsxImportOptions::default(),
+        Some(&ql_exec::EngineXlsxRecomputer),
+    );
     assert!(
         matches!(result, Err(ql_io_xlsx::XlsxError::MalformedOoxml { .. })),
         "expected MalformedOoxml for sheet name with control char, got {result:?}"
@@ -1408,7 +1488,12 @@ fn w5_d_pm_3_zero_sheet_workbook_rejected() {
         zw.finish().unwrap();
     }
     let registry = ql_functions::default_registry();
-    let result = ql_io_xlsx::import_xlsx_bytes(&bytes, &registry, XlsxImportOptions::default());
+    let result = ql_io_xlsx::import_xlsx_bytes(
+        &bytes,
+        &registry,
+        XlsxImportOptions::default(),
+        Some(&ql_exec::EngineXlsxRecomputer),
+    );
     assert!(
         matches!(result, Err(ql_io_xlsx::XlsxError::MalformedOoxml { .. })),
         "expected MalformedOoxml for zero-sheet workbook, got {result:?}"
@@ -1449,6 +1534,7 @@ fn w5_d_pm_3_unknown_r_id_surfaces_visibly() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     );
     match result {
         Err(_) => { /* calamine catches it — visible. OK. */ }
@@ -1498,6 +1584,7 @@ fn w5_d_pm_3_hidden_sheet_records_inventory_entry() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     assert!(
@@ -1625,6 +1712,7 @@ fn w5_d_15_2_blank_cell_with_format_overlay_round_trips() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let overlay = result.workbook.sheet(0).unwrap().format_overlay();
@@ -1672,6 +1760,7 @@ fn w5_d_15_1_empty_sheet_before_styled_sheet_preserves_alignment() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     assert_eq!(result.workbook.sheet_count(), 2);
@@ -1716,6 +1805,7 @@ fn w5_d_15_1_libreoffice_apply_number_format_default_true() {
         "../../.references/ironcalc/xlsx/tests/libreoffice_888_example.xlsx",
         &registry,
         opts,
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     // At least one sheet should have at least one populated overlay
@@ -1749,6 +1839,7 @@ fn import_ironcalc_example_fixture_with_recompute_doesnt_panic() {
         "../../.references/ironcalc/xlsx/tests/example.xlsx",
         &registry,
         opts,
+        Some(&ql_exec::EngineXlsxRecomputer),
     );
     // Whatever the report says, the import itself should succeed
     // (BestEffort = don't abort on formula failures).
@@ -1851,6 +1942,7 @@ fn step6_multi_peer_format_ids_flatten_and_report_on_xlsx_export() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .expect("re-import of multi-peer-flattened xlsx must succeed");
 
@@ -1945,6 +2037,7 @@ fn step6_legacy_peer_only_workbook_xlsx_export_byte_unchanged() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let imported_code = result
@@ -2087,6 +2180,7 @@ fn step6_audit_cross_peer_same_string_dedups_to_one_numfmt() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
 
@@ -2246,6 +2340,7 @@ fn step6_audit_xlsx_qbook_xlsx_double_round_trip_drops_to_zero_multi_peer_flatte
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
 
@@ -2395,6 +2490,7 @@ fn step8_audit_xlsx_import_unresolved_overlay_numfmt_reports_unsupported_feature
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .expect("xlsx import must succeed (issue reported, not raised)");
 

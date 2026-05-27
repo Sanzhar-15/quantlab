@@ -6,7 +6,7 @@
 
 use crate::error::XlsxError;
 use crate::read::calamine_grid::CalamineGrid;
-use crate::report::{FormulaImportFailure, XlsxImportReport};
+use crate::report::XlsxImportReport;
 use ql_storage::Workbook;
 
 /// Build a `Workbook` from the calamine grid reader.
@@ -98,50 +98,4 @@ pub(crate) fn build_workbook_from_grid(
     }
 
     Ok((wb, cells_loaded, formulas_loaded))
-}
-
-/// Run the recompute pass on every formula cell. Failures are
-/// collected into `report.formula_failures` but DO NOT abort the
-/// import — the imported cached value is preserved for any formula
-/// the engine couldn't evaluate. Per `RecomputeMode::BestEffort`
-/// (the default).
-///
-/// **W5-D-14a:** this is the bridge between the xlsx import path and
-/// the engine's `WorkbookRuntime::recompute_all`. The recompute
-/// runner mode (`Strict` / `BestEffort` / `Skip`) is dispatched at
-/// the public-API layer.
-pub(crate) fn recompute_loaded_workbook(
-    wb: Workbook,
-    registry: &ql_functions::FunctionRegistry,
-    report: &mut XlsxImportReport,
-) -> Result<Workbook, XlsxError> {
-    // The runtime borrows the workbook mutably and the registry by
-    // reference. We construct it, run recompute_all, then deconstruct
-    // (the runtime is per-recompute; the workbook lives on).
-    let mut wb = wb;
-    let mut rt = ql_exec::WorkbookRuntime::new(&mut wb, registry);
-
-    // recompute_all evaluates every formula cell in topological
-    // order. Per its docs, it reports per-cell failures and produces
-    // a summary count; it does not abort on the first failure.
-    let result = rt.recompute_all();
-
-    // Translate structural failures (lex/parse/bind errors) into
-    // FormulaImportFailure entries. The runtime carries the cell
-    // address + formula text + error directly on each `RecomputeFailure`.
-    //
-    // Note: evaluation errors that produce a `Value::Error(_)` cell
-    // (e.g. `#DIV/0!`, `#N/A`) are NOT failures — they're normal cell
-    // values. We only report structural failures here.
-    for failure in result.failures.iter() {
-        report.formula_failures.push(FormulaImportFailure {
-            sheet: failure.sheet,
-            row: failure.row,
-            col: failure.col,
-            formula: failure.formula_text.to_string(),
-            reason: format!("{:?}", failure.error),
-        });
-    }
-
-    Ok(wb)
 }

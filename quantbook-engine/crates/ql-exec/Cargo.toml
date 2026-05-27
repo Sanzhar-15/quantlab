@@ -20,6 +20,15 @@ ql-functions      = { path = "../ql-functions" }
 # convenience. No new transitive risk — ql-io was already linked through
 # dev-deps in the same crate.
 ql-io             = { path = "../ql-io" }
+# Phase 6.1B inc.2c-10 (2026-05-27): xlsx import for `WorkbookSession::import`.
+# ql-io-xlsx no longer depends on ql-exec (recompute is injected via its
+# `XlsxRecomputer` trait, which `EngineXlsxRecomputer` implements here) — so
+# `ql-exec -> ql-io-xlsx` is now acyclic. NOTE (tracked follow-up): ql-io-xlsx
+# pulls the xlsx WRITER's heavy deps (umya-spreadsheet + image/rav1e/exr/tiff)
+# transitively even though import needs only the reader; feature-gate the writer
+# behind a `write` feature + depend with default-features=false to keep the core
+# engine (and WASM/bindings) lean.
+ql-io-xlsx        = { path = "../ql-io-xlsx" }
 # Phase 2A.3.b (2026-05-12): opt-in op-log attachment for WorkbookRuntime +
 # WorkbookTransaction. CellWireValue conversion happens via ql-io (already
 # present); Op + OpLog types come from ql-oplog.

@@ -34,6 +34,7 @@ fn text_with_whitespace_xml_chars_newlines() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let sheet = r.workbook.sheet(s).unwrap();
@@ -67,6 +68,7 @@ fn very_long_text() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let back = r.workbook.sheet(s).unwrap().read(0, 0);
@@ -111,6 +113,7 @@ fn date1900_survives() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     println!("imported date system: {:?}", r.workbook.date_system());

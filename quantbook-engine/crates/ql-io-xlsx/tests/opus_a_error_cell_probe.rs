@@ -42,6 +42,7 @@ fn investigate_error_cells_with_and_without_formula() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
 

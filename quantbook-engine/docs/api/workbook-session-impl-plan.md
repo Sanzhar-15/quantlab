@@ -3,14 +3,15 @@
 **Status:** ⏳ IN PROGRESS — **2b/2c-1/2c-2 + audit-fix SHIPPED 2026-05-26; inc.2 audit (F3–F10) +
 inc.2c-3 `snapshot_delta` + inc.2c-4 `batch` + inc.2c-5 transaction handle + inc.2c-6 F2 `Op::ClearValue`
 + inc.2c-7 undo/redo + inc.2c-8 F10 atomic table-rename + inc.2c-9 `.qbook` open/save (Option 1)
-SHIPPED 2026-05-27.**
++ inc.2c-10 xlsx `import` (dependency-inverted `ql-io-xlsx`) SHIPPED 2026-05-27.**
 Chain: `83b1b33bac2` PlanCache → `7335a5a1bfa` core → `993492b6f9b` validate_formula/query_range/
 `CellValue::Blank` → `2b5e7a13f5b` delete/restore/move sheet + tables → `9f7a1645dbd` tombstone-read fix →
 **`879f3601747` inc.2 audit-fix (F3–F10)** → **`20427b1c4c7` inc.2c-3 snapshot_delta** → **`58a55f4cfb8`
 + `9d471be3663` inc.2c-4 batch** → `fdd80c7a43d` inc.2c-5 transaction handle → `d8d22a04248` inc.2c-6 F2
-`Op::ClearValue` → `4f8e9858d77` inc.2c-7 undo/redo → **`dca5695549e` inc.2c-8 F10 atomic table-rename**.
-`WorkbookSession` is in `crates/ql-exec/src/session.rs`; **ql-exec lib 719/0 + e2e 21/0, clippy clean,
-workspace build green.**
+`Op::ClearValue` → `4f8e9858d77` inc.2c-7 undo/redo → `dca5695549e` inc.2c-8 F10 atomic table-rename →
+`2f92d84f3ed` inc.2c-9 `.qbook` open/save → **inc.2c-10 xlsx `import` (this commit)**.
+`WorkbookSession` is in `crates/ql-exec/src/session.rs`; **ql-exec lib 723/0 + e2e 21/0, clippy clean,
+ql-io-xlsx green, workspace build green.** (xlsx import: see `docs/api/xlsx-import-integration-plan.md`.)
 
 ## §0 — Current state: method inventory, v1 limitations & remaining sequence (READ FIRST)
 
@@ -29,11 +30,13 @@ workspace build green.**
 (inc.2c-7 — Loro `UndoManager` + baseline-replay re-materialization); `recalc_dirty`, `recalc_all`,
 `mark_volatiles_dirty`; `query_range`, `snapshot`, **`snapshot_delta`**, `cell`, `list_sheets`; `cancel`,
 `operation_status`, `poll_events`; **`.qbook` `open`/`save`** (inc.2c-9 — Option 1: reconstruct from the
-envelope + fresh op-log/undo history). (Construction: `new`/`from_workbook`.)
+envelope + fresh op-log/undo history); **xlsx `import`** (inc.2c-10 — Option-1 adoption via
+dependency-inverted `ql-io-xlsx` + injected `EngineXlsxRecomputer`). (Construction: `new`/`from_workbook`.)
 **DEFERRED — return `EngineError{class:Capability, code:"not_implemented_in_v1_core"}` (honest, never a
-fallback):** `import`/`export` (xlsx/csv — a persistence follow-up sub-increment);
+fallback):** `import("csv")` (net-new — no csv importer exists) + `export` (xlsx/csv exporters);
 `register_function`/`unregister_function`/`list_functions` (6.4);
 `write_range`/`publish_dataset`/`bind_range`/`refresh_source`/`materialize_query` (6.4/6.5).
+(Unknown `import`/`export` formats → loud `BadArgument`, not Capability.)
 
 ### Known v1 limitations (documented, not bugs — revisit when relevant)
 - **Version token = `{epoch, state_seq}`** (inc.2c-3): `state_seq` (NOT `oplog.len()`) advances on every
@@ -85,11 +88,12 @@ only — the locked Option-1 trade-off); recompute-on-open; name-from-path-stem;
 collab-v1.5. Parallel Codex(gpt-5.5 xhigh)+Opus audit: 1 HIGH (the sidecar-payload validation gap — FIXED)
 + LOW/INFO (docs, 2 added tests) — synthesis `docs/audits/2026-05-27-inc2c9-persist-audit/`.
 
-**Remaining sequence (NEXT):** `import`/`export` (xlsx/csv — a persistence follow-up) → functions (6.4) →
-reserved bulk → Node smoke migration (+ pending `.node` rebuild + B#1/S2-01 mocha tests) → 6.1C audit.
-(`batch` inc.2c-4; **transaction handle** inc.2c-5; **F2 `Op::ClearValue`** inc.2c-6; **undo/redo** inc.2c-7;
-**F10 atomic table-rename** inc.2c-8; **`.qbook` open/save** inc.2c-9 — all Codex/Opus-audited, synthesis
-docs under `docs/audits/2026-05-27-*`.)
+**Remaining sequence (NEXT):** `import("csv")` + `export` (xlsx/csv — csv is net-new; feature-gate the
+xlsx writer so `ql-exec` sheds the image-codec deps) → functions (6.4) → reserved bulk → Node smoke
+migration (+ pending `.node` rebuild + B#1/S2-01 mocha tests) → 6.1C audit. (`batch` inc.2c-4;
+**transaction handle** inc.2c-5; **F2 `Op::ClearValue`** inc.2c-6; **undo/redo** inc.2c-7;
+**F10 atomic table-rename** inc.2c-8; **`.qbook` open/save** inc.2c-9; **xlsx import** inc.2c-10 — all
+Codex/Opus-audited, synthesis docs under `docs/audits/2026-05-27-*`.)
 
 > **✅ `batch` SHIPPED inc.2c-4 (2026-05-27) — OPTION (a) chosen.** Both tensions resolved; the
 > multi-call transaction handle stays deferred (see below).
@@ -224,9 +228,14 @@ docs under `docs/audits/2026-05-27-*`.)
     the tracked F10 gap. Codex audit clean.
 11. ✅ **persistence `.qbook` `open`/`save`** (SHIPPED inc.2c-9) — **Option 1** (locked): reconstruct from
     the envelope + fresh op-log/undo history; `map_persistence_err` fills Appendix A; sidecar op-payloads
-    validated on open (Codex HIGH fixed). `import`/`export` (xlsx/csv) deferred to a follow-up. See the
-    Remaining sequence block above.
-12. **NEXT: `import`/`export`** (xlsx/csv) → **functions** (6.4) + **reserved bulk** (6.4/6.5).
+    validated on open (Codex HIGH fixed). See the Remaining sequence block above.
+12. ✅ **xlsx `import`** (SHIPPED inc.2c-10) — broke the `ql-exec ↔ ql-io-xlsx` cycle via **dependency
+    inversion** (`ql-io-xlsx` now pure I/O; recompute injected through `XlsxRecomputer`/
+    `EngineXlsxRecomputer`); `WorkbookSession::import("xlsx")` = Option-1 adoption + import-report
+    diagnostics (incl. `feature_inventory`, Opus/Codex HIGH fixed); `map_xlsx_err` in Appendix A.
+    Tracked follow-up: feature-gate the xlsx WRITER so `ql-exec` doesn't pull image codecs. See
+    `docs/api/xlsx-import-integration-plan.md`.
+13. **NEXT: `import("csv")` + `export` (xlsx/csv)** → **functions** (6.4) + **reserved bulk** (6.4/6.5).
 
 ---
 

@@ -41,6 +41,7 @@ fn sheet_with_only_blank_overlay_cells_followed_by_normal_sheet() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let sheet0 = r.workbook.sheet(s0).unwrap();
@@ -113,6 +114,7 @@ fn strict_update_original_does_not_leave_partial_output() {
             preserve_package: true,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     println!("inventory: {:?}", r.report.feature_inventory.counts);
@@ -192,6 +194,7 @@ fn new_workbook_with_invalid_name_target_constant_error() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     for (n, t) in r.workbook.names().iter() {

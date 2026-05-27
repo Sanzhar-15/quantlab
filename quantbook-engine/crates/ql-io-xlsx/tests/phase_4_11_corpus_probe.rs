@@ -51,7 +51,12 @@ fn run_one(path: &std::path::Path) -> FixtureReport {
         recompute: RecomputeMode::Skip,
         ..Default::default()
     };
-    let first = match import_xlsx_path(path, &registry, import_opts.clone()) {
+    let first = match import_xlsx_path(
+        path,
+        &registry,
+        import_opts.clone(),
+        Some(&ql_exec::EngineXlsxRecomputer),
+    ) {
         Ok(r) => r,
         Err(e) => {
             r.error = Some(format!("import: {e:?}"));
@@ -94,7 +99,12 @@ fn run_one(path: &std::path::Path) -> FixtureReport {
         }
     }
 
-    let second = match import_xlsx_path(&tmp, &registry, import_opts) {
+    let second = match import_xlsx_path(
+        &tmp,
+        &registry,
+        import_opts,
+        Some(&ql_exec::EngineXlsxRecomputer),
+    ) {
         Ok(r) => r,
         Err(e) => {
             r.error = Some(format!("re-import: {e:?}"));

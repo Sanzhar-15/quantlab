@@ -98,6 +98,32 @@ pub struct XlsxImportResult {
     pub preservation: Option<XlsxPreservation>,
 }
 
+/// Injected formula-recompute provider (dependency inversion).
+///
+/// `ql-io-xlsx` is a pure-I/O crate and must **not** depend on the compute
+/// engine (`ql-exec`): `ql-exec` owns `WorkbookSession`, whose `import` calls
+/// this crate, so an `ql-io-xlsx → ql-exec` edge would form a dependency cycle.
+/// Instead the importer accepts a recomputer implemented by the engine layer.
+/// This mirrors the `.qbook` path, where `ql_io::load_workbook` loads raw and
+/// `ql-exec` recomputes — xlsx import now splits the same way.
+///
+/// Implementations MUST be **BestEffort**: recompute every formula, never abort
+/// on a per-cell failure, and append each *structural* failure (lex/parse/bind)
+/// to `report.formula_failures`. The public-API `RecomputeMode::Strict` abort is
+/// decided by the importer *after* this returns (by inspecting that vec).
+/// Evaluation errors that produce a `Value::Error` cell (`#DIV/0!`, `#N/A`, …)
+/// are normal cell values, NOT failures, and must not be reported here.
+pub trait XlsxRecomputer {
+    /// Recompute every formula in `wb`, appending structural failures to
+    /// `report.formula_failures`. Returns the recomputed workbook.
+    fn recompute_into(
+        &self,
+        wb: Workbook,
+        registry: &FunctionRegistry,
+        report: &mut XlsxImportReport,
+    ) -> Workbook;
+}
+
 /// Import an xlsx workbook from a filesystem path.
 ///
 /// **W5-D-14a (Phase 4.11 round-trip spine):** minimum viable import
@@ -108,9 +134,10 @@ pub fn import_xlsx_path(
     path: impl AsRef<std::path::Path>,
     registry: &FunctionRegistry,
     options: XlsxImportOptions,
+    recomputer: Option<&dyn XlsxRecomputer>,
 ) -> Result<XlsxImportResult, XlsxError> {
     let bytes = std::fs::read(path.as_ref())?;
-    import_xlsx_bytes(&bytes, registry, options)
+    import_xlsx_bytes(&bytes, registry, options, recomputer)
 }
 
 /// Import an xlsx workbook from an in-memory byte buffer.
@@ -123,6 +150,7 @@ pub fn import_xlsx_bytes(
     bytes: &[u8],
     registry: &FunctionRegistry,
     options: XlsxImportOptions,
+    recomputer: Option<&dyn XlsxRecomputer>,
 ) -> Result<XlsxImportResult, XlsxError> {
     let mut report = XlsxImportReport::default();
 
@@ -348,15 +376,29 @@ pub fn import_xlsx_bytes(
         });
     }
 
-    // Phase 3 — recompute (dispatched by RecomputeMode).
+    // Phase 3 — recompute (dispatched by RecomputeMode). The recompute provider
+    // is INJECTED (dependency inversion via `XlsxRecomputer`) so this crate does
+    // not depend on the compute engine. BestEffort/Strict require a recomputer;
+    // a missing one is a loud caller error (No-Fallbacks), never a silent skip.
     let workbook = match options.recompute {
         RecomputeMode::Skip => workbook,
         RecomputeMode::BestEffort => {
-            read::convert::recompute_loaded_workbook(workbook, registry, &mut report)?
+            let recomputer = recomputer.ok_or_else(|| {
+                XlsxError::Engine(
+                    "RecomputeMode::BestEffort requires a recomputer, but none was provided"
+                        .to_string(),
+                )
+            })?;
+            recomputer.recompute_into(workbook, registry, &mut report)
         }
         RecomputeMode::Strict => {
-            let recomputed =
-                read::convert::recompute_loaded_workbook(workbook, registry, &mut report)?;
+            let recomputer = recomputer.ok_or_else(|| {
+                XlsxError::Engine(
+                    "RecomputeMode::Strict requires a recomputer, but none was provided"
+                        .to_string(),
+                )
+            })?;
+            let recomputed = recomputer.recompute_into(workbook, registry, &mut report);
             if !report.formula_failures.is_empty() {
                 // Strict mode: any failure is fatal.
                 return Err(XlsxError::Engine(format!(
@@ -465,7 +507,18 @@ mod tests {
         // missing file surfaces as `XlsxError::Io`, not a panic.
         let reg = ql_functions::default_registry();
         let opts = XlsxImportOptions::default();
-        match import_xlsx_path("/tmp/this-file-does-not-exist-xlsxio.xlsx", &reg, opts) {
+        // NOTE: the lib-test cannot reference `ql_exec::EngineXlsxRecomputer`
+        // here — that impl targets the *normal-dependency* copy of this crate
+        // (`ql-exec -> ql-io-xlsx`), a distinct crate instance from the one the
+        // lib-test compiles against, so the trait bound never matches. `None`
+        // is correct because a missing file fails at `std::fs::read` before the
+        // recompute phase is ever reached.
+        match import_xlsx_path(
+            "/tmp/this-file-does-not-exist-xlsxio.xlsx",
+            &reg,
+            opts,
+            None,
+        ) {
             Err(XlsxError::Io(_)) => {}
             other => panic!("expected Io error, got {other:?}"),
         }
@@ -479,7 +532,10 @@ mod tests {
         // `Calamine` (pre-W5-D-14b ordering).
         let reg = ql_functions::default_registry();
         let opts = XlsxImportOptions::default();
-        match import_xlsx_bytes(b"not an xlsx file", &reg, opts) {
+        // NOTE: `None` (not `ql_exec::EngineXlsxRecomputer`) — see the lib-test
+        // crate-instance note above. Invalid bytes fail at the OOXML/zip parse
+        // before the recompute phase, so the recomputer is never invoked.
+        match import_xlsx_bytes(b"not an xlsx file", &reg, opts, None) {
             Err(XlsxError::Zip(_)) | Err(XlsxError::Calamine(_)) => {}
             other => panic!("expected Zip or Calamine error, got {other:?}"),
         }

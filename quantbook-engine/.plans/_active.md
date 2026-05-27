@@ -134,8 +134,23 @@ status: |
   Synthesis `docs/audits/2026-05-27-inc2c9-persist-audit/`. **ql-exec lib 719/0 + e2e 21/0, clippy clean,
   workspace build green.**
 
-  ⭐ NEXT = 6.1B `import`/`export` (xlsx/csv — a persistence follow-up) → functions (6.4) + reserved bulk
-  (6.4/6.5) → Node smoke-path migration (+ pending `.node` rebuild + B#1/S2-01 mocha) → 6.1C audit — **follow
+  ✅ 6.1B inc.2c-10 xlsx `import` SHIPPED 2026-05-27. Broke the `ql-exec ↔ ql-io-xlsx` cycle via
+  **dependency inversion**: new `XlsxRecomputer` trait in `ql-io-xlsx` (now pure I/O; `ql-exec` → its
+  dev-deps), `import_xlsx_bytes`/`_path` take `Option<&dyn XlsxRecomputer>` (loud if None+BestEffort/Strict),
+  `recompute_loaded_workbook` deleted; `ql-exec` gained `ql-io-xlsx` dep + public `EngineXlsxRecomputer`
+  (`src/xlsx_recompute.rs`). `WorkbookSession::import("xlsx")` = Option-1 adoption (mirrors open; no second
+  recompute) + `push_xlsx_import_diagnostics`; `"csv"` → not_implemented (net-new); unknown → BadArgument;
+  `map_xlsx_err` fills Appendix A. ~90 ql-io-xlsx test call-sites migrated (delegated + reviewed; 3 src
+  lib-test sites use `None` — dev-dep-cycle two-crate-instance E0277, behavior-preserving). Parallel
+  Codex(gpt-5.5 xhigh)+Opus audit: 1 HIGH (feature_inventory diagnostics dropped — FIXED + test) + 1 MEDIUM
+  (recompute outside FaultGuard — NON-BUG, atomic self-replace, documented) + INFO; verified at source.
+  **Tracked follow-up: feature-gate the xlsx WRITER so ql-exec sheds umya/image/rav1e deps.** Spec
+  `docs/api/xlsx-import-integration-plan.md`; synthesis `docs/audits/2026-05-27-inc2c10-xlsx-import-audit/`.
+  **ql-exec lib 723/0 + e2e 21/0, clippy clean; ql-io-xlsx green; workspace build green.**
+
+  ⭐ NEXT = 6.1B `import("csv")` + `export` (xlsx/csv — csv net-new; feature-gate the xlsx writer) →
+  functions (6.4-0 metadata substrate then 6.4) + reserved bulk (6.4/6.5) → Node smoke-path migration
+  (+ pending `.node` rebuild + B#1/S2-01 mocha) → 6.1C audit — **follow
   `docs/api/workbook-session-impl-plan.md` §0**. Do NOT freeze the CollabSession CRDT façade (collab = v1.5).
 date: 2026-05-26
 predecessor_plan: .plans/_archive/2026-05-26_phase-5-7-v3-6-1-delta-consumer-backlog.md (V3.6.1 backlog mini-phase, SUPERSEDED by Phase 5 COMPLETE)
@@ -193,8 +208,12 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
    - ✅ **inc.2c-9**: **`.qbook` `open`/`save`** — **Option 1 LOCKED** (reconstruct from envelope + fresh
      op-log/undo history; loaded op-log validated incl. per-op payloads then discarded; `map_persistence_err`
      fills Appendix A). Parallel Codex+Opus audit: 1 HIGH (sidecar payload-validation gap — FIXED) + LOW/INFO.
-     `import`/`export` (xlsx/csv) deferred to a follow-up.
-   - ⭐ **NEXT**: `import`/`export` (xlsx/csv) → functions/bulk (6.4) → migrate the Node smoke path
+   - ✅ **inc.2c-10**: **xlsx `import`** — broke the `ql-exec ↔ ql-io-xlsx` cycle via **dependency
+     inversion** (`XlsxRecomputer` trait + `EngineXlsxRecomputer`; `ql-io-xlsx` now pure I/O). `import("xlsx")`
+     = Option-1 adoption + import-report diagnostics (incl. `feature_inventory` — Codex/Opus HIGH fixed);
+     `map_xlsx_err` in Appendix A. ~90 test call-sites migrated (delegated + reviewed). Tracked follow-up:
+     feature-gate the xlsx writer (ql-exec pulls image codecs). Parallel audit clean after fixes.
+   - ⭐ **NEXT**: `import("csv")` + `export` (xlsx/csv) → functions/bulk (6.4) → migrate the Node smoke path
      (+ `.node` rebuild + B#1/S2-01 mocha) → 6.1C audit. See `workbook-session-impl-plan.md` §0. Leave
      collab/transport/presence feature-gated.
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).

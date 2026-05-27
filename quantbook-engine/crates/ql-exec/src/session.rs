@@ -27,11 +27,12 @@
 //! `txn_add`/`commit_transaction`/`rollback_transaction`, inc.2c-5 — a pure
 //! `SessionOp` buffer that commits through the same `batch` machinery) +
 //! **`undo`/`redo`** (inc.2c-7) + **`.qbook` `open`/`save`** (inc.2c-9 — Option 1:
-//! reconstruct from the envelope, fresh op-log/undo history) are also real. The
-//! remaining contract methods return a **surfaced** `Capability` /
-//! `not_implemented_in_v1_core` error (NOT a silent fallback — project
-//! No-Fallbacks rule) and land in later sub-increments:
-//! - `import`/`export` (xlsx/csv — a persistence follow-up),
+//! reconstruct from the envelope, fresh op-log/undo history) + **xlsx `import`**
+//! (inc.2c-10 — same Option-1 adoption, via `ql_io_xlsx` + the injected
+//! `EngineXlsxRecomputer`) are also real. The remaining contract methods return
+//! a **surfaced** `Capability` / `not_implemented_in_v1_core` error (NOT a silent
+//! fallback — project No-Fallbacks rule) and land in later sub-increments:
+//! - `import("csv")` (net-new; no importer exists yet) + `export` (xlsx/csv),
 //! - function registration (6.4), reserved bulk ops (6.4/6.5).
 //!
 //! ## Two design facts that shape this increment
@@ -892,6 +893,76 @@ impl WorkbookSession {
             rendered: None,
         })
     }
+
+    /// Surface an xlsx import report's fidelity caveats as `Warning`
+    /// diagnostics (inc.2c-10). The import SUCCEEDS, but unsupported OOXML
+    /// features (dropped), soft warnings, and formulas the engine couldn't
+    /// recompute (Excel cached value preserved) are all reported as poll-able
+    /// events — never silently dropped (No-Fallbacks). Called AFTER the
+    /// `*self = from_workbook(..)` adoption (which resets `events`).
+    fn push_xlsx_import_diagnostics(&mut self, report: &ql_io_xlsx::XlsxImportReport) {
+        // The PRIMARY fidelity-loss channel: `scan_unsupported_features` records
+        // dropped OOXML features (conditional formatting, data validation, merged
+        // cells, hyperlinks, protection, comments, drawings, images, pivots,
+        // macros, external links, hidden sheets) into `feature_inventory.counts`
+        // — NOT into `report.unsupported` (which carries only per-occurrence
+        // detail for a couple of cases). Under `UnsupportedPolicy::Permissive`
+        // (the import default) those features are silently ignored on the wire,
+        // so surfacing the inventory here is what keeps the No-Fallbacks promise.
+        // Sorted by kind for deterministic event order (HashMap iteration order
+        // is otherwise nondeterministic).
+        let mut inventory: Vec<_> = report.feature_inventory.counts.iter().collect();
+        inventory.sort_by_key(|(kind, _)| format!("{kind:?}"));
+        for (kind, count) in inventory {
+            self.events.push(Event::CellDiagnostic {
+                diagnostic: Diagnostic {
+                    addr: None,
+                    severity: Severity::Warning,
+                    code: "xlsx_unsupported_feature".to_string(),
+                    message: format!(
+                        "{kind:?} is not represented by the engine and was dropped on import \
+                         ({count} occurrence(s))"
+                    ),
+                },
+            });
+        }
+        // Per-occurrence unsupported records (location detail the inventory tally
+        // lacks — e.g. an unregistered custom number format at a specific cell).
+        for uf in &report.unsupported {
+            self.events.push(Event::CellDiagnostic {
+                diagnostic: Diagnostic {
+                    addr: None,
+                    severity: Severity::Warning,
+                    code: "xlsx_unsupported_feature".to_string(),
+                    message: format!("{:?} in {}: {}", uf.kind, uf.part, uf.detail),
+                },
+            });
+        }
+        for w in &report.warnings {
+            self.events.push(Event::CellDiagnostic {
+                diagnostic: Diagnostic {
+                    addr: None,
+                    severity: Severity::Warning,
+                    code: "xlsx_import_warning".to_string(),
+                    message: format!("{}: {}", w.location, w.message),
+                },
+            });
+        }
+        for f in &report.formula_failures {
+            self.events.push(Event::CellDiagnostic {
+                diagnostic: Diagnostic {
+                    addr: Some(CellAddr {
+                        sheet: f.sheet,
+                        row: f.row,
+                        col: f.col,
+                    }),
+                    severity: Severity::Warning,
+                    code: "xlsx_formula_recompute_failed".to_string(),
+                    message: format!("formula {:?}: {}", f.formula, f.reason),
+                },
+            });
+        }
+    }
 }
 
 impl Default for WorkbookSession {
@@ -972,8 +1043,60 @@ impl EngineSession for WorkbookSession {
         Ok(())
     }
 
-    fn import(&mut self, _bytes: &[u8], _format: &str) -> EngineResult<()> {
-        Err(not_implemented("import"))
+    /// Import a workbook from in-memory bytes (inc.2c-10). v1 supports
+    /// `"xlsx"`; `"csv"` is a deferred follow-up (net-new — no importer exists
+    /// yet); any other format is a loud `BadArgument`.
+    ///
+    /// **xlsx (Option 1, same adoption model as [`open`]):** parse the bytes via
+    /// `ql_io_xlsx::import_xlsx_bytes` — which recomputes BestEffort through the
+    /// injected [`EngineXlsxRecomputer`] (dependency inversion: `ql-io-xlsx` is
+    /// pure I/O) — then adopt the resulting workbook with a FRESH op-log + undo
+    /// history (`*self = from_workbook`, registry preserved, epoch re-minted).
+    /// Because the importer already recomputed, this does NOT recompute again
+    /// (unlike `open`, which loads a possibly-stale `.qbook`). The import
+    /// report's fidelity caveats (unsupported features, soft warnings, formulas
+    /// the engine couldn't recompute) are surfaced as `Warning` diagnostics —
+    /// never silently dropped (No-Fallbacks).
+    ///
+    /// **Panic safety (§8).** Unlike [`open`] — whose recompute mutates
+    /// `self.workbook` IN PLACE under a `with_runtime` `FaultGuard` — `import`'s
+    /// recompute runs inside `import_xlsx_bytes` on a LOCAL workbook (`self` only
+    /// lends `&self.registry`), and `self` is replaced by the SINGLE atomic
+    /// `*self = from_workbook(..)` only AFTER a successful parse+recompute. No
+    /// step leaves `self` half-mutated: a panic in parse / recompute / adopt
+    /// leaves `self` in its prior valid (`Ready`) state and the session stays
+    /// usable. A `FaultGuard` here would be wrong — it would fault a healthy
+    /// session. (Under `panic = "unwind"`, the boundary `catch_unwind` of §8.2
+    /// still maps the panic to `EngineError::panic`.)
+    ///
+    /// [`open`]: WorkbookSession::open
+    /// [`EngineXlsxRecomputer`]: crate::EngineXlsxRecomputer
+    fn import(&mut self, bytes: &[u8], format: &str) -> EngineResult<()> {
+        self.ensure_openable()?;
+        match format {
+            "xlsx" => {
+                let result = ql_io_xlsx::import_xlsx_bytes(
+                    bytes,
+                    &self.registry,
+                    ql_io_xlsx::XlsxImportOptions::default(),
+                    Some(&crate::EngineXlsxRecomputer),
+                )
+                .map_err(map_xlsx_err)?;
+                let report = result.report;
+                // Adopt the imported (already-recomputed) workbook as a fresh
+                // session, preserving the function registry (session tooling, not
+                // document state). Mirrors `open`'s Option-1 adoption.
+                let registry = Arc::clone(&self.registry);
+                *self = Self::from_workbook(result.workbook);
+                self.registry = registry;
+                self.push_xlsx_import_diagnostics(&report);
+                Ok(())
+            }
+            "csv" => Err(not_implemented("import (csv)")),
+            other => Err(EngineError::bad_argument(format!(
+                "unsupported import format {other:?} (v1 supports \"xlsx\")"
+            ))),
+        }
     }
 
     /// Save the live workbook + this session's op-log to a `.qbook` directory
@@ -2409,6 +2532,35 @@ fn map_persistence_err(e: ql_io::PersistenceError) -> EngineError {
     }
 }
 
+/// Map a `ql_io_xlsx::XlsxError` (from `import("xlsx")` — inc.2c-10) to the
+/// contract `EngineError` (Appendix A). Format/parse failures are
+/// `ErrorClass::Persistence` (an import is a load operation); engine-integration
+/// + export failures are `Internal` (engine bugs, not caller input).
+///
+/// `XlsxError` is a FOREIGN `#[non_exhaustive]` enum (it lives in `ql-io-xlsx`),
+/// so this match REQUIRES a wildcard arm — a future variant surfaces a loud
+/// `Internal`/`unmapped_xlsx_error`, never a silent or generic caller-visible
+/// code (No-Fallbacks).
+fn map_xlsx_err(e: ql_io_xlsx::XlsxError) -> EngineError {
+    use ql_io_xlsx::XlsxError as X;
+    let display = e.to_string();
+    match e {
+        X::Io(_) => EngineError::new(ErrorClass::Persistence, "xlsx_io", display),
+        X::Zip(_) => EngineError::new(ErrorClass::Persistence, "xlsx_zip", display),
+        X::Calamine(_) => EngineError::new(ErrorClass::Persistence, "xlsx_calamine", display),
+        X::XmlParse { .. } => EngineError::new(ErrorClass::Persistence, "xlsx_xml_parse", display),
+        X::MalformedOoxml { .. } => {
+            EngineError::new(ErrorClass::Persistence, "xlsx_malformed_ooxml", display)
+        }
+        X::UnsupportedFeature { .. } => {
+            EngineError::new(ErrorClass::Persistence, "xlsx_unsupported_feature", display)
+        }
+        X::Export(_) => EngineError::new(ErrorClass::Internal, "xlsx_export", display),
+        X::Engine(_) => EngineError::new(ErrorClass::Internal, "xlsx_engine", display),
+        _ => EngineError::new(ErrorClass::Internal, "unmapped_xlsx_error", display),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2516,11 +2668,11 @@ mod tests {
     fn deferred_methods_surface_capability_error() {
         let mut s = WorkbookSession::new();
         // `begin_transaction` ships in inc.2c-5; `undo`/`redo` ship in inc.2c-6;
-        // `open`/`save` ship in inc.2c-9 (no longer Capability errors). The
-        // remaining deferred methods still surface the honest Capability error:
-        // `import`/`export` (xlsx/csv — follow-up sub-increment) + functions.
+        // `open`/`save` ship in inc.2c-9; xlsx `import` ships in inc.2c-10 (no
+        // longer Capability errors). The remaining deferred methods still
+        // surface the honest Capability error: `export` (xlsx/csv exporters),
+        // `import("csv")` (net-new — see `import_unknown_format_*`), + functions.
         for err in [
-            s.import(&[], "xlsx").unwrap_err(),
             s.export("xlsx").unwrap_err(),
             s.list_functions().unwrap_err(),
         ] {
@@ -2771,6 +2923,103 @@ mod tests {
         let b1 = s3.cell(addr(sheet, 0, 1)).unwrap().unwrap();
         assert_eq!(b1.value, Some(CellValue::Number { number: 14.0 }));
         assert_eq!(b1.formula.as_deref(), Some("A1 * 2"));
+    }
+
+    // --- import: xlsx (inc.2c-10) ---
+
+    /// xlsx round-trip: export a fixture workbook to xlsx bytes (no committed
+    /// `.xlsx` fixtures exist), import them into a session, and confirm cells +
+    /// the formula's recompute (via the injected `EngineXlsxRecomputer`) survive.
+    #[test]
+    fn import_xlsx_round_trip_loads_cells_and_recomputes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let xlsx_path = dir.path().join("fixture.xlsx");
+        let reg = ql_functions::default_registry();
+
+        // Build A1=6, A2==A1*7 (=42), export to xlsx.
+        let mut wb = Workbook::new();
+        let sheet = wb.add_sheet("S");
+        wb.put_at(sheet, 0, 0, Value::Number(6.0));
+        {
+            let mut rt = WorkbookRuntime::new(&mut wb, &reg);
+            rt.set_formula(sheet, 1, 0, "A1 * 7").unwrap();
+            let _ = rt.recompute_all();
+        }
+        ql_io_xlsx::export_xlsx_path(&wb, &reg, &xlsx_path, Default::default()).unwrap();
+        let bytes = std::fs::read(&xlsx_path).unwrap();
+
+        let mut s = WorkbookSession::new();
+        s.import(&bytes, "xlsx").unwrap();
+        assert_eq!(s.lifecycle_state(), LifecycleState::Ready);
+        let a1 = s.cell(addr(0, 0, 0)).unwrap().unwrap();
+        assert_eq!(a1.value, Some(CellValue::Number { number: 6.0 }));
+        let a2 = s.cell(addr(0, 1, 0)).unwrap().unwrap();
+        assert_eq!(a2.value, Some(CellValue::Number { number: 42.0 }));
+        assert!(
+            a2.formula.is_some(),
+            "A2 must retain its formula after import"
+        );
+        // The import adopted a fresh op-log/undo history (Option 1): nothing undoable.
+        assert!(!s.can_undo());
+    }
+
+    /// import of bytes that aren't a valid xlsx (not a zip) fails loud as a
+    /// `Persistence` error and leaves the session unchanged + usable.
+    #[test]
+    fn import_malformed_xlsx_bytes_fails_loud_persistence() {
+        let mut s = WorkbookSession::new();
+        let err = s.import(b"not an xlsx file", "xlsx").unwrap_err();
+        assert_eq!(err.class, ErrorClass::Persistence);
+        assert_eq!(s.lifecycle_state(), LifecycleState::Ready);
+        assert!(s.add_sheet("StillWorks", 16384).is_ok());
+    }
+
+    /// import of an unknown format → `BadArgument`; `"csv"` is the deferred
+    /// follow-up → honest `Capability`/`not_implemented_in_v1_core`.
+    #[test]
+    fn import_unknown_format_bad_argument_and_csv_capability() {
+        let mut s = WorkbookSession::new();
+        let err = s.import(b"x", "ods").unwrap_err();
+        assert_eq!(err.class, ErrorClass::BadArgument);
+
+        let mut s2 = WorkbookSession::new();
+        let csv = s2.import(b"a,b\n1,2", "csv").unwrap_err();
+        assert_eq!(csv.class, ErrorClass::Capability);
+        assert_eq!(csv.code, "not_implemented_in_v1_core");
+    }
+
+    /// The xlsx feature inventory (the PRIMARY dropped-feature channel —
+    /// conditional formatting, merged cells, etc.) is surfaced as `Warning`
+    /// diagnostics, NOT silently dropped (Opus H1: `feature_inventory.counts`
+    /// is distinct from `report.unsupported`, and Permissive import drops those
+    /// features on the wire — the session must report them).
+    #[test]
+    fn xlsx_import_surfaces_feature_inventory_as_diagnostics() {
+        use ql_io_xlsx::UnsupportedFeatureKind;
+        let mut s = WorkbookSession::new();
+        let mut report = ql_io_xlsx::XlsxImportReport::default();
+        report
+            .feature_inventory
+            .record(UnsupportedFeatureKind::MergedCells);
+        report
+            .feature_inventory
+            .record(UnsupportedFeatureKind::ConditionalFormatting);
+        s.push_xlsx_import_diagnostics(&report);
+        let n = s
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::CellDiagnostic { diagnostic }
+                        if diagnostic.code == "xlsx_unsupported_feature"
+                )
+            })
+            .count();
+        assert_eq!(
+            n, 2,
+            "both inventoried dropped features must surface as diagnostics (No-Fallbacks)"
+        );
     }
 
     #[test]

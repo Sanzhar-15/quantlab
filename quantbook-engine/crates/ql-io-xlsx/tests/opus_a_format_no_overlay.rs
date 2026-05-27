@@ -42,6 +42,7 @@ fn format_registered_but_not_used_anywhere_round_trips() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     println!("--- after re-import ---");
@@ -97,6 +98,7 @@ fn overlay_on_unpopulated_builtin() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let sheet2 = r.workbook.sheet(s).unwrap();

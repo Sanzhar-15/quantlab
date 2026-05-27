@@ -119,6 +119,7 @@ pub mod session;
 pub mod simd;
 pub mod transaction;
 pub mod workbook_runtime;
+pub mod xlsx_recompute;
 
 pub use aggregate_cache::{
     AggregateCache, AggregateCacheStats, InMemAggregateCache, NoAggregateCache,
@@ -152,6 +153,7 @@ pub use simd::{
 };
 pub use transaction::WorkbookTransaction;
 pub use workbook_runtime::{RecomputeFailure, RecomputeResult, RuntimeError, WorkbookRuntime};
+pub use xlsx_recompute::EngineXlsxRecomputer;
 
 /// Phase 2B.7 audit H3 (2026-05-12): compile-time proof that the two
 /// engine state types the IDE binding will own are `Send + Sync`. If Loro

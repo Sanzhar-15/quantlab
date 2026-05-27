@@ -65,6 +65,7 @@ fn table_column_id_renumbering() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let imported = r.workbook.tables().lookup("SPARSE").unwrap();
@@ -158,6 +159,7 @@ fn unicode_survival() {
                     recompute: RecomputeMode::Skip,
                     ..Default::default()
                 },
+                Some(&ql_exec::EngineXlsxRecomputer),
             )
             .unwrap();
             println!("Unicode round-trip OK");
@@ -223,6 +225,7 @@ fn custom_format_byte_for_byte_preservation_with_special_chars() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     for (id, c) in r.workbook.formats().iter() {
@@ -265,6 +268,7 @@ fn name_case_round_trip() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     for (n, t) in r.workbook.names().iter() {
@@ -305,6 +309,7 @@ fn name_numeric_constant_precision() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     for (n, t) in r.workbook.names().iter() {
@@ -350,6 +355,7 @@ fn overlay_on_text_and_error_and_shared_string() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let sheet2 = r.workbook.sheet(s).unwrap();
@@ -424,6 +430,7 @@ fn sheet_scoped_name_with_orphan_target() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     for sid in 0..r.workbook.sheet_count() as u16 {
@@ -456,6 +463,7 @@ fn import_strict_with_drawings() {
             unsupported_policy: UnsupportedPolicy::Permissive,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     println!(
@@ -472,6 +480,7 @@ fn import_strict_with_drawings() {
             unsupported_policy: UnsupportedPolicy::Strict,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     );
     println!("strict: {:?}", r2.err().map(|e| format!("{e}")));
 }
@@ -496,6 +505,7 @@ fn dropped_features_vs_feature_inventory_completeness() {
             preserve_package: true,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
 

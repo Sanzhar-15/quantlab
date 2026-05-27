@@ -62,7 +62,7 @@ fn run_recompute_probe(path: &std::path::Path) {
         unsupported_policy: UnsupportedPolicy::Permissive,
         preserve_package: false,
     };
-    let result = import_xlsx_path(path, &reg, opts);
+    let result = import_xlsx_path(path, &reg, opts, Some(&ql_exec::EngineXlsxRecomputer));
     match result {
         Ok(r) => {
             let n_formulas = r.workbook.formula_count();
@@ -124,7 +124,8 @@ fn p2_import_then_edit_formula() {
         recompute: RecomputeMode::Skip,
         ..Default::default()
     };
-    let imported = import_xlsx_path(&path, &reg, opts).unwrap();
+    let imported =
+        import_xlsx_path(&path, &reg, opts, Some(&ql_exec::EngineXlsxRecomputer)).unwrap();
     let mut wb = imported.workbook;
 
     // Find first sheet, write a small formula in a far-away cell.
@@ -181,6 +182,7 @@ fn p3_roundtrip_with_literal_range_sum() {
             recompute: RecomputeMode::BestEffort,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let n_failures = imported.report.formula_failures.len();
@@ -239,6 +241,7 @@ fn p4_roundtrip_multi_feature_workbook() {
             preserve_package: true,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let wb2 = &imported.workbook;
@@ -321,6 +324,7 @@ fn p5_double_roundtrip_stability() {
             recompute: RecomputeMode::BestEffort,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let wb1 = r1.workbook;
@@ -332,6 +336,7 @@ fn p5_double_roundtrip_stability() {
             recompute: RecomputeMode::BestEffort,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let wb2 = r2.workbook;
@@ -382,6 +387,7 @@ fn p6_locale_survives_xlsx_roundtrip() {
             recompute: RecomputeMode::BestEffort,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let val = r.workbook.read(ql_types::Address::new(s, 0, 0));
@@ -423,6 +429,7 @@ fn p7_date1904_survives_roundtrip() {
             recompute: RecomputeMode::BestEffort,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let yr = r.workbook.read(ql_types::Address::new(s, 1, 0));
@@ -467,6 +474,7 @@ fn p8_export_writes_recomputed_cached_values() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let val = r.workbook.read(ql_types::Address::new(s, 2, 0));
@@ -510,6 +518,7 @@ fn p12_prefix_comma_failure_shapes() {
                     recompute: RecomputeMode::BestEffort,
                     ..Default::default()
                 },
+                Some(&ql_exec::EngineXlsxRecomputer),
             )
         })) {
             Ok(Ok(r)) => r,
@@ -615,7 +624,12 @@ fn p10_sweep_calc_tests_recompute_failure_rate() {
             ..Default::default()
         };
         let r = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            import_xlsx_path(&path, &reg, opts.clone())
+            import_xlsx_path(
+                &path,
+                &reg,
+                opts.clone(),
+                Some(&ql_exec::EngineXlsxRecomputer),
+            )
         })) {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => continue,
@@ -722,6 +736,7 @@ fn p13_full_ide_proof_point_xlsx_qbook_xlsx() {
             recompute: RecomputeMode::BestEffort,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let v1 = imported.workbook.read(ql_types::Address::new(s2, 0, 0));
@@ -764,6 +779,7 @@ fn p13_full_ide_proof_point_xlsx_qbook_xlsx() {
             recompute: RecomputeMode::BestEffort,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let v6 = r6.workbook.read(ql_types::Address::new(s2, 0, 0));
@@ -826,6 +842,7 @@ fn p15_edit_imported_literal_range_formula() {
             recompute: RecomputeMode::BestEffort,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let nf = imported.report.formula_failures.len();
@@ -954,6 +971,7 @@ fn p9_table_roundtrip_then_structured_ref() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
 
@@ -1006,6 +1024,7 @@ fn p16_failed_formula_cached_value_preserved_or_corrupted() {
             recompute: RecomputeMode::Skip,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let r_eff = import_xlsx_path(
@@ -1015,6 +1034,7 @@ fn p16_failed_formula_cached_value_preserved_or_corrupted() {
             recompute: RecomputeMode::BestEffort,
             ..Default::default()
         },
+        Some(&ql_exec::EngineXlsxRecomputer),
     )
     .unwrap();
     let mut differing_cells = 0;
