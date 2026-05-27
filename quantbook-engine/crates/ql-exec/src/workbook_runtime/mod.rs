@@ -280,6 +280,42 @@ impl<'a> WorkbookRuntime<'a> {
         }
     }
 
+    /// **Phase 6.1B inc.2c-4 (2026-05-27) — `batch` detached-op-log path.**
+    /// Same as [`with_session_state`] but with the op-log **detached**
+    /// (`oplog = None`). Every mutator then updates the workbook AND
+    /// maintains the calcgraph session — the graph hooks fire on
+    /// `self.graph.is_some()`, independent of the op-log — but appends **no**
+    /// per-op entries (each producer gates its append on
+    /// `self.oplog.as_deref_mut()`).
+    ///
+    /// This is the load-bearing primitive for `WorkbookSession::batch`
+    /// (option (a), impl-plan §0): the session builds + appends ONE
+    /// `Op::BatchCommit` itself, then applies the buffered ops through this
+    /// graph-maintaining-but-silent runtime so the result is exactly one
+    /// op-log entry (one undo unit, §3.4) with the session graph kept live
+    /// (the tension `WorkbookTransaction` could not resolve — it maintains
+    /// no graph). The session's `PlanCache` is threaded through (recovered
+    /// via [`into_plan_cache`]) so the batch warms the same cache as
+    /// single edits.
+    ///
+    /// [`with_session_state`]: WorkbookRuntime::with_session_state
+    /// [`into_plan_cache`]: WorkbookRuntime::into_plan_cache
+    pub fn with_session_state_no_oplog(
+        workbook: &'a mut Workbook,
+        registry: &'a FunctionRegistry,
+        graph: &'a mut crate::CalcgraphSession,
+        plan_cache: PlanCache,
+    ) -> Self {
+        Self {
+            workbook,
+            registry,
+            oplog: None,
+            plan_cache,
+            format_cache: std::collections::HashMap::new(),
+            graph: Some(graph),
+        }
+    }
+
     /// **Phase 6.1B inc.2 (2026-05-26).** Consume the runtime and return
     /// its (now warmed) `PlanCache` so the owning session can retain it
     /// for the next edit. Pairs with [`with_session_state`].

@@ -13,12 +13,13 @@ clippy clean, workspace `cargo check` green.**
 **REAL (implemented + tested):** `lifecycle_state`, `close`; `set_value`, `set_formula`, `clear`,
 `set_format`, `register_format`, `validate_formula`; `add_sheet`, `rename_sheet`, `delete_sheet`,
 `restore_sheet`, `move_sheet`, `set_name`; `create_table`/`rename_table`/`rename_column`/`resize_table`/
-`drop_table`; `recalc_dirty`, `recalc_all`, `mark_volatiles_dirty`; `query_range`, `snapshot`,
-**`snapshot_delta`**, `cell`, `list_sheets`; `cancel`, `operation_status`, `poll_events`. (Construction:
-`new`/`from_workbook`.)
+`drop_table`; **`batch`** (inc.2c-4); `recalc_dirty`, `recalc_all`, `mark_volatiles_dirty`; `query_range`,
+`snapshot`, **`snapshot_delta`**, `cell`, `list_sheets`; `cancel`, `operation_status`, `poll_events`.
+(Construction: `new`/`from_workbook`.)
 **DEFERRED — return `EngineError{class:Capability, code:"not_implemented_in_v1_core"}` (honest, never a
 fallback):** `open`/`import`/`save`/`export` (persistence);
-`batch`/`begin_transaction`/`txn_add`/`commit_transaction`/`rollback_transaction`; `undo`/`redo`
+`begin_transaction`/`txn_add`/`commit_transaction`/`rollback_transaction` (the multi-call handle — needs
+the two NEW `WorkbookSession` fields `txns`/`next_txn_id`, out of scope for inc.2c-4); `undo`/`redo`
 (`can_undo`/`can_redo` return `false`); `register_function`/`unregister_function`/`list_functions` (6.4);
 `write_range`/`publish_dataset`/`bind_range`/`refresh_source`/`materialize_query` (6.4/6.5).
 
@@ -43,44 +44,55 @@ fallback):** `open`/`import`/`save`/`export` (persistence);
   one `Op::BatchCommit` before any `put_formula`, mirroring `rename_sheet`. The misleading comment is
   corrected; the fix is deferred. See `docs/audits/2026-05-27-inc2-session-audit/SYNTHESIS.md`.
 
-**Remaining sequence (NEXT):** batch/txn → undo/redo → persistence → functions → reserved bulk → Node
-smoke migration (+ pending `.node` rebuild + B#1/S2-01 mocha tests) → 6.1C audit.
+**Remaining sequence (NEXT):** txn-handle (begin/txn_add/commit/rollback — needs new struct fields) →
+undo/redo → persistence → functions → reserved bulk → Node smoke migration (+ pending `.node` rebuild +
+B#1/S2-01 mocha tests) → 6.1C audit. (`batch` SHIPPED inc.2c-4.)
 
-> **⚠️ NEXT-SESSION DESIGN NOTE — `batch` is a DESIGN increment, not a wiring task (grounded
-> 2026-05-27; TWO tensions, decide both first):**
+> **✅ `batch` SHIPPED inc.2c-4 (2026-05-27) — OPTION (a) chosen.** Both tensions resolved; the
+> multi-call transaction handle stays deferred (see below).
 >
-> **Tension 1 — op coverage.** `WorkbookTransaction` (`transaction.rs:158/196`) buffers only
-> `put_value`/`put_formula` — **no clear/set_format** — while `SessionOp` (`ql-session/src/session.rs:40`)
-> has all four (SetValue/SetFormula/Clear/SetFormat).
+> **Tension 1 — op coverage (RESOLVED — all four covered).** `WorkbookTransaction`
+> (`transaction.rs:158/196`) buffers only `put_value`/`put_formula`, but `batch` covers all four
+> `SessionOp` variants (SetValue/SetFormula/Clear/SetFormat) by building the `BatchCommit` inner ops
+> directly (it does not route through `WorkbookTransaction`).
 >
-> **Tension 2 (the load-bearing one) — `WorkbookTransaction` does NOT maintain the calcgraph.** It is
-> the pre-Phase-3 batch primitive (module doc `:22-25`): `commit` writes values/formulas + evaluates in
-> op-order directly on the `Workbook`, with **no `CalcgraphSession` field**. But `WorkbookSession` owns a
-> LIVE graph that its single-cell mutators keep current (runtime `on_set_value` hooks). Routing `batch`
-> through `WorkbookTransaction` would leave the session graph **stale** → a later `recalc_dirty` misses
-> the batched cells' deps + fails to dirty their dependents = silent correctness break. So a faithful
-> `batch` must keep one `Op::BatchCommit` (§3.4 = one undo unit) AND keep the graph consistent.
+> **Tension 2 (load-bearing) — graph consistency (RESOLVED).** `WorkbookTransaction` maintains no
+> `CalcgraphSession`. `batch` instead applies the ops through a **graph-maintaining runtime with the
+> op-log DETACHED**: the verified source fact (`cells.rs:157/306/341/371/793/871`, `formats.rs:88/127`)
+> is that every producer gates its op-log append on `self.oplog.as_deref_mut()` while every calcgraph
+> hook (`on_set_value`/`on_set_formula`/`on_clear_formula`) fires on `self.graph.is_some()` —
+> **independently**. So a runtime with `oplog = None, graph = Some(..)` updates the workbook AND keeps
+> the graph live but appends NO ops. A later `recalc_dirty` therefore recomputes the batched cells'
+> dependents correctly (proven by `batch_keeps_calcgraph_live_for_later_recalc`).
 >
-> **Resolution options (pick deliberately):** **(a)** apply each op through the session's
-> graph-maintaining runtime mutators with the op-log **detached** (runtime takes `Option<&mut OpLog>` —
-> pass `None`, so graph + workbook update but NO per-op append), then append one manually-built
-> `Op::BatchCommit` — covers all 4 op types, graph stays live, but duplicates op-construction (fragile,
-> must mirror the per-mutator PutValue/ClearFormula/PutFormula/SetCellFormat logic); **(b)** a NEW native
-> runtime `apply_batch(ops)` (graph-maintaining + emits one BatchCommit) — cleanest, an engine addition
-> in `workbook_runtime`; **(c)** `WorkbookTransaction` + a full `CalcgraphSession::rebuild_from_workbook`
-> after commit — correct but O(all formulas)/batch and still no clear/set_format. **Do NOT** loop the
-> per-edit session mutators (emits N ops, not one undo unit, violating §3.4). Recommendation: **(b)** if
-> the engine-addition budget is acceptable (it's the right long-term primitive and 6.4 bulk writes will
-> want it too); otherwise **(a)** for a v1 that ships now. Verify the runtime maintains the graph with
-> `oplog = None` before committing to (a).
+> **Why (a), not (b)/(c).** (b) [a native `WorkbookRuntime::apply_batch`] is the cleaner long-term
+> primitive but a larger engine addition; (a) ships now with one small additive constructor
+> (`WorkbookRuntime::with_session_state_no_oplog`, `mod.rs`) + the session's own BatchCommit assembly,
+> reusing the audited single-edit mutators verbatim for the actual mutation. (c) [`WorkbookTransaction` +
+> `rebuild_from_workbook`] is O(all formulas)/batch and lacks clear/set_format. The "fragile duplicate
+> op-construction" risk that (a) carries is bounded here: the inner ops are built from the **pre-batch
+> workbook state** (mirroring `WorkbookTransaction::commit`'s `transaction.rs:311` `had_formula` reads),
+> `SetFormula` reuses `set_formula`'s exact canonicalize path (`canonicalize_and_bind`), and `Clear`
+> mirrors `clear_formula`'s preserved-value emission. **6.4 bulk writes should still consider promoting
+> this to the native (b) primitive.**
 >
-> **Plus:** the multi-call handle (`begin_transaction`/`txn_add`/`commit_transaction`/
+> **Mechanics shipped:** (1) validate-all up front (sheet liveness + grid bounds + formula lex/parse/bind
+> + finiteness of every serialized value) — any failure leaves the workbook + token UNCHANGED; (2) build
+> ONE `Op::BatchCommit` from pre-batch state; (3) append it BEFORE mutating (so an append/serialization
+> failure leaves nothing mutated — finiteness is pre-checked so only a Loro-internal append failure
+> remains, an `Internal` engine bug); (4) apply via the detached-op-log graph-maintaining runtime; (5)
+> `record_changes` ONCE → `state_seq` advances exactly one tick → `snapshot_delta` from a pre-batch token
+> reports every batched cell. `BatchResult.applied` = the requested op count (honest even when a batch
+> reduces to zero inner ops, e.g. a Blank-clear on a non-formula cell — then no BatchCommit is appended).
+> `options.undo_label` is accepted but not yet consumed (undo lands later). 11 session tests added.
+>
+> **STILL DEFERRED — the multi-call handle** (`begin_transaction`/`txn_add`/`commit_transaction`/
 > `rollback_transaction`) needs two NEW `WorkbookSession` fields (`txns: HashMap<TransactionId,
-> Vec<SessionOp>>`, `next_txn_id: u64`) not in the struct yet (impl-plan §2 sketched them; inc.2b shipped
-> without). `BatchResult` = `{applied: u32, version}`; `BatchOptions` = `{undo_label?}`;
-> `TransactionId(u64)`. **Undo/redo (next after batch) hits the same graph-reversion question** — undo
-> retracts ops but the workbook + graph must be rebuilt to the pre-op state (likely
-> `rebuild_from_workbook` after a Loro undo); `bump_epoch` is already wired for it.
+> Vec<SessionOp>>`, `next_txn_id: u64`) not in the struct yet (impl-plan §2 sketched them; inc.2b/2c
+> shipped without). It will buffer `SessionOp`s and call into the same `batch` machinery on commit.
+> **Undo/redo (next) hits the same graph-reversion question** — undo retracts ops but the workbook +
+> graph must be rebuilt to the pre-op state (likely `rebuild_from_workbook` after a Loro undo);
+> `bump_epoch` is already wired for it.
 
 ### What 2b shipped (REAL)
 - **2a — PlanCache session-ownership** (§3): `WorkbookRuntime::with_session_state(.., PlanCache)` +
@@ -120,8 +132,13 @@ smoke migration (+ pending `.node` rebuild + B#1/S2-01 mocha tests) → 6.1C aud
    `WorkbookRuntime` delegations (emit ops + graph table-hooks). drop/rename unknown → `NotFound`.
    (Zero-dim create → `Conflict` via `TableCreateRejected` — surfaced, classified one tier over
    `BadArgument`; minor.)
-6. **`batch`/transactions** + **`undo`/`redo`** (needs `OpLog::new_undo_manager`) + **persistence**
-   (`open`/`import`/`save`/`export` via `ql_io` — adds `PersistenceError` mapping to Appendix A).
+6. ✅ **`batch`** (SHIPPED inc.2c-4) — option (a): validate-all → build ONE `Op::BatchCommit` from
+   pre-batch state → append-before-mutate → apply via a graph-maintaining runtime with the op-log
+   DETACHED (new `WorkbookRuntime::with_session_state_no_oplog`) → `record_changes` once. All four
+   `SessionOp` variants covered; `state_seq` advances exactly one tick. **Transactions** (the multi-call
+   `begin/txn_add/commit/rollback` handle) + **`undo`/`redo`** (needs `OpLog::new_undo_manager`) +
+   **persistence** (`open`/`import`/`save`/`export` via `ql_io` — adds `PersistenceError` mapping to
+   Appendix A) remain.
 7. **functions** (6.4) + **reserved bulk** (6.4/6.5).
 
 ---

@@ -70,7 +70,8 @@ use ql_oplog::OpLog;
 use ql_storage::{NamedTarget, Workbook};
 use ql_types::{ColId, RowId, SheetId, Value};
 
-use ql_formula_syntax::{lex, parse};
+use ql_formula_syntax::{lex, lex_with, parse, print_with, FormulaSite};
+use ql_io::CellWireValue;
 use ql_oplog::Op;
 use ql_session::dto::{
     BatchOptions, BatchResult, BoundRange, CellAddr, CellRange, CellSnapshot, CellValue,
@@ -266,6 +267,43 @@ impl WorkbookSession {
         out
     }
 
+    /// Like [`with_runtime`] but with the op-log **detached** — the mutators
+    /// update the workbook AND maintain the calcgraph, but append **no** ops
+    /// (the [`batch`] path appends its single `Op::BatchCommit` itself). Same
+    /// `FaultGuard` panic safety + plan-cache take/restore as `with_runtime`.
+    ///
+    /// [`with_runtime`]: WorkbookSession::with_runtime
+    /// [`batch`]: WorkbookSession::batch
+    fn with_runtime_no_oplog<R>(&mut self, f: impl FnOnce(&mut WorkbookRuntime<'_>) -> R) -> R {
+        struct FaultGuard<'g> {
+            state: &'g mut LifecycleState,
+            armed: bool,
+        }
+        impl Drop for FaultGuard<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    *self.state = LifecycleState::Faulted;
+                }
+            }
+        }
+
+        let cache = std::mem::take(&mut self.plan_cache);
+        let mut guard = FaultGuard {
+            state: &mut self.state,
+            armed: true,
+        };
+        let mut rt = WorkbookRuntime::with_session_state_no_oplog(
+            &mut self.workbook,
+            &self.registry,
+            &mut self.graph,
+            cache,
+        );
+        let out = f(&mut rt);
+        self.plan_cache = rt.into_plan_cache();
+        guard.armed = false;
+        out
+    }
+
     /// Reject a coordinate outside the Excel-compatible addressable grid
     /// (`MAX_ROW` / `MAX_COLUMN`) with `BadArgument` (F4 / contract §8). The
     /// read paths (`cell`/`query_range`/`validate_formula`) read the live
@@ -383,6 +421,40 @@ impl WorkbookSession {
             ));
         }
         Ok(())
+    }
+
+    /// Canonicalize + bind-validate one formula exactly as
+    /// [`WorkbookRuntime::set_formula`] does (used by [`batch`] to build the
+    /// `PutFormula` inner op pre-mutation): lex under the workbook's current
+    /// reference-mode/locale → parse → `print_with(A1, EnUs, site)` to get the
+    /// canonical stored text → bind at the cell site. A lex/parse/print error
+    /// maps to a `Compute`/`formula_parse` `EngineError`; a bind error maps to
+    /// `Compute`/`formula_bind`. The returned `Arc<str>` is the canonical text
+    /// the cell will store, so the logged op matches a single edit's op.
+    ///
+    /// [`set_formula`]: WorkbookRuntime::set_formula
+    /// [`batch`]: WorkbookSession::batch
+    fn canonicalize_and_bind(&self, addr: CellAddr, text: &str) -> EngineResult<Arc<str>> {
+        let mode = self.workbook.reference_mode();
+        let locale = self.workbook.locale();
+        let address = ql_types::Address::new(addr.sheet, addr.row, addr.col);
+        let site = FormulaSite::at_cell(address);
+        let to_parse_err = |msg: String| EngineError::new(ErrorClass::Compute, "formula_parse", msg);
+        let tokens = lex_with(text, mode, locale).map_err(|e| to_parse_err(e.to_string()))?;
+        let expr = parse(tokens).map_err(|e| to_parse_err(e.to_string()))?;
+        let canonical: Arc<str> = Arc::from(
+            print_with(&expr, ql_types::ReferenceMode::A1, ql_types::Locale::EnUs, Some(site))
+                .map_err(|e| to_parse_err(e.to_string()))?,
+        );
+        bind_with_site(
+            &expr,
+            BindSite::at_cell(address),
+            &self.workbook,
+            &self.workbook,
+            &self.workbook,
+        )
+        .map_err(|e| EngineError::new(ErrorClass::Compute, "formula_bind", e.to_string()))?;
+        Ok(canonical)
     }
 
     /// Encode the current `{epoch, state_seq}` version token (§4.0). 16-byte
@@ -930,8 +1002,256 @@ impl EngineSession for WorkbookSession {
 
     // --- Batch / transaction (§3.4) ---
 
-    fn batch(&mut self, _ops: Vec<SessionOp>, _options: BatchOptions) -> EngineResult<BatchResult> {
-        Err(not_implemented("batch"))
+    /// Apply a sequence of cell mutations as ONE undo unit / ONE op-log entry
+    /// (`Op::BatchCommit`, §3.4). Option (a) of impl-plan §0:
+    ///
+    /// 1. **Validate-all up front (atomic).** Every op's sheet liveness +
+    ///    grid bounds are checked, every `SetFormula` is lex→parse→bind'd, and
+    ///    every value that will be serialized into the `BatchCommit`
+    ///    (`SetValue` literals + `Clear`'s preserved cell value) is checked
+    ///    finite — so the later append cannot fail on a NaN/Inf serialization.
+    ///    Any failure returns the error with the workbook + version token
+    ///    UNCHANGED (nothing mutated, no op appended).
+    /// 2. **Build the single `Op::BatchCommit`** from the PRE-batch workbook
+    ///    state (mirroring `WorkbookTransaction::commit`'s pre-commit reads at
+    ///    `transaction.rs:311`): `SetValue`→`PutValue`(+`ClearFormula` if the
+    ///    cell currently has a formula); `SetFormula`→`PutFormula`(canonical
+    ///    A1/EnUs text); `Clear`→`PutValue`(preserved scalar value)+
+    ///    `ClearFormula` (skipping a no-formula cell, mirroring
+    ///    `clear_formula`); `SetFormat`→`SetCellFormat`. (A `SetValue(Blank)`
+    ///    on a non-formula cell contributes no inner op, mirroring
+    ///    `set_value`.)
+    /// 3. **Append the `BatchCommit` BEFORE mutating** the workbook (one undo
+    ///    unit, one log entry; an append failure leaves the workbook
+    ///    unchanged), unless the batch reduces to zero inner ops.
+    /// 4. **Apply every op through a graph-maintaining runtime with the op-log
+    ///    DETACHED** ([`with_runtime_no_oplog`] / `with_session_state_no_oplog`)
+    ///    — so the workbook AND the session's `CalcgraphSession` update (the
+    ///    graph hooks fire on `graph.is_some()`, independent of the op-log) but
+    ///    NO second per-op append happens. This is the tension
+    ///    `WorkbookTransaction` could not resolve (it maintains no graph): after
+    ///    the batch, a later `recalc_dirty` correctly recomputes the batched
+    ///    cells' dependents.
+    /// 5. **Advance `state_seq` exactly once** for the whole batch
+    ///    (`record_changes` with every touched cell/format), so a
+    ///    `snapshot_delta` from a pre-batch token reflects every batched cell.
+    ///
+    /// `options.undo_label` is accepted but not yet consumed (undo lands in a
+    /// later increment; the label will tag the undo unit then). The eval of
+    /// formulas happens during apply (single-edit semantics); same-cell
+    /// duplicate ops use last-write-wins with the pre-batch `had_formula`
+    /// approximation, identical to `WorkbookTransaction`.
+    ///
+    /// [`with_runtime_no_oplog`]: WorkbookSession::with_runtime_no_oplog
+    fn batch(&mut self, ops: Vec<SessionOp>, _options: BatchOptions) -> EngineResult<BatchResult> {
+        self.ensure_ready()?;
+
+        // Empty batch: nothing observable changed → no op, no token advance.
+        if ops.is_empty() {
+            return Ok(BatchResult {
+                applied: 0,
+                version: self.current_version(),
+            });
+        }
+
+        // --- Phase 1: validate-all + build the BatchCommit inner ops, all
+        // against the PRE-batch workbook (no mutation yet). Any error here
+        // returns with the workbook + token UNCHANGED. ---
+        let mut inner_ops: Vec<Op> = Vec::with_capacity(ops.len() * 2);
+        // Touched cells/formats for the single `record_changes` call (deduped
+        // at delta-resolve time, so a plain Vec is fine).
+        let mut changes: Vec<SessionChange> = Vec::with_capacity(ops.len());
+
+        for op in &ops {
+            match op {
+                SessionOp::SetValue { addr, value } => {
+                    self.require_live_sheet(addr.sheet, "batch.set_value")?;
+                    Self::require_in_bounds(addr.row, addr.col, "batch.set_value")?;
+                    // Reject Pending/Error/non-finite inputs exactly as
+                    // `set_value` does (the runtime would too, but doing it
+                    // here keeps validation fully up front / pre-mutation).
+                    let v = cell_value_to_value(value.clone())?;
+                    if let Some(wire) = CellWireValue::from_value(&v) {
+                        inner_ops.push(Op::PutValue {
+                            sheet: addr.sheet,
+                            row: addr.row,
+                            col: addr.col,
+                            value: wire,
+                        });
+                    }
+                    // Mirror `set_value`: a `ClearFormula` lands iff the cell
+                    // currently (pre-batch) has a formula.
+                    if self
+                        .workbook
+                        .formula_at(addr.sheet, addr.row, addr.col)
+                        .is_some()
+                    {
+                        inner_ops.push(Op::ClearFormula {
+                            sheet: addr.sheet,
+                            row: addr.row,
+                            col: addr.col,
+                        });
+                    }
+                    changes.push(SessionChange::Cell {
+                        sheet: addr.sheet,
+                        row: addr.row,
+                        col: addr.col,
+                    });
+                }
+                SessionOp::SetFormula { addr, text } => {
+                    self.require_live_sheet(addr.sheet, "batch.set_formula")?;
+                    Self::require_in_bounds(addr.row, addr.col, "batch.set_formula")?;
+                    // Canonicalize + bind-validate exactly as `set_formula`
+                    // does (lex_with current mode/locale → parse → print_with
+                    // A1/EnUs at the cell site → bind). The canonical text is
+                    // what `set_formula` persists, so the `PutFormula` op
+                    // matches what an individual edit would have logged.
+                    let canonical = self.canonicalize_and_bind(*addr, text)?;
+                    inner_ops.push(Op::PutFormula {
+                        sheet: addr.sheet,
+                        row: addr.row,
+                        col: addr.col,
+                        text: canonical.as_ref().to_owned(),
+                    });
+                    changes.push(SessionChange::Cell {
+                        sheet: addr.sheet,
+                        row: addr.row,
+                        col: addr.col,
+                    });
+                }
+                SessionOp::Clear { addr } => {
+                    self.require_live_sheet(addr.sheet, "batch.clear")?;
+                    Self::require_in_bounds(addr.row, addr.col, "batch.clear")?;
+                    // Mirror `clear_formula`: a no-formula cell is a no-op
+                    // (no inner op, no change record). Otherwise emit the
+                    // preserved-value `PutValue` (unless this cell is a spill
+                    // anchor, whose value is part of the spill, or the value
+                    // is Blank) followed by `ClearFormula`.
+                    if self
+                        .workbook
+                        .formula_at(addr.sheet, addr.row, addr.col)
+                        .is_some()
+                    {
+                        let is_spill_anchor = self
+                            .workbook
+                            .spill_anchor_at(addr.sheet, addr.row, addr.col)
+                            .is_some();
+                        if !is_spill_anchor {
+                            let current = self
+                                .workbook
+                                .read(ql_types::Address::new(addr.sheet, addr.row, addr.col));
+                            // Up-front finiteness guard so the append cannot
+                            // fail on a non-finite preserved value (mirrors
+                            // clear_formula's append-before-mutate guarantee).
+                            if let Value::Number(n) = current {
+                                if !n.is_finite() {
+                                    return Err(EngineError::bad_argument(format!(
+                                        "batch.clear: cell ({}, {}) holds a non-finite \
+                                         value that cannot be preserved in the op log",
+                                        addr.row, addr.col
+                                    )));
+                                }
+                            }
+                            if let Some(wire) = CellWireValue::from_value(&current) {
+                                inner_ops.push(Op::PutValue {
+                                    sheet: addr.sheet,
+                                    row: addr.row,
+                                    col: addr.col,
+                                    value: wire,
+                                });
+                            }
+                        }
+                        inner_ops.push(Op::ClearFormula {
+                            sheet: addr.sheet,
+                            row: addr.row,
+                            col: addr.col,
+                        });
+                        changes.push(SessionChange::Cell {
+                            sheet: addr.sheet,
+                            row: addr.row,
+                            col: addr.col,
+                        });
+                    }
+                }
+                SessionOp::SetFormat { addr, format } => {
+                    self.require_live_sheet(addr.sheet, "batch.set_format")?;
+                    Self::require_in_bounds(addr.row, addr.col, "batch.set_format")?;
+                    let id = dto_format_id_to_storage(*format);
+                    // Mirror `set_cell_format`'s producer-side gate: refuse an
+                    // unregistered id up front (BadArgument), pre-mutation.
+                    if self.workbook.formats().lookup(id).is_none() {
+                        return Err(EngineError::new(
+                            ErrorClass::BadArgument,
+                            "unknown_format_id",
+                            format!("batch.set_format: format id {id:?} is not registered"),
+                        ));
+                    }
+                    inner_ops.push(Op::SetCellFormat {
+                        sheet: addr.sheet,
+                        row: addr.row,
+                        col: addr.col,
+                        id: Some(ql_oplog::FormatIdWire::from_storage(id)),
+                    });
+                    changes.push(SessionChange::Cell {
+                        sheet: addr.sheet,
+                        row: addr.row,
+                        col: addr.col,
+                    });
+                }
+            }
+        }
+
+        // --- Phase 2: append the single BatchCommit BEFORE any mutation.
+        // (Skip iff the batch reduced to zero inner ops — e.g. only
+        // Blank-clears on non-formula cells; then there is nothing to log and
+        // nothing observable changed.) ---
+        let applied = ops.len() as u32;
+        if inner_ops.is_empty() {
+            return Ok(BatchResult {
+                applied,
+                version: self.current_version(),
+            });
+        }
+        self.oplog
+            .append(Op::BatchCommit { ops: inner_ops })
+            .map_err(oplog_append_err)?;
+
+        // --- Phase 3: apply every op through a graph-maintaining runtime with
+        // the op-log DETACHED, so the workbook + calcgraph update but NO second
+        // per-op append happens. The inputs were validated in Phase 1; a
+        // mutator error here would be an engine inconsistency → fail loud
+        // (map_runtime_err, never swallowed). ---
+        self.with_runtime_no_oplog(|rt| -> Result<(), RuntimeError> {
+            for op in &ops {
+                match op {
+                    SessionOp::SetValue { addr, value } => {
+                        let v = cell_value_to_value(value.clone())
+                            .expect("batch.set_value: validated finite in Phase 1");
+                        rt.set_value(addr.sheet, addr.row, addr.col, v)?;
+                    }
+                    SessionOp::SetFormula { addr, text } => {
+                        rt.set_formula(addr.sheet, addr.row, addr.col, text.as_str())?;
+                    }
+                    SessionOp::Clear { addr } => {
+                        rt.clear_formula(addr.sheet, addr.row, addr.col)?;
+                    }
+                    SessionOp::SetFormat { addr, format } => {
+                        let id = dto_format_id_to_storage(*format);
+                        rt.set_cell_format(addr.sheet, addr.row, addr.col, Some(id))?;
+                    }
+                }
+            }
+            Ok(())
+        })
+        .map_err(map_runtime_err)?;
+
+        // --- Phase 4: advance state_seq exactly once for the whole batch. ---
+        self.record_changes(changes);
+
+        Ok(BatchResult {
+            applied,
+            version: self.current_version(),
+        })
     }
 
     fn begin_transaction(&mut self) -> EngineResult<TransactionId> {
@@ -2083,5 +2403,366 @@ mod tests {
         s.delete_sheet(added).unwrap();
         let d2 = s.snapshot_delta(&v1).unwrap();
         assert!(d2.sheets_removed.contains(&added));
+    }
+
+    // --- batch (inc.2c-4) ---
+
+    /// A paste-style batch (several SetValue + a SetFormula referencing them)
+    /// applies atomically: values land and the computed formula is correct.
+    #[test]
+    fn batch_paste_block_applies_atomically() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let ops = vec![
+            SessionOp::SetValue {
+                addr: addr(sheet, 0, 0),
+                value: CellValue::Number { number: 10.0 },
+            },
+            SessionOp::SetValue {
+                addr: addr(sheet, 1, 0),
+                value: CellValue::Number { number: 20.0 },
+            },
+            // B1 = A1 + A2 — references cells written EARLIER in the same batch.
+            SessionOp::SetFormula {
+                addr: addr(sheet, 0, 1),
+                text: "A1 + A2".to_string(),
+            },
+        ];
+        let res = s.batch(ops, BatchOptions::default()).unwrap();
+        assert_eq!(res.applied, 3);
+        assert_eq!(
+            s.cell(addr(sheet, 0, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 10.0 })
+        );
+        assert_eq!(
+            s.cell(addr(sheet, 1, 0)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 20.0 })
+        );
+        let b1 = s.cell(addr(sheet, 0, 1)).unwrap().unwrap();
+        assert_eq!(b1.value, Some(CellValue::Number { number: 30.0 }));
+        // Canonicalized text is stored (W5-147 spaced operators).
+        assert_eq!(b1.formula.as_deref(), Some("A1 + A2"));
+    }
+
+    /// THE load-bearing graph-consistency proof: after a batch that sets A1 and
+    /// a formula B1=A1*2, a LATER `set_value(A1)` + `recalc_dirty()` recomputes
+    /// B1 correctly — i.e. the batch kept the session calcgraph live (the
+    /// tension `WorkbookTransaction` could not resolve).
+    #[test]
+    fn batch_keeps_calcgraph_live_for_later_recalc() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.batch(
+            vec![
+                SessionOp::SetValue {
+                    addr: addr(sheet, 0, 0),
+                    value: CellValue::Number { number: 10.0 },
+                },
+                SessionOp::SetFormula {
+                    addr: addr(sheet, 0, 1),
+                    text: "A1*2".to_string(),
+                },
+            ],
+            BatchOptions::default(),
+        )
+        .unwrap();
+        // B1 == 20 right after the batch.
+        assert_eq!(
+            s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 20.0 })
+        );
+        // Change A1 OUTSIDE the batch → B1 must go dirty (graph saw the batch).
+        s.set_value(addr(sheet, 0, 0), CellValue::Number { number: 5.0 })
+            .unwrap();
+        s.recalc_dirty().unwrap();
+        assert_eq!(
+            s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 10.0 }),
+            "B1 must recompute to A1*2 = 10 — proves the batch maintained the graph"
+        );
+    }
+
+    /// Validation-atomicity: a batch containing one invalid op (malformed
+    /// formula) returns the error and leaves the workbook + version token
+    /// UNCHANGED — no earlier op in the batch is applied.
+    #[test]
+    fn batch_invalid_op_is_fully_rejected() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        let err = s
+            .batch(
+                vec![
+                    SessionOp::SetValue {
+                        addr: addr(sheet, 0, 0),
+                        value: CellValue::Number { number: 7.0 },
+                    },
+                    // Malformed formula → whole batch must roll back.
+                    SessionOp::SetFormula {
+                        addr: addr(sheet, 0, 1),
+                        text: "1 +* 2".to_string(),
+                    },
+                ],
+                BatchOptions::default(),
+            )
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::Compute);
+        // The earlier (valid) SetValue must NOT have landed.
+        assert!(
+            s.cell(addr(sheet, 0, 0)).unwrap().is_none(),
+            "no op may apply when the batch contains an invalid op"
+        );
+        assert_eq!(
+            v0,
+            s.snapshot().unwrap().version,
+            "a rejected batch must not advance the version token"
+        );
+    }
+
+    /// A batch targeting a tombstoned sheet is rejected (NotFound), nothing
+    /// applied.
+    #[test]
+    fn batch_on_tombstoned_sheet_is_not_found() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        s.delete_sheet(sheet).unwrap();
+        let err = s
+            .batch(
+                vec![SessionOp::SetValue {
+                    addr: addr(sheet, 0, 0),
+                    value: CellValue::Number { number: 1.0 },
+                }],
+                BatchOptions::default(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "sheet_not_found");
+    }
+
+    /// One BatchCommit: the op-log gains EXACTLY one `Op::BatchCommit` for a
+    /// multi-op batch, with the expected inner ops (PutValue + PutFormula).
+    #[test]
+    fn batch_emits_exactly_one_batch_commit() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let len_before = s.oplog.len();
+        s.batch(
+            vec![
+                SessionOp::SetValue {
+                    addr: addr(sheet, 0, 0),
+                    value: CellValue::Number { number: 10.0 },
+                },
+                SessionOp::SetFormula {
+                    addr: addr(sheet, 0, 1),
+                    text: "A1*2".to_string(),
+                },
+            ],
+            BatchOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            s.oplog.len() - len_before,
+            1,
+            "a batch must append exactly one op-log entry (one undo unit)"
+        );
+        let ops: Vec<Op> = s.oplog.iter().collect::<Result<_, _>>().unwrap();
+        match ops.last().unwrap() {
+            Op::BatchCommit { ops: inner } => {
+                assert_eq!(inner.len(), 2, "inner ops were: {inner:?}");
+                assert!(matches!(inner[0], Op::PutValue { .. }));
+                assert!(matches!(inner[1], Op::PutFormula { .. }));
+            }
+            other => panic!("expected BatchCommit, got {other:?}"),
+        }
+    }
+
+    /// A SetValue over a pre-existing formula cell emits PutValue + ClearFormula
+    /// inside the single BatchCommit (mirrors set_value's op shape).
+    #[test]
+    fn batch_set_value_over_formula_emits_clear_formula_inside_commit() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        // Pre-existing formula at A1.
+        s.set_formula(addr(sheet, 0, 0), "1 + 2").unwrap();
+        let len_before = s.oplog.len();
+        s.batch(
+            vec![SessionOp::SetValue {
+                addr: addr(sheet, 0, 0),
+                value: CellValue::Number { number: 99.0 },
+            }],
+            BatchOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(s.oplog.len() - len_before, 1);
+        let ops: Vec<Op> = s.oplog.iter().collect::<Result<_, _>>().unwrap();
+        match ops.last().unwrap() {
+            Op::BatchCommit { ops: inner } => {
+                assert_eq!(inner.len(), 2, "inner ops were: {inner:?}");
+                assert!(matches!(inner[0], Op::PutValue { .. }));
+                assert!(matches!(inner[1], Op::ClearFormula { .. }));
+            }
+            other => panic!("expected BatchCommit, got {other:?}"),
+        }
+        // The formula is gone; the literal landed.
+        let a1 = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(a1.value, Some(CellValue::Number { number: 99.0 }));
+        assert_eq!(a1.formula, None);
+    }
+
+    /// state_seq advances exactly once for the whole batch, and a
+    /// `snapshot_delta` from a pre-batch token reports EVERY batched cell.
+    #[test]
+    fn batch_advances_state_seq_once_and_delta_reports_all_cells() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        let (e0, seq0) = WorkbookSession::decode_version(&v0).unwrap();
+        s.batch(
+            vec![
+                SessionOp::SetValue {
+                    addr: addr(sheet, 0, 0),
+                    value: CellValue::Number { number: 1.0 },
+                },
+                SessionOp::SetValue {
+                    addr: addr(sheet, 1, 0),
+                    value: CellValue::Number { number: 2.0 },
+                },
+                SessionOp::SetFormula {
+                    addr: addr(sheet, 0, 1),
+                    text: "A1+A2".to_string(),
+                },
+            ],
+            BatchOptions::default(),
+        )
+        .unwrap();
+        let v1 = s.snapshot().unwrap().version;
+        let (e1, seq1) = WorkbookSession::decode_version(&v1).unwrap();
+        assert_eq!(e0, e1, "batch must not bump the epoch");
+        assert_eq!(seq1, seq0 + 1, "the whole batch advances state_seq exactly once");
+        // The delta from v0 must contain ALL three batched cells.
+        let d = s.snapshot_delta(&v0).unwrap();
+        assert!(!d.full_rebuild_required);
+        let changed: Vec<(u32, u32)> = d
+            .changed_cells
+            .iter()
+            .map(|c| (c.cell.row, c.cell.col))
+            .collect();
+        assert!(changed.contains(&(0, 0)));
+        assert!(changed.contains(&(1, 0)));
+        assert!(changed.contains(&(0, 1)));
+    }
+
+    /// All four SessionOp variants are supported (no Capability error).
+    /// SetFormat clears+rebinds; Clear strips a formula keeping its value.
+    #[test]
+    fn batch_supports_all_four_op_variants() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let fmt = s.register_format("0.00%").unwrap();
+        // Seed a formula cell that the batch will Clear.
+        s.set_formula(addr(sheet, 2, 0), "3 + 4").unwrap();
+        let res = s
+            .batch(
+                vec![
+                    SessionOp::SetValue {
+                        addr: addr(sheet, 0, 0),
+                        value: CellValue::Number { number: 5.0 },
+                    },
+                    SessionOp::SetFormula {
+                        addr: addr(sheet, 0, 1),
+                        text: "A1*3".to_string(),
+                    },
+                    SessionOp::SetFormat {
+                        addr: addr(sheet, 0, 0),
+                        format: fmt,
+                    },
+                    SessionOp::Clear {
+                        addr: addr(sheet, 2, 0),
+                    },
+                ],
+                BatchOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(res.applied, 4);
+        // SetValue + SetFormat on A1.
+        let a1 = s.cell(addr(sheet, 0, 0)).unwrap().unwrap();
+        assert_eq!(a1.value, Some(CellValue::Number { number: 5.0 }));
+        assert_eq!(a1.format, Some(fmt));
+        // SetFormula B1 = A1*3 = 15.
+        assert_eq!(
+            s.cell(addr(sheet, 0, 1)).unwrap().unwrap().value,
+            Some(CellValue::Number { number: 15.0 })
+        );
+        // Clear strips the formula at A3 but preserves its computed value (7).
+        let a3 = s.cell(addr(sheet, 2, 0)).unwrap().unwrap();
+        assert_eq!(a3.formula, None);
+        assert_eq!(a3.value, Some(CellValue::Number { number: 7.0 }));
+    }
+
+    /// An empty batch is a no-op: no op appended, no token advance.
+    #[test]
+    fn batch_empty_is_noop() {
+        let mut s = WorkbookSession::new();
+        s.add_sheet("S", 16384).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        let len_before = s.oplog.len();
+        let res = s.batch(Vec::new(), BatchOptions::default()).unwrap();
+        assert_eq!(res.applied, 0);
+        assert_eq!(s.oplog.len(), len_before, "empty batch appends nothing");
+        assert_eq!(v0, s.snapshot().unwrap().version);
+    }
+
+    /// A batch reduced to zero inner ops (a Blank-clear on a non-formula cell)
+    /// appends no BatchCommit and does not advance the token — but still
+    /// reports `applied` honestly.
+    #[test]
+    fn batch_blank_clear_on_blank_cell_appends_nothing() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        let len_before = s.oplog.len();
+        let res = s
+            .batch(
+                vec![SessionOp::Clear {
+                    addr: addr(sheet, 5, 5),
+                }],
+                BatchOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(res.applied, 1, "applied counts the requested ops honestly");
+        assert_eq!(
+            s.oplog.len(),
+            len_before,
+            "a no-effect batch appends no BatchCommit"
+        );
+        assert_eq!(v0, s.snapshot().unwrap().version);
+    }
+
+    /// A non-finite literal in a batch is rejected up front (BadArgument),
+    /// nothing applied.
+    #[test]
+    fn batch_non_finite_value_is_bad_argument() {
+        let mut s = WorkbookSession::new();
+        let sheet = s.add_sheet("S", 16384).unwrap();
+        let v0 = s.snapshot().unwrap().version;
+        let err = s
+            .batch(
+                vec![
+                    SessionOp::SetValue {
+                        addr: addr(sheet, 0, 0),
+                        value: CellValue::Number { number: 1.0 },
+                    },
+                    SessionOp::SetValue {
+                        addr: addr(sheet, 0, 1),
+                        value: CellValue::Number {
+                            number: f64::INFINITY,
+                        },
+                    },
+                ],
+                BatchOptions::default(),
+            )
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::BadArgument);
+        assert!(s.cell(addr(sheet, 0, 0)).unwrap().is_none());
+        assert_eq!(v0, s.snapshot().unwrap().version);
     }
 }
