@@ -135,12 +135,15 @@ use ql_collab::Transport as CoreTransport;
 use ql_collab::TransportError;
 use ql_collab_ws::WebSocketError;
 use ql_collab_ws::WebSocketTransport;
+// **inc.2d (2026-05-27):** the owning single-writer session + its contract.
+use ql_exec::WorkbookSession as CoreWorkbookSession;
 use ql_functions::default_registry;
 use ql_io::oplog_persistence::{
     load_workbook_with_oplog, save_workbook_with_oplog, PersistenceError,
 };
 use ql_oplog::CellWireValue;
 use ql_oplog::Op;
+use ql_session::{EngineError, EngineSession};
 use ql_types::PeerId;
 
 /// **Phase 5.7 V1 (2026-05-22):** smoke method exposing the binding's
@@ -4080,3 +4083,350 @@ mod tests {
         assert_eq!(session_b.op_count(), session_a.op_count());
     }
 }
+
+// ===========================================================================
+// Phase 6.1B inc.2d (2026-05-27) — the owning `WorkbookSession` over napi.
+//
+// The product-neutral `Session` class wraps `ql_exec::WorkbookSession` (the sole
+// `ql_session::EngineSession` implementor) so the IDE edit/recalc/snapshot path
+// can run through the single-writer owning session instead of the `CollabSession`
+// CRDT façade (decision-lock §2 item 3 + risk-mitigation #1). This is the
+// engine-side ENABLER; the IDE-side wiring + mocha proof (and the B#1/S2-01
+// cross-window tests) are the cross-repo follow-up. The existing `CollabSession`
+// class is untouched (collab = v1.5).
+//
+// All index args are `f64` + manually validated via `validate_u16_index` /
+// `validate_u32_index` (the documented Codex-HIGH closure that avoids JS
+// `ToUint32` silent coercion — same discipline as `appendPutValue` / `addSheet`).
+// Errors map through `engine_error_to_napi` (`EngineError::Display == "[code]
+// message"`, mirroring `collab_session_error_to_napi`).
+// ===========================================================================
+
+/// JS-facing lightweight sheet descriptor for [`Session::list_sheets`] (no cells).
+/// `id` is the u16 `SheetId` widened to u32 (lossless; matches
+/// [`SheetSnapshotJson`]'s `id`).
+#[napi(object)]
+pub struct SheetInfoJson {
+    /// Sheet id (u16 widened to u32).
+    pub id: u32,
+    /// Sheet display name.
+    pub name: String,
+}
+
+/// Map a structured [`EngineError`] to a napi [`Error`] with a code-prefixed
+/// message. `EngineError`'s `Display` is already `"[<code>] <message>"`
+/// (contract §5), so this mirrors [`collab_session_error_to_napi`] — the binding
+/// does NOT invent its own error shape (acceptance API6-03). The stable `code`
+/// is the leading bracketed token; the IDE branches on it.
+fn engine_error_to_napi(e: EngineError) -> Error {
+    Error::from_reason(e.to_string())
+}
+
+/// Build a validated [`ql_session::CellAddr`] from raw JS Numbers. `sheet` is a
+/// u16 `SheetId`; `row`/`col` are u32 `RowId`/`ColId`. Reuses the same
+/// finite/non-negative/integer/in-range validators as the collab append path.
+fn session_addr_from_f64(
+    method: &str,
+    sheet: f64,
+    row: f64,
+    col: f64,
+) -> Result<ql_session::CellAddr> {
+    let sheet = validate_u16_index(method, "sheet", sheet)?;
+    let row = validate_u32_index(method, "row", row)?;
+    let col = validate_u32_index(method, "col", col)?;
+    Ok(ql_session::CellAddr { sheet, row, col })
+}
+
+/// Map a JS-supplied [`CellValueJson`] to a [`ql_session::CellValue`] for
+/// `setValue`. Discriminates on `kind`; the payload field for that kind MUST be
+/// present (fail-loud `[bad_argument]` otherwise — No-Fallbacks, no silent
+/// default). A `number` must be finite (NaN/Inf rejected). `blank` clears the
+/// cell's value. `error`/`pending` are READ-only states (produced by the engine,
+/// never set by a caller) → rejected; an unknown `kind` is rejected.
+fn session_cell_value_from_json(v: CellValueJson) -> Result<ql_session::CellValue> {
+    match v.kind.as_str() {
+        "number" => {
+            let n = v.number.ok_or_else(|| {
+                bad_argument_error("setValue: kind 'number' requires a 'number' field".into())
+            })?;
+            if !n.is_finite() {
+                return Err(bad_argument_error(format!(
+                    "setValue: number must be finite, got {n}"
+                )));
+            }
+            Ok(ql_session::CellValue::Number { number: n })
+        }
+        "boolean" => {
+            let b = v.boolean.ok_or_else(|| {
+                bad_argument_error("setValue: kind 'boolean' requires a 'boolean' field".into())
+            })?;
+            Ok(ql_session::CellValue::Boolean { boolean: b })
+        }
+        "text" => {
+            let t = v.text.ok_or_else(|| {
+                bad_argument_error("setValue: kind 'text' requires a 'text' field".into())
+            })?;
+            Ok(ql_session::CellValue::Text { text: t })
+        }
+        "blank" => Ok(ql_session::CellValue::Blank),
+        other => Err(bad_argument_error(format!(
+            "setValue: unsupported value kind '{other}' \
+             (expected number|boolean|text|blank; 'error'/'pending' are engine-produced, read-only)"
+        ))),
+    }
+}
+
+/// Map a [`ql_session::CellValue`] to the JS [`CellValueJson`] discriminated
+/// union (mirrors the `From<CellWireValue>` impl; adds the `blank` kind).
+fn cell_value_json_from_session(v: ql_session::CellValue) -> CellValueJson {
+    use ql_session::CellValue as V;
+    let (kind, number, boolean, text, error) = match v {
+        V::Number { number } => ("number", Some(number), None, None, None),
+        V::Boolean { boolean } => ("boolean", None, Some(boolean), None, None),
+        V::Text { text } => ("text", None, None, Some(text), None),
+        V::Error { error } => ("error", None, None, None, Some(error)),
+        V::Blank => ("blank", None, None, None, None),
+        V::Pending => ("pending", None, None, None, None),
+    };
+    CellValueJson {
+        kind: kind.to_string(),
+        number,
+        boolean,
+        text,
+        error,
+    }
+}
+
+/// Map a [`ql_session::FormatId`] to the JS [`FormatIdJson`] tagged union
+/// (mirrors `From<ql_storage::FormatId>`; `ql_session` carries the peer as a
+/// raw u64 rather than `PeerId`).
+fn format_id_json_from_session(id: ql_session::FormatId) -> FormatIdJson {
+    match id {
+        ql_session::FormatId::Builtin { builtin } => FormatIdJson {
+            kind: "builtin".to_string(),
+            builtin: Some(builtin),
+            custom_peer: None,
+            custom_counter: None,
+        },
+        ql_session::FormatId::Custom { peer, counter } => FormatIdJson {
+            kind: "custom".to_string(),
+            builtin: None,
+            custom_peer: Some(BigInt::from(peer)),
+            custom_counter: Some(counter),
+        },
+    }
+}
+
+/// Map a [`ql_session::CellSnapshot`] to the JS [`CellSnapshotJson`].
+fn cell_snapshot_json_from_session(c: ql_session::CellSnapshot) -> CellSnapshotJson {
+    CellSnapshotJson {
+        row: c.row,
+        col: c.col,
+        value: c.value.map(cell_value_json_from_session),
+        formula: c.formula,
+        format: c.format.map(format_id_json_from_session),
+        rendered: c.rendered,
+    }
+}
+
+/// Map a [`ql_session::SheetSnapshot`] to the JS [`SheetSnapshotJson`].
+fn sheet_snapshot_json_from_session(s: ql_session::SheetSnapshot) -> SheetSnapshotJson {
+    SheetSnapshotJson {
+        id: u32::from(s.id),
+        name: s.name,
+        cells: s
+            .cells
+            .into_iter()
+            .map(cell_snapshot_json_from_session)
+            .collect(),
+    }
+}
+
+/// Map a [`ql_session::WorkbookSnapshot`] to the JS [`WorkbookSnapshotJson`].
+/// The opaque `version` token round-trips verbatim as a `Buffer` (contract §4.0
+/// — callers MUST NOT interpret it).
+fn workbook_snapshot_json_from_session(snap: ql_session::WorkbookSnapshot) -> WorkbookSnapshotJson {
+    let date_system = match snap.date_system {
+        ql_session::DateSystem::Excel1900 => "Excel1900",
+        ql_session::DateSystem::Excel1904 => "Excel1904",
+    };
+    WorkbookSnapshotJson {
+        sheets: snap
+            .sheets
+            .into_iter()
+            .map(sheet_snapshot_json_from_session)
+            .collect(),
+        formats: snap
+            .formats
+            .into_iter()
+            .map(|fd| FormatDefJson {
+                id: format_id_json_from_session(fd.id),
+                string: fd.string,
+            })
+            .collect(),
+        date_system: date_system.to_string(),
+        version: Buffer::from(snap.version.0),
+    }
+}
+
+/// JS-facing wrapper for the owning [`ql_exec::WorkbookSession`] (the product
+/// single-writer session). Holds `Arc<Mutex<…>>` for the same `Send + Sync`
+/// reason as [`CollabSession`] (positive proof at the bottom of this file): the
+/// engine session is `Send + !Sync`, and `Arc<Mutex<Send>>` is `Send + Sync`.
+///
+/// **Scope (inc.2d):** the minimal smoke surface — construct, single-cell
+/// edits, recalc, snapshot/read — enough to prove the IDE edit→recalc→snapshot
+/// loop runs through the owning session over FFI. The richer surface
+/// (batch/transaction/import/export/undo/delta) is 6.3 Full Bindings;
+/// `register_function`/… is 6.4.
+#[napi(js_name = "Session")]
+pub struct Session {
+    inner: Arc<Mutex<CoreWorkbookSession>>,
+}
+
+#[napi]
+impl Session {
+    /// Construct a fresh, empty in-memory session (lifecycle `Ready`).
+    #[napi(constructor)]
+    #[allow(clippy::new_without_default)] // napi(constructor); Default would not be exposed to JS.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(CoreWorkbookSession::new())),
+        }
+    }
+
+    /// Add a sheet; returns its assigned `SheetId` (u16 widened to u32).
+    /// `chunkRows` is the per-sheet row partition size (must be ≥ 1; the engine
+    /// rejects 0 to prevent a `ColumnStore` panic).
+    #[napi(js_name = "addSheet")]
+    pub fn add_sheet(&self, name: String, chunk_rows: f64) -> Result<u32> {
+        let chunk_rows = validate_u32_index("addSheet", "chunkRows", chunk_rows)?;
+        if chunk_rows == 0 {
+            return Err(bad_argument_error(
+                "addSheet: chunkRows must be >= 1 (engine rejects chunk_rows == 0)".into(),
+            ));
+        }
+        let id = self
+            .inner
+            .lock()
+            .add_sheet(&name, chunk_rows)
+            .map_err(engine_error_to_napi)?;
+        Ok(u32::from(id))
+    }
+
+    /// Set a cell's literal value (clears any formula). `value` is the
+    /// discriminated-union [`CellValueJson`]; `blank` clears the value.
+    #[napi(js_name = "setValue")]
+    pub fn set_value(&self, sheet: f64, row: f64, col: f64, value: CellValueJson) -> Result<()> {
+        let addr = session_addr_from_f64("setValue", sheet, row, col)?;
+        let value = session_cell_value_from_json(value)?;
+        self.inner
+            .lock()
+            .set_value(addr, value)
+            .map_err(engine_error_to_napi)
+    }
+
+    /// Set a cell's formula. `text` is the formula BODY **without** a leading
+    /// `=` (e.g. `"A1+1"`) — matching `appendPutFormula` + the engine op-log
+    /// convention; the IDE strips the `=` client-side. The engine canonicalizes
+    /// the text (e.g. `"A1+1"` → `"A1 + 1"`). Lex/parse/bind failures surface as
+    /// a structured engine error (`[formula_parse]`/`[bad_argument]`-class).
+    #[napi(js_name = "setFormula")]
+    pub fn set_formula(&self, sheet: f64, row: f64, col: f64, text: String) -> Result<()> {
+        let addr = session_addr_from_f64("setFormula", sheet, row, col)?;
+        self.inner
+            .lock()
+            .set_formula(addr, &text)
+            .map_err(engine_error_to_napi)
+    }
+
+    /// Clear a cell's formula — **convert-to-literal**: removes the formula but
+    /// PRESERVES the last computed value (maps to `clear_formula` / the inc.2c-6
+    /// contract; Excel "convert to value"). To also clear the value, call
+    /// `setValue(.., { kind: "blank" })`. (A single "delete contents"
+    /// value+formula command is a 6.1C contract decision — see handoff.)
+    #[napi(js_name = "clear")]
+    pub fn clear(&self, sheet: f64, row: f64, col: f64) -> Result<()> {
+        let addr = session_addr_from_f64("clear", sheet, row, col)?;
+        self.inner.lock().clear(addr).map_err(engine_error_to_napi)
+    }
+
+    /// Recompute the dirty set (incremental). Returns the operation id (u64 as
+    /// BigInt). In v1 a recalc is synchronous; cancel is honored pre-start only.
+    #[napi(js_name = "recalcDirty")]
+    pub fn recalc_dirty(&self) -> Result<BigInt> {
+        let op = self
+            .inner
+            .lock()
+            .recalc_dirty()
+            .map_err(engine_error_to_napi)?;
+        Ok(BigInt::from(op.0))
+    }
+
+    /// Recompute everything. Returns the operation id (u64 as BigInt).
+    #[napi(js_name = "recalcAll")]
+    pub fn recalc_all(&self) -> Result<BigInt> {
+        let op = self
+            .inner
+            .lock()
+            .recalc_all()
+            .map_err(engine_error_to_napi)?;
+        Ok(BigInt::from(op.0))
+    }
+
+    /// Full workbook snapshot (carries the opaque `version` token as a `Buffer`).
+    #[napi(js_name = "snapshot")]
+    pub fn snapshot(&self) -> Result<WorkbookSnapshotJson> {
+        let snap = self.inner.lock().snapshot().map_err(engine_error_to_napi)?;
+        Ok(workbook_snapshot_json_from_session(snap))
+    }
+
+    /// Single-cell lookup. `null` if the cell is empty/absent.
+    #[napi(js_name = "cell")]
+    pub fn cell(&self, sheet: f64, row: f64, col: f64) -> Result<Option<CellSnapshotJson>> {
+        let addr = session_addr_from_f64("cell", sheet, row, col)?;
+        let cell = self.inner.lock().cell(addr).map_err(engine_error_to_napi)?;
+        Ok(cell.map(cell_snapshot_json_from_session))
+    }
+
+    /// List (non-tombstoned) sheets (id + name, no cells).
+    #[napi(js_name = "listSheets")]
+    pub fn list_sheets(&self) -> Result<Vec<SheetInfoJson>> {
+        let sheets = self
+            .inner
+            .lock()
+            .list_sheets()
+            .map_err(engine_error_to_napi)?;
+        Ok(sheets
+            .into_iter()
+            .map(|s| SheetInfoJson {
+                id: u32::from(s.id),
+                name: s.name,
+            })
+            .collect())
+    }
+}
+
+// **Phase 6.1B inc.2d (2026-05-27) — Send + Sync positive proof (audit Rule 4).**
+//
+// `Session { inner: Arc<Mutex<CoreWorkbookSession>> }` mirrors `CollabSession`:
+//   - `CoreWorkbookSession` (`ql_exec::WorkbookSession`) is asserted `Send`
+//     below. It owns the same Loro substrate (an `OpLog` + a `loro::UndoManager`,
+//     each holding an internal `Arc<LoroDoc>`) as `CoreCollabSession` (documented
+//     `Send + !Sync`), plus `Workbook` / `CalcgraphSession` / `PlanCache` /
+//     `Arc<FunctionRegistry>` / plain collections.
+//   - `parking_lot::Mutex<T>: Send + Sync` when `T: Send` (no poison flag).
+//   - `Arc<T>: Send + Sync` when `T: Send + Sync`.
+//   - Therefore `Session` is `Send + Sync`.
+//
+// If `assert_send::<CoreWorkbookSession>()` fails to compile, that is a REAL
+// contract finding — the owning engine session is not FFI-shareable as-is — NOT
+// something to paper over. Surfacing exactly this class of gap is the point of
+// migrating the Node path early (decision-lock risk-mitigation #1).
+const _ASSERT_BINDING_SESSION_SEND: fn() = || {
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+    assert_send::<CoreWorkbookSession>();
+    assert_send::<Session>();
+    assert_sync::<Session>();
+};

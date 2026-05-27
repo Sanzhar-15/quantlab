@@ -188,12 +188,31 @@ status: |
   xlsx-write`), clippy clean; ql-io-xlsx 60+49/0 (default), `--no-default-features` builds clean;
   workspace build green.**
 
-  ⭐ NEXT = 6.1B functions (6.4-0 metadata substrate then 6.4) + reserved bulk (6.4/6.5) → Node
-  smoke-path migration (+ pending `.node` rebuild + B#1/S2-01 mocha) → 6.1C audit — **follow
-  `docs/api/workbook-session-impl-plan.md` §0**. The v1 import/export surface is now COMPLETE: .qbook
-  open/save (2c-9), xlsx import (2c-10) + export (2c-12), csv import/export (2c-11). Also tracked
-  cross-cutting: a storage-level effective-non-blank-value extent API for all serializers. Do NOT freeze
-  the CollabSession CRDT façade (collab = v1.5).
+  ✅ 6.1B inc.2d — owning `WorkbookSession` over napi (engine-side Node-smoke enabler) SHIPPED 2026-05-28.
+  `ql-bindings-node` now exposes a new **`Session`** `#[napi]` class over
+  `Arc<parking_lot::Mutex<ql_exec::WorkbookSession>>` (new/addSheet/setValue/setFormula/clear/recalcDirty/
+  recalcAll/snapshot/cell/listSheets) — decision-lock §2 item 3 + risk-mit #1. `CollabSession` façade
+  untouched (collab=v1.5). `engine_error_to_napi` + DTO mappers reuse the existing `#[napi(object)]` shapes
+  (+ new `SheetInfoJson`); `f64`+`validate_u16/u32_index` discipline; positive `WorkbookSession: Send`
+  compile-proof. Deps `ql-exec` (no default features → no umya/image tree) + `ql-session`. Plain-Node
+  `process.dlopen` smoke (`tests/smoke_session.mjs`) PASSES edit→recalc→snapshot. Parallel Codex+Opus
+  audit **SHIP — 0 HIGH/MED**; 1 LOW (clear docstring → convert-to-literal, FIXED); deferred (snapshot
+  `formats` ordering → 6.1C; `schema_version` omission → 6.3; no-`catch_unwind` under `panic=abort` =
+  known, == CollabSession). Synthesis `docs/audits/2026-05-28-inc2d-session-napi-audit/`. ⚠️ surfaced
+  PRE-EXISTING clippy debt: `clippy -p ql-bindings-node` RED at HEAD (4 deny-errors `lib.rs:416/502/564/
+  2788`, pre-existing CollabSession-path; + workspace warn-level doc_lazy_continuation/type_complexity) —
+  rust-1.95.0 bump; needs a focused hygiene pass; inc.2d code itself clippy-clean.
+
+  ⭐ NEXT — **reconciled to the canonical decision-lock §2** (the prior "functions-first" NEXT here had
+  drifted; the lock puts the Node smoke migration INSIDE 6.1B → THEN 6.1C → THEN 6.4-0): **IDE-side Node
+  smoke wiring + mocha** (drive the `Session` class through `loader.ts`; rebuild the `.node`; add the
+  B#1/S2-01 cross-window mocha tests) — **cross-repo on `feat/visualise-v1`, the explicit hand-off** →
+  **6.1C security/design audit** (also the home for the inc.2d-surfaced contract observations: snapshot
+  determinism, "delete cell contents" command, schema_version) → **6.4-0 function-metadata substrate** →
+  **6.4 Python UDFs**. The v1 import/export surface is COMPLETE (.qbook 2c-9, xlsx import 2c-10 + export
+  2c-12, csv 2c-11). Also tracked cross-cutting: a storage-level effective-non-blank-value extent API for
+  all serializers. Do NOT freeze the CollabSession CRDT façade (collab = v1.5). **Follow
+  `docs/api/workbook-session-impl-plan.md` §0.**
 date: 2026-05-26
 predecessor_plan: .plans/_archive/2026-05-26_phase-5-7-v3-6-1-delta-consumer-backlog.md (V3.6.1 backlog mini-phase, SUPERSEDED by Phase 5 COMPLETE)
 parent_phase: 6 Product Surfaces
@@ -268,11 +287,16 @@ audit_rules_inherited: parallel Codex+Opus per phase/wave/step; negative trait c
      `umya` optional); ql-exec `default-features=false` + `xlsx-write` feature gates the export (else
      honest `Capability`); dev-dep re-enables `write` for the round-trip fixture. Closes the inc.2c-10
      tracked writer-leanness follow-up. Parallel Codex+Opus audit CLEAN (0 HIGH/MED/LOW).
-   - ⭐ **NEXT**: functions/bulk (6.4-0 metadata substrate then 6.4) → migrate the Node smoke path (+
-     `.node` rebuild + B#1/S2-01 mocha) → 6.1C audit. The v1 import/export surface is COMPLETE (.qbook
-     open/save, xlsx import+export, csv import/export). Plus tracked cross-cutting effective-extent
-     serializer fix. See `workbook-session-impl-plan.md` §0. Leave collab/transport/presence
-     feature-gated.
+   - ✅ **inc.2d (2026-05-28)**: owning `WorkbookSession` over napi — the new `Session` `#[napi]` class
+     in `ql-bindings-node` (engine-side half of the Node smoke-path migration; `CollabSession` façade
+     untouched). Parallel Codex+Opus audit SHIP. Synthesis `docs/audits/2026-05-28-inc2d-session-napi-audit/`.
+   - ⭐ **NEXT (reconciled to canonical decision-lock §2 — the prior "functions-first" order here had
+     drifted)**: **IDE-side Node smoke wiring + mocha** (drive `Session` through `loader.ts`, rebuild the
+     `.node`, add B#1/S2-01 cross-window tests) — cross-repo `feat/visualise-v1` → **6.1C security/design
+     audit** → **6.4-0 function-metadata substrate** → **6.4 Python UDFs**. The v1 import/export surface is
+     COMPLETE (.qbook 2c-9, xlsx import 2c-10 + export 2c-12, csv 2c-11). Plus tracked cross-cutting
+     effective-extent serializer fix. See `workbook-session-impl-plan.md` §0. Leave collab/transport/
+     presence feature-gated.
 4. **6.1C — Security/design audit** (MANDATORY before broader binding/service exposure).
 5. **6.4-0 — Function-metadata substrate** — replace the hardcoded volatility whitelist
    (calcgraph_session.rs:149-164) + the address-only-reference whitelist (:201-203) +

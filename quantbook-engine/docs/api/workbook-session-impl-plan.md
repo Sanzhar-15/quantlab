@@ -110,8 +110,22 @@ keeps the dev-dep `write` out of the normal lib build. Parallel Codex(gpt-5.5 xh
 (0 HIGH/MED/LOW; both verified the `write_writer ≡ write` byte-equivalence + the feature graph via
 `cargo tree`). Synthesis `docs/audits/2026-05-27-inc2c12-xlsx-export-audit/`.
 
-**Remaining sequence (NEXT):** functions (6.4-0 metadata substrate then 6.4) → reserved bulk → Node smoke
-migration (+ pending `.node` rebuild + B#1/S2-01 mocha tests) → 6.1C audit. **Also tracked (cross-cutting):
+**✅ Node smoke-path migration — engine-side enabler SHIPPED (inc.2d, 2026-05-28).** The Node binding
+`ql-bindings-node` now exposes the owning `WorkbookSession` over napi as a new **`Session`** class
+(`Arc<parking_lot::Mutex<ql_exec::WorkbookSession>>`) — `new`/`addSheet`/`setValue`/`setFormula`/`clear`/
+`recalcDirty`/`recalcAll`/`snapshot`/`cell`/`listSheets`, with `engine_error_to_napi` + DTO mappers reusing
+the existing `#[napi(object)]` shapes, `f64`+`validate_u16/u32_index` discipline, and a positive
+`WorkbookSession: Send` compile-proof. The existing `CollabSession` CRDT façade is untouched (collab = v1.5).
+A plain-Node `process.dlopen` smoke (`crates/ql-bindings-node/tests/smoke_session.mjs`) proves
+edit→recalc→snapshot through the owning session over FFI. Parallel Codex+Opus audit **SHIP** (0 HIGH/MED;
+1 LOW doc-fix applied; rest tracked) — synthesis `docs/audits/2026-05-28-inc2d-session-napi-audit/`.
+
+**Remaining sequence (NEXT) — reconciled to the canonical decision-lock §2** (the prior "functions-first"
+ordering here had drifted; the lock puts the Node smoke migration inside 6.1B → then 6.1C → then 6.4-0):
+**IDE-side Node smoke wiring + mocha (drive the `Session` class through `loader.ts`; rebuild the `.node`;
+add the B#1/S2-01 cross-window mocha tests) — cross-repo (`feat/visualise-v1`), the explicit hand-off** →
+**6.1C security/design audit** → **6.4-0 function-metadata substrate** → **6.4 Python UDFs**. **Also tracked
+(cross-cutting):
 a storage-level effective-non-blank-value extent API** adopted by all serializers (csv/xlsx/.qbook) so a
 blank-inflated `Sheet::bounds` can't produce a giant export (Codex inc.2c-11 HIGH — currently
 consistent-with-siblings + documented; Opus inc.2c-12 INFO re-noted the HashMap-ordered fresh-rels emission,

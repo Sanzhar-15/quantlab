@@ -100,6 +100,13 @@ the runtime methods onto `WorkbookSession`). This is flagged work, not an emerge
   `Arc<Mutex<WorkbookSession>>`; C: opaque ptr + `qb_session_free`; WASM: JS handle; Python: PyO3
   class). **No method returns a borrowed Rust ref across FFI.** Tabular results are owned buffers or
   Arrow `RecordBatch` handles with explicit release (C: `qb_release_*`; managed: GC).
+  - **✅ Node realized (6.1B inc.2d, 2026-05-28):** `ql-bindings-node` exposes the **`Session`** `#[napi]`
+    class over `Arc<parking_lot::Mutex<ql_exec::WorkbookSession>>` (the smoke surface: `new`/`addSheet`/
+    `setValue`/`setFormula`/`clear`/`recalcDirty`/`recalcAll`/`snapshot`/`cell`/`listSheets`), proving
+    this contract over FFI (edit→recalc→snapshot smoke passes). `WorkbookSession: Send` is compile-proven;
+    every method returns owned data (no guard/ref escapes); `EngineError` maps via `engine_error_to_napi`
+    (`"[code] message"`). The richer surface (batch/txn/import/export/undo/delta, register_function) +
+    the IDE-side mocha wiring are the 6.3 / cross-repo follow-up.
 - Long-running / multi-call state (transactions §3.4, operations §6) is referenced by **opaque IDs**,
   never by a borrowed runtime object.
 

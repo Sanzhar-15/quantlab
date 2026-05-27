@@ -77,6 +77,18 @@ ql-io        = { path = "../ql-io" }
 ql-functions = { path = "../ql-functions" }
 ql-storage   = { path = "../ql-storage" }
 
+# **Phase 6.1B inc.2d (2026-05-27) — owning `WorkbookSession` over napi.**
+# The product-neutral engine session contract (`ql-session`: the `EngineSession`
+# trait + DTOs + `EngineError`) and its sole implementation
+# (`ql_exec::WorkbookSession`). The new `Session` napi class wraps the latter so
+# the IDE edit/recalc/snapshot path can run through the owning single-writer
+# session instead of the `CollabSession` CRDT façade (decision-lock §2 item 3 /
+# risk-mitigation #1: "migrate the Node path early"). `ql-exec` declares NO
+# default features (its `xlsx-write` writer + image-codec tree is opt-in), so
+# this dep does NOT pull umya/image into the binding's default cdylib.
+ql-exec      = { path = "../ql-exec" }
+ql-session   = { path = "../ql-session" }
+
 # **V2.4 (2026-05-22):** `parking_lot::Mutex` for the `Arc<Mutex<CoreCollabSession>>`
 # refactor that closes V2.3's `&mut self` async aliasing UB hazard. Faster
 # than `std::sync::Mutex` (no poison flag, no syscall on uncontended path).
